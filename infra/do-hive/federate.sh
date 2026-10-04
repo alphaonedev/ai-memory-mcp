@@ -273,6 +273,27 @@ EOS
 # node_sh <idx0> -- run the script on stdin as root on that node.
 node_sh() { ssh $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
 
+# safe_excerpt <bytes> -- how a failure line shows a node's reply (#4999): the byte count plus a
+# bounded excerpt of printable ASCII only (control bytes, ESC and non-ASCII are dropped), with any
+# 20+ character token-like run and everything after a credential word replaced by [redacted]; the
+# node API key is also removed by value. Never the raw reply. safe_code is the same for a field
+# that should be a 3-digit HTTP status: a status passes through, anything else is excerpted.
+safe_excerpt() {
+  local n s
+  n=$(printf '%s' "$1" | LC_ALL=C wc -c | LC_ALL=C tr -d ' ')
+  s=$(printf '%s' "$1" | LC_ALL=C tr -cd '\040-\176' | LC_ALL=C tr 'A-Z' 'a-z' \
+      | LC_ALL=C sed -E 's#[a-z0-9+/_=-]{20,}#[redacted]#g; s#(api[_-]?key|authorization|bearer|password|passwd|secret|token|private|begin [a-z ]*key)[ -~]*#[redacted]#g' \
+      | LC_ALL=C head -c 120)
+  [ -n "${api_key:-}" ] && s=${s//"$api_key"/[redacted]}
+  printf '%s bytes: %s' "$n" "$s"
+}
+safe_code() {
+  case "$1" in
+    [0123456789][0123456789][0123456789]) printf '%s' "$1" ;;
+    *) safe_excerpt "$1" ;;
+  esac
+}
+
 # node_get <idx0> <memory-id> -- read one memory from that node over its own
 # loopback mTLS listener, using the node's own cert + its own api key.
 # plain_id <id> -- the verify steps ask this BEFORE node_get so a refused id is reported as a
@@ -325,7 +346,7 @@ EOS
     if [ "$code" = "200" ]; then
       ok "node $n /health over mTLS (200)"
     else
-      no "node $n /health over mTLS got '$code' (expected 200)"
+      no "node $n /health over mTLS got '$(safe_code "$code")' (expected 200)"
     fi
 
     if node_sh "$i" <<'EOS' >/dev/null 2>&1
@@ -346,9 +367,9 @@ sudo -u postgres psql -d aimemory -Atc "SELECT current_setting('server_version')
 sudo -u postgres psql -d aimemory -Atc "SELECT extname || '=' || extversion FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname"
 EOS
 )"
-    echo "$versions" | grep -q '^18\.6' && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 ($versions)"
-    echo "$versions" | grep -qx 'age=1.8.0' && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 ($versions)"
-    echo "$versions" | grep -qx 'vector=0.8.6' && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 ($versions)"
+    echo "$versions" | grep -q '^18\.6' && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 ($(safe_excerpt "$versions"))"
+    echo "$versions" | grep -qx 'age=1.8.0' && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 ($(safe_excerpt "$versions"))"
+    echo "$versions" | grep -qx 'vector=0.8.6' && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 ($(safe_excerpt "$versions"))"
   done
 
   # These two assertions intentionally originate on f2/public internet.
@@ -356,7 +377,7 @@ EOS
     : # legacy local allowlist is not authoritative after remote enrollment
   fi
   code="$(curl -sS --max-time 15 --cacert "$OUT_DIR/ca.crt" --cert "$OUT_DIR/hive-loadgen-f2.crt" --key "$OUT_DIR/hive-loadgen-f2.key" -o /dev/null -w '%{http_code}' "https://${PUBLIC_IPS[0]}:9077/api/v1/health" 2>/dev/null)"
-  [ "$code" = 200 ] && ok "f2 loadgen reaches public /health over mTLS (200)" || no "f2 public mTLS /health got '$code'"
+  [ "$code" = 200 ] && ok "f2 loadgen reaches public /health over mTLS (200)" || no "f2 public mTLS /health got '$(safe_code "$code")'"
   if curl -sS --max-time 10 --cacert "$OUT_DIR/ca.crt" -o /dev/null "https://${PUBLIC_IPS[0]}:9077/api/v1/health" 2>/dev/null; then
     no "public endpoint accepted a client with no certificate"
   else
@@ -382,10 +403,10 @@ EOS
     dummy_pub="$(head -c 32 /dev/zero | base64)"
     code="$(lg_curl -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' -H "X-Agent-Id: ai:hive-loadgen-f2" \
       -d "{\"pubkey_b64\":\"$dummy_pub\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents/$probe/pubkey" 2>/dev/null)"
-    case "$code" in 2*) ok "loadgen admin (ai:hive-loadgen-f2 + API key + mTLS) may bind agent keys ($code)";; *) no "loadgen admin bind got '$code' (expected 2xx)";; esac
+    case "$code" in 2*) ok "loadgen admin (ai:hive-loadgen-f2 + API key + mTLS) may bind agent keys ($(safe_code "$code"))";; *) no "loadgen admin bind got '$(safe_code "$code")' (expected 2xx)";; esac
     code="$(lg_curl -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' -H "X-Agent-Id: ai:not-an-admin" \
       -d "{\"pubkey_b64\":\"$dummy_pub\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents/$probe/pubkey" 2>/dev/null)"
-    [ "$code" = 403 ] && ok "non-allowlisted name is refused admin (403) - header trust is off" || no "non-admin bind got '$code' (expected 403)"
+    [ "$code" = 403 ] && ok "non-allowlisted name is refused admin (403) - header trust is off" || no "non-admin bind got '$(safe_code "$code")' (expected 403)"
   else
     no "could not read the node API key for the admin-admission check"
   fi
@@ -404,7 +425,7 @@ EOS
   if [ "$code" = "200" ]; then
     ok "CROSS-HOST: node 1 reaches node 2 at $peerurl over mutual TLS (200)"
   else
-    no "CROSS-HOST: node 1 -> node 2 ($peerurl) got '$code' (expected 200)"
+    no "CROSS-HOST: node 1 -> node 2 ($peerurl) got '$(safe_code "$code")' (expected 200)"
   fi
 
   # A3 -- a W-of-N quorum write admitted at node 1 commits AND replicates.
@@ -430,7 +451,7 @@ EOS
   case "$qcode" in
     201) ok "W-of-N quorum write at node 1 committed + replicated (201 quorum_met)" ;;
     202) ok "quorum write at node 1 locally durable (202; peer ack timing) -- the mesh channel carried it" ;;
-    *)   no "quorum write at node 1 got '$qcode' ($qjson)" ;;
+    *)   no "quorum write at node 1 got '$(safe_code "$qcode")' ($(safe_excerpt "$qjson"))" ;;
   esac
   if [ -n "$QID" ] && ! plain_id "$QID"; then
     no "quorum write at node 1 returned a memory id that is not a plain id; it is not read back"
@@ -484,7 +505,7 @@ EOS
       if [ "$scode" = "201" ] && [ -n "$SID" ]; then
         ok "signed write accepted at node 1 (201 id=$SID)"
       elif [ -z "$srefused" ]; then
-        no "signed write at node 1 got '$scode' ($sjson)"
+        no "signed write at node 1 got '$(safe_code "$scode")' ($(safe_excerpt "$sjson"))"
       fi
       if [ -n "$SID" ]; then
         lvl=""
@@ -496,7 +517,7 @@ EOS
         case "$lvl" in
           agent_attested) ok "signed cross-peer write lands attest_level=agent_attested at node 2" ;;
           "")             no "signed write never reached node 2 (replication or author-enrollment failure)" ;;
-          *)              no "signed write reached node 2 at attest_level='$lvl' (expected agent_attested)" ;;
+          *)              no "signed write reached node 2 at attest_level='$(safe_code "$lvl")' (expected agent_attested)" ;;
         esac
       fi
     fi

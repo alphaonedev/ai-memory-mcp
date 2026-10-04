@@ -415,6 +415,58 @@ def p1_temp_entry_fail_closed():
               and (kf.stat().st_mode & 0o777) == 0o600, "rc=%s" % rc)
 
 
+def failure_lines_4999():
+    """#4999: a failure line shows a bounded printable excerpt of a node reply, never the raw bytes."""
+    fs = FED.read_text()
+    i = fs.find("safe_excerpt() {")
+    j = fs.find("# node_get <idx0>", i)
+    defs = fs[i:j] if 0 <= i < j else ""
+    probe("V1 safe_excerpt and safe_code exist", bool(defs))
+    longtok = "Zm9vYmFyYmF6cXV4" * 6
+    hostile = ('{"note":"see hunter2hunter ok","pad":"%s","error":"bad\x1b[31m\x01\x07 thing\x7f","id":"\xc3\xa9\xe2\x82\xac",'
+               '"k":"%s","t":"%s","Authorization":"Bearer short-tok","pem":"-----BEGIN PRIVATE KEY-----"}' % ("ab " * 100, SECRET, longtok))
+    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+        d = pathlib.Path(t)
+        sc = ("api_key=hunter2hunter\n%s\nb=$'%s'\nsafe_excerpt \"$b\"; echo\nsafe_code $'20\\x1b[31m1'; echo\nsafe_code 201; echo\n"
+              % (defs, hostile.replace("\\", "\\\\").replace("'", "\\'").replace("\x1b", "\\x1b").replace("\x01", "\\x01")
+                 .replace("\x07", "\\x07").replace("\x7f", "\\x7f")))
+        r = run_bash(sc.replace("short-tok", "short-tok hunter2hunter"), d)
+        out = r.stdout
+        lines = out.split("\n")
+        first = lines[0] if lines else ""
+        probe("V1 excerpt has no control or non-ASCII byte", all(32 <= ord(c) < 127 for c in out.replace("\n", "")) and bool(first), repr(out[:60]))
+        probe("V1 excerpt carries the byte count", first.startswith(str(len(hostile.replace("short-tok", "short-tok hunter2hunter").encode("utf-8"))) + " bytes: "), first[:30])
+        probe("V1 excerpt is bounded", len(first) <= 140, str(len(first)))
+        probe("V1 excerpt never holds the key, a token run, a credential word value or the api key by value",
+              SECRET not in out and longtok not in out and "short-tok" not in out and "hunter2hunter" not in out
+              and "PRIVATE KEY" not in out.upper(), first[:80])
+        probe("V1 safe_code passes a status and excerpts anything else", lines[2:3] == ["201"] and "bytes:" in (lines[1] if len(lines) > 1 else "")
+              and "\x1b" not in out, repr(lines[1:3]))
+        # Behaviour at the real sites: the quorum and the signed-write failure lines.
+        for var, cvar, jvar, start, end in (
+                ("quorum", "qcode", "qjson", '  case "$qcode" in', '  if [ -n "$QID" ] && ! plain_id'),
+                ("signed", "scode", "sjson", '      SID=$(echo "$sjson" | jq -r \'.id // empty\' 2>/dev/null)\n', '      if [ -n "$SID" ]; then\n        lvl=""')):
+            a = fs.find(start)
+            b = fs.find(end, a) if a >= 0 else -1
+            snip = fs[a:b] if 0 <= a < b else ""
+            sc = ("api_key=''\n%s\nok() { echo \"OK $*\"; }\nno() { echo \"NO $*\"; }\nQID=''\nSID=''\n%s='500'\n%s=$'%s'\n%s\n"
+                  % (defs + plain_id_def(fs), cvar, jvar, hostile.replace("\\", "\\\\").replace("'", "\\'").replace("\x1b", "\\x1b")
+                     .replace("\x01", "\\x01").replace("\x07", "\\x07").replace("\x7f", "\\x7f"), snip))
+            r = run_bash(sc, d)
+            out = r.stdout
+            probe("V1 %s failure line prints no raw node bytes" % var, 0 <= a < b and "NO " in out and "bytes:" in out and SECRET not in out
+                  and longtok not in out and all(32 <= ord(c) < 127 for c in out.replace("\n", "")), out.strip()[:80])
+    # No failure line in verify interpolates a node-derived value unsanitised.
+    vi = fs.index("\nverify() {")
+    raw = []
+    for n, l in enumerate(fs[vi:].splitlines()):
+        if re.search(r'\bno "', l):
+            rest = re.sub(r'\$\(safe_(?:code|excerpt) "\$\w+"\)', "", l[re.search(r'\bno "', l).start():])
+            if re.search(r"\$\{?(?:code|qcode|scode|lvl|qjson|sjson|versions|resp|sresp)\b", rest):
+                raw.append(n)
+    probe("V1 no failure line in verify prints a node-derived value unsanitised", not raw, str(raw))
+
+
 def n1_no_locale_ranges():
     guards = [l for l in (TPL.read_text() + FED.read_text()).splitlines() if "{64}" in l and "=~" in l]
     probe("N1 four key guards found", len(guards) == 4, str(len(guards)))
@@ -505,6 +557,7 @@ def main():
     n1_curl_config_injection()
     p1_federate_key_echo()
     p1_temp_entry_fail_closed()
+    failure_lines_4999()
     n3_main_tf()
     n1_no_locale_ranges()
     f2_node_get_id()
