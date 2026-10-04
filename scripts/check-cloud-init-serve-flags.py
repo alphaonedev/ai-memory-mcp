@@ -738,6 +738,8 @@ def unquote(w: str):
 
 ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*(?:\[[^]]*\])?\+?=")
 REDIR_RE = re.compile(r"^(?:\d*|&)(?:<<<|<<-|<<|<>|>>|>\||>&|<&|&>>|&>|<|>)(.*)$", re.S)
+# a redirection target before the ai-memory subcommand that holds rendered terraform text (#5099)
+REDIR_TF_HIT = "ai-memory redirection target: a terraform value (its text can hold a space and so the subcommand)"
 KEYWORDS = {"if", "then", "do", "else", "elif", "while", "until", "!", "time", "{", "}", "fi", "done", "esac", "coproc"}
 SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "mksh", "busybox"}
 INTERP_BASE_RE = re.compile(r"^(?:python[\d.]*|perl|ruby|node|nodejs|php|lua|tclsh|awk|gawk|mawk)$")
@@ -1300,10 +1302,18 @@ def companion_hits(stmt: str, st: dict, depth: int = 0, bins=frozenset()) -> lis
             for rw in raw_of[id(words)][idx + 1:]:
                 if skip:
                     skip = False
+                    if TF_VALUE in rw or TF_DIRECTIVE_MARK in rw:
+                        out.append(REDIR_TF_HIT)
+                        break
                     continue
                 rm = REDIR_RE.match(rw)
                 if rm is not None and not rw.startswith(("<(", ">(")):
-                    # a redirection is not an argument; bash removes it and its target
+                    # a redirection is not an argument; bash removes it and its target. The
+                    # target is still rendered text: a terraform value in it can end the
+                    # redirection and supply the subcommand (#4837 R12 R3, #5099)
+                    if TF_VALUE in rw or TF_DIRECTIVE_MARK in rw:
+                        out.append(REDIR_TF_HIT)
+                        break
                     skip = not rm.group(1)
                     continue
                 if want_value:
@@ -2429,6 +2439,10 @@ def build_probes() -> list:
         ('heredoc written by tee, listed (#4837 R12 R5)', [(dec, "      tee /etc/ai-memory/run.conf >/dev/null <<'EOF'\n      ${X} --db /x stats\n      EOF\n" + dec)]),
         # the first assignment names a data home: only the single-assignment test keeps D from being a constant
         ('heredoc through a variable assigned twice, listed (#4837 R12 R5)', [(dec, '      D=/etc/ai-memory\n      D=/usr/local/bin\n      cat > "$${D}/run.conf" <<\'EOF\'\n      ${X} --db /x stats\n      EOF\n' + dec)]),
+        ('ai-memory terraform value in a redirection target, listed (#4837 R12 R3, #5099)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db /x >${X} stats\n' + dec)]),
+        ('ai-memory terraform value in a separate redirection target, listed (#4837 R12 R3, #5099)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db /x 2> ${X} stats\n' + dec)]),
+        ('ai-memory quoted terraform value in a stdin redirection target, listed (#4837 R12 R3, #5099)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory <"${X}" stats\n' + dec)]),
+        ('ai-memory directive in a redirection target, listed (#4837 R12 R3, #5099)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory 2>%{ if c }/x%{ endif } stats\n' + dec)]),
         ("eval indented below the content block, listed (#4836)", [(dec, dec + '    eval "$PRE"\n')]),
         ("eval indented to the write_files key, listed (#4836)", [(dec, dec + '  eval "$PRE"\n')]),
         ("write_files encoding b64, listed", [(PROV, "  - path: /etc/x.sh\n    encoding: b64\n    content: |\n      Y3VybCBodHRwczovL3g=\n" + PROV)]),
