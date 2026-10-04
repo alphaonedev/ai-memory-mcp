@@ -181,6 +181,72 @@ fn doctor_cli_reports_a_read_fault_critical_not_empty_4715() {
         "the histogram fault is surfaced: {gov}"
     );
     assert_eq!(fact(gov, "over_depth_chains"), Some("unreadable"), "{gov}");
+    // L2: no read-fault fact may print a healthy-looking value.
+    assert_eq!(fact(gov, "inheritance_depth"), Some("unreadable"), "{gov}");
+    assert_eq!(code, 2);
+}
+
+/// R1: a 20k-row chain (the shape that took 11 s in a quadratic census, and
+/// on postgres surfaced as a bogus timeout) is censused in linear time, and
+/// the doctor still names the head with the exact hop count and keeps the
+/// named list bounded.
+#[test]
+fn sqlite_doctor_censuses_a_20k_row_chain_in_linear_time_4715() {
+    const N: usize = 20_000;
+    let (_t, db) = fresh_db();
+    {
+        let mut conn = ai_memory::db::open(&db).expect("open");
+        let tx = conn.transaction().expect("tx");
+        for (ns, parent) in chain("n", N) {
+            tx.execute(
+                "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace) \
+                 VALUES (?1, 'ghost', '2026-10-03T00:00:00Z', ?2)",
+                rusqlite::params![ns, parent],
+            )
+            .expect("plant link");
+        }
+        tx.commit().expect("commit");
+    }
+    let conn = ai_memory::db::open(&db).expect("open");
+    let started = std::time::Instant::now();
+    let found = ai_memory::db::doctor_over_depth_chains(&conn).expect("census");
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(3),
+        "the census over a 20k-row chain took {took:?}: not linear"
+    );
+    assert_eq!(found.len(), N - MAX, "every start past the bound is found");
+    assert!(
+        found.iter().any(|c| c.root == "n0" && c.hops == N),
+        "the chain head is named with every hop counted"
+    );
+    drop(conn);
+
+    let started = std::time::Instant::now();
+    let (report, code) = doctor_json(&db);
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(60),
+        "doctor over a 20k-row chain took {took:?}"
+    );
+    let gov = section(&report, "Governance");
+    assert!(is_critical(gov), "{gov}");
+    assert_eq!(
+        fact(gov, "over_depth_chains"),
+        Some((N - MAX).to_string().as_str()),
+        "{gov}"
+    );
+    let named = gov["facts"]
+        .as_array()
+        .expect("facts")
+        .iter()
+        .filter(|f| f[0].as_str().is_some_and(|k| k.starts_with("over_depth::")))
+        .count();
+    assert_eq!(named, 20, "the named list stays bounded: {named}");
+    assert!(
+        fact(gov, "over_depth::n0").is_some_and(|v| v.starts_with("20000 hops")),
+        "{gov}"
+    );
     assert_eq!(code, 2);
 }
 
@@ -305,32 +371,142 @@ mod pg {
         reset(&pool, &[]).await;
     }
 
+    /// `url` with its database name replaced by `database`; `None` when the
+    /// URL has no database path segment to replace.
+    fn with_database(url: &str, database: &str) -> Option<String> {
+        let authority = url.find("://")?.checked_add(3)?;
+        let slash = authority.checked_add(url.get(authority..)?.find('/')?)?;
+        let start = slash.checked_add(1)?;
+        let end = url
+            .get(start..)?
+            .find('?')
+            .map_or(url.len(), |q| start.saturating_add(q));
+        (end > start).then(|| format!("{}{database}{}", &url[..start], &url[end..]))
+    }
+
+    fn database_of(url: &str) -> Option<&str> {
+        let authority = url.find("://")?.checked_add(3)?;
+        let start = authority.checked_add(url.get(authority..)?.find('/')?)?;
+        let start = start.checked_add(1)?;
+        let rest = url.get(start..)?;
+        Some(rest.split('?').next().unwrap_or(rest))
+    }
+
+    /// Drops the throwaway database even when the cell panics. A fresh
+    /// runtime on its own thread, because `Drop` is sync and may run while
+    /// the test's runtime is shutting down.
+    struct DropDatabase {
+        admin_url: String,
+        name: String,
+    }
+
+    impl Drop for DropDatabase {
+        fn drop(&mut self) {
+            let (admin_url, name) = (self.admin_url.clone(), self.name.clone());
+            let joined = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async {
+                    let admin = sqlx::PgPool::connect(&admin_url).await?;
+                    sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                        .execute(&admin)
+                        .await?;
+                    admin.close().await;
+                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                })
+            })
+            .join();
+            if !matches!(joined, Ok(Ok(()))) {
+                eprintln!("could not drop the throwaway database {}", self.name);
+            }
+        }
+    }
+
     /// A store whose `namespace_meta` cannot be read is Critical in the
     /// section, never an empty census: the probe runs against a database that
-    /// exists but has no schema.
+    /// exists but has no schema. The database is named from the test URL's
+    /// own database (so it runs on every lane and in CI, not one hard-wired
+    /// name), created only once the URL is known to be usable, and dropped by
+    /// a guard. A usable-looking URL that cannot be used FAILS the cell.
     #[tokio::test(flavor = "multi_thread")]
     async fn pg_doctor_reports_a_read_fault_critical_4715() {
         let Some(url) = common::postgres_url() else {
             return;
         };
         let _s = SERIAL.lock().await;
-        let admin = sqlx::PgPool::connect(&url).await.expect("admin pool");
-        // Ignore "already exists": the cell only needs the empty database.
-        let _ = sqlx::query("CREATE DATABASE f1_4715_nometa")
+        let lane_db = database_of(&url).expect("the test URL names a database");
+        let nometa = format!("{lane_db}_nometa_4715_{}", std::process::id());
+        let schemaless_url =
+            with_database(&url, &nometa).expect("the test URL's database is replaceable");
+        assert_ne!(
+            schemaless_url, url,
+            "the schema-less URL must differ from the test URL"
+        );
+        let admin = sqlx::PgPool::connect(&url)
+            .await
+            .expect("the PG test URL is set but cannot be used");
+        sqlx::query(&format!("CREATE DATABASE \"{nometa}\""))
             .execute(&admin)
-            .await;
-        let bare = url.replacen("/f1_4715?", "/f1_4715_nometa?", 1);
-        if bare == url {
-            eprintln!("skip: the test URL does not name database f1_4715");
-            return;
-        }
-        let (report, code) = tokio::task::spawn_blocking(move || doctor_pg(&bare))
+            .await
+            .expect("create the throwaway schema-less database");
+        let _drop = DropDatabase {
+            admin_url: url.clone(),
+            name: nometa,
+        };
+        let (report, code) = tokio::task::spawn_blocking(move || doctor_pg(&schemaless_url))
             .await
             .expect("join");
         let sec = section(&report, NAME);
         assert!(is_critical(sec), "an unreadable census is Critical: {sec}");
         assert_eq!(fact(sec, "over_depth_chains"), Some("unreadable"), "{sec}");
         assert!(fact(sec, "over_depth_chains_error").is_some(), "{sec}");
+        assert_eq!(code, 2);
+    }
+
+    /// R1 on postgres: a 20k-row chain is read, censused in linear time and
+    /// named; it is NOT reported as a probe timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_doctor_censuses_a_20k_row_chain_without_a_bogus_timeout_4715() {
+        const N: usize = 20_000;
+        let Some(url) = common::postgres_url() else {
+            return;
+        };
+        let _s = SERIAL.lock().await;
+        let pool = pool(&url).await;
+        reset(&pool, &[]).await;
+        let (nss, parents): (Vec<String>, Vec<String>) = chain("n", N).into_iter().unzip();
+        sqlx::query(
+            "INSERT INTO namespace_meta (namespace, standard_id, parent_namespace) \
+             SELECT n, 'ghost', p FROM UNNEST($1::text[], $2::text[]) AS t(n, p)",
+        )
+        .bind(&nss)
+        .bind(&parents)
+        .execute(&pool)
+        .await
+        .expect("plant 20k links");
+        let started = std::time::Instant::now();
+        let (report, code) = tokio::task::spawn_blocking(move || doctor_pg(&url))
+            .await
+            .expect("join");
+        let took = started.elapsed();
+        reset(&pool, &[]).await;
+        let sec = section(&report, NAME);
+        assert!(is_critical(sec), "{sec}");
+        assert!(
+            fact(sec, "over_depth_chains_error").is_none(),
+            "a large chain is a finding, not a probe fault: {sec}"
+        );
+        assert_eq!(
+            fact(sec, "over_depth_chains"),
+            Some((N - MAX).to_string().as_str()),
+            "{sec}"
+        );
+        assert!(
+            fact(sec, "over_depth::n0").is_some_and(|v| v.starts_with("20000 hops")),
+            "{sec}"
+        );
+        assert!(took < std::time::Duration::from_secs(60), "{took:?}");
         assert_eq!(code, 2);
     }
 
@@ -341,7 +517,8 @@ mod pg {
     /// count.
     #[test]
     fn pg_doctor_section_is_floored_and_refuses_weak_sslmode_4715() {
-        let (report, _) = doctor_pg("postgres://u:pw4715@127.0.0.1:9/db?sslmode=prefer");
+        const WEAK: &str = "postgres://u:pw4715@127.0.0.1:9/db?sslmode=prefer";
+        let (report, _) = doctor_pg(WEAK);
         let sec = section(&report, NAME);
         assert!(is_critical(sec), "{sec}");
         assert!(sec.to_string().contains("REFUSED to connect"), "{sec}");
@@ -349,5 +526,26 @@ mod pg {
             fact(sec, "over_depth_chains").is_none(),
             "no census was run: {sec}"
         );
+        // The password must not appear in ANY output, text or JSON, stdout or
+        // stderr.
+        let tmp = TempDir::new().expect("tempdir");
+        let db = tmp.path().join("ai-memory.db");
+        for args in [&["doctor", "--json"][..], &["doctor"][..]] {
+            let out = ai_memory(&db)
+                .env("AI_MEMORY_STORE_URL", WEAK)
+                .args(args)
+                .output()
+                .expect("run doctor");
+            let all = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(all.contains("REFUSED to connect"), "{args:?}: {all}");
+            assert!(
+                !all.contains("pw4715"),
+                "the DSN password leaked into `doctor {args:?}` output"
+            );
+        }
     }
 }
