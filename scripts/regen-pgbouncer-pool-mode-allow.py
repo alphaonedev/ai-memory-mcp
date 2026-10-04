@@ -163,7 +163,9 @@ def main(argv):
                 for rule in rules:
                     if rule["file"] == key[0] and rule["match"] in key[1]:
                         text = " ".join(rule["reason"].replace("{unit}", key[1][:90].rstrip()).split())
-                        problem = gate.reason_problem(text)
+                        # #5209: the unit is quoted, never its own reason; the written part must be a reason alone
+                        written = " ".join(rule["reason"].replace("{unit}", " ").split())
+                        problem = gate.reason_problem(written) or gate.reason_problem(text)
                         if problem:
                             print("regen: FAULT: reason for %s is not a reason: %s" % (key[0], problem), file=sys.stderr)
                             return 2
