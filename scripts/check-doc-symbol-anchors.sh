@@ -53,9 +53,13 @@
 #            whose symbol equals the module's file stem is a module
 #            citation, which is legitimate). A relative link to a
 #            `src/` file with ANY label must point at an existing file
-#            (#5190), as must a link with a title, a reference
-#            definition (`[h]: src/x.rs`) and an HTML relative href
-#            (#5269).
+#            (#5190), as must a link with a title (double-quoted,
+#            single-quoted or parenthesised), an angle-bracket
+#            destination, a `?query`, a reference definition
+#            (`[h]: src/x.rs`, also in a blockquote or list item or
+#            with the destination on the next line) and an HTML
+#            relative href (any case, spaces around `=`, quoted or
+#            not) (#5269, #5343).
 #   LADDER_TIP — a claimed end of the migration ladder
 #            (`migrate_vNN`) must be the real tip.
 #
@@ -409,6 +413,73 @@ MDEOF
         '[handler]: src/mcp/tools/recall.rs#L2 "title"'
     anchor_green 5269 "an HTML relative href to a live file" \
         'See <a href="src/mcp/tools/recall.rs#L2">the handler</a> for it.'
+
+    # #5343: the residual relative-link forms #5269 left open: a paren title,
+    # an angle destination, a ?query, a reference definition in a blockquote
+    # or list item or with the destination on the next line, and an HTML href
+    # in any case, with spaces around "=", single-quoted or unquoted.
+    anchor_red 5343 PATH "a link with a parenthesised title to a missing file" \
+        'See [h](src/nope.rs (the handler)) here.'
+    anchor_red 5343 PATH "an angle-bracket link destination to a missing file" \
+        'See [h](<src/nope.rs>) here.'
+    anchor_red 5343 PATH "an angle-bracket destination with a title to a missing file" \
+        'See [h](<src/nope.rs> "t") here.'
+    anchor_red 5343 LINE "a parenthesised-title link with #L past end-of-file" \
+        'See [h](src/mcp/tools/recall.rs#L9999 (title)) here.'
+    anchor_red 5343 LINE "an angle-bracket link with #L past end-of-file" \
+        'See [h](<src/mcp/tools/recall.rs#L9999>) here.'
+    anchor_red 5343 LINE "a ?plain=1 link with #L past end-of-file" \
+        'See [h](src/mcp/tools/recall.rs?plain=1#L9999) here.'
+    anchor_red 5343 PATH "a ?plain=1 link to a missing file" \
+        'See [h](src/nope.rs?plain=1) here.'
+    anchor_red 5343 PATH "a reference definition inside a blockquote to a missing file" \
+        '> [h]: src/nope.rs'
+    anchor_red 5343 PATH "a reference definition inside a list item to a missing file" \
+        '- [h]: src/nope.rs'
+    anchor_red 5343 PATH "a reference definition inside a numbered list item to a missing file" \
+        '1. [h]: src/nope.rs'
+    anchor_red 5343 LINE "a reference definition in a nested blockquote list with #L past end-of-file" \
+        '> - [h]: src/mcp/tools/recall.rs#L9999'
+    anchor_red 5343 PATH "a reference definition with its destination on the next line" \
+        $'[h]:\nsrc/nope.rs'
+    anchor_red 5343 PATH "a reference definition with an angle destination and a title on the next line" \
+        $'[h]:\n  <src/nope.rs> "title"'
+    anchor_red 5343 PATH "a reference definition with a parenthesised title" \
+        '[h]: src/nope.rs (the handler)'
+    anchor_red 5343 PATH "a reference definition with an angle destination" \
+        '[h]: <src/nope.rs>'
+    anchor_red 5343 PATH "an unquoted HTML href to a missing file" \
+        '<a href=src/nope.rs>x</a>'
+    anchor_red 5343 PATH "an HTML href with spaces around the equals sign" \
+        '<a href = "src/nope.rs">x</a>'
+    anchor_red 5343 PATH "an upper-case HTML HREF to a missing file" \
+        '<a HREF="src/nope.rs">x</a>'
+    anchor_red 5343 PATH "a single-quoted HTML href to a missing file" \
+        "<a href='src/nope.rs'>x</a>"
+    anchor_red 5343 LINE "an unquoted HTML href with #L past end-of-file" \
+        '<a href=src/mcp/tools/recall.rs#L9999>x</a>'
+    anchor_red 5343 LINE "an HTML href with ?plain=1 and #L past end-of-file" \
+        '<a href="src/mcp/tools/recall.rs?plain=1#L9999">x</a>'
+    anchor_green 5343 "an angle-bracket link to a live file" \
+        'See [h](<src/mcp/tools/recall.rs>) here.'
+    anchor_green 5343 "a parenthesised-title link to a live file" \
+        'See [h](src/mcp/tools/recall.rs (the handler)) here.'
+    anchor_green 5343 "a ?plain=1 link to a live file" \
+        'See [h](src/mcp/tools/recall.rs?plain=1#L2) here.'
+    anchor_green 5343 "a blockquote reference definition to a live file" \
+        '> [h]: src/mcp/tools/recall.rs'
+    anchor_green 5343 "a next-line reference definition to a live file" \
+        $'[h]:\nsrc/mcp/tools/recall.rs#L2'
+    anchor_green 5343 "an unquoted upper-case spaced single-quoted HTML href to a live file" \
+        "<a HREF = 'src/mcp/tools/recall.rs'>x</a>"
+    anchor_green 5343 "an unquoted HTML href to a live file" \
+        '<a href=src/mcp/tools/recall.rs>x</a>'
+    anchor_green 5343 "an indented code block that looks like a reference definition" \
+        '    [h]: src/nope.rs'
+    anchor_green 5343 "a reference-style line followed by prose is not a definition" \
+        '[h]: src/nope.rs and more words'
+    anchor_green 5343 "an attribute that merely ends in href" \
+        '<a xhref="src/nope.rs">x</a>'
 
     # #5189: the #L fragment of a relative src link is range-checked.
     anchor_red 5189 LINE "a backticked-label link with #L past end-of-file" \
@@ -828,18 +899,27 @@ QUAL = re.compile(
 # so a URL path segment is never matched.
 BARE_QUAL = re.compile(
     r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|(" + SYM + r"))")
-MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(([^)]*src/[A-Za-z0-9_/]+\.rs)[^)]*\)")
+MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(<?([^)]*src/[A-Za-z0-9_/]+\.rs)[^)]*\)")
 # #5190: ANY relative markdown link to a src/ file, whatever its label
 # (MDLINK only sees a backticked-identifier label). canon() has already
 # removed a ./ or ../ prefix, so the target starts with src/.
-RELLINK = re.compile(
-    r"\]\((src/[A-Za-z0-9_/]+\.rs)(#[^)\s]*)?(?:\s+(?:\"[^\"]*\"|'[^']*'))?\)")
-# #5269: two more relative-link forms to a src/ file: a markdown reference
-# definition (`[h]: src/x.rs "title"`) and an HTML relative href.
+# #5343: the destination may be angle-bracketed (`<src/x.rs>`), carry a
+# `?query` (GitHub's `?plain=1`) before the fragment, and be followed by a
+# title in double quotes, single quotes or parentheses.
+_TITLE = r"(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?"
+_SRC = r"(src/[A-Za-z0-9_/]+\.rs)(?:\?[^)#\s>\"']*)?"
+RELLINK = re.compile(r"\]\(<?" + _SRC + r"(#[^)\s>]*)?>?" + _TITLE + r"\)")
+# #5269/#5343: two more relative-link forms to a src/ file: a markdown
+# reference definition (`[h]: src/x.rs "title"`, also inside a blockquote or a
+# list item; a destination on the NEXT line is joined in the loop below) and
+# an HTML relative href (any case, spaces around `=`, quoted or not).
+_REFDEF_HEAD = (r"^\s{0,3}(?:(?:>\s?|[-*+]\s+|\d{1,9}[.)]\s+)\s{0,3})*"
+                r"\[[^\]\n]+\]:")
 REFDEF = re.compile(
-    r"^\s{0,3}\[[^\]\n]+\]:\s*<?(src/[A-Za-z0-9_/]+\.rs)(#[^\s>]*)?>?"
-    r"(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*$")
-HREF = re.compile(r"\bhref=[\"'](src/[A-Za-z0-9_/]+\.rs)(#[^\"'\s]*)?[\"']")
+    _REFDEF_HEAD + r"\s*<?" + _SRC + r"(#[^\s>]*)?>?" + _TITLE + r"\s*$")
+REFDEF_OPEN = re.compile(_REFDEF_HEAD + r"\s*$")
+HREF = re.compile(
+    r"\b(?i:href)\s*=\s*[\"']?" + _SRC + r"(#[^\"'\s>]*)?(?=[\"'\s>]|$)")
 # #5189: the #L<a>[-L<b>] line fragment of such a link names lines too.
 # Only a RELATIVE link is range-checked; a commit-pinned permalink (an
 # https URL) is immutable and never reaches this rule.
@@ -1044,8 +1124,13 @@ for doc in seen_docs:
         md_starts = {m.start(2) for m in MDLINK.finditer(line)}
         rel_hits = [(m.group(1), m.group(2), m.start(1), True)
                     for m in RELLINK.finditer(line)]
+        # #5343: a reference definition may carry its destination on the
+        # NEXT line (`[h]:` then `src/x.rs`); join the two before matching.
+        refdef_line = line
+        if REFDEF_OPEN.match(line) and ln < len(doc_lines):
+            refdef_line = line.rstrip() + " " + canon(doc_lines[ln])[0].strip()
         rel_hits += [(m.group(1), m.group(2), m.start(1), False)
-                     for m in REFDEF.finditer(line)]
+                     for m in REFDEF.finditer(refdef_line)]
         rel_hits += [(m.group(1), m.group(2), m.start(1), False)
                      for m in HREF.finditer(line)]
         for tgt, frag, start, is_md in rel_hits:

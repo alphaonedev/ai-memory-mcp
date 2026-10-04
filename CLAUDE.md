@@ -1748,8 +1748,7 @@ path with one balanced generic group per component (commas, lifetimes,
 reported, never skipped), are checked too, the former
 reported as **BARE_QUAL**, and a qualified anchor always asserts that
 its file exists), **MDLINK** (a ``[`sym`](../src/<p>.rs)`` link must resolve, or `sym`
-must BE the module's file stem, which is a legitimate module citation; a relative link to a `src/` file, titled, a reference
-definition or an HTML href included, must point at an existing file),
+must BE the module's file stem, which is a legitimate module citation; a relative link to a `src/` file must point at an existing file, whatever its form: a double-quoted, single-quoted or parenthesised title, an angle-bracket destination, a `?query`, a reference definition (also inside a blockquote or list item, or with the destination on the next line) or an HTML href (any case, spaces around `=`, quoted or not)),
 **BARE_LN**
 (#4651: a bare, un-backticked `src/<p>.rs:<N>` in prose, a link label or
 HTML text is a finding that FAILS, unless it labels a commit-pinned
