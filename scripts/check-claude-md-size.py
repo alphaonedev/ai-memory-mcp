@@ -1557,6 +1557,38 @@ WORKFLOW_FORBIDDEN_KEYS = ("pull_request_target", "continue-on-error", "paths", 
 WORKFLOW_RUN_LINES = ("run: python3 scripts/check-claude-md-size.py",
                       "run: python3 scripts/check-claude-md-size.py --self-test")
 WORKFLOW_PR_TYPES = ("opened", "synchronize", "reopened")
+# R4 (#4507): the checkout action every CLAUDE.md workflow uses, pinned to ONE sha (the repo-wide pin), so a
+# fork-network impostor commit of the same action cannot pass as "a 40-hex sha".
+CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262"
+# R4 (#4507): the guard workflow is pinned to its canonical form WITH indentation (comments and blank lines
+# dropped). The heuristic checks below name the class of a change; this pin refuses every change they miss
+# (a pinned ref or repository on checkout, a third-party action, a label, a block-scalar run line).
+WORKFLOW_CANONICAL_LINES = (
+    'name: CLAUDE.md guard',
+    'on:',
+    '  push:',
+    '    branches: [main, develop, "release/**", "rehearsal/**"]',
+    '  pull_request:',
+    '    branches: [main, develop, "release/**", "rehearsal/**"]',
+    '  merge_group:',
+    '    types: [checks_requested]',
+    'permissions:',
+    '  contents: read',
+    'concurrency:',
+    '  group: claude-md-guard-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}',
+    '  cancel-in-progress: true',
+    'jobs:',
+    '  guard:',
+    '    name: CLAUDE.md rule-section guard',
+    '    runs-on: ubuntu-latest',
+    '    timeout-minutes: 5',
+    '    steps:',
+    '      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+    '      - name: Guard the tracked CLAUDE.md and its reference files',
+    '        run: python3 scripts/check-claude-md-size.py',
+    '      - name: Guard self-test',
+    '        run: python3 scripts/check-claude-md-size.py --self-test',
+)
 
 
 def workflow_blocks(lines: list) -> dict:
@@ -1640,6 +1672,11 @@ def workflow_errors(path: Path, label: str = WORKFLOW_PATH) -> list:
     for required in WORKFLOW_RUN_LINES:
         if required not in stripped_lines:
             errors.append(f"FAIL: {label} is missing the step `{required}` (check-claude-md-size.py) (#4507 R3-F4)")
+    if lines != list(WORKFLOW_CANONICAL_LINES):
+        first = next((n for n, (got, want) in enumerate(zip(lines, WORKFLOW_CANONICAL_LINES), 1) if got != want),
+                     min(len(lines), len(WORKFLOW_CANONICAL_LINES)) + 1)
+        errors.append(f"FAIL: {label} differs from the pinned form (WORKFLOW_CANONICAL_LINES) at meaningful line "
+                      f"{first}; indentation counts (#4507 R4)")
     return errors
 
 
@@ -1838,6 +1875,34 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
         "        if: false\n        run: python3 scripts/check-claude-md-size.py\n", 1), "if")
     ok &= case("R3-F4 env override", good.replace(
         "    timeout-minutes: 5", "    timeout-minutes: 5\n    env:\n      PYTHONPATH: /x", 1), "env")
+    ok &= case("R4 checkout pinned to a fixed ref", good.replace(
+        "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n",
+        "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n        with:\n          ref: 0000000000000000000000000000000000000000\n", 1),
+        "pinned form")
+    ok &= case("R4 run line swallowed in a block scalar", good.replace(
+        "        run: python3 scripts/check-claude-md-size.py\n",
+        "        run: |\n          python3 scripts/check-claude-md-size.py ||\n          true\n", 1), "pinned form")
+    ok &= case("R4 runner label changed", good.replace("runs-on: ubuntu-latest", "runs-on: no-such-runner", 1),
+               "pinned form")
+    uses = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n"
+    ok &= case("R5 checkout repository set", good.replace(
+        uses, uses + "        with:\n          repository: someone/else\n", 1), "pinned form")
+    ok &= case("R5 third-party checkout action pinned by sha", good.replace(
+        "actions/checkout@", "someone-else/checkout@", 1), "pinned form")
+    ok &= case("R5 guard run line moved into a step name", good.replace(
+        "      - name: Guard the tracked CLAUDE.md and its reference files\n        run: python3 scripts/check-claude-md-size.py\n",
+        "      - name: run: python3 scripts/check-claude-md-size.py\n        run: true\n", 1), "pinned form")
+    ok &= case("R5 step indentation shifted", good.replace(
+        "        run: python3 scripts/check-claude-md-size.py --self-test\n",
+        "          run: python3 scripts/check-claude-md-size.py --self-test\n", 1), "pinned form")
+    ok &= case("R5 timeout raised", good.replace("timeout-minutes: 5", "timeout-minutes: 500", 1), "pinned form")
+    ok &= case("R5 concurrency cancel switched off", good.replace(
+        "cancel-in-progress: true", "cancel-in-progress: false", 1), "pinned form")
+    commented = good.replace("jobs:\n", "jobs:\n\n  # a comment and a blank line change nothing\n", 1)
+    (wf / "w.yml").write_text(commented, encoding="utf-8")
+    if workflow_errors(wf / "w.yml", "R5 comment-only edit"):
+        print("FAIL: self-test - a comment-only edit of the guard workflow was refused", file=sys.stderr)
+        ok = False
     ok &= case("R3-F4 pull_request types closed only", good.replace(
         '  pull_request:\n', '  pull_request:\n    types: [closed]\n', 1), "types")
     missing = wf / "absent.yml"
