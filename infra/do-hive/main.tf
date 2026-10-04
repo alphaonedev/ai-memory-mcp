@@ -202,8 +202,8 @@ variable "ai_memory_image_url" {
   default     = ""
 
   validation {
-    condition     = var.ai_memory_image_url == "" || (startswith(var.ai_memory_image_url, "https://") && length(var.ai_memory_image_url) > length("https://") && !strcontains(var.ai_memory_image_url, "%") && !strcontains(lower(var.ai_memory_image_url), "/releases/latest") && can(regex("^https://[A-Za-z0-9][A-Za-z0-9._~/-]*$", var.ai_memory_image_url)))
-    error_message = "ai_memory_image_url must be empty or a non-empty https:// URL of a versioned release, with no percent-encoding or shell metacharacters (only letters, digits and ._~/- after https://); /releases/latest moves (in any letter case) and would not match ai_memory_image_sha256."
+    condition     = var.ai_memory_image_url == "" || (startswith(var.ai_memory_image_url, "https://") && length(var.ai_memory_image_url) > length("https://") && !strcontains(var.ai_memory_image_url, "%") && !strcontains(lower(var.ai_memory_image_url), "/releases/latest") && !can(regex("//|/\\.\\.?(/|$)", trimprefix(var.ai_memory_image_url, "https://"))) && can(regex("^https://[A-Za-z0-9][A-Za-z0-9._~/-]*$", var.ai_memory_image_url)))
+    error_message = "ai_memory_image_url must be empty or a non-empty https:// URL of a versioned release, with no percent-encoding or shell metacharacters (only letters, digits and ._~/- after https://); /releases/latest moves (in any letter case, and an empty, . or .. path segment is refused because curl resolves it) and would not match ai_memory_image_sha256."
   }
 }
 

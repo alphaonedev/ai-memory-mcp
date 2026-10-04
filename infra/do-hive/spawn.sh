@@ -97,6 +97,13 @@ require_image_pin() {
     echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_url must be a versioned release URL; releases/latest moves and would not match the pinned digest." >&2
     exit 2
   fi
+  # curl removes dot segments before the request, so /releases/./latest and
+  # /releases/x/../latest fetch releases/latest; an empty segment is refused too.
+  local path="/${TF_VAR_ai_memory_image_url#https://}/"
+  if [[ "$path" == *//* || "$path" == */./* || "$path" == */../* ]] && [[ -n "${TF_VAR_ai_memory_image_url:-}" ]]; then
+    echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_url must not contain an empty, . or .. path segment (curl resolves them, so the URL would not name the pinned artifact)." >&2
+    exit 2
+  fi
   if [[ -n "${TF_VAR_ai_memory_image_url:-}" ]] && ! [[ "${TF_VAR_ai_memory_image_url}" =~ ^https://[A-Za-z0-9][A-Za-z0-9._~/-]*$ ]]; then
     echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_url must be https:// followed only by letters, digits and ._~/- (it is written into a root-run script)." >&2
     exit 2
