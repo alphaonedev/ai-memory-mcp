@@ -2961,6 +2961,8 @@ See CURRENT_SCHEMA_VERSION<p>
 <p>a v0.8.x DB steps `v40 -> v52` on boot.</p>
 <p>a v0.8.x DB steps `v40 ->
 v52` on boot.</p>
+<p>See CURRENT_SCHEMA_VERSION
+</p>52 tools ship here.
 R4HTML
     # #5196: every block tag, opening and closing, stops the look-back; every inline or
     # in-row tag does not. One triple per tag (subject, tag-only line, value). block-fixture.html
@@ -3067,7 +3069,8 @@ R4HTML
         'docs/postgres-age-guide.md:77 ' \
         'docs/postgres-age-guide.md:81 ' \
         'docs/postgres-age-guide.md:82 ' \
-        'docs/schema-fixture.html:96 '
+        'docs/schema-fixture.html:96 ' \
+        'docs/schema-fixture.html:98 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     grep -qF 'STALE entry' <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - a ledger entry reported STALE although its line is present" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -3084,6 +3087,7 @@ R4HTML
     echo "PASS: self-test #5387 - a markdown transition with markers on BOTH versions wrapped across a line break (steps **v40** -> / **v52**): planted 52 REJECTED, 53 ACCEPTED; pins the fold of the continuation line"
     echo "PASS: self-test #5390 - a ledger needle with BOTH a doubled space and a marker stays exempt (the whitespace fold runs before the marker fold); no STALE row"
     echo "PASS: self-test #5388 - html literal backticks wrapped across a line break are NOT joined (the marker fold of the join is markdown-only)"
+    echo "PASS: self-test #5389 - a line that OPENS with a closing block tag (</p>52 tools) does not join the previous line's identifier"
     echo "PASS: self-test #5261/#5338 - markdown steps anchor wrapped in bold, a code span or underscore emphasis (steps **v40 -> v52**, a backtick span, _v40 -> v52_, __v40 -> v52__): planted 52 REJECTED, 53 ACCEPTED; an identifier with an inner underscore (v4_0) is not rewritten by the fold"
     echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5196 - the look-back bound is pinned both ways: 3 inline tag-only lines join (52 REJECTED), 4 do not"
