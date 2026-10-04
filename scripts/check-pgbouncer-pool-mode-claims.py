@@ -873,6 +873,8 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("soft hyphen in the mode word", "docs/a.md", "Run PgBouncer in trans\u00adaction mode.\n"),
     ("soft hyphen in a pooling claim with no product word (#5211)", "docs/a.md", "Use tr\u00adansaction pooling.\n"),
     ("zero-width inside the key, nothing else non-ASCII (#5211)", "docs/a.md", "pool_mo\u200bde = transaction\n"),
+    # round 6 (#5089): format characters hide the mode word AND the pool word, so only shadow's Cf drop sees it
+    ("soft hyphens in the mode word and the pool word (#5089)", "docs/a.md", "Use tr\u00adansaction po\u00adoling.\n"),
     # round 5 (#4741 closed world): the value is a variable, a default elsewhere or a template, never the literal session
     ("R8 terraform variable named pgb_mode (default on another line)", "deploy/main.tf", "variable \"pgb_mode\" {\n  type = string\n}\n"),
     ("R8 prefixed key set to a variable", "deploy/main.tf", "pgb_mode = var.pooler_choice\n"),
@@ -1283,6 +1285,7 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("F1 skip list path listed once", 'if " " in line or problem or line in listed:', 'if " " in line or problem:'),
     ("A1 distinct-word floor", "MIN_DISTINCT_WORDS = 5", "MIN_DISTINCT_WORDS = 1"),
     ("U3 look-alike table", ".translate(CONFUSABLE)", ""),
+    ("U3 shadow drops format characters (#5089)", 'if unicodedata.category(c) not in ("Cf", "Mn")', 'if unicodedata.category(c) not in ("Mn",)'),
     ("R5 context line shadow view (#5211)", "(not text.isascii() and OTHER_MODE.search(shadow(text)))", "False"),
     ('H skip list decode error is a fault', '    except (OSError, UnicodeDecodeError) as exc:  # R5: a decode error is a FAULT (rc 2), not a traceback\n        return {}, [', '    except OSError as exc:  # R5: a decode error is a FAULT (rc 2), not a traceback\n        return {}, ['),
     ('H allowlist decode error is a fault', '    except (OSError, UnicodeDecodeError) as exc:\n        return [], ["%s: unreadable', '    except OSError as exc:\n        return [], ["%s: unreadable'),
