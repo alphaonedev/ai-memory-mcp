@@ -165,7 +165,7 @@ def approvals(repo: Path, base_sha: str, head_sha: str) -> list:
 def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: Path, index_pins=None):
     """Return (report_text, failed). Raises RuntimeError for a fail-closed precondition."""
     for sha in (base_sha, head_sha):
-        if not SHA.match(sha):
+        if not SHA.fullmatch(sha):
             raise RuntimeError(f"{sha!r} is not a 40-hex commit id")
     guard = load_base_guard(base_root)
     head_root = scratch / "head"
@@ -512,6 +512,49 @@ def self_test() -> int:
         (root / GUARD_REL).unlink()
 
     case("a missing base guard fails closed", missing_manifest, True, "cannot stat base guard", base_mutate=drop_guard)
+
+    def fresh_pair(name):
+        work = base_dir / name
+        base_sha = make_repo(guard, work / "repo")
+        base_root = work / "baseroot"
+        shutil.copytree(work / "repo", base_root, ignore=shutil.ignore_patterns(".git"))
+        shutil.copyfile(guard_path, base_root / GUARD_REL)
+        return work, base_sha, base_root
+
+    def refused(label, base_root, repo, base_sha, head_sha, scratch, needle):
+        try:
+            compare(base_root, repo, base_sha, head_sha, scratch, guard.fixture_index_pins())
+        except RuntimeError as exc:
+            if needle in str(exc):
+                print(f"PASS: self-test - {label}")
+                return
+            print(f"FAIL: self-test - {label}: refused with {exc} (wanted {needle!r})", file=sys.stderr)
+        else:
+            print(f"FAIL: self-test - {label}: not refused", file=sys.stderr)
+        failures.append(label)
+
+    work, base_sha, base_root = fresh_pair("sym")
+    refused("R4 a symbolic ref instead of a commit id fails closed", base_root, work / "repo", "HEAD", base_sha,
+            work / "scratch", "40-hex")
+    refused("R5 an abbreviated commit id fails closed", base_root, work / "repo", base_sha, base_sha[:12],
+            work / "scratch", "40-hex")
+    refused("R5 an upper-case commit id fails closed", base_root, work / "repo", base_sha, base_sha.upper(),
+            work / "scratch", "40-hex")
+    refused("R5 a commit id with a trailing newline fails closed", base_root, work / "repo", base_sha,
+            base_sha + "\n", work / "scratch", "40-hex")
+
+    for label, body, want in (
+            ("no backticks keep the plain three-backtick fence", "plain text", "```diff"),
+            ("a three-backtick run gets a four-backtick fence", "a\n```\nb", "````diff"),
+            ("a five-backtick run gets a six-backtick fence", "a\n`````\nb", "``````diff"),
+            ("a tilde run does not lengthen the backtick fence", "~~~~~~~~\nb", "```diff")):
+        got = fenced(body)
+        closes = got[2]
+        if got[0] != want or closes != want[:-len("diff")] or got[1] != body:
+            print(f"FAIL: self-test - R5 fenced(): {label}: {got!r}", file=sys.stderr)
+            failures.append(label)
+        else:
+            print(f"PASS: self-test - R5 fenced(): {label}")
 
     shutil.rmtree(base_dir, ignore_errors=True)
     if failures:
