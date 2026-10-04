@@ -329,6 +329,51 @@ MDEOF
         'See <code>src/mcp/tools/recall.rs::RecallTool</code> here.'
     anchor_green 5191 "an unbackticked URL path segment is not an anchor" \
         'See https://example.com/x/src/mcp/tools/recall.rs::no_such for it.'
+    # #5342: a generic group with commas, spaces, quotes or parentheses is
+    # still ONE balanced group; the type and the method are both checked.
+    R=src/mcp/tools/recall.rs
+    anchor_red 5342 QUAL "a missing type with two generic arguments" \
+        "See \`$R::NoSuch<T, U>\` here."
+    anchor_red 5342 BARE_QUAL "an unbackticked missing type with two generic arguments" \
+        "See $R::NoSuch<T, U> here."
+    anchor_red 5342 QUAL "a missing type with two generic arguments, no space" \
+        "See \`$R::NoSuch<T,U>\` here."
+    anchor_red 5342 QUAL "a removed method after a lifetime and a type argument" \
+        "See \`$R::RecallTool<'a, T>::no_such\`."
+    anchor_red 5342 QUAL "a removed method after a lifetime argument" \
+        "See \`$R::RecallTool<'a>::no_such\`."
+    anchor_red 5342 QUAL "a removed method after a reference argument" \
+        "See \`$R::RecallTool<&str>::no_such\`."
+    anchor_red 5342 QUAL "a removed method after a dyn Fn argument" \
+        "See \`$R::RecallTool<dyn Fn(u8)>::no_such\`."
+    anchor_red 5342 BARE_QUAL "an unbackticked removed method after two generic arguments" \
+        "See $R::RecallTool<T, U>::no_such here."
+    anchor_red 5342 QUAL "a missing leading type of a <Type as Trait> path" \
+        "See \`$R::<NoSuch as Trait>::decorate_memory_many\`."
+    anchor_red 5342 QUAL "a removed method of a <Type as Trait> path" \
+        "See \`$R::<RecallTool as Trait>::no_such\`."
+    anchor_red 5342 QUAL "a removed method after HTML-entity generics" \
+        "See \`$R::RecallTool&lt;T&gt;::no_such\`."
+    anchor_red 5342 QUAL "a brace item with a two-argument generic and a removed method" \
+        "See \`$R::{RecallTool<T, U>::no_such, RecallTool}\`."
+    anchor_red 5342 QUAL "an unbalanced generic group on a missing type" \
+        "See \`$R::NoSuch<T\`."
+    anchor_green 5342 "a live method after a two-argument generic" \
+        "See \`$R::RecallTool<T, U>::decorate_memory_many\`."
+    anchor_green 5342 "a live method after a lifetime and a type argument" \
+        "See \`$R::RecallTool<'a, T>::decorate_memory_many\`."
+    anchor_green 5342 "a live method after a dyn Fn argument" \
+        "See \`$R::RecallTool<dyn Fn(u8)>::decorate_memory_many\`."
+    anchor_green 5342 "a live type with two generic arguments" \
+        "See \`$R::RecallTool<T, U>\` for it."
+    anchor_green 5342 "a live <Type as Trait> path" \
+        "See \`$R::<RecallTool as Trait>::decorate_memory_many\`."
+    anchor_green 5342 "a live method after HTML-entity generics" \
+        "See \`$R::RecallTool&lt;T&gt;::decorate_memory_many\`."
+    anchor_green 5342 "a brace list of live items, one with two generic arguments" \
+        "See \`$R::{RecallTool<T, U>, decorate_memory_many}\`."
+    anchor_green 5342 "a live symbol followed by a parenthesised aside" \
+        "See $R::RecallTool (a unit struct) here."
 
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
@@ -764,14 +809,25 @@ BARE_LN = re.compile(r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs):(\d+)")
 # PIN_TARGET below is the single owner of that pin rule (#5214).
 LABEL_MD = re.compile(r"^[^\]\n]*\]\(([^)\s]*)")
 LABEL_HTML = re.compile(r"^[^<\n]*</a>")
+# #5342: the symbol after `::` is path components, each optionally followed
+# by ONE balanced generic group (one nesting level; commas, spaces, quotes,
+# `&` and parentheses inside it are fine: `<T, U>`, `<'a>`, `<dyn Fn(u8)>`),
+# with an optional leading `<Type as Trait>`. A group may be written with HTML
+# entities (`&lt;T&gt;`). The old character class stopped at the first comma
+# or space and left an unbalanced `Name<T` that was skipped, hiding a missing
+# type.
+_G = (r"(?:<[^<>`\n]*(?:<[^<>`\n]*>[^<>`\n]*)*>"
+      r"|&lt;(?:(?!&gt;)[^`\n])*&gt;)")
+_ID = r"[A-Za-z_][A-Za-z0-9_]*"
+SYM = r"(?:" + _G + r"::)?" + _ID + _G + r"?(?:::(?:" + _ID + _G + r"?|" + _G + r"))*"
 QUAL = re.compile(
-    r"`(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_:<>]*))")
+    r"`(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|(" + SYM + r"))")
 # #5191: an UNBACKTICKED `src/x.rs::symbol` anchor (prose, an HTML code
 # element, a code-block comment) is a symbol claim too, and is the very form
 # the BARE_LN failure text tells authors to use. Same lookbehind as BARE_LN,
 # so a URL path segment is never matched.
 BARE_QUAL = re.compile(
-    r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_:<>]*))")
+    r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|(" + SYM + r"))")
 MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(([^)]*src/[A-Za-z0-9_/]+\.rs)[^)]*\)")
 # #5190: ANY relative markdown link to a src/ file, whatever its label
 # (MDLINK only sees a backticked-identifier label). canon() has already
@@ -790,6 +846,28 @@ HREF = re.compile(r"\bhref=[\"'](src/[A-Za-z0-9_/]+\.rs)(#[^\"'\s]*)?[\"']")
 LINEFRAG = re.compile(r"^#L(\d+)(?:C\d+)?(?:-L?(\d+)(?:C\d+)?)?$")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 GENERICS = re.compile(r"<[^<>]*>")
+SELF_TYPE = re.compile(r"^<\s*(" + _ID + r")[^<>]*?\bas\b[^<>]*>")
+
+
+def split_items(raw):
+    """Split a qualified-anchor payload into symbol tokens at commas and
+    whitespace that are NOT inside a generic group (`{A<T, U>::m, B}` is two
+    items, not four)."""
+    items, cur, depth = [], "", 0
+    for ch in raw.replace("&lt;", "<").replace("&gt;", ">"):
+        if ch == "<":
+            depth += 1
+        elif ch == ">" and depth > 0:
+            depth -= 1
+        if depth == 0 and (ch == "," or ch.isspace()):
+            if cur:
+                items.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur:
+        items.append(cur)
+    return items
 
 # A line that DELIBERATELY names a path as absent is not a stale anchor.
 # CLAUDE.md's worktree pre-flight literally asserts `test ! -f
@@ -918,13 +996,21 @@ for doc in seen_docs:
                 # absence-wording exemption never applies to it.
                 emit("PATH", doc, ln, f, ctx)
                 continue
-            for tok in raw.replace(",", " ").split():
-                # #5255: `Type<T>::method` checks BOTH components; generic
-                # arguments (and a stray closing tag) are not symbol claims.
+            for tok in split_items(raw):
+                # #5255/#5342: `Type<T, U>::method` checks BOTH components;
+                # generic arguments are not symbol claims. `<Type as
+                # Trait>::m` checks `Type` and `m`.
+                tok = tok.replace("&lt;", "<").replace("&gt;", ">")
+                tok = SELF_TYPE.sub(r"\1", tok)
                 prev = None
                 while prev != tok:
                     prev, tok = tok, GENERICS.sub("", tok)
                 tok = tok.strip().rstrip("(){}[]<>.,;")
+                if "<" in tok or ">" in tok:
+                    # An unbalanced group cannot be resolved: report it
+                    # rather than skip a component that may be missing.
+                    emit(rule, doc, ln, f"{f}::{tok}".replace(" ", ""), ctx)
+                    continue
                 if not tok:
                     continue
                 for part in tok.split("::"):
