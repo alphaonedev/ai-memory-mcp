@@ -18,7 +18,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 TPL = ROOT / "infra/do-hive/cloud-init-memory.yaml.tpl"
 FED = ROOT / "infra/do-hive/federate.sh"
 SPAWN = ROOT / "infra/do-hive/spawn.sh"
-SECRET = "s3cr3t-r4-0123456789abcdef"
+# 64 lowercase hex: the shape the sites now require before building a curl config line.
+SECRET = "5ec4e7" + "0123456789abcdef" * 3 + "a1b2c3d4e5"
 FAILS = []
 
 

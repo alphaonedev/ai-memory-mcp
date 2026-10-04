@@ -250,7 +250,8 @@ node_sh() { ssh $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
 # loopback mTLS listener, using the node's own cert + its own api key.
 node_get() {
   node_sh "$1" <<EOS 2>/dev/null
-printf 'header = "x-api-key: %s"\\n' "\$(cat /etc/ai-memory/api-key)" | curl -sS --max-time 15 --config - \\
+K=\$(cat /etc/ai-memory/api-key); [[ "\$K" =~ ^[0-9a-f]{64}\$ ]] || exit 3
+printf 'header = "x-api-key: %s"\\n' "\$K" | curl -sS --max-time 15 --config - \\
   --cacert /etc/ai-memory/fed/ca.crt \\
   --cert /etc/ai-memory/fed/node.crt --key /etc/ai-memory/fed/node.key \\
   -H 'x-agent-id: $AUTHOR_ID' \\
@@ -263,7 +264,8 @@ EOS
 node_post() {
   node_sh "$1" <<EOS 2>/dev/null
 BODY=\$(printf '%s' '$2' | base64 -d)
-printf 'header = "x-api-key: %s"\\n' "\$(cat /etc/ai-memory/api-key)" | curl -sS --max-time 30 --config - \\
+K=\$(cat /etc/ai-memory/api-key); [[ "\$K" =~ ^[0-9a-f]{64}\$ ]] || exit 3
+printf 'header = "x-api-key: %s"\\n' "\$K" | curl -sS --max-time 30 --config - \\
   --cacert /etc/ai-memory/fed/ca.crt \\
   --cert /etc/ai-memory/fed/node.crt --key /etc/ai-memory/fed/node.key \\
   -H 'content-type: application/json' \\
@@ -330,6 +332,11 @@ EOS
   # key) + enrolled client cert. Header trust is OFF on the droplet, so the
   # same request under a non-allowlisted name must be refused (403).
   api_key="$(on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' 2>/dev/null || true)"
+  # The key is node-supplied and becomes a curl config line on THIS host: only the
+  # minted 64-hex form can carry no quote or newline, so refuse anything else.
+  if [ -n "$api_key" ] && ! [[ "$api_key" =~ ^[0-9a-f]{64}$ ]]; then
+    die "node api key is not 64 lowercase hex; refusing to build a curl config from it"
+  fi
   if [ -n "$api_key" ]; then
     probe="ai:verify-probe-$(date -u +%s)"
     lg_curl() { printf 'header = "X-API-Key: %s"\n' "$api_key" | curl -sS --max-time 15 --config - --cacert "$OUT_DIR/ca.crt" --cert "$OUT_DIR/hive-loadgen-f2.crt" --key "$OUT_DIR/hive-loadgen-f2.key" "$@"; }

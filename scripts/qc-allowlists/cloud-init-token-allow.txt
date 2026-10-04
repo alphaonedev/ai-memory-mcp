@@ -237,6 +237,7 @@ do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | fi
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | chown root:aimemory /etc/ai-memory/api-key
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | chmod 0640 /etc/ai-memory/api-key
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | API_KEY="$(cat /etc/ai-memory/api-key)"
+do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | [[ "$API_KEY" =~ ^[0-9a-f]{64}$ ]] || fail "/etc/ai-memory/api-key is not 64 lowercase hex"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | DAEMON_CFG_DIR=/var/lib/ai-memory/.config/ai-memory
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | ( umask 077
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | runuser -u aimemory -- mkdir -p "$DAEMON_CFG_DIR" \ && printf 'schema_version = 2\napi_key = "%s"\n\n[admin]\nagent_ids = ["%s"]\n' "$API_KEY" "$ADMIN_ID" \ | runuser -u aimemory -- tee "$DAEMON_CFG_DIR/config.toml.new" >/dev/null \ && runuser -u aimemory -- mv -f "$DAEMON_CFG_DIR/config.toml.new" "$DAEMON_CFG_DIR/config.toml"
