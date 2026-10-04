@@ -289,8 +289,11 @@ jobs:
         # permalink label (green control). #4699-#4716 and #5188-#5191:
         # the ./ ../ // and src-escape path forms, :0 / reversed / en-dash
         # line ranges, unbackticked path::symbol, and the file and #L
-        # fragment of a relative link. Both allowlist directions are
-        # exercised, and an empty src/ tree must fail CLOSED rather than
+        # fragment of a relative link, a titled link, a reference
+        # definition and an HTML href (#5264-#5269, #5255), the dash-with-
+        # spaces and #L column ranges, Type<T>::method, and the rule that
+        # wording naming a destination exempts only what precedes it. Both
+        # allowlist directions are exercised, and an empty src/ tree must fail CLOSED rather than
         # green a no-op.
         run: bash scripts/check-doc-symbol-anchors.sh --self-test
 
