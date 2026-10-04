@@ -601,7 +601,7 @@ ANCHORS = [
     # index.html upgrade paragraph: "steps up to v100 on the first ..." and
     # "a v0.8.x DB steps v70 -> v100" (tag-stripped, entity-decoded).
     re.compile(r'\bv([0-9]+) on the first ai-memory serve after the upgrade'),
-    re.compile(r'\bsteps v[0-9]+\s*(?:→|->)\s*v([0-9]+)'),
+    re.compile(r'\bsteps\s+v[0-9]+\s*(?:→|->)\s*v([0-9]+)'),
     # CONFIG_SCHEMA postgres row: | ai-memory postgres schema | **v93** |
     re.compile(r'ai-memory postgres schema *\| *\*\*v([0-9]+)\*\*'),
     # schema.html phrasings.
@@ -2750,6 +2750,10 @@ a v0.8.x DB steps v40->v53 on boot.
 probe: `CURRENT_SCHEMA_VERSION` is
 
 v52 was the schema before #2555.
+a v0.8.x DB steps  v40 → v52 on boot.
+a v0.8.x DB steps  v40 → v53 on boot.
+a v0.8.x DB steps	v40 → v52 on boot.
+a v0.8.x DB steps	v40 → v53 on boot.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2819,6 +2823,8 @@ R4HTML
         'docs/postgres-age-guide.md:29 claims "52"' \
         'docs/schema-fixture.html:21 claims "52"' \
         'docs/postgres-age-guide.md:32 claims "52"' \
+        'docs/postgres-age-guide.md:37 claims "52"' \
+        'docs/postgres-age-guide.md:39 claims "52"' \
         'docs/schema-fixture.html:25 claims "52"' \
         'docs/schema-fixture.html:31 claims "52"'
     do grep -qF "$_want" <<<"$r4_out" || { echo "FAIL: self-test #3248 r4 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
@@ -2836,12 +2842,14 @@ R4HTML
         'docs/postgres-age-guide.md:27 ' 'docs/postgres-age-guide.md:31 ' 'docs/schema-fixture.html:24 ' \
         'docs/postgres-age-guide.md:33 ' 'docs/schema-fixture.html:26 ' \
         'docs/postgres-age-guide.md:36 ' 'docs/schema-fixture.html:36 ' \
-        'docs/schema-fixture.html:42 '
+        'docs/schema-fixture.html:42 ' \
+        'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5026/#5080 - anchor wrapped across two lines (steps / v40 -> v52) and identifier value more than 60 chars after the identifier: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #4511-R5 - wrapped claim with an issue ref / release triple in the subject tail, whitespace at the wrap point, and a tag-only middle line: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5140 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #4511-R6 - html look-back skips up to 3 tag-only lines (52 REJECTED, 53 ACCEPTED), stops past 3, and markdown never looks back past a blank line"
     echo "PASS: self-test #4851 - compact json schema_version:52 REJECTED, :53 ACCEPTED"
     echo "PASS: self-test #4852 - issue ref / release triple between identifier and value: planted 52 REJECTED, 53 ACCEPTED"
