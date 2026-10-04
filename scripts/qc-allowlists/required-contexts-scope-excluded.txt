@@ -1,0 +1,17 @@
+# required-contexts-scope-excluded.txt - the dated rule (f) SCOPE exclusion
+# ledger (#5331), read by `scripts/check-required-contexts.sh`.
+#
+# Rule (f) scope is DERIVED from workflow triggers: every workflow that
+# triggers on `pull_request`, `pull_request_target` or `merge_group` is in
+# scope. A workflow leaves scope ONLY by a row here. Empty is the passing state.
+#
+# FORMAT
+#   <workflow-file> <YYYY-MM-DD> #<issue> <note>
+#
+# Date and tracking issue are mandatory and format-checked. A row that names a
+# workflow that does not exist, or that no longer triggers on a pull request,
+# HARD-FAILS (stale), as does a malformed row. A workflow that carries a
+# mirrored required context cannot be excluded. A line whose first non-space
+# character is `#` is a comment.
+#
+# ---------------------------------------------------------------------------
