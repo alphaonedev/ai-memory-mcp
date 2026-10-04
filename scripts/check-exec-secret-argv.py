@@ -149,7 +149,7 @@ FLAG_RE = re.compile(r"(?<![\w$./\-])--?([A-Za-z][A-Za-z0-9_\-]*)")
 HEADER_RE = re.compile(
     r"\bauthorization\s*:|\bbearer\b|\bx-auth[\w-]*\s*:|\bproxy-authorization|\bapi[-_]?key\b|"
     r"\bpassword\s+['\"$\\]|\bidentified\s+by\b|\$\{\{\s*(?:secrets\.|github\.token|toJSON\(\s*secrets)|"
-    r"(?:(?<![\w-])-[A-Za-z]*H|--(?:proxy-)?header)[\s=]*[\"']?[\w-]*(?:token|secret|passw\w*|credential|cookie|"
+    r"(?:(?<![\w-])-[A-Za-z]*H|--(?:proxy-)?header)[\s=]*\\?[\"']?[\w-]*(?:token|secret|passw\w*|credential|cookie|"
     r"api[-_]?key)[\w-]*\s*:|"
     r"\bcookie\s*:", re.I)
 # A command substitution that reads a secret file or runs a secret-printing command puts the
@@ -561,8 +561,9 @@ CRED_TOOL_RE = re.compile(
     # --password-stdin is the safe form and is not matched (#4994)
     r"|\b(?:docker|podman)\s+login\b[^|;&]*\s(?:-p|--password)(?![\w-])"
     # a credential header in any letter case (#4997), after a combined short flag or --header=
-    # (#4993), whose value expands a variable inside or after its quotes (#4891 round 3)
-    r"|(?:(?<![\w-])-[A-Za-z]*H|--(?:proxy-)?header)[\s=]*[\"']?"
+    # (#4993), whose value expands a variable inside or after its quotes (#4891 round 3); a backslash
+    # before a quote is the ssh, sh -c and CMD-SHELL payload shape (#5294)
+    r"|(?:(?<![\w-])-[A-Za-z]*H|--(?:proxy-)?header)[\s=]*\\?[\"']?"
     r"(?i:x-api-key|authorization|proxy-authorization|x-auth-token)\s*:"
     r"[^\"'$]*(?:[\"'](?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?)?\$")
 
@@ -1340,6 +1341,9 @@ ROUND3_RED = [
     ("curl -H tab before colon", 'curl -H "X-Auth-Token\t: $X" h'),
     ("curl -sSH partly quoted", "curl -sSH 'Authorization: Bearer '\"$X\" h"),
     ("wget --header= Authorization", 'wget --header="Authorization: token $X" h'),
+    ("ssh payload escaped quotes, Authorization", 'ssh h "curl -H \\"Authorization: Bearer $X\\" https://h/"'),
+    ("ssh payload escaped quotes, combined flags", 'ssh h "curl -sH \\"X-API-Key: $X\\" https://h/"'),
+    ("sh -c payload escaped quotes", 'sh -c "curl --header=\\"Authorization: token $X\\" h"'),
     ("curl --proxy-header", 'curl --proxy-header "Proxy-Authorization: Basic $X" h'),
 ]
 ROUND3_GREEN = [
@@ -1353,6 +1357,7 @@ ROUND3_GREEN = [
     ("curl body from stdin", 'curl --data @- https://h/ < "$TOKEN_FILE"'),
     ("curl config from stdin", 'curl -K - https://h/ < "$TOKEN_FILE"'),
     ("docker login --password-stdin", 'docker login -u u --password-stdin reg < "$TOKEN_FILE"'),
+    ("ssh payload non-credential header", 'ssh h "curl -sH \\"X-Request-Id: $REQ_ID\\" h"'),
     ("curl -sH non-credential header", 'curl -sH "X-Request-Id: $REQ_ID" h'),
     ("sort -u after curl", 'curl -o "$OUT" h && sort -u "$TOKEN_FILE"'),
     ("curl --cert-type is not --cert", 'curl --cert-type=P12:$CERT_TYPE -o "$TOKEN_FILE" h'),
