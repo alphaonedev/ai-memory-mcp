@@ -609,6 +609,24 @@ MDEOF
         'Formerly src/../missing_5266.rs::insert held it.'
     anchor_green 5266 "a plain escape token on a 'formerly' line" \
         'Formerly `src/../missing_5266.rs` held it.'
+    # #5346: every occurrence of an escape token is judged, and a link target
+    # is never an absence claim.
+    anchor_red 5346 PATH "a markdown link to an escape token on a 'formerly' line" \
+        'Formerly [h](src/../missing_5346.rs) held it.'
+    anchor_red 5346 PATH "an HTML href to an escape token on a 'formerly' line" \
+        'Formerly <a href="src/../missing_5346.rs">h</a> held it.'
+    anchor_red 5346 PATH "an angle-bracket link to an escape token on a 'formerly' line" \
+        'Formerly [h](<src/../missing_5346.rs>) held it.'
+    anchor_red 5346 PATH "a reference definition to an escape token on a 'formerly' line" \
+        $'Formerly:\n[h]: src/../missing_5346.rs'
+    anchor_red 5346 PATH "a plain mention then a link to the same escape token on a 'formerly' line" \
+        'Formerly `src/../missing_5346.rs` and see [h](src/../missing_5346.rs).'
+    anchor_red 5346 PATH "a plain mention then a qualified use of the same escape token" \
+        'Formerly `src/../missing_5346.rs` then `src/../missing_5346.rs::insert` too.'
+    anchor_red 5346 PATH "an unbackticked plain mention then a qualified use of the same escape token" \
+        'Formerly src/../missing_5346.rs then src/../missing_5346.rs::insert too.'
+    anchor_green 5346 "a plain escape token repeated on a 'formerly' line" \
+        'Formerly `src/../missing_5346.rs` and `src/../missing_5346.rs` held it.'
     anchor_green 5201 "a plain path with 'was split' wording" \
         'The old module `src/missing_5201.rs` was split by #1670.'
     anchor_green 5201 "a plain path with 'renamed to' wording" \
@@ -1006,6 +1024,10 @@ ABSENT_ASSERTION = re.compile(
 ABSENT_DEST = re.compile(
     r"\bsplit (?:(?:up )?into|out|across)\b|\brenamed to\b|(?:->|" + chr(0x2192) + r")(?=\s*`?(?:\.{0,2}/)*src/)",
     re.IGNORECASE)
+# #5346: text that ends right before a link destination: `](`, `](<`,
+# `href=`, `href="` or a reference definition `]:`.
+ESCAPE_LINK_HEAD = re.compile(
+    r"(?:\]\(<?|\b(?i:href)\s*=\s*[\"']?|\]:\s*<?)$")
 
 
 PIN_TARGET = re.compile(
@@ -1070,12 +1092,19 @@ for doc in seen_docs:
             """The absence exemption for an anchor starting at `pos`."""
             return absent_win or dest_next or any(pos < d for d in dest_at)
 
-        for tok in escapes:
-            at = max(line.find(tok), 0)
-            # A qualified escape token (`src/../x.rs::sym`) asserts the file
-            # exists, like every qualified anchor: never exempt (#5266).
-            if not absent_ok_at(at) or line.startswith(tok + "::", at):
-                emit("PATH", doc, ln, tok, ctx)
+        for tok in dict.fromkeys(escapes):
+            # #5346: judge EVERY occurrence of the token, not the first. A
+            # qualified occurrence (`src/../x.rs::sym`) asserts the file
+            # exists, like every qualified anchor (#5266), and a link target
+            # (`](tok)`, `href=tok`, `[h]: tok`) is never an absence claim,
+            # whatever wording is nearby: either one reports the token.
+            for tm in re.finditer(re.escape(tok), line):
+                at = tm.start()
+                if (not absent_ok_at(at)
+                        or line.startswith(tok + "::", at)
+                        or ESCAPE_LINK_HEAD.search(line[:at])):
+                    emit("PATH", doc, ln, tok, ctx)
+                    break
 
         for m in PATH.finditer(line):
             f = m.group(1)
