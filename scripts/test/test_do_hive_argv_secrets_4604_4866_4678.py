@@ -456,6 +456,39 @@ def failure_lines_4999():
             out = r.stdout
             probe("V1 %s failure line prints no raw node bytes" % var, 0 <= a < b and "NO " in out and "bytes:" in out and SECRET not in out
                   and longtok not in out and all(32 <= ord(c) < 127 for c in out.replace("\n", "")), out.strip()[:80])
+    # Each redaction rule on its own: the trigger sits inside the first 120 bytes and no other rule can
+    # mask it, so dropping or loosening any one rule is a FAIL line (a hostile reply padded past the cut
+    # tested only the cut).
+    rules = (("a 20-character token run", "", '{"t":"%s"}' % ("q7" * 10), "q7" * 10),
+             ("an upper-case token run", "", '{"t":"%s"}' % ("Q7" * 11), "q7" * 11),
+             ("an api_key value", "", '{"api_key":"x9z"}', "x9z"),
+             ("an Authorization value", "", '{"h":"Authorization: x9z"}', "x9z"),
+             ("a bearer value", "", '{"h":"bearer x9z"}', "x9z"),
+             ("a password value", "", '{"password":"x9z"}', "x9z"),
+             ("a passwd value", "", '{"passwd":"x9z"}', "x9z"),
+             ("a secret value", "", '{"secret":"x9z"}', "x9z"),
+             ("a token value", "", '{"token":"x9z"}', "x9z"),
+             ("a private value", "", '{"private":"x9z"}', "x9z"),
+             ("a PEM key header", "", "-----BEGIN EC KEY----- x9z", "x9z"),
+             ("the api key by value", "hunter2hunter", '{"k":"hunter2hunter"}', "hunter2hunter"))
+    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+        d = pathlib.Path(t)
+        for label, key, body, leak in rules:
+            (d / "body").write_text(body)
+            r = run_bash("api_key='%s'\n%s\nb=$(cat %s)\nsafe_excerpt \"$b\"\n" % (key, defs, d / "body"), d)
+            low = r.stdout.lower()
+            probe("V2 excerpt redacts %s" % label, bool(defs) and "bytes: " in low and leak.lower() not in low,
+                  r.stdout.strip()[:80])
+        # The hostile reply above is padded past the 120-byte window, so each filter is also probed with
+        # a short reply whose hostile part sits inside the window (otherwise truncation alone passes).
+        for label, raw, bad in (("control and non-ASCII bytes", "e:bad\\x1b[31m\\x01\\x07 \\xc3\\xa9\\xe2\\x82\\xac end", None),
+                                ("a token run", "t:" + longtok + " end", longtok[:20].lower()),
+                                ("a credential word value", "Authorization: Bearer short-tok", "short-tok")):
+            r = run_bash("api_key=''\n%s\nsafe_excerpt $'%s'\n" % (defs, raw), d)
+            o = r.stdout
+            probe("V1 short reply with %s is filtered inside the window" % label, bool(defs) and " bytes: " in o
+                  and all(32 <= b < 127 for b in o.encode("utf-8", "surrogateescape"))
+                  and (bad is None or bad not in o.lower()), repr(o[:80]))
     # No failure line in verify interpolates a node-derived value unsanitised.
     vi = fs.index("\nverify() {")
     raw = []
