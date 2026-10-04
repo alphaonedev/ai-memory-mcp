@@ -889,8 +889,9 @@ ai-memory curator --prune-reports --json
 # Idempotent and resumable; safe to re-run.
 ai-memory curator --prune-reports --apply
 
-# Postgres-backed store: the same collapse through the SAL trait.
-ai-memory curator --prune-reports --apply --store-url postgres://…
+# Postgres-backed store: the same collapse through the SAL trait. The DSN
+# comes from a 0600 file (or AI_MEMORY_STORE_URL), never argv (#4820/#4915).
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory curator --prune-reports --apply
 ```
 
 **Curator self-reports (#3345).** Each sweep writes one `Tier::Short` row to
@@ -1661,7 +1662,7 @@ Walks the `signed_events` cross-row hash chain end-to-end. Supports
 Idempotent schema bootstrap for a fresh SAL store by URL
 (`--store-url <URL>` or, to keep a password off argv, `AI_MEMORY_STORE_URL_FILE` /
 `AI_MEMORY_STORE_URL`, resolved FILE > ENV > flag as for `serve`:
-`src/cli/schema_init.rs:293`, `src/store_url.rs:137`; flags: `--json`, `--embedding-dim`). When
+`src/cli/schema_init.rs:312`, `src/store_url.rs:137`; flags: `--json`, `--embedding-dim`). When
 `--embedding-dim` is omitted it resolves from the SAME config-driven
 source the daemon uses to pick its embedder (the effective tier's
 embedder dim; 384 for the keyword / no-embedder case) — so `schema-init`
@@ -1941,7 +1942,7 @@ ai-memory quarantine list                          # what is currently held (ide
 ai-memory quarantine list --namespace team/eng     # narrow to one namespace
 ai-memory quarantine list --limit 500 --json       # bounded page, machine-readable
 ai-memory quarantine release <id>                  # release ONE quarantined row to open, or decontaminate ONE contaminated row (#3266 R2.5)
-ai-memory quarantine list --store-url postgres://… # same two verbs on the enterprise tier
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory quarantine list   # same two verbs on the enterprise tier (#4915)
 ```
 
 [#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948) writes an

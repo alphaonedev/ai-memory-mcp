@@ -467,7 +467,7 @@ Bootstrap a fresh postgres backend with:
 AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` resolves its URL exactly like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:293`, `src/store_url.rs:137`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
+`schema-init` resolves its URL exactly like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:312`, `src/store_url.rs:137`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
 
 Opening the store runs the idempotent `postgres_schema.sql` bootstrap
 plus the in-process upgrade ladder to schema v91 as a side effect. The
