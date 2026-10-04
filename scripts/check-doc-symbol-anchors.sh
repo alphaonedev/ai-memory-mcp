@@ -686,6 +686,15 @@ MDEOF
         '`src/missing_5344.rs` was renamed to `src/mcp/tools/recall.rs`.'
     anchor_green 5344 "a source path before 'split across'" \
         '`src/missing_5344.rs` was split across `src/mcp/tools/recall.rs`.'
+    # #5349: pins for the destination words (cloud M14 and M15 survived).
+    anchor_green 5349 "a source path before a unicode arrow" \
+        '`src/missing_5349.rs` → `src/mcp/tools/recall.rs`'
+    anchor_green 5349 "a source path before 'split out'" \
+        '`src/missing_5349.rs` split out `src/mcp/tools/recall.rs`.'
+    anchor_green 5349 "a source path on the line above a wrapped unicode arrow" \
+        $'The module `src/missing_5349.rs`\n→ `src/mcp/tools/recall.rs` now.'
+    anchor_red 5349 PATH "a plain path after a unicode arrow with no source before it" \
+        'Moved → `src/missing_5349.rs` today.'
     # #5341: an arrow that is not followed by a src/ path names no
     # destination, so the missing file before it is still a stale anchor.
     anchor_red 5341 PATH "a missing file before a Rust signature arrow" \
