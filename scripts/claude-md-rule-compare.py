@@ -11,8 +11,9 @@ The BASE guard (scripts/check-claude-md-size.py of the base checkout) and the BA
 
   * every rule section whose raw text no longer hashes to the BASE manifest (changed, added, removed) is
     written to the step summary with the section name and a unified diff, headed "RULE TEXT CHANGED";
-  * if the only differences are ASCII digit runs of the generated census inside the Prime directive
-    section (a number before its unit words), the heading is "COUNT CHANGED" instead;
+  * if the only differences are ASCII digit runs of the generated census (a number before its unit words)
+    inside a section whose heading starts with `## Prime directive` (the real heading carries a date), the
+    heading is "COUNT CHANGED" instead;
   * any OTHER error the base guard reports about the head copies (a lowered floor, a deleted pinned
     heading, a broken index) is "BASE GUARD REFUSES THE HEAD" and counts as a rule change;
   * a rule change fails the job unless a commit in base..head carries a trailer line
@@ -60,8 +61,9 @@ DATA_PATHS = ("CLAUDE.md", "docs/reference/ARCHITECTURE_REFERENCE.md", "docs/ref
 TRAILER = re.compile(r"^Rule-Change-Approved-By: (\S.*)$", re.MULTILINE)
 SHA = re.compile(r"^[0-9a-f]{40}$")
 # R4 (#4507): a digit is rule text (a vote size, a file threshold, a release branch). Only a digit run that is a
-# public-surface census count INSIDE the prime-directive section (the generated inventory line) may change without
-# the trailer; the same words in any other section are rule text. Fail closed, the precedent of root issue #4869.
+# public-surface census count INSIDE a section whose heading STARTS WITH CENSUS_SECTION (the real heading carries a
+# date, so the match is a prefix; #5375) may change without the trailer; the same words in any other section are rule
+# text. Fail closed, the precedent of root issue #4869.
 CENSUS_SECTION = "## Prime directive"
 CENSUS_DIGITS = re.compile(
     r"\b\d+(?=\s+(?:MCP tools|production HTTP route registrations|unique URL paths|CLI subcommands|"
@@ -772,6 +774,15 @@ def self_test() -> int:
 
     case("a census number replaced by a literal # is a rule change, not COUNT CHANGED (#5376)", hash_for_count,
          True, "RULE TEXT CHANGED")
+
+    # #5375: the docstring says what the code does: the census exemption is a heading PREFIX match.
+    doc_words = " ".join((__doc__ or "").split())
+    if f"inside a section whose heading starts with `{CENSUS_SECTION}`" in doc_words:
+        print("PASS: self-test - the docstring states the COUNT CHANGED section rule as a heading prefix (#5375)")
+    else:
+        failures.append("docstring prefix")
+        print("FAIL: self-test - the docstring does not state that COUNT CHANGED applies to a heading prefix "
+              "(#5375)", file=sys.stderr)
 
     def base_claude_symlink(root):
         target = root / "CLAUDE.md"
