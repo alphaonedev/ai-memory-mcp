@@ -1,6 +1,6 @@
 # ai-memory Architecture Reference
 
-> Moved verbatim from the `## Architecture` section of the tracked `CLAUDE.md`
+> Moved verbatim (except rows 55 and 346, later corrected by #4529) from the `## Architecture` section of the tracked `CLAUDE.md`
 > (issue #4507) so that `CLAUDE.md` stays small enough to load into every agent session.
 > Use CodeGraph first; grep the row or symbol you need; do not read this file whole.
 
