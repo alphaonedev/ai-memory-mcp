@@ -962,6 +962,12 @@ def taint_findings(text, names):
             # A file read in a terminal line may print a node-fetched file (a peer key fetched by scp).
             if re.search(r"\$\(\s*(?:cat\b|<)", rest):
                 hit.append("file read")
+            # #5362: nor may any other command substitution (head, sed, od ... of a file the reply was
+            # written to), or a cat of a file operand, appear in a terminal line.
+            if re.search(r"\$\((?!\()", rest):
+                hit.append("command substitution")
+            if cmd == "cat" and re.search(r"(?:^|\s)(?:<\s*)?[^\s<>|&;-]", re.sub(r"\d*>&?\S*|<<-?\S*", "", args)):
+                hit.append("file operand")
             if hit:
                 bad.append("%d:%s:%s" % (n, cmd, ",".join(sorted(hit))))
     bad += heredoc_findings(text, names)
@@ -1054,7 +1060,13 @@ def closed_world_taint(fs):
                         ("logger with the reply", 'logger "$qjson"'),
                         ("an unknown command in a capture", 'z="$(frobnicate "$qjson")"'),
                         ("an unknown command after an if", 'if true; then frobnicate "$qjson"; fi'),
-                        ("an unknown command after an assignment", 'v=1 frobnicate "$qjson"')):
+                        ("an unknown command after an assignment", 'v=1 frobnicate "$qjson"'),
+                        # #5362: a reply written to a file and printed later.
+                        ("a reply file printed by cat", "printf '%s' \"$qjson\" > \"$OUT_DIR/r\"\ncat \"$OUT_DIR/r\""),
+                        ("a reply file read by head in a failure line", "printf '%s' \"$qjson\" > \"$OUT_DIR/r\"\nno \"x $(head -c 99 \"$OUT_DIR/r\")\""),
+                        ("a reply file read by sed in a failure line", 'no "x $(sed -n 1p "$OUT_DIR/r")"'),
+                        ("a reply file read by redirect-cat", 'cat < "$OUT_DIR/r"'),
+                        ("a command substitution in a PASS line", 'ok "x $(od -c "$OUT_DIR/r")"')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
         probe("V1 closed-world negative control is flagged: %s" % label, len(b2) > len(bad), str(b2[len(bad):][:2]))
     # #5236: constructs a name-based scan cannot follow are not allowed in federate.sh at all.
