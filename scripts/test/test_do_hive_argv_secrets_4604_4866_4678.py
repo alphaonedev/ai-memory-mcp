@@ -239,7 +239,7 @@ def f2_node_get_id():
 def n3_main_tf():
     tf = (ROOT / "infra/do-hive/main.tf").read_text()
     cond = next(l for l in tf.splitlines() if "ai_memory_image_url == \"\" ||" in l)
-    probe("N3 main.tf validation refuses empty/dot path segments", "&& !can(regex(\"//|/\\\\.\\\\.?(/|$)\"" in cond, cond[-120:])
+    probe("N3 main.tf validation refuses empty/dot path segments and a trailing slash", "&& !can(regex(\"//|/$|/\\\\.\\\\.?(/|$)\"" in cond, cond[-120:])
     probe("N3 main.tf condition has a single top-level alternative", cond.count("||") == 1, cond[:80])
 
 

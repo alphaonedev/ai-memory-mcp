@@ -98,10 +98,12 @@ require_image_pin() {
     exit 2
   fi
   # curl removes dot segments before the request, so /releases/./latest and
-  # /releases/x/../latest fetch releases/latest; an empty segment is refused too.
+  # /releases/x/../latest fetch releases/latest. curl keeps an empty segment, but
+  # it names no versioned artifact, so an empty segment or trailing slash is
+  # refused too (main.tf refuses the same set).
   local path="/${TF_VAR_ai_memory_image_url#https://}/"
   if [[ "$path" == *//* || "$path" == */./* || "$path" == */../* ]] && [[ -n "${TF_VAR_ai_memory_image_url:-}" ]]; then
-    echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_url must not contain an empty, . or .. path segment (curl resolves them, so the URL would not name the pinned artifact)." >&2
+    echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_url must not contain an empty, . or .. path segment or a trailing slash (curl removes . and .., and an empty segment names no versioned artifact)." >&2
     exit 2
   fi
   if [[ -n "${TF_VAR_ai_memory_image_url:-}" ]] && ! [[ "${TF_VAR_ai_memory_image_url}" =~ ^https://[0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ][0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ._~/-]*$ ]]; then
