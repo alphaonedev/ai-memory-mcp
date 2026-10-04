@@ -481,11 +481,16 @@ def self_test() -> int:
         shutil.copyfile(Path(__file__).resolve(), copy)
         for name in ("argparse", "difflib", "py_compile", "re", "shutil", "stat", "subprocess"):
             (iso / f"{name}.py").write_text("print('PLANTED')\nraise SystemExit(0)\n", encoding="utf-8")
-        result = subprocess.run([sys.executable, str(copy), "--base-root", ".", "--repo", ".",
-                                 "--base-sha", "0" * 40, "--head-sha", "0" * 40, "--scratch", str(iso / "s")],
-                                capture_output=True, text=True, check=False)
-        return (result.returncode == 1 and "isolated mode" in result.stdout
-                and "PLANTED" not in result.stdout + result.stderr)
+        # #5283: the refusal must hold for every partial isolation, not only for a bare interpreter: -E (ignore
+        # PYTHON* variables) and -s (no user site) each leave the script directory on sys.path.
+        for flags in ([], ["-E"], ["-s"]):
+            result = subprocess.run([sys.executable, *flags, str(copy), "--base-root", ".", "--repo", ".",
+                                     "--base-sha", "0" * 40, "--head-sha", "0" * 40, "--scratch", str(iso / "s")],
+                                    capture_output=True, text=True, check=False)
+            if not (result.returncode == 1 and "isolated mode" in result.stdout
+                    and "PLANTED" not in result.stdout + result.stderr):
+                return False
+        return True
 
     if isolated_refusal():
         print("PASS: self-test - a comparison run without -I fails closed (R5, #5163)")
