@@ -3939,8 +3939,9 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
     facts.push(("capability_issuers".into(), cap.issuer_count().to_string()));
 
     // #4715 — surface a coverage read fault instead of reporting 0/0.
-    let (with, without) = match db::doctor_governance_coverage(conn) {
-        Ok(c) => c,
+    // The fault is reported as `unreadable`, never a healthy-looking 0 (ERRORS-19).
+    let coverage = match db::doctor_governance_coverage(conn) {
+        Ok(c) => Some(c),
         Err(e) => {
             severity = Severity::Critical;
             facts.push(("governance_coverage_error".into(), format!("{e:#}")));
@@ -3948,11 +3949,24 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
                 &mut note,
                 "the namespace governance coverage could not be read (#4715)",
             );
-            (0, 0)
+            None
         }
     };
-    facts.push(("namespaces_with_policy".into(), with.to_string()));
-    facts.push(("namespaces_without_policy".into(), without.to_string()));
+    let count_fact = |n: Option<usize>| {
+        n.map_or_else(
+            || over_depth_4715::UNREADABLE.to_string(),
+            |n| n.to_string(),
+        )
+    };
+    facts.push((
+        "namespaces_with_policy".into(),
+        count_fact(coverage.map(|c| c.0)),
+    ));
+    facts.push((
+        "namespaces_without_policy".into(),
+        count_fact(coverage.map(|c| c.1)),
+    ));
+    let without = coverage.map_or(0, |c| c.1);
 
     // v1.0.0 fail-open remediation — the OPT-IN strict admission posture
     // (`AI_MEMORY_PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE`). Reported right
@@ -3983,7 +3997,7 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
 
     // #4715 — a read fault is a Critical finding, never an empty histogram.
     let dist = match db::doctor_governance_depth_distribution(conn) {
-        Ok(d) => d,
+        Ok(d) => Some(d),
         Err(e) => {
             severity = Severity::Critical;
             facts.push(("inheritance_depth_error".into(), format!("{e:#}")));
@@ -3991,7 +4005,7 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
                 &mut note,
                 "the namespace inheritance depth histogram could not be read (#4715)",
             );
-            Vec::new()
+            None
         }
     };
     over_depth_4715::apply(
@@ -4000,19 +4014,20 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
         &mut severity,
         &mut note,
     );
-    let depth_summary: String = dist
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| **n > 0)
-        .map(|(d, n)| format!("d{d}={n}"))
-        .collect::<Vec<_>>()
-        .join(",");
+    let depth_summary = dist.map(|dist| {
+        dist.iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(d, n)| format!("d{d}={n}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    });
     facts.push((
         "inheritance_depth".into(),
-        if depth_summary.is_empty() {
-            "empty".into()
-        } else {
-            depth_summary
+        match depth_summary {
+            None => over_depth_4715::UNREADABLE.into(),
+            Some(summary) if summary.is_empty() => "empty".into(),
+            Some(summary) => summary,
         },
     ));
 

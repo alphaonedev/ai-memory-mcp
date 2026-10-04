@@ -21,8 +21,18 @@ use super::{Severity, append_note};
 use crate::governance::bind_chain_depth::OverDepthChain;
 use crate::governance::chain_depth::GOVERNANCE_CHAIN_MAX_DEPTH;
 
+/// The value printed for a fact whose read failed (never a healthy-looking 0).
+pub(super) const UNREADABLE: &str = "unreadable";
+
 /// At most this many chains are named individually; the rest are counted.
 const MAX_NAMED: usize = 20;
+
+/// The census's own timeout text. It is NOT the extension probe's message: the
+/// store may well have answered, and the fix for a slow census is not an
+/// extension or connectivity change. No remedy is claimed (ERRORS-06).
+#[cfg(feature = "sal-postgres")]
+const MSG_CENSUS_TIMEOUT: &str = "the over-depth governance chain census (\"Governance chain \
+     depth (#4715)\" section) did not finish within its time limit";
 
 /// The postgres twin's section name (the sqlite finding lives in the
 /// "Governance" section).
@@ -40,7 +50,7 @@ pub(super) fn apply(
     let chains = match census {
         Ok(c) => c,
         Err(e) => {
-            facts.push(("over_depth_chains".into(), "unreadable".into()));
+            facts.push(("over_depth_chains".into(), UNREADABLE.into()));
             facts.push(("over_depth_chains_error".into(), format!("{e:#}")));
             *severity = Severity::Critical;
             append_note(
@@ -77,8 +87,8 @@ pub(super) fn apply(
         note,
         &format!(
             "{} explicit parent_namespace chain(s) exceed the maximum governance depth of \
-             {GOVERNANCE_CHAIN_MAX_DEPTH}: [{}]{tail} — every governed operation under them is \
-             refused (#4477). Shorten each chain to at most {GOVERNANCE_CHAIN_MAX_DEPTH} hops by \
+             {GOVERNANCE_CHAIN_MAX_DEPTH}: [{}]{tail} — operations that resolve \
+             these chains are refused (#4477). Shorten each chain to at most {GOVERNANCE_CHAIN_MAX_DEPTH} hops by \
              re-binding a namespace in it to a nearer parent (memory_namespace_set_standard \
              with `parent`) or clearing its parent.",
             chains.len(),
@@ -124,7 +134,7 @@ pub(super) fn section_postgres() -> Option<ReportSection> {
         };
         tokio::time::timeout(super::PG_PROBE_TIMEOUT, probe)
             .await
-            .map_err(|_elapsed| anyhow::anyhow!(super::MSG_PG_PROBE_TIMEOUT))?
+            .map_err(|_elapsed| anyhow::anyhow!(MSG_CENSUS_TIMEOUT))?
             .map_err(anyhow::Error::from)
     })
     .and_then(|inner| inner);
