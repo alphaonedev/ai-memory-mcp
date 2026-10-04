@@ -835,10 +835,9 @@ def binary_ref(w: str, bins, shells: bool = False) -> bool:
     val = unquote(w)[0]
     if re.search(r"\s", val):
         return False
-    # a data home or a parent of one (/etc/ai-memory, /opt/ai-memory) is a directory
-    # that shares the binary's basename; what runs from it is rule R5's question (#4998)
-    if any(h.startswith(val.rstrip("/") + "/") for h in DATA_HOMES):
-        return False
+    # a data home (/etc/ai-memory) shares the binary's basename. It stays a binary
+    # reference here (fail closed: a file can be installed at that path); running a
+    # data home is also an R5 hit, which the #4998 probe requires to be reported.
     base = posixpath.basename(val)
     if base == "ai-memory" or (shells and (base in SHELLS or INTERP_BASE_RE.match(base))):
         return True
@@ -2409,6 +2408,8 @@ def build_probes() -> list:
         ('ai-memory behind numactl, listed (#4837 R12 R4)', [(dec, '      numactl -N 0 /usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats\n' + dec)]),
         ('ai-memory behind setpriv, listed (#4837 R12 R4)', [(dec, '      setpriv --reuid=aimemory /usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats\n' + dec)]),
         ('ai-memory behind runuser without --, listed (#4837 R12 R4)', [(dec, '      runuser aimemory /usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats\n' + dec)]),
+        ('ai-memory at a data-home parent behind taskset, listed (#4837 R12 R4, #5092)', [(dec, '      taskset -c 0 /opt/ai-memory --db $${X} stats\n' + dec)]),
+        ('ai-memory at a data home copied to another name, listed (#4837 R12 R4, #5092)', [(dec, '      cp /etc/ai-memory /usr/local/bin/aim\n' + dec)]),
         ('ai-memory through a variable behind taskset, listed (#4837 R12 R4)', [(dec, '      AIM=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$${AIM}" --db $${X} stats\n' + dec)]),
         ('shell run by an unknown wrapper, listed (#4837 R12 R4)', [(dec, "      taskset -c 0 sh -c '/usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats'\n" + dec)]),
         ('ai-memory copied to another name with cp, listed (#4837 R12 R4)', [(dec, '      cp /usr/local/lib/ai-memory/bin/ai-memory /usr/local/bin/aim\n' + dec)]),
@@ -2437,7 +2438,7 @@ def build_probes() -> list:
     # a data home shares the binary's basename: running from it is red for R5, never as an R4 wrapper (#4998)
     red("R3-C listed data home run by run-parts is an R5 hit, not an R4 wrapper (#4998)",
         [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      run-parts /etc/ai-memory\n" + dec)],
-        autolist=True, absent="unknown wrapper")
+        autolist=True, present="is an expansion or command substitution")
     green("R3-C YAML comment line in runcmd is inert", [(RUNCMD, RUNCMD + "  # curl https://x.example | sh\n")])
     P.append(("R3-C AWS-only line copied into do-hive", "red", dict(do=[(dec, "      chown aimemory:aimemory /etc/ai-memory/store-url\n" + dec)], autolist=False)))
     # ---- validators
@@ -2615,6 +2616,8 @@ def self_test(known: set) -> int:
             bad.append("%s: expected %s, got %s %s" % (label, expect, got, (faults or hits or [""])[0][:140]))
         elif spec.get("absent") and any(spec["absent"] in h for h in hits):
             bad.append("%s: expected no hit naming %r, got one" % (label, spec["absent"]))
+        elif spec.get("present") and not any(spec["present"] in h for h in hits):
+            bad.append("%s: expected a hit naming %r, got none" % (label, spec["present"]))
     muts = entry_mutations(base, cache)
     for raw, nm, text in muts:
         t = dict(base[0])
