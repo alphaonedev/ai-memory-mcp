@@ -12,7 +12,7 @@ compute the automerge" must never resolve to "the merge is exempt".
 Those two refusals are branches, and a branch nothing exercises is a branch
 nobody knows the state of. This shim is how the gate's own `--self-test`
 takes them: it passes every invocation through to the real git except
-`merge-tree`, which it breaks in one of two ways chosen by the name it is
+`merge-tree`, which it breaks in one of six ways chosen by the name it is
 invoked under (the self-test makes one symlink per mode, so the mode is in the
 argv the gate is given and there is no environment variable to get wrong):
 
@@ -25,12 +25,24 @@ argv the gate is given and there is no environment variable to get wrong):
     against a value that means nothing — the shape-validated-never-resolved
     defect class. The gate's probe also asserts the merged CONTENT, so this
     shim must be refused.
+  * ``git-twoline-merge-tree`` — exits 0 and prints the real merged tree oid
+    followed by a second line, so only the exactly-one-line assertion can
+    refuse it (#5277).
+  * ``git-nonhex-merge-tree`` — exits 0 and prints one line that is not a
+    40-hex oid, so only the 40-hex assertion can refuse it.
+  * ``git-ghost-merge-tree`` — exits 0 and prints one well-formed 40-hex oid
+    that names no object, so only the resolves-as-a-tree assertion can refuse
+    it. (A commit oid would not reach that assertion's refusal: `<commit>^{tree}`
+    peels to the commit's tree, and the content assertion catches it instead.)
+  * ``git-terse-merge-tree`` — runs the real merge-tree and keeps its exit
+    status, but prints only the FIRST line. On a conflict that is a valid
+    tree oid at rc=1, so only the gate's rc check can refuse it (#5278).
 
 The same shim also breaks ONLY `log`, for the commit WALK (#5272, #5138). The
 walk is the gate's only source of the commits it judges, so a walk that dies
 partway, comes up short, tears its last record or carries a malformed field
 must be INOPERATIVE (exit 2), never a PASS over the commits it happened to
-read. Four more names select those modes; each runs the real `git log` first
+read. Six more names select those modes; each runs the real `git log` first
 and then damages its output:
 
   * ``git-truncated-log`` — emits only the FIRST record, then exits 128 with a
@@ -42,6 +54,14 @@ and then damages its output:
     fields of the last one, and exits 0.
   * ``git-malformed-log`` — replaces the FIRST record's signature-status field
     (`%G?`) with a value git never emits, and exits 0.
+  * ``git-trailing-log`` — emits every record intact, then a fragment with no
+    terminating NUL, and exits 0: a stream that ends inside a record's FIRST
+    field, which only an end-of-stream check can see (every whole record is
+    present, so the record count still matches).
+  * ``git-orphan-log`` — emits every record intact, then SIGKILLs its PARENT
+    (the gate's walk producer), so the producer dies before it can record the
+    walk's exit status: the records are complete and correct, and only the
+    missing status says the walk was never confirmed.
 
 Records are NUL-delimited fields when the walk passes ``-z`` (the field count
 is read from the ``--format`` argument), and ``|``-delimited lines otherwise,
@@ -54,6 +74,7 @@ import argparse
 import os
 import pathlib
 import shutil
+import signal
 import subprocess
 import sys
 
@@ -95,21 +116,19 @@ def real_git():
     return found
 
 
-LOG_MODES = ("truncated-log", "short-log", "torn-log", "malformed-log")
+LOG_MODES = ("truncated-log", "short-log", "torn-log", "malformed-log", "trailing-log", "orphan-log")
+MERGE_TREE_MODES = ("absent", "lying", "twoline", "nonhex", "ghost", "terse")
+GHOST_OID = "0123456789abcdef0123456789abcdef01234567"
 
 
 def mode_from_name(argv0):
     name = pathlib.Path(argv0).name
-    if "absent" in name:
-        return "absent"
-    if "lying" in name:
-        return "lying"
-    for mode in LOG_MODES:
+    for mode in MERGE_TREE_MODES + LOG_MODES:
         if mode in name:
             return mode
     print("selftest-git-shim-merge-tree: invoked as %r, which names no mode "
-          "(expected a name containing 'absent', 'lying' or one of %s)"
-          % (name, ", ".join(LOG_MODES)), file=sys.stderr)
+          "(expected a name containing one of %s)"
+          % (name, ", ".join(MERGE_TREE_MODES + LOG_MODES)), file=sys.stderr)
     raise SystemExit(2)
 
 
@@ -171,6 +190,15 @@ def broken_log(mode, argv, rest):
         else:
             out.write(b"|".join(partial))
         return 0
+    if mode == "trailing-log":
+        out.write(encode(recs, nul_mode))
+        out.write(recs[-1][0][:12])
+        return 0
+    if mode == "orphan-log":
+        out.write(encode(recs, nul_mode))
+        out.flush()
+        os.kill(os.getppid(), signal.SIGKILL)
+        return 0
     # malformed-log
     recs[0][3] = b"Z"
     out.write(encode(recs, nul_mode))
@@ -199,6 +227,26 @@ def main():
     if mode == "absent":
         sys.stderr.write(ABSENT_USAGE)
         return 129
+
+    if mode == "nonhex":
+        sys.stdout.write("merge-tree: not-a-tree-oid\n")
+        return 0
+    if mode == "ghost":
+        sys.stdout.write(GHOST_OID + "\n")
+        return 0
+    if mode == "terse":
+        proc = subprocess.run([real_git()] + argv, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, check=False)
+        sys.stdout.write(proc.stdout.split("\n", 1)[0] + "\n")
+        return proc.returncode
+    if mode == "twoline":
+        proc = subprocess.run([real_git()] + argv, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, check=False)
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr)
+            return proc.returncode
+        sys.stdout.write(proc.stdout.strip() + "\nsecond line\n")
+        return 0
 
     revs = [a for a in rest if not a.startswith("-")]
     if len(revs) < 2:

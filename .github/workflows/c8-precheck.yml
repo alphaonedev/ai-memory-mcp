@@ -1170,10 +1170,12 @@ jobs:
         #       `|`-split record these PASSED at bdc0723ae (rc=0) and were
         #       refused at df880a3f5 (rc=1).
         #   (5272-walk-*) a walk that exits non-zero, ends short with rc 0,
-        #       tears its last record, or carries a value git never emits is
-        #       INOPERATIVE (exit 2) with a named reason; a two-commit control
-        #       range through the same seam PASSES. The walk's exit status is
-        #       checked and its record count must equal `rev-list --count`.
+        #       tears its last record, carries a value git never emits, ends
+        #       inside an unterminated field, or whose producer dies before
+        #       recording git's exit status is INOPERATIVE (exit 2) with a
+        #       named reason; a two-commit control range through the same seam
+        #       PASSES. The walk's exit status is checked and its record count
+        #       must equal `rev-list --count`.
         #   (5065-probe-merge-tree-absent / -lies / -probe-git-binary-missing)
         #       the MANDATORY capability probe exits 2 (INOPERATIVE) when
         #       `merge-tree --write-tree` is missing (rc=129 + usage on bare
@@ -1181,8 +1183,18 @@ jobs:
         #       returns a well-formed and resolvable but WRONG tree oid, and
         #       when the git binary cannot be executed at all. The probe
         #       asserts rc=0, exactly one 40-hex line, that the oid resolves
-        #       as a tree, AND that the tree carries BOTH sides' content — the
-        #       `-lies` case is what makes that last assertion load-bearing.
+        #       as a tree, AND that the tree carries BOTH sides' content. One
+        #       cell reaches each assertion (`-lies` the content check;
+        #       `5277-two-lines`, `-non-hex`, `-ghost-oid` the shape checks)
+        #       and greps that assertion's refusal text, after a pass-through
+        #       call proves the shim executes (#5277).
+        #   (5276-merge-only-range-*) a range whose only commit is one
+        #       evaluated local merge is JUDGED (0 signed, 1 unsigned), never
+        #       INOPERATIVE: the floor counts evaluated commits.
+        #   (5278-webflow-conflict-merge-*) an unsigned web-flow merge of
+        #       CONFLICTING parents that records the conflicted tree is
+        #       EVALUATED and refused, through real git and through a
+        #       merge-tree that prints only the conflicted oid at rc=1.
         #       There is no `|| true` and no `2>/dev/null` on that call: the
         #       gate must never degrade to cannot-compute-therefore-exempt.
         # `gpg(1)` is required: if it is unavailable the self-test fails

@@ -639,11 +639,18 @@ automerge_tree() {
 # shape-checked; they are only ever compared against the enrolled set.
 walk_record_well_formed() {
   local sha="$1" sig_status="$2" sig_fpr="$3" commit_tree="$4" parents="$5"
-  local oid='([0-9a-f]{40}|[0-9a-f]{64})'
-  if [[ ! "$sha" =~ ^${oid}$ ]] || [[ ! "$commit_tree" =~ ^${oid}$ ]]; then
-    return 1
-  fi
-  if [[ ! "$parents" =~ ^(${oid}( ${oid})*)?$ ]]; then
+  # Glob and length tests, not `=~` with `{40}`: the regex is recompiled on
+  # every call and doubled the walk's wall clock on a 487-commit range.
+  local oid
+  local -a parent_words=()
+  read -r -a parent_words <<<"$parents"
+  for oid in "$sha" "$commit_tree" "${parent_words[@]}"; do
+    if { [ "${#oid}" -ne 40 ] && [ "${#oid}" -ne 64 ]; } || [[ "$oid" == *[!0-9a-f]* ]]; then
+      return 1
+    fi
+  done
+  # `%P` is the oids separated by single spaces and nothing else.
+  if [ "$parents" != "${parent_words[*]}" ]; then
     return 1
   fi
   case "$sig_status" in
@@ -651,7 +658,7 @@ walk_record_well_formed() {
     *) return 1 ;;
   esac
   # `%GF`: empty, a 40-hex OpenPGP fingerprint, or an SSH `SHA256:<base64>`.
-  if [[ ! "$sig_fpr" =~ ^[A-Za-z0-9:+/=]*$ ]]; then
+  if [[ "$sig_fpr" == *[!A-Za-z0-9:+/=]* ]]; then
     return 1
   fi
   return 0
@@ -763,7 +770,8 @@ check_range() {
     fi
   fi
 
-  # THE COMMIT WALK, captured to a file and checked BEFORE it is judged.
+  # THE COMMIT WALK, streamed into the judging loop and checked BEFORE any
+  # verdict is printed (findings are only emitted after the loop).
   #
   # Record format (#5138): seven fields, each terminated by a NUL (`-z` plus
   # `%x00` between placeholders), read one field per `read -d ''`. The two
@@ -775,24 +783,19 @@ check_range() {
   # NUL cannot occur inside any commit header field, so no field can shift;
   # walk_record_well_formed is the independent second layer.
   #
-  # Completeness (#5272): the walk's exit status is collected (a process
-  # substitution would discard it), and the number of records read must equal
-  # `rev-list --count` over the same range. A walk that died partway, came up
+  # Completeness (#5272): a process substitution discards its exit status, so
+  # the producer writes git's status to a file after git exits; the loop sees
+  # EOF only once the producer has exited, so the file is complete when it is
+  # read, and a missing or non-numeric status is itself INOPERATIVE. The
+  # number of records read must also equal `rev-list --count` over the same
+  # range. (The walk is streamed, not captured first: signature verification
+  # in `git log` and the per-record checks then overlap, as they did before.) A walk that died partway, came up
   # short, or tore its last record is INOPERATIVE (2), never a PASS over the
   # commits it happened to read — the floor below refuses only ZERO.
-  local walk_file walk_rc=0 expected_count
+  local walk_status walk_rc="" expected_count
   if ! mkdir -p "$GATE_SCRATCH_ROOT" \
-    || ! walk_file="$(mktemp "$GATE_SCRATCH_ROOT/walk.XXXXXX")"; then
-    echo "check-commit-signing-posture: ERROR — cannot create the commit-walk capture file under ${GATE_SCRATCH_ROOT} (fail-closed)" >&2
-    return 2
-  fi
-  GNUPGHOME="$gnupghome" "$walk_git" -C "$repo_dir" \
-    -c "gpg.ssh.allowedSignersFile=$signers_file" \
-    -c gpg.format=ssh \
-    log -z --format='%H%x00%ae%x00%ce%x00%G?%x00%GF%x00%T%x00%P' \
-    "${merge_base}..${head_resolved}" >"$walk_file" || walk_rc=$?
-  if [ "$walk_rc" -ne 0 ]; then
-    echo "check-commit-signing-posture: ERROR — the commit walk (git log over ${merge_base}..${head_resolved}) exited ${walk_rc}; a partial walk is not a verdict (#5272; fail-closed)" >&2
+    || ! walk_status="$(mktemp "$GATE_SCRATCH_ROOT/walk-status.XXXXXX")"; then
+    echo "check-commit-signing-posture: ERROR — cannot create the commit-walk status file under ${GATE_SCRATCH_ROOT} (fail-closed)" >&2
     return 2
   fi
   if ! expected_count="$("$walk_git" -C "$repo_dir" rev-list --count "${merge_base}..${head_resolved}")" \
@@ -886,8 +889,24 @@ check_range() {
       findings+="VIOLATION: $sha signing-key-not-pinned (%GF=${sig_fpr:-<empty>})"$'\n'
       violations=1
     fi
-  done <"$walk_file"
-  rm -f "$walk_file"
+  done < <(
+    GNUPGHOME="$gnupghome" "$walk_git" -C "$repo_dir" \
+      -c "gpg.ssh.allowedSignersFile=$signers_file" \
+      -c gpg.format=ssh \
+      log -z --format='%H%x00%ae%x00%ce%x00%G?%x00%GF%x00%T%x00%P' \
+      "${merge_base}..${head_resolved}"
+    printf '%s' "$?" >"$walk_status"
+  )
+  walk_rc="$(cat "$walk_status")" || walk_rc=""
+  rm -f "$walk_status"
+  if [[ ! "$walk_rc" =~ ^[0-9]+$ ]]; then
+    echo "check-commit-signing-posture: ERROR — the commit walk's exit status was not recorded ('${walk_rc}'); an unconfirmed walk is not a verdict (#5272; fail-closed)" >&2
+    return 2
+  fi
+  if [ "$walk_rc" -ne 0 ]; then
+    echo "check-commit-signing-posture: ERROR — the commit walk (git log over ${merge_base}..${head_resolved}) exited ${walk_rc}; a partial walk is not a verdict (#5272; fail-closed)" >&2
+    return 2
+  fi
   if [ -n "$sha" ]; then
     echo "check-commit-signing-posture: ERROR — the commit walk ended with an unterminated field '${sha}'; a torn record is not a verdict (#5272; fail-closed)" >&2
     return 2
@@ -1163,6 +1182,20 @@ self_test() {
   git -C "$repo" commit -q -m "side3"
   side3_sha="$(git -C "$repo" rev-parse HEAD)"
   git -C "$repo" checkout -q --detach "$clean_sha"
+  # (#5278) Two more enrolled, SSH-signed sides that DO conflict: both add
+  # `conflict.txt` with different content, so `merge-tree --write-tree` of
+  # them exits 1 and prints a conflicted tree oid plus conflict detail.
+  local cf1_sha cf2_sha
+  printf 'cf1\n' >"$repo/conflict.txt"
+  git -C "$repo" add conflict.txt
+  git -C "$repo" commit -q -m "conflict side 1"
+  cf1_sha="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" checkout -q --detach "$clean_sha"
+  printf 'cf2\n' >"$repo/conflict.txt"
+  git -C "$repo" add conflict.txt
+  git -C "$repo" commit -q -m "conflict side 2"
+  cf2_sha="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" checkout -q --detach "$clean_sha"
 
   # The CLEAN automerge of side1+side2, computed through the gate's own
   # automerge_tree helper so the fixture and the gate cannot disagree about
@@ -1304,6 +1337,44 @@ self_test() {
     GIT_COMMITTER_NAME='GitHub' GIT_COMMITTER_EMAIL="$WEBFLOW_COMMITTER_EMAIL" \
     git -C "$repo" commit-tree "$(git -C "$repo" rev-parse "${side1_sha}^{tree}")" \
     -p "$side1_sha" -p "$clean_sha" -m 'Merge pull request (no-op)')"
+
+  # (#5276 merge-only ranges) The same no-op merge shape made LOCALLY by the
+  # enrolled identity, once SSH-signed and once unsigned. Each range
+  # `side1_sha..<merge>` holds that one EVALUATED merge and NO non-merge
+  # commit, which is the only kind of range on which the rebuilt #5047 floor
+  # (count EVALUATED commits) and the pre-#5065 floor (count non-merge
+  # commits) disagree. Every other range in this self-test carries a
+  # non-merge commit, so without these two cells a revert to the old floor
+  # ships green.
+  # (#5278 web-flow conflict) A web-flow-identity, UNSIGNED, two-parent
+  # merge of the conflicting sides whose recorded tree IS the conflicted tree
+  # oid that `merge-tree --write-tree` prints first at rc=1. Terms (1) and (2)
+  # hold, so only automerge_tree's refusal of a non-clean result keeps it out
+  # of the exemption: a version that believed the first line of a conflicted
+  # result would find `%T` equal and exempt it.
+  local wf_conflict_tree="" wf_conflict_rc=0 m_wf_conflict_sha
+  wf_conflict_tree="$(git -C "$repo" merge-tree --write-tree "$cf1_sha" "$cf2_sha" </dev/null)" || wf_conflict_rc=$?
+  wf_conflict_tree="${wf_conflict_tree%%$'\n'*}"
+  if [ "$wf_conflict_rc" -ne 1 ] || [[ ! "$wf_conflict_tree" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "self-test FAILED: the #5278 fixture needs a CONFLICTING pair (merge-tree rc=1 and a tree oid first); got rc=$wf_conflict_rc first-line='$wf_conflict_tree'" >&2
+    exit 2
+  fi
+  m_wf_conflict_sha="$(GIT_AUTHOR_NAME='Dev' GIT_AUTHOR_EMAIL='dev@example.test' \
+    GIT_COMMITTER_NAME='GitHub' GIT_COMMITTER_EMAIL="$WEBFLOW_COMMITTER_EMAIL" \
+    git -C "$repo" commit-tree "$wf_conflict_tree" -p "$cf1_sha" -p "$cf2_sha" \
+    -m 'Merge pull request (conflicted tree recorded)')"
+
+  local m_only_signed_sha m_only_unsigned_sha
+  m_only_signed_sha="$(GIT_AUTHOR_NAME='Dev' GIT_AUTHOR_EMAIL='dev@example.test' \
+    GIT_COMMITTER_NAME='Dev' GIT_COMMITTER_EMAIL='dev@example.test' \
+    git -C "$repo" -c gpg.format=ssh commit-tree "$(git -C "$repo" rev-parse "${side1_sha}^{tree}")" \
+    -p "$side1_sha" -p "$clean_sha" -S"$enrolled_key.pub" \
+    -m "Merge branch 'clean' (local, signed, no-op)")"
+  m_only_unsigned_sha="$(GIT_AUTHOR_NAME='Dev' GIT_AUTHOR_EMAIL='dev@example.test' \
+    GIT_COMMITTER_NAME='Dev' GIT_COMMITTER_EMAIL='dev@example.test' \
+    git -C "$repo" commit-tree "$(git -C "$repo" rev-parse "${side1_sha}^{tree}")" \
+    -p "$side1_sha" -p "$clean_sha" \
+    -m "Merge branch 'clean' (local, unsigned, no-op)")"
 
   # (pipe) A two-parent merge whose AUTHOR email is `evil|noreply@github.com`
   # and whose REAL committer is the enrolled local identity. `git` records a
@@ -1812,7 +1883,48 @@ self_test() {
     echo "self-test FAILED: a range consisting of nothing but EXEMPTED web-flow merges returned $rc, expected 2 (#5047 non-vacuity floor as rebuilt by #5065). A gate that reports OK after evaluating zero commits is the #2444 defect class:" >&2
     echo "$out" >&2
     failed=1
+  elif ! grep -qF "EVALUATED ZERO commits and refuses to report PASS" <<<"$out"; then
+    echo "self-test FAILED: the all-exempt range returned 2, but not from the evaluated-commit floor (#5276):" >&2
+    echo "$out" >&2
+    failed=1
   fi
+
+  # (#5276) A range whose ONLY commit is one EVALUATED merge: the rebuilt
+  # floor counts it, so the gate JUDGES it (0 signed, 1 unsigned) instead of
+  # reporting INOPERATIVE. The pre-#5065 floor (non-merge commits only)
+  # returns 2 on both; the mutant "floor counts scanned minus merges
+  # evaluated" is the one these two cells kill.
+  local mo_label mo_sha mo_expect mo_count
+  for mo_label in signed unsigned; do
+    if [ "$mo_label" = "signed" ]; then
+      mo_sha="$m_only_signed_sha"
+      mo_expect=0
+    else
+      mo_sha="$m_only_unsigned_sha"
+      mo_expect=1
+    fi
+    mo_count="$(git -C "$repo" rev-list --count "${side1_sha}..${mo_sha}")"
+    if [ "$mo_count" != "1" ]; then
+      echo "self-test FAILED: the #5276 merge-only fixture must hold exactly ONE commit in ${side1_sha}..${mo_sha}; rev-list --count says '$mo_count'" >&2
+      failed=1
+    fi
+    rc=0
+    out="$(check_range "$side1_sha" "$mo_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" 2>&1)" || rc=$?
+    st_report "5276-merge-only-range-$mo_label" "$rc" "$mo_expect"
+    if [ "$rc" -ne "$mo_expect" ]; then
+      echo "self-test FAILED: a range holding ONE evaluated ${mo_label} merge and no non-merge commit returned $rc, expected $mo_expect. The #5047 floor must count EVALUATED commits, not non-merge commits (#5276):" >&2
+      echo "$out" >&2
+      failed=1
+    elif ! grep -qF "SCANNED: 1 commits (1 merges evaluated, 0 merges exempted" <<<"$out"; then
+      echo "self-test FAILED: the #5276 ${mo_label} merge-only cell did not report its one merge as SCANNED and EVALUATED:" >&2
+      echo "$out" >&2
+      failed=1
+    elif [ "$mo_label" = "unsigned" ] && ! grep -qF "VIOLATION: $mo_sha signature-not-verified (%G?=N)" <<<"$out"; then
+      echo "self-test FAILED: the #5276 unsigned merge-only cell was not refused as signature-not-verified (%G?=N):" >&2
+      echo "$out" >&2
+      failed=1
+    fi
+  done
 
   # (probe: subcommand absent) The MANDATORY CAPABILITY PROBE. The runner is
   # bare `ubuntu-latest` with no container and no git pin, so the subcommand
@@ -1827,41 +1939,85 @@ self_test() {
   chmod +x "$shim_dir/shim.py"
   ln -sf shim.py "$shim_dir/git-absent-merge-tree"
   ln -sf shim.py "$shim_dir/git-lying-merge-tree"
-  rc=0
-  out="$(check_range "$base_sha" "$clean_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" "$shim_dir/git-absent-merge-tree" 2>&1)" || rc=$?
-  st_report "5065-probe-merge-tree-absent" "$rc" "2"
-  if [ "$rc" -ne 2 ]; then
-    echo "self-test FAILED: with 'git merge-tree --write-tree' UNUSABLE the gate returned $rc over a range it would otherwise PASS, expected 2 (INOPERATIVE). 'I could not compute the automerge' must never resolve to a pass or to an exemption:" >&2
-    echo "$out" >&2
+  ln -sf shim.py "$shim_dir/git-twoline-merge-tree"
+  ln -sf shim.py "$shim_dir/git-nonhex-merge-tree"
+  ln -sf shim.py "$shim_dir/git-ghost-merge-tree"
+  ln -sf shim.py "$shim_dir/git-terse-merge-tree"
+
+  # The shim must RUN before any cell below can mean anything (#5277). Each
+  # probe failure returns 2, and so does a shim that never executes (a lost
+  # exec bit gives 126 at the probe's first `git init`). A pass-through call
+  # proves the interpreter, the shebang and the exec bit; and every cell
+  # below asserts the refusal text of the ONE probe assertion it targets, so
+  # a shim that stopped running cannot keep them green.
+  local shim_rc=0
+  "$shim_dir/git-absent-merge-tree" --version >/dev/null 2>&1 || shim_rc=$?
+  if [ "$shim_rc" -ne 0 ]; then
+    echo "self-test FAILED: the git shim at '$shim_dir/shim.py' does not execute (pass-through 'git --version' returned $shim_rc), so every shim-driven cell would return 2 for the wrong reason (#5277)" >&2
     failed=1
   fi
 
-  # (probe: subcommand LIES) The probe's content assertion is load-bearing,
-  # not decorative. This shim returns a 40-hex oid that really resolves as a
-  # tree — but it is one parent's tree, not the merge of both. A probe that
-  # only checked rc and the output shape would accept it, and term (3) would
-  # then compare `%T` against a value that means nothing. That is the
-  # shape-validated-never-resolved defect class, caught here.
-  rc=0
-  out="$(check_range "$base_sha" "$clean_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" "$shim_dir/git-lying-merge-tree" 2>&1)" || rc=$?
-  st_report "5065-probe-merge-tree-lies" "$rc" "2"
-  if [ "$rc" -ne 2 ]; then
-    echo "self-test FAILED: a 'git merge-tree --write-tree' that returns a well-formed tree oid carrying only ONE side of a known-clean merge returned $rc, expected 2. The capability probe's content assertion is the only thing standing between term (3) and a comparison against a meaningless value:" >&2
-    echo "$out" >&2
-    failed=1
-  fi
+  # (probe cells) The MANDATORY CAPABILITY PROBE, one cell per refusal it
+  # can make. Each row is: cell name, the git it is handed, and the refusal
+  # text of the assertion that must fire.
+  #   -absent   rc=129 + usage, a git too old to carry the subcommand.
+  #   -lies     rc 0 and a REAL tree oid that is one parent's tree, not the
+  #             merge of both: only the content assertion refuses it, which
+  #             is what makes that assertion load-bearing.
+  #   -binary-missing  no git at all: refused at fixture creation.
+  #   5277-two-lines / -non-hex / -ghost-oid  rc 0 with two lines, rc 0
+  #             with a non-hex line, rc 0 with a 40-hex oid naming no object:
+  #             each reaches exactly one of the probe's shape assertions,
+  #             which no other cell reaches.
+  local probe_row probe_cell probe_git probe_reason
+  for probe_row in \
+    "5065-probe-merge-tree-absent|$shim_dir/git-absent-merge-tree|is INOPERATIVE: it returned rc=129" \
+    "5065-probe-merge-tree-lies|$shim_dir/git-lying-merge-tree|does not carry BOTH sides of a known-clean merge" \
+    "5065-probe-git-binary-missing|$tmp/no-such-git-binary|could not create the hermetic merge-tree capability-probe fixture" \
+    "5277-probe-merge-tree-two-lines|$shim_dir/git-twoline-merge-tree|did not print exactly one line" \
+    "5277-probe-merge-tree-non-hex|$shim_dir/git-nonhex-merge-tree|which is not a 40-hex tree oid" \
+    "5277-probe-merge-tree-ghost-oid|$shim_dir/git-ghost-merge-tree|which does not resolve as a TREE object"; do
+    IFS='|' read -r probe_cell probe_git probe_reason <<<"$probe_row"
+    rc=0
+    out="$(check_range "$base_sha" "$clean_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" "$probe_git" 2>&1)" || rc=$?
+    st_report "$probe_cell" "$rc" "2"
+    if [ "$rc" -ne 2 ]; then
+      echo "self-test FAILED: with the merge-tree capability probe handed '$probe_git' the gate returned $rc over a range it would otherwise PASS, expected 2 (INOPERATIVE). 'I could not compute the automerge' must never resolve to a pass or to an exemption:" >&2
+      echo "$out" >&2
+      failed=1
+    elif ! grep -qF -- "$probe_reason" <<<"$out"; then
+      echo "self-test FAILED: the $probe_cell cell returned 2, but not from the probe assertion it targets ('$probe_reason'), so that assertion is not what refused (#5277):" >&2
+      echo "$out" >&2
+      failed=1
+    fi
+  done
 
-  # (probe: binary missing) The cheapest INOPERATIVE shape, asserted
-  # separately so a fix that only handles "the subcommand failed" cannot pass
-  # this self-test while leaving "git itself is not there" fail-open.
-  rc=0
-  out="$(check_range "$base_sha" "$clean_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" "$tmp/no-such-git-binary" 2>&1)" || rc=$?
-  st_report "5065-probe-git-binary-missing" "$rc" "2"
-  if [ "$rc" -ne 2 ]; then
-    echo "self-test FAILED: a MISSING git binary for the #5065 capability probe returned $rc, expected 2 (INOPERATIVE):" >&2
-    echo "$out" >&2
-    failed=1
-  fi
+  # (#5278) The web-flow conflict merge, through real git and through the
+  # terse shim (real merge-tree, real rc, FIRST line only). Real git kills
+  # "take the first line as the tree" (mutant A4); the terse shim, whose
+  # conflicted output is a single valid oid at rc=1, is what makes the rc
+  # check itself load-bearing (mutants A1 to A3): without it the conflicted
+  # oid passes the one-line and 40-hex checks, equals `%T`, and is exempted.
+  local wfc_git
+  for wfc_git in git "$shim_dir/git-terse-merge-tree"; do
+    rc=0
+    out="$(check_range "$base_sha" "$m_wf_conflict_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" "$wfc_git" 2>&1)" || rc=$?
+    if [ "$wfc_git" = "git" ]; then
+      st_report "5278-webflow-conflict-merge-real-git" "$rc" "1"
+    else
+      st_report "5278-webflow-conflict-merge-terse-git" "$rc" "1"
+    fi
+    if [ "$rc" -ne 1 ]; then
+      echo "self-test FAILED: an UNSIGNED web-flow merge of CONFLICTING parents, recording the conflicted tree, returned $rc through '$wfc_git', expected 1. A merge whose automerge is not clean is never exempt (#5278):" >&2
+      echo "$out" >&2
+      failed=1
+    elif ! grep -qF "1 merges evaluated, 0 merges exempted" <<<"$out" \
+      || ! grep -qF "VIOLATION: $m_wf_conflict_sha signature-not-verified (%G?=N)" <<<"$out"; then
+      echo "self-test FAILED: the #5278 cell through '$wfc_git' was refused, but its merge was not EVALUATED and refused as unsigned:" >&2
+      echo "$out" >&2
+      failed=1
+    fi
+  done
 
   # (#5138 non-merge shift, two pipes) Unsigned, single parent, author email
   # `dev@example.test|dev@example.test|G`, committer email = the PINNED
@@ -1895,7 +2051,9 @@ self_test() {
 
   # (#5272 walk integrity) The walk is the gate's only source of commits. A
   # walk that dies partway, ends short with a clean status, tears its last
-  # record, or carries a field git never emits must be INOPERATIVE (2) —
+  # record, carries a field git never emits, ends inside an unterminated
+  # field, or whose producer dies before recording git's exit status must be
+  # INOPERATIVE (2) —
   # never a PASS over the commits it happened to read. Range base..side1 is
   # TWO enrolled, SSH-signed commits that PASS through a healthy walk (the
   # control row), so every non-2 result below is the walk damage leaking out.
@@ -1903,6 +2061,8 @@ self_test() {
   ln -sf shim.py "$shim_dir/git-short-log"
   ln -sf shim.py "$shim_dir/git-torn-log"
   ln -sf shim.py "$shim_dir/git-malformed-log"
+  ln -sf shim.py "$shim_dir/git-trailing-log"
+  ln -sf shim.py "$shim_dir/git-orphan-log"
   rc=0
   out="$(check_range "$base_sha" "$side1_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" git git 2>&1)" || rc=$?
   st_report "5272-walk-control-two-commits" "$rc" "0"
@@ -1912,7 +2072,7 @@ self_test() {
     failed=1
   fi
   local walk_mode walk_reason
-  for walk_mode in truncated-log short-log torn-log malformed-log; do
+  for walk_mode in truncated-log short-log torn-log malformed-log trailing-log orphan-log; do
     rc=0
     out="$(check_range "$base_sha" "$side1_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" git "$shim_dir/git-$walk_mode" 2>&1)" || rc=$?
     st_report "5272-walk-$walk_mode" "$rc" "2"
@@ -1923,6 +2083,8 @@ self_test() {
       truncated-log) walk_reason="a partial walk is not a verdict" ;;
       short-log) walk_reason="a short walk is not a verdict" ;;
       torn-log) walk_reason="a torn record is not a verdict" ;;
+      trailing-log) walk_reason="ended with an unterminated field" ;;
+      orphan-log) walk_reason="an unconfirmed walk is not a verdict" ;;
       *) walk_reason="malformed commit-walk record" ;;
     esac
     if [ "$rc" -ne 2 ]; then
@@ -1996,7 +2158,7 @@ self_test() {
   if [ "$failed" -ne 0 ]; then
     exit 2
   fi
-  echo "check-commit-signing-posture self-test OK: (a) clean enrolled+SSH-signed commit passes; (b) #2486 identity-drift shape (unbound email, unsigned) rejected naming both violations; (c) enrolled-but-unsigned commit rejected (signature check isolated from email check); (d) enrolled-email-claimed-with-rogue-SSH-key-signature rejected (verification is against the registry, not mere signature presence); (e) unresolvable commit range fails closed with exit 2; (f) missing enrolled-signers registry fails closed; (g) empty enrolled-signers registry fails closed; (g2) missing AND zero-fingerprint OpenPGP registries fail closed; (h) a commit signed with the PINNED OpenPGP key PASSES alongside an SSH-signed commit in the same range (#5045); (i) a fully-verifying OpenPGP signature from an UNPINNED key in the SAME keyring is rejected as signing-key-not-pinned — LOAD-BEARING, the only guard against the OpenPGP path widening to 'any key in the runner keyring'; (j) an EMPTY range fails closed with exit 2 (#5047 non-vacuity floor, which previously PASSED); (k) a hermetic keyring builds from the SHIPPED registry + .asc material and the shipped pin carries both halves; (l) run_gate's own entry-point dispositions — a non-pull_request event reports N/A at exit 0, and a pull_request event with PR_BASE_SHA unset fails closed at exit 2 (inoperative), never 0 and never 1. (f)/(g)/(g2) prove the fail-closed-on-registry-loss property is an EXPLICIT assertion (assert_registry_usable / assert_gpg_registry_usable / assert_pinned_fingerprints_usable), not incidental pipefail behavior. #5065 merge-evaluation cases, per 5-agent vote (4d3ea1c5) — merges are no longer dropped by --no-merges, they are evaluated unless all three exemption terms hold: (7a) a two-parent web-flow-identity merge that is UNSIGNED (%G?=N) and whose tree is NOT the clean automerge of its two parents is REFUSED naming signature-not-verified; (7b) the same shape carrying a signature that does not verify (%G?=E with a populated %GK — the realistic shape, since the real web-flow cohort reads E) is REFUSED the same way, so a future '%G? != N' filter cannot silently reopen the hole 7a alone would catch; (7c) LOAD-BEARING POSITIVE — a two-parent web-flow-identity merge whose recorded tree EQUALS git merge-tree --write-tree p1 p2 stays EXEMPT and is reported as exempted, pinning the adopted predicate's zero-cost property AND the named residual in both directions; (5065-octopus) a web-flow merge with THREE parents whose tree EQUALS the clean automerge of its first two is EVALUATED, not exempted: terms (1) and (3) hold, so the parent-count term alone refuses it (#5271); (5065-local) a non-web-flow unsigned two-parent merge is REFUSED naming signature-not-verified and no email violation — this is the red-first cell the identity narrowing needs, and it is impossible to satisfy by dropping merges; (5065-unpinned-key) a merge whose OpenPGP signature fully verifies (%G?=G) from a key in the SAME keyring that is NOT pinned is REFUSED as signing-key-not-pinned, extending case (i) across the merge boundary; (5065-conflict) an enrolled, SSH-signed, conflict-resolving merge whose tree differs from the automerge PASSES and is counted as EVALUATED — this is what proves the operator's own conflict resolutions are not false-refused and that a PASS can never come from an exemption; (5065-floor) a range whose only commits are exempted web-flow merges fails CLOSED with exit 2, because the rebuilt #5047 non-vacuity floor counts EVALUATED commits rather than non-merge commits and an all-exempt range is not a pass; (5065-pipe-author-email) a two-parent merge whose AUTHOR email is 'evil|noreply@github.com' and whose real committer is enrolled is REFUSED, counted as EVALUATED, quoted whole as an unbound author email, with no committer violation — no author-written text reaches exemption term (1); (5138-nonmerge-two-pipe / -one-pipe / -author-only) three UNSIGNED non-merge commits whose email fields carry '|' and copy the pinned fingerprint are REFUSED as signature-not-verified (%G?=N), because the walk record is NUL-delimited and no email text can occupy a signature field; (5272-walk-truncated / -short / -torn / -malformed) a commit walk that exits non-zero, ends short, tears its last record, or carries a value git never emits is INOPERATIVE (exit 2) with its named reason, against a two-commit control range that PASSES through the same seam; (5065-probe-absent / 5065-probe-lies / 5065-probe-missing) the MANDATORY merge-tree capability probe exits 2 (INOPERATIVE) when the subcommand is absent, when it returns a well-formed but WRONG tree oid, and when the git binary cannot be executed at all — the gate never degrades to cannot-compute-therefore-exempt."
+  echo "check-commit-signing-posture self-test OK: (a) clean enrolled+SSH-signed commit passes; (b) #2486 identity-drift shape (unbound email, unsigned) rejected naming both violations; (c) enrolled-but-unsigned commit rejected (signature check isolated from email check); (d) enrolled-email-claimed-with-rogue-SSH-key-signature rejected (verification is against the registry, not mere signature presence); (e) unresolvable commit range fails closed with exit 2; (f) missing enrolled-signers registry fails closed; (g) empty enrolled-signers registry fails closed; (g2) missing AND zero-fingerprint OpenPGP registries fail closed; (h) a commit signed with the PINNED OpenPGP key PASSES alongside an SSH-signed commit in the same range (#5045); (i) a fully-verifying OpenPGP signature from an UNPINNED key in the SAME keyring is rejected as signing-key-not-pinned — LOAD-BEARING, the only guard against the OpenPGP path widening to 'any key in the runner keyring'; (j) an EMPTY range fails closed with exit 2 (#5047 non-vacuity floor, which previously PASSED); (k) a hermetic keyring builds from the SHIPPED registry + .asc material and the shipped pin carries both halves; (l) run_gate's own entry-point dispositions — a non-pull_request event reports N/A at exit 0, and a pull_request event with PR_BASE_SHA unset fails closed at exit 2 (inoperative), never 0 and never 1. (f)/(g)/(g2) prove the fail-closed-on-registry-loss property is an EXPLICIT assertion (assert_registry_usable / assert_gpg_registry_usable / assert_pinned_fingerprints_usable), not incidental pipefail behavior. #5065 merge-evaluation cases, per 5-agent vote (4d3ea1c5) — merges are no longer dropped by --no-merges, they are evaluated unless all three exemption terms hold: (7a) a two-parent web-flow-identity merge that is UNSIGNED (%G?=N) and whose tree is NOT the clean automerge of its two parents is REFUSED naming signature-not-verified; (7b) the same shape carrying a signature that does not verify (%G?=E with a populated %GK — the realistic shape, since the real web-flow cohort reads E) is REFUSED the same way, so a future '%G? != N' filter cannot silently reopen the hole 7a alone would catch; (7c) LOAD-BEARING POSITIVE — a two-parent web-flow-identity merge whose recorded tree EQUALS git merge-tree --write-tree p1 p2 stays EXEMPT and is reported as exempted, pinning the adopted predicate's zero-cost property AND the named residual in both directions; (5065-octopus) a web-flow merge with THREE parents whose tree EQUALS the clean automerge of its first two is EVALUATED, not exempted: terms (1) and (3) hold, so the parent-count term alone refuses it (#5271); (5065-local) a non-web-flow unsigned two-parent merge is REFUSED naming signature-not-verified and no email violation — this is the red-first cell the identity narrowing needs, and it is impossible to satisfy by dropping merges; (5065-unpinned-key) a merge whose OpenPGP signature fully verifies (%G?=G) from a key in the SAME keyring that is NOT pinned is REFUSED as signing-key-not-pinned, extending case (i) across the merge boundary; (5065-conflict) an enrolled, SSH-signed, conflict-resolving merge whose tree differs from the automerge PASSES and is counted as EVALUATED — this is what proves the operator's own conflict resolutions are not false-refused and that a PASS can never come from an exemption; (5065-floor) a range whose only commits are exempted web-flow merges fails CLOSED with exit 2, because the rebuilt #5047 non-vacuity floor counts EVALUATED commits rather than non-merge commits and an all-exempt range is not a pass; (5065-pipe-author-email) a two-parent merge whose AUTHOR email is 'evil|noreply@github.com' and whose real committer is enrolled is REFUSED, counted as EVALUATED, quoted whole as an unbound author email, with no committer violation — no author-written text reaches exemption term (1); (5138-nonmerge-two-pipe / -one-pipe / -author-only) three UNSIGNED non-merge commits whose email fields carry '|' and copy the pinned fingerprint are REFUSED as signature-not-verified (%G?=N), because the walk record is NUL-delimited and no email text can occupy a signature field; (5272-walk-truncated / -short / -torn / -malformed / -trailing / -orphan) a commit walk that exits non-zero, ends short, tears its last record, carries a value git never emits, ends inside an unterminated field, or whose producer dies before recording git's exit status is INOPERATIVE (exit 2) with its named reason, against a two-commit control range that PASSES through the same seam; (5065-probe-absent / -lies / -missing, 5277-probe-two-lines / -non-hex / -ghost-oid) the MANDATORY merge-tree capability probe exits 2 (INOPERATIVE) when the subcommand is absent, returns a well-formed but WRONG tree oid, cannot be executed at all, prints two lines, prints a non-hex line, or prints an oid naming no object, and each cell asserts the refusal text of the one probe assertion it targets after a pass-through call proves the shim executes (#5277) — the gate never degrades to cannot-compute-therefore-exempt; (5276-merge-only-range-signed / -unsigned) a range whose only commit is one evaluated local merge is JUDGED (0 signed, 1 unsigned), never INOPERATIVE, because the floor counts evaluated commits, not non-merge commits; (5278-webflow-conflict-merge-real-git / -terse-git) an unsigned web-flow merge of CONFLICTING parents recording the conflicted tree is EVALUATED and refused, through real git and through a merge-tree that prints only the conflicted oid at rc=1, so the rc check of automerge_tree is load-bearing."
 }
 
 case "${1:-}" in
