@@ -790,13 +790,24 @@ from the role's stored verifier:
 ```bash
 # On the primary, copy the stored SCRAM verifier for the role. mktemp creates
 # a new 0600 file, so the verifier is never written into a file with a wider
-# mode (umask alone does not narrow a userlist.txt that already exists):
-( umask 077
+# mode. userlist.txt is replaced only when psql succeeded and returned exactly
+# one SCRAM verifier line; otherwise the command fails and the old file stays.
+# The other entries in it (the admin_users and stats_users roles) are kept:
+( set -eu; umask 077
   tmp=$(mktemp /etc/pgbouncer/userlist.XXXXXX)
-  psql -At -U postgres -c \
+  trap 'rm -f "$tmp"' EXIT
+  line=$(psql -X -v ON_ERROR_STOP=1 -At -U postgres -c \
     "SELECT '\"aimemory\" \"' || rolpassword || '\"' \
-     FROM pg_authid WHERE rolname='aimemory';" > "$tmp"
-  chown pgbouncer: "$tmp" && chmod 0600 "$tmp" && mv "$tmp" /etc/pgbouncer/userlist.txt )
+     FROM pg_authid WHERE rolname='aimemory';")
+  printf '%s\n' "$line" | grep -Eqx '"aimemory" "SCRAM-SHA-256\$[^"]+"' &&
+    [ "$(printf '%s\n' "$line" | wc -l)" -eq 1 ] ||
+    { echo "no SCRAM verifier read; userlist.txt left unchanged" >&2; exit 1; }
+  if [ -f /etc/pgbouncer/userlist.txt ]; then
+    grep -v '^"aimemory" ' /etc/pgbouncer/userlist.txt >> "$tmp" || [ "$?" -eq 1 ]
+  fi
+  printf '%s\n' "$line" >> "$tmp"
+  chown pgbouncer: "$tmp"; chmod 0600 "$tmp"
+  mv "$tmp" /etc/pgbouncer/userlist.txt; trap - EXIT )
 ```
 
 The verifier must be the role's own `rolpassword` (same salt and iteration
