@@ -428,30 +428,51 @@ def p1_temp_entry_fail_closed():
                   "rc=%s hung=%s target_bytes=%d" % (rc, hung, len(tfile.read_text())))
             tfile.unlink()
         # An interrupt in the middle of the key write leaves no partial key at the temp name.
-        slow = 'on_node() { printf "%%s" %s; : > %s; sleep 30; }\n' % (SECRET[:32], ready)
+        # #5239: the stub sleeps in the background and waits for it. With a foreground sleep, a
+        # process-group SIGINT that lands in the child bash forks for sleep, before it execs, is taken by
+        # that child, and sleep then runs its full 30 s; for SIGINT bash waits for its foreground child and
+        # carries on when the child did not die of it, so the run outlived the 6 s wait. The wait builtin
+        # is interrupted by the signal itself, whatever the fork timing. The leftover sleep is killed with
+        # the process group. DO_HIVE_P2_SIGNAL_REPEAT=N runs each signal N times.
+        slow = 'on_node() { printf "%%s" %s; : > %s; sleep 30 & wait $!; }\n' % (SECRET[:32], ready)
+        rep = os.environ.get("DO_HIVE_P2_SIGNAL_REPEAT", "1")
+        repeat = int(rep) if rep.isdigit() and 0 < int(rep) <= 10000 else 0
+        if not repeat:
+            probe("P2 DO_HIVE_P2_SIGNAL_REPEAT is a count from 1 to 10000", False, rep[:20])
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            reset()
-            if ready.exists():
-                ready.unlink()
-            # A caller that started this test under nohup or in the background passes these signals as
-            # ignored; the child must see the defaults, as an interactive run does.
-            rp = subprocess.Popen(["bash", "-c", script("none", slow)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                  preexec_fn=lambda: [signal.signal(s, signal.SIG_DFL) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)],
-                                  start_new_session=True, env=dict(os.environ, PATH=str(d) + os.pathsep + os.environ["PATH"]))
-            end = time.time() + 6
-            while not ready.exists() and time.time() < end:
-                time.sleep(0.05)
-            started = ready.exists()
-            os.killpg(rp.pid, sig)
-            try:
-                rc, hung = rp.wait(timeout=6), False
-            except subprocess.TimeoutExpired:
-                os.killpg(rp.pid, signal.SIGKILL)
-                rc, hung = rp.wait(), True
-            left = sorted(q.name for q in rd.iterdir())
-            # #5151: the trap's own exit status (130), not only any non-zero status.
-            probe("P2 %s during the key write leaves no temp file and no api-key, and exits 130" % sig.name, started and not hung
-                  and rc == 130 and not left, "started=%s rc=%s hung=%s left=%s" % (started, rc, hung, left))
+            bad, hangs, t0 = [], 0, time.monotonic()
+            for _ in range(repeat):
+                reset()
+                if ready.exists():
+                    ready.unlink()
+                # A caller that started this test under nohup or in the background passes these signals as
+                # ignored; the child must see the defaults, as an interactive run does.
+                rp = subprocess.Popen(["bash", "-c", script("none", slow)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      preexec_fn=lambda: [signal.signal(s, signal.SIG_DFL) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)],
+                                      start_new_session=True, env=dict(os.environ, PATH=str(d) + os.pathsep + os.environ["PATH"]))
+                end = time.time() + 6
+                while not ready.exists() and time.time() < end:
+                    time.sleep(0.05)
+                started = ready.exists()
+                os.killpg(rp.pid, sig)
+                try:
+                    rc, hung = rp.wait(timeout=6), False
+                except subprocess.TimeoutExpired:
+                    os.killpg(rp.pid, signal.SIGKILL)
+                    rc, hung = rp.wait(), True
+                try:
+                    os.killpg(rp.pid, signal.SIGKILL)  # the background sleep the stub left behind
+                except ProcessLookupError:
+                    pass
+                left = sorted(q.name for q in rd.iterdir())
+                hangs += hung
+                # #5151: the trap's own exit status (130), not only any non-zero status.
+                if not (started and not hung and rc == 130 and not left):
+                    bad.append("started=%s rc=%s hung=%s left=%s" % (started, rc, hung, left))
+            probe("P2 %s during the key write leaves no temp file and no api-key, and exits 130" % sig.name
+                  + (" (%d runs)" % repeat if repeat > 1 else ""), repeat > 0 and not bad,
+                  "%d of %d failed, %d hung, %.1fs; first: %s" % (len(bad), repeat, hangs, time.monotonic() - t0,
+                                                                  bad[0] if bad else "-"))
         # After the block succeeds the trap is gone: a later interrupt ends the run by the default
         # action (signal death), it does not run the key-file cleanup or exit 130.
         reset()
