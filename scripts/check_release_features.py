@@ -12,8 +12,12 @@ and the docs all follow it, and that a BROKEN declaration fails the build
 instead of silently degrading it.
 
 DESIGN: AN ALLOWLIST OF TEXT *AND* OF POSITION. The units that decide what
-ships are compared to their EXACT expected text, after normalising only
-spaces/tabs and ``\\`` line continuation; anything else is refused:
+ships are compared to their EXACT expected text, after normalising only runs
+of spaces/tabs; anything else is refused. Line continuations are not modelled:
+a run line ending in ``\\`` is refused in release.yml and release-shape.yml, and
+in the Dockerfile the ONLY continued lines allowed are those of the canonical
+build RUN, which is compared physical line by physical line
+(``DOCKER_RUN_LINES``). The units are:
 
   * the release.yml build step, the strict-assert step, the SBOM step and the
     release-shape build step (statement lists, below);
@@ -65,45 +69,68 @@ each unit is and WHAT is substituted into it:
     ``--from`` another stage or image; that stage (the builder) must not start
     FROM another stage nor COPY ``--from``, must COPY Cargo.lock, and must end
     with exactly the declaration COPY followed by the canonical RUN. ``cargo``
-    anywhere else in the Dockerfile is refused. A blank or comment line inside a
-    ``\\`` continuation is refused (BuildKit drops it, a shell never sees it), a
-    ``FROM`` image containing ``$`` is refused (a build-arg base the guard cannot
-    resolve), and ``--mount`` is refused anywhere (a mount can import files the
-    guard never read). Logical lines are formed as BuildKit forms them: comment
-    and blank lines inside a continuation are dropped and the instruction keeps
-    joining (parity pinned by the PARITY table, recorded from the moby/buildkit
-    v0.23.2 parser).
-  * The docker job image build is an ALLOWLIST, not a denylist: the step keys
-    are exactly ``name``/``id``/``uses``/``with``; ``uses`` is exactly the pinned
-    ``docker/build-push-action`` SHA (owner and action case-exact, plain scalar);
-    ``with:`` carries exactly ``context: .``, the pinned ``push``, ``tags``,
-    ``labels``, ``cache-from`` and ``cache-to``, so ``file``, ``target``,
-    ``build-contexts``, ``build-args`` (a frontend override), another
-    ``context`` or any unread key is refused. The buildx and login actions are
-    pinned the same way. Any other image-builder ``uses`` (any case), any
-    reusable-workflow image builder, and any run text that spells
-    ``docker build|buildx|push``, ``buildctl``, ``buildah``... in command
-    position (quote and backslash characters ignored) is refused.
+    (and the other build tools) anywhere else in the Dockerfile is refused, read
+    with quote and backslash characters removed. Every line ending in ``\\``
+    outside the canonical RUN is refused, and the canonical RUN's lines must be
+    exactly ``DOCKER_RUN_LINES`` (no comment or blank line inside, no re-indent).
+    A ``FROM`` image containing ``$`` is refused (a build-arg base the guard
+    cannot resolve), and ``--mount`` is refused anywhere in an instruction (a
+    mount can import files the guard never read). Instructions are split as
+    BuildKit splits them (``bk_instructions``: a ``\\`` with only spaces/tabs
+    after it continues, the next line is appended as written). That join is
+    checked against recorded parser outputs (the PARITY table, from the
+    moby/buildkit v0.23.2 parser) and a differential fuzz, but the guard does
+    not RELY on it matching every BuildKit input: it refuses every continuation
+    it would have to join, except the one pinned line by line.
+  * The ``docker:`` job is pinned WHOLE, because it holds ``packages: write``:
+    its keys are exactly ``name``/``needs``/``if``/``runs-on``/``permissions``/
+    ``steps`` with pinned values (``DOCKER_JOB``; a job ``env:``, ``container:``,
+    ``defaults:``, ``services:`` or ``strategy:`` is refused), and its steps are
+    exactly the pinned ordered list (``DOCKER_STEPS``: checkout, Buildx setup,
+    registry login, version, image build, provenance attestation), each with its
+    exact keys, its ``uses`` pinned to a SHA constant, its ``with:`` inputs and
+    its run text. No step can be added, removed, reordered or changed.
+  * Permissions, secrets and the registry. The top-level ``permissions:`` is
+    exactly ``contents: write`` and every job's ``permissions:`` is pinned
+    (``RELEASE_JOB_PERMISSIONS``; ``packages: write`` exists in the docker job
+    only); the job set is pinned and no job may call a reusable workflow. Every
+    ``secrets`` reference must be ``secrets.<NAME>`` with NAME in
+    ``RELEASE_SECRETS`` and no key may be named ``secrets``. The registry host
+    (``ghcr.io``, any case) may appear only inside the docker job.
   * Quoting. A double-quoted YAML scalar containing a backslash is refused (YAML
     decodes escapes such as ``\\x63`` that this parser would read raw); a
-    single-quoted ``''`` is decoded to ``'`` as YAML does. Build-tool and image
-    command scans read the text with quote and backslash characters removed
-    (``c''argo`` reads as ``cargo``). That is a best-effort spelling view for
-    REFUSALS only; it cannot see a name built by expansion (#4768).
-  * The release-shape Postgres proof is located structurally: exactly one
-    ``run`` step in the ``release-shape:`` job whose statements equal the pinned
+    single-quoted ``''`` is decoded to ``'`` as YAML does. The build-tool scans
+    (release job, whole release.yml, Dockerfile) read the text with quote and
+    backslash characters removed (``c''argo`` reads as ``cargo``). That is a
+    best-effort spelling view for REFUSALS only; it cannot see a name built by
+    expansion (#4752, #4768).
+  * release-shape.yml is pinned as a skeleton: its top-level keys in order
+    (``SHAPE_TOP_KEYS``), the ``on:`` triggers (``SHAPE_ON``, branch and path
+    filters included), ``permissions:`` (``SHAPE_PERMISSIONS``) and ``env:``
+    (exactly the two ``CARGO_*`` values, ``SHAPE_ENV``); exactly one job,
+    ``release-shape:``, whose keys are exactly ``name``/``runs-on``/
+    ``timeout-minutes``/``steps`` with pinned values (``SHAPE_JOB``), so no job
+    ``needs:``, ``if:``, ``env:``, ``defaults:``, ``container:`` or
+    ``services:``. ``continue-on-error`` follows ``SHAPE_ADVISORY``: while it is
+    True (the #4480 ruling: advisory until the first green run on main) the job
+    must carry exactly the plain ``continue-on-error: true``; when #4720 flips it
+    to False the key is refused. The Postgres proof is located structurally:
+    exactly one ``run`` step whose statements equal the pinned
     ``bash scripts/release-shape-pg-proof.sh target/release/ai-memory "$url"``
     (the URL assignment may change its port only), with the step key set pinned
-    (so no step ``if:`` or ``continue-on-error:``), no job ``if:``, and ordered
-    after the release-shaped build. The ``paths:`` trigger filter is NOT evidence.
-    Job-level ``continue-on-error: true`` is the shipped, ruled advisory state
-    (#4480) and is deliberately allowed: the job still runs and its steps still
-    fail.
+    (so no step ``if:`` or ``continue-on-error:``), ordered after the
+    release-shaped build. The ``paths:`` trigger filter is NOT evidence.
+
+PIN MAINTENANCE. Every pin-mismatch message names the constant to update and
+this file. A Dependabot SHA bump of a docker-job action fails with ONE message
+naming its ``*_USES`` constant: update that constant to the new SHA in the same
+commit (the rest of the step is still compared). Any other intended change to a
+pinned unit is made the same way, in the workflow and here, in one commit.
 
 Whole-line comments are dropped; a trailing ``#`` is NOT trusted (the statement
 then differs from the allowed one and is refused). ``BASH_ENV`` is refused
-anywhere in release.yml and the Dockerfile. Control characters (CR, form feed,
-NUL...), NBSP and every other Unicode space or zero-width character in the
+anywhere in release.yml, release-shape.yml and the Dockerfile. Control
+characters (CR, form feed, NUL...), NBSP and every other Unicode space or zero-width character in the
 workflows or Dockerfile are refused, never folded: Python, YAML and bash
 disagree on what a line and a blank are.
 
@@ -171,36 +198,146 @@ DOCKER_RUN = (
     + "strip target/release/ai-memory; "
     + ASSERT_DOCKER
 )
+# The ONLY `\` continuation the guard accepts anywhere: the canonical build RUN,
+# compared physical line by physical line (#4719 C-1/C-2). Any other line that
+# ends in `\` (Dockerfile, or release.yml / release-shape.yml run text) is refused.
+DOCKER_RUN_LINES = (
+    "RUN set -eu; \\",
+    "    " + ALLOWED_FEATURES + "; \\",
+    "    " + ALLOWED_REQUIRE + "; \\",
+    '    test -n "$FEATURES"; \\',
+    '    test -n "$REQUIRE_FLAGS"; \\',
+    "    " + SHAPE_BUILD_CMD + "; \\",
+    "    strip target/release/ai-memory; \\",
+    "    " + ASSERT_DOCKER,
+)
 SHAPE_PROOF_CMD = 'bash scripts/release-shape-pg-proof.sh target/release/ai-memory "$url"'
 SHAPE_PROOF_URL = "url=<the TLS verify-full proof URL>"
 SHAPE_PROOF = ("set -euo pipefail", SHAPE_PROOF_URL, SHAPE_PROOF_CMD)
 SHAPE_URL_RE = re.compile(
     r'url="postgres://postgres:\$\{PGTLS_PW\}@127\.0\.0\.1:[0-9]+/proof\?sslmode=verify-full'
     r'&sslrootcert=\$\{PGTLS_DIR\}/ca\.crt"')
-# The docker job. Every docker/* action is pinned to its exact (case-exact) `uses`;
-# the image-build step may carry only the keys below with exactly these values.
+GUARD_PATH = "scripts/check_release_features.py"
+
+
+class Flow(str):
+    """A pinned flow-sequence value, compared by its text between the brackets."""
+
+
+class Double(str):
+    """A pinned double-quoted scalar (no backslash: the parser refuses one)."""
+
+
+class Block(tuple):
+    """A pinned ``|`` literal block, compared line by line."""
+
+
+# Pinned YAML: str = plain scalar, Flow / Double = that style, Block = `|` lines,
+# dict = a mapping with exactly these keys, list = a sequence of exactly these
+# items, None = a key with no value.
+Spec = Union[str, Flow, Double, Block, Dict[str, object], List[object], None]
+
+# The docker job is pinned WHOLE (#4719 SR-8/SR-9): it holds `packages: write`,
+# so anything it runs can put an image on the release tag. Every action is pinned
+# to its SHA; a Dependabot bump of one of these SHAs fails with one message that
+# names the constant to update.
+CHECKOUT_USES = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 BUILDX_USES = "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f"
 LOGIN_USES = "docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9"
 IMAGE_BUILD_USES = "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8"
-DOCKER_ACTIONS = frozenset((BUILDX_USES, LOGIN_USES, IMAGE_BUILD_USES))
-IMAGE_BUILD_KEYS = ("name", "id", "uses", "with")
-IMAGE_BUILD_SCALARS = {
-    "context": ".",
-    "push": "${{ github.event.inputs.dry_run == 'false' }}",
-    "cache-from": "type=gha",
-    "cache-to": "type=gha,mode=max",
+ATTEST_USES = "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be"
+USES_CONSTANTS = {
+    CHECKOUT_USES: "CHECKOUT_USES",
+    BUILDX_USES: "BUILDX_USES",
+    LOGIN_USES: "LOGIN_USES",
+    IMAGE_BUILD_USES: "IMAGE_BUILD_USES",
+    ATTEST_USES: "ATTEST_USES",
 }
-IMAGE_BUILD_BLOCKS = {
-    "tags": (
-        "ghcr.io/${{ github.repository_owner }}/ai-memory:${{ steps.version.outputs.version }}",
-        "ghcr.io/${{ github.repository_owner }}/ai-memory:latest",
-    ),
-    "labels": (
-        "org.opencontainers.image.source=https://github.com/${{ github.repository }}",
-        "org.opencontainers.image.version=${{ steps.version.outputs.version }}",
-    ),
+DOCKER_JOB: Dict[str, Spec] = {
+    "name": "Docker (GHCR)",
+    "needs": Flow("preflight, qualify, supply-chain"),
+    "if": "needs.preflight.outputs.is_prerelease == 'false'",
+    "runs-on": "ubuntu-latest",
+    "permissions": {"contents": "read", "packages": "write", "id-token": "write", "attestations": "write"},
 }
-LOGIN_WITH_KEYS = ("registry", "username", "password")
+DOCKER_STEPS: List[Spec] = [
+    {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
+    {"name": "Set up Docker Buildx", "uses": BUILDX_USES},
+    {"name": "Log in to GitHub Container Registry", "uses": LOGIN_USES,
+     "with": {"registry": "ghcr.io", "username": "${{ github.actor }}", "password": "${{ secrets.GITHUB_TOKEN }}"}},
+    {"name": "Extract version from tag", "id": "version", "run": 'echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"',
+     "env": {"TAG": "${{ needs.preflight.outputs.tag }}"}},
+    {"name": "Build and push Docker image", "id": "build", "uses": IMAGE_BUILD_USES, "with": {
+        "context": ".",
+        "push": "${{ github.event.inputs.dry_run == 'false' }}",
+        "tags": Block((
+            "ghcr.io/${{ github.repository_owner }}/ai-memory:${{ steps.version.outputs.version }}",
+            "ghcr.io/${{ github.repository_owner }}/ai-memory:latest",
+        )),
+        "labels": Block((
+            "org.opencontainers.image.source=https://github.com/${{ github.repository }}",
+            "org.opencontainers.image.version=${{ steps.version.outputs.version }}",
+        )),
+        "cache-from": "type=gha",
+        "cache-to": "type=gha,mode=max",
+    }},
+    {"name": "Attest build provenance (Docker image)", "if": "github.event.inputs.dry_run == 'false'",
+     "uses": ATTEST_USES, "with": {
+         "subject-name": "ghcr.io/${{ github.repository_owner }}/ai-memory",
+         "subject-digest": "${{ steps.build.outputs.digest }}",
+         "push-to-registry": "true",
+     }},
+]
+# What each pinned docker step is, for the messages.
+DOCKER_STEP_ROLES = ("checkout", "Buildx setup", "registry login", "version", "image build", "provenance attestation")
+# release.yml permissions, pinned per job (#4719 SR-8): `packages: write` exists in
+# the docker job only; None = the job declares none and inherits the top level.
+RELEASE_TOP_PERMISSIONS: Dict[str, Spec] = {"contents": "write"}
+_SIGN = {"contents": "write", "id-token": "write", "attestations": "write"}
+_READ_ATTEST = {"contents": "read", "attestations": "read"}
+RELEASE_JOB_PERMISSIONS: Dict[str, Optional[Dict[str, Spec]]] = {
+    "preflight": {"contents": "read"},
+    "qualify": {"contents": "read", "checks": "read", "actions": "read"},
+    "supply-chain": None,
+    "release": dict(_SIGN),
+    "sbom": dict(_SIGN),
+    "mobile-ios": dict(_SIGN),
+    "mobile-android": dict(_SIGN),
+    "crates-io": None,
+    "homebrew": dict(_READ_ATTEST),
+    "docker": dict(DOCKER_JOB["permissions"]),  # type: ignore[arg-type]
+    "copr": dict(_READ_ATTEST),
+}
+# The only secrets release.yml may read: a new credential (a registry token in
+# another job) is refused until it is added here on purpose.
+RELEASE_SECRETS = ("GITHUB_TOKEN", "CARGO_REGISTRY_TOKEN", "HOMEBREW_TAP_TOKEN", "COPR_CONFIG")
+SECRET_REF_RE = re.compile(r"(?<![\w.-])secrets(?![\w-])(?P<ref>\s*\.\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*))?", re.I)
+# The image registry is named only inside the pinned docker job.
+REGISTRY = "ghcr.io"
+# release-shape.yml skeleton (#4719 SR-10).
+SHAPE_TOP_KEYS = ("name", "on", "permissions", "concurrency", "env", "jobs")
+SHAPE_PERMISSIONS: Dict[str, Spec] = {"contents": "read"}
+SHAPE_ENV: Dict[str, Spec] = {"CARGO_TERM_COLOR": "always", "CARGO_INCREMENTAL": Double("0")}
+SHAPE_PATHS = (
+    ".github/workflows/release.yml", ".github/workflows/release-shape.yml", "scripts/release-features.sh",
+    "scripts/check_release_features.py", "scripts/release-shape-pg-proof.sh", "scripts/assert-compiled-features.sh",
+    "Cargo.toml", "Cargo.lock", "src/**", "migrations/**",
+)
+SHAPE_ON: Dict[str, Spec] = {
+    "pull_request": {"branches": Flow('"release/**", "rehearsal/**", "main"'), "paths": [Double(p) for p in SHAPE_PATHS]},
+    "push": {"branches": Flow('"release/**"')},
+    "workflow_dispatch": None,
+}
+SHAPE_JOB: Dict[str, Spec] = {
+    "name": Double("Release-shaped build + PG TLS proof"),
+    "runs-on": "ubuntu-latest",
+    "timeout-minutes": "60",
+}
+# #4480 ruled the release-shape job ADVISORY until its first green run on main; #4720
+# tracks the flip to required. While True the job must carry exactly the plain
+# `continue-on-error: true`; the #4720 fix sets this to False in the same commit
+# that drops the key from release-shape.yml, after which the key is refused.
+SHAPE_ADVISORY = True
 DOCKER_SYNTAX = "# syntax=docker/dockerfile:1"
 DOCKER_DECL_COPY = "COPY scripts/release-features.sh scripts/release-features.sh"
 DOCKER_LOCK_COPY = "COPY Cargo.toml Cargo.lock ./"
@@ -212,6 +349,7 @@ DOCKER_INSTRUCTIONS = frozenset((
 KEYS_SHELL = ("name", "shell", "run")
 KEYS_PLAIN = ("name", "run")
 TOP_KEYS = ("name", "on", "permissions", "concurrency", "jobs")
+RELEASE_JOBS = tuple(RELEASE_JOB_PERMISSIONS)
 JOB_KEYS = ("name", "needs", "runs-on", "permissions", "strategy", "steps")
 SBOM_JOB_KEYS = ("name", "needs", "runs-on", "permissions", "steps")
 RELEASE_RUNS_ON = "${{ matrix.os }}"
@@ -235,12 +373,6 @@ MATRIX_VALUE_RE = {
 # file system), not part of a longer word, option or file name (`Cargo.toml`).
 BUILD_TOOL_RE = re.compile(r"(?<![\w.-])(?:cargo-zigbuild|cargo|rustc|cross)(?![\w.-])", re.I)
 SBOM_TOOL_RE = re.compile(r"(?<![\w-])cargo(?![\w-]).*?\scyclonedx(?![\w-])", re.I)
-# An action that builds or pushes an image (matched on the lower-cased `uses`).
-IMAGE_BUILDER_RE = re.compile(r"build-push|buildx|buildah|buildkit|buildpack|kaniko|nerdctl|podman|docker")
-# A run-text command that builds or ships an image.
-IMAGE_CMD_RE = re.compile(
-    r"(?<![\w./-])(?:(?:docker|podman|nerdctl|buildah)\s+(?:-\S+\s+)*(?:build|buildx|bake|builder|push|image|commit|import|"
-    r"load|compose|run|manifest|buildx)|buildctl|kaniko)(?![\w-])", re.I)
 # Quote and backslash characters bash removes inside a word (`c''argo`, `ca\rgo`).
 QUOTE_RE = re.compile(r"['\"\\]")
 INLINE_USE_RE = re.compile(r"\$\(\s*bash [^)]*release-features\.sh|`\s*bash [^`]*release-features\.sh")
@@ -264,6 +396,7 @@ SCALAR_FORMS = (
 FROM_RE = re.compile(r"FROM(?: --platform=\S+)? (?P<image>\S+)(?: AS (?P<name>[A-Za-z][A-Za-z0-9_.-]*))?", re.I)
 BINARY_COPY_RE = re.compile(r"COPY --from=(?P<stage>\S+) /build/target/release/ai-memory /usr/local/bin/ai-memory")
 FROM_FLAG_RE = re.compile(r"--from=(?P<src>\S+)", re.I)
+BK_CONT_RE = re.compile(r"(^|[^\\])\\[ \t]*$")  # BuildKit lineContinuationRegex for the default escape `\`
 DIRECTIVE_RE = re.compile(r"^[ \t]*#[ \t]*(?:syntax|escape|check)[ \t]*=", re.I)
 
 
@@ -277,55 +410,98 @@ def is_blank_or_comment(line: str) -> bool:
     return not s or s.startswith("#")
 
 
-def logical_lines(lines: List[str], buildkit: bool = False) -> List[str]:
-    """Normalise to logical lines: whole-line comments and blanks dropped, ``\\``
-    continuations joined, runs of spaces/tabs collapsed (ONLY spaces and tabs:
-    any other Unicode space is refused by CONTROL_RE, never folded). NOTHING
-    else is interpreted: a trailing ``#`` stays in the line.
+def _collapse(text: str) -> str:
+    """Runs of spaces/tabs collapsed, ends stripped (ONLY spaces and tabs: any
+    other Unicode space is refused by CONTROL_RE, never folded)."""
+    return re.sub(r"[ \t]+", " ", text).strip(" ")
 
-    Inside an open continuation the two readers differ, and each is modelled on
-    the reader that runs the text. SHELL text (``buildkit=False``): bash joins
-    only the backslash-newline, so a comment line inside the continuation is
-    KEPT (it can only add refusals) and a blank line ends the command.
-    DOCKERFILE text (``buildkit=True``, the BuildKit parser): a comment line is
-    DROPPED before the shell sees it and a blank line is an empty continuation
-    line, skipped, so the instruction keeps joining across both. A reader that
-    ended the instruction at a blank line would see a different instruction
-    boundary than BuildKit does."""
-    out: List[str] = []
-    buf = ""
-    for raw in lines:
-        line = raw.strip(" \t")
-        if not line or line.startswith("#"):
-            if buf and not buildkit:
-                if not line:
-                    out.append(re.sub(r"[ \t]+", " ", buf).strip(" "))
-                    buf = ""
-                    continue
-            else:
-                continue
-        if line.endswith("\\"):
-            buf += line[:-1].rstrip(" \t") + " "
+
+def bk_instructions(lines: List[str]) -> List[Tuple[int, int, str]]:
+    """The BuildKit (v0.23 parser) instructions of a Dockerfile as (first line,
+    last line, text), 1-based. A physical line continues iff it matches
+    BK_CONT_RE; the ``\\`` and its trailing spaces/tabs are removed and the next
+    line is appended AS WRITTEN (its leading whitespace kept, so ``RUN ca\\`` +
+    ``rgo`` is ``RUN cargo``). Inside a continuation a whole-line comment is
+    dropped and a blank line skipped; outside one both are skipped. End of file
+    inside a continuation emits what was read, even when it is empty, as
+    BuildKit does. The text is then collapsed."""
+    out: List[Tuple[int, int, str]] = []
+    buf: Optional[str] = None
+    start = 0
+    for n, raw in enumerate(lines, 1):
+        s = raw.strip(" \t")
+        if not s or s.startswith("#"):
             continue
-        out.append(re.sub(r"[ \t]+", " ", buf + line).strip(" "))
-        buf = ""
-    if buf.strip(" \t"):
-        out.append(re.sub(r"[ \t]+", " ", buf).strip(" "))
+        if buf is None:
+            start, piece = n, raw.lstrip(" \t")
+        else:
+            piece = raw
+        m = BK_CONT_RE.search(piece)
+        if m is not None:
+            buf = (buf or "") + piece[: m.start()] + m.group(1)
+            continue
+        out.append((start, n, _collapse((buf or "") + piece)))
+        buf = None
+    if buf is not None:
+        out.append((start, len(lines), _collapse(buf)))
     return out
+
+
+def logical_lines(lines: List[str], buildkit: bool = False) -> List[str]:
+    """Normalise to logical lines, collapsed (see _collapse). NOTHING else is
+    interpreted: a trailing ``#`` stays in the line.
+
+    DOCKERFILE text (``buildkit=True``) is joined exactly as BuildKit joins it
+    (bk_instructions). SHELL text (``buildkit=False``) is joined as bash joins
+    it: only a line ending in an ODD number of backslashes with nothing after
+    them continues; one backslash is removed and the next line is appended as
+    written. Outside a continuation whole-line comments and blanks are dropped;
+    inside one a comment line is KEPT (it can only add refusals) and a blank
+    line ends the command. The guard refuses every continued line outside the
+    canonical Dockerfile RUN, so these joins only have to be exact, not lenient."""
+    if buildkit:
+        return [text for _, _, text in bk_instructions(lines)]
+    out: List[str] = []
+    buf: Optional[str] = None
+    for raw in lines:
+        s = raw.strip(" \t")
+        if buf is None and (not s or s.startswith("#")):
+            continue
+        if buf is not None and not s:
+            if _collapse(buf):
+                out.append(_collapse(buf))
+            buf = None
+            continue
+        cur = (buf or "") + raw
+        if (len(raw) - len(raw.rstrip("\\"))) % 2 == 1:
+            buf = cur[:-1]
+            continue
+        out.append(_collapse(cur))
+        buf = None
+    if buf is not None and _collapse(buf):
+        out.append(_collapse(buf))
+    return out
+
+
+def continued_lines(lines: List[str]) -> List[int]:
+    """1-based numbers of the lines that end in ``\\`` (trailing spaces/tabs
+    ignored): every one a reader might join to the next line."""
+    return [n for n, raw in enumerate(lines, 1) if raw.rstrip(" \t").endswith("\\")]
 
 
 def continuation_noise(lines: List[str]) -> List[int]:
     """1-based numbers of the blank and whole-line comment lines that sit inside an
-    open ``\\`` continuation (BuildKit drops them silently)."""
+    open BuildKit continuation (BuildKit drops them silently). Used by the parity
+    self-checks; the guard itself refuses the continuation."""
     noise: List[int] = []
     open_ = False
     for n, raw in enumerate(lines, 1):
-        line = raw.strip(" \t")
-        if not line or line.startswith("#"):
+        s = raw.strip(" \t")
+        if not s or s.startswith("#"):
             if open_:
                 noise.append(n)
             continue
-        open_ = line.endswith("\\")
+        open_ = BK_CONT_RE.search(raw) is not None
     return noise
 
 
@@ -670,11 +846,11 @@ def nearest_problem(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], e
 
 
 def one_unit(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], expected: Tuple[str, ...], what: str,
-             rep: Report, norm: Norm = _same) -> List[int]:
+             rep: Report, const: str, norm: Norm = _same) -> List[int]:
     found = canonical(steps, want_keys, expected, norm)
     if len(found) != 1:
         rep.bad(f"{what} must have exactly one step with exactly the allowed body (found {len(found)})"
-                + (": " + nearest_problem(steps, want_keys, expected, norm) if not found else ""))
+                + (": " + nearest_problem(steps, want_keys, expected, norm) if not found else "") + pin_hint(const))
     return found
 
 
@@ -713,40 +889,41 @@ def check_matrix(job: Node, rep: Report) -> None:
             or st.get("fail-fast").text() != "false" or matrix is None or matrix.keys() != ["include"]
             or include is None or include.kind != "seq"):
         rep.bad("release.yml release job `strategy:` must be exactly `fail-fast: false` plus `matrix:` with only "
-                "`include:` entries (no other axis, no `exclude:`, no expression)")
+                "`include:` entries (no other axis, no `exclude:`, no expression; the shape is fixed in check_matrix in "
+                f"{GUARD_PATH})")
         return
     targets: List[str] = []
     for n, entry in enumerate(include.value if isinstance(include.value, list) else []):
         keys = set(entry.keys())
         if entry.kind != "map" or not set(MATRIX_REQUIRED) <= keys <= set(MATRIX_VALUE_RE):
             rep.bad(f"release.yml release matrix entry {n + 1}: keys {sorted(keys)}; the allowed keys are "
-                    f"{list(MATRIX_REQUIRED)} plus optionally `nfpm_arch`")
+                    f"{list(MATRIX_REQUIRED)} plus optionally `nfpm_arch`" + pin_hint("MATRIX_REQUIRED"))
         for key in sorted(keys):
             val = entry.get(key)
             rx = MATRIX_VALUE_RE.get(key)
             if rx is not None and (val is None or val.style != "plain" or not rx.fullmatch(val.text())):
                 rep.bad(f"release.yml release matrix entry {n + 1}: `{key}:` must be an unquoted literal matching "
                         f"`{rx.pattern}` (it is substituted into the pinned build and assert text before bash runs: "
-                        "no expression, quote, space or shell metacharacter)")
+                        "no expression, quote, space or shell metacharacter)" + pin_hint("MATRIX_VALUE_RE"))
         tv = entry.get("target")
         targets.append(tv.text() if tv is not None else "")
     if sorted(targets) != sorted(RELEASE_TARGETS):
         rep.bad(f"release.yml release matrix targets {sorted(targets)} differ from the pinned set "
-                f"{sorted(RELEASE_TARGETS)}; if the release matrix legitimately changes, update RELEASE_TARGETS in "
-                "scripts/check_release_features.py in the same commit")
+                f"{sorted(RELEASE_TARGETS)}" + pin_hint("RELEASE_TARGETS"))
 
 
 def check_release_job(job: Node, rep: Report) -> None:
     if set(job.keys()) != set(JOB_KEYS):
         rep.bad(f"release.yml release job keys {job.keys()} differ from the pinned skeleton {list(JOB_KEYS)} (a job "
-                "`if:`, `env:`, `defaults:`, `container:` or `continue-on-error:` can skip or neutralise the assert)")
+                "`if:`, `env:`, `defaults:`, `container:` or `continue-on-error:` can skip or neutralise the assert)"
+                + pin_hint("JOB_KEYS"))
     ro = job.get("runs-on")
     if ro is None or ro.style != "plain" or ro.text() != RELEASE_RUNS_ON:
-        rep.bad(f"release.yml release job `runs-on:` must be exactly `{RELEASE_RUNS_ON}`")
+        rep.bad(f"release.yml release job `runs-on:` must be exactly `{RELEASE_RUNS_ON}`" + pin_hint("RELEASE_RUNS_ON"))
     check_matrix(job, rep)
     steps = job_steps(job, "release.yml release job", rep)
-    builds = one_unit(steps, KEYS_SHELL, WF_BUILD, "release.yml: the release job build", rep)
-    asserts = one_unit(steps, KEYS_SHELL, WF_ASSERT, "release.yml: the release job strict assert", rep)
+    builds = one_unit(steps, KEYS_SHELL, WF_BUILD, "release.yml: the release job build", rep, "WF_BUILD")
+    asserts = one_unit(steps, KEYS_SHELL, WF_ASSERT, "release.yml: the release job strict assert", rep, "WF_ASSERT")
     if builds and asserts and min(asserts) < max(builds):
         rep.bad("release.yml: the strict assert must run after the build, in the same job")
     for i, st in steps:
@@ -760,83 +937,185 @@ def check_release_job(job: Node, rep: Report) -> None:
 
 def check_sbom_job(job: Node, rep: Report) -> None:
     if set(job.keys()) != set(SBOM_JOB_KEYS):
-        rep.bad(f"release.yml sbom job keys {job.keys()} differ from the pinned skeleton {list(SBOM_JOB_KEYS)}")
-    one_unit(job_steps(job, "release.yml sbom job", rep), KEYS_PLAIN, WF_SBOM, "release.yml: the `sbom:` job SBOM", rep)
+        rep.bad(f"release.yml sbom job keys {job.keys()} differ from the pinned skeleton {list(SBOM_JOB_KEYS)}"
+                + pin_hint("SBOM_JOB_KEYS"))
+    one_unit(job_steps(job, "release.yml sbom job", rep), KEYS_PLAIN, WF_SBOM, "release.yml: the `sbom:` job SBOM", rep, "WF_SBOM")
 
 
-def check_image_step(step: Node, at: str, rep: Report) -> None:
-    """The image-build step is an ALLOWLIST: its keys, its `uses` and every `with:`
-    key and value are pinned, so no `file`, `target`, `build-contexts`,
-    `build-args` (a frontend or syntax override), other `context` or any key the
-    guard has not read can be added."""
-    if set(step.keys()) != set(IMAGE_BUILD_KEYS):
-        rep.bad(f"release.yml: the image build at {at} has keys {sorted(step.keys())}; the only allowed set is "
-                f"{sorted(IMAGE_BUILD_KEYS)} (a step `env:`, `if:` or `working-directory:` changes what is built)")
-    name = step.get("name")
-    if name is not None and "${{" in name.text():
-        rep.bad(f"release.yml: the image build at {at}: the step `name:` carries a `${{{{ }}}}` expression")
-    ident = step.get("id")
-    if ident is None or ident.style != "plain" or ident.text() != "build":
-        rep.bad(f"release.yml: the image build at {at} must have `id: build` (the provenance step reads its digest)")
-    with_ = step.get("with")
-    if with_ is None or with_.kind != "map":
-        rep.bad(f"release.yml: the image build at {at} must have a `with:` mapping")
+def pin_problem(node: Optional[Node], spec: Spec, path: str) -> str:
+    """Why ``node`` is not exactly the pinned ``spec`` ("" when it is). A mapping
+    must have exactly the pinned keys, a sequence exactly the pinned items."""
+    if node is None:
+        return f"`{path}` is missing"
+    if isinstance(spec, dict):
+        if node.kind != "map":
+            return f"`{path}` must be a mapping (got {node.kind})"
+        if set(node.keys()) != set(spec):
+            extra, lost = sorted(set(node.keys()) - set(spec)), sorted(set(spec) - set(node.keys()))
+            return f"`{path}` keys differ from the pinned set (extra {extra}, missing {lost})"
+        for key, sub in spec.items():
+            why = pin_problem(node.get(key), sub, f"{path}.{key}")
+            if why:
+                return why
+        return ""
+    if isinstance(spec, list):
+        items = node.value if node.kind == "seq" and isinstance(node.value, list) else None
+        if items is None or len(items) != len(spec):
+            return f"`{path}` must be a sequence of exactly {len(spec)} items (got {node.kind}" + (
+                f" of {len(items)})" if items is not None else ")")
+        for n, (item, sub) in enumerate(zip(items, spec)):
+            why = pin_problem(item, sub, f"{path}.{n + 1}")
+            if why:
+                return why
+        return ""
+    if spec is None:
+        return "" if node.kind == "null" else f"`{path}` must have no value (got {node.kind})"
+    if isinstance(spec, Block):
+        if node.kind == "block" and node.style == "|" and tuple(node.value) == tuple(spec):  # type: ignore[arg-type]
+            return ""
+        return f"`{path}` must be exactly the `|` block {list(spec)}"
+    style = "flow" if isinstance(spec, Flow) else "double" if isinstance(spec, Double) else "plain"
+    if node.kind == "scalar" and node.style == style and node.text() == spec:
+        return ""
+    got = node.text() if node.kind == "scalar" else ""
+    return f"`{path}` must be exactly the {style} value `{spec}` (got {node.kind} {node.style or ''} `{got[:60]}`)"
+
+
+def pin_hint(const: str) -> str:
+    """The actionable tail of every pin-mismatch message."""
+    return f"; if this change is intended, update {const} in {GUARD_PATH} in the same commit"
+
+
+def pin_message(label: str, why: str, const: str) -> str:
+    return f"{label}: {why}{pin_hint(const)}"
+
+
+def docker_step_message(step: Node, spec: Spec, n: int) -> str:
+    """The one message for docker job step ``n`` ("" when it is the pinned step).
+    A changed SHA of a pinned action (a Dependabot bump) names its constant; the
+    rest of the step is then compared as if the new SHA were pinned."""
+    at = f"jobs.docker.steps.{n + 1}"
+    role = f"release.yml ({DOCKER_STEP_ROLES[n]} step)"
+    uses = step.get("uses") if step.kind == "map" else None
+    want = spec.get("uses") if isinstance(spec, dict) else None
+    if (isinstance(want, str) and uses is not None and uses.kind == "scalar" and uses.style == "plain"
+            and uses.text() != want and uses.text().split("@")[0] == want.split("@")[0]):
+        const = USES_CONSTANTS[want]
+        rest = dict(spec)  # type: ignore[arg-type]
+        rest["uses"] = uses.text()
+        why = pin_problem(step, rest, at)
+        return (f"{role}: `{at}.uses` is `{uses.text()}` but {const} pins `{want}` (an action SHA bump, e.g. "
+                f"Dependabot): update {const} in {GUARD_PATH} to the new SHA in the same commit"
+                + (f"; also {why}" if why else ""))
+    why = pin_problem(step, spec, at)
+    return pin_message(role, why, "DOCKER_STEPS") if why else ""
+
+
+def check_docker_job(jobs: Node, rep: Report) -> None:
+    """The docker job holds `packages: write`, so it is pinned WHOLE: its keys and
+    values (DOCKER_JOB) and its exact ordered steps (DOCKER_STEPS: keys, SHA-pinned
+    `uses`, `with:` inputs, run text). No `env:`, `container:`, `defaults:`,
+    `services:`, `strategy:` or extra step can be added."""
+    job = jobs.get("docker")
+    if job is None or job.kind != "map":
+        rep.bad("release.yml: the `docker:` job is missing or not a mapping (the GHCR image is built and pushed only by "
+                "the pinned `docker:` job)")
         return
-    allowed = set(IMAGE_BUILD_SCALARS) | set(IMAGE_BUILD_BLOCKS)
-    if set(with_.keys()) != allowed:
-        extra, lost = sorted(set(with_.keys()) - allowed), sorted(allowed - set(with_.keys()))
-        rep.bad(f"release.yml: the image build at {at} `with:` keys differ from the only allowed set "
-                f"(extra {extra}, missing {lost}); `file`, `target`, `build-contexts`, `build-args` and any other input "
-                "would ship something the guard did not read")
-    for key, want in IMAGE_BUILD_SCALARS.items():
-        val = with_.get(key)
-        if val is not None and (val.style != "plain" or val.text() != want):
-            rep.bad(f"release.yml: the image build at {at} `with: {key}:` must be exactly the plain value `{want}`"
-                    + (" (the build context is the repository root, whose ./Dockerfile the guard reads)" if key == "context" else ""))
-    for key, want_lines in IMAGE_BUILD_BLOCKS.items():
-        val = with_.get(key)
-        if val is not None and not (val.kind == "block" and val.style == "|" and tuple(val.value) == want_lines):
-            rep.bad(f"release.yml: the image build at {at} `with: {key}:` must be exactly the pinned `|` block {list(want_lines)}")
+    want_keys = set(DOCKER_JOB) | {"steps"}
+    if set(job.keys()) != want_keys:
+        extra, lost = sorted(set(job.keys()) - want_keys), sorted(want_keys - set(job.keys()))
+        rep.bad(pin_message("release.yml", f"`jobs.docker` keys differ from the pinned set (extra {extra}, missing "
+                            f"{lost}; a job `env:`, `container:`, `defaults:`, `services:` or `strategy:` changes what is "
+                            "built or pushed)", "DOCKER_JOB"))
+    for key, spec in DOCKER_JOB.items():
+        why = pin_problem(job.get(key), spec, f"jobs.docker.{key}")
+        if why:
+            rep.bad(pin_message("release.yml", why, "DOCKER_JOB"))
+    steps = job.get("steps")
+    items = steps.value if steps is not None and steps.kind == "seq" and isinstance(steps.value, list) else None
+    if items is None:
+        rep.bad(pin_message("release.yml", "`jobs.docker.steps` must be a sequence", "DOCKER_STEPS"))
+        return
+    if len(items) != len(DOCKER_STEPS):
+        first = next((n for n in range(max(len(items), len(DOCKER_STEPS)))
+                      if n >= len(items) or n >= len(DOCKER_STEPS) or docker_step_message(items[n], DOCKER_STEPS[n], n)),
+                     0)
+        rep.bad(pin_message("release.yml", f"the docker job has {len(items)} steps, the pinned list has "
+                            f"{len(DOCKER_STEPS)} (an extra step can build or push an image the guard never read); the "
+                            f"first difference is step {first + 1}", "DOCKER_STEPS"))
+        return
+    for n, (step, spec) in enumerate(zip(items, DOCKER_STEPS)):
+        msg = docker_step_message(step, spec, n)
+        if msg:
+            rep.bad(msg)
 
 
-def check_docker_actions(jobs: Node, rep: Report) -> None:
-    """Every image-building action in release.yml is pinned case-exact, the image
-    build lives once in the `docker:` job, and no run text builds an image."""
-    builds: List[Tuple[str, Node]] = []
-    for jname, job in (jobs.value.items() if isinstance(jobs.value, dict) else []):
-        juses = job.get("uses")
-        if juses is not None and IMAGE_BUILDER_RE.search(juses.text().lower()):
-            rep.bad(f"release.yml: job `{jname}` calls the reusable workflow `{juses.text()[:60]}`, an image builder the guard cannot read")
-        steps = job.get("steps")
-        for i, st in enumerate(steps.value if steps is not None and steps.kind == "seq" and isinstance(steps.value, list) else []):
-            if st.kind != "map":
-                continue
-            at = f"jobs.{jname}.steps.{i + 1}"
-            uses = st.get("uses")
-            if uses is not None:
-                text = uses.text()
-                if IMAGE_BUILDER_RE.search(text.lower()):
-                    if uses.style != "plain" or text not in DOCKER_ACTIONS:
-                        rep.bad(f"release.yml: {at} uses `{text[:70]}`; an image builder must be exactly one of "
-                                f"{sorted(DOCKER_ACTIONS)} (owner/action are case-exact, the SHA is pinned)")
-                    elif text == IMAGE_BUILD_USES:
-                        builds.append((at, st))
-                    elif text == BUILDX_USES and set(st.keys()) != {"name", "uses"}:
-                        rep.bad(f"release.yml: {at} (buildx setup) may carry only `name` and `uses` (a driver or "
-                                "buildkitd option changes how the image is built)")
-                    elif text == LOGIN_USES:
-                        lw = st.get("with")
-                        if set(st.keys()) != {"name", "uses", "with"} or lw is None or set(lw.keys()) != set(LOGIN_WITH_KEYS):
-                            rep.bad(f"release.yml: {at} (registry login) may carry only `name`, `uses` and `with: "
-                                    f"{list(LOGIN_WITH_KEYS)}`")
-            for t in node_texts(st):
-                if IMAGE_CMD_RE.search(unquoted(t)):
-                    rep.bad(f"release.yml: {at} runs an image build or push command outside the pinned build action: {t[:70]}")
-    if len(builds) != 1 or not builds[0][0].startswith("jobs.docker."):
-        rep.bad(f"release.yml: the image must be built by exactly one `{IMAGE_BUILD_USES.split('@')[0]}` step in the "
-                f"`docker:` job (found {[at for at, _ in builds]})")
-    for at, st in builds:
-        check_image_step(st, at, rep)
+def check_release_permissions(doc: Node, jobs: Node, rep: Report) -> None:
+    """The job set and every job's `permissions:` are pinned; `packages: write`
+    is the docker job's alone (#4719 SR-8)."""
+    why = pin_problem(doc.get("permissions"), RELEASE_TOP_PERMISSIONS, "permissions")
+    if why:
+        rep.bad(pin_message("release.yml", why + " (`packages: write` belongs to the docker job only)",
+                            "RELEASE_TOP_PERMISSIONS"))
+    if set(jobs.keys()) != set(RELEASE_JOBS):
+        extra, lost = sorted(set(jobs.keys()) - set(RELEASE_JOBS)), sorted(set(RELEASE_JOBS) - set(jobs.keys()))
+        rep.bad(pin_message("release.yml", f"the job set differs from the pinned one (extra {extra}, missing {lost})",
+                            "RELEASE_JOB_PERMISSIONS"))
+    for name, want in RELEASE_JOB_PERMISSIONS.items():
+        job = jobs.get(name)
+        if job is None or job.kind != "map":
+            continue
+        if job.get("uses") is not None:
+            rep.bad(f"release.yml: `jobs.{name}` calls a reusable workflow (`uses:`), which the guard cannot read")
+        perms = job.get("permissions")
+        if want is None:
+            if perms is not None:
+                rep.bad(pin_message("release.yml", f"`jobs.{name}.permissions` is declared; the pinned job inherits the "
+                                    "top-level `contents: write` and declares none", "RELEASE_JOB_PERMISSIONS"))
+            continue
+        why = pin_problem(perms, want, f"jobs.{name}.permissions")
+        if why:
+            rep.bad(pin_message("release.yml", why, "RELEASE_JOB_PERMISSIONS"))
+
+
+def node_lines(node: Node) -> Iterator[Tuple[int, str]]:
+    """(0-based line, text) of a scalar, or of each line of a block scalar."""
+    if node.kind == "scalar":
+        yield node.line, node.text()
+    elif node.kind == "block" and isinstance(node.value, list):
+        for k, line in enumerate(node.value):
+            yield node.line + 1 + k, line
+
+
+def check_secrets_and_registry(doc: Node, rep: Report) -> None:
+    """Every `secrets` reference is `secrets.<NAME>` with NAME in RELEASE_SECRETS,
+    no key is named `secrets`, and the image registry is named only inside the
+    pinned docker job."""
+    for path, node in walk(doc):
+        if path and path[-1].lower() == "secrets":
+            rep.bad(f"release.yml: `{'.'.join(path)}` passes secrets on (a `secrets:` key is refused)")
+        in_docker = path[:2] == ("jobs", "docker")
+        for line, text in node_lines(node):
+            for m in SECRET_REF_RE.finditer(text):
+                if m.group("name") not in RELEASE_SECRETS or m.group(0) != "secrets." + str(m.group("name")):
+                    rep.bad(pin_message("release.yml", f"line {line + 1}: `{m.group(0)[:40]}` is not `secrets.<NAME>` "
+                                        "with a pinned NAME (a new credential is refused until it is pinned)",
+                                        "RELEASE_SECRETS"))
+            if not in_docker and REGISTRY in text.lower():
+                rep.bad(f"release.yml: line {line + 1}: `{REGISTRY}` outside the pinned `docker:` job (only that job may "
+                        f"address the image registry): {text.strip()[:70]}")
+
+
+def check_run_continuations(doc: Node, label: str, rep: Report) -> None:
+    """No run text line may end in a backslash: every pinned unit is compared statement by
+    statement, and a joined line is a second spelling the guard refuses to model."""
+    for path, node in walk(doc):
+        if not path or path[-1] != "run":
+            continue
+        for line, text in node_lines(node):
+            if text.rstrip(" \t").endswith("\\"):
+                rep.bad(f"{label}: line {line + 1}: a run line ends in `\\` (a line continuation; join the line, the "
+                        f"guard refuses continuations in run text): {text.strip()[:70]}")
 
 
 def check_release_yml(text: str, rep: Report) -> None:
@@ -846,18 +1125,21 @@ def check_release_yml(text: str, rep: Report) -> None:
     if doc is None:
         return
     check_blocks(doc, "release.yml", rep)
+    check_run_continuations(doc, "release.yml", rep)
+    check_secrets_and_registry(doc, rep)
     for key in doc.keys():
         if key not in TOP_KEYS:
-            rep.bad(f"release.yml top level: `{key}:` is not allowed (allowed: {', '.join(TOP_KEYS)})")
+            rep.bad(f"release.yml top level: `{key}:` is not allowed (allowed: {', '.join(TOP_KEYS)})" + pin_hint("TOP_KEYS"))
     jobs = doc.get("jobs")
     if not want_kind(jobs, "map", "release.yml `jobs:`", rep) or jobs is None:
         return
+    check_release_permissions(doc, jobs, rep)
     release, sbom = jobs.get("release"), jobs.get("sbom")
     if want_kind(release, "map", "release.yml `jobs.release`", rep) and release is not None:
         check_release_job(release, rep)
     if want_kind(sbom, "map", "release.yml `jobs.sbom`", rep) and sbom is not None:
         check_sbom_job(sbom, rep)
-    check_docker_actions(jobs, rep)
+    check_docker_job(jobs, rep)
 
 
 def docker_nearest(builder: List[str]) -> str:
@@ -874,17 +1156,28 @@ def check_dockerfile(text: str, rep: Report) -> None:
     raw = text.split("\n")
     if raw[0] != DOCKER_SYNTAX:
         rep.bad(f"Dockerfile: line 1 must be exactly `{DOCKER_SYNTAX}` (the syntax directive picks the frontend that "
-                f"parses the file): {raw[0][:60]}")
+                f"parses the file): {raw[0][:60]}" + pin_hint("DOCKER_SYNTAX"))
     for n, ln in enumerate(raw[1:], 2):
         if DIRECTIVE_RE.match(ln):
             rep.bad(f"Dockerfile: line {n}: a parser directive other than the pinned line-1 syntax (an `escape` "
                     f"directive changes what a line continuation is): {ln.strip()[:60]}")
     stages: List[Tuple[Optional[str], List[str]]] = []
     names: Dict[str, int] = {}
-    for n in continuation_noise(raw):
-        rep.bad(f"Dockerfile: line {n}: a blank or comment line inside a `\\` continuation (BuildKit drops it, a shell "
-                f"never sees it; the instruction text must be exactly what is written): {raw[n - 1].strip()[:60]}")
-    for ins in logical_lines(raw, buildkit=True):
+    spans = bk_instructions(raw)
+    canon_lines: set = set()
+    for first, last, ins in spans:
+        if ins == DOCKER_RUN:
+            if tuple(raw[first - 1:last]) == DOCKER_RUN_LINES:
+                canon_lines.update(range(first, last + 1))
+            else:
+                rep.bad(pin_message("Dockerfile", f"line {first}: the build RUN is not written exactly as the pinned "
+                                    "physical lines (compared line by line, no comment or blank line inside)",
+                                    "DOCKER_RUN_LINES"))
+    for n in continued_lines(raw):
+        if n not in canon_lines:
+            rep.bad(f"Dockerfile: line {n}: a line ending in `\\` outside the canonical build RUN (DOCKER_RUN_LINES in "
+                    f"{GUARD_PATH}); continuations are refused everywhere else: {raw[n - 1].strip()[:60]}")
+    for _, _, ins in spans:
         word = ins.split(" ", 1)[0].upper()
         if "--mount" in ins.lower():
             rep.bad(f"Dockerfile: `--mount` refused (a mount can overlay or import files the guard never read): {ins[:60]}")
@@ -936,7 +1229,7 @@ def check_dockerfile(text: str, rep: Report) -> None:
     for k, (_, body) in enumerate(stages):
         for pos, ins in enumerate(body):
             canon = k == bidx and pos == len(body) - 1 and ins == DOCKER_RUN
-            if BUILD_TOOL_RE.search(ins) and not canon:
+            if BUILD_TOOL_RE.search(unquoted(ins)) and not canon:
                 rep.bad(f"Dockerfile: a build tool outside the canonical build RUN (the last instruction of the stage the "
                         f"image copies the binary from): {ins[:80]}")
     builder = stages[bidx][1]
@@ -944,12 +1237,13 @@ def check_dockerfile(text: str, rep: Report) -> None:
         if FROM_FLAG_RE.search(ins):
             rep.bad(f"Dockerfile: the builder stage takes `--from` another stage or image: {ins[:60]}")
     if DOCKER_LOCK_COPY not in builder[:-2]:
-        rep.bad(f"Dockerfile: the builder stage does not `{DOCKER_LOCK_COPY}` before the build")
+        rep.bad(f"Dockerfile: the builder stage does not `{DOCKER_LOCK_COPY}` before the build" + pin_hint("DOCKER_LOCK_COPY"))
     if builder[-2:-1] != [DOCKER_DECL_COPY]:
-        rep.bad(f"Dockerfile: the builder stage must `{DOCKER_DECL_COPY}` immediately before the build RUN")
+        rep.bad(f"Dockerfile: the builder stage must `{DOCKER_DECL_COPY}` immediately before the build RUN"
+                + pin_hint("DOCKER_DECL_COPY"))
     if builder[-1:] != [DOCKER_RUN]:
         rep.bad("Dockerfile: the builder stage must END with exactly the allowed build+assert RUN (nothing after it); "
-                + docker_nearest(builder))
+                + docker_nearest(builder) + pin_hint("DOCKER_RUN"))
 
 
 def check_inline_use(name: str, text: str, rep: Report) -> None:
@@ -968,25 +1262,60 @@ def _shape_norm(lines: Tuple[str, ...]) -> Tuple[str, ...]:
     return lines
 
 
-def check_shape(text: str, rep: Report) -> None:
+def check_shape(text: str, rep: Report, advisory: Optional[bool] = None) -> None:
+    """release-shape.yml is pinned as a skeleton (#4719 SR-10): top-level keys,
+    `on:`, `permissions:` and `env:` values, the one job's keys and values, and
+    the build and proof units inside it. ``advisory`` defaults to SHAPE_ADVISORY."""
+    if advisory is None:
+        advisory = SHAPE_ADVISORY
+    check_no_bash_env("release-shape.yml", text, rep)
     doc = parse_yaml(text, "release-shape.yml", rep)
     if doc is None:
         return
     check_blocks(doc, "release-shape.yml", rep)
+    check_run_continuations(doc, "release-shape.yml", rep)
+    if doc.keys() != list(SHAPE_TOP_KEYS):
+        rep.bad(pin_message("release-shape.yml", f"top-level keys {doc.keys()} differ from the pinned "
+                            f"{list(SHAPE_TOP_KEYS)} (a top-level `defaults:` or `env:` change redirects every step)",
+                            "SHAPE_TOP_KEYS"))
+    for key, spec, const in (("on", SHAPE_ON, "SHAPE_ON"), ("permissions", SHAPE_PERMISSIONS, "SHAPE_PERMISSIONS"),
+                             ("env", SHAPE_ENV, "SHAPE_ENV")):
+        why = pin_problem(doc.get(key), spec, key)
+        if why:
+            rep.bad(pin_message("release-shape.yml", why, const))
     jobs = doc.get("jobs")
+    if jobs is None or jobs.kind != "map" or jobs.keys() != ["release-shape"]:
+        rep.bad("release-shape.yml: `jobs:` must be exactly the one `release-shape:` job" + pin_hint("SHAPE_JOB"))
     job = jobs.get("release-shape") if jobs is not None else None
-    if want_kind(job, "map", "release-shape.yml `jobs.release-shape`", rep) and job is not None:
-        # Job-level `continue-on-error: true` is the shipped, ruled "advisory until the first green run"
-        # state (#4480): the job still runs and its steps still fail. A job `if:` would skip the proof.
-        if job.get("if") is not None:
-            rep.bad("release-shape.yml: the `release-shape:` job carries `if:`, which can skip the proof")
-        steps = job_steps(job, "release-shape.yml release-shape job", rep)
-        builds = one_unit(steps, KEYS_SHELL, SHAPE_BUILD, "release-shape.yml: the `release-shape:` job build", rep)
-        proofs = one_unit(steps, KEYS_SHELL, SHAPE_PROOF, "release-shape.yml: the `release-shape:` job pg proof "
-                          "(an executing `bash scripts/release-shape-pg-proof.sh` run step; the `paths:` filter does not count)",
-                          rep, _shape_norm)
-        if builds and proofs and proofs[0] < builds[0]:
-            rep.bad("release-shape.yml: the pg proof must run after the release-shaped build, in the same job")
+    if not want_kind(job, "map", "release-shape.yml `jobs.release-shape`", rep) or job is None:
+        return
+    want_keys = set(SHAPE_JOB) | {"steps"}
+    if set(job.keys()) - {"continue-on-error"} != want_keys:
+        extra = sorted(set(job.keys()) - want_keys - {"continue-on-error"})
+        rep.bad(pin_message("release-shape.yml", f"`jobs.release-shape` keys {job.keys()} differ from the pinned set "
+                            f"(extra {extra}, missing {sorted(want_keys - set(job.keys()))}; `needs:`, `if:`, `env:`, "
+                            "`defaults:`, `container:` or `services:` can skip or redirect the proof)", "SHAPE_JOB"))
+    for key, spec in SHAPE_JOB.items():
+        why = pin_problem(job.get(key), spec, f"jobs.release-shape.{key}")
+        if why:
+            rep.bad(pin_message("release-shape.yml", why, "SHAPE_JOB"))
+    coe = job.get("continue-on-error")
+    if advisory:
+        why = pin_problem(coe, "true", "jobs.release-shape.continue-on-error")
+        if why:
+            rep.bad(f"release-shape.yml: {why}; while SHAPE_ADVISORY is True in {GUARD_PATH} (#4480) the job carries "
+                    "exactly the plain `continue-on-error: true`")
+    elif coe is not None:
+        rep.bad(f"release-shape.yml: `jobs.release-shape.continue-on-error` is set but SHAPE_ADVISORY is False in "
+                f"{GUARD_PATH} (#4720: the job is required, a failing proof must fail the run)")
+    steps = job_steps(job, "release-shape.yml release-shape job", rep)
+    builds = one_unit(steps, KEYS_SHELL, SHAPE_BUILD, "release-shape.yml: the `release-shape:` job build", rep,
+                      "SHAPE_BUILD")
+    proofs = one_unit(steps, KEYS_SHELL, SHAPE_PROOF, "release-shape.yml: the `release-shape:` job pg proof "
+                      "(an executing `bash scripts/release-shape-pg-proof.sh` run step; the `paths:` filter does not count)",
+                      rep, "SHAPE_PROOF", _shape_norm)
+    if builds and proofs and proofs[0] < builds[0]:
+        rep.bad("release-shape.yml: the pg proof must run after the release-shaped build, in the same job")
 
 
 def check_install(text: str, rep: Report) -> None:
@@ -998,7 +1327,7 @@ def check_install(text: str, rep: Report) -> None:
         rep.bad("docs/INSTALL.md still says the postgres path needs a source build")
 
 
-def run_guard(root: Path) -> Tuple[List[str], str]:
+def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], str]:
     rep = Report()
     feat = load(root / "scripts" / "release-features.sh", "scripts/release-features.sh", rep, False)
     rel = load(root / ".github" / "workflows" / "release.yml", ".github/workflows/release.yml", rep, True)
@@ -1028,7 +1357,7 @@ def run_guard(root: Path) -> Tuple[List[str], str]:
     if docker is not None:
         check_dockerfile(docker, rep)
     if shape is not None:
-        check_shape(shape, rep)
+        check_shape(shape, rep, advisory)
     if install is not None:
         check_install(install, rep)
     return rep.errors, declared
@@ -1139,7 +1468,7 @@ D_FINAL = "FROM debian:bookworm-slim\n"
 D_WORKDIR = "WORKDIR /build\n"
 D_LOCK = DOCKER_LOCK_COPY + "\n"
 D_BIN = "COPY --from=builder /build/target/release/ai-memory /usr/local/bin/ai-memory\n"
-SHAPE_JOB = "\n  release-shape:\n"
+SHAPE_JOB_HDR = "\n  release-shape:\n"
 
 
 def _docker(old: str, new: Union[str, Transform], every: bool = False) -> Edit:
@@ -1235,13 +1564,50 @@ def _d(old: str, new: str) -> Edit:
     return _docker(old, new)
 
 
+DOCKER_HDR = "\n  docker:\n    name: Docker (GHCR)\n"
+DOCKER_HEAD = ("needs: [preflight, qualify, supply-chain]\n    if: needs.preflight.outputs.is_prerelease == 'false'\n"
+               "    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      packages: write\n")
+CRATES_STEPS = ("    # CARGO_REGISTRY_TOKEN is scoped to the `release` Environment (#3546 D4).\n"
+                "    environment: release\n    steps:\n")
+COPR_HDR = "  copr:\n    name: Fedora COPR\n"
+LOGIN_PW = "          password: ${{ secrets.GITHUB_TOKEN }}\n"
+SHAPE_NAME = '    name: "Release-shaped build + PG TLS proof"\n'
+REL_PERMS = "      id-token: write\n      attestations: write\n    strategy:\n"
+
+
+def _docker_extra_step(body: str) -> List[Edit]:
+    """A new docker-job step before the image build."""
+    return [_rel(BUILD_IMG_NAME, "      - name: extra\n" + body + BUILD_IMG_NAME)]
+
+
+def _docker_step_last(text: str) -> str:
+    """An extra docker-job step after the provenance attestation (the last pinned step)."""
+    c = text.index("\n  copr:\n")
+    return text[:c].rstrip("\n") + "\n      - name: extra\n        run: echo done\n\n" + text[c:]
+
+
+def _docker_job_scalar(text: str) -> str:
+    a, c = text.index("\n  docker:\n"), text.index("\n  copr:\n")
+    return text[:a] + "\n  docker: none\n" + text[c:]
+
+
+def _docker_steps_scalar(text: str) -> str:
+    a, c = text.index("\n  docker:\n"), text.index("\n  copr:\n")
+    s = text.index("    steps:\n", a)
+    return text[:s] + "    steps: none\n" + text[c:]
+
+
+def _shape(old: str, new: Union[str, Transform]) -> Edit:
+    return (SHAPE, old, new, False)
+
+
 # name -> (want, edits). want: "pass" (guard accepts), "fail" (guard refuses),
 # "input-error" (guard exits 2). `--mutation-sweep` neutralises every refusal
 # site in turn and requires `--self-test` to go red, so each "fail" case must be
 # refused by a distinct refusal, not merely by a neighbour.
 CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "unmutated": ("pass", []),
-    "valid multi-line build": ("pass", [_rel(
+    "C1 multi-line build (a run continuation) is refused": ("fail", [_rel(
         REL_BUILD_CMD,
         IND + 'cargo build --locked --release \\\n            --target ${{ matrix.target }} \\\n            --features "$FEATURES"')]),
     "valid whole-line comments between statements": ("pass", [_rel(
@@ -1517,7 +1883,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "L6/J5 SBOM copied into a decoy job": ("fail", [_rel(
         SBOM_HDR, _append_job("      - name: x\n        run: cargo cyclonedx --format json --features sal\n"))]),
     "L6 sbom job carries an if": ("fail", [_rel(SBOM_JOB, SBOM_JOB + "    if: false\n")]),
-    "release-shape build job renamed": ("fail", [(SHAPE, SHAPE_JOB, "\n  release-shape-x:\n", False)]),
+    "release-shape build job renamed": ("fail", [(SHAPE, SHAPE_JOB_HDR, "\n  release-shape-x:\n", False)]),
     # --- #4719 SR-3/M2: Dockerfile directives, heredocs, stage chain
     "SR3 syntax directive changed": ("fail", [_docker(DOCKER_SYNTAX + "\n", "# syntax=docker/dockerfile:1.7\n")]),
     "SR3 escape directive": ("fail", [_docker(DOCKER_SYNTAX + "\n", DOCKER_SYNTAX + "\n# escape=`\n")]),
@@ -1579,10 +1945,10 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "IB image build moved to the sbom job": ("fail", [_rel(BUILD_IMG_NAME, _image_build_in_sbom_job)]),
     "IB image build copied into the sbom job": ("fail", [_rel(BUILD_IMG_NAME, _image_build_copy_in_sbom_job)]),
     "IB image build step deleted": ("fail", [_rel(BUILD_IMG_NAME, lambda t: t.replace(_image_step(t), "", 1))]),
-    "IB docker build in a run step": ("fail", _step_before_pkg("        run: docker build -t x .\n")),
-    "IB docker buildx build in a run step": ("fail", _step_before_pkg("        run: |\n          docker  buildx build --push .\n")),
-    "IB quoted docker build in a run step": ("fail", _step_before_pkg("        run: d''ocker build .\n")),
-    "IB buildctl in a run step": ("fail", _step_before_pkg("        run: buildctl build --frontend dockerfile.v0\n")),
+    "IB docker build in a docker-job run step": ("fail", _docker_extra_step("        run: docker build -t x .\n")),
+    "IB docker buildx build in a docker-job run step": ("fail", _docker_extra_step("        run: |\n          docker  buildx build --push .\n")),
+    "IB quoted docker build in a docker-job run step": ("fail", _docker_extra_step("        run: d''ocker build .\n")),
+    "IB buildctl in a docker-job run step": ("fail", _docker_extra_step("        run: buildctl build --frontend dockerfile.v0\n")),
     "IB reusable image-build workflow job": ("fail", [_rel(BUILD_IMG_NAME, _reusable_builder_job)]),
     "IB buildx setup carries with": ("fail", [_rel(BUILDX_STEP, BUILDX_STEP + "        with:\n          driver-opts: image=x\n")]),
     "IB buildx setup in another case": ("fail", [_rel(BUILDX_STEP, BUILDX_STEP.replace("docker/setup", "Docker/setup"))]),
@@ -1637,6 +2003,95 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "P15 proof URL points at another host": ("fail", [(SHAPE, "127.0.0.1:55432/proof", "198.51.100.7:55432/proof", False)]),
     "D16d uppercase RUN --MOUNT": ("fail", [_docker(D_BIN, D_BIN + "RUN --MOUNT=type=cache,target=/m true\n")]),
     "valid: proof URL port changed": ("pass", [(SHAPE, "127.0.0.1:55432/proof", "127.0.0.1:55433/proof", False)]),
+    # --- #4719 round 5 SR-8: the docker job is pinned whole; no other job may reach the registry
+    "SR8/I01 absolute-path docker push in a docker-job step": ("fail", _docker_extra_step("        run: /usr/bin/docker push x\n")),
+    "SR8/I02 docker -H push in a docker-job step": ("fail", _docker_extra_step("        run: docker -H tcp://x:2375 push x\n")),
+    "SR8/I05 registry copy tool in a docker-job step": ("fail", _docker_extra_step("        run: crane copy a b\n")),
+    "SR8/I09 another push action in the docker job": ("fail", _docker_extra_step("        uses: some/push-action@v1\n")),
+    "SR8/I10 local composite action in the docker job": ("fail", _docker_extra_step("        uses: ./.github/actions/x\n")),
+    "SR8 extra step after the attestation": ("fail", [_rel(BUILD_IMG_NAME, _docker_step_last)]),
+    "SR8/I11 registry copy in the crates-io job": ("fail", [_rel(
+        CRATES_STEPS, CRATES_STEPS + "      - name: extra\n        run: crane copy x ghcr.io/o/ai-memory:latest\n")]),
+    "SR8/I11b upper-case registry name in the crates-io job": ("fail", [_rel(
+        CRATES_STEPS, CRATES_STEPS + "      - name: extra\n        run: crane copy x GHCR.IO/o/ai-memory:latest\n")]),
+    "SR8 top-level packages write": ("fail", [_rel("\npermissions:\n  contents: write\n",
+                                                  "\npermissions:\n  contents: write\n  packages: write\n")]),
+    "SR8 crates-io declares permissions": ("fail", [_rel(CRATES_STEPS, CRATES_STEPS.replace(
+        "    environment:", "    permissions:\n      packages: write\n    environment:"))]),
+    "SR8 release job permissions changed": ("fail", [_rel(REL_PERMS, "      id-token: write\n    strategy:\n")]),
+    "SR8 copr job calls a reusable workflow": ("fail", [_rel(COPR_HDR, COPR_HDR + "    uses: ./.github/workflows/x.yml\n")]),
+    "SR8 an extra job": ("fail", [_rel(COPR_HDR, _append_job("      - run: echo\n"))]),
+    "SR8 unpinned secret": ("fail", _step_before_pkg("        env:\n          T: ${{ secrets.NPM_TOKEN }}\n        run: echo\n")),
+    "SR8 secrets dotted with spaces": ("fail", _step_before_pkg("        env:\n          T: ${{ secrets . GITHUB_TOKEN }}\n        run: echo\n")),
+    "SR8 all secrets as JSON": ("fail", _step_before_pkg("        env:\n          T: ${{ toJSON(secrets) }}\n        run: echo\n")),
+    "SR8 secrets: inherit": ("fail", [_rel(COPR_HDR, COPR_HDR + "    secrets: inherit\n")]),
+    "valid: pinned secret in a release step": ("pass", _step_before_pkg(
+        "        env:\n          T: ${{ secrets.GITHUB_TOKEN }}\n        run: echo\n")),
+    # --- SR-9: docker job keys and values
+    "SR9/D01 docker job env": ("fail", [_rel(DOCKER_HDR, DOCKER_HDR + "    env:\n      DOCKER_HOST: tcp://x:2375\n")]),
+    "SR9/D03 docker job container": ("fail", [_rel(DOCKER_HDR, DOCKER_HDR + "    container: alpine\n")]),
+    "SR9/D04 docker job runs-on self-hosted": ("fail", [_rel(DOCKER_HEAD, DOCKER_HEAD.replace("ubuntu-latest", "self-hosted"))]),
+    "SR9 docker job needs changed": ("fail", [_rel(DOCKER_HEAD, DOCKER_HEAD.replace(", supply-chain]", "]"))]),
+    "SR9 docker job if changed": ("fail", [_rel(DOCKER_HEAD, DOCKER_HEAD.replace("== 'false'", "== 'true'"))]),
+    "SR9 docker job missing": ("fail", [_rel(DOCKER_HDR, _docker_job_scalar)]),
+    "SR9 docker steps not a sequence": ("fail", [_rel(DOCKER_HDR, _docker_steps_scalar)]),
+    "X05 docker step id quoted": ("fail", [_rel("        id: build\n", "        id: 'build'\n")]),
+    "X09 registry login carries another with key": ("fail", [_rel(LOGIN_PW, LOGIN_PW + "          logout: false\n")]),
+    "X04 image tags as a folded block": ("fail", [_rel(PUSH_TAGS, "          tags: >\n")]),
+    "IB attestation push-to-registry quoted": ("fail", [_rel("push-to-registry: true", "push-to-registry: 'true'")]),
+    # --- SR-10: the release-shape skeleton
+    "SR10/P20b needs on the release-shape job": ("fail", [_shape(SHAPE_NAME, SHAPE_NAME + "    needs: [x]\n")]),
+    "SR10/P21 job defaults": ("fail", [_shape(SHAPE_NAME, SHAPE_NAME + "    defaults:\n      run:\n        working-directory: x\n")]),
+    "SR10/P22 job env": ("fail", [_shape(SHAPE_NAME, SHAPE_NAME + "    env:\n      X: y\n")]),
+    "SR10/P22b top-level env BASH_ENV": ("fail", [_shape('  CARGO_INCREMENTAL: "0"\n', '  CARGO_INCREMENTAL: "0"\n  BASH_ENV: x\n')]),
+    "SR10 top-level env gains a key": ("fail", [_shape('  CARGO_INCREMENTAL: "0"\n', '  CARGO_INCREMENTAL: "0"\n  X: y\n')]),
+    "SR10 CARGO_INCREMENTAL unquoted": ("fail", [_shape('  CARGO_INCREMENTAL: "0"\n', "  CARGO_INCREMENTAL: 0\n")]),
+    "SR10/P22c top-level defaults": ("fail", [_shape("\nenv:\n", "\ndefaults:\n  run:\n    working-directory: x\n\nenv:\n")]),
+    "SR10/P23 job container": ("fail", [_shape(SHAPE_NAME, SHAPE_NAME + "    container: alpine\n")]),
+    "SR10 job name changed": ("fail", [_shape(SHAPE_NAME, '    name: "Release shape"\n')]),
+    "SR10 job runs-on changed": ("fail", [_shape("    runs-on: ubuntu-latest\n    # Advisory", "    runs-on: self-hosted\n    # Advisory")]),
+    "SR10 job timeout changed": ("fail", [_shape("    timeout-minutes: 60\n", "    timeout-minutes: 600\n")]),
+    "SR10 an extra job": ("fail", [_shape(SHAPE_NAME, lambda t: t.rstrip("\n") + "\n\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n")]),
+    "SR10 permissions changed": ("fail", [_shape("permissions:\n  contents: read\n", "permissions:\n  contents: write\n")]),
+    "SR10/P25 last path filter dropped": ("fail", [_shape('      - "migrations/**"\n', "")]),
+    "SR10 push branches widened": ("fail", [_shape('branches: ["release/**"]\n', 'branches: ["release/**", "x"]\n')]),
+    "SR10 workflow_dispatch given a value": ("fail", [_shape("  workflow_dispatch:\n", "  workflow_dispatch: x\n")]),
+    "SR10 run continuation in the proof": ("fail", [_shape(SHAPE_PROOF_CMD, SHAPE_PROOF_CMD.replace(
+        " target/release", " \\\n            target/release"))]),
+    "X02 proof URL sslmode changed": ("fail", [_shape("55432/proof?sslmode=verify-full", "55432/proof?sslmode=require")]),
+    "X03 proof URL sslrootcert changed": ("fail", [_shape("sslrootcert=${PGTLS_DIR}/ca.crt", "sslrootcert=${PGTLS_DIR}/other.crt")]),
+    "X19 proof gains a statement after the invocation": ("fail", [_shape(SHAPE_PROOF_CMD, SHAPE_PROOF_CMD + "\n          echo done")]),
+    # --- C-1/C-2/SR-11: Dockerfile continuations and spellings
+    "C1 canonical build RUN re-indented": ("fail", [_d("    strip target/release/ai-memory; \\", "  strip target/release/ai-memory; \\")]),
+    "C1 canonical build RUN joined onto one line": ("fail", [_d("\n".join(DOCKER_RUN_LINES), DOCKER_RUN)]),
+    "builder ends with another single-line RUN": ("fail", [_d("\n".join(DOCKER_RUN_LINES), "RUN true")]),
+    "C1 continuation in another instruction": ("fail", [_d(D_BIN, D_BIN + "LABEL a=1 \\\n b=2\n")]),
+    "SR11/B05 quoted cargo in the final stage": ("fail", [_d(D_BIN, D_BIN + "RUN c''argo --version\n")]),
+    "X11 --mount after another flag": ("fail", [_d(D_BIN, D_BIN + "RUN --network=none --mount=type=cache,target=/m true\n")]),
+    "X00 FROM image with an embedded $VAR": ("fail", [_d(D_FINAL, "FROM debian:bookworm-slim$SUFFIX\n")]),
+}
+
+# SHAPE_ADVISORY states (C-5): (advisory, want, edits).
+ADVISORY_CASES: Dict[str, Tuple[bool, str, List[Edit]]] = {
+    "advisory: the plain continue-on-error true passes": (True, "pass", []),
+    "advisory: continue-on-error removed": (True, "fail", [(SHAPE, "    continue-on-error: true\n", "", False)]),
+    "advisory: continue-on-error quoted": (True, "fail", [(SHAPE, "continue-on-error: true", "continue-on-error: 'true'", False)]),
+    "advisory: continue-on-error false": (True, "fail", [(SHAPE, "continue-on-error: true", "continue-on-error: false", False)]),
+    "required: continue-on-error still set": (False, "fail", []),
+    "required: continue-on-error removed passes": (False, "pass", [(SHAPE, "    continue-on-error: true\n", "", False)]),
+}
+# C-6: (edits, exact error count, substring of the first message).
+MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
+    "message: LOGIN_USES SHA bump": ([_rel(LOGIN_USES, LOGIN_USES[:-1] + "0")], 1,
+                                     "registry login step): `jobs.docker.steps.3.uses` is"),
+    "message: LOGIN_USES SHA bump names the constant": ([_rel(LOGIN_USES, LOGIN_USES[:-1] + "0")], 1,
+                                                        "update LOGIN_USES in scripts/check_release_features.py"),
+    "message: IMAGE_BUILD_USES SHA bump": ([_rel(IMAGE_BUILD_USES, IMAGE_BUILD_USES[:-1] + "0")], 1,
+                                           "update IMAGE_BUILD_USES in scripts/check_release_features.py"),
+    "message: a tag added names DOCKER_STEPS": ([_rel(PUSH_TAGS, PUSH_TAGS + "            ghcr.io/o/ai-memory:x\n")], 1,
+                                                "update DOCKER_STEPS in scripts/check_release_features.py"),
+    "message: build unit drift names WF_BUILD": ([_rel(REL_BUILD_CMD, REL_BUILD_CMD + " --verbose")], 2,
+                                                 "update WF_BUILD in scripts/check_release_features.py"),
 }
 
 
@@ -1688,10 +2143,18 @@ PARITY: Tuple[Tuple[Tuple[str, ...], bool, Tuple[str, ...]], ...] = (
     (("RUN echo \\", "# c", "  b"), True, ("RUN echo b",)),
     (("RUN a \\  ", "b"), True, ("RUN a b",)),
     (("RUN echo \\",), True, ("RUN echo",)),
+    (("FROM img", "\\"), True, ("FROM img", "")),
+    (("FROM img", "  \\  "), True, ("FROM img", "")),
     (("# x", "", "  # y", "RUN  a\tb"), True, ("RUN a b",)),
     (("label x=1",), True, ("label x=1",)),
     (("a \\", "# c", "b"), False, ("a # c", "b")),
     (("a \\", "", "b"), False, ("a", "b")),
+    (("RUN ca\\", "rgo"), True, ("RUN cargo",)),
+    (("RUN ca\\", "  rgo"), True, ("RUN ca rgo",)),
+    (("RUN a\\\\", "b"), True, ("RUN a\\\\", "b")),
+    (("ca\\", "rgo"), False, ("cargo",)),
+    (("a \\ ", "b"), False, ("a \\", "b")),
+    (("a\\\\", "b"), False, ("a\\\\", "b")),
 )
 # YAML scalar decoding: (document, key, expected text or None when the document is refused).
 SCALARS: Tuple[Tuple[str, str, Optional[str]], ...] = (
@@ -1718,6 +2181,9 @@ def unit_checks() -> int:
         failures += 1
     if continuation_noise(["# a", "", "RUN a \\", "b", "", "# d"]):
         print("self-test FAIL: continuation_noise flags a line outside a continuation", file=sys.stderr)
+        failures += 1
+    if bk_instructions(list(DOCKER_RUN_LINES)) != [(1, len(DOCKER_RUN_LINES), DOCKER_RUN)]:
+        print("self-test FAIL: DOCKER_RUN_LINES does not join to DOCKER_RUN", file=sys.stderr)
         failures += 1
     for doc, key, want in SCALARS:
         rep = Report()
@@ -1788,6 +2254,26 @@ def self_test(root: Path) -> int:
                 print(f"self-test FAIL: guard case '{name}' wanted {want}, got {got}: {errs[:2]}", file=sys.stderr)
                 failures += 1
 
+        for name, (advisory, want, edits) in ADVISORY_CASES.items():
+            case_root = tmp / "case"
+            mk_root(root, case_root)
+            for rel, old, new, every in edits:
+                mutate_file(case_root / rel, old, new, every)
+            errs, _ = run_guard(case_root, advisory)
+            if ("fail" if errs else "pass") != want:
+                print(f"self-test FAIL: '{name}' wanted {want}: {errs[:2]}", file=sys.stderr)
+                failures += 1
+        for name, (edits, count, needle) in MESSAGE_CASES.items():
+            case_root = tmp / "case"
+            mk_root(root, case_root)
+            for rel, old, new, every in edits:
+                mutate_file(case_root / rel, old, new, every)
+            errs, _ = run_guard(case_root)
+            if len(errs) != count or needle not in errs[0]:
+                print(f"self-test FAIL: '{name}' wanted {count} message(s) containing {needle!r}: {errs[:3]}",
+                      file=sys.stderr)
+                failures += 1
+
         # --- through the real entry point: exit codes for unreadable input.
         for name, (setup, want_rc) in ENTRY_CASES.items():
             case_root = tmp / "entry"
@@ -1802,7 +2288,8 @@ def self_test(root: Path) -> int:
     print(
         "check_release_features: self-test OK "
         f"(a failing or empty declaration fails the build step and the Dockerfile RUN; "
-        f"{len(CASES)} guard cases, {len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases)"
+        f"{len(CASES)} guard cases, {len(ADVISORY_CASES)} advisory cases, {len(MESSAGE_CASES)} message cases, "
+        f"{len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases)"
     )
     return 0
 
@@ -1906,32 +2393,47 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("double-quoted backslash test never fires", 'if style == "double" and "\\\\" in v:', "if False:"),
     ("single-quoted '' is not decoded", 'v[1:-1].replace("\'\'", "\'")', "v[1:-1]"),
     ("single-quoted style test never fires", 'if style == "single":', "if False:"),
-    ("BuildKit continuation keeps shell semantics", "if buf and not buildkit:", "if buf and True:"),
     ("continuation noise never recorded", "            if open_:\n", "            if False:\n"),
     ("--mount refusal is case-sensitive", '"--mount" in ins.lower()', '"--mount" in ins'),
+    ("--mount refused only right after RUN", 'if "--mount" in ins.lower():', 'if ins.lower().startswith("run --mount"):'),
     ("FROM variable refusal never fires", 'if "$" in image:', "if False:"),
+    ("FROM variable refusal sees only ${", 'if "$" in image:', 'if "${" in image:'),
+    ("empty instruction at end of file inside a continuation dropped", "    if buf is not None:\n        out.append((start, len(lines), _collapse(buf)))", "    if buf is not None and buf.strip(\" \\t\"):\n        out.append((start, len(lines), _collapse(buf)))"),
     ("instruction word is not case-folded", 'word = ins.split(" ", 1)[0].upper()', 'word = ins.split(" ", 1)[0]'),
     ("final-stage binary COPY count not compared", "if len(copies) != 1:", "if False:"),
-    ("job-level if not refused in release-shape", 'if job.get("if") is not None:', "if False:"),
     ("proof order against the build not compared", "if builds and proofs and proofs[0] < builds[0]:", "if False:"),
     ("proof URL placeholder accepts any URL", "SHAPE_URL_RE.fullmatch(lines[1])", "True"),
-    ("image-builder uses not compared with the allowlist", "or text not in DOCKER_ACTIONS", "or False"),
-    ("image-builder uses may be quoted", 'uses.style != "plain" or', "False or"),
-    ("image-build with: key set not compared", "if set(with_.keys()) != allowed:", "if False:"),
-    ("image-build with: values not compared", 'if val is not None and (val.style != "plain" or val.text() != want):', "if False:"),
-    ("image-build with: blocks not compared", 'if val is not None and not (val.kind == "block"', "if False and (val.kind == \"block\""),
-    ("image-build step key set not compared", "if set(step.keys()) != set(IMAGE_BUILD_KEYS):", "if False:"),
-    ("image-build id not compared", 'ident.text() != "build"', "False"),
-    ("image-build step name expression allowed", 'if name is not None and "${{" in name.text():\n        rep.bad(f"release.yml: the image build', 'if False:\n        rep.bad(f"release.yml: the image build'),
+    ("proof norm drops statements after the URL", "if len(lines) == len(SHAPE_PROOF) and SHAPE_URL_RE", "if len(lines) >= 3 and SHAPE_URL_RE"),
+    ("proof URL sslmode not pinned", r"\?sslmode=verify-full", r"\?sslmode=[a-z-]+"),
+    ("proof URL sslrootcert not pinned", r"&sslrootcert=\$\{PGTLS_DIR\}/ca\.crt", r"&sslrootcert=[^\"]*"),
     ("pinned step name expression allowed", 'if name is not None and "${{" in name.text():\n        why.bad("the step', 'if False:\n        why.bad("the step'),
-    ("buildx setup extra keys allowed", 'set(st.keys()) != {"name", "uses"}', "False"),
-    ("login extra keys allowed", 'set(st.keys()) != {"name", "uses", "with"} or', "False or"),
-    ("single image build not required", "if len(builds) != 1 or", "if False or"),
-    ("image build may live outside the docker job", 'not builds[0][0].startswith("jobs.docker.")', "False"),
-    ("quoted image command spelling not unquoted", "IMAGE_CMD_RE.search(unquoted(t))", "IMAGE_CMD_RE.search(t)"),
-    ("quoted build tool spelling not unquoted", "BUILD_TOOL_RE.search(unquoted(t))", "BUILD_TOOL_RE.search(t)"),
+    ("quoted build tool spelling not unquoted (release job)", "BUILD_TOOL_RE.search(unquoted(t))", "BUILD_TOOL_RE.search(t)"),
+    ("quoted build tool spelling not unquoted (Dockerfile)", "BUILD_TOOL_RE.search(unquoted(ins))", "BUILD_TOOL_RE.search(ins)"),
     ("KEY_RE accepts a space before the colon", 'KEY_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_-]*):', 'KEY_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_-]*) ?:'),
-    ("reusable image-build job never refused", "if juses is not None and IMAGE_BUILDER_RE.search(juses.text().lower()):", "if False:"),
+    ("SHAPE_ADVISORY flipped", "SHAPE_ADVISORY = True", "SHAPE_ADVISORY = False"),
+    ("advisory default ignored", "        advisory = SHAPE_ADVISORY\n", "        advisory = False\n"),
+    ("advisory branch always taken", "    if advisory:\n", "    if True:\n"),
+    ("required state never refuses the key", "    elif coe is not None:\n", "    elif False:\n"),
+    ("pinned scalar style not compared", 'node.kind == "scalar" and node.style == style and', 'node.kind == "scalar" and'),
+    ("pinned block style not compared", 'node.kind == "block" and node.style == "|" and', 'node.kind == "block" and'),
+    ("pinned mapping key set not compared", "if set(node.keys()) != set(spec):", "if False:"),
+    ("pinned sequence length not compared", "if items is None or len(items) != len(spec):", "if items is None:"),
+    ("pinned no-value key not compared", 'return "" if node.kind == "null" else', 'return "" if True else'),
+    ("docker step count not compared", "if len(items) != len(DOCKER_STEPS):", "if False:"),
+    ("action SHA bump not recognised", 'uses.text().split("@")[0] == want.split("@")[0]', "False"),
+    ("canonical RUN physical lines not compared", "if tuple(raw[first - 1:last]) == DOCKER_RUN_LINES:", "if True:"),
+    ("continuations outside the canonical RUN allowed", "        if n not in canon_lines:\n", "        if False:\n"),
+    ("run continuation check never fires", 'if text.rstrip(" \\t").endswith("\\\\"):', "if False:"),
+    ("registry allowed outside the docker job", "if not in_docker and REGISTRY in text.lower():", "if False:"),
+    ("registry name compared case-sensitively", "REGISTRY in text.lower()", "REGISTRY in text"),
+    ("secret name not compared", 'm.group("name") not in RELEASE_SECRETS or ', ""),
+    ("secret reference shape not compared", ' or m.group(0) != "secrets." + str(m.group("name"))', ""),
+    ("secrets key never refused", 'if path and path[-1].lower() == "secrets":', "if False:"),
+    ("reusable workflow job never refused", 'if job.get("uses") is not None:', "if False:"),
+    ("shell join on any trailing backslash", '(len(raw) - len(raw.rstrip("\\\\"))) % 2 == 1', 'raw.endswith("\\\\")'),
+    ("BuildKit join strips the next line's indent", "            piece = raw\n", '            piece = raw.lstrip(" \\t")\n'),
+    ("BuildKit continuation needs a bare backslash", r'BK_CONT_RE = re.compile(r"(^|[^\\])\\[ \t]*$")', r'BK_CONT_RE = re.compile(r"(^|[^\\])\\$")'),
+    ("BuildKit continuation on an escaped backslash", r'(^|[^\\])\\[ \t]*$', r'\\[ \t]*$'),
 )
 
 
