@@ -256,14 +256,163 @@ def p1_federate_key_echo():
             rp.wait()
         th.join(6)
         probe("P1 racer-planted symlink to a FIFO does not receive the key", SECRET.encode() not in b"".join(got))
+        # A symlink to a directory planted at api-key: mv without -T would move the key INTO it.
+        if kf.exists() or kf.is_symlink():
+            kf.unlink()
+        pdir = d / "planted-dir"
+        pdir.mkdir()
+        rdir = pre + ('rm() { command rm "$@"; [ -e "$run_dir/api-key" ] || ln -s %s "$run_dir/api-key"; }\n'
+                      'on_node() { printf "%%s\\n" %s; }\np1f() {\n%s\n}\np1f\n') % (pdir, SECRET, blk)
+        r = run_bash(rdir, d)
+        probe("P1 planted symlink to a directory is replaced, not entered", r.returncode == 0 and not list(pdir.iterdir())
+              and kf.is_file() and not kf.is_symlink(), "rc=%d in_dir=%s" % (r.returncode, [p.name for p in pdir.iterdir()]))
         for label, body in (("a trailing extra line", SECRET + "\\nzz\\n"), ("64 non-hex bytes", "z" * 64 + "\\n"),
                             ("a hex first byte then 63 non-hex bytes", "a" + "z" * 63 + "\\n"),
                             ("65 hex bytes", SECRET + "a\\n"), ("the key twice", SECRET + "\\n" + SECRET + "\\n"),
-                            ("an empty first line then the key", "\\n" + SECRET), ("nothing", "")):
+                            ("an empty first line then the key", "\\n" + SECRET), ("nothing", ""),
+                            ("the key then a NUL byte", SECRET + "\\0"),
+                            ("the key then an empty line (66 bytes)", SECRET + "\\n\\n")):
             if kf.exists() or kf.is_symlink():
                 kf.unlink()
             r = run_bash(pre + 'on_node() { printf "%%b" "%s"; }\np1f() {\n%s\n}\np1f\n' % (body, blk), d)
             probe("P1 key file with %s fails closed and leaves no file" % label, r.returncode != 0 and not kf.exists(), "rc=%d" % r.returncode)
+
+
+def fifo_reader(path, secs, got):
+    """Open a FIFO for reading as soon as it exists and collect every byte written to it."""
+    def run():
+        end = time.time() + secs
+        fd = None
+        while fd is None and time.time() < end:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                time.sleep(0.02)
+        while fd is not None and time.time() < end:
+            try:
+                got.append(os.read(fd, 4096))
+            except BlockingIOError:
+                pass
+            time.sleep(0.05)
+        if fd is not None:
+            os.close(fd)
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    return th
+
+
+def run_timeout(script, d, secs):
+    """Run bash; return (returncode, timed_out). A blocked open on a FIFO shows as a timeout, not a hang."""
+    rp = subprocess.Popen(["bash", "-c", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          start_new_session=True, env=dict(os.environ, PATH=str(d) + os.pathsep + os.environ["PATH"]))
+    try:
+        return rp.wait(timeout=secs), False
+    except subprocess.TimeoutExpired:
+        os.killpg(rp.pid, signal.SIGKILL)
+        rp.wait()
+        return None, True
+
+
+HOOK = (
+    'NAME="$run_dir/.api-key.FORCED"\n'
+    'mktemp() { printf "%%s\\n" "$NAME"; }\n'
+    'on_node() { : > "$MARK"; printf "%%s\\n" %s; }\n'
+    '[() {\n'
+    '  builtin [ "$@"; local rc=$?\n'
+    '  case "$HK:$*" in\n'
+    '    fifo:*"-e $NAME"*) command mkfifo "$NAME" ;;\n'
+    '    swap:*"-f /dev/fd/9"*) printf "%%s\\n" %s > "$NAME.new"; command mv -f "$NAME.new" "$NAME" ;;\n'
+    '  esac\n'
+    '  return $rc\n'
+    '}\n'
+)
+
+
+def p1_temp_entry_fail_closed():
+    """#5000: the key is never written to anything but a regular file this run created."""
+    fs = FED.read_text()
+    i = fs.index('echo "[federate] loadgen bundle: $run_dir"')
+    blk = fs[i:fs.index("\n}\n", i)]
+    other = "b" * 64
+    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+        d = pathlib.Path(t)
+        rd = d / "run"
+        rd.mkdir()
+        mark = d / "on_node.ran"
+        name = rd / ".api-key.FORCED"
+        kf = rd / "api-key"
+        stub_dir(d, "unused")
+
+        def script(hk):
+            pre = 'die() { echo "DIE: $*" >&2; exit 2; }\nPUBLIC_IPS=(h)\nrun_dir=%s\nMARK=%s\nHK=%s\n' % (rd, mark, hk)
+            return pre + HOOK % (SECRET, other) + 'p1f() {\n%s\n}\np1f\n' % blk
+
+        def reset():
+            for p in list(rd.iterdir()) + [mark]:
+                if p.is_dir() and not p.is_symlink():
+                    p.rmdir()
+                elif p.exists() or p.is_symlink():
+                    p.unlink()
+
+        def plant_target(kind):
+            if kind == "fifo" or kind == "fifo, no reader" or kind == "symlink to a FIFO":
+                f = d / "t-fifo"
+                if f.exists():
+                    f.unlink()
+                os.mkfifo(str(f))
+                if kind == "symlink to a FIFO":
+                    name.symlink_to(f)
+                    return f
+                os.mkfifo(str(name))
+                return name
+            if kind == "symlink to a file":
+                f = d / "t-file"
+                f.write_text("")
+                name.symlink_to(f)
+                return f
+            if kind == "symlink to a device":
+                name.symlink_to("/dev/null")
+                return None
+            if kind == "dangling symlink":
+                name.symlink_to(d / "nowhere")
+                return None
+            name.mkdir()
+            return None
+
+        for kind in ("fifo, no reader", "fifo", "symlink to a FIFO", "symlink to a file", "symlink to a device",
+                     "dangling symlink", "directory"):
+            reset()
+            target = plant_target(kind)
+            got = []
+            th = fifo_reader(str(target), 4, got) if kind in ("fifo", "symlink to a FIFO") else None
+            time.sleep(0.2)
+            rc, hung = run_timeout(script("none"), d, 6)
+            if th:
+                th.join(6)
+            body = b"".join(got)
+            ok = (not hung) and rc not in (0, None) and not mark.exists() and SECRET.encode() not in body and not kf.exists()
+            if kind == "symlink to a file":
+                ok = ok and target.read_text() == ""
+            probe("P2 %s at the temp name: refused, the key is never produced or written" % kind, ok,
+                  "rc=%s hung=%s ran=%s bytes=%d" % (rc, hung, mark.exists(), len(body)))
+        # An entry swapped in AFTER the absence check: the opened descriptor is checked before the key is written.
+        reset()
+        got = []
+        th = fifo_reader(str(name), 4, got)
+        rc, hung = run_timeout(script("fifo"), d, 6)
+        th.join(6)
+        probe("P2 a FIFO swapped in after the absence check gets no key", (not hung) and rc not in (0, None)
+              and not mark.exists() and SECRET.encode() not in b"".join(got) and not kf.exists(),
+              "rc=%s hung=%s ran=%s bytes=%d" % (rc, hung, mark.exists(), len(b"".join(got))))
+        reset()
+        rc, hung = run_timeout(script("swap"), d, 6)
+        probe("P2 the name replaced after the open is refused before the key is written", (not hung) and rc not in (0, None)
+              and not mark.exists() and not kf.exists(), "rc=%s hung=%s ran=%s api-key=%s" % (rc, hung, mark.exists(), kf.exists()))
+        reset()
+        rc, hung = run_timeout(script("none"), d, 6)
+        # An unplanted name still works (the probes above are not red because the block is broken).
+        probe("P2 an unplanted temp name is accepted", rc == 0 and kf.is_file() and SECRET in kf.read_text()
+              and (kf.stat().st_mode & 0o777) == 0o600, "rc=%s" % rc)
 
 
 def n1_no_locale_ranges():
@@ -312,8 +461,9 @@ def f2_id_lists_agree():
 
 def f3_static_pins():
     fed = FED.read_text()
-    probe("F3 key file write uses noclobber (O_EXCL) on an unpredictable name", "set -o noclobber; on_node" in fed
-          and 'mktemp -u "$run_dir/.api-key.' in fed and 'mv -f -T -- "$keytmp" "$keyf"' in fed)
+    probe("F3 key file write uses noclobber (O_EXCL) on an unpredictable name", "set -o noclobber" in fed
+          and 'mktemp -u "$run_dir/.api-key.' in fed and 'mv -f -T -- "$keytmp" "$keyf"' in fed
+          and 'exec 9> "$keytmp"' in fed and "'cat /etc/ai-memory/api-key' >&9" in fed)
     i = fed.find("{ set +x; } 2>/dev/null")
     j = fed.find('api_key="$(on_node')
     probe("F3 verify suspends xtrace before the key is read", 0 <= i < j, "%d < %d" % (i, j))
@@ -350,6 +500,7 @@ def main():
     f6_spawn()
     n1_curl_config_injection()
     p1_federate_key_echo()
+    p1_temp_entry_fail_closed()
     n3_main_tf()
     n1_no_locale_ranges()
     f2_node_get_id()

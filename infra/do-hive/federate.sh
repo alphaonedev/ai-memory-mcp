@@ -237,12 +237,21 @@ EOS
   # name (a symlink to a FIFO or a terminal) is still opened and written through. So the key goes
   # to an unpredictable new name (O_EXCL), is checked there, and is renamed over
   # api-key: rename replaces whatever entry sits at that name and never writes through it.
+  # grep -a: GNU grep treats a NUL as a line end in a binary file, so key+NUL would count as one line.
   # The file is at most 65 bytes, has exactly one line of 64 hex, and starts with a hex digit (so an
   # empty first line followed by the key is refused): the key, optionally one newline, nothing else.
   keytmp="$(mktemp -u "$run_dir/.api-key.XXXXXXXXXX")" || die "mktemp failed in $run_dir"
-  if ! ( umask 077; set -o noclobber; on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' > "$keytmp" ) \
+  # The key is written only to a file descriptor this run created: nothing may exist at the new
+  # name (a FIFO, symlink, directory or device there is refused), the descriptor is opened with
+  # noclobber (O_EXCL), and it must be a regular file (-f follows the descriptor) that the name still
+  # points to (-ef), BEFORE the first key byte is written to it. A swap inside that window yields a
+  # refusal, never a key write; the key never reaches a FIFO, a terminal or another entry.
+  if ! ( umask 077; set -o noclobber
+         [ ! -e "$keytmp" ] && [ ! -L "$keytmp" ] && exec 9> "$keytmp" \
+           && [ -f /dev/fd/9 ] && [ "$keytmp" -ef /dev/fd/9 ] \
+           && on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' >&9 ) \
      || [ "$(LC_ALL=C wc -c < "$keytmp")" -gt 65 ] \
-     || [ "$(LC_ALL=C grep -Ecx '[0123456789abcdef]{64}' "$keytmp")" != 1 ] \
+     || [ "$(LC_ALL=C grep -aEcx '[0123456789abcdef]{64}' "$keytmp")" != 1 ] \
      || ! LC_ALL=C head -c 1 -- "$keytmp" | LC_ALL=C grep -q '[0123456789abcdef]' \
      || ! mv -f -T -- "$keytmp" "$keyf"; then
     rm -f -- "$keytmp"
