@@ -487,8 +487,10 @@ def self_test() -> int:
         for name in ("argparse", "difflib", "py_compile", "re", "shutil", "stat", "subprocess"):
             (iso / f"{name}.py").write_text("print('PLANTED')\nraise SystemExit(0)\n", encoding="utf-8")
         # #5283: the refusal must hold for every partial isolation, not only for a bare interpreter: -E (ignore
-        # PYTHON* variables) and -s (no user site) each leave the script directory on sys.path.
-        for flags in ([], ["-E"], ["-s"]):
+        # PYTHON* variables) and -s (no user site) each leave the script directory on sys.path. #5373: so do both
+        # together (-I is exactly -E plus -s plus the path rule) and -S, -B, -O; none is isolation. -P (safe path)
+        # is deliberately not pinned here: it removes the script directory, so a refusal under it is a posture choice.
+        for flags in ([], ["-E"], ["-s"], ["-E", "-s"], ["-E", "-s", "-S", "-B", "-O"]):
             result = subprocess.run([sys.executable, *flags, str(copy), "--base-root", ".", "--repo", ".",
                                      "--base-sha", "0" * 40, "--head-sha", "0" * 40, "--scratch", str(iso / "s")],
                                     capture_output=True, text=True, check=False)
