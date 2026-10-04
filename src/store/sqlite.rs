@@ -3895,9 +3895,14 @@ impl MemoryStore for SqliteStore {
         new_kind: crate::models::MemoryKind,
     ) -> StoreResult<bool> {
         self.gate_record_stop()?;
-        let mut conn = self.state.lock().await;
-        let tx = conn.transaction().map_err(box_err)?;
-        let old_kind: Option<String> = tx
+        let conn = self.state.lock().await;
+        // BEGIN IMMEDIATE (#5084, the #2250 class): this is a read-then-write
+        // (SELECT memory_kind, then UPDATE + signed-event append); a DEFERRED
+        // upgrade fails with SQLITE_BUSY_SNAPSHOT (not retried by
+        // busy_timeout) when another connection commits in between. Dropping
+        // `tx` on an early return rolls back.
+        let tx = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
+        let old_kind: Option<String> = conn
             .query_row(
                 "SELECT memory_kind FROM memories WHERE id = ?1",
                 rusqlite::params![id],
@@ -3917,7 +3922,7 @@ impl MemoryStore for SqliteStore {
         {
             return Ok(false);
         }
-        let changed = tx
+        let changed = conn
             .execute(
                 "UPDATE memories SET memory_kind = ?1, version = version + 1 \
                  WHERE id = ?2 AND memory_kind NOT IN ('reflection', 'persona')",
@@ -3952,7 +3957,7 @@ impl MemoryStore for SqliteStore {
             chrono::Utc::now().to_rfc3339(),
             Some(&cause),
         );
-        crate::signed_events::append_signed_event_no_tx(&tx, &event).map_err(box_err)?;
+        crate::signed_events::append_signed_event_no_tx(&conn, &event).map_err(box_err)?;
         tx.commit().map_err(box_err)?;
         Ok(true)
     }

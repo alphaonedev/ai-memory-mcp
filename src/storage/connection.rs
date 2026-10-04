@@ -117,14 +117,6 @@ pub const SQL_BEGIN_IMMEDIATE: &str = "BEGIN IMMEDIATE";
 pub const SQL_COMMIT: &str = "COMMIT";
 pub const SQL_ROLLBACK: &str = "ROLLBACK";
 
-/// v1.0.0 #3163 — the plain (DEFERRED) BEGIN, used by the CLI `mine` import's
-/// chunked transaction. Hoisted out of `cli/io.rs` as an inline literal so
-/// every transaction verb in the substrate is spelled once, here
-/// (pm-v3.1 no-hardcoded-literals). DEFERRED is correct there because the
-/// importer owns its own process-private connection and takes no lock until
-/// its first write.
-pub const SQL_BEGIN_DEFERRED: &str = "BEGIN";
-
 /// v1.0.0 #3163 — the migration ladder's exclusive-lock BEGIN, hoisted out
 /// of `migrations.rs` as an inline literal so every transaction verb in the
 /// substrate is spelled once, here (pm-v3.1 no-hardcoded-literals).
@@ -200,21 +192,6 @@ impl<'c> WriteTxn<'c> {
     /// is left to roll back.
     pub fn begin(conn: &'c Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(SQL_BEGIN_IMMEDIATE)?;
-        Ok(Self {
-            conn,
-            finished: false,
-        })
-    }
-
-    /// Open a DEFERRED transaction on `conn` — the chunked-import boundary,
-    /// which takes no write lock until its first write.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the `rusqlite` error from `BEGIN`. As with
-    /// [`WriteTxn::begin`], no guard is constructed on failure.
-    pub fn begin_deferred(conn: &'c Connection) -> rusqlite::Result<Self> {
-        conn.execute_batch(SQL_BEGIN_DEFERRED)?;
         Ok(Self {
             conn,
             finished: false,

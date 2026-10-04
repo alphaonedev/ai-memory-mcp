@@ -421,9 +421,11 @@ impl<'a> PersonaGenerator<'a> {
         // back on any early `?` (Transaction's Drop default). `generate()` is a
         // top-level call so there is no nesting. The signed_events emit is
         // committed-after (it self-transacts via append_signed_event).
-        let persona_tx = self
-            .conn
-            .unchecked_transaction()
+        //
+        // BEGIN IMMEDIATE (#5084, the #2250 class): `db::insert` reads the
+        // title slot before it writes, so a DEFERRED upgrade could fail with
+        // SQLITE_BUSY_SNAPSHOT (not retried by busy_timeout).
+        let persona_tx = crate::storage::connection::WriteTxn::begin(self.conn)
             .context("begin persona write transaction")?;
 
         // #2110 — persona rows are substrate-generated (the QW-2 generator

@@ -981,8 +981,7 @@ pub fn run_repair_schema_version(
         return Ok(2);
     }
 
-    let mut conn =
-        db::open_unmigrated(&resolved).context("open database for schema-version repair")?;
+    let conn = db::open_unmigrated(&resolved).context("open database for schema-version repair")?;
 
     let observed: i64 = conn
         .query_row(
@@ -1002,12 +1001,13 @@ pub fn run_repair_schema_version(
     // version, in ONE transaction so a mid-failure leaves the ledger exactly as
     // found.
     {
-        let tx = conn
-            .transaction()
+        // BEGIN IMMEDIATE (#5084): write-first, but one rule for every write
+        // path (a DEFERRED upgrade can fail with SQLITE_BUSY_SNAPSHOT).
+        let tx = crate::storage::connection::WriteTxn::begin(&conn)
             .context("begin schema-version restamp transaction")?;
-        tx.execute("DELETE FROM schema_version", [])
+        conn.execute("DELETE FROM schema_version", [])
             .context("clear schema_version")?;
-        tx.execute(
+        conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             rusqlite::params![target],
         )

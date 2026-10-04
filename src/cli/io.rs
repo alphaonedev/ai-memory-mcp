@@ -1261,7 +1261,12 @@ pub fn mine(
     // #3163 — RAII: an early `?` return (or a panic) inside the import loop
     // below now rolls the in-flight chunk back instead of leaving an open
     // transaction on the connection.
-    let mut write_txn = crate::storage::connection::WriteTxn::begin_deferred(&conn)?;
+    //
+    // BEGIN IMMEDIATE (#5084, the #2250 class): every `db::insert_with_conflict`
+    // reads the title slot before it writes, so a DEFERRED chunk fails with
+    // SQLITE_BUSY_SNAPSHOT (never retried by busy_timeout) when the daemon
+    // commits to the same file between the first read and the first write.
+    let mut write_txn = crate::storage::connection::WriteTxn::begin(&conn)?;
 
     for conv in &filtered {
         let Some(mined) = mine::conversation_to_memory(conv, format) else {
@@ -1345,7 +1350,7 @@ pub fn mine(
             // Close the chunk and open the next one. `commit` consumes the
             // guard, so the reassignment is what keeps the loop guarded.
             write_txn.commit()?;
-            write_txn = crate::storage::connection::WriteTxn::begin_deferred(&conn)?;
+            write_txn = crate::storage::connection::WriteTxn::begin(&conn)?;
         }
     }
 
