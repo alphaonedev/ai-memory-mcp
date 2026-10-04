@@ -1073,6 +1073,10 @@ def check_release_permissions(doc: Node, jobs: Node, rep: Report) -> None:
                 rep.bad(pin_message("release.yml", f"`jobs.{name}.permissions` is declared; the pinned job inherits the "
                                     "top-level `contents: write` and declares none", "RELEASE_JOB_PERMISSIONS"))
             continue
+        if name == "docker":
+            # #4941 F1: the docker job's permissions are DOCKER_JOB's (RELEASE_JOB_PERMISSIONS["docker"]
+            # is derived from it) and check_docker_job pins them: one drift, one message.
+            continue
         why = pin_problem(perms, want, f"jobs.{name}.permissions")
         if why:
             rep.bad(pin_message("release.yml", why, "RELEASE_JOB_PERMISSIONS"))
@@ -2070,7 +2074,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR10/P25 last path filter dropped": ("fail", [_shape('      - "migrations/**"\n', "")]),
     "4941 SR10 middle path filter changed": ("fail", [_shape('      - "src/**"\n', '      - "docs/**"\n')]),
     "4941 SR10 last path filter changed": ("fail", [_shape('      - "migrations/**"\n', '      - "other/**"\n')]),
-    "4941 SR10 later push branch changed": ("fail", [_shape('"rehearsal/**", "main"]', '"rehearsal/**", "mainx"]')]),
+    "4941 SR10 later pull_request branch changed": ("fail", [_shape('"rehearsal/**", "main"]', '"rehearsal/**", "mainx"]')]),
     "4943 SR10 BASH_ENV in the env of an unpinned shape step": ("fail", [_shape(
         "        run: python3 scripts/check_release_features.py\n",
         "        run: python3 scripts/check_release_features.py\n        env:\n          BASH_ENV: x\n")]),
@@ -2141,7 +2145,24 @@ MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
     "message: 4946 a re-indented canonical build RUN is one message": (
         [_d("    strip target/release/ai-memory; \\", "  strip target/release/ai-memory; \\")], 1,
         "update DOCKER_RUN_LINES in scripts/check_release_features.py"),
+    "message: 4946 the whitelist covers only the canonical RUN's own lines": (
+        [_d("    strip target/release/ai-memory; \\", "    strip target/release/ai-memory; \\ "),
+         _d(D_BIN, D_BIN + "LABEL a=1 \\\n b=2\n")], 2,
+        "update DOCKER_RUN_LINES in scripts/check_release_features.py"),
+    "message: 4941 a docker permissions drift is one message naming DOCKER_JOB": (
+        [_rel("      packages: write\n      # #2487", "      packages: read\n      # #2487")], 1,
+        "update DOCKER_JOB in scripts/check_release_features.py"),
 }
+
+
+# #4944: a tab never reaches the run-line check through the whole guard (the text scan refuses every
+# tab, parse_yaml refuses it too, and a decoded `\\t` escape is refused as a backslash in a
+# double-quoted scalar), so the tab half of its `rstrip(" \\t")` is pinned on hand-built nodes.
+RUN_LINE_UNITS: Tuple[Tuple[str, Tuple[str, ...], int], ...] = (
+    ("a run line ending in a backslash and a tab", ("echo a \\\t", "echo b"), 1),
+    ("a run line ending in a backslash and a space", ("echo a \\ ", "echo b"), 1),
+    ("a run line with a backslash inside, not last", ("echo a\\b\t", "echo b"), 0),
+)
 
 
 def _entry_dir(rel: str) -> Callable[[Path], None]:
@@ -2323,6 +2344,16 @@ def self_test(root: Path) -> int:
                       file=sys.stderr)
                 failures += 1
 
+        # --- the run-line check on its own (a tab cannot reach it through the whole guard).
+        for name, lines, want_n in RUN_LINE_UNITS:
+            rep_u = Report()
+            doc_u = Node("map", 0, {"run": Node("block", 0, list(lines), "|")})
+            check_run_continuations(doc_u, "unit.yml", rep_u)
+            if len(rep_u.errors) != want_n:
+                print(f"self-test FAIL: run-line unit '{name}' wanted {want_n} message(s): {rep_u.errors[:2]}",
+                      file=sys.stderr)
+                failures += 1
+
         # --- through the real entry point: exit codes for unreadable input.
         for name, (setup, want_rc) in ENTRY_CASES.items():
             case_root = tmp / "entry"
@@ -2338,7 +2369,7 @@ def self_test(root: Path) -> int:
         "check_release_features: self-test OK "
         f"(a failing or empty declaration fails the build step and the Dockerfile RUN; "
         f"{len(CASES)} guard cases, {len(ADVISORY_CASES)} advisory cases, {len(MESSAGE_CASES)} message cases, "
-        f"{len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases)"
+        f"{len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(RUN_LINE_UNITS)} run-line unit cases, {len(ENTRY_CASES)} entry-point cases)"
     )
     return 0
 
@@ -2495,6 +2526,9 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ('run continuation ignores trailing spaces', 'if text.rstrip(" \\t").endswith("\\\\"):', 'if text.endswith("\\\\"):'),
     ('pin_problem sequence compares only the first item', '            why = pin_problem(item, sub, f"{path}.{n + 1}")\n            if why:\n                return why\n', '            why = pin_problem(item, sub, f"{path}.{n + 1}")\n            return why\n'),
     ('docker step count mismatch: no early return (more messages)', '                            f"first difference is step {first + 1}", "DOCKER_STEPS"))\n        return\n', '                            f"first difference is step {first + 1}", "DOCKER_STEPS"))\n'),
+    ("workflow run continuation strips spaces only (#4944)", 'if text.rstrip(" \\t").endswith("\\\\"):', 'if text.rstrip(" ").endswith("\\\\"):'),
+    ("#4946 whitelist widened to the whole file", "                canon_lines.update(set(range(first, last + 1)))\n", "                canon_lines.update(set(range(1, len(raw) + 1)))\n"),
+    ("docker permissions pinned twice: RELEASE_JOB_PERMISSIONS again (#4941 F1)", '        if name == "docker":\n', '        if False:\n'),
     ("canonical RUN written differently: its lines not whitelisted (#4946)", "                canon_lines.update(set(range(first, last + 1)))\n", "                pass\n"),
 )
 
