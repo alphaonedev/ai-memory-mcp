@@ -812,10 +812,21 @@ def tainted_names(text):
             assigns.append((m.group(1), m.group(2)))
         for m in re.finditer(r"(?:^|[\s;(])printf\s+-v\s+(\w+)\s+(.*)", line):
             assigns.append((m.group(1), m.group(2)))
+    # #5360: a function whose body calls a source is a source (to a fixed point), so a wrapper such as
+    # node_get is followed without being listed. A wrapper counts only where it is a command word.
+    sources, wrappers = list(TAINT_SOURCES), []
+    while True:
+        rx = r"(?<![\w$/.-])(?:%s)(?![\w-])" % "|".join(sources + wrappers)
+        wrap = {f for _, line, f in logical_lines(text) if f and f not in sources + wrappers and re.search(rx, line)}
+        if not wrap:
+            break
+        wrappers += sorted(wrap)
+    src_rx = r"(?<![\w$-])(?:%s)(?![\w-])" % "|".join(sources)
+    wrap_rx = r"(?:^|[\s;(&|{`])(?:%s)(?=[\s;)&|}]|$)" % "|".join(wrappers or ["\\0"])
     names = set()
     while True:
         new = {v for v, rhs in assigns if v not in names and (
-            re.search(r"(?<![\w$-])(?:%s)(?![\w-])" % "|".join(TAINT_SOURCES), rhs)
+            re.search(src_rx, rhs) or re.search(wrap_rx, re.sub(r'"[^"$]*"', '""', rhs))
             or any(re.search(r"\$\{?[#!]?%s\b" % re.escape(n), rhs) for n in names))}
         if not new:
             return names
@@ -948,6 +959,10 @@ def closed_world_taint(fs):
                         ("a read into a variable", 'read -r t <<< "$qjson"\nno "x $t"'),
                         ("a mapfile into an array", 'mapfile -t t <<< "$qjson"\nno "x ${t[0]}"'),
                         ("a for loop variable", 'for t in $qjson; do no "x $t"; done'),
+                        # #5360: a function that wraps a node channel is a taint source of its own.
+                        ("a wrapper around a channel", 'fetch() { on_node "$1" "cat x" 2>/dev/null; }\nt=$(fetch h)\nno "x $t"'),
+                        ("a wrapper of a wrapper", 'f1() { node_get "$1" "$2"; }\nf2() { f1 "$1" x; }\nt=$(f2 h)\nno "x $t"'),
+                        ("a wrapper around curl", 'g1() { curl -s "$1" 2>/dev/null; }\nt="$(g1 u)"\nno "x $t"'),
                         ("an append assignment", 't=a\nt+=$qjson\nno "x $t"'),
                         ("printf -v", "printf -v t '%s' \"$qjson\"\nno \"x $t\""),
                         ("an indirect expansion", 't=qjson\nno "x ${!t}"'),
