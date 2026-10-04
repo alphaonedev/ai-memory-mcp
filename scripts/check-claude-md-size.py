@@ -2036,6 +2036,63 @@ def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
     return ok
 
 
+def run_index_entries_case(repo_root: Path) -> bool:
+    """R4: INDEX_ENTRIES_SHA256 is enforced. The fixture cases pass their own index pins, which skips the
+    exact-lines hash, so this case runs check_index on the live tree with the real pins: it must pass as is,
+    and fail when two index entries swap places (every other index check still passes on that input)."""
+    try:
+        visible = visible_lines(read_utf8(repo_root / "CLAUDE.md"))
+        ref_lines = {Path(rel).stem: split_lines(read_utf8(repo_root / rel)) for rel, _h, _m in REFERENCE_FILES}
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"FAIL: self-test - cannot read the live tree for the index-lines case: {exc}", file=sys.stderr)
+        return False
+    errors = []
+    check_index(visible, ref_lines, errors)
+    if errors:
+        print("FAIL: self-test - the live binding-rules index does not pass: " + errors[0][:200], file=sys.stderr)
+        return False
+    entries = [number for number, line in enumerate(visible) if INDEX_ENTRY.match(line)]
+    if len(entries) < 2:
+        print("FAIL: self-test - the live tree has fewer than two index entries", file=sys.stderr)
+        return False
+    swapped = list(visible)
+    first, second = entries[0], entries[1]
+    swapped[first], swapped[second] = swapped[second], swapped[first]
+    errors = []
+    check_index(swapped, ref_lines, errors)
+    if not any("INDEX_ENTRIES_SHA256" in error for error in errors):
+        print("FAIL: self-test - reordered index entries were NOT rejected (wanted INDEX_ENTRIES_SHA256)",
+              file=sys.stderr)
+        return False
+    return True
+
+
+def run_fence_cases() -> bool:
+    """R4: each CommonMark fence rule in fence_scan is pinned directly (a wrong rule shifts what is prose)."""
+    ok = True
+    cases = (
+        ("a run indented four spaces is code-block text, not a fence opener", "    ```\nX\n", {"X": False}),
+        ("a run indented three spaces is a fence opener", "   ```\nX\n", {"X": True}),
+        ("a shorter run does not close a longer fence", "````\n```\nX\n````\n", {"X": True}),
+        ("a longer run closes a shorter fence", "```\nX\n````\nY\n", {"X": True, "Y": False}),
+        ("a tilde run does not close a backtick fence", "```\n~~~\nX\n```\n", {"X": True}),
+        ("a backtick run does not close a tilde fence", "~~~\n```\nX\n~~~\n", {"X": True}),
+        ("a backtick run whose info string has a backtick is not a fence", "```a`b\nX\n", {"X": False}),
+        ("a tilde run whose info string has a backtick is a fence", "~~~a`b\nX\n", {"X": True}),
+        ("a closer indented three spaces closes", "```\nX\n   ```\nY\n", {"X": True, "Y": False}),
+        ("a closer indented four spaces does not close", "```\nX\n    ```\nY\n", {"X": True, "Y": True}),
+        ("a closer with an info string does not close", "```\nX\n```js\nY\n", {"X": True, "Y": True}),
+        ("an unclosed fence hides the rest of the file", "```\nX\nY\n", {"X": True, "Y": True}),
+        ("a fence is closed once and prose follows", "```\nX\n```\nY\n", {"X": True, "Y": False}),
+    )
+    for label, text, wants in cases:
+        got = {line.strip(): in_code for line, in_code in fence_scan(text) if line.strip() in wants}
+        if got != wants:
+            print(f"FAIL: self-test - fence case {label!r}: in_code={got} (wanted {wants})", file=sys.stderr)
+            ok = False
+    return ok
+
+
 def self_test() -> int:
     # Scratch lives under <repo>/.local-runs/ (project no-/tmp hard rule), never system /tmp.
     repo_root = Path(__file__).resolve().parent.parent
@@ -2051,6 +2108,8 @@ def self_test() -> int:
         ok &= run_limit_cases()
         ok &= run_scratch_cases(Path(tmp))
         ok &= run_workflow_cases(repo_root, Path(tmp))
+        ok &= run_index_entries_case(repo_root)
+        ok &= run_fence_cases()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if not ok:
