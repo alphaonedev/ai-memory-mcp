@@ -116,24 +116,46 @@ lab_posture_render() {
 # If a future row uses a shape this cannot resolve, the check reports "cannot
 # check" rather than passing — a drift guard that silently degrades to green is
 # worse than none. `run.sh --posture-selftest` proves the guard can fail.
-# _lab_posture_const <root> <CONST_NAME> — the string literal of `pub const NAME: &str`
-# (also `pub(crate)`, value on the same line or the next), or empty if unresolvable.
+# _lab_posture_const <root> <CONST_NAME> [<module/path>] — the string literal of
+# `pub const NAME: &str` (also `pub(crate)`, value on the same line or the next), or
+# empty if unresolvable. The file the KNOBS row names (`crate::a::b::NAME` is
+# src/a/b.rs or src/a/b/mod.rs) is searched first; only when the const is not
+# defined there (a re-export, or an associated const) is all of src searched. Either way
+# more than one DISTINCT value is refused as unresolvable (#5124): a shadowing duplicate
+# must never be picked by file order.
 _lab_posture_const() {
-  grep -rhzoE "pub(\(crate\))? const $2: &str =[[:space:]]*\"[^\"]*\"" "$1/src" \
-    | tr '\0\n' '  ' | sed -n 's/^[^"]*"\([^"]*\)".*/\1/p'
+  local root="$1" name="$2" modp="${3:-}" files=() f vals=""
+  if [ -n "$modp" ]; then
+    for f in "$root/src/$modp.rs" "$root/src/$modp/mod.rs"; do [ -f "$f" ] && files+=("$f"); done
+  fi
+  if [ "${#files[@]}" -gt 0 ]; then vals="$(_lab_posture_const_vals "$name" "${files[@]}")"; fi
+  if [ -z "$vals" ]; then vals="$(_lab_posture_const_vals "$name" -R "$root/src")"; fi
+  [ -n "$vals" ] || return 0
+  [ "$(printf '%s\n' "$vals" | wc -l)" -eq 1 ] || return 0
+  printf '%s' "$vals"
+}
+
+# _lab_posture_const_vals <NAME> <grep file args...> — the distinct literals, one per line.
+_lab_posture_const_vals() {
+  local name="$1"; shift
+  grep -hzoE "pub(\(crate\))? const $name: &str =[[:space:]]*\"[^\"]*\"" "$@" 2>/dev/null \
+    | tr '\0\n' '  ' | grep -oE '"[^"]*"' | sed 's/^"//; s/"$//' | sort -u
 }
 
 # _lab_posture_expr <root> <expr> — resolve one KNOBS field expression: a string
 # literal ("refuse") or a `crate::path::CONST` reference. Echoes the value (which
 # may be the empty string); returns 1 if a const cannot be resolved.
 _lab_posture_expr() {
-  local root="$1" expr="$2" cname val
+  local root="$1" expr="$2" cname val modp
   case "$expr" in
     \"*\") printf '%s' "$expr" | sed -n 's/^"\(.*\)"$/\1/p'; return 0 ;;
     crate::*)
       cname="$(printf '%s' "$expr" | sed -n 's/.*::\([A-Z0-9_]*\)$/\1/p')"
       [ -n "$cname" ] || return 1
-      val="$(_lab_posture_const "$root" "$cname")"
+      # Module path of the const: `crate::a::b::NAME` -> a/b; a type segment
+      # (`AppConfig::NAME`) is dropped so the file that owns the type is searched.
+      modp="$(printf '%s' "$expr" | sed -n 's/^crate:://; s/::[A-Z0-9_]*$//; s/::[A-Z][A-Za-z0-9]*$//; s|::|/|gp')"
+      val="$(_lab_posture_const "$root" "$cname" "$modp")"
       [ -n "$val" ] || return 1
       printf '%s' "$val"; return 0 ;;
   esac
@@ -228,6 +250,18 @@ lab_posture_selftest() {
   ( LAB_POSTURE_SET=("${LAB_POSTURE_SET[@]/AI_MEMORY_CID_ENFORCE=1}")
     LAB_POSTURE_UNSET+=("AI_MEMORY_CID_ENFORCE")
     _leg "a pinned knob moved to the unset list is refused" 1 ) || bad=1
+  # #5124: a const resolves from the file the KNOBS row names; a shadowing duplicate elsewhere
+  # in src must neither change a named-path result nor be picked by file order when the
+  # const has to be found by name alone (then two distinct values are "cannot check", rc 2).
+  local shadow; shadow="$(mktemp -d "${TMPDIR:-.}/posture-shadow.XXXXXX")" || return 1
+  mkdir -p "$shadow/src" && local e
+  for e in "$root"/src/*; do ln -s "$e" "$shadow/src/$(basename "$e")"; done
+  printf 'pub const MODE_REFUSE: &str = "warn";\n' > "$shadow/src/aaa_shadow.rs"
+  local real_root="$root"; root="$shadow"
+  ( _leg "a shadow duplicate of a path-named const does not change the result" 0 ) || bad=1
+  printf 'pub const ENV_PERMISSIONS_MODE: &str = "SHADOW_ENV";\n' >> "$shadow/src/aaa_shadow.rs"
+  ( _leg "a name-only const with two distinct values is cannot-check, not first-match" 2 ) || bad=1
+  root="$real_root"; rm -rf "$shadow"
   unset -f _leg
   return "$bad"
 }
