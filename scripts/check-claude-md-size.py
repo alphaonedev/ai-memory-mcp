@@ -1287,12 +1287,17 @@ def run_citation_cases(fresh) -> bool:
         root = fresh()
         doc = root / directory / "anchor.md"
         doc.parent.mkdir(parents=True, exist_ok=True)
-        doc.write_text(f"See [it](../../CLAUDE.md#{github_slug(heading)}).\n", encoding="utf-8")
+        # #5178: a literal GitHub anchor, not github_slug(): a broken slug function must fail this case.
+        doc.write_text("See [it](../../CLAUDE.md#key-modules).\n", encoding="utf-8")
         ok &= expect(root, f"R4 stale anchor link in {directory}", True, "R4")
     for label, form, want in (
             ("upper-case file name", 'See CLAUDE.MD section "{h}".', True),
             ("the word rule", 'See CLAUDE.md rule "{h}".', True),
-            ("upper-case anchor", "See CLAUDE.md#" + github_slug(heading).upper() + ".", True),
+            ("upper-case anchor", "See CLAUDE.md#KEY-MODULES.", True),
+            ("anchor of a heading with punctuation and an em dash",
+             "See CLAUDE.md#config-schema-v07x-1146--sectioned-llm--embeddings--reranker--storage--limits.", True),
+            ("anchor of a heading with parentheses", "See CLAUDE.md#mobile-target-support-v070-posture-1a-issue-1068.",
+             True),
             ("anchor of a heading that did not move", "See [rule](CLAUDE.md#hard-rule).", False),
             ("anchor that names no heading", "See CLAUDE.md#no-such-heading.", False),
             ("possessive of a section that stayed", 'See CLAUDE.md\'s "Hard rule".', False),
