@@ -53,12 +53,10 @@ fn assert_minted_on_node(tpl: &str, which: &str) {
         "{which}: the role password must be generated on the node"
     );
     assert!(
-        tpl.contains("sed -i \"s/CHANGEME/$NEW_SECRET/\" /etc/ai-memory/store-url"),
+        tpl.contains("\"$NEW_SECRET\" \"${DB_URL#*CHANGEME}\" > /etc/ai-memory/store-url"),
         "{which}: the minted secret must replace the placeholder in the store-url file"
     );
-    let guard = tpl
-        .matches("grep -q CHANGEME /etc/ai-memory/store-url")
-        .count();
+    let guard = tpl.matches("if [ \"$DB_PASS\" = CHANGEME ]; then").count();
     assert!(
         guard >= 2,
         "{which}: a mint check and a fail-closed check on a surviving placeholder are both required, found {guard}"
