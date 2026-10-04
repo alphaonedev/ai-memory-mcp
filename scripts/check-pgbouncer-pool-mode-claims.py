@@ -598,7 +598,7 @@ def load_unread(root: Path) -> Tuple[Dict[str, str], List[str]]:
         raw = (root / UNREAD_REL).read_text(encoding="utf-8")
     except FileNotFoundError:
         return listed, errors  # no file: nothing is excused
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:  # R5: a decode error is a FAULT (rc 2), not a traceback
         return {}, ["%s: unreadable: %s" % (UNREAD_REL, exc)]
     block: List[str] = []
     reason: Optional[str] = None
@@ -649,7 +649,7 @@ def load_allowlist(root: Path, require_ctx: bool = True) -> Tuple[List[Entry], L
     path = root / ALLOW_REL
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         return [], ["%s: unreadable: %s" % (ALLOW_REL, exc)]
     block: List[str] = []   # the comment block being read
     reason: Optional[str] = None  # the reason of the entry directly above, if any
@@ -723,7 +723,7 @@ def fault(message: str) -> int:
 def check_template(root: Path) -> Optional[str]:
     try:
         text = (root / INI_REL).read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         return "cannot read %s: %s" % (INI_REL, exc)
     modes = [m.group(1).lower() for m in (INI_ACTIVE.match(l) for l in text.splitlines()) if m]
     if modes != ["session"]:
@@ -1056,6 +1056,10 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
         ("a UTF-16 file with a BOM is decoded and judged", tree({"docs/u.txt": "Run PgBouncer in transaction mode.\n".encode("utf-16")}), EXIT_FINDING),
         ("a BOM-less UTF-16LE file is decoded and judged", tree({"docs/u.txt": "Run PgBouncer in transaction mode.\n".encode("utf-16-le")}), EXIT_FINDING),
         ("a BOM-less UTF-16BE file is decoded and judged", tree({"docs/u.txt": "Run PgBouncer in transaction mode.\n".encode("utf-16-be")}), EXIT_FINDING),
+        # a list or template that is not UTF-8 is a FAULT (rc 2), never a traceback (#5207)
+        ("an allowlist that is not UTF-8 is a FAULT", tree(retired, (REASON + retired_entry).encode("utf-8") + b"# \xff\n"), EXIT_FAULT),
+        ("a skip list that is not UTF-8 is a FAULT", dict(tree(retired, REASON + retired_entry), **{UNREAD_REL.as_posix(): b"# \xff\n"}), EXIT_FAULT),
+        ("an ini template that is not UTF-8 is a FAULT", tree(ini=b"[pgbouncer]\npool_mode = session\n; \xff\n"), EXIT_FAULT),
         ("a UTF-32 file is decoded and judged", tree({"docs/u.txt": "Run PgBouncer in transaction mode.\n".encode("utf-32")}), EXIT_FINDING),
         # R9 (#4667 round 6): closed world over characters
         ("R9: an invalid UTF-8 byte inside the mode word is red", tree({"docs/a.md": b"Run PgBouncer in tr\xffansaction mode.\n"}), EXIT_FINDING),
@@ -1212,6 +1216,9 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("round-4 S2 skip .ini", SKIP, SKIP[:-1] + " or rel.endswith('.ini'):"),
     ("round-4 S9 skip deploy/", SKIP, SKIP[:-1] + " or rel.startswith('deploy/'):"),
     ("guide pin", "    if not guide_ok:\n", "    if False:\n"),
+    ('H skip list decode error is a fault', '    except (OSError, UnicodeDecodeError) as exc:  # R5: a decode error is a FAULT (rc 2), not a traceback\n        return {}, [', '    except OSError as exc:  # R5: a decode error is a FAULT (rc 2), not a traceback\n        return {}, ['),
+    ('H allowlist decode error is a fault', '    except (OSError, UnicodeDecodeError) as exc:\n        return [], ["%s: unreadable', '    except OSError as exc:\n        return [], ["%s: unreadable'),
+    ('H template decode error is a fault', '    except (OSError, UnicodeDecodeError) as exc:\n        return "cannot read %s', '    except OSError as exc:\n        return "cannot read %s'),
     ("R9 unreadable lines are units", "                raw.append((base + i + 1, text, (i,)))  # R9", "                pass  # R9"),
     ("R9 U+FFFD always counts", '    found = {"\\ufffd"} if "\\ufffd" in text else set()', "    found = set()"),
     ("R9 approved shapes hold DECLARED characters", "    if not all(c in DECLARED for c in text):\n        return False", "    if False:\n        return False"),
