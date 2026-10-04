@@ -620,7 +620,7 @@ BARE_LN = re.compile(r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs):(\d+)")
 # A bare anchor is exempt ONLY as the label of a link whose target is a
 # commit-pinned permalink (/blob/<40 hex>/): immutable, cannot rot, and
 # only when the label's path and line (or range) equal the URL's (#4670).
-PIN_URL = re.compile(r"^https://github\.com/[^/]+/[^/]+/blob/[0-9a-f]{40}/")
+# PIN_TARGET below is the single owner of that pin rule (#5214).
 LABEL_MD = re.compile(r"^[^\]\n]*\]\(([^)\s]*)")
 LABEL_HTML = re.compile(r"^[^<\n]*</a>")
 QUAL = re.compile(
@@ -684,7 +684,7 @@ def pinned_label(line, m):
     elif LABEL_HTML.match(rest) and line[:start].rfind("<a ") >= 0:
         href = re.findall(r'href="([^"]*)"', line[:start])
         target = href[-1] if href else None
-    if target is None or not PIN_URL.match(target):
+    if target is None:
         return False
     pt = PIN_TARGET.match(target)
     if pt is None:
