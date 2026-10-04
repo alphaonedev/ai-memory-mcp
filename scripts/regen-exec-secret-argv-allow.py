@@ -30,6 +30,8 @@ Usage:
   scripts/regen-exec-secret-argv-allow.py --prune         also delete stale entries
   scripts/regen-exec-secret-argv-allow.py --accept-new --why 'reason: text'
   scripts/regen-exec-secret-argv-allow.py --accept-new --pending --why '#1234'
+  scripts/regen-exec-secret-argv-allow.py --retag pending --match <regex> --why '#<issue>'
+  scripts/regen-exec-secret-argv-allow.py --retag allow --to-pending --match <regex> --why '#<issue>'
   scripts/regen-exec-secret-argv-allow.py --check         exit 1 if the files would change
 """
 import argparse
@@ -68,7 +70,20 @@ def load_gate(root: Path):
 def foreign_comments(head: str, text: str) -> List[str]:
     """Comment lines of an existing list file that render() would drop (#4902)."""
     keep = set(head.splitlines())
-    return [ln for ln in text.splitlines() if ln.lstrip().startswith("#") and ln not in keep]
+    return [ln for ln in text.splitlines()
+            if ln.lstrip().startswith("#") and ln not in keep and not re.match(r"^#\d+ \|", ln)]
+
+
+def lenient_pending(text: str) -> List[Entry]:
+    """Pending rows read without the reason check, for --retag pending (the repair of a bad reason)."""
+    out: List[Entry] = []
+    for no, ln in enumerate(text.splitlines(), 1):
+        if not ln.strip() or (ln.lstrip().startswith("#") and not re.match(r"^#\d+ \|", ln)):
+            continue
+        parts = ln.split(" | ", 3)
+        if len(parts) == 4 and parts[2].strip().isdigit():
+            out.append((parts[0].strip(), parts[1].strip(), int(parts[2]), parts[3], no))
+    return out
 
 
 def render(head: str, entries: List[Entry]) -> str:
@@ -167,8 +182,41 @@ def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, p
     return rc, list(amap.values()), list(pmap.values()), msgs
 
 
+def retag(gate, allow: List[Entry], pend: List[Entry], source: str, match: Optional[str], why: Optional[str],
+          to_pending: bool) -> Tuple[int, List[Entry], List[Entry], List[str]]:
+    """Change the reason of matching entries, or move matching ALLOW entries to pending (#4911).
+
+    Moving is one way: an entry can go from allow to pending (a known-unsafe line is recorded
+    as such), never from pending to allow. ``match`` is required so a change is always chosen."""
+    if match is None or why is None:
+        return 2, allow, pend, ["--retag needs --match <regex> and --why"]
+    if to_pending and source != "allow":
+        return 2, allow, pend, ["--to-pending only moves allow entries (pending never moves to allow)"]
+    pat = gate.PEND_WHY_RE if (to_pending or source == "pending") else gate.WHY_RE
+    if not pat.match(why):
+        return 2, allow, pend, ["--why %r is not valid for the target list (pending needs '#<issue>')" % why]
+    src = allow if source == "allow" else pend
+    hit = [e for e in src if re.search(match, e[1] + " " + e[3])]
+    if not hit:
+        return 2, allow, pend, ["--retag --match matched no %s entry" % source]
+    msgs: List[str] = []
+    new_src = [e for e in src if e not in hit]
+    moved = [(why, e[1], e[2], e[3], e[4]) for e in hit]
+    for e in hit:
+        msgs.append("RETAG %s %s -> %s: %s | %s" % (source, e[0][:40], why if not to_pending else "pending " + why,
+                                                    e[1], e[3][:100]))
+    if to_pending:
+        keys = {(e[1], e[3]) for e in pend}
+        if any((e[1], e[3]) in keys for e in moved):
+            return 2, allow, pend, ["--to-pending: a matching line is already pending"]
+        return 0, new_src, pend + moved, msgs
+    if source == "allow":
+        return 0, new_src + moved, pend, msgs
+    return 0, allow, new_src + moved, msgs
+
+
 # ---------------------------------------------------------------- refusal cases
-REFUSAL_CASE_COUNT = 15
+REFUSAL_CASE_COUNT = 18
 
 
 def _f(gate, rel: str, line: str, flagged: bool = False):
@@ -234,6 +282,21 @@ def refusal_cases(root: Path) -> List[str]:
     rc, na, _np, _m = plan(gate, _f(gate, "x.sh", hdr), [], [], True, False, "reason: r", False, None, dl)
     if rc != 1 or na:
         bad.append("regen: a line the prose rules flag was added to allow (#4902)")
+    # #4911: retag may move allow to pending, never the reverse, and needs a chosen match
+    rc, *_ = retag(gate, allowed, pend_e, "allow", None, "#1", True)
+    if rc != 2:
+        bad.append("regen: --retag ran without --match (#4911)")
+    rc, *_ = retag(gate, allowed, pend_e, "pending", "x.sh", "#1", True)
+    if rc != 2:
+        bad.append("regen: --to-pending moved a pending entry toward allow (#4911)")
+    rc, na, npd, _m = retag(gate, allowed, [], "allow", "x.sh", "reason: unsafe", True)
+    if rc != 2 or na != allowed:
+        bad.append("regen: a pending entry took a reason with no issue number (#4911)")
+    rc, na, npd, _m = retag(gate, allowed, [], "allow", "x.sh", "#7", True)
+    if rc != 0 or na or len(npd) != 1 or npd[0][0] != "#7":
+        bad.append("regen: --to-pending did not move the allow entry (#4911)")
+    if foreign_comments(ALLOW_HEAD, ALLOW_HEAD + "#12 | f | 1 | x\n"):
+        bad.append("regen: an issue-keyed entry row was taken for a hand comment (#4902)")
     if not foreign_comments(ALLOW_HEAD, ALLOW_HEAD + "# a hand note\n"):
         bad.append("regen: a hand-written comment line would be dropped silently (#4902)")
     return bad
@@ -247,6 +310,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--why", help="'#<issue>' or 'reason: <text>' for every addition")
     ap.add_argument("--match", help="with --accept-new: only lines whose '<file> <text>' matches this regex")
     ap.add_argument("--prune", action="store_true", help="delete stale entries and lower counts")
+    ap.add_argument("--retag", choices=("allow", "pending"),
+                    help="change the reason of the entries chosen by --match in that list")
+    ap.add_argument("--to-pending", action="store_true",
+                    help="with --retag allow: move the chosen allow entries to pending (--why '#<issue>')")
     ap.add_argument("--check", action="store_true", help="write nothing; exit 1 if the files would change")
     ap.add_argument("--root", default=str(ROOT))
     return ap
@@ -263,6 +330,11 @@ def main(argv: List[str]) -> int:
     except (OSError, RuntimeError, SyntaxError) as exc:
         print("FAULT: %s" % exc, file=sys.stderr)
         return 2
+    if args.retag == "pending" or args.prune:
+        # retag and prune are the repairs for a pending row with a bad reason (it may be stale),
+        # so those faults do not stop them; the gate still faults on any row left behind
+        faults = [f for f in faults if not (f.startswith("pending:") and "bad why" in f)]
+        pend = lenient_pending((root / gate.PENDING_FILE).read_text(encoding="utf-8"))
     if faults:
         print("\n".join("FAULT: " + f for f in faults), file=sys.stderr)
         return 2
@@ -273,11 +345,16 @@ def main(argv: List[str]) -> int:
         print("FAULT: a hand-written comment line would be dropped; remove it or move it into the head "
               "of the tool (#4902): %s" % dropped[0][:100], file=sys.stderr)
         return 2
-    rc, na, np_, msgs = plan(gate, found, allow, pend, args.accept_new, args.pending, args.why, args.prune,
-                             args.match, dl)
+    if args.retag:
+        rc, na, np_, msgs = retag(gate, allow, pend, args.retag, args.match, args.why, args.to_pending)
+    else:
+        rc, na, np_, msgs = plan(gate, found, allow, pend, args.accept_new, args.pending, args.why, args.prune,
+                                 args.match, dl)
     for m in msgs:
         print(m, file=sys.stderr if m.startswith(("NEW", "STALE", "REFUSED")) else sys.stdout)
     if rc == 2:
+        return 2
+    if args.retag and args.check:
         return 2
     new_allow = render(ALLOW_HEAD, na)
     new_pend = render(PENDING_HEAD, np_)

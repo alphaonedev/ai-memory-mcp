@@ -631,6 +631,16 @@ def _flatten(cmd: List[str], dl, depth: int = 0) -> Iterable[List[str]]:
                         yield sub
 
 
+def _url_is_value(v: str) -> bool:
+    """A --store-url value matters when it is a connection URL (scheme://...) or a variable
+    expansion: the docs then teach the argv form of a DSN that can embed a password (#4890). The
+    flag named with no value, or followed by a bare word, is prose."""
+    return bool(re.search(r"://|\$\{?\w", v))
+
+
+NUMERIC_LIMIT_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_TOKENS=\d+\b")
+
+
 def prose_rule_hits(dl, line: str) -> List[str]:
     """Rules beyond the imported denylist, applied to one prose logical line."""
     reasons: List[str] = []
@@ -674,6 +684,8 @@ def prose_rule_hits(dl, line: str) -> List[str]:
                         reasons.append("container-env-secret-expansion")
                 fm = re.match(r"^--([A-Za-z][\w-]*)(?:=(.*))?$", w)
                 if fm and secret_name(fm.group(1)) and not LOCATOR_FLAG_RE.search(fm.group(1)) \
+                        and not (re.fullmatch(r"store[-_]url", fm.group(1), re.I) and not _url_is_value(
+                            fm.group(2) if fm.group(2) is not None else (rest[k + 1] if k + 1 < len(rest) else ""))) \
                         and not re.search(r"(?:^|-)(?:tokens|budget|key|tls)(?:-|$)", fm.group(1)):
                     v = fm.group(2) if fm.group(2) is not None else (rest[k + 1] if k + 1 < len(rest) else "")
                     if v and not v.startswith("-") and not v.isdigit() and not PATHISH_RE.search(v):
@@ -688,7 +700,8 @@ def scan_prose_file(dl, rel: str, text: str) -> Optional[List[Found]]:
     found: List[Found] = []
     for start, end, raw in units:
         reasons = prose_rule_hits(dl, raw)
-        if dl.scan_text("fence.sh", raw):
+        # NAME_TOKENS=<int> is a model token limit, not a credential (#4911)
+        if dl.scan_text("fence.sh", NUMERIC_LIMIT_RE.sub("NUMERIC_LIMIT=0", raw)):
             reasons.append("denylist")
         if reasons:
             found.append((start, norm(raw), sorted(set(reasons))))
@@ -1023,6 +1036,9 @@ def probe_files() -> List[Tuple[str, str, str]]:
     # #4903 #4926 #4904 #4923-#4928 (round 2 of PR 4891): forms the first reviewers planted
     P2 = "ProbeValue1"
     raw_rows = [
+        ("4911 prose --store-url with a userinfo password", "d.md",
+         "```bash\nzorbctl serve --store-url postgres://u:$P@h/d\n```\n".replace("$P", P2)),
+        ("4911 prose --store-url with a variable value", "d.md", "```bash\nzorbctl serve --store-url $URL\n```\n"),
         ("4903 comment ending in backslash hides the next line", "p.sh",
          '#!/bin/bash\n# note \\\ncurl -H "Authorization: Bearer $TOKEN" https://h\n'),
         ("4926 continuation splits a flag name", "p.sh", "#!/bin/bash\nzorbctl --to\\\nken=$P h\n".replace("$P", P2)),
@@ -1100,6 +1116,10 @@ def green_probes() -> List[Tuple[str, str, str]]:
         ("passed and author are not secret names", "g.sh", '#!/bin/bash\necho "$passed of $total by $author"\n'),
         ("comment line", "g.sh", '#!/bin/bash\n# curl -H "x-api-key: $KEY"\necho ok\n'),
         ("a plain compose command", "docker-compose.yml", "services:\n  a:\n    command: [\"serve\", \"--port\", \"1\"]\n"),
+        ("4911 prose --store-url named without a value", "g.md",
+         "```text\nError: --db and --store-url are mutually exclusive. Pass exactly one.\n```\n"),
+        ("4911 prose --store-url followed by a bare word", "g.md", "```text\ncurator --store-url postgres (epoch host)\n```\n"),
+        ("4911 prose model token limit", "g.md", "```bash\nenv OLLAMA_MAX_DRAFT_TOKENS=4 ollama serve\n```\n"),
         ("not an executable file", "notes.txt", 'curl -H "x-api-key: $KEY" https://h\n'),
         ("cloud-init memory template stays with its own gate", "infra/p/cloud-init-memory.yaml.tpl", 'curl -H "x-api-key: $KEY" https://h\n'),
     ]
@@ -1116,6 +1136,8 @@ ALLOWED_FORMS = [
 
 
 def _scan_one(dl, name: str, text: str) -> List[Found]:
+    if name.lower().endswith((".md", ".html", ".htm")):
+        return scan_prose_file(dl, name, text) or []
     res = scan_exec_file(dl, name, text)
     return res or []
 
