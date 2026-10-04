@@ -42,6 +42,25 @@ def load_gate(root):
     return gate
 
 
+def write_unread(gate, root, listed, stale_unread, new_unread, reason):
+    """Rewrite the unread-file skip list: drop stale paths, append new ones under one dated reason comment."""
+    path = root / gate.UNREAD_REL
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raw = ""
+    drop = set(stale_unread)
+    out = [line for line in raw.splitlines() if line not in drop]
+    if new_unread:
+        out += ["", "# added by regen-pgbouncer-pool-mode-allow.py --accept-new on %s:" % datetime.date.today().isoformat(),
+                "# " + (reason or gate.PLACEHOLDER + " before review: say why each file below cannot be read as text")]
+        out += new_unread
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".regen")
+    tmp.write_text("\n".join(out).lstrip("\n") + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--root", default=str(HERE.parent))
@@ -70,24 +89,22 @@ def main(argv):
             print("regen: FAULT: %s" % err, file=sys.stderr)
         return 2
     try:
-        units, read = gate.scan(root)
+        units, read, unreadable = gate.scan_detail(root)
     except OSError as exc:
         print("regen: FAULT: %s" % exc, file=sys.stderr)
         return 2
     if read == 0:
         print("regen: FAULT: empty scan", file=sys.stderr)
         return 2
+    listed, unread_errors = gate.load_unread(root)
+    if unread_errors:
+        for err in unread_errors:
+            print("regen: FAULT: %s" % err, file=sys.stderr)
+        return 2
     need = Counter((rel, text) for rel, _, text in units if not gate.approved(text))
     have = Counter(entries)
     stale = have - need
     new = need - have
-    for (rel, text), n in sorted(stale.items()):
-        print("STALE x%d: %s | %s" % (n, rel, text[:160]))
-    for (rel, text), n in sorted(new.items()):
-        print("NEW   x%d: %s | %s" % (n, rel, text[:160]))
-    if not stale and not new:
-        print("regen: allowlist matches the tree (%d entries)" % len(entries))
-        return 0
     # #4667 R4: a gate.forbidden_entry line is never allowlistable, reason or not.
     forbidden = sorted(key for key in new if gate.forbidden_entry(key[1]))
     if forbidden and not a.check:
@@ -95,12 +112,30 @@ def main(argv):
             print("regen: FAULT: refusing a forbidden entry: %s | %s" % (rel, text[:160]), file=sys.stderr)
         print("regen: correct those lines in the tree; file left unchanged", file=sys.stderr)
         return 2
-    refused = (stale and not a.drop_stale) or (new and not a.accept_new)
+    new_unread = sorted(set(unreadable) - set(listed))
+    stale_unread = sorted(set(listed) - set(unreadable))
+    for (rel, text), n in sorted(stale.items()):
+        print("STALE x%d: %s | %s" % (n, rel, text[:160]))
+    for (rel, text), n in sorted(new.items()):
+        print("NEW   x%d: %s | %s" % (n, rel, text[:160]))
+    for rel in stale_unread:
+        print("STALE SKIP: %s (readable or no longer tracked)" % rel)
+    for rel in new_unread:
+        print("NEW SKIP:   %s (%s)" % (rel, unreadable[rel]))
+    if not stale and not new and not new_unread and not stale_unread:
+        print("regen: allowlist matches the tree (%d entries, %d unread-file skips)" % (len(entries), len(listed)))
+        return 0
+    refused = ((stale or stale_unread) and not a.drop_stale) or ((new or new_unread) and not a.accept_new)
     if a.check or refused:
-        print("regen: %d stale, %d new; file left unchanged (%s)" % (
-            sum(stale.values()), sum(new.values()),
+        print("regen: %d stale, %d new, %d stale skip, %d new skip; files left unchanged (%s)" % (
+            sum(stale.values()), sum(new.values()), len(stale_unread), len(new_unread),
             "--check" if a.check else "pass --drop-stale / --accept-new after reading each line above"))
         return 1
+    if new_unread or stale_unread:
+        write_unread(gate, root, listed, stale_unread, new_unread, reason)
+        if not (stale or new):
+            print("regen: skip list: removed %d, added %d; review the diff" % (len(stale_unread), len(new_unread)))
+            return 0
     out = []
     drop = Counter(stale)
     for line in raw.splitlines():

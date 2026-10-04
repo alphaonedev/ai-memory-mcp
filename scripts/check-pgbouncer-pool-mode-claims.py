@@ -34,6 +34,8 @@ written reason. No list of bad or negating words decides anything.
                supavisor, pgcat), multiplexed transactions/statements, session
                next to a pool word, and a bare `mode =` / `mode:` key set to a
                mode word.
+            Long lines (over 4096 characters) are read in overlapping segments
+               plus a product-and-mode-word test over the whole line.
             R8 key (closed world): a pooler-prefixed key ending in `mode`
                (pgb_mode, PGBOUNCER_MODE, supavisor-mode, a Terraform variable
                "pgb_mode") whatever its value: a variable, a default on another
@@ -96,10 +98,10 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
-import fnmatch
+import codecs
 from pathlib import Path
 from collections import Counter
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INI_REL = Path("infra") / "pgbouncer" / "pgbouncer.ini"
@@ -144,15 +146,23 @@ TOOL_PATH = re.compile(
 _PATH_KEEP = re.compile(r"pgbouncer|pooler|odyssey|supavisor|pgcat|transaction(?:s|al)?|statements?|sessions?|txn|xact|\btx\b")
 
 TAG = re.compile(r"<[^>]*>")
+# A line longer than LONG_LINE (minified JSON, a data blob) is never handed to the backtracking patterns whole: a
+# megabyte-long line would take quadratic time. Its tags are matched with a bounded pattern, and mentions() reads it
+# in overlapping segments plus one linear product-and-mode-word test, so it is judged, never skipped (#5090).
+LONG_LINE = 4096
+SEGMENT, SEGMENT_STEP = 2048, 1536
+TAG_LONG = re.compile(r"<[^<>]{0,512}>")
+_PRODUCT_WORD = re.compile(r"\b%s\b" % _PRODUCT)
 INI_ACTIVE = re.compile(r"^\s*pool_mode\s*=\s*([A-Za-z]+)\s*(?:[;#].*)?$")
-MAX_BYTES = 4 * 1024 * 1024
-# F1 (#4667 R4): a file the gate does not read must be a binary class or named here with a reason;
-# anything else is a FAULT, so a large or NUL-bearing text file cannot hide a mention.
-BINARY_EXT = {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".ico", ".webp", ".bmp", ".woff", ".woff2", ".ttf", ".otf",
-              ".gz", ".tgz", ".zip", ".xz", ".bz2", ".zst", ".db", ".sqlite", ".wasm", ".so", ".a", ".bin", ".der", ".p12", ".pyc"}
-UNREAD_OK = (
-    ("audits/v063-coverage-80pct/closer-*-coverage.json", "machine-generated llvm-cov JSON, never operator guidance"),
-)
+# Reading (#5086, #5090): a file is streamed in chunks and judged in line windows, so size is never a reason to
+# skip it. A file the gate cannot read as text (NUL bytes outside UTF-16/32, or a binary magic number such as gzip,
+# zip, png, pdf) is named in UNREAD_REL with a written reason, or the gate fails: nothing is skipped silently.
+UNREAD_REL = Path("scripts") / "qc-allowlists" / "pgbouncer-pool-mode-unread.txt"
+CHUNK_BYTES = 1 << 20
+WINDOW_LINES = 20000
+BINARY_MAGIC = (b"\x1f\x8b", b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x28\xb5\x2f\xfd", b"\x89PNG", b"%PDF",
+                b"\xff\xd8\xff", b"\0asm", b"\x7fELF", b"SQLite format 3\0", b"GIF8", b"wOFF", b"wOF2", b"OTTO",
+                b"\x00\x01\x00\x00\x00", b"\x1f\x9d", b"7z\xbc\xaf\x27\x1c", b"Rar!")
 NEIGHBOURS = 2  # non-blank lines inspected on each side (R5, R6)
 
 # ------------------------------------------------------- approved (closed set)
@@ -201,7 +211,7 @@ def normalise(line: str) -> str:
     fence = line.strip()
     if FENCE.match(fence):
         return fence.casefold()  # kept whole: a fence is a neutral context line (R6)
-    text = TAG.sub("", html.unescape(line))
+    text = (TAG_LONG if len(line) > LONG_LINE else TAG).sub("", html.unescape(line))
     text = re.sub(r"[`*]", "", text)
     return " ".join(text.split()).casefold()
 
@@ -243,7 +253,17 @@ def _mentions_one(text: str) -> bool:
     return bool(MENTION_NAME.search(split) or MENTION_PROSE.search(split))
 
 
+def _mentions_long(text: str) -> bool:
+    for start in range(0, len(text), SEGMENT_STEP):
+        if mentions(text[start:start + SEGMENT]):
+            return True
+    view = text if text.isascii() else shadow(text)
+    return bool(_PRODUCT_WORD.search(view) and OTHER_MODE.search(view))  # a product and a mode word anywhere on the line
+
+
 def mentions(text: str) -> bool:
+    if len(text) > LONG_LINE:
+        return _mentions_long(text)
     if _mentions_one(text):
         return True
     if text.isascii() and not _PG_SPLIT.search(text):
@@ -311,21 +331,22 @@ def _neighbours(lines: List[str], i: int) -> List[int]:
     return found
 
 
-def scan_lines(rel: str, lines: List[str]) -> List[Unit]:
-    """The mention units of one file (rules R1-R6)."""
+def scan_lines(rel: str, lines: List[str], base: int = 0, core: Optional[Tuple[int, int]] = None) -> List[Unit]:
+    """The mention units of one file (rules R1-R6). `lines` may be a window of a larger file: `base` is the
+    absolute index of lines[0], `core` the range of anchors this window answers for. Every pair has exactly one
+    anchor (the mention line for R5/R6, the first line for R4), and cores are disjoint, so no pair repeats."""
     units: List[Unit] = []
+    lo_core, hi_core = core if core is not None else (0, len(lines))
     is_mention = [bool(t) and mentions(t) for t in lines]
-    pairs: Set[Tuple[int, int]] = set()
 
     def pair(a: int, b: int) -> None:
         lo, hi = min(a, b), max(a, b)
-        if (lo, hi) not in pairs:
-            pairs.add((lo, hi))
-            units.append((rel, hi + 1, lines[lo] + " " + lines[hi]))
+        units.append((rel, base + hi + 1, lines[lo] + " " + lines[hi]))
 
-    for i, text in enumerate(lines):
+    for i in range(lo_core, hi_core):
+        text = lines[i]
         if is_mention[i]:
-            units.append((rel, i + 1, text))
+            units.append((rel, base + i + 1, text))
             ok = approved(text)
             for j in _neighbours(lines, i):
                 if is_mention[j]:
@@ -340,39 +361,160 @@ def scan_lines(rel: str, lines: List[str]) -> List[Unit]:
     return units
 
 
-def scan(root: Path) -> Tuple[List[Unit], int]:
-    """Every mention unit and the number of files read."""
+WINDOW_MARGIN = 2 * NEIGHBOURS + 8  # non-blank lines kept on each side of a window: covers every rule's reach
+
+
+def _margin_index(lines: List[str], start: int, step: int) -> Optional[int]:
+    """Index of the WINDOW_MARGIN-th non-blank line walking from `start` by `step`, or None if there are fewer."""
+    got, j = 0, start
+    while 0 <= j < len(lines):
+        if lines[j]:
+            got += 1
+            if got == WINDOW_MARGIN:
+                return j
+        j += step
+    return None
+
+
+def scan_stream(rel: str, raw_lines: Iterable[str]) -> List[Unit]:
+    """scan_lines over a stream: windows of WINDOW_LINES anchors, each with WINDOW_MARGIN non-blank lines of
+    left and right margin, so the units equal those of one pass over the whole file."""
+    units: List[Unit] = []
+    buf: List[str] = []
+    base = start = 0
+    retry_at = WINDOW_LINES
+    for raw in raw_lines:
+        buf.append(normalise(raw))
+        if len(buf) - start < retry_at:
+            continue
+        cut = _margin_index(buf, len(buf) - 1, -1)  # buf[cut:] holds WINDOW_MARGIN non-blank lines
+        if cut is None or cut <= start:
+            retry_at = len(buf) - start + WINDOW_LINES  # a long blank run: look again later, not on every line
+            continue
+        units += scan_lines(rel, buf, base, (start, cut))
+        keep = _margin_index(buf, cut - 1, -1) or 0
+        base += keep
+        buf = buf[keep:]
+        start = cut - keep
+        retry_at = WINDOW_LINES
+    units += scan_lines(rel, buf, base, (start, len(buf)))
+    return units
+
+
+class Unreadable(Exception):
+    """A tracked file the gate cannot read as text (named with a reason in UNREAD_REL, or a FAULT)."""
+
+
+def _decoder_for(head: bytes):
+    if head[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"):
+        return codecs.getincrementaldecoder("utf-32")("replace")
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return codecs.getincrementaldecoder("utf-16")("replace")
+    zeros = [i for i, b in enumerate(head[:CHUNK_BYTES]) if b == 0]
+    if len(zeros) * 4 >= min(len(head), CHUNK_BYTES) > 0:  # BOM-less UTF-16: NULs sit on one byte parity
+        odd = sum(1 for i in zeros if i % 2)
+        if odd * 10 >= len(zeros) * 9:
+            return codecs.getincrementaldecoder("utf-16-le")("replace")
+        if (len(zeros) - odd) * 10 >= len(zeros) * 9:
+            return codecs.getincrementaldecoder("utf-16-be")("replace")
+    return None
+
+
+def read_lines(path: Path) -> Iterator[str]:
+    """The lines of a text file, streamed. Raises Unreadable for binary content; an OSError propagates."""
+    with open(str(path), "rb") as handle:
+        chunk = handle.read(CHUNK_BYTES)
+        if chunk.startswith(BINARY_MAGIC):
+            raise Unreadable("binary or compressed content (magic number %s)" % chunk[:4].hex())
+        decoder = _decoder_for(chunk)
+        utf8 = decoder is None
+        if utf8:
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        carry = ""
+        while True:
+            if utf8 and b"\0" in chunk:
+                raise Unreadable("NUL bytes in a file that is not UTF-16/32 text")
+            text = carry + decoder.decode(chunk, final=not chunk)
+            carry = ""
+            lines = text.splitlines(keepends=True)
+            if chunk and lines and (lines[-1].splitlines()[0] == lines[-1] or lines[-1].endswith("\r")):
+                carry = lines.pop()  # an unterminated tail, or a \r that may be half of \r\n
+            for line in lines:
+                yield line.splitlines()[0] if line.splitlines() else ""
+            if not chunk:
+                break
+            chunk = handle.read(CHUNK_BYTES)
+        if carry:
+            yield carry
+
+
+def scan_detail(root: Path) -> Tuple[List[Unit], int, Dict[str, str]]:
+    """(mention units, files read, {path: why} of files that could not be read as text)."""
     units: List[Unit] = []
     read = 0
-    unread: List[str] = []
+    unread: Dict[str, str] = {}
     for rel in tracked_files(root):
-        if Path(rel) in (ALLOW_REL, SELF_REL):
+        if Path(rel) in (ALLOW_REL, SELF_REL, UNREAD_REL):
             continue
         path = root / rel
         if not path.is_file() or path.is_symlink():
             continue
-        binary = Path(rel).suffix.lower() in BINARY_EXT
-        listed = any(fnmatch.fnmatchcase(rel, pattern) for pattern, _ in UNREAD_OK)
-        if path.stat().st_size > MAX_BYTES:
-            if not (binary or listed):
-                unread.append("%s: over %d bytes" % (rel, MAX_BYTES))
+        try:
+            found = scan_stream(rel, read_lines(path))  # an OSError propagates: run() reports a FAULT
+        except Unreadable as exc:
+            unread[rel] = str(exc)
             continue
-        data = path.read_bytes()  # an OSError propagates: run() reports a FAULT
-        if data[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"):
-            text = data.decode("utf-32", "replace")
-        elif data[:2] in (b"\xff\xfe", b"\xfe\xff"):
-            text = data.decode("utf-16", "replace")
-        elif b"\0" in data:
-            if not (binary or listed):
-                unread.append("%s: NUL bytes in a file that is not a binary class" % rel)
-            continue
-        else:
-            text = data.decode("utf-8", "replace")
         read += 1
-        units += scan_lines(rel, [normalise(l) for l in text.splitlines()])
-    if unread:
-        raise OSError("files the gate cannot read as text (add a binary extension or a UNREAD_OK entry with a reason): "
-                      + "; ".join(unread[:5]))
+        units += found
+    return units, read, unread
+
+
+def load_unread(root: Path) -> Tuple[Dict[str, str], List[str]]:
+    """{path: reason} of the files named as unreadable, and the errors. One exact path per line under a reason."""
+    listed: Dict[str, str] = {}
+    errors: List[str] = []
+    try:
+        raw = (root / UNREAD_REL).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return listed, errors  # no file: nothing is excused
+    except OSError as exc:
+        return {}, ["%s: unreadable: %s" % (UNREAD_REL, exc)]
+    block: List[str] = []
+    reason: Optional[str] = None
+    for number, line in enumerate(raw.splitlines(), 1):
+        if not line.strip():
+            block, reason = [], None
+            continue
+        if line.lstrip().startswith("#"):
+            text = line.lstrip().lstrip("#").strip()
+            if "reason required" in text.casefold():
+                errors.append("%s:%d: placeholder comment left by --accept-new; write the reason for each path below it" % (UNREAD_REL, number))
+            elif not text.startswith(REGEN_HEADER):
+                block.append(text)
+            reason = None
+            continue
+        if block:
+            reason, block = " ".join(block), []
+        problem = reason_problem(reason or "")
+        if " " in line or problem or line in listed:
+            errors.append("%s:%d: bad skip entry %r (%s)" % (UNREAD_REL, number, line[:80],
+                          problem or "one exact path without spaces, listed once"))
+            continue
+        listed[line] = reason or ""
+    return listed, errors
+
+
+def scan(root: Path) -> Tuple[List[Unit], int]:
+    """Every mention unit and the number of files read. An unreadable file that is not on the skip list, a skip
+    entry that names a readable or untracked file, and a bad skip list are all errors (OSError)."""
+    units, read, unread = scan_detail(root)
+    listed, errors = load_unread(root)
+    missing = ["%s: %s" % (rel, why) for rel, why in sorted(unread.items()) if rel not in listed]
+    stale = ["%s: skip entry for a file that is readable or no longer tracked" % rel for rel in sorted(listed) if rel not in unread]
+    problems = errors + ["files the gate cannot read as text and that %s does not name with a reason: %s"
+                         % (UNREAD_REL, "; ".join(missing[:5]))] * bool(missing) + stale
+    if problems:
+        raise OSError("; ".join(problems))
     return units, read
 
 
@@ -493,6 +635,7 @@ def run(root: Path) -> int:
 GOOD_GUIDE = "```ini\npool_mode = session\n```\n"
 GOOD_INI = "[pgbouncer]\npool_mode = session\n"
 REASON = "# reviewed: this line states the retired mode only to say it is withdrawn\n"
+UNREAD_REASON = "# reviewed: a compressed archive of generated output that holds no operator guidance\n"
 
 # Red probes: every wording the PR 4710 reviews planted, rounds 1 to 3.
 PLANTED: List[Tuple[str, str, str]] = [
@@ -608,15 +751,21 @@ GREEN: List[Tuple[str, str, str]] = [
 ]
 
 
-def write_tree(root: Path, files: Dict[str, str]) -> None:
+def write_tree(root: Path, files: Dict[str, object]) -> None:
     for rel, body in files.items():
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(body, encoding="utf-8")
+        if isinstance(body, bytes):
+            target.write_bytes(body)
+        else:
+            target.write_text(body, encoding="utf-8")
 
 
-def tree(extra: Optional[Dict[str, str]] = None, allow: str = "", guide: str = GOOD_GUIDE, ini: str = GOOD_INI) -> Dict[str, str]:
-    files = {INI_REL.as_posix(): ini, GUIDE_REL.as_posix(): guide, ALLOW_REL.as_posix(): allow}
+def tree(extra: Optional[Dict[str, object]] = None, allow: str = "", guide: str = GOOD_GUIDE, ini: str = GOOD_INI,
+         unread: Optional[str] = None) -> Dict[str, object]:
+    files: Dict[str, object] = {INI_REL.as_posix(): ini, GUIDE_REL.as_posix(): guide, ALLOW_REL.as_posix(): allow}
+    if unread is not None:
+        files[UNREAD_REL.as_posix()] = unread
     files.update(extra or {})
     return files
 
@@ -635,8 +784,8 @@ def run_quiet(root: Path) -> int:
         sink.close()
 
 
-def cases() -> List[Tuple[str, Dict[str, str], int]]:
-    out: List[Tuple[str, Dict[str, str], int]] = []
+def cases() -> List[Tuple[str, Dict[str, object], int]]:
+    out: List[Tuple[str, Dict[str, object], int]] = []
     for name, rel, body in PLANTED:
         out.append(("red: " + name, tree({rel: body}), EXIT_FINDING))
     for name, rel, body in GREEN:
@@ -686,10 +835,34 @@ def cases() -> List[Tuple[str, Dict[str, str], int]]:
          tree({"infra/x/setup.sh": "pool_mode = transaction\n"}, REASON + "infra/x/setup.sh | pool_mode = transaction\n"), EXIT_FAULT),
         ("a per-db override entry is refused",
          tree({"infra/x/pgb.ini": "ai = host=pg pool_mode=transaction\n"}, REASON + "infra/x/pgb.ini | ai = host=pg pool_mode=transaction\n"), EXIT_FAULT),
-        # files the gate cannot read as text (R4)
+        # files read, not skipped (#5086, #5090)
         ("NUL bytes in a markdown file fail closed", tree({"docs/n.md": "\0\nRun PgBouncer in transaction mode.\n"}), EXIT_FAULT),
-        ("a text file over the size cap fails closed", tree({"docs/big.md": "x\n" * (2 * 1024 * 1024 + 8)}), EXIT_FAULT),
-        ("a UTF-16 file is decoded and judged", tree({"docs/u.txt": "\ufeffRun PgBouncer in transaction mode.\n"}), EXIT_FINDING),
+        ("a gzip document fails closed", tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}), EXIT_FAULT),
+        ("a binary magic number under a text name fails closed", tree({"docs/p.md": b"%PDF-1.7 Run PgBouncer in transaction mode.\n"}), EXIT_FAULT),
+        ("a named unreadable file with a reason passes",
+         tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}, unread=UNREAD_REASON + "docs/z.md.gz\n"), EXIT_OK),
+        ("a skip entry without a reason fails",
+         tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}, unread="docs/z.md.gz\n"), EXIT_FAULT),
+        ("a skip entry with a filler reason fails",
+         tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}, unread="# todo todo todo todo todo todo todo todo\ndocs/z.md.gz\n"), EXIT_FAULT),
+        ("a skip entry with the placeholder fails",
+         tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}, unread="# REASON REQUIRED before review - say why\ndocs/z.md.gz\n"), EXIT_FAULT),
+        ("a stale skip entry (the file is readable text) fails", tree({"docs/ok.md": "Plain text.\n"}, unread=UNREAD_REASON + "docs/ok.md\n"), EXIT_FAULT),
+        ("a skip entry for an untracked path fails", tree({}, unread=UNREAD_REASON + "docs/gone.md\n"), EXIT_FAULT),
+        ("a skip entry does not hide another unreadable file",
+         tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz", "docs/y.bin": b"\0\0\0"}, unread=UNREAD_REASON + "docs/z.md.gz\n"), EXIT_FAULT),
+        ("a file past the old 4 MiB cap, many windows, is scanned to its end",
+         tree({"docs/big.md": ("x" * 99 + "\n") * 43000 + "Run PgBouncer in transaction mode.\n"}), EXIT_FINDING),
+        ("a long line with a product at the start and a mode word far away is a mention",
+         tree({"docs/long.md": "PgBouncer " + "x " * 3500 + "transaction\n"}), EXIT_FINDING),
+        ("a mention straddling a long-line segment boundary is found",
+         tree({"docs/long.md": "x " * 1021 + "pool_mode = transaction" + " y" * 1200 + "\n"}), EXIT_FINDING),
+        ("a mention that straddles a read chunk is found",
+         tree({"docs/big.md": "a" * (CHUNK_BYTES - 10) + " Run PgBouncer in transaction mode.\n"}), EXIT_FINDING),
+        ("a UTF-16 file with a BOM is decoded and judged", tree({"docs/u.txt": "Run PgBouncer in transaction mode.\n".encode("utf-16")}), EXIT_FINDING),
+        ("a BOM-less UTF-16LE file is decoded and judged", tree({"docs/u.txt": "Run PgBouncer in transaction mode.\n".encode("utf-16-le")}), EXIT_FINDING),
+        ("a BOM-less UTF-16BE file is decoded and judged", tree({"docs/u.txt": "Run PgBouncer in transaction mode.\n".encode("utf-16-be")}), EXIT_FINDING),
+        ("a UTF-32 file is decoded and judged", tree({"docs/u.txt": "Run PgBouncer in transaction mode.\n".encode("utf-32")}), EXIT_FINDING),
         # fail closed
         ("fail closed: guide with no approved pool_mode line", tree(guide="No pooler section here.\n"), EXIT_FAULT),
         ("fail closed: guide with only session prose", tree(guide="Use pool_mode = session in production.\n"), EXIT_FAULT),
@@ -706,9 +879,50 @@ def _scratch_base() -> str:
     return base
 
 
+STREAM_SAMPLE = [
+    "intro line", "pool_mode = session", "prose that follows the approved line", "", "more prose, then", "transaction.",
+    "Put PgBouncer in front of the primary and", "switch it to transaction for the daemon.", "", "", "",
+    "PgBouncer pools", "statements", "for the daemon", "[pgbouncer]", "pool_mode = session", "listen_port = 6432",
+    "unrelated", "text", "", "Front the primary with a pooler in", "transaction mode.", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
+    "pool_mode: session ; supported mode", "k", "l", "m", "n", "mode = txn", "o", "p",
+]
+
+
+def stream_failures() -> int:
+    """The windowed scan equals one pass over the file, and the chunked reader equals str.splitlines()."""
+    global WINDOW_LINES, CHUNK_BYTES
+    bad = 0
+    raw = [line + "\n" for line in STREAM_SAMPLE * 6]
+    whole = sorted(scan_lines("f.md", [normalise(l) for l in raw]))
+    saved_window = WINDOW_LINES
+    try:
+        for size in (3, 5, 8, 13, 21):
+            WINDOW_LINES = size
+            if sorted(scan_stream("f.md", raw)) != whole:
+                bad += 1
+                print("self-test FAIL windowed scan differs from the whole-file scan at WINDOW_LINES=%d" % size)
+    finally:
+        WINDOW_LINES = saved_window
+    body = "a\r\nb\rc\nd\u2028e\u00e9f\x0cg\r\r\nh\n\n\ni"
+    with tempfile.TemporaryDirectory(dir=_scratch_base()) as tmp:
+        sample = Path(tmp) / "r.txt"
+        sample.write_bytes(body.encode("utf-8"))
+        saved_chunk = CHUNK_BYTES
+        try:
+            for size in (1, 2, 3, 5, 7, 11):
+                CHUNK_BYTES = size
+                if list(read_lines(sample)) != body.splitlines():
+                    bad += 1
+                    print("self-test FAIL chunked read differs from splitlines() at CHUNK_BYTES=%d" % size)
+        finally:
+            CHUNK_BYTES = saved_chunk
+    print("self-test %s windowed scan and chunked read equal the whole-file results" % ("ok  " if not bad else "FAIL"))
+    return bad
+
+
 def run_cases(verbose: bool) -> int:
     scratch_base = _scratch_base()
-    failures = 0
+    failures = stream_failures()
     for name, files, want in cases():
         with tempfile.TemporaryDirectory(dir=scratch_base) as tmp:
             root = Path(tmp)
@@ -742,7 +956,16 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("R8 pooler-prefixed mode key", "    if MENTION_NAME.search(text) or MENTION_PROSE.search(text) or MENTION_KEY.search(text):", "    if MENTION_NAME.search(text) or MENTION_PROSE.search(text):"),
     ("U1 look-alike shadow", "    alt = shadow(text)\n", "    alt = text\n"),
     ("U2 separators", "    split = _SEPARATORS.sub(\" \", text)", "    split = text"),
-    ("F1 unread text files fail closed", "    if unread:\n", "    if False:\n"),
+    ("F1 unread files must be named", "    problems = errors + [", "    problems = [] and errors + ["),
+    ("F1 stale skip entries fail", "for rel in sorted(listed) if rel not in unread]", "for rel in sorted(listed) if False]"),
+    ("F1 skip entry needs a reason", "        problem = reason_problem(reason or \"\")\n        if \" \" in line or problem", "        problem = None\n        if \" \" in line or problem"),
+    ("F1 binary magic numbers", "        if chunk.startswith(BINARY_MAGIC):", "        if False:"),
+    ("F1 NUL bytes in non-UTF-16 text", "            if utf8 and b\"\\0\" in chunk:", "            if False:"),
+    ("F1 BOM-less UTF-16", "    if len(zeros) * 4 >= min(len(head), CHUNK_BYTES) > 0:", "    if False:"),
+    ("F2 long lines: product and mode word anywhere", "    return bool(_PRODUCT_WORD.search(view) and OTHER_MODE.search(view))", "    return False"),
+    ("F2 long lines: overlapping segments", "SEGMENT, SEGMENT_STEP = 2048, 1536", "SEGMENT, SEGMENT_STEP = 2048, 2048"),
+    ("F2 window margin", "WINDOW_MARGIN = 2 * NEIGHBOURS + 8", "WINDOW_MARGIN = 1"),
+    ("F2 chunk-boundary carriage return", " or lines[-1].endswith(\"\\r\")", ""),
     ("A1 forbidden entries", "        if forbidden_entry(text):\n", "        if False:\n"),
     ("A1 filler reasons", "    if FILLER.search(reason.casefold()) or", "    if False and"),
     ("R3 path tokens", "    text = TOOL_PATH.sub(_path_words, text)\n", ""),
@@ -755,7 +978,7 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("A1/A2 closed shapes (prose approves again)", "    return any(shape.match(text) for _, shape in APPROVED_SHAPES)",
      '    return bool(re.search(r"pool_mode = session", text)) and not OTHER_MODE.search(text)'),
     ("A2 closed comment vocabulary", '_COMMENT = r"\\s*[;#]\\s*%s(?:[\\s,.]+%s)*[\\s,.]*" % (_VOCAB, _VOCAB)', '_COMMENT = r"\\s*[;#].*"'),
-    ("allowlist reason required", "        problem = reason_problem(reason or \"\")\n", "        problem = None\n"),
+    ("allowlist reason required", "        problem = reason_problem(reason or \"\")\n        if problem:\n            errors.append(\"%s:%d: entry without", "        problem = None\n        if problem:\n            errors.append(\"%s:%d: entry without"),
     ("allowlist placeholder", 'if line.lstrip().startswith("#") and "reason required" in line.casefold():', "if False:"),
     ("allowlist reason length", "    if len(words) < MIN_REASON_WORDS or len(reason) < MIN_REASON_CHARS:", "    if not words:"),
     ("allowlist per-occurrence budget", "            budget[(rel, text)] -= 1\n", ""),
