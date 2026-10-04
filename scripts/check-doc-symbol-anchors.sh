@@ -426,6 +426,12 @@ MDEOF
         'Formerly `src/missing_5201.rs::insert` held it.'
     anchor_red 5201 PATH "an unbackticked qualified anchor on a 'formerly' line" \
         'Formerly src/missing_5201.rs::insert held it.'
+    anchor_red 5266 PATH "a qualified escape token on a 'formerly' line" \
+        'Formerly `src/../missing_5266.rs::insert` held it.'
+    anchor_red 5266 PATH "an unbackticked qualified escape token on a 'formerly' line" \
+        'Formerly src/../missing_5266.rs::insert held it.'
+    anchor_green 5266 "a plain escape token on a 'formerly' line" \
+        'Formerly `src/../missing_5266.rs` held it.'
     anchor_green 5201 "a plain path with 'was split' wording" \
         'The old module `src/missing_5201.rs` was split by #1670.'
     anchor_green 5201 "a plain path with 'renamed to' wording" \
@@ -798,7 +804,9 @@ for doc in seen_docs:
 
         for tok in escapes:
             at = max(line.find(tok), 0)
-            if not absent_ok_at(at):
+            # A qualified escape token (`src/../x.rs::sym`) asserts the file
+            # exists, like every qualified anchor: never exempt (#5266).
+            if not absent_ok_at(at) or line.startswith(tok + "::", at):
                 emit("PATH", doc, ln, tok, ctx)
 
         for m in PATH.finditer(line):
