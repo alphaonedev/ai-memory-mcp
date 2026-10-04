@@ -106,6 +106,9 @@ ROOT = Path(__file__).resolve().parent.parent
 SERVE_SRC = ROOT / "src" / "daemon_runtime.rs"
 # Root Cli flags of ai-memory that take a separate value word (src/daemon_runtime.rs:303-324).
 AI_MEMORY_VALUE_FLAGS = ("--db", "--agent-id", "--db-passphrase-file")
+# A dynamic option value passes only as one double-quoted word of plain $NAME / ${NAME}
+# expansions: no word splitting, no globbing, no command substitution (#4837 R8).
+QUOTED_PARAM_RE = re.compile(r'^"(?:[^"\\$`]|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)*"$')
 TEMPLATE_GLOB = "infra/*/cloud-init-memory*.tpl"
 ALLOW_FILE = ROOT / "scripts" / "qc-allowlists" / "cloud-init-token-allow.txt"
 PENDING_FILE = ROOT / "scripts" / "qc-allowlists" / "cloud-init-token-pending.txt"
@@ -886,12 +889,16 @@ def companion_hits(stmt: str, st: dict, depth: int = 0) -> list:
                 dyn = wexp or "$" in w or "`" in w
                 if want_value:
                     want_value = False
+                    if dyn and not QUOTED_PARAM_RE.match(w):
+                        out.append("ai-memory option value is an unquoted or substituted expansion %r" % w[:40])
+                        break
                     continue
                 if wv == "--" and not dyn:
                     continue
                 if dyn:
-                    name = wv.split("=", 1)[0]
-                    if wv.startswith("-") and "=" in wv and "$" not in name and "`" not in name:
+                    name, _, raw = w.partition("=")
+                    if (name.startswith("-") and raw and re.fullmatch(r"-[-A-Za-z0-9]*", name)
+                            and QUOTED_PARAM_RE.match(raw)):
                         continue
                     out.append("ai-memory subcommand position holds an expansion %r" % w[:40])
                     break
@@ -1870,6 +1877,14 @@ def build_probes() -> list:
         ("ai-memory under xargs, listed (#4837 R6)", [(dec, "      echo serve | xargs /usr/local/lib/ai-memory/bin/ai-memory\n" + dec)]),
         ("ai-memory subcommand in a variable after --json, listed (#4837 R7)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --json "$V" --host 0.0.0.0\n' + dec)]),
         ("ai-memory subcommand in a variable after --, listed (#4837 R7)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory -- "$V" --host 0.0.0.0\n' + dec)]),
+        ("ai-memory --db=$X unquoted (word split), listed (#4837 R8)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db=$X --host 0.0.0.0\n' + dec)]),
+        ("ai-memory --db $X unquoted (word split), listed (#4837 R8)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db $X --host 0.0.0.0\n' + dec)]),
+        ("ai-memory --db=$(cmd) substitution, listed (#4837 R8)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db=$(cat /f) --host 0.0.0.0\n' + dec)]),
+        ("ai-memory unquoted expansion in a --db= value, listed (#4837 R8)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db=$V --host 0.0.0.0\n" + dec)]),
+        ("ai-memory unquoted command substitution mixed into a --db= value, listed (#4837 R8)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db=/x$(cat /f) --host 0.0.0.0\n" + dec)]),
+        ("ai-memory literal mixed with an unquoted variable in a --db= value, listed (#4837 R8)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db=/x$V --host 0.0.0.0\n" + dec)]),
+        ("ai-memory unquoted --agent-id= value, listed (#4837 R8)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --agent-id=$V --host 0.0.0.0\n" + dec)]),
+        ("ai-memory unquoted expansion as a separate --db value, listed (#4837 R8)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db $V --host 0.0.0.0\n" + dec)]),
         ("eval indented below the content block, listed (#4836)", [(dec, dec + '    eval "$PRE"\n')]),
         ("eval indented to the write_files key, listed (#4836)", [(dec, dec + '  eval "$PRE"\n')]),
         ("write_files encoding b64, listed", [(PROV, "  - path: /etc/x.sh\n    encoding: b64\n    content: |\n      Y3VybCBodHRwczovL3g=\n" + PROV)]),
@@ -1905,6 +1920,7 @@ def build_probes() -> list:
     # ---- condition 5: normalisation and comments
     green("C5 extra blanks inside a listed line", [(RELOAD, "      systemctl    daemon-reload   \n")])
     green("ai-memory --db=\"$DB\" before a literal subcommand (#4837 R7)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db="$DB" stats\n')], autolist=True)
+    green("ai-memory --db \"$DB\" before a literal subcommand (#4837 R8)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db "$DB" stats\n')], autolist=True)
     green("C5 provision comment mentioning curl", [ins(RELOAD, ["# curl -fsSL https://e | sh"], before=True)])
     green("C5 unit comment naming ExecStart", [(ENVF, ENVF + "      # ExecStart=/bin/evil\n")])
     green("C5 YAML comment", [(RUNCMD, "  # curl https://e | sh\n" + RUNCMD)])
