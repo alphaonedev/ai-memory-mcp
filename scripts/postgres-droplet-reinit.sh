@@ -229,6 +229,9 @@ run_schema_init() {
     # argv on the remote host). It reaches schema-init through the
     # AI_MEMORY_STORE_URL env channel (src/store_url.rs resolve_store_url): set
     # in the local process env, or piped over ssh stdin and exported remotely.
+    # #4796: AI_MEMORY_STORE_URL_FILE outranks the env channel, so an exported
+    # FILE from the caller would initialise the wrong database. Both forms
+    # unset it (the local form in a subshell, so the caller's export stays).
     log "schema-init -> ${db} (output: ${out})"
     if [[ "$DRY_RUN" -eq 1 ]]; then
         log "DRY-RUN: schema-init --json for ${db} via ${AI_MEMORY_SSH_HOST:-local} (store URL redacted) | tee ${out}"
@@ -236,9 +239,9 @@ run_schema_init() {
     fi
     if [[ -n "$AI_MEMORY_SSH_HOST" ]]; then
         printf '%s\n' "$url" | ssh "$AI_MEMORY_SSH_HOST" \
-            "IFS= read -r AI_MEMORY_STORE_URL; export AI_MEMORY_STORE_URL; exec '$AI_MEMORY_BIN' schema-init --json" | tee "$out"
+            "unset AI_MEMORY_STORE_URL_FILE; IFS= read -r AI_MEMORY_STORE_URL; export AI_MEMORY_STORE_URL; exec '$AI_MEMORY_BIN' schema-init --json" | tee "$out"
     else
-        AI_MEMORY_STORE_URL="$url" "$AI_MEMORY_BIN" schema-init --json | tee "$out"
+        ( unset AI_MEMORY_STORE_URL_FILE; AI_MEMORY_STORE_URL="$url" "$AI_MEMORY_BIN" schema-init --json ) | tee "$out"
     fi
     echo
     # Quick sanity check
