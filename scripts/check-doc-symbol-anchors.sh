@@ -194,6 +194,8 @@ MDEOF
     echo "PASS: self-test #4680 — a backticked ./src/ anchor to a missing file is REJECTED"
 
 
+    # A well-formed 40-hex commit sha for the pinned-permalink plants.
+    pin40="a1403c742f9d590a08b6fd170deec5f50ca8e940"
     # ---- #4699/#4700/#4701: anchor path normalisation + line range ----
     # anchor_red/anchor_green plant ONE line in the clean tree. A red case
     # must be rejected by the named rule; a green control must pass.
@@ -301,6 +303,24 @@ MDEOF
         'See [the handler](../src/nope.rs#L3) for it.'
     anchor_green 5190 "a plain-label link to a live file" \
         'See [the handler](src/mcp/tools/recall.rs) for it.'
+
+    # #5189: the #L fragment of a relative src link is range-checked.
+    anchor_red 5189 LINE "a backticked-label link with #L past end-of-file" \
+        'See [`RecallTool`](src/mcp/tools/recall.rs#L9999) for it.'
+    anchor_red 5189 LINE "a link with an #L range whose end passes end-of-file" \
+        'See [`RecallTool`](src/mcp/tools/recall.rs#L2-L9999) for it.'
+    anchor_red 5189 LINE "a plain-label link with #L past end-of-file" \
+        'See [recall](src/mcp/tools/recall.rs#L9999) for it.'
+    anchor_red 5189 LINE "a link with a reversed #L range" \
+        'See [recall](src/mcp/tools/recall.rs#L3-L2) for it.'
+    anchor_red 5189 LINE "a link with #L0" \
+        'See [recall](src/mcp/tools/recall.rs#L0) for it.'
+    anchor_green 5189 "a link with an in-range #L fragment" \
+        'See [recall](src/mcp/tools/recall.rs#L4) for it.'
+    anchor_green 5189 "a link with a full-file #L range" \
+        'See [`RecallTool`](src/mcp/tools/recall.rs#L1-L4) for it.'
+    anchor_green 5189 "a commit-pinned permalink link keeps its own #L (immutable)" \
+        "See [recall](https://github.com/o/r/blob/${pin40}/src/mcp/tools/recall.rs#L9999) for it."
     write_clean
     printf '\n\nSee [`handler`](src/nope.rs) for it.\n' >> "$FIX/README.md"
     [[ "$(run_fixture_out | grep -c '^FAIL: doc-symbol-anchors \[')" = "1" ]] || {
@@ -310,7 +330,6 @@ MDEOF
     # ---- #4651: a BARE src/x.rs:N line anchor (no backtick) ----------
     # Every form the #4651 census found must FAIL as BARE_LN; the only
     # exemption is the label of a commit-pinned permalink (immutable).
-    pin40="a1403c742f9d590a08b6fd170deec5f50ca8e940"
     bare_red() {  # <description> <line planted in README.md>
         write_clean
         printf '\n\n%s\n' "$2" >> "$FIX/README.md"
@@ -617,6 +636,10 @@ MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(([^)]*src/[A-Za-z0-9_/]+\.
 # (MDLINK only sees a backticked-identifier label). canon() has already
 # removed a ./ or ../ prefix, so the target starts with src/.
 RELLINK = re.compile(r"\]\((src/[A-Za-z0-9_/]+\.rs)(#[^)\s]*)?\)")
+# #5189: the #L<a>[-L<b>] line fragment of such a link names lines too.
+# Only a RELATIVE link is range-checked; a commit-pinned permalink (an
+# https URL) is immutable and never reaches this rule.
+LINEFRAG = re.compile(r"^#L(\d+)(?:-L?(\d+))?$")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # A line that DELIBERATELY names a path as absent is not a stale anchor.
@@ -752,10 +775,18 @@ for doc in seen_docs:
         # a file that exists. MDLINK already reported a backticked-label link.
         md_starts = {m.start(2) for m in MDLINK.finditer(line)}
         for m in RELLINK.finditer(line):
+            tgt = m.group(1)
+            if tgt in per_file and m.group(2):
+                fm = LINEFRAG.match(m.group(2))
+                if fm:
+                    n = int(fm.group(1))
+                    last = int(fm.group(2)) if fm.group(2) else n
+                    if n < 1 or last < n or last > line_count[tgt]:
+                        emit("LINE", doc, ln, f"{tgt}{m.group(2)}", ctx)
             if m.start(1) in md_starts:
                 continue
-            if m.group(1) not in per_file and not absent_ok:
-                emit("PATH", doc, ln, m.group(1), ctx)
+            if tgt not in per_file and not absent_ok:
+                emit("PATH", doc, ln, tgt, ctx)
 
         # `migrate_vNN` claimed as the LADDER TIP must equal the tip the
         # migration-ladder gate computes. No new SSOT: the value comes
