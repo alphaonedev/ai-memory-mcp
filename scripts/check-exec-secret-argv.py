@@ -1203,6 +1203,12 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
         bad.append("a prose line held in allow passed the judge (#4910)")
     if len(empty_scan_faults(0, [("reason: r", "a.sh", 1, "x", 1)], one)) != 1:
         bad.append("a scan of zero executable files was not a fault (#4910)")
+    # the CI job checks out full history, which the merge-base rule (#4919) needs (#4910)
+    n += 1
+    wf = (root / ".github" / "workflows" / "c8-precheck.yml").read_text(encoding="utf-8")
+    m = re.search(r"\n  exec-secret-argv-gate:\n(.*?)(?=\n  [A-Za-z0-9_-]+:\n|\Z)", wf, re.S)
+    if not m or "fetch-depth: 0" not in m.group(1):
+        bad.append("the exec-secret-argv-gate CI job does not check out full history (#4919)")
     # an extensionless dotfile is a script only when its first line is a shell shebang (#4910)
     n += 2
     if file_class(".runner", "#!/bin/bash\ncurl x\n") != "shell":

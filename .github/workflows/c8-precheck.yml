@@ -1377,6 +1377,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The merge-base check (#4919) needs the base branch history; a depth-1
+          # checkout cannot resolve it and the gate would fault.
+          fetch-depth: 0
       - name: Run exec-file credentials-on-argv gate
         run: python3 scripts/check-exec-secret-argv.py
       - name: Self-test the gate (regression evidence)
