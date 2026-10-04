@@ -1170,6 +1170,9 @@ def check_dockerfile(text: str, rep: Report) -> None:
             if tuple(raw[first - 1:last]) == DOCKER_RUN_LINES:
                 canon_lines.update(range(first, last + 1))
             else:
+                # #4946: the RUN is the canonical instruction written differently (a trailing
+                # space after a backslash, a re-indent): its own lines are not stray continuations.
+                canon_lines.update(set(range(first, last + 1)))
                 rep.bad(pin_message("Dockerfile", f"line {first}: the build RUN is not written exactly as the pinned "
                                     "physical lines (compared line by line, no comment or blank line inside)",
                                     "DOCKER_RUN_LINES"))
@@ -2023,6 +2026,17 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR8 an extra job": ("fail", [_rel(COPR_HDR, _append_job("      - run: echo\n"))]),
     "SR8 unpinned secret": ("fail", _step_before_pkg("        env:\n          T: ${{ secrets.NPM_TOKEN }}\n        run: echo\n")),
     "SR8 secrets dotted with spaces": ("fail", _step_before_pkg("        env:\n          T: ${{ secrets . GITHUB_TOKEN }}\n        run: echo\n")),
+    "4942 SECRETS upper-case unpinned name": ("fail", _step_before_pkg(
+        "        env:\n          T: ${{ SECRETS.NPM_TOKEN }}\n        run: echo\n")),
+    "4942 Secrets mixed-case unpinned name": ("fail", _step_before_pkg(
+        "        env:\n          T: ${{ Secrets.NPM_TOKEN }}\n        run: echo\n")),
+    "4942 SECRETS upper-case with a pinned name": ("fail", _step_before_pkg(
+        "        env:\n          T: ${{ SECRETS.GITHUB_TOKEN }}\n        run: echo\n")),
+    "4942 Secrets: mixed-case key passes secrets on": ("fail", [_rel(COPR_HDR, COPR_HDR + "    Secrets: inherit\n")]),
+    "4942 valid: secrets only as the tail of another name": ("pass", _step_before_pkg(
+        "        run: echo not-secrets.X mysecrets.Y github.secrets.Z\n")),
+    "4944 run line ending in a backslash and a space (release.yml)": ("fail", _step_before_pkg(
+        "        run: |\n          echo a \\ \n          echo b\n")),
     "SR8 all secrets as JSON": ("fail", _step_before_pkg("        env:\n          T: ${{ toJSON(secrets) }}\n        run: echo\n")),
     "SR8 secrets: inherit": ("fail", [_rel(COPR_HDR, COPR_HDR + "    secrets: inherit\n")]),
     "valid: pinned secret in a release step": ("pass", _step_before_pkg(
@@ -2054,6 +2068,21 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR10 an extra job": ("fail", [_shape(SHAPE_NAME, lambda t: t.rstrip("\n") + "\n\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n")]),
     "SR10 permissions changed": ("fail", [_shape("permissions:\n  contents: read\n", "permissions:\n  contents: write\n")]),
     "SR10/P25 last path filter dropped": ("fail", [_shape('      - "migrations/**"\n', "")]),
+    "4941 SR10 middle path filter changed": ("fail", [_shape('      - "src/**"\n', '      - "docs/**"\n')]),
+    "4941 SR10 last path filter changed": ("fail", [_shape('      - "migrations/**"\n', '      - "other/**"\n')]),
+    "4941 SR10 later push branch changed": ("fail", [_shape('"rehearsal/**", "main"]', '"rehearsal/**", "mainx"]')]),
+    "4943 SR10 BASH_ENV in the env of an unpinned shape step": ("fail", [_shape(
+        "        run: python3 scripts/check_release_features.py\n",
+        "        run: python3 scripts/check_release_features.py\n        env:\n          BASH_ENV: x\n")]),
+    "4943 SR10 BASH_ENV written to GITHUB_ENV by an unpinned shape step": ("fail", [_shape(
+        "        run: python3 scripts/check_release_features.py\n",
+        "        run: |\n          echo \"BASH_ENV=x\" >> \"$GITHUB_ENV\"\n          python3 scripts/check_release_features.py\n")]),
+    "4944 SR10 run line ending in a backslash and a space": ("fail", [_shape(
+        "        run: python3 scripts/check_release_features.py\n",
+        "        run: |\n          echo a \\ \n          echo b\n")]),
+    "4945 SR10 top-level keys reordered": ("fail", [
+        _shape("\npermissions:\n  contents: read\n", ""),
+        _shape("  cancel-in-progress: true\n", "  cancel-in-progress: true\n\npermissions:\n  contents: read\n")]),
     "SR10 push branches widened": ("fail", [_shape('branches: ["release/**"]\n', 'branches: ["release/**", "x"]\n')]),
     "SR10 workflow_dispatch given a value": ("fail", [_shape("  workflow_dispatch:\n", "  workflow_dispatch: x\n")]),
     "SR10 run continuation in the proof": ("fail", [_shape(SHAPE_PROOF_CMD, SHAPE_PROOF_CMD.replace(
@@ -2066,6 +2095,8 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "C1 canonical build RUN joined onto one line": ("fail", [_d("\n".join(DOCKER_RUN_LINES), DOCKER_RUN)]),
     "builder ends with another single-line RUN": ("fail", [_d("\n".join(DOCKER_RUN_LINES), "RUN true")]),
     "C1 continuation in another instruction": ("fail", [_d(D_BIN, D_BIN + "LABEL a=1 \\\n b=2\n")]),
+    "4944 continuation with a trailing space in another instruction": ("fail", [_d(D_BIN, D_BIN + "LABEL a=1 \\ \n b=2\n")]),
+    "4944 continuation with a trailing tab in another instruction": ("fail", [_d(D_BIN, D_BIN + "LABEL a=1 \\\t\n b=2\n")]),
     "SR11/B05 quoted cargo in the final stage": ("fail", [_d(D_BIN, D_BIN + "RUN c''argo --version\n")]),
     "X11 --mount after another flag": ("fail", [_d(D_BIN, D_BIN + "RUN --network=none --mount=type=cache,target=/m true\n")]),
     "X00 FROM image with an embedded $VAR": ("fail", [_d(D_FINAL, "FROM debian:bookworm-slim$SUFFIX\n")]),
@@ -2092,6 +2123,24 @@ MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
                                                 "update DOCKER_STEPS in scripts/check_release_features.py"),
     "message: build unit drift names WF_BUILD": ([_rel(REL_BUILD_CMD, REL_BUILD_CMD + " --verbose")], 2,
                                                  "update WF_BUILD in scripts/check_release_features.py"),
+    "message: 4945 SHA bump plus a changed input is one message naming both": (
+        [_rel(IMAGE_BUILD_USES, IMAGE_BUILD_USES[:-1] + "0"), _rel("          context: .\n", "          context: ./evil\n")], 1,
+        "update IMAGE_BUILD_USES in scripts/check_release_features.py to the new SHA in the same commit; also "
+        "`jobs.docker.steps.5.with.context`"),
+    "message: 4945 a quoted uses is not a SHA bump": (
+        [_rel("uses: " + IMAGE_BUILD_USES, 'uses: "' + IMAGE_BUILD_USES[:-1] + '0"')], 1,
+        "update DOCKER_STEPS in scripts/check_release_features.py"),
+    "message: 4945 an extra docker step is one message": (_docker_extra_step("        run: echo\n"), 1,
+                                                          "the docker job has 7 steps"),
+    "message: 4942 a spaced dotted secret is named whole": (
+        _step_before_pkg("        env:\n          T: ${{ secrets . GITHUB_TOKEN }}\n        run: echo\n"), 1,
+        "`secrets . GITHUB_TOKEN` is not `secrets.<NAME>`"),
+    "message: 4946 a trailing space in the canonical build RUN is one message": (
+        [_d("    strip target/release/ai-memory; \\", "    strip target/release/ai-memory; \\ ")], 1,
+        "update DOCKER_RUN_LINES in scripts/check_release_features.py"),
+    "message: 4946 a re-indented canonical build RUN is one message": (
+        [_d("    strip target/release/ai-memory; \\", "  strip target/release/ai-memory; \\")], 1,
+        "update DOCKER_RUN_LINES in scripts/check_release_features.py"),
 }
 
 
@@ -2434,6 +2483,19 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("BuildKit join strips the next line's indent", "            piece = raw\n", '            piece = raw.lstrip(" \\t")\n'),
     ("BuildKit continuation needs a bare backslash", r'BK_CONT_RE = re.compile(r"(^|[^\\])\\[ \t]*$")', r'BK_CONT_RE = re.compile(r"(^|[^\\])\\$")'),
     ("BuildKit continuation on an escaped backslash", r'(^|[^\\])\\[ \t]*$', r'\\[ \t]*$'),
+    ('SHA-bump branch accepts quoted uses', 'uses.kind == "scalar" and uses.style == "plain"\n', 'uses.kind == "scalar"\n'),
+    ('SHA-bump branch does not compare the rest of the step', '        why = pin_problem(step, rest, at)\n', '        why = ""\n'),
+    ('SECRET_REF_RE case-sensitive', 'A-Za-z0-9_]*))?", re.I)', 'A-Za-z0-9_]*))?")'),
+    ('SECRET_REF_RE no lookbehind', 'r"(?<![\\w.-])secrets(?![\\w-])', 'r"secrets(?![\\w-])'),
+    ('SECRET_REF_RE spaces not allowed around dot', '(?P<ref>\\s*\\.\\s*(?P<name>', '(?P<ref>\\.(?P<name>'),
+    ('secrets key case-sensitive', 'if path and path[-1].lower() == "secrets":', 'if path and path[-1] == "secrets":'),
+    ('shape BASH_ENV text check removed', '    check_no_bash_env("release-shape.yml", text, rep)\n', ''),
+    ('shape top keys compared as a set', '    if doc.keys() != list(SHAPE_TOP_KEYS):', '    if set(doc.keys()) != set(SHAPE_TOP_KEYS):'),
+    ('continued_lines ignores trailing tabs/spaces', 'if raw.rstrip(" \\t").endswith("\\\\")]', 'if raw.endswith("\\\\")]'),
+    ('run continuation ignores trailing spaces', 'if text.rstrip(" \\t").endswith("\\\\"):', 'if text.endswith("\\\\"):'),
+    ('pin_problem sequence compares only the first item', '            why = pin_problem(item, sub, f"{path}.{n + 1}")\n            if why:\n                return why\n', '            why = pin_problem(item, sub, f"{path}.{n + 1}")\n            return why\n'),
+    ('docker step count mismatch: no early return (more messages)', '                            f"first difference is step {first + 1}", "DOCKER_STEPS"))\n        return\n', '                            f"first difference is step {first + 1}", "DOCKER_STEPS"))\n'),
+    ("canonical RUN written differently: its lines not whitelisted (#4946)", "                canon_lines.update(set(range(first, last + 1)))\n", "                pass\n"),
 )
 
 
