@@ -617,6 +617,23 @@ def wgetrc_credential(raw: str) -> bool:
     return False
 
 
+def _wget_password_options() -> str:
+    """Every prefix (two letters or more) of the wget long password options and their http, https,
+    ftp and proxy forms, as one regex alternation: getopt takes any unique prefix (#5300)."""
+    names = set()
+    for pre in ("", "http-", "https-", "ftp-", "proxy-"):
+        for tail in ("password", "passwd"):
+            full = pre + tail
+            for n in range(2, len(full) + 1):
+                names.add(full[:n])
+    return "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+
+
+WGET_PW_LONG_RE = re.compile(
+    r"\bwget\b[^|;&]*\s--(?:" + _wget_password_options() + r")(?![\w-])[\s=]*"
+    r"(?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?\$")
+
+
 def scan_exec_file(dl, rel: str, text: str) -> Optional[List[Found]]:
     """Triggered logical lines of one executable file, or None when it is not one."""
     if rel in SELF_EXEMPT:
@@ -630,7 +647,7 @@ def scan_exec_file(dl, rel: str, text: str) -> Optional[List[Found]]:
     for start, end, raw in units:
         reasons = trigger_reasons(raw, is_make)
         flagged = [deny[k] for k in range(start, end + 1) if k in deny]
-        if flagged or CRED_TOOL_RE.search(raw) or wgetrc_credential(raw):
+        if flagged or CRED_TOOL_RE.search(raw) or WGET_PW_LONG_RE.search(raw) or wgetrc_credential(raw):
             reasons.append("denylist")
         if reasons:
             found.append((start, norm(raw), reasons))
@@ -1322,6 +1339,11 @@ ROUND3_RED = [
     ("wget -qe password", 'wget -qe password="$X" h'),
     ("wget --execute=proxy_passwd", 'wget --execute=proxy_passwd="$X" h'),
     # wgetrc names ignore case, dashes and underscores and allow spaces around = (#5293)
+    # getopt takes any unique prefix of a long option; wget keeps deprecated aliases (#5300)
+    ("wget --passwo prefix", 'wget --passwo="$X" h'),
+    ("wget --http-passwd alias", 'wget --http-passwd="$X" h'),
+    ("wget --proxy-passwd alias", 'wget --proxy-passwd "$X" h'),
+    ("wget --ftp-pass prefix", 'wget --ftp-pass="$X" h'),
     ("wget -e spaces around =", 'wget -e "http_password = $X" h'),
     ("wget -e no separator", 'wget -e "httppassword=$X" h'),
     ("wget -e upper case", 'wget -e "HTTP_PASSWORD=$X" h'),
@@ -1350,6 +1372,7 @@ ROUND3_GREEN = [
     ("mysql --password-file is not --password", 'mysql -u r --password-file="$PW_FILE" db'),
     ("redis-cli --pass-file is not --pass", 'redis-cli --pass-file "$PW_FILE" ping'),
     ("wget -e non-credential settings", 'wget -e robots=off -e "https_proxy=$PROXY_HOST" -O "$TOKEN_FILE" h'),
+    ("wget --passive-ftp is not a password option", 'wget --passive-ftp -O "$TOKEN_FILE" h'),
     ("curl --user-agent= is not --user", 'curl --user-agent="$UA" h'),
     ("wget -U is the user agent", 'wget -U "$UA" h'),
     ("curl -E with a file only", 'curl -E "$CERT_PATH" h'),
