@@ -470,11 +470,15 @@ impl MemoryStore for SqliteStore {
         //
         // * ATOMIC_MULTI_WRITE ("atomic multi-row writes ... under one
         //   transaction") IS advertised: every multi-write op on this
-        //   adapter runs as a single `BEGIN IMMEDIATE … COMMIT` atom with
-        //   ROLLBACK on any mid-failure — `reflect` (src/storage/reflect.rs),
+        //   adapter runs as a single atomic transaction with ROLLBACK on
+        //   any mid-failure — `reflect` (src/storage/reflect.rs),
         //   `consolidate` + the bulk-insert / archive+insert paths
-        //   (src/storage/mod.rs). A partial multi-row write can never
-        //   commit, so the property the bit names genuinely holds.
+        //   (src/storage/mod.rs) as `BEGIN IMMEDIATE … COMMIT`; the
+        //   embedding batch writers `set_embeddings_batch` and
+        //   `set_embeddings_batch_reembed` (src/storage/mod.rs) open a
+        //   DEFERRED rusqlite transaction (atomic, write lock taken at the
+        //   first write). A partial multi-row write can never commit, so
+        //   the property the bit names genuinely holds.
         // * TRANSACTIONS ("adapter supports `begin_transaction` for
         //   multi-op atomicity") is WITHHELD: the SAL adapter exposes no
         //   caller-facing `begin_transaction()` handle (the trait default
