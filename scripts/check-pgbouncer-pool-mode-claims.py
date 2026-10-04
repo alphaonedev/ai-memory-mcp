@@ -47,8 +47,9 @@ written reason. No list of bad or negating words decides anything.
                mention, while `pgbouncer.ini ... transaction` still is.
             R4 wrap: two adjacent lines that only mention when joined.
             R5 paragraph: a line that names a mode word within the two nearest
-               non-blank lines (blank lines skipped) of a mention line is joined
-               with it and judged as one unit.
+               non-blank lines (blank lines skipped), or anywhere in the same
+               paragraph up to PARAGRAPH_MAX lines away (#4950), of a mention
+               line is joined with it and judged as one unit.
             R6 approved-line context: each of the two nearest non-blank lines on
                either side of an approved line must itself be a mention (judged
                on its own) or a NEUTRAL line: a code fence, a config section
@@ -331,6 +332,20 @@ def _neighbours(lines: List[str], i: int) -> List[int]:
     return found
 
 
+PARAGRAPH_MAX = 8  # R5 (#4950): lines of the same paragraph inspected on each side of a mention
+
+
+def _paragraph(lines: List[str], i: int) -> List[int]:
+    """Indices of the non-blank lines of line i's paragraph, at most PARAGRAPH_MAX lines away on each side."""
+    found: List[int] = []
+    for step in (-1, 1):
+        j = i + step
+        while 0 <= j < len(lines) and lines[j] and abs(j - i) <= PARAGRAPH_MAX:
+            found.append(j)
+            j += step
+    return found
+
+
 def scan_lines(rel: str, lines: List[str], base: int = 0, core: Optional[Tuple[int, int]] = None) -> List[Unit]:
     """The mention units of one file (rules R1-R6). `lines` may be a window of a larger file: `base` is the
     absolute index of lines[0], `core` the range of anchors this window answers for. Every pair has exactly one
@@ -348,7 +363,7 @@ def scan_lines(rel: str, lines: List[str], base: int = 0, core: Optional[Tuple[i
         if is_mention[i]:
             units.append((rel, base + i + 1, text))
             ok = approved(text)
-            for j in _neighbours(lines, i):
+            for j in sorted(set(_neighbours(lines, i)) | set(_paragraph(lines, i))):
                 if is_mention[j]:
                     continue  # judged on its own
                 if ok and not neutral(lines[j]):
@@ -725,6 +740,12 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("R8 env key set to a shell variable", "deploy/.env", "PGBOUNCER_POOL_MODE=${POOL_CHOICE}\n"),
     ("R8 dotted pooler key", "deploy/x.toml", "pgcat.mode = \"${MODE}\"\n"),
     ("R8 hyphenated pooler key", "deploy/x.yaml", "supavisor-mode: {{ .Values.m }}\n"),
+    ("R5 mode word 3 non-blank lines from an approved line (#4950)", "docs/x.md",
+     "pool_mode = session\nlisten_port = 6432\nauth_type = scram-sha-256\nFor more fan-in, switch to transaction.\n"),
+    ("R5 instruction 3 prose lines after a PgBouncer mention (#4950)", "docs/x.md",
+     "PgBouncer pool_mode = session is the default.\nIt fronts the primary.\nIt listens on 6432.\nFor fan-in, change it to transaction instead.\n"),
+    ("R5 mode word exactly PARAGRAPH_MAX lines from a mention (#4950)", "docs/x.md",
+     "pool_mode = session\n" + "listen_port = 6432\n" * 7 + "For fan-in, change it to transaction instead.\n"),
 ]
 
 # Green probes: one per approved shape, plus neutral context and path tokens.
@@ -971,6 +992,8 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("R3 path tokens", "    text = TOOL_PATH.sub(_path_words, text)\n", ""),
     ("R3 path keeps product words", 'return " " + " ".join(_PATH_KEEP.findall(match.group(0))) + " "', 'return " "'),
     ("R4 wrap", "                pair(i, i + 1)  # R4", "                pass  # R4"),
+    ("R5 paragraph reach (#4950)", "PARAGRAPH_MAX = 8  #", "PARAGRAPH_MAX = 7  #"),
+    ("R5 paragraph stops at a blank line", "while 0 <= j < len(lines) and lines[j] and abs(j - i) <= PARAGRAPH_MAX:", "while 0 <= j < len(lines) and abs(j - i) <= PARAGRAPH_MAX:"),
     ("R5 paragraph", "                    pair(i, j)  # R5", "                    pass  # R5"),
     ("R6 approved-line context", "                    pair(i, j)  # R6", "                    pass  # R6"),
     ("R6 key=value tokens are neutral", '    re.compile(r"^[a-z_][a-z0-9_.]*\\s*=\\s*(?:%s\\s*)+$" % _KV_TOKEN),', '    re.compile(r"(?!)"),'),

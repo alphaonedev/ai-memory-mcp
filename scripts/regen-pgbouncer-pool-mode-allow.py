@@ -22,11 +22,12 @@ matches the tree (or was rewritten as asked), 1 changes are pending and were
 refused, 2 fault.
 
 Usage:
-    scripts/regen-pgbouncer-pool-mode-allow.py [--root DIR] [--check] [--accept-new [--reason TEXT]] [--drop-stale]
+    scripts/regen-pgbouncer-pool-mode-allow.py [--root DIR] [--check] [--accept-new [--reason TEXT] [--only FILE] [--match TEXT]] [--drop-stale]
 """
 import argparse
 import datetime
 import importlib.util
+import json
 import sys
 from collections import Counter
 from pathlib import Path
@@ -67,6 +68,12 @@ def main(argv):
     ap.add_argument("--check", action="store_true", help="report only; never write")
     ap.add_argument("--accept-new", action="store_true", help="append unlisted mentions (printed) for review")
     ap.add_argument("--drop-stale", action="store_true", help="remove stale entries (printed)")
+    ap.add_argument("--only", default="", metavar="FILE", help="with --accept-new: add only units of this file")
+    ap.add_argument("--match", default="", metavar="TEXT", help="with --accept-new: add only units whose text contains TEXT (so each unit can get its own reason)")
+    ap.add_argument("--reasons-file", default="", metavar="JSON",
+                    help="with --accept-new: JSON list of {file, match, reason}; each unlisted unit takes the first rule whose file "
+                         "equals the unit's file and whose match is a substring of its text; {unit} in a reason becomes the "
+                         "first 90 characters of the unit; a unit no rule matches is refused")
     ap.add_argument("--reason", default="", help="the written reason for every line --accept-new adds")
     a = ap.parse_args(argv)
     root = Path(a.root).resolve()
@@ -105,6 +112,12 @@ def main(argv):
     have = Counter(entries)
     stale = have - need
     new = need - have
+    if a.only or a.match:
+        picked = Counter({k: n for k, n in new.items() if (not a.only or k[0] == a.only) and a.match in k[1]})
+        if not picked:
+            print("regen: FAULT: --only/--match select no unlisted unit", file=sys.stderr)
+            return 2
+        new = picked
     # #4667 R4: a gate.forbidden_entry line is never allowlistable, reason or not.
     forbidden = sorted(key for key in new if gate.forbidden_entry(key[1]))
     if forbidden and not a.check:
@@ -112,6 +125,28 @@ def main(argv):
             print("regen: FAULT: refusing a forbidden entry: %s | %s" % (rel, text[:160]), file=sys.stderr)
         print("regen: correct those lines in the tree; file left unchanged", file=sys.stderr)
         return 2
+    per_unit = {}
+    if a.reasons_file:
+        try:
+            rules = json.loads(Path(a.reasons_file).read_text(encoding="utf-8"))
+            for key in sorted(new):
+                for rule in rules:
+                    if rule["file"] == key[0] and rule["match"] in key[1]:
+                        text = " ".join(rule["reason"].replace("{unit}", key[1][:90].rstrip()).split())
+                        problem = gate.reason_problem(text)
+                        if problem:
+                            print("regen: FAULT: reason for %s is not a reason: %s" % (key[0], problem), file=sys.stderr)
+                            return 2
+                        per_unit[key] = text
+                        break
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print("regen: FAULT: --reasons-file: %s" % exc, file=sys.stderr)
+            return 2
+        left = [key for key in new if key not in per_unit]
+        if left and a.accept_new and not a.check:
+            for rel, text in left[:5]:
+                print("regen: FAULT: no rule in --reasons-file matches: %s | %s" % (rel, text[:100]), file=sys.stderr)
+            return 2
     new_unread = sorted(set(unreadable) - set(listed))
     stale_unread = sorted(set(listed) - set(unreadable))
     for (rel, text), n in sorted(stale.items()):
@@ -146,9 +181,11 @@ def main(argv):
                 continue
         out.append(line)
     if new:
-        out += ["", "# added by regen-pgbouncer-pool-mode-allow.py --accept-new on %s:" % datetime.date.today().isoformat(),
-                "# " + (reason or gate.PLACEHOLDER + " before review: say why each line below is safe")]
-        for (rel, text), n in sorted(new.items()):
+        today = datetime.date.today().isoformat()
+        for count, ((rel, text), n) in enumerate(sorted(new.items())):
+            note = per_unit.get((rel, text)) or reason or gate.PLACEHOLDER + " before review: say why each line below is safe"
+            if per_unit or count == 0:
+                out += ["", "# added by regen-pgbouncer-pool-mode-allow.py --accept-new on %s:" % today, "# " + note]
             out += ["%s%s%s" % (rel, gate.SEPARATOR, text)] * n
     tmp = allow_path.with_name(allow_path.name + ".regen")
     tmp.write_text("\n".join(out) + "\n", encoding="utf-8")

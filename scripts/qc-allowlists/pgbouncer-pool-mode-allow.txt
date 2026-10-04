@@ -314,3 +314,227 @@ tests/pg_parity_batch_2.rs | /// independent pool statements, so under read comm
 
 # #4710 R4 security review: architecture diagram cell that names a session-mode pgbouncer; the bracket split now reads it as a mention
 docs/v1.0.0/perfect-endpoint-assessment/waves/w5-a1-scale-backends.md | │ postgres + pgvector + age · sqlx pool · pgbouncer (session) │
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Fragment 4667 prose: the unit names transaction or statement pooling only as the withdrawn setting that the probe rejects, and its neighbour in the same paragraph describes the probe or the shipped session template; no line recommends the retired mode. Unit begins: (ci job pgbouncer pool-mode claim gate (#4667), not yet a required context) (plurals, tx/x
+changelog.d/4667.fixed.md | (ci job pgbouncer pool-mode claim gate (#4667), not yet a required context) (plurals, tx/xact, session next to a pool word, a bare mode = key) must
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Fragment 4667 prose: the unit names transaction or statement pooling only as the withdrawn setting that the probe rejects, and its neighbour in the same paragraph describes the probe or the shipped session template; no line recommends the retired mode. Unit begins: pgbouncer: session mode is the only supported pool mode (#4667). the table and prepared st
+changelog.d/4667.fixed.md | pgbouncer: session mode is the only supported pool mode (#4667). the table and prepared statement), exits 0 on session, and exits 2 when a client
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Fragment 4667 prose: the unit names transaction or statement pooling only as the withdrawn setting that the probe rejects, and its neighbour in the same paragraph describes the probe or the shipped session template; no line recommends the retired mode. Unit begins: pool_mode = transaction, which the postgres adapter is not safe behind: the table and prep
+changelog.d/4667.fixed.md | pool_mode = transaction, which the postgres adapter is not safe behind: the table and prepared statement), exits 0 on session, and exits 2 when a client
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Fragment 4667 prose: the unit names transaction or statement pooling only as the withdrawn setting that the probe rejects, and its neighbour in the same paragraph describes the probe or the shipped session template; no line recommends the retired mode. Unit begins: probe scripts/probe-pgbouncer-pool-mode.py exits 1 on transaction and table and prepared s
+changelog.d/4667.fixed.md | probe scripts/probe-pgbouncer-pool-mode.py exits 1 on transaction and table and prepared statement), exits 0 on session, and exits 2 when a client
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Fragment 4667 prose: the unit names transaction or statement pooling only as the withdrawn setting that the probe rejects, and its neighbour in the same paragraph describes the probe or the shipped session template; no line recommends the retired mode. Unit begins: table and prepared statement), exits 0 on session, and exits 2 when a client infra/pgbounc
+changelog.d/4667.fixed.md | table and prepared statement), exits 0 on session, and exits 2 when a client infra/pgbouncer ships pool_mode = session, scram, server_reset_query =
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Fragment 4667 prose: the unit names transaction or statement pooling only as the withdrawn setting that the probe rejects, and its neighbour in the same paragraph describes the probe or the shipped session template; no line recommends the retired mode. Unit begins: table and prepared statement), exits 0 on session, and exits 2 when a client recalculated,
+changelog.d/4667.fixed.md | table and prepared statement), exits 0 on session, and exits 2 when a client recalculated, and guidance for deployments that already ran transaction mode.
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Guide 5.6.6 prepared-statement caveat: states that in session mode each client keeps one server connection so its prepared statements stay on one backend, and recommends no other mode. Unit begins: > caveat — prepared statements. pgbouncer.ini ships > connection, so a client's prepared s
+docs/enterprise-deployment.md | > caveat — prepared statements. pgbouncer.ini ships > connection, so a client's prepared statements stay on one backend.
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Guide 5.6.1 pgbouncer.ini example: the pool_mode line is the approved session assignment and the paired line is an adjacent ini setting with its own comment (listen address, TLS, pool size), not a mode instruction. Unit begins: listen_addr = 0.0.0.0 ; bind the interface the daemons reach; both hops require tls below
+docs/enterprise-deployment.md | listen_addr = 0.0.0.0 ; bind the interface the daemons reach; both hops require tls below pool_mode = session ; supported mode, see 5.6.6
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Guide 5.6.1 pgbouncer.ini example: the pool_mode line is the approved session assignment and the paired line is an adjacent ini setting with its own comment (listen address, TLS, pool size), not a mode instruction. Unit begins: pool_mode = session ; supported mode, see 5.6.6 client_tls_sslmode = verify-full ; client
+docs/enterprise-deployment.md | pool_mode = session ; supported mode, see 5.6.6 client_tls_sslmode = verify-full ; client certificates are verified (mtls)
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Guide 5.6.1 pgbouncer.ini example: the pool_mode line is the approved session assignment and the paired line is an adjacent ini setting with its own comment (listen address, TLS, pool size), not a mode instruction. Unit begins: pool_mode = session ; supported mode, see 5.6.6 default_pool_size = 16 ; server conns per
+docs/enterprise-deployment.md | pool_mode = session ; supported mode, see 5.6.6 default_pool_size = 16 ; server conns per (user,db) pair: sum of the daemons' ai_memory_pg_pool_max
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Guide 5.6.1 pgbouncer.ini example: the pool_mode line is the approved session assignment and the paired line is an adjacent ini setting with its own comment (listen address, TLS, pool size), not a mode instruction. Unit begins: pool_mode = session ; supported mode, see 5.6.6 max_client_conn = 1000 ; client-facing adm
+docs/enterprise-deployment.md | pool_mode = session ; supported mode, see 5.6.6 max_client_conn = 1000 ; client-facing admission ceiling
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Guide 5.6.1 pgbouncer.ini example: the pool_mode line is the approved session assignment and the paired line is an adjacent ini setting with its own comment (listen address, TLS, pool size), not a mode instruction. Unit begins: pool_mode = session ; supported mode, see 5.6.6 reserve_pool_size = 4 ; burst headroom abo
+docs/enterprise-deployment.md | pool_mode = session ; supported mode, see 5.6.6 reserve_pool_size = 4 ; burst headroom above default_pool_size
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Guide pooler summary: says session mode is supported and transaction is not, pointing at 5.6.6 for the evidence, so the retired mode is named as unsupported. Unit begins: supported today; transaction is not, see §5.6.6 and rule with the t4 and t5 numbers, and t
+docs/enterprise-deployment.md | supported today; transaction is not, see §5.6.6 and rule with the t4 and t5 numbers, and the executed evidence for the pool mode
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Guide 5.6.5 sizing table: the row is the session mode row with the shipped default_pool_size, so the unit describes session mode and no retired mode is recommended. Unit begins: | pool_mode | default_pool_size | result | | session | 16 (the shipped template) | safe [0
+docs/enterprise-deployment.md | | pool_mode | default_pool_size | result | | session | 16 (the shipped template) | safe [0]: separate backends (106, 107); b got pg_try_advisory_lock = f, default search_path, statement_timeout = 30s; on the reused backend b saw no temporary table and no prepared statement. |
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > ai-memory runs behind a transaction-mode pooler that issues discard all between > sessio
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > ai-memory runs behind a transaction-mode pooler that issues discard all between > session sets to set local blanket-wrapping — ai-memory's non-transactional
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > ai-memory runs behind a transaction-mode pooler that issues discard all between > statem
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > ai-memory runs behind a transaction-mode pooler that issues discard all between > statements would then run with no timeout, regressing the safety envelope on the
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > partially-applied multi-statement graph writes. transaction mode pins the whole > set ma
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > partially-applied multi-statement graph writes. transaction mode pins the whole > set max_prepared_statements > 0 so sqlx's named prepared statements (the fix #4
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > pool_mode = transaction. hard rule: pool_mode = transaction is required; > search_path +
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > pool_mode = transaction. hard rule: pool_mode = transaction is required; > search_path + the cypher() call as multiple statements that must execute on
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > pool_mode = transaction. hard rule: pool_mode = transaction is required; > statement to
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > pool_mode = transaction. hard rule: pool_mode = transaction is required; > statement to a different backend — the cypher() call then lands on a backend
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > pool_mode = transaction. hard rule: pool_mode = transaction is required; > transaction t
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > pool_mode = transaction. hard rule: pool_mode = transaction is required; > transaction to one backend, which is exactly what age needs.
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > search_path + the cypher() call as multiple statements that must execute on > 3. compat
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > search_path + the cypher() call as multiple statements that must execute on > 3. compat caveat 1 — prepared statements (fix #4): pin pgbouncer ≥1.21 and
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > search_path + the cypher() call as multiple statements that must execute on > partially-
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > search_path + the cypher() call as multiple statements that must execute on > partially-applied multi-statement graph writes. transaction mode pins the whole
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > search_path + the cypher() call as multiple statements that must execute on > plan-cachi
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > search_path + the cypher() call as multiple statements that must execute on > plan-caching hot path) survive transaction-mode multiplexing. state plainly that
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > set max_prepared_statements > 0 so sqlx's named prepared statements (the fix #4 > pgboun
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > set max_prepared_statements > 0 so sqlx's named prepared statements (the fix #4 > pgbouncer's inter-transaction discard all; the robust path is role defaults —
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > statement mode is forbidden and session mode forfeits the fan-in benefit. > statement to
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > statement mode is forbidden and session mode forfeits the fan-in benefit. > statement to a different backend — the cypher() call then lands on a backend
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > statement mode is forbidden and session mode forfeits the fan-in benefit. > transaction
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > statement mode is forbidden and session mode forfeits the fan-in benefit. > transaction to one backend, which is exactly what age needs.
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > statement to a different backend — the cypher() call then lands on a backend > 3. compat
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > statement to a different backend — the cypher() call then lands on a backend > 3. compat caveat 1 — prepared statements (fix #4): pin pgbouncer ≥1.21 and
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > statement to a different backend — the cypher() call then lands on a backend > plan-cach
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > statement to a different backend — the cypher() call then lands on a backend > plan-caching hot path) survive transaction-mode multiplexing. state plainly that
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > the same backend within one transaction. statement-mode pooling can route each > set max
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > the same backend within one transaction. statement-mode pooling can route each > set max_prepared_statements > 0 so sqlx's named prepared statements (the fix #4
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > the same backend within one transaction. statement-mode pooling can route each > transac
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > the same backend within one transaction. statement-mode pooling can route each > transaction to one backend, which is exactly what age needs.
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > transaction to one backend, which is exactly what age needs. > pgbouncer's inter-transac
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > transaction to one backend, which is exactly what age needs. > pgbouncer's inter-transaction discard all; the robust path is role defaults —
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: > transaction to one backend, which is exactly what age needs. > plan-caching hot path) su
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > transaction to one backend, which is exactly what age needs. > plan-caching hot path) survive transaction-mode multiplexing. state plainly that
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: connection). transaction-mode compatibility (the mode that gives the fan-in benefit) does
+docs/v0.7.0/config-driven-pg-pool-prompt.md | connection). transaction-mode compatibility (the mode that gives the fan-in benefit) does load 'age' + set local search_path inside its own transaction and runs age
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: connection). transaction-mode compatibility (the mode that gives the fan-in benefit) prepa
+docs/v0.7.0/config-driven-pg-pool-prompt.md | connection). transaction-mode compatibility (the mode that gives the fan-in benefit) prepared-statement plan caching, and push statement_timeout / lock_timeout to
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: connection). transaction-mode compatibility (the mode that gives the fan-in benefit) state
+docs/v0.7.0/config-driven-pg-pool-prompt.md | connection). transaction-mode compatibility (the mode that gives the fan-in benefit) statements .persistent(false)).
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Historical v0.7.0 work prompt under the SUPERSEDED banner at the top of the file (#4667): the quoted lines record what was asked in v0.7.0 and the banner states that the transaction-pooling setting is withdrawn, so this is a record and not guidance. Unit begins: role defaults (alter role) so they survive pgbouncer's inter-transaction statements .persi
+docs/v0.7.0/config-driven-pg-pool-prompt.md | role defaults (alter role) so they survive pgbouncer's inter-transaction statements .persistent(false)).
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# pgbouncer README pool-mode note (#4667): says session is the only supported mode and that transaction and statement are not supported today, with the probe evidence, so the retired modes are named as unsupported. Unit begins: (transaction, statement), the probe observes all three crossing between transaction) needs
+infra/pgbouncer/README.md | (transaction, statement), the probe observes all three crossing between transaction) needs. full results, the daemon run through the pooler and the
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# pgbouncer README pool-mode note (#4667): says session is the only supported mode and that transaction and statement are not supported today, with the probe evidence, so the retired modes are named as unsupported. Unit begins: > and statement are not supported today: the postgres adapter keeps state on > returns to
+infra/pgbouncer/README.md | > and statement are not supported today: the postgres adapter keeps state on > returns to transaction mode only when that probe is green on a
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# pgbouncer README pool-mode note (#4667): says session is the only supported mode and that transaction and statement are not supported today, with the probe evidence, so the retired modes are named as unsupported. Unit begins: > and statement are not supported today: the postgres adapter keeps state on > session. ma
+infra/pgbouncer/README.md | > and statement are not supported today: the postgres adapter keeps state on > session. making the adapter safe under transaction pooling is tracked in
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# pgbouncer README pool-mode note (#4667): says session is the only supported mode and that transaction and statement are not supported today, with the probe evidence, so the retired modes are named as unsupported. Unit begins: > and statement are not supported today: the postgres adapter keeps state on > transaction
+infra/pgbouncer/README.md | > and statement are not supported today: the postgres adapter keeps state on > transaction-mode pooler.
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Comment block above pool_mode = session in the shipped template: it explains why transaction and statement mode are not set and cites the probe, then ends on the session assignment. Unit begins: # (scripts/probe-pgbouncer-pool-mode.py exits 1: the second client was granted pool_mode =
+infra/pgbouncer/pgbouncer.ini | # (scripts/probe-pgbouncer-pool-mode.py exits 1: the second client was granted pool_mode = session
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Comment block above pool_mode = session in the shipped template: it explains why transaction and statement mode are not set and cites the probe, then ends on the session assignment. Unit begins: # client can share the backend and see all three pool_mode = session
+infra/pgbouncer/pgbouncer.ini | # client can share the backend and see all three pool_mode = session
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Comment block above pool_mode = session in the shipped template: it explains why transaction and statement mode are not set and cites the probe, then ends on the session assignment. Unit begins: # either: it cannot hold the multi-statement transactions the adapter issues. pool_mode =
+infra/pgbouncer/pgbouncer.ini | # either: it cannot hold the multi-statement transactions the adapter issues. pool_mode = session
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Comment block above pool_mode = session in the shipped template: it explains why transaction and statement mode are not set and cites the probe, then ends on the session assignment. Unit begins: # statement_timeout / lock_timeout (:2776). under transaction mode a second # either: it c
+infra/pgbouncer/pgbouncer.ini | # statement_timeout / lock_timeout (:2776). under transaction mode a second # either: it cannot hold the multi-statement transactions the adapter issues.
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Comment block above pool_mode = session in the shipped template: it explains why transaction and statement mode are not set and cites the probe, then ends on the session assignment. Unit begins: # the migration lock and saw the first client's search_path and timeout); pool_mode = sess
+infra/pgbouncer/pgbouncer.ini | # the migration lock and saw the first client's search_path and timeout); pool_mode = session
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# smoke-test.py: the pool_mode value is read from SHOW output and compared with session (anything else fails), and the neighbouring comment says the admin console pseudo-database always reports statement, which is why that row is skipped; no mode is set. Unit begins: # the admin console's own pseudo-database always reports statement if r.get("pool_mode") n
+infra/pgbouncer/smoke-test.py | # the admin console's own pseudo-database always reports statement if r.get("pool_mode") not in (none, "", "session"):
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# smoke-test.py: the pool_mode value is read from SHOW output and compared with session (anything else fails), and the neighbouring comment says the admin console pseudo-database always reports statement, which is why that row is skipped; no mode is set. Unit begins: # the admin console's own pseudo-database always reports statement raise failure("show %s:
+infra/pgbouncer/smoke-test.py | # the admin console's own pseudo-database always reports statement raise failure("show %s: %s overrides pool_mode to %r, want 'session' (#4742)" % (
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# smoke-test.py: the pool_mode value is read from SHOW output and compared with session (anything else fails), and the neighbouring comment says the admin console pseudo-database always reports statement, which is why that row is skipped; no mode is set. Unit begins: # the admin console's own pseudo-database always reports statement what, r.get("name"), r.
+infra/pgbouncer/smoke-test.py | # the admin console's own pseudo-database always reports statement what, r.get("name"), r.get("pool_mode")))
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# smoke-test.py: the pool_mode value is read from SHOW output and compared with session (anything else fails), and the neighbouring comment says the admin console pseudo-database always reports statement, which is why that row is skipped; no mode is set. Unit begins: 1. a multi-statement age cypher transaction (load 'age' + set local 3. the pooler reports
+infra/pgbouncer/smoke-test.py | 1. a multi-statement age cypher transaction (load 'age' + set local 3. the pooler reports pool_mode = session, read with show config as the
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# smoke-test.py: the pool_mode value is read from SHOW output and compared with session (anything else fails), and the neighbouring comment says the admin console pseudo-database always reports statement, which is why that row is skipped; no mode is set. Unit begins: if not row or "pool_mode" not in row[0]: # the admin console's own pseudo-database always
+infra/pgbouncer/smoke-test.py | if not row or "pool_mode" not in row[0]: # the admin console's own pseudo-database always reports statement
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# smoke-test.py: the pool_mode value is read from SHOW output and compared with session (anything else fails), and the neighbouring comment says the admin console pseudo-database always reports statement, which is why that row is skipped; no mode is set. Unit begins: if row[0]["pool_mode"] != "session": # the admin console's own pseudo-database always repo
+infra/pgbouncer/smoke-test.py | if row[0]["pool_mode"] != "session": # the admin console's own pseudo-database always reports statement
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# smoke-test.py: the pool_mode value is read from SHOW output and compared with session (anything else fails), and the neighbouring comment says the admin console pseudo-database always reports statement, which is why that row is skipped; no mode is set. Unit begins: print(" effective pool_mode for %s@ai_memory = %s" % (app_role, row[0]["pool_mode"])) # th
+infra/pgbouncer/smoke-test.py | print(" effective pool_mode for %s@ai_memory = %s" % (app_role, row[0]["pool_mode"])) # the admin console's own pseudo-database always reports statement
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# smoke-test.py: the pool_mode value is read from SHOW output and compared with session (anything else fails), and the neighbouring comment says the admin console pseudo-database always reports statement, which is why that row is skipped; no mode is set. Unit begins: raise failure("show pools has no ai_memory/%s row with a pool_mode column (#4742)" % app_r
+infra/pgbouncer/smoke-test.py | raise failure("show pools has no ai_memory/%s row with a pool_mode column (#4742)" % app_role) # the admin console's own pseudo-database always reports statement
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# smoke-test.py: the pool_mode value is read from SHOW output and compared with session (anything else fails), and the neighbouring comment says the admin console pseudo-database always reports statement, which is why that row is skipped; no mode is set. Unit begins: raise failure("the ai_memory pool runs pool_mode %r, want 'session' (#4742)" % row[0]["poo
+infra/pgbouncer/smoke-test.py | raise failure("the ai_memory pool runs pool_mode %r, want 'session' (#4742)" % row[0]["pool_mode"]) # the admin console's own pseudo-database always reports statement
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Rust doc comment on the transaction-scoped advisory lock for #3008: the words are the Postgres transaction and independent sqlx pool statements, not a PgBouncer pooling mode. Unit begins: /// #3008 parity (v1.0.0 batch-2) — transaction-scoped advisory lock that /// insert as tw
+src/store/postgres.rs | /// #3008 parity (v1.0.0 batch-2) — transaction-scoped advisory lock that /// insert as two independent pool statements: under read committed two
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Test doc comment on the #3008 advisory-lock fix: the words are independent sqlx pool statements under read committed, not a PgBouncer pooling mode. Unit begins: /// independent pool statements, so under read committed both probes could see a /// not m
+tests/pg_parity_batch_2.rs | /// independent pool statements, so under read committed both probes could see a /// not merely a wrong answer). the advisory-lock + single-tx fix serializes
