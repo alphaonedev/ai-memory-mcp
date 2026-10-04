@@ -12,8 +12,11 @@ node API key and writes it to a 0600 file.
 Standard library only; exits 1 on any failed probe.
 """
 import os
+import time
+import threading
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -36,6 +39,11 @@ def probe(name, ok, detail=""):
 def section(text, start, end):
     i = text.index(start)
     return text[i:text.index(end, i)]
+
+
+def plain_id_def(text):
+    """The federate.sh plain_id helper line (node_get calls it), or empty before it existed."""
+    return next((l for l in text.splitlines() if l.startswith("plain_id() {")), "")
 
 
 def stub_dir(d, name, real=None):
@@ -97,7 +105,7 @@ def f5_admin_call():
 def f5_federate():
     fs = FED.read_text()
     for fname, arg in (("node_get", "1 mem-1"), ("node_post", "1 e30=")):
-        fn = section(fs, fname + "() {", "\n}\n") + "\n}\n"
+        fn = plain_id_def(fs) + "\n" + section(fs, fname + "() {", "\n}\n") + "\n}\n"
         with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
             d = pathlib.Path(t)
             stub_dir(d, "curl")
@@ -124,7 +132,8 @@ def f6_spawn():
              ("https://h/RELEASES/LATEST/x", False), ("https://h/rElEaSeS/lAtEsT/x", False),
              ("https://h/Releases/latest/x", False), ("https://h/releases/LATEST/x", False),
              ("https://h/releases/./latest", False), ("https://h/releases/x/../latest", False),
-             ("https://h/releases//latest", False), ("https://h/o/v1/./a.tgz", False)]
+             ("https://h/releases//latest", False), ("https://h/o/v1/./a.tgz", False),
+             ("https://h/o/v1/a.tgz/", False), ("https://h/", False), ("https://h/o/v1/", False)]
     with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
         script = pathlib.Path(t) / "fn.sh"
         script.write_text(fn + "\nrequire_image_pin\necho PASSED\n")
@@ -159,7 +168,7 @@ def n1_curl_config_injection():
             probe("N1 template admin_call %s key: no extra curl option" % label, curl_stdin_clean(d))
     fs = FED.read_text()
     for fname, arg in (("node_get", "1 mem-1"), ("node_post", "1 e30=")):
-        fn = section(fs, fname + "() {", "\n}\n") + "\n}\n"
+        fn = plain_id_def(fs) + "\n" + section(fs, fname + "() {", "\n}\n") + "\n}\n"
         with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
             d = pathlib.Path(t)
             stub_dir(d, "curl")
@@ -200,20 +209,61 @@ def p1_federate_key_echo():
         kf = rd / "api-key"
         probe("P1 key written to run_dir/api-key", kf.exists() and SECRET in kf.read_text())
         probe("P1 key file mode 0600", kf.exists() and (kf.stat().st_mode & 0o777) == 0o600)
-        kf.unlink()
+        if kf.exists() or kf.is_symlink():
+            kf.unlink()
         tgt = d / "planted-target"
         tgt.write_text("")
         tgt.chmod(0o644)
         kf.symlink_to(tgt)
         run_bash(script, d)
         probe("P1 planted symlink is not followed", tgt.read_text() == "" and not kf.is_symlink())
-        kf.unlink()
+        if kf.exists() or kf.is_symlink():
+            kf.unlink()
         kf.write_text("old\n")
         kf.chmod(0o644)
         run_bash(script, d)
-        probe("P1 pre-existing 0644 file ends 0600", (kf.stat().st_mode & 0o777) == 0o600)
+        probe("P1 pre-existing 0644 file ends 0600", kf.exists() and (kf.stat().st_mode & 0o777) == 0o600)
         r = run_bash(pre + 'on_node() { return 255; }\np1f() {\n%s\n}\np1f\n' % blk, d)
-        probe("P1 failed fetch fails closed and leaves no file", r.returncode != 0 and not kf.exists(), "rc=%d" % r.returncode)
+        probe("P1 failed fetch fails closed and leaves no file", r.returncode != 0 and not kf.exists()
+              and not list(rd.glob(".api-key.*")), "rc=%d" % r.returncode)
+        # A racer that wins between rm -f and the write plants a symlink to a FIFO it reads:
+        # bash noclobber opens an existing non-regular target without O_EXCL (#4893).
+        fifo = d / "racer-fifo"
+        os.mkfifo(str(fifo))
+        got = []
+        def reader():
+            fd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+            end = time.time() + 5
+            while time.time() < end:
+                try:
+                    b = os.read(fd, 4096)
+                except BlockingIOError:
+                    b = b""
+                got.append(b)
+                time.sleep(0.05)
+            os.close(fd)
+        th = threading.Thread(target=reader, daemon=True)
+        th.start()
+        time.sleep(0.2)
+        race = pre + ('rm() { command rm "$@"; [ -e "$run_dir/api-key" ] || ln -s %s "$run_dir/api-key"; }\n'
+                      'on_node() { printf "%%s\\n" %s; }\np1f() {\n%s\n}\np1f\n') % (fifo, SECRET, blk)
+        rp = subprocess.Popen(["bash", "-c", race], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              start_new_session=True, env=dict(os.environ, PATH=str(d) + os.pathsep + os.environ["PATH"]))
+        try:
+            rp.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            os.killpg(rp.pid, signal.SIGKILL)  # the unpatched block blocks reading the FIFO back
+            rp.wait()
+        th.join(6)
+        probe("P1 racer-planted symlink to a FIFO does not receive the key", SECRET.encode() not in b"".join(got))
+        for label, body in (("a trailing extra line", SECRET + "\\nzz\\n"), ("64 non-hex bytes", "z" * 64 + "\\n"),
+                            ("a hex first byte then 63 non-hex bytes", "a" + "z" * 63 + "\\n"),
+                            ("65 hex bytes", SECRET + "a\\n"), ("the key twice", SECRET + "\\n" + SECRET + "\\n"),
+                            ("an empty first line then the key", "\\n" + SECRET), ("nothing", "")):
+            if kf.exists() or kf.is_symlink():
+                kf.unlink()
+            r = run_bash(pre + 'on_node() { printf "%%b" "%s"; }\np1f() {\n%s\n}\np1f\n' % (body, blk), d)
+            probe("P1 key file with %s fails closed and leaves no file" % label, r.returncode != 0 and not kf.exists(), "rc=%d" % r.returncode)
 
 
 def n1_no_locale_ranges():
@@ -221,10 +271,16 @@ def n1_no_locale_ranges():
     probe("N1 four key guards found", len(guards) == 4, str(len(guards)))
     for g in guards:
         probe("N1 guard has no locale-dependent range: " + g.strip()[:60], re.search(r"\[[^\]]*\w-\w[^\]]*\]", g) is None)
+    # Every bash =~ check in the three shipped shell surfaces (the key guards, the node_get id
+    # check, the spawn.sh URL check): a range matches non-ASCII code points under UTF-8 locales.
+    allre = [l for l in (TPL.read_text() + FED.read_text() + SPAWN.read_text()).splitlines() if "=~" in l and not l.lstrip().startswith("#")]
+    probe("N1 seven =~ checks found", len(allre) == 7, str(len(allre)))
+    for g in allre:
+        probe("N1 =~ check has no locale-dependent range: " + g.strip()[:60], re.search(r"\[[^\]]*\w-\w[^\]]*\]", g) is None)
 
 
 def f2_node_get_id():
-    fn = section(FED.read_text(), "node_get() {", "\n}\n") + "\n}\n"
+    fn = plain_id_def(FED.read_text()) + "\n" + section(FED.read_text(), "node_get() {", "\n}\n") + "\n}\n"
     with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
         d = pathlib.Path(t)
         marker = d / "marker-id"
@@ -234,15 +290,49 @@ def f2_node_get_id():
         node_sh = "node_sh() { /usr/bin/sed 's#/etc/ai-memory/api-key#%s#' | bash; }" % key
         r = run_bash("AUTHOR_ID=au\n%s\n%s\nnode_get 1 'x;touch %s'\n" % (node_sh, fn, marker), d)
         probe("F2 node_get refuses a non-plain memory id", r.returncode != 0 and not marker.exists(), "rc=%d" % r.returncode)
+        # verify names the cause (a refused id) instead of retrying it as a replication failure.
+        fs = FED.read_text()
+        for var, start, end in (("QID", '  if [ -n "$QID" ] && ! plain_id "$QID"; then', "  # A4 --"),
+                                ("SID", '      if [ -n "$SID" ] && ! plain_id "$SID"; then', "      if [ \"$scode\" = \"201\" ]")):
+            i = fs.find(start)
+            snip = fs[i:fs.index(end, i)] if i >= 0 else ""
+            sc = ("%s\nok() { echo OK; }\nno() { echo \"NO $*\"; }\nnode_get() { echo CALLED; }\nsleep() { :; }\n"
+                  "%s='x;touch %s'\n%s\necho \"after=[$%s]\"\n" % (plain_id_def(fs), var, marker, snip, var))
+            r = run_bash(sc, d)
+            probe("F2 verify reports a non-plain %s as a refused id and never reads it back" % var,
+                  i >= 0 and "not a plain id" in r.stdout and "CALLED" not in r.stdout and "after=[]" in r.stdout
+                  and not marker.exists(), r.stdout.strip()[:80])
+
+
+def f2_id_lists_agree():
+    fs = FED.read_text()
+    lists = re.findall(r"\^(\[[^\]]*\])\{1,64\}\$", "\n".join(l for l in fs.splitlines() if "=~" in l and "1,64" in l))
+    probe("F2 plain_id and node_get accept the same id characters", len(lists) == 2 and set(lists[0]) == set(lists[1]), str(len(lists)))
 
 
 def f3_static_pins():
     fed = FED.read_text()
-    probe("F3 key file write uses noclobber (O_EXCL)", "set -o noclobber; on_node" in fed)
+    probe("F3 key file write uses noclobber (O_EXCL) on an unpredictable name", "set -o noclobber; on_node" in fed
+          and 'mktemp -u "$run_dir/.api-key.' in fed and 'mv -f -T -- "$keytmp" "$keyf"' in fed)
     i = fed.find("{ set +x; } 2>/dev/null")
     j = fed.find('api_key="$(on_node')
     probe("F3 verify suspends xtrace before the key is read", 0 <= i < j, "%d < %d" % (i, j))
-    probe("F3 verify restores xtrace only after the key is cleared", fed.find('api_key=""') < fed.find("[ \"$_fed_xtrace\" = 1 ] && set -x"))
+    k, x = fed.find('api_key=""'), fed.find("[ \"$_fed_xtrace\" = 1 ] && set -x")
+    probe("F3 verify restores xtrace only after the key is cleared", 0 <= k < x, "%d < %d" % (k, x))
+    # Behaviour, not text: run the verify key read under bash -x and look for the key in the trace.
+    seg = section(fed, "  # The key must not reach an xtrace log", "  if [ -n \"$api_key\" ]; then")
+    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+        d = pathlib.Path(t)
+        r = run_bash('set -x\ndie() { echo "DIE: $*" >&2; exit 2; }\nPUBLIC_IPS=(h)\n'
+                     'on_node() { printf "%%s\\n" %s; }\nvf() {\n%s\n}\nvf\necho "xt=$_fed_xtrace"\n' % (SECRET, seg), d)
+        k2 = fed.find('  api_key=""\n')
+        tail = fed[k2:fed.index('  [ "$fail" -eq 0 ]\n}\n', k2)] if k2 >= 0 else ""
+        r2 = run_bash('set -x\nfail=0\napi_key=%s\n_fed_xtrace=1\nvf() {\n%s\n}\nvf\n'
+                      'case $- in *x*) X=on ;; *) X=off ;; esac\n{ set +x; } 2>/dev/null\necho "X=$X K=${#api_key}"\n' % (SECRET, tail), d)
+        probe("F3 verify tail clears the key and restores xtrace", r2.returncode == 0 and "X=on K=0" in r2.stdout,
+              r2.stdout.strip()[-20:] if "X=on K=0" not in r2.stdout else "")
+        probe("F3 verify key read under bash -x leaves no key in the trace", r.returncode == 0 and "xt=1" in r.stdout
+              and SECRET not in r.stderr and SECRET not in r.stdout, "rc=%d" % r.returncode)
 
 
 def n3_main_tf():
@@ -263,6 +353,7 @@ def main():
     n3_main_tf()
     n1_no_locale_ranges()
     f2_node_get_id()
+    f2_id_lists_agree()
     f3_static_pins()
     print("RESULT: %s (%d failed)" % ("FAIL" if FAILS else "PASS", len(FAILS)))
     return 1 if FAILS else 0
