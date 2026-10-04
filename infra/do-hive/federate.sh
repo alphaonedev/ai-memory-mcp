@@ -402,7 +402,9 @@ sudo -u postgres psql -d aimemory -Atc "SELECT current_setting('server_version')
 sudo -u postgres psql -d aimemory -Atc "SELECT extname || '=' || extversion FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname"
 EOS
 )"
-    echo "$versions" | grep -q '^18\.6' && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 ($(safe_excerpt "$versions"))"
+    # #5172: the server_version token (first line, up to the first space) must be exactly 18.6.
+    pg_ver="${versions%%$'\n'*}"; pg_ver="${pg_ver%% *}"
+    [ "$pg_ver" = 18.6 ] && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 ($(safe_excerpt "$versions"))"
     echo "$versions" | grep -qx 'age=1.8.0' && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 ($(safe_excerpt "$versions"))"
     echo "$versions" | grep -qx 'vector=0.8.6' && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 ($(safe_excerpt "$versions"))"
   done

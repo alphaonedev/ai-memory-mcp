@@ -720,6 +720,42 @@ def f2_node_get_id():
                       and SECRET not in r.stdout and SECRET not in r.stderr, r.stdout.strip()[:100])
 
 
+def version_block(fs):
+    """The verify loop that reads the certified data-tier versions from each node, or empty."""
+    a = fs.find("  # Certified data-tier pins, asserted from the provisioned hosts.\n")
+    b = fs.find("  # These two assertions intentionally originate on f2", a) if a >= 0 else -1
+    return fs[a:b] if 0 <= a < b else ""
+
+
+def run_versions(fs, defs, reply, d):
+    """Run the version loop for one node whose psql reply is reply; return the CompletedProcess."""
+    (d / "versions.reply").write_bytes(reply.encode("utf-8", "surrogateescape"))
+    sc = ("set -u\n%s\nok() { echo \"OK $*\"; }\nno() { echo \"NO $*\"; }\nNODE_COUNT=1\napi_key=''\n"
+          "node_sh() { cat %s; }\n%s\n" % (defs, d / "versions.reply", version_block(fs)))
+    return run_bash(sc, d)
+
+
+def pg_version_5172():
+    """#5172: PostgreSQL passes only when the server_version token is exactly 18.6."""
+    fs = FED.read_text()
+    i, j = fs.find("safe_excerpt() {"), fs.find("# node_get <idx0>")
+    if i < 0:
+        i = fs.find("reply_status() {")
+    defs = fs[i:j] if 0 <= i < j else ""
+    tail = "\nage=1.8.0\nvector=0.8.6\n"
+    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+        d = pathlib.Path(t)
+        for first, want in (("18.6", True), ("18.6 (Debian 18.6-1.pgdg)", True), ("18.60", False),
+                            ("18.61 (Debian)", False), ("18.6.1", False), ("18.6beta", False), ("17.2", False)):
+            r = run_versions(fs, defs, first + tail, d)
+            pg = [l for l in r.stdout.splitlines() if "PostgreSQL" in l]
+            probe("#5172 server_version %r gives %s" % (first, "PASS" if want else "FAIL"), bool(version_block(fs)) and len(pg) == 1
+                  and pg[0].startswith("OK" if want else "NO"), "%s" % pg)
+        r = run_versions(fs, defs, "17.2\n18.6\n" + tail, d)
+        pg = [l for l in r.stdout.splitlines() if "PostgreSQL" in l]
+        probe("#5172 18.6 on a line after server_version does not pass", len(pg) == 1 and pg[0].startswith("NO"), "%s" % pg)
+
+
 def f2_id_lists_agree():
     fs = FED.read_text()
     lists = re.findall(r"\^(\[[^\]]*\])\{1,64\}\$", "\n".join(l for l in fs.splitlines() if "=~" in l and "1,64" in l))
@@ -773,6 +809,7 @@ def main():
     n1_no_locale_ranges()
     f2_node_get_id()
     f2_id_lists_agree()
+    pg_version_5172()
     f3_static_pins()
     print("RESULT: %s (%d failed)" % ("FAIL" if FAILS else "PASS", len(FAILS)))
     return 1 if FAILS else 0
