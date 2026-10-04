@@ -560,6 +560,14 @@ def failure_lines_4999():
         hostile = hostile_replies()
         probe("V1 the hostile replies are equal in length and hold no NUL or newline",
               len({len(h) for _, h in hostile}) == 1 and not any(b"\x00" in h or b"\n" in h for _, h in hostile))
+        # The set is the one the vote names (the key, a URL password, ESC bytes, random bytes) plus the 2xx
+        # value; a smaller set makes every byte-identity probe below vacuous.
+        hb = [h for _, h in hostile]
+        classes = (any(h == SECRET.encode() for h in hb), any(b"x9zQ@" in h for h in hb),
+                   any(b"\x1b[" in h and b"PASS" in h for h in hb), any(sum(c >= 128 for c in h) >= 16 for h in hb),
+                   any(h.startswith(b"204 ") and SECRET[:16].encode() in h for h in hb))
+        probe("V1 the hostile set holds 5 distinct replies: the key, a URL password, ESC bytes, random bytes, a 2xx value",
+              len(set(hb)) == 5 and all(classes), repr(classes))
         # The two HTTP sites, run whole with each hostile reply as the body and as the status.
         for site, cvar, jvar, start, end, pat in (
                 ("quorum", "qcode", "qjson", '  case "$qcode" in', '  if [ -n "$QID" ] && ! plain_id',
