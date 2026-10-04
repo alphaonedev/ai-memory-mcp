@@ -618,6 +618,7 @@ PILL = re.compile(r'class="pill"[^>]*>\s*v([0-9]+)\s+schema\s*<')
 TAG = re.compile(r'<[^>]+>')
 WS = re.compile(r'\s+')
 PRIOR = re.compile(r'PRIOR RELEASE', re.IGNORECASE)
+BLOCK_TAG = re.compile(r'</?(?:p|div|li|ul|ol|tr|td|th|table|h[1-6]|section|br)\b', re.IGNORECASE)
 
 
 def plain(s):
@@ -675,7 +676,10 @@ for path in files:
             # markdown line is a paragraph break (#4511-R6 pins both).
             back = ln - 2
             prev = plain(lines[back]) if is_html else lines[back]
-            while is_html and not prev and back > 0 and ln - 2 - back < 3:
+            # A block-boundary line (`</div>`, `<p>`, `<li>`) ends the claim's
+            # paragraph: the walk stops there (#5154).
+            while is_html and not prev and back > 0 and ln - 2 - back < 3 \
+                    and not BLOCK_TAG.search(lines[back]):
                 back -= 1
                 prev = plain(lines[back])
             # Whitespace at the wrap point is not part of the claim: markdown
@@ -2798,6 +2802,10 @@ v40&nbsp;&rarr;&nbsp;v53</span></em></strong>)</p>
 <li>
 <p>
 v52 added the audit table.</p>
+<p>See CURRENT_SCHEMA_VERSION</p>
+</div>
+<div>
+<p>52 tools ship today.</p>
 R4HTML
     r4_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test #3248 r4 - stale wordings not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -2843,13 +2851,14 @@ R4HTML
         'docs/postgres-age-guide.md:33 ' 'docs/schema-fixture.html:26 ' \
         'docs/postgres-age-guide.md:36 ' 'docs/schema-fixture.html:36 ' \
         'docs/schema-fixture.html:42 ' \
-        'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 '
+        'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 ' 'docs/schema-fixture.html:46 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5026/#5080 - anchor wrapped across two lines (steps / v40 -> v52) and identifier value more than 60 chars after the identifier: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #4511-R5 - wrapped claim with an issue ref / release triple in the subject tail, whitespace at the wrap point, and a tag-only middle line: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5140 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5154 - html look-back stops at a block-boundary line (</div>, <div>): the unrelated 52 is not joined to the subject"
     echo "PASS: self-test #4511-R6 - html look-back skips up to 3 tag-only lines (52 REJECTED, 53 ACCEPTED), stops past 3, and markdown never looks back past a blank line"
     echo "PASS: self-test #4851 - compact json schema_version:52 REJECTED, :53 ACCEPTED"
     echo "PASS: self-test #4852 - issue ref / release triple between identifier and value: planted 52 REJECTED, 53 ACCEPTED"
