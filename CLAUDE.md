@@ -1731,20 +1731,28 @@ ruling: *"Anchors that miss 6/6 are worse than no anchors — they cost
 the reviewer trust they cannot get back."* The class is worse than
 value drift because a wrong VALUE is falsifiable in one grep, while a
 wrong ANCHOR sends the reader to the wrong place and then makes them
-doubt everything else. FIVE rules, all keyed on PATH-QUALIFIED grammar:
+doubt everything else. SIX rules, all keyed on PATH-QUALIFIED grammar:
 **PATH** (a cited `src/<p>.rs` must exist — this is what caught the
 pre-modularisation `src/handlers.rs` / `src/mcp.rs` / `src/db.rs`
 anchors still live in the operator guides), **LINE** (a `src/<p>.rs:<N>`
-anchor must name a line the file has), **QUAL** (every identifier in
+anchor must name a line the file has; the range separator may be a
+hyphen, with or without spaces, an en dash or an em dash, and the
+`#L<a>-L<b>` fragment of a relative `src/` link is range-checked the
+same way, column suffix included), **QUAL** (every identifier in
 `src/<p>.rs::<sym>` and `src/<p>.rs::{a, B::c, d}` must be defined IN
 THAT FILE — each `::` component is checked, so
-`VectorIndex::build_with_capacity` resolves only if both do), and
-**MDLINK** (a ``[`sym`](../src/<p>.rs)`` link must resolve, or `sym`
-must BE the module's file stem, which is a legitimate module citation), and **BARE_LN**
+`VectorIndex::build_with_capacity` resolves only if both do; the
+unbackticked form, and `Type<T>::method`, are checked too, the former
+reported as **BARE_QUAL**, and a qualified anchor always asserts that
+its file exists), **MDLINK** (a ``[`sym`](../src/<p>.rs)`` link must resolve, or `sym`
+must BE the module's file stem, which is a legitimate module citation; a relative link to a `src/` file, titled, a reference
+definition or an HTML href included, must point at an existing file),
+**BARE_LN**
 (#4651: a bare, un-backticked `src/<p>.rs:<N>` in prose, a link label or
 HTML text is a finding that FAILS, unless it labels a commit-pinned
 `https://github.com/<owner>/<repo>/blob/<40-hex sha>/` permalink whose path
-and `#L` line (or range) equal the label's, which is immutable).
+and `#L` line (or range) equal the label's, which is immutable), and **LADDER_TIP** (a claimed
+migration-ladder tip must be the real tip).
 
 **What is deliberately NOT a rule:** a bare backticked identifier
 sharing a line with a `src/` path. Measured against the tree that
@@ -1754,9 +1762,13 @@ definitions. A rule with that false-positive rate gets switched off
 within a week, and a gate nobody can leave on is worse than no gate.
 Two further carve-outs are load-bearing: a line that DELIBERATELY names
 a path as absent (CLAUDE.md's own worktree pre-flight asserts
-`test ! -f src/handlers.rs`) is exempt, evaluated over a THREE-LINE
+`test ! -f src/handlers.rs`) is exempt for a plain path or line anchor
+(never for a qualified anchor, a link or a fragment), evaluated over a
+THREE-LINE
 window because this repo hard-wraps prose and the disclaimer routinely
-lands on the line above the path it disclaims; and frozen doc trees
+lands on the line above the path it disclaims (wording that names a
+destination, "split into", "split out" or an arrow, exempts only an
+anchor BEFORE it, never the live file after it); and frozen doc trees
 (`docs/v0.*/`, `docs/internal/`, `docs/audit/`, `docs/rfc/`, `docs/adr*`,
 `docs/BASELINE-*.md`, the `perfect-endpoint-assessment` wave artefacts)
 are out of scope for the CHANGELOG reason — they describe a tree AS IT
