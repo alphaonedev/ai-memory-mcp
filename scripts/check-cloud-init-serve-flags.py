@@ -1158,13 +1158,39 @@ def subst_consts(w: str, consts: dict) -> str:
     return re.sub(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)", rep, w)
 
 
-def path_uses(stmt: str, consts: dict, out: list, depth: int = 0) -> None:
-    """Append (text, safe) for every word of stmt, its -c scripts and substitutions."""
+def writes_out(words: list) -> bool:
+    """True when the command's output goes to a file other than /dev/null (#5096)."""
+    k = 0
+    while k < len(words):
+        w = words[k]
+        rm = REDIR_RE.match(w)
+        if rm is not None and not w.startswith(("<(", ">(")):
+            op = w[:len(w) - len(rm.group(1))]
+            tgt = unquote(rm.group(1) or (words[k + 1] if k + 1 < len(words) else ""))[0]
+            if ">" in op and "<" not in op and not re.fullmatch(r"\d*>&\d*-?", op + tgt) and tgt != "/dev/null":
+                return True
+            k += 1 if rm.group(1) else 2
+            continue
+        k += 1
+    return False
+
+
+def path_uses(stmt: str, consts: dict, out: list, depth: int = 0, in_sub: bool = False) -> None:
+    """Append (text, safe) for every word of stmt, its -c scripts and substitutions.
+    Nothing is safe in a command (other than chmod/chown/chgrp/mkdir, which print no
+    content) or a { } / ( ) group whose output goes to a file, in tee's stdin, or for
+    echo/printf/tee inside a substitution, whose output becomes words (#5096: a safe
+    read must not be a copy)."""
     t = tokenize(stmt) if depth <= 8 else None
     if t is None:
         out.append((subst_consts(stmt, consts), False))
         return
     cmds, subs, _ansi = t
+    grouped_out, prev = False, ""
+    for words, _pipe_in, term in cmds:
+        if (words[:1] in (["}"], [")"]) or prev == ")") and writes_out(words):
+            grouped_out = True
+        prev = term
     for ci, (words, _pipe_in, term) in enumerate(cmds):
         idx, scripts = resolve(words)
         for sv, _sexp in scripts:
@@ -1175,7 +1201,7 @@ def path_uses(stmt: str, consts: dict, out: list, depth: int = 0) -> None:
             has_c, sw = shell_script_word(base, rest)
             if has_c and sw is not None:
                 path_uses(unquote(sw)[0], consts, out, depth + 1)
-        safe = base in DATA_SAFE
+        safe = base in DATA_SAFE and not (in_sub and base in ("echo", "printf", "tee"))
         nxt = cmds[ci + 1][0] if term == "|" and ci + 1 < len(cmds) else None
         if nxt:
             # words piped into a shell, an interpreter or xargs are run, not data (#5095)
@@ -1197,6 +1223,8 @@ def path_uses(stmt: str, consts: dict, out: list, depth: int = 0) -> None:
             safe = any(a == "--directory" or (re.fullmatch(r"-[A-Za-z]+", a) is not None and "d" in a) for a in rest)
         elif base == "sed":
             safe = sed_reads_only(rest, term)
+        if grouped_out or (writes_out(words) and base not in ("chmod", "chown", "chgrp", "mkdir")):
+            safe = False
         k = 0
         while k < len(words):
             w = words[k]
@@ -1207,7 +1235,8 @@ def path_uses(stmt: str, consts: dict, out: list, depth: int = 0) -> None:
                 op = w[:len(w) - len(rm.group(1))]
                 tgt = rm.group(1) or (words[k + 1] if k + 1 < len(words) else "")
                 writes = ">" in op and "<" not in op
-                out.append((unquote(subst_consts(tgt, consts))[0], writes or safe))
+                # tee copies its standard input to its file operands: reading a path is a copy
+                out.append((unquote(subst_consts(tgt, consts))[0], writes or (safe and base != "tee")))
                 k += 1 if rm.group(1) else 2
                 continue
             if (idx is None or k < idx) and ASSIGN_RE.match(w):
@@ -1218,7 +1247,7 @@ def path_uses(stmt: str, consts: dict, out: list, depth: int = 0) -> None:
                 out.append((unquote(subst_consts(w, consts))[0], safe if k != idx else False))
             k += 1
     for s in subs:
-        path_uses(s, consts, out, depth + 1)
+        path_uses(s, consts, out, depth + 1, True)
 
 
 def use_glob(val: str) -> str:
@@ -2783,6 +2812,10 @@ def build_probes() -> list:
         ('data-home file run by a dot after PATH, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      PATH=/etc/ai-memory:$PATH; . run.conf\n" + dec)]),
         ('data-home file run as an unresolved operand, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      F=$(cat /etc/x); bash \"$${F}\"\n" + dec)]),
         ('data-home file run as an unresolved stdin target, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      read F < /etc/x; bash < \"$${F}\"\n" + dec)]),
+        ('data-home file copied by tee from its stdin, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      tee /usr/local/bin/r.sh < /etc/ai-memory/run.conf > /dev/null\n      bash /usr/local/bin/r.sh\n" + dec)]),
+        ('data-home file copied by sed in a redirected group, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      { sed 's/a/a/' /etc/ai-memory/run.conf; } > /usr/local/bin/r.sh\n      bash /usr/local/bin/r.sh\n" + dec)]),
+        ('data-home file named by echo in a substitution, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      taskset -c 0 \"$(echo /etc/ai-memory/run.conf)\".x\n      bash /usr/local/bin/r.sh\n" + dec)]),
+        ('data-home file read by tee in a substitution, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      taskset -c 0 \"$(tee < /etc/ai-memory/run.conf)\".x\n      bash /usr/local/bin/r.sh\n" + dec)]),
         ('data-home file run by a unit ExecStartPre through a doubled slash, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (ENVF, ENVF + "      ExecStartPre=/bin/sh /etc//ai-memory/run.conf\n")]),
         ('no-shebang write_files file run as a command, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      /etc/ai-memory/run.conf\n" + dec)]),
         ('no-shebang write_files file at mode 0755, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0755", ["${X} --db /x stats"]))]),
@@ -2850,6 +2883,7 @@ def build_probes() -> list:
     green("ai-memory under sudo -u (#4837 R12 R4)", [(RELOAD, RELOAD + '      sudo -u aimemory /usr/local/lib/ai-memory/bin/ai-memory --db /x stats\n')], autolist=True)
     green("resolved literal variable as an operand and quoted JSON brace (#4837 R12 R4, #5094)", [(RELOAD, RELOAD + '      L=/var/log/x.log; chmod 0640 "$${L}"\n      echo "$${H}" "{\\"a\\": 1}" >/dev/null\n      printf %s "$(date)"\n')], autolist=True)
     green("data-home file named in canonical-equal spellings by safe commands only (#4837 R12 R5, #5095)", [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} = 1"])), (RELOAD, RELOAD + '      chown root:aimemory /etc//ai-memory/./run.conf\n      D=/etc/ai-memory\n      chmod 0640 "$${D}/run.conf"\n      systemctl restart ai-memory\n')], autolist=True)
+    green("data-home file read by safe commands whose output is discarded (#4837 R12 R5, #5096)", [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} = 1"])), (RELOAD, RELOAD + "      printf %s /etc/ai-memory/run.conf > /dev/null\n      chmod 0640 /etc/ai-memory/run.conf > /dev/null 2>&1\n      { echo a; } > /var/log/x\n")], autolist=True)
     green("ai-memory installed keeping its name (#4837 R12 R4)", [(RELOAD, RELOAD + '      install -m 0755 /opt/x/ai-memory /usr/local/lib/ai-memory/bin/ai-memory\n      cp /opt/x/ai-memory /opt/y/\n      [ -x /usr/local/lib/ai-memory/bin/ai-memory ] || echo "no /usr/local/lib/ai-memory/bin/ai-memory"\n')], autolist=True)
     green("data file in a data home handled by chown/chmod/sed (#4837 R12 R5)", [(PROV, wf("/etc/ai-memory/peer.conf", "0640", ["${X} --db /x stats"])), (RELOAD, RELOAD + "      chown root:aimemory /etc/ai-memory/peer.conf\n      chmod 0640 /etc/ai-memory/peer.conf\n      chmod 0750 /etc/ai-memory\n      P=\"$(sed -n 's#^a=##p' /etc/ai-memory/peer.conf)\"\n")], autolist=True)
     green("data heredoc into a data home through a constant (#4837 R12 R5)", [(RELOAD, RELOAD + "      CFG=/etc/ai-memory/h\n      cat > \"$${CFG}/x.conf\" <<'EOF'\n      ${X} = 1\n      EOF\n")], autolist=True)
