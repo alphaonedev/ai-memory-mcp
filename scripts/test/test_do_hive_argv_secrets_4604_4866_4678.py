@@ -488,7 +488,8 @@ def failure_lines_4999():
             a = fs.find(start)
             b = fs.find(end, a) if a >= 0 else -1
             snip = fs[a:b] if 0 <= a < b else ""
-            sc = ("api_key=''\n%s\nok() { echo \"OK $*\"; }\nno() { echo \"NO $*\"; }\nQID=''\nSID=''\n%s='500'\n%s=$'%s'\n%s\n"
+            # set -u as in federate.sh: a site that reads an unset flag is red here, not only in production.
+            sc = ("set -u\napi_key=''\n%s\nok() { echo \"OK $*\"; }\nno() { echo \"NO $*\"; }\nQID=''\nSID=''\n%s='500'\n%s=$'%s'\n%s\n"
                   % (defs + plain_id_def(fs), cvar, jvar, hostile.replace("\\", "\\\\").replace("'", "\\'").replace("\x1b", "\\x1b")
                      .replace("\x01", "\\x01").replace("\x07", "\\x07").replace("\x7f", "\\x7f"), snip))
             r = run_bash(sc, d)
@@ -613,12 +614,24 @@ def f2_node_get_id():
             i = fs.find(start)
             j = fs.find(end, i) if i >= 0 else -1
             snip = fs[i + (len(start) if var == "SID" else 0):j] if 0 <= i < j else ""
-            sc = ("%s\nok() { echo OK; }\nno() { echo \"NO $*\"; }\nnode_get() { echo CALLED; }\nsleep() { :; }\n"
+            # set -u as in federate.sh: a snippet that reads an unset flag is red here, not only in production.
+            sc = ("set -u\n%s\nok() { echo OK; }\nno() { echo \"NO $*\"; }\nnode_get() { echo CALLED; }\nsleep() { :; }\n"
                   "scode=201\nsjson='{}'\n%s='x;touch %s'\n%s\necho \"after=[$%s]\"\n" % (plain_id_def(fs), var, marker, snip, var))
             r = run_bash(sc, d)
             probe("F2 verify reports a non-plain %s as a refused id, once, and never reads it back" % var,
                   0 <= i < j and "not a plain id" in r.stdout and r.stdout.count("NO ") == 1 and "OK" not in r.stdout
                   and "CALLED" not in r.stdout and "after=[]" in r.stdout and not marker.exists(), r.stdout.strip()[:80])
+        # A failed signed write that returns no id: exactly one failure line naming the code, run under
+        # set -u. srefused is read on this path only, so a dropped srefused="" is an unbound variable here.
+        i = fs.find('      SID=$(echo "$sjson" | jq -r \'.id // empty\' 2>/dev/null)\n')
+        j = fs.find('      if [ -n "$SID" ]; then\n        lvl=""', i) if i >= 0 else -1
+        snip = fs[i + len('      SID=$(echo "$sjson" | jq -r \'.id // empty\' 2>/dev/null)\n'):j] if 0 <= i < j else ""
+        sc = ("set -u\n%s\nok() { echo OK; }\nno() { echo \"NO $*\"; }\nnode_get() { echo CALLED; }\nsleep() { :; }\n"
+              "scode=500\nsjson='{}'\nSID=''\n%s\necho done\n" % (plain_id_def(fs) + "\n" + fs[fs.find("safe_excerpt() {"):fs.find("# node_get <idx0>")], snip))
+        r = run_bash(sc, d)
+        probe("#4957 a failed signed write with no id is one failure line, with srefused initialised under set -u",
+              0 <= i < j and r.returncode == 0 and "done" in r.stdout and r.stdout.count("NO ") == 1 and "'500'" in r.stdout
+              and "OK" not in r.stdout and "unbound" not in r.stderr, (r.stdout + r.stderr).strip()[:100])
 
 
 def f2_id_lists_agree():
