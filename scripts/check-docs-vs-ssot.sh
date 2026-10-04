@@ -678,10 +678,12 @@ for path in files:
             # trailing word or two, never more than one window) does not eat
             # the window of the value it introduces.
             idents = list(re.finditer(IDENT, prev))
+            # An issue ref (#2555) or a release triple (v1.0.0) in the tail is a
+            # GAP token, not a value, so only a ladder NUM disqualifies the tail.
             # A tail that already carries a number is a claim of its own (flagged
             # on that line), not a subject waiting for a value.
             if idents and len(prev) - idents[-1].end() <= SUBJECT_WINDOW \
-                    and not re.search(r'[0-9]', prev[idents[-1].end():]):
+                    and not re.search(NUM, prev[idents[-1].end():]):
                 stub = idents[-1].group(0) + ' '
                 for m in SWEEP[0].finditer(stub + probe):
                     if m.start() == 0 and m.start(1) >= len(stub) \
@@ -2724,6 +2726,10 @@ the value is read from `CURRENT_SCHEMA_VERSION` in
 `src/storage/migrations.rs`); an older DB is brought up to v52
 the value is read from `CURRENT_SCHEMA_VERSION` in
 `src/storage/migrations.rs`); an older DB is brought up to v53
+probe: `CURRENT_SCHEMA_VERSION` (#2555) at v1.0.0 is
+v52 on this build.
+probe: `CURRENT_SCHEMA_VERSION` (#2555) at v1.0.0 is
+v53 on this build.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2764,7 +2770,8 @@ R4HTML
         'docs/schema-fixture.html:11 claims "52"' \
         'docs/schema-fixture.html:13 claims "52"' \
         'docs/schema-fixture.html:16 claims "52"' \
-        'docs/postgres-age-guide.md:21 claims "52"'
+        'docs/postgres-age-guide.md:21 claims "52"' \
+        'docs/postgres-age-guide.md:25 claims "52"'
     do grep -qF "$_want" <<<"$r4_out" || { echo "FAIL: self-test #3248 r4 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
     for _not in \
         'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:4 ' \
@@ -2776,7 +2783,8 @@ R4HTML
         'docs/schema-fixture.html:6 ' 'docs/schema-fixture.html:8 ' \
         'docs/schema-fixture.html:10 ' 'docs/schema-fixture.html:12 ' 'docs/schema-fixture.html:14 ' \
         'docs/schema-fixture.html:15 ' 'docs/schema-fixture.html:17 ' 'docs/schema-fixture.html:18 ' \
-        'docs/postgres-age-guide.md:20 ' 'docs/postgres-age-guide.md:22 ' 'docs/postgres-age-guide.md:23 '
+        'docs/postgres-age-guide.md:20 ' 'docs/postgres-age-guide.md:22 ' 'docs/postgres-age-guide.md:23 ' \
+        'docs/postgres-age-guide.md:27 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
