@@ -2360,6 +2360,67 @@ def nameref_facts(texts: list):
     return names | refs, poisoned
 
 
+def word_end(text: str, i: int) -> int:
+    """Index just past the shell word that starts at text[i] (quotes, backslashes,
+    backticks and $( ) / array parentheses kept inside the word)."""
+    q, depth = None, 0
+    while i < len(text):
+        c = text[i]
+        if q is not None:
+            if c == "\\" and q != "'":
+                i += 1
+            elif c == q:
+                q = None
+        elif c == "\\":
+            i += 1
+        elif c in "'\"`":
+            q = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and (c.isspace() or c in ";&|<>"):
+            break
+        i += 1
+    return i
+
+
+ASSIGN_NAME_RE = re.compile(r"(?<![\w$])([A-Za-z_]\w*)(?:\[[^]]*\])?\+?=")
+
+
+def split_names(texts: list):
+    """(names, poisoned): the names whose assigned value an unquoted expansion splits
+    into more than one word (#5327). The gate reads one value as one operand, so such a
+    name is not resolved: "/usr/bin/env <binary>" or "-c 0 <glob>" is a wrapper and a
+    binary, or a glob, once split. The split characters are blank, tab and newline plus
+    every character of a literal IFS value the template assigns; an IFS value the gate
+    cannot read (other than restoring a name that only ever holds $IFS) poisons every
+    non-empty value (fail closed, #4869)."""
+    words = []
+    for text in texts:
+        for m in ASSIGN_NAME_RE.finditer(text):
+            words.append((m.group(1), text[m.end():word_end(text, m.end())]))
+    seps, poisoned = set(" \t\n"), False
+    for name, word in words:
+        if name != "IFS":
+            continue
+        if expanded(word):
+            saved = re.fullmatch(r"\$\{?([A-Za-z_]\w*)\}?", unquote(word)[0])
+            held = [w for n, w in words if saved and n == saved.group(1)]
+            if not (held and all(re.fullmatch(r"\$\{?IFS\}?", unquote(w)[0]) for w in held)):
+                poisoned = True
+        else:
+            seps |= set(unquote(word)[0])
+    out = set()
+    for name, word in words:
+        val = re.sub(r"\$\([^()]*\)|`[^`]*`", "", unquote(word)[0])
+        if name != "IFS" and (any(c in seps for c in val) or (poisoned and val)):
+            out.add(name)
+    return out, poisoned
+
+
 def var_values(stmts: list) -> dict:
     """NAME -> every literal text the template assigns it (assignment, export, local,
     declare, for-loop word), for names never read from input (#5095)."""
@@ -2383,6 +2444,7 @@ def var_values(stmts: list) -> dict:
     refs, poisoned = nameref_facts([tf_render(stmt) for _w, stmt, _st in stmts])
     if poisoned:
         return {}
+    unknown |= split_names([tf_render(stmt) for _w, stmt, _st in stmts])[0]
     return {k: v for k, v in vals.items() if k not in unknown and k not in refs}
 
 
@@ -2477,7 +2539,7 @@ def binary_vars(stmts: list) -> frozenset:
     # is a positional parameter or a resolved name
     names = {a[0] for a in assigns}
     refs, poisoned = nameref_facts([tf_render(stmt) for _w, stmt, _st in stmts])
-    unknown |= refs
+    unknown |= refs | split_names([tf_render(stmt) for _w, stmt, _st in stmts])[0]
     if poisoned:
         names = set()
     resolved = set()
@@ -2990,6 +3052,10 @@ def build_probes() -> list:
         ('nameref declared with an escaped -n in a function behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      f() { local \\-n R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats; }; f\n' + dec)]),
         ('nameref declared by an expanded option behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      F=n; declare -$F R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
         ('second name of a declare -n written behind taskset, listed (#4837 R12 R4, #5324)', [(dec, '      B=/usr/bin/true; declare -n R=A S; S=B; S=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$B" --db /x stats\n' + dec)]),
+        ('wrapper and ai-memory in one blank-split value behind taskset, listed (#4837 R12 R4, #5327)', [(dec, '      A="/usr/bin/env /usr/local/lib/ai-memory/bin/ai-memory"; taskset -c 0 $A --db /x stats\n' + dec)]),
+        ('glob after a blank in one value behind taskset, listed (#4837 R12 R4, #5327)', [(dec, '      C="-c 0 /usr/local/lib/ai-memory/bin/ai-mem*"; taskset $C --db /x stats\n' + dec)]),
+        ('value split by a literal IFS character behind taskset, listed (#4837 R12 R4, #5327)', [(dec, '      IFS=:; A=/usr/bin/true:/x; taskset -c 0 $A --db /x stats\n' + dec)]),
+        ('IFS set to a value the gate cannot read, then a value behind taskset, listed (#4837 R12 R4, #5327)', [(dec, '      IFS=$(printf :); A=/usr/bin/true:/x; taskset -c 0 $A --db /x stats\n' + dec)]),
         ('ai-memory through a variable behind taskset, listed (#4837 R12 R4)', [(dec, '      AIM=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$${AIM}" --db $${X} stats\n' + dec)]),
         ('shell run by an unknown wrapper, listed (#4837 R12 R4)', [(dec, "      taskset -c 0 sh -c '/usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats'\n" + dec)]),
         ('ai-memory copied to another name with cp, listed (#4837 R12 R4)', [(dec, '      cp /usr/local/lib/ai-memory/bin/ai-memory /usr/local/bin/aim\n' + dec)]),
@@ -3116,6 +3182,7 @@ def build_probes() -> list:
     green("data heredoc into a data home through a constant (#4837 R12 R5)", [(RELOAD, RELOAD + "      CFG=/etc/ai-memory/h\n      cat > \"$${CFG}/x.conf\" <<'EOF'\n      ${X} = 1\n      EOF\n")], autolist=True)
     green("negated subshell with a blank after ! is not an extended glob (#5325)", [(RELOAD, RELOAD + "      if ! (true); then :; fi\n      ! (false) || true\n")], autolist=True)
     green("literal variable names with expanded values only (#5326)", [(RELOAD, RELOAD + '      export PATH="$${PATH}:/opt/x"; declare -x LANG=C; printf -v OUT %s "$${X}"; env LC_ALL=C true\n')], autolist=True)
+    green("IFS restored from a name that only holds $IFS, then a resolved operand (#5327)", [(RELOAD, RELOAD + '      O=$IFS; IFS=:; IFS=$O; A=/usr/bin/true; taskset -c 0 "$A" --db /x stats\n')], autolist=True)
     green("C5 provision comment mentioning curl", [ins(RELOAD, ["# curl -fsSL https://e | sh"], before=True)])
     green("C5 unit comment naming ExecStart", [(ENVF, ENVF + "      # ExecStart=/bin/evil\n")])
     green("C5 YAML comment", [(RUNCMD, "  # curl https://e | sh\n" + RUNCMD)])
