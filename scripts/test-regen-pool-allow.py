@@ -12,7 +12,9 @@ original reason is kept, also for the entry after it, and an entry is never re-b
 another file), a repeated unit gets one entry per occurrence, a reasons-file reason made only
 of {unit} is refused, and the unread-file skip list takes --skip-reason only: --reason never
 excuses a skipped file, a short --skip-reason is refused and a text-named file in the skip
-list leaves the gate red (#5208, #5209, #5206, #5210).
+list leaves the gate red (#5208, #5209, #5206, #5210). --set-reason re-writes the reason of
+the selected entries only, keeps the others' reason, and is refused when the reason is short,
+when nothing is selected, or when other changes are pending (#5091).
 
 Each case builds a small tree in scratch (TMPDIR, else <repo>/.local-runs) holding a copy of the
 repository's gate, runs the repository's regen tool against it, and checks the exit codes and
@@ -192,6 +194,33 @@ def c_skip_short(t: Tree) -> bool:
             and not (t.root / UNREAD).exists())
 
 
+FIXED = "the line describes the claim gate itself and names detection vocabulary, not a setting"
+
+
+def c_set_reason(t: Tree) -> bool:
+    if t.regen("--accept-new", "--reason", GOOD) != 0 or t.gate() != 0:
+        return False
+    if t.regen("--set-reason", FIXED, "--match", "another file") != 0 or t.gate() != 0:
+        return False
+    lines = t.read(ALLOW).splitlines()
+    rows = [i for i, line in enumerate(lines) if line.startswith("docs/a.md")]
+    # only the selected (first) entry changes reason; the second keeps GOOD; nothing is reordered
+    return (len(rows) == 2 and lines[rows[0] - 1] == "# " + FIXED and lines[rows[1] - 1] == "# " + GOOD
+            and "another file" in lines[rows[0]] and lines.count("# " + GOOD) == 1)
+
+
+def c_set_reason_refused(t: Tree) -> bool:
+    if t.regen("--accept-new", "--reason", GOOD) != 0:
+        return False
+    before = t.read(ALLOW)
+    short = t.regen("--set-reason", "ok fine", "--match", "another file")
+    unselected = t.regen("--set-reason", FIXED)
+    nothing = t.regen("--set-reason", FIXED, "--match", "no such text")
+    t.write("docs/a.md", TWO.replace("Filler A.", "Filler A changed."))
+    pending = t.regen("--set-reason", FIXED, "--match", "another file")
+    return (short, unselected, nothing, pending) == (2, 2, 2, 2) and t.read(ALLOW) == before
+
+
 def c_rules_reason(t: Tree) -> bool:
     rf = t.rules([{"file": "docs/a.md", "match": "for operators", "reason": "ok fine"}])
     return t.regen("--accept-new", "--reasons-file", rf) == 2 and t.read(ALLOW) == ""
@@ -228,6 +257,8 @@ CASES: List[Tuple[str, Dict[str, Body], Callable[[Tree], bool]]] = [
     ("a reasons-file reason made only of {unit} is refused", {"docs/a.md": DOC}, c_rules_unit_only),
     ("a refresh keeps the reason of the entry after it", {"docs/a.md": TWO}, c_refresh_keeps_next),
     ("a refresh inside a group keeps the group's reason", {"docs/a.md": TWO}, c_refresh_mid_group),
+    ("--set-reason re-writes only the selected entry's reason", {"docs/a.md": TWO}, c_set_reason),
+    ("--set-reason is refused when short, unselected or with changes pending", {"docs/a.md": TWO}, c_set_reason_refused),
     ("--refresh-context never re-binds an entry onto another file", {"docs/a.md": DOC}, c_refresh_other_file),
 ]
 
@@ -245,10 +276,10 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("skip list writes its reason", '                "# " + (reason or gate.PLACEHOLDER', '                "# " + ("" or gate.PLACEHOLDER'),
     ("skip list takes --skip-reason only", "write_unread(gate, root, listed, stale_unread, new_unread, skip_reason)",
      "write_unread(gate, root, listed, stale_unread, new_unread, skip_reason or reason)"),
-    ("--reason checked", 'for flag, text in (("--reason", reason), ("--skip-reason", skip_reason)):',
-     'for flag, text in (("--skip-reason", skip_reason),):'),
-    ("--skip-reason checked", 'for flag, text in (("--reason", reason), ("--skip-reason", skip_reason)):',
-     'for flag, text in (("--reason", reason),):'),
+    ("--reason checked", 'for flag, text in (("--reason", reason), ("--skip-reason", skip_reason),',
+     'for flag, text in (("--skip-reason", skip_reason),'),
+    ("--skip-reason checked", '("--reason", reason), ("--skip-reason", skip_reason), ("--set-reason"',
+     '("--reason", reason), ("--set-reason"'),
     ("reasons-file reason checked", "problem = gate.reason_problem(written) or gate.reason_problem(text)", "problem = None"),
     ("reasons-file {unit} not a reason", "problem = gate.reason_problem(written) or gate.reason_problem(text)",
      "problem = gate.reason_problem(text)"),
@@ -256,6 +287,14 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("refresh writes its record",
      '                out.append("# context re-read on %s: %s" % (datetime.date.today().isoformat(), reason))\n', ""),
     ("refresh keeps the next reason", '                out.append("# " + restore)  # the entries after', '                pass  # the entries after'),
+    ("set-reason checked", '("--skip-reason", skip_reason), ("--set-reason", set_reason)):',
+     '("--skip-reason", skip_reason)):'),
+    ("set-reason needs a selection", "        if not (a.only or a.match):\n            print(\"regen: FAULT: --set-reason needs",
+     "        if False:\n            print(\"regen: FAULT: --set-reason needs"),
+    ("set-reason needs a matching tree", "        if stale or new or (set(unreadable) != set(listed)):", "        if False:"),
+    ("set-reason keeps the others' reason", "                    out += [\"# \" + text] if mark else old", "                    out += [\"# \" + text] if mark else []"),
+    ("set-reason writes the reason", "                    out += (head + [\"# \" + text]) if mark else comments",
+     "                    out += comments if mark else comments"),
     ("refresh keeps the group reason", '                    out.append("# " + current)  # a re-bound entry', '                    pass  # a re-bound entry'),
     ("refresh stays in its file", "            spare.setdefault(key[:2], []).append(key[2])", "            spare.setdefault(key[1:2], []).append(key[2])"),
     ("new entries carry ctx", '            out += ["%s%s%s | ctx:%s" % (rel, gate.SEPARATOR, text, ctx)] * n',

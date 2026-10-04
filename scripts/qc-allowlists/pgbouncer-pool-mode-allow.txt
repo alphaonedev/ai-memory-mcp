@@ -321,7 +321,7 @@ tests/pg_parity_batch_2.rs | /// independent pool statements, so under read comm
 docs/v1.0.0/perfect-endpoint-assessment/waves/w5-a1-scale-backends.md | │ postgres + pgvector + age · sqlx pool · pgbouncer (session) │ | ctx:12bbcb24c8fa
 
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
-# Fragment 4667 prose: the unit names transaction or statement pooling only as the withdrawn setting that the probe rejects, and its neighbour in the same paragraph describes the probe or the shipped session template; no line recommends the retired mode. Unit begins: (ci job pgbouncer pool-mode claim gate (#4667), not yet a required context) (plurals, tx/x
+# Fragment 4667 prose about the claim gate itself: the unit joins the CI job name with the list of spellings the gate detects (plurals, tx/xact, session next to a pool word, a bare mode = key); it names detection vocabulary, not a mode to configure, and no line recommends the retired mode (#5091 class, round-5 code review).
 changelog.d/4667.fixed.md | (ci job pgbouncer pool-mode claim gate (#4667), not yet a required context) (plurals, tx/xact, session next to a pool word, a bare mode = key) must | ctx:d1270d610724
 
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:

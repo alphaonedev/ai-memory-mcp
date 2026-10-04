@@ -21,6 +21,9 @@ The allowlist is a review surface, so this tool never changes it silently:
     not the placeholder); without --reason it is the placeholder, which the gate
     rejects with rc 2, so this tool cannot turn a red line green on its own
     (#4961). Replace the placeholder with a real reason per entry group.
+  * the reason of listed entries is re-written only with --set-reason TEXT and
+    --only/--match selecting them, on an allowlist that otherwise matches the
+    tree; other entries that shared the old reason keep it (#5091);
   * an unreadable file is added to pgbouncer-pool-mode-unread.txt only under
     --skip-reason, a reason of its own; --reason never excuses a skipped file,
     and the gate refuses a skip entry whose name is a text type.
@@ -35,6 +38,7 @@ Usage:
         [--accept-new [--reason TEXT | --reasons-file JSON] [--skip-reason TEXT]
                       [--only FILE] [--match TEXT]]
         [--refresh-context --reason TEXT] [--drop-stale]
+        [--set-reason TEXT (--only FILE | --match TEXT)]
 """
 import argparse
 import datetime
@@ -74,6 +78,54 @@ def write_unread(gate, root, listed, stale_unread, new_unread, reason):
     tmp.replace(path)
 
 
+def entry_key(gate, line):
+    """The (file, text, ctx) key of an allowlist entry line, as the gate loads it."""
+    found = gate.CTX.search(line)
+    body = line[:found.start()] if found else line
+    return tuple(body.split(gate.SEPARATOR, 1)) + (found.group(1) if found else "",)
+
+
+def set_reasons(gate, raw, picked, text):
+    """Rewrite the reason of every picked entry to TEXT, keeping order and every other entry's reason.
+
+    An entry's reason is the comment block directly above its run of entries. Within each such
+    group, a run of picked entries is written under "# TEXT" and a run of the others under their
+    old reason, so only the picked entries change reason; regen header lines are kept."""
+    out, changed = [], 0
+    lines = raw.splitlines()
+    i = 0
+    while i < len(lines):
+        if not lines[i].strip() or not (lines[i].lstrip().startswith("#") or gate.SEPARATOR in lines[i]):
+            out.append(lines[i])
+            i += 1
+            continue
+        comments = []
+        while i < len(lines) and lines[i].strip() and lines[i].lstrip().startswith("#"):
+            comments.append(lines[i])
+            i += 1
+        entries = []
+        while i < len(lines) and lines[i].strip() and not lines[i].lstrip().startswith("#") and gate.SEPARATOR in lines[i]:
+            entries.append(lines[i])
+            i += 1
+        marks = [entry_key(gate, line) in picked for line in entries]
+        if not any(marks):
+            out += comments + entries
+            continue
+        old = [c for c in comments if not c.lstrip().lstrip("#").strip().startswith(gate.REGEN_HEADER)]
+        head = [c for c in comments if c not in old]
+        last = None
+        for line, mark in zip(entries, marks):
+            if mark != last:
+                if last is None:
+                    out += (head + ["# " + text]) if mark else comments
+                else:
+                    out += ["# " + text] if mark else old
+                last = mark
+            out.append(line)
+            changed += 1 if mark else 0
+    return out, changed
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--root", default=str(HERE.parent))
@@ -84,8 +136,13 @@ def main(argv):
                     help="re-bind an entry whose text is still in the tree but whose neighbourhood changed (or that has no "
                          "fingerprint yet) to the new fingerprint; needs --reason, written above each re-bound entry as a dated record; "
                          "every refresh is printed and must be re-read")
-    ap.add_argument("--only", default="", metavar="FILE", help="with --accept-new: add only units of this file")
-    ap.add_argument("--match", default="", metavar="TEXT", help="with --accept-new: add only units whose text contains TEXT (so each unit can get its own reason)")
+    ap.add_argument("--only", default="", metavar="FILE", help="with --accept-new: add only units of this file; "
+                    "with --set-reason: select only entries of this file")
+    ap.add_argument("--match", default="", metavar="TEXT", help="with --accept-new: add only units whose text contains TEXT "
+                    "(so each unit can get its own reason); with --set-reason: select only entries whose text contains TEXT")
+    ap.add_argument("--set-reason", default="", metavar="TEXT",
+                    help="re-write the reason of the listed entries --only/--match select (printed); the allowlist must "
+                         "otherwise match the tree; entries that shared the old reason keep it")
     ap.add_argument("--reasons-file", default="", metavar="JSON",
                     help="with --accept-new: JSON list of {file, match, reason}; each unlisted unit takes the first rule whose file "
                          "equals the unit's file and whose match is a substring of its text; {unit} in a reason becomes the "
@@ -99,7 +156,8 @@ def main(argv):
     gate = load_gate(root)
     reason = " ".join(a.reason.split())
     skip_reason = " ".join(a.skip_reason.split())
-    for flag, text in (("--reason", reason), ("--skip-reason", skip_reason)):
+    set_reason = " ".join(a.set_reason.split())
+    for flag, text in (("--reason", reason), ("--skip-reason", skip_reason), ("--set-reason", set_reason)):
         problem = gate.reason_problem(text) if text else None
         if problem:
             print("regen: FAULT: %s is not a reason: %s" % (flag, problem), file=sys.stderr)
@@ -142,6 +200,29 @@ def main(argv):
                 refresh.append((key, spare[key[:2]].pop(0)))
         stale = stale - Counter(old for old, _ in refresh)
         new = new - Counter((old[0], old[1], c) for old, c in refresh)
+    if a.set_reason:
+        # #5091: a false reason is corrected through this tool, never by hand
+        if a.check or a.accept_new or a.drop_stale or a.refresh_context or a.reasons_file or a.reason or a.skip_reason:
+            print("regen: FAULT: --set-reason runs alone (with --only/--match)", file=sys.stderr)
+            return 2
+        if not (a.only or a.match):
+            print("regen: FAULT: --set-reason needs --only FILE or --match TEXT to select the entries", file=sys.stderr)
+            return 2
+        if stale or new or (set(unreadable) != set(listed)):
+            print("regen: FAULT: --set-reason needs an allowlist that matches the tree; run --check first", file=sys.stderr)
+            return 2
+        picked = {k for k in have if (not a.only or k[0] == a.only) and a.match in k[1]}
+        if not picked:
+            print("regen: FAULT: --only/--match select no listed entry", file=sys.stderr)
+            return 2
+        out, changed = set_reasons(gate, raw, picked, set_reason)
+        for rel, text, ctx in sorted(picked):
+            print("REASON: %s | %s | ctx:%s (re-read the new reason)" % (rel, text[:160], ctx))
+        tmp = allow_path.with_name(allow_path.name + ".regen")
+        tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+        tmp.replace(allow_path)
+        print("regen: re-wrote the reason of %d entries; review the diff" % changed)
+        return 0
     if a.only or a.match:
         picked = Counter({k: n for k, n in new.items() if (not a.only or k[0] == a.only) and a.match in k[1]})
         if not picked:
