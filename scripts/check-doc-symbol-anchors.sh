@@ -267,6 +267,12 @@ MDEOF
     anchor_green 4716 "a full-file range (:1-4)" 'See `src/mcp/tools/recall.rs:1-4`.'
     anchor_green 4716 "a one-line range (:4-4)" 'See `src/mcp/tools/recall.rs:4-4`.'
 
+    # #5188: an en dash or em dash range separator is a range too.
+    anchor_red 5188 LINE "an en-dash range whose end passes end-of-file" 'See `src/mcp/tools/recall.rs:2–9999`.'
+    anchor_red 5188 LINE "an em-dash range whose end passes end-of-file" 'See `src/mcp/tools/recall.rs:2—9999`.'
+    anchor_red 5188 LINE "a reversed en-dash range (:3-2)" 'See `src/mcp/tools/recall.rs:3–2`.'
+    anchor_green 5188 "a valid en-dash range (:2-4)" 'See `src/mcp/tools/recall.rs:2–4`.'
+
     # #5194: a src token preceded by a dot is left alone (its root is
     # unknown); the CANON lookbehind must keep the dot.
     anchor_green 5194 "an ellipsis-prefixed escape token (.../src/../x.rs)" \
@@ -570,7 +576,9 @@ def canon(line):
 
 
 PATH = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs)`")
-PATHLN = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs):(\d+)(?:-(\d+))?")
+# #5188: the range separator may also be an en dash (U+2013) or em dash
+# (U+2014), which smart-quote editors and pasted prose produce.
+PATHLN = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs):(\d+)(?:[-\u2013\u2014](\d+))?")
 # #4651: a BARE `src/x.rs:N` (no leading backtick: plain prose, a link
 # label, HTML text). Not preceded by a backtick (PATHLN owns that form),
 # a path separator, a dot or an alphanumeric, so URL path segments are
