@@ -772,6 +772,20 @@ PLANTED: List[Tuple[str, str, str]] = [
      "PgBouncer pool_mode = session is the default.\nIt fronts the primary.\nIt listens on 6432.\nFor fan-in, change it to transaction instead.\n"),
     ("R5 mode word exactly PARAGRAPH_MAX lines from a mention (#4950)", "docs/x.md",
      "pool_mode = session\n" + "listen_port = 6432\n" * 7 + "For fan-in, change it to transaction instead.\n"),
+    # round 4 code review (#5089): pins for the reviewer mutants that survived (shapes, products, entities, file classes)
+    ("closed vocabulary does not admit 'not'", "infra/x/pgb.ini", "pool_mode = session ; not supported\n"),
+    ("closed vocabulary does not admit 'unsafe'", "infra/x/pgb.ini", "pool_mode = session ; unsafe\n"),
+    ("a word before an approved line is not a prefix", "docs/a.md", "Avoid: pool_mode = session\n"),
+    ("a heading two lines above an approved line", "docs/a.md", "## Never set this\n\npool_mode = session\n"),
+    ("odyssey far before the mode word", "docs/a.md", "Odyssey sits in front of each module backbone for admission control; switch it to transaction.\n"),
+    ("supavisor far before the mode word", "docs/a.md", "Supavisor sits in front of each module backbone for admission control; switch it to transaction.\n"),
+    ("pgcat far before the mode word", "docs/a.md", "PgCat sits in front of each module backbone for admission control; switch it to transaction.\n"),
+    ("pooler far before the mode word", "docs/a.md", "A pooler sits in front of each module backbone for admission control; switch it to transaction.\n"),
+    ("html entity inside the mode word", "docs/a.html", "<p>PgBouncer &#116;ransaction mode</p>\n"),
+    ("shell script", "deploy/run.sh", "export PGBOUNCER_POOL_MODE=transaction\n"),
+    ("toml file", "deploy/pgcat.toml", "pool_mode = \"transaction\"\n"),
+    ("rust comment", "src/a.rs", "// run pgbouncer with pool_mode = transaction\n"),
+    ("Dockerfile", "deploy/Dockerfile", "ENV PGBOUNCER_POOL_MODE=transaction\n"),
 ]
 
 # Green probes: one per approved shape, plus neutral context and path tokens.
@@ -890,6 +904,9 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
          tree(retired, "# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:\n" + retired_entry), EXIT_FAULT),
         ("a reason shorter than a sentence fails", tree(retired, "# ok\n" + retired_entry), EXIT_FAULT),
         ("a blank line ends a reason", tree(retired, REASON + "\n" + retired_entry), EXIT_FAULT),
+        ("a five-word reason fails even when it is long",
+         tree(retired, "# reviewed, retirement statement only here\n" + retired_entry), EXIT_FAULT),
+        ("a six-word reason under thirty characters fails", tree(retired, "# a b c d e f g\n" + retired_entry), EXIT_FAULT),
         ("a filler reason (lorem) fails", tree(retired, "# lorem ipsum dolor sit amet consectetur\n" + retired_entry), EXIT_FAULT),
         ("a filler reason (todo x8) fails", tree(retired, "# todo todo todo todo todo todo todo todo\n" + retired_entry), EXIT_FAULT),
         ("a five-word reason under the sentence floor fails", tree(retired, "# retired mode kept for history\n" + retired_entry), EXIT_FAULT),
@@ -1001,6 +1018,9 @@ def run_cases(verbose: bool) -> int:
 # the case set against each mutated copy (in scratch, never in place) and needs at
 # least one case to fail; a mutant that survives, or whose text is absent from this
 # file, fails the self-test.
+SKIP = "        if Path(rel) in (ALLOW_REL, SELF_REL, " + "UNREAD_REL):"  # split so the mutated text is found once in the rules
+
+
 MUTANTS: List[Tuple[str, str, str]] = [
     ("R1 name rule", 'MENTION_NAME = re.compile(POOL_MODE + r"s?")', 'MENTION_NAME = re.compile(r"(?!)")'),
     ("R1 pooling spelling", 'POOL_MODE = r"pool(?:ing)?[\\s_-]*mode"', 'POOL_MODE = r"pool[\\s_-]*mode"'),
@@ -1047,6 +1067,25 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("allowlist reason length", "    if len(words) < MIN_REASON_WORDS or len(reason) < MIN_REASON_CHARS:", "    if not words:"),
     ("R7 context fingerprint", '    return hashlib.sha256("\\n".join(lines[j] for j in near).encode("utf-8")).hexdigest()[:12]', '    return "0" * 12'),
     ("allowlist per-occurrence budget", "            budget[(rel, text, ctx)] -= 1\n", ""),
+    ("round-4 W3 vocabulary gains not", '_VOCAB = r"(?:supported|', '_VOCAB = r"(?:not|supported|'),
+    ("round-4 W4 vocabulary gains unsafe", '_VOCAB = r"(?:supported|', '_VOCAB = r"(?:unsafe|supported|'),
+    ("round-4 W5 approved by search", "    return any(shape.match(text) for _, shape in APPROVED_SHAPES)",
+     "    return any(shape.search(text.split(' ', 1)[-1]) or shape.match(text) for _, shape in APPROVED_SHAPES)"),
+    ("round-4 W7 markdown heading is neutral", "    FENCE,                                                                  # code fence",
+     '    FENCE, re.compile(r"^#+ .*$"),'),
+    ("round-4 D4 drop supavisor from _PRODUCT", '_PRODUCT = r"(?:pgbouncer|pooler|odyssey|supavisor|pgcat)"', '_PRODUCT = r"(?:pgbouncer|pooler|odyssey|pgcat)"'),
+    ("round-4 D5 drop pgcat from _PRODUCT", '_PRODUCT = r"(?:pgbouncer|pooler|odyssey|supavisor|pgcat)"', '_PRODUCT = r"(?:pgbouncer|pooler|odyssey|supavisor)"'),
+    ("round-4 D6 drop pooler from _PRODUCT", '_PRODUCT = r"(?:pgbouncer|pooler|', '_PRODUCT = r"(?:pgbouncer|'),
+    ("round-4 D3b drop odyssey from _PRODUCT", '_PRODUCT = r"(?:pgbouncer|pooler|odyssey|', '_PRODUCT = r"(?:pgbouncer|pooler|'),
+    ("round-4 D8 drop html unescape", '.sub("", html.unescape(line))', '.sub("", line)'),
+    ("round-4 E5 word floor 2", "MIN_REASON_WORDS, MIN_REASON_CHARS = 6, 30", "MIN_REASON_WORDS, MIN_REASON_CHARS = 2, 3"),
+    ("round-4 S3 skip .sh", SKIP, SKIP[:-1] + " or rel.endswith('.sh'):"),
+    ("round-4 S4 skip .toml", SKIP, SKIP[:-1] + " or rel.endswith('.toml'):"),
+    ("round-4 S5 skip .rs", SKIP, SKIP[:-1] + " or rel.endswith('.rs'):"),
+    ("round-4 S7 skip Dockerfile", SKIP, SKIP[:-1] + " or 'Dockerfile' in rel:"),
+    ("round-4 S1 skip .html", SKIP, SKIP[:-1] + " or rel.endswith('.html'):"),
+    ("round-4 S2 skip .ini", SKIP, SKIP[:-1] + " or rel.endswith('.ini'):"),
+    ("round-4 S9 skip deploy/", SKIP, SKIP[:-1] + " or rel.startswith('deploy/'):"),
     ("guide pin", "    if not guide_ok:\n", "    if False:\n"),
 ]
 
