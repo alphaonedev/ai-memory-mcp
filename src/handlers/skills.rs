@@ -411,9 +411,12 @@ pub async fn skill_promote_route(
     }
 }
 
-/// #4622 - HTTP status for a failed skill-promote.
+/// #4622 - HTTP status for a failed skill-promote: 404 only when the chain
+/// carries the typed `ReflectionNotFound` root, never by matching error text.
 fn promote_error_status(e: &anyhow::Error) -> StatusCode {
-    if e.to_string().contains("not found") {
+    if e.downcast_ref::<crate::errors::ReflectionNotFound>()
+        .is_some()
+    {
         StatusCode::NOT_FOUND
     } else {
         StatusCode::BAD_REQUEST
@@ -592,7 +595,7 @@ pub async fn skill_delete_route(
 mod promote_status_4622_tests {
     use super::promote_error_status;
     use crate::errors::{MemoryError, ReflectionNotFound};
-    use crate::models::{Memory, MemoryKind, MemoryLink, MemoryLinkRelation, Tier};
+    use crate::models::{Memory, MemoryKind, Tier};
     use axum::http::StatusCode;
     use serde_json::json;
 
@@ -644,8 +647,16 @@ mod promote_status_4622_tests {
         let err = promote(&conn, "absent-id", "good-name").expect_err("missing reflection");
         assert_eq!(err.to_string(), "reflection not found: absent-id");
         assert_eq!(format!("{err:#}"), "reflection not found: absent-id");
-        let mapped = MemoryError::from(err);
+        // The pre-fix construction, kept here as the byte-for-byte reference.
+        let legacy = || crate::errors::refusal("reflection not found: absent-id");
+        let legacy_code = MemoryError::from(legacy()).code();
+        let legacy_wire = crate::mcp::error_text::mcp_foreign_err("legacy", legacy());
+        let wire = crate::mcp::error_text::mcp_foreign_err("now", err);
+        assert_eq!(wire, legacy_wire, "MCP wire text is byte-identical");
+        let again = promote(&conn, "absent-id", "good-name").expect_err("again");
+        let mapped = MemoryError::from(again);
         assert_eq!(mapped.code(), "REFUSED");
+        assert_eq!(mapped.code(), legacy_code);
         assert_eq!(mapped.message(), "reflection not found: absent-id");
     }
 
@@ -675,20 +686,16 @@ mod promote_status_4622_tests {
         let id = seed(&conn, "r", MemoryKind::Reflection);
         conn.pragma_update(None, "foreign_keys", false)
             .expect("foreign keys off");
-        let link = MemoryLink {
-            source_id: id.clone(),
-            target_id: uuid::Uuid::new_v4().to_string(),
-            relation: MemoryLinkRelation::ReflectsOn,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            signature: None,
-            observed_by: Some(CALLER.to_string()),
-            valid_from: None,
-            valid_until: None,
-            attest_level: None,
-            source_cid: None,
-            target_cid: None,
-        };
-        crate::db::create_link_inbound(&conn, &link, "unsigned").expect("dangling edge");
+        conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at) \
+             VALUES (?1, ?2, 'reflects_on', ?3)",
+            rusqlite::params![
+                id,
+                uuid::Uuid::new_v4().to_string(),
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .expect("dangling source edge");
         let err = promote(&conn, &id, "good-name").expect_err("missing source");
         assert_eq!(err.to_string(), format!("reflection not found: {id}"));
         assert_eq!(promote_error_status(&err), StatusCode::NOT_FOUND);

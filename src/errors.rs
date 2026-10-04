@@ -1090,6 +1090,12 @@ impl From<anyhow::Error> for MemoryError {
                 OwnText::InvalidInput(m) => Self::ValidationFailed(m.clone()),
             };
         }
+        // #4622 - a hidden or missing reflection / source member is our own
+        // typed root. It stays a refusal (JSON-RPC `REFUSED`, text unchanged)
+        // so the wire code does not move; the HTTP route reads the type.
+        if let Some(rnf) = e.downcast_ref::<ReflectionNotFound>() {
+            return Self::Refused(rnf.to_string());
+        }
         // #3713 — the optimistic-concurrency conflict (`memory_update`'s
         // `expected_version`) is our own typed root; keep its text.
         if let Some(vc) = e.downcast_ref::<crate::storage::VersionConflict>() {

@@ -1014,6 +1014,11 @@ pub async fn handle_export_reflection_http(
             if let Some(own) = e.downcast_ref::<crate::errors::OwnText>() {
                 return err_response(own.to_string());
             }
+            // #4622 - a hidden or missing member is the typed `ReflectionNotFound`
+            // root (same 400 text as before; the type is not an `OwnText`).
+            if let Some(rnf) = e.downcast_ref::<crate::errors::ReflectionNotFound>() {
+                return err_response(rnf.to_string());
+            }
             if let Some(crate::storage::StorageError::InvalidArgument { reason }) =
                 e.downcast_ref::<crate::storage::StorageError>()
             {
