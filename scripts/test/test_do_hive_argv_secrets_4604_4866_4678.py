@@ -720,6 +720,88 @@ def f2_node_get_id():
                       and SECRET not in r.stdout and SECRET not in r.stderr, r.stdout.strip()[:100])
 
 
+CHANNELS = ("on_node", "node_sh", "node_get", "node_post", "scp", "ssh", "curl", "lg_curl")
+# Functions whose job is to hand a node's stdout to their caller: inside them only stderr must be closed.
+CHANNEL_WRAPPERS = ("node_get", "node_post")
+# Function definitions that ARE a channel (their body is the ssh/curl call itself).
+CHANNEL_DEFS = re.compile(r"^\s*(on_node|node_sh|lg_curl)\(\) \{")
+
+
+def logical_lines(text):
+    """(first line number, joined text, enclosing function) per logical line, outside heredoc bodies and comments."""
+    out, buf, start, func, heredoc = [], "", 0, "", None
+    for n, raw in enumerate(text.splitlines(), 1):
+        if heredoc is not None:
+            if raw == heredoc:
+                heredoc = None
+            continue
+        if not buf and raw.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^(\w+)\(\) \{", raw)
+        if m:
+            func = m.group(1)
+        if not buf:
+            start = n
+        buf += raw[:-1] + " " if raw.endswith("\\") else raw
+        if raw.endswith("\\"):
+            continue
+        h = re.search(r"<<-?\s*'?(\w+)'?", buf)
+        if h:
+            heredoc = h.group(1)
+        out.append((start, buf, func))
+        if raw.startswith("}"):
+            func = ""
+        buf = ""
+    return out
+
+
+def strip_messages(line):
+    """Drop the text of die/echo/ok/no messages, which may name a command without running it."""
+    return re.sub(r'\b(?:die|echo|ok|no)\s+"(?:[^"\\$]|\\.|\$(?!\()|\$\((?:[^()]|\([^()]*\))*\))*"', "MSG", line)
+
+
+def node_stream_findings(text):
+    """#5171: every node-channel call closes stderr and captures or discards stdout (wrappers: stderr only)."""
+    bad = []
+    for n, line, func in logical_lines(text):
+        if CHANNEL_DEFS.match(line) or re.match(r"^\s*\w+\(\) \{\s*$", line):
+            continue
+        code = strip_messages(line)
+        for m in re.finditer(r"(?<![\w$/.-])(%s)(?![\w-])" % "|".join(CHANNELS), code):
+            before = code[:m.start()]
+            # A wrapper closes its own stderr (its body is checked like any other line).
+            err_ok = (m.group(1) in CHANNEL_WRAPPERS
+                      or re.search(r"2>\s*/dev/null|2>&1|&>\s*/dev/null", code) is not None)
+            out_ok = (before.count("$(") > before.count(")")
+                      or re.search(r"(?<![0-9&])>\s*/dev/null|>&9|-o /dev/null", code) is not None
+                      or func in CHANNEL_WRAPPERS)
+            if not (err_ok and out_ok):
+                bad.append("%d:%s:%s" % (n, m.group(1), "stderr" if not err_ok else "stdout"))
+    return bad
+
+
+def node_streams_5171():
+    """#5171: no node-channel call streams node output to the operator terminal."""
+    fs = FED.read_text()
+    bad = node_stream_findings(fs)
+    probe("#5171 every node-channel call in federate.sh closes stderr and captures or discards stdout", not bad, " ".join(bad[:12]))
+    seen = sum(1 for _, l, _ in logical_lines(fs) for _ in re.finditer(r"(?<![\w$/.-])(?:%s)(?![\w-])" % "|".join(CHANNELS), strip_messages(l)))
+    probe("#5171 the node-stream check sees the channel calls (not vacuous)", seen >= 30, str(seen))
+    probe("#5171 no node log is printed (the MESH READY timeout names the command instead)", not re.search(r"(?:on_node|node_sh|ssh)[^\n]*tail -30", fs.replace("echo \"[federate] node $n federation log: ssh", ""))
+          and "/var/log/ai-memory-federation.log" in fs)
+    # Negative controls: each of these streams node output and must be flagged.
+    for label, snippet in (("an on_node with no redirect", 'until on_node "$host" "test -f x"; do sleep 1; done'),
+                           ("an on_node with stdout to the terminal's stderr", 'on_node "$host" "tail -30 /var/log/x" >&2 || true'),
+                           ("a node_sh heredoc with stdout captured but stderr open", 'v="$(node_sh "$i" <<\'EOS\'\npsql\nEOS\n)"'),
+                           ("an scp with no redirect", 'scp $SSH_OPTS -q a "${SSH_USER}@${host}:/x" || die "scp failed"'),
+                           ("a curl writing the body to stdout", 'curl -sS https://x 2>/dev/null'),
+                           ("an ssh in a pipeline", 'ssh h cat /x | head -1')):
+        probe("#5171 negative control is flagged: %s" % label, bool(node_stream_findings(snippet + "\n")))
+    for label, snippet in (("a captured, stderr-closed node_sh", 'v="$(node_sh "$i" <<\'EOS\' 2>/dev/null\npsql\nEOS\n)"'),
+                           ("an on_node with both streams closed", 'on_node "$h" "touch x" >/dev/null 2>&1 || die "scp: could not"')):
+        probe("#5171 control is accepted: %s" % label, not node_stream_findings(snippet + "\n"), str(node_stream_findings(snippet + "\n")))
+
+
 def version_block(fs):
     """The verify loop that reads the certified data-tier versions from each node, or empty."""
     a = fs.find("  # Certified data-tier pins, asserted from the provisioned hosts.\n")
@@ -810,6 +892,7 @@ def main():
     f2_node_get_id()
     f2_id_lists_agree()
     pg_version_5172()
+    node_streams_5171()
     f3_static_pins()
     print("RESULT: %s (%d failed)" % ("FAIL" if FAILS else "PASS", len(FAILS)))
     return 1 if FAILS else 0

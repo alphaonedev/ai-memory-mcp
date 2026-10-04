@@ -141,22 +141,22 @@ wire() {
     printf '%s' "$AUTHOR_ID" > "$OUT_DIR/author.id"
     printf '%s' "$AUTHOR_PUB" > "$OUT_DIR/author.pub"
 
-    on_node "$host" "install -d -m 0750 $FED_DIR $FED_DIR/peers" \
+    on_node "$host" "install -d -m 0750 $FED_DIR $FED_DIR/peers" >/dev/null 2>&1 \
       || die "node $n: cannot create $FED_DIR (is the droplet up + reachable on 22?)"
     scp $SSH_OPTS -q \
       "$OUT_DIR/ca.crt" \
-      "${SSH_USER}@${host}:$FED_DIR/ca.crt" || die "node $n: scp ca.crt failed"
-    scp $SSH_OPTS -q "$OUT_DIR/hive-node-$n.crt" "${SSH_USER}@${host}:$FED_DIR/node.crt" \
+      "${SSH_USER}@${host}:$FED_DIR/ca.crt" >/dev/null 2>&1 || die "node $n: scp ca.crt failed"
+    scp $SSH_OPTS -q "$OUT_DIR/hive-node-$n.crt" "${SSH_USER}@${host}:$FED_DIR/node.crt" >/dev/null 2>&1 \
       || die "node $n: scp node.crt failed"
-    scp $SSH_OPTS -q "$OUT_DIR/hive-node-$n.key" "${SSH_USER}@${host}:$FED_DIR/node.key" \
+    scp $SSH_OPTS -q "$OUT_DIR/hive-node-$n.key" "${SSH_USER}@${host}:$FED_DIR/node.key" >/dev/null 2>&1 \
       || die "node $n: scp node.key failed"
-    scp $SSH_OPTS -q "$OUT_DIR/hive-node-$n.allowlist" "${SSH_USER}@${host}:$FED_DIR/peers.allowlist" \
+    scp $SSH_OPTS -q "$OUT_DIR/hive-node-$n.allowlist" "${SSH_USER}@${host}:$FED_DIR/peers.allowlist" >/dev/null 2>&1 \
       || die "node $n: scp peers.allowlist failed"
-    scp $SSH_OPTS -q "$OUT_DIR/peers.conf.node$n" "${SSH_USER}@${host}:$FED_DIR/peers.conf" \
+    scp $SSH_OPTS -q "$OUT_DIR/peers.conf.node$n" "${SSH_USER}@${host}:$FED_DIR/peers.conf" >/dev/null 2>&1 \
       || die "node $n: scp peers.conf failed"
-    scp $SSH_OPTS -q "$OUT_DIR/author.id" "$OUT_DIR/author.pub" "${SSH_USER}@${host}:$FED_DIR/" \
+    scp $SSH_OPTS -q "$OUT_DIR/author.id" "$OUT_DIR/author.pub" "${SSH_USER}@${host}:$FED_DIR/" >/dev/null 2>&1 \
       || die "node $n: scp author material failed"
-    on_node "$host" "chmod 0600 $FED_DIR/node.key" || die "node $n: chmod node.key failed"
+    on_node "$host" "chmod 0600 $FED_DIR/node.key" >/dev/null 2>&1 || die "node $n: chmod node.key failed"
   done
 
   # 4. Collect each node's freshly-minted federation .pub (published by the
@@ -168,13 +168,13 @@ wire() {
     host="${PUBLIC_IPS[$i]}"
     pub="${FED_IDS[$i]}.pub"
     t=0
-    until on_node "$host" "test -s '$FED_DIR/$pub'"; do
+    until on_node "$host" "test -s '$FED_DIR/$pub'" >/dev/null 2>&1; do
       t=$((t + 1))
       [ "$t" -gt "$WAIT_TRIES" ] && die "node $n never published $FED_DIR/$pub (journalctl -u ai-memory-fed-bootstrap)"
       [ $((t % 6)) -eq 1 ] && echo "  node $n: waiting for $pub ... $t/$WAIT_TRIES"
       sleep "$WAIT_SLEEP"
     done
-    scp $SSH_OPTS -q "${SSH_USER}@${host}:$FED_DIR/$pub" "$OUT_DIR/$pub" \
+    scp $SSH_OPTS -q "${SSH_USER}@${host}:$FED_DIR/$pub" "$OUT_DIR/$pub" >/dev/null 2>&1 \
       || die "node $n: could not fetch $pub"
     echo "  node $n: collected $pub"
   done
@@ -183,7 +183,7 @@ wire() {
     host="${PUBLIC_IPS[$i]}"
     for j in $(seq 0 $((NODE_COUNT - 1))); do
       [ "$j" -eq "$i" ] && continue
-      scp $SSH_OPTS -q "$OUT_DIR/${FED_IDS[$j]}.pub" "${SSH_USER}@${host}:$FED_DIR/peers/" \
+      scp $SSH_OPTS -q "$OUT_DIR/${FED_IDS[$j]}.pub" "${SSH_USER}@${host}:$FED_DIR/peers/" >/dev/null 2>&1 \
         || die "node $n: could not install peer pubkey ${FED_IDS[$j]}"
     done
     echo "[federate] node $n cross-enrolled with $((NODE_COUNT - 1)) peer key(s)"
@@ -191,18 +191,18 @@ wire() {
 
   # 5. Release the fail-closed wait on every node, then wait for MESH READY.
   for i in $(seq 0 $((NODE_COUNT - 1))); do
-    on_node "${PUBLIC_IPS[$i]}" "touch $FED_DIR/ENROLLED" \
+    on_node "${PUBLIC_IPS[$i]}" "touch $FED_DIR/ENROLLED" >/dev/null 2>&1 \
       || die "node $((i + 1)): could not mark ENROLLED"
   done
   for i in $(seq 0 $((NODE_COUNT - 1))); do
     n=$((i + 1))
     host="${PUBLIC_IPS[$i]}"
     t=0
-    until on_node "$host" "test -f '$FED_DIR/MESH-READY'"; do
+    until on_node "$host" "test -f '$FED_DIR/MESH-READY'" >/dev/null 2>&1; do
       t=$((t + 1))
       if [ "$t" -gt "$WAIT_TRIES" ]; then
-        echo "--- node $n federation log tail ---" >&2
-        on_node "$host" "tail -30 /var/log/ai-memory-federation.log" >&2 || true
+        # #5171: node output never reaches this terminal; the operator reads the log on the node.
+        echo "[federate] node $n federation log: ssh ${SSH_USER}@$host tail -30 /var/log/ai-memory-federation.log" >&2
         die "node $n never reached MESH READY"
       fi
       [ $((t % 6)) -eq 1 ] && echo "  node $n: waiting for MESH READY ... $t/$WAIT_TRIES"
@@ -218,7 +218,7 @@ loadgen() {
   [ -s "$OUT_DIR/hive-loadgen-f2.crt" ] || die "run '$0 wire' first"
   loadgen_fp="$(openssl x509 -in "$OUT_DIR/hive-loadgen-f2.crt" -outform DER | openssl dgst -sha256 | awk '{print $NF}')"
   for i in $(seq 0 $((NODE_COUNT - 1))); do
-    node_sh "$i" <<EOS || die "node $((i + 1)): loadgen enrollment failed"
+    node_sh "$i" <<EOS >/dev/null 2>&1 || die "node $((i + 1)): loadgen enrollment failed"
 set -e
 grep -qx '$loadgen_fp' '$FED_DIR/peers.allowlist' || printf '%s\n' '$loadgen_fp' >> '$FED_DIR/peers.allowlist'
 systemctl restart ai-memory
@@ -251,7 +251,7 @@ EOS
   if ! ( umask 077; set -o noclobber
          [ ! -e "$keytmp" ] && [ ! -L "$keytmp" ] && exec 9> "$keytmp" \
            && [ -f /dev/fd/9 ] && [ "$keytmp" -ef /dev/fd/9 ] \
-           && on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' >&9 ) \
+           && on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' >&9 2>/dev/null ) \
      || [ "$(LC_ALL=C wc -c < "$keytmp")" -gt 65 ] \
      || [ "$(LC_ALL=C grep -aEcx '[0123456789abcdef]{64}' "$keytmp")" != 1 ] \
      || ! LC_ALL=C head -c 1 -- "$keytmp" | LC_ALL=C grep -q '[0123456789abcdef]' \
@@ -397,7 +397,7 @@ EOS
 
   # Certified data-tier pins, asserted from the provisioned hosts.
   for i in $(seq 0 $((NODE_COUNT - 1))); do
-    versions="$(node_sh "$i" <<'EOS'
+    versions="$(node_sh "$i" <<'EOS' 2>/dev/null
 sudo -u postgres psql -d aimemory -Atc "SELECT current_setting('server_version')"
 sudo -u postgres psql -d aimemory -Atc "SELECT extname || '=' || extversion FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname"
 EOS
