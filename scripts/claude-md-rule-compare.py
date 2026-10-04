@@ -769,7 +769,8 @@ def self_test() -> int:
     # #5282: every head-controlled string printed outside a fence goes through span(), including text that holds a
     # backtick run; the cases below carry backticks in head headings and in the guard message that quotes them.
     for raw, want in (("a", "` a `"), ("a ``` b", "```` a ``` b ````"), ("a\nb", "` a b `"),
-                      ("`", "`` ` ``"), ("a`b", "`` a`b ``")):
+                      ("`", "`` ` ``"), ("a`b", "`` a`b ``"),
+                      ("a\rb", "` a b `"), ("a\u2028b", "` a b `")):  # #5381: CR and U+2028 break lines too
         if span(raw) == want:
             print(f"PASS: self-test - span({raw!r}) is one code span (#5282)")
         else:
