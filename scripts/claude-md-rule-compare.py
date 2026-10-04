@@ -382,6 +382,8 @@ def self_test() -> int:
     case("reworded section without a trailer fails with the diff", reword, True, "RULE TEXT CHANGED")
     case("the diff names the section and shows the change", reword, True, "+The tool limit is NOT 103 tools.")
     case("reworded section with the trailer passes", reword, False, "approval trailer(s): ` Justin `", trailer="Justin")
+    case("a trailer value with a backtick is one code span (#5378)", reword, False,
+         "approval trailer(s): `` Jus`tin ``", trailer="Jus`tin")
     case("a trailer quoted mid-line does not count", reword, True, "RESULT: FAIL",
          message="head change Rule-Change-Approved-By: Justin")
     case("an empty trailer value does not count", reword, True, "RESULT: FAIL",
