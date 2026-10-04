@@ -227,11 +227,9 @@ def main(argv):
                 block.append(text)
             restore = ""
         elif gate.SEPARATOR in line:
+            under_comment = bool(block)  # this entry's reason is the comment block directly above it
             if block:
                 current, block = " ".join(block), []
-            if restore:
-                out.append("# " + restore)  # the entries after a refreshed one keep their own reason
-                restore = ""
             found = gate.CTX.search(line)
             body = line[:found.start()] if found else line
             key = tuple(body.split(gate.SEPARATOR, 1)) + (found.group(1) if found else "",)
@@ -240,8 +238,13 @@ def main(argv):
                 continue
             if redo.get(key):
                 line = "%s | ctx:%s" % (body, redo[key].pop(0))
+                if current and not under_comment:
+                    out.append("# " + current)  # a re-bound entry inside a group keeps the group's reason
                 out.append("# context re-read on %s: %s" % (datetime.date.today().isoformat(), reason))
                 restore = current
+            elif restore:
+                out.append("# " + restore)  # the entries after a re-bound one keep their own reason
+                restore = ""
         out.append(line)
     if new:
         today = datetime.date.today().isoformat()
