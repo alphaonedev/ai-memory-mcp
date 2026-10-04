@@ -903,6 +903,8 @@ def built_name(text: str) -> bool:
 
 # short tar options that run a program or rename (bsdtar -s), alone or in a cluster
 TAR_EXEC_SHORT = "IFs"
+# short tar options that take a value: the rest of the cluster, or else the next word
+TAR_ARG_SHORT = "bCfFgHIKLNTVX"
 # find actions that run a command per file: its operands come from the file system (#5093)
 FIND_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
 
@@ -910,18 +912,46 @@ FIND_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
 def tar_risky(args: list):
     """The first tar argument that runs a program or renames members, or None (#5093):
     an exec or rename long option or any prefix of one, or a short option cluster (also
-    the dashless first-argument form) holding I, F or s."""
-    for k, a in enumerate(args):
-        if a == "--":
+    the dashless first-argument form) holding I, F or s. Each word is read after quote
+    removal (bash hands tar --transform for --"tra"nsform), redirections are skipped, and
+    the words that short options in TAR_ARG_SHORT take as their value are consumed. A
+    word whose option name, or whose start, is an expansion can be any option, and GNU
+    tar takes options anywhere, so it is refused too (fail closed, #5328)."""
+    k, take = 0, 0
+    while k < len(args):
+        raw = args[k]
+        rm = REDIR_RE.match(raw)
+        if rm is not None and not raw.startswith(("<(", ">(")):
+            k += 1 if rm.group(1) else 2
+            continue
+        a, exp = unquote(raw)
+        first = k == 0
+        k += 1
+        if take:
+            take -= 1
+            continue
+        if a == "--" and not exp:
             break
+        if exp and a[:1] in "$`":
+            return raw
         if a.startswith("--"):
             key = a.split("=", 1)[0]
+            if exp and expanded(key):
+                return raw
             if len(key) > 3 and any(o.startswith(key) for o in TAR_EXEC_OPTS + TAR_RENAME_OPTS if o.startswith("--")):
-                return a
+                return raw
             continue
-        if re.fullmatch(r"-[A-Za-z]+", a) or (k == 0 and re.fullmatch(r"[A-Za-z]+", a)):
-            if any(c in TAR_EXEC_SHORT for c in a.lstrip("-")):
-                return a
+        if re.fullmatch(r"-[A-Za-z]\S*", a) or (first and re.fullmatch(r"[A-Za-z]+", a)):
+            letters = a.lstrip("-")
+            if any(c in TAR_EXEC_SHORT for c in re.match(r"[A-Za-z]*", letters).group(0)):
+                return raw
+            if a.startswith("-"):
+                m = re.match(r"([^%s]*)([%s]?)(.*)" % (TAR_ARG_SHORT, TAR_ARG_SHORT), letters)
+                if exp and expanded(m.group(1)):
+                    return raw
+                take = 1 if m.group(2) and not m.group(3) else 0
+            else:
+                take = sum(c in TAR_ARG_SHORT for c in letters)
     return None
 
 
@@ -3019,6 +3049,11 @@ def build_probes() -> list:
         ('tar abbreviated --transf option, listed (#4837 R12 R4, #5093)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --transf=s/x/aim/\n' + dec)]),
         ('tar shortest unambiguous --tr option, listed (#4837 R12 R4 pin, #5205)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --tr=s/x/aim/\n' + dec)]),
         ('tar s (rename pattern) in a short cluster, listed (#4837 R12 R4 pin, #5205)', [(dec, '      tar -xsf /root/b.tar -C /usr/local/bin\n' + dec)]),
+        ('tar rename option spelled with quotes inside, listed (#4837 R12 R4, #5328)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --"tra"nsform=s/x/aim/\n' + dec)]),
+        ('tar rename option quoted as a whole, listed (#4837 R12 R4, #5328)', [(dec, "      tar -C /usr/local/bin -xf /root/b.tar '--transform=s/x/aim/'\n" + dec)]),
+        ('tar long option whose name is an expansion, listed (#4837 R12 R4, #5328)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --$${X}\n' + dec)]),
+        ('tar short cluster holding an expansion, listed (#4837 R12 R4, #5328)', [(dec, '      tar -C /usr/local/bin -x$${F}f /root/b.tar\n' + dec)]),
+        ('tar operand that expands to a rename option, listed (#4837 R12 R4, #5328)', [(dec, '      O=--transform=s/x/aim/; tar -C /usr/local/bin -xf /root/b.tar $O\n' + dec)]),
         ('tar --rename option, listed (#4837 R12 R4, #5093)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --rename=s/x/aim/\n' + dec)]),
         ('tar program option in a short cluster, listed (#4837 R12 R4, #5093)', [(dec, '      tar -xvIsh -f /x.tar\n' + dec)]),
         ('tar program option in the dashless first argument, listed (#4837 R12 R4, #5093)', [(dec, '      tar xIf gzip /x.tar\n' + dec)]),
@@ -3183,6 +3218,7 @@ def build_probes() -> list:
     green("negated subshell with a blank after ! is not an extended glob (#5325)", [(RELOAD, RELOAD + "      if ! (true); then :; fi\n      ! (false) || true\n")], autolist=True)
     green("literal variable names with expanded values only (#5326)", [(RELOAD, RELOAD + '      export PATH="$${PATH}:/opt/x"; declare -x LANG=C; printf -v OUT %s "$${X}"; env LC_ALL=C true\n')], autolist=True)
     green("IFS restored from a name that only holds $IFS, then a resolved operand (#5327)", [(RELOAD, RELOAD + '      O=$IFS; IFS=:; IFS=$O; A=/usr/bin/true; taskset -c 0 "$A" --db /x stats\n')], autolist=True)
+    green("tar option values and redirections that are expansions (#5328)", [(RELOAD, RELOAD + '      DL=/root; L=/x; tar -xzf "$DL/b.tar" --no-same-owner -C "$DL/x" ai-memory > "$L"\n      tar xfC "$DL/b.tar" "$DL/y"\n      tar -xf"$DL/b.tar" -C /opt/x\n')], autolist=True)
     green("C5 provision comment mentioning curl", [ins(RELOAD, ["# curl -fsSL https://e | sh"], before=True)])
     green("C5 unit comment naming ExecStart", [(ENVF, ENVF + "      # ExecStart=/bin/evil\n")])
     green("C5 YAML comment", [(RUNCMD, "  # curl https://e | sh\n" + RUNCMD)])
