@@ -67,6 +67,12 @@
 #     and the script will run schema-init via SSH.
 #   * `PG_PASSWORD_FILE` must contain the postgres role password (mode
 #     0600). Default: /root/aimemory-pg-password.txt.
+#   * `PG_SSLROOTCERT` must name the CA certificate file that signed the
+#     postgres server certificate (on the host that runs schema-init, so on
+#     the AI_MEMORY_SSH_HOST host when that is set). schema-init connects
+#     with sslmode=verify-full&sslrootcert=<PG_SSLROOTCERT> (#5143, #3705).
+#     No default: an unset, unreadable or oddly spelled path is refused before
+#     the backup and the first DROP.
 #
 # USAGE
 # -----
@@ -111,6 +117,10 @@ PG_PORT="${PG_PORT:-5432}"
 PG_USER="${PG_USER:-aimemory}"
 PG_PRIMARY_DB="${PG_PRIMARY_DB:-aimemory}"
 PG_PASSWORD_FILE="${PG_PASSWORD_FILE:-/root/aimemory-pg-password.txt}"
+# #5143: every 1.0.0 binary refuses a PostgreSQL store DSN that does not pin
+# sslmode=verify-full (#3705, loopback included), so schema-init needs the CA
+# bundle that signed the server certificate. No default: unset is refused.
+PG_SSLROOTCERT="${PG_SSLROOTCERT:-}"
 
 BACKUP_DIR="${BACKUP_DIR:-/var/backups}"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
@@ -176,6 +186,31 @@ require_password() {
     export PGPASSWORD="$PG_PWD"
 }
 
+# #5143: refuse BEFORE the backup and any DROP unless the CA path is usable.
+# Plain path characters only: the path is spliced into the store URL query.
+require_sslrootcert() {
+    if [[ -z "$PG_SSLROOTCERT" ]]; then
+        echo "FATAL: PG_SSLROOTCERT is unset: schema-init needs the CA file for sslmode=verify-full (#3705, #5143)" >&2
+        exit 7
+    fi
+    if [[ ! "$PG_SSLROOTCERT" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+        echo "FATAL: PG_SSLROOTCERT must be an absolute path of [A-Za-z0-9._/-] characters" >&2
+        exit 7
+    fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        return 0
+    fi
+    if [[ -n "$AI_MEMORY_SSH_HOST" ]]; then
+        if ! ssh "$AI_MEMORY_SSH_HOST" "test -r '$PG_SSLROOTCERT'"; then
+            echo "FATAL: PG_SSLROOTCERT $PG_SSLROOTCERT is not readable on $AI_MEMORY_SSH_HOST" >&2
+            exit 7
+        fi
+    elif [[ ! -r "$PG_SSLROOTCERT" ]]; then
+        echo "FATAL: PG_SSLROOTCERT $PG_SSLROOTCERT is not readable" >&2
+        exit 7
+    fi
+}
+
 # #1785 — interactive confirmation gate on the LIVE (non-dry-run)
 # destructive path. The operator must TYPE the primary db name to confirm
 # before any `DROP DATABASE` runs (step 2 primary + step 4 disposables).
@@ -222,7 +257,8 @@ psql_postgres() {
 
 run_schema_init() {
     local db="$1"
-    local url="postgres://${PG_USER}:${PG_PWD}@${PG_HOST}:${PG_PORT}/${db}"
+    # #5143: pin sslmode=verify-full (the #3705 floor refuses any other DSN).
+    local url="postgres://${PG_USER}:${PG_PWD}@${PG_HOST}:${PG_PORT}/${db}?sslmode=verify-full&sslrootcert=${PG_SSLROOTCERT}"
     local out="${SCHEMA_INIT_JSON%.json}-${db}.json"
     # #4603: the store URL carries the db password, so it never goes on argv
     # (local /proc/<pid>/cmdline, nor the ssh remote command string, which is
@@ -234,7 +270,7 @@ run_schema_init() {
     # unset it (the local form in a subshell, so the caller's export stays).
     log "schema-init -> ${db} (output: ${out})"
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        log "DRY-RUN: schema-init --json for ${db} via ${AI_MEMORY_SSH_HOST:-local} (store URL redacted) | tee ${out}"
+        log "DRY-RUN: schema-init --json for ${db} via ${AI_MEMORY_SSH_HOST:-local} (store URL postgres://${PG_USER}:***@${PG_HOST}:${PG_PORT}/${db}?sslmode=verify-full&sslrootcert=${PG_SSLROOTCERT}) | tee ${out}"
         return 0
     fi
     if [[ -n "$AI_MEMORY_SSH_HOST" ]]; then
@@ -260,6 +296,7 @@ run_schema_init() {
 
 log "postgres-droplet-reinit.sh starting (dry_run=${DRY_RUN}, skip_disposable=${SKIP_DISPOSABLE})"
 require_password
+require_sslrootcert
 
 if [[ -z "$AI_MEMORY_SSH_HOST" && ! -x "$AI_MEMORY_BIN" ]]; then
     echo "FATAL: ai-memory binary not found at $AI_MEMORY_BIN — set AI_MEMORY_BIN or AI_MEMORY_SSH_HOST" >&2
