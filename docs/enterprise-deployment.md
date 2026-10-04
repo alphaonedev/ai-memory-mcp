@@ -788,20 +788,24 @@ Store the SCRAM verifier, never the plaintext password. Generate it
 from the role's stored verifier:
 
 ```bash
-# On the primary, copy the stored SCRAM verifier for the role. The file is
-# created 0600 before anything is written to it (umask), then handed over:
+# On the primary, copy the stored SCRAM verifier for the role. mktemp creates
+# a new 0600 file, so the verifier is never written into a file with a wider
+# mode (umask alone does not narrow a userlist.txt that already exists):
 ( umask 077
+  tmp=$(mktemp /etc/pgbouncer/userlist.XXXXXX)
   psql -At -U postgres -c \
     "SELECT '\"aimemory\" \"' || rolpassword || '\"' \
-     FROM pg_authid WHERE rolname='aimemory';" > /etc/pgbouncer/userlist.txt )
-chown pgbouncer: /etc/pgbouncer/userlist.txt
+     FROM pg_authid WHERE rolname='aimemory';" > "$tmp"
+  chown pgbouncer: "$tmp" && chmod 0600 "$tmp" && mv "$tmp" /etc/pgbouncer/userlist.txt )
 ```
 
 The verifier must be the role's own `rolpassword` (same salt and iteration
 count): PgBouncer passes the client's SCRAM proof through to Postgres, which
 only works when both hold the same verifier. Add the `admin_users` and
-`stats_users` roles to the same file with verifiers PgBouncer generates for
-them; they are not Postgres roles.
+`stats_users` roles to the same file with SCRAM-SHA-256 verifiers you compute
+for their passwords (PgBouncer has no command that generates one;
+`scram_verifier()` in `infra/pgbouncer/smoke-test.py` shows the computation);
+they are not Postgres roles.
 
 The file is mode `0600`, owned by the PgBouncer service user. Treat it
 as a secret surface in the §14 hardening checklist.
