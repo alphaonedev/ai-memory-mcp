@@ -469,6 +469,8 @@ EOS
       # #5145: an accepted write with no id cannot be read back at node 2, so it is not a PASS.
       if [ -z "$QID" ]; then
         no "quorum write at node 1 was accepted ($(reply_status "$qcode")) with no memory id; replication to node 2 cannot be checked"
+      elif ! plain_id "$QID"; then
+        : # one FAIL with one cause: the not-a-plain-id check below prints it, and no PASS precedes it
       elif [ "$qcode" = 201 ]; then
         ok "W-of-N quorum write at node 1 committed + replicated (201 quorum_met)"
       else

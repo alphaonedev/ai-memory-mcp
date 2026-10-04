@@ -1058,6 +1058,23 @@ def f2_node_get_id():
                 probe("#5145 %s write accepted with %s and no memory id: 1 FAIL, 0 PASS, no readback" % (name, code),
                       bool(snip) and r.returncode == 0 and nos == 1 and oks == 0 and called == 0,
                       "rc=%s no=%d ok=%d called=%d %s" % (r.returncode, nos, oks, called, r.stderr.strip()[:60]))
+        # #5238: an accepted write (201 or 202) whose memory id is not a plain id is one FAIL with one cause:
+        # no PASS line may precede the refused-id FAIL, and the id is never read back.
+        for name, snip, cv, jv, idv, _ in sites:
+            for code in ("201", "202"):
+                sc = ("set -u\n%s\nok() { echo \"OK $*\"; }\nno() { echo \"NO $*\"; }\n"
+                      "node_get() { : > %s; echo '{\"id\":\"abc\",\"metadata\":{\"attest_level\":\"agent_attested\"}}'; }\n"
+                      "sleep() { :; }\n%s='%s'\n%s='{}'\nQID=''\nSID=''\n%s='a b'\n%s\n"
+                      % (defs, d / "called", cv, code, jv, idv, snip))
+                (d / "called").unlink() if (d / "called").exists() else None
+                r = run_bash(sc, d)
+                oks = sum(1 for l in r.stdout.splitlines() if l.startswith("OK"))
+                nos = sum(1 for l in r.stdout.splitlines() if l.startswith("NO"))
+                called = 1 if (d / "called").exists() else 0
+                probe("#5238 %s write accepted with %s and a non-plain memory id: 1 FAIL, 0 PASS, no readback" % (name, code),
+                      bool(snip) and r.returncode == 0 and nos == 1 and oks == 0 and called == 0
+                      and "not a plain id" in r.stdout,
+                      "rc=%s no=%d ok=%d called=%d %s" % (r.returncode, nos, oks, called, r.stderr.strip()[:60]))
         # #5170: the memory id is node-supplied and plain_id admits a 64-hex value, so a PASS or FAIL line
         # that names the id would print a key-shaped value. Read back found and not found, both sites.
         for name, snip, cv, jv, idv, _ in sites:
