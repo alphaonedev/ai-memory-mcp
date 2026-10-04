@@ -2461,9 +2461,15 @@ def var_values(stmts: list) -> dict:
             v = unquote(m.group(3).rstrip(";"))[0]
             # NAME+=text appends to every value NAME already holds; an append can repeat
             # (a loop), so the prior value followed by any text is kept too (#5174)
+            if vals.get(m.group(1)) == {VALUES_PAST_CAP}:
+                continue
             prior = set(vals.get(m.group(1), {""})) if m.group(2) else {""}
             add = {p + v for p in prior} | ({p + "*" for p in prior} if m.group(2) else set())
             vals.setdefault(m.group(1), set()).update(add)
+            # each append at least doubles the set: past EXPAND_CAP values the name stands for
+            # any text, and a use of it becomes the root use in expand_uses (#5329)
+            if len(vals[m.group(1)]) > EXPAND_CAP:
+                vals[m.group(1)] = {VALUES_PAST_CAP}
         for m in re.finditer(r"(?:^|[\s;&|(])for\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*)", text):
             for wd in m.group(2).split():
                 vals.setdefault(m.group(1), set()).add(unquote(wd)[0])
@@ -2479,36 +2485,42 @@ def var_values(stmts: list) -> dict:
 
 
 EXPAND_CAP = 64
+# the value set of a name assigned more than EXPAND_CAP texts (#5329)
+VALUES_PAST_CAP = "\x00past-cap"
 
 
 def expand_uses(uses: list, values: dict) -> list:
     """Each use with every plain $NAME / ${NAME} replaced by each value the template
     assigns NAME, to depth 4 (#5095). The original use stays, so an unknown or operator
-    form still reads as a wildcard in use_glob. Past EXPAND_CAP variants the use becomes
-    the root use "/", which runs_path reads as naming every path (fail closed, #5139: a
-    bare wildcard is skipped there as naming no place, so it would drop the use)."""
+    form still reads as a wildcard in use_glob. Past EXPAND_CAP variants, or through a
+    name whose values passed the cap in var_values (#5329), the use becomes the root use
+    "/", which runs_path reads as naming every path (fail closed, #5139: a bare wildcard
+    is skipped there as naming no place, so it would drop the use)."""
     ref = re.compile(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)")
     out = []
     for val, safe in uses:
         out.append((val, safe))
         if safe is True or "$" not in val:
             continue
-        seen, todo = {val}, [val]
+        seen, todo, over = {val}, [val], False
         for _ in range(4):
             nxt = []
             for v in todo:
                 m = next((x for x in ref.finditer(v) if (x.group(1) or x.group(2)) in values), None)
                 if m is None:
                     continue
-                for rep in values[m.group(1) or m.group(2)]:
+                reps = values[m.group(1) or m.group(2)]
+                over = over or VALUES_PAST_CAP in reps
+                for rep in reps - {VALUES_PAST_CAP}:
                     w = v[:m.start()] + rep + v[m.end():]
                     if w not in seen:
                         seen.add(w)
                         nxt.append(w)
             todo = nxt
-            if len(seen) > EXPAND_CAP:
+            over = over or len(seen) > EXPAND_CAP
+            if over:
                 break
-        if len(seen) <= EXPAND_CAP:
+        if not over:
             out.extend((v, safe) for v in seen if v != val)
         else:
             out.append(("/", safe))
@@ -3119,6 +3131,7 @@ def build_probes() -> list:
         ('data-home file run through a suffix operator, listed (#4837 R12 R5, #5173)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      A=/etc/ai-memory/run.conf.x; bash "$${A%.x}"\n' + dec)]),
         ('data-home file run through an append-built path, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/run; F+=.conf; bash "$F"\n' + dec)]),
         ('data-home file run through an append-built path with a suffix, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/run; F+=.conf; bash "$F".x\n' + dec)]),
+        ('data-home file copied through an append chain past the value cap, listed (#4837 R12 R5, #5329)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/r; F+=u; F+=n; F+=.; F+=c; F+=o; F+=n; F+=f; cp "$F" /usr/local/bin/\n' + dec)]),
         ('data-home file run through a nameref, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      declare -n R=A; A=/etc/ai-memory/run.conf; bash "$R"\n' + dec)]),
         ('data-home file copied by tee from its stdin, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      tee /usr/local/bin/r.sh < /etc/ai-memory/run.conf > /dev/null\n      bash /usr/local/bin/r.sh\n" + dec)]),
         ('data-home file copied by sed in a redirected group, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      { sed 's/a/a/' /etc/ai-memory/run.conf; } > /usr/local/bin/r.sh\n      bash /usr/local/bin/r.sh\n" + dec)]),
@@ -3383,6 +3396,11 @@ def self_test(known: set) -> int:
         want = "| tf-region: " if " | tf-region | " in raw else "not in the allowlist"
         if faults or not any(want in h for h in hits):
             bad.append("entry mutation stayed green: " + raw[:100])
+    # each append at least doubles the value set: past EXPAND_CAP it collapses, so a chain
+    # stays linear (#5329); a chain this short passes the cap and keeps a mutant fast
+    chain = [(0, "F+=a%d" % i, 0) for i in range(EXPAND_CAP.bit_length())]
+    if var_values(chain).get("F") != {VALUES_PAST_CAP}:
+        bad.append("an append chain past EXPAND_CAP did not collapse its value set")
     with contextlib.redirect_stderr(io.StringIO()):
         try:
             build_parser().parse_args(["--bogus"])
@@ -3393,7 +3411,7 @@ def self_test(known: set) -> int:
     if bad:
         print("\n".join("SELF-TEST FAIL: " + b for b in bad), file=sys.stderr)
         return 1
-    print("SELF-TEST PASS: %d red probes flagged, %d green probes clean, %d form faults raised, %d/%d allow-entry mutations red, mistyped argument exits 2"
+    print("SELF-TEST PASS: %d red probes flagged, %d green probes clean, %d form faults raised, %d/%d allow-entry mutations red, append chain past the cap collapses, mistyped argument exits 2"
           % (counts["red"], counts["green"], counts["fault"], len(muts), len(muts)))
     return 0
 
