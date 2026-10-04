@@ -13717,14 +13717,16 @@ pub(crate) fn stamp_contaminated_descendants_as(
     };
 
     // ONE transaction over the whole sweep so the taint lands all-or-nothing
-    // (atomicity). `unchecked_transaction` shares the caller's `&Connection`
-    // (the MCP link path holds a shared borrow); the per-row CAS guard in
-    // `contaminate_row` keeps every UPDATE correct even under the DEFERRED
-    // lock upgrade.
-    let tx = conn.unchecked_transaction()?;
+    // (atomicity). `WriteTxn` borrows the caller's `&Connection` (the MCP link
+    // path holds a shared borrow) and opens BEGIN IMMEDIATE (#5084, the #2250
+    // class): the per-row read-then-UPDATE never needs a DEFERRED lock
+    // upgrade, which can fail with SQLITE_BUSY_SNAPSHOT (not retried by
+    // busy_timeout) and fail the whole sweep. The per-row CAS guard in
+    // `contaminate_row` still keeps every UPDATE correct.
+    let tx = crate::storage::connection::WriteTxn::begin(conn)?;
     {
-        let mut read = tx.prepare(SELECT_LIFECYCLE_META_BY_ID_SQL)?;
-        let mut upd = tx.prepare(
+        let mut read = conn.prepare(SELECT_LIFECYCLE_META_BY_ID_SQL)?;
+        let mut upd = conn.prepare(
             "UPDATE memories \
                 SET lifecycle_state = ?1, metadata = ?2, updated_at = ?3, version = version + 1 \
               WHERE id = ?4 AND lifecycle_state = ?5",
@@ -19255,10 +19257,13 @@ pub fn set_embeddings_batch(
     // dim is immutable within this call's transaction window).
     let mut ns_dim_cache: HashMap<String, Option<usize>> = HashMap::new();
 
-    let tx = conn.transaction()?;
+    // BEGIN IMMEDIATE (#5084, the #2250 class): `namespace_embedding_dim` reads
+    // inside the transaction before the UPDATEs, so a DEFERRED upgrade could
+    // fail with SQLITE_BUSY_SNAPSHOT (not retried by busy_timeout).
+    let tx = crate::storage::connection::WriteTxn::begin(conn)?;
     {
-        let mut update = tx.prepare(SQL_UPDATE_EMBEDDING_WITH_DIM)?;
-        let mut update_empty = tx.prepare(SQL_UPDATE_EMBEDDING_NULL_DIM)?;
+        let mut update = conn.prepare(SQL_UPDATE_EMBEDDING_WITH_DIM)?;
+        let mut update_empty = conn.prepare(SQL_UPDATE_EMBEDDING_NULL_DIM)?;
 
         let mut rows_updated = 0usize;
         for (id, embedding) in entries {
@@ -19272,7 +19277,7 @@ pub fn set_embeddings_batch(
                 let established = if let Some(cached) = ns_dim_cache.get(ns) {
                     *cached
                 } else {
-                    let resolved = namespace_embedding_dim(&tx, ns)?;
+                    let resolved = namespace_embedding_dim(conn, ns)?;
                     ns_dim_cache.insert(ns.clone(), resolved);
                     resolved
                 };
@@ -19908,11 +19913,13 @@ pub fn set_embeddings_batch_reembed(
     if entries.iter().any(|(_, v)| !v.is_empty()) {
         reject_unattributed_embedding_space("set_embeddings_batch_reembed", space)?;
     }
-    let tx = conn.transaction()?;
+    // BEGIN IMMEDIATE (#5084): write-first (the plan read precedes the
+    // transaction), but one rule for every write path.
+    let tx = crate::storage::connection::WriteTxn::begin(conn)?;
     let mut rows_updated = 0usize;
     {
-        let mut update = tx.prepare(SQL_UPDATE_EMBEDDING_WITH_DIM)?;
-        let mut update_empty = tx.prepare(SQL_UPDATE_EMBEDDING_NULL_DIM)?;
+        let mut update = conn.prepare(SQL_UPDATE_EMBEDDING_WITH_DIM)?;
+        let mut update_empty = conn.prepare(SQL_UPDATE_EMBEDDING_NULL_DIM)?;
         for (id, embedding) in entries {
             let bytes = crate::embeddings::encode_embedding_blob(embedding);
             if embedding.is_empty() {
