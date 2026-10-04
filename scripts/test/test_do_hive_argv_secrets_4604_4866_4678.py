@@ -322,6 +322,8 @@ HOOK = (
     '  case "$HK:$*" in\n'
     '    fifo:*"-e $NAME"*) command mkfifo "$NAME" ;;\n'
     '    swap:*"-f /dev/fd/9"*) printf "%%s\\n" %s > "$NAME.new"; command mv -f "$NAME.new" "$NAME" ;;\n'
+    '    link:*"-L $NAME"*) command ln -s "$TFILE" "$NAME" ;;\n'
+    '    late:*"-ef /dev/fd/9"*) command ln -f "$TFILE" "$NAME.new"; command mv -f "$NAME.new" "$NAME" ;;\n'
     '  esac\n'
     '  return $rc\n'
     '}\n'
@@ -341,11 +343,14 @@ def p1_temp_entry_fail_closed():
         mark = d / "on_node.ran"
         name = rd / ".api-key.FORCED"
         kf = rd / "api-key"
+        tfile = d / "t-late"
+        ready = d / "on_node.ready"
         stub_dir(d, "unused")
 
-        def script(hk):
-            pre = 'die() { echo "DIE: $*" >&2; exit 2; }\nPUBLIC_IPS=(h)\nrun_dir=%s\nMARK=%s\nHK=%s\n' % (rd, mark, hk)
-            return pre + HOOK % (SECRET, other) + 'p1f() {\n%s\n}\np1f\n' % blk
+        def script(hk, extra=""):
+            pre = ('die() { echo "DIE: $*" >&2; exit 2; }\nPUBLIC_IPS=(h)\nrun_dir=%s\nMARK=%s\nHK=%s\nTFILE=%s\n'
+                   % (rd, mark, hk, tfile))
+            return pre + HOOK % (SECRET, other) + extra + 'p1f() {\n%s\n}\np1f\n' % blk
 
         def reset():
             for p in list(rd.iterdir()) + [mark]:
@@ -408,6 +413,40 @@ def p1_temp_entry_fail_closed():
         rc, hung = run_timeout(script("swap"), d, 6)
         probe("P2 the name replaced after the open is refused before the key is written", (not hung) and rc not in (0, None)
               and not mark.exists() and not kf.exists(), "rc=%s hung=%s ran=%s api-key=%s" % (rc, hung, mark.exists(), kf.exists()))
+        # A symlink to a regular file planted after the absence checks: noclobber refuses to open it, so
+        # the key never reaches the target (without noclobber the -f and -ef checks both pass). An entry
+        # swapped in after the -ef check: the key goes to the checked descriptor only, so a write that
+        # reopens the name by path puts the key in the target and is red here.
+        for hk, label in (("link", "a symlink to a regular file planted after the absence check"),
+                          ("late", "an entry swapped in after the -ef check")):
+            reset()
+            tfile.write_text("")
+            rc, hung = run_timeout(script(hk), d, 6)
+            probe("P2 %s never receives the key" % label, (not hung) and rc not in (0, None)
+                  and SECRET not in tfile.read_text() and not kf.exists(),
+                  "rc=%s hung=%s target_bytes=%d" % (rc, hung, len(tfile.read_text())))
+            tfile.unlink()
+        # An interrupt in the middle of the key write leaves no partial key at the temp name.
+        slow = 'on_node() { printf "%%s" %s; : > %s; sleep 30; }\n' % (SECRET[:32], ready)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            reset()
+            if ready.exists():
+                ready.unlink()
+            rp = subprocess.Popen(["bash", "-c", script("none", slow)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True, env=dict(os.environ, PATH=str(d) + os.pathsep + os.environ["PATH"]))
+            end = time.time() + 6
+            while not ready.exists() and time.time() < end:
+                time.sleep(0.05)
+            started = ready.exists()
+            os.killpg(rp.pid, sig)
+            try:
+                rc, hung = rp.wait(timeout=6), False
+            except subprocess.TimeoutExpired:
+                os.killpg(rp.pid, signal.SIGKILL)
+                rc, hung = rp.wait(), True
+            left = sorted(q.name for q in rd.iterdir())
+            probe("P2 %s during the key write leaves no temp file and no api-key" % sig.name, started and not hung
+                  and rc not in (0, None) and not left, "started=%s rc=%s hung=%s left=%s" % (started, rc, hung, left))
         reset()
         rc, hung = run_timeout(script("none"), d, 6)
         # An unplanted name still works (the probes above are not red because the block is broken).

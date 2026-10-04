@@ -241,6 +241,8 @@ EOS
   # The file is at most 65 bytes, has exactly one line of 64 hex, and starts with a hex digit (so an
   # empty first line followed by the key is refused): the key, optionally one newline, nothing else.
   keytmp="$(mktemp -u "$run_dir/.api-key.XXXXXXXXXX")" || die "mktemp failed in $run_dir"
+  # An interrupt between the first key byte and the rename must not leave a partial key at the temp name.
+  trap 'rm -f -- "$keytmp"; exit 130' INT TERM HUP
   # The key is written only to a file descriptor this run created: nothing may exist at the new
   # name (a FIFO, symlink, directory or device there is refused), the descriptor is opened with
   # noclobber (O_EXCL), and it must be a regular file (-f follows the descriptor) that the name still
@@ -255,8 +257,10 @@ EOS
      || ! LC_ALL=C head -c 1 -- "$keytmp" | LC_ALL=C grep -q '[0123456789abcdef]' \
      || ! mv -f -T -- "$keytmp" "$keyf"; then
     rm -f -- "$keytmp"
+    trap - INT TERM HUP
     die "could not fetch a 64-hex node API key into $keyf"
   fi
+  trap - INT TERM HUP
   echo "[federate] Phase A API key written to $keyf (0600)"
 }
 
