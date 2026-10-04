@@ -267,6 +267,13 @@ MDEOF
     anchor_green 4716 "a full-file range (:1-4)" 'See `src/mcp/tools/recall.rs:1-4`.'
     anchor_green 4716 "a one-line range (:4-4)" 'See `src/mcp/tools/recall.rs:4-4`.'
 
+    # #5194: a src token preceded by a dot is left alone (its root is
+    # unknown); the CANON lookbehind must keep the dot.
+    anchor_green 5194 "an ellipsis-prefixed escape token (.../src/../x.rs)" \
+        'See `.../src/../nope.rs:5`.'
+    anchor_green 5194 "a dot-suffixed word before an escape token (x../src/../x.rs)" \
+        'See `x../src/../nope.rs`.'
+
     # #5191: an UNBACKTICKED path::symbol anchor is a symbol claim too.
     anchor_red 5191 BARE_QUAL "an unbackticked anchor to a removed symbol" \
         'See (src/mcp/tools/recall.rs::no_such) here.'
