@@ -347,7 +347,19 @@ def imported_modules(path: Path) -> list:
     return sorted(names)
 
 
+def selftest_dir() -> Path:
+    """#5384: the scratch directory of this process's self-test, under the repo's .local-runs (never /tmp)."""
+    return Path(__file__).resolve().parent.parent / ".local-runs" / f"rule-compare-selftest-{os.getpid()}"
+
+
 def self_test() -> int:
+    try:
+        return _self_test_cases()
+    finally:
+        shutil.rmtree(selftest_dir(), ignore_errors=True)  # a case that raises must not leave scratch behind
+
+
+def _self_test_cases() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     guard_path = repo_root / GUARD_REL
     try:
@@ -359,7 +371,7 @@ def self_test() -> int:
     if refusal:
         print(refusal, file=sys.stderr)
         return 1
-    base_dir = repo_root / ".local-runs" / f"rule-compare-selftest-{os.getpid()}"
+    base_dir = selftest_dir()
     shutil.rmtree(base_dir, ignore_errors=True)
     base_dir.mkdir(parents=True)
     failures = []
@@ -552,6 +564,38 @@ def self_test() -> int:
     else:
         failures.append("importer refusal")
         print("FAIL: self-test - run() did not refuse a non-isolated caller that imports the module (#5377)",
+              file=sys.stderr)
+
+    def crash_cleanup():
+        # #5384: a self-test whose case raises still removes its scratch directory. The child loads this file as
+        # a module (so the module-top refusal does not apply), makes its first case raise, and prints its pid.
+        code = ("import importlib.util, os, sys\n"
+                "spec = importlib.util.spec_from_file_location('rc_crash', sys.argv[1])\n"
+                "module = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(module)\n"
+                "def boom(*args, **kwargs):\n"
+                "    raise RuntimeError('boom')\n"
+                "module.make_repo = boom\n"
+                "print(os.getpid(), flush=True)\n"
+                "try:\n"
+                "    module.self_test()\n"
+                "except RuntimeError:\n"
+                "    print('crashed')\n")
+        result = subprocess.run([sys.executable, "-I", "-c", code, str(Path(__file__).resolve())],
+                                capture_output=True, text=True, check=False)
+        lines = result.stdout.split()
+        if len(lines) != 2 or lines[1] != "crashed" or not lines[0].isdigit():
+            return False
+        left = repo_root / ".local-runs" / f"rule-compare-selftest-{lines[0]}"
+        survived = left.exists()
+        shutil.rmtree(left, ignore_errors=True)
+        return not survived
+
+    if crash_cleanup():
+        print("PASS: self-test - a self-test whose case raises removes its scratch directory (#5384)")
+    else:
+        failures.append("crash cleanup")
+        print("FAIL: self-test - a self-test whose case raises left its scratch directory behind (#5384)",
               file=sys.stderr)
 
     def rename_guard(root):
