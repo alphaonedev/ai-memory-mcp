@@ -80,7 +80,10 @@ infra/pgbouncer/README.md | > pool mode (#4667). session is the only supported m
 infra/pgbouncer/README.md | > session. making the adapter safe under transaction pooling is tracked in | ctx:b2bddb256810
 infra/pgbouncer/README.md | > returns to transaction mode only when that probe is green on a | ctx:408b18a49396
 infra/pgbouncer/README.md | > transaction-mode pooler. | ctx:1cd2e6e45faf
-infra/pgbouncer/README.md | | role-defaults.sql | alter role ai_memory set search_path = public, ag_catalog; set statement_timeout = '30s'; set lock_timeout = '5s'; — role defaults matching the session gucs ai-memory sets in after_connect; the narrowing step in guide §5.6.7 for deployments that ran transaction mode. values quote default_statement_timeout_secs=30 / default_lock_timeout_secs=5 and the path normalize_app_search_path computes. | | ctx:db5c9f6b7960
+# pgbouncer template README: states which modes are unsupported and why; session mode is stated in the same file
+# context re-read on 2026-10-04: The entry's own text is unchanged; its paragraph was rewrapped or a neighbouring row was extended by the server_reset_query sentence (#5213, #4736), which names session mode and no other mode to configure.
+infra/pgbouncer/README.md | | role-defaults.sql | alter role ai_memory set search_path = public, ag_catalog; set statement_timeout = '30s'; set lock_timeout = '5s'; — role defaults matching the session gucs ai-memory sets in after_connect; the narrowing step in guide §5.6.7 for deployments that ran transaction mode. values quote default_statement_timeout_secs=30 / default_lock_timeout_secs=5 and the path normalize_app_search_path computes. | | ctx:f86552bf8f87
+# pgbouncer template README: states which modes are unsupported and why; session mode is stated in the same file
 infra/pgbouncer/README.md | (src/store/postgres.rs). where a pooler lets two clients share a backend (transaction, statement), the probe observes all three crossing between | ctx:c831144e19e7
 infra/pgbouncer/README.md | clients. statement mode also refuses a transaction block | ctx:636e9fb1e00b
 infra/pgbouncer/README.md | (fatal: transaction blocks not allowed in statement pooling mode), which the | ctx:6404443897c2
@@ -180,7 +183,9 @@ infra/pgbouncer/README.md | application code in this path. in session mode every
 infra/pgbouncer/README.md | postgres+age module backbone with a session-mode pgbouncer pooler. | ctx:8590239ab393
 infra/pgbouncer/README.md | that the daemon's pool runs in session mode in show pools and that no | ctx:4bb1c382295b
 infra/pgbouncer/README.md | transaction, confirms the role-default statement_timeout, lock_timeout and search_path are visible through the pooler, asserts, as the stats role, | ctx:240362aa067a
-infra/pgbouncer/README.md | | smoke-test.py | infra test: proves an age cypher transaction + the role-default timeouts work through the pooler, that the daemon's pool is in session mode (show pools, and no show databases / show users override, as the stats role), that both hops are tls and that the application role cannot use the admin console. | | ctx:9f2b031740bf
+# #4710 R3 (regen --accept-new, reviewed line by line): README: each line states session mode (or describes the smoke test SHOW checks and the SQL transaction); none recommends another mode
+# context re-read on 2026-10-04: The entry's own text is unchanged; its paragraph was rewrapped or a neighbouring row was extended by the server_reset_query sentence (#5213, #4736), which names session mode and no other mode to configure.
+infra/pgbouncer/README.md | | smoke-test.py | infra test: proves an age cypher transaction + the role-default timeouts work through the pooler, that the daemon's pool is in session mode (show pools, and no show databases / show users override, as the stats role), that both hops are tls and that the application role cannot use the admin console. | | ctx:7560ca3f743c
 
 # #4710 R3 (regen --accept-new, reviewed line by line): compose header comment: states session mode is the only supported mode
 infra/pgbouncer/docker-compose.yml | # real postgres+age backend on 5432 in session mode (#4667: the only supported | ctx:2bfc8e20fd79
@@ -288,7 +293,6 @@ infra/pgbouncer/README.md | (transaction, statement), the probe observes all thr
 infra/pgbouncer/README.md | (transaction, statement), the probe observes all three crossing between clients. statement mode also refuses a transaction block | ctx:4ad2e5826bbb
 infra/pgbouncer/README.md | > pool mode (#4667). session is the only supported mode. transaction > and statement are not supported today: the postgres adapter keeps state on | ctx:a2613bfb6b74
 infra/pgbouncer/README.md | transaction, confirms the role-default statement_timeout, lock_timeout and that the daemon's pool runs in session mode in show pools and that no | ctx:380841720752
-infra/pgbouncer/README.md | | pgbouncer.ini | pooler config. pool_mode = session is required (pinned to the guide by scripts/check-pgbouncer-pool-mode-claims.py); max_prepared_statements = 256 (pgbouncer ≥ 1.21). default_pool_size = 16 covers one daemon at default_max_connections = 16; for n daemons use the sizing rule in guide §5.6.5. | | ctx:bddc0be3bdb4
 
 # template comments around the pinned pool_mode = session line: they explain why transaction and statement modes are not supported
 infra/pgbouncer/pgbouncer.ini | # either: it cannot hold the multi-statement transactions the adapter issues. # probe is green on a transaction-mode pooler; scripts/check-pgbouncer-pool-mode-claims.py | ctx:457b195c570b
@@ -645,32 +649,32 @@ tests/capture_layers_perf_budget.rs | /// release-mode test budget is 5 μs (5x 
 
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
 # Roadmap 4.B, rewrapped to 88 columns (#5077): conditional on #4679 landing; the line says the retired mode comes back only after that fix, not that it is supported now.
-ROADMAP.md | docs/enterprise-deployment.md §5.6). transaction mode returns when | ctx:394f49b80285
-
-# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
-# Pairs a retirement or session-mode statement in section 11.4 with the sqlx sentence (#5077), rewrapped to 88 columns: it says prepared statements and that no production code (src/) sets plan_cache_mode, and it names no pooler mode to set. Unit begins: docs/enterprise-deployment.md §5.6). transaction mode returns when sqlx layer uses named p
-ROADMAP.md | docs/enterprise-deployment.md §5.6). transaction mode returns when sqlx layer uses named prepared statements; no production code (src/) sets | ctx:55dd8f791442
+# context re-read on 2026-10-04: The entry's own text is unchanged; its paragraph was rewrapped or a neighbouring row was extended by the server_reset_query sentence (#5213, #4736), which names session mode and no other mode to configure.
+ROADMAP.md | docs/enterprise-deployment.md §5.6). transaction mode returns when | ctx:a8de52c17c20
 
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
 # Roadmap 4.B, rewrapped to 88 columns (#5077): names transaction-mode multiplexing only as the original plan, and the next line says that as shipped (#4667) the pooler runs in session mode.
-ROADMAP.md | front of each module's postgres+age backbone. as planned, this was transaction-mode | ctx:6be8229fc972
-
-# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
-# Pairs a retirement or session-mode statement in section 11.4 with the sqlx sentence (#5077), rewrapped to 88 columns: it says prepared statements and that no production code (src/) sets plan_cache_mode, and it names no pooler mode to set. Unit begins: infra/lan-parity-test/ integration test that runs the suite through pgbouncer. the sqlx la
-ROADMAP.md | infra/lan-parity-test/ integration test that runs the suite through pgbouncer. the sqlx layer uses named prepared statements; no production code (src/) sets | ctx:407192cdfeb9
+# context re-read on 2026-10-04: The entry's own text is unchanged; its paragraph was rewrapped or a neighbouring row was extended by the server_reset_query sentence (#5213, #4736), which names session mode and no other mode to configure.
+ROADMAP.md | front of each module's postgres+age backbone. as planned, this was transaction-mode | ctx:2ff972094afd
 
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
 # Roadmap 4.B, rewrapped to 88 columns (#5077): states that as shipped the pooler runs in session mode because the postgres adapter keeps session state; session prose is listed, not approved.
-ROADMAP.md | multiplexing with max_prepared_statements set; as shipped (#4667) it is session mode, because the postgres adapter keeps migration-lock, search_path and timeout | ctx:59811574f255
+# context re-read on 2026-10-04: The entry's own text is unchanged; its paragraph was rewrapped or a neighbouring row was extended by the server_reset_query sentence (#5213, #4736), which names session mode and no other mode to configure.
+ROADMAP.md | multiplexing with max_prepared_statements set; as shipped (#4667) it is session mode, because the postgres adapter keeps migration-lock, search_path and timeout | ctx:3370df714dba
 
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
 # Roadmap 4.B, rewrapped to 88 columns (#5077): names the two retired modes only as the ones the executed probe rejects, which is why session mode ships.
-ROADMAP.md | scripts/probe-pgbouncer-pool-mode.py fails on transaction and statement modes (see | ctx:3c443af81a2f
+# context re-read on 2026-10-04: The entry's own text is unchanged; its paragraph was rewrapped or a neighbouring row was extended by the server_reset_query sentence (#5213, #4736), which names session mode and no other mode to configure.
+ROADMAP.md | scripts/probe-pgbouncer-pool-mode.py fails on transaction and statement modes (see | ctx:3b47fbdaf28f
 
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
-# Pairs a retirement or session-mode statement in section 11.4 with the sqlx sentence (#5077), rewrapped to 88 columns: it says prepared statements and that no production code (src/) sets plan_cache_mode, and it names no pooler mode to set. Unit begins: scripts/probe-pgbouncer-pool-mode.py fails on transaction and statement modes (see sqlx la
-ROADMAP.md | scripts/probe-pgbouncer-pool-mode.py fails on transaction and statement modes (see sqlx layer uses named prepared statements; no production code (src/) sets | ctx:5b2fc8cc60fd
+# Roadmap 4.B, the #5213 sentence: in session mode a server connection passes to the next client only after the reset query, so server_reset_query = DISCARD ALL stays set; it names session mode as shipped and recommends no other mode.
+ROADMAP.md | max_prepared_statements stays set (pgbouncer ≥1.21). in session mode a server | ctx:d980cef887e7
 
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
-# Pairs a retirement or session-mode statement in section 11.4 with the sqlx sentence (#5077), rewrapped to 88 columns: it says prepared statements and that no production code (src/) sets plan_cache_mode, and it names no pooler mode to set. Unit begins: sqlx layer uses named prepared statements; no production code (src/) sets plan_cache_mode
-ROADMAP.md | sqlx layer uses named prepared statements; no production code (src/) sets plan_cache_mode or forces generic plans, so there is no plan pinning for the pooler to | ctx:0f657a01bf2d
+# Roadmap 4.B, rewrapped after the #4736 reset-query sentence was added (#5213): the line says the suite runs through the pooler and that sqlx uses named prepared statements; it names no pooler mode to set.
+ROADMAP.md | that runs the suite through pgbouncer. the sqlx layer uses named prepared statements; no | ctx:2951d5815360
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# README file table, pgbouncer.ini row (#5213): states that session mode is required and names server_reset_query = DISCARD ALL as the guard for sequential reuse of a server connection (#4736); it recommends no other mode.
+infra/pgbouncer/README.md | | pgbouncer.ini | pooler config. pool_mode = session is required (pinned to the guide by scripts/check-pgbouncer-pool-mode-claims.py); max_prepared_statements = 256 (pgbouncer ≥ 1.21). server_reset_query = discard all (with server_reset_query_always = 0) is the guard for sequential reuse: in session mode a server connection passes to the next client only after this reset, so keep it set (sequential-reuse test leg: #4736). default_pool_size = 16 covers one daemon at default_max_connections = 16; for n daemons use the sizing rule in guide §5.6.5. | | ctx:bddc0be3bdb4
