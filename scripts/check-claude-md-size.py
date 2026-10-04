@@ -50,6 +50,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unicodedata
@@ -2131,7 +2132,9 @@ def run_fence_cases() -> bool:
 
 def run_main_wiring_case(repo_root: Path, base: Path) -> bool:
     """R4: main() reports workflow errors. A fixture tree with the real workflows passes all_errors();
-    a narrowed guard workflow and a conditioned comparison workflow each fail it."""
+    a narrowed guard workflow and a conditioned comparison workflow each fail it. #5184: the same three trees
+    are also checked through main() itself, by running this script as a process on a copy of the live files
+    (the fixture cannot pass main(), which uses the live index pins), so main() cannot bypass all_errors()."""
     ok = True
     root = base / "wiring"
     root.mkdir()
@@ -2156,6 +2159,28 @@ def run_main_wiring_case(repo_root: Path, base: Path) -> bool:
         target.write_text(good.replace(old, new, 1), encoding="utf-8")
         if not any(needle in line for line in all_errors(root, pins)):
             print(f"FAIL: self-test - all_errors() did not report an edited {rel} (wanted {needle!r})", file=sys.stderr)
+            ok = False
+        target.write_text(good, encoding="utf-8")
+    live = base / "wiring-main"
+    for rel in ("CLAUDE.md", MANIFEST_PATH, WORKFLOW_PATH, COMPARE_WORKFLOW_PATH, *REFERENCE_PATHS):
+        (live / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(repo_root / rel, live / rel)
+    runs = ((WORKFLOW_PATH, "", "", 0, "PASS: CLAUDE.md is a regular file"),)
+    runs += tuple((rel, old, new, 1, needle) for rel, old, new, needle in edits)
+    for rel, old, new, want_rc, needle in runs:
+        target = live / rel
+        good = target.read_text(encoding="utf-8")
+        if old:
+            target.write_text(good.replace(old, new, 1), encoding="utf-8")
+        try:
+            res = subprocess.run([sys.executable, str(Path(__file__).resolve()), str(live)], capture_output=True,
+                                 text=True, check=False, timeout=300)
+            rc, stream = res.returncode, (res.stdout if want_rc == 0 else res.stderr)
+        except (OSError, subprocess.SubprocessError) as exc:
+            rc, stream = None, str(exc)
+        if rc != want_rc or needle not in stream:
+            print(f"FAIL: self-test - main() on {'an edited ' + rel if old else 'the live copy'}: rc={rc} "
+                  f"(wanted {want_rc}, needle {needle!r}): {stream.strip()[:300]}", file=sys.stderr)
             ok = False
         target.write_text(good, encoding="utf-8")
     return ok
