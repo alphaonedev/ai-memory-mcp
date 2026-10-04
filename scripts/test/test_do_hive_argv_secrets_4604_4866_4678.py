@@ -685,6 +685,22 @@ def f2_node_get_id():
                 probe("#5104 %s write with %s: %d FAIL, %d PASS, readback %s" % (name, label, want_no, want_ok, "runs" if want_called else "skipped"),
                       bool(snip) and r.returncode == 0 and nos == want_no and oks == want_ok and (called > 0) == bool(want_called),
                       "rc=%s no=%d ok=%d called=%d %s" % (r.returncode, nos, oks, called, r.stderr.strip()[:60]))
+        # #5145: a write the node accepts (201 or 202) but answers with no memory id cannot be read back at
+        # node 2, so it is one FAIL that says so, never a PASS that silently skips the replication check.
+        for name, snip, cv, jv, idv, _ in sites:
+            for code in ("201", "202"):
+                sc = ("set -u\n%s\nok() { echo \"OK $*\"; }\nno() { echo \"NO $*\"; }\n"
+                      "node_get() { : > %s; echo '{\"id\":\"abc\",\"metadata\":{\"attest_level\":\"agent_attested\"}}'; }\n"
+                      "sleep() { :; }\n%s='%s'\n%s='{}'\nQID=''\nSID=''\n%s\n"
+                      % (defs, d / "called", cv, code, jv, snip))
+                (d / "called").unlink() if (d / "called").exists() else None
+                r = run_bash(sc, d)
+                oks = sum(1 for l in r.stdout.splitlines() if l.startswith("OK"))
+                nos = sum(1 for l in r.stdout.splitlines() if l.startswith("NO"))
+                called = 1 if (d / "called").exists() else 0
+                probe("#5145 %s write accepted with %s and no memory id: 1 FAIL, 0 PASS, no readback" % (name, code),
+                      bool(snip) and r.returncode == 0 and nos == 1 and oks == 0 and called == 0,
+                      "rc=%s no=%d ok=%d called=%d %s" % (r.returncode, nos, oks, called, r.stderr.strip()[:60]))
 
 
 def f2_id_lists_agree():

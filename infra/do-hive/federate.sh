@@ -484,8 +484,15 @@ EOS
   qjson=$(echo "$resp" | sed '$d')
   QID=$(echo "$qjson" | jq -r '.id // empty' 2>/dev/null)
   case "$qcode" in
-    201) ok "W-of-N quorum write at node 1 committed + replicated (201 quorum_met)" ;;
-    202) ok "quorum write at node 1 locally durable (202; peer ack timing) -- the mesh channel carried it" ;;
+    201|202)
+      # #5145: an accepted write with no id cannot be read back at node 2, so it is not a PASS.
+      if [ -z "$QID" ]; then
+        no "quorum write at node 1 was accepted ($(safe_code "$qcode")) with no memory id; replication to node 2 cannot be checked"
+      elif [ "$qcode" = 201 ]; then
+        ok "W-of-N quorum write at node 1 committed + replicated (201 quorum_met)"
+      else
+        ok "quorum write at node 1 locally durable (202; peer ack timing) -- the mesh channel carried it"
+      fi ;;
     *)   no "quorum write at node 1 got '$(safe_code "$qcode")' ($(safe_excerpt "$qjson"))"
          QID="" ;; # a rejected write is not read back: node 2 must not print a PASS for it
   esac
