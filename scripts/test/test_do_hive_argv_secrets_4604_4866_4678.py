@@ -706,6 +706,18 @@ def f2_node_get_id():
                 probe("#5145 %s write accepted with %s and no memory id: 1 FAIL, 0 PASS, no readback" % (name, code),
                       bool(snip) and r.returncode == 0 and nos == 1 and oks == 0 and called == 0,
                       "rc=%s no=%d ok=%d called=%d %s" % (r.returncode, nos, oks, called, r.stderr.strip()[:60]))
+        # #5170: the memory id is node-supplied and plain_id admits a 64-hex value, so a PASS or FAIL line
+        # that names the id would print a key-shaped value. Read back found and not found, both sites.
+        for name, snip, cv, jv, idv, _ in sites:
+            for found in (True, False):
+                reply = "echo '{\"id\":\"%s\",\"metadata\":{\"attest_level\":\"agent_attested\"}}'" % SECRET if found else ":"
+                sc = ("set -u\n%s\nok() { echo \"OK $*\"; }\nno() { echo \"NO $*\"; }\nnode_get() { %s; }\n"
+                      "sleep() { :; }\n%s='201'\n%s='{\"id\":\"%s\"}'\n%s='%s'\nQID=${QID:-}\nSID=${SID:-}\n%s\n"
+                      % (defs, reply, cv, jv, SECRET, idv, SECRET, snip))
+                r = run_bash(sc, d)
+                probe("#5170 %s write with a key-shaped memory id (read back %s): the id is on no line" % (name, "found" if found else "missing"),
+                      bool(snip) and r.returncode == 0 and ("OK" in r.stdout or "NO" in r.stdout)
+                      and SECRET not in r.stdout and SECRET not in r.stderr, r.stdout.strip()[:100])
 
 
 def f2_id_lists_agree():

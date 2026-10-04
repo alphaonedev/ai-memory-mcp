@@ -508,9 +508,9 @@ EOS
       sleep 2
     done
     if [ -n "$landed" ]; then
-      ok "quorum write replicated: id $QID readable at node 2"
+      ok "quorum write replicated: the memory id node 1 returned is readable at node 2"
     else
-      no "quorum write id $QID never appeared at node 2 (replication failure)"
+      no "quorum write never appeared at node 2 (replication failure)"
     fi
   fi
 
@@ -546,7 +546,7 @@ EOS
       fi
       # A refused id is one failure with one cause: do not report it again as a rejected write.
       if [ "$scode" = "201" ] && [ -n "$SID" ]; then
-        ok "signed write accepted at node 1 (201 id=$SID)"
+        ok "signed write accepted at node 1 (201)"
       elif [ -z "$srefused" ]; then
         no "signed write at node 1 got '$(safe_code "$scode")' ($(safe_excerpt "$sjson"))"
         SID="" # a rejected write is not read back: node 2 must not print a PASS for it
