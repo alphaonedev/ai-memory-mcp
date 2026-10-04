@@ -669,9 +669,14 @@ def f2_node_get_id():
         sa += len('      SID=$(echo "$sjson" | jq -r \'.id // empty\' 2>/dev/null)\n') if sa >= 0 else 0
         sites = (("quorum", fs[qa:qb] if 0 <= qa < qb else "", "qcode", "qjson", "QID", '{"id":"abc"}'),
                  ("signed", fs[sa:sb] if 0 <= sa < sb else "", "scode", "sjson", "SID", '{"id":"abc"}'))
+        # #5146: the other 2xx codes too. The quorum site accepts 202 (mesh-accepted) and must read it
+        # back; the signed site accepts only 201. A 200 or 204 is not an accepted write at either site.
         for name, snip, cv, jv, idv, body in sites:
             for code, want_ok, want_called, label in (("500", 0, 0, "a 500"), ("403", 0, 0, "a 403"),
-                                                      ("201", 2, 1, "a 201 (control)")):
+                                                      ("201", 2, 1, "a 201 (control)"),
+                                                      ("202", 2 if name == "quorum" else 0, 1 if name == "quorum" else 0,
+                                                       "a 202 (mesh-accepted control)" if name == "quorum" else "a 202"),
+                                                      ("200", 0, 0, "a 200"), ("204", 0, 0, "a 204")):
                 sc = ("set -u\n%s\nok() { echo \"OK $*\"; }\nno() { echo \"NO $*\"; }\n"
                       "node_get() { : > %s; echo '{\"id\":\"abc\",\"metadata\":{\"attest_level\":\"agent_attested\"}}'; }\n"
                       "sleep() { :; }\n%s='%s'\n%s='%s'\n%s='abc'\nQID=${QID:-}\nSID=${SID:-}\n%s\n"
@@ -681,7 +686,7 @@ def f2_node_get_id():
                 oks = sum(1 for l in r.stdout.splitlines() if l.startswith("OK"))
                 nos = sum(1 for l in r.stdout.splitlines() if l.startswith("NO"))
                 called = 1 if (d / "called").exists() else 0
-                want_no = 0 if code == "201" else 1
+                want_no = 0 if want_ok else 1
                 probe("#5104 %s write with %s: %d FAIL, %d PASS, readback %s" % (name, label, want_no, want_ok, "runs" if want_called else "skipped"),
                       bool(snip) and r.returncode == 0 and nos == want_no and oks == want_ok and (called > 0) == bool(want_called),
                       "rc=%s no=%d ok=%d called=%d %s" % (r.returncode, nos, oks, called, r.stderr.strip()[:60]))
