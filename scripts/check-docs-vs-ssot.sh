@@ -2775,6 +2775,11 @@ SCHEMAHTML
         >> scripts/qc-allowlists/schema-claim-history.txt
     printf 'docs/postgres-age-guide.md\t| Schema version | **v58** |\t#5335 ledgered bold history\n' \
         >> scripts/qc-allowlists/schema-claim-history.txt
+    # A needle with BOTH a doubled space and a marker is exempt only when the whitespace
+    # fold runs before the marker fold: the folded view has one space, so folding markers
+    # out of the raw needle (two spaces) would not sit inside it (#5390).
+    printf 'docs/postgres-age-guide.md\tsteps  **v40** → v60\t#5390 ledgered doubled-space bold history\n' \
+        >> scripts/qc-allowlists/schema-claim-history.txt
     cat > "$tmpdir/docs/postgres-age-guide.md" <<'R4MD'
 The current `CURRENT_SCHEMA_VERSION` is
 52 on both backends.
@@ -2857,6 +2862,7 @@ a v0.8.x DB steps **v40** →
 **v52** on boot.
 a v0.8.x DB steps **v40** →
 **v53** on boot.
+a v0.6 DB steps  **v40** → v60 on boot.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -3057,7 +3063,8 @@ R4HTML
         'docs/postgres-age-guide.md:48 ' 'docs/postgres-age-guide.md:50 ' 'docs/postgres-age-guide.md:51 ' \
         'docs/postgres-age-guide.md:52 ' 'docs/postgres-age-guide.md:53 ' \
         'docs/postgres-age-guide.md:77 ' \
-        'docs/postgres-age-guide.md:81 '
+        'docs/postgres-age-guide.md:81 ' \
+        'docs/postgres-age-guide.md:82 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     grep -qF 'STALE entry' <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - a ledger entry reported STALE although its line is present" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -3072,6 +3079,7 @@ R4HTML
     echo "PASS: self-test #5340 - a markdown transition in bold or a code span wrapped across a line break (steps **v40 -> / v52**): planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5386 - a bare underscore-emphasis table cell (| Schema version | _v52_ |): planted 52 REJECTED, 53 ACCEPTED; pins the trailing underscore arm of MARKS"
     echo "PASS: self-test #5387 - a markdown transition with markers on BOTH versions wrapped across a line break (steps **v40** -> / **v52**): planted 52 REJECTED, 53 ACCEPTED; pins the fold of the continuation line"
+    echo "PASS: self-test #5390 - a ledger needle with BOTH a doubled space and a marker stays exempt (the whitespace fold runs before the marker fold); no STALE row"
     echo "PASS: self-test #5261/#5338 - markdown steps anchor wrapped in bold, a code span or underscore emphasis (steps **v40 -> v52**, a backtick span, _v40 -> v52_, __v40 -> v52__): planted 52 REJECTED, 53 ACCEPTED; an identifier with an inner underscore (v4_0) is not rewritten by the fold"
     echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5196 - the look-back bound is pinned both ways: 3 inline tag-only lines join (52 REJECTED), 4 do not"
