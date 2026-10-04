@@ -2355,7 +2355,7 @@ Preview using the same database and key directory as your deployment:
 
 ```bash
 ai-memory --db /path/to/memory.db keys --key-dir /path/to/keys prune --dry-run
-# store URL from AI_MEMORY_STORE_URL_FILE / AI_MEMORY_STORE_URL (src/cli/keys.rs::inventory); do not
+# store URL from AI_MEMORY_STORE_URL_FILE / AI_MEMORY_STORE_URL (`src/cli/keys.rs::inventory`); do not
 # copy it onto the command line, where its password is visible in ps (#4577)
 ai-memory keys --key-dir /path/to/keys prune --dry-run
 ```
