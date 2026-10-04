@@ -1321,11 +1321,11 @@ def _credential_harness(body: List[str], scratch: Path) -> str:
     password on the node, with the log and the store-url file pointed at
     ``scratch`` (no /etc or /var/log writes)."""
     pre_end = next(i for i, ln in enumerate(body) if ln.startswith('echo "=== ai-memory'))
-    mint = [i for i, ln in enumerate(body) if "grep -q CHANGEME /etc/ai-memory/store-url" in ln]
-    if len(mint) < 2:
+    mint = [i for i, ln in enumerate(body) if ln.strip() == 'if [ "$DB_PASS" = CHANGEME ]; then']
+    if len(mint) < 2 or not body[mint[0] - 1].lstrip().startswith("DB_PASS="):
         raise RuntimeError("provision script no longer has the mint + fail-closed CHANGEME blocks")
     end = next(i for i in range(mint[1], len(body)) if body[i].strip() == "fi")
-    text = "\n".join(body[:pre_end + 1] + body[mint[0]:end + 1]) + "\n"
+    text = "\n".join(body[:pre_end + 1] + body[mint[0] - 1:end + 1]) + "\n"
     for real, fake in (("/var/log/ai-memory-provision.log", str(scratch / "provision.log")),
                        ("/etc/ai-memory/store-url", str(scratch / "store-url"))):
         text = text.replace(real, fake)
