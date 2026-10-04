@@ -294,6 +294,37 @@ impl Drop for WriteTxn<'_> {
     }
 }
 
+/// v1.0.0 #3152 — run `unit` as ONE write transaction on `conn`.
+///
+/// Opens a [`WriteTxn`] when `conn` is in autocommit, commits it when
+/// `unit` returns `Ok`, and rolls it back on `Err` (or an unwind). When the
+/// caller already holds a transaction, `unit` JOINS it instead of nesting —
+/// a nested `BEGIN` fails with "cannot start a transaction within a
+/// transaction" — and the caller's own commit/rollback decides the outcome,
+/// so an `Err` is propagated untouched for that rollback to act on.
+///
+/// This is how a logical write that spans several statements (a content
+/// patch plus a lifecycle transition, #3152) lands all-or-nothing: no
+/// intermediate COMMIT exists, so a crash or a refusal between the
+/// statements leaves the row exactly as it was.
+///
+/// # Errors
+///
+/// Propagates `BEGIN IMMEDIATE` / `COMMIT` failures and `unit`'s own error.
+pub fn in_write_txn<T>(conn: &Connection, unit: impl FnOnce() -> Result<T>) -> Result<T> {
+    let owned = if conn.is_autocommit() {
+        Some(WriteTxn::begin(conn)?)
+    } else {
+        None
+    };
+    // An `Err` here drops `owned`, which rolls the owned transaction back.
+    let out = unit()?;
+    if let Some(txn) = owned {
+        txn.commit()?;
+    }
+    Ok(out)
+}
+
 /// Tracing target for the #3163 transaction-integrity guards.
 const TXN_GUARD_TRACE_TARGET: &str = "ai_memory::storage::txn_guard";
 
@@ -931,12 +962,18 @@ fn apply_writer_pragmas(conn: &Connection) -> Result<()> {
 /// v1.0.0 #2445 — open an EXISTING database WITHOUT applying the bootstrap
 /// schema, the migration ladder, the CHECK triggers, or the downgrade guard.
 ///
-/// This is the EGRESS funnel. When [`open`] refuses a schema-ahead database,
-/// `ai-memory backup` falls back to this so an operator can still snapshot
-/// their durable text with the binary they have on hand — the North Star reads
-/// the memory TEXT as the source of truth and the schema shape as a derived
-/// property of it, so a guard whose observable effect is "you may not take a
-/// backup" would invert the very directive it serves.
+/// This is the EGRESS / diagnostic funnel, and it GUARANTEES NO MIGRATION:
+/// opening through it never changes the schema stamp, never writes a
+/// pre-migration snapshot, and never appends lineage-watermark or
+/// rollback-evidence state. `ai-memory backup` (and so the scheduled backup
+/// timer, #4207) ALWAYS opens its source through it, so a newer binary on disk
+/// cannot upgrade a live primary under a still-running older daemon, and a
+/// schema-ahead or zeroed-stamp database (which [`open`] refuses) can still be
+/// snapshotted: the North Star reads the memory TEXT as the source of truth
+/// and the schema shape as a derived property of it. The other callers are
+/// the diagnostic and repair verbs that must work on a database [`open`]
+/// refuses: `doctor` schema-version repair, the `keys` registry prune, and the
+/// background FTS integrity checker.
 ///
 /// It is NOT a read-only connection: `VACUUM INTO` is refused under
 /// `PRAGMA query_only = ON` (verified), so [`open_read_only`] cannot serve the
@@ -996,9 +1033,10 @@ pub fn open(path: &Path) -> Result<Connection> {
     // mark); `AI_MEMORY_ALLOW_LINEAGE_REGRESSION` is the explicit-intent
     // override. It reads `sqlite_master`/`COUNT(*)` and writes only the derived
     // watermark side table, so it can neither lose nor corrupt durable data.
-    // `open_unmigrated` (backup egress) and `open_read_only` are exempt for the
-    // same reason they skip `migrate`: a backup must always be takeable, and a
-    // reader cannot issue the DDL/DML this records.
+    // `open_unmigrated` (backup egress, always) and `open_read_only` are exempt
+    // for the same reason they skip `migrate`: a backup must always be
+    // takeable and must never migrate, and a reader cannot issue the DDL/DML
+    // this records.
     crate::storage::schema_integrity::enforce_lineage_watermarks(&conn)
         .context("agent_lineage schema-masked data-loss gate (#3172)")?;
     apply_check_constraint_triggers(&conn)

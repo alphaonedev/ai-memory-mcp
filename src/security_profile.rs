@@ -83,6 +83,7 @@
 //! | `AI_MEMORY_UNSTAMPED_MUTATION` | `refuse` | a caller-scoped mutation of an UNSTAMPED (legacy-unowned) row is refused on every funnel of both backends; `warn` refuses boot. The documented `standard` default stays `warn` (#3124) |
 //! | `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS` | *(unset)* | PERMISSIVE-shaped: the store-url file lax-perms hatch is refused — a group/world-readable `AI_MEMORY_STORE_URL_FILE` is never silently accepted (#1927/#3813) |
 //! | `AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS` | *(unset)* | PERMISSIVE-shaped: the per-agent api-key file lax-perms hatch is refused — a group/world-readable `AI_MEMORY_AGENT_API_KEY_FILE` is never silently accepted (#3781/#3813) |
+//! | `AI_MEMORY_REQUIRE_FORENSIC_SINK` | `1` | a forensic log whose chain tail cannot be established refuses boot instead of running without the forensic sink (#4199) |
 //!
 //! In addition, `asi-hard` forces the config-backed governance knob
 //! `[governance].require_operator_pubkey` to `true` (see
@@ -560,6 +561,15 @@ const KNOBS: &[KnobSpec] = &[
         hard_value: "",
         meets_floor: lax_perms_hatch_meets_floor,
     },
+    // #4199 (5-agent vote 4d3ea1c5) — a forensic log whose chain tail cannot
+    // be established REFUSES boot instead of running without the forensic
+    // sink. `standard` degrades (no sink, ERROR, metric, doctor Critical, a
+    // signed outage row); `asi-hard` does not run without its forensic trail.
+    KnobSpec {
+        env: crate::governance::audit::REQUIRE_FORENSIC_SINK_ENV,
+        hard_value: "1",
+        meets_floor: is_truthy,
+    },
 ];
 
 /// The number of env knobs `asi-hard` pins — ONE named SSOT for a count that
@@ -611,7 +621,7 @@ pub fn pinned_knobs() -> Vec<(&'static str, &'static str)> {
 /// [`enforce_at_boot`], which may only run in the synchronous
 /// pre-runtime phase of `fn main()` (#2386), this is safe to call from
 /// any live process (e.g. `ai-memory doctor --posture
-/// enterprise-federation`, which reuses this as ONE SSOT for the 30
+/// enterprise-federation`, which reuses this as ONE SSOT for the 31
 /// `asi-hard` pinned knobs rather than re-deriving the KNOBS table).
 ///
 /// Returns `(env, current_value, hard_value)` triples.
@@ -1619,7 +1629,7 @@ mod tests {
             return;
         }
         // v1.0.0 §5.3 cutline ruling — `enterprise_federation_posture`
-        // reuses this accessor as the SSOT for the 30-knob asi-hard set
+        // reuses this accessor as the SSOT for the 31-knob asi-hard set
         // rather than re-deriving KNOBS; pin its own read-only contract
         // directly (in addition to the exhaustive coverage the
         // `enterprise_federation_posture::tests` module gives it

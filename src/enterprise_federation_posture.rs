@@ -28,7 +28,7 @@
 //!
 //! The certified posture is the UNION of:
 //!
-//! 1. The existing 30-knob `asi-hard` hardened set
+//! 1. The existing 31-knob `asi-hard` hardened set
 //!    ([`crate::security_profile::KNOBS`], reused via
 //!    [`crate::security_profile::is_asi_hard`] +
 //!    [`crate::security_profile::asi_hard_below_floor`] — no knob name
@@ -211,9 +211,9 @@ fn is_truthy(v: &str) -> bool {
 /// occurrence, so this mirrors that precedence and fails closed on a
 /// malformed / absent query (returns `false`), never opening the control.
 fn dsn_pins_sslmode_verify_full(dsn: &str) -> bool {
-    // #3705 — the parser is shared with the connect-funnel FLOOR
-    // (`store::postgres`) and doctor, so the posture check and the
-    // enforcement cannot disagree about what `verify-full` means.
+    // #3705 / #4434 — the verdict the connect funnel enforces
+    // (`transit_encryption::dsn_floor_verdict`: the options the driver PARSES,
+    // not the DSN text), so the check and the enforcement cannot disagree.
     crate::transit_encryption::dsn_pins_sslmode_verify_full(dsn)
 }
 
@@ -591,9 +591,12 @@ pub fn evaluate_with_live(
         let tls_verify_full = dsn_pins_sslmode_verify_full(dsn);
         // #3866 — the `actual` names the TRANSPORT so a socket DSN reads as
         // "TLS not applicable on this transport", never as a pinned floor.
-        let transport = match crate::transit_encryption::dsn_sslmode_floor(dsn) {
+        let transport = match crate::transit_encryption::dsn_floor_verdict(dsn) {
             crate::transit_encryption::SslmodeFloor::Pinned { host }
-            | crate::transit_encryption::SslmodeFloor::NotPinned { host } => {
+            | crate::transit_encryption::SslmodeFloor::NotPinned { host }
+            | crate::transit_encryption::SslmodeFloor::DriverResolved { host, .. }
+            | crate::transit_encryption::SslmodeFloor::DriverHost { named: host, .. }
+            | crate::transit_encryption::SslmodeFloor::Unverifiable { host } => {
                 format!("tcp host={host}")
             }
             crate::transit_encryption::SslmodeFloor::UnixSocket { dir } => {
@@ -876,6 +879,8 @@ pub fn enforce_at_boot_pre_runtime(app_config: &AppConfig) -> anyhow::Result<()>
 
 #[cfg(test)]
 mod tests {
+    /// #4434: a pin is provable only with `sal-postgres` (fail closed otherwise).
+    const PIN_PROVABLE: bool = cfg!(feature = "sal-postgres");
     use super::*;
 
     /// Every env var this module (or the `asi-hard` KNOBS it reuses)
@@ -978,7 +983,7 @@ mod tests {
         unsafe {
             std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "asi-hard");
         }
-        // Pins the 30 asi-hard knobs via the REAL enforcement fn — the
+        // Pins the 31 asi-hard knobs via the REAL enforcement fn — the
         // single source of truth for what "compliant" means for that set.
         crate::security_profile::enforce_at_boot().expect("asi-hard pins cleanly from a clean env");
 
@@ -2025,16 +2030,21 @@ mod tests {
     #[test]
     fn dsn_pins_sslmode_verify_full_parser_3061() {
         // No env — pure DSN string parsing.
-        assert!(dsn_pins_sslmode_verify_full(
-            "postgres://u@db.internal/mem?sslmode=verify-full"
-        ));
-        assert!(dsn_pins_sslmode_verify_full(
-            "postgres://u@h/db?application_name=x&sslmode=verify-full"
-        ));
+        assert_eq!(
+            dsn_pins_sslmode_verify_full("postgres://u@db.internal/mem?sslmode=verify-full"),
+            PIN_PROVABLE
+        );
+        assert_eq!(
+            dsn_pins_sslmode_verify_full(
+                "postgres://u@h/db?application_name=x&sslmode=verify-full"
+            ),
+            PIN_PROVABLE
+        );
         // Case-insensitive value; libpq accepts the mode regardless of case.
-        assert!(dsn_pins_sslmode_verify_full(
-            "postgres://u@h/db?sslmode=Verify-Full"
-        ));
+        assert_eq!(
+            dsn_pins_sslmode_verify_full("postgres://u@h/db?sslmode=Verify-Full"),
+            PIN_PROVABLE
+        );
         // Weaker / absent modes fail CLOSED (control does not open).
         assert!(!dsn_pins_sslmode_verify_full(
             "postgres://u@h/db?sslmode=require"
@@ -2046,9 +2056,10 @@ mod tests {
             "postgres://u@h/db?sslmode=verify-full&sslmode=require"
         ));
         // …and the inverse: a trailing verify-full wins.
-        assert!(dsn_pins_sslmode_verify_full(
-            "postgres://u@h/db?sslmode=require&sslmode=verify-full"
-        ));
+        assert_eq!(
+            dsn_pins_sslmode_verify_full("postgres://u@h/db?sslmode=require&sslmode=verify-full"),
+            PIN_PROVABLE
+        );
     }
 
     /// Sets the fully-hardened federation env AND points the resolved store
@@ -2063,6 +2074,7 @@ mod tests {
         fp
     }
 
+    #[cfg(feature = "sal-postgres")] // #4434: a pin is provable only with sal-postgres
     #[test]
     fn postgres_backend_compensating_control_passes_and_lets_gate_arm_3061() {
         if crate::config::run_env_isolated_child_or_spawn(
@@ -2113,6 +2125,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "sal-postgres")] // #4434: a pin is provable only with sal-postgres
     #[test]
     fn postgres_backend_fails_without_attestation_3061() {
         if crate::config::run_env_isolated_child_or_spawn(

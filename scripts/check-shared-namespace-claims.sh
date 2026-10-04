@@ -319,7 +319,7 @@ if [ "${#CANDS[@]}" -eq 0 ]; then
   mapfile -t CANDS <<< "$DERIVED"
   echo "candidates DERIVED from origin (built on $ANCHOR or later, not in $BASE): ${#CANDS[@]}"
 else
-  missing=$(comm -23 <(printf '%s\n' "$DERIVED" | sort) <(printf '%s\n' "${CANDS[@]}" | sed 's#^refs/remotes/##' | sort))
+  missing=$(LC_ALL=C comm -23 <(printf '%s\n' "$DERIVED" | LC_ALL=C sort) <(printf '%s\n' "${CANDS[@]}" | sed 's#^refs/remotes/##' | LC_ALL=C sort))
   if [ -n "$missing" ]; then
     echo "  [WARN] the named list NARROWS the derived set — derived candidates you did not name (a list is the denominator, and this is how it rots):"
     printf '%s\n' "$missing" | sed 's/^/         /'

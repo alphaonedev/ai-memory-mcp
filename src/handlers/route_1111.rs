@@ -119,7 +119,17 @@ async fn reflect_write_admission_pg(
         )
         .await
     {
-        Ok(GovernanceDecision::Allow) => None,
+        Ok(GovernanceDecision::Allow) => {
+            reflect_depth_approval_gate_pg(
+                app,
+                caller,
+                input,
+                &target_namespace,
+                proposed_depth,
+                &payload,
+            )
+            .await
+        }
         Ok(GovernanceDecision::Deny(refusal)) => {
             tracing::warn!(
                 target: crate::storage::reflect::REFLECT_TRACE_TARGET,
@@ -156,6 +166,79 @@ async fn reflect_write_admission_pg(
         ),
         Err(e) => Some(crate::handlers::postgres_gate::store_err_to_response(e)),
     }
+}
+
+/// #4357 — the L1-8 `require_approval_above_depth` gate on the postgres
+/// reflect path (CWE-862). The sqlite twin lives in
+/// `mcp::tools::reflect::handle_reflect_caller`; pre-#4357 this backend never
+/// consulted the threshold, so a reflection above an operator-configured
+/// depth was WRITTEN instead of parked for approval. Runs AFTER the #3638
+/// write admission (a caller the standard does not admit never reaches the
+/// threshold read) and BEFORE the substrate write.
+///
+/// Returns `Some(response)` — the queued approval (202, same body fields as
+/// the sqlite wire shape; the threshold itself is never echoed, #3638) or a
+/// store-error response — when the reflect must NOT proceed, `None` when it is
+/// at or below the threshold / no threshold is configured. A resolver or
+/// queue failure REFUSES the reflect (fail closed), never skips the gate.
+#[cfg(feature = "sal")]
+async fn reflect_depth_approval_gate_pg(
+    app: &AppState,
+    caller: &crate::store::CallerContext,
+    input: &crate::storage::reflect::ReflectInput,
+    target_namespace: &str,
+    proposed_depth: u32,
+    payload: &Value,
+) -> Option<axum::response::Response> {
+    let threshold = match app
+        .store
+        .resolve_require_approval_above_depth(target_namespace)
+        .await
+    {
+        Ok(Some(t)) => t,
+        Ok(None) => return None,
+        Err(e) => return Some(crate::handlers::postgres_gate::store_err_to_response(e)),
+    };
+    if proposed_depth <= threshold {
+        return None;
+    }
+    let pending_id = match app
+        .store
+        .queue_pending_action(
+            caller,
+            crate::store::GovernedAction::Reflect,
+            target_namespace,
+            None,
+            &input.agent_id,
+            payload,
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => return Some(crate::handlers::postgres_gate::store_err_to_response(e)),
+    };
+    tracing::info!(
+        target: crate::storage::reflect::REFLECT_TRACE_TARGET,
+        namespace = %target_namespace,
+        proposed_depth,
+        require_approval_above_depth = threshold,
+        "reflection requires approval"
+    );
+    Some(
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "pending",
+                (field_names::PENDING_ID): pending_id,
+                "reason": "governance requires approval for reflections above depth threshold",
+                "action": crate::models::GovernedAction::Reflect.as_str(),
+                "namespace": target_namespace,
+                (field_names::PROPOSED_DEPTH): proposed_depth,
+                (field_names::STORAGE_BACKEND): "postgres",
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// #1552 — shared federation fanout for the reflect write path, called by both
@@ -244,13 +327,28 @@ pub async fn handle_smart_load_http(
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return smart_load_http_via_store(&app, &headers, &body).await;
     }
+    // #4089 (rust-1.98 CONCURRENCY-22) — route the intent BEFORE taking the
+    // DB lock and OFF this worker: with an embedder the pick embeds the
+    // intent AND every family descriptor (CPU-bound forward passes), which
+    // pre-#4089 ran inline on this worker while holding the single shared
+    // `Mutex<Connection>`. Only the read runs under the lock. Same parse,
+    // same `intent is required` refusal and same trim as `handle_smart_load`.
+    let Some(intent_raw) = body["intent"].as_str() else {
+        return err_response(crate::mcp::load_family::INTENT_REQUIRED.to_string());
+    };
+    let intent = intent_raw.trim();
+    let (family, score, source) =
+        super::embed_offload::pick_family_for_intent(app.embedder.as_ref().as_ref(), intent).await;
     let lock = app.db.lock().await;
-    let embedder = app
-        .embedder
-        .as_ref()
-        .as_ref()
-        .map(|e| e as &dyn crate::embeddings::Embed);
-    let result = crate::mcp::handle_smart_load(&lock.0, &body, embedder, Some(caller.as_str()));
+    let result = crate::mcp::load_family::forward_to_load_family(
+        &lock.0,
+        family,
+        score,
+        source,
+        intent,
+        &body,
+        Some(caller.as_str()),
+    );
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
@@ -285,7 +383,7 @@ async fn smart_load_http_via_store(
     body: &Value,
 ) -> axum::response::Response {
     let Some(intent_raw) = body["intent"].as_str() else {
-        return err_response("intent is required".to_string());
+        return err_response(crate::mcp::load_family::INTENT_REQUIRED.to_string());
     };
     let intent = intent_raw.trim();
     let namespace = body
@@ -302,12 +400,11 @@ async fn smart_load_http_via_store(
         .unwrap_or(20);
     let k = usize::try_from(k_raw).unwrap_or(usize::MAX).clamp(1, 100);
 
-    let embedder = app
-        .embedder
-        .as_ref()
-        .as_ref()
-        .map(|e| e as &dyn crate::embeddings::Embed);
-    let (family, score, source) = crate::mcp::pick_family_for_intent(intent, embedder);
+    // #4089 (rust-1.98 CONCURRENCY-22) — the embedder vote inside
+    // `pick_family_for_intent` is CPU-bound; it runs on the blocking pool,
+    // never inline on this worker (`embed_offload`).
+    let (family, score, source) =
+        super::embed_offload::pick_family_for_intent(app.embedder.as_ref().as_ref(), intent).await;
     let family_name = family.name();
     tracing::info!(
         target: crate::mcp::load_family::SMART_LOAD_LOG_TARGET,
@@ -472,11 +569,27 @@ pub async fn handle_reflect_http(
         // re-resolution that used to live here; the owner rule now lives at ONE
         // site (`mcp::tools::reflect::resolve_reflect_owner`) that both backends
         // reach, instead of postgres overriding the parsed id after the fact.
-        let (input, caller_depth) =
+        let (mut input, caller_depth) =
             match crate::mcp::parse_reflect_input(&body, None, authenticated_caller.as_deref()) {
                 Ok(parsed) => parsed,
                 Err(e) => return err_response(e),
             };
+        // #4357 — the attestation posture crosses BEFORE the approval queue,
+        // exactly as the sqlite MCP handler does (#3014): under global-strict
+        // attestation an unsigned tenant reflect is refused here and never
+        // queued. `attest_level` is a substrate-stamped system key, so any
+        // caller-supplied value is scrubbed first (it must never ride the
+        // queued payload onto the durable row); the permissive-path `claimed`
+        // stamp goes onto a throwaway object so the queued payload stays what
+        // the caller supplied (#1176).
+        if let Some(obj) = input.metadata.as_object_mut() {
+            obj.remove(field_names::ATTEST_LEVEL);
+        }
+        let mut attest_sink = Value::Object(serde_json::Map::new());
+        if let Err(e) = crate::identity::attest::gate_unsigned_surface_attestation(&mut attest_sink)
+        {
+            return err_response(e.to_string());
+        }
         let caller = crate::store::CallerContext::for_agent(&input.agent_id);
         // #1325 caller-asserted depth pre-check (parity with the sqlite
         // MCP path): compare the asserted `depth` to the substrate-
@@ -546,13 +659,53 @@ pub async fn handle_reflect_http(
         )
             .into_response();
     }
+    // #4089 (rust-1.98 CONCURRENCY-22) — precompute the reflection embedding
+    // BEFORE taking the DB + vector-index locks: title and content are both
+    // required params so the document text is known pre-write, and the
+    // forward pass must not hold either lock (or this worker). When the
+    // precompute is attempted the callee gets `embedder: None`, so a failed
+    // precompute commits vectorless instead of being retried inline under
+    // the locks; when there is nothing to precompute (missing text or no
+    // embedder) the arguments pass through exactly as before.
+    let reflect_text: Option<String> = match (
+        body.get("title").and_then(Value::as_str),
+        body.get("content").and_then(Value::as_str),
+    ) {
+        (Some(title), Some(content)) => Some(crate::embeddings::embedding_document(title, content)),
+        _ => None,
+    };
+    let (embedder, precomputed_embedding): (
+        Option<&dyn crate::embeddings::Embed>,
+        Option<(Vec<f32>, String)>,
+    ) = match (reflect_text, app.embedder.as_ref().as_ref()) {
+        (Some(text), Some(emb)) => {
+            let space = emb.space_fingerprint();
+            match super::embed_offload::embed_document(
+                crate::metrics::EMBED_SURFACE_REFLECT,
+                emb,
+                text,
+            )
+            .await
+            {
+                Some(Ok(vector)) => (None, Some((vector, space))),
+                Some(Err(e)) => {
+                    tracing::warn!("failed to generate embedding for reflection: {e} (#4089)");
+                    (None, None)
+                }
+                // `embed_offload` already warned + counted (surface `reflect`).
+                None => (None, None),
+            }
+        }
+        _ => (
+            app.embedder
+                .as_ref()
+                .as_ref()
+                .map(|e| e as &dyn crate::embeddings::Embed),
+            None,
+        ),
+    };
     let lock = app.db.lock().await;
     let db_path = lock.1.clone();
-    let embedder = app
-        .embedder
-        .as_ref()
-        .as_ref()
-        .map(|e| e as &dyn crate::embeddings::Embed);
     let vec_lock = app.vector_index.lock().await;
     // v0.9 #1005 — deref through the boxed seam to the trait object.
     let vector_index = vec_lock.as_deref();
@@ -570,6 +723,7 @@ pub async fn handle_reflect_http(
         // #3423 — the authenticated principal owns the reflection, exactly as
         // on the postgres branch above.
         authenticated_caller.as_deref(),
+        precomputed_embedding,
     );
     drop(vec_lock);
     // #3638 — the sqlite path runs the write-admission gate inside the shared

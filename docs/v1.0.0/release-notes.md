@@ -64,21 +64,25 @@ kinds, claim-bitemporal columns), and certifies the postgres + Apache
 AGE + pgvector storage backend.
 
 > **Certified-backend scope — read this before choosing Postgres.** The
-> two backends are **not one identical API**: **61 of the 82 unique
-> production HTTP paths are served on Postgres; the remaining 21 fail
-> closed with a uniform `501 NOT IMPLEMENTED`** (the Agent Skills surface,
-> `/api/v1/share`, the legacy `/api/v1/find_paths` alias, and the
-> `memory_*` MCP-parity routes with no pg SAL trait method yet — pinned by
-> `tests/pg_supported_route_inventory_gate_2799.rs`), and **MCP-stdio is
+> two backends are **not one identical API**: **Postgres supports at least
+> one registered method on 76 of the 89 unique production HTTP paths; 13
+> paths are wholly unsupported on Postgres and fail closed with a uniform
+> `501 NOT IMPLEMENTED`** (the eight Agent Skills paths, `/api/v1/share`,
+> and four `memory_*` MCP-parity routes with no pg SAL trait method yet).
+> The legacy `POST /api/v1/find_paths` alias is supported. See the
+> method-level PostgreSQL gate (`src/handlers/postgres_gate.rs`) and
+> `tests/pg_supported_route_inventory_gate_2799.rs` for the supported and
+> unsupported inventories; path support does not imply all methods are
+> supported. **MCP-stdio is
 > structurally SQLite-only** ([#1675](https://github.com/alphaonedev/ai-memory-mcp/issues/1675)):
 > a Postgres-backed deployment serves MCP clients through the HTTP daemon,
 > not `ai-memory mcp`. The certified **PG 18.6 / AGE 1.8.0 / pgvector
-> 0.8.6** stack is now exercised in-PR on every `release/**` PR by
-> `.github/workflows/cert-postgres-age.yml`, which runs the pg-parity and
-> AGE cells `--include-ignored` against the certified image CI builds from
-> `deploy/docker-1461/Dockerfile.pg-age-vector` (SSOT-pinned PG 18.6 / AGE
-> 1.8.0 / pgvector 0.8.6) and hard-fails on any drift from the exact pinned
-> minors;
+> 0.8.6** stack is now exercised in-PR on every `release/**` PR: the
+> `.github/workflows/cert-postgres-age.yml` workflow runs the pg-parity and
+> AGE suites against a per-job database on the runner's native
+> PostgreSQL/AGE/pgvector tier and checks its live versions against the pins
+> in `deploy/docker-1461/provision/lib.sh`, hard-failing on any drift from
+> the exact pinned minors;
 > the PG 16 / AGE 1.6.0 combination in `coverage.yml` is the documented
 > **alternate** matrix (a line-coverage measurement). See §"Certified
 > backend versions" for the exact versions and evidence basis.
@@ -87,11 +91,14 @@ The "defaults stop lying" lane (Gate 1′) is the centerpiece: six knobs
 that shipped OFF (or non-functional) through v0.10.0 now resolve to their
 secure posture by default, each riding the one-cycle deprecation-WARN
 discipline the v0.10.0 `warn-carrier` release delivered. The release also
-advances the schema **v78 → v90** — additive `ADD COLUMN` through v85,
-then **two DATA-MUTATING rungs (v86, v87) that rewrite stored rows**, one
-index-only rung (v88), one derived-column-rebuild rung (v89, the
-postgres FTS `tags` fold) and one additive rung (v90, the archive
-genesis-cid parity); see §"Schema ladder v78 → v90" — adds an M-of-N
+advances the schema **v78 → v100**. The ladder is not uniformly additive:
+v86/v87 normalize stored timestamp renderings, v97 rewrites existing
+agent-registration memory rows (take a backup before upgrading), v89 rebuilds the derived
+PostgreSQL FTS column, v92 rebuilds SQLite's `schema_version` table to add
+its bound, and v100 replaces the title-slot unique index with a partial
+index. Other additions and backfills are described per rung in
+§"Schema ladder v78 → v100"; historical migration trials attest only their
+stated version range. The release also adds an M-of-N
 threshold key-recovery lane, human-key-signed m-of-n approvals, an
 open-time rollback-evidence check, an inference-plane egress gate, and a
 named `asi-hard` no-disable security posture.
@@ -110,7 +117,7 @@ CLI subcommands):
 | HTTP routes | **103 production `.route(...)` registrations** / 89 unique URL paths |
 | CLI subcommands | **90 default build** / **92 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
-| Schema | **v100** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), and v90–v97 are additive; v98 adds legacy inbox namespace aliases; v99 (#3655) adds the per-peer contact stamp; v100 (#3690) makes the `(title, namespace)` unique index PARTIAL (`WHERE lifecycle_state <> 'tombstoned'`) so a consolidation tombstone gives its slot up — index-only, no stored-row rewrite. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v100" |
+| Schema | **v100** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), v90–v97 add tables/columns, except that **v97 also rewrites existing `_agents` registration rows in `memories`** (removes `metadata.write_signature`, sets `attest_level=claimed`; sqlite `0081_v97_agent_pubkey_history.sql:118-140`, postgres `0054_v97_agent_pubkey_history.sql:118-132` — take a backup first) and v92 rebuilds SQLite's `schema_version` table (create + copy + drop + rename) to add its `version <= 100000` bound (postgres: `ADD CONSTRAINT`) — a version-table rebuild, not a `memories` rewrite; v98 adds legacy inbox namespace aliases; v99 (#3655) adds the per-peer contact stamp; v100 (#3690) makes the `(title, namespace)` unique index PARTIAL (`WHERE lifecycle_state <> 'tombstoned'`) so a consolidation tombstone gives its slot up — index-only, no stored-row rewrite. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v100" |
 
 ## Before upgrading — run `ai-memory config check` (#3715)
 
@@ -150,6 +157,43 @@ binary back across a config-schema step therefore means rolling the file
 back too (`config migrate` leaves `<config.toml>.bak.<timestamp>`) — the
 config analogue of the schema-ahead guard, and the reason a version-bound
 rollback runbook must name both artifacts.
+
+## Before upgrading — legacy agent keys must be well-formed (schema v97, #3464 / #3500)
+
+Schema v97 copies every canonical agent registration's flat
+`metadata.agent_pubkey` (rows in `_agents` titled `agent:<agent_id>`)
+into the new append-only `agent_pubkey_history` ledger as version 1.
+The ledger accepts only an Ed25519 public key in one of two spellings:
+the canonical 43-character URL-safe base64 form, or the 44-character
+padded standard base64 form (which the migration normalises). Any other
+value is copied verbatim and the ledger's `pubkey_b64` CHECK refuses it,
+so the whole v97 step fails and the upgraded binary refuses to open the
+database (both backends: `migrations/sqlite/0081_v97_agent_pubkey_history.sql`,
+`migrations/postgres/0054_v97_agent_pubkey_history.sql`). That refusal is
+deliberate — a malformed trust anchor is never silently dropped — and
+the database is left unchanged at its old version.
+
+A malformed key can only exist in a database written before #3362
+closed the generic `_agents` write path. In this release the refusal
+surfaces as a bare `CHECK constraint failed` that does not name the
+agent; a pre-flight that names every offending agent is tracked in
+[#3500](https://github.com/alphaonedev/ai-memory-mcp/issues/3500). Until
+then, check before upgrading. On SQLite, with the OLD binary stopped:
+
+```bash
+sqlite3 ai-memory.db "SELECT json_extract(metadata,'$.agent_id'),
+  length(trim(json_extract(metadata,'$.agent_pubkey')))
+  FROM memories WHERE namespace='_agents'
+  AND title = 'agent:' || json_extract(metadata,'$.agent_id')
+  AND json_extract(metadata,'$.agent_pubkey') IS NOT NULL;"
+```
+
+Every listed key must be 43 or 44 characters and decode to 32 bytes.
+For any agent whose key does not, run on the **pre-v1.0.0 binary**
+`ai-memory agents revoke-key --agent-id <id>` (removes the flat binding;
+re-enroll afterwards with `ai-memory agents bind-key`, which since #3464
+requires proof of possession), or remove that registration row. Then
+upgrade. See also [`docs/attestation.md`](../attestation.md).
 
 ## Secure-default flips (breaking)
 
@@ -209,12 +253,14 @@ behavior changes here.
   for v1.x (D3-021 → D3-031 → D3-060). `off` opts out.
 - **Agent-attestation default surface-scoped ([#1985](https://github.com/alphaonedev/ai-memory-mcp/issues/1985), resolving [#1981](https://github.com/alphaonedev/ai-memory-mcp/issues/1981)).**
   `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (env-table row #48) is now
-  tri-state with a per-surface compiled default. With the env unset, an
-  unsigned direct-store write is fail-CLOSED (`403 ATTESTATION_FAILED`)
-  ONLY on the HTTP direct-write surface (`POST /api/v1/memories` +
-  `/memories/bulk`); the MCP `memory_store` and CLI `store` surfaces are
-  the operator-as-actor path and stay permissive (unsigned →
-  `attest_level="claimed"`). This CORRECTS the v0.9.0 #1751
+  tri-state with a per-surface compiled default. With
+  `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` unset, the HTTP-direct default
+  applies to `POST /api/v1/memories`, `POST /api/v1/memories/bulk`, and
+  `POST /api/v1/capture_turn`: an unsigned direct-store write is
+  fail-CLOSED (`403 ATTESTATION_FAILED`), and HTTP capture requires a
+  valid host signature whose key is bound to the caller. MCP
+  `memory_store` and CLI `store` retain their separate operator-as-actor
+  default and stay permissive (unsigned → `attest_level="claimed"`). This CORRECTS the v0.9.0 #1751
   require-everywhere default, which was unsatisfiable on MCP (no MCP host
   can construct/sign the canonical `SignableWrite` envelope — the #1981
   external break). `=1` forces strict on every surface (the v0.9.0
@@ -278,17 +324,19 @@ AGE's release-vote convention; `CREATE EXTENSION age` reports extversion
 1.8.0), installed via the pinned pgdg `postgresql-18-age` `.deb`. As of
 [#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548) /
 [#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) the
-AGE/KG + recall-purity suites run against this exact stack in-PR:
-`.github/workflows/cert-postgres-age.yml` BUILDS
-`deploy/docker-1461/Dockerfile.pg-age-vector` — the same recipe the
-docker-1461 mesh ships — with build-args resolved straight from this SSOT
-(`deploy/docker-1461/provision/lib.sh`), runs the resulting image as the
-postgres under test, runs the pg-parity and AGE cells `--include-ignored`,
-and version-asserts the EXACT pinned minors (PostgreSQL 18.6, Apache AGE
-1.8.0, pgvector 0.8.6 — not merely "PG 18" or "pgvector >= 0.8.6") — so the
-certified tier is proven by execution on the cert branch, not merely
-claimed, and CI's build artifact is the SAME artifact the deploy SSOT
-ships (zero drift by construction). The PG 16 / AGE 1.6.0 combination in
+AGE/KG + recall-purity suites run against this exact stack in-PR: the
+`.github/workflows/cert-postgres-age.yml` workflow runs the pg-parity and
+AGE suites (`--include-ignored`) against a per-job database on the
+runner's native PostgreSQL/AGE/pgvector tier and checks its live versions
+against the pins in `deploy/docker-1461/provision/lib.sh` — the EXACT
+pinned minors (PostgreSQL 18.6, Apache AGE 1.8.0, pgvector 0.8.6 — not
+merely "PG 18" or "pgvector >= 0.8.6") — so the certified version triple
+is proven by execution on the cert branch, not merely claimed. The
+workflow does NOT build or run the
+`deploy/docker-1461/Dockerfile.pg-age-vector` image: the former per-PR
+`docker build`/`docker run` path was removed in the v1.0.0 self-hosted CI
+rewrite, so CI certifies the pinned versions, not the deploy image
+artifact itself. The PG 16 / AGE 1.6.0 combination in
 `coverage.yml` remains as the documented alternate matrix.
 
 > **Cross-lane pgvector pin — reconciled ([#2872](https://github.com/alphaonedev/ai-memory-mcp/issues/2872)).**
@@ -353,11 +401,11 @@ exercised in-PR.** `.github/workflows/cert-postgres-age.yml`
 ([#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548))
 triggers on `pull_request` + `push` to `release/**`, resolves every
 version pin from the ONE declaration source
-(`deploy/docker-1461/provision/lib.sh`), BUILDS
-`deploy/docker-1461/Dockerfile.pg-age-vector` with those pins as
-build-args (the same recipe the docker-1461 mesh ships — no second,
-drift-prone copy of the pins), runs the resulting image as the postgres
-under test, runs the `#[ignore]`-gated pg-parity binaries AND the
+(`deploy/docker-1461/provision/lib.sh` — no second, drift-prone copy of
+the pins), creates a per-job database on the runner's always-up native
+PostgreSQL/AGE/pgvector tier (no per-PR `docker build`/`docker run` —
+that path was removed in the v1.0.0 self-hosted CI rewrite), runs the
+`#[ignore]`-gated pg-parity binaries AND the
 AGE-backed cells (`AI_MEMORY_TEST_AGE_URL` set, so they stop
 self-skipping) under `--features sal-postgres --include-ignored`, and a
 version-assert step hard-fails on ANY drift from the exact pinned minors
@@ -484,8 +532,11 @@ tier via `cert-postgres-age.yml` and honestly labels the PG 16 alternate.
 - **Power-loss durability knob + named `asi-hard` posture ([#1961](https://github.com/alphaonedev/ai-memory-mcp/issues/1961), R23/R7).**
   `AI_MEMORY_DB_SYNCHRONOUS` (env-table row #128, default `NORMAL`)
   exposes `PRAGMA synchronous` — `FULL`/`EXTRA` fsync the WAL at every
-  commit so an acknowledged write survives a power cut. A fault-injection
-  harness (`AI_MEMORY_TEST_ABORT_AFTER_COMMIT`, row #129) proves it.
+  commit so an acknowledged write is durable on hardware that honours
+  fsync. A fault-injection harness (`AI_MEMORY_TEST_ABORT_AFTER_COMMIT`,
+  row #129) proves crash consistency across an unclean process exit; real
+  power-cut fsync behavior is not yet evidenced (see PERFORMANCE.md,
+  [#3561](https://github.com/alphaonedev/ai-memory-mcp/issues/3561)).
   `AI_MEMORY_SECURITY_PROFILE=asi-hard` (env-table row #130) engages the
   hardened NO-DISABLE posture: at boot it PINS the fail-closed security
   knobs ON (including `DB_SYNCHRONOUS=FULL`) and REFUSES to boot if an
@@ -556,8 +607,10 @@ program:
    ran, DO was the only place that exact triple had been exercised end to
    end; CI has since begun exercising the certified triple in-PR on
    `release/**` — now standardized to PG 18.6 / AGE 1.8.0 / pgvector 0.8.6
-   (operator directive 2026-08-18) — runs `deploy/docker-1461/Dockerfile.pg-age-vector`
-   built to the SSOT-pinned minors, and version-asserts the exact result — see
+   (operator directive 2026-08-18) — the `cert-postgres-age.yml` workflow
+   runs the pg-parity and AGE suites against a per-job database on the
+   runner's native PostgreSQL/AGE/pgvector tier and checks its live
+   versions against the pins in `deploy/docker-1461/provision/lib.sh` — see
    §"Certified backend versions" for the current in-PR posture)
    and attested (this also covers the v0.9.0 4-phase
    ship-gate boundary per ROADMAP §17's recorded exception, ruling
@@ -583,9 +636,9 @@ program:
    live data), functional green, and a sound `verify-audit-trail` (the
    witness / cause-binding / role-separation / identity-lineage /
    rollback-evidence readouts resolve cleanly on both backends). **That
-   dogfood covers v78 → v86 and nothing above it** — v87, v88, v89 and v90
+   dogfood covers v78 → v86 and nothing above it** — v87 through v100
    landed afterwards on `release/v1.0.0` and are NOT covered by it. See
-   §"Schema ladder v78 → v90".
+   §"Schema ladder v78 → v100".
 
 ### Scope of this attestation
 
@@ -666,20 +719,33 @@ column (a `DROP COLUMN` + `ADD COLUMN` on a derived, regenerated column;
 the durable `title`/`content`/`tags` TEXT is never touched). v90 is
 additive again — two nullable `archived_memories` columns on both
 backends, no full-table rebuild and therefore no trigger recreation
-(the v63/v65 lesson), and it deliberately backfills nothing. Both
-mutating rungs are
+(the v63/v65 lesson), and it deliberately backfills nothing. **v92
+rebuilds SQLite's `schema_version` table** (create
+`schema_version_new` + copy + drop + rename,
+`migrations/sqlite/0076_v92_schema_version_bound.sql`) to add its upper
+bound; postgres adds the bound with `ADD CONSTRAINT`. The rebuild touches
+only the version stamp, never `memories`. **v97 is also row-changing:** besides its additive tables it
+REWRITES existing agent-registration memory rows (`namespace='_agents'`,
+`title='agent:<id>'`) on both backends — it removes
+`metadata.write_signature` and sets `attest_level=claimed` where the stored
+pubkey disagrees with the live history anchor
+(`migrations/sqlite/0081_v97_agent_pubkey_history.sql:118-140`,
+`migrations/postgres/0054_v97_agent_pubkey_history.sql:118-132`). **Take a
+backup before upgrading across v97.** **v100 replaces the
+`(title, namespace)` unique index with a partial index** (index-only).
+The v86 and v87 rungs are
 instant/value-preserving, idempotent, and fail-safe on an unparseable
 value (left byte-untouched rather than destroyed), but they are row
 rewrites and are labelled as such below.
 
 **Migration evidence, at its true bound.** The Gate-3 dogfood
 (§"Gate-3 evidence" step 5) attested a lossless **v78 → v86**
-round-trip on a real corpus. **v87, v88, v89 and v90 are outside that
+round-trip on a real corpus. **v87 through v100 are outside that
 attestation** — all landed on `release/v1.0.0` after the dogfood ran.
 They are covered by their own regression tests, not by a
 real-corpus dogfood. Per the North Star, data-integrity evidence is
 under-claimed rather than stretched: if you are upgrading a populated
-database across v86 → v90, take a backup first (`ai-memory backup`).
+database across v86 → v100, take a backup first (`ai-memory backup`).
 The sqlite ladder additionally writes its own pre-migration
 `VACUUM INTO` snapshot beside the database file before any schema
 mutation. v1.0.0 [#2564](https://github.com/alphaonedev/ai-memory-mcp/issues/2564)
@@ -703,7 +769,7 @@ durable-row probe, so a populated database can never migrate unsnapshotted
 | v88 | postgres composite list/archive ordering indexes — **index-only, no row is read or rewritten** ([#2578](https://github.com/alphaonedev/ai-memory-mcp/issues/2578)). `migrate_v56()` had been recorded as a postgres version-stamp no-op, so the three composite ordering indexes SQLite has carried since v56 were never built on postgres and a namespace-scoped `list` read the whole namespace and sorted it. v88 is postgres catching up; the SQLite v88 arm is a version-stamp no-op so both adapters keep ONE logical schema number. The DDL runs `CREATE INDEX CONCURRENTLY` on a dedicated connection outside any transaction with `lock_timeout` cleared and a bounded `statement_timeout` — a plain in-transaction `CREATE INDEX` is a fleet-wide boot brick (reproduced live: `canceling statement due to lock timeout` at 5.002 s against a table with one ordinary uncommitted writer, on a small table as readily as a large one). It is **FAIL-OPEN**: these indexes are derived, disposable, non-UNIQUE artifacts regenerable from the durable text, so a build failure DEGRADES to today's query plan and the version stamps regardless — refusing to boot a fleet over a missing performance index would trade total availability for zero integrity. Because the stamp means the arm never re-runs, `connect_*` re-probes `indisvalid` on EVERY connect and rebuilds anything missing or left INVALID, so a node that lost one build self-heals instead of staying silently un-indexed |
 | v89 | postgres FTS `tags` fold — cross-backend determinism fix ([#2392](https://github.com/alphaonedev/ai-memory-mcp/issues/2392); 5-agent vote `4d3ea1c5`). SQLite's `memories_fts` FTS5 table has always indexed `(title, content, tags)`, but the postgres stored generated `tsv` tsvector (v57) folded only `title + content`, so a tag-only-hit search / recall / contradiction returned the row on SQLite but ZERO rows on the enterprise (postgres) tier. `migrate_v89` redefines the generated column to fold `coalesce(tags::text, '')` — the generated-column-LEGAL fold (a GENERATED column bars `jsonb_array_elements_text`; the immutable `jsonb -> text` cast's JSON punctuation tokenizes away, leaving the array elements as lexemes under the same `'english'` config already applied to title + content) — and every `tsv`-reading path (search / recall / contradiction / list) is fixed uniformly. PG16 has no `ALTER COLUMN ... SET EXPRESSION`, so the arm is `DROP COLUMN IF EXISTS tsv` (cascades away `memories_tsv_gin`) + `ADD COLUMN tsv ... GENERATED ... STORED` + recreate the GIN, one transaction on the pooled connection retaining `lock_timeout` (the ACCESS EXCLUSIVE STORED-generated rewrite cannot be `CONCURRENTLY`, so it fails CLOSED under contention — DEGRADE to fewer tag results, never a wrong result). The SQLite v89 arm is a version-stamp no-op (FTS5 already indexes tags), so both adapters keep ONE logical schema number. `tsv` is derived data regenerated from the durable text |
 | v90 | archive genesis-cid parity — **purely additive on both backends**, no full-table rebuild and therefore no trigger recreation (the v63/v65 lesson) ([#2385](https://github.com/alphaonedev/ai-memory-mcp/issues/2385)). `archived_memories` never gained the v74/#1825 genesis content-id pair, so every archive `INSERT…SELECT` DROPPED the row's BLAKE3 address on the way into cold storage and both `restore_archived*` paths RE-MINTED it on the way back out, recomputing `stamp_cid(agent_id, namespace, title, memory_kind, created_at, plaintext)` from six reconstructed inputs. A re-mint reproduces the original address only if all six are byte-identical at restore time; a rewritten `metadata.agent_id`, or a decrypt failure whose `unwrap_or` hashes the CIPHERTEXT placeholder instead of the plaintext, silently re-addressed the durable row and dangled every `memory_links.source_cid` / `target_cid` mirror resolving to it — the v74 genesis-identity contract violated with no write intent and no error. v90 adds `cid` (TEXT) + `cid_genesis` (BLOB / BYTEA) to `archived_memories`, carries them through all seven archive funnels on each backend, and makes both restore paths bind the CARRIED pair atomically (`CASE WHEN cid IS NOT NULL THEN cid ELSE <re-mint> END`, and the same predicate for `cid_genesis` — mixing a carried address with a re-derived pre-image would produce a row whose own verify disagrees with itself). It **backfills nothing**: a pre-v90 archived row's genesis address cannot be proven from the archive alone, so those rows keep NULL and keep the legacy re-mint fallback — degrade, never corrupt; inventing an address we cannot prove would be the corruption the rung exists to stop. SQLite applies it as a probe-guarded `ALTER` (no `ADD COLUMN IF NOT EXISTS`); postgres uses `ADD COLUMN IF NOT EXISTS`. Idempotent on both |
-| v97 | proof-of-possession enrollment history — additive `agent_pubkey_history` and single-use `agent_pubkey_bind_challenges` tables on both backends ([#3464](https://github.com/alphaonedev/ai-memory-mcp/issues/3464)). Candidate-key proof can bootstrap only an identity with no prior trust history, or reassert the same live key. Once anchored, a distinct replacement must traverse the predecessor-signed succession or guardian-recovery lineage path; admin role plus possession of an unrelated candidate key cannot replace another identity's trust anchor. Closed or revoked history cannot be reopened by direct bind. |
+| v97 | proof-of-possession enrollment history — **ROW-CHANGING**: adds the `agent_pubkey_history` and single-use `agent_pubkey_bind_challenges` tables on both backends AND rewrites existing agent-registration memory rows (`_agents` namespace: removes `write_signature`, sets `attest_level=claimed`; sqlite `0081:118-140`, postgres `0054:118-132`) — take a backup before upgrading ([#3464](https://github.com/alphaonedev/ai-memory-mcp/issues/3464)). Candidate-key proof can bootstrap only an identity with no prior trust history, or reassert the same live key. Once anchored, a distinct replacement must traverse the predecessor-signed succession or guardian-recovery lineage path; admin role plus possession of an unrelated candidate key cannot replace another identity's trust anchor. Closed or revoked history cannot be reopened by direct bind. |
 
 | v98 | Canonical `_inbox/<agent>` namespace on both backends (#3401). An additive view aliases live and archived legacy rows without rewriting any signed or stored bytes. Idempotent; rollback drops the view. |
 

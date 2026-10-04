@@ -174,7 +174,7 @@ Verify: `ai-memory boot --quiet --limit 1` should report
 
 Restart the IDE. You'll now see 7 `memory_*` tools in the tool list at
 the default `--profile core` (plus the always-on `memory_capabilities`
-bootstrap; `--profile full` advertises 74 entries). Ask the assistant
+bootstrap; `--profile full` advertises 104 entries). Ask the assistant
 "remember that my preferred deploy target is Kubernetes" and next
 session it'll recall it.
 

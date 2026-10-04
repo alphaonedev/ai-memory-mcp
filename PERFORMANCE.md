@@ -451,7 +451,7 @@ contract). Under the default `standard` posture every knob keeps its
 own default (byte-identical legacy). SSOT: `src/security_profile.rs`.
 
 Pinned knobs (unset → pinned to the hard value; already-compliant →
-accepted; set-below-floor → boot REFUSED). All **30** of them, in `KNOBS`
+accepted; set-below-floor → boot REFUSED). All **31** of them, in `KNOBS`
 order — this table is mechanically pinned to the SSOT by SET equality in
 `src/security_profile.rs::tests::performance_md_pinned_knobs_table_matches_the_knobs_ssot_exactly`,
 so a knob can no longer be added to `KNOBS` without a row here, and a row
@@ -490,17 +490,20 @@ here cannot claim a hardening guarantee the binary does not enforce
 | `AI_MEMORY_UNSTAMPED_MUTATION` | `refuse` (a caller-scoped mutation of an UNSTAMPED, legacy-unowned row is refused on every funnel of both backends; `warn` refuses boot. Documented `standard` default stays `warn` — #3124) |
 | `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS` | *(unset)* — PERMISSIVE-shaped: the store-url file lax-perms hatch must be non-truthy; a truthy value (which would accept a group/world-readable `AI_MEMORY_STORE_URL_FILE`) REFUSES boot (#1927/#3813) |
 | `AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS` | *(unset)* — PERMISSIVE-shaped: the per-agent api-key file lax-perms hatch must be non-truthy; a truthy value (which would accept a group/world-readable `AI_MEMORY_AGENT_API_KEY_FILE`) REFUSES boot (#3781/#3813) |
+| `AI_MEMORY_REQUIRE_FORENSIC_SINK` | `1` — a forensic log whose chain tail cannot be established (an I/O error, or no parseable row in any non-empty file) REFUSES boot (exit 78, `doctor` exempt) instead of running without the forensic sink; the `standard` posture degrades with an ERROR, a metric, a doctor Critical and a signed outage row (#4199) |
 
 In addition, `asi-hard` forces the config-backed governance knob
 `[governance].require_operator_pubkey` to `true` at the governance boot
 check. A loosening override (e.g. `AI_MEMORY_SECRET_SCREEN_MODE=off`
 under `asi-hard`) aborts boot with a clear error naming the knob.
 
-With federation peers configured, `asi-hard` also requires a valid,
-nonempty `AI_MEMORY_FED_PEER_ATTESTATION` map (#3582). This conditional
-read-only boot check adds no entry to `KNOBS`. Standard warns about a
-missing/empty/invalid map, while the default namespace requirement refuses
-inbound writes without authorization. Ordinary doctor remains runnable;
+With configured federation, `asi-hard` refuses an absent
+`AI_MEMORY_FED_PEER_ATTESTATION` authorization map; invalid maps also
+refuse hardened boot (#3582). A valid empty `{}` map permits boot and
+authorizes no peers. This conditional read-only boot check adds no entry
+to `KNOBS`. Standard warns for absent required configuration or invalid
+maps. The default namespace gate refuses inbound writes without
+authorization. Ordinary doctor remains runnable;
 see [federation posture and capabilities](docs/federation.md#current-defaults-and-boot-posture-3582)
 for inbound/outbound observation and the explicit Standard opt-out.
 

@@ -3,6 +3,8 @@ layout: doc
 ---
 # Enum proliferation audit — issue #970
 
+> **Point-in-time record, as of 2026-05-21.** The src/ file:line references in this document describe the source tree at commit `ba0e78365666` (read a file there with `git show ba0e78365666:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 **Wave-2 Tier-D3 — Multi-enum proliferation cleanup**
 **Closure path: B (audit + per-enum doc clarification, no consolidation warranted)**
 **Base SHA:** `ba0e783656665529057dec332b262834e4b92a6c`

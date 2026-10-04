@@ -26,6 +26,10 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
 
+#[cfg(feature = "sal-postgres")]
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1172,7 +1176,7 @@ mod pg_race {
     }
 
     async fn wait_blocked_behind(pg: &PostgresStore, holder_pid: i32) {
-        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let end = crate::pg_barrier::deadline();
         loop {
             let blocked: i64 = sqlx::query_scalar(
                 "WITH w AS (SELECT pid, pg_blocking_pids(pid) AS b FROM pg_stat_activity) \
@@ -1303,7 +1307,7 @@ mod pg_merge_race {
     /// Wait until `n` backends are blocked behind `holder_pid` — directly, or
     /// queued behind a waiter that is.
     async fn wait_blocked_behind(pg: &PostgresStore, holder_pid: i32, n: i64) {
-        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let end = crate::pg_barrier::deadline();
         loop {
             let blocked: i64 = sqlx::query_scalar(
                 "WITH w AS (SELECT pid, pg_blocking_pids(pid) AS b FROM pg_stat_activity \
@@ -1420,21 +1424,24 @@ mod pg_merge_race {
 }
 
 /// f1 goal4 FC (#3266), postgres: a caller lifecycle transition
-/// (`update` with a lifecycle target → `apply_lifecycle_patch`) and a racing
-/// quarantine never lose the quarantine. The competing writer attempts its
-/// quarantine AFTER the patch has read the row and BEFORE the patch writes
-/// (f2r's window): with the read locked in the write transaction the
-/// quarantine waits for the patch and lands after it; with an unlocked read
-/// (the pre-fix pool SELECT, or `FOR UPDATE` on the pool — f2r's trap) and no
-/// CAS, the patch overwrites a committed quarantine.
+/// (`update` with a lifecycle target) and a racing quarantine never lose the
+/// quarantine.
+///
+/// #3152 / #4053 — the transition now runs INSIDE the caller's owner-locked update
+/// transaction, so there is no longer a separate patch phase for the
+/// quarantine to slip into (the pre-#4053 window between the content commit
+/// and the patch's own read). The competing writer attempts its quarantine
+/// while the caller is inside its update holding the row lock: it must queue
+/// behind the caller and land AFTER the complete update, and the caller's
+/// update must succeed as a whole (pre-#4053 the queued quarantine won the
+/// row between the two transactions and the caller got a 409 AFTER its content
+/// edit had committed — the #3152 split).
 ///
 /// Deterministic interleaving (no sleeps): H holds `embed_skip` in SHARE mode,
-/// so the caller's main update M (a content edit) stalls in the
-/// `memories_embed_skip_clear` trigger while holding the row lock; S queues a
-/// SHARE lock on `memories` behind M; H commits → M commits → S is granted;
-/// the patch P reads the row, and its UPDATE queues behind S; Q then runs
-/// `SELECT … FOR UPDATE` (compatible with S) — it blocks on P's row lock iff
-/// P's read is locked — and queues its quarantine UPDATE behind S; S commits.
+/// so the caller's update M (a content edit) stalls in the
+/// `memories_embed_skip_clear` trigger while holding the row lock; Q runs
+/// `SELECT … FOR UPDATE` and queues behind M; H commits → M finishes and
+/// commits → Q quarantines.
 #[cfg(feature = "sal-postgres")]
 mod pg_fc_race {
     use super::{T_OLD, uniq};
@@ -1456,7 +1463,7 @@ mod pg_fc_race {
     }
 
     async fn wait_blocked(pg: &PostgresStore, holder_pid: i32, n: i64) {
-        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let end = crate::pg_barrier::deadline();
         while blocked_behind(pg, holder_pid).await < n {
             assert!(tokio::time::Instant::now() < end, "barrier not reached");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1509,21 +1516,7 @@ mod pg_fc_race {
             store.update(&caller_ctx, &rid, patch).await
         });
         wait_blocked(&pg, h_pid, 1).await;
-        // S: a SHARE lock on `memories`, queued behind M's ROW EXCLUSIVE.
-        let (mut share, s_pid) = locked_tx(&pg).await;
-        let s_task = tokio::spawn(async move {
-            sqlx::query("LOCK TABLE memories IN SHARE MODE")
-                .execute(&mut *share)
-                .await
-                .expect("S lock");
-            share
-        });
-        wait_blocked(&pg, h_pid, 2).await;
-        holder.commit().await.expect("H release");
-        let share = s_task.await.expect("S join");
-        // P has read the row; its UPDATE waits on S.
-        wait_blocked(&pg, s_pid, 1).await;
-        // Q: lock the row (compatible with S), then quarantine (waits on S).
+        // Q: lock the row, then quarantine — queued behind M's row lock.
         let (mut quarantiner, _q_pid) = locked_tx(&pg).await;
         let qid = id.clone();
         let q_task = tokio::spawn(async move {
@@ -1539,8 +1532,9 @@ mod pg_fc_race {
                 .expect("Q quarantine");
             quarantiner.commit().await.expect("Q commit");
         });
-        wait_blocked(&pg, s_pid, 2).await;
-        share.commit().await.expect("S release");
+        // M behind H, and Q behind M.
+        wait_blocked(&pg, h_pid, 2).await;
+        holder.commit().await.expect("H release");
         q_task.await.expect("Q join");
         let outcome = caller.await.expect("caller join");
         let state: String =
@@ -1552,6 +1546,10 @@ mod pg_fc_race {
         assert_eq!(
             state, "quarantined",
             "a caller transition overwrote a racing quarantine (outcome {outcome:?})"
+        );
+        outcome.expect(
+            "#4053: the caller's update (content + transition) completes as one unit \
+             before the queued quarantine; it is never refused after its content committed",
         );
     }
 }

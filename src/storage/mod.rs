@@ -859,10 +859,44 @@ pub(crate) fn escape_like_pattern(s: &str) -> String {
 // `pub use storage as db;` shim in `src/lib.rs` preserves the
 // historical `crate::db::*` paths used elsewhere.
 pub(crate) mod connection;
+mod governance_read;
+#[cfg(feature = "sal-postgres")]
+pub(crate) use governance_read::warn_corrupt_standard;
+pub use governance_read::{
+    CORRUPT_STANDARD_BACKEND_POSTGRES, CORRUPT_STANDARD_BACKEND_SQLITE, CorruptReason,
+    CorruptStandard, GOVERNANCE_POLICY_UNREADABLE, StandardMetadata,
+    boot_warn_corrupt_governance_standards, classify_standard_metadata,
+    classify_standard_metadata_text, classify_standard_metadata_value,
+    list_corrupt_governance_standards, resolve_governance_policy_for_optional_feature,
+    standard_metadata_corruption, warn_corrupt_governance_standards,
+};
+use governance_read::{
+    CTX_READ_NAMESPACE_STANDARD, SQL_SELECT_NAMESPACE_STANDARD_ID, try_get_namespace_parent,
+    try_get_namespace_standard,
+};
 pub(crate) mod contamination_marker;
 pub(crate) use contamination_marker::StampAuthority;
 pub(crate) mod decontaminate;
 mod lifecycle_write;
+// #4023 — the in-transaction peer-scope re-check on the sqlite federation merge
+// (`merge_inbound_authorized` + its typed refusal + the shared refusal
+// builder). Its own child module so this file's qual_10 ceiling is not
+// consumed by it; re-exported below so every `db::` / `storage::` path is
+// unchanged.
+mod merge_inbound_authorized_4023;
+pub use merge_inbound_authorized_4023::{
+    InboundStoredNamespaceRefused, StoredNamespaceAuthorizer, inbound_stored_namespace_refused,
+    merge_inbound_authorized,
+};
+// #4447 — the in-transaction peer-scope re-check on the sqlite federation
+// by-id lanes (deletions / archives / restores / links). Own child module for
+// the same qual_10 reason as `merge_inbound_authorized_4023`.
+mod federation_by_id_4447;
+pub use federation_by_id_4447::{
+    ByIdNamespaceAuthorizer, InboundByIdNamespaceRefused, archive_memory_authorized,
+    create_link_inbound_authorized, delete_authorized, inbound_by_id_namespace_refused,
+    restore_archived_authorized,
+};
 // `pub` (rather than `pub(crate)`) so the V-4 closeout
 // integration test suite (`tests/signed_events_chain_v34.rs`) can
 // invoke `migrate_v34_backfill_chain` directly to exercise the
@@ -871,14 +905,19 @@ mod lifecycle_write;
 // #1720 B3 — boot owner-lockout probe (read-only COUNT over the indexed
 // visibility generated columns). Lives in its own submodule to keep this
 // already-large module under the qual_10 size ceiling.
+/// #1964 [P1][D14] — recall-completeness index-coverage reconciliation:
+/// reconciles what the FTS5 + ANN recall indexes cover against the
+/// `memories` table so recall can report its coverage honestly.
+mod approval_depth;
 /// #1802 (R-05, S1) — doctor / observability probes extracted verbatim from
 /// this module. PRIVATE module (M-SINGLE-ITEM-PATH): every public item is
 /// re-exported below so the only public paths stay `crate::storage::*` /
 /// `crate::db::*`, byte-identical to pre-split.
 mod doctor;
-/// #1964 [P1][D14] — recall-completeness index-coverage reconciliation:
-/// reconciles what the FTS5 + ANN recall indexes cover against the
-/// `memories` table so recall can report its coverage honestly.
+pub use approval_depth::{
+    ApprovalDepthLevel, ApprovalDepthLevelState, ApprovalDepthWalk, approval_depth_level_decision,
+    approval_depth_level_state, resolve_require_approval_above_depth,
+};
 pub mod embed_skip;
 /// v1.0.0 #3288 — sqlite half of the bounded, keyset-paged admin export.
 pub mod export_page;
@@ -905,6 +944,10 @@ pub mod record_stop;
 // v1.0.0 #2445 — the schema DOWNGRADE guard (an OLDER binary must not
 // silently open and WRITE a NEWER database). Its own module so the pure
 // verdict is shared verbatim by the sqlite and postgres funnels.
+/// #4492 — sqlite reader for the bind-time chain-depth refusal.
+pub mod bind_chain_depth;
+/// #4356 — sqlite reader for the ancestor-owner bind gate.
+pub mod ns_standard_ancestor;
 pub(crate) mod reflect;
 pub mod schema_guard;
 /// v1.0.0 (#3113) — core-relation integrity for the migration ladder.
@@ -948,6 +991,8 @@ pub use connection::open_read_only;
 pub use connection::{MISSING_DATABASE_REFUSAL, open_existing_read_only};
 // v1.0.0 #2445 — the EGRESS + guard surface (see `schema_guard` module docs).
 pub use connection::{assert_schema_not_ahead, open_unmigrated, probe_schema_stamp};
+// v1.0.0 #3152 — one write transaction for a multi-statement logical write.
+pub use connection::in_write_txn;
 // #1579 B7 — mmap_size knob. `set_db_mmap_size` is the boot-time
 // seeding hook (`daemon_runtime::run`); the DEFAULT const is the
 // compiled fallback the `AppConfig::resolve_storage()` ladder bottoms
@@ -1071,6 +1116,47 @@ fn undecryptable_row_error(detail: String) -> rusqlite::Error {
         rusqlite::types::Type::Blob,
         Box::new(std::io::Error::other(detail)),
     )
+}
+
+/// #4133 — what a `memories.encrypted_envelope` cell holds, WITHOUT the
+/// fail-open `Option<Vec<u8>>` + `.unwrap_or(None)` read that folded a
+/// column TYPE error into "no envelope".
+pub(crate) enum EnvelopeColumn {
+    /// SQL NULL, or the column is not in the result set (pre-v44 backup).
+    Absent,
+    /// A BLOB: the envelope bytes (possibly truncated / corrupt — the
+    /// decrypt step decides).
+    Blob(Vec<u8>),
+    /// A non-NULL, non-BLOB value (`"text"` / `"integer"` / `"real"`): never
+    /// a valid envelope, never "absent". Callers fail closed.
+    Malformed(&'static str),
+}
+
+/// #4133 — read an envelope cell by column name or index.
+///
+/// # Errors
+/// Any read failure other than the column being absent from the row.
+pub(crate) fn read_envelope_column<I: rusqlite::RowIndex>(
+    row: &rusqlite::Row<'_>,
+    idx: I,
+) -> rusqlite::Result<EnvelopeColumn> {
+    use rusqlite::types::ValueRef;
+    match row.get_ref(idx) {
+        Ok(ValueRef::Null) | Err(rusqlite::Error::InvalidColumnName(_)) => {
+            Ok(EnvelopeColumn::Absent)
+        }
+        Ok(ValueRef::Blob(bytes)) => Ok(EnvelopeColumn::Blob(bytes.to_vec())),
+        Ok(ValueRef::Text(_)) => Ok(EnvelopeColumn::Malformed("text")),
+        Ok(ValueRef::Integer(_)) => Ok(EnvelopeColumn::Malformed("integer")),
+        Ok(ValueRef::Real(_)) => Ok(EnvelopeColumn::Malformed("real")),
+        Err(e) => Err(e),
+    }
+}
+
+/// #4133 — the fail-closed detail for a non-BLOB envelope cell (no value
+/// bytes are echoed).
+pub(crate) fn malformed_envelope_detail(kind: &str) -> String {
+    format!("encrypted_envelope holds a non-BLOB {kind} value (corrupt or tampered row)")
 }
 
 /// #3404 — the ONE canonical `memories` row projection. Every
@@ -1297,54 +1383,74 @@ fn row_to_memory_with_policy(
     // #228 Commit B — at-rest content decryption. The decrypt branch is
     // gated on envelope PRESENCE (a non-NULL `encrypted_envelope`), NOT on
     // `encryption_enabled`, so rows written while encryption was on remain
-    // readable after the flag is toggled off. When the column is NULL
+    // readable after the flag is toggled off. When the column is SQL NULL
     // (every legacy row + every row written under encryption-off) this is
     // a no-op — `memory.content` keeps the plaintext read above, so the
-    // default path stays byte-identical. `.unwrap_or(None)` tolerates the
-    // column being absent on a pre-v44 backup (the migrate ladder may not
-    // have reached this DB yet); an absent column reads as NULL.
-    let enc: Option<Vec<u8>> = row
-        .get::<_, Option<Vec<u8>>>(field_names::ENCRYPTED_ENVELOPE)
-        .unwrap_or(None);
-    if let Some(bytes) = enc {
-        let agent_id = memory
-            .metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        match crate::encryption::open_content(&bytes, agent_id) {
-            Ok(plaintext) => memory.content = plaintext,
-            Err(e) => {
-                // NEVER return the empty placeholder as if it were the
-                // plaintext content — that would silently surface an empty
-                // memory and mask key loss / corruption. The only two legal
-                // dispositions are "error" and "omit"; see
-                // [`DecryptFailurePolicy`] for which read takes which.
-                //
-                // v1.0.0 #2383 (N1) — SkipRow keeps ONE poisoned row from
-                // denying an entire namespace's `list` / `recall`. The row is
-                // NOT modified or deleted: its ciphertext stays on disk and
-                // becomes readable again the moment the correct keypair is
-                // restored (or `AI_MEMORY_STRICT_DECRYPT_READS=1` is set to
-                // surface the failure loudly instead).
-                if policy == DecryptFailurePolicy::SkipRow && !strict_decrypt_reads_enabled() {
-                    tracing::warn!(
-                        target: UNDECRYPTABLE_ROW_TRACE_TARGET,
-                        row_id = %memory.id,
-                        namespace = %memory.namespace,
-                        agent_id = %agent_id,
-                        error = %e,
-                        "{UNDECRYPTABLE_ROW_SKIPPED_MSG}"
-                    );
-                    crate::metrics::record_corrupt_provenance(field_names::ENCRYPTED_ENVELOPE);
-                    return Ok(None);
-                }
-                // #3718 — an ABSENT key renders as its class, never as a
-                // wrong-recipient "decrypt failed", and never with a path.
-                return Err(undecryptable_row_error(
-                    crate::encryption::read_failure_detail(&e),
-                ));
+    // default path stays byte-identical. A column ABSENT from the result set
+    // (a pre-v44 backup the migrate ladder has not reached) also reads as no
+    // envelope.
+    //
+    // #4133 — a non-NULL value that is NOT a BLOB (TEXT / INTEGER / REAL:
+    // a column type error from corruption or tampering) is NOT "no
+    // envelope". The old `.unwrap_or(None)` read it as absent and returned
+    // the plaintext `content` column as if the row were unencrypted (fail
+    // OPEN). It now takes the SAME fail-closed disposition as an
+    // undecryptable envelope below: error on a targeted read, omit with a
+    // WARN + metric on a scan. A truncated BLOB reaches `open_content` and
+    // fails there.
+    let opened: Option<std::result::Result<String, String>> =
+        match read_envelope_column(row, field_names::ENCRYPTED_ENVELOPE)? {
+            EnvelopeColumn::Absent => None,
+            EnvelopeColumn::Blob(bytes) => {
+                let agent_id = memory
+                    .metadata
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Some(
+                    crate::encryption::open_content(&bytes, agent_id)
+                        // #3718 — an ABSENT key renders as its class, never
+                        // as a wrong-recipient "decrypt failed", never with a
+                        // path.
+                        .map_err(|e| crate::encryption::read_failure_detail(&e)),
+                )
             }
+            EnvelopeColumn::Malformed(kind) => Some(Err(malformed_envelope_detail(kind))),
+        };
+    match opened {
+        None => {}
+        Some(Ok(plaintext)) => memory.content = plaintext,
+        Some(Err(detail)) => {
+            // NEVER return the empty placeholder (or the raw plaintext
+            // column) as if it were the content — that would silently
+            // surface wrong data and mask key loss / corruption. The only
+            // two legal dispositions are "error" and "omit"; see
+            // [`DecryptFailurePolicy`] for which read takes which.
+            //
+            // v1.0.0 #2383 (N1) — SkipRow keeps ONE poisoned row from
+            // denying an entire namespace's `list` / `recall`. The row is
+            // NOT modified or deleted: its ciphertext stays on disk and
+            // becomes readable again the moment the correct keypair is
+            // restored (or `AI_MEMORY_STRICT_DECRYPT_READS=1` is set to
+            // surface the failure loudly instead).
+            if policy == DecryptFailurePolicy::SkipRow && !strict_decrypt_reads_enabled() {
+                let agent_id = memory
+                    .metadata
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                tracing::warn!(
+                    target: UNDECRYPTABLE_ROW_TRACE_TARGET,
+                    row_id = %memory.id,
+                    namespace = %memory.namespace,
+                    agent_id = %agent_id,
+                    error = %detail,
+                    "{UNDECRYPTABLE_ROW_SKIPPED_MSG}"
+                );
+                crate::metrics::record_corrupt_provenance(field_names::ENCRYPTED_ENVELOPE);
+                return Ok(None);
+            }
+            return Err(undecryptable_row_error(detail));
         }
     }
 
@@ -4442,14 +4548,9 @@ pub fn update_with_expected_version(
     // transaction", so we open our own tx ONLY when none is active
     // (`is_autocommit()` is true only outside a transaction); when the
     // caller owns the tx, the archive + UPDATE run inside it and the
-    // caller's commit/rollback covers atomicity.
-    let owns_tx = conn.is_autocommit();
-    let write_txn = if owns_tx {
-        Some(connection::WriteTxn::begin(conn)?)
-    } else {
-        None
-    };
-    let txn_result = (|| -> Result<(bool, bool)> {
+    // caller's commit/rollback covers atomicity. #3152 — that join is what
+    // lets a caller fold a lifecycle transition into the SAME transaction.
+    connection::in_write_txn(conn, || -> Result<(bool, bool)> {
         if content_changed {
             archive_memory_insert_only(
                 conn,
@@ -4555,23 +4656,7 @@ pub fn update_with_expected_version(
             }
             Err(e) => Err(e.into()),
         }
-    })();
-    match txn_result {
-        Ok(r) => {
-            if let Some(write_txn) = write_txn {
-                write_txn.commit()?;
-            }
-            Ok(r)
-        }
-        Err(e) => {
-            // Only roll back a tx we opened. When the caller owns the tx,
-            // propagating the Err lets THEIR rollback revert the archive.
-            if let Some(write_txn) = write_txn {
-                write_txn.rollback();
-            }
-            Err(e)
-        }
-    }
+    })
 }
 
 /// v0.7.0 Provenance Gap 5 (issue #888) — append-and-archive result
@@ -5313,7 +5398,17 @@ pub fn reverse_conserve_contradiction(
 /// Returns an error if the INSERT-SELECT or DELETE fails.
 pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Result<bool> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
-    let write_txn = connection::WriteTxn::begin(conn)?;
+    // #3957 — transaction-aware, the `update_with_expected_version` /
+    // `delete` precedent: the SAL delete funnel now runs its ownership gate
+    // and this archive-then-delete in ONE caller-owned `BEGIN IMMEDIATE`, so
+    // open our own tx only when none is active and otherwise join the caller's.
+    let Some(write_txn) = conn
+        .is_autocommit()
+        .then(|| connection::WriteTxn::begin(conn))
+        .transpose()?
+    else {
+        return archive_memory_no_tx(conn, id, reason);
+    };
     let result = archive_memory_no_tx(conn, id, reason);
     match result {
         Ok(moved) => {
@@ -5698,7 +5793,16 @@ pub fn undo_in_place_edit(
                 let metadata_json: String =
                     r.get::<_, String>(8).unwrap_or_else(|_| "{}".to_string());
                 let raw_content: String = r.get(1)?;
-                let envelope: Option<Vec<u8>> = r.get::<_, Option<Vec<u8>>>(10).unwrap_or(None);
+                // #4133 — a non-BLOB envelope cell is corrupt, never "absent":
+                // restoring its raw `content` would silently write the
+                // placeholder back as the memory's content.
+                let envelope: Option<Vec<u8>> = match read_envelope_column(r, 10)? {
+                    EnvelopeColumn::Absent => None,
+                    EnvelopeColumn::Blob(bytes) => Some(bytes),
+                    EnvelopeColumn::Malformed(kind) => {
+                        return Err(undecryptable_row_error(malformed_envelope_detail(kind)));
+                    }
+                };
                 let content =
                     match resolve_embeddable_content(id, raw_content, envelope, &metadata_json) {
                         Some(c) => c,
@@ -5906,8 +6010,8 @@ pub(crate) fn caller_may_mutate_live_row(
 /// in the live `memories` table whose `metadata->'agent_id'` JSON
 /// field matches `caller` (with the inbox-target carve-out:
 /// `metadata->'target_agent_id' == caller` is also archivable by
-/// the inbox owner, matching
-/// [`crate::store::is_visible_to_caller`]).
+/// the inbox owner, matching the owner/inbox arm of
+/// [`crate::visibility::is_visible_by_fields`]).
 ///
 /// Pre-#940 the HTTP handler at
 /// `src/handlers/archive.rs::archive_by_ids` (sqlite branch) called
@@ -8509,7 +8613,10 @@ pub fn apply_token_budget(
     )
 }
 
-/// Recall — fuzzy OR search + touch + auto-promote + TTL extension.
+/// Recall — fuzzy OR search + optional semantic blend. Pure since #1953:
+/// it appends `recall_observations` rows only; the periodic fold job applies
+/// the access count and the per-tier TTL floor-extend, and no recall path
+/// promotes a tier (removed by v1.0.0 Boids item 1, vote 4d3ea1c5).
 /// Task 1.11: after ranking, applies optional `budget_tokens` cap.
 /// Phase P6: returns the full `BudgetOutcome` (tokens_used,
 /// tokens_remaining, memories_dropped, budget_overflow) instead of just
@@ -9638,7 +9745,8 @@ pub fn validate_link_pre_create(
             Ok(Some(m)) => m.namespace,
             _ => crate::DEFAULT_NAMESPACE.to_string(),
         };
-        let max_depth = resolve_governance_policy(conn, &link_ns)
+        // #4043 — unreadable policy refuses; never the default depth cap.
+        let max_depth = resolve_governance_policy(conn, &link_ns)?
             .unwrap_or_default()
             .effective_max_reflection_depth();
         if crate::kg::cycle_check::would_create_reflection_cycle(
@@ -10589,6 +10697,46 @@ pub fn consolidate(
     consolidator_agent_id: &str,
     substrate_authored: bool,
 ) -> Result<String> {
+    consolidate_with_expected_versions(
+        conn,
+        ids,
+        title,
+        summary,
+        namespace,
+        tier,
+        source,
+        consolidator_agent_id,
+        substrate_authored,
+        None,
+    )
+}
+
+/// Consolidate only if every source still has the version used to summarize it.
+/// `expected_versions`, when present, must be aligned one-for-one with `ids`.
+/// The comparison and all mutations share the immediate write transaction.
+///
+/// # Errors
+/// Returns a version conflict for stale inputs and propagates storage errors.
+#[allow(clippy::too_many_arguments)]
+pub fn consolidate_with_expected_versions(
+    conn: &Connection,
+    ids: &[String],
+    title: &str,
+    summary: &str,
+    namespace: &str,
+    tier: &Tier,
+    source: &str,
+    consolidator_agent_id: &str,
+    substrate_authored: bool,
+    expected_versions: Option<&[i64]>,
+) -> Result<String> {
+    crate::validate::validate_content(summary)?;
+    if let Some(versions) = expected_versions {
+        anyhow::ensure!(
+            versions.len() == ids.len(),
+            "source version count must match source ids"
+        );
+    }
     // #1955 R45 — record-stop fence for the consolidate funnel.
     crate::storage::record_stop::gate_storage_conn(conn)?;
     // #3014 — a TENANT consolidate is a memory-creating write (it mints a
@@ -10645,9 +10793,19 @@ pub fn consolidate(
         // confidence (which `get` already coalesces to that default) never
         // silently inflates the result.
         let mut min_confidence = crate::models::DEFAULT_CONFIDENCE;
-        for id in ids {
+        for (index, id) in ids.iter().enumerate() {
             match get(conn, id)? {
                 Some(mem) => {
+                    if let Some(versions) = expected_versions
+                        && versions[index] != mem.version
+                    {
+                        return Err(VersionConflict {
+                            id: id.clone(),
+                            expected: versions[index],
+                            current: mem.version,
+                        }
+                        .into());
+                    }
                     source_rows.push((
                         id.clone(),
                         mem.cid.clone(),
@@ -17054,6 +17212,17 @@ fn canonical_archived_expiry(conn: &Connection, id: &str) -> Result<Option<Strin
 }
 
 pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
+    restore_archived_impl(conn, id, None)
+}
+
+/// Body of [`restore_archived`] and (#4447) [`restore_archived_authorized`]:
+/// `authorize` is `None` for the unchecked operator restore and `Some` for the
+/// federated `restores[]` lane's in-transaction peer-scope re-check.
+fn restore_archived_impl(
+    conn: &Connection,
+    id: &str,
+    authorize: Option<ByIdNamespaceAuthorizer<'_>>,
+) -> Result<bool> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let now = Utc::now().to_rfc3339();
     let _erasure_guard = crate::erasure::archive_sync::coordination_lock_if_enabled(conn)?;
@@ -17079,6 +17248,20 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
             {
                 return Ok(false);
             }
+        }
+        // #4447 — re-authorize the ARCHIVED row's stored namespace under this
+        // transaction's write lock (after any cold-tier reconstruction above):
+        // the funnel's scope gate ran on an earlier read, and a broader writer
+        // can have re-keyed the archived row since.
+        if let Some(authorize) = authorize
+            && let Some(stored) = archived_namespace_by_id(conn, id)?
+            && !authorize(id, &stored)
+        {
+            return Err(anyhow::Error::new(InboundByIdNamespaceRefused {
+                lane: crate::federation::receive_auth::LANE_RESTORES,
+                id: id.to_string(),
+                stored_namespace: stored,
+            }));
         }
         // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): an
         // OPERATOR-initiated restore is an AUTHORIZED un-forget and must
@@ -17279,8 +17462,8 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
 /// rows whose `metadata->'agent_id'` JSON field matches `caller`
 /// (with the inbox-target carve-out: rows whose
 /// `metadata->'target_agent_id'` matches `caller` are also
-/// restorable by the inbox owner, matching the SAL
-/// [`crate::store::is_visible_to_caller`] visibility predicate).
+/// restorable by the inbox owner, matching the owner/inbox arm of the
+/// [`crate::visibility::is_visible_by_fields`] visibility predicate).
 ///
 /// Pre-#940 the only restore variant was owner-blind; any
 /// authenticated HTTP caller could restore any other owner's
@@ -17774,8 +17957,8 @@ pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<
 /// `metadata->'agent_id'` JSON field matches `caller` (with the
 /// inbox-target carve-out: rows whose `metadata->'target_agent_id'`
 /// matches `caller` are also purgeable by the inbox owner, matching
-/// the SAL [`crate::store::is_visible_to_caller`] visibility
-/// predicate).
+/// the owner/inbox arm of the [`crate::visibility::is_visible_by_fields`]
+/// visibility predicate).
 ///
 /// Pre-#936 the only purge variant was owner-blind; any authenticated
 /// HTTP caller could destroy every owner's archive corpus via
@@ -18222,8 +18405,11 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                 -- UPDATE and never pass can_transition_to, so the replicated
                 -- lifecycle value is NOT uniformly transition-validated -- the
                 -- enforcement gap is deferred to v1.1 per #3750.
-                -- Boids item 3 R2.1: local system-only never replaced, remote
-                -- system-only never adopted, else newer-wins (one shared twin).
+                -- Boids item 3 R2.1 (crdt_merge::merge_lifecycle_local_taint_wins,
+                -- one shared twin): a LOCAL contaminated / quarantined is never
+                -- replaced; a REMOTE contaminated is never adopted; every other
+                -- case, including a remote quarantined or tombstoned, is
+                -- newer-wins.
                 lifecycle_state = {lifecycle_case},
                 -- v1.0.0 #2333 (FBL-03) + v1.0.0 #2394 — the v79 denormalized
                 -- kind_provenance FOLLOWS THE KIND THAT ACTUALLY WON on the
@@ -18600,106 +18786,20 @@ pub fn archived_namespace_by_id(conn: &Connection, id: &str) -> Result<Option<St
 /// Bubbles up rusqlite / serde errors from the read, the merge-write, or
 /// the `insert_if_newer` fall-through. On any error inside the merge
 /// transaction the partial write is rolled back.
+///
+/// **UNCHECKED (#4023).** This wrapper does NOT re-authorize the pushing
+/// peer's namespace scope against the row it locks (it forwards a `None`
+/// authorizer). Tests and the sqlite adapter delegation only; every
+/// production federation caller must use [`merge_inbound_authorized`], and
+/// `tests/merge_inbound_unchecked_ceiling_4023.rs` pins that mechanically.
 pub fn merge_inbound(
     conn: &Connection,
     inbound: &Memory,
     receiver_verified: bool,
 ) -> Result<String> {
-    // Wave-2 B2 — record-stop fence on the same-id overwrite path.
-    // `insert_if_newer` (no-row fall-through) already gated; the existing-row
-    // branch used to bypass via `overwrite_full_row_by_id`. Federation-receive
-    // (`handlers/federation_receive.rs`) calls this free-fn directly, so the
-    // SAL `SqliteStore::merge_inbound` gate is not sufficient (ERRORS-09).
-    crate::storage::record_stop::gate_storage_conn(conn)?;
-    // Take the write lock up front so the read-merge-write is atomic
-    // against a concurrent peer push (BEGIN IMMEDIATE — same idiom as
-    // `consolidate` / `size_gc`).
-    let write_txn = connection::WriteTxn::begin(conn)?;
-    let tx_result = (|| -> Result<Option<String>> {
-        // Boids item 3 R2.2 (#3905) — `get_any`, not `get`: `get` hides
-        // system-only rows, so a contaminated local row fell through to the
-        // insert lane instead of reaching `merge_memory` (whose R2.1
-        // predicate keeps the local taint). The postgres twin already reads
-        // the raw row by id (`SQL_SELECT_MEMORY_ROW_BY_ID`).
-        match get_any(conn, &inbound.id)? {
-            Some(existing) => {
-                // #2123 — backend parity with `PostgresStore::merge_inbound`:
-                // the same-`id` field-merge path persists via
-                // `overwrite_full_row_by_id`, which (deliberately) bypasses
-                // the `insert` / `insert_if_newer` chokepoints — so pre-#2123
-                // this funnel consulted NEITHER the pre-write governance hook
-                // NOR the covenant clause-1 inbound why_trace gate NOR the
-                // secret screen, while the postgres twin runs all three.
-                // Screen first (ALWAYS redact, NEVER refuse — a refused
-                // inbound row would diverge replicas, env #95), then consult
-                // governance (refusal rolls the merge back, postgres parity),
-                // then the never-refuse inbound why_trace gate (advisory
-                // WARN + forensic record only — CRDT convergence is the
-                // load-bearing property of the merge primitive).
-                let screened = crate::secret_screen::redact_memory_for_receive(inbound);
-                let inbound = screened.as_ref().unwrap_or(inbound);
-                consult_governance_pre_write(inbound)?;
-                consult_why_trace_gate_inbound(inbound);
-                // #1719 item 3a — NEVER trust a peer's self-asserted
-                // attestation for the merge tiebreak: neutralize the
-                // inbound's `metadata.attest_level` to `claimed` so a
-                // forged remote cannot win the attested-identity LWW
-                // tiebreak by self-asserting `agent_attested`. Only the
-                // receiver's own stored local level can win on attestation.
-                let sanitized = crate::models::sanitize_inbound_attestation(inbound);
-                // #1755 item 3b — cap a relayed row's post-dated
-                // `updated_at` (the primary LWW key) to a freshness ceiling
-                // so an enrolled relay cannot win the merge by stamping a
-                // far-future timestamp. now + the attestation skew window.
-                let prepared = crate::models::clamp_inbound_updated_at(
-                    sanitized,
-                    &chrono::Utc::now().to_rfc3339(),
-                    crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS,
-                );
-                // #224 field-wise merge — the SAME pure reconciler the
-                // postgres adapter calls in Rust (no per-backend drift).
-                let merged = crate::models::merge_memory(&existing, &prepared);
-                // #2863 — re-assert the receiver-VERIFIED `agent_attested` level
-                // ATOMICALLY (inside this BEGIN IMMEDIATE tx, before the
-                // content-sealing `overwrite_full_row_by_id`). `sanitize` above
-                // demoted the inbound level to `claimed` for the LWW tiebreak
-                // (correct — a peer must not self-assert), but that must not
-                // DEMOTE a level THIS node verified over the persisted bytes:
-                // when the merged row's full SignableWrite surface + signature is
-                // byte-identical to the verified inbound, restore `agent_attested`.
-                // No-op when `receiver_verified` is false (every non-receive
-                // caller) — byte-identical legacy merge.
-                let merged = crate::models::reassert_verified_attestation(
-                    merged,
-                    inbound,
-                    receiver_verified,
-                );
-                overwrite_full_row_by_id(conn, &merged)?;
-                Ok(Some(merged.id))
-            }
-            // No row by this id — defer to the (title, namespace) dedup
-            // path OUTSIDE this transaction (signalled by `None`).
-            None => Ok(None),
-        }
-    })();
-
-    match tx_result {
-        Ok(Some(id)) => {
-            write_txn.commit()?;
-            Ok(id)
-        }
-        Ok(None) => {
-            // Nothing was written in the merge transaction; close it
-            // cleanly and fall through to the unchanged LWW path
-            // (handles fresh insert + (title, namespace) dedup-upsert).
-            write_txn.commit()?;
-            insert_if_newer(conn, inbound)
-        }
-        Err(e) => {
-            write_txn.rollback();
-            Err(e)
-        }
-    }
+    // UNCHECKED: no peer-scope re-check (#4023). Tests and the sqlite adapter
+    // delegation only — pinned by `tests/merge_inbound_unchecked_ceiling_4023.rs`.
+    merge_inbound_authorized(conn, inbound, receiver_verified, None)
 }
 
 /// v0.8.0 Pillar-3 (#1709 / #224) — persist a fully-merged [`Memory`] by
@@ -18737,7 +18837,7 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
     // copy instead of permanently discarding prior local content. INSERT OR
     // REPLACE so a repeated merge of the same id is idempotent; archives the
     // CURRENT row (incl its encrypted_envelope) before the UPDATE below.
-    archive_memory_insert_only(conn, &mem.id, "federation_merge")?;
+    archive_memory_insert_only(conn, &mem.id, field_names::ARCHIVE_REASON_FEDERATION_MERGE)?;
 
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
@@ -22370,13 +22470,17 @@ pub fn set_namespace_standard(
         None => auto_detect_parent(conn, namespace)?,
     };
     let now = chrono::Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
+    // #4492 — the chain-depth admission and the row in ONE write transaction.
+    connection::in_write_txn(conn, || {
+        bind_chain_depth::admit_bind(conn, namespace, resolved_parent.as_deref())?;
+        conn.execute(
+            "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(namespace) DO UPDATE SET standard_id = ?2, updated_at = ?3, parent_namespace = ?4",
-        params![namespace, standard_id, now, resolved_parent],
-    )?;
-    Ok(())
+            params![namespace, standard_id, now, resolved_parent],
+        )?;
+        Ok(())
+    })
 }
 
 /// Auto-detect parent namespace by `-` prefix.
@@ -22425,11 +22529,9 @@ fn auto_detect_parent(conn: &Connection, namespace: &str) -> Result<Option<Strin
 #[allow(clippy::unnecessary_wraps)]
 pub fn get_namespace_standard(conn: &Connection, namespace: &str) -> Result<Option<String>> {
     let result = conn
-        .query_row(
-            "SELECT standard_id FROM namespace_meta WHERE namespace = ?1",
-            params![namespace],
-            |r| r.get(0),
-        )
+        .query_row(SQL_SELECT_NAMESPACE_STANDARD_ID, params![namespace], |r| {
+            r.get(0)
+        })
         .ok();
     Ok(result)
 }
@@ -22533,7 +22635,7 @@ pub fn clear_namespace_standard(conn: &Connection, namespace: &str) -> Result<bo
 /// reuse the same walk.
 ///
 /// Properties (preserved from the prior MCP-only implementation):
-/// - cycle-safe (visited set + bounded by `MAX_EXPLICIT_DEPTH = 8`)
+/// - cycle-safe (visited set); complete up to `MAX_NAMESPACE_DEPTH`, refused beyond (#4477)
 /// - includes the global standard `*` as the most-general entry
 /// - prepends explicit `namespace_meta.parent_namespace` ancestors
 ///   before the `/`-derived hierarchy, supporting flat→hierarchical
@@ -22545,6 +22647,7 @@ pub fn clear_namespace_standard(conn: &Connection, namespace: &str) -> Result<bo
 #[must_use]
 pub fn build_namespace_chain(conn: &Connection, namespace: &str) -> Vec<String> {
     build_namespace_chain_view(conn, namespace, ChainView::Lookup)
+        .unwrap_or_else(|e| governance_read::structural_chain_fallback(namespace, &e))
 }
 
 /// #2542 — which VIEW of the namespace chain to build.
@@ -22602,24 +22705,29 @@ enum ChainView {
 /// severed / dangling, or the standard is UNOWNED (empty / exact `system` /
 /// [`crate::identity::sentinels::SYSTEM_PRINCIPAL`]). The unowned-set mirrors the
 /// bind gate [`crate::mcp::authorize_namespace_standard_bind`] exactly.
-fn namespace_standard_owner(conn: &Connection, namespace: &str) -> Option<String> {
-    let owner = get_namespace_standard(conn, namespace)
-        .ok()
-        .flatten()
-        .and_then(|sid| get(conn, &sid).ok().flatten())
-        .and_then(|mem| {
-            mem.metadata
-                .get("agent_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })?;
+/// #4043 — a read fault is an `Err`, never "unowned".
+fn namespace_standard_owner(conn: &Connection, namespace: &str) -> Result<Option<String>> {
+    let Some(sid) = try_get_namespace_standard(conn, namespace)? else {
+        return Ok(None);
+    };
+    let Some(mem) = get(conn, &sid).context("governance: read namespace standard (owner)")? else {
+        return Ok(None);
+    };
+    let Some(owner) = mem
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
     if owner.is_empty()
         || owner == "system"
         || owner == crate::identity::sentinels::SYSTEM_PRINCIPAL
     {
-        None
+        Ok(None)
     } else {
-        Some(owner)
+        Ok(Some(owner))
     }
 }
 
@@ -22642,11 +22750,11 @@ fn parent_link_governance_entitled(
     conn: &Connection,
     declarer_owner: Option<&str>,
     parent: &str,
-) -> bool {
-    match namespace_standard_owner(conn, parent) {
+) -> Result<bool> {
+    Ok(match namespace_standard_owner(conn, parent)? {
         None => true, // unowned parent — no cross-tenant authority to graft
         Some(parent_owner) => declarer_owner == Some(parent_owner.as_str()),
-    }
+    })
 }
 
 /// #2542 — one structured WARN per governance resolution that dropped a
@@ -22667,13 +22775,18 @@ fn warn_governance_graft_excluded(resolving_for: &str, child: &str, parent: &str
     );
 }
 
-fn build_namespace_chain_view(conn: &Connection, namespace: &str, view: ChainView) -> Vec<String> {
-    const MAX_EXPLICIT_DEPTH: usize = 8;
+/// #4043 — FALLIBLE in the GOVERNANCE view (a dropped ancestor is a dropped
+/// policy layer); the LOOKUP view keeps its lenient reads.
+fn build_namespace_chain_view(
+    conn: &Connection,
+    namespace: &str,
+    view: ChainView,
+) -> Result<Vec<String>> {
     let mut chain: Vec<String> = Vec::new();
 
     if namespace == "*" {
         chain.push("*".to_string());
-        return chain;
+        return Ok(chain);
     }
 
     // Always start with the global standard — most general.
@@ -22681,13 +22794,13 @@ fn build_namespace_chain_view(conn: &Connection, namespace: &str, view: ChainVie
 
     // 1. /-derived ancestors. `namespace_ancestors` returns most-specific-first;
     //    reverse for top-down (root ancestor first, then namespace itself last).
-    let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
-        .into_iter()
-        .rev()
-        .collect();
+    //    #4477 — complete, bounded by MAX_NAMESPACE_DEPTH with a fail-closed
+    //    refusal (`governance::chain_depth`, shared with postgres).
+    let mut hierarchy_chain: Vec<String> = crate::governance::chain_depth::slash_chain(namespace)?;
 
     // 2. If the ROOTmost of the /-chain has an explicit `namespace_meta` parent,
-    //    prepend that chain (bounded by MAX_EXPLICIT_DEPTH + cycle-safe).
+    //    prepend that chain (cycle-safe; #4477: every entitled parent is kept
+    //    and a walk past MAX_NAMESPACE_DEPTH hops REFUSES, never truncates).
     //    Supports legacy flat namespaces (e.g. `ai-memory` → `ai-memory-mcp`).
     //
     //    #2542 — the GOVERNANCE view STOPS at the first UNENTITLED (cross-tenant)
@@ -22702,20 +22815,25 @@ fn build_namespace_chain_view(conn: &Connection, namespace: &str, view: ChainVie
     if let Some(root) = hierarchy_chain.first().cloned() {
         let mut explicit_above: Vec<String> = Vec::new();
         let mut current = root;
-        for _ in 0..MAX_EXPLICIT_DEPTH {
-            let Some(p) = get_namespace_parent(conn, &current) else {
+        loop {
+            let parent = match view {
+                ChainView::Lookup => get_namespace_parent(conn, &current),
+                ChainView::Governance => try_get_namespace_parent(conn, &current)?,
+            };
+            let Some(p) = parent else {
                 break;
             };
             if p == "*" || explicit_above.contains(&p) || hierarchy_chain.contains(&p) {
                 break;
             }
             if view == ChainView::Governance {
-                let declarer_owner = namespace_standard_owner(conn, &current);
-                if !parent_link_governance_entitled(conn, declarer_owner.as_deref(), &p) {
+                let declarer_owner = namespace_standard_owner(conn, &current)?;
+                if !parent_link_governance_entitled(conn, declarer_owner.as_deref(), &p)? {
                     warn_governance_graft_excluded(namespace, &current, &p);
                     break;
                 }
             }
+            crate::governance::chain_depth::admit_explicit_parent(&explicit_above)?;
             explicit_above.push(p.clone());
             current = p;
         }
@@ -22733,7 +22851,7 @@ fn build_namespace_chain_view(conn: &Connection, namespace: &str, view: ChainVie
         }
     }
 
-    chain
+    Ok(chain)
 }
 
 /// #2542 — the GOVERNANCE view of [`build_namespace_chain`]: identical, except a
@@ -22745,7 +22863,14 @@ fn build_namespace_chain_view(conn: &Connection, namespace: &str, view: ChainVie
 /// [`resolve_require_approval_above_depth`], [`resolve_skill_promotion_min_depth`],
 /// [`namespace_owner`]) walks THIS chain; LOOKUP / display paths keep using
 /// [`build_namespace_chain`].
-fn build_namespace_governance_chain(conn: &Connection, namespace: &str) -> Vec<String> {
+///
+/// # Errors
+///
+/// #4043 — any `namespace_meta` / standard read fault on the walk.
+pub(crate) fn build_namespace_governance_chain(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<Vec<String>> {
     build_namespace_chain_view(conn, namespace, ChainView::Governance)
 }
 
@@ -22768,8 +22893,10 @@ enum NamespaceLevel {
     /// `standard_id IS NULL` (severed by a reap, see
     /// [`sever_namespace_standards`]) or non-NULL but naming a memory that no
     /// longer exists (a legacy dangle predating #2503, or one produced by a
-    /// raw out-of-band `DELETE`). Both mean the same thing: an operator
-    /// deliberately governed this namespace and the policy is gone.
+    /// raw out-of-band `DELETE`) — OR (#4285, reverses #1384) resolves to a
+    /// standard whose `metadata.governance` fails the typed deserialise. All
+    /// mean the same thing: an operator deliberately governed this namespace
+    /// and the policy is gone.
     Severed,
     /// A resolved, parsed policy. Most-specific wins; the walk stops here.
     Policy(Box<GovernancePolicy>),
@@ -22781,84 +22908,46 @@ enum NamespaceLevel {
 /// [`get_namespace_standard`], whose contract collapses a NULL `standard_id`
 /// into `None` ("no standard bound") — correct for its own callers and for the
 /// #1642 observable, but exactly the distinction this function exists to make.
-fn read_namespace_level(conn: &Connection, namespace: &str) -> NamespaceLevel {
+///
+/// # Errors
+///
+/// #4043 — a `namespace_meta` / standard read fault (incl. a fail-closed
+/// decrypt) is an `Err`: pre-#4043 it was `NoPolicy` (allow-on-silence).
+fn read_namespace_level(conn: &Connection, namespace: &str) -> Result<NamespaceLevel> {
     use rusqlite::OptionalExtension;
     // `Option<Option<String>>`: outer = row present?, inner = standard bound?
     let row: Option<Option<String>> = conn
-        .query_row(
-            "SELECT standard_id FROM namespace_meta WHERE namespace = ?1",
-            params![namespace],
-            |r| r.get::<_, Option<String>>(0),
-        )
+        .query_row(SQL_SELECT_NAMESPACE_STANDARD_ID, params![namespace], |r| {
+            r.get::<_, Option<String>>(0)
+        })
         .optional()
-        .unwrap_or(None);
+        .context("governance: read namespace_meta level")?;
     let Some(bound) = row else {
-        return NamespaceLevel::NoPolicy; // no row — never configured
+        return Ok(NamespaceLevel::NoPolicy); // no row — never configured
     };
     let Some(standard_id) = bound else {
-        return NamespaceLevel::Severed; // row survives, pointer severed
+        return Ok(NamespaceLevel::Severed); // row survives, pointer severed
     };
-    match get(conn, &standard_id) {
-        Ok(Some(mem)) => match read_policy_from_standard(namespace, &standard_id, &mem) {
-            Some(p) => NamespaceLevel::Policy(Box::new(p)),
-            None => NamespaceLevel::NoPolicy,
-        },
+    // `get` keeps the #4043 fail-closed decrypt / read-fault contract and detects
+    // a dangling pointer; the metadata is then classified from the RAW column
+    // (#4285) because the lenient row mapper defaults an unparseable cell to
+    // `{}`, which would read as NoPolicy — fail OPEN.
+    if get(conn, &standard_id)
+        .context(CTX_READ_NAMESPACE_STANDARD)?
+        .is_none()
+    {
         // The row names a memory that is not there: a dangling pointer. Same
         // meaning as an explicit severance — governed, policy gone.
-        Ok(None) => NamespaceLevel::Severed,
-        // A read fault is NOT evidence that the standard is gone, so it must
-        // not be reported as `Severed` (that would fail closed on a transient
-        // I/O error). Falling through as `NoPolicy` preserves the pre-#2503
-        // behaviour of this arm exactly.
-        Err(_) => NamespaceLevel::NoPolicy,
+        return Ok(NamespaceLevel::Severed);
     }
-}
-
-/// Parse the policy out of an already-resolved standard memory.
-///
-/// #2503 — extracted verbatim from the former `read_namespace_policy` so the
-/// severed-aware [`read_namespace_level`] reuses the SAME #1384 parse-drift
-/// observability instead of forking a second copy of it. The parse semantics
-/// (including the WARN and the `None` fall-through) are byte-identical.
-fn read_policy_from_standard(
-    namespace: &str,
-    standard_id: &str,
-    mem: &crate::models::Memory,
-) -> Option<GovernancePolicy> {
-    match GovernancePolicy::from_metadata(&mem.metadata) {
-        Some(Ok(p)) => Some(p),
-        // #1384 — observability for stored-corruption. The write path
-        // (`memory_namespace_set_standard` → typed `GovernancePolicy`
-        // deserialise) rejects unknown enum variants and malformed
-        // structures (verified live against alice: `write: "approval"`
-        // returns a typed 400 error). A parse error here therefore
-        // means the stored JSON drifted out-of-band: direct SQL update,
-        // migration corruption, older binary writing newer schema,
-        // etc. Pre-#1384 this arm silently returned `None` and the
-        // inheritance walk continued to the parent — which may be
-        // totally permissive, silently downgrading the operator's
-        // intent. Surface the drift via tracing WARN so operators
-        // can grep `ai_memory::governance::policy_read` for the lag.
-        // We still return `None` (don't fail-CLOSED at the read site
-        // — that could lock callers out of unrelated namespaces) but
-        // operators now have a structured signal to investigate.
-        Some(Err(parse_err)) => {
-            tracing::warn!(
-                target: "ai_memory::governance::policy_read",
-                namespace = %namespace,
-                standard_id = %standard_id,
-                error = %parse_err,
-                "stored metadata.governance failed typed deserialise — \
-                 inheritance walk will continue past this namespace as \
-                 if no policy were set. Likely cause: direct SQL update, \
-                 older binary, or corrupted migration. Operator should \
-                 re-run `memory_namespace_set_standard` to restore the \
-                 typed shape."
-            );
-            None
-        }
-        None => None,
-    }
+    Ok(
+        match governance_read::classify_bound_standard(conn, namespace, &standard_id)? {
+            Some(StandardMetadata::Policy(p, _)) => NamespaceLevel::Policy(p),
+            Some(StandardMetadata::NoGovernance) => NamespaceLevel::NoPolicy,
+            // #4285 — corrupt metadata (incl. non-object) is `Severed`.
+            Some(StandardMetadata::Corrupt(_)) | None => NamespaceLevel::Severed,
+        },
+    )
 }
 
 /// Resolve the governance policy that gates actions in `namespace`.
@@ -22903,7 +22992,7 @@ fn read_policy_from_standard(
 /// a parent.
 ///
 /// Cycle-safety is inherited from `build_namespace_chain`
-/// (`MAX_EXPLICIT_DEPTH = 8` + visited set). No new cache is
+/// (`MAX_NAMESPACE_DEPTH` bound + visited set, #4477). No new cache is
 /// introduced — profile-driven optimization is a v0.7 item.
 /// **#2503 — the SEVERED FLOOR.** A level whose `namespace_meta` row EXISTS
 /// but whose standard cannot be resolved (severed by a reap, or a legacy
@@ -22929,7 +23018,15 @@ fn read_policy_from_standard(
 ///    own policy, an ancestor severance is irrelevant because that ancestor
 ///    would never have been consulted. Tracking severance only until the first
 ///    policy is found is therefore precise, not an approximation.
-pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<GovernancePolicy> {
+///
+/// # Errors
+///
+/// #4043 — any read fault on the chain walk. Callers MUST refuse on it;
+/// mapping it to `None` / the default policy is the fail-open this fixes.
+pub fn resolve_governance_policy(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<Option<GovernancePolicy>> {
     // build_namespace_chain returns top-down (`["*", root, ..., leaf]`).
     // Governance resolution wants leaf-first (most specific first), so
     // we reverse before walking.
@@ -22937,10 +23034,10 @@ pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<G
     // #2542 — the GOVERNANCE chain excludes `-`-inferred parent links so an
     // inferred ancestor (a naming coincidence, possibly a different tenant's
     // namespace) cannot layer its governance/approver policy onto this write.
-    let chain = build_namespace_governance_chain(conn, namespace);
+    let chain = build_namespace_governance_chain(conn, namespace)?;
     let mut severed_level: Option<String> = None;
     for level in chain.into_iter().rev() {
-        match read_namespace_level(conn, &level) {
+        match read_namespace_level(conn, &level)? {
             // Most-specific match wins. Returning here means an explicit
             // policy at the leaf (or any descendant level with a policy)
             // authoritatively overrides anything above — precisely the
@@ -22949,13 +23046,13 @@ pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<G
             // pending_action approver resolver) don't re-walk to a parent.
             NamespaceLevel::Policy(policy) => {
                 let policy = *policy;
-                return Some(match severed_level {
+                return Ok(Some(match severed_level {
                     None => policy,
                     Some(ns) => {
                         warn_severed_floor_applied(&ns, namespace);
                         policy.with_severed_standard_floor()
                     }
-                });
+                }));
             }
             // #2503 — governed, but the policy is gone. Remember it and keep
             // walking so an intact ancestor policy is still found and honoured.
@@ -22975,13 +23072,13 @@ pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<G
     // level WAS severed, returning `None` is what handed the attacker
     // allow-on-silence over a namespace an operator had deliberately governed;
     // the floor is returned instead.
-    match severed_level {
+    Ok(match severed_level {
         None => None,
         Some(ns) => {
             warn_severed_floor_applied(&ns, namespace);
             Some(GovernancePolicy::default().with_severed_standard_floor())
         }
-    }
+    })
 }
 
 /// #2503 — one structured line per resolution that had to fall back to the
@@ -23000,139 +23097,82 @@ fn warn_severed_floor_applied(severed_namespace: &str, resolving_for: &str) {
     );
 }
 
-/// v0.7.0 L1-8 — read `governance.require_approval_above_depth` from the
-/// namespace's most-specific governance metadata blob, leaf-first.
-///
-/// This is intentionally a free function (not a field on
-/// [`GovernancePolicy`]) to avoid introducing a new required struct field
-/// that would need updating at every `GovernancePolicy { … }` literal
-/// in the codebase. The existing `GovernancePolicy` struct represents
-/// the resolved enforcement policy; this field is a pre-write interception
-/// threshold that lives beside it, not inside it.
-///
-/// Returns `None` when:
-/// - no namespace standard is configured at any level of the chain, OR
-/// - the standard's `metadata.governance` blob is absent or null, OR
-/// - the blob does not contain a `require_approval_above_depth` key, OR
-/// - the key is present but `null`.
-///
-/// Returns `Some(threshold)` when the key is a non-null unsigned integer.
-/// Callers in `memory_reflect` compare `proposed_depth > threshold` and
-/// queue a `pending_actions` row when the condition is true.
-pub fn resolve_require_approval_above_depth(conn: &Connection, namespace: &str) -> Option<u32> {
-    // #2542 — governance/approver LAYERING follows only explicitly-declared
-    // parents; a `-`-inferred ancestor must not inject an approval threshold.
-    let chain = build_namespace_governance_chain(conn, namespace);
-    for level in chain.into_iter().rev() {
-        let standard_id = match get_namespace_standard(conn, &level) {
-            Ok(Some(id)) => id,
-            _ => continue,
-        };
-        let mem = match get(conn, &standard_id) {
-            Ok(Some(m)) => m,
-            _ => continue,
-        };
-        // Governance blob must exist and not be null.
-        let gov = match mem.metadata.get(crate::META_KEY_GOVERNANCE) {
-            Some(g) if !g.is_null() => g,
-            _ => continue,
-        };
-        // The field is optional inside the blob — `None` means skip this
-        // level and keep walking (inherit semantics: an ancestor that sets
-        // the field governs if the leaf does not override it).
-        if let Some(threshold) = gov.get("require_approval_above_depth") {
-            if let Some(n) = threshold.as_u64() {
-                // QUAL-3 (FX-5): operator-controlled metadata. Reject the
-                // silent `n as u32` truncation that would let an operator
-                // who sets `require_approval_above_depth = 2^32` (which
-                // would silently land as 0) DISABLE the approval gate
-                // entirely (depth > 0 was the original intent, but
-                // `low_32(2^32) == 0` makes `depth > 0` the actual gate;
-                // any value ≥ 2^32 whose low-32 bits are also high turns
-                // off the gate). Fail-CLOSED on overflow: saturate to 0
-                // so EVERY depth triggers approval — this is the
-                // conservative posture per CLAUDE.md K3/K9 governance
-                // discipline. The companion regression test at
-                // `tests/governance_metadata_no_silent_truncation.rs`
-                // pins this behaviour.
-                return Some(u32::try_from(n).unwrap_or(0));
-            }
-            // Key present but null → no gate at this level; keep walking.
-        }
-        // Policy found at this level but no require_approval_above_depth
-        // key → no gate; stop walking (same leaf-first-wins semantics as
-        // the main resolve_governance_policy walker: a leaf policy that
-        // doesn't set the field takes precedence over a parent that does).
-        if GovernancePolicy::from_metadata(&mem.metadata).is_some() {
-            return None;
-        }
-    }
-    None
-}
-
 /// v0.7.0 L2-6 — read `governance.skill_promotion_min_depth` from the
 /// namespace's most-specific governance metadata blob, leaf-first.
 ///
-/// Mirrors [`resolve_require_approval_above_depth`] in shape and walk
-/// semantics: it's a free function (not a [`GovernancePolicy`] field)
-/// so it can land without churning every `GovernancePolicy { … }`
-/// literal in the codebase, and it's a per-namespace threshold rather
-/// than part of the resolved enforcement policy.
+/// Mirrors [`resolve_require_approval_above_depth`] (GOD final ruling,
+/// leaf-first-wins #2542): an explicit integer decides (overflow saturates to
+/// `u32::MAX`); an explicit `null` or a missing standard keeps walking; a
+/// well-formed policy that OMITS the key stops the walk; a corrupt or
+/// non-integer level keeps walking and, if the walk ends with nothing explicit
+/// after passing one, the floor is `u32::MAX` (no promotion). It's a free
+/// function (not a [`GovernancePolicy`] field) so it can land without churning
+/// every `GovernancePolicy { … }` literal, and it's a per-namespace threshold
+/// rather than part of the resolved enforcement policy.
 ///
-/// Returns `None` when:
-/// - no namespace standard is configured at any level of the chain, OR
-/// - the standard's `metadata.governance` blob is absent or null, OR
-/// - the blob does not contain a `skill_promotion_min_depth` key, OR
-/// - the key is present but `null`.
+/// Returns `None` when no level states a floor (no standard anywhere, or a
+/// well-formed policy that omits the key ended the walk) and no corrupt level
+/// was passed.
 ///
-/// Returns `Some(threshold)` when the key is a non-null unsigned integer.
+/// Returns `Some(threshold)` when a level's key is an unsigned integer.
 /// The `memory_skill_promote_from_reflection` MCP tool falls back to the
 /// compiled-in default of `1` when this returns `None` — a reflection
 /// must have at least one level of synthesised insight (depth ≥ 1)
 /// before it can be promoted to a reusable skill.
-pub fn resolve_skill_promotion_min_depth(conn: &Connection, namespace: &str) -> Option<u32> {
+///
+/// # Errors
+///
+/// #4043 — any read fault on the governance chain walk.
+pub fn resolve_skill_promotion_min_depth(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<Option<u32>> {
     // #2542 — governance LAYERING follows only explicitly-declared parents; a
     // `-`-inferred ancestor must not inject a promotion threshold.
-    let chain = build_namespace_governance_chain(conn, namespace);
+    let chain = build_namespace_governance_chain(conn, namespace)?;
+    let mut passed_corrupt = false;
     for level in chain.into_iter().rev() {
-        let standard_id = match get_namespace_standard(conn, &level) {
-            Ok(Some(id)) => id,
-            _ => continue,
+        let Some(standard_id) = try_get_namespace_standard(conn, &level)? else {
+            continue;
         };
-        let mem = match get(conn, &standard_id) {
-            Ok(Some(m)) => m,
-            _ => continue,
-        };
-        let gov = match mem.metadata.get(crate::META_KEY_GOVERNANCE) {
-            Some(g) if !g.is_null() => g,
-            _ => continue,
-        };
-        if let Some(threshold) = gov.get("skill_promotion_min_depth") {
-            if let Some(n) = threshold.as_u64() {
-                // QUAL-3 (FX-5): operator-controlled metadata. Reject the
-                // silent `n as u32` truncation that would let an operator
-                // who sets `skill_promotion_min_depth = 2^32 + k` silently
-                // land as `k` after truncation — including the
-                // catastrophic `k == 0` case which would mean "every
-                // reflection can be promoted to a skill regardless of
-                // depth". Fail-CLOSED on overflow: saturate to `u32::MAX`
-                // so NO reflection can be promoted (the
-                // `actual_depth_u32 < min_depth` check at
-                // `src/mcp/tools/skill_promote.rs:174` becomes
-                // permanently true). The companion regression test at
-                // `tests/governance_metadata_no_silent_truncation.rs`
-                // pins this behaviour.
-                return Some(u32::try_from(n).unwrap_or(u32::MAX));
-            }
-            // Key present but null → no override at this level; keep walking.
+        if get(conn, &standard_id)
+            .context(CTX_READ_NAMESPACE_STANDARD)?
+            .is_none()
+        {
+            continue;
         }
-        // Policy found at this level but no skill_promotion_min_depth
-        // key → no override; stop walking (leaf-first-wins semantics).
-        if GovernancePolicy::from_metadata(&mem.metadata).is_some() {
-            return None;
+        // #4285 — classify the RAW column. A corrupt or non-object level is
+        // SEVERED: it never contributes a raw key and the walk continues.
+        let gov = match governance_read::classify_bound_standard(conn, &level, &standard_id)? {
+            Some(StandardMetadata::Policy(_, raw)) => raw,
+            Some(StandardMetadata::Corrupt(_)) => {
+                passed_corrupt = true;
+                continue;
+            }
+            Some(StandardMetadata::NoGovernance) | None => continue,
+        };
+        match gov.get("skill_promotion_min_depth") {
+            // A well-formed policy that omits the knob: no override here and the
+            // walk STOPS (leaf-first-wins, #2542; GOD final ruling), mirroring
+            // the approval-depth walk. The result is the passed-corrupt rule.
+            None => break,
+            // An explicit null keeps walking (the explicit opt-in to inherit).
+            Some(serde_json::Value::Null) => {}
+            Some(v) => match v.as_u64() {
+                // QUAL-3 (FX-5): operator-controlled metadata. Fail-CLOSED on
+                // overflow: saturate to `u32::MAX` so NO reflection can be
+                // promoted (pinned by
+                // `tests/governance_metadata_no_silent_truncation.rs`).
+                Some(n) => return Ok(Some(u32::try_from(n).unwrap_or(u32::MAX))),
+                // A non-integer value is corrupt: keep walking, fail closed.
+                None => passed_corrupt = true,
+            },
         }
     }
-    None
+    // #4285 — a configured level that could not be read as a policy is not
+    // silence: with no explicit ancestor value, fail closed (no promotion)
+    // until the standard is repaired. An unconfigured chain keeps the default.
+    Ok(passed_corrupt.then_some(u32::MAX))
 }
 
 /// Return true if `agent_id` matches a registered agent in `_agents`.
@@ -23295,7 +23335,10 @@ fn evaluate_level(
 /// Without this walk, deep children with no standard of their own
 /// triggered `governance: owner-level action has no resolvable owner`
 /// despite the parent's policy being correctly inherited.
-fn namespace_owner(conn: &Connection, namespace: &str) -> Option<String> {
+///
+/// #4043 — a read fault is an `Err`, never "no owner" (an Owner gate evaluated
+/// against a missing owner must not be reached on evidence nobody read).
+fn namespace_owner(conn: &Connection, namespace: &str) -> Result<Option<String>> {
     // build_namespace_chain returns top-down (`["*", root, ..., leaf]`).
     // We want leaf-first so the most-specific owner wins, matching how
     // resolve_governance_policy picks up the most-specific policy.
@@ -23303,12 +23346,12 @@ fn namespace_owner(conn: &Connection, namespace: &str) -> Option<String> {
     // #2542 — resolve the Owner authority over the GOVERNANCE chain so a
     // `-`-inferred ancestor cannot become the effective owner (an Owner-level
     // policy check would otherwise resolve to a foreign tenant's standard owner).
-    let chain = build_namespace_governance_chain(conn, namespace);
+    let chain = build_namespace_governance_chain(conn, namespace)?;
     for level in chain.into_iter().rev() {
-        let Some(standard_id) = get_namespace_standard(conn, &level).ok().flatten() else {
+        let Some(standard_id) = try_get_namespace_standard(conn, &level)? else {
             continue;
         };
-        let Some(mem) = get(conn, &standard_id).ok().flatten() else {
+        let Some(mem) = get(conn, &standard_id).context("governance: read namespace owner")? else {
             continue;
         };
         if let Some(owner) = mem
@@ -23317,10 +23360,10 @@ fn namespace_owner(conn: &Connection, namespace: &str) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(str::to_string)
         {
-            return Some(owner);
+            return Ok(Some(owner));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Decide a `Store`/`Delete`/`Promote` whose namespace chain resolves NO
@@ -23436,7 +23479,18 @@ pub fn enforce_governance(
     //   `governance::ENV_REQUIRE_GOVERNED_NAMESPACE` for the full rationale.
     // The refusal returns EARLY, so it never reaches the capability-grant
     // joiner below — see `governance::ungoverned_namespace_refusal` for why.
-    let Some(policy) = resolve_governance_policy(conn, namespace) else {
+    //
+    // #4043 — an UNREADABLE policy is not an ungoverned one: `Err` under
+    // Enforce (callers refuse); Advisory logs and allows by contract.
+    let resolved = match resolve_governance_policy(conn, namespace) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            return governance_read::unreadable_policy_decision(
+                mode, action, namespace, agent_id, e,
+            );
+        }
+    };
+    let Some(policy) = resolved else {
         return Ok(ungoverned_namespace_decision(
             mode, action, namespace, agent_id,
         ));
@@ -23456,7 +23510,7 @@ pub fn enforce_governance(
     };
     // Always resolve the namespace-standard owner: Owner-level Store
     // uses it, and Approve uses it for every action (B15).
-    let ns_owner = namespace_owner(conn, namespace);
+    let ns_owner = namespace_owner(conn, namespace)?;
 
     let mut decision = evaluate_level(
         conn,
@@ -24100,7 +24154,8 @@ pub fn reject_with_approver_type(
     if pa.status != "pending" {
         return Ok(RejectOutcome::NotFound);
     }
-    let approver = resolve_governance_policy(conn, &pa.namespace)
+    // #4043 — unreadable policy refuses; never the `Human` default.
+    let approver = resolve_governance_policy(conn, &pa.namespace)?
         .map_or(ApproverType::Human, |p| p.core.approver);
     if let ApproverEligibility::Refused(reason) = evaluate_approver_eligibility(
         conn,
@@ -24151,7 +24206,8 @@ pub fn approve_with_approver_type(
     // which accepts any approval (back-compat with 1.9 callers).
     // #880 — `approver` lives on `policy.core` after the governance
     // decomposition.
-    let approver = resolve_governance_policy(conn, &pa.namespace)
+    // #4043 — unreadable policy refuses; never the `Human` default.
+    let approver = resolve_governance_policy(conn, &pa.namespace)?
         .map_or(ApproverType::Human, |p| p.core.approver);
 
     // v1.0.0 #3388 — the eligibility half of this gate is now ONE predicate
@@ -24331,9 +24387,9 @@ fn refuse_unapproved_destination_store(
     if mode == PermissionsMode::Off {
         return Ok(());
     }
-    let decision = match resolve_governance_policy(conn, to_ns) {
+    let decision = match resolve_governance_policy(conn, to_ns)? {
         Some(policy) => {
-            let ns_owner = namespace_owner(conn, to_ns);
+            let ns_owner = namespace_owner(conn, to_ns)?;
             evaluate_level(
                 conn,
                 GovernedAction::Store,
@@ -24544,6 +24600,26 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
 /// (the substrate validator rejects empty values, so missing keys
 /// surface as a `Validation` error rather than a panic).
 fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result<Option<String>> {
+    let input = reflect_input_from_pending(pa)?;
+    let outcome = crate::storage::reflect::reflect(conn, &input)
+        .map_err(|e| anyhow::anyhow!("reflect execute failed: {e}"))?;
+    Ok(Some(outcome.id))
+}
+
+/// Rebuild the [`crate::storage::reflect::ReflectInput`] a queued `reflect`
+/// pending action (see [`execute_reflect_from_payload`] for the payload shape)
+/// stands for. Shared by the SQLite executor above and the PostgreSQL
+/// `execute_pending_action` `reflect` arm (#4357): ONE payload decoder, so an
+/// approved reflection replays identically on both backends and a malformed
+/// payload is refused (never defaulted into a write) on both.
+///
+/// # Errors
+///
+/// A typed [`StorageError::InvalidArgument`] when `source_ids`, `title` or
+/// `content` is missing or the `tier` is present but unrecognised.
+pub fn reflect_input_from_pending(
+    pa: &PendingAction,
+) -> Result<crate::storage::reflect::ReflectInput> {
     let payload = &pa.payload;
     let source_ids: Vec<String> = payload
         .get(field_names::SOURCE_IDS)
@@ -24627,12 +24703,19 @@ fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| pa.requested_by.clone());
-    let metadata = payload
+    let mut metadata = payload
         .get("metadata")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    // #4357 — `attest_level` is a substrate-stamped system key, never
+    // caller-authoritative: a value that rode the queued payload (a payload
+    // queued before this scrub existed, or by any other funnel) must not
+    // survive the replay onto the durable row.
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.remove(field_names::ATTEST_LEVEL);
+    }
 
-    let input = crate::storage::reflect::ReflectInput {
+    Ok(crate::storage::reflect::ReflectInput {
         source_ids,
         title,
         content,
@@ -24648,14 +24731,13 @@ fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result
         source: crate::validate::DEFAULT_NHI_SOURCE.to_string(),
         agent_id,
         metadata,
-    };
-    let outcome = crate::storage::reflect::reflect(conn, &input)
-        .map_err(|e| anyhow::anyhow!("reflect execute failed: {e}"))?;
-    Ok(Some(outcome.id))
+    })
 }
 
 #[cfg(test)]
 mod forensic_ident_namespace_3774_tests;
+#[cfg(test)]
+mod governance_read_fault_4043_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -30795,6 +30877,7 @@ mod tests {
         set_namespace_standard(&conn, "ns/locked", &standard_id, None).unwrap();
 
         let resolved = resolve_governance_policy(&conn, "ns/locked")
+            .expect("policy read must succeed")
             .expect("policy must resolve when explicitly set");
         assert_eq!(resolved.core.write, crate::models::GovernanceLevel::Owner);
     }

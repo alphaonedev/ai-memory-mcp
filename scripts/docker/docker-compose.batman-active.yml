@@ -10,7 +10,11 @@
 # expose it). Form 7 operator key is generated on first launch by the
 # init container.
 #
-# Usage:
+# Usage (both variables are REQUIRED; compose refuses to render without them).
+# AI_MEMORY_API_KEY: at least 32 characters from [A-Za-z0-9._~+/=-]. To ROTATE
+# it, change the variable and `up -d` again: init rewrites the key and the
+# services restart with it (#4213).
+#   AI_MEMORY_IMAGE=ai-memory:local AI_MEMORY_API_KEY="$(openssl rand -hex 32)" \
 #   docker compose -f scripts/docker/docker-compose.batman-active.yml up -d
 #   docker compose -f scripts/docker/docker-compose.batman-active.yml logs -f curator
 #   docker compose -f scripts/docker/docker-compose.batman-active.yml exec curator \
@@ -30,13 +34,18 @@ services:
   # First-launch initializer: keygen + sign-seed + enable R001-R004 +
   # write a Batman standard memory. Exits 0 after activation. Idempotent.
   init-batman:
-    image: ${AI_MEMORY_IMAGE:-alphaonedev/ai-memory:0.7.0}
+    image: ${AI_MEMORY_IMAGE:?set AI_MEMORY_IMAGE to a v1.0.0+ ai-memory image (e.g. a local `docker build -t ai-memory:local .`); this stack assumes the TLS-only daemon}
     container_name: ai-memory-init-batman
     user: ${AI_MEMORY_UID:-1000}:${AI_MEMORY_GID:-1000}
     environment:
       AI_MEMORY_DB: /data/ai-memory.db
       AI_MEMORY_KEY_DIR: /keys
       BATMAN_NAMESPACE: ${BATMAN_NAMESPACE:-main}
+      # #3838 — REQUIRED. `serve` refuses a keyless non-loopback bind
+      # (`api_key_bind_guard`, #1458) and the mcp service binds 0.0.0.0 so the
+      # published port can reach it. The key goes into the 0600 config.toml
+      # below, never into argv and never into this file.
+      AI_MEMORY_API_KEY: ${AI_MEMORY_API_KEY:?set AI_MEMORY_API_KEY — serve refuses a keyless non-loopback bind (#1458); it is written to the 0600 config.toml, never to argv}
     volumes:
       - ai-memory-data:/data
       - ai-memory-keys:/keys
@@ -53,6 +62,43 @@ services:
         chmod +x /opt/scripts/*.sh 2>/dev/null || true
         # run the activator — idempotent
         bash /opt/scripts/install-batman-active.sh --db /data/ai-memory.db --namespace "$$BATMAN_NAMESPACE"
+        # #3838 -- `serve` takes no --tier flag (#703): the daemon's tier comes
+        # from config.toml, resolved under XDG_CONFIG_HOME. Write it once, on
+        # the shared data volume, so the mcp and curator services (which set
+        # XDG_CONFIG_HOME=/data/xdg) boot at the autonomous tier this stack
+        # documents. Idempotent: never overwrites an operator-edited file.
+        #
+        # The same file carries `api_key` (#3838), so it is a secret: 0700
+        # directory, 0600 file, written under umask 077, and every service runs
+        # as the same AI_MEMORY_UID.
+        # The key is checked in the C locale: under a UTF-8 locale the bracket
+        # ranges admit ~2000 non-ASCII letters (#3838 L8). At least 32
+        # characters (`openssl rand -hex 32` gives 64).
+        export LC_ALL=C
+        case "$$AI_MEMORY_API_KEY" in
+          ''|*[!A-Za-z0-9._~+/=-]*)
+            echo "init-batman: AI_MEMORY_API_KEY must be non-empty and use only [A-Za-z0-9._~+/=-]" >&2
+            exit 64 ;;
+        esac
+        if [ "$${#AI_MEMORY_API_KEY}" -lt 32 ]; then
+          echo "init-batman: AI_MEMORY_API_KEY must be at least 32 characters (e.g. openssl rand -hex 32)" >&2
+          exit 64
+        fi
+        mkdir -p /data/xdg/ai-memory
+        chmod 700 /data/xdg /data/xdg/ai-memory
+        cfg=/data/xdg/ai-memory/config.toml
+        if [ ! -f "$$cfg" ]; then
+          (umask 077; printf 'schema_version = 2\ntier = "autonomous"\n' > "$$cfg")
+        fi
+        # #4213 — AI_MEMORY_API_KEY is the source of truth: a changed key
+        # REPLACES the stored one (it used to be kept, so rotation silently did
+        # nothing). #4291 — only the TOP-LEVEL key is replaced: an api_key
+        # inside a table or a multi-line string is operator config and is left
+        # alone, and a file whose top-level scope cannot be established is
+        # refused (64) rather than guessed at. Shell builtins only; the key is
+        # read from the environment, never from argv.
+        bash /opt/scripts/docker/set-api-key.sh "$$cfg"
+        chmod 600 "$$cfg"
         echo "init-batman complete"
     restart: "no"
 
@@ -60,15 +106,19 @@ services:
   # are on from the first request; Form 5 env vars come from the
   # environment block here, picked up by every spawned process.
   mcp:
-    image: ${AI_MEMORY_IMAGE:-alphaonedev/ai-memory:0.7.0}
+    image: ${AI_MEMORY_IMAGE:?set AI_MEMORY_IMAGE to a v1.0.0+ ai-memory image (e.g. a local `docker build -t ai-memory:local .`); this stack assumes the TLS-only daemon}
     container_name: ai-memory-mcp
     user: ${AI_MEMORY_UID:-1000}:${AI_MEMORY_GID:-1000}
     depends_on:
       init-batman:
         condition: service_completed_successfully
+        # #4213 — a re-run init (e.g. a rotated AI_MEMORY_API_KEY) restarts
+        # this service, so the old key stops working.
+        restart: true
     environment:
       AI_MEMORY_DB: /data/ai-memory.db
       AI_MEMORY_KEY_DIR: /keys
+      XDG_CONFIG_HOME: /data/xdg
       AI_MEMORY_AUTO_CONFIDENCE: "1"
       AI_MEMORY_CONFIDENCE_SHADOW: "1"
       AI_MEMORY_CONFIDENCE_DECAY: "1"
@@ -79,20 +129,34 @@ services:
     # Stdio MCP server. Compose isn't the right transport — exec into
     # this container for ad-hoc CLI calls, and point your MCP-stdio
     # client at `docker exec -i ai-memory-mcp ai-memory --db /data/ai-memory.db mcp --tier autonomous`.
+    # #3838 -- `serve` has `--host`/`--port` (no `--bind`) and no `--tier`
+    # (the tier is the config.toml the init service wrote, above). The HTTP API
+    # requires the AI_MEMORY_API_KEY from that same file on every call except
+    # the `/api/v1/health` probe below. The bind is 0.0.0.0 because the port
+    # mapping only reaches a listener on the container's 0.0.0.0; the published
+    # port stays host-loopback (127.0.0.1:9077).
+    # #3838 (Codex review): the entrypoint is EXPLICIT on every service. The root
+    # Dockerfile sets ENTRYPOINT ["ai-memory"] and Dockerfile.batman-active sets
+    # none, so a command that also starts with `ai-memory` ran
+    # `ai-memory ai-memory ...` (exit 2) under the image the usage line names.
+    # With the entrypoint pinned here the stack boots the same under either.
+    entrypoint: ["ai-memory"]
     command:
-      - ai-memory
       - --db
       - /data/ai-memory.db
       - serve
-      - --bind
-      - 0.0.0.0:9077
-      - --tier
-      - autonomous
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9077"
     ports:
       - "127.0.0.1:9077:9077"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-fs", "http://localhost:9077/api/v1/healthz"]
+      # TLS only (#3705): the daemon answers no plaintext, and `/healthz` was
+      # never a route (`handlers::routes::HEALTH` is `/api/v1/health`). The
+      # zero-config local CA (#3709) lives under AI_MEMORY_KEY_DIR (/keys).
+      test: ["CMD", "curl", "-fs", "--cacert", "/keys/tls/local-ca.pem", "https://localhost:9077/api/v1/health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -102,15 +166,19 @@ services:
   # freshness-decay sweeps, Form 6 backfills, Rule-5 consolidation.
   # Always-on. Form 5 env vars baked in.
   curator:
-    image: ${AI_MEMORY_IMAGE:-alphaonedev/ai-memory:0.7.0}
+    image: ${AI_MEMORY_IMAGE:?set AI_MEMORY_IMAGE to a v1.0.0+ ai-memory image (e.g. a local `docker build -t ai-memory:local .`); this stack assumes the TLS-only daemon}
     container_name: ai-memory-curator
     user: ${AI_MEMORY_UID:-1000}:${AI_MEMORY_GID:-1000}
     depends_on:
       init-batman:
         condition: service_completed_successfully
+        # #4213 — a re-run init (e.g. a rotated AI_MEMORY_API_KEY) restarts
+        # this service, so the old key stops working.
+        restart: true
     environment:
       AI_MEMORY_DB: /data/ai-memory.db
       AI_MEMORY_KEY_DIR: /keys
+      XDG_CONFIG_HOME: /data/xdg
       AI_MEMORY_AUTO_CONFIDENCE: "1"
       AI_MEMORY_CONFIDENCE_SHADOW: "1"
       AI_MEMORY_CONFIDENCE_DECAY: "1"
@@ -118,8 +186,8 @@ services:
       - ai-memory-data:/data
       - ai-memory-keys:/keys
       - ../../scripts:/opt/scripts:ro
+    entrypoint: ["ai-memory"]
     command:
-      - ai-memory
       - --db
       - /data/ai-memory.db
       - curator
@@ -132,31 +200,39 @@ services:
 
   # Optional: peer-to-peer sync daemon (Crack 6 — single-node mesh).
   # Disabled by default since it needs peer addresses. Enable by
-  # providing --peer addresses via SYNC_PEERS env var, then:
+  # providing the peer list via SYNC_PEERS (comma-separated https:// URLs —
+  # an http:// peer is refused at boot, #2477/#3705), then:
   #   docker compose --profile sync up -d
   sync:
-    image: ${AI_MEMORY_IMAGE:-alphaonedev/ai-memory:0.7.0}
+    image: ${AI_MEMORY_IMAGE:?set AI_MEMORY_IMAGE to a v1.0.0+ ai-memory image (e.g. a local `docker build -t ai-memory:local .`); this stack assumes the TLS-only daemon}
     container_name: ai-memory-sync
     profiles: ["sync"]
     user: ${AI_MEMORY_UID:-1000}:${AI_MEMORY_GID:-1000}
     depends_on:
       init-batman:
         condition: service_completed_successfully
+        # #4213 — a re-run init (e.g. a rotated AI_MEMORY_API_KEY) restarts
+        # this service, so the old key stops working.
+        restart: true
     environment:
       AI_MEMORY_DB: /data/ai-memory.db
       AI_MEMORY_KEY_DIR: /keys
+      SYNC_PEERS: ${SYNC_PEERS:-}
     volumes:
       - ai-memory-data:/data
       - ai-memory-keys:/keys
+    entrypoint: ["sh", "-c"]
+    # #3838 (Codex review) — a LITERAL block (`|`), not a folded one (`>`): the
+    # folded scalar joined `fi` and `exec` onto one line, a shell syntax error,
+    # so this service could never start. `$$` defers SYNC_PEERS to the container
+    # shell (it arrives through `environment:` above) instead of compose.
     command:
-      - sh
-      - -c
-      - >
-        if [ -z "${SYNC_PEERS:-}" ]; then
-          echo "no SYNC_PEERS set — sync daemon idle, exiting";
-          exit 0;
+      - |
+        if [ -z "$${SYNC_PEERS:-}" ]; then
+          echo "no SYNC_PEERS set — sync daemon idle, exiting"
+          exit 0
         fi
-        exec ai-memory --db /data/ai-memory.db sync-daemon ${SYNC_PEERS}
+        exec ai-memory --db /data/ai-memory.db sync-daemon --peers "$${SYNC_PEERS}"
     restart: unless-stopped
 
 volumes:

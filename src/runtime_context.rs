@@ -204,6 +204,13 @@ pub struct AuditState {
     /// sequence so `audit verify` doesn't trip on a restart-induced
     /// reset (F2 round-2 fix).
     pub sequence: AtomicU64,
+    /// #3975 — delivery accounting for the flat audit trail: records
+    /// written, failed writes/flushes, the last successful write, and the
+    /// rate limit for the stderr diagnostic. Before #3975 a write or flush
+    /// failure after boot was reported only through `tracing` (a no-op
+    /// without a subscriber) or discarded outright, so a filled disk
+    /// silently stopped the trail.
+    pub delivery: crate::logging::DeliveryStats,
 }
 
 // ---------------------------------------------------------------------------

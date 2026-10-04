@@ -332,6 +332,8 @@ way to bootstrap a fresh postgres backend:
 ai-memory schema-init --store-url 'postgres://aimemory:changeme-please@localhost:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
 ```
 
+`schema-init` is one of two verbs with no non-argv channel: it reads its URL only from the required `--store-url` argument (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host, and start the long-running `serve` through `AI_MEMORY_STORE_URL_FILE` (see [Daemon configuration](#daemon-configuration)).
+
 Since v1.0.0 (#3705, "only encrypted data in transit") every DSN the
 daemon or CLI opens MUST pin `sslmode=verify-full&sslrootcert=<ca>`; a DSN
 without it is refused at the connect funnel before any socket is opened —
@@ -378,21 +380,26 @@ recursive-CTE fallback serves `kg_query`/`kg_timeline`/etc.
 `--store-url` on `serve` is still accepted, but as of v0.9.0 ([#1927](https://github.com/alphaonedev/ai-memory-mcp/issues/1927)) two
 non-argv channels exist and are preferred, since a password on
 `--store-url` is exposed via world-readable `/proc/<pid>/cmdline` and
-`ps auxww` to any local UID. `resolve_store_url()` (`src/daemon_runtime.rs`)
-resolves the store URL in this order, first hit wins:
+`ps auxww` to any local UID. `resolve_store_url()` (`src/store_url.rs:137`)
+resolves the store URL in this order, first hit wins (when more than one is set the others are ignored, with no error):
 
 1. `AI_MEMORY_STORE_URL_FILE` — a `0600` file whose sole contents are the store URL (the most restrictive channel).
 2. `AI_MEMORY_STORE_URL` — the owner-only process environment (`/proc/<pid>/environ` is mode `0400`, strictly better than argv).
 3. the `--store-url` CLI argument (unchanged; a userinfo password on this flag emits a warning pointing at the non-argv alternatives).
 
 ```bash
-# Preferred (v0.9.0+): non-argv channel
-export AI_MEMORY_STORE_URL='postgres://aimemory:PASSWORD@HOST:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
-ai-memory serve
-
-# Still accepted, but the password is exposed via /proc/<pid>/cmdline and `ps`
-ai-memory serve --store-url 'postgres://aimemory:PASSWORD@HOST:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
+# Preferred (v0.9.0+): a 0600 file, created without the URL touching a command line
+( umask 077; cat > /etc/ai-memory/store-url )   # paste the URL, then Ctrl-D
+# file content (one line):
+#   postgres://aimemory:PASSWORD@HOST:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory serve
 ```
+
+The file is read once and its surrounding whitespace, including the trailing newline, is trimmed
+(`src/store_url.rs:116`); an empty file is refused (`src/store_url.rs:117-118`). A file with any
+group or world permission bit is refused fail-closed (`src/store_url.rs:87-103`); only the mode is
+checked, not the owner, so make the service user the owner (`chown aimemory:aimemory`, `chmod 0600`).
+`AI_MEMORY_STORE_URL` (the environment channel) is the fallback when a file is not practical.
 
 URL shapes accepted by `--store-url` (and the env/file channels above):
 
@@ -514,12 +521,14 @@ and append the three flags to the `ExecStart=` line:
 
 ```ini
 [Service]
+Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
 ExecStart=/usr/local/bin/ai-memory serve \
-    --store-url 'postgres://aimemory:PWD@10.20.0.4:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt' \
     --tls-cert /etc/ai-memory/tls/server.pem \
     --tls-key  /etc/ai-memory/tls/server.key \
     --mtls-allowlist /etc/ai-memory/tls/mtls-allowlist.txt
 ```
+
+The store URL is deliberately not in `ExecStart=`: a unit file is normally mode `0644` and the argv of a running service is readable by any local UID, so the DSN password goes in the `0600` file named by `AI_MEMORY_STORE_URL_FILE` ([#4577](https://github.com/alphaonedev/ai-memory-mcp/issues/4577), see [Daemon configuration](#daemon-configuration)).
 
 Reload + restart:
 
@@ -804,9 +813,9 @@ confidence \* 2.0 + tier_bonus + recency_factor; v1.0.0 Boids item 1,
 vote 4d3ea1c5: popularity capped at ACCESS_SCORE_CAP=10, unassessed/NULL
 confidence scored neutral 0.5), 0.2 cosine gate, adaptive blend
 (`semantic_weight = 0.50` for ≤500 chars, lerp to `0.15` at ≥5000
-chars), atomic touch ops (++access_count + TTL extension +
-mid→long auto-promotion at 5 accesses + ++priority every 10
-accesses).
+chars), atomic touch ops (++access_count + TTL floor extension;
+v1.0.0 Boids item 1 removed the mid→long auto-promotion and the
+priority ladder, so tier changes only through `memory_promote`).
 
 ### Postgres route gate
 
@@ -846,9 +855,9 @@ tool names is unaffected. On sqlite nothing changes.
 
 ### What still returns 501 on postgres
 
-Of the **86 unique production URL paths** (over **100 `.route(...)`
+Of the **89 unique production URL paths** (over **103 `.route(...)`
 registrations in `src/lib.rs`**, surfaced through
-`/api/v1/capabilities`), **73 are served on a postgres-backed daemon
+`/api/v1/capabilities`), **76 are served on a postgres-backed daemon
 and 13 are fully fail-closed** — every HTTP method on those 13 paths
 returns a uniform `501 NOT IMPLEMENTED`. The gate FAILS CLOSED by
 design: an un-migrated handler can never fall through to the empty
@@ -1195,14 +1204,16 @@ adapter probes at connect time:
 
 | Op | AGE 1.8.0 (executed engine) | CTE / other | Speedup at depth=5 |
 |---|---|---|---|
-| `kg_query` | AGE Cypher `MATCH (a)-[*1..d]->(b) WHERE a.id = $1` | recursive `WITH` join (fallback) | ≥30% (S76 gate) |
-| `kg_timeline` | AGE Cypher `MATCH ... WHERE valid_from < $1 AND (valid_until IS NULL OR valid_until > $1)` | recursive temporal join (fallback) | ≥30% |
+| `kg_query` | AGE Cypher `MATCH (a)-[*1..d]->(b) WHERE a.id = $1` | recursive `WITH` join (fallback) | ≥30% threshold in the manual `benches/age_vs_cte.rs` bench (not run in CI) |
+| `kg_timeline` | AGE Cypher `MATCH ... WHERE valid_from < $1 AND (valid_until IS NULL OR valid_until > $1)` | recursive temporal join (fallback) | not measured (the bench covers `kg_query` only) |
 | `kg_invalidate` | AGE Cypher `MATCH ... SET valid_until = $1` | `UPDATE memory_links` (fallback) | parity |
 | `find_paths` | **relational recursive-CTE (bounded BFS) on both `KgBackend` values** — not AGE Cypher (#2582 / #3297) | (this **is** the production engine) | n/a (no AGE walk) |
 
-The S76 perf gate fires if AGE is reported as engaged but the AGE p95
-is **not** at least 30% faster than CTE p95 on the canonical 1k-entity
-/ 5k-edge corpus. That gate is honest about the AGE-vs-CTE comparison
+`benches/age_vs_cte.rs` exits non-zero if AGE is reported as engaged
+but the AGE p95 is **not** at least 30% faster than the CTE p95, measured
+on a 200-node / ~800-edge fixture at depth 5. It is a manually run bench:
+it skips itself when no Postgres+AGE URL is set and no CI job runs it
+(see `PERFORMANCE.md` §"AGE-vs-CTE speedup"). The comparison is honest about AGE vs CTE
 on the **same** postgres host — comparing AGE-on-postgres to
 CTE-on-sqlite is a different question and not the speedup we claim.
 

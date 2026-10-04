@@ -210,6 +210,20 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+/// #4447 — map the typed in-transaction by-id refusal onto the ONE
+/// `PermissionDenied` envelope the postgres adapter returns (error parity);
+/// anything else stays a backend detail.
+fn by_id_refusal(e: anyhow::Error, action: &str) -> StoreError {
+    match e.downcast::<crate::storage::InboundByIdNamespaceRefused>() {
+        Ok(refused) => StoreError::PermissionDenied {
+            action: action.to_string(),
+            target: refused.id.clone(),
+            reason: refused.to_string(),
+        },
+        Err(other) => box_err(other),
+    }
+}
+
 /// Map the typed coordination-guard refusal onto the SAL error: quota and
 /// validation keep their structural variants (the postgres twin maps
 /// `prepare_action` to `IntegrityFailed` the same way); a driver fault
@@ -225,6 +239,9 @@ fn memory_guard_err(e: crate::errors::MemoryError) -> StoreError {
         },
         crate::errors::MemoryError::ValidationFailed(detail) => {
             StoreError::IntegrityFailed { detail }
+        }
+        crate::errors::MemoryError::AuditTrailUnavailable(reason) => {
+            StoreError::AuditTrailUnavailable { reason }
         }
         other => box_err(other.message()),
     }
@@ -398,6 +415,37 @@ fn assert_caller_owns_for_mutation(
         reason,
     })
 }
+
+/// #3957 — test-only interleave point between the ownership gate and the
+/// write it authorises. A cell arms it for ONE row id; any other id (a
+/// concurrent test on another row) passes through untouched. Compiled out
+/// of every non-test build.
+#[cfg(test)]
+type OwnerGateHook = Box<dyn FnOnce() + Send>;
+/// Keyed by row id so concurrently running cells never replace each
+/// other's armed hook.
+#[cfg(test)]
+pub(crate) static OWNER_GATE_TEST_HOOK: std::sync::Mutex<
+    Option<std::collections::HashMap<String, OwnerGateHook>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn owner_gate_test_hook(id: &str) {
+    let hook = OWNER_GATE_TEST_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+        .and_then(|armed| armed.remove(id));
+    if let Some(f) = hook {
+        f();
+    }
+}
+
+#[cfg(not(test))]
+fn owner_gate_test_hook(_id: &str) {}
+
+#[cfg(test)]
+mod owner_gate_txn_3957;
 
 // #1709 Pillar 1 — the actions SELECT column list + row mapping live in
 // `crate::actions` (shared with the MCP `memory_action_*` handlers, which hold
@@ -821,6 +869,15 @@ impl MemoryStore for SqliteStore {
     async fn update(&self, ctx: &CallerContext, id: &str, patch: UpdatePatch) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
+        // #3957 — the ownership gate, the content write and the lifecycle
+        // transition run in ONE `BEGIN IMMEDIATE`. The mutex above only
+        // serialises THIS process; other OS processes write the same file
+        // (MCP stdio, `curator`, every CLI invocation), and without the
+        // write lock held from check to write one of them could commit an
+        // ownership change between the gate's read and our UPDATE — a
+        // mutation authorised against a stale owner (the sqlite twin of
+        // #3953). Every early `?` below drops the guard, which rolls back.
+        let txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
         // Parity finding #4 — SAL-level caller-owns gate (postgres parity).
         // Inbox carve-out DISABLED for update, mirroring the HTTP
         // `update_memory` / MCP `memory_update` convention.
@@ -832,53 +889,67 @@ impl MemoryStore for SqliteStore {
             false,
             crate::identity::owner_stamp::funnel::UPDATE,
         )?;
+        owner_gate_test_hook(id);
         // v0.7.0 Provenance Gap 2 (#906) — thread the patch's
         // `source_uri` slot into `update_with_expected_version` so the
         // sqlite SAL adapter honors source_uri rewrites end-to-end.
         // `expected_version=None` preserves the trait's existing
         // last-write-wins contract.
-        let (found, _content_changed) = db::update_with_expected_version(
-            &conn,
-            id,
-            patch.title.as_deref(),
-            patch.content.as_deref(),
-            patch.tier.as_ref(),
-            patch.namespace.as_deref(),
-            patch.tags.as_ref(),
-            patch.priority,
-            patch.confidence,
-            // #1634 — thread the patch's expires_at; the pg trait
-            // update honored it (#1423) while this adapter passed a
-            // literal None, silently dropping the field for any future
-            // sqlite-backed trait caller.
-            patch.expires_at.as_deref(),
-            patch.metadata.as_ref(),
-            patch.source_uri.as_deref(),
-            None,
-            // v1.0.0 #1834 — thread the patch's valid_until (valid_from immutable).
-            patch.valid_until.as_deref(),
-        )
-        .map_err(box_err)?;
+        //
+        // #3152 — the patch and the optional lifecycle transition are ONE
+        // write transaction: `update_with_expected_version` and
+        // `set_lifecycle_state` both JOIN the #3957 `BEGIN IMMEDIATE` opened
+        // above (the ownership gate already ran inside it), so an illegal
+        // edge, an error or a crash between them leaves the row exactly as it
+        // was instead of persisting the patch alone.
+        let found = db::in_write_txn(&conn, || {
+            let (found, _content_changed) = db::update_with_expected_version(
+                &conn,
+                id,
+                patch.title.as_deref(),
+                patch.content.as_deref(),
+                patch.tier.as_ref(),
+                patch.namespace.as_deref(),
+                patch.tags.as_ref(),
+                patch.priority,
+                patch.confidence,
+                // #1634 — thread the patch's expires_at; the pg trait
+                // update honored it (#1423) while this adapter passed a
+                // literal None, silently dropping the field for any future
+                // sqlite-backed trait caller.
+                patch.expires_at.as_deref(),
+                patch.metadata.as_ref(),
+                patch.source_uri.as_deref(),
+                None,
+                // v1.0.0 #1834 — thread the patch's valid_until (valid_from immutable).
+                patch.valid_until.as_deref(),
+            )?;
+            #[cfg(test)]
+            crate::recover::in_tx_fault::patched_before_lifecycle(id);
+            // #1726 — apply an optional lifecycle transition through the
+            // self-validating storage primitive (SELECT-current →
+            // can_transition_to → typed InvalidTransition). A request equal
+            // to the stored state is an idempotent no-op; an illegal edge
+            // surfaces as `StoreError::InvalidTransition` → HTTP 409,
+            // byte-parity with the postgres twin.
+            if found && let Some(target) = patch.lifecycle_state {
+                db::set_lifecycle_state(&conn, id, target)?;
+            }
+            Ok(found)
+        })
+        .map_err(|e| {
+            e.downcast_ref::<crate::storage::InvalidTransition>()
+                .map_or_else(
+                    || box_err(&e),
+                    |it| StoreError::InvalidTransition {
+                        detail: it.to_string(),
+                    },
+                )
+        })?;
         if !found {
             return Err(StoreError::NotFound { id: id.to_string() });
         }
-        // #1726 — apply an optional lifecycle transition through the
-        // self-validating storage primitive (SELECT-current →
-        // can_transition_to → typed InvalidTransition). A request equal to
-        // the stored state is an idempotent no-op; an illegal edge surfaces
-        // as `StoreError::InvalidTransition` → HTTP 409, byte-parity with the
-        // postgres twin.
-        if let Some(target) = patch.lifecycle_state {
-            db::set_lifecycle_state(&conn, id, target).map_err(|e| {
-                e.downcast_ref::<crate::storage::InvalidTransition>()
-                    .map_or_else(
-                        || box_err(&e),
-                        |it| StoreError::InvalidTransition {
-                            detail: it.to_string(),
-                        },
-                    )
-            })?;
-        }
+        txn.commit().map_err(box_err)?;
         Ok(())
     }
 
@@ -916,6 +987,9 @@ impl MemoryStore for SqliteStore {
     async fn delete(&self, ctx: &CallerContext, id: &str) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
+        // #3957 — gate and delete in ONE `BEGIN IMMEDIATE`, for the reason
+        // spelled out on `update` above (cross-PROCESS interleaving).
+        let txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
         // #3730 — retention policy by namespace: an inbox message is archived
         // (`archive_reason = "delete"`), every other row is erased. Looked up
         // FIRST, through the scalar probe (never the full-row `get`, whose
@@ -945,11 +1019,13 @@ impl MemoryStore for SqliteStore {
             retains,
             crate::identity::owner_stamp::funnel::DELETE,
         )?;
+        owner_gate_test_hook(id);
         let removed = if retains {
             db::delete_archive_first(&conn, id).map_err(box_err)?
         } else {
             db::delete(&conn, id).map_err(box_err)?
         };
+        txn.commit().map_err(box_err)?;
         if removed {
             Ok(())
         } else {
@@ -1739,6 +1815,31 @@ impl MemoryStore for SqliteStore {
         db::merge_inbound(&conn, inbound, receiver_verified).map_err(box_err)
     }
 
+    async fn merge_inbound_authorized(
+        &self,
+        _ctx: &CallerContext,
+        inbound: &Memory,
+        receiver_verified: bool,
+        authorize_stored: crate::storage::StoredNamespaceAuthorizer<'_>,
+    ) -> StoreResult<String> {
+        self.gate_record_stop()?;
+        // #4023 — the re-check runs inside the free-fn's BEGIN IMMEDIATE.
+        let conn = self.state.lock().await;
+        db::merge_inbound_authorized(&conn, inbound, receiver_verified, Some(authorize_stored))
+            .map_err(|e| {
+                // Error parity with postgres (5-agent vote (4d3ea1c5), memory
+                // 179cf088): the in-transaction refusal is ONE typed variant.
+                match e.downcast::<crate::storage::InboundStoredNamespaceRefused>() {
+                    Ok(refused) => StoreError::PermissionDenied {
+                        action: crate::store::FEDERATION_MERGE_INBOUND.to_string(),
+                        target: refused.id.clone(),
+                        reason: refused.to_string(),
+                    },
+                    Err(other) => box_err(other),
+                }
+            })
+    }
+
     async fn apply_remote_link(
         &self,
         _ctx: &CallerContext,
@@ -1765,6 +1866,68 @@ impl MemoryStore for SqliteStore {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::delete(&conn, id).map_err(box_err)
+    }
+
+    /// #4447 — in-transaction peer-scope re-check on the `deletions[]` lane.
+    async fn apply_remote_deletion_authorized(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::delete_authorized(&conn, id, authorize_stored)
+            .map_err(|e| by_id_refusal(e, crate::store::FEDERATION_APPLY_DELETION))
+    }
+
+    /// #4447 — in-transaction peer-scope re-check on the `archives[]` lane.
+    async fn apply_remote_archive_authorized(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::archive_memory_authorized(
+            &conn,
+            id,
+            Some(crate::models::field_names::ARCHIVE_REASON_SYNC_PUSH),
+            authorize_stored,
+        )
+        .map_err(|e| by_id_refusal(e, crate::store::FEDERATION_APPLY_ARCHIVE))
+    }
+
+    /// #4447 — in-transaction peer-scope re-check on the `restores[]` lane. The
+    /// G30 forget-tombstone gate runs first, exactly as `apply_remote_restore`.
+    async fn apply_remote_restore_authorized(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        if db::memory_is_tombstoned(&conn, id).map_err(box_err)? {
+            return Ok(false);
+        }
+        db::restore_archived_authorized(&conn, id, authorize_stored)
+            .map_err(|e| by_id_refusal(e, crate::store::FEDERATION_APPLY_RESTORE))
+    }
+
+    /// #4447 — in-transaction peer-scope re-check on the `links[]` lane.
+    async fn apply_remote_link_authorized(
+        &self,
+        _ctx: &CallerContext,
+        link: &MemoryLink,
+        attest_level: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<()> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::create_link_inbound_authorized(&conn, link, attest_level, authorize_stored)
+            .map_err(|e| by_id_refusal(e, crate::store::FEDERATION_APPLY_LINK))
     }
 
     /// #3075 — delegates VERBATIM to `db::upsert_pending_action`, the free
@@ -2123,17 +2286,35 @@ impl MemoryStore for SqliteStore {
         // governance standard. Owner read + upsert in ONE WriteTxn (the #3237
         // item 5 TOCTOU discipline of the CLEAR twin).
         let write_txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
-        if !ctx.bypass_visibility {
-            let binding = db::namespace_standard_binding(&conn, namespace).map_err(box_err)?;
-            crate::store::authorize_namespace_standard_mutation(
-                ctx,
-                namespace,
-                &binding,
-                crate::store::NamespaceStandardOp::Set,
-            )?;
-        }
-        db::set_namespace_standard(&conn, namespace, standard_id, parent).map_err(box_err)?;
+        // #4356 — plus the ancestor-owner gate on a first bind (shared verdict).
+        crate::storage::ns_standard_ancestor::set_admission_conn(
+            &conn,
+            ctx.effective_principal(),
+            ctx.bypass_visibility,
+            namespace,
+        )
+        .map_err(|r| crate::store::set_refusal_to_store_err(r, namespace))?;
+        db::set_namespace_standard(&conn, namespace, standard_id, parent).map_err(|e| {
+            // #4492 — the bind-time chain-depth refusal is typed input, not a
+            // backend fault (byte-identical to the postgres adapter).
+            if crate::storage::bind_chain_depth::is_bind_chain_over_depth(&e) {
+                StoreError::InvalidInput {
+                    detail: crate::governance::bind_chain_depth::BIND_CHAIN_OVER_DEPTH.to_string(),
+                }
+            } else {
+                box_err(e)
+            }
+        })?;
         write_txn.commit().map_err(box_err)
+    }
+
+    async fn namespace_governing_ancestor(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<crate::ns_standard_ancestor::GoverningAncestor> {
+        let conn = self.state.lock().await;
+        crate::storage::ns_standard_ancestor::governing_ancestor_binding(&conn, namespace)
+            .map_err(box_err)
     }
 
     async fn clear_namespace_standard(
@@ -2262,9 +2443,36 @@ impl MemoryStore for SqliteStore {
         source: &str,
         consolidator_agent_id: &str,
     ) -> StoreResult<String> {
+        self.consolidate_with_expected_versions(
+            ctx,
+            ids,
+            title,
+            summary,
+            namespace,
+            tier,
+            source,
+            consolidator_agent_id,
+            None,
+        )
+        .await
+    }
+
+    async fn consolidate_with_expected_versions(
+        &self,
+        ctx: &CallerContext,
+        ids: &[String],
+        title: &str,
+        summary: &str,
+        namespace: &str,
+        tier: &Tier,
+        source: &str,
+        consolidator_agent_id: &str,
+        expected_versions: Option<&[i64]>,
+    ) -> StoreResult<String> {
+        super::validate_consolidation_input(ids, summary, expected_versions)?;
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::consolidate(
+        db::consolidate_with_expected_versions(
             &conn,
             ids,
             title,
@@ -2274,8 +2482,14 @@ impl MemoryStore for SqliteStore {
             source,
             consolidator_agent_id,
             ctx.bypass_visibility,
+            expected_versions,
         )
-        .map_err(box_err)
+        .map_err(
+            |e| match e.downcast_ref::<crate::storage::VersionConflict>() {
+                Some(vc) => super::consolidation_version_conflict(&vc.id, vc.expected, vc.current),
+                None => box_err(e),
+            },
+        )
     }
 
     async fn set_row_metadata(
@@ -2666,6 +2880,13 @@ impl MemoryStore for SqliteStore {
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
         self.gate_record_stop()?;
+        // #4408 — refuse an invalid recipient before any sign or write; the
+        // shared validator never echoes the value.
+        crate::validate::validate_signal_recipient(signal.to_agent.as_deref()).map_err(|e| {
+            StoreError::InvalidInput {
+                detail: e.to_string(),
+            }
+        })?;
         // #1709 Pillar 1 — mirror `link_signed`: sign a clone when a signing
         // keypair is present, else persist the signal verbatim (unsigned).
         let conn = self.state.lock().await;
@@ -3111,7 +3332,16 @@ impl MemoryStore for SqliteStore {
         namespace: &str,
     ) -> StoreResult<Option<crate::models::GovernancePolicy>> {
         let conn = self.state.lock().await;
-        Ok(db::resolve_governance_policy(&conn, namespace))
+        // #4043 — a read fault propagates (postgres parity); it is never `None`.
+        db::resolve_governance_policy(&conn, namespace).map_err(box_err)
+    }
+
+    async fn resolve_require_approval_above_depth(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<Option<u32>> {
+        let conn = self.state.lock().await;
+        db::resolve_require_approval_above_depth(&conn, namespace).map_err(box_err)
     }
 
     async fn governance_approve_with_consensus(
@@ -3978,6 +4208,13 @@ impl MemoryStore for SqliteStore {
         tier: Option<&Tier>,
         why_trace: Option<&str>,
     ) -> StoreResult<String> {
+        // #4338 — refuse an invalid recipient before any quota charge, write
+        // or wake; the shared validator never echoes the value.
+        crate::validate::validate_notify_target(target_agent).map_err(|e| {
+            StoreError::InvalidInput {
+                detail: e.to_string(),
+            }
+        })?;
         // Compose the notify memory using the same shape as
         // `mcp::handle_notify`: a memory in `_inbox/<target_agent>` with
         // `metadata.target_agent_id` set so subsequent inbox pulls find it.
@@ -4038,10 +4275,8 @@ impl MemoryStore for SqliteStore {
         // inbox namespace, but the authenticated sender pays for the write.
         let payload_bytes =
             quotas::coordination_payload_bytes(&[&mem.title, &mem.content], &[&mem.metadata]);
-        let quota_op = quotas::QuotaOp::Memory {
-            bytes: payload_bytes,
-        };
-        match quotas::check_and_record(&conn, &ctx.agent_id, &mem.namespace, quota_op) {
+        // #4359 — also charges the per-sender aggregate row.
+        match quotas::check_and_record_notify(&conn, &ctx.agent_id, &mem.namespace, payload_bytes) {
             Ok(()) => {}
             Err(quotas::QuotaCheckError::Quota(q)) => {
                 return Err(StoreError::QuotaExceeded {
@@ -4078,7 +4313,7 @@ impl MemoryStore for SqliteStore {
             }
             Err(e) => {
                 if let Err(refund_err) =
-                    quotas::refund_op(&conn, &ctx.agent_id, &mem.namespace, quota_op)
+                    quotas::refund_notify(&conn, &ctx.agent_id, &mem.namespace, payload_bytes)
                 {
                     quotas::log_refund_op_failed(&ctx.agent_id, &refund_err);
                 }
@@ -6104,6 +6339,50 @@ mod tests {
             )
             .expect("count inbox rows");
         assert_eq!(inbox_rows, 0, "an over-quota notify must not materialise");
+    }
+
+    #[tokio::test]
+    async fn notify_distinct_recipient_flood_is_bound_per_sender_4359() {
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("flooder-4359");
+        {
+            let conn = store.state.lock().await;
+            quotas::get_status(&conn, &ctx.agent_id, quotas::NOTIFY_AGGREGATE_NAMESPACE)
+                .expect("seed aggregate row");
+            conn.execute(
+                "UPDATE agent_quotas SET max_memories_per_day = 3
+                 WHERE agent_id = ?1 AND namespace = ?2",
+                rusqlite::params![ctx.agent_id, quotas::NOTIFY_AGGREGATE_NAMESPACE],
+            )
+            .expect("tighten aggregate");
+        }
+        for index in 0..3 {
+            store
+                .notify(&ctx, &format!("ai:d-{index}"), "t", "p", None, None, None)
+                .await
+                .expect("under the sender ceiling");
+        }
+        let err = store
+            .notify(&ctx, "ai:d-3", "t", "p", None, None, None)
+            .await
+            .expect_err("4th distinct recipient refused");
+        assert!(matches!(
+            err,
+            StoreError::QuotaExceeded { ref namespace, .. }
+                if namespace == quotas::NOTIFY_AGGREGATE_NAMESPACE
+        ));
+        let conn = store.state.lock().await;
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = '_inbox/ai:d-3'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(rows, 0, "refused notify must not materialise");
+        let agg = quotas::peek_status(&conn, &ctx.agent_id, quotas::NOTIFY_AGGREGATE_NAMESPACE)
+            .expect("aggregate status");
+        assert_eq!(agg.current_memories_today, 3);
     }
 
     #[tokio::test]

@@ -243,6 +243,53 @@ async fn unimplemented_default_arms_refuse_naming_their_capability() {
         s.merge_inbound(&ctx, &mem, false).await,
         "FEDERATION_MERGE_INBOUND",
     );
+    // #4023 — the authorized sibling must ALSO fail closed on an adapter that
+    // cannot re-check inside its merge transaction (never a silent unchecked
+    // merge). Distinct capability name from the unchecked arm above.
+    refused(
+        s.merge_inbound_authorized(&ctx, &mem, false, &|_: &str| true)
+            .await,
+        "FEDERATION_MERGE_INBOUND_AUTHORIZED",
+    );
+    // #4447 — the four by-id authorized siblings fail closed too (one distinct
+    // capability each), never a silent unchecked write.
+    refused(
+        s.apply_remote_deletion_authorized(&ctx, &mem.id, &|_: &str, _: &str| true)
+            .await,
+        "APPLY_REMOTE_DELETION_AUTHORIZED",
+    );
+    refused(
+        s.apply_remote_archive_authorized(&ctx, &mem.id, &|_: &str, _: &str| true)
+            .await,
+        "APPLY_REMOTE_ARCHIVE_AUTHORIZED",
+    );
+    refused(
+        s.apply_remote_restore_authorized(&ctx, &mem.id, &|_: &str, _: &str| true)
+            .await,
+        "APPLY_REMOTE_RESTORE_AUTHORIZED",
+    );
+    refused(
+        s.apply_remote_link_authorized(
+            &ctx,
+            &MemoryLink {
+                source_id: mem.id.clone(),
+                target_id: mem.id.clone(),
+                relation: ai_memory::models::MemoryLinkRelation::DerivedFrom,
+                created_at: "2026-01-01T00:00:00+00:00".to_string(),
+                valid_from: None,
+                valid_until: None,
+                observed_by: None,
+                signature: None,
+                attest_level: None,
+                source_cid: None,
+                target_cid: None,
+            },
+            "unsigned",
+            &|_: &str, _: &str| true,
+        )
+        .await,
+        "APPLY_REMOTE_LINK_AUTHORIZED",
+    );
     refused(
         s.archived_namespace_by_id(&ctx, &mem.id).await,
         "ARCHIVED_NAMESPACE_BY_ID",

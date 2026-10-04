@@ -177,7 +177,7 @@ protocol design — a length-capped manual `read_until(b'\n')` reader
 (post-#1249 DoS guard, `MCP_MAX_LINE_BYTES`; the pre-#1249 form was
 `for line in stdin.lock().lines()`) in `src/mcp/mod.rs` — so there is
 no concurrent dispatch and no mutex is required. The HTTP daemon uses `Arc<Mutex<Connection>>`
-(`src/handlers/transport.rs:22`) protecting a single SQLite connection;
+(the [`Db`](../src/handlers/transport.rs) alias) protecting a single SQLite connection;
 lock contention is the bottleneck under concurrent HTTP load but at
 T1 scale (1 agent, single-host) the contention is unobservable.
 
@@ -227,11 +227,20 @@ the test-contract shim `VectorIndex::rebuild()`.
 
 Even a singleton should establish per-agent Ed25519 keypairs on the
 first session: `ai-memory identity generate --agent-id "alice@laptop"`.
-The `signed_events` per-row signature column is filled only when the
+The `signed_events` per-row signature column is filled when the
 daemon resolves an `agent_id` with a `*.priv` keypair on disk
-(`load_daemon_signing_key`, `src/main.rs:116-118`); without it, the
-daemon boots with the stderr "continuing unsigned" line and rows get
-blank signatures (the cross-row hash chain is still tamper-evident).
+([`load_daemon_signing_key`](../src/governance/audit.rs)). Since #3354 a
+ledger-writing command generates that key at boot when it is absent
+([`ensure_daemon_signing_key`](../src/governance/audit.rs)) and refuses to
+start ([`unsigned_ledger_refusal`](../src/governance/audit.rs)) when it can
+neither load nor generate one, so a writer never runs keyless
+(a writer is every command outside the egress, remediation and read-only
+verbs enumerated by `ledger_writer` in `src/main.rs`; serve, mcp and
+sync-daemon are examples). Every process except the key-provisioning verbs
+ensures the key at boot. A read-only, egress or remediation verb whose
+key cannot be ensured runs keyless (it is not refused at boot); the
+state is reported by the `doctor` identity facts (`daemon_signing`,
+`signing`), not by a boot line.
 Graduating to T2/T3 is a no-op if keypairs already exist — you just
 import the peer's public key on the destination side; graduating from
 "no keypair" to "keypair" mid-flight rewrites the audit story.
@@ -257,9 +266,11 @@ correct as written. On any Postgres-backed topology (T3+) use `pg_dump`
 / `pg_basebackup` instead — `ai-memory backup` is SQLite-only and now
 REFUSES a Postgres store rather than emitting a plausible-looking empty
 snapshot ([#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444)).
-Add `--store-url "$AI_MEMORY_STORE_URL"` to any backup cron on a host
-that might be re-pointed at Postgres, so the command fails loudly on the
-day it is.
+Export `AI_MEMORY_STORE_URL_FILE` (or `AI_MEMORY_STORE_URL`) in the environment of
+any backup cron on a host that might be re-pointed at Postgres, so the command
+fails loudly on the day it is: `backup` resolves the store from those channels
+itself (`src/cli/backup.rs:1112`). Do not copy the variable onto the command line
+as `--store-url "$AI_MEMORY_STORE_URL"`; that puts the password in argv.
 
 ### 2.7 When to graduate
 
@@ -300,7 +311,8 @@ Graduate directly to T3 (skip T2) when **any** of these are true:
 ### 3.2 Storage
 
 Same as T1 — SQLite-WAL — but **shared by all N agents** via the
-HTTP daemon process. Each agent connects over HTTP:
+HTTP daemon process. Every agent that shares this store reaches it over
+HTTP:
 
 ```bash
 # Daemon
@@ -311,9 +323,23 @@ curl -H "X-Agent-Id: alice@team-finance" \
      -H "X-API-Key: $(cat /etc/ai-memory/api.key)" \
      https://127.0.0.1:9077/api/v1/recall?q=quarterly+forecast
 
-# Agent 2 (using ai-memory CLI as a thin client)
-AI_MEMORY_AGENT_ID="bob@team-finance" ai-memory recall "quarterly forecast"
+# Agent 2 — same shape, a different caller identity
+curl -H "X-Agent-Id: bob@team-finance" \
+     -H "X-API-Key: $(cat /etc/ai-memory/api.key)" \
+     https://127.0.0.1:9077/api/v1/recall?q=quarterly+forecast
 ```
+
+> **`ai-memory recall` is not a thin client for this daemon.** The CLI
+> read/write verbs open a **local SQLite file** at the resolved `--db` /
+> `AI_MEMORY_DB` path — `Command::Recall` dispatches to
+> `cli::recall::run(&db_path, …)`, never an HTTP request — so
+> `AI_MEMORY_AGENT_ID="bob@…" ai-memory recall "…"` on an agent host
+> reads that host's own database, not the shared T2 store. It is a
+> different store with the same command name, which at T2 silently looks
+> like an empty or stale corpus. Use HTTP (or an MCP client pointed at
+> the daemon) for shared access; the CLI reaches the shared store only on
+> the daemon host with `--db` set to the daemon's own path, where WAL lets
+> that reader coexist with the daemon's writer (see the note below).
 
 WAL mode is critical at T2 — it permits a single writer to coexist
 with N readers without blocking. The substrate also serializes
@@ -339,7 +365,7 @@ host — federation attestation is not in play.
 | Concurrent writers | Effectively 1 (mutex on daemon's `Connection`) |
 | Sustained write throughput (p95 <100 ms) | 15–25 stores/sec |
 | Sustained read throughput | 200–500 recalls/sec |
-| Lock-contention hotspot | `src/handlers/transport.rs:22` `Db = Arc<Mutex<(Connection, …)>>` |
+| Lock-contention hotspot | [`Db`](../src/handlers/transport.rs) `= Arc<Mutex<(Connection, …)>>` |
 
 If you observe sustained write queues longer than 50 ms, graduate to
 T3. The Postgres path removes the mutex bottleneck via MVCC.
@@ -448,6 +474,8 @@ Bootstrap a fresh postgres backend with:
 ai-memory schema-init --store-url postgres://aimemory:PWD@hub.dc1.internal:5432/aimemory
 ```
 
+`schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
+
 Opening the store runs the idempotent `postgres_schema.sql` bootstrap
 plus the in-process upgrade ladder to schema v91 as a side effect. The
 `vector` (pgvector) extension is required (its absence aborts the
@@ -478,7 +506,7 @@ auth layers ([`federation.md`](federation.html)):
 | Layer | Mechanism | Effect |
 |---|---|---|
 | 1 (transport) | mTLS with SHA-256 fingerprint allowlist (`--mtls-allowlist`) | Peer without listed cert cannot open TCP |
-| 2 (application) | `x-api-key` header (the `?api_key=` query form is deprecated at v0.7.0, #1574 — WARNs once per process; slated for rejection in v0.8) | Every endpoint except `/api/v1/health` requires it |
+| 2 (application) | `x-api-key` header — the only accepted credential channel (the `?api_key=` query form was **REMOVED at v1.0.0**, #2032 L1, after deprecation at v0.7.0, #1574; it does not authenticate, and a once-per-process WARN names the header) | Every endpoint except `/api/v1/health` requires it; a missing or invalid credential ordinarily returns 401, and source-IP auth backoff can return 429 (#2502) |
 | 3 (identity) | Per-peer `PeerScope` JSON via `AI_MEMORY_FED_PEER_ATTESTATION` | `allowed_sender_agent_ids` gates the authorship a peer may claim on `/sync/push`; the `allowed_namespaces` glob gates WHICH namespaces it may touch on ALL THREE lanes — the `/sync/since` pull projection, the `deletions[]` lane (#1934), and the `memories[]` write lane + `archives[]` / `restores[]` (#2447); default-deny |
 
 Cert generation, fingerprint allowlist format, and the cert-revocation
@@ -509,8 +537,13 @@ Implications:
 
 ### 4.6 Latency budget (T3)
 
-Reference numbers from the LAN-parity test fleet
-(`infra/lan-parity-test/`) on two-rack same-DC topology:
+**Illustrative planning targets, not measurements.** The numbers below
+are planning targets for a two-rack same-DC topology. They do not come
+from `infra/lan-parity-test/` (that harness runs cross-adapter parity
+tests against a local PG+AGE container and samples no latency
+percentiles), and no committed receipt or script produced them. Measure
+your own deployment before treating any row as a budget; the measured,
+receipted numbers this project publishes live in `PERFORMANCE.md`.
 
 | Operation | p50 | p95 | p99 |
 |---|---|---|---|
@@ -518,10 +551,14 @@ Reference numbers from the LAN-parity test fleet
 | `POST /api/v1/memories` (W=2 of N=3 quorum) | 14 ms | 38 ms | 75 ms |
 | `GET /api/v1/recall?q=…` (local; hot HNSW) | 8 ms | 22 ms | 50 ms |
 | `POST /api/v1/sync/push` (single payload, 5 memories) | 11 ms | 30 ms | 65 ms |
-| `POST /api/v1/kg/find_paths` (depth=3, AGE) | 12 ms | 35 ms | 80 ms |
+| `POST /api/v1/kg/find_paths` (depth=3; recursive CTE on both backends) | 12 ms | 35 ms | 80 ms |
 
-LAN RTT-bound. Federation fanout adds one full RTT × peer count to
-the write path. The CRDT-lite merge cost on the receiving side scales
+LAN RTT-bound. Federation sends to peers concurrently and can complete
+the foreground wait once the configured quorum is met, subject to its
+shared acknowledgement deadline. Remaining fanouts continue in the
+background. Latency depends on the acknowledgements needed, peer/network
+behavior and local work; it is not defined as one RTT multiplied by peer
+count. The CRDT-lite merge cost on the receiving side scales
 with **row count**, not peer count (`federation.md §"Multi-peer
 scaling guidance"`).
 
@@ -540,8 +577,8 @@ Operator overrides:
 
 The vector-clock merge handles concurrent writes via standard
 CRDT-lite semantics (`src/federation/vector_clock.rs`). The
-`enforce_local_cap_on_derived` function
-(`src/federation/reflection_bookkeeping.rs:200`) is the additional
+[`enforce_local_cap_on_derived`](../src/federation/reflection_bookkeeping.rs)
+function is the additional
 v0.7.0 guard against depth-cap laundering across peers — even if a
 sending peer's `max_reflection_depth` is higher, the receiving peer
 refuses incoming reflections that exceed its **local** cap.
@@ -633,9 +670,12 @@ some queries but the production guidance at v0.7.0 is:
 - The recursive-CTE fallback runs against the replica's `memory_links`
   table and produces correct results without AGE — useful for the
   read-only audit case.
-- The S76 perf gate guarantees AGE Cypher is ≥30% faster than CTE at
-  depth=5 on the canonical 1k-entity / 5k-edge corpus
-  ([`postgres-age-guide.md §"AGE Cypher vs CTE fallback"`](postgres-age-guide.html)).
+- `benches/age_vs_cte.rs` is a manually run bench (200-node / ~800-edge
+  fixture, `kg_query` at depth 5) that fails if the AGE p95 is not at
+  least 30% faster than the CTE p95. It skips itself without
+  Postgres+AGE and does not run in CI, so it is not a guarantee
+  ([`postgres-age-guide.md §"AGE Cypher vs CTE fallback"`](postgres-age-guide.html);
+  `PERFORMANCE.md` §"AGE-vs-CTE speedup").
 
 ### 5.6 Connection pooling (PgBouncer enters at T4)
 
@@ -724,10 +764,16 @@ as a secret surface in the §14 hardening checklist.
 
 #### 5.6.5 Reconciling the daemon pool with PgBouncer
 
-Point each daemon at PgBouncer instead of the primary:
+Point each daemon at PgBouncer instead of the primary. Put the URL in the
+`0600` file the daemon reads through `AI_MEMORY_STORE_URL_FILE` (not on
+`--store-url`, whose argv any local UID can read from `/proc/<pid>/cmdline`;
+`src/store_url.rs:137`, [#4577](https://github.com/alphaonedev/ai-memory-mcp/issues/4577)):
 
 ```
---store-url postgres://aimemory:PWD@pgbouncer.rackA.internal:6432/aimemory
+# /etc/ai-memory/store-url   (mode 0600, owned by the service user, one line)
+postgres://aimemory:PWD@pgbouncer.rackA.internal:6432/aimemory
+
+# unit:  Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
 ```
 
 Then size the two pools so the daemon fleet never starves PgBouncer
@@ -874,13 +920,13 @@ x-peer-id: <peer-id>
 ```
 
 Receivers verify the signature against the enrolled peer key
-(`src/federation/signing.rs:120 verify_header`) and check the nonce
+([`verify_header`](../src/federation/signing.rs)) and check the nonce
 freshness against a per-peer bounded LRU. Replay of a valid
 `(body, sig)` pair under a stale nonce produces
 `401 x_memory_nonce_replay`.
 
 The signature is bound to the nonce by `body || 0x00 || nonce`
-(`NONCE_DOMAIN_SEP = 0x00` in `src/federation/signing.rs:39`), so a
+([`NONCE_DOMAIN_SEP`](../src/federation/signing.rs)` = 0x00`), so a
 captured signed body cannot be replayed under a fresh nonce without
 the private key.
 
@@ -912,7 +958,8 @@ writes. Three options:
 3. **Move to three DCs.** Three-of-three or three-of-five quorum;
    single-DC failure becomes tolerable.
 
-The `FederationConfig` in `src/federation/peer.rs:30` exposes the
+The [`FederationConfig`](../src/federation/mod.rs) `policy` field
+([`QuorumPolicy`](../src/replication.rs), its `w` member) carries the
 quorum width; the operator chooses it explicitly.
 
 ### 6.5 sync/push and sync/since across DCs
@@ -934,8 +981,8 @@ Federation peers exchange data via two endpoints:
   archive and restore lanes (#1934 / #2447), so data-residency scope is
   enforced in both directions rather than on reads alone.
 
-The catchup loop (`spawn_catchup_loop`,
-`src/federation/receive.rs:35`) drives the periodic pull; default
+The catchup loop ([`spawn_catchup_loop`](../src/federation/receive.rs))
+drives the periodic pull; default
 cadence is operator-set via `FederationConfig`. For T5 deployments:
 60–120 s catchup cadence is the practical sweet-spot (small enough
 that pull-lag is bounded; large enough that the cross-DC bandwidth
@@ -945,7 +992,8 @@ cost stays predictable).
 
 A push to a peer that fails (network error, peer down, peer-side
 refusal) is **durably queued** — it lands in the `federation_push_dlq`
-table (added schema v48; `src/federation/sync.rs:464+`). A
+table (added schema v48; written through
+[`FederationDlqSink`](../src/federation/push_dlq.rs)). A
 
 > ⚠️ **The queued payload can be replayed to the WRONG peer.** The
 > durable DLQ key is a **positional index**: peers are identified as
@@ -969,7 +1017,7 @@ background worker (`replay_federation_push_dlq`) re-attempts the
 push on a fixed cadence; after exhausting the operator-configured
 retry budget the row is quarantined (counted via the
 `ai_memory_federation_push_dlq_quarantined_total` Prometheus counter,
-`src/metrics.rs:310`).
+the `federation_push_dlq_quarantined` field of [`Metrics`](../src/metrics.rs)).
 
 Operator action on a non-zero quarantine counter: inspect the row's
 `last_error`, decide whether to retry (clear `quarantined_at`) or
@@ -1060,7 +1108,7 @@ is where data-residency policy is enforced:
 Namespace globs are the load-bearing primitive — they let the operator
 constrain which regions can pull which rows. A pull of `shared/eu/**`
 from outside `eu-west-1` is refused at the `namespace_allowed` gate
-(`src/federation/peer_attestation.rs:338`), before any row crosses
+([`namespace_allowed`](../src/federation/peer_attestation.rs)), before any row crosses
 the wire.
 
 ### 7.4 GDPR + data-residency callouts
@@ -1141,7 +1189,7 @@ write locally, and accept that cross-region peers see the write
 
 Every region runs its own Prometheus + Grafana + alert manager. The
 `/api/v1/metrics` endpoint exports the standard substrate metrics
-(`src/lib.rs:257`). Region-local dashboards; per-region on-call.
+([`prometheus_metrics`](../src/handlers/transport.rs)). Region-local dashboards; per-region on-call.
 
 Cross-region SLO monitoring lands at a higher layer — typically a
 central monitoring system that scrapes each region's `/metrics` over
@@ -1282,8 +1330,10 @@ api-key layer by design ([#702](https://github.com/alphaonedev/ai-memory-mcp/iss
 
 ### 8.7 Quorum cost in a 5-peer swarm
 
-Default W = ceil(5/2 + 1) = 3 (out of 5). Three peers must ack a
-write before it's canonical. Any single-peer outage is tolerated.
+There is no compiled majority default: bare `ai-memory serve` defaults to
+`--quorum-writes 0` (federation off), so W is set explicitly per
+deployment. A majority quorum for 5 nodes is W = 3 (out of 5): three
+nodes, counting the local commit, must ack a write before it's canonical. Any single-peer outage is tolerated.
 Two-peer simultaneous outage stalls writes.
 
 For deployments where the operator wants writes to land even with
@@ -1377,7 +1427,7 @@ For an operator piloting a hive in v0.7.0, the responsible shape is:
 2. **Mesh federation between the three** via the T6 wire shape (signed + nonce + attestation).
 3. **Strict trust gates** — every cross-cluster `PeerScope` row narrows to specific allowed namespaces. No `**` globs cross-cluster.
 4. **Per-cluster signed-events chain** — each cluster verifies independently. No global chain; V-4 is per-host tamper-evidence.
-5. **Per-cluster Prometheus.** The `ai_memory_federation_push_dlq_depth` gauge (`src/metrics.rs:299`) is the load-bearing pilot metric — a non-zero depth means cross-cluster pushes are failing.
+5. **Per-cluster Prometheus.** The `ai_memory_federation_push_dlq_depth` gauge (the `federation_push_dlq_depth` field of [`Metrics`](../src/metrics.rs)) is the load-bearing pilot metric — a non-zero depth means cross-cluster pushes are failing.
 6. **Edge-tier "pull-only" leaves.** Mobile/IoT/browser leaves configured with empty `allowed_sender_agent_ids` on inbound; pull-only via narrow `allowed_namespaces` outbound.
 7. **Manual escalation on hot-key writes.** No distributed lock ships; the Memory `version` column (Gap-1 optimistic concurrency, schema v45) detects conflicts and the operator resolves.
 
@@ -1707,13 +1757,32 @@ Six surfaces, each load-bearing for different ops scenarios:
    the `X-API-Key` requirement so load balancers can scrape without
    credentials.
 2. **`GET /api/v1/metrics`** (and the bare `/metrics` at the community
-   convention path, `src/lib.rs:253-257`) — Prometheus scrape
+   convention path; both routes dispatch to
+   [`prometheus_metrics`](../src/handlers/transport.rs)) — Prometheus scrape
    endpoint. Exports the substrate's metrics
    (`src/metrics.rs`).
-3. **Tracing spans on stderr** — every MCP tool call, every governance
-   decision, every federation event emits a `tracing::info!` span.
-   `RUST_LOG=ai_memory=info` is the default; `RUST_LOG=ai_memory=debug`
-   for deep traces.
+3. **Tracing on stderr** — an MCP `tools/call` request that reaches the
+   dispatch call runs inside an `mcp_tool_call` info span (fields `tool` and
+   `rpc_id`, `tools/call` arm of `src/mcp/mod.rs`) and reports an `ok` info
+   event with `elapsed_ms`, or an `err` warn event. A request with a missing
+   tool name, or for a tool not loaded in the active profile, returns before
+   the span. Non-object `arguments`, an unresolvable caller authority, the
+   record-stop gate, an unknown tool and an unrecognised wire format return
+   inside the span without an `ok` or `err` event. Governance decisions are not tracing spans:
+   [`record_decision`](../src/governance/audit.rs) records them as forensic
+   audit rows when the forensic audit sink is running and does nothing when
+   it is not. Federation emits `tracing::info!` events on the push,
+   DLQ-replay, receive and sync paths, not a span per event. The default
+   filter is the bare level `info`
+   ([`DEFAULT_LOG_DIRECTIVE`](../src/logging.rs), #3650), which is not limited
+   to the `ai_memory` prefix. A `RUST_LOG` directive is added on top of that base:
+   `RUST_LOG=ai_memory=debug` raises the `ai_memory` targets for deep traces
+   and leaves other targets at `info`, and a bare level such as
+   `RUST_LOG=error` replaces the base level. The sinks of the `[logging]`
+   pipeline (file, stdout and syslog) do not read `RUST_LOG`: their filter is
+   `[logging].level` (default `info`) plus the two `sqlx_postgres::options`
+   credential floors at `error`, so with `level = "ai_memory=info"` those sinks
+   write nothing from other targets except `error` events from those two floor targets.
 4. **File logging** — opt-in via `[logging]` in `config.toml`.
    Rotating appender; off by default.
 5. **`ai-memory doctor`** — 10-section health dashboard run locally.
@@ -1820,7 +1889,7 @@ Every restored snapshot must pass `verify-signed-events-chain` before
 production traffic reopens. The chain integrity property is binary
 (`chain_holds: true` or `false`) and the substrate refuses to append
 new rows against a partially-backfilled chain (the COR-9 fix,
-`read_chain_head`, `src/signed_events.rs:207`).
+[`read_chain_head`](../src/signed_events.rs)).
 
 Restore-time chain workflow:
 
@@ -1834,7 +1903,7 @@ Restore-time chain workflow:
 ### 13.4 Federation re-sync after restore
 
 A restored peer in a federation cluster needs to catch up. The
-catchup loop (`spawn_catchup_loop`, `src/federation/receive.rs:35`)
+catchup loop ([`spawn_catchup_loop`](../src/federation/receive.rs))
 handles this automatically — the restored peer's `/sync/since`
 watermark is behind the live peers', and the next pull cycle fills
 in the gap.
@@ -1873,7 +1942,7 @@ for the single-instance baseline.
 - [ ] Every agent has its own Ed25519 keypair (`ai-memory identity generate`); private keys mode 0600 under the canonical key directory.
 - [ ] No keypair shared across agents.
 - [ ] Key rotation playbook documented; old keys preserved under `<id>.key.rotated-<timestamp>` for historical signature verification ([`signed-events-v4.md`](signed-events-v4.html)).
-- [ ] Daemon `agent_id` has a keypair on disk; the stderr "continuing unsigned" line at boot is a T3-graduation blocker (`load_daemon_signing_key`, `src/main.rs:116-118`).
+- [ ] Daemon `agent_id` has a keypair on disk; a ledger writer that cannot load or generate the key refuses to start ([`unsigned_ledger_refusal`](../src/governance/audit.rs)), so the T3-graduation check is that the `doctor` identity facts report `daemon_signing` as `ready` and `signing` as `ready (<agent id>)`; any other value is a graduation blocker.
 
 ### 14.2 Transport — mTLS + API key (T3+)
 
@@ -1963,7 +2032,7 @@ shortcuts so a fleet operator does not audit each knob by hand:
 
 **`AI_MEMORY_SECURITY_PROFILE=asi-hard` — the NO-DISABLE hardened
 posture.** One named knob pins the fail-closed security floor: at boot
-the profile PINS **30** security env knobs to their hard value (SSOT)
+the profile PINS **31** security env knobs to their hard value (SSOT)
 `src/security_profile.rs::KNOBS`; the copy-deployable template is
 [`deploy/asi-hard.env`](deploy/asi-hard.env), pinned by
 `tests/deploy_templates.rs`) and **refuses to boot** if an operator set

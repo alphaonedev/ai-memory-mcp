@@ -63,7 +63,7 @@ impl PostgresStore {
                 crate::identity::owner_stamp::PG_UNSTAMPED_PREDICATE
             ),
         };
-        // $1 = namespace (when scoped); the UPDATE appends $2 = to_id.
+        // $1 = namespace (when scoped) in the plan; the UPDATE binds ids + to_id.
         let ns_clause = if namespace.is_some() {
             "namespace = $1"
         } else {
@@ -73,18 +73,23 @@ impl PostgresStore {
         // #3694 — plan the SET (id + prior owner), not only the count, so the
         // report names what moved and from whom on this backend exactly as
         // the sqlite funnel does; ids are kept only up to the report cap.
+        //
+        // #4209 / CONCURRENCY-04 — on a real run the plan IS the lock: it runs
+        // inside the write transaction, `FOR UPDATE`, in ascending
+        // `id COLLATE "C"` order (the #4010 containment-writer order), and the
+        // UPDATE then rewrites exactly the locked ids. A bare predicate UPDATE
+        // locked rows in heap order and deadlocked (40P01) against an
+        // ascending writer; it also let the report name rows other than the
+        // ones rewritten. A dry run takes no locks.
+        let lock = if dry_run { "" } else { " FOR UPDATE" };
         let plan_sql = format!(
             "SELECT id, metadata ->> 'agent_id' FROM memories \
-             WHERE {ns_clause}{owner_filter} ORDER BY id"
+             WHERE {ns_clause}{owner_filter} ORDER BY id COLLATE \"C\"{lock}"
         );
         let mut plan_q = sqlx::query_as::<_, (String, Option<String>)>(&plan_sql);
         if let Some(ns) = namespace {
             plan_q = plan_q.bind(ns);
         }
-        let planned = plan_q
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| to_store_err("reown plan", e))?;
         let mut report = crate::storage::ReownReport {
             matched: 0,
             rewritten: 0,
@@ -92,11 +97,14 @@ impl PostgresStore {
             select,
             ..crate::storage::ReownReport::default()
         };
-        for (id, from) in planned {
-            crate::storage::reown_plan_push(&mut report, id, from);
-        }
-
         if dry_run {
+            let planned = plan_q
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| to_store_err("reown plan", e))?;
+            for (id, from) in planned {
+                crate::storage::reown_plan_push(&mut report, id, from);
+            }
             return Ok(report);
         }
 
@@ -105,23 +113,26 @@ impl PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("reown begin", e))?;
-        let to_param = if namespace.is_some() { "$2" } else { "$1" };
-        let update_sql = format!(
-            "UPDATE memories \
-             SET metadata = jsonb_set(metadata, '{{agent_id}}', to_jsonb({to_param}::text)), \
-                 version = version + 1, updated_at = NOW() \
-             WHERE {ns_clause}{owner_filter}"
-        );
-        let mut update_q = sqlx::query(&update_sql);
-        if let Some(ns) = namespace {
-            update_q = update_q.bind(ns);
-        }
-        let rewritten = update_q
-            .bind(to_id)
-            .execute(&mut *tx)
+        let planned = plan_q
+            .fetch_all(&mut *tx)
             .await
-            .map_err(|e| to_store_err("reown update", e))?
-            .rows_affected();
+            .map_err(|e| to_store_err("reown lock plan", e))?;
+        let locked_ids: Vec<String> = planned.iter().map(|(id, _)| id.clone()).collect();
+        for (id, from) in planned {
+            crate::storage::reown_plan_push(&mut report, id, from);
+        }
+        let rewritten = sqlx::query(
+            "UPDATE memories \
+             SET metadata = jsonb_set(metadata, '{agent_id}', to_jsonb($2::text)), \
+                 version = version + 1, updated_at = NOW() \
+             WHERE id = ANY($1)",
+        )
+        .bind(&locked_ids)
+        .bind(to_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("reown update", e))?
+        .rows_affected();
         let rewritten = usize::try_from(rewritten).unwrap_or(usize::MAX);
 
         let now = chrono::Utc::now();

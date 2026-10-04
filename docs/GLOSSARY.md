@@ -132,8 +132,10 @@ OpenAI, Anthropic, Gemini, etc.). Set per-invocation (`--tier` on
 
 Opt-in multi-agent replication layer (v0.7, PR #282). Configured via
 `ai-memory serve --quorum-writes N --quorum-peers URL,URL`. Every HTTP
-write fans out to peers; returns 201 only on `W-1` peer acks within
-`--quorum-timeout-ms`. Otherwise returns 503 `quorum_not_met`.
+write fans out to peers; returns success once `W-1` peer acks land within
+`--quorum-timeout-ms`. After a local commit, a shortfall returns
+`202 Accepted` with `quorum_met:false`, `acks`, `needed`, `reason` and
+`durability:"local"` (locally committed, under-replicated, not rejected).
 
 ## FTS5
 
@@ -168,8 +170,8 @@ embeddings lose information on long text.
 ## MCP (Model Context Protocol)
 
 Anthropic's JSON-RPC protocol for AI-tool integration. ai-memory ships
-an MCP server via `ai-memory mcp` exposing **103 advertised entries at
-`--profile full`** (102 callable "memory tools" + the always-on
+an MCP server via `ai-memory mcp` exposing **104 advertised entries at
+`--profile full`** (103 callable "memory tools" + the always-on
 `memory_capabilities` bootstrap — both numbers are intentional; see
 issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862))
 plus 2 prompts over stdio. Default `--profile core` exposes 7 tools (the
@@ -234,8 +236,9 @@ context. Semantics: semantic + keyword + priority/confidence/recency
 blend. **Pure read** (#1953): writes zero rows to `memories` on the
 recall path — no `access_count` bump, no TTL extension, no promotion.
 It appends one row to the append-only `recall_observations` ledger; the
-access ladders (increment `access_count`, extend TTL, promote mid→long
-at 5 accesses, nudge priority every 10) are applied out of band by the
+access bookkeeping (increment `access_count`, update `last_accessed_at`,
+extend the TTL floor; never tier or priority, v1.0.0 Boids item 1) is
+applied out of band by the
 periodic fold job (`db::fold_recall_accesses`) from that ledger.
 
 ## SAL — Storage Abstraction Layer (v0.7)

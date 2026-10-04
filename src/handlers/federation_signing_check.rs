@@ -114,6 +114,56 @@ fn federation_apply_ctx(receive_principal: String) -> crate::store::CallerContex
     crate::store::CallerContext::for_admin(receive_principal)
 }
 
+/// #4478 — the federated `namespace_meta[]` bind on the store backend, gated
+/// by the #4356 ancestor-owner check for the agent the pushing peer is
+/// authenticated to act for (`crate::federation::ns_meta_ancestor_gate`).
+/// Only the postgres adapter implements the in-transaction federated gate; any
+/// other store refuses the entry (fail closed) rather than fall back to the
+/// admin bypass.
+#[cfg(feature = "sal")]
+#[cfg_attr(
+    not(feature = "sal-postgres"),
+    allow(
+        unused_variables,
+        clippy::unused_async,
+        reason = "only the postgres arm uses the identity inputs; one signature for both legs"
+    )
+)]
+async fn federated_namespace_meta_bind(
+    app: &AppState,
+    peer_header: Option<&str>,
+    sender_agent_id: &str,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    namespace: &str,
+    standard_id: &str,
+    parent: Option<&str>,
+) -> Result<(), crate::store::StoreError> {
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = app
+        .store
+        .as_any()
+        .downcast_ref::<crate::store::postgres::PostgresStore>()
+    {
+        let bypass = crate::federation::peer_attestation::trust_body_agent_id_bypass();
+        let actor_for = |owner: Option<&str>| {
+            crate::federation::ns_meta_ancestor_gate::federated_bind_actor(
+                peer_header,
+                sender_agent_id,
+                owner,
+                attest_cfg,
+                bypass,
+            )
+        };
+        return pg
+            .set_namespace_standard_federated(&actor_for, namespace, standard_id, parent)
+            .await;
+    }
+    Err(crate::store::set_refusal_to_store_err(
+        crate::ns_standard_ancestor::SetRefusal::Unverifiable,
+        namespace,
+    ))
+}
+
 /// #2478 / #3075 — postgres PROBE half of the pending effect-namespace gate.
 ///
 /// The DECISION lives once in
@@ -299,6 +349,16 @@ pub(super) async fn sync_push_via_store(
         Err(crate::store::StoreError::UnsupportedCapability { .. }) => {}
         Err(e) => return super::postgres_gate::store_err_to_response(e),
     }
+    // #4400 (s4400 F1) — the audit-trail latch, consulted here exactly as the
+    // sqlite twin's `refuse_if_record_stopped` -> `gate_storage_conn` does, so
+    // a latched postgres receiver refuses the whole push with a retryable 503
+    // instead of answering 200 with every item skipped (which a sender files
+    // as a peer refusal and quarantines).
+    if let Err(e) = crate::audit::audit_trail_gate() {
+        return super::postgres_gate::store_err_to_response(
+            crate::store::StoreError::AuditTrailUnavailable { reason: e.reason },
+        );
+    }
     let mut applied = 0usize;
     let mut noop = 0usize;
     let mut skipped = 0usize;
@@ -447,14 +507,22 @@ pub(super) async fn sync_push_via_store(
         // #1464 (v0.8.0, P0) — build the row first, then gate its quota +
         // ownership attribution (sqlite-twin parity). `resolve_governance_policy`
         // is async on the store, so resolve it before taking the quota lock.
-        let local_cap = app
-            .store
-            .resolve_governance_policy(&mem.namespace)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(crate::models::GovernancePolicy::default)
-            .effective_max_reflection_depth();
+        // #4043 — an unreadable policy refuses this row (sqlite twin); `.ok()`
+        // stamped the compiled default cap on evidence nobody read.
+        let local_cap = match app.store.resolve_governance_policy(&mem.namespace).await {
+            Ok(policy) => policy.unwrap_or_default().effective_max_reflection_depth(),
+            Err(e) => {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    memory_id = %mem.id,
+                    "sync_push: governance policy unreadable for {}: {e}; \
+                     refusing the write (#4043 fail-closed)",
+                    mem.namespace
+                );
+                skipped += 1;
+                continue;
+            }
+        };
         let mut to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
             mem,
             &body.sender_agent_id,
@@ -680,12 +748,28 @@ pub(super) async fn sync_push_via_store(
             &to_insert,
         )
         .await;
+        // #4023 — the #2447 stored-namespace verdict above was taken on a pool
+        // read OUTSIDE the merge transaction; a broader writer can move the row
+        // in between and `merge_memory` LWWs `namespace`. Re-authorize the row
+        // `merge_inbound_authorized` locks `FOR UPDATE`, inside its transaction.
+        let authorize_stored = |stored: &str| {
+            crate::federation::receive_auth::inbound_write_namespace_authorized(
+                crate::federation::receive_auth::LANE_MEMORIES,
+                &mem.id,
+                &mem.namespace,
+                Some(stored),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            )
+        };
         match app
             .store
-            .merge_inbound(
+            .merge_inbound_authorized(
                 &ctx,
                 &to_insert,
                 crate::handlers::federation_receive::row_is_agent_attested(&to_insert),
+                &authorize_stored,
             )
             .await
         {
@@ -883,6 +967,29 @@ pub(super) async fn sync_push_via_store(
             .into_response();
     }
 
+    // #4447 — the by-id lanes below (deletions / archives / restores / links)
+    // each probe a target row's STORED namespace on a read that precedes the
+    // write transaction; a broader writer on a second connection (or process)
+    // can move the row out of the peer's scope in between. Each lane's write is
+    // therefore the `*_authorized` store method, which re-evaluates THIS verdict on
+    // the namespace read under the row lock (`FOR UPDATE` / the write transaction). The verdict is the same shared
+    // `inbound_by_id_namespace_authorized` the pre-check uses, with the stored
+    // namespace elided exactly when the pre-check elides it (Layer 2 only).
+    let by_id_needs_stored = crate::federation::receive_auth::peer_declares_namespace_scope(
+        peer_header_owned.as_deref(),
+        &attest_cfg,
+    );
+    let by_id_verdict = |lane: &str, id: &str, stored: &str| -> bool {
+        crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+            lane,
+            id,
+            by_id_needs_stored.then_some(stored),
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_push_ns_scope,
+        )
+    };
+
     // ---- deletions ---------------------------------------------------
     for del_id in &body.deletions {
         if validate::validate_id(del_id).is_err() {
@@ -960,7 +1067,13 @@ pub(super) async fn sync_push_via_store(
                 continue;
             }
         }
-        match app.store.apply_remote_deletion(&ctx, del_id).await {
+        match app
+            .store
+            .apply_remote_deletion_authorized(&ctx, del_id, &|id: &str, stored: &str| {
+                by_id_verdict(crate::federation::receive_auth::LANE_DELETIONS, id, stored)
+            })
+            .await
+        {
             Ok(true) => deleted += 1,
             Ok(false) => noop += 1,
             Err(e) => {
@@ -1116,7 +1229,13 @@ pub(super) async fn sync_push_via_store(
             }
             _ => crate::models::AttestLevel::Unsigned.as_str(),
         };
-        match app.store.apply_remote_link(&ctx, link, attest_level).await {
+        match app
+            .store
+            .apply_remote_link_authorized(&ctx, link, attest_level, &|id: &str, stored: &str| {
+                by_id_verdict(crate::federation::receive_auth::LANE_LINKS, id, stored)
+            })
+            .await
+        {
             Ok(()) => links_applied += 1,
             Err(e) => {
                 tracing::warn!(
@@ -1148,6 +1267,15 @@ pub(super) async fn sync_push_via_store(
     let require_signal_sig = crate::federation::receive_auth::require_signal_sig_enabled();
     for sig in &body.signals {
         if validate::validate_id(&sig.id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        // #4408 — a federated signal whose recipient fails the agent-id
+        // contract is a PER-SIGNAL skip on BOTH backends, before any quota
+        // charge, insert or audit; the rest of the push still applies. The
+        // value is never logged or echoed.
+        if crate::validate::validate_signal_recipient(sig.to_agent.as_deref()).is_err() {
+            tracing::warn!("federation signal skipped: invalid recipient");
             skipped += 1;
             continue;
         }
@@ -1907,7 +2035,13 @@ pub(super) async fn sync_push_via_store(
             }
         }
         let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
-        match app.store.apply_remote_archive(&apply_ctx, arch_id).await {
+        match app
+            .store
+            .apply_remote_archive_authorized(&apply_ctx, arch_id, &|id: &str, stored: &str| {
+                by_id_verdict(crate::federation::receive_auth::LANE_ARCHIVES, id, stored)
+            })
+            .await
+        {
             Ok(true) => archived += 1,
             Ok(false) => noop += 1,
             Err(e) => {
@@ -1959,7 +2093,13 @@ pub(super) async fn sync_push_via_store(
             }
         }
         let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
-        match app.store.apply_remote_restore(&apply_ctx, res_id).await {
+        match app
+            .store
+            .apply_remote_restore_authorized(&apply_ctx, res_id, &|id: &str, stored: &str| {
+                by_id_verdict(crate::federation::receive_auth::LANE_RESTORES, id, stored)
+            })
+            .await
+        {
             Ok(true) => restored += 1,
             Ok(false) => noop += 1,
             Err(e) => {
@@ -2028,18 +2168,32 @@ pub(super) async fn sync_push_via_store(
             )
             .await;
         }
-        let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
-        match app
-            .store
-            .set_namespace_standard(
-                &apply_ctx,
-                &entry.namespace,
-                &entry.standard_id,
-                entry.parent_namespace.as_deref(),
-            )
-            .await
+        // #4478 — NOT the admin apply context: the #4356 ancestor-owner gate
+        // runs in the bind's transaction for the agent the peer is
+        // authenticated to act for (sqlite-twin rule, one shared verdict). A
+        // refusal is a per-entry skip under `namespace_meta_refused` with the
+        // same fixed log line; nothing is written and the batch survives.
+        match federated_namespace_meta_bind(
+            &app,
+            peer_header_owned.as_deref(),
+            &body.sender_agent_id,
+            &attest_cfg,
+            &entry.namespace,
+            &entry.standard_id,
+            entry.parent_namespace.as_deref(),
+        )
+        .await
         {
             Ok(()) => namespace_meta_applied += 1,
+            Err(crate::store::StoreError::PermissionDenied { .. }) => {
+                tracing::warn!(
+                    target: super::federation_receive::ATTESTATION_TRACE_TARGET,
+                    "{}",
+                    crate::federation::ns_meta_ancestor_gate::ANCESTOR_GATE_SKIP_LOG
+                );
+                namespace_meta_refused += 1;
+                skipped += 1;
+            }
             Err(e) => {
                 tracing::warn!(
                     "sync_push(store): set_namespace_standard failed for {}: {e}",

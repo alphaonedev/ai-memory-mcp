@@ -1028,8 +1028,9 @@ impl Default for ConfidenceSignals {
 
 /// Memory-lifecycle tier — short (6h TTL) / mid (7d TTL) / long
 /// (permanent). Drives the create-time backstop, the touch-time
-/// sliding window, the auto-promotion at 5 accesses (mid → long),
-/// the GC sweep, and the recall ranker's per-tier bonus.
+/// TTL floor-extend, explicit promotion via `memory_promote` (recall
+/// never auto-promotes since v1.0.0 Boids item 1), the GC sweep, and
+/// the recall ranker's per-tier bonus.
 ///
 /// # Disambiguation (issue #970)
 ///

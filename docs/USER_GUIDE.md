@@ -49,7 +49,7 @@ Below is an example for **Claude Code** (user scope: merge `mcpServers` into `~/
 
 ### How It Works
 
-With MCP configured, your AI client gains 103 memory tools at `--profile full` (102 callable tools + the always-on `memory_capabilities` bootstrap) (highlights below; see [API_REFERENCE.md](API_REFERENCE.html) for the full reference):
+With MCP configured, your AI client gains 104 memory tools at `--profile full` (103 callable tools + the always-on `memory_capabilities` bootstrap) (highlights below; see [API_REFERENCE.md](API_REFERENCE.html) for the full reference):
 
 - **memory_store** -- Store new knowledge (auto-deduplicates by title+namespace, reports contradictions)
 - **memory_recall** -- Recall relevant memories for the current context (supports `until` date filter)
@@ -77,7 +77,7 @@ Your AI assistant uses these tools automatically during conversations. You can a
 
 ## MCP Tool Reference
 
-This section documents the MCP tools with their exact parameter schemas, example requests, and response formats. **The surface advertises 103 entries at `--profile full`** (102 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation). Default `--profile core` exposes 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities`. Canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) and asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. All tools are invoked via JSON-RPC 2.0 using method `tools/call` with the tool name in `params.name` and tool parameters in `params.arguments`.
+This section presents selected MCP tools, selected parameters, and example response formats. For complete declared input schemas, call `memory_capabilities` with `{"family":"core","include_schema":true,"verbose":true}`; select the relevant family for other tools. Declared schemas do not by themselves enumerate undocumented dynamic handler behavior. **The surface advertises 104 entries at `--profile full`** (103 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation). Default `--profile core` exposes 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities`. Canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) and asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. All tools are invoked via JSON-RPC 2.0 using method `tools/call` with the tool name in `params.name` and tool parameters in `params.arguments`.
 
 `tools/list` descriptions are a compacted gist (32-byte preferred cut, extend to 80 on a dangling last token). Verbose per-tool docs and full schemas live in `memory_capabilities { verbose: true }` — optionally with `family` and `include_schema` to drill one family. The compact `memory_capabilities` label on the wire is `Discover runtime capabilities; full per-tool docs: verbose=true`.
 
@@ -99,9 +99,9 @@ On error, the envelope includes `"isError": true` and the text contains the erro
 
 ### memory_store
 
-Store a new memory. Deduplicates by title+namespace -- if a memory with the same title and namespace already exists, it updates the existing memory instead of creating a duplicate.
+Store a new memory. A title-and-namespace collision follows `on_conflict`: `error` refuses the write, `merge` follows the existing-row merge path subject to write admission, and `version` chooses a suffixed title. If omitted, clients whose normalized name begins `ai:claude-code` or `ai:ai-memory-cli/v2` default to `error`; other clients default to `merge`.
 
-**Parameters:**
+**Parameters (selected — 9 of the 23 fields `StoreRequest` declares):**
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
@@ -168,7 +168,7 @@ Store a new memory. Deduplicates by title+namespace -- if a memory with the same
 
 Recall memories relevant to a context. Uses fuzzy OR matching, ranked by a composite score of relevance + priority + access frequency + confidence + tier boost + recency decay. At semantic tier and above, uses hybrid scoring (semantic + keyword blending).
 
-**Parameters:**
+**Parameters (selected — 7 of the 20 fields `RecallRequest` declares):**
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
@@ -237,7 +237,7 @@ a1b2c3d4-...|Project uses PostgreSQL 15|long|my-app|8|0.763|database
 
 Search memories by exact keyword match with AND semantics (all terms must match).
 
-**Parameters:**
+**Parameters (selected — 7 of the 9 fields `SearchRequest` declares):**
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
@@ -281,7 +281,7 @@ Search memories by exact keyword match with AND semantics (all terms must match)
 
 List memories, optionally filtered by namespace or tier.
 
-**Parameters:**
+**Parameters (selected — 4 of the 6 fields `ListRequest` declares):**
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
@@ -1450,7 +1450,7 @@ pass `--agent-id` or `AI_MEMORY_AGENT_ID` to scrub that exposure. Tracking issue
 
 ## Zero Token Cost
 
-Unlike built-in memory systems (Claude Code auto-memory, ChatGPT memory) that load your entire memory into every conversation, ai-memory uses **zero context tokens until recalled**. Only relevant memories come back, ranked by a 6-factor scoring algorithm. For Claude Code users: disable auto-memory (`"autoMemoryEnabled": false` in settings.json) to stop paying for 200+ lines of idle context.
+Unlike built-in memory systems (Claude Code auto-memory, ChatGPT memory) that load your entire memory into every conversation, ai-memory puts **no memory content into the context until recalled** (the MCP tool schemas themselves cost a fixed per-request budget; `ai-memory doctor --tokens` prints it). Only relevant memories come back, ranked by a 6-factor scoring algorithm. For Claude Code users: disable auto-memory (`"autoMemoryEnabled": false` in settings.json) to stop paying for 200+ lines of idle context.
 
 ## TOON Format (Token-Oriented Object Notation)
 
@@ -1548,10 +1548,11 @@ This performs a fuzzy OR search across all your memories and returns the most re
 5. **Tier boost** -- long-term gets +3.0, mid gets +1.0, short gets +0.0
 6. **Recency decay** -- `1/(1 + days_old * 0.1)` so recent memories rank higher
 
-Recall also automatically:
+Recall also records the access; the periodic fold job then:
 - Bumps the access count
 - Extends the TTL (1 hour for short, 1 day for mid)
-- Auto-promotes mid-tier memories to long-term after 5 accesses
+
+Recall never changes a memory's tier or priority. Use `memory_promote` to make a memory long-term.
 
 ### Search for Exact Matches
 
@@ -1923,8 +1924,7 @@ Show archive statistics (count, size, oldest/newest).
 Recall itself is a **pure read** — it writes zero rows to `memories` and records each access in the append-only `recall_observations` ledger instead (#1953). The behaviors below are applied out of band by the periodic **fold job** (`db::fold_recall_accesses`) from that ledger, not inline on the recall path:
 
 - **TTL extension**: A recalled memory's expiry is floor-extended (1 hour for short, 1 day for mid; an access never moves an expiry earlier)
-- **Auto-promotion**: A mid-tier memory recalled 5+ times automatically becomes long-term (expiry cleared)
-- **Priority reinforcement**: Every 10 accesses, a memory's priority increases by 1 (max 10)
+- **No access-driven promotion**: recall never changes a memory's tier or priority (v1.0.0 Boids item 1). Promote with `memory_promote`; change priority with `memory_update`
 - **Garbage collection**: Expired memories are cleaned up every 30 minutes (optionally archived instead of deleted when `archive_on_gc = true` in `config.toml`)
 - **Deduplication**: Storing a memory with the same title+namespace updates the existing one (tier never downgrades, priority takes the higher value)
 

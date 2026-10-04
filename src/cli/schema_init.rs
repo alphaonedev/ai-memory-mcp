@@ -561,10 +561,17 @@ async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
     // and exits. We hold the pool for the duration of this function
     // and let it drop at the end so we don't keep a Postgres
     // connection slot warm.
+    // #4333 — the #3705 sslmode floor + the #3674 DSN screen, one function.
+    let options = crate::store::postgres::dsn::floored_connect_options(url).with_context(|| {
+        format!(
+            "refuse or parse postgres store URL for enumeration: {}",
+            crate::url_display::store_url_display(url)
+        )
+    })?;
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(std::time::Duration::from_secs(15))
-        .connect(url)
+        .connect_with(options)
         .await
         // #1579 A3 (SECURITY) — same redaction as the connect above.
         .with_context(|| {

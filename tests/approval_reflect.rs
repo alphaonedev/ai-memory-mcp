@@ -169,7 +169,8 @@ fn governed_action_reflect_as_str_is_reflect() {
 fn resolve_require_approval_above_depth_returns_none_with_no_governance() {
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
     // No namespace standard seeded → chain has no governance blob at any level.
-    let result = db::resolve_require_approval_above_depth(&conn, "ungoverned-ns");
+    let result = db::resolve_require_approval_above_depth(&conn, "ungoverned-ns")
+        .expect("#4043: governance policy read");
     assert_eq!(
         result, None,
         "must return None when no namespace standard is configured"
@@ -192,7 +193,8 @@ fn resolve_require_approval_above_depth_returns_none_when_key_absent() {
             "max_reflection_depth": 3
         }),
     );
-    let result = db::resolve_require_approval_above_depth(&conn, "no-key-ns");
+    let result = db::resolve_require_approval_above_depth(&conn, "no-key-ns")
+        .expect("#4043: governance policy read");
     assert_eq!(
         result, None,
         "must return None when key is absent from governance blob"
@@ -210,7 +212,8 @@ fn resolve_require_approval_above_depth_returns_value_when_set() {
             "require_approval_above_depth": 1_u32
         }),
     );
-    let result = db::resolve_require_approval_above_depth(&conn, "threshold-ns");
+    let result = db::resolve_require_approval_above_depth(&conn, "threshold-ns")
+        .expect("#4043: governance policy read");
     assert_eq!(result, Some(1), "must return Some(1) when key is set to 1");
 }
 
@@ -225,7 +228,8 @@ fn resolve_require_approval_above_depth_returns_zero_when_set_to_zero() {
             "require_approval_above_depth": 0_u32
         }),
     );
-    let result = db::resolve_require_approval_above_depth(&conn, "zero-threshold-ns");
+    let result = db::resolve_require_approval_above_depth(&conn, "zero-threshold-ns")
+        .expect("#4043: governance policy read");
     assert_eq!(
         result,
         Some(0),
@@ -256,7 +260,8 @@ fn depth_2_reflect_in_threshold_1_namespace_queues_pending_not_reflection() {
     let src_id = db::insert(&conn, &src).unwrap();
 
     // Verify the threshold resolves correctly.
-    let threshold = db::resolve_require_approval_above_depth(&conn, ns);
+    let threshold =
+        db::resolve_require_approval_above_depth(&conn, ns).expect("#4043: governance policy read");
     assert_eq!(threshold, Some(1));
 
     let src_mem = db::get(&conn, &src_id).unwrap().expect("source must exist");
@@ -325,7 +330,8 @@ fn depth_1_reflect_in_threshold_1_namespace_proceeds_without_pending() {
     let src = make_memory(ns, "depth-0-base", 0);
     let src_id = db::insert(&conn, &src).unwrap();
 
-    let threshold = db::resolve_require_approval_above_depth(&conn, ns);
+    let threshold =
+        db::resolve_require_approval_above_depth(&conn, ns).expect("#4043: governance policy read");
     assert_eq!(threshold, Some(1));
 
     let src_mem = db::get(&conn, &src_id).unwrap().expect("source must exist");
@@ -373,7 +379,8 @@ fn no_approval_gate_when_require_approval_above_depth_is_absent() {
     );
 
     // Threshold must be None.
-    let threshold = db::resolve_require_approval_above_depth(&conn, ns);
+    let threshold =
+        db::resolve_require_approval_above_depth(&conn, ns).expect("#4043: governance policy read");
     assert_eq!(
         threshold, None,
         "threshold must be None when key is absent from governance blob"
@@ -416,7 +423,8 @@ fn threshold_zero_gates_even_depth_1_reflections() {
     let src = make_memory(ns, "depth-0-source", 0);
     let src_id = db::insert(&conn, &src).unwrap();
 
-    let threshold = db::resolve_require_approval_above_depth(&conn, ns);
+    let threshold =
+        db::resolve_require_approval_above_depth(&conn, ns).expect("#4043: governance policy read");
     assert_eq!(threshold, Some(0));
 
     let src_mem = db::get(&conn, &src_id).unwrap().expect("source must exist");

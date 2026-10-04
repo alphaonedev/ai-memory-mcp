@@ -44,6 +44,10 @@ pub struct LoadFamilyRequest {
 /// scattered across production sites (pm-v3.1 / the hardcoded-literal gate).
 pub(crate) const SMART_LOAD_LOG_TARGET: &str = crate::mcp::registry::tool_names::MEMORY_SMART_LOAD;
 
+/// The `memory_smart_load` refusal for a missing/non-string `intent`, shared
+/// by the MCP handler and both HTTP branches so the wording cannot drift.
+pub(crate) const INTENT_REQUIRED: &str = "intent is required";
+
 pub struct LoadFamilyTool;
 
 impl McpTool for LoadFamilyTool {
@@ -452,7 +456,7 @@ pub fn handle_smart_load(
     embedder: Option<&dyn Embed>,
     caller: Option<&str>,
 ) -> Result<Value, String> {
-    let intent_raw = params["intent"].as_str().ok_or("intent is required")?;
+    let intent_raw = params["intent"].as_str().ok_or(INTENT_REQUIRED)?;
     let intent = intent_raw.trim();
     let (family, score, source) = pick_family_for_intent(intent, embedder);
     forward_to_load_family(conn, family, score, source, intent, params, caller)
@@ -515,7 +519,11 @@ pub fn pick_family_for_intent(
 /// [`handle_load_family`] with the chosen family. The forwarded JSON is
 /// flattened into the smart_load response shape so callers see one
 /// payload, not a nested `load_family_response` blob.
-fn forward_to_load_family(
+///
+/// #4089 — `pub(crate)` so the sqlite HTTP branch can route the intent on
+/// the blocking pool BEFORE taking the DB lock and only forward under it
+/// (the MCP dispatch keeps calling [`handle_smart_load`], unchanged).
+pub(crate) fn forward_to_load_family(
     conn: &rusqlite::Connection,
     family: crate::profile::Family,
     score: f32,

@@ -376,7 +376,7 @@ scan_test_lines () {
             grep -En "$STDIN_PATTERN" "$f" 2>/dev/null || true
             grep -En "$STDIN_TOKEN_PATTERN" "$f" 2>/dev/null || true
             grep -En "$STDIN_ALIAS_PATTERN" "$f" 2>/dev/null || true
-        } | sort -t: -k1,1n -u
+        } | LC_ALL=C sort -t: -k1,1n -u
     )"
     [[ -z "$matches" ]] && return 0
     local cfg_ranges
@@ -482,6 +482,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
             exit 2
         fi
     done
+    # #4292: every probe is removed on ANY exit, including an interrupted
+    # one, and INT/TERM re-raise. See scripts/lib/selftest-probes.sh.
+    source "${ROOT}/scripts/lib/selftest-probes.sh"
+    selftest_probes_arm "$probe1" "$probe2" "$probe3" "$probe4" "$probe5" "$probe6" "$probe7" "$probe8" "$probe9" "$probe10" "$probe11"
     cat > "$probe1" <<'EOF'
 // CONTRIVED VIOLATION for scripts/check-test-stdin-reads.sh --self-test.
 // This file is created + deleted by the self-test; if it persists,
@@ -654,10 +658,9 @@ EOF
         printf '%s\n' "}"
     } > "$probe11"
     set +e
-    gate_output="$("$0" 2>&1)"
-    gate_exit=$?
+    selftest_run gate_output gate_exit "$0"
     set -e
-    rm -f "$probe1" "$probe2" "$probe3" "$probe4" "$probe5" "$probe6" "$probe7" "$probe8" "$probe9" "$probe10" "$probe11"
+    selftest_probes_disarm
     printf '%s\n' "$gate_output"
     # PASS requires: non-zero exit, TEN probe violations reported (the
     # #2152 negative-depth probe is asserted via its loud WARN instead --

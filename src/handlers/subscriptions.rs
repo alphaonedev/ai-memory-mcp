@@ -153,6 +153,18 @@ pub async fn notify(
     // unchanged and postgres is brought onto the documented domain.
     let priority = body.priority.map(crate::models::normalize_priority);
 
+    // #4338 — validate the recipient ONCE, above the backend branch, with the
+    // shared validator, so sqlite and postgres answer an invalid target with
+    // the identical 400 body before any quota charge, write or wake. The
+    // value is never echoed.
+    if let Err(e) = crate::validate::validate_notify_target(&body.target_agent_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let priority_i32 = priority;
@@ -432,11 +444,16 @@ pub async fn subscribe(
             )
                 .into_response();
         };
-        // Synthetic loopback URL — never dispatched (the postgres
-        // persistence path doesn't run the webhook loop), serves only
-        // to round-trip the (agent_id, namespace) pair through the
-        // wire shape. We mark it so the SSRF guard can skip the
-        // loopback rejection — H11's allow_loopback_webhooks knob
+        // Synthetic loopback URL — round-trips the (agent_id, namespace)
+        // pair through the wire shape. It is NOT excluded from dispatch:
+        // the row is stored as an ordinary subscription with no marker,
+        // and `dispatch_event_postgres` matches and enqueues it like any
+        // other. Delivery to `https://localhost/...` is then refused by
+        // the dispatch-time SSRF guard and recorded as a failed delivery
+        // (DLQ reason `DNS_SSRF_REJECTED`), unless the operator enabled
+        // `allow_loopback_webhooks`, in which case a localhost POST is
+        // attempted. We mark it so the REGISTRATION-time SSRF guard can
+        // skip the loopback rejection — H11's allow_loopback_webhooks knob
         // gates real callers, not internally-synthesized stubs.
         // The assignment is unused under default features (the reader
         // is `#[cfg(feature = "sal")]`-gated); allow the unused-assignment
@@ -469,9 +486,11 @@ pub async fn subscribe(
     // peer originated the subscription.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // Skip SSRF validation for synthetic loopback stubs — they are
-        // never dispatched on the postgres path. Real caller-supplied
-        // URLs still go through the H11 SSRF guard.
+        // Skip registration-time SSRF validation for synthetic loopback
+        // stubs (see the note where they are built: they ARE matched by
+        // the dispatcher, and the dispatch-time guard refuses their
+        // delivery by default). Real caller-supplied URLs still go
+        // through the H11 SSRF guard here.
         if !url_was_synthesized && let Err(e) = crate::subscriptions::validate_url(&url) {
             return (
                 StatusCode::BAD_REQUEST,

@@ -390,11 +390,44 @@ pub enum SslmodeFloor {
     },
     /// Not a DSN the drivers parse.
     Unparseable,
+    /// #4434 - the DSN TEXT looks pinned but the DRIVER resolves a weaker
+    /// `sslmode` from it (key aliases, key letter case, percent-encoded or
+    /// tab/newline-split keys, a fragment, the `PGSSLMODE` fallback). Only
+    /// produced by the parsed-options verdict ([`dsn_floor_verdict`]).
+    DriverResolved {
+        /// The host the driver would dial.
+        host: String,
+        /// The sslmode the driver resolved (a fixed driver label, never DSN text).
+        resolved: String,
+    },
+    /// #4434 - the host the DSN text names is not the host the driver will
+    /// dial (a case-variant or percent-encoded `host` key the driver does not
+    /// recognise, so it falls back to `PGHOST` or its default). TLS may still
+    /// be verify-full, but the report would name a host that is not dialled,
+    /// so the DSN is refused (fail closed). Hosts are not credentials.
+    DriverHost {
+        /// The host the DSN text names.
+        named: String,
+        /// The host the driver will dial.
+        dialed: String,
+    },
+    /// #4434 - this BUILD cannot resolve what the driver would use: the
+    /// binary was built without `sal-postgres`, so there is no postgres
+    /// driver to parse the DSN and no postgres connect path (`serve` refuses
+    /// the store, #2679). A report must never say "pinned" on the strength of
+    /// the DSN text alone, so this is a NOT-pinned verdict (fail closed).
+    Unverifiable {
+        /// The host the DSN text names.
+        host: String,
+    },
 }
 
-/// Evaluate the floor for `dsn` — see [`SslmodeFloor`].
+/// The TEXT reading of the floor for `dsn` - see [`SslmodeFloor`]. It is only
+/// the cheap first screen of [`dsn_floor_verdict`]: the DSN text is NOT what
+/// the driver uses (#4434), so nothing outside this module may decide from
+/// it alone.
 #[must_use]
-pub fn dsn_sslmode_floor(dsn: &str) -> SslmodeFloor {
+pub(crate) fn dsn_sslmode_floor(dsn: &str) -> SslmodeFloor {
     let host = match dsn_transport(dsn) {
         DsnTransport::Tcp { host } => host,
         DsnTransport::UnixSocket { dir } => return SslmodeFloor::UnixSocket { dir },
@@ -418,15 +451,42 @@ pub fn dsn_sslmode_floor(dsn: &str) -> SslmodeFloor {
     }
 }
 
-/// Whether a PostgreSQL DSN pins `sslmode=verify-full` ON A TCP TRANSPORT.
-/// Shared by the connect funnel (the floor), the enterprise posture (check
-/// #15) and doctor. #3866: a Unix-socket DSN is `false` whatever its query
-/// string says — TLS does not run on a socket; the three consumers render
-/// the transport via [`dsn_sslmode_floor`] rather than guessing from this
-/// bool.
+/// Whether the DRIVER will connect to a PostgreSQL DSN with
+/// `sslmode=verify-full` ON A TCP TRANSPORT: `true` iff
+/// [`dsn_floor_verdict`] is [`SslmodeFloor::Pinned`]. The enterprise posture
+/// (check #15) and every other consumer read the same verdict the connect
+/// funnel enforces (#4434); a Unix-socket DSN is `false` whatever its query
+/// string says (#3866).
 #[must_use]
 pub fn dsn_pins_sslmode_verify_full(dsn: &str) -> bool {
-    matches!(dsn_sslmode_floor(dsn), SslmodeFloor::Pinned { .. })
+    matches!(dsn_floor_verdict(dsn), SslmodeFloor::Pinned { .. })
+}
+
+/// THE floor decision for a PostgreSQL DSN (#3705 / #3866 / #4434), shared by
+/// the connect funnel (`store::postgres::dsn::floored_connect_options`),
+/// doctor's Transit-encryption section and enterprise posture check #15, so a
+/// report can never say "pinned" for a DSN the connect refuses.
+///
+/// With `sal-postgres` it is the text screen followed by a check of the
+/// options the sqlx driver PARSES from the DSN (sslmode must resolve to
+/// `verify-full`, transport must be TCP). Without `sal-postgres` (the
+/// shipped release configuration) there is no driver to parse with, so the
+/// text screen can only REFUSE: a DSN it would pin comes back as
+/// [`SslmodeFloor::Unverifiable`], never [`SslmodeFloor::Pinned`] - the
+/// report must not claim a pin it cannot prove.
+#[must_use]
+pub fn dsn_floor_verdict(dsn: &str) -> SslmodeFloor {
+    #[cfg(feature = "sal-postgres")]
+    {
+        crate::store::postgres::dsn::floor_verdict(dsn)
+    }
+    #[cfg(not(feature = "sal-postgres"))]
+    {
+        match dsn_sslmode_floor(dsn) {
+            SslmodeFloor::Pinned { host } => SslmodeFloor::Unverifiable { host },
+            other => other,
+        }
+    }
 }
 
 /// The refusal for a PostgreSQL DSN whose transport is a Unix-domain socket
@@ -470,6 +530,41 @@ pub fn pg_sslmode_refusal() -> String {
          of memory would cross the socket unencrypted or to an unauthenticated server \
          ({MANDATE}). Fix: {REMEDY_PG_SSLMODE}."
     )
+}
+
+/// The operator-facing refusal for a floor verdict, `None` for
+/// [`SslmodeFloor::Pinned`]. Never echoes the DSN. Takes the typed verdict so
+/// the text and the decision cannot drift (#4434).
+#[must_use]
+pub fn pg_floor_refusal(verdict: &SslmodeFloor) -> Option<String> {
+    match verdict {
+        SslmodeFloor::Pinned { .. } => None,
+        SslmodeFloor::UnixSocket { dir } => Some(pg_unix_socket_refusal(dir)),
+        SslmodeFloor::Unparseable => Some(pg_dsn_unparseable_refusal()),
+        SslmodeFloor::NotPinned { .. } => Some(pg_sslmode_refusal()),
+        SslmodeFloor::DriverHost { named, dialed } => Some(format!(
+            "{ISSUE_TAG}: refusing the PostgreSQL store DSN: it names host {named} but the \
+             driver will dial {dialed} (a `host` key spelled with different letter case or \
+             percent-encoding is not recognised by the driver, which falls back to PGHOST or \
+             its default; #4434). A report or a pin on one host while the connection goes to \
+             another is refused ({MANDATE}). Fix: spell the key exactly `host` (or put the host \
+             in the authority)."
+        )),
+        SslmodeFloor::Unverifiable { .. } => Some(format!(
+            "{ISSUE_TAG}: refusing the PostgreSQL store DSN: this build has no postgres driver \
+             (built without the `sal-postgres` feature), so the sslmode the driver would use \
+             cannot be verified and the daemon refuses a postgres store at boot (#2679; #4434; \
+             {MANDATE}). Fix: run a binary built with `--features sal-postgres`."
+        )),
+        SslmodeFloor::DriverResolved { resolved, .. } => Some(format!(
+            "{ISSUE_TAG}: refusing the PostgreSQL store DSN: the driver resolves \
+             sslmode={resolved} from it, not {PG_SSLMODE_FLOOR} (the driver, not the text of the \
+             query string, decides: key aliases, key letter case, percent-encoded keys, a \
+             fragment and the PGSSLMODE environment variable all change what it uses; #4434). \
+             Every row of memory would cross the socket unencrypted or to an unauthenticated \
+             server ({MANDATE}). Fix: {REMEDY_PG_SSLMODE}, spelled exactly `sslmode`."
+        )),
+    }
 }
 
 /// The refusal for a deployment whose DECLARED shape is not `singleton` and
@@ -523,6 +618,9 @@ pub fn enforce_config_urls(app_config: &crate::config::AppConfig) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
+    /// #4434: a pin is provable only with `sal-postgres` (fail closed otherwise).
+    const PIN_PROVABLE: bool = cfg!(feature = "sal-postgres");
+
     use super::*;
 
     #[test]
@@ -568,14 +666,39 @@ mod tests {
         );
     }
 
+    /// #4434 - without `sal-postgres` nothing can be proven pinned.
+    #[cfg(not(feature = "sal-postgres"))]
+    #[test]
+    fn without_sal_postgres_no_dsn_is_ever_pinned_4434() {
+        for dsn in [
+            "postgres://u@h/db?sslmode=verify-full",
+            "postgres://u@h/db?sslmode=verify-full&ssl-mode=disable",
+            "postgres://u@h/db?sslmode=disable&SSLMODE=verify-full",
+            "postgres://u@h/db?sslmode=verify-full&%73slmode=disable",
+            "postgres://u@h/db?sslmode=disable#x&sslmode=verify-full",
+        ] {
+            assert!(
+                matches!(dsn_floor_verdict(dsn), SslmodeFloor::Unverifiable { .. }),
+                "{dsn}: must be Unverifiable, never Pinned"
+            );
+            assert!(!dsn_pins_sslmode_verify_full(dsn), "{dsn}");
+            let refusal = pg_floor_refusal(&dsn_floor_verdict(dsn)).expect("a refusal");
+            assert!(!refusal.contains("u@h"), "the refusal never echoes the DSN");
+        }
+    }
+
     #[test]
     fn dsn_floor_takes_the_last_sslmode_3705() {
-        assert!(dsn_pins_sslmode_verify_full(
-            "postgres://u@h/db?sslmode=verify-full"
-        ));
-        assert!(dsn_pins_sslmode_verify_full(
-            "postgres://u@h/db?application_name=x&sslmode=Verify-Full&sslrootcert=/ca.crt"
-        ));
+        assert_eq!(
+            dsn_pins_sslmode_verify_full("postgres://u@h/db?sslmode=verify-full"),
+            PIN_PROVABLE
+        );
+        assert_eq!(
+            dsn_pins_sslmode_verify_full(
+                "postgres://u@h/db?application_name=x&sslmode=Verify-Full&sslrootcert=/ca.crt"
+            ),
+            PIN_PROVABLE
+        );
         assert!(!dsn_pins_sslmode_verify_full("postgres://u@h/db"));
         assert!(!dsn_pins_sslmode_verify_full(
             "postgres://u@h/db?sslmode=require"

@@ -35,8 +35,14 @@
 
 #![allow(clippy::missing_panics_doc)]
 
-/// The postgres SAL adapter, relative to `CARGO_MANIFEST_DIR`.
-const PG_ADAPTER_PATH: &str = "src/store/postgres.rs";
+// #4023: ONE shared loader reads `postgres.rs` AND every child module under
+// `src/store/postgres/` (fail closed on an empty / short file set).
+#[path = "common/pg_sources.rs"]
+mod pg_sources;
+
+/// The postgres SAL adapter root, relative to `CARGO_MANIFEST_DIR`. The
+/// scanned source is the root PLUS every child module (see `pg_sources`).
+const PG_ADAPTER_PATH: &str = pg_sources::PG_ROOT_REL;
 
 /// The v79/#1945 denormalised epistemic-typing column (spec §4).
 const KIND_PROVENANCE_COLUMN: &str = "kind_provenance";
@@ -68,8 +74,13 @@ const AGE_UNPROJECT_CALL: &str = "unproject_memory_from_age(";
 const KIND_PROVENANCE_FUNNELS: &[&str] = &[
     // Already correct before #2393 — pinned so they cannot regress.
     "store",
-    "store_batch",     // #2289
-    "archive_restore", // #2333 / FBL-03
+    "store_batch", // #2289
+    // #4447 — `archive_restore` is now a thin delegator to the inherent
+    // `archive_restore_inner` (moved verbatim to
+    // `postgres/federation_by_id_4447.rs` to gain the in-transaction peer-scope
+    // re-check). The guard follows the INSERT..SELECT to the function that owns
+    // it, the same move as `store_with_embedding_inner` above (#2771).
+    "archive_restore_inner", // #2333 / FBL-03
     // Fixed by #2393 — the three funnels the issue named…
     // #2771 — `store_with_embedding` was refactored into a thin delegator to the
     // shared inherent `store_with_embedding_inner`, which now holds the INSERT +
@@ -86,6 +97,11 @@ const KIND_PROVENANCE_FUNNELS: &[&str] = &[
     "apply_remote_memory",
 ];
 
+/// Funnels that persist `kind_provenance` through an `INSERT ... SELECT` over
+/// the archive table rather than a Rust-side bind (they still must name the
+/// column). One list for the named-funnel pin AND the child-module sweep.
+const INSERT_SELECT_CARRIERS: &[&str] = &["archive_restore", "archive_restore_inner"];
+
 /// Every postgres funnel that hard-DELETEs a live `memories` row and MUST
 /// therefore unproject it from the AGE `memory_graph` projection.
 /// `update_with_archive_on_supersede` is the #2397 net-new arm; the rest
@@ -93,27 +109,31 @@ const KIND_PROVENANCE_FUNNELS: &[&str] = &[
 /// the class stays closed.
 const AGE_UNPROJECT_FUNNELS: &[&str] = &[
     "delete",
-    "apply_remote_deletion",
+    // #4447 — `apply_remote_deletion` is a thin delegator to
+    // `apply_remote_deletion_inner` (moved to `postgres/federation_by_id_4447.rs`);
+    // the guard follows the DELETE to the function that owns it.
+    "apply_remote_deletion_inner",
     "forget",
-    "consolidate",
+    // #4045/#4046/#4047 — `consolidate` was refactored into a thin delegator to
+    // `consolidate_with_expected_versions`, which now holds the hard-DELETE of
+    // the source rows and their AGE unprojection. The guard follows the DELETE
+    // to the function that owns it (same move as `store_with_embedding_inner`
+    // above for #2771); the wrapper deletes nothing itself.
+    "consolidate_with_expected_versions",
     "run_gc",
     "size_gc",
-    "archive_by_ids",
+    // #4447 — `archive_by_ids` delegates to `archive_by_ids_inner` (moved).
+    "archive_by_ids_inner",
     "update_with_archive_on_supersede", // #2397 (N17)
 ];
 
 fn adapter_source() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(PG_ADAPTER_PATH);
-    let raw =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    // Normalise CRLF -> LF once, at the single ingest point, so no downstream
-    // consumer in this file has to reason about line endings. On a Windows
-    // checkout with `core.autocrlf=true` every line arrives with a two-byte
-    // terminator; `fn_span` below is independently CRLF-correct, but keeping
-    // the source LF-only here means a future token/offset scan added to this
-    // file inherits the immunity instead of re-discovering the bug on the one
-    // platform none of us runs locally.
-    raw.replace("\r\n", "\n")
+    // Every adapter file (root first, then each child module), CRLF
+    // normalised to LF at the single ingest point inside the shared loader,
+    // so no downstream consumer in this file has to reason about line endings.
+    // `fn_span` below is independently CRLF-correct. Taking the FIRST match
+    // keeps `postgres.rs` ahead of any child.
+    pg_sources::pg_adapter_concat()
 }
 
 /// Extract the source span of the FIRST production `impl`-level function
@@ -140,6 +160,9 @@ fn adapter_source() -> String {
 fn fn_span<'a>(src: &'a str, name: &str) -> Option<&'a str> {
     let sig_a = format!("    async fn {name}(");
     let sig_b = format!("    pub async fn {name}(");
+    // #4447 — methods moved into child modules are `pub(super)` / `pub(crate)`.
+    let sig_c = format!("    pub(super) async fn {name}(");
+    let sig_d = format!("    pub(crate) async fn {name}(");
 
     // (byte_start, byte_end_past_terminator, content_without_terminator)
     let mut lines: Vec<(usize, usize, &str)> = Vec::new();
@@ -153,9 +176,12 @@ fn fn_span<'a>(src: &'a str, name: &str) -> Option<&'a str> {
     }
 
     // Single-line-signature variants (e.g. `archive_restore`, `delete`).
-    let start = lines
-        .iter()
-        .position(|(_, _, l)| l.starts_with(&sig_a) || l.starts_with(&sig_b))?;
+    let start = lines.iter().position(|(_, _, l)| {
+        l.starts_with(&sig_a)
+            || l.starts_with(&sig_b)
+            || l.starts_with(&sig_c)
+            || l.starts_with(&sig_d)
+    })?;
     let end = lines[start + 1..]
         .iter()
         .position(|(_, _, l)| *l == "    }")
@@ -356,7 +382,7 @@ fn pg_write_funnels_bind_kind_provenance_2393() {
         // `archive_restore` carries the column through an INSERT ... SELECT
         // over `archived_memories` (with a metadata-carrier COALESCE fallback
         // for legacy pre-v87 archive rows), so it has no Rust-side bind.
-        if *name != "archive_restore" && !span.contains(KIND_PROVENANCE_BIND) {
+        if !INSERT_SELECT_CARRIERS.contains(name) && !span.contains(KIND_PROVENANCE_BIND) {
             missing.push(format!(
                 "  {name}: no `{KIND_PROVENANCE_BIND}` bind — a raw literal or a \
                  dropped column silently NULLs the v79/#1945 provenance on postgres"
@@ -400,5 +426,141 @@ fn pg_hard_delete_funnels_unproject_from_age_2397() {
         "#2397 (N17): postgres hard-delete funnels missing AGE unprojection \
          (the graph projection would serve deleted state as live):\n{}",
         missing.join("\n")
+    );
+}
+
+/// Split one adapter file into `(fn name, body)` spans at every `fn` item
+/// (any indentation), cutting the file at its first `#[cfg(test)]` item so
+/// test fixtures are never swept.
+fn child_fn_spans(text: &str) -> Vec<(String, String)> {
+    let prod = text.split("\n#[cfg(test)]").next().unwrap_or(text);
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut cur: Option<(String, String)> = None;
+    for line in prod.lines() {
+        let t = line.trim_start();
+        let t = t
+            .strip_prefix("pub(crate) ")
+            .or_else(|| t.strip_prefix("pub(super) "))
+            .or_else(|| t.strip_prefix("pub "))
+            .unwrap_or(t);
+        let t = t.strip_prefix("async ").unwrap_or(t);
+        if let Some(rest) = t.strip_prefix("fn ")
+            && let Some(end) = rest.find(['(', '<'])
+            && rest[..end].chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            if let Some(done) = cur.take() {
+                out.push(done);
+            }
+            cur = Some((rest[..end].to_string(), String::new()));
+        }
+        if let Some((_, body)) = cur.as_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if let Some(done) = cur.take() {
+        out.push(done);
+    }
+    out
+}
+
+/// True when `body` contains the SQL fragment `needle` (whitespace-collapsed,
+/// case-insensitive) as a whole word.
+fn has_sql(body: &str, needle: &str) -> bool {
+    let norm = body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase();
+    let needle = needle.to_uppercase();
+    let mut from = 0;
+    while let Some(pos) = norm[from..].find(&needle) {
+        let after = from + pos + needle.len();
+        let next = norm[after..].chars().next();
+        if next.is_none_or(|c| !(c.is_alphanumeric() || c == '_')) {
+            return true;
+        }
+        from = after;
+    }
+    false
+}
+
+/// #4023 — child modules are NOT a blind spot. The two named-funnel lists
+/// above pin specific `postgres.rs` functions; a write funnel added to (or
+/// moved into) a `src/store/postgres/*.rs` child module would never be named
+/// there. So every function in a child module that INSERTs a `memories` row
+/// must bind `kind_provenance` (#2393), and every one that hard-DELETEs a
+/// `memories` row must unproject it from AGE (#2397). Today no child does
+/// either; this keeps it that way. The loader asserts the child set is
+/// non-empty and contains the expected modules, so this cannot pass vacuously.
+#[test]
+fn pg_child_module_memories_writes_obey_2393_2397_4023() {
+    let sources = pg_sources::pg_adapter_sources();
+    let children: Vec<&pg_sources::PgSource> = sources
+        .iter()
+        .filter(|s| s.rel != PG_ADAPTER_PATH)
+        .collect();
+    assert!(
+        children.len() >= pg_sources::EXPECTED_CHILDREN.len(),
+        "child scan saw only {} files — the sweep would be vacuous",
+        children.len()
+    );
+    let mut violations: Vec<String> = Vec::new();
+    for child in children {
+        for (name, body) in child_fn_spans(&child.text) {
+            if has_sql(&body, "INSERT INTO memories")
+                && !(body.contains(KIND_PROVENANCE_COLUMN)
+                    && (body.contains(KIND_PROVENANCE_BIND)
+                        || INSERT_SELECT_CARRIERS.contains(&name.as_str())))
+            {
+                violations.push(format!(
+                    "  {}::{name}: INSERTs a memories row without the kind_provenance \
+                     column + `{KIND_PROVENANCE_BIND}` bind (#2393)",
+                    child.rel
+                ));
+            }
+            if has_sql(&body, "DELETE FROM memories")
+                && !(body.contains(AGE_UNPROJECT_CALL)
+                    || body.contains("unproject_memory_ids_best_effort("))
+            {
+                violations.push(format!(
+                    "  {}::{name}: hard-DELETEs a memories row without AGE \
+                     unprojection (#2397)",
+                    child.rel
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "#4023: child-module write funnels violate the #2393/#2397 parity pins:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// #4447 — `fn_span` finds methods whose visibility is `pub(super)` /
+/// `pub(crate)` (the moved federation by-id bodies), and still bounds them.
+#[test]
+fn fn_span_matches_restricted_visibility_methods_4447() {
+    let src = concat!(
+        "impl PostgresStore {\n",
+        "    pub(super) async fn moved_funnel(\n",
+        "        &self,\n",
+        "    ) -> Result<()> {\n",
+        "        let marker = \"MOVED_ONLY_MARKER\";\n",
+        "        Ok(())\n",
+        "    }\n",
+        "\n",
+        "    pub(crate) async fn next_funnel(&self) -> Result<()> {\n",
+        "        Ok(())\n",
+        "    }\n",
+        "}\n",
+    );
+    let span = fn_span(src, "moved_funnel").expect("pub(super) method must be found");
+    assert!(span.contains("MOVED_ONLY_MARKER"));
+    assert!(!span.contains("next_funnel"), "span must not bleed");
+    assert!(
+        fn_span(src, "next_funnel").is_some(),
+        "pub(crate) method must be found"
     );
 }

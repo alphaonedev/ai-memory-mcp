@@ -8,26 +8,38 @@
 //! fire-and-forget thread POSTs an HMAC-SHA256-signed JSON payload.
 //!
 //! SSRF hardening:
-//! - `http://` only to `127.0.0.0/8` or `localhost` hosts;
-//!   everywhere else requires `https://`
-//! - RFC1918 / RFC4193 / link-local hosts are rejected unless
-//!   `allow_private_networks = true` in the daemon config
+//! - `https://` only: plaintext `http://` is refused for every host,
+//!   loopback included (#3705, `validate_url_with`)
+//! - RFC1918 / RFC4193 / link-local targets are refused
+//!   unconditionally, both as literal IPs at registration and as
+//!   resolved addresses at dispatch; there is no private-network
+//!   override
+//! - loopback targets are refused unless the operator opts in with
+//!   `[subscriptions] allow_loopback_webhooks = true` (or
+//!   `AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS`)
 //!
 //! Signature:
-//! - Header `X-Ai-Memory-Signature: sha256=<hex>` over the raw
-//!   JSON body
-//! - The secret stored in the DB is a SHA-256 of the plaintext
-//!   shared secret; the plaintext is returned **once** at
-//!   subscription time and never leaves the DB after.
+//! - Header `X-Ai-Memory-Signature: sha256=<hex>` where
+//!   `<hex>` = `HMAC-SHA256(key, "<timestamp>.<body>")`, `<timestamp>`
+//!   is the value sent in `X-Ai-Memory-Timestamp`, and `<body>` is the
+//!   raw JSON body
+//! - `key` is `SHA256(plaintext shared secret)`: the DB stores that
+//!   hash, and the plaintext is returned **once** at subscription time
+//!   and never leaves the DB after. With no per-subscription secret the
+//!   key is `SHA256` of the server-wide `[hooks.subscription]
+//!   hmac_secret`
 
 use crate::models::field_names;
 
 // #3659 — delivery-audit bookkeeping evidence (counters, /metrics, /health).
 pub mod audit_status;
+// #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
+mod unstarted;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+pub use unstarted::{DispatchDrainReport, UnstartedSweep, drain_dispatches_with_report};
 
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension as _, params};
@@ -99,12 +111,16 @@ pub async fn wait_dispatch_idle() {
 /// Wait for every ADMITTED webhook delivery to finish, up to `timeout`.
 ///
 /// Returns `true` when the fan-out drained and `false` when the deadline
-/// was hit with deliveries still in flight. Callers decide the severity:
-/// the long-lived HTTP daemon treats a miss as a fatal shutdown (a late
-/// worker could write after the final audit checkpoint), while a one-shot
-/// CLI treats it as a loud WARN — its write is already durable and the
-/// per-delivery audit row is persisted BEFORE the network send, so a K7
-/// replay-from-cursor can re-deliver what the exit truncated.
+/// was hit with deliveries still in flight. On `false` every delivery whose
+/// worker had not started (queued for a permit or a blocking-pool slot) has
+/// already been recorded to `subscription_dlq`, or logged at ERROR if that
+/// write failed (#3979); [`drain_dispatches_with_report`] has the counts.
+/// Callers decide the severity: the long-lived HTTP daemon treats a miss as
+/// a fatal shutdown (a late worker could write after the final audit
+/// checkpoint), while a one-shot CLI treats it as a loud WARN — its write
+/// is already durable.
+/// A crash never reaches this drain: deliveries not yet started are lost
+/// on a crash (#3979).
 ///
 /// v1.0.0 #3403 — extracted so the daemon-shutdown drain and the
 /// one-shot-CLI drain are the SAME wait, not two similar loops. Delivery
@@ -115,9 +131,7 @@ pub async fn wait_dispatch_idle() {
 /// #3589 — the wait itself is the dispatcher idle [`Notify`], not a
 /// poll of the clock. `timeout` is only a hang detector.
 pub async fn drain_dispatches(timeout: std::time::Duration) -> bool {
-    tokio::time::timeout(timeout, wait_dispatch_idle())
-        .await
-        .is_ok()
+    drain_dispatches_with_report(timeout).await.drained
 }
 
 /// The graceful-shutdown budget [`drain_dispatches`] callers use. See
@@ -602,6 +616,9 @@ pub mod dlq_reason {
     pub const SSRF_REJECTED: &str = "ssrf_rejected";
     /// The subscription URL failed the DNS-resolved SSRF guard.
     pub const DNS_SSRF_REJECTED: &str = "dns_ssrf_rejected";
+    /// #3979 — admitted, but its worker had not started at the shutdown
+    /// drain deadline; recorded instead of dropped. Nothing was sent.
+    pub const SHUTDOWN_UNSTARTED: &str = "shutdown_unstarted";
 }
 
 /// PERF-3 (fix campaign 2026-05-26, FX-10) — default upper bound on the
@@ -1101,6 +1118,16 @@ pub fn dispatch_event_to_subs(
         let db_path = db_path.to_path_buf();
         let secret_hash_owned = sub_secret_hash.clone();
         let server_wide_secret_owned = server_wide_secret.clone();
+        // #3979 — registered BEFORE the worker is spawned; the worker's
+        // first act is to claim it. Until then the shutdown drain can
+        // record it to the DLQ instead of dropping it with the runtime.
+        let ticket = unstarted::register(unstarted::UnstartedDelivery {
+            db_path: db_path.clone(),
+            sub_id: sub_id.clone(),
+            correlation_id: correlation_id.clone(),
+            event: event_owned.clone(),
+            body: body.clone(),
+        });
 
         // PERF-3 (FX-10) — the entire per-subscriber delivery body
         // is captured by a `FnOnce()` closure so it can run either
@@ -1108,6 +1135,11 @@ pub fn dispatch_event_to_subs(
         // freshly-spawned `std::thread` (no-runtime fallback). The
         // body is otherwise unchanged from the pre-fix code.
         let work = move || {
+            // #3979 — the shutdown sweep already recorded this delivery
+            // to the DLQ; sending it now would deliver it twice.
+            if !unstarted::claim(ticket) {
+                return;
+            }
             // v0.7.0 #1072 — open ONE sqlite connection for the
             // whole delivery instead of 4-5 across the
             // event-audit / status-update / dispatch-counter / DLQ
@@ -1132,7 +1164,9 @@ pub fn dispatch_event_to_subs(
             };
             // Persist the per-delivery audit row BEFORE the network
             // send so replay-from-cursor (K7) sees a stable record
-            // even if the dispatcher process crashes mid-retry.
+            // even if the dispatcher process crashes mid-retry. Only
+            // from HERE on: before this INSERT the delivery exists only
+            // in memory (#3979 — lost on a crash, DLQ'd at a drain miss).
             let event_audit_result = if let Some(c) = worker_conn.as_ref() {
                 record_subscription_event_with_conn(
                     c,

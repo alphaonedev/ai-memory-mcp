@@ -42,7 +42,7 @@
 //! | `AI_MEMORY_WAKE_SENDER` | agent that wrote the row |
 //! | `AI_MEMORY_WAKE_DIGEST` | lowercase hex SHA-256 OF THE BODY — never the body |
 //! | `AI_MEMORY_WAKE_SEQ` | the producer's wake watermark at mint time |
-//! | `AI_MEMORY_WAKE_MISSED` | wakes this listener demonstrably did not see |
+//! | `AI_MEMORY_WAKE_MISSED` | wakes this listener did not see, clamped to 65,536; NOT a count across a producer restart or eviction (the watermark rebases), so rely only on `> 0` (reason `gap`) |
 //! | `AI_MEMORY_WAKE_PENDING` | wakes the hub coalesced while offline |
 //! | `AI_MEMORY_WAKE_INBOX_COUNT` | messages the catch-up read returned |
 //!

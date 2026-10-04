@@ -457,6 +457,39 @@ pub fn validate_agent_id(agent_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fixed refusal text for an invalid notify recipient (#4338). It never
+/// carries the offending value: a recipient id is wire input, so echoing it
+/// would reflect arbitrary bytes into logs and responses.
+pub const NOTIFY_TARGET_REFUSAL: &str =
+    "target_agent_id is not a valid agent id (1-128 bytes of alphanumeric or _-:@./, not reserved)";
+
+/// Typed refusal for a notify recipient that fails [`validate_agent_id`].
+/// Its `Display` is the fixed [`NOTIFY_TARGET_REFUSAL`] text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidNotifyTarget;
+
+impl std::fmt::Display for InvalidNotifyTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(NOTIFY_TARGET_REFUSAL)
+    }
+}
+
+impl std::error::Error for InvalidNotifyTarget {}
+
+/// The ONE validator for a notify `target_agent_id`, shared by every notify
+/// funnel on both backends (MCP, HTTP, sqlite and postgres `MemoryStore::notify`)
+/// so a recipient the sqlite path refuses is refused identically on postgres
+/// (#4338). Fails closed and must run BEFORE any quota charge or write.
+///
+/// # Errors
+///
+/// [`InvalidNotifyTarget`] when `target` is empty, longer than the agent-id
+/// bound, outside the agent-id charset, or a reserved internal id. The error
+/// never contains `target`.
+pub fn validate_notify_target(target: &str) -> std::result::Result<(), InvalidNotifyTarget> {
+    validate_agent_id(target).map_err(|_| InvalidNotifyTarget)
+}
+
 /// Validate a wire-supplied base64-encoded Ed25519 agent public key
 /// (#626 Layer-3, Task 1.3).
 ///
@@ -676,6 +709,48 @@ pub fn validate_tags(tags: &[String]) -> Result<()> {
         crate::secret_screen::screen_for_caller(trimmed).map_err(|r| anyhow::anyhow!("{r}"))?;
     }
     Ok(())
+}
+
+/// Fixed refusal text for an invalid signal recipient (#4408). It never
+/// carries the offending value: a recipient id is wire input, so echoing it
+/// would reflect arbitrary bytes into logs, audit records and responses.
+pub const SIGNAL_RECIPIENT_REFUSAL: &str =
+    "to_agent is not a valid agent id (1-128 bytes of alphanumeric or _-:@./, not reserved)";
+
+/// Typed refusal for a signal recipient that fails [`validate_agent_id`].
+/// Its `Display` is the fixed [`SIGNAL_RECIPIENT_REFUSAL`] text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidSignalRecipient;
+
+impl std::fmt::Display for InvalidSignalRecipient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(SIGNAL_RECIPIENT_REFUSAL)
+    }
+}
+
+impl std::error::Error for InvalidSignalRecipient {}
+
+/// The ONE validator for a signal `to_agent`, shared by every `signal_send`
+/// funnel on both backends (MCP, HTTP, sqlite and postgres
+/// `MemoryStore::signal_send`) (#4408). An absent recipient (`None`) is a
+/// namespace broadcast and passes; a PRESENT recipient (including the empty
+/// or blank string) must satisfy the agent-id registration contract. Fails
+/// closed and must run BEFORE any quota charge, signature, write or audit.
+///
+/// # Errors
+///
+/// [`InvalidSignalRecipient`] when a present `to_agent` is empty, blank,
+/// longer than the agent-id bound, outside the agent-id charset, or a
+/// reserved internal id. The error never contains the value.
+pub fn validate_signal_recipient(
+    to_agent: Option<&str>,
+) -> std::result::Result<(), InvalidSignalRecipient> {
+    match to_agent {
+        None => Ok(()),
+        // ERRORS-15 exception: the underlying error is dropped on purpose because
+        // `validate_agent_id`'s messages (e.g. the reserved-id one) contain the value.
+        Some(id) => validate_agent_id(id).map_err(|_| InvalidSignalRecipient),
+    }
 }
 
 pub fn validate_id(id: &str) -> Result<()> {

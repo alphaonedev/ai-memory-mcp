@@ -33,7 +33,13 @@ x-api-key: <key>
 
 The header is the **only** credential channel.
 
-Failure → **401** `{"error": "missing or invalid API key"}`.
+Failure → **401** `{"error": "missing or invalid API key"}`. After repeated
+authentication failures from the same TCP source (5 free failures, then a
+backoff starting at 1 s and doubling to a 300 s ceiling — #2502), that
+source receives **429** `{"error": "auth_backoff"}` with `Retry-After`
+on every authenticated route, read or write, even when it presents a
+correct key during the backoff window. `/health`, keyless daemons and the
+mTLS-enforced `/sync` lane are not counted.
 
 > **BREAKING CHANGE at v1.0.0 — `?api_key=` query credential REMOVED**
 > ([#2032](https://github.com/alphaonedev/ai-memory-mcp/issues/2032) L1;
@@ -225,8 +231,11 @@ application; `429` (dominant cause) when **nothing** persisted and quota
 was the worst rejection. A wholly quota-rejected batch is therefore
 `429`, not `200`.
 
-Read paths (`GET /recall`, `/search`, `/memories`, …) are not quota-charged
-and never return 429.
+Read operations (`GET /recall`, `/search`, `/memories`, …) are not charged
+against write quotas. Authenticated read and write routes may nevertheless
+return 429 with `{"error":"auth_backoff"}` and `Retry-After` when their TCP
+source is in authentication-failure backoff. Ordinary missing or invalid
+credentials return 401 before backoff begins.
 
 ## Limits
 
@@ -478,9 +487,20 @@ Series an operator should wire alerts to (canonical registration:
 | `ai_memory_memories` | gauge | Corpus size. Refreshed on a paced loop (`AI_MEMORY_METRICS_GAUGE_REFRESH_SECS`, default `60`; `0` disables the loop), not per scrape. |
 | `ai_memory_memories_refreshed_at_seconds` | gauge | UNIX seconds at which the gauge above was last recomputed; `0` = never. **Not optional — alert on `time() - ai_memory_memories_refreshed_at_seconds`.** Without it a dead refresher would freeze a plausible-looking count forever, including through a mass deletion, while Prometheus `up` stayed `1`. |
 | `ai_memory_admission_shed_total` | counter | Requests shed by admission control with a typed `503`. |
+| `ai_memory_log_pipeline_active` | gauge | 1 when the configured operational log sink is installed and receiving events; 0 when logging is disabled (#3651). |
+| `ai_memory_log_records_delivered_total` | counter | Log records written to the configured sink without error. Present only while a log pipeline is active (#3651). |
+| `ai_memory_log_write_failures_total` | counter | Failed writes and flushes of the configured log sink; each lost at least one record (#3651). |
+| `ai_memory_log_queue_dropped_total` | counter | Log records dropped because the sink's worker queue was full (#3651). |
+| `ai_memory_log_last_delivery_seconds` | gauge | UNIX time of the most recent successful log delivery. Absent until the first delivery; never `0` (#3651). |
+| `ai_memory_audit_trail_active` | gauge | 1 when the flat audit trail (`[audit].enabled`) is recording in this process; 0 when auditing is off (#3975). |
+| `ai_memory_audit_records_written_total` | counter | Audit events written and flushed without error. Present only while the trail is active (#3975). |
+| `ai_memory_audit_write_failures_total` | counter | Audit writes or flushes that failed; each may be a lost event (a failed flush whose line reached the file leaves no gap). Run `ai-memory audit verify` for the actual gaps (#3975). |
+| `ai_memory_audit_last_write_seconds` | gauge | UNIX time of the most recent successful audit write. Absent until the first write; never `0` (#3975). |
+| `ai_memory_audit_trail_latched` | gauge | 1 while this process refuses mutating operations because its audit trail failed under `AI_MEMORY_REQUIRE_AUDIT_TRAIL`; 0 otherwise. Exported only when that mode is on (#4400). |
 | `ai_memory_recall_embed_degraded_total` | counter | Recalls that exceeded `AI_MEMORY_RECALL_EMBED_BUDGET_MS` and degraded to keyword (#2577). |
 | `ai_memory_rerank_budget_degraded_total` | counter | Recalls whose cross-encoder stage was skipped pre-flight under `AI_MEMORY_RERANK_BUDGET_MS`, shipping the hybrid ordering (#2608). |
 | `ai_memory_query_embed_cache_hits_total` | counter | Query-embedding cache hits (#2577). |
+| `ai_memory_embed_task_failed_total{surface}` | counter | HTTP-path embed/rerank tasks run on the blocking pool that did not complete (a panic or runtime shutdown), by surface (`bulk`, `create`, `update`, `check_duplicate`, `recall`, `rerank`, `smart_load`, `reflect`). Each request degraded as on an embed failure or failed closed; any increment is a bug to investigate (#4089). |
 | `ai_memory_corrupt_provenance_rows_total{column}` | counter | Rows skipped by a discovery scan because a provenance column would not open (e.g. `encrypted_envelope`, #2383). |
 | `ai_memory_fed_quarantined_unattributed_total` | counter | Inbound relayed memories quarantined by the route-IN provenance gate (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`, #2966). Always zero when the quarantine knob is off (the default); a non-zero rate means a peer is relaying provenance-less content this node is black-holing until dequarantine. Pairs with the `federation.quarantine.unattributed` WARN. |
 | `ai_memory_operator_dequarantined_total` | counter | The route-OUT twin (#2402): quarantined memories released by an OPERATOR through `ai-memory quarantine release` or `POST /api/v1/admin/quarantine/{id}/release`. Each increment also appends a `memory.dequarantined` signed-chain row naming the authenticated caller, in the same transaction as the state change; a no-op release does not increment. Pairs with the `quarantine.operator_release` WARN. |
@@ -585,9 +605,10 @@ or expect `"storage_backend": "sqlite"` — that key is absent on sqlite.
 }
 ```
 
-`ttl_secs` is HTTP-only — the MCP `memory_store` tool exposes
-`expires_at` instead (also accepted on this HTTP endpoint). See the
-HTTP ↔ MCP parameter coverage table at the bottom of this document.
+`ttl_secs` and create-time `expires_at` are HTTP-only. MCP `memory_store`
+applies the tier TTL; set an explicit expiry afterwards with `memory_update`
+(`expires_at`). See the HTTP ↔ MCP parameter coverage table at the bottom of
+this document.
 
 An optional `kind` field is also accepted. Omitting it keeps the
 `observation` default; a supplied value MUST be one of the **16**
@@ -818,8 +839,9 @@ serve from a read replica.
 
 The access ladders still exist — they are applied out of band by the
 periodic **fold job** from unfolded ledger rows: access-count bump,
-per-tier TTL floor extension, mid→long promotion at 5 accesses, the
-priority decade ladder. **The fold job only runs inside `ai-memory
+per-tier TTL floor extension and `last_accessed_at`. v1.0.0 Boids item 1
+(vote `4d3ea1c5`) removed the mid→long promotion and the priority decade
+ladder from the fold: tier changes only through `memory_promote`. **The fold job only runs inside `ai-memory
 serve`** (its own 60 s loop, `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS`, plus a
 fold at the top of every GC tick). On an MCP-stdio or CLI-only topology
 with no daemon, nothing folds until a GC chokepoint runs — so
@@ -888,12 +910,20 @@ schemas and enforced-caller visibility remain unchanged.
 ### `GET /api/v1/search`
 
 Read-only FTS5 keyword search. Same filter params as list, plus `q`
-(required) and `format` (`json` default | `toon` | `toon_compact` —
-v0.7.0 #1579 B4, same semantics as recall above).
+and `format` (`json` default | `toon` | `toon_compact` —
+v0.7.0 #1579 B4, same semantics as recall above). `q` is required only
+when `source_uri` is absent or blank; a nonempty `source_uri` supports
+source-only lookup (#891). A request with both empty is `400
+{"error": "query or source_uri is required"}`.
+
+Text-query responses contain `results`, `count`, and `query`:
 
 ```json
 { "results": [ … ], "count": 3, "query": "urgent deadline" }
 ```
+
+The SQLite source-only response contains `results`, `count`, and
+`source_uri` instead of `query`.
 
 > **Note (HTTP ↔ MCP parity):** The MCP `memory_recall`,
 > `memory_search`, and `memory_list` tools accept the same optional
@@ -1530,9 +1560,27 @@ through one shared funnel (`src/write_events.rs`), so the event stream is
 a complete record of writes regardless of which surface made them. Before
 #3403 no CLI verb dispatched anything, and subscribers were silently
 blind to CLI-originated writes. Delivery is fire-and-forget, so a one-shot
-CLI invocation drains the fan-out before exiting; if that drain hits its
-budget the write is still durable and each admitted delivery has a
-persisted audit row for replay-from-cursor.
+CLI invocation drains the fan-out before exiting (the daemon drains at
+shutdown too). If that drain hits its 30 s budget the write is still
+durable, and what happens to each delivery depends on whether its worker
+had started (#3979):
+
+- **Started** (holding a dispatch slot): it has a `subscription_events`
+  audit row, written before the first send, so
+  `memory_subscription_replay` re-delivers it.
+- **Not started** (queued behind `AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY`,
+  default 32, or behind the blocking pool): it has no audit row. The drain
+  records it to `subscription_dlq` with `last_error = "shutdown_unstarted"`
+  (visible in `memory_subscription_dlq_list`) and it is never sent late.
+  If that DLQ write fails (for example the per-subscription DLQ cap), the
+  delivery is logged at ERROR and lost.
+
+The shutdown WARN reports all three counts. **A crash is not covered.**
+SIGKILL, an OOM kill or an abort before the drain loses every delivery
+that had not started, because until its worker runs a delivery exists only
+in memory (admission-time persistence is tracked in #3980). The event
+stream therefore records every write that
+*dispatched*, not every delivery a subscriber will receive.
 
 ### `POST /api/v1/subscriptions` — register webhook
 

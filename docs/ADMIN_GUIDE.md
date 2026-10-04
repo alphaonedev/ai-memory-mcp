@@ -7,7 +7,7 @@ layout: doc
 
 `ai-memory` is an AI-agnostic memory management system. It works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. The HTTP API and CLI are completely platform-independent.
 
-**Key features for admins:** Zero token cost until recall (replaces built-in auto-memory), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous, with any LLM backend post-#1067 — local Ollama, xAI Grok, OpenAI, Anthropic, Gemini, etc.), and the v0.7.0 `attested-cortex` substrates (Ed25519 link attestation, 25-event hook pipeline, sidechain transcripts, optional AGE acceleration, capabilities v3, permissions + A2A approvals). v0.7.0 ships ~2,400 tests across the full surface with line coverage held above the ≥92% project bar; v0.6.3.1 baseline numbers (1,886 lib / 93.84%) and v0.6.3 baselines (1,600 lib / 93.08%) are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.7.0 deltas live in `CHANGELOG.md` and the per-release notes.
+**Key features for admins:** no memory content in context until recall (replaces built-in auto-memory; the MCP tool schemas still cost a fixed per-request budget), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous, with any LLM backend post-#1067 — local Ollama, xAI Grok, OpenAI, Anthropic, Gemini, etc.), and the v0.7.0 `attested-cortex` substrates (Ed25519 link attestation, 25-event hook pipeline, sidechain transcripts, optional AGE acceleration, capabilities v3, permissions + A2A approvals). v0.7.0 ships ~2,400 tests across the full surface with line coverage held above the ≥92% project bar; v0.6.3.1 baseline numbers (1,886 lib / 93.84%) and v0.6.3 baselines (1,600 lib / 93.08%) are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.7.0 deltas live in `CHANGELOG.md` and the per-release notes.
 
 > **Maturity framing (v0.7).** The single-machine primitive (T1/T2 in the [architectures matrix](https://alphaonedev.github.io/ai-memory-mcp/architectures.html)) is **production-ready**. Federation (T3 multi-node quorum cluster) is **beta** — the code is shipped and tested but not recommended for unattended production fleets. The Postgres+pgvector backend reaches **GA in v0.7** (with optional **Apache AGE acceleration** for KG ops behind a bench gate). Ed25519 attestation, the hook pipeline, sidechain transcripts, and the permissions/A2A surfaces are all **opt-in** — a v0.7.0 install with no `hooks.toml`, no keypair, and no `[transcripts]` config behaves identically to v0.6.4 at the lifecycle layer. Multi-region distributed consensus (T5 "global hive") is **vision** at v1.0+. See the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) for the canonical maturity labels — use those labels in all customer-facing materials.
 
@@ -48,7 +48,7 @@ Run the HTTP daemon directly in the foreground:
 ai-memory --db /path/to/ai-memory.db serve
 ```
 
-The daemon listens on `127.0.0.1:9077` by default and exposes 100 HTTP route registrations (86 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The daemon listens on `127.0.0.1:9077` by default and exposes 103 HTTP route registrations (89 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Systemd (Production HTTP Daemon)
 
@@ -143,7 +143,7 @@ The `--tier` flag controls which features are enabled. Each tier builds on the p
 | `keyword` | keyword subset | No | No | Minimal |
 | `semantic` (default) | semantic subset | Yes (HuggingFace) | No | ~256 MB |
 | `smart` | smart subset (LLM tools enabled) | Yes | Yes — any provider (#1067): Ollama, xAI, OpenAI, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp | ~1 GB (local Ollama) / ~256 MB (remote endpoint) |
-| `autonomous` | full 103-entry surface (v1.0.0; 102 callable memory tools + the always-on `memory_capabilities` bootstrap) | Yes | Yes — same as smart (#1067) | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder) |
+| `autonomous` | full 104-entry surface (v1.0.0; 103 callable memory tools + the always-on `memory_capabilities` bootstrap) | Yes | Yes — same as smart (#1067) | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder) |
 
 Set the tier when starting the MCP server or running per-invocation
 subcommands (`mcp`, `store`, `recall`, etc.):
@@ -361,7 +361,7 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `AI_MEMORY_MAX_STORAGE_BYTES` | `104857600` (100 MiB) | **[#1156 follow-up, v0.7.x]** Per-**(agent, namespace)** storage-byte quota seeded into fresh `agent_quotas` rows **(SQLite; the pg DDL divergence is #3209)**. Same ladder as above (`[limits].max_storage_bytes`). |
 | `AI_MEMORY_MAX_LINKS_PER_DAY` | `5000` | **[#1156 follow-up, v0.7.x]** Per-**(agent, namespace)** daily link-write quota seeded into fresh `agent_quotas` rows **(SQLite; the pg DDL divergence is #3209)**. Same ladder as above (`[limits].max_links_per_day`). |
 | `AI_MEMORY_MAX_PAGE_SIZE` | `1000` | **[#1156 follow-up, v0.7.x]** Cap on list / bulk-write / federation-sync page size — bounds per-request in-memory materialization (OOM guard). Precedence: env > `[limits].max_page_size` > compiled `MAX_BULK_SIZE`. Non-positive / unparseable falls through. |
-| `AI_MEMORY_MAX_INFLIGHT_REQUESTS` | unset ⇒ CPU-scaled | **[#1733 Pillar-4 4.A; TRI-STATE since #2032 M3]** Global HTTP admission-control concurrency cap. `0` **disables** it (the layer is not composed at all). When UNSET the daemon computes a CPU-scaled default — `cores × 64`, clamped to a floor of **256** and a ceiling of **4096** (`resolve_default_max_inflight_requests`, `src/config.rs:4368-4375`; constants `MAX_INFLIGHT_PER_CORE`/`MAX_INFLIGHT_FLOOR`/`MAX_INFLIGHT_CEILING` at `src/config.rs:4347,4352,4356`) — it is NOT "unset = disabled". Precedence: env > `[limits].max_inflight_requests` > CPU-scaled default (`src/config.rs:4326` for the env name, `:8938-8942` for the ladder). |
+| `AI_MEMORY_MAX_INFLIGHT_REQUESTS` | unset ⇒ CPU-scaled | **[#1733 Pillar-4 4.A; TRI-STATE since #2032 M3]** Global HTTP admission-control concurrency cap. `0` **disables** it (the layer is not composed at all). When UNSET the daemon computes a CPU-scaled default — `cores × 64`, clamped to a floor of **256** and a ceiling of **4096** ([`resolve_default_max_inflight_requests`](../src/config.rs); constants [`MAX_INFLIGHT_PER_CORE`](../src/config.rs) / [`MAX_INFLIGHT_FLOOR`](../src/config.rs) / [`MAX_INFLIGHT_CEILING`](../src/config.rs)) — it is NOT "unset = disabled". Precedence: env > `[limits].max_inflight_requests` > CPU-scaled default ([`ENV_MAX_INFLIGHT_REQUESTS`](../src/config.rs) names the env var; the ladder is resolved in [`resolve_limits`](../src/config.rs)). |
 | `RUST_LOG` | (none) | Logging filter (e.g., `ai_memory=info,tower_http=debug`) |
 | `AI_MEMORY_NO_CONFIG` | (none) | Set to a truthy value (`1`/`true`/`yes`/`on`, trimmed, case-insensitive) to skip config file loading (useful for testing). **[#3167]** Any other value — including an empty `AI_MEMORY_NO_CONFIG=` and `=0` — means "do NOT skip": the config file IS loaded and a one-shot WARN is printed to stderr. Before #3167 mere PRESENCE of the variable disabled the whole config file. **[#3603]** With a truthy value the config-path WARNs (legacy `~/.config` root, shadowed or Library-only macOS config) are not printed either, since no config is read. |
 
@@ -390,7 +390,7 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `llm_model` | String | Backend-dependent | `"gemma3:4b"` (Ollama default), `"grok-4.3"` (xai), `"gpt-5"` (openai), `"claude-opus-4.7"` (anthropic), `"qwen-max"`, … | **[LEGACY]** LLM model tag. Canonical v2: `[llm].model`. Default resolution lives in `src/config.rs::backend_default_model`. |
 | `cross_encoder` | **Bool** | `false` (`true` for autonomous tier) | `true`, `false` | **[LEGACY]** Enable neural cross-encoder reranking. Canonical v2: `[reranker].enabled`. |
 | `default_namespace` | String | `"global"` | Any valid namespace (max 512 chars; `/` hierarchy delimiter allowed; no spaces/nulls) | **[LEGACY]** Default namespace applied to new memories. Canonical v2: `[storage].default_namespace`. |
-| `max_memory_mb` | Integer | Tier-dependent | Any positive integer | **[LEGACY — PARSED BUT NOT ENFORCED (FBL-13)]** It has **no runtime consumer**: it does not cap memory or storage and is NOT an auto-tier-selection input on any live path. `resolve_storage` emits a one-shot WARN when it is set (`src/config.rs:145-149`). For an actual storage ceiling use `[limits].max_storage_bytes` / `AI_MEMORY_MAX_STORAGE_BYTES`. |
+| `max_memory_mb` | Integer | Tier-dependent | Any positive integer | **[LEGACY — PARSED BUT NOT ENFORCED (FBL-13)]** It has **no runtime consumer**: it does not cap memory or storage and is NOT an auto-tier-selection input on any live path. [`resolve_storage`](../src/config.rs) emits a one-shot WARN when it is set ([`warn_max_memory_mb_inert_once`](../src/config.rs)). For an actual storage ceiling use `[limits].max_storage_bytes` / `AI_MEMORY_MAX_STORAGE_BYTES` ([`ENV_MAX_STORAGE_BYTES`](../src/config.rs)). |
 | `archive_on_gc` | Bool | `true` | `true`, `false` | **[LEGACY]** Archive expired memories on GC. Canonical v2: `[storage].archive_on_gc`. |
 | `[ttl]` | Section | -- | -- | Per-tier TTL overrides (all sub-fields are integers in seconds) |
 | `ttl.short_ttl_secs` | Integer | `21600` (6 hours) | `0` = never expires, or positive integer | TTL for short-tier memories in seconds |
@@ -633,10 +633,10 @@ These are set in the source code and require recompilation to change:
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `DEFAULT_PORT` | 9077 | `src/daemon_runtime.rs:97` |
-| `GC_INTERVAL_SECS` | 1800 (30 min) | `src/daemon_runtime.rs:98` |
+| `DEFAULT_PORT` | 9077 | [`DEFAULT_PORT`](../src/daemon_runtime.rs) |
+| `GC_INTERVAL_SECS` | 1800 (30 min) | [`GC_INTERVAL_SECS`](../src/daemon_runtime.rs) |
 | `MAX_CONTENT_SIZE` | 65536 (64 KB) | `models.rs` |
-| `PROMOTION_THRESHOLD` | 5 accesses | `models.rs` |
+| `PROMOTION_THRESHOLD` | 5 (historical; no production reader since v1.0.0 Boids item 1 — access never promotes, only `memory_promote` raises a tier; kept for a regression test) | `models.rs` |
 | `SHORT_TTL_EXTEND_SECS` | 3600 (1 hour) | `models.rs` |
 | `MID_TTL_EXTEND_SECS` | 86400 (1 day) | `models.rs` |
 | `DEFAULT_MAX_MEMORIES_PER_DAY` | 1000 | `quotas.rs` (compiled fallback for `[limits].max_memories_per_day` / `AI_MEMORY_MAX_MEMORIES_PER_DAY`) |
@@ -660,7 +660,7 @@ profile is active.
 | `graph` | core + Graph family | Agents that walk `memory_link` / `memory_get_links` / `memory_kg_query` / `memory_find_paths` / `memory_verify` / `memory_replay` / the entity + taxonomy tools. |
 | `admin` | core + Lifecycle + Governance families | Operator sessions doing `memory_pending_*`, `memory_check_agent_action`, `memory_rule_list`, agent registration, lifecycle ops. |
 | `power` | core + Power family | Smart/autonomous tier deployments that want `memory_consolidate`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, `memory_check_duplicate`, `memory_inbox`, the subscription-reliability tools, etc. always available. |
-| `full` | every family — **103 advertised entries** (102 callable memory tools + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)) | Pre-v0.6.4 behavior 1:1, plus v0.7/v0.8/v0.9 additions. Canonical count asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. |
+| `full` | every family — **104 advertised entries** (103 callable memory tools + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)) | Pre-v0.6.4 behavior 1:1, plus v0.7/v0.8/v0.9 additions. Canonical count asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. |
 
 **v0.7 core additions:** `memory_load_family(family)` and `memory_smart_load(intent)` live in the Core family, so every named profile (all of which include core) advertises them. **They load MEMORIES tagged with a family — they do NOT register tools.** `memory_load_family` returns the top-k recent + high-priority memories whose `metadata.family` matches, and `memory_smart_load` picks the best-matching family from a free-text intent and forwards to it; neither mutates the tool registry or the resolved `Profile`, so neither makes an unloaded tool callable ([#2781](https://github.com/alphaonedev/ai-memory-mcp/issues/2781); the pre-#2781 sentence here claimed they "register additional families at runtime"). Restarting under a wider `--profile` is the only way to widen the callable tool surface. The pinned phrasings the agent sees live in [`v0.7/canonical-phrasings.md`](v0.7/canonical-phrasings.html).
 
@@ -902,6 +902,15 @@ For systemd, use `KillSignal=SIGINT` and `TimeoutStopSec=90`. This covers the
 default 30-second HTTP request grace period plus the bounded background-writer,
 webhook-delivery, deferred-audit drain, and final witness/checkpoint phases,
 leaving time for the visible exit-75 failure path.
+
+If the webhook-delivery drain misses its 30-second budget, webhook
+deliveries that had not started yet are recorded to the subscription DLQ
+(`last_error = "shutdown_unstarted"`, listed by
+`memory_subscription_dlq_list`) rather than dropped. The shutdown log line
+counts the started, DLQ-recorded and unrecordable deliveries (#3979). A
+crash or `SIGKILL` skips this step: webhook deliveries that had not started
+are lost, and neither replay nor the DLQ shows them. Use the graceful stop
+path above.
 
 > **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
 
@@ -1271,10 +1280,10 @@ These are written by the server; treat as read-only in queries:
 ### Transaction Safety
 
 Critical operations use `BEGIN IMMEDIATE` / `COMMIT` transactions to prevent data corruption under concurrent access:
-- **`touch()`** -- the read-modify-write cycle for access count, TTL extension, auto-promotion, and priority reinforcement is fully atomic
+- **`touch()`** -- the read-modify-write cycle for access count, `last_accessed_at` and the TTL floor extension is fully atomic (since v1.0.0 Boids item 1 it never changes tier or priority)
 - **`consolidate()`** -- the multi-step merge (create new memory, delete originals, aggregate tags) is fully atomic
 
-This prevents race conditions where two concurrent recalls could cause incorrect access counts or missed auto-promotions.
+This prevents race conditions where two concurrent recalls could cause incorrect access counts or a lost TTL extension.
 
 ### FTS Query Injection Protection
 
@@ -1676,7 +1685,7 @@ Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint
 
 Maximum request body size: **2 MiB** (`HTTP_BODY_LIMIT_BYTES` in `src/lib.rs`).
 
-The HTTP daemon exposes **100 production `.route(...)` registrations / 86 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.html) for the complete enumeration):
+The HTTP daemon exposes **103 production `.route(...)` registrations / 89 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=103` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.html) for the complete enumeration):
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -1831,7 +1840,7 @@ Note: `last_accessed_at` and `expires_at` are omitted from the JSON when null.
 
 #### GET /recall?context=... (Recall)
 
-Fuzzy OR search with ranked results. Automatically bumps access count, extends TTL, and auto-promotes frequently accessed mid-tier memories to long-term.
+Fuzzy OR search with ranked results. A pure read (#1953): it writes nothing to `memories` and appends one `recall_observations` ledger row; the periodic fold job later bumps the access count and extends the TTL floor. Recall never promotes a memory — `memory_promote` is the only verb that raises a tier.
 
 ```bash
 curl "https://127.0.0.1:9077/api/v1/recall?context=database+migration+postgres&namespace=infra&limit=5"
@@ -2346,7 +2355,9 @@ Preview using the same database and key directory as your deployment:
 
 ```bash
 ai-memory --db /path/to/memory.db keys --key-dir /path/to/keys prune --dry-run
-ai-memory keys --store-url "$AI_MEMORY_STORE_URL" --key-dir /path/to/keys prune --dry-run
+# store URL from AI_MEMORY_STORE_URL_FILE / AI_MEMORY_STORE_URL (src/cli/keys.rs:490); do not
+# copy it onto the command line, where its password is visible in ps (#4577)
+ai-memory keys --key-dir /path/to/keys prune --dry-run
 ```
 
 Omitting both flags also performs a dry run. After reviewing the candidate names,

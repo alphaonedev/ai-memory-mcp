@@ -547,10 +547,12 @@ fn postgres(
     include_public_only: bool,
     signer: &str,
 ) -> Result<Inventory> {
-    super::doctor::run_pg_probe(|| async {
+    // #4333 — the #3705 sslmode floor, before any socket opens.
+    let options = crate::store::postgres::dsn::floored_connect_options(url)?;
+    super::doctor::run_pg_probe(move || async move {
         use sqlx::Connection as _;
         let operation = async {
-            let mut conn = sqlx::PgConnection::connect(url).await?;
+            let mut conn = sqlx::PgConnection::connect_with(&options).await?;
             let mut tx = conn.begin().await?;
             if delete {
                 // Protect the entire _agents population against insertion,

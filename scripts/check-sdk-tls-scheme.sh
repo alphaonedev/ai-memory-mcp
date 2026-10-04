@@ -98,7 +98,7 @@ run_gate() {
                -o -name '*.json' -o -name '*.toml' -o -name '*.sh' \) \
             -not -path '*/node_modules/*' -not -path '*/dist/*' \
             -not -path '*/__pycache__/*' -not -path '*/.venv/*' \
-            2>/dev/null | sort
+            2>/dev/null | LC_ALL=C sort
     )
     if [[ "${#files[@]}" -eq 0 ]]; then
         printf 'FAIL: check-sdk-tls-scheme: scanned ZERO files under %s (gate would be a no-op, #2444)\n' "$sdk" >&2

@@ -28,9 +28,33 @@
 #   unmet ceremonies; certified modes NOT armed REFUSES to claim certified
 #   even though the bare verify is clean (the false-green MB1 closes).
 #
+#   LEG A is certified in TWO separately named shapes (#4333 R4 / #4434): the
+#   verify-full floor is only ever `Pinned` in a binary built WITH the
+#   `sal-postgres` driver (a driverless binary can never certify a pg posture,
+#   by design — fail-closed), so a single run on one binary cannot cover both.
+#     LEG A-pg         — `sal,sal-postgres` binary: certified pg config exits 0,
+#                        negative controls exit 2.
+#     LEG A-driverless — binary WITHOUT `sal-postgres`: the SAME config must
+#                        REFUSE (exit 2) and the failing posture ROW must be
+#                        AI_MEMORY_PG_AT_REST_ATTESTED (the row is asserted,
+#                        not merely a non-zero code).
+#   Each leg must print RUN; the gate FAILS if either did not run. Each binary
+#   is NON-VACUITY-probed through its own feature surface
+#   (`AI_MEMORY_NO_CONFIG=1 <bin> features --json`, parsed — never prose
+#   grep): A-pg's binary MUST list `sal-postgres`, A-driverless's MUST NOT. A
+#   missing / erroring / unparseable probe, or a swapped binary, is exit 3 with
+#   an INSTRUMENT ERROR naming #4434 and #2676.
+#
 # USAGE:
-#   scripts/check-bootstrap-cert-gate.sh          # build (if needed) + run
-#   AI_MEMORY_BIN=/path/to/ai-memory scripts/check-bootstrap-cert-gate.sh
+#   scripts/check-bootstrap-cert-gate.sh          # self-build both binaries + run
+#   AI_MEMORY_BIN_PG=/path/to/pg-binary \          # sal,sal-postgres build
+#   AI_MEMORY_BIN=/path/to/driverless-binary \     # build lacking sal-postgres
+#     scripts/check-bootstrap-cert-gate.sh
+#   scripts/check-bootstrap-cert-gate.sh --self-test   # stub-binary proof that
+#                                                      # the instrument fails closed
+#
+# Exit: 0 PASS; 1 a leg assertion failed; 3 INSTRUMENT ERROR (bad/missing/
+# swapped binary or probe, build failure).
 set -uo pipefail
 
 # #3117 — normalise to the STANDARD umask before creating ANY key directory.
@@ -53,37 +77,216 @@ set -uo pipefail
 # production keystore posture, which is correct as-is.
 umask 022
 
+
+# ── mode flags ──────────────────────────────────────────────────────────────
+# --self-test   stub-binary proof of the instrument (never touches real bins)
+# --probe-only  hidden: stop after the feature-surface probes (self-test hook)
+# --leg-a-only  hidden: run LEG A-pg + A-driverless, skip LEG B (self-test hook)
+SELF_TEST=0; PROBE_ONLY=0; LEG_A_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --self-test) SELF_TEST=1 ;;
+    --probe-only) PROBE_ONLY=1 ;;
+    --leg-a-only) LEG_A_ONLY=1 ;;
+    *) echo "unknown argument: $arg" >&2; exit 3 ;;
+  esac
+done
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SELF="$REPO_ROOT/scripts/$(basename "${BASH_SOURCE[0]}")"
 cd "$REPO_ROOT"
+
+python3 -c 'import json,sys' 2>/dev/null \
+  || { echo "INSTRUMENT ERROR: python3 is required to parse the feature probe and posture rows (#4434 #2676)"; exit 3; }
+
+# ── --self-test: STUB binaries only, writes only inside its own temp dir ────
+if [[ $SELF_TEST -eq 1 ]]; then
+  ST="$(mktemp -d)"
+  trap 'rm -rf "$ST"' EXIT
+  ST_FAIL=0
+  git_state() { git -C "$REPO_ROOT" status --porcelain 2>/dev/null | sha256sum; }
+  TREE_BEFORE="$(git_state)"
+
+  # mkstub <path> <features-json-body | RAW:<text> | ERR> <doctor-mode> <row-control>
+  #   doctor-mode: pgsim  = refuse unless attested AND sslmode=verify-full
+  #                fixed2 = always exit 2 failing <row-control>
+  #                zero   = always exit 0 (a driverless binary that certifies)
+  mkstub() {
+    local path="$1" feat="$2" mode="$3" row="$4"
+    {
+      echo '#!/usr/bin/env bash'
+      echo 'case "$1" in'
+      echo '  features)'
+      case "$feat" in
+        ERR) echo '    echo "stub: features probe unavailable" >&2; exit 1 ;;' ;;
+        RAW:*) printf '    printf %%s %q; exit 0 ;;\n' "${feat#RAW:}" ;;
+        *) printf '    printf %%s %q; exit 0 ;;\n' "$feat" ;;
+      esac
+      echo '  identity) case "$2" in export-pub) echo "AAAAstubpubkey";; esac; exit 0 ;;'
+      echo '  doctor)'
+      echo '    row() { printf "{\n  \"checks\": [\n    {\n      \"control\": \"%s\",\n      \"required\": \"r\",\n      \"actual\": \"a\",\n      \"pass\": %s,\n      \"remediation\": \"x\"\n    }\n  ]\n}\n" "$1" "$2"; }'
+      case "$mode" in
+        pgsim)
+          echo '    if [[ -n "${AI_MEMORY_PG_AT_REST_ATTESTED:-}" && "${AI_MEMORY_STORE_URL:-}" == *sslmode=verify-full* && -n "${AI_MEMORY_APPROVER_PUBKEYS:-}" ]]; then'
+          echo '      row "AI_MEMORY_PG_AT_REST_ATTESTED (postgres at-rest, COMPENSATING control)" true; exit 0'
+          echo '    fi'
+          echo '    row "AI_MEMORY_PG_AT_REST_ATTESTED (postgres at-rest, COMPENSATING control)" false; exit 2 ;;'
+          ;;
+        fixed2) printf '    row %q false; exit 2 ;;\n' "$row" ;;
+        zero)   printf '    row %q true; exit 0 ;;\n' "$row" ;;
+      esac
+      echo '  *) exit 0 ;;'
+      echo 'esac'
+    } > "$path"
+    chmod +x "$path"
+  }
+
+  F_PG='{"version":"1.0.0","features":["sal","sal-postgres","sqlite-bundled"]}'
+  F_ND='{"version":"1.0.0","features":["sal","sqlite-bundled"]}'
+  ROW_ATT='AI_MEMORY_PG_AT_REST_ATTESTED (postgres at-rest, COMPENSATING control)'
+  ROW_OTHER='AI_MEMORY_SOMETHING_ELSE (unrelated posture failure)'
+
+  # st_case <name> <expected-rc> <expected-text-or-""> <pg-stub> <nd-stub>
+  st_case() {
+    local name="$1" want="$2" text="$3" pgb="$4" ndb="$5" out rc
+    out="$(env TMPDIR="$ST" AI_MEMORY_CERT_EVIDENCE_DIR="$ST/evidence" \
+        AI_MEMORY_BIN_PG="$pgb" AI_MEMORY_BIN="$ndb" \
+        bash "$SELF" --leg-a-only 2>&1)"
+    rc=$?
+    if [[ $rc -eq $want ]] && { [[ -z "$text" ]] || grep -qF -- "$text" <<<"$out"; }; then
+      echo "[ST-OK]   $name: gate exit $rc (expected $want)${text:+, saw '$text'}"
+    else
+      echo "[ST-FAIL] $name: gate exit $rc (expected $want${text:+, text '$text'})"
+      sed 's/^/      | /' <<<"$out" | head -12
+      ST_FAIL=1
+    fi
+  }
+
+  mkdir -p "$ST/evidence"
+  mkstub "$ST/pg-good"   "$F_PG" pgsim  "$ROW_ATT"
+  mkstub "$ST/nd-good"   "$F_ND" fixed2 "$ROW_ATT"
+  mkstub "$ST/pg-nodrv"  "$F_ND" pgsim  "$ROW_ATT"
+  mkstub "$ST/nd-hasdrv" "$F_PG" fixed2 "$ROW_ATT"
+  mkstub "$ST/bin-garble" "RAW:this is not json {" fixed2 "$ROW_ATT"
+  mkstub "$ST/bin-nokey"  '{"version":"1.0.0"}' fixed2 "$ROW_ATT"
+  mkstub "$ST/bin-noprobe" ERR fixed2 "$ROW_ATT"
+  mkstub "$ST/nd-wrongrow" "$F_ND" fixed2 "$ROW_OTHER"
+  mkstub "$ST/nd-certifies" "$F_ND" zero "$ROW_ATT"
+  mkstub "$ST/pg-refuses" "$F_PG" fixed2 "$ROW_ATT"
+
+  echo "== --self-test: stub binaries, canned 'features --json' =="
+  st_case "positive control (right binaries)"          0 "CERT-BOOTSTRAP GATE LEG-A-ONLY: PASS" "$ST/pg-good" "$ST/nd-good"
+  st_case "A-pg binary WITHOUT sal-postgres"           3 "INSTRUMENT ERROR"          "$ST/pg-nodrv" "$ST/nd-good"
+  st_case "A-driverless binary WITH sal-postgres"      3 "INSTRUMENT ERROR"          "$ST/pg-good" "$ST/nd-hasdrv"
+  st_case "SWAPPED binaries"                           3 "INSTRUMENT ERROR"          "$ST/nd-good" "$ST/pg-good"
+  st_case "A-pg probe unparseable"                     3 "#2676"                     "$ST/bin-garble" "$ST/nd-good"
+  st_case "A-driverless probe unparseable"             3 "#2676"                     "$ST/pg-good" "$ST/bin-garble"
+  st_case "probe JSON lacks features key"              3 "#4434"                     "$ST/bin-nokey" "$ST/nd-good"
+  st_case "A-pg probe missing (binary errors)"         3 "INSTRUMENT ERROR"          "$ST/bin-noprobe" "$ST/nd-good"
+  st_case "A-driverless probe missing (binary errors)" 3 "INSTRUMENT ERROR"          "$ST/pg-good" "$ST/bin-noprobe"
+  st_case "A-pg binary not executable / absent"        3 "INSTRUMENT ERROR"          "$ST/does-not-exist" "$ST/nd-good"
+  st_case "driverless refuses on the WRONG row"        1 "[FAIL]"                    "$ST/pg-good" "$ST/nd-wrongrow"
+  st_case "driverless binary certifies (exit 0)"       1 "[FAIL]"                    "$ST/pg-good" "$ST/nd-certifies"
+  st_case "A-pg certified config does not reach 0"     1 "[FAIL]"                    "$ST/pg-refuses" "$ST/nd-good"
+
+  TREE_AFTER="$(git_state)"
+  if [[ "$TREE_BEFORE" == "$TREE_AFTER" ]]; then
+    echo "[ST-OK]   self-test left the working tree untouched"
+  else
+    echo "[ST-FAIL] self-test changed the working tree"; ST_FAIL=1
+  fi
+  if [[ $ST_FAIL -eq 0 ]]; then echo "CERT-BOOTSTRAP GATE SELF-TEST: PASS"; exit 0; fi
+  echo "CERT-BOOTSTRAP GATE SELF-TEST: FAIL"; exit 1
+fi
+
 # Absolute so the `cd "$WORK_B"` bring-up subshells below still resolve it.
-EVIDENCE_DIR="$REPO_ROOT/.local-runs/cert-bootstrap-evidence"
+EVIDENCE_DIR="${AI_MEMORY_CERT_EVIDENCE_DIR:-$REPO_ROOT/.local-runs/cert-bootstrap-evidence}"
 mkdir -p "$EVIDENCE_DIR"
 
 FAILED=0
 note() { printf '  %s\n' "$*"; }
 pass() { printf '[PASS] %s\n' "$*"; }
 fail() { printf '[FAIL] %s\n' "$*"; FAILED=1; }
+instrument_error() {
+  echo "INSTRUMENT ERROR: $*" >&2
+  echo "  (#4434: a driverless binary can never certify a pg posture; #2676: 'features --json' is the probe)" >&2
+  exit 3
+}
 
-# ── locate / build the binary ──────────────────────────────────────────────
-BIN="${AI_MEMORY_BIN:-}"
-if [[ -z "$BIN" ]]; then
-  echo "building ai-memory (default features)…"
-  cargo build --quiet --bin ai-memory || { echo "build failed"; exit 3; }
-  BIN="$REPO_ROOT/target/debug/ai-memory"
+# ── locate / build the TWO binaries ────────────────────────────────────────
+# A-pg needs `sal,sal-postgres`; A-driverless needs a binary lacking
+# `sal-postgres`. Separate target dirs so the two builds never clobber each
+# other's target/debug/ai-memory.
+BIN_PG="${AI_MEMORY_BIN_PG:-}"
+if [[ -z "$BIN_PG" ]]; then
+  echo "building ai-memory (--features sal,sal-postgres) for LEG A-pg…"
+  cargo build --quiet --bin ai-memory --features sal,sal-postgres \
+    --target-dir "$REPO_ROOT/target/cert-gate-pg" || { echo "build failed (A-pg)"; exit 3; }
+  BIN_PG="$REPO_ROOT/target/cert-gate-pg/debug/ai-memory"
 fi
-[[ -x "$BIN" ]] || { echo "binary not executable: $BIN"; exit 3; }
-echo "using binary: $BIN"
+BIN_ND="${AI_MEMORY_BIN:-}"
+if [[ -z "$BIN_ND" ]]; then
+  echo "building ai-memory (default features, no sal-postgres) for LEG A-driverless…"
+  cargo build --quiet --bin ai-memory \
+    --target-dir "$REPO_ROOT/target/cert-gate-driverless" || { echo "build failed (A-driverless)"; exit 3; }
+  BIN_ND="$REPO_ROOT/target/cert-gate-driverless/debug/ai-memory"
+fi
+[[ -x "$BIN_PG" ]] || { echo "INSTRUMENT ERROR: A-pg binary not executable: $BIN_PG" >&2; exit 3; }
+[[ -x "$BIN_ND" ]] || { echo "INSTRUMENT ERROR: A-driverless binary not executable: $BIN_ND" >&2; exit 3; }
+echo "A-pg binary:         $BIN_PG"
+echo "A-driverless binary: $BIN_ND"
+
+# NON-VACUITY: positive, PARSED probe of the binary's own feature surface.
+# Prints one feature per line; any failure to obtain a well-formed list is an
+# INSTRUMENT ERROR (never a silent pass).
+probe_features() {
+  local bin="$1" raw
+  raw="$(AI_MEMORY_NO_CONFIG=1 "$bin" features --json 2>/dev/null)" \
+    || instrument_error "'$bin features --json' failed (probe missing/erroring)"
+  printf '%s' "$raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+f = d["features"]
+if not isinstance(f, list) or not all(isinstance(x, str) for x in f):
+    raise SystemExit(1)
+print("\n".join(f))
+' 2>/dev/null || instrument_error "'$bin features --json' output is unparseable or lacks a features list"
+}
+FEATS_PG="$(probe_features "$BIN_PG")" || exit $?
+FEATS_ND="$(probe_features "$BIN_ND")" || exit $?
+has_feature() { grep -qxF -- "$2" <<<"$1"; }
+has_feature "$FEATS_PG" sal-postgres \
+  || instrument_error "A-pg binary '$BIN_PG' lacks the sal-postgres feature (features: $(tr '\n' ' ' <<<"$FEATS_PG"))"
+! has_feature "$FEATS_ND" sal-postgres \
+  || instrument_error "A-driverless binary '$BIN_ND' HAS the sal-postgres feature (swapped/mis-supplied binaries?)"
+echo "probe ok: A-pg features = [$(tr '\n' ' ' <<<"$FEATS_PG")]; A-driverless features = [$(tr '\n' ' ' <<<"$FEATS_ND")]"
+[[ $PROBE_ONLY -eq 1 ]] && { echo "probe-only: OK"; exit 0; }
 
 # A postgres DSN never connected (doctor --posture is env-only): the query
 # string is all that #15 machine-checks.
 PG_DSN_VERIFY_FULL="postgres://u@db.internal:5432/mem?sslmode=verify-full"
 PG_DSN_REQUIRE_ONLY="postgres://u@db.internal:5432/mem?sslmode=require"
 
-# ── LEG A — #3061 backend-aware #15, pg armability ─────────────────────────
-echo
-echo "== LEG A — #3061 pg posture armability =="
+# Failing posture rows (control names), one per line, parsed from the JSON.
+failing_rows() {
+  python3 -c '
+import json, sys
+def walk(x):
+    if isinstance(x, dict):
+        if "control" in x and x.get("pass") is False:
+            print(x["control"])
+        for v in x.values(): walk(v)
+    elif isinstance(x, list):
+        for v in x: walk(v)
+try:
+    walk(json.load(open(sys.argv[1])))
+except Exception:
+    raise SystemExit(1)
+' "$1"
+}
 
-# Shared certified env for a pg backend. asi-hard auto-pins the 30 knobs in
+# ── LEG A — #3061 backend-aware #15, pg armability ─────────────────────────
+# Shared certified env for a pg backend. asi-hard auto-pins the knobs in
 # the binary's pre-runtime phase (src/main.rs); the rest are the federation
 # additions the posture requires. A fingerprints file + attestation JSON +
 # trust domain satisfy checks #9/#10/#11/#12; append-only + a daemon audit
@@ -92,68 +295,75 @@ echo "== LEG A — #3061 pg posture armability =="
 # approver_keys` -> `resolve_operator_pubkey` walks BOTH the key dir and its
 # PARENT for an on-disk `operator.key.pub`, so a shared /tmp could otherwise
 # make the keyless negative control below silently un-negative on a dev host.
-WORK_A="$(mktemp -d)"
-KEYDIR_A="$WORK_A/keys"
-mkdir -p "$KEYDIR_A"
-FPFILE_A="$(mktemp)"
-printf 'example.org 0000000000000000000000000000000000000000000000000000000000000000\n' > "$FPFILE_A"
-# The daemon audit signing key for check #19 (resolve_agent_id honours
-# AI_MEMORY_AGENT_ID); generate it into the key dir.
-AGENT_A="cert-node-3061"
-env AI_MEMORY_KEY_DIR="$KEYDIR_A" AI_MEMORY_AGENT_ID="$AGENT_A" \
-  "$BIN" identity generate --agent-id "$AGENT_A" >/dev/null 2>&1 || true
-# #2991 check #20 — the certified config MUST enroll at least one R40
-# approver key so the wired L1-6 escalate producer routes to a SATISFIABLE
-# signed-approval gate (keyless, the producer's fail-closed guardrail would
-# block escalated writes forever). Mint a REAL Ed25519 key with the SAME
-# binary and enroll its pubkey — never a hardcoded literal.
-APPROVER_AGENT_A="cert-approver-2991"
-"$BIN" identity generate --agent-id "$APPROVER_AGENT_A" --key-dir "$KEYDIR_A" \
-  >/dev/null 2>&1 || true
-APPROVER_PUBKEY_A="$("$BIN" identity export-pub --agent-id "$APPROVER_AGENT_A" \
-  --key-dir "$KEYDIR_A" 2>/dev/null)"
-[[ -n "$APPROVER_PUBKEY_A" ]] || { echo "could not mint an R40 approver pubkey"; exit 3; }
+# leg_a_setup <bin> — mints the hermetic key material with THAT leg's binary.
+leg_a_setup() {
+  local bin="$1"
+  WORK_A="$(mktemp -d)"
+  KEYDIR_A="$WORK_A/keys"
+  mkdir -p "$KEYDIR_A"
+  FPFILE_A="$(mktemp)"
+  printf 'example.org 0000000000000000000000000000000000000000000000000000000000000000\n' > "$FPFILE_A"
+  # The daemon audit signing key for check #19 (resolve_agent_id honours
+  # AI_MEMORY_AGENT_ID); generate it into the key dir.
+  AGENT_A="cert-node-3061"
+  env AI_MEMORY_KEY_DIR="$KEYDIR_A" AI_MEMORY_AGENT_ID="$AGENT_A" \
+    "$bin" identity generate --agent-id "$AGENT_A" >/dev/null 2>&1 || true
+  # #2991 check #20 — the certified config MUST enroll at least one R40
+  # approver key so the wired L1-6 escalate producer routes to a SATISFIABLE
+  # signed-approval gate (keyless, the producer's fail-closed guardrail would
+  # block escalated writes forever). Mint a REAL Ed25519 key with the SAME
+  # binary and enroll its pubkey — never a hardcoded literal.
+  local approver="cert-approver-2991"
+  "$bin" identity generate --agent-id "$approver" --key-dir "$KEYDIR_A" \
+    >/dev/null 2>&1 || true
+  APPROVER_PUBKEY_A="$("$bin" identity export-pub --agent-id "$approver" \
+    --key-dir "$KEYDIR_A" 2>/dev/null)"
+  [[ -n "$APPROVER_PUBKEY_A" ]] || { echo "could not mint an R40 approver pubkey"; exit 3; }
+}
 
-posture_pg_env() {
-  # $1 = attestation value ("1" or ""), $2 = DSN,
-  # $3 = OPTIONAL override of the R40 approver enrollment assignment; pass ""
-  #      to strip it entirely (the #2991 check-#20 negative control).
+# posture_env <bin> <attest "1"|""> <dsn> [approver-assignment override]
+#   $4 = OPTIONAL override of the R40 approver enrollment assignment; pass ""
+#        to strip it entirely (the #2991 check-#20 negative control).
+posture_env() {
+  local bin="$1"
   env \
     AI_MEMORY_SECURITY_PROFILE=asi-hard \
     AI_MEMORY_FED_TRUST_DOMAIN=test-fleet \
     AI_MEMORY_FED_PEER_FINGERPRINTS="$FPFILE_A" \
     AI_MEMORY_FED_PEER_ATTESTATION='{"peer-1":{"allowed_namespaces":["public/*"]}}' \
-    AI_MEMORY_STORE_URL="$2" \
-    ${1:+AI_MEMORY_PG_AT_REST_ATTESTED=$1} \
+    AI_MEMORY_STORE_URL="$3" \
+    ${2:+AI_MEMORY_PG_AT_REST_ATTESTED=$2} \
     AI_MEMORY_APPEND_ONLY=1 \
     AI_MEMORY_KEY_DIR="$KEYDIR_A" \
     AI_MEMORY_AGENT_ID="$AGENT_A" \
-    ${3-AI_MEMORY_APPROVER_PUBKEYS=$APPROVER_PUBKEY_A} \
+    ${4-AI_MEMORY_APPROVER_PUBKEYS=$APPROVER_PUBKEY_A} \
     AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1 \
-    "$BIN" doctor --posture enterprise-federation --json
+    "$bin" doctor --posture enterprise-federation --json
 }
+
+RAN_A_PG=0
+RAN_A_DRIVERLESS=0
+
+# ── LEG A-pg — sal,sal-postgres binary: certify (exit 0) + negative controls
+echo
+echo "== LEG A-pg — #3061 pg posture armability (binary WITH sal-postgres) =="
+echo "LEG A-pg: RUN"
+leg_a_setup "$BIN_PG"
 
 # Certified pg config → doctor --posture exits 0, and #15 is the pg
 # compensating control (NOT the sqlcipher predicate).
 OUT_A="$EVIDENCE_DIR/pg-posture-pass.json"
 ERR_A="$EVIDENCE_DIR/pg-posture-pass.err"
-posture_pg_env 1 "$PG_DSN_VERIFY_FULL" > "$OUT_A" 2>"$ERR_A"
+posture_env "$BIN_PG" 1 "$PG_DSN_VERIFY_FULL" > "$OUT_A" 2>"$ERR_A"
 CODE_A=$?
 if [[ $CODE_A -eq 0 ]]; then
   pass "fresh pg node in the certified config: doctor --posture exit 0 (#3061 armable)"
 else
   fail "certified pg config did NOT reach exit 0 (got $CODE_A) — see $OUT_A"
-  # `run_posture --json` emits serde_json PRETTY output ("control": "…" with a
-  # space, one key per line), so the failing rows must be read line-wise — a
-  # compact-JSON grep silently matches NOTHING and leaves the auditor with a
-  # bare exit code. stderr is echoed too: a NON-doctor exit (e.g. a boot
-  # refusal) writes there and leaves this file empty, and that distinction is
-  # the whole diagnosis.
-  # PostureCheck pretty-prints control, required, actual, pass, remediation
-  # in that order. `-A 5` after `"pass": false` lands on the NEXT row's
-  # control (or nothing for a failing last row). `-B 4` is this row.
-  grep -B 4 '"pass": false' "$OUT_A" 2>/dev/null | grep '"control"' \
-    | sed 's/^/    FAIL-ROW /' || true
+  # Failing rows are parsed from the JSON (never grepped). stderr is echoed
+  # too: a NON-doctor exit (e.g. a boot refusal) writes there and leaves the
+  # JSON file empty, and that distinction is the whole diagnosis.
+  failing_rows "$OUT_A" 2>/dev/null | sed 's/^/    FAIL-ROW /' || true
   sed 's/^/    STDERR /' "$ERR_A" 2>/dev/null | head -20 || true
 fi
 # Both halves match the "control" FIELD (not any occurrence of the name in a
@@ -169,20 +379,23 @@ else
   fail "control #15 did not resolve to the pg compensating control on a postgres DSN"
 fi
 
-# NEGATIVE CONTROL 1 — drop the operator attestation → gate goes RED.
-posture_pg_env "" "$PG_DSN_VERIFY_FULL" > "$EVIDENCE_DIR/pg-posture-no-attest.json" 2>/dev/null
-if [[ $? -ne 0 ]]; then
-  pass "negative control: verify-full WITHOUT AI_MEMORY_PG_AT_REST_ATTESTED refuses (non-zero)"
+# NEGATIVE CONTROL 1 — drop the operator attestation → gate must refuse with
+# exit 2 (the posture refusal code), not merely any non-zero.
+posture_env "$BIN_PG" "" "$PG_DSN_VERIFY_FULL" > "$EVIDENCE_DIR/pg-posture-no-attest.json" 2>/dev/null
+RC=$?
+if [[ $RC -eq 2 ]]; then
+  pass "negative control: verify-full WITHOUT AI_MEMORY_PG_AT_REST_ATTESTED refuses (exit 2)"
 else
-  fail "the pg at-rest attestation is NOT load-bearing — posture passed without it"
+  fail "the pg at-rest attestation is NOT load-bearing — posture exit $RC without it (expected 2)"
 fi
 
-# NEGATIVE CONTROL 2 — weaken the DSN below verify-full → gate goes RED.
-posture_pg_env 1 "$PG_DSN_REQUIRE_ONLY" > "$EVIDENCE_DIR/pg-posture-weak-tls.json" 2>/dev/null
-if [[ $? -ne 0 ]]; then
-  pass "negative control: sslmode=require (not verify-full) + attestation refuses (non-zero)"
+# NEGATIVE CONTROL 2 — weaken the DSN below verify-full → gate must refuse (exit 2).
+posture_env "$BIN_PG" 1 "$PG_DSN_REQUIRE_ONLY" > "$EVIDENCE_DIR/pg-posture-weak-tls.json" 2>/dev/null
+RC=$?
+if [[ $RC -eq 2 ]]; then
+  pass "negative control: sslmode=require (not verify-full) + attestation refuses (exit 2)"
 else
-  fail "the sslmode=verify-full TLS half is NOT load-bearing — posture passed without it"
+  fail "the sslmode=verify-full TLS half is NOT load-bearing — posture exit $RC (expected 2)"
 fi
 
 # NEGATIVE CONTROL 3 (#2991 check #20) — strip the R40 approver enrollment
@@ -190,14 +403,59 @@ fi
 # required enrollment is LOAD-BEARING, not decorative, and pins the certified
 # config's #2991 half so a future control addition cannot silently drift the
 # gate's notion of "the certified pg config" again.
-posture_pg_env 1 "$PG_DSN_VERIFY_FULL" "" > "$EVIDENCE_DIR/pg-posture-no-approver.json" 2>/dev/null
-if [[ $? -ne 0 ]]; then
-  pass "negative control: certified pg config WITHOUT an enrolled R40 approver key refuses (non-zero)"
+posture_env "$BIN_PG" 1 "$PG_DSN_VERIFY_FULL" "" > "$EVIDENCE_DIR/pg-posture-no-approver.json" 2>/dev/null
+RC=$?
+if [[ $RC -eq 2 ]]; then
+  pass "negative control: certified pg config WITHOUT an enrolled R40 approver key refuses (exit 2)"
 else
-  fail "the #2991 approver-key enrollment is NOT load-bearing — posture passed without it"
+  fail "the #2991 approver-key enrollment is NOT load-bearing — posture exit $RC (expected 2)"
+fi
+rm -rf "$WORK_A" "$FPFILE_A"
+
+# ── LEG A-driverless — binary WITHOUT sal-postgres: must REFUSE, on the ROW ─
+RAN_A_PG=1   # set AFTER the leg body: the flag means "this leg finished its assertions"
+
+echo
+echo "== LEG A-driverless — #4333/#4434 driverless binary must REFUSE a pg posture =="
+echo "LEG A-driverless: RUN"
+leg_a_setup "$BIN_ND"
+OUT_D="$EVIDENCE_DIR/driverless-posture-refuse.json"
+posture_env "$BIN_ND" 1 "$PG_DSN_VERIFY_FULL" > "$OUT_D" 2>"$EVIDENCE_DIR/driverless-posture-refuse.err"
+RC=$?
+ROWS_D="$(failing_rows "$OUT_D" 2>/dev/null)"
+# N1 (f2r 2026-10-02, folded by GOD): the attested row must be the SOLE failing row, not merely
+# present. "Contained" would let the refusal be caused by something else entirely while this row
+# happens to appear. A SECOND failing row is therefore a red — and the message names the actual
+# set, so a future legitimate row is a self-describing review event, never a mystery red.
+ROWS_D_N="$(grep -c . <<<"${ROWS_D:-}" || true)"
+if [[ $RC -eq 2 ]] && grep -qE '^AI_MEMORY_PG_AT_REST_ATTESTED( |$)' <<<"$ROWS_D" && [[ "$ROWS_D_N" -eq 1 ]]; then
+  pass "driverless binary REFUSES the certified pg config: exit 2, SOLE FAIL-ROW AI_MEMORY_PG_AT_REST_ATTESTED (#4333 R4 fail-closed)"
+else
+  fail "driverless binary did not refuse on AI_MEMORY_PG_AT_REST_ATTESTED as the SOLE failing row (exit $RC; $ROWS_D_N failing row(s): ${ROWS_D:-none parsed}) — see $OUT_D"
+  sed 's/^/    FAIL-ROW /' <<<"$ROWS_D"
+fi
+rm -rf "$WORK_A" "$FPFILE_A"
+
+RAN_A_DRIVERLESS=1   # likewise: set only once the driverless leg has finished its assertions
+
+# f2r 2026-10-02: as first written the flags were set at each leg's BANNER, so this guard was
+# unreachable and I wrongly cited it as a tested property. The flags now mean "the leg finished",
+# so an early return inside a leg body reaches this check. It remains a TRIPWIRE for future edits
+# (no current path returns early), and it is NOT cited as evidence in the landing record.
+if [[ $RAN_A_PG -ne 1 || $RAN_A_DRIVERLESS -ne 1 ]]; then
+  fail "a LEG A shape did not RUN (A-pg=$RAN_A_PG A-driverless=$RAN_A_DRIVERLESS) — a skipped leg is never green"
 fi
 
-rm -rf "$WORK_A" "$FPFILE_A"
+if [[ $LEG_A_ONLY -eq 1 ]]; then
+  echo
+  # N2 (f2r 2026-10-02, folded by GOD): a partial run must never print the full-gate verdict —
+  # "CERT-BOOTSTRAP GATE: PASS" from a --leg-a-only run could be quoted as a full gate pass.
+  if [[ $FAILED -eq 0 ]]; then echo "CERT-BOOTSTRAP GATE LEG-A-ONLY: PASS (LEG B not run; NOT a full-gate pass)"; exit 0; fi
+  echo "CERT-BOOTSTRAP GATE LEG-A-ONLY: FAIL"; exit 1
+fi
+
+# LEG B is sqlite-only; run it with the superset (pg) binary.
+BIN="$BIN_PG"
 
 # ── LEG B — #3016/#3067 born-dirty → mechanical bring-up (asi-hard) ─────────
 echo

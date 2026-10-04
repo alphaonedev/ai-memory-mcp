@@ -1,0 +1,17 @@
+# cert-8714a984a §5.4(4)/(7) acceptance battery — exact test result lines (2026-10-04, 8714a984a, default features)
+# eight named integration binaries:
+boot_fail_closed_config_3166	test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+doctor_posture_exit_code_3003	test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+doctor_synchronous_posture_3553	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+federation_catchup_posture_3582	test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.64s
+federation_namespace_gate_3582	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+federation_peer_posture_3582	test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+federation_write_ns_scope_2447	test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.13s
+posture_control15_pg_resolution_3106	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+# three lib-slice invocations (each its OWN cargo test --lib <filter>):
+enterprise_federation_posture  test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 8882 filtered out; finished in 0.06s
+federation::peer_posture  test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 8914 filtered out; finished in 0.02s
+cli::backup::tests  test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 8838 filtered out; finished in 41.78s
+# #4434 coverage leg (--features sal-postgres): the cells #4434 gated behind sal-postgres, run under that feature:
+posture_control15_pg_resolution_3106 [sal-postgres]	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+enterprise_federation_posture [sal-postgres]  test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 9546 filtered out; finished in 0.07s

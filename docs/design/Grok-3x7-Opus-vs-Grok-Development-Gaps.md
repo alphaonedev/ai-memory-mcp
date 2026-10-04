@@ -1,5 +1,7 @@
 # Grok 3×7 — Opus vs Grok: Development Gaps (Reconciliation)
 
+> **Point-in-time record, dated 2026-06-28.** The src/ file:line references in this document refer to the source tree as of that date and are not maintained, so they may not match the current code.
+
 **Assessment date:** 2026-06-28  
 **Method:** Second 21-lens council (3 waves × 7) merging two gap catalogs against **CodeGraph** + [`TRACT-the-definitive-endpoint-ai-memory.md`](TRACT-the-definitive-endpoint-ai-memory.md).  
 **Inputs:**

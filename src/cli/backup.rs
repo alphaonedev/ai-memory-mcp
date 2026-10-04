@@ -1388,43 +1388,21 @@ fn run_backup_with(
     // SQLite VACUUM INTO is hot-backup-safe and produces a defragmented
     // file. Equivalent to `sqlite3 source '.backup dest'` in effect but
     // runs in-process via our existing connection.
-    // v1.0.0 #2445 — EGRESS FALLBACK. `db::open` now REFUSES a database whose
-    // schema is ahead of this binary, and that refusal must never cost the
-    // operator their backup: snapshotting the durable text is the FIRST thing
-    // a competent operator does in exactly this incident, and `VACUUM INTO`
-    // copies bytes it does not have to understand. So on that ONE typed error
-    // we re-open through the unmigrated funnel (no bootstrap DDL, no ladder,
-    // no trigger install) and proceed. Every other open failure still
-    // propagates. `open_read_only` cannot serve this path — `PRAGMA
-    // query_only = ON` refuses `VACUUM INTO` (verified, not assumed).
-    //
-    // v1.0.0 #2564 — the ZEROED-stamp refusal takes the SAME fallback, and it
-    // needs it even more urgently. That refusal's operator message states
-    // "`ai-memory backup` continues to operate against this database, so
-    // snapshot it before doing anything else"; without this arm that sentence
-    // would be a lie and the one instruction we give the operator in a
-    // destroyed-stamp incident would fail. The two refusals share the exact
-    // property that makes the fallback sound: neither says the BYTES are
-    // untrustworthy, only that this binary must not MIGRATE them, and
-    // `VACUUM INTO` copies bytes it does not have to understand.
-    let conn = match db::open(&source_db) {
-        Ok(conn) => conn,
-        Err(e)
-            if crate::storage::schema_guard::schema_ahead_of(&e).is_some()
-                || crate::storage::schema_guard::schema_stamp_zeroed(&e).is_some() =>
-        {
-            tracing::warn!(
-                target: crate::storage::schema_guard::TRACE_TARGET,
-                error = %e,
-                "this binary refuses to MIGRATE this database (schema ahead of the \
-                 binary, or a destroyed version stamp) — taking the snapshot anyway \
-                 through the read-oriented funnel so the durable text is preserved"
-            );
-            db::open_unmigrated(&source_db)
-                .context("opening source DB for backup (schema-refusal fallback)")?
-        }
-        Err(e) => return Err(e.context("opening source DB for backup")),
-    };
+    // v1.0.0 #4207 — a backup only COPIES data out and must never change the
+    // database it copies, so the source is ALWAYS opened through the unmigrated
+    // egress funnel (#2445): no bootstrap DDL, no migration ladder, no
+    // pre-migration snapshot, no lineage-watermark write, no rollback-evidence
+    // append. Through the migrating `db::open` the hourly `ai-memory-backup`
+    // timer — which runs whatever binary is on disk — would upgrade a live
+    // primary under a still-running OLDER daemon, the exact schema-ahead state
+    // the downgrade guard exists to refuse. This funnel is also the path the
+    // schema-ahead (#2445) and zeroed-stamp (#2564) refusals of `db::open`
+    // needed as a fallback: `VACUUM INTO` copies bytes it does not have to
+    // understand, so one opener now serves every posture. The manifest below
+    // still records the OBSERVED schema version. `open_read_only` cannot serve
+    // this path — `PRAGMA query_only = ON` refuses `VACUUM INTO` (verified).
+    let conn =
+        db::open_unmigrated(&source_db).context("opening source DB for backup (unmigrated)")?;
     // #2444 — provenance recorded INTO the manifest so the artifact is
     // self-describing: which backend produced it, which migration ladder it is
     // on, and how many memories it actually contains.
@@ -1435,13 +1413,17 @@ fn run_backup_with(
             |r| r.get(0),
         )
         .context("counting memories in the source DB")?;
-    let schema_version: i64 = conn
-        .query_row(
-            crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL,
-            [],
-            |r| r.get(0),
-        )
-        .context("reading the source DB schema version")?;
+    // v1.0.0 #4323 — read the stamp through the tri-state probe, never a bare
+    // `SELECT … FROM schema_version`. A populated store whose relation was
+    // DROPPED (not merely emptied) is exactly the #2564 incident whose refusal
+    // tells the operator to back up first; the bare query failed with
+    // `no such table` there and produced no snapshot. The manifest records the
+    // DIAGNOSTIC reading (`version()`): an absent or destroyed stamp lands as
+    // an explicit 0 (or its raw negative value), the same value the
+    // `DELETE FROM schema_version` shape always recorded.
+    let schema_version: i64 = crate::storage::probe_schema_stamp(&conn)
+        .context("reading the source DB schema version")?
+        .version();
     let ts = chrono::Utc::now().format(BACKUP_TS_FMT).to_string();
     let snapshot_name = format!("ai-memory-{ts}.db");
     let snapshot_path = args.to.join(&snapshot_name);

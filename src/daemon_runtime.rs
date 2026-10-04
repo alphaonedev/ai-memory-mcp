@@ -3143,19 +3143,17 @@ pub async fn run(
     // `std::process::exit` — not-found, governance Deny — do so BEFORE any
     // dispatch, so no admitted delivery can be stranded by that route.)
     //
-    // Severity is a WARN, never an error: the durable write already
-    // happened, and the per-delivery audit row is persisted BEFORE the
-    // network send, so a K7 replay-from-cursor can re-deliver whatever the
-    // deadline truncated. Turning a delivery deadline into a non-zero exit
-    // would misreport a committed write as a failure.
-    if !crate::subscriptions::drain_dispatches(crate::subscriptions::shutdown_drain_timeout()).await
-    {
-        tracing::warn!(
-            "webhook fan-out did not drain within the shutdown budget; the write(s) are \
-             durable and every admitted delivery has a persisted audit row — replay from \
-             the subscription cursor to re-deliver"
-        );
-    }
+    // Severity is a WARN, never an error: the durable write already happened,
+    // and a non-zero exit would misreport a committed write as a failure. On
+    // a miss, deliveries already started have their audit row (replay from
+    // the cursor); ones not yet started were DLQ-recorded by the drain and the
+    // WARN counts both (#3979). A crash never reaches this line, and loses
+    // every not-yet-started delivery: only its in-memory registration exists.
+    crate::subscriptions::drain_dispatches_with_report(
+        crate::subscriptions::shutdown_drain_timeout(),
+    )
+    .await
+    .log_miss("one-shot CLI");
 
     result
 }
@@ -6488,6 +6486,7 @@ pub async fn bootstrap_serve(
     let resolved_ttl = app_config.effective_ttl();
     let archive_on_gc = app_config.effective_archive_on_gc();
     let conn = db::open(db_path)?;
+    db::boot_warn_corrupt_governance_standards(&conn); // #4285
     // v1.0.0 #3700 — read the sqlite agent registry while the connection is
     // still ours (it moves into the shared `Db` state below); the shape gate
     // consumes it after the SAL handle is built. A registry that cannot be
@@ -8493,12 +8492,15 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // #3403 — the SHARED drain (`subscriptions::drain_dispatches`), also
-    // used by the one-shot CLI epilogue in `run`. The daemon's severity is
-    // FATAL: a late delivery worker could write after the final audit
-    // checkpoint.
-    if !crate::subscriptions::drain_dispatches(crate::subscriptions::shutdown_drain_timeout()).await
-    {
+    // #3403 — the SHARED drain, also run by the one-shot CLI epilogue. FATAL
+    // here: a late worker could write after the final audit checkpoint. #3979:
+    // a miss first DLQ-records every delivery not yet started, and logs counts.
+    let drain = crate::subscriptions::drain_dispatches_with_report(
+        crate::subscriptions::shutdown_drain_timeout(),
+    )
+    .await;
+    drain.log_miss("daemon");
+    if !drain.drained {
         return Err(fatal_shutdown(
             "subscription dispatch shutdown deadline exceeded",
         ));
@@ -9552,6 +9554,10 @@ fn _imports_in_use(_: Instant, _: Duration) {}
 mod daemon_runtime_shutdown_tests;
 
 #[cfg(test)]
+#[path = "daemon_runtime_1579_tests.rs"]
+mod daemon_runtime_1579_tests;
+
+#[cfg(test)]
 #[allow(deprecated)] // DOC-6: tests intentionally exercise legacy AppConfig flat fields
 mod tests {
     use super::*;
@@ -9844,80 +9850,6 @@ mod tests {
             + chrono::Duration::seconds(PULL_CURSOR_FUTURE_SKEW_SECS - 30))
         .to_rfc3339();
         assert!(validate_pull_cursor(&slightly_ahead, None).is_ok());
-    }
-
-    /// #1579 A3 (SECURITY) — regression pin: the Postgres SAL boot
-    /// path must log the REDACTED store URL. Pre-fix,
-    /// `build_store_handle` interpolated the raw `--store-url`
-    /// (password included) into the INFO boot line, shipping the
-    /// credential to journald / any log sink. The INFO line fires
-    /// before the connect attempt, so an unreachable port (`:1`)
-    /// still exercises the log site; the connect error itself is
-    /// expected and asserted as `Err`.
-    #[cfg(feature = "sal-postgres")]
-    #[tokio::test]
-    async fn issue_1579_a3_boot_log_redacts_store_url_password() {
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone, Default)]
-        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for SharedBuf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("buf lock").extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let buf = SharedBuf::default();
-        let writer_buf = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .with_writer(move || writer_buf.clone())
-            .finish();
-        // Thread-local default — `#[tokio::test]` runs the future on
-        // the current thread, so every log the boot path emits during
-        // the await lands in `buf`.
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let secret = "sup3r-s3cret-pw";
-        let url = format!("postgres://ai_memory:{secret}@127.0.0.1:1/ai_memory");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("unused.db");
-        let res = build_store_handle(
-            Some(&url),
-            &db_path,
-            None,
-            Some(384),
-            false,
-            crate::store::PoolConfig::default(),
-        )
-        .await;
-        assert!(res.is_err(), "port 1 must refuse the connection");
-
-        let logs = String::from_utf8_lossy(&buf.0.lock().expect("buf lock")).to_string();
-        // #3711 — the boot line renders the store URL through `url_display`
-        // (origin + path, userinfo DROPPED), not the old `ai_memory:****@`
-        // masker. PRESENT-plus-ABSENT on the same sink: the line must still
-        // be emitted with the allowlisted rendering, AND neither the password
-        // nor the username may appear anywhere in the log — an absence-only
-        // assertion would pass just as well if the boot line stopped being
-        // emitted at all.
-        assert!(
-            logs.contains("opening Postgres SAL store at postgres://127.0.0.1:1/ai_memory"),
-            "boot line must log the allowlist-rendered URL; got:\n{logs}"
-        );
-        assert!(
-            !logs.contains(secret),
-            "store-URL password leaked into the boot log:\n{logs}"
-        );
-        assert!(
-            !logs.contains("://ai_memory") && !logs.contains("@127.0.0.1"),
-            "store-URL userinfo (username or masker) leaked into the boot log:\n{logs}"
-        );
     }
 
     /// #1693 — `dispatch_recover_previous_session` routes a `None` /

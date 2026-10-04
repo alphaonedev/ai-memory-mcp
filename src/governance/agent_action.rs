@@ -432,6 +432,26 @@ pub fn matcher_status(rule: &Rule, action: &AgentAction) -> MatcherStatus {
     if matcher_is_inert_for_kind(&rule.kind, &matcher) {
         return MatcherStatus::Inert;
     }
+    if let AgentAction::NetworkRequest { host, scheme } = action {
+        // The evaluated host is canonicalised ONCE per rule here and the
+        // result handed to the matcher (no second pass).
+        let Ok(request) = crate::governance::host::canonicalize_host(host) else {
+            // #4300 — the evaluated host cannot be canonicalised (empty label,
+            // whitespace/control/NUL, over-long, bad IDNA...). Never allow by
+            // default: it matches every BLOCKING network_request rule (so a
+            // deny is never skipped by a malformed spelling) and no warn/log
+            // rule.
+            return match Severity::from_str(&rule.severity) {
+                Some(Severity::Refuse | Severity::Escalate) => MatcherStatus::Applies,
+                _ => MatcherStatus::DoesNotApply,
+            };
+        };
+        return if match_network_canonical(&matcher, &request, scheme) {
+            MatcherStatus::Applies
+        } else {
+            MatcherStatus::DoesNotApply
+        };
+    }
     if matcher_applies_inner(&matcher, action) {
         MatcherStatus::Applies
     } else {
@@ -562,6 +582,14 @@ fn matcher_is_inert_for_kind(kind: &str, matcher: &serde_json::Value) -> bool {
     let Some(obj) = matcher.as_object() else {
         return true;
     };
+    if kind == action_kinds::NETWORK_REQUEST
+        && let Some(host) = obj.get("host").and_then(|v| v.as_str())
+        && crate::governance::host::canonicalize_host_pattern(host).is_err()
+    {
+        // #4300 — a host pattern that cannot be canonicalised can never match
+        // a canonical host: INERT, so a blocking rule fails closed (#3031).
+        return true;
+    }
     !required
         .iter()
         .any(|(name, kind)| obj.get(*name).is_some_and(|v| kind.accepts(v)))
@@ -645,6 +673,16 @@ pub fn validate_matcher_for_kind(kind: &str, matcher: &serde_json::Value) -> Res
             render_key_set(required)
         ));
     }
+    if kind == action_kinds::NETWORK_REQUEST
+        && let Some(host) = obj.get("host").and_then(|v| v.as_str())
+        && let Err(e) = crate::governance::host::canonicalize_host_pattern(host)
+    {
+        return Err(format!(
+            "matcher for kind {kind:?} key \"host\" is not a valid host pattern ({e}); \
+             the engine canonicalises hosts (lowercase, one trailing dot, A-label) and \
+             could never match it (silently INERT)"
+        ));
+    }
     Ok(())
 }
 
@@ -683,7 +721,9 @@ fn matcher_applies_inner(matcher: &serde_json::Value, action: &AgentAction) -> b
     match action {
         AgentAction::Bash { command, .. } => match_bash(matcher, command),
         AgentAction::FilesystemWrite { path, .. } => match_filesystem_write(matcher, path),
-        AgentAction::NetworkRequest { host, .. } => match_network_request(matcher, host),
+        AgentAction::NetworkRequest { host, scheme } => {
+            match_network_request(matcher, host, scheme)
+        }
         AgentAction::ProcessSpawn { binary, args } => match_process_spawn(matcher, binary, args),
         AgentAction::Custom {
             custom_kind,
@@ -826,20 +866,51 @@ fn match_filesystem_write(matcher: &serde_json::Value, path: &std::path::Path) -
     crate::governance::glob_matches(glob, &path_str)
 }
 
-fn match_network_request(matcher: &serde_json::Value, host: &str) -> bool {
+fn match_network_request(matcher: &serde_json::Value, host: &str, scheme: &str) -> bool {
+    // #4300 — canonicalise BOTH sides through the one shared function before
+    // the glob engine runs (ASCII-lowercase, one trailing root dot, A-label,
+    // canonical IPs; see `governance::host`). Pre-fix the comparison was
+    // byte-literal, so `EVIL.example.com` / `evil.example.com.` slipped past a
+    // `refuse` rule for `evil.example.com` (fail-open).
+    //
+    // Fail closed: an un-canonicalisable pattern or host NEVER matches here.
+    // The engine routes both cases to a blocking outcome in
+    // [`matcher_status`] (inert pattern, #3031; invalid host, #4300) before
+    // this function is reached, so `false` is only the defense-in-depth arm.
+    //
+    // Glob semantics are unchanged: a plain host matches exactly, `*` spans
+    // any run of bytes (dots included), so `*.example.com` matches a
+    // subdomain at any depth but not the bare apex.
+    let Ok(request) = crate::governance::host::canonicalize_host(host) else {
+        return false;
+    };
+    match_network_canonical(matcher, &request, scheme)
+}
+
+/// [`match_network_request`] with the request already canonicalised (so
+/// [`matcher_status`] canonicalises it once per evaluation, not per rule pass).
+fn match_network_canonical(
+    matcher: &serde_json::Value,
+    request: &crate::governance::host::CanonHost,
+    scheme: &str,
+) -> bool {
     let Some(target_host) = matcher.get("host").and_then(|v| v.as_str()) else {
         return false;
     };
-    // Glob match on host (same engine as the filesystem `glob` matcher).
-    // A plain host with no `*` matches exactly — so pre-existing exact-host
-    // rules are unchanged — while `*.example.com`-style patterns now fire
-    // as the operator intended. Pre-fix this was a literal `==`, so a glob
-    // host pattern silently never matched: a DENY rule written as
-    // `{"host":"*.evil.example.com"}` would fail-OPEN, letting every
-    // subdomain through the gate. Hostnames contain no `/`, so the
-    // single-`*` (segment-bounded) and `**` (cross-segment) forms behave
-    // identically here.
-    crate::governance::glob_matches(target_host, host)
+    let Ok(pattern) = crate::governance::host::canonicalize_host_pattern(target_host) else {
+        return false;
+    };
+    // #4414 — a portless rule matches any port; a port rule needs the same
+    // effective port (explicit, else the scheme default).
+    if !crate::governance::host::port_matches(pattern.port(), request.port(), scheme) {
+        return false;
+    }
+    // #4300 — match the A-label form AND (when it differs) the Unicode form,
+    // so an in-label ASCII wildcard (`evil*.com`) still catches `evilü.com`.
+    crate::governance::glob_matches(pattern.host(), request.host())
+        || request
+            .unicode_form()
+            .is_some_and(|u| crate::governance::glob_matches(pattern.host(), &u))
 }
 
 fn match_process_spawn(matcher: &serde_json::Value, binary: &str, args: &[String]) -> bool {
@@ -1028,6 +1099,11 @@ pub struct RuleEngine {
     /// wraps a fresh `Vec` in `Arc::new`; cache hits clone the
     /// `Arc` (refcount bump, no row data copy).
     rules: Arc<Vec<Rule>>,
+    /// #4044 — the governance policy version `rules` were read under, in the
+    /// SAME read snapshot. `Some` for every attributed load (and every cached
+    /// load); `None` for the un-cached no-audit load and [`Self::from_rules`].
+    /// A signed verdict names THIS version — never one read after evaluation.
+    policy: Option<crate::governance::policy_version::PolicyVersion>,
 }
 
 impl RuleEngine {
@@ -1066,17 +1142,61 @@ impl RuleEngine {
         action: &AgentAction,
     ) -> Result<Self> {
         let kind = action.kind();
-        let rules = if let Some(c) = cache {
-            c.get_or_load(conn, kind).with_context(|| {
+        if let Some(c) = cache {
+            let (rules, policy) = c.get_or_load_attributed(conn, kind).with_context(|| {
                 format!("RuleEngine::load_for_action_cached: get_or_load({kind})")
+            })?;
+            return Ok(Self {
+                rules,
+                policy: Some(policy),
+            });
+        }
+        let v = crate::governance::rules_store::list_enabled_by_kind(conn, kind).with_context(
+            || format!("RuleEngine::load_for_action: list_enabled_by_kind({kind})"),
+        )?;
+        Ok(Self {
+            rules: Arc::new(v),
+            policy: None,
+        })
+    }
+
+    /// #4044 — load the rules for `action` TOGETHER with the governance
+    /// policy version they belong to, in ONE read snapshot (a cache hit
+    /// returns the pair cached together). Every path that SIGNS a policy
+    /// version into a verdict loads through here.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any SQLite / signature-verify / canonicalisation error.
+    pub fn load_for_action_attributed(
+        conn: &Connection,
+        cache: Option<&RuleCache>,
+        action: &AgentAction,
+    ) -> Result<Self> {
+        let kind = action.kind();
+        let (rules, policy) = if let Some(c) = cache {
+            c.get_or_load_attributed(conn, kind).with_context(|| {
+                format!("RuleEngine::load_for_action_attributed: get_or_load({kind})")
             })?
         } else {
-            let v = crate::governance::rules_store::list_enabled_by_kind(conn, kind).with_context(
-                || format!("RuleEngine::load_for_action: list_enabled_by_kind({kind})"),
-            )?;
-            Arc::new(v)
+            let (v, pv) =
+                crate::governance::policy_version::load_rules_with_policy_version(conn, kind)
+                    .with_context(|| {
+                        format!("RuleEngine::load_for_action_attributed: load({kind})")
+                    })?;
+            (Arc::new(v), pv)
         };
-        Ok(Self { rules })
+        Ok(Self {
+            rules,
+            policy: Some(policy),
+        })
+    }
+
+    /// #4044 — the policy version the loaded rules belong to (same snapshot),
+    /// or `None` when the engine was not loaded attributed.
+    #[must_use]
+    pub fn policy_version(&self) -> Option<crate::governance::policy_version::PolicyVersion> {
+        self.policy
     }
 
     /// Construct an engine directly from a pre-loaded rules slice.
@@ -1086,6 +1206,7 @@ impl RuleEngine {
     pub fn from_rules(rules: Vec<Rule>) -> Self {
         Self {
             rules: Arc::new(rules),
+            policy: None,
         }
     }
 
@@ -1267,16 +1388,42 @@ pub fn check_agent_action_cached(
     agent_id: &str,
     action: &AgentAction,
 ) -> Result<Decision> {
-    let engine = RuleEngine::load_for_action_cached(conn, cache, action).with_context(|| {
-        format!(
-            "check_agent_action_cached: load engine for {}",
-            action.kind()
-        )
-    })?;
+    check_agent_action_attributed(conn, cache, agent_id, action).map(|(decision, _)| decision)
+}
+
+/// #4044 — [`check_agent_action_cached`] that also returns the governance
+/// policy version that EVALUATED the verdict: the rules and the version are
+/// read in ONE snapshot ([`RuleEngine::load_for_action_attributed`]) and that
+/// same version is what the judge-signed verdict binds. A concurrent signed
+/// rule change (another connection or process) can therefore never make a
+/// verdict evaluated under policy P0 carry P1's sequence/digest.
+///
+/// Callers that sign a further artefact about this verdict (the CLI
+/// stopper enforcement anchor) MUST bind the returned version, not re-read.
+///
+/// # Errors
+///
+/// Returns an error if the SQLite query fails or the audit emit fails.
+pub fn check_agent_action_attributed(
+    conn: &Connection,
+    cache: Option<&RuleCache>,
+    agent_id: &str,
+    action: &AgentAction,
+) -> Result<(Decision, crate::governance::policy_version::PolicyVersion)> {
+    let engine =
+        RuleEngine::load_for_action_attributed(conn, cache, action).with_context(|| {
+            format!(
+                "check_agent_action_attributed: load engine for {}",
+                action.kind()
+            )
+        })?;
+    let policy = engine
+        .policy_version()
+        .context("check_agent_action_attributed: attributed load carried no policy version")?;
     let decision = engine.evaluate(agent_id, action);
-    emit_check_event(conn, agent_id, action, &decision)?;
+    emit_check_event(conn, agent_id, action, &decision, &policy)?;
     emit_forensic_decision(agent_id, action, &decision);
-    Ok(decision)
+    Ok((decision, policy))
 }
 
 /// #3647 — the forensic commitment preimage: the same `{action, decision}`
@@ -1332,6 +1479,7 @@ fn emit_check_event(
     agent_id: &str,
     action: &AgentAction,
     decision: &Decision,
+    policy: &crate::governance::policy_version::PolicyVersion,
 ) -> Result<()> {
     // #3818 (5-agent vote `4d3ea1c5`, #3818 comments 5774193216 + 5774241939) —
     // under an ENGAGED record-stop the `governance.check` row is a record-plane
@@ -1363,6 +1511,22 @@ fn emit_check_event(
                 scope = %scope,
                 "#3818: governance.check audit row SUPPRESSED under record-stop \
                  (verdict returned; forensic emit live; resume clears)"
+            );
+            return Ok(());
+        }
+        Err(crate::storage::StorageError::AuditTrailUnavailable { .. }) => {
+            // #4465 — the flat audit trail failed under
+            // AI_MEMORY_REQUIRE_AUDIT_TRAIL (#4400): the gate refuses every
+            // record-plane write in this process, this signed row included.
+            crate::metrics::inc_governance_check_audit_suppressed();
+            tracing::warn!(
+                target: crate::governance::GOVERNANCE_RULES_TRACE_TARGET,
+                agent_id,
+                kind = action.kind(),
+                "#4465: governance.check audit row SUPPRESSED — the flat audit trail \
+                 is not recording and {} is set (verdict returned; forensic emit \
+                 live; clears when the trail records again)",
+                crate::audit::REQUIRE_AUDIT_TRAIL_ENV
             );
             return Ok(());
         }
@@ -1423,7 +1587,7 @@ fn emit_check_event(
     // verdict (allow AND block) when a judge key is enrolled. Fire-and-forget:
     // a failure NEVER fails the audit append. Opt-in: no judge key → no-op
     // (byte-identical legacy).
-    maybe_emit_governance_verdict(conn, agent_id, action, decision);
+    maybe_emit_governance_verdict(conn, agent_id, action, decision, policy);
     Ok(())
 }
 
@@ -1434,8 +1598,9 @@ fn maybe_emit_governance_verdict(
     agent_id: &str,
     action: &AgentAction,
     decision: &Decision,
+    policy: &crate::governance::policy_version::PolicyVersion,
 ) {
-    if let Err(e) = try_emit_governance_verdict(conn, agent_id, action, decision) {
+    if let Err(e) = try_emit_governance_verdict(conn, agent_id, action, decision, policy) {
         tracing::warn!("governance verdict checkpoint emission failed (swallowed): {e:#}");
     }
 }
@@ -1447,6 +1612,7 @@ fn try_emit_governance_verdict(
     agent_id: &str,
     action: &AgentAction,
     decision: &Decision,
+    pv: &crate::governance::policy_version::PolicyVersion,
 ) -> Result<()> {
     let Some(keypair) = crate::governance::audit::load_judge_signing_key()? else {
         return Ok(()); // opt-in: no judge key enrolled → no-op.
@@ -1455,11 +1621,13 @@ fn try_emit_governance_verdict(
     let action_bytes = action.canonical_bytes()?;
     let action_hash = crate::governance::audit::action_hash_hex(&action_bytes);
     let now = chrono::Utc::now().timestamp();
-    // v0.9.0 §25.3 S4 (F-41) — bind the live governance policy version
-    // that evaluated this verdict. The governance rules DB is always the
-    // sqlite `conn` here (Postgres ships no governance_rules table), so
-    // this reads the single source of truth on all backends.
-    let pv = crate::governance::policy_version::current_policy_version(conn)?;
+    // v0.9.0 §25.3 S4 (F-41) — bind the governance policy version that
+    // evaluated this verdict. #4044: `pv` was read in the SAME snapshot as the
+    // evaluated rules (see `RuleEngine::load_for_action_attributed`); it is
+    // NOT re-read here, because a signed rule change committed between the
+    // evaluation and this point would otherwise be attributed a verdict it
+    // never produced. The governance rules DB is always the sqlite `conn`
+    // (Postgres ships no governance_rules table), on all backends.
     let cp = crate::governance::audit::build_signed_verdict_checkpoint(
         agent_id,
         action.kind(),
@@ -1501,8 +1669,11 @@ pub fn decision_wire_parts(decision: &Decision) -> (&'static str, &str, &str) {
 /// * **Best-effort audit (NON-FATAL).** When read rules exist, the
 ///   decision is appended to `signed_events`, but an append failure is
 ///   logged and the read PROCEEDS — read availability is never coupled to
-///   audit-sink liveness (the SPLIT fail-posture; the deferred-audit DLQ
-///   keeps the trail recoverable). This is why it does NOT reuse
+///   audit-sink liveness (the SPLIT fail-posture). The append is NOT
+///   admitted to the deferred-audit spool or any DLQ, so a failed append
+///   loses that decision from `signed_events`; only the best-effort
+///   forensic JSONL (when enabled) may still hold it (#3660). This is why
+///   it does NOT reuse
 ///   `check_agent_action`'s fatal `emit_check_event(...)?`.
 /// * **Fail-CLOSED on a blocking verdict** (`Refuse` / `Escalate`) and on a
 ///   rule-LOAD error — unless the operator opted into
@@ -1525,20 +1696,21 @@ pub fn gate_read(
     // Load the enabled `read_action` rules. A load error is a governance
     // outage: fail CLOSED unless the operator opted into the legacy
     // permissive posture (parity with the write pre-hook).
+    let load_failed = |e: anyhow::Error| {
+        if crate::daemon_runtime::governance_fail_open_on_error() {
+            tracing::warn!(
+                "read-gate: rule load failed, failing OPEN per \
+                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR: {e:#}"
+            );
+            return Ok(());
+        }
+        Err(crate::storage::GovernanceRefusal {
+            reason: "read governance unavailable (failing closed)".to_string(),
+        })
+    };
     let engine = match RuleEngine::load_for_action(conn, action) {
         Ok(e) => e,
-        Err(e) => {
-            if crate::daemon_runtime::governance_fail_open_on_error() {
-                tracing::warn!(
-                    "read-gate: rule load failed, failing OPEN per \
-                     AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR: {e:#}"
-                );
-                return Ok(());
-            }
-            return Err(crate::storage::GovernanceRefusal {
-                reason: "read governance unavailable (failing closed)".to_string(),
-            });
-        }
+        Err(e) => return load_failed(e),
     };
 
     // Zero-config fast-path: no read rules → allow, no eval, no audit.
@@ -1546,11 +1718,29 @@ pub fn gate_read(
         return Ok(());
     }
 
+    // #4044 — rules exist, so this verdict is audited and may be judge-signed
+    // with a policy version: re-load the rules TOGETHER with that version in
+    // one read snapshot and evaluate THOSE rules. (The zero-config probe above
+    // stays a single cheap read on the recall hot path.)
+    let engine = match RuleEngine::load_for_action_attributed(conn, None, action) {
+        Ok(e) => e,
+        Err(e) => return load_failed(e),
+    };
+    let Some(policy) = engine.policy_version() else {
+        return load_failed(anyhow::anyhow!(
+            "read-gate: attributed load carried no policy version"
+        ));
+    };
+    if engine.rules().is_empty() {
+        return Ok(());
+    }
+
     let decision = engine.evaluate(agent_id, action);
 
     // Best-effort audit — a read is NEVER blocked by an audit-append
-    // failure (SPLIT fail-posture; the DLQ keeps the trail recoverable).
-    if let Err(e) = emit_check_event(conn, agent_id, action, &decision) {
+    // failure (SPLIT fail-posture). No spool/DLQ backs this append: a
+    // failure loses the decision from `signed_events` (#3660).
+    if let Err(e) = emit_check_event(conn, agent_id, action, &decision, &policy) {
         tracing::warn!("read-gate: audit append failed (read proceeds; DLQ-backed): {e:#}");
     }
     emit_forensic_decision(agent_id, action, &decision);

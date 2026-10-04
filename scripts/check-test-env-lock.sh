@@ -447,7 +447,7 @@ guard_wrapper_names () {
             active = 0
         }
     }
-    ' "$1" 2>/dev/null | sort -u
+    ' "$1" 2>/dev/null | LC_ALL=C sort -u
 }
 
 # naked_home_mutations <file> <guard-tokens-COMMA-list> <mut-linenos-csv>
@@ -578,6 +578,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
             exit 2
         fi
     done
+
+    # #4292: every probe is removed on ANY exit, including an interrupted
+    # one, and INT/TERM re-raise. See scripts/lib/selftest-probes.sh.
+    source "${ROOT}/scripts/lib/selftest-probes.sh"
+    selftest_probes_arm "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g" "$probe_arm_h" "$probe_arm_h_compliant" "$probe_arm_h_param"
 
     # Case 1: a plain $HOME mutation with NO test_env_lock reference
     # anywhere in the file -- the "nobody serialized it at all" shape
@@ -966,11 +971,10 @@ fn contrived_param_caller_test() {
 EOF
 
     set +e
-    gate_output="$("$0" 2>&1)"
-    gate_exit=$?
+    selftest_run gate_output gate_exit "$0"
     set -e
 
-    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g" "$probe_arm_h" "$probe_arm_h_compliant" "$probe_arm_h_param"
+    selftest_probes_disarm
     printf '%s\n' "$gate_output"
 
     # PASS requires: non-zero exit, ALL EIGHT violators reported (no-lock,
@@ -1286,7 +1290,7 @@ env_mutation_census () {
         [[ "${e:-0}" -eq 0 && "${a:-0}" -eq 0 ]] && continue
         rel="${f#"${ROOT}/"}"
         printf '%s %s %s\n' "${a:-0}" "$e" "$rel"
-    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | sort -k3,3
+    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | LC_ALL=C sort -k3,3
 }
 
 # ---------------------------------------------------------------------
@@ -1328,7 +1332,7 @@ helper_mutation_census () {
         [[ "$total" -eq 0 ]] && continue
         rel="${f#"${ROOT}/"}"
         printf '%s %s\n' "$total" "$rel"
-    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | sort -k2,2
+    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | LC_ALL=C sort -k2,2
 }
 
 # ---------------------------------------------------------------------
@@ -1587,7 +1591,7 @@ reader_census () {
         else
             printf '%s %s\n' "$(printf '%s\n' "$flagged" | grep -c . || true)" "$rel"
         fi
-    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | sort -k2,2
+    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | LC_ALL=C sort -k2,2
 }
 
 if [[ "${1:-}" == "--reader-census" ]]; then

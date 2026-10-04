@@ -1,5 +1,7 @@
 # ai-memory v0.8.0 — TRACT Development-Gaps Catalog (Canonical · 32 Gaps)
 
+> **Point-in-time record, dated 2026-06-28.** The src/ file:line references in this document refer to the source tree as of that date and are not maintained, so they may not match the current code.
+
 ### The single reconciled gap roadmap — Grok↔Opus adjudicated, CodeGraph-anchored, ROADMAP §5-crosswalked, TRACKED/UNTRACKED-tagged.
 
 > **Method.** Four assessment passes across two decorrelated model families (Grok/xAI + Opus/Anthropic) — two first-party 21-agent councils, two reconciliations, then a final **21-agent adjudication council** — measured **TRACT** (`docs/design/TRACT-the-definitive-endpoint-ai-memory.md`) against ai-memory **`release/v0.8.0`**, CodeGraph as L1 evidence (846 files / 27,062 nodes / 92,578 edges). This is the canonical reduction; it supersedes the prior drafts. Companion: [`TRACT-v0.8.0-CORRECT-NOW-CANONICAL-opus.md`](TRACT-v0.8.0-CORRECT-NOW-CANONICAL-opus.md).

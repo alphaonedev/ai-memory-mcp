@@ -789,6 +789,17 @@ fn check_duplicate_response(check: &crate::models::DuplicateCheck) -> serde_json
     })
 }
 
+/// #3234 / #4089 — the ONE `check_duplicate` response for an embedder that
+/// could not encode the input (an embed error, or an embed task that did
+/// not complete). Fail closed: never an empty vector (a silent miss).
+fn embedder_failed_response() -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "embedder failed to encode input"})),
+    )
+        .into_response()
+}
+
 /// `POST /api/v1/check_duplicate` — REST mirror of the MCP
 /// `memory_check_duplicate` tool. Embeds `title + content`, scans
 /// embedded live memories, and returns the highest-cosine match plus
@@ -863,17 +874,24 @@ pub async fn check_duplicate(
         // through to phase-1 hash-only. #3234 — embed *failure* is 503
         // (sqlite parity; ERRORS-01 / ERRORS-06), never `unwrap_or_default()`
         // (empty vec = silent miss / fail-open).
+        // #4089 (rust-1.98 CONCURRENCY-22) — `embed` is CPU-bound; run it
+        // on the blocking pool, never inline on this worker. A task that
+        // did not complete fails closed with the same 503 (never
+        // `unwrap_or_default()`); `embed_offload` warns + counts it.
         let query_embedding: Vec<f32> = match app.embedder.as_ref().as_ref() {
-            Some(emb) => match emb.embed(&embedding_text) {
-                Ok(v) => v,
-                Err(e) => {
+            Some(emb) => match super::embed_offload::embed_document(
+                crate::metrics::EMBED_SURFACE_CHECK_DUPLICATE,
+                emb,
+                embedding_text.clone(),
+            )
+            .await
+            {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => {
                     tracing::warn!("embedding generation failed: {e}");
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({"error": "embedder failed to encode input"})),
-                    )
-                        .into_response();
+                    return embedder_failed_response();
                 }
+                None => return embedder_failed_response(),
             },
             None => Vec::new(),
         };
@@ -941,18 +959,25 @@ pub async fn check_duplicate(
     // Embed before taking the DB lock — same rationale as create_memory
     // (issue #219). The embedder call is 10-200ms; we don't want it
     // serialised behind the connection mutex.
+    // #4089 (rust-1.98 CONCURRENCY-22) — `embed` is CPU-bound; run it on
+    // the blocking pool, never inline on this worker. A task that did not
+    // complete fails closed with the same 503; `embed_offload` warns +
+    // counts it.
     let embedding_text = crate::embeddings::embedding_document(&body.title, &body.content);
     let query_embedding = match app.embedder.as_ref().as_ref() {
-        Some(emb) => match emb.embed(&embedding_text) {
-            Ok(v) => v,
-            Err(e) => {
+        Some(emb) => match super::embed_offload::embed_document(
+            crate::metrics::EMBED_SURFACE_CHECK_DUPLICATE,
+            emb,
+            embedding_text.clone(),
+        )
+        .await
+        {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
                 tracing::warn!("embedding generation failed: {e}");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"error": "embedder failed to encode input"})),
-                )
-                    .into_response();
+                return embedder_failed_response();
             }
+            None => return embedder_failed_response(),
         },
         None => {
             return (

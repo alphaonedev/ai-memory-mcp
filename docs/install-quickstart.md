@@ -28,8 +28,8 @@ Cursor, ChatGPT, Grok, Gemini, Continue.dev, Aider, Cody, Windsurf,
 Zed, Goose — anything that speaks the Model Context Protocol (MCP) —
 can plug into it. It stores what your AI learns in a local SQLite
 database on your machine, ranks those memories by relevance when the
-AI asks to recall them, and auto-promotes important ones to permanent
-storage. **It runs entirely locally and never phones home.** No
+AI asks to recall them, and lets the AI promote important ones to permanent
+storage with `memory_promote`. **It runs entirely locally and never phones home.** No
 cloud account, no telemetry, no outbound network calls (except when
 *you* deliberately enable peer-federation or a hosted LLM provider).
 The same database is shared across every AI client you wire up, so

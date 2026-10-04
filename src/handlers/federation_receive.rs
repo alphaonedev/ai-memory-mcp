@@ -324,7 +324,9 @@ fn stale_policy_refusal_response(sender_seq: i64, local_seq: i64) -> Response {
 /// fault clears, so a genuine transient fault degrades to a retry rather than
 /// data loss). The documented operator opt-out is UNCHANGED: with
 /// Wave-2 B5 — sqlite `/sync/push` write-dispatch record-stop CHOKEPOINT.
-/// Returns `Some(503 RECORD_STOPPED)` when the record plane is stopped so
+/// Returns `Some(503)` (code `RECORD_STOPPED`, or `RECORD_STOP_INDETERMINATE` /
+/// `AUDIT_TRAIL_UNAVAILABLE` for the gate's other refusals, #4400) when the
+/// record plane is stopped so
 /// every receive write in this request is fenced at one call site
 /// (ERRORS-09). `None` means the write-dispatch may proceed.
 fn refuse_if_record_stopped(conn: &rusqlite::Connection) -> Option<Response> {
@@ -2834,9 +2836,23 @@ async fn sync_push_write(
         // `resolve_inbound_attribution`). Done before the quota gate so the
         // gate charges the attributed agent, and so the persisted row's
         // owner (`metadata.agent_id`) reflects any re-attribution.
-        let cap_for_namespace = db::resolve_governance_policy(&lock.0, &mem.namespace)
-            .unwrap_or_else(crate::models::GovernancePolicy::default)
-            .effective_max_reflection_depth();
+        // #4043 — an unreadable policy refuses this row (reject-before-apply,
+        // the batch survives, the peer re-sends); it never stamps the compiled
+        // default as the local cap on evidence nobody read.
+        let cap_for_namespace = match db::resolve_governance_policy(&lock.0, &mem.namespace) {
+            Ok(policy) => policy.unwrap_or_default().effective_max_reflection_depth(),
+            Err(e) => {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    memory_id = %mem.id,
+                    "sync_push: governance policy unreadable for {}: {e:#}; \
+                     refusing the write (#4043 fail-closed)",
+                    mem.namespace
+                );
+                skipped += 1;
+                continue;
+            }
+        };
         let mut to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
             mem,
             &body.sender_agent_id,
@@ -3054,7 +3070,27 @@ async fn sync_push_write(
         // delivered notify can wake its recipient below (non-inbox rows: no
         // read at all).
         let inbox_wake_pre = crate::federation::applied_wake::probe_sqlite(&lock.0, &to_insert);
-        match db::merge_inbound(&lock.0, &to_insert, row_is_agent_attested(&to_insert)) {
+        // #4023 — the #2447 stored-namespace verdict above was taken on a read
+        // that precedes the merge's write transaction; a second connection (or
+        // process) can move the row in between, and `merge_memory` LWWs
+        // `namespace`. Re-authorize the row the merge actually locks.
+        let authorize_stored = |stored: &str| {
+            crate::federation::receive_auth::inbound_write_namespace_authorized(
+                crate::federation::receive_auth::LANE_MEMORIES,
+                &mem.id,
+                &mem.namespace,
+                Some(stored),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            )
+        };
+        match db::merge_inbound_authorized(
+            &lock.0,
+            &to_insert,
+            row_is_agent_attested(&to_insert),
+            Some(&authorize_stored),
+        ) {
             Ok(actual_id) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest.
@@ -3239,6 +3275,29 @@ async fn sync_push_write(
             .into_response();
     }
 
+    // #4447 — the by-id lanes below (deletions / archives / restores / links)
+    // each probe a target row's STORED namespace on a read that precedes the
+    // write transaction; a broader writer on a second connection (or process)
+    // can move the row out of the peer's scope in between. Each lane's write is
+    // therefore the `*_authorized` free-fn, which re-evaluates THIS verdict on
+    // the namespace read under the write lock. The verdict is the same shared
+    // `inbound_by_id_namespace_authorized` the pre-check uses, with the stored
+    // namespace elided exactly when the pre-check elides it (Layer 2 only).
+    let by_id_needs_stored = crate::federation::receive_auth::peer_declares_namespace_scope(
+        peer_header_owned.as_deref(),
+        &attest_cfg,
+    );
+    let by_id_verdict = |lane: &str, id: &str, stored: &str| -> bool {
+        crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+            lane,
+            id,
+            by_id_needs_stored.then_some(stored),
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_push_ns_scope,
+        )
+    };
+
     // Process deletions (v0.6.0.1 — scenario 10 fanout). Invalid ids are
     // skipped silently; missing rows count as no-op. Peers that have
     // already GC'd the row see identical post-state.
@@ -3332,7 +3391,9 @@ async fn sync_push_write(
                 continue;
             }
         }
-        match db::delete(&lock.0, del_id) {
+        match db::delete_authorized(&lock.0, del_id, &|id: &str, stored: &str| {
+            by_id_verdict(crate::federation::receive_auth::LANE_DELETIONS, id, stored)
+        }) {
             Ok(true) => deleted += 1,
             Ok(false) => noop += 1,
             Err(e) => {
@@ -3393,7 +3454,14 @@ async fn sync_push_write(
                 }
             }
         }
-        match db::archive_memory(&lock.0, arch_id, Some("sync_push")) {
+        match db::archive_memory_authorized(
+            &lock.0,
+            arch_id,
+            Some("sync_push"),
+            &|id: &str, stored: &str| {
+                by_id_verdict(crate::federation::receive_auth::LANE_ARCHIVES, id, stored)
+            },
+        ) {
             Ok(true) => archived += 1,
             Ok(false) => noop += 1,
             Err(e) => {
@@ -3473,7 +3541,9 @@ async fn sync_push_write(
                 continue;
             }
         }
-        match db::restore_archived(&lock.0, res_id) {
+        match db::restore_archived_authorized(&lock.0, res_id, &|id: &str, stored: &str| {
+            by_id_verdict(crate::federation::receive_auth::LANE_RESTORES, id, stored)
+        }) {
             Ok(true) => restored += 1,
             Ok(false) => noop += 1,
             Err(e) => {
@@ -3641,7 +3711,14 @@ async fn sync_push_write(
             _ => crate::models::AttestLevel::Unsigned.as_str(),
         };
 
-        match db::create_link_inbound(&lock.0, link, attest_level) {
+        match db::create_link_inbound_authorized(
+            &lock.0,
+            link,
+            attest_level,
+            &|id: &str, stored: &str| {
+                by_id_verdict(crate::federation::receive_auth::LANE_LINKS, id, stored)
+            },
+        ) {
             Ok(()) => links_applied += 1,
             Err(e) => {
                 tracing::warn!(
@@ -4051,6 +4128,15 @@ async fn sync_push_write(
     let require_signal_sig = crate::federation::receive_auth::require_signal_sig_enabled();
     for sig in &body.signals {
         if validate::validate_id(&sig.id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        // #4408 — a federated signal whose recipient fails the agent-id
+        // contract is a PER-SIGNAL skip on BOTH backends, before any quota
+        // charge, insert or audit; the rest of the push still applies. The
+        // value is never logged or echoed.
+        if crate::validate::validate_signal_recipient(sig.to_agent.as_deref()).is_err() {
+            tracing::warn!("federation signal skipped: invalid recipient");
             skipped += 1;
             continue;
         }
@@ -4505,13 +4591,46 @@ async fn sync_push_write(
                 peer_header_owned.as_deref(),
             );
         }
-        match db::set_namespace_standard(
-            &lock.0,
-            &entry.namespace,
-            &entry.standard_id,
-            entry.parent_namespace.as_deref(),
-        ) {
+        // #4478 / #4495 — the shared #3758 + #4356 verdict for the agent the
+        // peer is authenticated to act for, in EVERY binding state, read,
+        // decided, written and re-checked (no detaching re-parent) INSIDE one
+        // write transaction (race-safe on the single sqlite writer). The
+        // standard's existence is checked first, so a missing standard is the
+        // same not-found skip as on postgres. A refusal rolls the transaction
+        // back and is a per-entry skip counted under `namespace_meta_refused`;
+        // the batch survives.
+        let applied = crate::storage::in_write_txn(&lock.0, || {
+            crate::federation::ns_meta_ancestor_gate::federated_bind_conn(
+                &lock.0,
+                &entry.namespace,
+                &entry.standard_id,
+                entry.parent_namespace.as_deref(),
+                |owner| {
+                    crate::federation::ns_meta_ancestor_gate::federated_bind_actor(
+                        peer_header_owned.as_deref(),
+                        &body.sender_agent_id,
+                        owner,
+                        &attest_cfg,
+                        peer_attestation::trust_body_agent_id_bypass(),
+                    )
+                },
+            )
+        });
+        match applied {
             Ok(()) => namespace_meta_applied += 1,
+            Err(e)
+                if e
+                    .downcast_ref::<crate::federation::ns_meta_ancestor_gate::FederatedBindRefused>()
+                    .is_some() =>
+            {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    "{}",
+                    crate::federation::ns_meta_ancestor_gate::ANCESTOR_GATE_SKIP_LOG
+                );
+                namespace_meta_refused += 1;
+                skipped += 1;
+            }
             Err(e) => {
                 tracing::warn!(
                     "sync_push: set_namespace_standard failed for {}: {e}",

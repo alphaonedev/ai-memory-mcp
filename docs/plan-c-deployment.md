@@ -80,14 +80,18 @@ done
 After a binary rebuild or schema migration:
 
 ```bash
-docker compose -f infra/plan-c/docker-compose.yml down -v
-docker compose -f infra/plan-c/docker-compose.yml up -d --build
+docker compose -f infra/plan-c/docker-compose.yml up -d --build --force-recreate
 ```
 
-`down -v` wipes the named volumes (`ic-{alice,bob,carol}-{keys,audit}`),
-so daemon keypairs are regenerated on the next boot. For zero-downtime
-re-deploys that preserve identity, omit `-v` and let the
-`entrypoint.plan-c.sh` first-start guard skip key generation.
+This recreates the containers and keeps every named volume
+(`ic-tls`, `ic-{alice,bob,carol}-{keys,audit}`). Do NOT add `down -v` (or
+`down --volumes`) to an upgrade: that flag deletes the key, audit and TLS
+volumes. Each daemon's federation signing keypair lives in its `-keys` volume,
+so on the next boot `entrypoint.plan-c.sh` finds no private key and generates a
+NEW random keypair under the same identity name; the old identity cannot be
+recovered and peers that enrolled its public key refuse the new one. The audit
+history and the fleet TLS material are discarded the same way. Volume deletion
+is for a deliberate, destructive full teardown only (back the volumes up first).
 
 ## Recovering from a crashed Mac / colima restart
 

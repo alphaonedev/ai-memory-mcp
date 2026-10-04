@@ -135,6 +135,11 @@ if os.path.exists(allow_path):
             print(f"MALFORMED allowlist entry (need '<relpath> <substring>'): {s!r}", file=sys.stderr)
             sys.exit(2)
         allow.append((parts[0], parts[1]))
+# R4-G3 sibling: the header must not claim the file is empty while it holds
+# entries (a false "nothing is exempted" statement to every reader).
+if allow and re.search(r'file\s+is\s+currently\s+empty', open(allow_path, encoding='utf-8').read(), re.I):
+    print(f"FALSE EMPTY CLAIM (R4-G3): {allow_path} says it is currently empty but holds {len(allow)} entr{'y' if len(allow) == 1 else 'ies'}", file=sys.stderr)
+    sys.exit(2)
 allow_hit = [False] * len(allow)
 
 violations = []
@@ -244,6 +249,16 @@ EOF
   strc=0; scan "$tmp/vision" "$tmp/stale.txt" >/dev/null 2>&1 || strc=$?
   if [ "$strc" -ne 2 ]; then
     echo "SELF-TEST FAIL: a stale allowlist entry did not hard-fail (burn-down discipline)" >&2
+    exit 2
+  fi
+
+  # 3b) R4-G3: a header claiming the file is currently empty, alongside a
+  #     real (matching, non-stale) entry, must HARD-FAIL (rc 2).
+  printf '%s\n' '# *** THIS FILE IS CURRENTLY EMPTY, AND THAT IS THE PASSING STATE. ***' \
+    'vision.html millions of agents' > "$tmp/false-empty.txt"
+  fec=0; scan "$tmp/vision" "$tmp/false-empty.txt" >/dev/null 2>&1 || fec=$?
+  if [ "$fec" -ne 2 ]; then
+    echo "SELF-TEST FAIL: a header claiming 'currently empty' over a real entry was accepted (R4-G3)" >&2
     exit 2
   fi
 

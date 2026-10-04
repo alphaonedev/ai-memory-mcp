@@ -11,24 +11,12 @@ The short version: **`ai-memory` does not phone home, does not register your dep
 
 ## 1. What `ai-memory` emits
 
-The binary emits structured `tracing` spans on every meaningful operation. The categories are stable across v0.7.x:
+The binary emits `tracing` output for the following, and writes audit rows separately:
 
-- **MCP tool calls** — one span per JSON-RPC request. Includes the tool name, the resolved agent_id, the namespace, duration in microseconds, and the result tag (`ok`, `denied`, `error`).
-- **Governance decisions** — one span per policy evaluation (hook deny, namespace inheritance refusal, attestation verification). Includes the rule that fired and the verdict.
-- **Federation events** — one span per outbound push, inbound pull, signature verification, and allowlist refusal. Includes peer agent_id and message-class metadata.
-- **Audit emissions** — one span per audit-trail row. Includes audit kind and the hash of the appended row (for downstream chain verification).
-
-Span format (canonical):
-
-```
-operation_name     // e.g. "memory_store", "federation_push", "hook_pre_store"
-agent_id           // resolved per the precedence ladder in CLAUDE.md §Agent Identity
-namespace          // logical store namespace, never the memory content
-duration_us        // wall-clock microseconds
-result             // "ok" | "denied" | "error"
-```
-
-Spans do **not** contain memory content, embeddings, prompts, recall results, or any payload bytes. The substrate emits operation metadata only.
+- **MCP tool calls** — one `mcp_tool_call` info span per `tools/call` request that passes the tool-name and profile checks (`src/mcp/mod.rs`). The span's own fields are the tool name (`tool`) and the JSON-RPC id (`rpc_id`). After dispatch it reports an `ok` info event with `elapsed_ms`, or an `err` warn event with `elapsed_ms` and the error. A request with a missing tool name, or for a tool not loaded in the active profile, returns before the span; non-object `arguments`, an unresolvable caller authority, the record-stop gate, an unknown tool and an unrecognised wire format return inside the span without an `ok` or `err` event. The span does not record arguments or results.
+- **Governance decisions** — not tracing spans. `record_decision` (`src/governance/audit.rs`) records the decision as a forensic audit row when the forensic audit sink is running and does nothing when it is not; it emits a `tracing::error!` when it cannot queue or append the row.
+- **Federation events** — `tracing::info!` events on the push, DLQ-replay, receive and sync paths (`src/federation/`), not a span per event.
+- **Audit emissions** — audit-trail rows, not tracing spans. Where the trail is enabled, MCP dispatch appends them through `audit_emit_for_mcp_dispatch`.
 
 ---
 
@@ -36,7 +24,7 @@ Spans do **not** contain memory content, embeddings, prompts, recall results, or
 
 `ai-memory` makes one binding commitment about telemetry that distinguishes it from competing memory stacks and most observability libraries:
 
-> **No outbound network connection is initiated by the binary except to destinations the operator has explicitly configured.**
+> **No outbound network connection is initiated by the binary except to destinations the operator has explicitly configured — with one default exception: a one-time model download from HuggingFace on first start under the default `semantic` tier (below).**
 
 That means:
 
@@ -44,7 +32,7 @@ That means:
 - **No third-party SaaS sinks compiled in.** There is no Datadog client, no Honeycomb client, no Sentry hook, and no PostHog beacon in the binary. Adding one is an operator choice via the file-logging path or a custom hook.
 - **`RUST_LOG` controls verbosity, not destination.** Setting `RUST_LOG=ai_memory=debug` increases what the binary records to stderr or your configured file sink. It does not change where logs go.
 
-If you build with default Cargo features, the only outbound network calls the binary can make are: (a) federation push/pull to peers on your mTLS allowlist, (b) embedder fetches from HuggingFace if you have explicitly enabled the smart tier, and (c) LLM completions to your configured Ollama endpoint if you have enabled the autonomous tier. All three are off by default and named in the verbose `ai-memory doctor` report.
+If you build with default Cargo features, the only outbound network calls the binary can make are: (a) federation push/pull to peers on your mTLS allowlist; (b) a one-time embedder model download (all-MiniLM-L6-v2) from HuggingFace on first start under the **default** `semantic` tier, plus the cross-encoder model on first use of the `autonomous` tier — skipped with the `keyword` tier, or when the model is pre-staged and `AI_MEMORY_EMBED_OFFLINE=1` / `HF_HUB_OFFLINE=1` is set; and (c) LLM and API-embedding calls to the endpoint you configure (`AI_MEMORY_LLM_BACKEND` / `[llm]`, `AI_MEMORY_EMBED_BACKEND` / `[embeddings]`), on any tier. (a) and (c) are off until you configure them; (b) is **on by default** (the tier defaults to `semantic`, `src/config.rs`, and the offline flags default to off, `src/embeddings.rs::remote_fetch_disabled`). An air-gapped or regulated deployment should pre-stage the model and set the offline flag, or run `--tier keyword`.
 
 ---
 

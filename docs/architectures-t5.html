@@ -1,549 +1,260 @@
+<!DOCTYPE html>
 <!--
   Copyright 2026 AlphaOne LLC
   SPDX-License-Identifier: Apache-2.0
-  T5 — Global hive. Multi-region, attested, federated. The vision tier.
+  Tier 5: federated hive across data centers or regions (v1.0.0 GA).
+  Theme: the shared landing-page tokens in assets/site-theme.css (#4420).
+  Every capability drawn here is backed by code on the v1.0.0 tree; the
+  commit that introduced this page cites file:line for each one.
 -->
-<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ai-memory · T5 — Global hive</title>
-<meta name="description" content="The vision tier: multi-region cloud, attested agent identity, federated governance, many certified ≤50-peer clusters composed into a unified collective. The hundreds-of-thousands-to-millions total is aspirational north-star, not certified or measured capacity.">
-<meta property="og:title" content="ai-memory · T5 — Global hive">
-<meta property="og:description" content="Multi-region cloud · attested · federated · collective. The north star.">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ai-memory · T5: federated hive across sites</title>
+<meta name="description" content="Tier 5 of ai-memory v1.0.0: independent cluster blocks across data centers or regions joined by signed, mutually-authenticated federation with W-of-N quorum, 202 durable-local partitions and catch-up, without global consensus.">
+<meta name="theme-color" content="#0c0b08">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/architectures-t5.html">
-<style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
-*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
-html{scroll-behavior:smooth;scroll-padding-top:5rem}
-body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
-a{color:var(--text);text-decoration:none}a:hover{color:var(--p1)}
-code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
-pre{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:1rem 1.1rem;border-radius:8px;border:1px solid var(--border);overflow-x:auto;line-height:1.55;color:var(--text-muted);margin:1rem 0}
-pre code{padding:0;background:none}
-.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
-h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem;margin:1rem 0 .35rem}
-p{color:var(--text-muted);margin-bottom:.85rem}
-.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
-.topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
-.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
-.topnav .home-link{color:var(--text);font-weight:600}
-.topnav .right{display:flex;gap:1.25rem;flex-wrap:wrap}@media(max-width:800px){.topnav .right{display:none}}
-.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(255,107,157,0.08),transparent 60%);border-bottom:1px solid var(--border)}
-.hero h1{font-size:clamp(1.8rem,4vw,2.75rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
-.hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin:0 auto 1rem}
-.hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
-.hero .pill{padding:.4rem 1rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted)}
-
-section{padding:3rem 0;border-bottom:1px solid var(--border)}
-.eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
-.lede{color:var(--text-muted);font-size:.95rem;max-width:820px;margin-bottom:2rem}
-section h2{font-family:var(--font-sans);font-size:1.6rem;margin-bottom:.6rem}
-
-footer{padding:3rem 1.5rem;text-align:center;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)}
-footer a{color:var(--text-muted)}
-
-.topnav .menu{position:relative;display:inline-block}
-.topnav .menu-btn{background:none;border:none;color:var(--text-muted);font-family:inherit;font-size:inherit;cursor:pointer;padding:.2rem 0;line-height:1;letter-spacing:0}
-.topnav .menu-btn:hover,.topnav .menu:focus-within .menu-btn{color:var(--text)}
-.topnav .menu-btn.active{color:var(--text)}
-.topnav .menu-btn .caret{opacity:.5;font-size:.7em;margin-left:.2em}
-.topnav .menu-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:240px;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60;visibility:hidden;opacity:0;transition:opacity .12s ease,visibility 0s .12s}
-.topnav .menu:focus-within .menu-pane,.topnav .menu:hover .menu-pane{visibility:visible;opacity:1;transition:opacity .12s ease}
-.topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
-.topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
-
-.cap-badge{display:inline-block;padding:.15em .55em;font-family:var(--font-mono);font-size:.7rem;font-weight:600;border-radius:4px;border:1px solid;letter-spacing:.04em;margin:.1em .15em}
-.cap-today{color:#6ee7ff;border-color:#2a6571;background:rgba(110,231,255,.08)}
-.cap-roadmap{color:#c8a2ff;border-color:#5a4280;background:rgba(200,162,255,.08)}
-.cap-partial{color:#ffb86b;border-color:#7a5328;background:rgba(255,184,107,.08)}
-.cap-future{color:#ff6b9d;border-color:#7a3251;background:rgba(255,107,157,.08)}
-
-.arch-diagram{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;margin:1.5rem 0}
-.arch-diagram-title{font-family:var(--font-mono);font-size:.85rem;color:var(--p2);letter-spacing:.04em;margin-bottom:1rem;text-transform:uppercase}
-.arch-svg{width:100%;height:auto;display:block;background:#0a0a0a;border-radius:8px}
-.arch-svg .node{fill:#161616;stroke:#3d3d3d;stroke-width:1.2}
-.arch-svg .node-label{fill:#fff;font-family:'SF Mono',monospace;font-size:12px;font-weight:600}
-.arch-svg .sub-label{fill:#999;font-family:'SF Mono',monospace;font-size:10px}
-.arch-svg .edge{fill:none}
-.arch-svg .edge-dashed{fill:none;stroke:#666;stroke-width:1.2;stroke-dasharray:4 3}
-.arch-svg .edge-roadmap{fill:none;stroke:#a78bfa;stroke-width:1.4;stroke-dasharray:5 4;opacity:.7}
-.arch-svg .flow{filter:drop-shadow(0 0 4px currentColor)}
-.arch-svg .flow-write{fill:#f97316;color:#f97316}
-.arch-svg .flow-recall{fill:#2dd4bf;color:#2dd4bf}
-.arch-svg .flow-sync{fill:#a78bfa;color:#a78bfa}
-.arch-svg .flow-policy{fill:#facc15;color:#facc15}
-.arch-svg .flow-attest{fill:#f472b6;color:#f472b6}
-.arch-svg .ring{fill:none;stroke:#6ee7ff;stroke-width:2;opacity:.7;animation:pulse 2.4s ease-out infinite}
-@keyframes pulse{0%{r:6;opacity:.85}100%{r:18;opacity:0}}
-.arch-legend{display:flex;flex-wrap:wrap;gap:1rem;margin-top:1rem;font-family:var(--font-mono);font-size:.75rem;color:var(--text-muted)}
-.arch-legend-item{display:inline-flex;align-items:center;gap:.4rem}
-.arch-legend-dot{display:inline-block;width:10px;height:10px;border-radius:50%}
-.arch-diagram-caption{font-size:.85rem;color:var(--text-dim);margin-top:1rem;line-height:1.5}
-
-ul,ol{padding-left:1.5rem;color:var(--text-muted);font-size:.92rem;margin:.5rem 0 1rem}
-ul li,ol li{margin-bottom:.4rem}
-
-table{width:100%;border-collapse:collapse;margin:1rem 0 1.5rem;font-size:.85rem;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;overflow:hidden}
-table th,table td{padding:.65rem .85rem;text-align:left;border-bottom:1px solid var(--border)}
-table th{background:var(--bg-elev);font-family:var(--font-mono);font-size:.78rem;font-weight:600;color:var(--text);letter-spacing:.04em}
-table td{color:var(--text-muted)}
-table tr:last-child td{border-bottom:none}
-@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
-
-/* Zero-JS mobile nav fallback — visible only when .right collapses */
-.topnav .mnav{display:none;position:relative}
-.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
-.topnav .mnav summary::-webkit-details-marker{display:none}
-.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
-.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
-.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
-.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
-@media(max-width:800px){.topnav .mnav{display:block}}
-</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@500;600&amp;display=swap">
+<link rel="stylesheet" href="assets/site-theme.css">
 </head>
-<body>
-
-<nav class="topnav">
-  <div class="inner">
-    <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures · T5</span></a>
-    <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v09.html" style="color:#ffb86b">What's new</a>
-      <div class="menu">
-        <button class="menu-btn">Audiences<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="for-everyone.html">For Everyone</a>
-          <a href="audience/decision-maker.html">Decision Maker</a>
-          <a href="audience/developer.html">Developer</a>
-          <a href="audience/operator.html">Operator</a>
-          <a href="feature-matrix.html">Feature Matrix</a>
-          <a href="data-flow.html">Data Flow</a>
-          <a href="integrations.html">Integrations</a>
-          <a href="import-history.html">Import History</a>
-          <a href="release-pipeline.html">Release Pipeline</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Features<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="memory-tiers.html">Memory Tiers</a>
-          <a href="memory-rules.html">Memory Rules</a>
-          <a href="ttl-controls.html">TTL Controls</a>
-          <a href="archival.html">Archival</a>
-          <a href="encryption.html">Encryption</a>
-          <a href="hierarchies.html">Hierarchies</a>
-          <a href="knowledge-graph.html">Knowledge Graph</a>
-          <a href="autonomous.html">Autonomous</a>
-          <a href="a2a-messaging.html">A2A Messaging</a>
-          <a href="a2a-integration.html">Integrate an Agent</a>
-          <a href="lifecycle.html">Lifecycle</a>
-          <a href="performance.html">Performance</a>
-          <a href="agent-identity.html">Agent Identity (NHI)</a>
-          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="architectures.html">Overview</a>
-          <a href="architectures-t1.html">T1 — Single Agent</a>
-          <a href="architectures-t2.html">T2 — Many Agents</a>
-          <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
-          <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
-          <a href="architectures-t5.html" class="current">T5 — Global Hive</a>
-          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
-          <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-          <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Internals<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="schema.html">Schema</a>
-          <a href="types.html">Types</a>
-          <a href="validators.html">Validators</a>
-          <a href="governance.html">Governance</a>
-          <a href="batman-active-mode.html">Batman Mode</a>
-          <a href="tracing.html">Tracing</a>
-          <a href="spec/v1.html">Portability Spec v1</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Evidence<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="evidence.html">Frozen Claims</a>
-          <a href="evidence/">Evidence Hub (campaigns)</a>
-          <a href="performance.html">Performance budgets</a>
-          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
-        </div>
-      </div>
-      <a href="credits.html">Credits</a>
-      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
-    </div>
-    <details class="mnav">
-      <summary>Menu</summary>
-      <div class="mnav-pane">
-        <a href="./">Home</a>
-        <a href="at-a-glance.html">Atlas</a>
-        <a href="whats-new-v09.html">What's new</a>
-        <div class="mnav-group">Audiences</div>
-        <a href="for-everyone.html">For Everyone</a>
-        <a href="audience/decision-maker.html">Decision Maker</a>
-        <a href="audience/developer.html">Developer</a>
-        <a href="audience/operator.html">Operator</a>
-        <a href="feature-matrix.html">Feature Matrix</a>
-        <a href="data-flow.html">Data Flow</a>
-        <a href="integrations.html">Integrations</a>
-        <a href="import-history.html">Import History</a>
-        <a href="release-pipeline.html">Release Pipeline</a>
-        <div class="mnav-group">Features</div>
-        <a href="memory-tiers.html">Memory Tiers</a>
-        <a href="memory-rules.html">Memory Rules</a>
-        <a href="ttl-controls.html">TTL Controls</a>
-        <a href="archival.html">Archival</a>
-        <a href="encryption.html">Encryption</a>
-        <a href="hierarchies.html">Hierarchies</a>
-        <a href="knowledge-graph.html">Knowledge Graph</a>
-        <a href="autonomous.html">Autonomous</a>
-        <a href="a2a-messaging.html">A2A Messaging</a>
-          <a href="a2a-integration.html">Integrate an Agent</a>
-        <a href="lifecycle.html">Lifecycle</a>
-        <a href="performance.html">Performance</a>
-        <a href="agent-identity.html">Agent Identity (NHI)</a>
-        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
-        <div class="mnav-group">Architectures</div>
-        <a href="architectures.html">Overview</a>
-        <a href="architectures-t1.html">T1 — Single Agent</a>
-        <a href="architectures-t2.html">T2 — Many Agents</a>
-        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
-        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
-        <a href="architectures-t5.html">T5 — Global Hive</a>
-        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
-        <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-        <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        <div class="mnav-group">Internals</div>
-        <a href="schema.html">Schema</a>
-        <a href="types.html">Types</a>
-        <a href="validators.html">Validators</a>
-        <a href="governance.html">Governance</a>
-        <a href="batman-active-mode.html">Batman Mode</a>
-        <a href="tracing.html">Tracing</a>
-        <a href="spec/v1.html">Portability Spec v1</a>
-        <div class="mnav-group">Evidence</div>
-        <a href="evidence.html">Frozen Claims</a>
-        <a href="evidence/">Evidence Hub (campaigns)</a>
-        <a href="performance.html">Performance budgets</a>
-        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
-        <div class="mnav-group">More</div>
-        <a href="credits.html">Credits</a>
-        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
-      </div>
-    </details>
-  </div>
-</nav>
-
-<section class="hero">
-  <span class="cap-badge cap-future">VISION · v1.0+</span>
-  <span class="cap-badge cap-today">primitives composable today</span>
-  <h1>Tier 5 — Global hive</h1>
-  <p class="tagline">The north star. Multiple cloud regions, cross-organization federation with <strong>cryptographically attested identity</strong>, a unified collective of artificial minds reasoning over a shared knowledge graph while still respecting trust boundaries, jurisdictional rules, and per-namespace governance. The building block is the <strong>certified ≤50-peer cluster (~500–1000 agents)</strong>; the aspirational hundreds-of-thousands-to-millions total is a north-star composition, <em>not</em> a certified or measured capacity.</p>
-  <div class="pills">
-    <span class="pill">multi-region (vision)</span>
-    <span class="pill">many certified ≤50-peer clusters</span>
-    <span class="pill">attested identity</span>
-    <span class="pill">consensus governance</span>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <p>This tier is <strong>vision territory</strong>. It is what ai-memory is being built toward. The honest framing: every primitive on every diagram below is either shipped by v0.8.0, or scoped explicitly for v1.0+ with the design documented in an ADR or roadmap doc. There is <strong>no fiction</strong> on this page — only the destination, drawn explicitly so the path is legible.</p>
-    <p><strong>Scale grounding.</strong> The certified building block is a <strong>500–1000-agent cluster of ≤50 peers</strong> — issue #2438 retired the earlier 1M-single-fabric framing. The <em>peer</em> dimension is MEASURED to N=50 on one host (#2921 bench), the largest cross-host federation actually run is 2 nodes, and the per-region <code>~10⁵ agents</code> / global-millions figures on the diagram below are the <strong>aspirational composition of many such clusters</strong>, not a certified or measured capacity. Read the region counts as the destination, not a benchmark. Certified scope + §6 limits: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md" style="color:var(--p1)">the enterprise-federation certification</a>.</p>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Architecture diagram</span>
-    <h2>Multi-region · attested · federated · collective.</h2>
-
-    <div class="arch-diagram">
-      <div class="arch-diagram-title">T5 · Multi-region · attested · federated · collective</div>
-
-      <svg class="arch-svg" viewBox="0 0 940 660" role="img" aria-label="Multi-region global hive of ai-memory clusters with attested agent identity">
-
-        <defs>
-          <marker id="t5-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
-          </marker>
-
-          <radialGradient id="t5-globe-grad" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stop-color="#2dd4bf" stop-opacity="0.18"/>
-            <stop offset="70%" stop-color="#0d9488" stop-opacity="0.06"/>
-            <stop offset="100%" stop-color="#0d9488" stop-opacity="0"/>
-          </radialGradient>
-
-          <linearGradient id="t5-attest-grad" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stop-color="#f472b6" stop-opacity="0.20"/>
-            <stop offset="100%" stop-color="#be185d" stop-opacity="0.08"/>
-          </linearGradient>
-
-          <path id="t5-NA-EU" d="M 200 280 C 350 200, 540 200, 660 280" />
-          <path id="t5-EU-NA" d="M 660 300 C 540 380, 350 380, 200 300" />
-          <path id="t5-EU-APAC" d="M 720 280 C 800 220, 870 220, 870 290" />
-          <path id="t5-APAC-EU" d="M 850 290 C 820 340, 760 340, 720 300" />
-          <path id="t5-NA-APAC" d="M 180 320 C 350 540, 730 540, 870 320" />
-
-          <path id="t5-att-NA" d="M 470 80 L 200 250" />
-          <path id="t5-att-EU" d="M 470 80 L 660 250" />
-          <path id="t5-att-APAC" d="M 470 80 L 870 250" />
-        </defs>
-
-        <!-- ATTESTATION ROOT -->
-        <g>
-          <rect x="320" y="32" width="300" height="80" rx="14"
-                fill="url(#t5-attest-grad)" stroke="#f472b6" stroke-width="1.6" />
-          <text x="470" y="55" text-anchor="middle" class="node-label" style="font-size: 13px">Federated identity &amp; attestation root</text>
-          <text x="470" y="73" text-anchor="middle" class="sub-label">agent keypairs · signed memories · signed links</text>
-          <text x="470" y="88" text-anchor="middle" class="sub-label">memory_links.signature (WIRED with Ed25519 attestation)</text>
-          <text x="470" y="103" text-anchor="middle" class="sub-label" font-weight="700" fill="#be185d">v1.0+ · attested peers within one org (not cross-tenant confidentiality)</text>
-        </g>
-
-        <!-- ATTEST EDGES -->
-        <use href="#t5-att-NA" class="edge-roadmap" stroke="#f472b6" marker-end="url(#t5-arrow)" style="color: #f472b6" />
-        <use href="#t5-att-EU" class="edge-roadmap" stroke="#f472b6" marker-end="url(#t5-arrow)" style="color: #f472b6" />
-        <use href="#t5-att-APAC" class="edge-roadmap" stroke="#f472b6" marker-end="url(#t5-arrow)" style="color: #f472b6" />
-
-        <!-- REGION NA -->
-        <g>
-          <rect x="80" y="200" width="160" height="135" rx="14" fill="url(#t5-globe-grad)" stroke="#2dd4bf" stroke-width="1.5" />
-          <text x="160" y="222" text-anchor="middle" class="node-label">NA region</text>
-          <text x="160" y="238" text-anchor="middle" class="sub-label">us-east · us-west</text>
-          <text x="160" y="253" text-anchor="middle" class="sub-label">12 clusters</text>
-          <g><rect x="98" y="265" width="36" height="36" rx="6" class="node"/><text x="116" y="280" text-anchor="middle" class="sub-label" style="font-size: 8px">cluster</text><text x="116" y="292" text-anchor="middle" class="sub-label">1</text></g>
-          <g><rect x="142" y="265" width="36" height="36" rx="6" class="node"/><text x="160" y="280" text-anchor="middle" class="sub-label" style="font-size: 8px">cluster</text><text x="160" y="292" text-anchor="middle" class="sub-label">2</text></g>
-          <g><rect x="186" y="265" width="36" height="36" rx="6" class="node"/><text x="204" y="280" text-anchor="middle" class="sub-label" style="font-size: 8px">cluster</text><text x="204" y="292" text-anchor="middle" class="sub-label">3</text></g>
-          <text x="160" y="317" text-anchor="middle" class="sub-label">~10⁵ agents (vision)</text>
-          <text x="160" y="330" text-anchor="middle" class="sub-label">jurisdictional governance</text>
-        </g>
-
-        <!-- REGION EU -->
-        <g>
-          <rect x="540" y="200" width="160" height="135" rx="14" fill="url(#t5-globe-grad)" stroke="#2dd4bf" stroke-width="1.5" />
-          <text x="620" y="222" text-anchor="middle" class="node-label">EU region</text>
-          <text x="620" y="238" text-anchor="middle" class="sub-label">eu-west · eu-central</text>
-          <text x="620" y="253" text-anchor="middle" class="sub-label">8 clusters</text>
-          <g><rect x="558" y="265" width="36" height="36" rx="6" class="node"/><text x="576" y="280" text-anchor="middle" class="sub-label" style="font-size: 8px">cluster</text><text x="576" y="292" text-anchor="middle" class="sub-label">1</text></g>
-          <g><rect x="602" y="265" width="36" height="36" rx="6" class="node"/><text x="620" y="280" text-anchor="middle" class="sub-label" style="font-size: 8px">cluster</text><text x="620" y="292" text-anchor="middle" class="sub-label">2</text></g>
-          <g><rect x="646" y="265" width="36" height="36" rx="6" class="node"/><text x="664" y="280" text-anchor="middle" class="sub-label" style="font-size: 8px">cluster</text><text x="664" y="292" text-anchor="middle" class="sub-label">3</text></g>
-          <text x="620" y="317" text-anchor="middle" class="sub-label">~10⁵ agents (vision)</text>
-          <text x="620" y="330" text-anchor="middle" class="sub-label">jurisdictional governance</text>
-        </g>
-
-        <!-- REGION APAC -->
-        <g>
-          <rect x="770" y="200" width="160" height="135" rx="14" fill="url(#t5-globe-grad)" stroke="#2dd4bf" stroke-width="1.5" />
-          <text x="850" y="222" text-anchor="middle" class="node-label">APAC region</text>
-          <text x="850" y="238" text-anchor="middle" class="sub-label">ap-northeast · ap-south</text>
-          <text x="850" y="253" text-anchor="middle" class="sub-label">6 clusters</text>
-          <g><rect x="788" y="265" width="36" height="36" rx="6" class="node"/><text x="806" y="280" text-anchor="middle" class="sub-label" style="font-size: 8px">cluster</text><text x="806" y="292" text-anchor="middle" class="sub-label">1</text></g>
-          <g><rect x="832" y="265" width="36" height="36" rx="6" class="node"/><text x="850" y="280" text-anchor="middle" class="sub-label" style="font-size: 8px">cluster</text><text x="850" y="292" text-anchor="middle" class="sub-label">2</text></g>
-          <g><rect x="876" y="265" width="36" height="36" rx="6" class="node"/><text x="894" y="280" text-anchor="middle" class="sub-label" style="font-size: 8px">cluster</text><text x="894" y="292" text-anchor="middle" class="sub-label">3</text></g>
-          <text x="850" y="317" text-anchor="middle" class="sub-label">~10⁵ agents (vision)</text>
-          <text x="850" y="330" text-anchor="middle" class="sub-label">jurisdictional governance</text>
-        </g>
-
-        <!-- INTER-REGION MESH -->
-        <use href="#t5-NA-EU" class="edge" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#t5-arrow)" style="color: #a78bfa; opacity: 0.5" />
-        <use href="#t5-EU-NA" class="edge" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#t5-arrow)" style="color: #a78bfa; opacity: 0.5" />
-        <use href="#t5-EU-APAC" class="edge" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#t5-arrow)" style="color: #a78bfa; opacity: 0.5" />
-        <use href="#t5-APAC-EU" class="edge" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#t5-arrow)" style="color: #a78bfa; opacity: 0.5" />
-        <use href="#t5-NA-APAC" class="edge" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#t5-arrow)" style="color: #a78bfa; opacity: 0.5" />
-
-        <!-- PARTICLES — inter-region sync -->
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="5.4s" repeatCount="indefinite" begin="0s"><mpath href="#t5-NA-EU"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="5.4s" repeatCount="indefinite" begin="0.7s"><mpath href="#t5-EU-NA"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="5.4s" repeatCount="indefinite" begin="1.4s"><mpath href="#t5-EU-APAC"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="5.4s" repeatCount="indefinite" begin="2.1s"><mpath href="#t5-APAC-EU"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="5.4s" repeatCount="indefinite" begin="2.8s"><mpath href="#t5-NA-APAC"/></animateMotion></circle>
-
-        <!-- ATTESTATION particles -->
-        <circle r="3" class="flow flow-attest"><animateMotion dur="4.2s" repeatCount="indefinite" begin="0s"><mpath href="#t5-att-NA"/></animateMotion></circle>
-        <circle r="3" class="flow flow-attest"><animateMotion dur="4.2s" repeatCount="indefinite" begin="0.5s"><mpath href="#t5-att-EU"/></animateMotion></circle>
-        <circle r="3" class="flow flow-attest"><animateMotion dur="4.2s" repeatCount="indefinite" begin="1.0s"><mpath href="#t5-att-APAC"/></animateMotion></circle>
-
-        <!-- DISTRIBUTED CONSENSUS RAIL -->
-        <g>
-          <rect x="60" y="400" width="820" height="80" rx="12" fill="rgba(99,102,241,0.10)" stroke="#a78bfa" stroke-width="1.4" stroke-dasharray="6 3" />
-          <text x="470" y="425" text-anchor="middle" class="node-label" style="font-size: 13px">Distributed consensus rail · Raft / Paxos / Tangle</text>
-          <text x="470" y="442" text-anchor="middle" class="sub-label">strong consistency for governance writes · split-brain resolution · jurisdictional boundary enforcement</text>
-          <text x="470" y="458" text-anchor="middle" class="sub-label">gossip / DHT for many-node discovery</text>
-          <text x="470" y="475" text-anchor="middle" class="sub-label" font-weight="700" fill="#a78bfa">v1.0+ VISION · scoped, not yet designed</text>
-        </g>
-
-        <!-- HIVE EMERGENT BEHAVIOR -->
-        <g transform="translate(60, 510)">
-          <rect x="0" y="0" width="820" height="115" rx="12" fill="rgba(45,212,191,0.06)" stroke="#2dd4bf" stroke-width="1.4" />
-          <text x="410" y="22" text-anchor="middle" class="node-label" style="font-size: 13px">Hive properties — what becomes possible at this scale</text>
-          <text x="410" y="40" text-anchor="middle" class="sub-label">emergent collective recall · cross-region knowledge transfer · jurisdictional sandboxing</text>
-          <text x="410" y="56" text-anchor="middle" class="sub-label">attested provenance for every memory · zero-trust agent-to-agent · auditable lineage</text>
-          <text x="410" y="72" text-anchor="middle" class="sub-label">temporal-validity KG (v0.6.3) replays past states · point-in-time recall across the fleet</text>
-          <text x="410" y="88" text-anchor="middle" class="sub-label">policy-as-code at every namespace level · differential privacy on cross-tenant recall</text>
-          <text x="410" y="104" text-anchor="middle" class="sub-label" font-weight="700" fill="#0d9488">composed from primitives shipping today + v1.0</text>
-        </g>
-
-      </svg>
-
-      <div class="arch-legend">
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa"></span>inter-region sync (HMAC-signed + nonce-required)</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #f472b6"></span>attested identity (wired today, v1.0 fleet-trust)</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa; opacity: 0.5"></span>consensus rail (v1.0+ vision)</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #2dd4bf"></span>regional cluster (T4 pattern)</span>
-      </div>
-
-      <div class="arch-diagram-caption">
-        Each region is a T4 cluster pattern — composed of T3 cluster cells, composed of T2 multi-tenant nodes, composed of T1 primitives.
-        What's new at T5: cryptographic attestation, distributed consensus for governance, and emergent collective behavior.
+<body class="am-page">
+<a class="am-skip" href="#main">Skip to content</a>
+<header class="am-nav"><div class="am-nav-in">
+  <a class="am-brand" href="index.html" aria-label="ai-memory home">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2l9 5.2v9.6L12 22 3 16.8V7.2z" stroke="var(--accent)" stroke-width="1.5"/><circle cx="12" cy="12" r="2.4" fill="var(--accent)"/><path d="M12 9.6V4.5M12 14.4v5.1M14.4 12h5M4.9 12h5" stroke="var(--accent)" stroke-width="1.1"/></svg>
+    ai-memory <span class="am-crumb">/ architectures / T5</span>
+  </a>
+  <nav class="am-links" aria-label="Primary">
+    <a href="architectures.html">Architectures</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
+    <div class="am-dd">
+      <button aria-haspopup="true">Tiers ▾</button>
+      <div class="am-dd-menu">
+        <a href="architectures-t1.html">T1 · Single node<span>one agent, one store</span></a>
+        <a href="architectures-t2.html">T2 · Shared daemon<span>many agents, one host</span></a>
+        <a href="architectures-t3.html">T3 · Federated cluster<span>W-of-N quorum, signed sync</span></a>
+        <a href="architectures-t4.html">T4 · Data-center swarm<span>PostgreSQL tier</span></a>
+        <a href="architectures-t5.html">T5 · Federated hive<span>multi-DC / multi-region</span></a>
       </div>
     </div>
+    <div class="am-dd">
+      <button aria-haspopup="true">Reference ▾</button>
+      <div class="am-dd-menu">
+        <a href="reference-architecture/">3-region hive<span>the do-1461 run record</span></a>
+        <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory<span>API embeddings, no GPU</span></a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU<span>local embeddings</span></a>
+        <a href="enterprise-deployment.html">Enterprise deployment guide<span>sizing, replication, backups</span></a>
+        <a href="ARCHITECTURAL_LIMITS.html">Architectural limits<span>what does not scale, and why</span></a>
+      </div>
+    </div>
+    <div class="am-dd">
+      <button aria-haspopup="true">Planes ▾</button>
+      <div class="am-dd-menu">
+        <a href="federation.html">Federation<span>signed sync, quorum, catch-up</span></a>
+        <a href="wake-hub.html">Wake plane<span>wake-hub, wake-listen</span></a>
+        <a href="a2a-integration.html">Integrate any agent<span>inbox, notify, wake</span></a>
+        <a href="governance.html">Governance<span>policies, approvals</span></a>
+        <a href="encryption.html">Encryption<span>at rest and in transit</span></a>
+        <a href="SECURITY.html">Security model<span>threat model, posture</span></a>
+      </div>
+    </div>
+  </nav>
+  <details class="am-mnav"><summary>Menu</summary><div class="am-mnav-pane">
+    <a href="index.html">Home</a>
+    <a href="architectures.html">Architectures overview</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
+    <div class="am-g">Tiers</div>
+    <a href="architectures-t1.html">T1 · Single node</a>
+    <a href="architectures-t2.html">T2 · Shared daemon</a>
+    <a href="architectures-t3.html">T3 · Federated cluster</a>
+    <a href="architectures-t4.html">T4 · Data-center swarm</a>
+    <a href="architectures-t5.html">T5 · Federated hive</a>
+    <div class="am-g">Reference</div>
+    <a href="reference-architecture/">3-region hive</a>
+    <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory</a>
+    <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU</a>
+    <a href="ARCHITECTURAL_LIMITS.html">Architectural limits</a>
+    <div class="am-g">Planes</div>
+    <a href="federation.html">Federation</a>
+    <a href="wake-hub.html">Wake plane</a>
+    <a href="governance.html">Governance</a>
+    <a href="SECURITY.html">Security model</a>
+  </div></details>
+  <a class="am-cta" href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+</div></header>
+<main id="main">
+<section class="am-hero"><div class="am-wrap">
+  <nav class="am-rail" aria-label="Tiers"><a href="architectures.html">Overview</a><a href="architectures-t1.html">T1 · Single node</a><a href="architectures-t2.html">T2 · Shared daemon</a><a href="architectures-t3.html">T3 · Federated cluster</a><a href="architectures-t4.html">T4 · Data-center swarm</a><a href="architectures-t5.html" aria-current="page">T5 · Federated hive</a></nav>
+  <span class="am-pill"><i></i>Tier 5 · multi-DC · multi-region</span>
+  <h1 class="am-h1">A federated <span class="a">hive</span> of independent clusters.</h1>
+  <p class="am-sub">Tier 5 joins sites, data centers or regions, each a self-contained cluster block, with the same signed federation the lower tiers use: mutual TLS, Ed25519-signed and nonce-bound pushes from enrolled peers, W-of-N quorum writes with a timeout sized for the WAN, and catch-up pulls. <b>There is no global consensus.</b> A partition costs replication latency, never a committed write.</p>
+  <div class="am-proof">
+    <span><b>mTLS</b> + Ed25519 + nonce</span>
+    <span><b>202</b> durable-local on quorum miss</span>
+    <span><b>/sync/since</b> catch-up</span>
+    <span><b>asi-hard</b> posture</span>
+    <span><b>no</b> Raft / Paxos</span>
   </div>
-</section>
+</div></section>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">What's actually new</span>
-    <h2>T5 vs T4.</h2>
-    <p>T5 is <strong>not</strong> "more nodes than T4." The same cluster shape scales to thousands of nodes via T4's mechanisms. T5 is the tier where <strong>trust</strong> and <strong>consistency model</strong> change qualitatively.</p>
-
-    <h3>Cryptographic agent attestation</h3>
-    <p>At T1–T4, an agent's identity is <strong>claimed</strong> via <code>metadata.agent_id</code>. At T5 it must be <strong>proven</strong>.</p>
-    <p>The plumbing is already in v0.6.3 schema:</p>
-    <ul>
-      <li><code>memory_links.signature</code> column (schema v15) — reserved at v0.6.3 placeholder; populated with Ed25519 per-link attestation.</li>
-      <li>The <code>observed_by</code> column on <code>memory_links</code> records which agent observed the relationship — paired with <code>signature</code> this becomes provable provenance.</li>
-    </ul>
-    <p>What's needed to reach the T5 trust model:</p>
-    <ul>
-      <li>Agent keypair rotation (issuance shipped — Ed25519 keypairs).</li>
-      <li>Per-row signature verification on every <code>sync_push</code> ingress — the push <em>envelope</em> is already verified today (#791 <code>AI_MEMORY_FED_REQUIRE_SIG=1</code> default rejects missing/invalid <code>X-Memory-Sig</code>, plus #922 nonce anti-replay); per-row memory signatures across federation remain ahead.</li>
-      <li>Revocation list distribution.</li>
-      <li>Hardware-backed key custody for high-trust agents (TPM / Secure Enclave / Cloud KMS).</li>
-    </ul>
-    <p>The remaining chain is <strong>v1.0+ work</strong>. The v0.6.3 schema reservation was the down-payment; Ed25519 signing + envelope verification are now wired.</p>
-
-    <h3>Distributed consensus for governance</h3>
-    <p>At T3/T4, governance policies and pending decisions are <strong>eventually consistent</strong>. Two operators on partitioned sides of the cluster can both approve the same pending action. Last-write-wins resolves it on rejoin.</p>
-    <p>At T5 — with millions of agents and cross-jurisdictional rules — that's not enough. A change to <code>org/eu/personal-data</code> policy under GDPR has to be <strong>strongly consistent</strong> before any agent in any region commits a write under the new rule. This is the use case for a Raft-class consensus log on the <strong>governance plane only</strong> (not on the memory write path — that stays eventually consistent for performance).</p>
-    <p>The architectural separation:</p>
-    <ul>
-      <li><strong>Memory writes</strong> — eventually consistent, quorum-bounded (shipped — Track C).</li>
-      <li><strong>Governance writes</strong> — strongly consistent via consensus rail (v1.0+).</li>
-    </ul>
-    <p>Memories are append-mostly; governance is small, infrequent, and high-stakes. Different consistency models for different planes.</p>
-
-    <h3>Jurisdictional boundary enforcement</h3>
-    <p>At T5, namespaces aren't just visibility scopes — they're legal boundaries. The federated control plane has to enforce things like:</p>
-    <ul>
-      <li><em>"<code>org/eu/*</code> memories may only be physically resident in <code>eu-*</code> regions."</em></li>
-      <li><em>"Cross-region recall against <code>org/healthcare/*</code> requires policy assertion <code>hipaa_compliant=true</code> on the requesting agent."</em></li>
-      <li><em>"Audit log for any <code>org/finance/trading/*</code> write must be fsync'd to two independent storage backends in distinct AZs."</em></li>
-    </ul>
-    <p>These policies compose from existing primitives (namespace + governance + capabilities introspection + attested identity). They become enforceable when v1.0 wires the consensus rail and the attestation chain.</p>
-
-    <h3>Emergent collective behavior</h3>
-    <p>What makes T5 a <strong>hive</strong> rather than just a big cluster:</p>
-    <ul>
-      <li><strong>Cross-region knowledge transfer</strong> — A discovery in NA can propagate (or be rejected) by every other region's policy engine within seconds.</li>
-      <li><strong>Temporal-validity KG replay</strong> — v0.6.3's <code>memory_kg_query(valid_at=...)</code> plus the temporal columns (<code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>) means an agent can ask "what did the collective know at 14:23 UTC last Tuesday?" and get a deterministic answer across the fleet.</li>
-      <li><strong>Point-in-time provenance</strong> — Every memory has a signed origin and a tracked validity window. A regulator's request "show me what informed this decision" returns a verifiable lineage.</li>
-      <li><strong>Differential privacy on cross-tenant recall</strong> — Roadmap. The scope-visibility filter is the foundational primitive; DP noise on aggregated recalls is the v1.0+ cap.</li>
-    </ul>
-    <p>Each of these is a composition of primitives that ship today + v1.0. Nothing on the T5 list is a new fundamental capability — it's what becomes <strong>operationally possible</strong> when the lower-tier pieces are all in place at scale.</p>
+<section class="am-sec" id="diagram"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Architecture</span>
+    <h2>Sites meet only through <span class="a">federation</span>.</h2>
+    <p>Each site runs its own peers, its own same-host wake hubs and its own store. Two sites here keep data in operator-run PostgreSQL; the third is a small SQLite witness peer, so one site can be lost while W of N acknowledgements are still reachable. Size <code>--quorum-timeout-ms</code> for the round trip: the compiled default assumes peers in one data center, and the federation guide recommends several seconds for cross-region meshes.</p>
   </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">What ships today toward the hive</span>
-    <h2>A pleasant amount, actually.</h2>
-    <ul>
-      <li><strong>Hierarchical namespace + scope visibility</strong> — the substrate for jurisdictional boundaries.</li>
-      <li><strong>Per-namespace governance with pending workflows</strong> — the substrate for policy-as-code.</li>
-      <li><strong>Federated governance fanout</strong> — every node sees the same policy, eventually.</li>
-      <li><strong>Federated pending-decision sync</strong> — approve/reject propagates fleet-wide.</li>
-      <li><strong>Vector-clock causality</strong> — the substrate for "what did the fleet know when."</li>
-      <li><strong>Temporal-validity KG (v0.6.3)</strong> — <code>valid_from</code> / <code>valid_until</code> / <code>observed_by</code> columns on every link.</li>
-      <li><strong>Capabilities introspection v2 (v0.6.3)</strong> — runtime trust assessment per node.</li>
-      <li><strong>Hierarchical taxonomy (v0.6.3)</strong> — tree views over the global namespace tree.</li>
-      <li><strong><code>signature</code> column (reserved v0.6.3, now populated)</strong> — the schema down-payment for attestation, now carrying Ed25519 per-link signatures.</li>
-      <li><strong>Entity registry &amp; aliases (v0.6.3)</strong> — global entity identity, the substrate for cross-tenant identity resolution.</li>
-    </ul>
+  <div class="am-legend">
+    <span><i></i>federation · memory write</span>
+    <span><i class="teal"></i>wake hint</span>
+    <span><i class="bad"></i>limit</span>
   </div>
-</section>
+  <figure class="am-fig" style="--fig-min:920px">
+<svg class="dg" viewBox="0 0 1100 560" role="img" aria-labelledby="t5h-title" aria-describedby="t5h-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="t5h-title">Tier 5: a federated hive across data centers or regions</title><desc id="t5h-desc">Three sites, each an independent cluster block of ai-memory peers with same-host wake hubs and its own store: operator-run PostgreSQL in two sites and a small SQLite witness peer in the third. The sites federate over mutual TLS with Ed25519-signed, nonce-bound pushes from enrolled peers, W-of-N quorum writes with a timeout sized for the WAN, and catch-up pulls. There is no global consensus and no gossip discovery; wake hubs never cross hosts.</desc>
+<defs><marker id="t5h-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="t5h-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="t5h-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="t5h-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="t5h-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<g class="rise"><rect class="zone solid" x="30" y="70" width="320" height="266" rx="18"/><text class="t-k" x="46" y="92">SITE 1</text><text class="t-s" x="170" y="92">cluster block</text><rect class="box acc" x="46" y="104" width="136" height="70" rx="10"/><text class="t-m" x="58" y="126">ai-memory peer</text><text class="t-s" x="58" y="141">mTLS listener</text><text class="t-s" x="58" y="156">Ed25519 key</text><rect class="box teal" x="46" y="186" width="88" height="48" rx="9"/><text class="t-m" x="90" y="206" text-anchor="middle">wake-hub</text><text class="t-s" x="90" y="221" text-anchor="middle">this host</text><rect class="box acc" x="198" y="104" width="136" height="70" rx="10"/><text class="t-m" x="210" y="126">ai-memory peer</text><text class="t-s" x="210" y="141">mTLS listener</text><text class="t-s" x="210" y="156">Ed25519 key</text><rect class="box teal" x="198" y="186" width="88" height="48" rx="9"/><text class="t-m" x="242" y="206" text-anchor="middle">wake-hub</text><text class="t-s" x="242" y="221" text-anchor="middle">this host</text><rect class="box slate" x="46" y="252" width="288" height="72" rx="12"/><ellipse class="box slate" cx="190" cy="258" rx="134" ry="5"/><text class="t-m" x="190" y="280" text-anchor="middle">PostgreSQL 18 (operator-run)</text><text class="t-s" x="190" y="295" text-anchor="middle">primary + replicas · WAL archived off-site</text><text class="t-s" x="190" y="310" text-anchor="middle">volume encryption: operator-attested</text></g>
+<g class="rise" style="--d:0.15s"><rect class="zone solid" x="390" y="70" width="320" height="266" rx="18"/><text class="t-k" x="406" y="92">SITE 2</text><text class="t-s" x="530" y="92">cluster block</text><rect class="box acc" x="406" y="104" width="136" height="70" rx="10"/><text class="t-m" x="418" y="126">ai-memory peer</text><text class="t-s" x="418" y="141">mTLS listener</text><text class="t-s" x="418" y="156">Ed25519 key</text><rect class="box teal" x="406" y="186" width="88" height="48" rx="9"/><text class="t-m" x="450" y="206" text-anchor="middle">wake-hub</text><text class="t-s" x="450" y="221" text-anchor="middle">this host</text><rect class="box acc" x="558" y="104" width="136" height="70" rx="10"/><text class="t-m" x="570" y="126">ai-memory peer</text><text class="t-s" x="570" y="141">mTLS listener</text><text class="t-s" x="570" y="156">Ed25519 key</text><rect class="box teal" x="558" y="186" width="88" height="48" rx="9"/><text class="t-m" x="602" y="206" text-anchor="middle">wake-hub</text><text class="t-s" x="602" y="221" text-anchor="middle">this host</text><rect class="box slate" x="406" y="252" width="288" height="72" rx="12"/><ellipse class="box slate" cx="550" cy="258" rx="134" ry="5"/><text class="t-m" x="550" y="280" text-anchor="middle">PostgreSQL 18 (operator-run)</text><text class="t-s" x="550" y="295" text-anchor="middle">primary + replicas · WAL archived off-site</text><text class="t-s" x="550" y="310" text-anchor="middle">volume encryption: operator-attested</text></g>
+<g class="rise" style="--d:0.3s"><rect class="zone solid" x="750" y="70" width="320" height="266" rx="18"/><text class="t-k" x="766" y="92">SITE 3</text><text class="t-s" x="822" y="92">witness peer</text><rect class="box acc" x="766" y="104" width="288" height="70" rx="10"/><text class="t-m" x="778" y="126">ai-memory peer</text><text class="t-s" x="778" y="141">mTLS listener</text><text class="t-s" x="778" y="156">Ed25519 key</text><rect class="box teal" x="766" y="186" width="88" height="48" rx="9"/><text class="t-m" x="810" y="206" text-anchor="middle">wake-hub</text><text class="t-s" x="810" y="221" text-anchor="middle">this host</text><rect class="box" x="766" y="252" width="288" height="72" rx="12"/><ellipse class="box" cx="910" cy="258" rx="134" ry="5"/><text class="t-m" x="910" y="280" text-anchor="middle">SQLite witness peer</text><text class="t-s" x="910" y="295" text-anchor="middle">a small tie-breaking peer: W of N</text><text class="t-s" x="910" y="310" text-anchor="middle">can still be met if a site fails</text></g>
+<text class="t-k" x="550" y="22" text-anchor="middle">CROSS-SITE FEDERATION  ·  mTLS  ·  signed + nonce-bound pushes  ·  enrolled peers only  ·  W-of-N, WAN-sized timeout</text><path class="wire" d="M158 40 H966"/><path class="flow slow" d="M158 40 H966"/><path class="flow slow rev" d="M158 40 H966"/><path class="dot" pathLength="100" d="M158 40 H966" style="--d:0.2s"/><path class="dot" pathLength="100" d="M966 40 H158" style="--d:1.8s"/><path class="wire" d="M158 104 V40"/><path class="flow slow" d="M158 104 V40"/><circle class="ring" cx="158" cy="40" r="7"/><circle class="pulse" cx="158" cy="40" r="3.5"/><path class="wire" d="M310 104 V40"/><path class="flow slow" d="M310 104 V40"/><circle class="ring" cx="310" cy="40" r="7" style="--d:0.4s"/><circle class="pulse" cx="310" cy="40" r="3.5" style="--d:0.4s"/><path class="wire" d="M518 104 V40"/><path class="flow slow" d="M518 104 V40"/><circle class="ring" cx="518" cy="40" r="7" style="--d:0.8s"/><circle class="pulse" cx="518" cy="40" r="3.5" style="--d:0.8s"/><path class="wire" d="M670 104 V40"/><path class="flow slow" d="M670 104 V40"/><circle class="ring" cx="670" cy="40" r="7" style="--d:1.2000000000000002s"/><circle class="pulse" cx="670" cy="40" r="3.5" style="--d:1.2000000000000002s"/><path class="wire" d="M966 104 V40"/><path class="flow slow" d="M966 104 V40"/><circle class="ring" cx="966" cy="40" r="7" style="--d:1.6s"/><circle class="pulse" cx="966" cy="40" r="3.5" style="--d:1.6s"/><path class="wire" d="M90 174 V184" marker-end="url(#t5h-at)"/><path class="flow teal" d="M90 174 V184"/><path class="wire" d="M242 174 V184" marker-end="url(#t5h-at)"/><path class="flow teal" d="M242 174 V184"/><path class="wire" d="M160 234 V250" marker-end="url(#t5h-aa)"/><path class="flow" d="M160 234 V250"/><path class="wire" d="M450 174 V184" marker-end="url(#t5h-at)"/><path class="flow teal" d="M450 174 V184"/><path class="wire" d="M602 174 V184" marker-end="url(#t5h-at)"/><path class="flow teal" d="M602 174 V184"/><path class="wire" d="M520 234 V250" marker-end="url(#t5h-aa)"/><path class="flow" d="M520 234 V250"/><path class="wire" d="M810 174 V184" marker-end="url(#t5h-at)"/><path class="flow teal" d="M810 174 V184"/><path class="wire" d="M950 174 V250" marker-end="url(#t5h-aa)"/><path class="flow" d="M950 174 V250"/><g class="rise" style="--d:0.6s"><rect class="box teal" x="30" y="360" width="330" height="92" rx="12"/><text class="t-m" x="46" y="384">security posture</text><text class="t-s" x="46" y="401">asi-hard profile pins hardened knobs and</text><text class="t-s" x="46" y="418">refuses to boot if one is loosened;</text><text class="t-teal" x="46" y="435">doctor --posture enterprise-federation</text></g>
+<g class="rise" style="--d:0.7s"><rect class="box" x="380" y="360" width="340" height="92" rx="12"/><text class="t-m" x="396" y="384">certified scope</text><text class="t-s" x="396" y="401">500–1000-agent clusters of ≤ 50-peer</text><text class="t-s" x="396" y="418">blocks, certified as a trust boundary;</text><text class="t-s" x="396" y="435">scale out by adding independent clusters</text></g>
+<g class="rise" style="--d:0.8s"><rect class="box bad" x="740" y="360" width="330" height="92" rx="12"/><text class="t-bad" x="756" y="384">not in the box</text><text class="t-s" x="756" y="401">no Raft / Paxos, no gossip discovery</text><text class="t-s" x="756" y="418">wake hubs never cross hosts</text><text class="t-s" x="756" y="435">graph invalidations converge eventually</text></g>
+<text class="t-s" x="30" y="488">Agents in every site reach their local peer over HTTPS; a message for an agent in another site travels as an inbox row by federation,</text><text class="t-s" x="30" y="506">and the receiving peer wakes its local hub only when the apply moved the row forward (replays wake nobody).</text></svg>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Honest gap analysis</span>
-    <h2>What blocks T5 today.</h2>
-    <table>
-      <thead>
-        <tr><th>Capability</th><th>Today</th><th>v0.8.0</th><th>v1.0+</th></tr>
-      </thead>
-      <tbody>
-        <tr><td>Quorum-write contract</td><td>shipped</td><td>Track C ✓</td><td>—</td></tr>
-        <tr><td>Postgres + pgvector backbone</td><td>shipped as a store (<code>sal-postgres</code>)</td><td>Track B ✓</td><td>full federation-<em>receiver</em> parity (#3075)</td></tr>
-        <tr><td>Cryptographic agent attestation</td><td>wired (Ed25519, #626)</td><td>✓</td><td>full chain</td></tr>
-        <tr><td>Distributed consensus (governance plane)</td><td>—</td><td>—</td><td>designed</td></tr>
-        <tr><td>Gossip / DHT (many-node discovery)</td><td>—</td><td>—</td><td>designed</td></tr>
-        <tr><td>Cross-region failover / quorum bounds</td><td>—</td><td>—</td><td>designed</td></tr>
-        <tr><td>Differential privacy on recall</td><td>—</td><td>—</td><td>designed</td></tr>
-        <tr><td>Hardware-backed key custody</td><td>—</td><td>—</td><td>designed</td></tr>
-        <tr><td>Multi-tenant policy-as-code DSL</td><td>partial (JSON policies)</td><td>enriched</td><td>full DSL</td></tr>
-      </tbody>
-    </table>
-    <p>This is the honest road. Each row that flips toward shipping is a discrete piece of engineering with a tracked owner and an ADR. <strong>Postgres-backbone scope (#3075):</strong> PostgreSQL is a shipped, first-class <em>store</em> backend, but as a federation <em>receiver</em> it replicates only the <code>memories[]</code> lane in v1.0.0 — the federated-governance lanes (<code>checkpoints</code>, <code>pendings</code>, <code>pending_decisions</code>, <code>namespace_meta</code>, <code>namespace_meta_clears</code>, <code>archives</code>, <code>restores</code>) return an honest <code>unsupported_on_postgres</code> non-ack and are SQLite-receiver-only until full Postgres-receiver parity lands in v1.1. Keep governance-quorum receivers on the SQLite backend.</p>
+  </figure>
+  <p class="am-figcap"><b>Certified as a trust boundary.</b> The enterprise federation certification covers 500–1000-agent clusters built from blocks of at most 50 peers: namespace confinement, peer attestation, per-write authority, at-rest confidentiality and the tamper-evident audit spine. It certifies no throughput or latency figure; scale beyond one cluster by adding independent clusters. Sources: <code>src/federation/signing.rs</code>, <code>src/federation/peer_attestation.rs</code>, <code>src/replication.rs</code>, <code>src/security_profile.rs</code>, <code>docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md</code>.</p>
+</div></section>
+
+<section class="am-sec alt" id="partition"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Partitions</span>
+    <h2>Durable locally, <span class="a">converged</span> after the heal.</h2>
+    <p>A federated write commits on the receiving site before it fans out and is never rolled back. When fewer than W peers acknowledge in time, the daemon answers <code>202 Accepted</code> with <code>quorum_met:false</code> and <code>durability:"local"</code>, and the undelivered push waits in the dead-letter queue. After the partition heals, dead-letter replay and the <code>/sync/since</code> catch-up loop bring every peer to the same rows; erasures travel through a durable outbox the same way.</p>
   </div>
-</section>
+  <figure class="am-fig" style="--fig-min:900px">
+<svg class="dg" viewBox="0 0 1100 380" role="img" aria-labelledby="t5p-title" aria-describedby="t5p-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="t5p-title">Tier 5 partition behaviour: durable locally, converge after heal</title><desc id="t5p-desc">Four panels. Healthy: a write reaches W of N acknowledgements. Partition: site 3 is cut off, the write commits on site 1 and answers 202 Accepted with quorum_met false and durability local. Queued: the undelivered push waits in the dead-letter queue. Heal: dead-letter replay and the sync/since catch-up pull bring every peer to the same rows, erasures included.</desc>
+<defs><marker id="t5p-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="t5p-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="t5p-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="t5p-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="t5p-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<g class="rise"><rect class="zone solid" x="30" y="30" width="246" height="330" rx="18"/><text class="t-k" x="46" y="54">01 · HEALTHY</text></g>
+<path class="wire" d="M143 116 L92 194" marker-end="url(#t5p-aa)"/><path class="flow" d="M143 116 L92 194"/><path class="dot" pathLength="100" d="M143 116 L92 194" style="--d:0.3s"/><path class="wire" d="M163 116 L214 194" marker-end="url(#t5p-aa)"/><path class="flow" d="M163 116 L214 194"/><path class="dot" pathLength="100" d="M163 116 L214 194" style="--d:0.6s"/><path class="wire" d="M102 210 H204"/><circle class="box acc" cx="153" cy="100" r="20"/><text class="t-a" x="153" y="104" text-anchor="middle">1</text><text class="t-s" x="181" y="104">site 1</text><circle class="ring" cx="153" cy="100" r="20"/><circle class="box" cx="80" cy="210" r="20"/><text class="t-m" x="80" y="214" text-anchor="middle">2</text><text class="t-s" x="80" y="246" text-anchor="middle">site 2</text><circle class="box" cx="226" cy="210" r="20"/><text class="t-m" x="226" y="214" text-anchor="middle">3</text><text class="t-s" x="226" y="246" text-anchor="middle">site 3</text><g class="rise" style="--d:0.2s"><rect class="box" x="44" y="262" width="218" height="84" rx="10"/><text class="t-s" x="56" y="284">W of N acks in time</text><text class="t-s" x="56" y="301">→ write acknowledged</text></g>
+<path class="wire" d="M276 195 H292" marker-end="url(#t5p-aa)"/><path class="flow" d="M276 195 H292"/><g class="rise" style="--d:0.15s"><rect class="zone solid" x="292" y="30" width="246" height="330" rx="18"/><text class="t-k" x="308" y="54">02 · PARTITION</text></g>
+<path class="wire" d="M405 116 L354 194" marker-end="url(#t5p-ab)"/><path class="flow bad" d="M405 116 L354 194"/><path class="dot bad" pathLength="100" d="M405 116 L354 194" style="--d:0.5s"/><path class="wire ghost" d="M425 116 L445.5 147.0"/><path class="wire ghost" d="M457.5 163.0 L476 194"/><path class="flow bad" d="M443.5 147.0 l16 16 M459.5 147.0 l-16 16"/><path class="wire ghost" d="M364 210 H466"/><circle class="box acc" cx="415" cy="100" r="20"/><text class="t-a" x="415" y="104" text-anchor="middle">1</text><text class="t-s" x="443" y="104">site 1</text><circle class="ring" cx="415" cy="100" r="20" style="--d:0.5s"/><circle class="box" cx="342" cy="210" r="20"/><text class="t-m" x="342" y="214" text-anchor="middle">2</text><text class="t-s" x="342" y="246" text-anchor="middle">site 2</text><circle class="box ghost" cx="488" cy="210" r="20"/><text class="t-m" x="488" y="214" text-anchor="middle">3</text><text class="t-s" x="488" y="246" text-anchor="middle">site 3</text><g class="rise" style="--d:0.35s"><rect class="box bad" x="306" y="262" width="218" height="84" rx="10"/><text class="t-s" x="318" y="284">site 3 unreachable; acks &lt; W</text><text class="t-bad" x="318" y="301">→ 202 quorum_met:false</text><text class="t-s" x="318" y="318">   durability:"local"</text></g>
+<path class="wire" d="M538 195 H554" marker-end="url(#t5p-aa)"/><path class="flow" d="M538 195 H554"/><g class="rise" style="--d:0.3s"><rect class="zone solid" x="554" y="30" width="246" height="330" rx="18"/><text class="t-k" x="570" y="54">03 · QUEUED</text></g>
+<path class="wire" d="M667 116 L616 194" marker-end="url(#t5p-aa)"/><path class="flow" d="M667 116 L616 194"/><path class="dot" pathLength="100" d="M667 116 L616 194" style="--d:0.7s"/><path class="wire ghost" d="M687 116 L707.5 147.0"/><path class="wire ghost" d="M719.5 163.0 L738 194"/><path class="flow bad" d="M705.5 147.0 l16 16 M721.5 147.0 l-16 16"/><path class="wire ghost" d="M626 210 H728"/><circle class="box acc" cx="677" cy="100" r="20"/><text class="t-a" x="677" y="104" text-anchor="middle">1</text><text class="t-s" x="705" y="104">site 1</text><circle class="ring" cx="677" cy="100" r="20" style="--d:1.0s"/><circle class="box" cx="604" cy="210" r="20"/><text class="t-m" x="604" y="214" text-anchor="middle">2</text><text class="t-s" x="604" y="246" text-anchor="middle">site 2</text><circle class="box ghost" cx="750" cy="210" r="20"/><text class="t-m" x="750" y="214" text-anchor="middle">3</text><text class="t-s" x="750" y="246" text-anchor="middle">site 3</text><rect class="box slate" x="704" y="84" width="76" height="30" rx="7"/><text class="t-slate" x="742" y="104" text-anchor="middle">DLQ</text><g class="rise" style="--d:0.5s"><rect class="box" x="568" y="262" width="218" height="84" rx="10"/><text class="t-s" x="580" y="284">row committed on site 1</text><text class="t-s" x="580" y="301">push waits in the DLQ;</text><text class="t-s" x="580" y="318">nothing is rolled back</text></g>
+<path class="wire" d="M800 195 H816" marker-end="url(#t5p-aa)"/><path class="flow" d="M800 195 H816"/><g class="rise" style="--d:0.44999999999999996s"><rect class="zone solid" x="816" y="30" width="246" height="330" rx="18"/><text class="t-k" x="832" y="54">04 · HEAL</text></g>
+<path class="wire" d="M929 116 L878 194" marker-end="url(#t5p-at)"/><path class="flow teal" d="M929 116 L878 194"/><path class="dot teal" pathLength="100" d="M929 116 L878 194" style="--d:0.9000000000000001s"/><path class="wire" d="M949 116 L1000 194" marker-end="url(#t5p-at)"/><path class="flow teal" d="M949 116 L1000 194"/><path class="dot teal" pathLength="100" d="M949 116 L1000 194" style="--d:1.2000000000000002s"/><path class="wire" d="M888 210 H990"/><circle class="box acc" cx="939" cy="100" r="20"/><text class="t-a" x="939" y="104" text-anchor="middle">1</text><text class="t-s" x="967" y="104">site 1</text><circle class="ring teal" cx="939" cy="100" r="20" style="--d:1.5s"/><circle class="box" cx="866" cy="210" r="20"/><text class="t-m" x="866" y="214" text-anchor="middle">2</text><text class="t-s" x="866" y="246" text-anchor="middle">site 2</text><circle class="box" cx="1012" cy="210" r="20"/><text class="t-m" x="1012" y="214" text-anchor="middle">3</text><text class="t-s" x="1012" y="246" text-anchor="middle">site 3</text><g class="rise" style="--d:0.6499999999999999s"><rect class="box teal" x="830" y="262" width="218" height="84" rx="10"/><text class="t-s" x="842" y="284">DLQ replay + /sync/since</text><text class="t-s" x="842" y="301">catch-up pull; newer-wins</text><text class="t-s" x="842" y="318">merge; erasures delivered</text></g>
+</svg>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Why this tier matters</span>
-    <h2>Primitives compose.</h2>
-    <p>ai-memory is a primitive. <strong>Primitives compose.</strong> The same MCP protocol surface, the same recall pipeline, the same governance contract that runs on a developer's laptop is what runs in the fleet at T5. There is no separate "enterprise edition" or rebuild — there is the primitive, scaled.</p>
-    <p>That property — <strong>one continuous surface from one agent to the global hive</strong>, with no rewrite at any tier boundary — is what makes the architecture credible. (Honest bound: the surface is continuous, not byte-identical across backends. A PostgreSQL-backed tier serves 61 of the 82 unique HTTP paths; the other 21 fail closed with <code>501</code>, and MCP stdio is SQLite-only — see <a href="performance.html">performance.html</a>.) It's what lets a startup at T2 grow to T5 without rewriting their integration. It's what lets a research collective federate with a corporation while preserving each side's governance.</p>
-    <p>The compounding value:</p>
-    <ul>
-      <li><strong>Memory becomes infrastructure</strong> — like a CDN, like DNS. Any agent, anywhere, can ask "what does the collective know about X?" and get an answer that respects every relevant policy.</li>
-      <li><strong>Trust becomes verifiable</strong> — attested provenance means "agent A asserted this at time T from cluster C with these capabilities" is provable, not merely claimed.</li>
-      <li><strong>Governance becomes federated</strong> — a policy update in one rack lands in every rack. A pending approval on one continent is visible on every other.</li>
-      <li><strong>Knowledge becomes durable</strong> — the temporal-validity KG means past states are queryable. "What did the fleet think on 2026-01-15?" is a deterministic answer.</li>
-    </ul>
-    <p>That's the hive. It's worth building toward, even if v1.0 is still out there.</p>
+  </figure>
+  <p class="am-figcap">Sources: <code>src/handlers/parity.rs</code>, <code>src/federation/push_dlq.rs</code>, <code>src/federation/receive.rs</code>, <code>src/federation/erasure_outbox.rs</code>; design: <a href="ADR-0001-quorum-replication.html">ADR-0001 quorum replication</a>.</p>
+</div></section>
+
+<section class="am-sec" id="walkthrough"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Walkthrough</span>
+    <h2>One write, <span class="a">one recall</span>.</h2>
   </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Source</span>
-    <h2>Source-of-truth references.</h2>
-    <ul>
-      <li><code>ROADMAP.md</code> — Track A (T1/T2 polish), B (Postgres), C (quorum), D (attestation)</li>
-      <li><code>docs/ADR-0001-quorum-replication.md</code> — quorum write design</li>
-      <li><code>docs/ARCHITECTURAL_LIMITS.md</code> — honest ceiling on every dimension</li>
-      <li><code>src/models/</code> — <code>MemoryLink</code> (with v15 <code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>, <code>signature</code>)</li>
-      <li><code>src/storage/</code> — schema v15 migration (entity_aliases, KG tables, temporal indexes)</li>
-      <li>v0.6.3 release notes — taxonomy, KG layer, capabilities v2, entity registry</li>
-    </ul>
+  <div class="am-grid two">
+    <div class="am-card gold"><span class="am-k">Write</span><h3>Across sites</h3>
+      <ol class="am-steps" style="margin-top:12px">
+        <li>An agent in site 1 writes to its local peer over HTTPS; identity and the namespace governance gate run first.</li>
+        <li>The row commits in site 1's store.</li>
+        <li>The peer signs the body with its enrolled Ed25519 key, binds it to a fresh nonce and pushes it to the other sites over mutual TLS.</li>
+        <li>Each receiver verifies the signature and nonce, checks that the sender is enrolled and may write that namespace, and applies the row with a newer-wins merge.</li>
+        <li>W acknowledgements in time acknowledge the write; otherwise the answer is <code>202</code> and the dead-letter queue retries.</li>
+      </ol></div>
+    <div class="am-card teal"><span class="am-k">Recall</span><h3>Always local</h3>
+      <ol class="am-steps" style="margin-top:12px">
+        <li>An agent in site 2 recalls from its own peer; recall never crosses the WAN.</li>
+        <li>It sees every row its site has applied, filtered by scope visibility.</li>
+        <li>A row still in flight from site 1 appears once it is applied: this tier is eventually consistent, by design.</li>
+        <li>A message for this agent wakes its local hub only when the federated apply moved the inbox row forward.</li>
+      </ol></div>
   </div>
-</section>
+</div></section>
 
-<footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v1.0.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
-</footer>
+<section class="am-sec alt" id="recipe"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Deployment recipe</span>
+    <h2>Per site, the same <span class="a">daemon</span>.</h2>
+    <p>Every site runs the T3/T4 daemon configuration; what changes is the peer list, the WAN-sized quorum timeout and the hardened posture.</p>
+  </div>
+<pre><code># on each peer (site 1 shown); PostgreSQL sites add AI_MEMORY_STORE_URL_FILE
+AI_MEMORY_SECURITY_PROFILE=asi-hard \
+ai-memory serve \
+  --host 0.0.0.0 --port 9077 \
+  --tls-cert /etc/ai-memory/tls.crt --tls-key /etc/ai-memory/tls.key \
+  --mtls-allowlist /etc/ai-memory/mtls-allow.txt \
+  --quorum-writes 2 \
+  --quorum-peers https://site-2-peer:9077,https://site-3-witness:9077 \
+  --quorum-timeout-ms 8000 \
+  --quorum-client-cert /etc/ai-memory/fed.crt --quorum-client-key /etc/ai-memory/fed.key \
+  --quorum-ca-cert /etc/ai-memory/fed-ca.crt
 
+# verify the certified posture on every peer
+ai-memory doctor --posture enterprise-federation
+
+# verify the signed_events chain (reads the local SQLite --db; SQLite peers)
+ai-memory verify-signed-events-chain
+
+# OPERATOR side, not ai-memory: PostgreSQL replication across DCs,
+# WAL archive to off-site storage, DNS / load balancing per site</code></pre>
+  <p class="am-figcap">Flags and verbs: <code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>, <code>DoctorCliArgs</code>); the profile name is read by <code>src/security_profile.rs</code>. The 8000 ms value is the one the 3-region reference deploy pins, per the <a href="federation.html">federation guide</a>. Enrol each peer's certificate pin and signing key before the first push.</p>
+</div></section>
+
+<section class="am-sec" id="wiring"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Wiring</span>
+    <h2>Governance, wake and attestation <span class="a">at T5</span>.</h2>
+  </div>
+  <div class="am-grid">
+    <div class="am-card gold"><span class="am-k">Governance</span><h3>Replicated policy</h3><p>Namespace standards, pending actions and their decisions replicate through the same signed push as memories, so a policy set in one site applies in every site once applied.</p></div>
+    <div class="am-card teal"><span class="am-k">Wake plane</span><h3>Local by construction</h3><p>Each host has its own hub on a Unix socket. Messages cross sites as inbox rows by federation; the receiving peer publishes a local wake only for a fresh apply, so replays and superseded rows cannot loop.</p></div>
+    <div class="am-card"><span class="am-k">Attestation</span><h3>Every push accounted for</h3><p>Unsigned, replayed or unenrolled pushes are refused with <code>401</code>. Peer attestation checks the claimed sender and the namespaces it may write; every node keeps its own <code>signed_events</code> chain.</p></div>
+  </div>
+</div></section>
+
+<section class="am-sec alt" id="limits"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Honest limits</span>
+    <h2>What a hive <span class="a">is not</span>.</h2>
+  </div>
+  <div class="am-tablewrap"><table class="am-table">
+    <thead><tr><th>Limit</th><th>What it means</th><th>Where it is documented</th></tr></thead>
+    <tbody>
+      <tr><td><b>No consensus</b></td><td>No Raft or Paxos and no single global order of writes. Peers converge through quorum writes, dead-letter replay and catch-up.</td><td><a href="ADR-0001-quorum-replication.html">ADR-0001</a></td></tr>
+      <tr><td><b>No gossip discovery</b></td><td>Peers are listed and enrolled explicitly by the operator.</td><td><a href="federation.html">federation</a></td></tr>
+      <tr><td><b>Eventual consistency</b></td><td>A recall in another site sees a write once it is applied there; graph invalidations also converge asynchronously.</td><td><a href="ARCHITECTURAL_LIMITS.html">limits §13</a></td></tr>
+      <tr><td><b>Wake plane stays on its host</b></td><td>Cross-site delivery is federation plus the backstop poll; it is not a measured millisecond promise.</td><td><a href="wake-hub.html">wake plane</a></td></tr>
+      <tr><td><b>Certified scope</b></td><td>The certified unit is a 500–1000-agent cluster of at most 50-peer blocks; it is a trust boundary, not a throughput or latency figure.</td><td><a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md">certification</a></td></tr>
+      <tr><td><b>Daemon is the access path</b></td><td>As on T4: no direct-to-PostgreSQL client and no CDC stream.</td><td><a href="ARCHITECTURAL_LIMITS.html">limits §5, §7</a></td></tr>
+    </tbody>
+  </table></div>
+  <div class="am-note"><b>See it run.</b> The <a href="reference-architecture/">3-region reference hive</a> is the measured run record behind this tier: three regions, a federated quorum mesh and three encrypted legs, each proven with a positive and a negative test.</div>
+</div></section>
+
+<section class="am-sec" id="sources"><div class="am-wrap">
+  <div class="am-sec-h"><span class="am-eyebrow">Sources</span><h2>Read the <span class="a">code</span>.</h2></div>
+  <div class="am-grid">
+    <div class="am-card"><span class="am-k">Federation</span><ul><li><code>src/federation/signing.rs</code> · signatures, nonces</li><li><code>src/federation/peer_attestation.rs</code> · sender, scope</li><li><code>src/federation/push_dlq.rs</code> · dead-letter replay</li></ul></div>
+    <div class="am-card"><span class="am-k">Consistency</span><ul><li><code>src/replication.rs</code> · W-of-N quorum</li><li><code>src/handlers/parity.rs</code> · the 202 contract</li><li><code>src/federation/receive.rs</code> · catch-up loop</li></ul></div>
+    <div class="am-card"><span class="am-k">Posture</span><ul><li><code>src/security_profile.rs</code> · asi-hard</li><li><code>src/enterprise_federation_posture.rs</code> · posture check</li><li><code>src/federation/applied_wake.rs</code> · federated wake</li></ul></div>
+  </div>
+  <div class="am-btns"><a class="am-btn" href="architectures-t4.html">← T4 · Data-center swarm</a><a class="am-btn primary" href="reference-architecture/">3-region reference hive →</a></div>
+</div></section>
+</main>
+<footer class="am-foot"><div class="am-wrap">
+  <span>© 2026 AlphaOne LLC · Apache-2.0 · ai-memory v1.0.0</span>
+  <span><a href="https://github.com/alphaonedev/ai-memory-mcp">source</a> · <a href="index.html">home</a> · <a href="architectures.html">architectures</a> · <a href="ARCHITECTURAL_LIMITS.html">limits</a></span>
+</div></footer>
+<button class="am-themetog" id="am-themetog" type="button" aria-label="Toggle light or dark theme">theme</button>
+<script>
+(function(){var d=document.documentElement;try{var s=localStorage.getItem('aim-site-theme');if(s)d.setAttribute('data-theme',s);}catch(e){}
+var b=document.getElementById('am-themetog');if(!b)return;b.addEventListener('click',function(){var c=d.getAttribute('data-theme');var n=c==='dark'?'light':c==='light'?'dark':(matchMedia('(prefers-color-scheme:dark)').matches?'light':'dark');d.setAttribute('data-theme',n);try{localStorage.setItem('aim-site-theme',n);}catch(e){}});})();
+</script>
 </body>
 </html>

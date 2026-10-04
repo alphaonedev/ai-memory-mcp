@@ -199,7 +199,7 @@ if [[ "${1:-}" == "--update-baseline" ]]; then
         echo "# const-name-literals grandfathered baseline — burn-down to EMPTY"
         echo "# scheduled in the #1579 merge-train. Entries: relpath:identifier."
         echo "# Regenerate ONLY via --update-baseline (operator-gated)."
-        scan emit | sort -u
+        scan emit | LC_ALL=C sort -u
     } > "$BASELINE"
     echo "baseline regenerated: $(grep -cv '^#' "$BASELINE" || true) entries"
     exit 0
@@ -210,7 +210,18 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # a line the scanner must read. Each case is probed on its own so one
     # shape can never mask another.
     probe="${ROOT}/src/__name_literal_gate_selftest.rs"
-    trap 'rm -f "$probe"' EXIT
+    # Refuse rather than overwrite (and later delete) a file this run did not
+    # create, exactly like the other probe-planting self-tests (#4292, f2r).
+    if [[ -e "$probe" ]]; then
+        echo "ERROR: self-test scratch file already exists: $probe" >&2
+        echo "(cleanup may have failed in a prior run — remove manually)" >&2
+        exit 2
+    fi
+    # #4292: the probe is removed on ANY exit, including an interrupted one,
+    # and INT/TERM re-raise (an EXIT-only trap let an interrupted run finish
+    # and exit 0). See scripts/lib/selftest-probes.sh.
+    source "${ROOT}/scripts/lib/selftest-probes.sh"
+    selftest_probes_arm "$probe"
     st_rc=0
 
     # (a) TRUE POSITIVES — the gate must still HARD-BLOCK every one.
@@ -245,8 +256,7 @@ SELFTEST_POSITIVE
     let key256 = [0u8; 256];
 SELFTEST_NEGATIVE
 
-    rm -f "$probe"
-    trap - EXIT
+    selftest_probes_disarm
     if [[ "$st_rc" -ne 0 ]]; then
         exit 1
     fi

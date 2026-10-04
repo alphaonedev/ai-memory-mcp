@@ -85,7 +85,7 @@ fn parse_notify(params: &Value) -> Result<NotifyInput<'_>, MemoryError> {
         MemoryError::ValidationFailed(crate::errors::msg::invalid("tier", tier_str))
     })?;
 
-    validate::validate_agent_id(target)
+    validate::validate_notify_target(target)
         .map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
     validate::validate_title(title).map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
     validate::validate_content(payload)
@@ -187,10 +187,9 @@ fn persist_notify(
     // one row plus the caller-controlled title/content/metadata bytes.
     let payload_bytes =
         crate::quotas::coordination_payload_bytes(&[&mem.title, &mem.content], &[&mem.metadata]);
-    let quota_op = crate::quotas::QuotaOp::Memory {
-        bytes: payload_bytes,
-    };
-    crate::quotas::check_and_record(conn, sender, &mem.namespace, quota_op)
+    // #4359 — also charge the per-sender aggregate row so a flood to many
+    // DISTINCT recipients is bound, not only a flood to one.
+    crate::quotas::check_and_record_notify(conn, sender, &mem.namespace, payload_bytes)
         .map_err(|e| crate::mcp::error_text::log_foreign("check_and_record", e))?;
 
     // #3639 — refuse-on-conflict: an inbox delivery must NEVER merge into an
@@ -203,7 +202,7 @@ fn persist_notify(
             // every downstream refusal/failure so only durable notifications
             // remain charged.
             if let Err(refund_err) =
-                crate::quotas::refund_op(conn, sender, &mem.namespace, quota_op)
+                crate::quotas::refund_notify(conn, sender, &mem.namespace, payload_bytes)
             {
                 crate::quotas::log_refund_op_failed(sender, &refund_err);
             }
@@ -747,6 +746,102 @@ mod d1_5_986_tests {
             crate::quotas::get_status(&conn, &sender, &namespace).expect("sender quota status");
         assert_eq!(status.current_memories_today, 0);
         assert_eq!(status.current_storage_bytes, 0);
+    }
+
+    /// #4359 — deliver one notify as a pre-resolved sender (no env, no
+    /// `handle_*` entry: the lib-test env/reader census stays untouched).
+    fn send_4359(
+        conn: &rusqlite::Connection,
+        params: &Value,
+        ttl: &crate::config::ResolvedTtl,
+        sender: &str,
+    ) -> Result<Value, MemoryError> {
+        persist_notify(
+            conn,
+            std::path::Path::new(":memory:"),
+            parse_notify(params)?,
+            ttl,
+            sender,
+        )
+    }
+
+    #[test]
+    fn notify_distinct_recipient_flood_is_bound_per_sender_4359() {
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open database");
+        let ttl = crate::config::ResolvedTtl::default();
+        let client = "flood-sender-4359";
+        let sender = client.to_string();
+        let (mut ok, mut first_refusal) = (0_usize, None);
+        for index in 0..1_500_usize {
+            let params = json!({
+                "target_agent_id": format!("ai:distinct-{index}"),
+                "title": "flood",
+                "payload": "p",
+            });
+            match send_4359(&conn, &params, &ttl, &sender) {
+                Ok(_) => ok += 1,
+                Err(e) => {
+                    let e = e.message();
+                    assert!(e.contains("QUOTA_EXCEEDED"), "unexpected error: {e}");
+                    assert!(e.contains(crate::quotas::NOTIFY_AGGREGATE_NAMESPACE), "{e}");
+                    first_refusal.get_or_insert(index);
+                }
+            }
+        }
+        assert_eq!(first_refusal, Some(1_000), "refused at the sender ceiling");
+        assert_eq!(ok, 1_000);
+        // Both counters are reported truthfully; the rollup does not double-count.
+        let agg =
+            crate::quotas::peek_status(&conn, &sender, crate::quotas::NOTIFY_AGGREGATE_NAMESPACE)
+                .expect("notify aggregate status");
+        assert_eq!(agg.current_memories_today, 1_000);
+        assert_eq!(agg.max_memories_per_day, 1_000);
+        let rollup = crate::quotas::get_aggregate_status(&conn, &sender).expect("rollup");
+        assert_eq!(rollup.current_memories_today, 1_000);
+    }
+
+    #[test]
+    fn notify_single_recipient_flood_still_refused_at_1001_4359() {
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open database");
+        let ttl = crate::config::ResolvedTtl::default();
+        let client = "one-target-4359";
+        let sender = client.to_string();
+        let namespace = crate::inbox_namespace("ai:same");
+        let mut refused_at = None;
+        for index in 0..1_002_usize {
+            let params = json!({"target_agent_id": "ai:same", "title": "f", "payload": "p"});
+            if let Err(e) = send_4359(&conn, &params, &ttl, &sender) {
+                assert!(e.message().contains("QUOTA_EXCEEDED"), "{e:?}");
+                refused_at.get_or_insert(index);
+            }
+        }
+        assert_eq!(refused_at, Some(1_000));
+        let ns = crate::quotas::peek_status(&conn, &sender, &namespace).unwrap();
+        assert_eq!(ns.current_memories_today, 1_000);
+    }
+
+    #[test]
+    fn notify_refused_by_namespace_row_refunds_the_aggregate_4359() {
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open database");
+        let ttl = crate::config::ResolvedTtl::default();
+        let client = "refund-4359";
+        let sender = client.to_string();
+        let namespace = crate::inbox_namespace("ai:refund-target");
+        crate::quotas::get_status(&conn, &sender, &namespace).expect("seed");
+        conn.execute(
+            "UPDATE agent_quotas SET max_memories_per_day = 0 WHERE agent_id = ?1 AND namespace = ?2",
+            rusqlite::params![sender, namespace],
+        )
+        .expect("tighten");
+        let params = json!({"target_agent_id": "ai:refund-target", "title": "t", "payload": "p"});
+        send_4359(&conn, &params, &ttl, &sender).expect_err("per-namespace refusal");
+        let agg =
+            crate::quotas::peek_status(&conn, &sender, crate::quotas::NOTIFY_AGGREGATE_NAMESPACE)
+                .expect("aggregate status");
+        assert_eq!(
+            agg.current_memories_today, 0,
+            "refused notify consumes nothing"
+        );
     }
 
     #[test]

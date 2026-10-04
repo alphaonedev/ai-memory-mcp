@@ -403,7 +403,10 @@ pub(crate) fn decide_pretool_event(
         Err(_) => return Ok(None),
     };
 
-    let envelope = run_check(conn, agent_id, kind, &action)?;
+    // #4044 — keep the policy version that EVALUATED the verdict; the stopper
+    // anchor below binds it instead of re-reading a possibly newer one.
+    let (envelope, evaluated_policy) =
+        crate::mcp::tools::check_agent_action::run_check_attributed(conn, agent_id, kind, &action)?;
     let decision = envelope.get("decision").cloned().unwrap_or(Value::Null);
     let verdict = decision
         .get("decision")
@@ -442,8 +445,15 @@ pub(crate) fn decide_pretool_event(
     // JSON is byte-identical to legacy when no stopper key is enrolled.
     if let Some(d) = mapped.as_mut() {
         if d.permission == "deny" {
-            d.stopper_sig =
-                emit_stopper_enforcement(conn, agent_id, kind, &action, rule_id, reason);
+            d.stopper_sig = emit_stopper_enforcement(
+                conn,
+                agent_id,
+                kind,
+                &action,
+                rule_id,
+                reason,
+                &evaluated_policy,
+            );
         }
     }
     Ok(mapped)
@@ -462,6 +472,7 @@ fn emit_stopper_enforcement(
     action: &crate::governance::agent_action::AgentAction,
     rule_id: &str,
     reason: &str,
+    pv: &crate::governance::policy_version::PolicyVersion,
 ) -> Option<String> {
     use base64::Engine as _;
     let keypair = crate::governance::audit::load_stopper_signing_key()
@@ -470,9 +481,9 @@ fn emit_stopper_enforcement(
     let action_bytes = action.canonical_bytes().ok()?;
     let action_hash = crate::governance::audit::action_hash_hex(&action_bytes);
     let now = chrono::Utc::now().timestamp();
-    // v0.9.0 §25.3 S4 (F-41) — bind the live governance policy version
-    // (sqlite governance DB is the sole source of truth on all backends).
-    let pv = crate::governance::policy_version::current_policy_version(conn).ok()?;
+    // v0.9.0 §25.3 S4 (F-41) — bind the governance policy version that
+    // EVALUATED the deny (#4044: read in the same snapshot as the rules, never
+    // re-read here; sqlite governance DB is the source of truth on all backends).
     let cp = crate::governance::audit::build_signed_enforcement_checkpoint(
         agent_id,
         kind,

@@ -474,11 +474,13 @@ pub fn handle_skill_export_in_root(
     // -----------------------------------------------------------------------
     // Build SKILL.md text (round-trip-stable)
     // -----------------------------------------------------------------------
-    let mut fm_lines: Vec<String> = Vec::new();
-    fm_lines.push(format!("namespace: {namespace}"));
-    fm_lines.push(format!("name: {name}"));
-
-    // Minimal YAML quoting: quote the string if it contains special chars.
+    // #4065 — the frontmatter is a TYPED YAML mapping serialized by
+    // `serde_yaml_ng` (the same crate `skill_md::parse` reads it with), never
+    // hand-quoted text. The old `yaml_quote` escaped `"` but not `\` inside a
+    // double-quoted scalar, so `C:\new` re-parsed with a newline and the
+    // re-registered digest differed from the advertised identical-digest
+    // round-trip; it also dropped every non-string metadata value
+    // (composition declarations, parameter schemas) on export.
     let desc_row: Option<String> = conn
         .query_row(
             "SELECT description FROM skills WHERE id = ?1",
@@ -486,38 +488,22 @@ pub fn handle_skill_export_in_root(
             |row| row.get(0),
         )
         .ok();
-    if let Some(ref desc) = desc_row {
-        fm_lines.push(format!("description: {}", yaml_quote(desc)));
-    }
+    let tools: Option<Vec<String>> = allowed_tools
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
+        .filter(|t| !t.is_empty());
+    let meta_val = serde_json::from_str::<serde_json::Value>(&metadata).ok();
+    let frontmatter = build_frontmatter_yaml(&FrontmatterFields {
+        namespace: &namespace,
+        name: &name,
+        description: desc_row.as_deref(),
+        license: license.as_deref(),
+        compatibility: compatibility.as_deref(),
+        allowed_tools: tools.as_deref(),
+        metadata: meta_val.as_ref().and_then(serde_json::Value::as_object),
+    })?;
 
-    if let Some(ref lic) = license {
-        fm_lines.push(format!("license: {}", yaml_quote(lic)));
-    }
-    if let Some(ref compat) = compatibility {
-        fm_lines.push(format!("compatibility: {}", yaml_quote(compat)));
-    }
-    if let Some(ref tools_json) = allowed_tools {
-        if let Ok(tools_val) = serde_json::from_str::<Vec<String>>(tools_json) {
-            if !tools_val.is_empty() {
-                fm_lines.push("allowed_tools:".to_string());
-                for t in &tools_val {
-                    fm_lines.push(format!("  - {t}"));
-                }
-            }
-        }
-    }
-    // Include non-empty metadata keys (extra frontmatter fields).
-    if let Ok(meta_val) = serde_json::from_str::<serde_json::Value>(&metadata) {
-        if let Some(obj) = meta_val.as_object() {
-            for (k, v) in obj {
-                if let Some(s) = v.as_str() {
-                    fm_lines.push(format!("{k}: {}", yaml_quote(s)));
-                }
-            }
-        }
-    }
-
-    let skill_md_content = format!("---\n{}\n---\n\n{}", fm_lines.join("\n"), body);
+    let skill_md_content = format!("---\n{frontmatter}\n---\n\n{body}");
 
     // -----------------------------------------------------------------------
     // Write SKILL.md
@@ -754,21 +740,73 @@ pub fn handle_skill_export_in_root(
     Ok(response)
 }
 
-/// Minimal YAML quoting: wrap in double quotes if the value contains
-/// `:`, `#`, `"`, `'`, `\n`, or leading/trailing whitespace.
-fn yaml_quote(s: &str) -> String {
-    let needs_quoting = s.contains(':')
-        || s.contains('#')
-        || s.contains('"')
-        || s.contains('\'')
-        || s.contains('\n')
-        || s.starts_with(' ')
-        || s.ends_with(' ');
-    if needs_quoting {
-        format!("\"{}\"", s.replace('"', "\\\""))
-    } else {
-        s.to_string()
+/// #4065 — the exported frontmatter fields, borrowed from the skill row.
+struct FrontmatterFields<'a> {
+    namespace: &'a str,
+    name: &'a str,
+    description: Option<&'a str>,
+    license: Option<&'a str>,
+    compatibility: Option<&'a str>,
+    allowed_tools: Option<&'a [String]>,
+    metadata: Option<&'a serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Keys owned by the typed frontmatter; a metadata key of the same name is
+/// never allowed to shadow them on export.
+const CORE_FRONTMATTER_KEYS: [&str; 6] = [
+    field_names::NAMESPACE,
+    "name",
+    field_names::DESCRIPTION,
+    "license",
+    field_names::COMPATIBILITY,
+    field_names::ALLOWED_TOOLS,
+];
+
+/// #4065 — serialize the SKILL.md frontmatter with the YAML serializer.
+///
+/// Every scalar is emitted in a style `serde_yaml_ng` reads back to the SAME
+/// string (backslashes, quotes, `:`/`#`, newlines, leading/trailing space),
+/// and extra metadata keeps its JSON structure (arrays / objects / numbers /
+/// booleans / null), so export → re-register reproduces both the digest
+/// inputs and the metadata.
+///
+/// # Errors
+/// A metadata value the YAML serializer cannot represent (not expected for
+/// JSON-sourced values) — refused rather than silently dropped.
+fn build_frontmatter_yaml(f: &FrontmatterFields<'_>) -> Result<String, String> {
+    use serde_yaml_ng::{Mapping, Value as Yaml};
+    let mut map = Mapping::new();
+    map.insert(Yaml::from(field_names::NAMESPACE), Yaml::from(f.namespace));
+    map.insert(Yaml::from("name"), Yaml::from(f.name));
+    if let Some(d) = f.description {
+        map.insert(Yaml::from(field_names::DESCRIPTION), Yaml::from(d));
     }
+    if let Some(l) = f.license {
+        map.insert(Yaml::from("license"), Yaml::from(l));
+    }
+    if let Some(c) = f.compatibility {
+        map.insert(Yaml::from(field_names::COMPATIBILITY), Yaml::from(c));
+    }
+    if let Some(tools) = f.allowed_tools {
+        map.insert(
+            Yaml::from(field_names::ALLOWED_TOOLS),
+            Yaml::Sequence(tools.iter().map(|t| Yaml::from(t.as_str())).collect()),
+        );
+    }
+    if let Some(meta) = f.metadata {
+        for (k, v) in meta {
+            if CORE_FRONTMATTER_KEYS.contains(&k.as_str()) {
+                continue;
+            }
+            let value = serde_yaml_ng::to_value(v)
+                .map_err(|e| format!("skill metadata key {k:?} is not YAML-representable: {e}"))?;
+            map.insert(Yaml::from(k.as_str()), value);
+        }
+    }
+    let text = serde_yaml_ng::to_string(&Yaml::Mapping(map))
+        .map_err(|e| format!("frontmatter YAML serialization failed: {e}"))?;
+    let text = text.strip_prefix("---\n").unwrap_or(&text);
+    Ok(text.trim_end_matches('\n').to_string())
 }
 
 // --- D1.5 (#986): per-tool McpTool impl for memory_skill_export ---
@@ -1264,27 +1302,83 @@ mod tests {
         );
     }
 
-    // ---- yaml_quote helper ----------------------------------------------
+    // ---- #4065 frontmatter serializer ------------------------------------
 
-    #[test]
-    fn yaml_quote_plain_string_unchanged() {
-        assert_eq!(yaml_quote("simple"), "simple");
-        assert_eq!(yaml_quote("a-b_c.d"), "a-b_c.d");
+    /// Serialize `f` and parse it back with the registration parser.
+    fn reparse_4065(f: &FrontmatterFields<'_>) -> crate::models::skill::SkillManifest {
+        let fm = build_frontmatter_yaml(f).expect("serialize frontmatter");
+        crate::parsing::skill_md::parse(&format!("---\n{fm}\n---\n\nBody.\n"))
+            .expect("exported frontmatter must re-parse")
     }
 
     #[test]
-    fn yaml_quote_special_chars_wrapped() {
-        assert_eq!(yaml_quote("a:b"), "\"a:b\"");
-        assert_eq!(yaml_quote("a#b"), "\"a#b\"");
-        assert_eq!(yaml_quote("a\"b"), "\"a\\\"b\"");
-        assert_eq!(yaml_quote("a'b"), "\"a'b\"");
-        assert_eq!(yaml_quote("a\nb"), "\"a\nb\"");
+    fn frontmatter_scalars_round_trip_byte_exact_4065() {
+        for desc in [
+            "simple",
+            "Use C:\\new",
+            r"back\slash \t \u0041 \x41 \\ done",
+            "a:b # c",
+            "quote \" and ' mixed",
+            "multi\nline\n---\nnot a fence",
+            " leading and trailing ",
+            "- dash start",
+            "true",
+            "123",
+            "null",
+        ] {
+            let m = reparse_4065(&FrontmatterFields {
+                namespace: "ns-4065",
+                name: "round-trip",
+                description: Some(desc),
+                license: Some(desc),
+                compatibility: Some(desc),
+                allowed_tools: Some(&[desc.to_string(), "memory_recall".to_string()]),
+                metadata: None,
+            });
+            assert_eq!(m.description, desc, "description {desc:?}");
+            assert_eq!(m.license.as_deref(), Some(desc), "license {desc:?}");
+            assert_eq!(m.compatibility.as_deref(), Some(desc), "compat {desc:?}");
+            assert_eq!(m.allowed_tools[0], desc, "allowed_tools {desc:?}");
+            assert_eq!(m.body, "Body.\n", "body intact for {desc:?}");
+        }
     }
 
     #[test]
-    fn yaml_quote_leading_trailing_whitespace_wrapped() {
-        assert_eq!(yaml_quote(" leading"), "\" leading\"");
-        assert_eq!(yaml_quote("trailing "), "\"trailing \"");
+    fn frontmatter_structured_metadata_survives_4065() {
+        let meta = json!({
+            "composes_with_reflections": [{"namespace": "refl-ns", "min_depth": 1}],
+            "parameters_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+            "owner": "C:\\team",
+            "count": 3,
+            "flag": false,
+            "nothing": null,
+            // A core key in metadata never shadows the typed field.
+            "description": "shadow attempt",
+        });
+        let m = reparse_4065(&FrontmatterFields {
+            namespace: "ns-4065",
+            name: "structured",
+            description: Some("real description"),
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            metadata: meta.as_object(),
+        });
+        assert_eq!(m.description, "real description");
+        assert_eq!(m.composes_with_reflections.len(), 1);
+        assert_eq!(m.composes_with_reflections[0].namespace, "refl-ns");
+        assert_eq!(m.composes_with_reflections[0].min_depth, 1);
+        for key in [
+            "composes_with_reflections",
+            "parameters_schema",
+            "owner",
+            "count",
+            "flag",
+            "nothing",
+        ] {
+            assert_eq!(m.metadata.get(key), meta.get(key), "metadata key {key}");
+        }
+        assert!(m.metadata.get("description").is_none());
     }
 
     #[test]
@@ -1359,9 +1453,10 @@ mod tests {
     }
 
     #[test]
-    fn export_with_metadata_array_value_skipped() {
-        // Metadata fields with non-string values are skipped in the
-        // frontmatter — only string-valued keys are exported.
+    fn export_with_metadata_non_string_values_preserved_4065() {
+        // #4065 — non-string metadata values are exported with their JSON
+        // structure (pre-#4065 they were silently dropped) and re-parse to
+        // the same metadata.
         let (conn, dir) = open_db();
         let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
         let digest = vec![0u8; 32];
@@ -1383,8 +1478,18 @@ mod tests {
         .unwrap();
         let md = std::fs::read_to_string(target.join("SKILL.md")).unwrap();
         assert!(md.contains("author: alice"));
-        assert!(!md.contains("version_int:")); // integer skipped
-        assert!(!md.contains("tags:")); // array skipped
+        let reparsed = crate::parsing::skill_md::parse(&md).expect("exported SKILL.md re-parses");
+        assert_eq!(reparsed.metadata["author"], json!("alice"));
+        assert_eq!(
+            reparsed.metadata["version_int"],
+            json!(7),
+            "integer preserved"
+        );
+        assert_eq!(
+            reparsed.metadata["tags"],
+            json!(["a", "b"]),
+            "array preserved"
+        );
     }
 }
 

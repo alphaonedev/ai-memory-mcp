@@ -1,8 +1,12 @@
 # ai-memory systemd units
 
 Drop-in systemd units for operators running ai-memory as a hardened
-single-node deployment. Shipped by the Debian (.deb) and Fedora COPR
-packages; also usable standalone on any systemd distro.
+single-node deployment. The Debian (.deb), release RPM and Fedora COPR
+recipes are binary-only: install the users, state directories and units
+manually using the steps below before enabling services. The AUR package
+ships `ai-memory.service` and the sysusers fragment only (PKGBUILD:58-70); the
+other units are installed manually from this directory. These units also work standalone
+on any systemd distro.
 
 ## Units
 
@@ -10,6 +14,7 @@ packages; also usable standalone on any systemd distro.
 |------|---------|------|
 | `ai-memory.service` | Main daemon (HTTP + MCP) | `simple` |
 | `ai-memory-sync.service` | Peer-mesh sync daemon (optional) | `simple` |
+| `ai-memory-curator.service` | Autonomous curator daemon (optional) | `simple` |
 | `ai-memory-backup.service` | One-shot snapshot via `VACUUM INTO` | `oneshot` |
 | `ai-memory-backup.timer` | Hourly backup trigger | `timer` |
 | `ai-memory-wake-hub.service` | Content-free wake plane (`User=ai-memory-hub`) | `simple` |
@@ -20,10 +25,9 @@ packages; also usable standalone on any systemd distro.
 ## Install — manual
 
 ```sh
-# 1. System users + state dir. Distro packages install
-#    packaging/systemd/ai-memory.sysusers.conf as
-#    /usr/lib/sysusers.d/ai-memory.conf; systemd-sysusers creates both
-#    users on first boot (the AUR PKGBUILD ships this). Manual:
+# 1. System users + state dir. Required for binary-only deb/rpm installs.
+#    The AUR PKGBUILD installs /usr/lib/sysusers.d/ai-memory.conf; for
+#    manual installation, create both service users from the source fragment:
 sudo systemd-sysusers packaging/systemd/ai-memory.sysusers.conf
 # Fallback if systemd-sysusers is unavailable:
 # sudo useradd --system --home /var/lib/ai-memory --shell /usr/sbin/nologin ai-memory
@@ -31,7 +35,7 @@ sudo systemd-sysusers packaging/systemd/ai-memory.sysusers.conf
 sudo install -d -o ai-memory -g ai-memory -m 0750 /var/lib/ai-memory
 sudo install -d -o ai-memory -g ai-memory -m 0750 /var/lib/ai-memory/backups
 
-# 2. Units into /etc/systemd/system (or /usr/lib/systemd/system for distro packages)
+# 2. Units into /etc/systemd/system. The .deb and .rpm packages ship no units.
 sudo install -m 0644 packaging/systemd/*.service /etc/systemd/system/
 sudo install -m 0644 packaging/systemd/*.timer   /etc/systemd/system/
 

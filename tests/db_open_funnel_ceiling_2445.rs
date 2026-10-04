@@ -31,6 +31,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "common/cfg_test_modules.rs"]
+mod cfg_test_modules;
+
 /// The frozen inventory: `(file, count, disposition)`.
 ///
 /// `count` is the number of PRODUCTION raw-open sites in that file. Test-module
@@ -296,17 +299,28 @@ fn every_production_raw_sqlite_open_is_enumerated_2445() {
     walk_rs(&root.join("src"), &mut files);
     files.sort();
 
-    let mut observed: Vec<(String, usize)> = Vec::new();
-    for path in &files {
-        let src = std::fs::read_to_string(path).expect("read source");
-        let n = count_raw_opens(&src);
-        if n > 0 {
+    // #4200 — a module its PARENT declares `#[cfg(test)] mod x;` is
+    // test-only even with no in-file marker (the shared resolver B7 uses).
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .map(|path| {
             let rel = path
                 .strip_prefix(&root)
                 .expect("under repo root")
                 .to_string_lossy()
                 .replace('\\', "/");
-            observed.push((rel, n));
+            (rel, std::fs::read_to_string(path).expect("read source"))
+        })
+        .collect();
+    let test_only = cfg_test_modules::cfg_test_declared_files(&sources);
+    let mut observed: Vec<(String, usize)> = Vec::new();
+    for (rel, src) in &sources {
+        if test_only.contains(rel) {
+            continue;
+        }
+        let n = count_raw_opens(src);
+        if n > 0 {
+            observed.push((rel.clone(), n));
         }
     }
 
@@ -454,5 +468,37 @@ fn both_backends_gate_before_their_bootstrap_ddl_2445() {
     assert!(
         pg.contains("if current_version == CURRENT_SCHEMA_VERSION"),
         "postgres must keep the `==` no-op fast path"
+    );
+}
+
+/// #4200 — a raw open in a module its PARENT declares test-only does not
+/// count, and a raw open in a plain declared module does. RED against the
+/// pre-#4200 standalone read, which counted both.
+#[test]
+fn a_parent_declared_test_module_is_not_production_4200() {
+    let files = vec![
+        (
+            "src/store/sqlite.rs".to_string(),
+            "#[cfg(test)]\nmod x;\nmod y;\n".to_string(),
+        ),
+        (
+            "src/store/sqlite/x.rs".to_string(),
+            "fn t() { let c = rusqlite::Connection::open(p); }\n".to_string(),
+        ),
+        (
+            "src/store/sqlite/y.rs".to_string(),
+            "fn p() { let c = rusqlite::Connection::open(p); }\n".to_string(),
+        ),
+    ];
+    let test_only = cfg_test_modules::cfg_test_declared_files(&files);
+    assert!(test_only.contains("src/store/sqlite/x.rs"), "{test_only:?}");
+    assert!(
+        !test_only.contains("src/store/sqlite/y.rs"),
+        "{test_only:?}"
+    );
+    // The pre-#4200 read counted the declared test module as production.
+    assert!(
+        count_raw_opens(&files[1].1) > 0,
+        "the fixture really opens raw"
     );
 }

@@ -219,8 +219,8 @@ jobs:
   const-name-literal-gate:
     # #3122 follow-up: the companion name-literal gate was script-only
     # and unwired. Mirror hardcoded-literals (run + --self-test). NOT
-    # required at introduction (mirror-first; see
-    # required-contexts-not-required.txt).
+    # required at introduction (ledgered in
+    # required-contexts-not-required.txt; promotion is the #3554 lockstep).
     name: Const-name-literal identifier gate (#3121)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -399,6 +399,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run CI-job-claims gate
         run: bash scripts/check-ci-job-claims.sh
+      - name: Release feature-set guard (#4480)
+        # The release build, the assert pin, the release-shaped proof job and
+        # the INSTALL "pre-built binaries" claim all follow the one declaration
+        # in scripts/release-features.sh (sal-postgres ships).
+        run: bash scripts/check-release-features.sh
+      - name: Release feature-set guard self-test (a broken declaration must fail the build, #4480)
+        run: bash scripts/check-release-features.sh --self-test
       - name: Self-test the gate (regression evidence)
         # Plants all four historical claims. The C-31 leg is the
         # load-bearing one: the workflow EXISTS and its job EXISTS, so
@@ -597,6 +604,34 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run key-dir mode gate
         run: bash scripts/check-test-keydir-mode.sh
+      - name: Key-dir mode gate self-test (#4502)
+        # The gate shipped with no self-test, so nothing proved it could still
+        # see a violation -- and its predicate was line-based, which a rustfmt
+        # wrap silently defeats (#4501 class). Seventeen cells, fixtures under
+        # .local-runs/ -- never /tmp, and never a host-specific path: the
+        # scratch directory honours TMPDIR only when it exists and otherwise
+        # lives beside the fixtures, so this step cannot depend on the author's
+        # machine (it did, and would have gone red here on every PR).
+        #
+        # NINE pin the predicate. Must be caught: a bare create of the dir
+        # passed as the key dir; the tmp.path().join("keys") form; the
+        # rustfmt-WRAPPED call; and a second bare-created key dir in a file
+        # that also uses the sandbox helper. Must stay clean: mkdir_0700;
+        # from_mode(0o700); a bare create of an unrelated dir while the key dir
+        # is the TempDir root; a file that never mentions a key dir.
+        #
+        # EIGHT pin the enumeration and the interface, in throwaway git repos
+        # the self-test builds: a broken git dir and an empty candidate set are
+        # errors rather than a clean scan; an untracked new test file is scanned
+        # as well as a tracked one; --only cannot exit 1 on a missing path (1
+        # means "violation found") and cannot name a file outside tests/**/*.rs
+        # as a violator; and a TMPDIR that does not exist -- this runner's own
+        # shape -- does not break the run.
+        #
+        # The run also asserts that at least one cell is caught whole-file and
+        # MISSED by the old line-based form, so the coverage this gate gained
+        # cannot quietly regress.
+        run: bash scripts/check-test-keydir-mode.sh --self-test
 
   migration-ladder-gate:
     # v1.0.0 guardrail-D (2x5-vote decision memory b682c76a) — fail-closed
@@ -729,6 +764,24 @@ jobs:
         # the shared one (the #1998/#2115/#2127 recurrent shape); the
         # gate must reject both and spare a compliant control fixture.
         run: bash scripts/check-test-env-lock.sh --self-test
+      - name: Interrupted gate self-tests leave no probe behind (#4292)
+        # This gate's self-test, like five others, must plant probe files
+        # INSIDE the tree (the gate scans src/ and tests/). One interrupted
+        # run (a full disk, ^C, a CI cancel) used to strand them, and a
+        # stranded src/ probe then failed OTHER gates: it turned the #3838
+        # landing gate's check-cert-removal-proof.sh --self-test red on a
+        # clean change. Each self-test is interrupted with SIGINT (process
+        # group, like ^C) and SIGTERM (like timeout/CI cancel) once a probe
+        # appears; git status must be unchanged and the run must not exit 0.
+        # A file already at any declared probe path must make the self-test
+        # refuse (exit 2) and survive byte-identical.
+        run: bash scripts/test/test-gate-selftest-interrupt-cleanup.sh
+      - name: The interrupt harness itself never deletes or strands (#4292 r9)
+        # The harness must hold itself to the same rule: a file someone
+        # else creates in the tree mid-run is reported, never deleted, and
+        # a harness killed by SIGTERM in its sentinel phase removes the
+        # sentinel it planted instead of stranding it at a real probe path.
+        run: bash scripts/test/test-gate-selftest-interrupt-cleanup.sh --harness-self-test
 
   required-contexts-gate:
     # Issues #2494 / #2496 — required-status-check SOUNDNESS. The required set
@@ -1110,8 +1163,9 @@ jobs:
     #
     # No `needs:`, no job-level `if:`, no `paths:` -- always runs. Declared in
     # required-contexts-not-required.txt at introduction (rule (f) of gate 7
-    # of the lint set); REQUIRE it mirror-first when the required set is next
-    # revised (#3554 ORDER rule).
+    # of the lint set); REQUIRE it via the #3554 lockstep (live protection,
+    # --pin-from-live, then the mirror line in the same commit) when the
+    # required set is next revised.
     name: "Foreign-text-to-caller gate (#3688 gate 7)"
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1154,9 +1208,9 @@ jobs:
     #
     # Shape: no `needs:`, no job-level `if:`, no `paths:` filter — it ALWAYS
     # runs and always reports (rule (f) of scripts/check-required-contexts.sh).
-    # Declared in scripts/qc-allowlists/required-contexts-release.txt
-    # (mirror-first); the branch-protection API addition follows once this job
-    # has reported green on the base branch.
+    # Declared in scripts/qc-allowlists/required-contexts-release.txt and
+    # held equal to live protection by check-required-contexts-live.sh
+    # (#3554; it was first declared under the pre-#3554 mirror-first order).
     name: "External-PR operator-approval gate (author outside team => @alphaonedev review)"
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1274,3 +1328,22 @@ jobs:
         run: bash scripts/check-claude-plugin.sh
       - name: Self-test the gate (regression evidence)
         run: bash scripts/check-claude-plugin.sh --self-test
+
+  docs-no-argv-secrets-gate:
+    # #4577 - a tracked doc, unit, template or script must not put a database
+    # password on the --store-url argv (visible in ps and /proc/<pid>/cmdline).
+    # The store URL has non-argv channels: AI_MEMORY_STORE_URL_FILE, then
+    # AI_MEMORY_STORE_URL, then --store-url (src/store_url.rs:137). The one
+    # allowlisted verb is schema-init, which has no non-argv channel (#4600).
+    name: No-credentials-on-argv gate (#4577)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run no-credentials-on-argv gate
+        run: python3 scripts/check-docs-no-argv-secrets.py
+      - name: Self-test the gate (regression evidence)
+        # Red probes: inline, =, quoted, continuation and curator forms.
+        # Green near-misses: file form, no password, redaction tokens,
+        # shell expansion, the schema-init allowlist.
+        run: python3 scripts/check-docs-no-argv-secrets.py --self-test

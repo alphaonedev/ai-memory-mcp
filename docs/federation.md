@@ -272,7 +272,15 @@ the `x-peer-id` HTTP header) to a `PeerScope`
 > `restores[]`, `action_transitions[]`, `checkpoints[]`,
 > `namespace_meta`, and the catchup pull-accept path
 > (`src/federation/receive.rs::catchup_memory_namespace_authorized`,
-> [#2480](https://github.com/alphaonedev/ai-memory-mcp/issues/2480)).
+> [#2480](https://github.com/alphaonedev/ai-memory-mcp/issues/2480);
+> the stored-namespace probe on that pull path landed with
+> [#3195](https://github.com/alphaonedev/ai-memory-mcp/issues/3195) —
+> before it the helper passed `existing_namespace: None`, so the pull
+> lane checked only the CLAIMED namespace). On the pull path the probe
+> (`MemoryStore::namespace_by_id`, the scalar projection) runs whenever
+> Layer 1 is armed for that peer; a probe error skips the row AND halts
+> the catch-up watermark so the row is re-pulled, and a scope refusal
+> skips the row and also halts the watermark (#3233).
 > An endpoint whose namespace cannot be resolved is REFUSED, not
 > admitted under a scoped posture. With no allowlist, the default namespace
 > requirement refuses writes; only the explicit Standard `=0` opt-out
@@ -399,12 +407,12 @@ independently — these are layered on top.
   `EpochAdvance` epoch-freeze checkpoint rides this transport (ROADMAP
   §25.2). Decision function:
   [`src/federation/receive_auth.rs::authorize_remote_checkpoint_resolution`](../src/federation/receive_auth.rs);
-  apply: `src/checkpoints/mod.rs::apply_inbound_resolution`. On a
-  postgres-backed receiver the checkpoints table is not yet
-  MemoryStore-trait-covered for a federated verbatim-resolution write, so
-  the postgres funnel reports inbound checkpoints as
-  `unsupported_on_postgres` (honest count, never a silent drop) — the
-  sqlite / MCP-native path applies them fully.
+  apply: `src/checkpoints/mod.rs::apply_inbound_resolution`. A
+  postgres-backed receiver applies inbound resolutions through the SAL
+  method `MemoryStore::apply_remote_checkpoint_resolution`
+  ([#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)),
+  under the same authorization, signature and first-resolution-wins checks;
+  the lane is no longer reported as `unsupported_on_postgres`.
 
 - **Per-transition replay nonce
   ([#1805](https://github.com/alphaonedev/ai-memory-mcp/issues/1805)).**
@@ -605,6 +613,22 @@ local namespace cap, even if the sending peer's local cap is higher.
 1. **Generate peer certs.** Use your CA of choice; export the
    SHA-256 fingerprint via
    `openssl x509 -in peer.crt -noout -fingerprint -sha256`.
+   **Key format ([#3635](https://github.com/alphaonedev/ai-memory-mcp/issues/3635)).**
+   The loader (`src/tls.rs::rustls_pki_pem_parse_private_key`) accepts a
+   PKCS#8, PKCS#1 (RSA) or SEC1 PEM, but rustls signs only with an EC key on a
+   NAMED curve. macOS's stock `openssl` is LibreSSL; its
+   `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1` writes
+   the curve with explicit parameters, and the daemon refuses that key at
+   boot (`failed to build pinning rustls ClientConfig with client cert: …
+   failed to parse private key as RSA, ECDSA, or EdDSA`). Re-encoding with
+   `openssl pkcs8 -topk8` does not help — the explicit parameters survive.
+   Generate with OpenSSL 3 and force the named-curve encoding:
+   ```bash
+   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+       -pkeyopt ec_param_enc:named_curve -nodes \
+       -keyout peer.key -out peer.crt -days 365 -subj "/CN=peer-node-1"
+   ```
+   (a P-256 PKCS#8 key is about 241 bytes), or use an RSA or Ed25519 key.
 2. **Populate `peer-fingerprints.allow`.** One fingerprint per line.
    Inline comments (`# label`) and `:` separators tolerated.
 3. **Enroll each peer's Ed25519 signing key — REQUIRED under the
@@ -640,6 +664,12 @@ local namespace cap, even if the sending peer's local cap is higher.
    the key-exchange window the rollout escape hatch
    `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` temporarily accepts
    unenrolled peers — flip it back to unset once every peer is enrolled.
+   **Store directory must be owner-only (`0700`).** The deferred-audit
+   spool beside the database refuses to open — and audit delivery fails
+   CLOSED — when any ancestor directory is group- or world-writable without
+   the sticky bit, or owned by another user
+   (`deferred-audit spool ancestor permits untrusted rename: <dir>`). Run
+   `chmod 0700` on the store directory before first boot.
 4. **Author the peer attestation JSON and set
    `AI_MEMORY_FED_PEER_ATTESTATION`** on the receiving daemon's
    environment. Treat the file like a config blob, not a credential —
@@ -688,10 +718,12 @@ drives the periodic pull from peers; cadence is operator-set via
 For small meshes (2-5 peers, modest write volume), 30s is fine. For
 large meshes, increase to 60-300s to spread the pull traffic.
 
-**Quorum width.** v0.6.x defaults to majority (`W = ceil((N+1)/2)` —
-the `QuorumPolicy::majority` convenience constructor,
-[`src/replication.rs`](../src/replication.rs))
-which is the correct default for partition-tolerance. For a regulated
+**Quorum width.** There is no compiled majority default: bare
+`ai-memory serve` defaults to `--quorum-writes 0` (federation off), and a
+quorum-enabled deployment selects W explicitly. Majority
+(`W = ceil((N+1)/2)` — the `QuorumPolicy::majority` convenience
+constructor, [`src/replication.rs`](../src/replication.rs)) is the
+recommended topology choice for partition-tolerance. For a regulated
 deployment where every write must be witnessed by every peer (W = N),
 configure explicitly — but be aware that any single-peer outage
 becomes a write outage.
@@ -727,12 +759,16 @@ the remaining peers regardless.
 **Push DLQ + replay worker (Track D
 [#933](https://github.com/alphaonedev/ai-memory-mcp/issues/933)).**
 Per-peer fanout failures inside `broadcast_store_quorum` (peer
-unreachable, or no Ack before the deadline) are recorded as
-`federation_push_dlq` rows
+unreachable, or no Ack before the deadline) are submitted to the durable
+retry queue as `federation_push_dlq` rows
 ([`src/federation/push_dlq.rs`](../src/federation/push_dlq.rs);
-schema v48). A replay worker
+schema v48). If that enqueue itself fails, the failure is logged
+(`land_push_failures`, `src/federation/sync.rs`) and durable retry is not
+guaranteed for that peer. A replay worker
 (`spawn_replay_federation_push_dlq`) is spawned alongside the catchup
-loop at the same cadence (`--catchup-interval-secs`, default 30s); it
+loop at the same cadence (`--catchup-interval-secs`, default 30s; `0`
+disables both the catch-up loop and this replay worker, so persisted rows
+are retried only while replay is enabled); it
 re-POSTs the originally captured payload via `post_once` and stamps
 `replayed_at` on Ack. The per-tick batch is adaptive (#1579 B5):
 `min(backlog, cap)` with a floor of 64, where the cap defaults to

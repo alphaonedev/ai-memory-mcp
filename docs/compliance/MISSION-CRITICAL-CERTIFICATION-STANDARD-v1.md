@@ -46,9 +46,9 @@ A certificate is void outside its envelope. The envelope enumerates:
 
 | Axis | Declared values (v1.0.0 candidate) |
 |---|---|
-| Backends | SQLite (bundled, WAL) with `PRAGMA synchronous=FULL` — **not the compiled default**, which is `NORMAL` (`src/storage/connection.rs:558`, the documented #1579 B7 posture); the certified posture requires `AI_MEMORY_DB_SYNCHRONOUS=FULL` or the `asi-hard` profile, `ai-memory doctor --posture` attests it (N26), and a `NORMAL` node is inside the envelope only under the `local-only` durability class with its RPO declared accordingly · PostgreSQL 18.6 + Apache AGE 1.8.0 (apt package `1.8.0~rc0`, extension version 1.8.0) + pgvector 0.8.6; pins are the package SHA-256s mirrored in the bundle, the apt strings are informational |
+| Backends | SQLite (bundled, WAL) with `PRAGMA synchronous=FULL` — **not the compiled default**, which is `NORMAL` ([`DEFAULT_DB_SYNCHRONOUS`](../../src/storage/connection.rs), the documented #1579 B7 posture); the certified posture requires `AI_MEMORY_DB_SYNCHRONOUS=FULL` ([`ENV_DB_SYNCHRONOUS`](../../src/storage/connection.rs)) or the `asi-hard` profile, `ai-memory doctor --posture` attests it (N26), and a `NORMAL` node is inside the envelope only under the `local-only` durability class with its RPO declared accordingly · PostgreSQL 18.6 + Apache AGE 1.8.0 (apt package `1.8.0~rc0`, extension version 1.8.0) + pgvector 0.8.6; pins are the package SHA-256s mirrored in the bundle, the apt strings are informational |
 | Feature builds | exactly the Cargo feature sets certified: `default` (sqlite-bundled) · `sal` · `sal-postgres` (implies `sal`) · `vectorlite`. The CI lane named `enterprise-fed` is `sal-postgres` run against the certified PG/AGE/pgvector pins; it is not a Cargo feature |
-| Transports and principals | HTTP with per-agent enrolled keys is the only **multi-principal** transport. MCP over stdio resolves its caller from the launcher's `AI_MEMORY_AGENT_ID` environment (`src/identity/mod.rs:470-497`; absent → single-tenant trust-all) and is certified as a **single trust domain**: one launcher, one principal. A swarm of N agents is certifiable only over HTTP, or over stdio when an orchestrator provably controls each child's environment and is itself the certified principal |
+| Transports and principals | HTTP with per-agent enrolled keys is the only **multi-principal** transport. MCP over stdio resolves its caller from the launcher's `AI_MEMORY_AGENT_ID` environment ([`resolve_read_visibility_caller`](../../src/identity/mod.rs); absent → single-tenant trust-all) and is certified as a **single trust domain**: one launcher, one principal. A swarm of N agents is certifiable only over HTTP, or over stdio when an orchestrator provably controls each child's environment and is itself the certified principal |
 | Hosts / adapters | an adapter contract with a tested version **range** per host, recorded in the N4 matrix; `ai-memory doctor --host <name>` (new, item 21) runs the wrapper self-test on the installed node; a node outside the range is NOT CERTIFIED for that host |
 | Topologies | `single` · `swarm(1 region, N agents, 1 data tier)` · `hive(K regions federated, W-of-N)` with measured K, N, W. A region is an independently failing power and network domain, declared with its blast radius; the region of every data tier is declared (data residency) |
 | Postures | each hardening / at-rest profile with its generated allowed/refused operation matrix |
@@ -64,7 +64,7 @@ MCP; N4) · hook lifecycle events other than those with a production fire site (
 (#3032: advertised by `/capabilities`, inert) · `memory_load_family` / `memory_smart_load`
 quality on an organically grown corpus (#3028) · a configuration-bounded recall p99 on
 the local candle embedder (#3026: the embed latency budget is inert there) · complete
-portable export (`PORTABILITY_COMPLETE = false`, `src/export_scope.rs:39`) · any
+portable export ([`PORTABILITY_COMPLETE`](../../src/export_scope.rs)` = false`) · any
 relevance or LongMemEval advantage claim until #2437 lands · cross-backend semantic
 parity on `set_row_metadata`, `list_archived` tag shapes and tombstoned-root lineage
 (#3187, #3186, #3305) · sustained single-author write rates above the
@@ -112,7 +112,7 @@ What the existing harness measures: `.local-runs/continuity-cycle.py` publishes
 health 200; its `health_ok_ms` (329–382 ms in the 2026-09-01 artifact) is the honest
 clock-1 number and the dashboard publishes the larger one. Its `embedder_ready` wait is
 vacuous because the daemon's `embedder_ready` is a boot-time constant
-(`src/handlers/transport.rs:1267`). Corrections: historical figures are relabelled
+(reported by the [`health`](../../src/handlers/transport.rs) handler). Corrections: historical figures are relabelled
 `clock_1_harness_restart_to_health_ok_ms`; clock 2 is `NOT_MEASURED` (the recall probe is
 untimed); clocks 3–5 are measured with a harness-owned scripted reference agent and a
 mock external-effect sink, without a real host; a real host is required only for G2's
@@ -322,7 +322,7 @@ ship as the freeze list clears. Track column: `tag` = inside the v1.0.0 freeze
 | 12b | N27 | Enforce the Enterprise-federation cert-expiry context, after item 8 (else every PR is red while the certificate is VOID). | cert | S | infra (operator) |
 | 13 | N3 | Shims: read `status` and `memory_id`; `ask` is a false acknowledgment, `pending` is durable-but-deferred and must be reported as such (S); the seven-receipt-class conformance harness (M). Shims ship via `publish-sdk-shims.yml`, outside the tag artifact. | tag (S) / cert (M) | M | code + harness |
 | 14 | N14 | Posture × operation matrix (cell P) generated from the same manifest as item 4. | cert | M | harness |
-| 15 | N12 | Backup/restore (#3199 follow-up): signed manifests, name-or-manifest selection, directory-fsync failure surfaced, unlink sidecars before publish (today after, `backup.rs:1121→1135`) and fatal on failure (retires the #3131 pin), writer during restore; restore into a fresh environment and resume a mission. Native PostgreSQL recovery orchestration is v1.1 (the CLI refuses backup on a pg store by design); document the operator procedure. | tag (fixes) / cert (battery) | L | code + harness |
+| 15 | N12 | Backup/restore (#3199 follow-up): signed manifests, name-or-manifest selection, directory-fsync failure surfaced, unlink sidecars before publish and fatal on failure (landed in #3550: [`clear_live_sidecars`](../../src/cli/backup.rs) runs before the rename and refuses the publish; the earlier after-the-rename, warn-only behaviour was the #3131 contract), writer during restore; restore into a fresh environment and resume a mission. Native PostgreSQL recovery orchestration is v1.1 (the CLI refuses backup on a pg store by design); document the operator procedure. | tag (fixes) / cert (battery) | L | code + harness |
 | 16 | N20 | Soak host and 24 h / 72 h qualification soak with the growth ledger. Last binary-changing step precedes it. Child of #3308 Config 3. | cert | L | infra (operator) + harness |
 | 17 | N20 | Power-interruption VM for the persistence boundary named in `tests/power_loss_durability.rs` (carried inside N20). | cert | M | infra (operator) |
 | 18 | N22(b) | Procurement appendix (§8) and the ballot procedure into `docs/compliance/` (N22's certificate half; 0a is its tag half). | cert | S | docs |

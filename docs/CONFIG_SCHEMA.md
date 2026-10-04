@@ -157,7 +157,13 @@ archive_on_gc     = true         # archive expired memories into
                                  # `ai-memory doctor` reports the effective
                                  # value and its source.
 archive_max_days  = 90
-max_memory_mb     = 4096
+max_memory_mb     = 4096        # PARSED BUT NOT ENFORCED (FBL-13): caps
+                                # neither memory nor storage, and is not
+                                # an auto-tier-selection input on any live
+                                # path. Setting it emits a one-shot WARN.
+                                # Use [limits].max_storage_bytes for a
+                                # real per-agent storage ceiling; nothing
+                                # caps process RAM.
 db_mmap_size_bytes = 268435456  # sqlite PRAGMA mmap_size (#1579 B7).
                                 # 256 MiB compiled default; 0 disables
                                 # memory-mapped I/O. Env override:
@@ -268,7 +274,9 @@ the SSOT struct declares them.
 ### Top-level operational fields
 
 ```toml
-schema_version = 2          # None/1 = legacy flat parse; >=2 = sectioned parse
+schema_version = 2          # shape MARKER, not a parser selector: omitted/1 =
+                            # legacy shape, >=2 = sectioned shape + enables the
+                            # mixed-legacy-field warning (see below)
 
 # Postgres connection-pool + query bounds (resolved by AppConfig::resolve_pg_pool).
 postgres_pool_max_connections   = 16    # env: AI_MEMORY_PG_POOL_MAX
@@ -286,7 +294,7 @@ mcp_federation_forward_url = "https://localhost:9077"
 
 | Field | Type | Default | Purpose |
 |---|---|---|---|
-| `schema_version` | `u32?` | `1` (legacy) | `>= 2` selects the sectioned parse path; warns if legacy flat fields coexist. |
+| `schema_version` | `u32?` | `None` (omitted — DENOTES the legacy shape; not stored as `1`) | Advisory shape marker; `>= 2` enables the mixed-legacy-field warning. Does NOT select a parser — see the note below this table. |
 | `postgres_pool_max_connections` | `u32?` | `DEFAULT_MAX_CONNECTIONS` | sqlx `max_connections`; non-positive falls through to default. |
 | `postgres_pool_min_connections` | `u32?` | `DEFAULT_MIN_CONNECTIONS` | sqlx `min_connections` (warm floor). |
 | `postgres_acquire_timeout_secs` | `u64?` | derived from `DEFAULT_ACQUIRE_TIMEOUT` | sqlx `acquire_timeout`, whole seconds. |
@@ -294,6 +302,27 @@ mcp_federation_forward_url = "https://localhost:9077"
 | `request_timeout_secs` | `u64?` | `60` | per-HTTP-request wall-clock cap (H7). |
 | `llm_call_timeout_secs` | `u64?` | `30` | per-LLM-call timeout; on timeout falls back to the LLM-absent path (H8). |
 | `mcp_federation_forward_url` | `String?` | unset (direct SQLite) | when set, MCP-stdio write tools POST to this daemon so federation fanout runs (#318). |
+
+**`schema_version` is an advisory marker, not a parser selector (#4241).**
+
+```text
+schema_version is an optional configuration-shape marker. Omitted/1 denotes
+the legacy shape; values >=2 denote the sectioned shape and enable the
+mixed-legacy-field warning. The loader accepts known flat and sectioned
+fields through the same AppConfig parser, and the resolver precedence
+applies regardless of this marker. It does not by itself select a separate
+parser or prove a future schema is supported.
+```
+
+There is exactly one deserialization on this path: `AppConfig::from_toml_contents`
+runs the deprecation and unknown-key validation
+(`src/config.rs::refuse_unknown_keys`) and then a single
+`toml::from_str` (`src/config.rs:8605`) for every marker value. The
+inspected version predicate (`src/config.rs:8664`) selects only the drift
+WARN, and `AppConfig::resolve_llm` (`src/config.rs:9450`) resolves sectioned
+`[llm]` values without consulting the marker at all. The field is
+`Option<u32>` (`src/config.rs:3533`), so omitting it is not the same as
+storing the integer `1`.
 
 ### `[identity]` — identity-resolution fallback (#198)
 
@@ -319,7 +348,12 @@ path                        = "~/.local/state/ai-memory/audit/"   # dir or file
 schema_version              = 1       # reserved; must equal the binary's emitted version
 redact_content              = true    # v1 only supports true (no content field on the wire)
 hash_chain                  = true    # per-line hash chain (load-bearing tamper evidence)
-attestation_cadence_minutes = 60      # periodic CHECKPOINT.sig marker; 0 disables
+attestation_cadence_minutes = 60      # reserved: v1.0.0 emits no periodic CHECKPOINT.sig marker;
+                                      # a nonzero effective cadence warns when audit is enabled,
+                                      # and an effective 0 suppresses that warning. Compliance
+                                      # cadence overrides only change the reserved value.
+                                      # Anti-truncation evidence uses the separate signed_events
+                                      # witness/watermark mechanism.
 append_only                 = true    # best-effort platform append-only file flag
 retention_days              = 90      # purge/verify horizon; compliance presets override
 
@@ -340,7 +374,7 @@ retention_days              = 90      # purge/verify horizon; compliance presets
   # pseudonymize_actors       = true
   [audit.compliance.fedramp]
   applied                     = false
-  attestation_cadence_minutes = 15
+  attestation_cadence_minutes = 15   # reserved: changes only the warned value; no marker is emitted
 ```
 
 Each `[audit.compliance.<preset>]` table is a `CompliancePreset`:
@@ -376,7 +410,10 @@ claimed compliance control. This is the operator cutline ruling
 (2026-08-01, §1-condition-2: a compliance defaults-lie is a hard boot
 ERROR); a compliance surface must fail closed, not serve while lying.
 Only `retention_days` and `attestation_cadence_minutes` are actually
-consumed by the preset resolver today.
+consumed by the preset resolver today — and the resolved cadence is
+consumed only by the one-shot reserved-feature WARN (`src/audit.rs`
+`warn_attestation_reserved_once`); no `CHECKPOINT.sig` marker is
+emitted at v1.0.0.
 
 ### `[transcripts]` — transcript lifecycle sweeper (I3)
 
@@ -495,7 +532,13 @@ consumes the corresponding `Resolved*` struct produced by these
 methods:
 
 - `AppConfig::resolve_llm(cli_backend, cli_model, cli_base_url)`
-- `AppConfig::resolve_llm_auto_tag()`
+- `AppConfig::resolve_llm_auto_tag()` — the one EXCEPTION to the sentence
+  above: at v1.0.0 it has no production caller (test-only, `src/config.rs:14055`
+  / `:14067` / `:14083`, all inside the `#[cfg(test)] mod tests` block at
+  `src/config.rs:10681`). Production consumes only `[llm.auto_tag].model`,
+  threaded through the PRIMARY `[llm]` client; its `backend` / `base_url` /
+  `api_key_env` / `api_key_file` are parsed, WARNed about at boot, and
+  otherwise ignored (#3808, #3902).
 - `AppConfig::resolve_embeddings()` — #1598: full per-field ladder
   (`AI_MEMORY_EMBED_*` env > `[embeddings]` section > legacy flat
   `embed_url`/`embedding_model`/`ollama_url` > compiled default), embed
@@ -528,7 +571,7 @@ methods:
 CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  compiled default
 ```
 
-**The ONE documented inversion — the store-URL channel (#1927 / CWE-214).**
+**Precedence exception 1 — the store-URL inversion (#1927 / CWE-214).**
 `AppConfig::resolve_store_url` (`src/store_url.rs`) deliberately
 INVERTS the ladder above: `AI_MEMORY_STORE_URL_FILE` (env #158) >
 `AI_MEMORY_STORE_URL` (env #157) > the `--store-url` CLI flag. Here
@@ -541,6 +584,13 @@ Postgres DSN password) must NOT be able to override the safer ones
 slot; passing a password-bearing `--store-url` while an env channel is
 set logs a WARN naming both. Source:
 `src/store_url.rs::{STORE_URL_FILE_ENV, STORE_URL_ENV, resolve_store_url}`.
+
+**Precedence exception 2 — additive encryption enabling.** Application
+content encryption is enabled by a true `[encryption].at_rest` config/seed
+OR a truthy `AI_MEMORY_ENCRYPT_AT_REST` value
+(`src/encryption/mod.rs::encryption_enabled`); a falsy env value does not
+override an enabled config. This is an OR, not an env-over-config
+override.
 
 Resolvers are pure (no network I/O). File reads for `api_key_file`
 happen at resolve time; permission-bit enforcement is non-fatal and
@@ -602,7 +652,8 @@ resolver's `Legacy` arm. Loading a legacy config emits a one-shot
 stderr WARN pointing operators at the migration tool. **These fields
 remain parseable at v1.0.0.**
 
-A legacy field is the lowest-precedence **fallback**, not inert: the
+**Most** legacy flat fields remain lower-precedence **fallbacks** to
+their sectioned replacements, not inert: the
 sectioned value wins where it is set, and the flat field still decides
 any key the sections leave unset. For `archive_on_gc` that difference
 governs whether TTL expiry is reversible, so [#3385](https://github.com/alphaonedev/ai-memory-mcp/issues/3385)
@@ -614,6 +665,17 @@ the effective `archive_on_gc` value alongside its `archive_on_gc_source`
 attribute in `src/config.rs` still says so), but that hard removal
 has not yet shipped — migrate off them with `ai-memory config
 migrate` rather than relying on the stale target.
+
+`max_memory_mb` is the **exception** to that fallback rule. Both its
+flat and its `[storage]` form are parsed and carried for compatibility
+but enforce **no memory or storage limit** and emit a warning: the
+resolver carries the value and fires a one-shot WARN on `target:
+config.max_memory_mb` whenever it is set (`src/config.rs:213`, fired
+from `src/config.rs:10109`), and the deprecated-key ledger records the
+same exception (`src/config/deprecated_keys.rs:103`). Use
+`[limits].max_storage_bytes` / `AI_MEMORY_MAX_STORAGE_BYTES` for a
+per-agent storage quota; it is **not** a process RAM limit. Nothing
+caps process RAM at v1.0.0.
 
 To migrate in place:
 
@@ -703,8 +765,17 @@ operator does not override:
 | `vllm`           | `http://localhost:8000/v1`                        | `local-model`                                   |
 | `openai-compatible` | _(no meaningful default — operator must set `base_url`; the env-var path errors without it)_ | `gemma3:4b` (legacy fallthrough)                |
 
-Alias URLs for both `[llm]` and `[llm.auto_tag]` are resolved from the same
-canonical table as the environment-based client. Only `ollama` defaults to
+Alias URLs for `[llm]` are resolved from the same canonical table as the
+environment-based client. At v1.0.0 that resolution reaches production for
+`[llm]` ONLY: `AppConfig::resolve_llm_auto_tag` (`src/config.rs:9546`) does
+resolve an alias URL from the same canonical table for `[llm.auto_tag]`, but
+it has no production caller — its only callers are test cells inside the
+`#[cfg(test)] mod tests` block that begins at `src/config.rs:10681`
+(`src/config.rs:14055`, `:14067`, `:14083`). Production threads only the
+`[llm.auto_tag].model` string through the PRIMARY `[llm]` client, so setting
+`[llm.auto_tag].base_url` — or an aliased `[llm.auto_tag].backend` — does NOT
+point auto-tagging at a different endpoint, and the daemon WARNs at boot that
+the key is ignored (#3808, #3811, #3902). Only `ollama` defaults to
 port 11434; `vllm` defaults to port 8000 with `/v1`. `openai-compatible`
 requires an explicit `base_url`. An unknown or misspelled backend has no
 default URL and is refused by client construction and the LLM reachability

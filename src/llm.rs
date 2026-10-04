@@ -866,13 +866,30 @@ pub(crate) fn parse_classified_kind(text: &str) -> Option<crate::models::MemoryK
         .find_map(|tok| crate::models::MemoryKind::from_str(&tok.to_ascii_lowercase()))
 }
 
+/// #4341 — convert one embedding array to `f32`, refusing the WHOLE vector
+/// when any element is not a JSON number or does not fit a finite `f32` (an
+/// `as` cast saturates an out-of-range value to +/-inf). Dropping a bad
+/// element instead would return a vector shorter than the model's dimension
+/// as a success. `None` means the envelope is malformed.
+fn embedding_floats(values: &[Value]) -> Option<Vec<f32>> {
+    values
+        .iter()
+        .map(|v| {
+            #[allow(clippy::cast_possible_truncation)]
+            let f = v.as_f64()? as f32;
+            f.is_finite().then_some(f)
+        })
+        .collect()
+}
+
 /// #1603 — parse a batched OpenAI-compatible `/embeddings` response
 /// (`{"data": [{"index": i, "embedding": [...]}, ...]}`) into one
 /// vector per input, in INPUT order. The spec allows providers to
 /// reorder `data`, so each element's `index` field places its vector;
 /// elements without an `index` fall back to positional order. Errors on
 /// a missing/short `data` array, a missing `embedding`, an
-/// out-of-range/duplicate `index`, an empty vector, or a final count
+/// out-of-range/duplicate `index`, an empty vector, a non-numeric or
+/// non-finite element (#4341), or a final count
 /// that does not match `expected_len` — a misaligned batch must fail
 /// loudly rather than pair texts with the wrong vectors.
 fn parse_openai_embeddings_batch(body: &Value, expected_len: usize) -> Result<Vec<Vec<f32>>> {
@@ -903,11 +920,9 @@ fn parse_openai_embeddings_batch(body: &Value, expected_len: usize) -> Result<Ve
         let arr = item["embedding"].as_array().ok_or_else(|| {
             anyhow!("Missing 'data[{pos}].embedding' in OpenAI-compatible embed response")
         })?;
-        #[allow(clippy::cast_possible_truncation)]
-        let floats: Vec<f32> = arr
-            .iter()
-            .filter_map(|v| v.as_f64().map(|f| f as f32))
-            .collect();
+        let floats = embedding_floats(arr).ok_or_else(|| {
+            anyhow!("Non-numeric or non-finite element at index {idx} in embed response")
+        })?;
         if floats.is_empty() {
             return Err(anyhow!("Empty embedding at index {idx} in embed response"));
         }
@@ -1979,8 +1994,8 @@ impl OllamaClient {
     /// Returns the response text.
     ///
     /// v0.7.0 F6 — the call is guarded by a circuit breaker. After
-    /// [`CIRCUIT_BREAKER_THRESHOLD`] consecutive failures the call
-    /// fast-fails for [`CIRCUIT_BREAKER_COOLDOWN`] instead of waiting
+    /// [`CIRCUIT_BREAKER_THRESHOLD`] consecutive provider failures (transport,
+    /// HTTP 5xx, or unusable response envelopes) the call fast-fails for [`CIRCUIT_BREAKER_COOLDOWN`] instead of waiting
     /// the full HTTP timeout each time. This is the key defence
     /// against the Round-2 F6 deadlock where a dead ollama caused
     /// every chat-backed MCP tool to hang the daemon for 30s+.
@@ -2092,6 +2107,7 @@ impl OllamaClient {
             LlmProvider::Ollama => body["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider
                         .invalid_response("Missing 'message.content' field in chat output")
                 })?
@@ -2099,6 +2115,7 @@ impl OllamaClient {
             LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider.invalid_response(
                         "Missing 'choices[0].message.content' field in OpenAI-compatible \
                          chat response",
@@ -2258,6 +2275,7 @@ impl OllamaClient {
             LlmProvider::Ollama => message["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider
                         .invalid_response("Missing 'message.content' field in chat output")
                 })?
@@ -2265,6 +2283,7 @@ impl OllamaClient {
             LlmProvider::OpenAiCompatible { .. } => message["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider.invalid_response(
                         "Missing 'choices[0].message.content' field in OpenAI-compatible \
                          chat response",
@@ -2328,6 +2347,7 @@ impl OllamaClient {
         let prompt = SUMMARIZE_PROMPT.replace("{memories}", &formatted);
         let response = self.generate_async(&prompt, None).await?;
 
+        crate::validate::validate_content(&response)?;
         Ok(response.trim().to_string())
     }
 
@@ -2507,6 +2527,7 @@ impl OllamaClient {
             LlmProvider::Ollama => body["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider
                         .invalid_response("Missing 'message.content' in chat response")
                 })?
@@ -2514,6 +2535,7 @@ impl OllamaClient {
             LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider.invalid_response(
                         "Missing 'choices[0].message.content' in OpenAI-compatible \
                          chat response",
@@ -2556,7 +2578,7 @@ impl OllamaClient {
         let url = reqwest::Url::parse(&self.base_url).ok();
         let host = url
             .as_ref()
-            .and_then(|u| u.host_str().map(str::to_string))
+            .and_then(crate::governance::host::egress_host)
             .unwrap_or_else(|| crate::url_display::url_origin(&self.base_url));
         let scheme = url
             .as_ref()
@@ -2648,6 +2670,7 @@ impl OllamaClient {
         let response_text = parsed["response"]
             .as_str()
             .ok_or_else(|| {
+                self.note_failure();
                 self.provider
                     .invalid_response("Missing 'response' field in generate output")
             })?
@@ -2745,8 +2768,11 @@ impl OllamaClient {
     /// governance gate refuses the outbound, the HTTP send fails, the
     /// response is non-2xx, the body is not valid JSON, the
     /// expected `embeddings[0]` (Ollama) /
-    /// `data[0].embedding` (OpenAI-compatible) field is missing, or
-    /// the parsed embedding vector is empty.
+    /// `data[0].embedding` (OpenAI-compatible) field is missing, the
+    /// vector holds a non-numeric element or a number that does not fit
+    /// a finite `f32` (#4341; the whole vector is refused), or the parsed
+    /// embedding vector is empty. Every malformed-envelope refusal counts
+    /// once toward the circuit breaker.
     pub async fn embed_text_async(&self, text: &str, embed_model: &str) -> Result<Vec<f32>> {
         if self.breaker_is_open() {
             return Err(anyhow!(
@@ -2834,11 +2860,13 @@ impl OllamaClient {
                 .and_then(|arr| arr.first())
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider
                         .invalid_response("Missing 'embeddings[0]' in Ollama embed response")
                 })?,
             LlmProvider::OpenAiCompatible { .. } => {
                 body["data"][0]["embedding"].as_array().ok_or_else(|| {
+                    self.note_failure();
                     self.provider.invalid_response(
                         "Missing 'data[0].embedding' in OpenAI-compatible embed response",
                     )
@@ -2846,13 +2874,16 @@ impl OllamaClient {
             }
         };
 
-        #[allow(clippy::cast_possible_truncation)]
-        let floats: Vec<f32> = embedding_array
-            .iter()
-            .filter_map(|v| v.as_f64().map(|f| f as f32))
-            .collect();
-
+        // #4341 — a malformed vector is an invalid envelope: error and count
+        // it toward the breaker, never return a short / non-finite success.
+        let Some(floats) = embedding_floats(embedding_array) else {
+            self.note_failure();
+            return Err(self
+                .provider
+                .invalid_response("Non-numeric or non-finite element in embed response"));
+        };
         if floats.is_empty() {
+            self.note_failure();
             return Err(anyhow!("Empty embedding returned from LLM"));
         }
 
@@ -2942,7 +2973,7 @@ impl OllamaClient {
                     // text still fails individually, propagate THAT
                     // error (more precise than the batch-level one).
                     tracing::warn!(
-                        "batched embed of {} text(s) failed ({batch_err}); \
+                        "batched embed of {} text(s) failed ({batch_err:#}); \
                          falling back to per-text requests",
                         chunk.len()
                     );
@@ -3031,8 +3062,14 @@ impl OllamaClient {
             }
         };
 
-        let parsed = parse_openai_embeddings_batch(&body, chunk.len())
-            .map_err(|_| self.provider.failure(ProviderFailure::InvalidResponse))?;
+        // #4341 — a malformed batch envelope counts toward the breaker
+        // exactly once, and keeps the parser's structural cause (which
+        // element / index failed; never provider body text) under the
+        // sanitized `invalid_response` classification (ERRORS-15).
+        let parsed = parse_openai_embeddings_batch(&body, chunk.len()).map_err(|cause| {
+            self.note_failure();
+            cause.context(self.provider.failure(ProviderFailure::InvalidResponse))
+        })?;
         self.note_success();
         Ok(parsed)
     }
@@ -7084,6 +7121,9 @@ mod bridge_budget_tests_3140 {
 }
 
 #[cfg(test)]
+mod embed_envelope_4341_tests;
+
+#[cfg(test)]
 mod classify_kind_parse_tests {
     use super::parse_classified_kind;
     use crate::models::MemoryKind;
@@ -7126,3 +7166,9 @@ mod classify_kind_parse_tests {
         assert_eq!(parse_classified_kind("42!!"), None);
     }
 }
+
+#[cfg(test)]
+mod issue_4047_regression_tests;
+
+#[cfg(test)]
+mod issue_4046_http_regression_tests;

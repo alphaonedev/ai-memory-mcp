@@ -885,7 +885,7 @@ their own context. Their use is governed:
 | `long` | Permanent project knowledge — architecture, decisions, hard-won lessons, user preferences and corrections | "User prefers parameterized SQL with `params![]`" |
 
 Do not promote `short` straight to `long` to "save it" if the content is transient.
-Let the auto-promotion path (5+ accesses on `mid`) handle naturalization.
+Store it as `mid` and promote it explicitly with `memory_promote` once it has proven durable — access never promotes a memory (v1.0.0 Boids item 1).
 
 ### 7.2 Namespace discipline
 

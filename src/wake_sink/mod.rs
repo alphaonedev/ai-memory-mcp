@@ -179,7 +179,7 @@ pub fn wake_meta_for(event: &InboxEvent) -> WakeMeta {
         namespace,
         sender_agent_id,
         content_digest,
-        seq,
+        recipient_seq,
         ..
     } = event;
     WakeMeta {
@@ -187,12 +187,16 @@ pub fn wake_meta_for(event: &InboxEvent) -> WakeMeta {
         namespace: namespace.clone(),
         sender: sender_agent_id.clone(),
         digest: digest_bytes(content_digest),
-        // The producer's HOST-WIDE wake sequence, not a per-recipient inbox
-        // depth — see the field's own documentation. A sink-side per-recipient
-        // counter would be strictly WORSE: when the broadcast receiver lags it
-        // never sees the dropped frames, so it would hand clients contiguous
-        // numbers across a real gap.
-        seq_high_watermark: *seq,
+        // #4125 — the RECIPIENT's own wake number, assigned by the producer at
+        // publish time and forwarded VERBATIM. Never the host-wide `seq`: the
+        // gap between two of one recipient's host-wide values measures every
+        // other tenant's notify volume (the #4071 side channel). Never
+        // renumbered here either: a counter kept in this sink only advances
+        // for frames the sink actually receives, so when its broadcast
+        // receiver lags it would hand clients contiguous numbers across a real
+        // gap. A publish-time number keeps the dropped values missing, and the
+        // client reads the gap as one catch-up read.
+        seq_high_watermark: *recipient_seq,
     }
 }
 
@@ -444,7 +448,7 @@ mod tests {
 
     pub(super) fn event(recipient: &str, digest: &str) -> InboxEvent {
         InboxEvent::AgentNotified {
-            seq: 42,
+            seq: 900_042,
             recipient_agent_id: recipient.into(),
             correlation_id: "sha256:corr".into(),
             inbox_row_id: "row-3469".into(),
@@ -452,6 +456,7 @@ mod tests {
             sender_agent_id: "ai:alice".into(),
             content_digest: digest.into(),
             notified_at: "2026-09-05T00:00:00Z".into(),
+            recipient_seq: 42,
         }
     }
 

@@ -186,6 +186,67 @@ exercising it.
 - The signing-keypair auto-gen path in `ensure_and_load_daemon_keypair`
   is exercised by the F12 cold-boot cell.
 
+### `src/metrics.rs` — fallible-constructor Err arms (PARTIAL EXCEPTION)
+
+`coverage/thresholds.toml` holds `"metrics.rs" = 90` (measured 94.77)
+and names **this** section as the rationale for not carrying the tier-A
+98 aspiration. This is that rationale; it was missing until #4161.
+
+**What is uncovered.** Post-#3917 every Prometheus collector in the
+file is constructed AND registered through one of five module-level
+helpers — `int_counter`, `int_gauge`, `int_counter_vec`,
+`int_gauge_vec`, `histogram_vec` (all in `src/metrics.rs`, between the
+`registry` accessor and `Metrics::new_or_panic`). Each
+helper carries exactly one construction `Err` arm
+(the `Err(e) => unreachable!(...)` arm of each helper) plus one
+`registry.register` failure branch. Those arms are the whole residue —
+the `Ok` path of every helper is covered by the unit suite, which
+builds the registry on every run.
+
+**Why the arms are structurally unreachable in production.** Stated at
+the call site in the `COVERAGE:` note above `Metrics::try_new` in
+`src/metrics.rs`:
+
+1. `Metrics::try_new` builds a fresh `Registry::new()` per call
+   (`Metrics::try_new` in `src/metrics.rs`), so there is no shared registry
+   state.
+   Registration can only fail on a duplicate metric name, and every
+   name registered here is unique.
+2. Every metric and label name is a compile-time string literal that
+   already matches the Prometheus name regex
+   `[a-zA-Z_:][a-zA-Z0-9_:]*`, so construction cannot fail name
+   validation.
+
+The arms exist only because the `prometheus` crate's constructors
+return `Result`. They are written as `unreachable!()` rather than a
+silent fallback so that a future rename breaking either premise fails
+LOUDLY instead of shipping a missing metric.
+
+The `thresholds.toml` comment's shorthand "`?` Err arms" names these
+fallible-constructor error paths. Post-#3917 no per-metric call site
+carries a `?` at all: the helpers thread a single `err` slot that
+`try_new` surfaces once.
+
+**Ship-gate compensation**:
+
+- `Metrics::try_new` is exercised on every unit-test run through the
+  process-wide `OnceLock` handle (`registry()` in `src/metrics.rs`), so a real
+  duplicate-name or invalid-name regression trips the suite
+  immediately. The uncovered lines are the *failure* arms, not the
+  registration path they guard.
+- `new_or_panic` (`Metrics::new_or_panic` in `src/metrics.rs`) converts any such failure into
+  a startup panic, so the condition can never be reached silently in a
+  running daemon.
+- The `/metrics` scrape surface is exercised end-to-end by the
+  ship-gate HTTP cells, which fail if a collector is absent.
+
+**What retires this exception**: either (a) a toolchain with
+`coverage_nightly` / `#[coverage(off)]` support, which lets the arms
+leave the denominator under the residual policy above and the threshold
+return to the tier-A target, or (b) an upstream `prometheus` API that
+constructs a statically-named collector infallibly, which deletes the
+arms outright.
+
 ### L0.7-4 structural ceilings (Tier C — PARTIAL EXCEPTIONS)
 
 Five Tier C modules carry **structural ceilings** that prevent the tier-C
@@ -371,9 +432,9 @@ live PG.
 The `schema-init` CLI verb dispatches on URL scheme. The SQLite branch is
 exercised end-to-end (init + enumerate + JSON / human render + idempotent
 re-run) by both lib unit tests and `tests/cli_schema_init.rs`. The
-Postgres branch (`init_and_enumerate_postgres` at lines 380-401,
-`enumerate_postgres` at lines 405-523, `bootstrap_memory_graph` at lines
-532-585, plus the `--ignored` integration test body at lines 767-826)
+Postgres branch (`init_and_enumerate_postgres`, `enumerate_postgres` and
+`bootstrap_memory_graph` in `src/cli/schema_init.rs`, plus the `--ignored`
+integration test body)
 sits behind `PostgresStore::connect_with_dim(url, dim).await?` which
 errors out immediately when no Postgres is reachable. Coverage of the
 post-connect lines requires a live Postgres + pgvector + (for AGE)
@@ -431,13 +492,15 @@ the database mid-test (rejected as too brittle).
   real sqlite daemon, taking the happy path through each defensive
   closure (which is never reached because the sqlite call succeeds).
 
-### v0.7-polish #767 — `src/mcp/tools/store.rs` synthesis-gatekeeper + defensive-closure ceiling (Tier B — PARTIAL EXCEPTION)
+### v0.7-polish #767 — `src/mcp/tools/store/` synthesis-gatekeeper + defensive-closure ceiling (Tier B — PARTIAL EXCEPTION)
 
 After the coverage-recovery pass (PR #795) lifted `mcp/tools/store.rs`
+(since split by #881 PR-4 into the `src/mcp/tools/store/` directory: `mod`,
+`synthesis`, `embed`, `legacy_classifier`, `transport`, `validation`)
 to 92.74%, a follow-up pass tried to close the remaining gap to the
 tier-B 96% floor. Eight new lib/integration tests were landed:
 
-| Test                                                                              | Lines covered |
+| Test                                                                              | Lines covered (pre-split single file, historical measurement) |
 |-----------------------------------------------------------------------------------|---------------|
 | `store_failing_embedder_warns_but_completes`                                      | 890-891       |
 | `store_quota_exhausted_returns_quota_exceeded_error`                              | 802           |
@@ -450,7 +513,7 @@ Two pieces of test infrastructure were added to unblock the above:
 
 1. `embeddings::test_support::FailingEmbedder` — `Embed` trait impl that
    always returns `Err`, unblocking the `emb.embed(...)` failure-warn
-   arm at lines 890-891. The production `Embedder` only errors on
+   arm in `store_source_embedding` (`src/mcp/tools/store/embed.rs`). The production `Embedder` only errors on
    tokeniser/model-forward faults that don't happen against in-memory
    fixtures, and `MockEmbedder` is documented to never error.
 2. The Test 6 in `tests/governance_storage_insert_hook.rs` extends the
@@ -458,47 +521,50 @@ Two pieces of test infrastructure were added to unblock the above:
    keyed on a per-test `HookMode` mutex) to drive
    `mcp::tools::handle_store_for_tests` against a refusing substrate
    pre-write hook. This is the only path from unit-test scope that can
-   exercise the `GovernanceRefusal` downcast at lines 827-833.
+   exercise the `GovernanceRefusal` downcast in `handle_store_inner`
+   (`src/mcp/tools/store/mod.rs`).
 
 The residual gap to the 96% floor is composed of synthesis-batch arms
 the LLM-response parser (`synthesis::parse_response`) gatekeeps out:
 
-- `src/mcp/tools/store.rs:624-628` — `synthesis update target {id} not
+- `apply_synthesis_updates_and_deletes` in `src/mcp/tools/store/synthesis.rs` — `synthesis update target {id} not
   found in candidate set` warn. `parse_response` rejects fabricated
   candidate_ids (returns `Err`), so the verdict-honourer never sees an
   id outside `cands`. The arm is defence-in-depth against future
   parser evolution; structurally unreachable today.
-- `src/mcp/tools/store.rs:647-652` — `synthesis update failed for {id}`
+- `apply_synthesis_updates_and_deletes` in `src/mcp/tools/store/synthesis.rs` — `synthesis update failed for {id}`
   warn. Triggered when `db::update` on an existing row fails, which
   requires the row to vanish between `existing.iter().find` and the
   update call (a concurrent delete race the synthesis path doesn't
   spawn against itself). Structurally unreachable from unit tests.
-- `src/mcp/tools/store.rs:672` — `if del_id == primary_id { continue; }`
+- `apply_synthesis_updates_and_deletes` in `src/mcp/tools/store/synthesis.rs` — `if del_id == primary_id { continue; }`
   guard against the curator emitting both `update` and `delete` for the
   same id in a single batch. `parse_response` rejects duplicate
   candidate_ids, so this arm cannot fire.
-- `src/mcp/tools/store.rs:675, 717-723` — `synthesis delete failed for
+- `apply_synthesis_updates_and_deletes` and
+  `apply_pending_synthesis_deletes_with_links` in `src/mcp/tools/store/synthesis.rs` — `synthesis delete failed for
   {id}` warns on both the update-batch and delete-only paths.
   `db::delete` against an existing id requires concurrent deletion to
   fail; structurally unreachable.
-- `src/mcp/tools/store.rs:703-707` — `synthesis_failed_reason` populated
+- the `synthesis_failed_reason` response field written in `src/mcp/tools/store/synthesis.rs` (the
+  `Some(primary_update)` path) — populated
   inside the `primary_update.is_some()` branch. `synthesis_updates` is
   populated only on a successful `synthesise_with_cap` call; the
   failure path sets `synthesis_failed_reason` AND leaves
   `synthesis_updates` empty. So `if Some(reason) = &synthesis_failed_reason`
   inside the `Some(primary_update)` branch is mutually exclusive at
   construction.
-- `src/mcp/tools/store.rs:883` — `db::set_embedding` failure warn after
+- `store_source_embedding` in `src/mcp/tools/store/embed.rs` — `db::set_embedding` failure warn after
   successful insert. SQLite UPDATE against a just-inserted row requires
   concurrent schema corruption.
-- `src/mcp/tools/store.rs:937` — `if cand.id == actual_id || cand.id ==
+- `maybe_run_autonomy_hooks` in `src/mcp/tools/store/legacy_classifier.rs` — `if cand.id == actual_id || cand.id ==
   mem.id { continue; }` self-reference skip in the legacy classifier
   loop. `mem.id` is a fresh UUID never seen by `find_contradictions`;
   `actual_id` was just inserted AFTER the recall ran. Both conditions
   are structurally false on the post-insert legacy-classifier path.
-- `src/mcp/tools/store.rs:965, 978-984` — autonomy-hook metadata-update
+- `maybe_run_autonomy_hooks` in `src/mcp/tools/store/legacy_classifier.rs` — autonomy-hook metadata-update
   failure warn. Same `db::update` against a healthy row pattern as
-  647-652.
+  the `synthesis update failed` arm above.
 
 **Ship-gate compensation**:
 
@@ -829,13 +895,12 @@ classes, confirmed by source inspection:
 1. **Fault-injection `Err(e) => tracing::error!(…); INTERNAL_SERVER_ERROR`
    500-arms.** Fire only when a healthy DB connection faults mid-statement
    — unreachable without a fault-injecting store proxy. Representative:
-   `handlers/admin.rs:444-451` (quota_status), `:663-669` (export);
+   `quota_status_handler` and `export_memories` in `handlers/admin.rs`;
    `store/postgres.rs` — the hundreds of `to_store_err(...)` `.map_err`
-   sites (`:7111` helper) wrap every sqlx call. ~5-10% of each handler.
+   sites (the `to_store_err` helper) wrap every sqlx call. ~5-10% of each handler.
 2. **Live-LLM call bodies.** CI runs pg+AGE but no LLM service. The no-LLM
    degradation arms (503 / deterministic fallback) ARE covered; the
    `Ok(Ok)/Ok(Err)/timeout` join arms need a live LLM. Representative:
-   `handlers/http.rs::maybe_auto_tag` (~120-153),
    `handlers/power_consolidation.rs` `auto_tag_handler`/`expand_query_handler`/
    `resolve_consolidate_summary` LLM branches, `handlers/power.rs`
    `detect_contradictions` legacy LLM-resolution.
@@ -843,12 +908,12 @@ classes, confirmed by source inspection:
    `Arc<Option<Embedder>>` (not `dyn Embed`); the `MockEmbedder` is
    `#[cfg(test)]`-only and uninjectable from an integration crate. The
    shipped-vector `update_embedding` arm in
-   `handlers/federation_signing_check.rs:260-275` +
+   the `update_embedding` call in `handlers/federation_signing_check.rs` +
    `spawn_deferred_embedding_refresh_via_store` body need a real model
    download. The no-embedder fallback IS covered.
 4. **`#[allow(dead_code)]` not-yet-wired (#519).** `handlers/http.rs`
-   `maybe_detect_conflicts` (~183-249) + `fetch_namespace_candidates`
-   (~260-293) are staged for #519 and have no live call site / route —
+   `maybe_detect_conflicts` + `fetch_namespace_candidates`
+   are staged for #519 and have no live call site / route —
    uncoverable until wired (or deletable). Tracked under #519.
 5. **Long-lived SSE stream body.** `handlers/approvals.rs::approvals_sse`
    `ApprovalSseStream::poll_next` loop (lagged/serialize arms) can't be

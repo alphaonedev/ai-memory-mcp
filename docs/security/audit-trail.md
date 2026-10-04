@@ -375,11 +375,14 @@ sufficient.
 
 ### `ai-memory audit verify`
 
-Walks the audit log, recomputes every line's `self_hash`, and asserts
-each `prev_hash` matches the prior line's `self_hash`. Exits:
+Walks the audit log, recomputes every line's `self_hash`, asserts each
+`prev_hash` matches the prior line's `self_hash`, and (#4021) checks that no
+`sequence` number is missing between two lines. Exits:
 
-- `0` — chain intact
-- `2` — chain broken (precise line + failure kind printed)
+- `0` — chain intact and no event missing (`"status":"ok"`), or every
+  missing range acknowledged (`"status":"ok_acknowledged_gaps"`)
+- `2` — chain broken (precise line + failure kind printed), or an
+  unacknowledged sequence gap (`"kind":"SequenceGap"`)
 - non-zero with anyhow context — I/O error
 
 ```bash
@@ -387,11 +390,130 @@ $ ai-memory audit verify
 audit verify OK: 1428 line(s) verified at /home/op/.local/state/ai-memory/audit/audit.log
 
 $ ai-memory audit verify --json
-{"status":"ok","total_lines":1428,"path":"…/audit.log"}
+{"status":"ok","total_lines":1428,"gaps":[],"gap_count":0,"unmatched_acknowledgements":[],"path":"…/audit.log"}
 
 $ ai-memory audit verify   # after a tamper
 audit verify FAIL at line 203: SelfHash — self_hash mismatch: stored=ab…, recomputed=cd…
+
+$ ai-memory audit verify   # after a write failure lost one event
+audit verify FAIL: 1 audit event(s) missing: sequence gap(s) 812-812. These events were
+sequenced but never written, most likely a failed write (see ai_memory_audit_write_failures_total).
+If the loss is known and accepted, re-run with --acknowledge-gaps 812-812
 ```
+
+**Sequence gaps (#4021).** An event is numbered before it is written, so an
+event lost to a failed write (a full disk, a revoked permission; see
+§"Detecting a trail that stopped recording") leaves a missing `sequence`
+range while the hash chain stays intact. `verify` therefore fails on a gap, as
+its own kind (`SequenceGap`, "events missing"), never with the tamper
+wording. The HEAD of the trail is checked too (#4191): every trail `verify`
+accepts starts at the genesis anchor, which is sequence 0, so a first line
+above sequence 1 means the events before it were numbered and lost (the disk
+was already full, or the permission already gone, when the trail started).
+Those are reported as the gap `1..=first-1`, and a first line with sequence 0
+fails as `Sequence`.
+
+Once the loss is understood, acknowledge the exact ranges verify printed:
+`ai-memory audit verify --acknowledge-gaps 812-812,1040-1043`. A gap passes
+only if it EQUALS a listed range. A range that merely contains it does not
+count, so an acknowledgement can never become a blanket pass, and any later
+gap fails again. A listed range that matches no gap is reported on stderr, so
+a stale acknowledgement left in a cron line stays visible.
+
+**A write that fails part-way leaves no glued line (#4211).** A record and its
+newline go out as one buffer through one write. When the write fails
+part-way (a disk that fills mid-record writes some bytes, then reports
+ENOSPC), the bytes it left are removed: every ai-memory writer holds an
+exclusive lock on the trail around each append, and the leftover is
+truncated only when it is provably that write's own (a prefix of the record
+it was writing), and only AFTER the lost event's number is durable in the
+high-water mark (#4298). The trail is then exactly as it was, and the lost
+event is an ordinary gap. A crash at any point of this path cannot hide the
+loss: before the mark is written the partial record is still on disk (verify
+fails and a restart refuses the torn tail); after it, the mark names the
+lost number. If the mark cannot be written, the bytes are not removed at all
+(they stay as a `TornRecord`, below). If only the newline was missing, the line is finished and
+the event was not lost at all.
+
+When the leftover cannot be removed (the append-only OS flag set by
+`append_only_hint` refuses truncation; on macOS that is the default), the next
+record starts its own line instead of being glued onto it, and `verify`
+reports the leftover as `TornRecord`: never clean and not acknowledgeable,
+but the chain is checked ACROSS it (the next record must chain to the one
+before the torn line), so every later record is still verified and the lost
+event is still reported as a gap. An unparseable line that the chain does NOT
+pass around (a record replaced by garbage, or garbage at the end of the file)
+is still the `Parse` failure it always was.
+
+**A loss at the tail before a restart is a gap too (#4086).** A restart used
+to resume numbering from the last event WRITTEN, so the numbers of events lost
+after that write were reused and no gap ever appeared. The trail now keeps a
+sequence high-water mark next to it (`audit.log.seq`, one fixed-width number).
+When a write fails, the lost event's number is recorded there, durably, before
+the failure is reported; the record is an in-place overwrite of bytes the file
+already owns, so it still works on the full disk that lost the event. A
+restart resumes from the larger of the trail's last sequence and the mark,
+prints the lost range on stderr, and never reuses those numbers. `verify`
+reports numbers the mark holds past the last written line as a gap even before
+the next event is written, and a later event turns them into an ordinary
+interior gap. That includes an EMPTY trail: if every event was lost (a disk
+full from the first write), the file has no lines and the mark holds N, and
+`verify` reports the gap 1..=N instead of reading clean.
+
+**The mark is written AHEAD of every append (#4299).** Each event's number is
+written to the mark (in place, no fsync) before the event is appended, under
+the trail's exclusive lock, and made durable (fdatasync) only if the write
+fails. So a process that dies after numbering an event and before writing it
+(a kill, an OOM, a panic, even with the disk full on the first byte) leaves
+that number on disk, and `verify` reports it as a gap; after an ordinary
+write the mark simply equals the last line. The write-ahead is not fsynced
+because the trail lines are not fsynced either: the mark is exactly as
+durable as the lines it guards, and a per-event fsync would stall every audited
+operation. `verify` takes a shared lock on the trail, so a write in progress
+(mark already ahead, line not yet written) is waited out, never reported as a
+gap. If the write-ahead itself fails, the event is still written (the event
+matters more than its index) and stderr says so.
+
+The mark adds no boot refusal on a full disk. An existing mark is updated in
+place at start-up, and only when its value changes; only a missing mark is
+created through a temp file and a rename. Start-up needs no new file once the
+mark exists, as before #4086.
+
+A mark that exists but cannot be read, or holds anything but one in-range
+number, is refused: `init` fails (so the daemon refuses to boot, #3651) and
+`verify` fails, because the trail can no longer tell whether events were
+lost. After investigating, remove the file to accept that; the next start
+recreates it from the trail. A missing mark (a new trail, or one written before
+#4086) is simply created.
+
+Remaining limits:
+
+- **Power loss.** Neither the trail lines nor the write-ahead mark are
+  fsynced per event (the mark is fsynced only when a write fails). A power
+  loss or kernel crash can therefore drop the newest lines AND the mark's
+  record of them together, and `verify` then reads clean for those events.
+  Every PROCESS crash is covered: the write-ahead (#4299) is in the kernel
+  before the append, and a failed write's loss is made durable before any
+  bytes are removed (#4298).
+- If the write-ahead itself fails (the mark cannot be written, which stderr
+  reports) AND that event's append then fails on its first byte AND the
+  process dies before the failure path records the loss, nothing records
+  the lost number.
+- **Custody of the mark.** `audit.log.seq` is NOT signed and not chained; it
+  has exactly the custody of the trail (the same directory, the same
+  permissions). Deleting it, or rolling it back together with the trail's
+  tail, HIDES a tail loss: the loss is then indistinguishable from a trail
+  that simply ended there, and `verify` reads clean. The mark protects against
+  OPERATIONAL loss, like the acknowledgement below, not against anyone who
+  can write the audit directory. Keep the directory writable only by the
+  daemon's user, and ship the trail off-host (below) for evidence that
+  survives the host.
+
+**Honest limit.** The acknowledgement is a flag, not a signed record. On a
+hostile host, whoever can rewrite the trail (renumber the lines, recompute
+the chain) can also edit the cron line. Gap detection protects the trail
+against OPERATIONAL loss, not against an attacker with write access; that is
+the job of the signed `signed_events` chain and the off-host tiers below.
 
 ### `ai-memory audit tail`
 
@@ -687,6 +809,77 @@ OnCalendar=hourly
 [Install]
 WantedBy=timers.target
 ```
+
+### Detecting a trail that stopped recording (#3975)
+
+`audit verify` proves the lines on disk are intact. It cannot prove that
+events which never reached the disk were written. A disk filled after
+boot, an unmounted volume, or a revoked permission makes `emit` lose events
+while the daemon keeps serving. Every such loss is now counted and reported:
+
+| Signal | Meaning |
+|---|---|
+| `ai_memory_audit_write_failures_total` | Writes or flushes that failed. **Each may be a lost event**: a failed flush whose line did reach the file leaves no gap, and neither does a record whose newline was finished after a failed write (#4211). Run `ai-memory audit verify` for the actual gaps. |
+| `ai_memory_audit_records_written_total` | Events written and flushed without error. |
+| `ai_memory_audit_last_write_seconds` | UNIX time of the last successful write. Absent until the first write. |
+| `ai_memory_audit_trail_active` | `1` when a trail is recording in the process, `0` when auditing is off. |
+| stderr | `the audit trail failed to record an event: …`, at most once a minute, with the count of failures folded in since the previous line. |
+| `ai-memory doctor` | "Audit trail (#3975)": Critical on any lost event, or when `[audit].enabled = true` but no trail is recording. |
+
+Alert on `increase(ai_memory_audit_write_failures_total[5m]) > 0`. A lost
+event also leaves a skipped value in the `sequence` column (the counter
+advances before the write), and `audit verify` fails on it (#4021; see
+§"`ai-memory audit verify`"). The counter covers only the process that lost
+the event and only since it started; the gap stays in the file.
+
+### Refusing writes while the trail is down (opt-in, #4400)
+
+Counting a lost event is the default. Deployments that must not keep writing
+while the trail is down can set `AI_MEMORY_REQUIRE_AUDIT_TRAIL=1`. After a
+failed audit write or flush the process then refuses every later mutating
+operation with `503 AUDIT_TRAIL_UNAVAILABLE` (the MCP and CLI refusals carry
+the same text), through the same checkpoints the record-stop control uses
+(both storage backends, coordination writes, federation receive, every MCP
+write tool). Reads keep working.
+
+The next write after a failure retries the trail, at most once a second, by
+appending a real `trail_resumed` record. When that append succeeds the
+refusals stop, and the record marks in the trail where recording resumed; the
+events lost before it are the `sequence` gap `audit verify` reports. While
+refusing, a daemon's `/metrics` shows `ai_memory_audit_trail_latched 1`; that
+gauge is the only view of a running daemon's state, because `doctor` reports
+its own process (`fail_closed: on, LATCHED`, Critical, only if `doctor` itself
+hit the failure).
+
+What it cannot do:
+
+- Every audit event is written after its memory operation commits, so the
+  operations already under way when the trail fails have happened: at most one
+  unaudited write per write in flight at that moment (one for a single caller;
+  more under concurrent load on `serve`). Each is counted in
+  `ai_memory_audit_write_failures_total`, as before.
+- A failed retry is a failed audit write too: it uses up a sequence number and
+  is counted in `ai_memory_audit_write_failures_total`. While the trail stays
+  down, that counter and the gaps `audit verify` reports therefore grow by
+  about one a second from retries alone, not only from lost client events.
+- A single CLI command cannot refuse its own write; it relies on the refusal to
+  start when the trail cannot be opened (#3651).
+- It guards this flat trail only, not the signed event chain or the forensic
+  log. But it refuses through the record-stop checkpoints, so a refusing
+  process also refuses the signed `governance.check` records it would add
+  (each counted; the verdict is still returned).
+- While refusing, it refuses every mutation this process would make, including
+  credential operations such as revoking an HTTP API key. An audit outage must
+  not be mistaken for "a compromised key cannot be revoked": run the revocation
+  from a separate CLI process (`ai-memory agents revoke-api-key …`), which has
+  its own latch and is not refused, or unset the knob and restart.
+- It only acts when the flat trail is configured (`[audit].enabled = true`).
+  With auditing off there is no trail to fail, so the knob changes nothing;
+  `ai-memory doctor` reports that combination as a Warning (#4454).
+
+The mode is off by default and the `asi-hard` profile does not turn it on: it
+refuses live writes, so it runs for a release before it can become a hardened
+default.
 
 ### Off-host attestation
 

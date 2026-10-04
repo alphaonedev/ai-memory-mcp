@@ -47,16 +47,17 @@ Capabilities v3 stamps:
 The four enumerated wire-points (`src/governance/agent_action.rs`
 module docs):
 
-| Wire-point                          | AgentAction variant   | File:line                                   |
+| Wire-point                          | AgentAction variant   | File / symbol                               |
 |-------------------------------------|-----------------------|---------------------------------------------|
-| Skill manifest emission             | `FilesystemWrite`     | `src/mcp/tools/skill_export.rs:162,209`     |
-| Federation peer POST                | `NetworkRequest`      | `src/federation/sync.rs:66`                 |
-| Hooks subprocess spawn              | `ProcessSpawn`        | `src/hooks/executor.rs:399,783`             |
-| LLM (Ollama / OpenAI) HTTP          | `NetworkRequest`      | `src/llm.rs:421`                            |
+| Skill manifest emission             | `FilesystemWrite`     | [`handle_skill_export_in_root`](../../src/mcp/tools/skill_export.rs) (two sites: `SKILL.md` and each resource file) |
+| Federation peer POST                | `NetworkRequest`      | [`build_governed_peer_post`](../../src/federation/sync.rs) |
+| Hooks subprocess spawn              | `ProcessSpawn`        | [`fire_inner`](../../src/hooks/executor.rs) (exec hooks) and [`spawn_one`](../../src/hooks/executor.rs) (daemon hooks) |
+| LLM (Ollama / OpenAI) HTTP          | `NetworkRequest`      | [`check_outbound`](../../src/llm.rs) |
 
-Each wire-point calls `crate::governance::wire_check::check(&action)`
+Each wire-point calls a `crate::governance::wire_check` entry point
+(`check`, `check_governed` or `check_anyhow`, depending on the site)
 before issuing the syscall. The daemon `bootstrap_serve` installs ONE
-shared closure into the process-wide `GOVERNANCE_PRE_ACTION` OnceLock
+shared closure into the process-wide [`GOVERNANCE_PRE_ACTION`](../../src/governance/wire_check.rs) OnceLock
 that consults `check_agent_action_no_audit` against the live
 `governance_rules` table.
 
@@ -117,10 +118,52 @@ is exactly as inert as a misspelled key.
 |--------------------|------------------------------------------------------|-----------------------------------------|-----------------------------------------------------------------------|
 | `bash`             | `command_substring`:string (or the legacy alias `command_regex`:string) | —                     | LITERAL substring match on the command line — never a regex.          |
 | `filesystem_write` | `glob`:string                                        | —                                       | Reuses the substrate glob vocabulary (`*` per-segment, `**` cross-`/`). |
-| `network_request`  | `host`:string                                        | —                                       | Glob host match (a plain host with no `*` matches exactly).           |
+| `network_request`  | `host`:string                                        | —                                       | Glob host match on the CANONICAL host (see below).                    |
 | `process_spawn`    | `binary`:string                                      | `args_contain`:string, `disk_free_min_gib`:uint | Binary name match plus optional argv-substring / disk-threshold refusal. |
 | `custom`           | `kind`:string                                        | `namespace_glob`:string, `tier`:string, `title_contains`:string | Extension point for caller-specific actions.  |
 | `read_action`      | `surface`:string, `namespace`:string, `query_substring`:string, or `all`:bool | —                       | PE-2 read gating; `{"all": true}` is the explicit blanket opt-in.     |
+
+### `network_request` host canonicalisation (#4300, #4414, #4415)
+
+The rule `host` and the evaluated host are both canonicalised by one shared
+function before the glob runs: ASCII-lowercase, exactly one trailing root dot
+removed, Unicode labels converted to the A-label (punycode) form, IPv4 as a
+dotted quad (`127.1` and `127.000.000.001` become `127.0.0.1`), IPv6 bracketed
+and compressed. An IPv4-mapped IPv6 literal (`::ffff:127.0.0.1`,
+`[::ffff:7f00:1]`) becomes the IPv4 dotted quad on both sides, so each
+spelling matches the other. Empty labels, labels over 63 bytes, hosts over 253
+bytes and whitespace/control/NUL characters are rejected. `EVIL.example.com`,
+`evil.example.com.` and a Unicode spelling therefore match a rule written for
+`evil.example.com`.
+
+**Wildcards.** `*` spans any run of characters including dots:
+`*.example.com` matches a subdomain at any depth, never the bare apex
+`example.com`. Punycode does not preserve substrings, so a `*` that shares a
+label with non-ASCII text (`bü*.example`) is REJECTED by `rules add` and, if
+already stored, is inert (a blocking inert rule refuses, #3031); write a
+whole-label wildcard (`*.bücher.example`) instead. An ASCII in-label wildcard
+(`evil*.com`) is matched against both the request's A-label and Unicode forms,
+so `evilü.com` is caught. A wildcard pattern whose all-digit or `0x` labels are
+not canonical decimal octets (`0177.0.0.*`) is rejected the same way; write
+`127.0.0.*`.
+
+**Ports.** A rule WITHOUT a port compares the host only and matches any port
+or none (`example.com` matches `example.com:8443`). A rule WITH a port
+(`example.com:443`) matches only the same effective port: the request's
+explicit port, else the scheme default (`https`/`wss` 443, `http`/`ws` 80,
+`ftp` 21). When the effective port cannot be established (unknown scheme, no
+port) the port rule matches (over-block). The LLM client and federation peer
+POST pass the URL's explicit port to the gate, so port-scoped rules enforce
+there. A malformed rule port, including `evil.com:*`, is an inert pattern;
+there is no "any port" spelling beyond omitting the port.
+
+**Failure is never allow-by-default.** A host that cannot be canonicalised
+matches every `refuse`/`escalate` `network_request` rule and no `warn`/`log`
+rule. This deliberately over-blocks: a malformed host is refused by an
+UNRELATED blocking rule, and the audit reason is that rule's reason. Likewise an
+inert stored host pattern (such as `evil.com:*`) makes its blocking rule refuse
+every `network_request`. With zero blocking network rules configured there is
+nothing to deny and the action is allowed.
 
 ### Write-time validation and inert rules (#3031)
 

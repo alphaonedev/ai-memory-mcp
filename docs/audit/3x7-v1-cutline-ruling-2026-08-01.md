@@ -3,6 +3,8 @@
 
 # v1.0.0 GA Cut Line — Binding Ruling
 
+> **Point-in-time record, as of 2026-08-01.** The src/ file:line references in this document describe the source tree at commit `2f32dde10a21` (read a file there with `git show 2f32dde10a21:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 **Status:** BINDING. Supersedes all prior scope discussion for v1.0.0.
 **Decided by:** AI NHI synthesis over 13 adversarial lens verdicts.
 **Code baseline:** brief was verified at `release/v1.0.0 @ cc61a899`; **HEAD is now `2f32dde1`**. Every blocking item below must be re-verified at the cut commit before the certification is signed (see §6).

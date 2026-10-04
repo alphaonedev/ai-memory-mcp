@@ -3,8 +3,11 @@ layout: doc
 ---
 # ai-memory CLI Reference
 
-Complete reference for every subcommand, flag, and environment variable
-the `ai-memory` binary exposes.
+This guide documents the CLI's main workflows and selected flags.
+`ai-memory <command> --help` is the complete generated flag inventory;
+the CLAUDE.md environment table is an index, with any omissions stated
+explicitly. Some declared flags are deliberately not restated here —
+`--help` is authoritative for the full per-command set (#4240).
 
 ```bash
 ai-memory [GLOBAL_OPTIONS] <COMMAND> [COMMAND_OPTIONS]
@@ -34,7 +37,7 @@ supplements `--help` with examples and context.
 | `AI_MEMORY_AGENT_ID` | Default `metadata.agent_id` for memories written by this process. |
 | `AI_MEMORY_DB_PASSPHRASE` | SQLCipher passphrase (operator-set; `--db-passphrase-file` does not populate this — #3213). |
 | `AI_MEMORY_NO_CONFIG=1` | Skip loading the platform config file (`$XDG_CONFIG_HOME/ai-memory/config.toml`, else `~/.config/ai-memory/config.toml`). Used by tests. **[#3167]** Only a truthy value (`1`/`true`/`yes`/`on`) skips it; an empty value or `0` loads the config and WARNs. |
-| `AI_MEMORY_ANONYMIZE=1` | Suppress hostname/PID from fallback `agent_id` generation. |
+| `AI_MEMORY_ANONYMIZE=1` | Suppresses the hostname in the synthesized fallback identity. The fallback is `anonymous:pid-<pid>-<uuid8>`, so it still includes the PID and is process-specific. It does not replace an explicitly supplied identity. |
 | `AI_MEMORY_AUTONOMOUS_HOOKS=1` | Enable post-store LLM hooks (v0.6.0.0). Overrides config. |
 | `AI_MEMORY_BOOT_ENABLED` | Enable/disable session-boot context. Set to `0` to disable. Overrides config. |
 | `AI_MEMORY_AUDIT_DIR` | Override directory for the security audit trail. Default: `~/.local/state/ai-memory/audit/`. |
@@ -49,8 +52,13 @@ supplements `--help` with examples and context.
 | `AI_MEMORY_STORE_URL_FILE` | #1927 — **secret.** Path to a `0600`-enforced file holding the `--store-url` connection URL; takes precedence over `AI_MEMORY_STORE_URL`, which in turn takes precedence over the CLI arg. |
 | `RUST_LOG` | Tracing filter, e.g. `RUST_LOG=ai_memory=debug`. (Standard Rust ecosystem env, not product-specific.) |
 
-Resolution precedence for any setting: **CLI flag > `AI_MEMORY_*` env
-var > config file > compiled default**.
+Most scalar settings use **CLI flag > `AI_MEMORY_*` env var > config
+file > compiled default**; check the setting's resolver contract. Store
+URL uses `AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > `--store-url`.
+Application content encryption is enabled by a true config/seed OR a
+truthy `AI_MEMORY_ENCRYPT_AT_REST` value; a falsy env value does not
+override an enabled config. Removed downgrade controls and explicit
+refusal rules are not precedence fallbacks.
 
 ## Core memory operations
 
@@ -107,7 +115,8 @@ from that ledger: increment `access_count`, raise `expires_at` to
 an access can never move an expiry earlier; issue
 [#1596](https://github.com/alphaonedev/ai-memory-mcp/issues/1596),
 superseding the [#830](https://github.com/alphaonedev/ai-memory-mcp/issues/830)
-replacement contract), auto-promote mid→long at 5 accesses.
+replacement contract). The fold never changes tier or priority (v1.0.0
+Boids item 1); `ai-memory promote` is the only way to raise a tier.
 
 | Flag | Type | Default | Notes |
 |------|------|---------|-------|
@@ -380,7 +389,7 @@ records the original claim.
 ### `mcp`
 
 Run as an MCP tool server over stdio (JSON-RPC 2.0).
-`--profile full` advertises 103 entries (102 callable memory tools + the
+`--profile full` advertises 104 entries (103 callable memory tools + the
 always-on `memory_capabilities` bootstrap; see issue
 [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the
 disambiguation). Default `--profile core` ships 7 tools + the bootstrap.
@@ -405,12 +414,12 @@ API key comes from the `api_key` field in `config.toml`).
 | `--tls-cert`/`--tls-key` | path | — | Operator-supplied in-process HTTPS material (rustls, no OpenSSL): full chain PEM + PKCS#8 key, SANs covering every bind host. TLS itself is REQUIRED since v1.0.0 (#3705, "only encrypted data in transit"). On a SINGLETON the flags are optional — first boot generates a local CA + server certificate under `<key_dir>/tls/` and renews it (#3709 item 1). On a FLEET-shaped deployment (production / federated / hive, per #3700) they are REQUIRED: enterprise PKI is the first-class path and a fleet without operator material is refused (3x7 audit ruling — an unmanaged CA in an enterprise estate is an audit finding). A plaintext listener is refused everywhere, loopback included. |
 | `--mtls-allowlist` | path | — | SHA-256 cert-fingerprint allowlist (requires `--tls-cert`). |
 | `--shutdown-grace-secs` | u64 | `30` | SIGINT grace period. |
-| `--quorum-writes` | usize | `0` | v0.7 federation: W (peer acks required). `0` = federation off. |
+| `--quorum-writes` | usize | `0` | v0.7 federation: W, the acknowledgements required **including the local commit** (a write returns OK after the local commit plus `W-1` distinct peer acks within `--quorum-timeout-ms`; W=1 requires no remote acknowledgement). `0` = federation off. |
 | `--quorum-peers` | comma-list | — | Peer base URLs; each must expose `POST /api/v1/sync/push`. |
 | `--quorum-timeout-ms` | u64 | `2000` | Quorum-ack deadline; after it the locally-committed write returns **202 Accepted** with `quorum_met:false` in the body (`{quorum_met, acks, needed, reason, durability:"local"}`) — NOT a 503 (v0.8.1 W3 / gap G12); a durable write is never reported as a 5xx. Default assumes same-DC peers; cross-region (WAN) meshes need 5000-10000 (the do-1461 reference deployment uses 8000 — see `docs/federation.md`, [#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565)). |
 | `--quorum-client-cert`/`--quorum-client-key` | path | — | mTLS client pair for outbound quorum fanout. |
 | `--quorum-ca-cert` | path | — | CA for verifying quorum peers. |
-| `--catchup-interval-secs` | u64 | `30` | Federation catch-up loop cadence. |
+| `--catchup-interval-secs` | u64 | `30` | Cadence for federation catch-up and push-DLQ replay. `0` disables both workers in this release; queued failed pushes and erasure-outbox rows will not be replayed by them until replay is enabled. |
 | `--federation-identity` | string | — | Identity this node presents to peers (also `AI_MEMORY_FED_IDENTITY`). |
 | `--store-url` | URL | — | SAL backend selector (`postgres://…` under `--features sal-postgres`). **Mutually exclusive with `--db`** — passing both is rejected at startup with a clear error. A userinfo password should be supplied via `AI_MEMORY_STORE_URL` (owner-only environment) or `AI_MEMORY_STORE_URL_FILE` (a `0600` file) rather than on argv, which is exposed via `/proc/<pid>/cmdline` and `ps auxww` to any local UID (#1927). |
 
@@ -541,6 +550,14 @@ agent's Ed25519 public key for #626 Layer-3 store-path attestation
 identity or reasserts its same live key. A distinct replacement uses
 `ai-memory identity succeed`, so the current key cryptographically authorizes
 its successor; candidate possession plus an admin role cannot rotate it.
+
+`agents bind-api-key` enrolls a per-agent HTTP api-key token. Supply the
+token by file: `--token-file <PATH>` is an owner-only `0600` file whose
+sole contents are the token, and it is preferred over the
+`AI_MEMORY_AGENT_API_KEY_FILE` env var (the flag wins when both are set).
+`--token <TOKEN>` is **refused**: argv is world-readable through
+`/proc/<pid>/cmdline` and `ps auxww`. Only `sha256(token)` is persisted
+(#3781).
 
 | Flag | Applies to | Notes |
 |---|---|---|
@@ -1012,6 +1029,13 @@ strategy.
 Fall-through is `--system`. Same binary on macOS / Linux /
 Docker / Kubernetes. Exit code is propagated.
 
+> **Codex CLI ≥ 0.153 rejects `--system`** (`error: unexpected argument
+> '--system' found`, exit 2), so `ai-memory wrap codex` with the default
+> strategy is known broken on current Codex; there is no version probe
+> or tested-range table yet ([#3545](https://github.com/alphaonedev/ai-memory-mcp/issues/3545)).
+> Override with `--system-flag` / `--system-env`, or use Codex's native
+> MCP server configuration instead (see `docs/integrations/codex-cli.md`).
+
 ```bash
 ai-memory wrap codex -- "draft a release note"
 ai-memory wrap aider -- src/main.rs
@@ -1201,7 +1225,7 @@ operator's ruling) and `boot_verdict`. Critical when anything will refuse or
 a plaintext webhook target is stored, the local certificate is expired, or
 a declared non-singleton shape lacks enterprise PKI;
 Warning for plaintext model-server egress or a leaf inside its renewal
-window; Info otherwise. Doctor never refuses.
+window; Info otherwise. Doctor never refuses. The doctor sections that open their own postgres session (Postgres extensions, Unstamped owners, Identity key registry) apply the same `sslmode=verify-full` floor before any socket opens: below it they report the refusal as the section's fact (Critical for the first two, a Warning note for Identity) and never connect (#4333).
 
 ```bash
 ai-memory doctor
@@ -1483,6 +1507,8 @@ ai-memory reembed --batch 50                 # smaller batches
 | `--dry-run` | Print `{total_rows, rows_missing_embeddings, target_model, target_dim, backend}` and exit without writing. |
 | `--batch <n>` | Rows per embedding batch (defaults to the resolved `backfill_batch`). |
 | `--json` | Emit the machine-parseable summary envelope on stdout. |
+| `--skip-current-space` | Skip rows already in the active embedding space (`embedding_space IS DISTINCT FROM <target>`) — the incremental heal / resume-after-interruption sweep. Default **off**: a full-corpus re-derive from text is the guaranteed-correct path (#2167 §7). |
+| `--sleep-ms <MS>` | Inter-batch pacing in milliseconds, for fleet-orchestrated chunked runs. Default **0** (#2167 §7). |
 
 A live run replaces **all** vectors (not just missing ones). Rows
 whose batch fails are retried per-row (#1595 resilience); rows that
@@ -1693,7 +1719,7 @@ twin (byte-equal envelopes; `--json` for the raw envelope):
 | `replay` | `memory_replay` | Reconstruct the transcript chain that produced a memory. |
 | `capture-turn` | `memory_capture_turn` | #3587 U4 — L4 host-volunteered turn capture (CLI twin + Claude Code `Stop` hook sink). Reads a `memory_capture_turn` body or a host `Stop` payload on stdin; `--host-turn-index auto` derives `MAX+1` inside the write transaction; `--quiet` never fails. `refuse_pg_store`. |
 | `reflect` | `memory_reflect` | Synthesize a reflection over source memories (CLI dispatcher runs unsigned / no LLM dedup — use MCP/HTTP for those). |
-| `subscribe` / `unsubscribe` / `list-subscriptions` | `memory_subscribe` / `memory_unsubscribe` / `memory_list_subscriptions` | Webhook subscription CRUD. `created_by` / the #870/#872 owner gate is the global `--agent-id` ([#3433](https://github.com/alphaonedev/ai-memory-mcp/issues/3433)). |
+| `subscribe` / `unsubscribe` / `list-subscriptions` | `memory_subscribe` / `memory_unsubscribe` / `memory_list_subscriptions` | Webhook subscription CRUD. `created_by` / the #870/#872 owner gate is the global `--agent-id` ([#3433](https://github.com/alphaonedev/ai-memory-mcp/issues/3433)). `subscribe` flags: `--url <URL>` is **required** (the webhook endpoint the daemon POSTs to); `--events <CSV>` defaults to `*`; `--secret <SECRET>` is the HMAC secret, required when no server-wide `[hooks.subscription] hmac_secret` is configured; `--namespace-filter <NS>`, `--agent-filter <AGENT_ID>` and `--event-types <CSV>` are optional filters (`--event-types` is a comma-separated per-event-type opt-in). |
 | `subscription-replay` / `subscription-dlq-list` | `memory_subscription_replay` / `memory_subscription_dlq_list` | Webhook DLQ replay + inspection. Each replayed event carries `delivery_status`: `ack` / `failed` are terminal; **`pending` means no terminal status was recorded — including a delivery that settled but whose terminal status write failed** ([#3659](https://github.com/alphaonedev/ai-memory-mcp/issues/3659)); the field alone cannot separate in-flight from lost, and a row still `pending` past the 60 s settle window is the lost case (`doctor` warns; the reliable write is [#3735](https://github.com/alphaonedev/ai-memory-mcp/issues/3735)). |
 | `notify` / `inbox` | `memory_notify` / `memory_inbox` | Agent-to-agent inbox send / read. Sender/owner is the global `--agent-id`; a subcommand `inbox --agent-id` that disagrees is refused ([#3433](https://github.com/alphaonedev/ai-memory-mcp/issues/3433)). Every `notify` is a new inbox row — a repeated title never overwrites or re-attributes an earlier message; rows carry the stored unique `title` and the caller's `subject` ([#3639](https://github.com/alphaonedev/ai-memory-mcp/issues/3639)). **The inbox is a queue: `inbox` lists what you have not yet handled, and you drain it with `ai-memory delete <id>` once a message is handled** ([#3730](https://github.com/alphaonedev/ai-memory-mcp/issues/3730)). Plain `delete` ARCHIVES an inbox message (restorable, `archive list`); `delete --hard` ERASES it and destroys the record of what the agent was told — it warns, then proceeds. Reads never mark anything; there is no read marker (`access_count` counts touches). `--unread-only` is accepted for compatibility and narrows nothing. |
 | `ingest-multistep` | `memory_ingest_multistep` | Form 3 multi-step ingest (CLI passes no LLM handler; tier-locked advisory on every tier). |
@@ -2223,7 +2249,7 @@ shell word-splitting.
 | `AI_MEMORY_WAKE_SENDER` | agent that wrote the row |
 | `AI_MEMORY_WAKE_DIGEST` | lowercase hex SHA-256 **of the body** — never the body |
 | `AI_MEMORY_WAKE_SEQ` | the producer's wake watermark at mint time |
-| `AI_MEMORY_WAKE_MISSED` | wakes this listener demonstrably did not see |
+| `AI_MEMORY_WAKE_MISSED` | wakes this listener did not see, clamped to 65,536; across a producer restart or eviction the watermark rebases and this is NOT a count, so rely only on `> 0` (reason `gap`), never as a loop or batch bound |
 | `AI_MEMORY_WAKE_PENDING` | wakes the hub coalesced while this agent was offline |
 | `AI_MEMORY_WAKE_INBOX_COUNT` | messages the catch-up read returned |
 
@@ -2339,8 +2365,8 @@ results (#1468 / #1469); leave it unset for single-tenant trust-all reads.
 | `mid` | 7 days | Normal memories (default). |
 | `long` | permanent | Important records. |
 
-Accessing a memory extends TTL (short +1 h, mid +1 d). At 5 accesses,
-mid auto-promotes to long.
+Accessing a memory extends TTL (short +1 h, mid +1 d). Access never
+changes the tier: use `ai-memory promote` to move a memory to long.
 
 ## See also
 

@@ -489,6 +489,21 @@ pub fn handle_skill_register(
         validate_parameters_schema(schema)
             .map_err(|e| format!("parameters_schema rejected at register (fail-closed): {e}"))?;
     }
+    // #4065 — `memory_skill_export` now round-trips a registered schema
+    // through the SKILL.md frontmatter, so a folder re-register carries it in
+    // `manifest.metadata`. A frontmatter-declared schema is held to the SAME
+    // fail-closed mint-time validation as the wire argument (it rides the same
+    // `skills.metadata` key); the wire argument, when present, still wins.
+    if parameters_schema.is_none()
+        && let Some(schema) = manifest
+            .metadata
+            .get(field_names::PARAMETERS_SCHEMA)
+            .filter(|v| !v.is_null())
+    {
+        validate_parameters_schema(schema).map_err(|e| {
+            format!("frontmatter parameters_schema rejected at register (fail-closed): {e}")
+        })?;
+    }
 
     // Mirror `parameters_schema` into the metadata JSON blob (same
     // pattern L2-7's `composes_with_reflections` uses) so it rides the

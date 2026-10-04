@@ -253,7 +253,7 @@ cargo install --path .
 
 ## Pre-built Binaries
 
-Pre-built binaries are available on the [Releases](https://github.com/alphaonedev/ai-memory-mcp/releases) page for four targets: Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`) and macOS (`x86_64-apple-darwin`, `aarch64-apple-darwin`). Releases are created on git tags. Note the pre-built binaries are default-feature builds — the `migrate` / `schema-init` subcommands and the postgres `--store-url` daemon path require a `--features sal,sal-postgres` source build.
+Pre-built binaries are available on the [Releases](https://github.com/alphaonedev/ai-memory-mcp/releases) page for four targets: Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`) and macOS (`x86_64-apple-darwin`, `aarch64-apple-darwin`). Releases are created on git tags. The pre-built binaries are built with `--features sal,sal-postgres`, declared once in `scripts/release-features.sh` and used by `.github/workflows/release.yml` (and proven by the `release-shape` workflow, which round-trips a memory through a TLS PostgreSQL service), so the `migrate` / `schema-init` subcommands and the PostgreSQL + Apache AGE + pgvector `serve --store-url postgres://…` daemon path are all present in the shipped binary; the PostgreSQL driver is pure-Rust `sqlx` on rustls, so no `libpq` or system OpenSSL is needed. A PostgreSQL store must pin `sslmode=verify-full` (the #3705 transit-encryption floor); the published container image (`ghcr.io/alphaonedev/ai-memory`, built from the repository `Dockerfile`) is built with the same feature set, from the same declaration; run `ai-memory features` to print the feature set a given binary or image was compiled with.
 
 The easiest way to install is via the install scripts:
 
@@ -790,6 +790,12 @@ ai-memory store -T "Installation test" -c "It works." --tier short
 # Recall it
 ai-memory recall "installation"
 ```
+
+Before running in production, read the
+[observability and incident-tracing contract](operations/observability.md):
+which process exposes which metrics (only `ai-memory serve` serves
+`/metrics`), what an absent or stale signal means, alert examples, and how
+to trace an incident end to end.
 
 ## Post-install: migrate from v0.6.x (if upgrading)
 

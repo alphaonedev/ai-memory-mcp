@@ -7,8 +7,14 @@ layout: doc
 > **What the default is.** Agent attestation is **required by default only
 > on the HTTP direct-write surface** ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751),
 > surface-scoped by [#1985](https://github.com/alphaonedev/ai-memory-mcp/issues/1985)):
-> an **unsigned** `POST /api/v1/memories` (+`/bulk`) is **rejected** with
+> the default strict HTTP surfaces are `POST /api/v1/memories`,
+> `POST /api/v1/memories/bulk` and `POST /api/v1/capture_turn`
+> ([#3406](https://github.com/alphaonedev/ai-memory-mcp/issues/3406)). An
+> **unsigned** write to any of them is **rejected** with
 > **`403 ATTESTATION_FAILED`** instead of landing `attest_level="claimed"`.
+> Capture-turn uses its own **host-signed capture envelope**, with the host
+> key bound to the caller; follow the [capture-turn API contract](#http-capture-turn-uses-a-different-signing-contract)
+> rather than applying the store `SignableWrite` example below to that endpoint.
 > The **MCP** `memory_store` and **CLI** `ai-memory store` surfaces are the
 > operator-as-actor path and are **permissive by default** — an unsigned
 > write lands `claimed`, no configuration needed. `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`
@@ -177,6 +183,17 @@ binding is appended to the `agent_pubkey_history` ledger (schema v97) with a
 dense 1-based version and a `[bound_at, superseded_at)` window, so writes an
 older key already attested stay verifiable against the key that signed them.
 
+**Upgrade precondition (v97, [#3500](https://github.com/alphaonedev/ai-memory-mcp/issues/3500)).**
+The v97 upgrade copies each canonical registration's existing key into the
+ledger as version 1 (`bind_authority = 'legacy_unproven'`). A stored key that
+is neither the 43-character URL-safe nor the 44-character padded base64 form
+of a 32-byte Ed25519 key fails the ledger's CHECK, and the upgraded binary
+refuses to open the database rather than drop the anchor. The error does not
+yet name the agent. Before upgrading, list and repair such keys with the
+pre-v1.0.0 binary (`ai-memory agents revoke-key --agent-id <id>`, then
+re-enroll) — the query and steps are in the
+[v1.0.0 release notes](v1.0.0/release-notes.md#before-upgrading--legacy-agent-keys-must-be-well-formed-schema-v97-3464--3500).
+
 ### Proof of possession (#3464)
 
 A bind now has to PROVE the caller holds the private half of the key being
@@ -301,6 +318,26 @@ The signed envelope is `SignableWrite = agent_id + namespace + title +
 kind + created_at + sha256(content)`. If you're scripting HTTP/MCP
 signing yourself, that's the byte layout to reproduce; most operators use
 the CLI `--sign` path or Option A for MCP.
+
+### HTTP capture-turn uses a different signing contract
+
+`POST /api/v1/capture_turn` is the third strict HTTP-direct surface
+(`WriteSurface::HttpDirect` in `src/identity/attest.rs`), but it does **not**
+take a `SignableWrite` `signature`. It takes the host-signed capture envelope:
+`host_signature_b64` + `host_pubkey_b64`, where the signature covers
+`host_session_id`, `host_turn_index`, `role` and `content` (NUL-separated).
+Under the default posture an unsigned capture (no `host_pubkey_b64`) is refused
+with `403`. A presented host key must be on the L4 host-key allowlist
+(`AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST`) **and** equal the public key bound to the
+resolved caller (`ai-memory agents bind-key`); `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`
+permits unsigned captures but never relaxes those checks
+(`src/handlers/capture_turn/attestation.rs`). A verified capture lands
+`signed_by_peer`, never `agent_attested`, because identity, namespace and
+timestamp are not signed fields. See the `POST /api/v1/capture_turn` entry in
+[API_REFERENCE.md](API_REFERENCE.md) for the full contract.
+
+MCP/CLI store defaults remain permissive unless global strictness
+(`AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`) is enabled.
 
 ### `created_at` must be the canonical storage-stable form (#3422)
 

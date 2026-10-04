@@ -202,7 +202,7 @@ mod tests {
 
     fn wake_for(recipient: &str) -> InboxEvent {
         InboxEvent::AgentNotified {
-            seq: 1,
+            seq: 900_001,
             recipient_agent_id: recipient.to_string(),
             correlation_id: "sha256:c".into(),
             inbox_row_id: "row-1".into(),
@@ -210,6 +210,7 @@ mod tests {
             sender_agent_id: "alice".into(),
             content_digest: "sha256:d".into(),
             notified_at: "2026-09-02T00:00:00Z".into(),
+            recipient_seq: 1,
         }
     }
 

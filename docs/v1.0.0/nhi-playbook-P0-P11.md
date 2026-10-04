@@ -83,14 +83,15 @@ Form-4 provenance wire-schema fields (`source_uri`, `expected_version`,
 
 ## P2 — Lifecycle (tier transitions, archive-on-forget)
 
-**Verifies:** TTL tiers, auto-promotion, explicit promotion, scoped forget, and
+**Verifies:** TTL tiers, no access-driven promotion, explicit promotion, scoped forget, and
 the archive-on-forget data-integrity contract. At v1.0.0 recall is PURE
 (#1869/#1953) — access ladders are applied by the FOLD job, not synchronously —
-so promotion is asserted after a fold, not inline.
+so the unchanged tier is asserted after a fold, not inline.
 
 **Pass assertion:**
-- Default tier = mid (7d TTL); 5 accesses drive `access_count` to 5 and the row
-  auto-promotes **mid→long** at `PROMOTION_THRESHOLD` after the fold; `expires_at` clears on long.
+- Default tier = mid (7d TTL); 5 accesses drive `access_count` to 5 after the fold and the row
+  STAYS **mid** with its priority unchanged (v1.0.0 Boids item 1 removed the access-driven
+  mid→long promotion; `storage::tests::g10_3_touch_no_longer_auto_promotes`).
 - `memory_promote` explicitly jumps mid→long (single call by default; optional `target_tier` stops at mid).
 - `memory_forget` by namespace is EXACT-scoped (a sub-namespace survives a parent-namespace forget).
 - **Archive-on-forget:** `memory_forget` writes an `archived_memories` row

@@ -12,8 +12,10 @@
 # ***
 # *** Add or remove a required context THERE, never here. Read that file's
 # *** "HOW TO CHANGE THIS FILE" section first — the mirror and the protection
-# *** API call cannot be atomic, and the safe landing ORDER differs between an
-# *** ADDITION (mirror first) and a REMOVAL (protection first).
+# *** API call cannot be atomic, and the safe landing ORDER is in that file's
+# *** header: since #3554 an ADDITION is live protection, then
+# *** --pin-from-live, then the mirror line in the same commit as the pin;
+# *** a REMOVAL is protection first too (#3985).
 # =============================================================================
 #
 # WHO READS THIS FILE (#2443 — answered mechanically, not from memory).

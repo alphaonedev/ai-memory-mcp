@@ -54,6 +54,7 @@ pub mod param_names;
 // the handler's fallback branch (empty-success / filter dropped /
 // negative-as-absent / stringy-bool). These helpers refuse instead.
 pub mod param_guard;
+pub mod stdio_drain;
 
 // #3378 unit 2 — inline JSON-Schema `enum` lists for closed MCP string
 // fields (`to` / `edge_type` / `signal_type` / `condition_type` / `state`).
@@ -1005,6 +1006,7 @@ pub mod tools {
     pub mod check_agent_action {
         pub use super::super::check_agent_action::{
             DEFAULT_AGENT_ID, build_action, handle_check_agent_action, run_check,
+            run_check_attributed,
         };
     }
 
@@ -1202,7 +1204,8 @@ pub fn skill_compositional_context_for_tests(
     conn: &rusqlite::Connection,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    handle_skill_compositional_context(conn, params)
+    // Local-operator posture (`None` read caller), as before #4059.
+    handle_skill_compositional_context(conn, params, None)
 }
 // handle_skill_export, handle_skill_promote_from_reflection,
 // handle_skill_register, handle_skill_get, handle_skill_list, and
@@ -2999,7 +3002,10 @@ fn dispatch_memory_skill_promote_from_reflection(
 }
 
 fn dispatch_memory_skill_compositional_context(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_compositional_context(ctx.conn, ctx.arguments)
+    // v1.0.0 #4059 — the composed reflections are memory rows: every one must
+    // be readable by the dispatch-resolved caller.
+    let caller = ctx.authority.read_caller();
+    handle_skill_compositional_context(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_skill_retire(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -3737,7 +3743,14 @@ fn handle_request(
             // so a new tool cannot bypass the SSOT gates (ERRORS-09).
             if !mcp_tool_is_read_only(tool_name) {
                 if let Err(e) = crate::storage::record_stop::gate_storage_conn(conn) {
-                    return err_response(id, jsonrpc::INTERNAL_ERROR, e.to_string());
+                    // #4400: the caller gets our own text only; the error's
+                    // foreign detail goes to the log.
+                    tracing::warn!(code = e.code(), detail = %e, "record-stop gate refused an MCP tool call");
+                    return err_response(
+                        id,
+                        jsonrpc::INTERNAL_ERROR,
+                        crate::storage::record_stop::caller_message(&e),
+                    );
                 }
             }
             let Some(dispatch) = lookup_dispatch(tool_name) else {
@@ -4514,6 +4527,8 @@ pub fn run_mcp_server(
     // (single-operator trust-all default). The `?` makes the refuse posture
     // abort MCP startup before the stdio loop opens.
     crate::identity::enforce_owner_lockout_guard(&conn)?;
+    // #4285 — boot WARN listing every corrupt governance standard.
+    crate::storage::boot_warn_corrupt_governance_standards(&conn);
 
     // v1.0.0 #3383 — seed the process-wide admin allowlist from the resolved
     // operator configuration. MCP stdio has no `AppState`, so before this the
@@ -5217,39 +5232,31 @@ pub fn run_mcp_server(
         }
         let overrun = line_buf.last() != Some(&b'\n') && n > MCP_MAX_LINE_BYTES;
         if overrun {
-            // Drain the rest of this line so the next iteration starts
-            // on a clean boundary. We discard the bytes; this also caps
-            // the drain so a never-ending stream of non-newline bytes
-            // doesn't spin forever in the drain loop.
-            let mut scratch = [0u8; 8192];
-            let mut drained: usize = 0;
-            loop {
-                if drained >= MCP_MAX_DRAIN_BYTES {
-                    // Hard ceiling on drain — close the loop rather than
-                    // serve an infinitely-streaming peer.
-                    let resp = err_response(
-                        Value::Null,
-                        jsonrpc::PARSE_ERROR,
-                        format!(
-                            "parse error: line exceeded {MCP_MAX_LINE_BYTES} bytes \
-                             and drain ceiling {MCP_MAX_DRAIN_BYTES} hit; closing stream"
-                        ),
-                    );
-                    let out = serde_json::to_string(&resp)?;
-                    writeln!(stdout, "{out}")?;
-                    stdout.flush()?;
-                    let _ = db::checkpoint(&conn);
-                    eprintln!("ai-memory MCP server stopped (drain ceiling exceeded)");
-                    return Ok(());
-                }
-                let m = stdin_locked.read(&mut scratch)?;
-                if m == 0 {
-                    break;
-                }
-                drained = drained.saturating_add(m);
-                if scratch[..m].contains(&b'\n') {
-                    break;
-                }
+            // Drain the rest of this line so the next iteration starts on a
+            // clean boundary. #4064 — `drain_oversize_line` consumes through
+            // the offending line's newline ONLY (`fill_buf`/`consume`), so a
+            // request pipelined behind it in the same buffered chunk is
+            // served, not discarded. The drain is capped so a never-ending
+            // stream of non-newline bytes cannot spin here forever.
+            if stdio_drain::drain_oversize_line(&mut stdin_locked, MCP_MAX_DRAIN_BYTES)?
+                == stdio_drain::DrainOutcome::CeilingHit
+            {
+                // Hard ceiling on drain — close the loop rather than
+                // serve an infinitely-streaming peer.
+                let resp = err_response(
+                    Value::Null,
+                    jsonrpc::PARSE_ERROR,
+                    format!(
+                        "parse error: line exceeded {MCP_MAX_LINE_BYTES} bytes \
+                         and drain ceiling {MCP_MAX_DRAIN_BYTES} hit; closing stream"
+                    ),
+                );
+                let out = serde_json::to_string(&resp)?;
+                writeln!(stdout, "{out}")?;
+                stdout.flush()?;
+                let _ = db::checkpoint(&conn);
+                eprintln!("ai-memory MCP server stopped (drain ceiling exceeded)");
+                return Ok(());
             }
             let resp = err_response(
                 Value::Null,
@@ -9620,6 +9627,74 @@ mod tests {
         assert_eq!(val["count"], 0);
     }
 
+    /// #4400 (vote ruling item 5) — the MCP `tools/call` dispatch fence refuses
+    /// a write tool while the audit trail is latched, and a read tool stays live.
+    /// No agent-id env guard: the fence refuses before any agent id is
+    /// resolved, and the read does not depend on one (#3523 arm (e)).
+    #[test]
+    fn a_latched_audit_trail_refuses_mcp_writes_but_not_reads_4400() {
+        let _sink = crate::audit::sink_test_lock();
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        crate::audit::fail_closed_latch_for_test();
+        let store = invoke_handle_request(
+            &conn,
+            &make_tools_call(
+                "memory_store",
+                json!({"title": "t4400", "content": "while latched"}),
+            ),
+        );
+        let list = invoke_handle_request(&conn, &make_tools_call("memory_list", json!({})));
+        crate::audit::fail_closed_force_on_for_test(false);
+        let err = store
+            .error
+            .expect("the write tool is refused while latched");
+        assert!(
+            err.message.contains(crate::audit::REQUIRE_AUDIT_TRAIL_ENV),
+            "the refusal names the knob: {}",
+            err.message
+        );
+        assert!(list.error.is_none(), "reads stay live: {:?}", list.error);
+    }
+
+    /// #4400 — the MCP dispatch fence never hands the caller the database
+    /// text behind a record-stop refusal. An unreadable audit chain makes the
+    /// gate refuse fail-closed (#3877) with `RecordStopIndeterminate`, whose
+    /// `reason` is the read error's text; the RPC error must carry our own
+    /// sentence and none of that text. Red if the fence renders
+    /// `e.to_string()` again. A file-backed DB gives the gate a key no other
+    /// test has cached.
+    #[test]
+    fn the_mcp_record_stop_fence_never_renders_database_text_4400() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = db::open(&dir.path().join("fence-4400.db")).unwrap();
+        conn.execute(
+            "ALTER TABLE signed_events RENAME TO signed_events_4400_hidden",
+            [],
+        )
+        .expect("make the record-stop read fail");
+        let resp = invoke_handle_request(
+            &conn,
+            &make_tools_call(
+                "memory_store",
+                json!({"title": "t4400-fence", "content": "unreadable chain"}),
+            ),
+        );
+        let err = resp.error.expect("the write is refused fail-closed");
+        // The gate's `reason` is the read error's text; the caller gets our
+        // own sentence, exactly, and none of that reason.
+        let ours = crate::storage::record_stop::caller_message(
+            &crate::storage::StorageError::RecordStopIndeterminate {
+                reason: String::new(),
+            },
+        );
+        assert!(
+            !err.message.contains("read_state_sqlite"),
+            "no database text reaches the caller: {}",
+            err.message
+        );
+        assert_eq!(err.message, ours, "the refusal is our own sentence");
+    }
+
     /// Same #3475 treatment as its sibling above.
     #[test]
     fn handle_inbox_with_unread_only_filter() {
@@ -12842,6 +12917,10 @@ mod tests {
     #[test]
     fn handle_reflect_approval_gate_queues_pending_above_threshold() {
         // Configure namespace with `require_approval_above_depth = 1`.
+        // #4285 — the fixture is a VALID policy on purpose (`write: any`): a
+        // knob-only blob is a corrupt level whose Owner floor refuses this
+        // non-owner caller before the gate; that shape is pinned by
+        // `tests/corrupt_governance_escape_4285.rs`.
         // A reflection that would land at depth 2 must be intercepted
         // BEFORE the substrate write, returning a `status: "pending"`
         // envelope with a fresh pending_id.
@@ -12849,7 +12928,7 @@ mod tests {
         reflect_test_seed_governance(
             &conn,
             "team/r-approve",
-            json!({"require_approval_above_depth": 1}),
+            json!({"write": "any", "require_approval_above_depth": 1}),
         );
         let s1 = reflect_test_seed_source(&conn, "team/r-approve", "src-1", 1);
         let req = make_tools_call(
@@ -12887,7 +12966,10 @@ mod tests {
         reflect_test_seed_governance(
             &conn,
             "team/r-under",
-            json!({"require_approval_above_depth": 5}),
+            // #4357 — this cell needs a VALID policy (`write` is required by the
+            // typed shape): a threshold-only blob is a corrupt level that fails
+            // closed to approval-required, so it could not "proceed".
+            json!({"write": "any", "require_approval_above_depth": 5}),
         );
         let s1 = reflect_test_seed_source(&conn, "team/r-under", "src-1", 0);
         let req = make_tools_call(
@@ -13167,7 +13249,7 @@ mod tests {
         reflect_test_seed_governance(
             &conn,
             "team/r-defgate",
-            json!({"require_approval_above_depth": 0}),
+            json!({"write": "any", "require_approval_above_depth": 0}),
         );
         let s1 = reflect_test_seed_source(&conn, "team/r-defgate", "src", 0);
         let req = make_tools_call(

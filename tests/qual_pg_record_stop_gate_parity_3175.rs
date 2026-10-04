@@ -37,6 +37,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+// #4023: ONE shared loader reads `postgres.rs` AND every child module under
+// `src/store/postgres/` (fail closed on an empty / short file set).
+#[path = "common/pg_sources.rs"]
+mod pg_sources;
+
 /// Split an adapter source file into `method name -> method body`, for
 /// methods declared at `impl`-block indentation (four spaces).
 fn methods(src: &str) -> BTreeMap<String, String> {
@@ -94,6 +99,19 @@ const INHERENT_PG_PARITY: &[&str] = &[
     "dequarantine_raw",
 ];
 
+/// `method name -> body` over the WHOLE Postgres adapter: `postgres.rs` plus
+/// every child module (#4023). A method present in several files keeps the
+/// first (root-first) definition, so a child can never shadow the root.
+fn pg_methods() -> BTreeMap<String, String> {
+    let mut all: BTreeMap<String, String> = BTreeMap::new();
+    for file in pg_sources::pg_adapter_sources() {
+        for (name, body) in methods(&file.text) {
+            all.entry(name).or_insert(body);
+        }
+    }
+    all
+}
+
 fn read(rel: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
@@ -102,7 +120,7 @@ fn read(rel: &str) -> String {
 #[test]
 fn every_sqlite_record_stop_gated_method_is_gated_on_postgres_3175() {
     let sqlite = methods(&read("src/store/sqlite.rs"));
-    let postgres = methods(&read("src/store/postgres.rs"));
+    let postgres = pg_methods();
 
     let sqlite_gated: BTreeSet<&String> = sqlite
         .iter()
@@ -192,8 +210,15 @@ fn ssot_gated_inherent_pg_twins_must_gate_3175() {
     // sqlite SSOT twin gates (update_with_expected_version — the
     // If-Match path) were invisible. Pair storage/mod.rs gated free-fns
     // with same-named PostgresStore methods.
-    let ssot = ssot_free_fns(&read("src/storage/mod.rs"));
-    let postgres = methods(&read("src/store/postgres.rs"));
+    // #4023 (L1): `merge_inbound_authorized` and its `gate_storage_conn`
+    // moved to a storage child module; read it with the root so the SSOT side
+    // does not go blind to the moved free fn.
+    let ssot = ssot_free_fns(&format!(
+        "{}\n{}",
+        read("src/storage/mod.rs"),
+        read("src/storage/merge_inbound_authorized_4023.rs")
+    ));
+    let postgres = pg_methods();
     let pg_directly_gated: BTreeSet<&String> = postgres
         .iter()
         .filter(|(_, body)| body.contains(GATE_CALL))
@@ -236,7 +261,7 @@ fn pg_if_match_and_dequarantine_raw_gate_directly_b8() {
         INHERENT_PG_PARITY.len() >= 4,
         "INHERENT_PG_PARITY shrank — put update_with_expected_version back"
     );
-    let postgres = methods(&read("src/store/postgres.rs"));
+    let postgres = pg_methods();
     for name in INHERENT_PG_PARITY {
         let body = postgres
             .get(*name)
@@ -252,7 +277,7 @@ fn pg_if_match_and_dequarantine_raw_gate_directly_b8() {
 fn the_two_methods_3175_fixed_gate_directly_on_postgres() {
     // Regression pin for the exact pair the R-405 scout found. Kept separate
     // from the enumeration above so a parser regression cannot mask it.
-    let postgres = methods(&read("src/store/postgres.rs"));
+    let postgres = pg_methods();
     for name in ["undo_in_place_edit", "recover_turn_idempotent"] {
         let body = postgres
             .get(name)
@@ -264,4 +289,18 @@ fn the_two_methods_3175_fixed_gate_directly_on_postgres() {
              inserts durable turn rows) and must refuse on a STOPPED plane"
         );
     }
+}
+
+#[test]
+fn child_module_methods_are_scanned_4023() {
+    // #4023: `pg_merge_inbound` lives in a child module. The scan must see it
+    // (and see its gate), or the trait arms that delegate to it look ungated.
+    let postgres = pg_methods();
+    let body = postgres
+        .get("pg_merge_inbound")
+        .unwrap_or_else(|| panic!("pg_merge_inbound not found — child modules are not scanned"));
+    assert!(
+        body.contains(GATE_CALL),
+        "#4023: PostgresStore::pg_merge_inbound must call {GATE_CALL}"
+    );
 }

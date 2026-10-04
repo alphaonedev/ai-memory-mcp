@@ -296,6 +296,35 @@ pub const DEFAULT_RECONNECT_BASE_MS: u32 = 250;
 pub const DEFAULT_RECONNECT_JITTER_MS: u32 = 750;
 
 // ---------------------------------------------------------------------------
+// Producer-side per-recipient wake counters (#4125)
+// ---------------------------------------------------------------------------
+
+/// Byte budget of the PRODUCER's per-recipient wake-counter table
+/// (`inbox_wake::RecipientSeqs`, #4125). Recipient ids are caller-supplied up
+/// to [`MAX_ID_BYTES`], so an entry-COUNT bound is not a memory bound (262k
+/// distinct 128-byte ids is tens of MiB); the table is bounded in BYTES, per
+/// this file's discipline: the summed key length plus
+/// [`RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES`] per entry never exceeds this. At
+/// the 128-byte id ceiling that is ~26k tracked recipients; past it the
+/// least-recently-woken recipient is evicted (see `docs/wake-hub.md`). An id
+/// over [`MAX_ID_BYTES`] is never tracked at all (the hub cannot carry it). The
+/// hash table itself is a FIXED reservation on top of this budget: twice the
+/// most entries the budget can hold (`2 * budget /
+/// RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES` slots, 4.12 MiB (4,325,384 bytes) at the default). Twice,
+/// because remove-then-insert churn leaves tombstones and a table that is more
+/// than half full GROWS (doubles) to reclaim them, while one at most half full
+/// rehashes in place; so it never grows and has no transient peak.
+pub const RECIPIENT_SEQ_BUDGET_BYTES: usize = 8 * 1_024 * 1_024;
+
+/// Accounted per-entry cost on top of the key bytes: the shared `Arc<str>`
+/// header, the hash-map slot (key pointer, counter, recency tick, control
+/// byte) and the recency-index node. A deliberately generous constant so the
+/// accounted per-entry bytes are an argued upper bound on the per-entry heap
+/// cost (not a measured RSS figure). The pre-sized hash table is a separate
+/// fixed reservation, see [`RECIPIENT_SEQ_BUDGET_BYTES`].
+pub const RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES: usize = 192;
+
+// ---------------------------------------------------------------------------
 // Token bucket
 // ---------------------------------------------------------------------------
 

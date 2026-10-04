@@ -319,6 +319,29 @@ pub(crate) fn parse_reflect_input(
     Ok((input, caller_depth))
 }
 
+/// #4089 — store an already-computed reflection embedding (vector +
+/// its space fingerprint) on the committed reflection row and in the
+/// vector index. Shared by the precomputed (HTTP) and inline (MCP) arms
+/// so the write shape cannot drift between them.
+fn persist_reflection_embedding(
+    conn: &rusqlite::Connection,
+    vector_index: Option<&dyn VectorSearchIndex>,
+    outcome_id: &str,
+    embedding: Vec<f32>,
+    space: &str,
+) {
+    if let Err(e) = db::set_embedding(conn, outcome_id, &embedding, space) {
+        tracing::warn!(
+            "failed to store embedding for reflection {}: {}",
+            outcome_id,
+            e
+        );
+    }
+    if let Some(idx) = vector_index {
+        idx.insert(outcome_id.to_string(), embedding);
+    }
+}
+
 pub fn handle_reflect(
     conn: &rusqlite::Connection,
     db_path: &Path,
@@ -344,6 +367,7 @@ pub fn handle_reflect(
         vector_index,
         mcp_client,
         active_keypair,
+        None,
         None,
     )
 }
@@ -388,6 +412,16 @@ pub fn handle_reflect_caller(
     mcp_client: Option<&str>,
     active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
     authenticated_caller: Option<&str>,
+    // #4089 — `(vector, space)` precomputed on the blocking pool BEFORE any
+    // lock was taken (the HTTP surface; title + content are required params
+    // so the text is known pre-write). When the HTTP surface attempted the
+    // precompute it passes `embedder: None` alongside, so a FAILED
+    // precompute (`None` here) is NOT retried inline under the locks — the
+    // reflection commits vectorless exactly as an inline failure would.
+    // `None` with an embedder preserves every existing caller byte-for-byte:
+    // the MCP dispatch embeds inline (it already runs inside
+    // `spawn_blocking`).
+    precomputed_embedding: Option<(Vec<f32>, String)>,
 ) -> Result<Value, String> {
     // ─── Argument parsing ───────────────────────────────────────────
     let source_ids_arr = params[param_names::SOURCE_IDS]
@@ -663,7 +697,16 @@ pub fn handle_reflect_caller(
             // namespace's governance metadata blob — avoids adding a
             // new field to the GovernancePolicy struct (which would
             // require updating every GovernancePolicy { … } literal).
-            if let Some(threshold) = db::resolve_require_approval_above_depth(conn, ns) {
+            // #4043 — an unreadable threshold refuses the reflection; it is never
+            // "no approval required".
+            if let Some(threshold) =
+                db::resolve_require_approval_above_depth(conn, ns).map_err(|e| {
+                    crate::mcp::error_text::mcp_foreign_err(
+                        crate::storage::GOVERNANCE_POLICY_UNREADABLE,
+                        e,
+                    )
+                })?
+            {
                 if new_depth_u32 > threshold {
                     let pending_id = db::queue_pending_action(
                         conn,
@@ -718,7 +761,8 @@ pub fn handle_reflect_caller(
         });
         let auto_export = target_ns
             .as_deref()
-            .and_then(|ns| db::resolve_governance_policy(conn, ns))
+            // #4043 — optional feature knob: an unreadable policy leaves it OFF.
+            .map(|ns| db::resolve_governance_policy_for_optional_feature(conn, ns))
             .map(|p| p.effective_auto_export_reflections_to_filesystem())
             .unwrap_or(false);
         let mut h = if auto_export {
@@ -768,22 +812,20 @@ pub fn handle_reflect_caller(
     // Generate + persist an embedding for the new reflection memory so
     // semantic recall can find it. Failure is logged, not fatal — the
     // memory is already committed.
-    if let Some(emb) = embedder {
+    //
+    // #4089 (rust-1.98 CONCURRENCY-22) — when the HTTP surface precomputed
+    // the embedding on the blocking pool before any lock was taken, store
+    // it directly (no worker, no lock held across a forward pass). The MCP
+    // dispatch keeps the inline path: it already runs inside
+    // `spawn_blocking`.
+    if let Some((embedding, space)) = precomputed_embedding {
+        persist_reflection_embedding(conn, vector_index, &outcome.id, embedding, &space);
+    } else if let Some(emb) = embedder {
         let text = crate::embeddings::embedding_document(title, content);
         match emb.embed(&text) {
             Ok(embedding) => {
-                if let Err(e) =
-                    db::set_embedding(conn, &outcome.id, &embedding, &emb.space_fingerprint())
-                {
-                    tracing::warn!(
-                        "failed to store embedding for reflection {}: {}",
-                        &outcome.id,
-                        e
-                    );
-                }
-                if let Some(idx) = vector_index {
-                    idx.insert(outcome.id.clone(), embedding);
-                }
+                let space = emb.space_fingerprint();
+                persist_reflection_embedding(conn, vector_index, &outcome.id, embedding, &space);
             }
             Err(e) => {
                 tracing::warn!(
@@ -1438,8 +1480,11 @@ mod tests {
         for (key, bad, want) in &table {
             let mut p = base.clone();
             p[*key] = bad.clone();
-            let err = handle_reflect_caller(&conn, tmp.path(), &p, None, None, None, None, None)
-                .expect_err("#3390: handle_reflect_caller refuses the same wrong-typed optional");
+            let err =
+                handle_reflect_caller(&conn, tmp.path(), &p, None, None, None, None, None, None)
+                    .expect_err(
+                        "#3390: handle_reflect_caller refuses the same wrong-typed optional",
+                    );
             assert!(err.contains(want), "#3390 (caller) {key}={bad}: got: {err}");
         }
         // CONTROL — absent optionals default, and well-typed optionals succeed.

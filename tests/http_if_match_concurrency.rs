@@ -231,24 +231,154 @@ async fn http_put_with_quoted_if_match_etag_style_value_parses() {
     );
 }
 
+/// #4061 — a PRESENT `If-Match` that names no version used to be read as
+/// "no precondition": the compare-and-swap fence vanished and the stale
+/// write landed. It is now refused with 400 and the row is left untouched
+/// (fail closed; data integrity over convenience). The RFC 9110 wildcard
+/// `*` ("any current representation") still means last-write-wins.
 #[tokio::test]
-async fn http_put_with_unparseable_if_match_falls_through_to_legacy() {
-    // If the header is present but the value is not a valid integer,
-    // the gate is silently skipped (treated as None) and the update
-    // succeeds. The contract is "opt-in, integer-only" — a malformed
-    // header should not fail-closed and brick the caller.
+async fn http_put_with_unparseable_if_match_is_refused_4061() {
     let (router, file) = build_test_router();
     let id = seed(file.path(), "bogus-header");
-    let (status, _) = put_with_if_match(
-        &router,
-        &id,
-        Some("not-an-integer"),
-        json!({"content": "fallback"}),
-    )
-    .await;
+    for bogus in ["not-an-integer", "W/\"1\"", "1.5", "99999999999999999999"] {
+        let (status, body) = put_with_if_match(
+            &router,
+            &id,
+            Some(bogus),
+            json!({"content": "stale overwrite"}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "If-Match {bogus:?} must be refused, not silently dropped: {body}"
+        );
+    }
+    let conn = ai_memory::db::open(file.path()).expect("reopen");
+    let row = ai_memory::db::get(&conn, &id)
+        .expect("get")
+        .expect("row still present");
+    assert_eq!(row.content, "v1 body", "a refused If-Match must not write");
+    assert_eq!(
+        row.version, 1,
+        "a refused If-Match must not bump the version"
+    );
+}
+
+#[tokio::test]
+async fn http_put_with_wildcard_if_match_is_last_write_wins_4061() {
+    let (router, file) = build_test_router();
+    let id = seed(file.path(), "wildcard-header");
+    let (status, body) =
+        put_with_if_match(&router, &id, Some("*"), json!({"content": "any"})).await;
     assert_eq!(
         status,
         StatusCode::OK,
-        "unparseable If-Match value falls through to legacy path"
+        "If-Match: * is no precondition: {body}"
     );
+}
+
+/// PUT with an arbitrary list of raw `If-Match` field lines (0..n).
+async fn put_with_if_match_lines(
+    router: &axum::Router,
+    id: &str,
+    lines: &[&[u8]],
+    body: Value,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/memories/{id}"))
+        .header("content-type", "application/json");
+    for line in lines {
+        req = req.header(
+            "if-match",
+            axum::http::HeaderValue::from_bytes(line).expect("header value"),
+        );
+    }
+    let req = req
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// #4061 (R10 retest gap) — the WHOLE received `If-Match` field is parsed
+/// strictly. A repeated field line (RFC 9110 §5.2 combines them; `*` mixed
+/// with a tag is invalid), a comma list, unbalanced / stray / doubled
+/// quotes, a weak `W/` tag, signs, inner whitespace and an empty value are
+/// all refused with 400 and write nothing. Pre-fix the first field line
+/// alone was read (`*` then `"0"` wrote unconditionally) and edge quotes
+/// were trimmed arbitrarily (`"1` read as version 1 and wrote).
+#[tokio::test]
+async fn http_put_with_multiple_or_malformed_if_match_is_refused_4061() {
+    let (router, file) = build_test_router();
+    let id = seed(file.path(), "strict-if-match");
+    let cases: &[&[&[u8]]] = &[
+        // multiple field lines
+        &[b"*", b"\"0\""],
+        &[b"\"1\"", b"\"1\""],
+        &[b"1", b"1"],
+        &[b"*", b"*"],
+        // comma lists
+        &[b"\"1\", \"2\""],
+        &[b"*, \"1\""],
+        &[b"1,1"],
+        &[b"1,"],
+        // unbalanced / stray / doubled quotes
+        &[b"\"1"],
+        &[b"1\""],
+        &[b"\"\"1\"\""],
+        &[b"\""],
+        &[b"\"\""],
+        &[b"\"1\"\""],
+        // weak tags (If-Match uses strong comparison)
+        &[b"W/\"1\""],
+        &[b"w/\"1\""],
+        &[b"W/1"],
+        // signs, whitespace inside the tag, empty, non-ASCII
+        &[b"+1"],
+        &[b"-1"],
+        &[b"\" 1\""],
+        &[b"1 2"],
+        &[b""],
+        &[b"\xc2\xb9"],
+    ];
+    for lines in cases {
+        let (status, body) =
+            put_with_if_match_lines(&router, &id, lines, json!({"content": "clobber"})).await;
+        let shown: Vec<String> = lines
+            .iter()
+            .map(|l| String::from_utf8_lossy(l).into_owned())
+            .collect();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "If-Match {shown:?} must be refused before any write: {body}"
+        );
+    }
+    let conn = ai_memory::db::open(file.path()).expect("reopen");
+    let row = ai_memory::db::get(&conn, &id)
+        .expect("get")
+        .expect("row present");
+    assert_eq!(row.content, "v1 body", "no malformed If-Match may write");
+    assert_eq!(row.version, 1, "no malformed If-Match may bump the version");
+
+    // Controls on the same row: a single bare / quoted current version and
+    // surrounding whitespace are accepted; a single stale tag is a 409.
+    let (status, body) =
+        put_with_if_match_lines(&router, &id, &[b" \"1\" "], json!({"content": "v2"})).await;
+    assert_eq!(status, StatusCode::OK, "quoted current version: {body}");
+    let (status, body) =
+        put_with_if_match_lines(&router, &id, &[b"2"], json!({"content": "v3"})).await;
+    assert_eq!(status, StatusCode::OK, "bare current version: {body}");
+    let (status, body) =
+        put_with_if_match_lines(&router, &id, &[b"\"1\""], json!({"content": "stale"})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "single stale tag: {body}");
 }

@@ -367,7 +367,7 @@ collect_ladder_added_columns() {
     local -a inputs=()
     [[ -d "$mig_dir/$backend" ]] && while IFS= read -r f; do
         inputs+=("$f")
-    done < <(find "$mig_dir/$backend" -maxdepth 1 -type f -name '*.sql' | sort)
+    done < <(find "$mig_dir/$backend" -maxdepth 1 -type f -name '*.sql' | LC_ALL=C sort)
     [[ -f "$ladder_rs" ]] && inputs+=("$ladder_rs")
     (( ${#inputs[@]} == 0 )) && return 0
 
@@ -387,7 +387,7 @@ collect_ladder_added_columns() {
                 rest = substr(rest, RSTART + RLENGTH)
             }
         }
-    ' | sort -u
+    ' | LC_ALL=C sort -u
 }
 
 # extract_bootstrap <backend> <pg-schema-sql> <sqlite-migrations-rs>
@@ -480,13 +480,13 @@ run_gate() {
                 first_for[$pfx]="$base"
                 prefixes+=("$pfx")
             fi
-        done < <(find "$dir" -maxdepth 1 -type f -name '*.sql' | sort)
+        done < <(find "$dir" -maxdepth 1 -type f -name '*.sql' | LC_ALL=C sort)
         unset first_for
 
         # Gap check over the sorted unique prefix set.
         if (( seen_dup == 0 )) && (( ${#prefixes[@]} > 0 )); then
             local sorted min max i
-            IFS=$'\n' sorted=($(printf '%s\n' "${prefixes[@]}" | sort -n)); unset IFS
+            IFS=$'\n' sorted=($(printf '%s\n' "${prefixes[@]}" | LC_ALL=C sort -n)); unset IFS
             min="${sorted[0]}"; max="${sorted[-1]}"
             for (( i = min; i <= max; i++ )); do
                 if ! array_contains "$i" "${sorted[@]}"; then
@@ -551,7 +551,7 @@ run_gate() {
     if [[ -f "$pg_rs" ]]; then
         local dupfn
         # Match fn DEFINITIONS (`fn migrate_vN(`), not doc-comment mentions.
-        dupfn="$(grep -oE 'fn migrate_v[0-9]+\(' "$pg_rs" 2>/dev/null | sort | uniq -d || true)"
+        dupfn="$(grep -oE 'fn migrate_v[0-9]+\(' "$pg_rs" 2>/dev/null | LC_ALL=C sort | uniq -d || true)"
         if [[ -n "$dupfn" ]]; then
             echo "❌ migration-ladder [postgres]: RULE (b) DUPLICATE migrate fn(s):" >&2
             printf '%s\n' "$dupfn" | sed -E 's/^/     /' >&2
@@ -559,7 +559,7 @@ run_gate() {
         fi
         local duparm
         # Anchor to arm-opening code lines so a comment mention is not a false dup.
-        duparm="$(grep -E '^[[:space:]]*if current_version < [0-9]+ \{' "$pg_rs" 2>/dev/null | grep -oE 'current_version < [0-9]+' | sort | uniq -d || true)"
+        duparm="$(grep -E '^[[:space:]]*if current_version < [0-9]+ \{' "$pg_rs" 2>/dev/null | grep -oE 'current_version < [0-9]+' | LC_ALL=C sort | uniq -d || true)"
         if [[ -n "$duparm" ]]; then
             echo "❌ migration-ladder [postgres]: RULE (b) DUPLICATE arm(s):" >&2
             printf '%s\n' "$duparm" | sed -E 's/^/     /' >&2
@@ -572,7 +572,7 @@ run_gate() {
         #      Scan the NUMERIC after `fn migrate_v` across ALL variants and flag
         #      a repeated version. Catches the D2 escape.
         local dupfnnum
-        dupfnnum="$(grep -oE 'fn migrate_v[0-9]+' "$pg_rs" 2>/dev/null | grep -oE '[0-9]+' | sort -n | uniq -d || true)"
+        dupfnnum="$(grep -oE 'fn migrate_v[0-9]+' "$pg_rs" 2>/dev/null | grep -oE '[0-9]+' | LC_ALL=C sort -n | uniq -d || true)"
         if [[ -n "$dupfnnum" ]]; then
             echo "❌ migration-ladder [postgres]: RULE (b) DUPLICATE migrate fn VERSION(s) (a name-variant like migrate_vNN_suffix escapes the exact-name dup check):" >&2
             printf '%s\n' "$dupfnnum" | sed -E 's/^/     v/' >&2
@@ -626,7 +626,7 @@ run_gate() {
             dir="$mig_dir/$backend"
             [[ -d "$dir" ]] || continue
             local tip tip_base tip_v
-            tip="$(find "$dir" -maxdepth 1 -type f -name '*.sql' | sort | tail -1)"
+            tip="$(find "$dir" -maxdepth 1 -type f -name '*.sql' | LC_ALL=C sort | tail -1)"
             [[ -z "$tip" ]] && continue
             tip_base="$(basename "$tip")"
             tip_v="$(extract_vtag "$tip_base")"
@@ -643,7 +643,7 @@ run_gate() {
     # Postgres ladder tip (`migrate_vN`) must equal CURRENT_SCHEMA_VERSION.
     if [[ -n "$cv_pg" && -f "$pg_rs" ]]; then
         local pg_tip
-        pg_tip="$(grep -oE 'fn migrate_v[0-9]+\(' "$pg_rs" 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -1 || true)"
+        pg_tip="$(grep -oE 'fn migrate_v[0-9]+\(' "$pg_rs" 2>/dev/null | grep -oE '[0-9]+' | LC_ALL=C sort -n | tail -1 || true)"
         if [[ -n "$pg_tip" && "$pg_tip" != "$cv_pg" ]]; then
             echo "❌ migration-ladder [postgres]: RULE (d) ladder tip migrate_v$pg_tip != CURRENT_SCHEMA_VERSION=$cv_pg." >&2
             violations=$((violations + 1))
@@ -655,7 +655,7 @@ run_gate() {
     # or an inline-arm "canonical DDL" comment). One grep pass.
     local referenced=""
     if [[ -d "$src_dir" ]]; then
-        referenced="$(grep -rhoE 'migrations/(sqlite|postgres)/[0-9]{4}_[A-Za-z0-9_]+\.sql' "$src_dir" 2>/dev/null | sort -u || true)"
+        referenced="$(grep -rhoE 'migrations/(sqlite|postgres)/[0-9]{4}_[A-Za-z0-9_]+\.sql' "$src_dir" 2>/dev/null | LC_ALL=C sort -u || true)"
     fi
     # Pipe-free membership (#3608 / #2414): `printf | grep -qx` under
     # pipefail turns a first-line HIT into a miss when grep -q closes the
@@ -677,7 +677,7 @@ run_gate() {
                 echo "     Wire it into the ladder (include_str! or an inline arm), or add it to LADDER_EXEMPT_FILES with a reason." >&2
                 violations=$((violations + 1))
             fi
-        done < <(find "$dir" -maxdepth 1 -type f -name '*.sql' | sort)
+        done < <(find "$dir" -maxdepth 1 -type f -name '*.sql' | LC_ALL=C sort)
     done
     # include_str! arms referencing a missing file (compiler-enforced; belt).
     local ref_path
@@ -688,7 +688,7 @@ run_gate() {
             violations=$((violations + 1))
         fi
     done < <(grep -rhoE 'include_str!\("[^"]*migrations/(sqlite|postgres)/[0-9]{4}_[A-Za-z0-9_]+\.sql"\)' "$mig_rs" "$pg_rs" 2>/dev/null \
-                | grep -oE 'migrations/(sqlite|postgres)/[0-9]{4}_[A-Za-z0-9_]+\.sql' | sort -u || true)
+                | grep -oE 'migrations/(sqlite|postgres)/[0-9]{4}_[A-Za-z0-9_]+\.sql' | LC_ALL=C sort -u || true)
 
     # ---- Rule (f): BOOTSTRAP↔LADDER forward reference (#2424) ---------------
     # The bootstrap replays over LEGACY databases BEFORE the ladder runs, so an
@@ -774,7 +774,7 @@ run_gate() {
             done
             # Duplicate rows.
             local gdup
-            gdup="$(printf '%s\n' "${g_metas[@]}" | sort -n | uniq -d || true)"
+            gdup="$(printf '%s\n' "${g_metas[@]}" | LC_ALL=C sort -n | uniq -d || true)"
             if [[ -n "$gdup" ]]; then
                 echo "❌ migration-ladder: RULE (g) DUPLICATE MIGRATION_LADDER row(s) for version(s):" >&2
                 printf '%s\n' "$gdup" | sed -E 's/^/     v/' >&2

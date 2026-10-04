@@ -79,6 +79,12 @@ pub(crate) mod pg_migration_lock;
 /// per-DB sqlite flag registry.
 pub mod record_stop;
 
+/// v1.0.0 #3152 — one commit per logical `update` (patch + lifecycle
+/// transition), proven by refusal, visibility and crash tests on both
+/// backends.
+#[cfg(test)]
+mod update_atomicity_3152_tests;
+
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 
@@ -455,6 +461,15 @@ pub enum StoreError {
     #[error("{detail}")]
     TraversalBudgetExceeded { detail: String },
 
+    /// #4400 — a mutating operation refused because this process's flat audit
+    /// trail failed and `AI_MEMORY_REQUIRE_AUDIT_TRAIL` is set. Process-local and
+    /// self-clearing (the gate retries the trail); DISTINCT from
+    /// [`Self::Stopped`], an operator decision persisted in the chain.
+    ///
+    /// Wire shape (HTTP): `503` with code `AUDIT_TRAIL_UNAVAILABLE`.
+    #[error("{reason}")]
+    AuditTrailUnavailable { reason: String },
+
     #[error("underlying backend error: {0}")]
     Backend(#[from] BoxBackendError),
 }
@@ -537,6 +552,8 @@ impl StoreError {
             // backend-blind (the same budget on both adapters); it carries its
             // own slug rather than a generic backend fault.
             Self::TraversalBudgetExceeded { .. } => error_codes::TRAVERSAL_BUDGET_EXCEEDED,
+            // #4400 — retryable and self-clearing: its own slug.
+            Self::AuditTrailUnavailable { .. } => error_codes::AUDIT_TRAIL_UNAVAILABLE,
             Self::Backend(_) => error_codes::DATABASE_ERROR,
         }
     }
@@ -580,6 +597,50 @@ pub fn reject_unattributed_space(op: &str, space: &str) -> StoreResult<()> {
             detail: e.to_string(),
         }
     })
+}
+
+/// #4045 — shared input guard for
+/// [`MemoryStore::consolidate_with_expected_versions`], so BOTH adapters
+/// refuse an empty/whitespace summary (#4046) and a version list that is not
+/// aligned one-for-one with `ids` as the SAME typed
+/// [`StoreError::InvalidInput`], before any lock or write.
+///
+/// # Errors
+///
+/// [`StoreError::InvalidInput`] when the summary fails
+/// [`crate::validate::validate_content`] or the version count differs from
+/// the id count.
+pub(crate) fn validate_consolidation_input(
+    ids: &[String],
+    summary: &str,
+    expected_versions: Option<&[i64]>,
+) -> StoreResult<()> {
+    crate::validate::validate_content(summary).map_err(|e| StoreError::InvalidInput {
+        detail: e.to_string(),
+    })?;
+    if expected_versions.is_some_and(|versions| versions.len() != ids.len()) {
+        return Err(StoreError::InvalidInput {
+            detail: "source version count must match source ids".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// #4045 (5-agent vote 4d3ea1c5, memory 656eb5ff, item 2) — the ONE mapping
+/// of a stale consolidation source onto the SAL error, shared by both
+/// adapters so a caller matching on the variant sees [`StoreError::Conflict`]
+/// on sqlite AND postgres. `Conflict` carries only the id (a structured
+/// field, never decorated text), so the expected/stored versions are kept
+/// for the operator in a structured WARN emitted here, at the one point both
+/// values are known.
+pub(crate) fn consolidation_version_conflict(id: &str, expected: i64, stored: i64) -> StoreError {
+    tracing::warn!(
+        memory_id = %id,
+        expected_version = expected,
+        stored_version = stored,
+        "consolidation refused: source changed after it was summarized"
+    );
+    StoreError::Conflict { id: id.to_string() }
 }
 
 /// #1709 Pillar 1 — capability tag returned by the default (unsupported)
@@ -932,6 +993,18 @@ pub(crate) fn authorize_namespace_standard_mutation(
         binding,
         op,
     )
+}
+
+/// #4356 — map the shared SET verdict's refusal to the SAL error type.
+pub(crate) fn set_refusal_to_store_err(
+    refusal: crate::ns_standard_ancestor::SetRefusal,
+    namespace: &str,
+) -> StoreError {
+    StoreError::PermissionDenied {
+        action: NamespaceStandardOp::Set.label().to_string(),
+        target: namespace.to_string(),
+        reason: crate::ns_standard_ancestor::refusal_reason(refusal).to_string(),
+    }
 }
 
 /// #3176 — the CLEAR arm of [`authorize_namespace_standard_mutation`].
@@ -2737,6 +2810,14 @@ pub trait MemoryStore: Send + Sync {
     /// byte-identical to `inbound` — so the CRDT `sanitize` (which neutralizes an
     /// UNTRUSTED level for the LWW tiebreak) cannot demote a level this node
     /// independently verified. Non-receive callers pass `false` (legacy merge).
+    ///
+    /// **UNCHECKED (#4023).** This method does NOT re-authorize the pushing
+    /// peer's namespace scope against the row it locks. It exists for tests
+    /// and for the adapters' own delegation ONLY; every production federation
+    /// caller must use [`merge_inbound_authorized`](MemoryStore::merge_inbound_authorized).
+    /// Pinned by `tests/merge_inbound_unchecked_ceiling_4023.rs` (5-agent vote
+    /// (4d3ea1c5), memory 179cf088).
+    #[doc(hidden)]
     async fn merge_inbound(
         &self,
         _ctx: &CallerContext,
@@ -2745,6 +2826,40 @@ pub trait MemoryStore: Send + Sync {
     ) -> StoreResult<String> {
         Err(StoreError::UnsupportedCapability {
             capability: "FEDERATION_MERGE_INBOUND".to_string(),
+        })
+    }
+
+    /// #4023 — [`merge_inbound`](MemoryStore::merge_inbound) with the
+    /// federation peer-scope verdict re-evaluated against the STORED namespace
+    /// of the colliding row, read under the SAME lock the merge writes under.
+    ///
+    /// The receive funnel's scope gate reads a colliding row's namespace on a
+    /// pre-read; `merge_memory` LWWs `namespace`, so a row moved by a broader
+    /// writer between that read and the merge would otherwise take the narrow
+    /// peer's write. `authorize_stored` is called with the locked row's
+    /// namespace; `false` refuses the merge with `PermissionDenied` and writes
+    /// nothing. The no-row fall-through is not re-checked (its upsert targets
+    /// the already-authorized claimed namespace; a concurrently inserted
+    /// same-`id` row fails it on the primary key instead of being clobbered).
+    ///
+    /// Default: `UnsupportedCapability` — an adapter that cannot re-check
+    /// FAILS CLOSED rather than silently merging unchecked.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`merge_inbound`](MemoryStore::merge_inbound) returns, plus a
+    /// refusal when the locked row's namespace is not authorized
+    /// (`PermissionDenied { action: FEDERATION_MERGE_INBOUND }` on BOTH
+    /// backends, detail built by [`crate::storage::inbound_stored_namespace_refused`]).
+    async fn merge_inbound_authorized(
+        &self,
+        _ctx: &CallerContext,
+        _inbound: &Memory,
+        _receiver_verified: bool,
+        _authorize_stored: crate::storage::StoredNamespaceAuthorizer<'_>,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FEDERATION_MERGE_INBOUND_AUTHORIZED".to_string(),
         })
     }
 
@@ -3006,6 +3121,97 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #4447 — [`apply_remote_deletion`](MemoryStore::apply_remote_deletion) with
+    /// the federation peer-scope verdict re-evaluated against the STORED
+    /// namespace of the row it deletes, read under the SAME lock the delete
+    /// writes under (`FOR UPDATE` on postgres, the write transaction on
+    /// sqlite). The sibling of [`merge_inbound_authorized`](MemoryStore::merge_inbound_authorized)
+    /// for the `deletions[]` lane: the funnel's scope gate reads the namespace on
+    /// an earlier probe, and a broader writer can move the row out of the peer's
+    /// scope before the write. `authorize_stored(id, stored_namespace)` returning
+    /// `false` refuses with `PermissionDenied { action: FEDERATION_APPLY_DELETION }`
+    /// and writes nothing. A row absent under the lock is not re-checked (nothing
+    /// is deleted; the funnel already reports the no-op).
+    ///
+    /// Default: `UnsupportedCapability` — an adapter that cannot re-check FAILS
+    /// CLOSED rather than silently deleting unchecked.
+    ///
+    /// # Errors
+    ///
+    /// Everything `apply_remote_deletion` returns, plus the refusal above.
+    async fn apply_remote_deletion_authorized(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_DELETION_AUTHORIZED".to_string(),
+        })
+    }
+
+    /// #4447 — the `archives[]` twin of
+    /// [`apply_remote_deletion_authorized`](MemoryStore::apply_remote_deletion_authorized):
+    /// the live row's stored namespace is re-authorized inside the archive
+    /// transaction. Refusal is `PermissionDenied { action: FEDERATION_APPLY_ARCHIVE }`.
+    /// Default: `UnsupportedCapability` (fails closed).
+    ///
+    /// # Errors
+    ///
+    /// Everything `apply_remote_archive` returns, plus the refusal above.
+    async fn apply_remote_archive_authorized(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_ARCHIVE_AUTHORIZED".to_string(),
+        })
+    }
+
+    /// #4447 — the `restores[]` twin: the ARCHIVED row's stored namespace is
+    /// re-authorized inside the restore transaction. The #1848 / G30
+    /// forget-tombstone gate of [`apply_remote_restore`](MemoryStore::apply_remote_restore)
+    /// still runs first. Refusal is
+    /// `PermissionDenied { action: FEDERATION_APPLY_RESTORE }`. Default:
+    /// `UnsupportedCapability` (fails closed).
+    ///
+    /// # Errors
+    ///
+    /// Everything `apply_remote_restore` returns, plus the refusal above.
+    async fn apply_remote_restore_authorized(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_RESTORE_AUTHORIZED".to_string(),
+        })
+    }
+
+    /// #4447 — the `links[]` twin: BOTH endpoints' stored namespaces are
+    /// re-authorized (each through `authorize_stored(endpoint_id, namespace)`)
+    /// under the link transaction's lock. Refusal is
+    /// `PermissionDenied { action: FEDERATION_APPLY_LINK }`. Default:
+    /// `UnsupportedCapability` (fails closed).
+    ///
+    /// # Errors
+    ///
+    /// Everything `apply_remote_link` returns, plus the refusal above.
+    async fn apply_remote_link_authorized(
+        &self,
+        _ctx: &CallerContext,
+        _link: &MemoryLink,
+        _attest_level: &str,
+        _authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_LINK_AUTHORIZED".to_string(),
+        })
+    }
+
     /// v1.0.0 #3075 — apply a remote-origin PENDING-action row (`/sync/push`
     /// `pendings[]`).
     ///
@@ -3149,9 +3355,10 @@ pub trait MemoryStore: Send + Sync {
     // (semantic weight varies by content length: 0.50 for short
     // content ≤500 chars, 0.15 for long content ≥5000 chars, lerp in
     // between). Each candidate gets a 6-factor blended score, then
-    // the survivors are touched (access_count++, TTL extended,
-    // mid→long auto-promotion at 5 accesses, priority++ every 10
-    // accesses).
+    // recall is pure (#1953): the survivors are recorded in the
+    // `recall_observations` ledger and the fold job later applies
+    // access_count++ and the TTL floor-extend (no tier promotion or
+    // priority ladder since v1.0.0 Boids item 1).
     //
     // Both adapters implement; sqlite delegates to db::recall_hybrid,
     // postgres synthesises the same 6-factor blend over pgvector +
@@ -3197,8 +3404,8 @@ pub trait MemoryStore: Send + Sync {
 
     /// Touch the supplied memory ids: increment `access_count`,
     /// extend TTL (1h short / 1d mid by default — adapters honor the
-    /// resolved TTL config), auto-promote mid→long at 5 accesses,
-    /// increment priority every 10 accesses (capped at 10).
+    /// resolved TTL config) as a floor. Since v1.0.0 Boids item 1
+    /// (vote 4d3ea1c5) touch neither promotes a tier nor bumps priority.
     ///
     /// Idempotent on a per-id basis; missing ids are silently skipped.
     /// Default returns `Ok(())` — adapters that wire touch ops override.
@@ -3366,6 +3573,20 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #4356 — the nearest governing ancestor of `namespace` for the
+    /// ancestor-owner bind gate (the HTTP funnel's pre-write probe; the
+    /// adapters' own `set_namespace_standard` re-runs the gate in-transaction
+    /// as the fail-closed floor). Default returns `UnsupportedCapability`
+    /// (fail-closed: an adapter that cannot answer cannot admit the bind).
+    async fn namespace_governing_ancestor(
+        &self,
+        _namespace: &str,
+    ) -> StoreResult<crate::ns_standard_ancestor::GoverningAncestor> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_GOVERNING_ANCESTOR".to_string(),
+        })
+    }
+
     /// Clear the namespace standard. Returns `true` when a row was
     /// removed, `false` when no namespace_meta row matched. Default
     /// returns `UnsupportedCapability`.
@@ -3477,6 +3698,40 @@ pub trait MemoryStore: Send + Sync {
                 .as_str()
                 .to_string(),
         })
+    }
+
+    /// Consolidate with source versions aligned one-for-one with `ids`.
+    /// Adapters compare them inside the write transaction before any mutation;
+    /// PostgreSQL locks all sources in stable id order until commit.
+    /// `None` retains the ordinary consolidation contract.
+    async fn consolidate_with_expected_versions(
+        &self,
+        ctx: &CallerContext,
+        ids: &[String],
+        title: &str,
+        summary: &str,
+        namespace: &str,
+        tier: &Tier,
+        source: &str,
+        consolidator_agent_id: &str,
+        expected_versions: Option<&[i64]>,
+    ) -> StoreResult<String> {
+        if expected_versions.is_some() {
+            return Err(StoreError::UnsupportedCapability {
+                capability: "version-checked consolidation".to_string(),
+            });
+        }
+        self.consolidate(
+            ctx,
+            ids,
+            title,
+            summary,
+            namespace,
+            tier,
+            source,
+            consolidator_agent_id,
+        )
+        .await
     }
 
     /// #2860 (federation data-integrity, 5-agent vote `4d3ea1c5`) — replace a
@@ -4417,6 +4672,25 @@ pub trait MemoryStore: Send + Sync {
         _namespace: &str,
     ) -> StoreResult<Option<crate::models::GovernancePolicy>> {
         Ok(None)
+    }
+
+    /// v0.7.0 L1-8 / #4357 — resolve the namespace's
+    /// `governance.require_approval_above_depth` threshold, leaf-first, with
+    /// the SAME walk semantics on every backend (the per-level decision is the
+    /// shared [`crate::storage::approval_depth_level_decision`]). `Ok(None)`
+    /// means no gate is configured; `Ok(Some(t))` means a reflection whose
+    /// proposed depth exceeds `t` must be parked for approval, never written.
+    ///
+    /// Default returns `UnsupportedCapability` — NOT `Ok(None)`: an adapter
+    /// that has not wired the walk must fail the reflect loudly rather than
+    /// silently skip an approval gate the operator configured (fail closed).
+    async fn resolve_require_approval_above_depth(
+        &self,
+        _namespace: &str,
+    ) -> StoreResult<Option<u32>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "REFLECT_APPROVAL_GATE".to_string(),
+        })
     }
 
     /// Apply an approval vote against a pending action with full
@@ -5513,6 +5787,22 @@ pub const UNDO_IN_PLACE_EDIT_ACTION: &str = "undo_in_place_edit";
 /// envelope names when [`MemoryStore::execute_pending_action`] refuses an
 /// approver-on-behalf laundering attempt (S5-H4).
 pub const EXECUTE_PENDING_ACTION: &str = "execute_pending_action";
+
+/// #4023 — the `action` an [`StoreError::PermissionDenied`] envelope names when
+/// [`MemoryStore::merge_inbound_authorized`] refuses a federation merge whose
+/// locked row sits outside the pushing peer's namespace scope.
+pub const FEDERATION_MERGE_INBOUND: &str = "federation_merge_inbound";
+
+/// #4447 — the `action` of the [`StoreError::PermissionDenied`] envelope the
+/// `apply_remote_*_authorized` methods return when the in-transaction re-check
+/// refuses a federation by-id write (one per lane).
+pub const FEDERATION_APPLY_DELETION: &str = "federation_apply_deletion";
+/// See [`FEDERATION_APPLY_DELETION`] (`archives[]`).
+pub const FEDERATION_APPLY_ARCHIVE: &str = "federation_apply_archive";
+/// See [`FEDERATION_APPLY_DELETION`] (`restores[]`).
+pub const FEDERATION_APPLY_RESTORE: &str = "federation_apply_restore";
+/// See [`FEDERATION_APPLY_DELETION`] (`links[]`).
+pub const FEDERATION_APPLY_LINK: &str = "federation_apply_link";
 
 /// #1727 (v0.8.0) — outcome of an [`MemoryStore::undo_in_place_edit`]
 /// call: enough before/after detail to render a dry-run diff and to
@@ -7246,6 +7536,51 @@ mod tests {
             }
             Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
             Ok(_) => panic!("default begin_transaction must error"),
+        }
+    }
+
+    /// #4351 (#4045 vote item 1) — the trait default of
+    /// `consolidate_with_expected_versions` FAILS CLOSED: a store that does
+    /// not override it must refuse a version-checked merge rather than drop
+    /// the versions and forward to the unchecked `consolidate`. `None`
+    /// keeps the ordinary contract (it reaches `consolidate`, whose own
+    /// default refuses with the Consolidate capability, proving the forward).
+    #[test]
+    fn issue_4351_default_version_checked_consolidate_fails_closed() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = DefaultImplProbeStore;
+        let ctx = CallerContext::for_agent("test-agent");
+        let ids = vec!["a".to_string(), "b".to_string()];
+        let call = |versions: Option<&[i64]>| {
+            rt.block_on(store.consolidate_with_expected_versions(
+                &ctx,
+                &ids,
+                "t",
+                "s",
+                "ns",
+                &Tier::Mid,
+                "src",
+                "agent",
+                versions,
+            ))
+        };
+        match call(Some(&[1, 1])) {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "version-checked consolidation");
+            }
+            other => panic!("Some(versions) must fail closed, got: {other:?}"),
+        }
+        match call(None) {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(
+                    capability,
+                    crate::revisions::RecordKind::Consolidate.as_str(),
+                    "None must forward to the unchecked consolidate"
+                );
+            }
+            other => panic!("None must reach consolidate, got: {other:?}"),
         }
     }
 

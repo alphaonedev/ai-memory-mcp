@@ -42,7 +42,7 @@ prod_hits() {  # $1 = regex
     local cut; cut=$(grep -nE '^\s*(pub )?mod tests\b' "$f" | head -1 | cut -d: -f1 || true)
     local body; if [ -n "$cut" ]; then body=$(sed -n "1,$((cut-1))p" "$f"); else body=$(cat "$f"); fi
     while IFS= read -r m; do [ -n "$m" ] && hits+="$f:$m"$'\n'; done < <(printf '%s\n' "$body" | grep -nE "$re" || true)
-  done < <(find src -name '*.rs' | sort)
+  done < <(find src -name '*.rs' | LC_ALL=C sort)
   printf '%s' "$hits"
 }
 # The allowlist names deliberate-narrow SYMBOLS; a hit is exempt only if its

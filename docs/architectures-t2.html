@@ -1,567 +1,249 @@
+<!DOCTYPE html>
 <!--
   Copyright 2026 AlphaOne LLC
   SPDX-License-Identifier: Apache-2.0
-  T2 — Single node, many agents. The first multi-tenant tier.
+  Tier 2 · Shared daemon (v1.0.0 GA).
+  Theme: the shared landing-page tokens in assets/site-theme.css (#4420).
+  Every capability drawn here is backed by code on the v1.0.0 tree; the
+  commit that introduced this page cites file:line for each one.
 -->
-<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ai-memory · T2 — Single node, many agents</title>
-<meta name="description" content="One ai-memory process, ~10 concurrent agents, isolated by namespace + scope visibility, gated by per-namespace governance with pending-approval queues.">
-<meta property="og:title" content="ai-memory · T2 — Single node, many agents">
-<meta property="og:description" content="The first multi-tenant tier. Namespace isolation, scope visibility, federated governance.">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ai-memory · Tier 2: shared daemon</title>
+<meta name="description" content="Tier 2 of ai-memory v1.0.0: many agents on one host share one store through ai-memory serve, with namespace and scope isolation, per-namespace governance, a pending-approval queue and the same-host wake hub.">
+<meta name="theme-color" content="#0c0b08">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/architectures-t2.html">
-<style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
-*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
-html{scroll-behavior:smooth;scroll-padding-top:5rem}
-body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
-a{color:var(--text);text-decoration:none}a:hover{color:var(--p1)}
-code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
-pre{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:1rem 1.1rem;border-radius:8px;border:1px solid var(--border);overflow-x:auto;line-height:1.55;color:var(--text-muted);margin:1rem 0}
-pre code{padding:0;background:none}
-.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
-h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem;margin:1rem 0 .35rem}
-p{color:var(--text-muted);margin-bottom:.85rem}
-.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
-.topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
-.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
-.topnav .home-link{color:var(--text);font-weight:600}
-.topnav .right{display:flex;gap:1.25rem;flex-wrap:wrap}@media(max-width:800px){.topnav .right{display:none}}
-.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(255,184,107,0.08),transparent 60%);border-bottom:1px solid var(--border)}
-.hero h1{font-size:clamp(1.8rem,4vw,2.75rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
-.hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin:0 auto 1rem}
-.hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
-.hero .pill{padding:.4rem 1rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted)}
-
-section{padding:3rem 0;border-bottom:1px solid var(--border)}
-.eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
-.lede{color:var(--text-muted);font-size:.95rem;max-width:820px;margin-bottom:2rem}
-section h2{font-family:var(--font-sans);font-size:1.6rem;margin-bottom:.6rem}
-
-footer{padding:3rem 1.5rem;text-align:center;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)}
-footer a{color:var(--text-muted)}
-
-/* Grouped dropdown menu */
-.topnav .menu{position:relative;display:inline-block}
-.topnav .menu-btn{background:none;border:none;color:var(--text-muted);font-family:inherit;font-size:inherit;cursor:pointer;padding:.2rem 0;line-height:1;letter-spacing:0}
-.topnav .menu-btn:hover,.topnav .menu:focus-within .menu-btn{color:var(--text)}
-.topnav .menu-btn.active{color:var(--text)}
-.topnav .menu-btn .caret{opacity:.5;font-size:.7em;margin-left:.2em}
-.topnav .menu-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:240px;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60;visibility:hidden;opacity:0;transition:opacity .12s ease,visibility 0s .12s}
-.topnav .menu:focus-within .menu-pane,.topnav .menu:hover .menu-pane{visibility:visible;opacity:1;transition:opacity .12s ease}
-.topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
-.topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
-
-/* capability badges */
-.cap-badge{display:inline-block;padding:.15em .55em;font-family:var(--font-mono);font-size:.7rem;font-weight:600;border-radius:4px;border:1px solid;letter-spacing:.04em;margin:.1em .15em}
-.cap-today{color:#6ee7ff;border-color:#2a6571;background:rgba(110,231,255,.08)}
-.cap-roadmap{color:#c8a2ff;border-color:#5a4280;background:rgba(200,162,255,.08)}
-.cap-partial{color:#ffb86b;border-color:#7a5328;background:rgba(255,184,107,.08)}
-.cap-future{color:#ff6b9d;border-color:#7a3251;background:rgba(255,107,157,.08)}
-
-/* arch-diagram block */
-.arch-diagram{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;margin:1.5rem 0}
-.arch-diagram-title{font-family:var(--font-mono);font-size:.85rem;color:var(--p2);letter-spacing:.04em;margin-bottom:1rem;text-transform:uppercase}
-.arch-svg{width:100%;height:auto;display:block;background:#0a0a0a;border-radius:8px}
-.arch-svg .node{fill:#161616;stroke:#3d3d3d;stroke-width:1.2}
-.arch-svg .node-label{fill:#fff;font-family:'SF Mono',monospace;font-size:12px;font-weight:600}
-.arch-svg .sub-label{fill:#999;font-family:'SF Mono',monospace;font-size:10px}
-.arch-svg .edge{fill:none}
-.arch-svg .edge-dashed{fill:none;stroke:#666;stroke-width:1.2;stroke-dasharray:4 3}
-.arch-svg .edge-roadmap{fill:none;stroke:#a78bfa;stroke-width:1.4;stroke-dasharray:5 4;opacity:.7}
-.arch-svg .flow{filter:drop-shadow(0 0 4px currentColor)}
-.arch-svg .flow-write{fill:#f97316;color:#f97316}
-.arch-svg .flow-recall{fill:#2dd4bf;color:#2dd4bf}
-.arch-svg .flow-sync{fill:#a78bfa;color:#a78bfa}
-.arch-svg .flow-policy{fill:#facc15;color:#facc15}
-.arch-svg .flow-attest{fill:#f472b6;color:#f472b6}
-.arch-svg .ring{fill:none;stroke:#6ee7ff;stroke-width:2;opacity:.7;animation:pulse 2.4s ease-out infinite}
-@keyframes pulse{0%{r:6;opacity:.85}100%{r:18;opacity:0}}
-.arch-legend{display:flex;flex-wrap:wrap;gap:1rem;margin-top:1rem;font-family:var(--font-mono);font-size:.75rem;color:var(--text-muted)}
-.arch-legend-item{display:inline-flex;align-items:center;gap:.4rem}
-.arch-legend-dot{display:inline-block;width:10px;height:10px;border-radius:50%}
-.arch-diagram-caption{font-size:.85rem;color:var(--text-dim);margin-top:1rem;line-height:1.5}
-
-ul,ol{padding-left:1.5rem;color:var(--text-muted);font-size:.92rem;margin:.5rem 0 1rem}
-ul li,ol li{margin-bottom:.4rem}
-
-table{width:100%;border-collapse:collapse;margin:1rem 0 1.5rem;font-size:.85rem;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;overflow:hidden}
-table th,table td{padding:.65rem .85rem;text-align:left;border-bottom:1px solid var(--border)}
-table th{background:var(--bg-elev);font-family:var(--font-mono);font-size:.78rem;font-weight:600;color:var(--text);letter-spacing:.04em}
-table td{color:var(--text-muted)}
-table tr:last-child td{border-bottom:none}
-@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
-
-/* Zero-JS mobile nav fallback — visible only when .right collapses */
-.topnav .mnav{display:none;position:relative}
-.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
-.topnav .mnav summary::-webkit-details-marker{display:none}
-.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
-.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
-.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
-.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
-@media(max-width:800px){.topnav .mnav{display:block}}
-</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@500;600&amp;display=swap">
+<link rel="stylesheet" href="assets/site-theme.css">
 </head>
-<body>
-
-<nav class="topnav">
-  <div class="inner">
-    <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures · T2</span></a>
-    <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v09.html" style="color:#ffb86b">What's new</a>
-      <div class="menu">
-        <button class="menu-btn">Audiences<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="for-everyone.html">For Everyone</a>
-          <a href="audience/decision-maker.html">Decision Maker</a>
-          <a href="audience/developer.html">Developer</a>
-          <a href="audience/operator.html">Operator</a>
-          <a href="feature-matrix.html">Feature Matrix</a>
-          <a href="data-flow.html">Data Flow</a>
-          <a href="integrations.html">Integrations</a>
-          <a href="import-history.html">Import History</a>
-          <a href="release-pipeline.html">Release Pipeline</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Features<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="memory-tiers.html">Memory Tiers</a>
-          <a href="memory-rules.html">Memory Rules</a>
-          <a href="ttl-controls.html">TTL Controls</a>
-          <a href="archival.html">Archival</a>
-          <a href="encryption.html">Encryption</a>
-          <a href="hierarchies.html">Hierarchies</a>
-          <a href="knowledge-graph.html">Knowledge Graph</a>
-          <a href="autonomous.html">Autonomous</a>
-          <a href="a2a-messaging.html">A2A Messaging</a>
-          <a href="a2a-integration.html">Integrate an Agent</a>
-          <a href="lifecycle.html">Lifecycle</a>
-          <a href="performance.html">Performance</a>
-          <a href="agent-identity.html">Agent Identity (NHI)</a>
-          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="architectures.html">Overview</a>
-          <a href="architectures-t1.html">T1 — Single Agent</a>
-          <a href="architectures-t2.html" class="current">T2 — Many Agents</a>
-          <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
-          <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
-          <a href="architectures-t5.html">T5 — Global Hive</a>
-          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
-          <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-          <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Internals<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="schema.html">Schema</a>
-          <a href="types.html">Types</a>
-          <a href="validators.html">Validators</a>
-          <a href="governance.html">Governance</a>
-          <a href="batman-active-mode.html">Batman Mode</a>
-          <a href="tracing.html">Tracing</a>
-          <a href="spec/v1.html">Portability Spec v1</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Evidence<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="evidence.html">Frozen Claims</a>
-          <a href="evidence/">Evidence Hub (campaigns)</a>
-          <a href="performance.html">Performance budgets</a>
-          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
-        </div>
-      </div>
-      <a href="credits.html">Credits</a>
-      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
-    </div>
-    <details class="mnav">
-      <summary>Menu</summary>
-      <div class="mnav-pane">
-        <a href="./">Home</a>
-        <a href="at-a-glance.html">Atlas</a>
-        <a href="whats-new-v09.html">What's new</a>
-        <div class="mnav-group">Audiences</div>
-        <a href="for-everyone.html">For Everyone</a>
-        <a href="audience/decision-maker.html">Decision Maker</a>
-        <a href="audience/developer.html">Developer</a>
-        <a href="audience/operator.html">Operator</a>
-        <a href="feature-matrix.html">Feature Matrix</a>
-        <a href="data-flow.html">Data Flow</a>
-        <a href="integrations.html">Integrations</a>
-        <a href="import-history.html">Import History</a>
-        <a href="release-pipeline.html">Release Pipeline</a>
-        <div class="mnav-group">Features</div>
-        <a href="memory-tiers.html">Memory Tiers</a>
-        <a href="memory-rules.html">Memory Rules</a>
-        <a href="ttl-controls.html">TTL Controls</a>
-        <a href="archival.html">Archival</a>
-        <a href="encryption.html">Encryption</a>
-        <a href="hierarchies.html">Hierarchies</a>
-        <a href="knowledge-graph.html">Knowledge Graph</a>
-        <a href="autonomous.html">Autonomous</a>
-        <a href="a2a-messaging.html">A2A Messaging</a>
-          <a href="a2a-integration.html">Integrate an Agent</a>
-        <a href="lifecycle.html">Lifecycle</a>
-        <a href="performance.html">Performance</a>
-        <a href="agent-identity.html">Agent Identity (NHI)</a>
-        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
-        <div class="mnav-group">Architectures</div>
-        <a href="architectures.html">Overview</a>
-        <a href="architectures-t1.html">T1 — Single Agent</a>
-        <a href="architectures-t2.html">T2 — Many Agents</a>
-        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
-        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
-        <a href="architectures-t5.html">T5 — Global Hive</a>
-        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
-        <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-        <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        <div class="mnav-group">Internals</div>
-        <a href="schema.html">Schema</a>
-        <a href="types.html">Types</a>
-        <a href="validators.html">Validators</a>
-        <a href="governance.html">Governance</a>
-        <a href="batman-active-mode.html">Batman Mode</a>
-        <a href="tracing.html">Tracing</a>
-        <a href="spec/v1.html">Portability Spec v1</a>
-        <div class="mnav-group">Evidence</div>
-        <a href="evidence.html">Frozen Claims</a>
-        <a href="evidence/">Evidence Hub (campaigns)</a>
-        <a href="performance.html">Performance budgets</a>
-        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
-        <div class="mnav-group">More</div>
-        <a href="credits.html">Credits</a>
-        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
-      </div>
-    </details>
-  </div>
-</nav>
-
-<section class="hero">
-  <span class="cap-badge cap-today">SHIPS TODAY · v1.0.0</span>
-  <h1>Tier 2 — Single node, many agents</h1>
-  <p class="tagline">The first <strong>multi-tenant</strong> tier. One ai-memory process, but a swarm of agents — typically 10 concurrent — each writing into its own namespace, recalling with scope visibility filters, and gated by per-namespace governance with a pending-approval queue.</p>
-  <div class="pills">
-    <span class="pill">10 agents</span>
-    <span class="pill">namespace isolation</span>
-    <span class="pill">scope visibility</span>
-    <span class="pill">policy/namespace</span>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <p>This is the canonical shape for a workstation running a planner, a coder, a reviewer, and a handful of skills as separate Claude Code agents — all sharing the same memory store but each siloed by namespace.</p>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Architecture diagram</span>
-    <h2>10 agents · namespace isolation · governance gate.</h2>
-
-    <div class="arch-diagram">
-      <div class="arch-diagram-title">T2 · 10 agents · namespace isolation · governance gate</div>
-
-      <svg class="arch-svg" viewBox="0 0 880 540" role="img" aria-label="Ten agents writing through a governance gate to a single ai-memory instance">
-
-        <defs>
-          <marker id="t2-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
-          </marker>
-
-          <linearGradient id="t2-gov-gradient" x1="0" x2="1" y1="0" y2="0">
-            <stop offset="0%" stop-color="#facc15" stop-opacity="0.25"/>
-            <stop offset="100%" stop-color="#f97316" stop-opacity="0.25"/>
-          </linearGradient>
-
-          <linearGradient id="t2-mem-gradient" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stop-color="#2dd4bf" stop-opacity="0.18"/>
-            <stop offset="100%" stop-color="#0d9488" stop-opacity="0.06"/>
-          </linearGradient>
-
-          <path id="t2-p1" d="M 130 60  C 280 60,  330 200, 410 220" />
-          <path id="t2-p2" d="M 130 110 C 280 110, 330 210, 410 225" />
-          <path id="t2-p3" d="M 130 160 C 280 160, 330 220, 410 230" />
-          <path id="t2-p4" d="M 130 210 C 280 210, 330 230, 410 240" />
-          <path id="t2-p5" d="M 130 260 C 280 260, 330 240, 410 248" />
-          <path id="t2-p6" d="M 130 310 C 280 310, 330 270, 410 260" />
-          <path id="t2-p7" d="M 130 360 C 280 360, 330 290, 410 270" />
-          <path id="t2-p8" d="M 130 410 C 280 410, 330 310, 410 280" />
-          <path id="t2-p9" d="M 130 460 C 280 460, 330 330, 410 290" />
-          <path id="t2-p10" d="M 130 510 C 280 510, 330 350, 410 300" />
-
-          <path id="t2-gate-recall" d="M 525 260 L 600 260" />
-          <path id="t2-recall-sql" d="M 745 260 L 805 320" />
-          <path id="t2-sql-recall" d="M 805 360 L 745 290" />
-          <path id="t2-back" d="M 600 280 C 470 280, 360 460, 130 510" />
-        </defs>
-
-        <!-- AGENTS — 10 in a left column -->
-        <g><rect x="20" y="42" width="180" height="36" rx="8" class="node"/><text x="32" y="58" class="node-label" style="font-size: 11px">Planner</text><text x="32" y="72" class="sub-label">agents/planner</text></g>
-        <g><rect x="20" y="92" width="180" height="36" rx="8" class="node"/><text x="32" y="108" class="node-label" style="font-size: 11px">Coder</text><text x="32" y="122" class="sub-label">agents/coder</text></g>
-        <g><rect x="20" y="142" width="180" height="36" rx="8" class="node"/><text x="32" y="158" class="node-label" style="font-size: 11px">Reviewer</text><text x="32" y="172" class="sub-label">agents/reviewer</text></g>
-        <g><rect x="20" y="192" width="180" height="36" rx="8" class="node"/><text x="32" y="208" class="node-label" style="font-size: 11px">Researcher</text><text x="32" y="222" class="sub-label">agents/researcher</text></g>
-        <g><rect x="20" y="242" width="180" height="36" rx="8" class="node"/><text x="32" y="258" class="node-label" style="font-size: 11px">Data eng</text><text x="32" y="272" class="sub-label">agents/data-eng</text></g>
-        <g><rect x="20" y="292" width="180" height="36" rx="8" class="node"/><text x="32" y="308" class="node-label" style="font-size: 11px">SecOps</text><text x="32" y="322" class="sub-label">agents/secops</text></g>
-        <g><rect x="20" y="342" width="180" height="36" rx="8" class="node"/><text x="32" y="358" class="node-label" style="font-size: 11px">Tester</text><text x="32" y="372" class="sub-label">agents/test</text></g>
-        <g><rect x="20" y="392" width="180" height="36" rx="8" class="node"/><text x="32" y="408" class="node-label" style="font-size: 11px">Docs</text><text x="32" y="422" class="sub-label">agents/docs</text></g>
-        <g><rect x="20" y="442" width="180" height="36" rx="8" class="node"/><text x="32" y="458" class="node-label" style="font-size: 11px">Triage</text><text x="32" y="472" class="sub-label">agents/triage</text></g>
-        <g><rect x="20" y="492" width="180" height="36" rx="8" class="node"/><text x="32" y="508" class="node-label" style="font-size: 11px">Ops</text><text x="32" y="522" class="sub-label">agents/ops</text></g>
-
-        <!-- GOVERNANCE GATE -->
-        <g>
-          <rect x="410" y="200" width="115" height="120" rx="14"
-                fill="url(#t2-gov-gradient)" stroke="#facc15" stroke-width="1.6" />
-          <text x="467" y="222" text-anchor="middle" class="node-label" style="font-size: 11px">Governance</text>
-          <text x="467" y="237" text-anchor="middle" class="sub-label">policy/namespace</text>
-          <text x="467" y="252" text-anchor="middle" class="sub-label">Allow / Deny / Pending</text>
-          <text x="467" y="270" text-anchor="middle" class="sub-label" font-weight="700" fill="#16a34a">✓ allow</text>
-          <text x="467" y="285" text-anchor="middle" class="sub-label" font-weight="700" fill="#dc2626">✗ deny</text>
-          <text x="467" y="300" text-anchor="middle" class="sub-label" font-weight="700" fill="#a16207">⌛ pending</text>
-        </g>
-
-        <!-- PENDING QUEUE OUT-OF-BAND -->
-        <g>
-          <rect x="395" y="345" width="145" height="68" rx="10" stroke="#a16207" stroke-dasharray="4 3" fill="none" />
-          <text x="467" y="365" text-anchor="middle" class="sub-label" font-weight="700" fill="#a16207">PendingAction queue</text>
-          <text x="467" y="382" text-anchor="middle" class="sub-label">memory_pending_list</text>
-          <text x="467" y="396" text-anchor="middle" class="sub-label">memory_pending_approve</text>
-          <text x="467" y="408" text-anchor="middle" class="sub-label">memory_pending_reject</text>
-        </g>
-
-        <!-- AI-MEMORY CORE -->
-        <g>
-          <rect x="600" y="195" width="145" height="135" rx="14"
-                fill="url(#t2-mem-gradient)" stroke="#2dd4bf" stroke-width="1.6" />
-          <text x="672" y="218" text-anchor="middle" class="node-label" style="font-size: 12px">ai-memory core</text>
-          <text x="672" y="236" text-anchor="middle" class="sub-label">recall pipeline</text>
-          <text x="672" y="252" text-anchor="middle" class="sub-label">scope filter</text>
-          <text x="672" y="266" text-anchor="middle" class="sub-label">as_agent param</text>
-          <text x="672" y="284" text-anchor="middle" class="sub-label">FTS5 + HNSW</text>
-          <text x="672" y="300" text-anchor="middle" class="sub-label">pure recall · access ledger</text>
-          <text x="672" y="318" text-anchor="middle" class="sub-label">v0.6.3 KG layer (extended with Apache AGE backend + Ed25519 attestation)</text>
-        </g>
-
-        <!-- SQLITE -->
-        <g>
-          <rect x="780" y="320" width="85" height="105" rx="10" class="node" />
-          <text x="822" y="345" text-anchor="middle" class="node-label" style="font-size: 11px">SQLite</text>
-          <text x="822" y="362" text-anchor="middle" class="sub-label">memories</text>
-          <text x="822" y="376" text-anchor="middle" class="sub-label">scope_idx</text>
-          <text x="822" y="390" text-anchor="middle" class="sub-label">FTS5</text>
-          <text x="822" y="404" text-anchor="middle" class="sub-label">pending_actions</text>
-          <text x="822" y="418" text-anchor="middle" class="sub-label">namespace_meta</text>
-        </g>
-
-        <!-- NAMESPACE TAXONOMY (v0.6.3) -->
-        <g>
-          <rect x="595" y="350" width="155" height="65" rx="10" stroke="#a78bfa" stroke-width="1.4" fill="rgba(167,139,250,0.06)" />
-          <text x="672" y="370" text-anchor="middle" class="sub-label" font-weight="700" fill="#a78bfa">memory_get_taxonomy</text>
-          <text x="672" y="385" text-anchor="middle" class="sub-label">v0.6.3 hierarchical view</text>
-          <text x="672" y="400" text-anchor="middle" class="sub-label">agents/* / collective/*</text>
-        </g>
-
-        <!-- PATHS -->
-        <use href="#t2-p1" class="edge" stroke="#f97316" stroke-width="1.2" marker-end="url(#t2-arrow)" style="color: #f97316; opacity: 0.45" />
-        <use href="#t2-p2" class="edge" stroke="#f97316" stroke-width="1.2" marker-end="url(#t2-arrow)" style="color: #f97316; opacity: 0.45" />
-        <use href="#t2-p3" class="edge" stroke="#f97316" stroke-width="1.2" marker-end="url(#t2-arrow)" style="color: #f97316; opacity: 0.45" />
-        <use href="#t2-p4" class="edge" stroke="#f97316" stroke-width="1.2" marker-end="url(#t2-arrow)" style="color: #f97316; opacity: 0.45" />
-        <use href="#t2-p5" class="edge" stroke="#f97316" stroke-width="1.2" marker-end="url(#t2-arrow)" style="color: #f97316; opacity: 0.45" />
-        <use href="#t2-p6" class="edge" stroke="#f97316" stroke-width="1.2" marker-end="url(#t2-arrow)" style="color: #f97316; opacity: 0.45" />
-        <use href="#t2-p7" class="edge" stroke="#f97316" stroke-width="1.2" marker-end="url(#t2-arrow)" style="color: #f97316; opacity: 0.45" />
-        <use href="#t2-p8" class="edge" stroke="#f97316" stroke-width="1.2" marker-end="url(#t2-arrow)" style="color: #f97316; opacity: 0.45" />
-        <use href="#t2-p9" class="edge" stroke="#f97316" stroke-width="1.2" marker-end="url(#t2-arrow)" style="color: #f97316; opacity: 0.45" />
-        <use href="#t2-p10" class="edge" stroke="#f97316" stroke-width="1.2" marker-end="url(#t2-arrow)" style="color: #f97316; opacity: 0.45" />
-
-        <use href="#t2-gate-recall" class="edge" stroke="#0d9488" stroke-width="2" marker-end="url(#t2-arrow)" style="color: #0d9488" />
-        <use href="#t2-recall-sql" class="edge-dashed" />
-        <use href="#t2-sql-recall" class="edge-dashed" />
-        <use href="#t2-back" class="edge" stroke="#2dd4bf" stroke-width="1.5" marker-end="url(#t2-arrow)" style="color: #2dd4bf; opacity: 0.5" stroke-dasharray="3 3" />
-
-        <!-- Particles — write through gate -->
-        <circle r="3" class="flow flow-write"><animateMotion dur="3.6s" repeatCount="indefinite" begin="0.3s"><mpath href="#t2-p1"/></animateMotion></circle>
-        <circle r="3" class="flow flow-write"><animateMotion dur="3.6s" repeatCount="indefinite" begin="0.6s"><mpath href="#t2-p2"/></animateMotion></circle>
-        <circle r="3" class="flow flow-write"><animateMotion dur="3.6s" repeatCount="indefinite" begin="0.9s"><mpath href="#t2-p3"/></animateMotion></circle>
-        <circle r="3" class="flow flow-write"><animateMotion dur="3.6s" repeatCount="indefinite" begin="1.2s"><mpath href="#t2-p4"/></animateMotion></circle>
-        <circle r="3" class="flow flow-write"><animateMotion dur="3.6s" repeatCount="indefinite" begin="1.5s"><mpath href="#t2-p5"/></animateMotion></circle>
-        <circle r="3" class="flow flow-write"><animateMotion dur="3.6s" repeatCount="indefinite" begin="1.8s"><mpath href="#t2-p6"/></animateMotion></circle>
-        <circle r="3" class="flow flow-write"><animateMotion dur="3.6s" repeatCount="indefinite" begin="2.1s"><mpath href="#t2-p7"/></animateMotion></circle>
-        <circle r="3" class="flow flow-write"><animateMotion dur="3.6s" repeatCount="indefinite" begin="2.4s"><mpath href="#t2-p8"/></animateMotion></circle>
-        <circle r="3" class="flow flow-write"><animateMotion dur="3.6s" repeatCount="indefinite" begin="2.7s"><mpath href="#t2-p9"/></animateMotion></circle>
-        <circle r="3" class="flow flow-write"><animateMotion dur="3.6s" repeatCount="indefinite" begin="3.0s"><mpath href="#t2-p10"/></animateMotion></circle>
-
-        <!-- Gate → recall flow -->
-        <circle r="4" class="flow flow-policy"><animateMotion dur="2.4s" repeatCount="indefinite" begin="0s"><mpath href="#t2-gate-recall"/></animateMotion></circle>
-        <circle r="4" class="flow flow-policy"><animateMotion dur="2.4s" repeatCount="indefinite" begin="1.0s"><mpath href="#t2-gate-recall"/></animateMotion></circle>
-        <circle r="4" class="flow flow-policy"><animateMotion dur="2.4s" repeatCount="indefinite" begin="2.0s"><mpath href="#t2-gate-recall"/></animateMotion></circle>
-
-        <!-- Persistent I/O dots -->
-        <circle r="3" class="flow flow-write"><animateMotion dur="2.4s" repeatCount="indefinite" begin="0.3s"><mpath href="#t2-recall-sql"/></animateMotion></circle>
-        <circle r="3" class="flow flow-write"><animateMotion dur="2.4s" repeatCount="indefinite" begin="1.3s"><mpath href="#t2-recall-sql"/></animateMotion></circle>
-        <circle r="3" class="flow flow-recall"><animateMotion dur="2.4s" repeatCount="indefinite" begin="0s"><mpath href="#t2-sql-recall"/></animateMotion></circle>
-        <circle r="3" class="flow flow-recall"><animateMotion dur="2.4s" repeatCount="indefinite" begin="1.0s"><mpath href="#t2-sql-recall"/></animateMotion></circle>
-
-        <!-- Recall back to agents -->
-        <circle r="4" class="flow flow-recall"><animateMotion dur="4.2s" repeatCount="indefinite" begin="0s"><mpath href="#t2-back"/></animateMotion></circle>
-        <circle r="4" class="flow flow-recall"><animateMotion dur="4.2s" repeatCount="indefinite" begin="1.4s"><mpath href="#t2-back"/></animateMotion></circle>
-        <circle r="4" class="flow flow-recall"><animateMotion dur="4.2s" repeatCount="indefinite" begin="2.8s"><mpath href="#t2-back"/></animateMotion></circle>
-
-      </svg>
-
-      <div class="arch-legend">
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #f97316"></span>agent → governance</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #facc15"></span>policy decision</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #2dd4bf"></span>scope-filtered recall</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #666"></span>persistent I/O</span>
-      </div>
-
-      <div class="arch-diagram-caption">
-        Each agent writes into its own namespace, then trips the per-namespace governance gate before the row is committed.
-        Recalls flow back through the scope filter — agents only see what their namespace position permits.
+<body class="am-page">
+<a class="am-skip" href="#main">Skip to content</a>
+<header class="am-nav"><div class="am-nav-in">
+  <a class="am-brand" href="index.html" aria-label="ai-memory home">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2l9 5.2v9.6L12 22 3 16.8V7.2z" stroke="var(--accent)" stroke-width="1.5"/><circle cx="12" cy="12" r="2.4" fill="var(--accent)"/><path d="M12 9.6V4.5M12 14.4v5.1M14.4 12h5M4.9 12h5" stroke="var(--accent)" stroke-width="1.1"/></svg>
+    ai-memory <span class="am-crumb">/ architectures / T2</span>
+  </a>
+  <nav class="am-links" aria-label="Primary">
+    <a href="architectures.html">Architectures</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
+    <div class="am-dd">
+      <button aria-haspopup="true">Tiers ▾</button>
+      <div class="am-dd-menu">
+        <a href="architectures-t1.html">T1 · Single node<span>one agent, one store</span></a>
+        <a href="architectures-t2.html">T2 · Shared daemon<span>many agents, one host</span></a>
+        <a href="architectures-t3.html">T3 · Federated cluster<span>W-of-N quorum, signed sync</span></a>
+        <a href="architectures-t4.html">T4 · Data-center swarm<span>PostgreSQL tier</span></a>
+        <a href="architectures-t5.html">T5 · Federated hive<span>multi-DC / multi-region</span></a>
       </div>
     </div>
+    <div class="am-dd">
+      <button aria-haspopup="true">Reference ▾</button>
+      <div class="am-dd-menu">
+        <a href="reference-architecture/">3-region hive<span>the do-1461 run record</span></a>
+        <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory<span>API embeddings, no GPU</span></a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU<span>local embeddings</span></a>
+        <a href="enterprise-deployment.html">Enterprise deployment guide<span>sizing, replication, backups</span></a>
+        <a href="ARCHITECTURAL_LIMITS.html">Architectural limits<span>what does not scale, and why</span></a>
+      </div>
+    </div>
+    <div class="am-dd">
+      <button aria-haspopup="true">Planes ▾</button>
+      <div class="am-dd-menu">
+        <a href="federation.html">Federation<span>signed sync, quorum, catch-up</span></a>
+        <a href="wake-hub.html">Wake plane<span>wake-hub, wake-listen</span></a>
+        <a href="a2a-integration.html">Integrate any agent<span>inbox, notify, wake</span></a>
+        <a href="governance.html">Governance<span>policies, approvals</span></a>
+        <a href="encryption.html">Encryption<span>at rest and in transit</span></a>
+        <a href="SECURITY.html">Security model<span>threat model, posture</span></a>
+      </div>
+    </div>
+  </nav>
+  <details class="am-mnav"><summary>Menu</summary><div class="am-mnav-pane">
+    <a href="index.html">Home</a>
+    <a href="architectures.html">Architectures overview</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
+    <div class="am-g">Tiers</div>
+    <a href="architectures-t1.html">T1 · Single node</a>
+    <a href="architectures-t2.html">T2 · Shared daemon</a>
+    <a href="architectures-t3.html">T3 · Federated cluster</a>
+    <a href="architectures-t4.html">T4 · Data-center swarm</a>
+    <a href="architectures-t5.html">T5 · Federated hive</a>
+    <div class="am-g">Reference</div>
+    <a href="reference-architecture/">3-region hive</a>
+    <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory</a>
+    <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU</a>
+    <a href="ARCHITECTURAL_LIMITS.html">Architectural limits</a>
+    <div class="am-g">Planes</div>
+    <a href="federation.html">Federation</a>
+    <a href="wake-hub.html">Wake plane</a>
+    <a href="governance.html">Governance</a>
+    <a href="SECURITY.html">Security model</a>
+  </div></details>
+  <a class="am-cta" href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+</div></header>
+<main id="main">
+<section class="am-hero"><div class="am-wrap">
+  <nav class="am-rail" aria-label="Tiers"><a href="architectures-t1.html">T1 · Single node</a><a href="architectures-t2.html" aria-current="page">T2 · Shared daemon</a><a href="architectures-t3.html">T3 · Federated cluster</a><a href="architectures-t4.html">T4 · Data-center swarm</a><a href="architectures-t5.html">T5 · Federated hive</a><a href="architectures.html">Overview</a></nav>
+  <span class="am-pill" style="margin-top:18px"><i></i>Tier 2 · ships in v1.0.0</span>
+  <h1 class="am-h1">Many agents, one host, <span class="a">one shared memory</span>.</h1>
+  <p class="am-sub">A planner, a coder and a reviewer share one store through <b>ai-memory serve</b>. Each agent writes into its own namespace, recalls through <b>scope visibility</b>, and passes a <b>per-namespace governance</b> gate with a pending-approval queue. The host's <b>wake hub</b> tells an agent the moment a message for it lands.</p>
+  <div class="am-proof">
+    <span><b>HTTPS</b> 127.0.0.1:9077 · TLS on every bind</span>
+    <span><b>X-Agent-Id</b> + per-agent API keys</span>
+    <span><b>scopes</b> private · team · unit · org · collective</span>
+    <span><b>Allow · Deny · Pending</b></span>
+    <span><b>wake-hub</b> · wake-listen</span>
   </div>
-</section>
+</div></section>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Walkthrough</span>
-    <h2>What's actually happening.</h2>
-
-    <h3>Namespace isolation</h3>
-    <p>Every agent has a namespace position — typically <code>agents/&lt;role&gt;</code> or <code>org/team/role</code>. Memories are written with that namespace, and the indexed <code>scope_idx</code> generated column captures the agent's visibility scope (<code>private</code> / <code>team</code> / <code>unit</code> / <code>org</code> / <code>collective</code>).</p>
-    <p>When agent <code>agents/planner</code> calls <code>memory_recall</code> and passes <code>as_agent=agents/planner</code>, <code>compute_visibility_prefixes()</code> (<code>src/storage/mod.rs</code>) walks the namespace ancestors and returns <code>[agents/planner, agents/, '']</code>. The recall SQL then <code>WHERE</code>s on <code>scope_idx IN (...)</code> — the planner sees its own private memories plus anything scoped <code>team</code> or <code>collective</code> that an ancestor namespace publishes.</p>
-    <p>This is the same machinery T1 has — but at T2 it's actually doing work.</p>
-
-    <h3>Per-namespace governance</h3>
-    <p>Set a policy with <code>memory_namespace_set_standard</code>:</p>
-<pre><code># 1. store the standard memory that carries the policy, capture its id
-ai-memory --json store -T "secops namespace standard" -c "write gating" -n agents/secops
-# 2. bind it — the JSON merges into the standard's metadata.governance
-ai-memory namespace set-standard --namespace agents/secops --id &lt;standard-memory-uuid&gt; \
-  --governance '{"write":"approve","promote":"owner","delete":"approve"}'</code></pre>
-    <p>Now any agent writing into <code>agents/secops</code> triggers the governance gate (<code>check_agent_action()</code>) which returns <code>Pending(action_id)</code>. The write isn't committed — it's parked in <code>pending_actions</code>. The owning operator (or a designated approver agent) calls <code>memory_pending_list</code>, inspects the diff, and either <code>memory_pending_approve</code> or <code>memory_pending_reject</code>. Approved writes get committed; rejected ones are dropped with an audit row.</p>
-    <p>Per-namespace policy means a strict-write namespace can sit next to a permissive one. The hierarchy lets you set a default at <code>org/</code> and override at <code>org/team/</code>.</p>
-
-    <h3>Capabilities introspection (v0.6.3)</h3>
-    <p>Before an agent invokes a skill, it can ask: <em>"is auto-tag actually wired here?"</em></p>
-<pre><code>$ curl -s http://127.0.0.1:9077/api/v1/capabilities   # or the memory_capabilities MCP tool
-{
-  "schema_version": "3",
-  "tier": "semantic",
-  "version": "1.0.0",
-  "features": {
-    "keyword_search": true,
-    "hybrid_recall": true,
-    "auto_tagging": false,
-    "contradiction_analysis": false,
-    "cross_encoder_reranking": false,
-    ...
-  },
-  "permissions": { ... }, "hooks": { ... },
-  "approval": {"pending_requests": 7, ...}
-}</code></pre>
-    <p>Capabilities v2 shipped in v0.6.3; the envelope now defaults to <code>schema_version "3"</code> (v1/v2 still negotiable via <code>Accept-Capabilities</code>) — agents discover what's available at runtime instead of hard-coding assumptions.</p>
+<section class="am-sec" id="diagram"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Architecture</span>
+    <h2>One daemon, <span class="a">one file</span>, every writer takes its turn.</h2>
+    <p>HTTPS agents talk to the daemon. An MCP agent's <code>ai-memory mcp</code> child and the operator's CLI verbs are <b>not</b> clients of that daemon: they open the same SQLite file in-process. That is why a CLI <code>recall</code> sees the same memories as the daemon, and also why every one of these processes queues on the same file lock for writes.</p>
   </div>
-</section>
+  <div class="am-legend"><span><i></i>memory read/write</span><span><i class="teal"></i>wake hint</span></div>
+  <figure class="am-fig" style="--fig-min:920px">
+<svg class="dg" viewBox="0 0 1100 520" role="img" aria-labelledby="t2a-title" aria-describedby="t2a-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="t2a-title">Tier 2: many agents share one daemon on one host</title><desc id="t2a-desc">Planner and coder agents call ai-memory serve over HTTPS with their own agent id and API key. A reviewer agent spawns an MCP child and an operator runs CLI verbs; both open the same SQLite file in-process. All writers take turns on that one file. The daemon publishes committed messages to the same-host wake hub, which wakes the recipients' wake-listen sessions.</desc>
+<defs><marker id="t2a-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="t2a-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="t2a-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="t2a-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="t2a-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<rect class="zone solid" x="20" y="20" width="1060" height="480" rx="18"/><text class="t-k" x="40" y="44">ONE HOST  ·  MANY AGENTS</text><text class="t-teal" x="1060" y="44" text-anchor="end">wake → wake-listen sessions</text><g class="rise"><rect class="box" x="60" y="66" width="150" height="40" rx="10"/><text class="t-s" x="135" y="91" text-anchor="middle">planner · HTTPS</text><circle class="pulse good" cx="72" cy="77" r="2.6"/></g>
+<g class="rise" style="--d:0.08s"><rect class="box" x="270" y="66" width="150" height="40" rx="10"/><text class="t-s" x="345" y="91" text-anchor="middle">coder · HTTPS</text><circle class="pulse good" cx="282" cy="77" r="2.6" style="--d:0.3s"/></g>
+<g class="rise" style="--d:0.16s"><rect class="box" x="665" y="66" width="150" height="40" rx="10"/><text class="t-s" x="740" y="91" text-anchor="middle">reviewer · MCP</text><circle class="pulse good" cx="677" cy="77" r="2.6" style="--d:0.6s"/></g>
+<g class="rise" style="--d:0.24s"><rect class="box" x="845" y="66" width="150" height="40" rx="10"/><text class="t-s" x="920" y="91" text-anchor="middle">operator · CLI</text><circle class="pulse good" cx="857" cy="77" r="2.6" style="--d:0.8999999999999999s"/></g>
+<g class="rise" style="--d:0.2s"><rect class="box acc" x="40" y="150" width="430" height="140" rx="14"/><text class="t-h" x="56" y="176">ai-memory serve · 127.0.0.1:9077</text><rect class="box" x="56" y="188" width="398" height="20" rx="6"/><text class="t-s" x="68" y="202">identity: X-Agent-Id + per-agent API key</text><rect class="box" x="56" y="212" width="398" height="20" rx="6"/><text class="t-s" x="68" y="226">namespaces + scope visibility (as_agent)</text><rect class="box" x="56" y="236" width="398" height="20" rx="6"/><text class="t-s" x="68" y="250">governance gate: Allow · Deny · Pending</text><rect class="box" x="56" y="260" width="398" height="20" rx="6"/><text class="t-s" x="68" y="274">memory engine · pending_actions queue</text></g>
+<g class="rise" style="--d:0.3s"><rect class="box teal" x="490" y="150" width="150" height="140" rx="14"/><text class="t-m" x="504" y="176">wake-hub</text><text class="t-s" x="504" y="194">unix socket</text><text class="t-s" x="504" y="212">per-recipient</text><text class="t-s" x="504" y="230">queue</text><text class="t-s" x="504" y="248">allowlist</text><text class="t-s" x="504" y="266">no bodies</text></g>
+<g class="rise" style="--d:0.4s"><rect class="box" x="660" y="150" width="160" height="140" rx="14"/><text class="t-m" x="674" y="176">ai-memory mcp</text><text class="t-s" x="674" y="196">reviewer's child</text><text class="t-s" x="674" y="216">stdio</text><text class="t-s" x="674" y="236">in-process</text><text class="t-s" x="674" y="256">SQLite only</text></g>
+<g class="rise" style="--d:0.5s"><rect class="box" x="840" y="150" width="160" height="140" rx="14"/><text class="t-m" x="854" y="176">ai-memory &lt;verb&gt;</text><text class="t-s" x="854" y="196">operator CLI</text><text class="t-s" x="854" y="216">in-process</text><text class="t-s" x="854" y="236">not a thin</text><text class="t-s" x="854" y="256">client (#4254)</text></g>
+<path class="wire" d="M135 106 V146" marker-end="url(#t2a-aa)"/><path class="flow" d="M135 106 V146"/><path class="dot" pathLength="100" d="M135 106 V146"/><path class="wire" d="M345 106 V146" marker-end="url(#t2a-aa)"/><path class="flow" d="M345 106 V146"/><path class="dot" pathLength="100" d="M345 106 V146" style="--d:0.4s"/><path class="wire" d="M740 106 V146" marker-end="url(#t2a-aa)"/><path class="flow" d="M740 106 V146"/><path class="dot" pathLength="100" d="M740 106 V146" style="--d:0.8s"/><path class="wire" d="M920 106 V146" marker-end="url(#t2a-aa)"/><path class="flow" d="M920 106 V146"/><path class="dot" pathLength="100" d="M920 106 V146" style="--d:1.2s"/><path class="wire" d="M470 220 H486" marker-end="url(#t2a-at)"/><path class="flow teal" d="M470 220 H486"/><path class="dot teal" pathLength="100" d="M470 220 H486" style="--d:1.6s"/><path class="wire" d="M565 150 V56 H135 V62" marker-end="url(#t2a-at)"/><path class="flow teal" d="M565 150 V56 H135 V62"/><path class="dot teal" pathLength="100" d="M565 150 V56 H135 V62" style="--d:2.0s"/><path class="flow teal" d="M345 56 V62"/><g class="rise" style="--d:0.6s"><rect class="box acc" x="40" y="340" width="960" height="80" rx="14"/><ellipse class="box acc" cx="520" cy="346" rx="470" ry="6"/><text class="t-m" x="60" y="372">SQLite · WAL · one file</text><text class="t-s" x="60" y="390">shared by the daemon, MCP children and CLI processes: readers pass the writer, writes take turns</text><text class="t-a" x="60" y="408">SQLCipher build encrypts the file at rest</text></g>
+<path class="wire" d="M255 290 V336" marker-end="url(#t2a-aa)"/><path class="flow" d="M255 290 V336"/><path class="dot" pathLength="100" d="M255 290 V336" style="--d:1.4s"/><path class="wire" d="M740 290 V336" marker-end="url(#t2a-aa)"/><path class="flow" d="M740 290 V336"/><path class="dot" pathLength="100" d="M740 290 V336" style="--d:1.8s"/><path class="wire" d="M920 290 V336" marker-end="url(#t2a-aa)"/><path class="flow" d="M920 290 V336"/><path class="dot" pathLength="100" d="M920 290 V336" style="--d:2.2s"/><text class="t-s" x="40" y="452">Every surface resolves an agent identity and passes the same per-namespace governance gate.</text><text class="t-s" x="40" y="472">The hub carries hints only: the inbox row in SQLite is the message, and recipients keep a backstop poll.</text></svg>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Deployment recipe</span>
-    <h2>Workstation, multi-agent, multi-namespace.</h2>
-<pre><code># Run as a long-lived HTTP daemon on the workstation
-ai-memory --db /var/lib/ai-memory/store.db serve \
-  --host 127.0.0.1 --port 9077
+  </figure>
+  <p class="am-figcap"><b>Correction (#4254).</b> Earlier guides described the CLI at this tier as a thin client of the daemon. It is not: CLI verbs such as <code>store</code> and <code>recall</code> open the database in-process (<code>src/daemon_runtime.rs</code> dispatches them to <code>src/cli/store.rs</code> and <code>src/cli/recall.rs</code> with the local path). Only <code>sync</code> and <code>doctor --remote</code> speak HTTPS to a daemon or peer. Sources: <code>src/handlers/routes.rs</code>, <code>src/identity/authority.rs</code>, <code>src/wake_hub/routing.rs</code>, <code>src/wake_sink/in_process.rs</code>.</p>
+</div></section>
 
-# Each agent is a separate MCP client (or HTTP client) pointing at the same store.
-# MCP is stdio JSON-RPC, not an HTTP endpoint — spawn ai-memory mcp directly.
-# In .mcp.json for each agent's Claude Code config:
-{
-  "mcpServers": {
-    "memory": {
-      "command": "ai-memory",
-      "args": ["mcp", "--profile", "full"],
-      "env": {"AI_MEMORY_AGENT_ID": "agents/planner"}
-    }
-  }
-}
-
-# HTTP clients (non-MCP agents) connect to the daemon's REST surface:
-#   curl -s -X POST http://127.0.0.1:9077/api/v1/recall \
-#     -H "X-Agent-Id: agents/planner" -d '{"context": "..."}'
-
-# Agents pass as_agent=agents/&lt;role&gt; on every recall
-# Per-namespace policies set once, enforced forever:
-ai-memory namespace set-standard --namespace agents/secops --id &lt;standard-memory-uuid&gt; \
-  --governance '{"write":"approve","delete":"approve"}'</code></pre>
+<section class="am-sec alt" id="isolation"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Isolation and approval</span>
+    <h2>Who sees what, <span class="a">who may write where</span>.</h2>
+    <p>Recall takes <code>as_agent</code>: the engine computes visibility prefixes from the caller's namespace and its ancestors, and the SQL filter compares them against an indexed scope column. A write into a namespace whose standard says <code>"write":"approve"</code> is parked, not committed.</p>
   </div>
-</section>
+  <figure class="am-fig" style="--fig-min:920px">
+<svg class="dg" viewBox="0 0 1100 380" role="img" aria-labelledby="t2b-title" aria-describedby="t2b-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="t2b-title">Tier 2: scope visibility and a governed write</title><desc id="t2b-desc">Left: a recall with as_agent computes visibility prefixes from the caller namespace and the SQL filter keeps private rows of the caller, and team, unit, org and collective rows whose subtree contains the caller. Right: a write into a namespace whose standard sets write to approve returns 202 pending; the pending action waits until an approver approves or rejects it.</desc>
+<defs><marker id="t2b-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="t2b-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="t2b-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="t2b-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="t2b-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<text class="t-k" x="30" y="30">RECALL · WHO SEES WHAT</text><g class="rise"><rect class="box acc" x="30" y="46" width="200" height="70" rx="12"/><text class="t-m" x="44" y="72">memory_recall</text><text class="t-s" x="44" y="88">as_agent =</text><text class="t-a" x="44" y="104">org/team-a/coder</text></g>
+<path class="wire" d="M230 81 H256" marker-end="url(#t2b-aa)"/><path class="flow" d="M230 81 H256"/><path class="dot" pathLength="100" d="M230 81 H256"/><g class="rise" style="--d:0.1s"><rect class="box" x="260" y="46" width="220" height="70" rx="12"/><text class="t-m" x="274" y="72">visibility prefixes</text><text class="t-s" x="274" y="88">from the caller namespace</text><text class="t-s" x="274" y="104">and its ancestors</text></g>
+<g class="rise" style="--d:0.2s"><rect class="box teal" x="260" y="140" width="300" height="36" rx="8"/><text class="t-teal" x="274" y="163">private</text><text class="t-s" x="380" y="163">the caller's own rows</text></g>
+<g class="rise" style="--d:0.28s"><rect class="box" x="260" y="184" width="300" height="36" rx="8"/><text class="t-teal" x="274" y="207">team</text><text class="t-s" x="380" y="207">same team subtree</text></g>
+<g class="rise" style="--d:0.36s"><rect class="box" x="260" y="228" width="300" height="36" rx="8"/><text class="t-teal" x="274" y="251">unit</text><text class="t-s" x="380" y="251">same unit subtree</text></g>
+<g class="rise" style="--d:0.44s"><rect class="box" x="260" y="272" width="300" height="36" rx="8"/><text class="t-teal" x="274" y="295">org</text><text class="t-s" x="380" y="295">same org subtree</text></g>
+<g class="rise" style="--d:0.52s"><rect class="box" x="260" y="316" width="300" height="36" rx="8"/><text class="t-teal" x="274" y="339">collective</text><text class="t-s" x="380" y="339">every authenticated caller</text></g>
+<path class="wire" d="M370 116 V136" marker-end="url(#t2b-at)"/><path class="flow teal" d="M370 116 V136"/><path class="dot teal" pathLength="100" d="M370 116 V136" style="--d:0.6s"/><g class="rise" style="--d:0.5s"><rect class="box" x="30" y="140" width="200" height="212" rx="12"/><text class="t-m" x="44" y="166">SQL filter</text><text class="t-s" x="44" y="188">visibility_clause</text><text class="t-s" x="44" y="210">compares the indexed</text><text class="t-s" x="44" y="232">scope_idx column</text><text class="t-s" x="44" y="254">rows outside the</text><text class="t-s" x="44" y="276">caller's view never</text><text class="t-s" x="44" y="298">leave the store</text></g>
+<path class="wire ghost" d="M260 246 H234" marker-end="url(#t2b-ah)"/><text class="t-k" x="580" y="30">WRITE · GOVERNED NAMESPACE</text><g class="rise" style="--d:0.3s"><rect class="box" x="580" y="46" width="220" height="70" rx="12"/><text class="t-m" x="594" y="70">coder writes to</text><text class="t-a" x="594" y="86">org/secops</text><text class="t-s" x="594" y="102">standard: write = approve</text></g>
+<path class="wire" d="M800 81 H826" marker-end="url(#t2b-aa)"/><path class="flow" d="M800 81 H826"/><path class="dot" pathLength="100" d="M800 81 H826" style="--d:0.8s"/><g class="rise" style="--d:0.4s"><rect class="box acc" x="830" y="46" width="240" height="70" rx="12"/><text class="t-a" x="844" y="70">202 · status pending</text><text class="t-s" x="844" y="86">pending_id returned</text><text class="t-s" x="844" y="102">nothing committed yet</text></g>
+<path class="wire" d="M950 116 V146" marker-end="url(#t2b-aa)"/><path class="flow" d="M950 116 V146"/><path class="dot" pathLength="100" d="M950 116 V146" style="--d:1.2s"/><g class="rise" style="--d:0.5s"><rect class="box" x="830" y="150" width="240" height="70" rx="12"/><text class="t-m" x="844" y="174">pending_actions</text><text class="t-s" x="844" y="190">listed for approvers</text><text class="t-s" x="844" y="206">memory_pending_list</text></g>
+<path class="wire" d="M890 220 V250" marker-end="url(#t2b-aa)"/><path class="flow" d="M890 220 V250"/><path class="dot" pathLength="100" d="M890 220 V250" style="--d:1.6s"/><path class="wire" d="M1010 220 V250" marker-end="url(#t2b-ab)"/><path class="flow bad" d="M1010 220 V250"/><path class="dot bad" pathLength="100" d="M1010 220 V250" style="--d:1.9s"/><g class="rise" style="--d:0.6s"><rect class="box" x="830" y="254" width="116" height="64" rx="10"/><text class="t-a" x="842" y="278">approve</text><text class="t-s" x="842" y="294">row committed</text></g>
+<g class="rise" style="--d:0.7s"><rect class="box bad" x="954" y="254" width="116" height="64" rx="10"/><text class="t-bad" x="966" y="278">reject</text><text class="t-s" x="966" y="294">nothing lands</text></g>
+<g class="rise" style="--d:0.8s"><rect class="box teal" x="580" y="150" width="220" height="168" rx="12"/><text class="t-m" x="594" y="176">levels per action</text><text class="t-s" x="594" y="196">write · promote · delete</text><text class="t-s" x="594" y="216">any</text><text class="t-s" x="594" y="236">registered</text><text class="t-s" x="594" y="256">owner</text><text class="t-s" x="594" y="276">approve</text><text class="t-s" x="594" y="296">parent standards inherit</text></g>
+<text class="t-s" x="580" y="350">A capability token may lift Pending to Allow, never Deny.</text></svg>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Wiring</span>
-    <h2>Governance, skills, and attestations at T2.</h2>
-    <ul>
-      <li><strong>Governance</strong> — Live and enforced. <code>GovernancePolicy</code> (<code>src/models/mod.rs</code>) per namespace, hierarchical with parent inheritance, supports <code>any</code> / <code>registered</code> / <code>owner</code> / <code>approve</code> for each of <code>write</code> / <code>promote</code> / <code>delete</code>. Namespace metadata lives in <code>namespace_meta</code> and is the source of truth for the gate.</li>
-      <li><strong>Skills</strong> — Skills register themselves as agents (<code>memory_agent_register</code>). Auto-tagging, contradiction detection, query expansion, and consolidation all run through the same scope visibility — a skill at <code>skills/auto-tag</code> with <code>team</code> scope only sees memories its team published. Skills can be subject to the same governance policies as humans-in-the-loop.</li>
-      <li><strong>Attestations</strong> — <code>memory_links.signature</code> (reserved as a schema v15 column at v0.6.3) is POPULATED with Ed25519 per-link attestation — see <code>src/signed_events.rs</code> + the V-4 cross-row hash chain at schema v34. Peers verify signatures on receive.</li>
-    </ul>
+  </figure>
+  <p class="am-figcap">Sources: <code>src/models/namespace.rs</code> (scopes, governance levels and decisions), <code>src/storage/mod.rs</code> (visibility prefixes and clause, pending decisions), <code>src/handlers/create.rs</code> (the 202 pending response), <code>src/governance/capability.rs</code>.</p>
+</div></section>
+
+<section class="am-sec" id="walkthrough"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Walkthrough</span>
+    <h2>One write, one recall, <span class="a">one wake</span>.</h2>
   </div>
-</section>
+  <ol class="am-steps">
+    <li><b>Write.</b> The coder POSTs a memory with <code>X-Agent-Id: org/team-a/coder</code> and its own API key. The key is matched to an enrolled agent, the namespace standard is read, the decision is Allow, and the row commits.</li>
+    <li><b>Recall.</b> The planner recalls with <code>as_agent=org/team-a/planner</code>. Its own private rows come back, plus rows scoped <code>team</code>, <code>unit</code>, <code>org</code> or <code>collective</code> whose subtree contains the planner; the coder's private rows do not.</li>
+    <li><b>Governed write.</b> The coder writes into <code>org/secops</code>, whose standard requires approval. The answer is <code>202</code> with a pending id; an approver lists it with <code>memory_pending_list</code> and approves or rejects it.</li>
+    <li><b>Message.</b> The planner calls <code>memory_notify</code> for the reviewer. The inbox row commits first; the daemon then publishes a content-free wake to the host's hub, and the reviewer's <code>wake-listen</code> session does one catch-up inbox read. If the hint is lost, the reviewer's backstop poll (at least once a minute) still finds the row.</li>
+  </ol>
+</div></section>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Limits</span>
-    <h2>Honest ceilings.</h2>
-    <table>
-      <thead>
-        <tr><th>Dimension</th><th>T2 ceiling</th><th>When it bites</th></tr>
-      </thead>
-      <tbody>
-        <tr><td>Concurrent writers</td><td>~10–20 before mutex contention shows up</td><td>Bulk imports starve real-time agents</td></tr>
-        <tr><td>Total memories</td><td>~10⁶ before HNSW RAM cost is noticeable</td><td>Vector index lives in-process</td></tr>
-        <tr><td>Write throughput</td><td>~500-2000 writes/sec (single SQLite writer)</td><td>Bulk operations should chunk</td></tr>
-        <tr><td>Recall p95</td><td>~361 ms measured at 10⁵ rows (SQLite, #1579 P1 audit — see <a href="performance.html" style="color:var(--p1)">performance.html</a>); the ≤50 ms budget holds only at small-corpus/default scale</td><td>Default ≤50 ms budget stops holding past ~100k rows</td></tr>
-        <tr><td>Network exposure</td><td>loopback by default, mTLS available</td><td>Set up TLS before binding non-loopback</td></tr>
-        <tr><td>Cross-machine sharing</td><td>none</td><td>Walk to <a href="architectures-t3.html" style="color:var(--p1)">Tier 3</a></td></tr>
-      </tbody>
-    </table>
+<section class="am-sec alt" id="recipe"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Deployment recipe</span>
+    <h2>A shared workstation or <span class="a">a single VM</span>.</h2>
   </div>
-</section>
+<pre><code># TLS is mandatory on every listener, loopback included (#3705).
+# A team host brings its own certificate: verify it and install it once
+# (or pass --tls-cert / --tls-key to serve). Only the single-operator
+# singleton shape mints a local CA certificate for you.
+ai-memory tls import --cert /etc/ai-memory/tls/fullchain.pem --key /etc/ai-memory/tls/key.pem \
+  --ca /etc/ai-memory/tls/ca.pem --host 127.0.0.1
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Source</span>
-    <h2>Source-of-truth references.</h2>
-    <ul>
-      <li><code>src/storage/mod.rs</code> — <code>compute_visibility_prefixes()</code> (scope visibility)</li>
-      <li><code>src/storage/mod.rs</code> — <code>visibility_clause()</code> (SQL filter)</li>
-      <li><code>src/storage/mod.rs</code> — <code>namespace_meta</code> table for per-namespace policy</li>
-      <li><code>src/models/mod.rs</code> — <code>PendingAction</code> struct</li>
-      <li><code>src/models/mod.rs</code> — <code>GovernancePolicy</code></li>
-      <li><code>src/mcp/mod.rs</code> — <code>as_agent</code> parameter on recall</li>
-      <li><code>docs/AI_DEVELOPER_GOVERNANCE.md</code> — governance contract</li>
-      <li><code>docs/CHANGELOG.md</code> — v0.6.2 (governance GA), v0.6.3 (taxonomy + capabilities v2)</li>
-    </ul>
+# One daemon per host (loopback by default; a non-loopback bind refuses to start without api_key in config.toml)
+ai-memory --db /var/lib/ai-memory/ai-memory.db serve --host 127.0.0.1 --port 9077
+
+# HTTPS agents identify themselves on every call and trust the daemon's CA
+curl -s --cacert /etc/ai-memory/tls/ca.pem -X POST https://127.0.0.1:9077/api/v1/recall \
+  -H "X-Agent-Id: org/team-a/planner" -H "X-API-Key: $PLANNER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"context":"release blockers","as_agent":"org/team-a/planner"}'
+
+# Govern a namespace: store the standard memory, then bind it with a policy
+ai-memory --db /var/lib/ai-memory/ai-memory.db store -T "secops standard" -c "writes need approval" -n org/secops
+ai-memory --db /var/lib/ai-memory/ai-memory.db namespace set-standard --namespace org/secops \
+  --id &lt;standard-memory-id&gt; --governance '{"write":"approve","promote":"owner","delete":"approve"}'
+
+# Wake plane on this host: publish the allowlist, run the hub, listen per agent
+ai-memory identity hub-cache --daemon-producer --include-agent org/team-a/reviewer --out /run/ai-memory-hub/hub-allow.json
+ai-memory wake-hub --socket /run/ai-memory-hub/hub.sock --hub-id team-host --allowlist /run/ai-memory-hub/hub-allow.json
+ai-memory wake-listen --agent-id org/team-a/reviewer --socket /run/ai-memory-hub/hub.sock --hub-id team-host --unread-only --json</code></pre>
+  <p class="am-figcap">Flags verified against <code>src/daemon_runtime.rs</code>, <code>src/cli/namespace.rs</code>, <code>src/cli/identity_hub_cache.rs</code>, <code>src/cli/wake_hub.rs</code> and <code>src/cli/wake_listen.rs</code>. Attaching the daemon's wake sink to the hub, key directories and the snapshot refresher are covered step by step in the <a href="wake-hub.html">wake plane</a> guide.</p>
+</div></section>
+
+<section class="am-sec" id="wiring"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Wiring</span>
+    <h2>Governance, wake plane and <span class="a">identity</span> at Tier 2.</h2>
   </div>
-</section>
+  <div class="am-grid">
+    <div class="am-card gold"><span class="am-k">Governance</span><h3>Per namespace, inherited</h3><p>Each of write, promote and delete takes <code>any</code>, <code>registered</code>, <code>owner</code> or <code>approve</code>; a standard can name a parent so a default at <code>org/</code> applies below it. Capability tokens are on by default and can only lift Pending to Allow.</p></div>
+    <div class="am-card teal"><span class="am-k">Wake plane</span><h3>One hub per host</h3><p>The hub is a Unix-socket switch with per-recipient queues and an allowlist; the daemon reaches it under the reserved <code>wake-hub-producer</code> identity. Wakes carry a digest, never the body.</p></div>
+    <div class="am-card"><span class="am-k">Identity</span><h3>Per-agent keys</h3><p>An <code>X-API-Key</code> that matches an enrolled agent key proves that principal; agents also hold Ed25519 keypairs (<code>src/identity/keypair.rs</code>).</p></div>
+  </div>
+</div></section>
 
-<footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v1.0.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
-</footer>
-
+<section class="am-sec alt" id="limits"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Honest limits</span>
+    <h2>When Tier 2 <span class="a">stops fitting</span>.</h2>
+  </div>
+  <div class="am-tablewrap"><table class="am-table">
+    <thead><tr><th>Dimension</th><th>Tier 2 behaviour</th><th>Move up when</th></tr></thead>
+    <tbody>
+      <tr><td><b>Writers</b></td><td>The daemon, MCP children and CLI processes share one SQLite file; writes serialize on its lock.</td><td>Write contention shows up in latency: <a href="architectures-t4.html">PostgreSQL tier</a>.</td></tr>
+      <tr><td><b>Throughput</b></td><td>Every HTTPS request terminates at the one daemon.</td><td>One daemon is the bottleneck: add peers at <a href="architectures-t3.html">Tier 3</a>.</td></tr>
+      <tr><td><b>Availability</b></td><td>One host, one disk; snapshots with <code>backup</code>, no live replica.</td><td>You need a current second copy: <a href="architectures-t3.html">Tier 3</a>.</td></tr>
+      <tr><td><b>Wake reach</b></td><td>The hub reaches agents on this host only.</td><td>Agents on other hosts: federation at <a href="architectures-t3.html">Tier 3</a>.</td></tr>
+      <tr><td><b>Transport</b></td><td>TLS on every bind, loopback included; the daemon refuses to start in cleartext. Loopback by default; an mTLS allowlist is available on <code>serve</code>.</td><td>Add the allowlist and <code>api_key</code> before binding beyond loopback.</td></tr>
+      <tr><td><b>Shared filesystems</b></td><td>The SQLite file must sit on a local disk: NFS, SMB, FUSE or EFS locking is unsafe (architectural limit 4), so the daemon cannot be scaled out over a shared volume.</td><td>You need more than one host: <a href="architectures-t3.html">Tier 3</a> or the <a href="architectures-t4.html">PostgreSQL tier</a>.</td></tr>
+    </tbody>
+  </table></div>
+  <p class="am-figcap" style="margin-top:12px">Reasoning for each: <a href="ARCHITECTURAL_LIMITS.html">architectural limits</a>.</p>
+  <div class="am-btns"><a class="am-btn" href="architectures-t1.html">← Tier 1 · Single node</a><a class="am-btn primary" href="architectures-t3.html">Tier 3 · Federated cluster →</a></div>
+</div></section>
+</main>
+<footer class="am-foot"><div class="am-wrap">
+  <span>© 2026 AlphaOne LLC · Apache-2.0 · ai-memory v1.0.0</span>
+  <span><a href="https://github.com/alphaonedev/ai-memory-mcp">source</a> · <a href="index.html">home</a> · <a href="architectures.html">architectures</a> · <a href="ARCHITECTURAL_LIMITS.html">limits</a></span>
+</div></footer>
+<button class="am-themetog" id="am-themetog" type="button" aria-label="Toggle light or dark theme">theme</button>
+<script>
+(function(){var d=document.documentElement;try{var s=localStorage.getItem('aim-site-theme');if(s)d.setAttribute('data-theme',s);}catch(e){}
+var b=document.getElementById('am-themetog');if(!b)return;b.addEventListener('click',function(){var c=d.getAttribute('data-theme');var n=c==='dark'?'light':c==='light'?'dark':(matchMedia('(prefers-color-scheme:dark)').matches?'light':'dark');d.setAttribute('data-theme',n);try{localStorage.setItem('aim-site-theme',n);}catch(e){}});})();
+</script>
 </body>
 </html>

@@ -303,7 +303,11 @@ footer a{color:var(--text-muted)}
     .context(<span class="val">"PRAGMA key failed (wrong passphrase or unencrypted DB?)"</span>)?;
 
 <span class="cm">// Operator workflow — pass the passphrase by FILE (mode 0400), not env:
-// the CLI reads it once and exports AI_MEMORY_DB_PASSPHRASE for the process.</span>
+// --db-passphrase-file reads the passphrase once into process-private state.
+// It does NOT set or export AI_MEMORY_DB_PASSPHRASE and does not pass that
+// file-read secret to child processes (#3213). Operators may set
+// AI_MEMORY_DB_PASSPHRASE themselves. A passphrase requests whole-database
+// SQLCipher and is refused by a build without that feature.</span>
 <span class="ok">$</span> chmod 0400 /run/secrets/db-passphrase
 <span class="ok">$</span> ai-memory --db-passphrase-file /run/secrets/db-passphrase \
     serve --db /var/lib/ai-memory/data.sqlite
@@ -329,7 +333,8 @@ footer a{color:var(--text-muted)}
 //   version(1) || ephemeral_pub(32) || nonce(12) || ciphertext+tag</span>
 
 <span class="cm">// Opt-in (default OFF → byte-identical plaintext storage):</span>
-<span class="ok">$</span> AI_MEMORY_ENCRYPT_AT_REST=1 ai-memory serve   <span class="cm"># or [storage] encrypt_at_rest = true</span>
+<span class="ok">$</span> AI_MEMORY_ENCRYPT_AT_REST=1 ai-memory serve   <span class="cm"># or in config.toml: [encryption] / at_rest = true
+// (NOT [storage] — that section has no encrypt_at_rest field)</span>
 
 <span class="cm">// Fail-closed: with encryption ON, a memory that carries no agent_id is
 // rejected ("no agent_id to key encryption to") rather than stored in clear.</span></div>
@@ -345,7 +350,7 @@ footer a{color:var(--text-muted)}
 
     <div class="feature fed">
       <div class="feature-head"><span class="feature-name">rustls TLS 1.3</span><span class="feature-tag live">live since v0.6</span></div>
-      <div class="feature-desc">Federation HTTP traffic uses <code>rustls</code> — Rust-native TLS, no OpenSSL dependency. TLS 1.3 only (no fallback to 1.2 or below). Forward secrecy via X25519 ECDHE. AEAD ciphers only.</div>
+      <div class="feature-desc">Federation HTTP traffic uses <code>rustls</code> — Rust-native TLS, no OpenSSL dependency. The server supports TLS 1.3 and TLS 1.2, with TLS 1.3 preferred and TLS 1.2 as the minimum supported version. TLS 1.1 and earlier are excluded. Forward secrecy via X25519 ECDHE. AEAD ciphers only.</div>
     </div>
 
     <div class="feature fed">

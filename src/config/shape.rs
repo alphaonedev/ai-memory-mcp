@@ -322,7 +322,9 @@ impl StorageBackend {
 pub struct ShapeDerived {
     /// The shape this table was derived from.
     pub shape: DeploymentShape,
-    /// The `asi-hard` / `standard` posture (the 28-knob pin set).
+    /// The `asi-hard` / `standard` posture (the pinned set, whose size is
+    /// the derived `crate::security_profile::PINNED_KNOB_COUNT` —
+    /// `KNOBS.len()`; never a literal here, which is what drifted).
     /// Enforced at boot by [`enforce_at_boot_pre_runtime`] through the
     /// `AI_MEMORY_SECURITY_PROFILE` spelling so every existing
     /// `is_asi_hard()` read site honours it without change.

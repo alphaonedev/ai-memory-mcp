@@ -5396,22 +5396,48 @@ mod tests {
         std::fs::set_permissions(&exposed_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    /// #4443 — an extended ACL a cell adds, removed again (`chmod -N`) when the
+    /// guard drops: at the end of the cell, on a panic, and BEFORE the cell's
+    /// `TempDir` (declared earlier, so dropped later). An `everyone deny delete`
+    /// entry left in place made the tempdir undeletable: `TempDir`'s drop
+    /// ignores the error, so every macOS run leaked one directory that a plain
+    /// `rm -rf` could not remove.
+    #[cfg(target_os = "macos")]
+    struct AclGuard(PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for AclGuard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("chmod")
+                .arg("-N")
+                .arg(&self.0)
+                .status();
+        }
+    }
+
+    /// Add one extended ACL entry to `path` (asserting `chmod +a` succeeded)
+    /// and return the guard that removes it.
+    #[cfg(target_os = "macos")]
+    fn add_acl(path: &Path, entry: &str) -> AclGuard {
+        let status = std::process::Command::new("chmod")
+            .args(["+a", entry])
+            .arg(path)
+            .status()
+            .expect("run chmod +a");
+        assert!(status.success(), "chmod +a {entry:?} {}", path.display());
+        AclGuard(path.to_path_buf())
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn journal_macos_rejects_extended_acl_ancestor_despite_private_mode() {
         use std::os::unix::fs::PermissionsExt as _;
-        use std::process::Command;
 
         let dir = fresh_tempdir();
         let exposed_parent = dir.path().join("extended-acl-parent");
         std::fs::create_dir(&exposed_parent).unwrap();
         std::fs::set_permissions(&exposed_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let status = Command::new("chmod")
-            .args(["+a", "everyone allow add_file,delete_child"])
-            .arg(&exposed_parent)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let _acl = add_acl(&exposed_parent, "everyone allow add_file,delete_child");
         let journal_path = exposed_parent.join("audit.journal");
 
         let error = DeferredAuditJournal::open(&journal_path)
@@ -5429,41 +5455,33 @@ mod tests {
     #[test]
     fn journal_macos_accepts_deny_only_extended_acl_ancestor() {
         use std::os::unix::fs::PermissionsExt as _;
-        use std::process::Command;
 
         let dir = fresh_tempdir();
         let protected_parent = dir.path().join("deny-only-acl-parent");
         std::fs::create_dir(&protected_parent).unwrap();
         std::fs::set_permissions(&protected_parent, std::fs::Permissions::from_mode(0o700))
             .unwrap();
-        let status = Command::new("chmod")
-            .args(["+a", "everyone deny delete"])
-            .arg(&protected_parent)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let _acl = add_acl(&protected_parent, "everyone deny delete");
 
         let journal_path = protected_parent.join("audit.journal");
         let journal = DeferredAuditJournal::open(&journal_path)
             .expect("a deny-only ancestor ACL cannot grant rename authority");
         assert!(journal_path.exists());
         assert!(journal.spool_dir.exists());
+        // #4443 — once the guard drops, the tempdir is removable again.
+        drop(journal);
+        drop(_acl);
+        dir.close()
+            .expect("the tempdir is removable after the ACL guard drops (#4443)");
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn journal_macos_rejects_extended_acl_on_existing_journal_without_repair() {
-        use std::process::Command;
-
         let dir = fresh_tempdir();
         let journal_path = dir.path().join("extended-acl.journal");
         drop(DeferredAuditJournal::open(&journal_path).unwrap());
-        let status = Command::new("chmod")
-            .args(["+a", "everyone allow write,delete"])
-            .arg(&journal_path)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let _acl = add_acl(&journal_path, "everyone allow write,delete");
 
         let error = DeferredAuditJournal::open(&journal_path)
             .err()
@@ -5479,8 +5497,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn journal_macos_rejects_extended_acl_on_existing_spool_without_mutation() {
-        use std::process::Command;
-
         let dir = fresh_tempdir();
         let journal_path = dir.path().join("extended-spool.journal");
         let journal = DeferredAuditJournal::open(&journal_path).unwrap();
@@ -5488,12 +5504,7 @@ mod tests {
         let sentinel = spool_dir.join("preserve.pending");
         drop(journal);
         std::fs::write(&sentinel, b"untrusted evidence").unwrap();
-        let status = Command::new("chmod")
-            .args(["+a", "everyone allow add_file,delete_child"])
-            .arg(&spool_dir)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let _acl = add_acl(&spool_dir, "everyone allow add_file,delete_child");
 
         let error = DeferredAuditJournal::open(&journal_path)
             .err()
@@ -5515,7 +5526,6 @@ mod tests {
     #[test]
     fn journal_macos_rejects_extended_acl_pending_frame_without_deleting_it() {
         use std::os::unix::fs::PermissionsExt as _;
-        use std::process::Command;
 
         let dir = fresh_tempdir();
         let journal_path = dir.path().join("extended-pending.journal");
@@ -5524,12 +5534,7 @@ mod tests {
         drop(journal);
         std::fs::write(&pending, b"torn").unwrap();
         std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let status = Command::new("chmod")
-            .args(["+a", "everyone allow write,delete"])
-            .arg(&pending)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let _acl = add_acl(&pending, "everyone allow write,delete");
 
         let error = DeferredAuditJournal::open(&journal_path)
             .err()
@@ -5549,7 +5554,6 @@ mod tests {
     #[test]
     fn journal_macos_rejects_extended_acl_probe_without_deleting_it() {
         use std::os::unix::fs::PermissionsExt as _;
-        use std::process::Command;
 
         let dir = fresh_tempdir();
         let journal_path = dir.path().join("extended-probe.journal");
@@ -5560,12 +5564,7 @@ mod tests {
         drop(journal);
         std::fs::write(&probe, []).unwrap();
         std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let status = Command::new("chmod")
-            .args(["+a", "everyone allow write,delete"])
-            .arg(&probe)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let _acl = add_acl(&probe, "everyone allow write,delete");
 
         let error = DeferredAuditJournal::open(&journal_path)
             .err()

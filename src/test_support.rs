@@ -467,6 +467,35 @@ pub(crate) fn tls_test_client(timeout: std::time::Duration) -> reqwest::Client {
         .expect("TLS test client")
 }
 
+/// v1.0.0 #3152 — run THIS test binary again as a child that executes
+/// exactly `test` (its full path inside the lib test binary) with `env` set.
+/// The child starts from a CLEAN environment (the #3550 `publish_3550`
+/// shape), so no parallel test's environment leaks into it, and it never
+/// reads the operator config file. The crate's own `cfg(test)` harness arms
+/// the #3355 key-directory guard by itself, so no key-dir variable is
+/// needed. The spawn goes through the #1937 audited chokepoint (the
+/// `spawn_audit_gate_1937` guard bans a raw process constructor outside
+/// `src/spawn_audit.rs`); its best-effort audit emit is a no-op in a unit
+/// test process, which seeds no spawn-audit database.
+#[cfg(unix)]
+pub(crate) fn spawn_test_child(test: &str, env: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = crate::spawn_audit::audited_command(
+        std::env::current_exe().expect("lib test binary"),
+        "test_support::spawn_test_child",
+    );
+    cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
+        .env_clear()
+        // Keep the coverage profiler's sink (cargo llvm-cov sets `LLVM_PROFILE_FILE`
+        // with a %p pid template) so the child's execution is measured, not lost.
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+        .env("TMPDIR", std::env::temp_dir())
+        .env("AI_MEMORY_NO_CONFIG", "1");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("spawn the test child")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -608,4 +637,56 @@ mod tests {
             "#3577: simulate_production_lineage_seed must restore both flags on drop"
         );
     }
+}
+
+/// Captures formatted tracing output (no ANSI, no timestamps).
+#[derive(Clone, Default)]
+pub(crate) struct CapturedLines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for CapturedLines {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLines {
+    type Writer = CapturedLines;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+/// A DEBUG-level capturing subscriber plus the sink it writes to. Shared by
+/// the #4310 (forensic writer) and #4318 (flat audit trail) rate-limit cells.
+///
+/// #4090: the CALLER installs it (`tracing::subscriber::with_default`) inside
+/// a test guarded by `run_env_isolated_child_or_spawn`, so the install is
+/// visible to the isolation census; the install is deliberately not hidden in
+/// this shared helper where no guard can precede it.
+pub(crate) fn error_debug_capture() -> (impl tracing::Subscriber + Send + Sync, CapturedLines) {
+    let sink = CapturedLines::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    (subscriber, sink)
+}
+
+/// The (ERROR, DEBUG) line counts a [`error_debug_capture`] sink received.
+pub(crate) fn count_error_and_debug_lines(sink: &CapturedLines) -> (usize, usize) {
+    let text = String::from_utf8_lossy(
+        &sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .into_owned();
+    let count = |level: &str| text.lines().filter(|l| l.contains(level)).count();
+    (count("ERROR"), count("DEBUG"))
 }

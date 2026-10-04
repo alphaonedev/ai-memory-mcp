@@ -3,6 +3,8 @@ layout: doc
 ---
 # Baseline — ai-memory-mcp v0.6.3.1
 
+> **Point-in-time record, as of 2026-04-30.** The src/ file:line references in this document describe the source tree at commit `9e85d366316a` (read a file there with `git show 9e85d366316a:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 > **Purpose.** This file is the canonical, code-derived snapshot of what
 > ai-memory-mcp v0.6.3.1 actually *is* — produced from `main` via 6 parallel
 > read-only scans of the source tree. It is the reference doc that the

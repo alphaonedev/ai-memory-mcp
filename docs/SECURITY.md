@@ -369,13 +369,25 @@ Every HTTP endpoint except `/api/v1/health` enforces the key (when
 the mTLS allowlist is enforced, the `/api/v1/sync/*` federation
 endpoints additionally bypass the key check — they have already
 cleared a stronger transport gate; see #702 and
-[`docs/federation.md`](federation.html)). Accepts either:
+[`docs/federation.md`](federation.html)). There is exactly one accepted
+credential channel:
 
-- Header: `X-API-Key: <key>` — the supported channel.
-- Query parameter: `?api_key=<key>` — **DEPRECATED** at v0.7.0
-  (#1574; URL-embedded credentials leak into access logs, Referer
-  headers, and proxy logs — a once-per-process WARN is emitted on
-  use). Slated for removal; migrate callers to the header.
+- Header: `x-api-key: <key>` — **the only** accepted channel.
+- Query parameter: `?api_key=<key>` — **REMOVED at v1.0.0** (#2032 L1;
+  deprecated at v0.7.0 by #1574). It no longer authenticates:
+  `api_key_auth` reads the header and nothing else, so a query-only
+  request is refused exactly as a credential-less one is. The daemon
+  emits a once-per-process WARN naming the header alternative. Rotate
+  any key that was ever sent in a URL — URL-embedded credentials leak
+  into access logs, `Referer` headers, and proxy logs.
+
+At v1.0.0, the API-key credential channel is the `x-api-key` header; the
+`api_key` query parameter does not authenticate. Missing or invalid
+credentials on authenticated routes ordinarily return **401**; source-IP
+authentication backoff can return **429** (`{"error": "auth_backoff"}`
+plus `Retry-After`, #2502). Route-specific authentication bypasses — the
+mTLS-cleared `/api/v1/sync/*` lane above and `/api/v1/health` — remain
+separately scoped.
 
 Rotation: generate new key, update config, restart the daemon.
 Clients have a grace period determined by their connection
@@ -640,8 +652,12 @@ in `_curator/rollback/<ts>`.
 
 For compliance-grade audit, also:
 
-- Enable daemon structured logs (`RUST_LOG=ai_memory=info`) and ship
-  to syslog.
+- Enable daemon structured logs (the default filter is the bare level
+  `info`, which is not limited to the `ai_memory` prefix, #3650) and ship to syslog.
+  The `[logging]` sinks (file, stdout, syslog) filter on `[logging].level`
+  plus the two `sqlx_postgres::options` credential floors at `error`, not on
+  `RUST_LOG`; a target-prefixed value there such as `ai_memory=info` leaves out
+  events whose targets sit outside `ai_memory`, except `error` events from those two floor targets.
 - Enable Prometheus `/metrics` and scrape the full counter set.
 - Retain `archive` memories (don't `archive purge`).
 

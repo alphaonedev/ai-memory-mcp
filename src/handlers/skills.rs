@@ -451,7 +451,10 @@ pub async fn skill_compose_route(
         params[field_names::BUDGET_TOKENS] = json!(b);
     }
     let lock = app.db.lock().await;
-    match crate::mcp::handle_skill_compositional_context(&lock.0, &params) {
+    // #4059 — explicit HTTP-admin semantics preserved: this route is
+    // admin-only (`require_admin` above), and an admin compose reads the
+    // declared namespaces under the operator trust-all posture (`None`).
+    match crate::mcp::handle_skill_compositional_context(&lock.0, &params, None) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
             if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
