@@ -1769,7 +1769,7 @@ a path as absent (CLAUDE.md's own worktree pre-flight asserts
 THREE-LINE
 window because this repo hard-wraps prose and the disclaimer routinely
 lands on the line above the path it disclaims (wording that names a
-destination, "split into", "split out" or an arrow followed by a `src/`
+destination, "split into", "split up into", "split across", "split out", "renamed to" or an arrow followed by a `src/`
 path, exempts only an anchor BEFORE it, never the live file after it; an
 arrow with no `src/` path after it, such as a Rust signature or an HTML
 comment end, names no destination and exempts nothing); and frozen doc trees

@@ -621,6 +621,22 @@ MDEOF
         '`src/missing_5264.rs` -> `src/mcp/tools/recall.rs`'
     anchor_green 5264 "a source path on the line above a wrapped arrow" \
         $'The module `src/missing_5264.rs`\n-> `src/mcp/tools/recall.rs` now.'
+    # #5344: "split up into", "split across" and "renamed to" name a
+    # destination as well.
+    anchor_red 5344 PATH "a plain path after 'split up into'" \
+        'It has been split up into `src/missing_5344.rs` now.'
+    anchor_red 5344 PATH "a plain path after 'split across'" \
+        'The module was split across `src/missing_5344.rs`.'
+    anchor_red 5344 PATH "a plain path after 'renamed to'" \
+        'It was renamed to `src/missing_5344.rs`.'
+    anchor_red 5344 PATH "a second path after 'renamed to' on a line with a live source" \
+        '`src/old_5344.rs` was renamed to `src/missing_5344.rs`.'
+    anchor_green 5344 "a source path before 'split up into'" \
+        '`src/missing_5344.rs` was split up into `src/mcp/tools/recall.rs`.'
+    anchor_green 5344 "a source path before 'renamed to'" \
+        '`src/missing_5344.rs` was renamed to `src/mcp/tools/recall.rs`.'
+    anchor_green 5344 "a source path before 'split across'" \
+        '`src/missing_5344.rs` was split across `src/mcp/tools/recall.rs`.'
     # #5341: an arrow that is not followed by a src/ path names no
     # destination, so the missing file before it is still a stale anchor.
     anchor_red 5341 PATH "a missing file before a Rust signature arrow" \
@@ -960,7 +976,7 @@ def split_items(raw):
 # sentences that say the file is gone.
 ABSENT_ASSERTION = re.compile(
     r"test ! -f|no longer exists?|pre-?modularisation|pre-?modularization|"
-    r"modularisation|modularization|monolithic|formerly|\bsplit (?:from|off)\b|\b(?:was|been|got) split\b(?!\s+(?:into|out)\b)|pre-?split|renamed to|"
+    r"modularisation|modularization|monolithic|formerly|\bsplit (?:from|off)\b|\b(?:was|been|got) split\b(?!\s+(?:(?:up\s+)?into|out|across)\b)|pre-?split|"
     r"removed in|deleted in|STALE BASE|does not exist",
     re.IGNORECASE,
 )
@@ -968,12 +984,15 @@ ABSENT_ASSERTION = re.compile(
 # "-> X") says the file AFTER it is live, so it must never exempt a missing
 # file. It exempts only an anchor BEFORE it on the same line (the source,
 # which the sentence says has gone: "`src/old.rs` was split into ...").
+# #5344: "split up into", "split across" and "renamed to" are destination
+# wording too: they say the path AFTER them is live, so they are positional
+# (ABSENT_DEST) and no longer window-wide absence wording.
 # #5341: an arrow is destination wording ONLY when a src/ path follows it
 # (`-> `src/new.rs``); any other arrow (a Rust signature `-> u32`, an HTML
 # comment end `-->`, a table cell `a -> b`) names no destination and must
 # not exempt the missing file before it.
 ABSENT_DEST = re.compile(
-    r"\bsplit (?:into|out)\b|(?:->|" + chr(0x2192) + r")(?=\s*`?(?:\.{0,2}/)*src/)",
+    r"\bsplit (?:(?:up )?into|out|across)\b|\brenamed to\b|(?:->|" + chr(0x2192) + r")(?=\s*`?(?:\.{0,2}/)*src/)",
     re.IGNORECASE)
 
 
