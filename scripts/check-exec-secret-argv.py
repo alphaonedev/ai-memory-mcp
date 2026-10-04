@@ -545,7 +545,8 @@ CRED_TOOL_RE = re.compile(
     r"|\bsshpass\s+-p\s*[\"']?\$"
     r"|\bredis-cli\b[^|;&]*\s(?:-a|--pass)\s*[\"']?\$"
     r"|\b(?:curl|wget)\b[^|;&]*\s(?:-u|--user|--password|--http-password)[\s=]*[\"']?[^\s\"']*\$"
-    r"|\b(?:docker|podman)\s+login\b[^|;&]*\s(?:-p|--password)\b"
+    # --password-stdin is the safe form and is not matched (#4994)
+    r"|\b(?:docker|podman)\s+login\b[^|;&]*\s(?:-p|--password)(?![\w-])"
     r"|(?:-H|--header)\s*[\"']?(?:x-api-key|authorization|x-auth-token)\s*:[^\"']*\$")
 
 
@@ -1209,6 +1210,8 @@ ALLOWED_FORMS = [
     ("env prefix read by the child", 'MYSQL_PWD="$PW" mysql -u root db'),
     ("exported variable read by the child", 'export REDISCLI_AUTH="$A"'),
     ("-e NAME with no value", 'docker run -e PGPASSWORD img'),
+    ("curl body from stdin", 'curl --data @- https://h/ < "$TOKEN_FILE"'),
+    ("curl config from stdin", 'curl -K - https://h/ < "$TOKEN_FILE"'),
 ]
 
 
@@ -1280,6 +1283,11 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
             bad.append("%s fed from a variable is not tagged denylist (#4920)" % label)
         elif not check_allow_vs_denylist({"c.sh": res}, [("reason: r", "c.sh", 1, norm(line), 1)]):
             bad.append("%s fed from a variable could be allowed (#4920)" % label)
+    # the stdin form is the safe form: never denylist-tagged (#4994)
+    n += 1
+    sl = 'docker login -u u --password-stdin reg < "$TOKEN_FILE"'
+    if any("denylist" in r[2] for r in scan_exec_file(dl, "c.sh", "#!/bin/bash\n%s\n" % sl) or []):
+        bad.append("docker login --password-stdin is tagged denylist (#4994)")
     # a Dockerfile comment line inside a RUN continuation does not end the instruction (#4995)
     for label, mid in (("comment", "  # note\n"), ("comment ending in a backslash", "  # note \\\n"),
                        ("blank line", "\n")):
@@ -1377,6 +1385,7 @@ def self_test(root: Path) -> int:
             continue
         entries = [("reason: probe", "a.sh", 1, norm(line), 1)]
         hits, _, _ = judge(found, entries, [], dl)
+        hits = hits + check_allow_vs_denylist(found, entries)  # the real gate path (#4994)
         allowed += 1
         if hits:
             bad.append("allowed form went red: %s: %s" % (label, hits[0][:100]))
