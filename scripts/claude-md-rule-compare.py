@@ -20,19 +20,23 @@ The BASE guard (scripts/check-claude-md-size.py of the base checkout) and the BA
 This is TAMPERING EVIDENCE, not authority. The trailer is data an agent can also write, and the head also
 carries its own manifest, so the comparison deliberately uses the base one. What enforces is the two
 independent reviews and the sole merger. Fail closed: a missing, unreadable or symlinked base guard, base
-manifest or base CLAUDE.md is a failure. Bootstrap: pull_request_target runs only once this workflow is on the
-base branch, so the PR that introduces it is judged by review.
+manifest or base CLAUDE.md is a failure. The comparison runs only in isolated mode (`python3 -I`): the script
+directory is then not on the import path, so no file beside the script can stand in for a standard module, and
+the base guard is compiled from its source, never from a cached .pyc (#5163). Bootstrap: pull_request_target
+runs only once this workflow is on the base branch, so the PR that introduces it is judged by review.
 
 Python 3.9 standard library only.
 
-Usage:
-  claude-md-rule-compare.py --base-root DIR --repo DIR --base-sha SHA --head-sha SHA [--summary FILE]
-  claude-md-rule-compare.py --self-test
+Usage (the comparison refuses to run without -I):
+  python3 -I scripts/claude-md-rule-compare.py --base-root DIR --repo DIR --base-sha SHA --head-sha SHA
+      --scratch DIR [--summary FILE]
+  python3 -I scripts/claude-md-rule-compare.py --self-test
 """
 import argparse
 import difflib
 import importlib.util
 import os
+import py_compile
 import re
 import shutil
 import stat
@@ -83,17 +87,25 @@ def regular_file(path: Path, label: str) -> None:
         raise RuntimeError(f"{label} is a symlink or not a regular file")
 
 
+def load_source_module(name: str, path: Path):
+    """R5 (#5163): execute `path` compiled from its source bytes. A cached bytecode file beside it (an
+    unchecked-hash .pyc is loaded without comparing it to the source) is never consulted."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    code = compile(path.read_bytes(), str(path), "exec", dont_inherit=True)
+    exec(code, module.__dict__)  # noqa: S102 - trusted base code, compiled from source on purpose
+    return module
+
+
 def load_base_guard(base_root: Path):
-    """Import the BASE guard module (trusted code of the base commit)."""
+    """Import the BASE guard module (trusted code of the base commit), compiled from its source."""
     guard = base_root / GUARD_REL
     regular_file(guard, f"base guard {GUARD_REL}")
     regular_file(base_root / MANIFEST_REL, f"base manifest {MANIFEST_REL}")
     regular_file(base_root / "CLAUDE.md", "base CLAUDE.md")
-    spec = importlib.util.spec_from_file_location("base_claude_md_guard", guard)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("cannot load the base guard")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = load_source_module("base_claude_md_guard", guard)
     for name in ("rule_section_hashes", "load_manifest", "check", "read_utf8", "fence_scan"):
         if not hasattr(module, name):
             raise RuntimeError(f"the base guard has no {name}; it cannot judge this pull request")
@@ -233,11 +245,17 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
 
 
 def run(args) -> int:
+    if not sys.flags.isolated:
+        # R5 (#5163): without -I the script directory heads sys.path, so a file there named like a standard
+        # module would run instead of it. Fail closed rather than judge with code nobody reviewed as a guard.
+        print("## CLAUDE.md rule-change comparison\n\nRESULT: FAIL (closed) - run the comparison as "
+              "`python3 -I scripts/claude-md-rule-compare.py` (isolated mode)")
+        return 1
     scratch = Path(args.scratch)
     try:
         scratch.mkdir(parents=True, exist_ok=True)
         report, failed = compare(Path(args.base_root), Path(args.repo), args.base_sha, args.head_sha, scratch)
-    except (RuntimeError, OSError, UnicodeDecodeError, ValueError) as exc:
+    except (RuntimeError, OSError, UnicodeDecodeError, ValueError, SyntaxError) as exc:
         report, failed = f"## CLAUDE.md rule-change comparison\n\nRESULT: FAIL (closed) - {exc}\n", True
     print(report)
     if args.summary:
@@ -282,12 +300,11 @@ def commit_all(root: Path, message: str) -> str:
 def self_test() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     guard_path = repo_root / GUARD_REL
-    spec = importlib.util.spec_from_file_location("sibling_guard", guard_path)
-    if spec is None or spec.loader is None:
-        print("FAIL: self-test - cannot load the sibling guard", file=sys.stderr)
+    try:
+        guard = load_source_module("sibling_guard", guard_path)
+    except (RuntimeError, OSError, SyntaxError, ValueError) as exc:
+        print(f"FAIL: self-test - cannot load the sibling guard: {exc}", file=sys.stderr)
         return 1
-    guard = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(guard)
     refusal = guard.scratch_base_error(repo_root)
     if refusal:
         print(refusal, file=sys.stderr)
@@ -393,6 +410,38 @@ def self_test() -> int:
     for rel in TRUSTED_PATHS:
         case(f"a change to {rel} is reported and needs the trailer (R4)", trusted_write(rel), True,
              f"GUARD CHANGED: {rel}")
+
+    def weakened_pyc(root):
+        # #5163: an unchecked-hash .pyc of a guard that reports every section as pinned; the source is untouched.
+        source = (root / GUARD_REL).read_text(encoding="utf-8") + (
+            "\n_real_hashes = rule_section_hashes\n\n\n"
+            "def rule_section_hashes(text):\n"
+            "    hashes, dups = _real_hashes(text)\n"
+            "    pins = load_manifest(Path(__file__).resolve().parent.parent)[1]\n"
+            "    return {k: pins.get(k, v) for k, v in hashes.items()}, dups\n")
+        weak = root / "weak-guard-source.py"
+        weak.write_text(source, encoding="utf-8")
+        cfile = Path(importlib.util.cache_from_source(str(root / GUARD_REL)))
+        cfile.parent.mkdir(parents=True, exist_ok=True)
+        py_compile.compile(str(weak), cfile=str(cfile), doraise=True,
+                           invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+        weak.unlink()
+
+    case("a cached .pyc beside the base guard is never loaded (R5, #5163)", reword, True, "RULE TEXT CHANGED",
+         base_mutate=weakened_pyc)
+
+    def isolated_refusal():
+        # #5163: without -I the script directory heads sys.path, so the comparison itself must refuse to run.
+        result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--base-root", ".", "--repo", ".",
+                                 "--base-sha", "0" * 40, "--head-sha", "0" * 40, "--scratch", str(base_dir / "iso")],
+                                capture_output=True, text=True, check=False)
+        return result.returncode == 1 and "isolated mode" in result.stdout
+
+    if isolated_refusal():
+        print("PASS: self-test - a comparison run without -I fails closed (R5, #5163)")
+    else:
+        failures.append("non-isolated run")
+        print("FAIL: self-test - a comparison run without -I did not fail closed (R5, #5163)", file=sys.stderr)
 
     def rename_guard(root):
         subprocess.run(["git", "-C", str(root), "mv", GUARD_REL, GUARD_REL + ".old"], check=True)

@@ -1756,12 +1756,12 @@ COMPARE_WORKFLOW_LINES = (
     "PR_NUMBER: ${{ github.event.pull_request.number }}",
     'run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"',
     "- name: Comparison self-test (base code)",
-    "run: python3 scripts/claude-md-rule-compare.py --self-test",
+    "run: python3 -I scripts/claude-md-rule-compare.py --self-test",
     "- name: Compare the head rule sections with the base manifest",
     "env:",
     "BASE_SHA: ${{ github.event.pull_request.base.sha }}",
     "HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
-    'run: python3 scripts/claude-md-rule-compare.py --base-root . --repo . --base-sha "$BASE_SHA" '
+    'run: python3 -I scripts/claude-md-rule-compare.py --base-root . --repo . --base-sha "$BASE_SHA" '
     '--head-sha "$HEAD_SHA" --scratch "$RUNNER_TEMP/rule-compare" --summary "$GITHUB_STEP_SUMMARY"',
 )
 # R4 (#4507): the indentation of each meaningful line, so a key moved out of its block (for example
@@ -2012,7 +2012,7 @@ def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
     ok &= case("R3-F3 branch removed", good.replace(', "rehearsal/**"]', "]", 1), "differs from the pinned form")
     ok &= case("R3-F3 unpinned action", good.replace("@11d5960a326750d5838078e36cf38b85af677262", "@v4", 1), "pinned")
     ok &= case("R3-F3 step removed", good.replace(
-        "      - name: Comparison self-test (base code)\n        run: python3 scripts/claude-md-rule-compare.py --self-test\n", "", 1),
+        "      - name: Comparison self-test (base code)\n        run: python3 -I scripts/claude-md-rule-compare.py --self-test\n", "", 1),
         "meaningful lines")
     ok &= case("R3-F3 extra step", good + "      - run: python3 CLAUDE.md\n", "meaningful lines")
     ok &= case("R3-F3 swallowed failure", good.replace(
@@ -2026,6 +2026,12 @@ def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
         "types: [opened, synchronize, reopened, edited]", "types: [synchronize]", 1), "differs from the pinned form")
     ok &= case("R5 types line removed (default types skip edited)", good.replace(
         "    types: [opened, synchronize, reopened, edited]\n", "", 1), "meaningful lines")
+    ok &= case("R5 compare run without -I (a sibling module could shadow the standard library, #5163)", good.replace(
+        "python3 -I scripts/claude-md-rule-compare.py --base-root", "python3 scripts/claude-md-rule-compare.py --base-root", 1),
+        "differs from the pinned form")
+    ok &= case("R5 compare self-test run without -I (#5163)", good.replace(
+        "python3 -I scripts/claude-md-rule-compare.py --self-test", "python3 scripts/claude-md-rule-compare.py --self-test", 1),
+        "differs from the pinned form")
     ok &= case("R4 checkout impostor sha", good.replace(
         "@11d5960a326750d5838078e36cf38b85af677262", "@" + "1" * 40, 1), "pinned checkout action")
     ok &= case("R4 persist-credentials moved out of with:", good.replace(
