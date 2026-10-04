@@ -567,7 +567,8 @@ def stale_citation_errors(root: Path) -> list:
                         f"FAIL: {path.relative_to(root)}:{line} links CLAUDE.md#{match.group(1)}, which moved to a "
                         "docs/reference file; cite the reference file (#4507 R4)")
             for match in CLAUDE_CITATION.finditer(text):
-                if match.group(1).strip() in moved:
+                # #5181: the pattern ignores case, so the heading comparison does too.
+                if match.group(1).strip().casefold() in {sub.casefold() for sub in moved}:
                     line = text.count("\n", 0, match.start()) + 1
                     errors.append(
                         f"FAIL: {path.relative_to(root)}:{line} cites CLAUDE.md {match.group(1).strip()!r}, "
@@ -1293,6 +1294,8 @@ def run_citation_cases(fresh) -> bool:
     for label, form, want in (
             ("upper-case file name", 'See CLAUDE.MD section "{h}".', True),
             ("the word rule", 'See CLAUDE.md rule "{h}".', True),
+            # #5181: CLAUDE_CITATION ignores case, so the heading comparison does too (probe P-G11).
+            ("lower-case heading text", 'See CLAUDE.md "{h}".'.replace("{h}", heading.lower()), True),
             ("upper-case anchor", "See CLAUDE.md#KEY-MODULES.", True),
             ("anchor of a heading with punctuation and an em dash",
              "See CLAUDE.md#config-schema-v07x-1146--sectioned-llm--embeddings--reranker--storage--limits.", True),
