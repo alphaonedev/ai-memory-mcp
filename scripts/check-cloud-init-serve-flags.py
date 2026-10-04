@@ -2272,17 +2272,30 @@ def nameref_facts(texts: list):
     share one value, and an assignment through the nameref writes the target, so every
     name in an -n declaration, and every name assigned to a nameref, has a value the gate
     cannot read. A target built from an expansion can be any name: then no name is
-    resolved (poisoned, fail closed)."""
+    resolved (poisoned, fail closed). Bash removes quotes and backslashes before the
+    builtin reads its words, so the words are read without them; an option word that
+    holds an expansion can be -n (poisoned, #5323)."""
     refs, names, poisoned = set(), set(), False
-    for text in texts:
-        for m in re.finditer(r"(?<![\w$./-])(?:declare|typeset|local)((?:\s+[-+][A-Za-z]+)*)\s*([^;&|\n]*)", text):
-            if not any(f.startswith("-") and "n" in f for f in m.group(1).split()):
+    plain = [re.sub(r"[\"'\\]", "", text) for text in texts]
+    for text in plain:
+        for m in re.finditer(r"(?<![\w$./-])(?:declare|typeset|local)(?![\w-])([^;&|\n]*)", text):
+            words, nameref, i = m.group(1).split(), False, 0
+            while i < len(words) and (words[i][:1] in "-+" or re.search(r"[$`]", words[i].split("=", 1)[0])):
+                if words[i] == "--":
+                    i += 1
+                    break
+                if re.search(r"[$`]", words[i]):
+                    nameref = poisoned = True
+                elif words[i].startswith("-") and "n" in words[i]:
+                    nameref = True
+                i += 1
+            if not nameref:
                 continue
-            body = m.group(2)
-            refs.update(re.findall(r"(?<![\w$-])([A-Za-z_]\w*)", body.split("=", 1)[0]))
-            names.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", body))
-            poisoned = poisoned or "$" in body or "`" in body
-    for text in texts:
+            refs.update(re.findall(r"(?<![\w$-])([A-Za-z_]\w*)", " ".join(words[i:]).split("=", 1)[0]))
+            for w in words[i:]:
+                names.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", w))
+                poisoned = poisoned or "$" in w or "`" in w
+    for text in plain:
         for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)(?:\[[^]]*\])?\+?=(\S*)", text):
             if m.group(1) in refs:
                 names.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", m.group(2)))
@@ -2896,6 +2909,11 @@ def build_probes() -> list:
         ('nameref declared before its target behind taskset, listed (#4837 R12 R4, #5174)', [(dec, '      declare -n R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
         ('target written through a nameref behind taskset, listed (#4837 R12 R4, #5174)', [(dec, '      A=/usr/bin/true; declare -n R; R=A; R=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$A" --db /x stats\n' + dec)]),
         ('nameref whose target is an expansion behind taskset, listed (#4837 R12 R4, #5174)', [(dec, '      T=A; A=/usr/local/lib/ai-memory/bin/ai-memory; declare -n R="$T"; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('nameref declared by a quoted builtin name behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      "declare" -n R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('nameref declared by an escaped builtin name behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      d\\eclare -n R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('nameref declared with a quoted -n behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      typeset \'-n\' R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('nameref declared with an escaped -n in a function behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      f() { local \\-n R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats; }; f\n' + dec)]),
+        ('nameref declared by an expanded option behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      F=n; declare -$F R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
         ('ai-memory through a variable behind taskset, listed (#4837 R12 R4)', [(dec, '      AIM=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$${AIM}" --db $${X} stats\n' + dec)]),
         ('shell run by an unknown wrapper, listed (#4837 R12 R4)', [(dec, "      taskset -c 0 sh -c '/usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats'\n" + dec)]),
         ('ai-memory copied to another name with cp, listed (#4837 R12 R4)', [(dec, '      cp /usr/local/lib/ai-memory/bin/ai-memory /usr/local/bin/aim\n' + dec)]),
