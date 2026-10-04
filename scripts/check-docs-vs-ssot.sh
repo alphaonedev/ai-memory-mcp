@@ -2901,6 +2901,10 @@ v52</span></em></strong>)</p>
 53 on both backends.</p>
 See CURRENT_SCHEMA_VERSION
 <p>52 tools ship here.</p>
+<p>See CURRENT_SCHEMA_VERSION</p>
+52 tools ship today.
+<p>a</p><p>The CURRENT_SCHEMA_VERSION is
+52 on both backends.</p>
 R4HTML
     # #5196: every block tag, opening and closing, stops the look-back; every inline or
     # in-row tag does not. One triple per tag (subject, tag-only line, value). block-fixture.html
@@ -2961,6 +2965,7 @@ R4HTML
         'docs/block-control.html:45 claims "52"' \
         'docs/schema-fixture.html:79 claims "52"' \
         'docs/schema-fixture.html:83 claims "52"' \
+        'docs/schema-fixture.html:91 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:41 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:43 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:45 claims "52"' \
@@ -2985,7 +2990,7 @@ R4HTML
         'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 ' 'docs/schema-fixture.html:46 ' \
         'docs/schema-fixture.html:52 ' 'docs/schema-fixture.html:62 ' 'docs/schema-fixture.html:68 ' \
         'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' \
-        'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 ' \
+        'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 ' 'docs/schema-fixture.html:89 ' \
         'docs/postgres-age-guide.md:42 ' 'docs/postgres-age-guide.md:44 ' 'docs/postgres-age-guide.md:46 ' \
         'docs/postgres-age-guide.md:48 ' 'docs/postgres-age-guide.md:50 ' 'docs/postgres-age-guide.md:51 ' \
         'docs/postgres-age-guide.md:52 ' 'docs/postgres-age-guide.md:53 '
@@ -2997,7 +3002,7 @@ R4HTML
     echo "PASS: self-test #4511-R5 - wrapped claim with an issue ref / release triple in the subject tail, whitespace at the wrap point, and a tag-only middle line: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5140 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, any case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
-    echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag); a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
+    echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag, and when the previous line ends with a closing block tag and the next line carries no tag); a closing tag in the MIDDLE of the previous line does not cut a claim wrapped inside the next paragraph; a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
     echo "PASS: self-test #5200 - ident-less anchors (Current schema = vN, re-stamped to v1.0.0 (schema vN)) match a markdown claim with doubled spaces or a tab: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5261 - markdown steps anchor wrapped in bold or a code span (steps **v40 -> v52**, a backtick span): planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
