@@ -1643,15 +1643,15 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
         from_base2("copy1")
         (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n" % (ok_line, pl))
         (t / "w.sh").write_text("#!/bin/bash\n%s\n" % pl)
-        rows([("a.sh", ok_line), ("w.sh", pl)], [("a.sh", pl)])
+        rows([("a.sh", ok_line), ("c.sh", pl), ("w.sh", pl)], [("a.sh", pl)])
         commit_all("copy the pending line into an allowing file")
         git("update-ref", step1, "HEAD")
         if gate(EXEC_SECRET_ARGV_BASE=base2)[0] != 1:
             bad.append("run() let a pending line be allowed as a copy in another file (#5295)")
         (t / "a.sh").write_text("#!/bin/bash\n%s\n" % ok_line)
         (t / "w.sh").write_text("#!/bin/bash\n%s\n%s\n" % (pl, pl))
-        (t / ALLOW_FILE).write_text("reason: self-test | a.sh | 1 | %s\nreason: self-test | w.sh | 2 | %s\n"
-                                    % (ok_line, pl))
+        (t / ALLOW_FILE).write_text("reason: self-test | a.sh | 1 | %s\nreason: self-test | c.sh | 1 | %s\n"
+                                    "reason: self-test | w.sh | 2 | %s\n" % (ok_line, pl, pl))
         (t / PENDING_FILE).write_text("")
         commit_all("move the pending line into the allowing file")
         git("update-ref", step2, "HEAD")
