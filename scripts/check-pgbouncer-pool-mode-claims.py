@@ -564,9 +564,7 @@ def read_lines(path: Path) -> Iterator[str]:
                 yield line.splitlines()[0] if line.splitlines() else ""
             if not chunk:
                 break
-            chunk = handle.read(CHUNK_BYTES)
-        if carry:
-            yield carry
+            chunk = handle.read(CHUNK_BYTES)  # the final empty read flushes the decoder and keeps no carry
 
 
 def scan_detail(root: Path) -> Tuple[List[Unit], int, Dict[str, str]]:
@@ -864,6 +862,8 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("zero-width inside the mode word", "docs/a.md", "Run PgBouncer in trans\u200baction mode.\n"),
     ("cyrillic look-alike in the mode word", "docs/a.md", "Run PgBouncer in tr\u0430nsaction mode.\n"),
     ("fullwidth letter in the mode word", "docs/a.md", "Run PgBouncer in \uff54ransaction mode.\n"),
+    ("look-alikes in every pool and mode word (three per word: past the key-word fold)", "docs/a.md",
+     "Set the p\u043e\u043el\u0435r to tr\u0430ns\u0430cti\u043en.\n"),
     ("soft hyphen in the mode word", "docs/a.md", "Run PgBouncer in trans\u00adaction mode.\n"),
     # round 5 (#4741 closed world): the value is a variable, a default elsewhere or a template, never the literal session
     ("R8 terraform variable named pgb_mode (default on another line)", "deploy/main.tf", "variable \"pgb_mode\" {\n  type = string\n}\n"),
@@ -975,7 +975,42 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
     one = "Transaction mode is not supported.\n"
     dup = "Transaction mode is not supported.\nx\nTransaction mode is not supported.\n"
     rev = "Transaction mode is not supported (#4667).\nThat changed: it is now the recommended setting.\n"
+    # round 5 reviews (#5089): R7 binds every part of the neighbourhood; each sub-rule has a pinning case
+    para0 = "Transaction mode is not supported (#4667).\na\nb\nc\nd\n"
+    para1 = para0.replace("c\n", "It is now recommended.\n")
+    far0 = "Transaction mode is not supported (#4667).\n\nOld note.\n"
+    far1 = far0.replace("Old note.", "It is now recommended.")
+    pr0 = "PgBouncer session mode is supported, or\nstatement.\n\nx\ny\nz\n"
+    pr1 = pr0.replace("y\n", "It is now recommended.\n")
+    pr_allow = REASON + ent("docs/a.md", pr0, "pgbouncer session mode is supported, or") + ent(
+        "docs/a.md", pr0, "pgbouncer session mode is supported, or statement.")
+    sep0 = "x\nab\nTransaction mode is not supported (#4667).\nc\n"
+    sep1 = "x\na\nTransaction mode is not supported (#4667).\nbc\n"
+    ord0 = "x1\nx2\nTransaction mode is not supported (#4667).\n"
+    ord1 = "x2\nx1\nTransaction mode is not supported (#4667).\n"
     out += [
+        ("R7: an edit in the paragraph beyond the two neighbours makes the entry stale (#5088)",
+         tree({"docs/a.md": para1}, REASON + ent("docs/a.md", para0, "transaction mode is not supported (#4667).")), EXIT_FAULT),
+        ("R7: an edit to a neighbour across a blank line makes the entry stale (#5087)",
+         tree({"docs/a.md": far1}, REASON + ent("docs/a.md", far0, "transaction mode is not supported (#4667).")), EXIT_FAULT),
+        ("R7: an edit next to the far line of a pair makes the pair entry stale (#5087)",
+         tree({"docs/a.md": pr1}, pr_allow), EXIT_FAULT),
+        ("R7: the pair entry passes while its neighbourhood is unchanged", tree({"docs/a.md": pr0}, pr_allow), EXIT_OK),
+        ("R7: moving a line break between context lines changes the fingerprint (#5087)",
+         tree({"docs/a.md": sep1}, REASON + ent("docs/a.md", sep0, "transaction mode is not supported (#4667).")), EXIT_FAULT),
+        ("R7: reordering the neighbours makes the entry stale (#5087)",
+         tree({"docs/a.md": ord1}, REASON + ent("docs/a.md", ord0, "transaction mode is not supported (#4667).")), EXIT_FAULT),
+        ("R7: text after the fingerprint fails", tree(retired, REASON + retired_entry.replace("\n", " x\n")), EXIT_FAULT),
+        ("a reason of two words repeated fails (#4961)",
+         tree(retired, "# reviewed history reviewed history reviewed history\n" + retired_entry), EXIT_FAULT),
+        ("a NUL byte past the first read chunk fails closed (#5086)",
+         tree({"docs/n.md": ("x" * 99 + "\n") * 11000 + "\0\n"}), EXIT_FAULT),
+        ("a BOM-less UTF-16LE file with a third NULs is decoded and judged",
+         tree({"docs/u.txt": ("Run PgBouncer in transaction mode. " + "\u4e2d" * 20 + "\n").encode("utf-16-le")}), EXIT_FINDING),
+        ("a UTF-16 file with a BOM and few NULs is decoded and judged",
+         tree({"docs/u.txt": ("\u4e2d" * 200 + "\nRun PgBouncer in transaction mode.\n").encode("utf-16")}), EXIT_FINDING),
+        ("a path listed twice on the skip list fails",
+         tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}, unread=UNREAD_REASON + "docs/z.md.gz\ndocs/z.md.gz\n"), EXIT_FAULT),
         ("agreeing tree passes", tree(), EXIT_OK),
         ("session prose alone is not approved", tree({"docs/a.md": "PgBouncer session mode is supported.\n"}), EXIT_FINDING),
         ("session prose passes once allowlisted with a reason",
@@ -1216,6 +1251,23 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("round-4 S2 skip .ini", SKIP, SKIP[:-1] + " or rel.endswith('.ini'):"),
     ("round-4 S9 skip deploy/", SKIP, SKIP[:-1] + " or rel.startswith('deploy/'):"),
     ("guide pin", "    if not guide_ok:\n", "    if False:\n"),
+    # round 5 reviews (#5089): the sub-rules the round-5 range added, each with a pinning case above
+    ("R7 context reads the paragraph", "for k in idx for j in set(_neighbours(lines, k)) | set(_paragraph(lines, k))}",
+     "for k in idx for j in set(_neighbours(lines, k))}"),
+    ("R7 context reads the neighbours", "for k in idx for j in set(_neighbours(lines, k)) | set(_paragraph(lines, k))}",
+     "for k in idx for j in set(_paragraph(lines, k))}"),
+    ("R7 context reads every line of a pair", "near = sorted({j for k in idx for", "near = sorted({j for k in idx[:1] for"),
+    ("R7 context lines joined with a separator", 'hashlib.sha256("\\n".join(lines[j]', 'hashlib.sha256("".join(lines[j]'),
+    ("R7 context keeps line order", '"\\n".join(lines[j] for j in near)', '"\\n".join(sorted(lines[j] for j in near))'),
+    ("R7 ctx ends the entry", 'CTX = re.compile(r" \\| ctx:([0-9a-f]{12})$")', 'CTX = re.compile(r" \\| ctx:([0-9a-f]{12})")'),
+    ("F1 BOM-less UTF-16 NUL share", "if len(zeros) * 4 >= min(len(head), CHUNK_BYTES) > 0:",
+     "if len(zeros) * 2 >= min(len(head), CHUNK_BYTES) > 0:"),
+    ("F1 UTF-16 BOM", 'if head[:2] in (b"\\xff\\xfe", b"\\xfe\\xff"):', "if False:"),
+    ("F1 NUL bytes in every chunk", '            if utf8 and b"\\0" in chunk:',
+     '            if utf8 and b"\\0" in chunk and handle.tell() <= CHUNK_BYTES:'),
+    ("F1 skip list path listed once", 'if " " in line or problem or line in listed:', 'if " " in line or problem:'),
+    ("A1 distinct-word floor", "MIN_DISTINCT_WORDS = 5", "MIN_DISTINCT_WORDS = 1"),
+    ("U3 look-alike table", ".translate(CONFUSABLE)", ""),
     ('H skip list decode error is a fault', '    except (OSError, UnicodeDecodeError) as exc:  # R5: a decode error is a FAULT (rc 2), not a traceback\n        return {}, [', '    except OSError as exc:  # R5: a decode error is a FAULT (rc 2), not a traceback\n        return {}, ['),
     ('H allowlist decode error is a fault', '    except (OSError, UnicodeDecodeError) as exc:\n        return [], ["%s: unreadable', '    except OSError as exc:\n        return [], ["%s: unreadable'),
     ('H template decode error is a fault', '    except (OSError, UnicodeDecodeError) as exc:\n        return "cannot read %s', '    except OSError as exc:\n        return "cannot read %s'),
