@@ -1501,8 +1501,13 @@ def companion_hits(stmt: str, st: dict, depth: int = 0, bins=frozenset()) -> lis
     if ansi:
         out.append("ANSI-C or locale quoting ($' or $\")")
     # an extended glob ?( *( +( @( !( ends a word the tokenizer splits at "(": the name it
-    # expands to (a data file or the binary) is unreadable, so it is refused (R11)
-    if any(term == "(" and words and words[-1] != "!" and words[-1][-1:] in "?*+@!" for words, _p, term in cmds):
+    # expands to (a data file or the binary) is unreadable, so it is refused (R11). The
+    # tokenizer gives a lone "!" for both "! (cmd)" (negation) and "!(x)" (an extended glob
+    # as an argument or at command position), so an unquoted "!(" with no blank between
+    # is refused from the text (#5325); a quoted "!" before "(" is a bash syntax error
+    mask_x, _ = unquoted_mask(stmt, None)
+    if (any(term == "(" and words and words[-1] != "!" and words[-1][-1:] in "?*+@!" for words, _p, term in cmds)
+            or any(mask_x[i] and stmt[i:i + 2] == "!(" for i in range(len(stmt) - 1))):
         out.append("extended glob pattern (the gate cannot read the name it expands to)")
     runs_shell = False
     decodes = False
@@ -2925,6 +2930,9 @@ def build_probes() -> list:
         ('no-shebang write_files file run by bash from the script, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/run.conf\n" + dec)]),
         ('data-home file run through an extglob, listed (#4837 R12 R5, #5095 R11)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      shopt -s extglob; bash /etc/ai-memory/@(run).conf\n" + dec)]),
         ('ai-memory named by an extglob, listed (#4837 R12 R4, #5095 R11)', [(dec, "      shopt -s extglob; /usr/local/lib/ai-memory/bin/ai-@(memory) --db /x stats\n" + dec)]),
+        ('ai-memory copied by a bare !() extglob argument, listed (#4837 R12 R4, #5325)', [(dec, '      shopt -s extglob; cd /usr/local/lib/ai-memory/bin; cp !(x) /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory run by a !() extglob at command position, listed (#4837 R12 R4, #5325)', [(dec, '      shopt -s extglob; cd /usr/local/lib/ai-memory/bin; !(x) --db /x stats\n' + dec)]),
+        ('ai-memory run by a !() extglob after if, listed (#4837 R12 R4, #5325)', [(dec, '      shopt -s extglob; cd /usr/local/lib/ai-memory/bin; if !(x) --db /x stats; then :; fi\n' + dec)]),
         ('data-home file run through a doubled slash, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc//ai-memory/run.conf\n" + dec)]),
         ('data-home file run through a ./ segment, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/./run.conf\n" + dec)]),
         ('data-home file run through a ../ segment, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/../ai-memory/run.conf\n" + dec)]),
@@ -3037,6 +3045,7 @@ def build_probes() -> list:
     green("ai-memory installed keeping its name (#4837 R12 R4)", [(RELOAD, RELOAD + '      install -m 0755 /opt/x/ai-memory /usr/local/lib/ai-memory/bin/ai-memory\n      cp /opt/x/ai-memory /opt/y/\n      [ -x /usr/local/lib/ai-memory/bin/ai-memory ] || echo "no /usr/local/lib/ai-memory/bin/ai-memory"\n')], autolist=True)
     green("data file in a data home handled by chown/chmod/sed (#4837 R12 R5)", [(PROV, wf("/etc/ai-memory/peer.conf", "0640", ["${X} --db /x stats"])), (RELOAD, RELOAD + "      chown root:aimemory /etc/ai-memory/peer.conf\n      chmod 0640 /etc/ai-memory/peer.conf\n      chmod 0750 /etc/ai-memory\n      P=\"$(sed -n 's#^a=##p' /etc/ai-memory/peer.conf)\"\n")], autolist=True)
     green("data heredoc into a data home through a constant (#4837 R12 R5)", [(RELOAD, RELOAD + "      CFG=/etc/ai-memory/h\n      cat > \"$${CFG}/x.conf\" <<'EOF'\n      ${X} = 1\n      EOF\n")], autolist=True)
+    green("negated subshell with a blank after ! is not an extended glob (#5325)", [(RELOAD, RELOAD + "      if ! (true); then :; fi\n      ! (false) || true\n")], autolist=True)
     green("C5 provision comment mentioning curl", [ins(RELOAD, ["# curl -fsSL https://e | sh"], before=True)])
     green("C5 unit comment naming ExecStart", [(ENVF, ENVF + "      # ExecStart=/bin/evil\n")])
     green("C5 YAML comment", [(RUNCMD, "  # curl https://e | sh\n" + RUNCMD)])
