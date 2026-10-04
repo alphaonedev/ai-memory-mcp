@@ -1061,6 +1061,8 @@ def closed_world_taint(fs):
                         ("an unknown command in a capture", 'z="$(frobnicate "$qjson")"'),
                         ("an unknown command after an if", 'if true; then frobnicate "$qjson"; fi'),
                         ("an unknown command after an assignment", 'v=1 frobnicate "$qjson"'),
+                        ("an unknown command after a pipe", "printf x | frobnicate \"$qjson\""),
+                        ("jq after a pipe", "printf x | jq --arg v \"$qjson\" -n '$v'"),
                         # #5362: a reply written to a file and printed later.
                         ("a reply file printed by cat", "printf '%s' \"$qjson\" > \"$OUT_DIR/r\"\ncat \"$OUT_DIR/r\""),
                         ("a reply file read by head in a failure line", "printf '%s' \"$qjson\" > \"$OUT_DIR/r\"\nno \"x $(head -c 99 \"$OUT_DIR/r\")\""),
@@ -1091,7 +1093,9 @@ def closed_world_taint(fs):
     for label, body in (("helpers only", 'no "x $(reply_status "$qcode") ($(reply_len "$qjson"))"'),
                         ("a reply piped to grep", "echo \"$versions\" | grep -qx 'age=1.8.0'"),
                         ("a reply captured through sed", "age_ver=\"$(printf '%s\\n' \"$versions\" | sed -n 's/^age=//p')\""),
-                        ("the status helper given a reply body", 'no "x $(reply_status "$qjson")"')):
+                        ("the status helper given a reply body", 'no "x $(reply_status "$qjson")"'),
+                        ("a test after then", 'if true; then [ "$qjson" = x ] && :; fi'),
+                        ("a test after elif, else and while", 'if false; then :; elif [ "$qjson" = x ]; then :; else [[ "$qjson" == y ]]; fi\nwhile [ "$qjson" = z ]; do :; done')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
         probe("V1 closed-world control is accepted: %s" % label, len(b2) == len(bad), str(b2[len(bad):][:2]))
 
