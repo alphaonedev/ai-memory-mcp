@@ -1496,6 +1496,10 @@ def companion_hits(stmt: str, st: dict, depth: int = 0, bins=frozenset()) -> lis
     out = []
     if ansi:
         out.append("ANSI-C or locale quoting ($' or $\")")
+    # an extended glob ?( *( +( @( !( ends a word the tokenizer splits at "(": the name it
+    # expands to (a data file or the binary) is unreadable, so it is refused (R11)
+    if any(term == "(" and words and words[-1] != "!" and words[-1][-1:] in "?*+@!" for words, _p, term in cmds):
+        out.append("extended glob pattern (the gate cannot read the name it expands to)")
     runs_shell = False
     decodes = False
     for words, pipe_in, term in cmds:
@@ -2845,6 +2849,8 @@ def build_probes() -> list:
         ('ai-memory installed under another name, listed (#4837 R12 R4)', [(dec, '      install -m 0755 /usr/local/lib/ai-memory/bin/ai-memory /usr/local/bin/aim\n' + dec)]),
         ('ai-memory moved to another name through a variable, listed (#4837 R12 R4)', [(dec, '      AIM=/usr/local/lib/ai-memory/bin/ai-memory; mv "$${AIM}" /usr/local/bin/aim\n' + dec)]),
         ('no-shebang write_files file run by bash from the script, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/run.conf\n" + dec)]),
+        ('data-home file run through an extglob, listed (#4837 R12 R5, #5095 R11)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      shopt -s extglob; bash /etc/ai-memory/@(run).conf\n" + dec)]),
+        ('ai-memory named by an extglob, listed (#4837 R12 R4, #5095 R11)', [(dec, "      shopt -s extglob; /usr/local/lib/ai-memory/bin/ai-@(memory) --db /x stats\n" + dec)]),
         ('data-home file run through a doubled slash, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc//ai-memory/run.conf\n" + dec)]),
         ('data-home file run through a ./ segment, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/./run.conf\n" + dec)]),
         ('data-home file run through a ../ segment, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/../ai-memory/run.conf\n" + dec)]),
