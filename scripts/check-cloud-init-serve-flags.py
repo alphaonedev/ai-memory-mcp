@@ -855,12 +855,48 @@ def tar_risky(args: list):
     return None
 
 
-def built_name_matches(val: str) -> bool:
+def mask_expansions(val: str) -> str:
+    """val with each expansion ($NAME, ${..}, $(..), $((..)), backticks, $@ ...) replaced by
+    one U+0001 mark, which stands for any text (#5094)."""
+    out, i, n = [], 0, len(val)
+    while i < n:
+        c = val[i]
+        if c == "`":
+            j = val.find("`", i + 1)
+            i = n if j < 0 else j + 1
+            out.append("\x01")
+            continue
+        if c == "$" and i + 1 < n:
+            d = val[i + 1]
+            if d in "({":
+                close, depth, j = (")" if d == "(" else "}"), 0, i + 1
+                while j < n:
+                    if val[j] == d:
+                        depth += 1
+                    elif val[j] == close:
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                i = j + 1
+                out.append("\x01")
+                continue
+            m = re.match(r"[A-Za-z_]\w*|[0-9@*#?$!-]", val[i + 1:])
+            if m is not None:
+                i += 1 + m.end()
+                out.append("\x01")
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def built_name_matches(val: str, globs: bool = True) -> bool:
     """True when a word the shell builds (a brace or glob) can expand to a path whose
     basename is ai-memory (fail closed, #5093). Braces are expanded first, so a brace that
     holds a slash is read whole; a range, or more than 64 words, counts as any text."""
-    alts, rounds = [val], 0
-    while rounds < 16 and any(re.search(r"\{[^{}]*\}", a) for a in alts):
+    alts, rounds = [mask_expansions(val)], 0
+    while globs and rounds < 16 and any(re.search(r"\{[^{}]*\}", a) for a in alts):
         rounds += 1
         nxt = []
         for a in alts:
@@ -876,19 +912,69 @@ def built_name_matches(val: str) -> bool:
         if len(alts) > 64:
             return True
     for a in alts:
-        pat = re.sub(r"\[[^]]*\]?|\*", "\0", posixpath.basename(a))
-        pat = "".join(".*" if c == "\0" else ("." if c == "?" else re.escape(c)) for c in pat)
+        pat = re.sub(r"\[[^]]*\]?|\*|\x01" if globs else r"\x01", "\0", posixpath.basename(a))
+        pat = "".join(".*" if c == "\0" else ("." if c == "?" and globs else re.escape(c)) for c in pat)
         if re.fullmatch(pat, "ai-memory", re.S) is not None:
             return True
     return False
+
+
+# commands and keywords that never run an operand: they print it, fetch it as a URL, or
+# match or loop over it as text, so a bare unresolved expansion is safe there (#5094)
+PRINT_ONLY = {"echo", "printf", "curl", "for", "case", "select"}
+
+
+class VarFacts(frozenset):
+    """The tracked binary names (the set) plus .resolved: the names whose every value the
+    gate can read (#5094). None means unknown, and then no name is resolved."""
+    resolved = None
+
+
+def bare_operand_problem(words: list, idx, bins):
+    """#5094 closed world: an operand that is one bare expansion ("$X", ${X}, $(..)) of a
+    command that may run it must have a value the gate can read. A named variable that is
+    only set by a substitution, read, mapfile, printf -v, getopts, a loop over such a
+    value, or never set in the template is unresolved, and so is a substitution itself.
+    Positional parameters resolve at the call site, whose operands this same rule reads."""
+    if idx is None:
+        return None
+    base = posixpath.basename(unquote(words[idx])[0])
+    if base in KNOWN_NONEXEC or base in PRINT_ONLY or base == "ai-memory":
+        return None
+    resolved = getattr(bins, "resolved", None) or frozenset()
+    k = idx + 1
+    while k < len(words):
+        w = words[k]
+        rm = REDIR_RE.match(w)
+        if rm is not None and not w.startswith(("<(", ">(")):
+            k += 1 if rm.group(1) else 2
+            continue
+        k += 1
+        val, exp = unquote(w)
+        if not exp or mask_expansions(val) != "\x01":
+            continue
+        m = re.match(r"\$\{?[#!]?([A-Za-z_]\w*)", val)
+        if m is None and re.match(r"\$\{?[#!]?[0-9@*#?$!-]", val):
+            continue
+        name = None if m is None else m.group(1)
+        if name is None or (name not in resolved and name not in bins):
+            return ("%r is an operand of %r whose value the gate cannot read (an unresolved expansion may "
+                    "name the ai-memory binary)" % (w[:40], base))
+    return None
 
 
 def binary_ref(w: str, bins, shells: bool = False) -> bool:
     """True when w is one word naming the ai-memory binary: its text's basename is
     ai-memory, or it is exactly the expansion of a variable the template assigns such
     a path to. With shells, a shell or interpreter name counts too (it can run one)."""
-    val = unquote(w)[0]
-    if re.search(r"\s", val):
+    val, exp = unquote(w)
+    # $B, ${B} and every operator form ${B%x}, ${B:-x}, ${#B}, ${!B}, ${B[0]} of a tracked
+    # name (#5094); checked before the space test, since an operator word may hold one
+    if any(re.fullmatch(r"\$" + re.escape(b) + r"|\$\{[#!]?" + re.escape(b) + r"(?:[^A-Za-z0-9_].*)?\}", val, re.S)
+           for b in bins):
+        return True
+    masked = mask_expansions(val) if exp else val
+    if re.search(r"\s", masked):
         return False
     # a data home (/etc/ai-memory) shares the binary's basename. It stays a binary
     # reference here (fail closed: a file can be installed at that path); running a
@@ -897,9 +983,15 @@ def binary_ref(w: str, bins, shells: bool = False) -> bool:
     if base == "ai-memory" or (shells and (base in SHELLS or INTERP_BASE_RE.match(base))):
         return True
     # only an unquoted glob or brace is expanded by the shell; a quoted one is literal text
-    if re.search(r"[*?\[{]", unquoted_chars(w)) and built_name_matches(val):
+    globs = re.search(r"[*?\[{]", unquoted_chars(w)) is not None
+    if globs and built_name_matches(val):
         return True
-    return any(val in ("$" + b, "${" + b + "}") for b in bins)
+    # a name built from an expansion (/dir/$N, ai-$V, ${D}ai-memory) may be ai-memory: each
+    # expansion stands for any text (#5094). A bare expansion with no slash and no literal
+    # text is the unresolved-variable case, decided by bare_operand_problem.
+    if exp and "\x01" in masked and ("/" in masked or re.search(r"[^\x01]", posixpath.basename(masked))):
+        return built_name_matches(val, globs)
+    return False
 
 
 def copy_problem(base: str, args: list, bins):
@@ -1330,6 +1422,9 @@ def companion_hits(stmt: str, st: dict, depth: int = 0, bins=frozenset()) -> lis
                 out.extend(companion_hits(sv, {}, depth + 1, bins))
         if not st.get("data") and not (idx is None and scripts):
             why = operand_problem(words, idx, bins)
+            if why is not None:
+                out.append(why)
+            why = bare_operand_problem(words, idx, bins)
             if why is not None:
                 out.append(why)
         if idx is None:
@@ -2054,13 +2149,66 @@ def classify(name: str, text: str):
 
 
 def binary_vars(stmts: list) -> frozenset:
-    """Names the template assigns a path whose basename is ai-memory (rule R4)."""
+    """Names the template may give the ai-memory binary's path (rule R4, #5094), to a
+    fixpoint: an assignment, export, local or declare whose value is a binary reference,
+    a substitution that names ai-memory (command -v, which, readlink, realpath ...) or
+    expands a tracked name; and a for-loop variable whose list holds such a word."""
     out = set()
+    assigns = []
+    unknown = set()
     for _w, stmt, _st in stmts:
-        for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)=(\S+)", tf_render(stmt)):
-            if posixpath.basename(unquote(m.group(2))[0].rstrip(";")) == "ai-memory":
-                out.add(m.group(1))
-    return frozenset(out)
+        text = tf_render(stmt)
+        assigns.extend((m.group(1), m.group(2), text[m.start(2):])
+                       for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)(?:\[[^]]*\])?\+?=(\S*)", text))
+        for m in re.finditer(r"(?:^|[\s;&|(])for\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*)", text):
+            assigns.extend((m.group(1), wd, wd) for wd in m.group(2).split())
+            assigns.append((m.group(1), m.group(2), m.group(2)))
+        for m in re.finditer(r"(?:^|[\s;&|(])(?:read|mapfile|readarray)\b([^;&|\n]*)", text):
+            unknown.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", m.group(1)))
+        unknown.update(re.findall(r"\bprintf\s+-v\s*([A-Za-z_]\w*)", text))
+        unknown.update(re.findall(r"\bgetopts\s+\S+\s+([A-Za-z_]\w*)", text))
+    while True:
+        n = len(out)
+        for name, word, rest in assigns:
+            if name in out:
+                continue
+            sub = re.match(r"""["']?(\$\(|`)""", rest)
+            if sub:
+                # the substitution's own text: up to its closing parenthesis or backtick
+                rest = rest[sub.start(1):]
+                depth, j = 0, 0
+                if rest.startswith("`"):
+                    j = rest.find("`", 1)
+                    rest = rest if j < 0 else rest[:j + 1]
+                else:
+                    for j, ch in enumerate(rest):
+                        depth += ch == "("
+                        depth -= ch == ")"
+                        if depth == 0 and ch == ")":
+                            rest = rest[:j + 1]
+                            break
+            if (binary_ref(word.rstrip(";"), frozenset(out))
+                    or (sub and re.search(r"(?<![\w.-])ai-memory(?![\w./-])", rest))
+                    or any(re.search(r"\$\{?[#!]?" + re.escape(b) + r"(?!\w)", rest if sub else word) for b in out)):
+                out.add(name)
+        if len(out) == n:
+            break
+    # resolved names, to a fixpoint: every value is literal text and every expansion in it
+    # is a positional parameter or a resolved name
+    names = {a[0] for a in assigns}
+    resolved = set()
+    while True:
+        n = len(resolved)
+        for name in names - resolved - unknown - out:
+            vals = [a[1] for a in assigns if a[0] == name]
+            if all("`" not in v and "$(" not in v
+                   and all(r in resolved for r in re.findall(r"\$\{?[#!]?([A-Za-z_]\w*)", v)) for v in vals):
+                resolved.add(name)
+        if len(resolved) == n:
+            break
+    facts = VarFacts(out)
+    facts.resolved = frozenset(resolved)
+    return facts
 
 
 def analyse(name: str, text: str, cache: dict):
@@ -2502,6 +2650,15 @@ def build_probes() -> list:
         ('tar abbreviated --to-com option, listed (#4837 R12 R4, #5093)', [(dec, '      tar -xf /x.tar --to-com=/usr/local/bin/x\n' + dec)]),
         ('find -exec copies its match, listed (#4837 R12 R4, #5093)', [(dec, '      find /usr/local/lib -type f -exec cp {} /usr/local/bin/aim \\;\n' + dec)]),
         ('cp under xargs, listed (#4837 R12 R4, #5093)', [(dec, '      ls /usr/local/lib/ai-memory/bin | xargs -I{} cp {} /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory found by command -v behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      B=$(command -v ai-memory); taskset -c 0 "$${B}" --db /x stats\n' + dec)]),
+        ('ai-memory through a variable alias behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      B=/usr/local/lib/ai-memory/bin/ai-memory; C="$${B}"; taskset -c 0 "$${C}" --db /x stats\n' + dec)]),
+        ('ai-memory through a variable operator behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      B=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$${B%.x}" --db /x stats\n' + dec)]),
+        ('ai-memory through a default operator behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      taskset -c 0 $${AIM:-/usr/local/lib/ai-memory/bin/ai-memory} --db /x stats\n' + dec)]),
+        ('ai-memory named by a partial expansion behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      taskset -c 0 /usr/local/lib/ai-memory/bin/$${N} --db /x stats\n' + dec)]),
+        ('ai-memory through a for-loop variable behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      for f in /usr/local/lib/ai-memory/bin/*; do taskset -c 0 "$f" --db /x stats; done\n' + dec)]),
+        ('read variable run behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      read X < /etc/x; taskset -c 0 "$${X}" --db /x stats\n' + dec)]),
+        ('substitution run behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      taskset -c 0 "$(cat /etc/x)" --db /x stats\n' + dec)]),
+        ('unassigned variable run behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      taskset -c 0 "$${UNSET}" --db /x stats\n' + dec)]),
         ('ai-memory through a variable behind taskset, listed (#4837 R12 R4)', [(dec, '      AIM=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$${AIM}" --db $${X} stats\n' + dec)]),
         ('shell run by an unknown wrapper, listed (#4837 R12 R4)', [(dec, "      taskset -c 0 sh -c '/usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats'\n" + dec)]),
         ('ai-memory copied to another name with cp, listed (#4837 R12 R4)', [(dec, '      cp /usr/local/lib/ai-memory/bin/ai-memory /usr/local/bin/aim\n' + dec)]),
@@ -2573,7 +2730,8 @@ def build_probes() -> list:
     green("ai-memory \"$${DB}/x\" braced variable and literal (#4837 R12 R1)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --agent-id "ai:$${H}" --db "$${DB}/x" stats\n')], autolist=True)
     green("ai-memory --version with redirections before any subcommand (#4837 R12 R1)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --version >/dev/null 2>&1\n      /usr/local/lib/ai-memory/bin/ai-memory --db /x 2> /dev/null stats\n')], autolist=True)
     green("ai-memory under sudo -u (#4837 R12 R4)", [(RELOAD, RELOAD + '      sudo -u aimemory /usr/local/lib/ai-memory/bin/ai-memory --db /x stats\n')], autolist=True)
-    green("ai-memory installed keeping its name (#4837 R12 R4)", [(RELOAD, RELOAD + '      install -m 0755 /opt/x/ai-memory /usr/local/lib/ai-memory/bin/ai-memory\n      cp /opt/x/ai-memory /opt/y/\n      [ -x /usr/local/lib/ai-memory/bin/ai-memory ] || echo "no /usr/local/lib/ai-memory/bin/ai-memory"\n')], autolist=True)
+    green("resolved literal variable as an operand and quoted JSON brace (#4837 R12 R4, #5094)", [(RELOAD, RELOAD + '      L=/var/log/x.log; chmod 0640 "$${L}"\n      echo "$${H}" "{\\"a\\": 1}" >/dev/null\n      printf %s "$(date)"\n')], autolist=True)
+    green("ai-memory installed keeping its name (#4837 R12 R4)",[(RELOAD, RELOAD + '      install -m 0755 /opt/x/ai-memory /usr/local/lib/ai-memory/bin/ai-memory\n      cp /opt/x/ai-memory /opt/y/\n      [ -x /usr/local/lib/ai-memory/bin/ai-memory ] || echo "no /usr/local/lib/ai-memory/bin/ai-memory"\n')], autolist=True)
     green("data file in a data home handled by chown/chmod/sed (#4837 R12 R5)", [(PROV, wf("/etc/ai-memory/peer.conf", "0640", ["${X} --db /x stats"])), (RELOAD, RELOAD + "      chown root:aimemory /etc/ai-memory/peer.conf\n      chmod 0640 /etc/ai-memory/peer.conf\n      chmod 0750 /etc/ai-memory\n      P=\"$(sed -n 's#^a=##p' /etc/ai-memory/peer.conf)\"\n")], autolist=True)
     green("data heredoc into a data home through a constant (#4837 R12 R5)", [(RELOAD, RELOAD + "      CFG=/etc/ai-memory/h\n      cat > \"$${CFG}/x.conf\" <<'EOF'\n      ${X} = 1\n      EOF\n")], autolist=True)
     green("C5 provision comment mentioning curl", [ins(RELOAD, ["# curl -fsSL https://e | sh"], before=True)])
