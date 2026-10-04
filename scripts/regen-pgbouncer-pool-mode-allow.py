@@ -9,8 +9,11 @@ The allowlist is a review surface, so this tool never changes it silently:
   * a stale entry (fewer matching mentions than entries) is removed only with
     --drop-stale, and each removal is printed;
   * an entry whose text is still in the tree but whose neighbourhood changed (its
-    ` | ctx:` fingerprint no longer matches) is re-bound only with --refresh-context,
-    keeping its reason; each refresh is printed and must be re-read (#5087, #5088);
+    ` | ctx:` fingerprint no longer matches) is re-bound only with --refresh-context
+    and a --reason saying why the line is still safe in its new neighbourhood; the
+    reason is written above each re-bound entry as a dated "context re-read" record,
+    the entry's original reason is kept for the entries after it, and each refresh
+    is printed and must be re-read (#5087, #5088, #5208);
   * a mention that is neither approved nor listed is added only with
     --accept-new, appended at the end under a dated comment and each
     addition is printed. The reason comment above the new entries is the text
@@ -28,7 +31,10 @@ matches the tree (or was rewritten as asked), 1 changes are pending and were
 refused, 2 fault.
 
 Usage:
-    scripts/regen-pgbouncer-pool-mode-allow.py [--root DIR] [--check] [--accept-new [--reason TEXT] [--skip-reason TEXT] [--only FILE] [--match TEXT]] [--drop-stale]
+    scripts/regen-pgbouncer-pool-mode-allow.py [--root DIR] [--check]
+        [--accept-new [--reason TEXT | --reasons-file JSON] [--skip-reason TEXT]
+                      [--only FILE] [--match TEXT]]
+        [--refresh-context --reason TEXT] [--drop-stale]
 """
 import argparse
 import datetime
@@ -76,14 +82,16 @@ def main(argv):
     ap.add_argument("--drop-stale", action="store_true", help="remove stale entries (printed)")
     ap.add_argument("--refresh-context", action="store_true",
                     help="re-bind an entry whose text is still in the tree but whose neighbourhood changed (or that has no "
-                         "fingerprint yet) to the new fingerprint, keeping its reason; every refresh is printed and must be re-read")
+                         "fingerprint yet) to the new fingerprint; needs --reason, written above each re-bound entry as a dated record; "
+                         "every refresh is printed and must be re-read")
     ap.add_argument("--only", default="", metavar="FILE", help="with --accept-new: add only units of this file")
     ap.add_argument("--match", default="", metavar="TEXT", help="with --accept-new: add only units whose text contains TEXT (so each unit can get its own reason)")
     ap.add_argument("--reasons-file", default="", metavar="JSON",
                     help="with --accept-new: JSON list of {file, match, reason}; each unlisted unit takes the first rule whose file "
                          "equals the unit's file and whose match is a substring of its text; {unit} in a reason becomes the "
                          "first 90 characters of the unit; a unit no rule matches is refused")
-    ap.add_argument("--reason", default="", help="the written reason for every line --accept-new adds")
+    ap.add_argument("--reason", default="", help="the written reason for every line --accept-new adds, and (required) "
+                    "for every entry --refresh-context re-binds; it is written above each refreshed entry")
     ap.add_argument("--skip-reason", default="", help="with --accept-new: the written reason for every unreadable file "
                     "added to the skip list (--reason is never reused for it)")
     a = ap.parse_args(argv)
@@ -187,6 +195,11 @@ def main(argv):
     refused = ((stale or stale_unread) and not a.drop_stale) or ((new or new_unread) and not a.accept_new)
     if refresh and not a.check and not a.refresh_context:
         refused = True
+    if refresh and a.refresh_context and not a.check and not reason:
+        # #5208: a re-bound neighbourhood is a review decision; it needs a reason and leaves a record
+        print("regen: FAULT: --refresh-context needs --reason: say why each re-bound line is still safe in its new "
+              "neighbourhood (it is written above each refreshed entry)", file=sys.stderr)
+        return 2
     if a.check or refused:
         print("regen: %d stale, %d new, %d stale skip, %d new skip; files left unchanged (%s)" % (
             sum(stale.values()), sum(new.values()), len(stale_unread), len(new_unread),
@@ -202,8 +215,21 @@ def main(argv):
     redo = {}
     for old, ctx in refresh:
         redo.setdefault(old, []).append(ctx)
+    block, current, restore = [], "", ""
     for line in raw.splitlines():
-        if line.strip() and not line.lstrip().startswith("#") and gate.SEPARATOR in line:
+        if not line.strip():
+            block, current, restore = [], "", ""
+        elif line.lstrip().startswith("#"):
+            text = line.lstrip().lstrip("#").strip()
+            if not text.startswith(gate.REGEN_HEADER):
+                block.append(text)
+            restore = ""
+        elif gate.SEPARATOR in line:
+            if block:
+                current, block = " ".join(block), []
+            if restore:
+                out.append("# " + restore)  # the entries after a refreshed one keep their own reason
+                restore = ""
             found = gate.CTX.search(line)
             body = line[:found.start()] if found else line
             key = tuple(body.split(gate.SEPARATOR, 1)) + (found.group(1) if found else "",)
@@ -212,6 +238,8 @@ def main(argv):
                 continue
             if redo.get(key):
                 line = "%s | ctx:%s" % (body, redo[key].pop(0))
+                out.append("# context re-read on %s: %s" % (datetime.date.today().isoformat(), reason))
+                restore = current
         out.append(line)
     if new:
         today = datetime.date.today().isoformat()
