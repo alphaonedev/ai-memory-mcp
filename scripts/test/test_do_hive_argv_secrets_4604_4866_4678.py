@@ -739,7 +739,7 @@ def verify_trace_5237():
 
 
 TAINT_SOURCES = ("on_node","node_sh", "node_get", "node_post", "curl", "lg_curl", "ssh", "scp")
-SINKS =("ok", "no", "die", "echo", "printf")
+SINKS = ("ok", "no", "die", "echo", "printf", "cat", "tee")
 
 
 def _segments(line, name_re):
@@ -771,53 +771,130 @@ def _segments(line, name_re):
                 end = i
                 break
             i += 1
-        out.append((m.group(1), line[m.end():end], line[end:end + 2], before))
+        out.append((m.group(1), line[m.end():end], line[end:], before))
     return out
 
 
 def tainted_names(text):
-    """Variables that hold a node-derived value: assigned from a node channel, or from such a variable."""
+    """Variables that hold a node-derived value: assigned (=, +=, read, mapfile, readarray, for, printf -v)
+    from a node channel or from such a variable (#5236)."""
     assigns = []
     for _, line, _ in logical_lines(text):
-        for m in re.finditer(r"(?:^|[\s;(])(?:local\s+)?(\w+)=(\"\$\(.*|\$\(.*|\"[^\"]*\"|\S*)", line):
+        for m in re.finditer(r"(?:^|[\s;(])(?:local\s+)?(\w+)\+?=(\"\$\(.*|\$\(.*|\"[^\"]*\"|\S*)", line):
+            assigns.append((m.group(1), m.group(2)))
+        for m in re.finditer(r"(?:^|[\s;(])(?:read|mapfile|readarray)((?:\s+(?:-\w+|\w+))+)", line):
+            for w in m.group(1).split():
+                if not w.startswith("-"):
+                    assigns.append((w, line))
+        for m in re.finditer(r"(?:^|[\s;(])for\s+(\w+)\s+in\s+([^;]*)", line):
+            assigns.append((m.group(1), m.group(2)))
+        for m in re.finditer(r"(?:^|[\s;(])printf\s+-v\s+(\w+)\s+(.*)", line):
             assigns.append((m.group(1), m.group(2)))
     names = set()
     while True:
         new = {v for v, rhs in assigns if v not in names and (
             re.search(r"(?<![\w$-])(?:%s)(?![\w-])" % "|".join(TAINT_SOURCES), rhs)
-            or any(re.search(r"\$\{?#?%s\b" % re.escape(n), rhs) for n in names))}
+            or any(re.search(r"\$\{?[#!]?%s\b" % re.escape(n), rhs) for n in names))}
         if not new:
             return names
         names |= new
 
 
+# /dev/stderr, /dev/stdout, /dev/tty, /dev/fd/N and /proc/*/fd/N are the terminal, not a file (#5236).
+TERMINAL = r"/dev/(?:stderr|stdout|tty|fd/)|/proc/"
+
+
+def heredoc_findings(text, names):
+    """#5236: unquoted here-document bodies fed to cat or tee (which print them) that name a node value."""
+    bad, lines, i = [], text.splitlines(), 0
+    while i < len(lines):
+        m = re.search(r"\b(cat|tee)\b[^|]*<<-?\s*(['\"]?)(\w+)\2", lines[i])
+        if not m:
+            i += 1
+            continue
+        opener, quoted, delim, j = lines[i], bool(m.group(2)), m.group(3), i + 1
+        body = []
+        while j < len(lines) and lines[j].strip() != delim:
+            body.append(lines[j])
+            j += 1
+        to_file = re.search(r"(?<![0-9&])>\s*(?!&)(?!%s)\S" % TERMINAL, opener[m.start():]) or "$(" in opener[:m.start()]
+        if not quoted and not to_file:
+            hit = [v for v in names if re.search(r"\$\{?[#!]?%s\b" % re.escape(v), "\n".join(body))]
+            if hit:
+                bad.append("%d:%s<<:%s" % (i + 1, m.group(1), ",".join(sorted(hit))))
+        i = j + 1
+    return bad
+
+
 def taint_findings(text, names):
-    """Sink commands whose arguments name a node-derived variable other than through an allowed helper."""
+    """Sink commands whose arguments name a node-derived variable other than through an allowed helper.
+    #5236: a positional parameter, an indirect expansion, a pipe into anything but a silent or node-bound
+    consumer, a write to /dev/stderr or /dev/tty, and a here-document to cat or tee all count."""
     bad, checked = [], 0
     helper = r"\$\((?:%s)(?: \"\$\{?\w+\}?\")+\)" % "|".join(sorted(ALLOWED))
     for n, line, func in logical_lines(text):
         if func in ALLOWED or re.match(r"^\s*(?:ok|no|die)\(\) \{", line):
             continue
         for cmd, args, after, before in _segments(line, "|".join(SINKS)):
-            if cmd in ("echo", "printf"):
-                # Output into a pipe, a capture or a file is not the terminal.
-                if after.startswith("|") and not after.startswith("||"):
-                    continue
+            if cmd in ("echo", "printf", "cat"):
+                # Output into a capture is not the terminal.
                 if before.count("$(") > before.count(")"):
                     continue
-                if re.search(r"(?<![0-9&])>\s*(?!&)\S", args):
+                # A pipe is not the terminal only when it feeds a silent or node-bound consumer.
+                if after.startswith("|") and not after.startswith("||") \
+                        and re.match(r"\|\s*(?:grep\s+-q\w*\s|curl\s|base64\b)", after):
+                    continue
+                # A file is not the terminal; /dev/stderr, /dev/tty, /dev/fd/N and /proc/*/fd are.
+                if re.search(r"(?<![0-9&])>\s*(?!&)(?!%s)\S" % TERMINAL, args):
                     continue
             checked += 1
             rest = re.sub(helper, "", args)
             hit = [v for v in names if re.search(r"\$\{?[#!]?%s\b" % re.escape(v), rest)]
+            # A function argument reaches the sink unseen by the name-based taint: outside the output
+            # primitives and the reply helpers, no positional parameter may reach a terminal line.
+            if re.search(r"\$(?:\{[#!]?)?[1-9*@]", rest):
+                hit.append("positional")
+            if re.search(r"\$\{!\w", rest):
+                hit.append("indirect")
+            # A file read in a terminal line may print a node-fetched file (a peer key fetched by scp).
+            if re.search(r"\$\(\s*(?:cat\b|<)", rest):
+                hit.append("file read")
             if hit:
                 bad.append("%d:%s:%s" % (n, cmd, ",".join(sorted(hit))))
+    bad += heredoc_findings(text, names)
     return bad, checked
 
 
+BANNED_CONSTRUCTS = (
+    (r"(?<![\w-])eval(?![\w-])", "eval"), (r"<<<", "here-string"), (r"(?<![\w-])printf\s+-v", "printf -v"),
+    (r"\$\{!", "indirect expansion"), (r"(?<![\w-])(?:declare|local|typeset)\s+-\w*n", "nameref"),
+    (r"(?<![\w-])read(?![\w-])", "read"), (r"(?<![\w-])(?:mapfile|readarray)(?![\w-])", "mapfile"),
+    (r"(?<![\w-])tee(?![\w-])", "tee"), (r"(?<![\w-])source(?![\w-])|(?:^|[;&|]\s*)\.\s", "source"),
+)
+
+
+def construct_findings(text):
+    """#5236: lines (outside comments and quoted messages) using a construct the taint scan cannot follow."""
+    bad = []
+    for n, line, func in logical_lines(text):
+        if func in ("main",):
+            continue
+        # Drop double-quoted message text that holds no expansion, and single-quoted literals.
+        code = re.sub(r"'[^']*'", "''", line)
+        code = re.sub(r'"[^"$`]*"', '""', code)
+        code = re.sub(r"(?:^|\s)#.*$", "", code)  # a trailing comment
+        for rx, label in BANNED_CONSTRUCTS:
+            if re.search(rx, code):
+                bad.append("%d:%s" % (n, label))
+        # A here-document is allowed only as a script fed to a node (node_sh); any other reader may print it.
+        if re.search(r"<<-?\s*'?\w+'?", code) and "<<<" not in code and not re.search(r"(?<![\w-])node_sh\s[^<]*<<", code):
+            bad.append("%d:here-document" % n)
+    return bad
+
+
 def closed_world_taint(fs):
-    """Source-level closed world: no node-derived variable reaches ok/no/die/echo/printf except through
-    reply_status, reply_len or reply_version."""
+    """Source-level closed world: no node-derived variable reaches ok/no/die/echo/printf/cat/tee except
+    through reply_status, reply_len or reply_version, and no construct the scan cannot follow is used."""
     names = tainted_names(fs)
     expect = {"code", "versions", "api_key", "resp", "qcode", "qjson", "QID", "landed", "sresp", "scode", "sjson",
               "SID", "lvl", "pg_ver", "age_ver", "vec_ver"}
@@ -837,12 +914,47 @@ def closed_world_taint(fs):
                         ("a helper and then the raw status", 'no "x $(reply_len "$qjson") $qcode"'),
                         ("a helper wrapping a pipeline", 'no "x $(reply_len "$qjson" | cat; echo "$qjson")"'),
                         ("a variable derived from a reply", 'tok="${versions%% *}"\nno "x $tok"'),
-                        ("an echo to stderr", 'echo "$code" >&2')):
+                        ("an echo to stderr", 'echo "$code" >&2'),
+                        # #5236: the union of the bypass forms of the round-10 reviews.
+                        ("a function argument", 'say() { no "x $1"; }\nsay "$qjson"'),
+                        ("a function argument via $*", 'show() { no "got $*"; }\nshow "$qjson"'),
+                        ("a function defined outside verify", 'say2() { no "x $1"; }\nverify2() { say2 "$qjson"; }'),
+                        ("a read into a variable", 'read -r t <<< "$qjson"\nno "x $t"'),
+                        ("a mapfile into an array", 'mapfile -t t <<< "$qjson"\nno "x ${t[0]}"'),
+                        ("a for loop variable", 'for t in $qjson; do no "x $t"; done'),
+                        ("an append assignment", 't=a\nt+=$qjson\nno "x $t"'),
+                        ("printf -v", "printf -v t '%s' \"$qjson\"\nno \"x $t\""),
+                        ("an indirect expansion", 't=qjson\nno "x ${!t}"'),
+                        ("a printf piped to cat", "printf '%s' \"$qjson\" | cat"),
+                        ("an echo to /dev/stderr", 'echo "$qjson" > /dev/stderr'),
+                        ("an echo to /dev/tty", 'echo "$qjson" >/dev/tty'),
+                        ("a redirect before the command", '>&2 echo "$qjson"'),
+                        ("a pipe into tee", "printf '%s\\n' \"$qjson\" | tee /dev/stderr >/dev/null"),
+                        ("a here-string to cat", 'cat <<< "$qjson"'),
+                        ("a here-document to cat", 'cat <<EOT\nx $qjson\nEOT'),
+                        ("a printf %b of a reply", "printf '%b\\n' \"$resp\""),
+                        ("an echo inside an if", 'if true; then echo "$lvl"; fi'),
+                        ("a reply-derived helper argument", 'no "x $(reply_len "${qjson:0:64}")"'),
+                        ("a file read in a failure line", 'no "x $(cat "$OUT_DIR/$pub")"')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
         probe("V1 closed-world negative control is flagged: %s" % label, len(b2) > len(bad), str(b2[len(bad):][:2]))
+    # #5236: constructs a name-based scan cannot follow are not allowed in federate.sh at all.
+    cb = construct_findings(fs)
+    probe("V1 federate.sh uses no construct the taint scan cannot follow", not cb, " ".join(cb[:6]))
+    for label, body in (("eval", 'eval "no \\"x \\$qjson\\""'), ("eval in single quotes", "eval 'no \"x $qjson\"'"),
+                        ("eval of an echo", 'eval "echo \\$qjson"'), ("a here-string", 'cat <<< "$qjson"'),
+                        ("a here-string to jq", 'jq . <<< "$qjson"'),
+                        ("read", 'read -r t <<< "$qjson"'), ("printf -v", "printf -v t '%s' \"$qjson\""),
+                        ("an indirect expansion", 'n=qjson\nno "x ${!n}"'), ("a nameref", 'declare -n r=qjson\nno "x $r"'),
+                        ("mapfile", 'mapfile -t arr < "$f"'), ("tee", 'tee < "$f"'), ("source", 'source "$f"'),
+                        ("a here-document in verify", 'cat <<EOF\n$qjson\nEOF')):
+        probe("V1 construct negative control is flagged: %s" % label, len(construct_findings(wrap(body))) > len(cb))
+    # Accepted by design (#5236): reply_status prints only a 3-digit status or the word non-status, so a
+    # reply body passed to it reaches the terminal as one of those 1001 closed values, never as its bytes.
     for label, body in (("helpers only", 'no "x $(reply_status "$qcode") ($(reply_len "$qjson"))"'),
                         ("a reply piped to grep", "echo \"$versions\" | grep -qx 'age=1.8.0'"),
-                        ("a reply captured through sed", "age_ver=\"$(printf '%s\\n' \"$versions\" | sed -n 's/^age=//p')\"")):
+                        ("a reply captured through sed", "age_ver=\"$(printf '%s\\n' \"$versions\" | sed -n 's/^age=//p')\""),
+                        ("the status helper given a reply body", 'no "x $(reply_status "$qjson")"')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
         probe("V1 closed-world control is accepted: %s" % label, len(b2) == len(bad), str(b2[len(bad):][:2]))
 

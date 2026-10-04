@@ -281,10 +281,13 @@ node_sh() { ssh $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
 # verify suspends xtrace on its first line (#5237), so no reply reaches an xtrace log either; outside
 # verify a node reply only ever goes to a file or to /dev/null. A PASS or FAIL line names a node-derived
 # value only through these three helpers, whose output comes from a closed set. A static test follows
-# node-derived names to ok, no, die, echo and printf, and whole-verify probes check the printed bytes
-# for hostile replies. reply_status prints a 3-digit HTTP status, or the word non-status for anything else.
-# reply_len prints the reply's byte count. reply_version prints a version token only when it is 1 to 3
-# dot-separated groups of 1 to 3 ASCII digits, and the byte count of the whole reply otherwise.
+# node-derived names to ok, no, die, echo, printf, cat and tee, flags any positional parameter on such a
+# line outside ok, no, die and these helpers, and refuses constructs it cannot follow, such as eval, read,
+# mapfile, printf -v, indirect expansion, here-strings and here-documents not fed to a node (#5236);
+# whole-verify probes check the printed bytes for hostile replies. reply_status prints a 3-digit HTTP
+# status, or the word non-status for anything else. reply_len prints the reply's byte count.
+# reply_version prints a version token only when it is 1 to 3 dot-separated groups of 1 to 3 ASCII
+# digits, and the byte count of the whole reply otherwise.
 reply_status() {
   case "$1" in
     [0123456789][0123456789][0123456789]) printf '%s' "$1" ;;
