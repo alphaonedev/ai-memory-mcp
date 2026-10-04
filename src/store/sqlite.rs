@@ -446,6 +446,8 @@ fn owner_gate_test_hook(_id: &str) {}
 
 #[cfg(test)]
 mod owner_gate_txn_3957;
+#[cfg(test)]
+mod reclassify_txn_5084_tests;
 
 // #1709 Pillar 1 — the actions SELECT column list + row mapping live in
 // `crate::actions` (shared with the MCP `memory_action_*` handlers, which hold
