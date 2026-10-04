@@ -239,9 +239,12 @@ lab_probe_refusal_names_knob() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# Each leg mutates the lab posture arrays in a subshell and the check must
-# return the expected code: the control passes; a weakened value (plain and
-# const-valued), a dropped name and a SET knob moved to UNSET all go red.
+# 16 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 11
+# leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
+# const in a scratch src tree), five probe-matcher legs (lab_probe_refusal_names_knob against
+# generated logs), one structural leg (the matcher has no here-string, here-document or pipe)
+# and one layout leg (this comment sits directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
   local root="$1" bad=0 rc name want
