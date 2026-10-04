@@ -347,12 +347,6 @@ require_store_url_env_channel() {
   require_min_version 0.9.0 "no AI_MEMORY_STORE_URL env channel (#4603); refusing to render a unit that would silently fall back to sqlite"
 }
 
-# #4600 / #4797: schema-init reads AI_MEMORY_STORE_URL_FILE only from 1.0.0.
-# Refuse before any Postgres secret is staged for a binary that cannot read it.
-require_schema_init_store_url_channel() {
-  require_min_version 1.0.0 "schema-init reads AI_MEMORY_STORE_URL_FILE only from 1.0.0 (#4600); refusing to stage Postgres secrets for a binary that cannot read them"
-}
-
 # ssh_node <ip> <remote-command-string>
 # -n protects stdin so loops over `inv_*` output don't get consumed by ssh.
 ssh_node() {
