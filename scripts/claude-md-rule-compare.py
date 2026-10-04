@@ -702,7 +702,7 @@ def self_test() -> int:
         report, failed = compare(base_root, repo, fence_base, head_sha, work / "scratch", guard.fixture_index_pins())
     except RuntimeError as exc:
         report, failed = f"RESULT: FAIL (closed) - {exc}", True
-    if failed or "COUNT CHANGED" not in report or "`````diff" not in report:
+    if failed or "COUNT CHANGED" not in report or "\n`````diff\n" not in report:
         print(f"FAIL: self-test - R6 the COUNT CHANGED fence is not longer than a backtick run\n{report}",
               file=sys.stderr)
         failures.append("count fence")
