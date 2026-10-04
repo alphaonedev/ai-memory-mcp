@@ -2274,7 +2274,8 @@ def nameref_facts(texts: list):
     cannot read. A target built from an expansion can be any name: then no name is
     resolved (poisoned, fail closed). Bash removes quotes and backslashes before the
     builtin reads its words, so the words are read without them; an option word that
-    holds an expansion can be -n (poisoned, #5323)."""
+    holds an expansion can be -n (poisoned), and every name word of an -n declaration is
+    a nameref, not only the first (#5323, #5324)."""
     refs, names, poisoned = set(), set(), False
     plain = [re.sub(r"[\"'\\]", "", text) for text in texts]
     for text in plain:
@@ -2291,8 +2292,8 @@ def nameref_facts(texts: list):
                 i += 1
             if not nameref:
                 continue
-            refs.update(re.findall(r"(?<![\w$-])([A-Za-z_]\w*)", " ".join(words[i:]).split("=", 1)[0]))
             for w in words[i:]:
+                refs.update(re.findall(r"(?<![\w$-])([A-Za-z_]\w*)", w.split("=", 1)[0]))
                 names.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", w))
                 poisoned = poisoned or "$" in w or "`" in w
     for text in plain:
@@ -2914,6 +2915,7 @@ def build_probes() -> list:
         ('nameref declared with a quoted -n behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      typeset \'-n\' R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
         ('nameref declared with an escaped -n in a function behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      f() { local \\-n R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats; }; f\n' + dec)]),
         ('nameref declared by an expanded option behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      F=n; declare -$F R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('second name of a declare -n written behind taskset, listed (#4837 R12 R4, #5324)', [(dec, '      B=/usr/bin/true; declare -n R=A S; S=B; S=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$B" --db /x stats\n' + dec)]),
         ('ai-memory through a variable behind taskset, listed (#4837 R12 R4)', [(dec, '      AIM=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$${AIM}" --db $${X} stats\n' + dec)]),
         ('shell run by an unknown wrapper, listed (#4837 R12 R4)', [(dec, "      taskset -c 0 sh -c '/usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats'\n" + dec)]),
         ('ai-memory copied to another name with cp, listed (#4837 R12 R4)', [(dec, '      cp /usr/local/lib/ai-memory/bin/ai-memory /usr/local/bin/aim\n' + dec)]),
