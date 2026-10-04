@@ -632,6 +632,7 @@ automerge_tree() {
 
 # check_range BASE_SHA HEAD_SHA SIGNERS_FILE [REPO_DIR] [GPG_SIGNERS_FILE]
 #             [GPG_PUBKEY_FILE] [PREPARED_GNUPGHOME] [MERGE_TREE_GIT]
+#             [WALK_GIT]
 #
 # Walks EVERY commit in `merge-base(BASE,HEAD)..HEAD` inside REPO_DIR —
 # merges included (#5065) — and prints, to stdout, one `SCANNED: <n> ...` line
@@ -657,12 +658,19 @@ automerge_tree() {
 # — an env var would be an out-of-band way for a caller to redirect the
 # content check, which is exactly the kind of backdoor this gate must not
 # grow.
+#
+# WALK_GIT is the third self-test seam (default `git`), positional for the
+# same reason: the git binary that performs the commit walk (`log`) and its
+# `rev-list --count` cross-check, so a self-test cell can drive a walk that
+# dies partway, comes up short, tears a record, or emits a malformed field
+# (#5272, #5138). Production callers never pass it.
 check_range() {
   local base="$1" head="$2" signers_file="$3" repo_dir="${4:-$REPO_ROOT}"
   local gpg_signers_file="${5:-$GPG_SIGNERS_FILE_DEFAULT}"
   local gpg_pubkey_file="${6:-$GPG_PUBKEY_FILE_DEFAULT}"
   local prepared_gnupghome="${7:-}"
   local merge_tree_git="${8:-git}"
+  local walk_git="${9:-git}"
   local principals pinned violations=0
 
   if ! assert_registry_usable "$signers_file"; then
@@ -799,7 +807,7 @@ check_range() {
       findings+="VIOLATION: $sha signing-key-not-pinned (%GF=${sig_fpr:-<empty>})"$'\n'
       violations=1
     fi
-  done < <(GNUPGHOME="$gnupghome" git -C "$repo_dir" \
+  done < <(GNUPGHOME="$gnupghome" "$walk_git" -C "$repo_dir" \
     -c "gpg.ssh.allowedSignersFile=$signers_file" \
     -c gpg.format=ssh \
     log --format='%H|%ae|%ce|%G?|%GF|%T|%P' "${merge_base}..${head_resolved}")
@@ -1091,15 +1099,15 @@ self_test() {
     --cacheinfo "100644,$backdoor_blob,backdoor.txt"
   evil_tree="$(GIT_INDEX_FILE="$aux_index" git -C "$repo" write-tree)"
   rm -f "$aux_index"
-  # The INNOCENT three-way tree for the octopus cell: side3's file added to
-  # the automerge of the other two, i.e. exactly what a clean 3-way merge
-  # produces. The octopus cell must be refused for having three parents, NOT
-  # because its content is evil.
-  GIT_INDEX_FILE="$aux_index" git -C "$repo" read-tree "$auto_tree"
-  GIT_INDEX_FILE="$aux_index" git -C "$repo" update-index --add \
-    --cacheinfo "100644,$(git -C "$repo" rev-parse "${side3_sha}:s3.txt"),s3.txt"
-  octo_tree="$(GIT_INDEX_FILE="$aux_index" git -C "$repo" write-tree)"
-  rm -f "$aux_index"
+  # The octopus cell's tree is the CLEAN TWO-PARENT AUTOMERGE of its first
+  # two parents, byte for byte (#5271). Term (3) compares the recorded tree
+  # with `merge-tree --write-tree p1 p2` and nothing else, so on this tree
+  # term (3) is SATISFIED: if the parent-count term (2) were ignored, this
+  # three-parent web-flow merge would be exempted. Term (2) is therefore the
+  # ONLY term that can refuse it, which is what makes the cell load-bearing
+  # for term (2). (The earlier fixture added side3's file, so term (3)
+  # refused it on its own and deleting term (2) left every cell green.)
+  octo_tree="$auto_tree"
   if [ -z "$evil_tree" ] || [ "$evil_tree" = "$auto_tree" ]; then
     echo "self-test FAILED: the #5065 evil tree equals the automerge tree, so every negative merge cell would be VACUOUS (auto=$auto_tree evil=$evil_tree)" >&2
     exit 2
@@ -1155,11 +1163,12 @@ self_test() {
     git -C "$repo" commit-tree "$auto_tree" -p "$side1_sha" -p "$side2_sha" \
     -m 'Merge pull request #7c from side2 (content-neutral)')"
 
-  # (octopus) Web-flow committer, INNOCENT three-way tree, THREE parents.
-  # `merge-tree p1 p2` does not compute the automerge of a 3+-way merge, so
-  # there is no content check that covers it and term (2) refuses it. Zero
-  # octopus merges exist in the measured cohort; this cell keeps that true by
-  # refusing to guess rather than by assuming it stays true.
+  # (octopus) Web-flow committer, THREE parents, tree = the clean automerge
+  # of the first two (so term (3) holds — see octo_tree above). `merge-tree
+  # p1 p2` does not compute the automerge of a 3+-way merge, so there is no
+  # content check that covers it and term (2) refuses it. Zero octopus merges
+  # exist in the measured cohort; this cell keeps that true by refusing to
+  # guess rather than by assuming it stays true.
   m_octo_sha="$(GIT_AUTHOR_NAME='Dev' GIT_AUTHOR_EMAIL='dev@example.test' \
     GIT_COMMITTER_NAME='GitHub' GIT_COMMITTER_EMAIL="$WEBFLOW_COMMITTER_EMAIL" \
     git -C "$repo" commit-tree "$octo_tree" -p "$side1_sha" -p "$side2_sha" \
@@ -1237,6 +1246,29 @@ self_test() {
     git -C "$repo" commit-tree "$auto_tree" -p "$side1_sha" -p "$side2_sha" \
     -m 'Merge branch side2 (author email carries a pipe)')"
 
+  # (#5138 NON-MERGE record shift) The two measured fail-OPEN shapes. Both
+  # are UNSIGNED single-parent commits (`%G? = N`), built with nothing but
+  # `GIT_AUTHOR_EMAIL` / `GIT_COMMITTER_EMAIL`, no key. Against a walk that
+  # splits `%H|%ae|%ce|%G?|%GF|%T|%P` on `|`, the email text lands in the
+  # signature-status and fingerprint fields: `sig_status=G` and
+  # `sig_fpr=<the pinned fingerprint>`, while the real `N` is pushed into the
+  # parents remainder. Measured end to end before the fix: base `df880a3f5`
+  # refused both (rc=1, its last field absorbed the remainder), PR #5083 tip
+  # `bdc0723ae` PASSED both (rc=0). The walk must read the commit's REAL
+  # fields, so both must be refused naming `signature-not-verified (%G?=N)`.
+  local nm_tree nm_shift2_sha nm_shift1_sha
+  nm_tree="$(git -C "$repo" rev-parse "${clean_sha}^{tree}")"
+  nm_shift2_sha="$(GIT_AUTHOR_NAME='Dev' \
+    GIT_AUTHOR_EMAIL='dev@example.test|dev@example.test|G' \
+    GIT_COMMITTER_NAME='Dev' GIT_COMMITTER_EMAIL="$pinned_gpg_fpr" \
+    git -C "$repo" commit-tree "$nm_tree" -p "$clean_sha" \
+    -m 'non-merge: two pipes in the author email, pinned fingerprint as committer email')"
+  nm_shift1_sha="$(GIT_AUTHOR_NAME='Dev' \
+    GIT_AUTHOR_EMAIL='dev@example.test|dev@example.test' \
+    GIT_COMMITTER_NAME='Dev' GIT_COMMITTER_EMAIL="G|$pinned_gpg_fpr" \
+    git -C "$repo" commit-tree "$nm_tree" -p "$clean_sha" \
+    -m 'non-merge: one pipe in the author email, crafted committer email')"
+
   # FIXTURE SHAPE GUARDS. Every assertion below is on the shape a cell must
   # have for its verdict to mean anything. Without them a fixture regression
   # (a signature that silently stopped being produced, an evil tree that
@@ -1270,6 +1302,27 @@ self_test() {
   shape_ce="$(st_field "$m_pipe_sha" '%ce' "$repo" "$gpg_home" "$signers")"
   if [ "$shape_ce" = "$WEBFLOW_COMMITTER_EMAIL" ]; then
     echo "self-test FAILED: the #5065 pipe cell's REAL committer must NOT be the web-flow identity — the whole point is that the shifted field forges term (1) while the commit itself is a local one; %ce='$shape_ce'" >&2
+    failed=1
+  fi
+  local nm_sha
+  for nm_sha in "$nm_shift2_sha" "$nm_shift1_sha"; do
+    shape_g="$(st_field "$nm_sha" '%G?' "$repo" "$gpg_home" "$signers")"
+    shape_ae="$(st_field "$nm_sha" '%ae' "$repo" "$gpg_home" "$signers")"
+    shape_p="$(st_field "$nm_sha" '%P' "$repo" "$gpg_home" "$signers")"
+    if [ "$shape_g" != "N" ] || [ "$shape_p" != "$clean_sha" ]; then
+      echo "self-test FAILED: a #5138 non-merge shift cell must be an UNSIGNED (%G?=N) single-parent commit, or a refusal would prove nothing about the parser; $nm_sha has %G?='$shape_g' %P='$shape_p'" >&2
+      failed=1
+    fi
+    case "$shape_ae" in
+      *'|'*) : ;;
+      *)
+        echo "self-test FAILED: a #5138 non-merge shift cell needs git to have RECORDED a literal '|' in the author email; $nm_sha has %ae='$shape_ae'" >&2
+        failed=1
+        ;;
+    esac
+  done
+  if [ "$(st_field "$m_octo_sha" '%T' "$repo" "$gpg_home" "$signers")" != "$auto_tree" ]; then
+    echo "self-test FAILED: the #5065 octopus cell must record the CLEAN two-parent automerge tree so that term (3) is satisfied and ONLY the parent-count term (2) can refuse it (#5271)" >&2
     failed=1
   fi
   shape_g="$(st_field "$m7a_sha" '%G?' "$repo" "$gpg_home" "$signers")"
@@ -1536,9 +1589,11 @@ self_test() {
     failed=1
   fi
 
-  # (octopus) web-flow identity, INNOCENT three-way tree, THREE parents.
-  # Term (2) refuses it: `merge-tree p1 p2` is not the automerge of a 3-way
-  # merge, so no content check covers it and the gate declines to guess.
+  # (octopus) web-flow identity, THREE parents, and a tree EQUAL to the clean
+  # automerge of the first two (#5271). Terms (1) and (3) both hold, so term
+  # (2) is the only thing that refuses it: `merge-tree p1 p2` is not the
+  # automerge of a 3-way merge, so no content check covers it and the gate
+  # declines to guess. Delete term (2) and this cell goes RED.
   rc=0
   out="$(check_range "$base_sha" "$m_octo_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" 2>&1)" || rc=$?
   st_report "5065-octopus-webflow-three-parents" "$rc" "non-zero"
@@ -1711,6 +1766,65 @@ self_test() {
     echo "$out" >&2
     failed=1
   fi
+
+  # (#5138 non-merge shift, two pipes) Unsigned, single parent, author email
+  # `dev@example.test|dev@example.test|G`, committer email = the PINNED
+  # OpenPGP fingerprint. Fail-OPEN at bdc0723ae (rc=0). MUST be refused, and
+  # the refusal MUST quote the commit's REAL `%G?` (N), which proves the walk
+  # read the signature field from git rather than from an email.
+  local nm_label
+  for nm_label in two-pipe one-pipe; do
+    if [ "$nm_label" = "two-pipe" ]; then
+      nm_sha="$nm_shift2_sha"
+    else
+      # (#5138 non-merge shift, one pipe + crafted committer) Author email
+      # `dev@example.test|dev@example.test`, committer email `G|<pinned>`:
+      # the same record, reached with one pipe in each email.
+      nm_sha="$nm_shift1_sha"
+    fi
+    rc=0
+    out="$(check_range "$base_sha" "$nm_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" 2>&1)" || rc=$?
+    st_report "5138-nonmerge-${nm_label}-email-shift" "$rc" "1"
+    if [ "$rc" -ne 1 ]; then
+      echo "self-test FAILED: an UNSIGNED non-merge commit whose email fields carry '|' returned $rc, expected 1 (#5138). The walk must read the commit's own %G?/%GF, never text an author wrote into an email:" >&2
+      echo "$out" >&2
+      failed=1
+    elif ! grep -qF "VIOLATION: $nm_sha signature-not-verified (%G?=N)" <<<"$out"; then
+      echo "self-test FAILED: the #5138 ${nm_label} shift cell was refused, but not as signature-not-verified with the commit's REAL %G?=N, so the walk is still reading a shifted field:" >&2
+      echo "$out" >&2
+      failed=1
+    fi
+  done
+
+  # (#5272 walk integrity) The walk is the gate's only source of commits. A
+  # walk that dies partway, ends short with a clean status, tears its last
+  # record, or carries a field git never emits must be INOPERATIVE (2) —
+  # never a PASS over the commits it happened to read. Range base..side1 is
+  # TWO enrolled, SSH-signed commits that PASS through a healthy walk (the
+  # control row), so every non-2 result below is the walk damage leaking out.
+  ln -sf shim.py "$shim_dir/git-truncated-log"
+  ln -sf shim.py "$shim_dir/git-short-log"
+  ln -sf shim.py "$shim_dir/git-torn-log"
+  ln -sf shim.py "$shim_dir/git-malformed-log"
+  rc=0
+  out="$(check_range "$base_sha" "$side1_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" git git 2>&1)" || rc=$?
+  st_report "5272-walk-control-two-commits" "$rc" "0"
+  if [ "$rc" -ne 0 ] || ! grep -q '^SCANNED: 2 commits' <<<"$out"; then
+    echo "self-test FAILED: the #5272 walk control range (two enrolled, SSH-signed commits) did not PASS with SCANNED: 2, so the walk-damage cells below would prove nothing:" >&2
+    echo "$out" >&2
+    failed=1
+  fi
+  local walk_mode
+  for walk_mode in truncated-log short-log torn-log malformed-log; do
+    rc=0
+    out="$(check_range "$base_sha" "$side1_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" git "$shim_dir/git-$walk_mode" 2>&1)" || rc=$?
+    st_report "5272-walk-$walk_mode" "$rc" "2"
+    if [ "$rc" -ne 2 ]; then
+      echo "self-test FAILED: a commit walk damaged as '$walk_mode' returned $rc, expected 2 (INOPERATIVE). A gate that judges only the records it happened to read and reports the result is the #2444 defect class (#5272):" >&2
+      echo "$out" >&2
+      failed=1
+    fi
+  done
 
   # (k) The SHIPPED registries and the SHIPPED key material agree, and a
   # HERMETIC keyring really can be built from them (#5045) — no ephemeral

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A `git` stand-in that breaks ONLY `merge-tree`, for the #5065 self-test.
+"""A `git` stand-in that breaks ONE subcommand, for the signing gate's self-test.
 
 `scripts/check-commit-signing-posture.sh` exempts a merge from the commit
 signing rule only when its recorded tree equals the clean
@@ -25,6 +25,27 @@ argv the gate is given and there is no environment variable to get wrong):
     against a value that means nothing — the shape-validated-never-resolved
     defect class. The gate's probe also asserts the merged CONTENT, so this
     shim must be refused.
+
+The same shim also breaks ONLY `log`, for the commit WALK (#5272, #5138). The
+walk is the gate's only source of the commits it judges, so a walk that dies
+partway, comes up short, tears its last record or carries a malformed field
+must be INOPERATIVE (exit 2), never a PASS over the commits it happened to
+read. Four more names select those modes; each runs the real `git log` first
+and then damages its output:
+
+  * ``git-truncated-log`` — emits only the FIRST record, then exits 128 with a
+    ``fatal:`` line, the way a walk that hits a missing object does.
+  * ``git-short-log`` — emits every record but the last and exits 0: a walk
+    whose exit status is clean but whose output is short, which only a
+    record-count cross-check can see.
+  * ``git-torn-log`` — emits every record but the last, then the first three
+    fields of the last one, and exits 0.
+  * ``git-malformed-log`` — replaces the FIRST record's signature-status field
+    (`%G?`) with a value git never emits, and exits 0.
+
+Records are NUL-delimited fields when the walk passes ``-z`` (the field count
+is read from the ``--format`` argument), and ``|``-delimited lines otherwise,
+so the shim damages either record format the same way.
 
 Used only by the self-test. Never on a production path; nothing in CI invokes
 it directly.
@@ -74,16 +95,86 @@ def real_git():
     return found
 
 
+LOG_MODES = ("truncated-log", "short-log", "torn-log", "malformed-log")
+
+
 def mode_from_name(argv0):
     name = pathlib.Path(argv0).name
     if "absent" in name:
         return "absent"
     if "lying" in name:
         return "lying"
+    for mode in LOG_MODES:
+        if mode in name:
+            return mode
     print("selftest-git-shim-merge-tree: invoked as %r, which names no mode "
-          "(expected a name containing 'absent' or 'lying')" % name,
-          file=sys.stderr)
+          "(expected a name containing 'absent', 'lying' or one of %s)"
+          % (name, ", ".join(LOG_MODES)), file=sys.stderr)
     raise SystemExit(2)
+
+
+def split_records(out, rest):
+    """(records as lists of fields, nul_mode, fields per record)."""
+    if "-z" in rest:
+        fmt = ""
+        for arg in rest:
+            if arg.startswith("--format="):
+                fmt = arg.split("=", 1)[1]
+        width = fmt.count("%x00") + 1
+        toks = out.split(b"\0")
+        if toks and toks[-1] == b"":
+            toks.pop()
+        if len(toks) % width != 0:
+            print("selftest-git-shim-merge-tree: real git log emitted %d fields, "
+                  "not a multiple of %d" % (len(toks), width), file=sys.stderr)
+            raise SystemExit(2)
+        recs = [toks[i:i + width] for i in range(0, len(toks), width)]
+        return recs, True, width
+    lines = out.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    return [line.split(b"|") for line in lines], False, 0
+
+
+def encode(recs, nul_mode):
+    if nul_mode:
+        return b"".join(field + b"\0" for rec in recs for field in rec)
+    return b"".join(b"|".join(rec) + b"\n" for rec in recs)
+
+
+def broken_log(mode, argv, rest):
+    """Run the real `git log`, then damage its output as MODE says."""
+    proc = subprocess.run([real_git()] + argv, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, check=False)
+    if proc.returncode != 0:
+        sys.stderr.buffer.write(proc.stderr)
+        return proc.returncode
+    recs, nul_mode, _width = split_records(proc.stdout, rest)
+    if len(recs) < 2:
+        print("selftest-git-shim-merge-tree: mode %s needs a range of at least "
+              "two commits, got %d" % (mode, len(recs)), file=sys.stderr)
+        return 2
+    out = sys.stdout.buffer
+    if mode == "truncated-log":
+        out.write(encode(recs[:1], nul_mode))
+        out.flush()
+        sys.stderr.write("fatal: bad object (selftest shim: walk truncated)\n")
+        return 128
+    if mode == "short-log":
+        out.write(encode(recs[:-1], nul_mode))
+        return 0
+    if mode == "torn-log":
+        partial = recs[-1][:3]
+        out.write(encode(recs[:-1], nul_mode))
+        if nul_mode:
+            out.write(b"".join(field + b"\0" for field in partial))
+        else:
+            out.write(b"|".join(partial))
+        return 0
+    # malformed-log
+    recs[0][3] = b"Z"
+    out.write(encode(recs, nul_mode))
+    return 0
 
 
 def main():
@@ -96,10 +187,15 @@ def main():
     argv = sys.argv[1:]
     globals_, subcommand, rest = split_argv(argv)
 
+    mode = mode_from_name(sys.argv[0])
+    if mode in LOG_MODES:
+        if subcommand != "log":
+            os.execv(real_git(), ["git"] + argv)
+        return broken_log(mode, argv, rest)
+
     if subcommand != "merge-tree":
         os.execv(real_git(), ["git"] + argv)
 
-    mode = mode_from_name(sys.argv[0])
     if mode == "absent":
         sys.stderr.write(ABSENT_USAGE)
         return 129
