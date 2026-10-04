@@ -231,8 +231,16 @@ EOS
   install -m 0600 "$OUT_DIR/ca.crt" "$run_dir/ca.crt"
   echo "[federate] loadgen bundle: $run_dir"
   # The key is a credential: it goes to a 0600 file in the 0700 run dir, never to the terminal or a log.
-  ( umask 077; on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' > "$run_dir/api-key" )
-  echo "[federate] Phase A API key written to $run_dir/api-key (0600)"
+  local keyf="$run_dir/api-key"
+  rm -f -- "$keyf"
+  # noclobber makes the redirect O_EXCL: a planted symlink or file is refused, never followed.
+  if ! ( umask 077; set -o noclobber; on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' > "$keyf" ) \
+     || [ "$(LC_ALL=C wc -c < "$keyf")" -gt 65 ] \
+     || [ "$(LC_ALL=C grep -Ecx '[0123456789abcdef]{64}' "$keyf")" != 1 ]; then
+    rm -f -- "$keyf"
+    die "could not fetch a 64-hex node API key into $keyf"
+  fi
+  echo "[federate] Phase A API key written to $keyf (0600)"
 }
 
 # --- verify ------------------------------------------------------------------
@@ -251,8 +259,11 @@ node_sh() { ssh $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
 # node_get <idx0> <memory-id> -- read one memory from that node over its own
 # loopback mTLS listener, using the node's own cert + its own api key.
 node_get() {
+  # The id comes from a node HTTP response and is spliced into a root heredoc on
+  # another node: accept only a plain id (explicit list, locale-proof: a range would match non-ASCII).
+  [[ "$2" =~ ^[0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]{1,64}$ ]] || return 3
   node_sh "$1" <<EOS 2>/dev/null
-K=\$(cat /etc/ai-memory/api-key); [[ "\$K" =~ ^[0-9a-f]{64}\$ ]] || exit 3
+K=\$(cat /etc/ai-memory/api-key); [[ "\$K" =~ ^[0123456789abcdef]{64}\$ ]] || exit 3
 printf 'header = "x-api-key: %s"\\n' "\$K" | curl -sS --max-time 15 --config - \\
   --cacert /etc/ai-memory/fed/ca.crt \\
   --cert /etc/ai-memory/fed/node.crt --key /etc/ai-memory/fed/node.key \\
@@ -266,7 +277,7 @@ EOS
 node_post() {
   node_sh "$1" <<EOS 2>/dev/null
 BODY=\$(printf '%s' '$2' | base64 -d)
-K=\$(cat /etc/ai-memory/api-key); [[ "\$K" =~ ^[0-9a-f]{64}\$ ]] || exit 3
+K=\$(cat /etc/ai-memory/api-key); [[ "\$K" =~ ^[0123456789abcdef]{64}\$ ]] || exit 3
 printf 'header = "x-api-key: %s"\\n' "\$K" | curl -sS --max-time 30 --config - \\
   --cacert /etc/ai-memory/fed/ca.crt \\
   --cert /etc/ai-memory/fed/node.crt --key /etc/ai-memory/fed/node.key \\
@@ -333,10 +344,12 @@ EOS
   # Admin admission over the network: allowlisted NAME + request authn (API
   # key) + enrolled client cert. Header trust is OFF on the droplet, so the
   # same request under a non-allowlisted name must be refused (403).
+  # The key must not reach an xtrace log: suspend -x for the rest of verify.
+  case $- in *x*) _fed_xtrace=1; { set +x; } 2>/dev/null ;; *) _fed_xtrace=0 ;; esac
   api_key="$(on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' 2>/dev/null || true)"
   # The key is node-supplied and becomes a curl config line on THIS host: only the
   # minted 64-hex form can carry no quote or newline, so refuse anything else.
-  if [ -n "$api_key" ] && ! [[ "$api_key" =~ ^[0-9a-f]{64}$ ]]; then
+  if [ -n "$api_key" ] && ! [[ "$api_key" =~ ^[0123456789abcdef]{64}$ ]]; then
     die "node api key is not 64 lowercase hex; refusing to build a curl config from it"
   fi
   if [ -n "$api_key" ]; then
@@ -460,6 +473,8 @@ EOS
 
   echo "----"
   echo "federate verify: $pass PASS / $fail FAIL"
+  api_key=""
+  [ "$_fed_xtrace" = 1 ] && set -x
   [ "$fail" -eq 0 ]
 }
 

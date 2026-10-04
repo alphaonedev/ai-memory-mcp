@@ -331,7 +331,7 @@ export SWARM_BASE_URL="https://$(terraform -chdir=infra/do-hive output -raw memo
 export SWARM_CLIENT_CERT="$PWD/.local-runs/do-hive-runs/<UTC>/loadgen/client.crt"
 export SWARM_CLIENT_KEY="$PWD/.local-runs/do-hive-runs/<UTC>/loadgen/client.key"
 export SWARM_CA_CERT="$PWD/.local-runs/do-hive-runs/<UTC>/loadgen/ca.crt"
-export SWARM_API_KEY="$(ssh root@"$(terraform -chdir=infra/do-hive output -raw memory_public_ip)" cat /etc/ai-memory/api-key)"
+export SWARM_API_KEY="$(cat "$PWD/.local-runs/do-hive-runs/<UTC>/loadgen/api-key")"  # 0600 file written by federate.sh loadgen
 PYTHONPATH=sdk/python python -m swarm
 # (On the f2 METAL tier the admin principal is one of the daemon's
 #  AI_MEMORY_ADMIN_AGENT_IDS instead: export SWARM_ADMIN_AGENT_ID=<that id>.)

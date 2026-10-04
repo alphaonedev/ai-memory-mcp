@@ -192,19 +192,55 @@ def p1_federate_key_echo():
         d = pathlib.Path(t)
         rd = d / "run"
         rd.mkdir()
-        script = 'on_node() { printf "%%s\\n" %s; }\nPUBLIC_IPS=(h)\nrun_dir=%s\n%s\n' % (SECRET, rd, blk)
+        pre = 'die() { echo "DIE: $*" >&2; exit 2; }\nPUBLIC_IPS=(h)\nrun_dir=%s\n' % rd
+        script = pre + 'on_node() { printf "%%s\\n" %s; }\np1f() {\n%s\n}\np1f\n' % (SECRET, blk)
         r = run_bash(script, d)
         probe("P1 key block rc 0", r.returncode == 0, r.stderr[:80])
         probe("P1 key not on stdout or stderr", SECRET not in r.stdout and SECRET not in r.stderr)
         kf = rd / "api-key"
         probe("P1 key written to run_dir/api-key", kf.exists() and SECRET in kf.read_text())
         probe("P1 key file mode 0600", kf.exists() and (kf.stat().st_mode & 0o777) == 0o600)
+        kf.unlink()
+        tgt = d / "planted-target"
+        tgt.write_text("")
+        tgt.chmod(0o644)
+        kf.symlink_to(tgt)
+        run_bash(script, d)
+        probe("P1 planted symlink is not followed", tgt.read_text() == "" and not kf.is_symlink())
+        kf.unlink()
+        kf.write_text("old\n")
+        kf.chmod(0o644)
+        run_bash(script, d)
+        probe("P1 pre-existing 0644 file ends 0600", (kf.stat().st_mode & 0o777) == 0o600)
+        r = run_bash(pre + 'on_node() { return 255; }\np1f() {\n%s\n}\np1f\n' % blk, d)
+        probe("P1 failed fetch fails closed and leaves no file", r.returncode != 0 and not kf.exists(), "rc=%d" % r.returncode)
+
+
+def n1_no_locale_ranges():
+    guards = [l for l in (TPL.read_text() + FED.read_text()).splitlines() if "{64}" in l and "=~" in l]
+    probe("N1 four key guards found", len(guards) == 4, str(len(guards)))
+    for g in guards:
+        probe("N1 guard has no locale-dependent range: " + g.strip()[:60], re.search(r"\[[^\]]*\w-\w[^\]]*\]", g) is None)
+
+
+def f2_node_get_id():
+    fn = section(FED.read_text(), "node_get() {", "\n}\n") + "\n}\n"
+    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+        d = pathlib.Path(t)
+        marker = d / "marker-id"
+        stub_dir(d, "curl")
+        key = d / "api-key"
+        key.write_text(SECRET + "\n")
+        node_sh = "node_sh() { /usr/bin/sed 's#/etc/ai-memory/api-key#%s#' | bash; }" % key
+        r = run_bash("AUTHOR_ID=au\n%s\n%s\nnode_get 1 'x;touch %s'\n" % (node_sh, fn, marker), d)
+        probe("F2 node_get refuses a non-plain memory id", r.returncode != 0 and not marker.exists(), "rc=%d" % r.returncode)
 
 
 def n3_main_tf():
     tf = (ROOT / "infra/do-hive/main.tf").read_text()
     cond = next(l for l in tf.splitlines() if "ai_memory_image_url == \"\" ||" in l)
-    probe("N3 main.tf validation refuses empty/dot path segments", "//|/\\\\.\\\\.?(/|$)" in cond, cond[-120:])
+    probe("N3 main.tf validation refuses empty/dot path segments", "&& !can(regex(\"//|/\\\\.\\\\.?(/|$)\"" in cond, cond[-120:])
+    probe("N3 main.tf condition has a single top-level alternative", cond.count("||") == 1, cond[:80])
 
 
 def main():
@@ -216,6 +252,8 @@ def main():
     n1_curl_config_injection()
     p1_federate_key_echo()
     n3_main_tf()
+    n1_no_locale_ranges()
+    f2_node_get_id()
     print("RESULT: %s (%d failed)" % ("FAIL" if FAILS else "PASS", len(FAILS)))
     return 1 if FAILS else 0
 

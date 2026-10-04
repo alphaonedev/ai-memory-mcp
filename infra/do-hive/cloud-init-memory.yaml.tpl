@@ -320,7 +320,7 @@ write_files:
       API_KEY="$(cat /etc/ai-memory/api-key)"
       # The key is spliced into a curl config line and a TOML string below; only
       # the minted 64-hex form can carry no quote or newline, so refuse anything else.
-      [[ "$API_KEY" =~ ^[0-9a-f]{64}$ ]] || fail "/etc/ai-memory/api-key is not 64 lowercase hex"
+      [[ "$API_KEY" =~ ^[0123456789abcdef]{64}$ ]] || fail "/etc/ai-memory/api-key is not 64 lowercase hex"
       # The umask subshell matters: config.toml carries the api_key, so it must
       # never exist even momentarily at the inherited 0644.
       # #2852: the daemon's config resolver (AppConfig::config_path,
