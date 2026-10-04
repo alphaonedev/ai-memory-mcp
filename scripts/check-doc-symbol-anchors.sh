@@ -346,6 +346,13 @@ MDEOF
         'See [recall](src/mcp/tools/recall.rs#L4) for it.'
     anchor_green 5189 "a link with a full-file #L range" \
         'See [`RecallTool`](src/mcp/tools/recall.rs#L1-L4) for it.'
+    # #5268: a column part (#L<a>C<c>) does not hide the line.
+    anchor_red 5268 LINE "a link with a #L<a>C<c> fragment past end-of-file" \
+        'See [recall](src/mcp/tools/recall.rs#L9999C2) for it.'
+    anchor_red 5268 LINE "a link with a #L<a>C<c>-L<b>C<d> range past end-of-file" \
+        'See [recall](src/mcp/tools/recall.rs#L1C2-L9999C3) for it.'
+    anchor_green 5268 "a link with an in-range #L<a>C<c> fragment" \
+        'See [recall](src/mcp/tools/recall.rs#L2C3) for it.'
     # #5265: the second L of a range is optional (#L2-9999 is a range too).
     anchor_red 5265 LINE "a link with an #L<a>-<b> range (no second L) past end-of-file" \
         'See [recall](src/mcp/tools/recall.rs#L2-9999) for it.'
@@ -725,7 +732,7 @@ RELLINK = re.compile(r"\]\((src/[A-Za-z0-9_/]+\.rs)(#[^)\s]*)?\)")
 # #5189: the #L<a>[-L<b>] line fragment of such a link names lines too.
 # Only a RELATIVE link is range-checked; a commit-pinned permalink (an
 # https URL) is immutable and never reaches this rule.
-LINEFRAG = re.compile(r"^#L(\d+)(?:-L?(\d+))?$")
+LINEFRAG = re.compile(r"^#L(\d+)(?:C\d+)?(?:-L?(\d+)(?:C\d+)?)?$")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # A line that DELIBERATELY names a path as absent is not a stale anchor.
