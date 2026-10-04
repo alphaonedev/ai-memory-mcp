@@ -2283,8 +2283,9 @@ EXPAND_CAP = 64
 def expand_uses(uses: list, values: dict) -> list:
     """Each use with every plain $NAME / ${NAME} replaced by each value the template
     assigns NAME, to depth 4 (#5095). The original use stays, so an unknown or operator
-    form still reads as a wildcard in use_glob. Past EXPAND_CAP variants the use stays
-    a wildcard only (fail closed: a wildcard matches more, never less)."""
+    form still reads as a wildcard in use_glob. Past EXPAND_CAP variants the use becomes
+    the root use "/", which runs_path reads as naming every path (fail closed, #5139: a
+    bare wildcard is skipped there as naming no place, so it would drop the use)."""
     ref = re.compile(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)")
     out = []
     for val, safe in uses:
@@ -2309,7 +2310,7 @@ def expand_uses(uses: list, values: dict) -> list:
         if len(seen) <= EXPAND_CAP:
             out.extend((v, safe) for v in seen if v != val)
         else:
-            out.append(("/*", safe))
+            out.append(("/", safe))
     return out
 
 
@@ -2884,6 +2885,7 @@ def build_probes() -> list:
         ('data file under a root directory operand, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      foo /\n' + dec)]),
         ('data file written to a path with a dot segment, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/./run.conf", "0644", ["${X} --db /x stats"])), (dec, '      bash /etc/ai-memory/run.conf\n' + dec)]),
         ('data file named by two variables assigned twice, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/etc/ai-; P=/etc/ai-; Q=memory/run.conf; Q=memory/run.conf; bash "$P$Q"\n' + dec)]),
+        ('data file named by a variable expansion past the cap, listed (#4837 R12 R5, #5139)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      for A in /etc/ai- a2 a3 a4 a5 a6 a7 a8 a9; do for B in memory/run.conf b2 b3 b4 b5 b6 b7 b8 b9; do bash "$A$B"; done; done\n' + dec)]),
     ]
     for lbl, muts in listed:
         red("R3-C listed " + lbl, muts, autolist=True)
