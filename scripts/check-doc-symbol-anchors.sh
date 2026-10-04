@@ -369,6 +369,8 @@ MDEOF
         "[src/mcp/tools/recall.rs:2-4](https://github.com/o/r/blob/${pin40}/src/mcp/tools/recall.rs#L3-L4)"
     bare_red "a pinned permalink whose label range START differs from the #L start (HTML)" \
         "<a href=\"https://github.com/o/r/blob/${pin40}/src/mcp/tools/recall.rs#L1-L4\">src/mcp/tools/recall.rs:2-4</a>"
+    bare_red "a bare anchor in plain text AFTER a closed commit-pinned link (#5215)" \
+        "<a href=\"https://github.com/o/r/blob/${pin40}/src/mcp/tools/recall.rs#L2\">x</a> then src/mcp/tools/recall.rs:2 </a>"
     write_clean
     printf '\n\n[src/mcp/tools/recall.rs:2](https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs#L2)\n' "$pin40" >> "$FIX/README.md"
     printf '<a href="https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs#L3">src/mcp/tools/recall.rs:3</a>\n' "$pin40" >> "$FIX/README.md"
@@ -682,7 +684,11 @@ def pinned_label(line, m):
     if md and line[:start].rfind("[") > line[:start].rfind("]"):
         target = md.group(1)
     elif LABEL_HTML.match(rest) and line[:start].rfind("<a ") >= 0:
-        href = re.findall(r'href="([^"]*)"', line[:start])
+        # #5215: borrow the href only when no closing tag lies between the
+        # last opening <a and the anchor; otherwise the anchor is plain
+        # text after an already-closed link, not that link's label.
+        seg = line[line[:start].rfind("<a "):start]
+        href = re.findall(r'href="([^"]*)"', seg) if "</a>" not in seg else []
         target = href[-1] if href else None
     if target is None:
         return False
