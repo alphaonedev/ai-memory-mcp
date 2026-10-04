@@ -1339,7 +1339,10 @@ def ext_pin_5275():
              # #5357: command substitution strips trailing newlines, so a repeated empty label must still count.
              ("the age label repeated empty and last", "18.6\nage=1.8.0\nage=\nvector=0.8.6\n", False, True),
              ("the vector label repeated empty and last", "18.6\nage=1.8.0\nvector=0.8.6\nvector=", True, False),
-             ("both labels repeated empty and last", "18.6\nage=1.8.0\nage=\nvector=0.8.6\nvector=\n\n", False, False))
+             ("both labels repeated empty and last", "18.6\nage=1.8.0\nage=\nvector=0.8.6\nvector=\n\n", False, False),
+             # #5358: a label in the middle of a line is not a labelled line.
+             ("a mid-line vector label", "18.6 (Ubuntu)\nage=1.8.0\n0.8.vector=6\n", True, False),
+             ("a mid-line age label", "18.6 (Ubuntu)\n1.8.age=0\nvector=0.8.6\n", False, True))
     with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
         d = pathlib.Path(t)
         for label, reply, want_age, want_vec in cases:
