@@ -233,6 +233,13 @@ lab_posture_ssot_check() {
 # return the expected code: the control passes; a weakened value (plain and
 # const-valued), a dropped name and a SET knob moved to UNSET all go red.
 # Prints one line per leg; returns 0 only if every leg behaved.
+# #5155: true when a boot refusal in <file> names the lowered rollback-check knob.
+lab_probe_refusal_names_knob() {
+  # Read to EOF into a variable: `grep -q` closing the pipe early would make a real match
+  # return 141 under pipefail. The trailing colon pins the whole knob name.
+  local text; text="$(grep -v 'INFO' "$1")"
+  grep -q 'refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:' <<<"$text"
+}
 lab_posture_selftest() {
   local root="$1" bad=0 rc name want
   _leg() {  # <name> <want-rc> — runs the check in the CURRENT subshell's arrays
@@ -266,6 +273,27 @@ lab_posture_selftest() {
   printf 'pub const ENV_DB_SYNCHRONOUS: &str = "SHADOW_ENV";\n' >> "$shadow/src/aaa_shadow.rs"
   ( _leg "a name-only const with two distinct values is cannot-check, not first-match" 2 ) || bad=1
   root="$real_root"; rm -rf "$shadow"
+  # #5155: the probe-mutation matcher names the knob WITH its trailing colon, ignores INFO pin
+  # lines, and reads the whole log (a large log must not turn a detection into "inconclusive").
+  local plog; plog="$(mktemp -d "${TMPDIR:-.}/probe-matcher.XXXXXX")" || return 1
+  printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n' > "$plog/ok.log"
+  printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK_STRICT: nope\n' > "$plog/other-knob.log"
+  printf 'INFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/info-only.log"
+  { printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n'
+    local i; for i in $(seq 1 200000); do printf 'filler line to fill the pipe buffer\n'; done; } > "$plog/big.log"
+  ( lab_probe_refusal_names_knob "$plog/ok.log" ) \
+    && echo "  PASS probe matcher: refusal naming the knob is detected" \
+    || { echo "  FAIL probe matcher: refusal naming the knob not detected"; bad=1; }
+  ( lab_probe_refusal_names_knob "$plog/other-knob.log" ) \
+    && { echo "  FAIL probe matcher: a refusal for a longer knob name was counted"; bad=1; } \
+    || echo "  PASS probe matcher: a refusal for a longer knob name is not counted"
+  ( lab_probe_refusal_names_knob "$plog/info-only.log" ) \
+    && { echo "  FAIL probe matcher: an INFO pin line was counted"; bad=1; } \
+    || echo "  PASS probe matcher: an INFO pin line is not counted"
+  ( set -o pipefail; lab_probe_refusal_names_knob "$plog/big.log" ) \
+    && echo "  PASS probe matcher: detection in a large log survives pipefail" \
+    || { echo "  FAIL probe matcher: detection in a large log lost"; bad=1; }
+  rm -rf "$plog"
   unset -f _leg
   return "$bad"
 }
