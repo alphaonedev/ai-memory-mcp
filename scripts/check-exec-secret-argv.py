@@ -552,7 +552,7 @@ CRED_TOOL_RE = re.compile(
     # wget has no short credential flag (its -U is the user agent).
     r"|\b(?:curl\b[^|;&]*\s-[A-Za-z]*[uU]|(?:curl|wget)\b[^|;&]*\s(?:--(?:proxy-|http-|ftp-)?"
     r"(?:user|password|pass)|--(?:proxy-)?tlspassword|--oauth2-bearer)(?![\w-]))[\s=]*"
-    r"(?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?\$"
+    r"(?:\$'[^']*'|[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?(?:\$(?!')|`)"
     # curl -E/--cert <file>:<password>: a variable after the colon is the key password; a
     # variable that names the file alone is not (#4891 round 3)
     r"|\bcurl\b[^|;&]*\s(?:-[A-Za-z]*E|--(?:proxy-)?cert(?![\w-]))[\s=]*"
@@ -562,8 +562,9 @@ CRED_TOOL_RE = re.compile(
     r"|\b(?:docker|podman)\s+login\b[^|;&]*\s(?:-p|--password)(?![\w-])"
     # a credential header in any letter case (#4997), after a combined short flag or --header=
     # (#4993), whose value expands a variable inside or after its quotes (#4891 round 3); a backslash
-    # before a quote is the ssh, sh -c and CMD-SHELL payload shape (#5294)
-    r"|(?:(?<![\w-])-[A-Za-z]*H|--(?:proxy-)?header)[\s=]*\\?[\"']?"
+    # before a quote is the ssh, sh -c and CMD-SHELL payload shape (#5294); a command substitution
+    # or an ANSI-C quote in a value is one word (#5304)
+    r"|(?:(?<![\w-])-[A-Za-z]*H|--(?:proxy-)?header)[\s=]*\\?\$?[\"']?"
     r"(?i:(?:x-)?api-key|authorization|proxy-authorization|x-auth-token)\s*:"
     r"[^\"'$]*(?:[\"'](?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?)?\$")
 
@@ -1369,6 +1370,9 @@ ROUND3_RED = [
     ("ssh payload escaped quotes, combined flags", 'ssh h "curl -sH \\"X-API-Key: $X\\" https://h/"'),
     ("sh -c payload escaped quotes", 'sh -c "curl --header=\\"Authorization: token $X\\" h"'),
     ("curl -H Api-Key without the x- prefix", 'curl -H "Api-Key: $X" h'),
+    ("curl -u backtick substitution word", 'curl -u admin:`cat $PW_FILE` h'),
+    ("curl -u ANSI-C quoted user part", "curl -u $'u:'$X h"),
+    ("curl -H ANSI-C quoted header", "curl -H $'Authorization: Bearer '$X h"),
     ("curl --proxy-header", 'curl --proxy-header "Proxy-Authorization: Basic $X" h'),
 ]
 ROUND3_GREEN = [
@@ -1377,6 +1381,7 @@ ROUND3_GREEN = [
     ("wget -e non-credential settings", 'wget -e robots=off -e "https_proxy=$PROXY_HOST" -O "$TOKEN_FILE" h'),
     ("wget --passive-ftp is not a password option", 'wget --passive-ftp -O "$TOKEN_FILE" h'),
     ("curl --tlsuser is not a password", 'curl --tlsuser "$TLS_USER" h'),
+    ("curl output file with an ANSI-C word", "curl -o \"$TOKEN_FILE\" $'h'"),
     ("curl --user-agent= is not --user", 'curl --user-agent="$UA" h'),
     ("wget -U is the user agent", 'wget -U "$UA" h'),
     ("curl -E with a file only", 'curl -E "$CERT_PATH" h'),
