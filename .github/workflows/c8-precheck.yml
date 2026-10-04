@@ -1356,3 +1356,5 @@ jobs:
         # green near-misses, allowlist form faults, and a mutation of every
         # allowlist entry of both templates; round-3 probes (#4784, #4793-#4795).
         run: python3 scripts/check-cloud-init-serve-flags.py --self-test
+      - name: do-hive argv-secret and image-pin regression probes (#4604, #4866, #4678)
+        run: python3 scripts/test/test_do_hive_argv_secrets_4604_4866_4678.py
