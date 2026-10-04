@@ -5,7 +5,10 @@
 # context: top, a top-level key (bootcmd, runcmd, packages, ...) or the write_files path.
 # line: the template's logical line, whitespace-normalised (runs of blanks collapsed, no edge blanks).
 # Adding an entry approves the exact line for review: the gate still runs the companion rule and the
-# validators on it. A malformed, duplicate, non-normalised, unknown-scope or stale entry fails the gate.
+# validators on it. Per (template, context) the approved lines must be these entries in file order and
+# count: a repeated line needs a repeated entry. A malformed, non-normalised or unknown-scope entry, or
+# one also listed as pending, fails the gate. Regenerate: scripts/regen-cloud-init-token-allow.py <repo-root>
+# (an added, removed or moved line needs --accept-new; review the diff).
 both | top | package_update: true
 do-hive | top | package_upgrade: false
 both | top | bootcmd:

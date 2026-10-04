@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/docs/compliance/evidence/cert-55"
-FIX="$ROOT/.local-runs/cert-55-fixtures"
+export FIX="$ROOT/.local-runs/cert-55-fixtures"
 DEFAULT_BIN="${DEFAULT_BIN:-/home/fate_two/.cache/cargo-target-grok-cert55-default/release/ai-memory}"
 SQLCIPHER_BIN="${SQLCIPHER_BIN:-/home/fate_two/.cache/cargo-target-grok-cert55-sqlcipher/release/ai-memory}"
 export TMPDIR="${TMPDIR:-$ROOT/.local-runs/tmp}"
@@ -18,7 +18,7 @@ import os, base64
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption
 
-fix = Path(os.environ.get("FIX") or Path.cwd() / ".local-runs/cert-55-fixtures")
+fix = Path(os.environ["FIX"])
 fix.mkdir(parents=True, exist_ok=True)
 keys = fix / "keys"
 keys.mkdir(mode=0o700, exist_ok=True)

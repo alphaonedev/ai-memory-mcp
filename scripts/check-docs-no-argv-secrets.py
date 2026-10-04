@@ -31,8 +31,9 @@ What the gate refuses (exit 1):
       - a ``NAME=<value>`` word (also ``--opt=NAME=<value>``) after a wrapper
         that keeps its argv while the child runs or stores it (sudo, doas,
         runuser, timeout, systemd-run, kubectl, oc) where NAME names a
-        password, secret, token or API key. ``env NAME=v cmd`` execs in place
-        and is treated like an env prefix.
+        password, secret, token or API key. ``env NAME=v cmd`` is flagged too:
+        the value is on env's own argv until it execs, and an execve audit
+        (auditd, strace) records it (#4792).
     A systemd ``Environment=`` line carrying a credential URL is refused
     whatever the key spelling (#4689).
 
@@ -228,7 +229,7 @@ CONNINFO_PW_RE = re.compile(r"(?:^|[\s-])password\s*=\s*(?P<pw>'[^']*'|\S+)", re
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
 UNIT_EXEC_RE = re.compile(r"^(?:Exec[A-Za-z]*)=[-@+!:]*")
 UNIT_ENV_RE = re.compile(r"^\s*Environment\s*=", re.I)
-SECRET_NAME_RE = re.compile(r"pass|secret|token|key|cred|(?:^|_)pw(?:_|$)|pwd|auth", re.I)
+SECRET_NAME_RE = re.compile(r"pass|secret|token|key|cred|pw(?:_|$)|pwd|auth", re.I)
 # Wrappers whose NAME=value words are their own argv, not a shell env prefix.
 # A name that holds a location, not the secret itself (AI_MEMORY_KEY_DIR).
 LOCATOR_NAME_RE = re.compile(r"_(?:DIR|FILE|PATH|ID)$", re.I)
@@ -367,11 +368,11 @@ def container_env_hits(words: List[str]) -> List[str]:
             in_cli = True
         elif in_cli:
             val: Optional[str] = None
-            if w in ("-e", "--env") and i + 1 < len(words):
+            if w in ("-e", "--env", "--build-arg") and i + 1 < len(words):
                 val = words[i + 1]
                 i += 1
-            elif w.startswith("--env="):
-                val = w[len("--env="):]
+            elif w.startswith(("--env=", "--build-arg=")):
+                val = w.split("=", 1)[1]
             elif w.startswith("-e") and len(w) > 2 and not w.startswith("--"):
                 val = w[2:]
             if val is not None and "=" in val:
@@ -407,9 +408,50 @@ def word_hits(words: List[str], depth: int = 0) -> List[str]:
             resident = True
             continue
         m = ARGV_ASSIGN_RE.match(w) if resident else None
-        if m and ARGV_SECRET_NAME_RE.search(m.group("name")) and not is_redaction(m.group("value")):
+        if m and secret_name(m.group("name")) and not is_redaction(m.group("value")):
             reasons.append("NAME=value on a resident wrapper argv %s" % m.group("name"))
     return reasons
+
+
+def secret_name(name: str) -> bool:
+    """A NAME that holds a credential: either name rule, and not a locator."""
+    return bool((SECRET_NAME_RE.search(name) or ARGV_SECRET_NAME_RE.search(name))
+                and not LOCATOR_NAME_RE.search(name))
+
+
+# Programs that take a command string as one argv word and keep it on their
+# argv while it runs (ssh, docker exec, sh -c under sudo/runuser).
+STRING_RUNNERS = {"ssh", "sh", "bash", "dash", "zsh", "ksh", "su", "sudo", "doas", "runuser",
+                  "docker", "podman", "nerdctl", "kubectl", "oc", "systemd-run", "timeout", "env"}
+
+
+def string_env_prefix_hits(line: str) -> List[str]:
+    """ssh h "PGPASSWORD=$PW psql": the env prefix inside a command string is
+    part of the runner's argv. In a single-quoted string a $-value is literal
+    text (expanded later, inside the child), so only a literal value counts."""
+    try:
+        lex = shlex.shlex(line, posix=False, punctuation_chars=True)
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        return []
+    if not any(Path(t).name in STRING_RUNNERS for t in toks):
+        return []
+    found: List[str] = []
+    for t in toks:
+        if len(t) < 2 or t[0] not in "\"'" or t[-1] != t[0] or not any(c.isspace() for c in t):
+            continue
+        single = t[0] == "'"
+        for cmd in commands(split_words(t[1:-1])):
+            for a in cmd:
+                if not ASSIGN_RE.match(a):
+                    break
+                name, _, value = a.partition("=")
+                if single and ("$" in value or "`" in value):
+                    continue
+                if secret_name(name) and value and not is_redaction(value):
+                    found.append(name)
+    return found
 
 
 def wrapper_env_hits(words: List[str]) -> List[str]:
@@ -463,7 +505,7 @@ def shell_hits(rel: str, text: str) -> List[Hit]:
             if any(url_credential(m.group("url")) for m in WORD_URL_RE.finditer(" " + body)):
                 hits.append((rel, no, redact(raw_lines[no - 1].strip())))
             continue
-        if any(command_hits(cmd) for cmd in commands(split_words(line))):
+        if any(command_hits(cmd) for cmd in commands(split_words(line))) or string_env_prefix_hits(line):
             hits.append((rel, no, redact(raw_lines[no - 1].strip())))
     return hits
 
@@ -793,6 +835,40 @@ GREEN_SHELL_PROBES.update({
     "r3-C docker run -e bare name": "docker run --rm -e PGPASSWORD img",
     "r3-C redaction token ***": 'psql "postgresql://u:***@h/d"',
     "r3-C echo of a DSN (builtin, no argv)": 'echo "postgresql://u:%s@h/d" > f' % PW,
+})
+RED_SHELL_PROBES.update({
+    # round 4, security reviewer B-series (#4826, #4827, #4808, #4792)
+    "r4 B01 env -i NAME=v": "env -i PGPASSWORD=%s psql -h h" % PW,
+    "r4 B02 /usr/bin/env NAME=v": "/usr/bin/env PGPASSWORD=%s psql" % PW,
+    "r4 B03 env -S 'NAME=v cmd'": "env -S 'PGPASSWORD=%s psql -h h'" % PW,
+    "r4 B04 nohup env NAME=v": "nohup env PGPASSWORD=%s psql &" % PW,
+    "r4 B05 exec env NAME=v": "exec env PGPASSWORD=%s psql" % PW,
+    "r4 B06 env -u X NAME=v": "env -u HOME DB_PASSWORD=%s app" % PW,
+    "r4 B07 systemd-run --setenv=..._KEY=": "systemd-run --setenv=AI_MEMORY_DB_KEY=%s ai-memory serve" % PW,
+    "r4 B08 systemd-run -E DB_PASSPHRASE=": "systemd-run -E DB_PASSPHRASE=%s app" % PW,
+    "r4 B09 kubectl run --env=SQLCIPHER_KEY=": "kubectl run t --image=i --env=SQLCIPHER_KEY=%s" % PW,
+    "r4 B10 timeout 5 NAME_KEY= (needs env)": "timeout 5 env AI_MEMORY_DB_KEY=%s ai-memory list" % PW,
+    "r4 B11 kubectl set env PRIVATE_KEY=": "kubectl set env deploy/x PRIVATE_KEY=%s" % PW,
+    "r4 B12 oc set env CREDENTIALS=": "oc set env dc/x DB_CREDENTIALS=%s" % PW,
+    "r4 B13 kubectl --env=AUTH=": "kubectl run t --image=i --env=AUTH=%s" % PW,
+    "r4 B14 sudo -u pg bash -c 'NAME=v psql'": "sudo -u postgres bash -c \"PGPASSWORD=%s psql -h h\"" % PW,
+    "r4 B15 runuser -- sh -c 'NAME=v psql'": "runuser -u postgres -- sh -c 'PGPASSWORD=%s psql'" % PW,
+    "r4 B16 ssh host 'NAME=v psql'": "ssh host \"PGPASSWORD=%s psql -h h\"" % PW,
+    "r4 B17 docker exec c sh -c 'NAME=v psql'": "docker exec c sh -c 'PGPASSWORD=%s psql'" % PW,
+    "r4 B18 su -c 'NAME=v psql'": "su postgres -c 'PGPASSWORD=%s psql'" % PW,
+    "r4 B19 sudo DBPW=": "sudo DBPW=%s app" % PW,
+    "r4 B20 sudo PGPASS=": "sudo PGPASS=%s psql" % PW,
+    "r4 B21 sudo MYSQL_PWD=": "sudo MYSQL_PWD=%s mysql" % PW,
+    "r4 B22 docker -e DBPW=": "docker run -e DBPW=%s img" % PW,
+    "r4 B23 sudo PW=": "sudo PW=%s app" % PW,
+    "r4 B24 docker build --build-arg PASSWORD=": "docker build --build-arg DB_PASSWORD=%s ." % PW,
+})
+GREEN_SHELL_PROBES.update({
+    "r4 G01 env with locator name": "env AI_MEMORY_KEY_FILE=/k ai-memory serve",
+    "r4 G02 sudo -E (value from env)": "sudo -E psql -h h",
+    "r4 G03 env NAME=$(cat file) is still a value": "env -i HOME=/root psql",
+    "r4 G04 systemd-run --setenv=NAME (no value)": "systemd-run --setenv=PGPASSWORD psql",
+    "r4 kubectl --env locator name": "kubectl run t --image=i --env=AI_MEMORY_KEY_FILE=/k",
 })
 GREEN_PROBES = {
     "file-form": "AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory serve",
