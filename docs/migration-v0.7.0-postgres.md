@@ -240,7 +240,7 @@ sudo systemctl stop ai-memory   # or your service manager
 
 # (b) Reconfigure for postgres. The daemon reads the URL from
 #     AI_MEMORY_STORE_URL_FILE (a 0600 file), then AI_MEMORY_STORE_URL,
-#     then the --store-url flag (src/store_url.rs:137); keep the password
+#     then the --store-url flag (src/store_url.rs::resolve_store_url); keep the password
 #     off the flag so it never reaches /proc/<pid>/cmdline (#4577).
 #     Create the file without the URL on any command line (tee reads stdin):
 sudo install -m 0600 -o ai-memory -g ai-memory /dev/null /etc/ai-memory/store-url
