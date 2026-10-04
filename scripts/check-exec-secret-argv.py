@@ -542,9 +542,10 @@ def deny_lines(dl, rel: str, text: str) -> Dict[int, str]:
 # A credential-taking flag of a known tool fed from any expansion: the value is on argv
 # whatever the variable is called, so such a line is never allow-able (pending + issue only).
 CRED_TOOL_RE = re.compile(
-    r"\b(?:mysql|mariadb|mysqladmin|mysqldump)\b[^|;&]*\s-p[\"']?\$"
+    # mysql family: -p glued to the value, or --password with a space or an equals sign (#4920)
+    r"\b(?:mysql|mariadb|mysqladmin|mysqldump)\b[^|;&]*\s(?:-p|--password(?![\w-])[\s=]*)[\"']?\$"
     r"|\bsshpass\s+-p\s*[\"']?\$"
-    r"|\bredis-cli\b[^|;&]*\s(?:-a|--pass)\s*[\"']?\$"
+    r"|\bredis-cli\b[^|;&]*\s(?:-a|--pass(?![\w-]))[\s=]*[\"']?\$"
     # one shell word after the flag that expands a variable, however its user part is quoted:
     # u:$X, "u:$X", u:"$X", 'u':"$X", "u":"$X" (#5101). A short flag may close a group of
     # combined short flags (-su, -fsSU) (#4993); a long flag is matched whole (not --user-agent).
@@ -1262,6 +1263,11 @@ ROUND3_RED = [
     ("curl -E quoted cert password", "curl -E 'c.pem':\"$X\" h"),
     ("curl --oauth2-bearer", 'curl --oauth2-bearer "$X" h'),
     ("curl --pass", 'curl --pass "$X" --key k.pem h'),
+    ("mysql --password with a space", 'mysql -u r --password "$X" db'),
+    ("mysqldump --password unquoted", 'mysqldump --password $X db'),
+    ("mariadb --password=", 'mariadb -u r --password="$X" db'),
+    ("redis-cli --pass=", 'redis-cli --pass="$X" ping'),
+    ("redis-cli --pass with a space", 'redis-cli --pass "$X" ping'),
     ("wget --password=", 'wget --password="$X" h'),
     ("wget --http-password", 'wget --http-password "$X" h'),
     ("wget --ftp-password", 'wget --ftp-password "$X" h'),
@@ -1282,6 +1288,8 @@ ROUND3_RED = [
     ("curl --proxy-header", 'curl --proxy-header "Proxy-Authorization: Basic $X" h'),
 ]
 ROUND3_GREEN = [
+    ("mysql --password-file is not --password", 'mysql -u r --password-file="$PW_FILE" db'),
+    ("redis-cli --pass-file is not --pass", 'redis-cli --pass-file "$PW_FILE" ping'),
     ("curl --user-agent= is not --user", 'curl --user-agent="$UA" h'),
     ("wget -U is the user agent", 'wget -U "$UA" h'),
     ("curl -E with a file only", 'curl -E "$CERT_PATH" h'),
