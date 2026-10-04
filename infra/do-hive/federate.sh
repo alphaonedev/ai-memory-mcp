@@ -278,9 +278,11 @@ EOS
 node_sh() { ssh $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
 
 # Closed-world output (#4999, 5-agent vote 4d3ea1c5): no byte of a node reply reaches this terminal.
-# A PASS or FAIL line names a node-derived value only through these three helpers, whose output comes
-# from a closed set; a test lists them and fails on any other path from a node value to ok, no, die,
-# echo or printf. reply_status prints a 3-digit HTTP status, or the word non-status for anything else.
+# verify suspends xtrace on its first line (#5237), so no reply reaches an xtrace log either; outside
+# verify a node reply only ever goes to a file or to /dev/null. A PASS or FAIL line names a node-derived
+# value only through these three helpers, whose output comes from a closed set. A static test follows
+# node-derived names to ok, no, die, echo and printf, and whole-verify probes check the printed bytes
+# for hostile replies. reply_status prints a 3-digit HTTP status, or the word non-status for anything else.
 # reply_len prints the reply's byte count. reply_version prints a version token only when it is 1 to 3
 # dot-separated groups of 1 to 3 ASCII digits, and the byte count of the whole reply otherwise.
 reply_status() {
@@ -337,6 +339,9 @@ EOS
 b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 
 verify() {
+  # Neither the key nor any node reply may reach an xtrace log: suspend -x for the whole of verify (#5237);
+  # the end of verify restores it.
+  case $- in *x*) _fed_xtrace=1; { set +x; } 2>/dev/null ;; *) _fed_xtrace=0 ;; esac
   # A1 -- each node answers /health over mTLS with an authorised cert, and
   #       REFUSES a caller presenting no cert (mTLS mandatory, not optional).
   for i in $(seq 0 $((NODE_COUNT - 1))); do
@@ -396,8 +401,6 @@ EOS
   # Admin admission over the network: allowlisted NAME + request authn (API
   # key) + enrolled client cert. Header trust is OFF on the droplet, so the
   # same request under a non-allowlisted name must be refused (403).
-  # The key must not reach an xtrace log: suspend -x for the rest of verify.
-  case $- in *x*) _fed_xtrace=1; { set +x; } 2>/dev/null ;; *) _fed_xtrace=0 ;; esac
   api_key="$(on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' 2>/dev/null || true)"
   # The key is node-supplied and becomes a curl config line on THIS host: only the
   # minted 64-hex form can carry no quote or newline, so refuse anything else.

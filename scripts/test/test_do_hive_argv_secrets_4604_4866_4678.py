@@ -716,7 +716,29 @@ def verify_cost_5247():
     probe("#5247 verify does not strip a node reply with ${v%%...}, ${v##...}, ${v%...} or ${v#...}", not strip, str(strip[:4]))
 
 
-TAINT_SOURCES = ("on_node", "node_sh", "node_get", "node_post", "curl", "lg_curl", "ssh", "scp")
+def verify_trace_5237():
+    """#5237: no node reply and no key reaches an xtrace log of verify (bash -x)."""
+    fs = FED.read_text()
+    mark = "7a11" + "fe" * 30  # synthetic 64-hex marker carried by every node reply
+    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+        d = pathlib.Path(t)
+        for label, h in (("a reply", mark), ("a version reply", "18.6 " + mark)):
+            out, _ = verify_harness(fs, d, h.encode(), True)
+            why = "reply in trace" if mark.encode() in out else ("key in trace" if SECRET.encode() in out else "")
+            probe("#5237 whole verify under bash -x traces no byte of %s and no key" % label,
+                  b"rc=" in out and not why, why or ("" if b"rc=" in out else out[-80:]))
+    v0 = fs.find("verify() {\n")
+    sus = fs.find("{ set +x; } 2>/dev/null", v0)
+    first = min(x for x in (fs.find(c, v0) for c in ("on_node", "node_sh", "node_get", "node_post", "curl")) if x >= 0)
+    probe("#5237 verify suspends xtrace before its first node read", 0 <= v0 < sus < first, "%d %d %d" % (v0, sus, first))
+    head = fs[:fs.find("reply_status() {")]
+    probe("#5237 the closed-world comment names the xtrace suspension it relies on",
+          "verify suspends xtrace on its first line" in head)
+    probe("#5237 no comment says the suspension covers only the rest of verify",
+          "suspend -x for the rest of verify" not in fs)
+
+
+TAINT_SOURCES = ("on_node","node_sh", "node_get", "node_post", "curl", "lg_curl", "ssh", "scp")
 SINKS =("ok", "no", "die", "echo", "printf")
 
 
@@ -1070,7 +1092,11 @@ def f3_static_pins():
     k, x = fed.find('api_key=""'), fed.find("[ \"$_fed_xtrace\" = 1 ] && set -x")
     probe("F3 verify restores xtrace only after the key is cleared", 0 <= k < x, "%d < %d" % (k, x))
     # Behaviour, not text: run the verify key read under bash -x and look for the key in the trace.
-    seg = section(fed, "  # The key must not reach an xtrace log", "  if [ -n \"$api_key\" ]; then")
+    try:
+        seg = (section(fed, "  # Neither the key nor any node reply may reach an xtrace log", "  for i in ")
+               + section(fed, '  api_key="$(on_node', "  if [ -n \"$api_key\" ]; then"))
+    except ValueError:
+        seg = "  false"  # the suspension marker is gone: the behaviour probes below fail, not crash
     with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
         d = pathlib.Path(t)
         r = run_bash('set -x\ndie() { echo "DIE: $*" >&2; exit 2; }\nPUBLIC_IPS=(h)\n'
@@ -1109,6 +1135,7 @@ def main():
     pg_version_5172()
     node_streams_5171()
     verify_cost_5247()
+    verify_trace_5237()
     f3_static_pins()
     print("RESULT: %s (%d failed)" % ("FAIL" if FAILS else "PASS", len(FAILS)))
     return 1 if FAILS else 0
