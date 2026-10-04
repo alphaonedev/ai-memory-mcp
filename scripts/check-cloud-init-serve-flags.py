@@ -1320,7 +1320,9 @@ def validate_line(ln: Line, homes: set, binaries: set) -> list:
         out.extend(dsn_problems(m.group(0), ln.ctx))
     if "allow_lax" in v1:
         out.append("lax store-url permission opt-out")
-    if ln.kind != "unit" and re.search(r"(?<![\w-])ai-memory[\"']?\s+(?:\S+\s+)*?serve(?![\w-])", v1):
+    if not (ln.kind == "unit" and re.match(r"[ \t]*ExecStart=", j)) and re.search(
+        r"(?<![\w-])ai-memory[\"']?[\s,]+(?:[^\s,]+[\s,]+)*?[\"']?serve(?![\w-])", v1
+    ):
         out.append("ai-memory serve outside the unit ExecStart (serve flags are checked only on ExecStart)")
     if re.search(r"pgpassword|pgpassfile", v1):
         out.append("PGPASSWORD/PGPASSFILE")
@@ -1831,6 +1833,10 @@ def build_probes() -> list:
         ("quoted heredoc with base64 -d | sh, listed (#4793)", [(dec, "      cat > /usr/local/bin/pre <<'EOF'\n      echo Y3VybA== | base64 -d | sh\n      EOF\n" + dec)]),
         ("ai-memory serve in the provision script, listed (#4837)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory serve --bind 0.0.0.0:9077\n" + dec)]),
         ("sudo -u ai-memory --db serve in the provision script, listed (#4837)", [(dec, "      sudo -u aimemory /usr/local/lib/ai-memory/bin/ai-memory --db /x serve\n" + dec)]),
+        ("unit ExecStartPost runs serve, listed (#4837)", [(daemon_env, daemon_env + "      ExecStartPost=/usr/local/lib/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9078\n")]),
+        ("unit ExecStartPre runs serve, listed (#4837)", [(daemon_env, daemon_env + "      ExecStartPre=/usr/local/lib/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9078\n")]),
+        ("unit ExecReload runs serve, listed (#4837)", [(daemon_env, daemon_env + "      ExecReload=/usr/local/lib/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9078\n")]),
+        ("runcmd flow list runs serve, listed (#4837)", [(RUNCMD, RUNCMD + "  - [/usr/local/lib/ai-memory/bin/ai-memory, serve, --host, 0.0.0.0, --port, '9078']\n")]),
         ("eval indented below the content block, listed (#4836)", [(dec, dec + '    eval "$PRE"\n')]),
         ("eval indented to the write_files key, listed (#4836)", [(dec, dec + '  eval "$PRE"\n')]),
         ("write_files encoding b64, listed", [(PROV, "  - path: /etc/x.sh\n    encoding: b64\n    content: |\n      Y3VybCBodHRwczovL3g=\n" + PROV)]),
