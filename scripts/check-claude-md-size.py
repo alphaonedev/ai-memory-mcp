@@ -1955,6 +1955,18 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
         ok = False
     ok &= case("R3-F4 pull_request types closed only", good.replace(
         '  pull_request:\n', '  pull_request:\n    types: [closed]\n', 1), "types")
+    ok &= case("R4 push trigger deleted", good.replace(
+        '  push:\n    branches: [main, develop, "release/**", "rehearsal/**"]\n', "", 1), "no `push` trigger")
+    ok &= case("R5 merge_group trigger deleted", good.replace(
+        "  merge_group:\n    types: [checks_requested]\n", "", 1), "pinned form")
+    (wf / "bad.yml").write_bytes(good.encode("utf-8") + b"# \xff\n")
+    if not any("cannot read" in line for line in workflow_errors(wf / "bad.yml", "bad")):
+        print("FAIL: self-test - a workflow that is not UTF-8 was NOT rejected", file=sys.stderr)
+        ok = False
+    (wf / "empty.yml").write_text("", encoding="utf-8")
+    if not workflow_errors(wf / "empty.yml", "empty"):
+        print("FAIL: self-test - an empty workflow file was NOT rejected", file=sys.stderr)
+        ok = False
     missing = wf / "absent.yml"
     if not any("cannot stat" in line for line in workflow_errors(missing, "absent")):
         print("FAIL: self-test - a missing workflow file was NOT rejected", file=sys.stderr)
@@ -2029,6 +2041,14 @@ def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
         "    runs-on: ubuntu-latest", "\truns-on: ubuntu-latest", 1), "indentation")
     ok &= case("R3-F3 pull_request trigger instead", good.replace("  pull_request_target:\n", "  pull_request:\n", 1),
                "differs from the pinned form")
+    (wf / "bad.yml").write_bytes(good.encode("utf-8") + b"# \xff\n")
+    if not any("cannot read" in line for line in compare_workflow_errors(wf / "bad.yml", "bad")):
+        print("FAIL: self-test - a comparison workflow that is not UTF-8 was NOT rejected", file=sys.stderr)
+        ok = False
+    (wf / "empty.yml").write_text("", encoding="utf-8")
+    if not compare_workflow_errors(wf / "empty.yml", "empty"):
+        print("FAIL: self-test - an empty comparison workflow file was NOT rejected", file=sys.stderr)
+        ok = False
     missing = wf / "absent.yml"
     if not any("cannot stat" in line for line in compare_workflow_errors(missing, "absent")):
         print("FAIL: self-test - a missing comparison workflow was NOT rejected", file=sys.stderr)
@@ -2093,6 +2113,48 @@ def run_fence_cases() -> bool:
     return ok
 
 
+def run_main_wiring_case(repo_root: Path, base: Path) -> bool:
+    """R4: main() reports workflow errors. A fixture tree with the real workflows passes all_errors();
+    a narrowed guard workflow and a conditioned comparison workflow each fail it."""
+    ok = True
+    root = base / "wiring"
+    root.mkdir()
+    build_fixture(root)
+    for rel in (WORKFLOW_PATH, COMPARE_WORKFLOW_PATH):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(repo_root / rel, root / rel)
+    update_manifest_quiet(root)
+    pins = fixture_index_pins()
+    errors = all_errors(root, pins)
+    if errors:
+        print(f"FAIL: self-test - the wiring fixture was rejected: {errors[0]}", file=sys.stderr)
+        return False
+    edits = (
+        (WORKFLOW_PATH, '  push:\n    branches: [main, develop, "release/**", "rehearsal/**"]',
+         "  push:\n    branches: [main]", "push"),
+        (COMPARE_WORKFLOW_PATH, "    timeout-minutes: 10", "    timeout-minutes: 10\n    if: false", "`if:`"),
+    )
+    for rel, old, new, needle in edits:
+        target = root / rel
+        good = target.read_text(encoding="utf-8")
+        target.write_text(good.replace(old, new, 1), encoding="utf-8")
+        if not any(needle in line for line in all_errors(root, pins)):
+            print(f"FAIL: self-test - all_errors() did not report an edited {rel} (wanted {needle!r})", file=sys.stderr)
+            ok = False
+        target.write_text(good, encoding="utf-8")
+    return ok
+
+
+def all_errors(root: Path, index_pins=None) -> list:
+    """Every refusal main() reports: the tree checks plus both workflow pins."""
+    errors = check(root, index_pins)
+    errors += workflow_errors(root / WORKFLOW_PATH)
+    errors += compare_workflow_errors(root / COMPARE_WORKFLOW_PATH)
+    return errors
+ 
+ 
+
+
 def self_test() -> int:
     # Scratch lives under <repo>/.local-runs/ (project no-/tmp hard rule), never system /tmp.
     repo_root = Path(__file__).resolve().parent.parent
@@ -2110,6 +2172,7 @@ def self_test() -> int:
         ok &= run_workflow_cases(repo_root, Path(tmp))
         ok &= run_index_entries_case(repo_root)
         ok &= run_fence_cases()
+        ok &= run_main_wiring_case(repo_root, Path(tmp))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if not ok:
@@ -2139,9 +2202,7 @@ def main() -> int:
         for line in ref_errors:
             print(line, file=sys.stderr)
         return 1 if ref_errors else 0
-    errors = check(Path(args.root))
-    errors += workflow_errors(Path(args.root) / WORKFLOW_PATH)
-    errors += compare_workflow_errors(Path(args.root) / COMPARE_WORKFLOW_PATH)
+    errors = all_errors(Path(args.root))
     for line in errors:
         print(line, file=sys.stderr)
     if errors:
