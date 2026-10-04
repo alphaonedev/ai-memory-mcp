@@ -2152,8 +2152,6 @@ def all_errors(root: Path, index_pins=None) -> list:
     errors += workflow_errors(root / WORKFLOW_PATH)
     errors += compare_workflow_errors(root / COMPARE_WORKFLOW_PATH)
     return errors
- 
- 
 
 
 def self_test() -> int:
