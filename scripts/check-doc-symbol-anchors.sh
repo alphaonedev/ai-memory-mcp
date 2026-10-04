@@ -294,6 +294,19 @@ MDEOF
     anchor_green 5191 "an unbackticked URL path segment is not an anchor" \
         'See https://example.com/x/src/mcp/tools/recall.rs::no_such for it.'
 
+    # #5190: a relative link with a plain-text label to a src/ file.
+    anchor_red 5190 PATH "a plain-label link to a missing file" \
+        'See [the handler](src/nope.rs) for it.'
+    anchor_red 5190 PATH "a plain-label ../ link to a missing file" \
+        'See [the handler](../src/nope.rs#L3) for it.'
+    anchor_green 5190 "a plain-label link to a live file" \
+        'See [the handler](src/mcp/tools/recall.rs) for it.'
+    write_clean
+    printf '\n\nSee [`handler`](src/nope.rs) for it.\n' >> "$FIX/README.md"
+    [[ "$(run_fixture_out | grep -c '^FAIL: doc-symbol-anchors \[')" = "1" ]] || {
+        echo "FAIL: self-test #5190 — a backticked-label link to a missing file must be reported exactly once" >&2; exit 1; }
+    echo "PASS: self-test #5190 — a backticked-label link to a missing file is reported exactly once"
+
     # ---- #4651: a BARE src/x.rs:N line anchor (no backtick) ----------
     # Every form the #4651 census found must FAIL as BARE_LN; the only
     # exemption is the label of a commit-pinned permalink (immutable).
@@ -600,6 +613,10 @@ QUAL = re.compile(
 BARE_QUAL = re.compile(
     r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_:]*))")
 MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(([^)]*src/[A-Za-z0-9_/]+\.rs)[^)]*\)")
+# #5190: ANY relative markdown link to a src/ file, whatever its label
+# (MDLINK only sees a backticked-identifier label). canon() has already
+# removed a ./ or ../ prefix, so the target starts with src/.
+RELLINK = re.compile(r"\]\((src/[A-Za-z0-9_/]+\.rs)(#[^)\s]*)?\)")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # A line that DELIBERATELY names a path as absent is not a stale anchor.
@@ -730,6 +747,15 @@ for doc in seen_docs:
                     emit("PATH", doc, ln, tgt, ctx)
             elif sym not in per_file[tgt]:
                 emit("MDLINK", doc, ln, f"{tgt}::{sym}", ctx)
+
+        # #5190: a relative link with a plain-text label must still point at
+        # a file that exists. MDLINK already reported a backticked-label link.
+        md_starts = {m.start(2) for m in MDLINK.finditer(line)}
+        for m in RELLINK.finditer(line):
+            if m.start(1) in md_starts:
+                continue
+            if m.group(1) not in per_file and not absent_ok:
+                emit("PATH", doc, ln, m.group(1), ctx)
 
         # `migrate_vNN` claimed as the LADDER TIP must equal the tip the
         # migration-ladder gate computes. No new SSOT: the value comes
