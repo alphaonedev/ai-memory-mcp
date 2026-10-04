@@ -438,6 +438,141 @@ pub fn schema_ahead_of(err: &anyhow::Error) -> Option<&SchemaAheadOfBinary> {
     err.downcast_ref::<SchemaAheadOfBinary>()
 }
 
+/// v1.0.0 #5035 — the target label every LIFETIME refusal renders in place of
+/// the database path. The open-time refusal names the file because the
+/// operator who ran the verb owns it; a per-write refusal reaches remote MCP /
+/// HTTP callers, so the path goes to the operator WARN line only (ERRORS-12:
+/// the caller learns the condition and the remedy, never host layout).
+pub const LIVE_TARGET_LABEL: &str = "this database";
+
+/// v1.0.0 #5035 — the last observed version the hatch authorised for a
+/// LIFETIME write, so the "OVERRIDDEN" WARN fires once per version instead of
+/// once per write. `i64::MIN` is the never-warned sentinel (no stamp is ever
+/// that value: a stamp below 0 never reaches the hatch).
+static LIVE_HATCH_WARNED: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// v1.0.0 #5035 — the QUIET lifetime twin of [`evaluate`], shared by both
+/// backends' write gates.
+///
+/// [`evaluate`] runs once per open and WARNs on every call; this runs on every
+/// gated WRITE of an already-open connection, so it is silent on the operable
+/// and refused paths (the caller logs the refusal with its own target) and
+/// WARNs once per authorised version on the hatch path.
+///
+/// The verdict is otherwise [`evaluate`]'s, plus the #2555 poison ceiling the
+/// open path checks first:
+///
+/// * `observed <= supported` → operable. A negative or zero stamp is left to
+///   the open-time guard, which owns that corroboration (#2564); the lifetime
+///   gate exists to catch the schema moving FORWARD under a live connection.
+/// * `observed > MAX_SCHEMA_VERSION` → refused, hatch ignored (a poisoned
+///   ledger is not a schema any binary can operate).
+/// * otherwise refused unless [`ENV_ALLOW_SCHEMA_AHEAD`] is the EXACT observed
+///   version (fail-closed on anything else, #131 FBL-14).
+///
+/// # Errors
+///
+/// [`SchemaAheadOfBinary`] rendered against [`LIVE_TARGET_LABEL`].
+pub fn live_write_verdict(
+    observed: i64,
+    supported: i64,
+    backend: &'static str,
+) -> Result<(), SchemaAheadOfBinary> {
+    use std::sync::atomic::Ordering;
+    if observed <= supported {
+        return Ok(());
+    }
+    let target = LIVE_TARGET_LABEL;
+    if observed > crate::storage::migrations::MAX_SCHEMA_VERSION {
+        return Err(SchemaAheadOfBinary {
+            observed,
+            supported,
+            backend,
+            target: target.to_string(),
+            detail: SchemaVersionPoisoned::new(observed, backend, target).detail,
+        });
+    }
+    let raw = std::env::var(ENV_ALLOW_SCHEMA_AHEAD).unwrap_or_default();
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() && trimmed.parse::<i64>() == Ok(observed) {
+        if LIVE_HATCH_WARNED.swap(observed, Ordering::AcqRel) != observed {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                observed,
+                supported,
+                backend,
+                "schema-downgrade guard OVERRIDDEN by operator hatch for writes on an \
+                 already-open connection — the schema moved ahead after open; any write \
+                 may corrupt rows the newer schema owns (warned once per version)"
+            );
+        }
+        return Ok(());
+    }
+    let detail = if trimmed.is_empty() {
+        render(observed, supported, backend, target)
+    } else {
+        render_hatch_mismatch(observed, supported, backend, target, trimmed)
+    };
+    Err(SchemaAheadOfBinary {
+        observed,
+        supported,
+        backend,
+        target: target.to_string(),
+        detail,
+    })
+}
+
+/// v1.0.0 #5035 — the SQLite lifetime write gate, called from
+/// [`crate::storage::record_stop::gate_storage_conn`] (the funnel every
+/// mutating `db::` write and the MCP `tools/call` fence already pass).
+///
+/// One cached single-row read of `schema_version` per gated write. A read
+/// that cannot complete (absent relation on a partial-schema fixture, a
+/// transient I/O fault) is NOT a refusal: the open-time guard owns the
+/// unreadable-stamp disposition (#2445/#2564), and a database that cannot
+/// answer this read fails the write's own statements on the same connection.
+/// The gate refuses only on the positive fact that the schema is ahead.
+///
+/// # Errors
+///
+/// [`crate::storage::StorageError::SchemaAheadOfBinary`] when the recorded
+/// version moved past this binary's tip after the connection was opened and
+/// no exact-version hatch authorises it.
+pub fn gate_live_sqlite_write(
+    conn: &rusqlite::Connection,
+) -> Result<(), crate::storage::StorageError> {
+    let observed: i64 = match conn
+        .prepare_cached(crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL)
+        .and_then(|mut stmt| stmt.query_row([], |r| r.get(0)))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                error = %e,
+                "schema lifetime gate could not read schema_version; deferring to the \
+                 open-time guard and the write's own I/O"
+            );
+            return Ok(());
+        }
+    };
+    let supported = crate::storage::migrations::current_schema_version();
+    live_write_verdict(observed, supported, BACKEND_SQLITE).map_err(|refusal| {
+        tracing::warn!(
+            target: TRACE_TARGET,
+            observed,
+            supported,
+            db = conn.path().unwrap_or(":memory:"),
+            "schema-downgrade guard REFUSED a write on an already-open connection — \
+             the database schema moved ahead of this binary after open (#5035)"
+        );
+        crate::storage::StorageError::SchemaAheadOfBinary {
+            detail: refusal.detail,
+        }
+    })
+}
+
 /// v1.0.0 #3411 / #3434 — slug for a schema-behind refusal on a read-only
 /// verb (`boot`, `doctor`). A writer would migrate; these verbs must not.
 pub const SCHEMA_BEHIND_READ_ONLY_REFUSAL: &str =
@@ -739,6 +874,46 @@ mod tests {
         // a unit file pinned at 92 stops authorising once the DB reaches 93.
         with_hatch(Some("92"), || {
             assert!(evaluate(93, 87, BACKEND_SQLITE, "/db").is_err());
+        });
+    }
+
+    #[test]
+    fn live_verdict_is_path_free_and_fails_closed_5035() {
+        with_hatch(None, || {
+            assert!(live_write_verdict(87, 87, BACKEND_SQLITE).is_ok());
+            assert!(live_write_verdict(-1, 87, BACKEND_POSTGRES).is_ok());
+            let err = live_write_verdict(92, 87, BACKEND_POSTGRES)
+                .expect_err("a schema that moved ahead must be refused");
+            assert_eq!((err.observed, err.supported), (92, 87));
+            assert_eq!(err.target, LIVE_TARGET_LABEL);
+            assert!(err.detail.contains(LIVE_TARGET_LABEL), "{}", err.detail);
+            assert!(!err.detail.contains('/'), "no path: {}", err.detail);
+        });
+        with_hatch(Some("92"), || {
+            assert!(live_write_verdict(92, 87, BACKEND_SQLITE).is_ok());
+            assert!(live_write_verdict(93, 87, BACKEND_SQLITE).is_err());
+        });
+        for bad in ["1", "true", "  ", "92x", "-92"] {
+            with_hatch(Some(bad), || {
+                assert!(
+                    live_write_verdict(92, 87, BACKEND_SQLITE).is_err(),
+                    "value {bad:?} must fail closed"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn live_verdict_refuses_a_poisoned_stamp_even_under_a_matching_hatch_5035() {
+        let poisoned = crate::storage::migrations::MAX_SCHEMA_VERSION + 1;
+        with_hatch(Some(&poisoned.to_string()), || {
+            let err = live_write_verdict(poisoned, 87, BACKEND_POSTGRES)
+                .expect_err("a poisoned ledger is never operable");
+            assert_eq!(err.observed, poisoned);
+            assert_eq!(
+                err.detail,
+                SchemaVersionPoisoned::new(poisoned, BACKEND_POSTGRES, LIVE_TARGET_LABEL).detail
+            );
         });
     }
 

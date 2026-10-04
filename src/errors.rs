@@ -720,6 +720,7 @@ mod arch_9_slug_tests {
             StorageError::RecordStopIndeterminate { reason: "r".into() },
             StorageError::TraversalBudgetExceeded,
             StorageError::AuditTrailUnavailable { reason: "r".into() },
+            StorageError::SchemaAheadOfBinary { detail: "d".into() },
         ];
         let expected = [
             NOT_FOUND,
@@ -739,6 +740,7 @@ mod arch_9_slug_tests {
             RECORD_STOP_INDETERMINATE,
             TRAVERSAL_BUDGET_EXCEEDED,
             AUDIT_TRAIL_UNAVAILABLE,
+            SCHEMA_AHEAD_OF_BINARY,
         ];
         // #3196 — pin the lengths so a variant added to only one array is a
         // loud failure, not a silently `zip`-truncated skip.
@@ -875,6 +877,12 @@ pub enum MemoryError {
     /// trail is not recording (`AI_MEMORY_REQUIRE_AUDIT_TRAIL`). Our own text,
     /// passed through unchanged; HTTP 503 because it clears itself.
     AuditTrailUnavailable(String),
+    /// v1.0.0 #5035 — a mutating operation refused because the database schema
+    /// moved AHEAD of this binary after the connection was opened. Our own
+    /// path-free text (`schema_guard::LIVE_TARGET_LABEL`), passed through
+    /// unchanged; HTTP 503 with wire slug `SCHEMA_AHEAD_OF_BINARY`, the same
+    /// envelope the SAL `StoreError::SchemaAheadOfBinary` maps to.
+    SchemaAheadOfBinary(String),
 }
 
 impl MemoryError {
@@ -913,6 +921,7 @@ impl MemoryError {
             Self::QuotaExceeded(_) => error_codes::QUOTA_EXCEEDED,
             Self::Refused(_) => error_codes::REFUSED,
             Self::AuditTrailUnavailable(_) => error_codes::AUDIT_TRAIL_UNAVAILABLE,
+            Self::SchemaAheadOfBinary(_) => error_codes::SCHEMA_AHEAD_OF_BINARY,
         }
     }
 
@@ -941,7 +950,9 @@ impl MemoryError {
             }
             Self::QuotaExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Refused(_) => StatusCode::FORBIDDEN,
-            Self::AuditTrailUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::AuditTrailUnavailable(_) | Self::SchemaAheadOfBinary(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         }
     }
 
@@ -955,7 +966,8 @@ impl MemoryError {
             | Self::Llm(m)
             | Self::Codec(m)
             | Self::Refused(m)
-            | Self::AuditTrailUnavailable(m) => m.clone(),
+            | Self::AuditTrailUnavailable(m)
+            | Self::SchemaAheadOfBinary(m) => m.clone(),
             Self::ReflectionDepthExceeded {
                 attempted,
                 cap,
@@ -1141,6 +1153,8 @@ impl From<anyhow::Error> for MemoryError {
                 SE::TraversalBudgetExceeded => Self::ValidationFailed(se.to_string()),
                 // #4400 — retryable and self-clearing: its own 503 variant.
                 SE::AuditTrailUnavailable { .. } => Self::AuditTrailUnavailable(se.to_string()),
+                // #5035 — the lifetime schema-ahead refusal: its own 503 variant.
+                SE::SchemaAheadOfBinary { .. } => Self::SchemaAheadOfBinary(se.to_string()),
             };
         }
         Self::DatabaseError(e.to_string())

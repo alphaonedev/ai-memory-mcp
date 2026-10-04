@@ -143,6 +143,16 @@ pub enum StorageError {
     /// [`Self::RecordStopped`], an operator decision persisted in the chain.
     AuditTrailUnavailable { reason: String },
 
+    /// v1.0.0 #5035 — a mutating `db::` write refused because the recorded
+    /// schema version moved AHEAD of this binary after the connection was
+    /// opened (a newer binary migrated the file under a long-lived daemon).
+    /// The #2445 open-time refusal, held for the connection's lifetime.
+    /// `detail` is the path-free rendering from
+    /// [`crate::storage::schema_guard::live_write_verdict`] (wire slug
+    /// `SCHEMA_AHEAD_OF_BINARY`, HTTP 503 — the same code the SAL twin
+    /// `store::StoreError::SchemaAheadOfBinary` carries).
+    SchemaAheadOfBinary { detail: String },
+
     /// v1.0.0 #3196 — a `find_paths` traversal was refused because it would
     /// materialise more than
     /// [`crate::storage::FIND_PATHS_MAX_PREFIXES`] path-prefixes. Emitted by
@@ -229,6 +239,7 @@ impl std::fmt::Display for StorageError {
                  mutating operation refused, retry): {reason}",
             ),
             Self::AuditTrailUnavailable { reason } => f.write_str(reason),
+            Self::SchemaAheadOfBinary { detail } => f.write_str(detail),
             // #3196 — routed through the shared message builder so the SQLite
             // and Postgres budget-exceeded surfaces are byte-identical.
             Self::TraversalBudgetExceeded => {
@@ -289,6 +300,7 @@ impl StorageError {
             Self::AuditTrailUnavailable { .. } => {
                 crate::errors::error_codes::AUDIT_TRAIL_UNAVAILABLE
             }
+            Self::SchemaAheadOfBinary { .. } => crate::errors::error_codes::SCHEMA_AHEAD_OF_BINARY,
             Self::TraversalBudgetExceeded => crate::errors::error_codes::TRAVERSAL_BUDGET_EXCEEDED,
         }
     }
