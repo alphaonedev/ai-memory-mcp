@@ -353,8 +353,16 @@ def dockerfile_units(text: str) -> List[Unit]:
         if not _is_comment(raw):
             break
     out: List[Unit] = []
-    units = join_logical(lines, cont)
-    by_start = {u[0]: u for u in units}
+    # Docker removes a whole comment line (and an empty line) inside a continued instruction
+    # before it joins the continuation, so the instruction goes on past it (#4995).
+    kept: List[Tuple[int, str]] = []
+    joining = False
+    for no, raw in lines:
+        if joining and (_is_comment(raw) or not raw.strip()):
+            continue
+        kept.append((no, raw))
+        joining = _cont_end(raw, cont) and not _is_comment(raw)
+    units = join_logical(kept, cont)
     k = 0
     while k < len(units):
         start, end, t = units[k]
@@ -371,7 +379,6 @@ def dockerfile_units(text: str) -> List[Unit]:
                 k += 1
             out.extend(join_logical(body))
             k += 1
-    del by_start
     return out
 
 
@@ -1192,6 +1199,13 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
             bad.append("%s fed from a variable is not tagged denylist (#4920)" % label)
         elif not check_allow_vs_denylist({"c.sh": res}, [("reason: r", "c.sh", 1, norm(line), 1)]):
             bad.append("%s fed from a variable could be allowed (#4920)" % label)
+    # a Dockerfile comment line inside a RUN continuation does not end the instruction (#4995)
+    for label, mid in (("comment", "  # note\n"), ("comment ending in a backslash", "  # note \\\n"),
+                       ("blank line", "\n")):
+        n += 1
+        df = "FROM x\nRUN apk add y \\\n%s  && tool --opt $API_TOKEN\n" % mid
+        if not scan_exec_file(dl, "Dockerfile", df):
+            bad.append("a Dockerfile %s inside a RUN continuation hid the next line (#4995)" % label)
     # the judge refuses a line held in both lists, and a prose line held in allow (#4910)
     n += 3
     one = {"a.sh": [(1, "x --token $T", ["flag"])]}
