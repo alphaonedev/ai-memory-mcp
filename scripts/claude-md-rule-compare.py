@@ -45,7 +45,19 @@ MANIFEST_REL = "scripts/qc-allowlists/claude-md-rule-sections.sha256"
 DATA_PATHS = ("CLAUDE.md", "docs/reference/ARCHITECTURE_REFERENCE.md", "docs/reference/CODE_STYLE.md")
 TRAILER = re.compile(r"^Rule-Change-Approved-By: (\S.*)$", re.MULTILINE)
 SHA = re.compile(r"^[0-9a-f]{40}$")
-DIGITS = re.compile(r"\d+")
+# R4 (#4507): a digit is rule text (a vote size, a file threshold, a release branch). Only a digit run that is a
+# public-surface census count INSIDE the prime-directive section (the generated inventory line) may change without
+# the trailer; the same words in any other section are rule text. Fail closed, the precedent of root issue #4869.
+CENSUS_SECTION = "## Prime directive"
+CENSUS_DIGITS = re.compile(
+    r"\b\d+(?=\s+(?:MCP tools|production HTTP route registrations|unique URL paths|CLI subcommands|"
+    r"in the default build)\b)")
+# R4 (#4507): the code and configuration that judge a rule change. A change to any of them is reported and needs
+# the trailer, so a guard weakened in one PR cannot silently judge the next one. The manifest is not listed: the
+# section comparison above already judges it against the base.
+TRUSTED_PATHS = ("scripts/check-claude-md-size.py", "scripts/claude-md-rule-compare.py",
+                 ".github/workflows/claude-md-guard.yml", ".github/workflows/claude-md-rule-compare.yml",
+                 ".github/CODEOWNERS")
 DIFF_LINE_CAP = 200
 MAX_BLOB_BYTES = 2 * 1024 * 1024  # far above any legitimate file; refuses a memory-exhaustion blob
 # Messages of the base guard that the section comparison already reports in its own words.
@@ -119,6 +131,21 @@ def section_texts(guard, text: str) -> dict:
     return {key: "\n".join(lines) for key, lines in bodies.items()}
 
 
+def fenced(body: str, info: str = "diff") -> list:
+    """R4 (#4507): a code fence one backtick longer than the longest backtick run in `body`, so head text can
+    never close the block early and render as Markdown in the job summary."""
+    longest = max((len(run) for run in re.findall(r"`+", body)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return [fence + info, body, fence]
+
+
+def trusted_changes(repo: Path, base_sha: str, head_sha: str) -> list:
+    """The TRUSTED_PATHS the head changes relative to its merge base with the base (fail closed on git error)."""
+    merge_base = git(repo, "merge-base", base_sha, head_sha).decode("ascii").strip()
+    out = git(repo, "diff", "--name-only", "-z", "--no-renames", merge_base, head_sha, "--", *TRUSTED_PATHS)
+    return sorted(name.decode("utf-8", "replace") for name in out.split(b"\0") if name)
+
+
 def unified(old: str, new: str, key: str) -> str:
     diff = list(difflib.unified_diff(old.split("\n"), new.split("\n"), "base", "head", lineterm="", n=2))
     if len(diff) > DIFF_LINE_CAP:
@@ -167,15 +194,16 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
             continue
         old = base_bodies.get(key)
         new = head_bodies.get(key)
-        if old is not None and new is not None and DIGITS.sub("#", old) == DIGITS.sub("#", new):
+        if old is not None and new is not None and key.startswith(CENSUS_SECTION) and (
+                CENSUS_DIGITS.sub("#", old) == CENSUS_DIGITS.sub("#", new)):
             count_changed = True
-            lines += [f"### COUNT CHANGED: {key}", "", "Only digit runs differ.", "", "```diff",
-                      unified(old, new, key), "```", ""]
+            lines += [f"### COUNT CHANGED: {key}", "", "Only census counts differ.", ""] + fenced(
+                unified(old, new, key)) + [""]
         else:
             rule_changed = True
             state = "removed" if new is None else ("added" if old is None else "changed")
-            lines += [f"### RULE TEXT CHANGED ({state}): {key}", "", "```diff",
-                      unified(old or "", new or "", key), "```", ""]
+            lines += [f"### RULE TEXT CHANGED ({state}): {key}", ""] + fenced(
+                unified(old or "", new or "", key)) + [""]
     for key in duplicates:
         rule_changed = True
         lines += [f"### RULE TEXT CHANGED (duplicated heading): {key}", ""]
@@ -185,6 +213,9 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
         lines.append(f"- BASE GUARD REFUSES THE HEAD: {error}")
     if residual:
         lines.append("")
+    for rel in trusted_changes(repo, base_sha, head_sha):
+        rule_changed = True
+        lines.append(f"- GUARD CHANGED: {rel} (the code that judges rule changes; needs the trailer)")
     approved = approvals(repo, base_sha, head_sha)
     failed = False
     if rule_changed and not approved:
@@ -228,9 +259,17 @@ def make_repo(guard, root: Path):
     guard.build_fixture(root)
     path = root / "CLAUDE.md"
     heading = guard.CLAUDE_MD_REQUIRED_HEADINGS[2]
-    path.write_text(path.read_text(encoding="utf-8").replace(
-        heading + "\n", heading + "\nThe tool limit is 103 tools.\n", 1), encoding="utf-8")
+    census = next(h for h in guard.CLAUDE_MD_REQUIRED_HEADINGS if h.startswith(CENSUS_SECTION))
+    text = path.read_text(encoding="utf-8").replace(
+        heading + "\n", heading + "\nThe tool limit is 103 tools.\nThe vote needs 5 MCP tools.\n", 1)
+    path.write_text(text.replace(
+        census + "\n", census + "\nThe surface has 103 MCP tools and 99 CLI subcommands (97 in the default build). A vote needs 5 agents.\n",
+        1), encoding="utf-8")
     guard.update_manifest_quiet(root)
+    for rel in TRUSTED_PATHS:
+        stub = root / rel
+        stub.parent.mkdir(parents=True, exist_ok=True)
+        stub.write_text("# stub\n", encoding="utf-8")
     return commit_all(root, "base")
 
 
@@ -313,11 +352,90 @@ def self_test() -> int:
 
     case("same-size filler swap is a rule change", filler, True, "RULE TEXT CHANGED")
 
-    def count(root):
-        edit("103 tools", "104 tools")(root)
+    census_heading = next(h for h in guard.CLAUDE_MD_REQUIRED_HEADINGS if h.startswith(CENSUS_SECTION))
+
+    def census_edit(old, new):
+        def apply(root):
+            edit(old, new)(root)
+            reseal(root)
+        return apply
+
+    case("a census-count change prints COUNT CHANGED and passes", census_edit("103 MCP tools", "104 MCP tools"),
+         False, "COUNT CHANGED")
+    case("every census phrase may change together (R4)", census_edit(
+        "103 MCP tools and 99 CLI subcommands (97 in the default build)",
+        "110 MCP tools and 101 CLI subcommands (98 in the default build)"), False, "COUNT CHANGED")
+    case("a digit change in prose outside the census is a rule change (R4)",
+         census_edit("tool limit is 103 tools", "tool limit is 1 tools"), True, "RULE TEXT CHANGED")
+    case("a vote size next to census words outside the prime directive is a rule change (R4)",
+         census_edit("The vote needs 5 MCP tools.", "The vote needs 1 MCP tools."), True, "RULE TEXT CHANGED")
+    case("a prose digit in the census section is a rule change (R4)",
+         census_edit("A vote needs 5 agents.", "A vote needs 1 agents."), True, "RULE TEXT CHANGED")
+    case("a census digit plus a prose digit together is a rule change (R4)", census_edit(
+        "The surface has 103 MCP tools and 99 CLI subcommands (97 in the default build). A vote needs 5 agents.",
+        "The surface has 104 MCP tools and 99 CLI subcommands (97 in the default build). A vote needs 1 agents."),
+        True, "RULE TEXT CHANGED")
+    case("a census unit word changed with the same digits is a rule change (R4)",
+         census_edit("103 MCP tools and", "103 MCP toolz and"), True, "RULE TEXT CHANGED")
+    case("a census digit changed without its unit word is a rule change (R4)",
+         census_edit("(97 in the default build)", "(97 in the default build) 12"), True, "RULE TEXT CHANGED")
+
+    def trusted_write(rel, data=b"# weakened\n"):
+        def apply(root):
+            target = root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        return apply
+
+    guard_edit = trusted_write(GUARD_REL)
+    case("a change to the guard code is reported and needs the trailer (R4)", guard_edit, True, "GUARD CHANGED")
+    case("a guard change with the trailer passes (R4)", guard_edit, False, "approval trailer(s)", trailer="Justin")
+    for rel in TRUSTED_PATHS:
+        case(f"a change to {rel} is reported and needs the trailer (R4)", trusted_write(rel), True,
+             f"GUARD CHANGED: {rel}")
+
+    def rename_guard(root):
+        subprocess.run(["git", "-C", str(root), "mv", GUARD_REL, GUARD_REL + ".old"], check=True)
+
+    case("a renamed trusted file is reported (R4)", rename_guard, True, f"GUARD CHANGED: {GUARD_REL}")
+
+    def delete_compare_workflow(root):
+        (root / ".github/workflows/claude-md-rule-compare.yml").unlink()
+
+    case("a deleted trusted workflow is reported (R4)", delete_compare_workflow, True,
+         "GUARD CHANGED: .github/workflows/claude-md-rule-compare.yml")
+    case("a workflow trigger block removed is reported (R4)", trusted_write(
+        ".github/workflows/claude-md-guard.yml", b"name: stub\n"), True,
+        "GUARD CHANGED: .github/workflows/claude-md-guard.yml")
+    case("a trusted workflow that is not UTF-8 is reported, not a crash (R4)", trusted_write(
+        ".github/workflows/claude-md-guard.yml", b"\xff\xfe\x00"), True,
+        "GUARD CHANGED: .github/workflows/claude-md-guard.yml")
+
+    def chmod_guard(root):
+        (root / GUARD_REL).chmod(0o755)
+
+    case("a mode change of a trusted file is reported (R4)", chmod_guard, True, f"GUARD CHANGED: {GUARD_REL}")
+
+    def symlink_guard(root):
+        target = root / GUARD_REL
+        target.unlink()
+        target.symlink_to("claude-md-rule-compare.py")
+
+    case("a trusted file replaced by a symlink is reported (R4)", symlink_guard, True, f"GUARD CHANGED: {GUARD_REL}")
+    case("a change to an untrusted file is not a guard change (R4)", trusted_write("README.md", b"hi\n"), False,
+         "no rule section differs")
+
+    def fence_check(root):
+        edit("tool limit is 103 tools", "tool limit is 103 tools\n```\n[link](https://e.invalid)")(root)
         reseal(root)
 
-    case("a digit-only change prints COUNT CHANGED and passes", count, False, "COUNT CHANGED")
+    case("head backticks cannot close the summary fence (R4)", fence_check, True, "````diff")
+
+    def long_fence(root):
+        edit("tool limit is 103 tools", "tool limit is 103 tools\n``````\n[link](https://e.invalid)")(root)
+        reseal(root)
+
+    case("a long head backtick run gets a longer fence (R4)", long_fence, True, "```````diff")
 
     def reseal_only(root):
         manifest = root / MANIFEST_REL
