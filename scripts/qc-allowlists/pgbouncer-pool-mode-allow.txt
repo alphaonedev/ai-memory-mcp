@@ -195,7 +195,10 @@ infra/pgbouncer/docker-compose.yml | # real postgres+age backend on 5432 in sess
 
 # #4710 R3 (regen --accept-new, reviewed line by line): ini comments: each states session mode behaviour (one server connection per client); the active setting is pool_mode = session, checked by the gate
 infra/pgbouncer/pgbouncer.ini | # client disconnects, which is the only time session mode releases a server. | ctx:1cc34629abca
-infra/pgbouncer/pgbouncer.ini | # in session mode each client connection holds one server connection for its | ctx:6120da4f778b
+# #4710 R3 (regen --accept-new, reviewed line by line): ini comments: each states session mode behaviour (one server connection per client); the active setting is pool_mode = session, checked by the gate
+# context re-read on 2026-10-04: the line states that session mode holds one server connection per client, which is true; only the neighbouring sigma was reworded to the word sum
+infra/pgbouncer/pgbouncer.ini | # in session mode each client connection holds one server connection for its | ctx:a55013deedec
+# #4710 R3 (regen --accept-new, reviewed line by line): ini comments: each states session mode behaviour (one server connection per client); the active setting is pool_mode = session, checked by the gate
 infra/pgbouncer/pgbouncer.ini | # line present). it is kept as shipped; in session mode every client owns its | ctx:3576410d0222
 infra/pgbouncer/pgbouncer.ini | # session hygiene (#4736). in session mode a server connection is reused by | ctx:5edb9a1036d2
 

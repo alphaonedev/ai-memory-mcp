@@ -277,19 +277,35 @@ _SEPARATORS = re.compile(r"[\"'{}\[\](),]|_(?=mode)|(?<=pgbouncer)_")
 _PG_SPLIT = re.compile(r"\bpg[\s_-]+bouncer", re.I)
 
 
+# #5363: every Latin-script letter folds to the ASCII letter its Unicode name gives (small capitals, strokes), so a
+# mode word written in them is read as the word it spells, with no neighbouring ASCII letter needed.
+_LATIN_NAME = re.compile(r"^LATIN (?:(?:CAPITAL|SMALL) LETTER|LETTER SMALL CAPITAL) ([A-Z])(?: WITH [A-Z ]+)?$")
+
+
+class _LatinFold(dict):
+    def __missing__(self, cp: int) -> object:
+        found = _LATIN_NAME.match(unicodedata.name(chr(cp), "")) if cp > 0x7F else None
+        self[cp] = found.group(1).lower() if found else cp
+        return self[cp]
+
+
+_LATIN = _LatinFold()
+
+
 def shadow(text: str) -> str:
     """Mention-detection view of a normalised line: NFKD, format and combining marks dropped,
     look-alikes folded, `pg bouncer` spellings joined. The unit text (allowlist key) is unchanged."""
     t = unicodedata.normalize("NFKD", text)
-    t = "".join(c for c in t if unicodedata.category(c) not in ("Cf", "Mn")).translate(CONFUSABLE).translate(_INVISIBLE).casefold()
+    t = "".join(c for c in t if unicodedata.category(c) not in ("Cf", "Mn")).translate(CONFUSABLE).translate(_INVISIBLE)
+    t = t.translate(_LATIN).casefold()
     t = _TOKEN.sub(_fold_word, t)
     return re.sub(r"\bpg[\s_-]+bouncer", "pgbouncer", t)
 
 
 # R9 (#4667 round 6, closed world): the characters a reader can trust to show what they are. Printable ASCII and a
 # short typographic set (curly quotes, dashes, ellipsis, arrows, section sign, middle dot, inequality and
-# multiplication signs, box-drawing lines); everything else that touches an ASCII letter after the shadow fold may
-# hide a word, and U+FFFD marks an invalid byte the decoder replaced.
+# multiplication signs, box-drawing lines); every other letter, and any other character that touches an ASCII letter,
+# after the shadow fold may hide a word, and U+FFFD marks an invalid byte the decoder replaced.
 DECLARED = frozenset(map(chr, range(0x20, 0x7F))) | frozenset(
     "\u2018\u2019\u201c\u201d\u2013\u2014\u2026\u2190\u2192\u2194\u21d2\u00a7\u00b7\u00d7\u2264\u2265\u2500\u2502")
 _ANSI_CSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")  # colour codes in recorded terminal logs render as nothing
@@ -308,16 +324,32 @@ def hidden_chars(text: str) -> str:
     for i, c in enumerate(view):
         if c in DECLARED or c.isspace():
             continue
-        if (i and _ascii_letter(view[i - 1])) or (i + 1 < len(view) and _ascii_letter(view[i + 1])):
+        if unicodedata.category(c).startswith("L"):
+            found.add(c)  # #5363: a letter the fold does not know can spell a word on its own (small capitals)
+        elif (i and _ascii_letter(view[i - 1])) or (i + 1 < len(view) and _ascii_letter(view[i + 1])):
             found.add(c)
     return "".join(sorted(found))
+
+
+_LOOKALIKE_SCRIPTS = frozenset(("LATIN", "CYRILLIC", "GREEK", "ARMENIAN", "CHEROKEE", "COPTIC"))
+_LOOKALIKE_RUN = 4
+
+
+def _lookalike_word(view: str) -> bool:
+    """#5363: a word of four or more letters that are all non-ASCII letters of a script with Latin look-alikes: it can
+    spell a mode word with no ASCII letter and no pool word on the line to give it away."""
+    for word in _TOKEN.findall(view):
+        if len(word) >= _LOOKALIKE_RUN and all(
+                not c.isascii() and unicodedata.name(c, "?").split(" ", 1)[0] in _LOOKALIKE_SCRIPTS for c in word):
+            return True
+    return False
 
 
 def unreadable(text: str) -> bool:
     """R9: a line that may hide a pooler claim: U+FFFD anywhere, or a hiding character on a line that names a
     pool, mode or product word."""
     hidden = hidden_chars(text)
-    return bool(hidden) and ("\ufffd" in hidden or bool(_QUICK.search(shadow(text))))
+    return bool(hidden) and ("\ufffd" in hidden or bool(_QUICK.search(shadow(text))) or _lookalike_word(shadow(text)))
 
 
 def _mentions_one(text: str) -> bool:
@@ -790,6 +822,13 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("R9: three look-alikes the fold does not know", "docs/a.md", "Run PgBouncer in tr\u0251ns\u0251cti\u0254n mode.\n"),
     ("R9: a control character inside a word", "docs/a.md", "Run PgBouncer in tra\x01nsaction mode.\n"),
     ("R9: a symbol joined to the words of a pooler line", "docs/a.md", "Set the pooler to tr\u2016ansaction.\n"),
+    # #5363: a mode word made only of letters the fold does not know (small capitals), with or without an ASCII neighbour
+    ("R9 #5363: a mode word of small capitals only", "docs/a.md", "Run PgBouncer in \u1d1b\u0280\u1d00\u0274\ua731\u1d00\u1d04\u1d1b\u026a\u1d0f\u0274 \u1d0d\u1d0f\u1d05\u1d07.\n"),
+    ("R9 #5363: small capitals pooling after an ASCII-touching letter", "docs/a.md", "Use \u1d1b\u0280\u1d00\u0274s\u1d00\u1d04\u1d1b\u026a\u1d0f\u0274 \u1d18\u1d0f\u1d0f\u029f\u026a\u0274\u0262.\n"),
+    ("R9 #5363: a letter the fold does not know, spaced, on a pool line", "docs/a.md", "Run PgBouncer in \u0434\u0436\u0437\u0438\u044f mode.\n"),
+    ("R9 #5363: small capitals on a config context line fold to the mode word", "docs/a.md",
+     "```ini\npool_mode = session\ndefault = \u1d1b\u0280\u1d00\u0274s\u1d00\u1d04\u1d1b\u026a\u1d0f\u0274\n```\n"),
+    ("R9 #5363: a four-letter foreign word with no pool word on the line", "docs/a.md", "Look at \u0434\u0436\u0437\u044f here.\n"),
     ("lowercase ini line", "docs/a.md", "pool_mode = transaction\n"),
     ("uppercase POOL_MODE", "docs/a.md", "POOL_MODE = transaction\n"),
     ("yaml pool_mode:", "deploy/pgb.yaml", "pool_mode: transaction\n"),
@@ -928,6 +967,7 @@ GREEN: List[Tuple[str, str, str]] = [
     ("R9 declared typographic characters on a pool line", "docs/a.md", "The pool has \u2265 2 servers \u2014 see \u00a75.6 \u2192 notes.\n"),
     ("R9 an accented letter folds to ASCII", "docs/a.md", "The caf\u00e9 pool opens at nine.\n"),
     ("R9 a hiding character on a line with no pool word", "docs/a.md", "Latency is 50 \u03bcs per call.\n"),
+    ("R9 #5363 a three-letter foreign word and a Hebrew word with no pool word", "docs/a.md", "See \u0434\u0436\u0437 and \u05e9\u05dc\u05d5\u05dd here.\n"),
     ("R9 colour codes in a recorded log", "docs/run.log", "\x1b[33mWARN\x1b[0m pool size 5\n"),
 ]
 
@@ -1293,9 +1333,15 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("R9 unreadable lines are units", "                raw.append((base + i + 1, text, (i,)))  # R9", "                pass  # R9"),
     ("R9 U+FFFD always counts", '    found = {"\\ufffd"} if "\\ufffd" in text else set()', "    found = set()"),
     ("R9 approved shapes hold DECLARED characters", "    if not all(c in DECLARED for c in text):\n        return False", "    if False:\n        return False"),
-    ("R9 needs a pool word", "or bool(_QUICK.search(shadow(text))))", "or True)"),
+    ("R9 needs a pool word", "or bool(_QUICK.search(shadow(text))) or _lookalike", "or True or _lookalike"),
     ("R9 colour codes dropped", '    view = shadow(_ANSI_CSI.sub("", text))', "    view = shadow(text)"),
-    ("R9 a character touching a letter", "        if (i and _ascii_letter(view[i - 1])) or (i + 1 < len(view) and _ascii_letter(view[i + 1])):", "        if False:"),
+    ("R9 a character touching a letter", "        elif (i and _ascii_letter(view[i - 1])) or (i + 1 < len(view) and _ascii_letter(view[i + 1])):", "        elif False:"),
+    ("R9 #5363 any non-ASCII letter counts", '        if unicodedata.category(c).startswith("L"):', "        if False:"),
+    ("R9 #5363 Latin letters fold by name", "    t = t.translate(_LATIN).casefold()", "    t = t.casefold()"),
+    ("R9 #5363 a foreign word is unreadable without a pool word", "or _lookalike_word(shadow(text)))", ")"),
+    ("R9 #5363 foreign word run length", "_LOOKALIKE_RUN = 4", "_LOOKALIKE_RUN = 3"),
+    ("R9 #5363 foreign word run bound", "if len(word) >= _LOOKALIKE_RUN and all(", "if len(word) > _LOOKALIKE_RUN and all("),
+    ("R9 #5363 lookalike scripts closed set", '"LATIN", "CYRILLIC", "GREEK", "ARMENIAN", "CHEROKEE", "COPTIC"', '"LATIN", "GREEK", "ARMENIAN", "CHEROKEE", "COPTIC"'),
 ]
 
 
