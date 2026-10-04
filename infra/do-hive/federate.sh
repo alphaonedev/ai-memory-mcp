@@ -386,11 +386,13 @@ EOS
     # #5172: the server_version token (first line, up to the first space) must be exactly 18.6.
     # A sed pipeline, not ${versions%%...}: bash suffix removal is quadratic in the reply length (#5247).
     pg_ver="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '1{s/ .*//;p;q;}')"
-    age_ver="$(printf '%s\n' "$versions" | sed -n 's/^age=//p' | head -n 1)"
-    vec_ver="$(printf '%s\n' "$versions" | sed -n 's/^vector=//p' | head -n 1)"
+    # #5275: each extension version comes only from its own labelled line after server_version and must
+    # equal the pin exactly; an absent or repeated label leaves a value that is not the pin, so it fails.
+    age_ver="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '2,$s/^age=//p')"
+    vec_ver="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '2,$s/^vector=//p')"
     [ "$pg_ver" = 18.6 ] && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 (got $(reply_version "$pg_ver" "$versions"))"
-    echo "$versions" | grep -qx 'age=1.8.0' && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 (got $(reply_version "$age_ver" "$versions"))"
-    echo "$versions" | grep -qx 'vector=0.8.6' && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 (got $(reply_version "$vec_ver" "$versions"))"
+    [ "$age_ver" = 1.8.0 ] && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 (got $(reply_version "$age_ver" "$versions"))"
+    [ "$vec_ver" = 0.8.6 ] && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 (got $(reply_version "$vec_ver" "$versions"))"
   done
 
   # These two assertions intentionally originate on f2/public internet.

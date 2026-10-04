@@ -1300,6 +1300,34 @@ def pg_version_5172():
         probe("#5172 18.6 on a line after server_version does not pass", len(pg) == 1 and pg[0].startswith("NO"), "%s" % pg)
 
 
+def ext_pin_5275():
+    """#5275: AGE and pgvector pass only on their own labelled line after server_version, exactly once."""
+    fs = FED.read_text()
+    defs = reply_defs(fs)
+    cases = (("the certified reply", "18.6\nage=1.8.0\nvector=0.8.6\n", True, True),
+             ("a non-certified age line before a certified one", "18.6\nage=1.7.0\nage=1.8.0\nvector=0.8.6\n", False, True),
+             ("age=1.8.0 on the server_version line", "age=1.8.0\nage=1.7.0\nvector=0.8.6\n", False, True),
+             ("age=1.8.0 on the server_version line and no age row", "age=1.8.0\nvector=0.8.6\n", False, True),
+             ("the age line twice", "18.6\nage=1.8.0\nage=1.8.0\nvector=0.8.6\n", False, True),
+             ("no age row", "18.6\nvector=0.8.6\n", False, True),
+             ("a non-certified vector line before a certified one", "18.6\nage=1.8.0\nvector=0.8.5\nvector=0.8.6\n", True, False),
+             ("vector=0.8.6 on the server_version line", "vector=0.8.6\nage=1.8.0\nvector=0.8.5\n", True, False),
+             ("vector=0.8.6 on the server_version line and no vector row", "vector=0.8.6\nage=1.8.0\n", True, False),
+             ("the vector line twice", "18.6\nage=1.8.0\nvector=0.8.6\nvector=0.8.6\n", True, False),
+             ("a trailing byte after the version", "18.6\nage=1.8.0 \nvector=0.8.6\r\n", False, False))
+    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+        d = pathlib.Path(t)
+        for label, reply, want_age, want_vec in cases:
+            r = run_versions(fs, defs, reply, d)
+            out = r.stdout.splitlines()
+            age = [l for l in out if " AGE " in l]
+            vec = [l for l in out if " pgvector " in l]
+            good = (bool(version_block(fs)) and len(age) == 1 and len(vec) == 1
+                    and age[0].startswith("OK" if want_age else "NO") and vec[0].startswith("OK" if want_vec else "NO"))
+            probe("#5275 %s gives AGE %s, pgvector %s" % (label, "PASS" if want_age else "FAIL", "PASS" if want_vec else "FAIL"),
+                  good, "" if good else "%s %s" % (age, vec))
+
+
 def f2_id_lists_agree():
     fs = FED.read_text()
     lists = re.findall(r"\^(\[[^\]]*\])\{1,64\}\$", "\n".join(l for l in fs.splitlines() if "=~" in l and "1,64" in l))
@@ -1358,6 +1386,7 @@ def main():
     f2_node_get_id()
     f2_id_lists_agree()
     pg_version_5172()
+    ext_pin_5275()
     node_streams_5171()
     ssh_batch_5274()
     verify_cost_5247()
