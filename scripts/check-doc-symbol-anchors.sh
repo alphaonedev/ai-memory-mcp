@@ -340,6 +340,11 @@ MDEOF
         'See [recall](src/mcp/tools/recall.rs#L4) for it.'
     anchor_green 5189 "a link with a full-file #L range" \
         'See [`RecallTool`](src/mcp/tools/recall.rs#L1-L4) for it.'
+    # #5265: the second L of a range is optional (#L2-9999 is a range too).
+    anchor_red 5265 LINE "a link with an #L<a>-<b> range (no second L) past end-of-file" \
+        'See [recall](src/mcp/tools/recall.rs#L2-9999) for it.'
+    anchor_green 5265 "a link with an in-range #L<a>-<b> range (no second L)" \
+        'See [recall](src/mcp/tools/recall.rs#L2-4) for it.'
     anchor_green 5189 "a commit-pinned permalink link keeps its own #L (immutable)" \
         "See [recall](https://github.com/o/r/blob/${pin40}/src/mcp/tools/recall.rs#L9999) for it."
     write_clean
