@@ -149,33 +149,72 @@ FLAG = r"--[\"']*store[\"']*[-_][\"']*url[\"']*"
 ARG_RE = re.compile(FLAG + r"(?:=|(?:\s|\\)+)[\"']?(?P<url>" + SCHEME + r"[^\s\"']+)")
 
 # #4603: a runtime expansion of the store-URL env var, or of any variable named
-# like a DSN / URL, straight after the flag. A `_FILE` variable is the
-# sanctioned channel and is not matched.
+# like a DSN / URL / URI / CONN (#4808, #4802), or a command substitution
+# (#4802), straight after the flag. A `_FILE` variable is the sanctioned
+# channel and is not matched.
 EXPANSION_RE = re.compile(
-    FLAG + r"(?:=|(?:\s|\\)+)[\"']?\\*\$\{?[A-Za-z0-9_]*(?:DSN|URL)(?![A-Za-z0-9_])",
+    FLAG + r"(?:=|(?:\s|\\)+)[\"']?"
+    r"(?:\\*\$\{?[A-Za-z0-9_]*(?:DSN|URL|URI|CONN)(?![A-Za-z0-9_])|\$\(|`)",
     re.IGNORECASE,
 )
 # #4609: xtrace echoes every expanded command, so a credential-bearing line
 # must sit between `set +x` and `set -x`.
-XTRACE_ON_RE = re.compile(r"^\s*set\s+-[a-z]*x")
-XTRACE_OFF_RE = re.compile(r"^\s*set\s+\+[a-z]*x")
+# #4802: also `set -o xtrace` / `set +o xtrace`, a `#!/bin/bash -x` shebang,
+# and names ending in pw / pass ($PGPW, $DB_PASS).
+XTRACE_ON_RE = re.compile(r"^\s*set\s+(?:-[a-z]*x|-o\s+xtrace\b)")
+SHEBANG_X_RE = re.compile(r"^#!\S+(?:\s+\S+)?\s+-[a-z]*x")
+XTRACE_OFF_RE = re.compile(r"^\s*set\s+(?:\+[a-z]*x|\+o\s+xtrace\b)")
 TRACED_SECRET_RE = re.compile(
-    r"\$\{?(?:[A-Za-z0-9_]*(?:password|passwd|secret|token|_pw)|pw)(?![A-Za-z0-9])",
+    r"\$\{?[A-Za-z0-9_]*(?:password|passwd|pass|secret|token|pw)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 # #4604: a password literal in a psql -c / --command SQL string.
+# #4802: combined short flags (-tAc) and E'...' strings; #4808: $$...$$ and
+# $tag$...$tag$ dollar quoting.
 PSQL_ARGV_RE = re.compile(
-    r"\bpsql\b[^\n]*?\s(?:-c|--command)(?:=|\s)\s*[\"'][^\n]*?\bPASSWORD\s+\\?'(?P<pw>[^'\s]+)",
+    r"\bpsql\b[^\n]*?\s(?:-[A-Za-z]*c|--command)(?:=|\s)\s*[\"'][^\n]*?\bPASSWORD\s+"
+    r"(?:[Ee]?\\?'(?P<pw>[^'\s]+)|\\?\$(?P<tag>[A-Za-z_][A-Za-z0-9_]*)?\$(?P<pwd>[^\s$]+))",
     re.IGNORECASE,
 )
 # #4617: a runtime-expanded password on a docker -e / psql -v argv word.
+# #4859 (subsumes #4817, #4808): psql at a line start, by absolute path, after
+# $( ` ; | & or a quote; -v, joined -vNAME=, --set and --variable; a literal or
+# expanded value. #4802: a glued -eNAME=, AI_MEMORY_STORE_URL, and sh -c.
 ENV_ARGV_RE = re.compile(
-    r"(?:\s-e|\s--env)(?:=|\s)\s*[\"']?(?:PGPASSWORD|POSTGRES_PASSWORD)=[\"']?(?P<pw>\$[^\s\"']+)"
-    r"|\spsql\b[^\n]*?\s-v\s+(?:pw|password|passwd)=[\"']?(?P<pw2>\$[^\s\"']+)",
-    re.IGNORECASE,
+    r"(?:\s-e|\s--env)(?:=|\s)?\s*[\"']?(?:PGPASSWORD|POSTGRES_PASSWORD|AI_MEMORY_STORE_URL)=[\"']?(?P<pw>\$[^\s\"']+)"
+    r"|\b(?:ba)?sh\s+-c\s+[\"'][^\"'\n]*\bPGPASSWORD=(?P<pw3>\$[^\s\"']+)"
+    r"|(?:^|[\s;|&(`/\"'])psql\b[^\n]*?\s(?:-v\s*|--set(?:=|\s+)|--variable(?:=|\s+))"
+    r"[\"']?(?:pw|password|passwd)=[\"']?(?P<pw2>[^\s\"']+)",
+    re.IGNORECASE | re.MULTILINE,
 )
 SECRET_VAR_RE = re.compile(
-    r"\$\{[A-Za-z0-9_]*(?:password|passwd|secret|token|key|cred)[A-Za-z0-9_]*\}",
+    r"\$\{[A-Za-z0-9_]*(?:(?:password|passwd|secret|token|key|cred)[A-Za-z0-9_]*|pw|pass)\}",
+    re.IGNORECASE,
+)
+# #4802: a psql / pg_* connection URI carrying a password, in any tracked file
+# (the migration guides, #4804). Stops at a backtick, ; | & or a < redirect
+# (a here-string is stdin, not argv); a comment line is not run.
+PSQL_URL_RE = re.compile(
+    r"^(?![ \t]*#)[^\n]*?\b(?:psql|pg_dump|pg_dumpall|pg_restore|pg_isready)\b[^\n`;|&<]*?"
+    r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s/@\"':]*:(?P<pw>[^\s/@\"']+)@",
+    re.MULTILINE,
+)
+# #4808: a DSN-named container env var carrying scheme://user:PASSWORD@.
+DOCKER_ENV_DSN_RE = re.compile(
+    r"(?:\s-e|\s--env)(?:=|\s)?\s*[\"']?[A-Za-z0-9_]*(?:URL|DSN|URI|CONN)[A-Za-z0-9_]*="
+    r"[\"']?[A-Za-z][A-Za-z0-9+.\-]*://[^\s/@\"':]*:(?P<pw>[^\s/@\"']+)@",
+    re.IGNORECASE,
+)
+# #4808: the quoted remote command of ssh is an ssh argv word, so a URL with a
+# password anywhere inside it is on the local process list.
+SSH_REMOTE_URL_RE = re.compile(
+    r"\bssh\b[^\n]*?\s[\"'][^\n]*?[A-Za-z][A-Za-z0-9+.\-]*://[^\s/@\"':]*:(?P<pw>[^\s/@\"']+)@"
+)
+# #4808: a literal container password. The shell reader refuses every literal
+# (the stricter rule wins); in prose only the named CI fixture constants pass.
+FIXTURE_PASSWORDS = {"ai_memory_test", "ci_verify"}
+DOCKER_ENV_LITERAL_RE = re.compile(
+    r"(?:\s-e|\s--env)(?:=|\s)?\s*[\"']?(?:PGPASSWORD|POSTGRES_PASSWORD)=[\"']?(?P<pw>[^\s\"'$][^\s\"']*)",
     re.IGNORECASE,
 )
 ENTRY_RE = re.compile(r"^(?P<indent>\s*)- path:\s*(?P<path>\S+)")
@@ -487,6 +526,9 @@ def scan_xtrace(rel: str, text: str) -> List[Hit]:
     hits: List[Hit] = []
     traced = False
     for n, ln in enumerate(text.splitlines(), 1):
+        if n == 1 and SHEBANG_X_RE.match(ln):
+            traced = True
+            continue
         if ln.lstrip().startswith("#"):
             continue
         if XTRACE_OFF_RE.match(ln):
@@ -508,15 +550,27 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
         line, snippet = _line_of(text, m.start())
         hits.append((rel, line, "[store-url-expansion] " + snippet))
     for m in PSQL_ARGV_RE.finditer(text):
-        if is_redaction(m.group("pw")):
+        if is_redaction(m.group("pw") or m.group("pwd") or ""):
             continue
         line, snippet = _line_of(text, m.start())
         hits.append((rel, line, "[psql-password-argv] " + snippet))
     for m in ENV_ARGV_RE.finditer(text):
-        if is_redaction(m.group("pw") or m.group("pw2") or ""):
+        if is_redaction(m.group("pw") or m.group("pw2") or m.group("pw3") or ""):
             continue
         line, snippet = _line_of(text, m.start())
         hits.append((rel, line, "[env-password-argv] " + snippet))
+    for rule, tag in ((PSQL_URL_RE, "psql-url-password"), (DOCKER_ENV_DSN_RE, "env-dsn-argv"),
+                      (SSH_REMOTE_URL_RE, "ssh-remote-url-password")):
+        for m in rule.finditer(text):
+            if is_redaction(m.group("pw")):
+                continue
+            line, snippet = _line_of(text, m.start())
+            hits.append((rel, line, "[%s] %s" % (tag, snippet)))
+    for m in DOCKER_ENV_LITERAL_RE.finditer(text):
+        if m.group("pw") in FIXTURE_PASSWORDS or is_redaction(m.group("pw")):
+            continue
+        line, snippet = _line_of(text, m.start())
+        hits.append((rel, line, "[env-password-literal] " + snippet))
     if rel.endswith((".tpl", ".yaml", ".yml")):
         hits.extend(scan_write_files(rel, text))
     if rel.endswith((".sh", ".tpl", ".yaml", ".yml")):
@@ -749,6 +803,9 @@ GREEN_PROBES = {
     "ellipsis-char": "ai-memory serve %s postgres://user:…@h/db" % SU,
     "lookalike-flag": "wake_abab.sh %s-src postgres://u:p@h/d" % SU,
     "prose-mention": "the `serve %s` connection URL (e.g. postgres://user:pass@host/db)" % SU,
+    # #4808: in prose only the named CI fixture constants pass as a literal
+    # container password (the shell reader refuses every literal).
+    "4808 docker -e fixture password": "docker run -e POSTGRES_PASSWORD=ci_verify postgres:16",
 }
 
 
@@ -774,6 +831,37 @@ RED_PROBES_4600 = {
     "docker-exec-pgpassword": "ssh h \"docker exec -e PGPASSWORD='$SU_PW' c psql -U postgres\"",
     "docker-run-postgres-password": "docker run -d -e POSTGRES_PASSWORD=\"$PGPW\" img",
     "psql-v-pw": "docker exec -i c psql -v ON_ERROR_STOP=1 -v pw='$PG_PW' -f -",
+    "psql-v-pw-line-start": "psql -v ON_ERROR_STOP=1 -v pw='$PG_PW' -U postgres -f -",
+    "psql-v-pw-abs-path": '/usr/bin/psql -v pw="$PG_PW" -f x.sql',
+    "psql-v-pw-substitution": 'out=$(psql -v pw="$PG_PW" -f x.sql)',
+    "psql-v-pw-after-semicolon": 'true;psql -v pw="$PG_PW" -f x.sql',
+    "psql-set-pw": 'psql --set pw="$PG_PW" -f x.sql',
+    "psql-variable-pw": 'psql --variable=pw="$PG_PW" -f x.sql',
+    "psql-v-pw-joined": 'psql -vpw="$PG_PW" -f x.sql',
+    "psql-v-pw-literal": "psql -v pw=litsecret9 -f x.sql",
+    # #4808: the forms the #4782 gate missed.
+    "4808-docker-e-dsn-literal": "docker run -e DATABASE_URL=postgres://u:hunter2@h/d img",
+    "4808-psql-set-equals-pw": 'psql --set=pw="$PG_PW" -f bootstrap.sql',
+    "4808-psql-variable-space-pw": 'psql --variable pw="$PG_PW" -f bootstrap.sql',
+    "4808-expansion-conn-var": 'ai-memory serve --store-url "$PG_CONN"',
+    "4808-ssh-remote-env-dsn": "ssh root@h \"AI_MEMORY_STORE_URL='postgres://a:$PG_PW@127.0.0.1/a' ai-memory serve\"",
+    "4808-docker-e-literal-password": "docker run -e POSTGRES_PASSWORD=Sup3rS3cret postgres:16",
+    "4808-psql-dollar-quoted": "psql -c \"ALTER ROLE u PASSWORD $$hunter2$$\"",
+    "4808-psql-dollar-tag-quoted": "psql -c \"ALTER ROLE u PASSWORD $pw$hunter2$pw$\"",
+    # #4802: the 13 untracked forms of the #4782 code review.
+    "4802-psql-uri-password": 'psql "postgres://u:hunter2@h:5432/d" -c "select 1"',
+    "4802-psql-combined-c": "psql -U postgres -tAc \"ALTER ROLE u PASSWORD '$x'\"",
+    "4802-psql-e-string": "psql -c \"ALTER ROLE u PASSWORD E'hunter2'\"",
+    "4802-expansion-substitution": 'ai-memory serve --store-url "$(cat f)"',
+    "4802-expansion-backtick": "ai-memory serve --store-url `cat f`",
+    "4802-expansion-uri-var": 'ai-memory serve --store-url "$PG_URI"',
+    "4802-docker-e-store-url": 'docker run -e AI_MEMORY_STORE_URL="$DSN" img serve',
+    "4802-docker-e-glued": 'docker run -ePOSTGRES_PASSWORD="$PG_PW" postgres:16',
+    "4802-sh-c-pgpassword": 'sh -c "PGPASSWORD=$X psql -h h"',
+    "4802-set-o-xtrace": "set -o xtrace\nprintf '%s' \"$DB_PASS\" | x\n",
+    "4802-shebang-x": "#!/bin/bash -x\nprintf '%s' \"$PGPW\" | x\n",
+    "4802-traced-pw-suffix": "set -x\nprintf '%s' \"$PGPW\" | x\n",
+    "4802-cloud-init-pw-var": "write_files:\n  - path: /opt/p.sh\n    permissions: '0755'\n    content: |\n      x '${pg_pw}'\n",
     # #4609: xtrace on while the password is handled.
     "xtrace-secret": "set -euxo pipefail\nprintf '%s' ${db_password} > /etc/x\n",
     "xtrace-secret-after-restore": "set -x\nset +x\nset -x\necho $PG_PW\n",
@@ -783,6 +871,12 @@ RED_PROBES_4600 = {
     "cloud-init-0755": "write_files:\n  - path: /opt/p.sh\n    permissions: '0755'\n    content: |\n      x '${db_password}'\n",
     "cloud-init-no-perms": "write_files:\n  - path: /opt/p.sh\n    content: |\n      x ${api_token}\n",
 }
+RED_PROBES.update({
+    # #4802 / #4804: a psql URI password in a prose file (the migration guides).
+    "4804 psql URI password in prose": "psql 'postgres://aimemory:%s@HOST:5432/aimemory' -c x" % PW,
+    "4808 docker -e literal password in prose": "docker run -e POSTGRES_PASSWORD=%s postgres:16" % PW,
+    "4859 psql --set password in prose": 'psql --set=pw="$PG_PW" -f bootstrap.sql',
+})
 GREEN_PROBES_4600 = {
     "file-form": "AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory serve",
     "no-password": "ai-memory serve --store-url postgres://u@h/d",
@@ -798,6 +892,16 @@ GREEN_PROBES_4600 = {
     "docker-e-inherit": 'PGPASSWORD="$PW" docker exec -e PGPASSWORD c psql -U u',
     "docker-env-file": "docker run -d --env-file /run/s/su.env img",
     "psql-v-no-secret": "psql -v ON_ERROR_STOP=1 -f -",
+    "4859-psql-v-non-secret-name": "psql -v ON_ERROR_STOP=1 -v role=aimemory -f x.sql",
+    "4808-docker-e-dsn-inherit": "docker run -e DATABASE_URL img",
+    "4808-docker-e-dsn-no-password": "docker run -e DATABASE_URL=postgres://u@h/d img",
+    "4808-psql-set-no-secret": "psql --set=ON_ERROR_STOP=1 -f bootstrap.sql",
+    "4808-expansion-conn-file": 'ai-memory serve --store-url "$PG_CONN_FILE"',
+    "4808-ssh-remote-stdin-url": "ssh root@h \"IFS= read -r AI_MEMORY_STORE_URL; ai-memory serve\" < url",
+    "4808-psql-dollar-redacted": "psql -c \"ALTER ROLE u PASSWORD $$...$$\"",
+    "4802-set-plus-o-xtrace": "set -o xtrace\nset +o xtrace\nprintf '%s' \"$DB_PASS\" | x\nset -x\n",
+    "4804-psql-pgpass-uri": "psql 'postgres://aimemory@HOST:5432/aimemory' -c x",
+    "4802-psql-uri-comment": "# psql postgres://u:hunter2@h/d",
     "xtrace-off-around-secret": "set -euxo pipefail\nset +x\nprintf '%s' ${db_password} > /etc/x\nset -x\n",
     "xtrace-no-secret": "set -x\necho ${node_index}\n",
     "no-xtrace-secret": "set -euo pipefail\nprintf '%s' ${db_password} > /etc/x\n",
@@ -950,7 +1054,9 @@ def self_test() -> int:
                 print("SELF-TEST FAIL: green shell probe %r (%s) was flagged" % (name, suffix), file=sys.stderr)
                 bad += 1
     red += 1
-    if scan_text("probe.md", RED_SHELL_PROBES["4663 psql with a literal password"]):
+    # A psql URI password is a text rule now (#4802), so the prose-file check
+    # uses a form only the shell reader refuses (a NAME=value on a sudo argv).
+    if scan_text("probe.md", RED_SHELL_PROBES["r3 sudo NAME=value keeps the password on the sudo argv"]):
         print("SELF-TEST FAIL: a prose file (.md) was read as a shell file", file=sys.stderr)
         bad += 1
     red += 1
