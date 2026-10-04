@@ -1721,6 +1721,9 @@ COMPARE_WORKFLOW_LINES = (
     'run: python3 scripts/claude-md-rule-compare.py --base-root . --repo . --base-sha "$BASE_SHA" '
     '--head-sha "$HEAD_SHA" --scratch "$RUNNER_TEMP/rule-compare" --summary "$GITHUB_STEP_SUMMARY"',
 )
+# R4 (#4507): the indentation of each meaningful line, so a key moved out of its block (for example
+# `persist-credentials` lifted out of `with:`) is refused although its stripped text is unchanged.
+COMPARE_WORKFLOW_INDENTS = (0, 0, 2, 4, 4, 0, 2, 0, 2, 2, 0, 2, 4, 4, 4, 4, 6, 8, 8, 10, 10, 10, 6, 8, 10, 8, 6, 8, 6, 8, 10, 10, 8)
 COMPARE_DANGER = (
     ("if:", "a condition can skip the comparison"),
     ("paths:", "a paths filter can skip the comparison"),
@@ -1745,10 +1748,14 @@ def compare_workflow_errors(path: Path, label: str = COMPARE_WORKFLOW_PATH) -> l
     except (OSError, UnicodeDecodeError) as exc:
         return [f"FAIL: cannot read {label} as UTF-8: {exc}"]
     lines = []
+    indents = []
     for raw in split_lines(text):
-        stripped = re.sub(r"(^|\s)#.*$", "", raw).strip()
-        if stripped:
-            lines.append(stripped)
+        stripped = re.sub(r"(^|\s)#.*$", "", raw).rstrip()
+        if stripped.strip():
+            lines.append(stripped.strip())
+            indents.append(len(stripped) - len(stripped.lstrip(" ")))
+    if tuple(indents) != COMPARE_WORKFLOW_INDENTS:
+        errors.append(f"FAIL: {label} indentation differs from the pinned form (COMPARE_WORKFLOW_INDENTS) (#4507 R4)")
     for token, why in COMPARE_DANGER:
         if any(token in line for line in lines):
             errors.append(f"FAIL: {label} contains `{token}`: {why} (#4507 R3-F3)")
@@ -1760,7 +1767,7 @@ def compare_workflow_errors(path: Path, label: str = COMPARE_WORKFLOW_PATH) -> l
         errors.append(f"FAIL: {label} has {len(lines)} meaningful lines, the pinned form has {len(expected)} (#4507 R3-F3)")
     for number, (got, want) in enumerate(zip(lines, expected), 1):
         if want == COMPARE_CHECKOUT:
-            if not re.fullmatch(r"uses: actions/checkout@[0-9a-f]{40}", got):
+            if got != f"uses: actions/checkout@{CHECKOUT_SHA}":
                 errors.append(f"FAIL: {label} meaningful line {number} must be the pinned checkout action, got {got[:100]} (#4507 R3-F3)")
         elif got != want:
             errors.append(f"FAIL: {label} meaningful line {number} differs from the pinned form: {got[:100]} (#4507 R3-F3)")
@@ -1963,6 +1970,20 @@ def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
         "types: [opened, synchronize, reopened, edited]", "types: [synchronize]", 1), "differs from the pinned form")
     ok &= case("R5 types line removed (default types skip edited)", good.replace(
         "    types: [opened, synchronize, reopened, edited]\n", "", 1), "meaningful lines")
+    ok &= case("R4 checkout impostor sha", good.replace(
+        "@11d5960a326750d5838078e36cf38b85af677262", "@" + "1" * 40, 1), "pinned checkout action")
+    ok &= case("R4 persist-credentials moved out of with:", good.replace(
+        "          persist-credentials: false", "        persist-credentials: false", 1), "indentation")
+    ok &= case("R5 checkout re-pointed to another action pinned by sha", good.replace(
+        "actions/checkout@", "someone-else/checkout@", 1), "pinned checkout action")
+    ok &= case("R5 a step indented one level deeper", good.replace(
+        "      - name: Comparison self-test (base code)", "        - name: Comparison self-test (base code)", 1),
+        "indentation")
+    ok &= case("R5 ref moved out of with:", good.replace(
+        "          ref: ${{ github.event.pull_request.base.sha }}", "        ref: ${{ github.event.pull_request.base.sha }}", 1),
+        "indentation")
+    ok &= case("R5 tab-indented line", good.replace(
+        "    runs-on: ubuntu-latest", "\truns-on: ubuntu-latest", 1), "indentation")
     ok &= case("R3-F3 pull_request trigger instead", good.replace("  pull_request_target:\n", "  pull_request:\n", 1),
                "differs from the pinned form")
     missing = wf / "absent.yml"
