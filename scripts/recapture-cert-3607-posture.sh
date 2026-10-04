@@ -139,7 +139,7 @@ else
 fi
 
 {
-  echo "# posture-legs transcript — recorded exit codes (2026-09-11 #3607 re-issue recapture (22 checks) @ $(git -C "$ROOT" rev-parse --short HEAD))"
+  echo "# posture-legs transcript — recorded exit codes ($(date -u +%Y-%m-%d) #3607 re-issue recapture (22 checks) @ $(git -C "$ROOT" rev-parse --short HEAD))"
   echo "# each leg: the doctor invocation shape, then the observed shell exit status."
   echo
   echo "## leg 1: bare (env -i, AI_MEMORY_NO_CONFIG=1 only)"
@@ -163,3 +163,10 @@ for f in posture-bare-env.out posture-hardened-env.out posture-sqlcipher-pass.ou
     grep -E 'overall:' "$OUT/$f" || true
   fi
 done
+
+# #5036: ASSERT the ladder (legs 2/2/1/0, bare 12/10 > hardened 20/2 > sqlcipher 22/0)
+# instead of only recording it. Fail-closed: any deviation, a missing leg-4 binary
+# or an unreadable capture exits non-zero (the evidence above is kept for diagnosis).
+GATE_ARGS=("$OUT")
+if [[ -x "$SQLCIPHER_BIN" ]]; then GATE_ARGS+=(--default-bin "$DEFAULT_BIN" --sqlcipher-bin "$SQLCIPHER_BIN"); fi
+python3 "$ROOT/scripts/check-posture-ladder.py" "${GATE_ARGS[@]}"
