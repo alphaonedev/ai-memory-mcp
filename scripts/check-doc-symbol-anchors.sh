@@ -316,6 +316,17 @@ MDEOF
         'See v1.src/nope.rs::no_such here.'
     anchor_green 5191 "a letter-prefixed token has an unknown root (xsrc/x.rs::f)" \
         'See xsrc/nope.rs::no_such here.'
+    # #5255: generic arguments do not hide the method component.
+    anchor_red 5255 QUAL "a backticked Type<T>::method anchor to a removed method" \
+        'See `src/mcp/tools/recall.rs::RecallTool<T>::no_such`.'
+    anchor_red 5255 BARE_QUAL "an unbackticked Type<T>::method anchor to a removed method" \
+        'See src/mcp/tools/recall.rs::RecallTool<T>::no_such here.'
+    anchor_red 5255 QUAL "a brace list with a Type<T>::method component to a removed method" \
+        'See `src/mcp/tools/recall.rs::{RecallTool<T>::no_such, RecallTool}`.'
+    anchor_green 5255 "a Type<T>::method anchor to live components" \
+        'See src/mcp/tools/recall.rs::RecallTool<T>::decorate_memory_many here.'
+    anchor_green 5255 "a bare anchor followed by a closing code tag" \
+        'See <code>src/mcp/tools/recall.rs::RecallTool</code> here.'
     anchor_green 5191 "an unbackticked URL path segment is not an anchor" \
         'See https://example.com/x/src/mcp/tools/recall.rs::no_such for it.'
 
@@ -740,13 +751,13 @@ BARE_LN = re.compile(r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs):(\d+)")
 LABEL_MD = re.compile(r"^[^\]\n]*\]\(([^)\s]*)")
 LABEL_HTML = re.compile(r"^[^<\n]*</a>")
 QUAL = re.compile(
-    r"`(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_:]*))")
+    r"`(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_:<>]*))")
 # #5191: an UNBACKTICKED `src/x.rs::symbol` anchor (prose, an HTML code
 # element, a code-block comment) is a symbol claim too, and is the very form
 # the BARE_LN failure text tells authors to use. Same lookbehind as BARE_LN,
 # so a URL path segment is never matched.
 BARE_QUAL = re.compile(
-    r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_:]*))")
+    r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_:<>]*))")
 MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(([^)]*src/[A-Za-z0-9_/]+\.rs)[^)]*\)")
 # #5190: ANY relative markdown link to a src/ file, whatever its label
 # (MDLINK only sees a backticked-identifier label). canon() has already
@@ -764,6 +775,7 @@ HREF = re.compile(r"\bhref=[\"'](src/[A-Za-z0-9_/]+\.rs)(#[^\"'\s]*)?[\"']")
 # https URL) is immutable and never reaches this rule.
 LINEFRAG = re.compile(r"^#L(\d+)(?:C\d+)?(?:-L?(\d+)(?:C\d+)?)?$")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+GENERICS = re.compile(r"<[^<>]*>")
 
 # A line that DELIBERATELY names a path as absent is not a stale anchor.
 # CLAUDE.md's worktree pre-flight literally asserts `test ! -f
@@ -888,6 +900,11 @@ for doc in seen_docs:
                 emit("PATH", doc, ln, f, ctx)
                 continue
             for tok in raw.replace(",", " ").split():
+                # #5255: `Type<T>::method` checks BOTH components; generic
+                # arguments (and a stray closing tag) are not symbol claims.
+                prev = None
+                while prev != tok:
+                    prev, tok = tok, GENERICS.sub("", tok)
                 tok = tok.strip().rstrip("(){}[]<>.,;")
                 if not tok:
                     continue
