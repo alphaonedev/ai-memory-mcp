@@ -304,6 +304,10 @@ MDEOF
         'See src/mcp/tools/recall.rs::{RecallTool, no_such}.'
     anchor_green 5191 "an unbackticked anchor to a live symbol" \
         'See (src/mcp/tools/recall.rs::decorate_memory_many) here.'
+    anchor_green 5191 "a dot-prefixed token has an unknown root (v1.src/x.rs::f)" \
+        'See v1.src/nope.rs::no_such here.'
+    anchor_green 5191 "a letter-prefixed token has an unknown root (xsrc/x.rs::f)" \
+        'See xsrc/nope.rs::no_such here.'
     anchor_green 5191 "an unbackticked URL path segment is not an anchor" \
         'See https://example.com/x/src/mcp/tools/recall.rs::no_such for it.'
 
@@ -343,6 +347,13 @@ MDEOF
     [[ "$(run_fixture_out | grep -c '^FAIL: doc-symbol-anchors \[')" = "1" ]] || {
         echo "FAIL: self-test #5190 — a backticked-label link to a missing file must be reported exactly once" >&2; exit 1; }
     echo "PASS: self-test #5190 — a backticked-label link to a missing file is reported exactly once"
+
+    # #5191: a backticked qualified anchor is QUAL only, never also BARE_QUAL.
+    write_clean
+    printf '\n\nSee `src/mcp/tools/recall.rs::no_such` here.\n' >> "$FIX/README.md"
+    [[ "$(run_fixture_out | grep -c '^FAIL: doc-symbol-anchors \[')" = "1" ]] || {
+        echo "FAIL: self-test #5191 — a backticked qualified anchor must be reported exactly once" >&2; exit 1; }
+    echo "PASS: self-test #5191 — a backticked qualified anchor is reported exactly once"
 
     # ---- #4651: a BARE src/x.rs:N line anchor (no backtick) ----------
     # Every form the #4651 census found must FAIL as BARE_LN; the only
