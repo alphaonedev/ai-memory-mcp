@@ -171,7 +171,9 @@ Step 3. Compute the key (`SHA256(secret)`) and the signature:
 ```bash
 SECRET="$(cat /etc/ai-memory/hmac.secret)"
 KEY_HEX=$(printf '%s' "$SECRET" | openssl dgst -sha256 -hex | awk '{print $2}')
-SIG=$(printf '%s' "$CANONICAL" | openssl dgst -sha256 -hmac "$KEY_HEX" -hex | awk '{print $2}')
+# openssl dgst -hmac would put the key on its argv (visible in ps); python3 reads it from the
+# environment instead. The result is byte-identical to openssl dgst -sha256 -hmac "$KEY_HEX".
+SIG=$(printf '%s' "$CANONICAL" | KEY_HEX="$KEY_HEX" python3 -c 'import hashlib, hmac, os, sys; print(hmac.new(os.environ["KEY_HEX"].encode(), sys.stdin.buffer.read(), hashlib.sha256).hexdigest())')
 ```
 
 Step 4. Send the request:
