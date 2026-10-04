@@ -1903,7 +1903,7 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
     ok &= case("R3-F4 extra permission", good.replace(
         "  contents: read", "  contents: read\n  pull-requests: write", 1), "permissions")
     ok &= case("R3-F4 unpinned action", good.replace(
-        "@11d5960a326750d5838078e36cf38b85af677262", "@v4", 1), "pinned")
+        "@11d5960a326750d5838078e36cf38b85af677262", "@v4", 1), "action is not pinned")  # #5177: exact refusal
     ok &= case("R3-F4 guard step removed", good.replace(
         "python3 scripts/check-claude-md-size.py\n", "true\n", 1), "check-claude-md-size.py")
     ok &= case("R3-F4 self-test step removed", good.replace(" --self-test", "", 1), "--self-test")
@@ -2010,7 +2010,8 @@ def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
     ok &= case("R3-F3 job-level if", good.replace("    timeout-minutes: 10", "    timeout-minutes: 10\n    if: false", 1), "`if:`")
     ok &= case("R3-F3 paths filter", good.replace("    branches:", "    paths: [\"src/**\"]\n    branches:", 1), "`paths:`")
     ok &= case("R3-F3 branch removed", good.replace(', "rehearsal/**"]', "]", 1), "differs from the pinned form")
-    ok &= case("R3-F3 unpinned action", good.replace("@11d5960a326750d5838078e36cf38b85af677262", "@v4", 1), "pinned")
+    ok &= case("R3-F3 unpinned action", good.replace(
+        "@11d5960a326750d5838078e36cf38b85af677262", "@v4", 1), "action is not pinned")  # #5177: exact refusal
     ok &= case("R3-F3 step removed", good.replace(
         "      - name: Comparison self-test (base code)\n        run: python3 -I scripts/claude-md-rule-compare.py --self-test\n", "", 1),
         "meaningful lines")
