@@ -1043,7 +1043,7 @@ jobs:
       - name: Self-test the gate (#2486 regression evidence)
         # --self-test constructs a throwaway repo with TWO ephemeral SSH
         # keypairs and TWO ephemeral OpenPGP keys (no network, no dependency
-        # on the real enrolled keys) and asserts TWENTY-SEVEN shapes, printing
+        # on the real enrolled keys) and asserts FORTY-FOUR shapes, printing
         # each case's observed and expected exit code so the evidence is
         # readable straight out of this job's log:
         #
