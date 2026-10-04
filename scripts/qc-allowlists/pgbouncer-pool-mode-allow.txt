@@ -27,7 +27,9 @@ changelog.d/4667.fixed.md | probe scripts/probe-pgbouncer-pool-mode.py exits 1 o
 changelog.d/4667.fixed.md | statement pooling (a second client was granted the migration lock, saw the | ctx:e9961ed87721
 changelog.d/4667.fixed.md | recalculated, and guidance for deployments that already ran transaction mode. | ctx:4d430826d0f0
 changelog.d/4667.fixed.md | (ci job pgbouncer pool-mode claim gate (#4667), not yet a required context) | ctx:005e182d51f4
-changelog.d/4667.fixed.md | making the adapter safe under transaction pooling is tracked in #4679. | ctx:022de6156bc8
+# this fix's changelog: names the retired setting to say it is withdrawn
+# context re-read on 2026-10-04: The entry's own text is unchanged; the round-6 summary was added to the same changelog paragraph, and it names no pool mode to configure other than session.
+changelog.d/4667.fixed.md | making the adapter safe under transaction pooling is tracked in #4679. | ctx:a26327f424e1
 
 # guide 5.6: states which modes are unsupported, the probe results and migration steps; session mode is the supported mode and is stated in the same section
 docs/enterprise-deployment.md | > status (#4667). the supported pool mode behind the postgres adapter is | ctx:51f8076f07ce
@@ -242,8 +244,12 @@ scripts/regen-pgbouncer-pool-mode-allow.py | spec = importlib.util.spec_from_fil
 CHANGELOG.md | probe and the on conflict do nothing insert as two independent pool statements, so under read committed two concurrent adds of opposing arcs | ctx:679d9d0d5d89
 
 # this PR's own changelog fragment: it states session mode is the only supported mode and describes how the gate rejects the other modes
-changelog.d/4667.fixed.md | (plurals, tx/xact, session next to a pool word, a bare mode = key) must be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:d64203ee73a6
-changelog.d/4667.fixed.md | be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:aa644780285e
+# context re-read on 2026-10-04: The entry's own text is unchanged; the round-6 summary was added to the same changelog paragraph, and it names no pool mode to configure other than session.
+changelog.d/4667.fixed.md | (plurals, tx/xact, session next to a pool word, a bare mode = key) must be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:15a3a43b7e47
+# this PR's own changelog fragment: it states session mode is the only supported mode and describes how the gate rejects the other modes
+# context re-read on 2026-10-04: The entry's own text is unchanged; the round-6 summary was added to the same changelog paragraph, and it names no pool mode to configure other than session.
+changelog.d/4667.fixed.md | be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:159acd16cc22
+# this PR's own changelog fragment: it states session mode is the only supported mode and describes how the gate rejects the other modes
 changelog.d/4667.fixed.md | infra/pgbouncer ships pool_mode = session, scram, server_reset_query = | ctx:f2324c27bbd4
 changelog.d/4667.fixed.md | lines and paragraph neighbourhood that mentions a pooler mode in any spelling (plurals, tx/xact, session next to a pool word, a bare mode = key) must | ctx:d96ecbbdb579
 changelog.d/4667.fixed.md | statement pooling (a second client was granted the migration lock, saw the table and prepared statement), exits 0 on session, and exits 2 when a client | ctx:8d1e287a9fa6
@@ -678,3 +684,15 @@ ROADMAP.md | that runs the suite through pgbouncer. the sqlx layer uses named pr
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
 # README file table, pgbouncer.ini row (#5213): states that session mode is required and names server_reset_query = DISCARD ALL as the guard for sequential reuse of a server connection (#4736); it recommends no other mode.
 infra/pgbouncer/README.md | | pgbouncer.ini | pooler config. pool_mode = session is required (pinned to the guide by scripts/check-pgbouncer-pool-mode-claims.py); max_prepared_statements = 256 (pgbouncer ≥ 1.21). server_reset_query = discard all (with server_reset_query_always = 0) is the guard for sequential reuse: in session mode a server connection passes to the next client only after this reset, so keep it set (sequential-reuse test leg: #4736). default_pool_size = 16 covers one daemon at default_max_connections = 16; for n daemons use the sizing rule in guide §5.6.5. | | ctx:bddc0be3bdb4
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Fragment 4667 round-6 summary paired with its closing line: the summary lists the round-6 fixes and the closing line names transaction pooling only as the open work tracked in #4679, not as a supported mode.
+changelog.d/4667.fixed.md | (#5210). roadmap 4.b scopes the plan-cache statement to src/ (#5077) and names making the adapter safe under transaction pooling is tracked in #4679. | ctx:4e00a9f0a9d2
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Fragment 4667 round-6 summary: the wrapped pair says ROADMAP 4.B names server_reset_query = DISCARD ALL as the guard for session-mode reuse (#5213); it names session mode and no other mode to configure.
+changelog.d/4667.fixed.md | (#5210). roadmap 4.b scopes the plan-cache statement to src/ (#5077) and names server_reset_query = discard all as the guard for session-mode reuse (#5213). | ctx:c13a7dbf7a70
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Fragment 4667 round-6 summary: the line says ROADMAP 4.B names server_reset_query = DISCARD ALL as the guard for session-mode reuse (#5213); it names session mode and no other mode to configure.
+changelog.d/4667.fixed.md | server_reset_query = discard all as the guard for session-mode reuse (#5213). | ctx:b7a043e7f4e0
