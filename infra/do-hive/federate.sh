@@ -276,16 +276,47 @@ node_sh() { ssh $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
 # safe_excerpt <bytes> -- how a failure line shows a node's reply (#4999): the byte count plus a
 # bounded excerpt of printable ASCII only (control bytes, ESC and non-ASCII are dropped), with any
 # 20+ character token-like run and everything after a credential word replaced by [redacted]; the
-# node API key is also removed by value. Never the raw reply. safe_code is the same for a field
-# that should be a 3-digit HTTP status: a status passes through, anything else is excerpted.
+# node API key is also removed by value, and a reply that spells the key in any form
+# reply_carries_key knows is not excerpted at all. Never the raw reply. safe_code is the same for a
+# field that should be a 3-digit HTTP status: a status passes through, anything else is excerpted.
 safe_excerpt() {
   local n s
   n=$(printf '%s' "$1" | LC_ALL=C wc -c | LC_ALL=C tr -d ' ')
-  s=$(printf '%s' "$1" | LC_ALL=C tr -cd '\040-\176' | LC_ALL=C tr 'A-Z' 'a-z' \
-      | LC_ALL=C sed -E 's#[a-z0-9+/_=-]{20,}#[redacted]#g; s#(api[_-]?key|authorization|bearer|password|passwd|secret|token|private|begin [a-z ]*key)[ -~]*#[redacted]#g' \
-      | LC_ALL=C head -c 120)
-  [ -n "${api_key:-}" ] && s=${s//"$api_key"/[redacted]}
+  if reply_carries_key "$1"; then
+    s='[redacted: reply carries key material]'
+  else
+    s=$(printf '%s' "$1" | LC_ALL=C tr -cd '\040-\176' | LC_ALL=C tr 'A-Z' 'a-z' \
+        | LC_ALL=C sed -E 's#[a-z0-9+/_=-]{20,}#[redacted]#g; s#(api[_-]?key|authorization|bearer|password|passwd|secret|token|private|begin [a-z ]*key)[ -~]*#[redacted]#g' \
+        | LC_ALL=C head -c 120)
+    if [ -n "${api_key:-}" ]; then s=${s//"$api_key"/[redacted]}; fi
+  fi
   printf '%s bytes: %s' "$n" "$s"
+}
+# reply_carries_key <reply> -- success when the reply holds the node API key (when this scope knows
+# it) however the node spelled it. It compares, it does not guess shapes: the reply is lower-cased
+# and every byte that is not a letter or digit is dropped (so any separator, newline or case
+# disappears), and the result is searched for the key; the same is done keeping only hex digits
+# (letters as separators) and against the key written as ASCII hex, as base64 of its text and as
+# base64 of its 32 raw bytes (padding and the url-safe signs dropped on both sides, the last four
+# characters ignored because a trailing newline changes them). Anything else a node could do to a
+# key (reverse it, encrypt it, split it across replies) is outside what a text compare can see.
+reply_carries_key() {
+  [ -n "${api_key:-}" ] || return 1
+  local k s1 s2 c i raw
+  k=$(printf '%s' "$api_key" | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -cd '0123456789abcdefghijklmnopqrstuvwxyz')
+  [ -n "$k" ] || return 1
+  s1=$(printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -cd '0123456789abcdefghijklmnopqrstuvwxyz')
+  s2=$(printf '%s' "$s1" | LC_ALL=C tr -cd '0123456789abcdef')
+  [[ "$s1" == *"$k"* || "$s2" == *"$k"* ]] && return 0
+  raw=$(for ((i = 0; i + 1 < ${#k}; i += 2)); do printf "\\x${k:i:2}"; done \
+    | base64 | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -cd '0123456789abcdefghijklmnopqrstuvwxyz')
+  for c in "$(printf '%s' "$api_key" | LC_ALL=C od -An -v -tx1 | LC_ALL=C tr -cd '0123456789abcdef')" \
+           "$(printf '%s' "$api_key" | base64 | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -cd '0123456789abcdefghijklmnopqrstuvwxyz')" \
+           "$raw"; do
+    [ "${#c}" -gt 8 ] || continue
+    [[ "$s1" == *"${c:0:${#c}-4}"* ]] && return 0
+  done
+  return 1
 }
 safe_code() {
   case "$1" in

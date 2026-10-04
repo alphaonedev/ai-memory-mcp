@@ -479,6 +479,46 @@ def failure_lines_4999():
             low = r.stdout.lower()
             probe("V2 excerpt redacts %s" % label, bool(defs) and "bytes: " in low and leak.lower() not in low,
                   r.stdout.strip()[:80])
+        # The key itself, in every spelling a node could send: the failure line must carry none of it.
+        # The comparison is on the reply with separators and case removed, so no spelling needs its own
+        # pattern; each probe below is a different way to write the same 64 digits.
+        import base64
+        key = SECRET
+        grp = lambda s, n, sep: sep.join(s[k:k + n] for k in range(0, len(s), n))
+        raw_b64 = base64.b64encode(bytes.fromhex(key)).decode()
+        txt_b64 = base64.b64encode(key.encode()).decode()
+        spellings = (("space groups of 16", grp(key, 16, " ")),
+                     ("space groups of 4", grp(key, 4, " ")),
+                     ("dot groups of 8", grp(key, 8, ".")),
+                     ("dash groups of 8", grp(key, 8, "-")),
+                     ("colon pairs", grp(key, 2, ":")),
+                     ("newline groups of 16", grp(key, 16, "\n")),
+                     ("tab and comma groups", grp(key, 8, "\t,")),
+                     ("upper case", key.upper()),
+                     ("mixed case in groups", grp("".join(c.upper() if n % 2 else c for n, c in enumerate(key)), 16, " ")),
+                     ("a letter as the separator", grp(key, 16, "zz")),
+                     ("inside a JSON string", '{"detail":"key is %s now"}' % grp(key, 32, " ")),
+                     ("base64 of the text", txt_b64),
+                     ("base64 of the text in groups of 10", grp(txt_b64, 10, " ")),
+                     ("base64 of the raw bytes", raw_b64),
+                     ("base64 of the raw bytes in groups of 8", grp(raw_b64, 8, " ")),
+                     ("url-safe base64 of the raw bytes", raw_b64.replace("+", "-").replace("/", "_").rstrip("=")),
+                     ("ASCII hex of the text in pairs", grp(key.encode().hex(), 2, " ")))
+        for label, body in spellings:
+            (d / "body").write_text(body)
+            r = run_bash("api_key='%s'\n%s\nb=$(cat %s)\nsafe_excerpt \"$b\"\n" % (key, defs, d / "body"), d)
+            out = r.stdout.lower()
+            sq = "".join(c for c in out if c.isalnum())
+            probe("V2 excerpt carries no key spelled as %s" % label, bool(defs) and "bytes: " in out
+                  and key[:12] not in sq and txt_b64[:12].lower() not in sq and raw_b64[:12].lower() not in sq
+                  and key.encode().hex()[:12] not in sq, r.stdout.strip()[:80])
+        # A reply that merely looks like a key is still shown (the compare is not a blanket redaction).
+        other = "".join("0123456789abcdef"[(n * 7 + 3) % 16] for n in range(64))
+        for label, body in (("an unrelated 64-digit hex value in groups", grp(other, 16, " ")),
+                            ("a short prefix of the key", key[:20] + " is not the key")):
+            (d / "body").write_text(body)
+            r = run_bash("api_key='%s'\n%s\nb=$(cat %s)\nsafe_excerpt \"$b\"\n" % (key, defs, d / "body"), d)
+            probe("V2 excerpt still shows %s" % label, "bytes: " in r.stdout and "key material" not in r.stdout, r.stdout.strip()[:80])
         # The hostile reply above is padded past the 120-byte window, so each filter is also probed with
         # a short reply whose hostile part sits inside the window (otherwise truncation alone passes).
         for label, raw, bad in (("control and non-ASCII bytes", "e:bad\\x1b[31m\\x01\\x07 \\xc3\\xa9\\xe2\\x82\\xac end", None),
