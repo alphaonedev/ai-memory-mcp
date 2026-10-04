@@ -311,3 +311,6 @@ src/store/postgres.rs | /// insert as two independent pool statements: under rea
 # pool statements here means two separate SQL statements on the sqlx connection pool (an upsert race note); no pooler mode is named or advised
 tests/pg_parity_batch_2.rs | //! probe and the insert as two independent pool statements, so concurrent
 tests/pg_parity_batch_2.rs | /// independent pool statements, so under read committed both probes could see a
+
+# #4710 R4 security review: architecture diagram cell that names a session-mode pgbouncer; the bracket split now reads it as a mention
+docs/v1.0.0/perfect-endpoint-assessment/waves/w5-a1-scale-backends.md | │ postgres + pgvector + age · sqlx pool · pgbouncer (session) │

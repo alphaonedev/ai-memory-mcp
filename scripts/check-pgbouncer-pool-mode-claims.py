@@ -34,6 +34,11 @@ written reason. No list of bad or negating words decides anything.
                supavisor, pgcat), multiplexed transactions/statements, session
                next to a pool word, and a bare `mode =` / `mode:` key set to a
                mode word.
+            R8 key (closed world): a pooler-prefixed key ending in `mode`
+               (pgb_mode, PGBOUNCER_MODE, supavisor-mode, a Terraform variable
+               "pgb_mode") whatever its value: a variable, a default on another
+               line or a template is not the literal `session`, so it needs an
+               allowlist entry with a reason.
             R3 path tokens: a file path or file name (`a/b`, `x.py`) is reduced
                to the product and mode words it contains before R1/R2 run, so
                naming scripts/check-pgbouncer-pool-mode-claims.py is not a
@@ -90,6 +95,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import unicodedata
+import fnmatch
 from pathlib import Path
 from collections import Counter
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -106,7 +113,7 @@ EXIT_OK, EXIT_FINDING, EXIT_FAULT = 0, 1, 2
 
 POOL_MODE = r"pool(?:ing)?[\s_-]*mode"
 MENTION_NAME = re.compile(POOL_MODE + r"s?")  # R1
-_MODE_WORD = r"(?:transaction(?:s|al)?|statements?|txn|tx|xact)"
+_MODE_WORD = r"(?:transaction(?:s|al)?|statements?|txn|tx|xact|stmts?|trx|xaction|trans)"
 _ANY_MODE = r"(?:%s|sessions?)" % _MODE_WORD
 _POOLER = r"(?:pgbouncer|pooler|pooling|odyssey|supavisor|pgcat|multiplex(?:es|ed|ing)?)"
 _PRODUCT = r"(?:pgbouncer|pooler|odyssey|supavisor|pgcat)"
@@ -120,12 +127,16 @@ MENTION_PROSE = re.compile(  # R2
     # a pooler product (pgbouncer, pooler, odyssey, ...) anywhere on the same line as a mode word, either order
     r"|\b%s\b.*?\b%s\b|\b%s\b.*?\b%s\b"
     # a bare mode key (supavisor / pgcat / odyssey configs): mode = transaction, mode: statement
-    r"|\bmode\s*[:=]\s*[\"']?%s\b"
+    r"|\bmode(?:[\s_-]*type)?\s*[:=]\s*[\"']?%s\b"
     % (_ANY_MODE, _ANY_MODE, _POOLER, _MODE_WORD, _MODE_WORD, _POOLER,
        _PRODUCT, _MODE_WORD, _MODE_WORD, _PRODUCT, _MODE_WORD)
 )
+# R8 (closed world, #4741): a pooler-prefixed key that ends in `mode` (pgb_mode, PGBOUNCER_MODE, pgcat.mode,
+# supavisor-mode, a Terraform variable "pgb_mode") is a mention whatever its value or its line: the value may be a
+# variable or a default on another line, so only the literal `session` assignment (A1/A2) is approved.
+MENTION_KEY = re.compile(r"\b(?:pgbouncer|pgb|pgcat|odyssey|supavisor|pooler|pool(?:ing)?)(?:[_.-][a-z0-9]+)*[_.-]mode\b")
 OTHER_MODE = re.compile(r"\b%s\b" % _MODE_WORD)
-_QUICK = re.compile(r"mode|pool|pgbouncer|odyssey|supavisor|pgcat|multiplex")
+_QUICK = re.compile(r"mode|pool|pgbouncer|odyssey|supavisor|pgcat|multiplex|pgb")
 # R3: a file path (has a slash) or a file name (has a known extension).
 TOOL_PATH = re.compile(
     r"[\w.~+-]*(?:/[\w.~+#%-]*)+"
@@ -135,6 +146,13 @@ _PATH_KEEP = re.compile(r"pgbouncer|pooler|odyssey|supavisor|pgcat|transaction(?
 TAG = re.compile(r"<[^>]*>")
 INI_ACTIVE = re.compile(r"^\s*pool_mode\s*=\s*([A-Za-z]+)\s*(?:[;#].*)?$")
 MAX_BYTES = 4 * 1024 * 1024
+# F1 (#4667 R4): a file the gate does not read must be a binary class or named here with a reason;
+# anything else is a FAULT, so a large or NUL-bearing text file cannot hide a mention.
+BINARY_EXT = {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".ico", ".webp", ".bmp", ".woff", ".woff2", ".ttf", ".otf",
+              ".gz", ".tgz", ".zip", ".xz", ".bz2", ".zst", ".db", ".sqlite", ".wasm", ".so", ".a", ".bin", ".der", ".p12", ".pyc"}
+UNREAD_OK = (
+    ("audits/v063-coverage-80pct/closer-*-coverage.json", "machine-generated llvm-cov JSON, never operator guidance"),
+)
 NEIGHBOURS = 2  # non-blank lines inspected on each side (R5, R6)
 
 # ------------------------------------------------------- approved (closed set)
@@ -163,6 +181,16 @@ NEUTRAL_SHAPES = (
 # ------------------------------------------------------------------ reasons
 
 PLACEHOLDER = "REASON REQUIRED"
+# A1 (#4667 R4): an allowlist entry may describe a non-session mode, never set one. A whole-line
+# assignment of transaction/statement (any key spelling, ini/yaml/env/json/toml/compose form) or a
+# config line carrying a pool_mode=transaction token is refused (rc 2), whatever its reason says.
+FORBIDDEN_ENTRY = (
+    re.compile(r"^(?:[-*>]\s*)*[\"']?[a-z0-9_.]*mode(?:[_-]?type)?[\"']?\s*[=:]\s*[\"']?(?:transaction|statement)[\"']?,?\s*(?:[;#].*)?$"),
+    re.compile(r"^[a-z_][a-z0-9_.]*\s*=\s*(?:[a-z_][a-z0-9_.-]*=[^\s;#]*\s*)*pool_mode=(?:transaction|statement)\b"),
+    re.compile(r"^pool\s+[\"']?(?:transaction|statement)[\"']?$"),
+)
+FILLER = re.compile(r"\b(?:todo|tbd|fixme|xxx|lorem|ipsum|placeholder|n/?a|tk)\b")
+MIN_DISTINCT_WORDS = 5
 REGEN_HEADER = "added by regen-pgbouncer-pool-mode-allow.py"
 MIN_REASON_WORDS, MIN_REASON_CHARS = 6, 30
 
@@ -182,11 +210,46 @@ def _path_words(match: "re.Match[str]") -> str:
     return " " + " ".join(_PATH_KEEP.findall(match.group(0))) + " "
 
 
-def mentions(text: str) -> bool:
+# U1 (#4667 R4): look-alike letters folded to ASCII for mention detection only.
+CONFUSABLE = {ord(k): v for k, v in {
+    "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p", "\u0441": "c", "\u0443": "y", "\u0445": "x",
+    "\u0456": "i", "\u0458": "j", "\u0455": "s", "\u0501": "d", "\u04bb": "h", "\u0442": "t", "\u043c": "m",
+    "\u043d": "h", "\u0432": "b", "\u043a": "k", "\u0261": "g", "\u03bf": "o", "\u03c1": "p", "\u03c4": "t",
+    "\u03bd": "v", "\u03b1": "a", "\u03b5": "e", "\u03b9": "i", "\u03ba": "k", "\u03c5": "u", "\u03c7": "x",
+    "\u0131": "i", "\u017f": "s",
+}.items()}
+# U2/S1 (#4667 R4): separators that hide a word boundary from \b: underscore, quotes, brackets.
+_SEPARATORS = re.compile(r"[\"'{}\[\](),]|_(?=mode)|(?<=pgbouncer)_")
+
+
+_PG_SPLIT = re.compile(r"\bpg[\s_-]+bouncer", re.I)
+
+
+def shadow(text: str) -> str:
+    """Mention-detection view of a normalised line: NFKD, format and combining marks dropped,
+    look-alikes folded, `pg bouncer` spellings joined. The unit text (allowlist key) is unchanged."""
+    t = unicodedata.normalize("NFKD", text)
+    t = "".join(c for c in t if unicodedata.category(c) not in ("Cf", "Mn")).translate(CONFUSABLE).casefold()
+    return re.sub(r"\bpg[\s_-]+bouncer", "pgbouncer", t)
+
+
+def _mentions_one(text: str) -> bool:
     if not _QUICK.search(text):
         return False  # speed only: every R1/R2 pattern needs one of these words
     text = TOOL_PATH.sub(_path_words, text)
-    return bool(MENTION_NAME.search(text) or MENTION_PROSE.search(text))
+    if MENTION_NAME.search(text) or MENTION_PROSE.search(text) or MENTION_KEY.search(text):
+        return True
+    split = _SEPARATORS.sub(" ", text)  # PGB_MODE=x, {"mode": "x"}, pool "x", PGBOUNCER_MODE: x
+    return bool(MENTION_NAME.search(split) or MENTION_PROSE.search(split))
+
+
+def mentions(text: str) -> bool:
+    if _mentions_one(text):
+        return True
+    if text.isascii() and not _PG_SPLIT.search(text):
+        return False  # the shadow view only differs for non-ASCII text or a split `pg bouncer`
+    alt = shadow(text)
+    return alt != text and _mentions_one(alt)
 
 
 def approved(text: str) -> bool:
@@ -209,7 +272,14 @@ def reason_problem(reason: str) -> Optional[str]:
     if len(words) < MIN_REASON_WORDS or len(reason) < MIN_REASON_CHARS:
         return "the reason %r is shorter than a sentence (%d words / %d characters minimum)" % (
             reason[:60], MIN_REASON_WORDS, MIN_REASON_CHARS)
+    if FILLER.search(reason.casefold()) or len(set(w.casefold() for w in words)) < MIN_DISTINCT_WORDS:
+        return "the reason %r is filler, not a reason" % reason[:60]
     return None
+
+
+def forbidden_entry(text: str) -> bool:
+    """An entry text that sets a non-session mode (A1 R4): never allowlistable."""
+    return any(shape.match(text) for shape in FORBIDDEN_ENTRY)
 
 
 def tracked_files(root: Path) -> List[str]:
@@ -274,20 +344,35 @@ def scan(root: Path) -> Tuple[List[Unit], int]:
     """Every mention unit and the number of files read."""
     units: List[Unit] = []
     read = 0
+    unread: List[str] = []
     for rel in tracked_files(root):
         if Path(rel) in (ALLOW_REL, SELF_REL):
             continue
         path = root / rel
-        try:
-            if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_BYTES:
-                continue
-            data = path.read_bytes()
-        except OSError:
+        if not path.is_file() or path.is_symlink():
             continue
-        if b"\0" in data[:8192]:
+        binary = Path(rel).suffix.lower() in BINARY_EXT
+        listed = any(fnmatch.fnmatchcase(rel, pattern) for pattern, _ in UNREAD_OK)
+        if path.stat().st_size > MAX_BYTES:
+            if not (binary or listed):
+                unread.append("%s: over %d bytes" % (rel, MAX_BYTES))
             continue
+        data = path.read_bytes()  # an OSError propagates: run() reports a FAULT
+        if data[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"):
+            text = data.decode("utf-32", "replace")
+        elif data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            text = data.decode("utf-16", "replace")
+        elif b"\0" in data:
+            if not (binary or listed):
+                unread.append("%s: NUL bytes in a file that is not a binary class" % rel)
+            continue
+        else:
+            text = data.decode("utf-8", "replace")
         read += 1
-        units += scan_lines(rel, [normalise(l) for l in data.decode("utf-8", "replace").splitlines()])
+        units += scan_lines(rel, [normalise(l) for l in text.splitlines()])
+    if unread:
+        raise OSError("files the gate cannot read as text (add a binary extension or a UNREAD_OK entry with a reason): "
+                      + "; ".join(unread[:5]))
     return units, read
 
 
@@ -325,6 +410,9 @@ def load_allowlist(root: Path) -> Tuple[List[Tuple[str, str]], List[str]]:
         rel, text = line.split(SEPARATOR, 1)
         if not rel or " " in rel or not text or text != normalise(text):
             errors.append("%s:%d: malformed entry (file empty/has spaces, or text empty/not normalised)" % (ALLOW_REL, number))
+            continue
+        if forbidden_entry(text):
+            errors.append("%s:%d: entry sets a non-session pool mode; fix the line, it cannot be allowlisted" % (ALLOW_REL, number))
             continue
         problem = reason_problem(reason or "")
         if problem:
@@ -458,6 +546,7 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("xact abbreviation with a pooler product", "docs/a.md", "PgBouncer xact pooling suits the daemon.\n"),
     # round 3 code review (#4960, #4951): inversions outside any word list, keys, plurals
     ("pooling_mode key alone (pins the pooling spelling)", "deploy/x.yaml", "pooling_mode: transaction\n"),
+    ("POOLINGMODE key with no separator (pins the pooling spelling)", "deploy/.env", "POOLINGMODE=transaction\n"),
     ("bare mode key alone (pins the mode-key rule)", "deploy/x.conf", "  mode: transaction\n"),
     ("inversion outside any word list: stop using", "docs/a.md", "Stop using pool_mode = session.\n"),
     ("inversion outside any word list: breaks", "docs/a.md", "pool_mode = session breaks the daemon.\n"),
@@ -471,6 +560,28 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("plural: transactions next to PgBouncer", "docs/a.md", "PgBouncer pools transactions for the daemon.\n"),
     ("a mode claim beside a tool path is still a mention", "docs/a.md", "Run scripts/probe-pgbouncer-pool-mode.py, then set pool_mode = transaction.\n"),
     ("product named only in a file name", "docs/a.md", "In pgbouncer.ini choose transaction for the daemon.\n"),
+    # round 4 security review: abbreviations, separators, other config forms, look-alikes
+    ("abbreviation stmt", "docs/a.md", "Run PgBouncer in stmt mode for the daemon.\n"),
+    ("abbreviation trx", "docs/a.md", "Run PgBouncer in trx mode for the daemon.\n"),
+    ("abbreviation xaction", "docs/a.md", "Use xaction pooling for the daemon.\n"),
+    ("spelling pg_bouncer", "docs/a.md", "Run pg_bouncer per transaction for the daemon.\n"),
+    ("odyssey pool quoted value", "infra/o/odyssey.conf", "\t\tpool \"transaction\"\n"),
+    ("json mode_type", "deploy/t.json", "{\"db_user\": \"ai\", \"mode_type\": \"transaction\"}\n"),
+    ("json quoted mode key", "deploy/x.json", "{\"mode\": \"transaction\"}\n"),
+    ("env PGB_MODE", "deploy/.env", "PGB_MODE=transaction\n"),
+    ("configmap PGBOUNCER_MODE", "deploy/cm.yaml", "data:\n  PGBOUNCER_MODE: transaction\n"),
+    ("zero-width inside the key", "docs/a.md", "pool\u200b_mode = transaction\n"),
+    ("zero-width inside the mode word", "docs/a.md", "Run PgBouncer in trans\u200baction mode.\n"),
+    ("cyrillic look-alike in the mode word", "docs/a.md", "Run PgBouncer in tr\u0430nsaction mode.\n"),
+    ("fullwidth letter in the mode word", "docs/a.md", "Run PgBouncer in \uff54ransaction mode.\n"),
+    ("soft hyphen in the mode word", "docs/a.md", "Run PgBouncer in trans\u00adaction mode.\n"),
+    # round 5 (#4741 closed world): the value is a variable, a default elsewhere or a template, never the literal session
+    ("R8 terraform variable named pgb_mode (default on another line)", "deploy/main.tf", "variable \"pgb_mode\" {\n  type = string\n}\n"),
+    ("R8 prefixed key set to a variable", "deploy/main.tf", "pgb_mode = var.pooler_choice\n"),
+    ("R8 helm value templated", "deploy/values.yaml", "poolMode: {{ .Values.poolMode }}\n"),
+    ("R8 env key set to a shell variable", "deploy/.env", "PGBOUNCER_POOL_MODE=${POOL_CHOICE}\n"),
+    ("R8 dotted pooler key", "deploy/x.toml", "pgcat.mode = \"${MODE}\"\n"),
+    ("R8 hyphenated pooler key", "deploy/x.yaml", "supavisor-mode: {{ .Values.m }}\n"),
 ]
 
 # Green probes: one per approved shape, plus neutral context and path tokens.
@@ -568,6 +679,17 @@ def cases() -> List[Tuple[str, Dict[str, str], int]]:
          tree(retired, "# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:\n" + retired_entry), EXIT_FAULT),
         ("a reason shorter than a sentence fails", tree(retired, "# ok\n" + retired_entry), EXIT_FAULT),
         ("a blank line ends a reason", tree(retired, REASON + "\n" + retired_entry), EXIT_FAULT),
+        ("a filler reason (lorem) fails", tree(retired, "# lorem ipsum dolor sit amet consectetur\n" + retired_entry), EXIT_FAULT),
+        ("a filler reason (todo x8) fails", tree(retired, "# todo todo todo todo todo todo todo todo\n" + retired_entry), EXIT_FAULT),
+        ("a five-word reason under the sentence floor fails", tree(retired, "# retired mode kept for history\n" + retired_entry), EXIT_FAULT),
+        ("an entry that sets transaction mode is refused whatever its reason",
+         tree({"infra/x/setup.sh": "pool_mode = transaction\n"}, REASON + "infra/x/setup.sh | pool_mode = transaction\n"), EXIT_FAULT),
+        ("a per-db override entry is refused",
+         tree({"infra/x/pgb.ini": "ai = host=pg pool_mode=transaction\n"}, REASON + "infra/x/pgb.ini | ai = host=pg pool_mode=transaction\n"), EXIT_FAULT),
+        # files the gate cannot read as text (R4)
+        ("NUL bytes in a markdown file fail closed", tree({"docs/n.md": "\0\nRun PgBouncer in transaction mode.\n"}), EXIT_FAULT),
+        ("a text file over the size cap fails closed", tree({"docs/big.md": "x\n" * (2 * 1024 * 1024 + 8)}), EXIT_FAULT),
+        ("a UTF-16 file is decoded and judged", tree({"docs/u.txt": "\ufeffRun PgBouncer in transaction mode.\n"}), EXIT_FINDING),
         # fail closed
         ("fail closed: guide with no approved pool_mode line", tree(guide="No pooler section here.\n"), EXIT_FAULT),
         ("fail closed: guide with only session prose", tree(guide="Use pool_mode = session in production.\n"), EXIT_FAULT),
@@ -607,7 +729,8 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("R1 name rule", 'MENTION_NAME = re.compile(POOL_MODE + r"s?")', 'MENTION_NAME = re.compile(r"(?!)")'),
     ("R1 pooling spelling", 'POOL_MODE = r"pool(?:ing)?[\\s_-]*mode"', 'POOL_MODE = r"pool[\\s_-]*mode"'),
     ("R1 plural key", 'MENTION_NAME = re.compile(POOL_MODE + r"s?")', 'MENTION_NAME = re.compile(POOL_MODE + r"\\b")'),
-    ("R2 abbreviations tx/xact", '|statements?|txn|tx|xact)"', '|statements?|txn)"'),
+    ("R2 abbreviations tx/xact", '|statements?|txn|tx|xact|', '|statements?|txn|'),
+    ("R2 abbreviations stmt/trx/xaction", '|stmts?|trx|xaction|trans)"', ')"'),
     ("R2 plural modes", "(?:modes?|pooling|pooler|pools?)", "(?:mode|pooling|pooler|pool)"),
     ("R2 plural transactions", '_MODE_WORD = r"(?:transaction(?:s|al)?|', '_MODE_WORD = r"(?:transaction(?:al)?|'),
     ("R2 transactional", '_MODE_WORD = r"(?:transaction(?:s|al)?|', '_MODE_WORD = r"(?:transactions?|'),
@@ -615,7 +738,13 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("R2 session next to a pool word", '_ANY_MODE = r"(?:%s|sessions?)" % _MODE_WORD', '_ANY_MODE = r"(?:%s)" % _MODE_WORD'),
     ("R2 pooling word in _POOLER", '_POOLER = r"(?:pgbouncer|pooler|pooling|', '_POOLER = r"(?:pgbouncer|pooler|'),
     ("R2 product anywhere on the line", '    r"|\\b%s\\b.*?\\b%s\\b|\\b%s\\b.*?\\b%s\\b"\n', '    r"|\\b%s\\b(?!)\\b%s\\b|\\b%s\\b(?!)\\b%s\\b"\n'),
-    ("R2 bare mode key", 'r"|\\bmode\\s*[:=]\\s*[\\"\']?%s\\b"', 'r"|(?!)%s"'),
+    ("R2 bare mode key", 'r"|\\bmode(?:[\\s_-]*type)?\\s*[:=]\\s*[\\"\']?%s\\b"', 'r"|(?!)%s"'),
+    ("R8 pooler-prefixed mode key", "    if MENTION_NAME.search(text) or MENTION_PROSE.search(text) or MENTION_KEY.search(text):", "    if MENTION_NAME.search(text) or MENTION_PROSE.search(text):"),
+    ("U1 look-alike shadow", "    alt = shadow(text)\n", "    alt = text\n"),
+    ("U2 separators", "    split = _SEPARATORS.sub(\" \", text)", "    split = text"),
+    ("F1 unread text files fail closed", "    if unread:\n", "    if False:\n"),
+    ("A1 forbidden entries", "        if forbidden_entry(text):\n", "        if False:\n"),
+    ("A1 filler reasons", "    if FILLER.search(reason.casefold()) or", "    if False and"),
     ("R3 path tokens", "    text = TOOL_PATH.sub(_path_words, text)\n", ""),
     ("R3 path keeps product words", 'return " " + " ".join(_PATH_KEEP.findall(match.group(0))) + " "', 'return " "'),
     ("R4 wrap", "                pair(i, i + 1)  # R4", "                pass  # R4"),

@@ -69,7 +69,11 @@ def main(argv):
         for err in errors:
             print("regen: FAULT: %s" % err, file=sys.stderr)
         return 2
-    units, read = gate.scan(root)
+    try:
+        units, read = gate.scan(root)
+    except OSError as exc:
+        print("regen: FAULT: %s" % exc, file=sys.stderr)
+        return 2
     if read == 0:
         print("regen: FAULT: empty scan", file=sys.stderr)
         return 2
@@ -84,6 +88,13 @@ def main(argv):
     if not stale and not new:
         print("regen: allowlist matches the tree (%d entries)" % len(entries))
         return 0
+    # #4667 R4: a gate.forbidden_entry line is never allowlistable, reason or not.
+    forbidden = sorted(key for key in new if gate.forbidden_entry(key[1]))
+    if forbidden and not a.check:
+        for rel, text in forbidden:
+            print("regen: FAULT: refusing a forbidden entry: %s | %s" % (rel, text[:160]), file=sys.stderr)
+        print("regen: correct those lines in the tree; file left unchanged", file=sys.stderr)
+        return 2
     refused = (stale and not a.drop_stale) or (new and not a.accept_new)
     if a.check or refused:
         print("regen: %d stale, %d new; file left unchanged (%s)" % (
