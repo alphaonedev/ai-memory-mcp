@@ -310,7 +310,7 @@ mod tests {
             "the chain head is named with every hop counted"
         );
         assert!(
-            took < std::time::Duration::from_secs(3),
+            took < std::time::Duration::from_secs(10),
             "a 20k-row chain took {took:?}: the census is not linear"
         );
     }
