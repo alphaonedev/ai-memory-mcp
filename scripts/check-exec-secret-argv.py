@@ -551,7 +551,7 @@ CRED_TOOL_RE = re.compile(
     # combined short flags (-su, -fsSU) (#4993); a long flag is matched whole (not --user-agent).
     # wget has no short credential flag (its -U is the user agent).
     r"|\b(?:curl\b[^|;&]*\s-[A-Za-z]*[uU]|(?:curl|wget)\b[^|;&]*\s(?:--(?:proxy-|http-|ftp-)?"
-    r"(?:user|password|pass)|--oauth2-bearer)(?![\w-]))[\s=]*"
+    r"(?:user|password|pass)|--(?:proxy-)?tlspassword|--oauth2-bearer)(?![\w-]))[\s=]*"
     r"(?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?\$"
     # curl -E/--cert <file>:<password>: a variable after the colon is the key password; a
     # variable that names the file alone is not (#4891 round 3)
@@ -1325,6 +1325,8 @@ ROUND3_RED = [
     ("curl -sE cert password", 'curl -sE "c.pem:$X" h'),
     ("curl --cert password", 'curl --cert c.pem:"$X" h'),
     ("curl -E quoted cert password", "curl -E 'c.pem':\"$X\" h"),
+    ("curl --tlspassword", 'curl --tlspassword "$X" h'),
+    ("curl --proxy-tlspassword", 'curl --proxy-tlspassword "$X" h'),
     ("curl --oauth2-bearer", 'curl --oauth2-bearer "$X" h'),
     ("curl --pass", 'curl --pass "$X" --key k.pem h'),
     ("mysql --password with a space", 'mysql -u r --password "$X" db'),
@@ -1373,6 +1375,7 @@ ROUND3_GREEN = [
     ("redis-cli --pass-file is not --pass", 'redis-cli --pass-file "$PW_FILE" ping'),
     ("wget -e non-credential settings", 'wget -e robots=off -e "https_proxy=$PROXY_HOST" -O "$TOKEN_FILE" h'),
     ("wget --passive-ftp is not a password option", 'wget --passive-ftp -O "$TOKEN_FILE" h'),
+    ("curl --tlsuser is not a password", 'curl --tlsuser "$TLS_USER" h'),
     ("curl --user-agent= is not --user", 'curl --user-agent="$UA" h'),
     ("wget -U is the user agent", 'wget -U "$UA" h'),
     ("curl -E with a file only", 'curl -E "$CERT_PATH" h'),
