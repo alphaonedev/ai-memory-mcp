@@ -104,6 +104,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVE_SRC = ROOT / "src" / "daemon_runtime.rs"
+# Root Cli flags of ai-memory that take a separate value word (src/daemon_runtime.rs:303-324).
+AI_MEMORY_VALUE_FLAGS = ("--db", "--agent-id", "--db-passphrase-file")
 TEMPLATE_GLOB = "infra/*/cloud-init-memory*.tpl"
 ALLOW_FILE = ROOT / "scripts" / "qc-allowlists" / "cloud-init-token-allow.txt"
 PENDING_FILE = ROOT / "scripts" / "qc-allowlists" / "cloud-init-token-pending.txt"
@@ -876,20 +878,25 @@ def companion_hits(stmt: str, st: dict, depth: int = 0) -> list:
             # #4837 R6: the subcommand must be a literal word the serve rule can read.
             if any(posixpath.basename(unquote(w)[0]) == "xargs" for w in words[:idx]):
                 out.append("ai-memory under xargs (its subcommand comes from stdin)")
-            after_flag = False
+            # Only the root flags that take a value consume the next word; a boolean flag
+            # (--json) or an unknown flag does not, and "--" ends the options (#4837 R7).
+            want_value = False
             for w in args:
                 wv, wexp = unquote(w)
-                if wexp or "$" in w or "`" in w:
-                    if not after_flag:
-                        out.append("ai-memory subcommand position holds an expansion %r" % w[:40])
-                        break
-                    after_flag = False
+                dyn = wexp or "$" in w or "`" in w
+                if want_value:
+                    want_value = False
                     continue
+                if wv == "--" and not dyn:
+                    continue
+                if dyn:
+                    name = wv.split("=", 1)[0]
+                    if wv.startswith("-") and "=" in wv and "$" not in name and "`" not in name:
+                        continue
+                    out.append("ai-memory subcommand position holds an expansion %r" % w[:40])
+                    break
                 if wv.startswith("-"):
-                    after_flag = "=" not in wv
-                    continue
-                if after_flag:
-                    after_flag = False
+                    want_value = wv in AI_MEMORY_VALUE_FLAGS
                     continue
                 break
         if base in ("source", ".") and args and re.match(r"^[\"']?[<$]\(", args[0]):
@@ -1861,6 +1868,8 @@ def build_probes() -> list:
         ("backslash-split serve in the provision script, listed (#4837 R6)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory s\\erve --host 0.0.0.0\n" + dec)]),
         ("ai-memory subcommand in a variable, listed (#4837 R6)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db /x "$V" --host 0.0.0.0\n' + dec)]),
         ("ai-memory under xargs, listed (#4837 R6)", [(dec, "      echo serve | xargs /usr/local/lib/ai-memory/bin/ai-memory\n" + dec)]),
+        ("ai-memory subcommand in a variable after --json, listed (#4837 R7)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --json "$V" --host 0.0.0.0\n' + dec)]),
+        ("ai-memory subcommand in a variable after --, listed (#4837 R7)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory -- "$V" --host 0.0.0.0\n' + dec)]),
         ("eval indented below the content block, listed (#4836)", [(dec, dec + '    eval "$PRE"\n')]),
         ("eval indented to the write_files key, listed (#4836)", [(dec, dec + '  eval "$PRE"\n')]),
         ("write_files encoding b64, listed", [(PROV, "  - path: /etc/x.sh\n    encoding: b64\n    content: |\n      Y3VybCBodHRwczovL3g=\n" + PROV)]),
@@ -1895,6 +1904,7 @@ def build_probes() -> list:
     red("Y tab in YAML indentation", [(RUNCMD, RUNCMD + "\t- [true]\n")])
     # ---- condition 5: normalisation and comments
     green("C5 extra blanks inside a listed line", [(RELOAD, "      systemctl    daemon-reload   \n")])
+    green("ai-memory --db=\"$DB\" before a literal subcommand (#4837 R7)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db="$DB" stats\n')], autolist=True)
     green("C5 provision comment mentioning curl", [ins(RELOAD, ["# curl -fsSL https://e | sh"], before=True)])
     green("C5 unit comment naming ExecStart", [(ENVF, ENVF + "      # ExecStart=/bin/evil\n")])
     green("C5 YAML comment", [(RUNCMD, "  # curl https://e | sh\n" + RUNCMD)])
