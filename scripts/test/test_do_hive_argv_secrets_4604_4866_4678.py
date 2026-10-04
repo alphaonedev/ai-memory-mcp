@@ -676,8 +676,48 @@ def verify_canary(fs, d, hostile):
               str(len(nlines)))
 
 
+def verify_harness(fs, d, h, xtrace):
+    """The whole verify step with every node channel answering h (bytes); (stdout+stderr, wall seconds)."""
+    k = fs.find("# --- main")
+    (d / "fed-prefix.sh").write_text(fs[:k] if k > 0 else "")
+    (d / "signer").write_text("#!/bin/bash\necho sig\n")
+    (d / "signer").chmod(0o755)
+    (d / "hostile.reply").write_bytes(h)
+    sc = ("set -u\nH=\"$(cat %s)\"\nV=\"$H\"$'\\nage='\"$H\"$'\\nvector='\"$H\"\n"
+          "source %s\n"
+          "NODE_COUNT=2\nPUBLIC_IPS=(h1 h2)\nPEER_URLS=(https://p1:9077 https://p2:9077)\n"
+          "node_sh() { local s; s=$(cat); case \"$s\" in *server_version*) printf '%%s' \"$V\" ;; *) printf '%%s' \"$H\" ;; esac; }\n"
+          "on_node() { case \"$2\" in *api-key*) printf '%%s\\n' %s ;; *) printf '%%s' \"$H\" ;; esac; }\n"
+          "curl() { cat >/dev/null; case \" $* \" in *' -w '*) printf '%%s' \"$H\" ;; *' -o '*) : ;; *) printf '%%s' \"$H\" ;; esac; }\n"
+          "node_post() { printf '%%s\\n%%s' \"$H\" \"$H\"; }\nnode_get() { printf '%%s' \"$H\"; }\nsleep() { :; }\n"
+          "%sverify; echo \"rc=$?\"\n" % (d / "hostile.reply", d / "fed-prefix.sh", SECRET, "set -x\n" if xtrace else ""))
+    (d / "harness.sh").write_text(sc)
+    env = dict(os.environ, LC_ALL="C.UTF-8", SIGNER=str(d / "signer"), AUTHOR_KEY_DIR=str(d), OUT_DIR=str(d / "out"))
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run(["bash", str(d / "harness.sh")], capture_output=True, env=env, cwd=str(d), timeout=60,
+                           stdin=subprocess.DEVNULL)
+        return r.stdout + r.stderr, time.monotonic() - t0
+    except subprocess.TimeoutExpired:
+        return b"TIMEOUT", time.monotonic() - t0
+
+
+def verify_cost_5247():
+    """#5247: verify parses a large one-line node reply in linear time (no bash suffix/prefix removal on a reply)."""
+    fs = FED.read_text()
+    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+        d = pathlib.Path(t)
+        out, secs = verify_harness(fs, d, b"18.6 " + b"x" * (512 * 1024), False)
+        probe("#5247 whole verify on a 512 KiB one-line reply finishes in under 20 s", b"rc=" in out and secs < 20,
+              "%.1fs" % secs)
+    body = "\n".join(l for l in section(fs, "verify() {", "\n}\n").splitlines() if not l.lstrip().startswith("#"))
+    names = sorted(tainted_names(fs) | {"versions", "pg_ver", "age_ver", "vec_ver", "resp", "qjson", "sresp", "sjson", "code", "lvl"})
+    strip = re.findall(r"\$\{(?:%s)(?:%%%%|##|%%|#)[^}]" % "|".join(map(re.escape, names)), body)
+    probe("#5247 verify does not strip a node reply with ${v%%...}, ${v##...}, ${v%...} or ${v#...}", not strip, str(strip[:4]))
+
+
 TAINT_SOURCES = ("on_node", "node_sh", "node_get", "node_post", "curl", "lg_curl", "ssh", "scp")
-SINKS = ("ok", "no", "die", "echo", "printf")
+SINKS =("ok", "no", "die", "echo", "printf")
 
 
 def _segments(line, name_re):
@@ -1068,6 +1108,7 @@ def main():
     f2_id_lists_agree()
     pg_version_5172()
     node_streams_5171()
+    verify_cost_5247()
     f3_static_pins()
     print("RESULT: %s (%d failed)" % ("FAIL" if FAILS else "PASS", len(FAILS)))
     return 1 if FAILS else 0

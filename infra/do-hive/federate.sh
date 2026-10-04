@@ -372,7 +372,8 @@ sudo -u postgres psql -d aimemory -Atc "SELECT extname || '=' || extversion FROM
 EOS
 )"
     # #5172: the server_version token (first line, up to the first space) must be exactly 18.6.
-    pg_ver="${versions%%$'\n'*}"; pg_ver="${pg_ver%% *}"
+    # A sed pipeline, not ${versions%%...}: bash suffix removal is quadratic in the reply length (#5247).
+    pg_ver="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '1{s/ .*//;p;q;}')"
     age_ver="$(printf '%s\n' "$versions" | sed -n 's/^age=//p' | head -n 1)"
     vec_ver="$(printf '%s\n' "$versions" | sed -n 's/^vector=//p' | head -n 1)"
     [ "$pg_ver" = 18.6 ] && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 (got $(reply_version "$pg_ver" "$versions"))"
