@@ -1736,7 +1736,7 @@ doubt everything else. SIX rules, all keyed on PATH-QUALIFIED grammar:
 pre-modularisation `src/handlers.rs` / `src/mcp.rs` / `src/db.rs`
 anchors still live in the operator guides), **LINE** (a `src/<p>.rs:<N>`
 anchor must name a line the file has; the range separator may be a
-hyphen, with or without spaces, an en dash or an em dash, and the
+hyphen, a doubled hyphen, an en dash, an em dash or the minus sign U+2212, with or without spaces, and the
 `#L<a>-L<b>` fragment of a relative `src/` link is range-checked the
 same way, column suffix included), **QUAL** (every identifier in
 `src/<p>.rs::<sym>` and `src/<p>.rs::{a, B::c, d}` must be defined IN
