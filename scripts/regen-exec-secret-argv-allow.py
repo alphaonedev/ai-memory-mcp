@@ -42,7 +42,7 @@ import subprocess
 import sys
 from collections import Counter, OrderedDict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 ALLOW_HEAD = """# Allowlist of the closed-world argv-secret gate scripts/check-exec-secret-argv.py.
@@ -99,10 +99,14 @@ def is_prose(rel: str) -> bool:
 
 def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, pending: bool,
          why: Optional[str], prune: bool, match: Optional[str] = None, dl=None,
-         committed_pending: Optional[List[Entry]] = None) -> Tuple[int, List[Entry], List[Entry], List[str]]:
+         committed_pending: Optional[List[Entry]] = None,
+         frozen: Optional[Set[str]] = None) -> Tuple[int, List[Entry], List[Entry], List[str]]:
     """Pure core. Returns (exit code, new allow, new pending, messages). ``committed_pending`` is
     the pending list as committed at HEAD: a line pruned from pending in an earlier, uncommitted
-    run is still refused for allow (#4996), and so is a lightly edited copy of it (#5103)."""
+    run is still refused for allow (#4996), and so is a lightly edited copy of it (#5103).
+    ``frozen`` is the set of files that have a pending row at the merge base, at HEAD or now: no allow
+    entry is added or raised in such a file (#5298, 5-agent vote 4d3ea1c5). The set is built from the
+    current pending rows too, so it needs no argument to hold for the working tree."""
     msgs: List[str] = []
     if accept_new and (why is None or not (gate.PEND_WHY_RE if pending else gate.WHY_RE).match(why)):
         return 2, allow, pend, ["--accept-new needs --why '#<issue>' (pending: an issue number only) or --why 'reason: <text>'"]
@@ -111,6 +115,7 @@ def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, p
     amap: Dict[Tuple[str, str], Entry] = {(e[1], e[3]): e for e in allow}
     pmap: Dict[Tuple[str, str], Entry] = {(e[1], e[3]): e for e in pend}
     pend_texts = {e[3] for e in pend} | {e[3] for e in (committed_pending or [])}
+    frozen_files = set(frozen or ()) | {e[1] for e in pend} | {e[1] for e in (committed_pending or [])}
     # committed pending rows that are no longer pending (counted by text, the gate's rule)
     still = Counter(e[3] for e in pend)
     vanished: List[str] = []
@@ -189,6 +194,12 @@ def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, p
                 msgs.append("REFUSED %s:%d: the prose rules flag this line (%s); it can only be pending: %s" % (
                     rel, extra[0][0], ",".join(hits[:3]), text[:120]))
                 continue
+        if not pending and rel in frozen_files:
+            rc = 1
+            msgs.append("REFUSED %s:%d: the file has a pending row (at the merge base, at HEAD or now), so no "
+                        "allow entry may be added or raised in it until #4929 Part 1 (#5298): %s" % (
+                            rel, extra[0][0], text[:120]))
+            continue
         tgt = pmap if pending else amap
         if key in tgt:
             e = tgt[key]
@@ -236,7 +247,7 @@ def retag(gate, allow: List[Entry], pend: List[Entry], source: str, match: Optio
 
 
 # ---------------------------------------------------------------- refusal cases
-REFUSAL_CASE_COUNT = 24
+REFUSAL_CASE_COUNT = 31
 
 
 def _f(gate, rel: str, line: str, flagged: bool = False):
@@ -297,6 +308,37 @@ def refusal_cases(root: Path) -> List[str]:
     rc, na, _np, _m = plan(gate, base2, [], pend_e, True, False, "reason: r", False, None, dl)
     if rc != 1 or na:
         bad.append("regen: --accept-new moved a pending key into allow (#4902)")
+    # #5298 (5-agent vote 4d3ea1c5): no allow entry is added or raised in a file with a pending row
+    fresh_line = "export SERVICE_PASSWORD"
+    other_pend: List[Entry] = [("#1", "x.sh", 1, "x --token $T", 1)]
+    fx = _f(gate, "x.sh", fresh_line)
+    rc, na, _np, _m = plan(gate, fx, [], [], True, False, "reason: r", False, None, dl, None, {"x.sh"})
+    if rc != 1 or na:
+        bad.append("regen: a new allow entry was added in a file that had a pending row at the base (#5298)")
+    rc, na, _np, _m = plan(gate, fx, [], other_pend, True, False, "reason: r", False, None, dl)
+    if rc != 1 or na:
+        bad.append("regen: a new allow entry was added in a file with a pending row now (#5298)")
+    rc, na, _np, _m = plan(gate, fx, [], [], True, False, "reason: r", False, None, dl, other_pend)
+    if rc != 1 or na:
+        bad.append("regen: a new allow entry was added in a file with a pending row at HEAD (#5298)")
+    rc, na, _np, _m = plan(gate, _f(gate, "y.sh", fresh_line), [], [], True, False, "reason: r", False, None, dl,
+                           None, {"x.sh"})
+    if rc != 0 or len(na) != 1:
+        bad.append("regen: a new allow entry was refused in a file with no pending row (#5298)")
+    fx2 = {"x.sh": fx["x.sh"] * 2}
+    had: List[Entry] = [("reason: r", "x.sh", 1, gate.norm(fresh_line), 1)]
+    rc, na, _np, _m = plan(gate, fx2, had, [], True, False, "reason: r", False, None, dl, None, {"x.sh"})
+    if rc != 1 or na != had:
+        bad.append("regen: an allow count was raised in a file that had a pending row (#5298)")
+    rc, na, _np, _m = plan(gate, fx, had, [], True, False, "reason: r", False, None, dl, None, {"x.sh"})
+    if rc != 0 or na != had:
+        bad.append("regen: an unchanged allow entry in a frozen file was judged again (#5298)")
+    # the #5298 report: --prune and --accept-new in one run. The pruned pending row still froze its file
+    stale_pend: List[Entry] = [("#1", "x.sh", 1, "x --gone $T", 1)]
+    rc, na, np_, _m = plan(gate, fx, [], stale_pend, True, False, "reason: r", True, None, dl)
+    if rc != 1 or na or np_:
+        bad.append("regen: --prune with --accept-new let a new allow entry into the file of the pruned "
+                   "pending row (#5298)")
     renamed = _f(gate, "y.sh", a_line)
     rc, na, _np, _m = plan(gate, renamed, [], pend_e, True, False, "reason: renamed", True, None, dl)
     if rc != 1 or na:
@@ -388,6 +430,7 @@ def main(argv: List[str]) -> int:
               "of the tool (#4902): %s" % dropped[0][:100], file=sys.stderr)
         return 2
     committed: List[Entry] = []
+    frozen: Set[str] = set()
     if args.accept_new and not args.pending:
         try:
             old = gate._git(root, "show", "HEAD:" + gate.PENDING_FILE)
@@ -396,11 +439,19 @@ def main(argv: List[str]) -> int:
                   file=sys.stderr)
             return 2
         committed = lenient_pending(old)
+        ref = gate.base_ref()
+        if ref:  # the merge base too: a pending row removed by an earlier commit of this branch still freezes its file
+            try:
+                _mb, renames, base_pend, _ba = gate.base_state(root, ref)
+            except RuntimeError as exc:
+                print("FAULT: %s" % exc, file=sys.stderr)
+                return 2
+            frozen = {renames.get(e[1], e[1]) for e in base_pend}
     if args.retag:
         rc, na, np_, msgs = retag(gate, allow, pend, args.retag, args.match, args.why, args.to_pending)
     else:
         rc, na, np_, msgs = plan(gate, found, allow, pend, args.accept_new, args.pending, args.why, args.prune,
-                                 args.match, dl, committed)
+                                 args.match, dl, committed, frozen)
     for m in msgs:
         print(m, file=sys.stderr if m.startswith(("NEW", "STALE", "REFUSED")) else sys.stdout)
     if rc == 2:

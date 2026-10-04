@@ -1072,19 +1072,33 @@ def in_ci() -> bool:
             or os.environ.get("CI", "").strip().lower() in ("true", "1"))
 
 
-def merge_base_hits(root: Path, allow: List[Entry], pend: Optional[List[Entry]] = None) -> Optional[List[str]]:
-    """Run the merge-base rules (#4919, #4996, #5103) against the base named by
-    EXEC_SECRET_ARGV_BASE (any ref) or GITHUB_BASE_REF (a pull request). Unresolved means red:
-    in CI a missing base, or a named base that cannot be resolved, is a FAULT (fail closed).
-    Outside CI with no base named, returns None: the rule was not evaluated, and run() says so."""
+def allow_added_in_pending_file(allow: List[Entry], base_allow: List[Entry], base_pending: List[Entry],
+                                renames: Dict[str, str]) -> List[str]:
+    """#5298 (5-agent vote 4d3ea1c5, decision B): no allow entry may be added or raised in a file that
+    had a pending row at the merge base. A respelling of a pending line that stays under the
+    similarity floor is approved by no spelling rule, so the refusal is keyed on the file: while a file
+    holds a pending row, new approvals there come only from #4929 Part 1 (values, not spellings).
+    An entry that is unchanged or lowered is not an approval and is not judged. The pending row may be
+    removed in the same change: the freeze reads the base, not the head."""
+    frozen = {renames.get(e[1], e[1]) for e in base_pending}
+    had = {(renames.get(e[1], e[1]), e[3]): e[2] for e in base_allow}
+    return ["allow:%d: the file had a pending row at the merge base, so no allow entry may be added or "
+            "raised in it (#5298; fix the line or keep it pending): %s: %s" % (e[4], e[1], e[3][:80])
+            for e in allow if e[1] in frozen and e[2] > had.get((e[1], e[3]), 0)]
+
+
+def base_ref() -> str:
+    """The base named by EXEC_SECRET_ARGV_BASE (any ref) or GITHUB_BASE_REF (a pull request); empty
+    when none is named."""
     ref = os.environ.get("EXEC_SECRET_ARGV_BASE", "").strip()
     if not ref and os.environ.get("GITHUB_BASE_REF", "").strip():
         ref = "origin/" + os.environ["GITHUB_BASE_REF"].strip()
-    if not ref:
-        if in_ci():
-            raise RuntimeError("no merge base named in CI: set EXEC_SECRET_ARGV_BASE or GITHUB_BASE_REF "
-                               "(unresolved means red, #4996)")
-        return None
+    return ref
+
+
+def base_state(root: Path, ref: str) -> Tuple[str, Dict[str, str], List[Entry], List[Entry]]:
+    """(merge base, renames since it, base pending rows, base allow rows). Any git failure is a
+    RuntimeError: unresolved means red."""
     try:
         mb = _git(root, "merge-base", "HEAD", ref).strip()
         renames: Dict[str, str] = {}
@@ -1096,11 +1110,26 @@ def merge_base_hits(root: Path, allow: List[Entry], pend: Optional[List[Entry]] 
         old_allow = _show_or_absent(root, mb, ALLOW_FILE)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError("cannot resolve the merge base against %s (fail closed): %s" % (ref, exc))
-    base_pend = parse_entries(old, "base-pending", False, [])
-    base_allow = parse_entries(old_allow, "base-allow", False, [])
+    return (mb, renames, parse_entries(old, "base-pending", False, []),
+            parse_entries(old_allow, "base-allow", False, []))
+
+
+def merge_base_hits(root: Path, allow: List[Entry], pend: Optional[List[Entry]] = None) -> Optional[List[str]]:
+    """Run the merge-base rules (#4919, #4996, #5103, #5298) against the base named by
+    EXEC_SECRET_ARGV_BASE (any ref) or GITHUB_BASE_REF (a pull request). Unresolved means red:
+    in CI a missing base, or a named base that cannot be resolved, is a FAULT (fail closed).
+    Outside CI with no base named, returns None: the rule was not evaluated, and run() says so."""
+    ref = base_ref()
+    if not ref:
+        if in_ci():
+            raise RuntimeError("no merge base named in CI: set EXEC_SECRET_ARGV_BASE or GITHUB_BASE_REF "
+                               "(unresolved means red, #4996)")
+        return None
+    _mb, renames, base_pend, base_allow = base_state(root, ref)
     hits = allow_from_pending(allow, base_pend, renames)
     hits.extend(allow_like_vanished_pending(allow, base_allow, base_pend, pend or []))
     hits.extend(allow_text_pending_elsewhere(allow, base_allow, base_pend, pend or [], renames))
+    hits.extend(allow_added_in_pending_file(allow, base_allow, base_pend, renames))
     return hits
 
 
@@ -1671,14 +1700,15 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
         commit_all("drop the allowed copy and launder")
         if gate(EXEC_SECRET_ARGV_BASE=base2)[0] != 1:
             bad.append("run() let a pending line move to allow when its text is also allowed elsewhere (#4919)")
-        # a new line that only looks like a line still pending is not a launder: green
+        # a new line that only looks like a line still pending is not a launder of that line, but its file
+        # had a pending row at the base, so since #5298 (5-agent vote 4d3ea1c5) the new entry is refused
         from_base2("near2")
         (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n%s\n" % (ok_line, pl, pl + "2"))
         rows([("a.sh", ok_line), ("c.sh", pl), ("a.sh", pl + "2")], [("a.sh", pl)])
         commit_all("a new line near a line that stays pending")
         rc, out = gate(EXEC_SECRET_ARGV_BASE=base2)
-        if rc != 0:
-            bad.append("run() refused a new line near a line that is still pending (%d): %s"
+        if rc != 1 or "no allow entry may be added or raised" not in out:
+            bad.append("run() let a new line near a still-pending line into its file (%d): %s"
                        % (rc, out.strip()[:160]))
         # a real fix of the pending line keeps the copy allowed at the base: green
         from_base2("fix2")
@@ -1688,6 +1718,52 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
         rc, out = gate(EXEC_SECRET_ARGV_BASE=base2)
         if rc != 0:
             bad.append("run() refused a real fix next to an allow entry kept from the base (%d): %s"
+                       % (rc, out.strip()[:160]))
+        # #5298 (5-agent vote 4d3ea1c5): no allow entry is added or raised in a file that had a pending
+        # row at the base. base2 holds a pending row in a.sh; a.sh stays pending in every case below.
+        nl = "export SERVICE_PASSWORD"
+        from_base2("freeze new")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n%s\n" % (ok_line, pl, nl))
+        rows([("a.sh", ok_line), ("c.sh", pl), ("a.sh", nl)], [("a.sh", pl)])
+        commit_all("a new allow entry in a file with a pending row")
+        if gate(EXEC_SECRET_ARGV_BASE=base2)[0] != 1:
+            bad.append("run() let a new allow entry into a file that had a pending row at the base (#5298)")
+        from_base2("freeze other file")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n" % (ok_line, pl))
+        (t / "d.sh").write_text("#!/bin/bash\n%s\n" % nl)
+        rows([("a.sh", ok_line), ("c.sh", pl), ("d.sh", nl)], [("a.sh", pl)])
+        commit_all("a new allow entry in a file with no pending row")
+        rc, out = gate(EXEC_SECRET_ARGV_BASE=base2)
+        if rc != 0:
+            bad.append("run() refused a new allow entry in a file with no pending row (%d): %s"
+                       % (rc, out.strip()[:160]))
+        from_base2("freeze raise")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n%s\n" % (ok_line, ok_line, pl))
+        (t / ALLOW_FILE).write_text("reason: self-test | a.sh | 2 | %s\nreason: self-test | c.sh | 1 | %s\n"
+                                    % (ok_line, pl))
+        commit_all("a raised allow count in a file with a pending row")
+        if gate(EXEC_SECRET_ARGV_BASE=base2)[0] != 1:
+            bad.append("run() let an allow count be raised in a file that had a pending row at the base (#5298)")
+        from_base2("freeze removed")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n" % (ok_line, nl))
+        rows([("a.sh", ok_line), ("c.sh", pl), ("a.sh", nl)], [])
+        commit_all("the pending row is removed and a new allow entry added in the same file")
+        if gate(EXEC_SECRET_ARGV_BASE=base2)[0] != 1:
+            bad.append("run() let a new allow entry in when the same change removed the pending row (#5298)")
+        from_base2("freeze rename")
+        git("mv", "a.sh", "b.sh")
+        (t / "b.sh").write_text("#!/bin/bash\n%s\n%s\n%s\n" % (ok_line, pl, nl))
+        rows([("b.sh", ok_line), ("c.sh", pl), ("b.sh", nl)], [("b.sh", pl)])
+        commit_all("a renamed file with a pending row gets a new allow entry")
+        if gate(EXEC_SECRET_ARGV_BASE=base2)[0] != 1:
+            bad.append("run() let a new allow entry into a renamed file that had a pending row (#5298)")
+        from_base2("freeze rename unchanged")
+        git("mv", "a.sh", "b.sh")
+        rows([("b.sh", ok_line), ("c.sh", pl)], [("b.sh", pl)])
+        commit_all("a renamed file with a pending row keeps its allow entries unchanged")
+        rc, out = gate(EXEC_SECRET_ARGV_BASE=base2)
+        if rc != 0:
+            bad.append("run() judged an unchanged allow entry again in a renamed frozen file (%d): %s"
                        % (rc, out.strip()[:160]))
         # regen main(): a pending row pruned from the working tree but committed at HEAD is still
         # refused for allow by --accept-new (#4996), through the real argument path
@@ -1712,6 +1788,26 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
         if rc != 1 or "the line is pending" not in out.getvalue():
             bad.append("regen --accept-new approved a pending line pruned before the run (%d): %s"
                        % (rc, out.getvalue().strip()[:160]))
+        # regen main() reads the base too (#5298): the pending row of a.sh is gone at HEAD, but base2 had it
+        from_base2("regen freeze")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n" % (ok_line, nl))
+        rows([("a.sh", ok_line), ("c.sh", pl)], [])
+        commit_all("the pending row is gone at HEAD")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n" % (ok_line, nl))
+        shutil.copy(str(root / "scripts" / "check-exec-secret-argv.py"), str(t / "scripts"))
+        for base_env, want in ((base2, 1), ("", 0)):
+            cases[0] += 1
+            for k in keys:
+                os.environ.pop(k, None)
+            if base_env:
+                os.environ["EXEC_SECRET_ARGV_BASE"] = base_env
+            out = io.StringIO()
+            with contextlib.redirect_stderr(out), contextlib.redirect_stdout(out):
+                rc = regen.main(["regen", "--accept-new", "--why", "reason: self-test", "--match", "SERVICE",
+                                 "--root", str(t)])
+            if rc != want or (want == 1 and "pending row" not in out.getvalue()):
+                bad.append("regen --accept-new ignored the pending row at the merge base (#5298; base %r, %d): %s"
+                           % (base_env, rc, out.getvalue().strip()[:160]))
     finally:
         for k, v in saved.items():
             if v is None:
