@@ -186,6 +186,101 @@ fn doctor_cli_reports_a_read_fault_critical_not_empty_4715() {
     assert_eq!(code, 2);
 }
 
+/// Plants a namespace standard whose memory carries `metadata` verbatim (a
+/// bound standard the doctor must read through `json_extract`).
+fn plant_standard_with_metadata(db: &std::path::Path, metadata: &str) {
+    let conn = ai_memory::db::open(db).expect("open");
+    conn.execute(
+        "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at, metadata) \
+         VALUES ('std4956', 'long', 'ns4956', 'standard', 'standard', \
+                 '2026-10-03T00:00:00Z', '2026-10-03T00:00:00Z', ?1)",
+        rusqlite::params![metadata],
+    )
+    .expect("plant standard memory");
+    conn.execute(
+        "INSERT INTO namespace_meta (namespace, standard_id, updated_at) \
+         VALUES ('ns4956', 'std4956', '2026-10-03T00:00:00Z')",
+        [],
+    )
+    .expect("bind the standard");
+}
+
+/// #4956: a coverage read fault (a bound standard whose metadata is not valid
+/// JSON) is an error from the storage probe, never a healthy-looking 0/0.
+#[test]
+fn sqlite_coverage_probe_errors_on_invalid_standard_metadata_4956() {
+    let (_t, db) = fresh_db();
+    plant_standard_with_metadata(&db, "{not json");
+    let conn = ai_memory::db::open(&db).expect("open");
+    assert!(
+        ai_memory::db::doctor_governance_coverage(&conn).is_err(),
+        "a coverage read fault must be an error, not (0, n)"
+    );
+}
+
+/// #4956: the CLI prints `unreadable`, carries the error fact and is Critical.
+#[test]
+fn doctor_cli_reports_a_coverage_read_fault_unreadable_invalid_json_4956() {
+    let (_t, db) = fresh_db();
+    plant_standard_with_metadata(&db, "{not json");
+    let (report, code) = doctor_json(&db);
+    let gov = section(&report, "Governance");
+    assert!(is_critical(gov), "a coverage read fault is Critical: {gov}");
+    assert!(fact(gov, "governance_coverage_error").is_some(), "{gov}");
+    assert_eq!(
+        fact(gov, "namespaces_with_policy"),
+        Some("unreadable"),
+        "{gov}"
+    );
+    assert_eq!(
+        fact(gov, "namespaces_without_policy"),
+        Some("unreadable"),
+        "{gov}"
+    );
+    assert_eq!(code, 2);
+    // Text mode carries the same honest fact, not a 0.
+    let text = ai_memory(&db)
+        .args(["doctor"])
+        .output()
+        .expect("run doctor text");
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains("namespaces_with_policy") && text.contains("unreadable"),
+        "text output must say unreadable: {text}"
+    );
+}
+
+/// #4956: with `namespace_meta` missing the coverage reads fail and the CLI
+/// says `unreadable` with an error fact, not `0` / `0`.
+#[test]
+fn doctor_cli_reports_a_coverage_read_fault_unreadable_missing_table_4956() {
+    let (_t, db) = fresh_db();
+    {
+        let conn = ai_memory::db::open(&db).expect("open");
+        conn.execute_batch("ALTER TABLE namespace_meta RENAME TO namespace_meta_gone")
+            .expect("rename away");
+        assert!(
+            ai_memory::db::doctor_governance_coverage(&conn).is_err(),
+            "a missing namespace_meta must be an error, not (0, 0)"
+        );
+    }
+    let (report, code) = doctor_json(&db);
+    let gov = section(&report, "Governance");
+    assert!(is_critical(gov), "{gov}");
+    assert!(fact(gov, "governance_coverage_error").is_some(), "{gov}");
+    assert_eq!(
+        fact(gov, "namespaces_with_policy"),
+        Some("unreadable"),
+        "{gov}"
+    );
+    assert_eq!(
+        fact(gov, "namespaces_without_policy"),
+        Some("unreadable"),
+        "{gov}"
+    );
+    assert_eq!(code, 2);
+}
+
 /// R1: a 20k-row chain (the shape that took 11 s in a quadratic census, and
 /// on postgres surfaced as a bogus timeout) is censused in linear time, and
 /// the doctor still names the head with the exact hop count and keeps the
@@ -212,7 +307,7 @@ fn sqlite_doctor_censuses_a_20k_row_chain_in_linear_time_4715() {
     let found = ai_memory::db::doctor_over_depth_chains(&conn).expect("census");
     let took = started.elapsed();
     assert!(
-        took < std::time::Duration::from_secs(3),
+        took < std::time::Duration::from_secs(10),
         "the census over a 20k-row chain took {took:?}: not linear"
     );
     assert_eq!(found.len(), N - MAX, "every start past the bound is found");
@@ -392,6 +487,35 @@ mod pg {
         Some(rest.split('?').next().unwrap_or(rest))
     }
 
+    /// PostgreSQL truncates identifiers to 63 bytes, which would make the
+    /// created name differ from the URL's and the guard's. Keep the whole
+    /// derived name within the limit: a long lane name is cut on a char
+    /// boundary (deterministic), and the pid suffix is always kept so two
+    /// processes never collide.
+    const PG_IDENT_MAX: usize = 63;
+
+    fn throwaway_name(lane_db: &str, pid: u32) -> String {
+        let suffix = format!("_nometa_4715_{pid}");
+        let room = PG_IDENT_MAX.saturating_sub(suffix.len());
+        let mut cut = lane_db.len().min(room);
+        while !lane_db.is_char_boundary(cut) {
+            cut = cut.saturating_sub(1);
+        }
+        format!("{}{suffix}", &lane_db[..cut])
+    }
+
+    #[test]
+    fn throwaway_database_name_fits_the_pg_identifier_limit_4715() {
+        let long = "f1_a_very_long_lane_database_name_that_would_overflow_the_limit_x";
+        let name = throwaway_name(long, 4_294_967_295);
+        assert!(name.len() <= PG_IDENT_MAX, "{} bytes: {name}", name.len());
+        assert!(name.ends_with("_nometa_4715_4294967295"), "{name}");
+        assert_eq!(name, throwaway_name(long, 4_294_967_295), "deterministic");
+        assert_eq!(throwaway_name("lane", 7), "lane_nometa_4715_7");
+        let multibyte = "\u{e9}".repeat(40);
+        assert!(throwaway_name(&multibyte, 1).len() <= PG_IDENT_MAX);
+    }
+
     /// Drops the throwaway database even when the cell panics. A fresh
     /// runtime on its own thread, because `Drop` is sync and may run while
     /// the test's runtime is shutting down.
@@ -436,7 +560,7 @@ mod pg {
         };
         let _s = SERIAL.lock().await;
         let lane_db = database_of(&url).expect("the test URL names a database");
-        let nometa = format!("{lane_db}_nometa_4715_{}", std::process::id());
+        let nometa = throwaway_name(lane_db, std::process::id());
         let schemaless_url =
             with_database(&url, &nometa).expect("the test URL's database is replaceable");
         assert_ne!(

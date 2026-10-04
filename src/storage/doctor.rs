@@ -313,20 +313,20 @@ pub fn doctor_oldest_pending_age_secs(conn: &Connection) -> Result<Option<i64>> 
 ///
 /// # Errors
 ///
-/// Returns `Err` only on hard SQLite failures.
+/// Returns `Err` on any SQLite failure, including a standard whose metadata
+/// is not valid JSON or a missing `namespace_meta` table (#4956).
 pub fn doctor_governance_coverage(conn: &Connection) -> Result<(usize, usize)> {
-    let with_policy: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM memories m
-             INNER JOIN namespace_meta nm ON nm.standard_id = m.id
-             WHERE json_extract(m.metadata, '$.governance') IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let total_meta: i64 = conn
-        .query_row("SELECT COUNT(*) FROM namespace_meta", [], |r| r.get(0))
-        .unwrap_or(0);
+    // #4715 / #4956: a read fault is an error, never a healthy-looking 0
+    // (ERRORS-02, ERRORS-19). The caller reports it Critical.
+    let with_policy: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memories m
+         INNER JOIN namespace_meta nm ON nm.standard_id = m.id
+         WHERE json_extract(m.metadata, '$.governance') IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let total_meta: i64 =
+        conn.query_row("SELECT COUNT(*) FROM namespace_meta", [], |r| r.get(0))?;
     let with = usize::try_from(with_policy.max(0)).unwrap_or(0);
     let total = usize::try_from(total_meta.max(0)).unwrap_or(0);
     Ok((with, total.saturating_sub(with)))
