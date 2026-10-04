@@ -143,8 +143,13 @@ REDACTION_TOKENS = ("...", "…", "***", "redacted", "<redacted>", "xxxx")
 # A whole value made of one filler character ("xxxx", "****", "......").
 FILLER_RE = re.compile(r"(?:x{3,}|\*{3,}|\.{3,}|…+|_{3,}|-{3,})", re.I)
 
-# Files that quote the patterns on purpose: this gate.
-SELF_EXEMPT = {"scripts/check-docs-no-argv-secrets.py"}
+# Files that quote the patterns on purpose: this gate and the closed-world argv gate
+# (and its regen tool), whose red-probe fixtures are literal argv secrets (#4916).
+SELF_EXEMPT = {
+    "scripts/check-docs-no-argv-secrets.py",
+    "scripts/check-exec-secret-argv.py",
+    "scripts/regen-exec-secret-argv-allow.py",
+}
 
 # No path is skipped (#4615). If a historical file ever needs an exemption, add a
 # path entry here that names its tracking issue and is proven load-bearing by the
