@@ -1653,7 +1653,7 @@ COMPARE_WORKFLOW_LINES = (
     "on:",
     "pull_request_target:",
     'branches: [main, develop, "release/**", "rehearsal/**"]',
-    "types: [opened, synchronize, reopened]",
+    "types: [opened, synchronize, reopened, edited]",
     "permissions:",
     "contents: read",
     "concurrency:",
@@ -1891,6 +1891,13 @@ def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
         "--self-test\n", "--self-test\n        continue-on-error: true\n", 1), "continue-on-error")
     ok &= case("R3-F3 secret exposed", good.replace(
         "          PR_NUMBER:", "          TOKEN: ${{ secrets.GITHUB_TOKEN }}\n          PR_NUMBER:", 1), "secrets.")
+    ok &= case("R5 edited type removed (a PR edit would not re-run the comparison)", good.replace(
+        "types: [opened, synchronize, reopened, edited]", "types: [opened, synchronize, reopened]", 1),
+        "differs from the pinned form")
+    ok &= case("R5 types narrowed to synchronize only", good.replace(
+        "types: [opened, synchronize, reopened, edited]", "types: [synchronize]", 1), "differs from the pinned form")
+    ok &= case("R5 types line removed (default types skip edited)", good.replace(
+        "    types: [opened, synchronize, reopened, edited]\n", "", 1), "meaningful lines")
     ok &= case("R3-F3 pull_request trigger instead", good.replace("  pull_request_target:\n", "  pull_request:\n", 1),
                "differs from the pinned form")
     missing = wf / "absent.yml"
