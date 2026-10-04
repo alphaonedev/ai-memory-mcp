@@ -39,6 +39,8 @@ DOCKERFILE="$HIVE_ROOT/provision/pg-age/Dockerfile"
 BOOTSTRAP="$HIVE_ROOT/provision/pg-age/bootstrap.sql"
 SECRET_DIR="/opt/hive/pg-age/.secrets"
 TLS_DIR="/opt/hive/pg-age/tls"
+# The CA private key lives OUTSIDE the directory mounted into the container.
+CA_DIR="/opt/hive/pg-age/tls-ca"
 # Data volume and TLS mount shared by the init container and its recreate.
 PG_RUN_ARGS="--name hive-pg-age --restart unless-stopped -p 127.0.0.1:5432:5432 -v hive-pgdata:/var/lib/postgresql/data -v '$TLS_DIR':/tls:ro"
 PG_SSL_ARGS="-c ssl=on -c ssl_cert_file=/tls/server.crt -c ssl_key_file=/tls/server.key"
@@ -85,16 +87,18 @@ while read -r ip; do
   # key stays root-only on the peer, the server key is handed to the
   # container's postgres uid (999), read-only.
   log "[$host] issuing the peer-local Postgres TLS CA and server certificate (127.0.0.1)"
-  ssh_node "$ip" "set -e; umask 077; mkdir -p '$TLS_DIR'; cd '$TLS_DIR'; \
+  ssh_node "$ip" "set -e; umask 077; mkdir -p '$CA_DIR' '$TLS_DIR'; chmod 0700 '$CA_DIR'; cd '$CA_DIR'; \
     [ -s ca.key ] || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
       -subj '/CN=hive-pg-age-ca' -keyout ca.key -out ca.crt 2>/dev/null; \
+    rm -f '$TLS_DIR/ca.key' '$TLS_DIR/ca.srl'; \
     openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj '/CN=127.0.0.1' \
-      -keyout server.key -out server.csr 2>/dev/null; \
+      -keyout '$TLS_DIR/server.key' -out server.csr 2>/dev/null; \
     printf 'subjectAltName=IP:127.0.0.1\\nbasicConstraints=CA:FALSE\\nkeyUsage=digitalSignature,keyEncipherment\\nextendedKeyUsage=serverAuth\\n' > server.ext; \
     openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 825 \
-      -extfile server.ext -out server.crt 2>/dev/null; \
-    rm -f server.csr server.ext; chown 999:999 server.key server.crt; chmod 0600 server.key ca.key; \
-    chmod 0644 server.crt ca.crt; chmod 0755 '$TLS_DIR'"
+      -extfile server.ext -out '$TLS_DIR/server.crt' 2>/dev/null; \
+    rm -f server.csr server.ext; install -m 0644 ca.crt '$TLS_DIR/ca.crt'; chmod 0600 ca.key; \
+    chown 999:999 '$TLS_DIR/server.key' '$TLS_DIR/server.crt'; chmod 0600 '$TLS_DIR/server.key'; \
+    chmod 0644 '$TLS_DIR/server.crt'; chmod 0755 '$TLS_DIR'"
 
   log "[$host] (re)starting hive-pg-age container (localhost:5432, persistent volume)"
   SU_ENV_CONTAINER=1
