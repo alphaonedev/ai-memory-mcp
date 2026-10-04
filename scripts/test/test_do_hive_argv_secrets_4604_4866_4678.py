@@ -572,6 +572,20 @@ def failure_lines_4999():
             (d / "body").write_text(body)
             r = run_bash("api_key='%s'\n%s\nb=$(cat %s)\nsafe_excerpt \"$b\"\n" % (key, defs, d / "body"), d)
             probe("V2 excerpt still shows %s" % label, "bytes: " in r.stdout and "key material" not in r.stdout, r.stdout.strip()[:80])
+        # A letter between groups defeats a hex-only compare of the raw reply, so the hex-only reduction
+        # is probed on its own; a key with upper-case letters is compared case-folded.
+        (d / "body").write_text(" q ".join(key[k:k + 16] for k in range(0, 64, 16)))
+        r = run_bash("api_key='%s'\n%s\nb=$(cat %s)\nsafe_excerpt \"$b\"\n" % (key, defs, d / "body"), d)
+        probe("V2 excerpt carries no key spelled in groups with a letter and spaces between", bool(defs) and "bytes: " in r.stdout
+              and key[:12] not in "".join(c for c in r.stdout if c.isalnum()), r.stdout.strip()[:80])
+        (d / "body").write_text("Hunter2Hunter")
+        r = run_bash("api_key='Hunter2Hunter'\n%s\nb=$(cat %s)\nsafe_excerpt \"$b\"\n" % (defs, d / "body"), d)
+        probe("V2 excerpt redacts an upper-case api key that arrives lower-cased", bool(defs) and "bytes: " in r.stdout
+              and "hunter2hunter" not in r.stdout.lower(), r.stdout.strip()[:80])
+        (d / "body").write_text("ab cd " * 100)
+        r = run_bash("api_key=''\n%s\nb=$(cat %s)\nsafe_excerpt \"$b\"\n" % (defs, d / "body"), d)
+        probe("V1 a long plain reply is cut to 120 bytes of excerpt", bool(defs) and r.stdout.startswith("600 bytes: ")
+              and len(r.stdout) == len("600 bytes: ") + 120, "len=%d %r" % (len(r.stdout), r.stdout[:30]))
         # The hostile reply above is padded past the 120-byte window, so each filter is also probed with
         # a short reply whose hostile part sits inside the window (otherwise truncation alone passes).
         for label, raw, bad in (("control and non-ASCII bytes", "e:bad\\x1b[31m\\x01\\x07 \\xc3\\xa9\\xe2\\x82\\xac end", None),
