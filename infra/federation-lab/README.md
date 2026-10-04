@@ -278,7 +278,7 @@ every knob in that table (the run prints the count it read) to a hard floor and
 refuses to boot if any of them is set *below* that floor — the "no-disable"
 contract.
 
-**This lab runs every pinned knob at its hard floor (31 of 31), and does not set the profile knob.**
+**This lab runs every pinned knob at its hard floor (all of them, no count to go stale), and does not set the profile knob.**
 It sets each knob directly (and unsets the permissive hatches) so the run can name every
 one, and a drift check re-derives the list from the Rust SSOT on every run.
 
@@ -412,7 +412,7 @@ goes red if any of it stops being true:
 - That attested write replicates to the peer and arrives `agent_attested`, and
   the peer returns it from `recall`.
 - The `asi-hard` no-disable contract refuses a boot with a loosened pin.
-- Every pinned knob (31 of 31, including `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`, issue #2942 since fixed) boots cleanly together on a fresh node.
+- Every pinned knob (including `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`, issue #2942 since fixed) boots cleanly together on a fresh node.
 - The full-profile cold boot is probed on every run; a refusal fails the run and a timeout kill of a healthy node is not counted as a refusal (issue #4938).
 
 **Plausible** — consistent with what the kit shows, but *not* measured here:

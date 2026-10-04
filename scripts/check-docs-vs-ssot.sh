@@ -1679,8 +1679,9 @@ run_all_rules() {
     #   * CHANGELOG.md - every entry is a landing-time snapshot; "the existing
     #     17-knob asi-hard hardened set" was TRUE when written.
     #   * infra/federation-lab/README.md - a campaign log, same class. Its one
-    #     live-looking sentence (the "all of them" knob walk) was reworded to
-    #     carry no number, so it cannot go stale.
+    #     live-looking prose claims (the "all of them" knob walk) carry no
+    #     number, so they cannot go stale; its captured run transcript prints a
+    #     count as OUTPUT, which is a record, not a claim (#5123).
     # The certification doc IS walked: its signed 17-knob EVIDENCE note records
     # what the captured artifacts rendered pre-#3033 and is spared by the
     # historical guards (is_historical), not by omission from the scan set.
