@@ -2878,6 +2878,7 @@ def build_probes() -> list:
         ('ai-memory found by command -v behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      B=$(command -v ai-memory); taskset -c 0 "$${B}" --db /x stats\n' + dec)]),
         ('ai-memory through a variable alias behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      B=/usr/local/lib/ai-memory/bin/ai-memory; C="$${B}"; taskset -c 0 "$${C}" --db /x stats\n' + dec)]),
         ('ai-memory through a variable operator behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      B=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$${B%.x}" --db /x stats\n' + dec)]),
+        ('ai-memory copied through a variable operator, listed (#4837 R12 R4 pin, #5205)', [(dec, '      B=/usr/local/lib/ai-memory/bin/ai-memory; cp "$${B%x}" /usr/local/bin/aim\n' + dec)]),
         ('ai-memory through a default operator behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      taskset -c 0 $${AIM:-/usr/local/lib/ai-memory/bin/ai-memory} --db /x stats\n' + dec)]),
         ('ai-memory named by a partial expansion behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      taskset -c 0 /usr/local/lib/ai-memory/bin/$${N} --db /x stats\n' + dec)]),
         ('ai-memory through a for-loop variable behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      for f in /usr/local/lib/ai-memory/bin/*; do taskset -c 0 "$f" --db /x stats; done\n' + dec)]),
