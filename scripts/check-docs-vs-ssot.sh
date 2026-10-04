@@ -2824,6 +2824,12 @@ a v0.8.x DB steps _v40 -> v52_ on boot.
 a v0.8.x DB steps _v40 -> v53_ on boot.
 a v0.8.x DB steps v4_0 -> v52 on boot.
 a v0.8.x DB steps __v40 -> v52__ on boot.
+re-stamped to v1.0.0	(schema v52)
+re-stamped to v1.0.0	(schema v53)
+Schema v52	(was v51)
+Schema v53	(was v51)
+Current version:  52 at v1.0.0
+Current version:  53 at v1.0.0
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2986,6 +2992,9 @@ R4HTML
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:57 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:58 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:61 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:62 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:64 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:66 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:41 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:43 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:45 claims "52"' \
@@ -3011,6 +3020,7 @@ R4HTML
         'docs/schema-fixture.html:52 ' 'docs/schema-fixture.html:62 ' 'docs/schema-fixture.html:68 ' \
         'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' \
         'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 ' 'docs/schema-fixture.html:89 ' 'docs/schema-fixture.html:94 ' 'docs/postgres-age-guide.md:59 ' 'docs/postgres-age-guide.md:60 ' \
+        'docs/postgres-age-guide.md:63 ' 'docs/postgres-age-guide.md:65 ' 'docs/postgres-age-guide.md:67 ' \
         'docs/postgres-age-guide.md:42 ' 'docs/postgres-age-guide.md:44 ' 'docs/postgres-age-guide.md:46 ' \
         'docs/postgres-age-guide.md:48 ' 'docs/postgres-age-guide.md:50 ' 'docs/postgres-age-guide.md:51 ' \
         'docs/postgres-age-guide.md:52 ' 'docs/postgres-age-guide.md:53 '
@@ -3023,7 +3033,7 @@ R4HTML
     echo "PASS: self-test #5140 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, any case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
     echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag, and when the previous line ends with a closing block tag and the next line carries no tag); a closing tag in the MIDDLE of the previous line does not cut a claim wrapped inside the next paragraph; a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
-    echo "PASS: self-test #5200 - ident-less anchors (Current schema = vN, re-stamped to v1.0.0 (schema vN)) match a markdown claim with doubled spaces or a tab: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5200/#5339 - ident-less anchors (re-stamped to v1.0.0 (schema vN), Schema vN (was vM), Current version: N at v1.0.0) each match a markdown claim in BOTH a doubled-space and a tab variant: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5337 - join boundaries pinned: a line ending with an OPENING block tag still joins (52 REJECTED), markdown is not tag-aware (a closing tag at the end of a markdown line, or an opening tag at the start of the next, still joins; 52 REJECTED), html literal backticks are not folded (documented bound)"
     echo "PASS: self-test #5261/#5338 - markdown steps anchor wrapped in bold, a code span or underscore emphasis (steps **v40 -> v52**, a backtick span, _v40 -> v52_, __v40 -> v52__): planted 52 REJECTED, 53 ACCEPTED; an identifier with an inner underscore (v4_0) is not rewritten by the fold"
     echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
