@@ -8017,16 +8017,26 @@ pub async fn bootstrap_serve(
 /// in `src/main.rs`), so arming one for them would change their captured
 /// stdout/stderr — which is why the boot-time install is scoped rather than
 /// unconditional.
+///
+/// #4939 — `schema-init` and `migrate` are included although they are short
+/// one-shot commands: they resolve credential-bearing store URLs, and their
+/// bodies emit security diagnostics (the #1927 argv-password warning, the
+/// store-URL channel line, the #3085 unattributed-embedding warning) that were
+/// silently discarded without a subscriber. The funnel writes to stderr only,
+/// so their `--json` stdout is unchanged.
 #[must_use]
 fn command_installs_console_subscriber(cmd: &Command) -> bool {
-    matches!(
+    let console = matches!(
         cmd,
         Command::Serve(_)
             | Command::Curator(_)
             | Command::Watch(_)
             | Command::WakeHub(_)
             | Command::WakeListen(_)
-    )
+    );
+    #[cfg(feature = "sal")]
+    let console = console || matches!(cmd, Command::SchemaInit(_) | Command::Migrate(_));
+    console
 }
 
 /// v1.0.0 #2908 — arm the console subscriber for the boot posture reports.
