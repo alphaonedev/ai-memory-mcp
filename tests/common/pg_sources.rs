@@ -117,6 +117,15 @@ fn declared_children(root_text: &str) -> Vec<DeclaredMod> {
             }
             continue;
         };
+        // 2026-10-03 (GOD ai:god-zsg): drop a trailing LINE COMMENT before looking for the `;`.
+        // `rest.strip_suffix(';')` alone returned None for `mod governance_chain_4477; // #4477 …`,
+        // so three modules the unit and #4478 declared read as UNDECLARED and the batch-7 census
+        // failed 5/5 in 3175 and 4/6 in 2397 — while those scanners, being red, asserted nothing
+        // about the parity they exist to check. A `mod x;` line may carry a comment; a scanner that
+        // breaks on one depends on the textual shape of valid Rust beside the declaration it reads,
+        // which is the defect, not the declaration (rule k). A `mod` line cannot contain a string
+        // literal, so splitting on the first `//` is safe here.
+        let rest = rest.split("//").next().unwrap_or(rest).trim_end();
         if let Some(name) = rest.strip_suffix(';') {
             let name = name.trim();
             if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
@@ -129,6 +138,48 @@ fn declared_children(root_text: &str) -> Vec<DeclaredMod> {
         pending_path = None;
     }
     out
+}
+
+/// #4504-adjacent instrument pin (2026-10-03, GOD): a trailing line comment on a `mod x;`
+/// declaration must not hide the module from the parser. `declared_children` took
+/// `rest.strip_suffix(';')`, so `mod governance_chain_4477; // #4477 ...` yielded None and the
+/// module read as UNDECLARED — which made the batch-7 census fail 5/5 in 3175 and 4/6 in 2397 with
+/// "`governance_chain_4477.rs` is not declared", while the scanners those binaries exist to run
+/// asserted nothing at all. A scanner must not depend on the textual shape of valid Rust beside the
+/// declaration it reads (rule k). This cell lives next to the parser because the parser is private,
+/// and it is compiled into every binary that uses the helper, so a regression reds all of them.
+#[test]
+fn declaration_with_a_trailing_comment_is_still_declared() {
+    let root = "mod plain;\nmod commented; // a reason a human wrote here\npub mod pub_commented; // and here\n#[path = \"sub/renamed.rs\"]\nmod renamed; // with a path attribute too\n";
+    let got: Vec<String> = declared_children(root)
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert!(
+        got.contains(&"plain".to_string()),
+        "plain declaration lost: {got:?}"
+    );
+    assert!(
+        got.contains(&"commented".to_string()),
+        "a trailing `// comment` hid the declaration from the parser: {got:?}"
+    );
+    assert!(
+        got.contains(&"pub_commented".to_string()),
+        "a trailing comment on a `pub mod` hid the declaration: {got:?}"
+    );
+    assert!(
+        got.contains(&"renamed".to_string()),
+        "a trailing comment hid a #[path]-attributed declaration: {got:?}"
+    );
+    let renamed = declared_children(root)
+        .into_iter()
+        .find(|d| d.name == "renamed")
+        .unwrap();
+    assert_eq!(
+        renamed.path_attr.as_deref(),
+        Some("sub/renamed.rs"),
+        "the #[path] attribute must survive the comment strip"
+    );
 }
 
 /// Every adapter source file: `postgres.rs` first, then each child module in

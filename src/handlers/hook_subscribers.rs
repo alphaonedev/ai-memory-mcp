@@ -314,6 +314,129 @@ async fn set_namespace_standard_inner(
         } else {
             crate::store::CallerContext::for_agent(&caller)
         };
+        // #929 SECURITY-high (Track A P6, 2026-05-20) — uniform
+        // ownership gate on the postgres path. Catches both the
+        // body.id-supplied branch and the auto-seed reuse branch.
+        // First-writes land on a placeholder stamped with the
+        // caller's id (below), so an immediate re-fetch returns the
+        // caller as owner and this gate is a no-op for first writes.
+        // Subsequent writes by a different caller hit the !is_unowned
+        // branch and 403.
+        // #2541 — same authorize helper as MCP; no silent ownership claim.
+        //
+        // #2709 SECURITY-high (CB-4 / CWE-284, 2026-08-04) — the ownership
+        // probe MUST NOT fold a #910 visibility denial into "skip authz".
+        // `PostgresStore::get` under the tenant-scoped request `ctx`
+        // (`bypass_visibility=false`) returns `Err(NotFound)` for BOTH a
+        // genuinely-absent row AND a foreign-owned `scope=private` row the
+        // caller cannot see. The pre-fix `if let Ok(resolved_mem)` arm
+        // therefore SKIPPED the ownership check whenever `body.id` named
+        // another agent's non-shared memory — so `POST /namespaces/{ns}/
+        // standard {"id": <alice's private id>}` with `X-Agent-Id: bob`
+        // bound Alice's private memory as the namespace governance standard
+        // (a silent authz bypass; the sqlite twin at the `db::get` branch
+        // below never had this hole because storage-level `db::get` does
+        // NOT fold visibility). Fetch the row for the ownership check under
+        // a bypass-visibility probe ctx (the same `AI_HTTP_INTERNAL`
+        // admin-bind principal the get-standard binding probe uses, and the
+        // #2447 fold-avoiding precedent) so a hidden foreign row is
+        // RESOLVED and `authorize_namespace_standard_bind` runs the real
+        // ownership check against the REQUEST principal
+        // (`ctx.effective_principal()`), never the probe principal. The row
+        // is used ONLY for the ownership gate — it is never returned to the
+        // caller, so this does NOT weaken the #2537/#2707 read-path
+        // withholding. A `NotFound` from the probe means the row genuinely
+        // does not exist → skip authz + proceed, exactly as the sqlite
+        // `Ok(None)` branch does (first-write / non-existent id).
+        let ownership_probe_ctx =
+            crate::store::CallerContext::for_admin(sentinels::AI_HTTP_INTERNAL);
+        let caller_principal = ctx.effective_principal();
+
+        // #3758 — the REBIND gate, BEFORE any write this arm performs (the
+        // placeholder store and the governance merge below would otherwise
+        // land in the victim's namespace for a caller the bind then refuses;
+        // #4356 moved this block above the placeholder seed so that claim
+        // holds and the refusal shape cannot depend on the target's write
+        // policy).
+        // The standard CURRENTLY bound decides, through the same predicate
+        // CLEAR uses; the adapter re-runs it inside the upsert transaction as
+        // the fail-closed floor. A severed / dangling pointer is the SET repair
+        // path and passes; a read fault refuses.
+        let current_binding = match app
+            .store
+            .get_namespace_standard(&ownership_probe_ctx, ns)
+            .await
+        {
+            Ok(None) => crate::store::NamespaceStandardBinding::NoMetaRow,
+            Ok(Some((current_sid, _))) => {
+                match app.store.get(&ownership_probe_ctx, &current_sid).await {
+                    Ok(current) => crate::store::NamespaceStandardBinding::Resolved(
+                        current
+                            .metadata
+                            .get(crate::mcp::param_names::AGENT_ID)
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned),
+                    ),
+                    Err(crate::store::StoreError::NotFound { .. }) => {
+                        crate::store::NamespaceStandardBinding::Unresolvable
+                    }
+                    Err(e) => return store_err_to_response(e),
+                }
+            }
+            Err(e) => return store_err_to_response(e),
+        };
+        if let Err(crate::store::StoreError::PermissionDenied { reason, .. }) =
+            crate::store::authorize_namespace_standard_mutation(
+                &ctx,
+                ns,
+                &current_binding,
+                crate::store::NamespaceStandardOp::Set,
+            )
+        {
+            return crate::handlers::parity::owner_gate_refusal(
+                &reason,
+                Some(caller_principal),
+                crate::handlers::parity::RefusedResource::Namespace(ns),
+            );
+        }
+
+        // #4356 — the ancestor-owner gate on a FIRST bind, BEFORE any write this
+        // arm performs (the placeholder store would otherwise land first). Same
+        // shared verdict as every other funnel; the adapter re-runs it in-tx as
+        // the fail-closed floor. A read fault refuses.
+        if !ctx.bypass_visibility {
+            let ancestor = if crate::ns_standard_ancestor::needs_ancestor(&current_binding) {
+                match app.store.namespace_governing_ancestor(ns).await {
+                    Ok(a) => a,
+                    // Same status and text as the sqlite arm's read fault.
+                    Err(e) => {
+                        tracing::error!(target: super::AUTHZ_TRACE_TARGET, error = %e,
+                            "namespace_set_standard: cannot resolve the governing ancestor; refusing");
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": crate::ns_standard_ancestor::REASON_STANDARD_UNVERIFIABLE})),
+                        )
+                            .into_response();
+                    }
+                }
+            } else {
+                crate::ns_standard_ancestor::GoverningAncestor::None
+            };
+            if let Err(refusal) = crate::ns_standard_ancestor::set_admission(
+                caller_principal,
+                false,
+                ns,
+                &current_binding,
+                &ancestor,
+            ) {
+                return crate::handlers::parity::owner_gate_refusal(
+                    crate::ns_standard_ancestor::refusal_reason(refusal),
+                    Some(caller_principal),
+                    crate::handlers::parity::RefusedResource::Namespace(ns),
+                );
+            }
+        }
+
         // Resolve standard_id: caller-supplied or auto-seed a placeholder.
         let standard_id = if let Some(id) = body.id.clone() {
             id
@@ -396,89 +519,6 @@ async fn set_namespace_standard_inner(
                 }
             }
         };
-
-        // #929 SECURITY-high (Track A P6, 2026-05-20) — uniform
-        // ownership gate on the postgres path. Catches both the
-        // body.id-supplied branch and the auto-seed reuse branch.
-        // First-writes land on a placeholder stamped with the
-        // caller's id (above), so an immediate re-fetch returns the
-        // caller as owner and this gate is a no-op for first writes.
-        // Subsequent writes by a different caller hit the !is_unowned
-        // branch and 403.
-        // #2541 — same authorize helper as MCP; no silent ownership claim.
-        //
-        // #2709 SECURITY-high (CB-4 / CWE-284, 2026-08-04) — the ownership
-        // probe MUST NOT fold a #910 visibility denial into "skip authz".
-        // `PostgresStore::get` under the tenant-scoped request `ctx`
-        // (`bypass_visibility=false`) returns `Err(NotFound)` for BOTH a
-        // genuinely-absent row AND a foreign-owned `scope=private` row the
-        // caller cannot see. The pre-fix `if let Ok(resolved_mem)` arm
-        // therefore SKIPPED the ownership check whenever `body.id` named
-        // another agent's non-shared memory — so `POST /namespaces/{ns}/
-        // standard {"id": <alice's private id>}` with `X-Agent-Id: bob`
-        // bound Alice's private memory as the namespace governance standard
-        // (a silent authz bypass; the sqlite twin at the `db::get` branch
-        // below never had this hole because storage-level `db::get` does
-        // NOT fold visibility). Fetch the row for the ownership check under
-        // a bypass-visibility probe ctx (the same `AI_HTTP_INTERNAL`
-        // admin-bind principal the get-standard binding probe uses, and the
-        // #2447 fold-avoiding precedent) so a hidden foreign row is
-        // RESOLVED and `authorize_namespace_standard_bind` runs the real
-        // ownership check against the REQUEST principal
-        // (`ctx.effective_principal()`), never the probe principal. The row
-        // is used ONLY for the ownership gate — it is never returned to the
-        // caller, so this does NOT weaken the #2537/#2707 read-path
-        // withholding. A `NotFound` from the probe means the row genuinely
-        // does not exist → skip authz + proceed, exactly as the sqlite
-        // `Ok(None)` branch does (first-write / non-existent id).
-        let ownership_probe_ctx =
-            crate::store::CallerContext::for_admin(sentinels::AI_HTTP_INTERNAL);
-        let caller_principal = ctx.effective_principal();
-
-        // #3758 — the REBIND gate, BEFORE any write this arm performs (the
-        // placeholder store and the governance merge below would otherwise
-        // land in the victim's namespace for a caller the bind then refuses).
-        // The standard CURRENTLY bound decides, through the same predicate
-        // CLEAR uses; the adapter re-runs it inside the upsert transaction as
-        // the fail-closed floor. A severed / dangling pointer is the SET repair
-        // path and passes; a read fault refuses.
-        let current_binding = match app
-            .store
-            .get_namespace_standard(&ownership_probe_ctx, ns)
-            .await
-        {
-            Ok(None) => crate::store::NamespaceStandardBinding::NoMetaRow,
-            Ok(Some((current_sid, _))) => {
-                match app.store.get(&ownership_probe_ctx, &current_sid).await {
-                    Ok(current) => crate::store::NamespaceStandardBinding::Resolved(
-                        current
-                            .metadata
-                            .get(crate::mcp::param_names::AGENT_ID)
-                            .and_then(|v| v.as_str())
-                            .map(str::to_owned),
-                    ),
-                    Err(crate::store::StoreError::NotFound { .. }) => {
-                        crate::store::NamespaceStandardBinding::Unresolvable
-                    }
-                    Err(e) => return store_err_to_response(e),
-                }
-            }
-            Err(e) => return store_err_to_response(e),
-        };
-        if let Err(crate::store::StoreError::PermissionDenied { reason, .. }) =
-            crate::store::authorize_namespace_standard_mutation(
-                &ctx,
-                ns,
-                &current_binding,
-                crate::store::NamespaceStandardOp::Set,
-            )
-        {
-            return crate::handlers::parity::owner_gate_refusal(
-                &reason,
-                Some(caller_principal),
-                crate::handlers::parity::RefusedResource::Namespace(ns),
-            );
-        }
 
         // #2542 — resolve the DECLARED parent's currently-bound standard memory
         // so the bind gate can refuse a graft onto a parent chain the caller
@@ -639,16 +679,31 @@ async fn set_namespace_standard_inner(
                 })),
             )
                 .into_response(),
-            // #3758 — the adapter's own rebind refusal (a bind that raced the
-            // pre-check above), in the same closed shape with the caller.
+            // #3758 / #4356 — the adapter's own in-transaction refusal (a bind
+            // that raced the pre-check above), in the same closed shape and
+            // status the pre-check and the sqlite arm return.
             Err(crate::store::StoreError::PermissionDenied { reason, .. })
-                if reason == crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD =>
+                if reason == crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD
+                    || reason
+                        == crate::ns_standard_ancestor::REASON_ANCESTOR_STANDARD_UNRESOLVABLE =>
             {
                 crate::handlers::parity::owner_gate_refusal(
-                    crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+                    &reason,
                     Some(caller_principal),
                     crate::handlers::parity::RefusedResource::Namespace(ns),
                 )
+            }
+            Err(crate::store::StoreError::PermissionDenied { reason, .. })
+                if reason == crate::ns_standard_ancestor::REASON_STANDARD_UNVERIFIABLE =>
+            {
+                (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response()
+            }
+            // #4492 — the bind-time chain-depth refusal: the sqlite arm's
+            // shape (400 with the fixed text), not the generic adapter text.
+            Err(crate::store::StoreError::InvalidInput { detail })
+                if detail == crate::governance::bind_chain_depth::BIND_CHAIN_OVER_DEPTH =>
+            {
+                (StatusCode::BAD_REQUEST, Json(json!({"error": detail}))).into_response()
             }
             Err(e) => store_err_to_response(e),
         };
@@ -662,37 +717,26 @@ async fn set_namespace_standard_inner(
     // in the victim's namespace for a caller the bind then refuses. Same
     // predicate as CLEAR and as the MCP funnel this arm delegates to (which
     // re-runs it as the fail-closed floor); a read fault refuses.
-    {
-        let binding = match db::namespace_standard_binding(&lock.0, ns) {
-            Ok(b) => b,
-            Err(e) => {
-                drop(lock);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!(
-                        "cannot verify the current namespace-standard owner (error={e}); \
-                         refusing the bind rather than treating the standard as unowned"
-                    )})),
-                )
-                    .into_response();
-            }
-        };
-        if crate::visibility::namespace_standard_mutation_admission(
-            &caller,
-            caller == sentinels::DAEMON_PRINCIPAL,
-            ns,
-            &binding,
-            crate::visibility::NamespaceStandardOp::Set,
-        )
-        .is_err()
-        {
-            drop(lock);
-            return crate::handlers::parity::owner_gate_refusal(
-                crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+    // #4356 — plus the ancestor-owner gate on a first bind (shared verdict).
+    if let Err(refusal) = crate::storage::ns_standard_ancestor::set_admission_conn(
+        &lock.0,
+        &caller,
+        caller == sentinels::DAEMON_PRINCIPAL,
+        ns,
+    ) {
+        drop(lock);
+        return match refusal {
+            crate::ns_standard_ancestor::SetRefusal::Unverifiable => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": crate::ns_standard_ancestor::refusal_reason(refusal)})),
+            )
+                .into_response(),
+            _ => crate::handlers::parity::owner_gate_refusal(
+                crate::ns_standard_ancestor::refusal_reason(refusal),
                 Some(caller.as_str()),
                 crate::handlers::parity::RefusedResource::Namespace(ns),
-            );
-        }
+            ),
+        };
     }
     let resolved_id = if let Some(id) = body.id.clone() {
         id

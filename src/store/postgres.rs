@@ -87,6 +87,9 @@ mod tx_retry;
 // take NO relation-level DDL lock on connect. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod bootstrap_ddl;
+mod governance_chain_4477; // #4477 one chain builder, #4492 bind depth (qual_10 budget)
+mod ns_standard_ancestor_4356; // #4356 bind gate (own module: qual_10 budget)
+mod ns_standard_bind; // #4478 SET body, caller + federated gate (qual_10 budget)
 // v1.0.0 #3614 — the lineage walk (recursive CTE + AGE Cypher + the backend
 // dispatcher + the #3041 cycle check) and its two helpers. Own module for the
 // same qual_10 budget reason as `parity_3064` above: a pure MOVE (rule l),
@@ -105,9 +108,15 @@ pub mod dsn;
 // qual_10 budget. Read by the pg structural scanners through
 // `tests/common/pg_sources.rs`.
 mod merge_inbound_4023;
+// v1.0.0 #4447 — the federation by-id lane write bodies (deletions / archives /
+// restores / links) with the in-transaction peer-scope re-check. Own module:
+// postgres.rs is at its qual_10 budget.
+mod federation_by_id_4447;
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
+mod governance_corrupt_4285;
 mod reown_3124;
+pub use governance_corrupt_4285::list_corrupt_governance_standards_pg;
 mod swarm_rewind;
 // v1.0.0 #4329 / #4330 — the ascending-id (COLLATE "C") row-lock step for the
 // forget and run_gc evict sets. Own module for the qual_10 budget.
@@ -3309,6 +3318,7 @@ impl PostgresStore {
                 // regression refuses the connect (fail closed) unless the
                 // operator override acknowledges it.
                 store.enforce_lineage_watermarks().await?;
+                store.warn_corrupt_governance_standards_at_boot().await; // #4285
                 // v1.0.0 #2578 — self-heal the v88 composite ordering
                 // indexes on EVERY connect, not only inside the v88 arm.
                 // The arm is FAIL-OPEN (an index is derived, disposable
@@ -18705,62 +18715,6 @@ async fn pg_auto_detect_parent(
     Ok(None)
 }
 
-/// v0.7.0 H10 — transaction-bound twin of
-/// [`PostgresStore::build_namespace_chain`]. Reads every
-/// `namespace_meta.parent_namespace` lookup through the supplied tx so
-/// the chain walk shares a snapshot with the downstream policy lookup +
-/// pending_actions INSERT. Logic identical to the trait method — the
-/// only delta is `fetch_optional(&mut *tx)` instead of `&self.pool`.
-///
-/// # F-A2A1.2 inheritance recursion cap
-///
-/// The governance-inheritance walk is capped at
-/// [`GOVERNANCE_INHERITANCE_DEPTH_CAP`] (= 5) intermediate levels per the
-/// v0.7.0 spec. Both the `/`-derived ancestor chain and the explicit
-/// `namespace_meta.parent_namespace` walk are bounded by the same cap so a
-/// pathological deep namespace cannot blow the policy resolver's bind list
-/// or its connection-hold budget. The implicit `"*"` global standard is
-/// always retained and is not counted toward the cap.
-/// #2542 — the concrete owner (`metadata.agent_id`) of `namespace`'s bound
-/// standard, or `None` when there is no standard bound, the pointer is severed /
-/// dangling, or the standard is UNOWNED (empty / exact `system`). Read through
-/// the supplied `tx` (snapshot parity with the chain walk). Postgres twin of
-/// `storage::namespace_standard_owner`.
-async fn pg_namespace_standard_owner_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    namespace: &str,
-) -> StoreResult<Option<String>> {
-    let row: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
-         JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
-    )
-    .bind(namespace)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|e| to_store_err("pg_namespace_standard_owner_in_tx", e))?;
-    Ok(row
-        .and_then(|(o,)| o)
-        .filter(|o| !o.is_empty() && o != "system"))
-}
-
-/// #2542 — pool-side twin of [`pg_namespace_standard_owner_in_tx`].
-async fn pg_namespace_standard_owner_pool(
-    pool: &sqlx::PgPool,
-    namespace: &str,
-) -> StoreResult<Option<String>> {
-    let row: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
-         JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
-    )
-    .bind(namespace)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| to_store_err("pg_namespace_standard_owner_pool", e))?;
-    Ok(row
-        .and_then(|(o,)| o)
-        .filter(|o| !o.is_empty() && o != "system"))
-}
-
 /// #2542 — one structured WARN per governance resolution that dropped a
 /// cross-tenant `parent_namespace` graft on postgres. Mirrors the sqlite
 /// `storage::warn_governance_graft_excluded`.
@@ -18778,197 +18732,39 @@ fn pg_warn_governance_graft_excluded(resolving_for: &str, child: &str, parent: &
     );
 }
 
-/// #2542 — build the namespace inheritance chain through the supplied `tx`.
-///
-/// `governance` selects the VIEW, mirroring the sqlite `ChainView`:
-/// - `false` (LOOKUP): follow every `parent_namespace` link.
-/// - `true` (GOVERNANCE): follow a `parent_namespace` link ONLY when ENTITLED —
-///   the parent is UNOWNED or owned by the SAME principal as the namespace being
-///   resolved. A cross-tenant parent (and everything above it) is dropped with a
-///   WARN, so it cannot graft governance/approver policy onto this write. This is
-///   the exact Route-1 bind ownership rule re-checked at resolution; it closes a
-///   TOCTOU-bound-later parent, a `-`-auto-detected cross-tenant parent that
-///   reached pg via import, and any pre-#2542 on-disk graft — WITHOUT relying on
-///   the deferred provenance-persistence.
-/// #2542 — pool-side twin of [`build_namespace_chain_in_tx`]. `governance = false`
-/// is the LOOKUP chain (every `parent_namespace` link — the trait
-/// [`PostgresStore::build_namespace_chain`] contract); `governance = true` is the
-/// entitled-parents-only GOVERNANCE chain used by `resolve_governance_policy`.
+/// #4477 — the pool twin: the LOOKUP (`governance = false`, the trait
+/// [`PostgresStore::build_namespace_chain`] contract) or the entitled-parents
+/// GOVERNANCE chain, built by the one builder in `governance_chain_4477` on a
+/// single pooled connection.
 async fn pg_namespace_chain(
     pool: &sqlx::PgPool,
     namespace: &str,
     governance: bool,
 ) -> StoreResult<Vec<String>> {
-    let mut chain: Vec<String> = Vec::new();
-
-    if namespace == "*" {
-        chain.push("*".to_string());
-        return Ok(chain);
-    }
-    chain.push("*".to_string());
-
-    let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
-        .into_iter()
-        .rev()
-        .collect();
-
-    if let Some(root) = hierarchy_chain.first().cloned() {
-        let mut explicit_above: Vec<String> = Vec::new();
-        let mut current = root;
-        for _ in 0..GOVERNANCE_INHERITANCE_DEPTH_CAP {
-            let row: Option<(Option<String>,)> =
-                sqlx::query_as("SELECT parent_namespace FROM namespace_meta WHERE namespace = $1")
-                    .bind(&current)
-                    .fetch_optional(pool)
-                    .await
-                    .map_err(|e| to_store_err("build_namespace_chain parent lookup", e))?;
-            let next = row.and_then(|(p,)| p);
-            let Some(p) = next else { break };
-            if p == "*" || explicit_above.contains(&p) || hierarchy_chain.contains(&p) {
-                break;
-            }
-            // #2542 — the GOVERNANCE view stops at the first UNENTITLED
-            // (cross-tenant) parent so it cannot layer governance/approver policy.
-            // PER-HOP: entitled iff the parent is unowned OR owned by `current`'s
-            // (the DECLARING namespace's) principal — the Route-1 bind rule, which
-            // keeps a federated in-scope parent whose declarer shares its owner
-            // (#2479) while dropping a cross-tenant graft (mirrors sqlite).
-            if governance {
-                let declarer_owner = pg_namespace_standard_owner_pool(pool, &current).await?;
-                let parent_owner = pg_namespace_standard_owner_pool(pool, &p).await?;
-                let entitled = match parent_owner {
-                    None => true,
-                    Some(po) => declarer_owner.as_deref() == Some(po.as_str()),
-                };
-                if !entitled {
-                    pg_warn_governance_graft_excluded(namespace, &current, &p);
-                    break;
-                }
-            }
-            explicit_above.push(p.clone());
-            current = p;
-        }
-        for p in explicit_above.into_iter().rev() {
-            if !chain.contains(&p) {
-                chain.push(p);
-            }
-        }
-    }
-    // F-A2A1.2 — cap the `/`-derived ancestor chain to the same depth as the
-    // explicit walk (most-specific N levels).
-    let drained: Vec<String> = hierarchy_chain.drain(..).collect();
-    let drained_len = drained.len();
-    let kept: Vec<String> = if drained_len > GOVERNANCE_INHERITANCE_DEPTH_CAP {
-        drained
-            .into_iter()
-            .skip(drained_len - GOVERNANCE_INHERITANCE_DEPTH_CAP)
-            .collect()
-    } else {
-        drained
-    };
-    for entry in kept {
-        if !chain.contains(&entry) {
-            chain.push(entry);
-        }
-    }
-    Ok(chain)
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| to_store_err("build_namespace_chain acquire", e))?;
+    governance_chain_4477::build_chain_on(&mut conn, namespace, governance).await
 }
 
+/// v0.7.0 H10 / #4477 — the transaction twin: every read goes through `tx` so
+/// the walk shares a snapshot with the downstream policy lookup + write.
 async fn build_namespace_chain_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     namespace: &str,
     governance: bool,
 ) -> StoreResult<Vec<String>> {
-    let mut chain: Vec<String> = Vec::new();
-
-    if namespace == "*" {
-        chain.push("*".to_string());
-        return Ok(chain);
-    }
-    chain.push("*".to_string());
-
-    let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
-        .into_iter()
-        .rev()
-        .collect();
-
-    if let Some(root) = hierarchy_chain.first().cloned() {
-        let mut explicit_above: Vec<String> = Vec::new();
-        let mut current = root;
-        for _ in 0..GOVERNANCE_INHERITANCE_DEPTH_CAP {
-            let row: Option<(Option<String>,)> =
-                sqlx::query_as("SELECT parent_namespace FROM namespace_meta WHERE namespace = $1")
-                    .bind(&current)
-                    .fetch_optional(&mut **tx)
-                    .await
-                    .map_err(|e| to_store_err("build_namespace_chain_in_tx parent lookup", e))?;
-            let next = row.and_then(|(p,)| p);
-            let Some(p) = next else { break };
-            if p == "*" || explicit_above.contains(&p) || hierarchy_chain.contains(&p) {
-                break;
-            }
-            // #2542 — PER-HOP entitled iff the parent is unowned OR owned by
-            // `current`'s (the DECLARING namespace's) principal (mirrors sqlite /
-            // the pool twin).
-            if governance {
-                let declarer_owner = pg_namespace_standard_owner_in_tx(tx, &current).await?;
-                let parent_owner = pg_namespace_standard_owner_in_tx(tx, &p).await?;
-                let entitled = match parent_owner {
-                    None => true,
-                    Some(po) => declarer_owner.as_deref() == Some(po.as_str()),
-                };
-                if !entitled {
-                    pg_warn_governance_graft_excluded(namespace, &current, &p);
-                    break;
-                }
-            }
-            explicit_above.push(p.clone());
-            current = p;
-        }
-        for p in explicit_above.into_iter().rev() {
-            if !chain.contains(&p) {
-                chain.push(p);
-            }
-        }
-    }
-    // F-A2A1.2 — cap the `/`-derived ancestor chain to the same depth as
-    // the explicit walk so a deeply nested namespace cannot bypass the
-    // resolver's bounded budget. The cap counts the most-specific N
-    // levels (the leaf and its closest ancestors) so an over-deep
-    // namespace still resolves against its most-relevant policy.
-    let drained: Vec<String> = hierarchy_chain.drain(..).collect();
-    let drained_len = drained.len();
-    let kept: Vec<String> = if drained_len > GOVERNANCE_INHERITANCE_DEPTH_CAP {
-        // hierarchy_chain is top-down (root → leaf); keep the LAST
-        // GOVERNANCE_INHERITANCE_DEPTH_CAP entries (most-specific).
-        drained
-            .into_iter()
-            .skip(drained_len - GOVERNANCE_INHERITANCE_DEPTH_CAP)
-            .collect()
-    } else {
-        drained
-    };
-    for entry in kept {
-        if !chain.contains(&entry) {
-            chain.push(entry);
-        }
-    }
-    Ok(chain)
+    governance_chain_4477::build_chain_on(&mut **tx, namespace, governance).await
 }
 
-/// F-A2A1.2 — maximum depth of the governance-inheritance walk.
-///
-/// Bounds both the `/`-derived ancestor decomposition AND the explicit
-/// `namespace_meta.parent_namespace` walk to a single cap of 5 levels.
-/// The implicit `"*"` global standard is always retained and is not
-/// counted toward the cap.
-///
-/// Pinned to 5 per the v0.7.0 fold-A2A1 spec (see
-/// `docs/v0.7.0/a2a-triage-wave4-r2.md` §F-A2A1.2). Real-world
-/// namespaces are 3-4 levels deep; the cap leaves headroom for one
-/// inherited override beyond the deepest authored ancestor while
-/// keeping the per-write resolver's connection-hold budget bounded.
-pub const GOVERNANCE_INHERITANCE_DEPTH_CAP: usize = 5;
+/// F-A2A1.2 / #4477 — the governance-chain depth bound. It is no longer a
+/// truncation (postgres used to keep only the 5 most-specific levels, so an
+/// ancestor deeper than that governed nothing): every walk is complete up to
+/// [`crate::models::MAX_NAMESPACE_DEPTH`] and refuses beyond it, identically
+/// on sqlite (`crate::governance::chain_depth`).
+pub const GOVERNANCE_INHERITANCE_DEPTH_CAP: usize =
+    crate::governance::chain_depth::GOVERNANCE_CHAIN_MAX_DEPTH;
 
 /// Maximum traversal depth supported by [`PostgresStore::kg_query`].
 ///
@@ -19641,58 +19437,7 @@ fn normalize_app_search_path(search_path: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod normalize_app_search_path_tests {
-    use super::normalize_app_search_path;
-
-    #[test]
-    fn public_beats_user_and_ag_catalog_on_the_age_default() {
-        // The AGE-recommended database default: ag_catalog first + "$user"
-        // ahead of public. Both are demoted so `public` wins the create target
-        // (the CVE-2018-1058 `$user`-precedence split-brain fix); ag_catalog is
-        // kept LAST for type resolution.
-        assert_eq!(
-            normalize_app_search_path("ag_catalog, \"$user\", public").as_deref(),
-            Some("public, ag_catalog")
-        );
-        // The minor gap: a NON-leading ag_catalog that still precedes public.
-        assert_eq!(
-            normalize_app_search_path("\"$user\", ag_catalog, public").as_deref(),
-            Some("public, ag_catalog")
-        );
-        // `$user` ahead of public even without AGE -> still forced to public.
-        assert_eq!(
-            normalize_app_search_path("\"$user\", public").as_deref(),
-            Some("public")
-        );
-    }
-
-    #[test]
-    fn caller_pinned_and_already_ordered_paths_are_unchanged() {
-        // The #1381 per-test-schema harness pins its own path (no "$user", no
-        // ag_catalog): MUST be left alone so unqualified CREATE lands in the
-        // test schema.
-        assert_eq!(normalize_app_search_path("test_x_ab12, public"), None);
-        // An explicit non-$user app schema first is honoured (like the harness).
-        assert_eq!(normalize_app_search_path("myapp, public"), None);
-        // Already in order.
-        assert_eq!(normalize_app_search_path("public, ag_catalog"), None);
-        assert_eq!(normalize_app_search_path("public"), None);
-        assert_eq!(normalize_app_search_path(""), None);
-    }
-
-    #[test]
-    fn dedupes_extra_ag_catalog_and_handles_degenerate_paths() {
-        assert_eq!(
-            normalize_app_search_path("ag_catalog, public, ag_catalog").as_deref(),
-            Some("public, ag_catalog")
-        );
-        // All-special path -> fall back to public as the target.
-        assert_eq!(
-            normalize_app_search_path("\"$user\", ag_catalog").as_deref(),
-            Some("public, ag_catalog")
-        );
-    }
-}
+mod normalize_app_search_path_tests;
 
 /// v1.0.0 #3055 — relocate ai-memory app tables out of the AGE `ag_catalog`
 /// schema and into `public`, PRE-BOOTSTRAP.
@@ -25660,117 +25405,26 @@ impl MemoryStore for PostgresStore {
 
     async fn apply_remote_link(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         link: &MemoryLink,
         attest_level: &str,
     ) -> StoreResult<()> {
+        // The body lives in `postgres/federation_by_id_4447.rs` (#4447).
+        self.apply_remote_link_inner(ctx, link, attest_level, None)
+            .await
+    }
+
+    /// #4447 — `links[]` with the in-transaction peer-scope re-check.
+    async fn apply_remote_link_authorized(
+        &self,
+        ctx: &CallerContext,
+        link: &MemoryLink,
+        attest_level: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<()> {
         self.gate_record_stop().await?;
-        // Mirrors sqlite db::create_link_inbound. The unique
-        // (source_id, target_id, relation) index makes duplicate
-        // pushes a no-op (ON CONFLICT DO NOTHING), so retries and
-        // peer-to-peer fanouts converge cleanly.
-        let created_at = parse_rfc3339_required(&link.created_at)?;
-        let valid_from = parse_rfc3339_opt(link.valid_from.as_deref());
-        let valid_until = parse_rfc3339_opt(link.valid_until.as_deref());
-
-        // v0.7.0.1 G4 — federation replay must keep the AGE
-        // projection in sync with the SQL `memory_links` table the
-        // same way the local-write path does. A single transaction
-        // lets the SQL row + AGE MERGE commit atomically.
-        let mut tx = self
-            .pool
-            .begin()
+        self.apply_remote_link_inner(ctx, link, attest_level, Some(authorize_stored))
             .await
-            .map_err(|e| to_store_err("begin apply_remote_link tx", e))?;
-        // #4210 — the FK key-share locks, taken in ascending id order.
-        let ends = lock_order_4209::replay_endpoint_locks(&link.source_id, &link.target_id);
-        lock_order_4209::lock_memories_in_id_order(&mut tx, &ends)
-            .await
-            .map_err(|e| to_store_err("lock apply_remote_link endpoints", e))?;
-
-        sqlx::query(
-            "INSERT INTO memory_links (
-                source_id, target_id, relation, created_at,
-                valid_from, valid_until, observed_by, signature, attest_level
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (source_id, target_id, relation) DO NOTHING",
-        )
-        .bind(&link.source_id)
-        .bind(&link.target_id)
-        .bind(link.relation.as_str())
-        .bind(created_at)
-        .bind(valid_from)
-        .bind(valid_until)
-        .bind(link.observed_by.as_ref())
-        .bind(link.signature.as_ref())
-        .bind(attest_level)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("apply_remote_link", e))?;
-
-        if matches!(self.kg_backend, KgBackend::Age) {
-            // #1542 — same SAVEPOINT isolation + warn-on-runtime-failure
-            // semantics as `link_internal`. Pre-#1542 this site
-            // propagated the projection error with `?` AFTER the
-            // relational INSERT had been queued in the tx, so a
-            // fleet-wide `LOAD 'age'` refusal made every federated
-            // link replay fail forever (DLQ churn) even though the
-            // canonical row could have landed. The relational
-            // `memory_links` row is the source of truth; the AGE
-            // mirror degrades to the CTE fallback.
-            sqlx::query("SAVEPOINT age_link_projection")
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("savepoint age_link_projection", e))?;
-            // #2377 (FIX #9) — a federation relay of an already-invalidated
-            // edge carries `valid_until`; project it onto the AGE edge so the
-            // receiver's current-view Cypher reads exclude it exactly as the
-            // relational reads do (else the relayed retraction is lost graph-side).
-            let vf_str = valid_from.map(|t| t.to_rfc3339());
-            let vu_str = valid_until.map(|t| t.to_rfc3339());
-            match project_link_into_age(
-                &mut tx,
-                &link.source_id,
-                &link.target_id,
-                link.relation.as_str(),
-                vf_str.as_deref(),
-                vu_str.as_deref(),
-            )
-            .await
-            {
-                Ok(()) => {
-                    sqlx::query("RELEASE SAVEPOINT age_link_projection")
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| to_store_err("release savepoint age_link_projection", e))?;
-                }
-                Err(e) if is_age_runtime_failure(&e) => {
-                    sqlx::query("ROLLBACK TO SAVEPOINT age_link_projection")
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e2| to_store_err("rollback savepoint age_link_projection", e2))?;
-                    // #3883 (A1) — was WARN-only; now RECORD the unreconciled
-                    // projection (orphan => quarantined, transient => pending) so
-                    // a federated relay's committed edge is not silently dropped
-                    // from AGE forever.
-                    record_failed_age_projection(
-                        &mut tx,
-                        "apply_remote_link",
-                        &link.source_id,
-                        &link.target_id,
-                        link.relation.as_str(),
-                        &e,
-                    )
-                    .await?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("commit apply_remote_link tx", e))?;
-        Ok(())
     }
 
     /// #2488 — scalar namespace projection over the SAME
@@ -25852,36 +25506,45 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        // The body lives in `postgres/federation_by_id_4447.rs` (#4447).
+        self.apply_remote_deletion_inner(id, None).await
+    }
+
+    /// #4447 — `deletions[]` with the in-transaction peer-scope re-check.
+    async fn apply_remote_deletion_authorized(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
         self.gate_record_stop().await?;
-        // #2493 / #2503 / #3192 — this override still does NOT compose
-        // `self.delete` (that path carries the caller-owns gate this
-        // inbound lane must not apply — `_ctx` is discarded). It DOES
-        // share `pg_hard_delete_in_tx` with `delete` so the federated
-        // `deletions[]` lane cannot again omit namespace-meta SEVER
-        // (#2493) or the forget-tombstone + crypto-erase (#3192).
-        //
-        // Namespace-meta SEVER runs inside the tx even when the row is
-        // already gone: a push naming an id with no local row must still
-        // leave `namespace_meta` coherent rather than depending on
-        // presence. A missing row writes no forget-tombstone (no
-        // namespace to bind); that is a first-arrival hole, not a
-        // resurrection of a locally-erased row — documented on the
-        // sqlite twin.
-        let mut tx = self
-            .pool
-            .begin()
+        self.apply_remote_deletion_inner(id, Some(authorize_stored))
             .await
-            .map_err(|e| to_store_err("apply_remote_deletion begin tx", e))?;
-        let rows = pg_hard_delete_in_tx(&mut tx, id)
+    }
+
+    /// #4447 — `archives[]` with the in-transaction peer-scope re-check.
+    async fn apply_remote_archive_authorized(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop().await?;
+        self.apply_remote_archive_pg_with(ctx, id, Some(authorize_stored))
             .await
-            .map_err(|e| to_store_err("apply_remote_deletion", e))?;
-        tx.commit()
+    }
+
+    /// #4447 — `restores[]` with the in-transaction peer-scope re-check (the
+    /// G30 forget-tombstone gate still runs first).
+    async fn apply_remote_restore_authorized(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop().await?;
+        self.apply_remote_restore_pg_with(ctx, id, Some(authorize_stored))
             .await
-            .map_err(|e| to_store_err("apply_remote_deletion commit tx", e))?;
-        if rows > 0 {
-            self.unproject_memory_ids_best_effort(&[id]).await;
-        }
-        Ok(rows > 0)
     }
 
     // ----- v0.7.0 Wave-3 Continuation 2 — full hybrid recall ---------
@@ -26386,77 +26049,20 @@ impl MemoryStore for PostgresStore {
         standard_id: &str,
         parent: Option<&str>,
     ) -> StoreResult<()> {
-        // Wave-2 B7' — sqlite twin `db::set_namespace_standard` gates (ERRORS-09).
+        // Wave-2 B7' — the record-stop gate stays visible HERE (the #3175 / B7
+        // structural scanners read this method); the shared body repeats it.
         self.gate_record_stop().await?;
-        // Require the standard memory to exist first (parity with
-        // sqlite db::set_namespace_standard).
-        let exists: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)
-            .bind(standard_id)
-            .fetch_optional(&self.pool)
+        // #4478 — one body for the caller and the federated apply (own module).
+        let gate = ns_standard_bind::BindGate::Caller(ctx);
+        ns_standard_bind::set_namespace_standard_gated(self, gate, namespace, standard_id, parent)
             .await
-            .map_err(|e| to_store_err("set_namespace_standard verify memory", e))?;
-        if exists.is_none() {
-            return Err(StoreError::NotFound {
-                id: standard_id.to_string(),
-            });
-        }
-        if parent.is_some_and(|p| p == namespace) {
-            return Err(StoreError::InvalidInput {
-                detail: "namespace cannot be its own parent".to_string(),
-            });
-        }
-        // #3188 — CROSS-BACKEND PARITY. When the caller declares no parent,
-        // resolve the '-'-prefix ancestor EXACTLY as the sqlite twin
-        // (`db::set_namespace_standard` → `db::auto_detect_parent`) so both
-        // backends bind the SAME `parent_namespace`. Governance inheritance is
-        // resolved by walking `namespace_meta.parent_namespace`
-        // (`build_namespace_chain` / `pg_namespace_standard_owner_in_tx`), so a
-        // divergent bound parent means divergent governance: pre-#3188 pg bound
-        // NULL here, making e.g. `team-eng` an ungoverned ROOT on postgres while
-        // the sqlite twin inherited `team`'s standard. `pg_auto_detect_parent`
-        // FAILS CLOSED on a DB fault (it does not swallow the error into "no
-        // parent"), matching the sqlite `auto_detect_parent` contract.
-        let resolved_parent: Option<String> = match parent {
-            Some(p) => Some(p.to_string()),
-            None => pg_auto_detect_parent(&self.pool, namespace).await?,
-        };
-        // #3758 — the REBIND gate: the standard CURRENTLY bound decides,
-        // through the same predicate CLEAR uses. Pre-fix this adapter
-        // discarded `ctx` and any caller could replace another tenant's
-        // governance standard. Owner read + upsert in ONE transaction (the
-        // #3237 item 5 TOCTOU discipline of the CLEAR twin).
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("set_namespace_standard begin", e))?;
-        if !ctx.bypass_visibility {
-            let binding = pg_namespace_standard_binding(&mut tx, namespace).await?;
-            crate::store::authorize_namespace_standard_mutation(
-                ctx,
-                namespace,
-                &binding,
-                crate::store::NamespaceStandardOp::Set,
-            )?;
-        }
-        sqlx::query(
-            "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
-             VALUES ($1, $2, NOW(), $3)
-             ON CONFLICT (namespace) DO UPDATE
-                SET standard_id = EXCLUDED.standard_id,
-                    updated_at = EXCLUDED.updated_at,
-                    parent_namespace = EXCLUDED.parent_namespace",
-        )
-        .bind(namespace)
-        .bind(standard_id)
-        .bind(resolved_parent.as_deref())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("set_namespace_standard", e))?;
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("set_namespace_standard commit", e))?;
-        Ok(())
+    }
+
+    async fn namespace_governing_ancestor(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<crate::ns_standard_ancestor::GoverningAncestor> {
+        ns_standard_ancestor_4356::governing_ancestor_pool(&self.pool, namespace).await
     }
 
     async fn clear_namespace_standard(
@@ -31005,463 +30611,8 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn archive_restore(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
-        self.gate_record_stop().await?;
-        // v1.0.0 #3520 — routed through the shared bounded-retry funnel. Restore
-        // is the archive family's inverse (archived-row read + live INSERT +
-        // preserved-edge re-insert + archive DELETE), so it holds the same
-        // multi-relation lock set that a concurrent bootstrap's
-        // `CREATE INDEX IF NOT EXISTS` deadlocks against. An early `return`
-        // inside the block exits THIS attempt with that verdict, which the loop
-        // then yields unchanged — a not-found restore is still `Ok(false)`.
-        let mut retry = tx_retry::TxRetry::new("archive_restore tx");
-        let restored: bool = loop {
-            let attempt: StoreResult<bool> = async {
-                let mut tx = self
-                    .pool
-                    .begin()
-                    .await
-                    .map_err(|e| to_store_err("begin archive_restore tx", e))?;
-
-                // v1.0.0 #3271 (SECURITY-high) — SAL-side caller-owns gate, the
-                // archive-RESTORE sibling of the #3193 `archive_by_ids` gate. Pre-fix
-                // this funnel discarded its `_ctx` and matched on `WHERE id = $1` with
-                // NO owner predicate, so on a postgres-backed daemon ANY authenticated
-                // tenant could `POST /api/v1/archive/{victim's id}/restore` and pull a
-                // DIFFERENT tenant's deliberately-archived row back into the live set —
-                // and the 200-vs-404 split was an enumeration oracle over other
-                // tenants' archived ids (the sqlite twin has refused via
-                // `db::restore_archived_for_caller` since #940; #3193 fixed only the
-                // archive side of this class). The existence probe now carries the
-                // three-way owner predicate (owner OR inbox-target), so a non-owner
-                // sees the SAME `Ok(false)` a truly-absent id gives → the handler's
-                // 404 `NOT_FOUND_IN_ARCHIVE`, no oracle. Admin/operator lanes
-                // (`ctx.bypass_visibility`) round-trip regardless of ownership, exactly
-                // as they do on update / delete / archive.
-                //
-                // #3124 — the ownership verdict is the ONE cross-backend predicate:
-                // the probe reads the row's owner stamp (typed by `jsonb_typeof`, so a
-                // malformed owner is never mistaken for a stamp OR for unstamped) and
-                // decides in Rust — owner, inbox recipient of a STAMPED row, or an
-                // UNSTAMPED row admitted by `AI_MEMORY_UNSTAMPED_MUTATION` (`warn`, the
-                // pre-#3124 outcome, WARNs + counts; `refuse` refuses). A refusal is
-                // the same `Ok(false)` an absent id gives — still no oracle.
-                // `admit_unstamped_row` feeds the INSERT's defense-in-depth arm so the
-                // write predicate and this verdict cannot disagree.
-                let mut admit_unstamped_row = false;
-                if ctx.bypass_visibility {
-                    let exists: Option<(String,)> =
-                        sqlx::query_as("SELECT id FROM archived_memories WHERE id = $1")
-                            .bind(id)
-                            .fetch_optional(&mut *tx)
-                            .await
-                            .map_err(|e| to_store_err("archive_restore lookup", e))?;
-                    if exists.is_none() {
-                        return Ok(false);
-                    }
-                } else {
-                    let probe: Option<(Option<String>, Option<String>, Option<String>)> =
-                        sqlx::query_as(
-                            "SELECT jsonb_typeof(metadata->'agent_id'), metadata->>'agent_id', \
-                             metadata->>'target_agent_id' \
-                             FROM archived_memories WHERE id = $1",
-                        )
-                        .bind(id)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|e| to_store_err("archive_restore owner lookup", e))?;
-                    let Some((owner_type, owner, inbox)) = probe else {
-                        return Ok(false);
-                    };
-                    let caller = ctx.effective_principal();
-                    let stamp = crate::identity::owner_stamp::OwnerStamp::of_pg(
-                        owner_type.as_deref(),
-                        owner.as_deref(),
-                    );
-                    let admitted = if stamp.is_unstamped() {
-                        admit_unstamped_row = crate::identity::owner_stamp::admit_unstamped(
-                            crate::identity::owner_stamp::MutationSite::postgres(
-                                crate::identity::owner_stamp::funnel::RESTORE,
-                            ),
-                            id,
-                            caller,
-                        );
-                        admit_unstamped_row
-                    } else {
-                        stamp.is_owned_by(caller)
-                            || inbox
-                                .as_deref()
-                                .is_some_and(|t| !t.is_empty() && t == caller)
-                    };
-                    if !admitted {
-                        return Ok(false);
-                    }
-                }
-
-                // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): this is
-                // the OPERATOR un-forget path, so NO tombstone gate here — an authorized
-                // restore round-trips per #1771.
-                //
-                // #3075 — the ORIGINAL justification for that omission was "federation
-                // /sync/push restores[] are sqlite-only per federation_signing_check.rs,
-                // never PostgresStore". That premise is RETIRED: the postgres receiver
-                // now applies `restores[]`. The omission stands anyway, on the #1771
-                // reasoning alone — but the G30 gate the federated lane needs is no
-                // longer absent, it MOVED: it lives on `apply_remote_restore`
-                // (`postgres/federation_3075.rs`), which runs it BEFORE composing this
-                // method. Do NOT "fix" the two by merging them: gating here would break
-                // the documented operator un-forget capability on both backends.
-
-                // Reject if the id is already in active memories.
-                let active: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)
-                    .bind(id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("archive_restore active lookup", e))?;
-                if active.is_some() {
-                    return Err(StoreError::Conflict { id: id.to_string() });
-                }
-
-                // FX-C5 — substrate governance pre-write hook parity. Restoring
-                // an archived row mints a fresh live row via a raw INSERT...SELECT
-                // that bypasses `PostgresStore::store(..)` (which is where ARCH-1
-                // wired in the `consult_governance_pre_write_pg` adapter at
-                // line 7001). Without this call, an operator's signed governance
-                // rule could be bypassed by restoring a row whose `(title,
-                // namespace)` would otherwise be refused on a direct write.
-                // Load the archived row shaped as a `Memory` and fire the hook
-                // BEFORE the INSERT lands.
-                let candidate = Self::load_archived_as_memory_pg(&mut *tx, id).await?;
-                // #3124 — an UNSTAMPED row the owner probe above already admitted
-                // (and reported) is not re-decided here: re-running the policy would
-                // WARN + count the same restore twice. Every other row is re-checked
-                // against the loaded candidate (same row, same single predicate).
-                if !ctx.bypass_visibility
-                    && !admit_unstamped_row
-                    && !crate::visibility::caller_owns_for_mutation(
-                        &candidate,
-                        ctx.effective_principal(),
-                        true,
-                        crate::identity::owner_stamp::MutationSite::postgres(
-                            crate::identity::owner_stamp::funnel::RESTORE,
-                        ),
-                    )
-                {
-                    return Ok(false);
-                }
-                consult_governance_pre_write_pg(&candidate)?;
-                // #2110/#2113 audit — TRACT covenant clause 1 on the archive-RESTORE
-                // funnel. Advisory-only (never refuses): a legacy archived row that
-                // predates the covenant must stay restorable even under
-                // AI_MEMORY_REQUIRE_WHY_TRACE=1 (postgres parity with the sqlite
-                // `restore_archived` inbound gate).
-                crate::storage::consult_why_trace_gate_inbound(&candidate);
-
-                // v0.9.0 G8 (#1825) — re-mint the row's genesis content-id from the
-                // archived row's ORIGINAL identity + PLAINTEXT content (decrypting the
-                // archived envelope when present, falling back to the stored content
-                // on any decrypt error) so the restored live row carries the same
-                // `b3:` address it held before archival. created_at / title /
-                // namespace / kind are the ORIGINAL archived values (via `candidate`),
-                // NOT NOW(). Mirrors the sqlite `restored_cid_stamp` path.
-                let restored_cid = {
-                    let agent_id = candidate
-                        .metadata
-                        .get("agent_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let (raw_content, envelope): (String, Option<Vec<u8>>) = sqlx::query_as(
-                        "SELECT content, encrypted_envelope FROM archived_memories WHERE id = $1",
-                    )
-                    .bind(id)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("archive_restore load plaintext for cid", e))?;
-                    let plaintext = match envelope {
-                        Some(env) => {
-                            crate::encryption::open_content(&env, &agent_id).unwrap_or(raw_content)
-                        }
-                        None => raw_content,
-                    };
-                    crate::identity::cid::stamp_cid(
-                        &agent_id,
-                        &candidate.namespace,
-                        &candidate.title,
-                        candidate.memory_kind.as_str(),
-                        &candidate.created_at,
-                        &plaintext,
-                    )
-                };
-
-                let now = chrono::Utc::now();
-                // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry on
-                // archive→restore. Pre-#1025 the SELECT pulled only 17 columns
-                // from archived_memories, so the restored row landed in
-                // memories with reflection_depth=0, memory_kind='observation'
-                // (the live-table DEFAULT), citations=[], version=1, etc. —
-                // silent loss of provenance + persona + confidence calibration.
-                // Now copies all 26 v0.7.0 fields (with COALESCE defaults for
-                // pre-#1025 archived rows where the columns are NULL).
-                sqlx::query(
-                    "INSERT INTO memories (
-                        id, tier, namespace, title, content, tags, priority, confidence,
-                        source, access_count, created_at, updated_at, last_accessed_at,
-                        expires_at, metadata, embedding, embedding_dim, embedding_space,
-                        reflection_depth, atomised_into, atom_of, memory_kind,
-                        entity_id, persona_version, citations, source_uri, source_span,
-                        confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
-                        cid, cid_genesis, kind_provenance, valid_from, valid_until
-                    )
-                    SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
-                           tags, priority, confidence, source, access_count, created_at,
-                           $1::timestamptz, last_accessed_at, original_expires_at, metadata,
-                           -- v1.0.0 #2167 (S8) restore/migrate HEAL (postgres twin):
-                           -- keep the archived vector ONLY when its space matches the
-                           -- live active space ($5); a foreign- or NULL-space vector
-                           -- has its whole trio NULLed so the boot backfill re-embeds
-                           -- from the durable text under the LIVE space (self-heal).
-                           -- $5 NULL (no active embedder in this process) keeps any
-                           -- STAMPED vector but still drops an unverifiable NULL one.
-                           CASE WHEN embedding_space IS NOT NULL
-                                     AND ($5::text IS NULL OR embedding_space = $5)
-                                THEN embedding ELSE NULL END,
-                           CASE WHEN embedding_space IS NOT NULL
-                                     AND ($5::text IS NULL OR embedding_space = $5)
-                                THEN embedding_dim ELSE NULL END,
-                           CASE WHEN embedding_space IS NOT NULL
-                                     AND ($5::text IS NULL OR embedding_space = $5)
-                                THEN embedding_space ELSE NULL END,
-                           COALESCE(reflection_depth, 0),
-                           atomised_into,
-                           atom_of,
-                           COALESCE(memory_kind, 'observation'),
-                           entity_id, persona_version,
-                           COALESCE(citations, '[]'),
-                           source_uri, source_span,
-                           COALESCE(confidence_source, 'caller_provided'),
-                           confidence_signals, confidence_decayed_at,
-                           mentioned_entity_id,
-                           COALESCE(version, 1),
-                           COALESCE(lifecycle_state, 'open'),
-                           encrypted_envelope,
-                           -- v1.0.0 #2385 — the STORED genesis identity WINS. Pre-#2385
-                           -- `archived_memories` had no cid columns, so restore
-                           -- unconditionally bound the re-mint ($3/$4) recomputed from six
-                           -- reconstructed inputs (agent_id / namespace / title / kind /
-                           -- created_at / decrypted plaintext) — and a decrypt failure
-                           -- there falls back to the CIPHERTEXT placeholder. Any drift
-                           -- silently re-addressed the durable row and dangled every
-                           -- `memory_links.source_cid` / `target_cid` mirror. The v90
-                           -- columns make the identity a CARRIED fact; the re-mint is now
-                           -- the legacy fallback for pre-v90 archive rows only.
-                           -- The PAIR is selected atomically (the #2395 lesson applied
-                           -- here): `cid_genesis` is the canonical PRE-IMAGE of `cid`, so
-                           -- mixing a carried address with a re-derived pre-image would
-                           -- produce a row whose own verify disagrees with itself.
-                           CASE WHEN cid IS NOT NULL THEN cid ELSE $3::text END,
-                           CASE WHEN cid IS NOT NULL THEN cid_genesis ELSE $4::bytea END,
-                           -- v1.0.0 #2333 (FBL-03 pg mirror) — carry kind_provenance
-                           -- back on restore; legacy pre-v87 archive rows re-derive
-                           -- it from the metadata carrier, vocab-guarded (sqlite twin).
-                           COALESCE(kind_provenance,
-                                    CASE WHEN metadata->>'kind_provenance' IN
-                                              ('declared','channel_derived','regex','llm')
-                                         THEN metadata->>'kind_provenance' END),
-                           valid_from, valid_until
-                    FROM archived_memories WHERE id = $2
-                      -- v1.0.0 #3271 — owner-predicated write (defense-in-depth with
-                      -- the owner probe above; same predicate). $6 bypass
-                      -- short-circuits the owner/inbox/legacy arms so operator lanes
-                      -- still round-trip any row. #3124: owner equality is typed
-                      -- (a malformed non-string owner never matches), the inbox arm
-                      -- needs a STAMPED row, and the unstamped arm is live only when
-                      -- the probe's `AI_MEMORY_UNSTAMPED_MUTATION` verdict admitted
-                      -- it ($8) — the same ONE predicate as the sqlite
-                      -- `db::restore_archived_for_caller`.
-                      AND ($6::bool
-                           OR (jsonb_typeof(metadata->'agent_id') = 'string'
-                               AND metadata->>'agent_id' = $7)
-                           OR (metadata->>'target_agent_id' = $7
-                               AND metadata->>'agent_id' IS NOT NULL
-                               AND metadata->>'agent_id' <> '')
-                           OR ($8::bool
-                               AND (metadata->>'agent_id' IS NULL
-                                    OR metadata->>'agent_id' = '')))",
-                )
-                .bind(now)
-                .bind(id)
-                .bind(&restored_cid.cid)
-                .bind(&restored_cid.genesis)
-                // v1.0.0 #2167 (S8) — $5: the process-wide active-space fp (NULL when
-                // this process resolved no embedder) driving the restore heal above.
-                .bind(crate::embeddings::active_embedding_space())
-                .bind(ctx.bypass_visibility)
-                .bind(ctx.effective_principal())
-                // #3124 — $8: the probe's unstamped-row verdict.
-                .bind(admit_unstamped_row)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("archive_restore insert", e))?;
-
-                // #1771 (5-agent vote 4d3ea1c5) — re-insert this memory's preserved
-                // `archived_memory_links` edges back into `memory_links`, AFTER the
-                // memory row is restored above and within the same tx. Only edges
-                // whose BOTH endpoints currently exist in `memories` are restored —
-                // `memory_links` carries an `ON DELETE CASCADE` FK on both
-                // endpoints, so an edge whose OTHER endpoint is permanently gone
-                // would be rejected (and is correctly skipped here). Idempotent via
-                // the PK `ON CONFLICT`. Postgres twin of the SQLite
-                // `restore_links_for_memory` re-insert.
-                // #2315 — RETURNING the actually-restored edges so they can be
-                // re-projected into the AGE graph below (only edges this INSERT
-                // landed; ON CONFLICT skips report nothing, which is correct —
-                // an already-present edge is already projected or queued).
-                // #2377 (FIX #9) — RETURNING carries `valid_from`/`valid_until` too so a
-                // restored already-invalidated edge re-projects into AGE ALREADY-carrying
-                // its validity (else the current-view Cypher reads would serve it as VALID).
-                // #4210 sibling — the INSERT below key-shares every other endpoint
-                // through the FK in plan order; take those locks first, ascending.
-                sqlx::query(lock_order_4209::SQL_KEY_SHARE_ARCHIVED_LINK_PEERS)
-                    .bind(id)
-                    .fetch_all(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("archive_restore lock link peers", e))?;
-                let restored_edges: Vec<(
-                    String,
-                    String,
-                    String,
-                    Option<DateTime<Utc>>,
-                    Option<DateTime<Utc>>,
-                )> = sqlx::query_as(
-                    "INSERT INTO memory_links (
-                         source_id, target_id, relation, created_at, valid_from,
-                         valid_until, observed_by, signature, attest_level,
-                         source_cid, target_cid
-                     )
-                     SELECT aml.source_id, aml.target_id, aml.relation, aml.created_at,
-                            aml.valid_from, aml.valid_until, aml.observed_by,
-                            aml.signature, aml.attest_level,
-                            aml.source_cid, aml.target_cid
-                     FROM archived_memory_links aml
-                     WHERE (aml.source_id = $1 OR aml.target_id = $1)
-                       AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.source_id)
-                       AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.target_id)
-                     ON CONFLICT (source_id, target_id, relation) DO NOTHING
-                     RETURNING source_id, target_id, relation, valid_from, valid_until",
-                )
-                .bind(id)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("archive_restore restore links", e))?;
-
-                // #2315 — re-PROJECT the restored edges into the AGE `memory_graph`.
-                // Every delete path unprojects (forget / delete / consolidate / gc /
-                // size_gc / archive_by_ids), but restore previously re-inserted the
-                // relational rows WITHOUT re-projecting, so an AGE-routed kg_query
-                // permanently missed restored edges (the CTE fallback fires only on
-                // AGE runtime failure, never on a valid-but-empty result) — a
-                // split-brain with no self-heal. Deferred mode enqueues the outbox
-                // rows in THIS tx (the drainer's existence re-check tolerates any
-                // later delete); sync mode MERGEs via a SAVEPOINT so an AGE runtime
-                // failure degrades to a WARN instead of failing the relational
-                // restore (#700/#1542 posture — the graph is derived data; the
-                // restore of the durable rows must never be blocked by it).
-                if matches!(self.kg_backend, KgBackend::Age) {
-                    for (src, dst, rel, valid_from, valid_until) in &restored_edges {
-                        if matches!(
-                            crate::config::age_projection_mode(),
-                            crate::config::AgeProjectionMode::Deferred
-                        ) {
-                            // Deferred: the drainer re-reads validity from memory_links
-                            // (#2377 FIX #9) at drain time, so no validity is threaded here.
-                            sqlx::query(
-                                "INSERT INTO kg_projection_outbox (source_id, target_id, relation) \
-                                 VALUES ($1, $2, $3)",
-                            )
-                            .bind(src)
-                            .bind(dst)
-                            .bind(rel)
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(|e| {
-                                to_store_err("archive_restore enqueue kg_projection_outbox", e)
-                            })?;
-                        } else {
-                            sqlx::query("SAVEPOINT age_restore_projection")
-                                .execute(&mut *tx)
-                                .await
-                                .map_err(|e| to_store_err("savepoint age_restore_projection", e))?;
-                            // #2377 (FIX #9) — carry the restored edge's validity.
-                            let vf_str = valid_from.map(|t| t.to_rfc3339());
-                            let vu_str = valid_until.map(|t| t.to_rfc3339());
-                            match project_link_into_age(
-                                &mut tx,
-                                src,
-                                dst,
-                                rel,
-                                vf_str.as_deref(),
-                                vu_str.as_deref(),
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    sqlx::query("RELEASE SAVEPOINT age_restore_projection")
-                                        .execute(&mut *tx)
-                                        .await
-                                        .map_err(|e| {
-                                            to_store_err(
-                                                "release savepoint age_restore_projection",
-                                                e,
-                                            )
-                                        })?;
-                                }
-                                Err(e) if is_age_runtime_failure(&e) => {
-                                    sqlx::query("ROLLBACK TO SAVEPOINT age_restore_projection")
-                                        .execute(&mut *tx)
-                                        .await
-                                        .map_err(|e2| {
-                                            to_store_err(
-                                                "rollback savepoint age_restore_projection",
-                                                e2,
-                                            )
-                                        })?;
-                                    // #3883 (A1) — was WARN-only; now RECORD.
-                                    record_failed_age_projection(
-                                        &mut tx,
-                                        "archive_restore",
-                                        src,
-                                        dst,
-                                        rel,
-                                        &e,
-                                    )
-                                    .await?;
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        }
-                    }
-                }
-
-                sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("archive_restore delete", e))?;
-
-                tx.commit()
-                    .await
-                    .map_err(|e| to_store_err("archive_restore commit", e))?;
-                Ok(true)
-            }
-            .await;
-            match attempt {
-                Ok(v) => break v,
-                Err(e) => retry.consider(e).await?,
-            }
-        };
-
-        Ok(restored)
+        // The body lives in `postgres/federation_by_id_4447.rs` (#4447).
+        self.archive_restore_inner(ctx, id, None).await
     }
 
     async fn archive_purge(
@@ -31553,233 +30704,8 @@ impl MemoryStore for PostgresStore {
         ids: &[String],
         reason: Option<&str>,
     ) -> StoreResult<usize> {
-        self.gate_record_stop().await?;
-        if ids.is_empty() {
-            return Ok(0);
-        }
-        let now = chrono::Utc::now();
-        // Parity finding #1 (2026-08) — the reason-less default was
-        // `"manual"` here while BOTH sqlite funnels
-        // (`storage::archive_memory_no_tx` / `archive_memory_for_caller`)
-        // stamped `"archive"`, so the SAME reason-less archive produced a
-        // DIFFERENT audit-trail value per backend and every reason-filtered
-        // query / `archive_stats` report disagreed across backends. All
-        // three funnels now read ONE shared SSOT const; `"archive"` is the
-        // value pinned by the long-standing sqlite unit test
-        // `archive_memory_default_reason_is_archive`.
-        let archive_reason = reason.unwrap_or(crate::models::field_names::ARCHIVE_REASON_DEFAULT);
-        // v1.0.0 #3520 — routed through the shared bounded-retry funnel: the
-        // explicit-archive twin of `forget` / `run_gc`, holding the same
-        // multi-relation lock set a concurrent bootstrap's
-        // `CREATE INDEX IF NOT EXISTS` deadlocks against. `moved` is declared
-        // INSIDE the block on purpose — it was an accumulator outside the
-        // transaction, and a retry would have double-counted rows the rolled-back
-        // attempt never archived. `now` / `archive_reason` stay outside so every
-        // attempt stamps identically.
-        let mut retry = tx_retry::TxRetry::new("archive_by_ids tx");
-        let moved_count: usize = loop {
-            let attempt: StoreResult<usize> = async {
-                let mut tx = self
-                    .pool
-                    .begin()
-                    .await
-                    .map_err(|e| to_store_err("begin archive_by_ids tx", e))?;
-                let mut moved = 0usize;
-
-                // v1.0.0 #3296 A6 (CONCURRENCY-04) — lock rows in a GLOBAL order. The
-                // per-id `FOR UPDATE` owner probe below (`SQL_SELECT_MEMORY_ROW_BY_ID`
-                // gained `FOR UPDATE` in the same PR that shares the const across
-                // update/delete/archive) locks in the CALLER-SUPPLIED id order, so two
-                // overlapping batches submitted in opposite order can deadlock. Locking
-                // the id set in a fixed (sorted) order breaks the cycle. Sorting only
-                // reorders the work; `moved` and the all-or-nothing tx are unchanged.
-                let mut ordered: Vec<&str> = ids.iter().map(String::as_str).collect();
-                ordered.sort_unstable();
-
-                for id in ordered {
-                    // #3193 (SECURITY-high, 2026-08-22) — SAL-side caller-owns gate,
-                    // the archive-verb sibling of the #1412/#1628 gates on the trait
-                    // `update` / `delete`. Pre-fix this funnel discarded its
-                    // `_ctx: &CallerContext` entirely and the INSERT..SELECT below
-                    // matched on `WHERE id = $3` with NO owner predicate, so ANY
-                    // authenticated tenant on a postgres-backed daemon could
-                    // bulk-soft-delete up to `max_batch` of ANOTHER tenant's live
-                    // rows through `POST /api/v1/archive` (links cascaded; the rows
-                    // vanished from get/list/search/recall). The sqlite branch has
-                    // refused since #940 via `db::archive_memory_for_caller`; #3115
-                    // fixed only that side of this class.
-                    //
-                    // Runs INSIDE the batch transaction (`FOR UPDATE` owner+inbox
-                    // probe). A genuinely-absent id is `NotFound` → silent
-                    // `continue` (the count-delta contract the handler relies on;
-                    // not an existence oracle). A LIVE row owned by someone else
-                    // raises `PermissionDenied`. Inbox-target (`metadata.target_agent_id`
-                    // == caller) is permitted — sqlite #940 parity (Fable #3243
-                    // item 1). Admin/operator lanes (`ctx.bypass_visibility`) skip
-                    // the gate, exactly as they do on update/delete.
-                    match Self::assert_caller_owns_for_mutation_on(
-                        &mut *tx,
-                        ctx,
-                        id,
-                        "archive",
-                        REASON_UNSTAMPED_TENANT_ARCHIVE,
-                        true,
-                    )
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(StoreError::NotFound { .. }) => continue,
-                        Err(e) => return Err(e),
-                    }
-                    let insert_result = sqlx::query(&format!(
-                        "INSERT INTO archived_memories (
-                            id, tier, namespace, title, content, tags, priority, confidence,
-                            source, access_count, created_at, updated_at, last_accessed_at,
-                            expires_at, archived_at, archive_reason, metadata,
-                            embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
-                            -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
-                            reflection_depth, atomised_into, atom_of, memory_kind,
-                            entity_id, persona_version, citations, source_uri, source_span,
-                            confidence_source, confidence_signals, confidence_decayed_at,
-                            -- #2196 - carry lifecycle_state through the manual archive so a
-                            -- non-open state survives archive->restore (postgres parity).
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
-                        )
-                        SELECT id, tier, namespace, title, content, tags, priority, confidence,
-                               source, access_count, created_at, updated_at, last_accessed_at,
-                               expires_at, $1::timestamptz, $2::text, metadata,
-                               embedding, embedding_dim, embedding_space, tier, expires_at,
-                               reflection_depth, atomised_into, atom_of, memory_kind,
-                               entity_id, persona_version, citations, source_uri, source_span,
-                               confidence_source, confidence_signals, confidence_decayed_at,
-                               mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
-                        FROM memories WHERE id = $3
-                          AND ($4::bool
-                               OR metadata->>'agent_id' = $5
-                               OR metadata->>'target_agent_id' = $5)
-                        -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
-                        -- $4 bypass / $5 caller: owner-predicated write so a concurrent
-                        -- re-own cannot archive a row the FOR UPDATE probe no longer owns
-                        -- (Fable #3243 item 4). Bypass short-circuits the owner/inbox arms.
-                        {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
-                    ))
-                    .bind(now)
-                    .bind(archive_reason)
-                    .bind(id)
-                    .bind(ctx.bypass_visibility)
-                    .bind(ctx.effective_principal())
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("archive_by_ids insert", e))?;
-                    // v1.0.0 #3296 A2 — only count an id whose live row was ACTUALLY
-                    // archived. On the `bypass_visibility` (admin/CLI) lane
-                    // `assert_caller_owns_for_mutation_on` returns `Ok(())` immediately
-                    // WITHOUT proving the row exists, so a nonexistent id reached here
-                    // and `moved += 1` ran even though the owner-predicated
-                    // INSERT..SELECT matched 0 live rows — contradicting the trait
-                    // contract ("an id with no live row is skipped and not counted").
-                    // Skipping on a zero-row insert also protects the non-bypass lane
-                    // against a concurrent delete between the probe and this write. The
-                    // link snapshot / namespace sever / delete / AGE unprojection below
-                    // are all no-ops for an id with no live row, so `continue` is safe.
-                    if insert_result.rows_affected() == 0 {
-                        continue;
-                    }
-                    // #1771 (5-agent vote 4d3ea1c5) — snapshot this memory's
-                    // `memory_links` into `archived_memory_links` BEFORE the
-                    // same-tx cascade delete reaps them (FK `ON DELETE CASCADE`).
-                    // Postgres twin of the SQLite `archive_links_for_memory`
-                    // snapshot wired into `archive_memory_no_tx`. Idempotent via
-                    // the PK `ON CONFLICT`.
-                    //
-                    // v1.0.0 #3177 — the statement moved to
-                    // [`crate::store::postgres_parity::archive_links_for_memory_in_tx`]
-                    // and this call site now SHARES it with the `size_gc` archive
-                    // branch. That branch had a hand-absent twin (it snapshotted
-                    // nothing), which is exactly the failure mode a second copy of a
-                    // statement invites; one definition means the next archiving path
-                    // cannot forget the edges.
-                    crate::store::postgres_parity::archive_links_for_memory_in_tx(&mut tx, id).await?;
-                    // #2503 — SEVER any namespace_meta binding pointing at this row,
-                    // parity with BOTH sqlite archive funnels (`archive_memory_no_tx`
-                    // / `archive_memory_for_caller`), which have mirrored `delete`'s
-                    // cleanup since #1642. This pg funnel never did: archiving a
-                    // standard memory on postgres left the binding pointing at a row
-                    // that is no longer in `memories` — another arm of the #2493
-                    // class, in the same direction as `apply_remote_deletion`. Runs
-                    // INSIDE the per-batch tx so the sever commits atomically with the
-                    // archive+delete it accompanies.
-                    //
-                    // #3290 — route through the shared helper so this archive funnel
-                    // emits the WARN + signed `SUBSTRATE_NAMESPACE_STANDARD_SEVERED`
-                    // event, at parity with the sqlite archive twins
-                    // (`archive_memory_no_tx` / `archive_memory_for_caller`, which both
-                    // call `sever_namespace_standards`) — previously a bare, silent
-                    // UPDATE.
-                    pg_sever_namespace_standards_in_tx(&mut tx, id)
-                        .await
-                        .map_err(|e| to_store_err("archive_by_ids: namespace_meta sever", e))?;
-                    // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
-                    // append ONE identity-only ARCHIVE leaf IN THIS tx BEFORE the
-                    // delete (the cold-storage copy already landed above). Gated →
-                    // flag-OFF unchanged.
-                    if crate::config::append_only_enabled()
-                        && let Some((ns, ver)) =
-                            sqlx::query_as::<_, (String, i64)>(SQL_SELECT_NS_VERSION_BY_ID)
-                                .bind(id)
-                                .fetch_optional(&mut *tx)
-                                .await
-                                .map_err(|e| to_store_err("archive_by_ids read row for leaf", e))?
-                    {
-                        pg_emit_revision_leaf_if_enabled(
-                            &mut tx,
-                            id,
-                            crate::revisions::RecordKind::Archive,
-                            Some(ver),
-                            &ns,
-                            None,
-                            &now.to_rfc3339(),
-                        )
-                        .await
-                        .map_err(|e| to_store_err("append archive revision leaf", e))?;
-                    }
-                    sqlx::query(
-                        "DELETE FROM memories WHERE id = $1 \
-                         AND ($2::bool \
-                              OR metadata->>'agent_id' = $3 \
-                              OR metadata->>'target_agent_id' = $3)",
-                    )
-                    .bind(id)
-                    .bind(ctx.bypass_visibility)
-                    .bind(ctx.effective_principal())
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("archive_by_ids delete", e))?;
-                    // #2315 — AGE unprojection parity. This was the ONLY hard-delete
-                    // path that skipped `unproject_memory_from_age` (delete / forget /
-                    // apply_remote_deletion / consolidate / run_gc / size_gc all call
-                    // it), so a manually-archived memory left a ghost `:Memory` node +
-                    // incident edges in the `memory_graph` projection that AGE-routed
-                    // kg_query kept returning — a live-looking edge to a non-live
-                    // memory. Same-tx DETACH DELETE, mirroring the forget() shape.
-                    if matches!(self.kg_backend, KgBackend::Age) {
-                        unproject_memory_from_age(&mut tx, id).await?;
-                    }
-                    moved += 1;
-                }
-
-                tx.commit()
-                    .await
-                    .map_err(|e| to_store_err("archive_by_ids commit", e))?;
-                Ok(moved)
-            }
-            .await;
-            match attempt {
-                Ok(v) => break v,
-                Err(e) => retry.consider(e).await?,
-            }
-        };
-        Ok(moved_count)
+        // The body lives in `postgres/federation_by_id_4447.rs` (#4447).
+        self.archive_by_ids_inner(ctx, ids, reason, None).await
     }
 
     async fn export_memories(&self) -> StoreResult<Vec<Memory>> {
@@ -32022,7 +30948,10 @@ impl MemoryStore for PostgresStore {
                 }
                 Err(e) => return Err(e),
             };
-            if let Some(Ok(p)) = crate::models::GovernancePolicy::from_metadata(&mem.metadata) {
+            let (policy, corrupt) =
+                governance_corrupt_4285::parse_level(&ns, &standard_id, &mem.metadata);
+            severed |= corrupt;
+            if let Some(p) = policy {
                 return Ok(Some(if severed {
                     p.with_severed_standard_floor()
                 } else {
@@ -32036,6 +30965,55 @@ impl MemoryStore for PostgresStore {
             ));
         }
         Ok(None)
+    }
+
+    /// #4357 — postgres twin of `storage::resolve_require_approval_above_depth`.
+    /// Same governance chain (entitled parents only, #2542), same leaf-first
+    /// walk, and the per-level decision is the SHARED pure function
+    /// `storage::approval_depth_level_decision`, so the two backends cannot
+    /// drift. A level whose standard is unresolvable is skipped (the sqlite
+    /// walk's `continue`); a genuine DATABASE error is propagated so the
+    /// reflect refuses instead of skipping a configured approval gate (fail
+    /// closed — the sqlite helper has no error channel).
+    async fn resolve_require_approval_above_depth(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<Option<u32>> {
+        use crate::storage::{ApprovalDepthLevelState, ApprovalDepthWalk};
+        let chain = pg_namespace_chain(&self.pool, namespace, true).await?;
+        let mut walk = ApprovalDepthWalk::default();
+        for ns in chain.into_iter().rev() {
+            let row: Option<(Option<String>,)> = sqlx::query_as(SQL_SELECT_STANDARD_ID_BY_NS)
+                .bind(&ns)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("resolve_require_approval_above_depth lookup", e))?;
+            // An unresolvable standard is `Missing`; a corrupt one is Severed.
+            let state = match row {
+                Some((Some(standard_id),)) => {
+                    // Substrate-internal policy read: admin context, exactly as
+                    // `resolve_governance_policy` (#955) — a private standard
+                    // must still gate.
+                    let ctx =
+                        CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);
+                    match self.get(&ctx, &standard_id).await {
+                        Ok(m) => {
+                            governance_corrupt_4285::level_state(&ns, &standard_id, &m.metadata)
+                        }
+                        Err(StoreError::NotFound { .. }) => ApprovalDepthLevelState::Missing,
+                        Err(e) => return Err(e),
+                    }
+                }
+                _ => ApprovalDepthLevelState::Missing,
+            };
+            if let Some(n) = walk.step(state) {
+                return Ok(Some(n));
+            }
+            if walk.is_done() {
+                break;
+            }
+        }
+        Ok(walk.finish())
     }
 
     /// v1.0.0 #3448 — approver-gated REJECT (veto), the postgres twin of
@@ -32438,6 +31416,35 @@ impl MemoryStore for PostgresStore {
                     None
                 }
             }
+            // #4357 — the L1-8 / #3638 reflect pendings the postgres reflect
+            // gates queue. Pre-fix this arm did not exist: a queued
+            // reflection could never be applied on this backend ("unsupported
+            // action_type"). Same payload decoder as the sqlite executor
+            // (`storage::reflect_input_from_pending`); the replay is the
+            // approved write, so no gate re-runs (the approval IS the gate),
+            // exactly as sqlite replays through `storage::reflect::reflect`.
+            "reflect" => {
+                let input = crate::storage::reflect_input_from_pending(&pa).map_err(|e| {
+                    StoreError::InvalidInput {
+                        detail: e.to_string(),
+                    }
+                })?;
+                // #4357 — replay as the REQUESTER's tenant through the trait
+                // `reflect`, never admin: source visibility, the #3696
+                // title-slot admission (a hidden private row of another
+                // principal is refused, not merged into), the why_trace gate,
+                // the attestation posture and the provenance stamp all
+                // re-apply at execute time exactly as on the direct path. The
+                // payload agent is already bound to `requested_by` by
+                // `verify_payload_agent_id` above.
+                let requester = CallerContext::for_agent(&pa.requested_by);
+                let outcome = MemoryStore::reflect(self, &requester, &input, None)
+                    .await
+                    .map_err(|e| StoreError::InvalidInput {
+                        detail: format!("reflect execute failed: {e}"),
+                    })?;
+                Some(outcome.id)
+            }
             other => {
                 return Err(StoreError::InvalidInput {
                     detail: format!("unsupported action_type: {other}"),
@@ -32556,7 +31563,9 @@ impl MemoryStore for PostgresStore {
                 severed = true;
                 continue;
             };
-            if let Some(Ok(p)) = crate::models::GovernancePolicy::from_metadata(&m) {
+            let (policy, corrupt) = governance_corrupt_4285::parse_level(ns, &standard_id, &m);
+            severed |= corrupt;
+            if let Some(p) = policy {
                 resolved_policy = Some(p);
                 break;
             }
@@ -36532,28 +35541,28 @@ mod tests {
     // ------------------------------------------------------------------
 
     // ------------------------------------------------------------------
-    // F-A2A1.2 (#700) — governance inheritance depth cap.
+    // F-A2A1.2 (#700) / #4477 — governance inheritance depth bound.
     //
-    // These tests pin the depth-cap constant + the chain-build behaviour
-    // that does NOT require a live Postgres connection. The cap value is
-    // surface-visible via `GOVERNANCE_INHERITANCE_DEPTH_CAP`; the chain
-    // walk semantics (most-specific-N levels retained) ride the same
-    // helper for both the pool-side `build_namespace_chain` and the
-    // tx-side `build_namespace_chain_in_tx`. Live-PG variants below
+    // These tests pin the depth-bound constant + the chain-build behaviour
+    // that does NOT require a live Postgres connection. The bound is
+    // surface-visible via `GOVERNANCE_INHERITANCE_DEPTH_CAP`; since #4477
+    // every level is retained up to it (complete chain) and a deeper walk
+    // refuses, for both the pool-side `build_namespace_chain` and the
+    // tx-side `build_namespace_chain_in_tx` (one builder). Live-PG variants below
     // exercise the same paths through `enforce_governance_action` end-
     // to-end against a real schema; the unit tests here are the
     // structural pin so a future refactor cannot silently drift the cap.
     // ------------------------------------------------------------------
 
     #[test]
-    fn governance_inheritance_depth_cap_is_five() {
-        // Pinned to 5 per the v0.7.0 fold-A2A1 spec. Any change to this
-        // value must be reflected in
-        // `docs/v0.7.0/a2a-triage-wave4-r2.md` §F-A2A1.2 and
-        // accompanied by a CHANGELOG entry — the cap shapes the
-        // bind-list size and connection-hold budget of every governed
-        // write on postgres.
-        assert_eq!(super::GOVERNANCE_INHERITANCE_DEPTH_CAP, 5);
+    fn governance_inheritance_depth_bound_is_max_namespace_depth_4477() {
+        // #4477 (GOD ruling, supersedes the F-A2A1.2 value 5): the bound is
+        // MAX_NAMESPACE_DEPTH and it is a fail-closed REFUSAL, never a
+        // truncation; sqlite and postgres share it.
+        assert_eq!(
+            super::GOVERNANCE_INHERITANCE_DEPTH_CAP,
+            crate::models::MAX_NAMESPACE_DEPTH
+        );
     }
 
     #[test]
@@ -36573,36 +35582,16 @@ mod tests {
     }
 
     #[test]
-    fn namespace_ancestors_at_max_namespace_depth() {
-        // The compile-time `MAX_NAMESPACE_DEPTH` is 8; namespaces at
-        // that depth produce 8 ancestor levels. Our cap of 5 trims
-        // such a chain when applied in the governance walker.
+    fn namespace_chain_at_max_namespace_depth_keeps_every_level_4477() {
+        // #4477: a namespace at MAX_NAMESPACE_DEPTH keeps EVERY level, root
+        // included (pre-fix postgres dropped the 3 rootmost levels, so a root
+        // policy governed nothing at depth 6+); one level deeper refuses.
         let deep = "l1/l2/l3/l4/l5/l6/l7/l8";
-        let ancestors: Vec<String> = crate::models::namespace_ancestors(deep)
-            .into_iter()
-            .rev()
-            .collect();
-        assert_eq!(ancestors.len(), 8);
-        // Simulate the cap: keep last N most-specific entries.
-        let cap = super::GOVERNANCE_INHERITANCE_DEPTH_CAP;
-        let kept: Vec<String> = if ancestors.len() > cap {
-            ancestors
-                .iter()
-                .skip(ancestors.len() - cap)
-                .cloned()
-                .collect()
-        } else {
-            ancestors
-        };
-        assert_eq!(kept.len(), cap);
-        // The most-specific entry is the leaf itself.
+        let kept = crate::governance::chain_depth::slash_chain(deep).expect("within the bound");
+        assert_eq!(kept.len(), crate::models::MAX_NAMESPACE_DEPTH);
+        assert_eq!(kept.first().map(String::as_str), Some("l1"));
         assert_eq!(kept.last().map(String::as_str), Some(deep));
-        // The least-specific kept entry is the (cap-1)-from-leaf
-        // ancestor, NOT the root. The root ("l1") is dropped under
-        // the cap so resolution stays bounded — operators who want a
-        // root-level policy applied to deep children must seat that
-        // policy on a level within the cap reach.
-        assert_eq!(kept.first().map(String::as_str), Some("l1/l2/l3/l4"));
+        assert!(crate::governance::chain_depth::slash_chain("l1/l2/l3/l4/l5/l6/l7/l8/l9").is_err());
     }
 
     #[test]
@@ -38621,6 +37610,20 @@ mod tests {
     // - `live_governance_inheritance_cap_at_five`       — depth-cap spec pin
     // ------------------------------------------------------------------
 
+    /// #4468 — the active `PermissionsMode` is process-global and other lib
+    /// tests flip it under [`crate::config::lock_permissions_mode_for_test`];
+    /// these live cells set `Enforce` WITHOUT that lock, so under multiple test
+    /// threads another cell's `Advisory` window turned the expected
+    /// Deny/Pending decisions into `Allow`. Take the same gate, THEN set
+    /// `Enforce`, and hold the guard for the whole cell.
+    fn enforce_mode_serialised() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Enforce,
+        );
+        guard
+    }
+
     /// Seed a namespace standard memory and register it via
     /// `namespace_meta`. Returns the standard_id. Owner is the
     /// metadata.agent_id stamped on the standard memory.
@@ -38696,6 +37699,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // intentional: serialise the global permissions-mode window across the await (#4468)
     async fn live_governance_allow_owner_at_leaf() {
         // S53 phase B — owner writes to their own namespace under a
         // `write=owner` policy. Decision must be Allow.
@@ -38703,9 +37707,7 @@ mod tests {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        crate::config::override_active_permissions_mode_for_test(
-            crate::config::PermissionsMode::Enforce,
-        );
+        let _mode = enforce_mode_serialised();
         let store = PostgresStore::connect(&url).await.expect("connect");
         let pool = store.pool.clone();
         let owner = format!("ai:gov-owner-{}", uuid::Uuid::new_v4());
@@ -38740,6 +37742,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // intentional: serialise the global permissions-mode window across the await (#4468)
     async fn live_governance_deny_non_owner_inherited() {
         // S53/S60/S80 — a non-owner write to a deep child of a
         // `write=owner` parent must be Denied via the inheritance walk.
@@ -38747,9 +37750,7 @@ mod tests {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        crate::config::override_active_permissions_mode_for_test(
-            crate::config::PermissionsMode::Enforce,
-        );
+        let _mode = enforce_mode_serialised();
         let store = PostgresStore::connect(&url).await.expect("connect");
         let pool = store.pool.clone();
         let owner = format!("ai:gov-owner-{}", uuid::Uuid::new_v4());
@@ -38821,6 +37822,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // intentional: serialise the global permissions-mode window across the await (#4468)
     async fn live_governance_pending_on_approve_level() {
         // S34 — a `write=approve` policy on a namespace must route
         // non-owner writes through Pending. The decision payload must
@@ -38829,9 +37831,7 @@ mod tests {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        crate::config::override_active_permissions_mode_for_test(
-            crate::config::PermissionsMode::Enforce,
-        );
+        let _mode = enforce_mode_serialised();
         let store = PostgresStore::connect(&url).await.expect("connect");
         let pool = store.pool.clone();
         let owner = format!("ai:gov-owner-{}", uuid::Uuid::new_v4());
@@ -38879,14 +37879,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // intentional: serialise the global permissions-mode window across the await (#4468)
     async fn live_governance_inheritance_cap_at_five() {
-        // F-A2A1.2 depth cap — a namespace at MAX_NAMESPACE_DEPTH (8
-        // levels) under a `write=owner` parent at the root must still
-        // resolve to Deny for a non-owner, because the cap retains the
-        // most-specific 5 levels which include the policy-anchored
-        // child path. Conversely, a policy seated at the root that's
-        // OUTSIDE the cap (depth 8 child, policy at depth 1 root) is
-        // expected NOT to apply — the cap is the explicit contract.
+        // F-A2A1.2 / #4477 — a deep leaf under a `write=owner` ancestor
+        // resolves to Deny for a non-owner (since #4477 the chain is
+        // complete to MAX_NAMESPACE_DEPTH, so a root-level policy governs
+        // depth-8 children too; see tests/governance_chain_depth_4477.rs).
         //
         // This test pins the "most-specific kept" semantics by seating
         // the policy 2 levels above the leaf (well within the cap)
@@ -38895,9 +37893,7 @@ mod tests {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        crate::config::override_active_permissions_mode_for_test(
-            crate::config::PermissionsMode::Enforce,
-        );
+        let _mode = enforce_mode_serialised();
         let store = PostgresStore::connect(&url).await.expect("connect");
         let pool = store.pool.clone();
         let owner = format!("ai:cap-owner-{}", uuid::Uuid::new_v4());
@@ -42889,262 +41885,7 @@ mod tests {
     }
 }
 
-// ── v1.0.0 #3264 — pgvector preflight decision-table unit tests ────────
-//
-// Placed at EOF (after the existing `#[cfg(test)]` modules) deliberately:
-// `scripts/check-hardcoded-literals.sh` treats everything after the FIRST
-// `#[cfg(test)]` module in a file as test code, so a new test module
-// spliced in beside the production consts would silently retire the
-// literal gate for the ~20k production lines that follow it.
+// Test module declarations live at EOF (the literal gate treats code after the
+// first `#[cfg(test)]` as test code).
 #[cfg(test)]
-mod pgvector_preflight_tests_3264 {
-    use super::{
-        PG_SQLSTATE_FEATURE_NOT_SUPPORTED, PG_SQLSTATE_INSUFFICIENT_PRIVILEGE, PgvectorPreflight,
-        PgvectorPreflightFacts, classify_init_sql_error, classify_pgvector_preflight,
-        render_database_for_operator,
-    };
-
-    /// The full 2^3 decision table, enumerated. `installed` wins outright:
-    /// an already-installed extension makes the bootstrap
-    /// `CREATE EXTENSION IF NOT EXISTS` privilege-free for ANY role, which
-    /// is exactly the supported managed-Postgres remedy.
-    #[test]
-    fn decision_table_is_exhaustive_and_installed_wins() {
-        for rolsuper in [false, true] {
-            for available in [false, true] {
-                assert_eq!(
-                    classify_pgvector_preflight(available, true, rolsuper),
-                    PgvectorPreflight::Installed,
-                    "installed must win (available={available}, rolsuper={rolsuper})"
-                );
-            }
-        }
-        // Not installed, not available -> the #1065 image case, whatever
-        // the role is: a superuser cannot create what the server does not
-        // ship.
-        assert_eq!(
-            classify_pgvector_preflight(false, false, false),
-            PgvectorPreflight::NotAvailableOnServer
-        );
-        assert_eq!(
-            classify_pgvector_preflight(false, false, true),
-            PgvectorPreflight::NotAvailableOnServer
-        );
-        // Available, not installed -> the role's superuser bit decides,
-        // because pgvector is not a TRUSTED extension.
-        assert_eq!(
-            classify_pgvector_preflight(true, false, false),
-            PgvectorPreflight::AvailableNeedsSuperuserCreate
-        );
-        assert_eq!(
-            classify_pgvector_preflight(true, false, true),
-            PgvectorPreflight::AvailableCreatableProceed
-        );
-    }
-
-    /// Exactly the two FAULT classes carry a classified detail, and each
-    /// one names its remedy. The two healthy classes carry none — that is
-    /// what keeps the happy path byte-identical to the pre-#3264 bootstrap.
-    #[test]
-    fn only_the_two_fault_classes_carry_a_classified_detail() {
-        assert!(
-            PgvectorPreflight::Installed
-                .classified_detail("db")
-                .is_none()
-        );
-        assert!(
-            PgvectorPreflight::AvailableCreatableProceed
-                .classified_detail("db")
-                .is_none()
-        );
-
-        let not_available = PgvectorPreflight::NotAvailableOnServer
-            .classified_detail("aimemory")
-            .expect("fault class must carry a detail");
-        assert!(
-            not_available.contains("0A000"),
-            "must name the SQLSTATE: {not_available}"
-        );
-        assert!(
-            not_available.contains("Dockerfile.pg-age-vector"),
-            "must name the shipped remedy image: {not_available}"
-        );
-        assert!(
-            not_available.contains("#1065"),
-            "must cite the documented-unsupported case: {not_available}"
-        );
-
-        let needs_su = PgvectorPreflight::AvailableNeedsSuperuserCreate
-            .classified_detail("aimemory")
-            .expect("fault class must carry a detail");
-        assert!(
-            needs_su.contains("42501"),
-            "must name the SQLSTATE: {needs_su}"
-        );
-        assert!(
-            needs_su.contains("CREATE EXTENSION vector;"),
-            "must name the one-time superuser command: {needs_su}"
-        );
-        assert!(
-            needs_su.contains("postInitApplicationSQL"),
-            "must name the CloudNativePG hook: {needs_su}"
-        );
-        assert!(
-            needs_su.contains("rds_superuser"),
-            "must name the RDS / Aurora path: {needs_su}"
-        );
-    }
-
-    /// `{DATABASE}` is substituted everywhere it appears — the operator is
-    /// told the exact database to run the one-time create in, with no
-    /// placeholder left over.
-    #[test]
-    fn database_placeholder_is_substituted_everywhere() {
-        let detail = PgvectorPreflight::AvailableNeedsSuperuserCreate
-            .classified_detail("prod_mem")
-            .expect("fault class must carry a detail");
-        assert!(
-            !detail.contains("{DATABASE}"),
-            "placeholder left in: {detail}"
-        );
-        assert!(
-            detail.matches("prod_mem").count() >= 3,
-            "every placeholder site must be substituted: {detail}"
-        );
-    }
-
-    /// The SQLSTATE mapping requires CORROBORATION. `42501` is NOT
-    /// pgvector-specific — on PG15+ a role without `CREATE` on schema
-    /// `public` gets the same code from `CREATE TABLE` — so when the
-    /// preflight says pgvector is fine, the opaque driver error is kept
-    /// rather than emitting a WRONG diagnosis.
-    #[test]
-    fn sqlstate_mapping_requires_corroboration() {
-        // No preflight (probe failed, or the schema-AHEAD hatch skipped
-        // it): the SQLSTATE is the only evidence there is.
-        assert_eq!(
-            classify_init_sql_error(Some(PG_SQLSTATE_INSUFFICIENT_PRIVILEGE), None),
-            Some(PgvectorPreflight::AvailableNeedsSuperuserCreate)
-        );
-        assert_eq!(
-            classify_init_sql_error(Some(PG_SQLSTATE_FEATURE_NOT_SUPPORTED), None),
-            Some(PgvectorPreflight::NotAvailableOnServer)
-        );
-        // Preflight corroborates.
-        assert_eq!(
-            classify_init_sql_error(
-                Some(PG_SQLSTATE_INSUFFICIENT_PRIVILEGE),
-                Some(PgvectorPreflight::AvailableNeedsSuperuserCreate)
-            ),
-            Some(PgvectorPreflight::AvailableNeedsSuperuserCreate)
-        );
-        // Preflight CONTRADICTS -> stay opaque.
-        for observed in [
-            PgvectorPreflight::Installed,
-            PgvectorPreflight::AvailableCreatableProceed,
-            PgvectorPreflight::NotAvailableOnServer,
-        ] {
-            assert_eq!(
-                classify_init_sql_error(Some(PG_SQLSTATE_INSUFFICIENT_PRIVILEGE), Some(observed)),
-                None,
-                "42501 with preflight {observed:?} is a different privilege fault"
-            );
-        }
-        // Anything else keeps the historical opaque `init schema: {e}`.
-        assert_eq!(classify_init_sql_error(Some("42P07"), None), None);
-        assert_eq!(classify_init_sql_error(None, None), None);
-        assert_eq!(
-            classify_init_sql_error(None, Some(PgvectorPreflight::AvailableNeedsSuperuserCreate)),
-            None,
-            "a driverless error must never be classified from the preflight alone"
-        );
-    }
-
-    /// #3264 review fix (B1) — ONLY the `0A000` class refuses bootstrap
-    /// before the DDL runs.
-    ///
-    /// `pg_roles.rolsuper` is not the privilege oracle on managed
-    /// PostgreSQL (RDS `rds_superuser`, Cloud SQL `cloudsqlsuperuser`,
-    /// Azure `azure_pg_admin` all create extensions without it), so a
-    /// preemptive refusal on `AvailableNeedsSuperuserCreate` would
-    /// fail-close a fresh managed deployment that boots fine. That verdict
-    /// still CARRIES its classified detail — rendered only once the real
-    /// `CREATE EXTENSION` has actually returned `42501`.
-    #[test]
-    fn only_the_0a000_class_refuses_before_the_ddl_runs() {
-        assert!(
-            PgvectorPreflight::NotAvailableOnServer
-                .preemptive_refusal_detail("aimemory")
-                .is_some_and(|d| d.contains("0A000")),
-            "the no-vector.so image must still refuse preemptively"
-        );
-        for proceeding in [
-            PgvectorPreflight::Installed,
-            PgvectorPreflight::AvailableCreatableProceed,
-            PgvectorPreflight::AvailableNeedsSuperuserCreate,
-        ] {
-            assert_eq!(
-                proceeding.preemptive_refusal_detail("aimemory"),
-                None,
-                "{proceeding:?} must let the real CREATE EXTENSION be the gate"
-            );
-        }
-        // The 42501 remedy is intact for the SQLSTATE path that DOES fire.
-        assert!(
-            PgvectorPreflight::AvailableNeedsSuperuserCreate
-                .classified_detail("aimemory")
-                .is_some_and(|d| d.contains("42501")),
-            "the classified 42501 remedy must survive the non-preemptive shape"
-        );
-    }
-
-    /// #3264 review fix (S1) — a server-supplied `current_database()` is
-    /// escaped before it reaches the pasteable `psql` remedy and the log
-    /// lines. A quote, a semicolon, a newline or an ANSI escape in a
-    /// database name must not break out of the superuser one-liner the
-    /// operator is invited to paste.
-    #[test]
-    fn database_name_is_escaped_before_it_reaches_an_operator() {
-        for plain in ["aimemory", "prod_mem_2", "A1", "<unknown>"] {
-            assert_eq!(
-                render_database_for_operator(plain),
-                plain,
-                "a legitimate name must reach the operator verbatim"
-            );
-        }
-        let hostile = "mem'; DROP DATABASE mem; --\n\u{1b}[31mFORGED";
-        let rendered = render_database_for_operator(hostile);
-        assert!(
-            !rendered.contains('\n') && !rendered.contains('\u{1b}'),
-            "control characters must be escaped: {rendered}"
-        );
-        let detail = PgvectorPreflight::AvailableNeedsSuperuserCreate
-            .classified_detail(hostile)
-            .expect("fault class must carry a detail");
-        assert!(
-            !detail.contains('\n') && !detail.contains('\u{1b}'),
-            "the pasteable remedy must carry no injected control characters: {detail}"
-        );
-        // An empty name is not "plain" either — it would silently produce
-        // `psql -d  -c ...`, which targets the wrong database.
-        assert_eq!(render_database_for_operator(""), "\"\"");
-    }
-
-    /// `PgvectorPreflightFacts::verdict` is the same pure table — the
-    /// live probe adds no second decision path.
-    #[test]
-    fn facts_verdict_matches_the_pure_table() {
-        let facts = PgvectorPreflightFacts {
-            available: true,
-            installed: false,
-            role_is_superuser: false,
-            age_catalog_usage: false,
-            database: "aimemory".to_string(),
-        };
-        assert_eq!(
-            facts.verdict(),
-            PgvectorPreflight::AvailableNeedsSuperuserCreate
-        );
-        assert_eq!(facts.verdict().label(), "available_needs_superuser_create");
-    }
-}
+mod pgvector_preflight_tests_3264;

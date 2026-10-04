@@ -513,8 +513,10 @@ async fn no_allowlist_namespace_meta_posture_matrix_on_postgres_3582() {
             if scoped {
                 std::env::set_var(
                     ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
+                    // #4495: also allowlisted for the seeded standards' owner,
+                    // since a federated rebind needs the current owner (#3758).
                     json!({PEER_ID: {"allowed_namespaces": ["**"],
-                        "allowed_sender_agent_ids": [PEER_ID]}})
+                        "allowed_sender_agent_ids": [PEER_ID, "ai:victim-2479"]}})
                     .to_string(),
                 );
             }

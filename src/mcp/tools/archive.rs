@@ -310,9 +310,21 @@ fn gate_gc_sweep(
         .collect::<rusqlite::Result<Vec<String>>>()
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("query_map", e))?;
     for ns in &namespaces {
-        if db::resolve_governance_policy(conn, ns)
-            .is_some_and(|p| !matches!(p.core.delete, crate::models::GovernanceLevel::Any))
-        {
+        // #4043 — an unreadable policy is treated as GOVERNED (refused), never
+        // as "ungoverned" (swept).
+        let governed = match db::resolve_governance_policy(conn, ns) {
+            Ok(policy) => policy
+                .is_some_and(|p| !matches!(p.core.delete, crate::models::GovernanceLevel::Any)),
+            Err(e) => {
+                tracing::warn!(
+                    namespace = %ns,
+                    error = %e,
+                    "gc sweep: governance policy unreadable; treating the namespace as governed (#4043)"
+                );
+                true
+            }
+        };
+        if governed {
             crate::governance::audit::record_decision(
                 caller,
                 "refuse",

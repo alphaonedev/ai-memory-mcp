@@ -564,7 +564,7 @@ pub fn namespaces_requesting_auto_atomise(conn: &rusqlite::Connection) -> Vec<St
     let namespaces: Vec<String> = rows.filter_map(Result::ok).collect();
     let mut out = Vec::new();
     for ns in namespaces {
-        let policy = db::resolve_governance_policy(conn, &ns).unwrap_or_default();
+        let policy = db::resolve_governance_policy_for_optional_feature(conn, &ns);
         if policy.effective_auto_atomise_mode() != AutoAtomiseMode::Off {
             out.push(ns);
             if out.len() >= MAX_REPORTED {
@@ -604,7 +604,7 @@ pub fn maybe_enqueue_auto_atomise(
     calling_agent_id: &str,
     wiring: AtomiseWiring<'_>,
 ) -> AutoAtomisationOutcome {
-    let policy = db::resolve_governance_policy(conn, &memory.namespace).unwrap_or_default();
+    let policy = db::resolve_governance_policy_for_optional_feature(conn, &memory.namespace);
     if !policy.effective_auto_atomise() {
         return AutoAtomisationOutcome::Skipped {
             reason: OUTCOME_SKIPPED_POLICY_DISABLED,
@@ -805,7 +805,7 @@ mod tests {
             &mem.id,
             "ai:test",
             AutoAtomiseMode::Off,
-            &db::resolve_governance_policy(&conn, &mem.namespace).unwrap_or_default(),
+            &db::resolve_governance_policy_for_optional_feature(&conn, &mem.namespace),
             AtomiseWiring::default(),
         );
         assert_eq!(d.mode_ran, AutoAtomiseMode::Off);
@@ -827,7 +827,7 @@ mod tests {
             &mem.id,
             "ai:test",
             AutoAtomiseMode::Deferred,
-            &db::resolve_governance_policy(&conn, &mem.namespace).unwrap_or_default(),
+            &db::resolve_governance_policy_for_optional_feature(&conn, &mem.namespace),
             AtomiseWiring::default(),
         );
         assert_eq!(d.outcome, OUTCOME_SKIPPED_NO_CURATOR);
@@ -849,7 +849,7 @@ mod tests {
             &mem.id,
             "ai:test",
             AutoAtomiseMode::Deferred,
-            &db::resolve_governance_policy(&conn, &mem.namespace).unwrap_or_default(),
+            &db::resolve_governance_policy_for_optional_feature(&conn, &mem.namespace),
             AtomiseWiring::new(Some(&atomiser), None),
         );
         assert_eq!(d.outcome, OUTCOME_SKIPPED_UNDER_THRESHOLD);
@@ -877,7 +877,7 @@ mod tests {
             &id,
             "ai:test",
             AutoAtomiseMode::Synchronous,
-            &db::resolve_governance_policy(&conn, &mem.namespace).unwrap_or_default(),
+            &db::resolve_governance_policy_for_optional_feature(&conn, &mem.namespace),
             AtomiseWiring::new(Some(&atomiser), None),
         );
         assert_eq!(d.outcome, OUTCOME_ATOMISED, "disposition: {d:?}");
@@ -907,7 +907,7 @@ mod tests {
             &id,
             "ai:test",
             AutoAtomiseMode::Deferred,
-            &db::resolve_governance_policy(&conn, &mem.namespace).unwrap_or_default(),
+            &db::resolve_governance_policy_for_optional_feature(&conn, &mem.namespace),
             AtomiseWiring::new(Some(&atomiser), None),
         );
         assert_eq!(d.outcome, OUTCOME_SKIPPED_QUEUE_FULL);

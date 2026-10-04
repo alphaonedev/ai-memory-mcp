@@ -320,20 +320,34 @@ jobs:
       # #2676 packaging residual — release channel must not ship default-only
       # binaries that omit `sal` (federation/SAL surface). Assert via the same
       # pin Gate3 provision uses (`scripts/assert-compiled-features.sh`).
-      # Note: `sal-postgres` is NOT enabled here (sqlx/pgvector weight + native
-      # deps on every matrix OS); operators needing PG use an asserted
-      # sal-postgres build or the plan-c image. Agents never workflow_dispatch.
+      # #4480 — the PostgreSQL + AGE + pgvector tier SHIPS: every artifact is
+      # built with `sal-postgres` (sqlx on rustls: pure Rust, no libpq, no
+      # system OpenSSL, so no native dependency on any matrix OS). The feature
+      # set is declared ONCE in `scripts/release-features.sh`; the build, the
+      # assert step below and the `release-shape` CI job all read it.
+      # Agents never workflow_dispatch.
       - name: Build release binary
         # --locked (#2895): build against the COMMITTED Cargo.lock exactly.
         # A release must never silently resolve a newer transitive dependency
         # than the one that was reviewed/audited on the branch.
-        run: cargo build --locked --release --target ${{ matrix.target }} --features sal
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Own statement: a failing declaration aborts here under -e (a
+          # substitution inside the cargo arguments would be swallowed and the
+          # build would silently use default features).
+          FEATURES="$(bash scripts/release-features.sh)"
+          test -n "$FEATURES"
+          cargo build --locked --release --target ${{ matrix.target }} --features "$FEATURES"
 
       - name: Assert compiled features (#2676, #2728)
         shell: bash
         run: |
+          set -euo pipefail
           bin="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
           target="${{ matrix.target }}"
+          REQUIRE_FLAGS="$(bash scripts/release-features.sh --require-flags)"
+          test -n "$REQUIRE_FLAGS"
           # #2728 — the release matrix cross-builds x86_64-apple-darwin on an
           # arm64 `macos-latest` runner. `ai-memory features` self-report is an
           # EXECUTING assertion; running the x86_64 binary on arm64 needs
@@ -343,7 +357,7 @@ jobs:
           # runnable on this host; for a non-native target, verify the built
           # artifact's ARCHITECTURE WITHOUT running it. The compiled feature
           # set is identical across both darwin targets (same
-          # `cargo build --release --features sal` invocation above), so the
+          # `cargo build --release --features <release-features.sh>` above), so the
           # native aarch64-apple-darwin job's feature assertion already covers
           # the feature contract; the x86_64 job additionally confirms the
           # cross-build actually emitted an x86_64 Mach-O, not a silent
@@ -361,8 +375,8 @@ jobs:
             # Native target — safe to execute; the script invokes the
             # `features` subcommand via the path.
             echo "native target ($target on $host_arch): executing feature self-report assertion"
-            bash scripts/assert-compiled-features.sh "$bin" \
-              --require sqlite-bundled --require sal
+            # shellcheck disable=SC2086 # word-splitting the --require flags is intended
+            bash scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS
           else
             echo "non-native target ($target on $host_arch): verifying arch WITHOUT executing (#2728)"
             # Expected Mach-O / `file` architecture token for the target CPU.
@@ -599,7 +613,12 @@ jobs:
           # so the SBOM is byte-stable across re-runs of the same tag.
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH
-          cargo cyclonedx --format json
+          # The SBOM must enumerate what the shipped artifacts link (#4480:
+          # sqlx / pgvector / ... under sal-postgres), so it takes the SAME
+          # feature declaration as the build. Own statement: fail closed.
+          FEATURES="$(bash scripts/release-features.sh)"
+          test -n "$FEATURES"
+          cargo cyclonedx --format json --features "$FEATURES"
           mkdir -p dist
           cp ai-memory.cdx.json dist/
           cd dist

@@ -995,6 +995,18 @@ pub(crate) fn authorize_namespace_standard_mutation(
     )
 }
 
+/// #4356 — map the shared SET verdict's refusal to the SAL error type.
+pub(crate) fn set_refusal_to_store_err(
+    refusal: crate::ns_standard_ancestor::SetRefusal,
+    namespace: &str,
+) -> StoreError {
+    StoreError::PermissionDenied {
+        action: NamespaceStandardOp::Set.label().to_string(),
+        target: namespace.to_string(),
+        reason: crate::ns_standard_ancestor::refusal_reason(refusal).to_string(),
+    }
+}
+
 /// #3176 — the CLEAR arm of [`authorize_namespace_standard_mutation`].
 ///
 /// # Errors
@@ -3109,6 +3121,97 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #4447 — [`apply_remote_deletion`](MemoryStore::apply_remote_deletion) with
+    /// the federation peer-scope verdict re-evaluated against the STORED
+    /// namespace of the row it deletes, read under the SAME lock the delete
+    /// writes under (`FOR UPDATE` on postgres, the write transaction on
+    /// sqlite). The sibling of [`merge_inbound_authorized`](MemoryStore::merge_inbound_authorized)
+    /// for the `deletions[]` lane: the funnel's scope gate reads the namespace on
+    /// an earlier probe, and a broader writer can move the row out of the peer's
+    /// scope before the write. `authorize_stored(id, stored_namespace)` returning
+    /// `false` refuses with `PermissionDenied { action: FEDERATION_APPLY_DELETION }`
+    /// and writes nothing. A row absent under the lock is not re-checked (nothing
+    /// is deleted; the funnel already reports the no-op).
+    ///
+    /// Default: `UnsupportedCapability` — an adapter that cannot re-check FAILS
+    /// CLOSED rather than silently deleting unchecked.
+    ///
+    /// # Errors
+    ///
+    /// Everything `apply_remote_deletion` returns, plus the refusal above.
+    async fn apply_remote_deletion_authorized(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_DELETION_AUTHORIZED".to_string(),
+        })
+    }
+
+    /// #4447 — the `archives[]` twin of
+    /// [`apply_remote_deletion_authorized`](MemoryStore::apply_remote_deletion_authorized):
+    /// the live row's stored namespace is re-authorized inside the archive
+    /// transaction. Refusal is `PermissionDenied { action: FEDERATION_APPLY_ARCHIVE }`.
+    /// Default: `UnsupportedCapability` (fails closed).
+    ///
+    /// # Errors
+    ///
+    /// Everything `apply_remote_archive` returns, plus the refusal above.
+    async fn apply_remote_archive_authorized(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_ARCHIVE_AUTHORIZED".to_string(),
+        })
+    }
+
+    /// #4447 — the `restores[]` twin: the ARCHIVED row's stored namespace is
+    /// re-authorized inside the restore transaction. The #1848 / G30
+    /// forget-tombstone gate of [`apply_remote_restore`](MemoryStore::apply_remote_restore)
+    /// still runs first. Refusal is
+    /// `PermissionDenied { action: FEDERATION_APPLY_RESTORE }`. Default:
+    /// `UnsupportedCapability` (fails closed).
+    ///
+    /// # Errors
+    ///
+    /// Everything `apply_remote_restore` returns, plus the refusal above.
+    async fn apply_remote_restore_authorized(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_RESTORE_AUTHORIZED".to_string(),
+        })
+    }
+
+    /// #4447 — the `links[]` twin: BOTH endpoints' stored namespaces are
+    /// re-authorized (each through `authorize_stored(endpoint_id, namespace)`)
+    /// under the link transaction's lock. Refusal is
+    /// `PermissionDenied { action: FEDERATION_APPLY_LINK }`. Default:
+    /// `UnsupportedCapability` (fails closed).
+    ///
+    /// # Errors
+    ///
+    /// Everything `apply_remote_link` returns, plus the refusal above.
+    async fn apply_remote_link_authorized(
+        &self,
+        _ctx: &CallerContext,
+        _link: &MemoryLink,
+        _attest_level: &str,
+        _authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_LINK_AUTHORIZED".to_string(),
+        })
+    }
+
     /// v1.0.0 #3075 — apply a remote-origin PENDING-action row (`/sync/push`
     /// `pendings[]`).
     ///
@@ -3467,6 +3570,20 @@ pub trait MemoryStore: Send + Sync {
     ) -> StoreResult<()> {
         Err(StoreError::UnsupportedCapability {
             capability: "GOVERNANCE_SET_STANDARD".to_string(),
+        })
+    }
+
+    /// #4356 — the nearest governing ancestor of `namespace` for the
+    /// ancestor-owner bind gate (the HTTP funnel's pre-write probe; the
+    /// adapters' own `set_namespace_standard` re-runs the gate in-transaction
+    /// as the fail-closed floor). Default returns `UnsupportedCapability`
+    /// (fail-closed: an adapter that cannot answer cannot admit the bind).
+    async fn namespace_governing_ancestor(
+        &self,
+        _namespace: &str,
+    ) -> StoreResult<crate::ns_standard_ancestor::GoverningAncestor> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_GOVERNING_ANCESTOR".to_string(),
         })
     }
 
@@ -4555,6 +4672,25 @@ pub trait MemoryStore: Send + Sync {
         _namespace: &str,
     ) -> StoreResult<Option<crate::models::GovernancePolicy>> {
         Ok(None)
+    }
+
+    /// v0.7.0 L1-8 / #4357 — resolve the namespace's
+    /// `governance.require_approval_above_depth` threshold, leaf-first, with
+    /// the SAME walk semantics on every backend (the per-level decision is the
+    /// shared [`crate::storage::approval_depth_level_decision`]). `Ok(None)`
+    /// means no gate is configured; `Ok(Some(t))` means a reflection whose
+    /// proposed depth exceeds `t` must be parked for approval, never written.
+    ///
+    /// Default returns `UnsupportedCapability` — NOT `Ok(None)`: an adapter
+    /// that has not wired the walk must fail the reflect loudly rather than
+    /// silently skip an approval gate the operator configured (fail closed).
+    async fn resolve_require_approval_above_depth(
+        &self,
+        _namespace: &str,
+    ) -> StoreResult<Option<u32>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "REFLECT_APPROVAL_GATE".to_string(),
+        })
     }
 
     /// Apply an approval vote against a pending action with full
@@ -5656,6 +5792,17 @@ pub const EXECUTE_PENDING_ACTION: &str = "execute_pending_action";
 /// [`MemoryStore::merge_inbound_authorized`] refuses a federation merge whose
 /// locked row sits outside the pushing peer's namespace scope.
 pub const FEDERATION_MERGE_INBOUND: &str = "federation_merge_inbound";
+
+/// #4447 — the `action` of the [`StoreError::PermissionDenied`] envelope the
+/// `apply_remote_*_authorized` methods return when the in-transaction re-check
+/// refuses a federation by-id write (one per lane).
+pub const FEDERATION_APPLY_DELETION: &str = "federation_apply_deletion";
+/// See [`FEDERATION_APPLY_DELETION`] (`archives[]`).
+pub const FEDERATION_APPLY_ARCHIVE: &str = "federation_apply_archive";
+/// See [`FEDERATION_APPLY_DELETION`] (`restores[]`).
+pub const FEDERATION_APPLY_RESTORE: &str = "federation_apply_restore";
+/// See [`FEDERATION_APPLY_DELETION`] (`links[]`).
+pub const FEDERATION_APPLY_LINK: &str = "federation_apply_link";
 
 /// #1727 (v0.8.0) — outcome of an [`MemoryStore::undo_in_place_edit`]
 /// call: enough before/after detail to render a dry-run diff and to

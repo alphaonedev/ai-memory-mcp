@@ -512,11 +512,10 @@ async fn s80_postgres_inheritance_deep_child() {
     cleanup(&pool, &ns_prefix).await;
 }
 
-/// Inheritance depth cap — a policy seated within
-/// `GOVERNANCE_INHERITANCE_DEPTH_CAP` levels of the leaf is honored;
-/// a policy seated OUTSIDE the cap is NOT applied to a deep leaf.
-/// This pins the explicit contract that the postgres adapter caps the
-/// inheritance walk at 5 levels per the v0.7.0 spec.
+/// Inheritance depth — a policy seated above a deep leaf is honored. Since
+/// #4477 the walk is complete to `MAX_NAMESPACE_DEPTH` (no 5-level
+/// truncation; `tests/governance_chain_depth_4477.rs` pins depth 6-8 and the
+/// over-depth refusal on both backends).
 #[tokio::test]
 async fn inheritance_walk_capped_at_five_levels() {
     let Some(url) = postgres_url() else {
