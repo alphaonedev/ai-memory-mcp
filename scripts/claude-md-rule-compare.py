@@ -635,6 +635,27 @@ def self_test() -> int:
         else:
             print(f"PASS: self-test - R5 fenced(): {label}")
 
+    # #5179: the trusted-path diff starts at the merge base, so a trusted change that landed on the base after
+    # the head forked is not charged to the head (every other fixture is linear).
+    work, fork_sha, base_root = fresh_pair("mergebase")
+    repo = work / "repo"
+    (repo / GUARD_REL).write_text("# the base moved on\n", encoding="utf-8")
+    moved_sha = commit_all(repo, "base moves on")
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", fork_sha], check=True)
+    (repo / "docs").mkdir(parents=True, exist_ok=True)
+    (repo / "docs" / "untrusted-note.md").write_text("x\n", encoding="utf-8")
+    head_sha = commit_all(repo, "head change")
+    try:
+        report, failed = compare(base_root, repo, moved_sha, head_sha, work / "scratch", guard.fixture_index_pins())
+    except RuntimeError as exc:
+        report, failed = f"RESULT: FAIL (closed) - {exc}", True
+    if failed or "GUARD CHANGED" in report:
+        print(f"FAIL: self-test - R6 a base-side trusted change after the fork is charged to the head\n{report}",
+              file=sys.stderr)
+        failures.append("merge base")
+    else:
+        print("PASS: self-test - R6 a base-side trusted change after the fork is not charged to the head (#5179)")
+
     def base_claude_symlink(root):
         target = root / "CLAUDE.md"
         target.rename(root / "CLAUDE.real.md")
