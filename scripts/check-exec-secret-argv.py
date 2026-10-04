@@ -183,12 +183,20 @@ _QUOTED_RE = re.compile(r"""'[^']*'|"(?:\\.|[^"\\])*\"""")
 _ARRAY_RE = re.compile(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=\(")
 
 
-def _array_depth(s: str) -> int:
+ARRAY_JOIN_MAX = 400
+
+
+def _strip_line(s: str) -> str:
     t = _QUOTED_RE.sub("", re.sub(r"\\.", "", s))
-    t = re.split(r"(?:^|\s)#", t, 1)[0]
-    if not _ARRAY_RE.search(t):
+    return re.split(r"(?:^|\s)#", t, 1)[0]
+
+
+def _array_depth(parts: List[str]) -> int:
+    """Open-paren depth of a bash array literal spread over physical lines. Each physical
+    line drops its own trailing comment, so a comment cannot hide the closing paren."""
+    if not parts or not _ARRAY_RE.search(_strip_line(parts[0])):
         return 0
-    return t.count("(") - t.count(")")
+    return sum(t.count("(") - t.count(")") for t in map(_strip_line, parts))
 
 
 def join_logical(lines: List[Tuple[int, str]]) -> List[Unit]:
@@ -205,15 +213,18 @@ def join_logical(lines: List[Tuple[int, str]]) -> List[Unit]:
             end = lines[i][0]
             raw2 = lines[i][1]
             buf.append(raw2.rstrip()[:-1] if _backslash_end(raw2) else raw2)
-        depth = _array_depth(" ".join(buf))
+        depth = _array_depth(buf)
         guard = 0
-        while depth > 0 and i + 1 < n and guard < 400:
+        while depth > 0 and i + 1 < n:
             guard += 1
+            if guard > ARRAY_JOIN_MAX:
+                raise RuntimeError("array opened at line %d is not closed within %d lines; refusing to "
+                                   "approve it as one unit" % (start, ARRAY_JOIN_MAX))
             i += 1
             end = lines[i][0]
             raw2 = lines[i][1]
             buf.append(raw2.rstrip()[:-1] if _backslash_end(raw2) else raw2)
-            depth = _array_depth(" ".join(buf))
+            depth = _array_depth(buf)
         out.append((start, end, " ".join(buf)))
         i += 1
     return out
@@ -345,6 +356,17 @@ def deny_lines(dl, rel: str, text: str) -> Dict[int, str]:
     return out
 
 
+# A credential-taking flag of a known tool fed from any expansion: the value is on argv
+# whatever the variable is called, so such a line is never allow-able (pending + issue only).
+CRED_TOOL_RE = re.compile(
+    r"\b(?:mysql|mariadb|mysqladmin|mysqldump)\b[^|;&]*\s-p[\"']?\$"
+    r"|\bsshpass\s+-p\s*[\"']?\$"
+    r"|\bredis-cli\b[^|;&]*\s(?:-a|--pass)\s*[\"']?\$"
+    r"|\b(?:curl|wget)\b[^|;&]*\s(?:-u|--user|--password|--http-password)[\s=]*[\"']?[^\s\"']*\$"
+    r"|\b(?:docker|podman)\s+login\b[^|;&]*\s(?:-p|--password)\b"
+    r"|(?:-H|--header)\s*[\"']?(?:x-api-key|authorization|x-auth-token)\s*:[^\"']*\$")
+
+
 def scan_exec_file(dl, rel: str, text: str) -> Optional[List[Found]]:
     """Triggered logical lines of one executable file, or None when it is not one."""
     if rel in SELF_EXEMPT:
@@ -357,7 +379,7 @@ def scan_exec_file(dl, rel: str, text: str) -> Optional[List[Found]]:
     for start, end, raw in units:
         reasons = trigger_reasons(raw)
         flagged = [deny[k] for k in range(start, end + 1) if k in deny]
-        if flagged:
+        if flagged or CRED_TOOL_RE.search(raw):
             reasons.append("denylist")
         if reasons:
             found.append((start, norm(raw), reasons))
@@ -500,7 +522,7 @@ def scan_prose_file(dl, rel: str, text: str) -> Optional[List[Found]]:
 
 # ---------------------------------------------------------------- list files
 WHY_RE = re.compile(r"^(?:#\d+|reason: \S[^|]*)$")
-PEND_WHY_RE = re.compile(r"^(?:#\d+|reason: \S[^|]*)$")
+PEND_WHY_RE = re.compile(r"^#\d+$")
 
 
 def parse_entries(text: str, label: str, pending: bool, faults: List[str]) -> List[Entry]:
@@ -516,7 +538,7 @@ def parse_entries(text: str, label: str, pending: bool, faults: List[str]) -> Li
         why, rel, cnt, line = parts
         if not (PEND_WHY_RE if pending else WHY_RE).match(why):
             faults.append("%s:%d: bad why %r (want %s)" % (label, no, why[:40],
-                          "#<issue> or 'reason: <text>'"))
+                          "#<issue>" if pending else "#<issue> or 'reason: <text>'"))
             continue
         if not cnt.isdigit() or int(cnt) < 1:
             faults.append("%s:%d: count %r is not a positive integer" % (label, no, cnt))
@@ -602,22 +624,38 @@ def tracked_files(root: Path) -> List[str]:
     return files
 
 
+def read_tracked(root: Path, rel: str) -> Optional[str]:
+    """Text of one tracked file, or None when it is not a regular file (a directory or
+    submodule entry). Anything that cannot be scanned is an error, never a silent skip (#4909):
+    a symlink must resolve inside the tree, an exec or prose file may not exceed MAX_BYTES, and
+    undecodable bytes are read with replacement so every line is still scanned."""
+    p = root / rel
+    low = rel.lower()
+    if p.is_symlink():
+        tgt = p.resolve()
+        if root.resolve() not in tgt.parents or not tgt.is_file():
+            raise RuntimeError("tracked symlink %s points outside the tree or at no file (fail closed)" % rel)
+        p = tgt
+    if not p.is_file():
+        return None
+    raw = p.read_bytes() if p.stat().st_size <= MAX_BYTES else None
+    if raw is None:
+        head = p.open("rb").read(200).decode("utf-8", errors="replace")
+        if low.endswith((".md", ".html", ".htm")) or file_class(rel, head) is not None:
+            raise RuntimeError("%s is over %d bytes and was not scanned (fail closed)" % (rel, MAX_BYTES))
+        return None
+    return raw.decode("utf-8", errors="replace")
+
+
 def scan_repo(root: Path, dl) -> Tuple[Dict[str, List[Found]], int, int]:
     """(found lines by file, exec files scanned, prose files scanned)."""
     found: Dict[str, List[Found]] = {}
     n_exec = n_prose = 0
     for rel in tracked_files(root):
-        p = root / rel
-        low = rel.lower()
-        if not p.is_file() or p.is_symlink():
+        text = read_tracked(root, rel)
+        if text is None:
             continue
-        try:
-            if p.stat().st_size > MAX_BYTES:
-                continue
-            text = p.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
-            continue
-        if low.endswith((".md", ".html", ".htm")):
+        if rel.lower().endswith((".md", ".html", ".htm")):
             res = scan_prose_file(dl, rel, text)
             if res is not None:
                 n_prose += 1
@@ -647,12 +685,48 @@ def check_allow_vs_denylist(found: Dict[str, List[Found]], allow: List[Entry]) -
     return bad
 
 
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(root)] + list(args), check=True, capture_output=True).stdout.decode(
+        "utf-8", "replace")
+
+
+def allow_from_pending(allow: List[Entry], base_pending: List[Entry], changed: Iterable[str]) -> List[str]:
+    """#4919: an allow entry may not approve a (file, line) that was PENDING at the merge base
+    unless the same change also edits the file that holds the line (a code fix, not a list edit)."""
+    moved = set(changed)
+    base = {(e[1], e[3]) for e in base_pending}
+    return ["allow:%d: entry approves a line that was pending at the merge base without a change to %s: %s" % (
+        e[4], e[1], e[3][:80]) for e in allow if (e[1], e[3]) in base and e[1] not in moved]
+
+
+def merge_base_hits(root: Path, allow: List[Entry]) -> List[str]:
+    """Run allow_from_pending against the merge base named by GITHUB_BASE_REF (a pull request)
+    or EXEC_SECRET_ARGV_BASE (any ref). With neither set there is no change to judge. A named
+    base that cannot be resolved is a FAULT (fail closed)."""
+    ref = os.environ.get("EXEC_SECRET_ARGV_BASE", "").strip()
+    if not ref and os.environ.get("GITHUB_BASE_REF", "").strip():
+        ref = "origin/" + os.environ["GITHUB_BASE_REF"].strip()
+    if not ref:
+        return []
+    try:
+        mb = _git(root, "merge-base", "HEAD", ref).strip()
+        changed = [f for f in _git(root, "diff", "--name-only", mb, "HEAD").split("\n") if f]
+        try:
+            old = _git(root, "show", "%s:%s" % (mb, PENDING_FILE))
+        except subprocess.CalledProcessError:
+            old = ""
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError("cannot resolve the merge base against %s (fail closed): %s" % (ref, exc))
+    return allow_from_pending(allow, parse_entries(old, "base-pending", False, []), changed)
+
+
 def run(root: Path) -> int:
     try:
         dl = load_denylist(root)
         found, n_exec, n_prose = scan_repo(root, dl)
         allow, pend, faults = load_lists(root)
-    except (OSError, RuntimeError, subprocess.CalledProcessError, UnicodeDecodeError, SyntaxError) as exc:
+        base_hits = merge_base_hits(root, allow)
+    except Exception as exc:  # noqa: BLE001 - fail closed
         print("FAULT: %s" % exc, file=sys.stderr)
         return 2
     if n_exec == 0:
@@ -666,6 +740,7 @@ def run(root: Path) -> int:
         return 2
     hits, report, stats = judge(found, allow, pend, dl)
     hits.extend(check_allow_vs_denylist(found, allow))
+    hits.extend(base_hits)
     for line in report:
         print(line)
     if hits:
@@ -793,6 +868,75 @@ def _mutate(text: str, start: int, end: int) -> str:
     return "\n".join(phys)
 
 
+def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
+    """Fail-closed cases of the gate itself (#4901, #4909, #4919, #4920, #4922). Returns
+    (failures, case count)."""
+    import tempfile
+    bad: List[str] = []
+    n = 0
+    # #4901: a comment inside an array does not hide the closing paren; a runaway array is a fault
+    n += 1
+    units = join_logical(_numbered('A=(\n  a # (note\n  b\n)\ncurl -H "X-API-Key: $K" h\n'))
+    if units[0][:2] != (1, 4) or units[1][0] != 5:
+        bad.append("array with an inline comment did not close at its own paren (#4901)")
+    n += 1
+    try:
+        join_logical(_numbered("A=(\n" + "x # (\n" * (ARRAY_JOIN_MAX + 5)))
+        bad.append("a runaway array was joined without a fault (#4901)")
+    except RuntimeError:
+        pass
+    # #4919: an allow entry for a line that was pending at the base needs a change to its file
+    n += 2
+    ent = [("reason: r", "a.sh", 1, "x --token $T", 1)]
+    if not allow_from_pending(ent, [("#1", "a.sh", 1, "x --token $T", 1)], ["scripts/other.sh"]):
+        bad.append("an allow entry for a pending line passed with no change to its file (#4919)")
+    if allow_from_pending(ent, [("#1", "a.sh", 1, "x --token $T", 1)], ["a.sh"]):
+        bad.append("an allow entry for a pending line was refused although its file changed (#4919)")
+    # #4920: credential flags fed from a variable are denylist-tagged, so never allow-able
+    for label, line in (("mysql -p", 'mysql -u r -p"$X" db'), ("sshpass -p", 'sshpass -p "$X" ssh h'),
+                        ("redis-cli -a", 'redis-cli -a "$X" ping'), ("curl -u", 'curl -u "u:$X" h'),
+                        ("curl -u neutral", 'curl -u u:$X h')):
+        n += 1
+        res = scan_exec_file(dl, "c.sh", "#!/bin/bash\n%s\n" % line) or []
+        if not any("denylist" in r[2] for r in res):
+            bad.append("%s fed from a variable is not tagged denylist (#4920)" % label)
+        elif not check_allow_vs_denylist({"c.sh": res}, [("reason: r", "c.sh", 1, norm(line), 1)]):
+            bad.append("%s fed from a variable could be allowed (#4920)" % label)
+    # #4922 and #4909: scratch roots under the checkout's .local-runs
+    scratch = root / ".local-runs"
+    scratch.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=str(scratch)) as td:
+        t = Path(td)
+        (t / "scripts").mkdir()
+        (t / "scripts" / "check-docs-no-argv-secrets.py").write_text("raise ValueError('boom')\n")
+        n += 1
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = run(t)
+        if rc != 2:
+            bad.append("a non-listed exception in the denylist import exited %r, not 2 (#4922)" % rc)
+        (t / "big.sh").write_bytes(b"#!/bin/bash\n" + b"#" * (MAX_BYTES + 1))
+        (t / "bad.sh").write_bytes(b"#!/bin/bash\n\xff\xfe curl -H 'x-api-key: $K' h\n")
+        (t / "real.sh").write_text("#!/bin/bash\ntrue\n")
+        os.symlink("/etc/hostname", str(t / "out.sh"))
+        os.symlink("real.sh", str(t / "in.sh"))
+        n += 4
+        try:
+            read_tracked(t, "big.sh")
+            bad.append("an over-size .sh was skipped without a fault (#4909)")
+        except RuntimeError:
+            pass
+        if "x-api-key" not in (read_tracked(t, "bad.sh") or ""):
+            bad.append("a non-UTF-8 .sh was not read (#4909)")
+        try:
+            read_tracked(t, "out.sh")
+            bad.append("a symlink out of the tree was skipped without a fault (#4909)")
+        except RuntimeError:
+            pass
+        if read_tracked(t, "in.sh") != "#!/bin/bash\ntrue\n":
+            bad.append("a symlink inside the tree was not followed (#4909)")
+    return bad, n
+
+
 def self_test(root: Path) -> int:
     dl = load_denylist(root)
     bad: List[str] = []
@@ -844,6 +988,7 @@ def self_test(root: Path) -> int:
             ("malformed", "reason: r | a.sh | 1", False), ("bad why", "ok | a.sh | 1 | x", False),
             ("zero count", "reason: r | a.sh | 0 | x", False), ("not normalised", "reason: r | a.sh | 1 | x  y", False),
             ("pending with bad why", "baseline | a.sh | 1 | x", True),
+            ("pending with a reason and no issue", "reason: r | a.sh | 1 | x", True),
             ("duplicate", "reason: r | a.sh | 1 | x\nreason: r | a.sh | 1 | x", False)):
         faults: List[str] = []
         parse_entries(body, "t", pend, faults)
@@ -893,12 +1038,14 @@ def self_test(root: Path) -> int:
     # regen refusal cases
     regen_bad, regen_n = regen_cases(root)
     bad.extend(regen_bad)
+    hard_bad, hard_n = hardening_cases(root, dl)
+    bad.extend(hard_bad)
     if bad:
         print("\n".join("SELF-TEST FAIL: " + b for b in bad), file=sys.stderr)
         return 1
     print("SELF-TEST PASS: %d red probes flagged, %d green probes clean, %d allowed forms approved and "
           "red when changed, %d of %d allow and pending entry mutations red, %d regen refusal cases, "
-          "mistyped argument exits 2" % (red, green, allowed, mut_ok, mut_n, regen_n))
+          "%d gate hardening cases, mistyped argument exits 2" % (red, green, allowed, mut_ok, mut_n, regen_n, hard_n))
     return 0
 
 
@@ -934,8 +1081,8 @@ def main(argv: List[str]) -> int:
                     print("%s:%d [%s] %s" % (rel, start, ",".join(reasons[:3]), dl.redact(text)))
             return 0
         return run(root)
-    except (OSError, RuntimeError, subprocess.CalledProcessError, UnicodeDecodeError, SyntaxError) as exc:
-        print("FAULT: %s" % exc, file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - every failure of the gate itself fails closed
+        print("FAULT: %s: %s" % (type(exc).__name__, exc), file=sys.stderr)
         return 2
 
 

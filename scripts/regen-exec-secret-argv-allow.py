@@ -77,8 +77,8 @@ def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, p
          why: Optional[str], prune: bool, match: Optional[str] = None) -> Tuple[int, List[Entry], List[Entry], List[str]]:
     """Pure core. Returns (exit code, new allow, new pending, messages)."""
     msgs: List[str] = []
-    if accept_new and (why is None or not gate.PEND_WHY_RE.match(why)):
-        return 2, allow, pend, ["--accept-new needs --why '#<issue>' or --why 'reason: <text>'"]
+    if accept_new and (why is None or not (gate.PEND_WHY_RE if pending else gate.WHY_RE).match(why)):
+        return 2, allow, pend, ["--accept-new needs --why '#<issue>' (pending: an issue number only) or --why 'reason: <text>'"]
     if pending and not accept_new:
         return 2, allow, pend, ["--pending only works with --accept-new"]
     amap: Dict[Tuple[str, str], Entry] = {(e[1], e[3]): e for e in allow}
@@ -107,6 +107,11 @@ def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, p
                 rc = 1
                 msgs.append("STALE entry (file has %d of %d): %s | %s" % (have, listed, e[1], e[3][:80]))
     # new lines
+    if accept_new and match is None:
+        fresh = [k for k, v in occ.items() if len(v) > (amap[k][2] if k in amap else 0) + (pmap[k][2] if k in pmap else 0)]
+        if len(fresh) > 1:
+            return 2, allow, pend, ["--accept-new would take %d new keys at once; pass --match <regex> so each "
+                                    "addition is chosen (#4921)" % len(fresh)]
     for key, lines in sorted(occ.items()):
         rel, text = key
         listed = (amap[key][2] if key in amap else 0) + (pmap[key][2] if key in pmap else 0)
@@ -130,7 +135,9 @@ def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, p
         tgt = pmap if pending else amap
         if key in tgt:
             e = tgt[key]
-            tgt[key] = (e[0], e[1], e[2] + len(extra), e[3], e[4])
+            tgt[key] = (why or e[0], e[1], e[2] + len(extra), e[3], e[4])
+            msgs.append("BUMP %s %s: %d -> %d, reason now %r (was %r)" % (
+                "pending" if pending else "allow", rel, e[2], e[2] + len(extra), why, e[0]))
         else:
             tgt[key] = (why or "", rel, len(extra), text, 0)
         for ln in extra:
@@ -139,7 +146,7 @@ def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, p
 
 
 # ---------------------------------------------------------------- refusal cases
-REFUSAL_CASE_COUNT = 9
+REFUSAL_CASE_COUNT = 11
 
 
 def _f(gate, rel: str, line: str, flagged: bool = False):
@@ -182,6 +189,15 @@ def refusal_cases(root: Path) -> List[str]:
         rc2, na2, _p2, _m2 = plan(gate, base, na, [], False, False, None, False)
         if rc2 != 0 or render(ALLOW_HEAD, na2) != t1:
             bad.append("regen: a second run changed the output (not idempotent)")
+    # #4921: a bump takes the new reason, and a bulk accept needs --match
+    base2 = {"x.sh": base["x.sh"] * 2}
+    rc, na, _np, msgs = plan(gate, base2, allowed, [], True, False, "reason: second site", False)
+    if rc != 0 or not na or na[0][0] != "reason: second site" or not any(m.startswith("BUMP") for m in msgs):
+        bad.append("regen: a count bump kept the old reason (#4921)")
+    many = {"x.sh": [(3, gate.norm(a_line), ["assign:PW"]), (4, "tool --token $T", ["assign:T"])]}
+    rc, na, _np, _m = plan(gate, many, [], [], True, False, "reason: r", False)
+    if rc != 2 or na:
+        bad.append("regen: --accept-new without --match took several new keys at once (#4921)")
     return bad
 
 
