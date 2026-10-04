@@ -161,7 +161,6 @@ fn schema_init_4611_flag_disagreeing_with_a_channel_is_refused() {
     assert!(tmp.path().join("r-flag.db").exists());
 }
 
-
 /// #2444 precedent: an explicit `--store-url` that disagrees with the env or
 /// file channel is REFUSED; schema-init never initialises a store the operator
 /// did not name, and the refusal never echoes a password.
@@ -203,10 +202,7 @@ fn schema_init_4600_flag_disagreeing_with_env_or_file_refused() {
         .clone();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("ambiguous store"), "{stderr}");
-    assert!(
-        !stderr.contains(secret),
-        "password echoed: {stderr}"
-    );
+    assert!(!stderr.contains(secret), "password echoed: {stderr}");
 }
 
 #[test]
