@@ -797,6 +797,17 @@ def _segments(line, name_re):
     return out
 
 
+def wrapper_names(text):
+    """#5360: functions whose body calls a node channel or another such function (fixed point)."""
+    wrappers = []
+    while True:
+        rx = r"(?<![\w$/.-])(?:%s)(?![\w-])" % "|".join(list(TAINT_SOURCES) + wrappers)
+        wrap = {f for _, line, f in logical_lines(text) if f and f not in TAINT_SOURCES and f not in wrappers and re.search(rx, line)}
+        if not wrap:
+            return set(wrappers)
+        wrappers += sorted(wrap)
+
+
 def tainted_names(text):
     """Variables that hold a node-derived value: assigned (=, +=, read, mapfile, readarray, for, printf -v)
     from a node channel or from such a variable (#5236)."""
@@ -814,13 +825,7 @@ def tainted_names(text):
             assigns.append((m.group(1), m.group(2)))
     # #5360: a function whose body calls a source is a source (to a fixed point), so a wrapper such as
     # node_get is followed without being listed. A wrapper counts only where it is a command word.
-    sources, wrappers = list(TAINT_SOURCES), []
-    while True:
-        rx = r"(?<![\w$/.-])(?:%s)(?![\w-])" % "|".join(sources + wrappers)
-        wrap = {f for _, line, f in logical_lines(text) if f and f not in sources + wrappers and re.search(rx, line)}
-        if not wrap:
-            break
-        wrappers += sorted(wrap)
+    sources, wrappers = list(TAINT_SOURCES), sorted(wrapper_names(text))
     src_rx = r"(?<![\w$-])(?:%s)(?![\w-])" % "|".join(sources)
     wrap_rx = r"(?:^|[\s;(&|{`])(?:%s)(?=[\s;)&|}]|$)" % "|".join(wrappers or ["\\0"])
     names = set()
@@ -856,6 +861,71 @@ def heredoc_findings(text, names):
             if hit:
                 bad.append("%d:%s<<:%s" % (i + 1, m.group(1), ",".join(sorted(hit))))
         i = j + 1
+    return bad
+
+
+# #5361: commands that may take a node-derived argument. Test builtins and filters read their input and
+# print nothing of it; the node channels and their wrappers send it to a node.
+SILENT_CONSUMERS = frozenset(("[", "[[", "test", "case", "for", "local", "return", "exit", "true", "false", ":",
+                              "grep", "sed", "seq", "shift", "unset", "wc", "tr", "export", "readonly", "plain_id"))
+KEYWORDS = r"(?:(?:if|then|elif|else|while|until|do|time|!)\s+)*"
+
+
+def command_segments(line):
+    """Simple-command texts of a logical line, split at ; | & ( ) { } backticks and $( (also inside double
+    quotes); the text of a quoted message stays with its command (#5361)."""
+    segs, cur, stack, i = [], "", [], 0   # stack holds "'" or '"' or "$(" contexts
+    while i < len(line):
+        c = line[i]
+        if c == "\\":
+            cur += line[i:i + 2]
+            i += 2
+            continue
+        top = stack[-1] if stack else None
+        if top == "'":
+            if c == "'":
+                stack.pop()
+            cur += c
+        elif line.startswith("$(", i) and not line.startswith("$((", i):
+            segs.append(cur)
+            cur, i = "", i + 1
+            stack.append("$(")
+        elif top == '"':
+            if c == '"':
+                stack.pop()
+            cur += c
+        elif c == "'":
+            stack.append("'")
+            cur += c
+        elif c == '"':
+            stack.append('"')
+            cur += c
+        elif c in ";|&(){}`":
+            if c == ")" and stack and stack[-1] == "$(":
+                stack.pop()
+            segs.append(cur)
+            cur = ""
+        else:
+            cur += c
+        i += 1
+    segs.append(cur)
+    return [s for s in segs if s.strip()]
+
+
+def consumer_findings(text, names):
+    """#5361: a command outside SINKS and the silent consumers that names a node-derived variable."""
+    bad = []
+    known = set(SILENT_CONSUMERS) | set(SINKS) | set(TAINT_SOURCES) | set(ALLOWED) | wrapper_names(text)
+    for n, line, func in logical_lines(text):
+        if func in ALLOWED or re.match(r"^\s*(?:ok|no|die)\(\) \{", line):
+            continue
+        for seg in command_segments(line):
+            body = re.sub(KEYWORDS, "", seg.lstrip())
+            body = re.sub(r"^(?:\w+\+?=(?:\"[^\"]*\"|'[^']*'|\S*)\s*)+", "", body)
+            hit = [v for v in names if re.search(r"\$\{?[#!]?%s\b" % re.escape(v), body)]
+            word = body.split(None, 1)[0] if body.split() else ""
+            if hit and word and word not in known and not re.match(r"^\w+\+?=", word):
+                bad.append("%d:%s:%s" % (n, word, ",".join(sorted(hit))))
     return bad
 
 
@@ -895,6 +965,7 @@ def taint_findings(text, names):
             if hit:
                 bad.append("%d:%s:%s" % (n, cmd, ",".join(sorted(hit))))
     bad += heredoc_findings(text, names)
+    bad += consumer_findings(text, names)
     return bad, checked
 
 
@@ -976,7 +1047,14 @@ def closed_world_taint(fs):
                         ("a printf %b of a reply", "printf '%b\\n' \"$resp\""),
                         ("an echo inside an if", 'if true; then echo "$lvl"; fi'),
                         ("a reply-derived helper argument", 'no "x $(reply_len "${qjson:0:64}")"'),
-                        ("a file read in a failure line", 'no "x $(cat "$OUT_DIR/$pub")"')):
+                        ("a file read in a failure line", 'no "x $(cat "$OUT_DIR/$pub")"'),
+                        # #5361: a reply handed to a command outside SINKS.
+                        ("jq with the reply as an argument", "jq -rn --arg x \"$qjson\" '$x'"),
+                        ("awk with the reply as a variable", "awk -v x=\"$qjson\" 'BEGIN{print x}'"),
+                        ("logger with the reply", 'logger "$qjson"'),
+                        ("an unknown command in a capture", 'z="$(frobnicate "$qjson")"'),
+                        ("an unknown command after an if", 'if true; then frobnicate "$qjson"; fi'),
+                        ("an unknown command after an assignment", 'v=1 frobnicate "$qjson"')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
         probe("V1 closed-world negative control is flagged: %s" % label, len(b2) > len(bad), str(b2[len(bad):][:2]))
     # #5236: constructs a name-based scan cannot follow are not allowed in federate.sh at all.
