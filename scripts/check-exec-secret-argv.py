@@ -106,7 +106,8 @@ def load_denylist(root: Path):
 # ---------------------------------------------------------------- secret names
 SEGMENT_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
 STRONG = ("password", "passwd", "passphrase", "secret", "token", "credential", "bearer", "apikey")
-EXACT_SEGMENTS = {"pass", "pw", "pwd", "dbpw", "pgpass", "auth", "oauth", "key", "keys", "cred", "creds"}
+EXACT_SEGMENTS = {"pass", "pw", "pwd", "dbpw", "pgpass", "auth", "oauth", "key", "keys", "cred", "creds",
+                  "hmac", "psk", "jwt", "otp", "totp", "hotp", "apikey", "secretid"}
 SUFFIXES = ("key", "pass", "pw", "pwd", "auth")
 
 
@@ -121,7 +122,9 @@ def secret_name(name: str) -> bool:
     segment is a plain noun that cannot hold a secret (KEY_DIR, KEY_ID, TOKEN_COUNT) is not."""
     segs = SEGMENT_RE.findall(name)
     if segs and segs[-1].lower() in NOUN_SEGMENTS and len(segs) > 1:
-        return False
+        # SECRET_ID is the vault approle secret, not an identifier of a secret (#4925)
+        if not (segs[-1].lower() == "id" and segs[-2].lower() == "secret"):
+            return False
     low = [x.lower() for x in segs]
     for i, s in enumerate(low):
         # a connection string can embed a password (#4808): DSN, or a URL/URI of a data store
@@ -129,7 +132,7 @@ def secret_name(name: str) -> bool:
             return True
     for seg in segs:
         s = seg.lower()
-        if s.startswith("pub"):
+        if s in ("pub", "public", "pubkey", "publickey"):
             return False
         if s in EXACT_SEGMENTS or any(w in s for w in STRONG):
             return True
@@ -144,13 +147,32 @@ BARE_RE = re.compile(r"(?<![\w$.\-/{])([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*)(?![\w=\-/}
 FLAG_RE = re.compile(r"(?<![\w$./\-])--?([A-Za-z][A-Za-z0-9_\-]*)")
 HEADER_RE = re.compile(
     r"\bauthorization\s*:|\bbearer\b|\bx-auth[\w-]*\s*:|\bproxy-authorization|\bapi[-_]?key\b|"
-    r"\bpassword\s+['\"$\\]|\bidentified\s+by\b|\$\{\{\s*(?:secrets\.|github\.token)", re.I)
+    r"\bpassword\s+['\"$\\]|\bidentified\s+by\b|\$\{\{\s*(?:secrets\.|github\.token|toJSON\(\s*secrets)|"
+    r"(?:-H|--header)[\s=]*[\"']?[\w-]*(?:token|secret|passw\w*|credential|cookie|api[-_]?key)[\w-]*\s*:|"
+    r"\bcookie\s*:", re.I)
+# A command substitution that reads a secret file or runs a secret-printing command puts the
+# value on argv whatever the flag or variable is called (#4924).
+SUBST_RE = re.compile(
+    r"(?:\$\(|`)\s*(?:"
+    r"(?:(?:cat|head|tail|base64|xxd|tr|sed|awk|strings)\b|<)[^)`]*?[\s<]\s*[\"']?[^\s\"')`]*"
+    r"(?:\.(?:key|pgpass|netrc|pw|pass|passwd|password|passphrase|token|secret|secrets)|\bid_(?:rsa|ed25519|ecdsa|dsa)"
+    r"|/run/secrets/|/secrets?/)(?![\w.\-])"
+    r"|gh\s+auth\s+token|vault\s+(?:read|kv\s+get)|[\w-]*get-login-password|[\w-]*get-secret-value|"
+    r"pass\s+show|op\s+read|security\s+find-(?:generic|internet)-password|"
+    r"[\w\s]*print-(?:access|identity)-token|[\w\s]*get-access-token|kubectl\s+get\s+secret|"
+    r"[\w\s]*ssm\s+get-parameter)", re.I)
+# A JSON request body carrying a credential literal on a -d/--data/--json argument (#4925).
+JSONBODY_RE = re.compile(
+    r"(?:\s-d|--data(?:-raw|-binary|-urlencode)?|--json)\b[^|;&]*?"
+    r"\\?[\"']\s*(?:password|passwd|secret|token|api[-_]?key|access[-_]?token|client[-_]?secret|private[-_]?key)"
+    r"\s*\\?[\"']\s*:", re.I)
+MAKEVAR_RE = re.compile(r"\$\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)")
 PATH_RE = re.compile(
     r"/run/secrets|/secrets?/|\.(?:pw|pass|passwd|password|passphrase|token|secret|secrets)\b|"
     r"_pw_?file|\bpw[-_]?file|(?:passw\w*|passphrase|secret|token|credential)[-_.]?(?:file|path)\b", re.I)
 
 
-def trigger_reasons(text: str) -> List[str]:
+def trigger_reasons(text: str, make: bool = False) -> List[str]:
     """Why a logical line is triggered (secret-like name as assignment, flag, expansion,
     header or secret path). Empty when it is not."""
     out: List[str] = []
@@ -164,8 +186,16 @@ def trigger_reasons(text: str) -> List[str]:
         if secret_name(m.group(1)):
             out.append("expand:" + m.group(1))
     for m in BARE_RE.finditer(text):
-        if m.group(1) not in ("PASS", "AUTH", "KEY", "KEYS") and secret_name(m.group(1)):
+        if m.group(1) not in ("PASS", "AUTH", "KEY", "KEYS", "HMAC", "JWT", "OTP", "PSK") and secret_name(m.group(1)):
             out.append("word:" + m.group(1))
+    if make:
+        for m in MAKEVAR_RE.finditer(text):
+            if secret_name(m.group(1)):
+                out.append("make:" + m.group(1))
+    if SUBST_RE.search(text):
+        out.append("subst-secret")
+    if JSONBODY_RE.search(text):
+        out.append("json-secret")
     if HEADER_RE.search(text):
         out.append("header")
     if PATH_RE.search(text):
@@ -174,9 +204,13 @@ def trigger_reasons(text: str) -> List[str]:
 
 
 # ---------------------------------------------------------------- logical units
-def _backslash_end(raw: str) -> bool:
+def _cont_end(raw: str, ch: str = "\\") -> bool:
     s = raw.rstrip()
-    return s.endswith("\\") and not s.endswith("\\\\")
+    return s.endswith(ch) and not s.endswith(ch + ch)
+
+
+def _backslash_end(raw: str) -> bool:
+    return _cont_end(raw, "\\")
 
 
 _QUOTED_RE = re.compile(r"""'[^']*'|"(?:\\.|[^"\\])*\"""")
@@ -199,21 +233,36 @@ def _array_depth(parts: List[str]) -> int:
     return sum(t.count("(") - t.count(")") for t in map(_strip_line, parts))
 
 
-def join_logical(lines: List[Tuple[int, str]]) -> List[Unit]:
-    """Join backslash continuations and a bash array spread over lines into one unit."""
+def _is_comment(raw: str) -> bool:
+    return raw.lstrip().startswith("#")
+
+
+def join_logical(lines: List[Tuple[int, str]], cont: str = "\\", comments_continue: bool = False) -> List[Unit]:
+    """Join continuations and a bash array spread over lines into one unit.
+
+    A continuation is removed with no separator (the shell deletes backslash-newline, so a flag
+    or header name split across lines is one word, #4926). A whole comment line is never
+    continued (#4903); Make is the exception because GNU make continues a comment."""
+    def piece(raw: str) -> str:
+        return raw.rstrip()[:-1] if _cont_end(raw, cont) else raw
+
+    def continues(raw: str) -> bool:
+        return _cont_end(raw, cont) and (comments_continue or not _is_comment(raw))
+
     out: List[Unit] = []
     i = 0
     n = len(lines)
     while i < n:
         start, raw = lines[i]
-        buf = [raw.rstrip()[:-1] if _backslash_end(raw) else raw]
+        phys = [piece(raw)]
+        text = phys[0]
         end = start
-        while _backslash_end(lines[i][1]) and i + 1 < n:
+        while continues(lines[i][1]) and i + 1 < n:
             i += 1
             end = lines[i][0]
-            raw2 = lines[i][1]
-            buf.append(raw2.rstrip()[:-1] if _backslash_end(raw2) else raw2)
-        depth = _array_depth(buf)
+            phys.append(piece(lines[i][1]))
+            text += phys[-1]
+        depth = _array_depth(phys) if cont == "\\" else 0
         guard = 0
         while depth > 0 and i + 1 < n:
             guard += 1
@@ -222,10 +271,10 @@ def join_logical(lines: List[Tuple[int, str]]) -> List[Unit]:
                                    "approve it as one unit" % (start, ARRAY_JOIN_MAX))
             i += 1
             end = lines[i][0]
-            raw2 = lines[i][1]
-            buf.append(raw2.rstrip()[:-1] if _backslash_end(raw2) else raw2)
-            depth = _array_depth(buf)
-        out.append((start, end, " ".join(buf)))
+            phys.append(piece(lines[i][1]))
+            text += " " + phys[-1]
+            depth = _array_depth(phys)
+        out.append((start, end, text))
         i += 1
     return out
 
@@ -238,59 +287,91 @@ def _indent(s: str) -> int:
     return len(s) - len(s.lstrip())
 
 
-def workflow_units(text: str) -> List[Unit]:
+_ANCHOR_RE = re.compile(r"&[A-Za-z_][\w\-]*(?:\s+(.*))?$")
+_BLOCK_START = ("|", ">")
+
+
+def yaml_value_units(text: str, keys: Tuple[str, ...], anchors: bool = True) -> List[Unit]:
+    """Values of the given YAML keys, as logical units. Covers `key :` with any spacing, a key
+    inside a flow mapping or after `- `, block scalars, plain multi-line scalars (every line
+    indented deeper than the key, #4905), and anchor definitions (`&name value`) wherever they
+    sit, so an alias cannot carry a command the key-scan never saw (#4927)."""
     lines = text.split("\n")
+    key_re = re.compile(r"(?:^|(?<=[\s{,\-]))(?:%s)\s*:(?:\s+(.*))?$" % "|".join(keys))
     out: List[Unit] = []
     i = 0
     while i < len(lines):
-        m = re.match(r"^(\s*)(?:-\s+)?run:\s*(.*)$", lines[i])
-        if not m:
+        raw = lines[i]
+        stripped = raw.split(" #", 1)[0] if not raw.lstrip().startswith("#") else ""
+        m = key_re.search(stripped) if stripped else None
+        kind = "key"
+        if m is None and anchors and stripped:
+            m = _ANCHOR_RE.search(stripped)
+            kind = "anchor"
+        if m is None:
             i += 1
             continue
-        ind = len(m.group(1))
-        rest = m.group(2).strip()
-        if rest and rest[0] not in "|>":
-            out.extend(join_logical([(i + 1, rest)]))
-            i += 1
-            continue
-        j = i + 1
+        keycol = m.start() if kind == "key" else _indent(raw)
+        rest = raw[m.start(1):].strip() if m.group(1) else ""
         block: List[Tuple[int, str]] = []
-        while j < len(lines) and (not lines[j].strip() or _indent(lines[j]) > ind):
+        if rest and rest[0] not in _BLOCK_START:
+            block.append((i + 1, rest))
+        j = i + 1
+        seq_ok = rest == "" or rest[0] in _BLOCK_START
+        while j < len(lines) and (not lines[j].strip() or _indent(lines[j]) > keycol or (
+                seq_ok and _indent(lines[j]) == keycol and lines[j].lstrip().startswith("- "))):
             block.append((j + 1, lines[j]))
             j += 1
         out.extend(join_logical(block))
         i = j
     return out
+
+
+def workflow_units(text: str) -> List[Unit]:
+    return yaml_value_units(text, ("run", "options", "args"))
 
 
 def compose_units(text: str) -> List[Unit]:
-    lines = text.split("\n")
-    out: List[Unit] = []
-    i = 0
-    while i < len(lines):
-        m = re.match(r"^(\s*)(?:-\s+)?(command|entrypoint|test):\s*(.*)$", lines[i])
-        if not m:
-            i += 1
-            continue
-        ind = len(m.group(1))
-        block: List[Tuple[int, str]] = []
-        if m.group(3).strip() and m.group(3).strip() not in ("|", ">", "|-", ">-"):
-            block.append((i + 1, m.group(3)))
-        j = i + 1
-        while j < len(lines) and (not lines[j].strip() or _indent(lines[j]) > ind):
-            block.append((j + 1, lines[j]))
-            j += 1
-        out.extend(join_logical(block))
-        i = j
-    return out
+    return yaml_value_units(text, ("command", "entrypoint", "test", "args"))
+
+
+_ESCAPE_RE = re.compile(r"^\s*#\s*escape\s*=\s*(\S)\s*$", re.I)
+_HEREDOC_RE = re.compile(r"<<-?\s*[\"']?([A-Za-z_]\w*)[\"']?")
+_DOCKER_INSTR_RE = re.compile(r"\s*(?:ONBUILD\s+)?(RUN|CMD|ENTRYPOINT|HEALTHCHECK)\b(.*)$", re.I | re.S)
 
 
 def dockerfile_units(text: str) -> List[Unit]:
-    out: List[Unit] = []
-    for start, end, t in join_logical(_numbered(text)):
-        m = re.match(r"\s*(RUN|CMD|ENTRYPOINT|HEALTHCHECK)\b(.*)$", t, re.I | re.S)
+    lines = _numbered(text)
+    cont = "\\"
+    for _n, raw in lines:
+        if not raw.strip():
+            continue
+        m = _ESCAPE_RE.match(raw)
         if m:
-            out.append((start, end, m.group(2)))
+            cont = m.group(1)
+            continue
+        if not _is_comment(raw):
+            break
+    out: List[Unit] = []
+    units = join_logical(lines, cont)
+    by_start = {u[0]: u for u in units}
+    k = 0
+    while k < len(units):
+        start, end, t = units[k]
+        m = _DOCKER_INSTR_RE.match(t)
+        k += 1
+        if not m:
+            continue
+        out.append((start, end, m.group(2)))
+        for h in _HEREDOC_RE.finditer(m.group(2)):
+            word = h.group(1)
+            body: List[Tuple[int, str]] = []
+            while k < len(units) and units[k][2].strip() != word:
+                body.append((units[k][0], units[k][2]))
+                k += 1
+            out.extend(join_logical(body))
+            k += 1
+    del by_start
     return out
 
 
@@ -298,27 +379,118 @@ def service_units(text: str) -> List[Unit]:
     return [u for u in join_logical(_numbered(text)) if re.match(r"\s*Exec\w*=", u[2])]
 
 
+_RECIPEPREFIX_RE = re.compile(r"^\s*\.RECIPEPREFIX\s*:?=\s*(\S)?\s*$")
+
+
 def make_units(text: str) -> List[Unit]:
-    return [u for u in join_logical(_numbered(text)) if u[2].startswith("\t")]
+    prefix = "\t"
+    for raw in text.split("\n"):
+        m = _RECIPEPREFIX_RE.match(raw)
+        if m:
+            prefix = m.group(1) or "\t"
+            break
+    return [u for u in join_logical(_numbered(text), comments_continue=True) if u[2].startswith(prefix)]
+
+
+_PY_CALL_RE = re.compile(
+    r"\b(?:subprocess\.(?:run|Popen|call|check_call|check_output|getoutput|getstatusoutput)|Popen|check_output|"
+    r"check_call|os\.(?:system|popen|exec\w*|spawn\w*)|asyncio\.create_subprocess_(?:exec|shell))\s*\(")
+_PY_ARGV_RE = re.compile(r"^\s*[A-Za-z_]\w*(?:cmd|argv|args|command|cmdline)\w*\s*(?::[^=]+)?=\s*[\[(]", re.I)
+PY_UNIT_MAX = 120
+
+
+def _bracket_delta(s: str) -> int:
+    t = _QUOTED_RE.sub("", re.sub(r"\\.", "", s))
+    t = re.split(r"(?:^|\s)#", t, 1)[0]
+    return sum(t.count(c) for c in "([{") - sum(t.count(c) for c in ")]}")
+
+
+def _call_units(text: str, call_re, argv_re) -> List[Unit]:
+    lines = text.split("\n")
+    out: List[Unit] = []
+    for i, raw in enumerate(lines):
+        m = call_re.search(raw) or (argv_re.match(raw) if argv_re is not None else None)
+        if not m:
+            continue
+        depth = 0
+        buf: List[str] = []
+        j = i
+        while j < len(lines):
+            buf.append(lines[j].strip())
+            depth += _bracket_delta(lines[j])
+            if depth <= 0:
+                break
+            j += 1
+            if j - i > PY_UNIT_MAX:
+                raise RuntimeError("call at line %d is not closed within %d lines (fail closed)" %
+                                   (i + 1, PY_UNIT_MAX))
+        out.append((i + 1, j + 1, " ".join(buf)))
+    return out
+
+
+def python_units(text: str) -> List[Unit]:
+    """Every subprocess/os.system call and every argv-named list assignment, joined to its
+    closing bracket, so a credential on a Python argv is read like one on a shell line."""
+    return _call_units(text, _PY_CALL_RE, _PY_ARGV_RE)
+
+
+_JS_CALL_RE = re.compile(r"\b(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork)\s*\(")
+
+
+def node_units(text: str) -> List[Unit]:
+    """child_process calls of a JavaScript file, joined to the closing bracket."""
+    return _call_units(text, _JS_CALL_RE, None)
+
+
+# Extensionless tracked files that are data, not scripts. Every other extensionless file is
+# read as a shell script, because a script needs no suffix and no shebang to run (#4923).
+NONCODE_NAMES = {"LICENSE", "NOTICE", "CODEOWNERS", "changelog", "control", "copyright", "format",
+                 "SHA256SUMS", "COPYING", "AUTHORS", "VERSION", "MAINTAINERS", "OWNERS", "Cargo.lock"}
+
+_SYSTEMD_SUFFIXES = (".service", ".socket", ".timer", ".path", ".mount", ".automount", ".swap", ".target",
+                     ".service.in", ".socket.in", ".timer.in", ".path.in")
+_SH_SUFFIXES = (".sh", ".bash", ".zsh", ".ksh", ".bats", ".sh.in", ".bash.in", ".zsh.in")
+_CLOUD_INIT_MEMORY_RE = re.compile(r"^infra/[^/]+/cloud-init-memory[^/]*\.tpl$")
+
+
+def _systemd_dropin(lowrel: str) -> bool:
+    """x.service.d/override.conf: a drop-in directory named after a systemd unit."""
+    parent = lowrel.split("/")[-2] if lowrel.count("/") else ""
+    return parent.endswith(".d") and parent[:-2].endswith(_SYSTEMD_SUFFIXES)
 
 
 def file_class(rel: str, head: str) -> Optional[str]:
     base = os.path.basename(rel)
     low = base.lower()
-    if low.startswith(("dockerfile", "containerfile")) or low.endswith(".dockerfile"):
-        return "dockerfile"
-    if "compose" in low and low.endswith((".yml", ".yaml")):
-        return "compose"
-    if rel.startswith((".github/workflows/", ".github/actions/")) and low.endswith((".yml", ".yaml")):
+    lowrel = rel.lower()
+    # path first: a workflow named compose-*.yml or dockerfile-*.yml is still a workflow (#4907)
+    if lowrel.startswith((".github/workflows/", ".github/actions/")) and low.endswith((".yml", ".yaml")):
         return "workflow"
-    ext = os.path.splitext(base)[1].lower()
-    if ext in (".sh", ".bash"):
+    if low.startswith(("dockerfile", "containerfile")) or low.endswith((".dockerfile", ".containerfile")):
+        return "dockerfile"
+    if low.endswith((".yml", ".yaml")) and ("compose" in low or low.startswith("stack")):
+        return "compose"
+    if low.endswith((".yml", ".yaml", ".yml.in", ".yaml.in", ".yml.tpl", ".yaml.tpl")):
+        if _CLOUD_INIT_MEMORY_RE.match(rel):
+            return None
+        return "compose" if not low.endswith(".tpl") else "shell"
+    if low.endswith(_SH_SUFFIXES):
         return "shell"
-    if ext == ".service":
+    if low.endswith(_SYSTEMD_SUFFIXES) or (low.endswith(".conf") and _systemd_dropin(lowrel)):
         return "service"
-    if base in ("Makefile", "GNUmakefile", "makefile") or ext == ".mk":
+    if base in ("Makefile", "GNUmakefile", "makefile") or low.endswith((".mk", ".mk.in")):
         return "make"
-    if ext == "" and head.startswith("#!") and re.search(r"\b(?:ba|da|z|k)?sh\b", head.split("\n", 1)[0]):
+    if low.endswith(".py"):
+        return "python"
+    if low.endswith((".js", ".mjs", ".cjs")):
+        return "node"
+    if os.path.splitext(base)[1] == "" and base == "rules" and lowrel.startswith("debian/"):
+        return "make"
+    if os.path.splitext(base)[1] == "" and not base.startswith(".") and base not in NONCODE_NAMES and not \
+            base.startswith(("LICENSE", "README", "CHANGELOG")):
+        return "shell"
+    if os.path.splitext(base)[1] == "" and head.startswith("#!") and re.search(
+            r"\b(?:ba|da|z|k)?sh\b|\bbats\b", head.split("\n", 1)[0]):
         return "shell"
     return None
 
@@ -330,6 +502,8 @@ UNITS = {
     "dockerfile": dockerfile_units,
     "service": service_units,
     "make": make_units,
+    "python": python_units,
+    "node": node_units,
 }
 
 
@@ -376,8 +550,9 @@ def scan_exec_file(dl, rel: str, text: str) -> Optional[List[Found]]:
         return None
     deny = deny_lines(dl, rel, text)
     found: List[Found] = []
+    is_make = file_class(rel, text[:200]) == "make"
     for start, end, raw in units:
-        reasons = trigger_reasons(raw)
+        reasons = trigger_reasons(raw, is_make)
         flagged = [deny[k] for k in range(start, end + 1) if k in deny]
         if flagged or CRED_TOOL_RE.search(raw):
             reasons.append("denylist")
@@ -624,6 +799,21 @@ def tracked_files(root: Path) -> List[str]:
     return files
 
 
+def tracked_exec_bit(root: Path) -> List[str]:
+    """Tracked files carrying the executable bit (git mode 100755)."""
+    out = subprocess.run(["git", "-C", str(root), "ls-files", "-s", "-z"], check=True,
+                         capture_output=True).stdout.decode("utf-8", "replace")
+    res = []
+    for rec in out.split("\0"):
+        if rec.startswith("100755 ") and "\t" in rec:
+            res.append(rec.split("\t", 1)[1])
+    return res
+
+
+# Executable-bit files the gate has read and found to run no command line of their own.
+EXEC_BIT_OK: set = set()
+
+
 def read_tracked(root: Path, rel: str) -> Optional[str]:
     """Text of one tracked file, or None when it is not a regular file (a directory or
     submodule entry). Anything that cannot be scanned is an error, never a silent skip (#4909):
@@ -651,6 +841,8 @@ def scan_repo(root: Path, dl) -> Tuple[Dict[str, List[Found]], int, int]:
     """(found lines by file, exec files scanned, prose files scanned)."""
     found: Dict[str, List[Found]] = {}
     n_exec = n_prose = 0
+    exec_bit = set(tracked_exec_bit(root))
+    unclassified: List[str] = []
     for rel in tracked_files(root):
         text = read_tracked(root, rel)
         if text is None:
@@ -663,8 +855,13 @@ def scan_repo(root: Path, dl) -> Tuple[Dict[str, List[Found]], int, int]:
             res = scan_exec_file(dl, rel, text)
             if res is not None:
                 n_exec += 1
+        if res is None and rel in exec_bit and rel not in EXEC_BIT_OK and rel not in SELF_EXEMPT:
+            unclassified.append(rel)
         if res:
             found[rel] = res
+    if unclassified:
+        raise RuntimeError("executable file(s) with no scan class (fail closed, #4923): " +
+                           ", ".join(unclassified[:10]))
     return found, n_exec, n_prose
 
 
@@ -823,11 +1020,74 @@ def probe_files() -> List[Tuple[str, str, str]]:
         ("makefile recipe", "Makefile", "all:\n\tzorbctl --token $(TOKEN)\n"),
         ("suffix-less shebang script", "bin/tool", "#!/bin/sh\nzorbctl --token \"$TOKEN\"\n"),
     ]
+    # #4903 #4926 #4904 #4923-#4928 (round 2 of PR 4891): forms the first reviewers planted
+    P2 = "ProbeValue1"
+    raw_rows = [
+        ("4903 comment ending in backslash hides the next line", "p.sh",
+         '#!/bin/bash\n# note \\\ncurl -H "Authorization: Bearer $TOKEN" https://h\n'),
+        ("4926 continuation splits a flag name", "p.sh", "#!/bin/bash\nzorbctl --to\\\nken=$P h\n".replace("$P", P2)),
+        ("4926 continuation splits a header name", "p.sh",
+         '#!/bin/bash\nzorbctl -H "x-api-\\\nkey: $P" h\n'.replace("$P", P2)),
+        ("4904 x-vault-token header", "p.sh", "#!/bin/bash\nzorbctl -H \"X-Vault-Token: $v\" h\n"),
+        ("4904 private-token header", "p.sh", "#!/bin/bash\nzorbctl -H \"PRIVATE-TOKEN: $v\" h\n"),
+        ("4904 x-secret header", "p.sh", "#!/bin/bash\nzorbctl -H \"X-Secret: $v\" h\n"),
+        ("4925 cookie header", "p.sh", "#!/bin/bash\ncurl -H 'Cookie: session=$P' h\n".replace("$P", P2)),
+        ("4925 json body password", "p.sh", "#!/bin/bash\ncurl -d '{\"password\":\"$P\"}' h\n".replace("$P", P2)),
+        ("4925 hmac and jwt flags", "p.sh", "#!/bin/bash\nzorbctl --jwt $P --psk $P\n".replace("$P", P2)),
+        ("4925 publish token name", "p.sh", '#!/bin/bash\nzorbctl --opt "$NPM_PUBLISH_TOKEN"\n'),
+        ("4925 secret id name", "p.sh", '#!/bin/bash\nvault write auth/approle/login secret_id="$SECRET_ID"\n'),
+        ("4924 command substitution cat key file", "p.sh", '#!/bin/bash\nzorbctl --opt "$(cat /etc/app/db.key)"\n'),
+        ("4924 backtick key file", "p.sh", "#!/bin/bash\nzorbctl --opt `cat /etc/app/db.key`\n"),
+        ("4924 gh auth token", "p.sh", '#!/bin/bash\nzorbctl --opt "$(gh auth token)"\n'),
+        ("4924 vault kv get", "p.sh", '#!/bin/bash\nzorbctl --opt "$(vault kv get -field=v kv/app)"\n'),
+        ("4923 zsh script", "p.zsh", "#!/bin/zsh\nzorbctl --token $P\n".replace("$P", P2)),
+        ("4923 bats test", "p.bats", "#!/usr/bin/env bats\nzorbctl --token $P\n".replace("$P", P2)),
+        ("4923 sh.in template", "p.sh.in", "#!/bin/sh\nzorbctl --token $P\n".replace("$P", P2)),
+        ("4923 suffix-less script with no shebang", "p/deploy", "zorbctl --token $P\n".replace("$P", P2)),
+        ("4923 socket unit", "p.socket", "[Socket]\nExecStartPre=/usr/bin/zorbctl --token $P\n".replace("$P", P2)),
+        ("4923 systemd drop-in", "p.service.d/override.conf",
+         "[Service]\nExecStart=/usr/bin/zorbctl --token $P\n".replace("$P", P2)),
+        ("4923 service.in template", "p.service.in", "[Service]\nExecStart=/usr/bin/zorbctl --token $P\n".replace("$P", P2)),
+        ("4923 k8s manifest command", "p/deploy.yaml",
+         'spec:\n  containers:\n  - name: a\n    command: ["zorbctl", "--token", "$P"]\n'.replace("$P", P2)),
+        ("4923 docker stack file", "p/stack.yml", "services:\n  a:\n    command: zorbctl --token $P\n".replace("$P", P2)),
+        ("4923 python subprocess", "p.py", "import subprocess\nsubprocess.run(['zorbctl', '--token', '$P'])\n".replace("$P", P2)),
+        ("4923 node child_process", "p.mjs", "import { spawn } from 'node:child_process';\nspawn('zorbctl', ['--token', '$P']);\n".replace("$P", P2)),
+        ("4923 non-memory cloud-init template", "infra/p/cloud-init-agent2.yaml.tpl",
+         "#cloud-config\nruncmd:\n  - zorbctl --token $P\n".replace("$P", P2)),
+        ("4905 plain multi-line scalar run", ".github/workflows/p.yml",
+         "jobs:\n  a:\n    steps:\n      - run: zorbctl --opt\n          --token $P\n".replace("$P", P2)),
+        ("4927 run key with a space before the colon", ".github/workflows/p.yml",
+         "jobs:\n  a:\n    steps:\n      - run : zorbctl --token $P\n".replace("$P", P2)),
+        ("4927 flow-mapping step", ".github/workflows/p.yml",
+         "jobs:\n  a:\n    steps:\n      - {name: x, run: zorbctl --token $P}\n".replace("$P", P2)),
+        ("4927 yaml anchor read through an alias", ".github/workflows/p.yml",
+         "x: &c zorbctl --token $P\njobs:\n  a:\n    steps:\n      - run: *c\n".replace("$P", P2)),
+        ("4927 container options -e", ".github/workflows/p.yml",
+         "jobs:\n  a:\n    container:\n      image: x\n      options: -e DB_PASSWORD=${{ secrets.DBP }}\n"),
+        ("4927 toJSON(secrets) on argv", ".github/workflows/p.yml",
+         "jobs:\n  a:\n    steps:\n      - run: zorbctl --opt '${{ toJSON(secrets) }}'\n"),
+        ("4927 compose flow-mapping service", "docker-compose.yml",
+         "services:\n  a: {image: x, command: zorbctl --token $P}\n".replace("$P", P2)),
+        ("4927 compose alias of an x- anchor", "docker-compose.yml",
+         'x-cmd: &cmd ["zorbctl", "--token", "$P"]\nservices:\n  a:\n    command: *cmd\n'.replace("$P", P2)),
+        ("4907 workflow named compose-x.yml", ".github/workflows/compose-x.yml",
+         "jobs:\n  a:\n    steps:\n      - run: zorbctl --token $P\n".replace("$P", P2)),
+        ("4907 workflow named dockerfile-x.yml", ".github/workflows/dockerfile-x.yml",
+         "jobs:\n  a:\n    steps:\n      - run: zorbctl --token $P\n".replace("$P", P2)),
+        ("4908 dockerfile RUN heredoc body", "Dockerfile", "FROM x\nRUN <<EOF\nzorbctl --token $P\nEOF\n".replace("$P", P2)),
+        ("4908 dockerfile ONBUILD RUN", "Dockerfile", "FROM x\nONBUILD RUN zorbctl --token $P\n".replace("$P", P2)),
+        ("4908 dockerfile escape directive", "Dockerfile",
+         "# escape=`\nFROM x\nRUN zorbctl `\n  --token $P\n".replace("$P", P2)),
+        ("4928 makefile lower-case variable", "Makefile", "all:\n\tzorbctl --opt $(api_token)\n"),
+        ("4928 makefile RECIPEPREFIX", "Makefile", ".RECIPEPREFIX = >\nall:\n> zorbctl --token $P\n".replace("$P", P2)),
+    ]
     out = []
     for label, name, body in rows:
         text = body if name.endswith((".yml", ".yaml", ".service", "Makefile", "Dockerfile", "Dockerfile.p")) \
             or name.startswith("Dockerfile") else sh % body
         out.append((label, name, text))
+    out.extend(raw_rows)
     return out
 
 
@@ -841,7 +1101,7 @@ def green_probes() -> List[Tuple[str, str, str]]:
         ("comment line", "g.sh", '#!/bin/bash\n# curl -H "x-api-key: $KEY"\necho ok\n'),
         ("a plain compose command", "docker-compose.yml", "services:\n  a:\n    command: [\"serve\", \"--port\", \"1\"]\n"),
         ("not an executable file", "notes.txt", 'curl -H "x-api-key: $KEY" https://h\n'),
-        ("cloud-init template stays with its own gate", "t.yaml.tpl", 'curl -H "x-api-key: $KEY" https://h\n'),
+        ("cloud-init memory template stays with its own gate", "infra/p/cloud-init-memory.yaml.tpl", 'curl -H "x-api-key: $KEY" https://h\n'),
     ]
 
 
