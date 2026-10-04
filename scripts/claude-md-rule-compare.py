@@ -710,6 +710,58 @@ def self_test() -> int:
         print("PASS: self-test - R6 the COUNT CHANGED fence is longer than a backtick run in the census section "
               "(#5180)")
 
+    # #5282: every head-controlled string printed outside a fence goes through span(), including text that holds a
+    # backtick run; the cases below carry backticks in head headings and in the guard message that quotes them.
+    for raw, want in (("a", "` a `"), ("a ``` b", "```` a ``` b ````"), ("a\nb", "` a b `"),
+                      ("`", "`` ` ``"), ("a`b", "`` a`b ``")):
+        if span(raw) == want:
+            print(f"PASS: self-test - span({raw!r}) is one code span (#5282)")
+        else:
+            failures.append(f"span {raw!r}")
+            print(f"FAIL: self-test - span({raw!r}) = {span(raw)!r}, wanted {want!r} (#5282)", file=sys.stderr)
+
+    def tick_heading(root):
+        target = root / "CLAUDE.md"
+        target.write_text(target.read_text(encoding="utf-8") + "\n## added `x` heading\n\nbody\n", encoding="utf-8")
+
+    case("a head heading with a backtick is one code span (#5282)", tick_heading, True,
+         "RULE TEXT CHANGED (added): `` ## added `x` heading ``")
+
+    def duplicated_tick_heading(root):
+        target = root / "CLAUDE.md"
+        target.write_text(target.read_text(encoding="utf-8") + "\n## dup `y`\n\nbody\n\n## dup `y`\n\nbody\n",
+                          encoding="utf-8")
+
+    case("a duplicated head heading with a backtick is one code span (#5282)", duplicated_tick_heading, True,
+         "RULE TEXT CHANGED (duplicated heading): `` ## dup `y` ``")
+    case("a base-guard refusal quoting a head heading with a backtick is one code span (#5282)",
+         duplicated_tick_heading, True, "- BASE GUARD REFUSES THE HEAD: `` FAIL: CLAUDE.md has the heading '## dup `y`' more than once")
+
+    work, _, _ = fresh_pair("countkey")
+    repo = work / "repo"
+    claude = repo / "CLAUDE.md"
+    claude.write_text(claude.read_text(encoding="utf-8")
+                      + "\n## Prime directive census `z` addendum\n\nThe addendum has 103 MCP tools\n", encoding="utf-8")
+    guard.update_manifest_quiet(repo)
+    key_base = commit_all(repo, "base with a census section whose heading holds a backtick")
+    base_root = work / "baseroot3"
+    shutil.copytree(repo, base_root, ignore=shutil.ignore_patterns(".git"))
+    shutil.copyfile(guard_path, base_root / GUARD_REL)
+    claude.write_text(claude.read_text(encoding="utf-8").replace("addendum has 103 MCP tools", "addendum has 104 MCP tools", 1),
+                      encoding="utf-8")
+    guard.update_manifest_quiet(repo)
+    head_sha = commit_all(repo, "head change")
+    try:
+        report, failed = compare(base_root, repo, key_base, head_sha, work / "scratch", guard.fixture_index_pins())
+    except RuntimeError as exc:
+        report, failed = f"RESULT: FAIL (closed) - {exc}", True
+    needle = "### COUNT CHANGED: `` ## Prime directive census `z` addendum ``"
+    if failed or needle not in report:
+        print(f"FAIL: self-test - the COUNT CHANGED heading is not one code span (#5282)\n{report}", file=sys.stderr)
+        failures.append("count key span")
+    else:
+        print("PASS: self-test - the COUNT CHANGED heading with a backtick is one code span (#5282)")
+
     def base_claude_symlink(root):
         target = root / "CLAUDE.md"
         target.rename(root / "CLAUDE.real.md")
