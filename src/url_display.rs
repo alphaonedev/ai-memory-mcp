@@ -129,6 +129,19 @@ pub fn store_url_display(url: &str) -> String {
     }
 }
 
+/// #4782 F8 / #4939 — name the store-URL channel that won
+/// (`store_url::resolve_store_url`), NEVER the URL itself: no field carries
+/// the value, so no credential can reach a log sink. When an environment
+/// channel wins over an explicit `--store-url`, the flag used to be ignored
+/// silently; `overrides_store_url_flag` makes that visible.
+pub(crate) fn log_store_url_channel(channel: &'static str, overrides_store_url_flag: bool) {
+    tracing::info!(
+        channel,
+        overrides_store_url_flag,
+        "store URL resolved from {channel}"
+    );
+}
+
 /// The closed vocabulary a `reqwest::Error` collapses to at the ORIGIN of
 /// every transport failure (#3710). Nothing here carries the request URL,
 /// the redirect target or the response body.

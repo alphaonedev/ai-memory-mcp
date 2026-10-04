@@ -138,19 +138,19 @@ pub fn resolve_store_url(cli_arg: Option<&str>) -> Result<Option<String>> {
     if let Ok(path) = std::env::var(STORE_URL_FILE_ENV) {
         if !path.trim().is_empty() {
             let url = store_url_from_file(Path::new(path.trim()))?;
-            log_store_url_channel(STORE_URL_FILE_ENV, cli_arg.is_some());
+            crate::url_display::log_store_url_channel(STORE_URL_FILE_ENV, cli_arg.is_some());
             return Ok(Some(url));
         }
     }
     if let Ok(url) = std::env::var(STORE_URL_ENV) {
         let trimmed = url.trim();
         if !trimmed.is_empty() {
-            log_store_url_channel(STORE_URL_ENV, cli_arg.is_some());
+            crate::url_display::log_store_url_channel(STORE_URL_ENV, cli_arg.is_some());
             return Ok(Some(trimmed.to_string()));
         }
     }
     if let Some(url) = cli_arg {
-        log_store_url_channel("--store-url", false);
+        crate::url_display::log_store_url_channel("--store-url", false);
         if url_carries_credentials(url) {
             tracing::warn!(
                 "--store-url carries a password in argv, which is exposed via world-readable \
@@ -162,19 +162,6 @@ pub fn resolve_store_url(cli_arg: Option<&str>) -> Result<Option<String>> {
         return Ok(Some(url.to_string()));
     }
     Ok(None)
-}
-
-/// #4782 F8 — name the store-URL channel that won, NEVER the URL itself (no
-/// field carries the value, so no credential can reach a log sink). When an
-/// environment channel wins over an explicit `--store-url`, the flag was
-/// silently ignored before this line existed; `overrides_store_url_flag`
-/// makes that visible.
-fn log_store_url_channel(channel: &'static str, overrides_store_url_flag: bool) {
-    tracing::info!(
-        channel,
-        overrides_store_url_flag,
-        "store URL resolved from {channel}"
-    );
 }
 
 /// #2679 — refuse a `postgres://` store URL when this binary cannot open
