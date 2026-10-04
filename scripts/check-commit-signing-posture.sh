@@ -424,10 +424,28 @@ is_pinned_fingerprint() {
 # public key yields `%G? = U` ("good signature, unknown validity"), not `G`,
 # because `%G?` folds gpg's trust model in. Granting ultimate trust to the
 # pinned fingerprints is the mechanical form of "this key is hand-enrolled
-# from operator custody" — and it is granted ONLY to pinned fingerprints, so
-# a key that appears in the `.asc` but not in the pinned registry gets no
-# trust and cannot produce a `G`. That is the second of two independent
-# fail-closed layers; the `%GF` pin in the accept test is the first.
+# from operator custody", and it is granted ONLY to the pinned fingerprints:
+# a key that arrives in the `.asc` but is absent from the pinned registry
+# gets no ownertrust and so reads `U`, not `G`.
+#
+# THE SCOPE OF THAT SECOND LAYER, STATED EXACTLY (#5065 N4). The sentence
+# above is true of a PUBLIC-ONLY import, which is the only shape this
+# function builds in production — it imports `.asc` public key material and
+# never a secret key. It is NOT a general property of gpg: a key whose
+# SECRET half is in the keyring is implicitly ultimately trusted and yields
+# `%G? = G` with no `--import-ownertrust` grant at all. The self-test's own
+# `5065-merge-signed-by-unpinned-key` cell is precisely that shape — the
+# rogue key is created with `gpg --quick-generate-key` inside the self-test
+# GNUPGHOME, so its secret is present — and its shape guard asserts the
+# signature reads `%G? = G` while the fingerprint is NOT pinned. That cell is
+# refused, and it is refused by the `%GF` pin alone.
+#
+# So the two layers are not symmetric and must not be read as interchangeable:
+# the `%GF` pin in the accept test is the LOAD-BEARING layer and holds against
+# any key the keyring can verify, secret present or not; the ownertrust
+# restriction is defence in depth that holds for public-only imports. Any
+# future change that weakens the `%GF` pin on the strength of "ownertrust
+# already stops it" would be relying on a property the keyring does not have.
 prepare_hermetic_gnupghome() {
   local pubkey_file="$1" gpg_signers_file="$2" dest="$3"
 
@@ -1107,7 +1125,7 @@ self_test() {
   # BARE UNSIGNED (`%G? = N`). `GIT_COMMITTER_EMAIL` is a plain environment
   # variable: no key, no privilege, no config write.
   local m7a_sha m7b_sha m7c_sha m_octo_sha m_local_sha m_rogue_sha
-  local m_conflict_sha m_exempt_sha
+  local m_conflict_sha m_exempt_sha m_pipe_sha
   m7a_sha="$(GIT_AUTHOR_NAME='Dev' GIT_AUTHOR_EMAIL='dev@example.test' \
     GIT_COMMITTER_NAME='GitHub' GIT_COMMITTER_EMAIL="$WEBFLOW_COMMITTER_EMAIL" \
     git -C "$repo" commit-tree "$evil_tree" -p "$side1_sha" -p "$side2_sha" \
@@ -1193,12 +1211,67 @@ self_test() {
     git -C "$repo" commit-tree "$(git -C "$repo" rev-parse "${side1_sha}^{tree}")" \
     -p "$side1_sha" -p "$clean_sha" -m 'Merge pull request (no-op)')"
 
+  # (pipe) The record-parser field shift (#5138) turned into a predicate test.
+  # `git` accepts a literal `|` in an author email, and the walk parses its
+  # own `%H|%ae|%ce|%G?|%GF|%T|%P` line with `IFS='|' read -r`, so one pipe in
+  # `%ae` shifts every later field one position right. Measured on this exact
+  # fixture shape: `author_email=evil`, `committer_email=noreply@github.com`,
+  # `sig_status=dev@example.test`, `sig_fpr=N`, `commit_tree=<empty>`,
+  # `parents=<tree>|<p1> <p2>`. So an attacker who controls only the author
+  # email FORGES TERM (1) — the committer-identity field reads as the web-flow
+  # identity without the committer ever being it — and term (2) still counts
+  # two whitespace-separated words. Term (3) is the ONLY term left standing:
+  # `parent_arr[0]` is `<tree>|<p1>`, which is not a rev, so `merge-tree`
+  # exits 1 with empty stdout, `automerge_tree` returns non-zero, and the
+  # merge is EVALUATED. That is why this cell belongs to the exemption
+  # predicate and not to #5138: it pins the fail-closed direction of the one
+  # term the shift cannot satisfy. Repairing the parser (#5138) does not
+  # retire this cell — it only changes WHICH term refuses it.
+  #
+  # The tree here is the CLEAN automerge on purpose: the content is innocent,
+  # so nothing but the cannot-compute-therefore-REFUSE rule can reject it. A
+  # cell with an evil tree would have passed for the wrong reason.
+  m_pipe_sha="$(GIT_AUTHOR_NAME='Dev' \
+    GIT_AUTHOR_EMAIL="evil|$WEBFLOW_COMMITTER_EMAIL" \
+    GIT_COMMITTER_NAME='Dev' GIT_COMMITTER_EMAIL='dev@example.test' \
+    git -C "$repo" commit-tree "$auto_tree" -p "$side1_sha" -p "$side2_sha" \
+    -m 'Merge branch side2 (author email carries a pipe)')"
+
   # FIXTURE SHAPE GUARDS. Every assertion below is on the shape a cell must
   # have for its verdict to mean anything. Without them a fixture regression
   # (a signature that silently stopped being produced, an evil tree that
   # became the automerge) would turn a negative cell into a tautology that
   # still reported rc=1 for the wrong reason.
   local shape_g shape_gk
+  local shape_ae shape_t shape_p shape_ce
+  shape_ae="$(st_field "$m_pipe_sha" '%ae' "$repo" "$gpg_home" "$signers")"
+  case "$shape_ae" in
+    *'|'*) : ;;
+    *)
+      echo "self-test FAILED: the #5065 pipe cell needs git to have RECORDED a literal '|' in the author email; git reports %ae='$shape_ae'. Without the pipe the cell is an ordinary unenrolled-author commit and proves nothing about the exemption predicate." >&2
+      failed=1
+      ;;
+  esac
+  shape_t="$(st_field "$m_pipe_sha" '%T' "$repo" "$gpg_home" "$signers")"
+  if [ "$shape_t" != "$auto_tree" ]; then
+    echo "self-test FAILED: the #5065 pipe cell must record the CLEAN automerge tree so that its content is innocent and only the cannot-compute rule can refuse it; %T='$shape_t' auto_tree='$auto_tree'" >&2
+    failed=1
+  fi
+  shape_p="$(st_field "$m_pipe_sha" '%P' "$repo" "$gpg_home" "$signers")"
+  # `read -r -a`, never `set --`: this function's own positional parameters
+  # carry the self-test's invocation and clobbering them here would be a
+  # silent action at a distance (the same reason the walk uses `read -r -a`).
+  local -a pipe_parents=()
+  read -r -a pipe_parents <<<"$shape_p"
+  if [ "${#pipe_parents[@]}" -ne 2 ]; then
+    echo "self-test FAILED: the #5065 pipe cell must have exactly two parents (so term (2) cannot be what refuses it); %P='$shape_p'" >&2
+    failed=1
+  fi
+  shape_ce="$(st_field "$m_pipe_sha" '%ce' "$repo" "$gpg_home" "$signers")"
+  if [ "$shape_ce" = "$WEBFLOW_COMMITTER_EMAIL" ]; then
+    echo "self-test FAILED: the #5065 pipe cell's REAL committer must NOT be the web-flow identity — the whole point is that the shifted field forges term (1) while the commit itself is a local one; %ce='$shape_ce'" >&2
+    failed=1
+  fi
   shape_g="$(st_field "$m7a_sha" '%G?' "$repo" "$gpg_home" "$signers")"
   if [ "$shape_g" != "N" ]; then
     echo "self-test FAILED: #5065 cell (7a) must be BARE UNSIGNED (%G?=N) to be the shape it claims; git reports %G?='$shape_g'" >&2
@@ -1504,6 +1577,43 @@ self_test() {
     fi
   fi
 
+  # (pipe) A merge whose AUTHOR email contains a literal `|` MUST be REFUSED
+  # and MUST be counted as EVALUATED, never exempted. The shift forges the
+  # committer-identity term and keeps the parent count at two, so this is the
+  # cell that proves the exemption cannot be entered through a field the
+  # attacker writes. If it ever reports rc=0, or reports the merge as
+  # exempted, the predicate has a bypass and the #5138 parser defect has
+  # become a security hole rather than a correctness one.
+  rc=0
+  out="$(check_range "$base_sha" "$m_pipe_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" 2>&1)" || rc=$?
+  st_report "5065-merge-author-email-pipe" "$rc" "non-zero"
+  if [ "$rc" -eq 0 ]; then
+    echo "self-test FAILED: a two-parent merge whose AUTHOR email carries a '|' was ACCEPTED (#5065). The gate parses its own log line with IFS='|', so the shift moves the real committer out of the committer field and puts an attacker-chosen string into it; term (1) of the exemption then matches a committer the commit does not have:" >&2
+    echo "$out" >&2
+    failed=1
+  else
+    if ! grep -q "0 merges exempted" <<<"$out"; then
+      echo "self-test FAILED: the #5065 pipe cell was refused, but the SCANNED line does not report ZERO exempted merges — so the refusal came from somewhere other than the merge being evaluated, and the exemption may still be reachable through a shifted field:" >&2
+      echo "$out" >&2
+      failed=1
+    fi
+    if ! grep -q "1 merges evaluated" <<<"$out"; then
+      echo "self-test FAILED: the #5065 pipe cell was refused, but its merge was not counted as EVALUATED:" >&2
+      echo "$out" >&2
+      failed=1
+    fi
+    if ! grep -q "VIOLATION: $m_pipe_sha unbound-author-email" <<<"$out"; then
+      echo "self-test FAILED: the #5065 pipe cell was refused, but not with an unbound-author-email line naming the merge itself, so the named reason does not match the shape under test:" >&2
+      echo "$out" >&2
+      failed=1
+    fi
+    if ! grep -q "VIOLATION: $m_pipe_sha unbound-committer-email ($WEBFLOW_COMMITTER_EMAIL)" <<<"$out"; then
+      echo "self-test FAILED: the #5065 pipe cell was refused, but the committer-email violation does not quote the web-flow identity that the field shift injected. That injected value IS the forgery this cell exists to pin; if it is absent the fixture is no longer exercising the shift:" >&2
+      echo "$out" >&2
+      failed=1
+    fi
+  fi
+
   # (unpinned-key merge) The merge variant of LOAD-BEARING case (i): a
   # signature that fully verifies against a key in the SAME keyring that is
   # NOT pinned. MUST be refused SPECIFICALLY as signing-key-not-pinned —
@@ -1658,7 +1768,7 @@ self_test() {
   if [ "$failed" -ne 0 ]; then
     exit 2
   fi
-  echo "check-commit-signing-posture self-test OK: (a) clean enrolled+SSH-signed commit passes; (b) #2486 identity-drift shape (unbound email, unsigned) rejected naming both violations; (c) enrolled-but-unsigned commit rejected (signature check isolated from email check); (d) enrolled-email-claimed-with-rogue-SSH-key-signature rejected (verification is against the registry, not mere signature presence); (e) unresolvable commit range fails closed with exit 2; (f) missing enrolled-signers registry fails closed; (g) empty enrolled-signers registry fails closed; (g2) missing AND zero-fingerprint OpenPGP registries fail closed; (h) a commit signed with the PINNED OpenPGP key PASSES alongside an SSH-signed commit in the same range (#5045); (i) a fully-verifying OpenPGP signature from an UNPINNED key in the SAME keyring is rejected as signing-key-not-pinned — LOAD-BEARING, the only guard against the OpenPGP path widening to 'any key in the runner keyring'; (j) an EMPTY range fails closed with exit 2 (#5047 non-vacuity floor, which previously PASSED); (k) a hermetic keyring builds from the SHIPPED registry + .asc material and the shipped pin carries both halves; (l) run_gate's own entry-point dispositions — a non-pull_request event reports N/A at exit 0, and a pull_request event with PR_BASE_SHA unset fails closed at exit 2 (inoperative), never 0 and never 1. (f)/(g)/(g2) prove the fail-closed-on-registry-loss property is an EXPLICIT assertion (assert_registry_usable / assert_gpg_registry_usable / assert_pinned_fingerprints_usable), not incidental pipefail behavior. #5065 merge-evaluation cases, per 5-agent vote (4d3ea1c5) — merges are no longer dropped by --no-merges, they are evaluated unless all three exemption terms hold: (7a) a two-parent web-flow-identity merge that is UNSIGNED (%G?=N) and whose tree is NOT the clean automerge of its two parents is REFUSED naming signature-not-verified; (7b) the same shape carrying a signature that does not verify (%G?=E with a populated %GK — the realistic shape, since the real web-flow cohort reads E) is REFUSED the same way, so a future '%G? != N' filter cannot silently reopen the hole 7a alone would catch; (7c) LOAD-BEARING POSITIVE — a two-parent web-flow-identity merge whose recorded tree EQUALS git merge-tree --write-tree p1 p2 stays EXEMPT and is reported as exempted, pinning the adopted predicate's zero-cost property AND the named residual in both directions; (5065-octopus) a web-flow merge with THREE parents is EVALUATED, not exempted, because the parent-count term is checked independently of identity; (5065-local) a non-web-flow unsigned two-parent merge is REFUSED naming signature-not-verified and no email violation — this is the red-first cell the identity narrowing needs, and it is impossible to satisfy by dropping merges; (5065-unpinned-key) a merge whose OpenPGP signature fully verifies (%G?=G) from a key in the SAME keyring that is NOT pinned is REFUSED as signing-key-not-pinned, extending case (i) across the merge boundary; (5065-conflict) an enrolled, SSH-signed, conflict-resolving merge whose tree differs from the automerge PASSES and is counted as EVALUATED — this is what proves the operator's own conflict resolutions are not false-refused and that a PASS can never come from an exemption; (5065-floor) a range whose only commits are exempted web-flow merges fails CLOSED with exit 2, because the rebuilt #5047 non-vacuity floor counts EVALUATED commits rather than non-merge commits and an all-exempt range is not a pass; (5065-probe-absent / 5065-probe-lies / 5065-probe-missing) the MANDATORY merge-tree capability probe exits 2 (INOPERATIVE) when the subcommand is absent, when it returns a well-formed but WRONG tree oid, and when the git binary cannot be executed at all — the gate never degrades to cannot-compute-therefore-exempt."
+  echo "check-commit-signing-posture self-test OK: (a) clean enrolled+SSH-signed commit passes; (b) #2486 identity-drift shape (unbound email, unsigned) rejected naming both violations; (c) enrolled-but-unsigned commit rejected (signature check isolated from email check); (d) enrolled-email-claimed-with-rogue-SSH-key-signature rejected (verification is against the registry, not mere signature presence); (e) unresolvable commit range fails closed with exit 2; (f) missing enrolled-signers registry fails closed; (g) empty enrolled-signers registry fails closed; (g2) missing AND zero-fingerprint OpenPGP registries fail closed; (h) a commit signed with the PINNED OpenPGP key PASSES alongside an SSH-signed commit in the same range (#5045); (i) a fully-verifying OpenPGP signature from an UNPINNED key in the SAME keyring is rejected as signing-key-not-pinned — LOAD-BEARING, the only guard against the OpenPGP path widening to 'any key in the runner keyring'; (j) an EMPTY range fails closed with exit 2 (#5047 non-vacuity floor, which previously PASSED); (k) a hermetic keyring builds from the SHIPPED registry + .asc material and the shipped pin carries both halves; (l) run_gate's own entry-point dispositions — a non-pull_request event reports N/A at exit 0, and a pull_request event with PR_BASE_SHA unset fails closed at exit 2 (inoperative), never 0 and never 1. (f)/(g)/(g2) prove the fail-closed-on-registry-loss property is an EXPLICIT assertion (assert_registry_usable / assert_gpg_registry_usable / assert_pinned_fingerprints_usable), not incidental pipefail behavior. #5065 merge-evaluation cases, per 5-agent vote (4d3ea1c5) — merges are no longer dropped by --no-merges, they are evaluated unless all three exemption terms hold: (7a) a two-parent web-flow-identity merge that is UNSIGNED (%G?=N) and whose tree is NOT the clean automerge of its two parents is REFUSED naming signature-not-verified; (7b) the same shape carrying a signature that does not verify (%G?=E with a populated %GK — the realistic shape, since the real web-flow cohort reads E) is REFUSED the same way, so a future '%G? != N' filter cannot silently reopen the hole 7a alone would catch; (7c) LOAD-BEARING POSITIVE — a two-parent web-flow-identity merge whose recorded tree EQUALS git merge-tree --write-tree p1 p2 stays EXEMPT and is reported as exempted, pinning the adopted predicate's zero-cost property AND the named residual in both directions; (5065-octopus) a web-flow merge with THREE parents is EVALUATED, not exempted, because the parent-count term is checked independently of identity; (5065-local) a non-web-flow unsigned two-parent merge is REFUSED naming signature-not-verified and no email violation — this is the red-first cell the identity narrowing needs, and it is impossible to satisfy by dropping merges; (5065-unpinned-key) a merge whose OpenPGP signature fully verifies (%G?=G) from a key in the SAME keyring that is NOT pinned is REFUSED as signing-key-not-pinned, extending case (i) across the merge boundary; (5065-conflict) an enrolled, SSH-signed, conflict-resolving merge whose tree differs from the automerge PASSES and is counted as EVALUATED — this is what proves the operator's own conflict resolutions are not false-refused and that a PASS can never come from an exemption; (5065-floor) a range whose only commits are exempted web-flow merges fails CLOSED with exit 2, because the rebuilt #5047 non-vacuity floor counts EVALUATED commits rather than non-merge commits and an all-exempt range is not a pass; (5065-pipe-author-email) a two-parent merge whose AUTHOR email contains a literal '|' is REFUSED and counted as EVALUATED: the walk parses its own log line with IFS='|', so one pipe in %ae shifts the later fields and puts an attacker-chosen string into the committer-identity field, forging exemption term (1) while term (2) still counts two parents — term (3) is the only term the shift cannot satisfy, because the shifted parent is not a rev, merge-tree exits non-zero and the merge is evaluated rather than exempted (the parser shift itself is #5138; this cell pins the predicate's fail-closed direction and survives that fix); (5065-probe-absent / 5065-probe-lies / 5065-probe-missing) the MANDATORY merge-tree capability probe exits 2 (INOPERATIVE) when the subcommand is absent, when it returns a well-formed but WRONG tree oid, and when the git binary cannot be executed at all — the gate never degrades to cannot-compute-therefore-exempt."
 }
 
 case "${1:-}" in

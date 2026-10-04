@@ -1043,7 +1043,7 @@ jobs:
       - name: Self-test the gate (#2486 regression evidence)
         # --self-test constructs a throwaway repo with TWO ephemeral SSH
         # keypairs and TWO ephemeral OpenPGP keys (no network, no dependency
-        # on the real enrolled keys) and asserts TWENTY-SIX shapes, printing
+        # on the real enrolled keys) and asserts TWENTY-SEVEN shapes, printing
         # each case's observed and expected exit code so the evidence is
         # readable straight out of this job's log:
         #
@@ -1155,6 +1155,21 @@ jobs:
         #       prints `SCANNED: N commits (M merges evaluated, X merges
         #       exempted content-neutral web-flow)`, so an all-exempt range
         #       can never report PASS (#2444 shape).
+        #   (5065-merge-author-email-pipe) a two-parent merge whose AUTHOR
+        #       email contains a literal `|` is REFUSED and counted as
+        #       EVALUATED. The walk parses its own
+        #       `%H|%ae|%ce|%G?|%GF|%T|%P` line with `IFS='|' read -r`, so
+        #       one pipe in `%ae` shifts every later field one position
+        #       right: measured on this fixture the committer-identity
+        #       field reads `noreply@github.com` although the commit's real
+        #       committer is not, which FORGES exemption term (1), and term
+        #       (2) still counts two whitespace-separated words. Term (3) is
+        #       the only term the shift cannot satisfy — the shifted parent
+        #       is `<tree>|<p1>`, not a rev, so `merge-tree` exits 1 with
+        #       empty stdout and the merge is evaluated. The parser shift
+        #       itself is tracked as #5138 and is NOT fixed here; this case
+        #       pins the predicate's fail-closed direction and stays
+        #       meaningful after that fix (it then refuses one term earlier).
         #   (5065-probe-merge-tree-absent / -lies / -probe-git-binary-missing)
         #       the MANDATORY capability probe exits 2 (INOPERATIVE) when
         #       `merge-tree --write-tree` is missing (rc=129 + usage on bare
