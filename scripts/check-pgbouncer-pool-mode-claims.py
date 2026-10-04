@@ -57,6 +57,13 @@ written reason. No list of bad or negating words decides anything.
                Anything else (prose, a prose comment) is joined with the
                approved line and judged as one unit, so `pool_mode = session`
                followed by "is unsafe" is not approved.
+            R7 context binding (#5087, #5088): every allowlist entry ends in
+               ` | ctx:<12 hex>`, a fingerprint of the lines around its unit (the
+               nearest non-blank lines and the paragraph, without the unit's own
+               lines). When a line next to an allowlisted one changes, even with
+               no mode word, the entry is stale and the neighbourhood goes back
+               to review: regen-pgbouncer-pool-mode-allow.py --refresh-context
+               re-binds it after a human re-reads the lines.
   Approved  (closed set, matched against the WHOLE normalised line)
             A1 an assignment: an optional list/quote prefix, a pool-mode key in
                any spelling, `=` or `:`, the value `session` (optionally quoted),
@@ -92,6 +99,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import os
 import re
@@ -205,7 +213,9 @@ MIN_DISTINCT_WORDS = 5
 REGEN_HEADER = "added by regen-pgbouncer-pool-mode-allow.py"
 MIN_REASON_WORDS, MIN_REASON_CHARS = 6, 30
 
-Unit = Tuple[str, int, str]  # (relative path, line number, normalised text)
+Unit = Tuple[str, int, str, str]  # (relative path, line number, normalised text, context fingerprint)
+Entry = Tuple[str, str, str]  # (relative path, normalised text, context fingerprint)
+CTX = re.compile(r" \| ctx:([0-9a-f]{12})$")  # R7: an allowlist entry is bound to its neighbourhood
 
 
 def normalise(line: str) -> str:
@@ -350,18 +360,18 @@ def scan_lines(rel: str, lines: List[str], base: int = 0, core: Optional[Tuple[i
     """The mention units of one file (rules R1-R6). `lines` may be a window of a larger file: `base` is the
     absolute index of lines[0], `core` the range of anchors this window answers for. Every pair has exactly one
     anchor (the mention line for R5/R6, the first line for R4), and cores are disjoint, so no pair repeats."""
-    units: List[Unit] = []
+    raw: List[Tuple[int, str, Tuple[int, ...]]] = []
     lo_core, hi_core = core if core is not None else (0, len(lines))
     is_mention = [bool(t) and mentions(t) for t in lines]
 
     def pair(a: int, b: int) -> None:
         lo, hi = min(a, b), max(a, b)
-        units.append((rel, base + hi + 1, lines[lo] + " " + lines[hi]))
+        raw.append((base + hi + 1, lines[lo] + " " + lines[hi], (lo, hi)))
 
     for i in range(lo_core, hi_core):
         text = lines[i]
         if is_mention[i]:
-            units.append((rel, base + i + 1, text))
+            raw.append((base + i + 1, text, (i,)))
             ok = approved(text)
             for j in sorted(set(_neighbours(lines, i)) | set(_paragraph(lines, i))):
                 if is_mention[j]:
@@ -373,10 +383,18 @@ def scan_lines(rel: str, lines: List[str], base: int = 0, core: Optional[Tuple[i
         elif text and i + 1 < len(lines) and lines[i + 1] and not is_mention[i + 1]:
             if mentions(text + " " + lines[i + 1]):
                 pair(i, i + 1)  # R4: wrapped across a line break
-    return units
+    return [(rel, number, text, context(lines, idx)) for number, text, idx in raw]
 
 
-WINDOW_MARGIN = 2 * NEIGHBOURS + 8  # non-blank lines kept on each side of a window: covers every rule's reach
+def context(lines: List[str], idx: Sequence[int]) -> str:
+    """R7 (#5087, #5088): fingerprint of the lines around a unit (the nearest non-blank lines and the paragraph, as
+    R5/R6 read them), without the unit's own lines. An allowlist entry carries it, so an edit next to an allowlisted
+    line that names no mode word (a reversal) makes the entry stale and sends the neighbourhood back to review."""
+    near = sorted({j for k in idx for j in set(_neighbours(lines, k)) | set(_paragraph(lines, k))} - set(idx))
+    return hashlib.sha256("\n".join(lines[j] for j in near).encode("utf-8")).hexdigest()[:12]
+
+
+WINDOW_MARGIN = 2 * PARAGRAPH_MAX + 2 * NEIGHBOURS  # non-blank lines kept on each side of a window: a pair's context reaches a paragraph (PARAGRAPH_MAX) beyond its far line, plus the neighbours
 
 
 def _margin_index(lines: List[str], start: int, step: int) -> Optional[int]:
@@ -533,9 +551,10 @@ def scan(root: Path) -> Tuple[List[Unit], int]:
     return units, read
 
 
-def load_allowlist(root: Path) -> Tuple[List[Tuple[str, str]], List[str]]:
-    """Entries and errors. Every entry needs a real reason (see reason_problem)."""
-    entries: List[Tuple[str, str]] = []
+def load_allowlist(root: Path, require_ctx: bool = True) -> Tuple[List[Entry], List[str]]:
+    """Entries and errors. Every entry needs a real reason (see reason_problem) and, unless regen is migrating the
+    file (require_ctx False), a context fingerprint."""
+    entries: List[Entry] = []
     errors: List[str] = []
     path = root / ALLOW_REL
     try:
@@ -561,8 +580,14 @@ def load_allowlist(root: Path) -> Tuple[List[Tuple[str, str]], List[str]]:
             continue
         if block:
             reason, block = " ".join(block), []
+        ctx = CTX.search(line)
+        if not ctx and require_ctx:
+            errors.append("%s:%d: entry has no ` | ctx:<12 hex>` context fingerprint (regen writes it)" % (ALLOW_REL, number))
+            continue
+        if ctx:
+            line = line[:ctx.start()]
         if SEPARATOR not in line:
-            errors.append("%s:%d: malformed entry (want `<file> | <normalised line>`)" % (ALLOW_REL, number))
+            errors.append("%s:%d: malformed entry (want `<file> | <normalised line> | ctx:<hex>`)" % (ALLOW_REL, number))
             continue
         rel, text = line.split(SEPARATOR, 1)
         if not rel or " " in rel or not text or text != normalise(text):
@@ -575,22 +600,23 @@ def load_allowlist(root: Path) -> Tuple[List[Tuple[str, str]], List[str]]:
         if problem:
             errors.append("%s:%d: entry without a written reason (%s)" % (ALLOW_REL, number, problem))
             continue
-        entries.append((rel, text))
+        entries.append((rel, text, ctx.group(1) if ctx else ""))
     return entries, errors
 
 
-def judge(units: Sequence[Unit], entries: Sequence[Tuple[str, str]]) -> Tuple[List[str], List[str]]:
+def judge(units: Sequence[Unit], entries: Sequence[Entry]) -> Tuple[List[str], List[str]]:
     """(findings, stale entries). A finding is an unapproved, unlisted mention."""
     budget = Counter(entries)  # one entry per occurrence
     findings = []
-    for rel, number, text in units:
+    for rel, number, text, ctx in units:
         if approved(text):
             continue
-        if budget[(rel, text)] > 0:
-            budget[(rel, text)] -= 1
+        if budget[(rel, text, ctx)] > 0:
+            budget[(rel, text, ctx)] -= 1
             continue
-        findings.append("%s:%d: mentions a pooler mode without an approved session-mode shape: %s" % (rel, number, text[:170]))
-    stale = ["%s: stale allowlist entry (x%d unused): %s | %s" % (ALLOW_REL, n, r, t[:120]) for (r, t), n in budget.items() if n > 0]
+        findings.append("%s:%d: mentions a pooler mode without an approved session-mode shape (ctx:%s): %s" % (rel, number, ctx, text[:160]))
+    stale = ["%s: stale allowlist entry (x%d unused; text or neighbourhood changed): %s | %s | ctx:%s" % (ALLOW_REL, n, r, t[:120], c)
+             for (r, t, c), n in budget.items() if n > 0]
     return findings, stale
 
 
@@ -791,6 +817,12 @@ def tree(extra: Optional[Dict[str, object]] = None, allow: str = "", guide: str 
     return files
 
 
+def ent(rel: str, body: str, text: str, nth: int = 0) -> str:
+    """The allowlist line, with its context fingerprint, for the nth unit of `body` whose text is `text`."""
+    found = [u for u in scan_lines(rel, [normalise(line) for line in body.splitlines()]) if u[2] == text]
+    return "%s%s%s | ctx:%s\n" % (rel, SEPARATOR, text, found[nth][3])
+
+
 def run_quiet(root: Path) -> int:
     saved_out, saved_err = sys.stdout, sys.stderr
     sink = open(os.devnull, "w")
@@ -812,32 +844,41 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
     for name, rel, body in GREEN:
         out.append(("green: " + name, tree({rel: body}), EXIT_OK))
     retired = {"docs/a.md": "Transaction mode is not supported (#4667).\n"}
-    retired_entry = "docs/a.md | transaction mode is not supported (#4667).\n"
+    retired_entry = ent("docs/a.md", retired["docs/a.md"], "transaction mode is not supported (#4667).")
+    sup = "PgBouncer session mode is supported.\n"
+    sup_or = "PgBouncer session mode is supported, or\nstatement.\n"
+    two = "Transaction mode is not supported.\nx\nStatement mode is not supported.\n"
+    one = "Transaction mode is not supported.\n"
+    dup = "Transaction mode is not supported.\nx\nTransaction mode is not supported.\n"
+    rev = "Transaction mode is not supported (#4667).\nThat changed: it is now the recommended setting.\n"
     out += [
         ("agreeing tree passes", tree(), EXIT_OK),
         ("session prose alone is not approved", tree({"docs/a.md": "PgBouncer session mode is supported.\n"}), EXIT_FINDING),
         ("session prose passes once allowlisted with a reason",
-         tree({"docs/a.md": "PgBouncer session mode is supported.\n"}, REASON + "docs/a.md | pgbouncer session mode is supported.\n"), EXIT_OK),
+         tree({"docs/a.md": sup}, REASON + ent("docs/a.md", sup, "pgbouncer session mode is supported.")), EXIT_OK),
         ("R5: an allowlisted line does not cover a mode word on the next line",
-         tree({"docs/a.md": "PgBouncer session mode is supported, or\nstatement.\n"},
-              REASON + "docs/a.md | pgbouncer session mode is supported, or\n"), EXIT_FINDING),
+         tree({"docs/a.md": sup_or}, REASON + ent("docs/a.md", sup_or, "pgbouncer session mode is supported, or")), EXIT_FINDING),
+        ("R7: an allowlisted line does not cover a reversal next to it that names no mode word (#5087, #5088)",
+         tree({"docs/a.md": rev}, REASON + ent("docs/a.md", retired["docs/a.md"], "transaction mode is not supported (#4667).")), EXIT_FAULT),
+        ("R7: re-reviewing the line (a fresh fingerprint, as regen --refresh-context writes) passes",
+         tree({"docs/a.md": rev}, REASON + ent("docs/a.md", rev, "transaction mode is not supported (#4667).")), EXIT_OK),
         ("a mixed line (session and transaction) is not approved", tree({"docs/a.md": "pool_mode = session, not transaction mode\n"}), EXIT_FINDING),
         ("allowlisted retirement line passes", tree(retired, REASON + retired_entry), EXIT_OK),
         ("an entry continues the reason of the entry above",
-         tree({"docs/a.md": "Transaction mode is not supported.\nx\nStatement mode is not supported.\n"},
-              REASON + "docs/a.md | transaction mode is not supported.\ndocs/a.md | statement mode is not supported.\n"), EXIT_OK),
+         tree({"docs/a.md": two}, REASON + ent("docs/a.md", two, "transaction mode is not supported.")
+              + ent("docs/a.md", two, "statement mode is not supported.")), EXIT_OK),
         ("allowlist entry is bound to its file",
          tree({"docs/b.md": "Transaction mode is not supported (#4667).\n"}, REASON + retired_entry), EXIT_FAULT),
-        ("stale allowlist entry fails", tree({}, REASON + "docs/gone.md | pool_mode = transaction\n"), EXIT_FAULT),
+        ("stale allowlist entry fails", tree({}, REASON + "docs/gone.md | pool_mode = transaction | ctx:000000000000\n"), EXIT_FAULT),
         ("malformed allowlist entry fails", tree({}, REASON + "no separator here\n"), EXIT_FAULT),
         ("an entry beyond the occurrence count is stale",
-         tree({"docs/a.md": "Transaction mode is not supported.\n"},
-              REASON + "docs/a.md | transaction mode is not supported.\ndocs/a.md | transaction mode is not supported.\n"), EXIT_FAULT),
+         tree({"docs/a.md": one}, REASON + ent("docs/a.md", one, "transaction mode is not supported.") * 2), EXIT_FAULT),
         ("one entry does not cover a second occurrence",
-         tree({"docs/a.md": "Transaction mode is not supported.\nx\nTransaction mode is not supported.\n"},
-              REASON + "docs/a.md | transaction mode is not supported.\n"), EXIT_FINDING),
+         tree({"docs/a.md": dup}, REASON + ent("docs/a.md", dup, "transaction mode is not supported.")), EXIT_FINDING),
         ("non-normalised allowlist text fails",
-         tree({"docs/a.md": "Transaction mode is not supported.\n"}, REASON + "docs/a.md | Transaction mode is not supported.\n"), EXIT_FAULT),
+         tree({"docs/a.md": one}, REASON + ent("docs/a.md", one, "transaction mode is not supported.").replace("| t", "| T")), EXIT_FAULT),
+        ("an entry without a context fingerprint fails",
+         tree({"docs/a.md": one}, REASON + "docs/a.md | transaction mode is not supported.\n"), EXIT_FAULT),
         # reasons (#4961): the placeholder, no reason, a short reason, a reason cut off by a blank line
         ("regen placeholder left in the allowlist fails",
          tree(retired, "# REASON REQUIRED before review - say why each line below is safe\n" + retired_entry), EXIT_FAULT),
@@ -853,9 +894,9 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
         ("a filler reason (todo x8) fails", tree(retired, "# todo todo todo todo todo todo todo todo\n" + retired_entry), EXIT_FAULT),
         ("a five-word reason under the sentence floor fails", tree(retired, "# retired mode kept for history\n" + retired_entry), EXIT_FAULT),
         ("an entry that sets transaction mode is refused whatever its reason",
-         tree({"infra/x/setup.sh": "pool_mode = transaction\n"}, REASON + "infra/x/setup.sh | pool_mode = transaction\n"), EXIT_FAULT),
+         tree({"infra/x/setup.sh": "pool_mode = transaction\n"}, REASON + ent("infra/x/setup.sh", "pool_mode = transaction\n", "pool_mode = transaction")), EXIT_FAULT),
         ("a per-db override entry is refused",
-         tree({"infra/x/pgb.ini": "ai = host=pg pool_mode=transaction\n"}, REASON + "infra/x/pgb.ini | ai = host=pg pool_mode=transaction\n"), EXIT_FAULT),
+         tree({"infra/x/pgb.ini": "ai = host=pg pool_mode=transaction\n"}, REASON + ent("infra/x/pgb.ini", "ai = host=pg pool_mode=transaction\n", "ai = host=pg pool_mode=transaction")), EXIT_FAULT),
         # files read, not skipped (#5086, #5090)
         ("NUL bytes in a markdown file fail closed", tree({"docs/n.md": "\0\nRun PgBouncer in transaction mode.\n"}), EXIT_FAULT),
         ("a gzip document fails closed", tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}), EXIT_FAULT),
@@ -985,7 +1026,7 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("F1 BOM-less UTF-16", "    if len(zeros) * 4 >= min(len(head), CHUNK_BYTES) > 0:", "    if False:"),
     ("F2 long lines: product and mode word anywhere", "    return bool(_PRODUCT_WORD.search(view) and OTHER_MODE.search(view))", "    return False"),
     ("F2 long lines: overlapping segments", "SEGMENT, SEGMENT_STEP = 2048, 1536", "SEGMENT, SEGMENT_STEP = 2048, 2048"),
-    ("F2 window margin", "WINDOW_MARGIN = 2 * NEIGHBOURS + 8", "WINDOW_MARGIN = 1"),
+    ("F2 window margin", "WINDOW_MARGIN = 2 * PARAGRAPH_MAX + 2 * NEIGHBOURS", "WINDOW_MARGIN = 1"),
     ("F2 chunk-boundary carriage return", " or lines[-1].endswith(\"\\r\")", ""),
     ("A1 forbidden entries", "        if forbidden_entry(text):\n", "        if False:\n"),
     ("A1 filler reasons", "    if FILLER.search(reason.casefold()) or", "    if False and"),
@@ -1004,7 +1045,8 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("allowlist reason required", "        problem = reason_problem(reason or \"\")\n        if problem:\n            errors.append(\"%s:%d: entry without", "        problem = None\n        if problem:\n            errors.append(\"%s:%d: entry without"),
     ("allowlist placeholder", 'if line.lstrip().startswith("#") and "reason required" in line.casefold():', "if False:"),
     ("allowlist reason length", "    if len(words) < MIN_REASON_WORDS or len(reason) < MIN_REASON_CHARS:", "    if not words:"),
-    ("allowlist per-occurrence budget", "            budget[(rel, text)] -= 1\n", ""),
+    ("R7 context fingerprint", '    return hashlib.sha256("\\n".join(lines[j] for j in near).encode("utf-8")).hexdigest()[:12]', '    return "0" * 12'),
+    ("allowlist per-occurrence budget", "            budget[(rel, text, ctx)] -= 1\n", ""),
     ("guide pin", "    if not guide_ok:\n", "    if False:\n"),
 ]
 
@@ -1061,8 +1103,9 @@ def mutate_real_allowlist() -> int:
         print("self-test FAIL real tree does not judge clean (%d findings, %d stale)" % (len(findings), len(stale)))
         return 1
     bad = 0
-    for index, (rel, text) in enumerate(entries):
-        for label, mutant in (("text altered", (rel, text + " x")), ("file altered", (rel + ".moved", text))):
+    for index, (rel, text, ctx) in enumerate(entries):
+        for label, mutant in (("text altered", (rel, text + " x", ctx)), ("file altered", (rel + ".moved", text, ctx)),
+                              ("context altered", (rel, text, "f" * 12 if ctx != "f" * 12 else "0" * 12))):
             mutated = entries[:index] + [mutant] + entries[index + 1:]
             f2, s2 = judge(units, mutated)
             if not (f2 or s2):
