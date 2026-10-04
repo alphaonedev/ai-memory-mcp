@@ -77,7 +77,7 @@ usage: run.sh [options]
   --keep              keep run/ (daemons are still stopped) for post-mortem
   --no-caveat-probe   skip the asi-hard full-profile cold-boot probe (#2942, #4938)
   --probe-mutation    lower AI_MEMORY_REQUIRE_ROLLBACK_CHECK below its floor inside the probe and
-                      require the probe to go RED (proves the probe can fail; the run exits non-zero)
+                      require the probe to refuse for that knob (proves the probe can fail)
   --posture-selftest  run only the posture drift-guard legs (names AND values; no daemons) and exit
   -h, --help          this text
 USAGE
@@ -101,6 +101,11 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+# --probe-mutation mutates the cold-boot probe; with the probe skipped it would silently run nothing.
+if [ "$PROBE_MUTATION" -eq 1 ] && [ "$CAVEAT_PROBE" -eq 0 ]; then
+  echo "--probe-mutation needs the cold-boot probe: it cannot be combined with --no-caveat-probe" >&2; exit 2
+fi
 
 # ── identities used throughout ─────────────────────────────────────────────
 AGENT_A="ai:lab-node-a"        # node A's federation identity
@@ -388,7 +393,7 @@ if [ "$CAVEAT_PROBE" -eq 1 ]; then
     no "cold-boot probe cannot run: port $PROBE_PORT is occupied, so a non-zero exit would prove nothing"
   else
     # --probe-mutation lowers the rollback-check knob below its floor so the profile refuses the boot:
-    # the probe must then go RED, which proves it can fail.
+    # the boot must then refuse naming that knob (the pin-and-refuse path), which proves the probe can fail.
     PROBE_MUT=""
     if [ "$PROBE_MUTATION" -eq 1 ]; then PROBE_MUT="0"; fi
     # #3582: the profile refuses a federation config with no peer allowlist, so give the probe one;
@@ -413,7 +418,14 @@ if [ "$CAVEAT_PROBE" -eq 1 ]; then
       fi
     else
       if [ "$PROBE_MUTATION" -eq 1 ]; then
-        no "probe MUTATION DETECTED (expected red): the boot refused (exit $PROBE_RC) with the rollback-check knob lowered"
+        # The mutation is detected only when the refusal names the lowered knob. Any other refusal
+        # (port, config, a different knob) proves nothing about this probe, and the profile's INFO
+        # pin line names the knob on every boot, so it is excluded.
+        if grep -v 'INFO' "$PROBE" | grep -q 'refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK'; then
+          ok "probe mutation detected: the boot refused (exit $PROBE_RC) and the refusal names AI_MEMORY_REQUIRE_ROLLBACK_CHECK"
+        else
+          no "probe mutation inconclusive: the boot refused (exit $PROBE_RC) but not for the lowered rollback-check knob"
+        fi
       else
         no "full asi-hard cold boot on a fresh DB did NOT come up (exit $PROBE_RC): the lab runs this posture, so a refusal is a failure (#2942 regression or a new refusal)"
       fi
