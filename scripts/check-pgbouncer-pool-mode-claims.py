@@ -356,9 +356,15 @@ def approved(text: str) -> bool:
     return any(shape.match(text) for _, shape in APPROVED_SHAPES)
 
 
+def other_mode(text: str) -> bool:
+    """A mode word on a context line (R5, R6), also behind a look-alike or an invisible character: the context
+    line gets the same shadow view as a mention line (#4950, #5085, #5211)."""
+    return bool(OTHER_MODE.search(text) or (not text.isascii() and OTHER_MODE.search(shadow(text))))
+
+
 def neutral(text: str) -> bool:
     """A context line that cannot qualify an approved line (R6): fence, section, short config line."""
-    return not OTHER_MODE.search(text) and any(shape.match(text) for shape in NEUTRAL_SHAPES)
+    return not other_mode(text) and any(shape.match(text) for shape in NEUTRAL_SHAPES)
 
 
 def reason_problem(reason: str) -> Optional[str]:
@@ -446,7 +452,7 @@ def scan_lines(rel: str, lines: List[str], base: int = 0, core: Optional[Tuple[i
                     continue  # judged on its own
                 if ok and not neutral(lines[j]):
                     pair(i, j)  # R6: prose next to an approved line
-                elif OTHER_MODE.search(lines[j]):
+                elif other_mode(lines[j]):
                     pair(i, j)  # R5: a mode word in the same paragraph
         elif text:
             if unreadable(text):
@@ -865,6 +871,8 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("look-alikes in every pool and mode word (three per word: past the key-word fold)", "docs/a.md",
      "Set the p\u043e\u043el\u0435r to tr\u0430ns\u0430cti\u043en.\n"),
     ("soft hyphen in the mode word", "docs/a.md", "Run PgBouncer in trans\u00adaction mode.\n"),
+    ("soft hyphen in a pooling claim with no product word (#5211)", "docs/a.md", "Use tr\u00adansaction pooling.\n"),
+    ("zero-width inside the key, nothing else non-ASCII (#5211)", "docs/a.md", "pool_mo\u200bde = transaction\n"),
     # round 5 (#4741 closed world): the value is a variable, a default elsewhere or a template, never the literal session
     ("R8 terraform variable named pgb_mode (default on another line)", "deploy/main.tf", "variable \"pgb_mode\" {\n  type = string\n}\n"),
     ("R8 prefixed key set to a variable", "deploy/main.tf", "pgb_mode = var.pooler_choice\n"),
@@ -975,6 +983,9 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
     one = "Transaction mode is not supported.\n"
     dup = "Transaction mode is not supported.\nx\nTransaction mode is not supported.\n"
     rev = "Transaction mode is not supported (#4667).\nThat changed: it is now the recommended setting.\n"
+    # #5211: R5 and R6 context lines get the shadow view
+    lk = "PgBouncer session mode is supported.\nIt fronts the primary.\nIt listens on 6432.\nFor fan-in, switch it to tr\u0430nsaction.\n"
+    zw = lk.replace("tr\u0430nsaction", "trans\u200baction")
     # round 5 reviews (#5089): R7 binds every part of the neighbourhood; each sub-rule has a pinning case
     para0 = "Transaction mode is not supported (#4667).\na\nb\nc\nd\n"
     para1 = para0.replace("c\n", "It is now recommended.\n")
@@ -1011,6 +1022,10 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
          tree({"docs/u.txt": ("\u4e2d" * 200 + "\nRun PgBouncer in transaction mode.\n").encode("utf-16")}), EXIT_FINDING),
         ("a path listed twice on the skip list fails",
          tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}, unread=UNREAD_REASON + "docs/z.md.gz\ndocs/z.md.gz\n"), EXIT_FAULT),
+        ("R5: a look-alike mode word in the paragraph of an allowlisted line is paired (#5211)",
+         tree({"docs/a.md": lk}, REASON + ent("docs/a.md", lk, "pgbouncer session mode is supported.")), EXIT_FINDING),
+        ("R5: a zero-width-split mode word in the paragraph of an allowlisted line is paired (#5211)",
+         tree({"docs/a.md": zw}, REASON + ent("docs/a.md", zw, "pgbouncer session mode is supported.")), EXIT_FINDING),
         ("agreeing tree passes", tree(), EXIT_OK),
         ("session prose alone is not approved", tree({"docs/a.md": "PgBouncer session mode is supported.\n"}), EXIT_FINDING),
         ("session prose passes once allowlisted with a reason",
@@ -1268,6 +1283,7 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("F1 skip list path listed once", 'if " " in line or problem or line in listed:', 'if " " in line or problem:'),
     ("A1 distinct-word floor", "MIN_DISTINCT_WORDS = 5", "MIN_DISTINCT_WORDS = 1"),
     ("U3 look-alike table", ".translate(CONFUSABLE)", ""),
+    ("R5 context line shadow view (#5211)", "(not text.isascii() and OTHER_MODE.search(shadow(text)))", "False"),
     ('H skip list decode error is a fault', '    except (OSError, UnicodeDecodeError) as exc:  # R5: a decode error is a FAULT (rc 2), not a traceback\n        return {}, [', '    except OSError as exc:  # R5: a decode error is a FAULT (rc 2), not a traceback\n        return {}, ['),
     ('H allowlist decode error is a fault', '    except (OSError, UnicodeDecodeError) as exc:\n        return [], ["%s: unreadable', '    except OSError as exc:\n        return [], ["%s: unreadable'),
     ('H template decode error is a fault', '    except (OSError, UnicodeDecodeError) as exc:\n        return "cannot read %s', '    except OSError as exc:\n        return "cannot read %s'),
