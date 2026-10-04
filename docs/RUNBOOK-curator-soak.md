@@ -111,7 +111,7 @@ ai-memory list --namespace _curator/reports/daily --limit 1000 --json \
     > audit-cycles-daily.json
 
 # Aggregate cycle reports for the headline numbers.
-# Field shapes map to src/curator.rs::CuratorReport + src/autonomy.rs::AutonomyPassReport:
+# Field shapes map to src/curator/mod.rs::CuratorReport + src/autonomy.rs::AutonomyPassReport:
 #   - Top-level: auto_tagged, contradictions_found, operations_attempted,
 #     operations_skipped_cap, errors (Vec<String>), autonomy (nested).
 #   - Nested under .autonomy: clusters_formed, memories_consolidated,
