@@ -30,13 +30,20 @@ def pending_refusals(g, templates, allow, pend) -> list:
     g.load_entries(allow, False, faults, "allow")
     pe = g.load_entries(pend, True, faults, "pending")
     out = ["FAULT: " + f for f in faults]
-    seen = set()
+    per = {}
     cache = {}
     for nm, text in sorted(templates.items()):
-        sc = g.scope_of(nm)
         _, _, _, trig, _ = g.analyse(nm, text, cache)
-        seen |= {(s, ln.ctx, ln.text) for ln in trig for s in (sc, "both")}
-    out += ["STALE PENDING: %s %s | %s | %s" % (e[0], e[1], e[2], e[3]) for e in pe if (e[0], e[2], e[3]) not in seen]
+        per.setdefault(g.scope_of(nm), set()).update((ln.ctx, ln.text) for ln in trig)
+
+    def live(e):
+        # a 'both' entry must match a triggered line in every template, as the gate requires (#5116)
+        k = (e[2], e[3])
+        if e[0] == "both":
+            return bool(per) and all(k in v for v in per.values())
+        return k in per.get(e[0], set())
+
+    out += ["STALE PENDING: %s %s | %s | %s" % (e[0], e[1], e[2], e[3]) for e in pe if not live(e)]
     if out:
         out.append("refused: fix the allow or pending list first (%d problem(s)); nothing was written" % len(out))
     return out
@@ -50,6 +57,7 @@ def self_test(g, templates, allow, pend) -> int:
         ("clean lists", pend, False),
         ("stale pending entry", pend.replace(first, head + " | top | nothing-matches:", 1), True),
         ("pending entry under an unknown tracker", pend.replace(first, head.split(" ")[0] + " #1 | " + rest, 1), True),
+        ("both-scope pending entry that one template lacks", pend.replace(first, "both " + head.split(" ", 1)[1] + " | " + rest, 1), True),
     ]
     bad = [lbl for lbl, p, want in cases if bool(pending_refusals(g, templates, allow, p)) != want]
     for lbl in bad:
