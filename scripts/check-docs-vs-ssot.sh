@@ -618,7 +618,9 @@ PILL = re.compile(r'class="pill"[^>]*>\s*v([0-9]+)\s+schema\s*<')
 TAG = re.compile(r'<[^>]+>')
 WS = re.compile(r'\s+')
 PRIOR = re.compile(r'PRIOR RELEASE', re.IGNORECASE)
-BLOCK_TAG = re.compile(r'</?(?:p|div|li|ul|ol|tr|td|th|table|h[1-6]|section|br)\b', re.IGNORECASE)
+# A block that ends a claim's paragraph. Not `br` (a break inside the paragraph)
+# and not `td`/`th` (a subject cell and its value cell are one row's claim; #5195).
+BLOCK_TAG = re.compile(r'</?(?:p|div|li|ul|ol|tr|table|h[1-6]|section)\b', re.IGNORECASE)
 
 
 def plain(s):
@@ -2806,6 +2808,28 @@ v52 added the audit table.</p>
 </div>
 <div>
 <p>52 tools ship today.</p>
+<p>The live CURRENT_SCHEMA_VERSION is
+<br>
+52 on both backends.</p>
+<p>The live CURRENT_SCHEMA_VERSION is
+<br>
+53 on both backends.</p>
+<td>
+<code>CURRENT_SCHEMA_VERSION</code>
+</td>
+<td>
+52</td>
+<td>
+<code>CURRENT_SCHEMA_VERSION</code>
+</td>
+<td>
+53</td>
+<p>(a v0.8.x DB steps
+<br>
+v40&nbsp;&rarr;&nbsp;v52 on boot.)</p>
+<p>(a v0.8.x DB steps
+<br>
+v40&nbsp;&rarr;&nbsp;v53 on boot.)</p>
 R4HTML
     r4_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test #3248 r4 - stale wordings not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -2834,7 +2858,10 @@ R4HTML
         'docs/postgres-age-guide.md:37 claims "52"' \
         'docs/postgres-age-guide.md:39 claims "52"' \
         'docs/schema-fixture.html:25 claims "52"' \
-        'docs/schema-fixture.html:31 claims "52"'
+        'docs/schema-fixture.html:31 claims "52"' \
+        'docs/schema-fixture.html:49 claims "52"' \
+        'docs/schema-fixture.html:57 claims "52"' \
+        'docs/schema-fixture.html:65 claims "52"'
     do grep -qF "$_want" <<<"$r4_out" || { echo "FAIL: self-test #3248 r4 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
     for _not in \
         'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:4 ' \
@@ -2851,7 +2878,8 @@ R4HTML
         'docs/postgres-age-guide.md:33 ' 'docs/schema-fixture.html:26 ' \
         'docs/postgres-age-guide.md:36 ' 'docs/schema-fixture.html:36 ' \
         'docs/schema-fixture.html:42 ' \
-        'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 ' 'docs/schema-fixture.html:46 '
+        'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 ' 'docs/schema-fixture.html:46 ' \
+        'docs/schema-fixture.html:52 ' 'docs/schema-fixture.html:62 ' 'docs/schema-fixture.html:68 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
@@ -2859,6 +2887,7 @@ R4HTML
     echo "PASS: self-test #4511-R5 - wrapped claim with an issue ref / release triple in the subject tail, whitespace at the wrap point, and a tag-only middle line: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5140 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5154 - html look-back stops at a block-boundary line (</div>, <div>): the unrelated 52 is not joined to the subject"
+    echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #4511-R6 - html look-back skips up to 3 tag-only lines (52 REJECTED, 53 ACCEPTED), stops past 3, and markdown never looks back past a blank line"
     echo "PASS: self-test #4851 - compact json schema_version:52 REJECTED, :53 ACCEPTED"
     echo "PASS: self-test #4852 - issue ref / release triple between identifier and value: planted 52 REJECTED, 53 ACCEPTED"
