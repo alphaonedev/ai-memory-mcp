@@ -172,14 +172,16 @@ services:
       # DER SHA-256 is on the allowlist, so the healthcheck presents the
       # campaign client cert + CA and the X-API-Key. `$$VAR` defers
       # expansion to the in-container shell (compose strips one `$`).
+      # #4876: the key is printed by the printf builtin as a curl config line
+      # and read by `curl --config -` from stdin, so no argv carries it.
       test:
         - "CMD-SHELL"
         - >-
-          curl -f -sS --max-time 3
+          printf 'header = "X-API-Key: %s"\n' "$$AI_MEMORY_API_KEY"
+          | curl -f -sS --max-time 3 --config -
           --cacert ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}/ca.pem
           --cert ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}/client.pem
           --key ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}/client.key
-          -H "X-API-Key: $$AI_MEMORY_API_KEY"
           https://127.0.0.1:${CONTAINER_HTTPS_PORT:-19077}/api/v1/capabilities
       interval: 10s
       timeout: 5s
@@ -235,11 +237,11 @@ services:
       test:
         - "CMD-SHELL"
         - >-
-          curl -f -sS --max-time 3
+          printf 'header = "X-API-Key: %s"\n' "$$AI_MEMORY_API_KEY"
+          | curl -f -sS --max-time 3 --config -
           --cacert ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}/ca.pem
           --cert ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}/client.pem
           --key ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}/client.key
-          -H "X-API-Key: $$AI_MEMORY_API_KEY"
           https://127.0.0.1:${CONTAINER_HTTPS_PORT:-19077}/api/v1/capabilities
       interval: 10s
       timeout: 5s

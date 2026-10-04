@@ -31,9 +31,9 @@ Grok 4.3 and 2026-05-31-morning Ollama gemma4:e4b configs):
 **Connectivity probe (2026-05-31 11:23 ET):**
 
 ```
-$ curl https://openrouter.ai/api/v1/chat/completions \
+$ printf 'header = "Authorization: Bearer %s"\n' "$OPENROUTER_API_KEY" |
+    curl https://openrouter.ai/api/v1/chat/completions --config - \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $OPENROUTER_API_KEY" \
     -d '{ "model": "google/gemma-4-26b-a4b-it",
           "messages": [{"role":"user","content":"How many rs are in strawberry?"}] }'
 

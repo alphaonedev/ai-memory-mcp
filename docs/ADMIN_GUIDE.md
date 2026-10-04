@@ -1480,13 +1480,16 @@ would otherwise mint a live bearer secret none of those controls can see. The
 fix is one extra call by the same admin:
 
 ```bash
-curl -sS -X POST https://daemon/api/v1/agents \
-  -H "x-api-key: $KEY" -H "X-Agent-Id: $ADMIN" \
+# The key is piped to curl as a config line (printf is a shell builtin), never an argument.
+printf 'header = "x-api-key: %s"\n' "$KEY" |
+  curl -sS -X POST https://daemon/api/v1/agents --config - \
+  -H "X-Agent-Id: $ADMIN" \
   -H 'content-type: application/json' \
   -d '{"agent_id":"svc-indexer","agent_type":"service"}'
 # then enrol its key
-curl -sS -X POST https://daemon/api/v1/agents/svc-indexer/api-key \
-  -H "x-api-key: $KEY" -H "X-Agent-Id: $ADMIN" -d '{}'
+printf 'header = "x-api-key: %s"\n' "$KEY" |
+  curl -sS -X POST https://daemon/api/v1/agents/svc-indexer/api-key --config - \
+  -H "X-Agent-Id: $ADMIN" -d '{}'
 ```
 
 This includes minting a key for **yourself**: the rule is about the target, not

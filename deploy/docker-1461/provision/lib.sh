@@ -309,6 +309,16 @@ MTLS_CA="${MTLS_CA:-${TLS_ROOT}/ca.pem}"
 MTLS_CLIENT_CERT="${MTLS_CLIENT_CERT:-${TLS_ROOT}/client.pem}"
 MTLS_CLIENT_KEY="${MTLS_CLIENT_KEY:-${TLS_ROOT}/client.key}"
 
+# #4874: the api key never rides the curl argv. It is printed as a curl config line (printf
+# is a shell builtin) and piped to `curl --config -`, which reads it from stdin.
+_mtls_key_config() {
+  local k
+  k="$(effective_api_key)"
+  [ -n "$k" ] || return 0
+  k=${k//\\/\\\\}; k=${k//\"/\\\"}
+  printf 'header = "X-API-Key: %s"\n' "$k"
+}
+
 _mtls_curl_common() {
   # Emits the shared curl args on stdout, one per line (caller reads into argv).
   local port="$1" method="$2" path="$3" data="$4" aid="$5"; shift 5
@@ -322,7 +332,6 @@ _mtls_curl_common() {
   [ -f "$MTLS_CA" ]          && printf '%s\n' --cacert "$MTLS_CA"
   [ -f "$MTLS_CLIENT_CERT" ] && printf '%s\n' --cert "$MTLS_CLIENT_CERT"
   [ -f "$MTLS_CLIENT_KEY" ]  && printf '%s\n' --key "$MTLS_CLIENT_KEY"
-  printf '%s\n' -H "X-API-Key: $(effective_api_key)"
   [ -n "$aid" ] && printf '%s\n' -H "X-Agent-Id: ${aid}"
   if [ -n "$data" ]; then
     printf '%s\n' -H 'Content-Type: application/json'
@@ -340,14 +349,14 @@ mtls_curl_code() {
   local port="$1" method="$2" path="$3" data="${4:-}" aid="${5:-}"; shift 5 || true
   local args=() line
   while IFS= read -r line; do args+=("$line"); done < <(_mtls_curl_common "$port" "$method" "$path" "$data" "$aid" "$@")
-  curl "${args[@]}" -o /dev/null -w '%{http_code}' "$(_mtls_url "$port" "$path")" 2>/dev/null || printf '000'
+  _mtls_key_config | curl --config - "${args[@]}" -o /dev/null -w '%{http_code}' "$(_mtls_url "$port" "$path")" 2>/dev/null || printf '000'
 }
 
 mtls_curl_body() {
   local port="$1" method="$2" path="$3" data="${4:-}" aid="${5:-}"; shift 5 || true
   local args=() line
   while IFS= read -r line; do args+=("$line"); done < <(_mtls_curl_common "$port" "$method" "$path" "$data" "$aid" "$@")
-  curl -fsS "${args[@]}" "$(_mtls_url "$port" "$path")" 2>/dev/null || printf ''
+  _mtls_key_config | curl --config - -fsS "${args[@]}" "$(_mtls_url "$port" "$path")" 2>/dev/null || printf ''
 }
 
 # Minimal JSON field extractor (string or scalar) without a jq dependency in

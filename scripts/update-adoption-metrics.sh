@@ -31,10 +31,19 @@ readonly NPM_PKG="${ADOPTION_NPM_PKG:-ai-memory-mcp}"
 readonly OUT="${ADOPTION_OUT:-docs/adoption-metrics.json}"
 readonly TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-readonly GH_HEADERS=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+GH_HEADERS=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
 if [ -n "${GITHUB_TOKEN:-}" ]; then
-    GH_HEADERS+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    # #4875: the token never rides the curl argv; curl_json pipes it as a config line to
+    # `curl --config -`, and only the GitHub calls (which pass GH_HEADERS) opt in.
+    GH_HEADERS+=(--config -)
 fi
+
+gh_auth_config() {
+    local t="${GITHUB_TOKEN:-}"
+    [ -n "$t" ] || return 0
+    t=${t//\\/\\\\}; t=${t//\"/\\\"}
+    printf 'header = "Authorization: Bearer %s"\n' "$t"
+}
 
 if ! command -v curl >/dev/null 2>&1; then
     echo "ERROR: curl is required. Install curl and re-run." >&2
@@ -49,7 +58,7 @@ curl_json() {
     # $1: URL; rest: extra curl args. Returns body on stdout (empty
     # string on any failure — caller checks for empty).
     local url="$1"; shift
-    curl -sf -m 20 "$url" "$@" 2>/dev/null || echo ""
+    gh_auth_config | curl -sf -m 20 "$url" "$@" 2>/dev/null || echo ""
 }
 
 mkdir -p "$(dirname "$OUT")"

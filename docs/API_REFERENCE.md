@@ -59,7 +59,7 @@ mTLS-enforced `/sync` lane are not counted.
 > # before (v0.7.0 – v0.10.0) — now 401
 > curl "https://127.0.0.1:9077/api/v1/memories?api_key=$KEY"
 > # after (v1.0.0)
-> curl -H "x-api-key: $KEY" https://127.0.0.1:9077/api/v1/memories
+> printf 'header = "x-api-key: %s"\n' "$KEY" | curl --config - https://127.0.0.1:9077/api/v1/memories
 > ```
 >
 > **Diagnosing it.** The daemon emits a once-per-process WARN under the
@@ -670,8 +670,9 @@ with `_`: that prefix is reserved for substrate-owned funnels such as
 - **400 / 403 / 500** per validation / governance / server error.
 
 ```bash
-curl -X POST https://127.0.0.1:9077/api/v1/memories \
-  -H "X-API-Key: KEY" -H "X-Agent-Id: alice" \
+printf 'header = "X-API-Key: %s"\n' "$API_KEY" |
+  curl -X POST https://127.0.0.1:9077/api/v1/memories --config - \
+  -H "X-Agent-Id: alice" \
   -H "Content-Type: application/json" \
   -d '{"title":"Meeting notes","content":"Q2 roadmap","tier":"mid"}'
 ```

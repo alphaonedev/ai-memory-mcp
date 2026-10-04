@@ -83,6 +83,26 @@ ssh_node() {
   ssh -n $SSH_OPTS "root@${ip}" "$@"
 }
 
+# #4871: the admin API key never rides an argv. api_key_curl_config prints a curl config
+# line (printf is a shell builtin, so the key is not an exec argument); ssh_node_with_key
+# pipes it to the remote command's stdin, where `curl --config -` reads it. A caller adds
+# the non-secret word `--config -` to the curl arguments; curl reads stdin only then.
+api_key_curl_config() {
+  local k="${1-}"
+  [ -n "$k" ] || return 0
+  k=${k//\\/\\\\}; k=${k//\"/\\\"}
+  printf 'header = "x-api-key: %s"\n' "$k"
+}
+ssh_node_with_key() {
+  local k="$1" ip="$2"; shift 2
+  # shellcheck disable=SC2086
+  api_key_curl_config "$k" | ssh $SSH_OPTS "root@${ip}" "$@"
+}
+ssh_node_keyed() {
+  local ip="$1"; shift
+  ssh_node_with_key "${API_KEY:-}" "$ip" "$@"
+}
+
 # scp_to <local> <ip> <remote>
 scp_to() {
   local src="$1" ip="$2" dst="$3"

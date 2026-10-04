@@ -203,8 +203,9 @@ hostssl  all       all   ::/0         scram-sha-256  clientcert=verify-full</pre
     <span class="section-eyebrow">3 · The corpus</span>
     <h2>A deterministic seed, loaded via <code>migrate</code></h2>
     <p class="lede">The audit ran over a 7,855-row Atlas corpus (embedder = local all-MiniLM-L6-v2, 384-d, under loopback-only egress). That corpus is proprietary; a portable reproduction ships a <strong>generator</strong>, not the data. <code>seed-corpus.sh</code> writes a small, byte-deterministic corpus into a local sqlite DB — every run produces identical rows — then <code>repro.sh</code> migrates it into the pg tier verbatim (memories + links + embeddings; #3054/#3060).</p>
-    <pre class="codeblock">ai-memory schema-init --store-url "postgres://…?sslmode=verify-full&amp;sslrootcert=ca.crt&amp;sslcert=pg-client.crt&amp;sslkey=pg-client.key&amp;options=-csearch_path%3Dpublic%2Cag_catalog"
-ai-memory migrate --from "sqlite:///…/seed.db" --to "&lt;same TLS DSN&gt;" --batch 1000</pre>
+    <pre class="codeblock"># /etc/ai-memory/store-url (mode 0600) holds the TLS DSN: postgres://…?sslmode=verify-full&amp;sslrootcert=ca.crt&amp;sslcert=pg-client.crt&amp;sslkey=pg-client.key&amp;options=-csearch_path%3Dpublic%2Cag_catalog
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
+ai-memory migrate --from "sqlite:///…/seed.db" --to-url-file /etc/ai-memory/store-url --batch 1000</pre>
     <p><strong>Embeddings are derived, not durable.</strong> The seed rows carry only their durable TEXT — the source of truth. The certified daemon RE-DERIVES the embedding vectors from that text at serve-boot (its backfill sweep, under the local MiniLM embedder / loopback-only egress). Embedding vectors are disposable, regenerable artifacts; the memory text is never at risk. Semantic recall over the seed exercises the result.</p>
   </div>
 </section>

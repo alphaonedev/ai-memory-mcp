@@ -83,7 +83,7 @@ json_field() {
 # hdrs <agent_id> -> the standard auth/identity header fragment for a curl run.
 hdrs() {
   local aid="$1" h=""
-  [ -n "$API_KEY" ] && h="-H 'x-api-key: $API_KEY'"
+  [ -n "$API_KEY" ] && h="--config -"
   [ -n "$aid" ] && h="$h -H 'x-agent-id: $aid'"
   printf '%s' "$h"
 }
@@ -99,7 +99,7 @@ hdrs() {
 body_req() {
   local rip="$1" cip="$2" host="$3" m="$4" path="$5" data="${6:-}" aid="${7:-}"
   local extra=""; [ -n "$data" ] && extra="-H 'content-type: application/json' --data '$data'"
-  ssh_node "$rip" "curl -fsS --max-time 10 --resolve $host:$FEDERATION_PORT:$cip \
+  ssh_node_keyed "$rip" "curl -fsS --max-time 10 --resolve $host:$FEDERATION_PORT:$cip \
     --cacert $REMOTE_TLS/ca.pem --cert $REMOTE_TLS/client.pem --key $REMOTE_TLS/client.key \
     $(hdrs "$aid") $extra -X $m https://$host:$FEDERATION_PORT$path" 2>/dev/null || true
 }
@@ -117,7 +117,7 @@ body_req() {
 # and default an empty capture (ssh-level failure) to `000` here.
 code_raw() {
   local rip="$1" args="$2" out
-  out="$(ssh_node "$rip" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 $args; true" 2>/dev/null || true)"
+  out="$(ssh_node_keyed "$rip" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 $args; true" 2>/dev/null || true)"
   printf '%s' "${out:-000}"
 }
 
@@ -127,7 +127,7 @@ code_raw() {
 # tag (e.g. distinguishing an enrollment 401 from an api-key 401).
 body_raw() {
   local rip="$1" args="$2"
-  ssh_node "$rip" "curl -s --max-time 10 $args; true" 2>/dev/null || true
+  ssh_node_keyed "$rip" "curl -s --max-time 10 $args; true" 2>/dev/null || true
 }
 
 log "P3 full-spectrum test run $TS — fleet=$CAMPAIGN port=$FEDERATION_PORT"
@@ -237,8 +237,8 @@ c="$(code_raw "$P1_IP" "$RES $CA $CERT $KEY $PRIV")"
 assert_eq crypto apikey_required 401 "$c"
 
 # (5) privileged endpoint WITH x-api-key -> 200
-keyhdr=""; [ -n "$API_KEY" ] && keyhdr="-H 'x-api-key: $API_KEY'"
-c="$(code_raw "$P1_IP" "$RES $CA $CERT $KEY $keyhdr $PRIV")"
+cfgarg=""; [ -n "$API_KEY" ] && cfgarg="--config -"
+c="$(code_raw "$P1_IP" "$RES $CA $CERT $KEY $cfgarg $PRIV")"
 assert_eq crypto apikey_accepted 200 "$c"
 
 # (6) /health is exempt -> 200 without the key
@@ -246,7 +246,7 @@ c="$(code_raw "$P1_IP" "$RES $CA $CERT $KEY $URL")"
 assert_eq crypto health_exempt 200 "$c"
 
 # (7) admin-only endpoint as a non-admin caller -> 403 (authz enforced)
-c="$(code_raw "$P1_IP" "$RES $CA $CERT $KEY $keyhdr -H 'x-agent-id: $AID_H' $ADMIN")"
+c="$(code_raw "$P1_IP" "$RES $CA $CERT $KEY $cfgarg -H 'x-agent-id: $AID_H' $ADMIN")"
 assert_eq crypto admin_gated 403 "$c"
 
 # ====================== GROUP federation =====================================
@@ -329,14 +329,14 @@ fi
 # EVERY peer (the #1088 fail-closed arm is live fleet-wide under the Batman env).
 log "[zerotouch] unenrolled peer-id refused on /sync/since on every peer (#1088 fail-closed)"
 ZCA="--cacert $REMOTE_TLS/ca.pem"; ZCERT="--cert $REMOTE_TLS/client.pem"; ZKEY="--key $REMOTE_TLS/client.key"
-ZKEYHDR=""; [ -n "$API_KEY" ] && ZKEYHDR="-H 'x-api-key: $API_KEY'"
+ZCFGARG=""; [ -n "$API_KEY" ] && ZCFGARG="--config -"
 ZROGUE="rogue-unenrolled-$TS"
 printf '%s\n' "$PEER_IPS" | while IFS= read -r ip; do
   [ -n "$ip" ] || continue
   h="$(inv_name_for_ip "$ip")"
   ZRES="--resolve $h:$FEDERATION_PORT:127.0.0.1"
   ZSYNC="https://$h:$FEDERATION_PORT/api/v1/sync/since?since=1970-01-01T00:00:00Z"
-  ZPROBE="$ZRES $ZCA $ZCERT $ZKEY $ZKEYHDR -H 'x-peer-id: $ZROGUE' \"$ZSYNC\""
+  ZPROBE="$ZRES $ZCA $ZCERT $ZKEY $ZCFGARG -H 'x-peer-id: $ZROGUE' \"$ZSYNC\""
   zc="$(code_raw "$ip" "$ZPROBE")"
   assert_eq zerotouch "unenrolled_status[$h]" 401 "$zc"
   zb="$(body_raw "$ip" "$ZPROBE")"
@@ -484,15 +484,15 @@ printf '%s\n' "$PEER_IPS" | while IFS= read -r ip; do
   h="$(inv_name_for_ip "$ip")"
   RES="--resolve $h:$FEDERATION_PORT:127.0.0.1"
   CA="--cacert $REMOTE_TLS/ca.pem"; CERT="--cert $REMOTE_TLS/client.pem"; KEY="--key $REMOTE_TLS/client.key"
-  keyhdr=""; [ -n "$API_KEY" ] && keyhdr="-H 'x-api-key: $API_KEY'"
+  cfgarg=""; [ -n "$API_KEY" ] && cfgarg="--config -"
 
   # (1) unsigned write -> 403 ATTESTATION_FAILED. A normal POST /memories carries
   # NO caller Ed25519 signature, so under REQUIRE_AGENT_ATTESTATION it is refused.
   UNS="{\"title\":\"nsa-unsigned-$TS-$RANDOM\",\"content\":\"unsigned write probe\",\"namespace\":\"$NS_TEST\"}"
   MEM="https://$h:$FEDERATION_PORT/api/v1/memories"
-  uc="$(code_raw "$ip" "$RES $CA $CERT $KEY $keyhdr -H 'content-type: application/json' --data '$UNS' -X POST $MEM")"
+  uc="$(code_raw "$ip" "$RES $CA $CERT $KEY $cfgarg -H 'content-type: application/json' --data '$UNS' -X POST $MEM")"
   assert_eq nsa_gaps "unsigned_write_403[$h]" 403 "$uc"
-  ub="$(body_raw "$ip" "$RES $CA $CERT $KEY $keyhdr -H 'content-type: application/json' --data '$UNS' -X POST $MEM")"
+  ub="$(body_raw "$ip" "$RES $CA $CERT $KEY $cfgarg -H 'content-type: application/json' --data '$UNS' -X POST $MEM")"
   case "$ub" in *ATTESTATION_FAILED*|*attestation*) pass nsa_gaps "unsigned_write_reason[$h]" "ATTESTATION_FAILED" "attestation gate live" ;;
                                                  *) fail nsa_gaps "unsigned_write_reason[$h]" "ATTESTATION_FAILED" "${ub:-<empty>}" ;; esac
 
@@ -500,7 +500,7 @@ printf '%s\n' "$PEER_IPS" | while IFS= read -r ip; do
   # api-key, but the signed-federation header is absent, so the receiver refuses.
   PUSH="https://$h:$FEDERATION_PORT/api/v1/sync/push"
   SBODY="{\"memories\":[]}"
-  sc="$(code_raw "$ip" "$RES $CA $CERT $KEY $keyhdr -H 'content-type: application/json' --data '$SBODY' -X POST $PUSH")"
+  sc="$(code_raw "$ip" "$RES $CA $CERT $KEY $cfgarg -H 'content-type: application/json' --data '$SBODY' -X POST $PUSH")"
   assert_eq nsa_gaps "sync_push_missing_sig_401[$h]" 401 "$sc"
 
   # (3) /sync/push with an INVALID sig+nonce, sent TWICE -> 401 both times. The
@@ -508,8 +508,8 @@ printf '%s\n' "$PEER_IPS" | while IFS= read -r ip; do
   # (FED_REQUIRE_NONCE) is therefore exercised on the receive path; neither push
   # ever lands. A cryptographically-valid replay needs the peer key (see header).
   BADSIG="-H 'x-memory-sig: AAAA' -H 'x-memory-nonce: nonce-$TS-$RANDOM'"
-  r1="$(code_raw "$ip" "$RES $CA $CERT $KEY $keyhdr $BADSIG -H 'content-type: application/json' --data '$SBODY' -X POST $PUSH")"
-  r2="$(code_raw "$ip" "$RES $CA $CERT $KEY $keyhdr $BADSIG -H 'content-type: application/json' --data '$SBODY' -X POST $PUSH")"
+  r1="$(code_raw "$ip" "$RES $CA $CERT $KEY $cfgarg $BADSIG -H 'content-type: application/json' --data '$SBODY' -X POST $PUSH")"
+  r2="$(code_raw "$ip" "$RES $CA $CERT $KEY $cfgarg $BADSIG -H 'content-type: application/json' --data '$SBODY' -X POST $PUSH")"
   if [ "$r1" = "401" ] && [ "$r2" = "401" ]; then
     pass nsa_gaps "sync_push_replay_refused[$h]" "401/401" "$r1/$r2 (sig+nonce gate live)"
   else
@@ -594,7 +594,7 @@ SQL" 2>/dev/null | tail -1)"
   PROV="https://$h:$FEDERATION_PORT/api/v1/recall?q=$PNONCE&namespace=$PROV_PROBE_NS&limit=3&verbose_provenance=true"
   pi=0; pb=""
   while [ "$pi" -lt "$PROV_RECALL_POLL_TRIES" ]; do
-    pb="$(body_raw "$ip" "$RES $CA $CERT $KEY $keyhdr -H 'x-agent-id: $AID_H' -H 'accept-provenance: verbose' '$PROV'")"
+    pb="$(body_raw "$ip" "$RES $CA $CERT $KEY $cfgarg -H 'x-agent-id: $AID_H' -H 'accept-provenance: verbose' '$PROV'")"
     case "$pb" in *"$PNONCE"*) break ;; esac
     pi=$((pi + 1)); sleep "$PROV_RECALL_POLL_SLEEP_SECS"
   done

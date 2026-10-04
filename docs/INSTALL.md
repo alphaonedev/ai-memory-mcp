@@ -524,8 +524,10 @@ ai-memory serve --host 127.0.0.1 --port 9077
 Then add the MCP server to your Grok API call:
 
 ```bash
-curl https://api.x.ai/v1/responses \
-  -H "Authorization: Bearer $XAI_API_KEY" \
+# The key is piped to curl as a config line (printf is a shell builtin), so it is
+# never a curl argument and never appears in `ps`.
+printf 'header = "Authorization: Bearer %s"\n' "$XAI_API_KEY" |
+  curl https://api.x.ai/v1/responses --config - \
   -H "Content-Type: application/json" \
   -d '{
     "model": "grok-4.3",

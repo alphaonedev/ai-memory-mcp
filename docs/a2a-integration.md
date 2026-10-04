@@ -295,9 +295,10 @@ For immediate daemon-driven hints, set `API_BASE` to your daemon's HTTPS base
 URL and supply your approved API key and TLS files through these placeholders:
 
 ```bash
-curl --fail-with-body --silent --show-error \
+printf 'header = "X-API-Key: %s"\n' "$API_KEY" |
+  curl --fail-with-body --silent --show-error --config - \
   --cacert "$CA_CERT" --cert "$CLIENT_CERT" --key "$CLIENT_KEY" \
-  -H "X-API-Key: $API_KEY" -H "X-Agent-Id: $COORDINATOR" \
+  -H "X-Agent-Id: $COORDINATOR" \
   -H 'Content-Type: application/json' \
   "$API_BASE/api/v1/notify" \
   --data '{"target_agent_id":"ai:worker","title":"Next batch","content":"Please process the queued work."}'

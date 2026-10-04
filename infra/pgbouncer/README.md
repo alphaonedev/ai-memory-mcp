@@ -23,10 +23,10 @@ concurrency (that is bounded by the postgres+AGE backbone — see 4.D).
 
 ## Wire ai-memory at the pooler
 
-Point the daemon's store URL at the pooler's port (`6432`), not postgres (`5432`):
+Point the daemon's store URL at the pooler's port (`6432`), not postgres (`5432`). The URL (for example `postgres://ai_memory@pgbouncer:6432/ai_memory`, with the password in `~/.pgpass` or the URL) lives in a mode 0600 file, so it never reaches the process argv:
 
 ```bash
-ai-memory serve --store-url postgres://ai_memory@pgbouncer:6432/ai_memory
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory serve
 ```
 
 ## Why `pool_mode = transaction` is mandatory

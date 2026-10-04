@@ -52,12 +52,12 @@ mtls_curl() {
   local ip="$1" host="$2" method="$3" path="$4" data="${5:-}"
   local base="--max-time 8 --resolve $host:$FEDERATION_PORT:127.0.0.1 \
     --cacert $REMOTE_TLS/ca.pem --cert $REMOTE_TLS/client.pem --key $REMOTE_TLS/client.key"
-  local keyhdr=""; [ -n "$API_KEY" ] && keyhdr="-H 'x-api-key: $API_KEY'"
+  local cfgarg=""; [ -n "$API_KEY" ] && cfgarg="--config -"
   if [ "$method" = "POST" ]; then
-    ssh_node "$ip" "curl -fsS $base $keyhdr -X POST -H 'content-type: application/json' \
+    ssh_node_keyed "$ip" "curl -fsS $base $cfgarg -X POST -H 'content-type: application/json' \
       --data '$data' https://$host:$FEDERATION_PORT$path" 2>/dev/null || true
   else
-    ssh_node "$ip" "curl -fsS $base $keyhdr -X $method https://$host:$FEDERATION_PORT$path" 2>/dev/null || true
+    ssh_node_keyed "$ip" "curl -fsS $base $cfgarg -X $method https://$host:$FEDERATION_PORT$path" 2>/dev/null || true
   fi
 }
 

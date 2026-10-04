@@ -174,8 +174,8 @@ substrate, sorted by `(agent_id ASC, namespace ASC)`:
 ## HTTP wire shape
 
 ```bash
-curl -X POST -H "Content-Type: application/json" \
-  -H "X-API-Key: $API_KEY" \
+printf 'header = "X-API-Key: %s"\n' "$API_KEY" |
+  curl -X POST --config - -H "Content-Type: application/json" \
   -H "X-Agent-Id: ai:claude-opus@host:pid-12345" \
   https://127.0.0.1:9077/api/v1/quota/status \
   -d '{}'

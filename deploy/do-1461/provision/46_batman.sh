@@ -178,12 +178,12 @@ activate_form7_on_peer() {
   std_body="$(attested_body "$DEFAULT_NAMESPACE" "$std_title" observation collective \
     "Form 2 synchronous atomise-before-embed + Form 6 auto-classify (regex_then_llm) namespace standard. Set by provision/46_batman.sh on peer $host.")"
   curl_base="--max-time 8 --resolve $host:$FEDERATION_PORT:127.0.0.1 --cacert $REMOTE_TLS/ca.pem --cert $REMOTE_TLS/client.pem --key $REMOTE_TLS/client.key"
-  std_id="$(ssh_node "$ip" "curl -fsS $curl_base -H 'x-api-key: $api_key' -H 'x-agent-id: $HARNESS_AGENT_ID' -X POST -H 'content-type: application/json' --data '$std_body' https://$host:$FEDERATION_PORT/api/v1/memories" 2>/dev/null | sed -n 's/.*"id"[^"]*"\([^"]*\)".*/\1/p')"
+  std_id="$(ssh_node_with_key "$api_key" "$ip" "curl -fsS $curl_base --config - -H 'x-agent-id: $HARNESS_AGENT_ID' -X POST -H 'content-type: application/json' --data '$std_body' https://$host:$FEDERATION_PORT/api/v1/memories" 2>/dev/null | sed -n 's/.*"id"[^"]*"\([^"]*\)".*/\1/p')"
   [ -n "$std_id" ] \
     || die "[$host] namespace-standard store refused — Form-2/6 bind failed (#1614)"
   local std_payload
   std_payload="$(printf '{"id":"%s","governance":%s}' "$std_id" "$policy_json")"
-  ssh_node "$ip" "curl -fsS $curl_base -H 'x-api-key: $api_key' -H 'x-agent-id: $HARNESS_AGENT_ID' -X POST -H 'content-type: application/json' --data '$std_payload' https://$host:$FEDERATION_PORT/api/v1/namespaces/$DEFAULT_NAMESPACE/standard" >/dev/null 2>&1 \
+  ssh_node_with_key "$api_key" "$ip" "curl -fsS $curl_base --config - -H 'x-agent-id: $HARNESS_AGENT_ID' -X POST -H 'content-type: application/json' --data '$std_payload' https://$host:$FEDERATION_PORT/api/v1/namespaces/$DEFAULT_NAMESPACE/standard" >/dev/null 2>&1 \
     || die "[$host] namespace set-standard HTTP call failed — Form-2/6 bind incomplete (#1614)"
   # Belt-and-braces: prove the standard round-trips from the live store.
   # NOTE (#1614): the path-form GET /namespaces/<ns>/standard is an honest
@@ -192,7 +192,7 @@ activate_form7_on_peer() {
   # path-form DOES persist, DB-confirmed). The IMPLEMENTED postgres read
   # arm is the query-string form GET /namespaces?namespace=<ns>, which
   # returns {standard_id: <id>, ...}. Probe that one.
-  ssh_node "$ip" "curl -fsS $curl_base -H 'x-api-key: $api_key' 'https://$host:$FEDERATION_PORT/api/v1/namespaces?namespace=$DEFAULT_NAMESPACE'" 2>/dev/null \
+  ssh_node_with_key "$api_key" "$ip" "curl -fsS $curl_base --config - 'https://$host:$FEDERATION_PORT/api/v1/namespaces?namespace=$DEFAULT_NAMESPACE'" 2>/dev/null \
       | grep -q "$std_id" \
     || die "[$host] GET-standard probe did not return id=$std_id — Form-2/6 bind did not persist (#1614)"
   log "[$host] Form-2/6 namespace standard bound on $DEFAULT_NAMESPACE (id=$std_id, live store, GET-probe verified)"

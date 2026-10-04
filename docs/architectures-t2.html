@@ -187,8 +187,9 @@ ai-memory tls import --cert /etc/ai-memory/tls/fullchain.pem --key /etc/ai-memor
 ai-memory --db /var/lib/ai-memory/ai-memory.db serve --host 127.0.0.1 --port 9077
 
 # HTTPS agents identify themselves on every call and trust the daemon's CA
-curl -s --cacert /etc/ai-memory/tls/ca.pem -X POST https://127.0.0.1:9077/api/v1/recall \
-  -H "X-Agent-Id: org/team-a/planner" -H "X-API-Key: $PLANNER_KEY" \
+printf 'header = "X-API-Key: %s"\n' "$PLANNER_KEY" |
+  curl -s --config - --cacert /etc/ai-memory/tls/ca.pem -X POST https://127.0.0.1:9077/api/v1/recall \
+  -H "X-Agent-Id: org/team-a/planner" \
   -H "Content-Type: application/json" \
   -d '{"context":"release blockers","as_agent":"org/team-a/planner"}'
 

@@ -30,7 +30,8 @@ is consumed single-use to defeat replay within that window.
 ## Stream contract
 
 ```bash
-curl -N -H "X-API-Key: $API_KEY" \
+printf 'header = "X-API-Key: %s"\n' "$API_KEY" |
+  curl -N --config - \
      -H "X-Agent-Id: ai:dashboard@host" \
      https://127.0.0.1:9077/api/v1/approvals/stream
 ```
@@ -170,14 +171,16 @@ Step 3. Compute the key (`SHA256(secret)`) and the signature:
 ```bash
 SECRET="$(cat /etc/ai-memory/hmac.secret)"
 KEY_HEX=$(printf '%s' "$SECRET" | openssl dgst -sha256 -hex | awk '{print $2}')
-SIG=$(printf '%s' "$CANONICAL" | openssl dgst -sha256 -hmac "$KEY_HEX" -hex | awk '{print $2}')
+# openssl dgst -hmac would put the key on its argv (visible in ps); python3 reads it from the
+# environment instead. The result is byte-identical to openssl dgst -sha256 -hmac "$KEY_HEX".
+SIG=$(printf '%s' "$CANONICAL" | KEY_HEX="$KEY_HEX" python3 -c 'import hashlib, hmac, os, sys; print(hmac.new(os.environ["KEY_HEX"].encode(), sys.stdin.buffer.read(), hashlib.sha256).hexdigest())')
 ```
 
 Step 4. Send the request:
 
 ```bash
-curl -X POST \
-  -H "X-API-Key: $API_KEY" \
+printf 'header = "X-API-Key: %s"\n' "$API_KEY" |
+  curl -X POST --config - \
   -H "X-AI-Memory-Timestamp: $TS" \
   -H "X-AI-Memory-Signature: sha256=$SIG" \
   -H "Content-Type: application/json" \

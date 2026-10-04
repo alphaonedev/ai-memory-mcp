@@ -52,7 +52,7 @@ json_field() {
 }
 hdrs() {
   local aid="$1" h=""
-  [ -n "$API_KEY" ] && h="-H 'x-api-key: $API_KEY'"
+  [ -n "$API_KEY" ] && h="--config -"
   [ -n "$aid" ] && h="$h -H 'x-agent-id: $aid'"
   printf '%s' "$h"
 }
@@ -60,14 +60,14 @@ hdrs() {
 body_req() {
   local rip="$1" cip="$2" host="$3" m="$4" path="$5" data="${6:-}" aid="${7:-}"
   local extra=""; [ -n "$data" ] && extra="-H 'content-type: application/json' --data '$data'"
-  ssh_node "$rip" "curl -fsS --max-time 15 --resolve $host:$FEDERATION_PORT:$cip \
+  ssh_node_keyed "$rip" "curl -fsS --max-time 15 --resolve $host:$FEDERATION_PORT:$cip \
     --cacert $REMOTE_TLS/ca.pem --cert $REMOTE_TLS/client.pem --key $REMOTE_TLS/client.key \
     $(hdrs "$aid") $extra -X $m https://$host:$FEDERATION_PORT$path" 2>/dev/null || true
 }
 # body_raw <run_ip> <curl_arg_string> -> response body regardless of status.
 body_raw() {
   local rip="$1" args="$2"
-  ssh_node "$rip" "curl -s --max-time 15 $args; true" 2>/dev/null || true
+  ssh_node_keyed "$rip" "curl -s --max-time 15 $args; true" 2>/dev/null || true
 }
 # pgx_schema <region> <schema> <sql> -> psql result on that region's pg node,
 # scoped to <schema> via PGOPTIONS search_path (socket/peer auth, NO password on
@@ -299,11 +299,11 @@ record "$ANCHOR_H" federation bulk_corpus_cross_region "informational (loader pe
 PTERM="$(printf '%s' "$ATLAS_RECALL_TERMS" | awk '{print $1}')"
 RES="--resolve $ANCHOR_H:$FEDERATION_PORT:127.0.0.1"
 CA="--cacert $REMOTE_TLS/ca.pem"; CERT="--cert $REMOTE_TLS/client.pem"; KEY="--key $REMOTE_TLS/client.key"
-keyhdr=""; [ -n "$API_KEY" ] && keyhdr="-H 'x-api-key: $API_KEY'"
+cfgarg=""; [ -n "$API_KEY" ] && cfgarg="--config -"
 PURL="https://$ANCHOR_H:$FEDERATION_PORT/api/v1/recall?q=$PTERM&namespace=$ATLAS_NAMESPACE&limit=3&verbose_provenance=true"
 pi=0; pb=""
 while [ "$pi" -lt "$ATLAS_RECALL_POLL_TRIES" ]; do
-  pb="$(body_raw "$ANCHOR_IP" "$RES $CA $CERT $KEY $keyhdr -H 'x-agent-id: $ATLAS_AGENT_ID' -H 'accept-provenance: verbose' '$PURL'")"
+  pb="$(body_raw "$ANCHOR_IP" "$RES $CA $CERT $KEY $cfgarg -H 'x-agent-id: $ATLAS_AGENT_ID' -H 'accept-provenance: verbose' '$PURL'")"
   case "$pb" in *memory_kind*) break ;; esac
   pi=$((pi + 1)); sleep "$ATLAS_RECALL_POLL_SLEEP_SECS"
 done
