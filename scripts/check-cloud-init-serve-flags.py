@@ -2267,14 +2267,42 @@ def classify(name: str, text: str):
     return lines, hits + ["%s: rule R5 did not settle on which files are data" % name], entries, stmts
 
 
+def nameref_facts(texts: list):
+    """(names, poisoned) for declare/typeset/local -n (#5174). A nameref and its target
+    share one value, and an assignment through the nameref writes the target, so every
+    name in an -n declaration, and every name assigned to a nameref, has a value the gate
+    cannot read. A target built from an expansion can be any name: then no name is
+    resolved (poisoned, fail closed)."""
+    refs, names, poisoned = set(), set(), False
+    for text in texts:
+        for m in re.finditer(r"(?<![\w$./-])(?:declare|typeset|local)((?:\s+[-+][A-Za-z]+)*)\s*([^;&|\n]*)", text):
+            if not any(f.startswith("-") and "n" in f for f in m.group(1).split()):
+                continue
+            body = m.group(2)
+            refs.update(re.findall(r"(?<![\w$-])([A-Za-z_]\w*)", body.split("=", 1)[0]))
+            names.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", body))
+            poisoned = poisoned or "$" in body or "`" in body
+    for text in texts:
+        for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)(?:\[[^]]*\])?\+?=(\S*)", text):
+            if m.group(1) in refs:
+                names.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", m.group(2)))
+                poisoned = poisoned or "$" in m.group(2) or "`" in m.group(2)
+    return names | refs, poisoned
+
+
 def var_values(stmts: list) -> dict:
     """NAME -> every literal text the template assigns it (assignment, export, local,
     declare, for-loop word), for names never read from input (#5095)."""
     vals, unknown = {}, set()
     for _w, stmt, _st in stmts:
         text = tf_render(stmt)
-        for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)(?:\[[^]]*\])?\+?=(\S*)", text):
-            vals.setdefault(m.group(1), set()).add(unquote(m.group(2).rstrip(";"))[0])
+        for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)(?:\[[^]]*\])?(\+?)=(\S*)", text):
+            v = unquote(m.group(3).rstrip(";"))[0]
+            # NAME+=text appends to every value NAME already holds; an append can repeat
+            # (a loop), so the prior value followed by any text is kept too (#5174)
+            prior = set(vals.get(m.group(1), {""})) if m.group(2) else {""}
+            add = {p + v for p in prior} | ({p + "*" for p in prior} if m.group(2) else set())
+            vals.setdefault(m.group(1), set()).update(add)
         for m in re.finditer(r"(?:^|[\s;&|(])for\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*)", text):
             for wd in m.group(2).split():
                 vals.setdefault(m.group(1), set()).add(unquote(wd)[0])
@@ -2282,7 +2310,10 @@ def var_values(stmts: list) -> dict:
             unknown.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", m.group(1)))
         unknown.update(re.findall(r"\bprintf\s+-v\s*([A-Za-z_]\w*)", text))
         unknown.update(re.findall(r"\bgetopts\s+\S+\s+([A-Za-z_]\w*)", text))
-    return {k: v for k, v in vals.items() if k not in unknown}
+    refs, poisoned = nameref_facts([tf_render(stmt) for _w, stmt, _st in stmts])
+    if poisoned:
+        return {}
+    return {k: v for k, v in vals.items() if k not in unknown and k not in refs}
 
 
 EXPAND_CAP = 64
@@ -2341,11 +2372,8 @@ def binary_vars(stmts: list) -> frozenset:
             unknown.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", m.group(1)))
         unknown.update(re.findall(r"\bprintf\s+-v\s*([A-Za-z_]\w*)", text))
         unknown.update(re.findall(r"\bgetopts\s+\S+\s+([A-Za-z_]\w*)", text))
-        # a nameref (declare/typeset/local -n) reads another name; an array, an append
-        # (+=) or a glob in the value is not the text the operand expands to (R11)
-        for m in re.finditer(r"\b(?:declare|typeset|local)((?:\s+-[A-Za-z]+)+)([^;&|\n]*)", text):
-            if "n" in m.group(1):
-                unknown.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", m.group(2)))
+        # an array, an append (+=) or a glob in the value is not the text the operand
+        # expands to (#5219, #5174); namerefs are read by nameref_facts below
         for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)(\[[^]]*\])?(\+?)=(\S*)", text):
             if m.group(2) or m.group(3) or m.group(4).startswith("(") or re.search(r"[*?\[]", m.group(4)):
                 unknown.add(m.group(1))
@@ -2378,6 +2406,10 @@ def binary_vars(stmts: list) -> frozenset:
     # resolved names, to a fixpoint: every value is literal text and every expansion in it
     # is a positional parameter or a resolved name
     names = {a[0] for a in assigns}
+    refs, poisoned = nameref_facts([tf_render(stmt) for _w, stmt, _st in stmts])
+    unknown |= refs
+    if poisoned:
+        names = set()
     resolved = set()
     while True:
         n = len(resolved)
@@ -2857,6 +2889,9 @@ def build_probes() -> list:
         ('resolved name through a default operator behind taskset, listed (#4837 R12 R4, #5173)', [(dec, '      A=; taskset -c 0 "$${A:-/usr/local/lib/ai-memory/bin/ai-memory}" --db /x stats\n' + dec)]),
         ('resolved name through a pattern operator behind taskset, listed (#4837 R12 R4, #5173)', [(dec, '      A=/usr/local/lib/ai-memory/bin/ai-memorx; taskset -c 0 "$${A/x/y}" --db /x stats\n' + dec)]),
         ('resolved name through a case operator behind taskset, listed (#4837 R12 R4, #5173)', [(dec, '      A=/usr/local/lib/ai-memory/bin/AI-MEMORY; taskset -c 0 "$${A,,}" --db /x stats\n' + dec)]),
+        ('nameref declared before its target behind taskset, listed (#4837 R12 R4, #5174)', [(dec, '      declare -n R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('target written through a nameref behind taskset, listed (#4837 R12 R4, #5174)', [(dec, '      A=/usr/bin/true; declare -n R; R=A; R=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$A" --db /x stats\n' + dec)]),
+        ('nameref whose target is an expansion behind taskset, listed (#4837 R12 R4, #5174)', [(dec, '      T=A; A=/usr/local/lib/ai-memory/bin/ai-memory; declare -n R="$T"; taskset -c 0 "$R" --db /x stats\n' + dec)]),
         ('ai-memory through a variable behind taskset, listed (#4837 R12 R4)', [(dec, '      AIM=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$${AIM}" --db $${X} stats\n' + dec)]),
         ('shell run by an unknown wrapper, listed (#4837 R12 R4)', [(dec, "      taskset -c 0 sh -c '/usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats'\n" + dec)]),
         ('ai-memory copied to another name with cp, listed (#4837 R12 R4)', [(dec, '      cp /usr/local/lib/ai-memory/bin/ai-memory /usr/local/bin/aim\n' + dec)]),
@@ -2880,6 +2915,9 @@ def build_probes() -> list:
         ('data-home file run as an unresolved stdin target, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      read F < /etc/x; bash < \"$${F}\"\n" + dec)]),
         ('data-home file run through a default operator on an empty name, listed (#4837 R12 R5, #5173)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      A=; bash "$${A:-/etc/ai-memory/run.conf}"\n' + dec)]),
         ('data-home file run through a suffix operator, listed (#4837 R12 R5, #5173)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      A=/etc/ai-memory/run.conf.x; bash "$${A%.x}"\n' + dec)]),
+        ('data-home file run through an append-built path, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/run; F+=.conf; bash "$F"\n' + dec)]),
+        ('data-home file run through an append-built path with a suffix, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/run; F+=.conf; bash "$F".x\n' + dec)]),
+        ('data-home file run through a nameref, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      declare -n R=A; A=/etc/ai-memory/run.conf; bash "$R"\n' + dec)]),
         ('data-home file copied by tee from its stdin, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      tee /usr/local/bin/r.sh < /etc/ai-memory/run.conf > /dev/null\n      bash /usr/local/bin/r.sh\n" + dec)]),
         ('data-home file copied by sed in a redirected group, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      { sed 's/a/a/' /etc/ai-memory/run.conf; } > /usr/local/bin/r.sh\n      bash /usr/local/bin/r.sh\n" + dec)]),
         ('data-home file named by echo in a substitution, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      taskset -c 0 \"$(echo /etc/ai-memory/run.conf)\".x\n      bash /usr/local/bin/r.sh\n" + dec)]),
