@@ -16,9 +16,41 @@
 # FORMAT — native OpenSSH `allowed_signers`(5): one line per enrolled
 # principal, `<principal> <key-type> <base64-key> [comment]`. This is the
 # EXACT file format `git log --show-signature` / `%G?` consumes via
-# `gpg.ssh.allowedSignersFile` (git >= 2.34) — no custom parser needed on
-# either side, so the registry format and the verification format can never
-# drift apart the way a bespoke YAML/JSON mirror could.
+# `gpg.ssh.allowedSignersFile` (git >= 2.34), so for the principal-matching
+# half of the check there is no hand-written mirror of this data anywhere:
+# git reads THIS file.
+#
+# That native-format property is REAL but it is NOT a guarantee that nothing
+# can drift (#5045). An earlier revision of this header claimed the registry
+# format and the verification format "can never drift apart" with "no custom
+# parser needed on either side". That is no longer true, and saying so in an
+# attested registry would itself be the docs-drift defect this repo treats as
+# real. Three things parse signer data now:
+#
+#   1. git, natively, via `gpg.ssh.allowedSignersFile` — principal matching.
+#   2. `check-commit-signing-posture.sh`, which reads column 1 of this file
+#      for the enrolled-principal allowlist and DERIVES each key's
+#      `SHA256:` fingerprint from columns 2-3 with `ssh-keygen -lf` in order
+#      to pin `%GF` (the fingerprint that actually verified). Derived, never
+#      hand-copied: a typed-out fingerprint mirror would be a second place
+#      for the same key to drift.
+#   3. A SECOND, SEPARATE registry — `enrolled-gpg-commit-signers.txt` plus
+#      its `.asc` key material — which pins OpenPGP fingerprints in a bespoke
+#      format with its own parser. It exists because git dispatches signature
+#      verification on the signature type carried IN THE COMMIT OBJECT, and
+#      `gpg.format` does not override that dispatch: an OpenPGP-signed commit
+#      is checked against the OpenPGP keyring and never against this file. On
+#      a stock CI runner that keyring is empty, which is why 67 commits the
+#      operator legitimately signed were refused with `%G?=E` (#5045).
+#
+# So the honest statement is: the SSH principal check consumes this file
+# natively, the SSH fingerprint pin is derived from it mechanically, and the
+# OpenPGP pin lives in a sibling registry that CAN drift from this one. What
+# closes that is not a format claim but a test: the gate's `--self-test` case
+# (k) asserts, on every CI run, that the shipped registries agree with the
+# shipped key material and that the pinned set still carries BOTH halves, so
+# losing either half fails the gate closed instead of silently narrowing or
+# widening what it accepts.
 #
 # WHAT THIS DOES NOT CLAIM. This registry proves a commit's Ed25519 SSH
 # signature was produced by the holder of THIS exact private key, and that

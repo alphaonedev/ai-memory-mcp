@@ -1,0 +1,93 @@
+# enrolled-gpg-commit-signers.txt — the SSOT enrolled **OpenPGP fingerprint**
+# registry for `scripts/check-commit-signing-posture.sh` (#5045).
+#
+# ============================================================================
+# HAND-ENROLLED FROM OPERATOR CUSTODY. NEVER GENERATE THIS FILE (OR ITS
+# `.asc` SIBLING) FROM A LIVE GITHUB API CALL (e.g.
+# `https://github.com/<user>.gpg`). A live-fetched registry is exactly as
+# trustworthy as the network path fetching it, and a key ADD or REVOKE would
+# become effective the moment DNS/GitHub answers differently — silently, with
+# no reviewed diff. Same pinned-key discipline as
+# enrolled-commit-signers.txt and release-tag-signers.txt: an out-of-band
+# enrolled key, reviewed in a PR diff on rotation, never trusted from an
+# unauthenticated live fetch.
+# ============================================================================
+#
+# WHY A SECOND REGISTRY EXISTS. enrolled-commit-signers.txt is an OpenSSH
+# `allowed_signers`(5) file, and git consumes it only on the SSH verification
+# path. git dispatches signature verification on the signature TYPE IN THE
+# COMMIT OBJECT (`gpgsig -----BEGIN PGP SIGNATURE-----` vs
+# `-----BEGIN SSH SIGNATURE-----`); `gpg.format` does not override that
+# dispatch. So an OpenPGP-signed commit is verified against the OpenPGP
+# keyring, which on a stock CI runner is EMPTY — `%G?` is `E` and the gate
+# refuses a commit the operator legitimately signed. That is #5045: 67 such
+# commits. The remedy is NOT to relax the accept test; it is to give the job a
+# HERMETIC keyring holding exactly the enrolled key, and to pin the
+# fingerprint it must produce.
+#
+# WHY A FINGERPRINT AND NOT A LONG KEY ID. The gate pins `%GF` (the
+# fingerprint git reports from gpg's VALIDSIG line — only ever populated for a
+# signature that actually verified). It must NEVER pin `%GK`: `%GK` is read
+# from the UNVERIFIED signature packet, is populated even against an EMPTY
+# keyring, and is populated on commits whose `%GF` is empty — so a `%GK` pin
+# is forgeable. Both facts are measured evidence on the #5045 cohort.
+#
+# WHY THE PIN IS LOAD-BEARING AND THE KEYRING IS NOT TRUSTED ON ITS OWN.
+# Importing a key alone would be a gate that reports success while proving
+# nothing (the #2444 shape): ANY key merely present in the keyring with
+# trust also yields `%G? = G`, so trust would silently become "whatever is in
+# the runner keyring". The accept test is therefore `%G? == G` AND
+# `%GF` ∈ the pinned set derived from THIS file and from
+# enrolled-commit-signers.txt. The `.asc` sibling supplies key MATERIAL only;
+# it is not an authority. A key present in the `.asc` but absent from this
+# file is given no ownertrust and cannot produce a `G`, and a fingerprint
+# listed here but absent from the `.asc` fails the gate CLOSED.
+#
+# FORMAT — one line per enrolled key: `<40-hex-fingerprint> [comment]`.
+# Column 1 is compared case-insensitively (OpenPGP fingerprints are hex);
+# everything after it is a human comment. Blank lines and `#` comments are
+# ignored. A line whose column 1 is not exactly 40 hex characters is NOT a
+# pin and is ignored — if that leaves the file with zero fingerprints the
+# gate fails CLOSED, exactly as a missing or zero-principal
+# enrolled-commit-signers.txt already does.
+#
+# KEY MATERIAL — scripts/qc-allowlists/enrolled-gpg-commit-signers.asc, the
+# ASCII-armored PUBLIC key block for the fingerprints below, exported from
+# operator custody (`gpg --export --armor <long-id>`). Public key material
+# only; no secret key is ever committed.
+#
+# PRIMARY KEYS ONLY, AND WHY THAT IS COMPLETE RATHER THAN PARTIAL. git reports
+# `%GF` as the fingerprint of the key that ACTUALLY produced the signature. For
+# a signature made by a signing SUBKEY that is the SUBKEY's fingerprint, not
+# the primary's (the primary is `%GP`). The enrolled key's only subkey is
+# ENCRYPTION-ONLY — `gpg --with-colons --list-keys` reports
+# `sub:...:18:...:e:` (ECDH, capability `e`) against the primary's `22` /
+# `scESC` (EdDSA) — so it can never produce a commit signature, and all 67
+# OpenPGP-signed commits in the #5045 cohort report `%GF` == `%GP` == the
+# primary fingerprint below. Pinning the primary is therefore complete for
+# this key, not an oversight.
+#
+# If a SIGNING subkey is ever added to an enrolled key, commits signed with it
+# will be REFUSED — `signing-key-not-pinned (%GF=<subkey fingerprint>)` — until
+# that subkey's own fingerprint is enrolled here by a reviewed PR. That is
+# fail-CLOSED and deliberate: silently accepting any subkey of a pinned primary
+# would widen the pin to key material the reviewed diff never showed, and
+# subkey rotation is exactly the moment to re-review what is trusted.
+#
+# WHAT THIS DOES NOT CLAIM. This registry proves a commit's OpenPGP signature
+# was produced by the holder of the private key whose public half hashes to
+# the pinned fingerprint. It does NOT reproduce GitHub's own server-side
+# "Verified" badge computation (a separate system, not queried here) and it
+# does NOT prove which GitHub *account* holds the key — a public key carries
+# no identity of its own, and account binding here is the operator's
+# out-of-band enrollment record, recorded via this reviewed PR diff. Same
+# ATTESTABLE-vs-OPERATIONAL boundary documented in enrolled-commit-signers.txt
+# and in this repo's `AI_MEMORY_*_PUBKEY` rows: signature verification against
+# this pin is cryptographically enforced; WHO was enrolled here is
+# operational trust.
+#
+# Enrolled: the operator key (`alphaonedev`), the same identity
+# enrolled-commit-signers.txt pins on the SSH path. Enrolling (or revoking) a
+# fingerprint is a reviewed PR to this file AND to the `.asc` sibling, never a
+# silent host-side edit.
+3CC4DC662D9BBDD0C2BBF815A8DDC77E9747CBC9 alphaonedev (operator-bound OpenPGP identity; uid "Justin Jessup <Justin@alpha-one.mobi>"; ed25519, created 2026-04-08; long id A8DDC77E9747CBC9)

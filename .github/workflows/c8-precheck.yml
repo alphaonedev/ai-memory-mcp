@@ -957,17 +957,56 @@ jobs:
     # GIT_COMMITTER_EMAIL/GIT_AUTHOR_EMAIL env-var overrides, which a
     # host-side file fix cannot reach) and is not hypothetical.
     #
-    # For every commit in the PR's OWN range (`scripts/check-commit-signing-
-    # posture.sh`, never a GitHub web-flow squash/merge artifact — those
-    # exist only AFTER merge and are the separate, explicitly out-of-scope
-    # #2486 item 3 "merge-mechanism decision"): the committer AND author
-    # email must each be an enrolled principal in
-    # `scripts/qc-allowlists/enrolled-commit-signers.txt`, AND
-    # `git log --format=%G?` verified against that SAME registry must report
-    # exactly `G` (good signature, principal matched) — not merely "some
-    # signature is present", which would let an unenrolled key sign under a
-    # spoofed enrolled email and pass (the #2444 "reports success while
-    # doing nothing" shape).
+    # For every NON-MERGE commit in the PR's OWN range
+    # (`merge-base(base,HEAD)..HEAD --no-merges`, never a GitHub web-flow
+    # squash/merge artifact — those exist only AFTER merge and are the
+    # separate, explicitly out-of-scope #2486 item 3 "merge-mechanism
+    # decision"): the committer AND author email must each be an enrolled
+    # principal in `scripts/qc-allowlists/enrolled-commit-signers.txt`, AND
+    # `git log --format=%G?` must report exactly `G` (good signature,
+    # principal matched) AND `%GF` — the fingerprint of the key that
+    # ACTUALLY verified — must be a member of the PINNED fingerprint set.
+    # Not merely "some signature is present", which would let an unenrolled
+    # key sign under a spoofed enrolled email and pass (the #2444 "reports
+    # success while doing nothing" shape).
+    #
+    # The `--no-merges` scoping, the `%GF` pin, the hermetic OpenPGP keyring
+    # and the non-vacuity floor below are the #5045 / #5046 / #5047 repair,
+    # per the crossroads verdict `5-agent vote (4d3ea1c5)` (ai-memory
+    # 86c7ae16-2591-461c-a797-dfd779f05edf):
+    #
+    #   * #5045 — git dispatches verification on the signature type carried
+    #     IN THE COMMIT OBJECT, and `gpg.format` does not override that
+    #     dispatch, so an OpenPGP-signed commit is checked against the
+    #     OpenPGP keyring and never against the SSH registry. On a stock
+    #     runner that keyring is EMPTY, so `%G?` is `E` and the gate refused
+    #     67 commits the operator legitimately signed. The gate now builds a
+    #     HERMETIC, job-scoped GNUPGHOME (never the ambient runner keyring,
+    #     never a live GitHub API call) from the hand-enrolled
+    #     `scripts/qc-allowlists/enrolled-gpg-commit-signers.{txt,asc}`, and
+    #     pins `%GF` against the union of the SSH and OpenPGP registries.
+    #     `%GK` is deliberately NEVER pinned: it is read from the UNVERIFIED
+    #     signature packet, is populated even against an empty keyring and on
+    #     commits whose `%GF` is empty, so a `%GK` pin is forgeable.
+    #   * #5046 — the gate's own header has always scoped the rule to the
+    #     PR's source commits, but that carve-out was DOCUMENTED ONLY, so 8
+    #     two-parent web-flow merge commits (committer `GitHub
+    #     <noreply@github.com>`) were refused for unbound-committer-email.
+    #     All 8 of 8 are merges, so `--no-merges` clears them WITHOUT pinning
+    #     GitHub's web-flow key — deliberately, because pinning a third-party
+    #     key would extend this repo's sole-authority trust boundary to a key
+    #     whose continued ownership no self-test can prove.
+    #   * #5047 — an EMPTY range previously PASSED (exit 0, no output): a
+    #     gate reporting success while scanning nothing, inside the very gate
+    #     that exists to close that class. Zero commits scanned is now a FAIL
+    #     (exit 2) with a diagnostic naming the resolved base and head SHAs.
+    #
+    # Exit codes: 0 clean (or non-pull_request event, N/A) · 1 a commit in
+    # range violated the rule · 2 the gate could not do its job and refuses
+    # to report PASS (registry loss, unresolvable range, keyring-setup
+    # failure, zero commits scanned, or `PR_BASE_SHA` unset on a
+    # pull_request event). A wiring fault reports 2, not 1, so it is never
+    # misattributed to the PR author as a commit violation.
     #
     # This is #2486's "load-bearing item" (its proposed-fix #1): a CI posture
     # gate on the release branch's PR range. It does NOT stand in for
@@ -1002,27 +1041,64 @@ jobs:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: bash scripts/check-commit-signing-posture.sh
       - name: Self-test the gate (#2486 regression evidence)
-        # --self-test constructs a throwaway repo with an ephemeral SSH
-        # keypair (no network, no dependency on the real enrolled key) and
-        # asserts SEVEN shapes: (a) an enrolled identity with a valid
-        # signature PASSES; (b) the exact #2486 identity-drift shape
-        # (unbound email, unsigned) is REJECTED naming both violations
-        # independently; (c) an enrolled email with NO signature at all is
-        # REJECTED (isolates the signature check from the email check); (d)
-        # an enrolled email CLAIMED but signed with a non-enrolled ROGUE key
-        # is REJECTED (proves verification is against the registry, not
-        # merely "a signature exists" — the spoofed-identity case a bare
-        # has-a-signature check would miss); (e) an unresolvable commit
-        # range fails CLOSED; (f) a MISSING enrolled-signers registry fails
-        # CLOSED; (g) an EMPTY (zero-principal) registry fails CLOSED — (f)
-        # and (g) are the explicit `assert_registry_usable` guard (Fable
-        # review finding L5, #2486): the fail-closed-on-registry-loss
-        # property was previously ACCIDENTAL (an artifact of `set -e`/
-        # `pipefail` reacting to grep's no-match exit inside
-        # `enrolled_principals`), not directly asserted, so a future
-        # refactor (e.g. `local x=$(...)`, which swallows the substitution's
-        # exit status, or a stray `|| true`) could have silently flipped it
-        # fail-open with nothing catching the regression.
+        # --self-test constructs a throwaway repo with TWO ephemeral SSH
+        # keypairs and TWO ephemeral OpenPGP keys (no network, no dependency
+        # on the real enrolled keys) and asserts FIFTEEN shapes, printing
+        # each case's observed and expected exit code so the evidence is
+        # readable straight out of this job's log:
+        #
+        #   (a) an enrolled identity with a valid SSH signature PASSES.
+        #   (b) the exact #2486 identity-drift shape (unbound email,
+        #       unsigned) is REJECTED naming both violations independently.
+        #   (c) an enrolled email with NO signature at all is REJECTED
+        #       (isolates the signature check from the email check).
+        #   (d) an enrolled email CLAIMED but signed with a non-enrolled
+        #       ROGUE SSH key is REJECTED (proves verification is against
+        #       the registry, not merely "a signature exists" — the
+        #       spoofed-identity case a bare has-a-signature check misses).
+        #   (e) an unresolvable commit range fails CLOSED with exit 2.
+        #   (f) a MISSING enrolled-signers registry fails CLOSED.
+        #   (g) an EMPTY (zero-principal) registry fails CLOSED. (f) and (g)
+        #       are the explicit `assert_registry_usable` guard (Fable review
+        #       finding L5, #2486): the fail-closed-on-registry-loss property
+        #       was previously ACCIDENTAL (an artifact of `set -e`/`pipefail`
+        #       reacting to grep's no-match exit inside
+        #       `enrolled_principals`), not directly asserted, so a future
+        #       refactor (e.g. `local x=$(...)`, which swallows the
+        #       substitution's exit status, or a stray `|| true`) could have
+        #       silently flipped it fail-open with nothing catching it.
+        #   (g2) the same, for the #5045 OpenPGP fingerprint registry: both
+        #       MISSING and zero-well-formed-fingerprint fail CLOSED, so
+        #       losing the OpenPGP pin cannot degrade into "the SSH half
+        #       still passes, nothing noticed".
+        #   (h) a commit signed with the PINNED OpenPGP key PASSES, in a
+        #       range that also contains an SSH-signed commit — proving both
+        #       verification paths pass under ONE unioned pin (#5045).
+        #   (i) LOAD-BEARING, NEVER DELETE. A fully-verifying (`%G?=G`)
+        #       OpenPGP signature from a key that is IN THE SAME KEYRING but
+        #       NOT PINNED is REJECTED, specifically as
+        #       `signing-key-not-pinned`. This is the only case that fails if
+        #       a future edit drops the `%GF` pin while keeping the keyring
+        #       import — without it the OpenPGP path silently widens from
+        #       "the enrolled operator key" to "ANY key in the runner
+        #       keyring" (#2444 shape). Verified by mutation: deleting the
+        #       `%GF` branch turns (i) red and leaves (a) and (h) green.
+        #   (j) an EMPTY commit range fails CLOSED with exit 2 — the #5047
+        #       non-vacuity floor. This case PASSED before the repair.
+        #   (k) a hermetic keyring really builds from the SHIPPED registry +
+        #       `.asc` material (no ephemeral stand-in) and the shipped pin
+        #       still carries BOTH halves — this is what proves the import
+        #       step the step above depends on is not vapour, and that
+        #       `enrolled-gpg-commit-signers.txt` has not drifted from its
+        #       `.asc` sibling.
+        #   (l) the gate's ENTRY POINT, which no other case reaches: a
+        #       non-pull_request event reports N/A at exit 0, and a
+        #       pull_request event with `PR_BASE_SHA` unset fails CLOSED at
+        #       exit 2 (inoperative — a CI-wiring fault), never 0 and never 1.
+        #       Sibling precedent: check-cert-expiry.sh case (k).
+        #
+        # `gpg(1)` is required: if it is unavailable the self-test fails
+        # CLOSED (exit 2) rather than silently skipping the OpenPGP half.
         run: bash scripts/check-commit-signing-posture.sh --self-test
 
   cert-expiry-gate:
