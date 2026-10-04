@@ -322,6 +322,17 @@ def commit_all(root: Path, message: str) -> str:
     return git(root, "rev-parse", "HEAD").decode().strip()
 
 
+def non_isolated_child(script: Path, flags: list, scratch: Path):
+    """#5380: run `script` with the interpreter flags `flags` (never -I) and the comparison arguments. Returns None
+    without starting anything when `script` is inside the real scripts/ directory: there a merged sibling named
+    like a standard module would run inside the trusted job, so the child must start from a scratch copy."""
+    if Path(script).resolve().parent == Path(__file__).resolve().parent:
+        return None
+    return subprocess.run([sys.executable, *flags, str(script), "--base-root", ".", "--repo", ".",
+                           "--base-sha", "0" * 40, "--head-sha", "0" * 40, "--scratch", str(scratch)],
+                          capture_output=True, text=True, check=False)
+
+
 def imported_modules(path: Path) -> list:
     """#5379: the top-level names of every module `path` imports (parsed, never executed), except the built-in
     `sys`. The self-test plants one file per name beside its non-isolated child, so an import of ANY module
@@ -508,13 +519,12 @@ def self_test() -> int:
         # together (-I is exactly -E plus -s plus the path rule) and -S, -B, -O; none is isolation. -P (safe path)
         # is deliberately not pinned here: it removes the script directory, so a refusal under it is a posture choice.
         for flags in ([], ["-E"], ["-s"], ["-E", "-s"], ["-E", "-s", "-S", "-B", "-O"]):
-            result = subprocess.run([sys.executable, *flags, str(copy), "--base-root", ".", "--repo", ".",
-                                     "--base-sha", "0" * 40, "--head-sha", "0" * 40, "--scratch", str(iso / "s")],
-                                    capture_output=True, text=True, check=False)
-            if not (result.returncode == 1 and "isolated mode" in result.stdout
-                    and "PLANTED" not in result.stdout + result.stderr):
+            result = non_isolated_child(copy, flags, iso / "s")
+            if result is None or not (result.returncode == 1 and "isolated mode" in result.stdout
+                                      and "PLANTED" not in result.stdout + result.stderr):
                 return False
-        return True
+        # #5380: the helper refuses to start a child from the real scripts/ directory; pin that refusal.
+        return non_isolated_child(Path(__file__).resolve(), [], iso / "s") is None
 
     if isolated_refusal():
         print("PASS: self-test - a comparison run without -I fails closed (R5, #5163)")
