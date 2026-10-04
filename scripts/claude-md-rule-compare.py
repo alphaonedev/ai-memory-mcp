@@ -45,6 +45,7 @@ if __name__ == "__main__" and not sys.flags.isolated:
     sys.exit(1)
 
 import argparse  # noqa: E402 - after the isolated-mode refusal on purpose (#5163)
+import ast
 import difflib
 import importlib.util
 import os
@@ -321,6 +322,20 @@ def commit_all(root: Path, message: str) -> str:
     return git(root, "rev-parse", "HEAD").decode().strip()
 
 
+def imported_modules(path: Path) -> list:
+    """#5379: the top-level names of every module `path` imports (parsed, never executed), except the built-in
+    `sys`. The self-test plants one file per name beside its non-isolated child, so an import of ANY module
+    placed before the module-top refusal runs a planted file instead of going unnoticed."""
+    names = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module.split(".")[0])
+    names.discard("sys")
+    return sorted(names)
+
+
 def self_test() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     guard_path = repo_root / GUARD_REL
@@ -486,7 +501,7 @@ def self_test() -> int:
         iso.mkdir(parents=True, exist_ok=True)
         copy = iso / "claude-md-rule-compare.py"
         shutil.copyfile(Path(__file__).resolve(), copy)
-        for name in ("argparse", "difflib", "py_compile", "re", "shutil", "stat", "subprocess"):
+        for name in imported_modules(Path(__file__).resolve()):
             (iso / f"{name}.py").write_text("print('PLANTED')\nraise SystemExit(0)\n", encoding="utf-8")
         # #5283: the refusal must hold for every partial isolation, not only for a bare interpreter: -E (ignore
         # PYTHON* variables) and -s (no user site) each leave the script directory on sys.path. #5373: so do both
