@@ -42,7 +42,7 @@ def section(text, start, end):
 
 
 def plain_id_def(text):
-    """The federate.sh plain_id helper line (node_get calls it), or empty before it existed."""
+    """The federate.sh plain_id helper line (verify calls it before node_get), or empty before it existed."""
     return next((l for l in text.splitlines() if l.startswith("plain_id() {")), "")
 
 
@@ -442,15 +442,19 @@ def f2_node_get_id():
         # verify names the cause (a refused id) instead of retrying it as a replication failure.
         fs = FED.read_text()
         for var, start, end in (("QID", '  if [ -n "$QID" ] && ! plain_id "$QID"; then', "  # A4 --"),
-                                ("SID", '      if [ -n "$SID" ] && ! plain_id "$SID"; then', "      if [ \"$scode\" = \"201\" ]")):
+                                ("SID", '      SID=$(echo "$sjson" | jq -r \'.id // empty\' 2>/dev/null)\n', '      if [ -n "$SID" ]; then\n        lvl=""')):
+            # find, not index: a moved or renamed anchor is a FAIL line, never a traceback that skips later probes.
+            # SID starts after its assignment, so the snippet holds both the id check and the accept line
+            # in source order: a check moved after the accept line prints OK and turns this red.
             i = fs.find(start)
-            snip = fs[i:fs.index(end, i)] if i >= 0 else ""
+            j = fs.find(end, i) if i >= 0 else -1
+            snip = fs[i + (len(start) if var == "SID" else 0):j] if 0 <= i < j else ""
             sc = ("%s\nok() { echo OK; }\nno() { echo \"NO $*\"; }\nnode_get() { echo CALLED; }\nsleep() { :; }\n"
-                  "%s='x;touch %s'\n%s\necho \"after=[$%s]\"\n" % (plain_id_def(fs), var, marker, snip, var))
+                  "scode=201\nsjson='{}'\n%s='x;touch %s'\n%s\necho \"after=[$%s]\"\n" % (plain_id_def(fs), var, marker, snip, var))
             r = run_bash(sc, d)
-            probe("F2 verify reports a non-plain %s as a refused id and never reads it back" % var,
-                  i >= 0 and "not a plain id" in r.stdout and "CALLED" not in r.stdout and "after=[]" in r.stdout
-                  and not marker.exists(), r.stdout.strip()[:80])
+            probe("F2 verify reports a non-plain %s as a refused id, once, and never reads it back" % var,
+                  0 <= i < j and "not a plain id" in r.stdout and r.stdout.count("NO ") == 1 and "OK" not in r.stdout
+                  and "CALLED" not in r.stdout and "after=[]" in r.stdout and not marker.exists(), r.stdout.strip()[:80])
 
 
 def f2_id_lists_agree():

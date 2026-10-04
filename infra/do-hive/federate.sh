@@ -475,13 +475,15 @@ EOS
       scode=$(echo "$sresp" | tail -1)
       sjson=$(echo "$sresp" | sed '$d')
       SID=$(echo "$sjson" | jq -r '.id // empty' 2>/dev/null)
+      srefused=""
       if [ -n "$SID" ] && ! plain_id "$SID"; then
         no "signed write at node 1 returned a memory id that is not a plain id; it is not read back"
-        SID=""
+        SID=""; srefused=1
       fi
+      # A refused id is one failure with one cause: do not report it again as a rejected write.
       if [ "$scode" = "201" ] && [ -n "$SID" ]; then
         ok "signed write accepted at node 1 (201 id=$SID)"
-      else
+      elif [ -z "$srefused" ]; then
         no "signed write at node 1 got '$scode' ($sjson)"
       fi
       if [ -n "$SID" ]; then
