@@ -184,6 +184,8 @@ info "nothing is written outside this directory: no /tmp, no \$HOME"
 ADB="$RUN/node-a/node.db"; BDB="$RUN/node-b/node.db"
 ALOG="$RUN/node-a/daemon.log"; BLOG="$RUN/node-b/daemon.log"
 KA="$RUN/node-a/keys"; KB="$RUN/node-b/keys"; KAUTH="$RUN/author-keys"
+# #3198: identity generate refuses a group- or world-writable key dir, so pin 0700 explicitly (the umask is the caller's).
+chmod 0700 "$KA" "$KB" "$KAUTH" "$RUN/governance"
 
 # tier = keyword. The lab proves federation, mTLS and attestation — none of
 # which need an embedder — so the nodes must not try to download or load one.
@@ -265,7 +267,8 @@ for DB in "$ADB" "$BDB"; do
   while [ "$attempt" -lt 3 ]; do
     attempt=$((attempt + 1))
     AI_MEMORY_NO_CONFIG=1 "$BIN" agents register --agent-id "$AUTHOR" --agent-type system --db "$DB" >/dev/null 2>&1
-    AI_MEMORY_NO_CONFIG=1 "$BIN" agents bind-key --agent-id "$AUTHOR" --pubkey "$AUTHOR_PUB" --db "$DB" >/dev/null 2>&1
+    # #3464: bind-key proves possession in-process from the local key store, so point it at the author key dir.
+    AI_MEMORY_KEY_DIR="$KAUTH" AI_MEMORY_NO_CONFIG=1 "$BIN" agents bind-key --agent-id "$AUTHOR" --pubkey "$AUTHOR_PUB" --db "$DB" >/dev/null 2>&1
     bound="$(bound_pubkey "$DB")"
     [ "$bound" = "$AUTHOR_PUB" ] && break
     warn "bind-key attempt $attempt on $label did not persist metadata.agent_pubkey (issue #2941) — retrying"
@@ -372,27 +375,30 @@ if [ "$CAVEAT_PROBE" -eq 1 ]; then
   if ! lab_port_free "$PROBE_PORT"; then
     no "caveat probe cannot run: port $PROBE_PORT is occupied, so a non-zero exit would prove nothing"
   else
+    # #3582: the profile refuses a federation config with no peer allowlist, so give the probe one;
+    # otherwise it would refuse for THAT reason and not for the rollback check being documented.
     ( HOME="$PROBE_HOME" AI_MEMORY_SECURITY_PROFILE=asi-hard AI_MEMORY_KEY_DIR="$RUN/governance" \
+      AI_MEMORY_FED_PEER_ATTESTATION="{\"$AGENT_A\":{\"allowed_namespaces\":[\"$FED_NS\"]}}" \
       timeout 60 "$BIN" serve --host 127.0.0.1 --port "$PROBE_PORT" --db "$RUN/probe.db" \
         --tls-cert "$OUT/server.crt" --tls-key "$OUT/server.key" \
         --mtls-allowlist "$OUT/allowlist.txt" ) >>"$PROBE" 2>&1
     PROBE_RC=$?
     echo "exit_code=$PROBE_RC" >> "$PROBE"
-    # A non-zero exit alone is NOT the proof — a bind failure, a missing cert
-    # or any unrelated fault also exits non-zero. The refusal has to be the ONE
-    # being documented, so the captured stderr must name the rollback check.
-    if [ "$PROBE_RC" -ne 0 ] && grep -qi "rollback" "$PROBE"; then
-      ok "caveat demonstrated: full asi-hard cold boot on a fresh DB exited $PROBE_RC naming the rollback check (issue #2942) — evidence in run/evidence/caveat-asi-hard-coldboot.txt"
+    # #4938: a non-zero exit alone is NOT the proof, and neither is the word "rollback":
+    # the profile prints an INFO pin line naming the knob on every boot, and a node that
+    # booted and was killed by `timeout` exits 124. Only a REFUSAL counts as the caveat:
+    # a non-zero exit other than 124 with a non-INFO line naming the rollback check.
+    if grep -q "listening on" "$PROBE" && { [ "$PROBE_RC" -eq 124 ] || [ "$PROBE_RC" -eq 0 ]; }; then
+      warn "the full asi-hard cold boot SUCCEEDED (listening, exit $PROBE_RC): the #2942 caveat does NOT reproduce."
+      warn "  This kit's reduced posture and README caveat are STALE on this build (issue #4938)."
+      ok "caveat probe ran: #2942 no longer reproduces on this build (exit $PROBE_RC after listening) — evidence in run/evidence/caveat-asi-hard-coldboot.txt"
+    elif [ "$PROBE_RC" -ne 0 ] && [ "$PROBE_RC" -ne 124 ] \
+         && grep -v "pinned security knob" "$PROBE" | grep -Ev '(^| )INFO( |$)|INFO' | grep -qi "rollback"; then
+      ok "caveat demonstrated: full asi-hard cold boot on a fresh DB REFUSED (exit $PROBE_RC) naming the rollback check (issue #2942) — evidence in run/evidence/caveat-asi-hard-coldboot.txt"
       info "$(grep -iE 'rollback|refuse|fatal' "$PROBE" | tail -2 | sed 's/^/     /')"
-    elif [ "$PROBE_RC" -ne 0 ]; then
-      no "caveat probe exited $PROBE_RC but did NOT name the rollback check — that is a different failure, not #2942"
-      info "$(tail -3 "$PROBE" | sed 's/^/     /')"
     else
-      # Not a lab failure — it would mean #2942 was FIXED. Say so, loudly.
-      warn "the full asi-hard cold boot SUCCEEDED (exit 0)."
-      warn "  If you are on a build where #2942 is fixed, this kit's reduced posture and"
-      warn "  its README caveat are now STALE and should be updated to the full profile."
-      ok "caveat probe ran (exit 0 — #2942 appears fixed on this build; see the warning above)"
+      no "caveat probe exited $PROBE_RC with neither a clean boot nor a rollback-check refusal — a different failure"
+      info "$(tail -3 "$PROBE" | sed 's/^/     /')"
     fi
     rm -f "$RUN/probe.db"*
   fi
@@ -406,13 +412,16 @@ step "6 · launch the two-node mTLS federation"
 #   node-b :$PORT_B  server=peerB.crt  allowlist pins peerA's client cert
 # Each fans its writes to the other using its OWN cert as the outbound client
 # cert and verifies the peer's server cert against the shared CA.
-launch_node() { # <name> <port> <db> <keydir> <fedid> <homedir> <peerport> <servercert> <serverkey> <allowlist> <log>
-  local name="$1" port="$2" db="$3" keydir="$4" fedid="$5" home="$6" peer="$7" sc="$8" sk="$9" al="${10}" log="${11}"
+launch_node() { # <name> <port> <db> <keydir> <fedid> <homedir> <peerport> <servercert> <serverkey> <allowlist> <log> <peerfedid>
+  local name="$1" port="$2" db="$3" keydir="$4" fedid="$5" home="$6" peer="$7" sc="$8" sk="$9" al="${10}" log="${11}" peerfed="${12}"
   (
     lab_posture_export
     export HOME="$home"
     export AI_MEMORY_KEY_DIR="$keydir"
     export AI_MEMORY_FED_IDENTITY="$fedid"
+    # #3582: FED_REQUIRE_PUSH_NAMESPACE_SCOPE is pinned, so key enrollment alone grants no namespace
+    # scope: name the namespaces the peer may write.
+    export AI_MEMORY_FED_PEER_ATTESTATION="{\"$peerfed\":{\"allowed_namespaces\":[\"$FED_NS\",\"$CORPUS_NS\"]}}"
     export AI_MEMORY_WITNESS_KEY_DIR="$RUN/governance"
     export RUST_LOG="${RUST_LOG:-ai_memory=info,federation=debug}"
     exec "$BIN" serve --host 127.0.0.1 --port "$port" --db "$db" \
@@ -426,9 +435,9 @@ launch_node() { # <name> <port> <db> <keydir> <fedid> <homedir> <peerport> <serv
 }
 
 launch_node node-a "$PORT_A" "$ADB" "$KA" "$AGENT_A" "$RUN/node-a/home" "$PORT_B" \
-  "$OUT/peerA.crt" "$OUT/peerA.key" "$OUT/peerA.allowlist" "$ALOG"
+  "$OUT/peerA.crt" "$OUT/peerA.key" "$OUT/peerA.allowlist" "$ALOG" "$AGENT_B"
 launch_node node-b "$PORT_B" "$BDB" "$KB" "$AGENT_B" "$RUN/node-b/home" "$PORT_A" \
-  "$OUT/peerB.crt" "$OUT/peerB.key" "$OUT/peerB.allowlist" "$BLOG"
+  "$OUT/peerB.crt" "$OUT/peerB.key" "$OUT/peerB.allowlist" "$BLOG" "$AGENT_A"
 
 # peerB's cert is the client peerA trusts, and vice versa.
 CA_CLIENT=("$OUT/peerB.crt" "$OUT/peerB.key")

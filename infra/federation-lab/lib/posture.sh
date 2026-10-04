@@ -16,7 +16,9 @@
 #   ABSENT off-table head anchor as refuse-to-open, and that anchor is emitted
 #   only by the witness watermark cadence over the `signed_events` chain —
 #   which is empty on a brand-new database. Fresh DB => no anchor => exit 75.
-#   Tracked as issue #2942 (OPEN as of 2026-08-15).
+#   Tracked as issue #2942 (CLOSED, fixed by PR #3096: on a current build a fresh
+#   cold boot succeeds and the probe says so; the omission is kept until the lab is
+#   re-run at the full profile, issue #4938).
 #
 #   Because the profile knob's contract is pin-and-refuse, we cannot say
 #   "asi-hard, but with rollback-check off": setting the profile AND lowering

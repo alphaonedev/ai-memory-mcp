@@ -44,10 +44,10 @@ directory and cleans up after itself — including on Ctrl-C.
 
 **Honest by construction.** The lab runs every `asi-hard` posture
 knob but one at its hard floor and tells you exactly why that one is missing:
-`AI_MEMORY_REQUIRE_ROLLBACK_CHECK` cannot cold-boot a fresh node (no off-table
-head anchor exists yet — [#2942](https://github.com/alphaonedev/ai-memory-mcp/issues/2942)),
-so the kit *demonstrates* that limitation with a captured exit code rather than
-papering over it. It also re-derives the pinned-knob set from
+`AI_MEMORY_REQUIRE_ROLLBACK_CHECK` could not cold-boot a fresh node on older builds (no off-table
+head anchor — [#2942](https://github.com/alphaonedev/ai-memory-mcp/issues/2942)),
+so the kit probes it on every run and records the captured exit code (a timeout kill of a
+healthy node is never counted as a refusal) rather than papering over it. It also re-derives the pinned-knob set from
 `src/security_profile.rs` on every run and goes red if the kit and the code
 ever disagree.
 
