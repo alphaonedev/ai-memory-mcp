@@ -9,7 +9,10 @@ changes what is approved: any added, removed or reordered line in any
 (template, context) sequence is printed and the file is left unchanged, unless
 --accept-new is given, and then every change is printed so the approval is
 named in the run output as well as in the diff.
-Usage: regen-cloud-init-token-allow.py [--accept-new] <repo-root>
+It refuses to write anything while the allow or pending list has a form fault or a
+pending entry that matches no triggered line (#5116), since such an entry no longer
+keeps its line out of the allowlist.
+Usage: regen-cloud-init-token-allow.py [--accept-new | --self-test] <repo-root>
 """
 import argparse
 import difflib
@@ -19,17 +22,62 @@ from collections import Counter
 from pathlib import Path
 
 
+def pending_refusals(g, templates, allow, pend) -> list:
+    """Reasons to refuse any rewrite (#5116). A pending entry excludes its line from the
+    allowlist; one the gate drops as a form fault, or one that matches no triggered line,
+    excludes nothing, so a rewrite would write that tracked line as approved."""
+    faults = []
+    g.load_entries(allow, False, faults, "allow")
+    pe = g.load_entries(pend, True, faults, "pending")
+    out = ["FAULT: " + f for f in faults]
+    seen = set()
+    cache = {}
+    for nm, text in sorted(templates.items()):
+        sc = g.scope_of(nm)
+        _, _, _, trig, _ = g.analyse(nm, text, cache)
+        seen |= {(s, ln.ctx, ln.text) for ln in trig for s in (sc, "both")}
+    out += ["STALE PENDING: %s %s | %s | %s" % (e[0], e[1], e[2], e[3]) for e in pe if (e[0], e[2], e[3]) not in seen]
+    if out:
+        out.append("refused: fix the allow or pending list first (%d problem(s)); nothing was written" % len(out))
+    return out
+
+
+def self_test(g, templates, allow, pend) -> int:
+    """The clean lists give no refusal; a stale pending entry and an unknown tracker each do."""
+    first = next(x for x in pend.splitlines() if x and not x.startswith("#"))
+    head, rest = first.split(" | ", 1)
+    cases = [
+        ("clean lists", pend, False),
+        ("stale pending entry", pend.replace(first, head + " | top | nothing-matches:", 1), True),
+        ("pending entry under an unknown tracker", pend.replace(first, head.split(" ")[0] + " #1 | " + rest, 1), True),
+    ]
+    bad = [lbl for lbl, p, want in cases if bool(pending_refusals(g, templates, allow, p)) != want]
+    for lbl in bad:
+        print("REGEN SELF-TEST FAIL: " + lbl, file=sys.stderr)
+    if not bad:
+        print("REGEN SELF-TEST PASS: %d cases" % len(cases))
+    return 1 if bad else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root")
     ap.add_argument("--accept-new", action="store_true",
                     help="write added, removed or reordered lines (each change is printed)")
+    ap.add_argument("--self-test", action="store_true",
+                    help="check that a stale or faulty pending entry refuses a rewrite (#5116)")
     a = ap.parse_args()
     root = Path(a.root)
     spec = importlib.util.spec_from_file_location("g", str(root / "scripts/check-cloud-init-serve-flags.py"))
     g = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(g)
     templates, _, allow, pend = g.load_repo()
+    if a.self_test:
+        return self_test(g, templates, allow, pend)
+    refusals = pending_refusals(g, templates, allow, pend)
+    if refusals:
+        print("\n".join(refusals), file=sys.stderr)
+        return 1
     faults = []
     old = g.load_entries(allow, False, faults, "allow")
     pe = g.load_entries(pend, True, faults, "pending")
