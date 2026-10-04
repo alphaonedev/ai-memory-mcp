@@ -17,6 +17,7 @@ import threading
 import pathlib
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1300,6 +1301,26 @@ def pg_version_5172():
         probe("#5172 18.6 on a line after server_version does not pass", len(pg) == 1 and pg[0].startswith("NO"), "%s" % pg)
 
 
+def reply_len_padded_wc():
+    """#4999: reply_len prints only digits and ' bytes' even where wc pads its count (BSD wc prints
+    leading blanks); a GNU-only test cannot see that, so a PATH wc stand-in pads the real count."""
+    fs = FED.read_text()
+    defs = reply_defs(fs)
+    real_wc = shutil.which("wc")
+    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+        d = pathlib.Path(t)
+        (d / "wc").write_text("#!/bin/bash\nn=\"$(%s \"$@\" | tr -cd 0123456789)\"\nprintf '%%8s\\t\\n' \"$n\"\n" % real_wc)
+        (d / "wc").chmod(0o755)
+        own = run_bash_bytes("printf abc | wc -c", d)
+        probe("#4999 the padded wc stand-in pads the count", own.stdout == b"       3\t\n", repr(own.stdout))
+        bad = []
+        for b in (b"", b"abc", b"x" * 300, "é€".encode("utf-8"), b"a\nb\n"):
+            r = run_bash_bytes("%s\nreply_len %s\n" % (defs, bq(b)), d)
+            if r.stdout != b"%d bytes" % len(b):
+                bad.append("%d:%r" % (len(b), r.stdout))
+        probe("#4999 reply_len prints exactly the byte count and ' bytes' when wc pads its output", bool(defs) and not bad, " ".join(bad))
+
+
 def ext_pin_5275():
     """#5275: AGE and pgvector pass only on their own labelled line after server_version, exactly once."""
     fs = FED.read_text()
@@ -1385,6 +1406,7 @@ def main():
     n1_no_locale_ranges()
     f2_node_get_id()
     f2_id_lists_agree()
+    reply_len_padded_wc()
     pg_version_5172()
     ext_pin_5275()
     node_streams_5171()
