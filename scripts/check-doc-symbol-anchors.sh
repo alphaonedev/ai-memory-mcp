@@ -33,8 +33,8 @@
 #            0 never lands on code). Cheap, dependency-free, and it catches the
 #            whole truncated-anchor class without needing to know what
 #            is ON that line.
-#            The range separator may be `-`, an en dash or an em dash
-#            (#5188). A `[label](src/x.rs#L<a>-L<b>)` fragment of a
+#            The range separator may be `-`, an en dash or an em dash,
+#            with optional spaces around it (#5188, #5267). A `[label](src/x.rs#L<a>-L<b>)` fragment of a
 #            RELATIVE link is range-checked the same way (#5189).
 #   QUAL   — every identifier in `src/<path>.rs::<sym>` and
 #            `src/<path>.rs::{a, B::c, d}` must be DEFINED IN THAT FILE.
@@ -285,6 +285,12 @@ MDEOF
     anchor_red 5188 LINE "an em-dash range whose end passes end-of-file" 'See `src/mcp/tools/recall.rs:2—9999`.'
     anchor_red 5188 LINE "a reversed en-dash range (:3-2)" 'See `src/mcp/tools/recall.rs:3–2`.'
     anchor_green 5188 "a valid en-dash range (:2-4)" 'See `src/mcp/tools/recall.rs:2–4`.'
+    # #5267: whitespace around the dash does not hide a range.
+    anchor_red 5267 LINE "a spaced hyphen range whose end passes end-of-file" 'See `src/mcp/tools/recall.rs:2 - 9999`.'
+    anchor_red 5267 LINE "a spaced en-dash range whose end passes end-of-file" 'See `src/mcp/tools/recall.rs:2 – 9999`.'
+    anchor_red 5267 LINE "a spaced em-dash range whose end passes end-of-file" 'See `src/mcp/tools/recall.rs:2 — 9999`.'
+    anchor_green 5267 "a valid spaced range (:2 - 4)" 'See `src/mcp/tools/recall.rs:2 - 4`.'
+    anchor_green 5267 "a closed code span followed by a spaced dash and a number" 'See `src/mcp/tools/recall.rs:2` - 9999 other things.'
 
     # #5194: a src token preceded by a dot is left alone (its root is
     # unknown); the CANON lookbehind must keep the dot.
@@ -690,7 +696,7 @@ def canon(line):
 PATH = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs)`")
 # #5188: the range separator may also be an en dash (U+2013) or em dash
 # (U+2014), which smart-quote editors and pasted prose produce.
-PATHLN = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs):(\d+)(?:[-\u2013\u2014](\d+))?")
+PATHLN = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs):(\d+)(?:\s*[-\u2013\u2014]\s*(\d+))?")
 # #4651: a BARE `src/x.rs:N` (no leading backtick: plain prose, a link
 # label, HTML text). Not preceded by a backtick (PATHLN owns that form),
 # a path separator, a dot or an alphanumeric, so URL path segments are
