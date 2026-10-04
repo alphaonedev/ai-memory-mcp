@@ -5,7 +5,10 @@
 # context: top, a top-level key (bootcmd, runcmd, packages, ...) or the write_files path.
 # line: the template's logical line, whitespace-normalised (runs of blanks collapsed, no edge blanks).
 # Adding an entry approves the exact line for review: the gate still runs the companion rule and the
-# validators on it. A malformed, duplicate, non-normalised, unknown-scope or stale entry fails the gate.
+# validators on it. Per (template, context) the approved lines must be these entries in file order and
+# count: a repeated line needs a repeated entry. A malformed, non-normalised or unknown-scope entry, or
+# one also listed as pending, fails the gate. Regenerate: scripts/regen-cloud-init-token-allow.py <repo-root>
+# (an added, removed or moved line needs --accept-new; review the diff).
 both | top | package_update: true
 do-hive | top | package_upgrade: false
 both | top | bootcmd:
@@ -135,11 +138,14 @@ aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | mv "$HBA.new" "$HBA"
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | systemctl restart postgresql
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sleep 5
-aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if grep -q CHANGEME /etc/ai-memory/store-url; then
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if [ "$DB_PASS" = CHANGEME ]; then
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | NEW_SECRET="$(openssl rand -hex 24)"
-aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sed -i "s/CHANGEME/$NEW_SECRET/" /etc/ai-memory/store-url
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | DB_URL="$(sed -n 's#^\(.*\)$#\1#p' /etc/ai-memory/store-url)"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | printf '%s%s%s\n' "${DB_URL%%CHANGEME*}" "$NEW_SECRET" "${DB_URL#*CHANGEME}" > /etc/ai-memory/store-url
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
-aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if grep -q CHANGEME /etc/ai-memory/store-url; then
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if [ "$DB_PASS" = CHANGEME ]; then
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
@@ -243,12 +249,7 @@ do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | API_KEY="$(cat /etc/ai-me
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | DAEMON_CFG_DIR=/var/lib/ai-memory/.config/ai-memory
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | install -d -o aimemory -g aimemory -m 0750 "$DAEMON_CFG_DIR"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | ( umask 077
-do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | cat > "$DAEMON_CFG_DIR/config.toml" <<CFG
-do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | schema_version = 2
-do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | api_key = "$API_KEY"
-do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | [admin]
-do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | agent_ids = ["$ADMIN_ID"]
-do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | CFG
+do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | printf 'schema_version = 2\napi_key = "%s"\n\n[admin]\nagent_ids = ["%s"]\n' "$API_KEY" "$ADMIN_ID" > "$DAEMON_CFG_DIR/config.toml"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | ) || fail "could not write the daemon config"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | chown root:aimemory "$DAEMON_CFG_DIR/config.toml"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | chmod 0640 "$DAEMON_CFG_DIR/config.toml"
@@ -357,11 +358,14 @@ do-hive | /usr/local/sbin/ai-memory-provision.sh | install -d -o root -g root -m
 do-hive | /usr/local/sbin/ai-memory-provision.sh | install -d -o aimemory -g aimemory -m 0750 /var/lib/ai-memory /var/log/ai-memory
 do-hive | /usr/local/sbin/ai-memory-provision.sh | chown root:aimemory /etc/ai-memory
 do-hive | /usr/local/sbin/ai-memory-provision.sh | chmod 0750 /etc/ai-memory
-do-hive | /usr/local/sbin/ai-memory-provision.sh | if grep -q CHANGEME /etc/ai-memory/store-url; then
+do-hive | /usr/local/sbin/ai-memory-provision.sh | DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+do-hive | /usr/local/sbin/ai-memory-provision.sh | if [ "$DB_PASS" = CHANGEME ]; then
 do-hive | /usr/local/sbin/ai-memory-provision.sh | NEW_SECRET="$(openssl rand -hex 24)"
-do-hive | /usr/local/sbin/ai-memory-provision.sh | sed -i "s/CHANGEME/$NEW_SECRET/" /etc/ai-memory/store-url
+do-hive | /usr/local/sbin/ai-memory-provision.sh | DB_URL="$(sed -n 's#^\(.*\)$#\1#p' /etc/ai-memory/store-url)"
+do-hive | /usr/local/sbin/ai-memory-provision.sh | printf '%s%s%s\n' "${DB_URL%%CHANGEME*}" "$NEW_SECRET" "${DB_URL#*CHANGEME}" > /etc/ai-memory/store-url
 do-hive | /usr/local/sbin/ai-memory-provision.sh | fi
-do-hive | /usr/local/sbin/ai-memory-provision.sh | if grep -q CHANGEME /etc/ai-memory/store-url; then
+do-hive | /usr/local/sbin/ai-memory-provision.sh | DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+do-hive | /usr/local/sbin/ai-memory-provision.sh | if [ "$DB_PASS" = CHANGEME ]; then
 do-hive | /usr/local/sbin/ai-memory-provision.sh | echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1
 do-hive | /usr/local/sbin/ai-memory-provision.sh | fi
 do-hive | /usr/local/sbin/ai-memory-provision.sh | chown aimemory:aimemory /etc/ai-memory/store-url

@@ -755,8 +755,10 @@ CREATE EXTENSION IF NOT EXISTS age;
 # schema-init enumerates the target store's catalog, including
 # installed extensions — AGE present ⇒ Cypher path; absent ⇒ the
 # recursive-CTE fallback stays in place (see docs/kg-backend-fallback.md).
-# (#3705) the DSN must pin sslmode=verify-full&sslrootcert=<ca> or it is refused at connect
-ai-memory schema-init --store-url 'postgres://…?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
+# (#3705) the DSN must pin sslmode=verify-full&sslrootcert=<ca> or it is refused at connect.
+# (#4600, 1.0.0+) the DSN lives in a 0600 file, never on argv:
+#   postgres://…?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
 **Acceptance gate:** AGE p95 must beat CTE p95 by ≥30% at depth=5 to ship in a given build — the bench gate (`feat/v0.7-j-8-age-bench-gate`) enforces it. If AGE isn't faster on your Postgres + hardware combination, stay on the CTE path; the substrate is happy with either. See [MIGRATION § Apache AGE acceleration](MIGRATION_v0.7.html#apache-age-acceleration-opt-in) and the [`attested-cortex` RFC § Decision 3](v0.7/rfc-attested-cortex.html#decision-3--why-age-behind-a-feature-flag-vs-hard-dependency) for why AGE ships behind a feature flag instead of as a hard dependency.

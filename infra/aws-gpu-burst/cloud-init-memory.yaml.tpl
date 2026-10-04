@@ -250,11 +250,14 @@ write_files:
       # #4610/#4788: the role password is minted here, on the node, from the
       # placeholder (hex, so it needs no URL or SQL quoting); a re-run keeps the
       # one the file already carries. Fail closed if the placeholder survives.
-      if grep -q CHANGEME /etc/ai-memory/store-url; then
+      DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+      if [ "$DB_PASS" = CHANGEME ]; then
         NEW_SECRET="$(openssl rand -hex 24)"
-        sed -i "s/CHANGEME/$NEW_SECRET/" /etc/ai-memory/store-url
+        DB_URL="$(sed -n 's#^\(.*\)$#\1#p' /etc/ai-memory/store-url)"
+        printf '%s%s%s\n' "${DB_URL%%CHANGEME*}" "$NEW_SECRET" "${DB_URL#*CHANGEME}" > /etc/ai-memory/store-url
       fi
-      if grep -q CHANGEME /etc/ai-memory/store-url; then
+      DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+      if [ "$DB_PASS" = CHANGEME ]; then
         echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1
       fi
       DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"

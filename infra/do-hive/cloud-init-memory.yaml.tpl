@@ -328,13 +328,7 @@ write_files:
       DAEMON_CFG_DIR=/var/lib/ai-memory/.config/ai-memory
       install -d -o aimemory -g aimemory -m 0750 "$DAEMON_CFG_DIR"
       ( umask 077
-        cat > "$DAEMON_CFG_DIR/config.toml" <<CFG
-      schema_version = 2
-      api_key = "$API_KEY"
-
-      [admin]
-      agent_ids = ["$ADMIN_ID"]
-      CFG
+        printf 'schema_version = 2\napi_key = "%s"\n\n[admin]\nagent_ids = ["%s"]\n' "$API_KEY" "$ADMIN_ID" > "$DAEMON_CFG_DIR/config.toml"
       ) || fail "could not write the daemon config"
       chown root:aimemory "$DAEMON_CFG_DIR/config.toml"
       chmod 0640 "$DAEMON_CFG_DIR/config.toml"
@@ -498,12 +492,15 @@ write_files:
       # The role password is minted here, on the node, from the placeholder
       # (hex, so it needs no URL or SQL quoting); a re-run keeps the one the
       # file already carries.
-      if grep -q CHANGEME /etc/ai-memory/store-url; then
+      DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+      if [ "$DB_PASS" = CHANGEME ]; then
         NEW_SECRET="$(openssl rand -hex 24)"
-        sed -i "s/CHANGEME/$NEW_SECRET/" /etc/ai-memory/store-url
+        DB_URL="$(sed -n 's#^\(.*\)$#\1#p' /etc/ai-memory/store-url)"
+        printf '%s%s%s\n' "${DB_URL%%CHANGEME*}" "$NEW_SECRET" "${DB_URL#*CHANGEME}" > /etc/ai-memory/store-url
       fi
       # Fail closed: the shipped placeholder must never reach a running node.
-      if grep -q CHANGEME /etc/ai-memory/store-url; then
+      DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+      if [ "$DB_PASS" = CHANGEME ]; then
         echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1
       fi
       chown aimemory:aimemory /etc/ai-memory/store-url

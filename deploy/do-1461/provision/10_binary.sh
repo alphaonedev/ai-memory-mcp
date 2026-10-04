@@ -41,9 +41,8 @@ inv_all_ips | while read -r ip; do
   ssh_node "$ip" "chmod 0755 /usr/local/bin/.ai-memory.new && mv -f /usr/local/bin/.ai-memory.new /usr/local/bin/ai-memory"
   ver="$(ssh_node "$ip" "/usr/local/bin/ai-memory --version 2>/dev/null" || true)"
   log "[$host] installed: $ver (sha $remote_sha)"
-  case "$ver" in
-    *"$EXPECTED_VERSION"*) : ;;
-    *) die "[$host] version assertion failed: got '$ver', want *$EXPECTED_VERSION*" ;;
-  esac
+  # #4798: exact match, not a substring (EXPECTED_VERSION=7.0 matched 0.7.0).
+  [ "${ver#ai-memory }" = "$EXPECTED_VERSION" ] \
+    || die "[$host] version assertion failed: got '$ver', want exactly 'ai-memory $EXPECTED_VERSION'"
 done
 log "binary fan-out complete on all nodes (version $EXPECTED_VERSION, sha pinned)"

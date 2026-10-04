@@ -169,14 +169,12 @@ pub fn resolve_store_url(cli_arg: Option<&str>) -> Result<Option<String>> {
                 );
             }
         }
-        tracing::info!(
-            channel = name,
-            "store URL taken from {name} ({})",
-            crate::url_display::store_url_display(&url)
-        );
+        // The shared channel line (#4600): names the channel, never the URL.
+        crate::url_display::log_store_url_channel(name, cli_arg.is_some());
         return Ok(Some(url));
     }
     if let Some(url) = cli_arg {
+        crate::url_display::log_store_url_channel("--store-url", false);
         if url_carries_credentials(url) {
             tracing::warn!(
                 "--store-url carries a password in argv, which is exposed via world-readable \

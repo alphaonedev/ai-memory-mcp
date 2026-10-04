@@ -60,7 +60,9 @@ inv_all | while IFS="$(printf '\t')" read -r host role region pub priv; do
 
   fed_id="$CAMPAIGN/$region/$host"          # stable, trust-domain-scoped federation identity
   agent_id="ai:$host@$CAMPAIGN"             # stable, NON-reserved (never the reserved 'daemon', #1231)
-  store_url="postgres://aimemory:$PG_PW@127.0.0.1:5432/aimemory"
+  # #4860 / #3705: ai-memory refuses a Postgres DSN that does not pin
+  # sslmode=verify-full (loopback included); 20_pg_age.sh issues the peer-local CA.
+  store_url="postgres://aimemory:$PG_PW@127.0.0.1:5432/aimemory?sslmode=verify-full&sslrootcert=/opt/hive/pg-age/tls/ca.crt"
   peers_csv="$(build_peers_csv "$pub")"
   [ -n "$peers_csv" ] || die "[$host] no other peers resolved for quorum — inventory must list >=2 peers"
 
@@ -82,7 +84,7 @@ inv_all | while IFS="$(printf '\t')" read -r host role region pub priv; do
   scp_to "$local_env" "$pub" "$REMOTE_ENVFILE"
   ssh_node "$pub" "chmod 0400 '$REMOTE_ENVFILE'"
 
-  # --- systemd unit (no secret in the unit; store URL via ${VAR} expansion) ----
+  # --- systemd unit (no secret in the unit; store URL via the EnvironmentFile channel) ----
   outdir="$RENDER_DIR/$host"; mkdir -p "$outdir"
   unit="$outdir/ai-memory.service"
   cat > "$unit" <<UNIT

@@ -90,6 +90,13 @@ fn schema_init_4600_precedence_file_then_env_and_flag_alone() {
         .success();
     assert!(tmp.path().join("p-file.db").exists());
     assert!(!tmp.path().join("p-env.db").exists());
+    // A flag that AGREES with the env channel is accepted.
+    schema_init(&tmp.path().join("main.db"))
+        .env("AI_MEMORY_STORE_URL", &env_url)
+        .args(["--store-url", &env_url])
+        .assert()
+        .success();
+    assert!(tmp.path().join("p-env.db").exists());
     // The flag still works alone (unchanged argv form).
     schema_init(&tmp.path().join("main.db"))
         .args(["--store-url", &flag_url])
@@ -115,7 +122,7 @@ fn schema_init_4611_winning_channel_is_logged_without_the_secret() {
         .clone();
     let err = String::from_utf8_lossy(&out);
     assert!(
-        err.contains("store URL taken from AI_MEMORY_STORE_URL_FILE"),
+        err.contains("store URL resolved from AI_MEMORY_STORE_URL_FILE"),
         "the winning channel must be logged; stderr: {err}"
     );
 }
@@ -152,6 +159,54 @@ fn schema_init_4611_flag_disagreeing_with_a_channel_is_refused() {
         .assert()
         .success();
     assert!(tmp.path().join("r-flag.db").exists());
+}
+
+
+/// #2444 precedent: an explicit `--store-url` that disagrees with the env or
+/// file channel is REFUSED; schema-init never initialises a store the operator
+/// did not name, and the refusal never echoes a password.
+#[test]
+fn schema_init_4600_flag_disagreeing_with_env_or_file_refused() {
+    let tmp = TempDir::new().unwrap();
+    let env_url = sqlite_url(tmp.path(), "d-env.db");
+    let file_url = sqlite_url(tmp.path(), "d-file.db");
+    let f = write_url_file(tmp.path(), "store-url", &file_url, 0o600);
+    let flag_url = sqlite_url(tmp.path(), "d-flag.db");
+    for (var, val) in [
+        ("AI_MEMORY_STORE_URL", env_url.as_str()),
+        ("AI_MEMORY_STORE_URL_FILE", f.to_str().unwrap()),
+    ] {
+        let out = schema_init(&tmp.path().join("main.db"))
+            .env(var, val)
+            .args(["--store-url", &flag_url])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("ambiguous store"), "{var}: {stderr}");
+    }
+    assert!(!tmp.path().join("d-env.db").exists(), "env store touched");
+    assert!(!tmp.path().join("d-file.db").exists(), "file store touched");
+    assert!(!tmp.path().join("d-flag.db").exists(), "flag store touched");
+    // A password-bearing flag is refused before any connect and is redacted.
+    // The DSN is assembled at run time so no literal credential sits on an
+    // argv line in this file (the argv-secrets gate reads list-form args).
+    let secret = "hunter2-4600";
+    let flag_dsn = format!("postgres://u:{secret}@127.0.0.1:1/d");
+    let out = schema_init(&tmp.path().join("main.db"))
+        .env("AI_MEMORY_STORE_URL", &env_url)
+        .args(["--store-url", flag_dsn.as_str()])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ambiguous store"), "{stderr}");
+    assert!(
+        !stderr.contains(secret),
+        "password echoed: {stderr}"
+    );
 }
 
 #[test]
@@ -201,5 +256,6 @@ fn schema_init_4600_empty_file_refused() {
     schema_init(&tmp.path().join("main.db"))
         .env("AI_MEMORY_STORE_URL_FILE", &p)
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicates::str::contains("is empty"));
 }

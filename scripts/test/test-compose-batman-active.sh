@@ -166,16 +166,24 @@ echo "ok 2 - rendered; every service declares its entrypoint and restarts on a r
 # which would hide the config.toml and its api_key) can make this pass or fail.
 BASE_ENV=(PATH="${T}/bin:/usr/local/bin:/usr/bin:/bin" HOME="${T}/home" TMPDIR="${T}/tmp")
 # The key reaches the init through a 0600 file read inside the child: NAME=value after
-# env would sit on env's argv, readable by every local UID (#4792).
+# env would sit on env's argv, readable by every local UID (#4792). The rendered
+# init-batman environment carries AI_MEMORY_API_KEY=<key>, so it is dropped from the
+# env -i argv here and only the file supplies it.
+INIT_ENV_NOKEY=()
+for kv in "${INIT_ENV[@]}"; do
+    [[ "${kv}" == AI_MEMORY_API_KEY=* ]] || INIT_ENV_NOKEY+=("${kv}")
+done
+(( ${#INIT_ENV_NOKEY[@]} == ${#INIT_ENV[@]} - 1 )) \
+    || fail "the rendered init-batman environment does not carry exactly one AI_MEMORY_API_KEY"
 init_with_key() {
     local key="$1"
-    ( umask 077; printf '%s' "${key}" > "${T}/api-key.0600" )
-    env -i "${BASE_ENV[@]}" "${INIT_ENV[@]}" \
-        bash -c 'export AI_MEMORY_API_KEY="$(cat "$1")"; shift; exec "$@"' _ "${T}/api-key.0600" "${INIT_ARGV[@]}"
+    ( umask 077; printf '%s' "${key}" > "${T}/api-key.0600" ) || fail "could not write the 0600 key file"
+    env -i "${BASE_ENV[@]}" "${INIT_ENV_NOKEY[@]}" \
+        bash -c 'k="$(cat "$1")" || exit 70; export AI_MEMORY_API_KEY="$k"; shift; exec "$@"' _ "${T}/api-key.0600" "${INIT_ARGV[@]}"
 }
 
 # ---- 3. run the rendered init-batman script ---------------------------------
-env -i "${BASE_ENV[@]}" "${INIT_ENV[@]}" "${INIT_ARGV[@]}" > "${T}/init.log" 2>&1 \
+init_with_key "${API_KEY}" > "${T}/init.log" 2>&1 \
     || fail "rendered init-batman script failed:"$'\n'"$(tail -30 "${T}/init.log")"
 grep -q 'init-batman complete' "${T}/init.log" || fail "init-batman did not complete: $(tail -10 "${T}/init.log")"
 echo "ok 3 - rendered init-batman script completed"
@@ -185,7 +193,7 @@ CFG="${T}/data/xdg/ai-memory/config.toml"
 [[ -f "${CFG}" ]] || fail "init-batman wrote no ${CFG}"
 MODE="$(stat -c '%a' "${CFG}" 2>/dev/null || stat -f '%Lp' "${CFG}")"
 [[ "${MODE}" == 600 ]] || fail "config.toml holds the API key but is mode ${MODE}, not 600"
-grep -q "^api_key = \"${API_KEY}\"$" "${CFG}" || fail "config.toml does not carry the AI_MEMORY_API_KEY"
+grep -qxF -f <(printf 'api_key = "%s"\n' "${API_KEY}") "${CFG}" || fail "config.toml does not carry the AI_MEMORY_API_KEY"
 grep -q '^tier = "autonomous"$' "${CFG}" || fail "config.toml lost the autonomous tier"
 for d in "${T}/data/xdg" "${T}/data/xdg/ai-memory"; do
     DMODE="$(stat -c '%a' "${d}" 2>/dev/null || stat -f '%Lp' "${d}")"
@@ -214,7 +222,10 @@ echo "ok 5 - the mcp service's effective argv is up and the rendered TLS healthc
 CA="${T}/keys/tls/local-ca.pem"
 status_with() {  # status_with <key or empty>: HTTP status of an authenticated read
     local hdr=()
-    [[ -n "$1" ]] && hdr=(-H "x-api-key: $1")
+    if [[ -n "$1" ]]; then
+        ( umask 077; printf 'x-api-key: %s\n' "$1" > "${T}/api-key-header.0600" ) || fail "could not write the 0600 header file"
+        hdr=(-H "@${T}/api-key-header.0600")
+    fi
     curl -s -o /dev/null -w '%{http_code}' --cacert "${CA}" "${hdr[@]}" \
         "https://localhost:${PORT}/api/v1/memories?limit=1"
 }
@@ -258,7 +269,7 @@ init_with_key "${NEW_KEY}" > "${T}/init-rot.log" 2>&1 \
     || fail "init failed on a rotated key: $(tail -10 "${T}/init-rot.log")"
 grep -q 'API key rotated' "${T}/init-rot.log" || fail "init did not report the rotation: $(tail -5 "${T}/init-rot.log")"
 [[ "$(grep -c '^api_key' "${CFG}")" == 1 ]] || fail "config.toml does not carry exactly one api_key after rotation"
-grep -q "^api_key = \"${NEW_KEY}\"$" "${CFG}" || fail "config.toml does not carry the rotated key"
+grep -qxF -f <(printf 'api_key = "%s"\n' "${NEW_KEY}") "${CFG}" || fail "config.toml does not carry the rotated key"
 grep -q '^tier = "autonomous"$' "${CFG}" || fail "rotation lost the autonomous tier"
 MODE="$(stat -c '%a' "${CFG}" 2>/dev/null || stat -f '%Lp' "${CFG}")"
 [[ "${MODE}" == 600 ]] || fail "rotation left config.toml mode ${MODE}, not 600"
