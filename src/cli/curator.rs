@@ -321,7 +321,7 @@ pub async fn run(
         // (slice-3c1) through the `MemoryStore` trait; the rusqlite path
         // below only ever sees the local SQLite file.
         #[cfg(feature = "sal")]
-        if curator_store_url(args).is_some() {
+        if curator_routes_to_store(args)? {
             return run_store_backed_rollback(db_path, args, app_config, out).await;
         }
         return run_rollback(db_path, args, out);
@@ -335,7 +335,7 @@ pub async fn run(
         // #3345 — the store-backed (postgres) arm goes through the SAL trait;
         // the sqlite arm drives the same primitives directly.
         #[cfg(feature = "sal")]
-        if curator_store_url(args).is_some() {
+        if curator_routes_to_store(args)? {
             return run_store_backed_prune_reports(db_path, args, app_config, out).await;
         }
         return run_prune_reports(db_path, args, out);
@@ -355,7 +355,7 @@ pub async fn run(
     // daemon (auto_tag + contradiction + autonomy + persona) for exact
     // behaviour parity, since that subsystem is not yet trait-ported.
     #[cfg(feature = "sal")]
-    if curator_store_url(args).is_some() {
+    if curator_routes_to_store(args)? {
         return run_store_backed_sweep(db_path, args, app_config, out).await;
     }
 
@@ -484,10 +484,10 @@ fn curator_compaction_config(app_config: &config::AppConfig) -> curator::Compact
     }
 }
 
-/// v0.7.0 #1548 — resolve the operator-supplied `--store-url` flag in
-/// a feature-flag-aware way (no env binding — the
-/// `AI_MEMORY_STORE_URL` env fallback was deliberately dropped in
-/// `1e8ad69b`). Returns `None`
+/// v0.7.0 #1548 — the `--store-url` value as typed on argv, in a
+/// feature-flag-aware way (no clap `env =` binding — dropped in `1e8ad69b`).
+/// The environment channels are resolved by `curator_routes_to_store` and
+/// `build_curator_store` (#4603, #4820), never by this accessor. Returns `None`
 /// on builds without the `sal` feature (where the field does not exist)
 /// so the curator falls through to the legacy SQLite path.
 #[must_use]
@@ -501,6 +501,19 @@ fn curator_store_url(args: &CuratorArgs) -> Option<&str> {
         let _ = args;
         None
     }
+}
+
+/// #4603 / #4820 — whether the curator takes the store-backed (SAL) arm.
+/// Resolves the SAME channel ladder `build_store_handle` binds the store from
+/// (`AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > `--store-url`), so a
+/// unit that carries the URL only in its `EnvironmentFile` routes exactly as
+/// the pre-#4603 `--store-url` argv did, instead of silently running the
+/// conn-bound sqlite daemon against the local sidecar. Fails closed on a
+/// channel error (for example a group/world-readable
+/// `AI_MEMORY_STORE_URL_FILE`), per ERRORS-02.
+#[cfg(feature = "sal")]
+fn curator_routes_to_store(args: &CuratorArgs) -> Result<bool> {
+    Ok(crate::store_url::resolve_store_url(curator_store_url(args))?.is_some())
 }
 
 /// v0.7.0 #1548 — `--once` / `--daemon` upkeep against a SAL store

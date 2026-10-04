@@ -1259,7 +1259,16 @@ async fn dispatch_recover_previous_session(
     // `app_config` only feeds the postgres store build, which is `sal`-only.
     #[cfg(not(feature = "sal"))]
     let _ = app_config;
-    match a.store_url.as_deref().filter(|u| u.starts_with("postgres")) {
+    // #4915 / #4820 — the SAME channel ladder `serve`, `schema-init` and
+    // `curator` resolve (`AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` >
+    // `--store-url`), so a unit whose EnvironmentFile carries the Postgres URL
+    // recovers against that store instead of the local sqlite file. A channel
+    // error (e.g. a lax-permission URL file) fails closed (ERRORS-02).
+    let resolved_store_url = resolve_store_url(a.store_url.as_deref())?;
+    match resolved_store_url
+        .as_deref()
+        .filter(|u| u.starts_with("postgres"))
+    {
         Some(url) => {
             #[cfg(feature = "sal")]
             let c = {
@@ -2224,7 +2233,15 @@ pub async fn run(
             // routes through the SAL so the enterprise tier gets the SAME
             // verb, and the async store build happens BEFORE the stdout lock
             // is taken so no `!Send` guard is held across an `.await`.
-            match a.store_url.as_deref().filter(|u| u.starts_with("postgres")) {
+            // #4915 / #4820 — route on the full store-URL channel ladder
+            // (FILE > ENV > `--store-url`), not on argv alone: a release
+            // against the local sqlite file while the unit names a Postgres
+            // store is an unaudited no-op on the store the operator meant.
+            let resolved_store_url = resolve_store_url(a.store_url.as_deref())?;
+            match resolved_store_url
+                .as_deref()
+                .filter(|u| u.starts_with("postgres"))
+            {
                 Some(url) => {
                     #[cfg(feature = "sal")]
                     {
