@@ -407,7 +407,18 @@ def self_test() -> int:
     guard_edit = trusted_write(GUARD_REL)
     case("a change to the guard code is reported and needs the trailer (R4)", guard_edit, True, "GUARD CHANGED")
     case("a guard change with the trailer passes (R4)", guard_edit, False, "approval trailer(s)", trailer="Justin")
-    for rel in TRUSTED_PATHS:
+    # R5 (#5164): the trusted set is pinned to a literal, and the per-path cases loop over that literal, so
+    # dropping an entry from TRUSTED_PATHS fails here instead of silently dropping its own case.
+    pinned_trusted = ("scripts/check-claude-md-size.py", "scripts/claude-md-rule-compare.py",
+                      ".github/workflows/claude-md-guard.yml", ".github/workflows/claude-md-rule-compare.yml",
+                      ".github/CODEOWNERS")
+    if TRUSTED_PATHS != pinned_trusted:
+        failures.append("TRUSTED_PATHS pin")
+        print(f"FAIL: self-test - TRUSTED_PATHS {TRUSTED_PATHS} differs from the pinned set (R5, #5164)",
+              file=sys.stderr)
+    else:
+        print("PASS: self-test - TRUSTED_PATHS equals the pinned set (R5, #5164)")
+    for rel in pinned_trusted:
         case(f"a change to {rel} is reported and needs the trailer (R4)", trusted_write(rel), True,
              f"GUARD CHANGED: {rel}")
 
