@@ -287,8 +287,10 @@ lab_posture_selftest() {
   printf 'boot\nINFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/info-only.log"
   printf 'INFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\nfatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n' > "$plog/info-then-refusal.log"
   printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\nINFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/refusal-then-info.log"
-  awk 'BEGIN { for (i = 0; i < 200000; i++) print "filler line to fill the pipe buffer"
-               print "fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1" }' > "$plog/big.log"
+  # The refusal is printed in END, after the filler (#5292). /dev/null is the input so END
+  # runs without reading stdin (an awk program with only an END block reads stdin).
+  awk 'END { for (i = 0; i < 200000; i++) print "filler line to fill the pipe buffer"
+             print "fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1" }' /dev/null > "$plog/big.log"
   ( lab_probe_refusal_names_knob "$plog/ok.log" ) \
     && echo "  PASS probe matcher: refusal naming the knob is detected" \
     || { echo "  FAIL probe matcher: refusal naming the knob not detected"; bad=1; }
