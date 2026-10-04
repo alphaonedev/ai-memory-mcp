@@ -230,7 +230,9 @@ EOS
   install -m 0600 "$OUT_DIR/hive-loadgen-f2.key" "$run_dir/client.key"
   install -m 0600 "$OUT_DIR/ca.crt" "$run_dir/ca.crt"
   echo "[federate] loadgen bundle: $run_dir"
-  echo "[federate] Phase A API key: $(on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key')"
+  # The key is a credential: it goes to a 0600 file in the 0700 run dir, never to the terminal or a log.
+  ( umask 077; on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' > "$run_dir/api-key" )
+  echo "[federate] Phase A API key written to $run_dir/api-key (0600)"
 }
 
 # --- verify ------------------------------------------------------------------
