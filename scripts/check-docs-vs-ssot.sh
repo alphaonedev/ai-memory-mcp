@@ -601,7 +601,7 @@ ANCHORS = [
     # index.html upgrade paragraph: "steps up to v100 on the first ..." and
     # "a v0.8.x DB steps v70 -> v100" (tag-stripped, entity-decoded).
     re.compile(r'\bv([0-9]+) on the first ai-memory serve after the upgrade'),
-    re.compile(r'\bsteps v[0-9]+ (?:→|->) v([0-9]+)'),
+    re.compile(r'\bsteps v[0-9]+\s*(?:→|->)\s*v([0-9]+)'),
     # CONFIG_SCHEMA postgres row: | ai-memory postgres schema | **v93** |
     re.compile(r'ai-memory postgres schema *\| *\*\*v([0-9]+)\*\*'),
     # schema.html phrasings.
@@ -2742,6 +2742,8 @@ a v0.8.x DB steps
 	v40 → v52 on boot.
 a v0.8.x DB steps  
 	v40 → v53 on boot.
+a v0.8.x DB steps v40->v52 on boot.
+a v0.8.x DB steps v40->v53 on boot.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2768,6 +2770,8 @@ v40&nbsp;&rarr;&nbsp;v52</strong>)</p>
 <p>(a v0.8.x DB steps
 <strong>
 v40&nbsp;&rarr;&nbsp;v53</strong>)</p>
+<p>(a v0.8.x DB steps <strong>v40&rarr;v52</strong>)</p>
+<p>(a v0.8.x DB steps <strong>v40&rarr;v53</strong>)</p>
 R4HTML
     r4_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test #3248 r4 - stale wordings not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -2791,7 +2795,9 @@ R4HTML
         'docs/postgres-age-guide.md:21 claims "52"' \
         'docs/postgres-age-guide.md:25 claims "52"' \
         'docs/postgres-age-guide.md:29 claims "52"' \
-        'docs/schema-fixture.html:21 claims "52"'
+        'docs/schema-fixture.html:21 claims "52"' \
+        'docs/postgres-age-guide.md:32 claims "52"' \
+        'docs/schema-fixture.html:25 claims "52"'
     do grep -qF "$_want" <<<"$r4_out" || { echo "FAIL: self-test #3248 r4 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
     for _not in \
         'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:4 ' \
@@ -2804,7 +2810,8 @@ R4HTML
         'docs/schema-fixture.html:10 ' 'docs/schema-fixture.html:12 ' 'docs/schema-fixture.html:14 ' \
         'docs/schema-fixture.html:15 ' 'docs/schema-fixture.html:17 ' 'docs/schema-fixture.html:18 ' \
         'docs/postgres-age-guide.md:20 ' 'docs/postgres-age-guide.md:22 ' 'docs/postgres-age-guide.md:23 ' \
-        'docs/postgres-age-guide.md:27 ' 'docs/postgres-age-guide.md:31 ' 'docs/schema-fixture.html:24 '
+        'docs/postgres-age-guide.md:27 ' 'docs/postgres-age-guide.md:31 ' 'docs/schema-fixture.html:24 ' \
+        'docs/postgres-age-guide.md:33 ' 'docs/schema-fixture.html:26 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
