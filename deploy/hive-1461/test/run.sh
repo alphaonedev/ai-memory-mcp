@@ -70,7 +70,7 @@ json_field() {
 # hdrs <agent_id> -> the standard auth/identity header fragment for a curl run.
 hdrs() {
   local aid="$1" h=""
-  [ -n "$API_KEY" ] && h="-H 'x-api-key: $API_KEY'"
+  [ -n "$API_KEY" ] && h="--config -"
   [ -n "$aid" ] && h="$h -H 'x-agent-id: $aid'"
   printf '%s' "$h"
 }
@@ -86,7 +86,7 @@ hdrs() {
 body_req() {
   local rip="$1" cip="$2" host="$3" m="$4" path="$5" data="${6:-}" aid="${7:-}"
   local extra=""; [ -n "$data" ] && extra="-H 'content-type: application/json' --data '$data'"
-  ssh_node "$rip" "curl -fsS --max-time 10 --resolve $host:$FEDERATION_PORT:$cip \
+  ssh_node_keyed "$rip" "curl -fsS --max-time 10 --resolve $host:$FEDERATION_PORT:$cip \
     --cacert $REMOTE_TLS/ca.pem --cert $REMOTE_TLS/client.pem --key $REMOTE_TLS/client.key \
     $(hdrs "$aid") $extra -X $m https://$host:$FEDERATION_PORT$path" 2>/dev/null || true
 }
@@ -104,7 +104,7 @@ body_req() {
 # and default an empty capture (ssh-level failure) to `000` here.
 code_raw() {
   local rip="$1" args="$2" out
-  out="$(ssh_node "$rip" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 $args; true" 2>/dev/null || true)"
+  out="$(ssh_node_keyed "$rip" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 $args; true" 2>/dev/null || true)"
   printf '%s' "${out:-000}"
 }
 
@@ -114,7 +114,7 @@ code_raw() {
 # tag (e.g. distinguishing an enrollment 401 from an api-key 401).
 body_raw() {
   local rip="$1" args="$2"
-  ssh_node "$rip" "curl -s --max-time 10 $args; true" 2>/dev/null || true
+  ssh_node_keyed "$rip" "curl -s --max-time 10 $args; true" 2>/dev/null || true
 }
 
 log "P3 full-spectrum test run $TS — fleet=$CAMPAIGN port=$FEDERATION_PORT"
@@ -206,8 +206,8 @@ c="$(code_raw "$P1_IP" "$RES $CA $CERT $KEY $PRIV")"
 assert_eq crypto apikey_required 401 "$c"
 
 # (5) privileged endpoint WITH x-api-key -> 200
-keyhdr=""; [ -n "$API_KEY" ] && keyhdr="-H 'x-api-key: $API_KEY'"
-c="$(code_raw "$P1_IP" "$RES $CA $CERT $KEY $keyhdr $PRIV")"
+cfgarg=""; [ -n "$API_KEY" ] && cfgarg="--config -"
+c="$(code_raw "$P1_IP" "$RES $CA $CERT $KEY $cfgarg $PRIV")"
 assert_eq crypto apikey_accepted 200 "$c"
 
 # (6) /health is exempt -> 200 without the key
@@ -215,7 +215,7 @@ c="$(code_raw "$P1_IP" "$RES $CA $CERT $KEY $URL")"
 assert_eq crypto health_exempt 200 "$c"
 
 # (7) admin-only endpoint as a non-admin caller -> 403 (authz enforced)
-c="$(code_raw "$P1_IP" "$RES $CA $CERT $KEY $keyhdr -H 'x-agent-id: $AID_H' $ADMIN")"
+c="$(code_raw "$P1_IP" "$RES $CA $CERT $KEY $cfgarg -H 'x-agent-id: $AID_H' $ADMIN")"
 assert_eq crypto admin_gated 403 "$c"
 
 # ====================== GROUP federation =====================================
@@ -289,10 +289,10 @@ fi
 log "[zerotouch] unenrolled peer-id refused on /sync/since (#1088 fail-closed)"
 ZRES="--resolve $P1_H:$FEDERATION_PORT:127.0.0.1"
 ZCA="--cacert $REMOTE_TLS/ca.pem"; ZCERT="--cert $REMOTE_TLS/client.pem"; ZKEY="--key $REMOTE_TLS/client.key"
-ZKEYHDR=""; [ -n "$API_KEY" ] && ZKEYHDR="-H 'x-api-key: $API_KEY'"
+ZCFGARG=""; [ -n "$API_KEY" ] && ZCFGARG="--config -"
 ZROGUE="rogue-unenrolled-$TS"
 ZSYNC="https://$P1_H:$FEDERATION_PORT/api/v1/sync/since?since=1970-01-01T00:00:00Z"
-ZPROBE="$ZRES $ZCA $ZCERT $ZKEY $ZKEYHDR -H 'x-peer-id: $ZROGUE' \"$ZSYNC\""
+ZPROBE="$ZRES $ZCA $ZCERT $ZKEY $ZCFGARG -H 'x-peer-id: $ZROGUE' \"$ZSYNC\""
 zc="$(code_raw "$P1_IP" "$ZPROBE")"
 assert_eq zerotouch unenrolled_status 401 "$zc"
 zb="$(body_raw "$P1_IP" "$ZPROBE")"

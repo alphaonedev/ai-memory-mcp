@@ -705,6 +705,27 @@ attested_body() {
     "$(_json_escape "$title")" "$(_json_escape "$content")" "$ns" "$kind" "$scope" "$sig" "$created"
 }
 
+# #4871: the admin API key never rides an argv. api_key_curl_config prints a curl config
+# line (printf is a shell builtin, so the key is not an exec argument); ssh_node_with_key
+# pipes it to the remote command's stdin, where `curl --config -` reads it. A caller adds
+# the non-secret word `--config -` to the curl arguments; curl reads stdin only then.
+api_key_curl_config() {
+  local k="${1-}"
+  [ -n "$k" ] || return 0
+  k=${k//\\/\\\\}; k=${k//\"/\\\"}
+  printf 'header = "x-api-key: %s"\n' "$k"
+}
+ssh_node_with_key() {
+  local k="$1" ip="$2"; shift 2
+  # shellcheck disable=SC2086
+  api_key_curl_config "$k" | ssh $SSH_OPTS "root@${ip}" "$@"
+}
+ssh_node_keyed() {
+  local ip="$1"; shift
+  ssh_node_with_key "${API_KEY:-}" "$ip" "$@"
+}
+
+
 # agent_enroll_peer <peer_public_ip> <agent_id> -> register an attesting agent on
 # a peer (HTTP, lands in the peer's postgres _agents row) and bind its public key
 # so that agent's attested writes verify there. Registration is the daemon HTTP
@@ -727,10 +748,10 @@ agent_enroll_peer() {
   api_key=""; [ -s "$RUN_DIR/secrets/api.pw" ] && api_key="$(cat "$RUN_DIR/secrets/api.pw")"
 
   # 1) register over mTLS (idempotent — re-register just rewrites the _agents row).
-  local keyhdr=""; [ -n "$api_key" ] && keyhdr="-H 'x-api-key: $api_key'"
-  ssh_node "$peer_ip" "curl -fsS --max-time 12 --resolve $host:$FEDERATION_PORT:127.0.0.1 \
+  local cfgarg=""; [ -n "$api_key" ] && cfgarg="--config -"
+  ssh_node_with_key "$api_key" "$peer_ip" "curl -fsS --max-time 12 --resolve $host:$FEDERATION_PORT:127.0.0.1 \
     --cacert $REMOTE_TLS/ca.pem --cert $REMOTE_TLS/client.pem --key $REMOTE_TLS/client.key \
-    $keyhdr -H 'content-type: application/json' \
+    $cfgarg -H 'content-type: application/json' \
     --data '{\"agent_id\":\"$aid\",\"agent_type\":\"$HARNESS_AGENT_TYPE\",\"capabilities\":[\"attested-write\"]}' \
     -X POST https://$host:$FEDERATION_PORT/api/v1/agents" >/dev/null 2>&1 \
     || log "[$host] register $aid returned non-2xx (may already be registered) — continuing to bind"

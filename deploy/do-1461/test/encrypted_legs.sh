@@ -69,7 +69,7 @@ json_field() { printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\
 # emitting a second token, so NO `|| echo 000` (that would yield 000000).
 code_raw() {
   local rip="$1" args="$2" out
-  out="$(ssh_node "$rip" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 $args; true" 2>/dev/null || true)"
+  out="$(ssh_node_keyed "$rip" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 $args; true" 2>/dev/null || true)"
   printf '%s' "${out:-000}"
 }
 
@@ -77,10 +77,10 @@ code_raw() {
 # -> 2xx response body (over the full mTLS + api-key path), empty otherwise.
 body_req() {
   local rip="$1" cip="$2" host="$3" m="$4" path="$5" data="${6:-}" aid="${7:-}"
-  local h=""; [ -n "$API_KEY" ] && h="-H 'x-api-key: $API_KEY'"
+  local h=""; [ -n "$API_KEY" ] && h="--config -"
   [ -n "$aid" ] && h="$h -H 'x-agent-id: $aid'"
   local extra=""; [ -n "$data" ] && extra="-H 'content-type: application/json' --data '$data'"
-  ssh_node "$rip" "curl -fsS --max-time 10 --resolve $host:$FEDERATION_PORT:$cip \
+  ssh_node_keyed "$rip" "curl -fsS --max-time 10 --resolve $host:$FEDERATION_PORT:$cip \
     --cacert $REMOTE_TLS/ca.pem --cert $REMOTE_TLS/client.pem --key $REMOTE_TLS/client.key \
     $h $extra -X $m https://$host:$FEDERATION_PORT$path" 2>/dev/null || true
 }
@@ -108,10 +108,10 @@ printf '%s\n' "$PEER_IPS" | while IFS= read -r ip; do
   CA="--cacert $REMOTE_TLS/ca.pem"; CERT="--cert $REMOTE_TLS/client.pem"; KEY="--key $REMOTE_TLS/client.key"
   HEALTH="https://$h:$FEDERATION_PORT/api/v1/health"
   PRIV="https://$h:$FEDERATION_PORT/api/v1/capabilities"
-  keyhdr=""; [ -n "$API_KEY" ] && keyhdr="-H 'x-api-key: $API_KEY'"
+  cfgarg=""; [ -n "$API_KEY" ] && cfgarg="--config -"
 
   # POSITIVE: allowlisted client cert + api-key -> privileged handler 200
-  c="$(code_raw "$ip" "$RES $CA $CERT $KEY $keyhdr $PRIV")"
+  c="$(code_raw "$ip" "$RES $CA $CERT $KEY $cfgarg $PRIV")"
   assert_eq leg1_api_mtls "mtls+key_priv_200[$h]" 200 "$c"
 
   # NEGATIVE: no client cert -> client_auth_mandatory refuses handshake (000)

@@ -75,7 +75,7 @@ json_field() {
 # hdrs <agent_id> -> standard auth/identity header fragment
 hdrs() {
   local aid="$1" h=""
-  [ -n "$API_KEY" ] && h="-H 'x-api-key: $API_KEY'"
+  [ -n "$API_KEY" ] && h="--config -"
   [ -n "$aid" ] && h="$h -H 'x-agent-id: $aid'"
   printf '%s' "$h"
 }
@@ -84,7 +84,7 @@ hdrs() {
 body_req() {
   local rip="$1" cip="$2" host="$3" m="$4" path="$5" data="${6:-}" aid="${7:-}"
   local extra=""; [ -n "$data" ] && extra="-H 'content-type: application/json' --data '$data'"
-  ssh_node "$rip" "curl -fsS --max-time 10 --resolve $host:$FEDERATION_PORT:$cip \
+  ssh_node_keyed "$rip" "curl -fsS --max-time 10 --resolve $host:$FEDERATION_PORT:$cip \
     --cacert $REMOTE_TLS/ca.pem --cert $REMOTE_TLS/client.pem --key $REMOTE_TLS/client.key \
     $(hdrs "$aid") $extra -X $m https://$host:$FEDERATION_PORT$path" 2>/dev/null || true
 }
@@ -94,7 +94,7 @@ body_req() {
 body_raw() {
   local rip="$1" cip="$2" host="$3" m="$4" path="$5" data="${6:-}" aid="${7:-}"
   local extra=""; [ -n "$data" ] && extra="-H 'content-type: application/json' --data '$data'"
-  ssh_node "$rip" "curl -s --max-time 10 --resolve $host:$FEDERATION_PORT:$cip \
+  ssh_node_keyed "$rip" "curl -s --max-time 10 --resolve $host:$FEDERATION_PORT:$cip \
     --cacert $REMOTE_TLS/ca.pem --cert $REMOTE_TLS/client.pem --key $REMOTE_TLS/client.key \
     $(hdrs "$aid") $extra -X $m https://$host:$FEDERATION_PORT$path; true" 2>/dev/null || true
 }

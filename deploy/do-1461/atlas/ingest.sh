@@ -71,10 +71,12 @@ log "[atlas] ingesting $TOTAL records -> $ANCHOR_H ($ATLAS_NAMESPACE) in chunks 
 # `export -f` + nested `xargs bash -c` through the SSH command-string layer
 # (which double-expands and mangled the `\$@`). The poster reads bodies from
 # stdin (one per line), POSTs each over loopback mTLS in parallel, and prints the
-# HTTP code per line (`000` on transport failure). Secrets: the api key is staged
-# in the 0600 script on the node (root-only) and removed at end of ingest — it is
-# NEVER echoed to a log or a command line here.
+# HTTP code per line (`000` on transport failure). Secrets (#4873): the api key is
+# staged as a curl config file (0600, root-only) written over ssh stdin, so it is on
+# no argv and on no local disk, and the poster script holds only the file's path.
+# Both are removed at end of ingest.
 REMOTE_POSTER_PATH="/root/.atlas-poster-$$.sh"
+REMOTE_HDRCFG_PATH="/root/.atlas-hdr-$$.cfg"
 POSTER_LOCAL="$STAGE/poster.sh"
 {
   printf '#!/usr/bin/env bash\n'
@@ -83,7 +85,7 @@ POSTER_LOCAL="$STAGE/poster.sh"
   printf '  code="$(curl -sS -o /dev/null -w "%%{http_code}" --max-time %s \\\n' "$ATLAS_POST_MAX_TIME"
   printf '    --resolve %s:%s:127.0.0.1 \\\n' "$ANCHOR_H" "$FEDERATION_PORT"
   printf '    --cacert %s/ca.pem --cert %s/client.pem --key %s/client.key \\\n' "$REMOTE_TLS" "$REMOTE_TLS" "$REMOTE_TLS"
-  printf '    -H "x-api-key: %s" -H "x-agent-id: %s" -H "content-type: application/json" \\\n' "$API_KEY" "$ATLAS_AGENT_ID"
+  printf '    --config %s -H "x-agent-id: %s" -H "content-type: application/json" \\\n' "$REMOTE_HDRCFG_PATH" "$ATLAS_AGENT_ID"
   printf '    --data "$1" -X POST https://%s:%s/api/v1/memories 2>/dev/null || true)"\n' "$ANCHOR_H" "$FEDERATION_PORT"
   printf '  printf "%%s\\n" "${code:-000}"\n'
   printf '}\n'
@@ -92,6 +94,7 @@ POSTER_LOCAL="$STAGE/poster.sh"
 } > "$POSTER_LOCAL"
 scp_to "$POSTER_LOCAL" "$ANCHOR_IP" "$REMOTE_POSTER_PATH"
 ssh_node "$ANCHOR_IP" "chmod 600 $REMOTE_POSTER_PATH"
+ssh_node_with_key "$API_KEY" "$ANCHOR_IP" "umask 077; cat > $REMOTE_HDRCFG_PATH"
 
 transport_fail=0; http_2xx=0; quorum_soft=0; http_hard_err=0; processed=0
 chunk_idx=0
@@ -142,7 +145,7 @@ done
 # non-empty for forensics). The poster carries the api key, so its removal on the
 # node is mandatory, not best-effort.
 rm -f "$STAGE"/chunk-* "$SRC_SPLIT" "$POSTER_LOCAL"
-ssh_node "$ANCHOR_IP" "rm -f $REMOTE_POSTER_PATH" >/dev/null 2>&1 || true
+ssh_node "$ANCHOR_IP" "rm -f $REMOTE_POSTER_PATH $REMOTE_HDRCFG_PATH" >/dev/null 2>&1 || true
 
 # Summary token (parsed by run.sh). quorum_soft = 503 quorum-ack timeouts whose
 # rows STILL landed+attested locally (W=2 eventual model); http_hard_err = real
