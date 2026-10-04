@@ -803,9 +803,17 @@ PgBouncer.
 > sets 256). With tracking disabled (`max_prepared_statements = 0`, or
 > PgBouncer < 1.21), a statement prepared on one server connection is
 > missing on the next one PgBouncer assigns, and queries fail with
-> "prepared statement does not exist" errors. If you add a custom query
-> path, do not assume a named prepared statement persists beyond its
-> transaction under PgBouncer.
+> "prepared statement does not exist" errors. That is not the only
+> outcome: sqlx names its statements `sqlx_s_<n>` from a counter that
+> starts at the same value on every client connection, so two clients
+> that share one server connection also reuse the same names. Without
+> tracking this can fail with "prepared statement ... already exists",
+> or run a same-named statement that another client prepared, so a
+> different query executes instead of the request failing. Treat
+> `max_prepared_statements` > 0 as mandatory wherever server
+> connections are shared between clients, not as tuning. If you add a
+> custom query path, do not assume a named prepared statement persists
+> beyond its transaction under PgBouncer.
 
 > **Caveat — `statement_timeout` / `lock_timeout` under transaction
 > mode (REQUIRED ops step).** The daemon installs its query-safety
