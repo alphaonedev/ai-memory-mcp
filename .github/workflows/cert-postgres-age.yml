@@ -185,6 +185,10 @@ jobs:
             exit 1
           fi
           base_url="$(cat "$url_file")"
+          # #4889: the URL carries the password, so it never rides the psql argv. pg_url_run reads it
+          # from stdin (printf builtin) into libpq PG* variables (scripts/pg-url-libpq-env.py, fails
+          # closed) and execs psql with flags only.
+          pg_url_run() { local u="$1" e; shift; e="$(printf '%s' "$u" | python3 scripts/pg-url-libpq-env.py)" || return 1; ( eval "$e"; exec psql "$@" ); }
           # Unique db name: valid pg identifier (lowercase, [a-z0-9_], <=63
           # chars). run_id+attempt make it unique across concurrent runs; the
           # fixed `cert` suffix keeps it distinct from the ci.yml enterprise-fed
@@ -194,7 +198,7 @@ jobs:
           # drop use the byte-identical name.
           echo "CI_FED_DB=$CI_FED_DB" >> "$GITHUB_ENV"
           # Create the ephemeral db on the base tier (connected to ai_memory_test).
-          if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$CI_FED_DB\";"; then
+          if ! pg_url_run "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$CI_FED_DB\";"; then
             echo "::error::$RUNNER_NAME failed to CREATE DATABASE $CI_FED_DB on the native cert tier"
             exit 1
           fi
@@ -207,7 +211,7 @@ jobs:
           esac
           new_url="${head%/*}/${CI_FED_DB}${q}"
           # Provision the ephemeral db's extensions (the tier role is SUPERUSER).
-          if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
+          if ! pg_url_run "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
             echo "::error::$RUNNER_NAME failed to create age/vector extensions in $CI_FED_DB"
             exit 1
           fi
@@ -260,9 +264,13 @@ jobs:
       - name: Wait for native tier readiness
         run: |
           set -euo pipefail
+          # #4889: the URL carries the password, so it never rides the psql argv. pg_url_run reads it
+          # from stdin (printf builtin) into libpq PG* variables (scripts/pg-url-libpq-env.py, fails
+          # closed) and execs psql with flags only.
+          pg_url_run() { local u="$1" e; shift; e="$(printf '%s' "$u" | python3 scripts/pg-url-libpq-env.py)" || return 1; ( eval "$e"; exec psql "$@" ); }
           attempt=1
           while [ "$attempt" -le 30 ]; do
-            if psql "$AI_MEMORY_TEST_POSTGRES_URL" -v ON_ERROR_STOP=1 -tAc 'SELECT 1' >/dev/null 2>&1; then
+            if pg_url_run "$AI_MEMORY_TEST_POSTGRES_URL" -v ON_ERROR_STOP=1 -tAc 'SELECT 1' >/dev/null 2>&1; then
               echo "::notice::native cert tier is up"
               exit 0
             fi
@@ -281,24 +289,32 @@ jobs:
           # lack CREATE EXTENSION privilege, and that is fine — the "Assert
           # certified stack versions" step below is the load-bearing check and
           # HARD-FAILS if any extension is actually absent or off-version.
-          PSQL="psql $AI_MEMORY_TEST_POSTGRES_URL -v ON_ERROR_STOP=0"
-          $PSQL -c "CREATE EXTENSION IF NOT EXISTS vector;" || echo "vector: pre-provisioned or no CREATE priv (asserted below)"
-          $PSQL -c "CREATE EXTENSION IF NOT EXISTS age;" || echo "age: pre-provisioned or no CREATE priv (asserted below)"
-          $PSQL -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');" || echo "memory_graph already exists / no priv / AGE init handled by ladder"
+          # #4889: the URL carries the password, so it never rides the psql argv. pg_url_run reads it
+          # from stdin (printf builtin) into libpq PG* variables (scripts/pg-url-libpq-env.py, fails
+          # closed) and execs psql with flags only.
+          pg_url_run() { local u="$1" e; shift; e="$(printf '%s' "$u" | python3 scripts/pg-url-libpq-env.py)" || return 1; ( eval "$e"; exec psql "$@" ); }
+          psql_t() { pg_url_run "$AI_MEMORY_TEST_POSTGRES_URL" -v ON_ERROR_STOP=0 "$@"; }
+          psql_t -c "CREATE EXTENSION IF NOT EXISTS vector;" || echo "vector: pre-provisioned or no CREATE priv (asserted below)"
+          psql_t -c "CREATE EXTENSION IF NOT EXISTS age;" || echo "age: pre-provisioned or no CREATE priv (asserted below)"
+          psql_t -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');" || echo "memory_graph already exists / no priv / AGE init handled by ladder"
 
       - name: Assert certified stack versions (cert evidence, hard-fail on drift)
         run: |
           set -euo pipefail
-          PSQL="psql $AI_MEMORY_TEST_POSTGRES_URL -tAX"
+          # #4889: the URL carries the password, so it never rides the psql argv. pg_url_run reads it
+          # from stdin (printf builtin) into libpq PG* variables (scripts/pg-url-libpq-env.py, fails
+          # closed) and execs psql with flags only.
+          pg_url_run() { local u="$1" e; shift; e="$(printf '%s' "$u" | python3 scripts/pg-url-libpq-env.py)" || return 1; ( eval "$e"; exec psql "$@" ); }
+          psql_t() { pg_url_run "$AI_MEMORY_TEST_POSTGRES_URL" -tAX "$@"; }
           # split_part(...,' ',1) strips the "(Debian 18.4-1.pgdg13+1)" build
           # metadata SHOW server_version / current_setting append after the
           # bare version — without this, tr -d '[:space:]' collapses that
           # into "18.4(Debian18.4-1.pgdg13+1)", which never equals the exact
           # SSOT string and false-reds the assert below even when the
           # server IS the certified 18.4.
-          pg_ver=$($PSQL -c "SELECT split_part(current_setting('server_version'), ' ', 1);" | tr -d '[:space:]')
-          age_ver=$($PSQL -c "SELECT extversion FROM pg_extension WHERE extname='age';" | tr -d '[:space:]')
-          vec_ver=$($PSQL -c "SELECT extversion FROM pg_extension WHERE extname='vector';" | tr -d '[:space:]')
+          pg_ver=$(psql_t -c "SELECT split_part(current_setting('server_version'), ' ', 1);" | tr -d '[:space:]')
+          age_ver=$(psql_t -c "SELECT extversion FROM pg_extension WHERE extname='age';" | tr -d '[:space:]')
+          vec_ver=$(psql_t -c "SELECT extversion FROM pg_extension WHERE extname='vector';" | tr -d '[:space:]')
           echo "::notice::certified stack — PostgreSQL=$pg_ver  Apache AGE=$age_ver  pgvector=$vec_ver"
           {
             echo "### Certified Postgres + AGE + pgvector tier"
@@ -424,10 +440,14 @@ jobs:
             exit 0
           fi
           base_url="$(cat "$url_file")"
+          # #4889: the URL carries the password, so it never rides the psql argv. pg_url_run reads it
+          # from stdin (printf builtin) into libpq PG* variables (scripts/pg-url-libpq-env.py, fails
+          # closed) and execs psql with flags only.
+          pg_url_run() { local u="$1" e; shift; e="$(printf '%s' "$u" | python3 scripts/pg-url-libpq-env.py)" || return 1; ( eval "$e"; exec psql "$@" ); }
           # Connect to the base ai_memory_test to drop the ephemeral db. FORCE
           # terminates any lingering backend so the drop cannot wedge on a
           # still-connected test process.
-          if psql "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
+          if pg_url_run "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
             echo "::notice::dropped ephemeral db $CI_FED_DB on $RUNNER_NAME"
           else
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
