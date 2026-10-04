@@ -771,7 +771,9 @@ and timeout state on the server session and the executed probe
 [#4679](https://github.com/alphaonedev/ai-memory-mcp/issues/4679) lands. `max_prepared_statements`
 stays set (PgBouncer ≥1.21). Deliverables: deploy templates (compose + k8s), expansion of
 `docs/enterprise-deployment.md §10.4`, and an `infra/lan-parity-test/` integration
-test proving plan-caching holds through PgBouncer. **Supavisor is explicitly NOT
+test that runs the suite through PgBouncer. The sqlx layer uses named prepared
+statements; no production code sets `plan_cache_mode` or forces generic plans, so there is no
+plan pinning for the pooler to preserve (#5077). **Supavisor is explicitly NOT
 adopted** — the documented hive (Topology 8/9, `docs/reference-architectures.md`)
 absorbs millions-agent fan-in via hierarchical tiering (1:10–1:100 per tier) + the
 HMAC-batching edge sync gateway *before* Postgres, so the millions-of-concurrent-PG-

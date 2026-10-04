@@ -13,9 +13,9 @@
 
 # roadmap 4.B: states the retired setting to say it is withdrawn and that session mode ships
 ROADMAP.md | > - 4.b ([#1736](https://github.com/alphaonedev/ai-memory-mcp/issues/1736)) — pgbouncer per-module pooler: copy-deployable templates in [infra/pgbouncer/](infra/pgbouncer/) (session-mode pgbouncer.ini with max_prepared_statements = 256, role-defaults.sql, docker-compose.yml, smoke-test.py) + the rationale in docs/enterprise-deployment.md §5.6 (the config-only guidance the directory materializes; the design's "§10.4" placeholder landed as §5.6). the smoke-test.py proves an age cypher transaction + role-default timeouts work through the pooler and that it reports pool_mode = session (#4667: session is the only supported mode; transaction is tracked in [#4679](https://github.com/alphaonedev/ai-memory-mcp/issues/4679)); it is a docker-rig test, deliberately outside the 8-workflow ci gate (like infra/lan-parity-test/). | ctx:d8178830a055
-ROADMAP.md | transaction-mode multiplexing with max_prepared_statements set; as shipped (#4667) | ctx:60c88bbd9fbc
-ROADMAP.md | scripts/probe-pgbouncer-pool-mode.py fails on transaction and statement modes | ctx:f2243fcc544d
-ROADMAP.md | (see docs/enterprise-deployment.md §5.6). transaction mode returns when | ctx:f2b65c2425f6
+ROADMAP.md | transaction-mode multiplexing with max_prepared_statements set; as shipped (#4667) | ctx:7031c95d9f9a
+ROADMAP.md | scripts/probe-pgbouncer-pool-mode.py fails on transaction and statement modes | ctx:ba22d0c6bf59
+ROADMAP.md | (see docs/enterprise-deployment.md §5.6). transaction mode returns when | ctx:feb29211f05c
 
 # #4654 note: says the cloud-init template drops a pooler hop, names the retired mode as the reason
 changelog.d/4654.fixed.md | the do-hive cloud-init memory template now connects the daemon straight to postgres over verified tls, and checks the tarball it installs (#4654, #4635, #4637, #4638, #4642). infra/do-hive/cloud-init-memory.yaml.tpl no longer installs pgbouncer; the store url is postgres://aimemory:@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt on the default port, so the connect funnel's sslmode floor (src/store/postgres/dsn.rs:213-255 evaluate, :283-285 floored_connect_options) is met. postgres runs with ssl = on and a ca-signed server certificate minted on the node, and pg_hba starts with hostnossl all all all reject, so no role can log in to any database over tcp without tls (the packaged host all all lines are reachable only over tls; unix-socket local lines are unchanged; proven on a scratch pg 18 cluster: non-tls refused for the aimemory and postgres roles on 127.0.0.1 and ::1 across three databases, verify-full admitted, #4676). the role password is read back from the store-url file, percent-decoded and sql-quoted on the node and sent to psql on stdin, so it is no longer interpolated into a sql literal; provision.sh no longer runs under set -x and writes a root-only log. the tarball is downloaded into a root-only directory, checked against the new ai_memory_image_sha256 variable before extraction, extracted without ownership and version-probed as the service user; a mismatch stops provisioning. scripts/check-cloud-init-serve-flags.py loses its do-hive exemption and now also fails on a store url on port 6432 or carrying channel_binding, a local postgres without the all-roles hostnossl reject line, a root-run script under a service-user-owned directory, a block scalar line indented less than its block (every cloud-init template), a local postgres without ssl = on or a hostssl line, a tarball without a digest check before extraction (or ignored with || true), and a terraform value written into a sql password literal. channel_binding is not put in the daemon url and the daemon does not channel-bind: the connect funnel removes keys the driver does not honour (the recognised-key list is src/store/postgres/dsn.rs:60-79), so only psql/libpq clients bind (#4677). the root-run scripts moved to /usr/local/sbin (root:root 0755) and the service user's home to /var/lib/ai-memory, so nothing root runs sits under a directory the service user owns (#4674); the provision log is appended, not truncated, each run (#4709); the loadgen template parses as yaml (#4707); the leg-3 daemon step can now pass and fail (#4708). measurement results taken before this change ran through a transaction-pooling pgbouncer and are not like-for-like with results after it (infra/do-hive/readme-measurement.md). phase 2 (#4712, #4673, #4675, #4678, #4702, #4704, #4705): the daemon binary now lives in /usr/local/lib/ai-memory/bin (root:root 0755), so the unit execstart, the root-run bootstrap and the identity step execute nothing the service user can write (#4712); the tarball is extracted in a staging directory and only a regular file is installed (#4673); the postgres tls ca private key is minted in ram under /run and wiped on exit, and only the ca certificate persists (#4675); the node mints the role password with openssl and the db_password terraform variable is removed, so no password passes through terraform state or user-data (#4702, #4704); ai_memory_image_url has no default, refuses non-https, % and releases/latest urls, and spawn.sh refuses a url without its sha256 pin (#4678, #4705). the cloud-init gate now has do-hive probes for each of these and its pending file is empty. the pgdg apt key is pinned by sha256 (#4805), the image url accepts only https:// plus letters, digits and ._~/- (#4806), and provision.sh refuses a surviving changeme placeholder (#4807). merged fix/4616-aws-memory-template (pr 4655 round 3) to share the gate. | ctx:e3b0c44298fc
@@ -136,7 +136,7 @@ src/store/postgres.rs | // green. deployments that already ran transaction mode:
 .github/workflows/c8-precheck.yml | # mentions a pooler mode; each such line must state session mode or be on | ctx:b3f32fc54beb
 
 # #4710 R3 (regen --accept-new, reviewed line by line): roadmap 4.B: says the pooler runs in session mode because the postgres adapter keeps migration-lock and search_path state per session; session prose is listed, not approved
-ROADMAP.md | it is session mode, because the postgres adapter keeps migration-lock, search_path | ctx:c9d624d5178f
+ROADMAP.md | it is session mode, because the postgres adapter keeps migration-lock, search_path | ctx:497c5b479c45
 
 # #4710 R3 (regen --accept-new, reviewed line by line): changelog of this fix: states session mode is the only supported mode, and describes the gate
 changelog.d/4667.fixed.md | never got a server connection. the guide states session mode (or no pooler), the | ctx:d10a4f58eab8
@@ -153,7 +153,7 @@ docs/enterprise-deployment.md | - [ ] daemon binary version pinned per-host (no 
 docs/enterprise-deployment.md | 1.0.0 daemon with the sal-postgres backend started through a session-mode | ctx:5f4c5d59cc69
 docs/enterprise-deployment.md | 1.23.1. it shows that the hazards exist and that session mode removes them in | ctx:6976fdd0c92d
 docs/enterprise-deployment.md | > reports session mode. | ctx:db5a460879bd
-docs/enterprise-deployment.md | > with that line present. in session mode each client keeps its own server | ctx:82a79d130a3b
+docs/enterprise-deployment.md | > with that line present. in session mode each client keeps its own server | ctx:4d9856abc6c7
 docs/enterprise-deployment.md | and scram on both hops, the daemon's pool is in session mode in show pools with no overriding | ctx:0338ee59eaae
 docs/enterprise-deployment.md | daemons alone. behind a session-mode pooler, default_pool_size for a | ctx:13bbb4d79c29
 docs/enterprise-deployment.md | server-side pgbouncer pool in pool_mode = session (the only mode supported today; transaction is not, see §5.6.6 and | ctx:d8b4e83bd725
@@ -247,10 +247,10 @@ changelog.d/4667.fixed.md | table and prepared statement), exits 0 on session, a
 docs/enterprise-deployment.md | 1. move to session mode and re-size. set pool_mode = session, set | ctx:4097562f7736
 
 # guide 5.6.6 prepared-statements caveat: "statements" is SQL prepared statements next to the pgbouncer.ini file name, not statement pooling; the line states no pooler mode
-docs/enterprise-deployment.md | > caveat — prepared statements. pgbouncer.ini ships | ctx:055a7ca083d7
+docs/enterprise-deployment.md | > caveat — prepared statements. pgbouncer.ini ships | ctx:ac0f6b398779
 
 # guide section 5.6 prose and the probe result table: each line states session mode as the only supported mode or records transaction and statement as unsafe
-docs/enterprise-deployment.md | > with that line present. in session mode each client keeps its own server > connection, so a client's prepared statements stay on one backend. | ctx:7cf390bfc954
+docs/enterprise-deployment.md | > with that line present. in session mode each client keeps its own server > connection, so a client's prepared statements stay on one backend. | ctx:eb119cf99cac
 docs/enterprise-deployment.md | server-side pgbouncer pool in pool_mode = session (the only mode | ctx:1011b33945e5
 docs/enterprise-deployment.md | supported today; transaction is not, see §5.6.6 and session-mode pooler does not fan the daemons' connections down: each client | ctx:848c534f326b
 docs/enterprise-deployment.md | | pool_mode | default_pool_size | result | | transaction | 1 | unsafe [1]: a and b shared backend pid 96; b got pg_try_advisory_lock = t, saw a's search_path and statement_timeout = 7777ms; the reused backend kept a's search_path, statement_timeout, temporary table and prepared statement. | | ctx:7c419c75deb6
@@ -341,7 +341,7 @@ changelog.d/4667.fixed.md | table and prepared statement), exits 0 on session, a
 
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
 # Guide 5.6.6 prepared-statement caveat: states that in session mode each client keeps one server connection so its prepared statements stay on one backend, and recommends no other mode. Unit begins: > caveat — prepared statements. pgbouncer.ini ships > connection, so a client's prepared s
-docs/enterprise-deployment.md | > caveat — prepared statements. pgbouncer.ini ships > connection, so a client's prepared statements stay on one backend. | ctx:616481076a0c
+docs/enterprise-deployment.md | > caveat — prepared statements. pgbouncer.ini ships > connection, so a client's prepared statements stay on one backend. | ctx:810da565e910
 
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
 # Guide 5.6.1 pgbouncer.ini example: the pool_mode line is the approved session assignment and the paired line is an adjacent ini setting with its own comment (listen address, TLS, pool size), not a mode instruction. Unit begins: listen_addr = 0.0.0.0 ; bind the interface the daemons reach; both hops require tls below
@@ -538,3 +538,47 @@ src/store/postgres.rs | /// #3008 parity (v1.0.0 batch-2) — transaction-scoped
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
 # Test doc comment on the #3008 advisory-lock fix: the words are independent sqlx pool statements under read committed, not a PgBouncer pooling mode. Unit begins: /// independent pool statements, so under read committed both probes could see a /// not m
 tests/pg_parity_batch_2.rs | /// independent pool statements, so under read committed both probes could see a /// not merely a wrong answer). the advisory-lock + single-tx fix serializes | ctx:a3e4fa071b7f
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Pairs an existing retirement or session-mode statement in section 11.4 with the added sqlx sentence (#5077): it says prepared statements and that no production code sets plan_cache_mode, and it names no pooler mode to set. Reviewed, none sets or recommends transaction mode.
+ROADMAP.md | (see docs/enterprise-deployment.md §5.6). transaction mode returns when statements; no production code sets plan_cache_mode or forces generic plans, so there is no | ctx:f486510a9ce1
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Pairs an existing retirement or session-mode statement in section 11.4 with the added sqlx sentence (#5077): it says prepared statements and that no production code sets plan_cache_mode, and it names no pooler mode to set. Reviewed, none sets or recommends transaction mode.
+ROADMAP.md | it is session mode, because the postgres adapter keeps migration-lock, search_path statements; no production code sets plan_cache_mode or forces generic plans, so there is no | ctx:927eb76a2de6
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Pairs an existing retirement or session-mode statement in section 11.4 with the added sqlx sentence (#5077): it says prepared statements and that no production code sets plan_cache_mode, and it names no pooler mode to set. Reviewed, none sets or recommends transaction mode.
+ROADMAP.md | scripts/probe-pgbouncer-pool-mode.py fails on transaction and statement modes statements; no production code sets plan_cache_mode or forces generic plans, so there is no | ctx:5f1b67735845
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Pairs an existing retirement or session-mode statement in section 11.4 with the added sqlx sentence (#5077): it says prepared statements and that no production code sets plan_cache_mode, and it names no pooler mode to set. Reviewed, none sets or recommends transaction mode.
+ROADMAP.md | statements; no production code sets plan_cache_mode or forces generic plans, so there is no plan pinning for the pooler to preserve (#5077). supavisor is explicitly not | ctx:17612be6d1ad
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Pairs an existing retirement or session-mode statement in section 11.4 with the added sqlx sentence (#5077): it says prepared statements and that no production code sets plan_cache_mode, and it names no pooler mode to set. Reviewed, none sets or recommends transaction mode.
+ROADMAP.md | test that runs the suite through pgbouncer. the sqlx layer uses named prepared statements; no production code sets plan_cache_mode or forces generic plans, so there is no | ctx:46e8688340e8
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Pairs the section 5.6.6 session-mode caveat with the added prepared-statement failure-mode sentences (#5076): they explain why the pooler must not share a server connection between live clients until #4679 lands, and name no mode to set. Reviewed, none sets or recommends transaction mode.
+docs/enterprise-deployment.md | > caveat — prepared statements. pgbouncer.ini ships > next client (on the reused backend the probe saw no prepared statement). | ctx:84bbce927aeb
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Pairs the section 5.6.6 session-mode caveat with the added prepared-statement failure-mode sentences (#5076): they explain why the pooler must not share a server connection between live clients until #4679 lands, and name no mode to set. Reviewed, none sets or recommends transaction mode.
+docs/enterprise-deployment.md | > caveat — prepared statements. pgbouncer.ini ships > this matters because ai-memory's sqlx layer uses named prepared statements | ctx:e434d2f24744
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Pairs the section 5.6.6 session-mode caveat with the added prepared-statement failure-mode sentences (#5076): they explain why the pooler must not share a server connection between live clients until #4679 lands, and name no mode to set. Reviewed, none sets or recommends transaction mode.
+docs/enterprise-deployment.md | > connection also reuse the same names. on a pooler that hands one server > connection to several clients without prepared-statement tracking, that | ctx:65a412c6c063
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Pairs the section 5.6.6 session-mode caveat with the added prepared-statement failure-mode sentences (#5076): they explain why the pooler must not share a server connection between live clients until #4679 lands, and name no mode to set. Reviewed, none sets or recommends transaction mode.
+docs/enterprise-deployment.md | > with that line present. in session mode each client keeps its own server > connection to several clients without prepared-statement tracking, that | ctx:a70d86de4bbc
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Pairs the section 5.6.6 session-mode caveat with the added prepared-statement failure-mode sentences (#5076): they explain why the pooler must not share a server connection between live clients until #4679 lands, and name no mode to set. Reviewed, none sets or recommends transaction mode.
+docs/enterprise-deployment.md | > with that line present. in session mode each client keeps its own server > next client (on the reused backend the probe saw no prepared statement). | ctx:ed7ba17e594d
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Pairs the section 5.6.6 session-mode caveat with the added prepared-statement failure-mode sentences (#5076): they explain why the pooler must not share a server connection between live clients until #4679 lands, and name no mode to set. Reviewed, none sets or recommends transaction mode.
+docs/enterprise-deployment.md | > with that line present. in session mode each client keeps its own server > this matters because ai-memory's sqlx layer uses named prepared statements | ctx:6e22e729f89f

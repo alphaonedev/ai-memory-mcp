@@ -939,6 +939,18 @@ for its life.
 > `max_prepared_statements = 256` (needs PgBouncer 1.21 or later). The proof ran
 > with that line present. In `session` mode each client keeps its own server
 > connection, so a client's prepared statements stay on one backend.
+> `server_reset_query = DISCARD ALL` drops them before that backend serves the
+> next client (on the reused backend the probe saw no prepared statement).
+> This matters because ai-memory's sqlx layer uses named prepared statements
+> (cached per connection), named `sqlx_s_<n>` from a counter that starts at the
+> same value on every client connection, so two clients that share one server
+> connection also reuse the same names. On a pooler that hands one server
+> connection to several clients without prepared-statement tracking, that
+> fails with "prepared statement does not exist" or "prepared statement ...
+> already exists", or runs a same-named statement another client prepared, so a
+> different query executes instead of the request failing. It is one more
+> reason the pooler must not share a server connection between live clients
+> until [#4679](https://github.com/alphaonedev/ai-memory-mcp/issues/4679) lands.
 
 #### 5.6.7 If you already deployed per the earlier text of this section
 
