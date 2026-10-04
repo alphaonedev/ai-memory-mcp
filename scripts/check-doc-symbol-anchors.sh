@@ -500,6 +500,17 @@ MDEOF
         '[h]: src/nope.rs and more words'
     anchor_green 5343 "an attribute that merely ends in href" \
         '<a xhref="src/nope.rs">x</a>'
+    # #5348: pins for the surviving #5269 mutants (REFDEF/HREF).
+    anchor_red 5348 PATH "an unquoted HTML href at the very end of the line" \
+        '<a href=src/nope.rs'
+    anchor_red 5348 LINE "an unquoted HTML href at the end of the line with #L past end-of-file" \
+        '<a href=src/mcp/tools/recall.rs#L9999'
+    anchor_red 5348 PATH "a reference definition with a single-quoted title" \
+        "[h]: src/nope.rs 't'"
+    anchor_red 5348 PATH "a reference definition inside a list inside a blockquote" \
+        '> 1. [h]: src/nope.rs "t"'
+    anchor_green 5348 "an HTML href followed by more attributes" \
+        "<a href=src/mcp/tools/recall.rs class=x>x</a>"
 
     # #5189: the #L fragment of a relative src link is range-checked.
     anchor_red 5189 LINE "a backticked-label link with #L past end-of-file" \
