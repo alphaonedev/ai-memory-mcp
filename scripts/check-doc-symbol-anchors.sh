@@ -267,6 +267,20 @@ MDEOF
     anchor_green 4716 "a full-file range (:1-4)" 'See `src/mcp/tools/recall.rs:1-4`.'
     anchor_green 4716 "a one-line range (:4-4)" 'See `src/mcp/tools/recall.rs:4-4`.'
 
+    # #5191: an UNBACKTICKED path::symbol anchor is a symbol claim too.
+    anchor_red 5191 BARE_QUAL "an unbackticked anchor to a removed symbol" \
+        'See (src/mcp/tools/recall.rs::no_such) here.'
+    anchor_red 5191 BARE_QUAL "an unbackticked anchor in a code-block comment to a removed symbol" \
+        '# store URL from the env (src/mcp/tools/recall.rs::no_such); do not'
+    anchor_red 5191 PATH "an unbackticked anchor to a missing file" \
+        'See (src/nope.rs::resolve_store_url, #4577) here.'
+    anchor_red 5191 BARE_QUAL "an unbackticked brace list with a removed symbol" \
+        'See src/mcp/tools/recall.rs::{RecallTool, no_such}.'
+    anchor_green 5191 "an unbackticked anchor to a live symbol" \
+        'See (src/mcp/tools/recall.rs::decorate_memory_many) here.'
+    anchor_green 5191 "an unbackticked URL path segment is not an anchor" \
+        'See https://example.com/x/src/mcp/tools/recall.rs::no_such for it.'
+
     # ---- #4651: a BARE src/x.rs:N line anchor (no backtick) ----------
     # Every form the #4651 census found must FAIL as BARE_LN; the only
     # exemption is the label of a commit-pinned permalink (immutable).
@@ -564,6 +578,12 @@ LABEL_MD = re.compile(r"^[^\]\n]*\]\(([^)\s]*)")
 LABEL_HTML = re.compile(r"^[^<\n]*</a>")
 QUAL = re.compile(
     r"`(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_:]*))")
+# #5191: an UNBACKTICKED `src/x.rs::symbol` anchor (prose, an HTML code
+# element, a code-block comment) is a symbol claim too, and is the very form
+# the BARE_LN failure text tells authors to use. Same lookbehind as BARE_LN,
+# so a URL path segment is never matched.
+BARE_QUAL = re.compile(
+    r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_:]*))")
 MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(([^)]*src/[A-Za-z0-9_/]+\.rs)[^)]*\)")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -658,7 +678,9 @@ for doc in seen_docs:
                 continue
             emit("BARE_LN", doc, ln, f"{m.group(1)}:{m.group(2)}", ctx)
 
-        for m in QUAL.finditer(line):
+        quals = [("QUAL", m) for m in QUAL.finditer(line)]
+        quals += [("BARE_QUAL", m) for m in BARE_QUAL.finditer(line)]
+        for rule, m in quals:
             f = m.group(1)
             raw = m.group(2) if m.group(2) is not None else (m.group(3) or "")
             if f not in per_file:
@@ -683,7 +705,7 @@ for doc in seen_docs:
                     if part.endswith("_") and any(
                             n.startswith(part) for n in per_file[f]):
                         continue
-                    emit("QUAL", doc, ln, f"{f}::{part}", ctx)
+                    emit(rule, doc, ln, f"{f}::{part}", ctx)
 
         for m in MDLINK.finditer(line):
             sym = m.group(1)
@@ -756,7 +778,8 @@ if [[ -n "$violations" ]]; then
             LINE)  detail="file:line anchor is out of range (line numbers are 1-based and must not pass end-of-file)" ;;
             QUAL)  detail="symbol is not defined in the file it is qualified against" ;;
             MDLINK) detail="markdown symbol link does not resolve in its target file" ;;
-            BARE_LN) detail="bare file:line anchor in a live doc (rots silently); cite path::symbol, or pin a commit permalink" ;;
+            BARE_QUAL) detail="symbol is not defined in the file it is qualified against (unbackticked anchor)" ;;
+            BARE_LN) detail="bare file:line anchor in a live doc (rots silently); cite \`path::symbol\`, or pin a commit permalink" ;;
             LADDER_TIP) detail="claimed ladder tip disagrees with the tip scripts/check-migration-ladder.sh computes (left=cited, right=actual)" ;;
             *)     detail="unresolved anchor" ;;
         esac
