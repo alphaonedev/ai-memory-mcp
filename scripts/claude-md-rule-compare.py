@@ -471,11 +471,21 @@ def self_test() -> int:
          base_mutate=weakened_pyc)
 
     def isolated_refusal():
-        # #5163: without -I the script directory heads sys.path, so the comparison itself must refuse to run.
-        result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--base-root", ".", "--repo", ".",
-                                 "--base-sha", "0" * 40, "--head-sha", "0" * 40, "--scratch", str(base_dir / "iso")],
+        # #5163/#5313: without -I the script directory heads sys.path, so the comparison must refuse to run, and
+        # the non-isolated child is started from a COPY of the script in an empty scratch directory (never from
+        # the real scripts/ directory, where a merged sibling named like a standard module would run inside the
+        # trusted job). Standard-module files are planted beside the copy; none may run.
+        iso = base_dir / "iso"
+        iso.mkdir(parents=True, exist_ok=True)
+        copy = iso / "claude-md-rule-compare.py"
+        shutil.copyfile(Path(__file__).resolve(), copy)
+        for name in ("argparse", "difflib", "py_compile", "re", "shutil", "stat", "subprocess"):
+            (iso / f"{name}.py").write_text("print('PLANTED')\nraise SystemExit(0)\n", encoding="utf-8")
+        result = subprocess.run([sys.executable, str(copy), "--base-root", ".", "--repo", ".",
+                                 "--base-sha", "0" * 40, "--head-sha", "0" * 40, "--scratch", str(iso / "s")],
                                 capture_output=True, text=True, check=False)
-        return result.returncode == 1 and "isolated mode" in result.stdout
+        return (result.returncode == 1 and "isolated mode" in result.stdout
+                and "PLANTED" not in result.stdout + result.stderr)
 
     if isolated_refusal():
         print("PASS: self-test - a comparison run without -I fails closed (R5, #5163)")
