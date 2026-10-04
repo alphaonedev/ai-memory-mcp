@@ -1382,6 +1382,12 @@ jobs:
           # checkout cannot resolve it and the gate would fault.
           fetch-depth: 0
       - name: Run exec-file credentials-on-argv gate
+        # The merge-base rules (#4919, #4996, #5103) run on every event. A pull request names
+        # its base through GITHUB_BASE_REF; a merge group and a push name it here. A push that
+        # creates a branch (before is all zeros) is judged against the default branch. In CI a
+        # missing or unresolvable base is a FAULT: unresolved means red (#4869).
+        env:
+          EXEC_SECRET_ARGV_BASE: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && (github.event.before != '0000000000000000000000000000000000000000' && github.event.before || format('origin/{0}', github.event.repository.default_branch)) || '' }}
         run: python3 scripts/check-exec-secret-argv.py
       - name: Self-test the gate (regression evidence)
         # Red probes for each form of #4813-#4819, #4826, #4827, #4808, #4859,

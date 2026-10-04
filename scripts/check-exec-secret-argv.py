@@ -61,6 +61,7 @@ Usage:
 """
 import argparse
 import contextlib
+import difflib
 import importlib.util
 import io
 import os
@@ -907,34 +908,91 @@ def _git(root: Path, *args: str) -> str:
         "utf-8", "replace")
 
 
-def allow_from_pending(allow: List[Entry], base_pending: List[Entry], changed: Iterable[str]) -> List[str]:
-    """#4919: an allow entry may not approve a (file, line) that was PENDING at the merge base
-    unless the same change also edits the file that holds the line (a code fix, not a list edit)."""
-    moved = set(changed)
-    base = {(e[1], e[3]) for e in base_pending}
-    return ["allow:%d: entry approves a line that was pending at the merge base without a change to %s: %s" % (
-        e[4], e[1], e[3][:80]) for e in allow if (e[1], e[3]) in base and e[1] not in moved]
+def allow_from_pending(allow: List[Entry], base_pending: List[Entry], renames: Dict[str, str]) -> List[str]:
+    """#4919: an allow entry may not approve a (file, line) that was PENDING at the merge base.
+    A code fix changes the line text and so the key; an edit elsewhere in the file does not make
+    the same line safe (#4996). A renamed file keeps its pending lines under the new path."""
+    base = {(renames.get(e[1], e[1]), e[3]) for e in base_pending}
+    return ["allow:%d: entry approves a line that was pending at the merge base (change the line, "
+            "not the list): %s: %s" % (e[4], e[1], e[3][:80]) for e in allow if (e[1], e[3]) in base]
 
 
-def merge_base_hits(root: Path, allow: List[Entry]) -> List[str]:
-    """Run allow_from_pending against the merge base named by GITHUB_BASE_REF (a pull request)
-    or EXEC_SECRET_ARGV_BASE (any ref). With neither set there is no change to judge. A named
-    base that cannot be resolved is a FAULT (fail closed)."""
+# A new allow entry this close to a pending line that left the pending list in the same change
+# is that line with a cosmetic edit, not a fix: it stays pending (#4891 round-2 security).
+EDITED_PENDING_RATIO = 0.8
+
+
+def allow_like_vanished_pending(allow: List[Entry], base_allow: List[Entry], base_pending: List[Entry],
+                                head_pending: List[Entry]) -> List[str]:
+    """An allow entry that is new since the merge base may not approve a line, or a lightly edited
+    copy of a line, that was pending at the merge base and is no longer pending (any file, so a
+    rename is covered; an edit elsewhere in the file does not exempt it).
+    A real fix that takes the secret off the argv is no longer triggered and needs no entry; a
+    fixed line that is still triggered stays pending until its issue closes."""
+    # Counted by text, not keyed by (file, text): a renamed file keeps its counts unchanged, and a
+    # line pending in several files still counts as gone when one of its rows leaves the list.
+    old_allow = Counter(e[3] for e in base_allow)
+    still = Counter(e[3] for e in head_pending)
+    gone = []
+    for e in base_pending:
+        if still[e[3]] > 0:
+            still[e[3]] -= 1
+        else:
+            gone.append(e)
+    out: List[str] = []
+    for e in allow:
+        if old_allow[e[3]] > 0:
+            old_allow[e[3]] -= 1
+            continue
+        for v in gone:
+            if difflib.SequenceMatcher(None, e[3], v[3], autojunk=False).ratio() >= EDITED_PENDING_RATIO:
+                out.append("allow:%d: new entry approves an edited copy of a line that was pending at the merge "
+                           "base (%s %s); keep it pending: %s" % (e[4], v[0], v[1], e[3][:80]))
+                break
+    return out
+
+
+def in_ci() -> bool:
+    """True on a CI runner (GitHub Actions sets both variables)."""
+    return (os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true"
+            or os.environ.get("CI", "").strip().lower() in ("true", "1"))
+
+
+def merge_base_hits(root: Path, allow: List[Entry], pend: Optional[List[Entry]] = None) -> Optional[List[str]]:
+    """Run the merge-base rules (#4919, #4996, #5103) against the base named by
+    EXEC_SECRET_ARGV_BASE (any ref) or GITHUB_BASE_REF (a pull request). Unresolved means red:
+    in CI a missing base, or a named base that cannot be resolved, is a FAULT (fail closed).
+    Outside CI with no base named, returns None: the rule was not evaluated, and run() says so."""
     ref = os.environ.get("EXEC_SECRET_ARGV_BASE", "").strip()
     if not ref and os.environ.get("GITHUB_BASE_REF", "").strip():
         ref = "origin/" + os.environ["GITHUB_BASE_REF"].strip()
     if not ref:
-        return []
+        if in_ci():
+            raise RuntimeError("no merge base named in CI: set EXEC_SECRET_ARGV_BASE or GITHUB_BASE_REF "
+                               "(unresolved means red, #4996)")
+        return None
     try:
         mb = _git(root, "merge-base", "HEAD", ref).strip()
-        changed = [f for f in _git(root, "diff", "--name-only", mb, "HEAD").split("\n") if f]
+        renames: Dict[str, str] = {}
+        for row in _git(root, "diff", "-M", "--name-status", mb, "HEAD").split("\n"):
+            cols = row.split("\t")
+            if len(cols) == 3 and cols[0].startswith("R"):
+                renames[cols[1]] = cols[2]
         try:
             old = _git(root, "show", "%s:%s" % (mb, PENDING_FILE))
         except subprocess.CalledProcessError:
             old = ""
+        try:
+            old_allow = _git(root, "show", "%s:%s" % (mb, ALLOW_FILE))
+        except subprocess.CalledProcessError:
+            old_allow = ""
     except subprocess.CalledProcessError as exc:
         raise RuntimeError("cannot resolve the merge base against %s (fail closed): %s" % (ref, exc))
-    return allow_from_pending(allow, parse_entries(old, "base-pending", False, []), changed)
+    base_pend = parse_entries(old, "base-pending", False, [])
+    hits = allow_from_pending(allow, base_pend, renames)
+    hits.extend(allow_like_vanished_pending(allow, parse_entries(old_allow, "base-allow", False, []), base_pend,
+                                            pend or []))
+    return hits
 
 
 def empty_scan_faults(n_exec: int, allow: List[Entry], found: Dict[str, List[Found]]) -> List[str]:
@@ -954,7 +1012,7 @@ def run(root: Path) -> int:
         dl = load_denylist(root)
         found, n_exec, n_prose = scan_repo(root, dl)
         allow, pend, faults = load_lists(root)
-        base_hits = merge_base_hits(root, allow)
+        base_hits = merge_base_hits(root, allow, pend)
     except Exception as exc:  # noqa: BLE001 - fail closed
         print("FAULT: %s" % exc, file=sys.stderr)
         return 2
@@ -964,7 +1022,11 @@ def run(root: Path) -> int:
         return 2
     hits, report, stats = judge(found, allow, pend, dl)
     hits.extend(check_allow_vs_denylist(found, allow))
-    hits.extend(base_hits)
+    if base_hits is None:
+        print("NOTE: merge-base rule NOT evaluated: no EXEC_SECRET_ARGV_BASE or GITHUB_BASE_REF is set "
+              "(outside CI only; in CI this is a FAULT)", file=sys.stderr)
+    else:
+        hits.extend(base_hits)
     for line in report:
         print(line)
     if hits:
@@ -978,7 +1040,7 @@ def run(root: Path) -> int:
     print("PASS: check-exec-secret-argv: %d executable files and %d prose files scanned, %d triggered lines "
           "(%d allow entries covering %d lines, %d pending entries covering %d lines, listed not approved)"
           % (n_exec, n_prose, sum(len(v) for v in found.values()), len(allow), n_allow_lines,
-             len(pend), stats["pending"]))
+             len(pend), stats["pending"]) + ("; merge-base rule not evaluated" if base_hits is None else ""))
     return 0
 
 
@@ -1182,13 +1244,32 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
         bad.append("a runaway array was joined without a fault (#4901)")
     except RuntimeError:
         pass
-    # #4919: an allow entry for a line that was pending at the base needs a change to its file
-    n += 2
+    # #4919/#4996: an allow entry for a line that was pending at the base is refused, also when
+    # the file was edited or renamed in the same change; a changed line (a new key) is not
+    n += 3
     ent = [("reason: r", "a.sh", 1, "x --token $T", 1)]
-    if not allow_from_pending(ent, [("#1", "a.sh", 1, "x --token $T", 1)], ["scripts/other.sh"]):
-        bad.append("an allow entry for a pending line passed with no change to its file (#4919)")
-    if allow_from_pending(ent, [("#1", "a.sh", 1, "x --token $T", 1)], ["a.sh"]):
-        bad.append("an allow entry for a pending line was refused although its file changed (#4919)")
+    if not allow_from_pending(ent, [("#1", "a.sh", 1, "x --token $T", 1)], {}):
+        bad.append("an allow entry for a pending line passed (#4919)")
+    if not allow_from_pending(ent, [("#1", "old/a.sh", 1, "x --token $T", 1)], {"old/a.sh": "a.sh"}):
+        bad.append("an allow entry for a pending line passed after a rename of its file (#4996)")
+    if allow_from_pending(ent, [("#1", "a.sh", 1, "x --token $OTHER", 1)], {}):
+        bad.append("an allow entry for a changed line was refused (#4919)")
+    # round-2 security: a cosmetic edit of a pending line does not make it allow-able
+    n += 2
+    pl = 'ssh h "curl -fsS --max-time 10 $(hdrs) https://x/y"'
+    if not allow_like_vanished_pending([("reason: r", "b.sh", 1, pl.replace("10", "11"), 1)], [],
+                                       [("#1", "a.sh", 1, pl, 1)], []):
+        bad.append("an allow entry for an edited copy of a vanished pending line passed")
+    if allow_like_vanished_pending([("reason: r", "a.sh", 1, "cat /etc/hostname", 1),
+                                    ("reason: r", "b.sh", 1, pl.replace("10", "12"), 1)],
+                                   [("reason: r", "a.sh", 1, pl.replace("10", "12"), 1)],
+                                   [("#1", "a.sh", 1, pl, 1)], [("#1", "b.sh", 1, pl, 1)]):
+        bad.append("an unrelated new allow entry or a renamed file's entries were refused as edited pending lines")
+    n += 1
+    if not allow_like_vanished_pending([("reason: r", "a.sh", 1, pl, 1)], [],
+                                       [("#1", "a.sh", 1, pl, 1), ("#1", "c.sh", 1, pl, 1)],
+                                       [("#1", "c.sh", 1, pl, 1)]):
+        bad.append("a pending line moved to allow passed because the same text stays pending in another file")
     # #4920: credential flags fed from a variable are denylist-tagged, so never allow-able
     for label, line in (("mysql -p", 'mysql -u r -p"$X" db'), ("sshpass -p", 'sshpass -p "$X" ssh h'),
                         ("redis-cli -a", 'redis-cli -a "$X" ping'), ("curl -u", 'curl -u "u:$X" h'),
@@ -1224,6 +1305,12 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
     m = re.search(r"\n  exec-secret-argv-gate:\n(.*?)(?=\n  [A-Za-z0-9_-]+:\n|\Z)", wf, re.S)
     if not m or "fetch-depth: 0" not in m.group(1):
         bad.append("the exec-secret-argv-gate CI job does not check out full history (#4919)")
+    # ... and names a merge base on the merge_group and push legs too (#4996)
+    n += 1
+    job = m.group(1) if m else ""
+    if not re.search(r"EXEC_SECRET_ARGV_BASE:.*github\.event\.merge_group\.base_sha.*github\.event\.before.*"
+                     r"default_branch", job):
+        bad.append("the exec-secret-argv-gate CI job names no merge base for merge_group or push (#4996)")
     # an extensionless dotfile is a script only when its first line is a shell shebang (#4910)
     n += 2
     if file_class(".runner", "#!/bin/bash\ncurl x\n") != "shell":

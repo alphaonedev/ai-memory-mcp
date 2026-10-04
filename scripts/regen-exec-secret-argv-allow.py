@@ -35,10 +35,12 @@ Usage:
   scripts/regen-exec-secret-argv-allow.py --check         exit 1 if the files would change
 """
 import argparse
+import difflib
 import importlib.util
 import re
+import subprocess
 import sys
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -96,8 +98,11 @@ def is_prose(rel: str) -> bool:
 
 
 def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, pending: bool,
-         why: Optional[str], prune: bool, match: Optional[str] = None, dl=None) -> Tuple[int, List[Entry], List[Entry], List[str]]:
-    """Pure core. Returns (exit code, new allow, new pending, messages)."""
+         why: Optional[str], prune: bool, match: Optional[str] = None, dl=None,
+         committed_pending: Optional[List[Entry]] = None) -> Tuple[int, List[Entry], List[Entry], List[str]]:
+    """Pure core. Returns (exit code, new allow, new pending, messages). ``committed_pending`` is
+    the pending list as committed at HEAD: a line pruned from pending in an earlier, uncommitted
+    run is still refused for allow (#4996), and so is a lightly edited copy of it (#5103)."""
     msgs: List[str] = []
     if accept_new and (why is None or not (gate.PEND_WHY_RE if pending else gate.WHY_RE).match(why)):
         return 2, allow, pend, ["--accept-new needs --why '#<issue>' (pending: an issue number only) or --why 'reason: <text>'"]
@@ -105,7 +110,15 @@ def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, p
         return 2, allow, pend, ["--pending only works with --accept-new"]
     amap: Dict[Tuple[str, str], Entry] = {(e[1], e[3]): e for e in allow}
     pmap: Dict[Tuple[str, str], Entry] = {(e[1], e[3]): e for e in pend}
-    pend_texts = {e[3] for e in pend}
+    pend_texts = {e[3] for e in pend} | {e[3] for e in (committed_pending or [])}
+    # committed pending rows that are no longer pending (counted by text, the gate's rule)
+    still = Counter(e[3] for e in pend)
+    vanished: List[str] = []
+    for e in committed_pending or []:
+        if still[e[3]] > 0:
+            still[e[3]] -= 1
+        else:
+            vanished.append(e[3])
     rc = 0
     occ: Dict[Tuple[str, str], list] = {}
     for rel, lines in found.items():
@@ -163,6 +176,13 @@ def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, p
                 msgs.append("REFUSED %s:%d: the line is pending (or was, under another file); an allow entry "
                             "cannot replace a pending one: %s" % (rel, extra[0][0], text[:120]))
                 continue
+            near = [v for v in vanished if difflib.SequenceMatcher(None, text, v, autojunk=False).ratio()
+                    >= gate.EDITED_PENDING_RATIO]
+            if near:
+                rc = 1
+                msgs.append("REFUSED %s:%d: an edited copy of a line that left the pending list; it stays "
+                            "pending (#5103): %s" % (rel, extra[0][0], text[:120]))
+                continue
             hits = gate.prose_rule_hits(dl, text)
             if hits:
                 rc = 1
@@ -216,7 +236,7 @@ def retag(gate, allow: List[Entry], pend: List[Entry], source: str, match: Optio
 
 
 # ---------------------------------------------------------------- refusal cases
-REFUSAL_CASE_COUNT = 20
+REFUSAL_CASE_COUNT = 22
 
 
 def _f(gate, rel: str, line: str, flagged: bool = False):
@@ -281,6 +301,16 @@ def refusal_cases(root: Path) -> List[str]:
     rc, na, _np, _m = plan(gate, renamed, [], pend_e, True, False, "reason: renamed", True, None, dl)
     if rc != 1 or na:
         bad.append("regen: a renamed file moved a pending line into allow (#4902)")
+    # #4996: a second run after a --prune that dropped the pending row: the committed row refuses
+    rc, na, _np, _m = plan(gate, base2, [], [], True, False, "reason: r", False, None, dl, pend_e)
+    if rc != 1 or na:
+        bad.append("regen: a pending line pruned in an earlier run was added to allow (#4996)")
+    # #5103: a lightly edited copy of a committed pending line that left the list stays pending
+    edited = a_line.replace("db", "db2")
+    rc, na, _np, _m = plan(gate, _f(gate, "x.sh", edited), [], [], True, False, "reason: r", False, None, dl,
+                           pend_e)
+    if rc != 1 or na:
+        bad.append("regen: an edited copy of a pending line that left the list was added to allow (#5103)")
     hdr = 'curl -H "X-API-Key: $k" http://h/'
     rc, na, _np, _m = plan(gate, _f(gate, "x.sh", hdr), [], [], True, False, "reason: r", False, None, dl)
     if rc != 1 or na:
@@ -351,11 +381,20 @@ def main(argv: List[str]) -> int:
         print("FAULT: a hand-written comment line would be dropped; remove it or move it into the head "
               "of the tool (#4902): %s" % dropped[0][:100], file=sys.stderr)
         return 2
+    committed: List[Entry] = []
+    if args.accept_new and not args.pending:
+        try:
+            old = gate._git(root, "show", "HEAD:" + gate.PENDING_FILE)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print("FAULT: cannot read the committed pending list (fail closed, #4996): %s" % exc,
+                  file=sys.stderr)
+            return 2
+        committed = lenient_pending(old)
     if args.retag:
         rc, na, np_, msgs = retag(gate, allow, pend, args.retag, args.match, args.why, args.to_pending)
     else:
         rc, na, np_, msgs = plan(gate, found, allow, pend, args.accept_new, args.pending, args.why, args.prune,
-                                 args.match, dl)
+                                 args.match, dl, committed)
     for m in msgs:
         print(m, file=sys.stderr if m.startswith(("NEW", "STALE", "REFUSED")) else sys.stdout)
     if rc == 2:
