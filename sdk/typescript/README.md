@@ -172,7 +172,10 @@ you override `agentId`, pass an `AbortSignal`, or add custom headers.
 `grant()`, `revoke()` and `cluster()` are gone. They posted to
 `/api/v1/memories/:id/grant`, `/api/v1/memories/:id/revoke` and
 `/api/v1/cluster`, none of which the daemon registers — every call 404'd, in
-every release that shipped them. Replacements:
+every release that shipped them. Their request/response types (`GrantRequest`,
+`RevokeRequest`, `ClusterPeer`, `ClusterRequest`, `ClusterResponse`) are marked
+`@deprecated` and stay exported for one release; they will then be removed.
+Replacements:
 
 - **Per-memory access control** — set `metadata.scope` (`"private"` |
   `"collective"`) on the write, and attach a namespace governance standard for
@@ -212,7 +215,7 @@ await memory.store(
 #### Write attestation
 
 `POST /api/v1/memories` is `WriteSurface::HttpDirect`, which fails **closed**
-by default (`src/identity/attest.rs:130-136`). A store without a valid
+by default ([`resolve_require_agent_attestation`](../../src/identity/attest.rs)). A store without a valid
 Ed25519 attestation is `403 ATTESTATION_FAILED`.
 
 ```ts

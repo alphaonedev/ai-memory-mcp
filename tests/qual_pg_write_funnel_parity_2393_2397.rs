@@ -74,8 +74,13 @@ const AGE_UNPROJECT_CALL: &str = "unproject_memory_from_age(";
 const KIND_PROVENANCE_FUNNELS: &[&str] = &[
     // Already correct before #2393 — pinned so they cannot regress.
     "store",
-    "store_batch",     // #2289
-    "archive_restore", // #2333 / FBL-03
+    "store_batch", // #2289
+    // #4447 — `archive_restore` is now a thin delegator to the inherent
+    // `archive_restore_inner` (moved verbatim to
+    // `postgres/federation_by_id_4447.rs` to gain the in-transaction peer-scope
+    // re-check). The guard follows the INSERT..SELECT to the function that owns
+    // it, the same move as `store_with_embedding_inner` above (#2771).
+    "archive_restore_inner", // #2333 / FBL-03
     // Fixed by #2393 — the three funnels the issue named…
     // #2771 — `store_with_embedding` was refactored into a thin delegator to the
     // shared inherent `store_with_embedding_inner`, which now holds the INSERT +
@@ -92,6 +97,11 @@ const KIND_PROVENANCE_FUNNELS: &[&str] = &[
     "apply_remote_memory",
 ];
 
+/// Funnels that persist `kind_provenance` through an `INSERT ... SELECT` over
+/// the archive table rather than a Rust-side bind (they still must name the
+/// column). One list for the named-funnel pin AND the child-module sweep.
+const INSERT_SELECT_CARRIERS: &[&str] = &["archive_restore", "archive_restore_inner"];
+
 /// Every postgres funnel that hard-DELETEs a live `memories` row and MUST
 /// therefore unproject it from the AGE `memory_graph` projection.
 /// `update_with_archive_on_supersede` is the #2397 net-new arm; the rest
@@ -99,7 +109,10 @@ const KIND_PROVENANCE_FUNNELS: &[&str] = &[
 /// the class stays closed.
 const AGE_UNPROJECT_FUNNELS: &[&str] = &[
     "delete",
-    "apply_remote_deletion",
+    // #4447 — `apply_remote_deletion` is a thin delegator to
+    // `apply_remote_deletion_inner` (moved to `postgres/federation_by_id_4447.rs`);
+    // the guard follows the DELETE to the function that owns it.
+    "apply_remote_deletion_inner",
     "forget",
     // #4045/#4046/#4047 — `consolidate` was refactored into a thin delegator to
     // `consolidate_with_expected_versions`, which now holds the hard-DELETE of
@@ -109,7 +122,8 @@ const AGE_UNPROJECT_FUNNELS: &[&str] = &[
     "consolidate_with_expected_versions",
     "run_gc",
     "size_gc",
-    "archive_by_ids",
+    // #4447 — `archive_by_ids` delegates to `archive_by_ids_inner` (moved).
+    "archive_by_ids_inner",
     "update_with_archive_on_supersede", // #2397 (N17)
 ];
 
@@ -146,6 +160,9 @@ fn adapter_source() -> String {
 fn fn_span<'a>(src: &'a str, name: &str) -> Option<&'a str> {
     let sig_a = format!("    async fn {name}(");
     let sig_b = format!("    pub async fn {name}(");
+    // #4447 — methods moved into child modules are `pub(super)` / `pub(crate)`.
+    let sig_c = format!("    pub(super) async fn {name}(");
+    let sig_d = format!("    pub(crate) async fn {name}(");
 
     // (byte_start, byte_end_past_terminator, content_without_terminator)
     let mut lines: Vec<(usize, usize, &str)> = Vec::new();
@@ -159,9 +176,12 @@ fn fn_span<'a>(src: &'a str, name: &str) -> Option<&'a str> {
     }
 
     // Single-line-signature variants (e.g. `archive_restore`, `delete`).
-    let start = lines
-        .iter()
-        .position(|(_, _, l)| l.starts_with(&sig_a) || l.starts_with(&sig_b))?;
+    let start = lines.iter().position(|(_, _, l)| {
+        l.starts_with(&sig_a)
+            || l.starts_with(&sig_b)
+            || l.starts_with(&sig_c)
+            || l.starts_with(&sig_d)
+    })?;
     let end = lines[start + 1..]
         .iter()
         .position(|(_, _, l)| *l == "    }")
@@ -362,7 +382,7 @@ fn pg_write_funnels_bind_kind_provenance_2393() {
         // `archive_restore` carries the column through an INSERT ... SELECT
         // over `archived_memories` (with a metadata-carrier COALESCE fallback
         // for legacy pre-v87 archive rows), so it has no Rust-side bind.
-        if *name != "archive_restore" && !span.contains(KIND_PROVENANCE_BIND) {
+        if !INSERT_SELECT_CARRIERS.contains(name) && !span.contains(KIND_PROVENANCE_BIND) {
             missing.push(format!(
                 "  {name}: no `{KIND_PROVENANCE_BIND}` bind — a raw literal or a \
                  dropped column silently NULLs the v79/#1945 provenance on postgres"
@@ -489,7 +509,9 @@ fn pg_child_module_memories_writes_obey_2393_2397_4023() {
     for child in children {
         for (name, body) in child_fn_spans(&child.text) {
             if has_sql(&body, "INSERT INTO memories")
-                && !(body.contains(KIND_PROVENANCE_COLUMN) && body.contains(KIND_PROVENANCE_BIND))
+                && !(body.contains(KIND_PROVENANCE_COLUMN)
+                    && (body.contains(KIND_PROVENANCE_BIND)
+                        || INSERT_SELECT_CARRIERS.contains(&name.as_str())))
             {
                 violations.push(format!(
                     "  {}::{name}: INSERTs a memories row without the kind_provenance \
@@ -513,5 +535,32 @@ fn pg_child_module_memories_writes_obey_2393_2397_4023() {
         violations.is_empty(),
         "#4023: child-module write funnels violate the #2393/#2397 parity pins:\n{}",
         violations.join("\n")
+    );
+}
+
+/// #4447 — `fn_span` finds methods whose visibility is `pub(super)` /
+/// `pub(crate)` (the moved federation by-id bodies), and still bounds them.
+#[test]
+fn fn_span_matches_restricted_visibility_methods_4447() {
+    let src = concat!(
+        "impl PostgresStore {\n",
+        "    pub(super) async fn moved_funnel(\n",
+        "        &self,\n",
+        "    ) -> Result<()> {\n",
+        "        let marker = \"MOVED_ONLY_MARKER\";\n",
+        "        Ok(())\n",
+        "    }\n",
+        "\n",
+        "    pub(crate) async fn next_funnel(&self) -> Result<()> {\n",
+        "        Ok(())\n",
+        "    }\n",
+        "}\n",
+    );
+    let span = fn_span(src, "moved_funnel").expect("pub(super) method must be found");
+    assert!(span.contains("MOVED_ONLY_MARKER"));
+    assert!(!span.contains("next_funnel"), "span must not bleed");
+    assert!(
+        fn_span(src, "next_funnel").is_some(),
+        "pub(crate) method must be found"
     );
 }

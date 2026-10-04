@@ -664,7 +664,8 @@ pub(crate) fn run_with_curator(
     //
     // The policy is resolved against the PERSISTED namespace (the DB's
     // truth), never the requested one.
-    let ns_policy = db::resolve_governance_policy(&conn, &persisted.namespace).unwrap_or_default();
+    // #4043 — optional feature knob (auto-atomise): an unreadable policy leaves it OFF.
+    let ns_policy = db::resolve_governance_policy_for_optional_feature(&conn, &persisted.namespace);
     let atomise_disposition = crate::cli::post_store::run_auto_atomise_for_cli(
         &conn,
         db_path,

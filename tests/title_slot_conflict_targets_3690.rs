@@ -309,7 +309,18 @@ fn reviewed_consumers() -> BTreeMap<(&'static str, &'static str), &'static str> 
             "consumes `restore_or_conflict` (routed on both adapters) — skip + warn per original",
         ),
         (
-            ("src/store/postgres.rs", "archive_restore"),
+            // 2026-10-03 (GOD ai:god-zsg): RE-KEYED after #4447 moved this body from
+            // src/store/postgres.rs::archive_restore to
+            // src/store/postgres/federation_by_id_4447.rs::archive_restore_inner. The key moved only
+            // after the moved body was re-read: its ONLY `StoreError::Conflict` construction is the
+            // `// Reject if the id is already in active memories` branch, with the FX-C5 governance
+            // pre-write hook and the #3124 owner probe intact — so the review's conclusion survives
+            // the move. Re-keying first and reading afterwards would launder an unreviewed change
+            // through an old review, which is the one thing this table must never do.
+            (
+                "src/store/postgres/federation_by_id_4447.rs",
+                "archive_restore_inner",
+            ),
             "an ID collision (the archived id is already live), not a title collision; the title-key INSERT…SELECT has no ON CONFLICT and surfaces a unique violation",
         ),
         (

@@ -11,24 +11,12 @@ The short version: **`ai-memory` does not phone home, does not register your dep
 
 ## 1. What `ai-memory` emits
 
-The binary emits structured `tracing` spans on every meaningful operation. The categories are stable across v0.7.x:
+The binary emits `tracing` output for the following, and writes audit rows separately:
 
-- **MCP tool calls** — one span per JSON-RPC request. Includes the tool name, the resolved agent_id, the namespace, duration in microseconds, and the result tag (`ok`, `denied`, `error`).
-- **Governance decisions** — one span per policy evaluation (hook deny, namespace inheritance refusal, attestation verification). Includes the rule that fired and the verdict.
-- **Federation events** — one span per outbound push, inbound pull, signature verification, and allowlist refusal. Includes peer agent_id and message-class metadata.
-- **Audit emissions** — one span per audit-trail row. Includes audit kind and the hash of the appended row (for downstream chain verification).
-
-Span format (canonical):
-
-```
-operation_name     // e.g. "memory_store", "federation_push", "hook_pre_store"
-agent_id           // resolved per the precedence ladder in docs/reference/ARCHITECTURE_REFERENCE.md §Agent Identity
-namespace          // logical store namespace, never the memory content
-duration_us        // wall-clock microseconds
-result             // "ok" | "denied" | "error"
-```
-
-Spans do **not** contain memory content, embeddings, prompts, recall results, or any payload bytes. The substrate emits operation metadata only.
+- **MCP tool calls** — one `mcp_tool_call` info span per `tools/call` request that passes the tool-name and profile checks (`src/mcp/mod.rs`). The span's own fields are the tool name (`tool`) and the JSON-RPC id (`rpc_id`). After dispatch it reports an `ok` info event with `elapsed_ms`, or an `err` warn event with `elapsed_ms` and the error. A request with a missing tool name, or for a tool not loaded in the active profile, returns before the span; non-object `arguments`, an unresolvable caller authority, the record-stop gate, an unknown tool and an unrecognised wire format return inside the span without an `ok` or `err` event. The span does not record arguments or results.
+- **Governance decisions** — not tracing spans. `record_decision` (`src/governance/audit.rs`) records the decision as a forensic audit row when the forensic audit sink is running and does nothing when it is not; it emits a `tracing::error!` when it cannot queue or append the row.
+- **Federation events** — `tracing::info!` events on the push, DLQ-replay, receive and sync paths (`src/federation/`), not a span per event.
+- **Audit emissions** — audit-trail rows, not tracing spans. Where the trail is enabled, MCP dispatch appends them through `audit_emit_for_mcp_dispatch`.
 
 ---
 

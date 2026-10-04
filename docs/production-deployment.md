@@ -201,7 +201,7 @@ Migration failures roll back; the database is never left in a half-migrated stat
 
 Out-of-the-box observability lands in three places:
 
-- **Tracing spans on stderr.** Every MCP tool call, every governance decision, every federation event emits a `tracing::info!` span. `RUST_LOG=info` is the default (post-#3650 a bare level admitting every target, including the postgres SAL adapter's literal `store::postgres` / `store::postgres::kg` targets); `RUST_LOG=ai_memory=debug` for deep traces, e.g. `store::postgres=debug` for the postgres adapter specifically.
+- **Tracing on stderr.** An MCP `tools/call` request that passes the tool-name and profile checks runs inside an `mcp_tool_call` info span (fields `tool` and `rpc_id`) and reports an `ok` info event with `elapsed_ms`, or an `err` warn event. A request with a missing tool name, or for a tool not loaded in the active profile, returns before the span; non-object `arguments`, an unresolvable caller authority, the record-stop gate, an unknown tool and an unrecognised wire format return inside the span without an `ok` or `err` event. Governance decisions are not tracing spans: `record_decision` records them as forensic audit rows when the forensic audit sink is running and does nothing when it is not. Federation emits `tracing::info!` events on the push, DLQ-replay, receive and sync paths, not a span per event. `RUST_LOG=info` is the default (post-#3650 a bare level admitting every target, including the postgres SAL adapter's literal `store::postgres` / `store::postgres::kg` targets); `RUST_LOG=ai_memory=debug` for deep traces, e.g. `store::postgres=debug` for the postgres adapter specifically.
 - **File logging.** Opt-in via `[logging]` in `config.toml` (path, rotation size, retention days, `structured = true` for JSON). Routes to a rotating appender; off by default.
 - **`ai-memory doctor`.** A 13-section health dashboard run locally: Storage / Index / Embedding Space Census (#2167) / Recall Index Coverage (#1964) / Corpus Lifecycle (#1965) / Recall / Governance / Sync / Webhook / Capabilities / Reflection Health / LLM Reachability (#1146) / Embeddings Reachability (#1598). Nothing leaves the host except the opt-in reachability probes against your configured LLM / embedding backends. (`ai-memory doctor --remote <url>` becomes a fleet doctor against a running daemon.)
 
@@ -301,7 +301,10 @@ Fleet rollout pattern (systemd):
 EnvironmentFile=/etc/ai-memory/llm.env
 # NOTE: `serve` does NOT accept a --tier flag — the daemon's tier comes
 # from the `tier` field in config.toml (compiled default: semantic).
-ExecStart=/usr/local/bin/ai-memory serve --store-url postgres://...
+# The DSN (with its password) lives in a 0600 file, not on the argv that any
+# local UID can read from /proc/<pid>/cmdline (src/store_url.rs:137, #4577).
+Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
+ExecStart=/usr/local/bin/ai-memory serve
 User=ai-memory
 Group=ai-memory
 ```

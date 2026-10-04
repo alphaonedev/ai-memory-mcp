@@ -3,6 +3,8 @@ layout: doc
 ---
 # v0.7.0 Review Synthesis — Fix Dispatch Backlog
 
+> **Point-in-time record, dated 2026-05-15.** The src/ file:line references in this document refer to the source tree as of that date and are not maintained, so they may not match the current code.
+
 > Synthesized from 6 parallel reviewers (security/correctness/perf/API-UX/docs/coverage)
 > Base commit: `0536e96` (feat/v0.7.0-grand-slam HEAD with CHANGELOG + ship-readiness fixes)
 > Reviewer baseline: `ef92bd7` / `64528b1` (pre-ship-readiness reconciled trunk)

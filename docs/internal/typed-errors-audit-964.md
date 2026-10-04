@@ -3,6 +3,8 @@ layout: doc
 ---
 # Typed-errors audit — issue #964
 
+> **Point-in-time record, dated 2026-05-21.** The src/ file:line references in this document refer to the source tree as of that date and are not maintained, so they may not match the current code.
+
 **Wave-2 Tier-B4 — Replace remaining `anyhow::Result<T>` on substrate-public API with typed errors**
 **Closure path: B (audit + closure-as-evidence; substrate-public API already typed post-#962)**
 **Base SHA:** `762e5ede20e6e278fe6ff39be078e233f9934d91`

@@ -132,8 +132,13 @@ rm -f "$OUT/../otherca.key" "$OUT/../otherca.crt" "$OUT/../pg.*.err" 2>/dev/null
 # --- Optional: real daemon serves a verify-full store-url (needs sal-postgres)
 STORE="postgres://$PGUSER:$PGPASS@localhost:$PGPORT/$PGDB?sslmode=verify-full&sslrootcert=$CA"
 DLOG="$(mktemp)"
-AI_MEMORY_NO_CONFIG=1 AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 \
-  "$BIN" serve --host 127.0.0.1 --port 19078 --store-url "$STORE" >"$DLOG" 2>&1 &
+# #4577: the DSN carries the db password; hand it over through a 0600 file
+# (AI_MEMORY_STORE_URL_FILE), not the serve argv. mktemp creates mode 0600 and
+# printf is a shell builtin, so the secret is never on a command line.
+STORE_FILE="$(mktemp)"
+printf '%s\n' "$STORE" >"$STORE_FILE"
+AI_MEMORY_STORE_URL_FILE="$STORE_FILE" AI_MEMORY_NO_CONFIG=1 AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 \
+  "$BIN" serve --host 127.0.0.1 --port 19078 >"$DLOG" 2>&1 &
 DPID=$!
 sleep 8
 if grep -qiE "sal-postgres|requires .*features" "$DLOG"; then
@@ -143,7 +148,7 @@ elif curl -s --max-time 5 "http://127.0.0.1:19078/api/v1/health" -o /dev/null; t
 else
   echo "INFO: daemon did not bind within window; log tail:"; tail -5 "$DLOG"
 fi
-kill "$DPID" 2>/dev/null; rm -f "$DLOG"
+kill "$DPID" 2>/dev/null; rm -f "$DLOG" "$STORE_FILE"
 
 echo "----"; echo "leg3 summary: $pass PASS / $fail FAIL"
 [ "$fail" -eq 0 ]

@@ -65,6 +65,8 @@ pub mod erasure_outbox;
 // clock skew, per-peer DLQ backlog) and its Prometheus series.
 pub mod freshness;
 pub mod identity;
+/// #4478 — the #4356 ancestor-owner bind gate on the federated namespace_meta apply.
+pub mod ns_meta_ancestor_gate;
 pub mod peer;
 pub mod peer_attestation;
 pub mod peer_posture;

@@ -191,7 +191,7 @@ Operator doc: [`docs/provenance.md`](provenance.html).
 - `AI_MEMORY_CONFIDENCE_SHADOW_SAMPLE_RATE` — shadow-mode sample rate (default 0.1).
 - `AI_MEMORY_CONFIDENCE_DECAY` — enable per-memory freshness decay.
 
-Schema migration `0033_v07_form5_confidence_calibration.sql`. Capability registry entry: `CapabilityConfidenceCalibration` at `src/config.rs:1331`.
+Schema migration `0033_v07_form5_confidence_calibration.sql`. Capability registry entry: [`CapabilityConfidenceCalibration`](../src/config.rs).
 
 Operator doc: [`docs/confidence-calibration.md`](confidence-calibration.html).
 

@@ -1044,6 +1044,8 @@ pub mod transcripts;
 pub mod transit_encryption;
 // v1.0.0 #3709 item 1 — zero-config TLS: local CA + server certificate
 // generated into the key directory on first boot, renewed automatically.
+/// #4356 — the ancestor-owner gate on the first bind of a namespace standard.
+pub mod ns_standard_ancestor;
 pub mod tls_bootstrap;
 pub mod trust;
 pub mod validate;

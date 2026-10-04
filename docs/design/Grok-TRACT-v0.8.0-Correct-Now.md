@@ -1,5 +1,7 @@
 # Grok 3×7 Assessment — What ai-memory v0.8.0 Has Correct Now
 
+> **Point-in-time record, as of 2026-06-28.** The src/ file:line references in this document describe the source tree at commit `2b04bd5c6ada` (read a file there with `git show 2b04bd5c6ada:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 **Assessment date:** 2026-06-28  
 **Method:** 21-lens adversarial audit (3 waves × 7 lenses) of `docs/design/TRACT-the-definitive-endpoint-ai-memory.md` against `release/v0.8.0` @ `14a34566`, cross-checked with [main `ROADMAP.md`](https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/refs/heads/main/ROADMAP.md) and **CodeGraph** structural probes (846 files, 27,062 nodes, 92,578 edges).  
 **Analyst:** Grok (xAI) — synthesis round 4 of the TRACT design lineage.

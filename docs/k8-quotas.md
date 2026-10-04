@@ -63,7 +63,9 @@ operator-tunable via `AI_MEMORY_MAX_MEMORIES_PER_DAY` /
 rewritten.
 
 Compiled defaults
-([`src/quotas.rs:75-84`](../src/quotas.rs)):
+([`DEFAULT_MAX_MEMORIES_PER_DAY`](../src/quotas.rs),
+[`DEFAULT_MAX_STORAGE_BYTES`](../src/quotas.rs),
+[`DEFAULT_MAX_LINKS_PER_DAY`](../src/quotas.rs)):
 
 | Const | Value | Counter |
 |---|---|---|
@@ -77,23 +79,23 @@ len(metadata)` per stored memory.
 
 ## Daily reset
 
-`reset_daily` ([`src/quotas.rs:749`](../src/quotas.rs)) runs every UTC
+[`reset_daily`](../src/quotas.rs) runs every UTC
 midnight from the K8 sweep loop wired into
 `daemon_runtime::bootstrap_serve`. It zeroes
 `current_memories_today` and `current_links_today` on every row whose
 `day_started_at` is no longer today, and bumps `day_started_at` to
 the new bucket. `current_storage_bytes` is never zeroed.
 
-Inline roll-over: `check_and_record`
-([`src/quotas.rs:472`](../src/quotas.rs)) also performs an inline
+Inline roll-over: [`check_and_record`](../src/quotas.rs)
+also performs an inline
 daily-bucket roll inside the `BEGIN IMMEDIATE` transaction so the
 per-write quota stays honest even if the sweeper hasn't fired yet.
 Pinned by [`tests/k8_daily_reset.rs`](../tests/k8_daily_reset.rs).
 
 ## Enforcement semantics
 
-Every `memory_store` / `memory_link` write calls `check_and_record`
-([`src/quotas.rs:472`](../src/quotas.rs)) inside a `BEGIN IMMEDIATE`
+Every `memory_store` / `memory_link` write calls [`check_and_record`](../src/quotas.rs)
+inside a `BEGIN IMMEDIATE`
 SQLite transaction. The transaction acquires a `RESERVED` lock on the
 database at the start, serializing every other would-be writer until
 COMMIT/ROLLBACK — this is the SQLite analogue of
@@ -101,7 +103,7 @@ COMMIT/ROLLBACK — this is the SQLite analogue of
 write could otherwise pass the check and then both increment the
 counter past the cap).
 
-The three refusal shapes ([`src/quotas.rs:159-178`](../src/quotas.rs)):
+The three refusal shapes ([`QuotaLimit`](../src/quotas.rs)):
 
 - `QuotaLimit::MemoriesPerDay` — the pending memory_store would push
   `current_memories_today + 1 > max_memories_per_day`.
@@ -111,8 +113,8 @@ The three refusal shapes ([`src/quotas.rs:159-178`](../src/quotas.rs)):
 - `QuotaLimit::LinksPerDay` — the pending link_create would push
   `current_links_today + 1 > max_links_per_day`.
 
-Refusals raise `QuotaError`
-([`src/quotas.rs:186`](../src/quotas.rs)) which the MCP / HTTP layers
+Refusals raise [`QuotaError`](../src/quotas.rs)
+(carried as `QuotaCheckError::Quota`) which the MCP / HTTP layers
 map to the `QUOTA_EXCEEDED` diagnostic. The error envelope carries
 `agent_id`, `limit` (lower-snake-case name), `current`, `max` — the
 caller can render "you have used X/Y for today, reset at UTC midnight"
@@ -120,7 +122,7 @@ without a second round-trip. Pinned by
 [`tests/k8_quota_enforcement.rs`](../tests/k8_quota_enforcement.rs).
 
 If a downstream write fails *after* `check_and_record` succeeds,
-`refund_op` ([`src/quotas.rs:631`](../src/quotas.rs)) reverses the
+[`refund_op`](../src/quotas.rs) reverses the
 increment. The two-phase pattern: `check_and_record(...)?;
 op(...)?;` and on op-failure, `refund_op(...)`.
 
