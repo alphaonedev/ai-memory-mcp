@@ -1192,6 +1192,81 @@ def node_streams_5171():
         probe("#5171 control is accepted: %s" % label, not node_stream_findings(snippet + "\n"), str(node_stream_findings(snippet + "\n")))
 
 
+SSH_CALL = re.compile(r"(?<![\w$/.-])(ssh|scp)(?![\w-])")
+
+
+def ssh_batch_findings(text):
+    """#5274: every ssh/scp call passes $SSH_BATCH as its first argument, so no override can drop it."""
+    bad = []
+    for n, line, _ in logical_lines(text):
+        code = strip_messages(line)
+        for m in SSH_CALL.finditer(code):
+            if not re.match(r"\s+\$SSH_BATCH\s", code[m.end():]):
+                bad.append("%d:%s" % (n, m.group(1)))
+    return bad
+
+
+def first_batchmode(args):
+    """The BatchMode value ssh/scp would use: the first one given on the command line (ssh_config(5))."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-o" and i + 1 < len(args):
+            v, i = args[i + 1], i + 2
+        elif a.startswith("-o") and len(a) > 2:
+            v, i = a[2:], i + 1
+        else:
+            i += 1
+            continue
+        k = re.split(r"[=\s]+", v.strip(), 1)
+        if k[0].lower() == "batchmode":
+            return k[1].strip().lower() if len(k) > 1 else ""
+    return None
+
+
+def ssh_batch_5274():
+    """#5274: a node cannot raise an interactive ssh prompt on the operator's terminal or hang the run."""
+    fs = FED.read_text()
+    bad = ssh_batch_findings(fs)
+    probe("#5274 every ssh and scp call in federate.sh passes $SSH_BATCH first", not bad, " ".join(bad[:12]))
+    lines = [(l, f) for _, l, f in logical_lines(fs) if SSH_CALL.search(strip_messages(l))]
+    probe("#5274 the ssh/scp check sees the 10 call sites (not vacuous)", len(lines) == 10, str(len(lines)))
+    assigns = "\n".join(l for l in fs.splitlines() if re.match(r"^SSH_\w+=", l))
+    pre = ('%s\nSSH_USER=root\nOUT_DIR=o\nFED_DIR=/f\nn=1\nhost=h\npub=p\nj=0\nFED_IDS=(a)\nPUBLIC_IPS=(h)\n'
+           'die() { echo "DIE $*"; }\n' % assigns)
+    env0 = {k: v for k, v in os.environ.items() if k not in ("SSH_OPTS", "SSH_BATCH")}
+    override = {"SSH_OPTS": "-o BatchMode=no -o StrictHostKeyChecking=yes", "SSH_BATCH": "-o BatchMode=no"}
+    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+        d = pathlib.Path(t)
+        stub_dir(d, "ssh")
+        stub_dir(d, "scp")
+        for label, extra in (("default SSH_OPTS", {}), ("SSH_OPTS and SSH_BATCH overridden with BatchMode=no", override)):
+            got = []
+            for line, _ in lines:
+                prog = SSH_CALL.search(strip_messages(line)).group(1)
+                call = line
+                if CHANNEL_DEFS.match(line):
+                    call = line + "\n%s </dev/null" % ("on_node h true" if line.startswith("on_node") else "node_sh 0")
+                for f in d.glob("*.argv"):
+                    f.unlink()
+                env = dict(env0, PATH=str(d) + os.pathsep + env0["PATH"], LOGDIR=str(d), **extra)
+                r = subprocess.run(["bash", "-c", pre + call], capture_output=True, text=True, env=env,
+                                   stdin=subprocess.DEVNULL)
+                argv = (d / (prog + ".argv")).read_text().splitlines() if (d / (prog + ".argv")).exists() else []
+                if first_batchmode(argv) != "yes" or "DIE" in r.stdout:
+                    got.append("%s:%r" % (prog, first_batchmode(argv)))
+            probe("#5274 every ssh/scp call runs with BatchMode=yes in force (%s)" % label, bool(lines) and not got,
+                  " ".join(got[:6]))
+    for label, snippet in (("an scp with SSH_OPTS only", 'scp $SSH_OPTS -q a "$h:/x" >/dev/null 2>&1'),
+                           ("an ssh with BatchMode=no ahead of SSH_BATCH", 'ssh -o BatchMode=no $SSH_BATCH h true'),
+                           ("an on_node definition without SSH_BATCH", 'on_node() { ssh $SSH_OPTS "${SSH_USER}@$1" "$2"; }')):
+        probe("#5274 negative control is flagged: %s" % label, bool(ssh_batch_findings(snippet + "\n")))
+    probe("#5274 control is accepted: an scp with SSH_BATCH first",
+          not ssh_batch_findings('scp $SSH_BATCH $SSH_OPTS -q a "$h:/x" >/dev/null 2>&1 || die "scp failed"\n'))
+    probe("#5274 the BatchMode parser takes the first value given", first_batchmode(["-oBatchMode yes", "-o", "BatchMode=no"]) == "yes"
+          and first_batchmode(["-o", "batchmode=No", "-o", "BatchMode=yes"]) == "no" and first_batchmode(["-q"]) is None)
+
+
 def version_block(fs):
     """The verify loop that reads the certified data-tier versions from each node, or empty."""
     a = fs.find("  # Certified data-tier pins, asserted from the provisioned hosts.\n")
@@ -1284,6 +1359,7 @@ def main():
     f2_id_lists_agree()
     pg_version_5172()
     node_streams_5171()
+    ssh_batch_5274()
     verify_cost_5247()
     verify_trace_5237()
     f3_static_pins()

@@ -64,6 +64,10 @@ SSH_USER="${SSH_USER:-root}"
 # SSH_OPTS='-o StrictHostKeyChecking=yes -o ConnectTimeout=15' with the host
 # key pinned.
 SSH_OPTS="${SSH_OPTS:--o StrictHostKeyChecking=accept-new -o ConnectTimeout=15}"
+# #5274: every ssh and scp call passes SSH_BATCH first. ssh uses the first value given for an
+# option, so no SSH_OPTS override can turn batch mode off: a node cannot put a password or
+# keyboard-interactive prompt on the operator terminal or hang the run waiting for input.
+SSH_BATCH="-o BatchMode=yes"
 FED_DIR=/etc/ai-memory/fed
 NS="${NS:-fed-cert}"
 WAIT_TRIES="${WAIT_TRIES:-180}"
@@ -97,7 +101,7 @@ read_nodes() {
   done
 }
 
-on_node() { ssh $SSH_OPTS "${SSH_USER}@$1" "$2"; }
+on_node() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@$1" "$2"; }
 
 # --- wire --------------------------------------------------------------------
 
@@ -143,18 +147,18 @@ wire() {
 
     on_node "$host" "install -d -m 0750 $FED_DIR $FED_DIR/peers" >/dev/null 2>&1 \
       || die "node $n: cannot create $FED_DIR (is the droplet up + reachable on 22?)"
-    scp $SSH_OPTS -q \
+    scp $SSH_BATCH $SSH_OPTS -q \
       "$OUT_DIR/ca.crt" \
       "${SSH_USER}@${host}:$FED_DIR/ca.crt" >/dev/null 2>&1 || die "node $n: scp ca.crt failed"
-    scp $SSH_OPTS -q "$OUT_DIR/hive-node-$n.crt" "${SSH_USER}@${host}:$FED_DIR/node.crt" >/dev/null 2>&1 \
+    scp $SSH_BATCH $SSH_OPTS -q "$OUT_DIR/hive-node-$n.crt" "${SSH_USER}@${host}:$FED_DIR/node.crt" >/dev/null 2>&1 \
       || die "node $n: scp node.crt failed"
-    scp $SSH_OPTS -q "$OUT_DIR/hive-node-$n.key" "${SSH_USER}@${host}:$FED_DIR/node.key" >/dev/null 2>&1 \
+    scp $SSH_BATCH $SSH_OPTS -q "$OUT_DIR/hive-node-$n.key" "${SSH_USER}@${host}:$FED_DIR/node.key" >/dev/null 2>&1 \
       || die "node $n: scp node.key failed"
-    scp $SSH_OPTS -q "$OUT_DIR/hive-node-$n.allowlist" "${SSH_USER}@${host}:$FED_DIR/peers.allowlist" >/dev/null 2>&1 \
+    scp $SSH_BATCH $SSH_OPTS -q "$OUT_DIR/hive-node-$n.allowlist" "${SSH_USER}@${host}:$FED_DIR/peers.allowlist" >/dev/null 2>&1 \
       || die "node $n: scp peers.allowlist failed"
-    scp $SSH_OPTS -q "$OUT_DIR/peers.conf.node$n" "${SSH_USER}@${host}:$FED_DIR/peers.conf" >/dev/null 2>&1 \
+    scp $SSH_BATCH $SSH_OPTS -q "$OUT_DIR/peers.conf.node$n" "${SSH_USER}@${host}:$FED_DIR/peers.conf" >/dev/null 2>&1 \
       || die "node $n: scp peers.conf failed"
-    scp $SSH_OPTS -q "$OUT_DIR/author.id" "$OUT_DIR/author.pub" "${SSH_USER}@${host}:$FED_DIR/" >/dev/null 2>&1 \
+    scp $SSH_BATCH $SSH_OPTS -q "$OUT_DIR/author.id" "$OUT_DIR/author.pub" "${SSH_USER}@${host}:$FED_DIR/" >/dev/null 2>&1 \
       || die "node $n: scp author material failed"
     on_node "$host" "chmod 0600 $FED_DIR/node.key" >/dev/null 2>&1 || die "node $n: chmod node.key failed"
   done
@@ -174,7 +178,7 @@ wire() {
       [ $((t % 6)) -eq 1 ] && echo "  node $n: waiting for $pub ... $t/$WAIT_TRIES"
       sleep "$WAIT_SLEEP"
     done
-    scp $SSH_OPTS -q "${SSH_USER}@${host}:$FED_DIR/$pub" "$OUT_DIR/$pub" >/dev/null 2>&1 \
+    scp $SSH_BATCH $SSH_OPTS -q "${SSH_USER}@${host}:$FED_DIR/$pub" "$OUT_DIR/$pub" >/dev/null 2>&1 \
       || die "node $n: could not fetch $pub"
     echo "  node $n: collected $pub"
   done
@@ -183,7 +187,7 @@ wire() {
     host="${PUBLIC_IPS[$i]}"
     for j in $(seq 0 $((NODE_COUNT - 1))); do
       [ "$j" -eq "$i" ] && continue
-      scp $SSH_OPTS -q "$OUT_DIR/${FED_IDS[$j]}.pub" "${SSH_USER}@${host}:$FED_DIR/peers/" >/dev/null 2>&1 \
+      scp $SSH_BATCH $SSH_OPTS -q "$OUT_DIR/${FED_IDS[$j]}.pub" "${SSH_USER}@${host}:$FED_DIR/peers/" >/dev/null 2>&1 \
         || die "node $n: could not install peer pubkey ${FED_IDS[$j]}"
     done
     echo "[federate] node $n cross-enrolled with $((NODE_COUNT - 1)) peer key(s)"
@@ -275,7 +279,7 @@ EOS
 # separate operator/bastion cert in `gen-certs.sh`'s HIVE_NODE_IPS mode.
 
 # node_sh <idx0> -- run the script on stdin as root on that node.
-node_sh() { ssh $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
+node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
 
 # Closed-world output (#4999, 5-agent vote 4d3ea1c5): no byte of a node reply reaches this terminal.
 # verify suspends xtrace on its first line (#5237), so no reply reaches an xtrace log either; outside
