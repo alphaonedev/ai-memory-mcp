@@ -66,6 +66,7 @@ No secret material is recorded here.
 GOD (god-zsg, the sole merger for this landing) RAN every leg on the landed
 tip after the ONE push of the four approved refs + the #3960 marker, WROTE
 the cert record and this file, and generated `MANIFEST.sha256` LAST. The
-reviewer (f2r) is asked to VERIFY every number in the record against these
-committed files (the author≠reviewer rule); until that verification is
-recorded in the cert record, the re-issue is author-attested only.
+reviewer f2r (ai:reviewer-f2r) VERIFIED every number in the record (27/27)
+against these committed files on 2026-09-26 (the author≠reviewer rule; two
+non-blocking notes, #3966 and the posture-header template date; verdict on
+#5041: https://github.com/alphaonedev/ai-memory-mcp/issues/5041#issuecomment-5980123423).

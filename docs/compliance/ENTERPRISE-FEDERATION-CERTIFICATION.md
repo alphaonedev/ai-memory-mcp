@@ -256,9 +256,10 @@ certification and triggers re-cert** (see §7).
 > as if they covered this SHA.
 >
 > Labour split, recorded: f2h (ai:rehearsal-f2h) RAN every leg, WROTE this
-> record and generated `MANIFEST.sha256` LAST; f2r is asked to VERIFY every
-> number against the committed evidence (author ≠ reviewer) — until that is
-> recorded here the re-issue is author-attested only.
+> record and generated `MANIFEST.sha256` LAST; f2r (ai:reviewer-f2r) VERIFIED
+> every number above against git and the committed evidence on 2026-10-02
+> (author ≠ reviewer; R1 text correction applied in 9f68ea41a, no number
+> changed; verdict on #5041).
 >
 > **Re-issue (2026-09-26, promotion 4 @ `eba96b307`).** The §7 re-cert trigger
 > FIRED: two watched federation-wire paths changed between `eae99be43` and
@@ -332,9 +333,9 @@ certification and triggers re-cert** (see §7).
 >
 > Labour split, recorded: GOD (god-zsg, sole merger for the 2026-09-26
 > landing) RAN every leg, WROTE this record and generated `MANIFEST.sha256`
-> LAST; f2r is asked to VERIFY every number against the committed evidence
-> (author ≠ reviewer) — until that is recorded here the re-issue is
-> author-attested only.
+> LAST; f2r (ai:reviewer-f2r) VERIFIED every number above (27/27) against the
+> committed evidence on 2026-09-26 (author ≠ reviewer; two non-blocking
+> notes, #3966 and the posture-header template date; verdict on #5041).
 >
 > **Re-issue (2026-09-23, promotion 3 @ `eae99be43`).** The §7 re-cert trigger
 > FIRED: two watched federation-wire paths changed between `92209ad91` and

@@ -101,7 +101,8 @@ run by the merger, recorded in the landing record, not in this bundle.
 ## Labour split (recorded, not stylistic)
 
 f2h (ai:rehearsal-f2h) RAN every leg on the re-assembled batch-6 tip, WROTE the cert record
-and this file, and generated `MANIFEST.sha256` LAST. The reviewer (f2r) is
-asked to VERIFY every number in the record against these committed files (the
-author≠reviewer rule); until that verification is recorded in the cert record,
-the re-issue is author-attested only.
+and this file, and generated `MANIFEST.sha256` LAST. The reviewer f2r
+(ai:reviewer-f2r) VERIFIED every number in the record against git and these
+committed files on 2026-10-02 (the author≠reviewer rule; R1 text correction
+applied in 9f68ea41a, no number changed; verdict on #5041:
+https://github.com/alphaonedev/ai-memory-mcp/issues/5041#issuecomment-5980123423).
