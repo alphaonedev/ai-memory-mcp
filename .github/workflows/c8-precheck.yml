@@ -1130,9 +1130,11 @@ jobs:
         #       It is content-harmless (every byte derives from two parents
         #       that are themselves scanned; 0 of 202 in-range merge parents
         #       fall outside the scanned set) and is recorded, not "fixed".
-        #   (5065-octopus) a web-flow merge with THREE parents is EVALUATED,
-        #       not exempted — the parent-count term is independent of
-        #       identity, so an octopus cannot smuggle a third root in.
+        #   (5065-octopus) a web-flow merge with THREE parents whose tree
+        #       EQUALS the clean automerge of its first two is EVALUATED, not
+        #       exempted. Terms (1) and (3) both hold on that fixture, so the
+        #       parent-count term alone refuses it: deleting the term, or
+        #       weakening `-ne 2` to `-lt 2`, turns this case red (#5271).
         #   (5065-local) a NON-web-flow unsigned two-parent merge is REJECTED
         #       naming `signature-not-verified` and no email violation. This
         #       is the red-first merge cell: it is impossible to satisfy while
@@ -1156,20 +1158,22 @@ jobs:
         #       exempted content-neutral web-flow)`, so an all-exempt range
         #       can never report PASS (#2444 shape).
         #   (5065-merge-author-email-pipe) a two-parent merge whose AUTHOR
-        #       email contains a literal `|` is REFUSED and counted as
-        #       EVALUATED. The walk parses its own
-        #       `%H|%ae|%ce|%G?|%GF|%T|%P` line with `IFS='|' read -r`, so
-        #       one pipe in `%ae` shifts every later field one position
-        #       right: measured on this fixture the committer-identity
-        #       field reads `noreply@github.com` although the commit's real
-        #       committer is not, which FORGES exemption term (1), and term
-        #       (2) still counts two whitespace-separated words. Term (3) is
-        #       the only term the shift cannot satisfy — the shifted parent
-        #       is `<tree>|<p1>`, not a rev, so `merge-tree` exits 1 with
-        #       empty stdout and the merge is evaluated. The parser shift
-        #       itself is tracked as #5138 and is NOT fixed here; this case
-        #       pins the predicate's fail-closed direction and stays
-        #       meaningful after that fix (it then refuses one term earlier).
+        #       email is `evil|noreply@github.com` and whose real committer
+        #       is enrolled is REFUSED, counted as EVALUATED, quoted whole as
+        #       an unbound author email, and raises NO committer violation:
+        #       no author-written text can reach exemption term (1).
+        #   (5138-nonmerge-*-email-shift) three UNSIGNED single-parent
+        #       commits whose email fields carry `|` and copy the pinned
+        #       fingerprint are REFUSED as `signature-not-verified (%G?=N)`.
+        #       The walk record is NUL-delimited (`log -z`, `%x00`), so no
+        #       email text can occupy the signature fields. Under the earlier
+        #       `|`-split record these PASSED at bdc0723ae (rc=0) and were
+        #       refused at df880a3f5 (rc=1).
+        #   (5272-walk-*) a walk that exits non-zero, ends short with rc 0,
+        #       tears its last record, or carries a value git never emits is
+        #       INOPERATIVE (exit 2) with a named reason; a two-commit control
+        #       range through the same seam PASSES. The walk's exit status is
+        #       checked and its record count must equal `rev-list --count`.
         #   (5065-probe-merge-tree-absent / -lies / -probe-git-binary-missing)
         #       the MANDATORY capability probe exits 2 (INOPERATIVE) when
         #       `merge-tree --write-tree` is missing (rc=129 + usage on bare
