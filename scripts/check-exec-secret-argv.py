@@ -564,7 +564,7 @@ CRED_TOOL_RE = re.compile(
     # (#4993), whose value expands a variable inside or after its quotes (#4891 round 3); a backslash
     # before a quote is the ssh, sh -c and CMD-SHELL payload shape (#5294)
     r"|(?:(?<![\w-])-[A-Za-z]*H|--(?:proxy-)?header)[\s=]*\\?[\"']?"
-    r"(?i:x-api-key|authorization|proxy-authorization|x-auth-token)\s*:"
+    r"(?i:(?:x-)?api-key|authorization|proxy-authorization|x-auth-token)\s*:"
     r"[^\"'$]*(?:[\"'](?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?)?\$")
 
 
@@ -1368,6 +1368,7 @@ ROUND3_RED = [
     ("ssh payload escaped quotes, Authorization", 'ssh h "curl -H \\"Authorization: Bearer $X\\" https://h/"'),
     ("ssh payload escaped quotes, combined flags", 'ssh h "curl -sH \\"X-API-Key: $X\\" https://h/"'),
     ("sh -c payload escaped quotes", 'sh -c "curl --header=\\"Authorization: token $X\\" h"'),
+    ("curl -H Api-Key without the x- prefix", 'curl -H "Api-Key: $X" h'),
     ("curl --proxy-header", 'curl --proxy-header "Proxy-Authorization: Basic $X" h'),
 ]
 ROUND3_GREEN = [
