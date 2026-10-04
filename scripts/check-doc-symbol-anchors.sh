@@ -404,6 +404,8 @@ MDEOF
     printf '<a href="https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs#L3">src/mcp/tools/recall.rs:3</a>\n' "$pin40" >> "$FIX/README.md"
     printf '[src/mcp/tools/recall.rs:2-5](https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs#L2-L5)\n' "$pin40" >> "$FIX/README.md"
     printf 'Raw URL path https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs:2 is not a label.\n' "$pin40" >> "$FIX/README.md"
+    # #5215: a second pinned HTML link on the same line keeps its own label.
+    printf '<a href="https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs#L1">src/mcp/tools/recall.rs:1</a> and <a href="https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs#L2">src/mcp/tools/recall.rs:2</a>\n' "$pin40" "$pin40" >> "$FIX/README.md"
     [[ "$(run_fixture)" = "0" ]] || {
         echo "FAIL: self-test #4651 — a commit-pinned permalink label was REJECTED" >&2
         run_fixture_out | sed 's/^/       /' >&2; exit 1; }
