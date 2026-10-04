@@ -8,7 +8,7 @@
 # validators on it. Per (template, context) the approved lines must be these entries in file order and
 # count: a repeated line needs a repeated entry. A malformed, non-normalised or unknown-scope entry, or
 # one also listed as pending, fails the gate. Regenerate: scripts/regen-cloud-init-token-allow.py <repo-root>
-# (a new line needs --accept-new; review the diff).
+# (an added, removed or moved line needs --accept-new; review the diff).
 both | top | package_update: true
 do-hive | top | package_upgrade: false
 both | top | bootcmd:

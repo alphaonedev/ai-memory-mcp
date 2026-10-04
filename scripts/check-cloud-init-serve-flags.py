@@ -875,6 +875,26 @@ def companion_hits(stmt: str, st: dict, depth: int = 0) -> list:
             st["pattern"] = True
         if base == "eval":
             out.append("eval")
+        if base == "ai-memory":
+            # #4837 R6: the subcommand must be a literal word the serve rule can read.
+            if any(posixpath.basename(unquote(w)[0]) == "xargs" for w in words[:idx]):
+                out.append("ai-memory under xargs (its subcommand comes from stdin)")
+            after_flag = False
+            for w in args:
+                wv, wexp = unquote(w)
+                if wexp or "$" in w or "`" in w:
+                    if not after_flag:
+                        out.append("ai-memory subcommand position holds an expansion %r" % w[:40])
+                        break
+                    after_flag = False
+                    continue
+                if wv.startswith("-"):
+                    after_flag = "=" not in wv
+                    continue
+                if after_flag:
+                    after_flag = False
+                    continue
+                break
         if base in ("source", ".") and args and re.match(r"^[\"']?[<$]\(", args[0]):
             out.append("source of a substitution")
         is_shell = base in SHELLS
@@ -1331,7 +1351,9 @@ def validate_line(ln: Line, homes: set, binaries: set) -> list:
         out.extend(dsn_problems(m.group(0), ln.ctx))
     if "allow_lax" in v1:
         out.append("lax store-url permission opt-out")
-    if ln.kind != "unit" and re.search(r"(?<![\w-])ai-memory[\"']?\s+(?:\S+\s+)*?serve(?![\w-])", v1):
+    serve_re = r"(?<![\w-])ai-memory[\"']?[\s,]+(?:[^\s,]+[\s,]+)*?[\"']?serve(?![\w-])"
+    # v2 drops quotes and backslashes, so a quote- or backslash-split serve is read as serve (#4837 R6).
+    if not (ln.kind == "unit" and re.match(r"[ \t]*ExecStart=", j)) and (re.search(serve_re, v1) or re.search(serve_re, v2)):
         out.append("ai-memory serve outside the unit ExecStart (serve flags are checked only on ExecStart)")
     if re.search(r"pgpassword|pgpassfile", v1):
         out.append("PGPASSWORD/PGPASSFILE")
@@ -1892,6 +1914,14 @@ def build_probes() -> list:
         ("quoted heredoc with base64 -d | sh, listed (#4793)", [(dec, "      cat > /usr/local/bin/pre <<'EOF'\n      echo Y3VybA== | base64 -d | sh\n      EOF\n" + dec)]),
         ("ai-memory serve in the provision script, listed (#4837)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory serve --bind 0.0.0.0:9077\n" + dec)]),
         ("sudo -u ai-memory --db serve in the provision script, listed (#4837)", [(dec, "      sudo -u aimemory /usr/local/lib/ai-memory/bin/ai-memory --db /x serve\n" + dec)]),
+        ("unit ExecStartPost runs serve, listed (#4837)", [(daemon_env, daemon_env + "      ExecStartPost=/usr/local/lib/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9078\n")]),
+        ("unit ExecStartPre runs serve, listed (#4837)", [(daemon_env, daemon_env + "      ExecStartPre=/usr/local/lib/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9078\n")]),
+        ("unit ExecReload runs serve, listed (#4837)", [(daemon_env, daemon_env + "      ExecReload=/usr/local/lib/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9078\n")]),
+        ("runcmd flow list runs serve, listed (#4837)", [(RUNCMD, RUNCMD + "  - [/usr/local/lib/ai-memory/bin/ai-memory, serve, --host, 0.0.0.0, --port, '9078']\n")]),
+        ("quote-split serve in the provision script, listed (#4837 R6)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory se''rve --host 0.0.0.0\n" + dec)]),
+        ("backslash-split serve in the provision script, listed (#4837 R6)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory s\\erve --host 0.0.0.0\n" + dec)]),
+        ("ai-memory subcommand in a variable, listed (#4837 R6)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db /x "$V" --host 0.0.0.0\n' + dec)]),
+        ("ai-memory under xargs, listed (#4837 R6)", [(dec, "      echo serve | xargs /usr/local/lib/ai-memory/bin/ai-memory\n" + dec)]),
         ("eval indented below the content block, listed (#4836)", [(dec, dec + '    eval "$PRE"\n')]),
         ("eval indented to the write_files key, listed (#4836)", [(dec, dec + '  eval "$PRE"\n')]),
         ("write_files encoding b64, listed", [(PROV, "  - path: /etc/x.sh\n    encoding: b64\n    content: |\n      Y3VybCBodHRwczovL3g=\n" + PROV)]),
@@ -2159,7 +2189,7 @@ def main(argv: list) -> int:
     if hits:
         print("\n".join(hits), file=sys.stderr)
         print("FAIL: %d cloud-init template defect(s)" % len(hits), file=sys.stderr)
-        print("  re-list approved lines in template order: scripts/regen-cloud-init-token-allow.py <repo-root>, then review its diff", file=sys.stderr)
+        print("  list the changed approved lines: scripts/regen-cloud-init-token-allow.py <repo-root>; after review, rerun it with --accept-new and review its diff", file=sys.stderr)
         return 1
     print("PASS: %d templates, %d allow entries, %d pending entries, %d triggered lines, %d serve flags known"
           % (stats["templates"], stats["allow"], stats["pending"], stats["triggered"], len(known)))

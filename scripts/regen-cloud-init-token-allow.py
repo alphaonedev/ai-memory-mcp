@@ -4,13 +4,15 @@
 Keeps the header comments, keeps every existing 'both' choice where the two
 templates agree on order, lists a repeated line once per occurrence, lists each
 Terraform directive region (context tf-region) after the triggered lines, and
-skips lines that the pending list covers. It only reorders by default: a line
-that is not already approved is listed and the file is left unchanged, unless
---accept-new is given, and then every added and removed line is printed so
-the approval is named in the run output as well as in the diff.
+skips lines that the pending list covers. By default it writes nothing that
+changes what is approved: any added, removed or reordered line in any
+(template, context) sequence is printed and the file is left unchanged, unless
+--accept-new is given, and then every change is printed so the approval is
+named in the run output as well as in the diff.
 Usage: regen-cloud-init-token-allow.py [--accept-new] <repo-root>
 """
 import argparse
+import difflib
 import importlib.util
 import sys
 from collections import Counter
@@ -21,7 +23,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root")
     ap.add_argument("--accept-new", action="store_true",
-                    help="write lines that are not in the current allowlist (each is printed)")
+                    help="write added, removed or reordered lines (each change is printed)")
     a = ap.parse_args()
     root = Path(a.root)
     spec = importlib.util.spec_from_file_location("g", str(root / "scripts/check-cloud-init-serve-flags.py"))
@@ -76,9 +78,26 @@ def main():
         print("REMOVED: %s | %s | %s" % k)
     for k in sorted(added.elements()):
         print("NEW: %s | %s | %s" % k)
-    if added and not a.accept_new:
-        print("refused: %d line(s) not in the allowlist; review them, then rerun with --accept-new"
-              % sum(added.values()), file=sys.stderr)
+
+    def seqs_of(entries):
+        s = {}
+        for sc, ctx, text in entries:
+            for t in (("aws-gpu-burst", "do-hive") if sc == "both" else (sc,)):
+                s.setdefault((t, ctx), []).append(text)
+        return s
+
+    old_seq = seqs_of((e[0], e[2], e[3]) for e in old)
+    new_seq = seqs_of(out)
+    changed = [k for k in sorted(set(old_seq) | set(new_seq)) if old_seq.get(k, []) != new_seq.get(k, [])]
+    for k in changed:
+        print("CHANGED: %s | %s" % k)
+        for d in difflib.unified_diff(old_seq.get(k, []), new_seq.get(k, []), lineterm="", n=0):
+            if d[:1] in "+-" and not d.startswith(("+++", "---")):
+                print("    " + d)
+    if changed and not a.accept_new:
+        print("refused: %d approved sequence(s) changed (%d line(s) added, %d removed); review them, "
+              "then rerun with --accept-new" % (len(changed), sum(added.values()), sum(removed.values())),
+              file=sys.stderr)
         return 1
     head = [x for x in allow.splitlines() if x.startswith("#")]
     head = head[:next((k for k, x in enumerate(allow.splitlines()) if x and not x.startswith("#")), len(head))]
