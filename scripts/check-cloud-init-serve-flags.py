@@ -2594,10 +2594,10 @@ def binary_vars(stmts: list) -> frozenset:
     # resolved names, to a fixpoint: every value is literal text and every expansion in it
     # is a positional parameter or a resolved name
     names = {a[0] for a in assigns}
-    refs, poisoned = nameref_facts([tf_render(stmt) for _w, stmt, _st in stmts])
+    # a nameref target built from an expansion is refused for the whole template in
+    # analyse, which is the one fail-closed path for it (#5330)
+    refs = nameref_facts([tf_render(stmt) for _w, stmt, _st in stmts])[0]
     unknown |= refs | split_names([tf_render(stmt) for _w, stmt, _st in stmts])[0]
-    if poisoned:
-        names = set()
     resolved = set()
     while True:
         n = len(resolved)
@@ -3072,6 +3072,9 @@ def build_probes() -> list:
         ('tar options from mapfile into a name built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; set -a; mapfile -t "$${N}IONS" < /dev/null; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
         ('tar options from getopts into a name built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; set -a; getopts x "$${N}IONS"; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
         ('nameref whose target is built from an expansion, alone, listed (#4837 R12 R4, #5326)', [(dec, '      T=X; declare -n R="$T"\n' + dec)]),
+        ('binary assigned as a one-element array, then run behind taskset, listed (#4837 R12 R4, #5330)', [(dec, "      A=(/usr/local/lib/ai-memory/bin/ai-memory); taskset -c 0 \"$A\" --db /x stats\n" + dec)]),
+        ('binary written through a nameref whose target is built from an expansion, the store-url data line made plain so that no other rule reddens the template, listed (#4837 R12 R4, #5330)', [(DSNFILE, "postgres-url"), (dec, "      T=A; A=/usr/bin/true; declare -n R=\"$T\"; R=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 \"$A\" --db /x stats\n" + dec)]),
+        ('binary written through a nameref whose target is assigned from an expansion, the store-url data line made plain so that no other rule reddens the template, listed (#4837 R12 R4, #5330)', [(DSNFILE, "postgres-url"), (dec, "      T=A; A=/usr/bin/true; declare -n R; R=$T; R=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 \"$A\" --db /x stats\n" + dec)]),
         ('tar abbreviated --transf option, listed (#4837 R12 R4, #5093)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --transf=s/x/aim/\n' + dec)]),
         ('tar shortest unambiguous --tr option, listed (#4837 R12 R4 pin, #5205)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --tr=s/x/aim/\n' + dec)]),
         ('tar s (rename pattern) in a short cluster, listed (#4837 R12 R4 pin, #5205)', [(dec, '      tar -xsf /root/b.tar -C /usr/local/bin\n' + dec)]),
@@ -3146,6 +3149,7 @@ def build_probes() -> list:
         ('data-home file run through an append-built path, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/run; F+=.conf; bash "$F"\n' + dec)]),
         ('data-home file run through an append-built path with a suffix, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/run; F+=.conf; bash "$F".x\n' + dec)]),
         ('data-home file copied through an append chain past the value cap, listed (#4837 R12 R5, #5329)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/r; F+=u; F+=n; F+=.; F+=c; F+=o; F+=n; F+=f; cp "$F" /usr/local/bin/\n' + dec)]),
+        ('data-home file copied through an append repeated by a loop, listed (#4837 R12 R5, #5330)', [(PROV, wf("/etc/ai-memory/aaa", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/a; for i in 1 2; do F+=a; done; cp "$F" /usr/local/bin/\n' + dec)]),
         ('data-home file copied through a split append value, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      F=/etc/ai-memory/r; F+=\"un.conf /x\"; cp $F /usr/local/bin/\n" + dec)]),
         ('data-home file copied through a field of an IFS split, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      IFS=:; F=x:/etc/ai-memory/r; F+=u*; cp $F /usr/local/bin/\n" + dec)]),
         ('data-home file copied through a nameref, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      F=/etc/ai-memory/r; F+=un.conf; declare -n R=F; cp \"$R\" /usr/local/bin/\n" + dec)]),
