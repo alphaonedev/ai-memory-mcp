@@ -634,8 +634,10 @@ def plain(s):
 
 
 def needle_forms(nd):
-    # The forms of a ledger needle that a folded view can contain.
-    return {nd, WS.sub(' ', nd)}
+    # The forms of a ledger needle that a folded view can contain: raw, whitespace
+    # folded (#5334), and marker folded (#5335).
+    ws = WS.sub(' ', nd)
+    return {nd, ws, MARKS.sub('', ws)}
 
 
 canon = os.environ['GATE_SCHEMA_CANON']
@@ -747,8 +749,8 @@ for path in files:
             # matched span, so a history phrase never shields a real claim
             # that shares its line (schema.html carries both on one line).
             # The engine matched `span` in a folded view, so the needle is also
-            # tried in that fold (#5334): a needle with a doubled space still sits
-            # inside the whitespace-folded span.
+            # tried in that fold (#5334, #5335): a needle with a doubled space or a
+            # marker still sits inside the folded span.
             hit_entry = [st for nd, st in entries.items()
                          if any(f in span for f in needle_forms(nd))]
             if hit_entry:
@@ -2750,6 +2752,12 @@ SCHEMAHTML
     # ledger is tab-separated.
     printf 'docs/postgres-age-guide.md\tsteps  v40 → v57\t#5334 ledgered doubled-space history\n' \
         >> scripts/qc-allowlists/schema-claim-history.txt
+    # The marker-folded markdown view (#5261) must keep the exemption too (#5335): a
+    # needle with a code span or bold markers sits inside the span only once folded.
+    printf 'docs/postgres-age-guide.md\tsteps `v40 -> v59`\t#5335 ledgered code-span history\n' \
+        >> scripts/qc-allowlists/schema-claim-history.txt
+    printf 'docs/postgres-age-guide.md\t| Schema version | **v58** |\t#5335 ledgered bold history\n' \
+        >> scripts/qc-allowlists/schema-claim-history.txt
     cat > "$tmpdir/docs/postgres-age-guide.md" <<'R4MD'
 The current `CURRENT_SCHEMA_VERSION` is
 52 on both backends.
@@ -2802,6 +2810,8 @@ a v0.8.x DB steps **v40 → v53** on boot.
 a v0.8.x DB steps `v40 -> v52` on boot.
 a v0.8.x DB steps `v40 -> v53` on boot.
 a v0.6 DB steps  v40 → v57 on boot.
+a v0.6 DB steps `v40 -> v59` on boot.
+| Schema version | **v58** |
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2977,7 +2987,8 @@ R4HTML
         'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' \
         'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 ' \
         'docs/postgres-age-guide.md:42 ' 'docs/postgres-age-guide.md:44 ' 'docs/postgres-age-guide.md:46 ' \
-        'docs/postgres-age-guide.md:48 ' 'docs/postgres-age-guide.md:50 ' 'docs/postgres-age-guide.md:51 '
+        'docs/postgres-age-guide.md:48 ' 'docs/postgres-age-guide.md:50 ' 'docs/postgres-age-guide.md:51 ' \
+        'docs/postgres-age-guide.md:52 ' 'docs/postgres-age-guide.md:53 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     grep -qF 'STALE entry' <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - a ledger entry reported STALE although its line is present" >&2; cd "$REPO_ROOT"; exit 1; }
