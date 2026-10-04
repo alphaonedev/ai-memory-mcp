@@ -473,12 +473,34 @@ impl MemoryStore for SqliteStore {
         //   adapter runs as a single atomic transaction with ROLLBACK on
         //   any mid-failure — `reflect` (src/storage/reflect.rs),
         //   `consolidate` + the bulk-insert / archive+insert paths
-        //   (src/storage/mod.rs) as `BEGIN IMMEDIATE … COMMIT`; the
-        //   embedding batch writers `set_embeddings_batch` and
-        //   `set_embeddings_batch_reembed` (src/storage/mod.rs) open a
-        //   DEFERRED rusqlite transaction (atomic, write lock taken at the
-        //   first write). A partial multi-row write can never commit, so
-        //   the property the bit names genuinely holds.
+        //   (src/storage/mod.rs) as `BEGIN IMMEDIATE … COMMIT`. That is the
+        //   rule for every sqlite write path (`WriteTxn::begin` or
+        //   `TransactionBehavior::Immediate`), with exactly these measured
+        //   exceptions in production code (sweep of src/ at this tree: 98
+        //   transaction-open sites, 39 test-only sites excluded):
+        //   * BEGIN EXCLUSIVE: `migrate` (src/storage/migrations.rs) and the
+        //     `lock_exclusive` probe (src/cli/backup.rs).
+        //   * DEFERRED (15 functions; atomic, but the write lock is taken at
+        //     the first write, so a read that precedes it can hit
+        //     SQLITE_BUSY_SNAPSHOT, class of #2250). Read-then-write, tracked
+        //     for conversion to BEGIN IMMEDIATE in #5084: `create_guarded`
+        //     (src/actions/mod.rs), `materialize_template_for_caller`
+        //     (src/routines/materialization.rs), `mine` (src/cli/io.rs),
+        //     `generate_in_scope` (src/persona/mod.rs),
+        //     `stamp_contaminated_descendants_as`, `set_embeddings_batch`
+        //     (both src/storage/mod.rs), `rekey_peer`
+        //     (src/storage/sync_state_rekey.rs) and `reclassify_memory_kind`
+        //     (src/store/sqlite.rs). Write-first, no read before the first
+        //     write (same tracker): `sweep_expired_leases_reclaim`
+        //     (src/actions/mod.rs), `resolve` (src/checkpoints/mod.rs),
+        //     `run_repair_schema_version` (src/cli/doctor.rs),
+        //     `sweep_pending_action_timeouts` (src/storage/doctor.rs) and
+        //     `set_embeddings_batch_reembed` (src/storage/mod.rs). Read-only
+        //     snapshots, no write at all: `with_read_snapshot`
+        //     (src/governance/policy_version.rs) and the preview arm of
+        //     `sqlite` (src/cli/keys.rs).
+        //   A partial multi-row write can never commit, so the property the
+        //   bit names genuinely holds.
         // * TRANSACTIONS ("adapter supports `begin_transaction` for
         //   multi-op atomicity") is WITHHELD: the SAL adapter exposes no
         //   caller-facing `begin_transaction()` handle (the trait default
