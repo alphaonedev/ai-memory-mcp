@@ -4,7 +4,7 @@
 //! #4603 — the curator must route on the SAME store-URL channel ladder that
 //! binds its store (`AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` >
 //! `--store-url`, `src/store_url.rs` `resolve_store_url`). The deploy units
-//! rendered by PR #4782 carry the URL only in the EnvironmentFile; before this
+//! rendered by PR #4782 carry the URL only in the `EnvironmentFile`; before this
 //! fix `curator_store_url` read argv only, so an env-only unit silently ran the
 //! conn-bound sqlite daemon against the local sidecar instead of the
 //! store-backed (SAL) sweep against the configured store.

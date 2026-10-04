@@ -6,7 +6,7 @@
 //! that `serve`, `schema-init` and `curator` use (`AI_MEMORY_STORE_URL_FILE` >
 //! `AI_MEMORY_STORE_URL` > `--store-url`, `src/store_url.rs`
 //! `resolve_store_url`). Before the fix both read `--store-url` from argv
-//! only, so a unit that carries a Postgres URL in its EnvironmentFile (the
+//! only, so a unit that carries a Postgres URL in its `EnvironmentFile` (the
 //! sanctioned non-argv channel, #4600 / #4603) silently operated the local
 //! sqlite file and exited 0: a quarantine release or a session recovery
 //! against a store the operator did not name.
@@ -110,7 +110,7 @@ fn quarantine_4915_lax_file_channel_fails_closed() {
 }
 
 /// `recover-previous-session` keeps its graceful sqlite fallback on a build
-/// without `sal` (the SessionStart hook must not wedge), so the routing proof
+/// without `sal` (the `SessionStart` hook must not wedge), so the routing proof
 /// runs on `sal` builds, where the store-backed arm exists.
 #[cfg(feature = "sal")]
 const RECOVER: &[&str] = &["recover-previous-session", "--dry-run", "--quiet"];
