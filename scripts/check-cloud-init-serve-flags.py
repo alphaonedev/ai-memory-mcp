@@ -107,8 +107,12 @@ SERVE_SRC = ROOT / "src" / "daemon_runtime.rs"
 TEMPLATE_GLOB = "infra/*/cloud-init-memory*.tpl"
 ALLOW_FILE = ROOT / "scripts" / "qc-allowlists" / "cloud-init-token-allow.txt"
 HBA_CAT = 'cat "$HBA"; } > "$HBA.new"'
-HBA_SHAPE = {'HBA="/etc/postgresql/18/main/pg_hba.conf"', 'if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then', HBA_CAT,
-             'chown --reference="$HBA" "$HBA.new"', 'chmod --reference="$HBA" "$HBA.new"', 'mv "$HBA.new" "$HBA"'}
+HBA_ORDER = ['HBA="/etc/postgresql/18/main/pg_hba.conf"', 'if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then', HBA_CAT,
+             'chown --reference="$HBA" "$HBA.new"', 'chmod --reference="$HBA" "$HBA.new"', 'mv "$HBA.new" "$HBA"', "fi"]
+HBA_SHAPE = set(HBA_ORDER[:-1])
+HBA_PIN = "the pinned pg_hba write (HBA_ORDER in scripts/check-cloud-init-serve-flags.py)"
+HBA_PRINTF_RE = re.compile(r"""^\{ printf (?:'%s\\n'|"%s\\n") """)
+HBA_OPENER_RE = re.compile(r"(?:\bthen|\bdo|\belse|\bin|\{|\(|&&|\|\||\|)$")
 PENDING_FILE = ROOT / "scripts" / "qc-allowlists" / "cloud-init-token-pending.txt"
 AWS_TEMPLATE = "infra/aws-gpu-burst/cloud-init-memory.yaml.tpl"
 DO_TEMPLATE = "infra/do-hive/cloud-init-memory.yaml.tpl"
@@ -1586,34 +1590,32 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
         hits.extend(phits)
         live = [x.joined for x in lines if not x.exempt]
         if any("pg_hba" in x for x in live):
-            # Presence of the string is not protection: the reject must be an argument of
-            # the printf whose output is written AHEAD of the packaged lines (first match
-            # wins), i.e. the live line right before `cat "$HBA"; } > "$HBA.new"`, and
-            # that file must replace $HBA.
-            def hba_prepends(needle):
-                for i in range(len(live) - 1):
-                    s = live[i].strip()
-                    if (re.match(r"^\{\s*printf '%s\\n' ", s) and needle in s
-                            and live[i + 1].strip() == 'cat "$HBA"; } > "$HBA.new"'):
-                        return any(x.strip() == 'mv "$HBA.new" "$HBA"' for x in live[i + 2:])
-                return False
-            if not hba_prepends('"hostnossl all all all reject"'):
-                hits.append("%s: writes pg_hba without \"hostnossl all all all reject\" in the printf prepended ahead of the packaged lines (#4676)" % nm)
-            if not hba_prepends('"hostnossl replication all all reject"'):
-                hits.append("%s: writes pg_hba without \"hostnossl replication all all reject\" in the printf prepended ahead of the packaged lines: `all` does not match the replication pseudo-database (#4676)" % nm)
             if not any(re.search(r"[\"']ssl = on[\"']", x) for x in live):
                 hits.append("%s: writes pg_hba without a live \"ssl = on\" line (#4704)" % nm)
-            # Position, not presence (#4784): both rejects sit in ONE printf written BEFORE the
-            # packaged file, and no other live line touches pg_hba (a stray write, a decoy
-            # line or a second file replacing $HBA is a hit).
-            lv = [x.joined.strip() for x in lines if not x.exempt]
-            head = [i for i, x in enumerate(lv) if x.startswith("{ printf ") and '"hostnossl all all all reject"' in x
-                    and '"hostnossl replication all all reject"' in x and i + 1 < len(lv) and lv[i + 1] == HBA_CAT]
-            if len(head) != 1:
-                hits.append("%s: the hostnossl rejects are not written ahead of the packaged pg_hba lines (#4676/#4784)" % nm)
+            # Position, not presence (#4676/#4784): the rejects protect only as arguments of
+            # ONE printf whose output is written AHEAD of the packaged lines (first match
+            # wins), in the pinned line order ending with a mv over $HBA, not opened inside a
+            # compound command, and with no other live line touching pg_hba. Comparisons are
+            # whitespace-normalised; every message names the pin it compares against.
+            lv = [norm(x.joined) for x in lines if not x.exempt]
+            heads = [i for i, x in enumerate(lv) if HBA_PRINTF_RE.match(x) and i + 1 < len(lv) and lv[i + 1] == HBA_CAT]
+            if len(heads) != 1:
+                hits.append("%s: %d printf line(s) are followed by `%s`; exactly one must write the hostnossl rejects ahead of the packaged pg_hba lines (%s) (#4676/#4784)" % (nm, len(heads), HBA_CAT, HBA_PIN))
+            else:
+                h = heads[0]
+                for needle, why in (('"hostnossl all all all reject"', ""),
+                                    ('"hostnossl replication all all reject"', ": `all` does not match the replication pseudo-database")):
+                    if needle not in lv[h]:
+                        hits.append("%s: the printf written ahead of the packaged pg_hba lines lacks %s%s (#4676)" % (nm, needle, why))
+                got = lv[max(h - 2, 0):h] + lv[h + 1:h + 6]
+                if got != HBA_ORDER:
+                    hits.append("%s: the pg_hba write differs from %s line for line: expected %s around the printf, found %s (#4784)" % (nm, HBA_PIN, " | ".join(HBA_ORDER), " | ".join(x[:60] for x in got)))
+                prev = lv[h - 3] if h >= 3 else ""
+                if HBA_OPENER_RE.search(prev):
+                    hits.append("%s: the pg_hba write is inside the compound command opened by `%s` (#4784)" % (nm, prev[:60]))
             for x in lv:
-                if ("$HBA" in x or "pg_hba.conf" in x) and x not in HBA_SHAPE and not (head and x == lv[head[0]]):
-                    hits.append("%s: pg_hba touched outside the pinned write: %s (#4784)" % (nm, x[:80]))
+                if ("$HBA" in x or "pg_hba.conf" in x) and x not in HBA_SHAPE and not (len(heads) == 1 and x == lv[heads[0]]):
+                    hits.append("%s: pg_hba touched outside %s: %s (#4784)" % (nm, HBA_PIN, x[:80]))
         if not trig:
             faults.append("%s: zero triggered lines (fail closed)" % nm)
         ntrig += len(trig)
@@ -2014,6 +2016,21 @@ def build_probes() -> list:
     for hl, hm in HMUTS:
         dred("D-4784 " + hl, hm, autolist=True)
         red("S-4784 " + hl + " (aws)", hm)
+    HSET = '      HBA="/etc/postgresql/18/main/pg_hba.conf"\n'
+    HMVFI = '        mv "$HBA.new" "$HBA"\n      fi\n'
+    HMUTS2 = (("mv over $HBA dropped (rejects never reach the live file)", [('        mv "$HBA.new" "$HBA"\n', "")]),
+              ("whole pg_hba write inside if false", [(HSET, "      if false; then\n" + HSET), (HMVFI, HMVFI + "      fi\n")]),
+              ("whole pg_hba write behind false &&", [(HSET, "      false && {\n" + HSET), (HMVFI, HMVFI + "      }\n")]),
+              ("rejects written by one echo (one pg_hba line, no reject)", [(HHEAD, HHEAD.replace("{ printf '%s\\n'", "{ echo"))]),
+              ("packaged sample copied over $HBA after the write", [(HMVFI, HMVFI + '      cp /usr/share/postgresql/18/pg_hba.conf.sample "$HBA"\n')]))
+    for hl, hm in HMUTS2:
+        dred("D-4784 " + hl, hm, autolist=True)
+        red("S-4784 " + hl + " (aws)", hm)
+    HGOOD = (("printf format double-quoted", [(HHEAD, HHEAD.replace("'%s\\n'", '"%s\\n"'))]),
+             ("extra blanks in the cat and mv lines", [(HCAT2, '          cat  "$HBA";   } >  "$HBA.new"\n'), ('        mv "$HBA.new" "$HBA"\n', '        mv   "$HBA.new"  "$HBA"\n')]))
+    for hl, hm in HGOOD:
+        green("S-4784 correct edit: " + hl + " (aws)", hm, autolist=True)
+        P.append(("D-4784 correct edit: " + hl, "green", dict(do=hm, autolist=True)))
     dred("D-4676 replication reject line deleted", [(DREPL, "")], autolist=True)
     dred("D-4676 replication reject turned into an accept", [(DREPL, '            "hostnossl replication all all scram-sha-256" \\\n')], autolist=True)
     dred("D-4676 replication reject narrowed to one role", [(DREPL, '            "hostnossl replication postgres all reject" \\\n')], autolist=True)
