@@ -30,7 +30,8 @@ is consumed single-use to defeat replay within that window.
 ## Stream contract
 
 ```bash
-curl -N -H "X-API-Key: $API_KEY" \
+printf 'header = "X-API-Key: %s"\n' "$API_KEY" |
+  curl -N --config - \
      -H "X-Agent-Id: ai:dashboard@host" \
      https://127.0.0.1:9077/api/v1/approvals/stream
 ```
@@ -176,8 +177,8 @@ SIG=$(printf '%s' "$CANONICAL" | openssl dgst -sha256 -hmac "$KEY_HEX" -hex | aw
 Step 4. Send the request:
 
 ```bash
-curl -X POST \
-  -H "X-API-Key: $API_KEY" \
+printf 'header = "X-API-Key: %s"\n' "$API_KEY" |
+  curl -X POST --config - \
   -H "X-AI-Memory-Timestamp: $TS" \
   -H "X-AI-Memory-Signature: sha256=$SIG" \
   -H "Content-Type: application/json" \
