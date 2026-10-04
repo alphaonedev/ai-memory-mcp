@@ -245,7 +245,7 @@ The closing summary of a real green run on this machine
    PASS node-a: author pubkey bound AND read back from the _agents registry row (#2941 guard, attempt 1)
    PASS node-b: author pubkey bound AND read back from the _agents registry row (#2941 guard, attempt 1)
    PASS node-a seeded with 300 rows in namespace 'lab-corpus', all unexpired (from the committed SYNTHETIC fixture lab-corpus.json; file declares 300)
-   PASS caveat demonstrated: full asi-hard cold boot on a fresh DB exited 75 naming the rollback check (issue #2942) — evidence in run/evidence/caveat-asi-hard-coldboot.txt
+   PASS caveat probe ran: #2942 no longer reproduces on this build (exit 124 after listening) — evidence in run/evidence/caveat-asi-hard-coldboot.txt
    PASS both nodes answer /api/v1/health over mutual TLS with a PINNED client cert
    PASS node-a loaded its private config (tier=keyword) — no embedder, no network
    PASS N1 unpinned client cert refused at node-b's TLS layer (same CA, absent from the allowlist)
@@ -285,7 +285,9 @@ off-table head anchor as refuse-to-open, and that anchor is emitted only by the
 witness watermark cadence over the `signed_events` chain — which is empty on a
 brand-new database. Fresh DB → no anchor → **exit 75**. This is tracked as
 [**issue #2942**](https://github.com/alphaonedev/ai-memory-mcp/issues/2942)
-(open as of 2026-08-15), filed from the v1.0.0 federation-config assessment.
+(filed 2026-08-15, since **closed**: fixed by PR #3096, so on a current build the fresh cold
+boot succeeds and the step-5 probe reports that the caveat no longer reproduces; the omission is
+kept until the lab is re-run at the full profile, issue #4938).
 
 Because the profile knob's contract is *pin and refuse*, there is no such thing
 as "asi-hard with rollback-check off": setting the profile **and** lowering one
@@ -306,8 +308,9 @@ The kit does not ask you to take any of this on faith:
 - **Step 0** re-derives the pinned set from the Rust SSOT and fails on drift.
 - **Step 5** cold-boots a throwaway node under the *full* asi-hard profile (every `src/security_profile.rs::KNOBS` entry) and
   records the real exit code, so the caveat is demonstrated rather than
-  asserted. If that boot ever succeeds — i.e. #2942 is fixed on your build —
-  the kit says so loudly and tells you this README is now stale.
+  asserted. On a build where #2942 is fixed the node listens and
+  is stopped by the probe timeout (exit 124); the kit says so loudly, and a timeout kill is
+  never counted as a refusal (issue #4938).
 - **Step 7 N4** proves the no-disable contract is real by trying to loosen a
   pin under the profile and asserting the refusal.
 
@@ -407,8 +410,8 @@ goes red if any of it stops being true:
   the peer returns it from `recall`.
 - The `asi-hard` no-disable contract refuses a boot with a loosened pin.
 - Every pinned knob but one boots cleanly together on a fresh node.
-- The one left out does not (issue #2942) — demonstrated, with its exit code
-  captured.
+- The one left out (issue #2942, since fixed) is probed on every run; the exit code is
+  captured and a timeout kill of a healthy node is not counted as a refusal (issue #4938).
 
 **Plausible** — consistent with what the kit shows, but *not* measured here:
 
