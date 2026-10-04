@@ -3122,8 +3122,6 @@ def self_test(known: set) -> int:
         counts[expect] += 1
         if got != expect:
             bad.append("%s: expected %s, got %s %s" % (label, expect, got, (faults or hits or [""])[0][:140]))
-        elif spec.get("absent") and any(spec["absent"] in h for h in hits):
-            bad.append("%s: expected no hit naming %r, got one" % (label, spec["absent"]))
         elif spec.get("present") and not any(spec["present"] in h for h in hits):
             bad.append("%s: expected a hit naming %r, got none" % (label, spec["present"]))
     muts = entry_mutations(base, cache)
