@@ -1335,7 +1335,11 @@ def ext_pin_5275():
              ("vector=0.8.6 on the server_version line", "vector=0.8.6\nage=1.8.0\nvector=0.8.5\n", True, False),
              ("vector=0.8.6 on the server_version line and no vector row", "vector=0.8.6\nage=1.8.0\n", True, False),
              ("the vector line twice", "18.6\nage=1.8.0\nvector=0.8.6\nvector=0.8.6\n", True, False),
-             ("a trailing byte after the version", "18.6\nage=1.8.0 \nvector=0.8.6\r\n", False, False))
+             ("a trailing byte after the version", "18.6\nage=1.8.0 \nvector=0.8.6\r\n", False, False),
+             # #5357: command substitution strips trailing newlines, so a repeated empty label must still count.
+             ("the age label repeated empty and last", "18.6\nage=1.8.0\nage=\nvector=0.8.6\n", False, True),
+             ("the vector label repeated empty and last", "18.6\nage=1.8.0\nvector=0.8.6\nvector=", True, False),
+             ("both labels repeated empty and last", "18.6\nage=1.8.0\nage=\nvector=0.8.6\nvector=\n\n", False, False))
     with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
         d = pathlib.Path(t)
         for label, reply, want_age, want_vec in cases:

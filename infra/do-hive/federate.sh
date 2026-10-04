@@ -387,12 +387,17 @@ EOS
     # A sed pipeline, not ${versions%%...}: bash suffix removal is quadratic in the reply length (#5247).
     pg_ver="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '1{s/ .*//;p;q;}')"
     # #5275: each extension version comes only from its own labelled line after server_version and must
-    # equal the pin exactly; an absent or repeated label leaves a value that is not the pin, so it fails.
+    # equal the pin exactly, and the label must appear exactly once (counted below): an absent or repeated
+    # label fails.
     age_ver="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '2,$s/^age=//p')"
     vec_ver="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '2,$s/^vector=//p')"
+    # $(...) strips trailing newlines, so a repeated EMPTY label that comes last would leave the value
+    # above unchanged (#5357): count the labelled lines too (the count is digits only) and require one each.
+    age_n="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '2,$p' | LC_ALL=C grep -c '^age=')"
+    vec_n="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '2,$p' | LC_ALL=C grep -c '^vector=')"
     [ "$pg_ver" = 18.6 ] && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 (got $(reply_version "$pg_ver" "$versions"))"
-    [ "$age_ver" = 1.8.0 ] && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 (got $(reply_version "$age_ver" "$versions"))"
-    [ "$vec_ver" = 0.8.6 ] && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 (got $(reply_version "$vec_ver" "$versions"))"
+    [ "$age_ver" = 1.8.0 ] && [ "$age_n" = 1 ] && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 (got $(reply_version "$age_ver" "$versions"))"
+    [ "$vec_ver" = 0.8.6 ] && [ "$vec_n" = 1 ] && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 (got $(reply_version "$vec_ver" "$versions"))"
   done
 
   # These two assertions intentionally originate on f2/public internet.
