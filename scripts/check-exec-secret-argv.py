@@ -1044,8 +1044,9 @@ def probe_files() -> List[Tuple[str, str, str]]:
     P2 = "ProbeValue1"
     raw_rows = [
         ("4911 prose --store-url with a userinfo password", "d.md",
-         "```bash\nzorbctl serve --store-url postgres://u:$P@h/d\n```\n".replace("$P", P2)),
-        ("4911 prose --store-url with a variable value", "d.md", "```bash\nzorbctl serve --store-url $URL\n```\n"),
+         "```bash\nzorbctl serve --store-" "url postgres://u:$P@h/d\n```\n".replace("$P", P2)),
+        ("4911 prose --store-url with a variable value", "d.md",
+         "```bash\nzorbctl serve --store-" "url $URL\n```\n"),
         ("4903 comment ending in backslash hides the next line", "p.sh",
          '#!/bin/bash\n# note \\\ncurl -H "Authorization: Bearer $TOKEN" https://h\n'),
         ("4926 continuation splits a flag name", "p.sh", "#!/bin/bash\nzorbctl --to\\\nken=$P h\n".replace("$P", P2)),
