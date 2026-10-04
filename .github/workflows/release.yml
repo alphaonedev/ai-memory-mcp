@@ -45,9 +45,12 @@ on:
         type: boolean
         default: true
 
+# #4719 - `packages: write` (GHCR push) is granted to the `docker` job only;
+# jobs without their own `permissions:` (supply-chain, crates-io) get
+# `contents: write` and nothing else. scripts/check_release_features.py pins
+# this block and every job's `permissions:`.
 permissions:
   contents: write
-  packages: write
 
 concurrency:
   # One release at a time, per tag.
@@ -149,8 +152,7 @@ jobs:
           # Refetch the tag ref itself so the verified object is the remote's
           # current one, not a local leftover.
           git fetch --no-tags --force origin "refs/tags/$TAG:refs/tags/$TAG"
-          bash scripts/release/verify-tag.sh --repo . --tag "$TAG" \
-            --signers scripts/qc-allowlists/release-tag-signers.txt
+          bash scripts/release/verify-tag.sh --repo . --tag "$TAG" --signers scripts/qc-allowlists/release-tag-signers.txt
 
       - name: Refuse a tag that is not on the dispatch branch
         shell: bash
@@ -206,9 +208,7 @@ jobs:
           SHA: ${{ needs.preflight.outputs.sha }}
         run: |
           set -euo pipefail
-          python3 scripts/release/qualify-sha.py --fetch --repo "$REPO" --sha "$SHA" \
-            --contexts scripts/qc-allowlists/required-contexts-release.txt \
-            --carriers-from scripts/check-required-contexts.sh
+          python3 scripts/release/qualify-sha.py --fetch --repo "$REPO" --sha "$SHA" --contexts scripts/qc-allowlists/required-contexts-release.txt --carriers-from scripts/check-required-contexts.sh
 
   # --------------------------------------------------------------------
   # #2895 (§3C release-pipeline supply-chain) — run the SAME supply-chain
@@ -275,8 +275,7 @@ jobs:
     # is the GitHub-native application of that SAME OIDC → Sigstore/Rekor
     # mechanism to raw binary artifacts (which have no package-registry
     # trusted publisher). `contents: write` is retained for the GitHub
-    # Release upload; the top-level `packages: write` is dropped for this
-    # job because it publishes no package.
+    # Release upload; no `packages: write` (only the docker job has it).
     permissions:
       contents: write
       id-token: write
@@ -494,8 +493,7 @@ jobs:
           TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
           SHA: ${{ needs.preflight.outputs.sha }}
         run: |
-          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
-            --tag-object "$TAG_OBJECT" --sha "$SHA"
+          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" --tag-object "$TAG_OBJECT" --sha "$SHA"
 
       - name: Create GitHub Release
         if: github.event.inputs.dry_run == 'false'
@@ -605,8 +603,7 @@ jobs:
           TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
           SHA: ${{ needs.preflight.outputs.sha }}
         run: |
-          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
-            --tag-object "$TAG_OBJECT" --sha "$SHA"
+          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" --tag-object "$TAG_OBJECT" --sha "$SHA"
 
       - name: Upload to GitHub Release
         if: github.event.inputs.dry_run == 'false'
@@ -690,13 +687,7 @@ jobs:
           set -euo pipefail
           for TARGET in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
             echo "::group::cargo build --target $TARGET"
-            cargo build \
-              --locked \
-              --release \
-              --target "$TARGET" \
-              --no-default-features \
-              --features sqlite-bundled \
-              --lib
+            cargo build --locked --release --target "$TARGET" --no-default-features --features sqlite-bundled --lib
             echo "::endgroup::"
             test -f "target/$TARGET/release/libai_memory.a" || {
               echo "::error::libai_memory.a not produced for $TARGET"
@@ -732,14 +723,8 @@ jobs:
           # -library args ("equivalent library definitions"). lipo them into
           # one fat simulator lib first, then pass device + fat-sim.
           mkdir -p target/ios-sim-universal/release
-          lipo -create \
-            target/aarch64-apple-ios-sim/release/libai_memory.a \
-            target/x86_64-apple-ios/release/libai_memory.a \
-            -output target/ios-sim-universal/release/libai_memory.a
-          xcodebuild -create-xcframework \
-            -library target/aarch64-apple-ios/release/libai_memory.a -headers dist/headers \
-            -library target/ios-sim-universal/release/libai_memory.a -headers dist/headers \
-            -output dist/AiMemory.xcframework
+          lipo -create target/aarch64-apple-ios-sim/release/libai_memory.a target/x86_64-apple-ios/release/libai_memory.a -output target/ios-sim-universal/release/libai_memory.a
+          xcodebuild -create-xcframework -library target/aarch64-apple-ios/release/libai_memory.a -headers dist/headers -library target/ios-sim-universal/release/libai_memory.a -headers dist/headers -output dist/AiMemory.xcframework
           ls -la dist/AiMemory.xcframework/
 
       - name: Tar + sha256 the xcframework
@@ -767,8 +752,7 @@ jobs:
           TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
           SHA: ${{ needs.preflight.outputs.sha }}
         run: |
-          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
-            --tag-object "$TAG_OBJECT" --sha "$SHA"
+          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" --tag-object "$TAG_OBJECT" --sha "$SHA"
 
       - name: Upload to GitHub Release
         if: github.event.inputs.dry_run == 'false'
@@ -884,13 +868,7 @@ jobs:
           for TARGET in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android; do
             ABI="${ABI_OF[$TARGET]}"
             echo "::group::cargo build --target $TARGET ($ABI)"
-            cargo build \
-              --locked \
-              --release \
-              --target "$TARGET" \
-              --no-default-features \
-              --features sqlite-bundled \
-              --lib
+            cargo build --locked --release --target "$TARGET" --no-default-features --features sqlite-bundled --lib
             echo "::endgroup::"
             mkdir -p "dist/aar/jniLibs/$ABI"
             cp "target/$TARGET/release/libai_memory.so" "dist/aar/jniLibs/$ABI/"
@@ -946,8 +924,7 @@ jobs:
           TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
           SHA: ${{ needs.preflight.outputs.sha }}
         run: |
-          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
-            --tag-object "$TAG_OBJECT" --sha "$SHA"
+          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" --tag-object "$TAG_OBJECT" --sha "$SHA"
 
       - name: Upload to GitHub Release
         if: github.event.inputs.dry_run == 'false'
@@ -1088,9 +1065,7 @@ jobs:
             # match proves only that both were uploaded together. Also require
             # the build provenance the release job attached (#2487): it binds
             # the asset to release.yml in this repository at this run's commit.
-            gh attestation verify "$ASSET" --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+            gh attestation verify "$ASSET" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
 
             SAFE=$(echo "$TARGET" | tr '-' '_')
             echo "sha_${SAFE}=${ACTUAL}" >> "$GITHUB_OUTPUT"
@@ -1345,9 +1320,7 @@ jobs:
             # #3546 — require the release job's build provenance too (see the
             # homebrew job): a matching .sha256 from the same place as the
             # asset proves nothing about who built it.
-            gh attestation verify ~/rpmbuild/SOURCES/"$ASSET" --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+            gh attestation verify ~/rpmbuild/SOURCES/"$ASSET" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
             # The .sha256 is not a spec Source, so keep SOURCES/ clean.
             rm -f ~/rpmbuild/SOURCES/"${ASSET}.sha256"
           done
@@ -1364,13 +1337,9 @@ jobs:
           echo "RPM Version: $RPM_VERSION"
           echo "RPM Release: $RPM_RELEASE"
 
-          sed -e "s/^Version:.*/Version:        ${RPM_VERSION}/" \
-              -e "s/^Release:.*/Release:        ${RPM_RELEASE}/" \
-              ai-memory.spec > ~/rpmbuild/SPECS/ai-memory.spec
+          sed -e "s/^Version:.*/Version:        ${RPM_VERSION}/" -e "s/^Release:.*/Release:        ${RPM_RELEASE}/" ai-memory.spec > ~/rpmbuild/SPECS/ai-memory.spec
 
-          rpmbuild -bs ~/rpmbuild/SPECS/ai-memory.spec \
-            --define "_sourcedir $HOME/rpmbuild/SOURCES" \
-            --define "_srcrpmdir $HOME/rpmbuild/SRPMS"
+          rpmbuild -bs ~/rpmbuild/SPECS/ai-memory.spec --define "_sourcedir $HOME/rpmbuild/SOURCES" --define "_srcrpmdir $HOME/rpmbuild/SRPMS"
 
           ls -la ~/rpmbuild/SRPMS/
 
