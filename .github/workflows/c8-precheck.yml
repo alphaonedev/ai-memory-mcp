@@ -1043,7 +1043,7 @@ jobs:
       - name: Self-test the gate (#2486 regression evidence)
         # --self-test constructs a throwaway repo with TWO ephemeral SSH
         # keypairs and TWO ephemeral OpenPGP keys (no network, no dependency
-        # on the real enrolled keys) and asserts FIFTEEN shapes, printing
+        # on the real enrolled keys) and asserts FORTY-FOUR shapes, printing
         # each case's observed and expected exit code so the evidence is
         # readable straight out of this job's log:
         #
@@ -1097,6 +1097,106 @@ jobs:
         #       exit 2 (inoperative — a CI-wiring fault), never 0 and never 1.
         #       Sibling precedent: check-cert-expiry.sh case (k).
         #
+        #
+        #   --- #5065 merge-evaluation cases, per 5-agent vote (4d3ea1c5) ---
+        #   The scan no longer passes `--no-merges`. A merge is EXEMPT only
+        #   when all three terms hold: committer is the web-flow identity
+        #   `noreply@github.com`, AND `%P` is exactly two parents, AND the
+        #   recorded tree equals `git merge-tree --write-tree p1 p2`. Every
+        #   other merge is evaluated under the normal rule. The identity term
+        #   alone is NOT sufficient: `GIT_COMMITTER_NAME`/`EMAIL` are plain
+        #   environment variables, so `git commit-tree <any-tree> -p p1 -p p2`
+        #   mints a two-parent merge with the web-flow identity pointing at a
+        #   tree containing content that is in NEITHER parent and in no
+        #   scanned commit. The tree term is the only term an attacker with no
+        #   key cannot set, and it is what substitutes for the GitHub key pin
+        #   that was refused 5-0 (pinning `B5690EEEBB952194` would make a
+        #   third-party key a standing trust root this repo cannot revoke, and
+        #   the key id is forgeable without the keyring import anyway).
+        #   (7a) a two-parent web-flow-identity merge that is UNSIGNED
+        #       (`%G? = N`) with a tree that is NOT the clean automerge is
+        #       REJECTED naming `signature-not-verified`.
+        #   (7b) the same shape carrying a signature that does NOT verify
+        #       (`%G? = E`, populated `%GK`) is REJECTED the same way. This is
+        #       the REALISTIC shape — the real web-flow cohort reads `E` — so
+        #       (7a) alone would be left green by any future `%G? != N` filter
+        #       while the hole stayed open. Both ship; neither may be deleted.
+        #   (7c) LOAD-BEARING POSITIVE, NEVER DELETE. A two-parent web-flow
+        #       merge whose tree EQUALS the automerge stays EXEMPT and is
+        #       counted as exempted. This pins the measured zero-false-refusal
+        #       property (382/382 web-flow merges in reachable history
+        #       reproduce their tree) and records the NAMED RESIDUAL: a forged
+        #       noreply merge whose tree equals the automerge is still exempt.
+        #       It is content-harmless (every byte derives from two parents
+        #       that are themselves scanned; 0 of 202 in-range merge parents
+        #       fall outside the scanned set) and is recorded, not "fixed".
+        #   (5065-octopus) a web-flow merge with THREE parents whose tree
+        #       EQUALS the clean automerge of its first two is EVALUATED, not
+        #       exempted. Terms (1) and (3) both hold on that fixture, so the
+        #       parent-count term alone refuses it: deleting the term, or
+        #       weakening `-ne 2` to `-lt 2`, turns this case red (#5271).
+        #   (5065-local) a NON-web-flow unsigned two-parent merge is REJECTED
+        #       naming `signature-not-verified` and no email violation. This
+        #       is the red-first merge cell: it is impossible to satisfy while
+        #       merges are dropped before evaluation.
+        #   (5065-unpinned-key) a merge whose OpenPGP signature FULLY VERIFIES
+        #       (`%G? = G`) from a key in the same keyring that is NOT pinned
+        #       is REJECTED as `signing-key-not-pinned` — case (i) extended
+        #       across the merge boundary, which `--no-merges` had voided.
+        #   (5065-conflict) an enrolled, SSH-signed, CONFLICT-RESOLVING merge
+        #       whose tree necessarily differs from the automerge PASSES, and
+        #       the case asserts it was counted as EVALUATED. This is the
+        #       false-refusal guard for the operator's own merges (10 such
+        #       merges measured in `4fff967ce..6e3f6066b`, all `%G? = G`, all
+        #       `merge-tree` rc=1 true conflicts) and it also proves a PASS
+        #       cannot be manufactured by an exemption.
+        #   (5065-floor) a range whose only commits are EXEMPTED web-flow
+        #       merges fails CLOSED with exit 2. The #5047 floor at case (j)
+        #       counted NON-MERGE commits, which said nothing about merges
+        #       once merges are evaluated; it now counts EVALUATED commits and
+        #       prints `SCANNED: N commits (M merges evaluated, X merges
+        #       exempted content-neutral web-flow)`, so an all-exempt range
+        #       can never report PASS (#2444 shape).
+        #   (5065-merge-author-email-pipe) a two-parent merge whose AUTHOR
+        #       email is `evil|noreply@github.com` and whose real committer
+        #       is enrolled is REFUSED, counted as EVALUATED, quoted whole as
+        #       an unbound author email, and raises NO committer violation:
+        #       no author-written text can reach exemption term (1).
+        #   (5138-nonmerge-*-email-shift) three UNSIGNED single-parent
+        #       commits whose email fields carry `|` and copy the pinned
+        #       fingerprint are REFUSED as `signature-not-verified (%G?=N)`.
+        #       The walk record is NUL-delimited (`log -z`, `%x00`), so no
+        #       email text can occupy the signature fields. Under the earlier
+        #       `|`-split record these PASSED at bdc0723ae (rc=0) and were
+        #       refused at df880a3f5 (rc=1).
+        #   (5272-walk-*) a walk that exits non-zero, ends short with rc 0,
+        #       tears its last record, carries a value git never emits, ends
+        #       inside an unterminated field, or whose producer dies before
+        #       recording git's exit status is INOPERATIVE (exit 2) with a
+        #       named reason; a two-commit control range through the same seam
+        #       PASSES. The walk's exit status is checked and its record count
+        #       must equal `rev-list --count`.
+        #   (5065-probe-merge-tree-absent / -lies / -probe-git-binary-missing)
+        #       the MANDATORY capability probe exits 2 (INOPERATIVE) when
+        #       `merge-tree --write-tree` is missing (rc=129 + usage on bare
+        #       `ubuntu-latest`, where git is not version-pinned), when it
+        #       returns a well-formed and resolvable but WRONG tree oid, and
+        #       when the git binary cannot be executed at all. The probe
+        #       asserts rc=0, exactly one 40-hex line, that the oid resolves
+        #       as a tree, AND that the tree carries BOTH sides' content. One
+        #       cell reaches each assertion (`-lies` the content check;
+        #       `5277-two-lines`, `-non-hex`, `-ghost-oid` the shape checks)
+        #       and greps that assertion's refusal text, after a pass-through
+        #       call proves the shim executes (#5277).
+        #   (5276-merge-only-range-*) a range whose only commit is one
+        #       evaluated local merge is JUDGED (0 signed, 1 unsigned), never
+        #       INOPERATIVE: the floor counts evaluated commits.
+        #   (5278-webflow-conflict-merge-*) an unsigned web-flow merge of
+        #       CONFLICTING parents that records the conflicted tree is
+        #       EVALUATED and refused, through real git and through a
+        #       merge-tree that prints only the conflicted oid at rc=1.
+        #       There is no `|| true` and no `2>/dev/null` on that call: the
+        #       gate must never degrade to cannot-compute-therefore-exempt.
         # `gpg(1)` is required: if it is unavailable the self-test fails
         # CLOSED (exit 2) rather than silently skipping the OpenPGP half.
         run: bash scripts/check-commit-signing-posture.sh --self-test
