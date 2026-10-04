@@ -149,7 +149,8 @@ FLAG_RE = re.compile(r"(?<![\w$./\-])--?([A-Za-z][A-Za-z0-9_\-]*)")
 HEADER_RE = re.compile(
     r"\bauthorization\s*:|\bbearer\b|\bx-auth[\w-]*\s*:|\bproxy-authorization|\bapi[-_]?key\b|"
     r"\bpassword\s+['\"$\\]|\bidentified\s+by\b|\$\{\{\s*(?:secrets\.|github\.token|toJSON\(\s*secrets)|"
-    r"(?:-H|--header)[\s=]*[\"']?[\w-]*(?:token|secret|passw\w*|credential|cookie|api[-_]?key)[\w-]*\s*:|"
+    r"(?:(?<![\w-])-[A-Za-z]*H|--(?:proxy-)?header)[\s=]*[\"']?[\w-]*(?:token|secret|passw\w*|credential|cookie|"
+    r"api[-_]?key)[\w-]*\s*:|"
     r"\bcookie\s*:", re.I)
 # A command substitution that reads a secret file or runs a secret-printing command puts the
 # value on argv whatever the flag or variable is called (#4924).
@@ -544,10 +545,28 @@ CRED_TOOL_RE = re.compile(
     r"\b(?:mysql|mariadb|mysqladmin|mysqldump)\b[^|;&]*\s-p[\"']?\$"
     r"|\bsshpass\s+-p\s*[\"']?\$"
     r"|\bredis-cli\b[^|;&]*\s(?:-a|--pass)\s*[\"']?\$"
-    r"|\b(?:curl|wget)\b[^|;&]*\s(?:-u|--user|--password|--http-password)[\s=]*[\"']?[^\s\"']*\$"
+    # one shell word after the flag that expands a variable, however its user part is quoted:
+    # u:$X, "u:$X", u:"$X", 'u':"$X", "u":"$X" (#5101). A short flag may close a group of
+    # combined short flags (-su, -fsSU) (#4993); a long flag is matched whole (not --user-agent).
+    # wget has no short credential flag (its -U is the user agent).
+    r"|\b(?:curl\b[^|;&]*\s-[A-Za-z]*[uU]|(?:curl|wget)\b[^|;&]*\s(?:--(?:proxy-|http-|ftp-)?"
+    r"(?:user|password|pass)|--oauth2-bearer)(?![\w-]))[\s=]*"
+    r"(?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?\$"
+    # curl -E/--cert <file>:<password>: a variable after the colon is the key password; a
+    # variable that names the file alone is not (#4891 round 3)
+    r"|\bcurl\b[^|;&]*\s(?:-[A-Za-z]*E|--(?:proxy-)?cert(?![\w-]))[\s=]*"
+    r"(?:[^\s\"':]|\"[^\":]*\"|'[^':]*')*(?:[\"'][^\"':]*)?:"
+    r"(?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:[\"'][^\"'$]*)?\$"
+    # wget -e/--execute runs a wgetrc command; its password settings take the secret (#4891 round 3)
+    r"|\bwget\b[^|;&]*\s(?:-[A-Za-z]*e|--execute(?![\w-]))[\s=]*[\"']?(?:http_|ftp_|proxy_)?passw(?:or)?d"
+    r"\s*=[^\"'$\s]*(?:[\"'](?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?)?\$"
     # --password-stdin is the safe form and is not matched (#4994)
     r"|\b(?:docker|podman)\s+login\b[^|;&]*\s(?:-p|--password)(?![\w-])"
-    r"|(?:-H|--header)\s*[\"']?(?:x-api-key|authorization|x-auth-token)\s*:[^\"']*\$")
+    # a credential header in any letter case (#4997), after a combined short flag or --header=
+    # (#4993), whose value expands a variable inside or after its quotes (#4891 round 3)
+    r"|(?:(?<![\w-])-[A-Za-z]*H|--(?:proxy-)?header)[\s=]*[\"']?"
+    r"(?i:x-api-key|authorization|proxy-authorization|x-auth-token)\s*:"
+    r"[^\"'$]*(?:[\"'](?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?)?\$")
 
 
 def scan_exec_file(dl, rel: str, text: str) -> Optional[List[Found]]:
@@ -1276,13 +1295,26 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
     # #4920: credential flags fed from a variable are denylist-tagged, so never allow-able
     for label, line in (("mysql -p", 'mysql -u r -p"$X" db'), ("sshpass -p", 'sshpass -p "$X" ssh h'),
                         ("redis-cli -a", 'redis-cli -a "$X" ping'), ("curl -u", 'curl -u "u:$X" h'),
-                        ("curl -u neutral", 'curl -u u:$X h')):
+                        ("curl -u neutral", 'curl -u u:$X h'), ("curl -u quoted value", 'curl -u u:"$X" h'),
+                        ("curl --user quoted parts", "curl --user 'u':\"$X\" h"),
+                        ("curl -su combined", 'curl -su "u:$X" h'),
+                        ("curl -sH x-api-key combined", 'curl -sH "x-api-key: $X" h'),
+                        ("docker login --password", 'docker login -u u --password "$X" reg'),
+                        ("curl -H x-auth-token", 'curl -H "x-auth-token: $X" h'),
+                        ("curl -H Authorization mixed case", 'curl -H "Authorization: Bearer $X" h'),
+                        ("wget --header=", 'wget --header="x-api-key: $X" h')):
         n += 1
         res = scan_exec_file(dl, "c.sh", "#!/bin/bash\n%s\n" % line) or []
         if not any("denylist" in r[2] for r in res):
             bad.append("%s fed from a variable is not tagged denylist (#4920)" % label)
         elif not check_allow_vs_denylist({"c.sh": res}, [("reason: r", "c.sh", 1, norm(line), 1)]):
             bad.append("%s fed from a variable could be allowed (#4920)" % label)
+    # combined short flags carry a header the same as -H does (#4904, #4993)
+    for label, line in (("curl -sH X-Secret-Key", 'curl -sH "X-Secret-Key: $X" h'),
+                        ("curl -fsSH PRIVATE-TOKEN", "curl -fsSH 'PRIVATE-TOKEN: '\"$X\" h")):
+        n += 1
+        if not scan_exec_file(dl, "c.sh", "#!/bin/bash\n%s\n" % line):
+            bad.append("%s is not triggered (#4904)" % label)
     # the stdin form is the safe form: never denylist-tagged (#4994)
     n += 1
     sl = 'docker login -u u --password-stdin reg < "$TOKEN_FILE"'
