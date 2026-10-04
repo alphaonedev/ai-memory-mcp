@@ -36,6 +36,15 @@ written reason. No list of bad or negating words decides anything.
                mode word.
             Long lines (over 4096 characters) are read in overlapping segments
                plus a product-and-mode-word test over the whole line.
+            R9 unreadable characters (closed world, #4667 R6): a line whose
+               shadow view still holds a character outside DECLARED (printable
+               ASCII and a short typographic set) next to an ASCII letter, and
+               that names a pool, mode or product word, is a unit of its own;
+               a line with U+FFFD (an invalid byte in the file) is one whatever
+               its words. Such a character can hide a word from every pattern,
+               so the line is red unless an allowlist entry, written by regen
+               with a reason, names it. Approved shapes hold DECLARED
+               characters only.
             R8 key (closed world): a pooler-prefixed key ending in `mode`
                (pgb_mode, PGBOUNCER_MODE, supavisor-mode, a Terraform variable
                "pgb_mode") whatever its value: a variable, a default on another
@@ -238,7 +247,29 @@ CONFUSABLE = {ord(k): v for k, v in {
     "\u043d": "h", "\u0432": "b", "\u043a": "k", "\u0261": "g", "\u03bf": "o", "\u03c1": "p", "\u03c4": "t",
     "\u03bd": "v", "\u03b1": "a", "\u03b5": "e", "\u03b9": "i", "\u03ba": "k", "\u03c5": "u", "\u03c7": "x",
     "\u0131": "i", "\u017f": "s",
+    # R5: dashes NFKD keeps (transaction\u2011mode reads as transaction-mode)
+    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2212": "-", "\ufe58": "-", "\ufe63": "-",
 }.items()}
+# R5: letters that render as nothing (Hangul fillers, braille blank) are dropped like format characters.
+_INVISIBLE = dict.fromkeys(map(ord, "\u115f\u1160\u3164\uffa0\u2800\u17b4\u17b5"), None)
+# R5: a word of mostly ASCII letters with one or two other characters (a look-alike outside CONFUSABLE, or U+FFFD
+# where an invalid byte was) is read as the key word it spells when those characters are dropped or wildcarded.
+_KEY_WORDS = ("transaction", "transactions", "transactional", "statement", "statements", "pgbouncer", "pooling",
+              "pooler", "pool", "mode", "session", "sessions", "odyssey", "supavisor", "pgcat", "multiplexing")
+_TOKEN = re.compile(r"(?:[^\W_]|\ufffd)+")
+
+
+def _fold_word(match: "re.Match[str]") -> str:
+    word = match.group(0)
+    other = sum(1 for c in word if not c.isascii())
+    if not other or other > 2 or len(word) - other < 3:
+        return word
+    dropped = "".join(c for c in word if c.isascii())
+    wild = re.compile("".join(re.escape(c) if c.isascii() else "." for c in word))
+    for key in _KEY_WORDS:
+        if dropped == key or wild.fullmatch(key):
+            return key
+    return word
 # U2/S1 (#4667 R4): separators that hide a word boundary from \b: underscore, quotes, brackets.
 _SEPARATORS = re.compile(r"[\"'{}\[\](),]|_(?=mode)|(?<=pgbouncer)_")
 
@@ -250,8 +281,43 @@ def shadow(text: str) -> str:
     """Mention-detection view of a normalised line: NFKD, format and combining marks dropped,
     look-alikes folded, `pg bouncer` spellings joined. The unit text (allowlist key) is unchanged."""
     t = unicodedata.normalize("NFKD", text)
-    t = "".join(c for c in t if unicodedata.category(c) not in ("Cf", "Mn")).translate(CONFUSABLE).casefold()
+    t = "".join(c for c in t if unicodedata.category(c) not in ("Cf", "Mn")).translate(CONFUSABLE).translate(_INVISIBLE).casefold()
+    t = _TOKEN.sub(_fold_word, t)
     return re.sub(r"\bpg[\s_-]+bouncer", "pgbouncer", t)
+
+
+# R9 (#4667 round 6, closed world): the characters a reader can trust to show what they are. Printable ASCII and a
+# short typographic set (curly quotes, dashes, ellipsis, arrows, section sign, middle dot, inequality and
+# multiplication signs, box-drawing lines); everything else that touches an ASCII letter after the shadow fold may
+# hide a word, and U+FFFD marks an invalid byte the decoder replaced.
+DECLARED = frozenset(map(chr, range(0x20, 0x7F))) | frozenset(
+    "\u2018\u2019\u201c\u201d\u2013\u2014\u2026\u2190\u2192\u2194\u21d2\u00a7\u00b7\u00d7\u2264\u2265\u2500\u2502")
+_ANSI_CSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")  # colour codes in recorded terminal logs render as nothing
+
+
+def _ascii_letter(c: str) -> bool:
+    return c.isascii() and c.isalpha()
+
+
+def hidden_chars(text: str) -> str:
+    """The characters of a normalised line that may hide a word (R9), sorted, or "" when there are none."""
+    if text.isascii() and text.isprintable():
+        return ""
+    found = {"\ufffd"} if "\ufffd" in text else set()
+    view = shadow(_ANSI_CSI.sub("", text))
+    for i, c in enumerate(view):
+        if c in DECLARED or c.isspace():
+            continue
+        if (i and _ascii_letter(view[i - 1])) or (i + 1 < len(view) and _ascii_letter(view[i + 1])):
+            found.add(c)
+    return "".join(sorted(found))
+
+
+def unreadable(text: str) -> bool:
+    """R9: a line that may hide a pooler claim: U+FFFD anywhere, or a hiding character on a line that names a
+    pool, mode or product word."""
+    hidden = hidden_chars(text)
+    return bool(hidden) and ("\ufffd" in hidden or bool(_QUICK.search(shadow(text))))
 
 
 def _mentions_one(text: str) -> bool:
@@ -285,6 +351,8 @@ def mentions(text: str) -> bool:
 
 def approved(text: str) -> bool:
     """The whole line has one of the approved shapes (A1, A2). Nothing else is approved."""
+    if not all(c in DECLARED for c in text):
+        return False  # R9: an approved line holds DECLARED characters only
     return any(shape.match(text) for _, shape in APPROVED_SHAPES)
 
 
@@ -380,8 +448,10 @@ def scan_lines(rel: str, lines: List[str], base: int = 0, core: Optional[Tuple[i
                     pair(i, j)  # R6: prose next to an approved line
                 elif OTHER_MODE.search(lines[j]):
                     pair(i, j)  # R5: a mode word in the same paragraph
-        elif text and i + 1 < len(lines) and lines[i + 1] and not is_mention[i + 1]:
-            if mentions(text + " " + lines[i + 1]):
+        elif text:
+            if unreadable(text):
+                raw.append((base + i + 1, text, (i,)))  # R9: a character that may hide a word
+            if i + 1 < len(lines) and lines[i + 1] and not is_mention[i + 1] and mentions(text + " " + lines[i + 1]):
                 pair(i, i + 1)  # R4: wrapped across a line break
     return [(rel, number, text, context(lines, idx)) for number, text, idx in raw]
 
@@ -614,6 +684,11 @@ def judge(units: Sequence[Unit], entries: Sequence[Entry]) -> Tuple[List[str], L
         if budget[(rel, text, ctx)] > 0:
             budget[(rel, text, ctx)] -= 1
             continue
+        hidden = hidden_chars(text)
+        if hidden:
+            findings.append("%s:%d: unreadable-characters (%s) may hide a word; reword in plain text or allowlist with a "
+                            "reason (ctx:%s): %s" % (rel, number, " ".join("U+%04X" % ord(c) for c in hidden), ctx, text[:160]))
+            continue
         findings.append("%s:%d: mentions a pooler mode without an approved session-mode shape (ctx:%s): %s" % (rel, number, ctx, text[:160]))
     stale = ["%s: stale allowlist entry (x%d unused; text or neighbourhood changed): %s | %s | ctx:%s" % (ALLOW_REL, n, r, t[:120], c)
              for (r, t, c), n in budget.items() if n > 0]
@@ -680,6 +755,16 @@ UNREAD_REASON = "# reviewed: a compressed archive of generated output that holds
 
 # Red probes: every wording the PR 4710 reviews planted, rounds 1 to 3.
 PLANTED: List[Tuple[str, str, str]] = [
+    # R5 reviewer (#4667): look-alikes outside CONFUSABLE, invisible letters, dashes NFKD keeps
+    ("shadow: Armenian oh", "docs/a.md", "Run PgBouncer with transacti\u0585n pooling.\n"),
+    ("shadow: Latin alpha", "docs/a.md", "Run PgBouncer in tr\u0251nsaction mode.\n"),
+    ("shadow: Greek lunate sigma", "docs/a.md", "Run PgBouncer in transa\u03f2tion mode.\n"),
+    ("shadow: Hangul filler inside the word", "docs/a.md", "Run PgBouncer in trans\u3164action mode.\n"),
+    ("shadow: non-breaking hyphen", "docs/a.md", "For fan-in use transaction\u2011mode.\n"),
+    # R9 (#4667 round 6, closed world): characters the fold does not know are red, not read past
+    ("R9: three look-alikes the fold does not know", "docs/a.md", "Run PgBouncer in tr\u0251ns\u0251cti\u0254n mode.\n"),
+    ("R9: a control character inside a word", "docs/a.md", "Run PgBouncer in tra\x01nsaction mode.\n"),
+    ("R9: a symbol joined to the words of a pooler line", "docs/a.md", "Set the pooler to tr\u2016ansaction.\n"),
     ("lowercase ini line", "docs/a.md", "pool_mode = transaction\n"),
     ("uppercase POOL_MODE", "docs/a.md", "POOL_MODE = transaction\n"),
     ("yaml pool_mode:", "deploy/pgb.yaml", "pool_mode: transaction\n"),
@@ -809,6 +894,10 @@ GREEN: List[Tuple[str, str, str]] = [
      "Run scripts/check-pgbouncer-pool-mode-claims.py; see scripts/qc-allowlists/pgbouncer-pool-mode-allow.txt.\n"),
     ("R3 a bare tool file name is not a mention", "docs/a.md", "regen-pgbouncer-pool-mode-allow.py rewrites the file.\n"),
     ("sqlx pool and a SQL transaction are not a pooler", "src/a.rs", "let mut tx = pool.begin().await?;\n"),
+    ("R9 declared typographic characters on a pool line", "docs/a.md", "The pool has \u2265 2 servers \u2014 see \u00a75.6 \u2192 notes.\n"),
+    ("R9 an accented letter folds to ASCII", "docs/a.md", "The caf\u00e9 pool opens at nine.\n"),
+    ("R9 a hiding character on a line with no pool word", "docs/a.md", "Latency is 50 \u03bcs per call.\n"),
+    ("R9 colour codes in a recorded log", "docs/run.log", "\x1b[33mWARN\x1b[0m pool size 5\n"),
 ]
 
 
@@ -942,6 +1031,14 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
         ("a BOM-less UTF-16LE file is decoded and judged", tree({"docs/u.txt": "Run PgBouncer in transaction mode.\n".encode("utf-16-le")}), EXIT_FINDING),
         ("a BOM-less UTF-16BE file is decoded and judged", tree({"docs/u.txt": "Run PgBouncer in transaction mode.\n".encode("utf-16-be")}), EXIT_FINDING),
         ("a UTF-32 file is decoded and judged", tree({"docs/u.txt": "Run PgBouncer in transaction mode.\n".encode("utf-32")}), EXIT_FINDING),
+        # R9 (#4667 round 6): closed world over characters
+        ("R9: an invalid UTF-8 byte inside the mode word is red", tree({"docs/a.md": b"Run PgBouncer in tr\xffansaction mode.\n"}), EXIT_FINDING),
+        ("R9: an invalid UTF-8 byte is red on a line with no pool word", tree({"docs/a.md": b"Our tr\xffansaction notes.\n"}), EXIT_FINDING),
+        ("R9: an approved shape with a digit outside DECLARED is not approved",
+         tree({"docs/a.md": "pool_mode = session ; see \u0665.\u0666\n"}), EXIT_FINDING),
+        ("R9: a hiding line passes once allowlisted with a reason",
+         tree({"docs/a.md": "Run PgBouncer in tr\u0251ns\u0251cti\u0254n mode.\n"},
+              REASON + ent("docs/a.md", "Run PgBouncer in tr\u0251ns\u0251cti\u0254n mode.\n", "run pgbouncer in tr\u0251ns\u0251cti\u0254n mode.")), EXIT_OK),
         # fail closed
         ("fail closed: guide with no approved pool_mode line", tree(guide="No pooler section here.\n"), EXIT_FAULT),
         ("fail closed: guide with only session prose", tree(guide="Use pool_mode = session in production.\n"), EXIT_FAULT),
@@ -1087,6 +1184,12 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("round-4 S2 skip .ini", SKIP, SKIP[:-1] + " or rel.endswith('.ini'):"),
     ("round-4 S9 skip deploy/", SKIP, SKIP[:-1] + " or rel.startswith('deploy/'):"),
     ("guide pin", "    if not guide_ok:\n", "    if False:\n"),
+    ("R9 unreadable lines are units", "                raw.append((base + i + 1, text, (i,)))  # R9", "                pass  # R9"),
+    ("R9 U+FFFD always counts", '    found = {"\\ufffd"} if "\\ufffd" in text else set()', "    found = set()"),
+    ("R9 approved shapes hold DECLARED characters", "    if not all(c in DECLARED for c in text):\n        return False", "    if False:\n        return False"),
+    ("R9 needs a pool word", "or bool(_QUICK.search(shadow(text))))", "or True)"),
+    ("R9 colour codes dropped", '    view = shadow(_ANSI_CSI.sub("", text))', "    view = shadow(text)"),
+    ("R9 a character touching a letter", "        if (i and _ascii_letter(view[i - 1])) or (i + 1 < len(view) and _ascii_letter(view[i + 1])):", "        if False:"),
 ]
 
 

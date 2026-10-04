@@ -586,3 +586,63 @@ docs/enterprise-deployment.md | > with that line present. in session mode each c
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
 # This PR's own changelog fragment for the guide caveat: it records why the pooler stays in session mode with DISCARD ALL until #4679 lands and recommends no other mode.
 changelog.d/5076.docs.md | #5076 — the prepared-statement caveat in docs/enterprise-deployment.md section 5.6.6 now names every failure mode. sqlx names its statements sqlx_s_ from a counter that restarts on every client connection, so clients that share one server connection without prepared-statement tracking can hit "does not exist" or "already exists" errors, or run a same-named statement another client prepared. the caveat records this as a further reason the pooler stays in session mode (with server_reset_query = discard all) until #4679 lands. | ctx:e3b0c44298fc
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Microsecond timing figure: the Greek mu is the SI micro prefix on a latency number, and the line names no pooler mode to configure (R9 closed world, round 6).
+CHANGELOG.md | - zero hot-path impact. initialize fires once per mcp session, not on the recall hot path. the ed25519 sign over ~150 bytes of canonical identity costs ~10-50μs on modern hardware — the 50ms recall p95 budget is untouched. | ctx:13fa537c7186
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Status emoji (check mark, cross, warning sign, coloured circle) in a feature or milestone table mark progress next to ASCII words; no pooler mode is named or set (R9 closed world, round 6).
+docs/design/TRACT-v0.8.0-CORRECT-NOW-CANONICAL-opus.md | | 1 | one claim object, kinds-not-classes | 🟡 split ✅l3 / 🟡l1 | one memory struct, memory_kind over 13 kinds — l3-correct (src/models/memory.rs:51); l1-incorrect: uuid not blake3-cid, 27-field hash preimage (:756), owner outside grammar | | ctx:e776ce5b95da
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Microsecond timing figure: the Greek mu is the SI micro prefix on a latency number, and the line names no pooler mode to configure (R9 closed world, round 6).
+docs/v0.7/rfc-attested-cortex.md | partially mitigated. signature verification is computationally cheap (~50 μs per ed25519 verify on modern hardware), but a flood of invalid signatures could still consume cpu. v0.7 does not include explicit rate-limiting on verification; the k8 per-agent quotas (rps limits) provide indirect protection. | ctx:38dba9c45990
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Double vertical line used as a norm or separator sign in an epistemics design note about claim objects; the line names no pooler mode to configure (R9 closed world, round 6).
+docs/v1.0.0/perfect-endpoint-assessment/waves/w1-a6-epistemics.md | the perfect data model is a single content-addressed claim object whose kind is a tag (not a class hierarchy), whose identity is a hash of content‖provenance, and whose verbs never silently rewrite belief. observations, claims, decisions, reflections, goals/plans/steps, and provenance/confidence live as orthogonal axes on that object — never collapsed into “a string the model said once.” | ctx:67ddcbc489fd
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Ring operator for function composition of two threats in an analysis of AI fleet risks; the line names no pooler mode to configure (R9 closed world, round 6).
+docs/v1.0.0/perfect-endpoint-assessment/waves/w4-a3-asi-threats.md | t1∘t2 under claimed diversity + consumer trust: an asi (or monoculture fleet) launders priors into long-tier reflections, stamps claimed multi-family metadata, and a harness treats recall as ground truth while decorrelation remains advisory/default-off and model attestation is sparse. audit still records something — but operators read the content, not the chain, so integrity primitives never fire operationally. | ctx:93d3eed7eeee
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Status emoji (check mark, cross, warning sign, coloured circle) in a feature or milestone table mark progress next to ASCII words; no pooler mode is named or set (R9 closed world, round 6).
+docs/whats-new-v07.html | permissions actually enforce⚠️ advisory-only✅ enforce / advisory / off modes | ctx:dffcc46fcc89
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Status emoji (check mark, cross, warning sign, coloured circle) in a feature or milestone table mark progress next to ASCII words; no pooler mode is named or set (R9 closed world, round 6).
+docs/whats-new-v07.html | programmable lifecycle hooks❌ (subscriptions only)✅ 25 events, exec + daemon modes, decision contract | ctx:0dc523a20bd8
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Status emoji (check mark, cross, warning sign, coloured circle) in a feature or milestone table mark progress next to ASCII words; no pooler mode is named or set (R9 closed world, round 6).
+infra/pillar4-envelope/README.md | 4.c✅(#1735 staggered age cold-path) → 4.b✅(#1736 pgbouncer pooler) → 4.d. | ctx:8a275cd8438b
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Rust source that borrows a variable named current: the gate HTML-unescapes the ampersand form as a currency sign, the file holds plain ASCII and no pooler mode (R9 closed world, round 6).
+src/governance/deferred_audit.rs | ensure_regular_file(¤t, "deferred-audit spool lock")?; | ctx:ba90c74686b3
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Rust source that borrows a variable named current: the gate HTML-unescapes the ampersand form as a currency sign, the file holds plain ASCII and no pooler mode (R9 closed world, round 6).
+src/governance/deferred_audit.rs | if ¤t_spool != expected_spool { | ctx:456a437a7f16
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Microsecond timing figure: the Greek mu is the SI micro prefix on a latency number, and the line names no pooler mode to configure (R9 closed world, round 6).
+src/mcp/server_identity.rs | // ed25519 sign over ~150 bytes is ~10-50μs on modern hardware; the | ctx:54ae84859882
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Microsecond timing figure: the Greek mu is the SI micro prefix on a latency number, and the line names no pooler mode to configure (R9 closed world, round 6).
+src/mcp/server_identity.rs | //! takes ~10–50 μs on modern hardware. the cost is dwarfed by the | ctx:36e18f0d3fc3
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Rust source that borrows a variable named current: the gate HTML-unescapes the ampersand form as a currency sign, the file holds plain ASCII and no pooler mode (R9 closed world, round 6).
+src/store/postgres.rs | let declarer_owner = pg_namespace_standard_owner_pool(pool, ¤t).await?; | ctx:7a2abcb143eb
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Rust source that borrows a variable named current: the gate HTML-unescapes the ampersand form as a currency sign, the file holds plain ASCII and no pooler mode (R9 closed world, round 6).
+src/store/postgres_parity.rs | for next in fetch_reflects_on_targets(pool, ¤t).await? { | ctx:74ea7240b887
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Microsecond timing figure: the Greek mu is the SI micro prefix on a latency number, and the line names no pooler mode to configure (R9 closed world, round 6).
+tests/capture_layers_perf_budget.rs | /// release-mode test budget is 5 μs (5x headroom for ci hardware | ctx:5ab2105bb3d1
