@@ -238,3 +238,12 @@ scripts/probe-pgbouncer-pool-mode.py | return row["pool_mode"], "[databases] %s"
 scripts/probe-pgbouncer-pool-mode.py | return row["pool_mode"], "[users] %s" % user
 scripts/probe-pgbouncer-pool-mode.py | returns (mode, source). fails closed (probefault) when the tables lack a pool_mode column.
 scripts/probe-pgbouncer-pool-mode.py | server_reset_query provides in session mode. if b never lands on a's
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# regen tool self-reference: these lines are the tool's own source, naming this gate or its allowlist file; none recommends a non-session mode
+scripts/regen-pgbouncer-pool-mode-allow.py | """rewrite scripts/qc-allowlists/pgbouncer-pool-mode-allow.txt from the tree (#4667, #4741).
+scripts/regen-pgbouncer-pool-mode-allow.py | "# reason required before review - say why each line below may name a non-session mode"]
+scripts/regen-pgbouncer-pool-mode-allow.py | out += ["", "# added by regen-pgbouncer-pool-mode-allow.py --accept-new on %s:" % datetime.date.today().isoformat(),
+scripts/regen-pgbouncer-pool-mode-allow.py | path = root / "scripts" / "check-pgbouncer-pool-mode-claims.py"
+scripts/regen-pgbouncer-pool-mode-allow.py | scripts/regen-pgbouncer-pool-mode-allow.py [--root dir] [--check] [--accept-new] [--drop-stale]
+scripts/regen-pgbouncer-pool-mode-allow.py | spec = importlib.util.spec_from_file_location("pool_mode_gate", str(path))
