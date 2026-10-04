@@ -213,7 +213,9 @@ pub(crate) fn handle_skill_promote_for_caller(
     }
 
     // Resolve the per-namespace threshold; compiled default is 1.
+    // #4043 — an unreadable threshold refuses the promotion; never the default.
     let min_depth = crate::db::resolve_skill_promotion_min_depth(conn, &reflection.namespace)
+        .map_err(|e| e.context(crate::storage::GOVERNANCE_POLICY_UNREADABLE))?
         .unwrap_or(DEFAULT_SKILL_PROMOTION_MIN_DEPTH);
 
     // `reflection_depth` is stored as i32; clamp negative values to 0

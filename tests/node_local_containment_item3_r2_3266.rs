@@ -26,6 +26,10 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
 
+#[cfg(feature = "sal-postgres")]
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1172,7 +1176,7 @@ mod pg_race {
     }
 
     async fn wait_blocked_behind(pg: &PostgresStore, holder_pid: i32) {
-        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let end = crate::pg_barrier::deadline();
         loop {
             let blocked: i64 = sqlx::query_scalar(
                 "WITH w AS (SELECT pid, pg_blocking_pids(pid) AS b FROM pg_stat_activity) \
@@ -1303,7 +1307,7 @@ mod pg_merge_race {
     /// Wait until `n` backends are blocked behind `holder_pid` — directly, or
     /// queued behind a waiter that is.
     async fn wait_blocked_behind(pg: &PostgresStore, holder_pid: i32, n: i64) {
-        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let end = crate::pg_barrier::deadline();
         loop {
             let blocked: i64 = sqlx::query_scalar(
                 "WITH w AS (SELECT pid, pg_blocking_pids(pid) AS b FROM pg_stat_activity \
@@ -1459,7 +1463,7 @@ mod pg_fc_race {
     }
 
     async fn wait_blocked(pg: &PostgresStore, holder_pid: i32, n: i64) {
-        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let end = crate::pg_barrier::deadline();
         while blocked_behind(pg, holder_pid).await < n {
             assert!(tokio::time::Instant::now() < end, "barrier not reached");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

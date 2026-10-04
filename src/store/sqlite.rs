@@ -210,6 +210,20 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+/// #4447 — map the typed in-transaction by-id refusal onto the ONE
+/// `PermissionDenied` envelope the postgres adapter returns (error parity);
+/// anything else stays a backend detail.
+fn by_id_refusal(e: anyhow::Error, action: &str) -> StoreError {
+    match e.downcast::<crate::storage::InboundByIdNamespaceRefused>() {
+        Ok(refused) => StoreError::PermissionDenied {
+            action: action.to_string(),
+            target: refused.id.clone(),
+            reason: refused.to_string(),
+        },
+        Err(other) => box_err(other),
+    }
+}
+
 /// Map the typed coordination-guard refusal onto the SAL error: quota and
 /// validation keep their structural variants (the postgres twin maps
 /// `prepare_action` to `IntegrityFailed` the same way); a driver fault
@@ -1854,6 +1868,68 @@ impl MemoryStore for SqliteStore {
         db::delete(&conn, id).map_err(box_err)
     }
 
+    /// #4447 — in-transaction peer-scope re-check on the `deletions[]` lane.
+    async fn apply_remote_deletion_authorized(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::delete_authorized(&conn, id, authorize_stored)
+            .map_err(|e| by_id_refusal(e, crate::store::FEDERATION_APPLY_DELETION))
+    }
+
+    /// #4447 — in-transaction peer-scope re-check on the `archives[]` lane.
+    async fn apply_remote_archive_authorized(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::archive_memory_authorized(
+            &conn,
+            id,
+            Some(crate::models::field_names::ARCHIVE_REASON_SYNC_PUSH),
+            authorize_stored,
+        )
+        .map_err(|e| by_id_refusal(e, crate::store::FEDERATION_APPLY_ARCHIVE))
+    }
+
+    /// #4447 — in-transaction peer-scope re-check on the `restores[]` lane. The
+    /// G30 forget-tombstone gate runs first, exactly as `apply_remote_restore`.
+    async fn apply_remote_restore_authorized(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        if db::memory_is_tombstoned(&conn, id).map_err(box_err)? {
+            return Ok(false);
+        }
+        db::restore_archived_authorized(&conn, id, authorize_stored)
+            .map_err(|e| by_id_refusal(e, crate::store::FEDERATION_APPLY_RESTORE))
+    }
+
+    /// #4447 — in-transaction peer-scope re-check on the `links[]` lane.
+    async fn apply_remote_link_authorized(
+        &self,
+        _ctx: &CallerContext,
+        link: &MemoryLink,
+        attest_level: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<()> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::create_link_inbound_authorized(&conn, link, attest_level, authorize_stored)
+            .map_err(|e| by_id_refusal(e, crate::store::FEDERATION_APPLY_LINK))
+    }
+
     /// #3075 — delegates VERBATIM to `db::upsert_pending_action`, the free
     /// function the sqlite `/sync/push` `pendings[]` loop has always called.
     /// Owner-BLIND by trait contract: the peer-scope gate (#2478) plus the
@@ -2210,17 +2286,35 @@ impl MemoryStore for SqliteStore {
         // governance standard. Owner read + upsert in ONE WriteTxn (the #3237
         // item 5 TOCTOU discipline of the CLEAR twin).
         let write_txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
-        if !ctx.bypass_visibility {
-            let binding = db::namespace_standard_binding(&conn, namespace).map_err(box_err)?;
-            crate::store::authorize_namespace_standard_mutation(
-                ctx,
-                namespace,
-                &binding,
-                crate::store::NamespaceStandardOp::Set,
-            )?;
-        }
-        db::set_namespace_standard(&conn, namespace, standard_id, parent).map_err(box_err)?;
+        // #4356 — plus the ancestor-owner gate on a first bind (shared verdict).
+        crate::storage::ns_standard_ancestor::set_admission_conn(
+            &conn,
+            ctx.effective_principal(),
+            ctx.bypass_visibility,
+            namespace,
+        )
+        .map_err(|r| crate::store::set_refusal_to_store_err(r, namespace))?;
+        db::set_namespace_standard(&conn, namespace, standard_id, parent).map_err(|e| {
+            // #4492 — the bind-time chain-depth refusal is typed input, not a
+            // backend fault (byte-identical to the postgres adapter).
+            if crate::storage::bind_chain_depth::is_bind_chain_over_depth(&e) {
+                StoreError::InvalidInput {
+                    detail: crate::governance::bind_chain_depth::BIND_CHAIN_OVER_DEPTH.to_string(),
+                }
+            } else {
+                box_err(e)
+            }
+        })?;
         write_txn.commit().map_err(box_err)
+    }
+
+    async fn namespace_governing_ancestor(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<crate::ns_standard_ancestor::GoverningAncestor> {
+        let conn = self.state.lock().await;
+        crate::storage::ns_standard_ancestor::governing_ancestor_binding(&conn, namespace)
+            .map_err(box_err)
     }
 
     async fn clear_namespace_standard(
@@ -3238,7 +3332,16 @@ impl MemoryStore for SqliteStore {
         namespace: &str,
     ) -> StoreResult<Option<crate::models::GovernancePolicy>> {
         let conn = self.state.lock().await;
-        Ok(db::resolve_governance_policy(&conn, namespace))
+        // #4043 — a read fault propagates (postgres parity); it is never `None`.
+        db::resolve_governance_policy(&conn, namespace).map_err(box_err)
+    }
+
+    async fn resolve_require_approval_above_depth(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<Option<u32>> {
+        let conn = self.state.lock().await;
+        db::resolve_require_approval_above_depth(&conn, namespace).map_err(box_err)
     }
 
     async fn governance_approve_with_consensus(
