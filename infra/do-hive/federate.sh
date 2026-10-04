@@ -486,7 +486,8 @@ EOS
   case "$qcode" in
     201) ok "W-of-N quorum write at node 1 committed + replicated (201 quorum_met)" ;;
     202) ok "quorum write at node 1 locally durable (202; peer ack timing) -- the mesh channel carried it" ;;
-    *)   no "quorum write at node 1 got '$(safe_code "$qcode")' ($(safe_excerpt "$qjson"))" ;;
+    *)   no "quorum write at node 1 got '$(safe_code "$qcode")' ($(safe_excerpt "$qjson"))"
+         QID="" ;; # a rejected write is not read back: node 2 must not print a PASS for it
   esac
   if [ -n "$QID" ] && ! plain_id "$QID"; then
     no "quorum write at node 1 returned a memory id that is not a plain id; it is not read back"
@@ -541,6 +542,7 @@ EOS
         ok "signed write accepted at node 1 (201 id=$SID)"
       elif [ -z "$srefused" ]; then
         no "signed write at node 1 got '$(safe_code "$scode")' ($(safe_excerpt "$sjson"))"
+        SID="" # a rejected write is not read back: node 2 must not print a PASS for it
       fi
       if [ -n "$SID" ]; then
         lvl=""

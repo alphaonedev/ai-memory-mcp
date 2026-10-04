@@ -632,6 +632,32 @@ def f2_node_get_id():
         probe("#4957 a failed signed write with no id is one failure line, with srefused initialised under set -u",
               0 <= i < j and r.returncode == 0 and "done" in r.stdout and r.stdout.count("NO ") == 1 and "'500'" in r.stdout
               and "OK" not in r.stdout and "unbound" not in r.stderr, (r.stdout + r.stderr).strip()[:100])
+        # #5104: a rejected write must not be followed by a node-2 PASS. Each site runs whole, readback
+        # included, with a node_get that would report success; a failed write is one FAIL and no readback.
+        defs = plain_id_def(fs) + "\n" + fs[fs.find("safe_excerpt() {"):fs.find("# node_get <idx0>")]
+        qa = fs.find('  case "$qcode" in')
+        qb = fs.find("  # A4 --", qa) if qa >= 0 else -1
+        sa = fs.find('      SID=$(echo "$sjson" | jq -r \'.id // empty\' 2>/dev/null)\n')
+        sb = fs.find("    fi\n  fi\n  fi # NODE_COUNT", sa) if sa >= 0 else -1
+        sa += len('      SID=$(echo "$sjson" | jq -r \'.id // empty\' 2>/dev/null)\n') if sa >= 0 else 0
+        sites = (("quorum", fs[qa:qb] if 0 <= qa < qb else "", "qcode", "qjson", "QID", '{"id":"abc"}'),
+                 ("signed", fs[sa:sb] if 0 <= sa < sb else "", "scode", "sjson", "SID", '{"id":"abc"}'))
+        for name, snip, cv, jv, idv, body in sites:
+            for code, want_ok, want_called, label in (("500", 0, 0, "a 500"), ("403", 0, 0, "a 403"),
+                                                      ("201", 2, 1, "a 201 (control)")):
+                sc = ("set -u\n%s\nok() { echo \"OK $*\"; }\nno() { echo \"NO $*\"; }\n"
+                      "node_get() { : > %s; echo '{\"id\":\"abc\",\"metadata\":{\"attest_level\":\"agent_attested\"}}'; }\n"
+                      "sleep() { :; }\n%s='%s'\n%s='%s'\n%s='abc'\nQID=${QID:-}\nSID=${SID:-}\n%s\n"
+                      % (defs, d / "called", cv, code, jv, body, idv, snip))
+                (d / "called").unlink() if (d / "called").exists() else None
+                r = run_bash(sc, d)
+                oks = sum(1 for l in r.stdout.splitlines() if l.startswith("OK"))
+                nos = sum(1 for l in r.stdout.splitlines() if l.startswith("NO"))
+                called = 1 if (d / "called").exists() else 0
+                want_no = 0 if code == "201" else 1
+                probe("#5104 %s write with %s: %d FAIL, %d PASS, readback %s" % (name, label, want_no, want_ok, "runs" if want_called else "skipped"),
+                      bool(snip) and r.returncode == 0 and nos == want_no and oks == want_ok and (called > 0) == bool(want_called),
+                      "rc=%s no=%d ok=%d called=%d %s" % (r.returncode, nos, oks, called, r.stderr.strip()[:60]))
 
 
 def f2_id_lists_agree():
