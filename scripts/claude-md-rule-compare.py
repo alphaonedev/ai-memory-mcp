@@ -836,6 +836,17 @@ def self_test() -> int:
         print("FAIL: self-test - the docstring does not state that COUNT CHANGED applies to a heading prefix "
               "(#5375)", file=sys.stderr)
 
+    # #5383: the changelog states the guarantee the code gives: a program-level refusal under -I, not "never runs".
+    changelog = repo_root / "changelog.d" / "4507.fixed.md"
+    if not changelog.is_file():
+        print("PASS: self-test - changelog.d/4507.fixed.md is consumed; the #5383 wording pin does not apply")
+    elif "when the script is run as a program" in changelog.read_text(encoding="utf-8"):
+        print("PASS: self-test - the changelog scopes the sibling-module refusal to a program run (#5383)")
+    else:
+        failures.append("changelog wording")
+        print("FAIL: self-test - changelog.d/4507.fixed.md does not scope the sibling-module refusal to a program "
+              "run (#5383)", file=sys.stderr)
+
     def base_claude_symlink(root):
         target = root / "CLAUDE.md"
         target.rename(root / "CLAUDE.real.md")
