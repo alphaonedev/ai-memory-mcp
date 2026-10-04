@@ -633,6 +633,11 @@ def plain(s):
     return WS.sub(' ', htmlmod.unescape(TAG.sub(' ', s))).strip()
 
 
+def needle_forms(nd):
+    # The forms of a ledger needle that a folded view can contain.
+    return {nd, WS.sub(' ', nd)}
+
+
 canon = os.environ['GATE_SCHEMA_CANON']
 # A version TRANSITION (`CURRENT_SCHEMA_VERSION 71→72`) narrates a past bump:
 # the number before the arrow is history by construction, never a claim of the
@@ -741,7 +746,11 @@ for path in files:
             # The ledger exempts ONE hit: the needle must sit inside the
             # matched span, so a history phrase never shields a real claim
             # that shares its line (schema.html carries both on one line).
-            hit_entry = [st for nd, st in entries.items() if nd in span]
+            # The engine matched `span` in a folded view, so the needle is also
+            # tried in that fold (#5334): a needle with a doubled space still sits
+            # inside the whitespace-folded span.
+            hit_entry = [st for nd, st in entries.items()
+                         if any(f in span for f in needle_forms(nd))]
             if hit_entry:
                 for st in hit_entry:
                     st[1] = True
@@ -2735,6 +2744,12 @@ SCHEMAHTML
     # changes: each REJECT line passed green before them.
     printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 49→50\t#3248 fixture past bump\n' \
         > scripts/qc-allowlists/schema-claim-history.txt
+    # Ledgered history written in a shape the engine folds before matching must stay
+    # exempt in every view (#5334 doubled space; the ledger needle is matched against the
+    # span as the engine saw it, folded the same way). A needle cannot hold a tab: the
+    # ledger is tab-separated.
+    printf 'docs/postgres-age-guide.md\tsteps  v40 → v57\t#5334 ledgered doubled-space history\n' \
+        >> scripts/qc-allowlists/schema-claim-history.txt
     cat > "$tmpdir/docs/postgres-age-guide.md" <<'R4MD'
 The current `CURRENT_SCHEMA_VERSION` is
 52 on both backends.
@@ -2786,6 +2801,7 @@ a v0.8.x DB steps **v40 → v52** on boot.
 a v0.8.x DB steps **v40 → v53** on boot.
 a v0.8.x DB steps `v40 -> v52` on boot.
 a v0.8.x DB steps `v40 -> v53` on boot.
+a v0.6 DB steps  v40 → v57 on boot.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2961,9 +2977,10 @@ R4HTML
         'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' \
         'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 ' \
         'docs/postgres-age-guide.md:42 ' 'docs/postgres-age-guide.md:44 ' 'docs/postgres-age-guide.md:46 ' \
-        'docs/postgres-age-guide.md:48 ' 'docs/postgres-age-guide.md:50 '
+        'docs/postgres-age-guide.md:48 ' 'docs/postgres-age-guide.md:50 ' 'docs/postgres-age-guide.md:51 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
+    grep -qF 'STALE entry' <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - a ledger entry reported STALE although its line is present" >&2; cd "$REPO_ROOT"; exit 1; }
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5026/#5080 - anchor wrapped across two lines (steps / v40 -> v52) and identifier value more than 60 chars after the identifier: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #4511-R5 - wrapped claim with an issue ref / release triple in the subject tail, whitespace at the wrap point, and a tag-only middle line: planted 52 REJECTED, 53 ACCEPTED"
