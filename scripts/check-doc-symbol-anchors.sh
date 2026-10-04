@@ -306,6 +306,10 @@ MDEOF
         "<a href=\"https://github.com/o/r/blob/${pin40}/src/mcp/tools/other.rs#L2\">src/mcp/tools/recall.rs:2</a>"
     bare_red "a pinned permalink whose label range differs from the #L range" \
         "[src/mcp/tools/recall.rs:2-5](https://github.com/o/r/blob/${pin40}/src/mcp/tools/recall.rs#L2-L6)"
+    bare_red "a pinned permalink whose label range START differs from the #L start (markdown)" \
+        "[src/mcp/tools/recall.rs:2-4](https://github.com/o/r/blob/${pin40}/src/mcp/tools/recall.rs#L3-L4)"
+    bare_red "a pinned permalink whose label range START differs from the #L start (HTML)" \
+        "<a href=\"https://github.com/o/r/blob/${pin40}/src/mcp/tools/recall.rs#L1-L4\">src/mcp/tools/recall.rs:2-4</a>"
     write_clean
     printf '\n\n[src/mcp/tools/recall.rs:2](https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs#L2)\n' "$pin40" >> "$FIX/README.md"
     printf '<a href="https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs#L3">src/mcp/tools/recall.rs:3</a>\n' "$pin40" >> "$FIX/README.md"
