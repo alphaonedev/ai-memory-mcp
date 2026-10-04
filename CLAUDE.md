@@ -1599,12 +1599,16 @@ against the mirror frozen at
 pre-fix mirror a planted decider `if:` passes the gate SILENTLY, which is
 the blind spot the declaration closes and the proof the leg is not
 tautological. **(f) HARD-FAIL, added #2636** — every job in a GATING
-workflow (`ci.yml`, `c8-precheck.yml`, `coverage.yml`,
-`cert-postgres-age.yml`, `postgres-ignored.yml`, declared as
-`COVERED_WORKFLOWS` in the gate) must be declared EITHER in the mirror OR
-in the dated ledger
+workflow must be declared EITHER in the mirror OR in the dated ledger
 `scripts/qc-allowlists/required-contexts-not-required.txt`
-(`<workflow-file> <job-id> <YYYY-MM-DD> #<issue>`). Rules (a)-(e) all
+(`<workflow-file> <job-id> <YYYY-MM-DD> #<issue>`). GATING is derived from
+TRIGGERS (#5331): a workflow whose `on:` includes `pull_request`,
+`pull_request_target` or `merge_group`, minus the dated exclusion ledger
+`scripts/qc-allowlists/required-contexts-scope-excluded.txt`
+(`<workflow-file> <YYYY-MM-DD> #<issue> <note>`; stale, absent-file and
+malformed rows hard-fail). `COVERED_WORKFLOWS` in the gate is now only the
+release attribution carrier set read by `qualify-sha.py`, cross-checked
+against the derived scope. Rules (a)-(e) all
 reason mirror -> job, so not one of them can see a job that is simply
 ABSENT from the mirror: a newly-added integrity gate lands unrequired, in
 silence. It did. FOUR c8-precheck gates ran on every PR required by

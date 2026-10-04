@@ -196,11 +196,13 @@
 #       `cancel-in-progress: false`, is NOT flagged: it produces two SUCCESS
 #       runs — wasteful, but no `cancelled` row, so not this defect class.
 #
-#   (f) HARD-FAIL: every job in a GATING workflow (`COVERED_WORKFLOWS` below —
-#       `ci.yml`, `c8-precheck.yml`, `coverage.yml`, `cert-postgres-age.yml`,
-#       `postgres-ignored.yml`) must be declared EITHER in
+#   (f) HARD-FAIL: every job in a GATING workflow must be declared EITHER in
 #       the mirror OR in the dated not-required ledger
-#       `scripts/qc-allowlists/required-contexts-not-required.txt`.
+#       `scripts/qc-allowlists/required-contexts-not-required.txt`. A workflow
+#       is GATING when its `on:` includes `pull_request`,
+#       `pull_request_target` or `merge_group` (#5331: scope is DERIVED from
+#       triggers, not a hand-kept list), minus the dated exclusion ledger
+#       `scripts/qc-allowlists/required-contexts-scope-excluded.txt`.
 #
 #       WHY IT IS A DIFFERENT KIND OF RULE. Rules (a)-(e) all reason from the
 #       mirror OUTWARD: given a required context, is it sound? Not one of them
@@ -277,7 +279,8 @@
 #   RQC_ALLOW_FILE        (default <root>/scripts/qc-allowlists/required-contexts-joblevel-if-allow.txt)
 #   RQC_DUPTRIG_ALLOW_FILE (default <root>/scripts/qc-allowlists/dual-trigger-cancel-allow.txt)
 #   RQC_NOTREQ_FILE       (default <root>/scripts/qc-allowlists/required-contexts-not-required.txt)
-#   RQC_COVERED_WORKFLOWS (default "ci.yml c8-precheck.yml coverage.yml cert-postgres-age.yml postgres-ignored.yml") — rule (f) scope
+#   RQC_SCOPE_EXCLUDED_FILE (default <root>/scripts/qc-allowlists/required-contexts-scope-excluded.txt) — rule (f) scope exclusions
+#   RQC_COVERED_WORKFLOWS (default "ci.yml c8-precheck.yml coverage.yml cert-postgres-age.yml postgres-ignored.yml") — release attribution carrier set
 #   RQC_PROTECTED_BRANCH  (default release/v1.0.0)
 #   RQC_CLASSIFY_JOB      (default classify)  — the job id rule (b3) keys on
 #
@@ -293,6 +296,7 @@ MIRROR_FILE="${RQC_MIRROR_FILE:-$ROOT/scripts/qc-allowlists/required-contexts-re
 ALLOW_FILE="${RQC_ALLOW_FILE:-$ROOT/scripts/qc-allowlists/required-contexts-joblevel-if-allow.txt}"
 DUPTRIG_ALLOW_FILE="${RQC_DUPTRIG_ALLOW_FILE:-$ROOT/scripts/qc-allowlists/dual-trigger-cancel-allow.txt}"
 NOTREQ_FILE="${RQC_NOTREQ_FILE:-$ROOT/scripts/qc-allowlists/required-contexts-not-required.txt}"
+SCOPE_EXCLUDED_FILE="${RQC_SCOPE_EXCLUDED_FILE:-$ROOT/scripts/qc-allowlists/required-contexts-scope-excluded.txt}"
 SCRIPTS_DIR="${RQC_SCRIPTS_DIR:-$ROOT/scripts}"
 NOTWIRED_FILE="${RQC_NOTWIRED_FILE:-$ROOT/scripts/qc-allowlists/gates-not-wired.txt}"
 PROTECTED_BRANCH="${RQC_PROTECTED_BRANCH:-release/v1.0.0}"
@@ -300,25 +304,19 @@ CLASSIFY_JOB="${RQC_CLASSIFY_JOB:-classify}"
 
 # --- rule (f) SCOPE: the GATING workflows ----------------------------------
 #
-# The workflows that carry required contexts — the pull-request gating
-# pipeline. Every job in these must be declared in the mirror or in the
-# not-required ledger; none may DEFAULT to unenforced.
+# RELEASE ATTRIBUTION CARRIER SET (#5331). This literal is NOT rule (f)'s scope
+# any more: scope is derived from workflow triggers (pull_request,
+# pull_request_target, merge_group) minus the dated exclusion ledger. It is
+# kept because `scripts/release/qualify-sha.py` and `release.yml` read this
+# exact line to decide which workflows' check-runs count toward a release
+# qualification. The gate fails if a carrier named here has no parsed jobs or
+# is not in the derived scope (RULE (f) CARRIER), and if a mirror context is
+# carried by a workflow outside the derived scope (RULE (f) SCOPE).
 #
-# Deliberately NOT repo-wide, unlike rules (d) and (e). Those detect STATIC
-# DEFECTS, wrong wherever they appear. Rule (f) encodes a POLICY JUDGEMENT
-# ("should this job be required?") that has to be authored per workflow, and
-# sweeping in `release.yml` / `publish-sdks.yml` / `yank.yml` and the rest
-# would mean inventorying ~45 jobs that never fire on `pull_request` at all —
-# a junk drawer that teaches readers to skim past the ledger, which is how a
-# ledger stops being read.
-#
-# Deliberately DECLARED rather than derived from "workflows carrying a mirror
-# context": deriving it would make the scope a function of the mirror, so
-# dropping a workflow's last required context would silently remove that
-# workflow from rule (f)'s reach at the very moment it stopped being covered by
-# rules (a)-(c). Declared, the two can be cross-checked — and the gate DOES
-# cross-check, in both directions: a declared workflow with no parsed jobs
-# fails, and a mirror context carried by an undeclared workflow fails.
+# Measured at #5331: 12 workflows (63 jobs) trigger on a pull request; the 7
+# that do not (21 jobs: release.yml, publish-sdks.yml, yank.yml and the like)
+# are out of rule (f)'s reach by trigger, not by omission from a list. The old
+# "~45 jobs" figure here was wrong.
 COVERED_WORKFLOWS="${RQC_COVERED_WORKFLOWS:-ci.yml c8-precheck.yml coverage.yml cert-postgres-age.yml postgres-ignored.yml}"
 
 # --- rule (d) PR-HEAD PROBE CORPUS -----------------------------------------
@@ -389,6 +387,7 @@ fail() {
 # Record stream (TAB-delimited; workflow files in this repo contain no tabs):
 #   WF   <file> <pr_trigger> <pr_paths> <branches-csv>
 #   PUSH <file> <push_trigger> <push-branches-csv>
+#   TRIG <file> <scope_trigger> <events-csv>   (#5331: pull_request | pull_request_target | merge_group => 1)
 #   CONC <file> <has_concurrency> <cancel_in_progress> <group-expr>
 #   JOB  <file> <jobid> <name> <job_if> <has_matrix> <needs-csv> <name_truncation_risk>
 #   MX   <file> <jobid> <key> <value>
@@ -435,6 +434,26 @@ parse_workflows() {
             }
             return out[0]
         }
+        # RULE (f) SCOPE (#5331): record one `on:` event. Sets the pr/push
+        # flags too, so the flow-sequence / scalar / block-sequence `on:` forms
+        # reach rules (a)-(d) exactly as the block-map form always did.
+        function addev(e) {
+            e = trim(e)
+            if (e == "" || (e in evs)) return
+            evs[e] = 1
+            evlist = (evlist == "" ? e : evlist "," e)
+            if (e == "pull_request") pr_trigger = 1
+            else if (e == "push") push_trigger = 1
+        }
+        # `on: pull_request` / `on: [push, pull_request]` / `on: {push: ...}`:
+        # tokenise the raw tail and record every identifier. Over-approximating
+        # (a flow-map nested keys also become tokens) is the SAFE direction:
+        # a spurious token can only widen the rule (f) scope, never narrow it.
+        function flowevents(v,   n, i, toks) {
+            sub(/[ \t]+#.*$/, "", v)
+            n = split(v, toks, /[^A-Za-z0-9_-]+/)
+            for (i = 1; i <= n; i++) addev(toks[i])
+        }
         function flushstep() {
             if (cur_step > 0)
                 printf "STEP\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n", FNAME, job, cur_step, s_hasif, s_guard, s_uses, s_name
@@ -473,6 +492,7 @@ parse_workflows() {
             conc_seen = 0; conc_cancel = 0; conc_group = ""
             job = ""; cur_step = 0; j_namerisk = 0
             seqkey = ""; seqind = -1
+            evlist = ""
         }
         {
             line = $0
@@ -514,11 +534,20 @@ parse_workflows() {
             rawval = trim(val)
             isblock = (rawval ~ /^[|>][0-9+-]*$/)
 
+            # --- `on:` as a block SEQUENCE of event names (items may sit at
+            # indent 0 or 2). A `- cron: ...` item (schedule) carries a colon
+            # and is not an event name, so it is skipped.
+            if (section == "on" && ind <= 2 && substr(body, 1, 2) == "- ") {
+                if (index(body, ":") == 0) addev(scalar(substr(body, 3)))
+                next
+            }
+
             # --- top level ---
             if (ind == 0) {
                 flushjob()
                 section = key
                 on_key = ""
+                if (key == "on" && rawval != "" && !isblock) flowevents(rawval)
                 # A TOP-LEVEL `concurrency:` is the only one rule (d) reads: a
                 # job-level one lands at indent 4 inside `jobs:` and cannot
                 # coalesce two whole runs of the workflow.
@@ -530,6 +559,7 @@ parse_workflows() {
             if (section == "on") {
                 if (ind == 2) {
                     on_key = key
+                    if (key != "") addev(key)
                     if (key == "pull_request") pr_trigger = 1
                     else if (key == "push") push_trigger = 1
                 } else if (ind == 4 && on_key == "pull_request") {
@@ -652,6 +682,8 @@ parse_workflows() {
             printf "WF\t%s\t%d\t%d\t%s\n", FNAME, pr_trigger, pr_paths, branches
             printf "PUSH\t%s\t%d\t%s\n", FNAME, push_trigger, push_branches
             printf "CONC\t%s\t%d\t%d\t%s\n", FNAME, conc_seen, conc_cancel, conc_group
+            scope = ((("pull_request" in evs) || ("pull_request_target" in evs) || ("merge_group" in evs)) ? 1 : 0)
+            printf "TRIG\t%s\t%d\t%s\n", FNAME, scope, evlist
         }
         ' "$f"
     done
@@ -717,6 +749,7 @@ run_gate() {
     declare -A JOB_NAMERISK=()
     declare -A WF_PR=() WF_PATHS=() WF_BRANCHES=()
     declare -A WF_PUSH=() WF_PUSHBR=()
+    declare -A WF_SCOPE=() WF_EVENTS=()   # #5331: trigger-derived rule (f) scope
     declare -A WF_CONC=() WF_CANCEL=() WF_GROUP=()
     declare -A MXKEYS=()   # "file|job|key" -> space-joined values
     declare -a JOBKEYS=() WFKEYS=()
@@ -739,6 +772,9 @@ run_gate() {
                 ;;
             PUSH)
                 WF_PUSH["$a"]="$b"; WF_PUSHBR["$a"]="$c"
+                ;;
+            TRIG)
+                WF_SCOPE["$a"]="$b"; WF_EVENTS["$a"]="$c"
                 ;;
             CONC)
                 WF_CONC["$a"]="$b"; WF_CANCEL["$a"]="$c"; WF_GROUP["$a"]="$d"
@@ -1071,9 +1107,69 @@ run_gate() {
         NOTREQ_REF["$nfile|$njob"]="$ndate $nref"
     done
 
-    # The covered set must not silently narrow while the required set widens:
-    # a mirror context carried by a workflow OUTSIDE it means rule (f) has a
-    # blind spot in a pipeline that is already trusted with required contexts.
+    # ---- rule (f) SCOPE, derived from TRIGGERS (#5331) ---------------------
+    #
+    # Scope is every workflow that triggers on pull_request,
+    # pull_request_target or merge_group (the TRIG record), minus the dated
+    # exclusion ledger. It is NOT a hand-maintained list: a new PR-triggered
+    # workflow is in scope the moment it exists, and a workflow can leave scope
+    # only through a dated, tracked row. COVERED_WORKFLOWS survives solely as
+    # the release attribution carrier set (qualify-sha.py / release.yml read
+    # the literal) and is cross-checked against the derived scope below.
+    declare -A SXL=() SXL_REF=() SXL_USED=()
+    local -a sx_lines=()
+    mapfile -t sx_lines < <(read_list "$SCOPE_EXCLUDED_FILE")
+    local sxline sxfile sxdate sxref sxnote
+    for sxline in "${sx_lines[@]}"; do
+        # FORMAT: <workflow-file> <YYYY-MM-DD> #<issue> <note...>
+        read -r sxfile sxdate sxref sxnote <<< "$sxline"
+        if [ -z "$sxfile" ] \
+            || [[ ! "$sxdate" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+            || [[ ! "$sxref" =~ ^#[0-9]+$ ]] || [ -z "$sxnote" ]; then
+            fail "RULE (f) SCOPE-EXCLUDED LEDGER MALFORMED — '$sxline' in $SCOPE_EXCLUDED_FILE."
+            echo "     Every entry MUST be '<workflow-file> <YYYY-MM-DD> #<issue> <note>'. Without the date and the tracking issue an exclusion is an unexplained suppression of rule (f) for a whole workflow." >&2
+            continue
+        fi
+        SXL["$sxfile"]=1
+        SXL_REF["$sxfile"]="$sxdate $sxref"
+    done
+
+    declare -A INSCOPE=()
+    local swf
+    for swf in "${WFKEYS[@]}"; do
+        if [ -z "${WF_EVENTS[$swf]:-}" ]; then
+            fail "RULE (f) SCOPE — workflow '$swf' declares no trigger this gate can read, so its scope cannot be derived."
+            echo "     Fail-closed: a workflow whose triggers cannot be parsed would silently drop out of rule (f). FIX: give it a plain 'on:' block, flow list, scalar or block list." >&2
+            continue
+        fi
+        if [ "${WF_SCOPE[$swf]:-0}" = "1" ] && [ -z "${SXL[$swf]:-}" ]; then
+            INSCOPE["$swf"]=1
+        fi
+    done
+    local sxkey
+    for sxkey in "${!SXL[@]}"; do
+        if [ -z "${WF_EVENTS[$sxkey]:-}" ] || [ "${WF_SCOPE[$sxkey]:-0}" != "1" ]; then
+            fail "RULE (f) SCOPE-EXCLUDED LEDGER STALE — '$sxkey' (${SXL_REF[$sxkey]:-<no ref>}) is listed in $SCOPE_EXCLUDED_FILE but is absent from $WORKFLOW_DIR or no longer triggers on pull_request / pull_request_target / merge_group."
+            echo "     A stale exclusion would pre-absolve whatever workflow next takes that file name. It is fatal, not advisory. FIX: delete the line." >&2
+        fi
+    done
+
+    # A scope entry that parsed no jobs would let rule (f) pass over nothing.
+    local _jk2 sc_has
+    for swf in "${!INSCOPE[@]}"; do
+        sc_has=0
+        for _jk2 in "${JOBKEYS[@]}"; do
+            if [ "${JOB_FILE[$_jk2]}" = "$swf" ]; then sc_has=1; break; fi
+        done
+        if [ "$sc_has" != "1" ]; then
+            fail "RULE (f) — in-scope workflow '$swf' has NO parsed jobs in $WORKFLOW_DIR (unparseable jobs: block)."
+            echo "     Refusing to pass a scope entry that covers nothing (fail-closed)." >&2
+        fi
+    done
+
+    # Carrier set (release attribution). Every declared carrier must still
+    # exist and still be in the derived scope; a mirror context carried by a
+    # workflow OUTSIDE the derived scope is a blind spot.
     declare -A COVERED=()
     local cw
     for cw in $COVERED_WORKFLOWS; do
@@ -1084,16 +1180,19 @@ run_gate() {
         done
         if [ "$seen_cw" != "1" ]; then
             fail "RULE (f) — declared gating workflow '$cw' has NO parsed jobs in $WORKFLOW_DIR (renamed, deleted, or unparseable)."
-            echo "     Refusing to pass a scope declaration that covers nothing (fail-closed): a stale name here silently shrinks rule (f)'s reach to the workflows that happen to still match. FIX: update COVERED_WORKFLOWS in this script." >&2
+            echo "     Refusing to pass a scope declaration that covers nothing (fail-closed). FIX: update COVERED_WORKFLOWS in this script." >&2
+        elif [ -z "${INSCOPE[$cw]:-}" ]; then
+            fail "RULE (f) CARRIER — declared release carrier '$cw' is not in the trigger-derived scope (not PR-triggered, or excluded in $SCOPE_EXCLUDED_FILE)."
+            echo "     A carrier whose jobs rule (f) never audits is exactly the blind spot #5331 closes. FIX: make it PR-triggered / remove its exclusion, or remove it from COVERED_WORKFLOWS." >&2
         fi
     done
     for ctx in "${contexts[@]}"; do
         jk="${CTX_JOB[$ctx]:-}"
         [ -n "$jk" ] || continue
         wf="${JOB_FILE[$jk]}"
-        [ -z "${COVERED[$wf]:-}" ] || continue
-        fail "RULE (f) SCOPE — required context '$ctx' is carried by '$wf', which is NOT in this gate's COVERED_WORKFLOWS ($COVERED_WORKFLOWS)."
-        echo "     A workflow trusted to carry a required context must have ALL of its jobs accounted for, or rule (f) has a blind spot in exactly the pipeline that matters. FIX: add '$wf' to COVERED_WORKFLOWS and declare each of its jobs in the mirror or in $NOTREQ_FILE." >&2
+        [ -z "${INSCOPE[$wf]:-}" ] || continue
+        fail "RULE (f) SCOPE — required context '$ctx' is carried by '$wf', which is outside the trigger-derived rule (f) scope (not PR-triggered, or excluded in $SCOPE_EXCLUDED_FILE)."
+        echo "     A workflow trusted to carry a required context must have ALL of its jobs accounted for, or rule (f) has a blind spot in exactly the pipeline that matters. FIX: make '$wf' PR-triggered or drop its exclusion row, and declare each of its jobs in the mirror or in $NOTREQ_FILE." >&2
     done
 
     declare -A CTX_DECLARED=()
@@ -1102,7 +1201,7 @@ run_gate() {
     local fjk fwf fjob fname missing declared_any
     for fjk in "${JOBKEYS[@]}"; do
         fwf="${JOB_FILE[$fjk]}"
-        [ -n "${COVERED[$fwf]:-}" ] || continue
+        [ -n "${INSCOPE[$fwf]:-}" ] || continue
         fjob="${fjk#*|}"
 
         if [ -n "${NOTREQ[$fwf|$fjob]:-}" ]; then
@@ -1148,7 +1247,7 @@ run_gate() {
     local nkey
     for nkey in "${!NOTREQ[@]}"; do
         [ -z "${NOTREQ_USED[$nkey]:-}" ] || continue
-        fail "NOT-REQUIRED LEDGER STALE — '${nkey%%|*}' job '${nkey#*|}' (${NOTREQ_REF[$nkey]:-<no ref>}) is listed in $NOTREQ_FILE but no such job exists in a covered workflow."
+        fail "NOT-REQUIRED LEDGER STALE — '${nkey%%|*}' job '${nkey#*|}' (${NOTREQ_REF[$nkey]:-<no ref>}) is listed in $NOTREQ_FILE but no such job exists in an in-scope workflow."
         echo "     Unlike the rule (d) pending-fix ledger — where a stale line can only suppress a failure that no longer happens — a stale line HERE pre-absolves whatever job next takes that id, in the workflow where integrity gates live. It is therefore fatal, not advisory. FIX: delete the line." >&2
     done
 
@@ -1386,6 +1485,11 @@ TXT
             printf '\njobs:\n  gate:\n    name: dup carrier gate\n    runs-on: ubuntu-latest\n'
             printf '    steps:\n      - uses: actions/checkout@v4\n      - name: run\n        run: echo ok\n'
         } > "$wf/dup.yml"
+        # #5331: a PR-triggered dup.yml is in the derived rule (f) scope, so its
+        # one job is declared not-required to keep rule (f) quiet; the push-only
+        # shape (omit_pr) is out of scope and needs no row. Rule (d) owns the
+        # verdict under test either way.
+        [ -n "$omit_pr" ] || printf 'dup.yml gate 2026-10-04 #5331 self-test fixture\n' >> "$nrq"
     }
 
     local rc parsed_name e_out
@@ -1712,13 +1816,15 @@ YAML
     # rule that existed before #2636, which is exactly why four real integrity
     # gates could sit unrequired without any gate noticing.
     #
-    # (Note the deliberately-unusable alternative: emptying COVERED_WORKFLOWS
+    # (#5331: the control workflow is PUSH-ONLY, because scope is now derived
+    # from triggers and a PR-triggered dup.yml would be in scope.)
+    # (Note the deliberately-unusable alternative: emptying the scope
     # does NOT emulate the pre-fix state, because an empty scope leaves every
-    # mirror context carried by an uncovered workflow and the SCOPE
+    # mirror context carried by an out-of-scope workflow and the SCOPE
     # cross-check correctly fails. A gate whose scope can be silently zeroed
     # would be a control that reports success while doing nothing.)
     write_clean
-    write_dup '[main]' 'false' 'x-${{ github.ref }}'
+    write_dup '[main]' 'false' 'x-${{ github.ref }}' omit_pr
     printf '  newgate:\n    name: Brand New Integrity Gate (#9999)\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - name: run\n        run: echo ok\n' >> "$wf/dup.yml"
     rc="$(run_fixture)"
     if [ "$rc" != "0" ]; then
@@ -1816,12 +1922,12 @@ YAML
     # A required context carried by an UNCOVERED workflow means rule (f) has a
     # blind spot in a pipeline already trusted with required contexts...
     write_clean
-    write_dup '[main]' 'false' 'x-${{ github.ref }}'
+    write_dup '[main]' 'false' 'x-${{ github.ref }}' omit_pr
     printf 'dup carrier gate\n' >> "$mi"
     f_out="$(run_out)"
     rc="$(run_fixture)"
     if [ "$rc" = "0" ]; then
-        echo "  [f] a required context carried by a workflow OUTSIDE the covered set was accepted — rule (f) would have a blind spot there — FAIL" >&2
+        echo "  [f] a required context carried by a workflow OUTSIDE the trigger-derived scope was accepted — rule (f) would have a blind spot there — FAIL" >&2
         return 2
     fi
     case "$f_out" in
@@ -1978,7 +2084,7 @@ YAML
     printf 'pr.yml scopegate 2026-10-04 #5331 deliberate, tracked\n' > "$nrq"
     scope_expect "in-scope job declared in the not-required ledger" 0 "" || return 2
     write_clean
-    scope_wf pr.yml 'on:\n  pull_request:\n    branches: [main]\n'
+    scope_wf pr.yml 'on:\n  pull_request:\n    branches: [main, develop, "release/**"]\n'
     printf 'Scope probe gate\n' >> "$mi"
     scope_expect "in-scope job declared in the mirror" 0 "" || return 2
     # 8. the exclusion ledger: a dated, tracked row removes a PR-triggered workflow from scope
@@ -2039,7 +2145,7 @@ if [ "${1:-}" != "" ]; then
 fi
 
 if run_gate; then
-    echo "check-required-contexts: OK (${PROTECTED_BRANCH}: every mirrored required context maps to a reporting job; no matrix+if wedge; no decider with a job-level if; no path-filtered carrier; every needs-${CLASSIFY_JOB} step guarded; no dual-trigger cancelled-duplicate carrier; every job in ${COVERED_WORKFLOWS} declared required or dated-and-tracked as not-required)"
+    echo "check-required-contexts: OK (${PROTECTED_BRANCH}: every mirrored required context maps to a reporting job; no matrix+if wedge; no decider with a job-level if; no path-filtered carrier; every needs-${CLASSIFY_JOB} step guarded; no dual-trigger cancelled-duplicate carrier; every job in every PR-triggered workflow (trigger-derived scope, minus the dated exclusion ledger) declared required or dated-and-tracked as not-required)"
     exit 0
 fi
 

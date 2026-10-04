@@ -2,11 +2,10 @@
 # for the gating workflows, enforced by rule (f) of
 # `scripts/check-required-contexts.sh` (#2636).
 #
-# =====================================================================# *** THIS FILE IS CURRENTLY EMPTY, AND THAT IS THE PASSING STATE. ***
-# =====================================================================# Empty means every job in every gating workflow is DECLARED REQUIRED in
-# `required-contexts-release.txt`. The teeth are in the rule, not the contents:
-# from now on a newly-added job in a gating workflow must be declared one way
-# or the other, and cannot DEFAULT to unenforced.
+# Every job in every PR-triggered workflow is DECLARED REQUIRED in
+# `required-contexts-release.txt` or listed here. The teeth are in the rule, not
+# the contents: a newly-added job must be declared one way or the other, and
+# cannot DEFAULT to unenforced.
 #
 # WHY THE RULE EXISTS (#2636). Four `c8-precheck.yml` integrity gates ran on
 # every pull request and were required by nothing — including
@@ -18,19 +17,23 @@
 # and had gone stale without anyone noticing — which is the argument for a
 # machine-parsed ledger over a comment.
 #
-# SCOPE, and why it is not repo-wide. Rule (f) covers the workflows declared in
-# `COVERED_WORKFLOWS` in the gate: `ci.yml`, `c8-precheck.yml`, `coverage.yml`,
-# `cert-postgres-age.yml`, `postgres-ignored.yml` (#3552 added the last two).
-# Those are the workflows that carry required contexts — the PR gating pipeline.
-# Rules (d) and (e) ARE repo-wide, and the difference is deliberate: (d) and
-# (e) detect STATIC DEFECTS that are wrong wherever they appear, whereas (f)
-# encodes a POLICY JUDGEMENT ("should this job be required?") that has to be
-# authored per workflow. Sweeping `release.yml`, `publish-sdks.yml`,
-# `yank.yml` and the rest into it would mean inventorying ~45 jobs that never
-# fire on `pull_request` at all — a junk drawer that teaches readers to skim
-# past the file, which is how a ledger stops being read. The gate hard-fails if
-# a mirror context ever appears in a workflow OUTSIDE this list, so the scope
-# cannot silently narrow while the required set widens.
+# SCOPE (#5331: derived from TRIGGERS, not from a list). Rule (f) covers every
+# workflow that triggers on `pull_request`, `pull_request_target` or
+# `merge_group` (12 workflows, 63 jobs at the #5331 re-measure), minus the dated
+# exclusion ledger `required-contexts-scope-excluded.txt`. The other 7 workflows
+# (`release.yml`, `publish-sdks.yml`, `yank.yml` and the like; 21 jobs) never
+# fire on a pull request, so a "should this job be required?" judgement does not
+# apply to them. `COVERED_WORKFLOWS` in the gate is now ONLY the release
+# attribution carrier set read by `qualify-sha.py`; the gate fails if a carrier
+# leaves the derived scope, or if a mirror context is carried by a workflow
+# outside it, so the scope cannot silently narrow while the required set widens.
+#
+# The 15 jobs of batman-mode-acceptance, bench, clients-ci, codeql-rust,
+# mobile-runtime, token-budget and tool-count-drift entered scope with #5331.
+# They are declared below as not-required on 2026-10-04. Proposed REQUIRED,
+# especially `token-budget` and `tool-count-drift`: promoting any of them is the
+# operator-sequenced #3554 lockstep (live protection, then --pin-from-live, then
+# the mirror line, in ONE Conductor commit that also removes the entry here).
 #
 # FORMAT
 #   <workflow-file> <job-id> <YYYY-MM-DD> #<issue> [free-text note]
@@ -65,3 +68,18 @@ c8-precheck.yml declaration-hash-gate 2026-09-18 #3557 Declaration hash gate (#3
 c8-precheck.yml sdk-tls-scheme-gate 2026-09-18 #3782 SDK TLS-scheme + CA-trust gate (#3782); deliberately unrequired at introduction per the Conductor lockstep rule (a new c8-precheck job cannot report on release PRs until the #3769 promotion lands; check-required-contexts-live.sh refuses a declaration ahead of live protection, #3554 / #2712). The lockstep — live protection, then --pin-from-live, then the required-contexts-release.txt line — is ONE later Conductor commit that also removes this entry. The gate runs and hard-fails on every PR; only branch-protection enforcement is deferred.
 c8-precheck.yml truthy-grammar-gate 2026-09-18 #3200 truthy/falsy grammar consolidation gate; deliberately unrequired at introduction because requiring it means editing release/v1.0.0 branch protection, an operator action affecting every PR, which the GA freeze does not widen. The correct disposition is to REQUIRE it (add its reported name -- "Truthy-grammar consolidation gate (#3200)" -- to required-contexts-release.txt + the branch-protection API, mirror FIRST per the #3554 ORDER rule); declared here so rule (f) stays green rather than defaulting to unenforced. The job runs unconditionally on every PR and HARD-FAILS on any un-allowlisted narrow grammar; only branch-protection ENFORCEMENT (a live GitHub ruleset mutation, Sensitive-class) is deferred, not the check itself. Lockstep promotion is one later Conductor commit.
 c8-precheck.yml mcp-transport-isolation-gate 2026-09-19 #3829 MCP transport-isolation gate (#3829): src/mcp binds no server socket and constructs no network client for its own stdio transport, except the allowlisted federation-forward src/mcp/tools/store/transport.rs; deliberately unrequired at introduction per the Conductor lockstep rule (a new c8-precheck job cannot report on release PRs until the #3769 promotion lands; check-required-contexts-live.sh refuses a declaration ahead of live protection, #3554 / #2712). The lockstep — live protection, then --pin-from-live, then the required-contexts-release.txt line "MCP transport-isolation gate (#3829)" — is ONE later Conductor commit that also removes this entry. The gate runs and hard-fails on every PR; only branch-protection enforcement is deferred.
+batman-mode-acceptance.yml rust-integration 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED. Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+batman-mode-acceptance.yml bash-integration 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED. Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+batman-mode-acceptance.yml surface-stability 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED. Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+bench.yml bench 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED. Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+bench.yml regenerate-baseline 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED. Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+clients-ci.yml python-shims 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED. Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+clients-ci.yml ts-shims 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED. Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+clients-ci.yml host-adapter-shims 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED. Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+clients-ci.yml sdk-python 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED. Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+clients-ci.yml sdk-typescript 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED. Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+codeql-rust.yml analyze 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED. Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+mobile-runtime.yml ios-simulator 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED. Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+mobile-runtime.yml android-emulator 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED. Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+token-budget.yml budget 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED (esp. token-budget and tool-count-drift). Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
+tool-count-drift.yml grep-gate 2026-10-04 #5331 entered rule (f) scope when scope became trigger-derived; deliberately unrequired at entry. Proposed REQUIRED (esp. token-budget and tool-count-drift). Promotion is the operator-sequenced #3554 lockstep (live protection, --pin-from-live, mirror line, one Conductor commit that also removes this entry). The job runs on every pull request; only branch-protection ENFORCEMENT is deferred.
