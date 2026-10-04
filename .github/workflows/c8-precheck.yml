@@ -1356,3 +1356,34 @@ jobs:
         # green near-misses, allowlist form faults, and a mutation of every
         # allowlist entry of both templates; round-3 probes (#4784, #4793-#4795).
         run: python3 scripts/check-cloud-init-serve-flags.py --self-test
+
+  exec-secret-argv-gate:
+    # #4869 - executable files (shell scripts, workflow run steps, compose
+    # command/healthcheck, Dockerfile RUN/CMD, systemd Exec lines, Makefile
+    # recipes) as a closed-world allowlist gate, the cloud-init gate form
+    # (precedent 19497ef6, fail-closed allowlist gate).
+    #   - Every logical line that names a secret-like thing (assignment, flag,
+    #     expansion, bare word, header, secret path) or that the imported
+    #     check-docs-no-argv-secrets rules flag must match an entry of
+    #     scripts/qc-allowlists/exec-secret-argv-allow.txt, keyed by file, line
+    #     text and count, never by line number. An unknown line is red.
+    #   - Lines unsafe today sit in exec-secret-argv-pending.txt, each with its
+    #     issue: listed, never approved; a stale entry is red.
+    #   - Prose (markdown fences, html pre blocks) is a denylist mode with no
+    #     allowlist.
+    # Known limit: a secret read into a neutrally named variable is not caught.
+    name: Exec-file credentials-on-argv gate (#4869)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run exec-file credentials-on-argv gate
+        run: python3 scripts/check-exec-secret-argv.py
+      - name: Self-test the gate (regression evidence)
+        # Red probes for each form of #4813-#4819, #4826, #4827, #4808, #4859,
+        # header variables and arrays, invented tools no rule knows; green
+        # probes; a mutation of every allow and pending entry on its own line;
+        # the regen refusal cases.
+        run: python3 scripts/check-exec-secret-argv.py --self-test
+      - name: Allowlist is what regen would write (idempotent, no stale entry)
+        run: python3 scripts/regen-exec-secret-argv-allow.py --check

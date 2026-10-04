@@ -1,0 +1,943 @@
+#!/usr/bin/env python3
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+"""Closed-world gate against secrets on a process argv, for executable files.
+
+Decision: precedent 19497ef6, fail-closed allowlist gate. scripts/check-docs-no-argv-secrets.py
+is a denylist of known ways to put a credential on a command line, and every review round
+finds a form it misses. The cloud-init gate (scripts/check-cloud-init-serve-flags.py) is
+closed-world: every triggered line must match an allowlist entry, and it has held against
+every bypass in four review rounds. This gate gives executable files the same form.
+
+Mode 1, executable files (closed world). Files read: .sh and .bash files and shebang scripts
+without a suffix; workflow ``run:`` steps (.github/workflows, .github/actions); compose
+``command`` / ``entrypoint`` / healthcheck ``test`` (any ``*compose*.yml``); Dockerfile and
+Dockerfile.* RUN / CMD / ENTRYPOINT / HEALTHCHECK; ``.service`` Exec lines; Makefile
+recipes. Cloud-init ``.tpl`` files stay under the cloud-init gate. A logical line is a
+physical line with backslash continuations joined; a bash array that spans lines is one
+logical unit. A full-line comment is not executable and is skipped.
+
+A logical line is TRIGGERED when a secret-like name appears in it as an assignment
+(``NAME=``), a flag (``--NAME``), an expansion (``$NAME``, ``${NAME``, ``${{ secrets.X }}``),
+a header (``Authorization:``, ``x-api-key:``, ``Bearer``), or a secret path (``/run/secrets``,
+``api-key``, ``.pw``, ``_PW_FILE``), or when the imported denylist rules of
+check-docs-no-argv-secrets.py flag it. The trigger is NOT limited to argument position: a
+header variable such as ``keyhdr="-H 'x-api-key: $API_KEY'"`` that is expanded into an ssh or
+curl argv later is triggered where it is built. Secret-like names are matched on identifier
+segments (``DB_KEY``, ``DBPW``, ``PGPASSWORD``, ``apiKey``, ``PASSPHRASE``, ``AUTH``), so
+``passed`` and ``author`` are not secret names.
+
+Every triggered line must match an entry of scripts/qc-allowlists/exec-secret-argv-allow.txt,
+keyed by file, normalised logical line text (whitespace runs collapsed) and occurrence
+count, never by line number:   <why> | <file> | <count> | <line>
+An unknown line is red; an entry whose line or count no longer matches is stale and red.
+Lines that are unsafe today are listed in scripts/qc-allowlists/exec-secret-argv-pending.txt
+(same form, <why> is ``#<issue>`` or, for a product form whose issue is not yet filed,
+``reason: <text>``); the gate prints them and passes, as the cloud-init gate does for its
+pending entries. A pending line is never approved and its entry must go when the defect is fixed.
+
+Mode 2, prose (denylist). Markdown code fences and html ``<pre>`` blocks are read with the
+imported denylist rules (shell-like rules the denylist script applies to scripts only, such
+as a postgres URL with a password on a psql, pg_dump or migrate argv), plus a rule for
+``curl -H`` / ``--header`` carrying a key or Authorization header and ``curl -u user:value``,
+``openssl ... -hmac``, a container ``-e SECRET_NAME=$expansion`` and a secret-named flag with
+an inline value. Prose has no allowlist: a hit is red unless it is listed in the pending file.
+
+Known limits (stated, not hidden):
+  * A secret read into a NEUTRALLY NAMED variable (``v=$(cat k); tool --opt "$v"``) is not
+    caught by a name trigger, and neither is a literal secret on an unknown tool with no
+    secret-like word near it. The literal forms of #4813-#4819 are caught by the imported
+    denylist rules; a neutral name on an unknown tool is the residual risk.
+  * Arguments assembled at run time, ``eval`` and files written by one script and executed by
+    another are read as text only. Cloud-init templates are the cloud-init gate's.
+  * Threat model: honest drift. An author who hides a secret AND edits this gate or its
+    allowlist is caught by review of the allowlist diff, which regen-exec-secret-argv-allow.py
+    makes visible (additions need --accept-new and are printed).
+
+Usage:
+  scripts/check-exec-secret-argv.py             exit 0 clean, 1 on a hit, 2 on a scanner fault
+  scripts/check-exec-secret-argv.py --self-test red probes, green probes, allow-entry mutations
+  scripts/check-exec-secret-argv.py --list      print every triggered line (for review)
+"""
+import argparse
+import contextlib
+import importlib.util
+import io
+import os
+import re
+import subprocess
+import sys
+from collections import Counter, OrderedDict
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+ROOT = Path(__file__).resolve().parent.parent
+DENYLIST = "scripts/check-docs-no-argv-secrets.py"
+ALLOW_FILE = "scripts/qc-allowlists/exec-secret-argv-allow.txt"
+PENDING_FILE = "scripts/qc-allowlists/exec-secret-argv-pending.txt"
+MAX_BYTES = 4 * 1024 * 1024
+SELF_EXEMPT = {"scripts/check-exec-secret-argv.py", "scripts/regen-exec-secret-argv-allow.py"}
+
+# (first physical line, last physical line, raw text) of one logical unit.
+Unit = Tuple[int, int, str]
+# One found line: (first physical line, normalised text, reasons).
+Found = Tuple[int, str, List[str]]
+# One list entry: (why, file, count, text, line number in the list file).
+Entry = Tuple[str, str, int, str, int]
+
+
+def norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+# ---------------------------------------------------------------- denylist import
+def load_denylist(root: Path):
+    spec = importlib.util.spec_from_file_location("argv_denylist", str(root / DENYLIST))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load " + DENYLIST)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    for need in ("scan_text", "split_words", "commands", "redact", "logical_lines"):
+        if not hasattr(mod, need):
+            raise RuntimeError("%s no longer exports %s" % (DENYLIST, need))
+    return mod
+
+
+# ---------------------------------------------------------------- secret names
+SEGMENT_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
+STRONG = ("password", "passwd", "passphrase", "secret", "token", "credential", "bearer", "apikey")
+EXACT_SEGMENTS = {"pass", "pw", "pwd", "dbpw", "pgpass", "auth", "oauth", "key", "keys", "cred", "creds"}
+SUFFIXES = ("key", "pass", "pw", "pwd", "auth")
+
+
+DSN_QUALIFIERS = {"store", "database", "db", "pg", "postgres", "postgresql", "redis", "conn", "connection",
+                  "mysql", "mongo", "amqp"}
+NOUN_SEGMENTS = {"dir", "dirs", "directory", "id", "ids", "name", "names", "count", "len", "length",
+                 "size", "type", "pub", "public", "label", "user", "users", "hash", "num", "max", "min"}
+
+
+def secret_name(name: str) -> bool:
+    """True when an identifier or flag name has a secret-like segment. A name whose last
+    segment is a plain noun that cannot hold a secret (KEY_DIR, KEY_ID, TOKEN_COUNT) is not."""
+    segs = SEGMENT_RE.findall(name)
+    if segs and segs[-1].lower() in NOUN_SEGMENTS and len(segs) > 1:
+        return False
+    low = [x.lower() for x in segs]
+    for i, s in enumerate(low):
+        # a connection string can embed a password (#4808): DSN, or a URL/URI of a data store
+        if s == "dsn" or (s in ("url", "uri") and i > 0 and low[i - 1] in DSN_QUALIFIERS):
+            return True
+    for seg in segs:
+        s = seg.lower()
+        if s.startswith("pub"):
+            return False
+        if s in EXACT_SEGMENTS or any(w in s for w in STRONG):
+            return True
+        if len(s) > 3 and (s.endswith(SUFFIXES) or s.startswith("key")):
+            return True
+    return False
+
+
+EXPAND_RE = re.compile(r"\$\{?[!#]?\{?\s*(?:secrets\.|env\.|vars\.)?([A-Za-z_][A-Za-z0-9_]*)")
+ASSIGN_RE = re.compile(r"(?<![\w$.\-])([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?\+?=")
+BARE_RE = re.compile(r"(?<![\w$.\-/{])([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*)(?![\w=\-/}])")
+FLAG_RE = re.compile(r"(?<![\w$./\-])--?([A-Za-z][A-Za-z0-9_\-]*)")
+HEADER_RE = re.compile(
+    r"\bauthorization\s*:|\bbearer\b|\bx-auth[\w-]*\s*:|\bproxy-authorization|\bapi[-_]?key\b|"
+    r"\bpassword\s+['\"$\\]|\bidentified\s+by\b|\$\{\{\s*(?:secrets\.|github\.token)", re.I)
+PATH_RE = re.compile(
+    r"/run/secrets|/secrets?/|\.(?:pw|pass|passwd|password|passphrase|token|secret|secrets)\b|"
+    r"_pw_?file|\bpw[-_]?file|(?:passw\w*|passphrase|secret|token|credential)[-_.]?(?:file|path)\b", re.I)
+
+
+def trigger_reasons(text: str) -> List[str]:
+    """Why a logical line is triggered (secret-like name as assignment, flag, expansion,
+    header or secret path). Empty when it is not."""
+    out: List[str] = []
+    for m in ASSIGN_RE.finditer(text):
+        if secret_name(m.group(1)):
+            out.append("assign:" + m.group(1))
+    for m in FLAG_RE.finditer(text):
+        if secret_name(m.group(1)):
+            out.append("flag:" + m.group(1))
+    for m in EXPAND_RE.finditer(text):
+        if secret_name(m.group(1)):
+            out.append("expand:" + m.group(1))
+    for m in BARE_RE.finditer(text):
+        if m.group(1) not in ("PASS", "AUTH", "KEY", "KEYS") and secret_name(m.group(1)):
+            out.append("word:" + m.group(1))
+    if HEADER_RE.search(text):
+        out.append("header")
+    if PATH_RE.search(text):
+        out.append("path")
+    return out
+
+
+# ---------------------------------------------------------------- logical units
+def _backslash_end(raw: str) -> bool:
+    s = raw.rstrip()
+    return s.endswith("\\") and not s.endswith("\\\\")
+
+
+_QUOTED_RE = re.compile(r"""'[^']*'|"(?:\\.|[^"\\])*\"""")
+_ARRAY_RE = re.compile(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=\(")
+
+
+def _array_depth(s: str) -> int:
+    t = _QUOTED_RE.sub("", re.sub(r"\\.", "", s))
+    t = re.split(r"(?:^|\s)#", t, 1)[0]
+    if not _ARRAY_RE.search(t):
+        return 0
+    return t.count("(") - t.count(")")
+
+
+def join_logical(lines: List[Tuple[int, str]]) -> List[Unit]:
+    """Join backslash continuations and a bash array spread over lines into one unit."""
+    out: List[Unit] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        start, raw = lines[i]
+        buf = [raw.rstrip()[:-1] if _backslash_end(raw) else raw]
+        end = start
+        while _backslash_end(lines[i][1]) and i + 1 < n:
+            i += 1
+            end = lines[i][0]
+            raw2 = lines[i][1]
+            buf.append(raw2.rstrip()[:-1] if _backslash_end(raw2) else raw2)
+        depth = _array_depth(" ".join(buf))
+        guard = 0
+        while depth > 0 and i + 1 < n and guard < 400:
+            guard += 1
+            i += 1
+            end = lines[i][0]
+            raw2 = lines[i][1]
+            buf.append(raw2.rstrip()[:-1] if _backslash_end(raw2) else raw2)
+            depth = _array_depth(" ".join(buf))
+        out.append((start, end, " ".join(buf)))
+        i += 1
+    return out
+
+
+def _numbered(text: str) -> List[Tuple[int, str]]:
+    return list(enumerate(text.split("\n"), 1))
+
+
+def _indent(s: str) -> int:
+    return len(s) - len(s.lstrip())
+
+
+def workflow_units(text: str) -> List[Unit]:
+    lines = text.split("\n")
+    out: List[Unit] = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^(\s*)(?:-\s+)?run:\s*(.*)$", lines[i])
+        if not m:
+            i += 1
+            continue
+        ind = len(m.group(1))
+        rest = m.group(2).strip()
+        if rest and rest[0] not in "|>":
+            out.extend(join_logical([(i + 1, rest)]))
+            i += 1
+            continue
+        j = i + 1
+        block: List[Tuple[int, str]] = []
+        while j < len(lines) and (not lines[j].strip() or _indent(lines[j]) > ind):
+            block.append((j + 1, lines[j]))
+            j += 1
+        out.extend(join_logical(block))
+        i = j
+    return out
+
+
+def compose_units(text: str) -> List[Unit]:
+    lines = text.split("\n")
+    out: List[Unit] = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^(\s*)(?:-\s+)?(command|entrypoint|test):\s*(.*)$", lines[i])
+        if not m:
+            i += 1
+            continue
+        ind = len(m.group(1))
+        block: List[Tuple[int, str]] = []
+        if m.group(3).strip() and m.group(3).strip() not in ("|", ">", "|-", ">-"):
+            block.append((i + 1, m.group(3)))
+        j = i + 1
+        while j < len(lines) and (not lines[j].strip() or _indent(lines[j]) > ind):
+            block.append((j + 1, lines[j]))
+            j += 1
+        out.extend(join_logical(block))
+        i = j
+    return out
+
+
+def dockerfile_units(text: str) -> List[Unit]:
+    out: List[Unit] = []
+    for start, end, t in join_logical(_numbered(text)):
+        m = re.match(r"\s*(RUN|CMD|ENTRYPOINT|HEALTHCHECK)\b(.*)$", t, re.I | re.S)
+        if m:
+            out.append((start, end, m.group(2)))
+    return out
+
+
+def service_units(text: str) -> List[Unit]:
+    return [u for u in join_logical(_numbered(text)) if re.match(r"\s*Exec\w*=", u[2])]
+
+
+def make_units(text: str) -> List[Unit]:
+    return [u for u in join_logical(_numbered(text)) if u[2].startswith("\t")]
+
+
+def file_class(rel: str, head: str) -> Optional[str]:
+    base = os.path.basename(rel)
+    low = base.lower()
+    if low.startswith(("dockerfile", "containerfile")) or low.endswith(".dockerfile"):
+        return "dockerfile"
+    if "compose" in low and low.endswith((".yml", ".yaml")):
+        return "compose"
+    if rel.startswith((".github/workflows/", ".github/actions/")) and low.endswith((".yml", ".yaml")):
+        return "workflow"
+    ext = os.path.splitext(base)[1].lower()
+    if ext in (".sh", ".bash"):
+        return "shell"
+    if ext == ".service":
+        return "service"
+    if base in ("Makefile", "GNUmakefile", "makefile") or ext == ".mk":
+        return "make"
+    if ext == "" and head.startswith("#!") and re.search(r"\b(?:ba|da|z|k)?sh\b", head.split("\n", 1)[0]):
+        return "shell"
+    return None
+
+
+UNITS = {
+    "shell": lambda t: join_logical(_numbered(t)),
+    "workflow": workflow_units,
+    "compose": compose_units,
+    "dockerfile": dockerfile_units,
+    "service": service_units,
+    "make": make_units,
+}
+
+
+def exec_units(rel: str, text: str) -> Optional[List[Unit]]:
+    cls = file_class(rel, text[:200])
+    if cls is None:
+        return None
+    units = UNITS[cls](text)
+    return [u for u in units if u[2].strip() and not u[2].strip().startswith("#")]
+
+
+# ---------------------------------------------------------------- mode 1 scan
+def as_shell_name(rel: str) -> str:
+    return rel if rel.lower().endswith((".sh", ".bash", ".yml", ".yaml", ".service")) else rel + ".sh"
+
+
+def deny_lines(dl, rel: str, text: str) -> Dict[int, str]:
+    """Physical start line -> the denylist's hit snippet, for one file's text."""
+    out: Dict[int, str] = {}
+    if rel in SELF_EXEMPT:
+        return out
+    for _rel, line, snippet in dl.scan_text(as_shell_name(rel), text):
+        out.setdefault(line, snippet)
+    return out
+
+
+def scan_exec_file(dl, rel: str, text: str) -> Optional[List[Found]]:
+    """Triggered logical lines of one executable file, or None when it is not one."""
+    if rel in SELF_EXEMPT:
+        return None
+    units = exec_units(rel, text)
+    if units is None:
+        return None
+    deny = deny_lines(dl, rel, text)
+    found: List[Found] = []
+    for start, end, raw in units:
+        reasons = trigger_reasons(raw)
+        flagged = [deny[k] for k in range(start, end + 1) if k in deny]
+        if flagged:
+            reasons.append("denylist")
+        if reasons:
+            found.append((start, norm(raw), reasons))
+    return found
+
+
+# ---------------------------------------------------------------- mode 2 scan
+FENCE_LANGS = {"", "bash", "sh", "shell", "console", "zsh", "shell-session", "sh-session", "terminal",
+               "dockerfile", "docker", "yaml", "yml", "ini", "systemd", "text", "bash-session", "ps1",
+               "powershell", "cmd", "make", "makefile"}
+SECRET_HEADER_RE = re.compile(
+    r"^\s*(?:(?:x-)?api[-_]?key|authorization|proxy-authorization|x-auth[\w-]*|[\w-]*(?:token|secret)[\w-]*)\s*:", re.I)
+PATHISH_RE = re.compile(r"^(?:/|\./|\.\./|~|\$\{?\w*(?:DIR|PATH|HOME|FILE)\b)|\.(?:pem|key|crt|cert|p12|pub|json|txt|env|pw)$")
+LOCATOR_FLAG_RE = re.compile(r"(?:file|path|dir|stdin|id|env)$", re.I)
+
+
+def md_blocks(text: str) -> List[Unit]:
+    out: List[Unit] = []
+    lines = text.split("\n")
+    in_f, fence, lang, buf = False, "", "", []  # type: bool, str, str, List[Tuple[int, str]]
+    for n, raw in enumerate(lines, 1):
+        m = re.match(r"^\s*(`{3,}|~{3,})\s*([\w+-]*)", raw)
+        if not in_f and m:
+            in_f, fence, lang, buf = True, m.group(1)[:3], m.group(2).lower(), []
+            continue
+        if in_f and raw.strip().startswith(fence):
+            if lang in FENCE_LANGS:
+                out.extend(join_logical(buf))
+            in_f = False
+            continue
+        if in_f:
+            buf.append((n, raw))
+    return out
+
+
+def html_blocks(text: str) -> List[Unit]:
+    import html as _html
+    out: List[Unit] = []
+    in_p, buf = False, []  # type: bool, List[Tuple[int, str]]
+    for n, raw in enumerate(text.split("\n"), 1):
+        r = raw
+        if not in_p and "<pre" in r:
+            in_p, buf = True, []
+            r = re.sub(r".*?<pre[^>]*>", "", r, count=1)
+        if in_p:
+            end = "</pre>" in r
+            body = _html.unescape(re.sub(r"<[^>]+>", "", r.split("</pre>")[0]))
+            buf.append((n, body))
+            if end:
+                out.extend(join_logical(buf))
+                in_p = False
+    return out
+
+
+def prose_units(rel: str, text: str) -> Optional[List[Unit]]:
+    low = rel.lower()
+    if low.endswith(".md"):
+        units = md_blocks(text)
+    elif low.endswith((".html", ".htm")):
+        units = html_blocks(text)
+    else:
+        return None
+    return [(a, b, re.sub(r"^\s*(?:\$|#|>)\s+", "", t)) for a, b, t in units
+            if t.strip() and not t.strip().startswith("#")]
+
+
+def _flatten(cmd: List[str], dl, depth: int = 0) -> Iterable[List[str]]:
+    yield cmd
+    if depth < 3:
+        for w in cmd[1:]:
+            if any(c.isspace() for c in w):
+                for inner in dl.commands(dl.split_words(w)):
+                    for sub in _flatten(inner, dl, depth + 1):
+                        yield sub
+
+
+def prose_rule_hits(dl, line: str) -> List[str]:
+    """Rules beyond the imported denylist, applied to one prose logical line."""
+    reasons: List[str] = []
+    for top in dl.commands(dl.split_words(line)):
+        for cmd in _flatten(top, dl):
+            words = [w for w in cmd]
+            while words and re.match(r"^[A-Za-z_]\w*=", words[0]):
+                words = words[1:]
+            if not words:
+                continue
+            head = os.path.basename(words[0])
+            rest = words[1:]
+            if head == "curl":
+                for k, w in enumerate(rest):
+                    val = None
+                    if w in ("-H", "--header") and k + 1 < len(rest):
+                        val = rest[k + 1]
+                    elif w.startswith("--header="):
+                        val = w[len("--header="):]
+                    elif w.startswith("-H") and len(w) > 2:
+                        val = w[2:]
+                    if val is not None and not val.startswith("@") and SECRET_HEADER_RE.match(val):
+                        reasons.append("curl-secret-header")
+                    uval = None
+                    if w in ("-u", "--user") and k + 1 < len(rest):
+                        uval = rest[k + 1]
+                    elif w.startswith("--user="):
+                        uval = w[len("--user="):]
+                    if uval is not None and ":" in uval and uval.split(":", 1)[1].strip():
+                        reasons.append("curl-user-password")
+            if head == "openssl":
+                for k, w in enumerate(rest):
+                    if w == "-hmac" and k + 1 < len(rest) and not rest[k + 1].startswith("@"):
+                        reasons.append("openssl-hmac-key")
+            for k, w in enumerate(rest):
+                m = re.match(r"^(?:-e|--env)(?:=|$)(.*)$", w)
+                if head in ("docker", "podman", "nerdctl") and m:
+                    val = m.group(1) or (rest[k + 1] if k + 1 < len(rest) else "")
+                    nm, eq, v = val.partition("=")
+                    if eq and secret_name(nm) and "$" in v:
+                        reasons.append("container-env-secret-expansion")
+                fm = re.match(r"^--([A-Za-z][\w-]*)(?:=(.*))?$", w)
+                if fm and secret_name(fm.group(1)) and not LOCATOR_FLAG_RE.search(fm.group(1)) \
+                        and not re.search(r"(?:^|-)(?:tokens|budget|key|tls)(?:-|$)", fm.group(1)):
+                    v = fm.group(2) if fm.group(2) is not None else (rest[k + 1] if k + 1 < len(rest) else "")
+                    if v and not v.startswith("-") and not v.isdigit() and not PATHISH_RE.search(v):
+                        reasons.append("secret-flag-inline-value")
+    return reasons
+
+
+def scan_prose_file(dl, rel: str, text: str) -> Optional[List[Found]]:
+    units = prose_units(rel, text)
+    if units is None or rel in SELF_EXEMPT:
+        return None
+    found: List[Found] = []
+    for start, end, raw in units:
+        reasons = prose_rule_hits(dl, raw)
+        if dl.scan_text("fence.sh", raw):
+            reasons.append("denylist")
+        if reasons:
+            found.append((start, norm(raw), sorted(set(reasons))))
+    return found
+
+
+# ---------------------------------------------------------------- list files
+WHY_RE = re.compile(r"^(?:#\d+|reason: \S[^|]*)$")
+PEND_WHY_RE = re.compile(r"^(?:#\d+|reason: \S[^|]*)$")
+
+
+def parse_entries(text: str, label: str, pending: bool, faults: List[str]) -> List[Entry]:
+    out: List[Entry] = []
+    seen = set()
+    for no, raw in enumerate(text.split("\n"), 1):
+        if not raw.strip() or (raw.startswith("#") and not re.match(r"#\d+ \| ", raw)):
+            continue
+        parts = raw.split(" | ", 3)
+        if len(parts) != 4:
+            faults.append("%s:%d: malformed entry (want '<why> | <file> | <count> | <line>')" % (label, no))
+            continue
+        why, rel, cnt, line = parts
+        if not (PEND_WHY_RE if pending else WHY_RE).match(why):
+            faults.append("%s:%d: bad why %r (want %s)" % (label, no, why[:40],
+                          "#<issue> or 'reason: <text>'"))
+            continue
+        if not cnt.isdigit() or int(cnt) < 1:
+            faults.append("%s:%d: count %r is not a positive integer" % (label, no, cnt))
+            continue
+        if line != norm(line) or not line:
+            faults.append("%s:%d: line is not whitespace-normalised" % (label, no))
+            continue
+        if (rel, line) in seen:
+            faults.append("%s:%d: duplicate entry for %s" % (label, no, rel))
+            continue
+        seen.add((rel, line))
+        out.append((why, rel, int(cnt), line, no))
+    return out
+
+
+# ---------------------------------------------------------------- judge
+def judge(found: Dict[str, List[Found]], allow: List[Entry], pending: List[Entry], dl,
+          only: Optional[Iterable[str]] = None) -> Tuple[List[str], List[str], Dict[str, int]]:
+    """Compare found lines with the lists. Returns (hits, pending report, stats).
+    ``only`` limits the stale check to those files (used by the self-test)."""
+    hits: List[str] = []
+    report: List[str] = []
+    scope = set(only) if only is not None else None
+    allow_map = {(e[1], e[3]): e for e in allow}
+    pend_map = {(e[1], e[3]): e for e in pending}
+    for key in set(allow_map) & set(pend_map):
+        hits.append("%s: line is both allowed and pending: %s" % (key[0], key[1][:100]))
+    stats = {"triggered": 0, "pending": 0}
+    keys = set()
+    for rel, lines in sorted(found.items()):
+        prose = rel.lower().endswith((".md", ".html", ".htm"))
+        by_text: "OrderedDict[str, List[Found]]" = OrderedDict()
+        for ln in lines:
+            by_text.setdefault(ln[1], []).append(ln)
+        for text, occ in by_text.items():
+            key = (rel, text)
+            keys.add(key)
+            stats["triggered"] += len(occ)
+            a = allow_map.get(key)
+            p = pend_map.get(key)
+            if prose and a is not None:
+                hits.append("%s: prose line cannot be allowed, only pending: %s" % (rel, text[:100]))
+            have = (a[2] if a and not prose else 0) + (p[2] if p else 0)
+            if len(occ) > have:
+                for ln in occ[have:]:
+                    hits.append("%s:%d: %s: %s | %s" % (
+                        rel, ln[0],
+                        "prose line puts a credential on an argv and is not pending" if prose
+                        else "line not in the allowlist",
+                        ",".join(ln[2][:3]), dl.redact(text)[:160]))
+            elif len(occ) < have:
+                pass  # reported as stale below
+            if p:
+                stats["pending"] += min(len(occ), p[2])
+                for ln in occ[:p[2]]:
+                    report.append("PENDING %s %s:%d" % (p[0], rel, ln[0]))
+    for key, e in list(allow_map.items()) + list(pend_map.items()):
+        rel, text = key
+        if scope is not None and rel not in scope:
+            continue
+        occ = len(by_key(found, rel, text))
+        a = allow_map.get(key)
+        p = pend_map.get(key)
+        prose = rel.lower().endswith((".md", ".html", ".htm"))
+        have = (a[2] if a and not prose else 0) + (p[2] if p else 0)
+        if occ < have:
+            hits.append("%s:%d: stale %s entry (file has %d of %d): %s" % (
+                "pending" if e in pending else "allow", e[4], "pending" if e in pending else "allow",
+                occ, have, text[:80]))
+    return hits, sorted(set(report), key=report.index), stats
+
+
+def by_key(found: Dict[str, List[Found]], rel: str, text: str) -> List[Found]:
+    return [ln for ln in found.get(rel, []) if ln[1] == text]
+
+
+# ---------------------------------------------------------------- repo walk
+def tracked_files(root: Path) -> List[str]:
+    out = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], check=True, capture_output=True).stdout
+    files = [f for f in out.decode("utf-8", "replace").split("\0") if f]
+    if not files:
+        raise RuntimeError("git ls-files returned no files; refusing to pass on an empty scan")
+    return files
+
+
+def scan_repo(root: Path, dl) -> Tuple[Dict[str, List[Found]], int, int]:
+    """(found lines by file, exec files scanned, prose files scanned)."""
+    found: Dict[str, List[Found]] = {}
+    n_exec = n_prose = 0
+    for rel in tracked_files(root):
+        p = root / rel
+        low = rel.lower()
+        if not p.is_file() or p.is_symlink():
+            continue
+        try:
+            if p.stat().st_size > MAX_BYTES:
+                continue
+            text = p.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if low.endswith((".md", ".html", ".htm")):
+            res = scan_prose_file(dl, rel, text)
+            if res is not None:
+                n_prose += 1
+        else:
+            res = scan_exec_file(dl, rel, text)
+            if res is not None:
+                n_exec += 1
+        if res:
+            found[rel] = res
+    return found, n_exec, n_prose
+
+
+def load_lists(root: Path) -> Tuple[List[Entry], List[Entry], List[str]]:
+    faults: List[str] = []
+    allow = parse_entries((root / ALLOW_FILE).read_text(encoding="utf-8"), "allow", False, faults)
+    pend = parse_entries((root / PENDING_FILE).read_text(encoding="utf-8"), "pending", True, faults)
+    return allow, pend, faults
+
+
+def check_allow_vs_denylist(found: Dict[str, List[Found]], allow: List[Entry]) -> List[str]:
+    """An allow entry may not approve a line the imported denylist rules flag."""
+    bad = []
+    flagged = {(rel, ln[1]) for rel, lines in found.items() for ln in lines if "denylist" in ln[2]}
+    for e in allow:
+        if (e[1], e[3]) in flagged:
+            bad.append("allow:%d: entry approves a line the denylist rules flag: %s" % (e[4], e[3][:80]))
+    return bad
+
+
+def run(root: Path) -> int:
+    try:
+        dl = load_denylist(root)
+        found, n_exec, n_prose = scan_repo(root, dl)
+        allow, pend, faults = load_lists(root)
+    except (OSError, RuntimeError, subprocess.CalledProcessError, UnicodeDecodeError, SyntaxError) as exc:
+        print("FAULT: %s" % exc, file=sys.stderr)
+        return 2
+    if n_exec == 0:
+        faults.append("scanned 0 executable files (fail closed)")
+    if not allow:
+        faults.append("allowlist is empty (fail closed)")
+    if not any(not r.lower().endswith((".md", ".html", ".htm")) for r in found):
+        faults.append("zero triggered lines (fail closed)")
+    if faults:
+        print("\n".join("FAULT: " + f for f in faults), file=sys.stderr)
+        return 2
+    hits, report, stats = judge(found, allow, pend, dl)
+    hits.extend(check_allow_vs_denylist(found, allow))
+    for line in report:
+        print(line)
+    if hits:
+        for h in hits:
+            print("HIT " + h, file=sys.stderr)
+        print("FAIL: check-exec-secret-argv: %d defect(s). An unknown triggered line is red: review it, then "
+              "fix it or add it with scripts/regen-exec-secret-argv-allow.py --accept-new --why <#issue|reason>"
+              % len(hits), file=sys.stderr)
+        return 1
+    n_allow_lines = sum(e[2] for e in allow)
+    print("PASS: check-exec-secret-argv: %d executable files and %d prose files scanned, %d triggered lines "
+          "(%d allow entries covering %d lines, %d pending entries covering %d lines, listed not approved)"
+          % (n_exec, n_prose, sum(len(v) for v in found.values()), len(allow), n_allow_lines,
+             len(pend), stats["pending"]))
+    return 0
+
+
+# ---------------------------------------------------------------- self-test
+def probe_files() -> List[Tuple[str, str, str]]:
+    """(label, file name, text) red probes: each is a line with a secret on an argv (or in a
+    header variable that is expanded into one). No tool-specific rule is needed for the
+    unknown-tool probes: they are red because the line is triggered and not allowed."""
+    P = "ProbeValue1"
+    sh = "#!/bin/bash\n%s\n"
+    rows = [
+        # #4813-#4819 and #4859: variable and literal forms
+        ("4813 curl -u variable", "p.sh", 'curl -u "admin:$API_PW" https://h/x'),
+        ("4813 curl -u literal", "p.sh", "curl -u admin:%s https://h/x" % P),
+        ("4814 mysql -p variable", "p.sh", 'mysql -u root -p"$DB_PASSWORD" db'),
+        ("4814 mysql -p literal", "p.sh", "mysql -u root -p%s db" % P),
+        ("4814 mysql --password= literal", "p.sh", "mysqldump --password=%s db" % P),
+        ("4815 sshpass -p variable", "p.sh", 'sshpass -p "$SSH_PASS" ssh h true'),
+        ("4815 sshpass -p literal", "p.sh", "sshpass -p %s ssh h true" % P),
+        ("4816 redis-cli -a variable", "p.sh", 'redis-cli -a "$REDIS_PASS" ping'),
+        ("4816 redis-cli -a literal", "p.sh", "redis-cli -a %s ping" % P),
+        ("4817 psql -v pw variable", "p.sh", "psql -v pw=\"$PW\" -c 'select 1'"),
+        ("4817 psql -v pw literal", "p.sh", "psql -v pw=%s -c 'select 1'" % P),
+        ("4818 curl Authorization variable", "p.sh", 'curl -H "Authorization: Bearer $TOKEN" https://h'),
+        ("4818 curl Authorization literal", "p.sh", "curl -H 'Authorization: Bearer %s' https://h" % P),
+        ("4819 docker login -p variable", "p.sh", 'docker login -u u -p "$REG_TOKEN" reg.example'),
+        ("4819 docker login -p literal", "p.sh", "docker login -u u -p %s reg.example" % P),
+        ("4859 psql path form", "p.sh", '/usr/bin/psql --variable=pw="$PW" -c "select 1"'),
+        ("4859 psql joined -vpw", "p.sh", 'x=$(psql -vpw="$PW" -c "select 1")'),
+        ("4859 psql --set", "p.sh", 'psql --set pw="$PW" -c "select 1"'),
+        # #4826 names
+        ("4826 DB_KEY via systemd-run", "p.sh", 'systemd-run --setenv=AI_MEMORY_DB_KEY="$K" /bin/true'),
+        ("4826 PASSPHRASE via sudo env", "p.sh", 'sudo env PASSPHRASE="$X" /bin/true'),
+        ("4826 AUTH via kubectl", "p.sh", 'kubectl exec pod -- env AUTH="$X" /bin/true'),
+        ("4826 DBPW via timeout", "p.sh", 'timeout 5 env DBPW="$X" /bin/true'),
+        # #4827
+        ("4827 docker build --build-arg", "p.sh", 'docker build --build-arg DB_PASSWORD="$P" .'),
+        # #4808
+        ("4808 dollar-quoted PASSWORD", "p.sh", 'psql -c "ALTER ROLE r PASSWORD $$$PW$$"'),
+        ("4808 docker -e DSN name", "p.sh", 'docker run -e AI_MEMORY_STORE_URL="$U" img'),
+        ("4808 ssh remote env DSN", "p.sh", 'ssh h "AI_MEMORY_STORE_URL=$U /bin/true"'),
+        ("4808 non-pw variable name", "p.sh", 'docker run -e DB_SECRET="$S" img'),
+        # header variable that is expanded into a curl or ssh argv later
+        ("header variable built from a key", "p.sh", "keyhdr=\"-H 'x-api-key: $API_KEY'\""),
+        ("header array", "p.sh", 'KEY_HDR=(-H "X-API-Key: $EFFECTIVE_KEY")'),
+        ("header array spread over lines", "p.sh", 'HDRS=(\n  -H "X-Agent: a"\n  -H "X-API-Key: $K"\n)'),
+        ("printf of a key header into a script", "p.sh", "printf 'curl -H \"x-api-key: %s\"\\n' \"$KEY\" > run.sh"),
+        ("ssh_node with curl -H key inline", "p.sh", 'ssh_node "$ip" "curl -fsS -H \'x-api-key: $api_key\' https://h"'),
+        ("backslash continuation", "p.sh", 'curl -sS \\\n  --max-time 5 \\\n  -H "X-API-Key: $KEY" \\\n  https://h'),
+        # three invented tools no rule knows
+        ("invented tool zorbctl", "p.sh", 'zorbctl sync --auth-secret "$VAL" --to h'),
+        ("invented tool frobnicate", "p.sh", 'frobnicate login --token="$T"'),
+        ("invented tool quuxd", "p.sh", "quuxd -H 'x-api-key: $K' --url https://h"),
+        # file classes
+        ("workflow run", ".github/workflows/p.yml",
+         "jobs:\n  a:\n    steps:\n      - run: |\n          zorbctl --opt ${{ secrets.DEPLOY_TOKEN }}\n"),
+        ("workflow inline run", ".github/workflows/p.yml",
+         "jobs:\n  a:\n    steps:\n      - run: zorbctl --opt ${{ secrets.DEPLOY_TOKEN }}\n"),
+        ("compose healthcheck", "docker-compose.yml",
+         "services:\n  a:\n    healthcheck:\n      test: [\"CMD-SHELL\", \"curl -H 'X-API-Key: $$K' http://x\"]\n"),
+        ("compose command list item", "docker-compose.yml",
+         "services:\n  a:\n    command:\n      - serve\n      - --api-key\n      - $K\n"),
+        ("dockerfile RUN", "Dockerfile", "FROM x\nRUN zorbctl --pw \"$PW\"\n"),
+        ("dockerfile.variant CMD", "Dockerfile.p", "FROM x\nCMD [\"zorbctl\", \"--token\", \"abc\"]\n"),
+        ("service ExecStart", "p.service", "[Service]\nExecStart=/usr/bin/zorbctl --api-key abc\n"),
+        ("makefile recipe", "Makefile", "all:\n\tzorbctl --token $(TOKEN)\n"),
+        ("suffix-less shebang script", "bin/tool", "#!/bin/sh\nzorbctl --token \"$TOKEN\"\n"),
+    ]
+    out = []
+    for label, name, body in rows:
+        text = body if name.endswith((".yml", ".yaml", ".service", "Makefile", "Dockerfile", "Dockerfile.p")) \
+            or name.startswith("Dockerfile") else sh % body
+        out.append((label, name, text))
+    return out
+
+
+def green_probes() -> List[Tuple[str, str, str]]:
+    """Lines that are not triggered: no secret-like name and no denylist hit."""
+    return [
+        ("file flag", "g.sh", "#!/bin/bash\nmysql --defaults-extra-file=/run/x.cnf db\n"),
+        ("sshpass file", "g.sh", '#!/bin/bash\nsshpass -f "$PWF" ssh h true\n'),
+        ("curl netrc", "g.sh", '#!/bin/bash\ncurl --netrc-file "$NETRC" https://h\n'),
+        ("passed and author are not secret names", "g.sh", '#!/bin/bash\necho "$passed of $total by $author"\n'),
+        ("comment line", "g.sh", '#!/bin/bash\n# curl -H "x-api-key: $KEY"\necho ok\n'),
+        ("a plain compose command", "docker-compose.yml", "services:\n  a:\n    command: [\"serve\", \"--port\", \"1\"]\n"),
+        ("not an executable file", "notes.txt", 'curl -H "x-api-key: $KEY" https://h\n'),
+        ("cloud-init template stays with its own gate", "t.yaml.tpl", 'curl -H "x-api-key: $KEY" https://h\n'),
+    ]
+
+
+# Safe forms that mention a secret name: triggered, then approved by an allow entry.
+ALLOWED_FORMS = [
+    ("stdin form", 'docker login -u u --password-stdin reg.example < "$TOKEN_FILE"'),
+    ("password file flag", 'tool --password-file /run/secrets/pw'),
+    ("env prefix read by the child", 'MYSQL_PWD="$PW" mysql -u root db'),
+    ("exported variable read by the child", 'export REDISCLI_AUTH="$A"'),
+    ("-e NAME with no value", 'docker run -e PGPASSWORD img'),
+]
+
+
+def _scan_one(dl, name: str, text: str) -> List[Found]:
+    res = scan_exec_file(dl, name, text)
+    return res or []
+
+
+def _mutate(text: str, start: int, end: int) -> str:
+    phys = text.split("\n")
+    last = phys[end - 1]
+    cut = last.rfind("</pre")  # an html block closes on its last line; mark the text, not the tag
+    phys[end - 1] = (last[:cut] + " #m" + last[cut:]) if cut >= 0 else last + " #m"
+    return "\n".join(phys)
+
+
+def self_test(root: Path) -> int:
+    dl = load_denylist(root)
+    bad: List[str] = []
+    red = green = 0
+    for label, name, text in probe_files():
+        found = {name: _scan_one(dl, name, text)}
+        hits, _, _ = judge(found, [], [], dl)
+        red += 1
+        if not hits:
+            bad.append("red probe stayed green: " + label)
+    for label, name, text in green_probes():
+        found = {name: _scan_one(dl, name, text)}
+        hits, _, _ = judge(found, [], [], dl)
+        green += 1
+        if hits:
+            bad.append("green probe went red: %s: %s" % (label, hits[0][:100]))
+    allowed = 0
+    for label, line in ALLOWED_FORMS:
+        text = "#!/bin/bash\n%s\n" % line
+        found = {"a.sh": _scan_one(dl, "a.sh", text)}
+        if not found["a.sh"]:
+            bad.append("allowed-form probe is not triggered: " + label)
+            continue
+        entries = [("reason: probe", "a.sh", 1, norm(line), 1)]
+        hits, _, _ = judge(found, entries, [], dl)
+        allowed += 1
+        if hits:
+            bad.append("allowed form went red: %s: %s" % (label, hits[0][:100]))
+        # the same entry must go red when the line changes, grows or disappears
+        for kind, newtext in (("changed", text.replace(line, line + " #m")),
+                              ("duplicated", text + line + "\n"), ("removed", "#!/bin/bash\n")):
+            f2 = {"a.sh": _scan_one(dl, "a.sh", newtext)}
+            h2, _, _ = judge(f2, entries, [], dl)
+            if not h2:
+                bad.append("allow entry stayed green when the line was %s: %s" % (kind, label))
+    # a pending entry passes, and goes stale when the line is gone
+    pl = 'zorbctl --auth-secret "$VAL"'
+    ptext = "#!/bin/bash\n%s\n" % pl
+    pfound = {"p.sh": _scan_one(dl, "p.sh", ptext)}
+    pent = [("#1", "p.sh", 1, norm(pl), 1)]
+    h, rep, _ = judge(pfound, [], pent, dl)
+    if h or not rep:
+        bad.append("pending entry did not pass and report")
+    h, _, _ = judge({"p.sh": []}, [], pent, dl)
+    if not h:
+        bad.append("stale pending entry stayed green")
+    # list-file form faults
+    for label, body, pend in (
+            ("malformed", "reason: r | a.sh | 1", False), ("bad why", "ok | a.sh | 1 | x", False),
+            ("zero count", "reason: r | a.sh | 0 | x", False), ("not normalised", "reason: r | a.sh | 1 | x  y", False),
+            ("pending with bad why", "baseline | a.sh | 1 | x", True),
+            ("duplicate", "reason: r | a.sh | 1 | x\nreason: r | a.sh | 1 | x", False)):
+        faults: List[str] = []
+        parse_entries(body, "t", pend, faults)
+        if not faults:
+            bad.append("list-file fault not raised: " + label)
+    # every real allow and pending entry, mutated on its OWN line, must be red
+    allow, pend, lfaults = load_lists(root)
+    if lfaults:
+        bad.extend(lfaults)
+    cache: Dict[str, str] = {}
+    mut_ok = mut_n = 0
+    for kind, entries in (("allow", allow), ("pending", pend)):
+        for e in entries:
+            rel = e[1]
+            if rel not in cache:
+                cache[rel] = (root / rel).read_text(encoding="utf-8")
+            text = cache[rel]
+            prose = rel.lower().endswith((".md", ".html", ".htm"))
+            res = scan_prose_file(dl, rel, text) if prose else scan_exec_file(dl, rel, text)
+            hit = next((ln for ln in (res or []) if ln[1] == e[3]), None)
+            mut_n += 1
+            if hit is None:
+                bad.append("%s entry matches nothing: %s" % (kind, e[3][:80]))
+                continue
+            units = prose_units(rel, text) if prose else exec_units(rel, text)
+            unit = next((u for u in (units or []) if u[0] == hit[0]), None)
+            if unit is None:
+                bad.append("%s entry has no unit: %s" % (kind, e[3][:80]))
+                continue
+            mtext = _mutate(text, unit[0], unit[1])
+            res2 = scan_prose_file(dl, rel, mtext) if prose else scan_exec_file(dl, rel, mtext)
+            mine_a = [x for x in allow if x[1] == rel]
+            mine_p = [x for x in pend if x[1] == rel]
+            hits, _, _ = judge({rel: res2 or []}, mine_a, mine_p, dl, only=[rel])
+            if hits:
+                mut_ok += 1
+            else:
+                bad.append("%s entry mutation stayed green: %s" % (kind, e[3][:80]))
+    # a mistyped argument exits 2
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            build_parser().parse_args(["--bogus"])
+            bad.append("a mistyped argument was accepted")
+        except SystemExit as exc:
+            if exc.code != 2:
+                bad.append("a mistyped argument exited %r, not 2" % exc.code)
+    # regen refusal cases
+    regen_bad, regen_n = regen_cases(root)
+    bad.extend(regen_bad)
+    if bad:
+        print("\n".join("SELF-TEST FAIL: " + b for b in bad), file=sys.stderr)
+        return 1
+    print("SELF-TEST PASS: %d red probes flagged, %d green probes clean, %d allowed forms approved and "
+          "red when changed, %d of %d allow and pending entry mutations red, %d regen refusal cases, "
+          "mistyped argument exits 2" % (red, green, allowed, mut_ok, mut_n, regen_n))
+    return 0
+
+
+def regen_cases(root: Path) -> Tuple[List[str], int]:
+    spec = importlib.util.spec_from_file_location("regen_exec", str(root / "scripts/regen-exec-secret-argv-allow.py"))
+    if spec is None or spec.loader is None:
+        return ["cannot load the regen script"], 0
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod.refusal_cases(root), mod.REFUSAL_CASE_COUNT
+
+
+# ---------------------------------------------------------------- cli
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="Closed-world gate against secrets on a process argv (executable files).")
+    ap.add_argument("--self-test", action="store_true", help="red probes, green probes, allow-entry mutations")
+    ap.add_argument("--list", action="store_true", help="print every triggered line, then exit")
+    ap.add_argument("--root", default=str(ROOT), help="repository root (default: this checkout)")
+    return ap
+
+
+def main(argv: List[str]) -> int:
+    args = build_parser().parse_args(argv[1:])
+    root = Path(args.root)
+    try:
+        if args.self_test:
+            return self_test(root)
+        if args.list:
+            dl = load_denylist(root)
+            found, _, _ = scan_repo(root, dl)
+            for rel, lines in sorted(found.items()):
+                for start, text, reasons in lines:
+                    print("%s:%d [%s] %s" % (rel, start, ",".join(reasons[:3]), dl.redact(text)))
+            return 0
+        return run(root)
+    except (OSError, RuntimeError, subprocess.CalledProcessError, UnicodeDecodeError, SyntaxError) as exc:
+        print("FAULT: %s" % exc, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
