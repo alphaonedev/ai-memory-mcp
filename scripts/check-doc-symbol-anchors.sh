@@ -387,6 +387,10 @@ MDEOF
         '[src/mcp/tools/recall.rs:2](https://github.com/o/r/blob/cafe1234/src/mcp/tools/recall.rs#L2)'
     bare_red "a bare anchor whose URL has /blob/<hex>/ only in a query string" \
         "[src/mcp/tools/recall.rs:2](https://example.com/x?u=/blob/${pin40}/src/mcp/tools/recall.rs#L2)"
+    bare_red "a 40-hex permalink on a host other than github.com" \
+        "[src/mcp/tools/recall.rs:2](https://example.com/o/r/blob/${pin40}/src/mcp/tools/recall.rs#L2)"
+    bare_red "a pinned permalink with trailing text after the #L line" \
+        "[src/mcp/tools/recall.rs:2](https://github.com/o/r/blob/${pin40}/src/mcp/tools/recall.rs#L2x)"
     bare_red "a pinned permalink whose label names a different line" \
         "[src/mcp/tools/recall.rs:2](https://github.com/o/r/blob/${pin40}/src/mcp/tools/recall.rs#L3)"
     bare_red "a pinned permalink whose label names a different file" \
