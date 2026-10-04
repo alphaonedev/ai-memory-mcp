@@ -208,7 +208,7 @@ pub fn run_auto_export(
     config: &AutoExportConfig,
 ) -> anyhow::Result<()> {
     let conn = db::open(db_path)?;
-    let policy = db::resolve_governance_policy(&conn, namespace).unwrap_or_default();
+    let policy = db::resolve_governance_policy(&conn, namespace)?.unwrap_or_default();
     if !policy.effective_auto_export_reflections_to_filesystem() {
         // Defence-in-depth: the MCP handler also checks the policy
         // before installing the hook, but the substrate refuses to

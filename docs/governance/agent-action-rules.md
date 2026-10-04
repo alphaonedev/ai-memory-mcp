@@ -47,16 +47,17 @@ Capabilities v3 stamps:
 The four enumerated wire-points (`src/governance/agent_action.rs`
 module docs):
 
-| Wire-point                          | AgentAction variant   | File:line                                   |
+| Wire-point                          | AgentAction variant   | File / symbol                               |
 |-------------------------------------|-----------------------|---------------------------------------------|
-| Skill manifest emission             | `FilesystemWrite`     | `src/mcp/tools/skill_export.rs:162,209`     |
-| Federation peer POST                | `NetworkRequest`      | `src/federation/sync.rs:66`                 |
-| Hooks subprocess spawn              | `ProcessSpawn`        | `src/hooks/executor.rs:399,783`             |
-| LLM (Ollama / OpenAI) HTTP          | `NetworkRequest`      | `src/llm.rs:421`                            |
+| Skill manifest emission             | `FilesystemWrite`     | [`handle_skill_export_in_root`](../../src/mcp/tools/skill_export.rs) (two sites: `SKILL.md` and each resource file) |
+| Federation peer POST                | `NetworkRequest`      | [`build_governed_peer_post`](../../src/federation/sync.rs) |
+| Hooks subprocess spawn              | `ProcessSpawn`        | [`fire_inner`](../../src/hooks/executor.rs) (exec hooks) and [`spawn_one`](../../src/hooks/executor.rs) (daemon hooks) |
+| LLM (Ollama / OpenAI) HTTP          | `NetworkRequest`      | [`check_outbound`](../../src/llm.rs) |
 
-Each wire-point calls `crate::governance::wire_check::check(&action)`
+Each wire-point calls a `crate::governance::wire_check` entry point
+(`check`, `check_governed` or `check_anyhow`, depending on the site)
 before issuing the syscall. The daemon `bootstrap_serve` installs ONE
-shared closure into the process-wide `GOVERNANCE_PRE_ACTION` OnceLock
+shared closure into the process-wide [`GOVERNANCE_PRE_ACTION`](../../src/governance/wire_check.rs) OnceLock
 that consults `check_agent_action_no_audit` against the live
 `governance_rules` table.
 

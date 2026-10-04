@@ -195,19 +195,21 @@ and names **this** section as the rationale for not carrying the tier-A
 **What is uncovered.** Post-#3917 every Prometheus collector in the
 file is constructed AND registered through one of five module-level
 helpers — `int_counter`, `int_gauge`, `int_counter_vec`,
-`int_gauge_vec`, `histogram_vec`
-(`src/metrics.rs::{int_counter, int_gauge, int_counter_vec, int_gauge_vec, histogram_vec}`).
-Each helper carries exactly one construction `Err` arm (its
-`Err(e) => unreachable!(..)` match arm) plus one `registry.register`
-failure branch (the `err.get_or_insert(e)` slot write). Those arms are the whole residue —
+`int_gauge_vec`, `histogram_vec` (all in `src/metrics.rs`, between the
+`registry` accessor and `Metrics::new_or_panic`). Each
+helper carries exactly one construction `Err` arm
+(the `Err(e) => unreachable!(...)` arm of each helper) plus one
+`registry.register` failure branch. Those arms are the whole residue —
 the `Ok` path of every helper is covered by the unit suite, which
 builds the registry on every run.
 
 **Why the arms are structurally unreachable in production.** Stated at
-the call site in the `COVERAGE:` note directly above `src/metrics.rs::try_new`:
+the call site in the `COVERAGE:` note above `Metrics::try_new` in
+`src/metrics.rs`:
 
 1. `Metrics::try_new` builds a fresh `Registry::new()` per call
-   (`src/metrics.rs::try_new`), so there is no shared registry state.
+   (`Metrics::try_new` in `src/metrics.rs`), so there is no shared registry
+   state.
    Registration can only fail on a duplicate metric name, and every
    name registered here is unique.
 2. Every metric and label name is a compile-time string literal that
@@ -228,11 +230,11 @@ carries a `?` at all: the helpers thread a single `err` slot that
 **Ship-gate compensation**:
 
 - `Metrics::try_new` is exercised on every unit-test run through the
-  process-wide `OnceLock` handle (`src/metrics.rs::registry`), so a real
+  process-wide `OnceLock` handle (`registry()` in `src/metrics.rs`), so a real
   duplicate-name or invalid-name regression trips the suite
   immediately. The uncovered lines are the *failure* arms, not the
   registration path they guard.
-- `new_or_panic` (`src/metrics.rs::new_or_panic`) converts any such failure into
+- `new_or_panic` (`Metrics::new_or_panic` in `src/metrics.rs`) converts any such failure into
   a startup panic, so the condition can never be reached silently in a
   running daemon.
 - The `/metrics` scrape surface is exercised end-to-end by the
@@ -430,9 +432,9 @@ live PG.
 The `schema-init` CLI verb dispatches on URL scheme. The SQLite branch is
 exercised end-to-end (init + enumerate + JSON / human render + idempotent
 re-run) by both lib unit tests and `tests/cli_schema_init.rs`. The
-Postgres branch (`src/cli/schema_init.rs::{init_and_enumerate_postgres, enumerate_postgres, bootstrap_memory_graph}`,
-plus the `--ignored` integration test body
-`src/cli/schema_init.rs::schema_init_postgres_embedding_dim_conversion`)
+Postgres branch (`init_and_enumerate_postgres`, `enumerate_postgres` and
+`bootstrap_memory_graph` in `src/cli/schema_init.rs`, plus the `--ignored`
+integration test body)
 sits behind `PostgresStore::connect_with_dim(url, dim).await?` which
 errors out immediately when no Postgres is reachable. Coverage of the
 post-connect lines requires a live Postgres + pgvector + (for AGE)
@@ -490,7 +492,7 @@ the database mid-test (rejected as too brittle).
   real sqlite daemon, taking the happy path through each defensive
   closure (which is never reached because the sqlite call succeeds).
 
-### v0.7-polish #767 — `memory_store` synthesis-gatekeeper + defensive-closure ceiling (Tier B — PARTIAL EXCEPTION)
+### v0.7-polish #767 — `src/mcp/tools/store/` synthesis-gatekeeper + defensive-closure ceiling (Tier B — PARTIAL EXCEPTION)
 
 This section records the #767 disposition, written when the module was
 the single file `mcp/tools/store.rs`. #881 PR-4 later split that file
@@ -501,6 +503,8 @@ Arms are cited by symbol in the current files; the old line numbers no
 longer exist.
 
 After the coverage-recovery pass (PR #795) lifted `mcp/tools/store.rs`
+(since split by #881 PR-4 into the `src/mcp/tools/store/` directory: `mod`,
+`synthesis`, `embed`, `legacy_classifier`, `transport`, `validation`)
 to 92.74%, a follow-up pass tried to close the remaining gap to the
 tier-B 96% floor. These lib/integration tests were landed:
 
@@ -517,7 +521,7 @@ Two pieces of test infrastructure were added to unblock the above:
 
 1. `embeddings::test_support::FailingEmbedder` — `Embed` trait impl that
    always returns `Err`, unblocking the `emb.embed(...)` failure-warn
-   arm in `src/mcp/tools/store/embed.rs::store_source_embedding`. The production `Embedder` only errors on
+   arm in `store_source_embedding` (`src/mcp/tools/store/embed.rs`). The production `Embedder` only errors on
    tokeniser/model-forward faults that don't happen against in-memory
    fixtures, and `MockEmbedder` is documented to never error.
 2. The Test 6 in `tests/governance_storage_insert_hook.rs` extends the
@@ -525,8 +529,8 @@ Two pieces of test infrastructure were added to unblock the above:
    keyed on a per-test `HookMode` mutex) to drive
    `mcp::tools::handle_store_for_tests` against a refusing substrate
    pre-write hook. This is the only path from unit-test scope that can
-   exercise the `GovernanceRefusal` downcast in
-   `src/mcp/tools/store/mod.rs::handle_store_inner`.
+   exercise the `GovernanceRefusal` downcast in `handle_store_inner`
+   (`src/mcp/tools/store/mod.rs`).
 
 The residual gap to the 96% floor is composed of synthesis-batch arms
 the LLM-response parser (`synthesis::parse_response`) gatekeeps out:
@@ -905,11 +909,9 @@ classes, confirmed by source inspection:
 1. **Fault-injection `Err(e) => tracing::error!(…); INTERNAL_SERVER_ERROR`
    500-arms.** Fire only when a healthy DB connection faults mid-statement
    — unreachable without a fault-injecting store proxy. Representative:
-   `src/handlers/admin.rs::quota_status_handler` (its `INTERNAL_SERVER_ERROR`
-   arms) and `src/handlers/admin.rs::export_memories` (its
-   `store_err_to_response` arms);
+   `quota_status_handler` and `export_memories` in `handlers/admin.rs`;
    `store/postgres.rs` — the hundreds of `to_store_err(...)` `.map_err`
-   sites (helper `src/store/postgres.rs::to_store_err`) wrap every sqlx call. ~5-10% of each handler.
+   sites (the `to_store_err` helper) wrap every sqlx call. ~5-10% of each handler.
 2. **Live-LLM call bodies.** CI runs pg+AGE but no LLM service. The no-LLM
    degradation arms (503 / deterministic fallback) ARE covered; the
    `Ok(Ok)/Ok(Err)/timeout` join arms need a live LLM. Representative:
@@ -920,12 +922,12 @@ classes, confirmed by source inspection:
    `Arc<Option<Embedder>>` (not `dyn Embed`); the `MockEmbedder` is
    `#[cfg(test)]`-only and uninjectable from an integration crate. The
    shipped-vector `update_embedding` arm in
-   `src/handlers/federation_signing_check.rs::sync_push_via_store` +
+   the `update_embedding` call in `handlers/federation_signing_check.rs` +
    `spawn_deferred_embedding_refresh_via_store` body need a real model
    download. The no-embedder fallback IS covered.
 4. **`#[allow(dead_code)]` not-yet-wired (#519).** `handlers/http.rs`
    `maybe_detect_conflicts` + `fetch_namespace_candidates`
-   (both `src/handlers/http.rs`) are staged for #519 and have no live call site / route —
+   are staged for #519 and have no live call site / route —
    uncoverable until wired (or deletable). Tracked under #519.
 5. **Long-lived SSE stream body.** `handlers/approvals.rs::approvals_sse`
    `ApprovalSseStream::poll_next` loop (lagged/serialize arms) can't be

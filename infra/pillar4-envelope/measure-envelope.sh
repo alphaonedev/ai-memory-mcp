@@ -60,7 +60,7 @@ DAEMON_PID=""
 cleanup() {
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
   docker compose -p "$PROJECT" -f "$POOL_COMPOSE" down -v >/dev/null 2>&1 || true
-  rm -f "../pgbouncer/.userlist.generated.txt"
+  rm -f "../pgbouncer/.userlist.generated.txt" "${STORE_URL_FILE:-}"
 }
 trap cleanup EXIT
 
@@ -86,8 +86,13 @@ POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" -f "$POOL_COMPOSE" up -d --
 # ── 3. schema-init + serve THROUGH the pooler ────────────────────────────
 echo "[3/5] schema-init + serve (admission cap=${ADMISSION_CAP}) through pgbouncer:6432 ..."
 "$BIN" schema-init --store-url "$POOLED_URL"
-AI_MEMORY_NO_CONFIG=1 AI_MEMORY_MAX_INFLIGHT_REQUESTS="$ADMISSION_CAP" \
-  "$BIN" serve --store-url "$POOLED_URL" --host "$DAEMON_HOST" --port "$DAEMON_PORT" \
+# #4577: serve reads the pooled DSN (it carries the db password) from a 0600 file
+# via AI_MEMORY_STORE_URL_FILE, not argv. schema-init above has no non-argv
+# channel (src/cli/schema_init.rs store_url is a required argv String, #4600).
+STORE_URL_FILE="$RESULTS_DIR/.store-url"
+( umask 077; printf '%s\n' "$POOLED_URL" >"$STORE_URL_FILE" )
+AI_MEMORY_STORE_URL_FILE="$STORE_URL_FILE" AI_MEMORY_NO_CONFIG=1 AI_MEMORY_MAX_INFLIGHT_REQUESTS="$ADMISSION_CAP" \
+  "$BIN" serve --host "$DAEMON_HOST" --port "$DAEMON_PORT" \
   >"$RESULTS_DIR/daemon.log" 2>&1 &
 DAEMON_PID=$!
 # Wait for readiness (/api/v1/health is admission-control EXEMPT — 4.A).

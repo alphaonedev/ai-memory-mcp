@@ -171,7 +171,7 @@ pub fn run_auto_persona(
     keypair: Option<&AgentKeypair>,
 ) -> anyhow::Result<()> {
     let conn = db::open(db_path)?;
-    let policy = db::resolve_governance_policy(&conn, namespace).unwrap_or_default();
+    let policy = db::resolve_governance_policy(&conn, namespace)?.unwrap_or_default();
     let Some(cadence) = policy.effective_auto_persona_trigger_every_n_memories() else {
         return Ok(());
     };

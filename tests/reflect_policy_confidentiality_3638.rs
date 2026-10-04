@@ -305,8 +305,9 @@ async fn issue_3638_postgres_tenant_cannot_read_private_depth_cap() {
     exercise_private_policy_3638(store, StorageBackend::Postgres, None).await;
 }
 
-#[tokio::test]
-async fn issue_3638_sqlite_pending_response_hides_private_threshold() {
+/// Seed a victim standard carrying `governance` at `victim/private` and let the
+/// attacker reflect into it over HTTP; returns the response.
+async fn attacker_reflects_into_victim(governance: serde_json::Value) -> (StatusCode, Value) {
     let file = NamedTempFile::new().expect("sqlite file");
     let store = Arc::new(ai_memory::store::sqlite::SqliteStore::open(file.path()).expect("sqlite"));
     let attacker = CallerContext::for_agent(ATTACKER);
@@ -314,7 +315,7 @@ async fn issue_3638_sqlite_pending_response_hides_private_threshold() {
     let source = memory(ATTACKER, "attacker/sources", "approval source");
     store.store(&attacker, &source).await.expect("source");
     let mut standard = memory(VICTIM, "victim/standards", "approval standard");
-    standard.metadata["governance"] = json!({"require_approval_above_depth": 0});
+    standard.metadata["governance"] = governance;
     store.store(&victim, &standard).await.expect("standard");
     store
         .set_namespace_standard(&victim, "victim/private", &standard.id, None)
@@ -322,12 +323,44 @@ async fn issue_3638_sqlite_pending_response_hides_private_threshold() {
         .expect("bind standard");
     assert!(store.get(&attacker, &standard.id).await.is_err());
     let (router, _file) = build_router(StorageBackend::Sqlite, Some(store), Some(file.path()));
-    let (status, response) = call(&router, req("POST", "/api/v1/memory_reflect", Some(ATTACKER), Some(&json!({
+    call(&router, req("POST", "/api/v1/memory_reflect", Some(ATTACKER), Some(&json!({
         "source_ids": [source.id], "title": "probe", "content": "probe", "namespace": "victim/private"
-    })))).await;
+    })))).await
+}
+
+/// A VALID policy (`write: any`) admits the attacker, so the request reaches
+/// the approval gate: pending, and the threshold is not echoed.
+#[tokio::test]
+async fn issue_3638_sqlite_pending_response_hides_private_threshold() {
+    let (status, response) =
+        attacker_reflects_into_victim(json!({"write": "any", "require_approval_above_depth": 0}))
+            .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["status"], "pending", "{response}");
     assert!(response["pending_id"].is_string(), "{response}");
+    assert!(
+        response.get("require_approval_above_depth").is_none(),
+        "{response}"
+    );
+}
+
+/// The original knob-only (untyped) victim standard, kept: a standard with no
+/// `write` is a CORRUPT level (#4285), so the Owner floor refuses the non-owner
+/// attacker before the approval gate (403). Fail closed either way: the
+/// reflection is NEVER applied (no `id`), and the threshold is not echoed. The
+/// pre-#4285 behaviour (pending) is still acceptable; applied is not.
+#[tokio::test]
+async fn issue_3638_sqlite_knob_only_standard_is_never_applied() {
+    let (status, response) =
+        attacker_reflects_into_victim(json!({"require_approval_above_depth": 0})).await;
+    assert!(
+        response.get("id").is_none(),
+        "#4285/N1: a knob-only standard must never let the reflect land: {status} {response}"
+    );
+    assert!(
+        status == StatusCode::FORBIDDEN || response["status"] == "pending",
+        "{status} {response}"
+    );
     assert!(
         response.get("require_approval_above_depth").is_none(),
         "{response}"

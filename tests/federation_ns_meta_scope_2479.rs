@@ -87,14 +87,24 @@ const IN_SCOPE_NS: &str = "public/ok";
 /// `ai:evil` may act inside the `public/**` tree only.
 /// Tree pattern (not `public/*`) so in-scope `namespace_meta` controls still
 /// pass the #2536 descendant-coverage probe on `public/ok`.
-const SCOPED_ALLOWLIST: &str =
-    r#"{"ai:evil":{"allowed_namespaces":["public/**"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
+///
+/// #4495 — the peer is also allowlisted to act for the seeded standards'
+/// owner (`ai:victim`), exactly as `SCOPED_ALLOWLIST_WITH_VICTIM`, so the
+/// rebind exploit passes the owner gate and is refused by SCOPE alone: the
+/// exploit and its control differ only in scope (mutation-verified: with the
+/// #2479 scope check removed the exploit cell goes red).
+const SCOPED_ALLOWLIST: &str = r#"{"ai:evil":{"allowed_namespaces":["public/**"],"allowed_sender_agent_ids":["ai:evil","ai:victim"]}}"#;
 
 /// The CONTROL posture: the same peer, scoped to reach the victim namespace tree.
 /// #2536 requires tree coverage (`/**`) — a single-level `secure/*` matches
 /// `secure/ops` but not its descendants, so it may not set/clear hierarchical
 /// governance on that node.
-const SCOPED_ALLOWLIST_WITH_VICTIM: &str = r#"{"ai:evil":{"allowed_namespaces":["public/*","secure/**"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
+///
+/// #4495 — a federated REBIND now needs the current owner (#3758 parity), so
+/// the control's peer is also allowlisted to act for the victim's owner
+/// (`ai:victim` authored both seeded standards); the exploit cell's
+/// `SCOPED_ALLOWLIST` differs from this only in scope, as before.
+const SCOPED_ALLOWLIST_WITH_VICTIM: &str = r#"{"ai:evil":{"allowed_namespaces":["public/*","secure/**"],"allowed_sender_agent_ids":["ai:evil","ai:victim"]}}"#;
 
 /// Root-namespace posture for the parent cell: the peer owns `alpha` but NOT the
 /// namespace it tries to attach as `alpha`'s inheritance parent.
@@ -309,7 +319,9 @@ async fn resolved_write_level(
     namespace: &str,
 ) -> Option<ai_memory::models::GovernanceLevel> {
     let guard = db.lock().await;
-    ai_memory::db::resolve_governance_policy(&guard.0, namespace).map(|p| p.core.write)
+    ai_memory::db::resolve_governance_policy(&guard.0, namespace)
+        .expect("#4043: governance policy read")
+        .map(|p| p.core.write)
 }
 
 async fn memory_exists(db: &ai_memory::handlers::Db, id: &str) -> bool {
@@ -730,7 +742,9 @@ async fn no_allowlist_namespace_meta_posture_matrix_3582() {
         (true, Some("1"), true),
     ] {
         let allowlist = scoped.then_some(
-            r#"{"ai:evil":{"allowed_namespaces":["**"],"allowed_sender_agent_ids":["ai:evil"]}}"#,
+            // #4495: also allowlisted for the seeded standards' owner, since a
+            // federated rebind needs the current owner (#3758 parity).
+            r#"{"ai:evil":{"allowed_namespaces":["**"],"allowed_sender_agent_ids":["ai:evil","ai:victim"]}}"#,
         );
         set_posture(allowlist, require);
         let (router, db) = build_router_with_db();

@@ -344,6 +344,7 @@ the AGE projection prime, and the cutover dance.
    ai-memory schema-init \
      --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
    ```
+   `schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
    Opening the store walks the postgres ladder up to schema v57
    idempotently, preserving data.
 5. **Verify schema parity:**

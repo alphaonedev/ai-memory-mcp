@@ -102,6 +102,8 @@
 #   scripts/check-cert-removal-proof.sh                 # all controls
 #   scripts/check-cert-removal-proof.sh <control-name>  # one control
 #   scripts/check-cert-removal-proof.sh --list          # print the control map
+#   scripts/check-cert-removal-proof.sh --print-header       # what this run would certify (#4503)
+#   scripts/check-cert-removal-proof.sh --self-test-header  # cheap: the header is correct (#4503)
 #   scripts/check-cert-removal-proof.sh --self-test     # prove the mutation
 #                                                        # shapes rewrite source
 #                                                        # as intended, that an
@@ -916,17 +918,64 @@ preflight_no_stale_mutation() {
   exit 4
 }
 
+# ─── #4503 — the proof must say WHAT IT PROVED ──────────────────────────────
+# This harness printed control rows and `overall: PASS` and nothing else: no sha,
+# no branch, no worktree, no start time, no pre-run tree state. A §7 artefact that
+# cannot say which tree it ran on can be cited for ANY tree, and one was: the
+# 09:30Z run on 4d301e051 sat at .local-runs/cert-alone-b6.out, 15/15 with
+# CERT_EXIT=0, and satisfied a landing of 385da3a05 until the consumer grew a
+# tip check. f2h's wrapper had been printing this header for its own runs, which
+# is the right content one level too high — whoever runs the proof differently
+# gets nothing. So the harness prints it itself, first line and again before the
+# verdict, and `--print-header` exposes it for a consumer to read.
+#
+# `dirty` is measured HERE, before any mutation. It is the field a wrapper cannot
+# honestly supply: this harness rewrites controls in place, so a run that STARTED
+# dirty cannot attribute a RED to its own mutation.
+CERT_PROOF_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cert_proof_header() {
+  local tip branch dirty controls
+  tip="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+  branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo detached)"
+  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then dirty=1; else dirty=0; fi
+  controls=${#MAP[@]}
+  echo "CERT-PROOF: tip=$tip short=${tip:0:9} branch=$branch worktree=$REPO_ROOT dirty=$dirty controls=$controls started=$CERT_PROOF_STARTED"
+}
+
+case "${1:-}" in
+  --print-header) cert_proof_header; exit 0 ;;
+esac
+
 case "${1:-}" in
   --force-restore) force_restore ;;
 esac
 
 preflight_no_stale_mutation
 
+header_self_test() {
+  local ok=0 line tip
+  line="$(cert_proof_header)"
+  tip="$(git rev-parse HEAD)"
+  _c() { if [[ "$2" == "$3" ]]; then echo "  [HDR-ok] $1"; else echo "  [HDR-FAIL] $1: got '$2' want '$3'"; ok=1; fi; }
+  [[ "$line" == CERT-PROOF:\ tip=* ]] && echo "  [HDR-ok] the header is the first field of its own line" || { echo "  [HDR-FAIL] header shape: $line"; ok=1; }
+  _c "tip names git rev-parse HEAD" "$(sed -n 's/.*tip=\([0-9a-f]*\).*/\1/p' <<<"$line")" "$tip"
+  _c "short is the first 9 of tip"  "$(sed -n 's/.*short=\([0-9a-f]*\).*/\1/p' <<<"$line")" "${tip:0:9}"
+  _c "controls counts the MAP"      "$(sed -n 's/.*controls=\([0-9]*\).*/\1/p' <<<"$line")" "${#MAP[@]}"
+  local want_dirty=0; [[ -n "$(git status --porcelain)" ]] && want_dirty=1
+  _c "dirty reflects the tree"      "$(sed -n 's/.*dirty=\([01]\).*/\1/p' <<<"$line")" "$want_dirty"
+  _c "worktree names this repo"     "$(sed -n 's/.*worktree=\([^ ]*\).*/\1/p' <<<"$line")" "$REPO_ROOT"
+  [[ "$(cert_proof_header)" == "$line" ]] && echo "  [HDR-ok] the header is stable within a run (started= does not drift)" || { echo "  [HDR-FAIL] header not stable within a run"; ok=1; }
+  if [[ $ok -eq 0 ]]; then echo "header self-test: PASS (#4503)"; else echo "header self-test: FAIL (#4503)"; fi
+  return $ok
+}
+
 case "${1:-}" in
-  --list)      list_map;   exit 0 ;;
-  --self-test) self_test;  exit $? ;;
+  --list)             list_map;         exit 0 ;;
+  --self-test-header) header_self_test; exit $? ;;
+  --self-test)        header_self_test || exit $?; self_test;  exit $? ;;
 esac
 
+cert_proof_header
 sel="${1:-ALL}"
 overall=0
 for row in "${MAP[@]}"; do
@@ -944,5 +993,6 @@ for row in "${MAP[@]}"; do
 done
 
 echo
+cert_proof_header
 if [[ $overall -eq 0 ]]; then echo "overall: PASS — every checked control proven load-bearing (§5.4.5)"; else echo "overall: CERT-RED — a control failed the removal proof (§5.4.5)"; fi
 exit $overall

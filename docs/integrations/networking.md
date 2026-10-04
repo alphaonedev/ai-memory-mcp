@@ -26,8 +26,9 @@ like an `ai-memory` regression rather than a routing-table issue.
 
 Typical operator-visible failure modes:
 
-- `ai-memory serve --store-url postgres://user:pass@192.168.50.1/db`
-  fails to start with a connect error before the daemon binds its
+- `ai-memory serve` with `AI_MEMORY_STORE_URL_FILE` naming a `0600` file that holds
+  `postgres://user:pass@192.168.50.1/db` (keep the password off the `--store-url` argv,
+  #4577) fails to start with a connect error before the daemon binds its
   HTTP listener.
 - `psql -h 192.168.50.1 -U <user> <db>` from a Homebrew install fails
   with `could not connect to server: No route to host`.

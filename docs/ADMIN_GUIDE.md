@@ -361,7 +361,7 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `AI_MEMORY_MAX_STORAGE_BYTES` | `104857600` (100 MiB) | **[#1156 follow-up, v0.7.x]** Per-**(agent, namespace)** storage-byte quota seeded into fresh `agent_quotas` rows **(SQLite; the pg DDL divergence is #3209)**. Same ladder as above (`[limits].max_storage_bytes`). |
 | `AI_MEMORY_MAX_LINKS_PER_DAY` | `5000` | **[#1156 follow-up, v0.7.x]** Per-**(agent, namespace)** daily link-write quota seeded into fresh `agent_quotas` rows **(SQLite; the pg DDL divergence is #3209)**. Same ladder as above (`[limits].max_links_per_day`). |
 | `AI_MEMORY_MAX_PAGE_SIZE` | `1000` | **[#1156 follow-up, v0.7.x]** Cap on list / bulk-write / federation-sync page size — bounds per-request in-memory materialization (OOM guard). Precedence: env > `[limits].max_page_size` > compiled `MAX_BULK_SIZE`. Non-positive / unparseable falls through. |
-| `AI_MEMORY_MAX_INFLIGHT_REQUESTS` | unset ⇒ CPU-scaled | **[#1733 Pillar-4 4.A; TRI-STATE since #2032 M3]** Global HTTP admission-control concurrency cap. `0` **disables** it (the layer is not composed at all). When UNSET the daemon computes a CPU-scaled default — `cores × 64`, clamped to a floor of **256** and a ceiling of **4096** (`resolve_default_max_inflight_requests`, `src/config.rs:4368-4375`; constants `MAX_INFLIGHT_PER_CORE`/`MAX_INFLIGHT_FLOOR`/`MAX_INFLIGHT_CEILING` at `src/config.rs:4347,4352,4356`) — it is NOT "unset = disabled". Precedence: env > `[limits].max_inflight_requests` > CPU-scaled default (`src/config.rs:4326` for the env name, `:8938-8942` for the ladder). |
+| `AI_MEMORY_MAX_INFLIGHT_REQUESTS` | unset ⇒ CPU-scaled | **[#1733 Pillar-4 4.A; TRI-STATE since #2032 M3]** Global HTTP admission-control concurrency cap. `0` **disables** it (the layer is not composed at all). When UNSET the daemon computes a CPU-scaled default — `cores × 64`, clamped to a floor of **256** and a ceiling of **4096** ([`resolve_default_max_inflight_requests`](../src/config.rs); constants [`MAX_INFLIGHT_PER_CORE`](../src/config.rs) / [`MAX_INFLIGHT_FLOOR`](../src/config.rs) / [`MAX_INFLIGHT_CEILING`](../src/config.rs)) — it is NOT "unset = disabled". Precedence: env > `[limits].max_inflight_requests` > CPU-scaled default ([`ENV_MAX_INFLIGHT_REQUESTS`](../src/config.rs) names the env var; the ladder is resolved in [`resolve_limits`](../src/config.rs)). |
 | `RUST_LOG` | (none) | Logging filter (e.g., `ai_memory=info,tower_http=debug`) |
 | `AI_MEMORY_NO_CONFIG` | (none) | Set to a truthy value (`1`/`true`/`yes`/`on`, trimmed, case-insensitive) to skip config file loading (useful for testing). **[#3167]** Any other value — including an empty `AI_MEMORY_NO_CONFIG=` and `=0` — means "do NOT skip": the config file IS loaded and a one-shot WARN is printed to stderr. Before #3167 mere PRESENCE of the variable disabled the whole config file. **[#3603]** With a truthy value the config-path WARNs (legacy `~/.config` root, shadowed or Library-only macOS config) are not printed either, since no config is read. |
 
@@ -390,7 +390,7 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `llm_model` | String | Backend-dependent | `"gemma3:4b"` (Ollama default), `"grok-4.3"` (xai), `"gpt-5"` (openai), `"claude-opus-4.7"` (anthropic), `"qwen-max"`, … | **[LEGACY]** LLM model tag. Canonical v2: `[llm].model`. Default resolution lives in `src/config.rs::backend_default_model`. |
 | `cross_encoder` | **Bool** | `false` (`true` for autonomous tier) | `true`, `false` | **[LEGACY]** Enable neural cross-encoder reranking. Canonical v2: `[reranker].enabled`. |
 | `default_namespace` | String | `"global"` | Any valid namespace (max 512 chars; `/` hierarchy delimiter allowed; no spaces/nulls) | **[LEGACY]** Default namespace applied to new memories. Canonical v2: `[storage].default_namespace`. |
-| `max_memory_mb` | Integer | Tier-dependent | Any positive integer | **[LEGACY — PARSED BUT NOT ENFORCED (FBL-13)]** It has **no runtime consumer**: it does not cap memory or storage and is NOT an auto-tier-selection input on any live path. `resolve_storage` emits a one-shot WARN when it is set (`src/config.rs:145-149`). For an actual storage ceiling use `[limits].max_storage_bytes` / `AI_MEMORY_MAX_STORAGE_BYTES`. |
+| `max_memory_mb` | Integer | Tier-dependent | Any positive integer | **[LEGACY — PARSED BUT NOT ENFORCED (FBL-13)]** It has **no runtime consumer**: it does not cap memory or storage and is NOT an auto-tier-selection input on any live path. [`resolve_storage`](../src/config.rs) emits a one-shot WARN when it is set ([`warn_max_memory_mb_inert_once`](../src/config.rs)). For an actual storage ceiling use `[limits].max_storage_bytes` / `AI_MEMORY_MAX_STORAGE_BYTES` ([`ENV_MAX_STORAGE_BYTES`](../src/config.rs)). |
 | `archive_on_gc` | Bool | `true` | `true`, `false` | **[LEGACY]** Archive expired memories on GC. Canonical v2: `[storage].archive_on_gc`. |
 | `[ttl]` | Section | -- | -- | Per-tier TTL overrides (all sub-fields are integers in seconds) |
 | `ttl.short_ttl_secs` | Integer | `21600` (6 hours) | `0` = never expires, or positive integer | TTL for short-tier memories in seconds |
@@ -633,8 +633,8 @@ These are set in the source code and require recompilation to change:
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `DEFAULT_PORT` | 9077 | `src/daemon_runtime.rs:97` |
-| `GC_INTERVAL_SECS` | 1800 (30 min) | `src/daemon_runtime.rs:98` |
+| `DEFAULT_PORT` | 9077 | [`DEFAULT_PORT`](../src/daemon_runtime.rs) |
+| `GC_INTERVAL_SECS` | 1800 (30 min) | [`GC_INTERVAL_SECS`](../src/daemon_runtime.rs) |
 | `MAX_CONTENT_SIZE` | 65536 (64 KB) | `models.rs` |
 | `PROMOTION_THRESHOLD` | 5 (historical; no production reader since v1.0.0 Boids item 1 — access never promotes, only `memory_promote` raises a tier; kept for a regression test) | `models.rs` |
 | `SHORT_TTL_EXTEND_SECS` | 3600 (1 hour) | `models.rs` |
@@ -2355,7 +2355,9 @@ Preview using the same database and key directory as your deployment:
 
 ```bash
 ai-memory --db /path/to/memory.db keys --key-dir /path/to/keys prune --dry-run
-ai-memory keys --store-url "$AI_MEMORY_STORE_URL" --key-dir /path/to/keys prune --dry-run
+# store URL from AI_MEMORY_STORE_URL_FILE / AI_MEMORY_STORE_URL (src/cli/keys.rs:490); do not
+# copy it onto the command line, where its password is visible in ps (#4577)
+ai-memory keys --key-dir /path/to/keys prune --dry-run
 ```
 
 Omitting both flags also performs a dry run. After reviewing the candidate names,
