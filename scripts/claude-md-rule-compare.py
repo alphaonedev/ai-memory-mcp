@@ -33,7 +33,17 @@ Usage (the comparison refuses to run without -I):
       --scratch DIR [--summary FILE]
   python3 -I scripts/claude-md-rule-compare.py --self-test
 """
-import argparse
+import sys
+
+if __name__ == "__main__" and not sys.flags.isolated:
+    # R6 (#5163): checked before any other import. Without -I the script directory heads sys.path, so a
+    # file there named like a standard module (argparse, difflib, ...) would run at its import, before any
+    # check inside main() or run() could refuse. sys is built in and cannot be shadowed.
+    print("## CLAUDE.md rule-change comparison\n\nRESULT: FAIL (closed) - run the comparison as "
+          "`python3 -I scripts/claude-md-rule-compare.py` (isolated mode)")
+    sys.exit(1)
+
+import argparse  # noqa: E402 - after the isolated-mode refusal on purpose (#5163)
 import difflib
 import importlib.util
 import os
@@ -42,7 +52,6 @@ import re
 import shutil
 import stat
 import subprocess
-import sys
 from pathlib import Path
 
 GUARD_REL = "scripts/check-claude-md-size.py"
@@ -256,8 +265,8 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
 
 def run(args) -> int:
     if not sys.flags.isolated:
-        # R5 (#5163): without -I the script directory heads sys.path, so a file there named like a standard
-        # module would run instead of it. Fail closed rather than judge with code nobody reviewed as a guard.
+        # R5 (#5163): second line of defence for a caller that imports this module; the refusal that
+        # stops a sibling module is the one above the imports.
         print("## CLAUDE.md rule-change comparison\n\nRESULT: FAIL (closed) - run the comparison as "
               "`python3 -I scripts/claude-md-rule-compare.py` (isolated mode)")
         return 1
