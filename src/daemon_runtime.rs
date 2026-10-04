@@ -2326,7 +2326,10 @@ pub async fn run(
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::backup::run_restore(&db_path, &a, j, &mut out)
         }
-        Command::Curator(a) => {
+        Command::Curator(mut a) => {
+            // #5218 / #3431 - an explicit `--db` with a store URL from the env
+            // channels only keeps the explicit `--db` (see `resolve_store_binding`).
+            a.db_was_explicit = db_was_explicit;
             // v0.7.0 #1548 — the `--db` / `--store-url` mutual exclusion
             // (and the sqlite store-URL binding) is enforced once for every
             // store-URL command in `resolve_store_binding` above.

@@ -112,6 +112,13 @@ pub struct CuratorArgs {
     #[cfg(feature = "sal")]
     #[arg(long, value_name = "URL")]
     pub store_url: Option<String>,
+    /// #5218 / #3431 — set by the dispatcher (never parsed from argv): `--db`
+    /// (or `AI_MEMORY_DB`) was given explicitly. An explicit `--db` plus a
+    /// store URL that arrives only through the env channels keeps its
+    /// historical meaning: the operator's `--db` is still opened as the local
+    /// sidecar while the sweep runs against the store.
+    #[arg(skip)]
+    pub db_was_explicit: bool,
 }
 
 /// #1143: honor `AI_MEMORY_LLM_BACKEND` env so the `ai-memory curator`
@@ -537,6 +544,14 @@ async fn run_store_backed_sweep(
     app_config: &config::AppConfig,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // #5218 / #3431 - an explicit `--db` alongside an env-channel store URL
+    // still binds its local path: the file is opened (created and migrated)
+    // as the local sidecar, exactly as `resolve_store_binding` documents,
+    // instead of being silently skipped when the sweep routes to the store.
+    // A failure to open it fails closed (ERRORS-02).
+    if args.db_was_explicit {
+        drop(db::open(db_path)?);
+    }
     let store =
         crate::daemon_runtime::build_curator_store(curator_store_url(args), db_path, app_config)
             .await?;
@@ -1573,6 +1588,7 @@ mod tests {
             all_namespaces: false,
             #[cfg(feature = "sal")]
             store_url: None,
+            db_was_explicit: false,
         }
     }
 

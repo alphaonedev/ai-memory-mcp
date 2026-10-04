@@ -253,6 +253,7 @@ mod sal {
             max_depth: None,
             all_namespaces: false,
             store_url: Some(format!("sqlite://{}", store_url.display())),
+            db_was_explicit: false,
         }
     }
 

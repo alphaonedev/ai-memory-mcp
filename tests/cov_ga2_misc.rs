@@ -698,6 +698,7 @@ async fn curator_store_url_postgres_once_builds_store_handle() {
         max_depth: None,
         all_namespaces: false,
         store_url: Some(url),
+        db_was_explicit: false,
     };
 
     let mut stdout = Vec::<u8>::new();
