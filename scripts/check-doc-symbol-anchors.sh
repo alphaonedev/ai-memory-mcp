@@ -387,6 +387,17 @@ MDEOF
         "See \`$R::{RecallTool<T, U>, decorate_memory_many}\`."
     anchor_green 5342 "a live symbol followed by a parenthesised aside" \
         "See $R::RecallTool (a unit struct) here."
+    # #5347: the generic strip runs to a fixed point (a nested group needs
+    # more than one pass) and a single-argument group on a MISSING type still
+    # reports the type.
+    anchor_red 5347 QUAL "a missing type with a one-argument generic before a live method" \
+        "See \`$R::NoSuch<T>::decorate_memory_many\` here."
+    anchor_red 5347 QUAL "a missing type with a nested generic before a live method" \
+        "See \`$R::NoSuch<Vec<T>>::decorate_memory_many\` here."
+    anchor_green 5347 "a live type with a nested generic before a live method" \
+        "See \`$R::RecallTool<Vec<T>>::decorate_memory_many\` here."
+    anchor_green 5347 "a live type with a doubly nested generic before a live method" \
+        "See \`$R::RecallTool<Vec<Option<T>>>::decorate_memory_many\` here."
 
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
