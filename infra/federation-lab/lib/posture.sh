@@ -228,11 +228,6 @@ lab_posture_ssot_check() {
   return 0
 }
 
-# lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# Each leg mutates the lab posture arrays in a subshell and the check must
-# return the expected code: the control passes; a weakened value (plain and
-# const-valued), a dropped name and a SET knob moved to UNSET all go red.
-# Prints one line per leg; returns 0 only if every leg behaved.
 # #5155: true when a boot refusal in <file> names the lowered rollback-check knob.
 # One awk pass reads the whole file: no pipe (a `grep -q` reader closing early returns 141
 # under pipefail) and no here-string (bash spills a large one to a temp file under $TMPDIR,
@@ -242,6 +237,12 @@ lab_probe_refusal_names_knob() {
   awk 'index($0, "INFO") == 0 && index($0, "refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:") { f = 1 }
        END { exit (f ? 0 : 1) }' "$1" 2>/dev/null
 }
+
+# lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
+# Each leg mutates the lab posture arrays in a subshell and the check must
+# return the expected code: the control passes; a weakened value (plain and
+# const-valued), a dropped name and a SET knob moved to UNSET all go red.
+# Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
   local root="$1" bad=0 rc name want
   _leg() {  # <name> <want-rc> — runs the check in the CURRENT subshell's arrays
@@ -302,6 +303,12 @@ lab_posture_selftest() {
     *) echo "  PASS probe matcher: reads the log without a here-string or a pipe" ;;
   esac
   rm -rf "$plog"
+  # #5198: the doc comment sits on the function it describes (a helper between them is drift).
+  if [ "$(grep -B1 '^lab_posture_selftest() {' "${BASH_SOURCE[0]}" | head -n 1)" = "# Prints one line per leg; returns 0 only if every leg behaved." ]; then
+    echo "  PASS doc comment: lab_posture_selftest is documented by the comment directly above it"
+  else
+    echo "  FAIL doc comment: another function sits between the lab_posture_selftest comment and the function"; bad=1
+  fi
   unset -f _leg
   return "$bad"
 }
