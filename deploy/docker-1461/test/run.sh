@@ -88,18 +88,26 @@ assert_eq() { if [ "$3" = "$4" ]; then pass "$1" "$2" "$3" "$4"; else fail "$1" 
 # emits a code (literally `000` on a refused handshake); the `; true` masks
 # curl's non-zero exit WITHOUT appending a second code, and an empty capture
 # defaults to 000.
+# #4874: the api key is piped to a probe's `curl --config -` (stdin), never an argv word. A probe
+# opts in with the non-secret CFG_ARG; curl reads stdin only then.
+_probe_key_config() {
+  local k="$EFFECTIVE_KEY"
+  [ -n "$k" ] || return 0
+  k=${k//\\/\\\\}; k=${k//\"/\\\"}
+  printf 'header = "X-API-Key: %s"\n' "$k"
+}
 _url() { printf 'https://127.0.0.1:%s%s' "$1" "$2"; }
 probe_code() {
   local port="$1" path="$2"; shift 2
   local out
-  out="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$@" "$(_url "$port" "$path")" 2>/dev/null; true)"
+  out="$(_probe_key_config | curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$@" "$(_url "$port" "$path")" 2>/dev/null; true)"
   printf '%s' "${out:-000}"
 }
 # body REGARDLESS of status (keeps the error envelope so a negative can assert
 # on the JSON `error` tag — mtls_curl_body uses -fsS and would drop it).
 probe_body_raw() {
   local port="$1" path="$2"; shift 2
-  curl -s --max-time 15 "$@" "$(_url "$port" "$path")" 2>/dev/null || true
+  _probe_key_config | curl -s --max-time 15 "$@" "$(_url "$port" "$path")" 2>/dev/null || true
 }
 
 log "D6 full-spectrum test $TS — campaign=$CAMPAIGN peers=$PEER_COUNT"
@@ -167,7 +175,7 @@ case "$LB" in *"$MIDA"*) fail regression ns_cross_isolation "absent from other n
 log "[crypto] TLS/mTLS negatives + api_key/admin authz on $P1_NAME"
 CA_ARG=(--cacert "$MTLS_CA")
 CERT_ARGS=(--cert "$MTLS_CLIENT_CERT" --key "$MTLS_CLIENT_KEY")
-KEY_HDR=(-H "X-API-Key: $EFFECTIVE_KEY")
+CFG_ARG=(--config -)
 
 # (1) no client cert -> client-auth mandatory refuses the handshake (000)
 c="$(probe_code "$P1_PORT" "$API_HEALTH" "${CA_ARG[@]}")"
@@ -192,7 +200,7 @@ c="$(probe_code "$P1_PORT" "$API_CAPABILITIES" "${CA_ARG[@]}" "${CERT_ARGS[@]}")
 assert_eq crypto apikey_required 401 "$c"
 
 # (5) privileged endpoint WITH X-API-Key -> 200
-c="$(probe_code "$P1_PORT" "$API_CAPABILITIES" "${CA_ARG[@]}" "${CERT_ARGS[@]}" "${KEY_HDR[@]}")"
+c="$(probe_code "$P1_PORT" "$API_CAPABILITIES" "${CA_ARG[@]}" "${CERT_ARGS[@]}" "${CFG_ARG[@]}")"
 assert_eq crypto apikey_accepted 200 "$c"
 
 # (6) /health is exempt -> 200 without the key
@@ -200,7 +208,7 @@ c="$(probe_code "$P1_PORT" "$API_HEALTH" "${CA_ARG[@]}" "${CERT_ARGS[@]}")"
 assert_eq crypto health_exempt 200 "$c"
 
 # (7) admin-only endpoint as a non-admin caller -> 403 (authz enforced)
-c="$(probe_code "$P1_PORT" "$API_STATS" "${CA_ARG[@]}" "${CERT_ARGS[@]}" "${KEY_HDR[@]}" -H "X-Agent-Id: $AID_H")"
+c="$(probe_code "$P1_PORT" "$API_STATS" "${CA_ARG[@]}" "${CERT_ARGS[@]}" "${CFG_ARG[@]}" -H "X-Agent-Id: $AID_H")"
 assert_eq crypto admin_gated 403 "$c"
 
 # (8) daemon -> PostgreSQL leg is TLS (third encrypted leg). Join pg_stat_ssl
@@ -277,9 +285,9 @@ fi
 log "[zerotouch] unenrolled peer-id refused on /sync/since (#1088 fail-closed)"
 ZROGUE="rogue-unenrolled-$TS"
 ZSYNC="$API_SYNC_SINCE?since=1970-01-01T00:00:00Z"
-zc="$(probe_code "$P1_PORT" "$ZSYNC" "${CA_ARG[@]}" "${CERT_ARGS[@]}" "${KEY_HDR[@]}" -H "X-Peer-Id: $ZROGUE")"
+zc="$(probe_code "$P1_PORT" "$ZSYNC" "${CA_ARG[@]}" "${CERT_ARGS[@]}" "${CFG_ARG[@]}" -H "X-Peer-Id: $ZROGUE")"
 assert_eq zerotouch unenrolled_status 401 "$zc"
-zb="$(probe_body_raw "$P1_PORT" "$ZSYNC" "${CA_ARG[@]}" "${CERT_ARGS[@]}" "${KEY_HDR[@]}" -H "X-Peer-Id: $ZROGUE")"
+zb="$(probe_body_raw "$P1_PORT" "$ZSYNC" "${CA_ARG[@]}" "${CERT_ARGS[@]}" "${CFG_ARG[@]}" -H "X-Peer-Id: $ZROGUE")"
 case "$zb" in *peer_not_enrolled*) pass zerotouch unenrolled_reason "peer_not_enrolled" "fail-closed" ;;
                               *) fail zerotouch unenrolled_reason "peer_not_enrolled" "${zb:-<empty>}" ;; esac
 
