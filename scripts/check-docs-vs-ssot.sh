@@ -720,8 +720,11 @@ for path in files:
                 for m in rx.finditer(joined):
                     if m.start() < len(prev) < m.start(1):
                         hits.append((m.group(1), m.group(0)))
+        # Every anchor spells a gap as one space, so match it against the
+        # whitespace-folded line (html is already folded by plain(); #5200).
+        aline = WS.sub(' ', line)
         for rx in ANCHORS:
-            hits.extend((m.group(1), m.group(0)) for m in rx.finditer(line))
+            hits.extend((m.group(1), m.group(0)) for m in rx.finditer(aline))
         if is_html:
             hits.extend((m.group(1), m.group(0)) for m in PILL.finditer(htmlmod.unescape(raw)))
         seen = set()
@@ -2766,6 +2769,12 @@ a v0.8.x DB steps  v40 → v52 on boot.
 a v0.8.x DB steps  v40 → v53 on boot.
 a v0.8.x DB steps	v40 → v52 on boot.
 a v0.8.x DB steps	v40 → v53 on boot.
+re-stamped to v1.0.0  (schema v52)
+re-stamped to v1.0.0  (schema v53)
+Schema v52  (was v51)
+Schema v53  (was v51)
+Current version:	52 at v1.0.0
+Current version:	53 at v1.0.0
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2914,7 +2923,10 @@ R4HTML
         'docs/block-control.html:42 claims "52"' \
         'docs/block-control.html:45 claims "52"' \
         'docs/schema-fixture.html:79 claims "52"' \
-        'docs/schema-fixture.html:83 claims "52"'
+        'docs/schema-fixture.html:83 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:41 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:43 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:45 claims "52"'
     do grep -qF "$_want" <<<"$r4_out" || { echo "FAIL: self-test #3248 r4 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
     for _not in \
         'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:4 ' \
@@ -2934,7 +2946,8 @@ R4HTML
         'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 ' 'docs/schema-fixture.html:46 ' \
         'docs/schema-fixture.html:52 ' 'docs/schema-fixture.html:62 ' 'docs/schema-fixture.html:68 ' \
         'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' \
-        'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 '
+        'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 ' \
+        'docs/postgres-age-guide.md:42 ' 'docs/postgres-age-guide.md:44 ' 'docs/postgres-age-guide.md:46 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
@@ -2943,6 +2956,7 @@ R4HTML
     echo "PASS: self-test #5140 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, any case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
     echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag); a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
+    echo "PASS: self-test #5200 - ident-less anchors (Current schema = vN, re-stamped to v1.0.0 (schema vN)) match a markdown claim with doubled spaces or a tab: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5196 - the look-back bound is pinned both ways: 3 inline tag-only lines join (52 REJECTED), 4 do not"
     echo "PASS: self-test #4511-R6 - html look-back skips up to 3 tag-only lines (52 REJECTED, 53 ACCEPTED), stops past 3, and markdown never looks back past a blank line"
