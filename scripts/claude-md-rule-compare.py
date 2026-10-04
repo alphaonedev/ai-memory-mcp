@@ -505,6 +505,28 @@ def self_test() -> int:
         failures.append("non-isolated run")
         print("FAIL: self-test - a comparison run without -I did not fail closed (R5, #5163)", file=sys.stderr)
 
+    def importer_refusal():
+        # #5377: a caller that imports the module skips the module-top refusal (it is gated on __name__ ==
+        # "__main__"), so run() is its only refusal. Load the file as a module in a child without -I and call run().
+        imp = base_dir / "imp"
+        imp.mkdir(parents=True, exist_ok=True)
+        code = ("import argparse, importlib.util, sys\n"
+                "spec = importlib.util.spec_from_file_location('rc_importer', sys.argv[1])\n"
+                "module = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(module)\n"
+                "sys.exit(module.run(argparse.Namespace(base_root='.', repo='.', base_sha='0' * 40, "
+                "head_sha='0' * 40, scratch=sys.argv[2], summary=None)))\n")
+        result = subprocess.run([sys.executable, "-c", code, str(Path(__file__).resolve()), str(imp / "s")],
+                                capture_output=True, text=True, check=False, cwd=str(imp))
+        return result.returncode == 1 and "isolated mode" in result.stdout
+
+    if importer_refusal():
+        print("PASS: self-test - run() refuses a non-isolated caller that imports the module (#5377)")
+    else:
+        failures.append("importer refusal")
+        print("FAIL: self-test - run() did not refuse a non-isolated caller that imports the module (#5377)",
+              file=sys.stderr)
+
     def rename_guard(root):
         subprocess.run(["git", "-C", str(root), "mv", GUARD_REL, GUARD_REL + ".old"], check=True)
 
