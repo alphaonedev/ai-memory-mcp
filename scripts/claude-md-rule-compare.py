@@ -66,6 +66,9 @@ CENSUS_SECTION = "## Prime directive"
 CENSUS_DIGITS = re.compile(
     r"\b\d+(?=\s+(?:MCP tools|production HTTP route registrations|unique URL paths|CLI subcommands|"
     r"in the default build)\b)", re.ASCII)  # R5 (#5165): ASCII digits only; any other digit is rule text
+# #5376: the mask that stands in for a census number while comparing base and head. NUL cannot be typed into rule
+# text, so a head line that already holds "#" (or any printable stand-in) where the base had a number differs.
+CENSUS_MASK = "\0"
 # R4 (#4507): the code and configuration that judge a rule change. A change to any of them is reported and needs
 # the trailer, so a guard weakened in one PR cannot silently judge the next one. The manifest is not listed: the
 # section comparison above already judges it against the base.
@@ -225,7 +228,7 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
         old = base_bodies.get(key)
         new = head_bodies.get(key)
         if old is not None and new is not None and key.startswith(CENSUS_SECTION) and (
-                CENSUS_DIGITS.sub("#", old) == CENSUS_DIGITS.sub("#", new)):
+                CENSUS_DIGITS.sub(CENSUS_MASK, old) == CENSUS_DIGITS.sub(CENSUS_MASK, new)):
             count_changed = True
             lines += [f"### COUNT CHANGED: {span(key)}", "", "Only census counts differ.", ""] + fenced(
                 unified(old, new, key)) + [""]
@@ -761,6 +764,14 @@ def self_test() -> int:
         failures.append("count key span")
     else:
         print("PASS: self-test - the COUNT CHANGED heading with a backtick is one code span (#5282)")
+
+    # #5376: a head census line that holds a literal "#" where the base had a number is a rule change, not a count.
+    def hash_for_count(root):
+        edit("The surface has 103 MCP tools", "The surface has # MCP tools")(root)
+        reseal(root)
+
+    case("a census number replaced by a literal # is a rule change, not COUNT CHANGED (#5376)", hash_for_count,
+         True, "RULE TEXT CHANGED")
 
     def base_claude_symlink(root):
         target = root / "CLAUDE.md"
