@@ -763,10 +763,11 @@ queue-collapse.
 
 PgBouncer (≥1.21, for `max_prepared_statements`) as the per-module connection pooler
 in front of each module's Postgres+AGE backbone. Transaction-mode multiplexing with
-`max_prepared_statements` set so the Fix #4 sqlx prepared-statement / generic-plan
-pinning (shipped v0.7.0) survives the pooler (pre-1.21 transaction-mode broke named
-prepared statements). Deliverables: deploy templates (compose + k8s), expansion of
-`docs/enterprise-deployment.md §10.4`, and an `infra/lan-parity-test/` integration
+`max_prepared_statements` set, because the sqlx layer uses named prepared statements
+(no code sets `plan_cache_mode` or forces generic plans, so there is no plan pinning to
+preserve; pre-1.21 transaction-mode broke named prepared statements). Deliverables:
+deploy templates (compose + k8s), expansion of
+`docs/enterprise-deployment.md §10.4` (posture detail in §5.6.6), and an `infra/lan-parity-test/` integration
 test proving plan-caching holds through PgBouncer. **Supavisor is explicitly NOT
 adopted** — the documented hive (Topology 8/9, `docs/reference-architectures.md`)
 absorbs millions-agent fan-in via hierarchical tiering (1:10–1:100 per tier) + the
