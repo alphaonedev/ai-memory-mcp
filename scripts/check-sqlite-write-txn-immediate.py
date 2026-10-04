@@ -17,6 +17,10 @@ Rules (each has a mutant in ``--self-test``):
   R3  a raw ``BEGIN`` / ``BEGIN DEFERRED`` / ``BEGIN TRANSACTION`` SQL string
       or ``SQL_BEGIN_DEFERRED`` is DEFERRED.
   R4  ``WriteTxn::begin_deferred`` is DEFERRED (the helper no longer has it).
+  R5  an allowlisted DEFERRED function must be read-only: its body may not
+      contain a write statement (INSERT / UPDATE / DELETE / REPLACE / CREATE /
+      DROP / ALTER).  A DEFERRED function that reads then writes, or writes
+      first, is refused by R1-R4 (it is not allowlistable) and by R5.
 
 Closed world: only sites in ``ALLOWLIST`` (file, enclosing fn) pass, and each
 carries a written reason.  A stale allowlist entry (no matching site) also
@@ -67,6 +71,7 @@ RULES = [
     ),
     ("R4", re.compile(r"WriteTxn::begin_deferred")),
 ]
+WRITE_SQL = re.compile(r"\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b")
 CFG_TEST_MOD_FILE = re.compile(r"#\[cfg\(test\)\]\s*(?:pub(?:\([a-z]+\))?\s+)?mod\s+(\w+)\s*;")
 
 
@@ -138,6 +143,23 @@ def scan(files):
     return hits
 
 
+def fn_body(text, name):
+    """Lines of ``fn name`` up to its closing brace at the same indent."""
+    lines = text.splitlines()
+    for i, raw in enumerate(lines):
+        m = re.search(r"\bfn\s+" + re.escape(name) + r"\b", raw)
+        if not m:
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        out = [raw]
+        for nxt in lines[i + 1 :]:
+            out.append(nxt)
+            if nxt.rstrip() == " " * indent + "}":
+                break
+        return out
+    return []
+
+
 def evaluate(files, allowlist):
     hits = scan(files)
     used, bad = set(), []
@@ -147,6 +169,12 @@ def evaluate(files, allowlist):
             used.add(key)
         else:
             bad.append((rel, n, fn, rule, text))
+    for rel, fn in sorted(used):
+        for raw in fn_body(files[rel], fn):
+            code = strip_comment(raw)
+            # Only SQL text: look inside string literals, ignore identifiers.
+            if any(WRITE_SQL.search(lit) for lit in re.findall(r'"(?:[^"\\]|\\.)*"', code)):
+                bad.append((rel, 0, fn, "R5", raw.strip()))
     stale = sorted(k for k in allowlist if k not in used)
     return bad, stale, len(hits)
 
@@ -228,6 +256,28 @@ def self_test():
     for label, (rule, text) in red.items():
         bad, _, _ = run(text)
         expect("red:" + label, len(bad) == 1 and bad[0][3] == rule)
+    # R5: an allowlisted DEFERRED function that writes is refused, whichever
+    # order it reads and writes in; a read-only one stays green.
+    for label, body in (
+        (
+            "read-then-write",
+            'let r = c.query_row("SELECT 1", [], |_| Ok(()))?;\n c.execute("INSERT INTO t VALUES (1)", [])?;\n',
+        ),
+        ("write-first", 'c.execute("UPDATE t SET a = 1", [])?;\n'),
+    ):
+        text = "fn ro(c: &Connection) {\n let t = c.unchecked_transaction()?;\n " + body + "}\n"
+        bad, _, _ = evaluate({"src/ok.rs": text}, allow)
+        expect("red:R5 allowlisted " + label, [b[3] for b in bad] == ["R5"])
+    text = 'fn ro(c: &Connection) {\n let t = c.unchecked_transaction()?;\n c.query_row("SELECT 1", [], |_| Ok(()))?;\n}\n'
+    bad, _, _ = evaluate({"src/ok.rs": text}, allow)
+    expect("green:R5 read-only allowlisted", not bad)
+    # a non-allowlisted DEFERRED read-then-write / write-first fn is refused
+    for label, body in (
+        ("read-then-write", 'c.query_row("SELECT 1", [], |_| Ok(()))?; c.execute("DELETE FROM t", [])?;'),
+        ("write-first", 'c.execute("INSERT INTO t VALUES (1)", [])?;'),
+    ):
+        bad, _, _ = run("fn f(c: &Connection) {\n let t = c.unchecked_transaction()?;\n " + body + "\n}\n")
+        expect("red:DEFERRED " + label + " refused", len(bad) == 1 and bad[0][3] == "R1")
     # stale allowlist entry must fail
     _, stale, _ = evaluate({"src/x.rs": "fn f() {}\n"}, allow)
     expect("red:stale allowlist", stale == [("src/ok.rs", "ro")])
@@ -254,7 +304,7 @@ def self_test():
         for f in failures:
             print("SELF-TEST FAIL: " + f, file=sys.stderr)
         return 1
-    print("self-test ok: %d green, %d red probes, %d rules" % (len(green) + 3, len(red) + 2, len(RULES)))
+    print("self-test ok: %d green, %d red probes, %d rules" % (len(green) + 4, len(red) + 6, len(RULES) + 1))
     return 0
 
 
@@ -271,7 +321,12 @@ def main(argv=None):
         return 2
     bad, stale, total = evaluate(load_tree(root), ALLOWLIST)
     for rel, n, fn, rule, text in bad:
-        print("%s:%d: [%s] DEFERRED transaction in fn %s (use WriteTxn::begin, #5084): %s" % (rel, n, rule, fn, text))
+        why = (
+            "allowlisted read-only fn contains a write"
+            if rule == "R5"
+            else "DEFERRED transaction (use WriteTxn::begin, #5084)"
+        )
+        print("%s:%d: [%s] fn %s: %s: %s" % (rel, n, rule, fn, why, text))
     for rel, fn in stale:
         print("stale allowlist entry (no matching site): %s fn %s" % (rel, fn))
     if bad or stale:
