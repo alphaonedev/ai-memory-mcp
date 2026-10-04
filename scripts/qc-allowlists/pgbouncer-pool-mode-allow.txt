@@ -146,7 +146,7 @@ changelog.d/4667.fixed.md | pgbouncer: session mode is the only supported pool m
 docs/architectures-t4.html | # primary + streaming replicas, an optional pooler in session mode,
 docs/architectures-t4.html | federation · mtls · ed25519 x-memory-sig + nonce · w-of-n quorum · /sync/since catch-upoperator-run postgresql · not part of ai-memoryai-memory follows only its --store-urlconnection poolere.g. pgbouncer, session mode
 
-# #4710 R3 (regen --accept-new, reviewed line by line): the guide: every line states session mode (prose or pool_mode = session) or describes the SHOW commands/hazard; none recommends transaction or statement mode. Lines with "no"/"not"/"transaction is not" are excluded from approval by the negation rule, and the checklist line also says "no auto-update"
+# #4710 R3 (regen --accept-new, reviewed line by line): the guide: every line states session mode (prose or pool_mode = session) or describes the SHOW commands/hazard; none recommends transaction or statement mode. Each is listed here because the gate approves only the A1/A2 assignment shapes; the checklist line pins the PgBouncer version with pool_mode = session (section 5.6)
 docs/enterprise-deployment.md | ### 5.6 connection pooling (pgbouncer is optional at t4, session mode only)
 docs/enterprise-deployment.md | #### 5.6.6 why session mode — the executed evidence
 docs/enterprise-deployment.md | - [ ] daemon binary version pinned per-host (no auto-update); age minor pinned (v1.0.0 reference: 1.8.0 extversion; upgrade procedure §10.6); pgbouncer version pinned with pool_mode = session (§5.6).
@@ -245,7 +245,11 @@ changelog.d/4667.fixed.md | table and prepared statement), exits 0 on session, a
 
 # guide section 5.6 prose and the probe result table: each line states session mode as the only supported mode or records transaction and statement as unsafe
 docs/enterprise-deployment.md | 1. move to session mode and re-size. set pool_mode = session, set
+
+# guide 5.6.6 prepared-statements caveat: "statements" is SQL prepared statements next to the pgbouncer.ini file name, not statement pooling; the line states no pooler mode
 docs/enterprise-deployment.md | > caveat — prepared statements. pgbouncer.ini ships
+
+# guide section 5.6 prose and the probe result table: each line states session mode as the only supported mode or records transaction and statement as unsafe
 docs/enterprise-deployment.md | > with that line present. in session mode each client keeps its own server > connection, so a client's prepared statements stay on one backend.
 docs/enterprise-deployment.md | server-side pgbouncer pool in pool_mode = session (the only mode
 docs/enterprise-deployment.md | supported today; transaction is not, see §5.6.6 and session-mode pooler does not fan the daemons' connections down: each client
