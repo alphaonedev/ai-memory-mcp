@@ -1516,8 +1516,10 @@ SELF_TEST_PINNED_LIMITS = {
     "REFERENCE_FLOOR ARCHITECTURE_REFERENCE": 300_000,
     "REFERENCE_FLOOR CODE_STYLE": 45_000,
     "INDEX_MIN_QUOTE_CHARS": 20,
-    # sha256 of the sorted "<file> <quote sha256>" index pin lines: any pinned quote change is a deliberate edit.
+    # sha256 of the exact index lines (both sections, file order, newline-joined): a changed range or quote is a
+    # deliberate edit.
     "INDEX_ENTRIES_SHA256": "de11dd7af07f6e340e2c7d7a75b451f4e41c67cd66548d59165cf7c81c19b6f7",
+    # sha256 of the sorted "<file> <quote sha256>" index pin lines: any pinned quote change is a deliberate edit.
     "INDEX_QUOTE_PINS_SHA256": "9d4c301ad7f479615115f9605e0ea6d1d86d0ea04b653c08bedb4ed72986eaeb",
     "REFERENCE_SUBSECTIONS ARCHITECTURE_REFERENCE": 9,
     "REFERENCE_SUBSECTIONS CODE_STYLE": 1,
