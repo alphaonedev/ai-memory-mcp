@@ -664,8 +664,8 @@ export class AiMemoryClient {
   }
 
   // ========================================================================
-  // v0.6.0.0 new endpoints — subscriptions, notify/inbox, grant/revoke,
-  // cluster, Prometheus metrics. Some may not be merged server-side yet.
+  // Subscriptions, notify/inbox and Prometheus metrics — every route below
+  // is registered by the daemon.
   // ========================================================================
 
   /** `GET /api/v1/metrics` — Prometheus text-format exposition. */

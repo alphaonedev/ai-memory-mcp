@@ -74,6 +74,104 @@ allow-on-silence default is appropriate for single-operator local
 substrates, not for shared or federated deployments. Child
 namespaces inherit the parent's policy by default (`inherit: true`),
 so one standard at `org/` governs the subtree until a child opts out.
+Opting a child out is itself an authorized act (#4356): binding the
+**first** standard (or repairing a severed binding, the #3758 SET repair
+path, or rebinding an UNOWNED standard, #4499) at a namespace
+under a governed ancestor requires the caller to own the **nearest
+governing ancestor's** standard — the nearest ancestor on the
+governance chain whose standard carries a `metadata.governance`
+policy (a bound standard with no policy does not shadow a governed
+grandparent). A non-owner is refused with the usual 403 `NOT_OWNER`
+(the owner is never named). An ungoverned root, an unowned (`system`)
+ancestor standard and the daemon / operator CLI are unaffected, and a
+severed or dangling governing ancestor fails closed, and so does one whose
+stored metadata is corrupt (not a JSON object, or a `governance` blob that
+does not deserialize). The check runs inside the bind's write transaction
+on both backends, so it cannot pass on a chain a concurrent bind is
+changing. The global `*`
+default is not a governing ancestor for this gate. The federated
+`namespace_meta[]` apply (`/sync/push`, #4478 / #4495) runs the same owner
+gates on both backends after its #2479 peer-scope check, for every binding
+state: a first bind (or severed repair) needs the governing ancestor's owner,
+a rebind of an existing standard needs its current owner (#3758 parity), and a
+re-parent may not detach the namespace from a governing ancestor the caller
+does not own. The caller is the agent the pushing peer is authenticated to
+act for (the bound standard's owner when the peer is the attested sender for
+it or is allowlisted for it in `allowed_sender_agent_ids`, otherwise the
+attested sender), never the local admin apply context. When that identity
+cannot be established (no `X-Peer-Id`, or the body-agent-id trust bypass)
+any bind that consults an owner is refused. A refused entry is skipped and
+counted in `namespace_meta_refused` (a missing standard memory is a plain
+not-found skip on both backends); the rest of the batch applies. The
+identity is only as strong as the peer configuration. In the zero-config
+posture (no peer-attestation allowlist configured) ANY peer acts for whoever
+owns the memory it binds, and an unsigned `X-Peer-Id` naming an owner is that
+owner: the owner gates then hold against nobody the receive lane does not
+already trust on faith (the same model #1464 applies to row ownership there;
+the lane is refused in that posture unless the push-scope requirement is
+explicitly turned off). Governed deployments should configure
+`AI_MEMORY_FED_PEER_ATTESTATION` with per-peer `allowed_sender_agent_ids` and
+scopes, and peer attestation (signed pushes, enrolled keys, certificate
+binding), so a peer acts only for the agents it is allowlisted for.
+
+### Corrupt standards resolve as SEVERED ([#4285](https://github.com/alphaonedev/ai-memory-mcp/issues/4285))
+
+A namespace standard whose `metadata.governance` does not deserialize (a
+typo'd enum variant, an out-of-band edit, an older binary) is handled exactly
+like a severed standard ([#2503](https://github.com/alphaonedev/ai-memory-mcp/issues/2503))
+**at every level of the chain, on both backends**: the walk continues (an
+intact ancestor policy is still honoured) and the resolved `write` / `promote`
+/ `delete` are raised to **at least Owner**. It is never a hard refusal (a
+corrupt `*` would otherwise be a substrate-wide write outage) and never
+"no policy" (the pre-#4285 behaviour silently fell through to
+allow-on-silence). The owner of the corrupt standard is still the namespace
+owner, so an owner write is not locked out; a non-owner write is refused.
+
+- **Signal.** `ai-memory doctor` reports every corrupt standard as
+  **Critical** ("Corrupt governance standards (#4285)", both backends) and the
+  daemon / MCP server / postgres connect emit one boot `WARN` listing each
+  namespace, standard id and a value-free reason (the error category and
+  position; a stored value is never echoed into a log, the census or a
+  response). Every resolve of a corrupt level also
+  logs a `WARN` on target `ai_memory::governance::policy_read`.
+- **What counts as corrupt.** A `metadata.governance` that fails the typed
+  deserialise, **or** (sqlite) a whole `metadata` cell that is not a JSON object
+  (invalid JSON, an array, a string, ...). A corrupt level contributes nothing
+  to ANY governance reader: the sibling walkers
+  (`require_approval_above_depth`, `skill_promotion_min_depth`) keep walking to
+  the ancestor and never honour a raw key of an unparseable policy.
+  `memory_namespace_get_standard` and the capabilities `rule_summary` report
+  the effective severed (Owner-floored) policy with `corrupt: true`, not the
+  permissive default. Whole-`metadata` corruption also loses the stored owner
+  id: the corrupt level has no owner, so the nearest ancestor standard's owner (if any) is the namespace owner, otherwise nobody is until the binding is repaired (fail closed).
+- **Documented limit (depth knobs).** The depth walks are leaf-first-wins
+  (#2542): an explicit integer at the nearest level decides; an explicit `null`
+  or a missing standard keeps walking; a well-formed policy that **omits** the
+  key means no gate at that level and the walk **stops** (it is not
+  inherited from the ancestor). A corrupt level keeps walking and never
+  contributes a raw key. A walk that passed a corrupt level and ends without an
+  explicit value fails closed instead of reading as "no gate": the approval
+  threshold resolves to `0` (every reflection needs approval) and the
+  skill-promotion floor to `u32::MAX` (no promotion), until the standard is
+  repaired. This includes a corrupt leaf under a well-formed parent that omits
+  the key. Only a chain with no corrupt level and no explicit value keeps the
+  documented default (no approval gate; promotion floor 1). The Owner floor
+  still gates WRITE at the corrupt level. A corrupt level that meant a stricter
+  depth gate than the inherited one degrades to the inherited value until
+  repaired. Caveat: because an omitting child escapes the parent's gate, that
+  is safe only once #4356 (the ancestor-owner bind gate) lands.
+- **Repair.** Re-run `memory_namespace_set_standard` for the namespace with a
+  valid policy; the row is then read normally and no floor is applied.
+- **Documented limit.** A corrupt policy that *meant* something stricter than
+  Owner (`approve` / consensus) degrades to the Owner floor until repaired. The
+  doctor Critical is the operator's signal; the floor only ever tightens.
+- **Federation receive.** Measured by
+  `tests/fed_owner_floor_4285.rs`: the Owner floor does **not** refuse a
+  non-owner peer's relayed write on `/sync/push` (receive authorizes by peer
+  attestation and namespace scope, not by the namespace write level — see
+  *Enforcement scope* below). A corrupt standard therefore never turns
+  federation receive into an outage, and receive behaviour is identical to an
+  intact explicit Owner policy.
 
 ### Enforcement scope ([#1617](https://github.com/alphaonedev/ai-memory-mcp/issues/1617))
 

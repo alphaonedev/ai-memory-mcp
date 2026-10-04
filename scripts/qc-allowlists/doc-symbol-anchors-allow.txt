@@ -10,7 +10,7 @@
 # a BURN-DOWN ledger, not a pending-fix hold, so it follows the #2494
 # `required-contexts-joblevel-if-allow.txt` discipline rather than the
 # `dual-trigger-cancel-allow.txt` one. The distinction is deliberate:
-# the two PENDING-FIX ledgers this campaign ships
+# the three PENDING-FIX ledgers this campaign ships
 # (`doc-numeric-claims-pending.txt`, `sdk-route-paths-pending.txt`,
 # `ci-job-claims-pending.txt`) hold claims that a CONCURRENT correction
 # lane is already fixing, so a stale entry there is a race artefact and

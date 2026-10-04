@@ -450,7 +450,13 @@ export interface ListSubscriptionsResponse {
   count: number;
 }
 
-/** Memory ACL grant/revoke (Task 1.5 extensions). */
+/**
+ * Memory ACL grant request.
+ *
+ * @deprecated The daemon serves no grant, revoke or cluster route and the client
+ * methods that used it were removed. Kept exported for one release for
+ * importers; it will then be removed.
+ */
 export interface GrantRequest {
   /** Agent receiving access. */
   agent_id: string;
@@ -458,6 +464,13 @@ export interface GrantRequest {
   permission: "read" | "write" | "admin";
 }
 
+/**
+ * Memory ACL revoke request.
+ *
+ * @deprecated The daemon serves no grant, revoke or cluster route and the client
+ * methods that used it were removed. Kept exported for one release for
+ * importers; it will then be removed.
+ */
 export interface RevokeRequest {
   agent_id: string;
 }
@@ -530,7 +543,13 @@ export interface InboxQuery {
   limit?: number;
 }
 
-/** Cluster peer info. */
+/**
+ * Cluster peer info.
+ *
+ * @deprecated The daemon serves no grant, revoke or cluster route and the client
+ * methods that used it were removed. Kept exported for one release for
+ * importers; it will then be removed.
+ */
 export interface ClusterPeer {
   agent_id: string;
   endpoint: string;
@@ -538,6 +557,13 @@ export interface ClusterPeer {
   status: "healthy" | "degraded" | "unreachable";
 }
 
+/**
+ * Cluster membership request.
+ *
+ * @deprecated The daemon serves no grant, revoke or cluster route and the client
+ * methods that used it were removed. Kept exported for one release for
+ * importers; it will then be removed.
+ */
 export interface ClusterRequest {
   /** Action: "join", "leave", "list", "status". */
   action: "join" | "leave" | "list" | "status";
@@ -545,6 +571,13 @@ export interface ClusterRequest {
   agent_id?: string;
 }
 
+/**
+ * Cluster membership response.
+ *
+ * @deprecated The daemon serves no grant, revoke or cluster route and the client
+ * methods that used it were removed. Kept exported for one release for
+ * importers; it will then be removed.
+ */
 export interface ClusterResponse {
   peers: ClusterPeer[];
   self: ClusterPeer;

@@ -1,0 +1,217 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #4356 — the sqlite reader behind the ancestor-owner bind gate. The verdict
+//! lives once in [`crate::ns_standard_ancestor`]; this module only reads the
+//! governance chain's levels (nearest-first, the target and `*` excluded).
+//!
+//! Every read here is FALLIBLE (a fault refuses the bind, vote amendment d):
+//! the chain is the shared [`super::build_namespace_governance_chain`], which
+//! (since #4043) propagates every parent / owner read fault as an `Err` instead
+//! of swallowing it into "no parent" — a dropped explicit ancestor would be
+//! fail-open for this gate. #4356 originally carried a separate strict twin;
+//! it is gone so the two builders cannot drift.
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::ns_standard_ancestor::{
+    AncestorLevel, GoverningAncestor, SetRefusal, classify_standard_metadata_text,
+    select_governing_ancestor, set_admission,
+};
+
+/// The RAW level row: `namespace_meta.standard_id` and the bound memory's RAW
+/// `metadata` text. `LEFT JOIN` keeps a severed / dangling row visible.
+const SQL_LEVEL: &str = "SELECT nm.standard_id, m.id IS NOT NULL, m.metadata \
+     FROM namespace_meta nm LEFT JOIN memories m ON m.id = nm.standard_id \
+     WHERE nm.namespace = ?1";
+
+/// Read ONE ancestor level on sqlite in one statement (one snapshot). The
+/// stored metadata is classified Rust-side from the RAW column by the shared
+/// [`classify_standard_metadata_text`] (#4356 CR1): `json_extract` would read a
+/// JSON array / string metadata cell as "no governance" (NoPolicy, skipped)
+/// and the lenient row mapper reads unparseable text as `{}` — both fail open.
+fn read_level(conn: &Connection, namespace: &str) -> Result<AncestorLevel> {
+    type LevelRow = (Option<String>, bool, Option<String>);
+    let row: Option<LevelRow> = conn
+        .query_row(SQL_LEVEL, params![namespace], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, i64>(1)? != 0,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .optional()
+        .context("#4356 ancestor level read")?;
+    Ok(match row {
+        None => AncestorLevel::Absent,
+        Some((None, _, _) | (Some(_), false, _)) => AncestorLevel::Severed,
+        // A NULL metadata cell is not an object: corrupt.
+        Some((Some(_), true, raw)) => {
+            classify_standard_metadata_text(raw.as_deref().unwrap_or("null"))
+        }
+    })
+}
+
+/// The nearest governing ancestor of `namespace` on the GOVERNANCE chain.
+///
+/// # Errors
+///
+/// Any SQLite error (the caller refuses — fail-closed).
+pub fn governing_ancestor_binding(conn: &Connection, namespace: &str) -> Result<GoverningAncestor> {
+    let chain = super::build_namespace_governance_chain(conn, namespace)?;
+    select_governing_ancestor(
+        chain
+            .iter()
+            .rev()
+            .filter(|n| n.as_str() != namespace && n.as_str() != "*")
+            .map(|n| read_level(conn, n)),
+    )
+}
+
+/// The #3758 rebind gate + the #4356 ancestor gate for a SET on sqlite, from
+/// the connection (MCP / HTTP-sqlite / SAL-sqlite funnels). Every read fault
+/// maps to [`SetRefusal::Unverifiable`] (fail-closed). Callers that write run
+/// it INSIDE their `BEGIN IMMEDIATE` transaction (race-safe re-check).
+///
+/// # Errors
+///
+/// [`SetRefusal`].
+pub fn set_admission_conn(
+    conn: &Connection,
+    caller: &str,
+    bypass: bool,
+    namespace: &str,
+) -> Result<(), SetRefusal> {
+    if bypass {
+        return Ok(());
+    }
+    let binding = super::namespace_standard_binding(conn, namespace).map_err(|e| {
+        tracing::error!(target: crate::mcp::error_text::TRACE_TARGET, error = %e,
+            "namespace_set_standard: cannot read the current standard binding; refusing");
+        SetRefusal::Unverifiable
+    })?;
+    let ancestor = if crate::ns_standard_ancestor::needs_ancestor(&binding) {
+        governing_ancestor_binding(conn, namespace).map_err(|e| {
+            tracing::error!(target: crate::mcp::error_text::TRACE_TARGET, error = %e,
+                "namespace_set_standard: cannot resolve the governing ancestor; refusing");
+            SetRefusal::Unverifiable
+        })?
+    } else {
+        GoverningAncestor::None
+    };
+    set_admission(caller, false, namespace, &binding, &ancestor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn() -> Connection {
+        crate::storage::open(std::path::Path::new(":memory:")).expect("open")
+    }
+
+    fn standard(conn: &Connection, ns: &str, metadata: &str) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
+             confidence, source, access_count, created_at, updated_at, metadata) \
+             VALUES (?1, 'long', ?2, ?3, 'std', '[]', 5, 1.0, 'test', 0, ?4, ?4, ?5)",
+            params![id, ns, format!("std {id}"), now, metadata],
+        )
+        .expect("insert standard");
+        id
+    }
+
+    fn meta(conn: &Connection, ns: &str, sid: Option<&str>, parent: Option<&str>) {
+        conn.execute(
+            "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace) \
+             VALUES (?1, ?2, '2026-10-01T00:00:00Z', ?3)",
+            params![ns, sid, parent],
+        )
+        .expect("insert namespace_meta");
+    }
+
+    /// #4356 CR1 at the reader: an ancestor whose stored metadata is a JSON
+    /// array / string / invalid text / a corrupt governance blob is SEVERED,
+    /// so a stranger's first bind below it is refused (never NoPolicy-skipped).
+    #[test]
+    fn corrupt_ancestor_metadata_reads_severed_and_refuses_4356() {
+        for raw in [
+            "[]",
+            r#""x""#,
+            "{not json",
+            r#"{"agent_id":"a","governance":{"write":42}}"#,
+        ] {
+            let c = conn();
+            let sid = standard(&c, "s", raw);
+            meta(&c, "gov", Some(&sid), None);
+            assert_eq!(
+                governing_ancestor_binding(&c, "gov/leaf").expect("read"),
+                GoverningAncestor::Severed,
+                "{raw}"
+            );
+            assert_eq!(
+                set_admission_conn(&c, "s", false, "gov/leaf"),
+                Err(SetRefusal::AncestorUnresolvable),
+                "{raw}"
+            );
+        }
+    }
+
+    /// A read fault on the chain refuses (Unverifiable), never "ungoverned".
+    #[test]
+    fn chain_read_fault_refuses_4356() {
+        let c = conn();
+        c.execute_batch("DROP TABLE namespace_meta; CREATE TABLE namespace_meta (namespace TEXT)")
+            .expect("break the table");
+        assert_eq!(
+            set_admission_conn(&c, "s", false, "gov/leaf"),
+            Err(SetRefusal::Unverifiable)
+        );
+    }
+
+    /// F1 (code review, mutation-proven): the chain BUILDER must propagate a
+    /// read fault, not swallow it into "no parent". One hop's `parent_namespace`
+    /// is a BLOB (fails the String read on that hop only; every level read stays
+    /// intact), so a builder that swallowed the fault would drop the governed
+    /// `top` ancestor and ADMIT a stranger. The shared builder returns `Err` and
+    /// the gate refuses. Red if the shared builder swallows a read fault.
+    #[test]
+    fn chain_builder_propagates_a_parent_read_fault_4356() {
+        let c = conn();
+        let a = standard(
+            &c,
+            "s",
+            r#"{"agent_id":"a","governance":{"write":"owner"}}"#,
+        );
+        let n = standard(&c, "s", r#"{"agent_id":"a"}"#);
+        meta(&c, "top", Some(&a), None);
+        meta(&c, "root", Some(&n), Some("top"));
+        // Sanity (intact): the chain reaches `top`, the stranger is refused.
+        assert!(
+            crate::storage::build_namespace_governance_chain(&c, "root/leaf")
+                .expect("intact chain")
+                .contains(&"top".to_string())
+        );
+        assert_eq!(
+            set_admission_conn(&c, "stranger", false, "root/leaf"),
+            Err(SetRefusal::NotOwner)
+        );
+        c.execute(
+            "UPDATE namespace_meta SET parent_namespace = x'00ff' WHERE namespace = 'root'",
+            [],
+        )
+        .expect("blob the parent link");
+        assert!(
+            crate::storage::build_namespace_governance_chain(&c, "root/leaf").is_err(),
+            "the shared builder must propagate the read fault, not drop `top`"
+        );
+        assert_eq!(
+            set_admission_conn(&c, "stranger", false, "root/leaf"),
+            Err(SetRefusal::Unverifiable),
+            "a chain read fault refuses, never admits"
+        );
+    }
+}

@@ -456,7 +456,10 @@ fn handle_store_inner(
     // resolution falls back to defaults exactly as both legacy sites
     // did (`None.and_then(..)` ≡ `default().kind_class.auto_classify_kind`,
     // which is `None`).
-    let ns_policy = db::resolve_governance_policy(conn, &mem.namespace).unwrap_or_default();
+    // #4043 — a convenience knob only (auto-classify); an unreadable policy
+    // leaves it OFF. The authorization gate below re-resolves and REFUSES on
+    // a read fault.
+    let ns_policy = db::resolve_governance_policy_for_optional_feature(conn, &mem.namespace);
     crate::hooks::pre_store::maybe_auto_classify(&mut mem, ns_policy.kind_class.auto_classify_kind);
 
     // #626 Layer-3 (C7) — agent-attestation gate on the MCP store path.

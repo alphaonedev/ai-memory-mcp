@@ -2,6 +2,9 @@
 layout: doc
 ---
 # AI NHI Build Prompt — Unify the `private` Visibility Predicate + Durable Ownership + Namespace Required-Scope (§2.2)
+
+> **Point-in-time record, as of 2026-06-17.** The src/ file:line references in this document describe the source tree at commit `7f51c1d4d870` (read a file there with `git show 7f51c1d4d870:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 ### v0.8.0 EPIC #1709 fold-in · issue #1720 · `security-high` cross-tenant leak fix
 
 > **Feed this verbatim to the Claude Code CLI loop driving v0.8.0 EPIC #1709.**

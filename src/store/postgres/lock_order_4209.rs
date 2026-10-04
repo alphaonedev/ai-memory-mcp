@@ -42,6 +42,14 @@ pub(super) enum RowLock {
     /// endpoint. Compatible with other key-share holders (many links to one
     /// hot row do not serialise), conflicts with `FOR UPDATE`.
     KeyShare,
+    /// `FOR SHARE` (#4447): blocks an UPDATE of ANY column (unlike key-share,
+    /// which lets a non-key column such as `namespace` change underneath the
+    /// holder) while staying compatible with other `FOR SHARE` / `FOR KEY SHARE`
+    /// holders. The authorized federation link replay takes this as its ONE lock
+    /// per endpoint, so it can re-read the namespace under a lock that holds a
+    /// relocation off without ever upgrading a key-share lock (which would
+    /// deadlock two replays sharing an endpoint, 40P01).
+    Share,
     /// `FOR UPDATE`: the row is gated, rewritten or deleted.
     Update,
 }
@@ -65,6 +73,7 @@ pub(super) async fn lock_memories_in_id_order(
     for (id, lock) in canonical_lock_plan(rows) {
         let sql = match lock {
             RowLock::KeyShare => "SELECT 1 FROM memories WHERE id = $1 FOR KEY SHARE",
+            RowLock::Share => "SELECT 1 FROM memories WHERE id = $1 FOR SHARE",
             RowLock::Update => "SELECT 1 FROM memories WHERE id = $1 FOR UPDATE",
         };
         sqlx::query(sql).bind(id).fetch_optional(&mut *conn).await?;
@@ -105,6 +114,15 @@ pub(super) fn replay_endpoint_locks<'a>(
     [(source, RowLock::KeyShare), (target, RowLock::KeyShare)]
 }
 
+/// #4447 — the ids an AUTHORIZED federation link replay locks: both endpoints
+/// `FOR SHARE`, ONE lock each (never key-share then something stronger).
+pub(super) fn replay_endpoint_share_locks<'a>(
+    source: &'a str,
+    target: &'a str,
+) -> [(&'a str, RowLock); 2] {
+    [(source, RowLock::Share), (target, RowLock::Share)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +148,18 @@ mod tests {
         let plan = canonical_lock_plan(&link_endpoint_locks("same", "same"));
         assert_eq!(plan, vec![("same", RowLock::Update)]);
         let plan = canonical_lock_plan(&[("x", RowLock::KeyShare), ("x", RowLock::Update)]);
+        assert_eq!(plan, vec![("x", RowLock::Update)]);
+    }
+
+    #[test]
+    fn authorized_replay_takes_one_share_lock_per_endpoint_ascending_4447() {
+        let plan = canonical_lock_plan(&replay_endpoint_share_locks("z", "a"));
+        assert_eq!(plan, vec![("a", RowLock::Share), ("z", RowLock::Share)]);
+        // Share sits between key-share and update, so a duplicate keeps the
+        // strongest of the locks asked for.
+        let plan = canonical_lock_plan(&[("x", RowLock::KeyShare), ("x", RowLock::Share)]);
+        assert_eq!(plan, vec![("x", RowLock::Share)]);
+        let plan = canonical_lock_plan(&[("x", RowLock::Share), ("x", RowLock::Update)]);
         assert_eq!(plan, vec![("x", RowLock::Update)]);
     }
 }

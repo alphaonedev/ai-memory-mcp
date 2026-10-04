@@ -201,7 +201,9 @@ async fn resolved_write(
     ns: &str,
 ) -> Option<ai_memory::models::GovernanceLevel> {
     let lock = db.lock().await;
-    ai_memory::db::resolve_governance_policy(&lock.0, ns).map(|p| p.core.write)
+    ai_memory::db::resolve_governance_policy(&lock.0, ns)
+        .expect("#4043: governance policy read")
+        .map(|p| p.core.write)
 }
 
 /// Exact-scope peer sets standard on `secure` → would govern `secure/ops`.

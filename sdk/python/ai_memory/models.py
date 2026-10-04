@@ -333,11 +333,10 @@ class Stats(_Base):
 
 
 # ---------------------------------------------------------------------------
-# Subscriptions / webhooks / inbox / cluster
+# Subscriptions / webhooks / inbox
 #
-# These endpoints may not be merged on every server — the models are kept
-# loose (extra=allow) so the SDK can target in-flight server branches
-# without breaking when fields shift. Requests use snake_case to match the
+# The models are kept loose (extra=allow) so the SDK tolerates fields the
+# server adds without breaking. Requests use snake_case to match the
 # existing Rust serde conventions.
 # ---------------------------------------------------------------------------
 
@@ -395,6 +394,11 @@ class InboxMessage(_Base):
     # Handled = the recipient deleted the message (archived on this
     # namespace); ``unread_only`` is accepted for compatibility and narrows
     # nothing.
+
+
+# ---------------------------------------------------------------------------
+# Bulk create
+# ---------------------------------------------------------------------------
 
 
 class BulkCreateResponse(_Base):
