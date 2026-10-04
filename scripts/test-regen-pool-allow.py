@@ -121,6 +121,20 @@ def c_stale(t: Tree) -> bool:
     return t.regen() == 1 and t.read(ALLOW) == before and t.regen("--drop-stale") == 0 and t.gate() == 0
 
 
+def c_stale_group_gone(t: Tree) -> bool:
+    # #5257: when every entry of a group is dropped, its reason comment goes with it
+    if t.regen("--accept-new", "--reason", GOOD) != 0:
+        return False
+    t.write("docs/b.md", DOC2)
+    if t.regen("--accept-new", "--reason", REREAD) != 0 or t.gate() != 0:
+        return False
+    t.write("docs/a.md", "Nothing here now.\n")
+    if t.regen("--drop-stale") != 0 or t.gate() != 0:
+        return False
+    text = t.read(ALLOW)
+    return GOOD not in text and REREAD in text and "docs/b.md" in text
+
+
 def c_refresh(t: Tree) -> bool:
     t.regen("--accept-new", "--reason", GOOD)
     t.write("docs/a.md", DOC.replace("Filler one.", "This is now recommended."))
@@ -240,6 +254,7 @@ CASES: List[Tuple[str, Dict[str, Body], Callable[[Tree], bool]]] = [
     ("--check never writes", {"docs/a.md": DOC},
      lambda t: t.regen("--check", "--accept-new", "--reason", GOOD) == 1 and t.read(ALLOW) == ""),
     ("a stale entry is removed only with --drop-stale", {"docs/a.md": DOC}, c_stale),
+    ("a dropped group takes its reason comment with it", {"docs/a.md": DOC}, c_stale_group_gone),
     ("a changed neighbourhood is re-bound only with --refresh-context, keeping the reason", {"docs/a.md": DOC}, c_refresh),
     ("a repeated unit gets one entry per occurrence", {"docs/a.md": REPEATED},
      lambda t: t.regen("--accept-new", "--reason", GOOD) == 0 and t.gate() == 0),
@@ -296,6 +311,7 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("set-reason writes the reason", "                    out += (head + [\"# \" + text]) if mark else comments",
      "                    out += comments if mark else comments"),
     ("refresh keeps the group reason", '                    out.append("# " + current)  # a re-bound entry', '                    pass  # a re-bound entry'),
+    ("drop takes an emptied group's reason", "            del out[start:]  # every entry of this paragraph was dropped", "            pass"),
     ("refresh stays in its file", "            spare.setdefault(key[:2], []).append(key[2])", "            spare.setdefault(key[1:2], []).append(key[2])"),
     ("new entries carry ctx", '            out += ["%s%s%s | ctx:%s" % (rel, gate.SEPARATOR, text, ctx)] * n',
      '            out += ["%s%s%s" % (rel, gate.SEPARATOR, text)] * n'),

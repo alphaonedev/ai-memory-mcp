@@ -299,8 +299,17 @@ def main(argv):
     for old, ctx in refresh:
         redo.setdefault(old, []).append(ctx)
     block, current, restore = [], "", ""
+    start, dropped, kept = 0, False, False
+
+    def close_paragraph() -> None:
+        # #5257: a paragraph whose every entry was dropped takes its reason comments with it
+        if dropped and not kept:
+            del out[start:]  # every entry of this paragraph was dropped
+
     for line in raw.splitlines():
         if not line.strip():
+            close_paragraph()
+            start, dropped, kept = len(out), False, False
             block, current, restore = [], "", ""
         elif line.lstrip().startswith("#"):
             text = line.lstrip().lstrip("#").strip()
@@ -316,7 +325,9 @@ def main(argv):
             key = tuple(body.split(gate.SEPARATOR, 1)) + (found.group(1) if found else "",)
             if drop[key] > 0:
                 drop[key] -= 1
+                dropped = True
                 continue
+            kept = True
             if redo.get(key):
                 line = "%s | ctx:%s" % (body, redo[key].pop(0))
                 if current and not under_comment:
@@ -327,6 +338,7 @@ def main(argv):
                 out.append("# " + restore)  # the entries after a re-bound one keep their own reason
                 restore = ""
         out.append(line)
+    close_paragraph()
     if new:
         today = datetime.date.today().isoformat()
         for count, ((rel, text, ctx), n) in enumerate(sorted(new.items())):
