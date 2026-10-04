@@ -277,55 +277,24 @@ EOS
 # node_sh <idx0> -- run the script on stdin as root on that node.
 node_sh() { ssh $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
 
-# safe_excerpt <bytes> -- how a failure line shows a node's reply (#4999): the byte count plus a
-# bounded excerpt of printable ASCII only (control bytes, ESC and non-ASCII are dropped), with any
-# 20+ character token-like run and everything after a credential word replaced by [redacted]; the
-# node API key is also removed by value, and a reply that spells the key in any form
-# reply_carries_key knows is not excerpted at all. Never the raw reply. safe_code is the same for a
-# field that should be a 3-digit HTTP status: a status passes through, anything else is excerpted.
-safe_excerpt() {
-  local n s
-  n=$(printf '%s' "$1" | LC_ALL=C wc -c | LC_ALL=C tr -d ' ')
-  if reply_carries_key "$1"; then
-    s='[redacted: reply carries key material]'
-  else
-    s=$(printf '%s' "$1" | LC_ALL=C tr -cd '\040-\176' | LC_ALL=C tr 'A-Z' 'a-z' \
-        | LC_ALL=C sed -E 's#[a-z0-9+/_=-]{20,}#[redacted]#g; s#(api[_-]?key|authorization|bearer|password|passwd|secret|token|private|begin [a-z ]*key)[ -~]*#[redacted]#g' \
-        | LC_ALL=C head -c 120)
-    if [ -n "${api_key:-}" ]; then s=${s//"$api_key"/[redacted]}; fi
-  fi
-  printf '%s bytes: %s' "$n" "$s"
-}
-# reply_carries_key <reply> -- success when the reply holds the node API key (when this scope knows
-# it) however the node spelled it. It compares, it does not guess shapes: the reply is lower-cased
-# and every byte that is not a letter or digit is dropped (so any separator, newline or case
-# disappears), and the result is searched for the key; the same is done keeping only hex digits
-# (letters as separators) and against the key written as ASCII hex, as base64 of its text and as
-# base64 of its 32 raw bytes (padding and the url-safe signs dropped on both sides, the last four
-# characters ignored because a trailing newline changes them). Anything else a node could do to a
-# key (reverse it, encrypt it, split it across replies) is outside what a text compare can see.
-reply_carries_key() {
-  [ -n "${api_key:-}" ] || return 1
-  local k s1 s2 c i raw
-  k=$(printf '%s' "$api_key" | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -cd '0123456789abcdefghijklmnopqrstuvwxyz')
-  [ -n "$k" ] || return 1
-  s1=$(printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -cd '0123456789abcdefghijklmnopqrstuvwxyz')
-  s2=$(printf '%s' "$s1" | LC_ALL=C tr -cd '0123456789abcdef')
-  [[ "$s1" == *"$k"* || "$s2" == *"$k"* ]] && return 0
-  raw=$(for ((i = 0; i + 1 < ${#k}; i += 2)); do printf "\\x${k:i:2}"; done \
-    | base64 | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -cd '0123456789abcdefghijklmnopqrstuvwxyz')
-  for c in "$(printf '%s' "$api_key" | LC_ALL=C od -An -v -tx1 | LC_ALL=C tr -cd '0123456789abcdef')" \
-           "$(printf '%s' "$api_key" | base64 | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -cd '0123456789abcdefghijklmnopqrstuvwxyz')" \
-           "$raw"; do
-    [ "${#c}" -gt 8 ] || continue
-    [[ "$s1" == *"${c:0:${#c}-4}"* ]] && return 0
-  done
-  return 1
-}
-safe_code() {
+# Closed-world output (#4999, 5-agent vote 4d3ea1c5): no byte of a node reply reaches this terminal.
+# A PASS or FAIL line names a node-derived value only through these three helpers, whose output comes
+# from a closed set; a test lists them and fails on any other path from a node value to ok, no, die,
+# echo or printf. reply_status prints a 3-digit HTTP status, or the word non-status for anything else.
+# reply_len prints the reply's byte count. reply_version prints a version token only when it is 1 to 3
+# dot-separated groups of 1 to 3 ASCII digits, and the byte count of the whole reply otherwise.
+reply_status() {
   case "$1" in
     [0123456789][0123456789][0123456789]) printf '%s' "$1" ;;
-    *) safe_excerpt "$1" ;;
+    *) printf 'non-status' ;;
+  esac
+}
+reply_len() { printf '%s bytes' "$(printf '%s' "$1" | LC_ALL=C wc -c | LC_ALL=C tr -cd '0123456789')"; }
+reply_version() { # <token> <whole reply>
+  case "$1" in
+    '' | *[!0123456789.]* | .* | *. | *..* | *.*.*.* | *[0123456789][0123456789][0123456789][0123456789]*)
+      reply_len "$2" ;;
+    *) printf '%s' "$1" ;;
   esac
 }
 
@@ -381,7 +350,7 @@ EOS
     if [ "$code" = "200" ]; then
       ok "node $n /health over mTLS (200)"
     else
-      no "node $n /health over mTLS got '$(safe_code "$code")' (expected 200)"
+      no "node $n /health over mTLS got '$(reply_status "$code")' (expected 200)"
     fi
 
     if node_sh "$i" <<'EOS' >/dev/null 2>&1
@@ -404,9 +373,11 @@ EOS
 )"
     # #5172: the server_version token (first line, up to the first space) must be exactly 18.6.
     pg_ver="${versions%%$'\n'*}"; pg_ver="${pg_ver%% *}"
-    [ "$pg_ver" = 18.6 ] && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 ($(safe_excerpt "$versions"))"
-    echo "$versions" | grep -qx 'age=1.8.0' && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 ($(safe_excerpt "$versions"))"
-    echo "$versions" | grep -qx 'vector=0.8.6' && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 ($(safe_excerpt "$versions"))"
+    age_ver="$(printf '%s\n' "$versions" | sed -n 's/^age=//p' | head -n 1)"
+    vec_ver="$(printf '%s\n' "$versions" | sed -n 's/^vector=//p' | head -n 1)"
+    [ "$pg_ver" = 18.6 ] && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 (got $(reply_version "$pg_ver" "$versions"))"
+    echo "$versions" | grep -qx 'age=1.8.0' && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 (got $(reply_version "$age_ver" "$versions"))"
+    echo "$versions" | grep -qx 'vector=0.8.6' && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 (got $(reply_version "$vec_ver" "$versions"))"
   done
 
   # These two assertions intentionally originate on f2/public internet.
@@ -414,7 +385,7 @@ EOS
     : # legacy local allowlist is not authoritative after remote enrollment
   fi
   code="$(curl -sS --max-time 15 --cacert "$OUT_DIR/ca.crt" --cert "$OUT_DIR/hive-loadgen-f2.crt" --key "$OUT_DIR/hive-loadgen-f2.key" -o /dev/null -w '%{http_code}' "https://${PUBLIC_IPS[0]}:9077/api/v1/health" 2>/dev/null)"
-  [ "$code" = 200 ] && ok "f2 loadgen reaches public /health over mTLS (200)" || no "f2 public mTLS /health got '$(safe_code "$code")'"
+  [ "$code" = 200 ] && ok "f2 loadgen reaches public /health over mTLS (200)" || no "f2 public mTLS /health got '$(reply_status "$code")'"
   if curl -sS --max-time 10 --cacert "$OUT_DIR/ca.crt" -o /dev/null "https://${PUBLIC_IPS[0]}:9077/api/v1/health" 2>/dev/null; then
     no "public endpoint accepted a client with no certificate"
   else
@@ -440,10 +411,11 @@ EOS
     dummy_pub="$(head -c 32 /dev/zero | base64)"
     code="$(lg_curl -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' -H "X-Agent-Id: ai:hive-loadgen-f2" \
       -d "{\"pubkey_b64\":\"$dummy_pub\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents/$probe/pubkey" 2>/dev/null)"
-    case "$code" in 2*) ok "loadgen admin (ai:hive-loadgen-f2 + API key + mTLS) may bind agent keys ($(safe_code "$code"))";; *) no "loadgen admin bind got '$(safe_code "$code")' (expected 2xx)";; esac
+    # A PASS needs a 3-digit 2xx status: "2" and any other bytes is not one.
+    case "$code" in 2[0123456789][0123456789]) ok "loadgen admin (ai:hive-loadgen-f2 + API key + mTLS) may bind agent keys ($(reply_status "$code"))";; *) no "loadgen admin bind got '$(reply_status "$code")' (expected 2xx)";; esac
     code="$(lg_curl -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' -H "X-Agent-Id: ai:not-an-admin" \
       -d "{\"pubkey_b64\":\"$dummy_pub\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents/$probe/pubkey" 2>/dev/null)"
-    [ "$code" = 403 ] && ok "non-allowlisted name is refused admin (403) - header trust is off" || no "non-admin bind got '$(safe_code "$code")' (expected 403)"
+    [ "$code" = 403 ] && ok "non-allowlisted name is refused admin (403) - header trust is off" || no "non-admin bind got '$(reply_status "$code")' (expected 403)"
   else
     no "could not read the node API key for the admin-admission check"
   fi
@@ -462,7 +434,7 @@ EOS
   if [ "$code" = "200" ]; then
     ok "CROSS-HOST: node 1 reaches node 2 at $peerurl over mutual TLS (200)"
   else
-    no "CROSS-HOST: node 1 -> node 2 ($peerurl) got '$(safe_code "$code")' (expected 200)"
+    no "CROSS-HOST: node 1 -> node 2 ($peerurl) got '$(reply_status "$code")' (expected 200)"
   fi
 
   # A3 -- a W-of-N quorum write admitted at node 1 commits AND replicates.
@@ -489,13 +461,13 @@ EOS
     201|202)
       # #5145: an accepted write with no id cannot be read back at node 2, so it is not a PASS.
       if [ -z "$QID" ]; then
-        no "quorum write at node 1 was accepted ($(safe_code "$qcode")) with no memory id; replication to node 2 cannot be checked"
+        no "quorum write at node 1 was accepted ($(reply_status "$qcode")) with no memory id; replication to node 2 cannot be checked"
       elif [ "$qcode" = 201 ]; then
         ok "W-of-N quorum write at node 1 committed + replicated (201 quorum_met)"
       else
         ok "quorum write at node 1 locally durable (202; peer ack timing) -- the mesh channel carried it"
       fi ;;
-    *)   no "quorum write at node 1 got '$(safe_code "$qcode")' ($(safe_excerpt "$qjson"))"
+    *)   no "quorum write at node 1 got '$(reply_status "$qcode")' ($(reply_len "$qjson"))"
          QID="" ;; # a rejected write is not read back: node 2 must not print a PASS for it
   esac
   if [ -n "$QID" ] && ! plain_id "$QID"; then
@@ -550,7 +522,7 @@ EOS
       if [ "$scode" = "201" ] && [ -n "$SID" ]; then
         ok "signed write accepted at node 1 (201)"
       elif [ -z "$srefused" ]; then
-        no "signed write at node 1 got '$(safe_code "$scode")' ($(safe_excerpt "$sjson"))"
+        no "signed write at node 1 got '$(reply_status "$scode")' ($(reply_len "$sjson"))"
         SID="" # a rejected write is not read back: node 2 must not print a PASS for it
       fi
       if [ -n "$SID" ]; then
@@ -563,7 +535,7 @@ EOS
         case "$lvl" in
           agent_attested) ok "signed cross-peer write lands attest_level=agent_attested at node 2" ;;
           "")             no "signed write never reached node 2 (replication or author-enrollment failure)" ;;
-          *)              no "signed write reached node 2 at attest_level='$(safe_code "$lvl")' (expected agent_attested)" ;;
+          *)              no "signed write reached node 2 at an attest_level other than agent_attested ($(reply_len "$lvl"))" ;;
         esac
       fi
     fi

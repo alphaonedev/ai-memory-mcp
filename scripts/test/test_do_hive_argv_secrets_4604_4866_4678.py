@@ -449,8 +449,9 @@ def p1_temp_entry_fail_closed():
                 os.killpg(rp.pid, signal.SIGKILL)
                 rc, hung = rp.wait(), True
             left = sorted(q.name for q in rd.iterdir())
-            probe("P2 %s during the key write leaves no temp file and no api-key" % sig.name, started and not hung
-                  and rc not in (0, None) and not left, "started=%s rc=%s hung=%s left=%s" % (started, rc, hung, left))
+            # #5151: the trap's own exit status (130), not only any non-zero status.
+            probe("P2 %s during the key write leaves no temp file and no api-key, and exits 130" % sig.name, started and not hung
+                  and rc == 130 and not left, "started=%s rc=%s hung=%s left=%s" % (started, rc, hung, left))
         # After the block succeeds the trap is gone: a later interrupt ends the run by the default
         # action (signal death), it does not run the key-file cleanup or exit 130.
         reset()
@@ -465,146 +466,315 @@ def p1_temp_entry_fail_closed():
               and (kf.stat().st_mode & 0o777) == 0o600, "rc=%s" % rc)
 
 
+REPLY_HELPERS = ("reply_status", "reply_len", "reply_version")
+# The only paths from a node-derived value to a PASS/FAIL/REFUSE line or a terminal echo/printf (#4999,
+# 5-agent vote 4d3ea1c5). The set is closed: the test fails if federate.sh defines another reply_* helper
+# or if any other construct carries a node value to the terminal.
+ALLOWED = frozenset(REPLY_HELPERS)
+HOSTILE_LEN = 64
+
+
+def reply_defs(fs):
+    """The closed-world reply helpers in federate.sh, or empty when they are absent."""
+    i = fs.find("reply_status() {")
+    j = fs.find("# node_get <idx0>", i) if i >= 0 else -1
+    return fs[i:j] if 0 <= i < j else ""
+
+
+def bq(b):
+    """A bash ANSI-C literal that yields exactly the bytes b (no NUL)."""
+    return "$'" + "".join("\\x%02x" % c for c in b) + "'"
+
+
+def run_bash_bytes(script, d, lc="C.UTF-8", extra_env=None):
+    env = dict(os.environ, PATH=str(d) + os.pathsep + os.environ["PATH"], LOGDIR=str(d), LC_ALL=lc)
+    env.update(extra_env or {})
+    return subprocess.run(["bash", "-c", script], capture_output=True, stdin=subprocess.DEVNULL, env=env)
+
+
+def hostile_replies():
+    """Node replies of one byte length: the key, a postgres URL with a password, bytes that forge a
+    terminal line, seeded random bytes and a 2xx-looking value. None holds a NUL or a newline."""
+    import random
+    def pad(b):
+        assert len(b) <= HOSTILE_LEN
+        return b + b"~" * (HOSTILE_LEN - len(b))
+    rnd = random.Random(4999)
+    pool = [c for c in range(1, 256) if c != 10]
+    return (("the node API key", SECRET.encode()),
+            ("a postgres URL with a password", pad(b'{"e":"postgres://aimemory:x9zQ@10.20.0.5:5432/aimemory"}')),
+            ("ESC and control bytes that forge a PASS line", pad(b"\x1b[2K\r\x1b[32mPASS: node 1 PostgreSQL 18.6\x1b[0m\x07\x08\x7f\x01")),
+            ("seeded random bytes", bytes(rnd.choice(pool) for _ in range(HOSTILE_LEN))),
+            ("a 2xx-looking value that carries the key", pad(b"204 x-api-key: " + SECRET[:40].encode())))
+
+
+def clean_line(b):
+    """True when a byte line is printable ASCII and carries no secret, password or hostile marker, in any case."""
+    low = b.lower()
+    return (all(32 <= c < 127 for c in b) and SECRET.encode() not in low and SECRET[:16].encode() not in low
+            and b"x9zq" not in low and b"x-api-key" not in low)
+
+
 def failure_lines_4999():
-    """#4999: a failure line shows a bounded printable excerpt of a node reply, never the raw bytes."""
+    """#4999 closed world: no byte of a node reply reaches a failure line; status, length, version only."""
     fs = FED.read_text()
-    i = fs.find("safe_excerpt() {")
-    j = fs.find("# node_get <idx0>", i)
-    defs = fs[i:j] if 0 <= i < j else ""
-    probe("V1 safe_excerpt and safe_code exist", bool(defs))
-    longtok = "Zm9vYmFyYmF6cXV4" * 6
-    hostile = ('{"note":"see hunter2hunter ok","pad":"%s","error":"bad\x1b[31m\x01\x07 thing\x7f","id":"\xc3\xa9\xe2\x82\xac",'
-               '"k":"%s","t":"%s","Authorization":"Bearer short-tok","pem":"-----BEGIN PRIVATE KEY-----"}' % ("ab " * 100, SECRET, longtok))
+    defs = reply_defs(fs)
+    probe("V1 the closed-world reply helpers exist (reply_status, reply_len, reply_version)", bool(defs)
+          and all(h + "() {" in defs for h in REPLY_HELPERS))
+    probe("V1 the excerpt helpers are deleted (safe_excerpt, reply_carries_key, safe_code)",
+          not re.search(r"\b(?:safe_excerpt|reply_carries_key|safe_code)\b", fs))
+    defined = set(re.findall(r"^(reply_\w+)\(\) \{", fs, re.M))
+    probe("V1 the allow-list is exactly the reply_* helpers federate.sh defines", defined == set(ALLOWED), str(sorted(defined)))
     with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
         d = pathlib.Path(t)
-        sc = ("api_key=hunter2hunter\n%s\nb=$'%s'\nsafe_excerpt \"$b\"; echo\nsafe_code $'20\\x1b[31m1'; echo\nsafe_code 201; echo\n"
-              % (defs, hostile.replace("\\", "\\\\").replace("'", "\\'").replace("\x1b", "\\x1b").replace("\x01", "\\x01")
-                 .replace("\x07", "\\x07").replace("\x7f", "\\x7f")))
-        r = run_bash(sc.replace("short-tok", "short-tok hunter2hunter"), d)
-        out = r.stdout
-        lines = out.split("\n")
-        first = lines[0] if lines else ""
-        probe("V1 excerpt has no control or non-ASCII byte", all(32 <= ord(c) < 127 for c in out.replace("\n", "")) and bool(first), repr(out[:60]))
-        probe("V1 excerpt carries the byte count", first.startswith(str(len(hostile.replace("short-tok", "short-tok hunter2hunter").encode("utf-8"))) + " bytes: "), first[:30])
-        probe("V1 excerpt is bounded", len(first) <= 140, str(len(first)))
-        probe("V1 excerpt never holds the key, a token run, a credential word value or the api key by value",
-              SECRET not in out and longtok not in out and "short-tok" not in out and "hunter2hunter" not in out
-              and "PRIVATE KEY" not in out.upper(), first[:80])
-        probe("V1 safe_code passes a status and excerpts anything else", lines[2:3] == ["201"] and "bytes:" in (lines[1] if len(lines) > 1 else "")
-              and "\x1b" not in out, repr(lines[1:3]))
-        # Behaviour at the real sites: the quorum and the signed-write failure lines.
-        for var, cvar, jvar, start, end in (
-                ("quorum", "qcode", "qjson", '  case "$qcode" in', '  if [ -n "$QID" ] && ! plain_id'),
-                ("signed", "scode", "sjson", '      SID=$(echo "$sjson" | jq -r \'.id // empty\' 2>/dev/null)\n', '      if [ -n "$SID" ]; then\n        lvl=""')):
+        # reply_status: three ASCII digits, or the fixed word.
+        status_cases = ((b"200", b"200"), (b"201", b"201"), (b"2000", b"non-status"), (b"20", b"non-status"),
+                        (b"", b"non-status"), (b"20\x1b[31m", b"non-status"), (b"\xd9\xa2\xd9\xa0\xd9\xa0", b"non-status"),
+                        (b"\xef\xbc\x92\xef\xbc\x90\xef\xbc\x90", b"non-status"), (b" 200", b"non-status"),
+                        (b"200\n500", b"non-status"), (b"2\xc3\xa90", b"non-status"), (b"2x0", b"non-status"))
+        # reply_version: 1 to 3 dot-separated groups of 1 to 3 ASCII digits; anything else is a byte count.
+        ver_ok = (b"1", b"18", b"180", b"18.6", b"1.8.0", b"0.8.6", b"999.999.999")
+        ver_bad = (b"", b"1234", b"1.2.3.4", b"18.6.1.0", b"1..2", b".1", b"1.", b" 18.6", b"18.6 ", b"1e3",
+                   b"\xd9\xa1\xd9\xa8.6", b"\xef\xbc\x91\xef\xbc\x98", b"18.6x", b"-1", b"18,6", b"12345678901234567890",
+                   b"1.2345", b"18.6\x1b[0m", b"18.\xc3\xa96", b"1\n2", b"*", b"[0-9]", b"?")
+        for lc in ("C.UTF-8", "C"):
+            sc = "set -u\n" + defs + "\n"
+            for raw, _ in status_cases:
+                sc += "reply_status %s; echo\n" % bq(raw)
+            for raw in ver_ok + ver_bad:
+                sc += "reply_version %s %s; echo\n" % (bq(raw), bq(raw))
+            sc += "reply_len %s; echo\nreply_len ''; echo\n" % bq("\xe9\u20ac".encode())
+            r = run_bash_bytes(sc, d, lc)
+            lines = r.stdout.split(b"\n")
+            got_s = lines[:len(status_cases)]
+            want_s = [w for _, w in status_cases]
+            probe("V1 reply_status prints 3 ASCII digits or non-status, never other bytes (LC_ALL=%s)" % lc,
+                  bool(defs) and r.returncode == 0 and got_s == want_s, repr([g for g, w in zip(got_s, want_s) if g != w][:4]))
+            got_v = lines[len(status_cases):len(status_cases) + len(ver_ok) + len(ver_bad)]
+            want_v = list(ver_ok) + [b"%d bytes" % len(x) for x in ver_bad]
+            bad = [(x, g) for x, g, w in zip(ver_ok + ver_bad, got_v, want_v) if g != w]
+            probe("V1 reply_version accepts 1-3 groups of 1-3 digits and prints a byte count otherwise (LC_ALL=%s)" % lc,
+                  bool(defs) and len(got_v) == len(want_v) and not bad, repr(bad[:4]))
+            tail = lines[len(status_cases) + len(ver_ok) + len(ver_bad):]
+            probe("V1 reply_len counts bytes, not characters (LC_ALL=%s)" % lc, tail[:2] == [b"5 bytes", b"0 bytes"], repr(tail[:2]))
+        hostile = hostile_replies()
+        probe("V1 the hostile replies are equal in length and hold no NUL or newline",
+              len({len(h) for _, h in hostile}) == 1 and not any(b"\x00" in h or b"\n" in h for _, h in hostile))
+        # The two HTTP sites, run whole with each hostile reply as the body and as the status.
+        for site, cvar, jvar, start, end, pat in (
+                ("quorum", "qcode", "qjson", '  case "$qcode" in', '  if [ -n "$QID" ] && ! plain_id',
+                 rb"^NO quorum write at node 1 got '(\d{3}|non-status)' \((\d+) bytes\)$"),
+                ("signed", "scode", "sjson", '      srefused=""\n', '      if [ -n "$SID" ]; then\n        lvl=""',
+                 rb"^NO signed write at node 1 got '(\d{3}|non-status)' \((\d+) bytes\)$")):
             a = fs.find(start)
             b = fs.find(end, a) if a >= 0 else -1
             snip = fs[a:b] if 0 <= a < b else ""
-            # set -u as in federate.sh: a site that reads an unset flag is red here, not only in production.
-            sc = ("set -u\napi_key=''\n%s\nok() { echo \"OK $*\"; }\nno() { echo \"NO $*\"; }\nQID=''\nSID=''\n%s='500'\n%s=$'%s'\n%s\n"
-                  % (defs + plain_id_def(fs), cvar, jvar, hostile.replace("\\", "\\\\").replace("'", "\\'").replace("\x1b", "\\x1b")
-                     .replace("\x01", "\\x01").replace("\x07", "\\x07").replace("\x7f", "\\x7f"), snip))
-            r = run_bash(sc, d)
-            out = r.stdout
-            probe("V1 %s failure line prints no raw node bytes" % var, 0 <= a < b and "NO " in out and "bytes:" in out and SECRET not in out
-                  and longtok not in out and all(32 <= ord(c) < 127 for c in out.replace("\n", "")), out.strip()[:80])
-    # Each redaction rule on its own: the trigger sits inside the first 120 bytes and no other rule can
-    # mask it, so dropping or loosening any one rule is a FAIL line (a hostile reply padded past the cut
-    # tested only the cut).
-    rules = (("a 20-character token run", "", '{"t":"%s"}' % ("q7" * 10), "q7" * 10),
-             ("an upper-case token run", "", '{"t":"%s"}' % ("Q7" * 11), "q7" * 11),
-             ("an api_key value", "", '{"api_key":"x9z"}', "x9z"),
-             ("an Authorization value", "", '{"h":"Authorization: x9z"}', "x9z"),
-             ("a bearer value", "", '{"h":"bearer x9z"}', "x9z"),
-             ("a password value", "", '{"password":"x9z"}', "x9z"),
-             ("a passwd value", "", '{"passwd":"x9z"}', "x9z"),
-             ("a secret value", "", '{"secret":"x9z"}', "x9z"),
-             ("a token value", "", '{"token":"x9z"}', "x9z"),
-             ("a private value", "", '{"private":"x9z"}', "x9z"),
-             ("a PEM key header", "", "-----BEGIN EC KEY----- x9z", "x9z"),
-             ("the api key by value", "hunter2hunter", '{"k":"hunter2hunter"}', "hunter2hunter"))
-    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
-        d = pathlib.Path(t)
-        for label, key, body, leak in rules:
-            (d / "body").write_text(body)
-            r = run_bash("api_key='%s'\n%s\nb=$(cat %s)\nsafe_excerpt \"$b\"\n" % (key, defs, d / "body"), d)
-            low = r.stdout.lower()
-            probe("V2 excerpt redacts %s" % label, bool(defs) and "bytes: " in low and leak.lower() not in low,
-                  r.stdout.strip()[:80])
-        # The key itself, in every spelling a node could send: the failure line must carry none of it.
-        # The comparison is on the reply with separators and case removed, so no spelling needs its own
-        # pattern; each probe below is a different way to write the same 64 digits.
-        import base64
-        key = SECRET
-        grp = lambda s, n, sep: sep.join(s[k:k + n] for k in range(0, len(s), n))
-        raw_b64 = base64.b64encode(bytes.fromhex(key)).decode()
-        txt_b64 = base64.b64encode(key.encode()).decode()
-        spellings = (("space groups of 16", grp(key, 16, " ")),
-                     ("space groups of 4", grp(key, 4, " ")),
-                     ("dot groups of 8", grp(key, 8, ".")),
-                     ("dash groups of 8", grp(key, 8, "-")),
-                     ("colon pairs", grp(key, 2, ":")),
-                     ("newline groups of 16", grp(key, 16, "\n")),
-                     ("tab and comma groups", grp(key, 8, "\t,")),
-                     ("upper case", key.upper()),
-                     ("mixed case in groups", grp("".join(c.upper() if n % 2 else c for n, c in enumerate(key)), 16, " ")),
-                     ("a letter as the separator", grp(key, 16, "zz")),
-                     ("inside a JSON string", '{"detail":"key is %s now"}' % grp(key, 32, " ")),
-                     ("base64 of the text", txt_b64),
-                     ("base64 of the text in groups of 10", grp(txt_b64, 10, " ")),
-                     ("base64 of the raw bytes", raw_b64),
-                     ("base64 of the raw bytes in groups of 8", grp(raw_b64, 8, " ")),
-                     ("url-safe base64 of the raw bytes", raw_b64.replace("+", "-").replace("/", "_").rstrip("=")),
-                     ("base64 of the text and one more byte", grp(base64.b64encode((key + "~").encode()).decode(), 10, " ")),
-                     ("base64 of the raw bytes and one more byte", grp(base64.b64encode(bytes.fromhex(key) + b"\xff").decode(), 8, " ")),
-                     ("ASCII hex of the text in pairs", grp(key.encode().hex(), 2, " ")))
-        for label, body in spellings:
-            (d / "body").write_text(body)
-            r = run_bash("api_key='%s'\n%s\nb=$(cat %s)\nsafe_excerpt \"$b\"\n" % (key, defs, d / "body"), d)
-            out = r.stdout.lower()
-            sq = "".join(c for c in out if c.isalnum())
-            probe("V2 excerpt carries no key spelled as %s" % label, bool(defs) and "bytes: " in out
-                  and key[:12] not in sq and txt_b64[:12].lower() not in sq and raw_b64[:12].lower() not in sq
-                  and key.encode().hex()[:12] not in sq, r.stdout.strip()[:80])
-        # A reply that merely looks like a key is still shown (the compare is not a blanket redaction).
-        other = "".join("0123456789abcdef"[(n * 7 + 3) % 16] for n in range(64))
-        for label, body in (("an unrelated 64-digit hex value in groups", grp(other, 16, " ")),
-                            ("a short prefix of the key", key[:20] + " is not the key")):
-            (d / "body").write_text(body)
-            r = run_bash("api_key='%s'\n%s\nb=$(cat %s)\nsafe_excerpt \"$b\"\n" % (key, defs, d / "body"), d)
-            probe("V2 excerpt still shows %s" % label, "bytes: " in r.stdout and "key material" not in r.stdout, r.stdout.strip()[:80])
-        # A letter between groups defeats a hex-only compare of the raw reply, so the hex-only reduction
-        # is probed on its own; a key with upper-case letters is compared case-folded.
-        (d / "body").write_text(" q ".join(key[k:k + 16] for k in range(0, 64, 16)))
-        r = run_bash("api_key='%s'\n%s\nb=$(cat %s)\nsafe_excerpt \"$b\"\n" % (key, defs, d / "body"), d)
-        probe("V2 excerpt carries no key spelled in groups with a letter and spaces between", bool(defs) and "bytes: " in r.stdout
-              and key[:12] not in "".join(c for c in r.stdout if c.isalnum()), r.stdout.strip()[:80])
-        (d / "body").write_text("Hunter2Hunter")
-        r = run_bash("api_key='Hunter2Hunter'\n%s\nb=$(cat %s)\nsafe_excerpt \"$b\"\n" % (defs, d / "body"), d)
-        probe("V2 excerpt redacts an upper-case api key that arrives lower-cased", bool(defs) and "bytes: " in r.stdout
-              and "hunter2hunter" not in r.stdout.lower(), r.stdout.strip()[:80])
-        (d / "body").write_text("ab cd " * 100)
-        r = run_bash("api_key=''\n%s\nb=$(cat %s)\nsafe_excerpt \"$b\"\n" % (defs, d / "body"), d)
-        probe("V1 a long plain reply is cut to 120 bytes of excerpt", bool(defs) and r.stdout.startswith("600 bytes: ")
-              and len(r.stdout) == len("600 bytes: ") + 120, "len=%d %r" % (len(r.stdout), r.stdout[:30]))
-        # The hostile reply above is padded past the 120-byte window, so each filter is also probed with
-        # a short reply whose hostile part sits inside the window (otherwise truncation alone passes).
-        for label, raw, bad in (("control and non-ASCII bytes", "e:bad\\x1b[31m\\x01\\x07 \\xc3\\xa9\\xe2\\x82\\xac end", None),
-                                ("a token run", "t:" + longtok + " end", longtok[:20].lower()),
-                                ("a credential word value", "Authorization: Bearer short-tok", "short-tok")):
-            r = run_bash("api_key=''\n%s\nsafe_excerpt $'%s'\n" % (defs, raw), d)
-            o = r.stdout
-            probe("V1 short reply with %s is filtered inside the window" % label, bool(defs) and " bytes: " in o
-                  and all(32 <= b < 127 for b in o.encode("utf-8", "surrogateescape"))
-                  and (bad is None or bad not in o.lower()), repr(o[:80]))
-    # No failure line in verify interpolates a node-derived value unsanitised.
-    vi = fs.index("\nverify() {")
-    raw = []
-    for n, l in enumerate(fs[vi:].splitlines()):
-        if re.search(r'\bno "', l):
-            rest = re.sub(r'\$\(safe_(?:code|excerpt) "\$\w+"\)', "", l[re.search(r'\bno "', l).start():])
-            if re.search(r"\$\{?(?:code|qcode|scode|lvl|qjson|sjson|versions|resp|sresp)\b", rest):
-                raw.append(n)
-    probe("V1 no failure line in verify prints a node-derived value unsanitised", not raw, str(raw))
+            for codemode in ("500", "hostile"):
+                outs = {}
+                for lc in ("C.UTF-8", "C"):
+                    for label, h in hostile:
+                        code = bq(h) if codemode == "hostile" else "'500'"
+                        sc = ("set -u\n%s\n%s\nok() { echo \"OK $*\"; }\nno() { echo \"NO $*\"; }\nQID=''\nSID=''\n%s=%s\n%s=%s\n%s\n"
+                              % (defs, plain_id_def(fs), cvar, code, jvar, bq(h), snip))
+                        r = run_bash_bytes(sc, d, lc)
+                        outs[(lc, label)] = r.stdout + b"|" + r.stderr
+                lines = set(outs.values())
+                one = next(iter(lines))
+                fl = one.split(b"|")[0].rstrip(b"\n")
+                want = b"'500'" if codemode == "500" else b"'non-status'"
+                probe("V1 %s failure line is byte-identical for every equal-length hostile reply (status %s)" % (site, codemode),
+                      bool(snip) and len(lines) == 1, "%d distinct" % len(lines))
+                probe("V1 %s failure line matches the fixed pattern (status %s)" % (site, codemode),
+                      bool(snip) and re.match(pat, fl) is not None and want in fl and fl.endswith(b"(%d bytes)" % HOSTILE_LEN),
+                      repr(fl[:100]))
+                probe("#5152 %s failure line never prints the URL password or the key (status %s)" % (site, codemode),
+                      bool(snip) and all(clean_line(v.replace(b"\n", b" ").replace(b"|", b" ")) for v in outs.values()))
+        # The three psql version lines: a hostile token prints the byte count of the whole reply.
+        vb = version_block(fs)
+        outs = {}
+        for lc in ("C.UTF-8", "C"):
+            for label, h in hostile:
+                reply = b"Q" + h + b"\nage=Q" + h + b"\nvector=Q" + h
+                r = run_versions_bytes(fs, defs, reply, d, lc)
+                outs[(lc, label)] = r.stdout + b"|" + r.stderr
+        lines = set(outs.values())
+        one = next(iter(lines)).split(b"|")[0].splitlines()
+        vpat = rb"\(got (?:\d{1,3}(?:\.\d{1,3}){0,2}|\d+ bytes)\)$"
+        probe("V1 version failure lines are byte-identical for every equal-length hostile reply", bool(vb) and len(lines) == 1,
+              "%d distinct" % len(lines))
+        probe("V1 version failure lines match the fixed pattern", bool(vb) and len(one) == 3
+              and all(l.startswith(b"NO ") and re.search(vpat, l) for l in one)
+              and all(l.endswith(b"(got %d bytes)" % (3 * HOSTILE_LEN + 16)) for l in one), repr(one))
+        probe("#5152 version failure lines never print the URL password or the key",
+              all(clean_line(v.replace(b"\n", b" ").replace(b"|", b" ")) for v in outs.values()))
+        r = run_versions_bytes(fs, defs, b"17.2\nage=1.7.0\nvector=0.8.5", d, "C.UTF-8")
+        probe("V1 a benign version mismatch names the version token", r.stdout.splitlines() == [
+            b"NO node 1 PostgreSQL is not 18.6 (got 17.2)", b"NO node 1 AGE is not 1.8.0 (got 1.7.0)",
+            b"NO node 1 pgvector is not 0.8.6 (got 0.8.5)"], repr(r.stdout[:160]))
+        r = run_versions_bytes(fs, defs, b"17.2.1.0\nage=1.8.0.1\nvector=12345", d, "C.UTF-8")
+        probe("V1 an over-long version token prints the byte count, not the token", r.stdout.splitlines() == [
+            b"NO node 1 PostgreSQL is not 18.6 (got 33 bytes)", b"NO node 1 AGE is not 1.8.0 (got 33 bytes)",
+            b"NO node 1 pgvector is not 0.8.6 (got 33 bytes)"], repr(r.stdout[:160]))
+        verify_canary(fs, d, hostile)
+    closed_world_taint(fs)
+
+
+def run_versions_bytes(fs, defs, reply, d, lc):
+    (d / "versions.reply").write_bytes(reply)
+    sc = ("set -u\n%s\nok() { echo \"OK $*\"; }\nno() { echo \"NO $*\"; }\nNODE_COUNT=1\napi_key=''\n"
+          "node_sh() { cat %s; }\n%s\n" % (defs, d / "versions.reply", version_block(fs)))
+    return run_bash_bytes(sc, d, lc)
+
+
+def verify_canary(fs, d, hostile):
+    """Run the whole verify step with every node channel answering one hostile reply: the terminal output
+    is byte-identical across replies and carries no reply byte."""
+    k = fs.find("# --- main")
+    (d / "fed-prefix.sh").write_text(fs[:k] if k > 0 else "")
+    (d / "signer").write_text("#!/bin/bash\necho sig\n")
+    (d / "signer").chmod(0o755)
+    for mode in ("all-hostile", "id-then-hostile-level"):
+        outs = {}
+        for lc in ("C.UTF-8", "C"):
+            for label, h in hostile:
+                # A JSON-safe variant for the attest_level string (jq decodes it back to these bytes).
+                hj = bytes(c if c >= 32 and c != 127 and c < 128 and c not in (34, 92) else 0x3f for c in h)
+                if mode == "all-hostile":
+                    post = "printf '%s\\n%s' \"$H\" \"$H\""
+                    get = "printf '%s' \"$H\""
+                else:
+                    post = "printf '%s\\n%s' '{\"id\":\"abc\"}' 201"
+                    get = "printf '{\"id\":\"abc\",\"metadata\":{\"attest_level\":\"%%s\"}}' %s" % bq(hj)
+                sc = ("set -u\nH=%s\nV=$'Q'\"$H\"$'\\nage=Q'\"$H\"$'\\nvector=Q'\"$H\"\n"
+                      "source %s\n"
+                      "NODE_COUNT=2\nPUBLIC_IPS=(h1 h2)\nPEER_URLS=(https://p1:9077 https://p2:9077)\n"
+                      "node_sh() { local s; s=$(cat); case \"$s\" in *server_version*) printf '%%s' \"$V\" ;; *) printf '%%s' \"$H\" ;; esac; }\n"
+                      "on_node() { case \"$2\" in *api-key*) printf '%%s\\n' %s ;; *) printf '%%s' \"$H\" ;; esac; }\n"
+                      # curl as the real one: -w writes to stdout, -o /dev/null drops the body.
+                      "curl() { cat >/dev/null; case \" $* \" in *' -w '*) printf '%%s' \"$H\" ;; *' -o '*) : ;; *) printf '%%s' \"$H\" ;; esac; }\n"
+                      "node_post() { %s; }\nnode_get() { %s; }\nsleep() { :; }\n"
+                      "verify; echo \"rc=$?\"\n"
+                      % (bq(h), d / "fed-prefix.sh", SECRET, post, get))
+                r = run_bash_bytes(sc, d, lc, {"SIGNER": str(d / "signer"), "AUTHOR_KEY_DIR": str(d), "OUT_DIR": str(d / "out")})
+                outs[(lc, label)] = r.stdout + b"|" + r.stderr
+        distinct = set(outs.values())
+        one = next(iter(distinct))
+        probe("V1 whole verify output is byte-identical for every equal-length hostile reply (%s)" % mode,
+              k > 0 and len(distinct) == 1 and b"federate verify:" in one, "%d distinct; %r" % (len(distinct), one[-120:]))
+        probe("#5152 whole verify output carries no key, URL password, ESC or non-ASCII byte (%s)" % mode,
+              k > 0 and all(clean_line(v.replace(b"\n", b" ").replace(b"|", b" ")) for v in outs.values()))
+        nlines = [l for l in one.split(b"|")[0].splitlines() if l.startswith(b"FAIL: ")]
+        probe("V1 whole verify reports the hostile replies as failures (%s)" % mode, len(nlines) >= (6 if mode == "all-hostile" else 1),
+              str(len(nlines)))
+
+
+TAINT_SOURCES = ("on_node", "node_sh", "node_get", "node_post", "curl", "lg_curl", "ssh", "scp")
+SINKS = ("ok", "no", "die", "echo", "printf")
+
+
+def _segments(line, name_re):
+    """(command, argument text) for each sink command in a logical line; quote- and $()-aware."""
+    out = []
+    for m in re.finditer(r"(?:^|(?<=[\s;(&|]))(%s)(?=\s)" % name_re, line):
+        before = line[:m.start()]
+        # Skip a match that sits inside a quoted string (a message naming a command).
+        if before.count('"') % 2 == 1 and "$(" not in before[before.rfind('"'):]:
+            continue
+        i, depth, quote, end = m.end(), 0, None, len(line)
+        while i < len(line):
+            c = line[i]
+            if c == "\\":
+                i += 2
+                continue
+            if quote == "'":
+                quote = None if c == "'" else quote
+            elif line.startswith("$(", i):
+                depth += 1
+                i += 1
+            elif c == ")" and depth:
+                depth -= 1
+            elif c == '"':
+                quote = None if quote == '"' else ('"' if not depth else quote)
+            elif c == "'" and quote is None:
+                quote = "'"
+            elif quote is None and depth == 0 and (c in ";|" or line.startswith("&&", i) or c == ")"):
+                end = i
+                break
+            i += 1
+        out.append((m.group(1), line[m.end():end], line[end:end + 2], before))
+    return out
+
+
+def tainted_names(text):
+    """Variables that hold a node-derived value: assigned from a node channel, or from such a variable."""
+    assigns = []
+    for _, line, _ in logical_lines(text):
+        for m in re.finditer(r"(?:^|[\s;(])(?:local\s+)?(\w+)=(\"\$\(.*|\$\(.*|\"[^\"]*\"|\S*)", line):
+            assigns.append((m.group(1), m.group(2)))
+    names = set()
+    while True:
+        new = {v for v, rhs in assigns if v not in names and (
+            re.search(r"(?<![\w$-])(?:%s)(?![\w-])" % "|".join(TAINT_SOURCES), rhs)
+            or any(re.search(r"\$\{?#?%s\b" % re.escape(n), rhs) for n in names))}
+        if not new:
+            return names
+        names |= new
+
+
+def taint_findings(text, names):
+    """Sink commands whose arguments name a node-derived variable other than through an allowed helper."""
+    bad, checked = [], 0
+    helper = r"\$\((?:%s)(?: \"\$\{?\w+\}?\")+\)" % "|".join(sorted(ALLOWED))
+    for n, line, func in logical_lines(text):
+        if func in ALLOWED or re.match(r"^\s*(?:ok|no|die)\(\) \{", line):
+            continue
+        for cmd, args, after, before in _segments(line, "|".join(SINKS)):
+            if cmd in ("echo", "printf"):
+                # Output into a pipe, a capture or a file is not the terminal.
+                if after.startswith("|") and not after.startswith("||"):
+                    continue
+                if before.count("$(") > before.count(")"):
+                    continue
+                if re.search(r"(?<![0-9&])>\s*(?!&)\S", args):
+                    continue
+            checked += 1
+            rest = re.sub(helper, "", args)
+            hit = [v for v in names if re.search(r"\$\{?[#!]?%s\b" % re.escape(v), rest)]
+            if hit:
+                bad.append("%d:%s:%s" % (n, cmd, ",".join(sorted(hit))))
+    return bad, checked
+
+
+def closed_world_taint(fs):
+    """Source-level closed world: no node-derived variable reaches ok/no/die/echo/printf except through
+    reply_status, reply_len or reply_version."""
+    names = tainted_names(fs)
+    expect = {"code", "versions", "api_key", "resp", "qcode", "qjson", "QID", "landed", "sresp", "scode", "sjson",
+              "SID", "lvl", "pg_ver", "age_ver", "vec_ver"}
+    probe("V1 the taint scan finds every node-derived variable (not vacuous)", expect <= names, str(sorted(expect - names)))
+    bad, checked = taint_findings(fs, names)
+    probe("V1 no node-derived variable reaches a terminal line except through reply_status/reply_len/reply_version",
+          not bad, " ".join(bad[:8]))
+    probe("V1 the taint scan checks the terminal lines (not vacuous)", checked >= 60, str(checked))
+    wrap = lambda body: fs + "\nprobe_fn() {\n%s\n}\n" % body
+    for label, body in (("a raw reply in a failure line", 'no "x $qjson"'),
+                        ("an excerpt helper outside the allow-list", 'no "x $(safe_excerpt "$qjson")"'),
+                        ("an echo of the attest level", 'echo "$lvl"'),
+                        ("a printf of the memory id", "printf '%s\\n' \"$QID\""),
+                        ("an echo inside a failure line", 'no "x $(echo "$sjson")"'),
+                        ("a length expansion in a PASS line", 'ok "x ${#resp}"'),
+                        ("the key in a refusal", 'die "bad key $api_key"'),
+                        ("a helper and then the raw status", 'no "x $(reply_len "$qjson") $qcode"'),
+                        ("a helper wrapping a pipeline", 'no "x $(reply_len "$qjson" | cat; echo "$qjson")"'),
+                        ("a variable derived from a reply", 'tok="${versions%% *}"\nno "x $tok"'),
+                        ("an echo to stderr", 'echo "$code" >&2')):
+        b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
+        probe("V1 closed-world negative control is flagged: %s" % label, len(b2) > len(bad), str(b2[len(bad):][:2]))
+    for label, body in (("helpers only", 'no "x $(reply_status "$qcode") ($(reply_len "$qjson"))"'),
+                        ("a reply piped to grep", "echo \"$versions\" | grep -qx 'age=1.8.0'"),
+                        ("a reply captured through sed", "age_ver=\"$(printf '%s\\n' \"$versions\" | sed -n 's/^age=//p')\"")):
+        b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
+        probe("V1 closed-world control is accepted: %s" % label, len(b2) == len(bad), str(b2[len(bad):][:2]))
 
 
 def n1_no_locale_ranges():
@@ -654,14 +824,14 @@ def f2_node_get_id():
         j = fs.find('      if [ -n "$SID" ]; then\n        lvl=""', i) if i >= 0 else -1
         snip = fs[i + len('      SID=$(echo "$sjson" | jq -r \'.id // empty\' 2>/dev/null)\n'):j] if 0 <= i < j else ""
         sc = ("set -u\n%s\nok() { echo OK; }\nno() { echo \"NO $*\"; }\nnode_get() { echo CALLED; }\nsleep() { :; }\n"
-              "scode=500\nsjson='{}'\nSID=''\n%s\necho done\n" % (plain_id_def(fs) + "\n" + fs[fs.find("safe_excerpt() {"):fs.find("# node_get <idx0>")], snip))
+              "scode=500\nsjson='{}'\nSID=''\n%s\necho done\n" % (plain_id_def(fs) + "\n" + reply_defs(fs), snip))
         r = run_bash(sc, d)
         probe("#4957 a failed signed write with no id is one failure line, with srefused initialised under set -u",
               0 <= i < j and r.returncode == 0 and "done" in r.stdout and r.stdout.count("NO ") == 1 and "'500'" in r.stdout
               and "OK" not in r.stdout and "unbound" not in r.stderr, (r.stdout + r.stderr).strip()[:100])
         # #5104: a rejected write must not be followed by a node-2 PASS. Each site runs whole, readback
         # included, with a node_get that would report success; a failed write is one FAIL and no readback.
-        defs = plain_id_def(fs) + "\n" + fs[fs.find("safe_excerpt() {"):fs.find("# node_get <idx0>")]
+        defs = plain_id_def(fs) + "\n" + reply_defs(fs)
         qa = fs.find('  case "$qcode" in')
         qb = fs.find("  # A4 --", qa) if qa >= 0 else -1
         sa = fs.find('      SID=$(echo "$sjson" | jq -r \'.id // empty\' 2>/dev/null)\n')
@@ -820,10 +990,7 @@ def run_versions(fs, defs, reply, d):
 def pg_version_5172():
     """#5172: PostgreSQL passes only when the server_version token is exactly 18.6."""
     fs = FED.read_text()
-    i, j = fs.find("safe_excerpt() {"), fs.find("# node_get <idx0>")
-    if i < 0:
-        i = fs.find("reply_status() {")
-    defs = fs[i:j] if 0 <= i < j else ""
+    defs = reply_defs(fs)
     tail = "\nage=1.8.0\nvector=0.8.6\n"
     with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
         d = pathlib.Path(t)
