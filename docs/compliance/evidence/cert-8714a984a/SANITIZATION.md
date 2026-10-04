@@ -106,7 +106,7 @@ No secret material is recorded here.
 ## Labour split (recorded, not stylistic)
 
 f2h (ai:rehearsal-f2h) RAN every leg on the batch-7 tip, WROTE the cert record
-and this file, and generated `MANIFEST.sha256` LAST. The reviewer (f2r) is
-asked to VERIFY every number in the record against these committed files (the
-author≠reviewer rule); until that verification is recorded in the cert record,
-the re-issue is author-attested only.
+and this file, and generated `MANIFEST.sha256` LAST. The reviewer (f2r,
+ai:reviewer-f2r) VERIFIED every number in the record against git and these
+committed files on 2026-10-04 (the author≠reviewer rule; verdict on #5033, no
+change requested).

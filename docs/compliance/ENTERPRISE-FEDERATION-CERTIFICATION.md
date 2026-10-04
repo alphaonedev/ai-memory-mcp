@@ -170,9 +170,9 @@ certification and triggers re-cert** (see §7).
 > `77ba9d9e6045d7d53357750584285c4a3feac5a8c32a67d8ba2de93c0e1ee859`.
 >
 > Labour split, recorded: f2h (ai:rehearsal-f2h) RAN every leg, WROTE this
-> record and generated `MANIFEST.sha256` LAST; f2r is asked to VERIFY every
-> number against the committed evidence (author ≠ reviewer) — until that is
-> recorded here the re-issue is author-attested only.
+> record and generated `MANIFEST.sha256` LAST; f2r (ai:reviewer-f2r) VERIFIED
+> every number above against git and the committed evidence on 2026-10-04
+> (author ≠ reviewer; verdict on #5033, no change requested).
 >
 > **Re-issue (2026-10-02, batch 6 @ `385da3a05`).** The §7 re-cert trigger
 > FIRED: three watched federation-wire paths changed between `eba96b307` and
