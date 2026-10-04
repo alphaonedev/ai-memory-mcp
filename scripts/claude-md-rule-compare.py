@@ -151,6 +151,14 @@ def fenced(body: str, info: str = "diff") -> list:
     return [fence + info, body, fence]
 
 
+def span(text: str) -> str:
+    """R5 (#5166): head-controlled text outside a fence (a heading, a guard message, a trailer value) as one
+    inline code span, longer than any backtick run inside it, on one line, so it never renders as Markdown."""
+    flat = " ".join(text.splitlines())
+    ticks = "`" * (max((len(run) for run in re.findall(r"`+", flat)), default=0) + 1)
+    return f"{ticks} {flat} {ticks}"
+
+
 def trusted_changes(repo: Path, base_sha: str, head_sha: str) -> list:
     """The TRUSTED_PATHS the head changes relative to its merge base with the base (fail closed on git error)."""
     merge_base = git(repo, "merge-base", base_sha, head_sha).decode("ascii").strip()
@@ -209,20 +217,20 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
         if old is not None and new is not None and key.startswith(CENSUS_SECTION) and (
                 CENSUS_DIGITS.sub("#", old) == CENSUS_DIGITS.sub("#", new)):
             count_changed = True
-            lines += [f"### COUNT CHANGED: {key}", "", "Only census counts differ.", ""] + fenced(
+            lines += [f"### COUNT CHANGED: {span(key)}", "", "Only census counts differ.", ""] + fenced(
                 unified(old, new, key)) + [""]
         else:
             rule_changed = True
             state = "removed" if new is None else ("added" if old is None else "changed")
-            lines += [f"### RULE TEXT CHANGED ({state}): {key}", ""] + fenced(
+            lines += [f"### RULE TEXT CHANGED ({state}): {span(key)}", ""] + fenced(
                 unified(old or "", new or "", key)) + [""]
     for key in duplicates:
         rule_changed = True
-        lines += [f"### RULE TEXT CHANGED (duplicated heading): {key}", ""]
+        lines += [f"### RULE TEXT CHANGED (duplicated heading): {span(key)}", ""]
     residual = [error for error in guard.check(head_root, index_pins) if not any(marker in error for marker in DRIFT_MARKERS)]
     for error in residual:
         rule_changed = True
-        lines.append(f"- BASE GUARD REFUSES THE HEAD: {error}")
+        lines.append(f"- BASE GUARD REFUSES THE HEAD: {span(error)}")
     if residual:
         lines.append("")
     for rel in trusted_changes(repo, base_sha, head_sha):
@@ -235,7 +243,8 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
         lines.append("RESULT: FAIL - the rule text changed and no commit in the range carries a "
                      "`Rule-Change-Approved-By: <who>` trailer.")
     elif rule_changed:
-        lines.append("RESULT: PASS - rule text changed; approval trailer(s): " + "; ".join(approved)
+        lines.append("RESULT: PASS - rule text changed; approval trailer(s): "
+                     + "; ".join(span(value) for value in approved)
                      + ". This is tamper-evidence: the trailer is data, and review plus the sole merger enforce.")
     elif count_changed:
         lines.append("RESULT: PASS - only counts changed (printed above for review).")
@@ -357,7 +366,7 @@ def self_test() -> int:
 
     case("reworded section without a trailer fails with the diff", reword, True, "RULE TEXT CHANGED")
     case("the diff names the section and shows the change", reword, True, "+The tool limit is NOT 103 tools.")
-    case("reworded section with the trailer passes", reword, False, "approval trailer(s): Justin", trailer="Justin")
+    case("reworded section with the trailer passes", reword, False, "approval trailer(s): ` Justin `", trailer="Justin")
     case("a trailer quoted mid-line does not count", reword, True, "RESULT: FAIL",
          message="head change Rule-Change-Approved-By: Justin")
     case("an empty trailer value does not count", reword, True, "RESULT: FAIL",
@@ -398,6 +407,14 @@ def self_test() -> int:
          census_edit("(97 in the default build)", "(97 in the default build) 12"), True, "RULE TEXT CHANGED")
     case("a census count in non-ASCII digits is a rule change (R5, #5165)",
          census_edit("103 MCP tools", "\u0661\u0660\u0664 MCP tools"), True, "RULE TEXT CHANGED")
+
+    def link_heading(root):
+        target = root / "CLAUDE.md"
+        target.write_text(target.read_text(encoding="utf-8") + "\n## [ok](https://e.invalid/x)\n\nbody\n",
+                          encoding="utf-8")
+
+    case("a head heading is a code span in the summary (R5, #5166)", link_heading, True,
+         "RULE TEXT CHANGED (added): ` ## [ok](https://e.invalid/x) `")
 
     def trusted_write(rel, data=b"# weakened\n"):
         def apply(root):
