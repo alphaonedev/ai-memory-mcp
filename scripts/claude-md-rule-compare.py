@@ -55,7 +55,7 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 CENSUS_SECTION = "## Prime directive"
 CENSUS_DIGITS = re.compile(
     r"\b\d+(?=\s+(?:MCP tools|production HTTP route registrations|unique URL paths|CLI subcommands|"
-    r"in the default build)\b)")
+    r"in the default build)\b)", re.ASCII)  # R5 (#5165): ASCII digits only; any other digit is rule text
 # R4 (#4507): the code and configuration that judge a rule change. A change to any of them is reported and needs
 # the trailer, so a guard weakened in one PR cannot silently judge the next one. The manifest is not listed: the
 # section comparison above already judges it against the base.
@@ -396,6 +396,8 @@ def self_test() -> int:
          census_edit("103 MCP tools and", "103 MCP toolz and"), True, "RULE TEXT CHANGED")
     case("a census digit changed without its unit word is a rule change (R4)",
          census_edit("(97 in the default build)", "(97 in the default build) 12"), True, "RULE TEXT CHANGED")
+    case("a census count in non-ASCII digits is a rule change (R5, #5165)",
+         census_edit("103 MCP tools", "\u0661\u0660\u0664 MCP tools"), True, "RULE TEXT CHANGED")
 
     def trusted_write(rel, data=b"# weakened\n"):
         def apply(root):
