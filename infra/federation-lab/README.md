@@ -101,7 +101,7 @@ they never load or download an embedding model.
 ./run.sh --corpus-db /path/to/your.db     # seed YOUR local corpus instead of the fixture
 ./run.sh --recall-query 'kiln rotation'   # choose the corpus-recall proof query
 ./run.sh --no-caveat-probe        # skip the asi-hard full-profile cold-boot demonstration
-./run.sh --probe-mutation          # lower the rollback-check knob in the probe; the probe must go RED (exits non-zero by design)
+./run.sh --probe-mutation          # lower the rollback-check knob in the probe; the boot must refuse for that knob (PASS row)
 ./run.sh --posture-selftest       # drift-guard legs only (names AND values), no daemons
 ./run.sh --help
 ```
@@ -295,7 +295,8 @@ The step-5 cold-boot probe keeps that fix honest. It boots one throwaway node on
 database under the **full** `AI_MEMORY_SECURITY_PROFILE=asi-hard` profile and requires it to
 come up listening; a boot that refuses is a FAIL. `./run.sh --probe-mutation` re-runs the
 probe with `AI_MEMORY_REQUIRE_ROLLBACK_CHECK=0` (below the floor, which the profile refuses)
-and requires the probe to go red, which proves the probe can fail.
+and requires the boot to refuse with an error naming that knob, which proves the probe can fail;
+a refusal for any other reason, or a node that listens, is a FAIL.
 
 Some of the pinned knobs are *permissive* hatches whose hard floor is "unset"
 (for example `AI_MEMORY_ALLOW_SCHEMA_AHEAD`, #2445, and
