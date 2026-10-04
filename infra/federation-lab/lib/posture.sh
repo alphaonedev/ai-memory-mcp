@@ -281,7 +281,8 @@ lab_posture_selftest() {
   local plog; plog="$(mktemp -d "${TMPDIR:-.}/probe-matcher.XXXXXX")" || return 1
   printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n' > "$plog/ok.log"
   printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK_STRICT: nope\n' > "$plog/other-knob.log"
-  printf 'INFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/info-only.log"
+  printf 'boot\nINFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/info-only.log"
+  printf 'INFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\nfatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n' > "$plog/info-then-refusal.log"
   awk 'BEGIN { print "fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1"
                for (i = 0; i < 200000; i++) print "filler line to fill the pipe buffer" }' > "$plog/big.log"
   ( lab_probe_refusal_names_knob "$plog/ok.log" ) \
@@ -293,6 +294,9 @@ lab_posture_selftest() {
   ( lab_probe_refusal_names_knob "$plog/info-only.log" ) \
     && { echo "  FAIL probe matcher: an INFO pin line was counted"; bad=1; } \
     || echo "  PASS probe matcher: an INFO pin line is not counted"
+  ( lab_probe_refusal_names_knob "$plog/info-then-refusal.log" ) \
+    && echo "  PASS probe matcher: a refusal after an INFO line naming the knob is detected" \
+    || { echo "  FAIL probe matcher: a refusal after an INFO line naming the knob not detected"; bad=1; }
   ( set -o pipefail; lab_probe_refusal_names_knob "$plog/big.log" ) \
     && echo "  PASS probe matcher: detection in a large log survives pipefail" \
     || { echo "  FAIL probe matcher: detection in a large log lost"; bad=1; }
