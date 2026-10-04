@@ -12,13 +12,13 @@ timestamp inside a 300-second replay window, and the signature itself
 is consumed single-use to defeat replay within that window.
 
 - **Code paths:** [`src/approvals.rs`](../src/approvals.rs),
-  [`src/handlers/approvals.rs:481`](../src/handlers/approvals.rs)
-  (the `approvals_sse` handler),
-  [`src/handlers/approvals.rs:107`](../src/handlers/approvals.rs)
-  (the `verify_approval_hmac` core),
+  [`approvals_sse`](../src/handlers/approvals.rs)
+  (the SSE handler),
+  [`verify_approval_hmac`](../src/handlers/approvals.rs)
+  (the HMAC verification core),
   [`src/handlers/routes.rs`](../src/handlers/routes.rs)
   (`APPROVALS_STREAM = "/api/v1/approvals/stream"`),
-  [`src/lib.rs:914`](../src/lib.rs) (route registration).
+  [`build_router_with_timeout`](../src/lib.rs) (route registration).
 - **Schema:** [`migrations/sqlite/0015_v07_pending_action_timeouts.sql`](../migrations/sqlite/0015_v07_pending_action_timeouts.sql)
   + [`migrations/sqlite/0021_v07_a2a_correlation.sql`](../migrations/sqlite/0021_v07_a2a_correlation.sql).
 - **Reconciliation security-sweep commits:**
@@ -36,7 +36,7 @@ curl -N -H "X-API-Key: $API_KEY" \
 ```
 
 The stream emits one named event per state change. Frame names
-([`src/handlers/approvals.rs:481-596`](../src/handlers/approvals.rs)):
+([`approvals_sse`](../src/handlers/approvals.rs)):
 
 | Event | Frame body | Fires on |
 |---|---|---|
@@ -45,15 +45,21 @@ The stream emits one named event per state change. Frame names
 | `lagged`             | `{"lagged": true}` (no per-event detail) | The subscriber dropped frames; reconnect to re-sync. |
 
 A keepalive comment line fires every 15s
-([`src/handlers/approvals.rs:596`](../src/handlers/approvals.rs)) to prevent
-intermediary timeouts. The stream is intentionally unauthenticated
-beyond `api_key_auth` middleware — SSE re-key handshakes are clunky,
+([`approvals_sse`](../src/handlers/approvals.rs)) to prevent
+intermediary timeouts. The stream is intentionally not HMAC-signed:
+beyond `api_key_auth` middleware it carries only the per-agent-key identity
+gate at stream open ([`enforce_idor_identity`](../src/handlers/identity_binding.rs),
+#2154). That gate refuses a merely self-asserted named principal with
+`403 attested_identity_required` only under `enforce` AND once at least
+one per-agent key is enrolled; with zero enrolled keys it is inert in every
+mode, `enforce` included ([`enforce_for_request`](../src/handlers/identity_binding.rs),
+#1985, #3155) — SSE re-key handshakes are clunky,
 and the HMAC gate sits on the **write** side (the decide endpoint),
 not the read side.
 
 The `lagged` event carries **only the boolean flag**, never the
 per-event count — closing the K10 lagged-event-leak finding (commit
-`d1f6c9f`, [`src/handlers/approvals.rs:577-584`](../src/handlers/approvals.rs)).
+`d1f6c9f`, the `Lagged` arm of [`approvals_sse`](../src/handlers/approvals.rs)).
 The count would leak cross-tenant traffic volume to a noisy-neighbour
 subscriber. Subscribers that see `lagged` must reconnect and re-fetch
 the pending list via `GET /api/v1/pending`.
@@ -62,9 +68,9 @@ the pending list via `GET /api/v1/pending`.
 
 The subscriber's `agent_id` is captured at subscribe time from the
 `X-Agent-Id` header
-([`src/handlers/approvals.rs:495`](../src/handlers/approvals.rs)) and every event
-is filtered through `sse_event_visible_to`
-([`src/handlers/approvals.rs:425`](../src/handlers/approvals.rs)) before fan-out.
+([`approvals_sse`](../src/handlers/approvals.rs)) and every event
+is filtered through [`sse_event_visible_to`](../src/handlers/approvals.rs)
+before fan-out.
 Cross-tenant events are silently dropped — the subscriber sees only
 their own pending rows and decisions, plus rows in namespaces an
 active K9 `Allow` rule grants them.
@@ -95,7 +101,7 @@ requires two headers when the substrate has an
 - `X-AI-Memory-Timestamp: <unix seconds>` — request freshness clock.
 
 The canonical request that the HMAC covers is
-([`src/handlers/approvals.rs:100,164`](../src/handlers/approvals.rs)):
+([`verify_approval_hmac`](../src/handlers/approvals.rs)):
 
 ```text
 canonical = "<unix_ts>.<METHOD>.<pending_id>.<body>"
@@ -117,14 +123,12 @@ even a single byte of the body invalidates the signature.
 - **Body binding** prevents post-hoc decision flipping. Captured
   signature must replay the exact body that was signed.
 - **Timestamp + 300s window**
-  ([`src/handlers/approvals.rs:63`](../src/handlers/approvals.rs),
-  `APPROVAL_HMAC_MAX_AGE_SECS`) bounds the replay window. The 60s
+  ([`APPROVAL_HMAC_MAX_AGE_SECS`](../src/handlers/approvals.rs)) bounds the replay window. The 60s
   future-skew tolerance
-  ([`src/handlers/approvals.rs:69`](../src/handlers/approvals.rs),
-  `APPROVAL_HMAC_MAX_SKEW_SECS`) absorbs NTP drift without admitting
+  ([`APPROVAL_HMAC_MAX_SKEW_SECS`](../src/handlers/approvals.rs)) absorbs NTP drift without admitting
   forged-future-dated signatures.
 - **Nonce single-use within window** (`a69325f`,
-  [`src/handlers/approvals.rs:173-197`](../src/handlers/approvals.rs)) — the
+  [`record_hmac_nonce`](../src/handlers/approvals.rs)) — the
   signature hex itself is recorded in a process-wide replay cache for
   600s (`APPROVAL_HMAC_MAX_AGE_SECS * 2`). A captured signature
   cannot be replayed even within the freshness window. Entries expire
@@ -132,7 +136,7 @@ even a single byte of the body invalidates the signature.
 
 When no `[hooks.subscription].hmac_secret` is configured, the decide
 endpoint **rejects every request** with 401
-([`src/handlers/approvals.rs:121`](../src/handlers/approvals.rs)). The K10
+([`verify_approval_hmac`](../src/handlers/approvals.rs)). The K10
 contract is strict by default — better to refuse a write than to
 accept an unauthenticated one.
 
@@ -190,7 +194,7 @@ stream emits an `approval_decided` frame whose `pending_id` matches.
 
 The mirror outbound construction
 ([`src/subscriptions.rs`](../src/subscriptions.rs) `hmac_sha256_hex` /
-`sha256_hex`; config-key docs at [`src/config.rs:3997`](../src/config.rs)) is what
+`sha256_hex`; config-key docs on [`HooksSubscriptionConfig`](../src/config.rs)) is what
 `[hooks.subscription]` peers use to sign their own requests; signers
 must produce byte-identical canonical strings or the verify will
 401.
@@ -200,8 +204,8 @@ must produce byte-identical canonical strings or the verify will
 The 300s / 60s constants are intentionally hardcoded — they mirror
 AWS SigV4 and Stripe webhook windows and have been validated against
 both NTP drift and exfiltration windows. They are NOT operator-tunable
-via config today. The constants are visible at
-[`src/handlers/approvals.rs:63-69`](../src/handlers/approvals.rs).
+via config today. The constants are [`APPROVAL_HMAC_MAX_AGE_SECS`](../src/handlers/approvals.rs) and
+[`APPROVAL_HMAC_MAX_SKEW_SECS`](../src/handlers/approvals.rs).
 
 **Why 300s.** Long enough to absorb client-side retry jitter
 (network blip, queue lag), short enough that an exfiltrated
@@ -311,7 +315,7 @@ are #3580 (v1.1.0). Pinned by
 | Multi-tenant SaaS | 10-100 | hundreds/min | Watch for `lagged` frames — every subscriber sees every event before filtering. If lag is chronic, shard tenants across daemons. |
 | Compliance gate | 1-5 (with audit) | low (every write) | `fail_mode = "closed"` on the upstream K9 hooks so denied writes raise visible refusals. |
 
-`APPROVAL_BROADCAST_CAPACITY` ([`src/approvals.rs:50`](../src/approvals.rs))
+[`APPROVAL_BROADCAST_CAPACITY`](../src/approvals.rs)
 is the broadcast-channel capacity (currently 1024). A slow SSE
 subscriber that exceeds the channel depth triggers `lagged`, never
 loses correctness (it must reconnect-and-resync), but does cause a

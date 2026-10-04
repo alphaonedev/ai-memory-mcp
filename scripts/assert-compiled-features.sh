@@ -10,6 +10,10 @@
 # Usage:
 #   scripts/assert-compiled-features.sh [binary] [--require feat ...]
 # Defaults: binary=ai-memory (PATH), required=sqlite-bundled
+# --strict (#4480): refuse an EMPTY require list instead of defaulting, so a
+# release caller whose feature declaration came back empty fails closed, AND
+# require the reported set to EQUAL the required set (an extra feature such as
+# sqlcipher in a release artifact is a failure, not just a missing one).
 #
 # Examples:
 #   scripts/assert-compiled-features.sh ./target/release/ai-memory
@@ -19,8 +23,12 @@ set -euo pipefail
 
 bin="ai-memory"
 required=()
+strict=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --strict)
+      strict=1
+      ;;
     --require)
       shift
       required+=("${1:?--require needs a feature name}")
@@ -37,6 +45,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#required[@]} -eq 0 ]]; then
+  if [[ $strict -eq 1 ]]; then
+    echo "assert-compiled-features: --strict with an empty require list: refusing to pass vacuously" >&2
+    exit 2
+  fi
   required=(sqlite-bundled)
 fi
 
@@ -68,6 +80,22 @@ for r in "${required[@]}"; do
     missing=1
   fi
 done
+
+if [[ $strict -eq 1 ]]; then
+  # exact set: every reported token must be required.
+  IFS=',' read -r -a reported <<<"$feat_line"
+  for have in "${reported[@]}"; do
+    have="${have// /}"
+    [[ -z "$have" ]] && continue
+    found=0
+    for r in "${required[@]}"; do [[ "$have" == "$r" ]] && found=1; done
+    if [[ $found -eq 0 ]]; then
+      echo "assert-compiled-features: UNEXPECTED feature in a --strict (exact-set) check: $have" >&2
+      echo "  report: $feat_line" >&2
+      missing=1
+    fi
+  done
+fi
 
 if [[ $missing -ne 0 ]]; then
   exit 1

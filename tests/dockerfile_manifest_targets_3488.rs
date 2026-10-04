@@ -72,6 +72,35 @@ fn declared_target_paths_all_kinds(manifest: &toml::Value) -> Vec<(&'static str,
         .collect()
 }
 
+/// The byte offset of the Dockerfile's release build, located by the
+/// INSTRUCTION rather than by one literal spelling of it.
+///
+/// #4480 moved the build into a `RUN set -eu; \` block and gave it `--locked`
+/// and a computed `--features`, so the previous literal anchor
+/// (`"RUN cargo build --release"`) stopped matching and this cell's `.expect()`
+/// failed on a Dockerfile that was correct. Comment lines are skipped - four of
+/// them quote the command - and exactly ONE build line must remain, so a second
+/// release build cannot slip in ahead of the `COPY` ordering this offset
+/// anchors.
+fn release_build_offset(dockerfile: &str) -> usize {
+    let mut offsets = Vec::new();
+    let mut at = 0usize;
+    for line in dockerfile.split_inclusive('\n') {
+        let code = line.trim_start();
+        if !code.starts_with('#') && code.contains("cargo build") && code.contains("--release") {
+            offsets.push(at);
+        }
+        at += line.len();
+    }
+    assert_eq!(
+        offsets.len(),
+        1,
+        "the Dockerfile must declare exactly ONE release build line; this offset \
+         is what orders every COPY instruction against it"
+    );
+    offsets[0]
+}
+
 #[test]
 fn docker_builder_copies_every_manifest_declared_target_3488_3870() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -82,9 +111,7 @@ fn docker_builder_copies_every_manifest_declared_target_3488_3870() {
         std::fs::read_to_string(root.join(".dockerignore")).expect("read .dockerignore");
     let copied = copied_directories(&dockerfile);
 
-    let cargo_build = dockerfile
-        .find("RUN cargo build --release")
-        .expect("Dockerfile retains its release build");
+    let cargo_build = release_build_offset(&dockerfile);
     let declared = declared_target_paths_all_kinds(&manifest);
     assert!(
         declared.iter().any(|(kind, _)| *kind == "example"),

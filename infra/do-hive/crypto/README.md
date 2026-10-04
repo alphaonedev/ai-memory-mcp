@@ -39,14 +39,19 @@ known_hosts model, CA chain ignored), so `allowlist.txt` = `sha256(client-good D
 Common: `AI_MEMORY_NO_CONFIG=1` skips the host `config.toml` (so `tier` falls back to
 the compiled default `semantic` → MiniLM-384, and no stray `db`/`embeddings` leak in).
 
-**Leg 1 — API mTLS** (`ServeArgs`: `--tls-cert` src/daemon_runtime.rs:757,
-`--tls-key` :760, `--mtls-allowlist` :771; wired at :5150/:5158/:5163):
+**Leg 1 — API mTLS** (the `--tls-cert`, `--tls-key` and `--mtls-allowlist` fields of
+[`ServeArgs`](../../../src/daemon_runtime.rs); passed to the listener by
+[`bootstrap_serve`](../../../src/daemon_runtime.rs)):
 ```bash
 # AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 is redundant since v0.9.0 (#1751):
 # store-path attestation is REQUIRED by default (=0 opts out). Set explicitly here
 # only to pin the posture; the launch is byte-identical to omitting it.
+# PG_URL carries the db password, so it goes in a 0600 file named by
+# AI_MEMORY_STORE_URL_FILE, never on the serve argv (/proc/<pid>/cmdline, #4577):
+#   ( umask 077; printf '%s\n' "$PG_URL" > out/store-url )
+AI_MEMORY_STORE_URL_FILE=out/store-url \
 AI_MEMORY_NO_CONFIG=1 AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 \
-ai-memory serve --host 0.0.0.0 --port 9077 --store-url "$PG_URL" \
+ai-memory serve --host 0.0.0.0 --port 9077 \
   --tls-cert out/server.crt --tls-key out/server.key \
   --mtls-allowlist out/allowlist.txt
 # client: curl --cert out/client-good.crt --key out/client-good.key https://<host>:9077/api/v1/health
@@ -56,14 +61,16 @@ ai-memory serve --host 0.0.0.0 --port 9077 --store-url "$PG_URL" \
 `--quorum-client-cert` :804, `--quorum-client-key` :807, `--quorum-ca-cert` :815):
 ```bash
 # on peerA (symmetric on peerB, swapping certs + peer host):
-AI_MEMORY_NO_CONFIG=1 ai-memory serve --host 0.0.0.0 --port 9077 --store-url "$PG_URL" \
+AI_MEMORY_STORE_URL_FILE=out/store-url \
+AI_MEMORY_NO_CONFIG=1 ai-memory serve --host 0.0.0.0 --port 9077 \
   --tls-cert out/peerA.crt --tls-key out/peerA.key --mtls-allowlist out/peerA.allowlist \
   --quorum-writes 2 --quorum-peers https://<peerB>:9077 \
   --quorum-client-cert out/peerA.crt --quorum-client-key out/peerA.key \
   --quorum-ca-cert out/ca.crt --quorum-timeout-ms 8000
 ```
 
-**Leg 3 — daemon→Postgres verify-full** (sqlx `PgConnectOptions`, src/store/postgres.rs:829;
+**Leg 3 — daemon→Postgres verify-full** (sqlx `PgConnectOptions`, built by
+[`floored_connect_options`](../../../src/store/postgres/dsn.rs);
 sslmode/sslrootcert honoured from the URL query):
 ```bash
 PG_URL="postgres://aimemory:PW@<pg-host>:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/ca.crt"

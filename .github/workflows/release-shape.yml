@@ -1,0 +1,152 @@
+# #4480 - release-shaped proof: build the binary EXACTLY the way release.yml
+# does (`--features "$(scripts/release-features.sh)"`) and prove the shipped
+# PostgreSQL tier is real, before a tag cut finds out it is not.
+#
+# WHY. release.yml built `--features sal` only, so the advertised PostgreSQL +
+# AGE + pgvector tier was absent from every shipped artifact and nothing
+# noticed (the #2676 / #2728 / #3996 class). The release feature set now lives
+# in ONE file (scripts/release-features.sh); this job builds from it, asserts
+# the self-report, checks no OpenSSL/libpq is pulled in, and drives the binary
+# against a TLS PostgreSQL service it starts itself (a pgvector image, a
+# throwaway CA, hostssl-only pg_hba, sslmode=verify-full on 127.0.0.1). The
+# image has pgvector but NO Apache AGE, so the proof covers the pgvector / CTE
+# path, not the AGE graph projection.
+#
+# NEVER VACUOUS. A missing docker, a server that does not come up, a URL that
+# does not verify, or a round trip that loses the memory FAILS the job; there
+# is no skip path. What only the release matrix itself proves: the macOS and
+# aarch64-linux cross builds (this job builds the host target, x86_64 linux).
+#
+# ADVISORY (continue-on-error) by GOD's ruling on #4480: this workflow lands
+# untried, so its failure must not block a merge or a release until it has run
+# green once. It flips to REQUIRED (drop `continue-on-error`, declare the
+# context) after the first green run on main. It is not in COVERED_WORKFLOWS of
+# scripts/check-required-contexts.sh and is named by no doc as an enforcing
+# gate (scripts/check-ci-job-claims.sh). The feature declaration itself is
+# enforced separately and BLOCKING by scripts/check-release-features.sh
+# (c8-precheck), and gates release.yml and the Dockerfile.
+
+name: Release-shaped build + PostgreSQL TLS proof (#4480)
+
+on:
+  pull_request:
+    branches: ["release/**", "rehearsal/**", "main"]
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/release-shape.yml"
+      - "scripts/release-features.sh"
+      - "scripts/release-shape-pg-proof.sh"
+      - "scripts/assert-compiled-features.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "migrations/**"
+  push:
+    branches: ["release/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-shape-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  release-shape:
+    name: "Release-shaped build + PG TLS proof"
+    runs-on: ubuntu-latest
+    # Advisory until the first green run on main (#4480, GOD ruling).
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Release feature declaration guard
+        run: bash scripts/check-release-features.sh
+
+      - name: Build release binary (exactly as release.yml)
+        shell: bash
+        run: |
+          set -euo pipefail
+          FEATURES="$(bash scripts/release-features.sh)"
+          test -n "$FEATURES"
+          cargo build --locked --release --features "$FEATURES"
+
+      - name: No OpenSSL / libpq / native-tls in the shipped dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          FEATURES="$(bash scripts/release-features.sh)"
+          test -n "$FEATURES"
+          tree="$(cargo tree --locked -e normal --target all --features "$FEATURES")"
+          if printf '%s\n' "$tree" | grep -E '(^|[^a-z-])(openssl-sys|native-tls|openssl |libpq)'; then
+            echo "::error::the release feature set pulls a native TLS / libpq dependency (#4480 requires pure-Rust rustls)"
+            exit 1
+          fi
+          echo "no openssl-sys / native-tls / libpq in the release dependency graph"
+
+      - name: Start a TLS PostgreSQL service (throwaway CA, hostssl-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/pgtls"
+          mkdir -p "$d"
+          cd "$d"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=release-shape-ca" \
+            -keyout ca.key -out ca.crt
+          openssl req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.1" -keyout server.key -out server.csr
+          printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\n' > san.ext
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 \
+            -extfile san.ext -out server.crt
+          # hostssl ONLY on TCP: a plaintext login cannot succeed, so a green
+          # round trip proves the session was TLS.
+          printf 'local all all trust\nhostssl all all all scram-sha-256\n' > pg_hba.conf
+          sudo chown 999:999 server.key server.crt pg_hba.conf
+          sudo chmod 600 server.key
+          pw="$(openssl rand -hex 16)"
+          echo "::add-mask::$pw"
+          echo "PGTLS_DIR=$d" >> "$GITHUB_ENV"
+          echo "PGTLS_PW=$pw" >> "$GITHUB_ENV"
+          # Image: pgvector/pgvector 0.8.6-pg18 (canonical PostgreSQL 18.6 + pgvector 0.8.6
+          # stack of the repo SSOT), pinned by digest; no Apache AGE in this image.
+          docker run -d --name release-shape-pg -p 127.0.0.1:55432:5432 \
+            -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=proof \
+            -v "$d:/certs:ro" \
+            pgvector/pgvector@sha256:2ba9ca5f2e7daa0f0e7723cba1ee9167bab54efd3640516a44ac1a928dd67e7a \
+            -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key \
+            -c hba_file=/certs/pg_hba.conf
+          for _ in $(seq 1 60); do
+            if docker exec release-shape-pg pg_isready -U postgres -d proof >/dev/null 2>&1; then
+              ready=1; break
+            fi
+            sleep 2
+          done
+          if [ "${ready:-0}" != 1 ]; then
+            docker logs release-shape-pg || true
+            echo "::error::the TLS PostgreSQL service did not become ready (the proof must not pass vacuously)"
+            exit 1
+          fi
+          docker exec release-shape-pg psql -U postgres -d proof -v ON_ERROR_STOP=1 \
+            -c 'CREATE EXTENSION IF NOT EXISTS vector;'
+
+      - name: Prove the shipped binary reports sal-postgres and uses the tier over verify-full
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="postgres://postgres:${PGTLS_PW}@127.0.0.1:55432/proof?sslmode=verify-full&sslrootcert=${PGTLS_DIR}/ca.crt"
+          bash scripts/release-shape-pg-proof.sh target/release/ai-memory "$url"
+
+      - name: Stop the PostgreSQL service
+        if: always()
+        shell: bash
+        run: docker rm -f release-shape-pg >/dev/null 2>&1 || true

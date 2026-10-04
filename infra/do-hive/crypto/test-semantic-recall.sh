@@ -34,11 +34,18 @@ cleanup(){ [ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 STORE_ARGS=(--db "$WORK/rec.db")
-[ -n "${STORE_URL:-}" ] && STORE_ARGS=(--store-url "$STORE_URL")
+if [ -n "${STORE_URL:-}" ]; then
+  # #4577: STORE_URL may carry a db password; pass it via a 0600 file
+  # (AI_MEMORY_STORE_URL_FILE) instead of the serve argv. $WORK is mktemp -d (0700).
+  STORE_ARGS=()
+  printf '%s\n' "$STORE_URL" >"$WORK/store-url"
+  chmod 0600 "$WORK/store-url"
+  export AI_MEMORY_STORE_URL_FILE="$WORK/store-url"
+fi
 
 # attestation OFF here — this test isolates the EMBEDDER, not the attest gate.
 AI_MEMORY_NO_CONFIG=1 AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 \
-  "$BIN" serve --host 127.0.0.1 --port "$PORT" "${STORE_ARGS[@]}" >"$LOG" 2>&1 &
+  "$BIN" serve --host 127.0.0.1 --port "$PORT" ${STORE_ARGS[@]+"${STORE_ARGS[@]}"} >"$LOG" 2>&1 &
 DPID=$!
 for i in $(seq 1 60); do curl -s "http://127.0.0.1:$PORT/api/v1/health" -o /dev/null && break; sleep 0.5; done
 BASE="http://127.0.0.1:$PORT/api/v1"

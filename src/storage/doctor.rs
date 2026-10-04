@@ -57,50 +57,30 @@ pub fn count_active_governance_rules(conn: &Connection) -> Result<usize> {
 /// disclosure that the field was previously dropped from the wire because
 /// no per-rule serializer existed.
 ///
-/// Rows whose `metadata.governance` payload fails to round-trip through
-/// `GovernancePolicy::from_metadata` are silently skipped — the
-/// capabilities surface is best-effort and a malformed policy must not
-/// take down the entire response. The wider gate
-/// (`enforce_governance` → `read_namespace_policy`) already swallows the
-/// same parse failures, so the surfaces stay consistent.
+/// A standard whose `metadata.governance` (or whole `metadata` cell) is corrupt
+/// is NOT dropped (#4285): enforcement resolves it as a SEVERED level (the Owner
+/// floor), so the summary reports that same effective floored policy rather
+/// than hiding the namespace. [`crate::storage::list_corrupt_governance_standards`]
+/// names the corrupt ones.
 ///
 /// # Errors
 ///
-/// Returns `Err` only on hard SQLite failures (e.g. table missing); the
-/// row-level parse failures noted above are handled internally.
+/// Returns `Err` only on hard SQLite failures (e.g. table missing).
 pub fn list_active_governance_policies(
     conn: &Connection,
 ) -> Result<Vec<(String, GovernancePolicy)>> {
-    // Pull the raw `(namespace, metadata)` tuples for every namespace
-    // whose standard memory has a non-null `metadata.governance`. We
-    // ORDER BY at the SQL layer so the lex sort comes free and the
-    // caller doesn't have to re-sort.
-    let mut stmt = conn.prepare(
-        "SELECT nm.namespace, m.metadata
-         FROM namespace_meta nm
-         INNER JOIN memories m ON m.id = nm.standard_id
-         WHERE json_extract(m.metadata, '$.governance') IS NOT NULL
-         ORDER BY nm.namespace ASC",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        let ns: String = r.get(0)?;
-        let meta_str: String = r.get(1)?;
-        Ok((ns, meta_str))
-    })?;
-
+    use super::governance_read::{StandardMetadata, bound_standard_classes};
     let mut out = Vec::new();
-    for row in rows.flatten() {
-        let (ns, meta_str) = row;
-        // Parse the metadata blob; skip rows that don't deserialize.
-        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) else {
-            continue;
-        };
-        // `from_metadata` returns `None` when the field is missing/null
-        // (the SQL filter already excludes that path) and
-        // `Some(Err(_))` on a malformed policy payload — skip both.
-        match GovernancePolicy::from_metadata(&meta) {
-            Some(Ok(policy)) => out.push((ns, policy)),
-            _ => continue,
+    for (ns, _id, class) in bound_standard_classes(conn)? {
+        match class {
+            StandardMetadata::Policy(p, _) => out.push((ns, *p)),
+            StandardMetadata::Corrupt(_) => {
+                out.push((
+                    ns,
+                    GovernancePolicy::default().with_severed_standard_floor(),
+                ));
+            }
+            StandardMetadata::NoGovernance => {}
         }
     }
     Ok(out)

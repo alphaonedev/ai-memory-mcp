@@ -91,13 +91,25 @@ impl PostgresStore {
         ctx: &CallerContext,
         id: &str,
     ) -> StoreResult<bool> {
+        self.apply_remote_archive_pg_with(ctx, id, None).await
+    }
+
+    /// #4447 — [`Self::apply_remote_archive_pg`] with the optional in-transaction
+    /// peer-scope re-check (`Some` from the `*_authorized` trait arm).
+    pub(super) async fn apply_remote_archive_pg_with(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        authorize_stored: Option<crate::storage::ByIdNamespaceAuthorizer<'_>>,
+    ) -> StoreResult<bool> {
         let mut op_ctx = ctx.clone();
         op_ctx.bypass_visibility = true;
         let moved = self
-            .archive_by_ids(
+            .archive_by_ids_inner(
                 &op_ctx,
                 std::slice::from_ref(&id.to_string()),
                 Some(crate::models::field_names::ARCHIVE_REASON_SYNC_PUSH),
+                authorize_stored,
             )
             .await?;
         Ok(moved > 0)
@@ -120,6 +132,17 @@ impl PostgresStore {
         ctx: &CallerContext,
         id: &str,
     ) -> StoreResult<bool> {
+        self.apply_remote_restore_pg_with(ctx, id, None).await
+    }
+
+    /// #4447 — [`Self::apply_remote_restore_pg`] with the optional in-transaction
+    /// peer-scope re-check (`Some` from the `*_authorized` trait arm).
+    pub(super) async fn apply_remote_restore_pg_with(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        authorize_stored: Option<crate::storage::ByIdNamespaceAuthorizer<'_>>,
+    ) -> StoreResult<bool> {
         let tombstoned: bool = sqlx::query_scalar(SQL_FORGET_TOMBSTONE_EXISTS)
             .bind(id)
             .fetch_one(&self.pool)
@@ -136,7 +159,8 @@ impl PostgresStore {
         }
         let mut op_ctx = ctx.clone();
         op_ctx.bypass_visibility = true;
-        self.archive_restore(&op_ctx, id).await
+        self.archive_restore_inner(&op_ctx, id, authorize_stored)
+            .await
     }
 }
 
