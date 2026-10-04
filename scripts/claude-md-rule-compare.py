@@ -11,7 +11,8 @@ The BASE guard (scripts/check-claude-md-size.py of the base checkout) and the BA
 
   * every rule section whose raw text no longer hashes to the BASE manifest (changed, added, removed) is
     written to the step summary with the section name and a unified diff, headed "RULE TEXT CHANGED";
-  * if the only differences inside a section are digit runs, the heading is "COUNT CHANGED" instead;
+  * if the only differences are ASCII digit runs of the generated census inside the Prime directive
+    section (a number before its unit words), the heading is "COUNT CHANGED" instead;
   * any OTHER error the base guard reports about the head copies (a lowered floor, a deleted pinned
     heading, a broken index) is "BASE GUARD REFUSES THE HEAD" and counts as a rule change;
   * a rule change fails the job unless a commit in base..head carries a trailer line
