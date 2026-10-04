@@ -1374,13 +1374,23 @@ def use_glob(val: str) -> str:
 def runs_path(path: str, uses: list) -> bool:
     """True when a use that is not known safe names path, a glob matching it, or a parent.
     Every use is compared in canonical glob form (use_glob, #5095)."""
+    return path_runner(path, uses) is not None
+
+
+# rule R5: data-home path -> the use that made the gate read it as script, kept for the
+# self-test failure line only; it never changes a verdict (#5385)
+R5_READ_AS_SCRIPT = {}
+
+
+def path_runner(path: str, uses: list):
+    """The first use that runs_path counts as naming path, or None."""
     path = "/" + posixpath.normpath(path).lstrip("/")
     for val, safe in uses:
         if safe is True or not val:
             continue
         g = use_glob(val)
         if g == "/":
-            return True
+            return val
         if not re.search(r"[^*/]", g):
             # a bare expansion names no place; where it is run, bare_operand_problem
             # requires it to resolve (closed world, #5095)
@@ -1388,17 +1398,17 @@ def runs_path(path: str, uses: list) -> bool:
         wild = re.search(r"[*?\[]", g) is not None
         if safe == "exact":
             if g == path or (wild and fnmatch.fnmatchcase(path, g)):
-                return True
+                return val
             continue
         if path in val or path in g:
-            return True
+            return val
         if wild and fnmatch.fnmatchcase(path, g):
-            return True
+            return val
         # a directory names every file under it; a relative bare word with no slash is
         # not a directory operand the gate can place (systemctl unit names and the like)
         if (g.startswith("/") or "/" in val) and fnmatch.fnmatchcase(path, g.rstrip("/") + "/*"):
-            return True
-    return False
+            return val
+    return None
 
 
 def file_is_data(path: str, mode, info) -> bool:
@@ -1411,7 +1421,10 @@ def file_is_data(path: str, mode, info) -> bool:
             return False
     if not path.startswith(DATA_HOMES) or ".." in path.split("/"):
         return False
-    return not runs_path(path, info["uses"])
+    runner = path_runner(path, info["uses"])
+    if runner is not None:
+        R5_READ_AS_SCRIPT.setdefault(path, runner)
+    return runner is None
 
 
 def heredoc_target(joined: str, consts: dict):
@@ -3406,17 +3419,27 @@ def entry_mutations(base: tuple, cache: dict) -> list:
     return out
 
 
+def probe_failure(label: str, expect: str, got: str, found: list) -> str:
+    """The self-test line for a probe with the wrong verdict: the hit count and up to 3
+    hits whole, so the line names why the probe went red (#5385)."""
+    shown = "".join("\n    " + h for h in found[:3])
+    more = "\n    ... %d more" % (len(found) - 3) if len(found) > 3 else ""
+    return "%s: expected %s, got %s (%d hits)%s%s" % (label, expect, got, len(found), shown, more)
+
+
 def self_test(known: set) -> int:
     base = load_repo()
     cache = {}
     bad, counts = [], {"red": 0, "green": 0, "fault": 0}
     for label, expect, spec in build_probes():
         t, mt, a, p, auto, extra = case_inputs(base, spec)
+        R5_READ_AS_SCRIPT.clear()
         hits, faults, _ = run_scan(t, mt, a, p, known, autolist=auto, extra=extra, cache=cache)
         got = verdict(hits, faults, spec)
         counts[expect] += 1
         if got != expect:
-            bad.append("%s: expected %s, got %s %s" % (label, expect, got, (faults or hits or [""])[0][:140]))
+            why = ["R5: %s is read as script: the use %r names it" % kv for kv in sorted(R5_READ_AS_SCRIPT.items())]
+            bad.append(probe_failure(label, expect, got, why + list(faults or hits)))
         elif spec.get("present") and not any(spec["present"] in h for h in hits):
             bad.append("%s: expected a hit naming %r, got none" % (label, spec["present"]))
     muts = entry_mutations(base, cache)
@@ -3432,6 +3455,10 @@ def self_test(known: set) -> int:
     chain = [(0, "F+=a%d" % i, 0) for i in range(EXPAND_CAP.bit_length())]
     if var_values(chain).get("F") != {VALUES_PAST_CAP}:
         bad.append("an append chain past EXPAND_CAP did not collapse its value set")
+    # a failure line keeps each hit whole (#5385)
+    long_hit = "x" * 150 + " the reason"
+    if long_hit not in probe_failure("p", "green", "red", ["a", long_hit, "b", "c"]):
+        bad.append("a probe failure line cut a hit")
     with contextlib.redirect_stderr(io.StringIO()):
         try:
             build_parser().parse_args(["--bogus"])
