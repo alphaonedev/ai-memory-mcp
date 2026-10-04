@@ -152,7 +152,8 @@ acceptance criterion for the v0.7.0 expanded scope.
   against sqlite and postgres returns the same top-K with the same
   6-factor score breakdown (within FP tolerance).
 - `tests/cli_schema_init.rs` (Wave 1, Stream B) — `ai-memory
-  schema-init --store-url postgres://…` exits 0, creates schema
+  schema-init` against a `postgres://…` store URL (from 1.0.0 passed as
+  `AI_MEMORY_STORE_URL_FILE=<0600 file>`, #4600) exits 0, creates schema
   v28, rerun is idempotent.
 - `tests/age_cte_equivalence.rs` (Wave 1, Stream C) — both backends
   agree on `kg_query` / `kg_timeline` / `kg_invalidate` / `find_paths`

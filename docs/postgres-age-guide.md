@@ -334,7 +334,7 @@ way to bootstrap a fresh postgres backend:
 AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` resolves its URL exactly like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:293`, `src/store_url.rs:137`), so the password never has to be on argv ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)); `migrate --from/--to` still takes both URLs on argv only.
+`schema-init` resolves its URL exactly like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:293`, `src/store_url.rs:137`), so the password never has to be on argv ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)); `migrate` takes each side from `--from` / `--to` or from `--from-url-file` / `--to-url-file` (a `0600` file; it never reads the store-url env channels), so a Postgres password stays off argv there too.
 
 Since v1.0.0 (#3705, "only encrypted data in transit") every DSN the
 daemon or CLI opens MUST pin `sslmode=verify-full&sslrootcert=<ca>`; a DSN
@@ -1399,8 +1399,8 @@ bootstrap.
 ### Old postgres schema version detected
 
 If you're pointing at a v0.7-alpha postgres database (schema v15),
-run `ai-memory schema-init --store-url postgres://…` with a current
-(v0.9.0) binary — opening the store applies the upgrade ladder to v78
+run `AI_MEMORY_STORE_URL_FILE=<0600 file> ai-memory schema-init` with a
+1.0.0 or later binary — opening the store applies the upgrade ladder to v78
 idempotently. (See `migration-v0.7.0-postgres.md` for the full
 migration guide.)
 

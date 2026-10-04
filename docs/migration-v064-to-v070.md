@@ -318,8 +318,8 @@ operators wait at least 7 days of clean runtime before deleting.
 ## 5. Step-by-step migration — postgres deployments
 
 If you run ai-memory against PostgreSQL (with or without Apache AGE), the
-upgrade path differs because schema bumps land via the `ai-memory schema-init
---store-url <url>` command (opening the store runs the migration ladder as a
+upgrade path differs because schema bumps land via the `ai-memory schema-init`
+command (opening the store runs the migration ladder as a
 side effect; there is no `--upgrade` flag) rather than via the daemon's
 first-boot ladder. Note `schema-init`/`migrate` exist only in
 `--features sal` / `sal,sal-postgres` builds — the pre-built release
@@ -345,12 +345,14 @@ the AGE projection prime, and the cutover dance.
    #   postgres://aimemory:PASSWORD@HOST:5432/aimemory
    AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
    ```
-   `schema-init` resolves its URL exactly like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:293`, `src/store_url.rs:137`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
+   From ai-memory 1.0.0, `schema-init` resolves its URL like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:312`, `src/store_url.rs:137`, [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)). Passing `--store-url` together with a disagreeing env or file channel is refused as an ambiguous store ([#4887](https://github.com/alphaonedev/ai-memory-mcp/issues/4887)). Earlier releases, including the v0.7.0 binary this guide installs, accept only `--store-url`; run that form from a single-user admin host, because the password is visible to every local account while the command runs.
    Opening the store walks the postgres ladder up to schema v57
    idempotently, preserving data.
 5. **Verify schema parity:**
    ```bash
-   psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' \
+   # Password from ~/.pgpass (mode 0600): HOST:5432:aimemory:aimemory:<password>
+   # (#4804), so the URI carries none.
+   psql 'postgres://aimemory@HOST:5432/aimemory' \
      -tAc "SELECT MAX(version) FROM schema_version;"
    # → 55
    ```
@@ -368,7 +370,8 @@ the AGE projection prime, and the cutover dance.
 ### 5.2 If you want to switch sqlite → postgres at the same time
 
 The v0.7.0 SAL trait makes sqlite ↔ postgres a one-command migration.
-Run `ai-memory migrate --from sqlite:///path/to/memory.db --to postgres://...`
+Run `ai-memory migrate --from sqlite:///path/to/memory.db --to-url-file /etc/ai-memory/store-url`
+(a `0600` file holding the `postgres://...` URL, so the password stays off argv)
 per the postgres guide. You can do it before OR after the v0.7.0 upgrade —
 the SAL boundary is byte-stable across both backends at schema v57.
 

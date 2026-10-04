@@ -1785,7 +1785,8 @@ Follow [`docs/migration-v0.7.0-postgres.md`](../migration-v0.7.0-postgres.html):
 1. Provision postgres + Apache AGE + pgvector per
    [`docs/postgres-age-guide.md`](../postgres-age-guide.html).
 2. `ai-memory schema-init --store-url postgres://…`.
-3. `ai-memory migrate --from sqlite:///… --to postgres://… --dry-run`.
+3. `ai-memory migrate --from sqlite:///… --to-url-file /etc/ai-memory/store-url --dry-run`
+   (the file holds the `postgres://…` URL, mode `0600`; a password never goes on argv).
 4. Real migration; verify row counts + content fingerprint.
 5. Re-point the daemon at postgres via `--store-url` or
    `AI_MEMORY_STORE_URL`.
@@ -1800,7 +1801,7 @@ Follow [`docs/migration-v0.7.0-postgres.md`](../migration-v0.7.0-postgres.html):
 2. Restart the daemon.
 3. (Optional) Re-run the migration tool to backfill links if your
    v0.7-alpha migration predated the Wave 1 link-walk fix:
-   `ai-memory migrate --from sqlite:///… --to postgres://… --since
+   `ai-memory migrate --from sqlite:///… --to-url-file /etc/ai-memory/store-url --since
    <ISO8601>` — only the delta migrates.
 
 ## Operator references

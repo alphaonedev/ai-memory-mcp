@@ -285,6 +285,25 @@ pub async fn run(
     config_default_dim: Option<u32>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // #4600 + #2444 precedent (src/cli/backup.rs `resolve_sqlite_store`):
+    // `resolve_store_url` lets the env channels win over the flag, so an
+    // explicit `--store-url` that DISAGREES with AI_MEMORY_STORE_URL(_FILE)
+    // would otherwise initialise (and, with --force-reembed, rewrite) a store
+    // the operator did not name. Ambiguity is refused, never resolved.
+    if let Some(arg) = args.store_url.as_deref()
+        && let Some(env_url) = crate::store_url::resolve_store_url(None)?
+        && env_url.trim() != arg.trim()
+    {
+        anyhow::bail!(
+            "ambiguous store: --store-url names {} but the environment \
+             (AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE) names {}. \
+             Refusing to guess which store schema-init should initialise; \
+             unset one of them (#4600, #2444).",
+            crate::url_display::store_url_display(arg),
+            crate::url_display::store_url_display(&env_url),
+        );
+    }
+
     // #4600 (CWE-214) — same non-argv channels `serve` has: FILE > ENV > flag
     // (precedent copied: src/store_url.rs `resolve_store_url`). Fail closed
     // when no channel supplies a URL; the message names no URL, so no

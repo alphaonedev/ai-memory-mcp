@@ -56,7 +56,7 @@ GATE
     echo "[spawn.sh] REFUSE: AWS credentials must be sourced from operator vault." >&2
     exit 2
   fi
-  for v in TF_VAR_ssh_key_name TF_VAR_ssh_source_cidr; do
+  for v in TF_VAR_ssh_key_name TF_VAR_ssh_source_cidr TF_VAR_ai_memory_image_url TF_VAR_ai_memory_image_sha256; do
     if [[ -z "${!v:-}" ]]; then
       echo "[spawn.sh] REFUSE: ${v} must be set." >&2
       exit 2

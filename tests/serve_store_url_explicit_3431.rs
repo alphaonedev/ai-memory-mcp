@@ -331,6 +331,8 @@ fn explicit_db_plus_store_url_flag_still_refuses_3431() {
     let sb = Sandbox::new("both-flags", None);
     let explicit = sb.store("explicit.db");
 
+    // A throwaway fixture credential: the refusal must also keep it out of stderr.
+    let store_url = "postgres://operator:secretpw@db.example.invalid/mem";
     let out = sb.run(
         &[
             "--db",
@@ -338,7 +340,7 @@ fn explicit_db_plus_store_url_flag_still_refuses_3431() {
             "curator",
             "--once",
             "--store-url",
-            "postgres://operator:secretpw@db.example.invalid/mem",
+            store_url,
         ],
         &[],
     );

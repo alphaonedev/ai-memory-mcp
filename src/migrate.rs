@@ -21,8 +21,10 @@
 //!
 //! ```text
 //! ai-memory migrate --from sqlite:///var/lib/ai-memory/ai-memory.db \
-//!                   --to postgres://user:pass@pg:5432/ai_memory \
+//!                   --to-url-file /etc/ai-memory/store-url \
 //!                   [--batch 1000] [--dry-run] [--namespace foo]
+//! # `--to-url-file` / `--from-url-file` read the URL from a 0600 file so a
+//! # password never rides argv (#4600); `--from` / `--to` still take a URL.
 //! ```
 //!
 //! Reads batches via `MemoryStore::list`, writes via `MemoryStore::store`.
@@ -45,6 +47,52 @@ use std::collections::HashSet;
 use anyhow::{Context, Result};
 
 use crate::store::{CallerContext, Filter, MemoryStore, sqlite::SqliteStore};
+
+/// #4600 (CWE-214) — resolve one endpoint of `ai-memory migrate` from its
+/// plain URL flag or its `*-url-file` twin (5-agent vote (4d3ea1c5)).
+///
+/// `url_flag` / `file_flag` are the flag names (`--from` / `--from-url-file`),
+/// used only in messages. Exactly one of `url` / `file` must be set (clap
+/// already enforces that at parse time; this re-checks so a programmatic
+/// caller cannot reach the connect path with an ambiguous or empty endpoint,
+/// failing closed per ERRORS-01).
+///
+/// * `file` is read through [`crate::store_url::store_url_from_file`] (one
+///   open, `fstat` on that handle, group/world-readable modes refused).
+/// * `url` is accepted verbatim; when it carries a credential a warning names
+///   the file flag, because argv is world-readable through `/proc/<pid>/cmdline`.
+/// * `AI_MEMORY_STORE_URL` / `AI_MEMORY_STORE_URL_FILE` are never consulted:
+///   a stale exported destination would send a bulk upsert to the wrong store.
+///
+/// # Errors
+///
+/// Returns an error when both or neither source is given, or when the file
+/// cannot be read, has lax permissions, or is empty.
+pub fn resolve_endpoint(
+    url_flag: &str,
+    file_flag: &str,
+    url: Option<&str>,
+    file: Option<&std::path::Path>,
+) -> Result<String> {
+    match (url, file) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("{url_flag} and {file_flag} are mutually exclusive (#4600)")
+        }
+        (None, None) => anyhow::bail!("one of {url_flag} or {file_flag} is required (#4600)"),
+        (None, Some(path)) => crate::store_url::store_url_from_file(path)
+            .with_context(|| format!("resolving {file_flag}")),
+        (Some(url), None) => {
+            if crate::store_url::url_carries_credentials(url) {
+                tracing::warn!(
+                    "{url_flag} carries a password in argv, which is exposed via world-readable \
+                     /proc/<pid>/cmdline and `ps auxww` to any local UID (#4600). Prefer \
+                     {file_flag} (a 0600 file holding the URL) instead."
+                );
+            }
+            Ok(url.to_string())
+        }
+    }
+}
 
 /// One migration batch. Exposed for external callers that want to
 /// run a migration programmatically (e.g. a test harness or a
