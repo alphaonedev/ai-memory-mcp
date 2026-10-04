@@ -4,7 +4,7 @@
 #
 # check-commit-signing-posture.sh — CI posture gate for #2486
 # ([control-integrity] "commit-signing posture regressed silently on
-# 2026-07-22 and nothing detected it").
+# 2026-07-22 and nothing detected it"), repaired for #5045 / #5046 / #5047.
 #
 # THE DEFECT CLASS THIS CLOSES. A host-local `git config user.email` (or
 # `user.name`) can silently drift to an identity GitHub cannot bind to the
@@ -18,12 +18,15 @@
 # host (this repo's shared `.git/config` carried exactly that override,
 # unset as part of the #2486 fix) — proving the class is not hypothetical
 # and can recur on ANY host working this repo, silently, with no gate
-# watching for it before this change.
+# watching for it before this change. The host-config half of the SAME
+# class is still open as #5048 and is deliberately NOT touched here (a
+# shared `.git/config` is read by ~200 concurrent worktrees; mutating it
+# underneath them mid-campaign is the cross-lane hazard #856 exists to
+# prevent).
 #
-# THE RULE. For every commit in a PR's own range (never a GitHub web-flow
-# merge/squash artifact — those exist only AFTER merge, outside the PR
-# branch's history, and are the separate, explicitly-out-of-scope #2486
-# item 3 "merge-mechanism decision"), BOTH must hold or the PR is refused:
+# THE RULE. Over the PR's own range — `merge-base(BASE, HEAD)..HEAD`, with
+# `--no-merges` — BOTH of the following must hold for every commit or the PR
+# is refused:
 #
 #   1. The committer email AND the author email are each a principal
 #      enrolled in scripts/qc-allowlists/enrolled-commit-signers.txt (an
@@ -33,39 +36,127 @@
 #      own `sole-authority-operator` rule means exactly ONE identity class
 #      is ever legitimate here, so an allowlist is both stricter and
 #      simpler).
-#   2. `git log --format=%G?` for that commit, verified against THAT SAME
-#      registry via `gpg.ssh.allowedSignersFile`, reports exactly `G`
-#      (good signature, principal matched). Every other code — `N` (no
-#      signature at all), `B` (bad signature), `E` (signature present but
-#      unverifiable against the registry — an unenrolled key, INCLUDING a
-#      forged claim of an enrolled email backed by a different key), `X`/
-#      `Y`/`R` (expired/expired-key/revoked) — is a refusal. This is
-#      deliberately the STRICT accept-list of `%G?` values (only `G`), not
-#      "anything but `N`": accepting `E`/`B` would let an unenrolled key
-#      sign under a spoofed enrolled email and pass, which is precisely
-#      the "reports success while doing nothing" shape this repo's #2444
-#      class exists to close.
+#   2. `git log --format=%G?` reports exactly `G` (good signature,
+#      principal matched) AND `git log --format=%GF` — the fingerprint of
+#      the key that ACTUALLY VERIFIED — is a member of the PINNED
+#      FINGERPRINT SET (see "THE PINNED FINGERPRINT SET" below). Every
+#      other `%G?` code — `N` (no signature at all), `B` (bad signature),
+#      `E` (signature present but unverifiable), `U` (valid signature,
+#      key not trusted), `X`/`Y`/`R` (expired/expired-key/revoked) — is a
+#      refusal. This is deliberately the STRICT accept-list of `%G?`
+#      values (only `G`), not "anything but `N`": accepting `E`/`B` would
+#      let an unenrolled key sign under a spoofed enrolled email and pass,
+#      which is precisely the "reports success while doing nothing" shape
+#      this repo's #2444 class exists to close.
+#
+# THE `--no-merges` CARVE-OUT (#5046). This gate's rule has ALWAYS been
+# scoped to the PR's own source commits and never to a GitHub web-flow
+# merge/squash artifact — but before #5046 that scope was DOCUMENTED ONLY,
+# never implemented, so the gate refused 8 two-parent web-flow merge
+# commits for `unbound-committer-email` (committer `GitHub
+# <noreply@github.com>`, which is not and must not be an enrolled
+# principal). Unimplemented documented behavior is docs-drift, a real
+# defect under this repo's prime directive. `--no-merges` over
+# `merge-base(BASE, HEAD)..HEAD` is the implementation: measured on the
+# #5045 cohort, ALL 8 of 8 refused web-flow commits are two-or-more-parent
+# merges, so excluding merges clears 8/8 WITHOUT pinning GitHub's web-flow
+# key. That choice is deliberate and load-bearing: pinning
+# `B5690EEEBB952194` would extend this repo's sole-authority trust boundary
+# to a third-party key whose continued ownership no self-test can ever
+# prove. Excluding merges designs that objection out instead of trading it
+# off. Sibling precedents for the same range shape:
+# check-cert-expiry.sh, check-shared-namespace-claims.sh,
+# check-count-assertion-declared.sh.
+#
+# A "exclude commits already reachable from the protected branch"
+# predicate was considered and REJECTED, measured:
+# `git rev-list --left-right --count origin/release/v1.0.0...HEAD` = `0 487`
+# on the #5045 cohort — it excludes ZERO commits. A no-op predicate added
+# to a gate with no non-vacuity floor is how #2444 gates are born.
+#
+# THE PINNED FINGERPRINT SET. git dispatches signature verification on the
+# signature TYPE IN THE COMMIT OBJECT (`gpgsig -----BEGIN PGP SIGNATURE-----`
+# vs `-----BEGIN SSH SIGNATURE-----`); `gpg.format` does NOT override that
+# dispatch. So this repo has TWO verification paths and needs TWO pins,
+# unioned into ONE accept test so that neither path can be widened without
+# breaking the other path's self-tests too:
+#
+#   * SSH half — the SHA256 fingerprint of every key in
+#     enrolled-commit-signers.txt, derived with `ssh-keygen -lf`. `%GF` on
+#     the SSH path is that exact `SHA256:<base64>` string (base64, so it is
+#     compared CASE-SENSITIVELY).
+#   * OpenPGP half — every 40-hex fingerprint pinned in
+#     enrolled-gpg-commit-signers.txt, whose public key material lives in
+#     enrolled-gpg-commit-signers.asc. This is #5045: an OpenPGP-signed
+#     commit is verified against the OpenPGP keyring, which on a stock CI
+#     runner is EMPTY, so `%G?` is `E` and the gate refused 67 commits the
+#     operator legitimately signed. The remedy is a HERMETIC, job-scoped
+#     GNUPGHOME built inside this script (never the ambient runner keyring,
+#     never a live GitHub API call) holding exactly the enrolled key.
+#
+# WHY THE `%GF` PIN IS LOAD-BEARING, AND WHY NOT `%GK`. Importing the
+# operator's key alone would be a gate that reports success while proving
+# nothing: ANY key merely present in the keyring with ownertrust also
+# yields `%G? = G`, so trust would silently become "whatever is in the
+# runner keyring". `%GF` is only ever populated for a signature that
+# ACTUALLY verified, so pinning it closes that. `%GK` must NEVER be pinned:
+# it is read from the UNVERIFIED signature packet, is populated even against
+# an EMPTY keyring, and is populated on commits whose `%GF` is empty — a
+# `%GK` pin is forgeable. Both facts are measured evidence on the #5045
+# cohort. The self-test's rogue-key-in-the-SAME-keyring case is the only
+# thing that catches a future edit dropping the `%GF` branch while keeping
+# the keyring import; it must never be deleted.
+#
+# THE NON-VACUITY FLOOR (#5047). Before #5047 an EMPTY range PASSED: the
+# walk simply found nothing and reported OK — a gate that reports success
+# while scanning nothing, with no self-test case covering it (#2444 shape,
+# inside the very gate that exists to close that class). Zero commits
+# scanned is now a FAIL (exit 2) with a diagnostic naming the resolved base
+# and head SHAs and whether each ref resolved. Siblings that already carry
+# the floor: check-sdk-tls-scheme.sh, check-docs-vs-ssot.sh.
 #
 # WHAT THIS DOES NOT CLAIM. This gate proves the PR's OWN commits are
-# authored+signed by an enrolled identity holding the enrolled private key
+# authored+signed by an enrolled identity holding an enrolled private key
 # — it does NOT reproduce GitHub's own server-side "Verified" badge
-# computation (a separate system, not queried here) and it does NOT touch
-# the `required_signatures` branch ruleset, which #2486 separately
-# documents as self-satisfying under API squash-merges (see
+# computation (a separate system, not queried here), it does NOT prove
+# which GitHub *account* holds a pinned key (a public key carries no
+# identity of its own; account binding is the operator's out-of-band
+# enrollment record, reviewed as a PR diff to the two registries), and it
+# does NOT touch the `required_signatures` branch ruleset, which #2486
+# separately documents as self-satisfying under API squash-merges (see
 # .github/branch-protection.yml) and therefore not a control this gate
 # can or should stand in for. The squash-merge commit that eventually
 # lands on `release/v1.0.0` is produced by GitHub AFTER this check runs
 # and is out of scope (#2486 item 3, tracked separately) — this gate's
 # job is the PR's SOURCE commits, which is what #2486 calls "the
-# load-bearing item".
+# load-bearing item". This job also remains a DECLARED-BUT-NOT-REQUIRED
+# status check (scripts/qc-allowlists/required-contexts-not-required.txt);
+# promoting it is the operator-sequenced #3554 lockstep, not this script.
 #
-# Exit codes: 0 clean (or non-`pull_request` event, N/A) · 1 violation ·
-# 2 usage / self-test failure.
+# Exit codes: 0 clean (or non-`pull_request` event, N/A) · 1 a commit in
+# range violated the rule · 2 the gate could not do its job and refuses to
+# report PASS (usage error, self-test failure, missing/zero-principal
+# registry, unresolvable range, hermetic-keyring setup failure, or ZERO
+# commits scanned).
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SIGNERS_FILE_DEFAULT="$REPO_ROOT/scripts/qc-allowlists/enrolled-commit-signers.txt"
+GPG_SIGNERS_FILE_DEFAULT="$REPO_ROOT/scripts/qc-allowlists/enrolled-gpg-commit-signers.txt"
+GPG_PUBKEY_FILE_DEFAULT="$REPO_ROOT/scripts/qc-allowlists/enrolled-gpg-commit-signers.asc"
+
+# One per-process scratch root, under the project-local .local-runs/ (project
+# HARD RULE: never /tmp, never any tmpfs), removed by a single EXIT trap so
+# neither the hermetic keyring nor the self-test fixtures can outlive the run.
+GATE_SCRATCH_ROOT="$REPO_ROOT/.local-runs/check-commit-signing-posture.$$"
+cleanup_gate_scratch() {
+  if [ -n "${GATE_SCRATCH_ROOT:-}" ] && [ -d "$GATE_SCRATCH_ROOT" ]; then
+    rm -rf "$GATE_SCRATCH_ROOT"
+  fi
+  return 0
+}
+trap cleanup_gate_scratch EXIT
 
 # Extracts the set of enrolled principal emails (column 1 of each
 # non-comment, non-blank allowed_signers line) from the registry, one per
@@ -76,7 +167,50 @@ SIGNERS_FILE_DEFAULT="$REPO_ROOT/scripts/qc-allowlists/enrolled-commit-signers.t
 # not the attack this gate defends against).
 enrolled_principals() {
   local signers_file="$1"
-  grep -vE '^[[:space:]]*(#|$)' "$signers_file" | awk '{print tolower($1)}' | sort -u
+  awk '/^[[:space:]]*(#|$)/ { next } { print tolower($1) }' "$signers_file" | sort -u
+}
+
+# enrolled_ssh_fingerprints SIGNERS_FILE — the `SHA256:<base64>` fingerprint
+# of every enrolled SSH public key, derived with ssh-keygen(1): exactly the
+# string git reports as `%GF` when it verifies an SSH signature against this
+# same registry. Derived, never hand-maintained: a hand-typed mirror of a key
+# already in the file is a second place to drift.
+#
+# Deliberately permissive on the derivation step (`|| true`) and strict on the
+# RESULT: the explicit non-empty assertion in assert_pinned_fingerprints_usable
+# is where the fail-closed property lives, rather than relying on a pipeline's
+# incidental exit status (the same discipline assert_registry_usable documents).
+enrolled_ssh_fingerprints() {
+  local signers_file="$1"
+  {
+    awk '/^[[:space:]]*(#|$)/ { next }
+         { $1 = ""; sub(/^[[:space:]]+/, ""); print }' "$signers_file" \
+      | ssh-keygen -lf - 2>/dev/null || true
+  } | awk '$2 ~ /^SHA256:/ { print $2 }' | sort -u
+}
+
+# enrolled_gpg_fingerprints GPG_SIGNERS_FILE — column 1 of every non-comment,
+# non-blank line, upper-cased, kept only when it is exactly 40 hex characters.
+# A malformed line is NOT a pin; if that leaves zero fingerprints the gate
+# fails closed via assert_gpg_registry_usable.
+enrolled_gpg_fingerprints() {
+  local gpg_signers_file="$1"
+  awk '/^[[:space:]]*(#|$)/ { next }
+       { fpr = toupper($1); if (fpr ~ /^[0-9A-F]{40}$/) print fpr }' \
+    "$gpg_signers_file" | sort -u
+}
+
+# pinned_fingerprints SIGNERS_FILE GPG_SIGNERS_FILE — the ONE accept set:
+# the union of the SSH half and the OpenPGP half. Unioned on purpose: with a
+# single pin covering both paths, an edit that drops the `%GF` check cannot
+# quietly widen only the OpenPGP path — it breaks every SSH self-test case as
+# well, which is what makes the widening tamper-evident.
+pinned_fingerprints() {
+  local signers_file="$1" gpg_signers_file="$2"
+  {
+    enrolled_ssh_fingerprints "$signers_file"
+    enrolled_gpg_fingerprints "$gpg_signers_file"
+  } | sort -u
 }
 
 # assert_registry_usable SIGNERS_FILE — EXPLICIT fail-closed guard for a
@@ -108,6 +242,44 @@ assert_registry_usable() {
   return 0
 }
 
+# assert_gpg_registry_usable GPG_SIGNERS_FILE — the same explicit fail-closed
+# guard for the OpenPGP fingerprint registry (#5045). A missing file or a file
+# with zero well-formed 40-hex fingerprints is a refusal, never a pass.
+assert_gpg_registry_usable() {
+  local gpg_signers_file="$1"
+  if [ ! -f "$gpg_signers_file" ]; then
+    echo "check-commit-signing-posture: ERROR — enrolled OpenPGP fingerprint registry $gpg_signers_file is missing (fail-closed)" >&2
+    return 1
+  fi
+  local fprs
+  fprs="$(enrolled_gpg_fingerprints "$gpg_signers_file")"
+  if [ -z "$fprs" ]; then
+    echo "check-commit-signing-posture: ERROR — enrolled OpenPGP fingerprint registry $gpg_signers_file has zero pinned fingerprints (fail-closed)" >&2
+    return 1
+  fi
+  return 0
+}
+
+# assert_pinned_fingerprints_usable PINNED — the union must be non-empty AND
+# must carry at least one fingerprint from EACH half, so losing one path's pin
+# can never degrade into "the other path still passes, nothing noticed".
+assert_pinned_fingerprints_usable() {
+  local pinned="$1"
+  if [ -z "$pinned" ]; then
+    echo "check-commit-signing-posture: ERROR — the pinned fingerprint set is EMPTY; no commit could ever be accepted and no key is pinned (fail-closed)" >&2
+    return 1
+  fi
+  if ! grep -qE '^SHA256:' <<<"$pinned"; then
+    echo "check-commit-signing-posture: ERROR — the pinned fingerprint set has no SSH (SHA256:) fingerprint; the SSH half of the pin was lost (fail-closed)" >&2
+    return 1
+  fi
+  if ! grep -qE '^[0-9A-F]{40}$' <<<"$pinned"; then
+    echo "check-commit-signing-posture: ERROR — the pinned fingerprint set has no OpenPGP (40-hex) fingerprint; the OpenPGP half of the pin was lost (fail-closed)" >&2
+    return 1
+  fi
+  return 0
+}
+
 is_enrolled_principal() {
   local email_lc="$1"
   local principals="$2"
@@ -117,48 +289,210 @@ is_enrolled_principal() {
   grep -qxF "$email_lc" <<<"$principals"
 }
 
-# check_range BASE_SHA HEAD_SHA SIGNERS_FILE REPO_DIR
-# Walks every commit in BASE_SHA..HEAD_SHA inside REPO_DIR and prints one
-# "VIOLATION: <sha> <reason>" line per failing commit to stdout. Returns 1
-# if any violation was found, 0 otherwise (including an empty range).
+# is_pinned_fingerprint FPR PINNED — exact membership in the pinned set.
+# An SSH `SHA256:<base64>` fingerprint is compared case-SENSITIVELY (base64
+# is case-significant); an OpenPGP 40-hex fingerprint is additionally retried
+# upper-cased, because hex case carries no information. An empty `%GF` is
+# never a member (that is the "nothing actually verified" shape).
+is_pinned_fingerprint() {
+  local fpr="$1" pinned="$2"
+  if [ -z "$fpr" ]; then
+    return 1
+  fi
+  if grep -qxF "$fpr" <<<"$pinned"; then
+    return 0
+  fi
+  if [[ "$fpr" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+    local fpr_uc
+    fpr_uc="$(printf '%s' "$fpr" | tr '[:lower:]' '[:upper:]')"
+    if grep -qxF "$fpr_uc" <<<"$pinned"; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# prepare_hermetic_gnupghome GPG_PUBKEY_FILE GPG_SIGNERS_FILE DEST
+#
+# Builds a HERMETIC, job-scoped OpenPGP keyring at DEST and leaves it holding
+# exactly the enrolled key material, with ultimate ownertrust granted to
+# EXACTLY the fingerprints pinned in GPG_SIGNERS_FILE. The ambient runner
+# keyring is never read and never written; no network call is made.
+#
+# Why ownertrust is set at all (measured, #5045): a bare `gpg --import` of a
+# public key yields `%G? = U` ("good signature, unknown validity"), not `G`,
+# because `%G?` folds gpg's trust model in. Granting ultimate trust to the
+# pinned fingerprints is the mechanical form of "this key is hand-enrolled
+# from operator custody" — and it is granted ONLY to pinned fingerprints, so
+# a key that appears in the `.asc` but not in the pinned registry gets no
+# trust and cannot produce a `G`. That is the second of two independent
+# fail-closed layers; the `%GF` pin in the accept test is the first.
+prepare_hermetic_gnupghome() {
+  local pubkey_file="$1" gpg_signers_file="$2" dest="$3"
+
+  if [ -z "$dest" ]; then
+    echo "check-commit-signing-posture: ERROR — no destination for the hermetic keyring (fail-closed)" >&2
+    return 1
+  fi
+  if ! command -v gpg >/dev/null 2>&1; then
+    echo "check-commit-signing-posture: ERROR — gpg(1) is not available, so OpenPGP-signed commits cannot be verified; refusing to report PASS (fail-closed)" >&2
+    return 1
+  fi
+  if [ ! -f "$pubkey_file" ]; then
+    echo "check-commit-signing-posture: ERROR — enrolled OpenPGP public-key material $pubkey_file is missing (fail-closed)" >&2
+    return 1
+  fi
+
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  chmod 700 "$dest"
+
+  if ! GNUPGHOME="$dest" gpg --batch --quiet --no-tty --import "$pubkey_file" >/dev/null 2>&1; then
+    echo "check-commit-signing-posture: ERROR — importing $pubkey_file into the hermetic keyring failed (fail-closed)" >&2
+    return 1
+  fi
+
+  local fpr trusted=0
+  while IFS= read -r fpr; do
+    [ -z "$fpr" ] && continue
+    if ! GNUPGHOME="$dest" gpg --batch --quiet --no-tty --list-keys --with-colons "$fpr" >/dev/null 2>&1; then
+      echo "check-commit-signing-posture: ERROR — pinned OpenPGP fingerprint $fpr is not present in $pubkey_file; the registry and its key material have drifted apart (fail-closed)" >&2
+      return 1
+    fi
+    if ! printf '%s:6:\n' "$fpr" | GNUPGHOME="$dest" gpg --batch --quiet --no-tty --import-ownertrust >/dev/null 2>&1; then
+      echo "check-commit-signing-posture: ERROR — could not grant ownertrust to pinned OpenPGP fingerprint $fpr in the hermetic keyring (fail-closed)" >&2
+      return 1
+    fi
+    trusted=$((trusted + 1))
+  done < <(enrolled_gpg_fingerprints "$gpg_signers_file")
+
+  if [ "$trusted" -eq 0 ]; then
+    echo "check-commit-signing-posture: ERROR — the hermetic keyring ended with ZERO trusted pinned keys (fail-closed)" >&2
+    return 1
+  fi
+  return 0
+}
+
+# check_range BASE_SHA HEAD_SHA SIGNERS_FILE [REPO_DIR] [GPG_SIGNERS_FILE]
+#             [GPG_PUBKEY_FILE] [PREPARED_GNUPGHOME]
+#
+# Walks every NON-MERGE commit in `merge-base(BASE,HEAD)..HEAD` inside
+# REPO_DIR and prints, to stdout, one `SCANNED: <n> ...` line followed by one
+# `VIOLATION: <sha> <reason>` line per failing commit.
+#
+# Returns 0 clean · 1 at least one violation · 2 the gate could not do its
+# job (registry loss, unresolvable range, hermetic-keyring failure, or ZERO
+# commits scanned — the #5047 non-vacuity floor). An empty range is NO LONGER
+# a pass.
+#
+# PREPARED_GNUPGHOME is a self-test seam: when non-empty the keyring at that
+# path is used verbatim instead of building a hermetic one, so the self-test
+# can plant ephemeral keys. Production callers never pass it.
 check_range() {
   local base="$1" head="$2" signers_file="$3" repo_dir="${4:-$REPO_ROOT}"
-  local principals violations=0
+  local gpg_signers_file="${5:-$GPG_SIGNERS_FILE_DEFAULT}"
+  local gpg_pubkey_file="${6:-$GPG_PUBKEY_FILE_DEFAULT}"
+  local prepared_gnupghome="${7:-}"
+  local principals pinned violations=0
 
   if ! assert_registry_usable "$signers_file"; then
-    return 1
+    return 2
+  fi
+  if ! assert_gpg_registry_usable "$gpg_signers_file"; then
+    return 2
   fi
   principals="$(enrolled_principals "$signers_file")"
-
-  if ! git -C "$repo_dir" rev-parse --verify --quiet "${base}^{commit}" >/dev/null \
-    || ! git -C "$repo_dir" rev-parse --verify --quiet "${head}^{commit}" >/dev/null; then
-    echo "check-commit-signing-posture: ERROR — cannot resolve range ${base}..${head} (fail-closed)" >&2
-    return 1
+  pinned="$(pinned_fingerprints "$signers_file" "$gpg_signers_file")"
+  if ! assert_pinned_fingerprints_usable "$pinned"; then
+    return 2
   fi
 
-  local line sha author_email committer_email sig_status
-  while IFS='|' read -r sha author_email committer_email sig_status; do
+  # Resolve BOTH endpoints and say which one failed. #5047 wants the floor's
+  # diagnostic to distinguish "the base ref does not exist" from "the range
+  # is genuinely empty"; before this change both reported the same thing (and
+  # the empty range reported nothing at all, and passed).
+  local base_resolved head_resolved base_state head_state
+  if base_resolved="$(git -C "$repo_dir" rev-parse --verify --quiet "${base}^{commit}")"; then
+    base_state="resolved"
+  else
+    base_resolved=""
+    base_state="UNRESOLVED"
+  fi
+  if head_resolved="$(git -C "$repo_dir" rev-parse --verify --quiet "${head}^{commit}")"; then
+    head_state="resolved"
+  else
+    head_resolved=""
+    head_state="UNRESOLVED"
+  fi
+  if [ "$base_state" != "resolved" ] || [ "$head_state" != "resolved" ]; then
+    echo "check-commit-signing-posture: ERROR — cannot resolve range ${base}..${head} (fail-closed): base '${base}' ${base_state} (${base_resolved:-<none>}), head '${head}' ${head_state} (${head_resolved:-<none>})" >&2
+    return 2
+  fi
+
+  local merge_base
+  if ! merge_base="$(git -C "$repo_dir" merge-base "$base_resolved" "$head_resolved" 2>/dev/null)" \
+    || [ -z "$merge_base" ]; then
+    echo "check-commit-signing-posture: ERROR — no merge base between base '${base}' (${base_resolved}) and head '${head}' (${head_resolved}); the range cannot be scoped (fail-closed)" >&2
+    return 2
+  fi
+
+  # The hermetic OpenPGP keyring must exist BEFORE the walk, because `%G?`
+  # and `%GF` are computed during the walk.
+  local gnupghome
+  if [ -n "$prepared_gnupghome" ]; then
+    gnupghome="$prepared_gnupghome"
+  else
+    gnupghome="$GATE_SCRATCH_ROOT/hermetic-gnupghome"
+    mkdir -p "$GATE_SCRATCH_ROOT"
+    if ! prepare_hermetic_gnupghome "$gpg_pubkey_file" "$gpg_signers_file" "$gnupghome"; then
+      return 2
+    fi
+  fi
+
+  local sha author_email committer_email sig_status sig_fpr scanned=0
+  local findings=""
+  while IFS='|' read -r sha author_email committer_email sig_status sig_fpr; do
     [ -z "$sha" ] && continue
+    scanned=$((scanned + 1))
     local a_lc c_lc
     a_lc="$(printf '%s' "$author_email" | tr '[:upper:]' '[:lower:]')"
     c_lc="$(printf '%s' "$committer_email" | tr '[:upper:]' '[:lower:]')"
 
     if ! is_enrolled_principal "$a_lc" "$principals"; then
-      echo "VIOLATION: $sha unbound-author-email ($author_email)"
+      findings+="VIOLATION: $sha unbound-author-email ($author_email)"$'\n'
       violations=1
     fi
     if ! is_enrolled_principal "$c_lc" "$principals"; then
-      echo "VIOLATION: $sha unbound-committer-email ($committer_email)"
+      findings+="VIOLATION: $sha unbound-committer-email ($committer_email)"$'\n'
       violations=1
     fi
+    # `elif`, not a second `if`: when `%G?` is not `G` nothing verified, so
+    # `%GF` is empty by construction and a second "key not pinned" line would
+    # be noise on the same root cause. The two reasons stay DISTINCT so a
+    # rogue-key-in-the-keyring refusal is visibly its own failure mode.
     if [ "$sig_status" != "G" ]; then
-      echo "VIOLATION: $sha signature-not-verified (%G?=$sig_status)"
+      findings+="VIOLATION: $sha signature-not-verified (%G?=$sig_status)"$'\n'
+      violations=1
+    elif ! is_pinned_fingerprint "$sig_fpr" "$pinned"; then
+      findings+="VIOLATION: $sha signing-key-not-pinned (%GF=${sig_fpr:-<empty>})"$'\n'
       violations=1
     fi
-  done < <(git -C "$repo_dir" \
+  done < <(GNUPGHOME="$gnupghome" git -C "$repo_dir" \
     -c "gpg.ssh.allowedSignersFile=$signers_file" \
     -c gpg.format=ssh \
-    log --format='%H|%ae|%ce|%G?' "${base}..${head}")
+    log --no-merges --format='%H|%ae|%ce|%G?|%GF' "${merge_base}..${head_resolved}")
+
+  # #5047 NON-VACUITY FLOOR. Zero commits scanned is a FAIL, not a pass: a
+  # gate that reports OK while having looked at nothing is the #2444 shape.
+  if [ "$scanned" -eq 0 ]; then
+    echo "check-commit-signing-posture: ERROR — scanned ZERO non-merge commits and refuses to report PASS (#5047 non-vacuity floor; fail-closed). base '${base}' ${base_state} -> ${base_resolved}; head '${head}' ${head_state} -> ${head_resolved}; merge-base -> ${merge_base}; range scanned '${merge_base}..${head_resolved}' with --no-merges" >&2
+    return 2
+  fi
+
+  echo "SCANNED: $scanned non-merge commits in ${merge_base}..${head_resolved}"
+  if [ -n "$findings" ]; then
+    printf '%s' "$findings"
+  fi
 
   [ "$violations" -eq 0 ]
 }
@@ -173,32 +507,73 @@ run_gate() {
   local base="${PR_BASE_SHA:-}"
   local head="${PR_HEAD_SHA:-HEAD}"
   if [ -z "$base" ]; then
+    # Exit 2, not 1: nothing was scanned, so this is the gate being
+    # INOPERATIVE (a CI-wiring fault — `fetch-depth`, a renamed env var, a
+    # workflow edit), not a commit violating the rule. Reporting it as 1 would
+    # misattribute a wiring fault to the PR author, and 1 is the code this
+    # gate's documented contract reserves for "a commit in range violated the
+    # rule". Sibling precedent for the same env var and the same fail-closed
+    # shape: check-cert-expiry.sh.
     echo "check-commit-signing-posture: ERROR — PR_BASE_SHA is unset on a pull_request event (fail-closed)" >&2
-    return 1
+    return 2
   fi
 
-  local out
-  if out="$(check_range "$base" "$head" "$SIGNERS_FILE_DEFAULT" "$REPO_ROOT")"; then
-    echo "check-commit-signing-posture: OK — every commit in ${base}..${head} is an enrolled, signature-verified identity"
-    return 0
-  else
-    echo "check-commit-signing-posture: VIOLATION — one or more commits in ${base}..${head} are not an enrolled, signature-verified identity:" >&2
-    echo "$out" >&2
-    echo "" >&2
-    echo "  Fix: reset the committer/author identity to an account-bound one" >&2
-    echo "  enrolled in scripts/qc-allowlists/enrolled-commit-signers.txt" >&2
-    echo "  (check for a stray local 'git config user.email' override — this" >&2
-    echo "  is the exact #2486 defect class), re-sign, and re-push." >&2
-    return 1
-  fi
+  local out status=0
+  out="$(check_range "$base" "$head" "$SIGNERS_FILE_DEFAULT" "$REPO_ROOT")" || status=$?
+
+  local scanned_line
+  scanned_line="$(grep -m1 '^SCANNED:' <<<"$out" || true)"
+
+  case "$status" in
+    0)
+      echo "check-commit-signing-posture: OK — ${scanned_line:-SCANNED: (unreported)}; every one of them is an enrolled identity whose signature verified against a PINNED key fingerprint (range ${base}..${head}, --no-merges)"
+      return 0
+      ;;
+    1)
+      echo "check-commit-signing-posture: VIOLATION — one or more commits in ${base}..${head} are not an enrolled, signature-verified, PINNED-key identity (${scanned_line:-SCANNED: (unreported)}):" >&2
+      grep -v '^SCANNED:' <<<"$out" >&2 || true
+      echo "" >&2
+      echo "  Fix (unbound-author-email / unbound-committer-email): reset the" >&2
+      echo "  committer/author identity to an account-bound one enrolled in" >&2
+      echo "  scripts/qc-allowlists/enrolled-commit-signers.txt (check for a" >&2
+      echo "  stray local 'git config user.email' override — this is the exact" >&2
+      echo "  #2486 defect class), re-sign, and re-push." >&2
+      echo "  Fix (signature-not-verified): sign the commit with an enrolled" >&2
+      echo "  key; %G?=N means it is unsigned, E means the key is not enrolled," >&2
+      echo "  U means it verified but is not trusted in this job's keyring." >&2
+      echo "  Fix (signing-key-not-pinned): the signature verified, but the key" >&2
+      echo "  that produced it is NOT pinned. Enroll it via a reviewed PR to" >&2
+      echo "  scripts/qc-allowlists/enrolled-commit-signers.txt (SSH) or to" >&2
+      echo "  scripts/qc-allowlists/enrolled-gpg-commit-signers.txt plus its" >&2
+      echo "  .asc sibling (OpenPGP) — never by widening the accept test." >&2
+      return 1
+      ;;
+    *)
+      echo "check-commit-signing-posture: INOPERATIVE — the gate could not do its job over ${base}..${head} and refuses to report PASS (see the fail-closed diagnostic above)." >&2
+      return 2
+      ;;
+  esac
+}
+
+# st_report CASE OBSERVED_RC EXPECTED_RC — one stdout line per self-test case
+# naming the case, the exit code it actually produced and the code it must
+# produce. This is deliberately part of the gate rather than an out-of-band
+# harness: the per-case exit codes are the acceptance evidence for #5045 /
+# #5046 / #5047, so they are reproducible by anyone running `--self-test` and
+# readable straight out of the CI job log, forever.
+st_report() {
+  printf 'self-test case (%s): rc=%s (expected %s)\n' "$1" "$2" "$3"
 }
 
 self_test() {
   local tmp
-  tmp="$REPO_ROOT/.local-runs/check-commit-signing-posture-selftest.$$"
+  tmp="$GATE_SCRATCH_ROOT/selftest"
   mkdir -p "$tmp"
-  # shellcheck disable=SC2064
-  trap "rm -rf '$tmp'" EXIT
+
+  if ! command -v gpg >/dev/null 2>&1; then
+    echo "self-test FAILED: gpg(1) is unavailable, so the OpenPGP half of this gate (#5045) cannot be proven; refusing to report a partial PASS" >&2
+    exit 2
+  fi
 
   local enrolled_key="$tmp/enrolled_key" rogue_key="$tmp/rogue_key"
   ssh-keygen -q -t ed25519 -N '' -f "$enrolled_key" -C 'selftest-enrolled'
@@ -209,6 +584,34 @@ self_test() {
     echo "# self-test registry"
     printf 'dev@example.test %s\n' "$(cut -d' ' -f1,2 "$enrolled_key.pub")"
   } >"$signers"
+
+  # OpenPGP half (#5045): TWO ephemeral keys in ONE ephemeral keyring. Both
+  # are locally generated, so gpg gives BOTH ultimate ownertrust and BOTH
+  # yield `%G? = G` — which is precisely the measured threat shape: a rogue
+  # key merely PRESENT in the runner keyring verifies. Only the first is
+  # pinned, so the ONLY thing that can reject the second is the `%GF` pin.
+  local gpg_home="$tmp/gnupg"
+  mkdir -p "$gpg_home"
+  chmod 700 "$gpg_home"
+  GNUPGHOME="$gpg_home" gpg --batch --quiet --no-tty --pinentry-mode loopback \
+    --passphrase '' --quick-generate-key 'Selftest Pinned <pinned@example.test>' \
+    ed25519 sign 0 >/dev/null 2>&1
+  GNUPGHOME="$gpg_home" gpg --batch --quiet --no-tty --pinentry-mode loopback \
+    --passphrase '' --quick-generate-key 'Selftest Rogue <rogue@example.test>' \
+    ed25519 sign 0 >/dev/null 2>&1
+  local pinned_gpg_fpr rogue_gpg_fpr
+  pinned_gpg_fpr="$(GNUPGHOME="$gpg_home" gpg --batch --with-colons --list-secret-keys 'pinned@example.test' 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
+  rogue_gpg_fpr="$(GNUPGHOME="$gpg_home" gpg --batch --with-colons --list-secret-keys 'rogue@example.test' 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
+  if [ -z "$pinned_gpg_fpr" ] || [ -z "$rogue_gpg_fpr" ] || [ "$pinned_gpg_fpr" = "$rogue_gpg_fpr" ]; then
+    echo "self-test FAILED: could not plant two DISTINCT ephemeral OpenPGP keys (pinned='$pinned_gpg_fpr' rogue='$rogue_gpg_fpr')" >&2
+    exit 2
+  fi
+
+  local gpg_signers="$tmp/gpg_signers.txt"
+  {
+    echo "# self-test OpenPGP fingerprint registry"
+    printf '%s selftest-pinned\n' "$pinned_gpg_fpr"
+  } >"$gpg_signers"
 
   local repo="$tmp/repo"
   mkdir -p "$repo"
@@ -255,7 +658,7 @@ self_test() {
   git -C "$repo" reset -q --hard "$clean_sha"
 
   # (d) VIOLATION — enrolled email CLAIMED, but signed with a ROGUE
-  # (non-enrolled) key: proves the gate rejects an identity spoof that a
+  # (non-enrolled) SSH key: proves the gate rejects an identity spoof that a
   # bare "has-a-signature" check would miss.
   git -C "$repo" config commit.gpgsign true
   git -C "$repo" config user.signingkey "$rogue_key.pub"
@@ -264,11 +667,47 @@ self_test() {
   rogue_sha="$(git -C "$repo" rev-parse HEAD)"
   git -C "$repo" reset -q --hard "$clean_sha"
 
-  local failed=0
+  # (h) CLEAN — enrolled email, signed with the PINNED ephemeral OpenPGP key
+  # (#5045). MUST PASS. The range also contains the SSH-signed (a) commit, so
+  # this case additionally proves both verification paths pass in ONE range
+  # under ONE unioned pin.
+  git -C "$repo" config gpg.format openpgp
+  git -C "$repo" config user.signingkey "$pinned_gpg_fpr"
+  GNUPGHOME="$gpg_home" git -C "$repo" commit -q -m "clean: enrolled identity, pinned OpenPGP signature" --allow-empty
+  local gpg_clean_sha
+  gpg_clean_sha="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" reset -q --hard "$clean_sha"
+
+  # (i) VIOLATION — enrolled email, a signature that FULLY VERIFIES (`%G?=G`)
+  # against a key that is IN THE SAME KEYRING but is NOT PINNED (#5045).
+  #
+  # ****  LOAD-BEARING. NEVER DELETE THIS CASE.  ****
+  # This commit PASSED the gate before #5045 would have, once the keyring
+  # import existed, and it is the ONLY case that fails if a future edit drops
+  # the `%GF` pinned-fingerprint branch while keeping the keyring import. Drop
+  # that branch and the OpenPGP path silently widens from "the enrolled
+  # operator key" to "ANY key present in the runner keyring with trust" — a
+  # gate that reports success while proving nothing (#2444), and the exact
+  # trap the #5045 crossroads verdict (`5-agent vote (4d3ea1c5)`, memory
+  # 86c7ae16-2591-461c-a797-dfd779f05edf) identified in the naive fix. The
+  # rogue key here is ultimately trusted on purpose, so `%G?` really is `G`
+  # and the pin is the only thing standing between it and a PASS.
+  git -C "$repo" config user.signingkey "$rogue_gpg_fpr"
+  GNUPGHOME="$gpg_home" git -C "$repo" commit -q -m "bad: enrolled identity, UNPINNED OpenPGP key in the same keyring" --allow-empty
+  local gpg_rogue_sha
+  gpg_rogue_sha="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" reset -q --hard "$clean_sha"
+  git -C "$repo" config gpg.format ssh
+  git -C "$repo" config user.signingkey "$enrolled_key.pub"
+
+  local failed=0 out rc
 
   # (a) clean control MUST pass.
-  if ! out="$(check_range "$base_sha" "$clean_sha" "$signers" "$repo")"; then
-    echo "self-test FAILED: clean enrolled+signed commit was REJECTED:" >&2
+  rc=0
+  out="$(check_range "$base_sha" "$clean_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home")" || rc=$?
+  st_report "a" "$rc" "0"
+  if [ "$rc" -ne 0 ]; then
+    echo "self-test FAILED: clean enrolled+signed commit was REJECTED (rc=$rc):" >&2
     echo "$out" >&2
     failed=1
   fi
@@ -276,7 +715,10 @@ self_test() {
   # (b) identity-drift + unsigned MUST fail, naming BOTH the email and
   # signature violations (proves the two checks are independent, not one
   # masking the other).
-  if out="$(check_range "$base_sha" "$drift_sha" "$signers" "$repo" 2>&1)"; then
+  rc=0
+  out="$(check_range "$base_sha" "$drift_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" 2>&1)" || rc=$?
+  st_report "b" "$rc" "non-zero"
+  if [ "$rc" -eq 0 ]; then
     echo "self-test FAILED: #2486 identity-drift shape was NOT rejected" >&2
     failed=1
   else
@@ -294,7 +736,10 @@ self_test() {
 
   # (c) enrolled email but unsigned MUST fail on signature alone (email
   # check must NOT fire — proves independence in the other direction).
-  if out="$(check_range "$base_sha" "$unsigned_sha" "$signers" "$repo" 2>&1)"; then
+  rc=0
+  out="$(check_range "$base_sha" "$unsigned_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" 2>&1)" || rc=$?
+  st_report "c" "$rc" "non-zero"
+  if [ "$rc" -eq 0 ]; then
     echo "self-test FAILED: unsigned enrolled-identity commit was NOT rejected" >&2
     failed=1
   else
@@ -310,11 +755,14 @@ self_test() {
     fi
   fi
 
-  # (d) enrolled email claimed, rogue-key signature MUST fail — proves the
-  # gate verifies the signature against the REGISTRY, not merely "some
+  # (d) enrolled email claimed, rogue SSH-key signature MUST fail — proves
+  # the gate verifies the signature against the REGISTRY, not merely "some
   # signature is present" (the E status: unenrolled key rejects a spoofed
   # enrolled email).
-  if out="$(check_range "$base_sha" "$rogue_sha" "$signers" "$repo" 2>&1)"; then
+  rc=0
+  out="$(check_range "$base_sha" "$rogue_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" 2>&1)" || rc=$?
+  st_report "d" "$rc" "non-zero"
+  if [ "$rc" -eq 0 ]; then
     echo "self-test FAILED: rogue-key signature under a spoofed enrolled email was NOT rejected" >&2
     failed=1
   else
@@ -325,9 +773,14 @@ self_test() {
     fi
   fi
 
-  # (e) missing/unresolvable range fails CLOSED, not silently passes.
-  if check_range "0000000000000000000000000000000000000000" "$clean_sha" "$signers" "$repo" >/dev/null 2>&1; then
-    echo "self-test FAILED: an unresolvable base SHA did not fail closed" >&2
+  # (e) missing/unresolvable range fails CLOSED with exit 2 — never 0, and
+  # never the exit-1 "a commit violated the rule" code, because nothing was
+  # scanned (#5047: an inoperative gate is its own disposition).
+  rc=0
+  check_range "0000000000000000000000000000000000000000" "$clean_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" >/dev/null 2>&1 || rc=$?
+  st_report "e" "$rc" "2"
+  if [ "$rc" -ne 2 ]; then
+    echo "self-test FAILED: an unresolvable base SHA returned $rc, expected 2 (fail-closed, inoperative)" >&2
     failed=1
   fi
 
@@ -336,8 +789,11 @@ self_test() {
   # incidental pipefail. A future refactor that swallows
   # enrolled_principals' exit status would flip this fail-open silently
   # if it were not directly asserted here.
-  if check_range "$base_sha" "$clean_sha" "$tmp/does-not-exist-registry.txt" "$repo" >/dev/null 2>&1; then
-    echo "self-test FAILED: a missing enrolled-signers registry did not fail closed" >&2
+  rc=0
+  check_range "$base_sha" "$clean_sha" "$tmp/does-not-exist-registry.txt" "$repo" "$gpg_signers" "" "$gpg_home" >/dev/null 2>&1 || rc=$?
+  st_report "f" "$rc" "2"
+  if [ "$rc" -ne 2 ]; then
+    echo "self-test FAILED: a missing enrolled-signers registry returned $rc, expected 2 (fail-closed)" >&2
     failed=1
   fi
 
@@ -347,15 +803,136 @@ self_test() {
   # checks `[ -f ... ]` cannot pass this self-test.
   local empty_signers="$tmp/empty_signers.txt"
   printf '# no principals enrolled\n\n' >"$empty_signers"
-  if check_range "$base_sha" "$clean_sha" "$empty_signers" "$repo" >/dev/null 2>&1; then
-    echo "self-test FAILED: an empty enrolled-signers registry did not fail closed" >&2
+  rc=0
+  check_range "$base_sha" "$clean_sha" "$empty_signers" "$repo" "$gpg_signers" "" "$gpg_home" >/dev/null 2>&1 || rc=$?
+  st_report "g" "$rc" "2"
+  if [ "$rc" -ne 2 ]; then
+    echo "self-test FAILED: an empty enrolled-signers registry returned $rc, expected 2 (fail-closed)" >&2
+    failed=1
+  fi
+
+  # (g2) MISSING and EMPTY OpenPGP fingerprint registries fail CLOSED too
+  # (#5045) — the second registry gets the same explicit guard as the first,
+  # so losing the OpenPGP pin can never degrade into "the SSH half still
+  # passes, nothing noticed".
+  rc=0
+  check_range "$base_sha" "$clean_sha" "$signers" "$repo" "$tmp/does-not-exist-gpg-registry.txt" "" "$gpg_home" >/dev/null 2>&1 || rc=$?
+  st_report "g2-missing" "$rc" "2"
+  if [ "$rc" -ne 2 ]; then
+    echo "self-test FAILED: a missing OpenPGP fingerprint registry returned $rc, expected 2 (fail-closed)" >&2
+    failed=1
+  fi
+  local empty_gpg_signers="$tmp/empty_gpg_signers.txt"
+  printf '# no fingerprints pinned\nnot-a-fingerprint comment\n\n' >"$empty_gpg_signers"
+  rc=0
+  check_range "$base_sha" "$clean_sha" "$signers" "$repo" "$empty_gpg_signers" "" "$gpg_home" >/dev/null 2>&1 || rc=$?
+  st_report "g2-empty" "$rc" "2"
+  if [ "$rc" -ne 2 ]; then
+    echo "self-test FAILED: an OpenPGP fingerprint registry with zero well-formed fingerprints returned $rc, expected 2 (fail-closed)" >&2
+    failed=1
+  fi
+
+  # (h) PINNED OpenPGP signature MUST pass (#5045) — the whole point of the
+  # repair: the operator's OpenPGP-signed commits stop being refused, and the
+  # same range still accepts the SSH-signed commit.
+  rc=0
+  out="$(check_range "$base_sha" "$gpg_clean_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" 2>&1)" || rc=$?
+  st_report "h" "$rc" "0"
+  if [ "$rc" -ne 0 ]; then
+    echo "self-test FAILED: a commit signed with the PINNED OpenPGP key was REJECTED (rc=$rc):" >&2
+    echo "$out" >&2
+    failed=1
+  fi
+
+  # (i) LOAD-BEARING (NEVER DELETE): a fully-verifying (`%G?=G`) OpenPGP
+  # signature from an UNPINNED key in the SAME keyring MUST be refused, and
+  # refused specifically as signing-key-not-pinned. See the long comment at
+  # the planting site above for why this is the only guard against the
+  # OpenPGP path silently widening to "any key in the runner keyring".
+  rc=0
+  out="$(check_range "$base_sha" "$gpg_rogue_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" 2>&1)" || rc=$?
+  st_report "i" "$rc" "non-zero"
+  if [ "$rc" -eq 0 ]; then
+    echo "self-test FAILED: an UNPINNED OpenPGP key present in the same keyring was NOT rejected — the OpenPGP path has widened to 'any key in the runner keyring' (#5045):" >&2
+    echo "$out" >&2
+    failed=1
+  else
+    if ! grep -q "signing-key-not-pinned" <<<"$out"; then
+      echo "self-test FAILED: the unpinned-OpenPGP-key rejection did not name signing-key-not-pinned (so it was refused for the wrong reason, and the %GF pin is not what rejected it):" >&2
+      echo "$out" >&2
+      failed=1
+    fi
+  fi
+
+  # (j) EMPTY RANGE fails CLOSED with exit 2, never 0 (#5047). Before this
+  # change an empty range reported OK: a gate that passes while scanning
+  # nothing. Asserted on an exact code so "it failed for some other reason"
+  # cannot be mistaken for the floor firing.
+  rc=0
+  check_range "$clean_sha" "$clean_sha" "$signers" "$repo" "$gpg_signers" "" "$gpg_home" >/dev/null 2>&1 || rc=$?
+  st_report "j" "$rc" "2"
+  if [ "$rc" -ne 2 ]; then
+    echo "self-test FAILED: an EMPTY commit range returned $rc, expected 2 (#5047 non-vacuity floor)" >&2
+    failed=1
+  fi
+
+  # (k) The SHIPPED registries and the SHIPPED key material agree, and a
+  # HERMETIC keyring really can be built from them (#5045) — no ephemeral
+  # stand-in, no `prepared_gnupghome` seam. This is what proves the import
+  # step the CI job depends on is not vapour, and that
+  # enrolled-gpg-commit-signers.txt has not drifted from its .asc sibling.
+  rc=0
+  prepare_hermetic_gnupghome "$GPG_PUBKEY_FILE_DEFAULT" "$GPG_SIGNERS_FILE_DEFAULT" \
+    "$tmp/shipped-gnupghome" >/dev/null 2>&1 || rc=$?
+    st_report "k" "$rc" "0"
+  if [ "$rc" -ne 0 ]; then
+    echo "self-test FAILED: a hermetic keyring could not be built from the SHIPPED $GPG_PUBKEY_FILE_DEFAULT + $GPG_SIGNERS_FILE_DEFAULT (rc=$rc)" >&2
+    prepare_hermetic_gnupghome "$GPG_PUBKEY_FILE_DEFAULT" "$GPG_SIGNERS_FILE_DEFAULT" "$tmp/shipped-gnupghome" >&2 || true
+    failed=1
+  fi
+  local shipped_pinned
+  shipped_pinned="$(pinned_fingerprints "$SIGNERS_FILE_DEFAULT" "$GPG_SIGNERS_FILE_DEFAULT")"
+  if ! assert_pinned_fingerprints_usable "$shipped_pinned" >/dev/null 2>&1; then
+    echo "self-test FAILED: the SHIPPED pinned fingerprint set is missing one of its two halves:" >&2
+    printf '%s\n' "$shipped_pinned" >&2
+    failed=1
+  fi
+
+  # (l) `run_gate`'s OWN dispositions, which none of the check_range cases
+  # above can reach because they call check_range directly: the
+  # non-pull_request N/A skip, and a pull_request event carrying no
+  # PR_BASE_SHA. Sibling precedent: check-cert-expiry.sh's self-test case (k),
+  # which covers the identical fail-closed shape for the identical env var.
+  # Without this case the gate's entry point — the part CI actually invokes —
+  # had no self-test at all, so a wiring regression there (an N/A skip that
+  # swallowed a real pull_request, or an unset base that reported PASS) would
+  # not have been caught by anything.
+  local gate_self="${BASH_SOURCE[0]}"
+  rc=0
+  out="$(GITHUB_EVENT_NAME=push bash "$gate_self" 2>&1)" || rc=$?
+  st_report "l-na" "$rc" "0"
+  if [ "$rc" -ne 0 ]; then
+    echo "self-test FAILED: a non-pull_request event did not report N/A cleanly (rc=$rc):" >&2
+    echo "$out" >&2
+    failed=1
+  elif ! grep -q "N/A" <<<"$out"; then
+    echo "self-test FAILED: a non-pull_request event exited 0 without saying N/A, so a silent skip is indistinguishable from a PASS:" >&2
+    echo "$out" >&2
+    failed=1
+  fi
+  rc=0
+  out="$(env -u PR_BASE_SHA GITHUB_EVENT_NAME=pull_request bash "$gate_self" 2>&1)" || rc=$?
+  st_report "l-unset-base" "$rc" "2"
+  if [ "$rc" -ne 2 ]; then
+    echo "self-test FAILED: a pull_request event with PR_BASE_SHA unset returned $rc, expected 2 (fail-closed, inoperative — NOT 0 and NOT 1):" >&2
+    echo "$out" >&2
     failed=1
   fi
 
   if [ "$failed" -ne 0 ]; then
     exit 2
   fi
-  echo "check-commit-signing-posture self-test OK: (a) clean enrolled+signed commit passes; (b) #2486 identity-drift shape (unbound email, unsigned) rejected naming both violations; (c) enrolled-but-unsigned commit rejected (signature check isolated from email check); (d) enrolled-email-claimed-with-rogue-key-signature rejected (verification is against the registry, not mere signature presence); (e) unresolvable commit range fails closed; (f) missing enrolled-signers registry fails closed; (g) empty enrolled-signers registry fails closed — (f)/(g) prove the fail-closed-on-registry-loss property is an EXPLICIT assertion (assert_registry_usable), not incidental pipefail behavior."
+  echo "check-commit-signing-posture self-test OK: (a) clean enrolled+SSH-signed commit passes; (b) #2486 identity-drift shape (unbound email, unsigned) rejected naming both violations; (c) enrolled-but-unsigned commit rejected (signature check isolated from email check); (d) enrolled-email-claimed-with-rogue-SSH-key-signature rejected (verification is against the registry, not mere signature presence); (e) unresolvable commit range fails closed with exit 2; (f) missing enrolled-signers registry fails closed; (g) empty enrolled-signers registry fails closed; (g2) missing AND zero-fingerprint OpenPGP registries fail closed; (h) a commit signed with the PINNED OpenPGP key PASSES alongside an SSH-signed commit in the same range (#5045); (i) a fully-verifying OpenPGP signature from an UNPINNED key in the SAME keyring is rejected as signing-key-not-pinned — LOAD-BEARING, the only guard against the OpenPGP path widening to 'any key in the runner keyring'; (j) an EMPTY range fails closed with exit 2 (#5047 non-vacuity floor, which previously PASSED); (k) a hermetic keyring builds from the SHIPPED registry + .asc material and the shipped pin carries both halves; (l) run_gate's own entry-point dispositions — a non-pull_request event reports N/A at exit 0, and a pull_request event with PR_BASE_SHA unset fails closed at exit 2 (inoperative), never 0 and never 1. (f)/(g)/(g2) prove the fail-closed-on-registry-loss property is an EXPLICIT assertion (assert_registry_usable / assert_gpg_registry_usable / assert_pinned_fingerprints_usable), not incidental pipefail behavior."
 }
 
 case "${1:-}" in
