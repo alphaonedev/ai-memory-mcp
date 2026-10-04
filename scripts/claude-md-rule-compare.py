@@ -556,6 +556,39 @@ def self_test() -> int:
         else:
             print(f"PASS: self-test - R5 fenced(): {label}")
 
+    def base_claude_symlink(root):
+        target = root / "CLAUDE.md"
+        target.rename(root / "CLAUDE.real.md")
+        target.symlink_to("CLAUDE.real.md")
+
+    case("R4 a symlinked base CLAUDE.md fails closed", missing_manifest, True, "not a regular file",
+         base_mutate=base_claude_symlink)
+
+    def base_guard_symlink(root):
+        target = root / GUARD_REL
+        target.unlink()
+        target.symlink_to("/dev/null")
+
+    case("R5 a symlinked base guard fails closed", missing_manifest, True, "not a regular file",
+         base_mutate=base_guard_symlink)
+
+    def base_manifest_symlink(root):
+        target = root / MANIFEST_REL
+        target.rename(root / "manifest.real")
+        target.symlink_to("../../manifest.real")
+
+    case("R5 a symlinked base manifest fails closed", missing_manifest, True, "not a regular file",
+         base_mutate=base_manifest_symlink)
+
+    def base_manifest_garbage(root):
+        with open(root / MANIFEST_REL, "a", encoding="utf-8") as handle:
+            handle.write("not a manifest line\n")
+
+    case("R4 a malformed base manifest fails closed even with the trailer", reword, True, "unusable",
+         trailer="Justin", base_mutate=base_manifest_garbage)
+    case("R5 a malformed base manifest fails closed without the trailer", reword, True, "unusable",
+         base_mutate=base_manifest_garbage)
+
     shutil.rmtree(base_dir, ignore_errors=True)
     if failures:
         print(f"FAIL: self-test - {len(failures)} case(s) failed", file=sys.stderr)
