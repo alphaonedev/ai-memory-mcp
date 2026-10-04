@@ -129,6 +129,8 @@ mod lifecycle_tx_3152;
 mod forensic_outage_4199;
 // v1.0.0 #4209/#4210 — one ascending-id lock order for multi-row `memories` locks.
 mod lock_order_4209;
+// v1.0.0 #5035 — the lifetime schema-ahead write gate (qual_10 budget).
+mod schema_live_5035;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -2575,6 +2577,10 @@ pub struct PostgresStore {
     /// window where a stop engaged by ANOTHER daemon did not reach this
     /// pool's write gate until it reconnected.
     record_stop_refreshed_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// v1.0.0 #5035 — last observed `MAX(schema_version)`, seeded at connect
+    /// and re-read by the #3276 refresh winner; the write gate refuses when it
+    /// is ahead of this binary. Shared across pool clones.
+    schema_observed: schema_live_5035::SchemaObserved,
     /// #3344 amendment 2 — per-store amortisation of the `embed_skip`
     /// stale-marker walk. Behind `Arc` so [`Clone`] of this store shares
     /// ONE timer (not process-global; not per-clone-fresh). A key
@@ -3292,6 +3298,7 @@ impl PostgresStore {
                 record_stop_refreshed_ms: std::sync::Arc::new(
                     std::sync::atomic::AtomicU64::new(record_stop_refresh_now_ms()),
                 ),
+                schema_observed: schema_live_5035::seed(observed),
                 embed_skip_amort: std::sync::Arc::new(
                     crate::storage::embed_skip::EmbedSkipAmortisation::new(),
                 ),
@@ -20417,10 +20424,15 @@ impl PostgresStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Stopped`] when the record plane is stopped.
+    /// [`StoreError::Stopped`] when the record plane is stopped;
+    /// [`StoreError::SchemaAheadOfBinary`] when the cluster schema moved
+    /// ahead of this binary after connect (#5035).
     async fn gate_record_stop(&self) -> StoreResult<()> {
         self.refresh_record_stop_if_stale().await;
-        crate::store::record_stop::gate_flag(&self.record_stop)
+        crate::store::record_stop::gate_flag(&self.record_stop)?;
+        // #5035 (vote 4d3ea1c5) — the schema-ahead refusal for the pool's
+        // lifetime; the operator's stop above outranks it.
+        self.gate_schema_live()
     }
 
     /// #3276 — TTL-bounded, single-flight durable re-check of the record-stop
@@ -20492,6 +20504,8 @@ impl PostgresStore {
         // Winner: re-derive the durable state and reconcile the cache. On a
         // read error `seed_record_stop` leaves the cache as-is (fail-closed).
         self.seed_record_stop().await;
+        // #5035 — the same elected writer re-reads the cluster schema version.
+        self.refresh_schema_observed().await;
     }
 
     /// v1.0.0 #3180 / #3175 — append ONE `pending_action.<state>` audit row

@@ -206,8 +206,41 @@ impl SqliteStore {
     }
 }
 
-fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
+fn box_err<E: std::fmt::Display + 'static>(e: E) -> StoreError {
+    if let Some(detail) = schema_ahead_detail(&e) {
+        return StoreError::SchemaAheadOfBinary { detail };
+    }
     StoreError::Backend(BoxBackendError::new(e.to_string()))
+}
+
+/// [`box_err`] for a BORROWED `anyhow::Error` (a delegate that first inspects
+/// the chain for its own typed variant): same #5035 schema-ahead recovery.
+fn box_anyhow_ref(e: &anyhow::Error) -> StoreError {
+    match e.downcast_ref::<crate::storage::StorageError>() {
+        Some(crate::storage::StorageError::SchemaAheadOfBinary { detail }) => {
+            StoreError::SchemaAheadOfBinary {
+                detail: detail.clone(),
+            }
+        }
+        _ => StoreError::Backend(BoxBackendError::new(e.to_string())),
+    }
+}
+
+/// v1.0.0 #5035 — recover the lifetime schema-ahead refusal raised by the
+/// shared `db::` write gate (`record_stop::gate_storage_conn`) so the SAL
+/// caller gets the typed [`StoreError::SchemaAheadOfBinary`] (HTTP 503,
+/// `SCHEMA_AHEAD_OF_BINARY`) instead of a flattened backend string — the same
+/// variant the postgres adapter returns. Every delegate funnels through
+/// [`box_err`], so the downcast lives here once rather than at ~200 sites.
+fn schema_ahead_detail(e: &dyn std::any::Any) -> Option<String> {
+    let se = match e.downcast_ref::<anyhow::Error>() {
+        Some(chain) => chain.downcast_ref::<crate::storage::StorageError>(),
+        None => e.downcast_ref::<crate::storage::StorageError>(),
+    }?;
+    match se {
+        crate::storage::StorageError::SchemaAheadOfBinary { detail } => Some(detail.clone()),
+        _ => None,
+    }
 }
 
 /// #4447 — map the typed in-transaction by-id refusal onto the ONE
@@ -242,6 +275,9 @@ fn memory_guard_err(e: crate::errors::MemoryError) -> StoreError {
         }
         crate::errors::MemoryError::AuditTrailUnavailable(reason) => {
             StoreError::AuditTrailUnavailable { reason }
+        }
+        crate::errors::MemoryError::SchemaAheadOfBinary(detail) => {
+            StoreError::SchemaAheadOfBinary { detail }
         }
         other => box_err(other.message()),
     }
@@ -940,7 +976,7 @@ impl MemoryStore for SqliteStore {
         .map_err(|e| {
             e.downcast_ref::<crate::storage::InvalidTransition>()
                 .map_or_else(
-                    || box_err(&e),
+                    || box_anyhow_ref(&e),
                     |it| StoreError::InvalidTransition {
                         detail: it.to_string(),
                     },
@@ -3791,7 +3827,7 @@ impl MemoryStore for SqliteStore {
                         matches!(se, crate::storage::StorageError::TraversalBudgetExceeded)
                     })
                     .map_or_else(
-                        || box_err(&e),
+                        || box_anyhow_ref(&e),
                         |_| StoreError::TraversalBudgetExceeded {
                             detail: crate::storage::find_paths_budget_exceeded_message(),
                         },

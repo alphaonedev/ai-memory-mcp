@@ -284,6 +284,8 @@ pub fn caller_message(e: &crate::storage::StorageError) -> String {
              (fail-closed; mutating operation refused, retry)"
             .to_string(),
         SE::AuditTrailUnavailable { .. } => crate::audit::audit_trail_refusal_message(),
+        // #5035 — our own path-free rendering (schema_guard::LIVE_TARGET_LABEL).
+        SE::SchemaAheadOfBinary { detail } => detail.clone(),
         _ => "mutating operation refused".to_string(),
     }
 }
@@ -299,10 +301,16 @@ pub fn caller_message(e: &crate::storage::StorageError) -> String {
 /// [`crate::storage::StorageError::RecordStopIndeterminate`] when the stop
 /// state cannot be read; [`crate::storage::StorageError::AuditTrailUnavailable`]
 /// when this process's audit trail failed under `AI_MEMORY_REQUIRE_AUDIT_TRAIL`
-/// (#4400). The operator's stop is checked first: it outranks a health
-/// condition of this process's sink.
+/// (#4400); [`crate::storage::StorageError::SchemaAheadOfBinary`] when the
+/// recorded schema moved ahead of this binary after open (#5035). The
+/// operator's stop is checked first: it outranks a health condition of this
+/// process's sink.
 pub fn gate_storage_conn(conn: &rusqlite::Connection) -> Result<(), crate::storage::StorageError> {
     gate_record_stop(conn)?;
+    // #5035 (5-agent vote 4d3ea1c5 = A) — hold the #2445 schema-ahead refusal
+    // for the connection's LIFETIME, not only at open: a newer binary may have
+    // migrated this file under a long-lived daemon since `db::open` ran.
+    crate::storage::schema_guard::gate_live_sqlite_write(conn)?;
     crate::audit::audit_trail_gate()
         .map_err(|e| crate::storage::StorageError::AuditTrailUnavailable { reason: e.reason })
 }
