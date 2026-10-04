@@ -381,6 +381,24 @@ MDEOF
         run_fixture_out | sed 's/^/       /' >&2; exit 1; }
     echo "PASS: self-test #4651 green control — commit-pinned (40-hex) permalink labels are ACCEPTED"
 
+    # ---- #5201: the absent-path exemption must not fail open --------
+    # "split by #N" is not an absence assertion, and a QUAL anchor
+    # (path::symbol) asserts the file exists whatever the wording says.
+    anchor_red 5201 PATH "a plain path on a 'split by' line" \
+        'Split by #1670: see `src/missing_5201.rs` for it.'
+    anchor_red 5201 PATH "a qualified anchor on a 'split by' line" \
+        'Split by #1670 from `src/missing_5201.rs::insert` today.'
+    anchor_red 5201 PATH "a qualified anchor on a 'formerly' line" \
+        'Formerly `src/missing_5201.rs::insert` held it.'
+    anchor_red 5201 PATH "an unbackticked qualified anchor on a 'formerly' line" \
+        'Formerly src/missing_5201.rs::insert held it.'
+    anchor_green 5201 "a plain path with 'was split' wording" \
+        'The old module `src/missing_5201.rs` was split by #1670.'
+    anchor_green 5201 "a plain path with 'renamed to' wording" \
+        'The loop `src/missing_5201.rs` was renamed to `src/mcp/tools/recall.rs`.'
+    anchor_green 5201 "a plain path with 'pre-split' wording" \
+        'It was `src/missing_5201.rs` pre-split.'
+
     # ---- a stale migrate_vNN (the #2629 issue title's own example) ---
     write_clean
     printf '\n\nThe postgres ladder ends at `src/store/postgres.rs::migrate_v86`.\n' >> "$FIX/README.md"
@@ -655,7 +673,7 @@ IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # sentences that say the file is gone.
 ABSENT_ASSERTION = re.compile(
     r"test ! -f|no longer exists?|pre-?modularisation|pre-?modularization|"
-    r"modularisation|modularization|monolithic|formerly|\bsplit\b|renamed to|"
+    r"modularisation|modularization|monolithic|formerly|\bsplit (?:into|out|from|off)\b|\b(?:was|been|got) split\b|pre-?split|renamed to|"
     r"removed in|deleted in|STALE BASE|does not exist|(?:->|\u2192)\s*`?src/",
     re.IGNORECASE,
 )
@@ -745,8 +763,9 @@ for doc in seen_docs:
             f = m.group(1)
             raw = m.group(2) if m.group(2) is not None else (m.group(3) or "")
             if f not in per_file:
-                if not absent_ok:
-                    emit("PATH", doc, ln, f, ctx)
+                # #5201: a qualified anchor asserts the file exists, so the
+                # absence-wording exemption never applies to it.
+                emit("PATH", doc, ln, f, ctx)
                 continue
             for tok in raw.replace(",", " ").split():
                 tok = tok.strip().rstrip("(){}[]<>.,;")
