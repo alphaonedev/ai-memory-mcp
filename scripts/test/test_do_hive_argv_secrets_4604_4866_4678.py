@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Round-4 regression probes for PR 4671 (#4604 F4, #4866 F5, #4678 F6).
+"""Round-4/5 regression probes for PR 4671 (#4604 F4, #4866 F5, #4678 F6, #4898 N1, #4893 P1).
 
 Each probe extracts the shipped text (template or script), runs it under bash
 with a stand-in for curl or sed that records its argv and its stdin, and
 asserts the secret is on no argv and still reaches the program on stdin. The
-F6 probe feeds mixed-case releases/latest URLs to spawn.sh require_image_pin.
+F6 probe feeds mixed-case and dot-segment releases/latest URLs to spawn.sh
+require_image_pin (N3). The N1 probes feed a hostile api key (valid hex, then a
+quote, a newline and a curl option) to every curl-config site and assert no
+extra option reaches curl. The P1 probe asserts federate.sh never prints the
+node API key and writes it to a 0600 file.
 Standard library only; exits 1 on any failed probe.
 """
 import os
@@ -118,7 +122,9 @@ def f6_spawn():
     sha = "a" * 64
     cases = [("https://h/o/v1/a.tgz", True), ("https://h/releases/latest/x", False),
              ("https://h/RELEASES/LATEST/x", False), ("https://h/rElEaSeS/lAtEsT/x", False),
-             ("https://h/Releases/latest/x", False), ("https://h/releases/LATEST/x", False)]
+             ("https://h/Releases/latest/x", False), ("https://h/releases/LATEST/x", False),
+             ("https://h/releases/./latest", False), ("https://h/releases/x/../latest", False),
+             ("https://h/releases//latest", False), ("https://h/o/v1/./a.tgz", False)]
     with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
         script = pathlib.Path(t) / "fn.sh"
         script.write_text(fn + "\nrequire_image_pin\necho PASSED\n")
@@ -128,12 +134,88 @@ def f6_spawn():
             probe("F6 spawn url=%s accepted=%s" % (url, want), ("PASSED" in r.stdout) == want, "rc=%d" % r.returncode)
 
 
+HOSTILE = SECRET + '"\noutput = "marker-n1"\nurl = "http://127.0.0.1:9/"'
+
+
+def curl_stdin_clean(d):
+    p = d / "curl.stdin"
+    return (not p.exists()) or ("output =" not in p.read_text() and "url =" not in p.read_text())
+
+
+def n1_curl_config_injection():
+    tpl = TPL.read_text()
+    guard = next((l.strip() for l in tpl.splitlines() if l.lstrip().startswith('[[ "$API_KEY" =~')), "")
+    probe("N1 template has an API_KEY format guard", bool(guard))
+    fn = section(tpl, "admin_call() {", "\n      }\n") + "\n      }\n"
+    fn = fn.replace("%%{", "%{")
+    for label, key, want_ok in (("hostile", HOSTILE, False), ("valid", SECRET, True)):
+        with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+            d = pathlib.Path(t)
+            stub_dir(d, "curl")
+            script = ('fail() { echo "FAIL: $*" >&2; exit 1; }\nFED_DIR=/x ADMIN_ID=a\nAPI_KEY=$(printf %%b %s)\n%s\n%s\n'
+                      'admin_call -X POST http://127.0.0.1/\n' % (repr(key.replace("\n", "\\n")), guard, fn))
+            r = run_bash(script, d)
+            probe("N1 template admin_call %s key: rc ok=%s" % (label, want_ok), (r.returncode == 0) == want_ok, "rc=%d" % r.returncode)
+            probe("N1 template admin_call %s key: no extra curl option" % label, curl_stdin_clean(d))
+    fs = FED.read_text()
+    for fname, arg in (("node_get", "1 mem-1"), ("node_post", "1 e30=")):
+        fn = section(fs, fname + "() {", "\n}\n") + "\n}\n"
+        with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+            d = pathlib.Path(t)
+            stub_dir(d, "curl")
+            key = d / "api-key"
+            key.write_text(HOSTILE + "\n")
+            script = ("AUTHOR_ID=au\nnode_sh() { /usr/bin/sed 's#/etc/ai-memory/api-key#%s#' | bash; }\n%s\n%s %s\n"
+                      % (key, fn, fname, arg))
+            run_bash(script, d)
+            probe("N1 %s hostile key: no extra curl option" % fname, curl_stdin_clean(d))
+    i = fs.index('  api_key="$(on_node "${PUBLIC_IPS[0]}"')
+    j = fs.index("lg_curl()", i)
+    blk = fs[i:j]
+    for label, key, want_ok in (("hostile", HOSTILE, False), ("valid", SECRET, True)):
+        with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+            d = pathlib.Path(t)
+            stub_dir(d, "curl")
+            kf = d / "k"
+            kf.write_text(key)
+            script = ('die() { echo "DIE: $*" >&2; exit 2; }\non_node() { cat %s; }\nPUBLIC_IPS=(h)\n%s\n'
+                      'if [ -n "$api_key" ]; then :; fi\n' % (kf, blk.rsplit("if [ -n", 1)[0]))
+            r = run_bash(script, d)
+            probe("N1 federate verify %s key: rc ok=%s" % (label, want_ok), (r.returncode == 0) == want_ok, "rc=%d" % r.returncode)
+
+
+def p1_federate_key_echo():
+    fs = FED.read_text()
+    i = fs.index('echo "[federate] loadgen bundle: $run_dir"')
+    blk = fs[i:fs.index("\n}\n", i)]
+    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+        d = pathlib.Path(t)
+        rd = d / "run"
+        rd.mkdir()
+        script = 'on_node() { printf "%%s\\n" %s; }\nPUBLIC_IPS=(h)\nrun_dir=%s\n%s\n' % (SECRET, rd, blk)
+        r = run_bash(script, d)
+        probe("P1 key block rc 0", r.returncode == 0, r.stderr[:80])
+        probe("P1 key not on stdout or stderr", SECRET not in r.stdout and SECRET not in r.stderr)
+        kf = rd / "api-key"
+        probe("P1 key written to run_dir/api-key", kf.exists() and SECRET in kf.read_text())
+        probe("P1 key file mode 0600", kf.exists() and (kf.stat().st_mode & 0o777) == 0o600)
+
+
+def n3_main_tf():
+    tf = (ROOT / "infra/do-hive/main.tf").read_text()
+    cond = next(l for l in tf.splitlines() if "ai_memory_image_url == \"\" ||" in l)
+    probe("N3 main.tf validation refuses empty/dot path segments", "//|/\\\\.\\\\.?(/|$)" in cond, cond[-120:])
+
+
 def main():
     (ROOT / ".local-runs").mkdir(exist_ok=True)
     f4_sed()
     f5_admin_call()
     f5_federate()
     f6_spawn()
+    n1_curl_config_injection()
+    p1_federate_key_echo()
+    n3_main_tf()
     print("RESULT: %s (%d failed)" % ("FAIL" if FAILS else "PASS", len(FAILS)))
     return 1 if FAILS else 0
 
