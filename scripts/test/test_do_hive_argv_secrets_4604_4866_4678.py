@@ -304,6 +304,7 @@ def fifo_reader(path, secs, got):
 def run_timeout(script, d, secs):
     """Run bash; return (returncode, timed_out). A blocked open on a FIFO shows as a timeout, not a hang."""
     rp = subprocess.Popen(["bash", "-c", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          preexec_fn=lambda: [signal.signal(s, signal.SIG_DFL) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)],
                           start_new_session=True, env=dict(os.environ, PATH=str(d) + os.pathsep + os.environ["PATH"]))
     try:
         return rp.wait(timeout=secs), False
@@ -432,7 +433,10 @@ def p1_temp_entry_fail_closed():
             reset()
             if ready.exists():
                 ready.unlink()
+            # A caller that started this test under nohup or in the background passes these signals as
+            # ignored; the child must see the defaults, as an interactive run does.
             rp = subprocess.Popen(["bash", "-c", script("none", slow)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  preexec_fn=lambda: [signal.signal(s, signal.SIG_DFL) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)],
                                   start_new_session=True, env=dict(os.environ, PATH=str(d) + os.pathsep + os.environ["PATH"]))
             end = time.time() + 6
             while not ready.exists() and time.time() < end:
@@ -447,6 +451,13 @@ def p1_temp_entry_fail_closed():
             left = sorted(q.name for q in rd.iterdir())
             probe("P2 %s during the key write leaves no temp file and no api-key" % sig.name, started and not hung
                   and rc not in (0, None) and not left, "started=%s rc=%s hung=%s left=%s" % (started, rc, hung, left))
+        # After the block succeeds the trap is gone: a later interrupt ends the run by the default
+        # action (signal death), it does not run the key-file cleanup or exit 130.
+        reset()
+        okscript = script("none").replace("p1f\n", "p1f\nkill -INT $$\nsleep 5\n") if script("none").endswith("p1f\n") else ""
+        rc, hung = run_timeout(okscript, d, 8) if okscript else (None, True)
+        probe("P2 the interrupt trap is cleared once the key is written", (not hung) and rc == -signal.SIGINT and kf.exists(),
+              "rc=%s hung=%s api-key=%s" % (rc, hung, kf.exists()))
         reset()
         rc, hung = run_timeout(script("none"), d, 6)
         # An unplanted name still works (the probes above are not red because the block is broken).
@@ -543,6 +554,8 @@ def failure_lines_4999():
                      ("base64 of the raw bytes", raw_b64),
                      ("base64 of the raw bytes in groups of 8", grp(raw_b64, 8, " ")),
                      ("url-safe base64 of the raw bytes", raw_b64.replace("+", "-").replace("/", "_").rstrip("=")),
+                     ("base64 of the text and one more byte", grp(base64.b64encode((key + "~").encode()).decode(), 10, " ")),
+                     ("base64 of the raw bytes and one more byte", grp(base64.b64encode(bytes.fromhex(key) + b"\xff").decode(), 8, " ")),
                      ("ASCII hex of the text in pairs", grp(key.encode().hex(), 2, " ")))
         for label, body in spellings:
             (d / "body").write_text(body)
