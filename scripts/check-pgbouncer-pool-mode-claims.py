@@ -523,11 +523,29 @@ def _decoder_for(head: bytes):
     return None
 
 
+def _plain_text(chunk: bytes) -> bool:
+    """R5 (#4667): a chunk with no NUL that decodes as UTF-8 is text even when it starts like a magic number
+    (GIF8, %PDF, BZh, OTTO, Rar!, wOFF are printable ASCII and can open a markdown file)."""
+    if b"\0" in chunk:
+        return False
+    try:
+        codecs.getincrementaldecoder("utf-8")("strict").decode(chunk, final=False)
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+# R5 (#4667): a file with one of these extensions is text by name and is never excused by the skip list: a NUL
+# byte in it is a defect to fix, not a reason to stop reading it.
+TEXT_SUFFIXES = {".md", ".markdown", ".txt", ".rst", ".adoc", ".html", ".htm", ".rs", ".py", ".sh", ".toml", ".yaml",
+                 ".yml", ".json", ".ini", ".conf", ".cfg", ".tf", ".env", ".sql", ".log", ".csv", ".xml", ".svg"}
+
+
 def read_lines(path: Path) -> Iterator[str]:
     """The lines of a text file, streamed. Raises Unreadable for binary content; an OSError propagates."""
     with open(str(path), "rb") as handle:
         chunk = handle.read(CHUNK_BYTES)
-        if chunk.startswith(BINARY_MAGIC):
+        if chunk.startswith(BINARY_MAGIC) and not _plain_text(chunk):
             raise Unreadable("binary or compressed content (magic number %s)" % chunk[:4].hex())
         decoder = _decoder_for(chunk)
         utf8 = decoder is None
@@ -599,6 +617,8 @@ def load_unread(root: Path) -> Tuple[Dict[str, str], List[str]]:
         if block:
             reason, block = " ".join(block), []
         problem = reason_problem(reason or "")
+        if not problem and Path(line).suffix.lower() in TEXT_SUFFIXES:
+            problem = "a %s file is text and is read, never skipped" % Path(line).suffix.lower()
         if " " in line or problem or line in listed:
             errors.append("%s:%d: bad skip entry %r (%s)" % (UNREAD_REL, number, line[:80],
                           problem or "one exact path without spaces, listed once"))
@@ -761,6 +781,7 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("shadow: Greek lunate sigma", "docs/a.md", "Run PgBouncer in transa\u03f2tion mode.\n"),
     ("shadow: Hangul filler inside the word", "docs/a.md", "Run PgBouncer in trans\u3164action mode.\n"),
     ("shadow: non-breaking hyphen", "docs/a.md", "For fan-in use transaction\u2011mode.\n"),
+    ("skip list: an ASCII magic number opens a markdown file", "docs/g.md", "GIF89a is an image format.\nRun PgBouncer in transaction mode.\n"),
     # R9 (#4667 round 6, closed world): characters the fold does not know are red, not read past
     ("R9: three look-alikes the fold does not know", "docs/a.md", "Run PgBouncer in tr\u0251ns\u0251cti\u0254n mode.\n"),
     ("R9: a control character inside a word", "docs/a.md", "Run PgBouncer in tra\x01nsaction mode.\n"),
@@ -1006,7 +1027,8 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
         # files read, not skipped (#5086, #5090)
         ("NUL bytes in a markdown file fail closed", tree({"docs/n.md": "\0\nRun PgBouncer in transaction mode.\n"}), EXIT_FAULT),
         ("a gzip document fails closed", tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}), EXIT_FAULT),
-        ("a binary magic number under a text name fails closed", tree({"docs/p.md": b"%PDF-1.7 Run PgBouncer in transaction mode.\n"}), EXIT_FAULT),
+        ("a magic number on plain UTF-8 text is read as text and judged (R5)", tree({"docs/p.md": b"%PDF-1.7 Run PgBouncer in transaction mode.\n"}), EXIT_FINDING),
+        ("a magic number on binary bytes fails closed", tree({"docs/p.md": b"%PDF-1.7\n\x93\xff Run PgBouncer in transaction mode.\n"}), EXIT_FAULT),
         ("a named unreadable file with a reason passes",
          tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}, unread=UNREAD_REASON + "docs/z.md.gz\n"), EXIT_OK),
         ("a skip entry without a reason fails",
@@ -1016,7 +1038,11 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
         ("a skip entry with the placeholder fails",
          tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}, unread="# REASON REQUIRED before review - say why\ndocs/z.md.gz\n"), EXIT_FAULT),
         ("a stale skip entry (the file is readable text) fails", tree({"docs/ok.md": "Plain text.\n"}, unread=UNREAD_REASON + "docs/ok.md\n"), EXIT_FAULT),
+        ("a stale skip entry for a readable file with a binary name fails",
+         tree({"assets/ok.bin": "Plain text.\n"}, unread=UNREAD_REASON + "assets/ok.bin\n"), EXIT_FAULT),
         ("a skip entry for an untracked path fails", tree({}, unread=UNREAD_REASON + "docs/gone.md\n"), EXIT_FAULT),
+        ("a text file is never excused by the skip list (R5)",
+         tree({"docs/n.md": "\0\nRun PgBouncer in transaction mode.\n"}, unread=UNREAD_REASON + "docs/n.md\n"), EXIT_FAULT),
         ("a skip entry does not hide another unreadable file",
          tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz", "docs/y.bin": b"\0\0\0"}, unread=UNREAD_REASON + "docs/z.md.gz\n"), EXIT_FAULT),
         ("a file past the old 4 MiB cap, many windows, is scanned to its end",
@@ -1137,8 +1163,10 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("U2 separators", "    split = _SEPARATORS.sub(\" \", text)", "    split = text"),
     ("F1 unread files must be named", "    problems = errors + [", "    problems = [] and errors + ["),
     ("F1 stale skip entries fail", "for rel in sorted(listed) if rel not in unread]", "for rel in sorted(listed) if False]"),
-    ("F1 skip entry needs a reason", "        problem = reason_problem(reason or \"\")\n        if \" \" in line or problem", "        problem = None\n        if \" \" in line or problem"),
-    ("F1 binary magic numbers", "        if chunk.startswith(BINARY_MAGIC):", "        if False:"),
+    ("F1 skip entry needs a reason", "        problem = reason_problem(reason or \"\")\n        if not problem and Path(line).suffix", "        problem = None\n        if not problem and Path(line).suffix"),
+    ("F1 binary magic numbers", "        if chunk.startswith(BINARY_MAGIC) and not _plain_text(chunk):", "        if False:"),
+    ("F1 magic number on plain text is text", "        if chunk.startswith(BINARY_MAGIC) and not _plain_text(chunk):", "        if chunk.startswith(BINARY_MAGIC):"),
+    ("F1 a text suffix is never skipped", "        if not problem and Path(line).suffix.lower() in TEXT_SUFFIXES:", "        if False:"),
     ("F1 NUL bytes in non-UTF-16 text", "            if utf8 and b\"\\0\" in chunk:", "            if False:"),
     ("F1 BOM-less UTF-16", "    if len(zeros) * 4 >= min(len(head), CHUNK_BYTES) > 0:", "    if False:"),
     ("F2 long lines: product and mode word anywhere", "    return bool(_PRODUCT_WORD.search(view) and OTHER_MODE.search(view))", "    return False"),

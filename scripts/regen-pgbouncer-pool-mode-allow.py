@@ -18,6 +18,9 @@ The allowlist is a review surface, so this tool never changes it silently:
     not the placeholder); without --reason it is the placeholder, which the gate
     rejects with rc 2, so this tool cannot turn a red line green on its own
     (#4961). Replace the placeholder with a real reason per entry group.
+  * an unreadable file is added to pgbouncer-pool-mode-unread.txt only under
+    --skip-reason, a reason of its own; --reason never excuses a skipped file,
+    and the gate refuses a skip entry whose name is a text type.
 
 Without those flags the tool prints what it would change and exits 1, leaving
 the file untouched. With --check it never writes. Exit codes: 0 the file already
@@ -25,7 +28,7 @@ matches the tree (or was rewritten as asked), 1 changes are pending and were
 refused, 2 fault.
 
 Usage:
-    scripts/regen-pgbouncer-pool-mode-allow.py [--root DIR] [--check] [--accept-new [--reason TEXT] [--only FILE] [--match TEXT]] [--drop-stale]
+    scripts/regen-pgbouncer-pool-mode-allow.py [--root DIR] [--check] [--accept-new [--reason TEXT] [--skip-reason TEXT] [--only FILE] [--match TEXT]] [--drop-stale]
 """
 import argparse
 import datetime
@@ -81,14 +84,17 @@ def main(argv):
                          "equals the unit's file and whose match is a substring of its text; {unit} in a reason becomes the "
                          "first 90 characters of the unit; a unit no rule matches is refused")
     ap.add_argument("--reason", default="", help="the written reason for every line --accept-new adds")
+    ap.add_argument("--skip-reason", default="", help="with --accept-new: the written reason for every unreadable file "
+                    "added to the skip list (--reason is never reused for it)")
     a = ap.parse_args(argv)
     root = Path(a.root).resolve()
     gate = load_gate(root)
     reason = " ".join(a.reason.split())
-    if reason:
-        problem = gate.reason_problem(reason)
+    skip_reason = " ".join(a.skip_reason.split())
+    for flag, text in (("--reason", reason), ("--skip-reason", skip_reason)):
+        problem = gate.reason_problem(text) if text else None
         if problem:
-            print("regen: FAULT: --reason is not a reason: %s" % problem, file=sys.stderr)
+            print("regen: FAULT: %s is not a reason: %s" % (flag, problem), file=sys.stderr)
             return 2
     allow_path = root / gate.ALLOW_REL
     try:
@@ -187,7 +193,7 @@ def main(argv):
             "--check" if a.check else "pass --drop-stale / --accept-new after reading each line above"))
         return 1
     if new_unread or stale_unread:
-        write_unread(gate, root, listed, stale_unread, new_unread, reason)
+        write_unread(gate, root, listed, stale_unread, new_unread, skip_reason)
         if not (stale or new or refresh):
             print("regen: skip list: removed %d, added %d; review the diff" % (len(stale_unread), len(new_unread)))
             return 0
