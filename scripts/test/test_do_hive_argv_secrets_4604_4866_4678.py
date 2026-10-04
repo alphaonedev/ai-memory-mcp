@@ -236,6 +236,15 @@ def f2_node_get_id():
         probe("F2 node_get refuses a non-plain memory id", r.returncode != 0 and not marker.exists(), "rc=%d" % r.returncode)
 
 
+def f3_static_pins():
+    fed = FED.read_text()
+    probe("F3 key file write uses noclobber (O_EXCL)", "set -o noclobber; on_node" in fed)
+    i = fed.find("{ set +x; } 2>/dev/null")
+    j = fed.find('api_key="$(on_node')
+    probe("F3 verify suspends xtrace before the key is read", 0 <= i < j, "%d < %d" % (i, j))
+    probe("F3 verify restores xtrace only after the key is cleared", fed.find('api_key=""') < fed.find("[ \"$_fed_xtrace\" = 1 ] && set -x"))
+
+
 def n3_main_tf():
     tf = (ROOT / "infra/do-hive/main.tf").read_text()
     cond = next(l for l in tf.splitlines() if "ai_memory_image_url == \"\" ||" in l)
@@ -254,6 +263,7 @@ def main():
     n3_main_tf()
     n1_no_locale_ranges()
     f2_node_get_id()
+    f3_static_pins()
     print("RESULT: %s (%d failed)" % ("FAIL" if FAILS else "PASS", len(FAILS)))
     return 1 if FAILS else 0
 
