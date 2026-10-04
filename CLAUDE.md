@@ -1770,10 +1770,13 @@ issue title's own example. Burn-down allowlist
 `scripts/qc-allowlists/doc-symbol-anchors-allow.txt`, where a **STALE
 entry FAILS**. `--self-test` plants the audit's own `decorate_memory`
 rename, a pre-modularisation path, a past-EOF line anchor, a stale
-`migrate_vNN` tip claim and a dead markdown symbol link, with
-near-miss controls (the correct symbol, a `Type::method` brace list, an
-in-range anchor, a module link, the absent-path assertion) that must
-each PASS.
+`migrate_vNN` tip claim and a dead markdown symbol link, plus the bare
+and unbackticked anchor forms, the path forms (`./`, `../`, repeated
+slashes, `src/` escapes) and line ranges (`:0`, reversed, en/em dash,
+`#L` fragments of relative links) of #4651/#4699-#4716/#5188-#5191,
+with near-miss controls (the correct symbol, a `Type::method` brace
+list, an in-range anchor, a module link, the absent-path assertion)
+that must each PASS.
 
 **10. SDK-path vs `routes.rs` membership gate** (#2629, CERT GATE 2;
 register 3.3.2) — `scripts/check-sdk-route-paths.sh`. **Nothing pinned

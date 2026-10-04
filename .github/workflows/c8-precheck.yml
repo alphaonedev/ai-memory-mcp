@@ -286,8 +286,12 @@ jobs:
         # so the rule is proven to fire on the defect and not on its
         # neighbourhood. #4651: a bare un-backticked file:line anchor in
         # prose, a link label or HTML text (red) versus a commit-pinned
-        # permalink label (green control). Both allowlist directions are exercised, and an
-        # empty src/ tree must fail CLOSED rather than green a no-op.
+        # permalink label (green control). #4699-#4716 and #5188-#5191:
+        # the ./ ../ // and src-escape path forms, :0 / reversed / en-dash
+        # line ranges, unbackticked path::symbol, and the file and #L
+        # fragment of a relative link. Both allowlist directions are
+        # exercised, and an empty src/ tree must fail CLOSED rather than
+        # green a no-op.
         run: bash scripts/check-doc-symbol-anchors.sh --self-test
 
   sdk-route-path-gate:

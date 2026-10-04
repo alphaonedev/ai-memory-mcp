@@ -22,7 +22,7 @@
 # falsifiable by a reader in one grep, while a wrong ANCHOR sends the
 # reader to the wrong place and then makes them doubt the rest.
 #
-# FIVE RULES, all conservative, all keyed on PATH-QUALIFIED grammar so
+# SIX RULES, all conservative, all keyed on PATH-QUALIFIED grammar so
 # a bare backticked identifier in prose is never guessed at:
 #
 #   PATH   — a cited `src/<path>.rs` must EXIST. This is what caught the
@@ -33,11 +33,17 @@
 #            0 never lands on code). Cheap, dependency-free, and it catches the
 #            whole truncated-anchor class without needing to know what
 #            is ON that line.
+#            The range separator may be `-`, an en dash or an em dash
+#            (#5188). A `[label](src/x.rs#L<a>-L<b>)` fragment of a
+#            RELATIVE link is range-checked the same way (#5189).
 #   QUAL   — every identifier in `src/<path>.rs::<sym>` and
 #            `src/<path>.rs::{a, B::c, d}` must be DEFINED IN THAT FILE.
 #            Each `::`-separated component is checked, so
 #            `VectorIndex::build_with_capacity` resolves only if both
-#            the type and the method are in that file.
+#            the type and the method are in that file. The UNBACKTICKED
+#            form is checked too (reported as BARE_QUAL, #5191), and a
+#            qualified anchor never gets the absent-path exemption: it
+#            asserts the file exists (#5201).
 #   BARE_LN — (#4651) a BARE `src/<path>.rs:<N>` (no backtick: prose, a
 #            link label, HTML text) is a finding unless it labels a
 #            commit-pinned permalink (`/blob/<hex sha>/`, immutable).
@@ -45,7 +51,11 @@
 #   MDLINK — `[`sym`](../src/path.rs)` must resolve: the file must
 #            exist AND `sym` must be defined in it (or BE it — a link
 #            whose symbol equals the module's file stem is a module
-#            citation, which is legitimate).
+#            citation, which is legitimate). A relative link to a
+#            `src/` file with ANY label must point at an existing file
+#            (#5190).
+#   LADDER_TIP — a claimed end of the migration ladder
+#            (`migrate_vNN`) must be the real tip.
 #
 # PATH FORMS. Before any rule runs, a `src/<path>.rs` token is
 # normalised (#4699/#4701): any leading ./ and ../ segments are stripped
@@ -86,7 +96,8 @@
 #   scripts/check-doc-symbol-anchors.sh --self-test  — plant the
 #       historical shapes (a `decorate_memory` rename, a
 #       pre-modularisation path, an out-of-range line anchor, a stale
-#       `migrate_vNN`) in a throwaway copy UNDER `.local-runs/` (never
+#       `migrate_vNN`, bare and unbackticked anchors, the path forms
+#       and line ranges of #4699-#4716 and #5188-#5191) in a throwaway copy UNDER `.local-runs/` (never
 #       system /tmp, never `mktemp -d`) and prove the gate rejects each,
 #       alongside near-miss controls that must PASS.
 
