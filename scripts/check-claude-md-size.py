@@ -1882,7 +1882,8 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
     def case(label: str, text: str, needle: str) -> bool:
         target = wf / "w.yml"
         target.write_text(text, encoding="utf-8")
-        if not any(needle in line for line in workflow_errors(target, label)):
+        # A neutral label: the case label must not appear in the messages, or a loose needle matches it (#5135).
+        if not any(needle in line for line in workflow_errors(target, "W")):
             print(f"FAIL: self-test - workflow case {label!r} was NOT rejected (wanted {needle!r})", file=sys.stderr)
             return False
         return True
@@ -1907,9 +1908,9 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
         "python3 scripts/check-claude-md-size.py\n", "true\n", 1), "check-claude-md-size.py")
     ok &= case("R3-F4 self-test step removed", good.replace(" --self-test", "", 1), "--self-test")
     ok &= case("R3-F4 continue-on-error", good.replace(
-        "    timeout-minutes: 5", "    timeout-minutes: 5\n    continue-on-error: true", 1), "continue-on-error")
+        "    timeout-minutes: 5", "    timeout-minutes: 5\n    continue-on-error: true", 1), "uses `continue-on-error:`")
     ok &= case("R3-F4 pull_request_target", good.replace(
-        "  merge_group:", "  pull_request_target:\n    branches: [main]\n  merge_group:", 1), "pull_request_target")
+        "  merge_group:", "  pull_request_target:\n    branches: [main]\n  merge_group:", 1), "uses `pull_request_target:`")
     ok &= case("R3-F4 failure swallowed with || true", good.replace(
         "run: python3 scripts/check-claude-md-size.py\n", "run: python3 scripts/check-claude-md-size.py || true\n", 1),
         "swallow")
@@ -1919,10 +1920,10 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
                "exactly one job")
     ok &= case("R3-F4 shell override", good.replace(
         "        run: python3 scripts/check-claude-md-size.py\n",
-        "        shell: bash -c true {0}\n        run: python3 scripts/check-claude-md-size.py\n", 1), "shell")
+        "        shell: bash -c true {0}\n        run: python3 scripts/check-claude-md-size.py\n", 1), "uses `shell:`")
     ok &= case("R3-F4 step condition", good.replace(
         "        run: python3 scripts/check-claude-md-size.py\n",
-        "        if: false\n        run: python3 scripts/check-claude-md-size.py\n", 1), "if")
+        "        if: false\n        run: python3 scripts/check-claude-md-size.py\n", 1), "uses `if:`")
     ok &= case("R3-F4 env override", good.replace(
         "    timeout-minutes: 5", "    timeout-minutes: 5\n    env:\n      PYTHONPATH: /x", 1), "env")
     ok &= case("R4 checkout pinned to a fixed ref", good.replace(
@@ -1954,7 +1955,7 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
         print("FAIL: self-test - a comment-only edit of the guard workflow was refused", file=sys.stderr)
         ok = False
     ok &= case("R3-F4 pull_request types closed only", good.replace(
-        '  pull_request:\n', '  pull_request:\n    types: [closed]\n', 1), "types")
+        '  pull_request:\n', '  pull_request:\n    types: [closed]\n', 1), "pull_request types must include")
     ok &= case("R4 push trigger deleted", good.replace(
         '  push:\n    branches: [main, develop, "release/**", "rehearsal/**"]\n', "", 1), "no `push` trigger")
     ok &= case("R5 merge_group trigger deleted", good.replace(
