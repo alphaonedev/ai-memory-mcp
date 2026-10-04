@@ -432,6 +432,21 @@ MDEOF
         'The loop `src/missing_5201.rs` was renamed to `src/mcp/tools/recall.rs`.'
     anchor_green 5201 "a plain path with 'pre-split' wording" \
         'It was `src/missing_5201.rs` pre-split.'
+    # #5264: wording that names a DESTINATION never exempts the file after it.
+    anchor_red 5264 PATH "a plain path after 'was split into'" \
+        'The module was split into `src/missing_5264.rs` for it.'
+    anchor_red 5264 PATH "a plain path after 'split out'" \
+        'Split out `src/missing_5264.rs` from the monolith.'
+    anchor_red 5264 PATH "a plain path after an arrow" \
+        '-> `src/missing_5264.rs`'
+    anchor_red 5264 PATH "a plain path after a unicode arrow" \
+        'The loop moved → `src/missing_5264.rs` today.'
+    anchor_green 5264 "a source path before 'was split into'" \
+        '`src/missing_5264.rs` was split into `src/mcp/tools/recall.rs`.'
+    anchor_green 5264 "a source path before an arrow" \
+        '`src/missing_5264.rs` -> `src/mcp/tools/recall.rs`'
+    anchor_green 5264 "a source path on the line above a wrapped arrow" \
+        $'The module `src/missing_5264.rs`\n-> `src/mcp/tools/recall.rs` now.'
 
     # ---- a stale migrate_vNN (the #2629 issue title's own example) ---
     write_clean
@@ -707,10 +722,16 @@ IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # sentences that say the file is gone.
 ABSENT_ASSERTION = re.compile(
     r"test ! -f|no longer exists?|pre-?modularisation|pre-?modularization|"
-    r"modularisation|modularization|monolithic|formerly|\bsplit (?:into|out|from|off)\b|\b(?:was|been|got) split\b|pre-?split|renamed to|"
-    r"removed in|deleted in|STALE BASE|does not exist|(?:->|\u2192)\s*`?src/",
+    r"modularisation|modularization|monolithic|formerly|\bsplit (?:from|off)\b|\b(?:was|been|got) split\b(?!\s+(?:into|out)\b)|pre-?split|renamed to|"
+    r"removed in|deleted in|STALE BASE|does not exist",
     re.IGNORECASE,
 )
+# #5264: wording that names a DESTINATION ("split into X", "split out X",
+# "-> X") says the file AFTER it is live, so it must never exempt a missing
+# file. It exempts only an anchor BEFORE it on the same line (the source,
+# which the sentence says has gone: "`src/old.rs` was split into ...").
+ABSENT_DEST = re.compile(
+    r"\bsplit (?:into|out)\b|->|" + chr(0x2192), re.IGNORECASE)
 
 
 PIN_TARGET = re.compile(
@@ -765,22 +786,31 @@ for doc in seen_docs:
         ctx = line.strip()
         line, escapes = canon(line)
         window = "\n".join(doc_lines[max(0, ln - 2):ln + 1])
-        absent_ok = bool(ABSENT_ASSERTION.search(window))
+        absent_win = bool(ABSENT_ASSERTION.search(window))
+        dest_at = [d.start() for d in ABSENT_DEST.finditer(line)]
+        # A hard-wrapped sentence may put the arrow at the start of the NEXT
+        # line ("`src/old.rs`\n-> `src/new/`"): the anchor above is a source.
+        dest_next = ln < len(doc_lines) and bool(ABSENT_DEST.match(doc_lines[ln].lstrip()))
+
+        def absent_ok_at(pos):
+            """The absence exemption for an anchor starting at `pos`."""
+            return absent_win or dest_next or any(pos < d for d in dest_at)
 
         for tok in escapes:
-            if not absent_ok:
+            at = max(line.find(tok), 0)
+            if not absent_ok_at(at):
                 emit("PATH", doc, ln, tok, ctx)
 
         for m in PATH.finditer(line):
             f = m.group(1)
-            if f not in per_file and not absent_ok:
+            if f not in per_file and not absent_ok_at(m.start(1)):
                 emit("PATH", doc, ln, f, ctx)
 
         for m in PATHLN.finditer(line):
             f, n = m.group(1), int(m.group(2))
             last = int(m.group(3)) if m.group(3) else n
             if f not in per_file:
-                if not absent_ok:
+                if not absent_ok_at(m.start(1)):
                     emit("PATH", doc, ln, f, ctx)
             elif n < 1 or last < n or last > line_count[f]:
                 tok = f"{f}:{n}" if m.group(3) is None else f"{f}:{n}-{last}"
