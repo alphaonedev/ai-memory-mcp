@@ -1053,6 +1053,19 @@ def _show_or_absent(root: Path, mb: str, path: str) -> str:
     return ""
 
 
+def allow_text_pending_elsewhere(allow: List[Entry], base_allow: List[Entry], base_pending: List[Entry],
+                                 head_pending: List[Entry], renames: Dict[str, str]) -> List[str]:
+    """An allow entry that is new or changed since the merge base may not approve a line whose text
+    is pending in ANY file, at the base or at head. A line copied into a file that allows it, then
+    moved there, would otherwise be approved in two green steps (#5295). The regen tool refuses the
+    same across files; an entry that is unchanged since the base is not judged again."""
+    old = {(renames.get(e[1], e[1]), e[3], e[2]) for e in base_allow}
+    pending = {e[3] for e in base_pending} | {e[3] for e in head_pending}
+    return ["allow:%d: new entry approves a line whose text is pending in a file (change the line, not "
+            "the list): %s: %s" % (e[4], e[1], e[3][:80])
+            for e in allow if (e[1], e[3], e[2]) not in old and e[3] in pending]
+
+
 def in_ci() -> bool:
     """True on a CI runner (GitHub Actions sets both variables)."""
     return (os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true"
@@ -1084,9 +1097,10 @@ def merge_base_hits(root: Path, allow: List[Entry], pend: Optional[List[Entry]] 
     except subprocess.CalledProcessError as exc:
         raise RuntimeError("cannot resolve the merge base against %s (fail closed): %s" % (ref, exc))
     base_pend = parse_entries(old, "base-pending", False, [])
+    base_allow = parse_entries(old_allow, "base-allow", False, [])
     hits = allow_from_pending(allow, base_pend, renames)
-    hits.extend(allow_like_vanished_pending(allow, parse_entries(old_allow, "base-allow", False, []), base_pend,
-                                            pend or []))
+    hits.extend(allow_like_vanished_pending(allow, base_allow, base_pend, pend or []))
+    hits.extend(allow_text_pending_elsewhere(allow, base_allow, base_pend, pend or [], renames))
     return hits
 
 
@@ -1616,11 +1630,33 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
         git("rm", "-q", "--", ALLOW_FILE, PENDING_FILE)
         commit_all("lists absent")
         git("update-ref", "refs/remotes/origin/self-test-base3", "HEAD")
-        git("checkout", base2, "--", ALLOW_FILE, PENDING_FILE)
+        git("rm", "-q", "--ignore-unmatch", "c.sh")
+        (t / ALLOW_FILE).parent.mkdir(parents=True, exist_ok=True)
+        rows([("a.sh", ok_line)], [("a.sh", pl)])  # no allow entry for pending text: the F3 rule stays quiet
         commit_all("lists back")
         rc, out = gate(EXEC_SECRET_ARGV_BASE="refs/remotes/origin/self-test-base3")
         if rc != 0:
             bad.append("run() refused a base where the list files do not exist (%d): %s" % (rc, out.strip()[:160]))
+        # copy then move (#5295): step 1 allows the pending text in a new file, step 2 moves the line
+        # there with a count bump. Both are refused, the second against the first as its base.
+        step1, step2 = "refs/remotes/origin/self-test-step1", "refs/remotes/origin/self-test-step2"
+        from_base2("copy1")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n" % (ok_line, pl))
+        (t / "w.sh").write_text("#!/bin/bash\n%s\n" % pl)
+        rows([("a.sh", ok_line), ("w.sh", pl)], [("a.sh", pl)])
+        commit_all("copy the pending line into an allowing file")
+        git("update-ref", step1, "HEAD")
+        if gate(EXEC_SECRET_ARGV_BASE=base2)[0] != 1:
+            bad.append("run() let a pending line be allowed as a copy in another file (#5295)")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n" % ok_line)
+        (t / "w.sh").write_text("#!/bin/bash\n%s\n%s\n" % (pl, pl))
+        (t / ALLOW_FILE).write_text("reason: self-test | a.sh | 1 | %s\nreason: self-test | w.sh | 2 | %s\n"
+                                    % (ok_line, pl))
+        (t / PENDING_FILE).write_text("")
+        commit_all("move the pending line into the allowing file")
+        git("update-ref", step2, "HEAD")
+        if gate(EXEC_SECRET_ARGV_BASE=step1)[0] != 1:
+            bad.append("run() let a pending line move into a file that allows its text with a count bump (#5295)")
         from_base2("rename2")
         git("mv", "a.sh", "b.sh")
         git("rm", "-q", "c.sh")
