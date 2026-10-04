@@ -982,7 +982,7 @@ def bare_operand_problem(words: list, idx, bins):
         m = re.match(r"\$\{?[#!]?([A-Za-z_]\w*)", val)
         if m is None and re.match(r"\$\{?[#!]?[0-9@*#?$!-]", val):
             continue
-        name = None if m is None else m.group(1)
+        name = None if m is None or val.startswith("${!") else m.group(1)
         if name is None or (name not in resolved and name not in bins):
             return ("%r is an operand of %r whose value the gate cannot read (an unresolved expansion may "
                     "name the ai-memory binary)" % (w[:40], base))
@@ -2333,6 +2333,14 @@ def binary_vars(stmts: list) -> frozenset:
             unknown.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", m.group(1)))
         unknown.update(re.findall(r"\bprintf\s+-v\s*([A-Za-z_]\w*)", text))
         unknown.update(re.findall(r"\bgetopts\s+\S+\s+([A-Za-z_]\w*)", text))
+        # a nameref (declare/typeset/local -n) reads another name; an array, an append
+        # (+=) or a glob in the value is not the text the operand expands to (R11)
+        for m in re.finditer(r"\b(?:declare|typeset|local)((?:\s+-[A-Za-z]+)+)([^;&|\n]*)", text):
+            if "n" in m.group(1):
+                unknown.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", m.group(2)))
+        for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)(\[[^]]*\])?(\+?)=(\S*)", text):
+            if m.group(2) or m.group(3) or m.group(4).startswith("(") or re.search(r"[*?\[]", m.group(4)):
+                unknown.add(m.group(1))
     while True:
         n = len(out)
         for name, word, rest in assigns:
@@ -2824,6 +2832,11 @@ def build_probes() -> list:
         ('ai-memory through a for-loop variable behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      for f in /usr/local/lib/ai-memory/bin/*; do taskset -c 0 "$f" --db /x stats; done\n' + dec)]),
         ('read variable run behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      read X < /etc/x; taskset -c 0 "$${X}" --db /x stats\n' + dec)]),
         ('substitution run behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      taskset -c 0 "$(cat /etc/x)" --db /x stats\n' + dec)]),
+        ('indirect expansion run behind taskset, listed (#4837 R12 R4, #5094 R11)', [(dec, '      B=/usr/local/lib/ai-memory/bin/ai-memory; N=B; taskset -c 0 "$${!N}" --db /x stats\n' + dec)]),
+        ('nameref run behind taskset, listed (#4837 R12 R4, #5094 R11)', [(dec, '      B=/usr/local/lib/ai-memory/bin/ai-memory; declare -n R=B; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('array element run behind taskset, listed (#4837 R12 R4, #5094 R11)', [(dec, '      A=(/usr/local/lib/ai-memory/bin/ai-memory); taskset -c 0 "$${A[0]}" --db /x stats\n' + dec)]),
+        ('append-built name run behind taskset, listed (#4837 R12 R4, #5094 R11)', [(dec, '      C=/usr/local/lib/ai-memory/bin/ai-; C+=memory; taskset -c 0 "$C" --db /x stats\n' + dec)]),
+        ('glob value run unquoted behind taskset, listed (#4837 R12 R4, #5094 R11)', [(dec, '      C="/usr/local/lib/ai-memory/bin/ai-mem*"; taskset -c 0 $C --db /x stats\n' + dec)]),
         ('unassigned variable run behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      taskset -c 0 "$${UNSET}" --db /x stats\n' + dec)]),
         ('ai-memory through a variable behind taskset, listed (#4837 R12 R4)', [(dec, '      AIM=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$${AIM}" --db $${X} stats\n' + dec)]),
         ('shell run by an unknown wrapper, listed (#4837 R12 R4)', [(dec, "      taskset -c 0 sh -c '/usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats'\n" + dec)]),
