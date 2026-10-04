@@ -474,10 +474,12 @@ impl MemoryStore for SqliteStore {
         //   any mid-failure — `reflect` (src/storage/reflect.rs),
         //   `consolidate` + the bulk-insert / archive+insert paths
         //   (src/storage/mod.rs) as `BEGIN IMMEDIATE … COMMIT`. That is the
-        //   rule for every sqlite write path (`WriteTxn::begin`,
-        //   `TransactionBehavior::Immediate`, or a raw `BEGIN IMMEDIATE`
-        //   as in the delete arm of `sqlite` in src/cli/keys.rs), with
-        //   exactly these measured exceptions in production code (the list
+        //   rule for every sqlite write path (`WriteTxn::begin` or
+        //   `TransactionBehavior::Immediate`). The delete arm of `sqlite`
+        //   in src/cli/keys.rs is not a write path: it holds a raw
+        //   `BEGIN IMMEDIATE` as a writer reservation around a filesystem
+        //   delete, reads, and ends in `ROLLBACK` without writing a row.
+        //   The measured exceptions in production code are (the list
         //   names functions, not a site count, because no gate keeps a
         //   count true):
         //   * BEGIN EXCLUSIVE: `migrate` (src/storage/migrations.rs) and the
