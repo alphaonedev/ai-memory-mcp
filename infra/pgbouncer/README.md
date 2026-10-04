@@ -32,7 +32,7 @@ bounded by the postgres+AGE backbone — see 4.D).
 | `role-defaults.sql` | `ALTER ROLE ai_memory SET search_path = public, ag_catalog; SET statement_timeout = '30s'; SET lock_timeout = '5s';` — role defaults matching the session GUCs ai-memory sets in `after_connect`; the narrowing step in guide §5.6.7 for deployments that ran transaction mode. Values quote `DEFAULT_STATEMENT_TIMEOUT_SECS=30` / `DEFAULT_LOCK_TIMEOUT_SECS=5` and the path `normalize_app_search_path` computes. |
 | `docker-compose.yml` | postgres+AGE + pgbouncer, wired (clients → `pgbouncer:6432`, published on `127.0.0.1` only). TLS on both hops; the password and all keys come from `smoke-test.py`. |
 | `docker-compose.host.yml` | Override for hosts where Docker cannot create bridge networks (`--network host`). |
-| `smoke-test.py` | Infra test: proves an AGE cypher transaction + the role-default timeouts work through the pooler, that the pooler reports session mode (`SHOW CONFIG` as the stats role), that both hops are TLS and that the application role cannot use the admin console. |
+| `smoke-test.py` | Infra test: proves an AGE cypher transaction + the role-default timeouts work through the pooler, that the daemon's pool is in session mode (`SHOW POOLS`, and no `SHOW DATABASES` / `SHOW USERS` override, as the stats role), that both hops are TLS and that the application role cannot use the admin console. |
 
 ## Wire ai-memory at the pooler
 
@@ -76,8 +76,10 @@ The smoke test generates a throwaway CA, certificates, the SCRAM userlist and a
 random password under `./.smoke/` (git-ignored, removed on exit), brings the
 stack up, runs an AGE cypher MERGE+MATCH **through the pooler on 6432** in one
 transaction, confirms the role-default `statement_timeout`, `lock_timeout` and
-`search_path` are visible through the pooler, reads `pool_mode` with
-`SHOW CONFIG` as the stats role and asserts it is `session`, checks that a
+`search_path` are visible through the pooler, asserts, as the stats role,
+that the daemon's pool runs in session mode in `SHOW POOLS` and that no
+`SHOW DATABASES` / `SHOW USERS` row overrides it (#4742; `SHOW CONFIG` is the
+global value only), checks that a
 plaintext client is refused and the pooler-to-Postgres hop is TLS, and tears
 down. Exit 0 = validated. No password appears on any command line.
 

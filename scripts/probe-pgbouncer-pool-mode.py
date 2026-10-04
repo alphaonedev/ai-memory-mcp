@@ -56,7 +56,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SOURCE_FILE = REPO_ROOT / "src" / "store" / "postgres.rs"
@@ -165,6 +165,49 @@ def _admin_rows(done: "subprocess.CompletedProcess", what: str) -> List[Tuple[st
     return rows
 
 
+def admin_table(dsn_base: List[str], admin_db: str, what: str) -> List[Dict[str, str]]:
+    """Rows of a PgBouncer admin SHOW command, as dicts keyed by the column header."""
+    env = dict(os.environ)
+    if "PGADMIN_PASSWORD" in env:
+        env["PGPASSWORD"] = env["PGADMIN_PASSWORD"]
+    done = subprocess.run(
+        ["psql", "-X", "-A", "-q", "-F", "|", "-P", "footer=off"] + dsn_base + ["--dbname", admin_db, "-c", "SHOW %s;" % what],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=30,
+    )
+    if done.returncode != 0:
+        raise ProbeFault("pgbouncer admin console SHOW %s failed: %s" % (what, done.stderr.strip()))
+    lines = [line for line in done.stdout.splitlines() if line]
+    if not lines:
+        return []
+    header = lines[0].split("|")
+    return [dict(zip(header, line.split("|"))) for line in lines[1:]]
+
+
+def effective_pool_mode(dsn_base: List[str], admin_db: str, user: str, dbname: str, global_mode: str) -> Tuple[str, str]:
+    """The pool_mode PgBouncer applies to (dbname, user): [users] over [databases] over the global value.
+
+    #4742: SHOW CONFIG reports only the global value; a per-database or per-user
+    override is visible only in SHOW USERS / SHOW DATABASES / SHOW POOLS.
+    Returns (mode, source). Fails closed (ProbeFault) when the tables lack a pool_mode column.
+    """
+    users = admin_table(dsn_base, admin_db, "USERS")
+    dbs = admin_table(dsn_base, admin_db, "DATABASES")
+    if (users and "pool_mode" not in users[0]) or (dbs and "pool_mode" not in dbs[0]):
+        raise ProbeFault("SHOW USERS / SHOW DATABASES has no pool_mode column; cannot tell the effective mode")
+    for row in users:
+        if row.get("name") == user and row.get("pool_mode"):
+            return row["pool_mode"], "[users] %s" % user
+    for name in (dbname, "*"):
+        for row in dbs:
+            if row.get("name") == name and row.get("pool_mode"):
+                return row["pool_mode"], "[databases] %s" % name
+    return global_mode, "global"
+
+
 def dsn_args(args: argparse.Namespace, dbname: str) -> List[str]:
     return ["--host", args.host, "--port", str(args.port), "--username", args.user, "--dbname", dbname]
 
@@ -259,7 +302,10 @@ def run_probe(args: argparse.Namespace) -> int:
     pool_mode = config.get("pool_mode", "<unreported>")
     pool_size = config.get("default_pool_size", "<unreported>")
     reset_query = config.get("server_reset_query", "<unreported>")
-    print("pooler: %s:%s  pool_mode=%s  default_pool_size=%s  server_reset_query=%s" % (args.host, args.port, pool_mode, pool_size, reset_query))
+    global_mode = pool_mode
+    pool_mode, mode_source = effective_pool_mode(admin_base, args.admin_dbname, args.user, args.dbname, global_mode)
+    print("pooler: %s:%s  pool_mode=%s (effective for %s@%s, from %s; global %s)  default_pool_size=%s  server_reset_query=%s" % (
+        args.host, args.port, pool_mode, args.user, args.dbname, mode_source, global_mode, pool_size, reset_query))
     print("lock key: %d (MIGRATION_ADVISORY_LOCK_KEY, %s)" % (key, SOURCE_FILE.relative_to(REPO_ROOT)))
     hazards: List[str] = []
     concurrent = concurrent_leg(args, key, hazards)

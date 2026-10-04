@@ -876,7 +876,9 @@ from the adapter source.
   the check that `server_reset_query = DISCARD ALL` is doing its job.
 
 It reads `pool_mode`, `default_pool_size` and `server_reset_query` with
-`SHOW CONFIG` as the stats role (`SHOW pool_mode` is not a PgBouncer command).
+`SHOW CONFIG` as the stats role (`SHOW pool_mode` is not a PgBouncer command),
+and prints the effective mode for the probed database and role from `SHOW USERS`
+and `SHOW DATABASES`, which override the global value (#4742).
 Exit codes: 0 when no hazard is observed, 1 when any is, 2 when it could not
 run or a leg was inconclusive. The adapter state it checks is real: the
 migration lock is a session-level `pg_try_advisory_lock`
@@ -905,7 +907,8 @@ bootstrapped the schema, accepted `POST /api/v1/memories` (HTTP 201) and returne
 the stored memory from `GET /api/v1/recall` with `"storage_backend":"postgres"`.
 The transaction-mode run of the same daemon was not performed; the probe is the
 evidence for it. `infra/pgbouncer/smoke-test.py` checks a fresh stack end to end (TLS
-and SCRAM on both hops, `SHOW CONFIG` reads `session`, an AGE cypher round trip,
+and SCRAM on both hops, the daemon's pool is in session mode in `SHOW POOLS` with no overriding
+`SHOW DATABASES` / `SHOW USERS` row, an AGE cypher round trip,
 the role defaults, and the admin console refusing the application role); it does
 not repeat the probe.
 
@@ -929,9 +932,11 @@ An earlier revision of §5.6, §10.4 and `infra/pgbouncer` prescribed
 
 1. **Move to `session` mode and re-size.** Set `pool_mode = session`, set
    `default_pool_size` and `max_client_conn` per §5.6.5, reload PgBouncer, and
-   confirm with `SHOW CONFIG;` on the admin console, as the `stats_users` role
+   confirm on the admin console, as the `stats_users` role
    (`psql -p 6432 -U pgbouncer_stats pgbouncer`, never the application role),
-   that `pool_mode` reads `session`. Then run the probe (§5.6.6) against it and
+   that `SHOW POOLS;` lists the daemon's database and role in session mode, and that
+   no `SHOW DATABASES;` or `SHOW USERS;` row overrides it (`SHOW CONFIG` reports only
+   the global value; a `[databases]` or `[users]` entry overrides it, #4742). Then run the probe (§5.6.6) against it and
    expect exit 0. A transaction-mode setup that fit `max_connections` through
    fan-in may not fit once every client connection pins a server connection:
    redo the §5.6.5 sum first.
