@@ -1112,6 +1112,8 @@ PYEOF
     changelog_wording 5532 "checked from #5610" "every bound of a trait-object or impl self type"
     # #5618: the #5536 entry no longer overstates the fix.
     changelog_wording 5536 "followed from #5609" "recognised in every entity spelling"
+    # #5619: the #5537 entry no longer overstates the fix.
+    changelog_wording 5537 "until #5611" "now reported under the right name"
 
     # #5538: the word check above proves the wording is NAMED; these cases
     # prove ABSENT_DEST does not match wording it does not name, so a pattern
