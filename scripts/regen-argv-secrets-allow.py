@@ -4,9 +4,10 @@
 """Rewrite scripts/qc-allowlists/argv-secrets-operand-allow.txt (#5722, PR 4810 round 11).
 
 5-agent vote (4d3ea1c5), decision eda8d8fb: scripts/check-docs-no-argv-secrets.py flags a
-credential-shaped operand under a head it does not model (an unknown program). The only
-exemption is a reviewed line in the allowlist, keyed by file, class and the sha256 of the
-whole command text, never a program name. This script is the only writer of that file.
+credential-shaped operand under a head it does not model (an unknown program), or in a
+bash array body (#5723). The only exemption is a reviewed line in the allowlist, keyed by
+file, class and the sha256 of the whole command text, never a program name. This script is
+the only writer of that file.
 
 By default it only deletes and reorders: an entry that no longer matches a hit is removed,
 the rest are written in tree order (file, then line), and a hit with no entry is printed as
@@ -71,6 +72,7 @@ def self_test(g) -> int:
     a = ("docs/a.md", g.UNKNOWN_TAG, "a" * 32, "tool -v n=*")
     b = ("docs/b.md", g.UNKNOWN_TAG, "b" * 32, "tool -v m=*")
     c = ("scripts/c.sh", g.UNKNOWN_TAG, "c" * 32, "tool --set k=*")
+    d = ("scripts/d.sh", g.ARRAY_TAG, "d" * 32, "-v k=*")
     base = render(HEADER, [a, b])
     cases = [
         # label, old text, tree keys, accept, want text keys (None: fault), want NEW count
@@ -86,6 +88,7 @@ def self_test(g) -> int:
         ("non-waivable class refuses any rewrite", base.replace(g.UNKNOWN_TAG, "env-password-argv", 1),
          [a, b], True, None, 0),
         ("missing file starts from the header", "", [a], True, [a], 1),
+        ("an array-body entry is a waivable class", render(HEADER, [a, d]), [a, d], False, [a, d], 0),
     ]
     bad = 0
     for label, old, now, accept, want, want_new in cases:

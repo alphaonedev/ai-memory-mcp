@@ -59,6 +59,12 @@ template file):
                      by file and the sha256 of the whole command, written only
                      by scripts/regen-argv-secrets-allow.py; an entry that
                      claims no hit fails the gate.
+  array-element-operand  the same operand shape among the elements of a bash
+                     array body ``NAME=( ... )`` / ``NAME+=( ... )``, read as
+                     one element list with no head, comments skipped (#5723):
+                     the elements reach an argv only through ``"${NAME[@]}"``,
+                     which a text gate cannot follow. Waived only by a
+                     reviewed line in the same allowlist.
   cloud-init-readable-secret  a cloud-init ``write_files`` entry left group or
                      world readable (or with no ``permissions``) whose content
                      interpolates a ``${..password|secret|token|key|cred..}``
@@ -137,7 +143,8 @@ SELF_EXEMPT = {"scripts/check-docs-no-argv-secrets.py"}
 # reads it, and a form fault (exit 2) or an entry that claims no hit (exit 1) fails the run.
 ALLOW_REL = "scripts/qc-allowlists/argv-secrets-operand-allow.txt"
 UNKNOWN_TAG = "unknown-head-operand"
-WAIVABLE_TAGS = (UNKNOWN_TAG,)
+ARRAY_TAG = "array-element-operand"
+WAIVABLE_TAGS = (UNKNOWN_TAG, ARRAY_TAG)
 WAIVABLE_RE = re.compile(r"\[(?P<tag>[a-z-]+)\] h=(?P<h>[0-9a-f]{32}) (?P<preview>.*)\Z")
 ALLOW_LINE_RE = re.compile(r"(?P<rel>[^|\s][^|]*?) \| (?P<tag>[a-z-]+) \| (?P<h>[0-9a-f]{32}) \| (?P<preview>.*)\Z")
 
@@ -1512,7 +1519,15 @@ CLEAN, UNDECIDED, PSQL, STRING_HIT, RUNNER = "clean", "undecidable", "psql", "st
 # model. Its argv is still an argv, so a credential-shaped operand under it is red; the only
 # exemption is a reviewed line in ALLOW_FILE (never a program name).
 UNKNOWN = "unknown-head"
-Command = Tuple[List[Word], bool]
+# #5723 (round 11): the body of a bash array assignment NAME=( ... ) or NAME+=( ... ) is an
+# element list with no head. Its elements reach an argv only through "${NAME[@]}", which a
+# text gate cannot follow, so a credential-shaped element is undecidable (narrow operand rule,
+# no re-split), waivable only by a reviewed line in ALLOW_FILE under its own class.
+ARRAY = "array-body"
+# Declaration builtins that take NAME=( ... ) array assignments as operands.
+ARRAY_DECL_BUILTINS = frozenset({"declare", "local", "typeset", "readonly", "export"})
+# (words, forced, array): array marks the element list of an array body.
+Command = Tuple[List[Word], bool, bool]
 
 
 def unclosed_quote(raw: str) -> bool:
@@ -1543,11 +1558,31 @@ def unclosed_quote(raw: str) -> bool:
     return False
 
 
+def array_opener(text: str, cmd: List[Word], at: int) -> bool:
+    """#5723: text[at] == "(" opens an array body: the word just before it ends at at and is a
+    NAME= / NAME+= / NAME[..]= assignment, and every earlier word of the command is an
+    assignment, or the command is a declaration builtin followed by options and assignments."""
+    if not cmd or cmd[-1][1] != at:
+        return False
+    last = text[cmd[-1][0]:at]
+    m = ASSIGN_RE.match(last)
+    if not m or m.end() != len(last):
+        return False
+    first = plain_literal(text, cmd[0]) if len(cmd) > 1 else None
+    rest = cmd[1:-1] if first in ARRAY_DECL_BUILTINS else cmd[:-1]
+    for w in rest:
+        raw = text[w[0]:w[1]]
+        if not (ASSIGN_RE.match(raw) or (first in ARRAY_DECL_BUILTINS and raw.startswith("-"))):
+            return False
+    return True
+
+
 def shell_commands(text: str, lo: int = 0, hi: Optional[int] = None, depth: int = 0,
                    out: Optional[List[Command]] = None) -> List[Command]:
     """Every simple command of text[lo:hi] and of every nested context, as (argv words,
-    forced): redirections and their targets are dropped; forced marks a command found past
-    the nesting limit, which is never proven clean."""
+    forced, array): redirections and their targets are dropped; forced marks a command found
+    past the nesting limit, which is never proven clean; array marks the headless element list
+    of an array body (#5723), whose comments are skipped and whose newlines are whitespace."""
     hi = len(text) if hi is None else hi
     out = [] if out is None else out
     forced = depth >= NEST_LIMIT
@@ -1555,12 +1590,62 @@ def shell_commands(text: str, lo: int = 0, hi: Optional[int] = None, depth: int 
 
     def flush() -> None:
         if cmd:
-            out.append((list(cmd), forced))
+            out.append((list(cmd), forced, False))
             cmd.clear()
 
     def nest(a: int, b: int) -> None:
         if b > a:
             shell_commands(text, a, b, depth + 1, out)
+
+    def walk_word(i: int, j: int, pieces: List[WordPiece], subs: List[Tuple[int, int]]) -> None:
+        """Walk the nested contexts of the word text[i:j]."""
+        for a, b in subs:
+            quote = text[a - 1:a]
+            if quote in ("'", '"') and text[b:b + 1] == quote:
+                # A quoted string is a command string only when it is the whole word, or the value
+                # of a NAME= word (#5653: PROMPT_COMMAND='...', alias q='...'), and holds a space.
+                whole = a - 1 == i or bool(ALIAS_VALUE_PREFIX_RE.fullmatch(text, i, a - 1))
+                if whole and b + 1 == j and re.search(r"\s", text[a:b]):
+                    nest(a, b)
+            else:
+                nest(a, b)
+        for kind, value in pieces:
+            if kind != "h":
+                continue
+            a, b = value  # type: ignore[misc]
+            if text.startswith("${", a):
+                nest(a + 2, b - 1)
+            elif text.startswith("$(", a) and text[b - 1:b] != ")":
+                nest(a + 2, b)  # an unclosed $( runs to the line end
+
+    def array_body(j: int) -> int:
+        """#5723: read the array body that opens after text[j - 1] == "(" as one element list;
+        the index after its ) (or where a non-word character ends it) is returned."""
+        elems: List[Word] = []
+        while j < hi:
+            d = text[j]
+            if d in " \t\r\n":
+                j += 1
+                continue
+            if d == "#":
+                eol = text.find("\n", j, hi)
+                j = hi if eol < 0 else eol
+                continue
+            if d == ")":
+                j += 1
+                break
+            if d in WORD_DELIMS:
+                break
+            subs: List[Tuple[int, int]] = []
+            k, pieces = parse_word(text, j, hi, subs)
+            if k <= j:
+                break
+            elems.append((j, k, pieces))
+            walk_word(j, k, pieces, subs)
+            j = k
+        if elems:
+            out.append((elems, forced, True))
+        return j
 
     i = lo
     while i < hi:
@@ -1589,6 +1674,10 @@ def shell_commands(text: str, lo: int = 0, hi: Optional[int] = None, depth: int 
                     nest(a, b)
             i = max(j, i + 1)
             continue
+        if c == "(" and array_opener(text, cmd, i):
+            flush()
+            i = array_body(i + 1)
+            continue
         if c in "\n;|&()":
             flush()
             i += 1
@@ -1599,24 +1688,7 @@ def shell_commands(text: str, lo: int = 0, hi: Optional[int] = None, depth: int 
             i += 1
             continue
         cmd.append((i, j, pieces))
-        for a, b in subs:
-            quote = text[a - 1:a]
-            if quote in ("'", '"') and text[b:b + 1] == quote:
-                # A quoted string is a command string only when it is the whole word, or the value
-                # of a NAME= word (#5653: PROMPT_COMMAND='...', alias q='...'), and holds a space.
-                whole = a - 1 == i or bool(ALIAS_VALUE_PREFIX_RE.fullmatch(text, i, a - 1))
-                if whole and b + 1 == j and re.search(r"\s", text[a:b]):
-                    nest(a, b)
-            else:
-                nest(a, b)
-        for kind, value in pieces:
-            if kind != "h":
-                continue
-            a, b = value  # type: ignore[misc]
-            if text.startswith("${", a):
-                nest(a + 2, b - 1)
-            elif text.startswith("$(", a) and text[b - 1:b] != ")":
-                nest(a + 2, b)  # an unclosed $( runs to the line end
+        walk_word(i, j, pieces, subs)
         i = j
     flush()
     return out
@@ -1975,24 +2047,25 @@ def unproven_operand_commands(text: str, depth: int = 0) -> List[Tuple[int, int,
     """(report offset, start, end, class) of every command of text that is not proven clean
     and carries a credential-shaped -v / --set / --variable operand. class is UNKNOWN when the
     head is a literal program the gate does not model (#5722): only that class may be waived,
-    line by line, by ALLOW_FILE; every other class is "" and is never waived."""
+    line by line, by ALLOW_FILE, and so may ARRAY, an array body's element list (#5723);
+    every other class is "" and is never waived."""
     found: List[Tuple[int, int, int, str]] = []
     seen = set()
-    for words, forced in shell_commands(text):
+    for words, forced, array in shell_commands(text):
         key = (words[0][0], words[-1][1])
         if key in seen:
             continue
         seen.add(key)
-        verdict, at = head_verdict(text, words, depth)
-        if forced and verdict in (CLEAN, UNKNOWN):
+        verdict, at = (ARRAY, 0) if array else head_verdict(text, words, depth)
+        if forced and verdict in (CLEAN, UNKNOWN, ARRAY):
             # #5722: a command the walker could not finish is undecidable, never waivable.
             verdict = UNDECIDED
         report = words[min(at, len(words) - 1)][0]
-        if verdict == STRING_HIT or (verdict in (UNDECIDED, UNKNOWN, RUNNER, PSQL)
+        if verdict == STRING_HIT or (verdict in (UNDECIDED, UNKNOWN, ARRAY, RUNNER, PSQL)
                                      and credential_operand(text, words, verdict != PSQL,
                                                          verdict == RUNNER or (verdict in (UNDECIDED, UNKNOWN)
                                                                                and inside_wrapper(text, words, at)))):
-            found.append((report, words[0][0], words[-1][1], UNKNOWN if verdict == UNKNOWN else ""))
+            found.append((report, words[0][0], words[-1][1], verdict if verdict in (UNKNOWN, ARRAY) else ""))
     return found
 
 
@@ -2028,7 +2101,7 @@ def psql_var_operand_flagged(operand: str) -> bool:
 
 def operand_rule_hit(hit: Hit) -> bool:
     """#5722: a hit of the credential-operand rule, waivable (unknown head) or not."""
-    return hit[2].startswith(("[env-password-argv]", "[%s]" % UNKNOWN_TAG))
+    return hit[2].startswith(("[env-password-argv]", "[%s]" % UNKNOWN_TAG, "[%s]" % ARRAY_TAG))
 
 
 def text_rule_hits(rel: str, text: str) -> List[Hit]:
@@ -2076,9 +2149,11 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
         if line in argv_lines:
             continue
         argv_lines.add(line)
-        if cls == UNKNOWN:
-            # #5722: an unknown head is waivable, so its hit carries the allowlist key.
-            hits.append((rel, line, "[%s] h=%s %s" % (UNKNOWN_TAG, command_hash(text, start, end),
+        if cls in (UNKNOWN, ARRAY):
+            # #5722 #5723: an unknown head or an array body is waivable, so its hit carries the
+            # allowlist key.
+            tag = UNKNOWN_TAG if cls == UNKNOWN else ARRAY_TAG
+            hits.append((rel, line, "[%s] h=%s %s" % (tag, command_hash(text, start, end),
                                                        mask_preview(psql_command_snippet(text, start, end)))))
             continue
         hits.append((rel, line, "[env-password-argv] " + psql_command_snippet(text, start, end)))
@@ -3200,6 +3275,28 @@ R11_UNKNOWN_GREEN = {
 # #5722: classes that are never waivable even though the head is a literal unknown program:
 # a command the walker could not finish (nesting limit) is undecidable.
 R11_NOT_WAIVABLE = ('5593-m36-nesting-limit-literal-head',)
+# #5723: a bash array body NAME=( ... ) / NAME+=( ... ) is an element list with no head; its
+# elements reach an argv only through "${NAME[@]}", which a text gate cannot follow, so a
+# credential-shaped element is red under its own waivable class, one hit per body.
+R11_ARRAY_RED = {
+    '5723-a01-one-line-body': 'args=(-v pw="$PGPASSWORD" -f x.sql)',
+    '5723-a02-multi-line-append': 'args+=(\n  -f x.sql\n  -v "token=$TOKEN"\n)',
+    '5723-a03-comment-with-quote': "args=( # it's the list\n  --set \"pw=$PG_PW\"\n)",
+    '5723-a04-after-another-assignment': 'X=1 args=(-v pw="$PGPASSWORD")',
+    '5723-a05-local-a-builtin': 'local -a args=(-v pw="$PGPASSWORD")',
+    '5723-a06-indexed-name': 'declare -A m=([k]=1)\nargs=(--variable "secret=$S")',
+}
+# #5723: array bodies with no credential-shaped element are clean, and the element lines of
+# a body are never read as commands of their own.
+R11_ARRAY_GREEN = {
+    '5723-g01-mount-elements': 'args=(\n  -v "${DATA_DIR}:/data"\n  --rm\n)',
+    '5723-g02-comment-holds-shape': 'opts=(\n  # was: -v pw=$PGPASSWORD (removed)\n  -n 3\n)',
+    '5723-g03-neutral-v-element': 'args=(-v n=3 -f x.sql)',
+}
+# #5723: a command substitution inside an array body is still a command of its own.
+R11_ARRAY_NESTED_UNKNOWN = {
+    '5723-n01-cmdsubst-in-body': 'args=( "$(site-tool --set token=$TOKEN)" )',
+}
 
 
 def r9_variants(text: str) -> List[Tuple[str, str, str]]:
@@ -3438,6 +3535,30 @@ def self_test() -> int:
         if not got or any(waivable_key(h) for h in got):
             print("SELF-TEST FAIL: %r must be flagged and not waivable: %r" % (name, got), file=sys.stderr)
             bad += 1
+    # #5723: an array body is one headless element list with its own waivable class.
+    for name, text in R11_ARRAY_RED.items():
+        for label, suffix, body in r9_variants(text):
+            red += 1
+            got = text_rule_hits(suffix, body)
+            if [h[2].split(" ", 1)[0] for h in got] != ["[%s]" % ARRAY_TAG]:
+                print("SELF-TEST FAIL: array probe %r (%s) not one %s hit: %r" % (name, label, ARRAY_TAG, got),
+                      file=sys.stderr)
+                bad += 1
+    for name, text in R11_ARRAY_GREEN.items():
+        for label, suffix, body in r9_variants(text):
+            green += 1
+            got = scan_text(suffix, body)
+            if got:
+                print("SELF-TEST FAIL: array clean probe %r (%s) was flagged: %r" % (name, label, got),
+                      file=sys.stderr)
+                bad += 1
+    for name, text in R11_ARRAY_NESTED_UNKNOWN.items():
+        for label, suffix, body in r9_variants(text):
+            red += 1
+            if not any(h[2].startswith("[%s] h=" % UNKNOWN_TAG) for h in text_rule_hits(suffix, body)):
+                print("SELF-TEST FAIL: nested probe %r (%s) not flagged as %s" % (name, label, UNKNOWN_TAG),
+                      file=sys.stderr)
+                bad += 1
     # #5722: the allowlist file is read by its loader, not scanned as a doc.
     green += 1
     allow_probe = "x.sh | %s | %s | awk -v pw=* 1\n" % (UNKNOWN_TAG, "a" * 32)
