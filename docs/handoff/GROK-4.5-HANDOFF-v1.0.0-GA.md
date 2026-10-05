@@ -423,7 +423,7 @@ The binary reports **no feature set anywhere**, so that check passes identically
 
 **Operator directive:** *"there is previous terraform code that built a postgresql + AGE + pgvector droplet - you need to always look for prior code."*
 
-`infra/do-hive/` already has a battle-tested `cloud-init-memory.yaml.tpl` plus VPC, firewall, `db_password`, ssh-fingerprint and region wiring. Its comments encode the exact fixes you will otherwise re-discover:
+`infra/do-hive/` already has a battle-tested `cloud-init-memory.yaml.tpl` plus VPC, firewall, ssh-fingerprint and region wiring (the Postgres role password is minted on the node; there is no `db_password` variable). Its comments encode the exact fixes you will otherwise re-discover:
 
 - **#1842** — the prior template installed postgresql-16 but never installed pgvector and never built Apache AGE (AGE is source-only, not an apt package); it also used an invalid `--bind` flag.
 - **#2293** — the noble apt package `postgresql-16-pgvector` pins pgvector 0.6.0, below the tested 0.7.x–0.8.x range, so pgvector is built from source, pinned.

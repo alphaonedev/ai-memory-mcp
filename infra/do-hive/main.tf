@@ -196,17 +196,26 @@ variable "vpc_ip_range" {
   default     = "10.20.0.0/16"
 }
 
-variable "db_password" {
-  description = "PostgreSQL password for the ai-memory role (substrate-local; the daemon connects over localhost only — postgres is not exposed to the network). Pass via TF_VAR_db_password."
+variable "ai_memory_image_url" {
+  description = "URL of a VERSIONED ai-memory release tarball built with --features sal-postgres (for example .../releases/download/v1.0.0/ai-memory-x86_64-unknown-linux-gnu.tar.gz), operator-published. Empty (the default) means the operator supplies the binary by scp. When set it needs ai_memory_image_sha256; releases/latest is refused because the digest pins one artifact (#4678)."
   type        = string
-  default     = "aimem-do-substrate"
-  sensitive   = true
+  default     = ""
+
+  validation {
+    condition     = var.ai_memory_image_url == "" || (startswith(var.ai_memory_image_url, "https://") && length(var.ai_memory_image_url) > length("https://") && !strcontains(var.ai_memory_image_url, "%") && !strcontains(lower(var.ai_memory_image_url), "/releases/latest") && !can(regex("//|/$|/\\.\\.?(/|$)", trimprefix(var.ai_memory_image_url, "https://"))) && can(regex("^https://[A-Za-z0-9][A-Za-z0-9._~/-]*$", var.ai_memory_image_url)))
+    error_message = "ai_memory_image_url must be empty or a non-empty https:// URL of a versioned release, with no percent-encoding or shell metacharacters (only letters, digits and ._~/- after https://); /releases/latest in any letter case moves and would not match ai_memory_image_sha256; a . or .. path segment is refused because curl removes it before the request, and an empty path segment or a trailing slash is refused because it names no versioned artifact."
+  }
 }
 
-variable "ai_memory_image_url" {
-  description = "URL to the pre-built ai-memory release tarball (operator-published)."
+variable "ai_memory_image_sha256" {
+  description = "Lowercase hex SHA-256 of the tarball at ai_memory_image_url. The memory node refuses to extract or run a tarball that does not match (#4637). Required whenever ai_memory_image_url is non-empty (a memory droplet precondition enforces it at plan time): pin a versioned URL, not releases/latest, so the digest stays valid. Leave both empty to supply the binary by scp."
   type        = string
-  default     = "https://github.com/alphaonedev/ai-memory-mcp/releases/latest/download/ai-memory-x86_64-unknown-linux-gnu.tar.gz"
+  default     = ""
+
+  validation {
+    condition     = var.ai_memory_image_sha256 == "" || can(regex("^[0-9a-f]{64}$", var.ai_memory_image_sha256))
+    error_message = "ai_memory_image_sha256 must be empty or 64 lowercase hex characters."
+  }
 }
 
 variable "ironclaw_image_url" {
@@ -264,16 +273,20 @@ resource "digitalocean_droplet" "memory" {
   // byte-identically to the pre-Track-D template (verified by rendering both
   // and diffing against the parent commit).
   user_data = templatefile("${path.module}/cloud-init-memory.yaml.tpl", {
-    ai_memory_image_url = var.ai_memory_image_url
-    db_password         = var.db_password
-    federation_enabled  = var.memory_count > 1
-    node_index          = count.index + 1
-    node_count          = var.memory_count
-    fed_identity        = "ai:hive-memory-${count.index + 1}"
-    quorum_writes       = var.quorum_writes
+    ai_memory_image_url    = var.ai_memory_image_url
+    ai_memory_image_sha256 = var.ai_memory_image_sha256
+    federation_enabled     = var.memory_count > 1
+    node_index             = count.index + 1
+    node_count             = var.memory_count
+    fed_identity           = "ai:hive-memory-${count.index + 1}"
+    quorum_writes          = var.quorum_writes
   })
 
   lifecycle {
+    precondition {
+      condition     = var.ai_memory_image_url == "" || can(regex("^[0-9a-f]{64}$", var.ai_memory_image_sha256))
+      error_message = "ai_memory_image_sha256 must be 64 lowercase hex characters when ai_memory_image_url is set: the memory node refuses a tarball it cannot verify (#4637)."
+    }
     precondition {
       condition     = var.quorum_writes <= var.memory_count || var.memory_count == 1
       error_message = "quorum_writes must be <= memory_count. A W larger than N can never be satisfied: every federated write would burn the full --quorum-timeout-ms and then return 202 locally-durable, so the mesh would look alive while replicating nothing."

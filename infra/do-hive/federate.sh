@@ -64,6 +64,12 @@ SSH_USER="${SSH_USER:-root}"
 # SSH_OPTS='-o StrictHostKeyChecking=yes -o ConnectTimeout=15' with the host
 # key pinned.
 SSH_OPTS="${SSH_OPTS:--o StrictHostKeyChecking=accept-new -o ConnectTimeout=15}"
+# #5274: every ssh and scp call passes SSH_BATCH first. ssh uses the first value given for an
+# option, so no SSH_OPTS override can turn batch mode off: a node cannot put a password or
+# keyboard-interactive prompt on the operator terminal or hang the run waiting for input.
+# No here-document body runs ssh or scp (#5655): the lane test reads every body line and the
+# call sites outside them, so the count of calls it checks is the count bash would run.
+SSH_BATCH="-o BatchMode=yes"
 FED_DIR=/etc/ai-memory/fed
 NS="${NS:-fed-cert}"
 WAIT_TRIES="${WAIT_TRIES:-180}"
@@ -90,6 +96,10 @@ read_nodes() {
   PUBLIC_IPS=($(echo "$NODES_JSON" | jq -r '.[].public_ip'))
   PRIVATE_IPS=($(echo "$NODES_JSON" | jq -r '.[].private_ip'))
   FED_IDS=($(echo "$NODES_JSON" | jq -r '.[].fed_identity'))
+  # #5602: an identity names the peer key file under $OUT_DIR, so it must be a plain name (no /, . or glob).
+  for fid in "${FED_IDS[@]}"; do
+    [[ "$fid" =~ ^[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_:-]{1,64}$ ]] || die "a fed_identity in the terraform outputs is not a plain name"
+  done
   PEER_URLS=($(echo "$NODES_JSON" | jq -r '.[].peer_url'))
   echo "[federate] ${NODE_COUNT} memory nodes:"
   for i in $(seq 0 $((NODE_COUNT - 1))); do
@@ -97,7 +107,7 @@ read_nodes() {
   done
 }
 
-on_node() { ssh $SSH_OPTS "${SSH_USER}@$1" "$2"; }
+on_node() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@$1" "$2"; }
 
 # --- wire --------------------------------------------------------------------
 
@@ -141,22 +151,22 @@ wire() {
     printf '%s' "$AUTHOR_ID" > "$OUT_DIR/author.id"
     printf '%s' "$AUTHOR_PUB" > "$OUT_DIR/author.pub"
 
-    on_node "$host" "install -d -m 0750 $FED_DIR $FED_DIR/peers" \
+    on_node "$host" "install -d -m 0750 $FED_DIR $FED_DIR/peers" >/dev/null 2>&1 \
       || die "node $n: cannot create $FED_DIR (is the droplet up + reachable on 22?)"
-    scp $SSH_OPTS -q \
+    scp $SSH_BATCH $SSH_OPTS -q \
       "$OUT_DIR/ca.crt" \
-      "${SSH_USER}@${host}:$FED_DIR/ca.crt" || die "node $n: scp ca.crt failed"
-    scp $SSH_OPTS -q "$OUT_DIR/hive-node-$n.crt" "${SSH_USER}@${host}:$FED_DIR/node.crt" \
+      "${SSH_USER}@${host}:$FED_DIR/ca.crt" >/dev/null 2>&1 || die "node $n: scp ca.crt failed"
+    scp $SSH_BATCH $SSH_OPTS -q "$OUT_DIR/hive-node-$n.crt" "${SSH_USER}@${host}:$FED_DIR/node.crt" >/dev/null 2>&1 \
       || die "node $n: scp node.crt failed"
-    scp $SSH_OPTS -q "$OUT_DIR/hive-node-$n.key" "${SSH_USER}@${host}:$FED_DIR/node.key" \
+    scp $SSH_BATCH $SSH_OPTS -q "$OUT_DIR/hive-node-$n.key" "${SSH_USER}@${host}:$FED_DIR/node.key" >/dev/null 2>&1 \
       || die "node $n: scp node.key failed"
-    scp $SSH_OPTS -q "$OUT_DIR/hive-node-$n.allowlist" "${SSH_USER}@${host}:$FED_DIR/peers.allowlist" \
+    scp $SSH_BATCH $SSH_OPTS -q "$OUT_DIR/hive-node-$n.allowlist" "${SSH_USER}@${host}:$FED_DIR/peers.allowlist" >/dev/null 2>&1 \
       || die "node $n: scp peers.allowlist failed"
-    scp $SSH_OPTS -q "$OUT_DIR/peers.conf.node$n" "${SSH_USER}@${host}:$FED_DIR/peers.conf" \
+    scp $SSH_BATCH $SSH_OPTS -q "$OUT_DIR/peers.conf.node$n" "${SSH_USER}@${host}:$FED_DIR/peers.conf" >/dev/null 2>&1 \
       || die "node $n: scp peers.conf failed"
-    scp $SSH_OPTS -q "$OUT_DIR/author.id" "$OUT_DIR/author.pub" "${SSH_USER}@${host}:$FED_DIR/" \
+    scp $SSH_BATCH $SSH_OPTS -q "$OUT_DIR/author.id" "$OUT_DIR/author.pub" "${SSH_USER}@${host}:$FED_DIR/" >/dev/null 2>&1 \
       || die "node $n: scp author material failed"
-    on_node "$host" "chmod 0600 $FED_DIR/node.key" || die "node $n: chmod node.key failed"
+    on_node "$host" "chmod 0600 $FED_DIR/node.key" >/dev/null 2>&1 || die "node $n: chmod node.key failed"
   done
 
   # 4. Collect each node's freshly-minted federation .pub (published by the
@@ -168,13 +178,13 @@ wire() {
     host="${PUBLIC_IPS[$i]}"
     pub="${FED_IDS[$i]}.pub"
     t=0
-    until on_node "$host" "test -s '$FED_DIR/$pub'"; do
+    until on_node "$host" "test -s '$FED_DIR/$pub'" >/dev/null 2>&1; do
       t=$((t + 1))
       [ "$t" -gt "$WAIT_TRIES" ] && die "node $n never published $FED_DIR/$pub (journalctl -u ai-memory-fed-bootstrap)"
       [ $((t % 6)) -eq 1 ] && echo "  node $n: waiting for $pub ... $t/$WAIT_TRIES"
       sleep "$WAIT_SLEEP"
     done
-    scp $SSH_OPTS -q "${SSH_USER}@${host}:$FED_DIR/$pub" "$OUT_DIR/$pub" \
+    scp $SSH_BATCH $SSH_OPTS -q "${SSH_USER}@${host}:$FED_DIR/$pub" "$OUT_DIR/$pub" >/dev/null 2>&1 \
       || die "node $n: could not fetch $pub"
     echo "  node $n: collected $pub"
   done
@@ -183,7 +193,7 @@ wire() {
     host="${PUBLIC_IPS[$i]}"
     for j in $(seq 0 $((NODE_COUNT - 1))); do
       [ "$j" -eq "$i" ] && continue
-      scp $SSH_OPTS -q "$OUT_DIR/${FED_IDS[$j]}.pub" "${SSH_USER}@${host}:$FED_DIR/peers/" \
+      scp $SSH_BATCH $SSH_OPTS -q "$OUT_DIR/${FED_IDS[$j]}.pub" "${SSH_USER}@${host}:$FED_DIR/peers/" >/dev/null 2>&1 \
         || die "node $n: could not install peer pubkey ${FED_IDS[$j]}"
     done
     echo "[federate] node $n cross-enrolled with $((NODE_COUNT - 1)) peer key(s)"
@@ -191,18 +201,18 @@ wire() {
 
   # 5. Release the fail-closed wait on every node, then wait for MESH READY.
   for i in $(seq 0 $((NODE_COUNT - 1))); do
-    on_node "${PUBLIC_IPS[$i]}" "touch $FED_DIR/ENROLLED" \
+    on_node "${PUBLIC_IPS[$i]}" "touch $FED_DIR/ENROLLED" >/dev/null 2>&1 \
       || die "node $((i + 1)): could not mark ENROLLED"
   done
   for i in $(seq 0 $((NODE_COUNT - 1))); do
     n=$((i + 1))
     host="${PUBLIC_IPS[$i]}"
     t=0
-    until on_node "$host" "test -f '$FED_DIR/MESH-READY'"; do
+    until on_node "$host" "test -f '$FED_DIR/MESH-READY'" >/dev/null 2>&1; do
       t=$((t + 1))
       if [ "$t" -gt "$WAIT_TRIES" ]; then
-        echo "--- node $n federation log tail ---" >&2
-        on_node "$host" "tail -30 /var/log/ai-memory-federation.log" >&2 || true
+        # #5171: node output never reaches this terminal; the operator reads the log on the node.
+        echo "[federate] node $n federation log: ssh ${SSH_USER}@$host tail -30 /var/log/ai-memory-federation.log" >&2
         die "node $n never reached MESH READY"
       fi
       [ $((t % 6)) -eq 1 ] && echo "  node $n: waiting for MESH READY ... $t/$WAIT_TRIES"
@@ -218,7 +228,7 @@ loadgen() {
   [ -s "$OUT_DIR/hive-loadgen-f2.crt" ] || die "run '$0 wire' first"
   loadgen_fp="$(openssl x509 -in "$OUT_DIR/hive-loadgen-f2.crt" -outform DER | openssl dgst -sha256 | awk '{print $NF}')"
   for i in $(seq 0 $((NODE_COUNT - 1))); do
-    node_sh "$i" <<EOS || die "node $((i + 1)): loadgen enrollment failed"
+    node_sh "$i" <<EOS >/dev/null 2>&1 || die "node $((i + 1)): loadgen enrollment failed"
 set -e
 grep -qx '$loadgen_fp' '$FED_DIR/peers.allowlist' || printf '%s\n' '$loadgen_fp' >> '$FED_DIR/peers.allowlist'
 systemctl restart ai-memory
@@ -230,7 +240,38 @@ EOS
   install -m 0600 "$OUT_DIR/hive-loadgen-f2.key" "$run_dir/client.key"
   install -m 0600 "$OUT_DIR/ca.crt" "$run_dir/ca.crt"
   echo "[federate] loadgen bundle: $run_dir"
-  echo "[federate] Phase A API key: $(on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key')"
+  # The key is a credential: it goes to a 0600 file in the 0700 run dir, never to the terminal or a log.
+  local keyf="$run_dir/api-key" keytmp
+  rm -f -- "$keyf"
+  # bash noclobber adds O_EXCL only when the name does not exist yet; an entry planted at a known
+  # name (a symlink to a FIFO or a terminal) is still opened and written through. So the key goes
+  # to an unpredictable new name (O_EXCL), is checked there, and is renamed over
+  # api-key: rename replaces whatever entry sits at that name and never writes through it.
+  # grep -a: GNU grep treats a NUL as a line end in a binary file, so key+NUL would count as one line.
+  # The file is at most 65 bytes, has exactly one line of 64 hex, and starts with a hex digit (so an
+  # empty first line followed by the key is refused): the key, optionally one newline, nothing else.
+  keytmp="$(mktemp -u "$run_dir/.api-key.XXXXXXXXXX")" || die "mktemp failed in $run_dir"
+  # An interrupt between the first key byte and the rename must not leave a partial key at the temp name.
+  trap 'rm -f -- "$keytmp"; exit 130' INT TERM HUP
+  # The key is written only to a file descriptor this run created: nothing may exist at the new
+  # name (a FIFO, symlink, directory or device there is refused), the descriptor is opened with
+  # noclobber (O_EXCL), and it must be a regular file (-f follows the descriptor) that the name still
+  # points to (-ef), BEFORE the first key byte is written to it. A swap inside that window yields a
+  # refusal, never a key write; the key never reaches a FIFO, a terminal or another entry.
+  if ! ( umask 077; set -o noclobber
+         [ ! -e "$keytmp" ] && [ ! -L "$keytmp" ] && exec 9> "$keytmp" \
+           && [ -f /dev/fd/9 ] && [ "$keytmp" -ef /dev/fd/9 ] \
+           && on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' >&9 2>/dev/null ) \
+     || [ "$(LC_ALL=C wc -c < "$keytmp")" -gt 65 ] \
+     || [ "$(LC_ALL=C grep -aEcx '[0123456789abcdef]{64}' "$keytmp")" != 1 ] \
+     || ! LC_ALL=C head -c 1 -- "$keytmp" | LC_ALL=C grep -q '[0123456789abcdef]' \
+     || ! mv -f -T -- "$keytmp" "$keyf"; then
+    rm -f -- "$keytmp"
+    trap - INT TERM HUP
+    die "could not fetch a 64-hex node API key into $keyf"
+  fi
+  trap - INT TERM HUP
+  echo "[federate] Phase A API key written to $keyf (0600)"
 }
 
 # --- verify ------------------------------------------------------------------
@@ -244,15 +285,105 @@ EOS
 # separate operator/bastion cert in `gen-certs.sh`'s HIVE_NODE_IPS mode.
 
 # node_sh <idx0> -- run the script on stdin as root on that node.
-node_sh() { ssh $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
+node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
+
+# Closed-world output (#4999, 5-agent vote 4d3ea1c5): no byte of a node reply reaches this terminal.
+# verify suspends xtrace on its first line (#5237), so no reply reaches an xtrace log either; outside
+# verify a node reply only ever goes to a file or to /dev/null. A PASS or FAIL line names a node-derived
+# value only through these three helpers, whose output comes from a closed set. A static test
+# (scripts/test/test_do_hive_argv_secrets_4604_4866_4678.py) follows node-derived names and applies
+# these rules:
+#  - ok, no, die, echo, printf, cat and tee may not name one; a positional parameter on such a line is
+#    allowed only in ok, no, die and the three helpers; a command substitution or a backtick in such a
+#    line is refused; a cat of a file is refused (#5236, #5362, #5408);
+#  - any other command that names a node-derived variable is refused, except the test words [, [[,
+#    test, case, for, true, false and :, and plain_id; local, export, readonly, declare and typeset
+#    may take it only as the value of name=value, never as a name; a numeric test, an arithmetic
+#    expansion, a substring offset or length, an array subscript and the :? expansion are refused
+#    because bash prints the operand in its error message (#5361, #5406, #5411);
+#  - a command that reads a file or an input redirect and is the last stage of a pipeline prints that
+#    file, so it is refused unless its output goes to a file, it is wc or curl, or it is grep with a
+#    -q, -c, -l or -L style flag (#5409);
+#  - a redirect decides where output goes by the LAST fd-1 redirect; a dup, or a target computed by a
+#    command substitution, a backtick or a process substitution, is the terminal (#5412);
+#  - a write, cp, install, scp download, ln or dd target is a file only when it is proven to sit under
+#    $OUT_DIR or $run_dir with a canonical remainder (no empty, . or .. segment, no glob, brace or tilde,
+#    no expansion the scan does not model), or is /dev/null; every other target, every literal path
+#    included, is the terminal, and a cp, install, scp download or ln to it is refused (#5602);
+#  - $OUT_DIR and $run_dir are roots only while the scan proves their value (#5763): each of them, and
+#    HERE and REPO_ROOT that they are built from, has one reviewed assignment that runs unconditionally
+#    in its scope, every read comes after it (run_dir: inside loadgen), and no other line names it
+#    except to read it or to pass the same value to one command; a name split by quotes or attached
+#    to an option letter (wait -pOUT_DIR) names it (#5898). Each simple command is also read after
+#    quote removal, and the root is not proven when the scan finds an indirect writer on any line or
+#    in a literal trap action: eval, source or ., alias or enable as the command word after
+#    quote removal, a command word bash computes that is not a path, a nameref after any run of option
+#    words (#5895, #5896, #5897), a read, mapfile, readarray, getopts, let, printf -v or wait -p with
+#    a computed operand, a mapfile callback, a prompt, alias-table, command-table or startup-file
+#    variable, an indirect expansion that assigns (#5899), a computed trap action, a declarator or
+#    unset with a computed name, or a declarator with a computed option word; such a line is
+#    reported and every target under a root is then the terminal. The forms read as code are a
+#    closed list and a word the scan cannot decide fails the proof, so a root is proven only
+#    against that list, not against every indirect writer bash has;
+#  - a pipe into base64 is exempt only when it continues into curl, and the b64 helper only while its
+#    body is exactly the pinned one (#5413);
+#  - a function that wraps a node channel is followed as a source, in each definition spelling the
+#    scan lists (#5360, #5414);
+#  - outside main the scan refuses eval, read, mapfile, printf -v, indirect expansion, here-strings,
+#    here-documents not fed to a node, indexed and escaped-space assignments, default-assign and :?
+#    expansions, let, ((, process substitution and backticks (#5236, #5359, #5407, #5408, #5410).
+# It is a static aid and not a proof; a form it cannot decide is reported, not trusted (#5418, #5523):
+# a variable in a target other than a root is followed through every value this script assigns
+# it, and a value it cannot read (a parameter, the environment, a command substitution other than
+# date, mktemp or seq) is not proven; ${V:-x} is each value of V and x. An identity in FED_IDS is a plain name because
+# read_nodes checks it. A command it does not list that names a file this script may write is
+# reported unless its output goes to a file or it is a silent file command (#5525, #5621): the
+# written set is every output redirect at any fd and every cp, install, mv, ln, scp download and dd
+# destination, each followed through its assigned values, and an operand is compared with it by
+# name, so neither its spelling (a . segment, a glob, a variable) nor the working directory (cd,
+# pushd, popd, a subshell, env --chdir) decides; a relative . or .. operand and a glob under another
+# directory are reported, and so is a capture or a trap handler that reads a written file.
+# Stated limits: a root moved by the environment (inside V="${V:-x}" V is taken as x), a literal
+# absolute spelling of a directory above a computed root, symbolic links, an integer that bash
+# arithmetic assigns while it evaluates the text of a variable (#5901), and a path that reaches a
+# command only as a function argument or as a value with no literal spelling are not decided.
+# Whole-verify probes check the printed bytes.
+# reply_status prints a 3-digit HTTP
+# status, or the word non-status for anything else. reply_len prints the reply's byte count.
+# reply_version prints a version token only when it is 1 to 3 dot-separated groups of 1 to 3 ASCII
+# digits, and the byte count of the whole reply otherwise.
+reply_status() {
+  case "$1" in
+    [0123456789][0123456789][0123456789]) printf '%s' "$1" ;;
+    *) printf 'non-status' ;;
+  esac
+}
+reply_len() { printf '%s bytes' "$(printf '%s' "$1" | LC_ALL=C wc -c | LC_ALL=C tr -cd '0123456789')"; }
+reply_version() { # <token> <whole reply>
+  case "$1" in
+    '' | *[!0123456789.]* | .* | *. | *..* | *.*.*.* | *[0123456789][0123456789][0123456789][0123456789]*)
+      reply_len "$2" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
 
 # node_get <idx0> <memory-id> -- read one memory from that node over its own
 # loopback mTLS listener, using the node's own cert + its own api key.
+# plain_id <id> -- the verify steps ask this BEFORE node_get so a refused id is reported as a
+# refused id, not retried 20 times as a replication failure. Same list as the node_get check
+# below (a test pins that the two accept the same characters); explicit, locale-proof: a range would match non-ASCII.
+plain_id() { [[ "$1" =~ ^[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]{1,64}$ ]]; }
+
 node_get() {
+  # The id comes from a node HTTP response and is spliced into a root heredoc on
+  # another node: accept only a plain id (explicit list, locale-proof: a range would match non-ASCII).
+  [[ "$2" =~ ^[0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]{1,64}$ ]] || return 3
   node_sh "$1" <<EOS 2>/dev/null
-curl -sS --max-time 15 --cacert /etc/ai-memory/fed/ca.crt \\
+K=\$(cat /etc/ai-memory/api-key); [[ "\$K" =~ ^[0123456789abcdef]{64}\$ ]] || exit 3
+printf 'header = "x-api-key: %s"\\n' "\$K" | curl -sS --max-time 15 --config - \\
+  --cacert /etc/ai-memory/fed/ca.crt \\
   --cert /etc/ai-memory/fed/node.crt --key /etc/ai-memory/fed/node.key \\
-  -H "x-api-key: \$(cat /etc/ai-memory/api-key)" -H 'x-agent-id: $AUTHOR_ID' \\
+  -H 'x-agent-id: $AUTHOR_ID' \\
   https://127.0.0.1:9077/api/v1/memories/$2 2>/dev/null
 EOS
 }
@@ -262,10 +393,12 @@ EOS
 node_post() {
   node_sh "$1" <<EOS 2>/dev/null
 BODY=\$(printf '%s' '$2' | base64 -d)
-curl -sS --max-time 30 --cacert /etc/ai-memory/fed/ca.crt \\
+K=\$(cat /etc/ai-memory/api-key); [[ "\$K" =~ ^[0123456789abcdef]{64}\$ ]] || exit 3
+printf 'header = "x-api-key: %s"\\n' "\$K" | curl -sS --max-time 30 --config - \\
+  --cacert /etc/ai-memory/fed/ca.crt \\
   --cert /etc/ai-memory/fed/node.crt --key /etc/ai-memory/fed/node.key \\
   -H 'content-type: application/json' \\
-  -H "x-api-key: \$(cat /etc/ai-memory/api-key)" -H 'x-agent-id: $AUTHOR_ID' \\
+  -H 'x-agent-id: $AUTHOR_ID' \\
   -X POST https://127.0.0.1:9077/api/v1/memories -d "\$BODY" -w '\\n%{http_code}' 2>/dev/null
 EOS
 }
@@ -273,6 +406,9 @@ EOS
 b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 
 verify() {
+  # Neither the key nor any node reply may reach an xtrace log: suspend -x for the whole of verify (#5237);
+  # the end of verify restores it.
+  case $- in *x*) _fed_xtrace=1; { set +x; } 2>/dev/null ;; *) _fed_xtrace=0 ;; esac
   # A1 -- each node answers /health over mTLS with an authorised cert, and
   #       REFUSES a caller presenting no cert (mTLS mandatory, not optional).
   for i in $(seq 0 $((NODE_COUNT - 1))); do
@@ -286,7 +422,7 @@ EOS
     if [ "$code" = "200" ]; then
       ok "node $n /health over mTLS (200)"
     else
-      no "node $n /health over mTLS got '$code' (expected 200)"
+      no "node $n /health over mTLS got '$(reply_status "$code")' (expected 200)"
     fi
 
     if node_sh "$i" <<'EOS' >/dev/null 2>&1
@@ -302,14 +438,40 @@ EOS
 
   # Certified data-tier pins, asserted from the provisioned hosts.
   for i in $(seq 0 $((NODE_COUNT - 1))); do
-    versions="$(node_sh "$i" <<'EOS'
+    versions="$(node_sh "$i" <<'EOS' 2>/dev/null
 sudo -u postgres psql -d aimemory -Atc "SELECT current_setting('server_version')"
 sudo -u postgres psql -d aimemory -Atc "SELECT extname || '=' || extversion FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname"
 EOS
 )"
-    echo "$versions" | grep -q '^18\.6' && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 ($versions)"
-    echo "$versions" | grep -qx 'age=1.8.0' && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 ($versions)"
-    echo "$versions" | grep -qx 'vector=0.8.6' && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 ($versions)"
+    # #5172: the server_version token (first line, up to the first space) must be exactly 18.6.
+    # A sed pipeline, not ${versions%%...}: bash suffix removal is quadratic in the reply length (#5247).
+    pg_ver="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '1{s/ .*//;p;q;}')"
+    # #5275: each extension version comes only from its own labelled line after server_version and must
+    # equal the pin exactly, and the label must appear exactly once (counted below): an absent or repeated
+    # label fails.
+    age_ver="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '2,$s/^age=//p')"
+    vec_ver="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '2,$s/^vector=//p')"
+    # $(...) strips trailing newlines, so a repeated EMPTY label that comes last would leave the value
+    # above unchanged (#5357): count the labelled lines too (the count is digits only) and require one each.
+    age_n="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '2,$p' | LC_ALL=C grep -c '^age=')"
+    vec_n="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '2,$p' | LC_ALL=C grep -c '^vector=')"
+    [ "$pg_ver" = 18.6 ] && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 (got $(reply_version "$pg_ver" "$versions"))"
+    # #5417: a label count other than 1 is its own fixed line, tested BEFORE any version token is printed,
+    # so the line never says "(got X)" about a token it does not use and prints no byte of the reply.
+    if [ "$age_n" != 1 ]; then
+      no "node $((i + 1)) AGE is not 1.8.0 (the labelled row count is not 1)"
+    elif [ "$age_ver" = 1.8.0 ]; then
+      ok "node $((i + 1)) AGE 1.8.0"
+    else
+      no "node $((i + 1)) AGE is not 1.8.0 (got $(reply_version "$age_ver" "$versions"))"
+    fi
+    if [ "$vec_n" != 1 ]; then
+      no "node $((i + 1)) pgvector is not 0.8.6 (the labelled row count is not 1)"
+    elif [ "$vec_ver" = 0.8.6 ]; then
+      ok "node $((i + 1)) pgvector 0.8.6"
+    else
+      no "node $((i + 1)) pgvector is not 0.8.6 (got $(reply_version "$vec_ver" "$versions"))"
+    fi
   done
 
   # These two assertions intentionally originate on f2/public internet.
@@ -317,7 +479,7 @@ EOS
     : # legacy local allowlist is not authoritative after remote enrollment
   fi
   code="$(curl -sS --max-time 15 --cacert "$OUT_DIR/ca.crt" --cert "$OUT_DIR/hive-loadgen-f2.crt" --key "$OUT_DIR/hive-loadgen-f2.key" -o /dev/null -w '%{http_code}' "https://${PUBLIC_IPS[0]}:9077/api/v1/health" 2>/dev/null)"
-  [ "$code" = 200 ] && ok "f2 loadgen reaches public /health over mTLS (200)" || no "f2 public mTLS /health got '$code'"
+  [ "$code" = 200 ] && ok "f2 loadgen reaches public /health over mTLS (200)" || no "f2 public mTLS /health got '$(reply_status "$code")'"
   if curl -sS --max-time 10 --cacert "$OUT_DIR/ca.crt" -o /dev/null "https://${PUBLIC_IPS[0]}:9077/api/v1/health" 2>/dev/null; then
     no "public endpoint accepted a client with no certificate"
   else
@@ -328,18 +490,24 @@ EOS
   # key) + enrolled client cert. Header trust is OFF on the droplet, so the
   # same request under a non-allowlisted name must be refused (403).
   api_key="$(on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' 2>/dev/null || true)"
+  # The key is node-supplied and becomes a curl config line on THIS host: only the
+  # minted 64-hex form can carry no quote or newline, so refuse anything else.
+  if [ -n "$api_key" ] && ! [[ "$api_key" =~ ^[0123456789abcdef]{64}$ ]]; then
+    die "node api key is not 64 lowercase hex; refusing to build a curl config from it"
+  fi
   if [ -n "$api_key" ]; then
     probe="ai:verify-probe-$(date -u +%s)"
-    lg_curl() { curl -sS --max-time 15 --cacert "$OUT_DIR/ca.crt" --cert "$OUT_DIR/hive-loadgen-f2.crt" --key "$OUT_DIR/hive-loadgen-f2.key" -H "X-API-Key: $api_key" "$@"; }
+    lg_curl() { printf 'header = "X-API-Key: %s"\n' "$api_key" | curl -sS --max-time 15 --config - --cacert "$OUT_DIR/ca.crt" --cert "$OUT_DIR/hive-loadgen-f2.crt" --key "$OUT_DIR/hive-loadgen-f2.key" "$@"; }
     lg_curl -o /dev/null -X POST -H 'content-type: application/json' -H "X-Agent-Id: ai:hive-loadgen-f2" \
       -d "{\"agent_id\":\"$probe\",\"agent_type\":\"ai:verify\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents" 2>/dev/null || true
     dummy_pub="$(head -c 32 /dev/zero | base64)"
     code="$(lg_curl -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' -H "X-Agent-Id: ai:hive-loadgen-f2" \
       -d "{\"pubkey_b64\":\"$dummy_pub\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents/$probe/pubkey" 2>/dev/null)"
-    case "$code" in 2*) ok "loadgen admin (ai:hive-loadgen-f2 + API key + mTLS) may bind agent keys ($code)";; *) no "loadgen admin bind got '$code' (expected 2xx)";; esac
+    # A PASS needs a 3-digit 2xx status: "2" and any other bytes is not one.
+    case "$code" in 2[0123456789][0123456789]) ok "loadgen admin (ai:hive-loadgen-f2 + API key + mTLS) may bind agent keys ($(reply_status "$code"))";; *) no "loadgen admin bind got '$(reply_status "$code")' (expected 2xx)";; esac
     code="$(lg_curl -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' -H "X-Agent-Id: ai:not-an-admin" \
       -d "{\"pubkey_b64\":\"$dummy_pub\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents/$probe/pubkey" 2>/dev/null)"
-    [ "$code" = 403 ] && ok "non-allowlisted name is refused admin (403) - header trust is off" || no "non-admin bind got '$code' (expected 403)"
+    [ "$code" = 403 ] && ok "non-allowlisted name is refused admin (403) - header trust is off" || no "non-admin bind got '$(reply_status "$code")' (expected 403)"
   else
     no "could not read the node API key for the admin-admission check"
   fi
@@ -358,7 +526,7 @@ EOS
   if [ "$code" = "200" ]; then
     ok "CROSS-HOST: node 1 reaches node 2 at $peerurl over mutual TLS (200)"
   else
-    no "CROSS-HOST: node 1 -> node 2 ($peerurl) got '$code' (expected 200)"
+    no "CROSS-HOST: node 1 -> node 2 ($peerurl) got '$(reply_status "$code")' (expected 200)"
   fi
 
   # A3 -- a W-of-N quorum write admitted at node 1 commits AND replicates.
@@ -382,10 +550,24 @@ EOS
   qjson=$(echo "$resp" | sed '$d')
   QID=$(echo "$qjson" | jq -r '.id // empty' 2>/dev/null)
   case "$qcode" in
-    201) ok "W-of-N quorum write at node 1 committed + replicated (201 quorum_met)" ;;
-    202) ok "quorum write at node 1 locally durable (202; peer ack timing) -- the mesh channel carried it" ;;
-    *)   no "quorum write at node 1 got '$qcode' ($qjson)" ;;
+    201|202)
+      # #5145: an accepted write with no id cannot be read back at node 2, so it is not a PASS.
+      if [ -z "$QID" ]; then
+        no "quorum write at node 1 was accepted ($(reply_status "$qcode")) with no memory id; replication to node 2 cannot be checked"
+      elif ! plain_id "$QID"; then
+        : # one FAIL with one cause: the not-a-plain-id check below prints it, and no PASS precedes it
+      elif [ "$qcode" = 201 ]; then
+        ok "W-of-N quorum write at node 1 committed + replicated (201 quorum_met)"
+      else
+        ok "quorum write at node 1 locally durable (202; peer ack timing) -- the mesh channel carried it"
+      fi ;;
+    *)   no "quorum write at node 1 got '$(reply_status "$qcode")' ($(reply_len "$qjson"))"
+         QID="" ;; # a rejected write is not read back: node 2 must not print a PASS for it
   esac
+  if [ -n "$QID" ] && ! plain_id "$QID"; then
+    no "quorum write at node 1 returned a memory id that is not a plain id; it is not read back"
+    QID=""
+  fi
   if [ -n "$QID" ]; then
     landed=""
     for _ in $(seq 1 20); do
@@ -394,9 +576,9 @@ EOS
       sleep 2
     done
     if [ -n "$landed" ]; then
-      ok "quorum write replicated: id $QID readable at node 2"
+      ok "quorum write replicated: the memory id node 1 returned is readable at node 2"
     else
-      no "quorum write id $QID never appeared at node 2 (replication failure)"
+      no "quorum write never appeared at node 2 (replication failure)"
     fi
   fi
 
@@ -425,10 +607,17 @@ EOS
       scode=$(echo "$sresp" | tail -1)
       sjson=$(echo "$sresp" | sed '$d')
       SID=$(echo "$sjson" | jq -r '.id // empty' 2>/dev/null)
+      srefused=""
+      if [ -n "$SID" ] && ! plain_id "$SID"; then
+        no "signed write at node 1 returned a memory id that is not a plain id; it is not read back"
+        SID=""; srefused=1
+      fi
+      # A refused id is one failure with one cause: do not report it again as a rejected write.
       if [ "$scode" = "201" ] && [ -n "$SID" ]; then
-        ok "signed write accepted at node 1 (201 id=$SID)"
-      else
-        no "signed write at node 1 got '$scode' ($sjson)"
+        ok "signed write accepted at node 1 (201)"
+      elif [ -z "$srefused" ]; then
+        no "signed write at node 1 got '$(reply_status "$scode")' ($(reply_len "$sjson"))"
+        SID="" # a rejected write is not read back: node 2 must not print a PASS for it
       fi
       if [ -n "$SID" ]; then
         lvl=""
@@ -440,7 +629,7 @@ EOS
         case "$lvl" in
           agent_attested) ok "signed cross-peer write lands attest_level=agent_attested at node 2" ;;
           "")             no "signed write never reached node 2 (replication or author-enrollment failure)" ;;
-          *)              no "signed write reached node 2 at attest_level='$lvl' (expected agent_attested)" ;;
+          *)              no "signed write reached node 2 at an attest_level other than agent_attested ($(reply_len "$lvl"))" ;;
         esac
       fi
     fi
@@ -449,6 +638,8 @@ EOS
 
   echo "----"
   echo "federate verify: $pass PASS / $fail FAIL"
+  api_key=""
+  [ "$_fed_xtrace" = 1 ] && set -x
   [ "$fail" -eq 0 ]
 }
 

@@ -52,10 +52,10 @@ write_files:
         t1=$(now_ms)
         echo "store $code $((t1-t0))" >> "$OUT"
         cur_id=$(python3 -c 'import json,sys
-try: print(json.load(open(sys.argv[1])).get("id",""))
-except Exception: print("")' "$BODYF" 2>/dev/null || echo "")
+      try: print(json.load(open(sys.argv[1])).get("id",""))
+      except Exception: print("")' "$BODYF" 2>/dev/null || echo "")
         # link prev->cur -- exercises the AGE graph write path (the real
-        # per-module throughput bound; PgBouncer fixes fan-in, NOT AGE writes).
+        # per-module throughput bound).
         if [ -n "$prev_id" ] && [ -n "$cur_id" ]; then
           t0=$(now_ms)
           code=$(curl -s -o /dev/null -w '%%{http_code}' -X POST "$BASE/links" \
@@ -103,43 +103,43 @@ except Exception: print("")' "$BODYF" 2>/dev/null || echo "")
       wall=$(( $(date +%s) - start ))
       [ "$wall" -lt 1 ] && wall=1
       cat "$OUTDIR"/w*.txt 2>/dev/null | AGG_WALL="$wall" AGG_WORKERS="$WORKERS" python3 -c '
-import sys, os, json
-wall = float(os.environ.get("AGG_WALL", "1")) or 1.0
-workers = int(os.environ.get("AGG_WORKERS", "0"))
-ops = {}
-tot = 0; shed = 0
-for line in sys.stdin:
-    parts = line.split()
-    if len(parts) != 3:
-        continue
-    op, code, ms = parts
-    tot += 1
-    if code == "503":
-        shed += 1
-    d = ops.setdefault(op, {"lat": [], "count": 0})
-    d["count"] += 1
-    try:
-        d["lat"].append(int(ms))
-    except ValueError:
-        pass
-def pct(lat, p):
-    if not lat:
-        return 0
-    s = sorted(lat)
-    i = min(len(s) - 1, int(p / 100.0 * len(s)))
-    return s[i]
-out = {"workers": workers, "wall_secs": wall, "reqs": tot,
-       "shed": shed, "shed_rate": round((shed / tot) if tot else 0.0, 6), "ops": {}}
-for op, d in ops.items():
-    out["ops"][op] = {
-        "count": d["count"],
-        "ops_per_s": round(d["count"] / wall, 4),
-        "p50_ms": pct(d["lat"], 50),
-        "p95_ms": pct(d["lat"], 95),
-        "p99_ms": pct(d["lat"], 99),
-    }
-print(json.dumps(out))
-'
+      import sys, os, json
+      wall = float(os.environ.get("AGG_WALL", "1")) or 1.0
+      workers = int(os.environ.get("AGG_WORKERS", "0"))
+      ops = {}
+      tot = 0; shed = 0
+      for line in sys.stdin:
+          parts = line.split()
+          if len(parts) != 3:
+              continue
+          op, code, ms = parts
+          tot += 1
+          if code == "503":
+              shed += 1
+          d = ops.setdefault(op, {"lat": [], "count": 0})
+          d["count"] += 1
+          try:
+              d["lat"].append(int(ms))
+          except ValueError:
+              pass
+      def pct(lat, p):
+          if not lat:
+              return 0
+          s = sorted(lat)
+          i = min(len(s) - 1, int(p / 100.0 * len(s)))
+          return s[i]
+      out = {"workers": workers, "wall_secs": wall, "reqs": tot,
+             "shed": shed, "shed_rate": round((shed / tot) if tot else 0.0, 6), "ops": {}}
+      for op, d in ops.items():
+          out["ops"][op] = {
+              "count": d["count"],
+              "ops_per_s": round(d["count"] / wall, 4),
+              "p50_ms": pct(d["lat"], 50),
+              "p95_ms": pct(d["lat"], 95),
+              "p99_ms": pct(d["lat"], 99),
+          }
+      print(json.dumps(out))
+      '
       rm -rf "$OUTDIR"
   - path: /etc/systemd/system/loadgen.service
     permissions: '0644'

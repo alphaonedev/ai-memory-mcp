@@ -64,11 +64,16 @@ the operator triggers the paid steps.
 source <operator DO token vault>          # exports DIGITALOCEAN_TOKEN
 export AI_MEMORY_OPERATOR_DO_SPEND_APPROVED=1
 export TF_VAR_ssh_pubkey_fingerprint=<operator key fingerprint>
+export TF_VAR_ai_memory_image_url=<versioned sal-postgres tarball URL, never releases/latest>
+export TF_VAR_ai_memory_image_sha256=<lowercase hex SHA-256 of that tarball>
+#    (or leave both unset to supply the binary by scp, see step 1)
 
 # 1. Provision: 5 smallest load-gen droplets + one bumped substrate droplet.
 #    ai_memory_image_url MUST be a --features sal-postgres build (see the
-#    cloud-init-memory NOTE); scp a local sal-postgres binary over the
-#    provisioned one for an ad-hoc run.
+#    cloud-init-memory NOTE) and needs its digest in ai_memory_image_sha256
+#    (the launcher and the plan both refuse the URL without it); scp a local
+#    sal-postgres binary over /usr/local/lib/ai-memory/bin/ai-memory for an
+#    ad-hoc run with both left empty.
 cd infra/do-hive
 ./spawn.sh apply -var-file=measurement.tfvars    # MONEY-GATED, operator only
 
@@ -326,7 +331,7 @@ export SWARM_BASE_URL="https://$(terraform -chdir=infra/do-hive output -raw memo
 export SWARM_CLIENT_CERT="$PWD/.local-runs/do-hive-runs/<UTC>/loadgen/client.crt"
 export SWARM_CLIENT_KEY="$PWD/.local-runs/do-hive-runs/<UTC>/loadgen/client.key"
 export SWARM_CA_CERT="$PWD/.local-runs/do-hive-runs/<UTC>/loadgen/ca.crt"
-export SWARM_API_KEY="$(ssh root@"$(terraform -chdir=infra/do-hive output -raw memory_public_ip)" cat /etc/ai-memory/api-key)"
+export SWARM_API_KEY="$(cat "$PWD/.local-runs/do-hive-runs/<UTC>/loadgen/api-key")"  # 0600 file written by federate.sh loadgen
 PYTHONPATH=sdk/python python -m swarm
 # (On the f2 METAL tier the admin principal is one of the daemon's
 #  AI_MEMORY_ADMIN_AGENT_IDS instead: export SWARM_ADMIN_AGENT_ID=<that id>.)
@@ -334,7 +339,17 @@ PYTHONPATH=sdk/python python -m swarm
 infra/do-hive/teardown.sh
 ```
 
-The substrate is PostgreSQL 18.6, AGE 1.8.0, and pgvector 0.8.6. PgBouncer
-listens only on `127.0.0.1:6432`, uses transaction pooling, and admits 2000
-clients; the daemon points its store URL there so Phase A and Phase B share the
-same baseline.
+The substrate is PostgreSQL 18.6, AGE 1.8.0, and pgvector 0.8.6. The daemon
+connects straight to PostgreSQL on port 5432 over TLS with `sslmode=verify-full`
+(#4654); there is no PgBouncer on the path. Earlier campaign rounds ran the
+daemon through a transaction-pooling PgBouncer (`127.0.0.1:6432`, 2000 client
+admission, pool size 100), so results taken before this change and results taken
+after it are not like-for-like: the pooler hop and its pool are gone. Re-take
+the Phase A baseline on this topology before comparing it with Phase B, and do
+not compare either against an earlier round.
+
+The daemon's own connection pool defaults to 16 connections
+(`src/store/mod.rs:111`; the template sets no `AI_MEMORY_PG_POOL_MAX`), against
+PostgreSQL's `max_connections` default of 100 minus 3 reserved for superusers
+(`#max_connections = 100` and `#superuser_reserved_connections = 3` in
+`postgresql.conf.sample`; the template sets neither).

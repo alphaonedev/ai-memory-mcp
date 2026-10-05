@@ -84,12 +84,41 @@ GATE
   fi
 }
 
+# #4678/#4637: a non-empty ai_memory_image_url needs the pinned digest of that
+# tarball. The launcher names the missing input before terraform runs; a value
+# supplied through -var or -var-file is still caught by the memory droplet
+# precondition in main.tf. Both empty means the binary is supplied by scp.
+require_image_pin() {
+  if [[ -n "${TF_VAR_ai_memory_image_url:-}" && -z "${TF_VAR_ai_memory_image_sha256:-}" ]]; then
+    echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_sha256 must be set when TF_VAR_ai_memory_image_url is set (the lowercase hex SHA-256 of that versioned tarball; the node refuses a tarball it cannot verify)." >&2
+    exit 2
+  fi
+  if [[ "$(printf '%s' "${TF_VAR_ai_memory_image_url:-}" | tr '[:upper:]' '[:lower:]')" == *releases/latest* ]]; then
+    echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_url must be a versioned release URL; releases/latest moves and would not match the pinned digest." >&2
+    exit 2
+  fi
+  # curl removes dot segments before the request, so /releases/./latest and
+  # /releases/x/../latest fetch releases/latest. curl keeps an empty segment, but
+  # it names no versioned artifact, so an empty segment or trailing slash is
+  # refused too (main.tf refuses the same set).
+  local path="/${TF_VAR_ai_memory_image_url#https://}/"
+  if [[ "$path" == *//* || "$path" == */./* || "$path" == */../* ]] && [[ -n "${TF_VAR_ai_memory_image_url:-}" ]]; then
+    echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_url must not contain an empty, . or .. path segment or a trailing slash (curl removes . and .., and an empty segment names no versioned artifact)." >&2
+    exit 2
+  fi
+  if [[ -n "${TF_VAR_ai_memory_image_url:-}" ]] && ! [[ "${TF_VAR_ai_memory_image_url}" =~ ^https://[0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ][0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ._~/-]*$ ]]; then
+    echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_url must be https:// followed only by letters, digits and ._~/- (it is written into a root-run script)." >&2
+    exit 2
+  fi
+}
+
 case "${cmd}" in
   cost)
     print_cost
     ;;
   plan)
     print_cost
+    require_image_pin
     terraform init -input=false
     # #2850: forward extra CLI args (e.g. -var memory_count=2) to terraform.
     # Without this the documented recipe `spawn.sh apply -var memory_count=2`
@@ -100,6 +129,7 @@ case "${cmd}" in
   apply)
     print_cost
     require_money_gate
+    require_image_pin
     terraform init -input=false
     mkdir -p "${SCRATCH_ROOT}/${NOW}"
     # #2850: forward extra CLI args (e.g. -var memory_count=2) — see plan case.

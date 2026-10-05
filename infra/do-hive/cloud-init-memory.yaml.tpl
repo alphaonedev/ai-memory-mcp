@@ -29,12 +29,10 @@ bootcmd:
   - [bash, -c, "[ -d /etc/ai-memory ] || (umask 077 && mkdir /etc/ai-memory)"]
   # PG 18 is supplied by PGDG on Ubuntu Noble. Install the signed repository
   # before cloud-init's packages module runs; never fall back to Ubuntu's PG16.
-  - [bash, -c, "install -d -m 0755 /usr/share/postgresql-common/pgdg && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"]
-  - [bash, -c, "echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' > /etc/apt/sources.list.d/pgdg.list && apt-get update"]
+  - [bash, -c, "set -e; install -d -m 0755 /usr/share/postgresql-common/pgdg; rm -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc.new; curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc.new; echo '0144068502a1eddd2a0280ede10ef607d1ec592ce819940991203941564e8e76  /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc.new' | sha256sum -c -; mv -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc.new /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' > /etc/apt/sources.list.d/pgdg.list; apt-get update"]
 packages:
   - postgresql-18=18.6-1.pgdg24.04+2
   - postgresql-server-dev-18=18.6-1.pgdg24.04+2
-  - pgbouncer
   - build-essential
   - flex
   - bison
@@ -43,6 +41,7 @@ packages:
   - git
   - curl
   - jq
+  - openssl
 write_files:
   # #4577: the Postgres DSN (it carries the db password) reaches the daemon
   # through AI_MEMORY_STORE_URL_FILE, never on the serve argv where every local
@@ -52,11 +51,18 @@ write_files:
   # is what keeps other UIDs out during it. provision.sh hands the file to the
   # aimemory service user once that user exists (serve refuses a file with any
   # group/world mode bit, src/store_url.rs). A trailing newline is trimmed.
+  # #4654: the daemon connects straight to Postgres on the default port 5432
+  # (no pooler) with sslmode=verify-full against the CA that provision.sh mints
+  # (#4635); the host is localhost, which the certificate's SAN covers (with 127.0.0.1 and ::1).
+  # CHANGEME is a placeholder, not a credential: no Terraform secret is
+  # interpolated into user-data, which droplet metadata serves to any local
+  # process. provision.sh replaces it with a random role password minted on the
+  # node, and reads the role password from this one file (as in the AWS template).
   - path: /etc/ai-memory/store-url
     permissions: '0600'
     owner: root:root
     content: |
-      postgres://aimemory:${db_password}@127.0.0.1:6432/aimemory
+      postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt
   - path: /etc/systemd/system/ai-memory.service
     permissions: '0644'
     content: |
@@ -73,8 +79,12 @@ write_files:
       # ai-memory.db (deferred-audit journal + federation nonce cache). With no
       # WorkingDirectory systemd's default CWD is /, which User=aimemory cannot
       # write, so the open fails SQLITE_CANTOPEN (exit 75). Give it the aimemory
-      # home (writable) as CWD so the relative ai-memory.db lands there.
-      WorkingDirectory=/opt/ai-memory
+      # home (writable) as CWD so the relative ai-memory.db lands there. The
+      # home is /var/lib/ai-memory, NOT /opt/ai-memory, and the binary lives in
+      # the root-owned /usr/local/lib/ai-memory/bin, outside every directory the
+      # service user can write, so nothing it can write is ever executed by
+      # root (#4674, #4712).
+      WorkingDirectory=/var/lib/ai-memory
       Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
       Environment=AI_MEMORY_PERMISSIONS_MODE=enforce
       Environment=AI_MEMORY_AUTONOMOUS_HOOKS=0
@@ -82,7 +92,7 @@ write_files:
       # Public binding is permitted only with TLS + fingerprint-pinned mTLS.
       # Request authn additionally uses the per-node API key; header trust stays off.
       EnvironmentFile=/etc/ai-memory/fed/runtime.env
-      ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist
+      ExecStart=/usr/local/lib/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist
       Restart=on-failure
       RestartSec=5
 
@@ -186,10 +196,10 @@ write_files:
       Environment=AI_MEMORY_FED_IDENTITY=${fed_identity}
       Environment=AI_MEMORY_KEY_DIR=/etc/ai-memory/keys
       Environment=XDG_CONFIG_HOME=/etc/ai-memory/xdg
-      Environment=HOME=/opt/ai-memory
+      Environment=HOME=/var/lib/ai-memory
       EnvironmentFile=/etc/ai-memory/fed/peers.conf
       ExecStart=
-      ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist%{ if federation_enabled } --quorum-writes ${quorum_writes} --quorum-peers $${AI_MEMORY_QUORUM_PEERS} --quorum-client-cert /etc/ai-memory/fed/node.crt --quorum-client-key /etc/ai-memory/fed/node.key --quorum-ca-cert /etc/ai-memory/fed/ca.crt --quorum-timeout-ms 8000%{ endif }
+      ExecStart=/usr/local/lib/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist%{ if federation_enabled } --quorum-writes ${quorum_writes} --quorum-peers $${AI_MEMORY_QUORUM_PEERS} --quorum-client-cert /etc/ai-memory/fed/node.crt --quorum-client-key /etc/ai-memory/fed/node.key --quorum-ca-cert /etc/ai-memory/fed/ca.crt --quorum-timeout-ms 8000%{ endif }
   - path: /etc/systemd/system/ai-memory-fed-bootstrap.service
     permissions: '0644'
     content: |
@@ -207,12 +217,18 @@ write_files:
       # race it with a Restart= of its own. Re-run after fixing a problem
       # with: systemctl restart ai-memory-fed-bootstrap
       TimeoutStartSec=0
-      ExecStart=/opt/ai-memory/fed-bootstrap.sh
+      ExecStart=/usr/local/sbin/ai-memory-fed-bootstrap.sh
 
       [Install]
       WantedBy=multi-user.target
-  - path: /opt/ai-memory/fed-bootstrap.sh
+  # #4674: the two scripts root runs (this unit has no User=; provision.sh is
+  # run by runcmd) live in /usr/local/sbin, root:root 0755 under root-owned,
+  # non-group/other-writable parents. They must never sit in a directory the
+  # aimemory service user owns: it could rewrite them and gain root at the next
+  # boot or bootstrap restart.
+  - path: /usr/local/sbin/ai-memory-fed-bootstrap.sh
     permissions: '0755'
+    owner: root:root
     content: |
       #!/usr/bin/env bash
       # =================================================================
@@ -255,8 +271,8 @@ write_files:
       FED_DIR=/etc/ai-memory/fed
       KEY_DIR=/etc/ai-memory/keys
       XDG_DIR=/etc/ai-memory/xdg
+      BIN=/usr/local/lib/ai-memory/bin/ai-memory
       FED_ID='${fed_identity}'
-      BIN=/opt/ai-memory/bin/ai-memory
       ADMIN_ID=ai:hive-admin
       LOCAL=https://127.0.0.1:9077
       MATERIAL_TRIES=720
@@ -281,12 +297,14 @@ write_files:
       # --- A. mint this node's federation identity ---------------------
       [ -x "$BIN" ] || fail "no ai-memory binary at $BIN; scp a --features sal-postgres build over it, then: systemctl restart ai-memory-fed-bootstrap"
       if [ ! -f "$KEY_DIR/$FED_ID.priv" ]; then
-        sudo -u aimemory env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_DB=/opt/ai-memory/identity.db \
-          /opt/ai-memory/bin/ai-memory identity generate --agent-id "$FED_ID" --key-dir "$KEY_DIR" \
+        sudo -u aimemory env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_DB=/var/lib/ai-memory/identity.db \
+          /usr/local/lib/ai-memory/bin/ai-memory identity generate --agent-id "$FED_ID" --key-dir "$KEY_DIR" \
           || fail "identity generate failed for $FED_ID"
       fi
-      cp "$KEY_DIR/$FED_ID.pub" "$FED_DIR/$FED_ID.pub"
-      chmod 0644 "$FED_DIR/$FED_ID.pub"
+      runuser -u aimemory -- cat "$KEY_DIR/$FED_ID.pub" > "$FED_DIR/$FED_ID.pub.new" \
+        || fail "cannot copy the public key $KEY_DIR/$FED_ID.pub as the service user"
+      chmod 0644 "$FED_DIR/$FED_ID.pub.new"
+      mv -f "$FED_DIR/$FED_ID.pub.new" "$FED_DIR/$FED_ID.pub"
       echo "[fed-bootstrap] published $FED_DIR/$FED_ID.pub (public half only) for cross-enrollment"
 
       # --- B. local api_key + admin allowlist --------------------------
@@ -300,27 +318,24 @@ write_files:
       chown root:aimemory /etc/ai-memory/api-key
       chmod 0640 /etc/ai-memory/api-key
       API_KEY="$(cat /etc/ai-memory/api-key)"
+      # The key is spliced into a curl config line and a TOML string below; only
+      # the minted 64-hex form can carry no quote or newline, so refuse anything else.
+      [[ "$API_KEY" =~ ^[0123456789abcdef]{64}$ ]] || fail "/etc/ai-memory/api-key is not 64 lowercase hex"
       # The umask subshell matters: config.toml carries the api_key, so it must
       # never exist even momentarily at the inherited 0644.
       # #2852: the daemon's config resolver (AppConfig::config_path,
       # src/config.rs) reads $HOME/.config/ai-memory/config.toml and IGNORES
-      # XDG_CONFIG_HOME. In the serve drop-in $HOME=/opt/ai-memory, so the daemon
-      # loads /opt/ai-memory/.config/ai-memory/config.toml. Writing the api_key
+      # XDG_CONFIG_HOME. In the serve drop-in $HOME=/var/lib/ai-memory, so the daemon
+      # loads /var/lib/ai-memory/.config/ai-memory/config.toml. Writing the api_key
       # config to $XDG_DIR left it UNREAD and serve fail-closed on the 0.0.0.0
       # bind ("api_key is unset", exit 75). Write to the path the daemon loads.
-      DAEMON_CFG_DIR=/opt/ai-memory/.config/ai-memory
-      install -d -o aimemory -g aimemory -m 0750 "$DAEMON_CFG_DIR"
+      DAEMON_CFG_DIR=/var/lib/ai-memory/.config/ai-memory
       ( umask 077
-        cat > "$DAEMON_CFG_DIR/config.toml" <<CFG
-      schema_version = 2
-      api_key = "$API_KEY"
-
-      [admin]
-      agent_ids = ["$ADMIN_ID"]
-      CFG
+        runuser -u aimemory -- mkdir -p "$DAEMON_CFG_DIR" \
+          && printf 'schema_version = 2\napi_key = "%s"\n\n[admin]\nagent_ids = ["%s"]\n' "$API_KEY" "$ADMIN_ID" \
+            | runuser -u aimemory -- tee "$DAEMON_CFG_DIR/config.toml.new" >/dev/null \
+          && runuser -u aimemory -- mv -f "$DAEMON_CFG_DIR/config.toml.new" "$DAEMON_CFG_DIR/config.toml"
       ) || fail "could not write the daemon config"
-      chown root:aimemory "$DAEMON_CFG_DIR/config.toml"
-      chmod 0640 "$DAEMON_CFG_DIR/config.toml"
       # Unit environment is explicit and auditable. Header trust is
       # intentionally absent/off: the mTLS-enrolled load generator must also
       # present this node's API key before its admin agent id is considered.
@@ -376,13 +391,17 @@ write_files:
       PEER_PUBS=$(ls -1 "$FED_DIR"/peers/*.pub 2>/dev/null | wc -l)
 %{ if federation_enabled }
       [ "$PEER_PUBS" -ge 1 ] || fail "no peer public keys under $FED_DIR/peers"
-      cp "$FED_DIR"/peers/*.pub "$KEY_DIR"/ || fail "could not install peer public keys"
 %{ endif }
-      chown -R aimemory:aimemory "$KEY_DIR"
       # $FED_DIR stays root-owned (custody split above); the daemon reads it as
       # group aimemory and cannot rewrite its own trust anchors.
       chown -R root:aimemory "$FED_DIR"
       chmod 0750 "$FED_DIR" "$FED_DIR/peers"
+%{ if federation_enabled }
+      chmod 0644 "$FED_DIR"/peers/*.pub
+      # Copied as the service user: $KEY_DIR is the service user's directory, so
+      # root never writes through a link planted there.
+      runuser -u aimemory -- cp "$FED_DIR"/peers/*.pub "$KEY_DIR"/ || fail "could not install peer public keys"
+%{ endif }
       chmod 0640 "$FED_DIR/node.key"
       chmod 0644 "$FED_DIR/ca.crt" "$FED_DIR/node.crt" "$FED_DIR/peers.allowlist" "$FED_DIR/peers.conf"
       echo "[fed-bootstrap] enrolled $PEER_PUBS peer public key(s) into $KEY_DIR"
@@ -427,9 +446,9 @@ write_files:
       AUTHOR_ID="$(cat "$FED_DIR/author.id")"
       AUTHOR_PUB="$(cat "$FED_DIR/author.pub")"
       admin_call() {
-        curl -sS --max-time 15 \
+        printf 'header = "x-api-key: %s"\n' "$API_KEY" | curl -sS --max-time 15 --config - \
           --cacert "$FED_DIR/ca.crt" --cert "$FED_DIR/node.crt" --key "$FED_DIR/node.key" \
-          -H "content-type: application/json" -H "x-api-key: $API_KEY" -H "x-agent-id: $ADMIN_ID" \
+          -H "content-type: application/json" -H "x-agent-id: $ADMIN_ID" \
           -o /dev/null -w '%%{http_code}' "$@" 2>/dev/null
       }
       i=0
@@ -452,19 +471,82 @@ write_files:
 
       : > "$FED_DIR/MESH-READY"
       echo "[fed-bootstrap] MESH READY node ${node_index}/${node_count} identity=$FED_ID peers=$PEERS author=$AUTHOR_ID"
-  - path: /opt/ai-memory/provision.sh
+  - path: /usr/local/sbin/ai-memory-provision.sh
     permissions: '0755'
+    owner: root:root
     content: |
       #!/usr/bin/env bash
-      set -euxo pipefail
-      exec > >(tee -a /var/log/ai-memory-provision.log) 2>&1
+      set -euo pipefail
+      # No `set -x` and a root-only log: the role password and the store URL
+      # pass through this script (#4638).
+      # Create the log root-only WITHOUT truncating it: a re-run must keep the
+      # record of a failed first run (#4709).
+      ( umask 077; : >> /var/log/ai-memory-provision.log ); chmod 0600 /var/log/ai-memory-provision.log
+      exec >> /var/log/ai-memory-provision.log 2>&1
       echo "=== ai-memory postgres+AGE+pgvector provision $(date -u) ==="
 
       # --- user + dirs ---
-      id aimemory >/dev/null 2>&1 || useradd -m -d /opt/ai-memory -s /bin/bash aimemory
-      mkdir -p /opt/ai-memory/bin /var/log/ai-memory
-      chown -R aimemory:aimemory /opt/ai-memory /var/log/ai-memory
-      # #4577: hand the DSN file to the service user (mode stays 0600).
+      # #4674/#4712: the service user's home (data, ai-memory.db, .config) is
+      # /var/lib/ai-memory. The binary lives in /usr/local/lib/ai-memory/bin,
+      # root:root 0755 (nothing here is recursively chowned to aimemory), and
+      # only the paths the daemon writes are handed to it.
+      id aimemory >/dev/null 2>&1 || useradd -m -d /var/lib/ai-memory -s /bin/bash aimemory
+      install -d -o root -g root -m 0755 /usr/local/lib/ai-memory /usr/local/lib/ai-memory/bin
+      install -d -o aimemory -g aimemory -m 0750 /var/lib/ai-memory /var/log/ai-memory
+      # #4577/#4619: the service user traverses /etc/ai-memory and owns the DSN
+      # file (mode stays 0600).
+      chown root:aimemory /etc/ai-memory
+      chmod 0750 /etc/ai-memory
+      # The role password is minted here, on the node, from the placeholder
+      # (hex, so it needs no URL or SQL quoting); a re-run keeps the one the
+      # file already carries. The file is only ever read with a fixed sed -n
+      # expression and written with the shell's own printf, so the gate can show
+      # (rule R5) that no command runs it, and the secret is on no argv (#5428).
+      # Every such sed runs under LC_ALL=C, so a class or a dot matches one byte
+      # whatever the node's locale (#5807): a byte that is not valid UTF-8 can
+      # not hide the password and turn a kept file into a fresh mint.
+      # A file with no postgres://aimemory:...@ line (empty, or another scheme or user)
+      # is replaced by a freshly minted URL, not kept.
+      URL="$(LC_ALL=C sed -n 's#^\(.*CHANGEME.*\)#\1#p' /etc/ai-memory/store-url)"
+      CUR="$(LC_ALL=C sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+      if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ]; then
+        NEW_HEX="$(openssl rand -hex 24)"
+        if [ "$CUR" = CHANGEME ]; then
+          printf '%s\n' "$${URL/CHANGEME/$NEW_HEX}" > /etc/ai-memory/store-url
+        else
+          printf 'postgres://%s@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt\n' "aimemory:$NEW_HEX" > /etc/ai-memory/store-url
+        fi
+        unset NEW_HEX
+      fi
+      # Fail closed: the daemon trims the file and reads all the rest as one URL,
+      # so the file must hold exactly one non-empty line (#5521), that line must
+      # have the URL shape (a password of unreserved or %-escaped characters, and
+      # printable ASCII characters only: no space, CR or other control or high
+      # byte), and the shipped placeholder must never reach a running node
+      # (#5640). Each refusal names its cause. The shape sed runs under LC_ALL=C,
+      # so its classes match ASCII bytes alone whatever the node's locale (#5764).
+      # Every line is printed behind an x, so none is empty and each is counted
+      # whatever bytes it holds; an empty line prints a lone x. The file holds one
+      # non-empty line when it has a line and as many newlines between its lines
+      # as it has empty lines.
+      printf -v NL '\n'
+      ALL="$(LC_ALL=C sed -n 's#^#x#p' /etc/ai-memory/store-url)"
+      BLANK="$(LC_ALL=C sed -n 's#^$#x#p' /etc/ai-memory/store-url)"
+      GAPS="$${ALL//[!$NL]/}"
+      EMPTY="$${BLANK//$NL/}"
+      if [ -z "$ALL" ] || [ "$${#GAPS}" != "$${#EMPTY}" ]; then
+        echo "store-url must hold exactly one non-empty line: /etc/ai-memory/store-url"; exit 1
+      fi
+      # The scheme is written postgres[:]// so that no scan reads this pattern
+      # as a URL whose password is the bracket text (#5640).
+      SHAPED="$(LC_ALL=C sed -n 's#^postgres[:]//aimemory:[[:alnum:]%._~-]\{1,\}@[[:graph:]]\{1,\}$#url#p' /etc/ai-memory/store-url)"
+      if [ "$SHAPED" != url ]; then
+        echo "store-url line is not one aimemory URL of printable ASCII characters with an unreserved password: /etc/ai-memory/store-url"; exit 1
+      fi
+      CUR="$(LC_ALL=C sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+      if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ] || [[ "$CUR" == *[[:space:]]* ]]; then
+        echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1
+      fi
       chown aimemory:aimemory /etc/ai-memory/store-url
       chmod 0600 /etc/ai-memory/store-url
 
@@ -509,17 +591,101 @@ write_files:
         make install PG_CONFIG=/usr/bin/pg_config
       fi
 
-      # --- preload AGE + restart postgres ---
+      # --- PostgreSQL server TLS (#4635) ---------------------------------
+      # The store URL pins sslmode=verify-full (the connect funnel refuses
+      # anything weaker: src/store/postgres/dsn.rs:213-283, floor
+      # src/transit_encryption.rs:436-446). A local RSA CA signs a server
+      # cert whose SAN is the host the URL dials (localhost). RSA, not
+      # Ed25519: RSA keeps the chain usable by libpq clients such as psql with channel_binding (#2658); the daemon itself does not channel-bind.
+      # Shape follows infra/do-hive/crypto/gen-certs.sh:62-72 and :97-99 (RSA CA 4096,
+      # leaf 2048, CA-signed, SAN = dialed host) and the hostssl pg_hba of
+      # infra/do-hive/crypto/test-pg-verifyfull.sh (hostssl, scram-sha-256).
+      TLSD=/etc/ai-memory/tls
+      PGTLS=/etc/postgresql/18/main/tls
+      # #4675/#4698: the CA private key exists only in RAM (/run, tmpfs, no
+      # swap) while the leaf is signed, and is wiped on every success, failure
+      # or exit, so a compromised node cannot mint certificates the daemon
+      # would trust.
+      PGCA=/run/ai-memory-pgca
+      wipe_pgca() { rm -rf "$PGCA"; }
+      trap wipe_pgca EXIT
+      install -d -o root -g aimemory -m 0750 "$TLSD"
+      # An earlier image kept the CA key here: remove it unconditionally.
+      rm -f "$TLSD/pg-ca.key" "$TLSD/pg-ca.srl"
+      if [ ! -s "$TLSD/pg-ca.crt" ] || [ ! -s "$PGTLS/server.key" ]; then
+        [ "$(findmnt -n -o FSTYPE --target /run)" = tmpfs ] \
+          || { echo "/run is not tmpfs: refusing to write the CA key"; exit 1; }
+        [ -z "$(swapon --show --noheadings)" ] \
+          || { echo "swap is active: refusing to write the CA key"; exit 1; }
+        wipe_pgca
+        install -d -m 0700 "$PGCA"
+        ( umask 077
+          openssl genrsa -out "$PGCA/pg-ca.key" 4096
+          openssl req -x509 -new -key "$PGCA/pg-ca.key" -sha256 -days 365 \
+            -subj "/CN=ai-memory-hive-pg-CA" -out "$PGCA/pg-ca.crt"
+          openssl genrsa -out "$PGCA/pg-server.key" 2048
+          openssl req -new -key "$PGCA/pg-server.key" -subj "/CN=localhost" \
+            -out "$PGCA/pg-server.csr"
+          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:0:0:0:0:0:0:0:1\n' \
+            > "$PGCA/pg-server.ext"
+          openssl x509 -req -in "$PGCA/pg-server.csr" -CA "$PGCA/pg-ca.crt" \
+            -CAkey "$PGCA/pg-ca.key" -CAcreateserial -days 365 -sha256 \
+            -extfile "$PGCA/pg-server.ext" -out "$PGCA/pg-server.crt" ) \
+          || { echo "could not mint the postgres TLS pair"; exit 1; }
+        install -o root -g aimemory -m 0644 "$PGCA/pg-ca.crt" "$TLSD/pg-ca.crt"
+        install -d -o postgres -g postgres -m 0700 "$PGTLS"
+        install -o postgres -g postgres -m 0600 "$PGCA/pg-server.key" "$PGTLS/server.key"
+        install -o postgres -g postgres -m 0644 "$PGCA/pg-server.crt" "$PGTLS/server.crt"
+        wipe_pgca
+      fi
+      # The service user reads only the CA certificate (the trust anchor).
+      chown root:aimemory "$TLSD/pg-ca.crt"
+      chmod 0644 "$TLSD/pg-ca.crt"
+
+      # --- preload AGE + TLS settings + restart postgres ---
       PGCONF="/etc/postgresql/18/main/postgresql.conf"
       if ! grep -q "shared_preload_libraries.*age" "$PGCONF"; then
         echo "shared_preload_libraries = 'age'" >> "$PGCONF"
       fi
+      # Appended last, so it overrides the packaged snakeoil ssl settings.
+      if ! grep -q "^# ai-memory-tls (#4635)" "$PGCONF"; then
+        printf '%s\n' "# ai-memory-tls (#4635)" "ssl = on" \
+          "ssl_cert_file = '$PGTLS/server.crt'" "ssl_key_file = '$PGTLS/server.key'" \
+          "ssl_min_protocol_version = 'TLSv1.2'" >> "$PGCONF"
+      fi
+      # No role may log in to any database, or open a physical-replication
+      # connection, over TCP without TLS (#4676): the first two lines reject
+      # every non-TLS TCP attempt (hostnossl, all roles, all addresses; `all`
+      # does not match the replication pseudo-database, so it has its own line),
+      # so the packaged `host all all` and `host replication all` lines below
+      # are only reachable over TLS (first matching line wins). Unix-socket
+      # `local` lines are unaffected.
+      HBA="/etc/postgresql/18/main/pg_hba.conf"
+      if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then
+        { printf '%s\n' "# ai-memory-tls (#4635)" \
+            "hostnossl all all all reject" \
+            "hostnossl replication all all reject" \
+            "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256" \
+            "hostssl aimemory aimemory ::1/128 scram-sha-256"
+          cat "$HBA"; } > "$HBA.new"
+        chown --reference="$HBA" "$HBA.new"
+        chmod --reference="$HBA" "$HBA.new"
+        mv "$HBA.new" "$HBA"
+      fi
       systemctl restart postgresql
       sleep 5
 
-      # --- db + role + extensions (idempotent) ---
+      # --- db + role + extensions (idempotent). The role password is read
+      # from the store-url file and reaches psql on stdin, never on an argv.
+      # The DSN userinfo is percent-decoded here the way the daemon's URL parser
+      # decodes it, and any single quote is doubled for the SQL literal. psql runs with ON_ERROR_STOP so a failed statement
+      # stops the script instead of falling through to CREATE DATABASE.
+      DB_PASS="$(LC_ALL=C sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+      [ -n "$DB_PASS" ] || { echo "no db password in /etc/ai-memory/store-url"; exit 1; }
       sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1 || \
-        sudo -u postgres psql -c "CREATE USER aimemory WITH PASSWORD '${db_password}';"
+        printf '%s' "$DB_PASS" \
+          | python3 -c 'import sys,urllib.parse as u;p=u.unquote(sys.stdin.read());q=chr(39);print("CREATE USER aimemory WITH PASSWORD "+q+p.replace(q,q+q)+q+";")' \
+          | sudo -u postgres psql -v ON_ERROR_STOP=1
       sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='aimemory'" | grep -q 1 || \
         sudo -u postgres psql -c "CREATE DATABASE aimemory OWNER aimemory;"
       sudo -u postgres psql -d aimemory -c "CREATE EXTENSION IF NOT EXISTS vector;"
@@ -528,38 +694,41 @@ write_files:
       sudo -u postgres psql -d aimemory -c "GRANT ALL ON SCHEMA ag_catalog TO aimemory;" || true
       sudo -u postgres psql -d aimemory -c "SELECT extname, extversion FROM pg_extension WHERE extname IN ('vector','age');"
 
-      # Transaction pooling is part of the Phase-A baseline so Phase-B results
-      # remain comparable. PostgreSQL stays loopback-only behind PgBouncer.
-      cat > /etc/pgbouncer/pgbouncer.ini <<'PGB'
-      [databases]
-      aimemory = host=127.0.0.1 port=5432 dbname=aimemory
-      [pgbouncer]
-      listen_addr = 127.0.0.1
-      listen_port = 6432
-      auth_type = scram-sha-256
-      auth_file = /etc/pgbouncer/userlist.txt
-      pool_mode = transaction
-      max_client_conn = 2000
-      default_pool_size = 100
-      PGB
-      printf '"aimemory" "${db_password}"\n' > /etc/pgbouncer/userlist.txt
-      chown postgres:postgres /etc/pgbouncer/pgbouncer.ini /etc/pgbouncer/userlist.txt
-      chmod 0600 /etc/pgbouncer/userlist.txt
-      systemctl enable --now pgbouncer
-
       echo "PostgreSQL: $(sudo -u postgres psql -Atc 'SELECT version()')"
       sudo -u postgres psql -d aimemory -Atc "SELECT extname || ': ' || extversion FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname"
 
       # --- ai-memory binary (operator-published sal-postgres tarball) ---
       # NOTE: the binary MUST be compiled with --features sal-postgres for the
-      # postgres+AGE path. For ad-hoc runs the operator scp's a local build over
-      # this and `systemctl restart ai-memory`.
+      # postgres+AGE path. For ad-hoc runs the operator leaves ai_memory_image_url
+      # empty, scp's a local build over /usr/local/lib/ai-memory/bin/ai-memory and runs
+      # `systemctl restart ai-memory`.
+      # #4637 (form copied from infra/aws-gpu-burst/cloud-init-memory.yaml.tpl):
+      # the tarball is downloaded into a root-only directory, its SHA-256 is
+      # checked against the operator-supplied digest BEFORE it is extracted, and
+      # the version probe runs as the unprivileged service user, so the
+      # unverified download is not executed as root. A mismatch (or a malformed
+      # digest) stops the script before the systemctl enable line below.
       if [ -n "${ai_memory_image_url}" ]; then
-        curl -fsSL "${ai_memory_image_url}" -o /opt/ai-memory/ai-memory.tar.gz || true
-        tar -xzf /opt/ai-memory/ai-memory.tar.gz -C /opt/ai-memory/bin || true
-        chmod 0755 /opt/ai-memory/bin/ai-memory || true
+        DL=/var/cache/ai-memory-provision
+        install -d -m 0700 "$DL"
+        curl -fsSL "${ai_memory_image_url}" -o "$DL/ai-memory.tar.gz"
+        echo "${ai_memory_image_sha256}  $DL/ai-memory.tar.gz" | sha256sum -c - \
+          || { echo "ai-memory tarball digest mismatch"; rm -f "$DL/ai-memory.tar.gz"; exit 1; }
+        # #4673/#4665: extract only the one member into a root-only staging dir
+        # (never into a directory the service user can write). #4697: the member
+        # must be a regular file, not a symlink install would dereference.
+        # #4712: the binary goes to the root-owned /usr/local/lib/ai-memory/bin,
+        # outside the service home, so the service user cannot rename its
+        # directory aside and substitute it.
+        rm -rf "$DL/x"
+        install -d -m 0700 "$DL/x"
+        tar -xzf "$DL/ai-memory.tar.gz" --no-same-owner -C "$DL/x" ai-memory
+        [ -f "$DL/x/ai-memory" ] && [ ! -L "$DL/x/ai-memory" ] \
+          || { echo "tarball member ai-memory is not a regular file"; exit 1; }
+        install -o root -g root -m 0755 "$DL/x/ai-memory" /usr/local/lib/ai-memory/bin/ai-memory
+        rm -rf "$DL/x"
+        runuser -u aimemory -- /usr/local/lib/ai-memory/bin/ai-memory --version
       fi
-      chown -R aimemory:aimemory /opt/ai-memory
 
       systemctl daemon-reload
       # TLS is universal: do NOT start serve here. The overlay binds
@@ -567,11 +736,11 @@ write_files:
       # peer list, so an early start would just crash-loop. The one-shot
       # bootstrap unit owns the ordering; --no-block keeps cloud-init's runcmd
       # from hanging on a unit that legitimately waits for the operator.
-      if [ -x /opt/ai-memory/bin/ai-memory ]; then
+      if [ -x /usr/local/lib/ai-memory/bin/ai-memory ]; then
         systemctl enable ai-memory || true
       fi
       systemctl enable ai-memory-fed-bootstrap || true
       systemctl start --no-block ai-memory-fed-bootstrap || true
       echo "=== provision complete $(date -u) ==="
 runcmd:
-  - bash /opt/ai-memory/provision.sh
+  - bash /usr/local/sbin/ai-memory-provision.sh

@@ -159,8 +159,8 @@ write_files:
       # anything weaker: src/store/postgres/dsn.rs:213-283, floor
       # src/transit_encryption.rs:436-446). A local RSA CA signs a server
       # cert whose SAN is the host the URL dials (localhost). RSA, not
-      # Ed25519: libpq channel binding has no digest for Ed25519 (#2658).
-      # Shape follows infra/do-hive/crypto/gen-certs.sh:40-56 (RSA CA 4096,
+      # Ed25519: RSA keeps the chain usable by libpq clients such as psql with channel_binding (#2658); the daemon itself does not channel-bind.
+      # Shape follows infra/do-hive/crypto/gen-certs.sh:62-72 and :97-99 (RSA CA 4096,
       # leaf 2048, CA-signed, SAN = dialed host) and the hostssl pg_hba of
       # infra/do-hive/crypto/test-pg-verifyfull.sh (hostssl, scram-sha-256).
       TLSD=/etc/ai-memory/tls
@@ -219,14 +219,20 @@ write_files:
           "ssl_cert_file = '$PGTLS/server.crt'" "ssl_key_file = '$PGTLS/server.key'" \
           "ssl_min_protocol_version = 'TLSv1.2'" >> "$PGCONF"
       fi
-      # aimemory may only connect with TLS over TCP: hostssl lines first, then
-      # a reject for any non-TLS TCP attempt (first matching line wins).
+      # No role may log in to any database, or open a physical-replication
+      # connection, over TCP without TLS (#4676): the first two lines reject
+      # every non-TLS TCP attempt (hostnossl, all roles, all addresses; `all`
+      # does not match the replication pseudo-database, so it has its own line),
+      # so the packaged `host all all` and `host replication all` lines below
+      # are only reachable over TLS (first matching line wins). Unix-socket
+      # `local` lines are unaffected.
       HBA="/etc/postgresql/18/main/pg_hba.conf"
       if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then
         { printf '%s\n' "# ai-memory-tls (#4635)" \
+            "hostnossl all all all reject" \
+            "hostnossl replication all all reject" \
             "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256" \
-            "hostssl aimemory aimemory ::1/128 scram-sha-256" \
-            "hostnossl aimemory aimemory all reject"
+            "hostssl aimemory aimemory ::1/128 scram-sha-256"
           cat "$HBA"; } > "$HBA.new"
         chown --reference="$HBA" "$HBA.new"
         chmod --reference="$HBA" "$HBA.new"

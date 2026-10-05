@@ -147,6 +147,13 @@ TF_VALUE = "${tf\x03value}"
 CONTROL_RE = re.compile("[\x00-\x08\x0e-\x1b\x1f\x7f]")
 TEMPLATE_GLOB = "infra/*/cloud-init-memory*.tpl"
 ALLOW_FILE = ROOT / "scripts" / "qc-allowlists" / "cloud-init-token-allow.txt"
+HBA_CAT = 'cat "$HBA"; } > "$HBA.new"'
+HBA_ORDER = ['HBA="/etc/postgresql/18/main/pg_hba.conf"', 'if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then', HBA_CAT,
+             'chown --reference="$HBA" "$HBA.new"', 'chmod --reference="$HBA" "$HBA.new"', 'mv "$HBA.new" "$HBA"', "fi"]
+HBA_SHAPE = set(HBA_ORDER[:-1])
+HBA_PIN = "the pinned pg_hba write (HBA_ORDER in scripts/check-cloud-init-serve-flags.py)"
+HBA_PRINTF_RE = re.compile(r"""^\{ printf (?:'%s\\n'|"%s\\n") """)
+HBA_OPENER_RE = re.compile(r"(?:\bthen|\bdo|\belse|\bin|\{|\(|&&|\|\||\|)$")
 PENDING_FILE = ROOT / "scripts" / "qc-allowlists" / "cloud-init-token-pending.txt"
 AWS_TEMPLATE = "infra/aws-gpu-burst/cloud-init-memory.yaml.tpl"
 DO_TEMPLATE = "infra/do-hive/cloud-init-memory.yaml.tpl"
@@ -2145,6 +2152,14 @@ def dsn_problems(dsn: str, ctx: str) -> list:
             out.append("postgres URL %s has a case-variant sslmode key %r (sqlx keys are case-sensitive)" % (redact(dsn), k))
         if k.lower() in ("password", "passfile"):
             out.append("postgres URL %s carries a %s key" % (redact(dsn), k.lower()))
+        if k.lower() in ("host", "hostaddr", "port", "channel_binding"):
+            out.append("postgres URL %s carries a %s query key (the URL dials the authority only, #4702/#4677)" % (redact(dsn), k.lower()))
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    if port is not None and (port != 5432 or not re.search(r":5432$", parts.netloc)):
+        out.append("postgres URL %s names a port other than a literal 5432 (no pooler, #4702)" % redact(dsn))
     netloc = parts.netloc
     if "@" in netloc and ":" in netloc.rsplit("@", 1)[0] and ctx != STORE_URL_PATH:
         out.append("postgres URL with a userinfo password outside %s" % STORE_URL_PATH)
@@ -2412,6 +2427,18 @@ def validate_line(ln: Line, homes: set, binaries: set) -> list:
             out.append("curl/wget piped into a shell, tar or interpreter")
     if re.search(r"(?<![\w-])tar(?![\w-])", v1) and re.search(r"(?<![\w-])(?:-[a-z]*x[a-z]*|x[a-z]*f|--extract|--get)(?![\w-])", v1) and re.search(r"\|\|\s*true\b", v1):
         out.append("tar extract failure ignored with || true")
+    if re.search(r"(?<![\w-])sha(?:256|512)sum(?![\w-])", v1) and re.search(r"\|\|\s*(?:true|:)(?![\w-])", v1):
+        out.append("digest check failure ignored with || true or || : (#4704)")
+    if re.search(r"(?<![\w-])ssl\s*=\s*'?(?:off|false|no|0)\b", v1):
+        out.append("ssl turned off for a local Postgres (#4704)")
+    for hm in re.finditer(r"[\"'](hostnossl|host)\s+\S+\s+\S+\s+\S+\s+([^\"'\s]+)", v1):
+        if hm.group(2) != "reject":
+            out.append("pg_hba %s line that admits a login (only hostssl may admit, #4676/#4704)" % hm.group(1))
+    if ln.ctx == "bootcmd" and "apt.postgresql.org.asc" in v1 and re.search(r"(?<![\w-])curl(?![\w-])", v1):
+        if not re.search(r"(?<![\w-])sha256sum\s+-c(?![\w-])", v1):
+            out.append("bootcmd fetches the PGDG key without a sha256sum -c pin (#4805)")
+        elif not re.search(r"(?<![\w-])set\s+-\w*e|(?<![\w-])exit\s+1(?![\w-])", v1):
+            out.append("bootcmd PGDG key pin cannot stop the item (no set -e, no exit 1: cc_bootcmd runs the next item anyway, #4805)")
     em = re.match(r"^\s*exec\w*=\s*([-@+!:]*)(\S+)", v1)
     if em is not None and ln.kind == "unit":
         binary = em.group(2)
@@ -2466,7 +2493,7 @@ def userdata_hits(name: str, scope: str, text: str, maintf) -> list:
 # the entries each one may hold (#5098): moving an approved line to the pending list, or
 # citing a placeholder issue, is a fault. Change this only in the PR that lands or files
 # the tracker; a ceiling only falls.
-PENDING_TRACKERS = {"#4610": 1, "#4671": 6, "#4712": 3}
+PENDING_TRACKERS = {"#4610": 1}
 
 
 def load_entries(text: str, pending: bool, faults: list, label: str) -> list:
@@ -2937,6 +2964,34 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
         lines, phits, entries, trig, homes = analyse(nm, text, cache)
         binaries = {m.group(1) for m in (re.match(r"^\s*Exec\w*=\s*[-@+!:]*(/\S+)", x.joined) for x in lines if x.kind == "unit") if m}
         hits.extend(phits)
+        live = [x.joined for x in lines if not x.exempt]
+        if any("pg_hba" in x for x in live):
+            if not any(re.search(r"[\"']ssl = on[\"']", x) for x in live):
+                hits.append("%s: writes pg_hba without a live \"ssl = on\" line (#4704)" % nm)
+            # Position, not presence (#4676/#4784): the rejects protect only as arguments of
+            # ONE printf whose output is written AHEAD of the packaged lines (first match
+            # wins), in the pinned line order ending with a mv over $HBA, not opened inside a
+            # compound command, and with no other live line touching pg_hba. Comparisons are
+            # whitespace-normalised; every message names the pin it compares against.
+            lv = [norm(x.joined) for x in lines if not x.exempt]
+            heads = [i for i, x in enumerate(lv) if HBA_PRINTF_RE.match(x) and i + 1 < len(lv) and lv[i + 1] == HBA_CAT]
+            if len(heads) != 1:
+                hits.append("%s: %d printf line(s) are followed by `%s`; exactly one must write the hostnossl rejects ahead of the packaged pg_hba lines (%s) (#4676/#4784)" % (nm, len(heads), HBA_CAT, HBA_PIN))
+            else:
+                h = heads[0]
+                for needle, why in (('"hostnossl all all all reject"', ""),
+                                    ('"hostnossl replication all all reject"', ": `all` does not match the replication pseudo-database")):
+                    if needle not in lv[h]:
+                        hits.append("%s: the printf written ahead of the packaged pg_hba lines lacks %s%s (#4676)" % (nm, needle, why))
+                got = lv[max(h - 2, 0):h] + lv[h + 1:h + 6]
+                if got != HBA_ORDER:
+                    hits.append("%s: the pg_hba write differs from %s line for line: expected %s around the printf, found %s (#4784)" % (nm, HBA_PIN, " | ".join(HBA_ORDER), " | ".join(x[:60] for x in got)))
+                prev = lv[h - 3] if h >= 3 else ""
+                if HBA_OPENER_RE.search(prev):
+                    hits.append("%s: the pg_hba write is inside the compound command opened by `%s` (#4784)" % (nm, prev[:60]))
+            for x in lv:
+                if ("$HBA" in x or "pg_hba.conf" in x) and x not in HBA_SHAPE and not (len(heads) == 1 and x == lv[heads[0]]):
+                    hits.append("%s: pg_hba touched outside %s: %s (#4784)" % (nm, HBA_PIN, x[:80]))
         if not trig:
             faults.append("%s: zero triggered lines (fail closed)" % nm)
         ntrig += len(trig)
@@ -3062,6 +3117,14 @@ def build_probes() -> list:
         P.append((label, "green", dict(aws=muts, autolist=autolist, **kw)))
 
     # ---- security reviewer round 1 (#4662/#4663/#4664) and round 2 (#4687-#4693)
+    REPL = '            "hostnossl replication all all reject" \\\n'
+    red("S-4676 replication reject line deleted (aws)", [(REPL, "")])
+    red("S-4676 replication reject turned into an accept (aws)", [(REPL, '            "hostnossl replication all all scram-sha-256" \\\n')])
+    red("S-4676 replication reject narrowed to one role (aws)", [(REPL, '            "hostnossl replication aimemory all reject" \\\n')])
+    HCAT = '          cat "$HBA"; } > "$HBA.new"\n'
+    red("S-4676 replication reject moved after the packaged lines (aws)", [(REPL, ""), (HCAT, '          cat "$HBA"\n          printf \'%s\\n\' "hostnossl replication all all reject"; } > "$HBA.new"\n')])
+    red("S-4676 replication reject only on a no-op command (aws)", [(REPL, ""), (HCAT, HCAT + '          : "hostnossl replication all all reject"\n')])
+    red("S-4676 all-roles reject only printed to /dev/null (aws)", [('            "hostnossl all all all reject" \\\n', ""), (HCAT, HCAT + '          printf \'%s\\n\' "hostnossl all all all reject" > /dev/null\n')])
     red("S-R1 runtime argv via sh -c", [(EXEC, "ExecStart=/bin/sh -c 'exec " + BIN + " serve " + SU + " \"$(cat /etc/ai-memory/store-url)\" --host 0.0.0.0'")])
     red("S-R2 password= query on serve", [(EXEC, EXEC.replace("serve", "serve " + SU + " " + NOPW.replace("?", "?password=" + PW + "&")))])
     red("S-R3 Environment= DSN in a 0644 unit", [(ENVF, "      Environment=AI_MEMORY_STORE_URL=" + DSN + "\n")])
@@ -3163,7 +3226,7 @@ def build_probes() -> list:
               '        || { echo "tarball member ai-memory is not a regular file"; exit 1; }\n')
     owner = ('      [ "$(stat -c %U /opt/ai-memory)" = aimemory ] \\\n'
              '        || { echo "/opt/ai-memory is not owned by aimemory"; exit 1; }\n')
-    hba = '            "hostnossl aimemory aimemory all reject"\n'
+    hba = '            "hostnossl all all all reject" \\\n'
     inst = '      install -o root -g root -m 0755 "$DL/x/ai-memory" /usr/local/lib/ai-memory/bin/ai-memory\n'
     curl_bin = '      curl -fsSL "${ai_memory_image_url}" -o "$DL/ai-memory.tar.gz"\n'
     unit_exec = "      ExecStart=/usr/local/lib/ai-memory/bin/ai-memory serve"
@@ -3556,15 +3619,87 @@ def build_probes() -> list:
     P.append(("A empty allowlist", "fault", dict(allow_text="# only a comment\n")))
     P.append(("A stale entry", "red", dict(allow_add="aws-gpu-burst | top | nothing-matches:", autolist=False)))
     P.append(("A stale both entry (one template only)", "red", dict(allow_add="both | " + PROV_PATH + " | echo only-in-aws > /x", aws=[ins(RELOAD, ["echo only-in-aws > /x"], before=True)], autolist=False)))
-    P.append(("A stale pending entry", "red", dict(pend_sub=("do-hive #4671 | /etc/ai-memory/store-url | ", "do-hive #4671 | top | nothing-matches: "), autolist=False)))
+    P.append(("A stale pending entry", "red", dict(pend_sub=("aws-gpu-burst #4610 | /etc/ai-memory/store-url | ", "aws-gpu-burst #4610 | top | nothing-matches: "), autolist=False)))
     # an approved line moved to the pending list skips the validators: the tracker must be known and under its ceiling (#5098)
-    P.append(("A approved line moved under a tracker over its ceiling (#5098)", "fault", dict(pend_move="#4671", autolist=False)))
+    P.append(("A approved line moved under a tracker over its ceiling (#5098)", "fault", dict(pend_move="#4610", autolist=False)))
     P.append(("A approved line moved under a placeholder tracker #0 (#5098)", "fault", dict(pend_move="#0", autolist=False)))
     P.append(("A approved line moved under a zero-led tracker #00 (#5098)", "fault", dict(pend_move="#00", autolist=False)))
     P.append(("A approved line moved under an unknown tracker (#5098)", "fault", dict(pend_move="#99999999", autolist=False)))
     P.append(("A fewer than two templates", "fault", dict(drop_do=True)))
     P.append(("A two templates in one directory", "fault", dict(add_template=("infra/aws-gpu-burst/cloud-init-memory-2.yaml.tpl", "aws"))))
     P.append(("A template with zero triggered lines", "fault", dict(do_text="")))
+    # ---- do-hive template, fix round for PR 4671 (#4654): every probe mutates the do-hive template
+    DBIN = "/usr/local/lib/ai-memory/bin/ai-memory"
+    DDSN = PG + "aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt"
+    DNOSSL = "            \"hostnossl all all all reject\" \\\n"
+    DSSL = "printf '%s\\n' \"# ai-memory-tls (#4635)\" \"ssl = on\" \\\n"
+    DHBA = "            \"hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256\" \\\n"
+    DSHA = "| sha256sum -c - \\\n          || { echo \"ai-memory tarball digest mismatch\"; rm -f \"$DL/ai-memory.tar.gz\"; exit 1; }\n"
+    DTAR = "tar -xzf \"$DL/ai-memory.tar.gz\" --no-same-owner -C \"$DL/x\" ai-memory\n"
+
+    def dred(label, muts, autolist=False, **kw):
+        P.append((label, "red", dict(do=muts, autolist=autolist, **kw)))
+
+    dred("D-4676 hostnossl reject narrowed to one role", [(DNOSSL, "            \"hostnossl aimemory aimemory all reject\" \\\n")], autolist=True)
+    DREPL = '            "hostnossl replication all all reject" \\\n'
+    HHEAD = "        { printf '%s\\n' \"# ai-memory-tls (#4635)\" \\\n"
+    HCAT2 = '          cat "$HBA"; } > "$HBA.new"\n'
+    HMUTS = (("packaged pg_hba lines written before the rejects", [(HHEAD, "        { cat \"$HBA\"; printf '%s\\n' \"# ai-memory-tls (#4635)\" \\\n"), (HCAT2, '          } > "$HBA.new"\n')]),
+             ("rejects appended after the packaged file", [(HCAT2, HCAT2 + '        cat "$HBA" "$HBA.new" > "$HBA.new2"; mv "$HBA.new2" "$HBA.new"\n')]),
+             ("replication reject removed, decoy line keeps the text", [('            "hostnossl replication all all reject" \\\n', ""), (HCAT2, HCAT2 + '        echo "hostnossl replication all all reject" >/dev/null\n')]))
+    for hl, hm in HMUTS:
+        dred("D-4784 " + hl, hm, autolist=True)
+        red("S-4784 " + hl + " (aws)", hm)
+    HSET = '      HBA="/etc/postgresql/18/main/pg_hba.conf"\n'
+    HMVFI = '        mv "$HBA.new" "$HBA"\n      fi\n'
+    HMUTS2 = (("mv over $HBA dropped (rejects never reach the live file)", [('        mv "$HBA.new" "$HBA"\n', "")]),
+              ("whole pg_hba write inside if false", [(HSET, "      if false; then\n" + HSET), (HMVFI, HMVFI + "      fi\n")]),
+              ("whole pg_hba write behind false &&", [(HSET, "      false && {\n" + HSET), (HMVFI, HMVFI + "      }\n")]),
+              ("rejects written by one echo (one pg_hba line, no reject)", [(HHEAD, HHEAD.replace("{ printf '%s\\n'", "{ echo"))]),
+              ("packaged sample copied over $HBA after the write", [(HMVFI, HMVFI + '      cp /usr/share/postgresql/18/pg_hba.conf.sample "$HBA"\n')]))
+    for hl, hm in HMUTS2:
+        dred("D-4784 " + hl, hm, autolist=True)
+        red("S-4784 " + hl + " (aws)", hm)
+    HGOOD = (("printf format double-quoted", [(HHEAD, HHEAD.replace("'%s\\n'", '"%s\\n"'))]),
+             ("extra blanks in the cat and mv lines", [(HCAT2, '          cat  "$HBA";   } >  "$HBA.new"\n'), ('        mv "$HBA.new" "$HBA"\n', '        mv   "$HBA.new"  "$HBA"\n')]))
+    for hl, hm in HGOOD:
+        green("S-4784 correct edit: " + hl + " (aws)", hm, autolist=True)
+        P.append(("D-4784 correct edit: " + hl, "green", dict(do=hm, autolist=True)))
+    dred("D-4676 replication reject line deleted", [(DREPL, "")], autolist=True)
+    dred("D-4676 replication reject turned into an accept", [(DREPL, '            "hostnossl replication all all scram-sha-256" \\\n')], autolist=True)
+    dred("D-4676 replication reject narrowed to one role", [(DREPL, '            "hostnossl replication postgres all reject" \\\n')], autolist=True)
+    DHCAT = '          cat "$HBA"; } > "$HBA.new"\n'
+    dred("D-4676 replication reject moved after the packaged lines", [(DREPL, ""), (DHCAT, '          cat "$HBA"\n          printf \'%s\\n\' "hostnossl replication all all reject"; } > "$HBA.new"\n')], autolist=True)
+    dred("D-4676 replication reject only inside if false", [(DREPL, ""), (DHCAT, DHCAT + '          if false; then echo "hostnossl replication all all reject"; fi\n')], autolist=True)
+    dred("D-4676 all-roles reject only on a no-op command", [(DNOSSL, ""), (DHCAT, DHCAT + '          : "hostnossl all all all reject"\n')], autolist=True)
+    dred("D-4676 hostnossl reject line deleted", [(DNOSSL, "")], autolist=True)
+    dred("D-4676 hostnossl reject turned into an accept", [(DNOSSL, "            \"hostnossl all all all scram-sha-256\" \\\n")], autolist=True)
+    dred("D-4704 ssl = off with ssl = on only in a comment", [(DSSL, "# ssl = on\n        printf '%s\\n' \"# ai-memory-tls (#4635)\" \"ssl = off\" \\\n")], autolist=True)
+    dred("D-4704 hostssl turned into host for the aimemory role", [(DHBA, "            \"host aimemory aimemory 127.0.0.1/32 scram-sha-256\" \\\n")], autolist=True)
+    dred("D-4704 digest check ignored with || true (non-tar name)", [(DSHA, "| sha256sum -c - || true\n")], autolist=True)
+    dred("D-4704 digest check ignored with || :", [(DSHA, "| sha256sum -c - || :\n")], autolist=True)
+    dred("D-4702 store-url authority port with a leading zero", [(DDSN, DDSN.replace("@localhost/", "@localhost:06432/"))], autolist=True)
+    dred("D-4702 store-url port= query key", [(DDSN, DDSN + "&port=6432")], autolist=True)
+    dred("D-4702 store-url host= query key", [(DDSN, DDSN + "&host=db.example.com")], autolist=True)
+    dred("D-4702 provision writes a second store URL", [(RELOAD, "      printf '%s\\n' '" + PG + "aimemory:x@127.0.0.1:6432/aimemory?sslmode=verify-full' > /etc/ai-memory/store-url\n" + RELOAD)], autolist=True)
+    dred("D-4705 SQL E-string password literal with a terraform value", [(RELOAD, "      sudo -u postgres psql -c \"ALTER USER aimemory WITH PASSWORD E'$${db_password}';\"\n" + RELOAD)], autolist=True)
+    dred("D-4705 SQL dollar-quoted password literal with a terraform value", [(RELOAD, "      sudo -u postgres psql -c 'ALTER USER aimemory WITH PASSWORD $$${db_password}$$;'\n" + RELOAD)], autolist=True)
+    dred("D-4705 SQL password literal with a prefix before the terraform value", [(RELOAD, "      sudo -u postgres psql -c \"ALTER USER aimemory WITH PASSWORD 'pre$${db_password}';\"\n" + RELOAD)], autolist=True)
+    dred("D-4671 terraform secret interpolated into the store-url", [(DDSN, DDSN.replace("CHANGEME", "$${db_password}"))], autolist=True)
+    MINT = "      URL=\"$(LC_ALL=C sed -n 's#^\\(.*CHANGEME.*\\)#\\1#p' /etc/ai-memory/store-url)\"\n"
+    dred("D-5428 grep -q on the store-url in provision (R5 cannot show it is data)", [(MINT, MINT + "      if grep -q CHANGEME /etc/ai-memory/store-url; then :; fi\n")], autolist=True)
+    dred("D-5428 sed -i -f - rewrites the store-url in provision (a sed script on stdin)", [(MINT, MINT + "      printf 's/a/b/\\n' | sed -i -f - /etc/ai-memory/store-url\n")], autolist=True)
+    dred("D-4677 channel_binding in the store-url", [(DDSN, DDSN + "&channel_binding=require")], autolist=True)
+    dred("D-4712 unit binary under the service user home", [("ExecStart=" + DBIN + " serve", "ExecStart=/var/lib/ai-memory/bin/ai-memory serve")], autolist=True)
+    dred("D-4712 unit binary back under /opt/ai-memory", [("ExecStart=" + DBIN + " serve", "ExecStart=/opt/ai-memory/bin/ai-memory serve")])
+    dred("D-4712 expanded command word in the identity step", [("          " + DBIN + " identity generate", "          \"$BIN\" identity generate")], autolist=True)
+    dred("D-4674 root-run bootstrap script under the service user home", [("ExecStart=/usr/local/sbin/ai-memory-fed-bootstrap.sh", "ExecStart=/var/lib/ai-memory/fed-bootstrap.sh")])
+    dred("D-4673 tarball extracted into the binary directory", [(DTAR, "tar -xzf \"$DL/ai-memory.tar.gz\" --no-same-owner -C /usr/local/lib/ai-memory/bin\n")])
+    dred("D-4675 CA key written to the persistent TLS directory", [("PGCA=/run/ai-memory-pgca\n", "PGCA=/etc/ai-memory/tls\n")])
+    dred("D-4675 CA key wipe removed", [("      trap wipe_pgca EXIT\n", "")])
+    dred("D-4805 PGDG key pin item without set -e", [("set -e; install -d -m 0755 /usr/share/postgresql-common/pgdg; rm -f", "install -d -m 0755 /usr/share/postgresql-common/pgdg; rm -f")], autolist=True)
+    dred("D-4805 PGDG key fetched with no sha256sum pin", [(" | sha256sum -c -;", " | cat;")], autolist=True)
+    dred("D-4707 provision line de-indented below the block but inside it", [("      systemctl daemon-reload\n      # TLS is universal", "     systemctl daemon-reload\n      # TLS is universal")])
     P.append(("A real templates (green control)", "green", dict(autolist=False)))
     return P
 
