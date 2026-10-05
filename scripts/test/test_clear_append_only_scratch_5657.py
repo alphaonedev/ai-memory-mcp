@@ -871,6 +871,41 @@ class ScratchTreeCase(unittest.TestCase):
                              "the run reported a clean sweep over an unreadable flagged leftover")
             self.assertTrue(is_flagged(inner), "the fixture itself did not survive the run")
 
+    def test_an_unusable_fd_dir_is_refused_before_anything_is_opened_5996(self):
+        """#5996, the half the exit code cannot show. Deleting the refusal
+        outright leaves the suite green: the chmod through the missing route
+        fails a moment later and the leg reds either way. What the refusal
+        buys is that an entry whose mode could NOT be put back is never
+        pinned open and never mutated at all - the refusal is taken before
+        the `O_PATH` open, not after it."""
+        mod = load_script_module()
+        if not mod.HAS_O_PATH:
+            self.skipTest("the FD_DIR route is the O_PATH leg's; this host has no O_PATH")
+        shut = self.scratch / ".tmpNoRoute"
+        shut.mkdir()
+        inner = shut / "inner.log"
+        inner.write_text("{}\n")
+        pinned = []
+        real_open = os.open
+
+        def counting_open(path, flags, *rest, **kwargs):
+            if flags & os.O_PATH:
+                pinned.append((path, flags))
+            return real_open(path, flags, *rest, **kwargs)
+
+        with flagged(inner):
+            with restrictive(shut, 0o000):
+                with mock.patch.object(os, "open", counting_open):
+                    with mock.patch.object(mod, "FD_DIR", str(self.ws / "no-such-fd-dir")):
+                        rc, out, err = run_clear_in_process(mod, self.ws)
+            self.assertEqual(pinned, [],
+                             "an entry was pinned open on a leg with no way to set a mode on the "
+                             "pin, so a widen was attempted that could not have been undone:\n"
+                             + "\n".join(repr(entry) for entry in pinned))
+            self.assertNotEqual(rc, 0, "a flag that is still set is not a pass:\n" + out + err)
+            self.assertIn(str(shut), err, "the entry that could not be inspected is not named")
+            self.assertTrue(is_flagged(inner), "the fixture itself did not survive the run")
+
     def test_a_restore_that_fails_is_reported_and_reds_the_leg_6002(self):
         """#6002. The walk widens a directory it cannot search, descends, and
         puts the mode back on the way out. That restore used to be allowed to
