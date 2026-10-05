@@ -456,6 +456,9 @@ def script_gate_violations(job, block, text):
 
 ENV_KEY_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*):(?: (.*))?")
 ENV_LINE_RE = re.compile(r"""( *)["']?env["']?\s*:(.*)$""")
+# A step env written as the first key on the step's dash line (#5986): the
+# reader does not place it, so it is refused by name, never read as empty.
+DASH_ENV_RE = re.compile(r"""\s*-\s+["']?env["']?\s*:.*""")
 # Any of these in a script-gate job block can change what reaches the gate
 # process or turn its red into green (#5970): the pin refuses them.
 FORBIDDEN_IN_SCRIPT_JOB = ("continue-on-error", "GITHUB_ENV", "GITHUB_PATH", "container:")
@@ -518,6 +521,9 @@ def gate_step_env(text, job, script):
     lo, hi = starts[hits[0]], starts[hits[0] + 1]
     job_env, step_env = {}, {}
     for i, line in enumerate(blines):
+        if DASH_ENV_RE.fullmatch(line):
+            raise ValueError("%s: a step env on the dash line (- env:) is not read; write the step as"
+                             " '- name: ...' with env: as its own key under it" % job)
         m = ENV_LINE_RE.fullmatch(line)
         if m is None:
             continue
@@ -875,6 +881,8 @@ def self_test():
                                  "        env: ${{ fromJSON(vars.X) }}\n        run: true\n", 1), 1, []),
                 ("a block env ends at the next key of its own level",
                  wf_text.replace(dj, dj + "    env:\n      X: 1\n    timeout-minutes: 5\n", 1), 0, ["X=1"]),
+                ("a gate step env on the dash line is refused, never read as empty (#5986)",
+                 wf_text.replace("      - name: Run declaration hash gate\n        env:\n", "      - env:\n", 1), 1, []),
                 ("a flow env with an item that is not a key is refused",
                  wf_text.replace(dj, dj + "    env: {A: 1, B}\n", 1), 1, []),
                 ("the gate step is read when it is the last step of its job",
