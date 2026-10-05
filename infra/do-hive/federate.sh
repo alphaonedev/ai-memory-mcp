@@ -310,6 +310,14 @@ node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; 
 #    $OUT_DIR or $run_dir with a canonical remainder (no empty, . or .. segment, no glob, brace or tilde,
 #    no expansion the scan does not model), or is /dev/null; every other target, every literal path
 #    included, is the terminal, and a cp, install, scp download or ln to it is refused (#5602);
+#  - $OUT_DIR and $run_dir are roots only while the scan proves their value (#5763): each of them, and
+#    HERE and REPO_ROOT that they are built from, has one reviewed assignment that runs unconditionally
+#    in its scope, every read comes after it (run_dir: inside loadgen), no other line names it except
+#    to read it or to pass the same value to one command, and no indirect writer exists anywhere
+#    (eval, source or ., alias, a nameref, a read, mapfile, readarray, getopts, printf -v or wait -p
+#    with a computed operand, a computed trap action, a declarator or unset with a computed name, a
+#    computed command word); any other spelling is reported on its line and every target under a
+#    root is then the terminal;
 #  - a pipe into base64 is exempt only when it continues into curl, and the b64 helper only while its
 #    body is exactly the pinned one (#5413);
 #  - a function that wraps a node channel is followed as a source, in every spelling of the definition
@@ -318,9 +326,9 @@ node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; 
 #    here-documents not fed to a node, indexed and escaped-space assignments, default-assign and :?
 #    expansions, let, ((, process substitution and backticks (#5236, #5359, #5407, #5408, #5410).
 # It is a static aid and not a proof; a form it cannot decide is reported, not trusted (#5418, #5523):
-# a variable in a target is followed through every value this script assigns it, and a value it
-# cannot read (a parameter, the environment, a command substitution other than date, mktemp or seq)
-# is not proven; ${V:-x} is each value of V and x. An identity in FED_IDS is a plain name because
+# a variable in a target other than a root is followed through every value this script assigns
+# it, and a value it cannot read (a parameter, the environment, a command substitution other than
+# date, mktemp or seq) is not proven; ${V:-x} is each value of V and x. An identity in FED_IDS is a plain name because
 # read_nodes checks it. A command it does not list that names a file this script may write is
 # reported unless its output goes to a file or it is a silent file command (#5525, #5621): the
 # written set is every output redirect at any fd and every cp, install, mv, ln, scp download and dd
@@ -329,8 +337,9 @@ node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; 
 # pushd, popd, a subshell, env --chdir) decides; a relative . or .. operand and a glob under another
 # directory are reported, and so is a capture or a trap handler that reads a written file.
 # Stated limits: a root moved by the environment (inside V="${V:-x}" V is taken as x), a literal
-# absolute spelling of a directory above a computed root, symbolic links, and a path that reaches a
-# command only as a function argument or as a value with no literal spelling are not decided.
+# absolute spelling of a directory above a computed root, symbolic links, an integer that bash
+# arithmetic assigns while it evaluates the text of a variable, and a path that reaches a command
+# only as a function argument or as a value with no literal spelling are not decided.
 # Whole-verify probes check the printed bytes.
 # reply_status prints a 3-digit HTTP
 # status, or the word non-status for anything else. reply_len prints the reply's byte count.

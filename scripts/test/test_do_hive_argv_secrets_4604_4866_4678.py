@@ -981,7 +981,8 @@ OUT_REDIRECT = re.compile(r"(?:(?<![0-9&<>])|(?<=[\s;]1))(&>>|&>|>>|>\||>)(?!\()
 # #5602: an output target is a file only when the scan proves it. A write, copy or install target is a file when it
 # sits under one of these variable roots with a canonical remainder: no empty, . or .. segment, no glob, brace or
 # tilde, and no expansion the scan does not model. Every other target, every literal absolute path among them, is
-# the terminal; /dev/null is the null device. There is no list of terminal paths to keep complete.
+# the terminal; /dev/null is the null device. There is no list of terminal paths to keep complete. #5763: a root
+# counts only while root_findings proves its value; otherwise every target is the terminal.
 FILE_ROOTS = ("OUT_DIR", "run_dir")
 # Markers for the parts of an expanded word whose text the scan models as a class of strings, never as a value:
 # a counter ($(( )), seq), a name the script checked against NAME_CHARS, anything (an unmodelled expansion or a
@@ -1327,17 +1328,224 @@ def could_equal(a, b):
     return False
 
 
+# #5763: a root is a root only when the scan proves its value. Each variable a FILE_ROOTS value is built from is
+# listed with the one statement that may assign it and the function it sits in ("" is the top level). A listed
+# variable is proven when the script names it in that statement exactly once, outside it only to read it or to
+# pass the same value to one command (V="$V" cmd), the statement runs unconditionally (no open if, loop, case,
+# group, subshell or && || | chain before it in its scope), and every read is after it (a function root: in its
+# function). No indirect writer may exist anywhere in the script: eval, source or ., alias, a nameref, a read,
+# mapfile, readarray, getopts, printf -v or wait -p with a computed operand, a trap whose action is computed, a
+# declarator or unset with a computed name, or a computed command word that is not a path. Any other spelling
+# leaves every root unproven: each target under one is then the terminal, and the line is reported.
+ROOT_DEFS = (
+    ("HERE", "", 'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'),
+    ("REPO_ROOT", "", 'REPO_ROOT="$(cd "${HERE}/../.." && pwd)"'),
+    ("OUT_DIR", "", 'OUT_DIR="${OUT_DIR:-${HERE}/crypto/out}"'),
+    ("run_dir", "loadgen", 'run_dir="$REPO_ROOT/.local-runs/do-hive-runs/$(date -u +%Y-%m-%dT%H-%M-%SZ)/loadgen"'),
+)
+ROOT_INDIRECT = (
+    (r"(?<![\w./-])eval(?![\w-])", "eval"), (r"(?<![\w./-])source(?![\w-])", "source"),
+    (r"(?:^|[;&|({!]\s*|(?<![\w-])(?:then|do|else|command|builtin|exec)\s+)\.(?=\s)", "source"),
+    (r"(?<![\w./-])alias(?![\w-])", "alias"),
+    (r"(?<![\w-])(?:declare|local|typeset)\s+(?:-\S+\s+)*-\w*n", "nameref"),
+)
+# Builtins that assign the variable a name operand names. A literal root name among the operands is a mention of the
+# root (reported below); a computed operand (an expansion, a quote or a backslash) may spell one, so it is reported.
+NAME_WRITERS = frozenset(("read", "mapfile", "readarray", "getopts"))
+REDIRECTION = re.compile(r"\d*(?:<<<|<<-?|&>>|&>|>>|>\||<>|<&|>&|<|>)\s*(?:\"[^\"]*\"|'[^']*'|\S+)")
+_COMPOUND_OPEN = frozenset(("if", "for", "while", "until", "case", "select", "{"))
+_COMPOUND_CLOSE = frozenset(("fi", "done", "esac", "}"))
+_ROOT_CACHE = {}
+
+
+def _root_reads(name):
+    """A read of `name`: $name, ${name}, ${#name}, ${name:-x} and the other expansions that do not assign it."""
+    return r"\$%s(?!\w)|\$\{[#!]?%s(?=\}|\[|:(?!=)|[-+?%%#/^,@])" % (name, name)
+
+
+def _subshell_paren(code):
+    """True when `code` holds a ( or ) outside quotes that is not part of $( ), $(( )) or name=( )."""
+    i, quote = 0, None
+    while i < len(code):
+        c = code[i]
+        if c == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = None
+            elif quote == '"' and c == "$" and code[i + 1:i + 2] in ("(", "{"):
+                i = _close(code, i)
+                continue
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+        elif c == "$" and code[i + 1:i + 2] in ("(", "{"):
+            i = _close(code, i)
+            continue
+        elif c == "(" and code[i - 1:i] == "=":
+            i = _close("$" + code[i:], 0) + i - 1
+            continue
+        elif c in "()":
+            return True
+        i += 1
+    return False
+
+
+def _depth_change(code):
+    """The compound-command depth a logical line opens (if, for, while, until, case, select, {) minus what it
+    closes; None when the line holds a case or a subshell paren, which the count does not follow."""
+    if _subshell_paren(code):
+        return None
+    d = 0
+    for stmt in statements(code):
+        words = shell_words(stmt)
+        while words and words[0] in ("!", "time", "then", "do", "else", "elif", "{"):
+            if words[0] == "{":
+                d += 1
+            words = words[1:]
+        if not words:
+            continue
+        if words[0] == "case":
+            return None
+        if words[0] in _COMPOUND_OPEN:
+            d += 1
+        elif words[0] in _COMPOUND_CLOSE:
+            d -= 1
+        d -= sum(1 for w in words[1:] if w == "}")
+    return d
+
+
+def _computed_command(stmt, text):
+    """The command word of a simple command when it is computed (holds an expansion) and some value of it is not a
+    path: such a word may run a builtin that assigns a variable."""
+    if re.match(r"\s*\w+\+?=\(", stmt):
+        return None   # an array assignment: its parenthesised words are values, not a command
+    words = shell_words(stmt)
+    k = 0
+    while k < len(words) and (words[k] in ("if", "then", "elif", "else", "while", "until", "do", "!", "time", "{",
+                                             "command", "builtin", "exec")
+                              or re.match(r"\w+\+?=", words[k])):
+        k += 1
+    if k >= len(words) or not re.search(r"[$`]", words[k]):
+        return None
+    alts = expand(words[k], text)
+    if not alts or any("/" not in a or a.startswith(OPEN) and "/" not in a.split(CLOSE, 1)[-1] for a in alts):
+        return words[k]
+    return None
+
+
+def _name_writer(stmt):
+    """The builtin of `stmt` when it assigns a variable named by an operand (read, mapfile, readarray, getopts,
+    printf -v, wait -p) and some operand other than a redirection is computed; else None."""
+    words = shell_words(REDIRECTION.sub(" ", stmt))
+    k = 0
+    while k < len(words) and (words[k] in ("if", "then", "elif", "else", "while", "until", "do", "!", "time", "{",
+                                             "command", "builtin", "exec")
+                              or re.match(r"\w+\+?=", words[k])):
+        k += 1
+    if k >= len(words):
+        return None
+    cmd, rest = re.sub(r"[\\'\"]", "", words[k]), words[k + 1:]
+    flags = "".join(w[1:] for w in rest if re.fullmatch(r"-\w+", w))
+    if cmd in NAME_WRITERS or (cmd == "printf" and "v" in flags) or (cmd == "wait" and "p" in flags):
+        if any(re.search(r"[$`'\"\\]", w) for w in rest):
+            return cmd
+    return None
+
+
+def _root_pass(name, stmt):
+    """True when `stmt` names `name` only as name="$name" before a command word: the same value, passed to that
+    command's environment."""
+    words = shell_words(stmt)
+    k = next((i for i, w in enumerate(words) if w in ('%s="$%s"' % (name, name), "%s=$%s" % (name, name))), -1)
+    rest = words[:k] + words[k + 1:]
+    return k >= 0 and all(re.match(r"\w+=", w) for w in words[:k]) and k + 1 < len(words) \
+        and not re.match(r"\w+\+?=", words[k + 1]) and words[k + 1] not in DECLARATORS | {"unset"} \
+        and not re.search(r"(?<!\w)%s(?!\w)" % name, re.sub(_root_reads(name), "", " ".join(rest)))
+
+
+def root_findings(text):
+    """#5763: every line that keeps a FILE_ROOTS value from being proven (see ROOT_DEFS), as line:name:reason."""
+    if text in _ROOT_CACHE:
+        return _ROOT_CACHE[text]
+    bad, lines = [], logical_lines(text)
+    for n, line, func in lines:
+        code = re.sub(r'"[^"$`]*"', '""', strip_comment(line))
+        for rx, label in ROOT_INDIRECT:
+            if re.search(rx, code):
+                bad.append("%d:roots:%s" % (n, label))
+        if re.search(r"(?<![\w-])trap\s+(?!-\s|'[^']*'\s|\"\"\s)", code):
+            bad.append("%d:roots:computed trap action" % n)
+        for stmt in statements(code):
+            words = shell_words(stmt)
+            if words and words[0] in DECLARATORS | {"unset"} and any(
+                    re.search(r"[$`\"'\\]", w.split("=", 1)[0]) for w in words[1:] if not w.startswith("-")):
+                bad.append("%d:roots:computed name" % n)
+            cmd = _computed_command(stmt, text)
+            if cmd:
+                bad.append("%d:roots:computed command %s" % (n, cmd))
+            writer = _name_writer(stmt)
+            if writer:
+                bad.append("%d:roots:computed operand of %s" % (n, writer))
+    for name, scope, stmt in ROOT_DEFS:
+        defs, reads = [], _root_reads(name)
+        mention = r"(?<!\w)%s(?!\w)" % name
+        for n, line, func in lines:
+            code = strip_comment(line)
+            if not re.search(mention, re.sub(reads, "", code)):
+                continue
+            if code.strip() == stmt and func == scope:
+                defs.append(n)
+                continue
+            for st in statements(code):
+                if re.search(mention, re.sub(reads, "", st)) and not _root_pass(name, st):
+                    bad.append("%d:%s:named outside its one reviewed assignment" % (n, name))
+                    break
+        if len(defs) != 1:
+            bad.append("%d:%s:%d reviewed assignments, not one" % (defs[1] if len(defs) > 1 else 0, name, len(defs)))
+            continue
+        at = defs[0]
+        depth, chained = 0, False
+        for n, line, func in lines:
+            if n >= at or func != scope:
+                continue
+            code = strip_comment(line)
+            head = FUNC_DEF.match(code)
+            if head and scope and (head.group(2) or head.group(3)) == scope:
+                depth, chained = 0, False   # the header of the root's own function opens its scope
+                continue
+            ch = None if head else _depth_change(code)
+            if ch is None:
+                bad.append("%d:%s:a case, subshell or function definition before its assignment" % (n, name))
+                break
+            depth += ch
+            chained = bool(re.search(r"(?:&&|\|\||\||!)\s*$", code))
+        if depth != 0 or chained:
+            bad.append("%d:%s:assignment is not unconditional in its scope" % (at, name))
+        for n, line, func in lines:
+            if re.search(_root_reads(name), strip_comment(line)) and n != at \
+                    and (n < at or (scope and func != scope)):
+                bad.append("%d:%s:read before its assignment or outside its function" % (n, name))
+    if len(_ROOT_CACHE) > 8:
+        _ROOT_CACHE.clear()
+    _ROOT_CACHE[text] = bad
+    return bad
+
+
 def _opaque_segment(seg):
     return OPEN in seg or ANY in seg
 
 
 def target_kind(word, text, directory=False):
     """#5602: "null" for /dev/null, "file" when every expansion of `word` is under a FILE_ROOTS root with a canonical
-    remainder (a directory target may be the root itself), else "terminal"."""
+    remainder (a directory target may be the root itself) and #5763 the scan proves every root, else "terminal"."""
     alts = expand(word, text, keep=FILE_ROOTS)
     if alts == ["/dev/null"]:
         return "null"
-    if not alts:
+    # #5763: a root whose value the scan does not prove is no directory of files.
+    if not alts or root_findings(text):
         return "terminal"
     for a in alts:
         m = re.fullmatch(OPEN + r"(\w+)" + CLOSE + r"((?:/[^/]+)*)", a)
@@ -2178,6 +2386,7 @@ def taint_findings(text, names):
                 hit.append("file operand")
             if hit:
                 bad.append("%d:%s:%s" % (n, cmd, ",".join(sorted(hit))))
+    bad += root_findings(text)
     bad += heredoc_findings(text, names)
     bad += consumer_findings(text, names)
     bad += arith_findings(text, names)
@@ -2244,6 +2453,8 @@ def closed_world_taint(fs):
           not bad, " ".join(bad[:8]))
     probe("V1 the taint scan checks the terminal lines (not vacuous)", checked >= 60, str(checked))
     wrap = lambda body: fs + "\nprobe_fn() {\n%s\n}\n" % body
+    run_def = 'run_dir="$REPO_ROOT/.local-runs/do-hive-runs/$(date -u +%Y-%m-%dT%H-%M-%SZ)/loadgen"\n'
+    in_loadgen = lambda body: fs.replace(run_def, run_def + body + "\n", 1)
     for label, body in (("a raw reply in a failure line", 'no "x $qjson"'),
                         ("an excerpt helper outside the allow-list", 'no "x $(safe_excerpt "$qjson")"'),
                         ("an echo of the attest level", 'echo "$lvl"'),
@@ -2493,6 +2704,8 @@ def closed_world_taint(fs):
                         ('a script function given a written path', 'printf %s x > "$OUT_DIR/r9"\nrd() { iconv "$1"; }\nrd "$OUT_DIR/r9"'),
                         ('an option value naming a written file', 'printf %s x > "$OUT_DIR/r9"\nopenssl enc -in"$OUT_DIR/r9"')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
+        # #5763: a root finding is no evidence for the rule a negative control names; it is not counted.
+        b2 = [f for f in b2 if f not in root_findings(wrap(body))]
         probe("V1 closed-world negative control is flagged: %s" % label, len(b2) > len(bad), str(b2[len(bad):][:2]))
     # #5236: constructs a name-based scan cannot follow are not allowed in federate.sh at all.
     cb = construct_findings(fs)
@@ -2613,7 +2826,9 @@ def closed_world_taint(fs):
                         ('pushd and popd around an rm', 'printf %s x > "$OUT_DIR/r9"\npushd "$OUT_DIR" >/dev/null && rm -f r9 && popd >/dev/null'),
                         ('a while read loop over another file', 'printf %s x > "$OUT_DIR/r9"\nwhile read -r l; do :; done < /etc/hostname'),
                         ('exec that opens a proven file for writing', 'exec 8> "$OUT_DIR/r9"\nprintf x >&8')):
-        b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
+        # #5763: run_dir is proven only inside loadgen, after its assignment; a control under it runs there.
+        text = in_loadgen(body) if "$run_dir" in body else wrap(body)
+        b2, _ = taint_findings(text, tainted_names(text))
         probe("V1 closed-world control is accepted: %s" % label, len(b2) == len(bad), str(b2[len(bad):][:2]))
 
 
@@ -3046,6 +3261,109 @@ def ssh_batch_5274():
           and first_batchmode(["-o", "batchmode=No", "-o", "BatchMode=yes"]) == "no" and first_batchmode(["-q"]) is None)
 
 
+def file_roots_5763():
+    """#5763: OUT_DIR and run_dir are file roots only while the scan proves their value. A write under a root that
+    any spelling reassigns is a finding on the write line, and the spelling is reported on its own line."""
+    fs = FED.read_text()
+    probe("#5763 the real federate.sh proves every root (positive control)", root_findings(fs) == [],
+          " ".join(root_findings(fs)[:4]))
+    W, R = 'printf %s "$qjson" > "$OUT_DIR/stdout"', 'printf %s "$qjson" > "$run_dir/stdout"'
+    head = fs + "\nprobe_fn() {\n"
+    first = head.count("\n") + 1
+    names = tainted_names(fs)
+    ROOT_NAMES = {"roots"} | {d[0] for d in ROOT_DEFS}
+    for label, body, write_at in (
+            ("a plain reassignment", "OUT_DIR=/dev\n" + W, 1),
+            ("a local", "local OUT_DIR=/dev\n" + W, 1),
+            ("a run_dir reassignment", "run_dir=/dev\n" + R, 1),
+            ("a cp under a reassigned root", 'OUT_DIR=/dev\ncp "$run_dir/x" "$OUT_DIR/stdout"', 1),
+            ("declare", "declare OUT_DIR=/dev\n" + W, 1), ("export", "export OUT_DIR=/dev\n" + W, 1),
+            ("readonly", "readonly OUT_DIR=/dev\n" + W, 1), ("typeset", "typeset OUT_DIR=/dev\n" + W, 1),
+            ("declare -g", "declare -g OUT_DIR=/dev\n" + W, 1), ("a local without a value", "local OUT_DIR\n" + W, 1),
+            ("unset", "unset OUT_DIR\n" + W, 1), ("export -n", "export -n OUT_DIR\n" + W, 1),
+            ("printf -v", "printf -v OUT_DIR %s /dev\n" + W, 1), ("read", "read -r OUT_DIR <<< /dev\n" + W, 1),
+            ("mapfile", 'mapfile -t OUT_DIR < "$run_dir/x"\n' + W, 1), ("getopts", "getopts a: OUT_DIR\n" + W, 1),
+            ("eval", "eval OUT_DIR=/dev\n" + W, 1), ("a nameref", "declare -n r=OUT_DIR\nr=/dev\n" + W, 2),
+            ("a for variable", "for OUT_DIR in /dev; do\n" + W + "\ndone", 1),
+            ("a select variable", "select OUT_DIR in /dev; do\n" + W + "\ndone", 1),
+            ("source", 'source "$run_dir/env"\n' + W, 1), ("the dot builtin", '. "$run_dir/env"\n' + W, 1),
+            ("a default assignment", ': "${OUT_DIR:=/dev}"\n' + W, 1), ("an append", "OUT_DIR+=/x\n" + W, 1),
+            ("an array", "OUT_DIR=(/dev)\n" + W, 1), ("an indexed assignment", "OUT_DIR[0]=/dev\n" + W, 1),
+            ("an arithmetic assignment", "(( OUT_DIR = 1 ))\n" + W, 1), ("let", "let OUT_DIR=1\n" + W, 1)):
+        text = head + body + "\n}\n"
+        bad, _ = taint_findings(text, names)
+        roots = root_findings(text)
+        probe("#5763 a write under a root after %s is a finding on the write line" % label,
+              any(b.startswith("%d:" % (first + write_at)) and b.split(":")[1] not in ROOT_NAMES for b in bad),
+              " ".join(b for b in bad if b.startswith("%d:" % (first + write_at))))
+        probe("#5763 %s is reported on a named line" % label,
+              any(re.match(r"%d:\w+:" % first, r) for r in roots), " ".join(roots[:2]))
+    D = 'OUT_DIR="${OUT_DIR:-${HERE}/crypto/out}"'
+    RD = 'run_dir="$REPO_ROOT/.local-runs/do-hive-runs/$(date -u +%Y-%m-%dT%H-%M-%SZ)/loadgen"'
+    at, rat = fs[:fs.index(D)].count("\n") + 1, fs[:fs.index(RD)].count("\n") + 1
+    for label, text, want in (
+            ("an if around the assignment", fs.replace(D, 'if [ -n "${X:-}" ]; then\n' + D + "\nfi"),
+             "%d:OUT_DIR:assignment is not unconditional in its scope" % (at + 1)),
+            ("an && chain into the assignment", fs.replace(D, "true &&\n" + D),
+             "%d:OUT_DIR:assignment is not unconditional in its scope" % (at + 1)),
+            ("a group around the assignment", fs.replace(D, "{\n" + D + "\n}"),
+             "%d:OUT_DIR:assignment is not unconditional in its scope" % (at + 1)),
+            ("a loop around the assignment", fs.replace(D, "while false; do\n" + D + "\ndone"),
+             "%d:OUT_DIR:assignment is not unconditional in its scope" % (at + 1)),
+            ("a case before the assignment", fs.replace(D, "case x in x) : ;; esac\n" + D),
+             "%d:OUT_DIR:a case, subshell or function definition before its assignment" % at),
+            ("a subshell before the assignment", fs.replace(D, "( : )\n" + D),
+             "%d:OUT_DIR:a case, subshell or function definition before its assignment" % at),
+            ("an || on the assignment line", fs.replace(D, "false || " + D),
+             "%d:OUT_DIR:named outside its one reviewed assignment" % at),
+            ("a read before the assignment", fs.replace(D, ': "${OUT_DIR}"\n' + D),
+             "%d:OUT_DIR:read before its assignment or outside its function" % at),
+            ("a second reviewed assignment", fs + D + "\n",
+             "%d:OUT_DIR:2 reviewed assignments, not one" % (fs.count("\n") + 1)),
+            ("run_dir assigned in an if", fs.replace(RD, "if true; then\n" + RD + "\nfi"),
+             "%d:run_dir:assignment is not unconditional in its scope" % (rat + 1)),
+            ("run_dir read in another function", head + ': "$run_dir"\n}\n',
+             "%d:run_dir:read before its assignment or outside its function" % first),
+            ("HERE reassigned", head + "HERE=/dev\n}\n", "%d:HERE:named outside its one reviewed assignment" % first),
+            ("REPO_ROOT reassigned", head + "REPO_ROOT=/\n}\n",
+             "%d:REPO_ROOT:named outside its one reviewed assignment" % first),
+            ("a pass-through that changes the value", head + 'OUT_DIR="$OUT_DIR/x" true\n}\n',
+             "%d:OUT_DIR:named outside its one reviewed assignment" % first),
+            ("a computed trap action", head + 'trap "$X" EXIT\n}\n', "%d:roots:computed trap action" % first),
+            ("a computed command word", head + '"$c" OUT_DIR\n}\n', '%d:roots:computed command "$c"' % first),
+            ("a computed declarator name", head + 'declare "$n=/dev"\n}\n', "%d:roots:computed name" % first),
+            ("a computed unset name", head + 'unset "$n"\n}\n', "%d:roots:computed name" % first),
+            ("local -n", head + "local -n r=OUT_DIR\n}\n", "%d:roots:nameref" % first),
+            ("wait -p with a computed name", head + 'wait -n -p "$n"\n}\n', "%d:roots:computed operand of wait" % first),
+            ("readarray with a computed name", head + 'readarray "$n" < x\n}\n',
+             "%d:roots:computed operand of readarray" % first),
+            ("read with a quoted name", head + 'read -r "O"UT_DIR <<< /dev\n}\n', "%d:roots:computed operand of read" % first),
+            ("an escaped read with a computed name", head + '\\read -r "$n"\n}\n',
+             "%d:roots:computed operand of read" % first),
+            ("command read with a computed name", head + 'command read -r "$n"\n}\n',
+             "%d:roots:computed operand of read" % first),
+            ("printf -v with a computed name", head + 'printf -v "$n" %s /dev\n}\n',
+             "%d:roots:computed operand of printf" % first),
+            ("mapfile with a computed name", head + 'mapfile -t "$n" < x\n}\n', "%d:roots:computed operand of mapfile" % first),
+            ("getopts with a computed name", head + 'getopts a: "$n"\n}\n', "%d:roots:computed operand of getopts" % first),
+            ("an escaped OUT_DIR assignment through declare", head + 'declare O\\UT_DIR=/dev\n}\n',
+             "%d:roots:computed name" % first),
+            ("an alias", head + "alias x=y\n}\n", "%d:roots:alias" % first)):
+        roots = root_findings(text)
+        probe("#5763 %s is reported as %s" % (label, want), want in roots, " ".join(roots[:4]))
+        probe("#5763 %s leaves a root target the terminal" % label,
+              target_kind('"$OUT_DIR/a"', text) == "terminal", target_kind('"$OUT_DIR/a"', text))
+    for label, text in (("a same-value pass-through", head + 'OUT_DIR="$OUT_DIR" true\n}\n'),
+                        ("a literal trap action", head + "trap 'rm -f x' EXIT\n}\n"),
+                        ("a cd into the root", head + 'cd "$OUT_DIR"\n}\n'),
+                        ("a read of a literal name from a root file", head + 'read -r l < "$OUT_DIR/x"\n}\n'),
+                        ("a read of a literal name from a here-string", head + 'read -r l <<< "$x"\n}\n'),
+                        ("printf -v to a literal name", head + "printf -v x %s y\n}\n")):
+        probe("#5763 %s keeps every root proven" % label, root_findings(text) == [], " ".join(root_findings(text)))
+        probe("#5763 %s keeps a target under OUT_DIR a file" % label,
+              target_kind('"$OUT_DIR/a"', text) == "file", target_kind('"$OUT_DIR/a"', text))
+
+
 def heredoc_5655():
     """#5655: here-document bodies are read: an ssh or scp in a body is a finding, a <<- body ends at its
     tab-indented terminator, every operator of a line counts in any delimiter spelling, <<< and $(( << )) are no
@@ -3235,6 +3553,11 @@ def comment_pin_5416():
           and "nor the working directory (cd,\n# pushd, popd, a subshell, env --chdir) decides" in block
           and "Stated limits:" in block and "bare name counts" not in block
           and "is taken as x, so" not in block and "relative name alone" not in block, "")
+    probe("#5763 the closed-world comment states the root proof and the arithmetic limit", "#5763" in block
+          and "are roots only while the scan proves their value" in block
+          and "a variable in a target other than a root is followed" in block
+          and "an integer that bash\n# arithmetic assigns" in block
+          and "a variable in a target is followed" not in block, "")
     changelog = (ROOT / "changelog.d" / "4654.fixed.md").read_text()
     probe("#5416 the changelog does not call any member of the allowed set a known silent consumer",
           "known silent consumer" not in changelog and "#5418" in changelog, "")
@@ -3306,6 +3629,7 @@ def main():
     node_streams_5171()
     ssh_batch_5274()
     heredoc_5655()
+    file_roots_5763()
     verify_cost_5247()
     verify_trace_5237()
     f3_static_pins()
