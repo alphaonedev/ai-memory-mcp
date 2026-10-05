@@ -85,7 +85,7 @@ PLACEHOLDER_URL = "postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verif
 ROTATED = "postgres://aimemory:abc123@localhost/aimemory?sslmode=verify-full\n"
 # #5640: one message per refusal cause.
 MSG_LINES = "store-url must hold exactly one non-empty line"
-MSG_SHAPE = "store-url line is not one aimemory URL of printable characters with an unreserved password"
+MSG_SHAPE = "store-url line is not one aimemory URL of printable ASCII characters with an unreserved password"
 MSG_PLACEHOLDER = "placeholder db password still in"
 
 
@@ -187,6 +187,53 @@ def f4_sed():
                 probe("F4 " + label + ": minted value in a URL, no placeholder", SECRET in got and "CHANGEME" not in got
                       and got.startswith("postgres://aimemory:" + SECRET + "@localhost/"), repr(got[:60]))
             probe("F4 " + label + ": secret on no external argv", SECRET not in argv)
+
+
+def utf8_locales():
+    """The UTF-8 locales the store-url locale cases run under: C.UTF-8 always (a missing one is a failure, not a
+    skip), en_US.UTF-8 when it is installed."""
+    r = subprocess.run(["locale", "-a"], capture_output=True, text=True)
+    have = {l.strip().lower().replace("-", "") for l in r.stdout.splitlines()}
+    return ["C.UTF-8"] + (["en_US.UTF-8"] if "en_us.utf8" in have else [])
+
+
+def store_url_shape_locale_5764():
+    """#5764: the store-url shape check refuses a URL with a byte outside printable ASCII in every locale. Under a
+    UTF-8 locale the [[:alnum:]] and [[:graph:]] classes match multibyte letters and a no-break space, so the sed
+    runs under LC_ALL=C."""
+    tpl = TPL.read_text()
+    probe("#5764 the shape sed runs under LC_ALL=C",
+          re.search(r"^ +SHAPED=\"\$\(LC_ALL=C sed -n 's#\^postgres\[:\]//aimemory:", tpl, re.M) is not None, "")
+    probe("#5764 the comment states ASCII and the C locale, and no any-locale claim",
+          "printable ASCII characters only" in tpl and "The shape sed runs under LC_ALL=C" in tpl
+          and "in\n      # any locale" not in tpl, "")
+    block = mint_block()
+    probe("#5764 mint block present", bool(block))
+    if not block:
+        return
+    locales = utf8_locales()
+    for lc in locales:
+        r = subprocess.run(["sed", "-n", "s#^[[:alnum:]]x[[:graph:]]$#y#p"], input="\u00e9x\u00a0\n".encode("utf-8"),
+                           capture_output=True, env={"PATH": os.environ["PATH"], "LC_ALL": lc})
+        probe("#5764 %s makes the classes match a multibyte letter and a no-break space (the case discriminates)" % lc,
+              r.stdout == b"y\n", repr(r.stdout))
+    for lc in locales + ["C", "POSIX"]:
+        for label, start, rc in (("an e-acute in the password", "postgres://aimemory:ab\u00e9@localhost/x\n", 1),
+                                 ("an e-acute in the host", "postgres://aimemory:abc123@loc\u00e9/x\n", 1),
+                                 ("a no-break space in the host", "postgres://aimemory:abc123@loc\u00a0x/x\n", 1),
+                                 ("a rotated ASCII URL", ROTATED, 0)):
+            with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as d:
+                f = pathlib.Path(d) / "store-url"
+                f.write_bytes(start.encode("utf-8"))
+                r = run_bash(block.replace("/etc/ai-memory/store-url", str(f)), pathlib.Path(d), {"LC_ALL": lc})
+                kept = f.read_bytes() == start.encode("utf-8")
+                if rc:
+                    probe("#5764 %s is refused with the shape message under %s, file unchanged" % (label, lc),
+                          r.returncode == 1 and r.stdout.startswith(MSG_SHAPE) and r.stdout.count("\n") == 1 and kept,
+                          "rc=%d %r" % (r.returncode, r.stdout[:70]))
+                else:
+                    probe("#5764 %s is kept under %s" % (label, lc), r.returncode == 0 and kept and not r.stdout,
+                          "rc=%d %r" % (r.returncode, r.stdout[:70]))
 
 
 def f5_admin_call():
@@ -3611,6 +3658,7 @@ def n3_main_tf():
 def main():
     (ROOT / ".local-runs").mkdir(exist_ok=True)
     f4_sed()
+    store_url_shape_locale_5764()
     f5_admin_call()
     f5_federate()
     f6_spawn()

@@ -518,9 +518,10 @@ write_files:
       # Fail closed: the daemon trims the file and reads all the rest as one URL,
       # so the file must hold exactly one non-empty line (#5521), that line must
       # have the URL shape (a password of unreserved or %-escaped characters, and
-      # printable characters only: no space, CR or other control or high byte, in
-      # any locale), and the shipped placeholder must never reach a running node
-      # (#5640). Each refusal names its cause.
+      # printable ASCII characters only: no space, CR or other control or high
+      # byte), and the shipped placeholder must never reach a running node
+      # (#5640). Each refusal names its cause. The shape sed runs under LC_ALL=C,
+      # so its classes match ASCII bytes alone whatever the node's locale (#5764).
       # Every line is printed behind an x, so none is empty and each is counted
       # whatever bytes it holds; an empty line prints a lone x. The file holds one
       # non-empty line when it has a line and as many newlines between its lines
@@ -535,9 +536,9 @@ write_files:
       fi
       # The scheme is written postgres[:]// so that no scan reads this pattern
       # as a URL whose password is the bracket text (#5640).
-      SHAPED="$(sed -n 's#^postgres[:]//aimemory:[[:alnum:]%._~-]\{1,\}@[[:graph:]]\{1,\}$#url#p' /etc/ai-memory/store-url)"
+      SHAPED="$(LC_ALL=C sed -n 's#^postgres[:]//aimemory:[[:alnum:]%._~-]\{1,\}@[[:graph:]]\{1,\}$#url#p' /etc/ai-memory/store-url)"
       if [ "$SHAPED" != url ]; then
-        echo "store-url line is not one aimemory URL of printable characters with an unreserved password: /etc/ai-memory/store-url"; exit 1
+        echo "store-url line is not one aimemory URL of printable ASCII characters with an unreserved password: /etc/ai-memory/store-url"; exit 1
       fi
       CUR="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
       if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ] || [[ "$CUR" == *[[:space:]]* ]]; then
