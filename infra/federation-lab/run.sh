@@ -30,11 +30,14 @@
 # most 50 peers; nothing here extends it.
 # =============================================================================
 # START STATE (#5740). A variable that makes bash run code in this shell before line 1 (BASH_ENV) or changes how it
-# parses (POSIXLY_CORRECT) is refused, as is any function already defined. Posix mode makes the refusal itself safe from
+# parses (POSIXLY_CORRECT) is refused, as is any function already defined. So is a variable bash reads from the
+# environment that changes what this script's own commands do (#5744): CDPATH (cd prints, and LAB doubles), GLOBIGNORE,
+# EXECIGNORE, FUNCNEST, BASH_COMPAT, TMOUT and GLOBSORT. Posix mode makes the refusal itself safe from
 # functions: the special builtins export and : are found before any function, and the ${..:?} expansion exits without a
 # command lookup. export -pf lists every imported function (#5741), even one named builtin or declare that would make the
 # declare -F list lie. lab_shell_state_proven (lib/posture.sh) then proves the traps, aliases, options and attributes.
-_lab_pre="${BASH_ENV+BASH_ENV }${POSIXLY_CORRECT+POSIXLY_CORRECT }"
+_lab_pre="${BASH_ENV+BASH_ENV }${POSIXLY_CORRECT+POSIXLY_CORRECT }${CDPATH+CDPATH }${GLOBIGNORE+GLOBIGNORE }${EXECIGNORE+EXECIGNORE }"
+_lab_pre="$_lab_pre${FUNCNEST+FUNCNEST }${BASH_COMPAT+BASH_COMPAT }${TMOUT+TMOUT }${GLOBSORT+GLOBSORT }"
 POSIXLY_CORRECT=1
 _lab_pre="$_lab_pre$(export -pf)$(builtin declare -F)"
 _lab_r=
