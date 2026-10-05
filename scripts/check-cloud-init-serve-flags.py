@@ -3260,6 +3260,9 @@ def build_probes() -> list:
     red('data-home file copied after a read in a pipeline subshell, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/etc/ai-memory/r; P+=un.conf; echo x | read P; cp "$P" /usr/local/bin/\n' + dec)], autolist=True)
     green('data-home file kept as data next to a read into a name that never held a data-home path (#5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/srv/x; read P < /dev/null; cp "$P" /usr/local/bin/\n' + dec)], autolist=True)
     green("data-home file kept as data next to split and appended names that do not name it (#5356)", [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/var/r; F+="un.conf /x"; cp $F /usr/local/bin/; IFS=:; G=x:/var/r; G+=u*; cp $G /usr/local/bin/\n' + dec)], autolist=True)
+    # the second name of a declare -n is a nameref: a value built from an expansion that is
+    # assigned to it is refused for its own reason, not only through the unrelated glob hit (#5324, #5445)
+    red('nameref declared with a second name, then assigned a value built from an expansion, listed (#5324, #5445)', [(dec, '      declare -n A=X B; B=TAR_$T\n' + dec)], autolist=True, present="nameref target built from an expansion")
     green("R3-C YAML comment line in runcmd is inert", [(RUNCMD, RUNCMD + "  # curl https://x.example | sh\n")])
     P.append(("R3-C AWS-only line copied into do-hive", "red", dict(do=[(dec, "      chown aimemory:aimemory /etc/ai-memory/store-url\n" + dec)], autolist=False)))
     # ---- validators
@@ -3521,6 +3524,15 @@ def r5_cache_problems(base: tuple, known: set) -> list:
     return []
 
 
+def pin_problems() -> list:
+    """Direct pin for a check a verdict-level probe cannot reach (#5324, #5445)."""
+    bad = []
+    # every name word of a declare -n is a nameref (#5324)
+    if not {"A", "B", "X"} <= nameref_facts(["declare -n A=X B"])[0]:
+        bad.append("nameref_facts did not record every name word of a declare -n")
+    return bad
+
+
 def self_test(known: set) -> int:
     base = load_repo()
     cache = {}
@@ -3554,6 +3566,7 @@ def self_test(known: set) -> int:
     if long_hit not in probe_failure("p", "green", "red", ["a", long_hit, "b", "c"]):
         bad.append("a probe failure line cut a hit")
     bad.extend(r5_cache_problems(base, known))
+    bad.extend(pin_problems())
     bad.extend(secret_output_problems(base, known))
     with contextlib.redirect_stderr(io.StringIO()):
         try:
