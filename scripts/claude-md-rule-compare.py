@@ -478,20 +478,21 @@ def refusal_prefix_gap(source: bytes) -> str:
     `if __name__ == "__main__" and not sys.flags.isolated:` whose body is calls to print and sys.exit with constant
     arguments; otherwise why not. Parsed with ast from the bytes, never executed, so the check reads the file the way
     the interpreter does. It is closed-world and fails closed, so it over-refuses rather than risk a miss. The exact rule,
-    each sentence pinned by pin_5590 (#5590):
-    a non-bytes argument is refused.
-    A utf-8 BOM is refused (detect_encoding reports it as utf-8-sig), alone or with any cookie.
-    A coding cookie on line 1 or 2 is judged after tokenize.detect_encoding's PEP 263 normalisation (the rule the
+    each numbered rule is asserted by pin_5590 (#5590, #5622), and pin_5590 fails if a numbered rule has no assertion
+    group; the structure paragraph above is pinned by pin_5510, pin_5562 and pin_5563:
+    R1: a non-bytes argument is refused.
+    R2: A utf-8 BOM is refused (detect_encoding reports it as utf-8-sig), alone or with any cookie.
+    R3: A coding cookie on line 1 or 2 is judged after tokenize.detect_encoding's PEP 263 normalisation (the rule the
     interpreter uses, so a cookie in any spelling on line 1 or 2 is covered). Accepted: utf-8 in any letter case, utf_8,
     utf-8- followed by anything (so utf-8-sig WITHOUT a BOM is accepted: it names utf-8 for the interpreter too), and
     exactly lower-case utf8. Refused: every other name, including UTF8 and Utf8 (the interpreter accepts them; this
     check does not), utf-7, latin-1 and an unknown codec.
-    Bytes that are not strict utf-8 are refused.
-    Any control byte other than tab, LF and CRLF line ends (NUL, form feed, a lone CR and the rest) is refused anywhere
-    in the file.
-    Any line above the refusal that ends in a backslash is refused, whether it is a real line continuation or only the
-    last character of a comment.
-    Module level statements are the only code that runs when the file is started, so a dynamic import, eval, exec, a
+    R4: Bytes that are not strict utf-8 are refused.
+    R5: Any control byte other than tab, LF and CRLF line ends (NUL, form feed, a lone CR and the rest) is refused
+    anywhere in the file.
+    R6: Any line above the refusal that ends in a backslash is refused, whether it is a real line continuation or only
+    the last character of a comment.
+    R7: Module level statements are the only code that runs when the file is started, so a dynamic import, eval, exec, a
     branch, a class body or a decorator above the refusal cannot hide: any statement outside this whitelist is refused."""
     if not isinstance(source, (bytes, bytearray)):
         return "the source is not bytes"
@@ -1042,24 +1043,81 @@ def _self_test_cases() -> int:
         return ""
 
     def pin_5590():
-        # #5590: one assertion per sentence of the refusal_prefix_gap docstring, so the stated rule is the enforced rule.
+        # #5590/#5622: every numbered rule R<n> of the refusal_prefix_gap docstring has an assertion group below, and the
+        # last check fails when the docstring numbers a rule that no group asserts.
         refusal, hidden, plain = pin_sources()
+        tail = refusal.split("import sys\n", 1)[1].encode()
+        asserted = set()
+        for label, arg in (("a str", plain.decode("utf-8")), ("None", None), ("an int", 7)):  # R1
+            if refusal_prefix_gap(arg) != "the source is not bytes":
+                return f"the docstring says {label} is refused as not bytes but the reason was {refusal_prefix_gap(arg)!r} (R1)"
+        asserted.add("R1")
+        bom = b"\xef\xbb\xbf"  # R2
+        for cookie in (b"", b"# coding: utf-8\n", b"# coding: utf8\n", b"# coding: utf-8-sig\n", b"# coding: latin-1\n",
+                       b"# coding: utf-7\n", b"# coding: nope\n"):
+            if not refusal_prefix_gap(bom + cookie + plain):
+                return f"the docstring says a utf-8 BOM with cookie {cookie!r} is refused but it was accepted (R2)"
+        asserted.add("R2")
         accepted = {"UTF_8 cookie": b"# coding: UTF_8\n", "utf-8-sig cookie without a BOM": b"# coding: utf-8-sig\n",
                     "utf-8-x cookie": b"# coding: utf-8-x\n", "upper-case UTF-8 cookie": b"# coding: UTF-8\n",
-                    "lower-case utf8 cookie": b"# coding: utf8\n", "utf_8 cookie": b"# coding: utf_8\n"}
-        for label, prefix in accepted.items():
+                    "lower-case utf8 cookie": b"# coding: utf8\n", "utf_8 cookie": b"# coding: utf_8\n",
+                    "mixed-case Utf-8 cookie": b"# coding: Utf-8\n", "utf-8 cookie on line 2 under a shebang": b"#!/usr/bin/env python3\n# coding: utf-8\n"}
+        for label, prefix in accepted.items():  # R3
             if refusal_prefix_gap(prefix + plain):
-                return f"the docstring says a {label} is accepted but it was refused (#5590)"
+                return f"the docstring says a {label} is accepted but it was refused (R3, #5590)"
         refused = {"UTF8 cookie": (b"# coding: UTF8\n" + plain, "declares the encoding UTF8"),
                    "Utf8 cookie": (b"# coding: Utf8\n" + plain, "declares the encoding Utf8"),
-                   "utf-8 BOM alone": (b"\xef\xbb\xbf" + plain, "declares the encoding utf-8-sig"),
-                   "utf-8 BOM and a utf-8-sig cookie": (b"\xef\xbb\xbf# coding: utf-8-sig\n" + plain, "declares the encoding utf-8-sig"),
-                   "a comment ending in a backslash": (b"# path C:\\\n" + plain, "ends with a line-continuation backslash"),
-                   "a comment ending in a backslash after a cookie": (b"# coding: utf-8\n# path C:\\\n" + plain, "ends with a line-continuation backslash")}
+                   "utf-7 cookie": (b"# coding: utf-7\n" + plain, "declares the encoding utf-7"),
+                   "utf-16 cookie": (b"# coding: utf-16\n" + plain, "declares the encoding utf-16"),
+                   "latin-1 cookie": (b"# coding: latin-1\n" + plain, "declares the encoding iso-8859-1"),
+                   "unknown codec": (b"# coding: nope\n" + plain, "the source encoding cannot be determined"),
+                   "utf-8 BOM alone": (bom + plain, "declares the encoding utf-8-sig"),
+                   "utf-8 BOM and a utf-8-sig cookie": (bom + b"# coding: utf-8-sig\n" + plain, "declares the encoding utf-8-sig")}
         for label, (data, needle) in refused.items():
             why = refusal_prefix_gap(data)
             if needle not in why:
-                return f"the docstring says {label} is refused with {needle!r} but the reason was {why!r} (#5590)"
+                return f"the docstring says {label} is refused with {needle!r} but the reason was {why!r} (R3, #5590)"
+        asserted.add("R3")
+        for label, data in {"a byte after line 2": b'"""doc"""\n# note\n# \xff\n' + refusal.encode(), "an overlong form": b'"""doc"""\n# note\n# \xc0\xaf\n' + refusal.encode(),
+                            "an encoded surrogate": b'"""doc"""\n# note\n# \xed\xa0\x80\n' + refusal.encode()}.items():  # R4
+            why = refusal_prefix_gap(data)
+            if "the source is not strict utf-8" not in why:
+                return f"the docstring says {label} that is not strict utf-8 is refused with that reason but it was {why!r} (R4)"
+        asserted.add("R4")
+        for byte in [*range(0, 9), 11, 12, *range(14, 32), 127]:  # R5: refused wherever it is
+            for where, data in (("at the end", plain + b"#" + bytes([byte]) + b"\n"), ("in the docstring", b'"""d' + bytes([byte]) + b'"""\n' + refusal.encode()),
+                                ("on line 1", b"#" + bytes([byte]) + b"\n" + plain)):
+                if "control byte" not in refusal_prefix_gap(data):
+                    return f"the docstring says control byte {byte:#04x} {where} is refused with the control byte reason but it was not (R5)"
+        for label, data in {"a lone CR at the end": plain + b"#\r", "a CR before CR LF": plain.replace(b"\n", b"\r\r\n", 1)}.items():
+            if "control byte" not in refusal_prefix_gap(data):
+                return f"the docstring says {label} is refused with the control byte reason but it was not (R5)"
+        for label, data in {"a tab in a comment": plain + b"#\t\n", "CRLF line ends": plain.replace(b"\n", b"\r\n")}.items():
+            if refusal_prefix_gap(data):
+                return f"the docstring says {label} is not a refused control byte but it was refused: {refusal_prefix_gap(data)!r} (R5)"
+        asserted.add("R5")
+        bs = "ends with a line-continuation backslash"
+        for label, data in {"a comment ending in a backslash": b"# path C:\\\n" + plain,
+                            "a comment ending in a backslash after a cookie": b"# coding: utf-8\n# path C:\\\n" + plain,
+                            "a comment ending in a backslash with CRLF": b'"""doc"""\r\n# C:\\\r\n' + refusal.encode().replace(b"\n", b"\r\n"),
+                            "a real line continuation": b'"""doc"""\nimport sys\n\\\n' + tail,
+                            "a backslash that ends the docstring slot line": b'"""doc \\\nmore"""\n' + refusal.encode()}.items():  # R6
+            why = refusal_prefix_gap(data)
+            if bs not in why:
+                return f"the docstring says {label} is refused with the backslash reason but it was {why!r} (R6)"
+        below = plain.replace(b'print("refused")', b'print("refused", \\\n    "x")')
+        if b"\\\n" not in below or refusal_prefix_gap(below):
+            return "the docstring says only a line ABOVE the refusal is refused for a backslash, but a backslash line inside the refusal body was refused (R6)"
+        asserted.add("R6")
+        for label, first in (("a dynamic import", "__import__('colorsys')\n"), ("an eval", "x = eval('1')\n"), ("an exec", "exec('pass')\n"),
+                             ("a branch", "if False:\n    import json\n"), ("a class body", "class C:\n    import json\n"),
+                             ("a decorator", "@(lambda f: f)\ndef g():\n    pass\n")):  # R7
+            if not refusal_prefix_gap(('"""doc"""\nimport sys\n' + first + refusal.split("import sys\n", 1)[1]).encode()):
+                return f"the docstring says {label} above the refusal is refused but it was accepted (R7)"
+        asserted.add("R7")
+        numbered = set(re.findall(r"^\s+(R\d+):", refusal_prefix_gap.__doc__ or "", re.M))
+        if not numbered or numbered != asserted:
+            return f"the docstring numbers the rules {sorted(numbered)} but pin_5590 asserts {sorted(asserted)} (#5622)"
         return ""
 
     refusal_pins = {"#5510": pin_5510, "#5560": pin_5560, "#5562": pin_5562, "#5563": pin_5563, "#5588": pin_5588, "#5589": pin_5589, "#5590": pin_5590}
