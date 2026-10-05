@@ -668,6 +668,17 @@ MDEOF
         "See \`$R::RecallTool<T\`\`Vec>\`."
 
 
+    # #5436: a brace item that holds a second src path is judged once, against
+    # the file it is qualified with; the head search resumes after the brace.
+    write_clean
+    printf '\n\n%s\n' "See $R::{src/store/postgres.rs::no_such} here." >> "$FIX/README.md"
+    [[ "$(run_fixture)" != "0" ]] || {
+        echo "FAIL: self-test #5436 — a missing name in a brace item with a second path was ACCEPTED" >&2; exit 1; }
+    [[ "$(run_fixture_out | grep -c 'cites "')" = "1" ]] || {
+        echo "FAIL: self-test #5436 — a brace item with a second src path must be reported exactly once" >&2
+        run_fixture_out | sed 's/^/       /' >&2; exit 1; }
+    echo "PASS: self-test #5436 — a brace item with a second src path is reported exactly once"
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
