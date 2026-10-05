@@ -58,7 +58,13 @@ template file):
                      scripts/qc-allowlists/argv-secrets-operand-allow.txt, keyed
                      by file and the sha256 of the whole command, written only
                      by scripts/regen-argv-secrets-allow.py; an entry that
-                     claims no hit fails the gate.
+                     claims no hit fails the gate. The hit names the value
+                     kind of the flagged operand (``value=literal``,
+                     ``placeholder``, ``expansion`` or ``none``) and never
+                     the value; a literal value (any character left after
+                     removing expansions and quotes, so ``pw=abc$X`` too)
+                     is never waived: the regen script refuses it by name
+                     and the gate refuses an entry that claims one (#5835).
   array-element-operand  the same operand shape among the elements of a bash
                      array body ``NAME=( ... )`` / ``NAME+=( ... )``, read as
                      one element list with no head, comments skipped (#5723):
@@ -187,8 +193,17 @@ UNKNOWN_TAG = "unknown-head-operand"
 ARRAY_TAG = "array-element-operand"
 SHAPE_TAG = "argv-credential-shape"
 WAIVABLE_TAGS = (UNKNOWN_TAG, ARRAY_TAG)
-WAIVABLE_RE = re.compile(r"\[(?P<tag>[a-z-]+)\] h=(?P<h>[0-9a-f]{32}) (?P<preview>.*)\Z")
-ALLOW_LINE_RE = re.compile(r"(?P<rel>[^|\s][^|]*?) \| (?P<tag>[a-z-]+) \| (?P<h>[0-9a-f]{32}) \| (?P<preview>.*)\Z")
+# F1 (round 12): what the value of a flagged NAME=VALUE operand is, read from its literal view:
+# literal when any character outside an expansion, a quote and a backslash is left (pw=abc$X
+# included), placeholder when what is left is a redaction or placeholder token, expansion when
+# only expansions are left, none when there is no "=" or no value. A literal value is never
+# waivable: the gate never claims it with an entry and the regen script refuses it by name.
+VALUE_LITERAL, VALUE_PLACEHOLDER, VALUE_EXPANSION, VALUE_NONE = "literal", "placeholder", "expansion", "none"
+VALUE_RANK = (VALUE_NONE, VALUE_EXPANSION, VALUE_PLACEHOLDER, VALUE_LITERAL)
+WAIVABLE_VALUES = (VALUE_NONE, VALUE_EXPANSION, VALUE_PLACEHOLDER)
+WAIVABLE_RE = re.compile(r"\[(?P<tag>[a-z-]+)\] h=(?P<h>[0-9a-f]{32}) value=(?P<kind>[a-z]+) (?P<preview>.*)\Z")
+ALLOW_LINE_RE = re.compile(r"(?P<rel>[^|\s][^|]*?) \| (?P<tag>[a-z-]+) \| (?P<h>[0-9a-f]{32}) \| (?P<kind>[a-z]+)"
+                           r" \| (?P<preview>.*)\Z")
 
 # Historical or machine-generated trees where quoted old commands are a record,
 # not a recommendation: the changelog fragments and the per-PR review evidence.
@@ -433,38 +448,53 @@ def command_hash(text: str, start: int, end: int) -> str:
 
 
 def mask_preview(text: str) -> str:
-    """#5722: the preview printed in a hit and stored in the allowlist: every =VALUE, every
-    URL password and every | (the allowlist field separator) is masked, at most 100 chars."""
+    """#5722: the preview printed in a hit and stored in the allowlist: every =VALUE (F1, round
+    12: a quoted value too, so pw='x' and pw="x" print as pw=*), every URL password and every |
+    (the allowlist field separator) is masked, at most 100 chars."""
     text = re.sub(r"(://[^\s/@:\"']*:)[^\s/@\"']+@", r"\1*@", text)
-    text = re.sub(r"=[^\s\"']+", "=*", text)
+    text = re.sub(r"=(?:\"(?:[^\"\\]|\\.)*\"?|'[^']*'?|[^\s\"'])+", "=*", text)
     return text.replace("|", "/")[:100]
 
 
-def load_allow(text: str) -> Tuple[List[Tuple[str, str, str, str]], List[str]]:
+def load_allow(text: str) -> Tuple[List[Tuple[str, str, str, str, str]], List[str]]:
     """(entries, faults) of the allowlist text. Comment and blank lines are skipped; any
-    other line must be 'path | tag | hash | preview' with a waivable tag (#5722)."""
-    entries: List[Tuple[str, str, str, str]] = []
+    other line must be 'path | tag | hash | value kind | preview' with a waivable tag (#5722)
+    and a value kind that is not literal (F1, round 12)."""
+    entries: List[Tuple[str, str, str, str, str]] = []
     faults: List[str] = []
     for n, ln in enumerate(text.splitlines(), 1):
         if not ln.strip() or ln.startswith("#"):
             continue
         m = ALLOW_LINE_RE.fullmatch(ln)
         if not m:
-            faults.append("line %d is not 'path | tag | hash | preview'" % n)
+            faults.append("line %d is not 'path | tag | hash | value kind | preview'" % n)
         elif m.group("tag") not in WAIVABLE_TAGS:
             faults.append("line %d: class %s cannot be allowlisted" % (n, m.group("tag")))
+        elif m.group("kind") not in WAIVABLE_VALUES:
+            faults.append("line %d: a %s value cannot be allowlisted" % (n, m.group("kind")))
         elif mask_preview(m.group("preview")) != m.group("preview"):
             faults.append("line %d: preview is not masked" % n)
         else:
-            entries.append((m.group("rel"), m.group("tag"), m.group("h"), m.group("preview")))
+            entries.append((m.group("rel"), m.group("tag"), m.group("h"), m.group("kind"), m.group("preview")))
     return entries, faults
 
 
-def waivable_key(hit: Hit) -> Optional[Tuple[str, str, str, str]]:
+def waivable_key(hit: Hit) -> Optional[Tuple[str, str, str, str, str]]:
+    """The allowlist key of a waivable hit, or None. A hit whose value is literal has no key
+    (F1, round 12): no entry can claim it."""
     m = WAIVABLE_RE.match(hit[2])
-    if not m or m.group("tag") not in WAIVABLE_TAGS:
+    if not m or m.group("tag") not in WAIVABLE_TAGS or m.group("kind") not in WAIVABLE_VALUES:
         return None
-    return (hit[0], m.group("tag"), m.group("h"), m.group("preview"))
+    return (hit[0], m.group("tag"), m.group("h"), m.group("kind"), m.group("preview"))
+
+
+def literal_waivable_key(hit: Hit) -> Optional[Tuple[str, str, str, str, str]]:
+    """F1 (round 12): the key a waivable-class hit would have if its value were not literal, for
+    the regen script to name in its refusal; None for every other hit."""
+    m = WAIVABLE_RE.match(hit[2])
+    if not m or m.group("tag") not in WAIVABLE_TAGS or m.group("kind") != VALUE_LITERAL:
+        return None
+    return (hit[0], m.group("tag"), m.group("h"), m.group("kind"), m.group("preview"))
 
 
 def split_allowed(hits: List[Hit], entries) -> Tuple[List[Hit], int, List[str]]:
@@ -482,7 +512,7 @@ def split_allowed(hits: List[Hit], entries) -> Tuple[List[Hit], int, List[str]]:
             claimed.append(k)
         else:
             left.append(h)
-    stale = ["%s | %s | %s | %s" % k for k in sorted(want.elements())]
+    stale = ["%s | %s | %s | %s | %s" % k for k in sorted(want.elements())]
     if not stale and claimed != list(entries):
         stale.append("entries are not in tree order; run scripts/regen-argv-secrets-allow.py")
     return left, len(claimed), stale
@@ -2180,7 +2210,35 @@ def mount_shaped(view_operand: str, literal_operand: str) -> bool:
     return True
 
 
-def credential_operand(text: str, words: List[Word], narrow: bool, resplit: bool) -> bool:
+VALUE_STRIP_RE = re.compile("[\x02\"'\\\\]")
+
+
+def operand_value_kind(literal_operand: str) -> str:
+    """F1 (round 12): the value kind of one flagged operand, read from its literal view (an
+    expansion is \\x02 there): the value after the first literal "=" with every expansion, quote
+    and backslash removed is literal when anything is left that is not a placeholder (so
+    pw=abc$X is literal), placeholder when what is left is one, and expansion when nothing is
+    left but an expansion was there. An operand with no literal "=" has no literal NAME=VALUE
+    value: it is an expansion when it holds one (the expansion supplies any value at run time),
+    literal when its whole text is literal and secret-named (the bare word may be the secret
+    itself), and none otherwise."""
+    eq = literal_operand.find("=")
+    if eq < 0 and "\x02" not in literal_operand and PSQL_SECRET_VAR_NAME_RE.search(
+            VALUE_STRIP_RE.sub("", literal_operand)):
+        return VALUE_LITERAL
+    value = literal_operand[eq + 1:] if eq >= 0 else ""
+    rest = VALUE_STRIP_RE.sub("", value).replace("\x01", " ").strip()
+    if rest:
+        if SHAPE_PLACEHOLDER_RE.fullmatch(rest) or is_redaction(rest):
+            return VALUE_PLACEHOLDER
+        return VALUE_LITERAL
+    return VALUE_EXPANSION if "\x02" in literal_operand else VALUE_NONE
+
+
+def credential_operand(text: str, words: List[Word], narrow: bool, resplit: bool) -> Optional[str]:
+    """The strongest value kind (VALUE_RANK) of the command's flagged credential operands, or
+    None when none is flagged (F1, round 12: the kind decides whether the hit may be waived)."""
+    kind: Optional[str] = None
     for mask in (True, False) if resplit else (True,):
         view, lits = operand_views(text, words, mask)
         for m in PSQL_VAR_OPT_RE.finditer(view):
@@ -2188,8 +2246,10 @@ def credential_operand(text: str, words: List[Word], narrow: bool, resplit: bool
             if narrow and mount_shaped(view[a:b], lits[a:b]):
                 continue
             if psql_var_operand_flagged(m.group("operand")):
-                return True
-    return False
+                k = operand_value_kind(lits[a:b])
+                if kind is None or VALUE_RANK.index(k) > VALUE_RANK.index(kind):
+                    kind = k
+    return kind
 
 
 def inside_wrapper(text: str, words: List[Word], at: int) -> bool:
@@ -2203,13 +2263,15 @@ def inside_wrapper(text: str, words: List[Word], at: int) -> bool:
     return False
 
 
-def unproven_operand_commands(text: str, depth: int = 0) -> List[Tuple[int, int, int, str]]:
+def unproven_operand_commands(text: str, depth: int = 0) -> List[Tuple[int, int, int, str, str]]:
     """(report offset, start, end, class) of every command of text that is not proven clean
     and carries a credential-shaped -v / --set / --variable operand. class is UNKNOWN when the
     head is a literal program the gate does not model (#5722): only that class may be waived,
     line by line, by ALLOW_FILE, and so may ARRAY, an array body's element list (#5723);
-    every other class is "" and is never waived."""
-    found: List[Tuple[int, int, int, str]] = []
+    every other class is "" and is never waived. The fifth field is the value kind of the
+    flagged operands (operand_value_kind; VALUE_NONE for a string hit): a literal one is never
+    waived (F1, round 12)."""
+    found: List[Tuple[int, int, int, str, str]] = []
     seen = set()
     for words, forced, array in shell_commands(text):
         key = (words[0][0], words[-1][1])
@@ -2221,11 +2283,13 @@ def unproven_operand_commands(text: str, depth: int = 0) -> List[Tuple[int, int,
             # #5722: a command the walker could not finish is undecidable, never waivable.
             verdict = UNDECIDED
         report = words[min(at, len(words) - 1)][0]
-        if verdict == STRING_HIT or (verdict in (UNDECIDED, UNKNOWN, ARRAY, RUNNER, PSQL)
-                                     and credential_operand(text, words, verdict != PSQL,
-                                                         verdict == RUNNER or (verdict in (UNDECIDED, UNKNOWN)
-                                                                               and inside_wrapper(text, words, at)))):
-            found.append((report, words[0][0], words[-1][1], verdict if verdict in (UNKNOWN, ARRAY) else ""))
+        kind = VALUE_NONE if verdict == STRING_HIT else (
+            credential_operand(text, words, verdict != PSQL,
+                               verdict == RUNNER or (verdict in (UNDECIDED, UNKNOWN)
+                                                     and inside_wrapper(text, words, at)))
+            if verdict in (UNDECIDED, UNKNOWN, ARRAY, RUNNER, PSQL) else None)
+        if kind is not None:
+            found.append((report, words[0][0], words[-1][1], verdict if verdict in (UNKNOWN, ARRAY) else "", kind))
     return found
 
 
@@ -2467,7 +2531,7 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
     # #5556 #5557 #5558 and round 9: a credential operand is clean only under a command whose
     # head is proven literal and not psql (unproven_operand_commands); one hit per line.
     argv_lines = {hit[1] for hit in hits if hit[2].startswith("[env-password-argv] ")}
-    for report, start, end, cls in unproven_operand_commands(joined):
+    for report, start, end, cls, kind in unproven_operand_commands(joined):
         line = _line_of(text, report)[0]
         if line in argv_lines:
             continue
@@ -2476,8 +2540,14 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
             # #5722 #5723: an unknown head or an array body is waivable, so its hit carries the
             # allowlist key.
             tag = UNKNOWN_TAG if cls == UNKNOWN else ARRAY_TAG
-            hits.append((rel, line, "[%s] h=%s %s" % (tag, command_hash(text, start, end),
-                                                       mask_preview(psql_command_snippet(text, start, end)))))
+            # F1 (round 12): the hit states the value kind, never the value: a literal kind also
+            # masks every bare secret-named word (the word itself may be the secret).
+            preview = mask_preview(psql_command_snippet(text, start, end))
+            if kind == VALUE_LITERAL:
+                preview = " ".join("*" if "=" not in w and PSQL_SECRET_VAR_NAME_RE.search(w) else w
+                                   for w in preview.split(" "))
+            hits.append((rel, line, "[%s] h=%s value=%s %s" % (tag, command_hash(text, start, end), kind,
+                                                                preview)))
             continue
         hits.append((rel, line, "[env-password-argv] " + psql_command_snippet(text, start, end)))
     for rule, tag in ((PSQL_URL_RE, "psql-url-password"), (DOCKER_ENV_DSN_RE, "env-dsn-argv"),
@@ -3735,18 +3805,23 @@ def r9_variants(text: str) -> List[Tuple[str, str, str]]:
 def allow_self_test(bad: int, red: int, green: int) -> Tuple[int, int, int]:
     """#5722: the allowlist loader and matcher. Red: a fault or a stale entry is reported;
     green: a well-formed entry claims exactly one matching hit."""
-    hit = text_rule_hits("probe.sh", "pgbench -v db_" + "password=x1 -f a.sql\n")
+    hit = text_rule_hits("probe.sh", "pgbench -v db_" + "password=\"$X1\" -f a.sql\n")
     key = waivable_key(hit[0]) if hit else None
-    if key is None:
+    if key is None or key[3] != VALUE_EXPANSION:
         print("SELF-TEST FAIL: allowlist: the probe hit has no waivable key: %r" % (hit,), file=sys.stderr)
         return bad + 1, red, green
-    good = "# header\n\n%s | %s | %s | %s\n" % key
+    good = "# header\n\n%s | %s | %s | %s | %s\n" % key
     cases = [
         ("well-formed entry", good, 0),
-        ("missing field", "%s | %s | %s\n" % key[:3], 1),
+        ("missing field", "%s | %s | %s | %s\n" % key[:4], 1),
         ("short hash", good.replace(key[2], key[2][:31]), 1),
         ("class that is never waivable", good.replace(UNKNOWN_TAG, "env-password-argv"), 1),
         ("unmasked preview", good.replace("=*", "=x1"), 1),
+        # F1 (round 12): a quoted value is a value; an entry that prints one is unmasked.
+        ("unmasked single-quoted preview", good.replace("=*", "='x1'"), 1),
+        ("unmasked double-quoted preview", good.replace("=*", '="x1"'), 1),
+        ("a literal value is never allowlisted", good.replace(" | expansion | ", " | literal | "), 1),
+        ("an unknown value kind", good.replace(" | expansion | ", " | secret | "), 1),
         ("a program name instead of a line", "pgbench\n", 1),
     ]
     for label, text, want in cases:
@@ -3759,19 +3834,42 @@ def allow_self_test(bad: int, red: int, green: int) -> Tuple[int, int, int]:
             print("SELF-TEST FAIL: allowlist loader %r: entries %r faults %r" % (label, entries, faults),
                   file=sys.stderr)
             bad += 1
+    # F1 (round 12): a literal, quoted or not, or mixed with an expansion, has no key and no
+    # entry can claim it; the hit names its kind and never prints the value.
+    for spelled in ("pw=hunter2LIVE", "pw='hunter2LIVE'", 'pw="hunter2LIVE"', "pw=hunter2LIVE$X",
+                    "pw=$X'hunter2LIVE'", "hunter2LIVE_token"):
+        red += 1
+        lit = text_rule_hits("probe.sh", "mytool -v " + spelled.replace("pw", "p" + "w").replace(
+            "hunter2LIVE", "hunter2" + "LIVE") + "\n")
+        if (len(lit) != 1 or waivable_key(lit[0]) is not None or literal_waivable_key(lit[0]) is None
+                or " value=literal " not in lit[0][2] or "hunter2" + "LIVE" in lit[0][2]):
+            print("SELF-TEST FAIL: allowlist: literal value %r: %r" % (spelled, lit), file=sys.stderr)
+            bad += 1
+        elif split_allowed(lit, [literal_waivable_key(lit[0])])[1] != 0:
+            print("SELF-TEST FAIL: allowlist: a literal-kind entry claimed %r" % (lit,), file=sys.stderr)
+            bad += 1
+    for spelled, want in (("pw=$X", VALUE_EXPANSION), ("pw=\"${X}\"", VALUE_EXPANSION),
+                          ("pw='<password>'", VALUE_PLACEHOLDER), ("pw=xxxx", VALUE_PLACEHOLDER),
+                          ("${X}_token", VALUE_EXPANSION)):
+        green += 1
+        got = text_rule_hits("probe.sh", "mytool -v " + spelled.replace("pw", "p" + "w") + "\n")
+        if len(got) != 1 or (waivable_key(got[0]) or ("",) * 4)[3] != want:
+            print("SELF-TEST FAIL: allowlist: value kind of %r is not %s: %r" % (spelled, want, got),
+                  file=sys.stderr)
+            bad += 1
     other = ("probe.sh", 2, "[env-password-argv] x")
-    hit2 = text_rule_hits("probe.sh", "\nsite-dbctl --set tok" + "en=y2 apply\n")
+    hit2 = text_rule_hits("probe.sh", "\nsite-dbctl --set tok" + "en=\"$Y2\" apply\n")
     key2 = waivable_key(hit2[0]) if hit2 else None
     if key2 is None:
         print("SELF-TEST FAIL: allowlist: the second probe hit has no waivable key: %r" % (hit2,), file=sys.stderr)
         return bad + 1, red, green
-    other_key = ("probe.sh", "env-password-argv", "a" * 32, "x")
-    other_h = ("probe.sh", 2, "[env-password-argv] h=%s x" % ("a" * 32))
+    other_key = ("probe.sh", "env-password-argv", "a" * 32, VALUE_EXPANSION, "x")
+    other_h = ("probe.sh", 2, "[env-password-argv] h=%s value=expansion x" % ("a" * 32))
     # #5722: the key hashes the command with whitespace runs and backslash-newlines read as one
     # space, so a re-wrapped or re-spaced line keeps its reviewed entry; any other edit voids it.
     red += 1
-    respaced = text_rule_hits("probe.sh", "pgbench  -v \\\n    db_" + "password=x1 -f a.sql\n")
-    edited = text_rule_hits("probe.sh", "pgbench -v db_" + "password=x2 -f a.sql\n")
+    respaced = text_rule_hits("probe.sh", "pgbench  -v \\\n    db_" + "password=\"$X1\" -f a.sql\n")
+    edited = text_rule_hits("probe.sh", "pgbench -v db_" + "password=\"$X2\" -f a.sql\n")
     if not respaced or waivable_key(respaced[0])[2] != key[2] or not edited \
             or waivable_key(edited[0])[2] == key[2]:
         print("SELF-TEST FAIL: allowlist: command hash normalisation: %r %r" % (respaced, edited),
@@ -4067,7 +4165,7 @@ def self_test() -> int:
                 bad += 1
     # #5722: the allowlist file is read by its loader, not scanned as a doc.
     green += 1
-    allow_probe = "x.sh | %s | %s | awk -v pw=* 1\n" % (UNKNOWN_TAG, "a" * 32)
+    allow_probe = "x.sh | %s | %s | expansion | awk -v pw=* 1\n" % (UNKNOWN_TAG, "a" * 32)
     if scan_text(ALLOW_REL, allow_probe) or load_allow(allow_probe)[1]:
         print("SELF-TEST FAIL: the allowlist file was scanned or its entry refused", file=sys.stderr)
         bad += 1
