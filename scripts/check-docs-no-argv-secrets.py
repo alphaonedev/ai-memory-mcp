@@ -3027,6 +3027,8 @@ R10_XTRACE_RED = {
     '5597-x43-off-in-multiline-function': 'set -x\nf() {\n  set +x\n}\n',
     '5597-x44-off-in-multiline-while': 'set -x\nwhile r; do\n  set +x\ndone\n',
     '5597-x45-off-in-case-arm': 'set -x\ncase $a in\n  b) set +x ;;\nesac\n',
+    # #5727: the function keyword form; pins function in XTRACE_CONDITIONAL_WORDS.
+    '5727-x46-off-in-function-keyword-body': 'set -x\nfunction f { echo; set +x; }\n',
 }
 R10_XTRACE_GREEN = {
     '5597-g01-set-off-later-cluster': 'set -x\nset -e +x\n',
@@ -3048,6 +3050,9 @@ R10_XTRACE_GREEN = {
     '5597-g17-off-with-comment': 'set -x\nset +x # done\n',
     '5597-g18-off-after-closed-block': 'set -x\nif x; then\n  true\nfi\nset +x\n',
     '5597-g19-off-after-one-line-function': 'set -x\nf() { true; }\nset +x\n',
+    # #5727 (reviewer M6): an attached -S word is split, so -Sexpect is not read as a cluster
+    # holding an x; pins the split in shebang_xtrace.
+    '5727-g20-shebang-env-S-attached-no-x': '#!/usr/bin/env -Sexpect -f\n',
 }
 
 
