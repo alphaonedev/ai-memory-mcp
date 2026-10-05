@@ -1304,9 +1304,16 @@ jobs:
     # Shell-like files: shlex words per logical line, scanned for a credential
     # postgres URL (also --opt=<dsn> and inside sh -c / ssh strings), a keyword
     # conninfo password=, a docker/podman/nerdctl -e NAME=<secret>, and a unit
-    # Environment= credential URL (#4689-#4694). Not claimed: runtime-assembled
-    # arguments and SQL literals in psql -c (see the script header). The one
-    # allowlisted verb is schema-init (#4600); PENDING lists the #4762 sites.
+    # Environment= credential URL (#4689-#4694); a credential operand under a
+    # head the gate does not model or in a bash array body (#5722, #5723);
+    # and, inside shell-like fences and files, the argv-credential-shape rule
+    # (#5725: a password/token-named flag with a literal value, a NAME=secret
+    # operand, a URL with userinfo, an Authorization header). No verb is
+    # exempt (schema-init is checked like any other, #4600). PENDING lists the
+    # #4600 and #4864 sites; the operand allowlist holds reviewed lines only.
+    # Not claimed: the STATED LIMITS in the script header (runtime-assembled
+    # arguments, SQL literals in psql -c, attached short-flag secrets, bare
+    # positional secrets, .md prose outside a fence). A PASS is not a proof.
     name: No-credentials-on-argv gate (#4577)
     runs-on: ubuntu-latest
     timeout-minutes: 12
@@ -1317,8 +1324,10 @@ jobs:
       - name: Self-test the gate (regression evidence)
         # Red probes for every rule above in .md, .sh, .tpl and .service
         # files, redacted hit snippets, the pending/stale mechanism and the
-        # file walk. Green near-misses: assignments, env prefixes, echo/printf,
-        # YAML values, redaction tokens, bare -e NAME, the schema-init verb.
+        # file walk, the unknown-head and array-body rows, the shape rule rows
+        # and the top-level set +x rows. Green near-misses: assignments, env
+        # prefixes, the bare echo/printf builtins, YAML values, redaction
+        # tokens, bare -e NAME, the schema-init file channel.
         run: python3 scripts/check-docs-no-argv-secrets.py --self-test
       - name: Operand allowlist is current and regen-written (#5722)
         # 5-agent vote (4d3ea1c5): the reviewed-line allowlist of the

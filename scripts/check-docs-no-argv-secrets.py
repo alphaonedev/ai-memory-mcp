@@ -65,6 +65,16 @@ template file):
                      the elements reach an argv only through ``"${NAME[@]}"``,
                      which a text gate cannot follow. Waived only by a
                      reviewed line in the same allowlist.
+  argv-credential-shape  a closed set of credential shapes in an operand of
+                     any command, whatever the program (#5725): a URL whose
+                     userinfo holds a password (``scheme://user:pass@``); a
+                     flag whose last name part is password, passwd, secret or
+                     token, with a value attached by ``=`` or in the next word;
+                     a ``NAME=VALUE`` operand (also ``--opt=NAME=VALUE``) whose
+                     NAME ends in one of those words; an ``Authorization:``
+                     header value. Read on every command of a shell-like file
+                     and inside a shell-like or untagged fence of a .md file;
+                     the value is masked in the report. Not waivable.
   cloud-init-readable-secret  a cloud-init ``write_files`` entry left group or
                      world readable (or with no ``permissions``) whose content
                      interpolates a ``${..password|secret|token|key|cred..}``
@@ -87,9 +97,10 @@ matches no hit fails the gate as stale.
 Not an argv, so not refused: a variable assignment before the command word
 (``PGPASSWORD=x psql``) or after ``export``/``local``/``readonly``/``declare``;
 a comment; a line that is only a URL (a file line the script writes); a YAML
-``key: value`` mapping line; echo/printf (shell builtins); a redaction token
-(an ellipsis, asterisks, ``REDACTED``, ``<redacted>``); a value with no
-credential (``"$DSN"``).
+``key: value`` mapping line; echo or printf as the bare command word (shell
+builtins; ``/bin/echo`` and ``sudo echo`` run a program and are read); a
+redaction token (an ellipsis, asterisks, ``REDACTED``, ``<redacted>``); a value
+with no credential (``"$DSN"``).
 
 What the gate does NOT claim:
 
@@ -98,11 +109,33 @@ What the gate does NOT claim:
     is not seen here. For the two cloud-init templates that class is closed
     by scripts/check-cloud-init-serve-flags.py, which approves every sensitive
     template line from an exact allowlist.
-  * Prose (.md) is checked for ``--store-url`` only; a heredoc body is read as
-    commands (stricter, not looser); .tf, .py and .rs sources are checked for
-    ``--store-url`` only.
+  * Which files each rule reads: the shell parse above runs on shell-like
+    files only, where a heredoc body is read as commands (stricter, not
+    looser); the ``--store-url`` rule and the text rules from
+    store-url-expansion to array-element-operand run on every text file,
+    prose and .tf, .py and .rs sources included (xtrace-secret on .sh, .tpl,
+    .yaml and .yml; cloud-init-readable-secret on .tpl, .yaml and .yml);
+    argv-credential-shape reads shell-like files and the shell-like fences of
+    a .md file, never .md prose outside a fence.
   * changelog.d/, docs/reviews/, docs/handoff/ and CHANGELOG.md are records,
     not recommendations, and are skipped.
+
+STATED LIMITS. Shapes no rule reads; each is pinned as missed by a
+``--self-test`` row (R11_SHAPE_LIMITS), so closing one must update this list
+and the changelog (Refs #5725):
+
+  * a short flag that is a password only by one program's convention
+    (``mysql -pVALUE``, ``redis-cli -a VALUE``, ``skopeo login -p VALUE``,
+    ``az login -p VALUE``);
+  * ``user:pass`` after ``-u`` (``curl -u``);
+  * a bare positional secret (``vault login VALUE``, the keys of
+    ``mc alias set``);
+  * a credential inside a non-shell ``-c`` string (``python3 -c``);
+  * .md prose outside a fenced block, for argv-credential-shape.
+
+So a PASS means that no tracked line matches a rule above outside the PENDING
+list and the reviewed allowlist. It is not a proof that no credential reaches
+a process argv.
 
 Usage:
   scripts/check-docs-no-argv-secrets.py             exit 0 clean, 1 on a hit,
@@ -2323,7 +2356,8 @@ def shape_operands(text: str, words: List[Word], array: bool) -> List[Word]:
     if k >= len(words):
         return []
     first = shape_word(text, words[k])
-    if first.rstrip("/").rsplit("/", 1)[-1] in SHAPE_NON_EXEC_HEADS:
+    # A builtin only as a bare command word: /bin/echo is a program, and its argv is visible.
+    if first in SHAPE_NON_EXEC_HEADS:
         return []
     # No program is named with a leading dash: a first word that is an option is an argument
     # list item (a YAML args: entry), so it is an operand itself.
@@ -2568,7 +2602,10 @@ def run() -> int:
             file=sys.stderr,
         )
         return 1
-    print("PASS: check-docs-no-argv-secrets: %d files scanned, 0 argv credentials, %d pending (listed, not approved), "
+    # #5724: the PASS line names what was checked and points at the limits; it is not a proof
+    # that no credential reaches an argv.
+    print("PASS: check-docs-no-argv-secrets: %d files scanned, 0 hits of the checked shapes (the rules and the "
+          "STATED LIMITS are in the script header), %d pending (listed, not approved), "
           "%d allowlisted (reviewed lines, %s)" % (scanned, len(listed), allowed, ALLOW_REL))
     return 0
 
@@ -3636,6 +3673,9 @@ R11_SHAPE_RED = {
     '5725-r15-hash-inside-word': 'tool x#y --password S3cr3tPass',
     '5725-r16-hash-inside-quotes': 'tool "a #b" --password S3cr3tPass',
     '5725-r17-continued-line': 'tool \\\n  --password S3cr3tPass',
+    # #5724: echo and printf are builtins only as a bare command word; a path is the program.
+    '5724-r18-echo-by-path': '/bin/echo --password S3cr3tPass',
+    '5724-r19-echo-under-sudo': 'sudo echo --password S3cr3tPass',
 }
 R11_SHAPE_GREEN = {
     '5725-g01-password-stdin': 'docker login -u u --password-stdin registry.example.com',
