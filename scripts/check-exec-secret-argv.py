@@ -2101,6 +2101,8 @@ ROUND3_GREEN = [
     ('5696 mutant pin: clean 1: an escaped space stays inside its word', 'mysql -u r x\\ "$Y"'),
     ('5697 mutant pin: clean 1: a head inside an echoed quoted string is not a command', 'echo "restoring mysql $DB"'),
     ('5697 mutant pin: clean 2: a head inside an echoed quoted string is not a command', 'echo "see mysql -p$X"'),
+    ('5729 mutant pin: clean 1: a semicolon ends the mysql command', 'mysql -u r db; echo "$X"'),
+    ('5729 mutant pin: clean 2: a pipe ends the mysql command', 'mysql -u r db | grep "$X"'),
 ]
 
 # Raw logical-line text that holds a newline (the arm is a function of text; every unit the gate builds today is
