@@ -15,7 +15,8 @@ the build context directory it is given.
 Cases:
   - the build context holds no file at all, so neither the CA key nor a
     secret file is sent, and the Dockerfile comes in through -f;
-  - a build context directory that is not empty is refused before docker runs.
+  - a build context directory that is not empty is refused before docker runs;
+  - one that holds only a dotfile or only a dot directory is refused too (#5728).
 
 Scratch lives under <repo>/.local-runs (the repository forbids /tmp).
 """
@@ -126,6 +127,25 @@ class TestHivePgAgeBuildContext5401(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0, "a non-empty build context must be refused")
         self.assertIn("#5401", proc.stderr)
         self.assertEqual(self.docker_calls(), [], "docker must not run")
+
+    def test_build_context_holding_only_a_dot_entry_is_refused_5728(self):
+        # #5728: a context that holds only a dotfile or a dot directory is not empty either;
+        # ls without -A lists neither, so this case pins the -A of the emptiness check.
+        for name, is_dir in ((".env", False), (".secrets", True)):
+            with self.subTest(entry=name):
+                ctx = self.hive / "pg-age/build-ctx"
+                shutil.rmtree(str(ctx), True)
+                ctx.mkdir()
+                if is_dir:
+                    (ctx / name).mkdir()
+                else:
+                    (ctx / name).write_text("x\n", encoding="utf-8")
+                if self.log.exists():
+                    self.log.unlink()
+                proc = self.run_line(SCRIPT.read_text(encoding="utf-8"))
+                self.assertNotEqual(proc.returncode, 0, "a context holding only %s must be refused" % name)
+                self.assertIn("#5401", proc.stderr)
+                self.assertEqual(self.docker_calls(), [], "docker must not run")
 
 
 if __name__ == "__main__":
