@@ -1051,8 +1051,12 @@ def check_allow_vs_denylist(found: Dict[str, List[Found]], allow: List[Entry]) -
 
 
 def _git(root: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(root)] + list(args), check=True, capture_output=True).stdout.decode(
-        "utf-8", "replace")
+    # GIT_GRAFT_FILE points at the null device: .git/info/grafts is honoured even under
+    # --no-replace-objects and could make a row-dropping commit a root, so no read of the history
+    # follows a graft (#5503; replace refs are switched off per call with --no-replace-objects)
+    env = dict(os.environ, GIT_GRAFT_FILE=os.devnull)
+    return subprocess.run(["git", "-C", str(root)] + list(args), check=True, capture_output=True,
+                          env=env).stdout.decode("utf-8", "replace")
 
 
 def allow_from_pending(allow: List[Entry], base_pending: List[Entry], renames: Dict[str, str]) -> List[str]:
@@ -2359,6 +2363,14 @@ def _history_cases(t: Path) -> Tuple[List[str], int]:
     commit(repo, "remove")
     git(repo, "replace", "HEAD", "HEAD~1")
     judge_repo("a removal hidden behind a replace ref", repo)
+    # a graft that makes the removing commit a root: git honours .git/info/grafts even with
+    # --no-replace-objects, so the scan points GIT_GRAFT_FILE at the null device (#5503)
+    repo = fresh("graft")
+    drop(repo)
+    commit(repo, "remove")
+    (repo / ".git" / "info").mkdir(parents=True, exist_ok=True)
+    (repo / ".git" / "info" / "grafts").write_text(git(repo, "rev-parse", "HEAD").strip() + "\n")
+    judge_repo("a removal hidden behind a graft", repo)
     # every line-terminator and trailing-whitespace form of a row is read as the row (#5501): a row that ends
     # in CRLF, a row with trailing blanks, and a row hidden behind a lone CR in a comment line
     for tag, enc in (("crlf", lambda r: r + "\r\n"), ("trailing-blanks", lambda r: r + " \t\n"),
