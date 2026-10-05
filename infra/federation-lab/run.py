@@ -30,9 +30,9 @@ module, import hook or builtin that a plain start does not have, and no LD_* or 
 variable. A start with -I but without -S re-executes itself once with -I -S, so the program
 runs in a process where no .pth file or sitecustomize of the installation ran; where that site
 code already replaced a sys hook (Ubuntu's apport replaces sys.excepthook) the start is refused
-like any other replacement, so start it with -I -S as the first line does. Stated limits: code that runs inside the interpreter before line 1
-(an LD_PRELOAD library already loaded, an audit hook, a modified installation) can forge any
-check; the python3 found on PATH and its installation are trusted; Python 3.9 has no
+like any other replacement, so start it with -I -S as the first line does. Stated limits: code
+that runs inside the interpreter before line 1 (an LD_PRELOAD library already loaded, an audit
+hook, a modified installation) can forge any check; the python3 found on PATH and its installation are trusted; Python 3.9 has no
 sys.orig_argv, so there the entry check rests on __file__, __spec__ and sys.argv[0].
 
 EXIT CODES. 0 only when at least one PASS was recorded, no FAIL was, and the summary and every
@@ -2038,8 +2038,11 @@ def _selftest_signal_exit(T, base, signum, want):
 
     saved = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM), globals()["Lab"])
     globals()["Lab"] = _SignalLab
+    gone = []
     try:
         rc = main([], {"PATH": "/usr/bin:/bin"})
+        for proc in started:
+            gone.append(_pid_gone(proc))
     finally:
         globals()["Lab"] = saved[2]
         signal.signal(signal.SIGINT, saved[0])
@@ -2048,9 +2051,21 @@ def _selftest_signal_exit(T, base, signum, want):
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
-    stopped = [proc.returncode is not None for proc in started]
-    T.leg("signal: %s stops the daemons, removes run/ and exits %d" % (signal.Signals(signum).name, want),
-          (rc, stopped, os.path.exists(sig_dir)), (want, [True], False))
+    T.leg("signal: %s stops the daemons (the daemon pid is gone when main returns), removes run/ and exits %d"
+          % (signal.Signals(signum).name, want), (rc, gone, os.path.exists(sig_dir)), (want, [True], False))
+
+
+def _pid_gone(proc):
+    """True only when the child has exited by the time of the call: it was reaped and its pid no longer answers."""
+    if proc.poll() is None:
+        return False
+    try:
+        os.kill(proc.pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def selftest_probe_block(T, base):
@@ -2260,6 +2275,28 @@ def selftest_inputs(T, base):
     T.leg("program: a missing bare name is refused", resolve_program("no-such-program-x", progdir), None)
     T.leg("doc: the self-test is documented by its docstring", bool((selftest.__doc__ or "").strip()), True)
     with open(os.path.realpath(__file__), "r", encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    above = []
+    for i, line in enumerate(lines):
+        if re.match(r"\s*(def|class) ", line):
+            j = i - 1
+            while j >= 0 and re.match(r"\s*@", lines[j]):
+                j -= 1
+            if j >= 0 and lines[j].strip().startswith("#") and not lines[j].strip().startswith("# ---"):
+                above.append(i + 1)
+    T.leg("doc: no comment sits directly above a def or class in run.py (a description is the function's own docstring)",
+          above, [])
+    empty = os.path.join(base, "empty-path")
+    os.makedirs(empty)
+    for label, corpus, want in (
+            ("preflight: openssl is the one tool a run needs from PATH (no curl, jq or sqlite3 without --corpus-db)", None,
+             "missing required tool(s): openssl\n"),
+            ("preflight: --corpus-db also needs sqlite3 and jq", "x.db", "missing required tool(s): openssl sqlite3 jq\n")):
+        opts = {"corpus_db": corpus, "bin": "", "signer": "", "keep": False}
+        lab = Lab(opts, Ledger(Sink(), False), {"PATH": empty}, run_dir=os.path.join(base, "preflight-run"))
+        ok = lab.preflight()
+        T.leg(label, (ok, want in lab.led.out.value()), (False, True), lab.led.out.value()[-200:])
+    with open(os.path.realpath(__file__), "r", encoding="utf-8") as fh:
         src = fh.read()
     steps = [(int(m.group(1)), m.start()) for m in re.finditer(r'L\.step\("(\d+) · ', src)]
     n1 = src.find('"N1 ')
@@ -2437,6 +2474,13 @@ def selftest_start_state(T, base):
         ("bar-c: an import hook added before the file runs is refused",
          "import runpy, sys\nclass F:\n    @staticmethod\n    def find_spec(*a):\n        return None\nsys.meta_path.insert(0, F)\n"
          "sys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n", "sys.meta_path"),
+        ("bar-c: an object that is not a module standing in for one the matcher uses (re in sys.modules) is refused",
+         "import re, runpy, sys\nrunpy.run_path('/dev/null')\nclass R:\n    pass\nr = R()\nr.__dict__.update(vars(re))\n"
+         "sys.modules['re'] = r\nsys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n",
+         "module re is not a module object"),
+        ("start state: an object that is not the builtin posix module in sys.modules is refused",
+         "import runpy, sys, types\nrunpy.run_path('/dev/null')\nsys.modules['posix'] = types.SimpleNamespace(environ={})\n"
+         "sys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n", "the posix module is not the builtin one"),
         ("start state: a driver that runs the file through exec is refused",
          "import sys\nsys.argv = [%r, '--help']\nsrc = %r\nexec(compile(open(src).read(), src, 'exec'), {'__name__': '__main__', "
          "'__file__': src})\n", "__builtins__ is not the builtins module"),
