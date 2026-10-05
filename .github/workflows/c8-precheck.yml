@@ -1300,17 +1300,13 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            base="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")"
-            range="$base..$PR_HEAD_SHA"
-          elif [ -n "${GITHUB_EVENT_BEFORE:-}" ] && [ "$GITHUB_EVENT_BEFORE" != "0000000000000000000000000000000000000000" ] \
-               && git rev-parse --verify --quiet "$GITHUB_EVENT_BEFORE^{commit}" >/dev/null; then
-            range="$GITHUB_EVENT_BEFORE..$GITHUB_SHA"
-          else
-            range="HEAD~1..HEAD"
-          fi
+          # The range is chosen ONLY by scripts/ci-commit-range.py (#5579): it
+          # refuses what it cannot decide; there is no fallback range here.
+          range="$(python3 scripts/ci-commit-range.py)"
           echo "range=$range"
           bash scripts/check-stale-contract-assertions.sh --range "$range"
       - name: Self-test the gate (regression evidence)
@@ -1334,21 +1330,19 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            base="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")"
-            range="$base..$PR_HEAD_SHA"
-          elif [ -n "${GITHUB_EVENT_BEFORE:-}" ] && [ "$GITHUB_EVENT_BEFORE" != "0000000000000000000000000000000000000000" ] \
-               && git rev-parse --verify --quiet "$GITHUB_EVENT_BEFORE^{commit}" >/dev/null; then
-            range="$GITHUB_EVENT_BEFORE..$GITHUB_SHA"
-          else
-            range="HEAD~1..HEAD"
-          fi
+          # The range is chosen ONLY by scripts/ci-commit-range.py (#5579): it
+          # refuses what it cannot decide; there is no fallback range here.
+          range="$(python3 scripts/ci-commit-range.py)"
           echo "range=$range"
           bash scripts/check-count-assertion-declared.sh --range "$range"
       - name: Self-test the gate (regression evidence)
         run: bash scripts/check-count-assertion-declared.sh --self-test
+      - name: Self-test the range helper (#5579 regression evidence)
+        run: python3 scripts/ci-commit-range.py --self-test
 
   claude-plugin-gate:
     # The `.claude-plugin/` manifest structural check; existed, ran nowhere.
