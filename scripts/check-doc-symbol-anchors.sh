@@ -1394,6 +1394,10 @@ PYEOF
         "See $R::RecallTool<T> ::decorate_memory_many here."
     anchor_green 5609 "a path followed by a spaced separator in prose" \
         "See $R::RecallTool and :: in C++."
+    anchor_red_cites 5609 QUAL "a space between the file and its separator" \
+        "$R::NoSuch" "See \`$R ::NoSuch\` here."
+    anchor_red_cites 5609 QUAL "a space between the separator and a brace list" \
+        "$R::NoSuch" "See \`$R:: {NoSuch}\` here."
 
     # #5610: every bound of a self type is checked whatever its prefix, the
     # type is a whole path, and a form the reader does not model is refused.
