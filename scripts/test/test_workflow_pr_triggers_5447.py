@@ -304,7 +304,10 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
 
 
 TOP_KEY = re.compile(r"""("[^"\\]*"|'[^']*'|[A-Za-z_][A-Za-z0-9_-]*)""")
-ON_SPELLINGS = ("on", "true", "yes")  # all resolve to the boolean True key (YAML 1.1)
+# The words of the YAML 1.1 bool type. PyYAML 6 resolves yes, no, true, false, on
+# and off (lower, Capitalised or UPPER case) to a boolean key and reads y and n as
+# strings; the rule below refuses every case and quoting of all eight (#5708).
+YAML11_BOOLEANS = ("y", "yes", "n", "no", "true", "false", "on", "off")
 ON_KEYS = ('on', '"on"', "'on'")
 
 
@@ -312,10 +315,13 @@ def _check_top_level(rows: List[Tuple[int, str, str]]) -> None:
     """Closed-world top level: only mapping keys, each once (#5667, #5668, #5705).
 
     A single leading ``---`` is accepted; every other indent-0 row must be a bare
-    word key or an escape-free quoted key. Document markers, directives, sequences,
-    complex keys, merge keys, anchors, tags, flow collections and an unclosed quote
-    at the top level are all refused, because a YAML reader would read them
-    differently.
+    word key or an escape-free quoted key. Keys are compared case-folded and
+    unquoted. A key whose folded spelling is a YAML 1.1 boolean (y, yes, n, no,
+    true, false, on, off) is accepted only when spelled exactly on, "on" or 'on',
+    so no two boolean spellings can form a duplicate the reader misses (#5708).
+    Document markers, directives, sequences, complex keys, merge keys, anchors,
+    tags, flow collections and an unclosed quote at the top level are all
+    refused, because a YAML reader would read them differently.
     """
     seen: Set[str] = set()
     for idx, (ind, body, key) in enumerate(rows):
@@ -326,8 +332,8 @@ def _check_top_level(rows: List[Tuple[int, str, str]]) -> None:
         if not key or not TOP_KEY.fullmatch(key):
             raise Unparsed("top-level row is not a plain mapping key (#5668): " + repr(body))
         name = key.strip("\"'").lower()
-        if name in ON_SPELLINGS:
-            name = "on"
+        if name in YAML11_BOOLEANS and key not in ON_KEYS:
+            raise Unparsed("top-level key is a YAML 1.1 boolean other than on (#5708): " + body)
         if name in seen:
             raise Unparsed("repeated top-level key (#5667): " + body)
         seen.add(name)
@@ -341,7 +347,7 @@ def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
     _check_top_level(rows)
     start = None
     for idx, (ind, _body, key) in enumerate(rows):
-        if ind == 0 and key in ON_KEYS + ("true",):
+        if ind == 0 and key in ON_KEYS:
             start = idx
             break
     if start is None:
@@ -1228,6 +1234,32 @@ class QuotedScalars5706(unittest.TestCase):
     def test_5706_other_kind_of_quote_inside_stays_clean(self) -> None:
         text = "name: \"a'b\"\non:\n" + GOOD_PR + "x:\n  a: 'c\"d'\n  e: [\"f'g\", 'h\"i']\n"
         self.assertEqual([], violations("x.yml", text))
+
+
+class BooleanKeys5708(unittest.TestCase):
+    """#5708: a top-level YAML 1.1 boolean spelling is accepted only as on, "on" or 'on'."""
+
+    def _shape(self, text: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and "YAML 1.1 boolean" in v for v in got), got)
+
+    def test_5708_false_family_pairs(self) -> None:
+        # PyYAML: off and no (and false) are the same False key.
+        self._shape("off: 1\nno: 2\non:\n" + GOOD_PR)
+        self._shape("false: 1\nn: 2\non:\n" + GOOD_PR)
+
+    def test_5708_every_other_spelling_any_case_or_quoting(self) -> None:
+        for word in ("y", "Y", "yes", "Yes", "n", "N", "no", "NO", "true", "True", "false", "FALSE",
+                     "off", "Off", "On", "ON", '"On"', "'TRUE'", '"off"', "'y'"):
+            self._shape("name: x\non:\n" + GOOD_PR + word + ": 1\n")
+
+    def test_5708_true_is_not_read_as_the_on_block(self) -> None:
+        # A YAML 1.2 reader reads true: as the boolean true key, not as on.
+        self._shape("name: x\ntrue:\n" + GOOD_PR)
+
+    def test_5708_on_spellings_stay_clean(self) -> None:
+        for key in ("on", '"on"', "'on'"):
+            self.assertEqual([], violations("x.yml", "name: x\n" + key + ":\n" + GOOD_PR), key)
 
 
 class GlobSemantics5447(unittest.TestCase):
