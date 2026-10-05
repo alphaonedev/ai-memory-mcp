@@ -777,7 +777,9 @@ class LeadingWhitespace5660(unittest.TestCase):
         self._red(_with_on_block(GOOD_PUSH + GOOD_PR).replace("\n  push:", "\r  push:", 1))
 
     def test_5660_lone_cr_hides_a_trigger_in_a_comment(self) -> None:
-        # Without the lone-CR rule the CR-separated trigger vanishes into a comment.
+        # Without the lone-CR rule the CR-separated trigger vanishes into the comment
+        # (the file is then refused for a repeated branches key instead);
+        # test_5705_lone_cr_is_refused_by_its_own_rule pins the lone-CR reason.
         self._red(_with_on_block(GOOD_PUSH + "  # note\r  pull_request:\n    branches: [main]\n"))
 
     def test_5660_crlf_trailing_whitespace_stripped(self) -> None:
@@ -1314,6 +1316,41 @@ class DocTruth5707(unittest.TestCase):
             self.assertTrue(_space_like(ch), repr(ch))
         for ch in ("a", "#", "-", "é"):
             self.assertFalse(_space_like(ch), repr(ch))
+
+
+class ReaderMutants5705(unittest.TestCase):
+    """#5705: cases added for reader mutants the earlier cases let survive.
+
+    Each case names the rule it pins in the reason it requires.
+    """
+
+    def _shape(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5705_quote_inside_a_plain_flow_scalar(self) -> None:
+        # PyYAML: ['a"b', 'c"']. The reader does not split such items; it refuses them.
+        self._shape("name: x\non:\n" + GOOD_PR + 'x: [a"b, c"]\n', "quote inside a plain flow scalar")
+
+    def test_5705_comment_inside_a_flow_collection(self) -> None:
+        # PyYAML: the comment swallows the closing bracket, so the collection runs on
+        # into the next rows (here a ParserError).
+        self._shape("name: x\non:\n" + GOOD_PR + "x: [a, # c]\n", "does not close on its row")
+
+    def test_5705_block_scalar_content_one_column_past_its_owner(self) -> None:
+        # PyYAML: run is "echo\n"; content may start one column past the key that owns it.
+        for body in ("x: |\n a\n", "x:\n  - run: |\n     echo\n"):
+            self.assertEqual([], violations("x.yml", "name: x\non:\n" + GOOD_PR + body), body)
+
+    def test_5705_lone_cr_is_refused_by_its_own_rule(self) -> None:
+        for text in (_with_on_block(GOOD_PUSH + GOOD_PR).replace("\n  push:", "\r  push:", 1),
+                     _with_on_block(GOOD_PUSH + "  # note\r  pull_request:\n    branches: [main]\n")):
+            self._shape(text, "lone carriage return")
+
+    def test_5705_comment_needs_a_space_before_it(self) -> None:
+        # PyYAML 6 reads "a"#c as "a" plus a comment; YAML 1.2 needs a space before #.
+        self._shape("name: x\non:\n" + GOOD_PR + 'x: "a"#c\n', "text after a quoted scalar")
+        self._shape("name: x\non:\n" + GOOD_PR + "x: [a]#c\n", "text after a flow collection")
 
 
 class GlobSemantics5447(unittest.TestCase):
