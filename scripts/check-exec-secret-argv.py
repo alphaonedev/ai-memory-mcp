@@ -2217,6 +2217,7 @@ ROUND3_GREEN = [
     ('5821 substitution pin: clean 1: a substitution glued to a word is no command word', 'x$(command -v mysql) "$X"'),
     ('5821 substitution pin: clean 2: a substitution head with clean words', '$(command -v mysql) -uroot -h "$H" app'),
     ('5821 substitution pin: clean 3: a substitution that is an echo operand', 'echo "$(mysql --version)" "$X"'),
+    ('5868 mutant pin: clean 1: a substitution that does not close names no command word', 'printf \'%s\' "$X" | $(command -v mysql'),
     ('5863 mutant pin: clean 1: a verb in another letter case hides the head', 'Echo mysql -uroot -p"$X"'),
     ('5862 mutant pin: clean 1: a quoted verb hides the head', '"echo" mysql -uroot -p"$X"'),
     ('5860 mutant pin: clean 1: a verb inside a remote payload hides the head', 'ssh db1 "echo mysql -uroot -p$X"'),
