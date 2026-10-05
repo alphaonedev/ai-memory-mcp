@@ -84,7 +84,7 @@ def lenient_pending(text: str) -> List[Entry]:
             continue
         parts = ln.split(" | ", 3)
         if len(parts) == 4 and parts[2].strip().isdigit():
-            out.append((parts[0].strip(), parts[1].strip(), int(parts[2]), parts[3], no))
+            out.append((parts[0].strip(), parts[1].strip(), int(parts[2]), " ".join(parts[3].split()), no))  # blanks read as the row (#5501)
     return out
 
 
@@ -256,7 +256,7 @@ def retag(gate, allow: List[Entry], pend: List[Entry], source: str, match: Optio
 
 
 # ---------------------------------------------------------------- refusal cases
-REFUSAL_CASE_COUNT = 33
+REFUSAL_CASE_COUNT = 34
 
 
 def _f(gate, rel: str, line: str, flagged: bool = False):
@@ -401,6 +401,9 @@ def refusal_cases(root: Path) -> List[str]:
         bad.append("regen: an issue-keyed entry row was taken for a hand comment (#4902)")
     if not foreign_comments(ALLOW_HEAD, ALLOW_HEAD + "# a hand note\n"):
         bad.append("regen: a hand-written comment line would be dropped silently (#4902)")
+    # #5501: a committed pending row with a line terminator or trailing blanks is read as the row
+    if [e[3] for e in lenient_pending("#1 | a.sh | 1 | export X \t\r\n#2 | b.sh | 1 | export  Y\r")] != ["export X", "export Y"]:
+        bad.append("regen: a pending row with a CR or trailing blanks was read with that text, not as the row (#5501)")
     return bad
 
 

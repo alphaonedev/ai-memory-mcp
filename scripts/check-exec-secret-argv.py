@@ -838,6 +838,58 @@ def parse_entries(text: str, label: str, pending: bool, faults: List[str]) -> Li
     return out
 
 
+# Every Unicode line terminator but LF (str.splitlines): a list file uses LF only (#5501).
+LINE_TERMINATORS = "\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+TERMINATOR_RE = re.compile("[" + LINE_TERMINATORS + "]")
+ISSUE_WHY_RE = re.compile(r"#[0-9]+")
+
+
+def terminator_faults(text: str, label: str) -> List[str]:
+    """A list at the tip carries LF line ends only. A CR (or any other terminator) is read as a line end
+    by some readers and as part of the row by others, so the rule rows would differ between them (#5501)."""
+    hit = TERMINATOR_RE.search(text)
+    if hit is None:
+        return []
+    return ["%s: line terminator U+%04X in the list (LF only; fail closed, #5501)" % (label, ord(hit.group()))]
+
+
+def read_list_text(path: Path) -> str:
+    """The text of a list file, decoded with no newline translation: a CR stays visible (#5501)."""
+    return path.read_bytes().decode("utf-8")
+
+
+def diff_rows(body: str) -> List[Tuple[str, str]]:
+    """(whole row, text) of every pending-shaped row in the body of one diff line. A line terminator or
+    blank form of a row is read as the row, and a row behind a terminator inside one line is a row too
+    (over-collecting fails closed, #5501)."""
+    out: List[Tuple[str, str]] = []
+    for frag in TERMINATOR_RE.split(body):
+        parts = [norm(p) for p in frag.split("|", 3)]
+        if len(parts) == 4 and ISSUE_WHY_RE.fullmatch(parts[0]) and parts[3]:
+            out.append((" | ".join(parts), parts[3]))
+    return out
+
+
+def parse_git_list(text: str, label: str, pending: bool) -> List[Entry]:
+    """Parse a list read from git (the merge base, HEAD). Every line-terminator and blank form of a row is
+    read as the row, so a row cannot be hidden from a rule by its line ending; a row that still does not
+    parse is a RuntimeError, never a silent skip (#5501)."""
+    lines: List[str] = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if ln and not (ln.startswith("#") and not re.match(r"#[0-9]+\s*[|]", ln)):
+            cols = re.split(r"\s*[|]\s*", ln, 3)
+            if len(cols) == 4:
+                cols[3] = norm(cols[3])
+                ln = " | ".join(cols)
+        lines.append(ln)
+    faults: List[str] = []
+    out = parse_entries("\n".join(lines) + "\n", label, pending, faults)
+    if faults:
+        raise RuntimeError("the %s list read from git is malformed (fail closed, #5501): %s" % (label, faults[0]))
+    return out
+
+
 # ---------------------------------------------------------------- judge
 def judge(found: Dict[str, List[Found]], allow: List[Entry], pending: List[Entry], dl,
           only: Optional[Iterable[str]] = None) -> Tuple[List[str], List[str], Dict[str, int]]:
@@ -976,8 +1028,12 @@ def scan_repo(root: Path, dl) -> Tuple[Dict[str, List[Found]], int, int]:
 
 def load_lists(root: Path) -> Tuple[List[Entry], List[Entry], List[str]]:
     faults: List[str] = []
-    allow = parse_entries((root / ALLOW_FILE).read_text(encoding="utf-8"), "allow", False, faults)
-    pend = parse_entries((root / PENDING_FILE).read_text(encoding="utf-8"), "pending", True, faults)
+    allow_text = read_list_text(root / ALLOW_FILE)
+    pend_text = read_list_text(root / PENDING_FILE)
+    faults.extend(terminator_faults(allow_text, "allow"))
+    faults.extend(terminator_faults(pend_text, "pending"))
+    allow = parse_entries(allow_text, "allow", False, faults)
+    pend = parse_entries(pend_text, "pending", True, faults)
     return allow, pend, faults
 
 
@@ -1094,9 +1150,10 @@ HISTORY_REMEDY = ("fetch full history (git fetch --unshallow, or actions/checkou
 
 
 # A pending row is "#<issue> | <file> | <count> | <text>". The history scan matches that shape in every file
-# at every path (#5299, #5466): the list may have been renamed and rewritten in one commit, where git
-# detects no rename and a log limited to the path of the list goes blind to the old path.
-PENDING_ROW_PICKAXE = r"^#[0-9]+ [|] "
+# at every path (#5299, #5466): the list may have been renamed and rewritten in one commit, where a log
+# limited to the path of the list goes blind to the old path. The pickaxe is not anchored to the start of the
+# line and allows blanks before the bar: a row behind a CR inside one line, or with blanks, is a row (#5501).
+PENDING_ROW_PICKAXE = r"#[0-9]+[[:space:]]*[|]"
 
 
 def removed_pending_rows(root: Path) -> Dict[str, str]:
@@ -1150,19 +1207,18 @@ def removed_pending_rows(root: Path) -> Dict[str, str]:
             in_hunk = True
         elif not in_hunk and (raw.startswith("--- ") or raw.startswith("+++ ")):
             path = raw[6:] if raw[4:6] in ("a/", "b/") else path
-        elif in_hunk and raw[:2] in ("-#", "+#") and path != ALLOW_FILE:
-            parts = raw[1:].split(" | ", 3)
-            if len(parts) == 4 and parts[3] == norm(parts[3]):
+        elif in_hunk and raw[:1] in ("-", "+") and path != ALLOW_FILE:
+            for whole, text in diff_rows(raw[1:]):
                 if raw[0] == "-":
-                    removed.append((raw[1:], parts[3]))
+                    removed.append((whole, text))
                 else:
-                    added.add(parts[3])
+                    added.add(text)
                     if path == PENDING_FILE:
-                        readded[raw[1:]] += 1
+                        readded[whole] += 1
     flush()
     if not listed and (root / PENDING_FILE).is_file():
         raise RuntimeError("the history of %s is empty although the file exists: %s" % (PENDING_FILE, HISTORY_REMEDY))
-    unseen = sorted(r[3] for r in parse_entries(at_head, "head-pending", True, []) if r[3] not in added)
+    unseen = sorted(r[3] for r in parse_git_list(at_head, "head-pending", True) if r[3] not in added)
     if unseen:
         raise RuntimeError("the history of %s cannot be followed: no commit added the row %r: %s" % (
             PENDING_FILE, unseen[0][:60], HISTORY_REMEDY))
@@ -1203,8 +1259,7 @@ def base_state(root: Path, ref: str) -> Tuple[str, Dict[str, str], List[Entry], 
         old_allow = _show_or_absent(root, mb, ALLOW_FILE)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError("cannot resolve the merge base against %s (fail closed): %s" % (ref, exc))
-    return (mb, renames, parse_entries(old, "base-pending", False, []),
-            parse_entries(old_allow, "base-allow", False, []))
+    return (mb, renames, parse_git_list(old, "base-pending", False), parse_git_list(old_allow, "base-allow", False))
 
 
 def merge_base_hits(root: Path, allow: List[Entry], pend: Optional[List[Entry]] = None) -> Optional[List[str]]:
@@ -2117,7 +2172,7 @@ def _history_cases(t: Path) -> Tuple[List[str], int]:
 
     def put(repo: Path, rel: str, text: str) -> None:
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
-        (repo / rel).write_text(text)
+        (repo / rel).write_bytes(text.encode("utf-8"))  # bytes: no newline translation (#5501)
 
     def rows(repo: Path, *texts: str) -> None:
         put(repo, PENDING_FILE, "".join("#1 | a.sh | 1 | %s\n" % x for x in texts))
@@ -2289,6 +2344,19 @@ def _history_cases(t: Path) -> Tuple[List[str], int]:
     commit(repo, "remove")
     git(repo, "replace", "HEAD", "HEAD~1")
     judge_repo("a removal hidden behind a replace ref", repo)
+    # every line-terminator and trailing-whitespace form of a row is read as the row (#5501): a row that ends
+    # in CRLF, a row with trailing blanks, and a row hidden behind a lone CR in a comment line
+    for tag, enc in (("crlf", lambda r: r + "\r\n"), ("trailing-blanks", lambda r: r + " \t\n"),
+                     ("lone-cr", lambda r: "# note\r" + r + "\n"), ("vt", lambda r: r + "\x0b\n"),
+                     ("leading-blank", lambda r: "  " + r + "\n")):
+        repo = t / ("form-" + tag)
+        repo.mkdir(parents=True)
+        git(repo, "init", "-q", "-b", "develop")
+        put(repo, PENDING_FILE, enc("#1 | b.sh | 1 | " + gone_row) + enc("#1 | a.sh | 1 | " + kept_row))
+        commit(repo, "rows in the %s form" % tag)
+        put(repo, PENDING_FILE, enc("#1 | a.sh | 1 | " + kept_row))
+        commit(repo, "drop the row")
+        judge_repo("a row dropped in the %s form" % tag, repo)
     # history the scan cannot follow is a fault: a committed row no scanned commit added (#5463)
     repo = fresh("unfollowable")
     n += 1
@@ -2307,6 +2375,83 @@ def _history_cases(t: Path) -> Tuple[List[str], int]:
             bad.append("an unfollowable history faulted with the wrong message (%s)" % exc)
     finally:
         globals()["_git"] = real_git
+    return bad, n
+
+
+def _terminator_cases(root: Path, t: Path) -> Tuple[List[str], int]:
+    """The real gate path on lists with line-terminator and trailing-whitespace forms (#5501): at the tip any
+    form other than LF is a fault; at the merge base every form is read as the row, so a row cannot be
+    hidden from the base rules by its line ending. A control with an LF row is red for the same change."""
+    import shutil
+    bad: List[str] = []
+    n = 0
+    keys = ("EXEC_SECRET_ARGV_BASE", "GITHUB_BASE_REF", "GITHUB_ACTIONS", "CI")
+    saved = {k: os.environ.get(k) for k in keys}
+    ok_line, nl = "export API_TOKEN", "export SERVICE_PASSWORD"
+    base_ref = "refs/remotes/origin/self-test-base"
+
+    def git(*a: str) -> str:
+        return subprocess.run(["git", "-C", str(t), "-c", "user.name=self-test", "-c",
+                               "user.email=self-test@invalid", "-c", "commit.gpgsign=false"] + list(a),
+                              check=True, capture_output=True).stdout.decode("utf-8", "replace")
+
+    def put(rel: str, text: str) -> None:
+        (t / rel).write_bytes(text.encode("utf-8"))
+
+    def lists(allow_rows: List[str], pend_rows: List[str], eol: str = "\n") -> None:
+        put(ALLOW_FILE, "".join(r + eol for r in allow_rows))
+        put(PENDING_FILE, "".join(r + eol for r in pend_rows))
+
+    def gate(**env: str) -> Tuple[int, str]:
+        for k in keys:
+            os.environ.pop(k, None)
+        os.environ.update(env)
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out), contextlib.redirect_stdout(out):
+            rc = run(t)
+        return rc, out.getvalue()
+
+    ok_row = "reason: self-test | a.sh | 1 | " + ok_line
+    pend_row = "#1 | b.sh | 1 | " + nl
+    moved_row = "reason: self-test | b.sh | 1 | " + nl
+    try:
+        (t / "scripts" / "qc-allowlists").mkdir(parents=True)
+        shutil.copy(str(root / DENYLIST), str(t / DENYLIST))
+        put("a.sh", "#!/bin/bash\n%s\n" % ok_line)
+        put("b.sh", "#!/bin/bash\n%s\n" % nl)
+        for tag, eol in (("lf", "\n"), ("crlf", "\r\n"), ("lone-cr", "\r"), ("trailing-blanks", " \t\n")):
+            git("init", "-q")
+            lists([ok_row], [pend_row], eol)
+            if tag == "lone-cr":  # the whole file is one line to a reader that splits on LF only
+                put(PENDING_FILE, "# note" + eol + pend_row + eol)
+            git("add", "-A")
+            git("commit", "-q", "--allow-empty", "-m", "base " + tag)
+            git("update-ref", base_ref, "HEAD")
+            # one change drops the pending row and adds an allow entry with the same text
+            lists([ok_row, moved_row], [])
+            git("add", "-A")
+            git("commit", "-q", "-m", "launder " + tag)
+            n += 1
+            rc, out = gate(EXEC_SECRET_ARGV_BASE=base_ref)
+            if rc != 1 or "pending at the merge base" not in out:
+                bad.append("a pending row in the %s form was hidden from the merge-base rules (%d): %s"
+                           % (tag, rc, out.strip()[:140]))
+            git("reset", "-q", "--hard", base_ref)
+            # the tip itself: any terminator other than LF in a list is a fault (LF with blanks is a normalisation fault)
+            n += 1
+            rc, out = gate()
+            if tag == "lf":
+                if rc != 0:
+                    bad.append("the LF control list was refused at the tip (%d): %s" % (rc, out.strip()[:140]))
+            elif rc != 2 or "FAULT" not in out:
+                bad.append("a list in the %s form was accepted at the tip (%d): %s" % (tag, rc, out.strip()[:140]))
+            shutil.rmtree(str(t / ".git"))
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     return bad, n
 
 
@@ -2480,7 +2625,11 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
     with tempfile.TemporaryDirectory(dir=str(scratch)) as td:
         hb, hn = _history_cases(Path(td))
     bad.extend(hb)
-    return bad, n + wn + hn
+    # the lists read with every line-terminator and trailing-whitespace form (#5501)
+    with tempfile.TemporaryDirectory(dir=str(scratch)) as td:
+        tb, tn = _terminator_cases(root, Path(td))
+    bad.extend(tb)
+    return bad, n + wn + hn + tn
 
 
 def self_test(root: Path) -> int:
