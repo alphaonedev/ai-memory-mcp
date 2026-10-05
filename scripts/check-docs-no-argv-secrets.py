@@ -107,7 +107,13 @@ template file):
                      continuation, closes what it opens and is not inside a
                      multi-line if, loop, case or brace block; on any other
                      line (``eval "set +x"`` included) the region stays
-                     traced. The
+                     traced. A ``set`` call bash rejects (a letter outside
+                     its set options, ``set +xq``) never counts as off; a
+                     shell run with an x cluster or ``-o xtrace``
+                     (``bash -x -c '..'``) traces its own line; SHELLOPTS
+                     holding xtrace or an expansion turns tracing on; and
+                     the line that turns tracing on is scanned too (#5839).
+                     The
                      ``--self-test`` also runs the #4609 runtime probe: it
                      executes the credential-handling lines of the do-hive
                      ``provision.sh`` with a dummy password and proves the
@@ -875,11 +881,36 @@ def scan_write_files(rel: str, text: str) -> List[Hit]:
     return hits
 
 
+# #5839 (round 12): the option letters of bash's set builtin (o takes a name). Bash reads every
+# cluster before it applies one, and a letter outside this set fails the whole call, so after
+# set -x each of set +xq, set +qx and set +x -q leaves tracing on (measured, bash 5.2).
+SET_OPTION_LETTERS = frozenset("abefhkmnoptuvxBCEHPT")
+
+
+def set_rejected(args: List[str]) -> bool:
+    """#5839: True when a cluster of the set builtin's options holds a letter bash rejects, so
+    the call changes nothing (an off is never counted from it)."""
+    for arg in args:
+        if arg in ("-", "--") or len(arg) < 2 or arg[0] not in "-+":
+            return False
+        if any(c not in SET_OPTION_LETTERS for c in arg[1:]):
+            return True
+    return False
+
+
 def set_xtrace(args: List[str]) -> Optional[bool]:
     """#5597: the xtrace state after the set builtin's arguments, or None when they do not
     touch it. Every cluster is walked (set -e -x, set -u -o xtrace); each o takes the next
     word as an option name; set - turns tracing off; -- or a first operand ends the options;
-    an expansion where an option or an option name can stand counts as on (fail closed)."""
+    an expansion where an option or an option name can stand counts as on (fail closed).
+    #5839: a call bash rejects (set_rejected) never counts as off, and still counts as on
+    when it asks for x (fail closed)."""
+    state = set_xtrace_walk(args)
+    return None if state is False and set_rejected(args) else state
+
+
+def set_xtrace_walk(args: List[str]) -> Optional[bool]:
+    """set_xtrace without the rejected-call rule."""
     state: Optional[bool] = None
     i = 0
     while i < len(args):
@@ -946,6 +977,10 @@ def xtrace_effect(line: str, depth: int = 0) -> Optional[bool]:
             effect = set_xtrace(cmd[i + 1:])
         elif head == "shopt":
             effect = shopt_xtrace(cmd[i + 1:])
+        # #5839: SHELLOPTS=... holding xtrace, or an expansion, in an assignment, an export or an
+        # env operand makes every bash that inherits it trace (fail closed: on from here).
+        if any(SHELLOPTS_XTRACE_RE.match(w.lstrip("\\")) for w in cmd):
+            effect = True
         if effect is True or (effect is False and off_ok):
             state = effect
         if depth < 3:
@@ -954,6 +989,33 @@ def xtrace_effect(line: str, depth: int = 0) -> Optional[bool]:
                     if xtrace_effect(w, depth + 1) is True:
                         state = True
     return state
+
+
+SHELLOPTS_XTRACE_RE = re.compile(r"SHELLOPTS=.*(?:xtrace|[$`])")
+# #5839: words that may stand before a shell head and still run it (env NAME=V bash -x ...).
+SELF_TRACE_PREFIX = frozenset({"env", "sudo", "exec", "command", "builtin", "nohup", "nice", "time",
+                               "doas", "setsid", "stdbuf"})
+
+
+def self_traced(line: str) -> bool:
+    """#5839: True when a command of the line runs a shell whose options turn xtrace on (an x in
+    a - cluster, or -o xtrace): that shell traces the command string it runs, on this line."""
+    for cmd in commands(split_words(line)):
+        i = 0
+        while i < len(cmd) and (cmd[i].lstrip("\\") in XTRACE_PREFIX_WORDS | SELF_TRACE_PREFIX
+                                or cmd[i].startswith("-") or ASSIGN_RE.match(cmd[i])):
+            i += 1
+        if i >= len(cmd) or cmd[i].lstrip("\\").rsplit("/", 1)[-1] not in SHELLS:
+            continue
+        for k in range(i + 1, len(cmd)):
+            w = cmd[k]
+            if not w.startswith("-") or w in ("-", "--"):
+                break
+            if not w.startswith("--") and "x" in w[1:]:
+                return True
+            if not w.startswith("--") and "o" in w[1:] and cmd[k + 1:k + 2] == ["xtrace"]:
+                return True
+    return False
 
 
 def off_in_current_shell(line: str) -> bool:
@@ -1142,6 +1204,12 @@ def scan_xtrace(rel: str, text: str) -> List[Hit]:
         if effect is False and (block > 0 or not proven[n - 1]):
             effect = None
         block = max(0, block + block_delta(ln))
+        # #5839: a line that turns tracing on (set -x; echo $PW), or that runs a shell that
+        # traces its own command string (bash -x -c '... $PW'), is itself scanned.
+        if (effect is True or self_traced(ln)) and TRACED_SECRET_RE.search(ln):
+            hits.append((rel, n, "[xtrace-secret] " + ln.strip()[:120]))
+            traced = traced if effect is None else effect
+            continue
         if effect is not None:
             traced = effect
             continue
@@ -3751,6 +3819,42 @@ R10_XTRACE_RED = {
     '5726-x66-brace-after-or-next-line': 'set -x\ntrue ||\n{ set +x; }\n',
     '5726-x67-case-arm-one-line': 'set -x\ncase a in b) set +x;; esac\n',
 }
+# #5839 (round 12): a set call bash rejects (a letter outside SET_OPTION_LETTERS) never turns
+# tracing off; a shell head with an x cluster or -o xtrace traces its own line; SHELLOPTS holding
+# xtrace or an expansion turns tracing on; the line that turns tracing on is itself scanned. Each
+# row is a whole script (no secret line is appended), read as .sh and as .tpl; the off and on
+# facts were measured with bash 5.2.
+R12_XTRACE_RED = {
+    '5839-r01-plus-xq': 'set -x\nset +xq\necho $DB_PASS\n',
+    '5839-r02-plus-qx': 'set -x\nset +qx\necho $DB_PASS\n',
+    '5839-r03-plus-x-minus-q': 'set -x\nset +x -q\necho $DB_PASS\n',
+    '5839-r04-bash-x-c': "bash -x -c 'echo $DB_PASS'\n",
+    '5839-r05-bash-xc': 'bash -xc "psql -c x $PG_PW"\n',
+    '5839-r06-sh-o-xtrace': "sh -o xtrace -c 'echo $TOKEN'\n",
+    '5839-r07-env-bash-x': "env A=1 bash -x -c 'echo $DB_PASS'\n",
+    '5839-r08-export-shellopts': 'export SHELLOPTS=xtrace\necho $DB_PASS\n',
+    '5839-r09-env-shellopts': "env SHELLOPTS=xtrace bash -c 'echo $DB_PASS'\n",
+    '5839-r10-shellopts-expansion': 'SHELLOPTS=$OPTS\necho $DB_PASS\n',
+    '5839-r11-on-same-line': 'set -x; echo $DB_PASS\n',
+    '5839-r12-sudo-bash-x': 'sudo bash -ex /x.sh $DB_PASS\n',
+    '5839-r13-plus-x-bogus-letter-tpl': 'set -x\nset +xZ\necho $DB_PASS\n',
+    '5839-r14-usr-bin-bash-x': "/usr/bin/bash -x -c 'echo $SECRET'\n",
+    '5839-r15-shellopts-cmd-prefix': "SHELLOPTS=braceexpand:xtrace bash -c 'echo $PW'\n",
+}
+R12_XTRACE_GREEN = {
+    '5839-g01-plus-x-plus-o-bogus': 'set -x\nset +x +o bogus\necho $DB_PASS\n',
+    '5839-g02-plus-xv': 'set -x\nset +xv\necho $DB_PASS\n',
+    '5839-g03-plus-x-dash': 'set -x\nset +x -\necho $DB_PASS\n',
+    '5839-g04-plus-x-dashdash': 'set -x\nset +x --\necho $DB_PASS\n',
+    '5839-g05-plus-x-operand': 'set -x\nset +x foo\necho $DB_PASS\n',
+    '5839-g06-bash-c-no-x': "bash -c 'echo $DB_PASS'\n",
+    '5839-g07-bash-x-no-secret': "bash -x -c 'echo hi'\n",
+    '5839-g08-echo-bash-x': 'echo bash -x $DB_PASS\n',
+    '5839-g09-shellopts-other': 'export SHELLOPTS=braceexpand\necho $DB_PASS\n',
+    '5839-g10-bash-noprofile': "bash --noprofile -c 'echo $DB_PASS'\n",
+    '5839-g11-off-same-line-after': 'set +x; echo $DB_PASS\n',
+    '5839-g12-bash-script-x-arg': 'bash /x.sh -x $DB_PASS\n',
+}
 R10_XTRACE_GREEN = {
     '5597-g01-set-off-later-cluster': 'set -x\nset -e +x\n',
     '5597-g02-set-dash': 'set -x\nset -\n',
@@ -4288,6 +4392,15 @@ def self_test() -> int:
         if bool(got) != want:
             print("SELF-TEST FAIL: heredoc terminator probe (%s): %r" % (suffix, got), file=sys.stderr)
             bad += 1
+    for rows, want in ((R12_XTRACE_RED, True), (R12_XTRACE_GREEN, False)):
+        for name, text in rows.items():
+            for suffix in ("probe.sh", "probe.tpl"):
+                red += 1 if want else 0
+                green += 0 if want else 1
+                got = [h for h in scan_text(suffix, text) if "[xtrace-secret]" in h[2]]
+                if bool(got) != want:
+                    print("SELF-TEST FAIL: #5839 xtrace probe %r (%s): %r" % (name, suffix, got), file=sys.stderr)
+                    bad += 1
     for name, text in R10_XTRACE_GREEN.items():
         for suffix in ("probe.sh", "probe.tpl"):
             green += 1
