@@ -1102,8 +1102,10 @@ PENDING_ROW_PICKAXE = r"^#[0-9]+ [|] "
 def removed_pending_rows(root: Path) -> Dict[str, str]:
     """text -> short sha of a commit that removed a pending row with that text. Fail closed (#5299,
     #5463, #5466; 5-agent vote 4d3ea1c5, decision memory bf29bdb2): the whole history is read with no
-    path limit, so a list renamed and rewritten in one commit is followed (the deleted old file shows
-    its rows as removed: over-collecting fails closed), every merge is diffed against each of its
+    path limit and with no rename detection (--no-renames: a rename onto the allow list path hid a
+    removal, #5500), so a list renamed and rewritten in one commit is followed (the deleted old file
+    shows its rows as removed: over-collecting fails closed; a row moved unchanged under the pending
+    list path by the same diff is netted, so a pure rename of the list names nothing), every merge is diffed against each of its
     parents (-m: a merge, an evil merge and an octopus merge included), and replace refs and grafts are
     ignored. A shallow clone, a git failure, a list that exists but has no history, or a committed row
     that no scanned commit ever added (history this scan cannot follow) is a RuntimeError, never an
@@ -1112,7 +1114,7 @@ def removed_pending_rows(root: Path) -> Dict[str, str]:
         raise RuntimeError("the history of %s is incomplete (shallow clone): %s" % (PENDING_FILE, HISTORY_REMEDY))
     try:
         log = _git(root, "--no-replace-objects", "-c", "core.quotepath=false", "log", "-m", "--no-ext-diff",
-                   "--no-textconv", "-M", "-p", "-U0", "--no-color", "--format=commit %h",
+                   "--no-textconv", "--no-renames", "-p", "-U0", "--no-color", "--format=commit %h",
                    "-G" + PENDING_ROW_PICKAXE)
         listed = _git(root, "log", "-1", "--format=%h", "--full-history", "--", PENDING_FILE).strip()
         at_head = _show_or_absent(root, "HEAD", PENDING_FILE)
@@ -1123,8 +1125,24 @@ def removed_pending_rows(root: Path) -> Dict[str, str]:
     added = set()
     sha = path = ""
     in_hunk = False
+    removed: List[Tuple[str, str]] = []  # (whole row, text) removed by the diff being read
+    readded: Counter = Counter()  # whole rows added back under the pending list path by the same diff
+
+    def flush() -> None:
+        # a row removed from one path and added unchanged under the pending list path by the same
+        # diff is a move of the list, not a removal: git rename detection is not used (it hid a
+        # removal behind a rename onto the allow list path, #5500), so the move is netted here
+        for whole, text in removed:
+            if readded[whole] > 0:
+                readded[whole] -= 1
+            else:
+                gone.setdefault(text, sha)
+        removed.clear()
+        readded.clear()
+
     for raw in log.split("\n"):
         if raw.startswith("commit "):
+            flush()
             sha, path, in_hunk = raw[7:].strip(), "", False
         elif raw.startswith("diff --git "):
             path, in_hunk = "", False
@@ -1136,9 +1154,12 @@ def removed_pending_rows(root: Path) -> Dict[str, str]:
             parts = raw[1:].split(" | ", 3)
             if len(parts) == 4 and parts[3] == norm(parts[3]):
                 if raw[0] == "-":
-                    gone.setdefault(parts[3], sha)
+                    removed.append((raw[1:], parts[3]))
                 else:
                     added.add(parts[3])
+                    if path == PENDING_FILE:
+                        readded[raw[1:]] += 1
+    flush()
     if not listed and (root / PENDING_FILE).is_file():
         raise RuntimeError("the history of %s is empty although the file exists: %s" % (PENDING_FILE, HISTORY_REMEDY))
     unseen = sorted(r[3] for r in parse_entries(at_head, "head-pending", True, []) if r[3] not in added)
@@ -2221,6 +2242,26 @@ def _history_cases(t: Path) -> Tuple[List[str], int]:
             bad.append("a pure rename of the list named a row as removed (#5466)")
     except RuntimeError as exc:
         bad.append("the history scan faulted on a pure rename of the list: %s" % exc)
+    # the list renamed onto the allow list path with one row dropped, then both files restored: git rename
+    # detection shows the removed row under the allow path, which the scan skips (#5500)
+    repo = t / "rename-onto-allow"
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q", "-b", "develop")
+    others = "".join("#1 | a.sh | 1 | export OTHER_TOKEN_%d\n" % i for i in range(30))
+    both = others + "#1 | b.sh | 1 | %s\n" % gone_row
+    allow_text = "reason: x | z.sh | 1 | echo hi\n"
+    put(repo, PENDING_FILE, both)
+    put(repo, ALLOW_FILE, allow_text)
+    commit(repo, "both lists")
+    (repo / ALLOW_FILE).unlink()
+    commit(repo, "delete the allow list")
+    git(repo, "mv", PENDING_FILE, ALLOW_FILE)
+    put(repo, ALLOW_FILE, others)
+    commit(repo, "rename the pending list onto the allow path and drop a row")
+    put(repo, ALLOW_FILE, allow_text)
+    put(repo, PENDING_FILE, others)
+    commit(repo, "restore the allow list and recreate the pending list")
+    judge_repo("a row dropped while the list was renamed onto the allow path", repo)
     # a removed content line that reads like a diff header must not retarget the scan at the allow list (#5463)
     repo = t / "forged-header"
     repo.mkdir(parents=True)
