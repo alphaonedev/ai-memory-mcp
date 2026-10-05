@@ -1261,11 +1261,10 @@ jobs:
   # ---------------------------------------------------------------------------
   # #3967 — three gates that existed and ran NOWHERE. Rule (g) of
   # check-required-contexts.sh now fails a check-*.sh that no workflow
-  # references, so these jobs are the burn-down half of that finding; the two
-  # gates still unwired (`check-count-assertion-declared.sh`,
-  # `check-shared-namespace-claims.sh`) carry dated entries in
-  # scripts/qc-allowlists/gates-not-wired.txt with the reason each cannot run
-  # on a PR event today. All three jobs are declared in
+  # references, so these jobs are the burn-down half of that finding; the one
+  # gate still unwired (`check-shared-namespace-claims.sh`) carries a dated
+  # entry in scripts/qc-allowlists/gates-not-wired.txt with the reason it
+  # cannot run on a PR event today. All three jobs are declared in
   # required-contexts-not-required.txt (rule (f)) until the branch-protection
   # call + live-pin update promote them together.
   url-sink-redaction-gate:
@@ -1316,6 +1315,40 @@ jobs:
           bash scripts/check-stale-contract-assertions.sh --range "$range"
       - name: Self-test the gate (regression evidence)
         run: bash scripts/check-stale-contract-assertions.sh --self-test
+
+  count-assertion-declared-gate:
+    # #5499 / #5517 / #5518 (5-agent vote 4d3ea1c5) -- a commit that moves a
+    # shared .len()/.count() count assertion must declare it (own Count: or a
+    # later Count-Declared: trailer). Enforced over the PR's merge-base..head
+    # range only: carrier-history offenders outside a PR range are not checked.
+    name: "Count-assertion declaration gate (#5499)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Run count-assertion declaration gate over the change range
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")"
+            range="$base..$PR_HEAD_SHA"
+          elif [ -n "${GITHUB_EVENT_BEFORE:-}" ] && [ "$GITHUB_EVENT_BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git rev-parse --verify --quiet "$GITHUB_EVENT_BEFORE^{commit}" >/dev/null; then
+            range="$GITHUB_EVENT_BEFORE..$GITHUB_SHA"
+          else
+            range="HEAD~1..HEAD"
+          fi
+          echo "range=$range"
+          bash scripts/check-count-assertion-declared.sh --range "$range"
+      - name: Self-test the gate (regression evidence)
+        run: bash scripts/check-count-assertion-declared.sh --self-test
 
   claude-plugin-gate:
     # The `.claude-plugin/` manifest structural check; existed, ran nowhere.
