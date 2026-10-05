@@ -36,6 +36,7 @@ import ast
 import atexit
 import contextlib
 import errno
+import fcntl
 import importlib.util
 import io
 import itertools
@@ -133,10 +134,12 @@ def _drain_leaked_fixtures():
             if not os.path.islink(path):
                 os.chmod(path, mode)
         except OSError:
-            pass
+            _UNRESTORED.append(path)
 
 
 def _install_fixture_reaper():
+    # `atexit` runs last-registered first: drain, THEN forget the journal.
+    atexit.register(lambda: _forget_fixture_modes())
     atexit.register(_drain_leaked_fixtures)
     for name in ("SIGINT", "SIGTERM", "SIGHUP"):
         number = getattr(signal, name, None)
@@ -159,6 +162,135 @@ def _install_fixture_reaper():
 _install_fixture_reaper()
 
 
+# A `SIGKILL` runs no handler and no `atexit`, so the reaper above cannot see
+# it: a fixture held narrowed at that instant stays narrowed, and a narrowed
+# directory is one `git clean -ffdx` cannot empty (#6024). Every mode
+# `restrictive()` narrows is therefore also written down first - appended and
+# fsynced before the chmod, the shape of the janitor's own #6006 journal - in a
+# per-process file this process holds an exclusive `flock` on for its whole
+# life. The kernel drops that lock with the process however it ends, so a
+# journal nobody holds belongs to a process that is gone, and the next suite
+# start (`setUpModule`) puts its modes back, newest first, and removes the
+# `.ws5657-*` workspaces it names. Only paths inside one of this suite's own
+# workspaces are ever touched, and never through a symlink.
+_MODE_JOURNAL_PREFIX = ".fixture5657-modes-"
+_HEALABLE_PREFIXES = (".ws5657-", ".cancel5657-")
+_MODE_JOURNAL = []  # [fd, path] once this process has narrowed anything
+_UNRESTORED = []
+
+
+def _record_fixture_mode(path, before):
+    """Append `path`'s mode before it is narrowed, durably, to this process's
+    fixture journal (#6024)."""
+    if not _MODE_JOURNAL:
+        base = ROOT / ".local-runs"
+        base.mkdir(exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=_MODE_JOURNAL_PREFIX, dir=str(base))
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        _MODE_JOURNAL.extend([fd, name])
+    os.write(_MODE_JOURNAL[0], ("%o %s\n" % (before, os.fsencode(path).hex())).encode("ascii"))
+    os.fsync(_MODE_JOURNAL[0])
+
+
+def _forget_fixture_modes():
+    """On a clean exit, after the reaper has drained: every mode is back, so
+    the journal says nothing the next suite start needs."""
+    if not _MODE_JOURNAL or _UNRESTORED or _LEAKED_MODES:
+        return
+    fd, name = _MODE_JOURNAL
+    with contextlib.suppress(OSError):
+        os.unlink(name)
+    with contextlib.suppress(OSError):
+        os.close(fd)
+    del _MODE_JOURNAL[:]
+
+
+def _healable_workspace(real_base, path):
+    """The suite workspace `path` lies in, resolved without trusting any
+    symlink on the way, or None when it is not inside one."""
+    full = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+    rel = os.path.relpath(full, real_base)
+    first = rel.split(os.sep)[0]
+    if rel.startswith("..") or os.path.isabs(rel) or not first.startswith(_HEALABLE_PREFIXES):
+        return None
+    return os.path.join(real_base, first)
+
+
+def _heal_stranded_fixtures(base=None):
+    """Put back every fixture mode a killed suite process left narrowed, and
+    remove the `.ws5657-*` workspaces it held (#6024). Returns `(healed
+    workspaces, problems)`. A journal some live process still holds is not
+    touched, and one with anything it could not heal is kept."""
+    base = Path(base) if base is not None else ROOT / ".local-runs"
+    real_base = os.path.realpath(str(base))
+    healed, problems = [], []
+    for journal in sorted(base.glob(_MODE_JOURNAL_PREFIX + "*")):
+        try:
+            fd = os.open(str(journal), os.O_RDWR | os.O_NOFOLLOW)
+        except OSError as err:
+            problems.append("%s: %s" % (journal, err))
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue  # a live suite process holds it
+            raw = b""
+            while True:
+                chunk = os.read(fd, 1 << 16)
+                if not chunk:
+                    break
+                raw += chunk
+            # A line that never became whole was cut by the kill before the
+            # chmod it describes, which therefore never happened.
+            lines = raw.split(b"\n")[:-1]
+            kept, workspaces = False, []
+            for line in reversed(lines):
+                try:
+                    text, hexpath = line.decode("ascii").split(" ")
+                    mode, path = int(text, 8), os.fsdecode(bytes.fromhex(hexpath))
+                except ValueError:
+                    problems.append("%s: unreadable line %r" % (journal, line))
+                    kept = True
+                    continue
+                ws = _healable_workspace(real_base, path)
+                if ws is None:
+                    problems.append("%s: %s is not inside a suite workspace; left as it is" % (journal, path))
+                    kept = True
+                    continue
+                if os.path.basename(ws).startswith(".ws5657-") and ws not in workspaces:
+                    workspaces.append(ws)
+                if os.path.islink(path) or not os.path.lexists(path):
+                    continue
+                try:
+                    os.chmod(path, mode)
+                except OSError as err:
+                    problems.append("%s: %s" % (path, err))
+                    kept = True
+            for ws in workspaces:
+                if not os.path.lexists(ws):
+                    continue
+                subprocess.run(["chmod", "-R", "u+rwX", ws], capture_output=True)
+                shutil.rmtree(ws, ignore_errors=True)
+                if os.path.lexists(ws):
+                    problems.append("%s: could not be removed" % ws)
+                    kept = True
+                else:
+                    healed.append(ws)
+            if not kept:
+                os.unlink(str(journal))
+        finally:
+            os.close(fd)
+    return healed, problems
+
+
+def setUpModule():
+    _healed, problems = _heal_stranded_fixtures()
+    for problem in problems:
+        print("::warning::selftest5657: a fixture an earlier killed run stranded is not healed: %s"
+              % problem, file=sys.stderr)
+
+
 @contextlib.contextmanager
 def restrictive(path, mode):
     """Hold `path` at `mode` for the body only, and put the old mode back
@@ -169,6 +301,7 @@ def restrictive(path, mode):
     before = stat.S_IMODE(os.lstat(path).st_mode)
     entry = (path, before)
     _LEAKED_MODES.append(entry)
+    _record_fixture_mode(path, before)
     os.chmod(path, mode)
     try:
         yield path
@@ -177,7 +310,7 @@ def restrictive(path, mode):
             if not os.path.islink(path):
                 os.chmod(path, before)
         except OSError:
-            pass
+            _UNRESTORED.append(path)
         with contextlib.suppress(ValueError):
             _LEAKED_MODES.remove(entry)
 
@@ -1281,6 +1414,18 @@ class JournalCase(ScratchTree):
             self.assertEqual(stat.S_IMODE(os.lstat(raw).st_mode), 0o400,
                              "a widen on a non-UTF-8 name was not put back:\n" + r.stdout + r.stderr)
 
+    def outstanding(self):
+        """The `+` lines of the journal that no `-` line releases, as
+        `(inode, found, widened)` - what the next run reads as outstanding."""
+        held = {}
+        for line in self.journal().read_bytes().decode("ascii").splitlines():
+            fields = line.split(" ")
+            if fields[0] == "+":
+                held[fields[1]] = (int(fields[3]), int(fields[4], 8), int(fields[5], 8))
+            elif fields[0] == "-":
+                held.pop(fields[1], None)
+        return list(held.values())
+
 
 class WidenFailureCase(ScratchTree):
     """What every exit from the widen in `_open_at` leaves behind, and what it
@@ -2097,6 +2242,43 @@ class FixtureSafetyCase(unittest.TestCase):
         finally:
             os.chmod(str(victim), before)
         shutil.rmtree(victim)  # must not raise: this is what git clean does
+
+    def test_a_fixture_stranded_by_a_kill_is_healed_at_the_next_suite_start_6024(self):
+        """#6024, the suite's own share. A `SIGKILL` runs no handler and no
+        `atexit`, so a child killed inside `restrictive()` leaves its fixture
+        narrowed. The next suite start finds the journal no live process
+        holds, puts the mode back and removes the workspace, so `git clean`
+        never meets it."""
+        base = ROOT / ".local-runs"
+        base.mkdir(exist_ok=True)
+        ws = Path(tempfile.mkdtemp(prefix=".ws5657-", dir=str(base)))
+        self.addCleanup(shutil.rmtree, str(ws), True)
+        self.addCleanup(subprocess.run, ["chmod", "-R", "u+rwX", str(ws)], capture_output=True)
+        fixture = ws / ".local-runs" / ".tmpK" / "audit"
+        fixture.mkdir(parents=True)
+        (fixture / "audit.log").write_text("{}\n")
+        child = (
+            "import importlib.util as u, os, signal, stat, sys\n"
+            "spec = u.spec_from_file_location('selftest5657', sys.argv[1])\n"
+            "mod = u.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "held = mod.restrictive(sys.argv[2], 0o000)\n"
+            "held.__enter__()\n"
+            "print('HELD 0o%03o' % stat.S_IMODE(os.lstat(sys.argv[2]).st_mode), flush=True)\n"
+            "os.kill(os.getpid(), signal.SIGKILL)\n"
+        )
+        r = subprocess.run([sys.executable, "-c", child, str(Path(__file__).resolve()), str(fixture)],
+                           capture_output=True, text=True)
+        # Without these the test is vacuous (#2444): a child that never held
+        # the fixture, or that exited and ran its reaper, strands nothing.
+        self.assertIn("HELD 0o000", r.stdout, r.stdout + r.stderr)
+        self.assertEqual(r.returncode, -signal.SIGKILL, r.stdout + r.stderr)
+        self.assertEqual(stat.S_IMODE(os.lstat(fixture).st_mode), 0o000,
+                         "the kill did not strand the fixture, so this heals nothing")
+        _healed, problems = _heal_stranded_fixtures()
+        self.assertEqual([p for p in problems if os.path.basename(str(ws)) in p], [], "\n".join(problems))
+        self.assertFalse(os.path.lexists(str(ws)),
+                         "a workspace a killed run stranded survived the next suite start")
 
 
 # --------------------------------------------------------------------------
