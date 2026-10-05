@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import re
 import sys
+import unicodedata
 import unittest
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -63,6 +64,7 @@ class Unparsed(Exception):
 
 
 def _strip_comment(line: str) -> str:
+    """Drop a trailing comment and trailing whitespace (one row at a time)."""
     out: List[str] = []
     quote: Optional[str] = None
     for i, ch in enumerate(line):
@@ -105,88 +107,243 @@ def _parse_inline_list(text: str) -> List[str]:
 
 
 # Characters YAML 1.1 parsers treat as a line break besides LF/CR (PyYAML does).
-_EXOTIC_BREAKS = "\x0b\x0c\x1c\x1d\x1e\x1f\x85\u2028\u2029"
+_EXOTIC_BREAKS = "\x0b\x0c\x1c\x1d\x1e\x1f\x85  "
+# Control characters, noncharacters, and a BOM anywhere but the stream start.
+_FORBIDDEN = re.compile("[\x00-\x08\x0e-\x1f\x7f-\x9f﻿￾￿]")
+# Characters that start an anchor, alias, tag or reserved token.
+_NODE_PROPERTY = "&*!%@`"
+# Characters that may stand directly before a quoted scalar inside a flow collection.
+_FLOW_OPENERS = ("", "[", "{", ",", ":")
 
 
-def _suspect(raw: str, line: str) -> str:
-    """Reason a non-blank line cannot be trusted to keep its column, else ''."""
-    lead = raw[: len(raw) - len(raw.lstrip())]
-    if any(ch != " " for ch in lead):
-        return "non-space leading whitespace"
-    first = line.lstrip()[:1]
-    if first and not (" " < first <= "~"):
-        return "non-ASCII or control first character"
-    return ""
+def _space_like(ch: str) -> bool:
+    """True for a tab and any Unicode space, separator or format character."""
+    return ch == "\t" or ch.isspace() or unicodedata.category(ch) in ("Zs", "Zl", "Zp", "Cc", "Cf")
+
+
+def _quoted_end(s: str, i: int) -> int:
+    """Index just past the quoted scalar that opens at s[i]; it must close on its row."""
+    end = s.find(s[i], i + 1)
+    if end < 0:
+        raise Unparsed("quoted scalar does not close on its row: " + repr(s))
+    return end + 1
+
+
+def _tail(s: str, i: int, what: str) -> str:
+    """s[:i] when only spaces and a comment follow position i, else Unparsed."""
+    rest = s[i:]
+    after = rest.lstrip(" ")
+    if not after or (after[0] == "#" and len(after) < len(rest)):
+        return s[:i]
+    raise Unparsed("text after " + what + ": " + repr(s))
+
+
+def _flow_end(s: str, i: int) -> int:
+    """Index just past the flow collection that opens at s[i]; it must close on its row."""
+    depth = 0
+    prev = ""
+    j = i
+    while j < len(s):
+        ch = s[j]
+        if ch in "'\"":
+            if prev not in _FLOW_OPENERS:
+                raise Unparsed("quote inside a plain flow scalar: " + repr(s))
+            j = _quoted_end(s, j)
+            prev = ch
+            continue
+        if ch == "#" and s[j - 1] == " ":
+            break
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        if ch != " ":
+            prev = ch
+        j += 1
+    raise Unparsed("flow collection does not close on its row: " + repr(s))
+
+
+def _value(s: str, i: int) -> Tuple[str, bool]:
+    """(row text without its comment, opens-a-block-scalar) for the node at s[i:]."""
+    while i < len(s) and s[i] == " ":
+        i += 1
+    if i == len(s) or s[i] == "#":
+        return s[:i].rstrip(" "), False
+    ch = s[i]
+    if ch in "'\"":
+        return _tail(s, _quoted_end(s, i), "a quoted scalar"), False
+    if ch in "[{":
+        return _tail(s, _flow_end(s, i), "a flow collection"), False
+    if ch in "|>":
+        header = re.compile(r"[|>][-+]?").match(s, i)
+        assert header is not None
+        return _tail(s, header.end(), "a block scalar header"), True
+    if ch in _NODE_PROPERTY:
+        raise Unparsed("anchor, alias, tag or reserved indicator: " + repr(s))
+    if ch in ",]}" or (ch in "?:-" and s[i + 1:i + 2] in ("", " ")):
+        raise Unparsed("indicator where a value belongs: " + repr(s))
+    cut = s.find(" #", i)
+    end = len(s) if cut < 0 else cut
+    plain = s[i:end].rstrip(" ")
+    if ": " in plain or plain.endswith(":"):
+        raise Unparsed("nested mapping on one row: " + repr(s))
+    return s[:end].rstrip(" "), False
+
+
+def _plain_key_colon(s: str, i: int) -> int:
+    """Index of the ':' that ends a plain key starting at s[i], or -1."""
+    j = i
+    while j < len(s):
+        if s[j] == "#" and s[j - 1] == " ":
+            return -1
+        if s[j] == ":" and s[j + 1:j + 2] in ("", " "):
+            return j
+        j += 1
+    return -1
+
+
+def _scan_row(rest: str) -> Tuple[str, str, int, bool]:
+    """Positive rules for one structure row (text after its ASCII-space indentation).
+
+    Returns (row text without comment, mapping key or '', column offset of the node
+    that owns a block scalar, opens-a-block-scalar). A row is accepted only as a
+    mapping key row or a sequence entry, each optionally after ``- `` prefixes;
+    anything else is Unparsed.
+    """
+    i = 0
+    dash = -1
+    while rest.startswith("-", i) and rest[i + 1:i + 2] in ("", " "):
+        dash = i
+        i += 1
+        while i < len(rest) and rest[i] == " ":
+            i += 1
+    if i < len(rest) and rest[i] in "'\"":
+        end = _quoted_end(rest, i)
+        j = end
+        while j < len(rest) and rest[j] == " ":
+            j += 1
+        if rest.startswith(":", j) and rest[j + 1:j + 2] in ("", " "):
+            body, header = _value(rest, j + 1)
+            return body, rest[i:end], i, header
+    elif i < len(rest) and rest[i] not in "[{|>,]}#?:" + _NODE_PROPERTY:
+        colon = _plain_key_colon(rest, i)
+        if colon >= 0:
+            key = rest[i:colon].rstrip(" ")
+            if key == "<<":
+                raise Unparsed("merge key: " + repr(rest))
+            body, header = _value(rest, colon + 1)
+            return body, key, i, header
+    if dash < 0:
+        raise Unparsed("row is neither a mapping key, a sequence entry nor a comment: " + repr(rest))
+    body, header = _value(rest, i)
+    return body, "", dash, header
 
 
 def _meaningful(text: str) -> List[Tuple[int, str, str]]:
-    """(indent, body, suspect) per non-blank, non-comment line (#5660)."""
+    """(indent, row text, mapping key or '') per structure row; closed world (#5660, #5705).
+
+    Every line must be accepted by a positive rule: a blank line, a comment line, a
+    content line of a block scalar (indented past its owner, no whitespace other
+    than ASCII space before its first character), a single leading or trailing
+    document marker row, or a structure row that _scan_row accepts. A structure row
+    starts with printable ASCII after ASCII-space indentation and holds no tab.
+    """
     if re.search(r"\r(?!\n)", text):
         raise Unparsed("lone carriage return line break")
     if any(ch in _EXOTIC_BREAKS for ch in text):
         raise Unparsed("YAML 1.1 line-break character (form feed, NEL, U+2028/9, ...)")
+    bad = _FORBIDDEN.search(text)
+    if bad:
+        raise Unparsed("control character, noncharacter or inner BOM: U+%04X" % ord(bad.group()))
     rows: List[Tuple[int, str, str]] = []
+    owner: Optional[int] = None  # column of the node that owns an open block scalar
+    content: Optional[int] = None  # indentation of that block scalar's first line
     for raw in text.split("\n"):
-        line = _strip_comment(raw)
-        if line.strip():
-            rows.append((_indent(line), line.strip(), _suspect(raw, line)))
+        if raw.endswith("\r"):
+            raw = raw[:-1]
+        ind = _indent(raw)
+        rest = raw[ind:]
+        if owner is not None:
+            if not rest:
+                continue
+            if ind > owner:
+                if _space_like(rest[0]):
+                    raise Unparsed("block scalar line starts with non-space whitespace: " + repr(raw))
+                if content is None:
+                    content = ind
+                elif ind < content:
+                    raise Unparsed("block scalar line less indented than its first line: " + repr(raw))
+                continue
+            owner = None
+        if not rest:
+            continue
+        if not " " < rest[0] <= "~":
+            raise Unparsed("row starts with non-space whitespace or a non-ASCII character: " + repr(raw))
+        if "\t" in rest:
+            raise Unparsed("tab on a structure row: " + repr(raw))
+        if rest[0] == "#":
+            continue
+        if ind == 0 and _strip_comment(rest) in ("---", "..."):
+            rows.append((0, _strip_comment(rest), ""))
+            continue
+        body, key, node, header = _scan_row(rest)
+        rows.append((ind, body, key))
+        if header:
+            owner, content = ind + node, None
     return rows
 
 
-TOP_KEY = re.compile(r"""^("[^"\\]*"|'[^']*'|[A-Za-z_][A-Za-z0-9_-]*)\s*:(\s|$)""")
+TOP_KEY = re.compile(r"""("[^"\\]*"|'[^']*'|[A-Za-z_][A-Za-z0-9_-]*)""")
 ON_SPELLINGS = ("on", "true", "yes")  # all resolve to the boolean True key (YAML 1.1)
+ON_KEYS = ('on', '"on"', "'on'")
 
 
 def _check_top_level(rows: List[Tuple[int, str, str]]) -> None:
-    """Closed-world top level: only plain mapping keys, each once (#5667, #5668).
+    """Closed-world top level: only mapping keys, each once (#5667, #5668, #5705).
 
     A single leading ``---`` is accepted; every other indent-0 row must be a bare
-    or escape-free quoted key. Document markers, directives, sequences, complex
-    keys, merge keys, anchors, tags, flow collections and an unclosed quote at the
-    top level are all refused, because a YAML reader would read them differently.
+    word key or an escape-free quoted key. Document markers, directives, sequences,
+    complex keys, merge keys, anchors, tags, flow collections and an unclosed quote
+    at the top level are all refused, because a YAML reader would read them
+    differently.
     """
     seen: Set[str] = set()
-    for idx, (ind, body, sus) in enumerate(rows):
-        if ind != 0 or sus == "non-space leading whitespace":
-            continue  # tab/NBSP-led rows are block-scalar content, never a column-0 key
+    for idx, (ind, body, key) in enumerate(rows):
+        if ind != 0:
+            continue
         if idx == 0 and body == "---":
             continue
-        m = TOP_KEY.match(body)
-        if not m:
+        if not key or not TOP_KEY.fullmatch(key):
             raise Unparsed("top-level row is not a plain mapping key (#5668): " + repr(body))
-        value = body[m.end():].strip()
-        if value[:1] in ("'", '"') and not (len(value) >= 2 and value[-1] == value[0]):
-            raise Unparsed("top-level value with an unclosed quote (#5668): " + repr(body))
-        key = m.group(1).strip("\"'").lower()
-        if key in ON_SPELLINGS:
-            key = "on"
-        if key in seen:
+        name = key.strip("\"'").lower()
+        if name in ON_SPELLINGS:
+            name = "on"
+        if name in seen:
             raise Unparsed("repeated top-level key (#5667): " + body)
-        seen.add(key)
+        seen.add(name)
 
 
 def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
     """Return {trigger: {filter_key: [items]}} for the workflow's ``on:`` block."""
-    if text.startswith("\ufeff"):
+    if text.startswith("﻿"):
         text = text[1:]  # a BOM at the very start of the stream is not content
     rows = _meaningful(text)
     _check_top_level(rows)
     start = None
-    for idx, (ind, body, _sus) in enumerate(rows):
-        if ind == 0 and re.match(r"""^("on"|'on'|on|true)\s*:""", body):
+    for idx, (ind, _body, key) in enumerate(rows):
+        if ind == 0 and key in ON_KEYS + ("true",):
             start = idx
             break
     if start is None:
         raise Unparsed("no top-level on: block")
-    head = re.match(r"""^("on"|'on'|on|true)\s*:\s*(.*)$""", rows[start][1])
-    assert head is not None
-    if head.group(2).strip():
-        raise Unparsed("flow/scalar on: form: " + head.group(2).strip())
+    on_key = rows[start][2]
+    head = rows[start][1][len(on_key):].lstrip(" ")[1:].strip()
+    if head:
+        raise Unparsed("flow/scalar on: form: " + head)
     block: List[Tuple[int, str]] = []
-    for ind, body, sus in rows[start + 1:]:
-        if sus:
-            # Includes the line that would otherwise silently END the block (#5660).
-            raise Unparsed("on: block line is untrustworthy (" + sus + "): " + repr(body))
+    for ind, body, _key in rows[start + 1:]:
         if ind == 0:
             break
         block.append((ind, body))
@@ -200,10 +357,10 @@ def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
         ind, body = block[i]
         if ind != trig_indent:
             raise Unparsed("unexpected indentation in on: block: " + body)
-        m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$", body)
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*) *:(?: +(.*))?$", body)
         if not m:
             raise Unparsed("unreadable trigger line: " + body)
-        name, rest = m.group(1), m.group(2).strip()
+        name, rest = m.group(1), (m.group(2) or "").strip()
         if name.lower() in seen_triggers:
             raise Unparsed("repeated trigger key in on: block (#5666): " + name)
         seen_triggers.add(name.lower())
@@ -232,10 +389,10 @@ def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[s
         ind, body = sub[k]
         if ind != key_indent:
             raise Unparsed(trigger + ": unexpected indentation: " + body)
-        m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$", body)
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*) *:(?: +(.*))?$", body)
         if not m:
             raise Unparsed(trigger + ": unreadable filter line: " + body)
-        key, rest = m.group(1), m.group(2).strip()
+        key, rest = m.group(1), (m.group(2) or "").strip()
         if key.lower() in seen_keys:
             raise Unparsed(trigger + ": repeated filter key (#5666): " + key)
         seen_keys.add(key.lower())
@@ -611,9 +768,10 @@ class LeadingWhitespace5660(unittest.TestCase):
     def test_5660_bom_at_stream_start_stays_clean(self) -> None:
         self.assertEqual([], violations("x.yml", "\ufeff" + _with_on_block(GOOD_PUSH + GOOD_PR)))
 
-    def test_5660_tab_in_later_block_scalar_is_not_inspected(self) -> None:
-        text = _with_on_block(GOOD_PUSH + GOOD_PR) + "x:\n  run: |\n\t\techo hi\n"
-        self.assertEqual([], violations("x.yml", text))
+    def test_5660_tab_led_line_after_a_block_scalar_header_is_refused(self) -> None:
+        # Changed by #5705: a tab-led row is refused wherever it is, because it can
+        # also sit inside a multi-line quoted scalar that hides rows from the reader.
+        self._red(_with_on_block(GOOD_PUSH + GOOD_PR) + "x:\n  run: |\n\t\techo hi\n")
 
 
 def _push_text(entries: str) -> str:
@@ -919,6 +1077,115 @@ class TypesScalar5669(unittest.TestCase):
     def test_5669_unbalanced_or_spaced_scalar(self) -> None:
         for line in ("types: 'opened", 'types: opened"', "types: opened closed", "types: -"):
             self._shape(line)
+
+
+class ClosedWorld5705(unittest.TestCase):
+    """#5705: every line needs a positive rule; a line no rule accepts is Unparsed.
+
+    Each reproducer that ends with an on: block YAML reads differently returned no
+    violation at b5bcf59b9. The PyYAML 6.0.1 view quoted in a comment was measured
+    with yaml.safe_load on the same text.
+    """
+
+    J = "jobs:\n  a:\n    runs-on: x\n"
+    PUSH_BAD = "on:\n  push:\n    branches: ['rehearsal/**']\n"
+    LEAD = "non-space whitespace or a non-ASCII"
+
+    def _shape(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5705_control_clean(self) -> None:
+        self.assertEqual([], violations("x.yml", "name: x\non:\n" + GOOD_PUSH + GOOD_PR + self.J))
+
+    def test_5705_nbsp_led_first_on_row(self) -> None:
+        # PyYAML: the first key is the string NBSP+"on"; the second on: is the trigger block.
+        self._shape("\u00a0on:\n" + GOOD_PR + self.PUSH_BAD + self.J, self.LEAD)
+
+    def test_5705_tab_led_first_on_row(self) -> None:
+        self._shape("\ton:\n" + GOOD_PR + self.PUSH_BAD + self.J, self.LEAD)
+
+    def test_5705_tab_row_inside_escaped_double_quote(self) -> None:
+        # Round-2 reproducer 2. PyYAML: name swallows the tab row; on = the push block.
+        self._shape('name: "a\\"\n\ton:\n' + GOOD_PR + 'zz: 1 #"\n' + self.PUSH_BAD + self.J, self.LEAD)
+
+    def test_5705_unicode_space_led_rows(self) -> None:
+        for lead in ("\u200b", "\u2003", "\u3000", "\u00a0 ", " \u00a0"):
+            self._shape("name: x\non:\n" + GOOD_PR + lead + "zz: 1\n" + self.J, self.LEAD)
+
+    def test_5705_tab_or_nbsp_before_a_colon(self) -> None:
+        self._shape("name: x\non\t:\n" + GOOD_PR + self.J, "tab on a structure row")
+        # PyYAML: the trigger key is the string "pull_request" + NBSP, not pull_request.
+        self._shape("name: x\non:\n  pull_request\u00a0:\n    branches: [main]\n" + self.J, "unreadable trigger")
+        self._shape("name: x\non:\n" + GOOD_PR + "    branches\u00a0: [main]\n" + self.J, "unreadable filter")
+
+    def test_5705_tab_after_a_colon(self) -> None:
+        self._shape("name: x\non:\t\n" + GOOD_PR + self.J, "tab on a structure row")
+        self._shape("name: x\non:\n" + GOOD_PR + "zz:\t{}\n" + self.J, "tab on a structure row")
+
+    def test_5705_nested_multiline_quote_hides_column_0_rows(self) -> None:
+        # PyYAML: jobs.a.name swallows the on: rows; the file has no on key at all.
+        self._shape("name: x\njobs:\n  a:\n    name: \"a\non:\n" + GOOD_PR + "zz: 1 #\"\n    runs-on: x\n",
+                    "does not close on its row")
+        self._shape("name: x\njobs:\n  a:\n    - 'a\non:\n" + GOOD_PR + "zz: 1 #'\n", "does not close on its row")
+
+    def test_5705_multiline_flow_collection(self) -> None:
+        self._shape("name: x\njobs:\n  a:\n    with: [a,\non:\n" + GOOD_PR + "zz: b]\n", "does not close on its row")
+        self._shape("name: x\non:\n" + GOOD_PR + "x:\n  with: {a: b,\n    c: d}\n", "does not close on its row")
+
+    def test_5705_single_row_flow_collections_stay_clean(self) -> None:
+        text = "name: x\non:\n" + GOOD_PR + "x:\n  with: {a: 'b', c: [\"d\", e]}\n"
+        self.assertEqual([], violations("x.yml", text))
+
+    def test_5705_block_scalar_lines_led_by_tab_or_nbsp(self) -> None:
+        base = "name: x\non:\n" + GOOD_PR + "x:\n  run: |\n"
+        self._shape(base + "\t\techo hi\n", self.LEAD)
+        self._shape(base + "    echo a\n    \techo hi\n", "block scalar line starts with non-space")
+        self._shape(base + "    \u00a0echo hi\n", "block scalar line starts with non-space")
+
+    def test_5705_block_scalar_line_less_indented_than_first(self) -> None:
+        self._shape("name: x\non:\n" + GOOD_PR + "x:\n  run: |\n      echo a\n    echo b\n", "less indented")
+
+    def test_5705_block_scalar_content_is_not_read_as_rows(self) -> None:
+        body = "x:\n  - run: |\n      on:\n      \"a\\\n      '\n    # ok\n  - y: >-\n\n      z: 'w\n"
+        self.assertEqual([], violations("x.yml", "name: x\non:\n" + GOOD_PUSH + GOOD_PR + body))
+
+    def test_5705_block_scalar_indentation_indicator(self) -> None:
+        self._shape("name: x\non:\n" + GOOD_PR + "x:\n  run: |2\n    echo\n", "after a block scalar header")
+
+    def test_5705_inner_bom_and_control_characters(self) -> None:
+        for ch in ("\ufeff", "\x07", "\x00", "\x7f", "\x9b", "\ufffe"):
+            self._shape("name: x" + ch + "\non:\n" + GOOD_PR, "control character")
+
+    def test_5705_form_feed_and_vertical_tab_mid_row(self) -> None:
+        for ch in ("\x0c", "\x0b"):
+            self._shape("name: a" + ch + "b\non:\n" + GOOD_PR, "line-break character")
+
+    def test_5705_plain_scalar_continuation_row(self) -> None:
+        # PyYAML: name is "a b"; the reader refuses the bare row instead of guessing.
+        self._shape("name: a\n  b\non:\n" + GOOD_PR + self.J, "neither a mapping key")
+
+    def test_5705_indented_document_markers(self) -> None:
+        for row in ("  ---\n", "  ...\n"):
+            self._shape("name: x\non:\n" + GOOD_PR + "x:\n" + row, "neither a mapping key")
+
+    def test_5705_nested_anchor_alias_tag_merge_and_complex_key(self) -> None:
+        cases = (("  a: &x 1\n", "anchor"), ("  b: *x\n", "anchor"), ("  c: !!str 1\n", "anchor"),
+                 ("  <<: *x\n", "merge key"), ("  ? c\n", "neither a mapping key"),
+                 ("  - ? c\n", "indicator where a value"), ("  d: e: f\n", "nested mapping"))
+        for row, why in cases:
+            self._shape("name: x\non:\n" + GOOD_PR + "x:\n" + row, why)
+
+    def test_5705_sequence_rows_stay_clean(self) -> None:
+        body = "x:\n  - a\n  -\n  - - b\n  - 'c'\n  - \"d\"  # e\n  - k: v\n    l: [m]\n"
+        self.assertEqual([], violations("x.yml", "name: x\non:\n" + GOOD_PR + body))
+
+    def test_5705_every_live_file_is_read(self) -> None:
+        # GREEN CONTROL: every real workflow parses; none is waved through as Unparsed.
+        live = load_all()
+        for name, text in live.items():
+            self.assertTrue(parse_triggers(text), name)
+        self.assertGreaterEqual(len(live), 20)
 
 
 class GlobSemantics5447(unittest.TestCase):
