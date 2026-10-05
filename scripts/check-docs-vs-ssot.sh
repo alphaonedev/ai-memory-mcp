@@ -741,12 +741,15 @@ DIGITS = re.compile(r'[0-9]+')
 
 def occ(prefix):
     # Which number of its line a hit's value is (#5809): the count of digit runs
-    # before it, read with tags, whitespace, markers and width suffixes folded out.
+    # before it, read with whitespace, markers and width suffixes folded out.
     # Every view of a line (raw, marker-folded, anchor, wrapped-line join, the html
-    # pill read before or after unescaping) gives the same count for the same
+    # pill read with its entities decoded once) gives the same count for the same
     # number, so one number seen in several views is one hit, and two copies of a
-    # phrase on one line are two.
-    return len(DIGITS.findall(TYPED.sub('', MARKS.sub('', WS.sub(' ', TAG.sub(' ', prefix))))))
+    # phrase on one line are two. Tags are not folded (#5947): every view carries
+    # the same tag text (html views read the line after plain() strips real tags),
+    # and a copy inside markup (a tag attribute, escaped markup) is still a number
+    # of its line, so the copy after it counts as a second hit.
+    return len(DIGITS.findall(TYPED.sub('', MARKS.sub('', WS.sub(' ', prefix)))))
 
 
 def raw_cut(raw, upre):
@@ -3641,7 +3644,26 @@ R5809MD
         && { echo "FAIL: self-test #5809 - a hit two rows shield, alone, passed (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
     grep -qF 'is shielded by the entries at lines 1 and 2' <<<"$_s_out" \
         || { echo "FAIL: self-test #5809 - the lone shared hit was not named" >&2; cd "$REPO_ROOT"; exit 1; }
-    echo "PASS: self-test #5809 - one hit seen in two views counts once when the views read different text before it (a transition span, marker-split digits, a width suffix, an escaped entity before an html pill); a row shielding two hits, or a hit two rows shield, fails the gate on its own"
+    # ---- #5947: a copy inside markup is still a number of its line. One row against
+    # a markdown line whose first copy sits in a tag attribute, and an html line whose
+    # first copy sits in escaped markup, shields 2 hits on each line and fails.
+    {
+        printf 'docs/postgres-age-guide.md\tschema_version was 54\t#5947 first copy inside a tag\n'
+        printf 'docs/schema-fixture.html\tschema_version was 54\t#5947 first copy inside escaped markup\n'
+    } > "$_s"
+    printf '<a title="the schema_version was 54 at v0.6">and then, well past the claim window, in a different clause of the same line, the schema_version was 54</a> then\n' \
+        > "$tmpdir/docs/postgres-age-guide.md"
+    printf '<p>&lt;a title="the schema_version was 54 at v0.6"&gt; and then, well past the claim window, in a different clause of the same line, the schema_version was 54&lt;/a&gt;</p>\n' \
+        > "$tmpdir/docs/schema-fixture.html"
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5947 - a row shielding a copy inside markup and a copy after it passed (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in 'entry at line 1 shields 2 hits, exactly one is allowed (#5809): "schema_version was 54" at docs/postgres-age-guide.md:1, docs/postgres-age-guide.md:1 ' \
+        'entry at line 2 shields 2 hits, exactly one is allowed (#5809): "schema_version was 54" at docs/schema-fixture.html:1, docs/schema-fixture.html:1 '; do
+        grep -qF "$_want" <<<"$_s_out" \
+            || { echo "FAIL: self-test #5947 - missing: $_want" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    rm -f "$tmpdir/docs/schema-fixture.html"
+    echo "PASS: self-test #5809 - one hit seen in two views counts once when the views read different text before it (a transition span, marker-split digits, a width suffix, an escaped entity before an html pill); a row shielding two hits, or a hit two rows shield, fails the gate on its own, and so does a row shielding a copy inside markup and a copy after it (#5947)"
     rm -f "$tmpdir/docs/postgres-age-guide.md"
     printf '# fixture ledger (comment-only)\n' > "$_s"
 
