@@ -165,7 +165,7 @@ def main(argv):
     allow_path = root / gate.ALLOW_REL
     try:
         raw = allow_path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:  # #5369: a non-UTF-8 allowlist is a FAULT (rc 2), not a traceback
         print("regen: FAULT: cannot read %s: %s" % (gate.ALLOW_REL, exc), file=sys.stderr)
         return 2
     entries, errors = gate.load_allowlist(root, require_ctx=not a.refresh_context)
