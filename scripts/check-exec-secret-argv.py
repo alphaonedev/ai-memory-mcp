@@ -3063,6 +3063,12 @@ def _git_funnel_cases(t: Path) -> Tuple[List[str], int]:
     n += 1
     if marker.exists():
         bad.append("a repo-local core.fsmonitor program ran during the gate's git reads (#5633)")
+    # the pins are visible to git itself: a config read through the funnel names them (#5692)
+    n += 1
+    for key, want in (("core.fsmonitor", "false"), ("core.hookspath", os.devnull)):
+        got = _git_exec(repo, ["config", "--get", key]).stdout.decode("utf-8", "replace").strip()
+        if got != want:
+            bad.append("the funnel does not pin %s to %r (read back %r) (#5692)" % (key, want, got))
     repo, shas = build("attr-info")
     (repo / ".git" / "info").mkdir(parents=True, exist_ok=True)
     (repo / ".git" / "info" / "attributes").write_text("%s -diff\n" % PENDING_FILE)
