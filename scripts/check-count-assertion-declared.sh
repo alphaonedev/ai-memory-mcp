@@ -219,10 +219,14 @@ CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]*)\s*:\s*(?:usize|u\d+|i\d
 UNREAD = '?count#unreadable'
 UNREADABLE = '!unreadable'      # the key prefix of an undecidable assertion: red in every commit that reads its file
 # The `<` that opens a generic argument list (#5873), as rustc reads it: after `::` (a turbofish, also `Vec::<u8>`),
-# after the type path that follows `as` (`x as W<A, B>`, a leading `::` and raw identifiers too), and at the start of
-# an operand (a qualified path `<T as Tr<A, B>>::C`, also right after `as`). Any other `<` is a comparison or a shift.
-# angle_opens reads the first and the last (an operand starts after `:` too); AS_GENERIC reads the one after `as`.
-AS_GENERIC = re.compile(r"as\s+(?:(?:&|\*\s*(?:const|mut)\b|mut\b|dyn\b|'[A-Za-z_]\w*)\s*)*(?:::\s*)?(?:(?:r#)?[A-Za-z_]\w*\s*::\s*)*(?:r#)?[A-Za-z_]\w*\s*<")
+# right after the type path that follows `as` or `->` (`x as W<A, B>`, `f as fn() -> W<A, B>`, a leading `::` and raw
+# identifiers too; #5961), and at the start of an operand (a qualified path `<T as Tr<A, B>>::C`, also right after
+# `as`). A `<=` or `<<=` never opens one, `_` is not a type path, and a `<` right after the `>` that closes a generic
+# list is a comparison (#5960). Any other `<` is a comparison or a shift.
+# angle_opens reads the first and the last (an operand starts after `:` too); AS_GENERIC reads the one after `as`/`->`.
+TYPE_SEG = r'(?:r#)?(?:[A-Za-z]\w*|_\w+)'
+AS_GENERIC = re.compile(r"(?:as(?!\w)|->)\s*(?:(?:&|\*\s*(?:const|mut)\b|mut\b|dyn\b|impl\b|'[A-Za-z_]\w*)\s*)*"
+                        r'(?:::\s*)?(?:' + TYPE_SEG + r'\s*::\s*)*' + TYPE_SEG + r'\s*<(?!=|<=)')
 NO_CLOSER = 'a generic argument list `<` with no closing `>`'
 NOT_OPERAND = {'as', 'return', 'in', 'if', 'while', 'match', 'else', 'mut', 'move', 'break', 'let', 'yield', 'box', 'dyn'}
 
@@ -239,11 +243,14 @@ def block_end(t, j):
     return None
 
 
-def angle_opens(m, j):
+def angle_opens(m, j, s):
     """m[j] == '<' outside every generic list -> True when it opens one (a turbofish: `::` before it; a qualified path
-    at the start of an operand), False when it is a comparison or a shift (an operand ends right before it)."""
+    at the start of an operand), False when it is a comparison or a shift (an operand ends right before it, a `>` that
+    closed a generic list is such an end: s, the shape so far, holds `)` there; `<=` and `<<=` are operators; #5960)."""
+    if m.startswith('<=', j) or m.startswith('<<=', j): return False
     k = j - 1
     while k >= 0 and m[k].isspace(): k -= 1
+    if k >= 0 and m[k] == '>' and s[k] == ')': return False
     if k < 0 or m[k] in '([{,;=!&|+-*/%^<>:@': return True
     w = re.search(r'[A-Za-z_]\w*$', m[:k + 1])
     return bool(w) and w.group() in NOT_OPERAND and not m[:w.start()].endswith(('.', '::'))
@@ -283,11 +290,11 @@ def macro_args(t, i):
             elif ch in '([{': stack.append(ch)
             elif ch in ')]};': return NO_CLOSER if COUNT_CALL.search(m) else None
             j += 1; continue
-        a2 = AS_GENERIC.match(m, j) if (m.startswith('as', j) and not re.match(r'\w', m[j - 1:j])) else None
-        if a2:                                            # the `<` after the type path that follows `as`
+        a2 = AS_GENERIC.match(m, j) if ((m.startswith('as', j) and not re.match(r'\w', m[j - 1:j])) or m.startswith('->', j)) else None
+        if a2:                                            # the `<` after the type path that follows `as` or `->`
             j = a2.end() - 1; stack.append('<'); s[j] = '('; j += 1; continue
         if ch == '<':
-            if angle_opens(m, j): stack.append('<'); s[j] = '('
+            if angle_opens(m, j, s): stack.append('<'); s[j] = '('
             elif m.startswith('<<', j): j += 2; continue      # a shift: its second `<` opens nothing (`<=` needs no skip)
         elif ch in '([{': stack.append(ch)
         elif ch in ')]}' and stack: stack.pop()
@@ -1127,6 +1134,29 @@ def selftest():
          shared(UR_ % 'EXPECTED_N', L(18), L(19)), True, ['!unreadable line 1 (an unterminated block comment)'])
     case('#5888 an unreadable assertion is not re-read when a const its file does not name moves',
          shared(UR_ % 'OTHER_N', L(18), L(19)), False)
+    # ---- #5960: rustc opens a generic list after a cast type on <, << and <- only: <= and <<= compare, as _ < compares (_
+    # is not a path), and a < after the closing > of a type compares; such valid Rust is read, never unreadable --------
+    R9 = lambda a: 'fn t(n: u32, x: u32, y: u32, v: &[u8]) { assert!(%s); }\n' % a
+    for l_, a_ in (('<= after as u8 (M10)', 'n as u8 <= 3 && v.len() == 4'), ('<= after as u8 with no space', 'n as u8<=3 && v.len() == 4'),
+                   ('< after as _ (M11)', 'v.len() == 3 && x as _ < y'), ('<= after as _', 'v.len() == 3 && x as _ <= y'),
+                   ('<< after as _', 'v.len() == 3 && x as _ << 1 == y'), ('<<= after as u8', 'n as u8 <<= 1 && v.len() == 4'),
+                   ('<= after as a path', 'n as std::primitive::u8 <= 3 && v.len() == 4'), ('<= after as a raw ident', 'n as r#u8 <= 3 && v.len() == 4'),
+                   ('<= after as &u8', 'v.len() == 3 && &(n as u8) as &u8 <= &3'), ('<= after as *const u8', 'v.len() == 3 && &(n as u8) as *const u8 <= 0 as *const u8'),
+                   ('< after as dyn Tr<A, B>', 'v.len() == 3 && n as dyn Tr<u8, u8> < 3'), ('< after as impl Tr<A, B>', 'v.len() == 3 && n as impl Tr<u8, u8> < 3'),
+                   ('<= after as W<A, B>', 'v.len() == 3 && n as W<u8, u8> <= 3'), ('<= after as Vec<u8>', 'v.len() == 3 && n as Vec<u8> <= 3')):
+        case('#5960 %s is read, and a commit that only touches its file is green' % l_, scoped('tests/scope.rs', R9(a_), R9(a_) + '// touched\n'), False)
+    case('#5960 a count bump behind <= after as u8 is still a move', scoped('tests/scope.rs', R9('n as u8 <= 3 && v.len() == 4'), R9('n as u8 <= 3 && v.len() == 5')),
+         True, ['nasu8<=3&&v.len()==4  ?count#ambiguous -> (none)'])
+    case('#5960 control: < after as u8 still opens a generic list (rustc refuses it)', scoped('tests/scope.rs', R9('n as u8 < 3 && v.len() == 4'), R9('n as u8 < 3 && v.len() == 4') + '// t\n'),
+         True, ['!unreadable line 1 (a generic argument list'])
+    case('#5960 control: << after as u8 still opens a generic list (rustc refuses it)', scoped('tests/scope.rs', R9('n as u8 << 1 == 2 && v.len() == 4'), R9('n as u8 << 1 == 2 && v.len() == 4') + '// t\n'),
+         True, ['!unreadable line 1 (a generic argument list'])
+    # ---- #5961: the return type after -> is a type path, so its generic list is a bracket and a comma in it splits nothing
+    FR = lambda n: R9('f as fn() -> W<u8, u8> == g && v.len() == %s' % n)
+    case('#5961 a count bump behind fn() -> W<A, B> is a move', scoped('tests/scope.rs', FR(3), FR(4)), True, ['fasfn()->W<u8,u8>==g&&v.len()==3  ?count#ambiguous -> (none)'])
+    case('#5961 the same, declared', scoped_m('tests/scope.rs', FR(3), FR(4), msg('test: bump',
+         'Count: fasfn()->W<u8,u8>==g&&v.len()==3 ?count#ambiguous -> (none), fasfn()->W<u8,u8>==g&&v.len()==4 (none) -> ?count#ambiguous, '
+         'fasfn()->W<u8,u8>==g&&v.len()==3 ?W#unresolved -> (none), fasfn()->W<u8,u8>==g&&v.len()==4 (none) -> ?W#unresolved (fixture)')), False)
     # stated limits (#5715 brings a lexer): a quote or a // inside a block comment is read as the start of a string or of
     # a line comment, so such an assertion is unreadable (red with its line), never silently skipped
     case('#5872 a quote inside a block comment, with a string after it, is unreadable (#5715)',
