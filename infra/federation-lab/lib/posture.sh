@@ -248,15 +248,23 @@ lab_posture_ssot_check() {
 # Nothing on the verdict path calls return, printf or echo: lab_probe_verdict sets LAB_PROBE_VERDICT by assignment.
 # In-process, before the exec, the guard lab_probe_cmds_proven refuses (reason in LAB_PROBE_WHY) unless each row of
 # LAB_PROBE_CMDS resolves, at call time, to the kind the row names by both plain `type -t` and `builtin type -t` (rows: the
-# keyword [[, and the builtins builtin, type and exec), and an absolute bash file exists.
+# keyword [[, and the builtins builtin, type and exec), and an absolute bash file exists. It also refuses (#5663) when
+# xtrace, functrace, errtrace or extdebug is on, or any function carries the trace attribute (read with builtin declare
+# -F; a failed read refuses): only those let caller code run INSIDE the guard and the subshell (a DEBUG or RETURN trap
+# runs inside a function only under functrace, extdebug or the trace attribute, an ERR trap only under errtrace, and PS4
+# is expanded before each command only under xtrace). An untraced trap runs only at the caller's own level.
 # Covered (each is a self-test leg): a function, exported function, alias, `enable -n`, or `enable -n` with a PATH file
 # for every builtin row; a lying type or builtin; lying type and builtin together with a function named exec (posix mode
 # runs the builtin); a function named return, exit, local, set, shopt or any other neighbour; awk or bash by function,
 # exported function, alias, PATH file, hash -p, or a function named by an absolute path; a caller-set LAB_PROBE_BASH;
 # BASH_ENV, ENV, exported SHELLOPTS and BASHOPTS; a relative path in either path table; eight IFS values; twelve shell
-# options; an alias for exec present while this file is sourced (the structural leg refuses the changed body).
-# Not covered: a DEBUG, RETURN or ERR trap that the caller's functrace, errtrace or extdebug lets run inside the guard or
-# the subshell (#5663); lying type and builtin together with `enable -n exec` and a function named exec; a hostile regular
+# options; an alias for exec present while this file is sourced (the structural leg refuses the changed body); xtrace
+# (also with a PS4 that assigns), functrace, errtrace, extdebug and the trace attribute, each refused; DEBUG, RETURN and
+# ERR traps with none of those on, which never run inside; both #5663 reproducers.
+# Not covered: a trap that runs before the guard's first check (bash runs a DEBUG trap before the command it traces, so
+# a trap written against the matcher's own steps, for example one that clears LAB_PROBE_WHY and sets the status, or a
+# RETURN trap that rewrites LAB_PROBE_VERDICT after lab_probe_verdict returns, is not stopped: no in-shell check can
+# come first); lying type and builtin together with `enable -n exec` and a function named exec; a hostile regular
 # file at an absolute bash or awk path, or a replaced guard, matcher or table (LAB_PROBE_CMDS, LAB_PROBE_BASH_PATHS,
 # LAB_PROBE_AWK_PATHS); ignored signals, umask, cwd, open fds and ulimits cross exec (they can only make the child fail,
 # which reads as refused); a log path that begins with "-" is passed to awk as before.
@@ -265,6 +273,8 @@ LAB_PROBE_BASH_PATHS=(/bin/bash /usr/bin/bash)
 LAB_PROBE_AWK_PATHS=(/usr/bin/awk /bin/awk)
 lab_probe_cmds_proven() {
   LAB_PROBE_BASH=""; LAB_PROBE_WHY=""
+  [[ $- != *x* && ! -o functrace && ! -o errtrace && $BASHOPTS != *extdebug* ]] || LAB_PROBE_WHY="xtrace, functrace, errtrace or extdebug is on; "
+  _lab_t=$(builtin declare -F) && [[ ! $_lab_t =~ -f[a-z]*t ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}a function carries the trace attribute (or declare -F failed); "
   for _lab_row in "${LAB_PROBE_CMDS[@]}"; do
     _lab_n=${_lab_row%%:*}; _lab_k=${_lab_row#*:}
     [[ $(type -t "$_lab_n") == "$_lab_k" && $(builtin type -t "$_lab_n") == "$_lab_k" ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}${_lab_n} is not the ${_lab_k} the matcher needs; "
@@ -301,7 +311,7 @@ lab_probe_expected_body() {
   printf '%s' "lab_probe_refusal_names_knob () { lab_probe_cmds_proven && ( POSIXLY_CORRECT=1; exec -c \"\$LAB_PROBE_BASH\" --noprofile --norc -c ${q}[[ -r \$1 ]] || exit 4; for a in \"\${@:3}\"; do if [[ \$a == /* && -f \$a && -x \$a ]]; then \"\$a\" \"\$2\" \"\$1\"; exit; fi; done; exit 3${q} lab-probe \"\$1\" ${q}index(\$0, \"INFO\") == 0 && index(\$0, \"refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:\") { f = 1 } END { exit (f ? 10 : 11) }${q} \"\${LAB_PROBE_AWK_PATHS[@]}\" ) 2> /dev/null }"
 }
 lab_probe_expected_guard_body() {
-  printf '%s' 'lab_probe_cmds_proven () { LAB_PROBE_BASH=""; LAB_PROBE_WHY=""; for _lab_row in "${LAB_PROBE_CMDS[@]}"; do _lab_n=${_lab_row%%:*}; _lab_k=${_lab_row#*:}; [[ $(type -t "$_lab_n") == "$_lab_k" && $(builtin type -t "$_lab_n") == "$_lab_k" ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}${_lab_n} is not the ${_lab_k} the matcher needs; "; done; for _lab_b in "${LAB_PROBE_BASH_PATHS[@]}"; do [[ -z $LAB_PROBE_BASH && $_lab_b == /* && -f $_lab_b && -x $_lab_b ]] && LAB_PROBE_BASH=$_lab_b; done; [[ -n $LAB_PROBE_BASH ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}no bash file in ${LAB_PROBE_BASH_PATHS[*]}; "; [[ -z $LAB_PROBE_WHY ]] }'
+  printf '%s' 'lab_probe_cmds_proven () { LAB_PROBE_BASH=""; LAB_PROBE_WHY=""; [[ $- != *x* && ! -o functrace && ! -o errtrace && $BASHOPTS != *extdebug* ]] || LAB_PROBE_WHY="xtrace, functrace, errtrace or extdebug is on; "; _lab_t=$(builtin declare -F) && [[ ! $_lab_t =~ -f[a-z]*t ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}a function carries the trace attribute (or declare -F failed); "; for _lab_row in "${LAB_PROBE_CMDS[@]}"; do _lab_n=${_lab_row%%:*}; _lab_k=${_lab_row#*:}; [[ $(type -t "$_lab_n") == "$_lab_k" && $(builtin type -t "$_lab_n") == "$_lab_k" ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}${_lab_n} is not the ${_lab_k} the matcher needs; "; done; for _lab_b in "${LAB_PROBE_BASH_PATHS[@]}"; do [[ -z $LAB_PROBE_BASH && $_lab_b == /* && -f $_lab_b && -x $_lab_b ]] && LAB_PROBE_BASH=$_lab_b; done; [[ -n $LAB_PROBE_BASH ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}no bash file in ${LAB_PROBE_BASH_PATHS[*]}; "; [[ -z $LAB_PROBE_WHY ]] }'
 }
 
 # lab_probe_body_allowed <declare -f text> [expected-generator] — true only when the text, whitespace-normalized, equals the expected body.
@@ -315,8 +325,8 @@ lab_probe_body_allowed() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 164 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 159
+# 182 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 177
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), eight probe-matcher legs (lab_probe_refusal_names_knob against generated logs, each
 # checking the exact child status: 10, 11, or 4 for an unreadable log, #5662), three structural legs (the matcher body
@@ -327,14 +337,17 @@ lab_probe_body_allowed() {
 # command substitution, extra statement, function call, eval, mktemp, exec redirect, awk writing a file), a changed awk
 # program, ten child spellings (guard dropped or not chained, bash by bare name, no exec, exec without -c, no posix
 # mode, awk exits 0 or 1, awk by bare name, a relative awk path accepted, no readability check) and two extra-text
-# spellings (#5587)), nine closed-world guard-body mutants (#5588, #5662), five probe-verdict legs (the two verdicts, a
-# shadowed builtin, every non-verdict status, a recorded reason over status 10, the #5662 return reproducer),
-# ninety-two shadow-matrix legs (#5588: the control, one cell per table row per route (function, exported function,
+# spellings (#5587)), twelve closed-world guard-body mutants (#5588, #5662, #5663), six probe-verdict legs (the two
+# verdicts, a shadowed builtin, every non-verdict status, a recorded reason over status 10, the #5662 return reproducer,
+# a DEBUG trap under functrace forcing status 10, #5663), one hundred and five shadow-matrix legs (#5588: the control, one cell per table row per route (function, exported function,
 # alias, enable -n, enable -n with a PATH file, a lying function for builtin and type), the keyword row, lying type and
 # builtin with a function named exec, ten awk and bash cells (bare-name routes, absolute-path functions, caller-set
 # LAB_PROBE_BASH, relative path), four environment cells, three missing-file cells, two first-path-wins cells, sixteen
-# neighbour commands by function and by PATH file, eight IFS values, twelve shell options, and the LAB_PROBE_WHY
-# reason), and one layout leg (this comment sits directly on the function).
+# neighbour commands by function and by PATH file, eight IFS values, eleven shell options, thirteen trace-route cells
+# (#5663: xtrace, xtrace with an assigning PS4, functrace, errtrace, extdebug, the trace attribute, enable -n declare, a
+# function named declare, reproducer a, and DEBUG, RETURN and ERR traps with no trace option), reproducer b, and the
+# LAB_PROBE_WHY reason), a run.sh pin leg (run.sh turns on no trace route, #5663), and one layout leg (this comment sits
+# directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
   local root="$1" bad=0 rc name want v1 v2 v3 v4 vr1 vr2 vr3 vok
@@ -493,6 +506,9 @@ lab_posture_selftest() {
   _refuse_guard "lets the last bash path win" "${gexp/-z \$LAB_PROBE_BASH \&\& /}" || bad=1
   _refuse_guard "keeps a caller-set LAB_PROBE_BASH" "${gexp/LAB_PROBE_BASH=\"\"; /}" || bad=1
   _refuse_guard "keeps a caller-set LAB_PROBE_WHY" "${gexp/ LAB_PROBE_WHY=\"\";/}" || bad=1
+  _refuse_guard "drops the xtrace, functrace, errtrace and extdebug check (#5663)" "${gexp/\$- != \*x\* \&\& /}" || bad=1
+  _refuse_guard "drops the trace-attribute check (#5663)" "${gexp/ \&\& \[\[ ! \$_lab_t =~ -f\[a-z\]\*t \]\]/}" || bad=1
+  _refuse_guard "ignores a failed declare -F (#5663)" "${gexp/_lab_t=\$(builtin declare -F) \&\& /_lab_t=\$(builtin declare -F); }" || bad=1
   unset -f _refuse_guard
   # #5587: lab_probe_body_allowed is equality, not a substring, prefix or suffix compare.
   _refuse "has extra text after the allowed body (kills a prefix or substring compare)" "${exp} ; cp \"\$1\" /dev/shm/lab-probe" || bad=1
@@ -580,7 +596,7 @@ lab_posture_selftest() {
   done
   # #5662: two coordinated lying probes (type and builtin answer each row's kind) plus a function named exec: posix mode finds the
   # special builtin exec before the function, so the function never runs and the child gives the true verdict.
-  _cell_clean "lying type and builtin plus a function named exec (posix mode runs the builtin exec)" "type() { case \$2 in '[[') echo keyword ;; *) echo builtin ;; esac; }; builtin() { case \$3 in '[[') echo keyword ;; *) echo builtin ;; esac; }; exec() { : > \"\$canary\"; return 10; }" || bad=1
+  _cell_clean "lying type and builtin plus a function named exec (posix mode runs the builtin exec)" "type() { case \${2-} in '[[') echo keyword ;; *) echo builtin ;; esac; }; builtin() { case \${3-} in '[[') echo keyword ;; *) echo builtin ;; esac; }; exec() { : > \"\$canary\"; return 10; }" || bad=1
   # awk and bash run in the child by absolute path and are never looked up by name: every bare-name route is unchanged and never runs.
   _cell_clean "a shell function named awk" "awk() { : > \"\$canary\"; command awk \"\$@\"; }" || bad=1
   _cell_clean "a shell function named awk (exported to a child bash)" "awk() { : > \"\$canary\"; command awk \"\$@\"; }; export -f awk" child || bad=1
@@ -626,10 +642,49 @@ lab_posture_selftest() {
   done
   _cell_clean "IFS unset" "unset IFS" || bad=1
   local opt
-  for opt in 'set -f' 'set -u' 'set -e' 'set -x' 'set -o noclobber' 'set -o pipefail' 'set -o posix' 'shopt -s nullglob' 'shopt -s failglob' 'shopt -s extglob' 'shopt -s nocasematch' 'shopt -s dotglob'; do
+  for opt in 'set -f' 'set -u' 'set -e' 'set -o noclobber' 'set -o pipefail' 'set -o posix' 'shopt -s nullglob' 'shopt -s failglob' 'shopt -s extglob' 'shopt -s nocasematch' 'shopt -s dotglob'; do
     _cell_clean "shell option: $opt" "$opt" || bad=1
   done
+  # #5663: caller code that runs INSIDE the guard and the subshell. A DEBUG or RETURN trap runs inside a function only under
+  # functrace, extdebug or the function's trace attribute, an ERR trap only under errtrace, and PS4 is expanded before every
+  # command only under xtrace; each of those is refused. An untraced trap runs only at the caller's own level, never inside.
+  _cell "xtrace (set -x)" refused 'set -x' || bad=1
+  _cell "xtrace with a PS4 that assigns the matcher's status" refused 'PS4="\$((_lab_s=10))"; set -x' || bad=1
+  _cell "functrace (set -T)" refused 'set -T' || bad=1
+  _cell "errtrace (set -E)" refused 'set -E' || bad=1
+  _cell "extdebug" refused 'shopt -s extdebug' || bad=1
+  _cell "the trace attribute on the guard and the matcher with a DEBUG trap" refused 'declare -ft lab_probe_cmds_proven lab_probe_refusal_names_knob; trap ": > \"\$canary\"" DEBUG' || bad=1
+  _cell "the trace attribute on an unrelated function" refused 'f() { :; }; declare -ft f' || bad=1
+  _cell "declare disabled with enable -n (the trace check cannot run)" refused 'enable -n declare' || bad=1
+  _cell_clean "a shell function named declare (builtin declare is called)" 'declare() { : > "$canary"; }' || bad=1
+  rm -f "$canary"
+  if _cell "functrace with a DEBUG trap that defines a function at the absolute awk path (#5663 reproducer a)" refused "set -T; trap 'function ${LAB_PROBE_AWK_PATHS[0]} { : > \"\$canary\"; }' DEBUG" && [ ! -e "$canary" ]; then :; else
+    echo "  FAIL shadow matrix: reproducer a ran the hostile function"; bad=1; fi
+  _cell_clean "a DEBUG trap with no functrace never runs inside the matcher" 'trap "[[ \${FUNCNAME[0]-} == lab_probe_* ]] && : > \"\$canary\"" DEBUG' || bad=1
+  _cell_clean "a RETURN trap with no functrace never runs inside the matcher" 'trap ": > \"\$canary\"" RETURN' || bad=1
+  _cell_clean "an ERR trap with no errtrace never runs inside the matcher" 'trap "[[ \${FUNCNAME[0]-} == lab_probe_* ]] && : > \"\$canary\"" ERR' || bad=1
   unset -f _cell _cell_clean
+  # #5663 reproducer b: extdebug, a forwarding builtin and a DEBUG trap that skips every LAB_PROBE_WHY assignment. The trap
+  # can drop the reasons, but the child still gives the true verdict: ok.log is detected or refused, no.log not-detected or refused.
+  # set +u as in the reported reproducer: under run.sh's set -u the skipped reset leaves LAB_PROBE_WHY unset and the shell exits.
+  v1="$( set +u; shopt -s extdebug; builtin() { command builtin "$@"; }; trap '[[ $BASH_COMMAND != LAB_PROBE_WHY=* ]]' DEBUG; lab_probe_verdict "$plog/ok.log"; trap - DEBUG; shopt -u extdebug; unset -f builtin; printf '%s' "$LAB_PROBE_VERDICT" )"
+  v2="$( set +u; shopt -s extdebug; builtin() { command builtin "$@"; }; trap '[[ $BASH_COMMAND != LAB_PROBE_WHY=* ]]' DEBUG; lab_probe_verdict "$plog/no.log"; trap - DEBUG; shopt -u extdebug; unset -f builtin; printf '%s' "$LAB_PROBE_VERDICT" )"
+  case "$v1:$v2" in
+    detected:not-detected|detected:refused*|refused*:not-detected|refused*:refused*) echo "  PASS shadow matrix: a DEBUG trap that skips the refusal reasons cannot invert the verdict (#5663 reproducer b: [$v1] [$v2])" ;;
+    *) echo "  FAIL shadow matrix: reproducer b gave [$v1] [$v2]"; bad=1 ;;
+  esac
+  # #5663: functrace with a DEBUG trap that forces the child status to 10 just before the verdict is read. Without the option
+  # refusal this reported detected for a log with no refusal line; the recorded reason now makes it refused.
+  v1="$( set -T; trap '[[ $BASH_COMMAND == case* ]] && _lab_s=10' DEBUG; lab_probe_verdict "$plog/no.log"; trap - DEBUG; set +T; printf '%s' "$LAB_PROBE_VERDICT" )"
+  case "$v1" in
+    "refused: xtrace, functrace, errtrace or extdebug is on; "*) echo "  PASS probe verdict: a DEBUG trap under functrace that forces status 10 reads as refused, never detected (#5663)" ;;
+    *) echo "  FAIL probe verdict: a DEBUG trap under functrace that forces status 10 gave [$v1] (#5663)"; bad=1 ;;
+  esac
+  # #5663: run.sh (and the common.sh it sources) must not itself turn on xtrace, functrace, errtrace or extdebug, set a
+  # DEBUG, RETURN or ERR trap, or give a function the trace attribute, or every real probe would be refused.
+  if [ -r "$root/infra/federation-lab/run.sh" ] && ! grep -nE 'trap .*(DEBUG|RETURN|ERR)|set -[a-zA-Z]*[xTE]|extdebug|functrace|errtrace|xtrace|declare -[a-z]*t' "$root/infra/federation-lab/run.sh" "$root/infra/federation-lab/lib/common.sh" >/dev/null; then
+    echo "  PASS run.sh pin: run.sh and lib/common.sh set no DEBUG, RETURN or ERR trap, no xtrace, functrace, errtrace or extdebug, no trace attribute"
+  else echo "  FAIL run.sh pin: run.sh or lib/common.sh turns on a trace route the probe guard refuses"; bad=1; fi
   # The refusal reason is reported through LAB_PROBE_WHY (the caller prints it; the guard calls no printing command).
   if ( type() { echo builtin; }; builtin() { command builtin "$@"; }; lab_probe_refusal_names_knob "$plog/ok.log"; [ -n "$LAB_PROBE_WHY" ] ); then
     echo "  PASS shadow matrix: a refusal names the shadowed command in LAB_PROBE_WHY"
