@@ -388,8 +388,8 @@ lab_shell_state_proven() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 230 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 224
+# 247 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 241
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), eight probe-matcher legs (lab_probe_refusal_names_knob against generated logs, each
 # checking the exact child status: 10, 11, or 4 for an unreadable log, #5662), three structural legs (the matcher body
@@ -413,12 +413,13 @@ lab_shell_state_proven() {
 # run.sh pin and four run.sh branch legs (#5664: run.sh's own probe-verdict lines run with stub ok and no reach ok,
 # not-detected, and refused for a missing awk and a shadowed exec), a run.sh pin leg (run.sh turns on no trace route,
 # #5663), a probe-region pin, eleven probe-block legs and an attribute pin (#5739: run.sh's own probe region, run at top
-# level with stand-in state, fails the run whenever a verdict could not be written), twenty-five start-state legs (#5740:
+# level with stand-in state, fails the run whenever a verdict could not be written), forty-two start-state legs (#5740, #5741:
 # run.sh --help from a clean environment: three controls (clean, an ignored SIGHUP, bash -p), refused for the F2 BASH_ENV
 # DEBUG trap, POSIXLY_CORRECT, a self-unsetting BASH_ENV that leaves a DEBUG, RETURN, ERR or EXIT trap, a readonly,
-# integer or nameref variable, an alias, a function, IFS, a disabled builtin or a hashed path, an exported SHELLOPTS or
-# BASHOPTS, and bash -x, -e, -T and -E, and two stated-limit legs, noexec and bash -t, that exit 0 with no output), and
-# one layout leg (this comment sits directly on the function).
+# integer or nameref variable, an alias, a function, IFS, a disabled builtin or a hashed path, an exported function named
+# source, ., command, builtin, declare, export, exec, printf, :, unset, trap, set, eval, echo, shopt or [ (bash -p, which
+# ignores one, starts), an exported SHELLOPTS or BASHOPTS, and bash -x, -e, -T and -E, and two stated-limit legs, noexec
+# and bash -t, that exit 0 with no output), and one layout leg (this comment sits directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
   local root="$1" bad=0 rc name want v1 v2 v3 v4 vr1 vr2 vr3 vok
@@ -874,6 +875,11 @@ lab_posture_selftest() {
   _start "a BASH_ENV untraced DEBUG trap that forges the verdict is refused (#5740 F2)" refused 'trap "[[ \$BASH_COMMAND == lab_probe_report* ]] && LAB_PROBE_VERDICT=detected; :" DEBUG' || bad=1
   _start "POSIXLY_CORRECT is refused" refused - POSIXLY_CORRECT=1 || bad=1
   local k
+  # #5741: an exported function of any name, a command run.sh or its refusal uses included, is refused; bash -p ignores it.
+  for k in source . command builtin declare export exec printf : unset trap set eval echo shopt [; do
+    _start "an exported function named $k is refused (#5741)" refused - "BASH_FUNC_$k%%=() { :; }" || bad=1
+  done
+  _start "bash -p ignores an exported function named builtin and runs" ok - -p 'BASH_FUNC_builtin%%=() { :; }' || bad=1
   for k in DEBUG RETURN ERR EXIT; do
     _start "a BASH_ENV that unsets itself and leaves a $k trap is refused" refused "unset BASH_ENV; trap ': x' $k" || bad=1
   done

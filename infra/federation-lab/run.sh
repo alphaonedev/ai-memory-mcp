@@ -32,10 +32,11 @@
 # START STATE (#5740). A variable that makes bash run code in this shell before line 1 (BASH_ENV) or changes how it
 # parses (POSIXLY_CORRECT) is refused, as is any function already defined. Posix mode makes the refusal itself safe from
 # functions: the special builtins export and : are found before any function, and the ${..:?} expansion exits without a
-# command lookup. lab_shell_state_proven (lib/posture.sh) then proves the traps, aliases, options and attributes.
+# command lookup. export -pf lists every imported function (#5741), even one named builtin or declare that would make the
+# declare -F list lie. lab_shell_state_proven (lib/posture.sh) then proves the traps, aliases, options and attributes.
 _lab_pre="${BASH_ENV+BASH_ENV }${POSIXLY_CORRECT+POSIXLY_CORRECT }"
 POSIXLY_CORRECT=1
-_lab_pre="$_lab_pre$(builtin declare -F)"
+_lab_pre="$_lab_pre$(export -pf)$(builtin declare -F)"
 _lab_r=
 [[ -z $_lab_pre ]] || : "${_lab_r:?run.sh refuses to start (#5740): the start environment sets or defines [$_lab_pre]; unset each one (bash -p run.sh ignores an exported function)}"
 unset POSIXLY_CORRECT _lab_pre _lab_r
