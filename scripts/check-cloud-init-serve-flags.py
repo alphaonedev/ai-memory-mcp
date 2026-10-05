@@ -2271,7 +2271,7 @@ def userdata_hits(name: str, scope: str, text: str, maintf) -> list:
 # the entries each one may hold (#5098): moving an approved line to the pending list, or
 # citing a placeholder issue, is a fault. Change this only in the PR that lands or files
 # the tracker; a ceiling only falls.
-PENDING_TRACKERS = {"#4610": 1, "#4671": 6, "#4712": 3}
+PENDING_TRACKERS = {"#4610": 1}
 
 
 def load_entries(text: str, pending: bool, faults: list, label: str) -> list:
@@ -3378,7 +3378,7 @@ def build_probes() -> list:
     P.append(("A stale both entry (one template only)", "red", dict(allow_add="both | " + PROV_PATH + " | echo only-in-aws > /x", aws=[ins(RELOAD, ["echo only-in-aws > /x"], before=True)], autolist=False)))
     P.append(("A stale pending entry", "red", dict(pend_sub=("aws-gpu-burst #4610 | /etc/ai-memory/store-url | ", "aws-gpu-burst #4610 | top | nothing-matches: "), autolist=False)))
     # an approved line moved to the pending list skips the validators: the tracker must be known and under its ceiling (#5098)
-    P.append(("A approved line moved under a tracker over its ceiling (#5098)", "fault", dict(pend_move="#4671", autolist=False)))
+    P.append(("A approved line moved under a tracker over its ceiling (#5098)", "fault", dict(pend_move="#4610", autolist=False)))
     P.append(("A approved line moved under a placeholder tracker #0 (#5098)", "fault", dict(pend_move="#0", autolist=False)))
     P.append(("A approved line moved under a zero-led tracker #00 (#5098)", "fault", dict(pend_move="#00", autolist=False)))
     P.append(("A approved line moved under an unknown tracker (#5098)", "fault", dict(pend_move="#99999999", autolist=False)))
