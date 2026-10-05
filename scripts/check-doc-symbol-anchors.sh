@@ -105,7 +105,7 @@
 #            read, after the file head (#5698) or after a component
 #            (#5780), an empty brace list (#5698), or a nested brace list
 #            (`T::{a, b}`, each item checked as `T::a`, #5780) that is
-#            empty, holds braces or is followed by `::`; a `src/` token
+#            empty, unclosed, holds braces or is followed by `::`; a `src/` token
 #            still holding a non-ASCII letter, mark, digit, private-use
 #            or unassigned character (a variation selector, a combining
 #            accent) after the text form (#5781).
@@ -1741,6 +1741,8 @@ PYEOF
         "See \`$R::RecallTool::{decorate_memory_many, RecallTool}::NoSuch\`."
     anchor_red_cites 5780 UNMODELLED "an empty nested brace list" \
         "$R::RecallTool::{}" "See \`$R::RecallTool::{}\`."
+    anchor_red_cites 5780 UNMODELLED "an unclosed nested brace list" \
+        "$R::RecallTool::{NoSuch" "See \`$R::RecallTool::{NoSuch\`."
 
     # #5781: literal text reaches the same normal form as decoded text. The
     # characters are written as UTF-8 bytes so the case holds in any locale.
