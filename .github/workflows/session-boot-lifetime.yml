@@ -441,6 +441,10 @@ jobs:
                   self._st = st
                   self._want_dir = want_dir
                   self._fd = None
+                  # True from the instant a chmod is issued until it is known to have
+                  # failed. A chmod that raised did not happen, so a widen that fails
+                  # with this False left the mode exactly as the walk found it (#6023).
+                  self.may_have_landed = False
                   if HAS_O_PATH:
                       if not os.path.isdir(FD_DIR):
                           # Every mode this leg sets is addressed THROUGH this directory.
@@ -464,6 +468,12 @@ jobs:
                       self._fd = fd
                   elif not CAN_CHMOD_NOFOLLOW:
                       raise OSError(errno.EPERM, "no way to widen a mode here without re-resolving the name")
+                  else:
+                      # The stand-in for the pin's check: the entry is read again and a
+                      # replaced or shared inode is refused HERE, before the caller
+                      # journals a widen - so a refusal leaves no line claiming one
+                      # (#6028). `chmod` repeats it, because the name can change again.
+                      self._identity()
 
               def _identity(self):
                   """Read the entry's identity off the NAME and refuse a mismatch.
@@ -486,13 +496,18 @@ jobs:
                       # Before: nothing has been mutated yet, so a mismatch is a clean
                       # refusal and the error is allowed to say exactly that.
                       self._identity()
+                      self.may_have_landed = True
                       try:
                           os.chmod(self._name, mode, dir_fd=self._dirfd, follow_symlinks=False)
                       except NotImplementedError:
                           # The interpreter refuses this combination here. Widening by a
                           # name that would be re-resolved is not an acceptable fallback,
                           # so the entry is reported instead of being mutated.
+                          self.may_have_landed = False
                           raise OSError(errno.EPERM, "no way to widen a mode here without re-resolving the name")
+                      except OSError:
+                          self.may_have_landed = False
+                          raise
                       try:
                           self._identity()
                       except OSError as err:
@@ -505,15 +520,27 @@ jobs:
                                                    "and is left applied: it can only be reached by the name it "
                                                    "no longer has (%s)" % (mode, err))
                   else:
+                      self.may_have_landed = True
                       try:
                           os.chmod("%s/%d" % (FD_DIR, self._fd), mode)
                       except OSError as err:
+                          self.may_have_landed = False
                           # Never `FileNotFoundError` out of here. The caller reads that
                           # as "the entry went away" and returns WITHOUT reporting
                           # anything, so a procfs that is missing or refusing would print
                           # `0 cleared, 0 failed` over a flag that is still set (#5996).
+                          # Linux refuses a mode change on an inode that carries the
+                          # append-only or immutable attribute with `EPERM`, and behind a
+                          # mode that hides the flags this is where that shows, so the
+                          # report names the attribute and its remedy (#6023).
+                          remedy = ""
+                          if err.errno == errno.EPERM:
+                              remedy = ("; Linux refuses a mode change on an inode with the append-only or "
+                                        "immutable attribute: as a holder of CAP_LINUX_IMMUTABLE run "
+                                        "`chattr -a` (and `chattr -i` for the immutable attribute) on it, then "
+                                        "run this again")
                           raise OSError(errno.EPERM, "could not set mode 0o%03o on the pinned inode "
-                                                     "through %s: %s" % (mode, FD_DIR, err))
+                                                     "through %s: %s%s" % (mode, FD_DIR, err, remedy))
                       landed = stat.S_IMODE(os.fstat(self._fd).st_mode)
                       if landed != mode:
                           raise OSError(errno.EPERM, "mode 0o%03o did not take on the pinned inode, "
@@ -1107,6 +1134,14 @@ jobs:
                                       os.close(fd)
                                       raise
                               except BaseException:
+                                  if not widened and not widener.may_have_landed:
+                                      # The widen was refused before its chmod, or by the
+                                      # chmod itself: the inode carries exactly the mode
+                                      # the walk found, so there is nothing to put back,
+                                      # nothing to report twice and no widen for the line
+                                      # to describe (#6023, #6028).
+                                      self.release(held, path)
+                                      raise
                                   # The widen is never abandoned. A widen that raised, a
                                   # reopen that raised and an inode that turns out to have
                                   # been swapped all put the original mode back before the
@@ -1123,9 +1158,9 @@ jobs:
                                                           "not the 0o%03o the walk found: putting it back was "
                                                           "refused (%s)" % (mode | needed, mode, undo))
                                       else:
-                                          self.fail(path, "the widen to 0o%03o failed and putting the 0o%03o the "
-                                                          "walk found back was refused too, so the mode it carries "
-                                                          "is not known; its journal line is kept (%s)"
+                                          self.fail(path, "the widen to 0o%03o may have landed and putting the "
+                                                          "0o%03o the walk found back was refused, so the mode it "
+                                                          "carries is not known; its journal line is kept (%s)"
                                                           % (mode | needed, mode, undo))
                                   else:
                                       self.release(held, path)

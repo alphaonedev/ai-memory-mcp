@@ -2000,6 +2000,115 @@ class WidenFailureCase(ScratchTree):
         finally:
             os.unlink(str(outside))
 
+    def test_a_widen_refused_before_it_lands_leaves_no_journal_line_6028(self):
+        """#6028. A widen the widen step refuses before any chmod - here, a
+        second name outside the scratch tree appearing the instant the janitor
+        decides to widen - must leave no `+` line claiming a widen, and the
+        entry is reported once, with its mode known."""
+        mod = load_script_module()
+        entry = self.audit / "single-6028.log"
+        entry.write_text("{}\n")
+        outside = self.ws / "late-outside-6028.log"
+        lines = []
+        real = mod.Journal._append
+
+        def append(journal, text):
+            lines.append(text)
+            return real(journal, text)
+
+        try:
+            with restrictive(entry, 0o000):
+                ino = os.lstat(entry).st_ino
+                with swap_when_inspected(mod, ino, lambda: os.link(str(entry), str(outside))) as fired, \
+                        mock.patch.object(mod.Journal, "_append", append):
+                    rc, out, err = run_clear_in_process(mod, self.ws)
+                self.assertTrue(fired, "the seam never fired: the entry was never a widen candidate")
+                self.assertEqual(stat.S_IMODE(os.lstat(entry).st_mode), 0o000, out + err)
+        finally:
+            if os.path.lexists(str(outside)):
+                os.unlink(str(outside))
+        held = [l for l in lines if l.startswith("+ ") and l.split(" ")[3] == str(ino)]
+        self.assertEqual(held, [], "a widen that never landed was journalled:\n" + "".join(lines) + out + err)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertEqual(len([l for l in err.splitlines() if str(entry) in l]), 1,
+                         "the entry is not reported exactly once:\n" + out + err)
+        self.assertNotIn("not known", err, out + err)
+        self.assertIn("2 links", err, out + err)
+
+    def test_a_widen_the_kernel_refuses_is_released_not_undone_6023(self):
+        """#6023 and #6028, on both legs. A widen whose own chmod is refused
+        never landed, so the inode carries the mode the walk found: nothing is
+        put back, nothing is reported twice and no `+` line is left claiming a
+        widen. The kernel's refusal is injected at the widen's chmod - through
+        the pin on Linux, by name on macOS - and refuses every later chmod of
+        the entry too, so a run that took the refused widen for a landed one
+        would try to put the mode back, be refused, and report a mode that is
+        not known."""
+        mod = load_script_module()
+        entry = self.audit / "refused-6023.log"
+        entry.write_text("{}\n")
+        journal = self.scratch / mod.PENDING_RESTORE_FILE
+        real = os.chmod
+        calls = []
+
+        def chmod(path, mode, *args, **kwargs):
+            if kwargs.get("dir_fd") is not None or str(path).startswith(mod.FD_DIR + "/"):
+                calls.append((path, mode))
+                raise PermissionError(errno.EPERM, "Operation not permitted (injected, #6023)")
+            return real(path, mode, *args, **kwargs)
+
+        with restrictive(entry, 0o000):
+            with mock.patch.object(mod.os, "chmod", chmod):
+                rc, out, err = run_clear_in_process(mod, self.ws)
+            self.assertEqual(stat.S_IMODE(os.lstat(entry).st_mode), 0o000, out + err)
+        self.assertEqual(len(calls), 1, "a refused widen was followed by another chmod of the entry:\n"
+                         + repr(calls) + "\n" + out + err)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertEqual(len([l for l in err.splitlines() if str(entry) in l]), 1,
+                         "the entry is not reported exactly once:\n" + out + err)
+        self.assertNotIn("not known", err, out + err)
+        held = {}
+        for line in (journal.read_bytes().decode("ascii").splitlines() if journal.exists() else ()):
+            fields = line.split(" ")
+            if fields[0] == "+":
+                held[fields[1]] = line
+            elif fields[0] == "-":
+                held.pop(fields[1], None)
+        self.assertEqual(held, {}, "a widen that never landed is still outstanding:\n" + out + err)
+
+    @unittest.skipIf(IS_BSD, "Linux: macOS/BSD refuses this case up front from the lstat (#6022)")
+    def test_a_chattr_append_only_file_behind_mode_0o000_is_reported_once_with_its_remedy_6023(self):
+        """#6023. Linux refuses a mode change on an append-only inode, and the
+        flag cannot be read behind mode 0o000 without one. The widen fails
+        without landing, so the mode is known - the one the walk found - and
+        the run reports the entry ONCE, naming the attribute and its remedy,
+        with no journal line left for a widen that never happened."""
+        f = self.audit / "single-6023.log"
+        f.write_text("{}\n")
+        journal = self.scratch / load_script_module().PENDING_RESTORE_FILE
+        with restrictive(f, 0o000):
+            with flagged(f):
+                r = run_clear(self.ws)
+                # A second run meets the same inode: it must not also report a
+                # journal line the first one left for a widen that never was.
+                again = run_clear(self.ws)
+                self.assertTrue(is_flagged(f), r.stdout + r.stderr)
+            self.assertEqual(stat.S_IMODE(os.lstat(f).st_mode), 0o000, r.stdout + r.stderr)
+        for run in (r, again):
+            self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+            mine = [l for l in run.stderr.splitlines() if str(f) in l]
+            self.assertEqual(len(mine), 1, "the entry is not reported exactly once:\n" + run.stdout + run.stderr)
+            self.assertIn("chattr -a", mine[0], run.stdout + run.stderr)
+            self.assertNotIn("not known", run.stderr, run.stdout + run.stderr)
+        held = {}
+        for line in (journal.read_bytes().decode("ascii").splitlines() if journal.exists() else ()):
+            fields = line.split(" ")
+            if fields[0] == "+":
+                held[fields[1]] = line
+            elif fields[0] == "-":
+                held.pop(fields[1], None)
+        self.assertEqual(held, {}, "a widen that never landed is still outstanding:\n" + r.stdout + r.stderr)
+
 
 # --------------------------------------------------------------------------
 # structural pins: the containment primitives the behaviour tests cannot race
