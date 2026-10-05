@@ -84,8 +84,10 @@
 #
 # REFUSALS. Where the gate cannot positively read an anchor it refuses
 # it rather than pass it (fail closed, #5680):
-#   UNDECIDABLE_REF — the anchor's character references decode
-#            differently in CommonMark and HTML (#5607).
+#   UNDECIDABLE_REF — a line's character references decode differently
+#            in CommonMark and HTML and any rule judges the two readings
+#            differently (#5607, #5782); its qualified anchors are cited,
+#            or with none, the tokens the readings disagree on.
 #   UNDECIDABLE_LT — a prose `<` before it may or may not open a group,
 #            and the anchor is judged differently either way (#5608).
 #   UNMODELLED — a self type the gate cannot read, any Rust keyword
@@ -120,7 +122,10 @@
 # TEXT FORM. Before any rule runs, every Unicode format character
 # (category Cf: a zero-width space, a word joiner, a soft hyphen, a bidi
 # control) is dropped from the doc, the same as from a decoded character
-# reference, and a line ends only at CR, LF or CRLF (#5781).
+# reference, and a line ends only at CR, LF or CRLF (#5781). Every rule
+# then runs on the text a reader sees: a line holding a character
+# reference is read as CommonMark and as HTML (an .html doc as HTML only),
+# and a finding both readings make is reported (#5607, #5782).
 #
 # THE ABSENT-PATH EXEMPTION. A plain path or `path:line` anchor is not
 # reported when absence wording ("no longer exists", "formerly",
@@ -1647,6 +1652,23 @@ PYEOF
     anchor_green 5781 "a zero-width space inside a live anchor" \
         "See \`$R::Recall${ZW}Tool\`."
 
+    # #5782: every per-line rule runs on each reading of the line, so a
+    # path written with character references is checked like its literal.
+    anchor_red_cites 5782 PATH "an entity-spelled dot-dot segment before a qualified anchor" \
+        "src/../x.rs" "See \`src/&#46;&#46;/x.rs::NoSuch\`."
+    anchor_red_cites 5782 PATH "an entity-spelled underscore in a missing path" \
+        "src/no_such.rs" "See \`src/no&#95;such.rs\`."
+    anchor_red_cites 5782 LINE "an entity-spelled dot before a line number" \
+        "$R:9999" "See \`src/mcp/tools/recall&#46;rs:9999\`."
+    anchor_red_cites 5782 BARE_LN "an entity-spelled colon before a line number" \
+        "$R:1" "See $R&#58;1 here."
+    anchor_red_cites 5782 MDLINK "an entity-spelled dot in a symbol link target" \
+        "$R::NoSuch" "See [\`NoSuch\`](src/mcp/tools/recall&#46;rs) here."
+    anchor_red_cites 5782 UNDECIDABLE_REF "a path the two readings decode differently" \
+        "src/no_such.rs" "See \`src/no&#95such.rs\`."
+    anchor_green 5782 "an entity-spelled dot in a live path" \
+        "See \`src/mcp/tools/recall&#46;rs\`."
+
     # #5613 (review item N-2): pin the #5536 repro and its self-type sibling
     # so that every spaced closer is counted and a spaced extra closer after a
     # self type still continues the path.
@@ -3130,12 +3152,14 @@ def qual_findings(line):
     return out
 
 
-def undecidable_extents(line, readings):
+def undecidable_extents(line, readings, differing):
     """UNDECIDABLE_REF findings for the qualified anchors of `line`, each
     cited as written: the head and the whitespace-free text after it (#5607).
-    An anchor that exists only once decoded is cited from the HTML reading."""
+    An anchor that exists only once decoded is cited from the first reading
+    that holds it. With no qualified anchor in any reading, the tokens the
+    readings disagree on are cited (#5782): never a bare dash."""
     out = []
-    for text in [line] + readings[-1:]:
+    for text in [line] + readings:
         for head in (QUAL_HEAD, BARE_QUAL_HEAD):
             for hm in head.finditer(text):
                 start = _skip_space(text, hm.end())
@@ -3143,7 +3167,7 @@ def undecidable_extents(line, readings):
                             hm.group(1) + "::" + text[start:_path_end(text, start)]))
         if out:
             break
-    return out or [("UNDECIDABLE_REF", "-")]
+    return out or [("UNDECIDABLE_REF", tok) for tok in differing]
 
 
 def emit(rule, doc, ln, token, ctx):
@@ -3152,6 +3176,145 @@ def emit(rule, doc, ln, token, ctx):
     # written.
     token = re.sub(r"\s+", "", token).replace(CODE_TICK, "`")
     print(f"{rule}\t{doc}\t{ln}\t{token}\t{ctx[:150]}")
+
+
+def line_findings(doc, doc_lines, ln, dec):
+    """Every finding the per-line rules make on ONE reading of line `ln`
+    (#5782): the raw line when `dec` is None, else the line decoded by `dec`
+    (CommonMark or HTML). Each finding is (rule, token, qualified), where
+    `qualified` marks a finding of the qualified-anchor rules. A neighbour
+    line (a link destination or a hard-wrapped arrow) is read the same way."""
+    out = []
+
+    def read(text):
+        """`text` canonicalised, then decoded by this reading, then
+        canonicalised again: (line, escapes)."""
+        text, esc = canon(text)
+        if dec is None:
+            return text, esc
+        text, more = canon(dec(text))
+        return text, esc + more
+
+    line, escapes = read(doc_lines[ln - 1])
+    window = "\n".join(doc_lines[max(0, ln - 2):ln + 1])
+    absent_win = bool(ABSENT_ASSERTION.search(window))
+    dest_at = [d.start() for d in ABSENT_DEST.finditer(line)]
+    # A hard-wrapped sentence may put the arrow at the start of the NEXT
+    # line ("`src/old.rs`\n-> `src/new/`"): the anchor above is a source.
+    next_line = read(doc_lines[ln])[0] if ln < len(doc_lines) else ""
+    prev_line = read(doc_lines[ln - 2])[0] if ln > 1 else ""
+    dest_next = ln < len(doc_lines) and bool(ABSENT_DEST.match(next_line.lstrip()))
+
+    def absent_ok_at(pos):
+        """The absence exemption for an anchor starting at `pos`."""
+        return absent_win or dest_next or any(pos < d for d in dest_at)
+
+    for tok in dict.fromkeys(escapes):
+        # #5346: judge EVERY occurrence of the token, not the first. A
+        # qualified occurrence (`src/../x.rs::sym`) asserts the file
+        # exists, like every qualified anchor (#5266), and a link target
+        # (`](tok)`, `href=tok`, `[h]: tok`) is never an absence claim,
+        # whatever wording is nearby: either one reports the token.
+        for tm in re.finditer(re.escape(tok), line):
+            at = tm.start()
+            # #5396: a destination on the line after an open `](` or
+            # `]:` is a link target too.
+            # #5432: `]:` counts only at the start of a reference
+            # definition, never at the end of prose.
+            next_line_dest = (ln > 1 and not line[:at].strip(" \t<")
+                              and bool(LINK_OPEN.search(prev_line)
+                                       or REFDEF_OPEN.match(prev_line)))
+            if (not absent_ok_at(at)
+                    or line.startswith(tok + "::", at)
+                    or ESCAPE_LINK_HEAD.search(line[:at])
+                    or next_line_dest):
+                out.append(("PATH", tok, False))
+                break
+
+    if not line.isascii():
+        for m in SRC_RUN.finditer(line):
+            if _glued(m.group(0)):
+                out.append(("UNMODELLED", m.group(0), False))
+
+    for m in PATH.finditer(line):
+        f = m.group(1)
+        if f not in per_file and not absent_ok_at(m.start(1)):
+            out.append(("PATH", f, False))
+
+    for m in PATHLN.finditer(line):
+        f, n = m.group(1), int(m.group(2))
+        last = int(m.group(3)) if m.group(3) else n
+        if f not in per_file:
+            if not absent_ok_at(m.start(1)):
+                out.append(("PATH", f, False))
+        elif n < 1 or last < n or last > line_count[f]:
+            tok = f"{f}:{n}" if m.group(3) is None else f"{f}:{n}-{last}"
+            out.append(("LINE", tok, False))
+
+    for m in BARE_LN.finditer(line):
+        if pinned_label(line, m):
+            continue
+        out.append(("BARE_LN", f"{m.group(1)}:{m.group(2)}", False))
+
+    out += [(rule, tok, True) for rule, tok in qual_findings(line)]
+
+    # #5431: the joined line feeds MDLINK too, so a symbol label whose
+    # destination is on the next line is checked like the one-line form.
+    # #5396: a line that ends in an open `](` takes its destination from
+    # the next line, as CommonMark does.
+    link_line = line
+    if LINK_OPEN.search(line) and ln < len(doc_lines):
+        link_line = line.rstrip() + " " + next_line.lstrip()
+    for m in MDLINK.finditer(link_line):
+        sym = m.group(1)
+        tgt = m.group(2).split("#")[0]
+        if tgt not in per_file:
+            # A link to a missing file is a dead link whatever the
+            # surrounding wording says: no absence exemption.
+            out.append(("PATH", tgt, False))
+        elif raw_name(sym) not in per_file[tgt]:
+            out.append(("MDLINK", f"{tgt}::{sym}", False))
+
+    # #5190: a relative link with a plain-text label must still point at
+    # a file that exists. MDLINK already reported a backticked-label link.
+    md_spans = [(m.start(2), m.end(2)) for m in MDLINK.finditer(link_line)]
+    rel_hits = [(m.group(1), m.group(2), m.start(1), True)
+                for m in RELLINK.finditer(link_line)]
+    # #5343: a reference definition may carry its destination on the
+    # NEXT line (`[h]:` then `src/x.rs`); join the two before matching.
+    refdef_line = line
+    if REFDEF_OPEN.match(line) and ln < len(doc_lines):
+        refdef_line = line.rstrip() + " " + next_line.strip()
+    rel_hits += [(m.group(1), m.group(2), m.start(1), False)
+                 for m in REFDEF.finditer(refdef_line)]
+    rel_hits += [(m.group(1), m.group(2), m.start(1), False)
+                 for m in HREF.finditer(line)]
+    for tgt, frag, start, is_md in rel_hits:
+        if tgt in per_file and frag:
+            fm = LINEFRAG.match(frag)
+            if fm:
+                n = int(fm.group(1))
+                last = int(fm.group(2)) if fm.group(2) else n
+                if n < 1 or last < n or last > line_count[tgt]:
+                    out.append(("LINE", f"{tgt}{frag}", False))
+        if is_md and any(a <= start < b for a, b in md_spans):
+            continue
+        if tgt not in per_file:
+            out.append(("PATH", tgt, False))
+
+    # `migrate_vNN` claimed as the LADDER TIP must equal the tip the
+    # migration-ladder gate computes. No new SSOT: the value comes
+    # from that gate's own reader.
+    if ladder_tip:
+        for m in re.finditer(
+                r"(?:ladder (?:ends|end) at|ladder tip(?: is)?|tip is)\s*`?"
+                r"(?:[A-Za-z0-9_/.]*::)?migrate_v(\d+)", line, re.IGNORECASE):
+            if m.group(1) != ladder_tip:
+                # Token is whitespace-free so the allowlist stays
+                # parseable; the tip lives in the failure detail.
+                out.append(("LADDER_TIP",
+                            f"migrate_v{m.group(1)}!=migrate_v{ladder_tip}", False))
+    return out
 
 
 for doc in seen_docs:
@@ -3170,142 +3333,37 @@ for doc in seen_docs:
     doc_lines = LINE_END.split(normal_form(text))
     if doc_lines and doc_lines[-1] == "":
         doc_lines.pop()
-    for ln, line in enumerate(doc_lines, 1):
-        ctx = line.strip()
-        line, escapes = canon(line)
-        window = "\n".join(doc_lines[max(0, ln - 2):ln + 1])
-        absent_win = bool(ABSENT_ASSERTION.search(window))
-        dest_at = [d.start() for d in ABSENT_DEST.finditer(line)]
-        # A hard-wrapped sentence may put the arrow at the start of the NEXT
-        # line ("`src/old.rs`\n-> `src/new/`"): the anchor above is a source.
-        dest_next = ln < len(doc_lines) and bool(ABSENT_DEST.match(doc_lines[ln].lstrip()))
-
-        def absent_ok_at(pos):
-            """The absence exemption for an anchor starting at `pos`."""
-            return absent_win or dest_next or any(pos < d for d in dest_at)
-
-        for tok in dict.fromkeys(escapes):
-            # #5346: judge EVERY occurrence of the token, not the first. A
-            # qualified occurrence (`src/../x.rs::sym`) asserts the file
-            # exists, like every qualified anchor (#5266), and a link target
-            # (`](tok)`, `href=tok`, `[h]: tok`) is never an absence claim,
-            # whatever wording is nearby: either one reports the token.
-            for tm in re.finditer(re.escape(tok), line):
-                at = tm.start()
-                # #5396: a destination on the line after an open `](` or
-                # `]:` is a link target too.
-                # #5432: `]:` counts only at the start of a reference
-                # definition, never at the end of prose.
-                prev_line = doc_lines[ln - 2] if ln > 1 else ""
-                next_line_dest = (ln > 1 and not line[:at].strip(" \t<")
-                                  and bool(LINK_OPEN.search(prev_line)
-                                           or REFDEF_OPEN.match(prev_line)))
-                if (not absent_ok_at(at)
-                        or line.startswith(tok + "::", at)
-                        or ESCAPE_LINK_HEAD.search(line[:at])
-                        or next_line_dest):
-                    emit("PATH", doc, ln, tok, ctx)
-                    break
-
-        if not line.isascii():
-            for m in SRC_RUN.finditer(line):
-                if _glued(m.group(0)):
-                    emit("UNMODELLED", doc, ln, m.group(0), ctx)
-
-        for m in PATH.finditer(line):
-            f = m.group(1)
-            if f not in per_file and not absent_ok_at(m.start(1)):
-                emit("PATH", doc, ln, f, ctx)
-
-        for m in PATHLN.finditer(line):
-            f, n = m.group(1), int(m.group(2))
-            last = int(m.group(3)) if m.group(3) else n
-            if f not in per_file:
-                if not absent_ok_at(m.start(1)):
-                    emit("PATH", doc, ln, f, ctx)
-            elif n < 1 or last < n or last > line_count[f]:
-                tok = f"{f}:{n}" if m.group(3) is None else f"{f}:{n}-{last}"
-                emit("LINE", doc, ln, tok, ctx)
-
-        for m in BARE_LN.finditer(line):
-            if pinned_label(line, m):
-                continue
-            emit("BARE_LN", doc, ln, f"{m.group(1)}:{m.group(2)}", ctx)
-
-        # #5607: the anchors are judged on the DECODED line. A Markdown
-        # line is decoded both ways (CommonMark and HTML); when the findings
-        # differ the reading is undecidable and each anchor is refused as
-        # written. An .html doc has the HTML reading only.
+    for ln, raw in enumerate(doc_lines, 1):
+        ctx = raw.strip()
+        # #5607/#5782: EVERY per-line rule runs on every reading of the
+        # line: the raw line when it holds no character reference, else the
+        # CommonMark and HTML readings (an .html doc has the HTML reading
+        # only). A finding every reading makes is reported; when the
+        # readings disagree the line is undecidable and its anchors (or, with
+        # no qualified anchor, the tokens the readings disagree on) are
+        # refused as UNDECIDABLE_REF.
+        line = canon(raw)[0]
         if "&" in line:
-            readings = [decode_html(line)]
-            if not doc.endswith(".html"):
-                readings.insert(0, decode_cm(line))
+            decs = [decode_html] if doc.endswith(".html") else [decode_cm, decode_html]
         else:
-            readings = [line]
-        found = [qual_findings(canon(r)[0]) for r in readings]
-        for rule, tok in found[0]:
-            if all((rule, tok) in other for other in found[1:]):
+            decs = [None]
+        found = [line_findings(doc, doc_lines, ln, d) for d in decs]
+        keys = [{(rule, tok) for rule, tok, _ in f} for f in found]
+        for rule, tok, _ in found[0]:
+            if all((rule, tok) in other for other in keys[1:]):
                 emit(rule, doc, ln, tok, ctx)
-        if any(sorted(other) != sorted(found[0]) for other in found[1:]):
-            for rule, tok in undecidable_extents(line, readings):
+        if any(other != keys[0] for other in keys[1:]):
+            common = set.intersection(*keys)
+            differing = [(tok, q) for f in found for rule, tok, q in f
+                         if (rule, tok) not in common]
+            plain = list(dict.fromkeys(tok for tok, q in differing if not q))
+            cited = []
+            if any(q for _, q in differing):
+                cited = undecidable_extents(
+                    line, [canon(d(line))[0] for d in decs],
+                    list(dict.fromkeys(tok for tok, q in differing if q)))
+            for rule, tok in cited + [("UNDECIDABLE_REF", tok) for tok in plain]:
                 emit(rule, doc, ln, tok, ctx)
-
-        # #5431: the joined line feeds MDLINK too, so a symbol label whose
-        # destination is on the next line is checked like the one-line form.
-        # #5396: a line that ends in an open `](` takes its destination from
-        # the next line, as CommonMark does.
-        link_line = line
-        if LINK_OPEN.search(line) and ln < len(doc_lines):
-            link_line = line.rstrip() + " " + canon(doc_lines[ln])[0].lstrip()
-        for m in MDLINK.finditer(link_line):
-            sym = m.group(1)
-            tgt = m.group(2).split("#")[0]
-            if tgt not in per_file:
-                # A link to a missing file is a dead link whatever the
-                # surrounding wording says: no absence exemption.
-                emit("PATH", doc, ln, tgt, ctx)
-            elif raw_name(sym) not in per_file[tgt]:
-                emit("MDLINK", doc, ln, f"{tgt}::{sym}", ctx)
-
-        # #5190: a relative link with a plain-text label must still point at
-        # a file that exists. MDLINK already reported a backticked-label link.
-        md_spans = [(m.start(2), m.end(2)) for m in MDLINK.finditer(link_line)]
-        rel_hits = [(m.group(1), m.group(2), m.start(1), True)
-                    for m in RELLINK.finditer(link_line)]
-        # #5343: a reference definition may carry its destination on the
-        # NEXT line (`[h]:` then `src/x.rs`); join the two before matching.
-        refdef_line = line
-        if REFDEF_OPEN.match(line) and ln < len(doc_lines):
-            refdef_line = line.rstrip() + " " + canon(doc_lines[ln])[0].strip()
-        rel_hits += [(m.group(1), m.group(2), m.start(1), False)
-                     for m in REFDEF.finditer(refdef_line)]
-        rel_hits += [(m.group(1), m.group(2), m.start(1), False)
-                     for m in HREF.finditer(line)]
-        for tgt, frag, start, is_md in rel_hits:
-            if tgt in per_file and frag:
-                fm = LINEFRAG.match(frag)
-                if fm:
-                    n = int(fm.group(1))
-                    last = int(fm.group(2)) if fm.group(2) else n
-                    if n < 1 or last < n or last > line_count[tgt]:
-                        emit("LINE", doc, ln, f"{tgt}{frag}", ctx)
-            if is_md and any(a <= start < b for a, b in md_spans):
-                continue
-            if tgt not in per_file:
-                emit("PATH", doc, ln, tgt, ctx)
-
-        # `migrate_vNN` claimed as the LADDER TIP must equal the tip the
-        # migration-ladder gate computes. No new SSOT: the value comes
-        # from that gate's own reader.
-        if ladder_tip:
-            for m in re.finditer(
-                    r"(?:ladder (?:ends|end) at|ladder tip(?: is)?|tip is)\s*`?"
-                    r"(?:[A-Za-z0-9_/.]*::)?migrate_v(\d+)", line, re.IGNORECASE):
-                if m.group(1) != ladder_tip:
-                    # Token is whitespace-free so the allowlist stays
-                    # parseable; the tip lives in the failure detail.
-                    emit("LADDER_TIP", doc, ln,
-                         f"migrate_v{m.group(1)}!=migrate_v{ladder_tip}", ctx)
 PY
 )"; then
     # FAIL CLOSED (#2713): the analysis engine exited non-zero (an uncaught
