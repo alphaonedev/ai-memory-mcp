@@ -233,6 +233,16 @@ require_primary_db_identifier() {
     fi
 }
 
+# #5454: PG_PORT is spliced into the pg_dump connection string and passed to the local
+# psql, so it must be a port number (no leading zero, 1..65535); the backup, the DROP and
+# the store URL then name the same server.
+require_pg_port() {
+    if [[ ! "$PG_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || (( PG_PORT > 65535 )); then
+        echo "FATAL: PG_PORT must be a port number from 1 to 65535 (#5454)" >&2
+        exit 7
+    fi
+}
+
 # #5402: the pg_dump backup is a TCP connection to PG_HOST; refuse BEFORE the
 # backup and any DROP unless it can run with sslmode=verify-full and a local CA.
 require_dump_sslrootcert() {
@@ -291,9 +301,9 @@ psql_postgres() {
     # password required. Use this for DROP / CREATE DATABASE and
     # CREATE EXTENSION since `aimemory` role is not a superuser.
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        log "DRY-RUN: sudo -u postgres psql $*"
+        log "DRY-RUN: sudo -u postgres psql -p ${PG_PORT} $*"
     else
-        sudo -u postgres psql "$@"
+        sudo -u postgres psql -p "$PG_PORT" "$@"
     fi
 }
 
@@ -338,6 +348,7 @@ run_schema_init() {
 
 log "postgres-droplet-reinit.sh starting (dry_run=${DRY_RUN}, skip_disposable=${SKIP_DISPOSABLE})"
 require_primary_db_identifier
+require_pg_port
 require_password
 require_sslrootcert
 require_dump_sslrootcert
@@ -354,7 +365,7 @@ fi
 run mkdir -p "$BACKUP_DIR"
 log "step 1: pg_dump ${PG_PRIMARY_DB} -> ${BACKUP_FILE}"
 if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: pg_dump -h ${PG_HOST} -U ${PG_USER} -d 'dbname=${PG_PRIMARY_DB} sslmode=verify-full sslrootcert=${PG_DUMP_SSLROOTCERT}' -F c -f ${BACKUP_FILE}"
+    log "DRY-RUN: pg_dump -h ${PG_HOST} -U ${PG_USER} -d 'dbname=${PG_PRIMARY_DB} port=${PG_PORT} sslmode=verify-full sslrootcert=${PG_DUMP_SSLROOTCERT}' -F c -f ${BACKUP_FILE}"
 else
     # #5402 / #5449: libpq ranks a connection string above PGSSLMODE/PGSSLROOTCERT and
     # above a PGSERVICE file, so the pin is IN the connection string (measured: a
@@ -364,7 +375,7 @@ else
     unset PGSERVICE PGSERVICEFILE
     PGSSLMODE=verify-full PGSSLROOTCERT="$PG_DUMP_SSLROOTCERT" \
         pg_dump -h "$PG_HOST" -U "$PG_USER" \
-        -d "dbname=${PG_PRIMARY_DB} sslmode=verify-full sslrootcert=${PG_DUMP_SSLROOTCERT}" \
+        -d "dbname=${PG_PRIMARY_DB} port=${PG_PORT} sslmode=verify-full sslrootcert=${PG_DUMP_SSLROOTCERT}" \
         -F c -f "$BACKUP_FILE"
     if [[ ! -s "$BACKUP_FILE" ]]; then
         echo "FATAL: backup file is empty — aborting before destructive step" >&2

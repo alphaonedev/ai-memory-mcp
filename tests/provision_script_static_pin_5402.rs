@@ -68,6 +68,7 @@ fn dry_run(extra: &[(&str, &str)]) -> Output {
         .env_remove("AI_MEMORY_SSH_HOST")
         .env_remove("PG_DUMP_SSLROOTCERT")
         .env_remove("PG_PRIMARY_DB")
+        .env_remove("PG_PORT")
         .env("PG_PASSWORD_FILE", "/dev/null")
         .env("PG_SSLROOTCERT", "/nonexistent/ca.pem")
         .env("AI_MEMORY_BIN", "/bin/sh");
@@ -131,7 +132,9 @@ fn reinit_pg_dump_pin_is_inside_the_connection_string_5449() {
     );
     let out = stdout_of(&o);
     assert!(
-        out.contains("-d 'dbname=aimemory sslmode=verify-full sslrootcert=/etc/ca/root.pem'"),
+        out.contains(
+            "-d 'dbname=aimemory port=5432 sslmode=verify-full sslrootcert=/etc/ca/root.pem'"
+        ),
         "#5449: the pin must be inside the -d connection string: {out}"
     );
 }
@@ -151,7 +154,7 @@ fn reinit_live_pg_dump_uses_pinned_conninfo_and_unsets_service_5449() {
     let call = code[dump..dump + 3].join(" ");
     assert!(
         call.contains(
-            "-d \"dbname=${PG_PRIMARY_DB} sslmode=verify-full sslrootcert=${PG_DUMP_SSLROOTCERT}\""
+            "-d \"dbname=${PG_PRIMARY_DB} port=${PG_PORT} sslmode=verify-full sslrootcert=${PG_DUMP_SSLROOTCERT}\""
         ),
         "#5449: the live -d argument must carry the pin: {call}"
     );
@@ -248,13 +251,82 @@ fn reinit_dump_ca_fallback_guard_is_pinned_5450() {
     );
 }
 
-/// #5484 (round-5 F4): PG_PRIMARY_DB is spliced UNQUOTED into DROP/CREATE DATABASE, where
+/// #5454: the pre-DROP backup connects to the same port the store URL and the DROP use.
+#[test]
+fn reinit_pg_dump_and_drop_honour_pg_port_5454() {
+    let o = dry_run(&[
+        ("PG_PORT", "5445"),
+        ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem"),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr_of(&o));
+    let dump = dump_line(&o);
+    assert!(
+        dump.contains("dbname=aimemory port=5445 sslmode=verify-full"),
+        "#5454: the planned pg_dump must carry port=5445: {dump}"
+    );
+    assert!(
+        stdout_of(&o)
+            .contains("sudo -u postgres psql -p 5445 -c DROP DATABASE IF EXISTS aimemory;"),
+        "#5454: the DROP must target the same port as the backup: {}",
+        stdout_of(&o)
+    );
+    let default = dry_run(&[("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem")]);
+    assert!(
+        dump_line(&default).contains("port=5432 sslmode=verify-full"),
+        "#5454: the default port is 5432: {}",
+        dump_line(&default)
+    );
+}
+
+/// #5454: PG_PORT is spliced into a connection string, so only 1..=65535 digits pass,
+/// and the refusal comes before any step is planned.
+#[test]
+fn reinit_refuses_a_bad_pg_port_before_any_step_5454() {
+    for bad in [
+        "0",
+        "65536",
+        "99999",
+        "123456",
+        "05432",
+        "54 32",
+        "5432 sslmode=disable",
+        "5432;x",
+        "-1",
+        "abc",
+        "5432\n",
+    ] {
+        let o = dry_run(&[
+            ("PG_PORT", bad),
+            ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem"),
+        ]);
+        assert_eq!(
+            o.status.code(),
+            Some(7),
+            "#5454: PG_PORT {bad:?} must exit 7: {}",
+            stderr_of(&o)
+        );
+        assert!(
+            stderr_of(&o).contains("PG_PORT must be a port number"),
+            "#5454: refusal text for {bad:?}: {}",
+            stderr_of(&o)
+        );
+        assert!(
+            !stdout_of(&o).contains("pg_dump"),
+            "#5454: nothing may be planned for {bad:?}"
+        );
+    }
+}
+
+/// #5454 / round-5 F4: PG_PRIMARY_DB is spliced UNQUOTED into DROP/CREATE DATABASE, where
 /// PostgreSQL folds it to lower case, while the pg_dump dbname is case-sensitive; an upper
 /// case name would dump one database and drop another, so it is refused.
 #[test]
 fn reinit_refuses_an_uppercase_primary_db_f4() {
     for bad in ["AiMem", "aiMem", "AIMEM", "aimemoryX"] {
-        let o = dry_run(&[("PG_PRIMARY_DB", bad), ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem")]);
+        let o = dry_run(&[
+            ("PG_PRIMARY_DB", bad),
+            ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem"),
+        ]);
         assert_eq!(
             o.status.code(),
             Some(7),
@@ -266,6 +338,9 @@ fn reinit_refuses_an_uppercase_primary_db_f4() {
             "F4: nothing may be planned for {bad:?}"
         );
     }
-    let ok = dry_run(&[("PG_PRIMARY_DB", "ai_mem_2"), ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem")]);
+    let ok = dry_run(&[
+        ("PG_PRIMARY_DB", "ai_mem_2"),
+        ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem"),
+    ]);
     assert_eq!(ok.status.code(), Some(0), "{}", stderr_of(&ok));
 }
