@@ -194,9 +194,20 @@ ENV_ARGV_RE = re.compile(
 PSQL_HEAD_RE = re.compile(r"(?:^|[\s;|&(`/\"'${])psql[A-Za-z0-9_]*\b", re.IGNORECASE | re.MULTILINE)
 PSQL_VAR_OPT_RE = re.compile(
     r"\s(?:-[A-Za-z]*v\s*|--(?:set?|va[a-z]*)(?:=|\s+))"
-    r"[\"']?(?P<name>[A-Za-z_][A-Za-z0-9_]*)=[\"']?(?P<pw2>[^\s\"']+)",
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<pw2>[^\s]+)",
     re.IGNORECASE,
 )
+# #5399 (PR 4810 round-4 security re-review): the shell removes quotes and
+# backslashes before psql sees its argv, so the psql -v scan reads the segment with
+# both removed (-v 'pw'=, -v p"w"=, pw\=, "-vpw=...", '--set=pw='"$X" are all the
+# same argv as -v pw=...). For a psql -v value the NAME rule is a plain substring
+# (pw2, pwnew, admin_pw1 are secrets), and neither the locator exemption (pw_id)
+# nor a redaction-token suffix (${PW}xxxx) clears a value: a variable whose name
+# says it is a credential is flagged whatever its value looks like.
+# STATED LIMIT: options that reach psql through an array or another variable
+# (args=(-v pw=$X); psql "${args[@]}") are not after the psql word and a text gate
+# cannot follow them; that form is tracked by its own open issue, #5398.
+PSQL_SECRET_VAR_NAME_RE = re.compile(r"pass|secret|token|key|cred|pw|auth", re.IGNORECASE)
 SECRET_VAR_RE = re.compile(
     r"\$\{[A-Za-z0-9_]*(?:(?:password|passwd|secret|token|key|cred)[A-Za-z0-9_]*|pw|pass)\}",
     re.IGNORECASE,
@@ -616,8 +627,9 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
     for head in PSQL_HEAD_RE.finditer(joined):
         eol = joined.find("\n", head.end())
         segment = joined[head.end():eol if eol >= 0 else len(joined)]
-        if any(secret_name(m.group("name")) and not is_redaction(m.group("pw2"))
-               for m in PSQL_VAR_OPT_RE.finditer(segment)):
+        shell_view = segment.replace("\\", "").replace('"', "").replace("'", "")
+        if any(PSQL_SECRET_VAR_NAME_RE.search(m.group("name"))
+               for m in PSQL_VAR_OPT_RE.finditer(shell_view)):
             line, snippet = _line_of(text, head.start())
             hits.append((rel, line, "[env-password-argv] " + snippet))
     for rule, tag in ((PSQL_URL_RE, "psql-url-password"), (DOCKER_ENV_DSN_RE, "env-dsn-argv"),
@@ -943,6 +955,18 @@ RED_PROBES_4600 = {
     "4859-psql-combined-qv": 'psql -qv pw="$PG_PW" -f x.sql',
     "4859-psql-abbrev-vari": 'psql --vari=pw="$PG_PW" -f x.sql',
     "4859-psql-via-variable": '"$PSQL" -v pw="$PG_PW" -f x.sql',
+    # #5399 (PR 4810 round-4 security re-review): spellings 1-11 that passed.
+    "5399-01-quoted-name-single": "psql -v 'pw'=\"$PG_PW\" -f x.sql",
+    "5399-02-quoted-name-double": 'psql -v "pw"="$PG_PW" -f x.sql',
+    "5399-03-quote-inside-name": 'psql -v p"w"="$PG_PW" -f x.sql',
+    "5399-04-escaped-equals": 'psql -v pw\\="$PG_PW" -f x.sql',
+    "5399-05-quoted-option-word": 'psql "-vpw=$PG_PW" -f x.sql',
+    "5399-06-quoted-long-option": "psql '--set=pw='\"$PG_PW\" -f x.sql",
+    "5399-07-pw-digit": 'psql -v pw2="$PG_PW" -f x.sql',
+    "5399-08-pw-letters": 'psql -v pwnew="$PG_PW" -f x.sql',
+    "5399-09-pw-name-digit": 'psql -v admin_pw1="$PG_PW" -f x.sql',
+    "5399-10-locator-suffix": 'psql -v pw_id="$PG_PW" -f x.sql',
+    "5399-11-redaction-suffixed-value": "psql -v pw=${PG_PW}xxxx -f x.sql",
     # #4808: the forms the #4782 gate missed.
     "4808-docker-e-dsn-literal": "docker run -e DATABASE_URL=postgres://u:hunter2@h/d img",
     "4808-psql-set-equals-pw": 'psql --set=pw="$PG_PW" -f bootstrap.sql',
