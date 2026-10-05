@@ -91,11 +91,14 @@
 #   UNMODELLED — a self type the gate cannot read, any Rust keyword
 #            in a checked path (#5610, #5611), a raw identifier Rust
 #            rejects (`r#crate`, `r#self`, `r#super`, `r#Self`, `r#_`,
-#            #5778), a brace-list item or item component that is not an
+#            #5778), a brace-list item or path component that is not an
 #            identifier (punctuation, a digit, a glob, an empty item; an
 #            ellipsis item is an elision and is skipped) or a path after a
-#            brace list (#5779), or a `::` after the file head followed by
-#            nothing the gate can read or by an empty brace list (#5698).
+#            brace list (#5779), a `::` followed by nothing the gate can
+#            read, after the file head (#5698) or after a component
+#            (#5780), an empty brace list (#5698), or a nested brace list
+#            (`T::{a, b}`, each item checked as `T::a`, #5780) that is
+#            empty, holds braces or is followed by `::`.
 #   SETUP  — the gate cannot do its job: a doc or source file in the
 #            checked set cannot be read (#5616), or src/ has no Rust file.
 #
@@ -1585,6 +1588,27 @@ PYEOF
     anchor_green 5779 "a turbofish before the last component" \
         "See \`$R::RecallTool::<u8>::decorate_memory_many\`."
 
+    # #5780: a later `::` is read or refused; a nested brace list is read.
+    anchor_red_cites 5780 UNMODELLED "an ampersand after a later separator" \
+        "$R::RecallTool::&NoSuch" "See \`$R::RecallTool::&NoSuch\`."
+    anchor_red_cites 5780 UNMODELLED "a parenthesis after a later separator" \
+        "$R::RecallTool::(NoSuch)" "See \`$R::RecallTool::(NoSuch)\`."
+    anchor_red_cites 5780 UNMODELLED "a digit after a later separator" \
+        "$R::RecallTool::9NoSuch" "See \`$R::RecallTool::9NoSuch\`."
+    anchor_red_cites 5780 UNMODELLED "a glob after a later separator" \
+        "$R::RecallTool::*" "See \`$R::RecallTool::*\`."
+    anchor_red_cites 5780 UNMODELLED "a later separator at the end of a code span" \
+        "$R::RecallTool::" "See \`$R::RecallTool::\`."
+    anchor_red_cites 5780 QUAL "a missing item in a nested brace list" \
+        "$R::NoSuch" "See \`$R::RecallTool::{decorate_memory_many, NoSuch}\`."
+    anchor_green 5780 "a nested brace list of live items" \
+        "See \`$R::RecallTool::{decorate_memory_many, RecallTool}\`."
+    anchor_red_cites 5780 UNMODELLED "a path after a nested brace list" \
+        "$R::RecallTool::{decorate_memory_many,RecallTool}::NoSuch" \
+        "See \`$R::RecallTool::{decorate_memory_many, RecallTool}::NoSuch\`."
+    anchor_red_cites 5780 UNMODELLED "an empty nested brace list" \
+        "$R::RecallTool::{}" "See \`$R::RecallTool::{}\`."
+
     # #5613 (review item N-2): pin the #5536 repro and its self-type sibling
     # so that every spaced closer is counted and a spaced extra closer after a
     # self type still continues the path.
@@ -2541,8 +2565,22 @@ def scan_sym(text, i, outer=0):
             stray = _stray_close(text, pos, outer)
             if stray is not None:
                 return _path_end(text, stray)
+        elif text.startswith("{", nxt):
+            # #5780: a nested brace list (`T::{a, b}`) ends the path; its
+            # items are checked one by one. A `::` after it is not read, so
+            # the capture runs on and the item check refuses it.
+            close = text.find("}", nxt)
+            if close < 0:
+                return _path_end(text, pos)
+            after = _skip_space(text, close + 1)
+            if text.startswith("::", after):
+                return _path_end(text, after)
+            return close + 1
         else:
-            return pos
+            # #5780: a `::` followed by nothing the scanner reads (a glob,
+            # punctuation, a digit, the end of the anchor) is captured to
+            # the token end, so the item check refuses it, never drops it.
+            return _path_end(text, pos)
 
 
 def iter_quals(line):
@@ -2806,21 +2844,42 @@ def _scan_items(raw):
         if depth == 0 and ch.isspace():
             continue
         out.append(ch)
-    return split_items("".join(out))
+    return [x for item in split_items("".join(out)) for x in _expand(item)]
+
+
+NESTED_BRACE = re.compile(r"^([^{}]*)::\{([^{}]*)\}$")
+
+
+def _expand(item):
+    """`P::{a, b}` -> [`P::a`, `P::b`] (#5780). An item with any other
+    brace shape (nested braces, a path after the list, an empty or
+    comma-empty list) is returned whole, so the item check refuses it."""
+    if "{" not in item and "}" not in item:
+        return [item]
+    m = NESTED_BRACE.match(item)
+    if not m or EMPTY_ITEM.search(m.group(2)):
+        return [item]
+    parts = split_items(m.group(2))
+    return [m.group(1) + "::" + x for x in parts] if parts else [item]
 
 
 def split_items(raw):
     """Split a qualified-anchor payload into symbol tokens at commas and
     whitespace that are NOT inside a generic group (`{A<T, U>::m, B}` is two
     items, not four)."""
-    items, cur, depth = [], "", 0
+    items, cur, depth, braces = [], "", 0, 0
     norm = raw
     for idx, ch in enumerate(norm):
         if ch == "<":
             depth += 1
         elif ch == ">" and depth > 0 and not (idx and norm[idx - 1] == "-"):
             depth -= 1
-        if depth == 0 and (ch == "," or ch.isspace()):
+        # #5780: a nested brace list is one item until it is expanded.
+        elif ch == "{":
+            braces += 1
+        elif ch == "}" and braces > 0:
+            braces -= 1
+        if depth == 0 and braces == 0 and (ch == "," or ch.isspace()):
             if cur:
                 items.append(cur)
             cur = ""
@@ -3217,7 +3276,7 @@ if [[ -n "$violations" ]]; then
             BARE_QUAL) detail="symbol is not defined in the file it is qualified against (unbackticked anchor)" ;;
             BARE_LN) detail="bare file:line anchor in a live doc (rots silently); cite \`path::symbol\`, or pin a commit permalink" ;;
             UNDECIDABLE_REF) detail="anchor is refused: its character references decode differently in CommonMark and HTML, so the anchor cannot be resolved; write the characters plainly" ;;
-            UNMODELLED) detail="anchor is refused: it is written in a form this gate does not model (a self type it cannot read, a Rust keyword in its path, or nothing it can read after the ::), so it cannot be checked; name the type and method plainly (src/x.rs::Type::method)" ;;
+            UNMODELLED) detail="anchor is refused: it is written in a form this gate does not model (a self type it cannot read, a Rust keyword in its path, or a component that is not an identifier), so it cannot be checked; name the type and method plainly (src/x.rs::Type::method)" ;;
             UNDECIDABLE_LT) detail="anchor is refused: a \`<\` before it may or may not open a group, and the anchor is judged differently either way; write a comparison spaced (a < b) or in code" ;;
             LADDER_TIP) detail="claimed ladder tip disagrees with the tip scripts/check-migration-ladder.sh computes (left=cited, right=actual)" ;;
             *)     detail="unresolved anchor" ;;
