@@ -302,12 +302,33 @@ pub fn verify_policy_digest_advisory(conn: &Connection) -> Result<bool> {
     Ok(matches)
 }
 
+/// #5235 test seam: a fault a test can inject into the read-snapshot guard
+/// (read the prior `query_only`, set it ON, restore it) on this thread. The
+/// guard has no other failure a unit test can reach on demand.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GuardFault5235 {
+    ReadPrior,
+    SetOn,
+    Restore,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static GUARD_FAULT_5235: std::cell::Cell<Option<GuardFault5235>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[path = "read_snapshot_guard_5235_tests.rs"]
+mod read_snapshot_guard_5235_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::governance::rules_store;
 
-    fn fresh_conn_with_audit() -> Connection {
+    pub(super) fn fresh_conn_with_audit() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE governance_rules (
@@ -340,7 +361,7 @@ mod tests {
         conn
     }
 
-    fn make_rule(id: &str, kind: &str, enabled: bool) -> rules_store::Rule {
+    pub(super) fn make_rule(id: &str, kind: &str, enabled: bool) -> rules_store::Rule {
         rules_store::Rule {
             id: id.to_string(),
             kind: kind.to_string(),
