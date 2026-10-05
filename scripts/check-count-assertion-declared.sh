@@ -639,6 +639,11 @@ def selftest():
     case('what = the hit path plus a token', one_decl('tests/f.rs sections'), False)
     case('what = the hit path alone names nothing', one_decl('tests/f.rs'), True)
     case('what = a token plus a two-letter word is refused', one_decl('sections to'), True)
+    # #5760: ONE word that holds a short chunk beside a good token refuses the item (the header's "a word with a chunk of
+    # one or two characters ... refuses the whole item"); the same bump named by the good token alone is the control
+    case('what = one word with a two-character chunk beside a token (ab-sections) is refused', one_decl('ab-sections'), True,
+         ['sections.len()  18 -> 19'], ['IGNORED Count', '"ab-sections 18 -> 19" matches no change'])
+    case('what = the same token without the short chunk (sections) is the green control', one_decl('sections'), False)
     def c_stem(s, b): s.w('tests/multi.rs', multi_rs(6)); s.commit(msg('test: bump', 'Count: multi 5 -> 6 (fixture)')); return b + '..HEAD'
     case('what = a token of the file-name stem', c_stem, False)
     def c_late_short(s, b):
