@@ -834,6 +834,16 @@ def _self_test_cases() -> int:
         for label, data in encodings.items():
             if not refusal_prefix_gap(data):
                 return f"a source with {label} was not refused (#5560)"
+        # #5562: only a real docstring (a str constant) is stripped from the front. Any other first statement must be
+        # refused, however harmless it looks, so it cannot be mistaken for the docstring.
+        tail = refusal
+        for label, first in (("a call", "__import__('colorsys')\n"), ("a number", "1\n"), ("a bytes literal", "b'doc'\n"),
+                             ("an f-string", "f'{__import__(\"colorsys\")}'\n"), ("a name", "x\n"),
+                             ("a docstring-like call", "str('doc')\n"), ("an ellipsis", "...\n"), ("None", "None\n")):
+            if not gap(first + tail):
+                return f"{label} in the docstring slot was not refused (#5562)"
+        if gap('"""doc"""\n' + tail) or gap(tail):
+            return "a plain docstring or no docstring was refused (#5562)"
         names = list(EXPECTED_IMPORTS)  # the probe set is the pin, never the output of imported_modules (#5472)
         if "importlib" not in names:
             return "importlib is not in the plant set"
