@@ -3525,11 +3525,27 @@ def r5_cache_problems(base: tuple, known: set) -> list:
 
 
 def pin_problems() -> list:
-    """Direct pin for a check a verdict-level probe cannot reach (#5324, #5445)."""
+    """Direct pins for checks a verdict-level probe cannot reach (#5324, #5100, #5329, #5446)."""
     bad = []
     # every name word of a declare -n is a nameref (#5324)
     if not {"A", "B", "X"} <= nameref_facts(["declare -n A=X B"])[0]:
         bad.append("nameref_facts did not record every name word of a declare -n")
+    # -- ends the option words, and an expanded option word can be -n (#5323)
+    if nameref_facts(["declare -- $X=1"]) != (set(), False):
+        bad.append("nameref_facts did not stop at -- before a name word")
+    if not nameref_facts(["declare -$X R=A"])[1]:
+        bad.append("nameref_facts did not poison an expanded option word")
+    # the fields of a split name are in its value set (IFS cut, #5100)
+    if not {"x", "/var/r"} <= var_values([("w", "IFS=:; G=x:/var/r; cp $G /usr/local/bin/", {})]).get("G", set()):
+        bad.append("var_values did not cut a split name on IFS")
+    # an IFS the gate cannot read leaves a split name standing for any text (#5100)
+    if var_values([("w", "IFS=$X; G=a:b; cp $G /x", {})]).get("G") != {VALUES_PAST_CAP}:
+        bad.append("var_values did not collapse a split name under an IFS it cannot read")
+    # no value set is kept past EXPAND_CAP: the cap, not only that one exists (#5329)
+    for n in range(1, EXPAND_CAP.bit_length() + 3):
+        vals = var_values([("w", "F+=a", {})] * n).get("F", set())
+        if vals != {VALUES_PAST_CAP} and len(vals) > EXPAND_CAP:
+            bad.append("an append chain of %d kept %d values, past EXPAND_CAP" % (n, len(vals)))
     return bad
 
 
