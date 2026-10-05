@@ -2765,7 +2765,7 @@ def shape_hit(text: str, ops: List[Word]) -> Optional[Tuple[int, str]]:
 #   ("pos", index)          the positional operand at index, after the leading words;
 #   ("pair", name_re)       the word after a word whose name matches, or NAME=VALUE in one word;
 #   ("code", flags)         the program text of the flag, read for NAME = "literal", NAME:
-#                           "literal" and URL passwords;
+#                           "literal", NAME => "literal" (perl, php; #5924) and URL passwords;
 #   ("htpasswd",)           the password operand of htpasswd -b (-nb: the second, else the third).
 # A value is read like every shape value (shape_value): a literal or an expansion, never a
 # placeholder; "-" (stdin, or rar -p- for no password) is not a value.
@@ -2775,7 +2775,7 @@ _LDAP_HEADS = frozenset({"ldapsearch", "ldapmodify", "ldapadd", "ldapdelete", "l
                          "ldapmodrdn", "ldapexop", "ldapvc"})
 _SMB_HEADS = frozenset({"smbclient", "rpcclient", "smbcacls", "smbcquotas", "smbget", "smbtree"})
 CODE_CRED_RE = re.compile(r"(?<![\w.])(?:(?:[A-Za-z_][\w.]*?)?" + SECRET_WORD_LONG + r"|(?:[A-Za-z_][\w.]*?[_.])?"
-                          + SECRET_WORD_SHORT + r")[\"']?\s*[=:]\s*(?P<v>\"[^\"\n]*\"|'[^'\n]*'"
+                          + SECRET_WORD_SHORT + r")[\"']?\s*(?:=>|[=:])\s*(?P<v>\"[^\"\n]*\"|'[^'\n]*'"
                           r"|\$\{?[A-Za-z_][A-Za-z0-9_]*)", re.I)
 HEAD_CRED_ROWS = (
     (frozenset({"curl"}), (), (("split", ("-u", "--user", "-U", "--proxy-user"), ":"),)),
@@ -4390,6 +4390,9 @@ R11_SHAPE_RED = {
     '5804-r90-npm-authtoken': 'npm config set _authToken S3cr3tTok',
     '5805-r91-vault-kv-password': 'vault kv put secret/x password=S3cr3tPass',
     '5805-r92-bare-secret-name': 'mytool run secret=S3cr3tTok',
+    # #5924: a perl or php code string names a key with =>.
+    '5924-r93-perl-fat-arrow': "perl -E 'login(password => \"S3cr3tPass\")'",
+    '5924-r94-php-fat-arrow': "php -r 'login([\"password\" => \"S3cr3tPass\"]);'",
 }
 R11_SHAPE_GREEN = {
     '5725-g01-password-stdin': 'docker login -u u --password-stdin registry.example.com',
@@ -4445,6 +4448,7 @@ R11_SHAPE_GREEN = {
     '5803-g45-smbclient-U-user-only': 'smbclient -U bob //h/s',
     '4816-g46-redis-a-placeholder': 'redis-cli -a "<redacted>" ping',
     '5788-g47-mc-alias-ls': 'mc alias ls s3',
+    '5924-g48-php-getenv': "php -r 'login([\"password\" => getenv(\"PW\")]);'",
 }
 # #5725 STATED LIMITS: shapes the rule does not read, each pinned as missed so the limit text in
 # the header and the changelog stays measured (a rule that closes one must update both).
