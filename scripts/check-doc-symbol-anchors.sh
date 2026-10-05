@@ -658,6 +658,16 @@ MDEOF
     anchor_green 5433 "a placeholder group with no path behind it, with a nested group" \
         "See \`$R::<name<T>>\` here."
 
+    # #5435: where an unbalanced backticked token ends is pinned by the exact
+    # text reported; the group may not run on into the next code span.
+    anchor_red_cites 5435 QUAL "an unbalanced group followed by another code span" \
+        "$R::RecallTool<T" \
+        "See \`$R::RecallTool<T\` and \`Vec>\`."
+    anchor_red_cites 5435 QUAL "an unbalanced group closed only by a later code span, no space between" \
+        "$R::RecallTool<T" \
+        "See \`$R::RecallTool<T\`\`Vec>\`."
+
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
