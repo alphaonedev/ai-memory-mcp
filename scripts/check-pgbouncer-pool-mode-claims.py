@@ -1690,6 +1690,12 @@ RAW_LINE_PINS: List[Tuple[bytes, str, int, bool, Tuple[int, ...], List[str]]] = 
     (b"abcdefghijklmnopqrstuvwxyz\ntail", "latin-1", 0, False, (1, 2, 3, 5, 26),
      ["abcdef", "efghij", "ijklmn", "mnopqr", "qrstuv", "uvwxyz", "tail"]),
     (b"abcdefghijklmnopqrstuvwxyz\ntail", "latin-1", 0, False, (27, 64), ["abcdefghijklmnopqrstuvwxyz", "tail"]),
+    (b"t\xe0s\xc3\xa0\nio\xffn", "latin-1", 0, False, ANY_CHUNK, ["t\u00e0s\u00c3\u00a0", "io\u00ffn"]),
+    (b"t\xe0s\xc3\xa0\nio\xffn", "utf-8", 0, False, ANY_CHUNK, ["t\ufffds\u00e0", "io\ufffdn"]),
+    (b"\xc3\0\xa0b\xc3", "utf-8", 0, True, ANY_CHUNK, ["\u00e0b\ufffd"]),
+    ("x\u0430\0b\U0001d42d".encode("utf-16-le"), "utf-16-le", 0, False, ANY_CHUNK, ["x\u0430", "b\U0001d42d"]),
+    (b"\0" + "x\u0430\0b\U0001d42d".encode("utf-16-be"), "utf-16-be", 1, True, ANY_CHUNK, ["x\u0430b\U0001d42d"]),
+    (b"\0\0\0" + "q\0r".encode("utf-32-le"), "utf-32-le", 3, False, ANY_CHUNK, ["q", "r"]),
 ]
 # #5721: the exact place raw_mention reports, line numbers counted from 1.
 RAW_MENTION_PINS: List[Tuple[bytes, str]] = [
@@ -1887,6 +1893,12 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("F3a #5719 one raw cut per chunk", "            while len(carry) > RAW_LINE_CAP:", "            if len(carry) > RAW_LINE_CAP:"),
     ("F3a #5719 a raw segment one short", "yield carry[:RAW_LINE_CAP]", "yield carry[:RAW_LINE_CAP - 1]"),
     ("F3a #5719 the raw overlap one short", "carry = carry[RAW_LINE_CAP - RAW_OVERLAP:]", "carry = carry[RAW_LINE_CAP - RAW_OVERLAP + 1:]"),
+    ("F3b #5720 raw decoding drops bad bytes", 'getincrementaldecoder(codec)("replace")', 'getincrementaldecoder(codec)("ignore")'),
+    ("F3b #5720 raw decoding is strict", 'getincrementaldecoder(codec)("replace")', 'getincrementaldecoder(codec)("strict")'),
+    ("F3b #5720 the latin-1 view read as ASCII", 'getincrementaldecoder(codec)("replace")',
+     'getincrementaldecoder("ascii" if codec == "latin-1" else codec)("replace")'),
+    ("F3b #5720 a cut sequence at the end of the file is not flushed", "decoder.decode(data, final=not chunk)",
+     "decoder.decode(data, final=False)"),
     # #5554, #5555: rules shown unpinned by mutants N01-N12 (round-8 review)
     ("N01 #5554 set-env reach of four arguments", "[^\\s=\\\"']+){0,4}?", "[^\\s=\\\"']+){0,3}?"),
     ("N02 #5555 a prefixed key before a command", 're.compile(r"^[a-z0-9_]*pool[_-]?mode=', 're.compile(r"^pool[_-]?mode='),
