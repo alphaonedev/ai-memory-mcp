@@ -76,9 +76,10 @@
 # call found inside it:
 #   * assert_eq!: read only when the first argument is ONE operand that ends in
 #     `.len()` or `.count()` (so `v.iter().filter(|x| x.len() == 2).count()` reads
-#     as itself). A first argument whose last term is not the count call (a
-#     tuple, `v.len() + 1`, `v.len() as u32`, `&v[..v.len()]`, `f(v.len())`)
-#     is not read.
+#     as itself). A first argument whose last term is not exactly `.len()` or
+#     `.count()` (a tuple, `v.len() + 1`, `v.len() as u32`, `&v[..v.len()]`,
+#     `f(v.len())`, a path call `<[u8]>::len(v)`, `v.len ()` with a space inside
+#     the call) is neither read nor tracked (#5799, #5801).
 #   * assert!: read only when the first argument has exactly one `==` outside
 #     every bracket, no `&&` and no `|` outside every bracket, and the left
 #     operand ends in `.len()` or `.count()`.
@@ -97,6 +98,10 @@
 #     is never exempt (so adding, removing or rewording it is a count change),
 #     and every const name in it is tracked as `<spelling> [NAME]` with the
 #     const's value, so bumping that const is a count change too.
+#   * NOT READ assert! (stated limits): a count call only on the right of every
+#     `==` (reversed operands, `18 == v.len()`, also behind `&&`; #5714); a count
+#     compared without `==` (`v.len().eq(&18)`, `matches!(v.len(), 18)`; #5800);
+#     a count call spelled as a path call (`<[u8]>::len(v) == 18`; #5801).
 # The named-const spelling — `assert_eq!(x.len(), EXPECTED)` with
 # `const EXPECTED: usize = 19;` — is resolved the same way: a const that a
 # count assertion names, whose literal moved, is a count change.
@@ -957,6 +962,16 @@ def selftest():
                    ('match arm after =>', 'match k { _ => v.len() as a::T == %s }'), ('tuple operand', '(v.len(), 2) == (%s, 2)'),
                    ('a block with a statement', '{ let n = v.len(); n } == %s')):
         amb_leg(l_, a_)
+    # stated limits, pinned with today's reading (a move here is NOT flagged): #5799 #5800 #5801 #5714
+    for l_, a0_ in (('M3 an assert_eq! tuple first argument (#5799)', 'assert_eq!((v.len(), v.len()), (2, %s))'),
+                    ('an assert_eq! first argument cast to a path type (#5799)', 'assert_eq!(v.len() as core::primitive::usize, %s)'),
+                    ('an assert! comparing the count with .eq() (#5800)', 'assert!(v.len().eq(&%s))'),
+                    ('an assert! comparing the count with matches! (#5800)', 'assert!(matches!(v.len(), %s))'),
+                    ('an assert! with a path-call count (#5801)', 'assert!(<[u8]>::len(v) == %s)'),
+                    ('an assert_eq! with a path-call count (#5801)', 'assert_eq!(<[u8]>::len(v), %s)'),
+                    ('an assert_eq! with a space inside the count call (#5801)', 'assert_eq!(v.len (), %s)'),
+                    ('a reversed operand behind && (#5714)', 'assert!(ok && %s == v.len())')):
+        case('stays unread: %s' % l_, scoped('tests/scope.rs', 'fn t() { %s; }\n' % (a0_ % 18), 'fn t() { %s; }\n' % (a0_ % 19)), False)
     case('a count call behind && in a closure, with == on another operand, is not read',
          scoped('tests/scope.rs', 'fn t() { assert!(v.iter().all(|x| x.len() > 0 && x[0] == 18)); }\n',
                 'fn t() { assert!(v.iter().all(|x| x.len() > 0 && x[0] == 19)); }\n'), False)
