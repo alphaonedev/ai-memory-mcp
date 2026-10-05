@@ -2432,6 +2432,11 @@ ROUND3_RED = [
     ('5832 split-head pin: reported 6: a head spelled with a hex escape in an ANSI-C quote', "$'my\\x73ql' -uroot -p\"$X\""),
     ('5832 split-head pin: reported 7: a head spelled with an octal escape in an ANSI-C quote', "$'\\155ysql' -uroot -p\"$X\""),
     ('5832 split-head pin: reported 8: a head spelled with a unicode escape in an ANSI-C quote', "$'mariadb\\u002ddump' -uroot -p\"$X\" app"),
+    ('5958 backtick pin: reported 1: a backtick substitution after text in an echoed quote runs', 'echo "start `mysql -uroot -p$X`"'),
+    ('5958 backtick pin: reported 2: a backtick substitution after a verb word in an ssh payload runs', 'ssh h "status `mysql -p$X`"'),
+    ('5958 backtick pin: reported 3: a substitution that is the command word inside a backtick assignment', 'x=`$(command -v mysql) -p"$X"`'),
+    ('5958 backtick pin: reported 4: a substitution command word inside a quoted backtick', 'echo "`$(command -v mysql) -p$X`"'),
+    ('5958 backtick pin: reported 5: a backtick command word inside a backtick body', 'x=`\\`command -v mysql\\` -p"$X"`'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
