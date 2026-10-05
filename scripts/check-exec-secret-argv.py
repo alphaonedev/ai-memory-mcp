@@ -1384,8 +1384,8 @@ def _git_exec(root: Path, args: Sequence[str]) -> "subprocess.CompletedProcess[b
     # repo-local config that runs a command is pinned off for every read (#5633): core.fsmonitor runs its value
     # from ls-files and status, core.hooksPath would point git at hooks; log.showSignature would make every log
     # read run the signature verifier of each signed commit, so it is off and every verifier program (gpg,
-    # openpgp, x509, ssh) is the null device as well (#5822); the history log and the blob reads also
-    # pass --no-ext-diff and --no-textconv themselves
+    # openpgp, x509, ssh) is the null device as well (#5822); the history log passes --no-ext-diff and
+    # --no-textconv itself, the blob reads pass --no-textconv (a blob read does not diff) (#5825)
     argv =["git", "-C", str(root), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull,
             "-c", "log.showSignature=false"]
     for key in GIT_VERIFIER_KEYS:
@@ -3228,6 +3228,15 @@ def _git_funnel_cases(t: Path) -> Tuple[List[str], int]:
         pass
     if tmark.exists():
         bad.append("a repo-local textconv program ran during the gate's git reads (#5693)")
+    # the history log passes --no-ext-diff: a repo-local diff.external program does not run (#5825)
+    repo, shas = build("local-extdiff")
+    emark, eprog = marker_prog("extdiff")
+    with open(str(repo / ".git" / "config"), "a") as fh:
+        fh.write("[diff]\n\texternal = %s\n" % eprog)
+    check("a repo-local diff.external program", repo, shas)
+    n += 1
+    if emark.exists():
+        bad.append("a repo-local diff.external program ran during the gate's git reads (#5825)")
     # a signed history read with a repo-local log.showSignature runs no verifier program (#5822): every commit of
     # the case repo gets a gpgsig header of the kind each verifier key serves
     for kind, key, armor in (("ssh", "gpg.ssh.program", "SSH SIGNATURE"), ("pgp", "gpg.program", "PGP SIGNATURE"),
