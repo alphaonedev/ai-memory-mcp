@@ -1736,7 +1736,13 @@ POSITIVE_REFUSED = (
     ("Cyrillic e in the heading", 'CLAUDE.md "Kеy Modules"', "may name"),
     ("Greek omicron in the heading", 'CLAUDE.md "Key Mοdules"', "may name"),
     ("replacement character in the name", 'CLAU�E.md "Key Modules"', "may name"),
-    ("escapes that do not settle", "CLAUDE.md %" + "25" * 9 + "41", "escapes that do not settle"))
+    ("enclosing mark inside the heading", 'CLAUDE.md "Ke\u20ddy Modules"', "moved"),
+    ("combining mark inside the heading", 'CLAUDE.md "Ke\u0301y Modules"', "moved"),
+    ("bar for l", 'C|AUDE.md: "Key Modules"', "moved"),
+    ("heading cut to the prefix", 'CLAUDE.md "Key Modul"', "moved"),
+    ("singular of a short last word", "CLAUDE.md, Lint gate", "moved"),
+    # Seven levels need nine rounds to settle; the accepted six-level case below settles in eight.
+    ("escapes that do not settle", "CLAUDE.md %" + "25" * 7 + "41", "escapes that do not settle"))
 # #5770: units the positive rule passes: no moved heading's words, or the name and the heading too far apart.
 POSITIVE_ACCEPTED = (
     ("paraphrase with no heading words", "CLAUDE.md env table"),
@@ -1745,7 +1751,10 @@ POSITIVE_ACCEPTED = (
     ("heading two lines below the name", "CLAUDE.md is long.\nIt has rules.\nKey Modules moved."),
     ("paragraph break between", 'CLAUDE.md:\n\n"Key Modules"'),
     ("heading words with no name", 'docs/reference/ARCHITECTURE_REFERENCE.md "Key Modules"'),
-    ("escapes that settle in eight rounds", "CLAUDE.md %" + "25" * 6 + "41"))
+    ("escapes that settle in eight rounds", "CLAUDE.md %" + "25" * 6 + "41"),
+    ("heading cut below the prefix", 'CLAUDE.md "Key Modu"'),
+    ("a short last word cut below four letters", "CLAUDE.md lint gat"),
+    ("another file whose name starts the same", 'CLAUDE.mdx "Key Modules"'))
 
 
 def run_positive_citation_cases(fresh) -> bool:
@@ -1770,18 +1779,34 @@ def run_positive_citation_cases(fresh) -> bool:
         if errors:
             print(f"FAIL: self-test - #5770 positive rule: {label} was refused: {errors[0]}", file=sys.stderr)
             ok = False
+    if cite_skeleton("Vv") != " w ":
+        print("FAIL: self-test - #5770 the skeleton does not fold vv to w", file=sys.stderr)
+        ok = False
+    root = fresh()
+    (root / "docs" / "v1.0.0").mkdir(parents=True)
+    (root / "docs" / "v1.0.0" / "cite.md").write_text('Before.\nSee CLAUDE.md: "Key Modules".\nAfter.\n',
+                                                      encoding="utf-8")
+    errors = [e for e in stale_citation_errors(root) if "(#5770)" in e]
+    if len(errors) != 1 or "cite.md:2 " not in errors[0]:
+        print(f"FAIL: self-test - #5770 a refused line was reported again inside a pair: {errors}", file=sys.stderr)
+        ok = False
     root = fresh()
     (root / "docs" / "internal").mkdir(parents=True)
     line = 'See docs/reference/ARCHITECTURE_REFERENCE.md "Key Modules"; CLAUDE.md "Build & Test Commands".'
     pair = ("CLAUDE.md, for the", "Key Modules table.")
     (root / "docs" / "internal" / "ok.md").write_text(line + "\n\n" + "\n".join(pair) + "\n", encoding="utf-8")
     exempt = (("docs/internal/ok.md", line), ("docs/internal/ok.md", "\n".join(pair)))
-    if len([e for e in stale_citation_errors(root) if "(#5770)" in e]) != 2:
+    errors = [e for e in stale_citation_errors(root) if "(#5770)" in e]
+    if len(errors) != 2 or not any("ok.md:3-4 " in e for e in errors):
         print("FAIL: self-test - #5770 the line and the pair were not each refused without an exemption",
               file=sys.stderr)
         ok = False
     if stale_citation_errors(root, exempt):
         print("FAIL: self-test - #5770 a reviewed exemption did not excuse its exact unit", file=sys.stderr)
+        ok = False
+    errors = stale_citation_errors(root, exempt[:1])
+    if len(errors) != 1 or "ok.md:3-4 " not in errors[0]:
+        print(f"FAIL: self-test - #5770 an exemption excused a unit other than its own: {errors}", file=sys.stderr)
         ok = False
     for label, entries in (("an exemption whose unit text differs", (("docs/internal/ok.md", line + " "),)),
                            ("an exemption for another path", (("docs/internal/other.md", line),)),
