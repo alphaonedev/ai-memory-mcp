@@ -1238,6 +1238,26 @@ def psql_var_operand_flagged(operand: str) -> bool:
     return False
 
 
+# #5594 (round 9, B): the operand is psql's NAME=VALUE. Under a head that is not proven to be
+# psql, an operand whose first literal colon stands before any literal = (a docker or compose
+# mount SRC:DST, /run/secrets/pgpass:/s:ro, "$SECRET_DIR:/s") is not that shape: psql rejects
+# a variable name that holds a colon. An expansion's own colon or = never counts.
+OPERAND_EXPANSION_RE = re.compile(r"\$\{[^}]*\}|\$\([^)]*\)|`[^`]*`|\$[A-Za-z0-9_@*#?$!-]+")
+
+
+def mount_shaped(literal_operand: str) -> bool:
+    """SRC:DST with no literal = before the first literal colon is not psql's NAME=VALUE."""
+    colon = literal_operand.find(":")
+    equals = literal_operand.find("=")
+    return colon >= 0 and (equals < 0 or colon < equals)
+
+
+def mount_shaped_operand(operand: str) -> bool:
+    """mount_shaped on an operand as written: quotes dropped, each expansion masked."""
+    masked = OPERAND_EXPANSION_RE.sub(lambda m: "\x02" * len(m.group(0)), operand)
+    return mount_shaped(masked.replace('"', "").replace("'", ""))
+
+
 def text_rule_hits(rel: str, text: str) -> List[Hit]:
     """The #4600-line text rules: expansion, psql -c password, docker -e / psql
     -v runtime-expanded password, readable cloud-init secret, traced secret."""
@@ -1282,7 +1302,7 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
         if any(wstart <= hs < wend and wend <= he for hs, he in seen_heads):
             continue
         end = psql_segment_end(joined, wend)
-        if any(psql_var_operand_flagged(m.group("operand"))
+        if any(psql_var_operand_flagged(m.group("operand")) and not mount_shaped_operand(m.group("operand"))
                for m in PSQL_VAR_OPT_RE.finditer(segment_view(joined[wend:end])[0])):
             hits.append((rel, _line_of(text, wstart)[0], "[env-password-argv] "
                          + psql_command_snippet(text, wstart, end)))
@@ -2021,6 +2041,30 @@ GREEN_HEAD_PROBES = {
     "5556-g8-prose-quote-no-command": "Set the **loss** value to 3 -v pw is not run here",
 }
 
+# #5594 (round 9): a docker or compose mount SRC:DST is not psql's NAME=VALUE, in both
+# directions. Each probe runs as a script, a prose file and a fenced block.
+R9_NEUTRAL_TAIL = ' -v x="$PGPASSWORD" -f x.sql'
+R9_RED_PROBES = {
+    '5594-B-r1-equals-before-colon': '$X -v "pw=$A:$B" -f x.sql',
+    '5594-B-r2-docker-env-shaped-operand': '"$DOCKER" run -v "pw=$PG_PW" img',
+    '5594-B-r3-only-expansion': '$X -v "$SECRET_OPT" -f x.sql',
+    '5594-B-r4-value-colon-after-equals': '$X -v pw=$PG_PW:x -f x.sql',
+}
+R9_GREEN_PROBES = {
+    '5594-g20-FP1-docker-secret-dir-mount': '"$DOCKER" run -v "$SECRET_DIR:/s" img',
+    '5594-g21-docker-secret-path-mount': '$DOCKER run -v /run/secrets/pgpass:/s:ro img',
+    '5594-g22-compose-token-mount': '$COMPOSE run -v "$TOKEN_PATH":/t img',
+    '5594-g23-psql-non-credential': 'psql -v ON_ERROR_STOP=1 -f x.sql',
+    '5594-g24-head-non-credential': '$X -v ON_ERROR_STOP=1 -f x.sql',
+    '5594-g25-docker-pw-dir-mount': 'docker run -v "$PW_DIR:/pw" img',
+}
+
+
+def r9_variants(text: str) -> List[Tuple[str, str, str]]:
+    """(label, file name, text): the probe as a script, as prose and inside a fenced block."""
+    return [("sh", "probe.sh", text), ("md", "probe.md", text),
+            ("fence", "probe.md", "```bash\n" + text + "\n```\n")]
+
 
 def self_test() -> int:
     bad = 0
@@ -2137,6 +2181,19 @@ def self_test() -> int:
         if got != want_lines:
             print("SELF-TEST FAIL: head line probe %r gave lines %r (want %r)" % (name, got, want_lines), file=sys.stderr)
             bad += 1
+    # #5594 (round 9): every probe as a script, a prose file and a fenced block.
+    for name, text in R9_RED_PROBES.items():
+        for label, suffix, body in r9_variants(text):
+            red += 1
+            if not any(h[2].startswith("[env-password-argv]") for h in text_rule_hits(suffix, body)):
+                print("SELF-TEST FAIL: red probe %r (%s) was not flagged" % (name, label), file=sys.stderr)
+                bad += 1
+    for name, text in R9_GREEN_PROBES.items():
+        for label, suffix, body in r9_variants(text):
+            green += 1
+            if scan_text(suffix, body):
+                print("SELF-TEST FAIL: green probe %r (%s) was flagged" % (name, label), file=sys.stderr)
+                bad += 1
     # A glob head with no credential option is emphasis in prose; a script refuses it as undecidable.
     green += 1
     if scan_text("probe.md", "```bash\n[p]sql -f x.sql\n```\n"):
