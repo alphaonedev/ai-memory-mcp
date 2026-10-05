@@ -3249,7 +3249,6 @@ def build_probes() -> list:
     red("R3-C listed data home run by run-parts is an R5 hit, not an R4 wrapper (#4998)",
         [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      run-parts /etc/ai-memory\n" + dec)],
         autolist=True, present="is an expansion or command substitution")
-    # a name read from input has no known value: its literal assignments are not expanded (#5095 pin, #5100)
     # a name read from input keeps every literal it is assigned: the read may run after
     # the use, may not run, or may run in a pipeline subshell, so this #5100 green form is
     # red now (#5356, 5-agent vote 4d3ea1c5)
