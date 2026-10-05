@@ -135,23 +135,285 @@ fn policy_advance_count(conn: &Connection) -> Result<i64> {
 /// When the caller already holds a transaction on `conn`, its reads are
 /// already one snapshot, so `read` runs directly on it.
 ///
+/// # Read-only at runtime (#5235)
+///
+/// The snapshot is read-only by construction, not by convention: `read` runs
+/// under `PRAGMA query_only = ON` on BOTH paths (the autocommit path and the
+/// caller-transaction path), so a write in `read` or in any helper it calls
+/// fails with `SQLITE_READONLY`, and the error carries
+/// [`ReadSnapshotGuardRefusal::WriteRefused`] (its text names the
+/// "read-snapshot guard"). Decision: 5-agent vote (4d3ea1c5), option A.
+///
+/// - The PRIOR value is saved and restored, never forced OFF: a read-only
+///   pool connection stays `query_only`, and a nested scope returns the
+///   outer scope's ON.
+/// - Setup fails closed: if the prior value cannot be read or ON cannot be
+///   set, the error ([`ReadSnapshotGuardRefusal::SetupFailed`]) is returned
+///   before `read` runs.
+/// - The value is restored on Ok, Err and panic. On the autocommit path the
+///   snapshot transaction ends (COMMIT, or ROLLBACK from `Drop`) BEFORE the
+///   restore, so the rollback also runs read-only. On Ok a failed restore is
+///   an error ([`ReadSnapshotGuardRefusal::RestoreFailed`]); on Err or panic
+///   it is logged at ERROR from `Drop`. Either way the connection is left
+///   read-only, never silently writable.
+/// - After `read` returns Ok, the scope is checked: `query_only` must still
+///   be ON, and the change counter, the `main` and `temp` schema cookies,
+///   `user_version` and `application_id` must not have moved; on the
+///   autocommit path the transaction must not have become a write
+///   transaction. Any of these is [`ReadSnapshotGuardRefusal::ScopeTampered`],
+///   and on the autocommit path the transaction is rolled back.
+///
+/// # Known limits
+///
+/// - On the caller-transaction path the guard cannot roll back what `read`
+///   did: if `read` turns `query_only` OFF, writes, and turns it back ON, the
+///   scope check refuses with an error, but the write stays in the CALLER's
+///   transaction and lands if the caller ignores that error and commits
+///   (#5881).
+/// - `crate::storage::touch_many` reads `query_only` and skips its write
+///   with `Ok(0)`, so a touch inside the scope is silently not recorded
+///   instead of refused (#5882).
+/// - `ATTACH` / `DETACH` and `SAVEPOINT` / `RELEASE` are not writes to
+///   SQLite and are not refused by the pragma; `ATTACH` fails anyway inside
+///   the snapshot transaction, and a write after a `SAVEPOINT` is refused.
+///
 /// # Errors
 ///
-/// Propagates the error from `read` and any BEGIN/COMMIT failure.
+/// Propagates the error from `read` (with the guard marker attached to a
+/// write refusal), any BEGIN/COMMIT failure, and every
+/// [`ReadSnapshotGuardRefusal`].
 pub fn with_read_snapshot<T>(
     conn: &Connection,
     read: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<T> {
+    // Declared BEFORE the transaction: on an early return or a panic the
+    // transaction drops first (ROLLBACK while still read-only) and the guard
+    // drops second (restore).
+    let guard = QueryOnlyGuard::engage(conn)?;
     if !conn.is_autocommit() {
-        return read(conn);
+        let mark = ScopeMark::take(conn)?;
+        let out = read(conn).map_err(|e| guard.mark_refusal(e))?;
+        mark.check(conn, false)?;
+        guard.restore()?;
+        return Ok(out);
     }
     let tx = conn
         .unchecked_transaction()
         .context("policy_version::with_read_snapshot: BEGIN")?;
-    let out = read(&tx)?;
+    let mark = ScopeMark::take(&tx)?;
+    let out = read(&tx).map_err(|e| guard.mark_refusal(e))?;
+    mark.check(&tx, true)?;
     tx.commit()
         .context("policy_version::with_read_snapshot: COMMIT")?;
+    guard.restore()?;
     Ok(out)
+}
+
+/// #5235 — why the read-snapshot guard refused. Attached to the returned
+/// error as context, so a caller can tell a guard refusal from an ordinary
+/// read-only error with `err.downcast_ref::<ReadSnapshotGuardRefusal>()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadSnapshotGuardRefusal {
+    /// A write was attempted inside the read snapshot.
+    WriteRefused,
+    /// `query_only` could not be read or set ON; the closure did not run.
+    SetupFailed,
+    /// The prior `query_only` value could not be restored; the connection
+    /// is left read-only.
+    RestoreFailed,
+    /// The closure turned `query_only` OFF, or changed rows, schema or the
+    /// header cookies, inside the scope.
+    ScopeTampered,
+}
+
+impl std::fmt::Display for ReadSnapshotGuardRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self {
+            Self::WriteRefused => "write refused inside a read-only snapshot",
+            Self::SetupFailed => "could not set query_only ON; the read did not run",
+            Self::RestoreFailed => "could not restore query_only; the connection is left read-only",
+            Self::ScopeTampered => "the read changed query_only, rows, schema or header cookies",
+        };
+        write!(f, "read-snapshot guard (#5235): {what}")
+    }
+}
+
+impl std::error::Error for ReadSnapshotGuardRefusal {}
+
+/// #5235 test seam: `true` when a test armed `fault` on this thread.
+#[cfg(test)]
+fn guard_fault(fault: GuardFault5235) -> bool {
+    GUARD_FAULT_5235.with(|c| c.get() == Some(fault))
+}
+
+/// The SQLite error text of a refused write under `query_only`.
+const READONLY_TEXT: &str = "attempt to write a readonly database";
+
+/// Read `PRAGMA query_only` (`0` or `1`).
+fn query_only_value(conn: &Connection) -> rusqlite::Result<i64> {
+    #[cfg(test)]
+    if guard_fault(GuardFault5235::ReadPrior) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    conn.pragma_query_value(None, "query_only", |row| row.get(0))
+}
+
+/// Set `PRAGMA query_only`. The ONLY place that can turn it OFF, and only
+/// to restore a prior OFF (the static gate's R7 allowlists this fn alone).
+fn set_query_only(conn: &Connection, on: bool) -> rusqlite::Result<()> {
+    #[cfg(test)]
+    if guard_fault(if on {
+        GuardFault5235::SetOn
+    } else {
+        GuardFault5235::Restore
+    }) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    conn.pragma_update(None, "query_only", on)
+}
+
+/// Holds `query_only = ON` for one read-snapshot scope and restores the
+/// prior value when it is consumed by [`Self::restore`] or dropped.
+struct QueryOnlyGuard<'c> {
+    conn: &'c Connection,
+    prior_on: bool,
+    armed: bool,
+}
+
+impl<'c> QueryOnlyGuard<'c> {
+    /// Read the prior value, then set ON. Fails closed before any read.
+    fn engage(conn: &'c Connection) -> Result<Self> {
+        let prior = query_only_value(conn)
+            .context("read-snapshot guard: read prior query_only")
+            .context(ReadSnapshotGuardRefusal::SetupFailed)?;
+        set_query_only(conn, true)
+            .context("read-snapshot guard: set query_only ON")
+            .context(ReadSnapshotGuardRefusal::SetupFailed)?;
+        Ok(Self {
+            conn,
+            prior_on: prior != 0,
+            armed: true,
+        })
+    }
+
+    /// Attach [`ReadSnapshotGuardRefusal::WriteRefused`] to a closure error
+    /// that is a `SQLITE_READONLY` refusal this guard caused (the prior value
+    /// was OFF). An error that already carries a guard marker (a nested
+    /// scope) and an ordinary error are returned unchanged.
+    fn mark_refusal(&self, err: anyhow::Error) -> anyhow::Error {
+        if self.prior_on || err.downcast_ref::<ReadSnapshotGuardRefusal>().is_some() {
+            return err;
+        }
+        let readonly = err.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ErrorCode::ReadOnly,
+                        ..
+                    },
+                    _
+                ))
+            ) || cause.to_string().contains(READONLY_TEXT)
+        });
+        if readonly {
+            err.context(ReadSnapshotGuardRefusal::WriteRefused)
+        } else {
+            err
+        }
+    }
+
+    /// Restore the prior value. A failure is an error and leaves the
+    /// connection read-only.
+    fn restore(mut self) -> Result<()> {
+        self.armed = false;
+        if let Err(e) = set_query_only(self.conn, self.prior_on) {
+            leave_read_only(self.conn);
+            return Err(anyhow::Error::new(e)
+                .context("read-snapshot guard: restore query_only")
+                .context(ReadSnapshotGuardRefusal::RestoreFailed));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for QueryOnlyGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(e) = set_query_only(self.conn, self.prior_on) {
+            tracing::error!(
+                error = %e,
+                prior_on = self.prior_on,
+                "read-snapshot guard (#5235): could not restore query_only after \
+                 the read; the connection is left read-only"
+            );
+            leave_read_only(self.conn);
+        }
+    }
+}
+
+/// Best effort after a failed restore: make sure the connection is read-only
+/// rather than in an unknown state. Its own failure is logged, not raised.
+fn leave_read_only(conn: &Connection) {
+    if let Err(e) = conn.pragma_update(None, "query_only", "ON") {
+        tracing::error!(
+            error = %e,
+            "read-snapshot guard (#5235): could not force query_only ON after a \
+             failed restore"
+        );
+    }
+}
+
+/// What a write inside the scope could move, taken before the closure runs.
+#[derive(Debug, PartialEq, Eq)]
+struct ScopeMark {
+    changes: u64,
+    schema: i64,
+    temp_schema: i64,
+    user_version: i64,
+    application_id: i64,
+}
+
+impl ScopeMark {
+    fn take(conn: &Connection) -> Result<Self> {
+        let read = |db: rusqlite::DatabaseName<'_>, name: &str| -> Result<i64> {
+            conn.pragma_query_value(Some(db), name, |row| row.get(0))
+                .with_context(|| format!("read-snapshot guard: read {name}"))
+                .context(ReadSnapshotGuardRefusal::SetupFailed)
+        };
+        Ok(Self {
+            changes: conn.total_changes(),
+            schema: read(rusqlite::DatabaseName::Main, "schema_version")?,
+            temp_schema: read(rusqlite::DatabaseName::Temp, "schema_version")?,
+            user_version: read(rusqlite::DatabaseName::Main, "user_version")?,
+            application_id: read(rusqlite::DatabaseName::Main, "application_id")?,
+        })
+    }
+
+    /// Refuse a scope in which the closure switched the guard off or wrote.
+    fn check(&self, conn: &Connection, owns_txn: bool) -> Result<()> {
+        let still_on = query_only_value(conn)
+            .context("read-snapshot guard: re-read query_only")
+            .context(ReadSnapshotGuardRefusal::ScopeTampered)?;
+        let after = Self::take(conn).context(ReadSnapshotGuardRefusal::ScopeTampered)?;
+        let wrote_txn = owns_txn
+            && conn
+                .transaction_state(None)
+                .context("read-snapshot guard: read transaction state")
+                .context(ReadSnapshotGuardRefusal::ScopeTampered)?
+                == rusqlite::TransactionState::Write;
+        if still_on == 0 || after != *self || wrote_txn {
+            return Err(anyhow::anyhow!(
+                "read-snapshot guard: query_only={still_on}, before={before:?}, \
+                 after={after:?}, write transaction={wrote_txn}",
+                before = self
+            )
+            .context(ReadSnapshotGuardRefusal::ScopeTampered));
+        }
+        Ok(())
+    }
 }
 
 /// The sequence and digest read on `conn` as-is: the caller guarantees the

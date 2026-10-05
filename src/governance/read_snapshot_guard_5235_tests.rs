@@ -82,6 +82,7 @@ fn fingerprint(conn: &Connection) -> String {
         one("SELECT count(*) FROM t_log"),
         one("SELECT count(*) FROM t_fts"),
         one("PRAGMA user_version"),
+        one("PRAGMA application_id"),
         one("SELECT group_concat(name) FROM sqlite_schema"),
         one("SELECT group_concat(name) FROM sqlite_temp_schema"),
         one("SELECT count(*) FROM governance_rules"),
@@ -363,5 +364,315 @@ fn restore_failure_in_drop_is_logged_and_leaves_read_only_5235() {
         query_only(&conn),
         1,
         "left read-only, never silently writable"
+    );
+}
+
+// ---------------------------------------------------------------- neighbours
+
+/// One neighbour probe: SQL the closure runs inside the scope.
+struct Probe {
+    name: &'static str,
+    sql: &'static str,
+}
+
+/// Writes of every shape the pragma must refuse, on both paths: each one
+/// errors, the error names the guard, and nothing it would change lands.
+const WRITE_PROBES: &[Probe] = &[
+    Probe {
+        name: "INSERT",
+        sql: "INSERT INTO p (id, v) VALUES (2, 'b')",
+    },
+    Probe {
+        name: "UPDATE",
+        sql: "UPDATE p SET v = 'z' WHERE id = 1",
+    },
+    Probe {
+        name: "DELETE",
+        sql: "DELETE FROM p",
+    },
+    Probe {
+        name: "REPLACE",
+        sql: "REPLACE INTO p (id, v) VALUES (1, 'r')",
+    },
+    Probe {
+        name: "CREATE TABLE",
+        sql: "CREATE TABLE x5235 (a)",
+    },
+    Probe {
+        name: "CREATE TEMP TABLE",
+        sql: "CREATE TEMP TABLE x5235 (a)",
+    },
+    Probe {
+        name: "CREATE INDEX",
+        sql: "CREATE INDEX p_v5235 ON p (v)",
+    },
+    Probe {
+        name: "DROP TABLE",
+        sql: "DROP TABLE p",
+    },
+    Probe {
+        name: "ALTER TABLE",
+        sql: "ALTER TABLE p ADD COLUMN w5235 TEXT",
+    },
+    Probe {
+        name: "trigger-driven UPDATE",
+        sql: "UPDATE t SET v = 'b' WHERE id = 1",
+    },
+    Probe {
+        name: "FTS insert",
+        sql: "INSERT INTO t_fts (body) VALUES ('x')",
+    },
+    Probe {
+        name: "FTS rebuild",
+        sql: "INSERT INTO t_fts (t_fts) VALUES ('rebuild')",
+    },
+    Probe {
+        name: "PRAGMA user_version",
+        sql: "PRAGMA user_version = 7",
+    },
+    Probe {
+        name: "PRAGMA application_id",
+        sql: "PRAGMA application_id = 7",
+    },
+    Probe {
+        name: "SAVEPOINT then write",
+        sql: "SAVEPOINT s5235; INSERT INTO p (id, v) VALUES (3, 'c'); RELEASE s5235",
+    },
+];
+
+#[test]
+fn neighbour_writes_are_refused_on_both_paths_5235() {
+    for probe in WRITE_PROBES {
+        for path in PATHS {
+            let conn = probe_conn();
+            let before = fingerprint(&conn);
+            let (r, during) = in_scope(&conn, path, |c| {
+                c.execute_batch(probe.sql)?;
+                Ok(())
+            });
+            let what = format!("{} {path:?}", probe.name);
+            let err = r.expect_err(&what);
+            assert_named(&err, &what);
+            assert_eq!(
+                err.downcast_ref::<super::ReadSnapshotGuardRefusal>(),
+                Some(&super::ReadSnapshotGuardRefusal::WriteRefused),
+                "{what}: typed marker"
+            );
+            assert_eq!(during, before, "{what}: nothing lands");
+            assert_eq!(query_only(&conn), 0, "{what}: prior OFF restored");
+        }
+    }
+}
+
+#[test]
+fn cached_statement_prepared_before_the_scope_is_refused_5235() {
+    const SQL: &str = "INSERT INTO p (id, v) VALUES (4, 'd')";
+    for path in PATHS {
+        let conn = probe_conn();
+        let before = fingerprint(&conn);
+        drop(conn.prepare_cached(SQL).unwrap());
+        let (r, during) = in_scope(&conn, path, |c| {
+            c.prepare_cached(SQL)?.execute([])?;
+            Ok(())
+        });
+        assert_named(&r.expect_err("cached INSERT"), &format!("{path:?} cached"));
+        assert_eq!(during, before, "{path:?}");
+    }
+}
+
+#[test]
+fn nested_begin_and_attach_fail_and_write_nothing_5235() {
+    for (name, sql) in [
+        ("nested BEGIN", "BEGIN"),
+        (
+            "ATTACH then write",
+            "ATTACH ':memory:' AS aux5235; CREATE TABLE aux5235.x (a)",
+        ),
+    ] {
+        for path in PATHS {
+            let conn = probe_conn();
+            let before = fingerprint(&conn);
+            let (r, during) = in_scope(&conn, path, |c| {
+                c.execute_batch(sql)?;
+                Ok(())
+            });
+            assert!(
+                r.is_err(),
+                "{name} {path:?}: inside a transaction this fails"
+            );
+            assert_eq!(during, before, "{name} {path:?}");
+            assert_eq!(query_only(&conn), 0, "{name} {path:?}");
+        }
+    }
+}
+
+#[test]
+fn ordinary_read_only_error_is_not_marked_as_a_guard_refusal_5235() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("ro-mark-5235.db");
+    drop(crate::storage::connection::open(&db).unwrap());
+    let ro = crate::storage::connection::open_read_only(&db).unwrap();
+    let r = with_read_snapshot(&ro, |c| {
+        c.execute_batch("CREATE TABLE y5235 (a)")?;
+        Ok(())
+    });
+    let err = r.expect_err("a read-only pool connection refuses the write itself");
+    assert!(format!("{err:#}").contains("readonly"), "{err:#}");
+    assert!(
+        err.downcast_ref::<super::ReadSnapshotGuardRefusal>()
+            .is_none(),
+        "the guard did not cause this refusal, so it must not claim it"
+    );
+}
+
+#[test]
+fn nested_refusal_is_marked_once_5235() {
+    let conn = probe_conn();
+    let r = with_read_snapshot(&conn, |outer| {
+        with_read_snapshot(outer, |inner| {
+            inner.execute("INSERT INTO p (id, v) VALUES (6, 'n')", [])?;
+            Ok(())
+        })
+    });
+    let text = format!("{:#}", r.unwrap_err());
+    assert_eq!(text.matches(GUARD_NAME).count(), 1, "{text}");
+}
+
+/// A helper that flattens the SQLite error into text (no typed cause left)
+/// is still recognised as a guard refusal, by the SQLite message.
+#[test]
+fn stringified_refusal_is_still_marked_5235() {
+    let conn = probe_conn();
+    let r: Result<()> = with_read_snapshot(&conn, |c| {
+        c.execute("INSERT INTO p (id, v) VALUES (7, 's')", [])
+            .map_err(|e| anyhow::anyhow!("helper failed: {e}"))?;
+        Ok(())
+    });
+    let err = r.expect_err("refused");
+    assert!(err.downcast_ref::<rusqlite::Error>().is_none(), "{err:#}");
+    assert_eq!(
+        err.downcast_ref::<super::ReadSnapshotGuardRefusal>(),
+        Some(&super::ReadSnapshotGuardRefusal::WriteRefused),
+        "{err:#}"
+    );
+}
+
+/// A typed `SQLITE_READONLY` whose message is not the stock text is still
+/// recognised as a guard refusal, by its error code.
+#[test]
+fn readonly_code_with_other_text_is_still_marked_5235() {
+    let conn = probe_conn();
+    let r: Result<()> = with_read_snapshot(&conn, |_| {
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
+            Some("refused by a helper".to_owned()),
+        )
+        .into())
+    });
+    let err = r.expect_err("refused");
+    assert!(
+        !format!("{err:#}").contains(super::READONLY_TEXT),
+        "{err:#}"
+    );
+    assert_eq!(
+        err.downcast_ref::<super::ReadSnapshotGuardRefusal>(),
+        Some(&super::ReadSnapshotGuardRefusal::WriteRefused),
+        "{err:#}"
+    );
+}
+
+// ---------------------------------------------------------------- bypass
+
+/// Writes a closure could smuggle past the pragma by turning it OFF and
+/// back ON around them. The post-scope check must refuse each one.
+const BYPASS_WRITES: &[(&str, &str)] = &[
+    ("INSERT", "INSERT INTO p (id, v) VALUES (8, 'h')"),
+    ("CREATE TABLE", "CREATE TABLE bypass5235 (a)"),
+    ("CREATE TEMP TABLE", "CREATE TEMP TABLE bypass5235 (a)"),
+    ("user_version", "PRAGMA user_version = 9"),
+    ("application_id", "PRAGMA application_id = 9"),
+    ("FTS insert", "INSERT INTO t_fts (body) VALUES ('bypass')"),
+];
+
+fn assert_tampered(err: &anyhow::Error, what: &str) {
+    assert_named(err, what);
+    assert_eq!(
+        err.downcast_ref::<super::ReadSnapshotGuardRefusal>(),
+        Some(&super::ReadSnapshotGuardRefusal::ScopeTampered),
+        "{what}: {err:#}"
+    );
+}
+
+#[test]
+fn off_write_on_is_refused_and_rolled_back_on_the_autocommit_path_5235() {
+    for (name, sql) in BYPASS_WRITES {
+        let conn = probe_conn();
+        let before = fingerprint(&conn);
+        let r = with_read_snapshot(&conn, |c| {
+            c.pragma_update(None, "query_only", false)?;
+            c.execute_batch(sql)?;
+            c.pragma_update(None, "query_only", true)?;
+            Ok(())
+        });
+        assert_tampered(&r.expect_err(name), name);
+        assert_eq!(
+            fingerprint(&conn),
+            before,
+            "{name}: the guard rolled it back"
+        );
+        assert_eq!(query_only(&conn), 0, "{name}: prior OFF restored");
+        assert!(conn.is_autocommit(), "{name}");
+    }
+}
+
+#[test]
+fn off_left_off_is_refused_on_both_paths_5235() {
+    for path in PATHS {
+        let conn = probe_conn();
+        let (r, _) = in_scope(&conn, path, |c| {
+            c.pragma_update(None, "query_only", false)?;
+            Ok(())
+        });
+        assert_tampered(&r.expect_err("OFF left off"), &format!("{path:?}"));
+        assert_eq!(query_only(&conn), 0, "{path:?}");
+    }
+}
+
+/// Known limit (#5881), pinned so a fix flips it: on the caller-transaction
+/// path the guard refuses the scope, but the smuggled write is in the
+/// CALLER's transaction, which the guard does not own and cannot roll back.
+#[test]
+fn off_write_on_in_a_caller_txn_is_refused_but_stays_in_the_caller_txn_5235() {
+    for (name, sql) in BYPASS_WRITES {
+        let conn = probe_conn();
+        let before = fingerprint(&conn);
+        let (r, during) = in_scope(&conn, Path::CallerTxn, |c| {
+            c.pragma_update(None, "query_only", false)?;
+            c.execute_batch(sql)?;
+            c.pragma_update(None, "query_only", true)?;
+            Ok(())
+        });
+        assert_tampered(&r.expect_err(name), name);
+        assert_ne!(
+            during, before,
+            "{name}: limit #5881 -- the write is in the caller txn"
+        );
+        assert_eq!(fingerprint(&conn), before, "{name}: the caller rolled back");
+    }
+}
+
+/// Known limit (#5882), pinned so a fix flips it: `touch_many` reads
+/// `query_only` and returns `Ok(0)` without writing, so a touch inside the
+/// scope is skipped silently instead of refused.
+#[test]
+fn touch_many_inside_the_scope_is_skipped_silently_5235() {
+    let conn = probe_conn();
+    let touched = with_read_snapshot(&conn, |c| {
+        crate::storage::touch_many(c, &["no-such-id"], 1, 1)
+    });
+    assert_eq!(
+        touched.unwrap(),
+        0,
+        "limit #5882: silent skip, not a refusal"
     );
 }
