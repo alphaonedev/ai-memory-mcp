@@ -473,17 +473,26 @@ CONTROL_BYTES = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\r(?!\n)")
 
 
 def refusal_prefix_gap(source: bytes) -> str:
-    """#5510/#5560: "" when `source` (the file BYTES, never a str) is plain strict utf-8 and the only statements that
+    """#5510/#5560/#5590: "" when `source` (the file BYTES, never a str) is plain strict utf-8 and the only statements that
     execute above the isolation refusal are the docstring and `import sys`, and the refusal is exactly
     `if __name__ == "__main__" and not sys.flags.isolated:` whose body is calls to print and sys.exit with constant
     arguments; otherwise why not. Parsed with ast from the bytes, never executed, so the check reads the file the way
-    the interpreter does. It is closed-world and fails closed: it refuses a non-bytes argument; any coding cookie or
-    BOM other than plain utf-8 spelled utf-8 or utf8 (tokenize.detect_encoding follows the PEP 263 rule the
-    interpreter uses, so a cookie in any spelling on line 1 or 2 is covered); bytes that are not strict utf-8; any
-    control byte other than tab, LF and CRLF line ends (NUL, form feed, a lone CR and the rest) anywhere in the file;
-    and a line ending in a line-continuation backslash above the refusal. Module level statements are the only code
-    that runs when the file is started, so a dynamic import, eval, exec, a branch, a class body or a decorator above
-    the refusal cannot hide: any statement outside this whitelist is refused."""
+    the interpreter does. It is closed-world and fails closed, so it over-refuses rather than risk a miss. The exact rule,
+    each sentence pinned by pin_5590 (#5590):
+    a non-bytes argument is refused.
+    A utf-8 BOM is refused (detect_encoding reports it as utf-8-sig), alone or with any cookie.
+    A coding cookie on line 1 or 2 is judged after tokenize.detect_encoding's PEP 263 normalisation (the rule the
+    interpreter uses, so a cookie in any spelling on line 1 or 2 is covered). Accepted: utf-8 in any letter case, utf_8,
+    utf-8- followed by anything (so utf-8-sig WITHOUT a BOM is accepted: it names utf-8 for the interpreter too), and
+    exactly lower-case utf8. Refused: every other name, including UTF8 and Utf8 (the interpreter accepts them; this
+    check does not), utf-7, latin-1 and an unknown codec.
+    Bytes that are not strict utf-8 are refused.
+    Any control byte other than tab, LF and CRLF line ends (NUL, form feed, a lone CR and the rest) is refused anywhere
+    in the file.
+    Any line above the refusal that ends in a backslash is refused, whether it is a real line continuation or only the
+    last character of a comment.
+    Module level statements are the only code that runs when the file is started, so a dynamic import, eval, exec, a
+    branch, a class body or a decorator above the refusal cannot hide: any statement outside this whitelist is refused."""
     if not isinstance(source, (bytes, bytearray)):
         return "the source is not bytes"
     source = bytes(source)
@@ -1032,7 +1041,28 @@ def _self_test_cases() -> int:
             return "a plain utf-8 source was refused after the injected ast.parse was restored (#5589)"
         return ""
 
-    refusal_pins = {"#5510": pin_5510, "#5560": pin_5560, "#5562": pin_5562, "#5563": pin_5563, "#5588": pin_5588, "#5589": pin_5589}
+    def pin_5590():
+        # #5590: one assertion per sentence of the refusal_prefix_gap docstring, so the stated rule is the enforced rule.
+        refusal, hidden, plain = pin_sources()
+        accepted = {"UTF_8 cookie": b"# coding: UTF_8\n", "utf-8-sig cookie without a BOM": b"# coding: utf-8-sig\n",
+                    "utf-8-x cookie": b"# coding: utf-8-x\n", "upper-case UTF-8 cookie": b"# coding: UTF-8\n",
+                    "lower-case utf8 cookie": b"# coding: utf8\n", "utf_8 cookie": b"# coding: utf_8\n"}
+        for label, prefix in accepted.items():
+            if refusal_prefix_gap(prefix + plain):
+                return f"the docstring says a {label} is accepted but it was refused (#5590)"
+        refused = {"UTF8 cookie": (b"# coding: UTF8\n" + plain, "declares the encoding UTF8"),
+                   "Utf8 cookie": (b"# coding: Utf8\n" + plain, "declares the encoding Utf8"),
+                   "utf-8 BOM alone": (b"\xef\xbb\xbf" + plain, "declares the encoding utf-8-sig"),
+                   "utf-8 BOM and a utf-8-sig cookie": (b"\xef\xbb\xbf# coding: utf-8-sig\n" + plain, "declares the encoding utf-8-sig"),
+                   "a comment ending in a backslash": (b"# path C:\\\n" + plain, "ends with a line-continuation backslash"),
+                   "a comment ending in a backslash after a cookie": (b"# coding: utf-8\n# path C:\\\n" + plain, "ends with a line-continuation backslash")}
+        for label, (data, needle) in refused.items():
+            why = refusal_prefix_gap(data)
+            if needle not in why:
+                return f"the docstring says {label} is refused with {needle!r} but the reason was {why!r} (#5590)"
+        return ""
+
+    refusal_pins = {"#5510": pin_5510, "#5560": pin_5560, "#5562": pin_5562, "#5563": pin_5563, "#5588": pin_5588, "#5589": pin_5589, "#5590": pin_5590}
     for pin_issue, pin_check in refusal_pins.items():
         pin_failure = pin_check()
         if not pin_failure:
