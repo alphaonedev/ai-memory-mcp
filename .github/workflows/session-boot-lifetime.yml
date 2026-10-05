@@ -378,9 +378,12 @@ jobs:
                   refused by `Widener` with nothing mutated at all; where it cannot, both
                   address the NAME, so a swap between the scan and the widen means some
                   other inode is widened and is then set to the SCANNED entry's mode
-                  rather than to its own (#5812, #5813). The reopened inode is compared
-                  with the one that was scanned, so a swapped entry is reported instead
-                  of being cleared."""
+                  rather than to its own (#5812, #5813). EVERY descriptor this frame
+                  returns is compared against the inode that was scanned - the reopen
+                  after a widen and the ordinary open that needed none alike - so an
+                  entry replaced between the `lstat` that classified it and the `open`
+                  that acts on it is reported instead of being cleared, descended into,
+                  or given the scanned entry's mode (#5995)."""
                   flags = _OPEN_FLAGS | (os.O_DIRECTORY if want_dir else 0)
                   mode = stat.S_IMODE(st.st_mode)
                   needed = (stat.S_IRUSR | stat.S_IXUSR) if want_dir else stat.S_IRUSR
@@ -412,6 +415,13 @@ jobs:
                       finally:
                           widener.close()
                       return fd, mode
+                  opened = os.fstat(fd)
+                  if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                      # The name resolved to an inode the caller never classified. It is
+                      # closed and reported, never cleared and never descended into: its
+                      # flags, its mode and its contents are all somebody else's (#5995).
+                      os.close(fd)
+                      raise OSError(errno.EIO, "the entry was replaced while it was being inspected")
                   if want_dir and (mode & needed) != needed and self._ownable(st):
                       # Readable enough to open, not searchable enough to stat its
                       # entries (mode 0o400): widen on the descriptor, never by path.

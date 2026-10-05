@@ -280,6 +280,33 @@ def swap_after_the_widen(mod, swap):
         mod.os.chmod = real
 
 
+@contextlib.contextmanager
+def swap_before_the_open(mod, name, swap):
+    """Replace an entry between the `lstat` that classified it and the `open`
+    that acts on it (#5995).
+
+    `_walk` takes ONE `lstat` per entry and hands that struct down through
+    `_visit` to `_open_at`; file-or-directory, widen-or-not and which-mode-to-
+    put-back are all decided from it. Swapping from inside the `open` call
+    itself is that window exactly, with no timing assumption anywhere. Yields a
+    list that stays empty if the window was never reached, so a test cannot
+    pass by never racing anything."""
+    real = mod.os.open
+    fired = []
+
+    def opener(path, *args, **kwargs):
+        if path == name and not fired:
+            fired.append(True)
+            swap()
+        return real(path, *args, **kwargs)
+
+    mod.os.open = opener
+    try:
+        yield fired
+    finally:
+        mod.os.open = real
+
+
 class ScratchTreeCase(unittest.TestCase):
     """Every case gets `<repo>/.local-runs/.ws5657-*/` as a fake workspace whose
     own `.local-runs/.tmpAbC123/audit/audit.log` is the poisoned leftover."""
@@ -687,6 +714,55 @@ class ScratchTreeCase(unittest.TestCase):
             self.assertTrue(fired, "the seam never fired: the race window was never reached")
             self.assertEqual(stat.S_IMODE(os.lstat(victim).st_mode), 0o000,
                              "the widen was applied to a re-resolved name, not to the open descriptor")
+
+    def test_a_swapped_entry_is_never_given_another_inodes_mode_5995(self):
+        """#5995. The widen-and-reopen path proves its inode; the ORDINARY
+        open - the common case, the one that needed no widen at all - did not.
+
+        An entry replaced between the `lstat` that classified it and the `open`
+        that acts on it is a different inode with a mode of its own, and every
+        decision the walk then takes comes from a struct it no longer holds: it
+        reads and clears that stranger's flags, descends into it, widens it to
+        the SCANNED entry's mode and finally leaves it at the scanned entry's
+        mode for good - and reports none of it. `rename` is the only swap a
+        directory entry admits (`O_NOFOLLOW` already refuses a symlink and a
+        directory cannot be hardlinked), so this is the whole of the reachable
+        race for one."""
+        mod = load_script_module()
+        stranger = self.ws / "never-scanned.d"   # outside the scratch tree
+        stranger.mkdir(mode=0o750)
+        (stranger / "inner.log").write_text("{}\n")
+        entry = self.scratch / ".tmpS"
+        entry.mkdir()
+        (entry / "inner.log").write_text("{}\n")
+        moved = self.ws / "moved-away.d"
+        seen = {}
+
+        def swap():
+            # A directory at 0o400 cannot be renamed at all (`rename(2)` needs
+            # write on the source directory to update its `..`), and a
+            # directory left at 0o400 is what wedges the next checkout
+            # (#5814) - so the mode comes off before the move, which the walk
+            # cannot see either way: it took its `lstat` before this ran.
+            os.chmod(entry, 0o700)
+            os.rename(entry, moved)
+            os.rename(stranger, entry)
+            # `rename` bumps the ctime itself, so the only honest baseline is
+            # the one taken after the swap and before the janitor can act.
+            seen["mode"] = stat.S_IMODE(os.lstat(entry).st_mode)
+            seen["ctime"] = os.lstat(entry).st_ctime_ns
+
+        with restrictive(entry, 0o400):
+            with swap_before_the_open(mod, ".tmpS", swap) as fired:
+                rc, out, err = run_clear_in_process(mod, self.ws)
+            self.assertTrue(fired, "the seam never fired: the race window was never reached")
+            self.assertEqual(seen.get("mode"), 0o750, "the swap itself did not land: %r" % (seen,))
+            self.assertEqual(stat.S_IMODE(os.lstat(entry).st_mode), 0o750,
+                             "an inode the walk never scanned was left at the scanned entry's mode")
+            self.assertEqual(os.lstat(entry).st_ctime_ns, seen.get("ctime"),
+                             "an inode the walk never scanned was chmod'ed and then put back")
+            self.assertNotEqual(rc, 0, "a replaced entry is not a pass:\n" + out + err)
+            self.assertIn(".tmpS", err)
 
 
 # --------------------------------------------------------------------------
