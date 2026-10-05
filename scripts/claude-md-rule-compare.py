@@ -537,6 +537,14 @@ def refusal_prefix_gap(source: bytes) -> str:
     return ""
 
 
+def numbered_rules(doc) -> set:
+    """#5622/#5674: the R<n> rule numbers of a docstring: every line that starts with `R<n>:` once its own leading and
+    trailing whitespace is removed. Each line is stripped on its own, so the result does not depend on whether the
+    compiler removed the common indentation (3.13 and later do, 3.12 and older do not)."""
+    found = (re.match(r"(R\d+):", line.strip()) for line in (doc or "").split("\n"))
+    return {match.group(1) for match in found if match}
+
+
 def selftest_dir() -> Path:
     """#5384: the scratch directory of this process's self-test, under the repo's .local-runs (never /tmp)."""
     return Path(__file__).resolve().parent.parent / ".local-runs" / f"rule-compare-selftest-{os.getpid()}"
@@ -1163,7 +1171,18 @@ def _self_test_cases() -> int:
         marker.unlink(missing_ok=True)
         if not refusal_prefix_gap(f'"""doc"""\nopen({str(marker)!r}, "w").close()\nimport sys\n'.encode() + tail) or marker.exists():
             return "the docstring says the source is never executed but a statement above the refusal ran or was not refused (#5624)"
-        numbered = set(re.findall(r"^\s+(R\d+):", refusal_prefix_gap.__doc__ or "", re.M))
+        # #5674: 3.13 and later remove the common indentation of a docstring at compile time (3.12 and older keep it),
+        # so the rule numbers must read the same from both forms. Both forms are built here on every interpreter.
+        doc_lines = (refusal_prefix_gap.__doc__ or "").split("\n")
+        indents = [len(line) - len(line.lstrip()) for line in doc_lines[1:] if line.strip()]
+        dedented = "\n".join(doc_lines[:1] + [line[min(indents or [0]):] for line in doc_lines[1:]])
+        indented = "\n".join(dedented.split("\n")[:1] + ["    " + line for line in dedented.split("\n")[1:]])
+        if not re.search(r"^R1:", dedented, re.M) or not re.search(r"^    R1:", indented, re.M):
+            return "the 3.13-form and 3.12-form docstrings were not built with R1 at column 0 and at column 4 (#5674)"
+        numbered = numbered_rules(refusal_prefix_gap.__doc__)
+        for label, form in (("3.13 dedented", dedented), ("3.12 indented", indented)):
+            if numbered_rules(form) != numbered:
+                return f"the {label} docstring numbers the rules {sorted(numbered_rules(form))}, not {sorted(numbered)} (#5674)"
         if not numbered or numbered != asserted:
             return f"the docstring numbers the rules {sorted(numbered)} but pin_5590 asserts {sorted(asserted)} (#5622)"
         return ""
