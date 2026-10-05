@@ -249,7 +249,7 @@ def defs_of(rev):
 
 def resolve(rev, assertions):
     """Replace every `@NAME` with the tree-wide value: exactly one definition -> its value; none -> `?NAME#unresolved`;
-    several (two files define the name) -> `?NAME#ambiguous`. Closed-world: a name that cannot be resolved to ONE integer
+    several (two files define the name) -> `?NAME#ambiguous(<every value>)`, so a bump of either definition still moves it. Closed-world: a name that cannot be resolved to ONE integer
     is never read as 'unchanged' (#5578)."""
     out = {}
     for k, vals in assertions.items():
@@ -257,7 +257,7 @@ def resolve(rev, assertions):
         for v in vals:
             if v.startswith('@'):
                 ds = defs_of(rev).get(v[1:], [])
-                v = ds[0][1] if len(ds) == 1 else (f'?{v[1:]}#ambiguous' if ds else f'?{v[1:]}#unresolved')
+                v = ds[0][1] if len(ds) == 1 else (f"?{v[1:]}#ambiguous({','.join(sorted(x[1] for x in ds))})" if ds else f'?{v[1:]}#unresolved')
             rv.add(v)
         out[k] = rv
     return out
@@ -618,6 +618,7 @@ def selftest():
                         ('a token in upper case', 'SECTIONS', False)]:
         case('what = %s (%s)' % (w, lbl), one_decl(w), red, ['sections.len()  18 -> 19'] if red else ())
     case('what = a token plus free prose of 3+ characters', one_decl('sections trail test'), False)
+    case('what = a good token plus a punctuation-only word is refused', one_decl('sections ..'), True)
     case('what = the hit path plus a token', one_decl('tests/f.rs sections'), False)
     case('what = the hit path alone names nothing', one_decl('tests/f.rs'), True)
     case('what = a token plus a two-letter word is refused', one_decl('sections to'), True)
@@ -675,6 +676,8 @@ def selftest():
     case('a nested-call left side with a comma is seen', typed('18', '19', None, 'f(a, b).len()'), True, ['f(a,b).len()  18 -> 19'])
     case('a turbofish left side with a comma is seen', typed('18', '19', None, 'v.iter().collect::<HashMap<K, V>>().len()'), True)
     case('a trailing message argument does not hide the literal', typed('18', '19', None, 'sections.len()'), True)
+    case('a call right-hand side with a comma is read whole', typed('max(18, 19)', 'max(18, 20)'), True, ['?max(18,19) -> ?max(18,20)'])
+    case('a turbofish right-hand side with a comma is read whole', typed('size_of::<HashMap<K, V>>()', 'size_of::<HashMap<K, W>>()'), True, ['K,V', 'K,W'])
     def c_added_expr(s, b):
         s.w('tests/typed.rs', 'fn t() { assert_eq!(a.len(), 1); }\n'); t0 = s.commit('test: add')
         s.w('tests/typed.rs', 'fn t() { assert_eq!(a.len(), 1); assert_eq!(x.len(), y.len()); }\n'); s.commit('test: add a length comparison'); return t0 + '..HEAD'
@@ -713,6 +716,10 @@ def selftest():
     case('a const whose value is an expression moves as an undecidable spelling',
          shared(A('crate::EXPECTED_N'), 'pub const EXPECTED_N: usize = 9 + 9;\n', 'pub const EXPECTED_N: usize = 9 + 10;\n'), True, ['?9+9 -> ?9+10'])
     case('a shared const bumped that no assertion uses is no move', shared('fn t() {}\n', L(18), L(19)), False)
+    case('a QUALIFIED name is never the local const of the same spelling',
+         shared('const EXPECTED_N: usize = 5;\n' + A('crate::EXPECTED_N'), L(18), L(19)), True, ['#ambiguous(18,5) -> ?EXPECTED_N#ambiguous(19,5)'])
+    case('a shared const bumped while the asserting file is also edited is ONE move, declared once',
+         shared(A('crate::EXPECTED_N') + '// a\n', L(18), L(19), None, {SH: A('crate::EXPECTED_N') + '// b\n'}, 'sections 18 -> 19'), False)
     case('a local const of the same name shadows the shared one',
          shared('const EXPECTED_N: usize = 5;\n' + A('EXPECTED_N'), L(18), L(19)), False)
     case('a shared const unchanged while its file changes is no move', shared(A('crate::EXPECTED_N'), L(18) + '// a\n', L(18) + '// b\n'), False)
