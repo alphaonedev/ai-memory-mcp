@@ -1832,6 +1832,18 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
         if rc != 0:
             bad.append("run() judged an unchanged allow entry again in a renamed frozen file (%d): %s"
                        % (rc, out.strip()[:160]))
+        # #5295: the text of a pending row added in THIS change (pending at head, not at the base) is
+        # not approved by a new allow entry in another file either
+        from_base2("head pending")
+        (t / "d.sh").write_text("#!/bin/bash\n%s\n" % nl)
+        (t / "e.sh").write_text("#!/bin/bash\n%s\n" % nl)
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n" % (ok_line, pl))
+        rows([("a.sh", ok_line), ("c.sh", pl), ("d.sh", nl)], [("a.sh", pl), ("e.sh", nl)])
+        commit_all("a pending row and a new allow entry with the same text in one change")
+        rc, out = gate(EXEC_SECRET_ARGV_BASE=base2)
+        if rc != 1 or "pending in a file" not in out:
+            bad.append("run() let a new allow entry approve a text that is pending only at head (%d): %s"
+                       % (rc, out.strip()[:160]))
         # #5299 (5-agent vote 4d3ea1c5): a pending row that an earlier change removed may not come back
         # as an allow entry with its exact text; the merge base no longer has the row, only history does
         from_base2("hist fix")
@@ -1991,6 +2003,15 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
         bad.append("a runaway array was joined without a fault (#4901)")
     except RuntimeError:
         pass
+    # #5295: allow_text_pending_elsewhere reads the pending rows at the base AND at head (each half alone)
+    n += 1
+    ent = [("reason: r", "b.sh", 1, "x --token $T", 5)]
+    row = [("#1", "a.sh", 1, "x --token $T", 3)]
+    if len(allow_text_pending_elsewhere(ent, [], [], row, {})) != 1:
+        bad.append("a new allow entry was not refused for a text pending only at head (#5295)")
+    n += 1
+    if len(allow_text_pending_elsewhere(ent, [], row, [], {})) != 1:
+        bad.append("a new allow entry was not refused for a text pending only at the base (#5295)")
     # #4919/#4996: an allow entry for a line that was pending at the base is refused, also when
     # the file was edited or renamed in the same change; a changed line (a new key) is not
     n += 3
