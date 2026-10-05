@@ -947,6 +947,36 @@ def _self_test_cases() -> int:
     census_case("a census number followed by U+0000 is a rule change (#5425)",
                 "has 103 MCP tools", "has 10\x00 MCP tools")
 
+    # Further mutants of the same lines (round 10): a pattern or comparison weakened in a way no case above caught.
+    # N2 (one whitespace, not a run): a census number followed by two spaces is still a census number.
+    census_case("a census count change across a double space is still COUNT CHANGED (#5426)",
+                "has 103 MCP tools", "has 104  MCP tools", "has 103 MCP tools", "has 103  MCP tools", want_fail=False)
+    # N8 (digit run capped at three): a four-digit count is a census number too.
+    census_case("a four-digit census count change is still COUNT CHANGED (#5426)",
+                "has 103 MCP tools", "has 1040 MCP tools", "has 103 MCP tools", "has 1030 MCP tools",
+                want_fail=False)
+    # N3 (a census phrase dropped from the alternation): the route and URL-path phrases are census counts.
+    census_case("route and URL-path census counts change as COUNT CHANGED (#5426)",
+                "has 103 MCP tools", "has 104 MCP tools, 104 production HTTP route registrations, 90 unique URL paths",
+                "has 103 MCP tools", "has 103 MCP tools, 103 production HTTP route registrations, 89 unique URL paths",
+                want_fail=False)
+    # N6 (case-insensitive census words): a lower-case words run is not a census phrase.
+    census_case("a count before lower-case census words is a rule change (#5426)",
+                "has 103 MCP tools", "has 104 mcp tools", "has 103 MCP tools", "has 103 mcp tools")
+    # N7 (no word boundary after the census words): a census word glued to more letters is not a census phrase.
+    census_case("a count before census words with a glued suffix is a rule change (#5426)",
+                "has 103 MCP tools", "has 104 MCP toolsX", "has 103 MCP tools", "has 103 MCP toolsX")
+    # N11 (compare the pieces sorted): the text between the numbers moved to another place is a rule change.
+    census_case("census text between the numbers reordered is a rule change (#5426)",
+                "103 MCP tools and 99 CLI subcommands (97 in the default build)",
+                "103 CLI subcommands (99 MCP tools and 97 in the default build)")
+    # N12/N13 (strip or collapse the pieces): whitespace between a number and its words is rule text.
+    census_case("extra whitespace between a census number and its words is a rule change (#5426)",
+                "has 103 MCP tools", "has 103   MCP tools")
+    # N14 (case-fold the pieces): a case change in the text between the numbers is a rule change.
+    census_case("a case change in census prose is a rule change (#5426)",
+                "A vote needs 5 agents.", "a vote needs 5 agents.")
+
     # #5375: the docstring says what the code does: the census exemption is a heading PREFIX match.
     doc_words = " ".join((__doc__ or "").split())
     if f"inside a section whose heading starts with `{CENSUS_SECTION}`" in doc_words:
