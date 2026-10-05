@@ -815,8 +815,9 @@ or overclaim).
   head-hash anchor's `canonical_chain_bytes` deliberately excludes
   `prev_hash`, so it commits only to the anchored row, not the whole
   prefix — nor the up-to-`WATERMARK_INTERVAL`−1 (=63) un-anchored
-  rows above the last watermark. See `CLAUDE.md`'s `signed_events`
-  paragraph for the full residual-2 scoping; the off-host
+  rows above the last watermark. See the `signed_events.rs` row of the
+  Key Modules table in `docs/reference/ARCHITECTURE_REFERENCE.md` for
+  the full residual-2 scoping; the off-host
   `AI_MEMORY_LOG_SINK=syslog` tier (or a future rolling/accumulator
   hash committing the whole prefix) is the residual-closing control
   for a hostile host.
