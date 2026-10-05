@@ -26,10 +26,17 @@ RULES ENFORCED (all closed-world: a trigger the reader cannot parse is a FAILURE
          quotes inside, tags, ``?``, ``+``, ``[``, backslash and alias-like
          ``*name`` items are undecidable and fail.  A push trigger with no
          ``branches`` and no ``tags`` key matches every branch and counts.
-  R-SHAPE (#5660) a tab, NBSP, form feed or BOM-led line, a lone CR or a YAML 1.1
-         line-break character inside the ``on:`` block fails; so does a
-         ``pull_request`` / ``push`` trigger that does not use only the keys
-         branches, tags, paths, paths-ignore, types; ``branches`` must be an
+  R-SHAPE (#5660, #5667, #5668, #5705-#5708) the whole file is read closed-world:
+         each line must be blank, a comment, a block scalar content line, one
+         leading ``---``, or a mapping-key row or sequence entry whose quoted
+         scalars and flow collections close on that row, with no backslash in
+         a double-quoted and no doubled quote in a single-quoted scalar.  Any
+         other line fails, and so do a lone CR, another line-break character,
+         a control character or inner BOM, a repeated top-level key and a
+         top-level YAML 1.1 boolean key other than ``on`` (bare or quoted).
+         Under ``on:`` a ``pull_request`` / ``push`` trigger fails when it
+         does not use only the keys branches, tags, paths, paths-ignore,
+         types; ``branches`` must be an
          inline list or a block list.  Anything else (branches-ignore, scalar
          ``on:`` forms, flow-style ``on:``, an unterminated list) fails.
 
@@ -106,7 +113,9 @@ def _parse_inline_list(text: str) -> List[str]:
     return [_unquote(p) for p in pieces]
 
 
-# Characters YAML 1.1 parsers treat as a line break besides LF/CR (PyYAML does).
+# Line-break and separator characters other than LF and CR. PyYAML 6 reads NEL,
+# U+2028 and U+2029 as line breaks and refuses the other six as non-printable;
+# the reader refuses all nine (#5707).
 _EXOTIC_BREAKS = "\x0b\x0c\x1c\x1d\x1e\x1f\x85  "
 # Control characters, noncharacters, and a BOM anywhere but the stream start.
 _FORBIDDEN = re.compile("[\x00-\x08\x0e-\x1f\x7f-\x9f﻿￾￿]")
@@ -117,7 +126,7 @@ _FLOW_OPENERS = ("", "[", "{", ",", ":")
 
 
 def _space_like(ch: str) -> bool:
-    """True for a tab and any Unicode space, separator or format character."""
+    """True for a tab and any Unicode space, separator, control or format character."""
     return ch == "\t" or ch.isspace() or unicodedata.category(ch) in ("Zs", "Zl", "Zp", "Cc", "Cf")
 
 
@@ -254,14 +263,16 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
 
     Every line must be accepted by a positive rule: a blank line, a comment line, a
     content line of a block scalar (indented past its owner, no whitespace other
-    than ASCII space before its first character), a single leading or trailing
-    document marker row, or a structure row that _scan_row accepts. A structure row
-    starts with printable ASCII after ASCII-space indentation and holds no tab.
+    than ASCII space before its first character), a column-0 ``---`` or ``...``
+    row (which _check_top_level accepts only as one leading ``---``), or a
+    structure row that _scan_row accepts. A structure row starts with printable
+    ASCII after ASCII-space indentation and holds no tab.
     """
     if re.search(r"\r(?!\n)", text):
         raise Unparsed("lone carriage return line break")
     if any(ch in _EXOTIC_BREAKS for ch in text):
-        raise Unparsed("YAML 1.1 line-break character (form feed, NEL, U+2028/9, ...)")
+        bad = next(ch for ch in text if ch in _EXOTIC_BREAKS)
+        raise Unparsed("line-break character other than LF or CR LF: U+%04X" % ord(bad))
     bad = _FORBIDDEN.search(text)
     if bad:
         raise Unparsed("control character, noncharacter or inner BOM: U+%04X" % ord(bad.group()))
@@ -319,9 +330,9 @@ def _check_top_level(rows: List[Tuple[int, str, str]]) -> None:
     unquoted. A key whose folded spelling is a YAML 1.1 boolean (y, yes, n, no,
     true, false, on, off) is accepted only when spelled exactly on, "on" or 'on',
     so no two boolean spellings can form a duplicate the reader misses (#5708).
-    Document markers, directives, sequences, complex keys, merge keys, anchors,
-    tags, flow collections and an unclosed quote at the top level are all
-    refused, because a YAML reader would read them differently.
+    Every other document marker, a directive, a sequence entry, a complex key, a
+    merge key, an anchor, a tag and a flow collection at the top level is
+    refused, because the reader does not model them.
     """
     seen: Set[str] = set()
     for idx, (ind, body, key) in enumerate(rows):
@@ -943,7 +954,11 @@ class DuplicateKeys5666(unittest.TestCase):
 
 
 class DuplicateTopLevel5667(unittest.TestCase):
-    """#5667: a repeated top-level key (any quoting or case; on/true/yes are one key) is Unparsed."""
+    """#5667: a repeated top-level key (compared unquoted and case-folded) is Unparsed.
+
+    Since #5708 a second on spelled true, yes or On is refused as a YAML 1.1
+    boolean key before the repeat check sees it.
+    """
 
     TAIL = "  push:\n    branches: ['rehearsal/x']\n"
 
@@ -991,7 +1006,10 @@ class DuplicateTopLevel5667(unittest.TestCase):
 
 
 class TopLevelShapes5668(unittest.TestCase):
-    """#5668: every indent-0 row must be a plain mapping key; anything else is Unparsed."""
+    """#5668: every indent-0 row except one leading --- must be a mapping key, else Unparsed.
+
+    The key is a bare word or an escape-free quoted word (TOP_KEY).
+    """
 
     def _shape(self, text: str) -> None:
         got = violations("x.yml", text)
@@ -1096,9 +1114,10 @@ class TypesScalar5669(unittest.TestCase):
 class ClosedWorld5705(unittest.TestCase):
     """#5705: every line needs a positive rule; a line no rule accepts is Unparsed.
 
-    Each reproducer that ends with an on: block YAML reads differently returned no
-    violation at b5bcf59b9. The PyYAML 6.0.1 view quoted in a comment was measured
-    with yaml.safe_load on the same text.
+    Measured against the reader at b5bcf59b9: every refusal case here except
+    test_5705_form_feed_and_vertical_tab_mid_row failed there, and the clean
+    cases passed. Each PyYAML 6.0.1 view quoted in a comment was measured with
+    yaml.safe_load on the same text.
     """
 
     J = "jobs:\n  a:\n    runs-on: x\n"
@@ -1140,7 +1159,8 @@ class ClosedWorld5705(unittest.TestCase):
         self._shape("name: x\non:\n" + GOOD_PR + "zz:\t{}\n" + self.J, "tab on a structure row")
 
     def test_5705_nested_multiline_quote_hides_column_0_rows(self) -> None:
-        # PyYAML: jobs.a.name swallows the on: rows; the file has no on key at all.
+        # PyYAML: in the first text jobs.a.name swallows the on: rows and the file has
+        # no on key at all. The second text is a PyYAML ParserError; both are refused.
         self._shape("name: x\njobs:\n  a:\n    name: \"a\non:\n" + GOOD_PR + "zz: 1 #\"\n    runs-on: x\n",
                     "does not close on its row")
         self._shape("name: x\njobs:\n  a:\n    - 'a\non:\n" + GOOD_PR + "zz: 1 #'\n", "does not close on its row")
@@ -1244,7 +1264,8 @@ class BooleanKeys5708(unittest.TestCase):
         self.assertTrue(any("R-SHAPE" in v and "YAML 1.1 boolean" in v for v in got), got)
 
     def test_5708_false_family_pairs(self) -> None:
-        # PyYAML: off and no (and false) are the same False key.
+        # PyYAML: off and no are one False key. YAML 1.1 also reads false and n as one
+        # key; PyYAML reads n as a string.
         self._shape("off: 1\nno: 2\non:\n" + GOOD_PR)
         self._shape("false: 1\nn: 2\non:\n" + GOOD_PR)
 
@@ -1260,6 +1281,39 @@ class BooleanKeys5708(unittest.TestCase):
     def test_5708_on_spellings_stay_clean(self) -> None:
         for key in ("on", '"on"', "'on'"):
             self.assertEqual([], violations("x.yml", "name: x\n" + key + ":\n" + GOOD_PR), key)
+
+
+class DocTruth5707(unittest.TestCase):
+    """#5707: each reason the reader gives, and each claim its comments make, is measured.
+
+    Every refused line-break character is named by its code point, and none of
+    them is called a YAML 1.1 line break: YAML 1.1 breaks only on LF, CR, NEL,
+    U+2028 and U+2029, while form feed, vertical tab and U+001C..U+001F are refused
+    because str.splitlines (or, for U+001F, the YAML printable set) disagrees.
+    """
+
+    BREAKS = ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x1f", "\x85", " ", " ")
+
+    def test_5707_each_extra_line_break_is_named_by_code_point(self) -> None:
+        for ch in self.BREAKS:
+            got = violations("x.yml", "name: a" + ch + "b\non:\n" + GOOD_PR)
+            code = "U+%04X" % ord(ch)
+            self.assertTrue(any("R-SHAPE" in v and code in v and "YAML 1.1" not in v for v in got),
+                            (code, got))
+
+    def test_5707_document_markers_only_one_leading_start(self) -> None:
+        # _meaningful keeps column-0 markers as rows; _check_top_level accepts only a
+        # leading ---. A trailing --- or ... is refused like any other marker.
+        self.assertEqual([], violations("x.yml", "---\nname: x\non:\n" + GOOD_PR))
+        for tail in ("---\n", "...\n", "--- # c\n", "... # c\n"):
+            got = violations("x.yml", "name: x\non:\n" + GOOD_PR + tail)
+            self.assertTrue(any("R-SHAPE" in v and "not a plain mapping key" in v for v in got), (tail, got))
+
+    def test_5707_space_like_covers_control_and_format_characters(self) -> None:
+        for ch in ("\t", " ", " ", " ", "\x85", "\x01", "​", "‎"):
+            self.assertTrue(_space_like(ch), repr(ch))
+        for ch in ("a", "#", "-", "é"):
+            self.assertFalse(_space_like(ch), repr(ch))
 
 
 class GlobSemantics5447(unittest.TestCase):
