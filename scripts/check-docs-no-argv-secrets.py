@@ -148,27 +148,29 @@ What the gate does NOT claim:
     store-url-expansion to array-element-operand run on every text file,
     prose and .tf, .py and .rs sources included (xtrace-secret on .sh, .tpl,
     .yaml and .yml; cloud-init-readable-secret on .tpl, .yaml and .yml);
-    argv-credential-shape reads shell-like files and the shell-like fences of
-    a .md file, never .md prose outside a fence.
+    argv-credential-shape reads shell-like files and, in a .md file, the
+    shell-like fences, the indented code blocks and the inline code spans,
+    never the prose words outside them (#5906).
   * changelog.d/, docs/reviews/, docs/handoff/ and CHANGELOG.md are records,
     not recommendations, and are skipped.
 
+A credential by one program's convention (a short flag such as
+``mysql -pVALUE`` or ``redis-cli -a VALUE``, ``user:pass`` after ``curl -u``,
+a bare positional secret such as ``vault login VALUE``, a credential in a
+``python3 -c`` string) is read only for the programs of the per-head table
+HEAD_CRED_ROWS; another program's convention is not read (#5725).
+
 STATED LIMITS. Shapes no rule reads; each is pinned as missed by a
 ``--self-test`` row (R11_SHAPE_LIMITS), so closing one must update this list
-and the changelog (Refs #5725):
+and the changelog:
 
-  * a short flag that is a password only by one program's convention
-    (``mysql -pVALUE``, ``redis-cli -a VALUE``, ``skopeo login -p VALUE``,
-    ``az login -p VALUE``);
-  * ``user:pass`` after ``-u`` (``curl -u``);
-  * a bare positional secret (``vault login VALUE``, the keys of
-    ``mc alias set``);
   * a flag or name that is only ``key``, ``auth`` or ``cred`` (``--key VALUE``,
     ``--auth VALUE``), the client, private and tls key spellings
     (``--client-key VALUE``) and a ``NAME=VALUE`` whose whole NAME is ``pass``:
     in most programs they name a file, a mode or a test counter (#5847);
-  * a credential inside a non-shell ``-c`` string (``python3 -c``);
-  * .md prose outside a fenced block, for argv-credential-shape.
+  * .md prose words outside a fence, an indented code block and an inline
+    code span, and an HTML code element (``<code>``), for
+    argv-credential-shape (#5906).
 
 STATED FALSE POSITIVE (fail closed, kept by the 5-agent vote (4d3ea1c5) on
 #5845): under a head the gate cannot decide (``$RSYNC``), the word after a
@@ -2503,9 +2505,9 @@ def operand_rule_hit(hit: Hit) -> bool:
 
 
 # #5725 (round 11): the closed credential shapes, read on every command of a shell-like file and
-# of a shell fence in a .md file, whatever its program (STATED LIMITS: a short flag that is a
-# password only by one program's convention, a bare positional secret, user:pass after -u, a
-# credential inside a non-shell -c string, and prose outside a fence are not read).
+# of a shell fence, an indented code block or an inline code span in a .md file, whatever its
+# program (STATED LIMIT #5906: prose words outside them are not read). A credential by one
+# program's convention is read by HEAD_CRED_ROWS for its programs only (#5725).
 # #5837 (round 12): the words are in two sets. A LONG word ends a name whatever precedes it
 # (dbpassword, my_secret); a SHORT word ends a name only as a whole name part, at the start or
 # after _ . or - (pass, db_pw, api-key; never bypass, compass or ppw). STATED LIMITS (#5847): a
@@ -2517,7 +2519,7 @@ SECRET_WORD_SHORT = (r"(?:pass|pwd|pw|creds|api[_.-]?key|access[_.-]?key|secret[
                      r"|auth[_.-]?key|account[_.-]?key|master[_.-]?key|sas[_.-]?key)")
 SECRET_WORD = r"(?:%s|%s)" % (SECRET_WORD_LONG, SECRET_WORD_SHORT)
 SHAPE_FLAG_RE = re.compile(r"--?(?:[A-Za-z0-9]+[_.-])*" + SECRET_WORD + r"(?:=(?P<v>.*))?\Z", re.I)
-SHAPE_ASSIGN_RE = re.compile(r"(?:--?[A-Za-z][\w.-]*=)?(?:[A-Za-z_][\w.-]*?" + SECRET_WORD_LONG
+SHAPE_ASSIGN_RE = re.compile(r"(?:--?[A-Za-z][\w.-]*=)?(?:(?:[A-Za-z_][\w.-]*?)?" + SECRET_WORD_LONG
                              + r"|(?:[A-Za-z_][\w.-]*?[_.-])?" + SECRET_WORD_SHORT + r")=(?P<v>.+)\Z", re.I)
 SHAPE_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/@:]*:(?P<v>[^\s/@]+)@")
 # #5837: a header that carries a credential: Authorization, an API key, an auth, access, vault or
@@ -2537,9 +2539,13 @@ MD_SHELL_FENCES = frozenset({"", "bash", "sh", "shell", "console", "zsh", "shell
 
 def md_shell_view(text: str) -> Tuple[str, List[Tuple[int, int]]]:
     """#5725: the .md text with every character outside a shell-like fenced block blanked (newlines
-    kept), so offsets and lines stay valid; an unclosed fence runs to the end of the file. #5902:
-    with the (start, end) span of each fence body, a shell text of its own."""
+    kept), so offsets and lines stay valid; an unclosed fence runs to the end of the file. #5789:
+    outside every fenced block, an indented code block and the inside of an inline code span are
+    kept too; the backticks that open and close a span read as ';', so each span is a command of
+    its own, and a newline inside a span reads as a space. #5902: with the (start, end) span of
+    each fence body, indented block and code span, in order; each is a shell text of its own."""
     keep = bytearray(len(text))
+    fenced = bytearray(len(text))
     spans: List[Tuple[int, int]] = []
     pos = 0
     while True:
@@ -2551,8 +2557,72 @@ def md_shell_view(text: str) -> Tuple[str, List[Tuple[int, int]]]:
         if m.group(2).lower() in MD_SHELL_FENCES:
             keep[m.end():body_end] = b"\x01" * (body_end - m.end())
             spans.append((m.end(), body_end))
-        pos = close.end() if close else len(text)
-    return "".join(c if keep[i] or c == "\n" else " " for i, c in enumerate(text)), spans
+        block_end = close.end() if close else len(text)
+        fenced[m.start():block_end] = b"\x01" * (block_end - m.start())
+        pos = block_end
+    out = [c if keep[i] or c == "\n" else " " for i, c in enumerate(text)]
+    spans.extend(md_code_spans(text, fenced, out))
+    return "".join(out), sorted(spans)
+
+
+MD_LIST_ITEM_RE = re.compile(r" {0,3}(?:[-*+]|\d{1,9}[.)])(?:[ \t]|\Z)")
+MD_BLANK_RUN_RE = re.compile(r"\n[ \t]*\n")
+
+
+def md_code_spans(text: str, fenced: bytearray, out: List[str]) -> List[Tuple[int, int]]:
+    """#5789: copy the indented code blocks and the inline code spans of the .md text outside the
+    fenced blocks into out. An indented code block is a run of lines indented four columns after a
+    blank line, outside a list (a list item's indented lines are its paragraphs). A code span is a
+    backtick run closed by a run of the same length in the same paragraph. Returns the span of each
+    indented block and each code span."""
+    prose = bytearray(len(text))
+    spans: List[Tuple[int, int]] = []
+    prev_blank, in_code, in_list = True, False, False
+    start = 0
+    for line in text.split("\n"):
+        end = start + len(line)
+        if start < len(text) and fenced[start]:
+            prev_blank, in_code = False, False
+        elif not line.strip():
+            prev_blank = True
+        elif (line.startswith("    ") or line.startswith("\t")) and (in_code or prev_blank) and not in_list:
+            out[start:end] = list(line)
+            if in_code:
+                spans[-1] = (spans[-1][0], end)
+            else:
+                spans.append((start, end))
+            in_code, prev_blank = True, False
+        else:
+            if MD_LIST_ITEM_RE.match(line):
+                in_list = True
+            elif prev_blank and not line[:1].isspace():
+                in_list = False
+            stop = min(end + 1, len(text))
+            prose[start:stop] = b"\x01" * (stop - start)
+            in_code, prev_blank = False, False
+        start = end + 1
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "`" or not prose[i] or (i and text[i - 1] == "\\"):
+            i += 1
+            continue
+        j = i
+        while j < n and text[j] == "`":
+            j += 1
+        run = j - i
+        stop = MD_BLANK_RUN_RE.search(text, j)
+        limit = stop.start() if stop else n
+        close = re.compile(r"(?<!`)`{%d}(?!`)" % run).search(text, j, limit)
+        if not close or not all(prose[j:close.start()]):
+            i = j
+            continue
+        out[i] = ";"
+        out[close.start()] = ";"
+        for k in range(j, close.start()):
+            out[k] = " " if text[k] == "\n" else text[k]
+        spans.append((i, close.end()))
+        i = close.end()
+    return spans
 
 
 def blank_shell_comments(text: str) -> str:
@@ -2622,20 +2692,26 @@ def shape_word(text: str, word: Word) -> str:
 
 
 def shape_operands(text: str, words: List[Word], array: bool) -> List[Word]:
-    """The words of a command that reach an exec argv as operands: after the reserved words, the
+    """The operands of shape_command."""
+    return shape_command(text, words, array)[1]
+
+
+def shape_command(text: str, words: List[Word], array: bool) -> Tuple[Optional[Word], List[Word]]:
+    """The head word (None for an array body or an argument list) and the words of a command that
+    reach an exec argv as operands: after the reserved words, the
     assignments and the document markers before the head. Every comment is blanked first
     (blank_shell_comments) except one at the head of a backtick command (echo `#x ..`), cut here:
     a # word right after a backtick (the tokenizer keeps a word whole after a closing one, so
     that one never heads a command). Any other # word is glued to the text before it (a
     line continuation, #5883, or a ')' the tokenizer splits at, #5887) and is not a comment."""
     if array:
-        return words
+        return None, words
     k = 0
     while k < len(words):
         raw = text[words[k][0]:words[k][1]]
         w0 = words[k][0]
         if raw.startswith("#") and text[w0 - 1:w0] == "`":
-            return []
+            return None, []
         # DOC_MARKERS holds the YAML list marker "-".
         if (ASSIGN_RE.match(raw) or raw in SKIPPED_KEYWORDS or raw == "time" or raw in DOC_MARKERS
                 or LIST_NUMBER_RE.fullmatch(raw) or raw.endswith(":")):
@@ -2643,17 +2719,17 @@ def shape_operands(text: str, words: List[Word], array: bool) -> List[Word]:
             continue
         break
     if k >= len(words):
-        return []
+        return None, []
     first = shape_word(text, words[k])
     # #5875: eval runs its operands as a command line; they are not an argv of their own.
     if first == "eval":
-        return shape_operands(text, words[k + 1:], False)
+        return shape_command(text, words[k + 1:], False)
     # A builtin only as a bare command word: /bin/echo is a program, and its argv is visible.
     if first in SHAPE_NON_EXEC_HEADS:
-        return []
+        return None, []
     # No program is named with a leading dash: a first word that is an option is an argument
     # list item (a YAML args: entry), so it is an operand itself.
-    return words[k:] if first.startswith("-") else words[k + 1:]
+    return (None, words[k:]) if first.startswith("-") else (words[k], words[k + 1:])
 
 
 def shape_hit(text: str, ops: List[Word]) -> Optional[Tuple[int, str]]:
@@ -2675,6 +2751,168 @@ def shape_hit(text: str, ops: List[Word]) -> Optional[Tuple[int, str]]:
                 continue
             if m and shape_value(m.group("v")):
                 return w[0], m.group("v")
+    return None
+
+
+# #5725 part B (round 12): the per-head credential table. A program whose credential is a short
+# flag by its own convention, a USER:SECRET or USER%SECRET value, a pass: prefix, a positional
+# operand, a NAME VALUE pair or a name inside its program text. Each row is (heads, the leading
+# positional words, reads); a read is one of
+#   ("opt", flags, form)    the value of the flag: form "sep" (the next word), "att" (glued to a
+#                           short flag, -pVALUE) or "both";
+#   ("split", flags, sep)   the flag value is USER<sep>SECRET, and SECRET is read;
+#   ("prefix", flags, pre)  the flag value is pre + SECRET (openssl -passin pass:SECRET);
+#   ("pos", index)          the positional operand at index, after the leading words;
+#   ("pair", name_re)       the word after a word whose name matches, or NAME=VALUE in one word;
+#   ("code", flags)         the program text of the flag, read for NAME = "literal", NAME:
+#                           "literal" and URL passwords;
+#   ("htpasswd",)           the password operand of htpasswd -b (-nb: the second, else the third).
+# A value is read like every shape value (shape_value): a literal or an expansion, never a
+# placeholder; "-" (stdin, or rar -p- for no password) is not a value.
+_MYSQL_HEADS = frozenset({"mysql", "mariadb", "mysqldump", "mariadb-dump", "mysqladmin", "mariadb-admin",
+                          "mysqlimport", "mysqlshow", "mysqlcheck", "mysqlpump", "mysqlslap", "mysqlbinlog"})
+_LDAP_HEADS = frozenset({"ldapsearch", "ldapmodify", "ldapadd", "ldapdelete", "ldapwhoami", "ldapcompare",
+                         "ldapmodrdn", "ldapexop", "ldapvc"})
+_SMB_HEADS = frozenset({"smbclient", "rpcclient", "smbcacls", "smbcquotas", "smbget", "smbtree"})
+CODE_CRED_RE = re.compile(r"(?<![\w.])(?:(?:[A-Za-z_][\w.]*?)?" + SECRET_WORD_LONG + r"|(?:[A-Za-z_][\w.]*?[_.])?"
+                          + SECRET_WORD_SHORT + r")[\"']?\s*[=:]\s*(?P<v>\"[^\"\n]*\"|'[^'\n]*'"
+                          r"|\$\{?[A-Za-z_][A-Za-z0-9_]*)", re.I)
+HEAD_CRED_ROWS = (
+    (frozenset({"curl"}), (), (("split", ("-u", "--user", "-U", "--proxy-user"), ":"),)),
+    (_MYSQL_HEADS, (), (("opt", ("-p",), "att"),)),
+    (frozenset({"sshpass"}), (), (("opt", ("-p",), "both"),)),
+    (frozenset({"redis-cli", "valkey-cli", "keydb-cli"}), (), (("opt", ("-a",), "sep"),)),
+    (frozenset({"docker", "podman", "nerdctl", "buildah", "skopeo"}), ("login",), (("opt", ("-p",), "both"),)),
+    (frozenset({"az"}), ("login",), (("opt", ("-p",), "sep"),)),
+    (frozenset({"vault", "bao"}), ("login",), (("pos", 0),)),
+    (frozenset({"mc", "mcli"}), ("alias", "set"), (("pos", 3),)),
+    (frozenset({"mc", "mcli"}), ("config", "host", "add"), (("pos", 3),)),
+    (frozenset({"python"}), (), (("code", ("-c",)),)),
+    (frozenset({"node", "nodejs", "bun"}), (), (("code", ("-e", "--eval", "-p", "--print")),)),
+    (frozenset({"ruby", "perl"}), (), (("code", ("-e", "-E")),)),
+    (frozenset({"php"}), (), (("code", ("-r",)),)),
+    (_LDAP_HEADS, (), (("opt", ("-w",), "both"),)),
+    (frozenset({"ldappasswd"}), (), (("opt", ("-w", "-a", "-s"), "both"),)),
+    (frozenset({"openssl"}), (), (("prefix", ("-passin", "-passout", "-pass", "-password"), "pass:"),
+                                  ("opt", ("-k",), "sep"))),
+    (frozenset({"gpg", "gpg2"}), (), (("opt", ("--passphrase",), "sep"),)),
+    (frozenset({"htpasswd"}), (), (("htpasswd",),)),
+    (frozenset({"aws"}), ("configure", "set"),
+     (("pair", re.compile(r"(?:^|\.)aws_(?:secret_access_key|session_token)\Z", re.I)),)),
+    (frozenset({"npm", "pnpm", "yarn"}), ("config", "set"),
+     (("pair", re.compile(r"(?:^|[:/.])_(?:authtoken|auth|password)\Z|^npm(?:authtoken|authident)\Z", re.I)),)),
+    (frozenset({"unzip", "zip", "zipcloak"}), (), (("opt", ("-P",), "both"),)),
+    (frozenset({"7z", "7za", "7zr", "7zz", "rar", "unrar"}), (), (("opt", ("-p",), "att"),)),
+    (frozenset({"mosquitto_pub", "mosquitto_sub", "mosquitto_rr"}), (), (("opt", ("-P",), "sep"),)),
+    (_SMB_HEADS, (), (("split", ("-U", "--user"), "%"),)),
+)
+HEAD_CRED_NAMES = frozenset(h for row in HEAD_CRED_ROWS for h in row[0])
+# A head that runs the words after it as a command (sudo mysql -p..., docker exec c redis-cli -a ...).
+HEAD_CRED_RUNNERS = frozenset(TRANSPARENT_WRAPPERS) | KNOWN_RUNNERS
+
+
+def head_cred_name(word: str) -> str:
+    """The table name of a command word: its basename, and python3.12 or pypy3 as python."""
+    name = word.rsplit("/", 1)[-1]
+    return "python" if re.fullmatch(r"(?:python|pypy)[0-9.]*", name) else name
+
+
+def _flag_value(ts: List[str], n: int, flag: str, form: str) -> Optional[str]:
+    """The value of flag at word n of ts, or None (form as in HEAD_CRED_ROWS)."""
+    t = ts[n]
+    if t == flag:
+        return ts[n + 1] if form != "att" and n + 1 < len(ts) else None
+    if flag.startswith("--"):
+        return t[len(flag) + 1:] if t.startswith(flag + "=") else None
+    if form != "sep" and len(flag) == 2 and t.startswith(flag) and len(t) > 2:
+        return t[2:]
+    return None
+
+
+def _htpasswd_value(ts: List[str]) -> Optional[str]:
+    """The password operand of htpasswd -b, or None."""
+    letters = ""
+    pos: List[str] = []
+    skip = False
+    for t in ts:
+        if skip:
+            skip = False
+        elif t.startswith("-") and len(t) > 1:
+            letters += t[1:]
+            skip = t in ("-C", "-r")
+        else:
+            pos.append(t)
+    if "b" not in letters:
+        return None
+    at = 1 if "n" in letters else 2
+    return pos[at] if at < len(pos) else None
+
+
+def head_table_read(ts: List[str], offs: List[int], row) -> Optional[Tuple[int, str]]:
+    """(offset, value) of the first credential a row reads in the operand texts ts, or None."""
+    _heads, lead, reads = row
+    pos = [n for n, t in enumerate(ts) if not t.startswith("-") or t == "-"]
+    if tuple(ts[n] for n in pos[:len(lead)]) != lead:
+        return None
+    for read in reads:
+        kind = read[0]
+        if kind == "pos":
+            rest = pos[len(lead):]
+            if read[1] < len(rest):
+                n = rest[read[1]]
+                if "=" not in ts[n] and ts[n] != "-" and shape_value(ts[n]):
+                    return offs[n], ts[n]
+            continue
+        if kind == "htpasswd":
+            v = _htpasswd_value(ts)
+            if v is not None and v != "-" and shape_value(v):
+                return offs[0], v
+            continue
+        for n, t in enumerate(ts):
+            if kind == "pair":
+                name, eq, val = t.partition("=")
+                if read[1].search(name):
+                    v = val if eq else (ts[n + 1] if n + 1 < len(ts) else None)
+                    if v is not None and shape_value(v):
+                        return offs[n], v
+                continue
+            for flag in read[1]:
+                form = "both" if kind in ("split", "prefix", "code") else read[2]
+                v = _flag_value(ts, n, flag, form)
+                if v is None or v == "-":
+                    continue
+                if kind == "split":
+                    v = v.split(read[2], 1)[1] if read[2] in v else None
+                elif kind == "prefix":
+                    v = v[len(read[2]):] if v.startswith(read[2]) else None
+                elif kind == "code":
+                    m = CODE_CRED_RE.search(v) or SHAPE_URL_RE.search(v)
+                    v = m.group("v") if m else None
+                if v is not None and shape_value(v):
+                    return offs[n], v
+    return None
+
+
+def head_table_hit(text: str, head: Optional[Word], ops: List[Word]) -> Optional[Tuple[int, str]]:
+    """(offset, value) of a credential the per-head table reads in a command, or None. A runner
+    head (sudo, env, docker exec, ssh ...) is followed to the first table head among its words."""
+    if head is None:
+        return None
+    ts = [shape_word(text, w) for w in ops]
+    offs = [w[0] for w in ops]
+    name = head_cred_name(shape_word(text, head))
+    starts = [0] if name in HEAD_CRED_NAMES else []
+    if name in HEAD_CRED_RUNNERS or name in HEAD_CRED_NAMES:
+        nested = next((n for n, t in enumerate(ts) if head_cred_name(t) in HEAD_CRED_NAMES), None)
+        if nested is not None:
+            starts.append(nested + 1)
+    for at in starts:
+        cmd = name if at == 0 else head_cred_name(ts[at - 1])
+        for row in HEAD_CRED_ROWS:
+            if cmd in row[0]:
+                found = head_table_read(ts[at:], offs[at:], row)
+                if found is not None:
+                    return found
     return None
 
 
@@ -2700,7 +2938,8 @@ def shape_hits(rel: str, text: str) -> List[Hit]:
     hits: List[Hit] = []
     lines = set()
     for words, _forced, array in shell_commands(view.replace("\\\n", "  ")):
-        found = shape_hit(view, shape_operands(view, words, array))
+        head, ops = shape_command(view, words, array)
+        found = shape_hit(view, ops) or head_table_hit(view, head, ops)
         if found is None:
             continue
         phys = text.count("\n", 0, found[0]) + 1
@@ -4111,6 +4350,46 @@ R11_SHAPE_RED = {
     # #5887: only a # word right after an OPENING backtick heads a comment.
     '5887-r53-closing-backtick-then-hash': '`echo mytool`#x --token S3cr3tTok',
     '5887-r54-glued-hash-inside-backticks': 'echo `B=\\\n#c mytool --token S3cr3tTok`',
+    # Part B (round 12): a credential by one program's convention, read by HEAD_CRED_ROWS. The
+    # first eight were the #5725 stated limits.
+    '4814-r55-mysql-short-p': 'mysql -u root -pS3cr3tPass appdb',
+    '4816-r56-redis-a': 'redis-cli -a S3cr3tToken PING',
+    '4813-r57-curl-u-userpass': 'curl -u admin:S3cr3tPass https://api.example.com/v1',
+    '5784-r58-skopeo-p': 'skopeo login -u u -p S3cr3tPass registry.example.com',
+    '5785-r59-az-p': 'az login -u u -p S3cr3tPass',
+    '5786-r60-positional-token': 'vault login s.S3cr3tToken',
+    '5788-r61-positional-secret': 'mc alias set s3 https://s3.example.com AKIAKEY S3cr3tSecretKey',
+    '5787-r62-python-c-string': 'python3 -c "import psycopg; psycopg.connect(password=\'S3cr3tPass\')"',
+    '4813-r63-curl-user-long': 'curl --user alice:S3cr3tPass https://h/x',
+    '4813-r64-curl-proxy-user': 'curl --proxy-user bob:S3cr3tPass https://h/x',
+    '4814-r65-mariadb-p-attached': 'mariadb -u bob -pS3cr3tPass appdb',
+    '4815-r66-sshpass-p': 'sshpass -p S3cr3tPass ssh h',
+    '4815-r67-sshpass-p-attached': 'sshpass -pS3cr3tPass ssh h',
+    '4816-r68-valkey-a': 'valkey-cli -a S3cr3tPass ping',
+    '4819-r69-docker-login-p': 'docker login -u bob -p S3cr3tPass registry.example.com',
+    '4819-r70-podman-login-p-attached': 'podman login -u bob -pS3cr3tPass registry.example.com',
+    '4819-r71-sudo-docker-login': 'sudo docker login -u bob -p S3cr3tPass registry.example.com',
+    '5784-r72-skopeo-creds': 'skopeo copy --creds bob:S3cr3tPass docker://a docker://b',
+    '5784-r73-skopeo-src-creds': 'skopeo copy --src-creds bob:S3cr3tPass docker://a docker://b',
+    '5786-r74-bao-login': 'bao login S3cr3tTok',
+    '5787-r75-node-e': "node -e \"connect({password: 'S3cr3tPass'})\"",
+    '5787-r76-python-c-env-var': 'python3 -c "login(token=$TOKEN)"',
+    '5788-r77-mc-config-host-add': 'mc config host add s3 https://h AKIAEXAMPLE S3cr3tTok',
+    '5790-r78-ldapsearch-w': 'ldapsearch -x -D cn=admin -w S3cr3tPass -b dc=x',
+    '5790-r79-ldappasswd-s': 'ldappasswd -x -D cn=admin -W -s S3cr3tPass uid=bob',
+    '5791-r80-openssl-passin': 'openssl rsa -in k.pem -passin pass:S3cr3tPass -out k2.pem',
+    '5791-r81-openssl-enc-k': 'openssl enc -aes-256-cbc -k S3cr3tPass -in a -out b',
+    '5792-r82-gpg-passphrase': 'gpg --batch --passphrase S3cr3tPass -d f.gpg',
+    '5793-r83-htpasswd-b': 'htpasswd -b users bob S3cr3tPass',
+    '5793-r84-htpasswd-nb': 'htpasswd -nb bob S3cr3tPass',
+    '5794-r85-aws-configure-secret': 'aws configure set aws_secret_access_key S3cr3tTok',
+    '5795-r86-unzip-P': 'unzip -P S3cr3tPass a.zip',
+    '5795-r87-7z-p-attached': '7z x -pS3cr3tPass a.7z',
+    '5802-r88-mosquitto-P': 'mosquitto_pub -u bob -P S3cr3tPass -t t -m m',
+    '5803-r89-smbclient-U-percent': 'smbclient -U bob%S3cr3tPass //h/s',
+    '5804-r90-npm-authtoken': 'npm config set _authToken S3cr3tTok',
+    '5805-r91-vault-kv-password': 'vault kv put secret/x password=S3cr3tPass',
+    '5805-r92-bare-secret-name': 'mytool run secret=S3cr3tTok',
 }
 R11_SHAPE_GREEN = {
     '5725-g01-password-stdin': 'docker login -u u --password-stdin registry.example.com',
@@ -4149,18 +4428,27 @@ R11_SHAPE_GREEN = {
     # #5887: a ')' that closes a subshell or a group is an operator; a # after it is a comment.
     '5887-g30-subshell-then-comment': '(true)#x | mytool --token S3cr3tTok',
     '5887-g31-nested-subshell-then-comment': '( (true) )#x | mytool --token S3cr3tTok',
+    # Part B (round 12): the same programs with no credential on the argv.
+    '5725-g32-docker-run-p': 'docker run -p 8080:80 nginx',
+    '4814-g33-mysql-p-prompt': 'mysql -u root -p appdb',
+    '4813-g34-curl-u-user-only': 'curl -u alice https://h/x',
+    '5795-g35-7z-p-prompt': '7z x -p a.7z',
+    '5795-g36-rar-p-dash': 'rar a -p- a.rar f',
+    '5791-g37-openssl-passin-env': 'openssl rsa -in k.pem -passin env:PW -out k2.pem',
+    '5791-g38-openssl-passin-file': 'openssl rsa -in k.pem -passin file:/run/secrets/p -out k2.pem',
+    '5786-g39-vault-login-stdin': 'vault login -',
+    '5786-g40-vault-login-method': 'vault login -method=userpass username=bob',
+    '5794-g41-aws-configure-region': 'aws configure set region us-east-1',
+    '5804-g42-npm-config-registry': 'npm config set registry https://r.example.com',
+    '5787-g43-python-c-os-environ': 'python3 -c "import os; login(password=os.environ[\'PW\'])"',
+    '5793-g44-htpasswd-prompt': 'htpasswd -c users bob',
+    '5803-g45-smbclient-U-user-only': 'smbclient -U bob //h/s',
+    '4816-g46-redis-a-placeholder': 'redis-cli -a "<redacted>" ping',
+    '5788-g47-mc-alias-ls': 'mc alias ls s3',
 }
 # #5725 STATED LIMITS: shapes the rule does not read, each pinned as missed so the limit text in
 # the header and the changelog stays measured (a rule that closes one must update both).
 R11_SHAPE_LIMITS = {
-    '5725-l01-mysql-short-p': 'mysql -u root -pS3cr3tPass appdb',
-    '5725-l02-redis-a': 'redis-cli -a S3cr3tToken PING',
-    '5725-l03-curl-u-userpass': 'curl -u admin:S3cr3tPass https://api.example.com/v1',
-    '5725-l04-skopeo-p': 'skopeo login -u u -p S3cr3tPass registry.example.com',
-    '5725-l05-az-p': 'az login -u u -p S3cr3tPass',
-    '5725-l06-positional-token': 'vault login s.S3cr3tToken',
-    '5725-l07-positional-secret': 'mc alias set s3 https://s3.example.com AKIAKEY S3cr3tSecretKey',
-    '5725-l08-python-c-string': 'python3 -c "import psycopg; psycopg.connect(password=\'S3cr3tPass\')"',
     # #5847: a plain key / auth / cred flag is a stated limit.
     '5847-l09-plain-key-flag': 'mytool --key S3cr3tPass run',
     '5847-l10-plain-auth-flag': 'mytool --auth S3cr3tPass run',
@@ -4169,6 +4457,26 @@ R11_SHAPE_LIMITS = {
     '5847-l13-private-key-flag': 'mytool --private_key=S3cr3tTok run',
 }
 SHAPE_PROBE_SECRETS = ("S3cr3tPass", "S3cr3tTok", "ghp_S3cr3tToken", "dTpw")
+# #5789: an indented code block and an inline code span of a .md file are read like a fence; a
+# paragraph continuation, a list item paragraph, single words in two spans, an escaped backtick,
+# a span cut by a blank line and a placeholder are not.
+R12_MD_CODE_RED = {
+    '5789-m01-indented-block': 'Intro.\n\n    mytool --token S3cr3tTok\n',
+    '5789-m02-indented-after-list-ended': '- item\n\nPara.\n\n    mytool --token S3cr3tTok\n',
+    '5789-m03-span-across-a-line': 'Run `mytool --token\nS3cr3tTok` now.\n',
+    '5789-m04-double-backtick-span': 'Run ``mytool --token S3cr3tTok`` now.\n',
+    '5789-m05-span-curl-u': 'Call `curl -u admin:S3cr3tPass https://h` first.\n',
+    '5789-m06-span-in-table': '| a | `redis-cli -a S3cr3tPass ping` |\n',
+}
+R12_MD_CODE_GREEN = {
+    '5789-m07-paragraph-continuation': 'Intro line\n    mytool --token S3cr3tTok\n',
+    '5789-m08-list-item-paragraph': '- item\n\n    mytool --token S3cr3tTok\n',
+    '5789-m09-words-in-two-spans': 'Use `--token` and `S3cr3tTok` here.\n',
+    '5789-m10-escaped-backticks': 'Run \\`mytool --token S3cr3tTok\\` now.\n',
+    '5789-m11-span-cut-by-blank-line': 'Run `mytool --token\n\nS3cr3tTok` now.\n',
+    '5789-m12-span-placeholder': 'Run `mytool --token <TOKEN>` now.\n',
+    '5789-m13-apostrophe-before-a-fence': "It's here.\n\n```bash\n# mytool --token S3cr3tTok\n```\n",
+}
 # #5723: a command substitution inside an array body is still a command of its own.
 R11_ARRAY_NESTED_UNKNOWN = {
     '5723-n01-cmdsubst-in-body': 'args=( "$(site-tool --set token=$TOKEN)" )',
@@ -4563,11 +4871,33 @@ def self_test() -> int:
                 print("SELF-TEST FAIL: stated-limit probe %r (%s) is now flagged; update the STATED LIMITS: %r"
                       % (name, label, got), file=sys.stderr)
                 bad += 1
-    # #5725: prose outside a shell fence is not read by the shape rule (a stated limit).
+    # #5906 STATED LIMIT: prose words outside a fence, an indented block and a code span, and an
+    # HTML code element, are not read by the shape rule.
     green += 1
     if any(h[2].startswith("[%s]" % SHAPE_TAG) for h in scan_text("probe.md", "Run tool --password S3cr3tPass.\n")):
-        print("SELF-TEST FAIL: the shape rule read prose outside a fence", file=sys.stderr)
+        print("SELF-TEST FAIL: the shape rule read prose outside a fence; update the STATED LIMITS (#5906)",
+              file=sys.stderr)
         bad += 1
+    green += 1
+    if any(h[2].startswith("[%s]" % SHAPE_TAG)
+           for h in scan_text("probe.md", "<code>tool --password S3cr3tPass</code>\n")):
+        print("SELF-TEST FAIL: the shape rule read an HTML code element; update the STATED LIMITS (#5906)",
+              file=sys.stderr)
+        bad += 1
+    # #5789: indented code blocks and inline code spans of a .md file.
+    for name, text in R12_MD_CODE_RED.items():
+        red += 1
+        got = scan_text("probe.md", text)
+        if not got or any(sec in h[2] for h in got for sec in SHAPE_PROBE_SECRETS):
+            print("SELF-TEST FAIL: md code probe %r not flagged or prints the value: %r" % (name, got),
+                  file=sys.stderr)
+            bad += 1
+    for name, text in R12_MD_CODE_GREEN.items():
+        green += 1
+        got = scan_text("probe.md", text)
+        if got:
+            print("SELF-TEST FAIL: md clean probe %r was flagged: %r" % (name, got), file=sys.stderr)
+            bad += 1
     # #5725: a fence tagged with a language that is not shell-like is not read (MD_SHELL_FENCES).
     green += 1
     if any(h[2].startswith("[%s]" % SHAPE_TAG)
