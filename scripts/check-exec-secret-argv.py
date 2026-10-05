@@ -774,6 +774,68 @@ def _my_head_command(text: str, start: int, directory: str) -> bool:
     return not any(w.lower() in _MY_NONCMD_PREV for w in words)
 
 
+def _my_substitutions(text: str, pos: int) -> List[Tuple[int, int]]:
+    """(index of the dollar sign, index of the closing parenthesis or -1) of every $( ... ) around text[pos],
+    innermost first. Quotes are transparent (a quoted sh -c payload runs its substitutions); an escaped character
+    is skipped, except before a dollar sign, because an escaped \\$( in an ssh or sh -c payload runs on the far side;
+    a plain parenthesis nests (#5821)."""
+    stack: List[Tuple[int, bool]] = []
+    i = 0
+    while i < pos:
+        c = text[i]
+        if c == "\\":
+            i += 1 if text[i + 1:i + 2] == "$" else 2
+            continue
+        if c == "$" and text[i + 1:i + 2] == "(":
+            stack.append((i, True))
+            i += 2
+            continue
+        elif c == "(":
+            stack.append((i, False))
+        elif c == ")" and stack:
+            stack.pop()
+        i += 1
+    out: List[Tuple[int, int]] = []
+    depth = 0
+    k = pos
+    opened = [o for o, sub in stack]
+    subs = {o for o, sub in stack if sub}
+    while opened and k < len(text):
+        c = text[k]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            if depth:
+                depth -= 1
+            else:
+                o = opened.pop()
+                if o in subs:
+                    out.append((o, k))
+        k += 1
+    out.extend((o, -1) for o in reversed(opened) if o in subs)
+    return out
+
+
+def _my_substitution_hit(raw: str, pos: int) -> bool:
+    """A head inside a command substitution that is itself the command word (#5821): $(command -v mysql),
+    "$(which mysqldump)". The substitution prints the command, so the words after it are the client's words and
+    are read as such. A substitution glued to a word before it (v=$(mysql ...), x$(...)) is no command word."""
+    for opener, close in _my_substitutions(raw, pos):
+        if close < 0:
+            continue
+        word = opener - 1 if opener > 0 and raw[opener - 1] in "\"'\\" else opener
+        if word > 0 and not (raw[word - 1].isspace() or raw[word - 1] in "|;&(`"):
+            continue
+        if not _my_head_command(raw, word, ""):
+            continue
+        rest = raw[close + 1:]
+        if word != opener and rest[:1] == raw[word]:
+            rest = rest[1:]
+        if _my_words_hit(_my_words(rest)):
+            return True
+    return False
+
+
 def mysql_family_hit(raw: str) -> bool:
     """True when a mysql family command of one logical line carries a credential the gate cannot clear."""
     for m in _MY_HEAD_RE.finditer(raw):
@@ -784,7 +846,7 @@ def mysql_family_hit(raw: str) -> bool:
         rest = raw[m.end():]
         if m.start() > 0 and rest[:1] in ("\"", "'") and raw[m.start() - 1] == rest[:1]:
             rest = rest[1:]  # the head was quoted on its own: "/usr/bin/mysql" --password="$X"
-        if _my_words_hit(_my_words(rest)):
+        if _my_words_hit(_my_words(rest)) or _my_substitution_hit(raw, m.start()):
             return True
     return False
 
@@ -2051,6 +2113,12 @@ ROUND3_RED = [
     ('5820 wrapper pin: reported 3: sudo after a semicolon inside a single-quoted payload', "sh -c 'cd /x; sudo mysql -p$X'"),
     ('5820 wrapper pin: reported 4: timeout inside a docker exec payload', 'docker exec db bash -c "timeout 5 mysqladmin -uroot -p$X ping"'),
     ('5820 wrapper pin: reported 5: an env assignment inside a kubectl exec payload', "kubectl exec db -- sh -c 'FOO=x mysql -p$X'"),
+    ('5821 substitution pin: reported 1: a head printed by command -v is the command word', '$(command -v mysql) -uroot -p"$X"'),
+    ('5821 substitution pin: reported 2: a quoted which substitution', '"$(which mysqldump)" -uroot -p"$X" app'),
+    ('5821 substitution pin: reported 3: sudo before a type -P substitution', 'sudo $(type -P mysql) -p"$X"'),
+    ('5821 substitution pin: reported 4: a substitution inside a sh -c payload', 'sh -c "$(which mysql) -p$X"'),
+    ('5821 substitution pin: reported 5: an escaped substitution in an ssh payload runs on the far side', 'ssh h "sudo \\$(which mysql) -p$X"'),
+    ('5821 substitution pin: reported 6: nested substitutions', '$(realpath $(command -v mysql)) -p"$X"'),
     ('5683 mutant pin: reported 2: the password command word of mysqladmin is matched in any letter case', 'mysqladmin PASSWORD "x$NEW"'),
 ]
 ROUND3_GREEN = [
@@ -2123,6 +2191,9 @@ ROUND3_GREEN = [
     ('5820 wrapper pin: clean 1: a wrapper inside an echoed string is no command', 'echo "run sudo mysql -p$X"'),
     ('5820 wrapper pin: clean 2: a wrapper inside a printf operand is no command', "printf '%s\\n' \"now sudo mysql -p$X\""),
     ('5820 wrapper pin: clean 3: a wrapped head in a payload with clean words', 'ssh h "sudo mysql -uroot -h $H app"'),
+    ('5821 substitution pin: clean 1: a substitution glued to a word is no command word', 'x$(command -v mysql) "$X"'),
+    ('5821 substitution pin: clean 2: a substitution head with clean words', '$(command -v mysql) -uroot -h "$H" app'),
+    ('5821 substitution pin: clean 3: a substitution that is an echo operand', 'echo "$(mysql --version)" "$X"'),
 ]
 
 # Raw logical-line text that holds a newline (the arm is a function of text; every unit the gate builds today is
