@@ -889,6 +889,16 @@ PYEOF
         echo "PASS: self-test #5497 — the header and CLAUDE.md name \"$wording\""
     done
 
+    # #5538: the word check above proves the wording is NAMED; these cases
+    # prove ABSENT_DEST does not match wording it does not name, so a pattern
+    # that keeps the words and changes the match is killed.
+    anchor_red 5538 PATH "a missing path before \"split up out\" is not exempt" \
+        'See `src/handlers.rs` split up out here.'
+    anchor_red 5538 PATH "a missing path before \"split up across\" is not exempt" \
+        'See `src/handlers.rs` split up across here.'
+    anchor_red 5538 PATH "a missing path before \"renamed it later to\" is not exempt" \
+        'See `src/handlers.rs` renamed it later to x here.'
+
     # #5460: the type of an as group inside a brace item is a claim.
     anchor_red_cites 5460 QUAL "an as group with a missing type inside a brace item" \
         "$R::NoSuch" \
