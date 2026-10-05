@@ -895,7 +895,19 @@ jobs:
           a workflow `::error::` and the exit code is non-zero, because an abandoned widen
           that is named is recoverable and one that is silent is not (#5812, #5852). A
           reopen after a widening chmod is still checked against the inode that was
-          scanned. Symlinks are never
+          scanned.
+
+          An exit that runs no code at all - `SIGKILL`, a job timeout, an OOM kill - is
+          covered by neither a handler nor a `finally`, so it is covered two other ways
+          (#6006). No mode is held across a descent: a directory is widened for ONE
+          lookup and narrowed again immediately, by `Search`, through the descriptor the
+          walk already holds. And the widen that is outstanding during that one lookup is
+          written to a single durable record in the scratch root BEFORE the chmod that
+          needs it, so the next run's startup sweep puts that mode back on the inode the
+          record names and reports the repair. A record that cannot be written refuses the
+          widen rather than making a change that nothing accounts for.
+
+          Symlinks are never
           followed and their flags are never cleared (a clear would have to go back
           through a path); a flagged symlink is reported instead. A
           flagged regular file with more than one link is refused, because its inode may
@@ -919,6 +931,17 @@ jobs:
 
           SCRATCH_DIR = ".local-runs"
           IS_BSD = hasattr(os, "lchflags")
+
+          # The one widen a walk may be holding, written down before it happens so a kill
+          # that runs no code leaves something the next run can finish (#6006). It lives
+          # INSIDE the scratch root on purpose: the record and the mode it describes are
+          # then removed by the same `rm -rf`, so a record can never outlive the tree it
+          # refers to and point at a path some later run would read as its own. One record
+          # is the whole state - the walk is depth-first and widens one directory at a
+          # time - and it is released by truncating it to empty, because this file never
+          # unlinks anything.
+          PENDING_RESTORE_FILE = ".clear-append-only-pending"
+          _PENDING_LIMIT = 4096
 
           # Linux inode flags (uapi/linux/fs.h).
           FS_APPEND_FL = 0x0000_0020
@@ -1153,24 +1176,210 @@ jobs:
                       self._fd = None
 
 
+          class Search:
+              """Owner search permission on a directory this walk already holds open, for
+              ONE lookup at a time (#6006).
+
+              A directory that is readable but not searchable can be listed from a
+              descriptor with no mode change at all, but a lookup BY NAME under it -
+              `os.lstat(name, dir_fd=)`, `os.open(name, dir_fd=)` - needs the search bit
+              at the instant of the call. Widening for the whole descent, as this walk
+              used to, makes that window as long as a subtree; widening around the lookup
+              makes it one syscall. Only `S_IXUSR` is added, and only through the
+              descriptor the walk already holds, so neither the name nor any other bit is
+              involved.
+
+              The one syscall that remains cannot be covered by a handler, because
+              `SIGKILL` runs none, so the first widen writes the outstanding restore down
+              (`Cleaner.hold`) for the next run to finish (`Cleaner.sweep`). A narrow that
+              FAILS poisons this object: the mode is left applied, it is reported with its
+              path, the record is deliberately left in place, and no further lookup is made
+              under a directory whose mode this walk can no longer control (#6002)."""
+
+              def __init__(self, cleaner, fd, path, st, mode):
+                  self._cleaner = cleaner
+                  self._fd = fd
+                  self._path = path
+                  self._st = st
+                  self._mode = mode
+                  self._armed = False
+                  self._broken = False
+
+              def __enter__(self):
+                  if self._broken:
+                      raise OSError(errno.EPERM, "the mode of this directory could not be narrowed again, so "
+                                                 "nothing further under it is looked up")
+                  if not self._armed:
+                      # Written down BEFORE the first widen, so a kill cannot leave a mode
+                      # applied that no record accounts for. A record that cannot be
+                      # written refuses the widen: this janitor exists because silent
+                      # leftovers are the failure, and an unrecorded one is the silent
+                      # kind.
+                      self._cleaner.hold(self._path, self._st, self._mode)
+                      self._armed = True
+                  os.fchmod(self._fd, self._mode | stat.S_IXUSR)
+                  return self
+
+              def __exit__(self, kind, value, trace):
+                  try:
+                      os.fchmod(self._fd, self._mode)
+                  except OSError as err:
+                      self._broken = True
+                      try:
+                          applied = "0o%03o" % stat.S_IMODE(os.fstat(self._fd).st_mode)
+                      except OSError:
+                          applied = "a mode that could no longer be read back"
+                      self._cleaner.fail(self._path, "the mode this walk widened is left applied (%s, not the "
+                                                     "0o%03o the walk found): %s" % (applied, self._mode, err))
+                  return False
+
+              def release(self):
+                  """Drop the record once the descent is over: nothing is outstanding.
+
+                  A broken window keeps its record on purpose. The mode really is still
+                  widened there, and the next run's sweep is the only thing left that can
+                  put it back."""
+                  if self._armed and not self._broken:
+                      self._cleaner.release(self._path)
+
+
+          class _NoSearch:
+              """A directory that is already searchable, or one this process may not
+              chmod at all. Nothing is widened and nothing is recorded, so the walk has
+              one shape for both cases instead of a flag it has to remember to test."""
+
+              def __enter__(self):
+                  return self
+
+              def __exit__(self, kind, value, trace):
+                  return False
+
+              def release(self):
+                  pass
+
+
+          _NO_SEARCH = _NoSearch()
+
+
           class Cleaner:
-              """Depth-first clear over one scratch tree. Collects cleared paths and
-              failures; never raises out of `run`."""
+              """Depth-first clear over one scratch tree. Collects cleared paths, mode
+              repairs and failures; never raises out of `run`."""
 
               def __init__(self):
                   self.cleared = []
+                  self.repaired = []
                   self.failures = []
+                  self._pending = None
 
               def fail(self, path, why):
                   self.failures.append((path, str(why)))
 
               def run(self, top):
+                  self._pending = os.path.join(top, PENDING_RESTORE_FILE)
+                  self.sweep()
                   try:
                       st = os.lstat(top)
                   except OSError as err:
                       self.fail(top, "could not stat the scratch root: %s" % err)
                       return
-                  self._visit(None, top, top, st)
+                  self._visit(None, top, top, st, _NO_SEARCH)
+
+              def hold(self, path, st, mode):
+                  """Write down the widen a walk is about to hold, before it happens.
+
+                  The reader is the NEXT process, after this one was killed, so the record
+                  is fsynced before the chmod it covers is allowed to happen. It names the
+                  inode as well as the path, because a path alone would let a later run
+                  put a mode on whatever has taken that name since (#6006)."""
+                  if "\n" in path:
+                      raise OSError(errno.EIO, "a path with a newline in it cannot be recorded as one line, "
+                                               "so the widen it would need is refused")
+                  self._write_pending("%d %d %o %s\n" % (st.st_dev, st.st_ino, mode, path))
+
+              def release(self, path):
+                  """Release the record: what it described is no longer outstanding."""
+                  try:
+                      self._write_pending("")
+                  except OSError as err:
+                      self.fail(path, "the mode was put back but its pending-restore record could not be "
+                                      "released, so the next run will read a widen that is no longer "
+                                      "outstanding: %s" % err)
+
+              def _write_pending(self, line):
+                  fd = os.open(self._pending, _OPEN_FLAGS | os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                               stat.S_IRUSR | stat.S_IWUSR)
+                  try:
+                      if line:
+                          os.write(fd, line.encode("utf-8"))
+                      os.fsync(fd)
+                  finally:
+                      os.close(fd)
+
+              def sweep(self):
+                  """Finish the restore a killed run started (#6006).
+
+                  `SIGKILL`, a job timeout and an OOM kill run no handler and no
+                  `finally`, so the only thing that can put back a mode one of them
+                  interrupted is the next run reading what the killed one wrote down. The
+                  record is advisory about the MODE and authoritative about the INODE: the
+                  repair happens only where the entry still is the inode that was
+                  recorded, and every outcome - repaired, gone, unreadable, or refused -
+                  is said out loud rather than assumed."""
+                  try:
+                      fd = os.open(self._pending, _OPEN_FLAGS)
+                  except FileNotFoundError:
+                      return  # no run was interrupted here
+                  except OSError as err:
+                      self.fail(self._pending, "a pending-restore record that cannot be opened cannot be ruled "
+                                               "out, so neither can a mode a previous run left widened: %s" % err)
+                      return
+                  try:
+                      raw = os.read(fd, _PENDING_LIMIT).decode("utf-8", "replace")
+                  except OSError as err:
+                      self.fail(self._pending, "could not read the pending-restore record: %s" % err)
+                      return
+                  finally:
+                      os.close(fd)
+                  if not raw.strip():
+                      return  # the last run released what it held
+                  try:
+                      dev, ino, mode_text, path = raw.rstrip("\n").split(" ", 3)
+                      inode = (int(dev), int(ino))
+                      want = int(mode_text, 8)
+                  except ValueError:
+                      self.fail(self._pending, "the pending-restore record cannot be parsed, so a mode a "
+                                               "previous run left widened cannot be ruled out: %r" % raw.strip())
+                      return
+                  self._repair(path, inode, want)
+
+              def _repair(self, path, inode, want):
+                  try:
+                      fd = os.open(path, _OPEN_FLAGS | os.O_DIRECTORY)
+                  except FileNotFoundError:
+                      # The ordinary case by far: the scratch tree the record refers to
+                      # was deleted, which is what the janitor runs to make possible, so
+                      # the mode went with it and the record is spent.
+                      self.release(path)
+                      return
+                  except OSError as err:
+                      self.fail(path, "a mode a previous run may have left widened cannot be reached: %s" % err)
+                      return
+                  try:
+                      now = os.fstat(fd)
+                      if (now.st_dev, now.st_ino) != inode:
+                          self.fail(path, "the entry a previous run recorded is a different inode now, so its "
+                                          "mode is not this run's to put back")
+                          return
+                      current = stat.S_IMODE(now.st_mode)
+                      if current != want:
+                          os.fchmod(fd, want)
+                          self.repaired.append((path, current, want))
+                  except OSError as err:
+                      self.fail(path, "could not put back a mode a previous run left widened: %s" % err)
+                      return
+                  finally:
+                      os.close(fd)
+                  self.release(path)
 
               @staticmethod
               def _ownable(st):
@@ -1178,73 +1387,85 @@ jobs:
                   euid = os.geteuid()
                   return euid == 0 or st.st_uid == euid
 
-              def _open_at(self, dirfd, name, path, st, want_dir):
-                  """Open `name` under `dirfd` without following symlinks.
+              def _open_at(self, dirfd, name, path, st, want_dir, parent):
+                  """Open `name` under `dirfd` without following symlinks, inside the
+                  parent directory's search window.
 
-                  Returns `(fd, mode_to_restore)`. A mode that hides the inode flags is
-                  answered by widening it - the scanning process can chmod its way back
-                  in, see `_ownable` - and the caller restores the original mode through
-                  the descriptor. Every widen here goes through `Widener` and is undone
-                  before EVERY failure exit from this frame, by the same route it took.
-                  What that is worth depends on the platform (module docstring, #5852):
-                  where the inode can be pinned, the widen and its undo both address the
-                  INODE that was scanned, and an entry swapped underneath the walk is
-                  refused by `Widener` with nothing mutated at all; where it cannot, both
-                  address the NAME, so a swap between the scan and the widen means some
-                  other inode is widened and is then set to the SCANNED entry's mode
-                  rather than to its own (#5812, #5813). EVERY descriptor this frame
-                  returns is compared against the inode that was scanned - the reopen
-                  after a widen and the ordinary open that needed none alike - so an
-                  entry replaced between the `lstat` that classified it and the `open`
-                  that acts on it is reported instead of being cleared, descended into,
-                  or given the scanned entry's mode (#5995)."""
+                  Returns the descriptor, and nothing this frame widened is still widened
+                  when it does. A mode that hides the inode flags is answered by widening
+                  it - the scanning process can chmod its way back in, see `_ownable` -
+                  and the widen comes off through the descriptor that has just been proven
+                  to be the scanned inode, before this frame returns. A descriptor keeps
+                  the access it was opened with, so the caller loses nothing by being
+                  handed an entry whose mode is exactly what the walk found, and a kill
+                  during the caller's descent finds no widened mode to leave behind
+                  (#6006).
+
+                  Every widen here goes through `Widener` and is undone before EVERY exit
+                  from this frame, by the same route it took. What that is worth depends
+                  on the platform (module docstring, #5852): where the inode can be
+                  pinned, the widen and its undo both address the INODE that was scanned,
+                  and an entry swapped underneath the walk is refused by `Widener` with
+                  nothing mutated at all; where it cannot, both address the NAME, so a
+                  swap between the scan and the widen means some other inode is widened
+                  and is then set to the SCANNED entry's mode rather than to its own
+                  (#5812, #5813). EVERY descriptor this frame returns is compared against
+                  the inode that was scanned - the reopen after a widen and the ordinary
+                  open that needed none alike - so an entry replaced between the `lstat`
+                  that classified it and the `open` that acts on it is reported instead of
+                  being cleared, descended into, or given the scanned entry's mode
+                  (#5995)."""
                   flags = _OPEN_FLAGS | (os.O_DIRECTORY if want_dir else 0)
                   mode = stat.S_IMODE(st.st_mode)
                   needed = (stat.S_IRUSR | stat.S_IXUSR) if want_dir else stat.S_IRUSR
-                  try:
-                      fd = os.open(name, flags, dir_fd=dirfd)
-                  except OSError as err:
-                      if err.errno != errno.EACCES:
-                          raise
-                      if not self._ownable(st):
-                          raise PermissionError(errno.EACCES, "not the owner, so the flag state cannot be read")
-                      widener = Widener(dirfd, name, st, want_dir)
+                  with parent:
                       try:
-                          widener.chmod(mode | needed)
-                          try:
-                              fd = os.open(name, flags, dir_fd=dirfd)
-                              opened = os.fstat(fd)
-                              if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
-                                  os.close(fd)
-                                  raise OSError(errno.EIO, "the entry was replaced while it was being inspected")
-                          except BaseException:
-                              # The widen is never abandoned. A reopen that raised and an
-                              # inode that turns out to have been swapped both put the
-                              # original mode back before the failure leaves this frame;
-                              # a restore that itself fails replaces the error, so a
-                              # widen abandoned HERE is never silent. The caller's own
-                              # restore is quieter on purpose - see `_visit`.
-                              widener.chmod(mode)
+                          fd = os.open(name, flags, dir_fd=dirfd)
+                      except OSError as err:
+                          if err.errno != errno.EACCES:
                               raise
-                      finally:
-                          widener.close()
-                      return fd, mode
-                  opened = os.fstat(fd)
-                  if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
-                      # The name resolved to an inode the caller never classified. It is
-                      # closed and reported, never cleared and never descended into: its
-                      # flags, its mode and its contents are all somebody else's (#5995).
-                      os.close(fd)
-                      raise OSError(errno.EIO, "the entry was replaced while it was being inspected")
-                  if want_dir and (mode & needed) != needed and self._ownable(st):
-                      # Readable enough to open, not searchable enough to stat its
-                      # entries (mode 0o400): widen on the descriptor, never by path.
-                      try:
-                          os.fchmod(fd, mode | needed)
-                          return fd, mode
-                      except OSError:
-                          pass
-                  return fd, None
+                          if not self._ownable(st):
+                              raise PermissionError(errno.EACCES, "not the owner, so the flag state cannot be read")
+                          widener = Widener(dirfd, name, st, want_dir)
+                          try:
+                              widener.chmod(mode | needed)
+                              try:
+                                  fd = os.open(name, flags, dir_fd=dirfd)
+                                  opened = os.fstat(fd)
+                                  if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                                      os.close(fd)
+                                      raise OSError(errno.EIO, "the entry was replaced while it was being inspected")
+                              except BaseException:
+                                  # The widen is never abandoned. A reopen that raised and
+                                  # an inode that turns out to have been swapped both put
+                                  # the original mode back before the failure leaves this
+                                  # frame; a restore that itself fails replaces the error,
+                                  # so a widen abandoned HERE is never silent.
+                                  widener.chmod(mode)
+                                  raise
+                          finally:
+                              widener.close()
+                          try:
+                              # The inode is proven and this frame holds a descriptor on
+                              # it, so the widen comes off NOW rather than being held for
+                              # the caller's whole descent, where a kill that runs no code
+                              # would leave it applied with nothing reported (#6006).
+                              os.fchmod(fd, mode)
+                          except OSError as err:
+                              os.close(fd)
+                              raise OSError(errno.EPERM, "the mode this frame widened to 0o%03o is left applied: "
+                                                         "it could not be put back to the 0o%03o the walk found "
+                                                         "(%s)" % (mode | needed, mode, err))
+                          return fd
+                      opened = os.fstat(fd)
+                      if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                          # The name resolved to an inode the caller never classified. It
+                          # is closed and reported, never cleared and never descended
+                          # into: its flags, its mode and its contents are all somebody
+                          # else's (#5995).
+                          os.close(fd)
+                          raise OSError(errno.EIO, "the entry was replaced while it was being inspected")
+                      return fd
 
               def _clear_fd(self, fd, path):
                   """Clear the append-only bit on `fd`, then PROVE the name is unlinkable."""
@@ -1273,7 +1494,7 @@ jobs:
                       self.fail(path, "symlink carries an append/immutable flag (0x%x); a flag is never "
                                       "cleared through a symlink" % st.st_flags)
 
-              def _visit(self, dirfd, name, path, st):
+              def _visit(self, dirfd, name, path, st, parent):
                   if stat.S_ISLNK(st.st_mode):
                       self._symlink(path, st)
                       return
@@ -1281,7 +1502,7 @@ jobs:
                       return  # fifo / socket / device: no inode flag can block its unlink
                   want_dir = stat.S_ISDIR(st.st_mode)
                   try:
-                      fd, restore = self._open_at(dirfd, name, path, st, want_dir)
+                      fd = self._open_at(dirfd, name, path, st, want_dir, parent)
                   except FileNotFoundError:
                       return
                   except OSError as err:
@@ -1290,49 +1511,47 @@ jobs:
                   try:
                       self._clear_fd(fd, path)
                       if want_dir:
-                          self._walk(fd, path)
+                          mode = stat.S_IMODE(st.st_mode)
+                          search = _NO_SEARCH
+                          if not mode & stat.S_IXUSR and self._ownable(st):
+                              # A directory this process cannot search has to be widened
+                              # to look an entry up BY NAME - and only for that lookup.
+                              # Held across the descent, as it used to be, a kill that
+                              # runs no code left the mode added with nothing reported;
+                              # `Search` widens around one lookup at a time and writes the
+                              # outstanding widen down first (#6006).
+                              search = Search(self, fd, path, st, mode)
+                          try:
+                              self._walk(fd, path, search)
+                          finally:
+                              search.release()
                   except OSError as err:
                       self.fail(path, "could not clear or descend: %s" % err)
                   finally:
-                      if restore is not None:
-                          # Reported, like the restore inside `_open_at`, and for the
-                          # same reason: a mode this walk added and could not take off is
-                          # something it changed and cannot account for. `fail` only
-                          # appends, so it cannot replace the verdict `_clear_fd` already
-                          # reached from this same descriptor - which was the whole
-                          # objection to reporting from a `finally` - and it makes `main`
-                          # exit non-zero. Silence here was "0 failed" over an inode left
-                          # more permissive than the walk found it, which is the #5657
-                          # shape with a mode in place of a flag (#6002).
-                          try:
-                              os.fchmod(fd, restore)
-                          except OSError as err:
-                              try:
-                                  applied = "0o%03o" % stat.S_IMODE(os.fstat(fd).st_mode)
-                              except OSError:
-                                  applied = "a mode that could no longer be read back"
-                              self.fail(path, "the mode this walk widened is left applied (%s, not the "
-                                              "0o%03o the walk found): %s" % (applied, restore, err))
                       os.close(fd)
 
-              def _walk(self, dirfd, path):
+              def _walk(self, dirfd, path, search):
+                  # `os.listdir` reads the descriptor this walk already holds, so it needs
+                  # no mode on the directory at all. Only the per-name lookup does, and
+                  # that - plus the open in `_open_at` - is the whole of what `search`
+                  # widens for (#6006).
                   for name in sorted(os.listdir(dirfd)):
                       child = os.path.join(path, name)
-                      try:
-                          st = os.lstat(name, dir_fd=dirfd)
-                      except FileNotFoundError:
-                          continue
-                      except OSError as err:
-                          self.fail(child, "could not stat, so a flag on it cannot be ruled out: %s" % err)
-                          continue
-                      self._visit(dirfd, name, child, st)
-
+                      with search:
+                          try:
+                              st = os.lstat(name, dir_fd=dirfd)
+                          except FileNotFoundError:
+                              continue
+                          except OSError as err:
+                              self.fail(child, "could not stat, so a flag on it cannot be ruled out: %s" % err)
+                              continue
+                      self._visit(dirfd, name, child, st, search)
 
           def clear_tree(top):
-              """Clear append-only under `top`. Returns (cleared, failures)."""
+              """Clear append-only under `top`. Returns (cleared, repaired, failures)."""
               cleaner = Cleaner()
               cleaner.run(top)
-              return cleaner.cleared, cleaner.failures
+              return cleaner.cleared, cleaner.repaired, cleaner.failures
 
 
           def main(argv=None):
@@ -1346,9 +1565,14 @@ jobs:
                   why = "is a symlink and is never followed" if os.path.islink(top) else "is not there"
                   print("clear-append-only-scratch: %s under %s %s; nothing to do" % (SCRATCH_DIR, args.root, why))
                   return 0
-              cleared, failures = clear_tree(top)
+              cleared, repaired, failures = clear_tree(top)
               for path in cleared:
                   print("clear-append-only-scratch: cleared append-only on %s" % path)
+              for path, applied, want in repaired:
+                  # A repair is this run finishing what a killed one started, so it is
+                  # named even though nothing is wrong by the time anyone reads it (#6006).
+                  print("clear-append-only-scratch: put mode 0o%03o back on %s, which a previous run left "
+                        "at 0o%03o" % (want, path, applied))
               for path, why in failures:
                   print("::error::clear-append-only-scratch: could not clear %s: %s" % (path, why), file=sys.stderr)
               print("clear-append-only-scratch: %d cleared, %d failed" % (len(cleared), len(failures)))

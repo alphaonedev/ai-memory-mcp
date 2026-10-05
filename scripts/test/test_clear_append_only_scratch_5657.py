@@ -220,6 +220,30 @@ def run_clear_in_process(mod, root):
     return rc, out.getvalue(), err.getvalue()
 
 
+# Run the janitor and have it killed the instant a mode it widened is on disk.
+# The seam is `os.fchmod`, which is where BOTH the pre-#6006 descent-wide widen
+# and the per-lookup `Search` widen land, so the same child reaches the same
+# window on either revision - the difference is what the NEXT run does about it.
+# `SIGKILL` is sent from inside the process because no handler, no `finally` and
+# no `atexit` may run: that is the whole of what this reproduces.
+_KILLED_MID_WIDEN = (
+    "import importlib.util as u, os, signal, stat, sys\n"
+    "spec = u.spec_from_file_location('selftest5657', sys.argv[1])\n"
+    "mod = u.module_from_spec(spec)\n"
+    "spec.loader.exec_module(mod)\n"
+    "script = mod.load_script_module()\n"
+    "real, fired = script.os.fchmod, []\n"
+    "def fchmod(fd, mode):\n"
+    "    real(fd, mode)\n"
+    "    if not fired:\n"
+    "        fired.append(mode)\n"
+    "        print('WIDENED 0o%03o' % stat.S_IMODE(os.lstat(sys.argv[3]).st_mode), flush=True)\n"
+    "        os.kill(os.getpid(), signal.SIGKILL)\n"
+    "script.os.fchmod = fchmod\n"
+    "sys.exit(script.main(['--root', sys.argv[2]]))\n"
+)
+
+
 @contextlib.contextmanager
 def foreign_euid(mod):
     """Make every inode in the tree look like somebody else's WITHOUT creating
@@ -883,6 +907,49 @@ class ScratchTreeCase(unittest.TestCase):
             self.assertNotIn(" 0 failed", out,
                              "the run reported no failures while leaving a mode it added:\n" + out)
 
+    def test_a_run_killed_with_a_widened_directory_is_repaired_by_the_next_run_6006(self):
+        """#6006. The widen used to be held for the whole subtree descent and
+        put back afterwards, which covers every exit that runs code and none of
+        the exits that do not. A job timeout, an OOM kill and any other
+        `SIGKILL` run no handler and no `finally`, so one of them inside that
+        window left the directory more permissive than the walk found it, with
+        nothing reported and nothing written down to find it by.
+
+        `SIGKILL` cannot be caught, so the remedy is not a handler: it is a
+        window one syscall wide plus a record on disk that the next run reads.
+        This test is the only thing that can tell the two apart, because the
+        leftover it is about is invisible by construction - the run that made it
+        is gone."""
+        d = self.scratch / ".tmpK"
+        d.mkdir()
+        (d / "inner.log").write_text("{}\n")
+        widened = 0o400 | stat.S_IXUSR
+        with restrictive(d, 0o400):
+            killed = subprocess.run(
+                [sys.executable, "-c", _KILLED_MID_WIDEN, str(Path(__file__).resolve()),
+                 str(self.ws), str(d)],
+                capture_output=True, text=True)
+            # Without these two the test is vacuous (#2444): a child that dies
+            # before it widens anything leaves a mode that was never changed,
+            # and a child that EXITS has run the code the defect is about.
+            self.assertIn("WIDENED 0o%03o" % widened, killed.stdout,
+                          "the child never reached the widened state:\n" + killed.stdout + killed.stderr)
+            self.assertEqual(killed.returncode, -signal.SIGKILL,
+                             "the janitor exited instead of being killed, so this is not the "
+                             "uncatchable window:\n" + killed.stdout + killed.stderr)
+            self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), widened,
+                             "a kill that runs no code cannot have put the mode back, so the "
+                             "fixture is not in the state this test is about")
+            r = run_clear(self.ws)
+            self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o400,
+                             "the next run left the mode a killed run added:\n" + r.stdout + r.stderr)
+            self.assertIn("put mode 0o400 back on %s" % d, r.stdout,
+                          "the repair is unreported, so nothing distinguishes it from a mode "
+                          "nobody ever changed:\n" + r.stdout + r.stderr)
+            self.assertIn("0o%03o" % widened, r.stdout,
+                          "the repair does not name the mode it found:\n" + r.stdout + r.stderr)
+            self.assertEqual(r.returncode, 0,
+                             "a leftover this run repaired is not a failure:\n" + r.stdout + r.stderr)
 
 # --------------------------------------------------------------------------
 # structural pins: the containment primitives the behaviour tests cannot race
