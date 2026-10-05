@@ -1,0 +1,4 @@
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# Binary files tracked in the repository (a PDF license agreement and a JPEG logo): they hold no readable text and no operator guidance, so the gate cannot and need not scan them.
+OIN_LICENSE_AGREEMENT.pdf
+docs/ai-memory-logo.jpg

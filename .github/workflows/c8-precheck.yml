@@ -475,6 +475,40 @@ jobs:
         # the stale-entry hard-fail, and the empty-scan fail-closed.
         run: bash scripts/check-capacity-claims.sh --self-test
 
+  pgbouncer-pool-mode-claim-gate:
+    # #4667 (5-agent vote 4d3ea1c5, decision memory b6ed2e38; gate form = the
+    # allowlist form of the PR 4655 gate vote, memory 19497ef6). The guide once
+    # called PgBouncer `pool_mode = transaction` REQUIRED while the Postgres
+    # adapter keeps state on the server session (migration advisory lock,
+    # search_path, statement_timeout) and is not safe behind that pooler
+    # (scripts/probe-pgbouncer-pool-mode.py exits 1). The gate does not try to
+    # recognise bad wordings. It scans every tracked text file for a line that
+    # mentions a pooler mode; each such line must state session mode or be on
+    # scripts/qc-allowlists/pgbouncer-pool-mode-allow.txt (file plus exact
+    # normalised line). A stale entry, a malformed entry or an empty scan fails.
+    name: PgBouncer pool-mode claim gate (#4667)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run pool-mode claim gate
+        run: python3 scripts/check-pgbouncer-pool-mode-claims.py
+      - name: Self-test the gate (regression evidence)
+        # Plants 20 different wordings of the retired claim (case, YAML and env
+        # forms, wrapped lines, HTML entities, ini, yml, txt, a per-database
+        # override, a nearby retirement word) and requires each to fail; checks
+        # the near misses pass; mutates the text, the file and the presence of
+        # every real allowlist entry and requires the gate to fail; and checks
+        # the fail-closed cases (missing allowlist, template without exactly
+        # one active session line) exit 2.
+        run: python3 scripts/check-pgbouncer-pool-mode-claims.py --self-test
+      - name: Behaviour test of the allowlist regen tool (round-5 code review)
+        # The regen tool writes the allowlist the gate trusts: refuse without a flag,
+        # --check never writes, no stock reason, lines the A1 shapes refuse never written,
+        # --drop-stale / --refresh-context / --reasons-file / skip-list reason
+        # promises; each promise has a mutant that must be killed.
+        run: python3 scripts/test-regen-pool-allow.py --mutants
+
   benchmark-claim-gate:
     # CERT GATE (TRUTHFULNESS; #2879, following #2869 + CERT-GATE-2
     # #2629/#2492). The final cert vote caught `ROADMAP.md` §9.5 still

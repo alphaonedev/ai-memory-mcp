@@ -2715,22 +2715,22 @@ impl PostgresStore {
         // that case to keep the wire silent for operators who
         // explicitly opted out of the safety envelope.
         //
-        // POOLER NOTE: this session-level `SET` is correct for a direct
-        // Postgres connection and for PgBouncer *session* mode. Under
-        // PgBouncer *transaction* mode (the mode the T4+ enterprise
-        // topology recommends) the standalone `SET` does NOT persist —
-        // PgBouncer runs it on whichever server connection it assigns
-        // for that one statement, then releases the connection, so the
-        // envelope is lost before the next transaction. Operators
-        // fronting the primary with a transaction-mode pooler MUST also
-        // pin the envelope at the Postgres role level (`ALTER ROLE
-        // aimemory SET statement_timeout = '…'; … SET lock_timeout =
-        // '…';`) so every backend inherits it as its server default.
-        // See docs/enterprise-deployment.md §5.6.6. We deliberately do
-        // NOT use the libpq `options` startup parameter to carry the
-        // timeout (PgBouncer < 1.21 rejects it and the daemon would
-        // fail to connect), keeping the role-level path the single
-        // version-independent pooled-deployment recipe.
+        // POOLER NOTE (#4667): this session-level `SET`, the `search_path`
+        // set_config in after_connect below and the migration advisory lock are server-SESSION
+        // state. They are correct on a direct Postgres connection and behind a
+        // PgBouncer in `session` mode. They are NOT safe behind `transaction` or
+        // `statement` mode: PgBouncer runs each on whichever server connection
+        // it assigns and may hand that connection to another client, which then
+        // sees this client's `search_path` and timeouts and can also be granted
+        // the migration lock (scripts/probe-pgbouncer-pool-mode.py exits 1 on
+        // both modes, 0 on session). Supported today: a direct connection or
+        // `session` mode (docs/enterprise-deployment.md §5.6). Transaction mode
+        // returns only when #4679 makes this state pooler-safe and the probe is
+        // green. Deployments that already ran transaction mode: §5.6.7 (role-
+        // level `ALTER ROLE ... SET` defaults narrow the exposure; they do not
+        // remove the lock hazard). Mirror the configured timeout values in
+        // the role defaults (see DEFAULT_STATEMENT_TIMEOUT_SECS).
+        //
         let stmt_secs = statement_timeout_secs;
         let lock_secs = if stmt_secs == 0 {
             0

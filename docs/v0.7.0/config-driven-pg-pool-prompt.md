@@ -3,6 +3,12 @@ layout: doc
 ---
 # Work Prompt — v0.7.0 Enhancement (a): Config-Driven Postgres Pool Sizing + Doc-Drift Fix + PgBouncer Admin-Docs
 
+> **SUPERSEDED (#4667, 2026-10-03).** The PgBouncer pooling setting this historical
+> prompt prescribes (task T7 and everywhere else below) is withdrawn: the postgres
+> adapter is not safe behind it. The supported setting is PgBouncer session mode;
+> see `docs/enterprise-deployment.md` §5.6. The prompt below is kept as the record
+> of what was asked in v0.7.0, not as guidance.
+
 > **Document type:** Operational AI-NHI work prompt. The operator feeds this
 > document back to the agent to BEGIN the work. Each task below carries a
 > self-contained starter prompt. Execute tasks in order; QC-gate every task;
