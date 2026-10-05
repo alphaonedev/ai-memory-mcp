@@ -2031,6 +2031,8 @@ ROUND3_RED = [
     ('5682 red 3: every -e and --execute option of a wget command is read', 'wget --exe robots=off --exec "http_password=$X" URL'),
     ('5682 red 4: every -e and --execute option of a wget command is read', 'wget -q -e robots=off -e timestamping=on -e "proxy_password=$X" URL'),
     ('5683 mutant pin: reported 1: the password command word of mysqladmin is matched in any letter case', 'mysqladmin PASSWORD "$X"'),
+    ('5684 mutant pin: reported 1: an operand after old-password or pass is a credential when it is not led by a dollar sign', 'mysqladmin old-password "x$NEW"'),
+    ('5684 mutant pin: reported 2: an operand after old-password or pass is a credential when it is not led by a dollar sign', 'mariadb-admin pass "x$X"'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
