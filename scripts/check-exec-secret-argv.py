@@ -539,16 +539,27 @@ def deny_lines(dl, rel: str, text: str) -> Dict[int, str]:
     return out
 
 
+# mysql family (#4920, #5464, #5502, #5582, #5583): keyed on the option shape of the whole family, not on a list of
+# client names. A head is mysql followed by word characters (mysqldump, mysqlimport, mysql_upgrade, ...) or
+# mariadb followed by word characters and dash words (mariadb-dump, mariadb-backup, ...), after any path or
+# wrapper; a head spelled in any letter case is read when it ends in .exe. The option is -p glued to a value
+# or a prefix of --password with an optional loose prefix and a dash or an underscore after it (my_getopt),
+# and its value is an expansion. --pa is a unique prefix of --password in the non-interactive clients (and
+# ambiguous with --pager in the bare interactive mysql and mariadb, which keep --pas as the shortest prefix);
+# every other family client reads --pa and up. No client list: a new family client is read by its head shape.
+_MY_HEAD = r"(?:mysql\w*|mariadb\w*(?:-\w+)*|(?i:(?:mysql\w*|mariadb\w*(?:-\w+)*)\.exe))(?![\w-]*=)"
+_MY_BARE = r"(?!(?i:mysql|mariadb)(?:\.exe)?(?![\w-]))"
+_MY_PW = r"(?:loose[-_])?pa(?:s(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?)?"
+_MY_PW_LONG = r"(?:loose[-_])?pas(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?"
+_MY_TAIL = r"[\"']?(?:\$|`)"
+MYSQL_FAMILY_RE = (
+    r"\b" + _MY_HEAD + r"[^|;&]*\s(?:-p|--" + _MY_PW_LONG + r"(?![\w-])[\s=]*)" + _MY_TAIL
+    + r"|\b" + _MY_BARE + _MY_HEAD + r"[^|;&]*\s(?:-p|--" + _MY_PW + r"(?![\w-])[\s=]*)" + _MY_TAIL)
+
 # A credential-taking flag of a known tool fed from any expansion: the value is on argv
 # whatever the variable is called, so such a line is never allow-able (pending + issue only).
 CRED_TOOL_RE = re.compile(
-    # mysql family: -p glued to the value, or --password with a space or an equals sign (#4920). Every
-    # client accepts each unique prefix from --pas up, with an optional loose prefix and a - or _ after it (#5582). --pa is a
-    # unique prefix of --password in the dump and admin tools but ambiguous with --pager in the
-    # interactive mysql and mariadb clients (the first arm excludes it; mariadb-dump and mariadb-admin
-    # also match the first arm at the word boundary, and the second arm reads their --pa) (#5464, #5502).
-    r"\b(?:mysql|mariadb)\b[^|;&]*\s(?:-p|--(?:loose[-_])?pas(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?(?![\w-])[\s=]*)[\"']?(?:\$|`)"
-    r"|\b(?:mysqladmin|mysqldump|mariadb-admin|mariadb-dump)\b[^|;&]*\s(?:-p|--(?:loose[-_])?pa(?:s(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?)?(?![\w-])[\s=]*)[\"']?(?:\$|`)"
+    MYSQL_FAMILY_RE +
     r"|\bsshpass\s+-p\s*[\"']?(?:\$|`)"
     r"|\bredis-cli\b[^|;&]*\s(?:-a|--pass(?![\w-]))[\s=]*[\"']?(?:\$|`)"
     # one shell word after the flag that expands a variable, however its user part is quoted:
@@ -1550,6 +1561,51 @@ ROUND3_RED = [
     ("5502 mysqldump --loose-pa", 'mysqldump --loose-pa="$DB_PASSWORD" db'),
     ("5502 mariadb --loose-password", 'mariadb --loose-password="$DB_PASSWORD" db'),
     ("5502 mysqladmin --loose-passw backtick", 'mysqladmin --loose-passw=`cat f` status'),
+    # whole family keyed on the option shape, not on a client name list (#5583)
+    ("5583 mysqlcheck --pa", 'mysqlcheck --pa="$DB_PASSWORD" db'),
+    ("5583 mysqlpump --pa", 'mysqlpump --pa="$DB_PASSWORD" db'),
+    ("5583 mysqlbinlog --pa", 'mysqlbinlog --pa="$DB_PASSWORD" db'),
+    ("5583 mysqlshow --pa", 'mysqlshow --pa="$DB_PASSWORD" db'),
+    ("5583 mysqlslap --pa", 'mysqlslap --pa="$DB_PASSWORD" db'),
+    ("5583 mysqlimport --pa", 'mysqlimport --pa="$DB_PASSWORD" db'),
+    ("5583 mysql_upgrade --pa", 'mysql_upgrade --pa="$DB_PASSWORD" db'),
+    ("5583 mariadb-check --pa", 'mariadb-check --pa="$DB_PASSWORD" db'),
+    ("5583 mariadb-import --pa", 'mariadb-import --pa="$DB_PASSWORD" db'),
+    ("5583 mariadb-backup --pa", 'mariadb-backup --pa="$DB_PASSWORD" db'),
+    ("5583 mariadb-show --pa", 'mariadb-show --pa="$DB_PASSWORD" db'),
+    ("5583 mariadb-slap --pa", 'mariadb-slap --pa="$DB_PASSWORD" db'),
+    ("5583 mariadb-binlog --pa", 'mariadb-binlog --pa="$DB_PASSWORD" db'),
+    ("5583 mariadb-upgrade --pa", 'mariadb-upgrade --pa="$DB_PASSWORD" db'),
+    ("5583 mysqlcheck --pas", 'mysqlcheck --pas="$X" db'),
+    ("5583 mysqlslap --passw", 'mysqlslap --passw="$X" -q f'),
+    ("5583 mysqlimport --passwo space", 'mysqlimport --passwo "$X" db f'),
+    ("5583 mysqlpump --passwor", 'mysqlpump --passwor=$X'),
+    ("5583 mysqlshow --pass", 'mysqlshow --pass="$X"'),
+    ("5583 mysql_upgrade --pas backtick", 'mysql_upgrade --pas=`cat f`'),
+    ("5583 mariadb-backup --password", 'mariadb-backup --password="$X" --backup'),
+    ("5583 mysqlimport -p attached", 'mysqlimport -p"$X" db f'),
+    ("5583 mysqlcheck -p attached", 'mysqlcheck -p$X db'),
+    ("5583 mysqlslap -p attached", 'mysqlslap -p`cat f` -q f'),
+    ("5583 mariadb-backup -p attached", 'mariadb-backup -p"$X" --backup'),
+    ("5583 mysqlpump -p attached", 'mysqlpump -p"${DB_PASSWORD}"'),
+    ("5583 mysql_upgrade -p attached", 'mysql_upgrade -p"$X"'),
+    ("5583 mysqlbinlog -p attached", 'mysqlbinlog -p"$X" f'),
+    ("5583 mysqlcheck --loose_pa", 'mysqlcheck --loose_pa="$X" db'),
+    ("5583 mariadb-import --loose_pas", 'mariadb-import --loose_pas="$X" db f'),
+    ("5583 mysqlimport --loose-pa", 'mysqlimport --loose-pa="$X" db f'),
+    ("5583 mysqlslap --loose_password", 'mysqlslap --loose_password=$X'),
+    ("5583 path-prefixed mysqlcheck --pa", '/usr/bin/mysqlcheck --pa="$X" db'),
+    ("5583 path-prefixed mysqlimport -p", '/opt/mysql/bin/mysqlimport -p"$X" db f'),
+    ("5583 exe mysqlpump --pa", './mysqlpump.exe --pa=$X'),
+    ("5583 quoted path mysqlslap --passw", '"/usr/local/mysql/bin/mysqlslap" --passw="$X"'),
+    ("5583 windows path mysqlcheck.exe", 'C:\\mysql\\bin\\mysqlcheck.exe --pa="$X" db'),
+    ("5583 upper-case exe MYSQLDUMP.EXE -p", 'MYSQLDUMP.EXE -p"$X" db'),
+    ("5583 sudo mysqlimport -p", 'sudo -u deploy mysqlimport -p"$X" db f'),
+    ("5583 env mysqlcheck --pas", 'env MYSQL_HOST=h mysqlcheck --pas="$X" db'),
+    ("5583 nice mysqlslap --passw", 'nice -n5 mysqlslap --passw=$X'),
+    ("5583 ssh mysqlpump --pa", 'ssh h mysqlpump --pa="$X"'),
+    ("5583 time mariadb-backup --pa", 'time mariadb-backup --pa="$X" --backup'),
+    ("5583 docker exec mysqlimport -p", 'docker exec -i db mysqlimport -p"$X" d f'),
     # the loose_ underscore spelling: my_getopt reads the special prefix loose followed by - or _ (#5582)
     ("5582 mysql --loose_pas", 'mysql --loose_pas="$DB_PASSWORD" db'),
     ("5582 mysqldump --loose_pa", 'mysqldump --loose_pa="$DB_PASSWORD" db'),
@@ -1640,6 +1696,16 @@ ROUND3_GREEN = [
     ("5464 mysql --pass-file is not --pass", 'mysql -u r --pass-file="$PW_FILE" db'),
     ("5502 mariadb --pa is ambiguous, not --password", 'mariadb -u r --pa="$X" db'),
     ("5502 mysql --loose-pa is ambiguous, not --password", 'mysql --loose-pa="$X" db'),
+    ("5583 mysqlcheck --pass-file is not --pass", 'mysqlcheck --pass-file="$PW_FILE" db'),
+    ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
+    ("5583 mysqlimport -P is the port", 'mysqlimport -P "$DB_PORT" db f'),
+    ("5583 mysqlimport -p then a space prompts", 'mysqlimport -u r -p "$DB_NAME" f'),
+    ("5583 mysqlslap --pass_word is no option", 'mysqlslap --pass_word="$X"'),
+    ("5583 mysqlcheck --pass-word is no option", 'mysqlcheck --pass-word="$X" db'),
+    ("5583 docker publish with a variable and no family client", 'docker run -p"$HOST_PORT:80" nginx'),
+    ("5583 an environment variable name is not a family client", 'docker run -e MYSQL_ROOT_PASSWORD -p"$HOST_PORT:3306" img'),
+    ("5583 an interactive mariadb --pa is ambiguous", 'mariadb --pa="$X" db'),
+    ("5583 an interactive mysql.exe --loose_pa is ambiguous", 'mysql.exe --loose_pa="$X" db'),
     ("5582 mysql --loose_pa is ambiguous, not --password", 'mysql --loose_pa="$X" db'),
     ("5582 mysqldump --loose_password-file is not --password", 'mysqldump --loose_password-file="$PW_FILE" db'),
     ("5582 mysql --loose_pager is not --password", 'mysql --loose_pager="$PAGER_CMD" db'),
