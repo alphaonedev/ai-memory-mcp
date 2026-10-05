@@ -397,6 +397,18 @@ def parse_plant(stdout: str, xopts: list, isolate, returncode: int = 0) -> Plant
                  int(safe_path), frozen_xopt)
 
 
+def safe_path_probe_bad(plant: Plant) -> bool:
+    """#5511: True when a probe child started with -E and PYTHONSAFEPATH=1 in its environment either did not behave as
+    its own verdict says or reports a non-zero safe_path flag, that is, it honoured the environment variable."""
+    return (not plant.ok) or plant.safe_path != 0
+
+
+def safe_path_measurement_gap(has_flag: bool, honours: bool) -> bool:
+    """#5511: True when the interpreter has sys.flags.safe_path but a bare child did not report it from
+    PYTHONSAFEPATH, which means the measurement of PYTHONSAFEPATH support is itself broken."""
+    return has_flag and not honours
+
+
 def plant_coverage_gap(probed: list, names: list, rounds: int) -> bool:
     """#5443: True when `probed` is not exactly `names` once per round."""
     return probed != names * rounds
@@ -701,8 +713,16 @@ def _self_test_cases() -> int:
             return "a preloaded module's planted file ran, or the child did not report it preloaded"
         # #5441/#5475: with PYTHONSAFEPATH=1 in the environment the child, started with -E, must report safe_path 0
         # and the planted file must behave as the child's verdict says.
+        # #5511: the two conditions below are pure functions, pinned on synthetic input so that deleting or weakening one is red.
+        good, wrong_flag = parse_plant("VERDICT 0 1 1 1 0 -\nREAL\n", [], ("-S", "-E")), \
+            parse_plant("VERDICT 0 1 1 1 1 -\nREAL\n", [], ("-S", "-E"))
+        if safe_path_probe_bad(good) or not safe_path_probe_bad(wrong_flag) \
+                or not safe_path_probe_bad(parse_plant("", [], ("-S", "-E"))) \
+                or safe_path_measurement_gap(False, False) or safe_path_measurement_gap(True, True) \
+                or safe_path_measurement_gap(False, True) or not safe_path_measurement_gap(True, False):
+            return "the PYTHONSAFEPATH probe conditions are not pinned (#5511)"
         safe = plant_probe("importlib", base_dir / "implant", [], {**os.environ, "PYTHONSAFEPATH": "1"})
-        if not safe.ok or safe.safe_path != 0:
+        if safe_path_probe_bad(safe):
             return "the probe child honours PYTHONSAFEPATH, so its result depends on the environment"
         # Negative control (#5475): whether this interpreter honours PYTHONSAFEPATH is MEASURED by a bare child,
         # not read from sys.version_info. When it does, a child started without -E must report safe_path 1 and the
@@ -711,7 +731,7 @@ def _self_test_cases() -> int:
         honours = subprocess.run([sys.executable, "-S", "-c", "import sys; print(int(getattr(sys.flags, 'safe_path', 0)))"],
                                  capture_output=True, text=True, check=False,
                                  env={**os.environ, "PYTHONSAFEPATH": "1"}).stdout.strip() == "1"
-        if hasattr(sys.flags, "safe_path") and not honours:
+        if safe_path_measurement_gap(hasattr(sys.flags, "safe_path"), honours):
             return "this interpreter has sys.flags.safe_path but a bare child did not report it from PYTHONSAFEPATH (#5475)"
         if honours:
             control = plant_probe("importlib", base_dir / "implant", [], {**os.environ, "PYTHONSAFEPATH": "1"}, ("-S",))
