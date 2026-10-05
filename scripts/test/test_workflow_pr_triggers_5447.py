@@ -122,10 +122,18 @@ def _space_like(ch: str) -> bool:
 
 
 def _quoted_end(s: str, i: int) -> int:
-    """Index just past the quoted scalar that opens at s[i]; it must close on its row."""
+    """Index just past the quoted scalar that opens at s[i]; it must close on its row.
+
+    A double-quoted scalar may hold no backslash and a single-quoted one no doubled
+    quote (#5706): an escape can move the real closing quote to a later line.
+    """
     end = s.find(s[i], i + 1)
     if end < 0:
         raise Unparsed("quoted scalar does not close on its row: " + repr(s))
+    if s[i] == '"' and "\\" in s[i + 1:end]:
+        raise Unparsed("double-quoted scalar holds a backslash (#5706): " + repr(s))
+    if s[i] == "'" and s[end + 1:end + 2] == "'":
+        raise Unparsed("single-quoted scalar holds a doubled quote (#5706): " + repr(s))
     return end + 1
 
 
@@ -1107,7 +1115,9 @@ class ClosedWorld5705(unittest.TestCase):
 
     def test_5705_tab_row_inside_escaped_double_quote(self) -> None:
         # Round-2 reproducer 2. PyYAML: name swallows the tab row; on = the push block.
-        self._shape('name: "a\\"\n\ton:\n' + GOOD_PR + 'zz: 1 #"\n' + self.PUSH_BAD + self.J, self.LEAD)
+        # Since #5706 the escaped quote is refused first; the tab row alone is pinned
+        # by test_5705_tab_led_first_on_row.
+        self._shape('name: "a\\"\n\ton:\n' + GOOD_PR + 'zz: 1 #"\n' + self.PUSH_BAD + self.J, "backslash")
 
     def test_5705_unicode_space_led_rows(self) -> None:
         for lead in ("\u200b", "\u2003", "\u3000", "\u00a0 ", " \u00a0"):
@@ -1186,6 +1196,38 @@ class ClosedWorld5705(unittest.TestCase):
         for name, text in live.items():
             self.assertTrue(parse_triggers(text), name)
         self.assertGreaterEqual(len(live), 20)
+
+
+class QuotedScalars5706(unittest.TestCase):
+    """#5706: a quoted scalar holds no backslash and no quote of its own kind, else Unparsed."""
+
+    def _shape(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5706_escaped_double_quote_hides_the_on_block(self) -> None:
+        # PyYAML: name holds the on: rows as text; the file has no on key at all.
+        self._shape('name: "a\\"\non:\n' + GOOD_PR + 'zz: 1 #"\njobs: {}\n', "backslash")
+
+    def test_5706_escaped_double_quote_at_nested_level(self) -> None:
+        self._shape("name: x\non:\n" + GOOD_PR + 'x:\n  a: "b\\"\n  c: 1 #"\n', "backslash")
+        self._shape("name: x\non:\n" + GOOD_PR + 'x:\n  - "b\\"\n', "backslash")
+
+    def test_5706_any_backslash_in_double_quotes(self) -> None:
+        self._shape("name: x\non:\n" + GOOD_PR + 'x:\n  a: "b\\nc"\n', "backslash")
+        self._shape('"o\\x6e":\n' + GOOD_PR, "backslash")
+
+    def test_5706_doubled_single_quote(self) -> None:
+        self._shape("name: 'it''s'\non:\n" + GOOD_PR, "doubled quote")
+        self._shape("name: x\non:\n" + GOOD_PR + "x:\n  - 'a''\n", "doubled quote")
+
+    def test_5706_escapes_inside_flow_collections(self) -> None:
+        self._shape("name: x\non:\n  pull_request:\n    branches: [main, \"a\\\", 'rehearsal/**']\n", "backslash")
+        self._shape("name: x\non:\n" + GOOD_PR + "x: ['it''s']\n", "doubled quote")
+
+    def test_5706_other_kind_of_quote_inside_stays_clean(self) -> None:
+        text = "name: \"a'b\"\non:\n" + GOOD_PR + "x:\n  a: 'c\"d'\n  e: [\"f'g\", 'h\"i']\n"
+        self.assertEqual([], violations("x.yml", text))
 
 
 class GlobSemantics5447(unittest.TestCase):
