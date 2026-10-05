@@ -308,9 +308,10 @@ node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; 
 #  - outside main the scan refuses eval, read, mapfile, printf -v, indirect expansion, here-strings,
 #    here-documents not fed to a node, indexed and escaped-space assignments, default-assign and :?
 #    expansions, let, ((, process substitution and backticks (#5236, #5359, #5407, #5408, #5410).
-# It is a static aid and not a proof, and it has two stated limits (#5418): a redirect target held in a
-# variable is not resolved, and a node reply written to a file that is later read by a command the
-# scan does not list is not followed; whole-verify probes check the printed bytes for hostile replies.
+# It is a static aid and not a proof; a form it cannot decide is reported, not trusted (#5418): a redirect
+# target with an expansion or a glob is a file only as "$VAR/literal", so a target held in a variable is
+# the terminal, and a command it does not list that names a file this script writes is reported unless it
+# ends in a file redirect or is a silent file command. Whole-verify probes check the printed bytes.
 # reply_status prints a 3-digit HTTP
 # status, or the word non-status for anything else. reply_len prints the reply's byte count.
 # reply_version prints a version token only when it is 1 to 3 dot-separated groups of 1 to 3 ASCII

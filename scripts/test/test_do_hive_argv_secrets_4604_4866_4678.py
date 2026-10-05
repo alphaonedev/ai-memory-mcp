@@ -897,8 +897,13 @@ def tainted_names(text):
 # #5236, #5412: where does a command's stdout go? Every output redirect (> >> >| &> &>> >&N 1>...) is parsed and
 # the LAST one decides, as in bash. Only a plain path (a literal or a "$VAR/..." path) or /dev/null is a file:
 # a dup (&N), any other /dev path (stderr, stdout, tty, console, pts, fd, vcs ...), /proc, a target computed by
-# $( ), backticks or >( ) is the terminal. A redirect target held wholly in a variable is a stated limit (#5418).
+# $( ), backticks or >( ) is the terminal. #5418: a target the scan cannot decide is reported, not trusted: any
+# target with an expansion or a glob is a file only in the form "$VAR/<literal segments>" (a variable may end a
+# segment), so a target held wholly in a variable, or in a computed one, counts as the terminal.
 OUT_REDIRECT = re.compile(r"(?:(?<![0-9&<>])|(?<=[\s;]1))(&>>|&>|>>|>\||>)(?!\()\s*(\"[^\"]*\"|'[^']*'|\S+)")
+
+
+VAR_PATH = r"\$\{?\w+\}?/[\w.\-/]*(?:\$\{?\w+\}?[\w.\-]*)*"
 
 
 def stdout_to_file(text):
@@ -911,6 +916,8 @@ def stdout_to_file(text):
     if last.startswith("&") or "$(" in last or "`" in last or last.startswith(">("):
         return False
     if last.startswith("/dev/") and last != "/dev/null":
+        return False
+    if re.search(r"[$~*?\[{]", last) and not re.fullmatch(VAR_PATH, last):
         return False
     return not re.match(r"/proc/", last)
 
@@ -1157,6 +1164,35 @@ def reads_a_file_silent(stage):
     return bool(words) and words[0] in ("grep", "egrep", "fgrep") and any(re.fullmatch(r"-\w*[qclL]\w*", w) for w in words[1:])
 
 
+# #5418: a command that is not a listed file printer may still print a file; a command outside this set that names a
+# file the script wrote, and does not end in a file redirect or a silent consumer, is reported.
+SILENT_FILE_CMDS = frozenset(("rm", "mv", "cp", "chmod", "chown", "scp", "mkdir", "touch", "test", "[", "wc", "curl",
+                              "mktemp", "stat", "ln", "sync", "rmdir", "install", "exec", "trap", "cmp", "ls", "true"))
+
+
+def unlisted_reader_findings(text):
+    """#5418: a stage outside FILE_PRINTERS and SILENT_FILE_CMDS that names a file this script redirects output to
+    (as an operand or as an input redirect) is a reader the scan does not model, so it is reported."""
+    targets = set()
+    for m in OUT_REDIRECT.finditer(text):
+        t = m.group(2).strip("\"'")
+        if re.fullmatch(VAR_PATH, t):
+            targets.add(t)
+    bad = []
+    for n, line, func in logical_lines(text):
+        if func in ALLOWED or re.match(r"^\s*(?:ok|no|die)\(\) \{", line) or b64_pinned(line):
+            continue
+        for stage, _ in pipeline_stages(line):
+            words = stage_words(stage).split()
+            word = words[0] if words else ""
+            if not word or word in FILE_PRINTERS or word in SILENT_FILE_CMDS or word in ("printf", "echo"):
+                continue
+            body = re.sub(r"\d*>&?\S*|&>>?\S*", "", stage)
+            if any(t in body.replace("\"", "").replace("'", "") for t in targets) and not stdout_to_file(stage):
+                bad.append("%d:%s:unlisted file reader" % (n, word))
+    return bad
+
+
 def taint_findings(text, names):
     """Sink commands whose arguments name a node-derived variable other than through an allowed helper.
     #5236: a positional parameter, an indirect expansion, a pipe into anything but a silent or node-bound
@@ -1204,6 +1240,7 @@ def taint_findings(text, names):
     bad += consumer_findings(text, names)
     bad += arith_findings(text, names)
     bad += file_printer_findings(text)
+    bad += unlisted_reader_findings(text)
     return bad, checked
 
 
@@ -1380,7 +1417,24 @@ def closed_world_taint(fs):
                         ("type with the reply", 'type "$qjson"'), ("alias with the reply", 'alias "$qjson"'),
                         ("printf with the reply as the format", 'printf "$qjson"'),
                         ("command -v with the reply", 'command -v "$qjson"'),
-                        ("declare with the reply as the name", 'declare "$qjson"')):
+                        ("declare with the reply as the name", 'declare "$qjson"'),
+                        # #5418: a redirect target the scan cannot decide is reported; a reader it does not model too.
+                        ("a write to a target held in a variable", 'dest=/dev/stderr\nprintf %s "$qjson" > "$dest"'),
+                        ("a write to an unquoted variable target", 'dest=/dev/stderr\nprintf %s "$qjson" > $dest'),
+                        ("a write to a braced variable target", 'dest=/dev/stderr\nprintf %s "$qjson" >"${dest}"'),
+                        ("a write to a variable target with a suffix", 'printf %s "$qjson" > "$dest.log"'),
+                        ("a write to a tilde target", 'printf %s "$qjson" > ~/r'),
+                        ("a write to a glob target", 'printf %s "$qjson" > /dev/tty[0-9]*'),
+                        ("a write to a brace-expanded target", 'printf %s "$qjson" > /dev/{stderr,null}'),
+                        ("an append to a target held in a variable", 'dest=/dev/stderr\nprintf %s "$qjson" >> "$dest"'),
+                        ("a here-document to a target held in a variable", 'dest=/dev/pts/1\ncat > "$dest" <<EOT\nx $qjson\nEOT'),
+                        ("a read by perl", 'perl -pe 1 "$OUT_DIR/author.id"'),
+                        ("a read by python", "python3 -c 'import sys;print(open(sys.argv[1]).read())' \"$OUT_DIR/author.pub\""),
+                        ("a read by bat", 'bat "$OUT_DIR/author.id"'),
+                        ("a read by an input redirect", 'lolcat < "$OUT_DIR/author.id"'),
+                        ("a read of a file the probe wrote", 'printf %s x > "$OUT_DIR/r9"\nbat "$OUT_DIR/r9"'),
+                        ("a read of a peers file", 'batcat "$OUT_DIR/peers.conf.node$n"'),
+                        ("an unlisted reader at the end of a pipe", 'true | perl -pe 1 "$OUT_DIR/author.id"')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
         probe("V1 closed-world negative control is flagged: %s" % label, len(b2) > len(bad), str(b2[len(bad):][:2]))
     # #5236: constructs a name-based scan cannot follow are not allowed in federate.sh at all.
@@ -1441,6 +1495,14 @@ def closed_world_taint(fs):
                         ("stderr to the terminal, then a file", 'printf %s "$qjson" 2>&1 >"$OUT_DIR/r"'),
                         ("an &> to a file", 'printf %s "$qjson" &>"$OUT_DIR/r"'),
                         ("a dup to stderr, then a file", 'printf %s "$qjson" >&2 >"$OUT_DIR/r"'),
+                        # #5418: the "$VAR/literal" form stays a file, and the silent file commands are not readers.
+                        ("a file with a variable suffix", 'printf %s "$qjson" > "$OUT_DIR/r$n"'),
+                        ("a file under a braced variable", 'printf %s "$qjson" > "${OUT_DIR}/r.txt"'),
+                        ("rm of a written file", 'printf %s x > "$OUT_DIR/r9"\nrm -f -- "$OUT_DIR/r9"'),
+                        ("scp of a written file", 'printf %s x > "$OUT_DIR/r9"\nscp -q "$OUT_DIR/r9" h:/x >/dev/null 2>&1'),
+                        ("mv of a written file", 'printf %s x > "$OUT_DIR/r9"\nmv -f -- "$OUT_DIR/r9" "$OUT_DIR/r8"'),
+                        ("a reader that writes to a file", 'printf %s x > "$OUT_DIR/r9"\nbat "$OUT_DIR/r9" > "$OUT_DIR/o"'),
+                        ("a reader of an unrelated path", 'bat /etc/hostname'),
                         ("a here-document to a file", 'cat > "$OUT_DIR/r" <<EOT\nx $qjson\nEOT'),
                         # #5406: a reply is a VALUE of a declaration, or reaches a filter on stdin: both print nothing.
                         ("arithmetic on a counter", 'c=$((c + 1))\n[ "$c" -gt 3 ] && :'),
@@ -1858,8 +1920,9 @@ def comment_pin_5416():
     block = fs[start:end] if start >= 0 and end > start else ""
     missing = [w for w in sorted(SILENT_CONSUMERS | DECLARATORS) if not re.search(r"(?<![\w-])" + re.escape(w) + r"(?![\w-])", block)]
     probe("#5416 the closed-world comment names every silent word and declarator the scan allows", bool(block) and not missing, str(missing))
-    probe("#5416 the closed-world comment states the scan's two limits", "#5418" in block and "variable is not resolved" in block
-          and "does not list is not followed" in block, "")
+    probe("#5418 the closed-world comment states that an undecidable form is reported", "#5418" in block
+          and "a form it cannot decide is reported" in block and "is not resolved" not in block
+          and "is not followed" not in block, "")
     changelog = (ROOT / "changelog.d" / "4654.fixed.md").read_text()
     probe("#5416 the changelog does not call any member of the allowed set a known silent consumer",
           "known silent consumer" not in changelog and "#5418" in changelog, "")
