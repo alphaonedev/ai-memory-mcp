@@ -80,7 +80,15 @@ template file):
                      interpolates a ``${..password|secret|token|key|cred..}``
                      template variable (#4604).
   xtrace-secret      a line that expands a password-named variable while xtrace
-                     is on and not switched off by ``set +x`` (#4609). The
+                     is on and not switched off by ``set +x`` (#4609). A
+                     ``set +x`` counts only on a line proven top-level in
+                     the current shell (#5726): it starts outside every
+                     quote, subshell, ``$(..)``, backtick, ``${..}``,
+                     arithmetic, heredoc body, function header and
+                     continuation, closes what it opens and is not inside a
+                     multi-line if, loop, case or brace block; on any other
+                     line (``eval "set +x"`` included) the region stays
+                     traced. The
                      ``--self-test`` also runs the #4609 runtime probe: it
                      executes the credential-handling lines of the do-hive
                      ``provision.sh`` with a dummy password and proves the
