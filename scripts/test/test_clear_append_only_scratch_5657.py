@@ -29,6 +29,7 @@ is caught by meaning rather than by string match. `PyYAML` is required for those
 absence FAILS those tests rather than skipping them.
 """
 import ast
+import atexit
 import contextlib
 import errno
 import importlib.util
@@ -38,12 +39,14 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "clear-append-only-scratch.py"
@@ -99,6 +102,100 @@ def is_flagged(path):
     return any(c in r.stdout.split()[0] for c in "ai")
 
 
+# --------------------------------------------------------------------------
+# fixture containment (#5814): nothing this file creates may outlive it
+# --------------------------------------------------------------------------
+# A cancelled CI run does not unwind `addCleanup`. A fixture that is left at
+# mode 0o444 or 0o000 with anything inside it survives `git clean -ffdx` (git
+# cannot read the directory to empty it, and exits 1), so ONE cancellation
+# wedges the very runner this suite exists to unblock. Every mode this file
+# changes is therefore held by a context manager AND registered here, and the
+# registry is drained on the way out however the process leaves - normal exit,
+# SIGINT, SIGTERM, SIGHUP.
+_LEAKED_MODES = []
+_LEAKED_FLAGS = []
+
+
+def _drain_leaked_fixtures():
+    while _LEAKED_FLAGS:
+        path = _LEAKED_FLAGS.pop()
+        try:
+            drop_flags(path)
+        except Exception:  # a reaper never raises: it is the last thing to run
+            pass
+    while _LEAKED_MODES:
+        path, mode = _LEAKED_MODES.pop()
+        try:
+            if not os.path.islink(path):
+                os.chmod(path, mode)
+        except OSError:
+            pass
+
+
+def _install_fixture_reaper():
+    atexit.register(_drain_leaked_fixtures)
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is None:
+            continue
+        previous = signal.getsignal(number)
+
+        def handler(signum, frame, _previous=previous):
+            _drain_leaked_fixtures()
+            if callable(_previous):
+                return _previous(signum, frame)
+            raise SystemExit(128 + signum)
+
+        try:
+            signal.signal(number, handler)
+        except (ValueError, OSError):  # not the main thread: atexit still holds
+            pass
+
+
+_install_fixture_reaper()
+
+
+@contextlib.contextmanager
+def restrictive(path, mode):
+    """Hold `path` at `mode` for the body only, and put the old mode back
+    however the body ends - including a signal (#5814). The restore skips a
+    symlink, because a test that swaps an entry mid-race must not have its
+    cleanup chmod the swap target."""
+    path = str(path)
+    before = stat.S_IMODE(os.lstat(path).st_mode)
+    entry = (path, before)
+    _LEAKED_MODES.append(entry)
+    os.chmod(path, mode)
+    try:
+        yield path
+    finally:
+        try:
+            if not os.path.islink(path):
+                os.chmod(path, before)
+        except OSError:
+            pass
+        with contextlib.suppress(ValueError):
+            _LEAKED_MODES.remove(entry)
+
+
+@contextlib.contextmanager
+def flagged(path, immutable=False):
+    """Set an inode flag for the body only. A leftover flag is the #5657
+    defect itself, so the fixture that models it is never left behind."""
+    path = str(path)
+    set_flag(path, immutable=immutable)
+    _LEAKED_FLAGS.append(path)
+    try:
+        yield path
+    finally:
+        try:
+            drop_flags(path)
+        except Exception:
+            pass
+        with contextlib.suppress(ValueError):
+            _LEAKED_FLAGS.remove(path)
+
+
 def load_script_module():
     """Import the janitor as a module so a single platform seam can be made to
     fail. A subprocess cannot be given an unreadable flag state on demand."""
@@ -112,6 +209,75 @@ def run_clear(root, privileged=False):
     """Run the janitor. Unprivileged by default: that is how CI runs it."""
     cmd = ([] if (IS_BSD or not privileged) else _priv()) + [sys.executable, str(SCRIPT), "--root", str(root)]
     return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def run_clear_in_process(mod, root):
+    """Run the janitor inside this process, so a seam can be held open across
+    it. Returns `(rc, stdout, stderr)`."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = mod.main(["--root", str(root)])
+    return rc, out.getvalue(), err.getvalue()
+
+
+@contextlib.contextmanager
+def foreign_euid(mod):
+    """Make every inode in the tree look like somebody else's WITHOUT creating
+    one (#5814). `Cleaner._ownable` compares `st_uid` against `os.geteuid()`;
+    moving the EUID it compares against is indistinguishable from moving the
+    owner, the kernel's real EACCES still drives the branch, and no root-owned
+    fixture is left inside the runner workspace for a cancelled run to strand."""
+    if os.geteuid() == 0:
+        raise unittest.SkipTest("running as root: every inode is ownable")
+    with mock.patch.object(mod.os, "geteuid", return_value=os.geteuid() + 1):
+        yield
+
+
+@contextlib.contextmanager
+def swap_when_inspected(mod, inode, swap):
+    """Replace an entry at the instant the janitor decides it may widen it.
+
+    `Cleaner._ownable` is the last call before BOTH widen sites, so a swap
+    performed from here lands inside the window the janitor has to be immune
+    to. Yields a list that stays empty if the window was never reached, so a
+    test cannot pass by never racing anything."""
+    original = mod.Cleaner._ownable
+    fired = []
+
+    def ownable(st):
+        answer = original(st)
+        if st.st_ino == inode and not fired:
+            fired.append(True)
+            swap()
+        return answer
+
+    mod.Cleaner._ownable = staticmethod(ownable)
+    try:
+        yield fired
+    finally:
+        mod.Cleaner._ownable = staticmethod(original)
+
+
+@contextlib.contextmanager
+def swap_after_the_widen(mod, swap):
+    """Replace an entry the instant a widening chmod has landed and before the
+    janitor reopens the name. A widen by name and a widen through a pinned
+    descriptor both go through `os.chmod`, so this seam reaches the same
+    window either way - and what the two do afterwards is the whole of #5812."""
+    real = mod.os.chmod
+    fired = []
+
+    def chmod(*args, **kwargs):
+        real(*args, **kwargs)
+        if not fired:
+            fired.append(True)
+            swap()
+
+    mod.os.chmod = chmod
+    try:
+        yield fired
+    finally:
+        mod.os.chmod = real
 
 
 class ScratchTreeCase(unittest.TestCase):
@@ -128,6 +294,41 @@ class ScratchTreeCase(unittest.TestCase):
         self.log = self.audit / "audit.log"
         self.log.write_text("{}\n")
         self.addCleanup(self._teardown)
+
+    def tearDown(self):
+        """The property #5814 is actually about: when a test RETURNS, its
+        workspace must already be removable by an ordinary `git clean -ffdx`.
+
+        `tearDown` runs BEFORE the `addCleanup` repair, so a test that only
+        survives because of that repair fails here - which is the same test a
+        cancelled run would have failed by wedging the runner, except that
+        this way somebody finds out. A directory that is not readable,
+        writable and searchable by its owner cannot be emptied, and `git clean`
+        exits 1 and leaves the whole tree behind; an unreadable FILE is
+        harmless, because unlinking it only needs the parent's bits."""
+        stranded = []
+
+        def note(err):
+            stranded.append("%s: %s" % (err.filename, err.strerror))
+
+        need = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+        for root, dirnames, _files in os.walk(str(self.ws), onerror=note):
+            for name in [""] + list(dirnames):
+                full = os.path.join(root, name) if name else root
+                if os.path.islink(full):
+                    continue
+                try:
+                    mode = stat.S_IMODE(os.lstat(full).st_mode)
+                except OSError as err:
+                    stranded.append("%s: %s" % (full, err.strerror))
+                    continue
+                if mode & need != need:
+                    stranded.append("%s is a directory at mode 0o%03o" % (full, mode))
+        self.assertFalse(stranded,
+                         "the test left behind a fixture a cancelled run could not clean up "
+                         "(#5814): " + "; ".join(sorted(set(stranded))))
+        self.assertFalse(_LEAKED_MODES, "a mode change outlived the test that made it: %r" % (_LEAKED_MODES,))
+        self.assertFalse(_LEAKED_FLAGS, "an inode flag outlived the test that set it: %r" % (_LEAKED_FLAGS,))
 
     def _teardown(self):
         # `a+rwX`, not `u+rwX`: a root-owned fixture is not ours to widen for
@@ -178,20 +379,19 @@ class ScratchTreeCase(unittest.TestCase):
         look, put the mode back, and exit 0."""
         zero = self.audit / "unreadable.key"
         zero.write_text("k")
-        os.chmod(zero, 0o000)
         wo = self.audit / "writeonly.log"
         wo.write_text("w")
-        os.chmod(wo, 0o200)
         shut = self.scratch / ".tmpShut"
         shut.mkdir()
         (shut / "inner.log").write_text("{}\n")
-        os.chmod(shut, 0o000)
-        r = run_clear(self.ws)
-        self.assertEqual(r.returncode, 0, "an unflagged leftover must not red the leg:\n" + r.stdout + r.stderr)
-        self.assertIn("0 cleared, 0 failed", r.stdout)
-        self.assertEqual(stat.S_IMODE(os.lstat(zero).st_mode), 0o000, "original mode must be restored")
-        self.assertEqual(stat.S_IMODE(os.lstat(wo).st_mode), 0o200, "original mode must be restored")
-        self.assertEqual(stat.S_IMODE(os.lstat(shut).st_mode), 0o000, "original mode must be restored")
+        with restrictive(zero, 0o000), restrictive(wo, 0o200), restrictive(shut, 0o000):
+            r = run_clear(self.ws)
+            self.assertEqual(r.returncode, 0,
+                             "an unflagged leftover must not red the leg:\n" + r.stdout + r.stderr)
+            self.assertIn("0 cleared, 0 failed", r.stdout)
+            self.assertEqual(stat.S_IMODE(os.lstat(zero).st_mode), 0o000, "original mode must be restored")
+            self.assertEqual(stat.S_IMODE(os.lstat(wo).st_mode), 0o200, "original mode must be restored")
+            self.assertEqual(stat.S_IMODE(os.lstat(shut).st_mode), 0o000, "original mode must be restored")
 
     def test_unsearchable_directory_is_widened_not_reported_5657(self):
         """mode-0400 opens but cannot be stat'ed through: the janitor owns it,
@@ -199,21 +399,20 @@ class ScratchTreeCase(unittest.TestCase):
         d = self.scratch / ".tmpR"
         d.mkdir()
         (d / "inner.log").write_text("{}\n")
-        os.chmod(d, 0o400)
-        r = run_clear(self.ws)
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("0 cleared, 0 failed", r.stdout)
-        self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o400, "original mode must be restored")
+        with restrictive(d, 0o400):
+            r = run_clear(self.ws)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("0 cleared, 0 failed", r.stdout)
+            self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o400, "original mode must be restored")
 
     # -- SEC-F1: a surviving flag is never reported as success -------------
     def test_flagged_file_under_unreadable_directory_is_not_silently_skipped_5657(self):
         """The round-1 script walked with `os.walk` and no `onerror`, so this
         tree printed `0 cleared, 0 failed`, exited 0, and left the flag set."""
-        set_flag(self.log)
-        os.chmod(self.audit, 0o000)
-        r = run_clear(self.ws)
-        os.chmod(self.audit, 0o700)
-        still = is_flagged(self.log)
+        with flagged(self.log):
+            with restrictive(self.audit, 0o000):
+                r = run_clear(self.ws)
+            still = is_flagged(self.log)
         self.assertFalse(r.returncode == 0 and still,
                          "reported success while the flag survived:\n" + r.stdout + r.stderr)
         self.assertFalse("0 cleared, 0 failed" in r.stdout and still,
@@ -358,31 +557,136 @@ class ScratchTreeCase(unittest.TestCase):
         self.assertIn("0 cleared, 0 failed", out.getvalue())
 
     def test_foreign_owned_unreadable_directory_is_reported_5657(self):
-        if not _sudo_available():
-            raise unittest.SkipTest("no passwordless sudo to build a foreign-owned fixture")
-        if os.geteuid() == 0:
-            raise unittest.SkipTest("running as root: every inode is ownable")
+        """An inode the janitor does not own cannot be widened, so an EACCES
+        on it is reported rather than guessed at. The fixture moves the EUID
+        instead of creating a root-owned directory: a root-owned mode-000
+        directory inside the workspace is exactly what a cancelled run cannot
+        clean up and `git clean -ffdx` cannot remove (#5814)."""
+        mod = load_script_module()
         d = self.scratch / ".tmpForeign"
-        subprocess.run(_priv() + ["mkdir", "-p", str(d)], check=True, capture_output=True)
-        subprocess.run(_priv() + ["chmod", "000", str(d)], check=True, capture_output=True)
-        r = run_clear(self.ws)
-        self.assertNotEqual(r.returncode, 0, "an inode we cannot inspect is not a pass:\n" + r.stdout + r.stderr)
-        self.assertIn("not the owner", r.stderr)
-        self.assertIn(str(d), r.stderr)
+        d.mkdir()
+        with restrictive(d, 0o000), foreign_euid(mod):
+            rc, out, err = run_clear_in_process(mod, self.ws)
+        self.assertNotEqual(rc, 0, "an inode we cannot inspect is not a pass:\n" + out + err)
+        self.assertIn("not the owner", err)
+        self.assertIn(str(d), err)
 
     def test_foreign_owned_unsearchable_directory_is_reported_5657(self):
-        if not _sudo_available():
-            raise unittest.SkipTest("no passwordless sudo to build a foreign-owned fixture")
-        if os.geteuid() == 0:
-            raise unittest.SkipTest("running as root: every inode is ownable")
+        """Readable enough to list, not searchable enough to stat - and not
+        ours to widen. The entry that cannot be stat'ed is named, because a
+        flag on it cannot be ruled out."""
+        mod = load_script_module()
         d = self.scratch / ".tmpForeignRO"
-        subprocess.run(_priv() + ["mkdir", "-p", str(d)], check=True, capture_output=True)
-        subprocess.run(_priv() + ["touch", str(d / "inner.log")], check=True, capture_output=True)
-        subprocess.run(_priv() + ["chmod", "444", str(d)], check=True, capture_output=True)
-        r = run_clear(self.ws)
-        self.assertNotEqual(r.returncode, 0, "an entry we cannot stat is not a pass:\n" + r.stdout + r.stderr)
-        self.assertIn("cannot be ruled out", r.stderr)
-        self.assertIn(str(d / "inner.log"), r.stderr)
+        d.mkdir()
+        (d / "inner.log").write_text("{}\n")
+        with restrictive(d, 0o444), foreign_euid(mod):
+            rc, out, err = run_clear_in_process(mod, self.ws)
+        self.assertNotEqual(rc, 0, "an entry we cannot stat is not a pass:\n" + out + err)
+        self.assertIn("cannot be ruled out", err)
+        self.assertIn(str(d / "inner.log"), err)
+
+    # -- #5812 / #5813: the widen is the one mutation on an unproven entry --
+    def test_a_widen_is_never_redirected_onto_another_inode_5657(self):
+        """#5813. The entry is swapped for a symlink in the window between the
+        EACCES and the widen. A widen that goes by NAME re-resolves it and
+        lands on the symlink's target - an inode outside the scratch tree
+        entirely - so the assertion is on THAT inode's mode. The exit code is
+        1 either way, which is why it proves nothing here."""
+        mod = load_script_module()
+        victim = self.ws / "OUTSIDE-the-scratch-tree.key"
+        victim.write_text("v")
+        entry = self.audit / "unreadable.key"
+        entry.write_text("k")
+        with restrictive(victim, 0o000), restrictive(entry, 0o000):
+            inode = os.lstat(entry).st_ino
+            untouched = os.lstat(victim).st_ctime_ns
+
+            def swap():
+                os.unlink(entry)
+                os.symlink(victim, entry)
+
+            with swap_when_inspected(mod, inode, swap) as fired:
+                run_clear_in_process(mod, self.ws)
+            self.assertTrue(fired, "the seam never fired: the race window was never reached")
+            self.assertEqual(stat.S_IMODE(os.lstat(victim).st_mode), 0o000,
+                             "a widen was redirected onto an inode outside the scratch tree")
+            # The end-state mode alone is not enough: a widen that is redirected
+            # here and then RESTORED on the way out leaves the mode looking
+            # untouched while an inode outside the tree was still mutated twice.
+            # chmod bumps ctime, and a restore bumps it again, so ctime is what
+            # actually says "nothing out here was touched".
+            self.assertEqual(os.lstat(victim).st_ctime_ns, untouched,
+                             "an inode outside the scratch tree was chmod'ed and then put back")
+
+    def test_a_replaced_entry_is_refused_with_nothing_widened_5657(self):
+        """#5812, the deliberate refusal path. The entry is replaced by a
+        different inode before the widen; the janitor must notice and refuse,
+        and the inode that is left standing in the tree must not have been
+        widened on the way out."""
+        mod = load_script_module()
+        entry = self.audit / "unreadable.key"
+        entry.write_text("k")
+        # OUTSIDE the scratch tree, so the walk never visits the decoy itself
+        # and the only entry that races is the one the test is about.
+        decoy = self.ws / "decoy.key"
+        decoy.write_text("d")
+        with restrictive(entry, 0o000), restrictive(decoy, 0o000):
+            inode = os.lstat(entry).st_ino
+            with swap_when_inspected(mod, inode, lambda: os.replace(decoy, entry)) as fired:
+                rc, out, err = run_clear_in_process(mod, self.ws)
+            self.assertTrue(fired, "the seam never fired: the race window was never reached")
+            self.assertEqual(stat.S_IMODE(os.lstat(entry).st_mode), 0o000,
+                             "the replacement inode was left widened by a refusal")
+            self.assertNotEqual(rc, 0, "a replaced entry is not a pass:\n" + out + err)
+
+    def test_a_widened_mode_is_restored_when_the_reopen_fails_5657(self):
+        """#5812, the other exit. The widen lands on the right inode, and only
+        THEN is the name replaced, so the reopen fails. The inode the janitor
+        widened must be back at the mode the walk found it at - it is still in
+        the tree, just under a different name."""
+        mod = load_script_module()
+        entry = self.audit / "unreadable.key"
+        entry.write_text("k")
+        decoy = self.ws / "decoy.key"   # outside the scratch tree: never walked
+        decoy.write_text("d")
+        kept = self.ws / "kept-original.key"
+        with restrictive(entry, 0o000), restrictive(decoy, 0o000):
+            def swap():
+                os.rename(entry, kept)
+                os.replace(decoy, entry)
+
+            with swap_after_the_widen(mod, swap) as fired:
+                rc, out, err = run_clear_in_process(mod, self.ws)
+            self.assertTrue(fired, "the seam never fired: nothing was ever widened")
+        self.assertEqual(stat.S_IMODE(os.lstat(kept).st_mode), 0o000,
+                         "the widened mode was abandoned on the failure path")
+        self.assertNotEqual(rc, 0, "a failed reopen is not a pass:\n" + out + err)
+
+    def test_an_unsearchable_directory_is_widened_through_its_own_descriptor_5657(self):
+        """The mutant the first three reviews let through: widen by path
+        instead of by fd. The directory is swapped for a symlink in the window
+        between `_ownable` and the widen, so a by-name widen lands on the
+        symlink's target outside the scratch tree, while a widen on the
+        descriptor already held cannot move at all."""
+        mod = load_script_module()
+        victim = self.ws / "OUTSIDE-the-scratch-tree.key"
+        victim.write_text("v")
+        d = self.scratch / ".tmpR"
+        d.mkdir()
+        (d / "inner.log").write_text("{}\n")
+        with restrictive(victim, 0o000), restrictive(d, 0o400):
+            inode = os.lstat(d).st_ino
+
+            def swap():
+                os.chmod(d, 0o700)
+                shutil.rmtree(d)
+                os.symlink(victim, d)
+
+            with swap_when_inspected(mod, inode, swap) as fired:
+                run_clear_in_process(mod, self.ws)
+            self.assertTrue(fired, "the seam never fired: the race window was never reached")
+            self.assertEqual(stat.S_IMODE(os.lstat(victim).st_mode), 0o000,
+                             "the widen was applied to a re-resolved name, not to the open descriptor")
 
 
 # --------------------------------------------------------------------------
@@ -393,7 +697,17 @@ _BANNED_CALLS = frozenset({
     "os.path.realpath", "os.path.abspath", "os.unlink", "os.remove", "os.rmdir",
     "shutil.rmtree",
 })
-_DIR_FD_FUNCS = frozenset({"os.open", "os.lstat", "os.chmod"})
+# `os.chmod` is deliberately NOT in this set, and must never be put back into
+# it. `dir_fd` makes a lookup RELATIVE; it does not make it non-following, and
+# chmod's final component is still dereferenced. Asserting "it carries a
+# dir_fd" where the property is "it cannot be redirected onto another inode"
+# is what let a by-name widen survive three reviews (#5813). `os.open` is
+# non-following because `_OPEN_FLAGS` carries `O_NOFOLLOW` (pinned separately)
+# and `os.lstat` never follows; the walk may not call `os.chmod` at all.
+_DIR_FD_FUNCS = frozenset({"os.open", "os.lstat"})
+# Functions that walk the tree: a mode change from any of them must go through
+# a descriptor that is already held, never through a name.
+_WALK_FUNCS = ("_open_at", "_walk", "_visit", "_clear_fd")
 
 
 def _named_def(tree, name):
@@ -401,6 +715,20 @@ def _named_def(tree, name):
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return node
     raise AssertionError("%s defines no %s()" % (SCRIPT.name, name))
+
+
+def _named_class(tree, name):
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return node
+    raise AssertionError("%s defines no class %s" % (SCRIPT.name, name))
+
+
+def _named_method(tree, class_name, name):
+    for node in _named_class(tree, class_name).body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError("%s defines no %s.%s()" % (SCRIPT.name, class_name, name))
 
 
 def _carries_open_flags(tree, call):
@@ -476,6 +804,84 @@ class StructuralPinCase(unittest.TestCase):
                     self.assertIn("dir_fd", [kw.arg for kw in node.keywords],
                                   "%s in %s() resolves a path instead of a (dirfd, name) pair" % (name, fname))
 
+    def test_a_mode_is_only_ever_changed_through_a_held_descriptor_5657(self):
+        """#5813. The widen is the only mutation the walk performs on an entry
+        it has not proven anything about yet, so it must address an INODE. A
+        chmod by name - even one relative to a `dir_fd` - re-resolves the final
+        component and follows a symlink planted in the race window, which put
+        a mode on an inode outside the scratch tree entirely."""
+        for fname in _WALK_FUNCS:
+            for node in ast.walk(_named_def(self.tree, fname)):
+                if isinstance(node, ast.Call) and ast.unparse(node.func) == "os.chmod":
+                    self.fail("os.chmod in %s(): a mode change in the walk must go through a "
+                              "descriptor the walk already holds, never through a name" % fname)
+        self.assertIn("Widener(", ast.unparse(_named_def(self.tree, "_open_at")),
+                      "the EACCES widen must be bound to an inode by Widener")
+        capability = _module_assign(self.tree, "CAN_CHMOD_NOFOLLOW")
+        self.assertIn("os.supports_follow_symlinks", capability,
+                      "the no-follow chmod must be capability-tested, not guessed from a platform name")
+        for platform_name in ("darwin", "sys.platform", "uname", "IS_BSD"):
+            self.assertNotIn(platform_name, capability,
+                             "a platform name is not a capability test")
+
+    def test_the_widener_pins_the_inode_before_it_changes_anything_5657(self):
+        """Every widen goes through this class, so the class itself has to be
+        incapable of addressing a name that can be re-resolved (#5813)."""
+        init = _named_method(self.tree, "Widener", "__init__")
+        source = ast.unparse(init)
+        self.assertIn("os.O_PATH", source, "the entry must be pinned open before anything changes")
+        self.assertIn("_OPEN_FLAGS", source, "the pin must carry O_NOFOLLOW")
+        self.assertIn("st_dev", source)
+        self.assertIn("st_ino", source)
+        for node in ast.walk(init):
+            if not isinstance(node, ast.Call):
+                continue
+            name = ast.unparse(node.func)
+            self.assertNotEqual(name, "os.chmod", "the pin must land BEFORE any mutation")
+            if name == "os.open":
+                self.assertIn("dir_fd", [kw.arg for kw in node.keywords],
+                              "the pin must be taken relative to the open parent descriptor")
+        chmods = 0
+        for node in ast.walk(_named_method(self.tree, "Widener", "chmod")):
+            if not isinstance(node, ast.Call) or ast.unparse(node.func) != "os.chmod":
+                continue
+            chmods += 1
+            if "FD_DIR" in ast.unparse(node.args[0]):
+                continue  # addresses the pinned descriptor, not a name
+            keywords = {kw.arg: ast.unparse(kw.value) for kw in node.keywords}
+            self.assertEqual(keywords.get("follow_symlinks"), "False",
+                             "Widener.chmod(%s) may be redirected by a symlink"
+                             % ast.unparse(node.args[0]))
+        self.assertGreater(chmods, 0, "Widener.chmod changes no mode at all")
+        # Fail closed where neither route exists. On CPython the by-name leg
+        # also raises NotImplementedError when `fchmodat(AT_SYMLINK_NOFOLLOW)`
+        # is unsupported, so this guard is defence in depth - which is exactly
+        # why it needs a pin: deleting it is invisible to a behavioural test on
+        # any platform that has one of the two safe routes.
+        self.assertIn("CAN_CHMOD_NOFOLLOW", source,
+                      "the widener must refuse a platform with no non-following route")
+        raises = [n for n in ast.walk(init) if isinstance(n, ast.Raise)]
+        self.assertTrue(any("EPERM" in ast.unparse(n) for n in raises),
+                        "no safe route must be a refusal, never a widen by name")
+
+    def test_the_widen_is_restored_on_every_exit_from_the_open_5657(self):
+        """#5812. The widened mode escaped the old `_open_at` only on the
+        success return: a reopen that raised and the deliberate "the entry was
+        replaced" refusal both left the inode permanently more permissive."""
+        node = _named_def(self.tree, "_open_at")
+        handlers = [
+            h for h in ast.walk(node)
+            if isinstance(h, ast.ExceptHandler) and "widener.chmod(mode)" in ast.unparse(h)
+        ]
+        self.assertTrue(handlers, "_open_at has no exit that puts the widened mode back")
+        for handler in handlers:
+            self.assertTrue(any(isinstance(n, ast.Raise) for n in ast.walk(handler)),
+                            "a restored widen must still report the failure it came from")
+        self.assertTrue(
+            any(isinstance(n, ast.Try) and n.finalbody and "widener.close()" in ast.unparse(n.finalbody)
+                for n in ast.walk(node)),
+            "the pinning descriptor must be closed on every exit")
+
     def test_reopen_after_widening_is_checked_against_the_scanned_inode_5657(self):
         body = ast.unparse(_named_def(self.tree, "_open_at"))
         self.assertIn("os.fstat", body)
@@ -504,6 +910,66 @@ class StructuralPinCase(unittest.TestCase):
         for name in ("ENOTTY", "EOPNOTSUPP", "ENOTSUP"):
             self.assertIn(name, tolerated)
         self.assertNotRegex(tolerated, r"\b\d{2,}\b", "tolerate errnos by NAME, not by number")
+
+
+class FixtureSafetyCase(unittest.TestCase):
+    """#5814 - this suite runs ON the self-hosted runner it exists to unblock.
+    A fixture it cannot remove is the same outage it is testing for."""
+
+    def test_no_test_body_builds_a_fixture_it_cannot_remove_5657(self):
+        """A fixture built with `sudo` is owned by root. `addCleanup` does not
+        run when a workflow is cancelled, so one cancellation leaves a
+        root-owned directory in the runner workspace that `git clean -ffdx`
+        cannot remove and this janitor cannot heal. Privilege is for SETTING
+        AN INODE FLAG - which the owner can clear again - never for creating
+        an inode."""
+        tree = ast.parse(Path(__file__).resolve().read_text())
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+                continue
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                text = ast.unparse(call)
+                if "_priv()" in text or "'sudo'" in text or '"sudo"' in text:
+                    offenders.append("%s: %s" % (node.name, text.splitlines()[0]))
+        self.assertFalse(offenders, "a test body escalates privilege to build a fixture: "
+                                    + "; ".join(sorted(set(offenders))))
+
+    def test_a_cancelled_run_restores_every_mode_it_changed_5657(self):
+        """The reaper is the difference between "this suite was interrupted"
+        and "this runner is wedged", so it is tested by actually interrupting
+        a run that is holding a restrictive mode."""
+        base = ROOT / ".local-runs"
+        base.mkdir(exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix=".cancel5657-", dir=base))
+        self.addCleanup(shutil.rmtree, str(work), True)
+        victim = work / "fixture"
+        (victim / "inner").mkdir(parents=True)
+        (victim / "inner" / "x.log").write_text("{}\n")
+        before = stat.S_IMODE(os.lstat(victim).st_mode)
+        child = (
+            "import importlib.util as u, os, signal, stat, sys\n"
+            "spec = u.spec_from_file_location('selftest5657', sys.argv[1])\n"
+            "mod = u.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "held = mod.restrictive(sys.argv[2], 0o444)\n"
+            "held.__enter__()\n"
+            "print('HELD 0o%03o' % stat.S_IMODE(os.lstat(sys.argv[2]).st_mode), flush=True)\n"
+            "os.kill(os.getpid(), signal.SIGTERM)\n"
+        )
+        r = subprocess.run([sys.executable, "-c", child, str(Path(__file__).resolve()), str(victim)],
+                           capture_output=True, text=True)
+        # Without this the test is vacuous (#2444): a child that dies before it
+        # changes anything leaves the mode untouched and "restored" trivially.
+        self.assertIn("HELD 0o444", r.stdout,
+                      "the child never reached the held state, so nothing was restored:\n%s%s"
+                      % (r.stdout, r.stderr))
+        after = stat.S_IMODE(os.lstat(victim).st_mode)
+        self.assertEqual(after, before,
+                         "a cancelled run left %s at mode 0o%03o:\n%s%s" % (victim, after, r.stdout, r.stderr))
+        shutil.rmtree(victim)  # must not raise: this is what git clean does
 
 
 # --------------------------------------------------------------------------
@@ -742,6 +1208,20 @@ def job_runner_labels(job):
     return labels
 
 
+def _all_steps():
+    """Every `(path, job_id, step)` in every workflow in the repository."""
+    for path in sorted(WF_DIR.glob("*.yml")) + sorted(WF_DIR.glob("*.yaml")):
+        doc = load_workflow(path)
+        if not isinstance(doc, dict):
+            continue
+        for job_id, job in (doc.get("jobs") or {}).items():
+            if not isinstance(job, dict):
+                continue
+            for step in job.get("steps") or []:
+                if isinstance(step, dict):
+                    yield path, job_id, step
+
+
 def step_index(steps, predicate):
     for i, step in enumerate(steps):
         if isinstance(step, dict) and predicate(step):
@@ -784,7 +1264,13 @@ class WorkflowPinCase(unittest.TestCase):
     def test_clear_step_condition_runs_on_every_self_hosted_leg_5657(self):
         """Evaluated, not grepped: a guard rewritten to `== 'true'`, to
         `false && ...`, or to anything else that skips a self-hosted leg is a
-        poisoned runner on the next job."""
+        poisoned runner on the next job.
+
+        The `continue` below is the #2444 vacuity shape: with no clear step
+        anywhere, every job is skipped and the test passes having asserted
+        nothing. `evaluated` is what makes the pass mean something."""
+        evaluated = 0
+        covered = set()
         for path in WORKFLOWS:
             doc = load_workflow(path)
             for job_id, job in (doc.get("jobs") or {}).items():
@@ -792,6 +1278,8 @@ class WorkflowPinCase(unittest.TestCase):
                 idx = step_index(steps, is_clear_step)
                 if idx is None:
                     continue
+                evaluated += 1
+                covered.add(path.name)
                 condition = steps[idx].get("if")
                 self.assertIsNotNone(condition, "%s/%s clear step needs an `if:`" % (path.name, job_id))
                 legs = matrix_legs(job)
@@ -812,6 +1300,31 @@ class WorkflowPinCase(unittest.TestCase):
                             self.assertFalse(got, "%s/%s: hosted leg %r runs the clear step"
                                              % (path.name, job_id, leg))
                 self.assertGreater(self_hosted, 0, "%s/%s has no self-hosted leg" % (path.name, job_id))
+        self.assertEqual(covered, set(p.name for p in WORKFLOWS),
+                         "a workflow carries no clear step at all, so this test asserted nothing "
+                         "about it: %d guard(s) evaluated across %r"
+                         % (evaluated, sorted(covered)))
+
+    def test_a_step_that_is_not_the_clear_step_is_not_named_like_it_5657(self):
+        """Every pin in this file finds the clear step by EXACT name. A
+        neighbouring step one word away from that name makes the next edit of
+        either silently unpin the other, and a step that runs the SELF-TEST
+        while being named like the CLEAR step is the trap that was there."""
+        core = "append-only scratch clear"
+        checked = 0
+        for path, job_id, step in _all_steps():
+            name = str(step.get("name") or "")
+            if not name or is_clear_step(step):
+                continue
+            checked += 1
+            self.assertNotIn(core, name.lower(),
+                             "%s/%s step %r is one word from the clear step's exact name"
+                             % (path.name, job_id, name))
+            if SELFTEST_REL in str(step.get("run") or ""):
+                self.assertIn("self-test", name.lower(),
+                              "%s/%s runs the #5657 self-test but is not named as one"
+                              % (path.name, job_id))
+        self.assertGreater(checked, 0, "no named step was examined")
 
     def test_every_self_hosted_macos_job_clears_before_checkout_5657(self):
         """Repo-wide: ANY job that can land on the self-hosted macOS node and

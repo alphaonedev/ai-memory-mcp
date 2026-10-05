@@ -31,13 +31,28 @@ The decision rule is about FLAGS, not about openability (#5747 round 2):
 
 Containment. The walk descends by directory descriptor: every entry is reached
 as a bare name relative to an already-open parent fd, with `O_NOFOLLOW`, and
-every clear and every mode change happens on that descriptor. No path is ever
-re-resolved between the scan and the clear, so an intermediate directory cannot
-be swapped for a symlink underneath the walk; a reopen after a widening chmod is
-checked against the inode that was scanned. Symlinks are never followed and
-their flags are never cleared (a clear would have to go back through a path); a
-flagged symlink is reported instead. A flagged regular file with more than one
-link is refused, because its inode may also live outside the scratch tree.
+every flag clear happens on that descriptor.
+
+Widening a mode is the one mutation the walk performs on an entry it has not
+proven anything about yet, so it is bound to an INODE and never to a name (see
+`Widener`, #5813). On Linux the entry is pinned with `O_PATH|O_NOFOLLOW` - which
+succeeds whatever the mode is - and the pinned inode is compared with the
+scanned one BEFORE anything changes, so an entry swapped underneath the walk is
+refused with nothing mutated at all; the chmod then addresses that descriptor
+through `/proc/self/fd`, so it can neither follow a symlink nor land on a name
+that has since been replaced. Where there is no `O_PATH` (macOS) the chmod is
+`fchmodat` with `AT_SYMLINK_NOFOLLOW` relative to the already-open parent
+descriptor: it cannot traverse a symlink either, and cannot leave the directory
+the walk is standing in. A platform with neither mechanism gets no widen at all.
+
+The widened mode is put back on EVERY exit from the widen - a reopen that
+raised, an inode that turns out to have been swapped, and the ordinary success
+- so no inode is ever left more permissive than the walk found it (#5812). A
+reopen after a widening chmod is still checked against the inode that was
+scanned. Symlinks are never followed and their flags are never cleared (a clear
+would have to go back through a path); a flagged symlink is reported instead. A
+flagged regular file with more than one link is refused, because its inode may
+also live outside the scratch tree.
 
 The workflow runs this BEFORE `actions/checkout`, when the repository may not be
 on disk yet, so the workflow step carries a byte-identical inline copy of this
@@ -90,6 +105,17 @@ NO_FLAG_SUPPORT = frozenset(
 
 _OPEN_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
 _LIBC_FCHFLAGS = None
+
+# Widening a mode is the only mutation the walk performs on an entry it has not
+# proven anything about yet, so it has to address an inode rather than a name.
+# `O_PATH` opens an entry whatever its mode and `/proc/self/fd/N` then addresses
+# THAT inode (Linux). macOS has no `O_PATH`, but it does have
+# `fchmodat(AT_SYMLINK_NOFOLLOW)`, which `os.chmod(..., follow_symlinks=False)`
+# reaches; `os.supports_follow_symlinks` is the capability test, because the
+# same call raises `NotImplementedError` on Linux (#5813).
+HAS_O_PATH = hasattr(os, "O_PATH")
+FD_DIR = "/proc/self/fd"
+CAN_CHMOD_NOFOLLOW = os.chmod in os.supports_follow_symlinks and os.chmod in os.supports_dir_fd
 
 
 def _linux_ioctl_numbers():
@@ -163,6 +189,62 @@ def set_flags(fd, flags):
     fcntl.ioctl(fd, set_req, struct.pack("l", flags))
 
 
+class Widener:
+    """A mode change that cannot be redirected onto a different inode (#5813).
+
+    Built BEFORE anything is mutated, from the `(dirfd, name)` pair the walk is
+    standing on and the `lstat` that was already taken of it.
+
+    `os.chmod(name, ..., dir_fd=dirfd)` is NOT a descriptor operation: `dir_fd`
+    makes the lookup relative, it does not make it non-following, and the final
+    component is still dereferenced. So on Linux the entry is pinned open with
+    `O_PATH|O_NOFOLLOW` - which succeeds whatever the mode is, and which yields
+    the symlink itself rather than its target - and the pinned inode is compared
+    with the scanned one straight away: an entry swapped underneath the walk is
+    refused here, with nothing changed at all. Every later chmod goes through
+    `/proc/self/fd/N`, which addresses the pinned inode.
+
+    Where there is no `O_PATH`, `fchmodat(AT_SYMLINK_NOFOLLOW)` relative to the
+    already-open parent descriptor cannot traverse a symlink either, and cannot
+    leave the directory the walk is standing in. A platform with neither
+    mechanism gets no widen: the entry is reported, never mutated through a
+    resolvable path."""
+
+    def __init__(self, dirfd, name, st, want_dir):
+        self._dirfd = dirfd
+        self._name = name
+        self._fd = None
+        if HAS_O_PATH:
+            flags = _OPEN_FLAGS | os.O_PATH | (os.O_DIRECTORY if want_dir else 0)
+            fd = os.open(name, flags, dir_fd=dirfd)
+            pinned = os.fstat(fd)
+            if (pinned.st_dev, pinned.st_ino) != (st.st_dev, st.st_ino):
+                os.close(fd)
+                raise OSError(errno.EIO, "the entry was replaced while it was being inspected")
+            self._fd = fd
+        elif not CAN_CHMOD_NOFOLLOW:
+            raise OSError(errno.EPERM, "no way to widen a mode here without re-resolving the name")
+
+    def chmod(self, mode):
+        """Set `mode` on the pinned inode, or - with no `O_PATH` - on the entry
+        itself without following a symlink."""
+        if self._fd is None:
+            try:
+                os.chmod(self._name, mode, dir_fd=self._dirfd, follow_symlinks=False)
+            except NotImplementedError:
+                # The interpreter refuses this combination here. Widening by a
+                # name that would be re-resolved is not an acceptable fallback,
+                # so the entry is reported instead of being mutated.
+                raise OSError(errno.EPERM, "no way to widen a mode here without re-resolving the name")
+        else:
+            os.chmod("%s/%d" % (FD_DIR, self._fd), mode)
+
+    def close(self):
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+
 class Cleaner:
     """Depth-first clear over one scratch tree. Collects cleared paths and
     failures; never raises out of `run`."""
@@ -194,6 +276,10 @@ class Cleaner:
         Returns `(fd, mode_to_restore)`. A mode that hides the inode flags is
         answered by widening it - the owner can always chmod its way back in -
         and the caller restores the original mode through the descriptor. The
+        widen is bound to the inode that was scanned and never to the name (see
+        `Widener`, #5813), and the original mode is put back before EVERY
+        failure exit from here, so neither a swapped entry nor a failed reopen
+        can leave an inode more permissive than the walk found it (#5812). The
         reopened inode is compared with the one that was scanned, so an entry
         swapped underneath the walk is reported instead of being cleared."""
         flags = _OPEN_FLAGS | (os.O_DIRECTORY if want_dir else 0)
@@ -206,12 +292,25 @@ class Cleaner:
                 raise
             if not self._ownable(st):
                 raise PermissionError(errno.EACCES, "not the owner, so the flag state cannot be read")
-            os.chmod(name, mode | needed, dir_fd=dirfd)
-            fd = os.open(name, flags, dir_fd=dirfd)
-            opened = os.fstat(fd)
-            if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
-                os.close(fd)
-                raise OSError(errno.EIO, "the entry was replaced while it was being inspected")
+            widener = Widener(dirfd, name, st, want_dir)
+            try:
+                widener.chmod(mode | needed)
+                try:
+                    fd = os.open(name, flags, dir_fd=dirfd)
+                    opened = os.fstat(fd)
+                    if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                        os.close(fd)
+                        raise OSError(errno.EIO, "the entry was replaced while it was being inspected")
+                except BaseException:
+                    # The widen is never abandoned. A reopen that raised and an
+                    # inode that turns out to have been swapped both put the
+                    # original mode back before the failure leaves this frame;
+                    # a restore that itself fails replaces the error, so a
+                    # widened inode is never left behind silently.
+                    widener.chmod(mode)
+                    raise
+            finally:
+                widener.close()
             return fd, mode
         if want_dir and (mode & needed) != needed and self._ownable(st):
             # Readable enough to open, not searchable enough to stat its
@@ -304,7 +403,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     top = os.path.join(args.root, SCRATCH_DIR)
     if not os.path.isdir(top) or os.path.islink(top):
-        print("clear-append-only-scratch: no %s under %s; nothing to do" % (SCRATCH_DIR, args.root))
+        # A symlinked scratch root is refused, not absent: say which it was so
+        # the log cannot be read as "the janitor found nothing here" (#5657).
+        why = "is a symlink and is never followed" if os.path.islink(top) else "is not there"
+        print("clear-append-only-scratch: %s under %s %s; nothing to do" % (SCRATCH_DIR, args.root, why))
         return 0
     cleared, failures = clear_tree(top)
     for path in cleared:
