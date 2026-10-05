@@ -50,10 +50,14 @@ async fn reclassify_memory_kind_is_immediate_5084() {
     let out = store
         .reclassify_memory_kind(&ctx, &id, MemoryKind::Decision)
         .await;
-    {
+    let fired = {
         let mut conn = store.state.lock().await;
-        disarm_5084(&mut conn);
-    }
+        disarm_5084(&mut conn)
+    };
+    assert!(
+        fired,
+        "#5084: the interleaving hook never fired (vacuous pass)"
+    );
     assert!(
         matches!(out, Ok(true)),
         "#5084: reclassify_memory_kind must open BEGIN IMMEDIATE and not fail the lock \
