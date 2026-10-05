@@ -122,6 +122,15 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# #5745: a port is used in arithmetic (PORT_B + 1, PORT_B + 2), where a non-numeric value is evaluated as an expression
+# and an error aborts the enclosing block. Only a plain decimal port from 1 to 65533 (room for PORT_B + 2) is accepted;
+# the arithmetic compare runs only after the pattern has matched.
+for _lab_pv in "PORT_A=$PORT_A" "PORT_B=$PORT_B"; do
+  if [[ ! ${_lab_pv#*=} =~ ^[1-9][0-9]{0,4}$ ]] || (( ${_lab_pv#*=} > 65533 )); then
+    echo "run.sh: ${_lab_pv%%=*} must be a decimal port from 1 to 65533, got [${_lab_pv#*=}] (#5745)" >&2; exit 2
+  fi
+done
+
 # --probe-mutation mutates the cold-boot probe; with the probe skipped it would silently run nothing.
 if [ "$PROBE_MUTATION" -eq 1 ] && [ "$CAVEAT_PROBE" -eq 0 ]; then
   echo "--probe-mutation needs the cold-boot probe: it cannot be combined with --no-caveat-probe" >&2; exit 2

@@ -388,8 +388,8 @@ lab_shell_state_proven() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 256 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 250
+# 272 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 266
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), eight probe-matcher legs (lab_probe_refusal_names_knob against generated logs, each
 # checking the exact child status: 10, 11, or 4 for an unreadable log, #5662), three structural legs (the matcher body
@@ -420,7 +420,9 @@ lab_shell_state_proven() {
 # source, ., command, builtin, declare, export, exec, printf, :, unset, trap, set, eval, echo, shopt or [ (bash -p, which
 # ignores one, starts), an exported CDPATH, GLOBIGNORE, EXECIGNORE, FUNCNEST, BASH_COMPAT, TMOUT or GLOBSORT, an ENV
 # file that is never run, IFS from the environment that never arrives, an exported SHELLOPTS or BASHOPTS, and bash -x, -e, -T and -E, and two stated-limit legs, noexec
-# and bash -t, that exit 0 with no output), and one layout leg (this comment sits directly on the function).
+# and bash -t, that exit 0 with no output), sixteen port legs (#5745: a valid PORT_B, 65533 and 1 reach the next check;
+# 1/0, PORT_A+1, an array subscript, abc, -1, 0, a leading zero, 65534, 99999, 123456, a leading or trailing space and
+# PORT_A=abc exit 2 with the named line), and one layout leg (this comment sits directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
   local root="$1" bad=0 rc name want v1 v2 v3 v4 vr1 vr2 vr3 vok
@@ -905,6 +907,21 @@ lab_posture_selftest() {
   for k in -x -e -T -E; do _start "bash $k is refused" refused - "$k" || bad=1; done
   _start "an exported SHELLOPTS=noexec runs nothing" silent - SHELLOPTS=noexec || bad=1
   _start "bash -t runs one command" silent - -t || bad=1
+  # #5745: a port must be a plain decimal from 1 to 65533 before it reaches arithmetic; run.sh exits 2 with a named line.
+  # The control reaches the next check (the --probe-mutation and --no-caveat-probe combination), so no lab starts.
+  _port() {  # <label> <VAR=value> <wanted text>
+    local out; out="$(env -i PATH="$PATH" HOME="${HOME-}" "$2" "$BASH" "$runsh" --probe-mutation --no-caveat-probe 2>&1)"; rc=$?
+    if [ "$rc" = 2 ] && [[ $out == *"$3"* ]]; then echo "  PASS port check: $1 (exit 2)"; else echo "  FAIL port check: $1: exit $rc: $(printf '%s' "$out" | head -c 200)"; return 1; fi
+  }
+  local pbad='PORT_B must be a decimal port from 1 to 65533'
+  _port "a valid PORT_B reaches the next check (control)" PORT_B=19482 'cannot be combined with --no-caveat-probe' || bad=1
+  for k in 1/0 'PORT_A+1' 'x[$(:)]' abc -1 0 019482 65534 99999 123456 ' 19482' '19482 '; do
+    _port "PORT_B=[$k] is refused" "PORT_B=$k" "$pbad" || bad=1
+  done
+  _port "PORT_A=[abc] is refused" PORT_A=abc 'PORT_A must be a decimal port from 1 to 65533' || bad=1
+  _port "PORT_B=65533, the highest port, is accepted" PORT_B=65533 'cannot be combined with --no-caveat-probe' || bad=1
+  _port "PORT_B=1, the lowest port, is accepted" PORT_B=1 'cannot be combined with --no-caveat-probe' || bad=1
+  unset -f _port
   unset -f _start
   rm -rf "$plog"
   # #5198: the doc comment sits on the function it describes (a helper between them is drift).
