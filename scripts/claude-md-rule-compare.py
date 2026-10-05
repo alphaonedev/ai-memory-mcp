@@ -323,6 +323,19 @@ def commit_all(root: Path, message: str) -> str:
     return git(root, "rev-parse", "HEAD").decode().strip()
 
 
+CHILD_ENV_KEEP = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT")
+
+
+def child_env(extra=None) -> dict:
+    """#5508: the environment of every Python child the self-test starts. Built explicitly: only the names in
+    CHILD_ENV_KEEP are copied from this process (a child needs a PATH and a locale; SYSTEMROOT is for Windows), plus
+    `extra`. Nothing else is inherited, so PYTHONPATH, PYTHONHOME, PYTHONSAFEPATH, PYTHONSTARTUP, PYTHONINSPECT and the
+    like set by an operator cannot change what a child measures."""
+    env = {key: os.environ[key] for key in CHILD_ENV_KEEP if key in os.environ}
+    env.update(extra or {})
+    return env
+
+
 def non_isolated_child(script: Path, flags: list, scratch: Path):
     """#5380: run `script` with the interpreter flags `flags` (never -I) and the comparison arguments. Returns None
     without starting anything when `script` is inside the real scripts/ directory: there a merged sibling named
@@ -331,7 +344,7 @@ def non_isolated_child(script: Path, flags: list, scratch: Path):
         return None
     return subprocess.run([sys.executable, *flags, str(script), "--base-root", ".", "--repo", ".",
                            "--base-sha", "0" * 40, "--head-sha", "0" * 40, "--scratch", str(scratch)],
-                          capture_output=True, text=True, check=False)
+                          capture_output=True, text=True, check=False, env=child_env(), stdin=subprocess.DEVNULL)
 
 
 class Plant(NamedTuple):
@@ -349,7 +362,7 @@ class Plant(NamedTuple):
 
 def plant_probe(name: str, probe: Path, xopts: list, env=None, isolate=("-S", "-E")) -> Plant:
     """#5441: plant `name`.py beside a child that imports `name`, run with the isolation flags `isolate` (default
-    -S -E) plus the interpreter options `xopts`; `env` (None: inherit) is the child's environment. Before importing,
+    -S -E) plus the interpreter options `xopts`; `env` (None: child_env(), never the inherited environment) is the child's environment. Before importing,
     the CHILD prints its own verdict (through _frozen_importlib): whether `name` is already loaded, and whether it is
     loaded, built-in or frozen, together with the flags it was started with (#5473: sys.flags.no_site,
     sys.flags.ignore_environment, sys.flags.safe_path where the interpreter has it, and the frozen_modules -X
@@ -366,7 +379,8 @@ def plant_probe(name: str, probe: Path, xopts: list, env=None, isolate=("-S", "-
         "__import__(name)\n"
         "print('REAL')\n", encoding="utf-8")
     result = subprocess.run([sys.executable, *xopts, *isolate, str(probe / "probe.py")],
-                            capture_output=True, text=True, check=False, cwd=str(probe), env=env)
+                            capture_output=True, text=True, check=False, cwd=str(probe),
+                            env=child_env() if env is None else env, stdin=subprocess.DEVNULL)
     return parse_plant(result.stdout, xopts, isolate, result.returncode)
 
 
@@ -721,7 +735,7 @@ def _self_test_cases() -> int:
                 or safe_path_measurement_gap(False, False) or safe_path_measurement_gap(True, True) \
                 or safe_path_measurement_gap(False, True) or not safe_path_measurement_gap(True, False):
             return "the PYTHONSAFEPATH probe conditions are not pinned (#5511)"
-        safe = plant_probe("importlib", base_dir / "implant", [], {**os.environ, "PYTHONSAFEPATH": "1"})
+        safe = plant_probe("importlib", base_dir / "implant", [], child_env({"PYTHONSAFEPATH": "1"}))
         if safe_path_probe_bad(safe):
             return "the probe child honours PYTHONSAFEPATH, so its result depends on the environment"
         # Negative control (#5475): whether this interpreter honours PYTHONSAFEPATH is MEASURED by a bare child,
@@ -729,12 +743,12 @@ def _self_test_cases() -> int:
         # probe must say ok False (the planted file is inert while the verdict says shadowable); this shows the
         # check above can fail and that ok is not always True. When it does not, the control is skipped and said so.
         honours = subprocess.run([sys.executable, "-S", "-c", "import sys; print(int(getattr(sys.flags, 'safe_path', 0)))"],
-                                 capture_output=True, text=True, check=False,
-                                 env={**os.environ, "PYTHONSAFEPATH": "1"}).stdout.strip() == "1"
+                                 capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
+                                 env=child_env({"PYTHONSAFEPATH": "1"})).stdout.strip() == "1"
         if safe_path_measurement_gap(hasattr(sys.flags, "safe_path"), honours):
             return "this interpreter has sys.flags.safe_path but a bare child did not report it from PYTHONSAFEPATH (#5475)"
         if honours:
-            control = plant_probe("importlib", base_dir / "implant", [], {**os.environ, "PYTHONSAFEPATH": "1"}, ("-S",))
+            control = plant_probe("importlib", base_dir / "implant", [], child_env({"PYTHONSAFEPATH": "1"}), ("-S",))
             if control.safe_path != 1 or control.ok:
                 return "the probe cannot tell an inert planted file from a live one"
         print(f"INFO: self-test - this interpreter honours PYTHONSAFEPATH: {honours} (measured; the control runs only then)")
@@ -766,7 +780,8 @@ def _self_test_cases() -> int:
                 "sys.exit(module.run(argparse.Namespace(base_root='.', repo='.', base_sha='0' * 40, "
                 "head_sha='0' * 40, scratch=sys.argv[2], summary=None)))\n")
         result = subprocess.run([sys.executable, "-c", code, str(Path(__file__).resolve()), str(imp / "s")],
-                                capture_output=True, text=True, check=False, cwd=str(imp))
+                                capture_output=True, text=True, check=False, cwd=str(imp), env=child_env(),
+                                stdin=subprocess.DEVNULL)
         return result.returncode == 1 and "isolated mode" in result.stdout
 
     if importer_refusal():
@@ -774,6 +789,40 @@ def _self_test_cases() -> int:
     else:
         failures.append("importer refusal")
         print("FAIL: self-test - run() did not refuse a non-isolated caller that imports the module (#5377)",
+              file=sys.stderr)
+
+    def hostile_parent_env():
+        # #5508: the self-test children get a controlled environment (child_env), so a parent that exports the variables
+        # below must not change any result. Rerun the three child-spawning checks with those variables set in THIS
+        # process; each must still pass. PYTHONINSPECT is left out here only because a child that honoured it would
+        # wait on stdin; child_env never passes it either.
+        hostile_dir = base_dir / "hostile"
+        hostile_dir.mkdir(parents=True, exist_ok=True)
+        for name in EXPECTED_IMPORTS:
+            (hostile_dir / f"{name}.py").write_text("print('PLANTED')\nraise SystemExit(0)\n", encoding="utf-8")
+        startup = hostile_dir / "startup.py"
+        startup.write_text("print('PLANTED')\n", encoding="utf-8")
+        hostile = {"PYTHONPATH": str(hostile_dir), "PYTHONHOME": str(hostile_dir / "no-home"), "PYTHONSAFEPATH": "1",
+                   "PYTHONSTARTUP": str(startup), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONWARNINGS": "error"}
+        saved = {key: os.environ.get(key) for key in hostile}
+        os.environ.update(hostile)
+        try:
+            refusal_ok = isolated_refusal()
+            plant_why = importlib_plant()
+            importer_ok = importer_refusal()
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        return refusal_ok and not plant_why and importer_ok
+
+    if hostile_parent_env():
+        print("PASS: self-test - the probe, refusal and importer checks are green under a hostile parent environment (#5508)")
+    else:
+        failures.append("hostile parent environment")
+        print("FAIL: self-test - the probe, refusal and importer checks depend on the parent environment (#5508)",
               file=sys.stderr)
 
     def crash_cleanup():
@@ -792,7 +841,7 @@ def _self_test_cases() -> int:
                 "except RuntimeError:\n"
                 "    print('crashed')\n")
         result = subprocess.run([sys.executable, "-I", "-c", code, str(Path(__file__).resolve())],
-                                capture_output=True, text=True, check=False)
+                                capture_output=True, text=True, check=False, env=child_env(), stdin=subprocess.DEVNULL)
         lines = result.stdout.split()
         if len(lines) != 2 or lines[1] != "crashed" or not lines[0].isdigit():
             return False
