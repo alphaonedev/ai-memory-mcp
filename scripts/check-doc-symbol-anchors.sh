@@ -553,6 +553,39 @@ MDEOF
     anchor_red 5396 PATH "a next-line angle destination with indentation" \
         $'See [h](\n   <src/gone.rs>) x'
 
+    # Round-6 helper: a red case that also pins the exact text the violation
+    # reports (a wrong token named is a wrong report).
+    anchor_red_cites() {  # <issue> <rule> <description> <cites text> <line>
+        write_clean
+        printf '\n\n%s\n' "$5" >> "$FIX/README.md"
+        [[ "$(run_fixture)" != "0" ]] || {
+            echo "FAIL: self-test #$1 — $3 was ACCEPTED" >&2; exit 1; }
+        run_fixture_out | grep -qF "[$2]: README.md" || {
+            echo "FAIL: self-test #$1 — $3 rejected for the wrong reason (no $2)" >&2; exit 1; }
+        run_fixture_out | grep -qF "cites \"$4\"" || {
+            echo "FAIL: self-test #$1 — $3 did not name \"$4\"" >&2
+            run_fixture_out | sed 's/^/       /' >&2; exit 1; }
+        echo "PASS: self-test #$1 — $3 is REJECTED naming the right token"
+    }
+
+    # #5429: the entity spelling of an arrow (-&gt;) is not a group closer
+    # either, in every mix with real angle brackets.
+    anchor_green 5429 "a live method after a dyn Fn arrow written with entities throughout" \
+        "See \`$R::RecallTool&lt;dyn Fn(u8) -&gt; u8&gt;::decorate_memory_many\`."
+    anchor_green 5429 "an unbackticked entity arrow generic with a live method, then prose" \
+        "See $R::RecallTool&lt;dyn Fn(u8) -&gt; u8&gt;::decorate_memory_many and more."
+    anchor_green 5429 "an entity arrow inside real angle brackets with a live method" \
+        "See \`$R::RecallTool<dyn Fn(u8) -&gt; u8>::decorate_memory_many\`."
+    anchor_red_cites 5429 QUAL "a missing method after a mixed entity-arrow group" \
+        "$R::no_such" \
+        "See \`$R::RecallTool<dyn Fn(u8) -&gt; u8>::no_such\`."
+    anchor_red_cites 5429 QUAL "a missing method after an all-entity arrow group" \
+        "$R::no_such" \
+        "See \`$R::RecallTool&lt;dyn Fn(u8) -&gt; u8&gt;::no_such\`."
+    anchor_red_cites 5429 QUAL "a missing method in a brace item with an entity arrow" \
+        "$R::no_such" \
+        "See \`$R::{RecallTool&lt;F: Fn() -&gt; u8&gt;::no_such}\`."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
@@ -1133,11 +1166,12 @@ BRACE_BODY = re.compile(r"\{([^}]*)\}")
 def _group_step(text, j):
     """Classify the text at `j`: ('open'|'close', width) for an angle bracket
     or its HTML entity, ('stop', 1) for a character a group may not contain,
-    else ('other', 1). The `>` of an arrow (`->`) is not a closer."""
+    else ('other', 1). The `>` of an arrow (`->` or `-&gt;`) is not a closer."""
     if text.startswith("&lt;", j):
         return "open", 4
     if text.startswith("&gt;", j):
-        return "close", 4
+        # #5429: the entity spelling of an arrow (-&gt;) is not a closer.
+        return ("other", 4) if j > 0 and text[j - 1] == "-" else ("close", 4)
     ch = text[j]
     if ch == "<":
         return "open", 1
