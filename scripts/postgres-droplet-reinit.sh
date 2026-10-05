@@ -72,7 +72,9 @@
 #     the AI_MEMORY_SSH_HOST host when that is set). schema-init connects
 #     with sslmode=verify-full&sslrootcert=<PG_SSLROOTCERT> (#5143, #3705).
 #     No default: an unset, unreadable or oddly spelled path is refused before
-#     the backup and the first DROP.
+#     the backup and the first DROP. With AI_MEMORY_SSH_HOST set, one
+#     verify-full psql connection from that host (psql must be installed
+#     there) must also succeed before the backup, or the run exits 7 (#5600).
 #   * `PG_DUMP_SSLROOTCERT` (#5402): the CA file for the pg_dump backup, on THIS
 #     host (pg_dump connects to PG_HOST over TCP with sslmode=verify-full).
 #     Defaults to PG_SSLROOTCERT when AI_MEMORY_SSH_HOST is unset; required when
@@ -195,6 +197,31 @@ require_password() {
     export PGPASSWORD="$PG_PWD"
 }
 
+# libpq conninfo value: backslash and single quote escaped, the value single-quoted.
+conninfo_quote() {
+    local v="$1"
+    v="${v//\\/\\\\}"
+    v="${v//\'/\\\'}"
+    printf "'%s'" "$v"
+}
+
+# #5600: with AI_MEMORY_SSH_HOST, schema-init connects from the remote host with
+# the remote CA path, which pg_dump (on this host) does not prove. Before the
+# backup and any DROP, make one sslmode=verify-full psql connection from the
+# remote host to the same host, port, user and database as the store URL, with
+# the same CA path, and refuse (exit 7) when it fails. The password and the
+# connection string go over ssh stdin, never argv (#4603). psql must be
+# installed on the remote host; without it the probe fails and the run stops.
+require_remote_verify_full() {
+    local conninfo
+    conninfo="host=$(conninfo_quote "$PG_HOST") port=${PG_PORT} user=$(conninfo_quote "$PG_USER") dbname=${PG_PRIMARY_DB} sslmode=verify-full sslrootcert=${PG_SSLROOTCERT}"
+    if ! printf '%s\n%s\n' "$PG_PWD" "$conninfo" | ssh "$AI_MEMORY_SSH_HOST" \
+        "unset PGSERVICE PGSERVICEFILE; IFS= read -r PGPASSWORD; IFS= read -r c; export PGPASSWORD PGSSLMODE=verify-full PGSSLROOTCERT='$PG_SSLROOTCERT'; exec psql \"\$c\" -X -q -t -A -c 'select 1'" >/dev/null; then
+        echo "FATAL: a sslmode=verify-full connection from $AI_MEMORY_SSH_HOST to ${PG_HOST}:${PG_PORT} with sslrootcert=$PG_SSLROOTCERT failed; refusing before the backup and any DROP (#5600)" >&2
+        exit 7
+    fi
+}
+
 # #5143: refuse BEFORE the backup and any DROP unless the CA path is usable.
 # Plain path characters only: the path is spliced into the store URL query.
 require_sslrootcert() {
@@ -214,6 +241,7 @@ require_sslrootcert() {
             echo "FATAL: PG_SSLROOTCERT $PG_SSLROOTCERT is not readable on $AI_MEMORY_SSH_HOST" >&2
             exit 7
         fi
+        require_remote_verify_full
     elif [[ ! -r "$PG_SSLROOTCERT" ]]; then
         echo "FATAL: PG_SSLROOTCERT $PG_SSLROOTCERT is not readable" >&2
         exit 7

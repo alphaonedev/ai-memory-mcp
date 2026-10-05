@@ -16,6 +16,12 @@ Cases:
   #5402  the live pg_dump carries sslmode=verify-full and the CA in its
          connection string and in PGSSLMODE/PGSSLROOTCERT, with PGSERVICE
          unset; a missing CA file is refused (exit 7) before any pg_dump;
+  #5600  with AI_MEMORY_SSH_HOST set, a verify-full psql connection from the
+         remote host, with the same host, port, user, database and CA path
+         schema-init uses, must succeed before the backup and the DROP; a
+         failing probe exits 7 with no pg_dump and no DROP. The stub psql
+         stands in for libpq: the case proves the order and the arguments,
+         not real TLS verification.
 
 Scratch lives under <repo>/.local-runs (the repository forbids /tmp).
 """
@@ -206,6 +212,50 @@ class TestReinitPgDump5402(ReinitHarness):
         names = [c["argv0"] for c in self.calls()]
         self.assertNotIn("pg_dump", names)
         self.assertEqual(self.drops(), [])
+
+
+class TestReinitSshProbe5600(ReinitHarness):
+    def ssh_env(self, **extra):
+        env = {"AI_MEMORY_SSH_HOST": "h1", "PG_DUMP_SSLROOTCERT": str(self.ca)}
+        env.update(extra)
+        return env
+
+    def test_failing_remote_verify_full_probe_refuses_before_drop_5600(self):
+        proc = self.run_script(["--yes", "--skip-disposable"], **self.ssh_env(STUB_PSQL_RC="2"))
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        self.assertEqual(self.drops(), [], "no DROP after a failed verify-full probe")
+        names = [c["argv0"] for c in self.calls()]
+        self.assertNotIn("pg_dump", names)
+        self.assertNotIn("ai-memory", names)
+        self.assert_password_off_argv(proc)
+
+    def test_remote_probe_is_verify_full_with_the_schema_init_ca_5600(self):
+        proc = self.run_script(["--yes", "--skip-disposable"], **self.ssh_env())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        calls = self.calls()
+        probes = [c for c in calls if c["argv0"] == "psql"]
+        self.assertEqual(len(probes), 1, calls)
+        probe = probes[0]
+        conninfo = " ".join(probe["argv"])
+        self.assertIn("sslmode=verify-full", conninfo)
+        self.assertIn("sslrootcert=" + str(self.ca), conninfo)
+        self.assertIn("host='db.example.invalid'", conninfo)
+        self.assertIn("user='aimemory'", conninfo)
+        self.assertIn("dbname=aimemory", conninfo)
+        self.assertIn("port=5432", conninfo)
+        self.assertEqual(probe["pgsslmode"], "verify-full")
+        self.assertEqual(probe["pgsslrootcert"], str(self.ca))
+        self.assertFalse(probe["pgservice"])
+        self.assertTrue(probe["pgpassword_ok"], "the probe reads the password from ssh stdin")
+        names = [c["argv0"] for c in calls]
+        self.assertLess(names.index("psql"), names.index("pg_dump"), "probe before the backup")
+        self.assertLess(names.index("pg_dump"), names.index("sudo"), "backup before the DROP")
+        self.assert_password_off_argv(proc)
+
+    def test_dry_run_runs_no_remote_probe_5600(self):
+        proc = self.run_script(["--dry-run", "--skip-disposable"], **self.ssh_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.calls(), [])
 
 
 if __name__ == "__main__":
