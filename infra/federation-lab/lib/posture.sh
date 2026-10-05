@@ -349,7 +349,7 @@ lab_probe_body_allowed() {
 # program, ten child spellings (guard dropped or not chained, bash by bare name, no exec, exec without -c, no posix
 # mode, awk exits 0 or 1, awk by bare name, a relative awk path accepted, no readability check) and two extra-text
 # spellings (#5587)), twelve closed-world guard-body mutants (#5588, #5662, #5663), six probe-verdict legs (the two
-# verdicts, a shadowed builtin, every non-verdict status, a recorded reason over status 10, the #5662 return reproducer,
+# verdicts, a shadowed builtin, every non-verdict status, a recorded reason over status 10 and 11, the #5662 return reproducer,
 # a DEBUG trap under functrace forcing status 10, #5663), one hundred and five shadow-matrix legs (#5588: the control, one cell per table row per route (function, exported function,
 # alias, enable -n, enable -n with a PATH file, a lying function for builtin and type), the keyword row, lying type and
 # builtin with a function named exec, ten awk and bash cells (bare-name routes, absolute-path functions, caller-set
@@ -546,9 +546,12 @@ lab_posture_selftest() {
     [ "$v3" = "refused: the probe child exited $v4, which is not a verdict" ] || { echo "  FAIL probe verdict: status $v4 gave [$v3]"; vok=0; }
   done
   if [ "$vok" -eq 1 ]; then echo "  PASS probe verdict: every status other than 10 and 11 (0 1 2 3 4 9 12 126 127 137) reads as refused"; else bad=1; fi
-  v3="$( lab_probe_refusal_names_knob() { LAB_PROBE_WHY="a recorded reason; "; return 10; }; lab_probe_verdict "$plog/ok.log"; printf '%s' "$LAB_PROBE_VERDICT" )"
-  if [ "$v3" = "refused: a recorded reason; " ]; then echo "  PASS probe verdict: a recorded reason wins over a child status of 10"
-  else echo "  FAIL probe verdict: a recorded reason with status 10 gave [$v3]"; bad=1; fi
+  vok=1
+  for v4 in 10 11; do
+    v3="$( lab_probe_refusal_names_knob() { LAB_PROBE_WHY="a recorded reason; "; return "$v4"; }; lab_probe_verdict "$plog/ok.log"; printf '%s' "$LAB_PROBE_VERDICT" )"
+    [ "$v3" = "refused: a recorded reason; " ] || { echo "  FAIL probe verdict: a recorded reason with status $v4 gave [$v3]"; vok=0; }
+  done
+  if [ "$vok" -eq 1 ]; then echo "  PASS probe verdict: a recorded reason wins over a child status of 10 and of 11"; else bad=1; fi
   # #5662: the reported reproducer. One function named return (no second function) used to make the matcher run awk after the
   # guard refused, reporting not-detected for a log that holds the refusal line. No return is called on the verdict path now.
   v1="$( return() { LAB_PROBE_AWK=/bin/false; }; lab_probe_verdict "$plog/ok.log"; command printf '%s' "$LAB_PROBE_VERDICT" )"
