@@ -512,7 +512,7 @@ MDEOF
     anchor_red 5396 PATH "an escape-token link target on the next line" \
         $'Formerly [h](\nsrc/../gone.rs) x'
     anchor_red 5396 PATH "an escape-token reference definition target on the next line" \
-        $'Formerly [h]:\nsrc/../gone.rs'
+        $'Formerly it lived here.\n[h]:\nsrc/../gone.rs'
     anchor_red 5396 PATH "a missing file after a space, behind a live link on the same line" \
         'See [a](src/mcp/tools/recall.rs) and [b]( src/gone.rs) x'
     anchor_red 5396 LINE "a spaced link whose line fragment passes end-of-file" \
@@ -622,6 +622,21 @@ MDEOF
         $'See [`RecallTool`](\nsrc/mcp/tools/recall.rs) x'
     anchor_green 5431 "a next-line destination whose label is the module (file stem)" \
         $'See [`recall`](\nsrc/mcp/tools/recall.rs) x'
+
+    # #5432: only a real reference-definition head (or an open `](`) makes the
+    # next line a link target; prose that merely ends in `]:` does not.
+    anchor_green 5432 "prose ending in a bracketed word and a colon, then an absent escape path" \
+        $'Note [x]:\nsrc/../gone.rs no longer exists'
+    anchor_green 5432 "a sentence ending in a bracketed word and a colon, then an absent escape path" \
+        $'The legacy layout, see [old]:\nsrc/../gone.rs no longer exists'
+    anchor_red 5432 PATH "a real reference definition head, then an escape path on the next line" \
+        $'[x]:\nsrc/../gone.rs no longer exists'
+    anchor_red 5432 PATH "a list-item reference definition head, then an escape path below" \
+        $'- [x]:\nsrc/../gone.rs no longer exists'
+    anchor_red 5432 PATH "a blockquote reference definition head, then an escape path below" \
+        $'> [x]:\nsrc/../gone.rs no longer exists'
+    anchor_red 5432 PATH "an open link head, then an escape path on the next line" \
+        $'See [h](\nsrc/../gone.rs) no longer exists'
 
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
@@ -1352,7 +1367,6 @@ _SRC = r"(src/[A-Za-z0-9_/]+\.rs)(?:\?[^)#\s>\"']*)?"
 # loop below (LINK_OPEN).
 RELLINK = re.compile(r"\]\(\s*<?" + _SRC + r"(#[^)\s>]*)?>?" + _TITLE + r"\s*\)")
 LINK_OPEN = re.compile(r"\]\(\s*$")
-PREV_HEAD_OPEN = re.compile(r"(?:\]\(|\]:)\s*$")
 # #5269/#5343: two more relative-link forms to a src/ file: a markdown
 # reference definition (`[h]: src/x.rs "title"`, also inside a blockquote or a
 # list item; a destination on the NEXT line is joined in the loop below) and
@@ -1515,8 +1529,12 @@ for doc in seen_docs:
                 at = tm.start()
                 # #5396: a destination on the line after an open `](` or
                 # `]:` is a link target too.
+                # #5432: `]:` counts only at the start of a reference
+                # definition, never at the end of prose.
+                prev_line = doc_lines[ln - 2] if ln > 1 else ""
                 next_line_dest = (ln > 1 and not line[:at].strip(" \t<")
-                                  and bool(PREV_HEAD_OPEN.search(doc_lines[ln - 2])))
+                                  and bool(LINK_OPEN.search(prev_line)
+                                           or REFDEF_OPEN.match(prev_line)))
                 if (not absent_ok_at(at)
                         or line.startswith(tok + "::", at)
                         or ESCAPE_LINK_HEAD.search(line[:at])
