@@ -1426,6 +1426,50 @@ class JournalCase(ScratchTree):
                 held.pop(fields[1], None)
         return list(held.values())
 
+    def test_a_journalled_inode_that_gained_a_link_is_refused_not_repaired_6025(self):
+        """#6025. A run is killed the instant its widen of a mode-0o000 file has
+        landed, so the journal truly holds that widen. Before the next run a
+        second name for the inode appears OUTSIDE the scratch tree. Putting the
+        recorded mode back is a mode change on an inode this janitor was never
+        pointed at - the one #5936 refuses on the walk's own widen - so the
+        replay refuses it too: the outside name keeps its mode and its ctime,
+        the run says why, and the line is kept until a run meets the inode with
+        one link again, which then puts the mode back."""
+        f = self.audit / "held.log"
+        f.write_text("{}\n")
+        outside = self.ws / "outside-6025.log"
+        with restrictive(f, 0o000):
+            out = self.kill_at("chmod", 1, 0, f)
+            self.assertIn("held.log=0o400", out, "the widen had not landed when the kill did")
+            self.assertEqual(self.outstanding(), [(os.lstat(f).st_ino, 0o000, 0o400)],
+                             "the killed run did not leave its widen in the journal")
+            os.link(str(f), str(outside))
+            try:
+                before = os.lstat(outside)
+                r = run_clear(self.ws)
+                after = os.lstat(outside)
+                self.assertEqual(after.st_ctime_ns, before.st_ctime_ns,
+                                 "an inode reachable from outside the scratch tree was chmod'ed by the "
+                                 "replay:\n" + r.stdout + r.stderr)
+                self.assertEqual(stat.S_IMODE(after.st_mode), 0o400, r.stdout + r.stderr)
+                self.assertNotIn("put mode", r.stdout, r.stdout + r.stderr)
+                self.assertNotEqual(r.returncode, 0, "a refused replay is not a pass:\n" + r.stdout + r.stderr)
+                self.assertIn("2 links", r.stderr, r.stdout + r.stderr)
+                self.assertIn(str(f), r.stderr, r.stdout + r.stderr)
+                self.assertEqual(self.outstanding(), [(os.lstat(f).st_ino, 0o000, 0o400)],
+                                 "the record of a widen that is still applied was dropped:\n"
+                                 + r.stdout + r.stderr)
+            finally:
+                os.unlink(str(outside))
+            # The record survived, so a run that meets the inode with one link
+            # finishes it.
+            r = run_clear(self.ws)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(stat.S_IMODE(os.lstat(f).st_mode), 0o000, r.stdout + r.stderr)
+            self.assertIn("put mode 0o000 back on %s, which a previous run left at 0o400" % f, r.stdout,
+                          r.stdout + r.stderr)
+            self.assertEqual(self.outstanding(), [], r.stdout + r.stderr)
+
 
 class WidenFailureCase(ScratchTree):
     """What every exit from the widen in `_open_at` leaves behind, and what it

@@ -293,14 +293,16 @@ def set_flags(fd, flags):
     fcntl.ioctl(fd, set_req, struct.pack("l", flags))
 
 
-def _refuse_a_shared_file(st):
+def _refuse_a_shared_file(st, change="widened to read its flags"):
     """Refuse a regular file with more than one link before its mode changes.
 
     Another name for the same inode may sit outside the scratch tree, and a
-    mode put on the inode is put on every one of its names (#5936)."""
+    mode put on the inode is put on every one of its names (#5936). That holds
+    for a widen and for putting a recorded mode back alike (#6025); `change`
+    names which one is refused."""
     if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
         raise PermissionError(errno.EACCES, "has %d links, so its inode may live outside the scratch "
-                                            "tree; its mode is not widened to read its flags" % st.st_nlink)
+                                            "tree; its mode is not %s" % (st.st_nlink, change))
 
 
 def _shown(text, stream):
@@ -829,6 +831,18 @@ class Cleaner:
         current = stat.S_IMODE(now.st_mode)
         for entry in entries:
             entry.settled = True
+        try:
+            # Putting a recorded mode back is a mode change on this inode, and
+            # an inode with a second name may live outside the scratch tree:
+            # the change would land on that name too. The widen it undoes was
+            # refused on the same grounds (#5936), so this is refused the same
+            # way, and the line is kept for a run that meets the inode with one
+            # link again (#6025).
+            _refuse_a_shared_file(now, "put back from the journal")
+        except PermissionError as err:
+            self.fail(path, "a previous run recorded widening this inode, and it %s, so nothing is "
+                            "changed and the journal line is kept" % err.strerror)
+            return current
         if not self._ownable(now):
             self.fail(path, "a previous run recorded widening this inode and this process may not "
                             "chmod it, so nothing is changed and the journal line is kept")
