@@ -1065,6 +1065,90 @@ def segment_view(segment: str) -> Tuple[str, List[int]]:
     return "".join(out), undecided
 
 
+def psql_segment_end(joined: str, head_end: int) -> int:
+    """Offset where the command that owns the psql word ends (#5516): the newline, an
+    unquoted ; | or & (not a redirection such as 2>&1 or &>) at the nesting level of the
+    word, or the close of the quote, parenthesis or backtick that holds it. Quote, $( ),
+    ( ) and backtick nesting is tracked from the line start so a separator inside a
+    string or a substitution does not end the segment. A quote that holds only the word
+    ("$PSQL", "psql") is part of the word, not an enclosing string, so its close does
+    not end the segment."""
+    n = len(joined)
+    i = joined.rfind("\n", 0, head_end) + 1
+    stack: List[str] = []
+    opens: List[int] = []
+    base = -1
+    base_top = ""
+    word_quote = False
+
+    def push(ch: str, at: int) -> None:
+        stack.append(ch)
+        opens.append(at)
+
+    def pop() -> None:
+        stack.pop()
+        opens.pop()
+
+    while i < n:
+        if base < 0 and i >= head_end:
+            base, base_top = len(stack), (stack[-1] if stack else "")
+            if base_top in ('"', "'"):
+                close = joined.find(base_top, head_end)
+                inside = joined[opens[-1] + 1:close if close >= 0 else n]
+                word_quote = close >= 0 and not re.search(r"\s", inside)
+        c = joined[i]
+        if c == "\n":
+            return i
+        top = stack[-1] if stack else ""
+        if c == "\\" and top != "'":
+            i += 2
+            continue
+        if top == "'":
+            if c == "'":
+                pop()
+        elif top == '"':
+            if c == '"':
+                pop()
+            elif c == "`":
+                push("`", i)
+            elif c == "$" and joined[i + 1:i + 2] == "(":
+                push("(", i)
+                i += 1
+        elif c in "'\"":
+            push(c, i)
+        elif c == "`":
+            if top == "`":
+                pop()
+            else:
+                push("`", i)
+        elif c == "(":
+            push("(", i)
+        elif c == ")":
+            if top == "(":
+                pop()
+            elif base >= 0:
+                return i
+        elif c in ";|&" and base >= 0 and len(stack) == base and top == base_top:
+            redirect = c == "&" and (joined[i - 1:i] in ("<", ">") or joined[i + 1:i + 2] == ">")
+            if not redirect:
+                return i
+        if base >= 0 and len(stack) < base:
+            if not word_quote:
+                return i
+            word_quote = False
+            base = len(stack)
+            base_top = stack[-1] if stack else ""
+        i += 1
+    return n
+
+
+def psql_command_snippet(text: str, start: int, end: int) -> str:
+    """The whole (continued) psql command from its word to the segment end, on one
+    line, so a hit shows the offending option (#5516)."""
+    one = re.sub(r"\\\r?\n\s*", " ", text[start:end])
+    return redact(re.sub(r"\s+", " ", one).strip())
+
+
 def psql_var_operand_flagged(operand: str) -> bool:
     """A psql -v operand is flagged when its name is secret-like, non-ASCII or
     undecidable (#5448), or when its VALUE expands a secret-named variable (#5483)."""
@@ -1113,9 +1197,8 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
     # _line_of on the original text still names the right line.
     joined = norm.replace("\\\n", "  ")
     for head in PSQL_HEAD_RE.finditer(joined):
-        eol = joined.find("\n", head.end())
-        segment = joined[head.end():eol if eol >= 0 else len(joined)]
-        shell_view, undecided = segment_view(segment)
+        end = psql_segment_end(joined, head.end())
+        shell_view, undecided = segment_view(joined[head.end():end])
         for off in undecided:
             line, snippet = _line_of(text, head.end() + off)
             hits.append((rel, line, "[psql-undecidable-option] " + snippet))
@@ -1123,8 +1206,9 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
                for m in PSQL_VAR_OPT_RE.finditer(shell_view)):
             # head.start() is the PREFIX character, a newline when psql opens a line, which
             # reported the previous line; the word itself names the line (#5485).
-            line, snippet = _line_of(text, head.start("word"))
-            hits.append((rel, line, "[env-password-argv] " + snippet))
+            line = _line_of(text, head.start("word"))[0]
+            hits.append((rel, line, "[env-password-argv] "
+                         + psql_command_snippet(text, head.start("word"), end)))
     for rule, tag in ((PSQL_URL_RE, "psql-url-password"), (DOCKER_ENV_DSN_RE, "env-dsn-argv"),
                       (SSH_REMOTE_URL_RE, "ssh-remote-url-password")):
         for m in rule.finditer(text):
@@ -1744,6 +1828,29 @@ def runtime_probe() -> int:
     return bad
 
 
+# #5516 (PR 4810 round-6 F5): (name, text, expected hit lines, text each snippet shows).
+PSQL_SEGMENT_PROBES = (
+    ("5516-01-repeated-head-one-hit", 'psql -X; psql -v pw="$PG_PW"', [1], "-v pw="),
+    ("5516-02-continued-snippet-shows-v", 'psql \\\n  -X \\\n  -v pw="$PG_PW" \\\n  -f x.sql\n', [1], "-v pw="),
+    ("5516-03-two-real-commands-two-hits", 'psql -v pw="$A"; psql -v token="$B"', [1, 1], "-v"),
+    ("5516-04-separator-inside-quotes-kept", 'psql -c "select 1;" -v pw="$PG_PW"', [1], "-v pw="),
+    ("5516-05-redirect-ampersand-kept", 'psql -X 2>&1 -v pw="$PG_PW"', [1], "-v pw="),
+    ("5516-06-ampersand-redirect-kept", 'psql -X &>/dev/null -v pw="$PG_PW"', [1], "-v pw="),
+    ("5516-07-separator-inside-substitution-kept", 'psql -X $(true; echo) -v pw="$PG_PW"', [1], "-v pw="),
+    ("5516-08-second-line-reports-line-2", 'echo a\npsql -X \\\n  -v pw="$PG_PW"\n', [2], "-v pw="),
+    ("5516-09-other-command-after-semicolon", 'psql -X; foo -v pw="$PG_PW"', [], ""),
+    ("5516-10-other-command-after-pipe", 'psql -X | foo -v pw="$PG_PW"', [], ""),
+    ("5516-11-other-command-after-and", 'psql -X && foo -v pw="$PG_PW"', [], ""),
+    ("5516-12-head-in-parenthesis-ends-at-close", '(psql -X) -v pw="$PG_PW"', [], ""),
+    ("5516-13-head-in-backticks-ends-at-close", 'x=`psql -X` -v pw="$PG_PW"', [], ""),
+    ("5516-14-head-in-dollar-paren-ends-at-close", 'x=$(psql -X) -v pw="$PG_PW"', [], ""),
+    ("5516-15-head-in-double-quotes-ends-at-close", 'bash -c "psql -X" -v pw="$PG_PW"', [], ""),
+    ("5516-16-or-list", 'psql -X || foo -v pw="$PG_PW"', [], ""),
+    ("5516-17-quoted-variable-head-keeps-segment", '"$PSQL" -v pw="$PG_PW" -f x.sql', [1], "-v pw="),
+    ("5516-18-quoted-head-word-keeps-segment", '"psql" -v pw="$PG_PW" -f x.sql', [1], "-v pw="),
+)
+
+
 def self_test() -> int:
     bad = 0
     red = green = 0
@@ -1819,6 +1926,15 @@ def self_test() -> int:
     if [h[1] for h in pinned] != [4]:
         print("SELF-TEST FAIL: a psql -v hit after split heads is not reported on line 4: %r" % pinned, file=sys.stderr)
         bad += 1
+    # #5516: one real command is one hit, on its own line, with a snippet that shows
+    # the offending option; a separator ends the psql segment.
+    for name, text, want_lines, must_show in PSQL_SEGMENT_PROBES:
+        red += 1
+        got = [h for h in scan_text("probe.md", text) if h[2].startswith("[env-password-argv]")]
+        if [h[1] for h in got] != want_lines or any(must_show not in h[2] for h in got):
+            print("SELF-TEST FAIL: psql segment probe %r gave %r (want lines %r showing %r)"
+                  % (name, got, want_lines, must_show), file=sys.stderr)
+            bad += 1
     # A reported snippet never carries the placeholder secret.
     red += 1
     reported = scan_text("probe.sh", RED_SHELL_PROBES["4692 keyword conninfo with spaces around ="])
