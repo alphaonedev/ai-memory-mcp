@@ -24,6 +24,20 @@ Rules (each has a mutant in ``--self-test``):
 
   R6  ``.savepoint()`` / ``savepoint_with_name`` / a raw ``SAVEPOINT`` open a
       DEFERRED transaction when no transaction is open.
+  R7  (#5235) ``PRAGMA query_only`` may only be READ or set ON.  The runtime
+      read-snapshot guard in ``with_read_snapshot`` sets it ON for the scope
+      of the closure; source text that could turn it off would let a closure
+      switch the guard off.  Positive rule: a string literal that names
+      ``query_only`` (any case) passes only as the read ``PRAGMA query_only``,
+      the set ``PRAGMA query_only = ON|1|TRUE|YES``, or the bare pragma name
+      as the name argument of ``pragma_query_value`` / ``pragma_query`` (read)
+      or of ``pragma_update`` whose value is ``"ON"`` / ``true`` / ``1``.  Any
+      other spelling (OFF, 0, a variable value, a format string, a const
+      holding the name) is refused unless its (file, fn) is in
+      ``QUERY_ONLY_ALLOWLIST``; the one entry is the guard's own setter
+      (``set_query_only``), which restores the PRIOR value.  Prose that
+      mentions query_only without ``PRAGMA`` (an error message) is not SQL
+      and is not checked.
 
 SQL text rules (R3 literals, R6 literals) match string-literal contents in any
 case and in batches ("BEGIN; ...") and format strings ("BEGIN {m}"); they skip
@@ -38,7 +52,14 @@ file with ``#![cfg(test)]``.  No file is skipped by name and no file is cut
 short, so production code after a test module is scanned.
 
 Known limit (R5): it reads SQL literals in the allowlisted fn body only; a
-write through a helper call or a caller-supplied closure is not seen.
+write through a helper call or a caller-supplied closure is not seen by this
+static check.  ``with_read_snapshot`` refuses such a write at runtime instead:
+it runs the closure under ``PRAGMA query_only = ON`` (#5235), and R7 refuses
+source text that could turn that pragma off.  Known limit (R7): it reads
+literals; a pragma name built at runtime (escapes, ``concat!``, text read from
+a file) is not seen.  The runtime guard's post-scope check refuses a scope in
+which ``query_only`` was turned off and left off, or in which the change
+counter, a schema cookie, ``user_version`` or ``application_id`` moved.
 
 Python 3.9 stdlib only.  Exit 0 = clean, 1 = violation, 2 = usage error.
 """
@@ -58,6 +79,16 @@ ALLOWLIST = {
     ("src/cli/keys.rs", "sqlite"): (
         "preview arm only: opens read-only (open_read_only) and issues plain "
         "BEGIN for a consistent read; the delete arm is BEGIN IMMEDIATE"
+    ),
+}
+
+# R7 (#5235): (relative file, enclosing fn) allowed to name ``query_only`` in a
+# form other than read / set ON.  Kept apart from ALLOWLIST: a site here is not
+# a read-only transaction and R5 does not apply to it.
+QUERY_ONLY_ALLOWLIST = {
+    ("src/governance/policy_version.rs", "set_query_only"): (
+        "the read-snapshot guard's own setter: sets ON for the scope and "
+        "restores the PRIOR value (OFF only when it was OFF before)"
     ),
 }
 
@@ -93,6 +124,18 @@ BEGIN_SQL = re.compile(
 # transaction opens DEFERRED.
 SAVEPOINT_SQL = re.compile(r"(?:^|;)\s*SAVEPOINT\b", re.IGNORECASE)
 LIT_RULES = [("R3", BEGIN_SQL), ("R6", SAVEPOINT_SQL)]
+# R7 (SQLite files only): a literal that names query_only passes only in the
+# forms below; everything else (OFF, 0, a variable, a format string, a const
+# holding the name) is refused outside QUERY_ONLY_ALLOWLIST.
+QO_PRAGMA_SQL = re.compile(r"\bPRAGMA\s+(?:\w+\.)?query_only\b", re.IGNORECASE)
+QO_READ_SQL = re.compile(r"^\s*PRAGMA\s+(?:\w+\.)?query_only\s*;?\s*$", re.IGNORECASE)
+QO_ON_SQL = re.compile(
+    r"^\s*PRAGMA\s+(?:\w+\.)?query_only\s*=\s*(?:ON|1|TRUE|YES)\s*;?\s*$", re.IGNORECASE
+)
+QO_READ_CALL = re.compile(r"\bpragma_query(?:_value)?\s*\(\s*[^,()]*,\s*\"query_only\"\s*,")
+QO_ON_CALL = re.compile(
+    r"\bpragma_update\s*\(\s*[^,()]*,\s*\"query_only\"\s*,\s*(?:\"ON\"|\"on\"|true|1)\s*\)"
+)
 STRING_LIT = re.compile(r'r#*"(?:[^"]|"(?!#))*"#*|"(?:[^"\\]|\\.)*"')
 NONLITERAL_EXEC = re.compile(r"\.execute(?:_batch)?\s*\(\s*(?!\"|r#*\"|if\b)\S")
 WRITE_SQL = re.compile(r"\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b", re.IGNORECASE)
@@ -264,9 +307,49 @@ def scan(files):
                     rule_hit = next((r for r, rx in LIT_RULES if rx.search(body)), None)
                     if rule_hit:
                         break
+            if rule_hit is None and sqlite_file and R7_ON and query_only_refused(lines, n, code):
+                rule_hit = "R7"
             if rule_hit:
                 hits.append((rel, n, cur, rule_hit, raw.strip()))
     return hits
+
+
+# Mutant switch for the self-test (dropping R7 must go silent).
+R7_ON = True
+
+
+def query_only_refused(lines, n, code):
+    """True when line ``n`` (1-based, ``code`` comment-stripped) holds a
+    string literal naming query_only that is not a read or a set-ON form."""
+    bodies = [re.sub(r'^r#*"|"#*$|^"|"$', "", lit) for lit in STRING_LIT.findall(code)]
+    rest = STRING_LIT.sub("", code)
+    opened = re.search(r'r#*"|"', rest)
+    if opened:
+        bodies.append(rest[opened.end():])
+    # SQL that names the pragma, or the bare pragma name (any case).  Prose
+    # that merely mentions query_only (an error message) is neither.
+    sql = [b for b in bodies if QO_PRAGMA_SQL.search(b)]
+    bare = [b for b in bodies if b.strip().lower() == "query_only"]
+    if any(not (QO_READ_SQL.match(b) or QO_ON_SQL.match(b)) for b in sql):
+        return True
+    if any(b != "query_only" for b in bare):
+        return True
+    if not bare:
+        return False
+    # A bare "query_only" passes only as the name argument of a read call or
+    # a set-ON call, and that call must cover THIS line's literal (a read
+    # call on a neighbouring line cannot excuse it).  rustfmt may split the
+    # call: read it from 3 lines above to 2 below.
+    before = [strip_comment(l).strip() for l in lines[max(0, n - 4) : n - 1]]
+    after = [strip_comment(l).strip() for l in lines[n : n + 2]]
+    head = " ".join(before + [""]) if before else ""
+    window = head + code.strip() + " " + " ".join(after)
+    lo, hi = len(head), len(head) + len(code.strip())
+    calls = [m.span() for rx in (QO_READ_CALL, QO_ON_CALL) for m in rx.finditer(window)]
+    for occ in re.finditer(r'"query_only"', window):
+        if lo <= occ.start() < hi and not any(s <= occ.start() and occ.end() <= e for s, e in calls):
+            return True
+    return False
 
 
 def fn_body(text, name):
@@ -286,11 +369,19 @@ def fn_body(text, name):
     return []
 
 
-def evaluate(files, allowlist):
+def evaluate(files, allowlist, qo_allowlist=None):
+    qo_allowlist = qo_allowlist or {}
     hits = scan(files)
-    used, bad = set(), []
+    used, qo_used, bad = set(), set(), []
     for rel, n, fn, rule, text in hits:
         key = (rel, fn)
+        if rule == "R7":
+            # R7 has its own allowlist; ALLOWLIST never excuses it.
+            if key in qo_allowlist:
+                qo_used.add(key)
+            else:
+                bad.append((rel, n, fn, rule, text))
+            continue
         if key in allowlist:
             used.add(key)
         else:
@@ -309,7 +400,13 @@ def evaluate(files, allowlist):
             # Only SQL text: look inside string literals, ignore identifiers.
             if any(WRITE_SQL.search(lit) for lit in re.findall(r'"(?:[^"\\]|\\.)*"', code)):
                 bad.append((rel, 0, fn, "R5", raw.strip()))
+    for rel, fn in sorted(qo_used):
+        defs = [l for l in files[rel].splitlines()
+                if re.search(r"\bfn\s+" + re.escape(fn) + r"\b", strip_comment(l))]
+        if len(defs) != 1:
+            bad.append((rel, 0, fn, "R7", "allowlisted fn name defined %d times in file" % len(defs)))
     stale = sorted(k for k in allowlist if k not in used)
+    stale += sorted(k for k in qo_allowlist if k not in qo_used)
     return bad, stale, len(hits)
 
 
@@ -501,9 +598,63 @@ def self_test():
         {"src/ok.rs": "fn other(c: &Connection) {\n c.unchecked_transaction();\n}\n"}, allow
     )
     expect("red:allowlist scoped to fn", len(bad) == 1)
+    # --- R7 (#5235): query_only may only be read or set ON ---
+    qo_green = {
+        "read sql": 'fn f(c: &Connection) {\n let q: i64 = c.query_row("PRAGMA query_only", [], |r| r.get(0))?;\n}\n',
+        "read call": 'fn f(c: &Connection) {\n c.pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))?;\n}\n',
+        "read call split": 'fn f(c: &Connection) {\n c.pragma_query_value(\n None,\n "query_only",\n |r| r.get::<_, i64>(0),\n )?;\n}\n',
+        "set ON call": 'fn f(c: &Connection) {\n c.pragma_update(None, "query_only", "ON")?;\n}\n',
+        "set true call": 'fn f(c: &Connection) {\n c.pragma_update(None, "query_only", true)?;\n}\n',
+        "set ON sql": 'fn f(c: &Connection) {\n c.execute_batch("PRAGMA query_only = ON")?;\n}\n',
+        "comment": "fn f() {\n // PRAGMA query_only = OFF is refused\n}\n",
+        "prose message": 'fn f() {\n let e = "could not restore query_only; left read-only";\n}\n',
+    }
+    for label, text in qo_green.items():
+        bad, _, _ = run(text)
+        expect("green:R7 " + label, not bad)
+    qo_red = {
+        "set OFF call": 'fn f(c: &Connection) {\n c.pragma_update(None, "query_only", false)?;\n}\n',
+        "set \"OFF\" call": 'fn f(c: &Connection) {\n c.pragma_update(None, "query_only", "OFF")?;\n}\n',
+        "set variable": 'fn f(c: &Connection, v: bool) {\n c.pragma_update(None, "query_only", v)?;\n}\n',
+        "OFF sql": 'fn f(c: &Connection) {\n c.execute_batch("PRAGMA query_only = OFF")?;\n}\n',
+        "0 sql lowercase": 'fn f(c: &Connection) {\n c.execute_batch("pragma QUERY_ONLY=0")?;\n}\n',
+        "format string": 'fn f(c: &Connection) {\n c.execute_batch(&format!("PRAGMA query_only = {v}"))?;\n}\n',
+        "const name": 'const Q: &str = "query_only";\nfn f(c: &Connection) {\n c.pragma_update(None, Q, false)?;\n}\n',
+        "OFF next to a read": (
+            'fn f(c: &Connection) {\n let v = c.pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))?;\n'
+            ' c.pragma_update(None, "query_only", 0)?;\n}\n'
+        ),
+        "bare name upper case": 'fn f(c: &Connection) {\n c.pragma_update(None, "QUERY_ONLY", false)?;\n}\n',
+        "batch ON then OFF": 'fn f(c: &Connection) {\n c.execute_batch("PRAGMA query_only = ON; PRAGMA query_only = OFF")?;\n}\n',
+    }
+    for label, text in qo_red.items():
+        bad, _, _ = run(text)
+        expect("red:R7 " + label, len(bad) == 1 and bad[0][3] == "R7")
+    qo_allow = {("src/ok.rs", "setter"): "probe"}
+    setter = 'fn setter(c: &Connection, v: bool) {\n c.pragma_update(None, "query_only", v)?;\n}\n'
+    bad, stale, _ = evaluate({"src/ok.rs": setter}, {}, qo_allow)
+    expect("green:R7 allowlisted setter", not bad and not stale)
+    bad, _, _ = evaluate({"src/ok.rs": setter}, {("src/ok.rs", "setter"): "probe"})
+    expect("red:R7 not excused by the transaction ALLOWLIST", [b[3] for b in bad] == ["R7"])
+    _, stale, _ = evaluate({"src/ok.rs": "fn f() {}\n"}, {}, qo_allow)
+    expect("red:R7 stale allowlist", stale == [("src/ok.rs", "setter")])
+    # A second fn with the allowlisted name (e.g. in another impl) would
+    # inherit the exemption; the name must be defined exactly once.
+    twice = setter + "mod m {\n fn setter(c: &Connection) {\n c.pragma_update(None, \"query_only\", false)?;\n }\n}\n"
+    bad, _, _ = evaluate({"src/ok.rs": twice}, {}, qo_allow)
+    expect("red:R7 allowlisted name defined twice",
+           [(b[3], b[1]) for b in bad] == [("R7", 0)])
+    bad, _, _ = run(qo_red["set OFF call"], "src/store/postgres.rs")
+    expect("green:R7 postgres adapter not scanned", not bad)
     # mutants: dropping any one rule must make at least one red probe pass
     # undetected (proves each rule is load-bearing, not vacuous).
-    global RULES, LIT_RULES
+    global RULES, LIT_RULES, R7_ON
+    R7_ON = False
+    try:
+        silent = all(not run(text)[0] for text in qo_red.values())
+    finally:
+        R7_ON = True
+    expect("mutant:R7 dropped goes silent (rule is load-bearing)", silent)
     full, full_lit = RULES, LIT_RULES
     try:
         for dropped, _ in full:
@@ -522,7 +673,7 @@ def self_test():
         return 1
     print(
         "self-test ok: %d green, %d red probes, %d mutants, %d rules"
-        % (counts["green"], counts["red"], counts["mutant"], len(RULES) + 1)
+        % (counts["green"], counts["red"], counts["mutant"], len(RULES) + 2)
     )
     return 0
 
@@ -538,11 +689,13 @@ def main(argv=None):
     if not (root / "src").is_dir():
         print("check-sqlite-write-txn-immediate: no src/ under %s" % root, file=sys.stderr)
         return 2
-    bad, stale, total = evaluate(load_tree(root), ALLOWLIST)
+    bad, stale, total = evaluate(load_tree(root), ALLOWLIST, QUERY_ONLY_ALLOWLIST)
     for rel, n, fn, rule, text in bad:
         why = (
             "allowlisted read-only fn contains a write"
             if rule == "R5"
+            else "query_only may only be read or set ON (#5235 read-snapshot guard)"
+            if rule == "R7"
             else (
                 "DEFERRED transaction (use WriteTxn::begin, or "
                 "Transaction::new_unchecked(.., TransactionBehavior::Immediate) "
