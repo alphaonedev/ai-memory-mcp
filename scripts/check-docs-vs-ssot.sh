@@ -3052,6 +3052,13 @@ R4HTML
     for _bt in pre link track; do
         printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>52 rows.\n' "$_bt" >> "$tmpdir/docs/block-control.html"
     done
+    # dd and dt (lines 61-72, values on 63, 66, 69, 72) are not in BLOCK_TAG: a tag-only
+    # dd / dt line does not stop the look-back, so the inline subject's 52 is still joined
+    # and flagged. This pins the current fail-closed reading; moving dd / dt into
+    # BLOCK_TAG is the open #5229 question and must change these cells deliberately.
+    for _bt in dd dt /dd /dt; do
+        printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-control.html"
+    done
     # #5700: a label/value card is one claim across two block elements. A value block
     # whose whole text is one ladder number (52, v52) is read with the block before it
     # (lines 2, 4, 14 flag; a list item that is only a number is refused the same way,
@@ -3124,6 +3131,8 @@ R4CARD
         'docs/block-control.html:54 claims "52"' \
         'docs/block-control.html:56 claims "52"' 'docs/block-control.html:58 claims "52"' \
         'docs/block-control.html:60 claims "52"' \
+        'docs/block-control.html:63 claims "52"' 'docs/block-control.html:66 claims "52"' \
+        'docs/block-control.html:69 claims "52"' 'docs/block-control.html:72 claims "52"' \
         'docs/schema-fixture.html:79 claims "52"' \
         'docs/schema-fixture.html:83 claims "52"' \
         'docs/schema-fixture.html:91 claims "52"' \
@@ -3189,6 +3198,7 @@ R4CARD
     echo "PASS: self-test #5200/#5339 - ident-less anchors (re-stamped to v1.0.0 (schema vN), Schema vN (was vM), Current version: N at v1.0.0) each match a markdown claim in BOTH a doubled-space and a tab variant: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5419 - a tag-only line whose tag only begins like a block tag (pre, link, track) does not stop the look-back from the inline subject (52 REJECTED); pins the trailing \\b of BLOCK_TAG"
     echo "PASS: self-test #5701 - a value line that opens with a tag that only begins like a block tag (pre, link, track) is not a new block: the inline subject is joined (52 REJECTED); pins the trailing \\b of BLOCK_OPEN"
+    echo "PASS: self-test #5229 pin - a tag-only dd / dt line (open or closing) does not stop the look-back from the inline subject (52 REJECTED): the fail-closed reading of dd and dt is pinned until #5229 is decided"
     echo "PASS: self-test #5700 - a label/value card is one claim: a value block that is only a ladder number (52, v52) after the identifier block is joined (52 REJECTED, 53 ACCEPTED; a bare-number list item is refused the same way, fail-closed); a steps transition split over two blocks is joined by its anchor (52 REJECTED, 53 ACCEPTED); a block with words after its number keeps the #5199 reset"
     echo "PASS: self-test #5337 - join boundaries pinned: a line ending with an OPENING block tag still joins (52 REJECTED), markdown is not tag-aware (a closing tag at the end of a markdown line, or an opening tag at the start of the next, still joins; 52 REJECTED), html literal backticks are not folded (documented bound)"
     echo "PASS: self-test #5340 - a markdown transition in bold or a code span wrapped across a line break (steps **v40 -> / v52**): planted 52 REJECTED, 53 ACCEPTED"
