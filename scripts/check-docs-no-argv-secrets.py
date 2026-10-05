@@ -2104,6 +2104,10 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
 def scan_text(rel: str, text: str) -> List[Hit]:
     if rel in SELF_EXEMPT:
         return []
+    if rel == ALLOW_REL:
+        # #5722: the allowlist quotes the reviewed lines it waives. It is not scanned; its
+        # loader refuses any entry whose preview is not masked (a form fault, exit 2).
+        return []
     hits = flag_hits(rel, text)
     if Path(rel).suffix.lower() in SHELL_SUFFIXES:
         seen = {h[:2] for h in hits}
@@ -3434,6 +3438,12 @@ def self_test() -> int:
         if not got or any(waivable_key(h) for h in got):
             print("SELF-TEST FAIL: %r must be flagged and not waivable: %r" % (name, got), file=sys.stderr)
             bad += 1
+    # #5722: the allowlist file is read by its loader, not scanned as a doc.
+    green += 1
+    allow_probe = "x.sh | %s | %s | awk -v pw=* 1\n" % (UNKNOWN_TAG, "a" * 32)
+    if scan_text(ALLOW_REL, allow_probe) or load_allow(allow_probe)[1]:
+        print("SELF-TEST FAIL: the allowlist file was scanned or its entry refused", file=sys.stderr)
+        bad += 1
     bad, red, green = allow_self_test(bad, red, green)
     # A glob head with no credential option is emphasis in prose; a script refuses it as undecidable.
     green += 1
