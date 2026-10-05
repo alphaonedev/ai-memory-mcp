@@ -601,7 +601,15 @@ ANCHORS = [
     # index.html upgrade paragraph: "steps up to v100 on the first ..." and
     # "a v0.8.x DB steps v70 -> v100" (tag-stripped, entity-decoded).
     re.compile(r'\bv([0-9]+) on the first ai-memory serve after the upgrade'),
-    re.compile(r'\bsteps\s+v[0-9]+\s*(?:→|->)\s*v([0-9]+)'),
+    # Whitespace in this anchor is spelled as spaces only (#5585): every view an anchor sees is
+    # WS-folded first (the cross-line join, the same-line aline), so a tab, a doubled space and a
+    # non-breaking space already arrive as one space; the marker fold then deletes markers and can
+    # leave a run of spaces (`steps ** v40`), which ` +` and ` *` accept and a single literal space
+    # would not. So ` +` equals the old backslash-s-plus on every view the gate builds. Pinned by the
+    # self-test: steps ** v40 -> v52 REJECTED (kills a single space), stepsv40 -> v52 ACCEPTED (kills
+    # ` *` after steps), v40->v52 REJECTED (kills a required space around the arrow), v40 ** -> v52 and
+    # v40 -> ** v52 REJECTED (kill an at-most-one space on either side of the arrow).
+    re.compile(r'\bsteps +v[0-9]+ *(?:→|->) *v([0-9]+)'),
     # CONFIG_SCHEMA postgres row: | ai-memory postgres schema | **v93** |
     re.compile(r'ai-memory postgres schema *\| *\*\*v([0-9]+)\*\*'),
     # schema.html phrasings.
@@ -2863,6 +2871,11 @@ a v0.8.x DB steps **v40** →
 a v0.8.x DB steps **v40** →
 **v53** on boot.
 a v0.6 DB steps  **v40** → v60 on boot.
+a v0.8.x DB steps ** v40 -> v52 on boot.
+a v0.8.x DB stepsv40 -> v52 on boot.
+a v0.8.x DB steps ** v40 -> v53 on boot.
+a v0.8.x DB steps v40 ** -> v52 on boot.
+a v0.8.x DB steps v40 -> ** v52 on boot.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -3041,6 +3054,9 @@ R4HTML
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:73 claims "52"' \
         'docs/postgres-age-guide.md:76 claims "52"' \
         'docs/postgres-age-guide.md:79 claims "52"' \
+        'docs/postgres-age-guide.md:83 claims "52"' \
+        'docs/postgres-age-guide.md:86 claims "52"' \
+        'docs/postgres-age-guide.md:87 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:41 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:43 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:45 claims "52"' \
@@ -3074,6 +3090,7 @@ R4HTML
         'docs/postgres-age-guide.md:77 ' \
         'docs/postgres-age-guide.md:81 ' \
         'docs/postgres-age-guide.md:82 ' \
+        'docs/postgres-age-guide.md:84 ' 'docs/postgres-age-guide.md:85 ' \
         'docs/schema-fixture.html:96 ' \
         'docs/schema-fixture.html:98 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -3082,7 +3099,7 @@ R4HTML
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5026/#5080 - anchor wrapped across two lines (steps / v40 -> v52) and identifier value more than 60 chars after the identifier: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #4511-R5 - wrapped claim with an issue ref / release triple in the subject tail, whitespace at the wrap point, and a tag-only middle line: planted 52 REJECTED, 53 ACCEPTED"
-    echo "PASS: self-test #5140 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5140/#5585 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED; the anchor spells spaces only (the views are folded): a marker-fold run of spaces (steps ** v40 -> v52, v40 ** -> v52, v40 -> ** v52) is REJECTED, no space after steps (stepsv40 -> v52) is ACCEPTED"
     echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, lower and upper case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
     echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag, and when the previous line ends with a closing block tag and the next line carries no tag); a closing tag in the MIDDLE of the previous line does not cut a claim wrapped inside the next paragraph; a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
     echo "PASS: self-test #5200/#5339 - ident-less anchors (re-stamped to v1.0.0 (schema vN), Schema vN (was vM), Current version: N at v1.0.0) each match a markdown claim in BOTH a doubled-space and a tab variant: planted 52 REJECTED, 53 ACCEPTED"
