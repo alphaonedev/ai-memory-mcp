@@ -26,7 +26,7 @@ The allowlist is a review surface, so this tool never changes it silently:
     tree; other entries that shared the old reason keep it (#5091);
   * an unreadable file is added to pgbouncer-pool-mode-unread.txt only under
     --skip-reason, a reason of its own; --reason never excuses a skipped file,
-    and the gate refuses a skip entry whose name is a text type.
+    and neither the gate nor regen accepts a skip entry whose suffix is not a declared binary type.
 
 Without those flags the tool prints what it would change and exits 1, leaving
 the file untouched. With --check it never writes. Exit codes: 0 the file already
@@ -288,6 +288,13 @@ def main(argv):
             sum(stale.values()), sum(new.values()), len(stale_unread), len(new_unread),
             "--check" if a.check else "pass --drop-stale / --accept-new after reading each line above"))
         return 1
+    text_named = [rel for rel in new_unread if Path(rel).suffix.lower() not in gate.BINARY_SUFFIXES]
+    if text_named:
+        # #5367: the skip list excuses declared binary types only; a text file that will not read is fixed, not listed
+        for rel in text_named:
+            print("regen: FAULT: refusing to skip %s: it is not a declared binary type, so it is text and must be readable" % rel,
+                  file=sys.stderr)
+        return 2
     if new_unread or stale_unread:
         write_unread(gate, root, listed, stale_unread, new_unread, skip_reason)
         if not (stale or new or refresh):

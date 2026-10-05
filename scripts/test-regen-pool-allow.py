@@ -11,8 +11,8 @@ is never written, a stale entry needs --drop-stale, a changed neighbourhood need
 original reason is kept, also for the entry after it, and an entry is never re-bound onto
 another file), a repeated unit gets one entry per occurrence, a reasons-file reason made only
 of {unit} is refused, and the unread-file skip list takes --skip-reason only: --reason never
-excuses a skipped file, a short --skip-reason is refused and a text-named file in the skip
-list leaves the gate red (#5208, #5209, #5206, #5210). --set-reason re-writes the reason of
+excuses a skipped file, a short --skip-reason is refused and a file whose suffix is not a declared
+binary type is never written to the skip list (#5208, #5209, #5206, #5210, #5367). --set-reason re-writes the reason of
 the selected entries only, keeps the others' reason, and is refused when the reason is short,
 when nothing is selected, or when other changes are pending (#5091).
 
@@ -268,10 +268,13 @@ CASES: List[Tuple[str, Dict[str, Body], Callable[[Tree], bool]]] = [
      and SKIP in t.read(UNREAD) and GOOD not in t.read(UNREAD)),
     ("--reason never excuses a skipped file", {"docs/a.md": DOC, "docs/x.gz": b"\x1f\x8b\x08\x00junk"}, c_skip_not_reason),
     ("a short --skip-reason is refused", {"docs/a.md": DOC, "docs/x.gz": b"\x1f\x8b\x08\x00junk"}, c_skip_short),
-    ("a text-named file in the skip list leaves the gate red",
+    ("a text file is never written to the skip list (#5367)",
      {"docs/a.md": DOC, "docs/c.md": b"Notes\x00" + DOC.encode("utf-8")},
-     lambda t: t.regen("--accept-new", "--reason", GOOD, "--skip-reason", SKIP) == 0 and "docs/c.md" in t.read(UNREAD)
+     lambda t: t.regen("--accept-new", "--reason", GOOD, "--skip-reason", SKIP) == 2 and not (t.root / UNREAD).exists()
      and t.gate() == 2),
+    ("a suffix-less or template file is never written to the skip list (#5367)",
+     {"docs/a.md": DOC, "infra/Dockerfile": b"Notes\x00" + DOC.encode("utf-8"), "infra/x.tpl": b"Notes\x00" + DOC.encode("utf-8")},
+     lambda t: t.regen("--accept-new", "--reason", GOOD, "--skip-reason", SKIP) == 2 and not (t.root / UNREAD).exists()),
     ("a reasons-file reason made only of {unit} is refused", {"docs/a.md": DOC}, c_rules_unit_only),
     ("a refresh keeps the reason of the entry after it", {"docs/a.md": TWO}, c_refresh_keeps_next),
     ("a refresh inside a group keeps the group's reason", {"docs/a.md": TWO}, c_refresh_mid_group),
@@ -305,6 +308,7 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("refresh writes its record",
      '                out.append("# context re-read on %s: %s" % (datetime.date.today().isoformat(), reason))\n', ""),
     ("refresh keeps the next reason", '                out.append("# " + restore)  # the entries after', '                pass  # the entries after'),
+    ("skip list refuses a non-binary suffix (#5367)", "    if text_named:", "    if False:"),
     ("set-reason checked", '("--skip-reason", skip_reason), ("--set-reason", set_reason)):',
      '("--skip-reason", skip_reason)):'),
     ("set-reason needs a selection", "        if not (a.only or a.match):\n            print(\"regen: FAULT: --set-reason needs",

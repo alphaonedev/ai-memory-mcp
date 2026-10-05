@@ -591,10 +591,13 @@ def _plain_text(chunk: bytes) -> bool:
     return True
 
 
-# R5 (#4667): a file with one of these extensions is text by name and is never excused by the skip list: a NUL
-# byte in it is a defect to fix, not a reason to stop reading it.
-TEXT_SUFFIXES = {".md", ".markdown", ".txt", ".rst", ".adoc", ".html", ".htm", ".rs", ".py", ".sh", ".toml", ".yaml",
-                 ".yml", ".json", ".ini", ".conf", ".cfg", ".tf", ".env", ".sql", ".log", ".csv", ".xml", ".svg"}
+# R5 (#4667, #5367): the skip list may name only a file whose suffix is on this closed list of binary types. Every
+# other file (a .tpl or .service template, a Dockerfile or Makefile with no suffix, a .ts or .hcl source) is text and
+# is read: a NUL byte in it is a defect to fix, not a reason to stop reading it. The set may only grow by review.
+BINARY_SUFFIXES = frozenset((".pdf", ".jpg", ".jpeg", ".png", ".gif", ".ico", ".webp", ".bmp", ".tif", ".tiff", ".woff",
+                             ".woff2", ".ttf", ".otf", ".eot", ".zip", ".gz", ".tgz", ".bz2", ".xz", ".zst", ".7z", ".tar",
+                             ".jar", ".wasm", ".so", ".dylib", ".dll", ".exe", ".bin", ".db", ".sqlite", ".mp3", ".mp4",
+                             ".mov", ".webm", ".ogg", ".wav", ".class", ".o", ".a", ".rlib"))
 
 
 def read_lines(path: Path) -> Iterator[str]:
@@ -671,8 +674,8 @@ def load_unread(root: Path) -> Tuple[Dict[str, str], List[str]]:
         if block:
             reason, block = " ".join(block), []
         problem = reason_problem(reason or "")
-        if not problem and Path(line).suffix.lower() in TEXT_SUFFIXES:
-            problem = "a %s file is text and is read, never skipped" % Path(line).suffix.lower()
+        if not problem and Path(line).suffix.lower() not in BINARY_SUFFIXES:
+            problem = "a %s file is not a declared binary type and is read, never skipped" % (Path(line).suffix.lower() or "suffix-less")
         if " " in line or problem or line in listed:
             errors.append("%s:%d: bad skip entry %r (%s)" % (UNREAD_REL, number, line[:80],
                           problem or "one exact path without spaces, listed once"))
@@ -1176,6 +1179,16 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
         ("a magic number on binary bytes fails closed", tree({"docs/p.md": b"%PDF-1.7\n\x93\xff Run PgBouncer in transaction mode.\n"}), EXIT_FAULT),
         ("a named unreadable file with a reason passes",
          tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}, unread=UNREAD_REASON + "docs/z.md.gz\n"), EXIT_OK),
+        # #5367: the skip list excuses declared binary types only, so a NUL byte in other text cannot hide a claim
+        ("a NUL byte in a .tpl file fails closed", tree({"infra/x/cloud-init.tpl": b"Run PgBouncer in transaction mode.\n\0\n"}), EXIT_FAULT),
+        ("a .tpl file in the skip list is refused",
+         tree({"infra/x/cloud-init.tpl": b"Run PgBouncer in transaction mode.\n\0\n"}, unread=UNREAD_REASON + "infra/x/cloud-init.tpl\n"), EXIT_FAULT),
+        ("a suffix-less file in the skip list is refused",
+         tree({"infra/x/Dockerfile": b"Run PgBouncer in transaction mode.\n\0\n"}, unread=UNREAD_REASON + "infra/x/Dockerfile\n"), EXIT_FAULT),
+        ("a .service file in the skip list is refused",
+         tree({"infra/x/pgb.service": b"Run PgBouncer in transaction mode.\n\0\n"}, unread=UNREAD_REASON + "infra/x/pgb.service\n"), EXIT_FAULT),
+        ("an upper-case binary suffix is still a declared binary type",
+         tree({"docs/z.GZ": b"\x1f\x8b\x08\x00zzz"}, unread=UNREAD_REASON + "docs/z.GZ\n"), EXIT_OK),
         ("a skip entry without a reason fails",
          tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}, unread="docs/z.md.gz\n"), EXIT_FAULT),
         ("a skip entry with a filler reason fails",
@@ -1271,9 +1284,25 @@ def stream_failures() -> int:
     return bad
 
 
+# #5367: the reviewed set of binary suffixes the skip list may name, written out here on purpose: the pin must not
+# be derived from BINARY_SUFFIXES itself, or narrowing the set would narrow the pin with it.
+REVIEWED_BINARY_SUFFIXES = frozenset(
+    ".pdf .jpg .jpeg .png .gif .ico .webp .bmp .tif .tiff .woff .woff2 .ttf .otf .eot .zip .gz .tgz .bz2 .xz .zst .7z "
+    ".tar .jar .wasm .so .dylib .dll .exe .bin .db .sqlite .mp3 .mp4 .mov .webm .ogg .wav .class .o .a .rlib".split())
+
+
+def binary_suffix_failures() -> int:
+    """BINARY_SUFFIXES is exactly the reviewed set, every member is lower case with a dot, none is a text type."""
+    bad = 0 if BINARY_SUFFIXES == REVIEWED_BINARY_SUFFIXES else 1
+    bad += sum(1 for ext in BINARY_SUFFIXES if ext != ext.lower() or not ext.startswith(".") or ext in (".md", ".txt", ".tpl"))
+    if bad:
+        print("self-test FAIL BINARY_SUFFIXES differs from the reviewed set: %s" % sorted(BINARY_SUFFIXES ^ REVIEWED_BINARY_SUFFIXES))
+    return bad
+
+
 def run_cases(verbose: bool) -> int:
     scratch_base = _scratch_base()
-    failures = stream_failures()
+    failures = stream_failures() + binary_suffix_failures()
     for name, files, want in cases():
         with tempfile.TemporaryDirectory(dir=scratch_base) as tmp:
             root = Path(tmp)
@@ -1315,7 +1344,10 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("F1 skip entry needs a reason", "        problem = reason_problem(reason or \"\")\n        if not problem and Path(line).suffix", "        problem = None\n        if not problem and Path(line).suffix"),
     ("F1 binary magic numbers", "        if chunk.startswith(BINARY_MAGIC) and not _plain_text(chunk):", "        if False:"),
     ("F1 magic number on plain text is text", "        if chunk.startswith(BINARY_MAGIC) and not _plain_text(chunk):", "        if chunk.startswith(BINARY_MAGIC):"),
-    ("F1 a text suffix is never skipped", "        if not problem and Path(line).suffix.lower() in TEXT_SUFFIXES:", "        if False:"),
+    ("F1 only a declared binary suffix is skipped (#5367)", "        if not problem and Path(line).suffix.lower() not in BINARY_SUFFIXES:", "        if False:"),
+    ("F1 pdf is a declared binary suffix (#5367)", '".pdf", ".jpg", ".jpeg", ".png"', '".jpg", ".jpeg", ".png"'),
+    ("F1 a text type is not declared binary (#5367)", '".mov", ".webm"', '".mov", ".tpl", ".webm"'),
+    ("F1 the suffix is read case-blind (#5367)", "Path(line).suffix.lower() not in BINARY_SUFFIXES", "Path(line).suffix not in BINARY_SUFFIXES"),
     ("F1 NUL bytes in non-UTF-16 text", "            if utf8 and b\"\\0\" in chunk:", "            if False:"),
     ("F1 BOM-less UTF-16", "    if len(zeros) * 4 >= min(len(head), CHUNK_BYTES) > 0:", "    if False:"),
     ("F2 long lines: product and mode word anywhere", "    return bool(_PRODUCT_WORD.search(view) and OTHER_MODE.search(view))", "    return False"),
