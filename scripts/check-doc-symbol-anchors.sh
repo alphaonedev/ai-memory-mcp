@@ -1125,6 +1125,49 @@ PYEOF
         "$R::NoSuch" \
         "See $R::&#x003C;NoSuch as RecallTool&#x0003E;::decorate_memory_many here."
 
+
+    # #5607: every character reference is decoded with the full HTML5 table
+    # before the anchor is read, so a whitespace reference outside the old
+    # hand list (`&Tab;`, `&hairsp;` ...) no longer turns a spaced comparison
+    # into a phantom group that absorbs a real over-closer.
+    anchor_red 5607 BARE_QUAL "a comparison spaced with &Tab; before an over-closed anchor" \
+        "See a <&Tab;b and $R::RecallTool<T>> here."
+    anchor_red 5607 BARE_QUAL "a comparison spaced with &hairsp; before an over-closed anchor" \
+        "See a <&hairsp;b and $R::RecallTool<T>> here."
+    anchor_red 5607 BARE_QUAL "a comparison spaced with &NonBreakingSpace; before an over-closed anchor" \
+        "See a <&NonBreakingSpace;b and $R::RecallTool<T>> here."
+    anchor_red 5607 BARE_QUAL "a comparison spaced with &ThinSpace; before an over-closed anchor" \
+        "See a <&ThinSpace;b and $R::RecallTool<T>> here."
+    anchor_red 5607 BARE_QUAL "a comparison spaced with &numsp; before an over-closed anchor" \
+        "See a <&numsp;b and $R::RecallTool<T>> here."
+    anchor_red 5607 BARE_QUAL "a comparison spaced with &emsp13; before an over-closed anchor" \
+        "See a <&emsp13;b and $R::RecallTool<T>> here."
+    anchor_red 5607 BARE_QUAL "a comparison spaced with &NewLine; before an over-closed anchor" \
+        "See a <&NewLine;b and $R::RecallTool<T>> here."
+    anchor_red 5607 BARE_QUAL "a comparison spaced with &MediumSpace; before an over-closed anchor" \
+        "See a <&MediumSpace;b and $R::RecallTool<T>> here."
+    anchor_red_cites 5607 BARE_QUAL "a zero-width space reference renders as nothing" \
+        "$R::NoSuch" \
+        "See $R::RecallTool&ZeroWidthSpace;::NoSuch here."
+    # #5607: a reference HTML decodes and CommonMark keeps literal (no `;`,
+    # more than 7 decimal or 6 hex digits) is undecidable in a Markdown doc
+    # when the two readings judge the anchor differently: it is refused.
+    anchor_red 5607 UNDECIDABLE_REF "a non-breaking space with no semicolon before an over-closed anchor" \
+        "See a <&nbsp b and $R::RecallTool<T>> here."
+    anchor_red_cites 5607 UNDECIDABLE_REF "a decimal closer with no semicolon is cited as written" \
+        "$R::RecallTool&#62::NoSuch" \
+        "See $R::RecallTool&#62::NoSuch here."
+    anchor_red 5607 UNDECIDABLE_REF "an eight-digit decimal closer" \
+        "See $R::RecallTool<T>&#00000062;::NoSuch here."
+    anchor_red 5607 UNDECIDABLE_REF "a seven-digit hex closer" \
+        "See $R::RecallTool<T>&#x000003e;::NoSuch here."
+    anchor_green 5607 "a legacy reference with no semicolon beside a live anchor" \
+        "Copyright &copy 2026 and $R::RecallTool<T> here."
+    anchor_green 5607 "an ampersand reference after a live anchor" \
+        "See $R::RecallTool&amp; here."
+    anchor_green 5607 "an escaped angle reference is decoded once, never twice" \
+        "See $R::RecallTool&amp;lt;T&amp;gt; here."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
@@ -1583,9 +1626,12 @@ fi
 if ! violations="$(
     REPO_ROOT="$REPO_ROOT" LADDER_TIP="$LADDER_TIP" python3 - <<'PY'
 import glob
+import html
 import os
 import posixpath
 import re
+import unicodedata
+from html.entities import html5 as HTML5
 
 root = os.environ["REPO_ROOT"].rstrip("/")
 ladder_tip = os.environ.get("LADDER_TIP", "").strip()
@@ -1724,29 +1770,63 @@ BARE_QUAL_HEAD = re.compile(r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs)::")
 BRACE_BODY = re.compile(r"\{([^}]*)\}")
 
 
-# #5536: an angle bracket may also be a numeric character reference (`&#60;`,
-# `&#x3c;`, zero padded) or the upper-case named entity (`&LT;`).
-_ENT_LT = re.compile(r"&(?:lt|#0*60|#[xX]0*3[cC]);", re.IGNORECASE)
-_ENT_GT = re.compile(r"&(?:gt|#0*62|#[xX]0*3[eE]);", re.IGNORECASE)
+# #5607: a character reference is decoded ONCE, before any anchor analysis,
+# with the complete HTML5 table (html.entities.html5), never a hand list, so
+# every whitespace, angle-bracket or plus spelling is read as its character
+# and the scanners below see characters only (`&amp;lt;` stays the text
+# `&lt;`, it is not decoded twice). Two readings exist: HTML (html.unescape:
+# a legacy name or a number with no `;`, any zero padding) and CommonMark (a
+# `;` is required, at most 7 decimal or 6 hex digits, no backslash before
+# the `&`). A Markdown line whose anchor findings differ between the two
+# readings is refused as UNDECIDABLE_REF, citing the anchor as written. A
+# decoded backtick never opens a code span (it becomes CODE_TICK), a decoded
+# line ending is a space, and a decoded format character (Unicode Cf, such
+# as a zero-width space) is dropped: it renders as nothing.
+CODE_TICK = "\ue060"
+_REF_HTML = re.compile(r"&(?:#[xX][0-9A-Fa-f]+;?|#[0-9]+;?|[A-Za-z][A-Za-z0-9]*;?)")
+_REF_CM = re.compile(r"(?<!\\)&(?:#[xX][0-9A-Fa-f]{1,6};|#[0-9]{1,7};|[A-Za-z][A-Za-z0-9]*;)")
 
 
-def _decode_angles(text):
-    """`text` with every angle-bracket entity spelling turned into the sign."""
-    return _ENT_GT.sub(">", _ENT_LT.sub("<", text))
+def _decoded_chars(text):
+    """Decoded reference text as the scanners must see it (#5607)."""
+    out = []
+    for ch in text:
+        if ch == "`":
+            out.append(CODE_TICK)
+        elif ch in "\r\n":
+            out.append(" ")
+        elif unicodedata.category(ch) != "Cf":
+            out.append(ch)
+    return "".join(out)
+
+
+def _ref_html(m):
+    raw = m.group(0)
+    dec = html.unescape(raw)
+    return raw if dec == raw else _decoded_chars(dec)
+
+
+def _ref_cm(m):
+    raw = m.group(0)
+    if raw[1] == "#":
+        return _decoded_chars(html.unescape(raw))
+    return _decoded_chars(HTML5[raw[1:]]) if raw[1:] in HTML5 else raw
+
+
+def decode_html(line):
+    """`line` with every character reference decoded as HTML does."""
+    return _REF_HTML.sub(_ref_html, line) if "&" in line else line
+
+
+def decode_cm(line):
+    """`line` with every character reference decoded as CommonMark does."""
+    return _REF_CM.sub(_ref_cm, line) if "&" in line else line
 
 
 def _group_step(text, j):
     """Classify the text at `j`: ('open'|'close', width) for an angle bracket
     or its HTML entity, ('stop', 1) for a character a group may not contain,
     else ('other', 1). The `>` of an arrow (`->` or `-&gt;`) is not a closer."""
-    m = _ENT_LT.match(text, j)
-    if m:
-        return "open", m.end() - j
-    m = _ENT_GT.match(text, j)
-    if m:
-        # #5429: the entity spelling of an arrow (-&gt;) is not a closer.
-        width = m.end() - j
-        return ("other", width) if j > 0 and text[j - 1] == "-" else ("close", width)
     ch = text[j]
     if ch == "<":
         return "open", 1
@@ -1777,7 +1857,7 @@ def scan_group(text, i):
 
 
 def _opens_group(text, i):
-    return text.startswith("<", i) or _ENT_LT.match(text, i) is not None
+    return text.startswith("<", i)
 
 
 def _token_end(text, i):
@@ -1788,23 +1868,7 @@ def _token_end(text, i):
     return j
 
 
-_WS_ENTITY = re.compile(r"&(nbsp|ensp|emsp|thinsp|#[0-9]+|#[xX][0-9a-fA-F]+);")
-_WS_NAMED = {"nbsp": "\u00a0", "ensp": "\u2002", "emsp": "\u2003",
-             "thinsp": "\u2009"}
 _OP_CHARS = frozenset("<>=-!")
-
-
-def _ws_entity(m):
-    """A whitespace HTML entity (named or numeric) as a space; any other
-    entity is left exactly as written (#5531)."""
-    name = m.group(1)
-    if name in _WS_NAMED:
-        return " "
-    try:
-        ch = chr(int(name[2:], 16) if name[1] in "xX" else int(name[1:]))
-    except (ValueError, OverflowError):
-        return m.group(0)
-    return " " if ch.isspace() else m.group(0)
 
 
 def _operator_token_end(prefix, j):
@@ -1822,7 +1886,7 @@ def _operator_token_end(prefix, j):
         e += 1
     if e >= len(prefix):
         return None
-    tok = _decode_angles(prefix[j:e])
+    tok = prefix[j:e]
     return e if tok and set(tok) <= _OP_CHARS else None
 
 
@@ -1830,7 +1894,6 @@ def _outer_depth(prefix):
     """Number of angle groups (`<` or `&lt;`) still open at the end of
     `prefix` (#5456): prose such as `Vec<src/x.rs::T<U>>` opens a group of its
     own before the anchor, and the last closer belongs to it."""
-    prefix = _WS_ENTITY.sub(_ws_entity, prefix)
     depth, j = 0, 0
     while j < len(prefix):
         kind, width = _group_step(prefix, j)
@@ -1851,16 +1914,9 @@ def _outer_depth(prefix):
 
 
 def _skip_space(text, j):
-    """Index after any whitespace (a character or a whitespace entity) at `j`."""
-    while j < len(text):
-        if text[j].isspace():
-            j += 1
-            continue
-        m = _WS_ENTITY.match(text, j)
-        if m and _ws_entity(m) == " ":
-            j = m.end()
-            continue
-        break
+    """Index after any whitespace at `j` (references are already decoded)."""
+    while j < len(text) and text[j].isspace():
+        j += 1
     return j
 
 
@@ -2145,7 +2201,7 @@ def split_items(raw):
     whitespace that are NOT inside a generic group (`{A<T, U>::m, B}` is two
     items, not four)."""
     items, cur, depth = [], "", 0
-    norm = _decode_angles(raw)
+    norm = raw
     for idx, ch in enumerate(norm):
         if ch == "<":
             depth += 1
@@ -2234,6 +2290,68 @@ def pinned_label(line, m):
     return pt.group(1) == m.group(1) and int(pt.group(2)) == first and want_last == last
 
 
+def qual_findings(line):
+    """(rule, token) for every qualified anchor on `line` (decoded, canon)."""
+    out = []
+    for rule, f, raw in iter_quals(line):
+        if f not in per_file:
+            # #5201: a qualified anchor asserts the file exists, so the
+            # absence-wording exemption never applies to it.
+            out.append(("PATH", f))
+            continue
+        for tok in split_items(raw):
+            # #5255/#5342: `Type<T, U>::method` checks BOTH components;
+            # generic arguments are not symbol claims. `<Type as
+            # Trait>::m` checks `Type` and `m`.
+            whole = tok
+            toks = unwrap_self_type(tok)
+            if toks is None:
+                # #5493: a self type that names no type cannot be
+                # resolved: report it rather than accept it.
+                out.append((rule, f"{f}::{whole}".replace(" ", "")))
+                continue
+            for tok in toks:
+                tok = strip_generics(tok).strip().rstrip("(){}[].,;")
+                if "<" in tok or ">" in tok:
+                    # An unbalanced group cannot be resolved: report it
+                    # rather than skip a component that may be missing.
+                    out.append((rule, f"{f}::{tok}".replace(" ", "")))
+                    continue
+                if not tok:
+                    continue
+                for part in tok.split("::"):
+                    part = part.split("(")[0].strip()
+                    # `…`, `*`, `_`, generics and other prose fillers are
+                    # not symbol claims.
+                    if not part or not IDENT.match(part):
+                        continue
+                    if part in per_file[f]:
+                        continue
+                    # A trailing `_` is a PREFIX citation of a test/fn
+                    # family (`issue_965_audit_*`); it resolves if any
+                    # symbol in that file starts with it.
+                    if part.endswith("_") and any(
+                            n.startswith(part) for n in per_file[f]):
+                        continue
+                    out.append((rule, f"{f}::{part}"))
+    return out
+
+
+def undecidable_extents(line, readings):
+    """UNDECIDABLE_REF findings for the qualified anchors of `line`, each
+    cited as written: the head and the whitespace-free text after it (#5607).
+    An anchor that exists only once decoded is cited from the HTML reading."""
+    out = []
+    for text in [line] + readings[-1:]:
+        for head in (QUAL_HEAD, BARE_QUAL_HEAD):
+            for hm in head.finditer(text):
+                out.append(("UNDECIDABLE_REF",
+                            hm.group(1) + "::" + text[hm.end():_token_end(text, hm.end())]))
+        if out:
+            break
+    return out or [("UNDECIDABLE_REF", "-")]
+
+
 def emit(rule, doc, ln, token, ctx):
     print(f"{rule}\t{doc}\t{ln}\t{token}\t{ctx[:150]}")
 
@@ -2301,48 +2419,23 @@ for doc in seen_docs:
                 continue
             emit("BARE_LN", doc, ln, f"{m.group(1)}:{m.group(2)}", ctx)
 
-        for rule, f, raw in iter_quals(line):
-            if f not in per_file:
-                # #5201: a qualified anchor asserts the file exists, so the
-                # absence-wording exemption never applies to it.
-                emit("PATH", doc, ln, f, ctx)
-                continue
-            for tok in split_items(raw):
-                # #5255/#5342: `Type<T, U>::method` checks BOTH components;
-                # generic arguments are not symbol claims. `<Type as
-                # Trait>::m` checks `Type` and `m`.
-                tok = _decode_angles(tok)
-                whole = tok
-                toks = unwrap_self_type(tok)
-                if toks is None:
-                    # #5493: a self type that names no type cannot be
-                    # resolved: report it rather than accept it.
-                    emit(rule, doc, ln, f"{f}::{whole}".replace(" ", ""), ctx)
-                    continue
-                for tok in toks:
-                    tok = strip_generics(tok).strip().rstrip("(){}[].,;")
-                    if "<" in tok or ">" in tok:
-                        # An unbalanced group cannot be resolved: report it
-                        # rather than skip a component that may be missing.
-                        emit(rule, doc, ln, f"{f}::{tok}".replace(" ", ""), ctx)
-                        continue
-                    if not tok:
-                        continue
-                    for part in tok.split("::"):
-                        part = part.split("(")[0].strip()
-                        # `…`, `*`, `_`, generics and other prose fillers are
-                        # not symbol claims.
-                        if not part or not IDENT.match(part):
-                            continue
-                        if part in per_file[f]:
-                            continue
-                        # A trailing `_` is a PREFIX citation of a test/fn
-                        # family (`issue_965_audit_*`); it resolves if any
-                        # symbol in that file starts with it.
-                        if part.endswith("_") and any(
-                                n.startswith(part) for n in per_file[f]):
-                            continue
-                        emit(rule, doc, ln, f"{f}::{part}", ctx)
+        # #5607: the anchors are judged on the DECODED line. A Markdown
+        # line is decoded both ways (CommonMark and HTML); when the findings
+        # differ the reading is undecidable and each anchor is refused as
+        # written. An .html doc has the HTML reading only.
+        if "&" in line:
+            readings = [decode_html(line)]
+            if not doc.endswith(".html"):
+                readings.insert(0, decode_cm(line))
+        else:
+            readings = [line]
+        found = [qual_findings(canon(r)[0]) for r in readings]
+        for rule, tok in found[0]:
+            if all((rule, tok) in other for other in found[1:]):
+                emit(rule, doc, ln, tok, ctx)
+        if any(sorted(other) != sorted(found[0]) for other in found[1:]):
+            for rule, tok in undecidable_extents(line, readings):
+                emit(rule, doc, ln, tok, ctx)
 
         # #5431: the joined line feeds MDLINK too, so a symbol label whose
         # destination is on the next line is checked like the one-line form.
@@ -2452,6 +2545,7 @@ if [[ -n "$violations" ]]; then
             MDLINK) detail="markdown symbol link does not resolve in its target file" ;;
             BARE_QUAL) detail="symbol is not defined in the file it is qualified against (unbackticked anchor)" ;;
             BARE_LN) detail="bare file:line anchor in a live doc (rots silently); cite \`path::symbol\`, or pin a commit permalink" ;;
+            UNDECIDABLE_REF) detail="anchor is refused: its character references decode differently in CommonMark and HTML, so the anchor cannot be resolved; write the characters plainly" ;;
             LADDER_TIP) detail="claimed ladder tip disagrees with the tip scripts/check-migration-ladder.sh computes (left=cited, right=actual)" ;;
             *)     detail="unresolved anchor" ;;
         esac
