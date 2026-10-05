@@ -388,8 +388,8 @@ lab_shell_state_proven() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 272 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 266
+# 273 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 267
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), eight probe-matcher legs (lab_probe_refusal_names_knob against generated logs, each
 # checking the exact child status: 10, 11, or 4 for an unreadable log, #5662), three structural legs (the matcher body
@@ -402,12 +402,12 @@ lab_shell_state_proven() {
 # mode, awk exits 0 or 1, awk by bare name, a relative awk path accepted, no readability check) and two extra-text
 # spellings (#5587)), twelve closed-world guard-body mutants (#5588, #5662, #5663), six probe-verdict legs (the two
 # verdicts, a shadowed builtin, every non-verdict status, a recorded reason over status 10 and 11, the #5662 return reproducer,
-# a DEBUG trap under functrace forcing status 10, #5663), one hundred and five shadow-matrix legs (#5588: the control, one cell per table row per route (function, exported function,
+# a DEBUG trap under functrace forcing status 10, #5663), one hundred and six shadow-matrix legs (#5588: the control, one cell per table row per route (function, exported function,
 # alias, enable -n, enable -n with a PATH file, a lying function for builtin and type), the keyword row, lying type and
 # builtin with a function named exec, ten awk and bash cells (bare-name routes, absolute-path functions, caller-set
 # LAB_PROBE_BASH, relative path), four environment cells, three missing-file cells, two first-path-wins cells, sixteen
-# neighbour commands by function and by PATH file, eight IFS values, eleven shell options, thirteen trace-route cells
-# (#5663: xtrace, xtrace with an assigning PS4, functrace, errtrace, extdebug, the trace attribute, enable -n declare, a
+# neighbour commands by function and by PATH file, eight IFS values, eleven shell options, fourteen trace-route cells
+# (#5663: xtrace, xtrace with an assigning PS4, functrace, errtrace, extdebug, extdebug with functrace and errtrace turned back off (#5742), the trace attribute, enable -n declare, a
 # function named declare, reproducer a, and DEBUG, RETURN and ERR traps with no trace option), reproducer b, and the
 # LAB_PROBE_WHY reason), four probe-report legs (#5664: detected is ok, not-detected, refused and empty are no), a
 # run.sh pin and four run.sh branch legs (#5664: run.sh's own probe-verdict lines run with stub ok and no reach ok,
@@ -739,6 +739,8 @@ lab_posture_selftest() {
   _cell "functrace (set -T)" refused 'set -T' || bad=1
   _cell "errtrace (set -E)" refused 'set -E' || bad=1
   _cell "extdebug" refused 'shopt -s extdebug' || bad=1
+  # #5742: extdebug turns on functrace and errtrace; with both turned back off only the extdebug test can refuse it.
+  _cell "extdebug with functrace and errtrace turned back off" refused 'shopt -s extdebug; set +o functrace +o errtrace' || bad=1
   _cell "the trace attribute on the guard and the matcher with a DEBUG trap" refused 'declare -ft lab_probe_cmds_proven lab_probe_refusal_names_knob; trap ": > \"\$canary\"" DEBUG' || bad=1
   _cell "the trace attribute on an unrelated function" refused 'f() { :; }; declare -ft f' || bad=1
   _cell "declare disabled with enable -n (the trace check cannot run)" refused 'enable -n declare' || bad=1
