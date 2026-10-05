@@ -757,6 +757,22 @@ MDEOF
         "$R::no_such" \
         "See \`$R::<dyn RecallTool>::no_such\`."
 
+    # #5494: one killing case per round-7 mutant of the closer depth (#5456)
+    # and the self-type prefix (#5457).
+    anchor_green 5494 "a prose generic after a stray closer keeps the depth at zero, not below" \
+        "If a > b then see Vec<$R::RecallTool<T>> here."
+    anchor_red 5494 BARE_QUAL "a closed prose generic no longer owns the closer after the anchor" \
+        "See Vec<x> and $R::RecallTool<T>> here."
+    anchor_green 5494 "a bare mut self type with live parts" \
+        "See \`$R::<mut RecallTool>::decorate_memory_many\`."
+    anchor_green 5494 "a stacked reference and dyn self type with live parts" \
+        "See \`$R::<&dyn RecallTool>::decorate_memory_many\`."
+    anchor_green 5494 "a stacked mutable reference and dyn self type with live parts" \
+        "See \`$R::<&mut dyn RecallTool>::decorate_memory_many\`."
+    anchor_red_cites 5494 QUAL "a stacked reference and dyn self type whose trait is missing" \
+        "$R::NoSuch" \
+        "See \`$R::<&dyn NoSuch>::decorate_memory_many\`."
+
     # #5460: the type of an as group inside a brace item is a claim.
     anchor_red_cites 5460 QUAL "an as group with a missing type inside a brace item" \
         "$R::NoSuch" \
