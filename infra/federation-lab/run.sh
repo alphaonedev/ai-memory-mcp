@@ -29,6 +29,20 @@
 # v1.0.0 enterprise-federation certification scope is 500-1000 agents and at
 # most 50 peers; nothing here extends it.
 # =============================================================================
+# START STATE (#5740). A variable that makes bash run code in this shell before line 1 (BASH_ENV) or changes how it
+# parses (POSIXLY_CORRECT) is refused, as is any function already defined. So is a variable bash reads from the
+# environment that changes what this script's own commands do (#5744): CDPATH (cd prints, and LAB doubles), GLOBIGNORE,
+# EXECIGNORE, FUNCNEST, BASH_COMPAT, TMOUT and GLOBSORT. Posix mode makes the refusal itself safe from
+# functions: the special builtins export and : are found before any function, and the ${..:?} expansion exits without a
+# command lookup. export -pf lists every imported function (#5741), even one named builtin or declare that would make the
+# declare -F list lie. lab_shell_state_proven (lib/posture.sh) then proves the traps, aliases, options and attributes.
+_lab_pre="${BASH_ENV+BASH_ENV }${POSIXLY_CORRECT+POSIXLY_CORRECT }${CDPATH+CDPATH }${GLOBIGNORE+GLOBIGNORE }${EXECIGNORE+EXECIGNORE }"
+_lab_pre="$_lab_pre${FUNCNEST+FUNCNEST }${BASH_COMPAT+BASH_COMPAT }${TMOUT+TMOUT }${GLOBSORT+GLOBSORT }"
+POSIXLY_CORRECT=1
+_lab_pre="$_lab_pre$(export -pf)$(builtin declare -F)"
+_lab_r=
+[[ -z $_lab_pre ]] || : "${_lab_r:?run.sh refuses to start (#5740): the start environment sets or defines [$_lab_pre]; unset each one (bash -p run.sh ignores an exported function)}"
+unset POSIXLY_CORRECT _lab_pre _lab_r
 set -uo pipefail
 
 LAB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,6 +53,12 @@ RUN="$LAB/run"
 source "$LAB/lib/common.sh"
 # shellcheck source=lib/posture.sh
 source "$LAB/lib/posture.sh"
+# #5740: refuse a shell whose traps, aliases, options or attributes are not the ones a plain bash run.sh gives.
+# bash lists a DEBUG, RETURN or ERR trap only to a top-level trap -p, so the list is read here and passed in. The verdict
+# is set only by the last command of a chain on its own line, so an abort or errexit anywhere in it reads as refused.
+_lab_ok=0
+_lab_traps=$(builtin trap -p) && lab_shell_state_proven "$_lab_traps" && _lab_ok=1
+case $_lab_ok in 1) ;; *) printf 'run.sh refuses to start (#5740): %s\n' "${LAB_SHELL_WHY:-the shell-state check did not complete}" >&2; exit 78 ;; esac
 
 # ── options ────────────────────────────────────────────────────────────────
 BIN="${BIN:-}"
@@ -100,6 +120,15 @@ while [ $# -gt 0 ]; do
     -h|--help)         usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
   esac
+done
+
+# #5745: a port is used in arithmetic (PORT_B + 1, PORT_B + 2), where a non-numeric value is evaluated as an expression
+# and an error aborts the enclosing block. Only a plain decimal port from 1 to 65533 (room for PORT_B + 2) is accepted;
+# the arithmetic compare runs only after the pattern has matched.
+for _lab_pv in "PORT_A=$PORT_A" "PORT_B=$PORT_B"; do
+  if [[ ! ${_lab_pv#*=} =~ ^[1-9][0-9]{0,4}$ ]] || (( ${_lab_pv#*=} > 65533 )); then
+    echo "run.sh: ${_lab_pv%%=*} must be a decimal port from 1 to 65533, got [${_lab_pv#*=}] (#5745)" >&2; exit 2
+  fi
 done
 
 # --probe-mutation mutates the cold-boot probe; with the probe skipped it would silently run nothing.
@@ -377,6 +406,9 @@ lab_posture_render | tee "$RUN/evidence/posture.env" | sed 's/^/   /'
 info "$(lab_posture_count) pinned knobs at their hard floor."
 info "AI_MEMORY_SECURITY_PROFILE is deliberately NOT set (every knob is pinned directly) — see README §asi-hard."
 
+# #5739: the probe block must record exactly one verdict. A failed assignment (a readonly or integer variable, an
+# arithmetic error) aborts a whole top-level compound in bash, which would skip the block's ok or no silently.
+LAB_PROBE_AT=$((LAB_PASS + LAB_FAIL))
 if [ "$CAVEAT_PROBE" -eq 1 ]; then
   # PROVE the full profile cold-boots (#2942 fixed, #4938): boot a throwaway node
   # under the FULL asi-hard profile and record what actually happens.
@@ -421,11 +453,11 @@ if [ "$CAVEAT_PROBE" -eq 1 ]; then
         # The mutation is detected only when the refusal names the lowered knob. Any other refusal
         # (port, config, a different knob) proves nothing about this probe, and the profile's INFO
         # pin line names the knob on every boot, so it is excluded.
-        if lab_probe_refusal_names_knob "$PROBE"; then
-          ok "probe mutation detected: the boot refused (exit $PROBE_RC) and the refusal names AI_MEMORY_REQUIRE_ROLLBACK_CHECK"
-        else
-          no "probe mutation inconclusive: the boot refused (exit $PROBE_RC) but not for the lowered rollback-check knob"
-        fi
+        # #5662, #5664: lab_probe_verdict reports by assignment (no output command on the verdict path), and
+        # lab_probe_report turns the verdict into the line and the outcome: only detected is ok; not-detected and
+        # every refused verdict (the guard refused, or the child exited with a status that is not a verdict) are no.
+        lab_probe_verdict "$PROBE"
+        if lab_probe_report "$LAB_PROBE_VERDICT" "$PROBE_RC"; then ok "$LAB_PROBE_LINE"; else no "$LAB_PROBE_LINE"; fi
       else
         no "full asi-hard cold boot on a fresh DB did NOT come up (exit $PROBE_RC): the lab runs this posture, so a refusal is a failure (#2942 regression or a new refusal)"
       fi
@@ -434,6 +466,11 @@ if [ "$CAVEAT_PROBE" -eq 1 ]; then
     rm -f "$RUN/probe.db"*
   fi
 fi
+# #5739: exactly one verdict, counted on variables that carry no attribute. This is its own top-level statement, and the
+# next one reads its status, so an abort of the check itself (status 1) fails the run too.
+[[ $CAVEAT_PROBE != 1 || ( -z ${LAB_PROBE_AT@a}${LAB_PASS@a}${LAB_FAIL@a} && $((LAB_PASS + LAB_FAIL - LAB_PROBE_AT)) == 1 ) ]]
+case $? in 0) ;; *) printf '   FAIL the cold-boot probe did not record exactly one verdict (PASS %s, FAIL %s, %s before it): a verdict that could not be written fails the run (#5739)\n' "${LAB_PASS-?}" "${LAB_FAIL-?}" "${LAB_PROBE_AT-?}"; exit 1 ;; esac
+# end of the cold-boot probe verdict count (#5739)
 
 # ===========================================================================
 step "6 · launch the two-node mTLS federation"

@@ -601,7 +601,21 @@ ANCHORS = [
     # index.html upgrade paragraph: "steps up to v100 on the first ..." and
     # "a v0.8.x DB steps v70 -> v100" (tag-stripped, entity-decoded).
     re.compile(r'\bv([0-9]+) on the first ai-memory serve after the upgrade'),
-    re.compile(r'\bsteps\s+v[0-9]+\s*(?:→|->)\s*v([0-9]+)'),
+    # Whitespace in this anchor is spelled as spaces only (#5585): every view an anchor sees is
+    # WS-folded first (the cross-line join, the same-line aline), so a tab, a doubled space and a
+    # non-breaking space already arrive as one space; the marker fold then deletes markers and can
+    # leave a run of spaces (`steps ** v40`), which ` +` and ` *` accept and a single literal space
+    # would not. So ` +` equals the old backslash-s-plus on every view the gate builds. Pinned by the
+    # self-test: steps ** v40 -> v52 REJECTED (kills a single space), stepsv40 -> v52 ACCEPTED (kills
+    # ` *` after steps), v40->v52 REJECTED (kills a required space around the arrow), v40 ** -> v52 and
+    # v40 -> ** v52 REJECTED (kill an at-most-one space on either side of the arrow).
+    # EQUIVALENT MUTANT (#5650): reverting the spaces to the backslash-s form changes no verdict, because
+    # the only characters the two spellings treat differently (a tab, a newline, a non-breaking space) never
+    # reach an anchor: WS.sub(' ', ...) (the html view, the cross-line join and the same-line aline) turns each
+    # run of them into one space first. The paired mutants that DO change a verdict are killed by the legs
+    # named above (a single space, a dropped space, a dropped fold). The tab leg (steps<TAB>v40 -> v52) and the
+    # nbsp-and-entity html legs (v40&nbsp;&rarr;&nbsp;v52) pin the fold that makes this so.
+    re.compile(r'\bsteps +v[0-9]+ *(?:→|->) *v([0-9]+)'),
     # CONFIG_SCHEMA postgres row: | ai-memory postgres schema | **v93** |
     re.compile(r'ai-memory postgres schema *\| *\*\*v([0-9]+)\*\*'),
     # schema.html phrasings.
@@ -2863,6 +2877,11 @@ a v0.8.x DB steps **v40** →
 a v0.8.x DB steps **v40** →
 **v53** on boot.
 a v0.6 DB steps  **v40** → v60 on boot.
+a v0.8.x DB steps ** v40 -> v52 on boot.
+a v0.8.x DB stepsv40 -> v52 on boot.
+a v0.8.x DB steps ** v40 -> v53 on boot.
+a v0.8.x DB steps v40 ** -> v52 on boot.
+a v0.8.x DB steps v40 -> ** v52 on boot.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2975,6 +2994,11 @@ R4HTML
     for _bt in em span strong a code b br td th /td /th /em /span /strong /br; do
         printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-control.html"
     done
+    # #5545: the same block tags spelled in upper case (opening and closing) must stop the look-back too; nothing is flagged.
+    : > "$tmpdir/docs/block-case-fixture.html"
+    for _bt in P DIV LI UL OL TR TABLE H1 H2 H3 H4 H5 H6 SECTION /P /DIV /LI /UL /OL /TR /TABLE /H1 /H2 /H3 /H4 /H5 /H6 /SECTION; do
+        printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-case-fixture.html"
+    done
     r4_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test #3248 r4 - stale wordings not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
     for _want in \
@@ -3036,6 +3060,9 @@ R4HTML
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:73 claims "52"' \
         'docs/postgres-age-guide.md:76 claims "52"' \
         'docs/postgres-age-guide.md:79 claims "52"' \
+        'docs/postgres-age-guide.md:83 claims "52"' \
+        'docs/postgres-age-guide.md:86 claims "52"' \
+        'docs/postgres-age-guide.md:87 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:41 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:43 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:45 claims "52"' \
@@ -3059,7 +3086,7 @@ R4HTML
         'docs/schema-fixture.html:42 ' \
         'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 ' 'docs/schema-fixture.html:46 ' \
         'docs/schema-fixture.html:52 ' 'docs/schema-fixture.html:62 ' 'docs/schema-fixture.html:68 ' \
-        'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' \
+        'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' 'docs/block-case-fixture.html:' \
         'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 ' 'docs/schema-fixture.html:89 ' 'docs/schema-fixture.html:94 ' 'docs/postgres-age-guide.md:59 ' 'docs/postgres-age-guide.md:60 ' \
         'docs/postgres-age-guide.md:63 ' 'docs/postgres-age-guide.md:65 ' 'docs/postgres-age-guide.md:67 ' \
         'docs/postgres-age-guide.md:71 ' 'docs/postgres-age-guide.md:75 ' \
@@ -3069,6 +3096,7 @@ R4HTML
         'docs/postgres-age-guide.md:77 ' \
         'docs/postgres-age-guide.md:81 ' \
         'docs/postgres-age-guide.md:82 ' \
+        'docs/postgres-age-guide.md:84 ' 'docs/postgres-age-guide.md:85 ' \
         'docs/schema-fixture.html:96 ' \
         'docs/schema-fixture.html:98 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -3077,8 +3105,8 @@ R4HTML
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5026/#5080 - anchor wrapped across two lines (steps / v40 -> v52) and identifier value more than 60 chars after the identifier: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #4511-R5 - wrapped claim with an issue ref / release triple in the subject tail, whitespace at the wrap point, and a tag-only middle line: planted 52 REJECTED, 53 ACCEPTED"
-    echo "PASS: self-test #5140 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED"
-    echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, any case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
+    echo "PASS: self-test #5140/#5585 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED; the anchor spells spaces only (the views are folded): a marker-fold run of spaces (steps ** v40 -> v52, v40 ** -> v52, v40 -> ** v52) is REJECTED, no space after steps (stepsv40 -> v52) is ACCEPTED"
+    echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, lower and upper case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
     echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag, and when the previous line ends with a closing block tag and the next line carries no tag); a closing tag in the MIDDLE of the previous line does not cut a claim wrapped inside the next paragraph; a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
     echo "PASS: self-test #5200/#5339 - ident-less anchors (re-stamped to v1.0.0 (schema vN), Schema vN (was vM), Current version: N at v1.0.0) each match a markdown claim in BOTH a doubled-space and a tab variant: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5337 - join boundaries pinned: a line ending with an OPENING block tag still joins (52 REJECTED), markdown is not tag-aware (a closing tag at the end of a markdown line, or an opening tag at the start of the next, still joins; 52 REJECTED), html literal backticks are not folded (documented bound)"
@@ -3100,7 +3128,7 @@ R4HTML
     echo "PASS: self-test #4849 - drifted current-state wording (v1.0.0 substrate, bold value) REJECTED, canonical ACCEPTED"
     echo "PASS: self-test #4844/#4845/#4846 - ROADMAP header parenthetical, at-a-glance card + stat tile, compliance tagline, index upgrade paragraph: stale REJECTED, canonical ACCEPTED"
     rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/schema-fixture.html"
-    rm -f "$tmpdir/docs/block-fixture.html" "$tmpdir/docs/block-control.html"
+    rm -f "$tmpdir/docs/block-fixture.html" "$tmpdir/docs/block-control.html" "$tmpdir/docs/block-case-fixture.html"
     rm -f "$tmpdir/docs/CONFIG_SCHEMA.md" "$tmpdir/docs/schema-fixture.html"
     printf '# fixture ledger (comment-only)\n' > scripts/qc-allowlists/schema-claim-history.txt
 
