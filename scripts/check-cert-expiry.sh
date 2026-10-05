@@ -56,8 +56,9 @@
 #   BASE SOURCE (#5970; GOD ruling 2026-10-05; 5-agent vote 4d3ea1c5,
 #   decision 424172a1) — in CI the range comes ONLY from
 #                      scripts/ci-commit-range.py. Closed-world on the
-#                      environment: every exported CERT_EXPIRY_* variable
-#                      other than CERT_EXPIRY_LOCAL_BASE and
+#                      environment: every CERT_EXPIRY_* shell variable,
+#                      exported or only set in the shell (a BASH_ENV
+#                      file), other than CERT_EXPIRY_LOCAL_BASE and
 #                      CERT_EXPIRY_LOCAL_HEAD is refused wherever it is set,
 #                      even when empty; the two local overrides name a range
 #                      by hand outside CI only and are refused whenever
@@ -290,7 +291,7 @@ refuse_overrides() {
                 ;;
             CERT_EXPIRY_*) bad+=("$name") ;;
         esac
-    done < <(compgen -e)
+    done < <(compgen -v)
     if [[ -n "${CERT_EXPIRY_LOCAL_HEAD+set}" && -z "${CERT_EXPIRY_LOCAL_BASE+set}" ]]; then
         bad+=("CERT_EXPIRY_LOCAL_HEAD without CERT_EXPIRY_LOCAL_BASE")
     fi
@@ -1200,7 +1201,7 @@ self_test() {
                 GITHUB_EVENT_BEFORE GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS
             while IFS= read -r kv; do
                 case "$kv" in CERT_EXPIRY_*) unset "$kv" ;; esac
-            done < <(compgen -e)
+            done < <(compgen -v)
             kv=""
             for kv in "$@"; do export "${kv?}"; done
             run_gate "$repo" 2>&1
@@ -1342,11 +1343,12 @@ self_test() {
     # a creation push (all-zero before). Every leg must be red, never not-applicable.
     local wf="$REPO_ROOT/.github/workflows/c8-precheck.yml" mwf="$tmp/wf.yml" me="${BASH_SOURCE[0]}" own
     own="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-    wleg() { # LABEL LEVEL(none|job|workflow) NAME YAML-VALUE WANT('|'-separated)
+    wleg() { # LABEL LEVEL(none|job|workflow|bashenv) NAME VALUE WANT('|'-separated)
         local label="$1" level="$2" var="$3" val="$4" want="$5" rc=0 text line w
         local -a resolved=() wants=()
         case "$level" in
             none) cp "$wf" "$mwf" ;;
+            bashenv) cp "$wf" "$mwf" && printf '%s=%s\n' "$var" "$val" >"$tmp/bashenv" ;;
             job) awk -v k="$var" -v v="$val" '{print} $0=="  cert-expiry-gate:"{print "    env:"; print "      " k ": " v}' "$wf" >"$mwf" ;;
             workflow) awk -v k="$var" -v v="$val" '$0=="jobs:"{print "env:"; print "  " k ": " v} {print}' "$wf" >"$mwf" ;;
         esac
@@ -1358,7 +1360,8 @@ self_test() {
         while IFS= read -r line; do
             case "$line" in *'${{'*) ;; *) resolved+=("$line") ;; esac
         done <<<"$text"
-        if [[ "$level" != none ]] && ! printf '%s\n' "${resolved[@]}" | grep -q "^$var="; then
+        [[ "$level" != bashenv ]] || resolved+=("BASH_ENV=$tmp/bashenv")
+        if [[ "$level" == job || "$level" == workflow ]] && ! printf '%s\n' "${resolved[@]}" | grep -q "^$var="; then
             echo "self-test FAILED ($label): $var did not reach the gate step" >&2
             failed=1
             return
@@ -1391,6 +1394,10 @@ self_test() {
     wleg "wf4 job-level CERT_EXPIRY_HEAD" job CERT_EXPIRY_HEAD HEAD "CERT_EXPIRY_HEAD|$src"
     wleg "wf5 workflow-level CERT_EXPIRY_HEAD" workflow CERT_EXPIRY_HEAD HEAD "CERT_EXPIRY_HEAD|$src"
     wleg "wf6 job-level CERT_EXPIRY_LOCAL_BASE under CI" job CERT_EXPIRY_LOCAL_BASE HEAD "CERT_EXPIRY_LOCAL_BASE (a local override|$src"
+    # A shell variable set but not exported (a BASH_ENV file) is read like an
+    # exported one, so the refusal lists every shell variable, not only the env.
+    wleg "wf7 an unexported CERT_EXPIRY_LOCAL_BASE under CI" bashenv CERT_EXPIRY_LOCAL_BASE "$own" "CERT_EXPIRY_LOCAL_BASE (a local override|$src"
+    wleg "wf8 an unexported CERT_EXPIRY_BASE under CI" bashenv CERT_EXPIRY_BASE "$own" "CERT_EXPIRY_BASE|$src"
 
     # (n) fail-closed — unresolvable range.
     if check_change "$repo" "0000000000000000000000000000000000000000" "$base_sha" >/dev/null 2>&1; then
@@ -1426,7 +1433,7 @@ self_test() {
         echo "check-cert-expiry self-test: FAIL" >&2
         exit 2
     fi
-    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request base missing RED, docs-only GREEN, wire change RED; (l) merge_group checked, missing base RED; (m) push all-zero, empty, unset, unreachable, malformed (39/41-char, upper-case, whitespace, ref name) before RED, normal ranges checked, other events and an empty event with GITHUB_ACTIONS set RED (#5603, no skip); (ov) every CERT_EXPIRY_ variable but the two local overrides RED by name, local overrides RED with GITHUB_ACTIONS set (#5970); (wf) job-level and workflow-level CERT_EXPIRY_ env from a mutated workflow RED by name in a creation push, and the unmutated creation push RED, never not-applicable (#5970, #5851); (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 passes the change-shape rule (#5850); (p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated change over a LIVE banner with wire drift since the bind RED (#3556 C, names the bound SHA and the drift); (t) unrelated change over a VOID banner GREEN; (u) stale LIVE healed by recording EXPIRED GREEN; (v1) LIVE bound to a non-ancestor with an identical watched tree GREEN (squash-merge shape, tree diff); (v2) LIVE bound to a non-ancestor whose watched tree differs RED (the ancestry hatch would have silenced it); (w) unparseable STATUS line fail-closed; (x1) decoy STATUS line above the banner RED (exactly-one rule); (x2) decoy Binds-to line RED; (y) cert doc deleted alongside a wire change RED (ABSENT fails closed); (z) pure banner reformat on a docs-only change GREEN (tolerant parse); (z2) reformat + wire change RED as incidental, not unparseable."
+    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request base missing RED, docs-only GREEN, wire change RED; (l) merge_group checked, missing base RED; (m) push all-zero, empty, unset, unreachable, malformed (39/41-char, upper-case, whitespace, ref name) before RED, normal ranges checked, other events and an empty event with GITHUB_ACTIONS set RED (#5603, no skip); (ov) every CERT_EXPIRY_ variable but the two local overrides RED by name, local overrides RED with GITHUB_ACTIONS set (#5970); (wf) job-level and workflow-level CERT_EXPIRY_ env from a mutated workflow and an unexported CERT_EXPIRY_ shell variable from a BASH_ENV file RED by name in a creation push, and the unmutated creation push RED, never not-applicable (#5970, #5851); (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 passes the change-shape rule (#5850); (p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated change over a LIVE banner with wire drift since the bind RED (#3556 C, names the bound SHA and the drift); (t) unrelated change over a VOID banner GREEN; (u) stale LIVE healed by recording EXPIRED GREEN; (v1) LIVE bound to a non-ancestor with an identical watched tree GREEN (squash-merge shape, tree diff); (v2) LIVE bound to a non-ancestor whose watched tree differs RED (the ancestry hatch would have silenced it); (w) unparseable STATUS line fail-closed; (x1) decoy STATUS line above the banner RED (exactly-one rule); (x2) decoy Binds-to line RED; (y) cert doc deleted alongside a wire change RED (ABSENT fails closed); (z) pure banner reformat on a docs-only change GREEN (tolerant parse); (z2) reformat + wire change RED as incidental, not unparseable."
 }
 
 case "${1:-}" in

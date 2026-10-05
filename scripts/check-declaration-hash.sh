@@ -27,8 +27,9 @@
 #
 # BASE SOURCE (#5970; GOD ruling 2026-10-05; 5-agent vote 4d3ea1c5, decision 424172a1).
 # In CI the base comes ONLY from scripts/ci-commit-range.py. Closed-world on the
-# environment: every exported DECLARATION_GATE_* variable other than the three local
-# overrides (DECLARATION_GATE_LOCAL_BASE, DECLARATION_GATE_LOCAL_PREVIOUS_PIN,
+# environment: every DECLARATION_GATE_* shell variable, exported or only set in the
+# shell (a BASH_ENV file), other than the three local overrides
+# (DECLARATION_GATE_LOCAL_BASE, DECLARATION_GATE_LOCAL_PREVIOUS_PIN,
 # DECLARATION_GATE_LOCAL_ROOT) is refused wherever it is set, even when empty; the
 # local overrides are refused whenever GITHUB_ACTIONS is set (even to an empty
 # string), and setting both LOCAL_BASE and LOCAL_PREVIOUS_PIN is refused. A refusal
@@ -79,7 +80,7 @@ refuse_overrides() {
         [ -z "${GITHUB_ACTIONS+set}" ] || bad+=("$name (a local override; GITHUB_ACTIONS is set)") ;;
       DECLARATION_GATE_*) bad+=("$name") ;;
     esac
-  done < <(compgen -e)
+  done < <(compgen -v)
   if [ -n "${DECLARATION_GATE_LOCAL_BASE+set}" ] && [ -n "${DECLARATION_GATE_LOCAL_PREVIOUS_PIN+set}" ]; then
     bad+=("DECLARATION_GATE_LOCAL_BASE with DECLARATION_GATE_LOCAL_PREVIOUS_PIN (two previous-pin sources)")
   fi
@@ -262,6 +263,12 @@ self_test() {
   bleg "override leg: a local previous pin under GITHUB_ACTIONS=true is refused" fail "DECLARATION_GATE_LOCAL_PREVIOUS_PIN (a local override|$src" GITHUB_ACTIONS=true DECLARATION_GATE_LOCAL_PREVIOUS_PIN="$scratch/previous.pin"
   bleg "override leg: a local base with a local previous pin is refused" fail "two previous-pin sources|$src" DECLARATION_GATE_LOCAL_BASE="$c2" DECLARATION_GATE_LOCAL_PREVIOUS_PIN="$scratch/previous.pin"
   bleg "override leg: a lowercase look-alike is not an input and changes nothing" pass "" declaration_gate_base="$c1" DECLARATION_GATE_LOCAL_BASE="$c2"
+  # A shell variable that is set but not exported (for example by a BASH_ENV file) is read
+  # by the gate exactly like an exported one, so the refusal lists every shell variable.
+  printf 'DECLARATION_GATE_LOCAL_BASE=%s\n' "$c2" > "$scratch/bashenv-local"
+  printf 'DECLARATION_GATE_BASE=%s\n' "$c2" > "$scratch/bashenv-base"
+  bleg "override leg: an unexported local base under GITHUB_ACTIONS=true is refused" fail "DECLARATION_GATE_LOCAL_BASE (a local override|$src" GITHUB_ACTIONS=true BASH_ENV="$scratch/bashenv-local"
+  bleg "override leg: an unexported DECLARATION_GATE_BASE is refused" fail "DECLARATION_GATE_BASE|$src" BASH_ENV="$scratch/bashenv-base"
   # Workflow-env runtime legs (#5970 F1, #5851): plant the variable in a copy of the real
   # workflow at job level or workflow level, resolve the env that reaches the gate step
   # with ci-commit-range.py --gate-step-env, and run the gate with exactly that env under
