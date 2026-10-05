@@ -418,7 +418,7 @@ impl<'a> PersonaGenerator<'a> {
         // mid-sequence failure left an orphaned / mis-attested persona row.
         // Wrap the memory insert + N derived_from links + the metadata patch
         // (none of which use an inner transaction) in one unit; the guard rolls
-        // back on any early `?` (Transaction's Drop default). `generate()` is a
+        // back on any early `?` (`WriteTxn`'s Drop issues ROLLBACK). `generate()` is a
         // top-level call so there is no nesting. The signed_events emit is
         // committed-after (it self-transacts via append_signed_event).
         //
