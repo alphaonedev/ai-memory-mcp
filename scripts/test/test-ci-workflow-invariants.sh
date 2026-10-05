@@ -791,6 +791,16 @@ else
     ok "E regression: --no-clean + --no-report mutant is rejected"
 fi
 
+# SECTION F (#5447): pull_request / push branch-filter pins across every
+# workflow. rehearsal/** must gate PRs (pull_request.branches) and must never
+# overlap push.branches (#2506, #2523, #2508). Closed-world, stdlib-only reader.
+if python3 "$ROOT/scripts/test/test_workflow_pr_triggers_5447.py" >"$SCRATCH/f-5447.out" 2>&1; then
+    ok "F: every workflow pins rehearsal/** in pull_request.branches and never in push.branches (#5447)"
+else
+    bad "F: workflow trigger pin failed (#5447)" \
+        "$(grep -E 'R-(PR|PUSH|SHAPE)|^FAIL|^ERROR' "$SCRATCH/f-5447.out" | head -12)"
+fi
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "ci.yml invariants: $PASS/$PASS PASS"
