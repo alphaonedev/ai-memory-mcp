@@ -669,6 +669,8 @@ def _self_test_cases() -> int:
         honours = subprocess.run([sys.executable, "-S", "-c", "import sys; print(int(getattr(sys.flags, 'safe_path', 0)))"],
                                  capture_output=True, text=True, check=False,
                                  env={**os.environ, "PYTHONSAFEPATH": "1"}).stdout.strip() == "1"
+        if hasattr(sys.flags, "safe_path") and not honours:
+            return "this interpreter has sys.flags.safe_path but a bare child did not report it from PYTHONSAFEPATH (#5475)"
         if honours:
             control = plant_probe("importlib", base_dir / "implant", [], {**os.environ, "PYTHONSAFEPATH": "1"}, ("-S",))
             if control.safe_path != 1 or control.ok:
