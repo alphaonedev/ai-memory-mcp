@@ -723,6 +723,17 @@ def selftest():
     case('a local const of the same name shadows the shared one',
          shared('const EXPECTED_N: usize = 5;\n' + A('EXPECTED_N'), L(18), L(19)), False)
     case('a shared const unchanged while its file changes is no move', shared(A('crate::EXPECTED_N'), L(18) + '// a\n', L(18) + '// b\n'), False)
+    # ---- #5672: "an identical state on both sides is no move" for the unresolved and the ambiguous state ------------
+    case('an unresolved name unchanged on both sides is no move',
+         shared(A('ext::MISSING_N') + '// a\n', L(18), L(18), None, {SH: A('ext::MISSING_N') + '// b\n'}), False)
+    case('an ambiguous name unchanged on both sides is no move',
+         shared(A('crate::EXPECTED_N') + '// a\n', L(18), L(18), {'src/other.rs': L(3)}, {SH: A('crate::EXPECTED_N') + '// b\n'}), False)
+    case('an ambiguous name newly asserted is a move',
+         shared('fn t() {}\n', L(18), L(18), {'src/other.rs': L(3)}, {SH: A('crate::EXPECTED_N')}), True, ['?EXPECTED_N#ambiguous'])
+    case('an unresolved name that becomes resolved is a move',
+         shared(A('crate::MISSING_N'), L(18), L(18) + 'pub const MISSING_N: usize = 4;\n'), True, ['?MISSING_N#unresolved -> 4'])
+    case('an ambiguous name that becomes resolved is a move',
+         shared(A('crate::EXPECTED_N'), L(18), L(18), {'src/other.rs': L(3)}, {'src/other.rs': 'pub fn x() {}\n'}), True, ['?EXPECTED_N#ambiguous(18,3) -> 18'])
     def c_ren(s, b):                                       # the defining file is renamed with the bump
         s.w('src/lib.rs', L(18) + PAD); s.w(SH, A('crate::EXPECTED_N')); t0 = s.commit('test: add')
         s.g('mv', 'src/lib.rs', 'src/consts.rs'); s.w('src/consts.rs', L(19) + PAD); s.commit('test: move and bump'); return t0 + '..HEAD'
