@@ -289,6 +289,15 @@ CASES: List[Tuple[str, Dict[str, Body], Callable[[Tree], bool]]] = [
      {"docs/a.md": DOC, "infra/override.bin": b"%PDF\n" + DOC.encode("utf-8") + b"\x00",
       UNREAD: "# " + SKIP + "\ninfra/override.bin\n"},
      lambda t: t.regen("--accept-new", "--reason", GOOD) == 2 and t.regen("--check") == 2 and t.gate() == 2),
+    ("a binary whose UTF-16 bytes hold a mention with a Cyrillic letter is never written to the skip list (#5717)",
+     {"docs/a.md": DOC, "infra/override.bin": b"%PDF\n" + "Run PgBouncer in trаnsaction mode.\n".encode("utf-16-le")
+      + b"\x00"},
+     lambda t: t.regen("--accept-new", "--reason", GOOD, "--skip-reason", SKIP) == 2 and not (t.root / UNREAD).exists()
+     and t.gate() == 2),
+    ("a listed skip whose UTF-32 bytes hold a mention is a fault for --check as for the gate (#5717)",
+     {"docs/a.md": DOC, "infra/override.bin": b"%PDF\n" + "pool_mo⁠de = transaction\n".encode("utf-32-be") + b"\x00",
+      UNREAD: "# " + SKIP + "\ninfra/override.bin\n"},
+     lambda t: t.regen("--accept-new", "--reason", GOOD) == 2 and t.regen("--check") == 2 and t.gate() == 2),
     ("a magic-number file under a text suffix is never written to the skip list (#5367)",
      {"docs/a.md": DOC, "docs/c.md": b"\x1f\x8b\x08\x00junk"},
      lambda t: t.regen("--accept-new", "--reason", GOOD, "--skip-reason", SKIP) == 2 and not (t.root / UNREAD).exists()),

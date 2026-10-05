@@ -659,39 +659,104 @@ def read_lines(path: Path) -> Iterator[str]:
             chunk = handle.read(CHUNK_BYTES)  # the final empty read flushes the decoder and keeps no carry
 
 
-def _raw_lines(path: Path, drop_nul: bool) -> Iterator[str]:
-    """The raw bytes of a file as latin-1 lines (every byte value decodes, nothing is replaced). With drop_nul the NUL
-    bytes are removed (a word cut by NULs, text in another width); otherwise each NUL ends a line."""
-    carry = b""
+# #5717: the views of a file the gate cannot read as text: latin-1 (every byte value decodes, nothing is replaced) and
+# every encoding the text reader decodes (read_lines: UTF-8, UTF-16 and UTF-32 in either byte order), each at every
+# code-unit alignment, so a run of text that starts on any byte is read whole in one view.
+RAW_VIEWS: Tuple[Tuple[str, int], ...] = (("latin-1", 0), ("utf-8", 0)) + tuple(
+    (codec, offset) for codec, width in (("utf-16-le", 2), ("utf-16-be", 2), ("utf-32-le", 4), ("utf-32-be", 4))
+    for offset in range(width))
+_BYTE_CODECS = frozenset(("latin-1", "utf-8"))
+# #5717, speed only: characters that neither fold to an ASCII letter nor hide one (CJK ideographs, Hangul syllables,
+# private use, U+FFFD). A view line made only of them and spaces holds no mention and hides no word.
+_INERT = re.compile("[\\s\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7a3\ue000-\uf8ff\ufffd\U00020000-\U0002ebef]*")
+
+
+def _raw_lines(path: Path, codec: str, offset: int, drop_nul: bool) -> Iterator[str]:
+    """The bytes of a file from `offset` on, decoded as `codec` with each invalid sequence replaced, as the lines
+    str.splitlines() gives. With drop_nul each NUL is removed (a word cut by NULs; in latin-1 and UTF-8 the NUL bytes
+    go before decoding, so a multi-byte sequence cut by them is whole again); otherwise each NUL ends a line. A line
+    longer than RAW_LINE_CAP is cut in segments that overlap by RAW_OVERLAP characters, so no word is lost."""
+    decoder = codecs.getincrementaldecoder(codec)("replace")
+    nul = "" if drop_nul else "\n"
+    carry = ""
     with open(str(path), "rb") as handle:
+        handle.seek(offset)
         while True:
             chunk = handle.read(CHUNK_BYTES)
-            data = carry + (chunk.replace(b"\0", b"") if drop_nul else chunk.replace(b"\0", b"\n"))
-            parts = data.splitlines()
-            carry = parts.pop() if chunk and parts else b""
-            for part in parts:
-                yield part.decode("latin-1")
+            data = chunk.replace(b"\0", nul.encode("ascii")) if codec in _BYTE_CODECS else chunk
+            text = carry + decoder.decode(data, final=not chunk).replace("\0", nul)
+            lines = text.splitlines(keepends=True)
+            carry = ""
+            if chunk and lines and (lines[-1].splitlines()[0] == lines[-1] or lines[-1].endswith("\r")):
+                carry = lines.pop()  # #5717: a tail with no line break yet, or a \r that may be half of \r\n
+            for line in lines:
+                yield line.splitlines()[0]
             while len(carry) > RAW_LINE_CAP:
-                yield carry[:RAW_LINE_CAP].decode("latin-1")
+                yield carry[:RAW_LINE_CAP]
                 carry = carry[RAW_LINE_CAP - RAW_OVERLAP:]
             if not chunk:
-                if carry:
-                    yield carry.decode("latin-1")
                 return
 
 
-def raw_mention(path: Path) -> Optional[int]:
-    """#5552: the 1-based line of the first pool-mode mention in the raw bytes of a file the gate cannot read as text,
-    under the gate's own rules R1/R2/R4 (a line, or a line joined to the next), or None. Two views: NUL as a line
-    break, and NUL removed. The first bytes of the file decide nothing."""
-    for drop_nul in (False, True):
-        before = ""
-        for number, raw in enumerate(_raw_lines(path, drop_nul), 1):
-            text = normalise(raw)
-            if text and (mentions(text) or (before and mentions(before + " " + text))):
-                return number
-            before = text
+def raw_mention(path: Path) -> Optional[str]:
+    """#5552, #5717: where the first pool-mode mention is in the bytes of a file the gate cannot read as text, under
+    the gate's own mention rules R1/R2/R4 with the shadow fold (a line, or a line joined to the one before), as
+    "<codec>+<offset> view, line <n>", or None. Every view in RAW_VIEWS is read twice: NUL as a line break, and NUL
+    removed. The first bytes of the file decide nothing."""
+    for codec, offset in RAW_VIEWS:
+        for drop_nul in (False, True):
+            before = ""
+            for number, raw in enumerate(_raw_lines(path, codec, offset, drop_nul), 1):
+                if _INERT.fullmatch(raw):
+                    before = ""  # it adds no letter to a joined pair either
+                    continue
+                text = normalise(raw)
+                if text and (mentions(text) or (before and mentions(before + " " + text)) or raw_hides(text)):
+                    return "%s+%d view%s, line %d" % (codec, offset, ", NUL removed" if drop_nul else "", number)
+                before = text
     return None
+
+
+SPELL_CAP = 15  # #5717: a longer run is not read as a spelled key word (13 letters at most, and two more)
+# Any cap above 15 reads the same runs, since _spelled_word also needs len(word) <= len(key) + 2 <= 15; a cap below
+# 15 misses a spelled transactional (the self-test pins 14).
+
+
+def _lookalike_letter(c: str) -> bool:
+    return unicodedata.category(c).startswith("L") and unicodedata.name(c, "?").split(" ", 1)[0] in _LOOKALIKE_SCRIPTS
+
+
+_SPELL_TOKEN = re.compile(r"[^\s!-/:-@\[-`{-~]+")  # a run with no space and no ASCII punctuation
+
+
+def _spelled_word(view: str) -> bool:
+    """#5717: a run of a shadow view that spells a key word once each character outside ASCII is read as one letter or
+    none. The run has at least three ASCII letters and at most two characters more than the key word; at most two
+    letters of the key word are missing from its ASCII and look-alike letters; and it holds at most
+    max(0, (len(key) - 5) // 2) other characters (a CJK character, a symbol, U+FFFD): none in pool or mode, three in
+    transaction. Decoded binary data holds such characters next to ASCII letters everywhere, so a short key word is
+    read only from letters."""
+    for word in _SPELL_TOKEN.findall(view):
+        if word.isascii() or len(word) > SPELL_CAP or sum(1 for c in word if _ascii_letter(c)) < 3:
+            continue
+        known = sum(1 for c in word if c.isascii() or _lookalike_letter(c))
+        wild = re.compile("".join(re.escape(c) if c.isascii() else ".?" for c in word))
+        for key in _KEY_WORDS:
+            junk = max(0, (len(key) - 5) // 2)
+            if len(word) <= len(key) + 2 and known >= len(key) - 2 and len(word) - known <= junk and wild.fullmatch(key):
+                return True
+    return False
+
+
+def raw_hides(text: str) -> bool:
+    """#5717: R9 for a line of a view of a skipped file, scoped to words, since decoded binary data holds U+FFFD and
+    stray letters on almost every line: a reordering character on a line that names a pool, mode or product word read
+    either way round, a word of four or more look-alike letters (#5363), or a spelled key word (_spelled_word)."""
+    if text.isascii():
+        return False  # no reordering character, no letter outside ASCII: mentions() has read the line
+    view = shadow(text)
+    return (any(c in BIDI for c in text) and bool(_QUICK.search(view) or _QUICK.search(view[::-1]))) \
+        or _lookalike_word(view) or _spelled_word(view)
 
 
 def skip_problem(reason: str) -> Optional[str]:
@@ -717,8 +782,8 @@ def scan_detail(root: Path) -> Tuple[List[Unit], int, Dict[str, str]]:
         try:
             found = scan_stream(rel, read_lines(path))  # an OSError propagates: run() reports a FAULT
         except Unreadable as exc:
-            line = raw_mention(path)  # an OSError propagates: run() reports a FAULT
-            unread[rel] = str(exc) + ("" if line is None else "; %s (line %d)" % (RAW_MENTION_MARK, line))
+            where = raw_mention(path)  # an OSError propagates: run() reports a FAULT
+            unread[rel] = str(exc) + ("" if where is None else "; %s (%s)" % (RAW_MENTION_MARK, where))
             continue
         read += 1
         units += found
@@ -1161,6 +1226,70 @@ def skip_tree(rel: str, body: bytes) -> Dict[str, object]:
 MENTION = b"pool_mode = transaction\n"  # a claim that must never hide in a skipped file (#5552)
 
 
+def skip_spelled(label: str, spelling: str, codec: str, head: bytes = b"%PDF\n") -> Tuple[str, Dict[str, object], int]:
+    """#5717: a skip-listed file whose bytes after a printable magic number spell a mention in `codec`: a fault."""
+    body = head + spelling.encode(codec) + b"\n\0"
+    return ("a %s mention spelled with %s cannot be skipped (#5717)" % (codec, label), skip_tree("docs/z.bin", body), EXIT_FAULT)
+
+
+# #5717: spellings the text scan reads as a mention (R4 shadow fold), each hidden in a skipped file in an encoding the
+# text reader decodes. The head b"%PDF\n" is five bytes, so a UTF-16 run starts on an odd byte and a UTF-32 run on 1 mod 4.
+SPELLED = (
+    ("an en dash", "PgBouncer transaction–mode", "utf-8"),
+    ("a non-breaking hyphen", "PgBouncer transaction‑mode", "utf-8"),
+    ("a Cyrillic a", "Run PgBouncer in trаnsaction mode.", "utf-8"),
+    ("a zero-width space", "Run PgBouncer in trans​action mode.", "utf-8"),
+    ("a soft hyphen", "Run PgBouncer in trans­action mode.", "utf-8"),
+    ("a Greek o and a Cyrillic a", "pοol_mode = trаnsaction", "utf-8"),
+    ("a no-break space", "Run PgBouncer in transaction mode.", "utf-8"),
+    ("full-width letters", "Run PgBouncer in ｔｒansaction mode.", "utf-8"),
+    ("a decomposed accent", "Run PgBouncer in transactión mode.", "utf-8"),
+    ("a word joiner", "pool_mo⁠de = transaction", "utf-8"),
+    ("a mathematical bold t", "Run PgBouncer in \U0001d42dransaction mode.", "utf-8"),
+    ("a Hangul filler", "Run PgBouncer in transㅤaction mode.", "utf-8"),
+    ("Latin letters outside the look-alike table", "Run PgBouncer in trɑnsɑctiɔn mode.", "utf-8"),
+    ("plain ASCII on an odd byte", "pool_mode = transaction", "utf-16-le"),
+    ("a Cyrillic a", "Run PgBouncer in trаnsaction mode.", "utf-16-le"),
+    ("full-width letters", "Run PgBouncer in ｔｒansaction mode.", "utf-16-be"),
+    ("a mathematical bold t", "Run PgBouncer in \U0001d42dransaction mode.", "utf-16-be"),
+    ("a word joiner", "pool_mo⁠de = transaction", "utf-32-le"),
+    ("Latin letters outside the look-alike table", "Run PgBouncer in trɑnsɑctiɔn mode.", "utf-32-be"),
+    # R9 forms the mention rules do not read, refused in a view by the word-scoped raw_hides()
+    ("a right-to-left override", "‮edom_loop = noitcasnart‬", "utf-8"),
+    ("a right-to-left override", "‮edom_loop = noitcasnart‬", "utf-16-be"),
+    ("a word of Cherokee look-alikes", "ᏢᎾᎾᏞ_mode = transaction", "utf-8"),
+    ("a word of Cherokee look-alikes", "ᏢᎾᎾᏞ_mode = transaction", "utf-32-le"),
+    ("Cherokee look-alikes around ASCII letters", "Run it in ᎢᎡᎪnsᎪᏟᎢᎥᎾn mode.", "utf-8"),
+    ("Cherokee look-alikes around ASCII letters", "Run it in ᎢᎡᎪnsᎪᏟᎢᎥᎾn mode.", "utf-16-le"),
+    ("a symbol inside the word", "Run it in trans★action mode.", "utf-8"),
+    ("a symbol inside the word", "Run it in trans★action mode.", "utf-32-be"),
+    # the edges of each view and of each _spelled_word limit (a mutant of the view list or a limit changes the result)
+    ("five mathematical bold letters", "Run it in \U0001d42d\U0001d42b\U0001d41a\U0001d427\U0001d42caction mode.",
+     "utf-32-le"),
+    ("three look-alike letters inserted in pool", "Run it in po\u0254\u0254\u0254l mode.", "utf-8"),
+    ("three look-alike letters inserted in mode", "Run it in transaction m\u0254\u0254\u0254de.", "utf-8"),
+    ("a mathematical bold t", "Run it in \U0001d42dransaction mode.", "utf-32-be"),
+    ("Latin-1 accented letters", "Run it in trànsàctión mode.", "latin-1"),
+    ("a Cyrillic a and a NUL code unit", "Run it in trаns\0action mode.", "utf-16-le"),
+    ("Cyrillic letters and a space only", "рооӏ моԁе", "utf-8"),
+    ("full-width characters only", "ｐｏｏｌ＿ｍｏｄｅ　＝　"
+     "ｔｒａｎｓａｃｔｉｏｎ", "utf-8"),
+    ("a word of Cherokee look-alikes and no ASCII letter", "Run it in ᎢᎡᎪᏁᏚᎪᏟᎢ"
+     "ᎥᎾᏁ mode.", "utf-8"),
+    ("two missing letters and a third star (the known and junk limits)", "Run it in tr★ns★ct★ion mode.",
+     "utf-8"),
+    ("two stars in a 15-character run (SPELL_CAP)", "Run it in trans★action★al mode.", "utf-8"),
+)
+
+# #5717 stated limits: one step past each _spelled_word limit the run is read as data, as decoded binary data is.
+PAST_SPELL_LIMITS = (
+    ("four stars, one more than transaction allows", "Run it in tr★ns★ct★ion★ mode."),
+    ("three missing letters", "Run it in ★r★ns★ction mode."),
+    ("three characters more than multiplexing has", "Run it in multi★plex★ing★ mode."),
+    ("two ASCII letters", "Run it in pᏅᏅl mode."),
+)
+
+
 def run_quiet(root: Path) -> int:
     saved_out, saved_err = sys.stdout, sys.stderr
     sink = open(os.devnull, "w")
@@ -1425,8 +1554,12 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
         ("an upper-case mention cannot be skipped (#5552)", skip_tree("docs/z.bin", b"GIF8\nPOOL_MODE = TRANSACTION\n\0"), EXIT_FAULT),
         ("a mention that straddles a read chunk boundary cannot be skipped (#5552)",
          skip_tree("docs/z.bin", b"GIF8\0" + b"x" * (CHUNK_BYTES - 12) + b"pool_mo" + b"de = session\n"), EXIT_FAULT),
+        # #5717: the line runs on past the next chunk, so it is cut while it is read (a line that ends in the chunk is
+        # never cut), nine letters into transaction: neither half nor the two halves joined is a mention. The NUL
+        # before the line break makes the file binary and starts the line at the same byte in both NUL views.
         ("a mention that straddles a raw segment cut cannot be skipped (#5552)",
-         skip_tree("docs/z.bin", b"GIF8\0" + b"x" * (RAW_LINE_CAP - 7) + b"pool_mo" + b"de = session\n"), EXIT_FAULT),
+         skip_tree("docs/z.bin", b"GIF8\0\n" + b"x" * (RAW_LINE_CAP - 10) + b" transacti" + b"on mode "
+                   + b"x" * (CHUNK_BYTES + 10) + b"\n"), EXIT_FAULT),
         ("an unlisted GIF8 file with a NUL byte over a mention is a fault (#5552)",
          tree({"infra/pgbouncer/override.bin": b"GIF8\n" + MENTION + b"\0"}), EXIT_FAULT),
         ("an empty file under a binary suffix cannot be skipped (#5552)", skip_tree("infra/pgbouncer/override.bin", b""), EXIT_FAULT),
@@ -1471,6 +1604,32 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
         ("fail closed: template with two active pool_mode lines", tree(ini=GOOD_INI + "pool_mode = session\n"), EXIT_FAULT),
         ("fail closed: template mode is transaction", tree(ini="[pgbouncer]\npool_mode = transaction\n"), EXIT_FAULT),
         ("fail closed: missing allowlist file", {k: v for k, v in tree().items() if k != ALLOW_REL.as_posix()}, EXIT_FAULT),
+    ]
+    out += [skip_spelled(*row) for row in SPELLED]
+    out += [("a run with %s is read as data, a stated limit (#5717)" % label,
+             skip_tree("docs/z.bin", b"%PDF\n" + spelling.encode("utf-8") + b"\n\0"), EXIT_OK)
+            for label, spelling in PAST_SPELL_LIMITS]
+    out += [
+        skip_spelled("plain ASCII on an even byte", "pool_mode = transaction", "utf-16-be", head=b"%PDF\n\n"),
+        skip_spelled("plain ASCII on byte 3 mod 4", "pool_mode = transaction", "utf-32-le", head=b"%PDF\n\n\n"),
+        skip_spelled("plain ASCII on byte 2 mod 4", "Run PgBouncer in transaction mode.", "utf-32-be", head=b"%PDF\n\n"),
+        skip_spelled("plain ASCII on byte 0 mod 4", "Run PgBouncer in transaction mode.", "utf-32-le", head=b"%PDF\n\n\n\n"),
+        ("a UTF-8 look-alike cut by a NUL byte cannot be skipped (#5717)",
+         skip_tree("docs/z.bin", b"%PDF\nRun PgBouncer in tr\xd0\0\xb0nsaction mode.\n"), EXIT_FAULT),
+        ("a UTF-16 mention cut by a NUL code unit cannot be skipped (#5717)",
+         skip_tree("docs/z.bin", b"%PDF\n" + "pool_mo\0de = transaction\n".encode("utf-16-le") + b"\0"), EXIT_FAULT),
+        ("a UTF-16 mention wrapped over two lines cannot be skipped (#5717)",
+         skip_tree("docs/z.bin", b"%PDF\n" + "use pool\nmode here\n".encode("utf-16-le") + b"\0"), EXIT_FAULT),
+        ("three invalid UTF-8 bytes for a letter cannot be skipped (#5717)",
+         skip_tree("docs/z.bin", b"%PDF\nRun it in tr\xff\xff\xffnsaction mode.\n\0"), EXIT_FAULT),
+        ("a short word with a stray byte in a binary file may be skipped (#5717)",
+         skip_tree("docs/z.bin", b"%PDF\nxx mo\x93de yy \x9bpoo\x9b\n\0"), EXIT_OK),
+        ("three Cyrillic letters each cut by a NUL byte cannot be skipped (#5717)",
+         skip_tree("docs/z.bin", b"%PDF\nRun it in tr\xd0\0\xb0ns\xd0\0\xb0cti\xd0\0\xben mode.\n"), EXIT_FAULT),
+        ("a line of CJK between two halves of a mention does not join them (#5717)",
+         skip_tree("docs/z.bin", b"%PDF\nRun it in transaction\n\xe4\xb8\x80\nmode.\n\0"), EXIT_OK),
+        ("a binary file with Cyrillic and Greek words and no mention may be skipped (#5717)",
+         skip_tree("docs/z.bin", b"%PDF\n" + "привет καλημέρα".encode("utf-16-le") + b"\n\0\xff"), EXIT_OK),
     ]
     return out
 
@@ -1631,16 +1790,52 @@ MUTANTS: List[Tuple[str, str, str]] = [
     # #5552: the raw-byte rule (twelve mutants over its lines)
     ("F1 #5552 a raw mention refuses the skip", "    if RAW_MENTION_MARK in reason:", "    if False:"),
     ("F1 #5552 a missing magic number refuses the skip", "    if not reason.startswith(MAGIC_REASON):\n        return \"it has", "    if False:\n        return \"it has"),
-    ("F1 #5552 the mention is recorded in the reason", '("" if line is None else "; %s (line %d)" % (RAW_MENTION_MARK, line))', '""'),
-    ("F1 #5552 the raw mention is looked for", "            line = raw_mention(path)", "            line = None"),
+    ("F1 #5552 the mention is recorded in the reason", '("" if where is None else "; %s (%s)" % (RAW_MENTION_MARK, where))', '""'),
+    ("F1 #5552 the raw mention is looked for", "            where = raw_mention(path)", "            where = None"),
     ("F1 #5552 the NUL-as-break view", "    for drop_nul in (False, True):", "    for drop_nul in (True,):"),
     ("F1 #5552 the NUL-removed view", "    for drop_nul in (False, True):", "    for drop_nul in (False,):"),
-    ("F1 #5552 a NUL ends a raw line", 'chunk.replace(b"\\0", b"\\n"))', "chunk)"),
-    ("F1 #5552 a NUL is removed in its view", 'data = carry + (chunk.replace(b"\\0", b"") if drop_nul else', "data = carry + (chunk if drop_nul else"),
+    ("F1 #5552 a NUL ends a raw line", 'nul = "" if drop_nul else "\\n"', 'nul = "" if drop_nul else "\\0"'),
+    ("F1 #5552 a NUL is removed in its view", 'nul = "" if drop_nul else "\\n"', 'nul = "\\0" if drop_nul else "\\n"'),
     ("F1 #5552 an overlong raw line overlaps its segments", "carry = carry[RAW_LINE_CAP - RAW_OVERLAP:]", "carry = carry[RAW_LINE_CAP:]"),
-    ("F1 #5552 a raw line is carried across a chunk", 'carry = parts.pop() if chunk and parts else b""', 'carry = b""'),
+    ("F1 #5552 a raw line is carried across a chunk", "carry = lines.pop()  # #5717", "lines.pop()  # #5717"),
     ("F1 #5552 a mention wrapped over two raw lines", ' or (before and mentions(before + " " + text))', ""),
     ("F1 #5552 a raw line is normalised", "            text = normalise(raw)\n", "            text = raw\n"),
+    # #5717: the raw views and the word-scoped hiding rule (35 mutants; SPELL_CAP 15 -> 16 is equivalent, see SPELL_CAP)
+    ("F1 #5717 no utf-8 view", '(("latin-1", 0), ("utf-8", 0)) + tuple(', '(("latin-1", 0),) + tuple('),
+    ("F1 #5717 no latin-1 view", '(("latin-1", 0), ("utf-8", 0)) + tuple(', '(("utf-8", 0),) + tuple('),
+    ("F1 #5717 no utf-16-le view", '(("utf-16-le", 2), ("utf-16-be", 2), ', '(("utf-16-be", 2), '),
+    ("F1 #5717 no utf-16-be view", '("utf-16-be", 2), ("utf-32-le", 4)', '("utf-32-le", 4)'),
+    ("F1 #5717 no utf-32-le view", '("utf-32-le", 4), ("utf-32-be", 4))', '("utf-32-be", 4))'),
+    ("F1 #5717 no utf-32-be view", ', ("utf-32-be", 4))\n', ')\n'),
+    ("F1 #5717 one alignment only", '    for offset in range(width))', '    for offset in range(1))'),
+    ("F1 #5717 last alignment dropped", '    for offset in range(width))', '    for offset in range(width - 1))'),
+    ("F1 #5717 utf-8 NULs kept before decoding", '_BYTE_CODECS = frozenset(("latin-1", "utf-8"))', '_BYTE_CODECS = frozenset(("latin-1",))'),
+    ("F1 #5717 wide NULs not handled", 'decoder.decode(data, final=not chunk).replace("\\0", nul)', 'decoder.decode(data, final=not chunk)'),
+    ("F1 #5717 alignment ignored", '        handle.seek(offset)\n', '        handle.seek(0)\n'),
+    ("F1 #5717 no hiding rule", ' or raw_hides(text)):', '):'),
+    ("F1 #5717 no bidi clause", '    return (any(c in BIDI for c in text) and bool(_QUICK.search(view) or _QUICK.search(view[::-1]))) \\\n        or _lookalike_word', '    return _lookalike_word'),
+    ("F1 #5717 bidi not read reversed", ' or _QUICK.search(view[::-1])))', '))'),
+    ("F1 #5717 no look-alike word clause", '        or _lookalike_word(view) or _spelled_word(view)', '        or _spelled_word(view)'),
+    ("F1 #5717 no spelled word clause", '        or _lookalike_word(view) or _spelled_word(view)', '        or _lookalike_word(view)'),
+    ("F1 #5717 junk limit tighter", 'len(word) - known <= junk', 'len(word) - known < junk'),
+    ("F1 #5717 junk limit looser", 'junk = max(0, (len(key) - 5) // 2)', 'junk = max(0, (len(key) - 3) // 2)'),
+    ("F1 #5717 junk limit removed", ' and len(word) - known <= junk and', ' and'),
+    ("F1 #5717 known limit tighter", 'known >= len(key) - 2 and', 'known >= len(key) - 1 and'),
+    ("F1 #5717 known limit looser", 'known >= len(key) - 2 and', 'known >= len(key) - 3 and'),
+    ("F1 #5717 length limit tighter", 'if len(word) <= len(key) + 2 and', 'if len(word) <= len(key) + 1 and'),
+    ("F1 #5717 length limit looser", 'if len(word) <= len(key) + 2 and', 'if len(word) <= len(key) + 3 and'),
+    ("F1 #5717 SPELL_CAP 14", 'SPELL_CAP = 15  #', 'SPELL_CAP = 14  #'),
+    ("F1 #5717 ascii letters at least 4", 'sum(1 for c in word if _ascii_letter(c)) < 3:', 'sum(1 for c in word if _ascii_letter(c)) < 4:'),
+    ("F1 #5717 ascii letters at least 2", 'sum(1 for c in word if _ascii_letter(c)) < 3:', 'sum(1 for c in word if _ascii_letter(c)) < 2:'),
+    ("F1 #5717 look-alike letter read as junk", 'known = sum(1 for c in word if c.isascii() or _lookalike_letter(c))', 'known = sum(1 for c in word if c.isascii())'),
+    ("F1 #5717 wildcard exact one", 're.escape(c) if c.isascii() else ".?" for c in word))\n        for key', 're.escape(c) if c.isascii() else "." for c in word))\n        for key'),
+    ("F1 #5717 inert line keeps the pair", '                    before = ""  # it adds no letter', '                    pass  # it adds no letter'),
+    ("F1 #5717 inert widened to Cyrillic", '\\ufffd\\U00020000', '\\ufffd\\u0400-\\u052f\\U00020000'),
+    ("F1 #5717 inert takes ASCII letters", '"[\\\\s\\u3400', '"[\\\\sa-z\\u3400'),
+    ("F1 #5717 inert widened to full-width forms", '\\ufffd\\U00020000', '\\ufffd\\uff00-\\uffef\\U00020000'),
+    ("F1 #5717 ascii shortcut wrong way", '    if text.isascii():\n        return False  # no reordering', '    if not text.isascii():\n        return False  # no reordering'),
+    ("F1 #5717 junk floor removed", 'junk = max(0, (len(key) - 5) // 2)', 'junk = (len(key) - 5) // 2'),
+    ("F1 #5717 junk floor one", 'junk = max(0, (len(key) - 5) // 2)', 'junk = max(1, (len(key) - 5) // 2)'),
     # #5554, #5555: rules shown unpinned by mutants N01-N12 (round-8 review)
     ("N01 #5554 set-env reach of four arguments", "[^\\s=\\\"']+){0,4}?", "[^\\s=\\\"']+){0,3}?"),
     ("N02 #5555 a prefixed key before a command", 're.compile(r"^[a-z0-9_]*pool[_-]?mode=', 're.compile(r"^pool[_-]?mode='),
