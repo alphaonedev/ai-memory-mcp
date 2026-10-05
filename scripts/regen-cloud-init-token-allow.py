@@ -27,9 +27,11 @@ def pending_refusals(g, templates, allow, pend) -> list:
     allowlist; one the gate drops as a form fault, or one that matches no triggered line,
     excludes nothing, so a rewrite would write that tracked line as approved."""
     faults = []
+    g.register_credentials(allow)
+    g.register_credentials(pend)
     g.load_entries(allow, False, faults, "allow")
     pe = g.load_entries(pend, True, faults, "pending")
-    out = ["FAULT: " + f for f in faults]
+    out = ["FAULT: " + g.mask_credentials(f) for f in faults]
     per = {}
     cache = {}
     for nm, text in sorted(templates.items()):
@@ -43,9 +45,23 @@ def pending_refusals(g, templates, allow, pend) -> list:
             return bool(per) and all(k in v for v in per.values())
         return k in per.get(e[0], set())
 
-    out += ["STALE PENDING: %s %s | %s | %s" % (e[0], e[1], e[2], e[3]) for e in pe if not live(e)]
+    out += ["STALE PENDING: %s %s | %s | %s" % (e[0], e[1], e[2], g.mask_credentials(e[3])) for e in pe if not live(e)]
     if out:
         out.append("refused: fix the allow or pending list first (%d problem(s)); nothing was written" % len(out))
+    return out
+
+
+def change_report(g, removed, added, changed, old_seq, new_seq) -> list:
+    """The REMOVED, NEW and CHANGED lines the rewrite prints. Each carries template text, so
+    each goes through g.mask_credentials: a template line that holds a password is shown with
+    it masked (#5488). Credential text must be registered first (g.analyse does it)."""
+    out = ["REMOVED: %s | %s | %s" % (k[0], k[1], g.mask_credentials(k[2])) for k in sorted(removed.elements())]
+    out += ["NEW: %s | %s | %s" % (k[0], k[1], g.mask_credentials(k[2])) for k in sorted(added.elements())]
+    for k in changed:
+        out.append("CHANGED: %s | %s" % k)
+        for d in difflib.unified_diff(old_seq.get(k, []), new_seq.get(k, []), lineterm="", n=0):
+            if d[:1] in "+-" and not d.startswith(("+++", "---")):
+                out.append("    " + g.mask_credentials(d))
     return out
 
 
@@ -60,6 +76,18 @@ def self_test(g, templates, allow, pend) -> int:
         ("both-scope pending entry that one template lacks", pend.replace(first, "both " + head.split(" ", 1)[1] + " | " + rest, 1), True),
     ]
     bad = [lbl for lbl, p, want in cases if bool(pending_refusals(g, templates, allow, p)) != want]
+    # a stale pending line and a changed line that hold a password print it masked (#5488)
+    leak = "postgres://aimemory:Aq7Zk'Bq7Zk@h/x"
+    stale = pend.replace(first, head + " | top | " + leak, 1)
+    shown = "\n".join(pending_refusals(g, templates, allow, stale))
+    if "Bq7Zk" in shown or "STALE PENDING" not in shown:
+        bad.append("a stale pending line printed a password, or was not refused")
+    g.register_credentials(leak)
+    key = ("aws-gpu-burst", "top", leak)
+    rep_lines = "\n".join(change_report(g, Counter([key]), Counter([key]), [("aws-gpu-burst", "top")],
+                                         {("aws-gpu-burst", "top"): [leak]}, {("aws-gpu-burst", "top"): ["+" + leak]}))
+    if "Bq7Zk" in rep_lines or rep_lines.count("REMOVED") != 1 or rep_lines.count("NEW") != 1 or "CHANGED" not in rep_lines:
+        bad.append("the rewrite report printed a password, or lost a line")
     for lbl in bad:
         print("REGEN SELF-TEST FAIL: " + lbl, file=sys.stderr)
     if not bad:
@@ -130,11 +158,6 @@ def main():
     was = per_scope((e[0], e[2], e[3]) for e in old)
     now = per_scope(out)
     added, removed = now - was, was - now
-    for k in sorted(removed.elements()):
-        print("REMOVED: %s | %s | %s" % k)
-    for k in sorted(added.elements()):
-        print("NEW: %s | %s | %s" % k)
-
     def seqs_of(entries):
         s = {}
         for sc, ctx, text in entries:
@@ -145,11 +168,9 @@ def main():
     old_seq = seqs_of((e[0], e[2], e[3]) for e in old)
     new_seq = seqs_of(out)
     changed = [k for k in sorted(set(old_seq) | set(new_seq)) if old_seq.get(k, []) != new_seq.get(k, [])]
-    for k in changed:
-        print("CHANGED: %s | %s" % k)
-        for d in difflib.unified_diff(old_seq.get(k, []), new_seq.get(k, []), lineterm="", n=0):
-            if d[:1] in "+-" and not d.startswith(("+++", "---")):
-                print("    " + d)
+    lines = change_report(g, removed, added, changed, old_seq, new_seq)
+    if lines:
+        print("\n".join(lines))
     if changed and not a.accept_new:
         print("refused: %d approved sequence(s) changed (%d line(s) added, %d removed); review them, "
               "then rerun with --accept-new" % (len(changed), sum(added.values()), sum(removed.values())),
