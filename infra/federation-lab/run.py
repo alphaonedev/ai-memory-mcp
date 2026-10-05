@@ -2056,8 +2056,8 @@ def _selftest_signal_exit(T, base, signum, want):
 
 
 def _pid_gone(proc):
-    """True only when the child has exited by the time of the call: it was reaped and its pid no longer answers."""
-    if proc.poll() is None:
+    """True only when the child was already reaped (returncode set, no poll here) and its pid no longer answers."""
+    if proc.returncode is None:
         return False
     try:
         os.kill(proc.pid, 0)
@@ -2129,6 +2129,15 @@ def selftest_probe_block(T, base):
           signal.SIGTERM, lab.led.out.value())
     for signum, want in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
         _selftest_signal_exit(T, base, signum, want)
+    live = subprocess.Popen([sys.executable, "-I", "-S", "-c", "import time\ntime.sleep(60)\n"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin"})
+    try:
+        before = _pid_gone(live)
+    finally:
+        live.kill()
+        live.wait()
+    T.leg("signal: the pid check reports a live daemon as not gone and a reaped one as gone (control)",
+          (before, _pid_gone(live)), (False, True))
     try:
         try:
             raise LabInterrupted(signal.SIGINT)
@@ -2459,6 +2468,9 @@ def selftest_start_state(T, base):
     drivers = (
         ("bar-b: a driver that replaces open before running the file is refused",
          "import builtins, runpy, sys\nreal = builtins.open\nbuiltins.open = lambda *a, **k: real(*a, **k)\n"
+         "sys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n", "builtin open replaced"),
+        ("bar-b: a built-in function of another module that is also named open (os.open) in place of open is refused",
+         "import builtins, os, runpy, sys\nbuiltins.open = os.open\n"
          "sys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n", "builtin open replaced"),
         ("bar-c: a name that replaces the matcher's open (an injected global) is refused",
          "import runpy, sys\nsys.argv = [%r, '--help']\nrunpy.run_path(%r, init_globals={'open': open}, run_name='__main__')\n",
