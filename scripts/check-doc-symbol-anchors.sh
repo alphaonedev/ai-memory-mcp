@@ -49,7 +49,9 @@
 #            Self types and closers (#5457, #5493, #5498, #5530-#5537,
 #            #5608-#5612): the type and every bound of `<dyn A + B>::m`,
 #            `<A + B>::m`, `<&mut T>::m` or a lone `<*const T>` are checked
-#            (only `?Sized` and a `use<..>` bound are skipped) and a self
+#            (a lifetime bound, `?Sized`, a `use<..>` bound and the empty
+#            bound after a trailing `+` name no type and are skipped, #5767;
+#            any other bound that is not a plain path is reported) and a self
 #            type naming no type is refused; a closer after the anchor's own
 #            group (attached, spaced, or an entity) is reported; whitespace
 #            before or after any `::` is followed (#5609). A prose `<` opens
@@ -1154,6 +1156,30 @@ if len(cited) < 4 or bad:
     sys.exit(1)
 PYEOF
     echo "PASS: self-test #5765 — every issue a refusal line cites has a case of that rule"
+
+    # #5767: every bound _bound_tokens skips is named in the header. The
+    # skips are read from the function (each regex a bound is matched
+    # against before `continue`, and the trailing-plus skip), so a new skip
+    # with no header wording fails here.
+    python3 - "$SELF" <<'PYEOF' || { echo "FAIL: self-test #5767 — a bound the gate skips is not named in the header" >&2; exit 1; }
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+head, body = src.split("\nset -", 1)
+header = re.sub(r"\s+", " ", re.sub(r"(?m)^#", "", head))
+fn = re.search(r"\ndef _bound_tokens\(body\):\n(.*?)\n\n\n", body, re.S)
+wording = {"_LIFETIME_BOUND": "a lifetime bound", "_SIZED_BOUND": "`?Sized`",
+           "_USE_BOUND": "a `use<..>` bound", "trailing": "the empty bound after a trailing `+`"}
+if not fn:
+    sys.exit(1)
+skips = set(re.findall(r"(_[A-Z_]+)\.match\(piece\)", fn.group(1)))
+if "idx == len(pieces) - 1" in fn.group(1):
+    skips.add("trailing")
+bad = sorted(k for k in skips if k not in wording or wording[k] not in header)
+if len(skips) < 4 or bad:
+    print("skipped bounds the header does not name:", bad, "skips:", sorted(skips), file=sys.stderr)
+    sys.exit(1)
+PYEOF
+    echo "PASS: self-test #5767 — the header names every bound the gate skips"
 
     # #5615: a changelog entry for this gate states what is decoded, refused
     # and unmodelled, not a closure the code does not have. The entry is read
