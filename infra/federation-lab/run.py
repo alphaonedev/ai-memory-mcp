@@ -1031,11 +1031,41 @@ def stop_process(proc, grace=10.0):
         pass
 
 
+_SPAWN_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+def spawn(argv, register=None, **kwargs):
+    """Popen with SIGINT and SIGTERM held back until the child is registered (#5527 r8, F2).
+
+    A signal that lands between Popen returning and the child being tracked would otherwise raise with the child
+    in no list, so nothing could stop it. While held, the signal is only recorded; afterwards the child is
+    registered (daemons) or stopped (short tool), and then LabInterrupted is raised.
+    """
+    held = []
+    saved = []
+    for signum in _SPAWN_SIGNALS:
+        if signal.getsignal(signum) is _interrupt:
+            saved.append((signum, signal.signal(signum, lambda n, _f: held.append(n))))
+    proc = None
+    try:
+        proc = subprocess.Popen(argv, **kwargs)
+        if register is not None:
+            register(proc)
+    finally:
+        for signum, old in saved:
+            signal.signal(signum, old)
+    if held:
+        if register is None and proc is not None:
+            stop_process(proc, grace=2.0)
+        raise LabInterrupted(held[0])
+    return proc
+
+
 def run_bounded(argv, env, timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                 cwd=None):
     """Run ARGV (absolute program, argument list, given environment); 124 when TIMEOUT expires (then TERM, KILL)."""
     try:
-        proc = subprocess.Popen(argv, env=env, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, close_fds=True)
+        proc = spawn(argv, env=env, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, close_fds=True)
     except OSError:
         return 127
     try:
@@ -1052,7 +1082,7 @@ def run_capture(argv, env, timeout, stderr_path=None):
     """(rc, stdout bytes) for a short tool command; stderr to STDERR_PATH or discarded."""
     err = open(stderr_path, "wb") if stderr_path else subprocess.DEVNULL
     try:
-        proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err, close_fds=True)
+        proc = spawn(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err, close_fds=True)
     except OSError:
         if stderr_path:
             err.close()
@@ -1541,9 +1571,8 @@ class Lab:
                 "https://127.0.0.1:%d" % peer, "--quorum-client-cert", sc, "--quorum-client-key", sk,
                 "--quorum-ca-cert", os.path.join(self.out, "ca.crt"), "--quorum-timeout-ms", "8000"]
         with open(log, "wb") as fh:
-            proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
-                                    close_fds=True)
-        self.daemons.append(proc)
+            proc = spawn(argv, self.daemons.append, env=env, stdin=subprocess.DEVNULL, stdout=fh,
+                         stderr=subprocess.STDOUT, close_fds=True)
         self.led.info("%s pid %d on https://127.0.0.1:%d" % (name, proc.pid, port))
 
     def step_launch(self):
@@ -2077,6 +2106,104 @@ def _selftest_signal_exit(T, base, signum, want):
           % (signal.Signals(signum).name, want), (rc, gone, os.path.exists(sig_dir)), (want, [True], False))
 
 
+def _selftest_signal_window(T, base, window, signum):
+    """5527 r8 F2: main with SIGINT or SIGTERM delivered inside one window; cleanup runs and the exit is 128+n.
+
+    The signal is delivered by os.kill from a wrapper at the exact point named by WINDOW, so the handler runs at
+    the next bytecode, inside the window.
+    """
+    want = 128 + signum
+    sig_dir = os.path.join(base, "window-%s-%d" % (window, signum))
+    started = []
+    real_popen = subprocess.Popen
+    real_signal = signal.signal
+    real_no = Ledger.no
+    state = {"fired": False}
+
+    def fire():
+        if not state["fired"]:
+            state["fired"] = True
+            os.kill(os.getpid(), signum)
+
+    class _WindowLab(Lab):
+        def __init__(self, opts, ledger, environ):
+            super().__init__(opts, ledger, environ, run_dir=sig_dir)
+
+        def run(self):
+            os.makedirs(sig_dir)
+            self.owned = True
+            self.bin = os.path.join(sig_dir, "fake-daemon")
+            _write(self.bin, "#!%s -IS\nimport time\ntime.sleep(60)\n" % sys.executable, 0o755)
+            self.rust_log = "info"
+            if window == "spawn":
+                self.launch("n", 1, "db", sig_dir, "fed", sig_dir, 2, "c", "k", "a", os.path.join(sig_dir, "log"), "peer")
+                return 98
+            proc = real_popen([sys.executable, "-I", "-S", "-c", "import time\ntime.sleep(60)\n"],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              env={"PATH": "/usr/bin:/bin"})
+            started.append(proc)
+            self.daemons.append(proc)
+            if window == "handler":
+                raise RuntimeError("forced")
+            return 0
+
+    def late_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        started.append(proc)
+        fire()
+        return proc
+
+    def window_signal(num, handler):
+        if window == "install" and num == signal.SIGTERM and handler is _interrupt:
+            old = real_signal(num, handler)
+            fire()
+            return old
+        if window == "ignore-1" and num == signal.SIGINT and handler == signal.SIG_IGN:
+            fire()
+        old = real_signal(num, handler)
+        if window == "ignore-2" and num == signal.SIGINT and handler == signal.SIG_IGN:
+            fire()
+        return old
+
+    def window_no(self, text):
+        fire()
+
+    saved = (real_signal(signal.SIGINT, signal.SIG_DFL), real_signal(signal.SIGTERM, signal.SIG_DFL), Lab)
+    real_signal(signal.SIGINT, saved[0])
+    real_signal(signal.SIGTERM, saved[1])
+    globals()["Lab"] = _WindowLab
+    if window == "spawn":
+        subprocess.Popen = late_popen
+    if window in ("install", "ignore-1", "ignore-2"):
+        signal.signal = window_signal
+    if window == "handler":
+        Ledger.no = window_no
+    gone = []
+    err = ""
+    rc = None
+    try:
+        try:
+            rc = main([], {"PATH": "/usr/bin:/bin"})
+        except BaseException as exc:  # noqa: BLE001 - an escape is the defect this leg detects
+            err = exc.__class__.__name__
+        for proc in started:
+            gone.append(_pid_gone(proc))
+    finally:
+        subprocess.Popen = real_popen
+        signal.signal = real_signal
+        Ledger.no = real_no
+        globals()["Lab"] = saved[2]
+        real_signal(signal.SIGINT, saved[0])
+        real_signal(signal.SIGTERM, saved[1])
+        for proc in started:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    T.leg("signal window %s: %s stops every started daemon, removes run/ and exits %d with no escaping exception"
+          % (window, signal.Signals(signum).name, want),
+          (rc, all(gone) and (bool(gone) or window == "install"), os.path.exists(sig_dir), err), (want, True, False, ""))
+
+
 def _pid_gone(proc):
     """True only when the child was already reaped (returncode set, no poll here) and its pid no longer answers."""
     if proc.returncode is None:
@@ -2151,6 +2278,9 @@ def selftest_probe_block(T, base):
           signal.SIGTERM, lab.led.out.value())
     for signum, want in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
         _selftest_signal_exit(T, base, signum, want)
+        for window in ("install", "spawn", "handler", "ignore-1", "ignore-2"):
+            if window != "ignore-2" or signum == signal.SIGTERM:  # SIGINT is already ignored in the second window
+                _selftest_signal_window(T, base, window, signum)
     live = subprocess.Popen([sys.executable, "-I", "-S", "-c", "import time\ntime.sleep(60)\n"], stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin"})
     try:
@@ -2612,6 +2742,9 @@ def selftest(out):
 # ---------------------------------------------------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------------------------------------------------
+_FINISH_ATTEMPTS = 8
+
+
 def _interrupt(signum, _frame):
     raise LabInterrupted(signum)
 
@@ -2634,23 +2767,42 @@ def main(argv, environ):
         return rc if flush_streams([sys.stdout, sys.stderr]) else 1
     ledger = Ledger(sys.stdout, sys.stdout.isatty() and not environ.get("NO_COLOR"))
     lab = Lab(opts, ledger, environ)
-    signal.signal(signal.SIGINT, _interrupt)
-    signal.signal(signal.SIGTERM, _interrupt)
+    rc = 1
     try:
-        rc = lab.run()
-    except LabInterrupted as exc:
+        try:
+            signal.signal(signal.SIGINT, _interrupt)
+            signal.signal(signal.SIGTERM, _interrupt)
+            rc = lab.run()
+        except LabInterrupted as exc:
+            rc = 128 + exc.signum
+        except Exception as exc:  # noqa: BLE001 - an unexpected error is a FAIL, never a pass
+            ledger.no("the lab stopped on an unexpected %s: %s" % (exc.__class__.__name__, exc))
+            rc = 1
+    except LabInterrupted as exc:  # a signal in the handler-install or error-report window
         rc = 128 + exc.signum
-    except Exception as exc:  # noqa: BLE001 - an unexpected error is a FAIL, never a pass
-        ledger.no("the lab stopped on an unexpected %s: %s" % (exc.__class__.__name__, exc))
-        rc = 1
-    finally:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        lab.cleanup()
+    rc = _finish(lab, ledger, rc)
     if rc == 0:
         return final_rc(ledger, lab.summarized, [sys.stdout, sys.stderr])
     flush_streams([sys.stdout, sys.stderr])
     return rc
+
+
+def _finish(lab, ledger, rc):
+    """Ignore SIGINT and SIGTERM, then clean up. A signal that lands first only restarts that step (cleanup is
+    idempotent); if the bound is exhausted the exit is non-zero with a named line (#5527 r8, F2)."""
+    for _ in range(_FINISH_ATTEMPTS):
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            lab.cleanup()
+            return rc
+        except LabInterrupted as exc:
+            rc = rc or 128 + exc.signum
+    try:
+        ledger.no("cleanup did not complete: interrupted %d times; daemons or run/ may remain" % _FINISH_ATTEMPTS)
+    except Exception:  # noqa: BLE001 - the exit code still carries the failure
+        pass
+    return rc or 1
 
 
 if __name__ == "__main__":
