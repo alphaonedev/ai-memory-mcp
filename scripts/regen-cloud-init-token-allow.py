@@ -69,11 +69,24 @@ def self_test(g, templates, allow, pend) -> int:
     """The clean lists give no refusal; a stale pending entry and an unknown tracker each do."""
     first = next(x for x in pend.splitlines() if x and not x.startswith("#"))
     head, rest = first.split(" | ", 1)
+    # the 'both' case needs a line one scope has and the other lacks: the first pending line can be in
+    # both once the templates converge, so derive it from the templates, not from the pending file (#5222)
+    per = {}
+    cache = {}
+    for nm, text in sorted(templates.items()):
+        _, _, _, trig, _ = g.analyse(nm, text, cache)
+        per.setdefault(g.scope_of(nm), set()).update((ln.ctx, ln.text) for ln in trig)
+    scopes = sorted(per)
+    lone = sorted(set.union(*per.values()) - set.intersection(*per.values())) if len(scopes) > 1 else []
+    if not lone:
+        print("REGEN SELF-TEST FAIL: no line is held by only one template scope; the both-scope case cannot be built", file=sys.stderr)
+        return 1
+    one_scope_only = lone[0][0] + " | " + lone[0][1]
     cases = [
         ("clean lists", pend, False),
         ("stale pending entry", pend.replace(first, head + " | top | nothing-matches:", 1), True),
         ("pending entry under an unknown tracker", pend.replace(first, head.split(" ")[0] + " #1 | " + rest, 1), True),
-        ("both-scope pending entry that one template lacks", pend.replace(first, "both " + head.split(" ", 1)[1] + " | " + rest, 1), True),
+        ("both-scope pending entry that one template lacks", pend.replace(first, "both " + head.split(" ", 1)[1] + " | " + one_scope_only, 1), True),
     ]
     bad = [lbl for lbl, p, want in cases if bool(pending_refusals(g, templates, allow, p)) != want]
     # a stale pending line and a changed line that hold a password print it masked (#5488)
