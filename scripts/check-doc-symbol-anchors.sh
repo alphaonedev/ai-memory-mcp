@@ -1196,30 +1196,35 @@ PYEOF
     echo "PASS: self-test #5680 — the RULES table and the header name the same rules and counts"
 
     # #5783: the census and emit() fail on each planted disagreement.
-    plant_5783() {  # <old text> <new text> <out file>
-        # The text is replaced where it occurs in the header (before the
-        # self-test) or else in the engine (after the self-test), never in
-        # the self-test's own arguments.
-        python3 - "$SELF" "$1" "$2" "$3" <<'PYEOF'
+    plant_5783() {  # <out file> <old text> <new text> [<old text> <new text> ...]
+        # Each old text is replaced where it occurs in the header (before
+        # the self-test) or else in the engine (after the self-test), never
+        # in the self-test's own arguments.
+        python3 - "$SELF" "$@" <<'PYEOF'
 import sys
 s = open(sys.argv[1], encoding="utf-8").read()
 head, rest = s.split("\nset -", 1)
 pre, engine = rest.split("<<'PY'\n", 1)
-if sys.argv[2] in head:
-    head = head.replace(sys.argv[2], sys.argv[3], 1)
-elif sys.argv[2] in engine:
-    engine = engine.replace(sys.argv[2], sys.argv[3], 1)
-else:
-    sys.exit("plant_5783: text not found: " + sys.argv[2])
-open(sys.argv[4], "w", encoding="utf-8").write(head + "\nset -" + pre + "<<'PY'\n" + engine)
+pairs = sys.argv[3:]
+if not pairs or len(pairs) % 2:
+    sys.exit("plant_5783: old and new texts come in pairs")
+for old, new in zip(pairs[0::2], pairs[1::2]):
+    if old in head:
+        head = head.replace(old, new, 1)
+    elif old in engine:
+        engine = engine.replace(old, new, 1)
+    else:
+        sys.exit("plant_5783: text not found: " + old)
+open(sys.argv[2], "w", encoding="utf-8").write(head + "\nset -" + pre + "<<'PY'\n" + engine)
 PYEOF
     }
-    census_red_5783() {  # <description> <old text> <new text>
-        plant_5783 "$2" "$3" "$FIX/planted-5783.sh" || exit 1
+    census_red_5783() {  # <description> <old text> <new text> [<old text> <new text> ...]
+        desc_5783="$1"; shift
+        plant_5783 "$FIX/planted-5783.sh" "$@" || exit 1
         if census_5680 "$FIX/planted-5783.sh" 2>/dev/null; then
-            echo "FAIL: self-test #5783 — the census passed $1" >&2; exit 1
+            echo "FAIL: self-test #5783 — the census passed $desc_5783" >&2; exit 1
         fi
-        echo "PASS: self-test #5783 — the census fails $1"
+        echo "PASS: self-test #5783 — the census fails $desc_5783"
     }
     census_red_5783 "a table row with no header line" \
         '    "SETUP": ("refusal",' '    "ZZ_EXTRA": ("part", "planted"),
@@ -1233,9 +1238,12 @@ PYEOF
         '# SIX CHECKING RULES' '# FIVE CHECKING RULES'
     census_red_5783 "a wrong count of refusals" \
         'and four REFUSALS' 'and five REFUSALS'
+    census_red_5783 "a refusal and a check that swap kinds (the counts unchanged)" \
+        '"SETUP": ("refusal",' '"SETUP": ("check",' \
+        '"LADDER_TIP": ("check",' '"LADDER_TIP": ("refusal",'
     census_red_5783 "a finding built with a rule that is not a row" \
         'out.append(("BARE_LN",' 'out.append(("ZZ_UNLISTED",'
-    plant_5783 'out.append(("BARE_LN",' 'out.append(("ZZ_UNLISTED",' "$FIX/planted-5783.sh" || exit 1
+    plant_5783 "$FIX/planted-5783.sh" 'out.append(("BARE_LN",' 'out.append(("ZZ_UNLISTED",' || exit 1
     chmod +x "$FIX/planted-5783.sh"
     write_clean
     printf '\n\nSee %s:1 here.\n' "$R" >> "$FIX/README.md"
@@ -1247,6 +1255,13 @@ PYEOF
         printf '%s\n' "$unl_out" | sed 's/^/       /' >&2; exit 1; }
     rm -f "$FIX/planted-5783.sh"
     echo "PASS: self-test #5783 — a rule outside the RULES table FAILS CLOSED (exit 2, no PASS banner)"
+    # #5783: the reporter prints the detail the record carries from the table.
+    write_clean
+    printf '\n\nSee `%s::NoSuch`.\n' "$R" >> "$FIX/README.md"
+    run_fixture_out | grep -qF -- "— symbol is not defined in the file it is qualified against" || {
+        echo "FAIL: self-test #5783 — a QUAL finding did not print its RULES detail" >&2
+        run_fixture_out | sed 's/^/       /' >&2; exit 1; }
+    echo "PASS: self-test #5783 — a finding is printed with the detail its RULES row holds"
 
     # #5765: every issue a refusal line of the header cites has a self-test
     # case of that rule filed under that issue, so a refusal cannot cite an
