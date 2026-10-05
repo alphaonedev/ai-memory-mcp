@@ -502,7 +502,8 @@ write_files:
       # file already carries. The file is only ever read with a fixed sed -n
       # expression and written with the shell's own printf, so the gate can show
       # (rule R5) that no command runs it, and the secret is on no argv (#5428).
-      # A file that is empty or holds no URL is minted again from the template URL.
+      # A file with no postgres://aimemory:...@ line (empty, or another scheme or user)
+      # is replaced by a freshly minted URL, not kept.
       URL="$(sed -n 's#^\(.*CHANGEME.*\)#\1#p' /etc/ai-memory/store-url)"
       CUR="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
       if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ]; then

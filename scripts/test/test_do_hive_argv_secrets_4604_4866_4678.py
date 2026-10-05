@@ -91,6 +91,9 @@ def f4_sed():
     if not block:
         return
     probe("F4 no grep on the store-url", "grep" not in block)
+    # #5522: the comment above the block states the rule the code applies.
+    probe("F4 the comment names the replaced files: no postgres://aimemory line",
+          "no postgres://aimemory:...@ line" in TPL.read_text() and "holds no URL" not in TPL.read_text())
     probe("F4 no sed -i or script on stdin", not re.search(r"sed\s+(-\S*i|-f)", block))
     cases = [
         ("CHANGEME is replaced", "postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full\n", "mint"),
@@ -101,6 +104,8 @@ def f4_sed():
         # or nothing must make the block exit 1 and leave no running node with a placeholder password.
         ("a mint that yields the placeholder is refused", "garbage\n", "refuse:CHANGEME"),
         ("a mint that yields nothing is refused", "garbage\n", "refuse:"),
+        # #5522: any file without a postgres://aimemory:...@ line is replaced, whatever else it holds.
+        ("another scheme is minted", "postgresql://aimemory:keepme@db/aimemory\n", "fresh"),
         # #5521: a file with more than one URL line is undecidable, so it is refused, never kept or half-minted.
         ("two placeholder lines are refused", PLACEHOLDER_URL + PLACEHOLDER_URL, "refuse:" + SECRET),
         ("a placeholder line after a rotated line is refused", "postgres://aimemory:abc123@h/x\n" + PLACEHOLDER_URL, "refuse:" + SECRET),
