@@ -84,6 +84,13 @@ ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
               number or date (#5734), ``<<`` or ``=`` (#5749).  A filter key with
               neither a list nor a word is refused: its YAML value is null, not a
               list (#5736).
+  class       a ``[...]`` class inside a branches item is read only when its
+              body is one or more of: a letter or digit, or an ascending range
+              of two letters of one case or two digits (``a-z``, ``A-Z``,
+              ``0-9``; ``a-a`` is refused).  Every other body is refused with R-SHAPE cannot match
+              filters: ``!`` or ``^`` first, empty, ``]`` first, a backslash, a
+              ``-`` that ends or starts the body, a reversed or mixed range, and
+              any other character (#5853, #5854).
 
 The reader is the Python standard library only (no PyYAML) so it runs on any CI
 image.  The mutation legs at the bottom prove the reader is not vacuous: each
@@ -670,8 +677,41 @@ def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[s
     return filters
 
 
+_CLASS_LOWER = "abcdefghijklmnopqrstuvwxyz"
+_CLASS_UPPER = _CLASS_LOWER.upper()
+_CLASS_DIGIT = "0123456789"
+
+
+def _class_regex(body: str, pattern: str) -> str:
+    """Regex for a class body made only of proven forms; any other body is Unparsed (#5854)."""
+    out: List[str] = []
+    i = 0
+    while i < len(body):
+        lo = body[i]
+        if lo not in _CLASS_LOWER + _CLASS_UPPER + _CLASS_DIGIT:
+            raise Unparsed("character class holds a form not proven to read like GitHub: " + pattern)
+        if body[i + 1:i + 2] == "-":
+            hi = body[i + 2:i + 3]
+            for kind in (_CLASS_LOWER, _CLASS_UPPER, _CLASS_DIGIT):
+                if lo in kind and hi and hi in kind and kind.index(hi) > kind.index(lo):
+                    break
+            else:
+                raise Unparsed("character class range is not ascending letters or digits: " + pattern)
+            out.append(lo + "-" + hi)
+            i += 3
+        else:
+            out.append(lo)
+            i += 1
+    if not out:
+        raise Unparsed("empty character class: " + pattern)
+    return "[" + "".join(out) + "]"
+
+
 def glob_match(pattern: str, ref: str) -> bool:
-    """GitHub Actions filter glob: ** crosses '/', * does not, ? is one non-/ char."""
+    """GitHub Actions filter glob: ** crosses '/', * does not, ? is one non-/ char.
+
+    A [...] class is read only when its body is a proven form (_class_regex).
+    """
     regex: List[str] = []
     i = 0
     while i < len(pattern):
@@ -688,18 +728,13 @@ def glob_match(pattern: str, ref: str) -> bool:
             end = pattern.find("]", i + 1)
             if end == -1:
                 raise Unparsed("unterminated character class: " + pattern)
-            regex.append(pattern[i:end + 1])
+            regex.append(_class_regex(pattern[i + 1:end], pattern))
             i = end + 1
             continue
         else:
             regex.append(re.escape(ch))
         i += 1
-    try:
-        return re.fullmatch("".join(regex), ref) is not None
-    except re.error as exc:
-        # A class the regex engine cannot compile (empty, reversed range) is a
-        # named refusal, not an exception out of violations() (#5853).
-        raise Unparsed("unreadable character class (" + str(exc) + "): " + pattern) from exc
+    return re.fullmatch("".join(regex), ref) is not None
 
 
 def filter_matches(patterns: List[str], ref: str) -> bool:
@@ -782,9 +817,9 @@ def violations(name: str, text: str) -> List[str]:
     try:
         return _rule_violations(name, triggers)
     except Unparsed as exc:
-        # A filter item the glob reader cannot read (an unterminated, empty or
-        # reversed-range [ class) is a named failure too, not an exception out of
-        # violations() (#5777, #5853).
+        # A filter item the glob reader cannot read (a [ class that is unterminated
+        # or whose body is not a proven form) is a named failure too, not an
+        # exception out of violations() (#5777, #5853, #5854).
         return [f"{name}: R-SHAPE cannot match filters ({exc})"]
 
 
@@ -2149,6 +2184,76 @@ class UnreadableClass5853(unittest.TestCase):
 
     def test_5853_reversed_range_is_a_named_refusal(self) -> None:
         self._refused("[z-a]")
+
+
+class ClosedWorldClass5854(unittest.TestCase):
+    """#5854: a [...] class is read only when its body is made of proven forms.
+
+    Measured at 0e5758dc: '[!a]' returned no finding because Python reads '!' in
+    a class as a literal and '^' as negation, so the checker gave a definite
+    answer for spellings it had not proven it reads like GitHub.  The neighbour
+    table below holds every probed spelling and its verdict.
+    """
+
+    # (item, True when the class body is a proven form and no finding is expected)
+    NEIGHBOURS = (
+        ("[!a]", False), ("[^a]", False), ("[]a]", False), ("[a\\]]", False),
+        ("[a-]", False), ("[-a]", False), ("[[]", False), ("[!]", False),
+        ("[a-Z]", False), ("[a-9]", False), ("[z-a]", False), ("[a-a]", False),
+        ("[[a]]", False), ("[a-c-e]", False), ("[a b]", False), ("[a/b]", False),
+        ("[._]", False), ("[a.b]", False), ("[_]", False), ("[a_b]", False), ("[a-z-]", False), ("[*]", False),
+        ("[?]", False), ("rehearsal/**/[!a]", False), ("![!a]", False),
+        ("a[]b", False), ("a[b", False),
+        ("[a-z0-9]", True), ("[ab]", True), ("[A-Z]", True), ("[0-9]", True),
+        ("[a-cx-z]", True), ("[aZ9]", True), ("[a-b]", True), ("[y-z]", True), ("a[bc]d", True),
+        ("rehearsal/[a-z]*/**", True), ("**/[a-z]", True), ("[a-z]-[0-9]", True),
+    )
+
+    def _verdict(self, item: str) -> List[str]:
+        text = "name: x\non:\n  pull_request:\n    branches: [main, 'rehearsal/**', '" + item + "']\n"
+        return violations("x.yml", text)
+
+    def test_5854_neighbour_table(self) -> None:
+        for item, readable in self.NEIGHBOURS:
+            got = self._verdict(item)
+            if readable:
+                self.assertEqual([], got, item)
+            else:
+                named = item[1:] if item.startswith("!") else item
+                self.assertTrue(any("R-SHAPE cannot match filters" in v and named in v for v in got), (item, got))
+
+    def test_5854_each_refusal_names_its_reason(self) -> None:
+        for item, why in (
+            ("a[]b", "empty character class"),
+            ("a[b", "unterminated character class"),
+            ("[!a]", "form not proven to read like GitHub"),
+            ("[a-]", "range is not ascending letters or digits"),
+            ("[a-Z]", "range is not ascending letters or digits"),
+            ("[a-a]", "range is not ascending letters or digits"),
+            ("[]a]", "empty character class"),
+            ("[a\\]]", "form not proven to read like GitHub"),
+        ):
+            got = self._verdict(item)
+            self.assertTrue(any("R-SHAPE cannot match filters" in v and why in v for v in got), (item, why, got))
+
+    def test_5854_bang_and_caret_led_class_are_refused(self) -> None:
+        for item in ("[!a]", "[^a]"):
+            self.assertTrue(any("R-SHAPE cannot match filters" in v for v in self._verdict(item)), item)
+
+    def test_5854_class_is_refused_after_a_negation(self) -> None:
+        # The leading '!' of the item negates; the class after it is read the same way.
+        self.assertTrue(any("R-SHAPE" in v for v in self._verdict("![!a]")))
+        self.assertEqual([], self._verdict("![a-z]x"))
+
+    def test_5854_proven_class_still_matches(self) -> None:
+        self.assertTrue(glob_match("a[b-d]e", "ace"))
+        self.assertFalse(glob_match("a[b-d]e", "aee"))
+        self.assertTrue(glob_match("[a-cx-z]1", "y1"))
+        self.assertFalse(glob_match("[a-cx-z]1", "m1"))
+        self.assertTrue(glob_match("[ab]", "b"))
+        self.assertFalse(glob_match("[ab]", "!"))
+        self.assertTrue(glob_match("[0-9]", "7"))
+        self.assertFalse(glob_match("[A-C]", "d"))
 
 
 class GlobSemantics5447(unittest.TestCase):
