@@ -18,6 +18,11 @@ Inputs (a flag overrides the environment variable of the same role):
     --repo DIR        repository to resolve against (default: cwd)
     --base-only       print only the base side of the range (#5604): the one
                       older commit a gate compares a file against
+    --gate-step-env JOB  print NAME=VALUE, one per line, for the env that
+                      reaches the gate step of a script-gate job (workflow,
+                      then job, then step env; #5970); --workflow FILE names
+                      the workflow (default: <repo>/.github/workflows/c8-precheck.yml).
+                      The gate self-tests start the gate with that env.
 
 Rules:
 
@@ -27,11 +32,13 @@ Rules:
                   resolves to a commit in this repository
     anything else refuse
 
-A refusal for a push whose previous tip is missing, all-zero or not in this
-checkout names its cause (the creation push or force-push of a protected branch
-has no comparable previous tip) and says the next ordinary push produces a
-comparable range; a refused run is red and a re-run cannot turn it green
-(#5603, #5604). A merge_group refusal for a missing base_sha says the same.
+A refusal for a push whose previous tip is missing, empty or all-zero names a
+creation push (no previous tip); one whose previous tip is a well-formed sha
+that is not a commit in this checkout names a force-push or a checkout that
+lacks it; a malformed value names neither. Each says the next ordinary push
+produces a comparable range; a refused run is red and a re-run cannot turn it
+green (#5603, #5604, #5970). A merge_group refusal for a missing or unresolved
+base_sha says the event carries no usable base_sha and the same next-push text.
 
 An empty range is a valid output, not a refusal: push with before equal to the
 new tip or moving a branch backward, a pull_request whose base equals its head
@@ -90,9 +97,17 @@ CALL = 'range="$(python3 scripts/ci-commit-range.py)"'
 
 NEXT_PUSH = ("; the next ordinary push produces a comparable range "
              "(this run is red and a re-run cannot turn it green)")
-PUSH_CAUSE = (" (a creation push or a force-push of a protected branch has no "
-              "comparable previous tip)")
-MG_CAUSE = " (the merge_group event carries no usable base_sha)"
+# The cause text is picked by the kind of refusal (#5970 F2): an absent before
+# names the creation push, an unresolved one names the force-push; a malformed
+# value names neither.
+PUSH_CAUSE = {
+    "absent": (" (no previous tip: a creation push carries an all-zero before, "
+               "and an empty or missing before is refused the same way)"),
+    "unresolved": (" (the previous tip is not a commit in this checkout: a "
+                   "force-push dropped it, or the checkout lacks it)"),
+}
+MG_CAUSE = {kind: " (the merge_group event carries no usable base_sha)"
+            for kind in ("absent", "unresolved")}
 
 
 class Refused(Exception):
@@ -135,13 +150,13 @@ def checked_sha(repo, role, value):
     return value
 
 
-def with_cause(check, cause, repo, role, value):
-    """Run a sha check; name the cause on an absent or unresolved sha (D6)."""
+def with_cause(check, causes, repo, role, value):
+    """Run a sha check; name the cause of an absent or unresolved sha by its kind (D6)."""
     try:
         return check(repo, role, value)
     except Refused as exc:
-        if exc.kind in ("absent", "unresolved"):
-            raise Refused("%s%s%s" % (exc, cause, NEXT_PUSH), exc.kind)
+        if exc.kind in causes:
+            raise Refused("%s%s%s" % (exc, causes[exc.kind], NEXT_PUSH), exc.kind)
         raise
 
 
@@ -396,7 +411,7 @@ def step_run_body(block):
     return picked
 
 
-def script_gate_violations(job, block):
+def script_gate_violations(job, block, text):
     """Pin for a job whose script calls the helper (#5603, #5604): closed-world."""
     problems = []
     script = SCRIPT_GATE_JOBS[job]
@@ -424,7 +439,100 @@ def script_gate_violations(job, block):
             problems.append("%s: the step contains %r" % (job, bad))
     if re.search(r"HEAD(?!_SHA)", step):
         problems.append("%s: the step names HEAD (no default base)" % job)
+    # #5970 F1: the env that REACHES the gate (workflow + job + step) is exactly the six inputs.
+    try:
+        effective = gate_step_env(text, job, script)
+    except ValueError as exc:
+        problems.append("%s: %s" % (job, exc))
+    else:
+        if sorted(effective) != sorted(line.split(":", 1)[0] for line in SCRIPT_GATE_ENV):
+            problems.append("%s: the env reaching the gate is %s, expected exactly the six event inputs"
+                            % (job, sorted(effective)))
+    for bad in FORBIDDEN_IN_SCRIPT_JOB:
+        if bad in block:
+            problems.append("%s: the job contains %r" % (job, bad))
     return problems
+
+
+ENV_KEY_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*):(?: (.*))?")
+ENV_LINE_RE = re.compile(r"""( *)["']?env["']?\s*:(.*)$""")
+# Any of these in a script-gate job block can change what reaches the gate
+# process or turn its red into green (#5970): the pin refuses them.
+FORBIDDEN_IN_SCRIPT_JOB = ("continue-on-error", "GITHUB_ENV", "GITHUB_PATH", "container:")
+# A gate-input variable family; the workflow never names one (#5970, F1).
+GATE_OVERRIDE_PREFIXES = ("CERT_EXPIRY_", "DECLARATION_GATE_")
+
+
+def env_mapping(lines, i, indent):
+    """The env: mapping whose key line is lines[i] at this indent (block or flow form).
+
+    Raises ValueError on any form it cannot read (closed-world)."""
+    rest = ENV_LINE_RE.fullmatch(lines[i]).group(2).strip()
+    out = {}
+    if rest and not rest.startswith("#"):
+        if not (rest.startswith("{") and rest.endswith("}")):
+            raise ValueError("env form %r is neither a block nor a flow mapping" % rest)
+        body = rest[1:-1].strip()
+        for item in (x.strip() for x in body.split(",")) if body else ():
+            m = ENV_KEY_RE.fullmatch(item)
+            if m is None:
+                raise ValueError("env item %r cannot be read" % item)
+            out[m.group(1)] = (m.group(2) or "").strip()
+        return out
+    for line in lines[i + 1:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        lead = len(line) - len(line.lstrip(" "))
+        if lead <= indent:
+            break
+        m = ENV_KEY_RE.fullmatch(line[lead:])
+        if lead != indent + 2 or m is None:
+            raise ValueError("env entry %r cannot be read" % line)
+        out[m.group(1)] = (m.group(2) or "").strip()
+    return out
+
+
+def gate_step_env(text, job, script):
+    """The env that reaches the one step running scripts/<script> in job (#5970).
+
+    Workflow-level env, then job-level env, then step-level env (a later level
+    overrides an earlier one), the way GitHub Actions merges them. Raises
+    ValueError when the job or the step is missing or an env form cannot be read."""
+    lines = text.splitlines()
+    env = {}
+    tops = [i for i, line in enumerate(lines)
+            if ENV_LINE_RE.fullmatch(line) and not line.startswith(" ")]
+    if len(tops) > 1:
+        raise ValueError("more than one workflow-level env")
+    for i in tops:
+        env.update(env_mapping(lines, i, 0))
+    block = job_block(text, job)
+    if block is None:
+        raise ValueError("job %s not found" % job)
+    blines = block.splitlines()
+    run_line = "        run: bash scripts/%s" % script
+    starts = [i for i, line in enumerate(blines) if line.startswith("      - ")] + [len(blines)]
+    hits = [k for k in range(len(starts) - 1) if run_line in blines[starts[k]:starts[k + 1]]]
+    if len(hits) != 1:
+        raise ValueError("%s: expected exactly one step running %s, found %d" % (job, script, len(hits)))
+    lo, hi = starts[hits[0]], starts[hits[0] + 1]
+    job_env, step_env = {}, {}
+    for i, line in enumerate(blines):
+        m = ENV_LINE_RE.fullmatch(line)
+        if m is None:
+            continue
+        indent = len(m.group(1))
+        if indent == 4:
+            job_env.update(env_mapping(blines, i, 4))
+        elif indent == 8 and lo <= i < hi:
+            step_env.update(env_mapping(blines, i, 8))
+        elif indent == 8:
+            env_mapping(blines, i, 8)  # another step's env: read it, it does not reach the gate
+        else:
+            raise ValueError("%s: env at indent %d is not a job or step env" % (job, indent))
+    env.update(job_env)
+    env.update(step_env)
+    return env
 
 
 def pin_violations(text):
@@ -432,13 +540,17 @@ def pin_violations(text):
     problems = []
     if "HEAD~1" in text:
         problems.append("HEAD~1 appears in the workflow")
+    for prefix in GATE_OVERRIDE_PREFIXES:
+        if prefix in text:
+            problems.append("%s appears in the workflow (a gate takes its base only from %s)"
+                            % (prefix, HELPER_NAME))
     for job in GATE_JOBS:
         block = job_block(text, job)
         if block is None:
             problems.append("%s: job not found" % job)
             continue
         if job in SCRIPT_GATE_JOBS:
-            problems.extend(script_gate_violations(job, block))
+            problems.extend(script_gate_violations(job, block, text))
             continue
         steps = step_run_body(block)
         if len(steps) != 1:
@@ -611,24 +723,34 @@ def self_test():
             print("FAIL flag override: %r %r" % (proc.returncode, proc.stdout))
         # D6: a refusal names its cause and says what produces a comparable range.
         c1, c3 = shas["c1"], shas["c3"]
-        for label, event, kw, words in (
+        # #5970 F2: the cause is picked by kind; an absent before never names a
+        # force-push and an unresolved one never names a creation push.
+        for label, event, kw, words, never in (
                 ("push all-zero before", "push", {"before": ZERO_SHA, "head": c3},
-                 ("creation push", "force-push", "no comparable previous tip",
-                  "next ordinary push", "cannot turn it green")),
+                 ("creation push", "no previous tip", "next ordinary push", "cannot turn it green"),
+                 ("force-push", "protected branch")),
                 ("push empty before", "push", {"before": "", "head": c3},
-                 ("creation push", "next ordinary push")),
+                 ("creation push", "next ordinary push"), ("force-push",)),
+                ("push missing before", "push", {"head": c3},
+                 ("creation push", "next ordinary push"), ("force-push",)),
                 ("push unreachable before", "push", {"before": shas["ghost"], "head": c3},
-                 ("force-push", "next ordinary push")),
+                 ("force-push", "not a commit in this checkout", "next ordinary push"),
+                 ("creation push", "protected branch")),
                 ("merge_group missing base", "merge_group", {"mg_head": c3},
-                 ("merge_group base_sha", "next ordinary push")),
+                 ("merge_group base_sha", "no usable base_sha", "next ordinary push"),
+                 ("creation push", "force-push")),
+                ("merge_group unresolved base", "merge_group", {"mg_base": shas["ghost"], "mg_head": c3},
+                 ("no usable base_sha", "next ordinary push"), ("creation push", "force-push")),
                 ("merge_group empty base", "merge_group", {"mg_base": "", "mg_head": c3},
-                 ("merge_group", "next ordinary push"))):
+                 ("merge_group", "next ordinary push"), ("creation push", "force-push"))):
             total += 1
             code, out, err = invoke(repo, event, kw)
             missing = [w for w in words if w not in err]
-            if code != 1 or out != "" or missing:
+            present = [w for w in never if w in err]
+            if code != 1 or out != "" or missing or present:
                 failures += 1
-                print("FAIL refusal text %s: exit=%s missing=%s err=%r" % (label, code, missing, err))
+                print("FAIL refusal text %s: exit=%s missing=%s present=%s err=%r"
+                      % (label, code, missing, present, err))
         # A malformed value is not a creation push: no misleading cause text.
         total += 1
         code, out, err = invoke(repo, "push", {"before": c1[:39], "head": c3})
@@ -705,6 +827,29 @@ def self_test():
                          and "git() and run_git()" not in (__doc__ or "")))
         shell_fns = sorted(n for n, f in globals().items() if inspect.isfunction(f) and '"ba' 'sh", "-c"' in inspect.getsource(f))
         contract.append(("only red_proof() runs bash -c", shell_fns == ["red_proof"]))
+        # #5970: --gate-step-env prints the env that reaches the gate step (workflow, job, step).
+        wf_text = (WORKFLOW if WORKFLOW.exists() else Path(__file__).resolve().parent.parent / WORKFLOW).read_text()
+        six = sorted(line.split(":", 1)[0] for line in SCRIPT_GATE_ENV)
+        for label, mutated, job, want_code, want_names in (
+                ("the live workflow passes exactly the six inputs", wf_text, "cert-expiry-gate", 0, six),
+                ("a workflow-level env reaches the gate step",
+                 wf_text.replace("\njobs:\n", "\nenv:\n  CERT_EXPIRY_BASE: HEAD\njobs:\n", 1),
+                 "cert-expiry-gate", 0, sorted(six + ["CERT_EXPIRY_BASE"])),
+                ("a job-level flow env reaches the gate step",
+                 wf_text.replace("  declaration-hash-gate:\n", "  declaration-hash-gate:\n    env: {DECLARATION_GATE_BASE: HEAD}\n", 1),
+                 "declaration-hash-gate", 0, sorted(six + ["DECLARATION_GATE_BASE"])),
+                ("another job's env does not reach the gate step",
+                 wf_text.replace("  declaration-hash-gate:\n", "  declaration-hash-gate:\n    env: {DECLARATION_GATE_BASE: HEAD}\n", 1),
+                 "cert-expiry-gate", 0, six),
+                ("an env form it cannot read is refused",
+                 wf_text.replace("\njobs:\n", "\nenv: ${{ fromJSON(vars.X) }}\njobs:\n", 1), "cert-expiry-gate", 1, []),
+                ("an unknown job is refused", wf_text, "c8-precheck", 1, [])):
+            wf_file = Path(tmp) / "wf.yml"
+            wf_file.write_text(mutated)
+            proc = cli(["--gate-step-env", job, "--workflow", str(wf_file)])
+            names = sorted(line.split("=", 1)[0] for line in proc.stdout.splitlines())
+            contract.append(("--gate-step-env: " + label, proc.returncode == want_code and names == want_names
+                             and (want_code == 0 or proc.stderr.startswith("ci-commit-range: REFUSED: "))))
         for label, good in contract:
             total += 1
             if not good:
@@ -846,6 +991,30 @@ def script_job_mutations(text, job, script):
                 in_job(text, job, run_anchor, "        run: |\n          if [ \"$GITHUB_EVENT_NAME\" = pull_request ]; then bash scripts/%s; fi\n" % script)))
     out.append(("%s: job renamed away" % job,
                 text.replace("  %s:\n" % job, "  %s-x:\n" % job, 1)))
+    # #5970 F1 (M1-M5 of the round-1 review, plus neighbours): job-level and
+    # workflow-level env, block and flow form, any key, and red-to-green knobs.
+    head = "  %s:\n" % job
+    jobs = "\njobs:\n"
+    for key in ("CERT_EXPIRY_BASE", "DECLARATION_GATE_BASE", "DECLARATION_GATE_PREVIOUS_PIN",
+                "CERT_EXPIRY_HEAD", "X_BASE"):
+        out.append(("%s: job-level env %s (block)" % (job, key),
+                    text.replace(head, head + "    env:\n      %s: HEAD\n" % key, 1)))
+        out.append(("%s: job-level env %s (flow)" % (job, key),
+                    text.replace(head, head + "    env: {%s: HEAD}\n" % key, 1)))
+        out.append(("%s: workflow-level env %s" % (job, key),
+                    text.replace(jobs, "\nenv:\n  %s: HEAD\n" % key + jobs, 1)))
+    out.append(("%s: workflow-level env as an expression" % job,
+                text.replace(jobs, "\nenv: ${{ fromJSON(vars.X) }}\n" + jobs, 1)))
+    out.append(("%s: job-level env, empty value" % job,
+                text.replace(head, head + "    env:\n      X_BASE:\n", 1)))
+    out.append(("%s: continue-on-error on the gate step" % job,
+                in_job(text, job, run_anchor, run_anchor + "        continue-on-error: true\n")))
+    out.append(("%s: continue-on-error on the job" % job,
+                text.replace(head, head + "    continue-on-error: true\n", 1)))
+    out.append(("%s: GITHUB_ENV write in an earlier step" % job,
+                in_job(text, job, "    steps:\n", "    steps:\n      - run: echo X_BASE=HEAD >> \"$GITHUB_ENV\"\n")))
+    out.append(("%s: job runs in a container" % job,
+                text.replace(head, head + "    container: ubuntu:24.04\n", 1)))
     return out
 
 
@@ -896,6 +1065,24 @@ def red_proof():
     return 0
 
 
+def print_gate_step_env(job, workflow):
+    """--gate-step-env: print NAME=VALUE for the env reaching a script-gate step (#5970)."""
+    script = SCRIPT_GATE_JOBS.get(job)
+    try:
+        if script is None:
+            raise ValueError("%r is not a script-gate job (%s)" % (job, ", ".join(sorted(SCRIPT_GATE_JOBS))))
+        env = gate_step_env(Path(workflow).read_text(), job, script)
+    except (ValueError, OSError) as exc:
+        sys.stderr.write("ci-commit-range: REFUSED: %s\n" % exc)
+        return 1
+    for name in sorted(env):
+        value = env[name]
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]  # a quoted YAML scalar reaches the process unquoted
+        sys.stdout.write("%s=%s\n" % (name, value))
+    return 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description="Choose the commit range for a CI gate (fail-closed).")
     ap.add_argument("--event")
@@ -909,11 +1096,15 @@ def main(argv):
     ap.add_argument("--base-only", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--red-proof", action="store_true")
+    ap.add_argument("--gate-step-env", metavar="JOB")
+    ap.add_argument("--workflow")
     args = ap.parse_args(argv)
     if args.self_test:
         return 3 if self_test() else 0
     if args.red_proof:
         return red_proof()
+    if args.gate_step_env is not None:
+        return print_gate_step_env(args.gate_step_env, args.workflow or str(Path(args.repo) / WORKFLOW))
     try:
         rng = choose(
             args.repo,
