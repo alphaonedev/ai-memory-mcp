@@ -26,7 +26,8 @@ RULES ENFORCED (all closed-world: a trigger the reader cannot parse is a FAILURE
          quotes inside, tags, ``?``, ``+``, ``[``, backslash and alias-like
          ``*name`` items are undecidable and fail.  A push trigger with no
          ``branches`` and no ``tags`` key matches every branch and counts.
-  R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730-#5736) the whole file is
+  R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730-#5736,
+         #5748) the whole file is
          read closed-world by the grammar below.  A file the reader cannot read
          is a failure whatever words it holds (#5731).
 
@@ -111,7 +112,7 @@ class Unparsed(Exception):
 
 
 def _strip_comment(line: str) -> str:
-    """Drop a trailing comment and trailing whitespace (one row at a time)."""
+    """Drop a trailing comment and trailing ASCII space, tab or CR (one row at a time, #5748)."""
     out: List[str] = []
     quote: Optional[str] = None
     for i, ch in enumerate(line):
@@ -120,10 +121,10 @@ def _strip_comment(line: str) -> str:
                 quote = None
         elif ch in ("'", '"'):
             quote = ch
-        elif ch == "#" and (i == 0 or line[i - 1].isspace()):
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
             break
         out.append(ch)
-    return "".join(out).rstrip()
+    return "".join(out).rstrip(" \t\r")
 
 
 def _indent(line: str) -> int:
@@ -131,7 +132,7 @@ def _indent(line: str) -> int:
 
 
 def _unquote(item: str) -> str:
-    item = item.strip()
+    item = item.strip(" ")  # only ASCII space is YAML white space here (#5748)
     if len(item) >= 2 and item[0] == item[-1] and item[0] in ("'", '"'):
         return item[1:-1]
     return item
@@ -539,7 +540,7 @@ def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
     if start is None:
         raise Unparsed("no top-level on: block")
     on_key = rows[start][2]
-    head = rows[start][1][len(on_key):].lstrip(" ")[1:].strip()
+    head = rows[start][1][len(on_key):].lstrip(" ")[1:].strip(" ")
     if head:
         raise Unparsed("flow/scalar on: form: " + head)
     block: List[Tuple[int, str]] = []
@@ -560,7 +561,7 @@ def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*) *:(?: +(.*))?$", body)
         if not m:
             raise Unparsed("unreadable trigger line: " + body)
-        name, rest = m.group(1), (m.group(2) or "").strip()
+        name, rest = m.group(1), (m.group(2) or "").strip(" ")  # a Unicode space is text (#5748)
         if name.lower() in YAML11_BOOLEANS + ("null",):
             raise Unparsed("trigger name YAML 1.1 reads as a boolean or null (#5735): " + name)
         if name.lower() in PR_TRIGGERS + ("push",) and name not in PR_TRIGGERS + ("push",):
@@ -615,7 +616,7 @@ def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[s
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*) *:(?: +(.*))?$", body)
         if not m:
             raise Unparsed(trigger + ": unreadable filter line: " + body)
-        key, rest = m.group(1), (m.group(2) or "").strip()
+        key, rest = m.group(1), (m.group(2) or "").strip(" ")  # a Unicode space is text (#5748)
         if key.lower() in seen_keys:
             raise Unparsed(trigger + ": repeated filter key (#5666): " + key)
         seen_keys.add(key.lower())
@@ -1827,6 +1828,35 @@ class CommentTruth5732(unittest.TestCase):
         self.assertNotEqual(body, GOOD_PR)
         got = violations("x.yml", "on:\n" + body)
         self.assertTrue(any("R-SHAPE" in v for v in got), got)
+
+
+class UnicodeSpaceIsText5748(unittest.TestCase):
+    """#5748: only ASCII space and tab are YAML white space; other Unicode spaces are text.
+
+    Measured at 90a3f698 (round-4 differential, seed 5665, text 8715): each refusal
+    case here was accepted there because Python's str.strip() dropped an EM SPACE
+    (U+2003) that PyYAML 6.0.1 keeps, so the reader saw a list or a null where
+    PyYAML reads the string shown in each comment.
+    """
+
+    def _shape(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5748_unicode_space_around_a_filter_value(self) -> None:
+        # PyYAML: '\u2003[main]' (a string, not a list).
+        self._shape("on:\n  push:\n    branches: \u2003[main]\n" + GOOD_PR, "unterminated or non-list flow value")
+        # PyYAML: types 'opened\u2003'.
+        self._shape("on:\n" + GOOD_PR + "    types: opened\u2003\n", "scalar is not one plain word")
+
+    def test_5748_unicode_space_around_a_null_trigger(self) -> None:
+        # PyYAML: push '\u2003~' and '~\u2003' (strings, not null).
+        for value in ("\u2003~", "~\u2003"):
+            self._shape("on:\n  push: " + value + "\n" + GOOD_PR, "inline value not supported")
+
+    def test_5748_ascii_space_still_stripped(self) -> None:
+        got = parse_triggers("on:\n  push:   ~  \n" + GOOD_PR + "    types:  opened  \n")
+        self.assertEqual({"push": {}, "pull_request": {"branches": ["main", "rehearsal/**"], "types": ["opened"]}}, got)
 
 
 class GlobSemantics5447(unittest.TestCase):
