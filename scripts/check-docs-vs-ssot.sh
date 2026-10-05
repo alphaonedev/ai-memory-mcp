@@ -635,11 +635,23 @@ def plain(s):
     return WS.sub(' ', htmlmod.unescape(TAG.sub(' ', s))).strip()
 
 
-def needle_forms(nd):
-    # The forms of a ledger needle that a folded view can contain: raw, whitespace
-    # folded (#5334), and marker folded (#5335).
+def shields(nd, val, span, src):
+    # Does ledger needle nd exempt the hit (val, span)? src is None for a hit
+    # matched in a raw view, else the unfolded text of the marker-folded view it
+    # was matched in. A raw hit is shielded by the needle as written or whitespace
+    # folded (#5334); a folded hit only by the marker-folded needle (#5335), and
+    # only when the whitespace-folded needle occurs in src, so a bold needle never
+    # shields a plain claim elsewhere in its file (#5699). The shielding form must
+    # also name the hit's value as a whole number.
     ws = WS.sub(' ', nd)
-    return {nd, ws, MARKS.sub('', ws)}
+    if src is None:
+        forms = (nd, ws)
+    elif ws in src:
+        forms = (MARKS.sub('', ws),)
+    else:
+        return False
+    num = re.compile(r'(?<![0-9])' + re.escape(val) + r'(?![0-9])')
+    return any(f in span and num.search(f) for f in forms)
 
 
 canon = os.environ['GATE_SCHEMA_CANON']
@@ -662,6 +674,15 @@ for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8')
     if parts[1] in ledger.get(parts[0].strip(), {}):
         rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', 'duplicate entry: ' + raw.strip()[:140]))
         continue
+    # A needle must name the ladder number it exempts. One with no ASCII digit
+    # (markers, whitespace, format characters, punctuation or words only) names
+    # none: an all-marker needle folds to '', sat inside every span of its file
+    # and could never go stale. Folding never adds a digit, so the raw needle is
+    # tested (#5699).
+    if not re.search(r'[0-9]', parts[1]):
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-',
+                     'vacuous needle, names no ladder number (#5699): ' + raw.strip()[:120]))
+        continue
     ledger.setdefault(parts[0].strip(), {})[parts[1]] = [n, False]
 
 files = os.environ.get('GATE_SCHEMA_FILES', '').split()
@@ -678,12 +699,12 @@ for path in files:
             if PRIOR.search(window):
                 continue
         probe = TYPED.sub('', line)
-        hits = []  # (value, matched span)
+        hits = []  # (value, matched span, unfolded source of a marker-folded view)
         for rx in SWEEP:
             for m in rx.finditer(probe):
                 if ARROW.match(probe, m.end(1)):
                     continue
-                hits.append((m.group(1), m.group(0)))
+                hits.append((m.group(1), m.group(0), None))
         # A claim wrapped across two source lines: the subject ends the previous
         # line, the value opens this one. Only values on THIS line count.
         if ln > 1:
@@ -721,7 +742,7 @@ for path in files:
                 for m in SWEEP[0].finditer(stub + body):
                     if m.start() == 0 and m.start(1) >= len(stub) \
                             and not ARROW.match(stub + body, m.end(1)):
-                        hits.append((m.group(1), m.group(0)))
+                        hits.append((m.group(1), m.group(0), None))
             # Anchor form (#5026): an anchor whose subject words end the previous
             # line and whose value opens this one (docs/index.html "a v0.8.x DB
             # steps" / "v70 -> v100"). The match must start on the previous line
@@ -730,7 +751,7 @@ for path in files:
             for rx in ANCHORS:
                 for m in rx.finditer(joined):
                     if m.start() < len(prev) < m.start(1):
-                        hits.append((m.group(1), m.group(0)))
+                        hits.append((m.group(1), m.group(0), None))
             # Markdown only: the same join with the emphasis / code-span markers
             # folded out of both lines, so a bold or code-span transition wrapped
             # across the line break is seen too (#5340). The marker fold reaches one
@@ -741,7 +762,7 @@ for path in files:
                 for rx in ANCHORS:
                     for m in rx.finditer(fjoined):
                         if m.start() < len(fprev) < m.start(1):
-                            hits.append((m.group(1), m.group(0)))
+                            hits.append((m.group(1), m.group(0), joined))
         # Every anchor spells a gap as one space, so match it against the
         # whitespace-folded line (html is already folded by plain(); #5200).
         aline = WS.sub(' ', line)
@@ -752,24 +773,22 @@ for path in files:
         # join block above (#5340).
         # Bounds pinned by the self-test (#5337): html literal markers (a backtick span
         # typed into html text) are NOT folded, and the html join reset above is html-only.
-        views = [aline] if is_html else [aline, MARKS.sub('', aline)]
+        views = [(aline, None)] if is_html else [(aline, None), (MARKS.sub('', aline), aline)]
         for rx in ANCHORS:
-            for view in views:
-                hits.extend((m.group(1), m.group(0)) for m in rx.finditer(view))
+            for view, src in views:
+                hits.extend((m.group(1), m.group(0), src) for m in rx.finditer(view))
         if is_html:
-            hits.extend((m.group(1), m.group(0)) for m in PILL.finditer(htmlmod.unescape(raw)))
+            hits.extend((m.group(1), m.group(0), None) for m in PILL.finditer(htmlmod.unescape(raw)))
         seen = set()
-        for val, span in hits:
+        for val, span, src in hits:
             if val == canon or val in seen:
                 continue
             # The ledger exempts ONE hit: the needle must sit inside the
             # matched span, so a history phrase never shields a real claim
             # that shares its line (schema.html carries both on one line).
-            # The engine matched `span` in a folded view, so the needle is also
-            # tried in that fold (#5334, #5335): a needle with a doubled space or a
-            # marker still sits inside the folded span.
-            hit_entry = [st for nd, st in entries.items()
-                         if any(f in span for f in needle_forms(nd))]
+            # A needle with a doubled space or a marker still sits inside the
+            # folded span it exempts (#5334, #5335); shields() bounds the fold (#5699).
+            hit_entry = [st for nd, st in entries.items() if shields(nd, val, span, src)]
             if hit_entry:
                 for st in hit_entry:
                     st[1] = True
@@ -2732,7 +2751,8 @@ SCHEMAHTML
     grep -qF 'malformed entry' <<<"$_led_out" \
         || { echo "FAIL: self-test #3248 - malformed ledger entry not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
     cp "$_led.keep" "$_led"
-    printf 'docs/postgres-age-guide.md\tno such span anywhere\t#3248 stale on purpose\n' >> "$_led"
+    # The needle names a number (v4242) so it is refused as stale, not as vacuous (#5699).
+    printf 'docs/postgres-age-guide.md\tno such span anywhere v4242\t#3248 stale on purpose\n' >> "$_led"
     _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 || true)
     grep -qF 'STALE entry' <<<"$_led_out" \
         || { echo "FAIL: self-test #3248 - stale ledger entry not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -3102,6 +3122,89 @@ R4HTML
     rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/schema-fixture.html"
     rm -f "$tmpdir/docs/block-fixture.html" "$tmpdir/docs/block-control.html"
     rm -f "$tmpdir/docs/CONFIG_SCHEMA.md" "$tmpdir/docs/schema-fixture.html"
+
+    # ---- #5699: a ledger needle must name the ladder number it exempts. A needle
+    # that folds to nothing (markers, whitespace, format characters) once sat inside
+    # every span of its file, so one such row exempted every claim and could never
+    # go stale. Rows 1-3, 19-21 and 22-23 are real needles; rows 4-18 are each refused by
+    # line number (row 17 is a fullwidth digit, not an ASCII one; row 18 is an empty
+    # needle cell, the format validator's arm). The planted claim on line 1 must still
+    # be flagged; a bold needle must not shield the plain claim on line 3; a needle
+    # without the hit's number as a whole number (5, #152, #521) must not shield 52;
+    # a bold history wrapped across two lines (lines 8-9) stays exempt. Rows 22-23
+    # are bold needles whose only candidate is a claim the bold needle does not
+    # spell: a code-span v59 seen only in the marker-folded view (line 10), and a
+    # plain v58 in an html file, which has no folded view. Both are flagged and both
+    # rows are reported STALE.
+    _v=scripts/qc-allowlists/schema-claim-history.txt
+    {
+        printf 'docs/postgres-age-guide.md\t**v58**\t#5699 ledgered bold history\n'
+        printf 'docs/postgres-age-guide.md\tSchema version  | **v60**\t#5390 doubled-space table history\n'
+        printf 'docs/postgres-age-guide.md\t5\t#5699 a digit that is not the value\n'
+        printf 'docs/postgres-age-guide.md\t**\t#5699 vacuous\n'
+        printf 'docs/postgres-age-guide.md\t``\t#5699 vacuous\n'
+        printf 'docs/postgres-age-guide.md\t_\t#5699 vacuous\n'
+        printf 'docs/postgres-age-guide.md\t__\t#5699 vacuous\n'
+        printf 'docs/postgres-age-guide.md\t*_*\t#5699 vacuous\n'
+        printf 'docs/postgres-age-guide.md\t** **\t#5699 vacuous\n'
+        printf 'docs/postgres-age-guide.md\t**\xc2\xa0**\t#5699 vacuous NBSP\n'
+        printf 'docs/postgres-age-guide.md\t**\xe2\x80\x8b**\t#5699 vacuous ZWSP\n'
+        printf 'docs/postgres-age-guide.md\t`\xe3\x80\x80`\t#5699 vacuous ideographic space\n'
+        printf 'docs/postgres-age-guide.md\t\xef\xbb\xbf\t#5699 vacuous BOM\n'
+        printf 'docs/postgres-age-guide.md\t...\t#5699 vacuous punctuation\n'
+        printf 'docs/postgres-age-guide.md\t\xe2\x86\x92\t#5699 vacuous arrow\n'
+        printf 'docs/postgres-age-guide.md\tschema\t#5699 vacuous word\n'
+        printf 'docs/postgres-age-guide.md\t**\xef\xbc\x95**\t#5699 vacuous fullwidth digit\n'
+        printf 'docs/postgres-age-guide.md\t\t#5699 empty needle cell\n'
+        printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION constant (#152)\t#5699 52 only inside 152\n'
+        printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION constant (#521)\t#5699 52 only inside 521\n'
+        printf 'docs/postgres-age-guide.md\tsteps **v40 -> v61**\t#5699 ledgered bold history wrapped\n'
+        printf 'docs/postgres-age-guide.md\t**v59**\t#5699 bold needle, code-span line\n'
+        printf 'docs/vacuous-fixture.html\t**v58**\t#5699 bold needle, html line\n'
+    } > "$_v"
+    cat > "$tmpdir/docs/postgres-age-guide.md" <<'R5MD'
+The CURRENT_SCHEMA_VERSION is 52 here.
+Schema **v58** (was v51)
+Schema v58 (was v51)
+| Schema version  | **v60** |
+Schema v52 (was v51)
+the CURRENT_SCHEMA_VERSION constant (#152) is 52
+the CURRENT_SCHEMA_VERSION constant (#521) is 52
+a v0.6 DB steps **v40 ->
+v61** on boot.
+Schema `v59` (was v51)
+R5MD
+    printf '<p>Schema v58 (was v51)</p>\n' > "$tmpdir/docs/vacuous-fixture.html"
+    _v_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5699 - vacuous ledger needles not rejected (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in \
+        'docs/postgres-age-guide.md:1 claims "52"' \
+        'docs/postgres-age-guide.md:3 claims "58"' \
+        'docs/postgres-age-guide.md:5 claims "52"' \
+        'docs/postgres-age-guide.md:6 claims "52"' \
+        'docs/postgres-age-guide.md:7 claims "52"' \
+        'docs/postgres-age-guide.md:10 claims "59"' 'docs/vacuous-fixture.html:1 claims "58"' \
+        'line 22 (docs/postgres-age-guide.md no longer carries "**v59**")' \
+        'line 23 (docs/vacuous-fixture.html no longer carries "**v58**")' \
+        'no longer carries "5")' \
+        'no longer carries "CURRENT_SCHEMA_VERSION constant (#152)")' \
+        'no longer carries "CURRENT_SCHEMA_VERSION constant (#521)")'
+    do grep -qF "$_want" <<<"$_v_out" || { echo "FAIL: self-test #5699 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
+    for _n in 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do
+        grep -qF "malformed entry at line $_n \"vacuous needle" <<<"$_v_out" \
+            || { echo "FAIL: self-test #5699 - vacuous ledger needle at line $_n not refused by name" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    grep -qF 'malformed entry at line 18 ' <<<"$_v_out" \
+        || { echo "FAIL: self-test #5699 - empty needle cell at line 18 not refused" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _not in 'docs/postgres-age-guide.md:2 ' 'docs/postgres-age-guide.md:4 ' \
+        'docs/postgres-age-guide.md:8 ' 'docs/postgres-age-guide.md:9 ' \
+        'docs/postgres-age-guide.md no longer carries "**v58**")' 'no longer carries "Schema version  | **v60**")' \
+        'no longer carries "steps **v40 -> v61**")'
+    do grep -qF "$_not" <<<"$_v_out" && { echo "FAIL: self-test #5699 - ledgered history flagged or reported stale: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test #5699 - a ledger needle that names no ladder number (markers only, mixed markers, markers with a space / NBSP / ZWSP / ideographic space, a BOM, punctuation, an arrow, a bare word) is REFUSED by line number; the planted 52 is still REJECTED; a bold needle shields its own bold line but not a plain v58 on another line, a code-span v59, or a plain v58 in an html file; a needle without the hit's number as a whole number (5, #152, #521) does not shield it and is reported STALE; a ledgered bold transition wrapped across two lines stays exempt"
+    echo "PASS: self-test #5390 - the whitespace-folded needle form is pinned: Schema version  | **v60** (doubled space) exempts its table row only through the whitespace fold"
+    rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/vacuous-fixture.html"
     printf '# fixture ledger (comment-only)\n' > scripts/qc-allowlists/schema-claim-history.txt
 
     # ---- FAIL-CLOSED-ONLY-WITH-A-CLAIM: remove both SSOTs. A doc that
