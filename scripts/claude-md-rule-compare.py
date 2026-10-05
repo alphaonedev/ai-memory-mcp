@@ -489,7 +489,7 @@ def refusal_prefix_gap(source: bytes) -> str:
     source = bytes(source)
     try:
         encoding = tokenize.detect_encoding(iter(source.splitlines(keepends=True)).__next__)[0]
-    except (SyntaxError, StopIteration, LookupError) as exc:
+    except Exception as exc:  # fail closed: detect_encoding raises only SyntaxError (measured), but ANY failure refuses (#5588)
         return f"the source encoding cannot be determined: {exc}"
     if encoding not in ("utf-8", "utf8"):
         return f"the source declares the encoding {encoding}, not plain utf-8 (a BOM or a coding cookie)"
@@ -975,7 +975,33 @@ def _self_test_cases() -> int:
             return "a refusal body of print and sys.exit calls was refused (#5563)"
         return ""
 
-    refusal_pins = {"#5510": pin_5510, "#5560": pin_5560, "#5562": pin_5562, "#5563": pin_5563}
+    def pin_5588():
+        # #5588: ANY exception from tokenize.detect_encoding refuses, not only the SyntaxError it raises today for an
+        # unknown codec (measured on 3.12). The injected LookupError, StopIteration and RuntimeError make the broad
+        # catch load-bearing: narrowing it back to SyntaxError turns this pin red.
+        refusal, hidden, plain = pin_sources()
+        real = tokenize.detect_encoding
+        try:
+            for injected in (LookupError("injected"), StopIteration(), RuntimeError("injected")):
+                def boom(readline, injected=injected):
+                    raise injected
+
+                tokenize.detect_encoding = boom
+                try:
+                    why = refusal_prefix_gap(plain)
+                except Exception as exc:  # the injected failure must not escape: an escape is a fail-open crash path
+                    return f"a {type(injected).__name__} from detect_encoding escaped refusal_prefix_gap as {exc!r} (#5588)"
+                if "the source encoding cannot be determined" not in why:
+                    return f"a {type(injected).__name__} from detect_encoding did not refuse (#5588)"
+        finally:
+            tokenize.detect_encoding = real
+        if "the source encoding cannot be determined: unknown encoding" not in refusal_prefix_gap(b"# coding: nope\n" + plain):
+            return "an unknown coding cookie was not refused with the encoding reason (#5588)"
+        if refusal_prefix_gap(plain):
+            return "a plain utf-8 source was refused after the injected detect_encoding was restored (#5588)"
+        return ""
+
+    refusal_pins = {"#5510": pin_5510, "#5560": pin_5560, "#5562": pin_5562, "#5563": pin_5563, "#5588": pin_5588}
     for pin_issue, pin_check in refusal_pins.items():
         pin_failure = pin_check()
         if not pin_failure:
