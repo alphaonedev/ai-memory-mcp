@@ -284,15 +284,34 @@ node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; 
 # Closed-world output (#4999, 5-agent vote 4d3ea1c5): no byte of a node reply reaches this terminal.
 # verify suspends xtrace on its first line (#5237), so no reply reaches an xtrace log either; outside
 # verify a node reply only ever goes to a file or to /dev/null. A PASS or FAIL line names a node-derived
-# value only through these three helpers, whose output comes from a closed set. A static test follows
-# node-derived names to ok, no, die, echo, printf, cat and tee, flags any positional parameter on such a
-# line outside ok, no, die and these helpers, and refuses (outside main) constructs it cannot follow, such as eval, read,
-# mapfile, printf -v, indirect expansion, here-strings, here-documents not fed to a node, indexed and
-# escaped-space assignments and default-assign expansions (#5236, #5359); it follows a function that wraps
-# a node channel as a source (#5360), refuses a command outside those sinks that names a node-derived
-# variable unless it is a test builtin, grep, sed, a node channel or a helper (#5361), and refuses a
-# command substitution or a cat of a file in a terminal line (#5362). It is a static aid and not a proof;
-# whole-verify probes check the printed bytes for hostile replies. reply_status prints a 3-digit HTTP
+# value only through these three helpers, whose output comes from a closed set. A static test
+# (scripts/test/test_do_hive_argv_secrets_4604_4866_4678.py) follows node-derived names and applies
+# these rules:
+#  - ok, no, die, echo, printf, cat and tee may not name one; a positional parameter on such a line is
+#    allowed only in ok, no, die and the three helpers; a command substitution or a backtick in such a
+#    line is refused; a cat of a file is refused (#5236, #5362, #5408);
+#  - any other command that names a node-derived variable is refused, except the test words [, [[,
+#    test, case, for, true, false and :, and plain_id; local, export, readonly, declare and typeset
+#    may take it only as the value of name=value, never as a name; a numeric test, an arithmetic
+#    expansion, a substring offset or length, an array subscript and the :? expansion are refused
+#    because bash prints the operand in its error message (#5361, #5406, #5411);
+#  - a command that reads a file or an input redirect and is the last stage of a pipeline prints that
+#    file, so it is refused unless its output goes to a file, it is wc or curl, or it is grep with a
+#    -q, -c, -l or -L style flag (#5409);
+#  - a redirect decides where output goes by the LAST fd-1 redirect: only a plain path or /dev/null is a
+#    file; a dup, any other /dev path, /proc, or a target computed by a command substitution, a
+#    backtick or a process substitution is the terminal (#5412);
+#  - a pipe into base64 is exempt only when it continues into curl, and the b64 helper only while its
+#    body is exactly the pinned one (#5413);
+#  - a function that wraps a node channel is followed as a source, in every spelling of the definition
+#    (#5360, #5414);
+#  - outside main the scan refuses eval, read, mapfile, printf -v, indirect expansion, here-strings,
+#    here-documents not fed to a node, indexed and escaped-space assignments, default-assign and :?
+#    expansions, let, ((, process substitution and backticks (#5236, #5359, #5407, #5408, #5410).
+# It is a static aid and not a proof, and it has two stated limits (#5418): a redirect target held in a
+# variable is not resolved, and a node reply written to a file that is later read by a command the
+# scan does not list is not followed; whole-verify probes check the printed bytes for hostile replies.
+# reply_status prints a 3-digit HTTP
 # status, or the word non-status for anything else. reply_len prints the reply's byte count.
 # reply_version prints a version token only when it is 1 to 3 dot-separated groups of 1 to 3 ASCII
 # digits, and the byte count of the whole reply otherwise.

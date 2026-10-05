@@ -1794,6 +1794,21 @@ def ext_pin_5275():
                   good, "" if good else "%s %s" % (age, vec))
 
 
+def comment_pin_5416():
+    """#5416: the federate.sh closed-world comment names every silent word, declarator and stated limit the scan has."""
+    fs = FED.read_text()
+    start = fs.find("# Closed-world output (#4999")
+    end = fs.find("# reply_status prints", start)
+    block = fs[start:end] if start >= 0 and end > start else ""
+    missing = [w for w in sorted(SILENT_CONSUMERS | DECLARATORS) if not re.search(r"(?<![\w-])" + re.escape(w) + r"(?![\w-])", block)]
+    probe("#5416 the closed-world comment names every silent word and declarator the scan allows", bool(block) and not missing, str(missing))
+    probe("#5416 the closed-world comment states the scan's two limits", "#5418" in block and "variable is not resolved" in block
+          and "does not list is not followed" in block, "")
+    changelog = (ROOT / "changelog.d" / "4654.fixed.md").read_text()
+    probe("#5416 the changelog does not call any member of the allowed set a known silent consumer",
+          "known silent consumer" not in changelog and "#5418" in changelog, "")
+
+
 def f2_id_lists_agree():
     fs = FED.read_text()
     lists = re.findall(r"\^(\[[^\]]*\])\{1,64\}\$", "\n".join(l for l in fs.splitlines() if "=~" in l and "1,64" in l))
@@ -1854,6 +1869,7 @@ def main():
     reply_len_padded_wc()
     pg_version_5172()
     ext_pin_5275()
+    comment_pin_5416()
     node_streams_5171()
     ssh_batch_5274()
     verify_cost_5247()
