@@ -540,9 +540,10 @@ def deny_lines(dl, rel: str, text: str) -> Dict[int, str]:
 
 
 # mysql family (#4920, #5464, #5502, #5582, #5583, #5630-#5639): a closed world. A head is a word that begins with
-# mysql or mariadb in any letter case (mysqldump, mysql_upgrade, mariadb-dump, MySQLDump, mysql.exe ...) after any
-# path, at a command position; it is not a head when an assignment, a URL, a user:group pair or a path component
-# continues it. The words after the head up to the next pipe, semicolon, ampersand or unmatched parenthesis are
+# mysql or mariadb in any letter case (mysqldump, mysql_upgrade, mariadb-dump, MySQLDump, mysql.exe ...) with no
+# path, or after a path that has a bin, sbin or libexec directory or starts with ./ ../ ~/ or a dollar sign
+# (_MY_BIN_DIR_RE, #5824; any other path is not read, #5831), at a command position; it is not a head when an
+# assignment, a URL, a user:group pair or a path component continues it. The words after the head up to the next pipe, semicolon, ampersand or unmatched parenthesis are
 # read by shell word, quotes removed. A word is clean only when it is positively recognised as no credential:
 # a word without any expansion, a flag of the measured set, a short cluster read letter by letter, the value of
 # a measured value option, an operand that is not led by an expansion, or any operand after --. Everything else
@@ -2201,6 +2202,7 @@ ROUND3_GREEN = [
     ('5729 mutant pin: clean 2: a pipe ends the mysql command', 'mysql -u r db | grep "$X"'),
     ('5738 mutant pin: clean 1: a semicolon ends the wget command', 'wget -q URL; ls -e "http_password=$X"'),
     ('5738 mutant pin: clean 2: a pipe ends the wget command', 'wget URL | tee -e "http_password=$X"'),
+    ('5824 doc pin: clean 1: a path without a bin, sbin or libexec directory is no head (stated limit #5831)', '/opt/mysql-8.0/mysql -p"$X"'),
     ('5820 wrapper pin: clean 1: a wrapper inside an echoed string is no command', 'echo "run sudo mysql -p$X"'),
     ('5820 wrapper pin: clean 2: a wrapper inside a printf operand is no command', "printf '%s\\n' \"now sudo mysql -p$X\""),
     ('5820 wrapper pin: clean 3: a wrapped head in a payload with clean words', 'ssh h "sudo mysql -uroot -h $H app"'),
