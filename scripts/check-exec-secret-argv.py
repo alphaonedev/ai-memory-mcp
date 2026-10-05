@@ -539,28 +539,252 @@ def deny_lines(dl, rel: str, text: str) -> Dict[int, str]:
     return out
 
 
-# mysql family (#4920, #5464, #5502, #5582, #5583): keyed on the option shape of the whole family, not on a list of
-# client names. A head is mysql followed by word characters (mysqldump, mysqlimport, mysql_upgrade, ...) or
-# mariadb followed by word characters and dash words (mariadb-dump, mariadb-backup, ...), after any path or
-# wrapper; a head spelled in any letter case is read when it ends in .exe. The option is -p glued to a value
-# or a prefix of --password with an optional loose prefix and a dash or an underscore after it (my_getopt),
-# and its value is an expansion. --pa is a unique prefix of --password in the non-interactive clients (and
-# ambiguous with --pager in the bare interactive mysql and mariadb, which keep --pas as the shortest prefix);
-# every other family client reads --pa and up. No client list: a new family client is read by its head shape.
-_MY_HEAD = r"(?:mysql|mariadb|(?i:(?:mysql|mariadb)[\w-]*\.exe))(?![\w-]*=)"
-_MY_BARE = r"(?!(?i:mysql|mariadb)(?![\w-]))"
-_MY_PW = r"(?:loose[-_])?pa(?:s(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?)?"
-_MY_PW_LONG = r"(?:loose[-_])?pas(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?"
-_MY_TAIL = r"[\"']?(?:\$|`)"
-MYSQL_FAMILY_RE = (
-    r"\b" + _MY_HEAD + r"[^|;&]*\s(?:-p|--" + _MY_PW_LONG + r"[\s=]*)" + _MY_TAIL
-    + r"|\b" + _MY_BARE + _MY_HEAD + r"[^|;&]*\s(?:-p|--" + _MY_PW + r"[\s=]*)" + _MY_TAIL)
+# mysql family (#4920, #5464, #5502, #5582, #5583, #5630-#5639): a closed world. A head is a word that begins with
+# mysql or mariadb in any letter case (mysqldump, mysql_upgrade, mariadb-dump, MySQLDump, mysql.exe ...) after any
+# path, at a command position; it is not a head when an assignment, a URL, a user:group pair or a path component
+# continues it. The words after the head up to the next pipe, semicolon, ampersand or unmatched parenthesis are
+# read by shell word, quotes removed. A word is clean only when it is positively recognised as no credential:
+# a word without any expansion, a flag of the measured set, a short cluster read letter by letter, the value of
+# a measured value option, an operand that is not led by an expansion, or any operand after --. Everything else
+# that carries an expansion is reported: the value of -p or of any prefix of --password (with or without a loose,
+# skip, enable or disable prefix, a dash or an underscore), the value of a flag or option the gate does not know,
+# the next word of an unknown option, an expansion-led operand before --, and an operand after a password command
+# word. Measured on the 5.7.24 clients' --help; the sets are a measured sample, not a client list.
+_MY_LONG_VALUE = frozenset("""
+auto-generate-sql-execute-number auto-generate-sql-load-type auto-generate-sql-secondary-indexes
+auto-generate-sql-unique-query-number auto-generate-sql-unique-write-number auto-generate-sql-write-number
+base64-output bind-address binlog-row-event-max-size character-sets-dir columns commit compatible
+compress-output concurrency connect-timeout connection-server-id create create-schema database default-auth
+default-character-set default-parallelism defaults-extra-file defaults-file defaults-group-suffix delimiter
+detach engine exclude-databases exclude-events exclude-gtids exclude-routines exclude-tables exclude-triggers
+exclude-users fields-enclosed-by fields-escaped-by fields-optionally-enclosed-by fields-terminated-by host
+ignore-error ignore-lines ignore-table include-databases include-events include-gtids include-routines
+include-tables include-triggers include-users iterations lines-terminated-by local-load log-error
+log-error-file login-path max-allowed-packet max-join-size net-buffer-length number-char-cols number-int-cols
+number-of-queries offset open-files-limit parallel-schemas plugin-dir port protocol read-from-remote-master
+result-file rewrite-db select-limit server-id server-id-bits server-public-key-path shutdown-timeout
+skip-database sleep socket sql-mode ssl-ca ssl-capath ssl-cert ssl-cipher ssl-crl ssl-crlpath ssl-key ssl-mode
+start-datetime start-position stop-datetime stop-never-slave-server-id stop-position tab tee tls-version
+use-threads user
+""".split())
+_MY_LONG_FLAG = frozenset("""
+add-drop-database add-drop-table add-drop-trigger add-drop-user add-locks all-databases all-in-1
+all-tablespaces allow-keywords analyze apply-slave-statements auto-generate-sql
+auto-generate-sql-add-autoincrement auto-generate-sql-guid-primary auto-rehash auto-repair
+auto-vertical-output batch binary-as-hex binary-mode check check-only-changed check-upgrade column-names
+column-type-info comments compact complete-insert compress connect-expired-password count create-options csv
+databases debug debug-check debug-info defer-table-indexes delete delete-master-logs disable-keys
+disable-log-bin dump-date dump-slave enable-cleartext-plugin events extended extended-insert fast fix-db-names
+fix-table-names flush-logs flush-privileges force force-if-open force-read get-server-public-key help hex-blob
+hexdump html i-am-a-dummy idempotent ignore ignore-spaces include-master-host-port insert-ignore keys
+line-numbers local local-infile lock-all-tables lock-tables low-priority master-data medium-check
+named-commands no-auto-rehash no-autocommit no-beep no-create-db no-create-info no-data no-defaults no-drop
+no-set-names no-tablespaces one-database only-print opt optimize order-by-primary print-defaults quick
+quote-names raw read-from-remote-server reconnect relative repair replace routines safe-updates secure-auth
+set-charset set-gtid-purged short-form show-table-type show-warnings sigint-ignore silent single-transaction
+skip-column-names skip-definer skip-dump-rows skip-gtids skip-line-numbers skip-opt skip-sys-schema ssl
+ssl-verify-server-cert status stop-never syslog table tables to-last-log triggers tz-utc unbuffered
+upgrade-system-tables use-frm users verbose verify-binlog-checksum version version-check vertical wait
+watch-progress write-binlog xml
+""".split())
+_MY_NOARG_SHORT = frozenset("1?ABCEGHIKLNQRUVXYabfgkmnstv")
+_MY_VALUE_SHORT = frozenset("huPS")
+_MY_SENSITIVE = ("password", "password1", "password2", "password3")
+_MY_NAME_PREFIXES = ("loose-", "skip-", "enable-", "disable-", "maximum-")
+_MY_HEAD_RE = re.compile(
+    r"(?<![\w.$-])(?P<dir>(?:[^\s\"'|;&()<>=]*[/\\])?)(?P<name>(?i:mysql|mariadb)[\w-]*(?:(?i:\.exe))?)(?![\w.:/\\=@{}-])")
+_MY_NONCMD_PREV = frozenset("""
+install reinstall remove purge upgrade update start stop restart reload status enable disable is-active is-enabled
+cd ls cat rm mkdir chown chmod chgrp cp mv ln touch test stat du df find tail head echo printf export unset
+""".split())
+_MY_BIN_DIR_RE = re.compile(r"(?:^|[/\\])(?:s?bin|libexec)[/\\]|^\.{1,2}[/\\]|^~[/\\]|^[\"']?\$")
+_MY_REDIRECT_RE = re.compile(r"^(?:\d*|&)(?:<<<|<<-?|<>|>>|>\||>&|<&|<|>)$|^&>>?$")
+_MY_REDIRECT_ATTACHED_RE = re.compile(r"^(?:\d*|&)(?:<<<|<<-?|<>|>>|>\||>&|<&|<|>)|^&>>?")
+
+
+def _my_has_exp(word: str) -> bool:
+    return "$" in word or "`" in word
+
+
+def _my_long_kind(name: str) -> Optional[str]:
+    """'flag' or 'value' for a long option name that is positively a measured non-password option (an exact name or
+    an abbreviation no password option shares), None for every other spelling (closed world)."""
+    base = name.replace("_", "-")
+    stripped = True
+    while stripped:
+        stripped = False
+        for pre in _MY_NAME_PREFIXES:
+            if base.startswith(pre) and len(base) > len(pre):
+                base = base[len(pre):]
+                stripped = True
+    if not base or base in _MY_SENSITIVE:
+        return None
+    kinds = set()
+    for known, kind in ((_MY_LONG_VALUE, "value"), (_MY_LONG_FLAG, "flag")):
+        if base in known:
+            return kind
+        kinds.update(kind for item in known if item.startswith(base))
+    if any(item.startswith(base) for item in _MY_SENSITIVE) or len(kinds) != 1:
+        return None
+    return next(iter(kinds))
+
+
+def _my_words(text: str) -> List[str]:
+    """The shell words of one command (quotes and backslashes removed), up to its terminator: an unquoted pipe,
+    semicolon, ampersand (not the one of a redirection) or unmatched closing parenthesis, a newline, or a quote that
+    has no partner (the closing quote of an enclosing sh -c string)."""
+    words: List[str] = []
+    cur: List[str] = []
+    started = False
+    depth = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            j = text.find(c, i + 1)
+            if j < 0:
+                break
+            piece = text[i + 1:j]
+            cur.append(piece.replace("\\" + c, c) if c == '"' else piece)
+            started = True
+            i = j + 1
+            continue
+        if c == "\\" and i + 1 < n:
+            if text[i + 1] != "\n":
+                cur.append(text[i + 1])
+                started = True
+            i += 2
+            continue
+        if c == "$" and text[i + 1:i + 2] == "(":
+            depth += 1
+            cur.append("$(")
+            started = True
+            i += 2
+            continue
+        if c == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and (c in "|;\n" or (c == "&" and not (cur and cur[-1][-1:] in "<>") and text[i + 1:i + 2] != ">")):
+            break
+        if c.isspace() and depth == 0:
+            if started:
+                words.append("".join(cur))
+                cur, started = [], False
+            i += 1
+            continue
+        cur.append(c)
+        started = True
+        i += 1
+    if started:
+        words.append("".join(cur))
+    return words
+
+
+def _my_words_hit(words: Sequence[str]) -> bool:
+    """True when a word of one command carries an expansion that the closed world does not clear (see above)."""
+    expect = ""
+    options_done = False
+    after_password_word = False
+    skip_next = False
+    for w in words:
+        if skip_next:
+            skip_next = False
+            continue
+        if _MY_REDIRECT_RE.match(w):
+            skip_next = True
+            continue
+        if _MY_REDIRECT_ATTACHED_RE.match(w):
+            continue
+        dashed = w.startswith("-") and len(w) > 1 and not options_done
+        if expect and not dashed:
+            if expect == "unknown" and _my_has_exp(w):
+                return True
+            expect = ""
+            continue
+        expect = ""
+        if not dashed:
+            if _my_has_exp(w) and (after_password_word or (not options_done and w[:1] in "$`")):
+                return True
+            after_password_word = not _my_has_exp(w) and bool(w) and ("password".startswith(w.lower())
+                                                                     or "old-password".startswith(w.lower()))
+            continue
+        after_password_word = False
+        if w == "--":
+            options_done = True
+        elif w.startswith("--"):
+            name, eq, value = w[2:].partition("=")
+            if _my_has_exp(name):
+                return True
+            kind = _my_long_kind(name)
+            if eq:
+                if kind != "value" and _my_has_exp(value):
+                    return True
+            elif kind != "flag":
+                expect = "safe" if kind == "value" else "unknown"
+        else:
+            letters = w[1:]
+            for idx, ch in enumerate(letters):
+                rest = letters[idx + 1:]
+                if _my_has_exp(ch):
+                    return True
+                if ch in _MY_NOARG_SHORT:
+                    continue
+                if ch in _MY_VALUE_SHORT:
+                    expect = "" if rest else "safe"
+                elif ch == "p":
+                    if _my_has_exp(rest):
+                        return True
+                elif _my_has_exp(rest):
+                    return True
+                else:
+                    expect = "" if rest else "unknown"
+                break
+    return False
+
+
+def _my_head_command(text: str, start: int, directory: str) -> bool:
+    """Whether the head matched at text[start:] is a command word: not a word of an echo string, not a package or
+    path operand. A head inside a quote opened before it counts only as the first word of that quote."""
+    if directory and not _MY_BIN_DIR_RE.search(directory):
+        return False
+    quote = ""
+    opener = -1
+    for k in range(start):
+        c = text[k]
+        if quote:
+            if c == quote:
+                quote = ""
+        elif c in "\"'":
+            quote, opener = c, k
+    before = text[opener + 1:start] if quote else text[:start]
+    if quote:
+        tail = re.split(r"[|;&(]", before)[-1]
+        return not tail.strip()
+    words = re.split(r"[|;&(]", before)[-1].replace("\"", " ").replace("'", " ").split()
+    return not any(w.lower() in _MY_NONCMD_PREV for w in words)
+
+
+def mysql_family_hit(raw: str) -> bool:
+    """True when a mysql family command of one logical line carries a credential the gate cannot clear."""
+    for m in _MY_HEAD_RE.finditer(raw):
+        if re.fullmatch(r"[A-Z0-9_]+", m.group("name")):
+            continue  # MYSQL_ROOT_PASSWORD, MYSQL_HOST: an environment variable name, not a command
+        if not _my_head_command(raw, m.start(), m.group("dir")):
+            continue
+        rest = raw[m.end():]
+        if m.start() > 0 and rest[:1] in ("\"", "'") and raw[m.start() - 1] == rest[:1]:
+            rest = rest[1:]  # the head was quoted on its own: "/usr/bin/mysql" --password="$X"
+        if _my_words_hit(_my_words(rest)):
+            return True
+    return False
+
 
 # A credential-taking flag of a known tool fed from any expansion: the value is on argv
 # whatever the variable is called, so such a line is never allow-able (pending + issue only).
 CRED_TOOL_RE = re.compile(
-    MYSQL_FAMILY_RE +
-    r"|\bsshpass\s+-p\s*[\"']?(?:\$|`)"
+    r"\bsshpass\s+-p\s*[\"']?(?:\$|`)"
     r"|\bredis-cli\b[^|;&]*\s(?:-a|--pass(?![\w-]))[\s=]*[\"']?(?:\$|`)"
     # one shell word after the flag that expands a variable, however its user part is quoted:
     # u:$X, "u:$X", u:"$X", 'u':"$X", "u":"$X" (#5101). A short flag may close a group of
@@ -665,7 +889,7 @@ def scan_exec_file(dl, rel: str, text: str) -> Optional[List[Found]]:
     for start, end, raw in units:
         reasons = trigger_reasons(raw, is_make)
         flagged = [deny[k] for k in range(start, end + 1) if k in deny]
-        if flagged or CRED_TOOL_RE.search(raw) or WGET_PW_LONG_RE.search(raw) or wgetrc_credential(raw):
+        if flagged or CRED_TOOL_RE.search(raw) or mysql_family_hit(raw) or WGET_PW_LONG_RE.search(raw) or wgetrc_credential(raw):
             reasons.append("denylist")
         if reasons:
             found.append((start, norm(raw), reasons))
@@ -1732,32 +1956,34 @@ ROUND3_RED = [
     ("curl -H backtick api key", 'curl -H "X-API-KEY: `cat f`" h'),
     ("curl -H backtick after the quote", "curl -H 'Authorization: Bearer '`cat f` h"),
     ("wget --header= backtick", 'wget --header="Authorization: token `cat f`" h'),
+    # a spelling the closed world does not recognise as a non-password option is reported (#5631, #5635); these were
+    # green when only the password spellings were read
+    ("mysql --password-file is not --password (closed world: reported)", 'mysql -u r --password-file="$PW_FILE" db'),
+    ("5464 mysql --pa is ambiguous, not --password (closed world: reported)", 'mysql -u r --pa="$X" db'),
+    ("5464 mysql --pass-file is not --pass (closed world: reported)", 'mysql -u r --pass-file="$PW_FILE" db'),
+    ("5502 mariadb --pa is ambiguous, not --password (closed world: reported)", 'mariadb -u r --pa="$X" db'),
+    ("5502 mysql --loose-pa is ambiguous, not --password (closed world: reported)", 'mysql --loose-pa="$X" db'),
+    ("5583 mysqlcheck --pass-file is not --pass (closed world: reported)", 'mysqlcheck --pass-file="$PW_FILE" db'),
+    ("5583 mysqlimport -p then a space prompts (closed world: reported)", 'mysqlimport -u r -p "$DB_NAME" f'),
+    ("5583 mysqlslap --pass_word is no option (closed world: reported)", 'mysqlslap --pass_word="$X"'),
+    ("5583 mysqlcheck --pass-word is no option (closed world: reported)", 'mysqlcheck --pass-word="$X" db'),
+    ("5583 an interactive mariadb --pa is ambiguous (closed world: reported)", 'mariadb --pa="$X" db'),
+    ("5583 an interactive mysql.exe --loose_pa is ambiguous (closed world: reported)", 'mysql.exe --loose_pa="$X" db'),
+    ("5582 mysql --loose_pa is ambiguous, not --password (closed world: reported)", 'mysql --loose_pa="$X" db'),
+    ("5582 mysqldump --loose_password-file is not --password (closed world: reported)", 'mysqldump --loose_password-file="$PW_FILE" db'),
+    ("5582 mysql --loose_pager is not --password (closed world: reported)", 'mysql --loose_pager="$PAGER_CMD" db'),
+    ("5502 mysqldump --pass-file is not --pass (closed world: reported)", 'mysqldump --pass-file="$PW_FILE" db'),
+    ("5502 mariadb-dump --loose-password-file is not --password (closed world: reported)", 'mariadb-dump --loose-password-file="$PW_FILE" db'),
 ]
 ROUND3_GREEN = [
-    ("mysql --password-file is not --password", 'mysql -u r --password-file="$PW_FILE" db'),
-    ("5464 mysql --pa is ambiguous, not --password", 'mysql -u r --pa="$X" db'),
-    ("5464 mysql --pass-file is not --pass", 'mysql -u r --pass-file="$PW_FILE" db'),
-    ("5502 mariadb --pa is ambiguous, not --password", 'mariadb -u r --pa="$X" db'),
-    ("5502 mysql --loose-pa is ambiguous, not --password", 'mysql --loose-pa="$X" db'),
-    ("5583 mysqlcheck --pass-file is not --pass", 'mysqlcheck --pass-file="$PW_FILE" db'),
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
     ("5583 mysqlimport -P is the port", 'mysqlimport -P "$DB_PORT" db f'),
-    ("5583 mysqlimport -p then a space prompts", 'mysqlimport -u r -p "$DB_NAME" f'),
-    ("5583 mysqlslap --pass_word is no option", 'mysqlslap --pass_word="$X"'),
-    ("5583 mysqlcheck --pass-word is no option", 'mysqlcheck --pass-word="$X" db'),
     ("5583 docker publish with a variable and no family client", 'docker run -p"$HOST_PORT:80" nginx'),
     ("5583 an environment variable name is not a family client", 'docker run -e MYSQL_ROOT_PASSWORD -p"$HOST_PORT:3306" img'),
-    ("5583 an interactive mariadb --pa is ambiguous", 'mariadb --pa="$X" db'),
-    ("5583 an interactive mysql.exe --loose_pa is ambiguous", 'mysql.exe --loose_pa="$X" db'),
     ("5583 a tool whose name only ends in a client name is no client", 'xmysql -p"$DB_PASSWORD"'),
     ("5583 a later command after && is not an argument of the client", 'mysqldump db && echo -p"$DB_PASSWORD"'),
     ("5583 an assignment named like a client is no command", 'mysql_args=(-x -p"$DB_PASSWORD")'),
     ("5583 a mariadb-named assignment is no command", 'mariadb_opts="-x --password=$DB_PASSWORD"'),
-    ("5582 mysql --loose_pa is ambiguous, not --password", 'mysql --loose_pa="$X" db'),
-    ("5582 mysqldump --loose_password-file is not --password", 'mysqldump --loose_password-file="$PW_FILE" db'),
-    ("5582 mysql --loose_pager is not --password", 'mysql --loose_pager="$PAGER_CMD" db'),
-    ("5502 mysqldump --pass-file is not --pass", 'mysqldump --pass-file="$PW_FILE" db'),
-    ("5502 mariadb-dump --loose-password-file is not --password", 'mariadb-dump --loose-password-file="$PW_FILE" db'),
     ("redis-cli --pass-file is not --pass", 'redis-cli --pass-file "$PW_FILE" ping'),
     ("wget -e non-credential settings", 'wget -e robots=off -e "https_proxy=$PROXY_HOST" -O "$TOKEN_FILE" h'),
     ("wget --passive-ftp is not a password option", 'wget --passive-ftp -O "$TOKEN_FILE" h'),
