@@ -1142,70 +1142,507 @@ def psql_segment_end(joined: str, head_end: int) -> int:
     return n
 
 
-# #5556 #5557 #5558 (round-8): the gate does not guess whether an unresolved first word of a
-# command spells psql. The words that may stand before the real command (an assignment, an
-# option and its argument, a redirection target, and these wrappers and keywords) are skipped;
-# a first word that is then not fully literal is read as a psql head.
-# Closed world: the operand decides, never a spelling list of heads. The rule is the same in
-# every file type (script, prose, fenced block, indented block, inline code). STATED LIMITS of
-# this rule: a first word that IS fully literal and is not psql (docker, foo) is a different
-# command and is not read; a non-literal word that stands after such a literal word is an
-# argument, not a head; a head that carries no credential -v operand is not flagged by this
-# rule (a script still refuses an undecidable psql-like word, a prose file does not).
-HEAD_PREFIX_WORDS = frozenset({
-    "env", "command", "exec", "sudo", "doas", "time", "nohup", "nice", "ionice", "builtin",
-    "xargs", "stdbuf", "timeout", "runuser", "setsid", "eval", "watch", "unbuffer", "taskset",
-    "then", "do", "else", "elif", "if", "while", "until", "!", "$", "{",
+# #5556 #5557 #5558 (round 8) and round 9 (the unresolved-head class, B-operand shape):
+# the proof obligation is inverted. A credential-shaped -v / --set / --variable operand is
+# CLEAN only when the command it belongs to provably has a fully literal head that is not
+# psql. Every other command (a non-literal head, a psql head, a head behind a wrapper,
+# keyword, option or redirection form the model below does not know) is undecidable, and an
+# undecidable command with a credential operand is flagged. There is no word-count cap: the
+# walk is bounded by the command, and the command comes from a tokenisation of the text.
+#
+# Command starts (shell_commands): the text start, a newline, an unquoted ; & | ( and ) (so
+# &&, ||, |&, ;; and a case-arm close paren), and the inside of every $( ), backtick span,
+# <( ), >( ), ${ } body, and every whole-word quoted string that holds a space (read as a
+# command string). The reserved words !, {, }, then, do, else, elif, if, while, until, fi,
+# done and esac stand before a command and are skipped; coproc is modelled; case, for,
+# select and function are not, so a command that opens with them is undecidable.
+# A redirection ([n]<, [n]>, >>, <<, <<-, <<<, <>, >|, <&, >&, &>, &>>, {name}>) and its
+# target are removed from the argv wherever they stand. A word with an unclosed quote is
+# undecidable (the quoting of the rest of the line is unknown).
+#
+# Transparent wrappers (TRANSPARENT_WRAPPERS) are followed with their exact grammar: the
+# options with no argument, the options that take one argument (attached, separate, or
+# --long=value), the count of positional operands before the command, and where a command
+# string stands. An option the table does not list, a long-option abbreviation, a
+# non-literal word where an option or the command may stand, and a word in an argument or
+# positional slot that may expand to other than one field (an unquoted expansion) make the
+# command undecidable. KNOWN_RUNNERS run their arguments with a grammar that is not
+# modelled (ssh, docker, kubectl, xargs, su, nsenter, ...) and are undecidable.
+#
+# B (round 9): the operand is psql's NAME=VALUE. Under a head that is not proven to be psql,
+# an operand whose first literal colon stands before any literal = (a docker or compose
+# mount SRC:DST, /run/secrets/pgpass:/s:ro, "$SECRET_DIR:/s") is not that shape: psql
+# rejects a variable name that holds a colon, and an = that only an expansion could add is
+# the #5398 indirection limit. A literal psql head keeps the full operand rule.
+#
+# STATED LIMITS: a fully literal head that is neither psql, a known runner nor a modelled
+# wrapper is a different program and its arguments are not read (a site-specific script that
+# itself runs "$@" is not followed); a word in prose that the tokeniser reads as a
+# redirection target (an HTML tag such as <code>) is not a command word.
+Grammar = Tuple[frozenset, frozenset, int, frozenset, frozenset, bool]
+# name -> (flags, options with one argument, positional operands, command-string options,
+#          long options with an optional =argument, obsolete -NUM accepted)
+TRANSPARENT_WRAPPERS = {
+    "env": (frozenset({"-", "-i", "-0", "-v", "--ignore-environment", "--null", "--debug"}),
+            frozenset({"-u", "--unset", "-C", "--chdir"}), 0, frozenset(), frozenset(), False),
+    "nice": (frozenset(), frozenset({"-n", "--adjustment"}), 0, frozenset(), frozenset(), True),
+    "nohup": (frozenset(), frozenset(), 0, frozenset(), frozenset(), False),
+    "timeout": (frozenset({"-v", "--verbose", "--foreground", "--preserve-status"}),
+                frozenset({"-k", "--kill-after", "-s", "--signal"}), 1, frozenset(), frozenset(), False),
+    "stdbuf": (frozenset(), frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}), 0,
+               frozenset(), frozenset(), False),
+    "setsid": (frozenset({"-c", "-f", "-w", "--ctty", "--fork", "--wait"}), frozenset(), 0,
+               frozenset(), frozenset(), False),
+    "taskset": (frozenset({"-a", "-c", "--all-tasks", "--cpu-list"}), frozenset(), 1, frozenset(),
+                frozenset(), False),
+    "ionice": (frozenset({"-t", "--ignore"}), frozenset({"-c", "-n", "--class", "--classdata"}), 0,
+               frozenset(), frozenset(), False),
+    "chrt": (frozenset({"-a", "-b", "-d", "-f", "-i", "-o", "-r", "-R", "-v", "--all-tasks", "--batch",
+                        "--deadline", "--fifo", "--idle", "--other", "--rr", "--reset-on-fork",
+                        "--verbose"}),
+             frozenset({"-T", "-P", "-D", "--sched-runtime", "--sched-period", "--sched-deadline"}), 1,
+             frozenset(), frozenset(), False),
+    "flock": (frozenset({"-s", "-x", "-e", "-u", "-n", "-o", "-F", "--shared", "--exclusive", "--unlock",
+                         "--nonblock", "--nb", "--close", "--no-fork", "--verbose"}),
+              frozenset({"-w", "-E", "--timeout", "--wait", "--conflict-exit-code"}), 1,
+              frozenset({"-c", "--command"}), frozenset(), False),
+    "chroot": (frozenset({"--skip-chdir"}), frozenset({"--userspec", "--groups"}), 1, frozenset(),
+               frozenset(), False),
+    "sudo": (frozenset({"-A", "-B", "-b", "-E", "-H", "-i", "-k", "-n", "-P", "-S", "-s", "--askpass",
+                        "--bell", "--background", "--preserve-env", "--set-home", "--login",
+                        "--reset-timestamp", "--non-interactive", "--preserve-groups", "--stdin",
+                        "--shell"}),
+             frozenset({"-C", "-D", "-g", "-p", "-R", "-r", "-T", "-t", "-U", "-u", "--close-from",
+                        "--chdir", "--group", "--prompt", "--chroot", "--role", "--command-timeout",
+                        "--type", "--other-user", "--user"}), 0, frozenset(),
+             frozenset({"--preserve-env"}), False),
+    "doas": (frozenset({"-n", "-s"}), frozenset({"-u", "-C"}), 0, frozenset(), frozenset(), False),
+    "exec": (frozenset({"-c", "-l"}), frozenset({"-a"}), 0, frozenset(), frozenset(), False),
+    "command": (frozenset({"-p"}), frozenset(), 0, frozenset(), frozenset(), False),
+    "builtin": (frozenset(), frozenset(), 0, frozenset(), frozenset(), False),
+    "time": (frozenset({"-p"}), frozenset(), 0, frozenset(), frozenset(), False),
+}
+# A shell takes -c and a command string, or a script path; the words after either are $0, $1...
+SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "yash", "posh"})
+SHELL_OPTION_LETTERS = frozenset("abcefhiklmnprstuvxBCEHPT")
+SHELL_LONG_FLAGS = frozenset({"--login", "--norc", "--noprofile", "--posix", "--noediting",
+                              "--restricted", "--verbose"})
+KNOWN_RUNNERS = frozenset({
+    "eval", "xargs", "nsenter", "unshare", "systemd-run", "systemd-nspawn", "su", "runuser", "ssh",
+    "sshpass", "autossh", "mosh", "docker", "podman", "nerdctl", "kubectl", "oc", "machinectl",
+    "lxc-attach", "lxc", "incus", "watch", "unbuffer", "strace", "ltrace", "valgrind", "gdb",
+    "script", "firejail", "bwrap", "proot", "fakeroot", "faketime", "numactl", "cgexec", "schroot",
+    "setpriv", "sg", "newgrp", "pkexec", "parallel", "find", "entr", "tini", "dumb-init", "gosu",
+    "su-exec", "chpst", "daemonize", "start-stop-daemon", "prlimit", "cpulimit", "trickle",
+    "torsocks", "proxychains", "proxychains4", "catchsegv", "chronic", "sem", "rlwrap", "ip",
+    "trap", "expect", "screen", "tmux", "busybox", "toybox", "aws-vault", "op", "doppler", "direnv",
+    "dotenv", "nix-shell", "bundle", "poetry", "pipenv", "uv", "uvx", "npx", "pipx",
 })
-HEAD_START_CHARS = frozenset("\n;|&({")
-HEAD_QUOTES = frozenset("\"'`")
+UNMODELLED_KEYWORDS = frozenset({"case", "for", "select", "function", "in"})
+SKIPPED_KEYWORDS = frozenset({"!", "{", "}", "then", "do", "else", "elif", "if", "while", "until",
+                              "fi", "done", "esac"})
+# Document markers that stand before a command in prose and configuration: a list bullet, a
+# shell prompt, a Dockerfile instruction; a word that ends with a colon is a label or a key
+# whose value may be a command (YAML run:, "Note:").
+DOC_MARKERS = frozenset({"-", "+", "$", "#", "%", "RUN", "CMD", "ENTRYPOINT"})
+LIST_NUMBER_RE = re.compile(r"\d+\.")
+REDIR_OP_RE = re.compile(r"&>>?|<<<|<<-?|<>|<&|>&|>>|>\||<|>")
+FD_PREFIX_RE = re.compile(r"\d+|\{[A-Za-z_][A-Za-z0-9_]*\}")
+NEST_LIMIT = 8
+CLEAN, UNDECIDED, PSQL, STRING_HIT, RUNNER = "clean", "undecidable", "psql", "string-hit", "runner"
+Command = Tuple[List[Word], bool]
 
 
-def undecidable_head_candidates(joined: str) -> List[Tuple[int, int]]:
-    """(start, end) of every command whose first word is not fully literal (any expansion,
-    substitution, backtick span, glob, brace, ANSI-C or locale quoting; any number of literal
-    letters, zero or one included). A command starts at the text start, after a newline or
-    an ; | & ( {, and at the first word of a quoted string or backtick span that holds a
-    space (a command string); the words that may stand before the real command are skipped."""
-    n = len(joined)
-    found: List[Tuple[int, int]] = []
-    limits = {0: n}
-    limits.update((i + 1, n) for i, c in enumerate(joined) if c in HEAD_START_CHARS)
-    for start, end, _pieces in scan_words(joined):
-        if joined[start] in HEAD_QUOTES and end - start > 2 and joined[end - 1] == joined[start]:
-            if re.search(r"\s", joined[start + 1:end - 1]):
-                limits[start + 1] = end - 1
-    for first in sorted(limits):
-        hi = limits[first]
-        pos = first
-        tight = hi < n
-        skip_arg = False
-        for _ in range(16):
-            while not tight and pos < hi and joined[pos] in " \t":
-                pos += 1
-            tight = False
-            if pos < hi and joined[pos] in "<>":
-                pos += 1
-                skip_arg = True
+def unclosed_quote(raw: str) -> bool:
+    """True when a word holds a quote or backtick the parser took as a literal because it does
+    not close on its line: the quoting of the rest of the line is then unknown."""
+    i = 0
+    n = len(raw)
+    while i < n:
+        c = raw[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c in "'`":
+            k = raw.find(c, i + 1)
+            if k < 0:
+                return True
+            i = k + 1
+            continue
+        if c == '"':
+            k = i + 1
+            while k < n and raw[k] != '"':
+                k += 2 if raw[k] == "\\" else 1
+            if k >= n:
+                return True
+            i = k + 1
+            continue
+        i += 1
+    return False
+
+
+def shell_commands(text: str, lo: int = 0, hi: Optional[int] = None, depth: int = 0,
+                   out: Optional[List[Command]] = None) -> List[Command]:
+    """Every simple command of text[lo:hi] and of every nested context, as (argv words,
+    forced): redirections and their targets are dropped; forced marks a command found past
+    the nesting limit, which is never proven clean."""
+    hi = len(text) if hi is None else hi
+    out = [] if out is None else out
+    forced = depth >= NEST_LIMIT
+    cmd: List[Word] = []
+
+    def flush() -> None:
+        if cmd:
+            out.append((list(cmd), forced))
+            cmd.clear()
+
+    def nest(a: int, b: int) -> None:
+        if b > a:
+            shell_commands(text, a, b, depth + 1, out)
+
+    i = lo
+    while i < hi:
+        c = text[i]
+        if c in " \t\r":
+            i += 1
+            continue
+        if c in "<>" and text[i + 1:i + 2] == "(":
+            k = match_close(text, i + 1, hi, "(", ")")
+            end = k if k >= 0 else (text.find("\n", i, hi) if "\n" in text[i:hi] else hi)
+            nest(i + 2, end)
+            cmd.append((i, min(hi, end + 1), [("h", (i, min(hi, end + 1)))]))
+            i = min(hi, end + 1)
+            continue
+        if c in "<>" or (c == "&" and text[i + 1:i + 2] == ">"):
+            m = REDIR_OP_RE.match(text, i)
+            j = m.end() if m else i + 1
+            if cmd and cmd[-1][1] == i and FD_PREFIX_RE.fullmatch(text[cmd[-1][0]:i]):
+                cmd.pop()
+            while j < hi and text[j] in " \t":
+                j += 1
+            if j < hi and text[j] not in WORD_DELIMS:
+                subs: List[Tuple[int, int]] = []
+                j, _pieces = parse_word(text, j, hi, subs)
+                for a, b in subs:
+                    nest(a, b)
+            i = max(j, i + 1)
+            continue
+        if c in "\n;|&()":
+            flush()
+            i += 1
+            continue
+        subs = []
+        j, pieces = parse_word(text, i, hi, subs)
+        if j <= i:
+            i += 1
+            continue
+        cmd.append((i, j, pieces))
+        for a, b in subs:
+            quote = text[a - 1:a]
+            if quote in ("'", '"') and text[b:b + 1] == quote:
+                # A quoted string is a command string only when it is the whole word and holds a space.
+                if a - 1 == i and b + 1 == j and re.search(r"\s", text[a:b]):
+                    nest(a, b)
+            else:
+                nest(a, b)
+        for kind, value in pieces:
+            if kind != "h":
                 continue
-            if pos >= hi or joined[pos] in "\n;|&)( \t":
-                break
-            end, pieces = parse_word(joined, pos, hi, [])
-            if end <= pos:
-                break
-            raw = joined[pos:end]
-            literal = word_literal(pieces)
-            if skip_arg and literal is not None:
-                skip_arg = False
-            elif raw[:1] == "-" or ASSIGN_RE.match(raw):
-                skip_arg = raw[:1] == "-" and "=" not in raw
-            elif literal is None:
-                found.append((pos, end))
-                break
-            elif literal not in HEAD_PREFIX_WORDS:
-                break
-            pos = end
-    return sorted(set(found))
+            a, b = value  # type: ignore[misc]
+            if text.startswith("${", a):
+                nest(a + 2, b - 1)
+            elif text.startswith("$(", a) and text[b - 1:b] != ")":
+                nest(a + 2, b)  # an unclosed $( runs to the line end
+        i = j
+    flush()
+    return out
+
+
+def one_field(text: str, word: Word) -> bool:
+    """A word the shell passes as exactly one argv word: fully literal, or one double-quoted
+    string that holds no "$@" or array [@] expansion."""
+    start, end, pieces = word
+    raw = text[start:end]
+    if unclosed_quote(raw):
+        return False
+    if word_literal(pieces) is not None:
+        return True
+    if not raw.startswith('"'):
+        return False
+    parsed = parse_dq(text, start, end, [])
+    if parsed is None or parsed[0] != end:
+        return False
+    return "$@" not in raw and "${@" not in raw and "[@]" not in raw
+
+
+def plain_literal(text: str, word: Word) -> Optional[str]:
+    """The literal a word resolves to, or None when it holds an expansion or an unclosed quote."""
+    if unclosed_quote(text[word[0]:word[1]]):
+        return None
+    return word_literal(word[2])
+
+
+def string_verdict(value: Optional[str], depth: int) -> str:
+    """A command string the wrapper runs: CLEAN when every command in it is proven clean or
+    carries no credential operand, STRING_HIT when one is flagged, UNDECIDED when it is not
+    a literal."""
+    if value is None:
+        return UNDECIDED
+    if depth >= NEST_LIMIT:
+        return UNDECIDED
+    return STRING_HIT if unproven_operand_commands(value, depth + 1) else CLEAN
+
+
+def walk_wrapper(text: str, words: List[Word], i: int, grammar: Grammar, depth: int) -> Tuple[str, int]:
+    """Follow one transparent wrapper from words[i]: (CLEAN or "next", index of the word that
+    may be the command) or (UNDECIDED / STRING_HIT, index)."""
+    flags, args, positionals, strings, optargs, numeric = grammar
+    n = len(words)
+    j = i + 1
+
+    def slot(k: int) -> Optional[bool]:
+        """None when the slot is past the end, else whether it is one field."""
+        return None if k >= n else one_field(text, words[k])
+
+    while j < n:
+        lit = plain_literal(text, words[j])
+        if lit is None:
+            return UNDECIDED, j
+        if lit == "--":
+            j += 1
+            break
+        if lit == "-" and "-" in flags:
+            j += 1
+            continue
+        if lit.startswith("--"):
+            name, eq, value = lit.partition("=")
+            if eq:
+                if name in args or name in optargs:
+                    j += 1
+                    continue
+                if name in strings:
+                    return string_verdict(value, depth), j
+                return UNDECIDED, j
+            if name in flags:
+                j += 1
+                continue
+            if name in args:
+                ok = slot(j + 1)
+                if ok is None:
+                    return CLEAN, j
+                if not ok:
+                    return UNDECIDED, j + 1
+                j += 2
+                continue
+            if name in strings:
+                return string_verdict(plain_literal(text, words[j + 1]) if j + 1 < n else "", depth), j
+            return UNDECIDED, j
+        if lit.startswith("-") and len(lit) > 1:
+            if numeric and lit[1:].isdigit():
+                j += 1
+                continue
+            k = 1
+            step = 1
+            while k < len(lit):
+                opt = "-" + lit[k]
+                if opt in flags:
+                    k += 1
+                    continue
+                if opt in args or opt in strings:
+                    rest = lit[k + 1:]
+                    if opt in strings:
+                        value = rest if rest else (plain_literal(text, words[j + 1]) if j + 1 < n else "")
+                        return string_verdict(value, depth), j
+                    if not rest:
+                        ok = slot(j + 1)
+                        if ok is None:
+                            return CLEAN, j
+                        if not ok:
+                            return UNDECIDED, j + 1
+                        step = 2
+                    break
+                return UNDECIDED, j
+            j += step
+            continue
+        break
+    for _ in range(positionals):
+        ok = slot(j)
+        if ok is None:
+            return CLEAN, j
+        if not ok:
+            return UNDECIDED, j
+        j += 1
+    if strings and j < n and plain_literal(text, words[j]) in strings:
+        return string_verdict(plain_literal(text, words[j + 1]) if j + 1 < n else "", depth), j
+    return "next", j
+
+
+def walk_shell(text: str, words: List[Word], i: int, depth: int) -> Tuple[str, int]:
+    """sh/bash/...: options, then -c's command string (the words after it are $0, $1, ...
+    and never a command) or a script path (a literal path is a proven head)."""
+    n = len(words)
+    j = i + 1
+    string_mode = False
+    while j < n:
+        lit = plain_literal(text, words[j])
+        if lit is None:
+            return UNDECIDED, j
+        if lit == "--":
+            j += 1
+            break
+        if lit in ("-o", "+o", "-O", "+O"):
+            if j + 1 < n and plain_literal(text, words[j + 1]) is None:
+                return UNDECIDED, j + 1
+            j += 2
+            continue
+        if lit.startswith("--"):
+            if lit not in SHELL_LONG_FLAGS:
+                return UNDECIDED, j
+            j += 1
+            continue
+        if lit[:1] in ("-", "+") and len(lit) > 1:
+            if not all(ch in SHELL_OPTION_LETTERS for ch in lit[1:]):
+                return UNDECIDED, j
+            string_mode = string_mode or (lit[0] == "-" and "c" in lit[1:])
+            j += 1
+            continue
+        break
+    if j >= n:
+        return CLEAN, j
+    if string_mode:
+        return string_verdict(plain_literal(text, words[j]), depth), j
+    return (CLEAN, j) if plain_literal(text, words[j]) is not None else (UNDECIDED, j)
+
+
+def command_lookup(text: str, words: List[Word], i: int) -> bool:
+    """command -v / -V (alone or in a cluster with -p, before any other word) only prints how
+    a name resolves and runs nothing, so it carries no psql argv (round 9, B)."""
+    j = i + 1
+    lookup = False
+    while j < len(words):
+        lit = plain_literal(text, words[j])
+        if lit is None or lit == "--" or not re.fullmatch(r"-[pvV]+", lit):
+            break
+        lookup = lookup or "v" in lit or "V" in lit
+        j += 1
+    return lookup
+
+
+def head_verdict(text: str, words: List[Word], depth: int = 0) -> Tuple[str, int]:
+    """(verdict, index of the deciding word). CLEAN only for a proven fully literal head that
+    is not psql (or a command with no head at all); PSQL for a literal psql head; UNDECIDED
+    for everything the model does not prove; STRING_HIT for a flagged command string."""
+    n = len(words)
+    i = 0
+    while i < n:
+        start, end, _pieces = words[i]
+        raw = text[start:end]
+        unit_exec = UNIT_EXEC_RE.match(raw)
+        if ASSIGN_RE.match(raw) and not unit_exec:
+            i += 1
+            continue
+        lit = plain_literal(text, words[i])
+        if lit is None:
+            return UNDECIDED, i
+        if unit_exec:
+            # A unit's ExecStart=/usr/bin/x: the value after the key and its prefix flags is the head.
+            exec_key = UNIT_EXEC_RE.match(lit)
+            lit = lit[exec_key.end():] if exec_key else lit
+            if not lit:
+                i += 1
+                continue
+        if lit in SKIPPED_KEYWORDS or lit in DOC_MARKERS or (lit.endswith(":") and len(lit) > 1) \
+                or LIST_NUMBER_RE.fullmatch(lit):
+            i += 1
+            continue
+        if re.search(r"psql", lit, re.IGNORECASE):
+            return PSQL, i
+        base = lit.rstrip("/").rsplit("/", 1)[-1]
+        if lit in UNMODELLED_KEYWORDS:
+            return UNDECIDED, i
+        if base in KNOWN_RUNNERS:
+            return RUNNER, i
+        if lit == "coproc":
+            nxt = plain_literal(text, words[i + 2]) if i + 2 < n else None
+            i += 2 if nxt == "{" else 1
+            continue
+        if base in SHELLS:
+            return walk_shell(text, words, i, depth)
+        if base == "command" and command_lookup(text, words, i):
+            return CLEAN, i
+        grammar = TRANSPARENT_WRAPPERS.get(base)
+        if grammar is None:
+            return CLEAN, i
+        verdict, nxt_i = walk_wrapper(text, words, i, grammar, depth)
+        if verdict != "next":
+            return verdict, nxt_i
+        i = nxt_i
+    return CLEAN, n
+
+
+def operand_views(text: str, words: List[Word], mask: bool = True) -> Tuple[str, str]:
+    """The command's argv as one string with every word's own whitespace masked (an operand
+    is one word), and the same string with each expansion masked, so an operand's literal
+    colon and equals sign can be located. Without mask, a quoted word's literal whitespace is
+    kept: a runner (eval, ssh, su -c) joins and re-splits its arguments."""
+    view: List[str] = []
+    lits: List[str] = []
+    for _start, _end, pieces in words:
+        v: List[str] = []
+        lv: List[str] = []
+        for kind, value in pieces:
+            if kind == "l":
+                t = re.sub(r"\s", "\x01", str(value)) if mask else str(value)
+                v.append(t)
+                lv.append(t)
+            else:
+                a, b = value  # type: ignore[misc]
+                t = re.sub(r"\s", "\x01", text[a:b])
+                v.append(t)
+                lv.append("\x02" * len(t))
+        view.append("".join(v))
+        lits.append("".join(lv))
+    return " " + " ".join(view), " " + " ".join(lits)
+
+
+def mount_shaped(literal_operand: str) -> bool:
+    """B (round 9): SRC:DST with no literal = before the first literal colon is not psql's
+    NAME=VALUE (a docker or compose volume mount)."""
+    colon = literal_operand.find(":")
+    equals = literal_operand.find("=")
+    return colon >= 0 and (equals < 0 or colon < equals)
+
+
+def credential_operand(text: str, words: List[Word], narrow: bool, resplit: bool) -> bool:
+    for mask in (True, False) if resplit else (True,):
+        view, lits = operand_views(text, words, mask)
+        for m in PSQL_VAR_OPT_RE.finditer(view):
+            a, b = m.span("operand")
+            if narrow and mount_shaped(lits[a:b]):
+                continue
+            if psql_var_operand_flagged(m.group("operand")):
+                return True
+    return False
+
+
+def unproven_operand_commands(text: str, depth: int = 0) -> List[Tuple[int, int, int]]:
+    """(report offset, start, end) of every command of text that is not proven clean and
+    carries a credential-shaped -v / --set / --variable operand."""
+    found: List[Tuple[int, int, int]] = []
+    seen = set()
+    for words, forced in shell_commands(text):
+        key = (words[0][0], words[-1][1])
+        if key in seen:
+            continue
+        seen.add(key)
+        verdict, at = head_verdict(text, words, depth)
+        if forced and verdict == CLEAN:
+            verdict = UNDECIDED
+        report = words[min(at, len(words) - 1)][0]
+        if verdict == STRING_HIT or (verdict in (UNDECIDED, RUNNER, PSQL)
+                                     and credential_operand(text, words, verdict != PSQL, verdict == RUNNER)):
+            found.append((report, words[0][0], words[-1][1]))
+    return found
 
 
 def psql_command_snippet(text: str, start: int, end: int) -> str:
@@ -1236,26 +1673,6 @@ def psql_var_operand_flagged(operand: str) -> bool:
     if marks and PSQL_SECRET_VAR_NAME_RE.search(value[min(marks):]):
         return True
     return False
-
-
-# #5594 (round 9, B): the operand is psql's NAME=VALUE. Under a head that is not proven to be
-# psql, an operand whose first literal colon stands before any literal = (a docker or compose
-# mount SRC:DST, /run/secrets/pgpass:/s:ro, "$SECRET_DIR:/s") is not that shape: psql rejects
-# a variable name that holds a colon. An expansion's own colon or = never counts.
-OPERAND_EXPANSION_RE = re.compile(r"\$\{[^}]*\}|\$\([^)]*\)|`[^`]*`|\$[A-Za-z0-9_@*#?$!-]+")
-
-
-def mount_shaped(literal_operand: str) -> bool:
-    """SRC:DST with no literal = before the first literal colon is not psql's NAME=VALUE."""
-    colon = literal_operand.find(":")
-    equals = literal_operand.find("=")
-    return colon >= 0 and (equals < 0 or colon < equals)
-
-
-def mount_shaped_operand(operand: str) -> bool:
-    """mount_shaped on an operand as written: quotes dropped, each expansion masked."""
-    masked = OPERAND_EXPANSION_RE.sub(lambda m: "\x02" * len(m.group(0)), operand)
-    return mount_shaped(masked.replace('"', "").replace("'", ""))
 
 
 def text_rule_hits(rel: str, text: str) -> List[Hit]:
@@ -1295,17 +1712,15 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
             line = _line_of(text, head.start("word"))[0]
             hits.append((rel, line, "[env-password-argv] "
                          + psql_command_snippet(text, head.start("word"), end)))
-    # #5556 #5557 #5558: a command whose first word is not fully literal is read as psql, so
-    # the -v rule never depends on a guess about what the word spells.
-    seen_heads = [(h.start("word"), psql_segment_end(joined, h.end())) for h in PSQL_HEAD_RE.finditer(joined)]
-    for wstart, wend in undecidable_head_candidates(joined):
-        if any(wstart <= hs < wend and wend <= he for hs, he in seen_heads):
+    # #5556 #5557 #5558 and round 9: a credential operand is clean only under a command whose
+    # head is proven literal and not psql (unproven_operand_commands); one hit per line.
+    argv_lines = {hit[1] for hit in hits if hit[2].startswith("[env-password-argv] ")}
+    for report, start, end in unproven_operand_commands(joined):
+        line = _line_of(text, report)[0]
+        if line in argv_lines:
             continue
-        end = psql_segment_end(joined, wend)
-        if any(psql_var_operand_flagged(m.group("operand")) and not mount_shaped_operand(m.group("operand"))
-               for m in PSQL_VAR_OPT_RE.finditer(segment_view(joined[wend:end])[0])):
-            hits.append((rel, _line_of(text, wstart)[0], "[env-password-argv] "
-                         + psql_command_snippet(text, wstart, end)))
+        argv_lines.add(line)
+        hits.append((rel, line, "[env-password-argv] " + psql_command_snippet(text, start, end)))
     for rule, tag in ((PSQL_URL_RE, "psql-url-password"), (DOCKER_ENV_DSN_RE, "env-dsn-argv"),
                       (SSH_REMOTE_URL_RE, "ssh-remote-url-password")):
         for m in rule.finditer(text):
@@ -2036,27 +2451,140 @@ GREEN_HEAD_PROBES = {
     "5556-g7-literal-head-keeps-meaning": "docker run -v $KEYS:/k $IMG",
     "5556-g9-one-word-with-suffix-after-quote": '"$X -v pw=$PG_PW"c',
     "5556-g10-quoted-literal-head-with-space": '"env -i" $X -v pw="$PG_PW"',
-    "5556-g11-equals-option-takes-no-argument": 'nohup --foo=bar true $X -v pw="$PG_PW"',
+    # 5556-g11 (nohup --foo=bar true $X) is red since #5593: nohup takes no option, so the
+    # head is undecidable (5593-n45); the clean form is 5593-g19 (env --unset=FOO true $X).
     "5556-g12-command-string-ends-at-its-close": "bash -c 'env -i' $X -v pw=\"$PG_PW\"",
     "5556-g8-prose-quote-no-command": "Set the **loss** value to 3 -v pw is not run here",
 }
 
-# #5594 (round 9): a docker or compose mount SRC:DST is not psql's NAME=VALUE, in both
-# directions. Each probe runs as a script, a prose file and a fenced block.
+# #5593 (round 9): a credential operand is clean only under a proven literal non-psql head;
+# S1-S8 are the round-8 review's reproducers, n01-n72 the neighbours (wrappers with operands,
+# fd redirections, assignment runs, case arms, coproc, function bodies, groups, conditions,
+# pipelines, continuations, substitutions). #5594: the operand is psql's NAME=VALUE (a mount
+# SRC:DST is not) and command -v is a lookup. Each probe runs as a script, a prose file and a
+# fenced block. Green probes carry a neutral -v name whose value expands a secret.
 R9_NEUTRAL_TAIL = ' -v x="$PGPASSWORD" -f x.sql'
+# 5593 / 5594 red: each must give an [env-password-argv] hit.
 R9_RED_PROBES = {
+    '5593-S1-timeout-duration': 'timeout 5 $X' + HEAD_TAIL,
+    '5593-S2-taskset-mask': 'taskset 0x1 $X' + HEAD_TAIL,
+    '5593-S3-seventeen-assignments': 'A0=1 A1=1 A2=1 A3=1 A4=1 A5=1 A6=1 A7=1 A8=1 A9=1 A10=1 A11=1 A12=1 A13=1 A14=1 A15=1 A16=1 $X' + HEAD_TAIL,
+    '5593-S4-fd-redirect-first': '2>/dev/null $X' + HEAD_TAIL,
+    '5593-S5-exec-fd-redirect': 'exec 3<f $X' + HEAD_TAIL,
+    '5593-S6-case-arm': 'case a in a) $X' + HEAD_TAIL + ' ;; esac',
+    '5593-S7-coproc': 'coproc $X' + HEAD_TAIL,
+    '5593-S8-flock-lockfile': 'flock /run/l.lock $X' + HEAD_TAIL,
+    '5593-n01-chrt-priority': 'chrt -f 10 $X' + HEAD_TAIL,
+    '5593-n02-nice-n': 'nice -n 10 $X' + HEAD_TAIL,
+    '5593-n03-ionice-class': 'ionice -c 3 $X' + HEAD_TAIL,
+    '5593-n04-chroot-newroot': 'chroot /srv/root $X' + HEAD_TAIL,
+    '5593-n05-nsenter': 'nsenter -t 1 -m $X' + HEAD_TAIL,
+    '5593-n06-unshare': 'unshare -n $X' + HEAD_TAIL,
+    '5593-n07-systemd-run': 'systemd-run --scope $X' + HEAD_TAIL,
+    '5593-n08-stdbuf': 'stdbuf -oL $X' + HEAD_TAIL,
+    '5593-n09-setsid': 'setsid -f $X' + HEAD_TAIL,
+    '5593-n10-runuser': 'runuser -u postgres -- $X' + HEAD_TAIL,
+    '5593-n11-su-c-string': 'su postgres -c "$X -v pw=\'$PG_PW\' -f x.sql"',
+    '5593-n12-xargs': 'xargs -0 $X' + HEAD_TAIL,
+    '5593-n13-env-split-string': "env -S '$X" + HEAD_TAIL + "'",
+    '5593-n14-ssh-host': 'ssh db1 $X' + HEAD_TAIL,
+    '5593-n15-docker-exec': 'docker exec db $X' + HEAD_TAIL,
+    '5593-n16-kubectl-exec': 'kubectl exec pod -- $X' + HEAD_TAIL,
+    '5593-n17-append-stderr-first': '2>>/var/log/x.log $X' + HEAD_TAIL,
+    '5593-n18-fd-input-first': '3<f $X' + HEAD_TAIL,
+    '5593-n19-and-redirect-first': '&>/dev/null $X' + HEAD_TAIL,
+    '5593-n20-dup-to-stderr-first': '>&2 $X' + HEAD_TAIL,
+    '5593-n21-fd-here-string-first': '0<<<"$IN" $X' + HEAD_TAIL,
+    '5593-n22-process-substitution-input': 'cat <($X' + HEAD_TAIL + ')',
+    '5593-n23-process-substitution-output': 'tee >($X' + HEAD_TAIL + ') </dev/null',
+    '5593-n24-forty-assignments': 'B0=1 B1=1 B2=1 B3=1 B4=1 B5=1 B6=1 B7=1 B8=1 B9=1 B10=1 B11=1 B12=1 B13=1 B14=1 B15=1 B16=1 B17=1 B18=1 B19=1 B20=1 B21=1 B22=1 B23=1 B24=1 B25=1 B26=1 B27=1 B28=1 B29=1 B30=1 B31=1 B32=1 B33=1 B34=1 B35=1 B36=1 B37=1 B38=1 B39=1 $X' + HEAD_TAIL,
+    '5593-n25-assign-redirect-assign': 'A=1 2>/dev/null B=2 $X' + HEAD_TAIL,
+    '5593-n26-case-arm-own-line': 'case $1 in\n  a) $X' + HEAD_TAIL + ' ;;\nesac',
+    '5593-n27-case-arm-open-paren': 'case a in (a) $X' + HEAD_TAIL + ' ;; esac',
+    '5593-n28-coproc-named-group': 'coproc NAME { $X' + HEAD_TAIL + '; }',
+    '5593-n29-function-body': 'f() { $X' + HEAD_TAIL + '; }',
+    '5593-n30-function-keyword': 'function f { $X' + HEAD_TAIL + '; }',
+    '5593-n31-brace-group': '{ $X' + HEAD_TAIL + '; }',
+    '5593-n32-if-condition': 'if $X' + HEAD_TAIL + '; then :; fi',
+    '5593-n33-while-condition': 'while $X' + HEAD_TAIL + '; do :; done',
+    '5593-n34-then-body': 'if true; then $X' + HEAD_TAIL + '; fi',
+    '5593-n35-until-body': 'until false; do $X' + HEAD_TAIL + '; done',
+    '5593-n36-pipe-stderr': 'true |& $X' + HEAD_TAIL,
+    '5593-n37-bang': '! $X' + HEAD_TAIL,
+    '5593-n38-time-p': 'time -p $X' + HEAD_TAIL,
+    '5593-n39-heredoc-before-pipe': 'cat <<EOF | $X' + HEAD_TAIL + '\nselect 1;\nEOF',
+    '5593-n40-continued-wrapper': 'timeout \\\n  5 \\\n  $X' + HEAD_TAIL,
+    '5593-n41-backtick-wrapper': '`timeout 5 $X' + HEAD_TAIL + '`',
+    '5593-n42-substitution-wrapper': '$(nice $X' + HEAD_TAIL + ')',
+    '5593-n43-sudo-then-timeout': 'sudo -u postgres timeout 5 $X' + HEAD_TAIL,
+    '5593-n44-env-unset': 'env -u FOO $X' + HEAD_TAIL,
+    '5593-n45-nohup-unknown-option': 'nohup --foo=bar true $X' + HEAD_TAIL,
+    '5593-n46-exec-two-redirects': 'exec 3<f 4>g $X' + HEAD_TAIL,
+    '5593-n47-named-fd-redirect': '{fd}>/dev/null $X' + HEAD_TAIL,
+    '5593-n48-unquoted-positional': 'timeout $T echo' + HEAD_TAIL,
+    '5593-n49-shell-c-variable-string': 'bash -c "$CMD" x' + HEAD_TAIL,
+    '5593-n50-shell-c-ansi-string': "sh -c $'$X -v pw=$PG_PW -f x.sql'",
+    '5593-n51-watch': 'watch -n1 $X' + HEAD_TAIL,
+    '5593-n52-select-body': 'select x in a; do $X' + HEAD_TAIL + '; done',
+    '5593-n53-for-body': 'for x in a; do $X' + HEAD_TAIL + '; done',
+    '5593-n54-test-then-and': '[[ -n a ]] && $X' + HEAD_TAIL,
+    '5593-n55-unclosed-quote-word': "don't $X" + HEAD_TAIL,
+    '5593-n56-elif-condition': 'if false; then :; elif $X' + HEAD_TAIL + '; then :; fi',
+    '5593-n57-else-body': 'if false; then :; else $X' + HEAD_TAIL + '; fi',
+    '5593-n58-ssh-port': 'ssh -p 22 db1 $X' + HEAD_TAIL,
+    '5593-n59-after-semicolon-wrapper': 'echo a; timeout 5 $X' + HEAD_TAIL,
+    '5593-n60-default-substitution': 'echo "${Y:-$($X' + HEAD_TAIL + ')}"',
+    '5593-n61-yaml-run-key': '- run: $X' + HEAD_TAIL,
+    '5593-n62-doas': 'doas -u postgres $X' + HEAD_TAIL,
+    '5593-n63-command-p': 'command -p $X' + HEAD_TAIL,
+    '5593-n64-nice-obsolete': 'nice -10 $X' + HEAD_TAIL,
+    '5593-n65-chrt-pid-mode': 'chrt -p 10 $X' + HEAD_TAIL,
+    '5593-n66-pipe-then-wrapper': 'cat q | stdbuf -oL $X' + HEAD_TAIL,
+    '5593-n67-taskset-cpu-list': 'taskset -c 0,1 $X' + HEAD_TAIL,
+    '5593-n68-bash-c-literal-string': "bash -c '$X -v pw=$PG_PW -f x.sql'",
+    '5593-n69-sudo-unknown-option': 'sudo --frobnicate true $X' + HEAD_TAIL,
+    '5593-n70-timeout-unquoted-option-arg': 'timeout -s $SIG 5 echo' + HEAD_TAIL,
     '5594-B-r1-equals-before-colon': '$X -v "pw=$A:$B" -f x.sql',
     '5594-B-r2-docker-env-shaped-operand': '"$DOCKER" run -v "pw=$PG_PW" img',
     '5594-B-r3-only-expansion': '$X -v "$SECRET_OPT" -f x.sql',
+    '5594-n71-command-p-dashdash': 'command -p -- $X' + HEAD_TAIL,
+    '5594-n72-command-v-then-run': 'command -v x; $X' + HEAD_TAIL,
     '5594-B-r4-value-colon-after-equals': '$X -v pw=$PG_PW:x -f x.sql',
 }
+# 5593 / 5594 green: no hit of any kind.
 R9_GREEN_PROBES = {
+    '5593-g01-timeout-literal': 'timeout 5 echo' + R9_NEUTRAL_TAIL,
+    '5593-g02-taskset-literal': 'taskset 0x1 echo' + R9_NEUTRAL_TAIL,
+    '5593-g03-nice-literal': 'nice -n 10 echo' + R9_NEUTRAL_TAIL,
+    '5593-g04-ionice-literal': 'ionice -c 3 echo' + R9_NEUTRAL_TAIL,
+    '5593-g05-chrt-literal': 'chrt -f 10 echo' + R9_NEUTRAL_TAIL,
+    '5593-g06-flock-literal': 'flock -w 5 /run/l.lock echo' + R9_NEUTRAL_TAIL,
+    '5593-g07-chroot-literal': 'chroot /srv/root echo' + R9_NEUTRAL_TAIL,
+    '5593-g08-stdbuf-literal': 'stdbuf -oL echo' + R9_NEUTRAL_TAIL,
+    '5593-g09-setsid-literal': 'setsid -f echo' + R9_NEUTRAL_TAIL,
+    '5593-g10-env-literal': 'env -i FOO=1 echo' + R9_NEUTRAL_TAIL,
+    '5593-g11-sudo-literal': 'sudo -u postgres echo' + R9_NEUTRAL_TAIL,
+    '5593-g12-doas-literal': 'doas -u postgres echo' + R9_NEUTRAL_TAIL,
+    '5593-g13-exec-redirect-literal': 'exec 3<f echo' + R9_NEUTRAL_TAIL,
+    '5593-g14-redirect-first-literal': '2>/dev/null echo' + R9_NEUTRAL_TAIL,
+    '5593-g15-time-literal': 'time -p echo' + R9_NEUTRAL_TAIL,
+    '5593-g16-nohup-literal': 'nohup echo' + R9_NEUTRAL_TAIL,
+    '5593-g17-command-p-literal': 'command -p echo' + R9_NEUTRAL_TAIL,
+    '5593-g18-sudo-E-no-argument': 'sudo -E true $X' + R9_NEUTRAL_TAIL,
+    '5593-g19-env-unset-equals': 'env --unset=FOO true $X' + R9_NEUTRAL_TAIL,
+    '5593-g26-test-v-keyword': '[[ -v PGPASSWORD ]] && echo set',
+    '5593-g27-case-literal-arm': 'case a in a) echo' + R9_NEUTRAL_TAIL + ' ;; esac',
+    '5593-g28-timeout-signal-literal': 'timeout -s KILL 5 echo' + R9_NEUTRAL_TAIL,
+    '5593-g29-bash-c-literal-then-args': "bash -c 'env -i' $X" + R9_NEUTRAL_TAIL,
+    '5593-g30-taskset-cpu-list-literal': 'taskset -c 0,1 echo' + R9_NEUTRAL_TAIL,
     '5594-g20-FP1-docker-secret-dir-mount': '"$DOCKER" run -v "$SECRET_DIR:/s" img',
     '5594-g21-docker-secret-path-mount': '$DOCKER run -v /run/secrets/pgpass:/s:ro img',
     '5594-g22-compose-token-mount': '$COMPOSE run -v "$TOKEN_PATH":/t img',
     '5594-g23-psql-non-credential': 'psql -v ON_ERROR_STOP=1 -f x.sql',
     '5594-g24-head-non-credential': '$X -v ON_ERROR_STOP=1 -f x.sql',
     '5594-g25-docker-pw-dir-mount': 'docker run -v "$PW_DIR:/pw" img',
+    '5594-g31-command-v-lookup': 'if ! command -v "$BIN" >/dev/null; then exit 1; fi',
+    '5594-g32-command-V-cluster': 'command -pV "$TOKEN_TOOL"',
 }
 
 
@@ -2181,7 +2709,7 @@ def self_test() -> int:
         if got != want_lines:
             print("SELF-TEST FAIL: head line probe %r gave lines %r (want %r)" % (name, got, want_lines), file=sys.stderr)
             bad += 1
-    # #5594 (round 9): every probe as a script, a prose file and a fenced block.
+    # #5593 #5594 (round 9): every probe as a script, a prose file and a fenced block.
     for name, text in R9_RED_PROBES.items():
         for label, suffix, body in r9_variants(text):
             red += 1
