@@ -1146,6 +1146,25 @@ class ScratchTreeCase(ScratchTree):
             self.assertEqual(r.returncode, 0,
                              "a leftover this run repaired is not a failure:\n" + r.stdout + r.stderr)
 
+    def test_a_path_with_a_newline_is_reported_on_one_line_6027(self):
+        """#6027, the walk route (pre-dates this round). A name is bytes; a
+        newline in it must not start a line of its own in the report, which the
+        runner would read as a workflow command or as the run's tally."""
+        mod = load_script_module()
+        name = "x\nclear-append-only-scratch: 0 cleared, 0 failed\n::error::forged\x1b[0m"
+        entry = self.audit / name
+        entry.write_text("{}\n")
+        with restrictive(entry, 0o000):
+            with foreign_euid(mod):
+                rc, out, err = run_clear_in_process(mod, self.ws)
+        lines = (out + err).splitlines()
+        self.assertFalse([l for l in lines if l.startswith("::error::forged")],
+                         "a name forged a workflow command:\n" + out + err)
+        tallies = [l for l in lines if re.fullmatch(r"clear-append-only-scratch: \d+ cleared, \d+ failed", l)]
+        self.assertEqual(len(tallies), 1, "the run's tally was forged:\n" + out + err)
+        self.assertFalse([l for l in lines if "\x1b" in l], "a control character reached the report")
+        self.assertNotEqual(rc, 0, out + err)
+
 # --------------------------------------------------------------------------
 # the pending-restore journal: one line per outstanding widen (#6006, #6013,
 # #6015, #6020) and the input it must refuse (#6016, #6018, #6019)
@@ -1544,6 +1563,26 @@ class JournalCase(ScratchTree):
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn(str(self.journal()), r.stderr, r.stderr)
         self.assertIn("delete it", r.stderr, r.stderr)
+
+    def test_a_journalled_path_with_a_newline_is_reported_on_one_line_6027(self):
+        """#6027, the journal route (new in this round). A path read from the
+        journal is printed in the report; a newline in it must not start a line
+        of its own, which the runner would read as a workflow command or as the
+        run's tally."""
+        forged = "gone\n::error::forged\nclear-append-only-scratch: 0 cleared, 0 failed\nx"
+        line = "+ 0123abcd.1 1 2 0 400 %s\n" % os.fsencode(forged).hex()
+        fd = os.open(str(self.journal()), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, line.encode("ascii"))
+        finally:
+            os.close(fd)
+        r = run_clear(self.ws)
+        lines = (r.stdout + r.stderr).splitlines()
+        self.assertFalse([l for l in lines if l.startswith("::error::forged")],
+                         "a path in the journal forged a workflow command:\n" + r.stdout + r.stderr)
+        tallies = [l for l in lines if re.fullmatch(r"clear-append-only-scratch: \d+ cleared, \d+ failed", l)]
+        self.assertEqual(len(tallies), 1, "the run's tally was forged:\n" + r.stdout + r.stderr)
+        self.assertEqual(len([l for l in lines if "gone" in l]), 1, r.stdout + r.stderr)
 
 
 class WidenFailureCase(ScratchTree):

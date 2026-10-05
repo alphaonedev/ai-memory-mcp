@@ -376,12 +376,23 @@ jobs:
                                                       "tree; its mode is not %s" % (st.st_nlink, change))
 
 
+          # Every C0 and C1 control character, DEL and the two Unicode line separators,
+          # each as a visible escape. A name may hold any of them, and a report line is
+          # read by the runner: a newline would start a line of its own - a workflow
+          # command, a forged tally - and an escape sequence would rewrite what the log
+          # shows (#6027).
+          _UNPRINTABLE = dict((code, "\\x%02x" % code) for code in list(range(0x20)) + list(range(0x7f, 0xa0)))
+          _UNPRINTABLE.update({0x2028: "\\u2028", 0x2029: "\\u2029"})
+
+
           def _shown(text, stream):
-              """`text` as `stream` can print it. A path is bytes, not text: a name that
-              is not UTF-8 arrives with surrogate escapes, and printing one to a strict
-              stream would crash the report it belongs in (#6016)."""
+              """`text` as `stream` can print it, on one line. A path is bytes, not text:
+              a name that is not UTF-8 arrives with surrogate escapes, and printing one
+              to a strict stream would crash the report it belongs in (#6016); a name
+              with a control character in it is shown with that character escaped
+              (#6027)."""
               encoding = getattr(stream, "encoding", None) or "utf-8"
-              return text.encode(encoding, "backslashreplace").decode(encoding)
+              return text.translate(_UNPRINTABLE).encode(encoding, "backslashreplace").decode(encoding)
 
 
           class Widener:
