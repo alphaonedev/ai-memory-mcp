@@ -110,11 +110,16 @@ image.  The mutation legs at the bottom prove the reader is not vacuous: each
 mutant of the LIVE workflow files must be rejected, and the unmutated control
 must be accepted first.
 
-PyYAML 6.0.1 (yaml.SafeLoader) stood in for GitHub's own workflow parser in the
-round-4 differential, which ran outside this file: 20,000 seeded mutations of the
-live files at seed 5665 and 20,000 at seed 5666, plus the named_cells() below as
-fixed cases, gave 0 disagreements and 0 live files refused.  Where GitHub's parser
-and PyYAML differ, that probe does not see it.
+PyYAML 6.0.1 (yaml.SafeLoader) stood in for GitHub's own workflow parser in a
+differential that runs outside this file (PR #5665 rounds 4 to 7): 20,000 seeded
+mutations of the live files at seed 5665 and 20,000 at seed 5666, plus the named
+cells of that round as fixed cases.  Each run gave 0 disagreements and 0 of 20
+live files refused: round 4 at 528c2195 ran 15 named cells, round 5 at 0e5758dc
+ran 16, round 6 at 3d953877 ran 22 and round 7 ran 38 (at 1452e37f, 16 refused
+by this reader and 22 read the same as PyYAML).  The differential compares
+parse_triggers() with yaml.SafeLoader only: it never calls violations(),
+filter_matches() or glob_match(), so it is no evidence on how a branches pattern
+is matched.  Where GitHub's parser and PyYAML differ, it does not see it.
 
 Run:  python3 scripts/test/test_workflow_pr_triggers_5447.py
 """
@@ -900,15 +905,18 @@ def _replace_once(text: str, old: str, new: str) -> str:
 
 
 def named_cells() -> List[Tuple[str, str, str]]:
-    """(name, text, refusal reason) for each known-bad shape of PR #5665 rounds 3 to 6.
+    """(name, text, refusal reason) for each known-bad shape of PR #5665 rounds 3 to 7.
 
     Sixteen cells are reproducers from the round-3 review (F1 #5730, F2 #5731, F3
     #5732), from the round-4 differential (#5733-#5736, #5748-#5750) or from the
     round-4 review (F2, an indented first row, #5777).  Six are the class items of
-    round 6 (#5853, #5854); PyYAML 6.0.1 reads each as the same plain string the
-    reader hands to the glob.  The
-    test below runs every cell each time; the round-4 PyYAML probe runs the same
-    cells as fixed cases beside its seeded random ones.
+    round 6 (#5853, #5854).  Sixteen are the pattern items of round 7 (#5943,
+    #5856, #5857).  PyYAML 6.0.1 reads each round-6 and round-7 item as the same
+    plain string the reader hands to the glob.  The test below runs every cell
+    each time.  The PyYAML differential of each round ran the cells that existed
+    then as fixed cases (see the module docstring); it compares parse_triggers()
+    only, so for the round-6 and round-7 cells, which are refused by the glob and
+    not by the parse, it checks the item text and not the refusal.
     """
     jobs = "jobs:\n  a:\n    runs-on: x\n"
     ci = _replace_once(load_all()["ci.yml"], '    branches: [main, develop, "release/**", "rehearsal/**"]\n',
@@ -973,7 +981,7 @@ def named_cells() -> List[Tuple[str, str, str]]:
 
 
 class NamedCells5665(unittest.TestCase):
-    """Every named known-bad cell is refused with its own reason (rounds 3 to 6)."""
+    """Every named known-bad cell is refused with its own reason (rounds 3 to 7)."""
 
     def test_5665_named_cells_refused(self) -> None:
         cells = named_cells()
@@ -2455,6 +2463,43 @@ class GlobDocTruth5944(unittest.TestCase):
         for ch in "aZ7._/-":
             self.assertTrue(glob_match("x" + ch, "x" + ch), ch)
             self.assertFalse(glob_match("x" + ch, "xq" if ch != "q" else "xr"), ch)
+
+
+class DifferentialTruth5945(unittest.TestCase):
+    """#5945: the stated PyYAML differential runs name their cells and their limit.
+
+    Measured at 3d953877: the module docstring said the round-4 differential ran
+    "the named_cells() below" (22 cells at that tip; round 4 ran 15) and neither it
+    nor the named_cells docstring said the differential never reads a pattern.
+    """
+
+    def _doc(self) -> str:
+        return " ".join((sys.modules[__name__].__doc__ or "").split())
+
+    def test_5945_each_stated_run_names_its_cell_count(self) -> None:
+        doc = self._doc()
+        self.assertNotIn("plus the named_cells() below as fixed cases", doc)
+        for run in ("round 4 at 528c2195 ran 15 named cells", "round 5 at 0e5758dc ran 16",
+                    "round 6 at 3d953877 ran 22", "round 7 ran " + str(len(named_cells()))):
+            self.assertIn(run, doc)
+
+    def test_5945_the_parse_only_limit_is_stated(self) -> None:
+        doc = self._doc()
+        self.assertIn("compares parse_triggers() with yaml.SafeLoader only", doc)
+        self.assertIn("never calls violations(), filter_matches() or glob_match()", doc)
+        cells = " ".join((named_cells.__doc__ or "").split())
+        self.assertNotIn("the round-4 PyYAML probe runs the same cells", cells)
+        self.assertIn("parse_triggers()", cells)
+
+    def test_5945_cell_rounds_add_up(self) -> None:
+        names = [n for n, _t, _w in named_cells()]
+        self.assertEqual(16, sum(1 for n in names if not n.startswith(("R6-", "R7-"))))
+        self.assertEqual(6, sum(1 for n in names if n.startswith("R6-")))
+        self.assertEqual(16, sum(1 for n in names if n.startswith("R7-")))
+        cells = " ".join((named_cells.__doc__ or "").split())
+        self.assertIn("Sixteen cells are reproducers", cells)
+        self.assertIn("Six are the class items of round 6", cells)
+        self.assertIn("Sixteen are the pattern items of round 7", cells)
 
 
 class GlobSemantics5447(unittest.TestCase):
