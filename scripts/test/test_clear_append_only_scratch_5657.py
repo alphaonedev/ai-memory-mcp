@@ -694,9 +694,9 @@ class ScratchTreeCase(unittest.TestCase):
             self.assertEqual(os.lstat(victim).st_ctime_ns, untouched,
                              "an inode outside the scratch tree was chmod'ed and then put back")
 
-    def test_a_replaced_entry_is_refused_with_nothing_widened_5657(self):
-        """#5812, the deliberate refusal path. The entry is replaced by a
-        different inode before the widen; the janitor must notice and refuse,
+    def test_a_replaced_entry_is_refused_with_nothing_widened_5852(self):
+        """#5852, the pre-chmod half of the bracket. The entry is replaced by
+        a different inode before the widen; the janitor must notice and refuse,
         and the inode that is left standing in the tree must not have been
         widened on the way out."""
         mod = load_script_module()
@@ -715,9 +715,9 @@ class ScratchTreeCase(unittest.TestCase):
                              "the replacement inode was left widened by a refusal")
             self.assertNotEqual(rc, 0, "a replaced entry is not a pass:\n" + out + err)
 
-    def test_a_widened_mode_is_restored_when_the_reopen_fails_5657(self):
-        """#5812, the other exit. The widen lands on the right inode, and only
-        THEN is the name replaced, so the reopen fails.
+    def test_a_widened_mode_is_restored_or_reported_when_the_reopen_fails_5812(self):
+        """#5812, the post-chmod half. The widen lands on the right inode,
+        and only THEN is the name replaced, so the reopen fails.
 
         What happens next is not the same on both legs, and this test used to
         assert only the stronger half - which is why it was green where the
@@ -1171,8 +1171,8 @@ class StructuralPinCase(unittest.TestCase):
         raises the failure it came from. Whether the attempt REACHES the inode
         that was widened is a runtime property of the platform, and only the
         leg that can pin an inode delivers it - that half is pinned behaviourally
-        by `test_a_widened_mode_is_restored_when_the_reopen_fails_5657`, which
-        is split by platform for exactly this reason (#5852)."""
+        by `test_a_widened_mode_is_restored_or_reported_when_the_reopen_fails_5812`,
+        which is split by platform for exactly this reason (#5852)."""
         node = _named_def(self.tree, "_open_at")
         handlers = [
             h for h in ast.walk(node)
