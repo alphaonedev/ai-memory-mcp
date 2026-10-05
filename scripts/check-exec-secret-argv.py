@@ -543,12 +543,12 @@ def deny_lines(dl, rel: str, text: str) -> Dict[int, str]:
 # whatever the variable is called, so such a line is never allow-able (pending + issue only).
 CRED_TOOL_RE = re.compile(
     # mysql family: -p glued to the value, or --password with a space or an equals sign (#4920). Every
-    # client accepts each unique prefix from --pas up, with an optional --loose- prefix. --pa is a
+    # client accepts each unique prefix from --pas up, with an optional loose prefix and a - or _ after it (#5582). --pa is a
     # unique prefix of --password in the dump and admin tools but ambiguous with --pager in the
     # interactive mysql and mariadb clients (the first arm excludes it; mariadb-dump and mariadb-admin
     # also match the first arm at the word boundary, and the second arm reads their --pa) (#5464, #5502).
-    r"\b(?:mysql|mariadb)\b[^|;&]*\s(?:-p|--(?:loose-)?pas(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?(?![\w-])[\s=]*)[\"']?(?:\$|`)"
-    r"|\b(?:mysqladmin|mysqldump|mariadb-admin|mariadb-dump)\b[^|;&]*\s(?:-p|--(?:loose-)?pa(?:s(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?)?(?![\w-])[\s=]*)[\"']?(?:\$|`)"
+    r"\b(?:mysql|mariadb)\b[^|;&]*\s(?:-p|--(?:loose[-_])?pas(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?(?![\w-])[\s=]*)[\"']?(?:\$|`)"
+    r"|\b(?:mysqladmin|mysqldump|mariadb-admin|mariadb-dump)\b[^|;&]*\s(?:-p|--(?:loose[-_])?pa(?:s(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?)?(?![\w-])[\s=]*)[\"']?(?:\$|`)"
     r"|\bsshpass\s+-p\s*[\"']?(?:\$|`)"
     r"|\bredis-cli\b[^|;&]*\s(?:-a|--pass(?![\w-]))[\s=]*[\"']?(?:\$|`)"
     # one shell word after the flag that expands a variable, however its user part is quoted:
@@ -1550,6 +1550,13 @@ ROUND3_RED = [
     ("5502 mysqldump --loose-pa", 'mysqldump --loose-pa="$DB_PASSWORD" db'),
     ("5502 mariadb --loose-password", 'mariadb --loose-password="$DB_PASSWORD" db'),
     ("5502 mysqladmin --loose-passw backtick", 'mysqladmin --loose-passw=`cat f` status'),
+    # the loose_ underscore spelling: my_getopt reads the special prefix loose followed by - or _ (#5582)
+    ("5582 mysql --loose_pas", 'mysql --loose_pas="$DB_PASSWORD" db'),
+    ("5582 mysqldump --loose_pa", 'mysqldump --loose_pa="$DB_PASSWORD" db'),
+    ("5582 mariadb --loose_password", 'mariadb --loose_password="$DB_PASSWORD" db'),
+    ("5582 mysqladmin --loose_passw backtick", 'mysqladmin --loose_passw=`cat f` status'),
+    ("5582 mariadb-dump --loose_pa", 'mariadb-dump --loose_pa=$DB_PASSWORD db'),
+    ("5582 mysql --loose_pass space", 'mysql -u r --loose_pass "$X" db'),
     ("5464 mysqladmin --passw= glued", 'mysqladmin --passw=$X status'),
     ("5464 mysqldump --passwo space", 'mysqldump --passwo $X db'),
     ("5464 mariadb --passwor= glued", 'mariadb --passwor="$X" db'),
@@ -1633,6 +1640,9 @@ ROUND3_GREEN = [
     ("5464 mysql --pass-file is not --pass", 'mysql -u r --pass-file="$PW_FILE" db'),
     ("5502 mariadb --pa is ambiguous, not --password", 'mariadb -u r --pa="$X" db'),
     ("5502 mysql --loose-pa is ambiguous, not --password", 'mysql --loose-pa="$X" db'),
+    ("5582 mysql --loose_pa is ambiguous, not --password", 'mysql --loose_pa="$X" db'),
+    ("5582 mysqldump --loose_password-file is not --password", 'mysqldump --loose_password-file="$PW_FILE" db'),
+    ("5582 mysql --loose_pager is not --password", 'mysql --loose_pager="$PAGER_CMD" db'),
     ("5502 mysqldump --pass-file is not --pass", 'mysqldump --pass-file="$PW_FILE" db'),
     ("5502 mariadb-dump --loose-password-file is not --password", 'mariadb-dump --loose-password-file="$PW_FILE" db'),
     ("redis-cli --pass-file is not --pass", 'redis-cli --pass-file "$PW_FILE" ping'),
