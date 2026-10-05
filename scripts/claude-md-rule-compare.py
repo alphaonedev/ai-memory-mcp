@@ -664,17 +664,23 @@ def _self_test_cases() -> int:
         enc = plant_probe("encodings", base_dir / "implant", [])
         if not (enc.preloaded and not enc.planted_ran and enc.ok):
             return "a preloaded module's planted file ran, or the child did not report it preloaded"
-        # #5441: -E keeps the child independent of PYTHON* variables; PYTHONSAFEPATH=1 (3.11+) would drop the
-        # script directory from sys.path and make the planted file inert while the child reports it shadowable.
-        if not plant_probe("importlib", base_dir / "implant", [], {**os.environ, "PYTHONSAFEPATH": "1"}).ok:
+        # #5441/#5475: with PYTHONSAFEPATH=1 in the environment the child, started with -E, must report safe_path 0
+        # and the planted file must behave as the child's verdict says.
+        safe = plant_probe("importlib", base_dir / "implant", [], {**os.environ, "PYTHONSAFEPATH": "1"})
+        if not safe.ok or safe.safe_path != 0:
             return "the probe child honours PYTHONSAFEPATH, so its result depends on the environment"
-        # Negative control: without -E the same variable makes the planted file inert on 3.11+, and the probe must
-        # say so (ok False); this shows the PYTHONSAFEPATH case above can fail, and that ok is not always True.
-        if sys.version_info >= (3, 11):
-            control = plant_probe("importlib", base_dir / "implant", [],
-                                  {**os.environ, "PYTHONSAFEPATH": "1"}, ("-S",))
-            if control.ok:
+        # Negative control (#5475): whether this interpreter honours PYTHONSAFEPATH is MEASURED by a bare child,
+        # not read from sys.version_info. When it does, a child started without -E must report safe_path 1 and the
+        # probe must say ok False (the planted file is inert while the verdict says shadowable); this shows the
+        # check above can fail and that ok is not always True. When it does not, the control is skipped and said so.
+        honours = subprocess.run([sys.executable, "-S", "-c", "import sys; print(int(getattr(sys.flags, 'safe_path', 0)))"],
+                                 capture_output=True, text=True, check=False,
+                                 env={**os.environ, "PYTHONSAFEPATH": "1"}).stdout.strip() == "1"
+        if honours:
+            control = plant_probe("importlib", base_dir / "implant", [], {**os.environ, "PYTHONSAFEPATH": "1"}, ("-S",))
+            if control.safe_path != 1 or control.ok:
                 return "the probe cannot tell an inert planted file from a live one"
+        print(f"INFO: self-test - this interpreter honours PYTHONSAFEPATH: {honours} (measured; the control runs only then)")
         # #5473: the flag report can say 0. A child started without -S must report no_site 0 (and -E still 1), and a
         # child started without -E must report ignore_environment 0; an always-1 report is red.
         no_s = plant_probe("importlib", base_dir / "implant", [], isolate=("-E",))
