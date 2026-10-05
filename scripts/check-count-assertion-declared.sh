@@ -221,7 +221,7 @@ UNREADABLE = '!unreadable'      # the key prefix of an undecidable assertion: re
 # The `<` that opens a generic argument list (#5873), as rustc reads it: after `::` (a turbofish, also `Vec::<u8>`),
 # after the type path that follows `as` (`x as W<A, B>`, a leading `::` and raw identifiers too), and at the start of
 # an operand (a qualified path `<T as Tr<A, B>>::C`, also right after `as`). Any other `<` is a comparison or a shift.
-TURBOFISH = re.compile(r'::\s*<')
+# angle_opens reads the first and the last (an operand starts after `:` too); AS_GENERIC reads the one after `as`.
 AS_GENERIC = re.compile(r"as\s+(?:(?:&|\*\s*(?:const|mut)\b|mut\b|dyn\b|'[A-Za-z_]\w*)\s*)*(?:::\s*)?(?:(?:r#)?[A-Za-z_]\w*\s*::\s*)*(?:r#)?[A-Za-z_]\w*\s*<")
 NO_CLOSER = 'a generic argument list `<` with no closing `>`'
 NOT_OPERAND = {'as', 'return', 'in', 'if', 'while', 'match', 'else', 'mut', 'move', 'break', 'let', 'yield', 'box', 'dyn'}
@@ -240,8 +240,8 @@ def block_end(t, j):
 
 
 def angle_opens(m, j):
-    """m[j] == '<' outside every generic list -> True when it opens one (a qualified path at the start of an operand),
-    False when it is a comparison or a shift (an operand ends right before it)."""
+    """m[j] == '<' outside every generic list -> True when it opens one (a turbofish: `::` before it; a qualified path
+    at the start of an operand), False when it is a comparison or a shift (an operand ends right before it)."""
     k = j - 1
     while k >= 0 and m[k].isspace(): k -= 1
     if k < 0 or m[k] in '([{,;=!&|+-*/%^<>:@': return True
@@ -283,13 +283,12 @@ def macro_args(t, i):
             elif ch in '([{': stack.append(ch)
             elif ch in ')]};': return NO_CLOSER if COUNT_CALL.search(m) else None
             j += 1; continue
-        t2 = TURBOFISH.match(m, j)
         a2 = AS_GENERIC.match(m, j) if (m.startswith('as', j) and not re.match(r'\w', m[j - 1:j])) else None
-        if t2 or a2:
-            j = (t2 or a2).end() - 1; stack.append('<'); s[j] = '('; j += 1; continue
+        if a2:                                            # the `<` after the type path that follows `as`
+            j = a2.end() - 1; stack.append('<'); s[j] = '('; j += 1; continue
         if ch == '<':
             if angle_opens(m, j): stack.append('<'); s[j] = '('
-            elif m.startswith(('<<', '<='), j): j += 2; continue
+            elif m.startswith('<<', j): j += 2; continue      # a shift: its second `<` opens nothing (`<=` needs no skip)
         elif ch in '([{': stack.append(ch)
         elif ch in ')]}' and stack: stack.pop()
         j += 1
@@ -1086,6 +1085,7 @@ def selftest():
                    ('=>', 'ok && v.len() /* => */ == %s'), ('==', 'ok && v.len() /* == 5 */ == %s'),
                    ('a closing bracket', 'ok && v.len() /* ) */ == %s'), ('an opening bracket', 'ok && v.len() /* ( */ == %s'),
                    ('a quote', 'ok && v.len() /* " */ == %s'), ('a nested comment with &&', 'ok && v.len() /* a /* && */ b */ == %s'),
+                   ('&& after the close of a nested comment', 'ok && v.len() /* a /* b */ && */ == %s'),
                    ('&&, before the call', 'ok && /* && */ v.len() == %s'), ('&&, inside the call parentheses', 'ok && v.len(/* && */) == %s')):
         amb_leg('#5872 a block comment holding %s behind &&' % l_, a_)
     for l_, b_ in (('assert! with a comment holding && and no other operator', 'assert!(v.len() /* && */ == %s)'),
@@ -1102,6 +1102,10 @@ def selftest():
          scoped('tests/scope.rs', UC(18), UC(19)), True, [(UK % (1, 19)) + '  (none) -> ?count#unreadable'])
     case('#5872 an unreadable assertion stays red when declared',
          scoped_m('tests/scope.rs', UC(18), UC(19), msg('test: bump', 'Count: unreadable (none) -> ?count#unreadable (fixture)')), True,
+         [UK % (1, 19)], noerrs=['IGNORED'])
+    case('#5872 an unreadable assertion stays red when both of its findings are declared',
+         scoped_m('tests/scope.rs', UC(18), UC(19), msg('test: bump', 'Count: unreadable ?count#unreadable -> (none), '
+                                                          'unreadable (none) -> ?count#unreadable (fixture)')), True,
          [UK % (1, 19)], noerrs=['IGNORED'])
     case('#5872 an unchanged unreadable assertion is red in a commit that changes its file',
          scoped('tests/scope.rs', 'fn u() {}\n' + UC(18), 'fn u() { let _k = 1; }\n' + UC(18)), True,
@@ -1153,6 +1157,13 @@ def selftest():
                    ('a generic cast behind a pointer', 'ok && v.len() as *const W<u8, u16> == %s'),
                    ('a qualified-path cast with a comma', 'ok && v.len() as <usize as Tr<u8, u16>>::O == %s'),
                    ('a qualified-path operand with a comma', 'ok && v.len() + <usize as Tr<u8, u16>>::O::default() == %s'),
+                   ('a generic cast behind &dyn', 'ok && v.len() as &dyn Tr<u8, u16> == %s'),
+                   ('a generic cast behind &mut', 'ok && v.len() as &mut W<u8, u16> == %s'),
+                   ('a generic cast with a space before <', 'ok && v.len() as W <u8, u16> == %s'),
+                   ('a qualified-path cast whose type holds a comma', 'ok && v.len() as <W<u8, u16> as Tr>::O == %s'),
+                   ('a qualified-path operand whose type holds a comma', 'ok && v.len() + <W<u8, u16> as Tr>::O::default() == %s'),
+                   ('a qualified path that starts the argument', '<W<u8, u16> as Tr>::O::f() && v.len() == %s'),
+                   ('a turbofish holding nested parentheses', 'ok && v.len() + f::<fn((u8, u16)) -> u8>() == %s'),
                    ('a shift left', 'ok && v.len() << 1 == %s'), ('a shift right after a turbofish', 'ok && v.len() + g::<u8>() >> 1 == %s'),
                    ('a less-than compare before the count', '0 < v.len() && v.len() == %s'),
                    ('a less-or-equal compare after a cast', 'ok && (v.len() as usize) <= 20 && v.len() == %s')):
@@ -1168,8 +1179,20 @@ def selftest():
     case('#5873 a turbofish with no closing > in a count assertion is unreadable, red with its line',
          scoped('tests/scope.rs', TF(18), TF(19)), True,
          ['!unreadable line 1 (a generic argument list `<` with no closing `>`): assert!(ok&&v.len()+f::<u8,u16()==19);}  (none) -> ?count#unreadable'])
+    case('#5873 a turbofish with no closing > in a count assertion on a later line is unreadable, red with that line',
+         scoped('tests/scope.rs', 'fn u() { let _a = 1; let _b = 2; }\n' + TF(18), 'fn u() { let _a = 1; let _b = 2; }\n' + TF(19)), True,
+         ['!unreadable line 2 (a generic argument list `<` with no closing `>`): assert!(ok&&v.len()+f::<u8,u16()==19);}  (none) -> ?count#unreadable'])
     case('#5873 a turbofish with no closing > and no count call is not read',
          scoped('tests/scope.rs', 'fn t() { assert!(ok && k == f::<u8, u16() + 18); }\n', 'fn t() { assert!(ok && k == f::<u8, u16() + 19); }\n'), False)
+    TP = lambda n: 'fn t() { assert!(ok && (f::<u8) + v.len() == %s); }\n' % n      # the list meets a ) before its >
+    case('#5873 a turbofish closed by ) before its > in a count assertion is unreadable, red with its line',
+         scoped('tests/scope.rs', TP(18), TP(19)), True,
+         ['!unreadable line 1 (a generic argument list `<` with no closing `>`): assert!(ok&&(f::<u8)+v.len()==19);}  (none) -> ?count#unreadable'])
+    case('#5873 a turbofish closed by ) before its > with no count call is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok && (f::<u8) + k == 18); }\n', 'fn t() { assert!(ok && (f::<u8) + k == 19); }\n'), False)
+    case('#5873 a turbofish with no closing > whose only count call is in a comment is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok && k + f::<u8 /* v.len() */ == 18); }\n',
+                'fn t() { assert!(ok && k + f::<u8 /* v.len() */ == 19); }\n'), False)
     case('#5873 a turbofish count assertion, declared, is green',
          scoped_m('tests/scope.rs', 'fn t() { assert!(v.len() + f::<u8, u16>() == 18); }\n', 'fn t() { assert!(v.len() + f::<u8, u16>() == 19); }\n',
                   msg('test: bump', 'Count: v.len()+f::<u8,u16>()==18 ?count#ambiguous -> (none), v.len()+f::<u8,u16>()==19 (none) -> ?count#ambiguous (fixture)')),
