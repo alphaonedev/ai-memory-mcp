@@ -12,7 +12,7 @@
 #
 # This cannot be prevented inside a branch. It is a merge property. So the
 # rule has two halves:
-#   DECLARE  — a commit that changes a `.len()` count assertion says so, in a
+#   DECLARE  — a commit that changes a `.len()`/`.count()` count assertion says so, in a
 #              trailer of its OWN message, so the merger knows a shared count moved:
 #                  Count: <what> <old> -> <new> (<why>)
 #              several changes may share one line, separated by ", ":
@@ -29,10 +29,12 @@
 #     contain `count:`, a declaration line in the middle of the body, a `# count:`
 #     line and a declaration in the subject line are NOT declarations.
 #   * <old> and <new> must equal the gate's own finding, and <what> must name the
-#     assertion (#5575): the whole asserted expression, or words of at least 3
-#     characters that are each a WHOLE token (case-insensitive) of the expression or
-#     of the file-name stem; a one-letter word, a punctuation-only word, a directory
-#     name and a bare `len`/`count` name nothing. EVERY changed assertion of the commit must be
+#     assertion (#5575): either the whole asserted expression, or words of which AT
+#     LEAST ONE is a whole token (case-insensitive) of the expression or of the
+#     file-name stem, other than `len`/`count`; the other words are free prose of at
+#     least 3 characters. A word with a chunk of one or two characters, or a
+#     punctuation-only word, refuses the whole item; the file path or file name of
+#     the assertion is skipped as context (#5712). EVERY changed assertion of the commit must be
 #     covered; a declaration that covers only some of them leaves the commit red.
 #     Several correct declarations (own line plus later ones) are pooled, and the
 #     items are CONSUMED ONE-TO-ONE against the hits (#5576): each changed
@@ -53,15 +55,82 @@
 #     exact match, so the gate stays fail-closed. An offender outside the range
 #     (a stacked PR) is neither examined nor required.
 #
-# HOW A CHANGE IS FOUND — whole-file, not diff-line. rustfmt splits any
-# `assert_eq!` past ~100 columns onto three lines, so the number sits on a line
-# of its own and, when ONLY the number changes, the `.len()` line is not in the
-# diff at all; a per-line regex over `git show` misses exactly the shape the
-# gate exists for. So for every file a commit touches under src/ and tests/,
-# the OLD and NEW contents are parsed whole (comments stripped, string
-# literals blanked), every count assertion is extracted as
-# (normalised expression, numeric literal), and the two sets are compared:
-# an assertion whose literal moved, appeared or disappeared is a count change.
+# HOW A CHANGE IS FOUND — whole-file, not diff-line. rustfmt breaks an
+# `assert_eq!` that does not fit on one line so that each argument starts a line
+# of its own (a long receiver chain is broken further), so the number sits on a line
+# of its own and, when ONLY the number changes, the `.len()` line is not a
+# changed line of the diff (at most a context line); a per-line regex over the
+# changed lines of `git show` misses exactly the shape the
+# gate exists for. So for every .rs file a commit touches under the
+# repository-root src/ and tests/ directories (#5711, #5716; tools/*/src, examples/,
+# benches/ and fuzz/ are not checked),
+# the OLD and NEW contents are parsed whole (`//` line comments stripped and
+# double-quoted string literals blanked, a line break kept; outside the arguments
+# of an assert! or assert_eq! a `/* */` block comment is read as code, and a raw
+# string is blanked only up to its first inner quote, #5712, #5715), every
+# count assertion is extracted as (normalised expression, value), and the two
+# sets are compared: an assertion whose value moved, appeared or disappeared is a
+# count change, except that an assertion whose values are all undecidable
+# `?<spelling>` values holding no `#` neither appears nor disappears (a
+# `?NAME#unresolved`, `?NAME#ambiguous(..)` or `?count#ambiguous` value is
+# never exempt). Reversed operands and `assert_ne!`
+# are not read (#5714).
+# WHAT IS READ (#5759) — the WHOLE first argument decides, never the first count
+# call found inside it:
+#   * assert_eq!: read only when the first argument is ONE operand that ends in
+#     `.len()` or `.count()` (so `v.iter().filter(|x| x.len() == 2).count()` reads
+#     as itself). A first argument whose last term is not exactly `.len()` or
+#     `.count()` (a tuple, `v.len() + 1`, `v.len() as u32`, `&v[..v.len()]`,
+#     `f(v.len())`, a path call `<[u8]>::len(v)`, `v.len ()` with a space inside
+#     the call) is neither read nor tracked (#5799, #5801).
+#   * assert!: read only when the first argument has exactly one `==` outside
+#     every bracket, no `&&` and no `|` outside every bracket, and the left
+#     operand ends in `.len()` or `.count()`.
+#   * AMBIGUOUS assert! (#5797, #5798): any other first argument in which the
+#     LEFT OPERAND of some `==`, at any bracket depth, holds a count call
+#     (`.len()` or `.count()`, spaces allowed after the dot and inside the
+#     call, never an argument). That operand
+#     runs back from the `==` to the nearest `&&`, `||`, `==`, `!=`, `=>`, `,`
+#     or `;` at the same depth, or to the bracket that opens that depth, so
+#     nothing between the call and the `==` other than one of those stops hides
+#     it: a cast to any type, braces,
+#     a block comment, a generic argument list, a method chain such as
+#     `.into()`, a line break or arithmetic. Every shape the reader does not
+#     bind is decided by this rule alone: a comparison inside a closure only,
+#     behind `&&` or `||`, negated, parenthesised or chained with a second `==`
+#     is ambiguous exactly when such a left operand holds the count call. It is
+#     never guessed: it is tracked under its whole spelling with the value
+#     `?count#ambiguous`, which
+#     is never exempt (so adding, removing or rewording it is a count change),
+#     and every const name in it is tracked as `<spelling> [NAME]` with the
+#     const's value, so bumping that const is a count change too.
+#   * GENERIC ARGUMENT LISTS (#5873): inside the arguments of an assert! or
+#     assert_eq! a generic argument list `<..>` is a bracket, nested ones too,
+#     so a comma, `&&` or `||` inside it never ends an operand or splits an
+#     argument, and the `>` of a `->` inside it closes nothing. A `<` opens such
+#     a list after `::` (a turbofish `f::<A, B>()`), after the type path that
+#     follows `as` (`x as W<A, B>`, also `x as ::m::W<A, B>` and `x as r#W<A, B>`;
+#     a `&`, a lifetime, `mut`, `*const`, `*mut` or `dyn` may stand before the path),
+#     and at the start of an operand (a qualified path `<T as Tr<A, B>>::C`); any
+#     other `<` is a comparison or a shift.
+#   * BLOCK COMMENTS AND UNREADABLE ASSERTIONS (#5872; 5-agent vote (4d3ea1c5)
+#     on #5715): inside the arguments of an assert! or assert_eq! a `/* */`
+#     block comment, nested ones too, is blank space, so an operator, a comma,
+#     a semicolon or a bracket inside it never ends an operand, splits an
+#     argument or hides a compare. An assertion whose arguments the gate cannot
+#     read (a block comment with no closing `*/`, which is also what a quote or
+#     a `//` inside a block comment becomes until #5715 brings a lexer; or, in
+#     arguments that hold a count call, a generic argument list whose closing
+#     `>` the gate cannot find) is
+#     tracked as `!unreadable line <N> (<reason>): <spelling>` with the value
+#     `?count#unreadable`. It is red in every commit that changes its file (or
+#     moves a const that file names, #5888) and cannot be declared; one that leaves
+#     the tree is a count change `?count#unreadable -> (none)`, declared as usual.
+#   * NOT READ assert! (stated limits): a count call only on the right of every
+#     `==` (reversed operands, `18 == v.len()`, also behind `&&`; #5714); a count
+#     compared without `==` (`v.len().eq(&18)`, `matches!(v.len(), 18)`; #5800);
+#     a count spelled as a path call (`<[u8]>::len(v) == 18`), a free function
+#     (`row_count() == 18`) or a call with an argument (`m.count(k) == 18`; #5801).
 # The named-const spelling — `assert_eq!(x.len(), EXPECTED)` with
 # `const EXPECTED: usize = 19;` — is resolved the same way: a const that a
 # count assertion names, whose literal moved, is a count change.
@@ -70,8 +139,9 @@
 # copied file is compared with its SOURCE path, so rename-plus-bump and
 # copy-plus-bump stay red. An assertion is skipped as new (no earlier count
 # exists to drift from; #5499) only when its file has status A in that same
-# commit AND the asserted expression or constant exists in no other file of the
-# parent tree. A new assertion in an EXISTING file stays red until declared.
+# commit AND the asserted expression or constant exists in no checked (src/ or
+# tests/) .rs file of the parent tree. A new assertion in an EXISTING file stays
+# red until declared.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 RANGE="HEAD~1..HEAD"; SELF_TEST=0
@@ -114,7 +184,8 @@ CHR = re.compile(r"'(?:[^'\\\n]|\\[^\n]|\\u\{[0-9a-fA-F_]+\})'")
 
 def clean(t):
     t = re.sub(r'//[^\n]*', '', t)                       # line comments
-    return CHR.sub("''", LIT.sub('""', t))               # string and char literals are not code
+    # string and char literals are not code; a blanked string keeps its line breaks, so a line number stays true
+    return CHR.sub("''", LIT.sub(lambda m: '"' + '\n' * m.group().count('\n') + '"', t))
 
 
 # The full Rust integer literal grammar (#5577): decimal, 0x, 0o, 0b, underscores, a type suffix. Normalised to decimal.
@@ -133,46 +204,186 @@ def int_value(tok):
     return str(int(digits, base)) if digits else None
 
 
-# assert!(...) / assert_eq!(...): the macro arguments are cut out with balanced brackets, so a right-hand side of ANY
-# shape is seen (a typed literal, an expression, a path); the LEFT side must be `<expr>.len()` / `.count()`.
-HEAD = re.compile(r'assert(?:_eq)?!\s*\(')
-LEFT = re.compile(r'^\s*(?P<expr>[^;{}]*?)\.(?P<m>len|count)\(\)\s*,(?P<rest>.*)$', re.S)
+# assert_eq!(<expr>.len()|.count(), <rhs>[, message]) and assert!(<expr>.len()|.count() == <rhs>[, message]) (#5710),
+# where the WHOLE first argument has that shape (#5759; see WHAT IS READ in the header);
+# HEAD has no word boundary, so a prefixed name (debug_assert_eq!, debug_assert!) matches too. The macro arguments are
+# cut out with balanced brackets, so a right-hand side of ANY shape is seen (a typed literal, an expression, a path).
+HEAD = re.compile(r'assert(?P<eq>_eq)?!\s*\(')
+TAIL = re.compile(r'^(?P<expr>\S.*)\.(?P<m>len|count)\(\)$', re.S)     # a WHOLE operand that ends in .len() or .count()
+# a count call: `.len()` or `.count()`, spaces allowed around the name and inside the parentheses
+COUNT_CALL = re.compile(r'\.\s*(?:len|count)\s*\(\s*\)')
+# what ends the left operand of a `==` at its own bracket depth (scanning back from the `==`); `==` itself also ends
+# one, in its own branch of compares_count, and a `,` or `;` ends one as well
+OPERAND_STOPS = ('&&', '||', '!=', '=>')
 CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]*)\s*:\s*(?:usize|u\d+|i\d+)\s*=\s*(?P<val>[^;]+?)\s*;')
+UNREAD = '?count#unreadable'
+UNREADABLE = '!unreadable'      # the key prefix of an undecidable assertion: red in every commit that reads its file
+# The `<` that opens a generic argument list (#5873), as rustc reads it: after `::` (a turbofish, also `Vec::<u8>`),
+# after the type path that follows `as` (`x as W<A, B>`, a leading `::` and raw identifiers too), and at the start of
+# an operand (a qualified path `<T as Tr<A, B>>::C`, also right after `as`). Any other `<` is a comparison or a shift.
+# angle_opens reads the first and the last (an operand starts after `:` too); AS_GENERIC reads the one after `as`.
+AS_GENERIC = re.compile(r"as\s+(?:(?:&|\*\s*(?:const|mut)\b|mut\b|dyn\b|'[A-Za-z_]\w*)\s*)*(?:::\s*)?(?:(?:r#)?[A-Za-z_]\w*\s*::\s*)*(?:r#)?[A-Za-z_]\w*\s*<")
+NO_CLOSER = 'a generic argument list `<` with no closing `>`'
+NOT_OPERAND = {'as', 'return', 'in', 'if', 'while', 'match', 'else', 'mut', 'move', 'break', 'let', 'yield', 'box', 'dyn'}
 
 
-def macro_args(t, i):
-    """t[i:] follows a macro's '('. -> the text up to the matching ')', or None when unbalanced."""
-    depth, angle, j, n = 0, 0, i, len(t)
-    while j < n:
-        ch = t[j]
-        if ch in '([{': depth += 1
-        elif ch in ')]}':
-            if depth == 0: return t[i:j] if ch == ')' else None
-            depth -= 1
-        elif ch == ';' and depth == 0: return None
-        j += 1
+def block_end(t, j):
+    """t[j:] starts with `/*` -> the offset just past its closing `*/`, nested comments included; None when unterminated."""
+    depth, k, n = 1, j + 2, len(t)
+    while k < n:
+        if t.startswith('/*', k): depth += 1; k += 2
+        elif t.startswith('*/', k):
+            depth -= 1; k += 2
+            if depth == 0: return k
+        else: k += 1
     return None
 
 
-def first_arg(rest):
-    """The first top-level comma-separated argument of `rest` (turbofish commas do not split)."""
-    depth, angle, j, n = 0, 0, 0, len(rest)
-    while j < n:
-        ch = rest[j]
-        if rest.startswith('::<', j): angle += 1; j += 3; continue
-        if angle and ch == '<': angle += 1
-        elif angle and ch == '>' and rest[j - 1:j] != '-': angle -= 1
-        elif ch in '([{': depth += 1
-        elif ch in ')]}': depth -= 1
-        elif ch == ',' and depth == 0 and angle == 0: break
+def angle_opens(m, j):
+    """m[j] == '<' outside every generic list -> True when it opens one (a turbofish: `::` before it; a qualified path
+    at the start of an operand), False when it is a comparison or a shift (an operand ends right before it)."""
+    k = j - 1
+    while k >= 0 and m[k].isspace(): k -= 1
+    if k < 0 or m[k] in '([{,;=!&|+-*/%^<>:@': return True
+    w = re.search(r'[A-Za-z_]\w*$', m[:k + 1])
+    return bool(w) and w.group() in NOT_OPERAND and not m[:w.start()].endswith(('.', '::'))
+
+
+def macro_args(t, i):
+    """t[i:] follows a macro's '('. -> (orig, shape): orig is the text up to the matching ')'; shape is the same text,
+    the same length, with every block comment blanked (nested ones too) and every generic argument list `<..>` turned
+    into `(..)`, so a comment or a generic list is never read as an operator, a comma or a stop (#5872, #5873).
+    -> None when unbalanced, when a ';' is met at depth 0, or when the first depth-0 closer is not ')'.
+    -> a reason string when the arguments are undecidable: an unterminated block comment, or a generic list whose
+    closing `>` cannot be found."""
+    out, depth, j, n = [], 0, i, len(t)
+    while j < n:                                          # pass 1: the extent of the arguments, comments blanked
+        if t.startswith('/*', j):
+            k = block_end(t, j)
+            if k is None: return 'an unterminated block comment'
+            out.append(re.sub(r'[^\n]', ' ', t[j:k])); j = k; continue
+        ch = t[j]
+        if ch in '([{': depth += 1
+        elif ch in ')]}':
+            if depth == 0:
+                if ch != ')': return None
+                break
+            depth -= 1
+        elif ch == ';' and depth == 0: return None
+        out.append(ch); j += 1
+    else:
+        return None
+    orig, m = t[i:j], ''.join(out)
+    s, stack, j, n = list(m), [], 0, len(m)
+    while j < n:                                          # pass 2: generic argument lists become brackets
+        ch = m[j]
+        if stack and stack[-1] == '<':
+            if ch == '<': stack.append('<'); s[j] = '('
+            elif ch == '>' and m[j - 1] != '-': stack.pop(); s[j] = ')'      # `->` (a fn type's arrow) closes nothing
+            elif ch in '([{': stack.append(ch)
+            elif ch in ')]};': return NO_CLOSER if COUNT_CALL.search(m) else None
+            j += 1; continue
+        a2 = AS_GENERIC.match(m, j) if (m.startswith('as', j) and not re.match(r'\w', m[j - 1:j])) else None
+        if a2:                                            # the `<` after the type path that follows `as`
+            j = a2.end() - 1; stack.append('<'); s[j] = '('; j += 1; continue
+        if ch == '<':
+            if angle_opens(m, j): stack.append('<'); s[j] = '('
+            elif m.startswith('<<', j): j += 2; continue      # a shift: its second `<` opens nothing (`<=` needs no skip)
+        elif ch in '([{': stack.append(ch)
+        elif ch in ')]}' and stack: stack.pop()
         j += 1
-    return rest[:j].strip()
+    if '<' in stack: return NO_CLOSER if COUNT_CALL.search(m) else None
+    return orig, ''.join(s)
+
+
+def trim(s, a, b):
+    """-> (a', b'): the bounds of s[a:b] with surrounding whitespace removed."""
+    while a < b and s[a].isspace(): a += 1
+    while b > a and s[b - 1].isspace(): b -= 1
+    return a, b
+
+
+def split_arg(s, a=0):
+    """-> (end of the first top-level comma-separated argument of s[a:], offset just past its comma or None when there
+    is no further argument). s is a shape (macro_args), so a comma inside a generic list or a comment never splits."""
+    depth, j, n = 0, a, len(s)
+    while j < n:
+        ch = s[j]
+        if ch in '([{': depth += 1
+        elif ch in ')]}': depth -= 1
+        elif ch == ',' and depth == 0: return j, j + 1
+        j += 1
+    return n, None
+
+
+def top_ops(arg):
+    """-> (offsets of every `==` at paren, bracket and brace depth 0 of `arg`; True when depth 0 also holds `&&` or a
+    `|`, i.e. a logical operator or a closure)."""
+    depth, eqs, logic, j, n = 0, [], False, 0, len(arg)
+    while j < n:
+        ch = arg[j]
+        if ch in '([{': depth += 1
+        elif ch in ')]}': depth -= 1
+        elif depth == 0 and arg.startswith('==', j): eqs.append(j); j += 2; continue
+        elif depth == 0 and (ch == '|' or arg.startswith('&&', j)): logic = True
+        j += 1
+    return eqs, logic
+
+
+AMBIG = '?count#ambiguous'
+
+
+def compares_count(arg):
+    """True when the LEFT OPERAND of some `==` of `arg` (a shape), at ANY bracket depth, holds a count call (#5797,
+    #5798). The left operand runs back from the `==` to the nearest `&&`, `||`, `==`, `!=`, `=>`, `,` or `;` at the same
+    depth, or to the bracket that opens that depth; whatever else sits between the call and the `==` (a cast to any
+    type, braces, a block comment, a generic list, a method chain, a line break, arithmetic) keeps the call in the
+    operand."""
+    starts, j, n = [0], 0, len(arg)                       # starts[-1]: where the current operand begins at this depth
+    while j < n:
+        ch, two = arg[j], arg[j:j + 2]
+        if ch in '([{': starts.append(j + 1)
+        elif ch in ')]}':
+            if len(starts) > 1: starts.pop()
+        elif two == '==':
+            if COUNT_CALL.search(arg, starts[-1], j): return True
+            starts[-1] = j + 2; j += 2; continue
+        elif two in OPERAND_STOPS: starts[-1] = j + 2; j += 2; continue
+        elif ch in ',;': starts[-1] = j + 1
+        j += 1
+    return False
+
+
+def read_cond(o, s):
+    """assert!'s first argument, as (orig, shape) -> (expr, method, rhs) when the WHOLE argument is
+    `<expr>.len()|.count() == <rhs>`: one `==` at depth 0, no depth-0 `&&` or `|`, and the left operand ends in the count
+    call (#5710, #5759). Any other argument in which the left operand of some `==`, at any bracket depth, holds a count
+    call (compares_count) -> AMBIG, never a guess (#5797, #5798); otherwise -> None."""
+    eqs, logic = top_ops(s)
+    if len(eqs) == 1 and not logic:
+        a, b = trim(s, 0, eqs[0])
+        m = TAIL.match(s[a:b])
+        if m:
+            ra, rb = trim(s, eqs[0] + 2, len(s))
+            return o[a:a + m.end('expr')], m.group('m'), o[ra:rb]
+    return AMBIG if compares_count(s) else None
+
+
+# A const-shaped name (NAME, a::NAME, <T as Tr>::NAME) anywhere in an ambiguous assert!'s first argument; a name right
+# after `::` is qualified even when no path word precedes it.
+NAMES = re.compile(r'(?<![A-Za-z0-9_])(?P<path>(?:[A-Za-z_][A-Za-z0-9_]*::)*)(?P<name>[A-Z][A-Z0-9_]*)(?![A-Za-z0-9_])')
+
+
+def named(consts, name, qualified):
+    """A const name's value: this file's const when the name is unqualified, else `@NAME` for resolve()."""
+    v = consts.get(name) if not qualified else None
+    return v if v is not None else '@' + name
 
 
 def extract(text):
     """-> ({expr-key: {value, ...}}, {const name: value}, {const names referenced from another file}).
-    A value is a decimal integer, `?<spelling>` (undecidable right-hand side) or `@NAME` (a const defined in another
-    file: resolved against the whole tree by resolve(), never guessed here)."""
+    A value is a decimal integer, `?<spelling>` (undecidable right-hand side) or `@NAME` (a name not defined as a const in
+    this file: resolved by resolve() against every eligible .rs file of the tree, never guessed here)."""
     text = clean(text)
     consts = {}
     for m in CONST.finditer(text):
@@ -181,22 +392,45 @@ def extract(text):
     out = {}
     for h in HEAD.finditer(text):
         args = macro_args(text, h.end())
-        m = LEFT.match(args) if args is not None else None
-        if not m: continue
-        expr = re.sub(r'\s+', '', m.group('expr')) + '.' + m.group('m') + '()'
-        rhs = first_arg(m.group('rest'))
+        if args is None: continue
+        if isinstance(args, str):                         # undecidable arguments: red with a named line (#5872, #5873)
+            line = text.count('\n', 0, h.start()) + 1
+            src = re.sub(r'\s+', '', text[h.start():].split('\n', 1)[0])[:80]
+            out.setdefault(f'{UNREADABLE} line {line} ({args}): {src}', set()).add(UNREAD)
+            continue
+        o, s = args                                       # o: the text as written; s: its shape (macro_args)
+        fa, fb = trim(s, 0, split_arg(s)[0])
+        more = split_arg(s)[1]
+        first = o[fa:fb]
+        if h.group('eq'):                                 # assert_eq!: the WHOLE first argument is the count call
+            m = TAIL.match(s[fa:fb])
+            if not m or more is None: continue
+            ra, rb = trim(s, more, split_arg(s, more)[0])
+            got, rhs = (first[:m.end('expr')], m.group('m')), o[ra:rb]
+        else:                                             # assert!: the WHOLE first argument is `<expr>.len() == <rhs>`
+            got = read_cond(first, s[fa:fb])
+            if got is None: continue
+            if got == AMBIG:                              # undecidable shape: tracked by its whole spelling, never exempt
+                key = re.sub(r'\s+', '', first)
+                out.setdefault(key, set()).add(AMBIG)
+                for nm in NAMES.finditer(first):          # and every const it names, so a bump of one moves it
+                    out.setdefault(f"{key} [{nm.group('name')}]", set()).add(named(consts, nm.group('name'), nm.group('path') or first[:nm.start()].endswith('::')))
+                continue
+            got, rhs = got[:2], got[2]
+        expr = re.sub(r'\s+', '', got[0]) + '.' + got[1] + '()'
         val = int_value(rhs)
         if val is None:
             pc = PATH_CONST.match(rhs)
             if pc:                                        # a named const: this file first, else the whole tree (#5578)
                 name = pc.group('name')
-                val = consts.get(name) if '::' not in rhs else None
-                if val is None: val = '@' + name
+                val = named(consts, name, '::' in rhs)
                 expr += f' [{name}]'                      # name the const the count is spelled through
             else:
                 val = '?' + re.sub(r'\s+', '', rhs)         # undecidable: neither a literal nor a const (#5577)
         out.setdefault(expr, set()).add(val)
     refs = {v[1:] for vs in out.values() for v in vs if v.startswith('@')}
+    if any(k.startswith(UNREADABLE) for k in out):       # an unreadable assertion names whatever it names: every const name
+        refs |= {nm.group('name') for nm in NAMES.finditer(text)}   # of the file, so moving one re-reads it (#5888)
     return out, consts, refs
 
 
@@ -238,7 +472,7 @@ def build_state(rev):
 
 
 def defs_of(rev):
-    """{const name: [(path, value)]} over the whole tree of rev."""
+    """{const name: [(path, value)]} over every eligible (src/, tests/) .rs file of rev."""
     if rev not in _DEFS:
         d = {}
         for path, (_, consts, _r) in _STATE[rev].items():
@@ -248,9 +482,9 @@ def defs_of(rev):
 
 
 def resolve(rev, assertions):
-    """Replace every `@NAME` with the tree-wide value: exactly one definition -> its value; none -> `?NAME#unresolved`;
+    """Replace every `@NAME` with its value over the eligible files of the tree: exactly one definition -> its value; none -> `?NAME#unresolved`;
     several (two files define the name) -> `?NAME#ambiguous(<every value>)`, so a bump of either definition still moves it. Closed-world: a name that cannot be resolved to ONE integer
-    is never read as 'unchanged' (#5578)."""
+    stays a `?` state, which is a move unless the state is identical on both sides (#5578, #5672)."""
     out = {}
     for k, vals in assertions.items():
         rv = set()
@@ -291,7 +525,7 @@ def changed_files(c):
 
 
 def count_changes(c):
-    """-> [(file, expr, old, new)] one per changed count assertion of commit c, consts resolved over the whole tree."""
+    """-> [(file, expr, old, new)] one per changed count assertion of commit c, consts resolved over the eligible files of the tree."""
     parent = git('rev-parse', '--verify', '--quiet', c + '^').strip()
     entries = [e for e in changed_files(c)
                if (e[1] and eligible(e[1])) or (e[2] and eligible(e[2]))]
@@ -321,6 +555,9 @@ def count_changes(c):
         new = resolve(c, new_st[np_][0]) if (np_ and np_ in new_st) else {}
         for expr in sorted(set(old) | set(new)):
             o, n = old.get(expr, set()), new.get(expr, set())
+            if expr.startswith(UNREADABLE) and n:         # an undecidable assertion in the new tree: red whenever its file is
+                hits.append((np_ or op, expr, ','.join(sorted(o)) or '(none)', UNREAD))   # read, never declarable
+                continue                                 # (one that leaves the tree is a declarable `-> (none)` below)
             if o == n: continue
             if (not o and all(v.startswith('?') and '#' not in v for v in n)) or (not n and all(v.startswith('?') and '#' not in v for v in o)):
                 continue                                 # an assertion with no literal count on either side moves no count (#5577)
@@ -459,7 +696,7 @@ def check_range(rng):
                 if any(item_matches(it, h) for h in hits[c]): own.append(it)
                 else: err.append(f'count-assertion-declared: IGNORED Count in {short(c)}: "{it[0]} {it[1]} -> {it[2]}" matches no change of this commit')
         declared = own + accepted.get(c, [])
-        if covers(declared, hits[c]): continue
+        if covers(declared, hits[c]) and not any(h[3] == UNREAD for h in hits[c]): continue   # an unreadable one: never declarable
         subj = msgs[c].split('\n', 1)[0]
         out.append(f'  {short(c)}  {subj[:70]}')
         for h in hits[c][:8]: out.append(f'      {h[0]}  {h[1]}  {h[2]} -> {h[3]}')
@@ -621,7 +858,14 @@ def selftest():
     case('what = a good token plus a punctuation-only word is refused', one_decl('sections ..'), True)
     case('what = the hit path plus a token', one_decl('tests/f.rs sections'), False)
     case('what = the hit path alone names nothing', one_decl('tests/f.rs'), True)
+    case('what = the hit file name plus a token', one_decl('f.rs sections'), False)
+    case('what = the hit file name alone names nothing', one_decl('f.rs'), True, ['sections.len()  18 -> 19'], ['IGNORED Count'])
     case('what = a token plus a two-letter word is refused', one_decl('sections to'), True)
+    # #5760: ONE word that holds a short chunk beside a good token refuses the item (the header's "a word with a chunk of
+    # one or two characters ... refuses the whole item"); the same bump named by the good token alone is the control
+    case('what = one word with a two-character chunk beside a token (ab-sections) is refused', one_decl('ab-sections'), True,
+         ['sections.len()  18 -> 19'], ['IGNORED Count', '"ab-sections 18 -> 19" matches no change'])
+    case('what = the same token without the short chunk (sections) is the green control', one_decl('sections'), False)
     def c_stem(s, b): s.w('tests/multi.rs', multi_rs(6)); s.commit(msg('test: bump', 'Count: multi 5 -> 6 (fixture)')); return b + '..HEAD'
     case('what = a token of the file-name stem', c_stem, False)
     def c_late_short(s, b):
@@ -723,6 +967,323 @@ def selftest():
     case('a local const of the same name shadows the shared one',
          shared('const EXPECTED_N: usize = 5;\n' + A('EXPECTED_N'), L(18), L(19)), False)
     case('a shared const unchanged while its file changes is no move', shared(A('crate::EXPECTED_N'), L(18) + '// a\n', L(18) + '// b\n'), False)
+    # ---- #5672: "an identical state on both sides is no move" for the unresolved and the ambiguous state ------------
+    case('an unresolved name unchanged on both sides is no move',
+         shared(A('ext::MISSING_N') + '// a\n', L(18), L(18), None, {SH: A('ext::MISSING_N') + '// b\n'}), False)
+    case('an ambiguous name unchanged on both sides is no move',
+         shared(A('crate::EXPECTED_N') + '// a\n', L(18), L(18), {'src/other.rs': L(3)}, {SH: A('crate::EXPECTED_N') + '// b\n'}), False)
+    case('an ambiguous name newly asserted is a move',
+         shared('fn t() {}\n', L(18), L(18), {'src/other.rs': L(3)}, {SH: A('crate::EXPECTED_N')}), True, ['?EXPECTED_N#ambiguous'])
+    case('an unresolved name that becomes resolved is a move',
+         shared(A('crate::MISSING_N'), L(18), L(18) + 'pub const MISSING_N: usize = 4;\n'), True, ['?MISSING_N#unresolved -> 4'])
+    case('an ambiguous name that becomes resolved is a move',
+         shared(A('crate::EXPECTED_N'), L(18), L(18), {'src/other.rs': L(3)}, {'src/other.rs': 'pub fn x() {}\n'}), True, ['?EXPECTED_N#ambiguous(18,3) -> 18'])
+    # ---- #5673: the changelog scope clause: assert(_eq)!(<expr>.len()|.count(), <rhs>) in an eligible src/ or tests/ .rs file ----
+    def scoped(path, body0, body1):
+        def f_(s, b):
+            s.w(path, body0); t0 = s.commit('test: add scope fixture'); s.w(path, body1)
+            s.commit('test: bump scope fixture'); return t0 + '..HEAD'
+        return f_
+    E = lambda macro, meth, n: 'fn t() { %s!(items.%s(), %s); }\n' % (macro, meth, n)
+    case('a .count() left side is seen', scoped('tests/scope.rs', E('assert_eq', 'count', 18), E('assert_eq', 'count', 19)), True, ['items.count()  18 -> 19'])
+    # #5710: assert! is read only in its compiling count form assert!(<expr>.len()|.count() == <rhs>[, message])
+    Q = lambda n, tail='': 'fn t() { assert!(items.len() == %s%s); }\n' % (n, tail)
+    case('an assert!(<expr>.len() == <rhs>) is seen', scoped('tests/scope.rs', Q(18), Q(19)), True, ['items.len()  18 -> 19'])
+    case('an assert!(<expr>.len() == <rhs>, message) is seen', scoped('tests/scope.rs', Q(18, ', "m {}", 1'), Q(19, ', "m {}", 1')), True, ['items.len()  18 -> 19'])
+    case('an assert!(<expr>.count() == <rhs>) is seen', scoped('tests/scope.rs', E('assert', 'count', 18).replace('(), 18', '() == 18'), E('assert', 'count', 19).replace('(), 19', '() == 19')), True, ['items.count()  18 -> 19'])
+    case('an assert!(<expr>.len() != <rhs>) is not a count assertion', scoped('tests/scope.rs', Q(18).replace('==', '!='), Q(19).replace('==', '!=')), False)
+    case('the non-compiling comma form assert!(<expr>.len(), <rhs>) is not a count assertion', scoped('tests/scope.rs', E('assert', 'len', 18), E('assert', 'len', 19)), False)
+    case('a non-count assert!(i < b.len(), message) whose message spelling changes is no move',
+         scoped('tests/scope.rs', 'fn t() { assert!(i < b.len(), "m"); }\n', 'fn t() { assert!(i < b.len(), M); }\n'), False)
+    case('assert_eq! and assert! with the same expression and value are one assertion (a rewrite is no move)',
+         scoped('tests/scope.rs', E('assert_eq', 'len', 18), Q(18)), False)
+    case('a prefixed macro name (debug_assert_eq!) is seen', scoped('tests/scope.rs', E('debug_assert_eq', 'len', 18), E('debug_assert_eq', 'len', 19)), True, ['items.len()  18 -> 19'])
+    case('a prefixed macro name (debug_assert!) is seen', scoped('tests/scope.rs', Q(18).replace('assert!', 'debug_assert!'), Q(19).replace('assert!', 'debug_assert!')), True, ['items.len()  18 -> 19'])
+    # ---- #5759: the WHOLE first argument decides which count an assertion binds to (WHAT IS READ in the header) ------------
+    def scoped_m(path, body0, body1, m):
+        def f_(s, b):
+            s.w(path, body0); t0 = s.commit('test: add scope fixture'); s.w(path, body1)
+            s.commit(m); return t0 + '..HEAD'
+        return f_
+    FK = 'v.iter().filter(|x|x.len()==2).count()'
+    FA = lambda n, c='': c + 'fn u(v: &[&str]) { assert!(v.iter().filter(|x| x.len() == 2).count() == %s); }\n' % n
+    FC = lambda n: FA('N', 'const N: usize = %s;\n' % n)
+    case('assert! with an inner closure comparison binds to the outer count (const bump)', scoped('tests/scope.rs', FC(3), FC(4)), True, [FK + ' [N]  3 -> 4'])
+    case('assert! with an inner closure comparison binds to the outer count (literal bump)', scoped('tests/scope.rs', FA(3), FA(4)), True, [FK + '  3 -> 4'])
+    case('assert! with an inner closure comparison that appears is flagged', scoped('tests/scope.rs', 'fn t() {}\n', FA(3)), True, [FK + '  (none) -> 3'])
+    case('assert! with an inner closure comparison that disappears is flagged', scoped('tests/scope.rs', FA(3), 'fn t() {}\n'), True, [FK + '  3 -> (none)'])
+    case('assert! with an inner closure comparison, declared by a whole token (filter), is green',
+         scoped_m('tests/scope.rs', FA(3), FA(4), msg('test: bump', 'Count: filter 3 -> 4 (fixture)')), False)
+    case('the inner comparison is not a separate assertion: an unchanged outer count with a moved inner literal is a key change',
+         scoped('tests/scope.rs', FA(3), FA(3).replace('== 2)', '== 5)')), True, [FK + '  3 -> (none)', 'v.iter().filter(|x|x.len()==5).count()  (none) -> 3'])
+    FB = lambda n: 'fn u(v: &[&str]) {\n    assert!(\n        v.iter().filter(|x| { x.len() == 2 }).count() == %s,\n        "m {}",\n        1,\n    );\n}\n' % n
+    case('a multi-line assert! with a block closure, a message and a trailing comma binds to the outer count',
+         scoped('tests/scope.rs', FB(3), FB(4)), True, ['v.iter().filter(|x|{x.len()==2}).count()  3 -> 4'])
+    case('a debug_assert! with an inner closure comparison binds to the outer count',
+         scoped('tests/scope.rs', FA(3).replace('assert!', 'debug_assert!'), FA(4).replace('assert!', 'debug_assert!')), True, [FK + '  3 -> 4'])
+    MK = 'v.iter().map(|x|max(x.len(),1)).count()'
+    MA = lambda n: 'fn u(v: &[&str]) { assert_eq!(v.iter().map(|x| max(x.len(), 1)).count(), %s); }\n' % n
+    case('assert_eq! whose count call holds an inner .len(), call binds to the outer count (appears)', scoped('tests/scope.rs', 'fn t() {}\n', MA(3)), True, [MK + '  (none) -> 3'])
+    case('assert_eq! whose count call holds an inner .len(), call binds to the outer count (disappears)', scoped('tests/scope.rs', MA(3), 'fn t() {}\n'), True, [MK + '  3 -> (none)'])
+    case('assert_eq! whose count call holds an inner .len(), call binds to the outer count (bump)', scoped('tests/scope.rs', MA(3), MA(4)), True, [MK + '  3 -> 4'])
+    # an assert_eq! first argument whose last term is not the count call is not read (the stated limit)
+    for a_ in ('(items.len(), 1)', 'items.len() + 1', 'items.len() as u32', '&v[..items.len()]', 'f(items.len())'):
+        case('an assert_eq! first argument %s is not read' % a_,
+             scoped('tests/scope.rs', 'fn t() { assert_eq!(%s, 18); }\n' % a_, 'fn t() { assert_eq!(%s, 19); }\n' % a_), False)
+    # AMBIGUOUS assert! shapes: tracked by the whole spelling as ?count#ambiguous, never exempt, never guessed
+    AA = 'fn u(v: &[&str]) { assert!(v.iter().any(|x| x.len() == 2)); }\n'
+    AK = 'v.iter().any(|x|x.len()==2)'
+    case('an ambiguous assert! (a count comparison inside a closure only) that appears is flagged', scoped('tests/scope.rs', 'fn t() {}\n', AA), True, [AK + '  (none) -> ?count#ambiguous'])
+    case('an ambiguous assert! that disappears is flagged', scoped('tests/scope.rs', AA, 'fn t() {}\n'), True, [AK + '  ?count#ambiguous -> (none)'])
+    case('an ambiguous assert! that appears, declared with the ?count#ambiguous value, is green',
+         scoped_m('tests/scope.rs', 'fn t() {}\n', AA, msg('test: add', 'Count: any (none) -> ?count#ambiguous (fixture)')), False)
+    case('an ambiguous assert! that is unchanged beside an unrelated edit is no move', scoped('tests/scope.rs', AA, AA + 'fn w() {}\n'), False)
+    case('a reworded ambiguous assert! is flagged on both spellings', scoped('tests/scope.rs', AA, AA.replace('== 2', '== 3')), True,
+         [AK + '  ?count#ambiguous -> (none)', 'v.iter().any(|x|x.len()==3)  (none) -> ?count#ambiguous'])
+    NA = lambda n: 'const N: usize = %s;\nfn u(v: &[u8], k: usize) { assert!(k > 0 && v.len() == N); }\n' % n
+    case('a const named in an ambiguous assert! (behind &&) that is bumped is flagged', scoped('tests/scope.rs', NA(3), NA(4)), True, ['k>0&&v.len()==N [N]  3 -> 4'])
+    case('a const named through a path in an ambiguous assert! resolves over the tree',
+         shared('fn u(v: &[u8], k: usize) { assert!(k > 0 && v.len() == crate::EXPECTED_N); }\n', L(18), L(19)), True, ['k>0&&v.len()==crate::EXPECTED_N [EXPECTED_N]  18 -> 19'])
+    for a_, k_ in (('(items.len()) == %s', '(items.len())==%s'), ('items.len() as u32 == %s', 'items.len()asu32==%s'),
+                   ('!(items.len() == %s)', '!(items.len()==%s)'), ('items.len() == %s || ok', 'items.len()==%s||ok'),
+                   ('ok && items.len() == %s', 'ok&&items.len()==%s')):
+        case('an assert!(%s) is ambiguous and its literal bump is flagged' % (a_ % 'N'),
+             scoped('tests/scope.rs', 'fn t() { assert!(%s); }\n' % (a_ % 18), 'fn t() { assert!(%s); }\n' % (a_ % 19)), True,
+             [(k_ % 18) + '  ?count#ambiguous -> (none)', (k_ % 19) + '  (none) -> ?count#ambiguous'])
+    def amb_leg(label, a_):                               # assert!(a_ % 18) -> assert!(a_ % 19), undeclared: both spellings flagged
+        k_ = re.sub(r'\s+', '', a_)
+        case('%s: assert!(%s) is ambiguous and its literal bump is flagged' % (label, a_ % 'N'),
+             scoped('tests/scope.rs', 'fn t() { assert!(%s); }\n' % (a_ % 18), 'fn t() { assert!(%s); }\n' % (a_ % 19)), True,
+             [(k_ % 18) + '  ?count#ambiguous -> (none)', (k_ % 19) + '  (none) -> ?count#ambiguous'])
+    # #5797 (round-6 F1): a cast to ANY type between the count call and == leaves the call in the left operand
+    for l_, a_ in (('M1 path cast behind &&', 'ok && v.len() as core::primitive::usize == %s'),
+                   ('M7 generic cast behind &&', 'ok && v.len() as Wrapping<usize> == %s'),
+                   ('path cast', 'v.len() as core::primitive::usize == %s'), ('reference cast', 'v.len() as &usize == %s'),
+                   ('pointer cast', 'v.len() as *const usize == %s'), ('nested generic cast', 'v.len() as Option<Vec<usize>> == %s'),
+                   ('double cast', 'v.len() as usize as u64 == %s'), ('negated path cast', '!(v.len() as core::primitive::usize == %s)'),
+                   ('closure-only path cast', 'v.iter().any(|x| x.len() as core::primitive::usize == %s)'),
+                   ('closure without parameters, path cast', '(|| v.len() as a::T == %s)()'),
+                   ('a second count behind &&, path cast', 'v.len() > 0 && v.len() as a::T == %s')):
+        amb_leg(l_, a_)
+    # #5798 (round-6 F2): braces, a block comment, a method chain or anything else between the count call and ==
+    for l_, a_ in (('M2 braces behind &&', 'ok && { v.len() } == %s'), ('M4 block comment behind &&', 'ok && v.len() /* n */ == %s'),
+                   ('M8 .into() behind &&', 'ok && v.len().into() == %s'), ('braces', '{ v.len() } == %s'),
+                   ('line break behind &&', 'ok && v.len()\n        == %s'),
+                   ('.into()', 'v.len().into() == %s'), ('.try_into().unwrap()', 'v.len().try_into().unwrap() == %s'),
+                   ('space inside the call', 'v.len () == %s'), ('.count() with spaces inside the call', 'v.iter().count( ) == %s && ok'),
+                   ('count call as a call argument', 'f(v.len(), 2) == %s'), ('if-expression operand', 'if ok { v.len() } else { 0 } == %s'),
+                   ('arithmetic after a cast', 'ok && v.len() as u64 + 0 == %s'), ('closure-only braces', 'v.iter().any(|x| { x.len() } == %s)'),
+                   ('match arm after =>', 'match k { _ => v.len() as a::T == %s }'), ('tuple operand', '(v.len(), 2) == (%s, 2)'),
+                   ('a block with a statement', '{ let n = v.len(); n } == %s'),
+                   ('an array operand', '[v.len(), 0][0] == %s'), ('space after the dot', 'v. len() == %s')):
+        amb_leg(l_, a_)
+    # ---- #5872: a block comment inside the arguments is blank space (nested ones too): it never ends an operand, never
+    # splits an argument and never hides a compare. An assertion the gate cannot read is red with a named line and is
+    # never declarable (5-agent vote (4d3ea1c5) on #5715: an undecidable state is red with a named line) ----
+    for l_, a_ in (('&&', 'ok && v.len() /* && */ == %s'), ('||', 'ok && v.len() /* || */ == %s'),
+                   ('a comma', 'ok && v.len() /* , */ == %s'), ('a semicolon', 'ok && v.iter().count() /* ; */ == %s'),
+                   ('=>', 'ok && v.len() /* => */ == %s'), ('==', 'ok && v.len() /* == 5 */ == %s'),
+                   ('a closing bracket', 'ok && v.len() /* ) */ == %s'), ('an opening bracket', 'ok && v.len() /* ( */ == %s'),
+                   ('a quote', 'ok && v.len() /* " */ == %s'), ('a nested comment with &&', 'ok && v.len() /* a /* && */ b */ == %s'),
+                   ('&& after the close of a nested comment', 'ok && v.len() /* a /* b */ && */ == %s'),
+                   ('&&, before the call', 'ok && /* && */ v.len() == %s'), ('&&, inside the call parentheses', 'ok && v.len(/* && */) == %s')):
+        amb_leg('#5872 a block comment holding %s behind &&' % l_, a_)
+    for l_, b_ in (('assert! with a comment holding && and no other operator', 'assert!(v.len() /* && */ == %s)'),
+                   ('assert! with a comment between the call and ==', 'assert!(v.len() /* n */ == %s)'),
+                   ('assert_eq! with a comment after the call', 'assert_eq!(v.len() /* n */, %s)'),
+                   ('assert_eq! with a comment holding a comma', 'assert_eq!(v.len() /* , */, %s)'),
+                   ('assert_eq! with a comment holding a semicolon after the value', 'assert_eq!(v.len(), %s /* ; */)')):
+        case('#5872 %s is read through the comment' % l_,
+             scoped('tests/scope.rs', 'fn t() { %s; }\n' % (b_ % 18), 'fn t() { %s; }\n' % (b_ % 19)), True, ['v.len()  18 -> 19'])
+    UC = lambda n, pre='': pre + 'fn t() { assert!(ok && v.len() /* == %s); }\n' % n     # an unterminated block comment
+    UK = '!unreadable line %d (an unterminated block comment): assert!(ok&&v.len()/*==%s);}'
+    UL = 'const S: &str = "a\nb\nc";\n'                   # a string literal over three lines
+    case('#5872 an unterminated block comment in an assertion is unreadable, red with its line',
+         scoped('tests/scope.rs', UC(18), UC(19)), True, [(UK % (1, 19)) + '  (none) -> ?count#unreadable'])
+    case('#5872 an unreadable assertion stays red when declared',
+         scoped_m('tests/scope.rs', UC(18), UC(19), msg('test: bump', 'Count: unreadable (none) -> ?count#unreadable (fixture)')), True,
+         [UK % (1, 19)], noerrs=['IGNORED'])
+    case('#5872 an unreadable assertion stays red when both of its findings are declared',
+         scoped_m('tests/scope.rs', UC(18), UC(19), msg('test: bump', 'Count: unreadable ?count#unreadable -> (none), '
+                                                          'unreadable (none) -> ?count#unreadable (fixture)')), True,
+         [UK % (1, 19)], noerrs=['IGNORED'])
+    case('#5872 an unchanged unreadable assertion is red in a commit that changes its file',
+         scoped('tests/scope.rs', 'fn u() {}\n' + UC(18), 'fn u() { let _k = 1; }\n' + UC(18)), True,
+         [(UK % (2, 18)) + '  ?count#unreadable -> ?count#unreadable'])
+    case('#5872 the line of an unreadable assertion counts the lines of a string literal before it',
+         scoped('tests/scope.rs', UC(18, UL), UC(19, UL)), True, [UK % (4, 19)])
+    case('#5872 an unreadable assertion that leaves the tree is a count change',
+         scoped('tests/scope.rs', UC(18), 'fn t() {}\n'), True, [(UK % (1, 18)) + '  ?count#unreadable -> (none)'])
+    case('#5872 an unreadable assertion that leaves the tree, declared, is green',
+         scoped_m('tests/scope.rs', UC(18), 'fn t() {}\n', msg('test: drop', 'Count: unreadable ?count#unreadable -> (none) (fixture)')),
+         False, noerrs=['IGNORED'])
+    case('#5872 an unterminated block comment is unreadable with no count call in the arguments',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok /* == 18); }\n', 'fn t() { assert!(ok /* == 19); }\n'), True,
+         ['!unreadable line 1 (an unterminated block comment): assert!(ok/*==19);}'])
+    # ---- #5888: a file that holds an unreadable assertion names every const it mentions, so a commit that moves one of
+    # them in another file re-reads it and the unreadable finding is red; a const the file does not name moves nothing
+    UR_ = 'fn t(v: &[u8]) { assert!(v.len() == crate::%s /* x ); }\n'
+    case('#5888 an unreadable assertion is red when only a const it names moves in another file',
+         shared(UR_ % 'EXPECTED_N', L(18), L(19)), True, ['!unreadable line 1 (an unterminated block comment)'])
+    case('#5888 an unreadable assertion is not re-read when a const its file does not name moves',
+         shared(UR_ % 'OTHER_N', L(18), L(19)), False)
+    # stated limits (#5715 brings a lexer): a quote or a // inside a block comment is read as the start of a string or of
+    # a line comment, so such an assertion is unreadable (red with its line), never silently skipped
+    case('#5872 a quote inside a block comment, with a string after it, is unreadable (#5715)',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok && v.len() /* " */ == 18, "m"); }\n', 'fn t() { assert!(ok && v.len() /* " */ == 19, "m"); }\n'),
+         True, ['!unreadable line 1 (an unterminated block comment)'])
+    case('#5872 a // inside a block comment is unreadable (#5715)',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok && v.len() /* a // b */ == 18); }\n', 'fn t() { assert!(ok && v.len() /* a // b */ == 19); }\n'),
+         True, ['!unreadable line 1 (an unterminated block comment)'])
+    # ---- #5873: a generic argument list (after ::, after the type path that follows as, or a qualified path at the start
+    # of an operand) is a bracket: a comma, && or || inside it never ends an operand, the > of an -> inside it closes
+    # nothing, and a list whose > the gate cannot find in an assertion holding a count call is red with a named line ----
+    for l_, a_ in (('a turbofish with a comma behind &&', 'ok && v.len() + f::<u8, u16>() == %s'),
+                   ('a turbofish with a comma', 'v.len() + f::<u8, u16>() == %s'),
+                   ('a turbofish with one argument behind &&', 'ok && v.len() + g::<u8>() == %s'),
+                   ('a turbofish with a space after ::', 'ok && v.len() + f:: <u8, u16>() == %s'),
+                   ('a comment between :: and <', 'ok && v.len() + f::/* , */<u8, u16>() == %s'),
+                   ('a nested turbofish', 'ok && v.len() + f::<Vec<(u8, u16)>, W<u8, u16>>() == %s'),
+                   ('a turbofish holding a fn arrow and a comma', 'ok && v.len() + f::<fn(u8) -> u8, u16>() == %s'),
+                   ('a turbofish holding &&', 'v.len() + g::<&&u8>() == %s'),
+                   ('a turbofish holding a const block with <', 'ok && v.len() + h::<{ 1 < 2 }, u8>() == %s'),
+                   ('a comment holding > inside a turbofish', 'ok && v.len() + g::<u8 /* > */>() == %s'),
+                   ('a turbofish on a method', 'ok && v.iter().map(|x| *x as usize).sum::<usize>() + v.len() + f::<u8, u16>() == %s'),
+                   ('a generic cast with a comma', 'ok && v.len() as W<u8, u16> == %s'),
+                   ('a generic cast with a leading ::', 'ok && v.len() as ::m::W<u8, u16> == %s'),
+                   ('a generic cast to a raw identifier', 'ok && v.len() as r#W<u8, u16> == %s'),
+                   ('a generic cast to a raw-identifier path', 'ok && v.len() as r#m::W<u8, u16> == %s'),
+                   ('a generic cast behind a reference with a lifetime', "ok && v.len() as &'static W<u8, u16> == %s"),
+                   ('a generic cast behind a pointer', 'ok && v.len() as *const W<u8, u16> == %s'),
+                   ('a qualified-path cast with a comma', 'ok && v.len() as <usize as Tr<u8, u16>>::O == %s'),
+                   ('a qualified-path operand with a comma', 'ok && v.len() + <usize as Tr<u8, u16>>::O::default() == %s'),
+                   ('a generic cast behind &dyn', 'ok && v.len() as &dyn Tr<u8, u16> == %s'),
+                   ('a generic cast behind &mut', 'ok && v.len() as &mut W<u8, u16> == %s'),
+                   ('a generic cast with a space before <', 'ok && v.len() as W <u8, u16> == %s'),
+                   ('a qualified-path cast whose type holds a comma', 'ok && v.len() as <W<u8, u16> as Tr>::O == %s'),
+                   ('a qualified-path operand whose type holds a comma', 'ok && v.len() + <W<u8, u16> as Tr>::O::default() == %s'),
+                   ('a qualified path that starts the argument', '<W<u8, u16> as Tr>::O::f() && v.len() == %s'),
+                   ('a turbofish holding nested parentheses', 'ok && v.len() + f::<fn((u8, u16)) -> u8>() == %s'),
+                   ('a shift left', 'ok && v.len() << 1 == %s'), ('a shift right after a turbofish', 'ok && v.len() + g::<u8>() >> 1 == %s'),
+                   ('a less-than compare before the count', '0 < v.len() && v.len() == %s'),
+                   ('a less-or-equal compare after a cast', 'ok && (v.len() as usize) <= 20 && v.len() == %s')):
+        amb_leg('#5873 ' + l_, a_)
+    case('#5873 assert_eq! with a turbofish in the count expression is read',
+         scoped('tests/scope.rs', 'fn t() { assert_eq!(v.iter().collect::<Vec<u8>>().len(), 18); }\n',
+                'fn t() { assert_eq!(v.iter().collect::<Vec<u8>>().len(), 19); }\n'), True, ['v.iter().collect::<Vec<u8>>().len()  18 -> 19'])
+    case('#5873 assert_eq! with a qualified path holding a comma in the value keeps the whole value',
+         scoped('tests/scope.rs', 'fn t() { assert_eq!(v.len(), 18 + <usize as Tr<u8, u16>>::O::default()); }\n',
+                'fn t() { assert_eq!(v.len(), 19 + <usize as Tr<u8, u16>>::O::default()); }\n'), True,
+         ['v.len()  ?18+<usizeasTr<u8,u16>>::O::default() -> ?19+<usizeasTr<u8,u16>>::O::default()'])
+    TF = lambda n: 'fn t() { assert!(ok && v.len() + f::<u8, u16() == %s); }\n' % n
+    case('#5873 a turbofish with no closing > in a count assertion is unreadable, red with its line',
+         scoped('tests/scope.rs', TF(18), TF(19)), True,
+         ['!unreadable line 1 (a generic argument list `<` with no closing `>`): assert!(ok&&v.len()+f::<u8,u16()==19);}  (none) -> ?count#unreadable'])
+    case('#5873 a turbofish with no closing > in a count assertion on a later line is unreadable, red with that line',
+         scoped('tests/scope.rs', 'fn u() { let _a = 1; let _b = 2; }\n' + TF(18), 'fn u() { let _a = 1; let _b = 2; }\n' + TF(19)), True,
+         ['!unreadable line 2 (a generic argument list `<` with no closing `>`): assert!(ok&&v.len()+f::<u8,u16()==19);}  (none) -> ?count#unreadable'])
+    case('#5873 a turbofish with no closing > and no count call is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok && k == f::<u8, u16() + 18); }\n', 'fn t() { assert!(ok && k == f::<u8, u16() + 19); }\n'), False)
+    TP = lambda n: 'fn t() { assert!(ok && (f::<u8) + v.len() == %s); }\n' % n      # the list meets a ) before its >
+    case('#5873 a turbofish closed by ) before its > in a count assertion is unreadable, red with its line',
+         scoped('tests/scope.rs', TP(18), TP(19)), True,
+         ['!unreadable line 1 (a generic argument list `<` with no closing `>`): assert!(ok&&(f::<u8)+v.len()==19);}  (none) -> ?count#unreadable'])
+    case('#5873 a turbofish closed by ) before its > with no count call is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok && (f::<u8) + k == 18); }\n', 'fn t() { assert!(ok && (f::<u8) + k == 19); }\n'), False)
+    case('#5873 a turbofish with no closing > whose only count call is in a comment is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok && k + f::<u8 /* v.len() */ == 18); }\n',
+                'fn t() { assert!(ok && k + f::<u8 /* v.len() */ == 19); }\n'), False)
+    case('#5873 a turbofish count assertion, declared, is green',
+         scoped_m('tests/scope.rs', 'fn t() { assert!(v.len() + f::<u8, u16>() == 18); }\n', 'fn t() { assert!(v.len() + f::<u8, u16>() == 19); }\n',
+                  msg('test: bump', 'Count: v.len()+f::<u8,u16>()==18 ?count#ambiguous -> (none), v.len()+f::<u8,u16>()==19 (none) -> ?count#ambiguous (fixture)')),
+         False, noerrs=['IGNORED'])
+    # stated limits, pinned with today's reading (a move here is NOT flagged): #5799 #5800 #5801 #5714
+    for l_, a0_ in (('M3 an assert_eq! tuple first argument (#5799)', 'assert_eq!((v.len(), v.len()), (2, %s))'),
+                    ('an assert_eq! first argument cast to a path type (#5799)', 'assert_eq!(v.len() as core::primitive::usize, %s)'),
+                    ('an assert! comparing the count with .eq() (#5800)', 'assert!(v.len().eq(&%s))'),
+                    ('an assert! comparing the count with matches! (#5800)', 'assert!(matches!(v.len(), %s))'),
+                    ('an assert! with a path-call count (#5801)', 'assert!(<[u8]>::len(v) == %s)'),
+                    ('an assert_eq! with a path-call count (#5801)', 'assert_eq!(<[u8]>::len(v), %s)'),
+                    ('an assert_eq! with a space inside the count call (#5801)', 'assert_eq!(v.len (), %s)'),
+                    ('a reversed operand behind && (#5714)', 'assert!(ok && %s == v.len())'),
+                    ('a free-function count such as row_count() (#5801)', 'assert!(row_count() == %s)'),
+                    ('a .count(..) call with an argument (#5801)', 'assert!(m.count(k) == %s)')):
+        case('stays unread: %s' % l_, scoped('tests/scope.rs', 'fn t() { %s; }\n' % (a0_ % 18), 'fn t() { %s; }\n' % (a0_ % 19)), False)
+    case('a count call behind && in a closure, with == on another operand, is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(v.iter().all(|x| x.len() > 0 && x[0] == 18)); }\n',
+                'fn t() { assert!(v.iter().all(|x| x.len() > 0 && x[0] == 19)); }\n'), False)
+    case('a count call compared with >, with == on another operand behind &&, is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(v.len() > 0 && n == 18); }\n', 'fn t() { assert!(v.len() > 0 && n == 19); }\n'), False)
+    # every operand stop is pinned: && by the leg above, and each of these with a count call before the stop and == after
+    # it on another operand (not read). == ends the left operand of a later == in its own branch of compares_count; that
+    # reset changes no reading (a count call cannot hold `=`), and the leg '== after &&' pins that the left operand of the
+    # second == never reaches back past the first. The != and '== after &&' legs are textual: rustc refuses a chained
+    # compare, the gate reads text and must still stop there (#5874)
+    for l_, a0_ in (('a comma', 'assert!(f(v.len(), n == %s))'), ('a semicolon', 'assert!({ let k = v.len(); n == %s })'),
+                    ('||', 'assert!(v.len() > 0 || n == %s)'), ('a match arm =>', 'assert!(match k { _ if v.len() > 0 => n == %s, _ => true })'),
+                    ('!=', 'assert!(v.len() != 0 == %s)'), ('== after &&', 'assert!(v.len() > 0 && n == 1 == %s)')):
+        case('operand stop %s: a count call before it, with == after it, is not read' % l_,
+             scoped('tests/scope.rs', 'fn t() { %s; }\n' % (a0_ % 18), 'fn t() { %s; }\n' % (a0_ % 19)), False)
+    case('an assert! comparing the count with <= is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(v.len() <= 18); }\n', 'fn t() { assert!(v.len() <= 19); }\n'), False)
+    case('an assert! with a closure count comparison that is not == is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(v.iter().all(|x| x.len() > 2)); }\n', 'fn t() { assert!(v.iter().all(|x| x.len() > 3)); }\n'), False)
+    # #5761 (S2): which comparison an assert! binds to is pinned: only ONE == outside every bracket ((), [] and {}) binds
+    case('an inner comparison in the RIGHT operand does not bind: the left count is the assertion',
+         scoped('tests/scope.rs', 'fn t() { assert!(items.len() == v.iter().filter(|x| x.len() == 2).count()); }\n',
+                'fn t() { assert!(items.len() == v.iter().filter(|x| x.len() == 3).count()); }\n'), True,
+         ['items.len()  ?v.iter().filter(|x|x.len()==2).count() -> ?v.iter().filter(|x|x.len()==3).count()'])
+    case('two == outside every bracket are ambiguous (not bound to the first)',
+         scoped('tests/scope.rs', 'fn t() { assert!(items.len() == 18 == ok); }\n', 'fn t() { assert!(items.len() == 19 == ok); }\n'), True,
+         ['items.len()==18==ok  ?count#ambiguous -> (none)', 'items.len()==19==ok  (none) -> ?count#ambiguous'])
+    case('two == outside every bracket are ambiguous (not bound to the last)',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok == items.len() == 18); }\n', 'fn t() { assert!(ok == items.len() == 19); }\n'), True,
+         ['ok==items.len()==18  ?count#ambiguous -> (none)', 'ok==items.len()==19  (none) -> ?count#ambiguous'])
+    case('a == inside braces (a struct literal) is inside a bracket and does not bind',
+         scoped('tests/scope.rs', 'fn t() { assert!(S { a: k == 1 }.n.len() == 3); }\n', 'fn t() { assert!(S { a: k == 1 }.n.len() == 4); }\n'), True,
+         ['S{a:k==1}.n.len()  3 -> 4'])
+    case('a closure outside every bracket makes the assert! ambiguous',
+         scoped('tests/scope.rs', 'fn t() { assert!(|x: &[u8]| x.len() == 18); }\n', 'fn t() { assert!(|x: &[u8]| x.len() == 19); }\n'), True,
+         ['|x:&[u8]|x.len()==18  ?count#ambiguous -> (none)'])
+    case('assert_eq! with two inner .len() calls binds to the outer count',
+         scoped('tests/scope.rs', 'fn t() { assert_eq!(v.iter().filter(|x| x.len() == w.len()).count(), 3); }\n',
+                'fn t() { assert_eq!(v.iter().filter(|x| x.len() == w.len()).count(), 4); }\n'), True, ['v.iter().filter(|x|x.len()==w.len()).count()  3 -> 4'])
+    case('assert_eq! with a parenthesised receiver is read', scoped('tests/scope.rs', 'fn t() { assert_eq!((items).len(), 18); }\n', 'fn t() { assert_eq!((items).len(), 19); }\n'), True, ['(items).len()  18 -> 19'])
+    case('an ambiguous assert! whose closure compares a .count() is flagged when it appears',
+         scoped('tests/scope.rs', 'fn t() {}\n', 'fn t() { assert!(v.iter().any(|x| x.chars().count() == 2)); }\n'), True, ['v.iter().any(|x|x.chars().count()==2)  (none) -> ?count#ambiguous'])
+    case('a path-qualified const in an ambiguous assert! is resolved over the tree, not to a same-named local const',
+         shared('const EXPECTED_N: usize = 5;\nfn u(v: &[u8], k: usize) { assert!(k > 0 && v.len() == crate::EXPECTED_N); }\n', L(18), L(19)), True,
+         ['k>0&&v.len()==crate::EXPECTED_N [EXPECTED_N]  ?EXPECTED_N#ambiguous(18,5) -> ?EXPECTED_N#ambiguous(19,5)'])
+    case('a const named through <T as Tr>:: in an ambiguous assert! is tracked and resolved over the tree',
+         shared('const EXPECTED_N: usize = 5;\nfn u(v: &[u8], k: usize) { assert!(k > 0 && v.len() == <S as Tr>::EXPECTED_N); }\n', L(18), L(19)), True,
+         ['k>0&&v.len()==<SasTr>::EXPECTED_N [EXPECTED_N]  ?EXPECTED_N#ambiguous(18,5) -> ?EXPECTED_N#ambiguous(19,5)'])
+    # ---- end #5759 ----
+    case('a .rs file under benches/ is not checked', scoped('benches/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
+    case('a non-.rs file under tests/ is not checked', scoped('tests/scope.txt', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
+    case('a .rs file under src/ is checked', scoped('src/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), True, ['items.len()  18 -> 19'])
+    # #5711: eligibility is anchored at the REPOSITORY ROOT: src/ and tests/ at any depth below it, nothing nested elsewhere
+    case('a .rs file in a subdirectory of tests/ is checked', scoped('tests/sub/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), True, ['items.len()  18 -> 19'])
+    for p_ in ('tools/x/src/scope.rs', 'tools/x/tests/scope.rs', 'examples/scope.rs', 'fuzz/fuzz_targets/scope.rs'):
+        case('a .rs file under %s is not checked (not the repository-root src/ or tests/)' % p_.rsplit('/', 1)[0],
+             scoped(p_, E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
+    # ---- #5712: clause pins from the sentence sweep of the changelog and this header (#5714 #5715 #5716 pin the limits) ----
+    case('a reversed operand order assert_eq!(<rhs>, <expr>.len()) is not read',
+         scoped('tests/scope.rs', 'fn t() { assert_eq!(18, items.len()); }\n', 'fn t() { assert_eq!(19, items.len()); }\n'), False)
+    case('a reversed operand order assert!(<rhs> == <expr>.len()) is not read', scoped('tests/scope.rs', 'fn t() { assert!(18 == items.len()); }\n', 'fn t() { assert!(19 == items.len()); }\n'), False)
+    case('assert_ne! is not read', scoped('tests/scope.rs', E('assert_ne', 'len', 18), E('assert_ne', 'len', 19)), False)
+    case('an assertion inside a block comment is read as code', scoped('tests/scope.rs', '/* ' + E('assert_eq', 'len', 18) + ' */\n', '/* ' + E('assert_eq', 'len', 19) + ' */\n'), True, ['items.len()  18 -> 19'])
+    case('an assertion after a line comment marker is not read', scoped('tests/scope.rs', '// ' + E('assert_eq', 'len', 18), '// ' + E('assert_eq', 'len', 19)), False)
+    case('an assertion inside a double-quoted string literal is not read', scoped('tests/scope.rs', 'const S: &str = "%s";\n' % E('assert_eq', 'len', 18).strip(), 'const S: &str = "%s";\n' % E('assert_eq', 'len', 19).strip()), False)
+    case('a raw string is blanked only up to its first inner quote', scoped('tests/scope.rs', 'const S: &str = r#"q " %s "#;\n' % E('assert_eq', 'len', 18).strip(), 'const S: &str = r#"q " %s "#;\n' % E('assert_eq', 'len', 19).strip()), True, ['items.len()  18 -> 19'])
+    def c_parent_tools(s, b):                              # the parent holds the expression only in a file that is not checked
+        s.w('tools/x/src/old.rs', 'fn t() { assert_eq!(builds.len(), 1); }\n'); t0 = s.commit('test: tools file')
+        s.w('tests/n1.rs', 'fn t() { assert_eq!(builds.len(), 2); }\n'); s.commit('test: new file'); return t0 + '..HEAD'
+    case('a new file whose expression exists in the parent only in an unchecked file is skipped as new', c_parent_tools, False)
+    case('a const of the same name in an unchecked file is not a second definition',
+         shared(A('crate::EXPECTED_N'), L(18), L(19), {'tools/x/src/lib.rs': L(3)}), True, ['sections.len() [EXPECTED_N]  18 -> 19'])
+    case('a const defined only in an unchecked file stays unresolved, so its bump there moves nothing',
+         shared(A('crate::OTHER_N') + '// a\n', L(18), L(18), {'tools/x/src/lib.rs': 'pub const OTHER_N: usize = 1;\n'},
+                {'tools/x/src/lib.rs': 'pub const OTHER_N: usize = 2;\n', SH: A('crate::OTHER_N') + '// b\n'}), False)
     def c_ren(s, b):                                       # the defining file is renamed with the bump
         s.w('src/lib.rs', L(18) + PAD); s.w(SH, A('crate::EXPECTED_N')); t0 = s.commit('test: add')
         s.g('mv', 'src/lib.rs', 'src/consts.rs'); s.w('src/consts.rs', L(19) + PAD); s.commit('test: move and bump'); return t0 + '..HEAD'
@@ -763,6 +1324,9 @@ def selftest():
     def c_late_abbrev(s, b):
         o = offender(s, b); s.touch(msg('docs: declare', late(o, S_FF, sha=o[:12]))); return b + '..HEAD'
     case('late declaration with an abbreviated sha', c_late_abbrev, True, ['18 -> 19'], ['40-character'])
+    def c_late_upper(s, b):
+        o = offender(s, b); s.touch(msg('docs: declare', late(o, S_FF, sha=o.upper()))); return b + '..HEAD'
+    case('late declaration with an upper-case sha', c_late_upper, True, ['18 -> 19'], ['40-character'])
     def c_late_partial(s, b):
         o = offender(s, b, two=True); s.touch(msg('docs: declare', late(o, S_FF))); return b + '..HEAD'
     case('late declaration covering one of two hits', c_late_partial, True, ['long_name.len()  5 -> 6'])
@@ -920,6 +1484,8 @@ commit's trailer block (the last paragraph of the message):
 or, from a LATER commit of the same range (the range cannot be rewritten):
     Count-Declared: <40-char sha of the offender> <what> <old> -> <new> (<why>)
 <old> and <new> must equal the finding above for EVERY changed assertion.
+A finding named !unreadable cannot be declared: the gate could not read that
+assertion (the reason is in the finding). Rewrite it so the gate can read it.
 MSG
   exit 1
 fi

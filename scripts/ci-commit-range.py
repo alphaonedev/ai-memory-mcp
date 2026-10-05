@@ -33,12 +33,24 @@ has no comparable previous tip) and says the next ordinary push produces a
 comparable range; a refused run is red and a re-run cannot turn it green
 (#5603, #5604). A merge_group refusal for a missing base_sha says the same.
 
-Every sha must be exactly 40 lowercase hex characters, must not be all zeros
-and must resolve to a commit here before it reaches git as an argument (git is
-always called with an argument list, never a shell).
+An empty range is a valid output, not a refusal: push with before equal to the
+new tip or moving a branch backward, a pull_request whose base equals its head
+or whose head is an ancestor of its base, and merge_group with base_sha equal
+to head_sha each print A..B with no commits (git rev-list --count A..B is 0)
+and exit 0. merge_group does not check that base_sha is an ancestor of
+head_sha: a non-ancestor base prints base..head and exits 0.
 
-Output: one line "A..B" (or just "A" with --base-only) on stdout and exit 0, or one "ci-commit-range: REFUSED"
-line on stderr and exit 1. Usage errors exit 2. A failed --self-test exits 3.
+Every sha must be exactly 40 lowercase hex characters, must not be all zeros
+and must resolve to a commit here before it reaches git as an argument (computing
+a range, through main(), choose(), checked_sha() and env_or(), calls git only
+through git(), with an argument list and no shell; run_git() is the self-test's
+fixture helper; only the --red-proof mode runs the frozen pre-fix workflow
+block through bash -c, #5713, #5601).
+
+Output: one line "A..B" (or just "A" with --base-only) on stdout and exit 0, or one
+"ci-commit-range: REFUSED: <why>" line on stderr, nothing on stdout, and exit 1. Usage
+errors (argparse) exit 2. A failed --self-test exits 3. Each of these is a named self-test
+case (#5713).
 
     python3 scripts/ci-commit-range.py --self-test
     python3 scripts/ci-commit-range.py --red-proof   # old YAML block vs fixtures
@@ -200,7 +212,7 @@ def run_git(repo, *args):
 
 
 def build_fixture(root):
-    """Return (repo, shas): main c1..c3, a branch off c1 (b1), a shallow clone."""
+    """Return (repo, shallow, shas): repo has main c1..c3 and a branch off c1 (b1); shallow is a depth-1 clone."""
     repo = root / "repo"
     repo.mkdir()
     run_git(repo, "init", "-q", "-b", "main")
@@ -224,6 +236,11 @@ def build_fixture(root):
     # Objects that exist but are not commits.
     shas["tree"] = run_git(repo, "rev-parse", "main^{tree}")
     shas["blob"] = run_git(repo, "rev-parse", "main:c1.txt")
+    # A commit object that is present but contained in no branch or tag: what a force-push leaves behind
+    # on a reused checkout after the old branch is deleted and the reflog is expired (#5670).
+    shas["orphan"] = run_git(repo, "commit-tree", shas["tree"], "-p", shas["c1"], "-m", "orphan")
+    if run_git(repo, "for-each-ref", "--contains", shas["orphan"]) != "":
+        raise RuntimeError("fixture orphan commit is reachable from a ref")
     shallow = root / "shallow"
     proc = subprocess.run(
         ["git", "clone", "-q", "--depth", "1", "file://" + str(repo), str(shallow)],
@@ -233,11 +250,26 @@ def build_fixture(root):
     return repo, shallow, shas
 
 
+def empty_range_cases(shas):
+    """(label, event, kwargs, expected) for every empty range the docstring promises (#5671)."""
+    c1, c3 = shas["c1"], shas["c3"]
+    return [
+        ("empty: push moving a branch backward", "push", {"before": c3, "head": c1}, "%s..%s" % (c3, c1)),
+        ("empty: pull_request base equals head", "pull_request", {"pr_base": c3, "pr_head": c3}, "%s..%s" % (c3, c3)),
+        ("empty: pull_request head is an ancestor of base", "pull_request", {"pr_base": c3, "pr_head": c1},
+         "%s..%s" % (c1, c1)),
+        ("empty: merge_group base_sha equals head_sha", "merge_group", {"mg_base": c3, "mg_head": c3},
+         "%s..%s" % (c3, c3)),
+    ]
+
+
 def cases(shas):
     """(label, event, kwargs, expected) ; expected None = refusal, str = range."""
     c1, c2, c3, b1 = shas["c1"], shas["c2"], shas["c3"], shas["b1"]
     ghost = shas["ghost"]
     out = []
+    for label, event, kw, expected in empty_range_cases(shas):
+        out.append((label, event, kw, expected))
 
     def case(label, event, expected, **kw):
         out.append((label, event, kw, expected))
@@ -245,6 +277,11 @@ def cases(shas):
     case("push normal", "push", "%s..%s" % (c1, c3), before=c1, head=c3)
     case("push empty range (before == head)", "push", "%s..%s" % (c3, c3), before=c3, head=c3)
     case("push all-zero before", "push", None, before=ZERO_SHA, head=c3)
+    case("push force (before is not an ancestor of head)", "push", "%s..%s" % (b1, c3), before=b1, head=c3)
+    case("push before present but contained in no branch or tag", "push",
+         "%s..%s" % (shas["orphan"], c3), before=shas["orphan"], head=c3)
+    case("push head present but contained in no branch or tag", "push",
+         "%s..%s" % (c1, shas["orphan"]), before=c1, head=shas["orphan"])
     case("push unreachable before", "push", None, before=ghost, head=c3)
     case("push missing before", "push", None, head=c3)
     case("push empty before", "push", None, before="", head=c3)
@@ -275,6 +312,8 @@ def cases(shas):
     case("push ignores merge_group/pr inputs", "push", "%s..%s" % (c1, c3),
          before=c1, head=c3, mg_base=ghost, pr_base=ghost)
     case("merge_group good", "merge_group", "%s..%s" % (c1, c3), mg_base=c1, mg_head=c3)
+    case("merge_group base is not an ancestor of head (not checked)", "merge_group",
+         "%s..%s" % (b1, c3), mg_base=b1, mg_head=c3)
     case("merge_group missing base", "merge_group", None, mg_head=c3)
     case("merge_group empty base", "merge_group", None, mg_base="", mg_head=c3)
     case("merge_group zero base", "merge_group", None, mg_base=ZERO_SHA, mg_head=c3)
@@ -351,7 +390,7 @@ FORBIDDEN_IN_RANGE_STEP = ("HEAD~1", "merge-base", "GITHUB_EVENT_BEFORE", "rev-p
 
 
 def step_run_body(block):
-    """The run body of the step that obtains the range (the one with CALL)."""
+    """Every step of the job block whose text contains "range=" (the caller requires exactly one)."""
     steps = re.split(r"\n      - ", block)
     picked = [s for s in steps if "range=" in s]
     return picked
@@ -540,6 +579,13 @@ def self_test():
             if not good:
                 failures += 1
                 print("FAIL %s: exit=%s out=%r err=%r want=%r" % (label, code, out, err, expected))
+        # Each promised empty range really holds no commit (git rev-list --count A..B is 0) (#5671).
+        for label, event, kw, expected in empty_range_cases(shas):
+            total += 1
+            counted = run_git(repo, "rev-list", "--count", expected)
+            if counted != "0":
+                failures += 1
+                print("FAIL %s: rev-list --count %s is %s, not 0" % (label, expected, counted))
         # Shallow clone: the previous tip is not present, so a push must refuse.
         total += 1
         code, out, err = invoke(shallow, "push", {"before": shas["c1"], "head": run_git(shallow, "rev-parse", "HEAD")})
@@ -589,6 +635,81 @@ def self_test():
         if code != 1 or "creation push" in err:
             failures += 1
             print("FAIL malformed before must not claim a creation push: %r" % err)
+        # An EMPTY flag is still a flag: it overrides a valid environment variable and is refused,
+        # never replaced by the environment (#5645). The control runs the same environment with no flag.
+        env_all = {"PATH": os.environ.get("PATH", ""), "GITHUB_SHA": shas["c3"], "GITHUB_EVENT_BEFORE": shas["c1"],
+                   "PR_BASE_SHA": shas["c1"], "PR_HEAD_SHA": shas["c3"], "MG_BASE_SHA": shas["c1"], "MG_HEAD_SHA": shas["c3"]}
+        want_pr = "%s..%s" % (run_git(repo, "merge-base", shas["c1"], shas["c3"]), shas["c3"])
+        for event, flag in (("push", "--event"), ("push", "--head-sha"), ("push", "--before"),
+                            ("pull_request", "--pr-base"), ("pull_request", "--pr-head"),
+                            ("merge_group", "--mg-base"), ("merge_group", "--mg-head")):
+            env = dict(env_all, GITHUB_EVENT_NAME=event)
+            want = want_pr if event == "pull_request" else "%s..%s" % (shas["c1"], shas["c3"])
+            for label, extra, ok_code in (("empty %s" % flag, [flag, ""], 1), ("control for %s" % flag, [], 0)):
+                total += 1
+                proc = subprocess.run([sys.executable, os.path.abspath(__file__), "--repo", str(repo)] + extra,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, env=env)
+                good = proc.returncode == ok_code and (proc.stdout == want + "\n" if ok_code == 0 else proc.stdout == "")
+                if not good:
+                    failures += 1
+                    print("FAIL %s (%s): exit=%s out=%r" % (label, event, proc.returncode, proc.stdout))
+        probe = "CI_COMMIT_RANGE_SELFTEST_PROBE"
+        saved = os.environ.get(probe)
+        os.environ[probe] = "from-env"
+        try:
+            for label, got, want in (("empty flag beats env", env_or("", probe), ""),
+                                     ("unset flag reads env", env_or(None, probe), "from-env"),
+                                     ("flag beats env", env_or("flag", probe), "flag"),
+                                     ("unset flag, unset env", env_or(None, probe + "_UNSET"), None)):
+                total += 1
+                if got != want:
+                    failures += 1
+                    print("FAIL env_or %s: got %r want %r" % (label, got, want))
+        finally:
+            if saved is None:
+                del os.environ[probe]
+            else:
+                os.environ[probe] = saved
+        # #5713: the CLI contract stated in the module docstring, one named case each.
+        def cli(args, cwd=None, env=None):
+            return subprocess.run([sys.executable, os.path.abspath(__file__)] + args, cwd=cwd, env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        push_env = dict(os.environ, GITHUB_EVENT_NAME="push", GITHUB_EVENT_BEFORE=shas["c1"], GITHUB_SHA=shas["c3"])
+        contract = []
+        proc = cli(["--repo", str(repo)], env=dict(push_env, GITHUB_EVENT_BEFORE=shas["ghost"]))
+        contract.append(("a refusal is exactly one ci-commit-range: REFUSED: line on stderr and nothing on stdout",
+                         proc.returncode == 1 and proc.stdout == "" and len(proc.stderr.splitlines()) == 1
+                         and proc.stderr.startswith("ci-commit-range: REFUSED: ") and proc.stderr.endswith("\n")))
+        proc = cli([], cwd=str(repo), env=push_env)
+        contract.append(("--repo defaults to the current directory",
+                         proc.returncode == 0 and proc.stdout == "%s..%s\n" % (shas["c1"], shas["c3"])))
+        proc = cli(["--repo", str(repo), "--no-such-flag"], env=push_env)
+        contract.append(("an unknown flag is a usage error, exit 2", proc.returncode == 2 and proc.stdout == ""))
+        saved_st = globals()["self_test"]
+        try:
+            globals()["self_test"] = lambda: 1
+            failed_exit = main(["--self-test"])
+            globals()["self_test"] = lambda: 0
+            passed_exit = main(["--self-test"])
+        finally:
+            globals()["self_test"] = saved_st
+        contract.append(("a failed --self-test exits 3 and a passing one exits 0", failed_exit == 3 and passed_exit == 0))
+        import inspect
+        contract.append(("git() and run_git() pass an argument list and never a shell",
+                         all("shell" not in inspect.getsource(f) and '["git", "-C", str(repo)] + list(args)' in inspect.getsource(f)
+                             for f in (git, run_git))))
+        # N1 of #5601 (Refs #5713): computing a range reaches git only through git(); run_git() is fixture-only
+        contract.append(("computing a range (main, choose, checked_sha, env_or) reaches git only through git(), never run_git()",
+                         all("run_git(" not in inspect.getsource(f) for f in (main, choose, checked_sha, env_or))
+                         and all("subprocess" not in inspect.getsource(f) for f in (choose, checked_sha, env_or))
+                         and "git() and run_git()" not in (__doc__ or "")))
+        shell_fns = sorted(n for n, f in globals().items() if inspect.isfunction(f) and '"ba' 'sh", "-c"' in inspect.getsource(f))
+        contract.append(("only red_proof() runs bash -c", shell_fns == ["red_proof"]))
+        for label, good in contract:
+            total += 1
+            if not good:
+                failures += 1
+                print("FAIL %s" % label)
         # Frozen old block: the cases whose answer changed are accepted by it.
         # (Covered by --red-proof; the self-test only needs the new behaviour.)
     total += 1
