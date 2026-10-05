@@ -17,8 +17,10 @@
 # FAILS the gate; a needle is malformed when it carries no subject text beyond
 # the value (#5808), or a character that does not read as written: anything but
 # printable ASCII or a non-ASCII letter, punctuation mark or symbol (a zero-width
-# or no-break space, a combining mark, a BOM; #5809). A STALE entry (it suppresses no hit any more) FAILS the gate:
-# delete it. A missing ledger FAILS the gate.
+# or no-break space, a combining mark, a BOM; #5809). A STALE entry (it
+# suppresses no hit any more) FAILS the gate: delete it. A missing ledger FAILS
+# the gate. The ledger exempts hits of this sweep only: the separate bold-form
+# rule (the word schema, then a bold vN) does not read it.
 #
 # One entry exempts exactly ONE hit (#5809). A hit is one number on one line,
 # however many views of the line (raw, marker-folded, anchor, wrapped-line join,

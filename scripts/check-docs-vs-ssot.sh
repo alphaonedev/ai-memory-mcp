@@ -776,6 +776,21 @@ ARROW = re.compile(r'\s*(?:→|->)')
 
 rows = []
 # ---- the history ledger -------------------------------------------------
+
+
+def readable(ch):
+    # A character a reviewer reads as written (#5809): printable ASCII, or a
+    # non-ASCII letter, punctuation mark or symbol.
+    return ' ' <= ch <= '~' or (ord(ch) > 0x7f and unicodedata.category(ch)[0] in 'LPS')
+
+
+def spell(text):
+    # Every other character is spelled as \uXXXX (tabs kept) in a refusal, so the
+    # log shows what the ledger line really holds and never carries a control
+    # or format character itself (#5809).
+    return ''.join(ch if ch == '\t' or readable(ch) else '\\u%04x' % ord(ch) for ch in text)
+
+
 ledger = {}
 for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8').read().splitlines(), 1):
     if not raw.strip() or raw.lstrip().startswith('#'):
@@ -783,10 +798,10 @@ for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8')
     parts = raw.split('\t')
     if len(parts) != 3 or not parts[0].strip() or not parts[1].strip() \
             or not re.search(r'#[0-9]+', parts[2]):
-        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', raw.strip()[:160]))
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', spell(raw.strip())[:160]))
         continue
     if parts[1] in ledger.get(parts[0].strip(), {}):
-        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', 'duplicate entry: ' + raw.strip()[:140]))
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', 'duplicate entry: ' + spell(raw.strip())[:140]))
         continue
     # A needle must name the ladder number it exempts. One with no ASCII digit
     # (markers, whitespace, format characters, punctuation or words only) names
@@ -795,7 +810,7 @@ for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8')
     # tested (#5699).
     if not re.search(r'[0-9]', parts[1]):
         rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-',
-                     'vacuous needle, names no ladder number (#5699): ' + raw.strip()[:120]))
+                     'vacuous needle, names no ladder number (#5699): ' + spell(raw.strip())[:120]))
         continue
     # A needle must also carry subject text beyond the value (#5808). A needle that
     # is the bare value sits inside every span that claims that value, so one row
@@ -809,7 +824,7 @@ for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8')
                    for t in re.findall(r'[A-Za-z0-9_]+', v))
                for v in (WS.sub(' ', parts[1]), MARKS.sub('', WS.sub(' ', parts[1])))):
         rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-',
-                     'needle carries no subject text beyond the value (#5808): ' + raw.strip()[:120]))
+                     'needle carries no subject text beyond the value (#5808): ' + spell(raw.strip())[:120]))
         continue
     # A needle must read as written (#5809). The rule is positive: every character
     # is printable ASCII, or a non-ASCII letter, punctuation or symbol (the real
@@ -817,17 +832,11 @@ for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8')
     # control, a combining mark, a non-ASCII space or a non-ASCII digit can glue a
     # word to the value, or change the value, without showing it, so a reviewer
     # reads a needle that is not the one shields() matches. It is refused by name.
-    # The message spells each such character as \uXXXX, so the log shows what the
-    # needle really holds and never carries a control character itself.
-    def readable(ch):
-        return ' ' <= ch <= '~' or (ord(ch) > 0x7f and unicodedata.category(ch)[0] in 'LPS')
     bad = [ch for ch in parts[1] if not readable(ch)]
     if bad:
-        shown = ''.join(ch if ch == '\t' or readable(ch) else '\\u%04x' % ord(ch)
-                        for ch in raw.strip())
         rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-',
                      'needle carries a character that does not read as written (U+%04X %s, #5809): %s'
-                     % (ord(bad[0]), unicodedata.category(bad[0]), shown[:120])))
+                     % (ord(bad[0]), unicodedata.category(bad[0]), spell(raw.strip())[:120])))
         continue
     ledger.setdefault(parts[0].strip(), {})[parts[1]] = [n, set()]
 
@@ -3519,20 +3528,29 @@ R5809MD
         || { echo "FAIL: self-test #5809 - expected exactly 3 one-hit refusals" >&2; cd "$REPO_ROOT"; exit 1; }
     rm -f "$tmpdir/docs/schema-fixture.html"
     echo "PASS: self-test #5809 - a ledger row that shields the same phrase on two lines, or twice on one line, FAILS naming every file:line; a hit two rows shield FAILS naming both rows; one hit seen in two views (raw and folded, sweep and anchor, wrapped-line join, html pill and sweep) counts once; a stale claim beside them is still flagged"
-    # ---- #5809 item 2: a needle must read as written. Rows 1, 4, 5 and 6 each
+    # ---- #5809 item 2: a needle must read as written. Rows 1, 4, 5, 6 and 8 each
     # carry subject text and a ladder number, but a zero-width space glues the word
-    # to the value, or a no-break space, a combining mark or a BOM hides inside: each
-    # is refused by name and its claim stays flagged. Rows 2 and 3 use the arrow and
-    # the em dash the real entries use and are accepted.
+    # to the value, or a no-break space (with a later zero-width space: the first
+    # is named), a combining mark, a BOM or a DEL hides inside: each is refused by
+    # name and its claim stays flagged. Rows 2, 3 and 7 (arrow, em dash, tilde) are
+    # accepted. Rows 9 to 12 are refused for another reason (two fields, no digit,
+    # no subject text, a duplicate with a zero-width space in its note); every
+    # refusal spells the unreadable character as \uXXXX and never echoes it.
     {
         printf 'docs/postgres-age-guide.md\twas\xe2\x80\x8b51\t#5809 zero-width space\n'
         printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 50\xe2\x86\x9251\t#5809 arrow, accepted\n'
         printf 'docs/postgres-age-guide.md\tv51 \xe2\x80\x94 the schema_version\t#5809 em dash, accepted\n'
-        printf 'docs/postgres-age-guide.md\tschema_version\xc2\xa0was 51\t#5809 no-break space\n'
+        printf 'docs/postgres-age-guide.md\tschema_version\xc2\xa0was\xe2\x80\x8b 51\t#5809 no-break space, then a zero-width space\n'
         printf 'docs/postgres-age-guide.md\tschema_version wa\xcc\x81s 51\t#5809 combining mark\n'
         printf 'docs/postgres-age-guide.md\tschema_version\xef\xbb\xbf was 51\t#5809 BOM\n'
+        printf 'docs/postgres-age-guide.md\tschema_version ~51\t#5809 tilde, accepted\n'
+        printf 'docs/postgres-age-guide.md\tschema_version was\x7f 51\t#5809 DEL\n'
+        printf 'docs/postgres-age-guide.md\twas\xe2\x80\x8b52\n'
+        printf 'docs/postgres-age-guide.md\twas\xe2\x80\x8b\t#5809 no digit\n'
+        printf 'docs/postgres-age-guide.md\t\xe2\x80\x8b52\t#5809 no subject text\n'
+        printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 50\xe2\x86\x9251\t#5809 arrow\xe2\x80\x8b dup\n'
     } > "$_s"
-    printf 'the schema_version was\xe2\x80\x8b51 then\na CURRENT_SCHEMA_VERSION 50\xe2\x86\x9251 past bump\nv51 \xe2\x80\x94 the schema_version of v0.5\nthe schema_version\xc2\xa0was 51 then\nthe schema_version wa\xcc\x81s 51 then\nthe schema_version\xef\xbb\xbf was 51 then\n' \
+    printf 'the schema_version was\xe2\x80\x8b51 then\na CURRENT_SCHEMA_VERSION 50\xe2\x86\x9251 past bump\nv51 \xe2\x80\x94 the schema_version of v0.5\nthe schema_version\xc2\xa0was 51 then\nthe schema_version wa\xcc\x81s 51 then\nthe schema_version\xef\xbb\xbf was 51 then\nthe schema_version ~51 then\nthe schema_version was\x7f 51 then\n' \
         > "$tmpdir/docs/postgres-age-guide.md"
     _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
         && { echo "FAIL: self-test #5809 - needles that do not read as written were accepted (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -3541,16 +3559,26 @@ R5809MD
         'malformed entry at line 5 "needle carries a character that does not read as written (U+0301 Mn' \
         'malformed entry at line 6 "needle carries a character that does not read as written (U+FEFF Cf' \
         'docs/postgres-age-guide.md:1 claims "51"' 'docs/postgres-age-guide.md:4 claims "51"' \
+        'malformed entry at line 8 "needle carries a character that does not read as written (U+007F Cc' \
         'docs/postgres-age-guide.md:5 claims "51"' 'docs/postgres-age-guide.md:6 claims "51"' \
-        'was\u200b51' 'schema_version\u00a0was 51' 'wa\u0301s 51' 'schema_version\ufeff was 51'
+        'docs/postgres-age-guide.md:8 claims "51"' \
+        $'docs/postgres-age-guide.md\twas\\u200b51\t#5809' 'schema_version\u00a0was\u200b 51' 'wa\u0301s 51' \
+        'schema_version\ufeff was 51' 'schema_version was\u007f 51' \
+        $'malformed entry at line 9 "docs/postgres-age-guide.md\twas\\u200b52"' \
+        $'vacuous needle, names no ladder number (#5699): docs/postgres-age-guide.md\twas\\u200b\t#5809' \
+        $'needle carries no subject text beyond the value (#5808): docs/postgres-age-guide.md\t\\u200b52\t#5809' \
+        $'duplicate entry: docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 50\xe2\x86\x9251\t#5809 arrow\\u200b dup'
     do grep -qF "$_want" <<<"$_s_out" || { echo "FAIL: self-test #5809 - not refused or not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
-    grep -F 'malformed entry' <<<"$_s_out" | grep -qF "$(printf '\xe2\x80\x8b')" \
-        && { echo "FAIL: self-test #5809 - the refusal echoed a zero-width space instead of spelling it" >&2; cd "$REPO_ROOT"; exit 1; }
-    for _not in 'malformed entry at line 2 ' 'malformed entry at line 3 ' 'docs/postgres-age-guide.md:2 ' \
-        'docs/postgres-age-guide.md:3 ' 'STALE entry' 'exactly one is allowed'
+    for _raw in '\xe2\x80\x8b' '\xc2\xa0' '\xcc\x81' '\xef\xbb\xbf' '\x7f'; do
+        grep -F 'malformed entry' <<<"$_s_out" | grep -qF "$(printf "$_raw")" \
+            && { echo "FAIL: self-test #5809 - a ledger refusal echoed $_raw instead of spelling it" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    for _not in 'malformed entry at line 2 ' 'malformed entry at line 3 ' 'malformed entry at line 7 ' \
+        'docs/postgres-age-guide.md:2 ' 'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:7 ' \
+        'STALE entry' 'exactly one is allowed'
     do grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5809 - a readable needle was refused or its history flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
-    echo "PASS: self-test #5809 - a ledger needle with a zero-width space, a no-break space, a combining mark or a BOM is refused by name and its claim stays flagged; an arrow or an em dash is accepted"
+    echo "PASS: self-test #5809 - a ledger needle with a zero-width space, a no-break space, a combining mark, a BOM or a DEL is refused naming its first such character and its claim stays flagged; an arrow, an em dash or a tilde is accepted; every ledger refusal spells such characters and never echoes them"
     rm -f "$tmpdir/docs/postgres-age-guide.md"
     printf '# fixture ledger (comment-only)\n' > "$_s"
 
