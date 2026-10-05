@@ -32,8 +32,8 @@ runs in a process where no .pth file or sitecustomize of the installation ran; w
 code already replaced a sys hook (Ubuntu's apport replaces sys.excepthook) the start is refused
 like any other replacement, so start it with -I -S as the first line does. Stated limits: code
 that runs inside the interpreter before line 1 (an LD_PRELOAD library already loaded, an audit
-hook, a modified installation) can forge any check; the python3 found on PATH and its installation are trusted; Python 3.9 has no
-sys.orig_argv, so there the entry check rests on __file__, __spec__ and sys.argv[0].
+hook, a modified installation) can forge any check; the python3 found on PATH and its installation are trusted; on Python 3.9, which has no
+sys.orig_argv, the interpreter command line is read through ctypes (Py_GetArgcArgv), and a start where it cannot be read is refused.
 
 EXIT CODES. 0 only when at least one PASS was recorded, no FAIL was, and the summary and every
 output stream were written; --help is 0. 1: a preflight failure, a RED run, a missing option
@@ -62,7 +62,7 @@ _LAB_START_GLOBALS = (
     "__builtins__", "__file__", "__cached__", "sys", "_LAB_REFUSED_RC",
     "_LAB_ALLOWED_OPTION_LETTERS", "_LAB_ALLOWED_XOPTIONS", "_LAB_REQUIRED_FLAGS",
     "_LAB_TOLERATED_FLAGS", "_LAB_STRUCTSEQ_ATTRS", "_LAB_START_GLOBALS", "_LAB_BUILTIN_NAMES",
-    "_lab_refuse", "_lab_flag_reasons", "_lab_argv_reasons", "_lab_entry_reasons",
+    "_lab_refuse", "_lab_flag_reasons", "_lab_ctypes_argv", "_lab_orig_argv", "_lab_argv_reasons", "_lab_entry_reasons",
     "_lab_hook_reasons", "_lab_world_reasons", "_lab_start_state",
 )
 _LAB_BUILTIN_NAMES = (
@@ -111,11 +111,31 @@ def _lab_flag_reasons():
     return reasons
 
 
-def _lab_argv_reasons():
-    """The interpreter options before the script token (Python 3.10+: sys.orig_argv)."""
+def _lab_ctypes_argv():
+    """The interpreter command line from Py_GetArgcArgv through ctypes; None when it cannot be read."""
+    try:
+        import ctypes
+        argc = ctypes.c_int()
+        argv = ctypes.POINTER(ctypes.c_wchar_p)()
+        ctypes.pythonapi.Py_GetArgcArgv(ctypes.byref(argc), ctypes.byref(argv))
+        return [argv[n] for n in range(argc.value)]
+    except Exception:  # noqa: BLE001 - an unreadable command line is a refusal, never a pass
+        return None
+
+
+def _lab_orig_argv():
+    """The interpreter command line: sys.orig_argv (3.10+), else the ctypes reader (3.9); None when unreadable."""
     orig = getattr(sys, "orig_argv", None)
-    if orig is None:
-        return []
+    if orig is not None:
+        return list(orig)
+    return _lab_ctypes_argv()
+
+
+def _lab_argv_reasons():
+    """The interpreter options before the script token (sys.orig_argv, or ctypes on Python 3.9)."""
+    orig = _lab_orig_argv()
+    if orig is None or len(orig) < 1 or any(type(t) is not str for t in orig):
+        return ["the interpreter command line cannot be read (Python 3.9 needs ctypes)"]
     reasons = []
     i = 1
     script = None
@@ -310,8 +330,10 @@ def _lab_stage1_reasons(names):
     me = os.path.realpath(names["__file__"])
     if os.path.realpath(os.path.abspath(sys.argv[0])) != me:
         reasons.append("argv[0] does not resolve to this file")
-    orig = getattr(sys, "orig_argv", None)
-    if orig is not None:
+    orig = _lab_orig_argv()
+    if orig is None:
+        reasons.append("the interpreter command line cannot be read")
+    else:
         tokens = [t for t in orig[1:] if not t.startswith("-") and not t.startswith("frozen_modules=")]
         if not tokens or os.path.realpath(os.path.abspath(tokens[0])) != me:
             reasons.append("the script on the interpreter command line is not this file")
@@ -2351,6 +2373,10 @@ def selftest_start_state(T, base):
     with open(copy, "wb") as fh:
         fh.write(source)
     os.chmod(copy, 0o755)
+    plain_dir = os.path.join(base, "plain")
+    os.makedirs(plain_dir)
+    with open(os.path.join(plain_dir, "run.py"), "wb") as fh:
+        fh.write(source)
     marker = os.path.join(base, "marker")
     shadow_body = ("import builtins as _b\n_f = _b.open(%r, 'a')\n_f.write(__name__ + '\\n')\n_f.close()\n"
                    "_real = _b.open\n" % marker)
@@ -2443,7 +2469,7 @@ def selftest_start_state(T, base):
         ("start state: -c that sets __file__ first is refused",
          [py, "-I", "-S", "-c", "__file__ = %r\nexec(compile(open(%r).read(), %r, 'exec'))" % (copy, copy, copy), "--help"],
          None, None, "entry by -c or -m"),
-        ("start state: -m from the script directory is refused", [py, "-m", "run", "--help"], None, copy_dir, "REFUSED"),
+        ("start state: -m from the script directory is refused", [py, "-m", "run", "--help"], None, plain_dir, "REFUSED"),
         ("start state: run as a module through runpy.run_module is refused",
          [py, "-I", "-S", "-c", "import sys, runpy; sys.path.insert(0, %r); sys.argv = [%r, '--help']; "
           "runpy.run_module('run', run_name='__main__', alter_sys=True)" % (copy_dir, copy)], None, None,
@@ -2465,6 +2491,11 @@ def selftest_start_state(T, base):
     _child(T, base, "start state: entry from stdin is refused", [py, "-I", "-S", "-", "--help"], _LAB_REFUSED_RC,
            "run.py: REFUSED: entry from stdin is not allowed",
            stdin_path=copy, marker_ok=True)
+    orig_now = getattr(sys, "orig_argv", None)
+    ctypes_now = _lab_ctypes_argv()
+    T.leg("5908: the ctypes command-line reader (Python 3.9 path) agrees with sys.orig_argv",
+          ctypes_now == list(orig_now) if orig_now is not None else ctypes_now is not None and len(ctypes_now) >= 1, True,
+          "%r vs %r" % (ctypes_now, orig_now))
     drivers = (
         ("bar-b: a driver that replaces open before running the file is refused",
          "import builtins, runpy, sys\nreal = builtins.open\nbuiltins.open = lambda *a, **k: real(*a, **k)\n"
@@ -2496,6 +2527,9 @@ def selftest_start_state(T, base):
         ("start state: a driver that runs the file through exec is refused",
          "import sys\nsys.argv = [%r, '--help']\nsrc = %r\nexec(compile(open(src).read(), src, 'exec'), {'__name__': '__main__', "
          "'__file__': src})\n", "__builtins__ is not the builtins module"),
+        ("5908: a command line that cannot be read (no sys.orig_argv, ctypes unusable) is refused",
+         "import runpy, sys\nif hasattr(sys, 'orig_argv'):\n    del sys.orig_argv\nsys.modules['ctypes'] = None\n"
+         "sys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n", "command line cannot be read"),
         ("start state: a trace hook set before the file runs is refused",
          "import runpy, sys\nsys.settrace(lambda *a: None)\nsys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n",
          "trace or profile hook"),
