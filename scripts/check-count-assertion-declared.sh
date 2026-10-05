@@ -63,8 +63,9 @@
 # repository-root src/ and tests/ directories (#5711, #5716; tools/*/src, examples/,
 # benches/ and fuzz/ are not checked),
 # the OLD and NEW contents are parsed whole (`//` line comments stripped and
-# double-quoted string literals blanked; a `/* */` block comment is read as code,
-# and a raw string is blanked only up to its first inner quote, #5712, #5715), every
+# double-quoted string literals blanked, a line break kept; outside the arguments
+# of an assert! or assert_eq! a `/* */` block comment is read as code, and a raw
+# string is blanked only up to its first inner quote, #5712, #5715), every
 # count assertion is extracted as (normalised expression, value), and the two
 # sets are compared: an assertion whose value moved, appeared or disappeared is a
 # count change, except that an assertion whose values are all undecidable
@@ -99,6 +100,17 @@
 #     is never exempt (so adding, removing or rewording it is a count change),
 #     and every const name in it is tracked as `<spelling> [NAME]` with the
 #     const's value, so bumping that const is a count change too.
+#   * BLOCK COMMENTS AND UNREADABLE ASSERTIONS (#5872; 5-agent vote (4d3ea1c5)
+#     on #5715): inside the arguments of an assert! or assert_eq! a `/* */`
+#     block comment, nested ones too, is blank space, so an operator, a comma,
+#     a semicolon or a bracket inside it never ends an operand, splits an
+#     argument or hides a compare. An assertion whose arguments the gate cannot
+#     read (a block comment with no closing `*/`, which is also what a quote or
+#     a `//` inside a block comment becomes until #5715 brings a lexer) is
+#     tracked as `!unreadable line <N> (<reason>): <spelling>` with the value
+#     `?count#unreadable`. It is red in every commit that changes its file (or
+#     moves a const that file names) and cannot be declared; one that leaves
+#     the tree is a count change `?count#unreadable -> (none)`, declared as usual.
 #   * NOT READ assert! (stated limits): a count call only on the right of every
 #     `==` (reversed operands, `18 == v.len()`, also behind `&&`; #5714); a count
 #     compared without `==` (`v.len().eq(&18)`, `matches!(v.len(), 18)`; #5800);
@@ -157,7 +169,8 @@ CHR = re.compile(r"'(?:[^'\\\n]|\\[^\n]|\\u\{[0-9a-fA-F_]+\})'")
 
 def clean(t):
     t = re.sub(r'//[^\n]*', '', t)                       # line comments
-    return CHR.sub("''", LIT.sub('""', t))               # string and char literals are not code
+    # string and char literals are not code; a blanked string keeps its line breaks, so a line number stays true
+    return CHR.sub("''", LIT.sub(lambda m: '"' + '\n' * m.group().count('\n') + '"', t))
 
 
 # The full Rust integer literal grammar (#5577): decimal, 0x, 0o, 0b, underscores, a type suffix. Normalised to decimal.
@@ -187,41 +200,70 @@ COUNT_CALL = re.compile(r'\.\s*(?:len|count)\s*\(\s*\)')
 # what ends the left operand of a `==` at its own bracket depth (scanning back from the `==`)
 OPERAND_STOPS = ('&&', '||', '==', '!=', '=>')
 CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]*)\s*:\s*(?:usize|u\d+|i\d+)\s*=\s*(?P<val>[^;]+?)\s*;')
+UNREAD = '?count#unreadable'
+UNREADABLE = '!unreadable'      # the key prefix of an undecidable assertion: red in every commit that reads its file
 
 
-def macro_args(t, i):
-    """t[i:] follows a macro's '('. -> the text up to the matching ')', or None when unbalanced, when a ';' is met at
-    depth 0, or when the first depth-0 closer is not ')'."""
-    depth, angle, j, n = 0, 0, i, len(t)
-    while j < n:
-        ch = t[j]
-        if ch in '([{': depth += 1
-        elif ch in ')]}':
-            if depth == 0: return t[i:j] if ch == ')' else None
-            depth -= 1
-        elif ch == ';' and depth == 0: return None
-        j += 1
+def block_end(t, j):
+    """t[j:] starts with `/*` -> the offset just past its closing `*/`, nested comments included; None when unterminated."""
+    depth, k, n = 1, j + 2, len(t)
+    while k < n:
+        if t.startswith('/*', k): depth += 1; k += 2
+        elif t.startswith('*/', k):
+            depth -= 1; k += 2
+            if depth == 0: return k
+        else: k += 1
     return None
 
 
-def split_arg(rest):
-    """-> (the first top-level comma-separated argument of `rest`, stripped; the text after its comma, or None when
-    there is no further argument). Turbofish commas do not split."""
-    depth, angle, j, n = 0, 0, 0, len(rest)
+def macro_args(t, i):
+    """t[i:] follows a macro's '('. -> (orig, shape): orig is the text up to the matching ')'; shape is the same text,
+    the same length, with every block comment blanked (nested ones too),
+    so a comment is never read as an operator, a comma or a stop (#5872).
+    -> None when unbalanced, when a ';' is met at depth 0, or when the first depth-0 closer is not ')'.
+    -> a reason string when the arguments are undecidable: an unterminated block comment."""
+    out, depth, j, n = [], 0, i, len(t)
+    while j < n:                                          # pass 1: the extent of the arguments, comments blanked
+        if t.startswith('/*', j):
+            k = block_end(t, j)
+            if k is None: return 'an unterminated block comment'
+            out.append(re.sub(r'[^\n]', ' ', t[j:k])); j = k; continue
+        ch = t[j]
+        if ch in '([{': depth += 1
+        elif ch in ')]}':
+            if depth == 0:
+                if ch != ')': return None
+                break
+            depth -= 1
+        elif ch == ';' and depth == 0: return None
+        out.append(ch); j += 1
+    else:
+        return None
+    return t[i:j], ''.join(out)
+
+
+def trim(s, a, b):
+    """-> (a', b'): the bounds of s[a:b] with surrounding whitespace removed."""
+    while a < b and s[a].isspace(): a += 1
+    while b > a and s[b - 1].isspace(): b -= 1
+    return a, b
+
+
+def split_arg(s, a=0):
+    """-> (end of the first top-level comma-separated argument of s[a:], offset just past its comma or None when there
+    is no further argument). s is a shape (macro_args), so a comma inside a comment never splits; turbofish commas do
+    not split."""
+    depth, angle, j, n = 0, 0, a, len(s)
     while j < n:
-        ch = rest[j]
-        if rest.startswith('::<', j): angle += 1; j += 3; continue
+        ch = s[j]
+        if s.startswith('::<', j): angle += 1; j += 3; continue
         if angle and ch == '<': angle += 1
-        elif angle and ch == '>' and rest[j - 1:j] != '-': angle -= 1
+        elif angle and ch == '>' and s[j - 1:j] != '-': angle -= 1
         elif ch in '([{': depth += 1
         elif ch in ')]}': depth -= 1
-        elif ch == ',' and depth == 0 and angle == 0: return rest[:j].strip(), rest[j + 1:]
+        elif ch == ',' and depth == 0 and angle == 0: return j, j + 1
         j += 1
-    return rest.strip(), None
-
-
-def first_arg(rest):
-    return split_arg(rest)[0]
+    return n, None
 
 
 def top_ops(arg):
@@ -242,10 +284,11 @@ AMBIG = '?count#ambiguous'
 
 
 def compares_count(arg):
-    """True when the LEFT OPERAND of some `==` of `arg`, at ANY bracket depth, holds a count call (#5797, #5798).
-    The left operand runs back from the `==` to the nearest `&&`, `||`, `==`, `!=`, `=>`, `,` or `;` at the same
+    """True when the LEFT OPERAND of some `==` of `arg` (a shape), at ANY bracket depth, holds a count call (#5797,
+    #5798). The left operand runs back from the `==` to the nearest `&&`, `||`, `==`, `!=`, `=>`, `,` or `;` at the same
     depth, or to the bracket that opens that depth; whatever else sits between the call and the `==` (a cast to any
-    type, braces, a block comment, a method chain, a line break, arithmetic) keeps the call in the operand."""
+    type, braces, a block comment, a method chain, a line break, arithmetic) keeps the call in the
+    operand."""
     starts, j, n = [0], 0, len(arg)                       # starts[-1]: where the current operand begins at this depth
     while j < n:
         ch, two = arg[j], arg[j:j + 2]
@@ -261,16 +304,19 @@ def compares_count(arg):
     return False
 
 
-def read_cond(arg):
-    """assert!'s first argument -> (expr, method, rhs) when the WHOLE argument is `<expr>.len()|.count() == <rhs>`: one
-    `==` at depth 0, no depth-0 `&&` or `|`, and the left operand ends in the count call (#5710, #5759). Any other
-    argument in which the left operand of some `==`, at any bracket depth, holds a count call (compares_count) ->
-    AMBIG, never a guess (#5797, #5798); otherwise -> None."""
-    eqs, logic = top_ops(arg)
+def read_cond(o, s):
+    """assert!'s first argument, as (orig, shape) -> (expr, method, rhs) when the WHOLE argument is
+    `<expr>.len()|.count() == <rhs>`: one `==` at depth 0, no depth-0 `&&` or `|`, and the left operand ends in the count
+    call (#5710, #5759). Any other argument in which the left operand of some `==`, at any bracket depth, holds a count
+    call (compares_count) -> AMBIG, never a guess (#5797, #5798); otherwise -> None."""
+    eqs, logic = top_ops(s)
     if len(eqs) == 1 and not logic:
-        m = TAIL.match(arg[:eqs[0]].strip())
-        if m: return m.group('expr'), m.group('m'), arg[eqs[0] + 2:].strip()
-    return AMBIG if compares_count(arg) else None
+        a, b = trim(s, 0, eqs[0])
+        m = TAIL.match(s[a:b])
+        if m:
+            ra, rb = trim(s, eqs[0] + 2, len(s))
+            return o[a:a + m.end('expr')], m.group('m'), o[ra:rb]
+    return AMBIG if compares_count(s) else None
 
 
 # A const-shaped name (NAME, a::NAME, <T as Tr>::NAME) anywhere in an ambiguous assert!'s first argument; a name right
@@ -297,13 +343,22 @@ def extract(text):
     for h in HEAD.finditer(text):
         args = macro_args(text, h.end())
         if args is None: continue
-        first, more = split_arg(args)
+        if isinstance(args, str):                         # undecidable arguments: red with a named line (#5872)
+            line = text.count('\n', 0, h.start()) + 1
+            src = re.sub(r'\s+', '', text[h.start():].split('\n', 1)[0])[:80]
+            out.setdefault(f'{UNREADABLE} line {line} ({args}): {src}', set()).add(UNREAD)
+            continue
+        o, s = args                                       # o: the text as written; s: its shape (macro_args)
+        fa, fb = trim(s, 0, split_arg(s)[0])
+        more = split_arg(s)[1]
+        first = o[fa:fb]
         if h.group('eq'):                                 # assert_eq!: the WHOLE first argument is the count call
-            m = TAIL.match(first)
+            m = TAIL.match(s[fa:fb])
             if not m or more is None: continue
-            got, rhs = (m.group('expr'), m.group('m')), first_arg(more)
+            ra, rb = trim(s, more, split_arg(s, more)[0])
+            got, rhs = (first[:m.end('expr')], m.group('m')), o[ra:rb]
         else:                                             # assert!: the WHOLE first argument is `<expr>.len() == <rhs>`
-            got = read_cond(first)
+            got = read_cond(first, s[fa:fb])
             if got is None: continue
             if got == AMBIG:                              # undecidable shape: tracked by its whole spelling, never exempt
                 key = re.sub(r'\s+', '', first)
@@ -448,6 +503,9 @@ def count_changes(c):
         new = resolve(c, new_st[np_][0]) if (np_ and np_ in new_st) else {}
         for expr in sorted(set(old) | set(new)):
             o, n = old.get(expr, set()), new.get(expr, set())
+            if expr.startswith(UNREADABLE) and n:         # an undecidable assertion in the new tree: red whenever its file is
+                hits.append((np_ or op, expr, ','.join(sorted(o)) or '(none)', UNREAD))   # read, never declarable
+                continue                                 # (one that leaves the tree is a declarable `-> (none)` below)
             if o == n: continue
             if (not o and all(v.startswith('?') and '#' not in v for v in n)) or (not n and all(v.startswith('?') and '#' not in v for v in o)):
                 continue                                 # an assertion with no literal count on either side moves no count (#5577)
@@ -586,7 +644,7 @@ def check_range(rng):
                 if any(item_matches(it, h) for h in hits[c]): own.append(it)
                 else: err.append(f'count-assertion-declared: IGNORED Count in {short(c)}: "{it[0]} {it[1]} -> {it[2]}" matches no change of this commit')
         declared = own + accepted.get(c, [])
-        if covers(declared, hits[c]): continue
+        if covers(declared, hits[c]) and not any(h[3] == UNREAD for h in hits[c]): continue   # an unreadable one: never declarable
         subj = msgs[c].split('\n', 1)[0]
         out.append(f'  {short(c)}  {subj[:70]}')
         for h in hits[c][:8]: out.append(f'      {h[0]}  {h[1]}  {h[2]} -> {h[3]}')
@@ -956,7 +1014,7 @@ def selftest():
     # #5798 (round-6 F2): braces, a block comment, a method chain or anything else between the count call and ==
     for l_, a_ in (('M2 braces behind &&', 'ok && { v.len() } == %s'), ('M4 block comment behind &&', 'ok && v.len() /* n */ == %s'),
                    ('M8 .into() behind &&', 'ok && v.len().into() == %s'), ('braces', '{ v.len() } == %s'),
-                   ('block comment', 'v.len() /* n */ == %s'), ('line break behind &&', 'ok && v.len()\n        == %s'),
+                   ('line break behind &&', 'ok && v.len()\n        == %s'),
                    ('.into()', 'v.len().into() == %s'), ('.try_into().unwrap()', 'v.len().try_into().unwrap() == %s'),
                    ('space inside the call', 'v.len () == %s'), ('.count() with spaces inside the call', 'v.iter().count( ) == %s && ok'),
                    ('count call as a call argument', 'f(v.len(), 2) == %s'), ('if-expression operand', 'if ok { v.len() } else { 0 } == %s'),
@@ -965,6 +1023,52 @@ def selftest():
                    ('a block with a statement', '{ let n = v.len(); n } == %s'),
                    ('an array operand', '[v.len(), 0][0] == %s'), ('space after the dot', 'v. len() == %s')):
         amb_leg(l_, a_)
+    # ---- #5872: a block comment inside the arguments is blank space (nested ones too): it never ends an operand, never
+    # splits an argument and never hides a compare. An assertion the gate cannot read is red with a named line and is
+    # never declarable (5-agent vote (4d3ea1c5) on #5715: an undecidable state is red with a named line) ----
+    for l_, a_ in (('&&', 'ok && v.len() /* && */ == %s'), ('||', 'ok && v.len() /* || */ == %s'),
+                   ('a comma', 'ok && v.len() /* , */ == %s'), ('a semicolon', 'ok && v.iter().count() /* ; */ == %s'),
+                   ('=>', 'ok && v.len() /* => */ == %s'), ('==', 'ok && v.len() /* == 5 */ == %s'),
+                   ('a closing bracket', 'ok && v.len() /* ) */ == %s'), ('an opening bracket', 'ok && v.len() /* ( */ == %s'),
+                   ('a quote', 'ok && v.len() /* " */ == %s'), ('a nested comment with &&', 'ok && v.len() /* a /* && */ b */ == %s'),
+                   ('&&, before the call', 'ok && /* && */ v.len() == %s'), ('&&, inside the call parentheses', 'ok && v.len(/* && */) == %s')):
+        amb_leg('#5872 a block comment holding %s behind &&' % l_, a_)
+    for l_, b_ in (('assert! with a comment holding && and no other operator', 'assert!(v.len() /* && */ == %s)'),
+                   ('assert! with a comment between the call and ==', 'assert!(v.len() /* n */ == %s)'),
+                   ('assert_eq! with a comment after the call', 'assert_eq!(v.len() /* n */, %s)'),
+                   ('assert_eq! with a comment holding a comma', 'assert_eq!(v.len() /* , */, %s)'),
+                   ('assert_eq! with a comment holding a semicolon after the value', 'assert_eq!(v.len(), %s /* ; */)')):
+        case('#5872 %s is read through the comment' % l_,
+             scoped('tests/scope.rs', 'fn t() { %s; }\n' % (b_ % 18), 'fn t() { %s; }\n' % (b_ % 19)), True, ['v.len()  18 -> 19'])
+    UC = lambda n, pre='': pre + 'fn t() { assert!(ok && v.len() /* == %s); }\n' % n     # an unterminated block comment
+    UK = '!unreadable line %d (an unterminated block comment): assert!(ok&&v.len()/*==%s);}'
+    UL = 'const S: &str = "a\nb\nc";\n'                   # a string literal over three lines
+    case('#5872 an unterminated block comment in an assertion is unreadable, red with its line',
+         scoped('tests/scope.rs', UC(18), UC(19)), True, [(UK % (1, 19)) + '  (none) -> ?count#unreadable'])
+    case('#5872 an unreadable assertion stays red when declared',
+         scoped_m('tests/scope.rs', UC(18), UC(19), msg('test: bump', 'Count: unreadable (none) -> ?count#unreadable (fixture)')), True,
+         [UK % (1, 19)], noerrs=['IGNORED'])
+    case('#5872 an unchanged unreadable assertion is red in a commit that changes its file',
+         scoped('tests/scope.rs', 'fn u() {}\n' + UC(18), 'fn u() { let _k = 1; }\n' + UC(18)), True,
+         [(UK % (2, 18)) + '  ?count#unreadable -> ?count#unreadable'])
+    case('#5872 the line of an unreadable assertion counts the lines of a string literal before it',
+         scoped('tests/scope.rs', UC(18, UL), UC(19, UL)), True, [UK % (4, 19)])
+    case('#5872 an unreadable assertion that leaves the tree is a count change',
+         scoped('tests/scope.rs', UC(18), 'fn t() {}\n'), True, [(UK % (1, 18)) + '  ?count#unreadable -> (none)'])
+    case('#5872 an unreadable assertion that leaves the tree, declared, is green',
+         scoped_m('tests/scope.rs', UC(18), 'fn t() {}\n', msg('test: drop', 'Count: unreadable ?count#unreadable -> (none) (fixture)')),
+         False, noerrs=['IGNORED'])
+    case('#5872 an unterminated block comment is unreadable with no count call in the arguments',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok /* == 18); }\n', 'fn t() { assert!(ok /* == 19); }\n'), True,
+         ['!unreadable line 1 (an unterminated block comment): assert!(ok/*==19);}'])
+    # stated limits (#5715 brings a lexer): a quote or a // inside a block comment is read as the start of a string or of
+    # a line comment, so such an assertion is unreadable (red with its line), never silently skipped
+    case('#5872 a quote inside a block comment, with a string after it, is unreadable (#5715)',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok && v.len() /* " */ == 18, "m"); }\n', 'fn t() { assert!(ok && v.len() /* " */ == 19, "m"); }\n'),
+         True, ['!unreadable line 1 (an unterminated block comment)'])
+    case('#5872 a // inside a block comment is unreadable (#5715)',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok && v.len() /* a // b */ == 18); }\n', 'fn t() { assert!(ok && v.len() /* a // b */ == 19); }\n'),
+         True, ['!unreadable line 1 (an unterminated block comment)'])
     # stated limits, pinned with today's reading (a move here is NOT flagged): #5799 #5800 #5801 #5714
     for l_, a0_ in (('M3 an assert_eq! tuple first argument (#5799)', 'assert_eq!((v.len(), v.len()), (2, %s))'),
                     ('an assert_eq! first argument cast to a path type (#5799)', 'assert_eq!(v.len() as core::primitive::usize, %s)'),
@@ -1247,6 +1351,8 @@ commit's trailer block (the last paragraph of the message):
 or, from a LATER commit of the same range (the range cannot be rewritten):
     Count-Declared: <40-char sha of the offender> <what> <old> -> <new> (<why>)
 <old> and <new> must equal the finding above for EVERY changed assertion.
+A finding named !unreadable cannot be declared: the gate could not read that
+assertion (the reason is in the finding). Rewrite it so the gate can read it.
 MSG
   exit 1
 fi
