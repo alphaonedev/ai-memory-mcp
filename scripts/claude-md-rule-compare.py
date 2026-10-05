@@ -877,10 +877,10 @@ def _self_test_cases() -> int:
         print(f"INFO: self-test - importlib already loaded without -S: {no_s.preloaded} (measured, not assumed)")
         return ""
 
-    # The refusal_prefix_gap pins (#5628): the refusal_pins table below lists them, and a check after the loop requires the
-    # table to equal the pin_<number> functions defined here. They start no child process (also checked after the
-    # loop). Each has its own function and its own PASS/FAIL line (#5591), separate from importlib_plant, whose banner
-    # and issue tags they would otherwise borrow.
+    # The refusal_prefix_gap pins (#5628): the refusal_pins table below lists them. run_refusal_pins requires the table
+    # to equal the pin_<number> functions and names in this file (found by ast at any depth) and requires that no pin
+    # starts a child process; planted cases prove each half trips (#5677). Each pin has its own function and its own
+    # PASS/FAIL line (#5591), separate from importlib_plant, whose banner and issue tags they would otherwise borrow.
     raw = Path(__file__).read_bytes()
     source = raw.decode("utf-8")
 
@@ -1242,21 +1242,59 @@ def _self_test_cases() -> int:
     def raising_pin():
         raise TypeError("planted")
 
+    def run_refusal_pins(table, pin_source):
+        """#5628, #5677: run every pin in the table while counting subprocess.Popen calls, then return the results
+        and the gap: the child processes the pins started, and any difference between the table and the pin_<number>
+        functions or names bound anywhere in pin_source (any depth, any indent, found by ast, not by a pattern)."""
+        real_popen, popen_calls = subprocess.Popen, []
+
+        def counting_popen(*args, **kwargs):
+            popen_calls.append(args)
+            return real_popen(*args, **kwargs)
+
+        subprocess.Popen = counting_popen
+        try:
+            results = {pin_issue: run_pin(pin_issue, pin_check) for pin_issue, pin_check in table.items()}
+        finally:
+            subprocess.Popen = real_popen
+        defined = set()
+        for node in ast.walk(ast.parse(pin_source)):
+            name = node.name if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else \
+                node.id if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) else ""
+            if re.fullmatch(r"pin_\d+", name):
+                defined.add("#" + name[4:])
+        gap = [f"a pin started {len(popen_calls)} child process(es)"] if popen_calls else []
+        if set(table) != defined:
+            gap.append(f"the refusal_pins table {sorted(table)} is not the pin_<number> functions {sorted(defined)}")
+        return results, "; ".join(gap)
+
+    def popen_pin():
+        subprocess.Popen([sys.executable, "-I", "-c", ""], stdin=subprocess.DEVNULL).wait()
+        return ""
+
     refusal_pins = {"#5510": pin_5510, "#5560": pin_5560, "#5562": pin_5562, "#5563": pin_5563, "#5588": pin_5588, "#5589": pin_5589, "#5590": pin_5590}
-    real_popen, popen_calls = subprocess.Popen, []
-
-    def counting_popen(*args, **kwargs):
-        popen_calls.append(args)
-        return real_popen(*args, **kwargs)
-
-    subprocess.Popen = counting_popen
-    try:
-        pin_results = {pin_issue: run_pin(pin_issue, pin_check) for pin_issue, pin_check in refusal_pins.items()}
-    finally:
-        subprocess.Popen = real_popen
-    if popen_calls or set(refusal_pins) != {"#" + n for n in re.findall(r"^    def pin_(\d+)\(", source, re.M)}:
+    pin_results, pin_gap = run_refusal_pins(refusal_pins, source)
+    if pin_gap:
         failures.append("refusal pin table")
-        print(f"FAIL: self-test - the refusal_pins table is not the pin_<number> functions, or a pin started a child process ({len(popen_calls)}) (#5628)", file=sys.stderr)
+        print(f"FAIL: self-test - {pin_gap} (#5628)", file=sys.stderr)
+    # #5677: each half of the gap check has a planted case that must trip it, and only it.
+    green = {pin_issue: (lambda: "") for pin_issue in refusal_pins}
+    nested = source + "\nif True:\n    if True:\n        def pin_9998():\n            return ''\n"
+    plants = (("a table missing a pin", dict(list(green.items())[1:]), source, "is not the pin_<number>"),
+              ("a table with an extra pin", dict(green, **{"#9999": lambda: ""}), source, "is not the pin_<number>"),
+              ("a pin defined at a deeper indent", green, nested, "is not the pin_<number>"),
+              ("a pin bound by assignment", green, source + "\npin_9997 = None\n", "is not the pin_<number>"),
+              ("a pin that starts a child process", {"#9996": popen_pin}, "def pin_9996():\n    pass\n",
+               "child process"))
+    for plant_label, plant_table, plant_source, needle in plants:
+        plant_gap = run_refusal_pins(plant_table, plant_source)[1]
+        other = "child process" if needle != "child process" else "is not the pin_<number>"
+        if needle not in plant_gap or other in plant_gap:
+            failures.append(f"refusal pin plant {plant_label}")
+            print(f"FAIL: self-test - {plant_label} gave the gap {plant_gap!r}, not one naming {needle!r} (#5677)",
+                  file=sys.stderr)
+        else:
+            print(f"PASS: self-test - {plant_label} is reported by the refusal pin check (#5677)")
     for pin_issue, pin_failure in pin_results.items():
         if not pin_failure:
             print(f"PASS: self-test - the refusal_prefix_gap pin {pin_issue} is green")
