@@ -2134,6 +2134,7 @@ ROUND3_RED = [
     ('5821 substitution pin: reported 4: a substitution inside a sh -c payload', 'sh -c "$(which mysql) -p$X"'),
     ('5821 substitution pin: reported 5: an escaped substitution in an ssh payload runs on the far side', 'ssh h "sudo \\$(which mysql) -p$X"'),
     ('5821 substitution pin: reported 6: nested substitutions', '$(realpath $(command -v mysql)) -p"$X"'),
+    ('5859 mutant pin: reported 1: a backtick substitution in a quote is read like $(', 'echo "`sudo mysql -uroot -p$X`"'),
     ('5858 mutant pin: reported 1: a verb outside a quote does not hide a head that the substitution in the quote runs', 'echo "$(sudo mysql -uroot -p$X)"'),
     ('5683 mutant pin: reported 2: the password command word of mysqladmin is matched in any letter case', 'mysqladmin PASSWORD "x$NEW"'),
 ]
