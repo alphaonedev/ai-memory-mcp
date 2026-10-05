@@ -456,7 +456,8 @@ def imported_modules(path: Path) -> list:
     interpreter is not stated here: plant_probe has the child report whether each name is loaded, built-in or
     frozen, and the self-test requires the planted file to run exactly when the child says it is not (#5441).
     EXPECTED_IMPORTS pins the set (#5472). Dynamic imports (importlib.import_module, __import__) are not found by
-    this ast scan (#5405); the script has none."""
+    this ast scan (#5405). They cannot run before the refusal: refusal_prefix_gap (#5510) requires the code above it to
+    be the docstring and `import sys`; the self-test applies it to this file."""
     names = set()
     for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Import):
@@ -465,6 +466,35 @@ def imported_modules(path: Path) -> list:
             names.add(node.module.split(".")[0])
     names.discard("sys")
     return sorted(names)
+
+
+def refusal_prefix_gap(source: str) -> str:
+    """#5510: "" when the only statements that execute above the isolation refusal in `source` are the docstring and
+    `import sys`, and the refusal is exactly `if __name__ == "__main__" and not sys.flags.isolated:` whose body is
+    calls to print and sys.exit with constant arguments; otherwise why not. Parsed with ast, never executed. Module
+    level statements are the only code that runs when the file is started, so a dynamic import, eval, exec, a branch,
+    a class body or a decorator above the refusal cannot hide: any statement outside this whitelist is refused."""
+    try:
+        body = ast.parse(source).body
+    except SyntaxError as exc:
+        return f"the source does not parse: {exc}"
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        body = body[1:]
+    if not body or not isinstance(body[0], ast.Import) or [(a.name, a.asname) for a in body[0].names] != [("sys", None)]:
+        return "the first statement after the docstring is not `import sys`"
+    if len(body) < 2 or not isinstance(body[1], ast.If) or body[1].orelse:
+        return "the statement after `import sys` is not the refusal if"
+    refusal = body[1]
+    want = ast.dump(ast.parse('__name__ == "__main__" and not sys.flags.isolated', mode="eval").body)
+    if ast.dump(refusal.test) != want:
+        return "the refusal test is not `__name__ == \"__main__\" and not sys.flags.isolated`"
+    for stmt in refusal.body:
+        call = stmt.value if isinstance(stmt, ast.Expr) else None
+        name = ast.unparse(call.func) if isinstance(call, ast.Call) else ""
+        if name not in ("print", "sys.exit") or call.keywords or not all(isinstance(a, ast.Constant) for a in call.args):
+            return "the refusal body is not print and sys.exit calls with constant arguments"
+    return ""
 
 
 def selftest_dir() -> Path:
@@ -706,6 +736,28 @@ def _self_test_cases() -> int:
             return "parse_plant accepted a probe child that exited non-zero (#5509)"
         if not parse_plant("VERDICT 0 0 1 1 0 -\nPLANTED\n", [], ("-S", "-E")).planted_ran:
             return "parse_plant did not read the planted marker (#5473)"
+        # #5510: nothing may execute above the refusal except `import sys`. The real source must pass; each synthetic
+        # source (mutant M05b and siblings: a dynamic import, an eval, an import in a branch, a class body, a decorator,
+        # a second imported name, a call inside the refusal, a weakened refusal test) must be refused.
+        source = Path(__file__).read_text(encoding="utf-8")
+        if refusal_prefix_gap(source):
+            return f"the source has code above the isolation refusal: {refusal_prefix_gap(source)} (#5510)"
+        marker = "if __name__ == \"__main__\" and not sys.flags.isolated:"
+        before = {"__import__('colorsys')\n", "import json\n", "if False:\n    import json\n", "x = eval('1')\n",
+                  "class C:\n    import json\n", "@(lambda f: f)\ndef g():\n    pass\n", "exec('pass')\n",
+                  "import importlib\nimportlib.import_module('colorsys')\n", "x = 1\n", "from os import path\n"}
+        for inserted in sorted(before):
+            if not refusal_prefix_gap(source.replace(marker, inserted + marker, 1)):
+                return f"code above the isolation refusal was not refused: {inserted!r} (#5510)"
+        for old, new in (("import sys\n\nif __name__", "import sys, json\n\nif __name__"),
+                         ("import sys\n\nif __name__", "import sys as s\nimport sys\n\nif __name__"),
+                         ("sys.exit(1)", "sys.exit(__import__('colorsys'))"), ("    print(\"## CLAUDE.md rule-change", "    __import__('colorsys')\n    print(\"## CLAUDE.md rule-change"),
+                         ("not sys.flags.isolated:", "not sys.flags.isolated or True:"), ("not sys.flags.isolated:", "not sys.flags.isolated or __import__('colorsys'):"),
+                         (marker, "if True:"), ("import sys\n\nif __name__", "import sys\n\nx = 1\nif __name__")):
+            if old not in source or not refusal_prefix_gap(source.replace(old, new, 1)):
+                return f"a changed refusal or import line was not refused: {new!r} (#5510)"
+        if not refusal_prefix_gap("") or not refusal_prefix_gap("import sys\n"):
+            return "a source without the refusal was not refused (#5510)"
         names = list(EXPECTED_IMPORTS)  # the probe set is the pin, never the output of imported_modules (#5472)
         if "importlib" not in names:
             return "importlib is not in the plant set"
