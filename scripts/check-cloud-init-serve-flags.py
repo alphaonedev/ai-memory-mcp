@@ -3491,6 +3491,14 @@ def secret_output_problems(base: tuple, known: set) -> list:
             bad.append("a store-url password with a nameref was not refused (%r)" % pw[:12])
         if "Mark9" in out:
             bad.append("failure output carries a store-url password (%r)" % pw[:12])
+    # the expansion hit cuts the command word at 40 bytes: scrub first, or the cut drops the @
+    spec = {"aws": [(dec, "      postgres://aimemory:ExpMark9xyzExpMark9xyzExpMark9xyz@h/$X a\n" + dec)]}
+    t, mt, a, p, auto, extra = case_inputs(base, spec)
+    hits, faults, _ = run_scan(t, mt, a, p, known, cache={})
+    if not any("expansion or command substitution" in h for h in hits):
+        bad.append("an expanded command word that quotes a store url was not refused")
+    if "ExpMark9" in "\n".join(faults + hits):
+        bad.append("an expansion hit carries a store-url password")
     # main() itself prints through printable: stub the scan so that its hit and fault both
     # quote a password, and read what reaches stderr (a fault path and a hit path)
     scan_real, load_real = globals()["run_scan"], globals()["load_repo"]
@@ -3504,8 +3512,19 @@ def secret_output_problems(base: tuple, known: set) -> list:
                 rc = main(["check"])
             if rc not in (1, 2) or "MainMark9" in err.getvalue() or "<userinfo>" not in err.getvalue():
                 bad.append("main() printed a store-url password or no redaction (rc %r)" % rc)
+        # the exception path of main() and probe_failure on a raw hit (#5438)
+        def boom():
+            raise RuntimeError("bad postgres://aimemory:ExcMark9xyz@localhost")
+        globals()["load_repo"] = boom
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = main(["check"])
+        if rc != 2 or "ExcMark9" in err.getvalue() or "<userinfo>" not in err.getvalue():
+            bad.append("main() exception path printed a store-url password (rc %r)" % rc)
     finally:
         globals()["run_scan"], globals()["load_repo"] = scan_real, load_real
+    if "PfMark9" in probe_failure("p", "green", "red", ["x postgres://aimemory:PfMark9xyz@localhost"]):
+        bad.append("probe_failure printed a store-url password")
     return bad
 
 
