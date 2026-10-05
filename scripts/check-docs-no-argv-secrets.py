@@ -1714,12 +1714,26 @@ def operand_views(text: str, words: List[Word], mask: bool = True) -> Tuple[str,
     return " " + " ".join(view), " " + " ".join(lits)
 
 
-def mount_shaped(literal_operand: str) -> bool:
+# F1 (round 10): the only expansions a mount source may hold before its first literal colon.
+MOUNT_SOURCE_EXPANSION_RE = re.compile(r"\$(?:\{(?P<b>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<n>[A-Za-z_][A-Za-z0-9_]*))")
+MOUNT_SOURCE_NAME_RE = re.compile(r"^(?:HOME|PWD)$|_(?:DIR|FILE|PATH)$", re.I)
+
+
+def mount_shaped(view_operand: str, literal_operand: str) -> bool:
     """B (round 9): SRC:DST with no literal = before the first literal colon is not psql's
-    NAME=VALUE (a docker or compose volume mount)."""
+    NAME=VALUE (a docker or compose volume mount). F1 (round 10): an expansion before that
+    colon can supply the = itself ($PW_ASSIGN:x is pw=...:x), so the source may hold only
+    plain $NAME / ${NAME} expansions of a path-named variable (HOME, PWD, *_DIR, *_FILE,
+    *_PATH); any other expansion there leaves the operand a credential candidate."""
     colon = literal_operand.find(":")
     equals = literal_operand.find("=")
-    return colon >= 0 and (equals < 0 or colon < equals)
+    if colon < 0 or (0 <= equals < colon):
+        return False
+    for run in re.finditer("\x02+", literal_operand[:colon]):
+        m = MOUNT_SOURCE_EXPANSION_RE.fullmatch(view_operand[run.start():run.end()])
+        if not m or not MOUNT_SOURCE_NAME_RE.search(m.group("b") or m.group("n")):
+            return False
+    return True
 
 
 def credential_operand(text: str, words: List[Word], narrow: bool, resplit: bool) -> bool:
@@ -1727,7 +1741,7 @@ def credential_operand(text: str, words: List[Word], narrow: bool, resplit: bool
         view, lits = operand_views(text, words, mask)
         for m in PSQL_VAR_OPT_RE.finditer(view):
             a, b = m.span("operand")
-            if narrow and mount_shaped(lits[a:b]):
+            if narrow and mount_shaped(view[a:b], lits[a:b]):
                 continue
             if psql_var_operand_flagged(m.group("operand")):
                 return True
@@ -2557,7 +2571,7 @@ GREEN_HEAD_PROBES = {
     "5556-g4-lookalike-long-option": '"${example_bin}" --variant "${variant}" --report "${report}"',
     "5556-g5-volume-mount-of-other-tool": "$COMPOSE run -v /host:/ct img",
     "5556-g6-literal-other-head": 'echo "$X" -v pw=1',
-    "5556-g7-literal-head-keeps-meaning": "docker run -v $KEYS:/k $IMG",
+    "5556-g7-literal-head-keeps-meaning": "docker run -v $KEYS_DIR:/k $IMG",  # #5651: path-named
     "5556-g9-one-word-with-suffix-after-quote": '"$X -v pw=$PG_PW"c',
     "5556-g10-quoted-literal-head-with-space": '"env -i" $X -v pw="$PG_PW"',
     # 5556-g11 (nohup --foo=bar true $X) is red since #5593: nohup takes no option, so the
@@ -2749,9 +2763,25 @@ R10_RED_PROBES = {
     '4612-r07-store-url-query-redacted-inside': 'ai-memory serve --store-url "postgres://u@h/d?password=hunterREDACTEDx"',
     '4612-r08-psql-c-sql-redacted-inside': 'psql -c "ALTER ROLE x PASSWORD \'hunterREDACTEDx\'"',
     '4612-r09-docker-env-stars-inside': 'docker run -e PGPASSWORD=hunter***x img',
+    # #5651: an expansion before the first literal colon can supply psql's = itself.
+    '5651-r01-assign-var-before-colon': '"$CLI" -v "$PW_ASSIGN:x"',
+    '5651-r02-sudo-braced-var-before-colon': 'sudo -u postgres "$CLI" -v "${CRED}":tail',
+    '5651-r03-name-tail-expansion': '"$CLI" -v pw$X:y',
+    '5651-r04-command-substitution': '"$CLI" -v "$(printf pw=hunter2):x"',
+    '5651-r05-backtick-substitution': '"$CLI" -v "`printf pw=hunter2`:x"',
+    '5651-r06-positional': '"$CLI" -v "$1:x"',
+    '5651-r07-default-operator': '"$CLI" -v "${A:-pw=x}:y"',
+    '5651-r08-path-name-then-other': '"$CLI" -v "$HOME$PW:y"',
+    '5651-r09-literal-between': '"$CLI" -v "${HOME}x$CRED:y"',
+    '5651-r10-unnamed-var-mount-source': 'docker run -v $KEYS:/k $IMG',
 }
 # Round 10 green: no hit of any kind.
 R10_GREEN_PROBES = {
+    # #5651: the real-tree mount shapes stay clean.
+    '5651-g01-home-mount': 'docker run -v "$HOME/.ai-memory:/data" img',
+    '5651-g02-dir-mount-ro': 'docker run -v "$TLS_DIR:/certs-src:ro" img',
+    '5651-g03-pwd-mount': 'docker run -v "$PWD":/work img',
+    '5651-g04-braced-path-mount': 'docker run -v "${DATA_PATH}:/d" img',
     # #5620: a URL password is compared after percent-decoding, as libpq and sqlx read it.
     '5620-g01-psql-url-encoded-stars': 'psql "postgresql://app:%2A%2A%2A@db.example/app"',
     '5620-g02-store-url-encoded-stars': 'ai-memory serve --store-url postgres://u:%2a%2a%2a@h/d',
