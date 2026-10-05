@@ -174,6 +174,8 @@ XTRACE_UNREAD = ("$", "`")
 XTRACE_CONDITIONAL_WORDS = frozenset({"if", "then", "elif", "else", "fi", "while", "until",
                                       "do", "done", "case", "esac", "for", "select",
                                       "function"})
+XTRACE_BLOCK_OPEN = frozenset({"if", "while", "until", "for", "select", "case", "{"})
+XTRACE_BLOCK_CLOSE = frozenset({"fi", "done", "esac", "}"})
 TRACED_SECRET_RE = re.compile(
     r"\$\{?[A-Za-z0-9_]*(?:password|passwd|pass|secret|token|pw)(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -747,10 +749,33 @@ def shebang_xtrace(line: str) -> bool:
     return False
 
 
+def block_delta(line: str) -> int:
+    """#5597: how a line changes the depth of multi-line compound commands (if, while,
+    until, for, select, case, a { } group or function body). A set +x on a line that starts
+    inside one may not run, or runs only when a function is called, so scan_xtrace does not
+    let it turn tracing off. Words are counted wherever they stand (an echo done lowers the
+    depth too); the depth never drops below 0."""
+    try:
+        lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        words = list(lex)
+    except ValueError:
+        words = line.split()
+    delta = 0
+    for w in words:
+        w = w.lstrip("\\")
+        if w in XTRACE_BLOCK_OPEN:
+            delta += 1
+        elif w in XTRACE_BLOCK_CLOSE:
+            delta -= 1
+    return delta
+
+
 def scan_xtrace(rel: str, text: str) -> List[Hit]:
     """Credential-bearing lines executed while xtrace is on (#4609)."""
     hits: List[Hit] = []
     traced = False
+    block = 0
     for n, ln in enumerate(text.splitlines(), 1):
         if n == 1 and ln.startswith("#!"):
             traced = shebang_xtrace(ln)
@@ -758,6 +783,9 @@ def scan_xtrace(rel: str, text: str) -> List[Hit]:
         if ln.lstrip().startswith("#"):
             continue
         effect = xtrace_effect(ln)
+        if effect is False and block > 0:
+            effect = None
+        block = max(0, block + block_delta(ln))
         if effect is not None:
             traced = effect
             continue
@@ -2985,6 +3013,10 @@ R10_XTRACE_RED = {
     '5597-x39-off-in-while-body': 'set -x\nwhile false; do set +x; done\n',
     '5597-x40-off-in-function-body': 'set -x\nf() { set +x; }\n',
     '5597-x41-off-in-trap-string': 'set -x\ntrap "set +x" EXIT\n',
+    '5597-x42-off-in-multiline-if': 'set -x\nif x; then\n  set +x\nfi\n',
+    '5597-x43-off-in-multiline-function': 'set -x\nf() {\n  set +x\n}\n',
+    '5597-x44-off-in-multiline-while': 'set -x\nwhile r; do\n  set +x\ndone\n',
+    '5597-x45-off-in-case-arm': 'set -x\ncase $a in\n  b) set +x ;;\nesac\n',
 }
 R10_XTRACE_GREEN = {
     '5597-g01-set-off-later-cluster': 'set -x\nset -e +x\n',
@@ -3004,6 +3036,8 @@ R10_XTRACE_GREEN = {
     '5597-g15-off-negated': 'set -x\n! set +x\n',
     '5597-g16-off-brace-redirected': 'set -x\n{ set +x; } 2>/dev/null\n',
     '5597-g17-off-with-comment': 'set -x\nset +x # done\n',
+    '5597-g18-off-after-closed-block': 'set -x\nif x; then\n  true\nfi\nset +x\n',
+    '5597-g19-off-after-one-line-function': 'set -x\nf() { true; }\nset +x\n',
 }
 
 
