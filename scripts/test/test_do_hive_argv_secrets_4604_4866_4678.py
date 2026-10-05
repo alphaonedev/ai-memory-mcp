@@ -1164,6 +1164,14 @@ def closed_world_taint(fs):
                         ("tr with the reply as a set", 'echo abc | tr abc "$qjson"'),
                         ("unset with the reply", 'unset "$qjson"'),
                         ("readonly with the reply as the name", 'readonly "$qjson"'),
+                        # #5414: a wrapper around a node channel in every function spelling is a taint source.
+                        ("a function keyword wrapper", 'function pf { node_sh 0 </dev/null; }\nt=$(pf)\nno "x $t"'),
+                        ("a spaced name () wrapper", 'pf2 () { node_sh 0 </dev/null; }\nt=$(pf2)\nno "x $t"'),
+                        ("a function keyword and parentheses wrapper", 'function pf3() { node_sh 0 </dev/null; }\nt=$(pf3)\nno "x $t"'),
+                        ("a wrapper with the brace on the next line", 'pf4()\n{\n node_sh 0 </dev/null\n}\nt=$(pf4)\nno "x $t"'),
+                        ("an indented wrapper", '  pf5() { node_sh 0 </dev/null; }\n  t=$(pf5)\n  no "x $t"'),
+                        ("a multi-line wrapper of a wrapper", 'pf6() {\n  node_get 0 x\n}\npf7 () {\n  pf6\n}\nt=$(pf7)\nno "x $t"'),
+                        ("a one-line helper that borrows an allowed name", 'reply_len() { :; }\nno "x $qjson"'),
                         # #5413: base64 is a filter, not a node-bound consumer: only a pipe on into curl is.
                         ("a bare pipe into base64", 'printf %s "$qjson" | base64'),
                         ("a pipe into base64 -w0", 'echo "$qjson" | base64 -w0'),
@@ -1406,9 +1414,16 @@ CHANNEL_WRAPPERS = ("node_get", "node_post")
 CHANNEL_DEFS = re.compile(r"^\s*(on_node|node_sh|lg_curl)\(\) \{")
 
 
+FUNC_DEF = re.compile(r"^(\s*)(?:function\s+(\w+)(?:\s*\(\s*\))?|(\w+)\s*\(\s*\))\s*(\{.*)?$")
+
+
 def logical_lines(text):
-    """(first line number, joined text, enclosing function) per logical line, outside heredoc bodies and comments."""
-    out, buf, start, func, heredoc = [], "", 0, "", None
+    """(first line number, joined text, enclosing function) per logical line, outside heredoc bodies and comments.
+    #5414: a function is recorded in every spelling (name() {, name () {, function name {, function name() {,
+    a brace on the next line), indented or not; a one-line definition names only its own line; a multi-line one
+    is open until a closing brace at its own indent."""
+    out, buf, start, heredoc = [], "", 0, None
+    stack, pending = [], None   # open functions (name, indent); a definition whose brace has not opened yet
     for n, raw in enumerate(text.splitlines(), 1):
         if heredoc is not None:
             if raw == heredoc:
@@ -1416,9 +1431,18 @@ def logical_lines(text):
             continue
         if not buf and raw.lstrip().startswith("#"):
             continue
-        m = re.match(r"^(\w+)\(\) \{", raw)
-        if m:
-            func = m.group(1)
+        d = FUNC_DEF.match(raw) if not buf else None
+        name = d and (d.group(2) or d.group(3))
+        rest = (d.group(4) or "") if d else ""
+        oneliner = bool(name) and rest.startswith("{") and rest.rstrip().endswith("}") and not raw.endswith("\\")
+        if name and not oneliner:
+            pending = (name, len(d.group(1)))
+            if rest.startswith("{"):
+                stack.append(pending)
+                pending = None
+        elif pending and raw.strip().startswith("{") and not buf:
+            stack.append(pending)
+            pending = None
         if not buf:
             start = n
         buf += raw[:-1] + " " if raw.endswith("\\") else raw
@@ -1427,9 +1451,10 @@ def logical_lines(text):
         h = re.search(r"<<-?\s*'?(\w+)'?", buf)
         if h:
             heredoc = h.group(1)
+        func = name if oneliner else (name or (pending[0] if pending else (stack[-1][0] if stack else "")))
         out.append((start, buf, func))
-        if raw.startswith("}"):
-            func = ""
+        if stack and raw.lstrip().startswith("}") and len(raw) - len(raw.lstrip()) == stack[-1][1] and not (name and not oneliner):
+            stack.pop()
         buf = ""
     return out
 
