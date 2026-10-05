@@ -2358,6 +2358,10 @@ ROUND3_RED = [
     ('5954 escaped-substitution pin: reported 3: an escaped dollar paren in a single-quoted ssh payload', "ssh h '\\$(command -v mysql) -p\\$X'"),
     ('5954 escaped-substitution pin: reported 4: an escaped backtick pair in a double-quoted ssh payload', 'ssh h "\\`command -v mysql\\` -p\\$X"'),
     ('5954 escaped-substitution pin: reported 5: a quoted escaped substitution in a docker exec payload', 'docker exec db sh -c "\\"\\$(command -v mariadb)\\" -p\\$X"'),
+    ('5955 quoted-paren pin: reported 1: a double-quoted closing parenthesis does not end the substitution', '$(command -v mysql || echo ")") -p"$X"'),
+    ('5955 quoted-paren pin: reported 2: a single-quoted closing parenthesis does not end the substitution', "$(command -v mysql || echo ')') -p\"$X\""),
+    ('5955 quoted-paren pin: reported 3: a quoted opening parenthesis does not nest', '$(echo "(" >&2; command -v mysql) -uroot -p"$X"'),
+    ('5955 quoted-paren pin: reported 4: a quoted parenthesis inside a quoted substitution', '"$(command -v mysql || echo ")")" -p"$X"'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
