@@ -31,8 +31,12 @@ name: Mobile runtime (iOS Simulator + Android emulator)
 on:
   push:
     branches: ["release/**"]
+  # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
+  # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
+  # together), #2523 and #2508 (push must not overlap a PR head such as
+  # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: [main]
+    branches: [main, "rehearsal/**"]
     paths:
       - ".github/workflows/mobile-runtime.yml"
       - "tests/mobile/**"
