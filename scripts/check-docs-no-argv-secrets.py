@@ -77,11 +77,19 @@ template file):
   argv-credential-shape  a closed set of credential shapes in an operand of
                      any command, whatever the program (#5725): a URL whose
                      userinfo holds a password (``scheme://user:pass@``); a
-                     flag whose last name part is password, passwd, secret or
-                     token, with a value attached by ``=`` or in the next word;
-                     a ``NAME=VALUE`` operand (also ``--opt=NAME=VALUE``) whose
-                     NAME ends in one of those words; an ``Authorization:``
-                     header value. Read on every command of a shell-like file
+                     flag whose last name part is a credential word, with a
+                     value attached by ``=`` or in the next word; a
+                     ``NAME=VALUE`` operand (also ``--opt=NAME=VALUE``) whose
+                     NAME ends in one; a credential header value. The words
+                     (#5837): password, passwd, passphrase, secret, token,
+                     apikey, credentials at the end of any name, and pass,
+                     pwd, pw, creds and the api, access, secret, auth,
+                     account, master and sas key spellings as a whole name
+                     part (``--api-key``, ``db_pw=``, never ``bypass=``; a
+                     whole NAME ``pass=`` is not read, ``db_pass=`` is). The headers: Authorization,
+                     Proxy-Authorization, (X-)Api-Key, an auth, access,
+                     vault, private, api, session, csrf or xsrf token, a
+                     ``*-Secret`` header and (Set-)Cookie. Read on every command of a shell-like file
                      and inside a shell-like or untagged fence of a .md file;
                      the value is masked in the report. Not waivable.
   cloud-init-readable-secret  a cloud-init ``write_files`` entry left group or
@@ -147,6 +155,10 @@ and the changelog (Refs #5725):
   * ``user:pass`` after ``-u`` (``curl -u``);
   * a bare positional secret (``vault login VALUE``, the keys of
     ``mc alias set``);
+  * a flag or name that is only ``key``, ``auth`` or ``cred`` (``--key VALUE``,
+    ``--auth VALUE``), the client, private and tls key spellings
+    (``--client-key VALUE``) and a ``NAME=VALUE`` whose whole NAME is ``pass``:
+    in most programs they name a file, a mode or a test counter (#5847);
   * a credential inside a non-shell ``-c`` string (``python3 -c``);
   * .md prose outside a fenced block, for argv-credential-shape.
 
@@ -240,6 +252,21 @@ PENDING = (
     ("docs/CLI_REFERENCE.md", "ai-memory capability attenuate --token", "#4864"),
     ("docs/CLI_REFERENCE.md", "ai-memory capability inspect --token", "#4864"),
     ("docs/CLI_REFERENCE.md", "ai-memory capability verify  --token", "#4864"),
+    # #5837 (round 12): the x-api-key header is a credential shape; these lines put the API key
+    # on a curl or ssh argv. Each needle names the header and the variable, never a value.
+    ("deploy/do-1461/atlas/ingest.sh", '-H "x-api-key: %s"', "#5848"),
+    ("deploy/do-1461/atlas/run.sh", "x-api-key: $API_KEY", "#5848", 2),
+    ("deploy/do-1461/provision/46_batman.sh", "x-api-key: $api_key", "#4872", 3),
+    ("deploy/do-1461/provision/lib.sh", "x-api-key: $api_key", "#5848"),
+    ("deploy/do-1461/test/encrypted_legs.sh", "x-api-key: $API_KEY", "#5848", 2),
+    ("deploy/do-1461/test/recursive.sh", "x-api-key: $API_KEY", "#5848"),
+    ("deploy/do-1461/test/run.sh", "x-api-key: $API_KEY", "#5848", 4),
+    ("deploy/do-1461/validate/run.sh", "x-api-key: $API_KEY", "#5848", 2),
+    ("deploy/hive-1461/test/run.sh", "x-api-key: $API_KEY", "#5848", 3),
+    ("deploy/hive-1461/validate/run.sh", "x-api-key: $API_KEY", "#5848"),
+    ("docs/API_REFERENCE.md", '-H "X-API-Key: KEY"', "#4878"),
+    ("docs/TROUBLESHOOTING.md", '-H "X-API-Key: YOUR_KEY"', "#4878"),
+    ("infra/do-hive/federate.sh", "x-api-key: \\$(cat /etc/ai-memory/api-key)", "#4866", 2),
 )
 
 TEXT_SUFFIXES = {
@@ -2362,11 +2389,25 @@ def operand_rule_hit(hit: Hit) -> bool:
 # of a shell fence in a .md file, whatever its program (STATED LIMITS: a short flag that is a
 # password only by one program's convention, a bare positional secret, user:pass after -u, a
 # credential inside a non-shell -c string, and prose outside a fence are not read).
-SECRET_WORD = r"(?:password|passwd|secret|token)"
+# #5837 (round 12): the words are in two sets. A LONG word ends a name whatever precedes it
+# (dbpassword, my_secret); a SHORT word ends a name only as a whole name part, at the start or
+# after _ . or - (pass, db_pw, api-key; never bypass, compass or ppw). STATED LIMITS (#5847): a
+# plain key, auth or cred, the client, private and tls key spellings (--client-key names a key
+# FILE in most programs, the product's own serve flags included) and a NAME=VALUE whose whole
+# NAME is pass (a PASS= test counter) are not read.
+SECRET_WORD_LONG = r"(?:password|passwd|passphrase|secret|token|apikey|credentials)"
+SECRET_WORD_SHORT = (r"(?:pass|pwd|pw|creds|api[_.-]?key|access[_.-]?key|secret[_.-]?key"
+                     r"|auth[_.-]?key|account[_.-]?key|master[_.-]?key|sas[_.-]?key)")
+SECRET_WORD = r"(?:%s|%s)" % (SECRET_WORD_LONG, SECRET_WORD_SHORT)
 SHAPE_FLAG_RE = re.compile(r"--?(?:[A-Za-z0-9]+[_.-])*" + SECRET_WORD + r"(?:=(?P<v>.*))?\Z", re.I)
-SHAPE_ASSIGN_RE = re.compile(r"(?:--?[A-Za-z][\w.-]*=)?[A-Za-z_][\w.-]*?" + SECRET_WORD + r"=(?P<v>.+)\Z", re.I)
+SHAPE_ASSIGN_RE = re.compile(r"(?:--?[A-Za-z][\w.-]*=)?(?:[A-Za-z_][\w.-]*?" + SECRET_WORD_LONG
+                             + r"|(?:[A-Za-z_][\w.-]*?[_.-])?" + SECRET_WORD_SHORT + r")=(?P<v>.+)\Z", re.I)
 SHAPE_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/@:]*:(?P<v>[^\s/@]+)@")
-SHAPE_AUTH_RE = re.compile(r"(?:--?[A-Za-z][\w.-]*=)?(?:proxy-)?authorization:\s*(?P<v>\S.*)\Z", re.I)
+# #5837: a header that carries a credential: Authorization, an API key, an auth, access, vault or
+# private token, a secret and a cookie.
+SHAPE_AUTH_RE = re.compile(r"(?:--?[A-Za-z][\w.-]*=)?(?:(?:proxy-)?authorization|(?:x-)?api[-_]?key"
+                           r"|(?:x-)?(?:auth|access|vault|private|api|session|csrf|xsrf)[-_]?token"
+                           r"|(?:x-)?[a-z-]*-secret|(?:set-)?cookie):\s*(?P<v>\S.*)\Z", re.I)
 # Builtins and keywords whose words never reach an exec argv.
 SHAPE_NON_EXEC_HEADS = frozenset({"echo", "printf", "export", "local", "declare", "typeset", "readonly",
                                   "unset", "read", "test", "[", "[[", ":", "true", "false", "alias",
@@ -2486,6 +2527,9 @@ def shape_hit(text: str, ops: List[Word]) -> Optional[Tuple[int, str]]:
                 return w[0], str(v)
         for rx in (SHAPE_ASSIGN_RE, SHAPE_URL_RE, SHAPE_AUTH_RE):
             m = rx.match(t) if rx is not SHAPE_URL_RE else rx.search(t)
+            # #5847 STATED LIMIT: a whole NAME pass= (a PASS= test counter) is not read.
+            if rx is SHAPE_ASSIGN_RE and m and t[:m.start("v") - 1].rsplit("=", 1)[-1].lower() == "pass":
+                continue
             if m and shape_value(m.group("v")):
                 return w[0], m.group("v")
     return None
@@ -3332,7 +3376,8 @@ GREEN_HEAD_PROBES = {
     "5556-g9-one-word-with-suffix-after-quote": '"$X -v pw=$PG_PW"c',
     # 5556-g11 (nohup --foo=bar true $X) is red since #5593: nohup takes no option, so the
     # head is undecidable (5593-n45); the clean form is 5593-g19 (env --unset=FOO true $X).
-    "5556-g12-command-string-ends-at-its-close": "bash -c 'env -i' $X -v pw=\"$PG_PW\"",
+    # 5556-g12 (bash -c 'env -i' $X -v pw="$PG_PW") is red since #5837: the words after the -c
+    # string are bash's own positional argv, and pw= is now a credential name (5837-r39).
 }
 
 # #5593 (round 9): a credential operand is clean only under a proven literal non-psql head
@@ -3768,9 +3813,9 @@ R11_ARRAY_GREEN = {
     '5723-g03-neutral-v-element': 'args=(-v n=3 -f x.sql)',
 }
 # #5725: the closed credential shapes, in a script and in a shell fence of a .md file, whatever
-# the program: a URL with a userinfo password, a flag whose last name part is password, passwd,
-# secret or token with a value, a NAME=VALUE operand whose NAME ends in one of those words
-# (dotted names too), and an Authorization header value.
+# the program: a URL with a userinfo password, a flag whose last name part is a credential word
+# (SECRET_WORD, widened by #5837) with a value, a NAME=VALUE operand whose NAME ends in one
+# (dotted names too), and a credential header value (SHAPE_AUTH_RE).
 R11_SHAPE_RED = {
     '5725-r01-mongodb-url': 'mongosh "mongodb://admin:S3cr3tPass@db:27017/app"',
     '5725-r02-redis-url': 'redis-cli -u redis://u:S3cr3tPass@cache:6379 PING',
@@ -3792,6 +3837,28 @@ R11_SHAPE_RED = {
     # #5724: echo and printf are builtins only as a bare command word; a path is the program.
     '5724-r18-echo-by-path': '/bin/echo --password S3cr3tPass',
     '5724-r19-echo-under-sudo': 'sudo echo --password S3cr3tPass',
+    # #5837: the widened words and headers (the round-11 review reproducers first).
+    '5837-r20-api-key-flag': 'mytool --api-key S3cr3tTok',
+    '5837-r21-apikey-equals': 'mytool --apikey=S3cr3tTok',
+    '5837-r22-pass-flag': 'mytool --pass S3cr3tPass',
+    '5837-r23-pwd-equals': 'mytool --pwd=S3cr3tPass',
+    '5837-r24-x-api-key-header': "curl -H 'X-Api-Key: S3cr3tTok' https://x.example",
+    '5837-r25-api-key-expansion': 'mytool --api-key="$KEY"',
+    '5837-r26-passphrase': 'mytool --passphrase S3cr3tPass',
+    '5837-r27-pw-short': 'mytool -pw S3cr3tPass',
+    '5837-r28-access-key': 'mytool --access-key S3cr3tTok',
+    '5837-r29-secret-key-name': 'mytool -e aws_secret_access_key=S3cr3tTok',
+    '5837-r30-secret-key-equals': 'mytool --secret_key=S3cr3tTok',
+    '5837-r31-credentials': 'mytool --credentials S3cr3tTok',
+    '5837-r32-db-pw-name': 'mytool -e db_pw=S3cr3tPass',
+    '5837-r33-creds-name': 'mytool --set creds=S3cr3tPass',
+    '5837-r34-auth-token-header': "curl -H 'X-Auth-Token: S3cr3tTok' https://x.example",
+    '5837-r35-cookie-header': 'curl -H "Cookie: session=S3cr3tTok" https://x.example',
+    '5837-r36-private-token-header': "curl --header 'PRIVATE-TOKEN: S3cr3tTok' https://x.example",
+    '5837-r37-client-secret-header': "curl -H 'X-Client-Secret: S3cr3tTok' https://x.example",
+    '5837-r38-account-key': 'mytool --account-key S3cr3tTok',
+    '5837-r40-db-pass-name': 'mytool -e db_pass=S3cr3tPass',
+    '5837-r39-bash-c-positional-pw': 'bash -c \'env -i\' $X -v pw="$PG_PW"',
 }
 R11_SHAPE_GREEN = {
     '5725-g01-password-stdin': 'docker login -u u --password-stdin registry.example.com',
@@ -3808,6 +3875,14 @@ R11_SHAPE_GREEN = {
     '5725-g12-name-without-secret-word': 'tool -e db_user=app --limit tokens_max=3 run',
     '5725-g13-comment-with-subshell-text': '# a 0600 file (or KEY_FILE): --token on argv is refused',
     '5725-g14-trailing-comment': 'tool run # --password S3cr3tPass',
+    # #5837: a short word only as a whole name part; a file or stdin flag; a non-credential header.
+    '5837-g15-bypass-name': 'mytool -e bypass=1 run',
+    '5837-g16-compass-name': 'mytool -e compass=north run',
+    '5837-g17-passphrase-file': 'mytool --passphrase-file /run/secrets/p run',
+    '5837-g18-api-key-file': 'mytool --api-key-file /run/secrets/k run',
+    '5837-g19-accept-header': "curl -H 'Accept: application/json' https://x.example",
+    '5837-g20-pass-stdin': 'mytool --pass-stdin run',
+    '5837-g21-keyboard-name': 'mytool -e keyboard=us run',
 }
 # #5725 STATED LIMITS: shapes the rule does not read, each pinned as missed so the limit text in
 # the header and the changelog stays measured (a rule that closes one must update both).
@@ -3820,6 +3895,12 @@ R11_SHAPE_LIMITS = {
     '5725-l06-positional-token': 'vault login s.S3cr3tToken',
     '5725-l07-positional-secret': 'mc alias set s3 https://s3.example.com AKIAKEY S3cr3tSecretKey',
     '5725-l08-python-c-string': 'python3 -c "import psycopg; psycopg.connect(password=\'S3cr3tPass\')"',
+    # #5847: a plain key / auth / cred flag is a stated limit.
+    '5847-l09-plain-key-flag': 'mytool --key S3cr3tPass run',
+    '5847-l10-plain-auth-flag': 'mytool --auth S3cr3tPass run',
+    '5847-l11-client-key-flag': 'mytool --client-key S3cr3tPass run',
+    '5847-l12-whole-name-pass': 'mytool -e PASS=S3cr3tPass run',
+    '5847-l13-private-key-flag': 'mytool --private_key=S3cr3tTok run',
 }
 SHAPE_PROBE_SECRETS = ("S3cr3tPass", "S3cr3tTok", "ghp_S3cr3tToken", "dTpw")
 # #5723: a command substitution inside an array body is still a command of its own.
