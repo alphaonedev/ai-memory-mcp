@@ -212,7 +212,8 @@ PLACEHOLDER = "REASON REQUIRED"
 # A1 (#4667 R4, #5366): an allowlist entry may describe a non-session mode, never set one. A whole-line
 # assignment of transaction/statement (any key spelling, ini/yaml/env/json/toml/compose form), a config
 # line carrying a pool_mode=transaction token, or a pool_mode key assigned transaction/statement by a command
-# (shell export, Dockerfile ENV, docker -e) or a quoted JSON key is refused (rc 2), whatever its reason says.
+# (shell export, Dockerfile ENV, docker -e, kubectl set env, helm --set, admin SET), a quoted JSON key, a flow mapping or
+# inline table, an env prefix on a command, or a sed/echo style write of the key is refused (rc 2), whatever its reason says.
 # Prose that quotes the withdrawn setting (a retirement note) stays allowlistable: a bare key=value inside a
 # sentence is not refused. The shapes are matched on the entry text and on its shadow view, so a look-alike
 # letter does not slip past.
@@ -220,8 +221,12 @@ FORBIDDEN_ENTRY = (
     re.compile(r"^(?:[-*>]\s*)*[\"']?[a-z0-9_.]*mode(?:[_-]?type)?[\"']?\s*[=:]\s*[\"']?(?:transaction|statement)[\"']?,?\s*(?:[;#].*)?$"),
     re.compile(r"^[a-z_][a-z0-9_.]*\s*=\s*(?:[a-z_][a-z0-9_.-]*=[^\s;#]*\s*)*pool_mode=(?:transaction|statement)\b"),
     re.compile(r"^pool\s+[\"']?(?:transaction|statement)[\"']?$"),
-    re.compile(r"(?:^|\s)(?:export|env|set|-e|--env)[=\s]\s*[\"']?[a-z0-9_.]*pool[_-]?mode[\"']?[=\s]\s*[\"']?(?:transaction|statement)\b"),
+    re.compile(r"(?:^|\s)(?:export|env|set|-e|--env|--set|--set-string)(?:\s+[^\s=\"']+){0,4}?(?:\s+|=)[\"']?[a-z0-9_.]*pool[_-]?mode[\"']?(?:\s*=\s*|\s+)[\"']?(?:transaction|statement)\b"),
     re.compile(r"[\"'][a-z0-9_.]*pool[_-]?mode[\"']\s*:\s*[\"'](?:transaction|statement)[\"']"),
+    # #5477: a flow mapping or inline table, an env prefix on a command, a stream editor or echo that writes the key
+    re.compile(r"\{[^{}]*?[\"']?[a-z0-9_.]*pool[_-]?mode[\"']?\s*[:=]\s*[\"']?(?:transaction|statement)\b"),
+    re.compile(r"^[a-z0-9_]*pool[_-]?mode=[\"']?(?:transaction|statement)[\"']?\s+(?:\.{1,2}/|/\w|~/|\$|exec\b|sudo\b|bash\b|pgbouncer\b)"),
+    re.compile(r"(?:^|[\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\b.*pool[_-]?mode\s*[=:]\s*[\"']?(?:transaction|statement)\b"),
 )
 FILLER = re.compile(r"\b(?:todo|tbd|fixme|xxx|lorem|ipsum|placeholder|n/?a|tk)\b")
 MIN_DISTINCT_WORDS = 5
@@ -235,8 +240,8 @@ CTX = re.compile(r" \| ctx:([0-9a-f]{12})$")  # R7: an allowlist entry is bound 
 
 # #5365: markdown underscore emphasis (_word_, __two words__) is markup like the backtick and the asterisk: a span that
 # opens at a word edge and closes at a word edge loses its underscores (never one inside a word: pool_mode, sqlx_s_)
-# so the word boundary \b sees the word. Up to three underscores: ___word___ is bold italic (#5476).
-_EMPHASIS = re.compile(r"(?<![^\W_])(_{1,3})(?=[^\W_])(.+?)(?<=[^\W_])\1(?![^\W_])")
+# so the word boundary \b sees the word. Any run of underscores: ___word___ is bold italic (#5476).
+_EMPHASIS = re.compile(r"(?<![^\W_])(_+)(?=[^\W_])(.+?)(?<=[^\W_])\1(?![^\W_])")
 
 
 def normalise(line: str) -> str:
@@ -876,6 +881,7 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("R1 #5365: underscore emphasis on the second word only", "docs/a.md", "Use pooling _transaction_ everywhere.\n"),
     ("R1 #5476: triple underscore emphasis on the mode word", "docs/a.md", "Run PgBouncer in ___transaction___ mode.\n"),
     ("R1 #5476: triple underscore emphasis over two words", "docs/a.md", "Use ___transaction pooling___ here.\n"),
+    ("R1 #5476: four underscore emphasis on the mode word", "docs/a.md", "Run PgBouncer in ____transaction____ mode.\n"),
     ("R9 #5363: a letter the fold does not know, spaced, on a pool line", "docs/a.md", "Run PgBouncer in \u0434\u0436\u0437\u0438\u044f mode.\n"),
     ("R9 #5363: small capitals on a config context line fold to the mode word", "docs/a.md",
      "```ini\npool_mode = session\ndefault = \u1d1b\u0280\u1d00\u0274s\u1d00\u1d04\u1d1b\u026a\u1d0f\u0274\n```\n"),
@@ -1052,6 +1058,12 @@ def ent(rel: str, body: str, text: str, nth: int = 0) -> str:
     return "%s%s%s | ctx:%s\n" % (rel, SEPARATOR, text, found[nth][3])
 
 
+def entry_case(label: str, line: str, ok: bool = False) -> Tuple[str, Dict[str, object], int]:
+    """An allowlist entry for `line` in a shell script: refused (rc 2) when it sets the mode, accepted when it only quotes it."""
+    rel = "infra/x/setup.sh"
+    return (label, tree({rel: line + "\n"}, REASON + ent(rel, line + "\n", normalise(line))), EXIT_OK if ok else EXIT_FAULT)
+
+
 def run_quiet(root: Path) -> int:
     saved_out, saved_err = sys.stdout, sys.stderr
     sink = open(os.devnull, "w")
@@ -1212,6 +1224,40 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
          tree({"docs/a.md": "Old _a_ x _b_ transaction mode is not supported.\n"},
               REASON + ent("docs/a.md", "Old _a_ x _b_ transaction mode is not supported.",
                            "old a x b transaction mode is not supported.")), EXIT_OK),
+        # #5477: shapes that set the mode and were not refused (round-7 review, F3)
+        entry_case("an entry with kubectl set env is refused", "kubectl set env deploy/pgbouncer pool_mode=transaction"),
+        entry_case("an entry with oc set env and four arguments is refused", "oc set env dc/pgbouncer -c pgbouncer pool_mode=transaction"),
+        entry_case("an entry with an env prefix on a script is refused", "POOL_MODE=transaction ./entrypoint.sh"),
+        entry_case("an entry with an env prefix on a parent path is refused", "pool_mode=statement ../run.sh"),
+        entry_case("an entry with an env prefix on an absolute path is refused", "pool_mode=transaction /usr/bin/pgbouncer pgbouncer.ini"),
+        entry_case("an entry with an env prefix on a home path is refused", "pool_mode=transaction ~/bin/start"),
+        entry_case("an entry with an env prefix on a variable is refused", "pool_mode=transaction $PGB_CMD"),
+        entry_case("an entry with an env prefix on exec is refused", "pool_mode=transaction exec pgbouncer"),
+        entry_case("an entry with an env prefix on sudo is refused", "pool_mode=transaction sudo -u pgbouncer pgbouncer"),
+        entry_case("an entry with an env prefix on bash is refused", "pool_mode=transaction bash -c start"),
+        entry_case("an entry with an env prefix on pgbouncer is refused", "pool_mode=transaction pgbouncer pgbouncer.ini"),
+        entry_case("an entry with a quoted env prefix is refused", "pool_mode=\"transaction\" ./entrypoint.sh"),
+        entry_case("an entry with a yaml flow mapping is refused", "environment: { pool_mode: transaction }"),
+        entry_case("an entry with a toml inline table is refused", "pgbouncer = { pool_mode = \"transaction\" }"),
+        entry_case("an entry with a flow mapping that opens on a comma is refused", "env: {a: 1, pool_mode: statement}"),
+        entry_case("an entry with helm --set is refused", "helm install pgb chart --set config.pgbouncer.pool_mode=transaction"),
+        entry_case("an entry with helm --set-string is refused", "helm install pgb chart --set-string pool_mode=statement"),
+        entry_case("an entry with the admin console SET is refused", "SET pool_mode = 'transaction';"),
+        entry_case("an entry with sed is refused", "sed -i 's/pool_mode = session/pool_mode = transaction/' pgbouncer.ini"),
+        entry_case("an entry with awk is refused", "awk -v x=1 '{print}' pool_mode=transaction pgbouncer.ini"),
+        entry_case("an entry with perl is refused", "perl -pi -e 's/pool_mode = session/pool_mode = transaction/' pgbouncer.ini"),
+        entry_case("an entry with echo is refused", "echo 'pool_mode = transaction' >> pgbouncer.ini"),
+        entry_case("an entry with printf is refused", "printf 'pool_mode = statement\\n' >> pgbouncer.ini"),
+        entry_case("an entry with tee is refused", "tee -a pgbouncer.ini <<< pool_mode=transaction"),
+        entry_case("an entry with docker --env= is refused", "docker run --env=POOL_MODE=transaction img"),
+        entry_case("an entry with a Dockerfile ENV space form is refused", "ENV POOL_MODE transaction"),
+        entry_case("an entry with crudini is refused", "crudini --merge pgbouncer.ini pgbouncer pool_mode=transaction"),
+        entry_case("an entry with crudini --set is refused", "crudini --set pgbouncer.ini pgbouncer pool_mode transaction"),
+        entry_case("an entry with a quoted json key inside a sentence is refused", "see \"pool_mode\": \"transaction\" in the file"),
+        entry_case("an entry with yq is refused", "yq -i '.pool_mode = transaction' values.yaml"),
+        # the same words in prose stay allowlistable: a retirement note quotes the setting
+        entry_case("prose that quotes pool_mode=transaction mid-sentence stays allowed", "Withdrawn: pool_mode=transaction / was required", ok=True),
+        entry_case("prose that starts with the key and a space-slash stays allowed", "pool_mode=transaction / max_client_conn were sketched", ok=True),
         # files read, not skipped (#5086, #5090)
         ("NUL bytes in a markdown file fail closed", tree({"docs/n.md": "\0\nRun PgBouncer in transaction mode.\n"}), EXIT_FAULT),
         ("a gzip document fails closed", tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}), EXIT_FAULT),
@@ -1403,7 +1449,7 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("R1 asterisks stripped (sweep)", 're.sub(r"[`*]", "", text)', 're.sub(r"[`]", "", text)'),
     ("R9 private-mode terminal codes (sweep)", "[0-9;?]*[A-Za-z]", "[0-9;]*[A-Za-z]"),
     ("A1 forbidden statement alternative (sweep)", '[\\"\']?(?:transaction|statement)\\b"),\n    re.compile(r"[\\"\'][a-z0-9_.]*pool', '[\\"\']?(?:transaction)\\b"),\n    re.compile(r"[\\"\'][a-z0-9_.]*pool'),
-    ("A1 forbidden key without separator (sweep)", '[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?[=\\s]', '[\\"\']?[a-z0-9_.]*pool_mode[\\"\']?[=\\s]'),
+    ("A1 forbidden key without separator (sweep)", '[a-z0-9_.]*pool[_-]?mode[\\"\']?(?:', '[a-z0-9_.]*pool_mode[\\"\']?(?:'),
     ("F1 skip entry has no spaces (sweep)", '        if " " in line or problem or line in listed:', '        if problem or line in listed:'),
     ("R1 emphasis span is lazy (sweep)", "(.+?)(?<=[^\\W_])\\1", "(.+)(?<=[^\\W_])\\1"),
     ("F1 the suffix is read case-blind (#5367)", "Path(line).suffix.lower() not in BINARY_SUFFIXES", "Path(line).suffix not in BINARY_SUFFIXES"),
@@ -1414,9 +1460,40 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("F2 window margin", "WINDOW_MARGIN = 2 * PARAGRAPH_MAX + 2 * NEIGHBOURS", "WINDOW_MARGIN = 1"),
     ("F2 chunk-boundary carriage return", " or lines[-1].endswith(\"\\r\")", ""),
     ("A1 forbidden entries", "        if forbidden_entry(text):\n", "        if False:\n"),
-    ("A1 forbidden command assignment (#5366)", '(?:^|\\s)(?:export|env|set|-e|--env)[=\\s]', "(?:^|\\s)(?:zzexport)[=\\s]"),
-    ("A1 forbidden command words (#5366)", "(?:export|env|set|-e|--env)[=\\s]", "(?:export)[=\\s]"),
+    ("A1 forbidden command assignment (#5366)", '(?:^|\\s)(?:export|env|set|-e|--env|--set|--set-string)', "(?:^|\\s)(?:zzexport)"),
+    ("A1 forbidden command words (#5366)", "(?:export|env|set|-e|--env|--set|--set-string)", "(?:export|--set|--set-string)"),
     ("A1 forbidden quoted json key (#5366)", '[\\"\'][a-z0-9_.]*pool[_-]?mode[\\"\']\\s*:', '[\\"\'][a-z0-9_.]*pool[_-]?zzmode[\\"\']\\s*:'),
+    ('A1 command word --set (#5477)', 're.compile(r"(?:^|\\s)(?:export|env|set|-e|--env|--set|--set-string)(?:\\s+[^\\s=\\"\']+){0,4}?(?:\\s+|=)[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?(?:\\s*=\\s*|\\s+)[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|\\s)(?:export|env|set|-e|--env|--set-string)(?:\\s+[^\\s=\\"\']+){0,4}?(?:\\s+|=)[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?(?:\\s*=\\s*|\\s+)[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 command word --set-string (#5477)', 're.compile(r"(?:^|\\s)(?:export|env|set|-e|--env|--set|--set-string)(?:\\s+[^\\s=\\"\']+){0,4}?(?:\\s+|=)[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?(?:\\s*=\\s*|\\s+)[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|\\s)(?:export|env|set|-e|--env|--set)(?:\\s+[^\\s=\\"\']+){0,4}?(?:\\s+|=)[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?(?:\\s*=\\s*|\\s+)[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 command arguments up to four (#5477)', 're.compile(r"(?:^|\\s)(?:export|env|set|-e|--env|--set|--set-string)(?:\\s+[^\\s=\\"\']+){0,4}?(?:\\s+|=)[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?(?:\\s*=\\s*|\\s+)[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|\\s)(?:export|env|set|-e|--env|--set|--set-string)(?:\\s+[^\\s=\\"\']+){0,1}?(?:\\s+|=)[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?(?:\\s*=\\s*|\\s+)[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 command word then = (#5477)', 're.compile(r"(?:^|\\s)(?:export|env|set|-e|--env|--set|--set-string)(?:\\s+[^\\s=\\"\']+){0,4}?(?:\\s+|=)[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?(?:\\s*=\\s*|\\s+)[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|\\s)(?:export|env|set|-e|--env|--set|--set-string)(?:\\s+[^\\s=\\"\']+){0,4}?(?:\\s+)[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?(?:\\s*=\\s*|\\s+)[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 space form after the key (#5477)', 're.compile(r"(?:^|\\s)(?:export|env|set|-e|--env|--set|--set-string)(?:\\s+[^\\s=\\"\']+){0,4}?(?:\\s+|=)[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?(?:\\s*=\\s*|\\s+)[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|\\s)(?:export|env|set|-e|--env|--set|--set-string)(?:\\s+[^\\s=\\"\']+){0,4}?(?:\\s+|=)[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?(?:\\s*=\\s*)[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 equals form after the key (#5477)', 're.compile(r"(?:^|\\s)(?:export|env|set|-e|--env|--set|--set-string)(?:\\s+[^\\s=\\"\']+){0,4}?(?:\\s+|=)[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?(?:\\s*=\\s*|\\s+)[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|\\s)(?:export|env|set|-e|--env|--set|--set-string)(?:\\s+[^\\s=\\"\']+){0,4}?(?:\\s+|=)[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?(?:\\s+)[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 env prefix statement (#5477)', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),'),
+    ('A1 env prefix quoted value (#5477)', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),'),
+    ('A1 env prefix on a parent path (#5477)', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\./|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),'),
+    ('A1 env prefix on a relative path (#5477)', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),'),
+    ('A1 env prefix on an absolute path (#5477)', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),'),
+    ('A1 env prefix on a home path (#5477)', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),'),
+    ('A1 env prefix on a variable (#5477)', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),'),
+    ('A1 env prefix on exec (#5477)', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|sudo\\b|bash\\b|pgbouncer\\b)"),'),
+    ('A1 env prefix on sudo (#5477)', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|bash\\b|pgbouncer\\b)"),'),
+    ('A1 env prefix on bash (#5477)', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|pgbouncer\\b)"),'),
+    ('A1 env prefix on pgbouncer (#5477)', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b|pgbouncer\\b)"),', 're.compile(r"^[a-z0-9_]*pool[_-]?mode=[\\"\']?(?:transaction|statement)[\\"\']?\\s+(?:\\.{1,2}/|/\\w|~/|\\$|exec\\b|sudo\\b|bash\\b)"),'),
+    ('A1 command write statement (#5477)', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction)\\b"),'),
+    ('A1 command write with sed (#5477)', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|[\\s;&|])(?:awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 command write with awk (#5477)', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|[\\s;&|])(?:sed|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 command write with perl (#5477)', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 command write with echo (#5477)', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 command write with printf (#5477)', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 command write with tee (#5477)', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 command write with crudini (#5477)', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 command write with yq (#5477)', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 flow mapping opens on a brace (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\[[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 flow mapping holds other keys before the key (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\{[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 flow mapping with an equals sign (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 flow mapping with a colon (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[=]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 flow mapping statement (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction)\\b"),'),
     ("A1 forbidden shapes read the shadow view (#5366)", "    views = (text, shadow(text))\n", "    views = (text,)\n"),
     ("A1 filler reasons", "    if FILLER.search(reason.casefold()) or", "    if False and"),
     ("R3 path tokens", "    text = TOOL_PATH.sub(_path_words, text)\n", ""),
@@ -1484,12 +1561,12 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("R9 needs a pool word", "or bool(_QUICK.search(shadow(text))) or _lookalike", "or True or _lookalike"),
     ("R9 colour codes dropped", '    plain = _ANSI_CSI.sub("", text)', "    plain = text"),
     ("R9 a character touching a letter", "        elif (i and _ascii_letter(view[i - 1])) or (i + 1 < len(view) and _ascii_letter(view[i + 1])):", "        elif False:"),
-    ("R1 #5365 emphasis opens at a word edge", "(?<![^\\W_])(_{1,3})", "(_{1,3})"),
+    ("R1 #5365 emphasis opens at a word edge", "(?<![^\\W_])(_+)", "(_+)"),
     ("R1 #5365 emphasis closes at a word edge", "\\1(?![^\\W_])", "\\1"),
-    ("R1 #5365 emphasis may use two underscores", "(_{1,3})(?=", "(_)(?="),
-    ("R1 #5476 emphasis may use three underscores", "(_{1,3})(?=", "(_{1,2})(?="),
-    ("R1 #5476 emphasis may use one underscore", "(_{1,3})(?=", "(_{2,3})(?="),
-    ("R1 #5476 emphasis needs no more than three underscores", "(_{1,3})(?=", "(_{1,4})(?="),
+    ("R1 #5365 emphasis may use two underscores", "(_+)(?=", "(_)(?="),
+    ("R1 #5476 emphasis may use three underscores", "(_+)(?=", "(_{1,2})(?="),
+    ("R1 #5476 emphasis may use four underscores", "(_+)(?=", "(_{1,3})(?="),
+    ("R1 #5476 emphasis may use one underscore", "(_+)(?=", "(_{2,})(?="),
     ("R1 #5365 emphasis is stripped", '    text = _EMPHASIS.sub(r"\\2", re.sub(r"[`*]", "", text))', '    text = re.sub(r"[`*]", "", text)'),
     ("R9 #5364 bidi controls are reported", "    found |= {c for c in plain if c in BIDI}", "    found |= set()"),
     ("R9 #5364 a bidi control makes a line unreadable on its own", 'or any(c in BIDI for c in hidden) or', "or"),
