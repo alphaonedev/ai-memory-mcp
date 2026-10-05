@@ -918,7 +918,7 @@ mod handler_tests {
     /// resolves (denied AND allowed path).
     #[test]
     fn resolve_refuses_malformed_resolved_by_3368() {
-        let _envg = crate::identity::agent_id_env_unset_guard();
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
         let conn = fresh();
         let created = handle_checkpoint_create(
             &conn,
@@ -938,11 +938,17 @@ mod handler_tests {
             .expect("count audit rows")
         };
 
+        // One byte over the 128-byte agent-id ceiling.
+        let long_id = "a".repeat(129);
         for bad in [
             "ai:x\nINJECTED",
             "ai:x\r\nforged line",
             "ai:x\u{0}nul",
             "has spaces;DROP",
+            "../x",
+            "daemon",
+            "system",
+            long_id.as_str(),
         ] {
             let err = handle_checkpoint_resolve(
                 &conn,
@@ -959,6 +965,19 @@ mod handler_tests {
             assert_eq!(audit_rows(&conn), 0, "no audit row on refusal");
         }
 
+        // A bad resolver on an UNKNOWN id is refused as invalid input, not
+        // reported as "not found" (validation precedes the lookup).
+        let err = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": "no-such-id", "state": "resolved", "resolved_by": "ai:x\nINJECTED" }),
+            None,
+        )
+        .expect_err("malformed resolved_by on an unknown id is refused");
+        assert!(err.contains("invalid agent_id"), "got: {err}");
+
+        // Shape-only, not a caller binding: a differing enforced caller does
+        // not refuse a well-formed resolver on the legacy lane.
+        let _bound = crate::identity::test_agent_id::AgentIdOverride::set("ai:node");
         let ok = handle_checkpoint_resolve(
             &conn,
             &json!({ "id": id, "state": "resolved", "resolved_by": "ai:worker-1" }),
@@ -970,6 +989,38 @@ mod handler_tests {
             Some("ai:worker-1")
         );
         assert_eq!(audit_rows(&conn), 1, "exactly one audit row on success");
+    }
+
+    /// #3368 — the pre-existing `require_str` trim stays in force: a padded
+    /// but otherwise valid resolver is stored trimmed (never with the padding),
+    /// and an all-whitespace one is refused as missing.
+    #[test]
+    fn resolve_trims_padded_resolved_by_3368() {
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
+        let conn = fresh();
+        let created = handle_checkpoint_create(
+            &conn,
+            &json!({ "namespace": "_cp", "title": "t", "created_by": "agent-a" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+        let err = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": id, "state": "resolved", "resolved_by": "   " }),
+            None,
+        )
+        .expect_err("blank resolved_by refused");
+        assert!(err.contains("resolved_by is required"), "got: {err}");
+        let ok = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": id, "state": "resolved", "resolved_by": "  ai:pad  " }),
+            None,
+        )
+        .expect("padded valid id resolves");
+        assert_eq!(ok["checkpoint"]["resolved_by"].as_str(), Some("ai:pad"));
     }
 
     /// #1722 — resolving a checkpoint appends one
