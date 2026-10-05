@@ -435,6 +435,8 @@ MDEOF
         "See \`$R::RecallTool<dyn Fn(u8) -> Vec<u8>>::decorate_memory_many\`."
     anchor_green 5392 "a live method after a turbofish group" \
         "See \`$R::RecallTool::<Vec<T>>::decorate_memory_many\`."
+    anchor_red 5392 QUAL "a missing type whose <Type<A as B>> argument holds an as" \
+        "See \`$R::<NoSuch<A as B>>::decorate_memory_many\`."
     anchor_green 5392 "a live nested <Type<T> as Trait> path" \
         "See \`$R::<RecallTool<Vec<T>> as Trait>::decorate_memory_many\`."
     anchor_green 5392 "an unbackticked three-deep generic with live parts, then prose" \
@@ -452,6 +454,10 @@ MDEOF
         "See \`$R::RecallTool&lt;Vec&lt;T&gt;&gt;::no_such\`."
     anchor_red 5394 QUAL "a missing method after mixed entity and angle generics" \
         "See \`$R::RecallTool&lt;Vec<T>&gt;::no_such\`."
+    anchor_green 5394 "a live method after HTML-entity generics with comma-space arguments" \
+        "See \`$R::RecallTool&lt;T, U&gt;::decorate_memory_many\`."
+    anchor_green 5394 "an unbackticked HTML-entity generic with live parts, then prose" \
+        "See $R::RecallTool&lt;T, U&gt;::decorate_memory_many and more."
 
     # #5393: a generic group that never balances captures to the end of its
     # token and is REPORTED (it used to fall off the capture, skipping every
@@ -521,6 +527,31 @@ MDEOF
         'See [`recall`]( src/mcp/tools/recall.rs) x'
     anchor_green 5396 "an open link whose next line is plain prose" \
         $'See [h](\nthe docs) x'
+
+    # #5397: a brace payload splits at whitespace as well as at commas (outside
+    # a generic group), so the SECOND name of a space-separated list is checked.
+    anchor_red 5397 QUAL "a space-separated brace list whose second name is missing" \
+        "See \`$R::{RecallTool no_such}\`."
+    anchor_red 5397 QUAL "a space-separated brace list whose first name is missing" \
+        "See \`$R::{no_such RecallTool}\`."
+    anchor_red 5397 QUAL "a tab-separated brace list whose second name is missing" \
+        $'See `src/mcp/tools/recall.rs::{RecallTool\tno_such}`.'
+    anchor_red 5397 QUAL "a comma list with a space-separated pair whose second name is missing" \
+        "See \`$R::{RecallTool, decorate_memory_many no_such}\`."
+    anchor_green 5397 "a space-separated brace list of live names" \
+        "See \`$R::{RecallTool decorate_memory_many}\`."
+    anchor_green 5397 "a space-separated brace list of live names, one with a generic group holding a space" \
+        "See \`$R::{RecallTool<dyn Fn(u8)> decorate_memory_many}\`."
+
+    # Own probes of the #5392/#5393/#5396 classes (not from the review): a
+    # group may not span a code span, a second anchor on a line is checked on
+    # its own, and a next-line angle destination may be indented.
+    anchor_red 5393 QUAL "an unbalanced group is not balanced by a later bracket in another code span" \
+        "See \`$R::RecallTool<T\` and \`Vec>\`."
+    anchor_red 5392 BARE_QUAL "a second anchor on a line with a nested generic and a missing method" \
+        "See \`$R::RecallTool<Vec<T>>::decorate_memory_many\` and $R::RecallTool<Vec<T>>::no_such here."
+    anchor_red 5396 PATH "a next-line angle destination with indentation" \
+        $'See [h](\n   <src/gone.rs>) x'
 
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
@@ -1259,7 +1290,8 @@ AS_WORD = re.compile(r"\bas\b")
 
 
 def unwrap_self_type(tok):
-    """`<Type<T> as Trait>::m` -> `Type<T>::m` (the type is the claim)."""
+    """`<Type<T> as Trait>::m` -> `Type<T>::m` (the type is the claim); an
+    `as` inside a nested argument (`<Vec<<T as Tr>::X>>::new`) counts too."""
     if not tok.startswith("<"):
         return tok
     end = scan_group(tok, 0)
@@ -1267,7 +1299,7 @@ def unwrap_self_type(tok):
         return tok
     inner = tok[1:end - 1]
     m = ID_RE.match(inner.lstrip())
-    if m and AS_WORD.search(strip_generics(inner)):
+    if m and AS_WORD.search(inner):
         return m.group(0) + tok[end:]
     return tok
 
@@ -1467,7 +1499,7 @@ for doc in seen_docs:
 
         for m in MDLINK.finditer(line):
             sym = m.group(1)
-            tgt = m.group(2).split("#")[0].strip()
+            tgt = m.group(2).split("#")[0]
             if tgt not in per_file:
                 # A link to a missing file is a dead link whatever the
                 # surrounding wording says: no absence exemption.
