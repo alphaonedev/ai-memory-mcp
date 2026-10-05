@@ -46,6 +46,7 @@ if __name__ == "__main__" and not sys.flags.isolated:
 
 import argparse  # noqa: E402 - after the isolated-mode refusal on purpose (#5163)
 import ast
+import codecs
 import difflib
 import importlib.machinery
 import importlib.util
@@ -442,8 +443,8 @@ def plant_coverage_gap(probed: list, names: list, rounds: int) -> bool:
 # #5472: the top-level modules this script imports (except sys), pinned as a literal so the self-test has a source of
 # truth that does not come from imported_modules() itself. Adding or removing an import without updating this tuple
 # makes the self-test red.
-EXPECTED_IMPORTS = ("argparse", "ast", "difflib", "importlib", "os", "pathlib", "py_compile", "re", "shutil", "stat",
-                    "subprocess", "tokenize", "typing")
+EXPECTED_IMPORTS = ("argparse", "ast", "codecs", "difflib", "importlib", "os", "pathlib", "py_compile", "re", "shutil",
+                    "stat", "subprocess", "tokenize", "typing")
 
 
 def import_pin_gap(found: list, pinned) -> tuple:
@@ -470,6 +471,42 @@ def imported_modules(path: Path) -> list:
 
 
 CONTROL_BYTES = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\r(?!\n)")
+# #5771: the PEP 263 cookie and blank-line patterns of tokenize, on bytes (so \w is ASCII, as tokenize's re.ASCII).
+COOKIE_LINE = re.compile(rb"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+COOKIE_BLANK = re.compile(rb"^[ \t\f]*(?:[#\r\n]|$)")
+
+
+def cookie_gap(source: bytes) -> str:
+    """#5771: the refusal for the PEP 263 cookie lines, judged before detect_encoding so the reason does not depend on
+    the interpreter. The lines judged are line 1, and line 2 when line 1 is blank or a comment. A judged line that is
+    not utf-8 is refused. A cookie is normalised the way tokenize does (utf-8 and utf-8-* to utf-8, the latin-1
+    spellings to iso-8859-1, any other name as written); a name other than utf-8 and utf8 that the codec registry
+    knows is refused as declared. "" when the source starts with a utf-8 BOM, has no cookie, the cookie is utf-8, or
+    the registry does not know the name (detect_encoding then judges those)."""
+    if source.startswith(b"\xef\xbb\xbf"):
+        return ""
+    for number, line in enumerate(source.splitlines(keepends=True)[:2], start=1):
+        try:
+            line.decode("utf-8")
+        except UnicodeDecodeError:
+            return f"the source encoding cannot be determined: line {number} can hold a coding cookie and is not utf-8"
+        match = COOKIE_LINE.match(line)
+        if match:
+            name = match.group(1).decode("ascii")
+            enc = name[:12].lower().replace("_", "-")
+            if enc == "utf-8" or enc.startswith("utf-8-") or name == "utf8":
+                return ""
+            if enc in ("latin-1", "iso-8859-1", "iso-latin-1") or enc.startswith(("latin-1-", "iso-8859-1-",
+                                                                                  "iso-latin-1-")):
+                name = "iso-8859-1"
+            try:
+                codecs.lookup(name)
+            except LookupError:
+                return ""
+            return f"the source declares the encoding {name}, not plain utf-8 (a BOM or a coding cookie)"
+        if number == 1 and not COOKIE_BLANK.match(line):
+            return ""
+    return ""
 
 
 def refusal_prefix_gap(source: bytes) -> str:
@@ -487,8 +524,9 @@ def refusal_prefix_gap(source: bytes) -> str:
     judged. Accepted: utf-8 in any letter case, utf_8, utf-8- followed by anything (so utf-8-sig WITHOUT a BOM is
     accepted, and compile() accepts it too), and exactly lower-case utf8. Refused: every other name, including UTF8 and
     Utf8 (compile() accepts them; this check does not), utf-7, latin-1, utf-16 and an unknown codec (compile() rejects
-    it). A utf-16 cookie is refused as a declared encoding where detect_encoding returns utf-16 (3.13 and older) and
-    as an encoding that cannot be determined where it raises SyntaxError (3.14).
+    it). The cookie lines are judged before detect_encoding (cookie_gap, #5771): a cookie naming a codec the registry
+    knows is refused as that declared encoding, so utf-16 gives the same reason on every interpreter; a line where a
+    cookie can be that is not utf-8 is refused as undeterminable; an unknown codec is refused as undeterminable.
     R4: Bytes that are not strict utf-8 are refused.
     R5: Any control byte other than tab, LF and CRLF line ends (NUL, form feed, a lone CR and the rest) is refused
     anywhere in the file.
@@ -499,10 +537,16 @@ def refusal_prefix_gap(source: bytes) -> str:
     if not isinstance(source, (bytes, bytearray)):
         return "the source is not bytes"
     source = bytes(source)
-    # #5681: before detect_encoding, which raises for a NUL on line 1 or 2 on 3.14 and not on 3.13 and older, so the
-    # reason for a control byte is the same on every interpreter.
+    # #5681: before detect_encoding, which raises for a NUL on line 1 or 2 on 3.14.8 and not on 3.9.25 to 3.13.16, so
+    # the reason for a control byte is the same on every interpreter.
     if CONTROL_BYTES.search(source):
         return "the source has a control byte other than tab, LF and CRLF line ends"
+    # #5771: the cookie lines are judged here, before detect_encoding, which returns utf-16 for a utf-16 cookie on 3.9.25
+    # to 3.13.16 and raises on 3.14.8, and reads a non-utf-8 cookie line differently on 3.14.8, so neither reason
+    # depends on the interpreter.
+    why = cookie_gap(source)
+    if why:
+        return why
     try:
         encoding = tokenize.detect_encoding(iter(source.splitlines(keepends=True)).__next__)[0]
     except Exception as exc:  # fail closed: ANY failure refuses (#5588); pin_5588 shows SyntaxError for three inputs (#5626)
@@ -1118,8 +1162,9 @@ def _self_test_cases() -> int:
             why = refusal_prefix_gap(data)
             if needle not in why:
                 return f"the docstring says {label} is refused with {needle!r} but the reason was {why!r} (R3, #5590)"
-        # #5675: detect_encoding returns utf-16 for a utf-16 cookie on 3.13 and older and raises SyntaxError on 3.14.
-        # Both are refusals; the case runs with the real detect_encoding and with one that raises the way 3.14 does.
+        # #5675, #5771: detect_encoding returns utf-16 for a utf-16 cookie on 3.9.25 to 3.13.16 and raises SyntaxError on
+        # 3.14.8. The cookie is judged before detect_encoding, so the reason is the same under the real detect_encoding
+        # and under one that raises the way 3.14.8 does.
         real_detect, utf16 = tokenize.detect_encoding, b"# coding: utf-16\n" + plain
 
         def detect_like_314(readline):
@@ -1132,13 +1177,17 @@ def _self_test_cases() -> int:
         try:
             for label, detect in (("the running detect_encoding", real_detect), ("a 3.14-style detect_encoding", detect_like_314)):
                 tokenize.detect_encoding = detect
-                try:
-                    needle = f"declares the encoding {detect(iter(utf16.splitlines(keepends=True)).__next__)[0]}"
-                except SyntaxError:
-                    needle = "the source encoding cannot be determined"
-                why = refusal_prefix_gap(utf16)
-                if needle not in why:
-                    return f"the docstring says a utf-16 cookie is refused with {needle!r} under {label} but the reason was {why!r} (R3, #5675)"
+                for data in (utf16, b"#!/usr/bin/env python3\n" + utf16, b"\n" + utf16):
+                    why = refusal_prefix_gap(data)
+                    if "the source declares the encoding utf-16, not plain utf-8" not in why:
+                        return f"a utf-16 cookie gave {why!r} under {label}, not the declared-encoding reason (R3, #5771)"
+                # #5771: a non-utf-8 cookie line was read differently by 3.14.8; it is refused before detect_encoding.
+                for data, needle in ((b"# \xff coding: latin-1\n" + plain, "line 1 can hold a coding cookie and is not"),
+                                     (b"\n# \xff\n" + plain, "line 2 can hold a coding cookie and is not utf-8"),
+                                     (b"x = 1\n# \xff\n" + plain, "the source is not strict utf-8")):
+                    why = refusal_prefix_gap(data)
+                    if needle not in why:
+                        return f"{data[:12]!r} gave {why!r} under {label}, not {needle!r} (R3, #5771)"
         finally:
             tokenize.detect_encoding = real_detect
         for label, spelling in (("UTF8", b"UTF8"), ("Utf8", b"Utf8"), ("utf-8-sig without a BOM", b"utf-8-sig"), ("utf_8", b"utf_8")):
