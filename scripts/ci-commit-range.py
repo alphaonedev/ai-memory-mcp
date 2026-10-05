@@ -25,6 +25,13 @@ Rules:
                   resolves to a commit in this repository
     anything else refuse
 
+An empty range is a valid output, not a refusal: push with before equal to the
+new tip or moving a branch backward, a pull_request whose base equals its head
+or whose head is an ancestor of its base, and merge_group with base_sha equal
+to head_sha each print A..B with no commits (git rev-list --count A..B is 0)
+and exit 0. merge_group does not check that base_sha is an ancestor of
+head_sha: a non-ancestor base prints base..head and exits 0.
+
 Every sha must be exactly 40 lowercase hex characters, must not be all zeros
 and must resolve to a commit here before it reaches git as an argument (git is
 always called with an argument list, never a shell).
