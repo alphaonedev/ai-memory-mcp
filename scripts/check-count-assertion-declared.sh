@@ -29,8 +29,10 @@
 #     contain `count:`, a declaration line in the middle of the body, a `# count:`
 #     line and a declaration in the subject line are NOT declarations.
 #   * <old> and <new> must equal the gate's own finding, and <what> must name the
-#     assertion (every word of <what> occurs, case-insensitively, in the file path
-#     or the asserted expression). EVERY changed assertion of the commit must be
+#     assertion (#5575): the whole asserted expression, or words of at least 3
+#     characters that are each a WHOLE token (case-insensitive) of the expression or
+#     of the file-name stem; a one-letter word, a punctuation-only word, a directory
+#     name and a bare `len`/`count` name nothing. EVERY changed assertion of the commit must be
 #     covered; a declaration that covers only some of them leaves the commit red.
 #     Several correct declarations (own line plus later ones) are unioned.
 #   * LATE DECLARATION. A missed declaration cannot be added by rewriting the
@@ -226,10 +228,40 @@ def parse_items(s):
     return items or None
 
 
+# <what> must NAME the assertion by a real token match, never by substring (#5575). Closed-world: a word that is not
+# a whole token of the asserted expression or of the file-name stem names nothing. Two accepted forms:
+#   (1) the whole asserted expression, whitespace ignored (with or without its `[CONST]` suffix) — the only form that can
+#       name a short variable such as `v.len()`; it cannot be met by accident;
+#   (2) words, each holding identifier chunks of at least MIN_WHAT_CHUNK characters, every chunk a whole token of the
+#       expression or of the file-name STEM (a directory name never counts), and at least one chunk that is not a bare
+#       method name every hit carries (len, count).
+MIN_WHAT_CHUNK = 3
+WHAT_STOP = frozenset({'len', 'count'})
+CHUNK = re.compile(r'[A-Za-z0-9_]+')
+
+
+def tokens_of(text):
+    """Whole identifiers and their underscore-separated parts, lower-cased."""
+    out = set()
+    for ident in CHUNK.findall(text):
+        ident = ident.lower(); out.add(ident); out.update(q for q in ident.split('_') if q)
+    return out
+
+
+def names_assertion(what, hit):
+    key = re.sub(r'\s+', '', hit[1]); w = re.sub(r'\s+', '', what)
+    if w and w in (key, key.split('[', 1)[0]): return True        # form (1): the whole expression
+    words = what.split()
+    if not words or any(not CHUNK.search(x) for x in words): return False   # a punctuation-only word names nothing
+    chunks = CHUNK.findall(what)
+    if any(len(c) < MIN_WHAT_CHUNK for c in chunks): return False
+    toks = tokens_of(hit[1]) | tokens_of(os.path.basename(hit[0]).split('.', 1)[0])
+    return all(c.lower() in toks for c in chunks) and any(c.lower() not in WHAT_STOP for c in chunks)
+
+
 def item_matches(item, hit):
     what, old, new = item
-    hay = (hit[0] + ' ' + hit[1]).lower()
-    return old == hit[2] and new == hit[3] and all(w in hay for w in what.lower().split())
+    return old == hit[2] and new == hit[3] and names_assertion(what, hit)
 
 
 def short(c):
@@ -430,6 +462,22 @@ def selftest():
     case('own Count: as the subject line only', c_own_subject, True)
     def c_own_delete(s, b): s.w('tests/f.rs', PAD + 'fn a() {}\n'); s.commit(msg('test: drop', 'Count: sections 18 -> (none) (removed)')); return b + '..HEAD'
     case('own Count: for a removed assertion, 18 -> (none)', c_own_delete, False)
+
+    # ---- #5575: <what> names the assertion by whole-token match, never by substring ---------------
+    def one_decl(what):
+        def f_(s, b): bump_f(s); s.commit(msg('test: bump', 'Count: %s 18 -> 19 (fixture)' % what)); return b + '..HEAD'
+        return f_
+    for lbl, w, red in [('one-letter word', 'e', True), ('two-letter word', 'se', True), ('punctuation-only word', '..', True),
+                        ('directory token only', 'tests', True), ('a number', '18', True), ('a substring of a token', 'sect', True),
+                        ('a bare method name', 'len', True), ('a good word beside a one-letter word', 'sections e', True),
+                        ('the whole expression', 'sections.len()', False), ('a token and the method name', 'sections len', False),
+                        ('a token in upper case', 'SECTIONS', False)]:
+        case('what = %s (%s)' % (w, lbl), one_decl(w), red, ['sections.len()  18 -> 19'] if red else ())
+    def c_stem(s, b): s.w('tests/multi.rs', multi_rs(6)); s.commit(msg('test: bump', 'Count: multi 5 -> 6 (fixture)')); return b + '..HEAD'
+    case('what = a token of the file-name stem', c_stem, False)
+    def c_late_short(s, b):
+        bump_f(s); o = s.commit('test: bump without a declaration'); s.touch(msg('docs: declare', late(o, 'e 18 -> 19 (fixture)'))); return b + '..HEAD'
+    case('late declaration with a one-letter what', c_late_short, True, ['sections.len()  18 -> 19'])
 
     # ---- #5499: late declaration -------------------------------------------------------------
     def offender(s, b, two=False):
