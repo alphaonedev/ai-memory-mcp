@@ -82,6 +82,11 @@ def mint_block():
 
 
 PLACEHOLDER_URL = "postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full\n"
+ROTATED = "postgres://aimemory:abc123@localhost/aimemory?sslmode=verify-full\n"
+# #5640: one message per refusal cause.
+MSG_LINES = "store-url must hold exactly one non-empty line"
+MSG_SHAPE = "store-url line is not one aimemory URL of printable characters with an unreserved password"
+MSG_PLACEHOLDER = "placeholder db password still in"
 
 
 def f4_sed():
@@ -96,6 +101,8 @@ def f4_sed():
     probe("F4 the comment names the replaced files: no postgres://aimemory line",
           "no postgres://aimemory:...@ line" in TPL.read_text() and "holds no URL" not in TPL.read_text())
     probe("F4 no sed -i or script on stdin", not re.search(r"sed\s+(-\S*i|-f)", block))
+    probe("#5640 the comment states that the daemon reads the whole file as one URL",
+          "the daemon trims the file and reads all the rest as one URL" in block and "(#5640)" in block, "")
     cases = [
         ("CHANGEME is replaced", "postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full\n", "mint"),
         ("rotated file is unchanged", "postgres://aimemory:abc123@localhost/aimemory?sslmode=verify-full\n", "keep"),
@@ -104,29 +111,59 @@ def f4_sed():
         # The refusal is reachable only when the mint yields no usable value: a stub that prints the placeholder
         # or nothing must make the block exit 1 and leave no running node with a placeholder password.
         ("a mint that yields the placeholder is refused", "garbage\n", "refuse:CHANGEME"),
-        ("a mint that yields nothing is refused", "garbage\n", "refuse:"),
+        ("a mint that yields nothing is refused", "garbage\n", "refuse::" + MSG_SHAPE),
         # #5522: any file without a postgres://aimemory:...@ line is replaced, whatever else it holds.
         ("another scheme is minted", "postgresql://aimemory:keepme@db/aimemory\n", "fresh"),
         # #5521: a file with more than one URL line is undecidable, so it is refused, never kept or half-minted.
-        ("two placeholder lines are refused", PLACEHOLDER_URL + PLACEHOLDER_URL, "refuse:" + SECRET),
-        ("a placeholder line after a rotated line is refused", "postgres://aimemory:abc123@h/x\n" + PLACEHOLDER_URL, "refuse:" + SECRET),
-        ("two rotated lines are refused", "postgres://aimemory:abc123@h/x\npostgres://aimemory:def456@h/x\n", "refuse:" + SECRET),
+        ("two placeholder lines are refused", PLACEHOLDER_URL + PLACEHOLDER_URL, "refuse:" + SECRET + ":" + MSG_LINES),
+        ("a placeholder line after a rotated line is refused", "postgres://aimemory:abc123@h/x\n" + PLACEHOLDER_URL,
+         "refuse:" + SECRET + ":" + MSG_LINES),
+        ("two rotated lines are refused", "postgres://aimemory:abc123@h/x\npostgres://aimemory:def456@h/x\n",
+         "refuse:" + SECRET + ":" + MSG_LINES),
+        # #5640: the daemon trims the file and reads the rest as one URL, so the check reads every line, not only the
+        # URL lines, and each refusal names its cause.
+        ("a second postgresql:// line is refused", ROTATED + "postgresql://aimemory:def456@h/x\n", "refuse:" + SECRET + ":" + MSG_LINES),
+        ("a trailing garbage line is refused", ROTATED + "garbage\n", "refuse:" + SECRET + ":" + MSG_LINES),
+        ("a leading garbage line is refused", "garbage\n" + ROTATED, "refuse:" + SECRET + ":" + MSG_LINES),
+        ("a line of spaces after the URL is refused", ROTATED + "   \n", "refuse:" + SECRET + ":" + MSG_LINES),
+        ("a CR line end is refused", ROTATED.replace("\n", "\r\n"), "refuse:" + SECRET + ":" + MSG_SHAPE),
+        ("a CR line end on the placeholder is refused", PLACEHOLDER_URL.replace("\n", "\r\n"), "refuse:" + SECRET + ":" + MSG_SHAPE),
+        ("CR line ends on two lines are refused", (ROTATED + "x\n").replace("\n", "\r\n"), "refuse:" + SECRET + ":" + MSG_LINES),
+        ("a tab inside the URL is refused", "postgres://aimemory:abc123@h/x\ty\n", "refuse:" + SECRET + ":" + MSG_SHAPE),
+        ("an escape byte inside the URL is refused", "postgres://aimemory:abc123@h/x\x1by\n", "refuse:" + SECRET + ":" + MSG_SHAPE),
+        ("a quote in the password is refused", "postgres://aimemory:ab'c@h/x\n", "refuse:" + SECRET + ":" + MSG_SHAPE),
+        ("a percent-escaped password is kept", "postgres://aimemory:a%2Fb.c_d~e-f@h/x?sslmode=verify-full\n", "keep"),
+        ("a space inside the URL is refused", "postgres://aimemory:abc123@h/x y\n", "refuse:" + SECRET + ":" + MSG_SHAPE),
+        ("an empty password is minted", "postgres://aimemory:@h/x\n", "fresh"),
+        ("leading and trailing blank lines keep a rotated file", "\n\n" + ROTATED + "\n", "keep"),
+        ("a rotated file with no final newline is kept", ROTATED[:-1], "keep"),
+        ("a trailing line of non-UTF-8 bytes is refused", ROTATED + "\udcff\udcfe\n", "refuse:" + SECRET + ":" + MSG_LINES),
+        ("a URL line with a non-UTF-8 byte is refused", ROTATED.replace("localhost", "local\udcffhost"), "refuse:" + SECRET + ":" + MSG_SHAPE),
+        ("a line that is only a CR after the URL is refused", ROTATED + "\r\n", "refuse:" + SECRET + ":" + MSG_LINES),
+        ("blank lines around the placeholder are minted", "\n" + PLACEHOLDER_URL + "\n", "mint"),
     ]
-    for label, start, want in cases:
+    # #5640: every case runs in the C locale too, where a high byte is a character and the shape check must still
+    # refuse it.
+    for label, start, want, lc in [c + (l,) for c in cases for l in ("", "C")]:
+        label = label + (" [LC_ALL=C]" if lc else "")
         with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
             d = pathlib.Path(t)
             (d / "sed").write_text('#!/bin/bash\nprintf "%s\\n" "$@" >> "$LOGDIR/argv.log"\nexec /usr/bin/sed "$@"\n')
             (d / "sed").chmod(0o755)
-            (d / "openssl").write_text('#!/bin/bash\nprintf "%s\\n" "$@" >> "$LOGDIR/argv.log"\nprintf "%s\\n" "' + (want[7:] if want.startswith("refuse:") else SECRET) + '"\n')
+            mint, _, why = (want[7:] if want.startswith("refuse:") else SECRET).partition(":")
+            (d / "openssl").write_text('#!/bin/bash\nprintf "%s\\n" "$@" >> "$LOGDIR/argv.log"\nprintf "%s\\n" "' + mint + '"\n')
             (d / "openssl").chmod(0o755)
             f = d / "store-url"
-            f.write_text(start)
-            r = run_bash(block.replace("/etc/ai-memory/store-url", str(f)), d)
-            got = f.read_text()
+            f.write_bytes(start.encode("utf-8", "surrogateescape"))
+            r = run_bash(block.replace("/etc/ai-memory/store-url", str(f)), d, {"LC_ALL": lc} if lc else None)
+            got = f.read_bytes().decode("utf-8", "surrogateescape")
             argv = (d / "argv.log").read_text() if (d / "argv.log").exists() else ""
             if want.startswith("refuse:"):
-                probe("F4 " + label + ": rc 1 with the placeholder message",
-                      r.returncode == 1 and "placeholder db password still in" in r.stdout, "rc=%d %r" % (r.returncode, r.stdout[:60]))
+                why = why or MSG_PLACEHOLDER
+                probe("F4 " + label + ": rc 1 with the message that names the cause",
+                      r.returncode == 1 and r.stdout.startswith(why) and r.stdout.count("\n") == 1,
+                      "rc=%d %r" % (r.returncode, r.stdout[:60]))
+                probe("F4 " + label + ": secret on no external argv", SECRET not in argv)
                 continue
             probe("F4 " + label + ": rc 0", r.returncode == 0, r.stderr[:80])
             if want == "keep":

@@ -358,6 +358,18 @@ do-hive | /usr/local/sbin/ai-memory-provision.sh | printf 'postgres://%s@localho
 do-hive | /usr/local/sbin/ai-memory-provision.sh | fi
 do-hive | /usr/local/sbin/ai-memory-provision.sh | unset NEW_HEX
 do-hive | /usr/local/sbin/ai-memory-provision.sh | fi
+do-hive | /usr/local/sbin/ai-memory-provision.sh | printf -v NL '\n'
+do-hive | /usr/local/sbin/ai-memory-provision.sh | ALL="$(sed -n 's#^#x#p' /etc/ai-memory/store-url)"
+do-hive | /usr/local/sbin/ai-memory-provision.sh | BLANK="$(sed -n 's#^$#x#p' /etc/ai-memory/store-url)"
+do-hive | /usr/local/sbin/ai-memory-provision.sh | GAPS="$${ALL//[!$NL]/}"
+do-hive | /usr/local/sbin/ai-memory-provision.sh | EMPTY="$${BLANK//$NL/}"
+do-hive | /usr/local/sbin/ai-memory-provision.sh | if [ -z "$ALL" ] || [ "$${#GAPS}" != "$${#EMPTY}" ]; then
+do-hive | /usr/local/sbin/ai-memory-provision.sh | echo "store-url must hold exactly one non-empty line: /etc/ai-memory/store-url"; exit 1
+do-hive | /usr/local/sbin/ai-memory-provision.sh | fi
+do-hive | /usr/local/sbin/ai-memory-provision.sh | SHAPED="$(sed -n 's#^postgres://aimemory:[[:alnum:]%._~-]\{1,\}@[[:graph:]]\{1,\}$#url#p' /etc/ai-memory/store-url)"
+do-hive | /usr/local/sbin/ai-memory-provision.sh | if [ "$SHAPED" != url ]; then
+do-hive | /usr/local/sbin/ai-memory-provision.sh | echo "store-url line is not one aimemory URL of printable characters with an unreserved password: /etc/ai-memory/store-url"; exit 1
+do-hive | /usr/local/sbin/ai-memory-provision.sh | fi
 do-hive | /usr/local/sbin/ai-memory-provision.sh | CUR="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
 do-hive | /usr/local/sbin/ai-memory-provision.sh | if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ] || [[ "$CUR" == *[[:space:]]* ]]; then
 do-hive | /usr/local/sbin/ai-memory-provision.sh | echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1

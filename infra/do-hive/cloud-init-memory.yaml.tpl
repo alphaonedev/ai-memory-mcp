@@ -515,8 +515,28 @@ write_files:
         fi
         unset NEW_HEX
       fi
-      # Fail closed: the shipped placeholder must never reach a running node.
-      # More than one URL line leaves CUR holding a newline: that is refused too (#5521).
+      # Fail closed: the daemon trims the file and reads all the rest as one URL,
+      # so the file must hold exactly one non-empty line (#5521), that line must
+      # have the URL shape (a password of unreserved or %-escaped characters, and
+      # printable characters only: no space, CR or other control or high byte, in
+      # any locale), and the shipped placeholder must never reach a running node
+      # (#5640). Each refusal names its cause.
+      # Every line is printed behind an x, so none is empty and each is counted
+      # whatever bytes it holds; an empty line prints a lone x. The file holds one
+      # non-empty line when it has a line and as many newlines between its lines
+      # as it has empty lines.
+      printf -v NL '\n'
+      ALL="$(sed -n 's#^#x#p' /etc/ai-memory/store-url)"
+      BLANK="$(sed -n 's#^$#x#p' /etc/ai-memory/store-url)"
+      GAPS="$${ALL//[!$NL]/}"
+      EMPTY="$${BLANK//$NL/}"
+      if [ -z "$ALL" ] || [ "$${#GAPS}" != "$${#EMPTY}" ]; then
+        echo "store-url must hold exactly one non-empty line: /etc/ai-memory/store-url"; exit 1
+      fi
+      SHAPED="$(sed -n 's#^postgres://aimemory:[[:alnum:]%._~-]\{1,\}@[[:graph:]]\{1,\}$#url#p' /etc/ai-memory/store-url)"
+      if [ "$SHAPED" != url ]; then
+        echo "store-url line is not one aimemory URL of printable characters with an unreserved password: /etc/ai-memory/store-url"; exit 1
+      fi
       CUR="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
       if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ] || [[ "$CUR" == *[[:space:]]* ]]; then
         echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1
