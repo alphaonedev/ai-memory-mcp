@@ -68,8 +68,27 @@
 # count assertion is extracted as (normalised expression, value), and the two
 # sets are compared: an assertion whose value moved, appeared or disappeared is a
 # count change, except that an assertion whose values are all undecidable
-# spellings neither appears nor disappears. Reversed operands and `assert_ne!`
+# `?<spelling>` values holding no `#` neither appears nor disappears (a
+# `?NAME#unresolved`, `?NAME#ambiguous(..)` or `?count#ambiguous` value is
+# never exempt). Reversed operands and `assert_ne!`
 # are not read (#5714).
+# WHAT IS READ (#5759) — the WHOLE first argument decides, never the first count
+# call found inside it:
+#   * assert_eq!: read only when the first argument is ONE operand that ends in
+#     `.len()` or `.count()` (so `v.iter().filter(|x| x.len() == 2).count()` reads
+#     as itself). A first argument whose last term is not the count call (a
+#     tuple, `v.len() + 1`, `v.len() as u32`, `&v[..v.len()]`, `f(v.len())`)
+#     is not read.
+#   * assert!: read only when the first argument has exactly one `==` outside
+#     every bracket, no `&&` and no `|` outside every bracket, and the left
+#     operand ends in `.len()` or `.count()`. Any other first argument that holds
+#     a `.len()`/`.count()` call followed by `==` (through spaces, `)` and
+#     `as <type>` casts) is AMBIGUOUS: a comparison inside a closure only, behind
+#     `&&` or `||`, negated, parenthesised or cast. It is never guessed: it is
+#     tracked under its whole spelling with the value `?count#ambiguous`, which
+#     is never exempt (so adding, removing or rewording it is a count change),
+#     and every const name in it is tracked as `<spelling> [NAME]` with the
+#     const's value, so bumping that const is a count change too.
 # The named-const spelling — `assert_eq!(x.len(), EXPECTED)` with
 # `const EXPECTED: usize = 19;` — is resolved the same way: a const that a
 # count assertion names, whose literal moved, is a count change.
@@ -142,12 +161,15 @@ def int_value(tok):
     return str(int(digits, base)) if digits else None
 
 
-# assert_eq!(<expr>.len()|.count(), <rhs>[, message]) and assert!(<expr>.len()|.count() == <rhs>[, message]) (#5710);
+# assert_eq!(<expr>.len()|.count(), <rhs>[, message]) and assert!(<expr>.len()|.count() == <rhs>[, message]) (#5710),
+# where the WHOLE first argument has that shape (#5759; see WHAT IS READ in the header);
 # HEAD has no word boundary, so a prefixed name (debug_assert_eq!, debug_assert!) matches too. The macro arguments are
 # cut out with balanced brackets, so a right-hand side of ANY shape is seen (a typed literal, an expression, a path).
 HEAD = re.compile(r'assert(?P<eq>_eq)?!\s*\(')
-LEFT = re.compile(r'^\s*(?P<expr>[^;{}]*?)\.(?P<m>len|count)\(\)\s*,(?P<rest>.*)$', re.S)
-COND = re.compile(r'^\s*(?P<expr>[^;{}]*?)\.(?P<m>len|count)\(\)\s*==(?P<rest>.*)$', re.S)
+TAIL = re.compile(r'^(?P<expr>\S.*)\.(?P<m>len|count)\(\)$', re.S)     # a WHOLE operand that ends in .len() or .count()
+# a count comparison anywhere in an argument: a .len()/.count() call followed by `==` through spaces, closing
+# parentheses and `as <type>` casts only
+CMP = re.compile(r'\.(?:len|count)\(\)(?:\s|\)|\bas\s+[A-Za-z0-9_]+)*==')
 CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]*)\s*:\s*(?:usize|u\d+|i\d+)\s*=\s*(?P<val>[^;]+?)\s*;')
 
 
@@ -166,8 +188,9 @@ def macro_args(t, i):
     return None
 
 
-def first_arg(rest):
-    """The first top-level comma-separated argument of `rest` (turbofish commas do not split)."""
+def split_arg(rest):
+    """-> (the first top-level comma-separated argument of `rest`, stripped; the text after its comma, or None when
+    there is no further argument). Turbofish commas do not split."""
     depth, angle, j, n = 0, 0, 0, len(rest)
     while j < n:
         ch = rest[j]
@@ -176,9 +199,52 @@ def first_arg(rest):
         elif angle and ch == '>' and rest[j - 1:j] != '-': angle -= 1
         elif ch in '([{': depth += 1
         elif ch in ')]}': depth -= 1
-        elif ch == ',' and depth == 0 and angle == 0: break
+        elif ch == ',' and depth == 0 and angle == 0: return rest[:j].strip(), rest[j + 1:]
         j += 1
-    return rest[:j].strip()
+    return rest.strip(), None
+
+
+def first_arg(rest):
+    return split_arg(rest)[0]
+
+
+def top_ops(arg):
+    """-> (offsets of every `==` at paren, bracket and brace depth 0 of `arg`; True when depth 0 also holds `&&` or a
+    `|`, i.e. a logical operator or a closure)."""
+    depth, eqs, logic, j, n = 0, [], False, 0, len(arg)
+    while j < n:
+        ch = arg[j]
+        if ch in '([{': depth += 1
+        elif ch in ')]}': depth -= 1
+        elif depth == 0 and arg.startswith('==', j): eqs.append(j); j += 2; continue
+        elif depth == 0 and (ch == '|' or arg.startswith('&&', j)): logic = True
+        j += 1
+    return eqs, logic
+
+
+AMBIG = '?count#ambiguous'
+
+
+def read_cond(arg):
+    """assert!'s first argument -> (expr, method, rhs) when the WHOLE argument is `<expr>.len()|.count() == <rhs>`: one
+    `==` at depth 0, no depth-0 `&&` or `|`, and the left operand ends in the count call (#5710, #5759). Any other
+    argument in which CMP finds a count call followed by `==` (inside a closure only, behind `&&`/`||`, negated,
+    parenthesised, cast, more than one depth-0 `==`) -> AMBIG, never a guess; otherwise -> None."""
+    eqs, logic = top_ops(arg)
+    if len(eqs) == 1 and not logic:
+        m = TAIL.match(arg[:eqs[0]].strip())
+        if m: return m.group('expr'), m.group('m'), arg[eqs[0] + 2:].strip()
+    return AMBIG if CMP.search(arg) else None
+
+
+# A const-shaped name (NAME, a::NAME) anywhere in an ambiguous assert!'s first argument.
+NAMES = re.compile(r'(?<![A-Za-z0-9_:])(?P<path>(?:[A-Za-z_][A-Za-z0-9_]*::)*)(?P<name>[A-Z][A-Z0-9_]*)(?![A-Za-z0-9_])')
+
+
+def named(consts, name, qualified):
+    """A const name's value: this file's const when the name is unqualified, else `@NAME` for resolve()."""
+    v = consts.get(name) if not qualified else None
+    return v if v is not None else '@' + name
 
 
 def extract(text):
@@ -194,21 +260,28 @@ def extract(text):
     for h in HEAD.finditer(text):
         args = macro_args(text, h.end())
         if args is None: continue
-        if h.group('eq'):                                 # assert_eq!: the right-hand side is the second argument
-            m = LEFT.match(args)
-            rhs = first_arg(m.group('rest')) if m else None
-        else:                                             # assert!: the first argument is `<expr>.len() == <rhs>` (#5710)
-            m = COND.match(first_arg(args))
-            rhs = m.group('rest').strip() if m else None
-        if not m: continue
-        expr = re.sub(r'\s+', '', m.group('expr')) + '.' + m.group('m') + '()'
+        first, more = split_arg(args)
+        if h.group('eq'):                                 # assert_eq!: the WHOLE first argument is the count call
+            m = TAIL.match(first)
+            if not m or more is None: continue
+            got, rhs = (m.group('expr'), m.group('m')), first_arg(more)
+        else:                                             # assert!: the WHOLE first argument is `<expr>.len() == <rhs>`
+            got = read_cond(first)
+            if got is None: continue
+            if got == AMBIG:                              # undecidable shape: tracked by its whole spelling, never exempt
+                key = re.sub(r'\s+', '', first)
+                out.setdefault(key, set()).add(AMBIG)
+                for nm in NAMES.finditer(first):          # and every const it names, so a bump of one moves it
+                    out.setdefault(f"{key} [{nm.group('name')}]", set()).add(named(consts, nm.group('name'), nm.group('path')))
+                continue
+            got, rhs = got[:2], got[2]
+        expr = re.sub(r'\s+', '', got[0]) + '.' + got[1] + '()'
         val = int_value(rhs)
         if val is None:
             pc = PATH_CONST.match(rhs)
             if pc:                                        # a named const: this file first, else the whole tree (#5578)
                 name = pc.group('name')
-                val = consts.get(name) if '::' not in rhs else None
-                if val is None: val = '@' + name
+                val = named(consts, name, '::' in rhs)
                 expr += f' [{name}]'                      # name the const the count is spelled through
             else:
                 val = '?' + re.sub(r'\s+', '', rhs)         # undecidable: neither a literal nor a const (#5577)
@@ -777,6 +850,60 @@ def selftest():
          scoped('tests/scope.rs', E('assert_eq', 'len', 18), Q(18)), False)
     case('a prefixed macro name (debug_assert_eq!) is seen', scoped('tests/scope.rs', E('debug_assert_eq', 'len', 18), E('debug_assert_eq', 'len', 19)), True, ['items.len()  18 -> 19'])
     case('a prefixed macro name (debug_assert!) is seen', scoped('tests/scope.rs', Q(18).replace('assert!', 'debug_assert!'), Q(19).replace('assert!', 'debug_assert!')), True, ['items.len()  18 -> 19'])
+    # ---- #5759: the WHOLE first argument decides which count an assertion binds to (WHAT IS READ in the header) ------------
+    def scoped_m(path, body0, body1, m):
+        def f_(s, b):
+            s.w(path, body0); t0 = s.commit('test: add scope fixture'); s.w(path, body1)
+            s.commit(m); return t0 + '..HEAD'
+        return f_
+    FK = 'v.iter().filter(|x|x.len()==2).count()'
+    FA = lambda n, c='': c + 'fn u(v: &[&str]) { assert!(v.iter().filter(|x| x.len() == 2).count() == %s); }\n' % n
+    FC = lambda n: FA('N', 'const N: usize = %s;\n' % n)
+    case('assert! with an inner closure comparison binds to the outer count (const bump)', scoped('tests/scope.rs', FC(3), FC(4)), True, [FK + ' [N]  3 -> 4'])
+    case('assert! with an inner closure comparison binds to the outer count (literal bump)', scoped('tests/scope.rs', FA(3), FA(4)), True, [FK + '  3 -> 4'])
+    case('assert! with an inner closure comparison that appears is flagged', scoped('tests/scope.rs', 'fn t() {}\n', FA(3)), True, [FK + '  (none) -> 3'])
+    case('assert! with an inner closure comparison that disappears is flagged', scoped('tests/scope.rs', FA(3), 'fn t() {}\n'), True, [FK + '  3 -> (none)'])
+    case('assert! with an inner closure comparison, declared by a whole token (filter), is green',
+         scoped_m('tests/scope.rs', FA(3), FA(4), msg('test: bump', 'Count: filter 3 -> 4 (fixture)')), False)
+    case('the inner comparison is not a separate assertion: an unchanged outer count with a moved inner literal is a key change',
+         scoped('tests/scope.rs', FA(3), FA(3).replace('== 2)', '== 5)')), True, [FK + '  3 -> (none)', 'v.iter().filter(|x|x.len()==5).count()  (none) -> 3'])
+    FB = lambda n: 'fn u(v: &[&str]) {\n    assert!(\n        v.iter().filter(|x| { x.len() == 2 }).count() == %s,\n        "m {}",\n        1,\n    );\n}\n' % n
+    case('a multi-line assert! with a block closure, a message and a trailing comma binds to the outer count',
+         scoped('tests/scope.rs', FB(3), FB(4)), True, ['v.iter().filter(|x|{x.len()==2}).count()  3 -> 4'])
+    case('a debug_assert! with an inner closure comparison binds to the outer count',
+         scoped('tests/scope.rs', FA(3).replace('assert!', 'debug_assert!'), FA(4).replace('assert!', 'debug_assert!')), True, [FK + '  3 -> 4'])
+    MK = 'v.iter().map(|x|max(x.len(),1)).count()'
+    MA = lambda n: 'fn u(v: &[&str]) { assert_eq!(v.iter().map(|x| max(x.len(), 1)).count(), %s); }\n' % n
+    case('assert_eq! whose count call holds an inner .len(), call binds to the outer count (appears)', scoped('tests/scope.rs', 'fn t() {}\n', MA(3)), True, [MK + '  (none) -> 3'])
+    case('assert_eq! whose count call holds an inner .len(), call binds to the outer count (disappears)', scoped('tests/scope.rs', MA(3), 'fn t() {}\n'), True, [MK + '  3 -> (none)'])
+    case('assert_eq! whose count call holds an inner .len(), call binds to the outer count (bump)', scoped('tests/scope.rs', MA(3), MA(4)), True, [MK + '  3 -> 4'])
+    # an assert_eq! first argument whose last term is not the count call is not read (the stated limit)
+    for a_ in ('(items.len(), 1)', 'items.len() + 1', 'items.len() as u32', '&v[..items.len()]', 'f(items.len())'):
+        case('an assert_eq! first argument %s is not read' % a_,
+             scoped('tests/scope.rs', 'fn t() { assert_eq!(%s, 18); }\n' % a_, 'fn t() { assert_eq!(%s, 19); }\n' % a_), False)
+    # AMBIGUOUS assert! shapes: tracked by the whole spelling as ?count#ambiguous, never exempt, never guessed
+    AA = 'fn u(v: &[&str]) { assert!(v.iter().any(|x| x.len() == 2)); }\n'
+    AK = 'v.iter().any(|x|x.len()==2)'
+    case('an ambiguous assert! (a count comparison inside a closure only) that appears is flagged', scoped('tests/scope.rs', 'fn t() {}\n', AA), True, [AK + '  (none) -> ?count#ambiguous'])
+    case('an ambiguous assert! that disappears is flagged', scoped('tests/scope.rs', AA, 'fn t() {}\n'), True, [AK + '  ?count#ambiguous -> (none)'])
+    case('an ambiguous assert! that appears, declared with the ?count#ambiguous value, is green',
+         scoped_m('tests/scope.rs', 'fn t() {}\n', AA, msg('test: add', 'Count: any (none) -> ?count#ambiguous (fixture)')), False)
+    case('an ambiguous assert! that is unchanged beside an unrelated edit is no move', scoped('tests/scope.rs', AA, AA + 'fn w() {}\n'), False)
+    case('a reworded ambiguous assert! is flagged on both spellings', scoped('tests/scope.rs', AA, AA.replace('== 2', '== 3')), True,
+         [AK + '  ?count#ambiguous -> (none)', 'v.iter().any(|x|x.len()==3)  (none) -> ?count#ambiguous'])
+    NA = lambda n: 'const N: usize = %s;\nfn u(v: &[u8], k: usize) { assert!(k > 0 && v.len() == N); }\n' % n
+    case('a const named in an ambiguous assert! (behind &&) that is bumped is flagged', scoped('tests/scope.rs', NA(3), NA(4)), True, ['k>0&&v.len()==N [N]  3 -> 4'])
+    case('a const named through a path in an ambiguous assert! resolves over the tree',
+         shared('fn u(v: &[u8], k: usize) { assert!(k > 0 && v.len() == crate::EXPECTED_N); }\n', L(18), L(19)), True, ['k>0&&v.len()==crate::EXPECTED_N [EXPECTED_N]  18 -> 19'])
+    for a_, k_ in (('(items.len()) == %s', '(items.len())==%s'), ('items.len() as u32 == %s', 'items.len()asu32==%s'),
+                   ('!(items.len() == %s)', '!(items.len()==%s)'), ('items.len() == %s || ok', 'items.len()==%s||ok'),
+                   ('ok && items.len() == %s', 'ok&&items.len()==%s')):
+        case('an assert!(%s) is ambiguous and its literal bump is flagged' % (a_ % 'N'),
+             scoped('tests/scope.rs', 'fn t() { assert!(%s); }\n' % (a_ % 18), 'fn t() { assert!(%s); }\n' % (a_ % 19)), True,
+             [(k_ % 18) + '  ?count#ambiguous -> (none)', (k_ % 19) + '  (none) -> ?count#ambiguous'])
+    case('an assert! with a closure count comparison that is not == is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(v.iter().all(|x| x.len() > 2)); }\n', 'fn t() { assert!(v.iter().all(|x| x.len() > 3)); }\n'), False)
+    # ---- end #5759 ----
     case('a .rs file under benches/ is not checked', scoped('benches/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
     case('a non-.rs file under tests/ is not checked', scoped('tests/scope.txt', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
     case('a .rs file under src/ is checked', scoped('src/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), True, ['items.len()  18 -> 19'])
