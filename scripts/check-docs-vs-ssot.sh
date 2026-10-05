@@ -845,9 +845,11 @@ for path in files:
         for val, span, src in hits:
             if val == canon or val in seen:
                 continue
-            # The ledger exempts ONE hit: the needle must sit inside the
-            # matched span, so a history phrase never shields a real claim
-            # that shares its line (schema.html carries both on one line).
+            # A ledger row exempts a hit only when its needle sits inside the
+            # hit's matched span, so a history phrase never shields a real claim
+            # that shares its line (schema.html carries both on one line). A row
+            # is not bounded to one hit: the same phrase on two lines is exempt on
+            # both (two real rows do this today; a per-row bound waits on #5809).
             # A needle with a doubled space or a marker still sits inside the
             # folded span it exempts (#5334, #5335); shields() bounds the fold (#5699).
             hit_entry = [st for nd, st in entries.items() if shields(nd, val, span, src)]
@@ -3356,6 +3358,18 @@ R5808MD
         grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5808 - a needle with subject text was refused or its history flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     echo "PASS: self-test #5808 - a ledger needle without subject text beyond the value (the bare value, v52, V52, 52., (52), bold, code span, padding, bold padding, a number plus a letter, two letters, two numbers, an arrow, an issue ref, a word glued to the number by letters or an underscore, a short bold word, single letters split by markers) is REFUSED by line number and the stale claims it would have shielded are flagged; fullwidth digits are refused by the #5699 rule; a needle with a subject word is accepted"
+    # ---- #5810: a ledger row is not bounded to one hit. One row exempts the same
+    # history phrase on two lines, and a stale claim on a third line is still flagged.
+    printf 'docs/postgres-age-guide.md\tschema_version was 54\t#5810 one row, two lines\n' > "$_s"
+    printf 'the schema_version was 54 at v0.6\nagain, the schema_version was 54 at v0.6\nCURRENT_SCHEMA_VERSION = 52\n' \
+        > "$tmpdir/docs/postgres-age-guide.md"
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) || true
+    grep -qF 'docs/postgres-age-guide.md:3 claims "52"' <<<"$_s_out" \
+        || { echo "FAIL: self-test #5810 - the stale claim beside a twice-used ledger row was not flagged" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _not in 'docs/postgres-age-guide.md:1 ' 'docs/postgres-age-guide.md:2 ' 'line 1 ' 'malformed entry'; do
+        grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5810 - a twice-used ledger row did not exempt both lines: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test #5810 - one ledger row exempts the same history phrase on two lines (no per-row bound; #5809) and a stale claim on a third line is still flagged"
     rm -f "$tmpdir/docs/postgres-age-guide.md"
     printf '# fixture ledger (comment-only)\n' > "$_s"
 
