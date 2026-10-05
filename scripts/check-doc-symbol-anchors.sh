@@ -959,6 +959,41 @@ MDEOF
     anchor_green 5535 "a lone dyn self type with a live trait" \
         "See \`$R::<dyn RecallTool>\`."
 
+    # #5536: a group closer is a closer however it is written or spaced: a
+    # numeric or upper-case entity is an angle bracket, and whitespace (space,
+    # tab, non-breaking space, a whitespace entity) between the closers or
+    # before `::` does not hide the path that continues past them.
+    anchor_red 5536 BARE_QUAL "a missing name after a space-separated closer" \
+        "See $R::RecallTool >::NoSuch here."
+    anchor_red 5536 BARE_QUAL "a missing name after a closer then a space then ::" \
+        "See $R::RecallTool> ::NoSuch here."
+    anchor_red 5536 BARE_QUAL "a missing name after a closer spaced from the group" \
+        "See $R::RecallTool<T> >::NoSuch here."
+    anchor_red 5536 BARE_QUAL "a missing name after a tab-separated closer" \
+        $'See '"$R"$'::RecallTool\t>::NoSuch here.'
+    anchor_red 5536 BARE_QUAL "a missing name after a non-breaking-space-separated closer" \
+        $'See '"$R"$'::RecallTool\xc2\xa0>::NoSuch here.'
+    anchor_red 5536 BARE_QUAL "a missing name after an entity-spaced closer" \
+        "See $R::RecallTool&nbsp;>::NoSuch here."
+    anchor_red 5536 BARE_QUAL "a missing name after a decimal entity closer" \
+        "See $R::RecallTool&#62;::NoSuch here."
+    anchor_red 5536 BARE_QUAL "a missing name after a hexadecimal entity closer" \
+        "See $R::RecallTool&#x3e;::NoSuch here."
+    anchor_red 5536 BARE_QUAL "a missing name after an upper-case entity closer" \
+        "See $R::RecallTool&GT;::NoSuch here."
+    anchor_red 5536 BARE_QUAL "a missing name after a closer of a decimal-entity prose generic" \
+        "See Vec&#60;$R::RecallTool&#62;::NoSuch here."
+    anchor_red 5536 BARE_QUAL "an over-closed anchor whose group is written with decimal entities" \
+        "See $R::RecallTool&#60;T&#62;>::decorate_memory_many here."
+    anchor_green 5536 "a closer followed by prose that merely mentions a later path separator" \
+        "See $R::RecallTool> and :: later here."
+    anchor_green 5536 "a live anchor whose group is written with decimal entities" \
+        "See $R::RecallTool&#60;T&#62;::decorate_memory_many here."
+    anchor_green 5536 "a live anchor in a prose generic written with upper-case entities" \
+        "See Vec&LT;$R::RecallTool&GT; here."
+    anchor_green 5536 "a group followed by a spaced greater-than comparison" \
+        "See $R::RecallTool<T> > 3 here."
+
     # #5497: the header, ABSENT_DEST and the CLAUDE.md gate paragraph state the
     # same destination wording and the same never-exempt cases.
     for wording in "split into" "split up into" "split across" "split out" "renamed to" "a link or a fragment"; do
@@ -1601,15 +1636,29 @@ BARE_QUAL_HEAD = re.compile(r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs)::")
 BRACE_BODY = re.compile(r"\{([^}]*)\}")
 
 
+# #5536: an angle bracket may also be a numeric character reference (`&#60;`,
+# `&#x3c;`, zero padded) or the upper-case named entity (`&LT;`).
+_ENT_LT = re.compile(r"&(?:lt|#0*60|#[xX]0*3[cC]);", re.IGNORECASE)
+_ENT_GT = re.compile(r"&(?:gt|#0*62|#[xX]0*3[eE]);", re.IGNORECASE)
+
+
+def _decode_angles(text):
+    """`text` with every angle-bracket entity spelling turned into the sign."""
+    return _ENT_GT.sub(">", _ENT_LT.sub("<", text))
+
+
 def _group_step(text, j):
     """Classify the text at `j`: ('open'|'close', width) for an angle bracket
     or its HTML entity, ('stop', 1) for a character a group may not contain,
     else ('other', 1). The `>` of an arrow (`->` or `-&gt;`) is not a closer."""
-    if text.startswith("&lt;", j):
-        return "open", 4
-    if text.startswith("&gt;", j):
+    m = _ENT_LT.match(text, j)
+    if m:
+        return "open", m.end() - j
+    m = _ENT_GT.match(text, j)
+    if m:
         # #5429: the entity spelling of an arrow (-&gt;) is not a closer.
-        return ("other", 4) if j > 0 and text[j - 1] == "-" else ("close", 4)
+        width = m.end() - j
+        return ("other", width) if j > 0 and text[j - 1] == "-" else ("close", width)
     ch = text[j]
     if ch == "<":
         return "open", 1
@@ -1640,7 +1689,7 @@ def scan_group(text, i):
 
 
 def _opens_group(text, i):
-    return text.startswith("<", i) or text.startswith("&lt;", i)
+    return text.startswith("<", i) or _ENT_LT.match(text, i) is not None
 
 
 def _token_end(text, i):
@@ -1685,7 +1734,7 @@ def _operator_token_end(prefix, j):
         e += 1
     if e >= len(prefix):
         return None
-    tok = prefix[j:e].replace("&lt;", "<").replace("&gt;", ">")
+    tok = _decode_angles(prefix[j:e])
     return e if tok and set(tok) <= _OP_CHARS else None
 
 
@@ -1713,29 +1762,64 @@ def _outer_depth(prefix):
     return depth
 
 
-def _closer_then_path(text, i):
-    """True when one or more group closers at `i` are followed by `::` (#5496)."""
+def _skip_space(text, j):
+    """Index after any whitespace (a character or a whitespace entity) at `j`."""
+    while j < len(text):
+        if text[j].isspace():
+            j += 1
+            continue
+        m = _WS_ENTITY.match(text, j)
+        if m and _ws_entity(m) == " ":
+            j = m.end()
+            continue
+        break
+    return j
+
+
+def _closer_run(text, i):
+    """Closers at `i`: (attached count, index after them, count of closers
+    when whitespace between them is skipped, index after those and the
+    whitespace that follows them) (#5536)."""
     n, j = 0, i
     while j < len(text):
         kind, width = _group_step(text, j)
         if kind != "close":
             break
         n, j = n + 1, j + width
-    return n > 0 and text.startswith("::", j)
+    total, k = n, j
+    while True:
+        k = _skip_space(text, k)
+        kind, width = _group_step(text, k) if k < len(text) else ("other", 1)
+        if kind != "close":
+            break
+        total, k = total + 1, k + width
+    return n, j, total, k
+
+
+def _closer_then_path(text, i):
+    """The index to take the token end from when one or more group closers at
+    `i` (attached, or separated by whitespace, #5536) are followed by `::`
+    (#5496); None otherwise."""
+    n, j, total, k = _closer_run(text, i)
+    if n > 0 and text.startswith("::", j):
+        return j
+    if total > 0 and text.startswith("::", k):
+        return k
+    return None
 
 
 def _stray_close(text, i, outer=0):
-    """True when `text` has more extra group closers (`>` or `&gt;`) at `i`
-    than the `outer` groups opened before the anchor can take (#5456). Closers
-    that fit the outer groups still count as an over-close when a `::` follows
-    them: the path then continues past a closer, which is the #5430 shape."""
-    n, j = 0, i
-    while j < len(text):
-        kind, width = _group_step(text, j)
-        if kind != "close":
-            break
-        n, j = n + 1, j + width
-    return n > outer or (n > 0 and text.startswith("::", j))
+    """The index to take the token end from when `text` has more extra group
+    closers (`>` or `&gt;`) at `i` than the `outer` groups opened before the
+    anchor can take (#5456), or a closer is followed by `::` (the path then
+    continues past a closer, the #5430 shape, also across whitespace, #5536);
+    None otherwise."""
+    n, j, total, k = _closer_run(text, i)
+    if n > outer or (n > 0 and text.startswith("::", j)):
+        return j
+    if total > 0 and text.startswith("::", k):
+        return k
+    return None
 
 
 def scan_sym(text, i, outer=0):
@@ -1753,8 +1837,9 @@ def scan_sym(text, i, outer=0):
         end = scan_group(text, pos)
         if end is None:
             return _token_end(text, pos)
-        if _stray_close(text, end, outer):
-            return _token_end(text, end)
+        stray = _stray_close(text, end, outer)
+        if stray is not None:
+            return _token_end(text, stray)
         if not text.startswith("::", end):
             # #5535: a lone balanced group is a self type with no method: the
             # caller checks (or refuses) it, it is never silently dropped.
@@ -1770,13 +1855,15 @@ def scan_sym(text, i, outer=0):
             if end is None:
                 return _token_end(text, pos)
             pos = end
-            if _stray_close(text, pos, outer):
-                return _token_end(text, pos)
+            stray = _stray_close(text, pos, outer)
+            if stray is not None:
+                return _token_end(text, stray)
         if not text.startswith("::", pos):
             # #5496: a closer followed by `::` continues the path past the
             # closer even when the anchor has no group of its own.
-            if _closer_then_path(text, pos):
-                return _token_end(text, pos)
+            past = _closer_then_path(text, pos)
+            if past is not None:
+                return _token_end(text, past)
             return pos
         m = ID_RE.match(text, pos + 2)
         if m:
@@ -1786,8 +1873,9 @@ def scan_sym(text, i, outer=0):
             if end is None:
                 return _token_end(text, pos + 2)
             pos = end
-            if _stray_close(text, pos, outer):
-                return _token_end(text, pos)
+            stray = _stray_close(text, pos, outer)
+            if stray is not None:
+                return _token_end(text, stray)
         else:
             return pos
 
@@ -1966,7 +2054,7 @@ def split_items(raw):
     whitespace that are NOT inside a generic group (`{A<T, U>::m, B}` is two
     items, not four)."""
     items, cur, depth = [], "", 0
-    norm = raw.replace("&lt;", "<").replace("&gt;", ">")
+    norm = _decode_angles(raw)
     for idx, ch in enumerate(norm):
         if ch == "<":
             depth += 1
@@ -2132,7 +2220,7 @@ for doc in seen_docs:
                 # #5255/#5342: `Type<T, U>::method` checks BOTH components;
                 # generic arguments are not symbol claims. `<Type as
                 # Trait>::m` checks `Type` and `m`.
-                tok = tok.replace("&lt;", "<").replace("&gt;", ">")
+                tok = _decode_angles(tok)
                 whole = tok
                 toks = unwrap_self_type(tok)
                 if toks is None:
