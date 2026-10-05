@@ -812,7 +812,8 @@ CRED_TOOL_RE = re.compile(
 # wget -e/--execute runs a wgetrc command; getopt takes any unique prefix of the long name, so --exe
 # .. --execute all run it (--ex is ambiguous and wget refuses it). wgetrc ignores case, dashes and underscores in a
 # command name and allows spaces around "=", so the name is folded and read, not matched (#5293).
-WGET_EXEC_RE = re.compile(r"\bwget\b[^|;&]*?(?:(?<![\w-])-[A-Za-z]*e|--exe(?:c(?:u(?:te?)?)?)?(?![\w-]))[\s=]*")
+WGET_CMD_RE = re.compile(r"\bwget\b[^|;&]*")
+WGET_EXEC_OPT_RE = re.compile(r"(?:(?<![\w-])-[A-Za-z]*e|--exe(?:c(?:u(?:te?)?)?)?(?![\w-]))[\s=]*")
 WGETRC_PASSWORD_RE = re.compile(r"(?:https?|ftp|proxy)?passw(?:or)?d")
 
 
@@ -850,12 +851,14 @@ def _shell_word(text: str, pos: int) -> str:
 def wgetrc_credential(raw: str) -> bool:
     """True when a wget -e/--execute value sets a password, or names a setting the gate cannot
     resolve (an expansion in the name): unresolved means flagged (#4869, #5293)."""
-    for m in WGET_EXEC_RE.finditer(raw):
-        name = _shell_word(raw, m.end()).split("=", 1)[0]
-        if "$" in name or "`" in name:
-            return True
-        if WGETRC_PASSWORD_RE.fullmatch(re.sub(r"[-_\s]", "", name).lower()):
-            return True
+    for cmd in WGET_CMD_RE.finditer(raw):
+        # every -e and --execute option of the command, not only the first (#5682)
+        for m in WGET_EXEC_OPT_RE.finditer(raw, cmd.start(), cmd.end()):
+            name = _shell_word(raw, m.end()).split("=", 1)[0]
+            if "$" in name or "`" in name:
+                return True
+            if WGETRC_PASSWORD_RE.fullmatch(re.sub(r"[-_\s]", "", name).lower()):
+                return True
     return False
 
 
@@ -2023,6 +2026,10 @@ ROUND3_RED = [
     ('5631 closed world: reported 8: quoted words are read as the shell reads them', 'ssh h "mysql -u r -p$X"'),
     ('5631 closed world: reported 9: quoted words are read as the shell reads them', 'bash -c "mysqldump -u r -p\\"$X\\" db | gzip"'),
     ('5631 closed world: reported 10: quoted words are read as the shell reads them', "sh -c 'mysql -p$P db'"),
+    ('5682 red 1: every -e and --execute option of a wget command is read', 'wget -e robots=off -e "http_password=$X" URL'),
+    ('5682 red 2: every -e and --execute option of a wget command is read', 'wget -e robots=off --execute "ftp_password=$X" URL'),
+    ('5682 red 3: every -e and --execute option of a wget command is read', 'wget --exe robots=off --exec "http_password=$X" URL'),
+    ('5682 red 4: every -e and --execute option of a wget command is read', 'wget -q -e robots=off -e timestamping=on -e "proxy_password=$X" URL'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
@@ -2076,6 +2083,8 @@ ROUND3_GREEN = [
     ('5631 closed world: clean 1: quoted words are read as the shell reads them', 'apt-get install -y mysql-client "$PKG"'),
     ('5631 closed world: clean 2: quoted words are read as the shell reads them', 'chown -R mysql:mysql "$DIR"'),
     ('5631 closed world: clean 3: quoted words are read as the shell reads them', 'curl http://mysql:3306/$X'),
+    ('5682 green 1: every -e and --execute option of a wget command is read', 'wget -e robots=off -e timestamping=on URL'),
+    ('5682 green 2: every -e and --execute option of a wget command is read', 'wget -e robots=off --execute "dirstruct=off" "$URL"'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
