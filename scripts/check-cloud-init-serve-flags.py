@@ -3952,10 +3952,37 @@ def layer_problems() -> list:
     return bad
 
 
+def reader_problems() -> list:
+    """Each reader of a credential value is pinned on its exact output, so the others (the
+    alphanumeric runs, the keyword mask) cannot cover for it: the shell word (quote
+    concatenation, an escaped quote), the libpq value (an escaped quote, unescaped), the mixed
+    run of a line tail, and the whole value of a joined continuation (#5546-#5548)."""
+    bad = []
+    for text, want in (("abc'Zk7secretXY' psql", ("abc'Zk7secretXY'", "abcZk7secretXY")),
+                       ("ab\\'Zk7secretXY x", ("ab\\'Zk7secretXY", "ab'Zk7secretXY"))):
+        if read_shell_word(text, 0) != want:
+            bad.append("F1 read_shell_word(%r) is %r, not %r" % (text, read_shell_word(text, 0), want))
+    want = ["ab\\'Zk7secretXY", "ab'Zk7secretXY"]
+    if libpq_value("'ab\\'Zk7secretXY' x", 0) != want:
+        bad.append("F2 libpq_value is %r, not %r" % (libpq_value("'ab\\'Zk7secretXY' x", 0), want))
+    if "Zk7secretXY" not in credential_values("password=a Zk7secretXY")[3:]:
+        bad.append("F1 the mixed run of a line tail is not read")
+    spelled = "PGPASSWORD=Zk7\\\nsecretXY psql -h h"
+    try:
+        CRED_PIECES.clear()
+        register_credentials(spelled)
+        for piece in ("Zk7secretXY", "Zk7⏎secretXY", "Zk7\\⏎secretXY"):
+            if piece not in CRED_PIECES:
+                bad.append("F3 the continuation value %r is not registered" % piece)
+    finally:
+        CRED_PIECES.clear()
+    return bad
+
+
 def spelling_problems(base: tuple) -> list:
     """No spelling in CRED_SPELLINGS puts a byte of the secret on the gate scan or the listing,
     and the scan refuses each one (#5546-#5550)."""
-    bad = layer_problems()
+    bad = layer_problems() + reader_problems()
     for cls, label, text in CRED_SPELLINGS:
         outs = spelling_outputs(base, text)
         for path, rc, out in outs:
