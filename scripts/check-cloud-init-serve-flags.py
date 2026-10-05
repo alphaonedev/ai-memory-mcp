@@ -3554,7 +3554,7 @@ def build_probes() -> list:
     dred("D-4705 SQL dollar-quoted password literal with a terraform value", [(RELOAD, "      sudo -u postgres psql -c 'ALTER USER aimemory WITH PASSWORD $$${db_password}$$;'\n" + RELOAD)], autolist=True)
     dred("D-4705 SQL password literal with a prefix before the terraform value", [(RELOAD, "      sudo -u postgres psql -c \"ALTER USER aimemory WITH PASSWORD 'pre$${db_password}';\"\n" + RELOAD)], autolist=True)
     dred("D-4671 terraform secret interpolated into the store-url", [(DDSN, DDSN.replace("CHANGEME", "$${db_password}"))], autolist=True)
-    MINT = "      URL=\"$(sed -n 's#^\\(.*CHANGEME.*\\)#\\1#p' /etc/ai-memory/store-url)\"\n"
+    MINT = "      URL=\"$(LC_ALL=C sed -n 's#^\\(.*CHANGEME.*\\)#\\1#p' /etc/ai-memory/store-url)\"\n"
     dred("D-5428 grep -q on the store-url in provision (R5 cannot show it is data)", [(MINT, MINT + "      if grep -q CHANGEME /etc/ai-memory/store-url; then :; fi\n")], autolist=True)
     dred("D-5428 sed -i -f - rewrites the store-url in provision (a sed script on stdin)", [(MINT, MINT + "      printf 's/a/b/\\n' | sed -i -f - /etc/ai-memory/store-url\n")], autolist=True)
     dred("D-4677 channel_binding in the store-url", [(DDSN, DDSN + "&channel_binding=require")], autolist=True)

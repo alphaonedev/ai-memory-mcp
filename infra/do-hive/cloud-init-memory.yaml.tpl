@@ -502,10 +502,13 @@ write_files:
       # file already carries. The file is only ever read with a fixed sed -n
       # expression and written with the shell's own printf, so the gate can show
       # (rule R5) that no command runs it, and the secret is on no argv (#5428).
+      # Every such sed runs under LC_ALL=C, so a class or a dot matches one byte
+      # whatever the node's locale (#5807): a byte that is not valid UTF-8 can
+      # not hide the password and turn a kept file into a fresh mint.
       # A file with no postgres://aimemory:...@ line (empty, or another scheme or user)
       # is replaced by a freshly minted URL, not kept.
-      URL="$(sed -n 's#^\(.*CHANGEME.*\)#\1#p' /etc/ai-memory/store-url)"
-      CUR="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+      URL="$(LC_ALL=C sed -n 's#^\(.*CHANGEME.*\)#\1#p' /etc/ai-memory/store-url)"
+      CUR="$(LC_ALL=C sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
       if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ]; then
         NEW_HEX="$(openssl rand -hex 24)"
         if [ "$CUR" = CHANGEME ]; then
@@ -527,8 +530,8 @@ write_files:
       # non-empty line when it has a line and as many newlines between its lines
       # as it has empty lines.
       printf -v NL '\n'
-      ALL="$(sed -n 's#^#x#p' /etc/ai-memory/store-url)"
-      BLANK="$(sed -n 's#^$#x#p' /etc/ai-memory/store-url)"
+      ALL="$(LC_ALL=C sed -n 's#^#x#p' /etc/ai-memory/store-url)"
+      BLANK="$(LC_ALL=C sed -n 's#^$#x#p' /etc/ai-memory/store-url)"
       GAPS="$${ALL//[!$NL]/}"
       EMPTY="$${BLANK//$NL/}"
       if [ -z "$ALL" ] || [ "$${#GAPS}" != "$${#EMPTY}" ]; then
@@ -540,7 +543,7 @@ write_files:
       if [ "$SHAPED" != url ]; then
         echo "store-url line is not one aimemory URL of printable ASCII characters with an unreserved password: /etc/ai-memory/store-url"; exit 1
       fi
-      CUR="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+      CUR="$(LC_ALL=C sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
       if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ] || [[ "$CUR" == *[[:space:]]* ]]; then
         echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1
       fi
@@ -677,7 +680,7 @@ write_files:
       # The DSN userinfo is percent-decoded here the way the daemon's URL parser
       # decodes it, and any single quote is doubled for the SQL literal. psql runs with ON_ERROR_STOP so a failed statement
       # stops the script instead of falling through to CREATE DATABASE.
-      DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+      DB_PASS="$(LC_ALL=C sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
       [ -n "$DB_PASS" ] || { echo "no db password in /etc/ai-memory/store-url"; exit 1; }
       sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1 || \
         printf '%s' "$DB_PASS" \

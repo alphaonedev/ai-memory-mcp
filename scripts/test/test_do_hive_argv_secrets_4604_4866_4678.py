@@ -77,7 +77,7 @@ def mint_block():
     """The provision.sh role-password rotation statements (from the URL read to the placeholder refusal), with the
     Terraform escape $${ turned into the shell text ${ and the store-url path left for the caller to replace."""
     tpl = TPL.read_text()
-    m = re.search(r"^[ ]*URL=\"\$\(sed -n .*?^[ ]*echo \"placeholder db password still in /etc/ai-memory/store-url\"; exit 1\n[ ]*fi\n", tpl, re.S | re.M)
+    m = re.search(r"^[ ]*URL=\"\$\(LC_ALL=C sed -n .*?^[ ]*echo \"placeholder db password still in /etc/ai-memory/store-url\"; exit 1\n[ ]*fi\n", tpl, re.S | re.M)
     return None if not m else m.group(0).replace("$${", "${")
 
 
@@ -234,6 +234,52 @@ def store_url_shape_locale_5764():
                 else:
                     probe("#5764 %s is kept under %s" % (label, lc), r.returncode == 0 and kept and not r.stdout,
                           "rc=%d %r" % (r.returncode, r.stdout[:70]))
+
+
+
+def store_url_premint_locale_5807():
+    """#5807: every sed that reads the store-url runs under LC_ALL=C, so the mint decision is the same in every
+    locale. Under a UTF-8 locale [^@]* and .* stop at a byte that is not valid UTF-8, so the password read came out
+    empty and a store-url whose password held such a byte was silently replaced by a fresh mint."""
+    tpl = TPL.read_text()
+    reads = re.findall(r"^.*\bsed\b.*/etc/ai-memory/store-url.*$", tpl, re.M)
+    probe("#5807 the template reads the store-url with sed at 7 sites", len(reads) == 7, repr(len(reads)))
+    bare = [l.strip() for l in reads if not re.search(r"\"\$\(LC_ALL=C sed -n '", l)]
+    probe("#5807 every sed that reads the store-url runs under LC_ALL=C", not bare, repr(bare[:2]))
+    probe("#5807 the comment states that the file is read under LC_ALL=C in every locale",
+          "Every such sed runs under LC_ALL=C, so a class or a dot matches one byte\n      # whatever the node's locale"
+          " (#5807)" in tpl, "")
+    block = mint_block()
+    probe("#5807 mint block present", bool(block))
+    if not block:
+        return
+    locales = utf8_locales()
+    for lc in locales:
+        r = subprocess.run(["sed", "-n", "s#^p:\\([^@]*\\)@.*#\\1#p"], input=b"p:ab\xff@h\n", capture_output=True,
+                           env={"PATH": os.environ["PATH"], "LC_ALL": lc})
+        probe("#5807 %s makes [^@]* stop at an invalid byte (the case discriminates)" % lc, r.stdout == b"", repr(r.stdout))
+    bad_pw = b"postgres://aimemory:ab\xff@localhost/x\n"
+    bad_host = b"postgres://aimemory:CHANGEME@loc\xffx/x\n"
+    for lc in locales + ["C", "POSIX"]:
+        for label, start, want in (("an invalid byte in the password", bad_pw, bad_pw),
+                                   ("a placeholder with an invalid byte in the host", bad_host,
+                                    bad_host.replace(b"CHANGEME", SECRET.encode())),
+                                   ("a rotated ASCII URL", ROTATED.encode(), None)):
+            with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+                d = pathlib.Path(t)
+                (d / "openssl").write_text('#!/bin/bash\nprintf "%s\\n" "' + SECRET + '"\n')
+                (d / "openssl").chmod(0o755)
+                f = d / "store-url"
+                f.write_bytes(start)
+                r = run_bash(block.replace("/etc/ai-memory/store-url", str(f)), d, {"LC_ALL": lc})
+                got = f.read_bytes()
+                if want is None:
+                    probe("#5807 %s is kept under %s" % (label, lc), r.returncode == 0 and got == start and not r.stdout,
+                          "rc=%d %r" % (r.returncode, r.stdout[:70]))
+                    continue
+                probe("#5807 %s is refused with the shape message under %s, not replaced by a fresh mint" % (label, lc),
+                      r.returncode == 1 and r.stdout.startswith(MSG_SHAPE) and r.stdout.count("\n") == 1 and got == want,
+                      "rc=%d %r %r" % (r.returncode, r.stdout[:70], got[:60]))
 
 
 def f5_admin_call():
@@ -3659,6 +3705,7 @@ def main():
     (ROOT / ".local-runs").mkdir(exist_ok=True)
     f4_sed()
     store_url_shape_locale_5764()
+    store_url_premint_locale_5807()
     f5_admin_call()
     f5_federate()
     f6_spawn()
