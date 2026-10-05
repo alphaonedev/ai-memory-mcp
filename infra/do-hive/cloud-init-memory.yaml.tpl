@@ -302,7 +302,7 @@ write_files:
           || fail "identity generate failed for $FED_ID"
       fi
       runuser -u aimemory -- cat "$KEY_DIR/$FED_ID.pub" > "$FED_DIR/$FED_ID.pub.new" \
-        || fail "could not read $KEY_DIR/$FED_ID.pub as the service user"
+        || fail "cannot copy the public key $KEY_DIR/$FED_ID.pub as the service user"
       chmod 0644 "$FED_DIR/$FED_ID.pub.new"
       mv -f "$FED_DIR/$FED_ID.pub.new" "$FED_DIR/$FED_ID.pub"
       echo "[fed-bootstrap] published $FED_DIR/$FED_ID.pub (public half only) for cross-enrollment"

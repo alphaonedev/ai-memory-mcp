@@ -227,7 +227,7 @@ do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | [ -x "$BIN" ] || fail "no
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | if [ ! -f "$KEY_DIR/$FED_ID.priv" ]; then
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | sudo -u aimemory env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_DB=/var/lib/ai-memory/identity.db \⏎ /usr/local/lib/ai-memory/bin/ai-memory identity generate --agent-id "$FED_ID" --key-dir "$KEY_DIR" \⏎ || fail "identity generate failed for $FED_ID"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | fi
-do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | runuser -u aimemory -- cat "$KEY_DIR/$FED_ID.pub" > "$FED_DIR/$FED_ID.pub.new" \⏎ || fail "could not read $KEY_DIR/$FED_ID.pub as the service user"
+do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | runuser -u aimemory -- cat "$KEY_DIR/$FED_ID.pub" > "$FED_DIR/$FED_ID.pub.new" \⏎ || fail "cannot copy the public key $KEY_DIR/$FED_ID.pub as the service user"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | chmod 0644 "$FED_DIR/$FED_ID.pub.new"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | mv -f "$FED_DIR/$FED_ID.pub.new" "$FED_DIR/$FED_ID.pub"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | echo "[fed-bootstrap] published $FED_DIR/$FED_ID.pub (public half only) for cross-enrollment"
