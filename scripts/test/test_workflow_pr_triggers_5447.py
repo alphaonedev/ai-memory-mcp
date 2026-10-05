@@ -137,15 +137,26 @@ TOP_KEY = re.compile(r"""^("[^"\\]*"|'[^']*'|[A-Za-z_][A-Za-z0-9_-]*)\s*:(\s|$)"
 ON_SPELLINGS = ("on", "true", "yes")  # all resolve to the boolean True key (YAML 1.1)
 
 
-def _refuse_repeated_top_level(rows: List[Tuple[int, str, str]]) -> None:
-    """A top-level key may appear once (#5667); a YAML reader would keep the last."""
+def _check_top_level(rows: List[Tuple[int, str, str]]) -> None:
+    """Closed-world top level: only plain mapping keys, each once (#5667, #5668).
+
+    A single leading ``---`` is accepted; every other indent-0 row must be a bare
+    or escape-free quoted key. Document markers, directives, sequences, complex
+    keys, merge keys, anchors, tags, flow collections and an unclosed quote at the
+    top level are all refused, because a YAML reader would read them differently.
+    """
     seen: Set[str] = set()
-    for ind, body, _sus in rows:
-        if ind != 0:
+    for idx, (ind, body, sus) in enumerate(rows):
+        if ind != 0 or sus == "non-space leading whitespace":
+            continue  # tab/NBSP-led rows are block-scalar content, never a column-0 key
+        if idx == 0 and body == "---":
             continue
         m = TOP_KEY.match(body)
         if not m:
-            continue
+            raise Unparsed("top-level row is not a plain mapping key (#5668): " + repr(body))
+        value = body[m.end():].strip()
+        if value[:1] in ("'", '"') and not (len(value) >= 2 and value[-1] == value[0]):
+            raise Unparsed("top-level value with an unclosed quote (#5668): " + repr(body))
         key = m.group(1).strip("\"'").lower()
         if key in ON_SPELLINGS:
             key = "on"
@@ -156,8 +167,10 @@ def _refuse_repeated_top_level(rows: List[Tuple[int, str, str]]) -> None:
 
 def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
     """Return {trigger: {filter_key: [items]}} for the workflow's ``on:`` block."""
+    if text.startswith("\ufeff"):
+        text = text[1:]  # a BOM at the very start of the stream is not content
     rows = _meaningful(text)
-    _refuse_repeated_top_level(rows)
+    _check_top_level(rows)
     start = None
     for idx, (ind, body, _sus) in enumerate(rows):
         if ind == 0 and re.match(r"""^("on"|'on'|on|true)\s*:""", body):
@@ -797,6 +810,76 @@ class DuplicateTopLevel5667(unittest.TestCase):
     def test_5667_first_on_quoted_second_bare(self) -> None:
         text = 'name: x\n"on":\n' + GOOD_PUSH + GOOD_PR + "jobs: {}\non:\n" + self.TAIL
         self._shape(text)
+
+
+class TopLevelShapes5668(unittest.TestCase):
+    """#5668: every indent-0 row must be a plain mapping key; anything else is Unparsed."""
+
+    def _shape(self, text: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v for v in got), got)
+
+    def _base(self) -> str:
+        return _with_on_block(GOOD_PUSH + GOOD_PR)
+
+    BAD = "on:\n  push:\n    branches: ['rehearsal/x']\n"
+
+    def test_5668_control_clean(self) -> None:
+        self.assertEqual([], violations("x.yml", self._base()))
+
+    def test_5668_single_leading_document_start_is_clean(self) -> None:
+        self.assertEqual([], violations("x.yml", "---\n" + self._base()))
+
+    def test_5668_second_document(self) -> None:
+        self._shape(self._base() + "---\nextra: y\n")
+
+    def test_5668_document_end_marker(self) -> None:
+        self._shape(self._base() + "...\n")
+
+    def test_5668_two_leading_document_starts(self) -> None:
+        self._shape("---\n---\n" + self._base())
+
+    def test_5668_document_start_with_content(self) -> None:
+        self._shape("--- !!map\n" + self._base())
+
+    def test_5668_yaml_directive(self) -> None:
+        self._shape("%YAML 1.1\n" + self._base())
+
+    def test_5668_top_level_sequence_entry(self) -> None:
+        self._shape(self._base() + "- x\n")
+
+    def test_5668_complex_key(self) -> None:
+        self._shape(self._base() + "? on\n")
+
+    def test_5668_merge_key(self) -> None:
+        self._shape(self._base() + "<<: *a\n")
+
+    def test_5668_anchored_key(self) -> None:
+        self._shape("&a on:\n  push:\n    branches: [main]\n" + GOOD_PR)
+
+    def test_5668_tagged_key(self) -> None:
+        self._shape(self._base() + "!!str x: y\n")
+
+    def test_5668_flow_mapping_document(self) -> None:
+        self._shape("{on: {push: {branches: ['rehearsal/x']}}}\n")
+
+    def test_5668_flow_sequence_document(self) -> None:
+        self._shape("[on, push]\n")
+
+    def test_5668_escaped_double_quoted_key(self) -> None:
+        self._shape(self._base() + '"o\\x6e": 1\n')
+
+    def test_5668_multiline_double_quoted_value(self) -> None:
+        self._shape('name: "x\n' + self._base()[len("name: x\n"):] + 'extra: "\n')
+
+    def test_5668_multiline_single_quoted_value(self) -> None:
+        self._shape("name: 'x\n" + self._base()[len("name: x\n"):] + "extra: '\n")
+
+    def test_5668_scalar_document(self) -> None:
+        self._shape("just text\n" + self._base())
+
+    def test_5668_block_scalar_value_stays_clean(self) -> None:
+        self.assertEqual([], violations("x.yml", "name: |\n  text\n" + self._base()[len("name: x\n"):]))
 
 
 class GlobSemantics5447(unittest.TestCase):
