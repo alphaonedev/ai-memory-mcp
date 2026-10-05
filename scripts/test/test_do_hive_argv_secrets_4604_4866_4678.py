@@ -671,6 +671,36 @@ def failure_lines_4999():
         probe("V1 an over-long version token prints the byte count, not the token", r.stdout.splitlines() == [
             b"NO node 1 PostgreSQL is not 18.6 (got 33 bytes)", b"NO node 1 AGE is not 1.8.0 (got 33 bytes)",
             b"NO node 1 pgvector is not 0.8.6 (got 33 bytes)"], repr(r.stdout[:160]))
+        # #5417: a label count other than 1 is one fixed line that prints no version token and no count.
+        cnt_age = b"NO node 1 AGE is not 1.8.0 (the labelled row count is not 1)"
+        cnt_vec = b"NO node 1 pgvector is not 0.8.6 (the labelled row count is not 1)"
+        ok_age, ok_vec = b"OK node 1 AGE 1.8.0", b"OK node 1 pgvector 0.8.6"
+        pg = b"NO node 1 PostgreSQL is not 18.6 (got 17.2)"
+        for label, reply, want in (
+                ("age twice", b"17.2\nage=1.8.0\nage=1.8.0\nvector=0.8.6", [pg, cnt_age, ok_vec]),
+                ("age twice, the second empty", b"17.2\nage=1.8.0\nage=\nvector=0.8.6", [pg, cnt_age, ok_vec]),
+                ("age twice, both empty", b"17.2\nage=\nage=\nvector=0.8.6", [pg, cnt_age, ok_vec]),
+                ("no age row", b"17.2\nvector=0.8.6", [pg, cnt_age, ok_vec]),
+                ("no rows at all", b"17.2", [pg, cnt_age, cnt_vec]),
+                ("vector twice", b"17.2\nage=1.8.0\nvector=0.8.6\nvector=0.8.6", [pg, ok_age, cnt_vec]),
+                ("one empty age label", b"17.2\nage=\nvector=0.8.6", [pg, b"NO node 1 AGE is not 1.8.0 (got 22 bytes)", ok_vec]),
+                ("one wrong age version", b"17.2\nage=1.7.0\nvector=0.8.6", [pg, b"NO node 1 AGE is not 1.8.0 (got 1.7.0)", ok_vec]),
+                ("one right row each", b"17.2\nage=1.8.0\nvector=0.8.6", [pg, ok_age, ok_vec])):
+            r = run_versions_bytes(fs, defs, reply, d, "C.UTF-8")
+            probe("#5417 %s: exact lines" % label, bool(vb) and r.stdout.splitlines() == want, repr(r.stdout.splitlines()[:3]))
+        # No output line may say a value is not X while showing X as what it got, for any row layout.
+        rows = (b"", b"age=1.8.0\n", b"age=1.8.0\nage=1.8.0\n", b"age=\nage=\n", b"age=1.7.0\nage=1.7.0\n", b"age=1.8.0\nage=\n")
+        vrows = (b"", b"vector=0.8.6\n", b"vector=0.8.6\nvector=0.8.6\n", b"vector=\nvector=\n", b"vector=0.8.6\nvector=\n")
+        bad_lines, seen = [], 0
+        for a in rows:
+            for v in vrows:
+                for first in (b"18.6", b"17.2"):
+                    r = run_versions_bytes(fs, defs, first + b"\n" + a + v, d, "C.UTF-8")
+                    for ln in r.stdout.splitlines():
+                        seen += 1
+                        if re.search(rb"is not (\S+) \(got \1\)", ln):
+                            bad_lines.append(ln)
+        probe("#5417 no line reads: is not X (got X)", bool(vb) and seen > 0 and not bad_lines, repr(bad_lines[:2]))
         verify_canary(fs, d, hostile)
     closed_world_taint(fs)
 

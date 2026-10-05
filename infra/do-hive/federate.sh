@@ -419,8 +419,22 @@ EOS
     age_n="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '2,$p' | LC_ALL=C grep -c '^age=')"
     vec_n="$(printf '%s\n' "$versions" | LC_ALL=C sed -n '2,$p' | LC_ALL=C grep -c '^vector=')"
     [ "$pg_ver" = 18.6 ] && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 (got $(reply_version "$pg_ver" "$versions"))"
-    [ "$age_ver" = 1.8.0 ] && [ "$age_n" = 1 ] && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 (got $(reply_version "$age_ver" "$versions"))"
-    [ "$vec_ver" = 0.8.6 ] && [ "$vec_n" = 1 ] && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 (got $(reply_version "$vec_ver" "$versions"))"
+    # #5417: a label count other than 1 is its own fixed line, tested BEFORE any version token is printed,
+    # so the line never says "(got X)" about a token it does not use and prints no byte of the reply.
+    if [ "$age_n" != 1 ]; then
+      no "node $((i + 1)) AGE is not 1.8.0 (the labelled row count is not 1)"
+    elif [ "$age_ver" = 1.8.0 ]; then
+      ok "node $((i + 1)) AGE 1.8.0"
+    else
+      no "node $((i + 1)) AGE is not 1.8.0 (got $(reply_version "$age_ver" "$versions"))"
+    fi
+    if [ "$vec_n" != 1 ]; then
+      no "node $((i + 1)) pgvector is not 0.8.6 (the labelled row count is not 1)"
+    elif [ "$vec_ver" = 0.8.6 ]; then
+      ok "node $((i + 1)) pgvector 0.8.6"
+    else
+      no "node $((i + 1)) pgvector is not 0.8.6 (got $(reply_version "$vec_ver" "$versions"))"
+    fi
   done
 
   # These two assertions intentionally originate on f2/public internet.
