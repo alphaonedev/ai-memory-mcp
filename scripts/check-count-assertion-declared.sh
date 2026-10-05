@@ -946,6 +946,17 @@ def selftest():
                    ('closure without parameters, path cast', '(|| v.len() as a::T == %s)()'),
                    ('a second count behind &&, path cast', 'v.len() > 0 && v.len() as a::T == %s')):
         amb_leg(l_, a_)
+    # #5798 (round-6 F2): braces, a block comment, a method chain or anything else between the count call and ==
+    for l_, a_ in (('M2 braces behind &&', 'ok && { v.len() } == %s'), ('M4 block comment behind &&', 'ok && v.len() /* n */ == %s'),
+                   ('M8 .into() behind &&', 'ok && v.len().into() == %s'), ('braces', '{ v.len() } == %s'),
+                   ('block comment', 'v.len() /* n */ == %s'), ('line break behind &&', 'ok && v.len()\n        == %s'),
+                   ('.into()', 'v.len().into() == %s'), ('.try_into().unwrap()', 'v.len().try_into().unwrap() == %s'),
+                   ('space inside the call', 'v.len () == %s'), ('.count() with spaces inside the call', 'v.iter().count( ) == %s && ok'),
+                   ('count call as a call argument', 'f(v.len(), 2) == %s'), ('if-expression operand', 'if ok { v.len() } else { 0 } == %s'),
+                   ('arithmetic after a cast', 'ok && v.len() as u64 + 0 == %s'), ('closure-only braces', 'v.iter().any(|x| { x.len() } == %s)'),
+                   ('match arm after =>', 'match k { _ => v.len() as a::T == %s }'), ('tuple operand', '(v.len(), 2) == (%s, 2)'),
+                   ('a block with a statement', '{ let n = v.len(); n } == %s')):
+        amb_leg(l_, a_)
     case('a count call behind && in a closure, with == on another operand, is not read',
          scoped('tests/scope.rs', 'fn t() { assert!(v.iter().all(|x| x.len() > 0 && x[0] == 18)); }\n',
                 'fn t() { assert!(v.iter().all(|x| x.len() > 0 && x[0] == 19)); }\n'), False)
