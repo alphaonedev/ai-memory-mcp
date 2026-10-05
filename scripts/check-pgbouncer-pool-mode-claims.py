@@ -245,6 +245,12 @@ CTX = re.compile(r" \| ctx:([0-9a-f]{12})$")  # R7: an allowlist entry is bound 
 _EMPHASIS = re.compile(r"(?<![^\W_])(_+)(?=[^\W_])(.+?)(?<=[^\W_])\1(?![^\W_])")
 
 
+# #5480 (F6, M14/M15): a lone underscore at a word edge is not emphasis but still hides the word from \b (transaction_ mode,
+# _transaction mode, _ transaction_ mode). mentions() reads a second view with those underscores replaced by a space;
+# the unit text keeps them, so the allowlist keys do not move.
+_EDGE_US = re.compile(r"(?<![^\W_])_+(?=[^\W_])|(?<=[^\W_])_+(?![^\W_])")
+
+
 def normalise(line: str) -> str:
     fence = line.strip()
     if FENCE.match(fence):
@@ -376,6 +382,13 @@ def unreadable(text: str) -> bool:
 
 
 def _mentions_one(text: str) -> bool:
+    if _mentions_view(text):
+        return True
+    edge = _EDGE_US.sub(" ", text)
+    return edge != text and _mentions_view(edge)
+
+
+def _mentions_view(text: str) -> bool:
     if not _QUICK.search(text):
         return False  # speed only: every R1/R2 pattern needs one of these words
     text = TOOL_PATH.sub(_path_words, text)
@@ -891,6 +904,15 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("R1 #5476: triple underscore emphasis on the mode word", "docs/a.md", "Run PgBouncer in ___transaction___ mode.\n"),
     ("R1 #5476: triple underscore emphasis over two words", "docs/a.md", "Use ___transaction pooling___ here.\n"),
     ("R1 #5476: four underscore emphasis on the mode word", "docs/a.md", "Run PgBouncer in ____transaction____ mode.\n"),
+    ("R1 #5480: a trailing underscore on the mode word", "docs/a.md", "Run PgBouncer in transaction_ mode.\n"),
+    ("R1 #5480: a leading underscore on the mode word", "docs/a.md", "Run PgBouncer in _transaction mode.\n"),
+    ("R1 #5480: an underscore on each side with a space", "docs/a.md", "Run PgBouncer in _ transaction_ mode.\n"),
+    ("R1 #5480: two trailing underscores on the mode word", "docs/a.md", "Run PgBouncer in transaction__ mode.\n"),
+    ("R1 #5480: a leading underscore on the second word", "docs/a.md", "Run PgBouncer in pooling _statement.\n"),
+    ("R1 #5480: an emphasis span may not open before a space", "docs/a.md", "Run PgBouncer in _ transaction__transaction mode.\n"),
+    ("R1 #5480: an emphasis span may not close after a space", "docs/a.md", "Run PgBouncer in transaction__transaction _ mode.\n"),
+    ("R9 #5480: a hidden character splits a four-letter Coptic word", "docs/a.md", "Notes: \u2c80\u2c82\u200b\u2c84\u2c86 here.\n"),
+    ("R1 #5480: stroked Latin letters spell the mode word", "docs/a.md", "Use \u0167ransac\u0167\u0268\u00f8n m\u00f8\u0111e.\n"),
     ("R9 #5363: a letter the fold does not know, spaced, on a pool line", "docs/a.md", "Run PgBouncer in \u0434\u0436\u0437\u0438\u044f mode.\n"),
     ("R9 #5363: small capitals on a config context line fold to the mode word", "docs/a.md",
      "```ini\npool_mode = session\ndefault = \u1d1b\u0280\u1d00\u0274s\u1d00\u1d04\u1d1b\u026a\u1d0f\u0274\n```\n"),
@@ -1015,6 +1037,10 @@ GREEN: List[Tuple[str, str, str]] = [
     ("R9 #5370: a symbol set apart by spaces hides no word", "docs/a.md", "Our pgbouncer runs \u2016 ab for the api tier.\n"),
     ("R9 #5370: a symbol first on the line does not read the last letter", "docs/a.md", "\u2016 our pgbouncer runs the api\n"),
     ("R9 #5370: a symbol last on the line reads no neighbour past the end", "docs/a.md", "our pgbouncer runs the api \u2016\n"),
+    ("R1 #5480: one underscore emphasis on the session value is stripped", "docs/a.md", "pool_mode = _session_\n"),
+    ("R1 #5480: two underscore emphasis on the session value is stripped", "docs/a.md", "pool_mode = __session__\n"),
+    ("R1 #5480: three underscore emphasis on the session value is stripped", "docs/a.md", "pool_mode = ___session___\n"),
+    ("R1 #5480: four underscore emphasis on the session value is stripped", "docs/a.md", "pool_mode = ____session____\n"),
     ("A1 ini assignment", "docs/a.md", "pool_mode = session\n"),
     ("A1 yaml assignment", "deploy/pgb.yaml", "pool_mode: session\n"),
     ("A1 env assignment", "deploy/.env", "PGBOUNCER_POOL_MODE=session\n"),
@@ -1262,6 +1288,8 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
         entry_case("an entry with a Dockerfile ENV space form is refused", "ENV POOL_MODE transaction"),
         entry_case("an entry with crudini is refused", "crudini --merge pgbouncer.ini pgbouncer pool_mode=transaction"),
         entry_case("an entry with crudini --set is refused", "crudini --set pgbouncer.ini pgbouncer pool_mode transaction"),
+        entry_case("an entry with a quoted key before the equals sign is refused (#5480)", "export \"pool_mode\"=transaction"),
+        entry_case("an entry with a quoted json key and the statement value is refused (#5480)", "see \"pool_mode\": \"statement\" in the file"),
         entry_case("an entry with a quoted json key inside a sentence is refused", "see \"pool_mode\": \"transaction\" in the file"),
         entry_case("an entry with yq is refused", "yq -i '.pool_mode = transaction' values.yaml"),
         # the same words in prose stay allowlistable: a retirement note quotes the setting
@@ -1293,6 +1321,8 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
         ("a stale skip entry (the file is readable text) fails", tree({"docs/ok.md": "Plain text.\n"}, unread=UNREAD_REASON + "docs/ok.md\n"), EXIT_FAULT),
         ("a stale skip entry for a readable file with a binary name fails",
          tree({"assets/ok.bin": "Plain text.\n"}, unread=UNREAD_REASON + "assets/ok.bin\n"), EXIT_FAULT),
+        ("a magic-number file under a text suffix cannot be skipped (#5367)",
+         tree({"docs/z.md": b"\x1f\x8b\x08\x00zzz"}, unread=UNREAD_REASON + "docs/z.md\n"), EXIT_FAULT),
         ("a skip entry for an untracked path fails", tree({}, unread=UNREAD_REASON + "docs/gone.md\n"), EXIT_FAULT),
         ("a text file is never excused by the skip list (R5)",
          tree({"docs/n.md": "\0\nRun PgBouncer in transaction mode.\n"}, unread=UNREAD_REASON + "docs/n.md\n"), EXIT_FAULT),
@@ -1458,6 +1488,19 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("F4 a skip entry needs a binary magic number (#5478)", "if rel in unread and not unread[rel].startswith(MAGIC_REASON)]", "if rel in unread and False]"),
     ("F4 the skip reason names the magic number (#5478)", 'raise Unreadable("%s (magic number %s)" % (MAGIC_REASON, chunk[:4].hex()))', 'raise Unreadable("%s (magic number %s)" % ("", chunk[:4].hex()))'),
     ("F4 a NUL-only file is not binary content (#5478)", 'raise Unreadable("NUL bytes in a file that is not UTF-16/32 text")', 'raise Unreadable("%s NUL bytes in a file that is not UTF-16/32 text" % MAGIC_REASON)'),
+    ("F6 #5480 M3 stroked Latin letters fold to their base letter", '(?: WITH [A-Z ]+)?$")', '$")'),
+    ("F6 #5480 M7 the foreign word test reads the shadow view", "or _lookalike_word(shadow(text)))", "or _lookalike_word(text))"),
+    ("F6 #5480 M9 the A1 command key may be quoted", 'pool[_-]?mode[\\"\']?(?:\\s*=\\s*|\\s+)', 'pool[_-]?mode(?:\\s*=\\s*|\\s+)'),
+    ("F6 #5480 M10 the A1 json shape refuses statement", '[\\"\']\\s*:\\s*[\\"\'](?:transaction|statement)[\\"\']"),', '[\\"\']\\s*:\\s*[\\"\'](?:transaction)[\\"\']"),'),
+    ("F6 #5480 M14 emphasis opens before a word character", "(_+)(?=[^\\W_])", "(_+)(?=.)"),
+    ("F6 #5480 M15 emphasis closes after a word character", "(?<=[^\\W_])\\1", "\\1"),
+    ("F6 #5480 the edge underscore view is read", "    return edge != text and _mentions_view(edge)", "    return False"),
+    ("F6 #5480 a leading underscore is an edge", "(?<![^\\W_])_+(?=[^\\W_])|(?<=[^\\W_])_+(?![^\\W_])\")", "(?<=[^\\W_])_+(?![^\\W_])\")"),
+    ("F6 #5480 a trailing underscore is an edge", "(?<![^\\W_])_+(?=[^\\W_])|(?<=[^\\W_])_+(?![^\\W_])\")", "(?<![^\\W_])_+(?=[^\\W_])\")"),
+    ('F6 #5480 M8 the A1 command value may be quoted', '(?:\\s*=\\s*|\\s+)[\\"\']?(?:transaction|statement)\\b"),\n    re.compile(r"[\\"\'][a-z0-9_.]*pool', '(?:\\s*=\\s*|\\s+)(?:transaction|statement)\\b"),\n    re.compile(r"[\\"\'][a-z0-9_.]*pool'),
+    ('F6 #5480 M11 the A1 command shape reads --env', '|-e|--env|--set|', '|-e|--set|'),
+    ('F6 #5480 M12 the A1 command shape reads set', '(?:export|env|set|-e|', '(?:export|env|-e|'),
+    ('F6 #5480 M13 the A1 command shape reads a space between key and value', '[\\"\']?(?:\\s*=\\s*|\\s+)[\\"\']?(?:transaction|statement)\\b"),\n    re.compile(r"[\\"\'][a-z0-9_.]*pool', '[\\"\']?(?:\\s*=\\s*)[\\"\']?(?:transaction|statement)\\b"),\n    re.compile(r"[\\"\'][a-z0-9_.]*pool'),
     ("F1 only a declared binary suffix is skipped (#5367)", "        if not problem and Path(line).suffix.lower() not in BINARY_SUFFIXES:", "        if False:"),
     ("F1 pdf is a declared binary suffix (#5367)", '".pdf", ".jpg", ".jpeg", ".png"', '".jpg", ".jpeg", ".png"'),
     ("F1 a text type is not declared binary (#5367)", '".mov", ".webm"', '".mov", ".tpl", ".webm"'),
