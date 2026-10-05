@@ -1028,6 +1028,8 @@ def taint_findings(text, names):
             # written to), or a cat of a file operand, appear in a terminal line.
             if re.search(r"\$\((?!\()", rest):
                 hit.append("command substitution")
+            if "`" in rest:
+                hit.append("backtick substitution")
             if cmd == "cat" and re.search(r"(?:^|\s)(?:<\s*)?[^\s<>|&;-]", re.sub(r"\d*>&?\S*|<<-?\S*", "", args)):
                 hit.append("file operand")
             if hit:
@@ -1051,6 +1053,8 @@ BANNED_CONSTRUCTS = (
     (r"\$\{\w+:?\?", "error expansion"),
     # #5407: a process substitution runs a command the scan does not follow, and its redirect is no file.
     (r"(?<![\w$\\])[<>]\(", "process substitution"),
+    # #5408: a backtick command substitution is as unreadable to the scan as $( ) is readable.
+    (r"`", "backtick substitution"),
     (r"(?<![\w-])let(?![\w-])", "let"), (r"(?<![\w$])\(\(", "arithmetic command"),
 )
 
@@ -1151,6 +1155,10 @@ def closed_world_taint(fs):
                         ("tr with the reply as a set", 'echo abc | tr abc "$qjson"'),
                         ("unset with the reply", 'unset "$qjson"'),
                         ("readonly with the reply as the name", 'readonly "$qjson"'),
+                        # #5408: a backtick command substitution is a command substitution.
+                        ("a backtick substitution in a PASS line", 'ok "x `head -c 9 \\"$OUT_DIR/r\\"`"'),
+                        ("a backtick substitution in a failure line", 'no "x `sed -n 1p "$OUT_DIR/r"`"'),
+                        ("a backtick substitution in an echo", 'echo `od -c "$OUT_DIR/r"`'),
                         # #5412: the LAST output redirect decides, >> and >| are redirects, and only a plain path is a file.
                         ("an append to /dev/stderr", 'printf %s "$qjson" >> /dev/stderr'),
                         ("a clobber to /dev/stderr", 'printf %s "$qjson" >| /dev/stderr'),
@@ -1200,6 +1208,9 @@ def closed_world_taint(fs):
                         ("an escaped space in an assignment", 't=x\\ $qjson\nno "x $t"'),
                         ("a default-assign expansion", ': "${t:=$qjson}"\nno "x $t"'),
                         ("a default-assign expansion without the colon", ': "${t=$qjson}"\nno "x $t"'),
+                        # #5408: a backtick command substitution is refused like $( ).
+                        ("a backtick substitution", 't=`printf x`'), ("a backtick substitution in a message", 'ok "x `date`"'),
+                        ("a backtick substitution naming a reply", 'echo `echo $qjson`'),
                         # #5407: a process substitution runs a command the scan does not follow.
                         ("a process substitution as a redirect target", 'printf %s "$qjson" > >(cat)'),
                         ("a process substitution as a tee target", 'printf %s "$qjson" > >(cat >&2)'),
