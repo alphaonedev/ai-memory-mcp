@@ -822,6 +822,18 @@ MDEOF
     anchor_red 5495 QUAL "a self type that opens with a nested group is refused" \
         "See \`$R::<<NoSuch as Tr>::X>::decorate_memory_many\`."
 
+    # #5534: a refused self type is cited without the author's spaces, so one
+    # anchor is reported one way whatever its spacing.
+    anchor_red_cites 5534 QUAL "a spaced parenthesised self type is cited without spaces" \
+        "$R::<(NoSuch)>::decorate_memory_many" \
+        "See \`$R::<( NoSuch )>::decorate_memory_many\`."
+    anchor_red_cites 5534 QUAL "a spaced tuple self type is cited without spaces" \
+        "$R::<(NoSuch,u8)>::decorate_memory_many" \
+        "See \`$R::<( NoSuch, u8 )>::decorate_memory_many\`."
+    anchor_red_cites 5534 QUAL "a spaced slice self type is cited without spaces" \
+        "$R::<[NoSuch]>::decorate_memory_many" \
+        "See \`$R::<[ NoSuch ]>::decorate_memory_many\`."
+
     # #5496: a `::` right after a closer continues the path past the closer
     # whether or not the anchor has a generic of its own; the component behind
     # it is a claim, so the token is reported, not skipped.
