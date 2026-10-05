@@ -2975,6 +2975,11 @@ R4HTML
     for _bt in em span strong a code b br td th /td /th /em /span /strong /br; do
         printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-control.html"
     done
+    # #5545: the same block tags spelled in upper case (opening and closing) must stop the look-back too; nothing is flagged.
+    : > "$tmpdir/docs/block-case-fixture.html"
+    for _bt in P DIV LI UL OL TR TABLE H1 H2 H3 H4 H5 H6 SECTION /P /DIV /LI /UL /OL /TR /TABLE /H1 /H2 /H3 /H4 /H5 /H6 /SECTION; do
+        printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-case-fixture.html"
+    done
     r4_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test #3248 r4 - stale wordings not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
     for _want in \
@@ -3059,7 +3064,7 @@ R4HTML
         'docs/schema-fixture.html:42 ' \
         'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 ' 'docs/schema-fixture.html:46 ' \
         'docs/schema-fixture.html:52 ' 'docs/schema-fixture.html:62 ' 'docs/schema-fixture.html:68 ' \
-        'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' \
+        'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' 'docs/block-case-fixture.html:' \
         'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 ' 'docs/schema-fixture.html:89 ' 'docs/schema-fixture.html:94 ' 'docs/postgres-age-guide.md:59 ' 'docs/postgres-age-guide.md:60 ' \
         'docs/postgres-age-guide.md:63 ' 'docs/postgres-age-guide.md:65 ' 'docs/postgres-age-guide.md:67 ' \
         'docs/postgres-age-guide.md:71 ' 'docs/postgres-age-guide.md:75 ' \
@@ -3078,7 +3083,7 @@ R4HTML
     echo "PASS: self-test #5026/#5080 - anchor wrapped across two lines (steps / v40 -> v52) and identifier value more than 60 chars after the identifier: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #4511-R5 - wrapped claim with an issue ref / release triple in the subject tail, whitespace at the wrap point, and a tag-only middle line: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5140 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED"
-    echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, any case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
+    echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, lower and upper case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
     echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag, and when the previous line ends with a closing block tag and the next line carries no tag); a closing tag in the MIDDLE of the previous line does not cut a claim wrapped inside the next paragraph; a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
     echo "PASS: self-test #5200/#5339 - ident-less anchors (re-stamped to v1.0.0 (schema vN), Schema vN (was vM), Current version: N at v1.0.0) each match a markdown claim in BOTH a doubled-space and a tab variant: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5337 - join boundaries pinned: a line ending with an OPENING block tag still joins (52 REJECTED), markdown is not tag-aware (a closing tag at the end of a markdown line, or an opening tag at the start of the next, still joins; 52 REJECTED), html literal backticks are not folded (documented bound)"
@@ -3100,7 +3105,7 @@ R4HTML
     echo "PASS: self-test #4849 - drifted current-state wording (v1.0.0 substrate, bold value) REJECTED, canonical ACCEPTED"
     echo "PASS: self-test #4844/#4845/#4846 - ROADMAP header parenthetical, at-a-glance card + stat tile, compliance tagline, index upgrade paragraph: stale REJECTED, canonical ACCEPTED"
     rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/schema-fixture.html"
-    rm -f "$tmpdir/docs/block-fixture.html" "$tmpdir/docs/block-control.html"
+    rm -f "$tmpdir/docs/block-fixture.html" "$tmpdir/docs/block-control.html" "$tmpdir/docs/block-case-fixture.html"
     rm -f "$tmpdir/docs/CONFIG_SCHEMA.md" "$tmpdir/docs/schema-fixture.html"
     printf '# fixture ledger (comment-only)\n' > scripts/qc-allowlists/schema-claim-history.txt
 
