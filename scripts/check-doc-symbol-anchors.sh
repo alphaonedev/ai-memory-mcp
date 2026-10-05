@@ -91,7 +91,10 @@
 #   UNMODELLED — a self type the gate cannot read, any Rust keyword
 #            in a checked path (#5610, #5611), a raw identifier Rust
 #            rejects (`r#crate`, `r#self`, `r#super`, `r#Self`, `r#_`,
-#            #5778), or a `::` followed by
+#            #5778), a brace-list item or item component that is not an
+#            identifier (punctuation, a digit, a glob, an empty item; an
+#            ellipsis item is an elision and is skipped) or a path after a
+#            brace list (#5779), or a `::` after the file head followed by
 #            nothing the gate can read or by an empty brace list (#5698).
 #   SETUP  — the gate cannot do its job: a doc or source file in the
 #            checked set cannot be read (#5616), or src/ has no Rust file.
@@ -1563,6 +1566,25 @@ PYEOF
         "$R::r#no_such" "See [\`r#no_such\`]($R)."
     anchor_green 5778 "a raw link label that resolves" "See [\`r#match\`](src/store/raw.rs)."
 
+    # #5779: every brace-list item and component is read or refused.
+    anchor_red_cites 5779 UNMODELLED "an ampersand brace item" \
+        "$R::&NoSuch" "See \`$R::{RecallTool, &NoSuch}\`."
+    anchor_red_cites 5779 UNMODELLED "a parenthesised brace item" \
+        "$R::(NoSuch)" "See \`$R::{RecallTool, (NoSuch)}\`."
+    anchor_red_cites 5779 UNMODELLED "a brace item starting with a digit" \
+        "$R::9NoSuch" "See \`$R::{RecallTool, 9NoSuch}\`."
+    anchor_red_cites 5779 UNMODELLED "a brace item starting with a minus" \
+        "$R::-NoSuch" "See \`$R::{RecallTool, -NoSuch}\`."
+    anchor_red_cites 5779 UNMODELLED "a glob inside a brace item" \
+        "$R::RecallTool::*" "See \`$R::{decorate_memory_many, RecallTool::*}\`."
+    anchor_red_cites 5779 UNMODELLED "an empty brace item" \
+        "$R::{RecallTool,,NoSuch}" "See \`$R::{RecallTool, , NoSuch}\`."
+    anchor_red_cites 5779 UNMODELLED "a path after a brace list" \
+        "$R::{RecallTool,decorate_memory_many}::NoSuch" "See \`$R::{RecallTool, decorate_memory_many}::NoSuch\`."
+    anchor_green 5779 "an elision brace item" "See \`$R::{RecallTool, …}\`."
+    anchor_green 5779 "a turbofish before the last component" \
+        "See \`$R::RecallTool::<u8>::decorate_memory_many\`."
+
     # #5613 (review item N-2): pin the #5536 repro and its self-type sibling
     # so that every spaced closer is counted and a spaced extra closer after a
     # self type still continues the path.
@@ -2538,7 +2560,11 @@ def iter_quals(line):
             pos = _skip_space(line, hm.end())
             bm = BRACE_BODY.match(line, pos) if line.startswith("{", pos) else None
             if bm:
-                if split_items(bm.group(1)):
+                after = _skip_space(line, bm.end())
+                if line.startswith("::", after):
+                    # #5779: a path after a brace list is not read; refuse it.
+                    yield rule, hm.group(1), (UNMODELLED, line[pos:_path_end(line, after)])
+                elif split_items(bm.group(1)):
                     yield rule, hm.group(1), bm.group(1)
                 else:
                     # #5698: an empty brace list names nothing to check.
@@ -2609,6 +2635,9 @@ HREF = re.compile(
 LINEFRAG = re.compile(r"^#L(\d+)(?:C\d+)?(?:-L?(\d+)(?:C\d+)?)?$")
 IDENT = re.compile(r"^(?:r#)?[A-Za-z_][A-Za-z0-9_]*$")
 # #5778: Rust rejects these as raw identifiers, so they name nothing.
+# #5779: the one filler a brace list may hold: an elision.
+ELISIONS = frozenset(["\u2026", "..."])
+EMPTY_ITEM = re.compile(r"^\s*,|,\s*,")
 RAW_FORBIDDEN = frozenset("crate self super Self _".split())
 
 
@@ -2890,8 +2919,14 @@ def _item_findings(rule, f, tok):
         # resolved: report it rather than accept it.
         out.append((rule, f"{f}::{whole}".replace(" ", "")))
         return out
+    refuse = ("UNMODELLED", f"{f}::{whole}".replace(" ", ""))
     for tok in toks:
-        tok = strip_generics(tok).strip().rstrip("(){}[].,;")
+        if tok.strip() in ELISIONS:
+            # #5779: an ellipsis item (`{a, …}`) elides; it names nothing.
+            continue
+        # #5779: a turbofish separator (`T::<U>::m`) is a generic group.
+        lone = tok.startswith("<")
+        tok = strip_generics(tok.replace("::<", "<")).strip().rstrip("(){}[].,;")
         if any(part.split("(")[0].strip() in KEYWORDS for part in tok.split("::")):
             # #5611: a keyword is not a symbol: refuse the whole anchor.
             out.append(("UNMODELLED", f"{f}::{whole}".replace(" ", "")))
@@ -2903,13 +2938,19 @@ def _item_findings(rule, f, tok):
             out.append((rule, f"{f}::{whole}"))
             continue
         if not tok:
-            continue
+            if lone:
+                # A lone `<Name>` placeholder (#5393) names nothing.
+                continue
+            out.append(refuse)
+            return out
         for part in tok.split("::"):
             part = part.split("(")[0].strip()
-            # `…`, `*`, `_`, generics and other prose fillers are
-            # not symbol claims.
+            # #5779: closed world: every component is an identifier. An
+            # empty one, punctuation, a digit or a glob is not read, so
+            # the anchor is refused, never passed with the part skipped.
             if not part or not IDENT.match(part):
-                continue
+                out.append(refuse)
+                return out
             name = raw_name(part)
             if name != part and name in RAW_FORBIDDEN:
                 # #5778: `r#crate` and friends are not identifiers.
@@ -2940,6 +2981,10 @@ def qual_findings(line):
             out.append(("UNMODELLED", f"{f}::{raw[1]}"))
             continue
         if isinstance(raw, str):
+            if EMPTY_ITEM.search(raw):
+                # #5779: an empty item (`{, a}`, `{a, , b}`) is not read.
+                out.append(("UNMODELLED", f"{f}::{{{raw}}}"))
+                continue
             for tok in split_items(raw):
                 out += _item_findings(rule, f, tok)
             continue
