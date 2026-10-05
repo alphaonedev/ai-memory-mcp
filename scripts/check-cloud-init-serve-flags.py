@@ -3679,6 +3679,12 @@ def secret_output_problems(base: tuple, known: set) -> list:
         globals()["run_scan"], globals()["load_repo"] = scan_real, load_real
     if "PfMark9" in probe_failure("p", "green", "red", ["x postgres://aimemory:PfMark9xyz@localhost"]):
         bad.append("probe_failure printed a store-url password")
+    # the failure lines of the self-test itself reach stderr through printable (#5491)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        emit_self_test_failures(["x postgres://aimemory:Sf/Mark9xyz/more@localhost", "FAIL"])
+    if "Mark9" in err.getvalue() or "SELF-TEST FAIL: x postgres://<userinfo>@localhost" not in err.getvalue() or "SELF-TEST FAIL: FAIL" not in err.getvalue():
+        bad.append("the self-test failure lines were printed raw or lost")
     return bad
 
 
@@ -3719,12 +3725,6 @@ def pin_problems() -> list:
         vals = var_values([("w", "F+=a", {})] * n).get("F", set())
         if vals != {VALUES_PAST_CAP} and len(vals) > EXPAND_CAP:
             bad.append("an append chain of %d kept %d values, past EXPAND_CAP" % (n, len(vals)))
-    return bad
-
-
-def self_test(known: set) -> int:
-    base = load_repo()
-    cache = {}
     # no template or fixture text is cut before it is scrubbed: a cut inside scrub() drops the
     # "@" that marks the userinfo (#5489, #5490)
     src = Path(__file__).read_text(encoding="utf-8")
@@ -3732,6 +3732,17 @@ def self_test(known: set) -> int:
     for no, line in enumerate(src.splitlines(), 1):
         if cut_first.search(line):
             bad.append("line %d cuts text before scrub() or prints it uncut-scrubbed" % no)
+    return bad
+
+
+def emit_self_test_failures(bad: list) -> None:
+    """Print the self-test failure lines to stderr, each through printable (#5491)."""
+    print(printable(bad, "SELF-TEST FAIL: "), file=sys.stderr)
+
+
+def self_test(known: set) -> int:
+    base = load_repo()
+    cache = {}
     bad, counts = [], {"red": 0, "green": 0, "fault": 0}
     for label, expect, spec in build_probes():
         t, mt, a, p, auto, extra = case_inputs(base, spec)
@@ -3772,7 +3783,7 @@ def self_test(known: set) -> int:
             if exc.code != 2:
                 bad.append("a mistyped argument exited %r, not 2" % exc.code)
     if bad:
-        print(printable(bad, "SELF-TEST FAIL: "), file=sys.stderr)
+        emit_self_test_failures(bad)
         return 1
     print("SELF-TEST PASS: %d red probes flagged, %d green probes clean, %d form faults raised, %d/%d allow-entry mutations red, append chain past the cap collapses, mistyped argument exits 2"
           % (counts["red"], counts["green"], counts["fault"], len(muts), len(muts)))
