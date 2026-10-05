@@ -608,6 +608,21 @@ MDEOF
     anchor_green 5430 "a live symbol closed by a prose angle bracket, no group of its own" \
         "See Option<$R::RecallTool> here."
 
+    # #5431: a backticked-label link whose destination is on the NEXT line has
+    # its symbol checked like the one-line form.
+    anchor_red 5431 MDLINK "a next-line destination with a missing symbol label" \
+        $'See [`no_such`](\nsrc/mcp/tools/recall.rs) x'
+    anchor_red 5431 MDLINK "a next-line angle destination with a missing symbol label" \
+        $'See [`no_such`](\n   <src/mcp/tools/recall.rs>) x'
+    anchor_red 5431 MDLINK "a spaced open link with a missing symbol label and the destination below" \
+        $'See [`no_such`](  \nsrc/mcp/tools/recall.rs) x'
+    anchor_red 5431 PATH "a next-line destination to a missing file under a symbol label" \
+        $'See [`recall`](\nsrc/gone.rs) x'
+    anchor_green 5431 "a next-line destination whose symbol is live" \
+        $'See [`RecallTool`](\nsrc/mcp/tools/recall.rs) x'
+    anchor_green 5431 "a next-line destination whose label is the module (file stem)" \
+        $'See [`recall`](\nsrc/mcp/tools/recall.rs) x'
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
@@ -1565,7 +1580,14 @@ for doc in seen_docs:
                         continue
                     emit(rule, doc, ln, f"{f}::{part}", ctx)
 
-        for m in MDLINK.finditer(line):
+        # #5431: the joined line feeds MDLINK too, so a symbol label whose
+        # destination is on the next line is checked like the one-line form.
+        # #5396: a line that ends in an open `](` takes its destination from
+        # the next line, as CommonMark does.
+        link_line = line
+        if LINK_OPEN.search(line) and ln < len(doc_lines):
+            link_line = line.rstrip() + " " + canon(doc_lines[ln])[0].lstrip()
+        for m in MDLINK.finditer(link_line):
             sym = m.group(1)
             tgt = m.group(2).split("#")[0]
             if tgt not in per_file:
@@ -1577,12 +1599,7 @@ for doc in seen_docs:
 
         # #5190: a relative link with a plain-text label must still point at
         # a file that exists. MDLINK already reported a backticked-label link.
-        md_spans = [(m.start(2), m.end(2)) for m in MDLINK.finditer(line)]
-        # #5396: a line that ends in an open `](` takes its destination from
-        # the next line, as CommonMark does.
-        link_line = line
-        if LINK_OPEN.search(line) and ln < len(doc_lines):
-            link_line = line.rstrip() + " " + canon(doc_lines[ln])[0].lstrip()
+        md_spans = [(m.start(2), m.end(2)) for m in MDLINK.finditer(link_line)]
         rel_hits = [(m.group(1), m.group(2), m.start(1), True)
                     for m in RELLINK.finditer(link_line)]
         # #5343: a reference definition may carry its destination on the
