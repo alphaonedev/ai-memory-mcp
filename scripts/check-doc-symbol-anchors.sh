@@ -1108,6 +1108,23 @@ PYEOF
     anchor_red 5459 PATH "a tab-indented definition head (conservative: one tab counts as one space), then an escape path" \
         $'\t[x]:\nsrc/../gone.rs no longer exists'
 
+    # #5606: a numeric reference for an angle bracket may carry leading zeros
+    # (`&#062;`, `&#x003e;`); a padded closer or opener is read as the sign.
+    anchor_red 5606 BARE_QUAL "a zero-padded decimal closer before a path separator" \
+        "See $R::RecallTool<T>&#062;::NoSuch here."
+    anchor_red 5606 BARE_QUAL "a zero-padded hex closer before a path separator" \
+        "See $R::RecallTool&#x003e;::NoSuch here."
+    anchor_red 5606 BARE_QUAL "a seven-digit zero-padded decimal closer" \
+        "See $R::RecallTool<T>&#0000062;::NoSuch here."
+    anchor_red 5606 BARE_QUAL "an upper-case X zero-padded hex closer" \
+        "See $R::RecallTool<T>&#X03E;::NoSuch here."
+    anchor_red_cites 5606 BARE_QUAL "a zero-padded decimal as group with a missing type" \
+        "$R::NoSuch" \
+        "See $R::&#060;NoSuch as RecallTool&#062;::decorate_memory_many here."
+    anchor_red_cites 5606 BARE_QUAL "a zero-padded hex as group with a missing type" \
+        "$R::NoSuch" \
+        "See $R::&#x003C;NoSuch as RecallTool&#x0003E;::decorate_memory_many here."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
