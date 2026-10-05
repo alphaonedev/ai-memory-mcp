@@ -367,8 +367,10 @@ def imported_modules(path: Path) -> list:
     FrozenImporter precedes PathFinder on sys.meta_path, so a planted os.py or stat.py is never resolved from
     the script directory, whether or not the module is already loaded; the frozen set varies by Python version.
     importlib is NOT frozen: its planted file is load-bearing. Under -S (no site import) an `import importlib`
-    resolves the planted importlib.py; without -S the site startup has already loaded importlib, so the plant is
-    inert there on 3.12.7 but is not relied on (#5424). The importlib plant is pinned by the self-test.
+    resolves the planted importlib.py. Whether the site startup (no -S) has already loaded importlib depends on
+    the installation's .pth files, not on the Python version (measured on one node: 3.12.3 no, an anaconda 3.12.7
+    yes), so the probe runs under -S and the self-test requires importlib not to be preloaded there (#5442). The
+    importlib plant is pinned by the self-test.
     Dynamic imports (importlib.import_module, __import__) are not found by this AST scan (#5405); the script
     has none."""
     names = set()
@@ -579,7 +581,7 @@ def _self_test_cases() -> int:
         print("FAIL: self-test - a comparison run without -I did not fail closed (R5, #5163)", file=sys.stderr)
 
     def importlib_plant():
-        # #5424/#5441/#5443: importlib is in the plant set (it is not frozen, so its plant is load-bearing), the
+        # #5424/#5441/#5442/#5443: importlib is in the plant set (it is not frozen, so its plant is load-bearing), the
         # docstring says so, and for EVERY name the script imports a planted file runs exactly when the child finds
         # the module neither preloaded, built-in nor frozen; also under -X frozen_modules=off. Returns "" or why.
         names = imported_modules(Path(__file__).resolve())
@@ -588,10 +590,14 @@ def _self_test_cases() -> int:
         words = " ".join((imported_modules.__doc__ or "").split())
         if "never runs" in words or "importlib is NOT frozen" not in words or "frozen stdlib modules" not in words:
             return "the docstring is wrong"
+        if "inert there" in words or "depends on the installation's .pth files" not in words:
+            return "the docstring generalises the site-import fact to a Python version (#5442)"
         probed = []
         for xopts in ([], ["-X", "frozen_modules=off"]):
             for name in names:
-                shadowable, _, _, ok = plant_probe(name, base_dir / "implant", xopts)
+                _, preloaded, _, ok = plant_probe(name, base_dir / "implant", xopts)
+                if name == "importlib" and preloaded:
+                    return "importlib was already loaded under -S -E, so the probe is not independent of site (#5442)"
                 if not ok:
                     return f"the planted {name}.py behaved differently from the child's own verdict (xopts {xopts})"
                 probed.append(name)
