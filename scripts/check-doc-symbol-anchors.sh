@@ -98,7 +98,10 @@
 #            read, after the file head (#5698) or after a component
 #            (#5780), an empty brace list (#5698), or a nested brace list
 #            (`T::{a, b}`, each item checked as `T::a`, #5780) that is
-#            empty, holds braces or is followed by `::`.
+#            empty, holds braces or is followed by `::`; a `src/` token
+#            still holding a non-ASCII letter, mark, digit, private-use
+#            or unassigned character (a variation selector, a combining
+#            accent) after the text form (#5781).
 #   SETUP  — the gate cannot do its job: a doc or source file in the
 #            checked set cannot be read (#5616), or src/ has no Rust file.
 #
@@ -113,6 +116,11 @@
 # names no file under `src/`: it is reported as a PATH finding, and a
 # qualified or link-target occurrence of it is reported whatever the wording
 # nearby (#5346).
+#
+# TEXT FORM. Before any rule runs, every Unicode format character
+# (category Cf: a zero-width space, a word joiner, a soft hyphen, a bidi
+# control) is dropped from the doc, the same as from a decoded character
+# reference, and a line ends only at CR, LF or CRLF (#5781).
 #
 # THE ABSENT-PATH EXEMPTION. A plain path or `path:line` anchor is not
 # reported when absence wording ("no longer exists", "formerly",
@@ -1609,6 +1617,36 @@ PYEOF
     anchor_red_cites 5780 UNMODELLED "an empty nested brace list" \
         "$R::RecallTool::{}" "See \`$R::RecallTool::{}\`."
 
+    # #5781: literal text reaches the same normal form as decoded text. The
+    # characters are written as UTF-8 bytes so the case holds in any locale.
+    ZW=$'\xe2\x80\x8b' SHY=$'\xc2\xad' WJ=$'\xe2\x81\xa0' \
+        RLO=$'\xe2\x80\xae' VS=$'\xef\xb8\x8f' LS=$'\xe2\x80\xa8'
+    anchor_red_cites 5781 QUAL "a zero-width space before a later separator" \
+        "$R::NoSuch" "See \`$R::RecallTool${ZW}::NoSuch\`."
+    anchor_red_cites 5781 QUAL "a zero-width space after the file" \
+        "$R::NoSuch" "See \`$R${ZW}::NoSuch\`."
+    anchor_red_cites 5781 QUAL "a zero-width space inside the symbol" \
+        "$R::NoSuch" "See \`$R::No${ZW}Such\`."
+    anchor_red_cites 5781 BARE_QUAL "a soft hyphen in a bare anchor" \
+        "$R::NoSuch" "See $R::No${SHY}Such here."
+    anchor_red_cites 5781 QUAL "a word joiner before a later separator" \
+        "$R::NoSuch" "See \`$R::Recall${WJ}Tool::NoSuch\`."
+    anchor_red_cites 5781 QUAL "a bidi control before the symbol" \
+        "$R::NoSuch" "See \`$R::${RLO}NoSuch\`."
+    anchor_red_cites 5781 PATH "a zero-width space inside a missing path" \
+        "src/nosuch.rs" "See \`src/no${ZW}such.rs\`."
+    anchor_red_cites 5781 UNMODELLED "a variation selector glued to the file" \
+        "$R${VS}::NoSuch" "See \`$R${VS}::NoSuch\`."
+    CA=$'\xcc\x81' PU=$'\xee\x80\x80'
+    anchor_red_cites 5781 UNMODELLED "a combining accent glued to a symbol" \
+        "$R::RecallTool${CA}" "See \`$R::RecallTool${CA}\`."
+    anchor_red_cites 5781 UNMODELLED "a private-use character glued to a symbol" \
+        "$R::NoSuch${PU}" "See \`$R::NoSuch${PU}\`."
+    anchor_red_cites 5781 QUAL "a line separator before a later separator" \
+        "$R::NoSuch" "See \`$R::RecallTool${LS}::NoSuch\`."
+    anchor_green 5781 "a zero-width space inside a live anchor" \
+        "See \`$R::Recall${ZW}Tool\`."
+
     # #5613 (review item N-2): pin the #5536 repro and its self-type sibling
     # so that every spaced closer is counted and a spaced extra closer after a
     # self type still continues the path.
@@ -2248,6 +2286,40 @@ _REF_HTML = re.compile(r"&(?:#[xX][0-9A-Fa-f]+;?|#[0-9]+;?|[A-Za-z][A-Za-z0-9]*;
 _REF_CM = re.compile(r"(?<!\\)&(?:#[xX][0-9A-Fa-f]{1,6};|#[0-9]{1,7};|[A-Za-z][A-Za-z0-9]*;)")
 
 
+def _invisible(ch):
+    """A format character (Unicode Cf: a zero-width space, a word joiner, a
+    soft hyphen, a bidi control) renders as nothing (#5607, #5781)."""
+    return unicodedata.category(ch) == "Cf"
+
+
+_NON_ASCII = re.compile(r"[^\x00-\x7f]")
+
+
+def normal_form(text):
+    """`text` with every format character dropped: the one normal form that
+    literal and decoded text both reach before any rule runs (#5781)."""
+    if text.isascii():
+        return text
+    return _NON_ASCII.sub(lambda m: "" if _invisible(m.group(0)) else m.group(0), text)
+
+
+# #5781: a src/ token holding a non-ASCII letter, mark or digit (or an
+# unassigned or private-use character) ends every scanner early, so the
+# rest of the anchor would go unchecked; the token is refused instead.
+LINE_END = re.compile(r"\r\n|\r|\n")
+SRC_RUN = re.compile(r"(?<![A-Za-z0-9./])src/[^\s`]*")
+
+
+def _glued(run):
+    """True when `run` holds a character the scanners cannot read past."""
+    for ch in run:
+        if ord(ch) > 127:
+            cat = unicodedata.category(ch)
+            if cat[0] in "LMN" or cat in ("Co", "Cn", "Cs"):
+                return True
+    return False
+
+
 def _decoded_chars(text):
     """Decoded reference text as the scanners must see it (#5607)."""
     out = []
@@ -2256,7 +2328,7 @@ def _decoded_chars(text):
             out.append(CODE_TICK)
         elif ch in "\r\n":
             out.append(" ")
-        elif unicodedata.category(ch) != "Cf":
+        elif not _invisible(ch):
             out.append(ch)
     return "".join(out)
 
@@ -3091,7 +3163,13 @@ for doc in seen_docs:
         # with no read permission, was skipped silently).
         emit("SETUP", doc, 0, "-", f"cannot read {doc}: {e.strerror or e}")
         continue
-    doc_lines = text.splitlines()
+    # #5781: literal text reaches the same normal form as decoded text, and
+    # a line ends only at a line ending (CR, LF or CRLF), as in Markdown:
+    # splitlines() also broke at U+2028, form feed and the like, cutting an
+    # anchor in two so neither half was checked.
+    doc_lines = LINE_END.split(normal_form(text))
+    if doc_lines and doc_lines[-1] == "":
+        doc_lines.pop()
     for ln, line in enumerate(doc_lines, 1):
         ctx = line.strip()
         line, escapes = canon(line)
@@ -3128,6 +3206,11 @@ for doc in seen_docs:
                         or next_line_dest):
                     emit("PATH", doc, ln, tok, ctx)
                     break
+
+        if not line.isascii():
+            for m in SRC_RUN.finditer(line):
+                if _glued(m.group(0)):
+                    emit("UNMODELLED", doc, ln, m.group(0), ctx)
 
         for m in PATH.finditer(line):
             f = m.group(1)
