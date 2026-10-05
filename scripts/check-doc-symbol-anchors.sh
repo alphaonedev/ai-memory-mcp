@@ -881,13 +881,15 @@ MDEOF
     anchor_green 5498 "a live generic anchor inside a prose generic after a comparison" \
         "If a < b then see Vec<$R::RecallTool<T>> here."
 
-    # #5530: a `<` is a comparison only with whitespace on both sides; a
-    # generic opener written with a space or tab after it is still an opener.
-    anchor_green 5530 "a generic opener with a space before the anchor" \
+    # #5530: a `<` is a comparison only with whitespace on both sides, so a
+    # `<` attached to a word with whitespace after it is never read as a
+    # comparison. #5608: nor is it provably an opener (`x< y` is a valid
+    # comparison too), so an anchor whose verdict depends on it is refused.
+    anchor_red 5530 UNDECIDABLE_LT "a word-attached < with a space before the anchor" \
         "See Vec< $R::RecallTool<T>> here."
-    anchor_green 5530 "a generic opener with a tab before the anchor" \
+    anchor_red 5530 UNDECIDABLE_LT "a word-attached < with a tab before the anchor" \
         $'See Vec<\t'"$R"'::RecallTool<T>> here.'
-    anchor_green 5530 "a generic opener with two spaces before the anchor" \
+    anchor_red 5530 UNDECIDABLE_LT "a word-attached < with two spaces before the anchor" \
         "See Vec<  $R::RecallTool<T>> here."
     anchor_red 5530 BARE_QUAL "an over-closed anchor right after a spaced comparison" \
         "See a < $R::RecallTool<T>> here."
@@ -911,7 +913,9 @@ MDEOF
         $'See a <\xc2\xa0b and '"$R"'::RecallTool<T>> here.'
     anchor_red 5531 BARE_QUAL "an over-closed anchor after an entity-spelled shift operator" \
         "See a &lt;&lt; b and $R::RecallTool<T>> here."
-    anchor_green 5531 "a generic opener with a non-breaking-space entity before the anchor" \
+    # #5608: a word-attached `<` followed by whitespace is not provably an
+    # opener, so the anchor whose verdict depends on it is refused.
+    anchor_red 5531 UNDECIDABLE_LT "a word-attached < with a non-breaking-space entity before the anchor" \
         "See Vec<&nbsp;$R::RecallTool<T>> here."
     anchor_green 5531 "a generic opener attached to the anchor after a spaced word" \
         "See a <$R::RecallTool<T>> here."
@@ -1167,6 +1171,41 @@ PYEOF
         "See $R::RecallTool&amp; here."
     anchor_green 5607 "an escaped angle reference is decoded once, never twice" \
         "See $R::RecallTool&amp;lt;T&amp;gt; here."
+
+
+    # #5608: a `<` written in a closed code span is atomic code, never a
+    # prose opener; a `<` is an opener only when a type provably follows it,
+    # and an anchor whose verdict depends on any other `<` is refused.
+    anchor_red 5608 BARE_QUAL "a less-than in a code span before an over-closed anchor" \
+        "Use the \`<\` operator; see $R::RecallTool<T>> here."
+    anchor_red 5608 UNDECIDABLE_LT "a quoted less-than before an over-closed anchor" \
+        "Use the \"<\" sign; see $R::RecallTool<T>> here."
+    anchor_red 5608 UNDECIDABLE_LT "a parenthesised less-than before an over-closed anchor" \
+        "Use (<) and $R::RecallTool<T>> here."
+    anchor_red 5608 UNDECIDABLE_LT "a less-than before a negative number" \
+        "See x <-1 and $R::RecallTool<T>> here."
+    anchor_red 5608 UNDECIDABLE_LT "a single-quoted less-than" \
+        "See '<' and $R::RecallTool<T>> here."
+    anchor_red 5608 UNDECIDABLE_LT "a bracketed less-than" \
+        "See [<] and $R::RecallTool<T>> here."
+    anchor_red 5608 UNDECIDABLE_LT "a less-or-equal before a digit" \
+        "See x <=1 and $R::RecallTool<T>> here."
+    anchor_red 5608 UNDECIDABLE_LT "a word-attached less-than before a comma" \
+        "See x<, and $R::RecallTool<T>> here."
+    anchor_red 5608 UNDECIDABLE_LT "a word-attached less-than before a minus" \
+        "See x<-y and $R::RecallTool<T>> here."
+    anchor_red 5608 UNDECIDABLE_LT "a spaced less-than before a digit" \
+        "See x <1 and $R::RecallTool<T>> here."
+    anchor_red 5608 QUAL "an over-closed backticked anchor after a prose opener" \
+        "See a <b and \`$R::RecallTool<T>>\` here."
+    anchor_green 5608 "a code-span less-than before a balanced anchor" \
+        "Use the \`<\` operator; see $R::RecallTool<T> here."
+    anchor_green 5608 "a less-than before a negative number and a live path" \
+        "See x <-1 and $R::RecallTool<T>::decorate_memory_many here."
+    anchor_green 5608 "a prose generic inside the same code span as the anchor" \
+        "See \`Vec<$R::RecallTool<T>>\` here."
+    anchor_green 5608 "a prose generic with a lifetime argument before the anchor" \
+        "See Vec<'a, $R::RecallTool<T>> here."
 
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
@@ -1890,27 +1929,77 @@ def _operator_token_end(prefix, j):
     return e if tok and set(tok) <= _OP_CHARS else None
 
 
-def _outer_depth(prefix):
-    """Number of angle groups (`<` or `&lt;`) still open at the end of
-    `prefix` (#5456): prose such as `Vec<src/x.rs::T<U>>` opens a group of its
-    own before the anchor, and the last closer belongs to it."""
-    depth, j = 0, 0
+# #5608: a `<` is a generic opener only when it is PROVABLY one: the next
+# character begins a type (a letter, `_`, `&`, `(`, `[`, `*`, `<`, `/`, `:`,
+# `?`, or `'` followed by a letter: a lifetime). A whitespace-delimited
+# operator token (#5531) is a comparison. Any other `<` (before a quote, a
+# digit, `-`, `=`, `,`, `)`, whitespace ...) is undecidable: it may or may
+# not open a group.
+_TYPE_START = re.compile(r"[A-Za-z_&(\[*</:?]|'[A-Za-z_]")
+
+
+def _outer_range(prefix, nxt=""):
+    """(lo, hi): the fewest and the most angle groups that can still be open
+    at the end of `prefix` (#5456), counting each undecidable `<` as no
+    opener (lo) and as an opener (hi) (#5608). `nxt` is the character after
+    the prefix (the anchor head), which decides a `<` at its very end. Prose
+    such as `Vec<src/x.rs::T<U>>` opens a group of its own before the anchor,
+    and the last closer belongs to it."""
+    text = prefix + nxt
+    lo = hi = j = 0
     while j < len(prefix):
         kind, width = _group_step(prefix, j)
         if kind == "open":
-            # #5498/#5530/#5531: a whitespace-delimited operator token such as
-            # `a < b`, `a <= b`, `a << b` or `a <- b` is a comparison, not a
-            # generic open; a `<` attached to a word is a generic opener.
             end = _operator_token_end(prefix, j)
-            if end is None:
-                depth += 1
-            else:
+            if end is not None:
+                # #5498/#5530/#5531: `a < b`, `a <= b`, `a << b`, `a <- b`
+                # is a comparison, not a generic open.
                 j = end
                 continue
+            hi += 1
+            if _TYPE_START.match(text, j + 1):
+                lo += 1
         elif kind == "close":
-            depth = max(0, depth - 1)
+            lo, hi = max(0, lo - 1), max(0, hi - 1)
         j += width
-    return depth
+    return lo, hi
+
+
+def _code_spans(line):
+    """(open start, content start, content end, close end) of every CommonMark
+    code span on `line`: a backtick run closed by the next run of the same
+    length; a run with no such closer is literal text (#5608)."""
+    runs = [(m.start(), m.end()) for m in re.finditer(r"`+", line)]
+    spans, i = [], 0
+    while i < len(runs):
+        width = runs[i][1] - runs[i][0]
+        k = next((k for k in range(i + 1, len(runs))
+                  if runs[k][1] - runs[k][0] == width), None)
+        if k is None:
+            i += 1
+            continue
+        spans.append((runs[i][0], runs[i][1], runs[k][0], runs[k][1]))
+        i = k + 1
+    return spans
+
+
+def _anchor_prefix(line, spans, p):
+    """The text whose open groups can belong around the anchor at `p`
+    (#5608). Inside a code span it is the span's own text before `p`; outside,
+    it is the line before `p` with every closed code span made atomic (one
+    neutral character), so a `<` written in code is never a prose opener."""
+    for _o, cs, ce, _c in spans:
+        if cs <= p < ce:
+            return line[cs:p]
+    out, j = [], 0
+    for o, _cs, _ce, c in spans:
+        if c > p:
+            break
+        out.append(line[j:o])
+        out.append("\ue061")
+        j = c
+    out.append(line[j:p])
+    return "".join(out)
 
 
 def _skip_space(text, j):
@@ -2026,7 +2115,10 @@ def scan_sym(text, i, outer=0):
 
 def iter_quals(line):
     """Yield (rule, file, payload) for every qualified anchor on `line`:
-    backticked `src/x.rs::sym` (QUAL) and unbackticked (BARE_QUAL)."""
+    backticked `src/x.rs::sym` (QUAL) and unbackticked (BARE_QUAL). A brace
+    payload is a string; any other payload is a list of the candidate scans
+    (one per possible outer depth, #5608)."""
+    spans = _code_spans(line)
     for rule, head in (("QUAL", QUAL_HEAD), ("BARE_QUAL", BARE_QUAL_HEAD)):
         pos = 0
         while True:
@@ -2039,10 +2131,14 @@ def iter_quals(line):
                 yield rule, hm.group(1), bm.group(1)
                 pos = bm.end()
                 continue
-            end = scan_sym(line, pos, _outer_depth(line[:hm.start()]))
-            if end is not None:
-                yield rule, hm.group(1), line[pos:end]
-                pos = end
+            p0 = hm.start(1)
+            lo, hi = _outer_range(_anchor_prefix(line, spans, p0), line[p0:p0 + 1])
+            ends = [scan_sym(line, pos, d) for d in range(lo, hi + 1)]
+            if ends[0] is not None:
+                # #5608: one payload per possible outer depth; the caller
+                # refuses the anchor when they are judged differently.
+                yield rule, hm.group(1), [line[pos:e] for e in dict.fromkeys(ends)]
+                pos = min(ends)
 
 
 def strip_generics(tok):
@@ -2290,6 +2386,46 @@ def pinned_label(line, m):
     return pt.group(1) == m.group(1) and int(pt.group(2)) == first and want_last == last
 
 
+def _item_findings(rule, f, tok):
+    """(rule, token) findings for one symbol item `tok` of a file `f` anchor."""
+    out = []
+    # #5255/#5342: `Type<T, U>::method` checks BOTH components;
+    # generic arguments are not symbol claims. `<Type as
+    # Trait>::m` checks `Type` and `m`.
+    whole = tok
+    toks = unwrap_self_type(tok)
+    if toks is None:
+        # #5493: a self type that names no type cannot be
+        # resolved: report it rather than accept it.
+        out.append((rule, f"{f}::{whole}".replace(" ", "")))
+        return out
+    for tok in toks:
+        tok = strip_generics(tok).strip().rstrip("(){}[].,;")
+        if "<" in tok or ">" in tok:
+            # An unbalanced group cannot be resolved: report it
+            # rather than skip a component that may be missing.
+            out.append((rule, f"{f}::{tok}".replace(" ", "")))
+            continue
+        if not tok:
+            continue
+        for part in tok.split("::"):
+            part = part.split("(")[0].strip()
+            # `…`, `*`, `_`, generics and other prose fillers are
+            # not symbol claims.
+            if not part or not IDENT.match(part):
+                continue
+            if part in per_file[f]:
+                continue
+            # A trailing `_` is a PREFIX citation of a test/fn
+            # family (`issue_965_audit_*`); it resolves if any
+            # symbol in that file starts with it.
+            if part.endswith("_") and any(
+                    n.startswith(part) for n in per_file[f]):
+                continue
+            out.append((rule, f"{f}::{part}"))
+    return out
+
+
 def qual_findings(line):
     """(rule, token) for every qualified anchor on `line` (decoded, canon)."""
     out = []
@@ -2299,41 +2435,18 @@ def qual_findings(line):
             # absence-wording exemption never applies to it.
             out.append(("PATH", f))
             continue
-        for tok in split_items(raw):
-            # #5255/#5342: `Type<T, U>::method` checks BOTH components;
-            # generic arguments are not symbol claims. `<Type as
-            # Trait>::m` checks `Type` and `m`.
-            whole = tok
-            toks = unwrap_self_type(tok)
-            if toks is None:
-                # #5493: a self type that names no type cannot be
-                # resolved: report it rather than accept it.
-                out.append((rule, f"{f}::{whole}".replace(" ", "")))
-                continue
-            for tok in toks:
-                tok = strip_generics(tok).strip().rstrip("(){}[].,;")
-                if "<" in tok or ">" in tok:
-                    # An unbalanced group cannot be resolved: report it
-                    # rather than skip a component that may be missing.
-                    out.append((rule, f"{f}::{tok}".replace(" ", "")))
-                    continue
-                if not tok:
-                    continue
-                for part in tok.split("::"):
-                    part = part.split("(")[0].strip()
-                    # `…`, `*`, `_`, generics and other prose fillers are
-                    # not symbol claims.
-                    if not part or not IDENT.match(part):
-                        continue
-                    if part in per_file[f]:
-                        continue
-                    # A trailing `_` is a PREFIX citation of a test/fn
-                    # family (`issue_965_audit_*`); it resolves if any
-                    # symbol in that file starts with it.
-                    if part.endswith("_") and any(
-                            n.startswith(part) for n in per_file[f]):
-                        continue
-                    out.append((rule, f"{f}::{part}"))
+        if isinstance(raw, str):
+            for tok in split_items(raw):
+                out += _item_findings(rule, f, tok)
+            continue
+        # #5608: an undecidable `<` before the anchor leaves more than one
+        # scan; when they are judged differently the anchor is refused.
+        judged = [[x for tok in split_items(r) for x in _item_findings(rule, f, tok)]
+                  for r in raw]
+        if all(j == judged[0] for j in judged):
+            out += judged[0]
+        else:
+            out.append(("UNDECIDABLE_LT", f"{f}::{max(raw, key=len)}"))
     return out
 
 
@@ -2546,6 +2659,7 @@ if [[ -n "$violations" ]]; then
             BARE_QUAL) detail="symbol is not defined in the file it is qualified against (unbackticked anchor)" ;;
             BARE_LN) detail="bare file:line anchor in a live doc (rots silently); cite \`path::symbol\`, or pin a commit permalink" ;;
             UNDECIDABLE_REF) detail="anchor is refused: its character references decode differently in CommonMark and HTML, so the anchor cannot be resolved; write the characters plainly" ;;
+            UNDECIDABLE_LT) detail="anchor is refused: a \`<\` before it may or may not open a group, and the anchor is judged differently either way; write a comparison spaced (a < b) or in code" ;;
             LADDER_TIP) detail="claimed ladder tip disagrees with the tip scripts/check-migration-ladder.sh computes (left=cited, right=actual)" ;;
             *)     detail="unresolved anchor" ;;
         esac
