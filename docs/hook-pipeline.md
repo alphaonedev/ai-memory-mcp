@@ -21,10 +21,9 @@ identically to v0.6.4 at the lifecycle layer.
   post-reflect hook subtree under [`src/hooks/post_reflect/`](../src/hooks/post_reflect/).
 - **Helper binary:** [`tools/auto-link-detector/`](../tools/auto-link-detector/)
   is the R3 reference `pre_link` hook (~775 LoC).
-- **Capability registry entry:** `CapabilityHooks` in
-  [`src/config.rs:944`](../src/config.rs).
+- **Capability registry entry:** [`CapabilityHooks`](../src/config.rs).
 - **Config file:** `~/.config/ai-memory/hooks.toml` — hot-reloadable
-  via `SIGHUP` ([`src/hooks/config.rs:424`](../src/hooks/config.rs)).
+  via `SIGHUP` ([`spawn_reload_task`](../src/hooks/config.rs)).
 
 ## Configuration
 
@@ -36,32 +35,31 @@ priority = 100
 timeout_ms = 5000
 mode = "daemon"          # daemon | exec (optional; default per event class)
 enabled = true
-namespace = "team/*"     # glob match (today: non-empty string accepted)
+namespace = "team/*"     # "*", exact, or "prefix/*" (see matches_namespace)
 fail_mode = "open"       # open (default) | closed
 ```
 
-Fields ([`src/hooks/config.rs:174-190`](../src/hooks/config.rs)):
+Fields ([`HookConfig`](../src/hooks/config.rs)):
 
 - **`event`** — one of the 22 events below.
 - **`command`** — absolute path to the helper binary.
 - **`priority`** — higher fires first; first `Deny` short-circuits the chain.
 - **`timeout_ms`** — wall-clock budget per call; capped at
-  `MAX_TIMEOUT_MS = 30_000` ([`src/hooks/config.rs:138`](../src/hooks/config.rs)).
+  `MAX_TIMEOUT_MS = 30_000` ([`MAX_TIMEOUT_MS`](../src/hooks/config.rs)).
   Exceeded → executor returns `Timeout`; chain converts per `fail_mode`.
 - **`mode`** — `daemon` (long-lived subprocess, stdin JSON-RPC) or
   `exec` (one-shot fork+exec; the helper MUST drain its stdin to EOF
   before exiting — see the exec stdin contract in §"Operator workflow",
   or it can be denied under load on `fail_mode = "closed"`). Optional in
   TOML; missing values resolve
-  via `default_mode_for_event` ([`src/hooks/config.rs:157`](../src/hooks/config.rs))
+  via [`default_mode_for_event`](../src/hooks/config.rs)
   — daemon for hot-path events (`post_recall`, `post_search`,
   `pre_recall_expand`), exec otherwise.
 - **`enabled`** — soft-disable without removing the row.
-- **`namespace`** — glob pattern; chain is filtered before invocation.
-  `*` or empty (the schema default) matches every namespace; otherwise the
+- **`namespace`** — namespace pattern (`*`, exact, or `prefix/*`); chain is filtered before invocation.
+  `*` matches every namespace (the field is required: [`validate_hook`](../src/hooks/config.rs) rejects an empty value); otherwise the
   pattern matches EXACTLY, or as a `prefix/*` glob covering the prefix itself
-  and any child under it. Validation is shape-only (`validate_hook` at
-  [`src/hooks/config.rs:297`](../src/hooks/config.rs)); the runtime matcher is
+  and any child under it. Validation is shape-only; the runtime matcher is
   [`HookConfig::matches_namespace`](../src/hooks/config.rs). See
   §"Namespace scoping on pre-* events" below for how the in-flight namespace is
   resolved.
@@ -70,7 +68,7 @@ Fields ([`src/hooks/config.rs:174-190`](../src/hooks/config.rs)):
   chain `Deny` and short-circuit). Use `closed` only for
   compliance-critical hooks (PII redaction, regulated-tenant access
   control) where silent fail-open is worse than a hard refusal.
-  Defined at [`src/hooks/config.rs:111-122`](../src/hooks/config.rs).
+  Defined as [`FailMode`](../src/hooks/config.rs).
 
 ## Namespace scoping on pre-\* events (#2390)
 
@@ -203,17 +201,16 @@ The 2 v0.8.0 Pillar-1 additions:
 | `post_signal_ack` | v0.8.0 #1709 | Write (notify-only) | after a coordination signal is acknowledged (`memory_signal_ack`) |
 
 The discriminator strings (snake_case of the variant names via
-`#[serde(rename_all = "snake_case")]`) and the `HookEvent` enum live at
-[`src/hooks/events.rs:91`](../src/hooks/events.rs); the canonical wire
-shapes for every event's payload (`MemoryDelta`, `RecallQuery`,
-`SearchResult`, `ReflectDelta`, `CompactionDelta`, …) start right
-after the enum (≈[`src/hooks/events.rs:235`](../src/hooks/events.rs))
+`#[serde(rename_all = "snake_case")]`) and the [`HookEvent`](../src/hooks/events.rs)
+enum live in `src/hooks/events.rs`; the canonical wire
+shapes for every event's payload (`MemoryDelta`, `RecallExpandQuery`,
+`SearchResult`, `ReflectDelta`, `CompactionDelta`, …) start with
+[`MemoryDelta`](../src/hooks/events.rs) after the enum
 and span the rest of the module.
 
 ## Decision-class semantics
 
-Every hook returns a `HookDecision`
-([`src/hooks/decision.rs:87`](../src/hooks/decision.rs)):
+Every hook returns a [`HookDecision`](../src/hooks/decision.rs):
 
 - **`Allow`** — chain proceeds to the next hook (or to the substrate
   if this was the last one).
@@ -231,17 +228,15 @@ Every hook returns a `HookDecision`
   default is applied if the K10 sweeper expires the row before an
   operator answers.
 
-`is_pre_event` ([`src/hooks/decision.rs:344`](../src/hooks/decision.rs))
+[`is_pre_event`](../src/hooks/decision.rs)
 is the canonical predicate for "may this event return `Modify`" — the
 chain runner rejects `Modify` decisions on `post_*` events.
 
 ## Per-class deadline budgets
 
-The chain runner reads `event_class(event)`
-([`src/hooks/timeouts.rs:137`](../src/hooks/timeouts.rs)) at fire
+The chain runner reads [`event_class`](../src/hooks/timeouts.rs) at fire
 entry and computes a wall-clock ceiling on the *entire* chain. Per-hook
-budgets are derived by `per_hook_budget_ms`
-([`src/hooks/timeouts.rs:264`](../src/hooks/timeouts.rs)) and shrink
+budgets are derived by [`per_hook_budget_ms`](../src/hooks/timeouts.rs) and shrink
 monotonically as earlier hooks consume time:
 
 | Class | Deadline | Events |
@@ -261,7 +256,7 @@ When `per_hook_budget_ms` returns `None`, the chain has already
 exhausted its class deadline before this hook even fired. The runner
 increments the process-wide
 `timeout_violations_total` counter
-([`src/hooks/timeouts.rs:306-313`](../src/hooks/timeouts.rs)) and
+([`record_timeout_violation`](../src/hooks/timeouts.rs)) and
 handles the missed hook per its `fail_mode` (`open` → treated as
 `Allow`; `closed` → chain `Deny`). The doctor surface reads this
 counter for the "did we trip a budget since boot" panel.
@@ -269,7 +264,7 @@ counter for the "did we trip a budget since boot" panel.
 ## Hot-path constraint
 
 `post_recall` and `post_search` default to `mode = "daemon"`
-([`src/hooks/config.rs:157`](../src/hooks/config.rs)). The v0.6.3
+([`default_mode_for_event`](../src/hooks/config.rs)). The v0.6.3
 recall p95 budget is 50 ms; the daemon subprocess keeps the hook
 chain off the synchronous fork/exec path. `mode = "exec"` is
 permitted for these events but requires the explicit setting — the
@@ -285,14 +280,14 @@ the recall path for a full second.
 
 ## Hot-reload (SIGHUP)
 
-`spawn_reload_task` ([`src/hooks/config.rs:424`](../src/hooks/config.rs))
+[`spawn_reload_task`](../src/hooks/config.rs)
 listens for `SIGHUP` on Linux/macOS and atomically swaps the chain's
 config snapshot (a shared `Arc<HookConfigSnapshot>`, i.e.
 `RwLock<Vec<HookConfig>>`). Read-side dispatch resolves the
 snapshot once per fire, so a reload mid-fire never tears: any
 in-flight chain finishes against the old config; new chains see the
 new config. On non-Unix targets the function is a no-op
-([`src/hooks/config.rs:473`](../src/hooks/config.rs)).
+(the `#[cfg(not(unix))]` stub of [`spawn_reload_task`](../src/hooks/config.rs)).
 
 **Race window discussion.** Between the operator's `kill -HUP <pid>`
 and the chain snapshot swap there is a sub-millisecond window where a
@@ -308,7 +303,7 @@ before treating the reload as effective.
 
 On parse failure (TOML error, validation error, missing file) the
 reload task logs an error and **keeps the previous config**
-([`src/hooks/config.rs:456`](../src/hooks/config.rs)). The daemon
+([`spawn_reload_task`](../src/hooks/config.rs)). The daemon
 never reloads to an empty config because of operator typo — silent
 hook removal would be a security regression.
 
@@ -316,8 +311,7 @@ hook removal would be a security regression.
 
 - **Stderr redaction** — the executor unconditionally scrubs the
   captured stderr tail through a keyword/shape-based pass
-  (`redact_stderr_tail`,
-  [`src/hooks/executor.rs:303`](../src/hooks/executor.rs)) before
+  ([`redact_stderr_tail`](../src/hooks/executor.rs)) before
   forwarding to the daemon log — conservative, favouring
   over-redaction over leaking. Pinned by
   [`tests/g3_hooks_stderr_drain.rs`](../tests/g3_hooks_stderr_drain.rs).
@@ -423,10 +417,10 @@ For deployment sizes:
 | Symptom | Likely cause | Diagnostic recipe |
 |---|---|---|
 | Hook not firing | Namespace mismatch, `enabled = false`, or config not loaded | Confirm the `hooks: reloaded config on SIGHUP` line reported a non-zero hook count (or restart and watch boot logs). Then `RUST_LOG=ai_memory::hooks=debug` and watch the chain's per-hook warn/debug lines. |
-| Hook fires but result ignored | Returned `Modify` on a `post_*` event | Check `decision.rs:344` `is_pre_event` — `Modify` is only valid on pre-events. Daemon log carries the rejection reason. |
+| Hook fires but result ignored | Returned `Modify` on a `post_*` event | Check [`is_pre_event`](../src/hooks/decision.rs) — `Modify` is only valid on pre-events. Daemon log carries the rejection reason. |
 | No hook log lines on any write | No `hooks.toml`, or zero matching rows (an empty chain is a silent no-op returning `Allow`) | This is the **expected v0.6.4-equivalent behavior**. Confirms hooks aren't quietly firing. |
 | Recall p95 regressed after enabling hook | Hook is `mode = "exec"` on a hot-path event | Switch to `mode = "daemon"`. If already daemon, reduce `timeout_ms` and inspect helper-binary tracing for the slow path. |
-| `timeout_violations_total` growing | A hook's class deadline tripping | Compare to per-hook `ExecutorMetrics` ([`src/hooks/executor.rs:530`](../src/hooks/executor.rs)) to identify the slow hook; widen its `timeout_ms` (cap is 30s) or migrate work off the synchronous path. |
+| `timeout_violations_total` growing | A hook's class deadline tripping | Compare to per-hook [`ExecutorMetrics`](../src/hooks/executor.rs) to identify the slow hook; widen its `timeout_ms` (cap is 30s) or migrate work off the synchronous path. |
 | Daemon-mode hook respawn loop | Helper binary panics on framed stdin | Inspect daemon log for the `hook spawn failed for <command>` error. Fix the helper, redeploy, `SIGHUP`. The chain fails open in the meantime (per `fail_mode = "open"` default). |
 | `mode = "exec"` hook intermittently DENIED under load (or spuriously fails-open) | The helper emits its decision and exits WITHOUT reading stdin, so the executor's envelope write hits `EPIPE` → `ExecutorError::Io` ("an I/O error occurred talking to the hook") | Make the exec helper drain stdin to EOF before writing its decision (`cat >/dev/null` in `sh`, or a `read`-to-EOF loop). See the exec stdin contract in §"Operator workflow". Daemon-mode helpers already read stdin and are unaffected. |
 | Reload didn't pick up new hook | TOML parse error | Look for `hooks: SIGHUP reload failed; keeping previous config` in the log. Validate the file with `cat ~/.config/ai-memory/hooks.toml | toml --check` (or `taplo lint`). |
