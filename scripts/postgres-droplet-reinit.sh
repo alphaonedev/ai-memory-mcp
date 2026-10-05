@@ -220,6 +220,16 @@ require_sslrootcert() {
     fi
 }
 
+# #5449: PG_PRIMARY_DB is spliced into the pg_dump connection string and into
+# DROP/CREATE DATABASE, so only a plain identifier is accepted; a conninfo such
+# as "dbname=x sslmode=disable" would otherwise outrank the PGSSLMODE pin.
+require_primary_db_identifier() {
+    if [[ ! "$PG_PRIMARY_DB" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "FATAL: PG_PRIMARY_DB must be a plain identifier ([A-Za-z_][A-Za-z0-9_]*) (#5449)" >&2
+        exit 7
+    fi
+}
+
 # #5402: the pg_dump backup is a TCP connection to PG_HOST; refuse BEFORE the
 # backup and any DROP unless it can run with sslmode=verify-full and a local CA.
 require_dump_sslrootcert() {
@@ -324,6 +334,7 @@ run_schema_init() {
 # ---------------------------------------------------------------------------
 
 log "postgres-droplet-reinit.sh starting (dry_run=${DRY_RUN}, skip_disposable=${SKIP_DISPOSABLE})"
+require_primary_db_identifier
 require_password
 require_sslrootcert
 require_dump_sslrootcert
@@ -340,11 +351,18 @@ fi
 run mkdir -p "$BACKUP_DIR"
 log "step 1: pg_dump ${PG_PRIMARY_DB} -> ${BACKUP_FILE}"
 if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: PGSSLMODE=verify-full PGSSLROOTCERT=${PG_DUMP_SSLROOTCERT} pg_dump -h ${PG_HOST} -U ${PG_USER} -d ${PG_PRIMARY_DB} -F c -f ${BACKUP_FILE}"
+    log "DRY-RUN: pg_dump -h ${PG_HOST} -U ${PG_USER} -d 'dbname=${PG_PRIMARY_DB} sslmode=verify-full sslrootcert=${PG_DUMP_SSLROOTCERT}' -F c -f ${BACKUP_FILE}"
 else
-    # #5402: verify-full against a pinned CA; PGPASSWORD stays in the environment.
+    # #5402 / #5449: libpq ranks a connection string above PGSSLMODE/PGSSLROOTCERT and
+    # above a PGSERVICE file, so the pin is IN the connection string (measured: a
+    # conninfo sslmode=disable and a service-file sslmode=disable both beat the env
+    # pin; the conninfo pin beats a service file) and the service sources are
+    # unset. PGPASSWORD stays in the environment, never on the argv.
+    unset PGSERVICE PGSERVICEFILE
     PGSSLMODE=verify-full PGSSLROOTCERT="$PG_DUMP_SSLROOTCERT" \
-        pg_dump -h "$PG_HOST" -U "$PG_USER" -d "$PG_PRIMARY_DB" -F c -f "$BACKUP_FILE"
+        pg_dump -h "$PG_HOST" -U "$PG_USER" \
+        -d "dbname=${PG_PRIMARY_DB} sslmode=verify-full sslrootcert=${PG_DUMP_SSLROOTCERT}" \
+        -F c -f "$BACKUP_FILE"
     if [[ ! -s "$BACKUP_FILE" ]]; then
         echo "FATAL: backup file is empty — aborting before destructive step" >&2
         exit 5
