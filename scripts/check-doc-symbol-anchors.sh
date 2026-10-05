@@ -45,7 +45,8 @@
 #            the type and the method are in that file. The UNBACKTICKED
 #            form is checked too (reported as BARE_QUAL, #5191), and a
 #            qualified anchor never gets the absent-path exemption: it
-#            asserts the file exists (#5201).
+#            asserts the file exists (#5201). A raw identifier (`r#match`)
+#            is looked up by its name and cited as written (#5778).
 #            Self types and closers (#5457, #5493, #5498, #5530-#5537,
 #            #5608-#5612): the type and every bound of `<dyn A + B>::m`,
 #            `<A + B>::m`, `<&mut T>::m` or a lone `<*const T>` are checked
@@ -88,7 +89,9 @@
 #   UNDECIDABLE_LT — a prose `<` before it may or may not open a group,
 #            and the anchor is judged differently either way (#5608).
 #   UNMODELLED — a self type the gate cannot read, any Rust keyword
-#            in a checked path (#5610, #5611), or a `::` followed by
+#            in a checked path (#5610, #5611), a raw identifier Rust
+#            rejects (`r#crate`, `r#self`, `r#super`, `r#Self`, `r#_`,
+#            #5778), or a `::` followed by
 #            nothing the gate can read or by an empty brace list (#5698).
 #   SETUP  — the gate cannot do its job: a doc or source file in the
 #            checked set cannot be read (#5616), or src/ has no Rust file.
@@ -180,6 +183,7 @@ pub struct PostgresStore;
 fn migrate_v87() {}
 fn migrate_v88() {}
 RSEOF
+    printf 'pub fn r#%s() {}\n' match > "$FIX/src/store/raw.rs"
     printf 'placeholder\n' > "$FIX/scripts/qc-allowlists/doc-symbol-anchors-allow.txt"
     : > "$FIX/scripts/qc-allowlists/doc-symbol-anchors-allow.txt"
 
@@ -1547,6 +1551,18 @@ PYEOF
     anchor_red_cites 5612 QUAL "an unclosed self type keeps the component behind a spaced separator" \
         "$R::<RecallTool::NoSuch" "See \`$R::<RecallTool:: NoSuch\` here."
 
+    # #5778: a raw identifier is one component, looked up by its name and
+    # cited as written; one Rust rejects is refused; a raw link label is read.
+    anchor_green 5778 "a raw identifier defined raw" "See \`src/store/raw.rs::r#match\` here."
+    anchor_green 5778 "a raw spelling of a plain name" "See \`$R::RecallTool::r#decorate_memory_many\`."
+    anchor_red_cites 5778 QUAL "a missing raw identifier is cited with its prefix" \
+        "$R::r#no_such" "See \`$R::RecallTool::r#no_such\`."
+    anchor_red_cites 5778 UNMODELLED "a raw identifier Rust rejects" \
+        "$R::r#crate::RecallTool" "See \`$R::r#crate::RecallTool\`."
+    anchor_red_cites 5778 MDLINK "a raw link label that does not resolve" \
+        "$R::r#no_such" "See [\`r#no_such\`]($R)."
+    anchor_green 5778 "a raw link label that resolves" "See [\`r#match\`](src/store/raw.rs)."
+
     # #5613 (review item N-2): pin the #5536 repro and its self-type sibling
     # so that every spaced closer is counted and a spaced extra closer after a
     # self type still continues the path.
@@ -2039,8 +2055,9 @@ if os.environ.get("AI_MEMORY_SYMBOL_GATE_SELFTEST_FAULT"):
 # ---- symbol index over src/ ------------------------------------------
 DEF = re.compile(
     r"\b(?:pub(?:\([^)]*\))?\s+)?(?:async\s+|unsafe\s+|extern\s+\"[^\"]*\"\s+)*"
-    r"(?:fn|struct|enum|trait|type|const|static|mod|union)\s+([A-Za-z_][A-Za-z0-9_]*)")
-MACRO = re.compile(r"macro_rules!\s+([A-Za-z_][A-Za-z0-9_]*)")
+    r"(?:fn|struct|enum|trait|type|const|static|mod|union)\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)")
+# #5778: a raw identifier (`fn r#match`) is indexed under its name.
+MACRO = re.compile(r"macro_rules!\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)")
 # A 4-space-indented CamelCase item is an enum variant / struct field in
 # house style; docs cite those the same way they cite functions.
 VARIANT = re.compile(r"^\s{4}([A-Z][A-Za-z0-9_]*)\s*[,({=]", re.M)
@@ -2155,7 +2172,8 @@ LABEL_HTML = re.compile(r"^[^<\n]*</a>")
 # A real depth-counting scan (scan_group / scan_sym below) replaces the old
 # fixed-depth regex, which stopped at the first comma or space and then at one
 # nesting level and so hid every component after a deeper group.
-_ID = r"[A-Za-z_][A-Za-z0-9_]*"
+# #5778: a raw identifier (`r#match`) is one component, cited as written.
+_ID = r"(?:r#)?[A-Za-z_][A-Za-z0-9_]*"
 ID_RE = re.compile(_ID)
 # #5609: whitespace between the file and `::` does not end the anchor.
 QUAL_HEAD = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs)\s*::")
@@ -2560,7 +2578,7 @@ def strip_generics(tok):
     return "".join(out)
 
 
-MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(\s*<?([^)]*src/[A-Za-z0-9_/]+\.rs)[^)]*\)")
+MDLINK = re.compile(r"\[`((?:r#)?[A-Za-z_][A-Za-z0-9_]*)`\]\(\s*<?([^)]*src/[A-Za-z0-9_/]+\.rs)[^)]*\)")
 # #5190: ANY relative markdown link to a src/ file, whatever its label
 # (MDLINK only sees a backticked-identifier label). canon() has already
 # removed a ./ or ../ prefix, so the target starts with src/.
@@ -2589,7 +2607,14 @@ HREF = re.compile(
 # Only a RELATIVE link is range-checked; a commit-pinned permalink (an
 # https URL) is immutable and never reaches this rule.
 LINEFRAG = re.compile(r"^#L(\d+)(?:C\d+)?(?:-L?(\d+)(?:C\d+)?)?$")
-IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+IDENT = re.compile(r"^(?:r#)?[A-Za-z_][A-Za-z0-9_]*$")
+# #5778: Rust rejects these as raw identifiers, so they name nothing.
+RAW_FORBIDDEN = frozenset("crate self super Self _".split())
+
+
+def raw_name(part):
+    """The name a component looks up: a raw identifier without its `r#`."""
+    return part[2:] if part.startswith("r#") else part
 AS_WORD = re.compile(r"\bas\b")
 # #5457: a self type may open with a reference or a trait-object keyword
 # (`<dyn Trait>::m`, `<&mut T>::m`); those are not the type's name.
@@ -2885,13 +2910,18 @@ def _item_findings(rule, f, tok):
             # not symbol claims.
             if not part or not IDENT.match(part):
                 continue
-            if part in per_file[f]:
+            name = raw_name(part)
+            if name != part and name in RAW_FORBIDDEN:
+                # #5778: `r#crate` and friends are not identifiers.
+                out.append(("UNMODELLED", f"{f}::{whole}".replace(" ", "")))
+                return out
+            if name in per_file[f]:
                 continue
             # A trailing `_` is a PREFIX citation of a test/fn
             # family (`issue_965_audit_*`); it resolves if any
             # symbol in that file starts with it.
-            if part.endswith("_") and any(
-                    n.startswith(part) for n in per_file[f]):
+            if name.endswith("_") and any(
+                    n.startswith(name) for n in per_file[f]):
                 continue
             out.append((rule, f"{f}::{part}"))
     return out
@@ -3047,7 +3077,7 @@ for doc in seen_docs:
                 # A link to a missing file is a dead link whatever the
                 # surrounding wording says: no absence exemption.
                 emit("PATH", doc, ln, tgt, ctx)
-            elif sym not in per_file[tgt]:
+            elif raw_name(sym) not in per_file[tgt]:
                 emit("MDLINK", doc, ln, f"{tgt}::{sym}", ctx)
 
         # #5190: a relative link with a plain-text label must still point at
