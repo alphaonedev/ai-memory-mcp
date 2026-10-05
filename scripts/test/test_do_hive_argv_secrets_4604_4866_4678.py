@@ -1441,6 +1441,11 @@ ROOT_INDIRECT = (
     (r"(?:^|[;&|({!]\s*|(?<![\w-])(?:then|do|else|command|builtin|exec)\s+)\.(?=\s)", "source"),
     (r"(?<![\w./-])alias(?![\w-])", "alias"),
     (r"(?<![\w-])(?:declare|local|typeset)\s+(?:[-+]\S+\s+)*[-+]\w*n", "nameref"),
+    # #5899: a variable whose value bash runs or expands as code (a prompt under set -x, an alias table, a startup
+    # file), named in any form, and an indirect expansion that assigns the variable it names.
+    (r"(?<!\w)(?:[-+][A-Za-z]*)?(?:PS[0-4]|PROMPT_COMMAND|BASH_ALIASES|BASH_ENV|ENV|BASH_CMDS)(?!\w)",
+     "code variable"),
+    (r"\$\{!\w+(?:\[[^]]*\])?:?=", "indirect default assignment"),
 )
 # Builtins that assign the variable a name operand names. A literal root name among the operands is a mention of the
 # root (reported below); a computed operand (an expansion, a quote or a backslash) may spell one, so it is reported.
@@ -1614,7 +1619,7 @@ def _command_word(stmt):
     return words, plain, min(k, len(words))
 
 
-_INDIRECT_WORDS = {".": "source", "source": "source", "eval": "eval", "alias": "alias"}
+_INDIRECT_WORDS = {".": "source", "source": "source", "eval": "eval", "alias": "alias", "enable": "enable"}
 
 
 def _command_findings(stmt):
@@ -1631,6 +1636,8 @@ def _command_findings(stmt):
         return ([] if re.search(r"[$`]", words[k]) else ["computed command %s" % words[k]]), []
     if cw in _INDIRECT_WORDS:
         why.append(_INDIRECT_WORDS[cw])
+    if cw in ("mapfile", "readarray") and any(re.match(r"-\w*C", p or "-C") for p in plain[k + 1:]):
+        why.append("callback of %s" % cw)   # #5899: -C runs its operand as code
     if cw in ("declare", "local", "typeset"):
         # #5895: a nameref in any run of option words (+i -n, -gn, -"n"); a computed option word may be -n.
         for w, p in zip(words[k + 1:], plain[k + 1:]):
@@ -1658,11 +1665,21 @@ def _command_findings(stmt):
     return why, code
 
 
+def _plain_word(word):
+    """#5896: `word` after quote removal, white space inside it turned into _ (a quoted message is one word, not a
+    command line). A computed word keeps its value as written, but a literal name before its first = is unquoted
+    (#5899: P""S4="$p" names PS4)."""
+    p = _dequote(word)
+    if p is None and "=" in word:
+        name = _dequote(word.split("=", 1)[0])
+        p = None if name is None else re.sub(r"\s", "_", name) + "=" + word.split("=", 1)[1]
+        return word if p is None else p
+    return word if p is None else re.sub(r"\s", "_", p)
+
+
 def _normalised(stmt):
-    """#5896: `stmt` with every word bash does not compute replaced by its quote-removed text, white space inside a
-    word turned into _ (a quoted message is one word, not a command line); a computed word stays as written."""
-    return " ".join(w if p is None else re.sub(r"\s", "_", p) for w, p in zip(shell_words(stmt),
-                                                                             map(_dequote, shell_words(stmt))))
+    """#5896: `stmt` with each word replaced by _plain_word of it."""
+    return " ".join(_plain_word(w) for w in shell_words(stmt))
 
 
 def _names_root(name, stmt):
@@ -3745,6 +3762,19 @@ ROOT_SPELLINGS = (
     ("#5898", "a split attached name", 'printf -vOUT_""DIR %s /dev', "OUT_DIR:named outside its one reviewed assignment"),
     ("#5898", "an option word that ends with the root name after an upper-case flag", "read -NOUT_DIR",
      "OUT_DIR:named outside its one reviewed assignment"),
+    # #5899: builtins and variables that run or expand code.
+    ("#5899", "enable -n eval", "enable -n eval", "roots:enable"),
+    ("#5899", "a quoted enable", '"enable" -f "$so" x', "roots:enable"),
+    ("#5899", "a mapfile callback", 'mapfile -C "$cb" -c 1 arr <<< x', "roots:callback of mapfile"),
+    ("#5899", "an attached readarray callback", "readarray -tC cb arr <<< x", "roots:callback of readarray"),
+    ("#5899", "PS4 under set -x", 'PS4="$p"; set -x', "roots:code variable"),
+    ("#5899", "an alias table entry", 'BASH_ALIASES[q]="$c"', "roots:code variable"),
+    ("#5899", "PROMPT_COMMAND", 'PROMPT_COMMAND="$c"', "roots:code variable"),
+    ("#5899", "printf -v to PS4", 'printf -vPS4 %s "$c"', "roots:code variable"),
+    ("#5899", "a quoted declare of BASH_ENV", 'declare "BASH_ENV=$f"', "roots:code variable"),
+    ("#5899", "a split PS4", 'declare P""S4="$p"', "roots:code variable"),
+    ("#5899", "an indirect default assignment", ': "${!n:=/dev}"', "roots:indirect default assignment"),
+    ("#5899", "an indirect assignment without a colon", ": ${!n=/dev}", "roots:indirect default assignment"),
 )
 # Spellings that leave every root proven: a builtin name as a literal argument of another command.
 ROOT_SPELLINGS_CLEAN = (
@@ -3755,6 +3785,8 @@ ROOT_SPELLINGS_CLEAN = (
     ("#5895", "a name n after --", 'local -- n=1'),
     ("#5898", "a root read attached to an option", 'ls -d"$OUT_DIR" -x'),
     ("#5898", "a longer name that starts with the root name", 'wait -pOUT_DIRX'),
+    ("#5899", "an indirect read", 'echo "${!n}" "${!n:-x}"'),
+    ("#5899", "mapfile without a callback", "mapfile -t arr <<< x"),
 )
 
 
