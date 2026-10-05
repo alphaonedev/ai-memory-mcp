@@ -3,7 +3,7 @@
 # tools/make-local-slice.sh — build your own LOCAL corpus slice (never committed).
 # =============================================================================
 # Turns a real SQLite corpus you already have into an import-shaped JSON file
-# the lab can seed from, so `run.sh --corpus-db <path>` exercises the lab
+# the lab can seed from, so `run.py --corpus-db <path>` exercises the lab
 # against YOUR data instead of the committed synthetic fixture.
 #
 # THE OUTPUT OF THIS SCRIPT MUST NOT BE COMMITTED. It is a verbatim slice of
@@ -18,7 +18,7 @@
 # golden/conformance vectors from synthetic identities).
 #
 # Accordingly the default output path is `sample/local/`, which the lab's
-# .gitignore excludes, and `run.sh --corpus-db` writes its slice under `run/`,
+# .gitignore excludes, and `run.py --corpus-db` writes its slice under `run/`,
 # which is also ignored and is deleted on exit.
 #
 # EMBEDDER-AGNOSTIC BY CONSTRUCTION (caveat F-L8a). This script NULLs the

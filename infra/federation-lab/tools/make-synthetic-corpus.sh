@@ -17,7 +17,7 @@
 # this repo's house standard for committed data for exactly these reasons; see
 # PR #2926, which re-minted the golden/conformance vectors from synthetic
 # identities. To exercise the lab against a REAL corpus, use
-# `tools/make-local-slice.sh` + `run.sh --corpus-db`, which keeps that corpus
+# `tools/make-local-slice.sh` + `run.py --corpus-db`, which keeps that corpus
 # on your machine and out of git.
 #
 # DETERMINISM. Every field is written here — ids are UUIDv5 over a fixed

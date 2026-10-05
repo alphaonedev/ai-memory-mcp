@@ -9,7 +9,7 @@ are all refused.
 
 ```bash
 cd infra/federation-lab
-./run.sh
+./run.py
 ```
 
 No cloud account, no Docker, no network egress, no `/tmp`, no `sudo`. It
@@ -60,20 +60,20 @@ the trust anchor, the CA is not.
 
 | Tool | Why |
 | --- | --- |
+| `python3` (3.9 or later) | runs the lab itself (`run.py`, standard library only) |
 | `openssl` | mints the CA + leaf certificates (via the prior-art generator) |
-| `curl` | drives the HTTPS/mTLS surface |
-| `jq` | builds and reads JSON bodies |
-| `sqlite3` | reads each node's own database — the receiver's ground truth |
+| `bash` | runs the prior-art certificate generator and, with `--corpus-db`, `tools/make-local-slice.sh` |
+| `sqlite3`, `jq` | only with `--corpus-db`: `tools/make-local-slice.sh` uses them to cut your slice |
 
-`python3` is **not** required to run the lab. It is needed only to regenerate
-the committed synthetic fixture (`tools/make-synthetic-corpus.sh`), which a lab
-user never has to do.
+The lab drives the HTTPS/mTLS surface and reads each node's own database (the
+receiver's ground truth) with the Python standard library, so it needs no
+`curl`, and needs `jq` and `sqlite3` only for `--corpus-db`.
 
 ```bash
 # Debian / Ubuntu
-sudo apt-get install -y openssl curl jq sqlite3
+sudo apt-get install -y python3 openssl sqlite3 jq
 # macOS
-brew install openssl curl jq sqlite
+brew install openssl sqlite jq
 ```
 
 Plus an `ai-memory` binary and the `attest_sign` example. From a checkout:
@@ -82,10 +82,10 @@ Plus an `ai-memory` binary and the `attest_sign` example. From a checkout:
 cargo build --release --bin ai-memory --example attest_sign
 ```
 
-`run.sh` finds them in `target/release/` automatically; `--bin` / `--signer`
+`run.py` finds them in `target/release/` automatically; `--bin` / `--signer`
 override. The signer is not optional and not replaceable by a shell script:
 the lab signs its attested write with the **same crate code the daemon
-verifies with**, so the canonical CBOR bytes are never re-implemented in bash.
+verifies with**, so the canonical CBOR bytes are never re-implemented in the lab.
 
 **No network access is required.** The nodes run at `tier = "keyword"`, so
 they never load or download an embedding model.
@@ -95,24 +95,39 @@ they never load or download an embedding model.
 ## Running it
 
 ```bash
-./run.sh                          # the whole thing
-./run.sh --keep                   # keep run/ afterwards for a post-mortem
-./run.sh --port-a 20481 --port-b 20482
-./run.sh --corpus-db /path/to/your.db     # seed YOUR local corpus instead of the fixture
-./run.sh --recall-query 'kiln rotation'   # choose the corpus-recall proof query
-./run.sh --no-caveat-probe        # skip the asi-hard full-profile cold-boot demonstration
-./run.sh --probe-mutation          # lower the rollback-check knob in the probe; the boot must refuse for that knob (PASS row)
-./run.sh --posture-selftest       # drift-guard legs only (names AND values), no daemons
-./run.sh --help
+./run.py                          # the whole thing
+./run.py --keep                   # keep run/ afterwards for a post-mortem
+./run.py --port-a 20481 --port-b 20482
+./run.py --corpus-db /path/to/your.db     # seed YOUR local corpus instead of the fixture
+./run.py --recall-query 'kiln rotation'   # choose the corpus-recall proof query
+./run.py --no-caveat-probe        # skip the asi-hard full-profile cold-boot demonstration
+./run.py --probe-mutation          # lower the rollback-check knob in the probe; the boot must refuse for that knob (PASS row)
+./run.py --posture-selftest       # drift-guard legs only (names AND values), no daemons
+./run.py --help
 ```
 
-Exit code `0` means every assertion passed. Any non-zero exit means at least
-one `FAIL` row is printed above the summary, and the summary lists them again.
+Run it as `./run.py` (its first line starts `python3 -I -S`) or as
+`python3 -I -S run.py`. A plain `python3 run.py` is refused: without `-I` the
+interpreter reads `PYTHON*` variables and the user site directory before the
+program's first line runs, which is code the lab cannot see.
 
-`run.sh` is **idempotent**: it deletes and recreates `run/` at the start of
+Exit code `0` means every assertion passed: at least one `PASS` row, no `FAIL`
+row, the summary printed and every output stream written (`--help` also exits
+`0`). Exit `1` means a preflight failure, a `FAIL` row (printed above the
+summary and listed again in it), a verdict that could not be recorded or
+written, or a missing option value. Exit `2` means an unknown argument, a bad
+port, a bad `--corpus-ns`, or a bad `--corpus-rows` (or `CORPUS_ROWS`), or `--probe-mutation` together with
+`--no-caveat-probe`. Exit `78` means `run.py` refused to start because its
+interpreter start state is not the one it proves (not started with `-I`, an
+interpreter option such as `-O` or `-i`, an `LD_*` variable, a module or builtin
+a plain start does not have); the one `REFUSED` line on stderr names the reason.
+An interrupt exits `130` (`SIGINT`) or `143` (`SIGTERM`) after the daemons are
+stopped, never `0`.
+
+`run.py` is **idempotent**: it deletes and recreates `run/` at the start of
 every invocation, so a crashed previous run leaves nothing behind that can
-change the next one. It is also self-cleaning: an `EXIT`/`INT`/`TERM` trap
-stops every daemon it started and (absent `--keep`) removes `run/`.
+change the next one. It is also self-cleaning: on exit, `SIGINT` or `SIGTERM`
+it stops every daemon it started and (absent `--keep`) removes `run/`.
 
 ---
 
@@ -120,9 +135,9 @@ stops every daemon it started and (absent `--keep`) removes `run/`.
 
 ### 0 · preflight
 
-Checks the five tools, resolves the binary and the signer, refuses to start if
+Checks the required tools, resolves the binary and the signer, refuses to start if
 either lab port is already bound, and then runs the **posture drift guard**:
-`lib/posture.sh::lab_posture_ssot_check` re-parses `src/security_profile.rs::KNOBS`
+`run.py`'s `posture_ssot_check` re-parses `src/security_profile.rs::KNOBS`
 and asserts the lab's knob list is exactly the SSOT's, names and hard values (no
 omissions). If the code grows another pinned knob or raises a floor, this step goes red
 rather than quietly demonstrating a posture that no longer exists. (Running
@@ -293,7 +308,7 @@ full profile, so the omission is removed (issue #4938) and the lab sets the knob
 
 The step-5 cold-boot probe keeps that fix honest. It boots one throwaway node on a fresh
 database under the **full** `AI_MEMORY_SECURITY_PROFILE=asi-hard` profile and requires it to
-come up listening; a boot that refuses is a FAIL. `./run.sh --probe-mutation` re-runs the
+come up listening; a boot that refuses is a FAIL. `./run.py --probe-mutation` re-runs the
 probe with `AI_MEMORY_REQUIRE_ROLLBACK_CHECK=0` (below the floor, which the profile refuses)
 and requires the boot to refuse with an error naming that knob, which proves the probe can fail;
 a refusal for any other reason, or a node that listens, is a FAIL.
@@ -301,14 +316,14 @@ a refusal for any other reason, or a node that listens, is a FAIL.
 Some of the pinned knobs are *permissive* hatches whose hard floor is "unset"
 (for example `AI_MEMORY_ALLOW_SCHEMA_AHEAD`, #2445, and
 `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS`, #2477; the list is `LAB_POSTURE_UNSET` in
-`lib/posture.sh`). The lab actively **unsets** them rather than inheriting whatever the
+`run.py`). The lab actively **unsets** them rather than inheriting whatever the
 operator's shell exported — an inherited hatch is exactly the silent weakening
 the posture exists to prevent.
 
 The kit does not ask you to take any of this on faith:
 
 - **Step 0** re-derives the pinned set (names AND hard values) from the Rust SSOT and fails on drift;
-  `./run.sh --posture-selftest` runs the guard's legs (no daemons) and requires a weakened value, a dropped knob and
+  `./run.py --posture-selftest` runs the guard's legs (no daemons) and requires a weakened value, a dropped knob and
   a pinned knob moved to the unset list to go red (issue #5078).
 - **Step 5** cold-boots a throwaway node under the *full* asi-hard profile (every `src/security_profile.rs::KNOBS` entry) and
   records the real exit code. The node must listen (it is then stopped by the probe timeout, exit 124);
@@ -339,8 +354,7 @@ the machine that generated them. Synthetic fixtures are this repo's house
 standard for committed data for exactly these reasons; see PR #2926, which
 re-minted the golden/conformance vectors from synthetic identities.
 
-Regenerate the fixture with `tools/make-synthetic-corpus.sh` (needs `python3`,
-which the lab itself does not). It is fully deterministic — ids are UUIDv5 over
+Regenerate the fixture with `tools/make-synthetic-corpus.sh` (needs `python3`). It is fully deterministic — ids are UUIDv5 over
 a fixed namespace and the row index, timestamps are a constant, the vocabulary
 is drawn with a seeded PRNG — so a reviewer can regenerate and `diff` rather
 than take the artifact on trust. There is no hostname, no machine identity and
@@ -349,13 +363,13 @@ no wall-clock anywhere in the output.
 ### Running against your own corpus
 
 ```bash
-./run.sh --corpus-db /path/to/your.db --corpus-ns your-namespace
+./run.py --corpus-db /path/to/your.db --corpus-ns your-namespace
 ```
 
 `--corpus-db` builds a slice through `tools/make-local-slice.sh` into the run
 directory, seeds it, and deletes it on exit. **That output is never
 committed**: the tool's default path is `sample/local/`, which this directory's
-`.gitignore` excludes, and `run.sh` writes its slice under `run/`, which is
+`.gitignore` excludes, and `run.py` writes its slice under `run/`, which is
 ignored and removed on exit. Keeping a real corpus on your machine and out of
 git is the whole point of the split between the two tools.
 
@@ -477,7 +491,7 @@ and was purged from PR #2940; do not reintroduce it.
 carries the apt/brew lines.
 
 **`port 19481 is already in use`** — another process (often a previous lab run
-that was `kill -9`'d) holds it. `./run.sh --port-a 20481 --port-b 20482`, or
+that was `kill -9`'d) holds it. `./run.py --port-a 20481 --port-b 20482`, or
 find the holder with `ss -ltnp | grep 19481`.
 
 **`no ai-memory binary found`** — `cargo build --release --bin ai-memory --example attest_sign`,

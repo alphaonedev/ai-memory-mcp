@@ -13,7 +13,7 @@ changes, this file changes with it in the same commit.
 git clone https://github.com/alphaonedev/ai-memory-mcp
 cd ai-memory-mcp
 cargo build --release --bin ai-memory --example attest_sign
-infra/federation-lab/run.sh
+infra/federation-lab/run.py
 ```
 
 That stands up **two v1.0.0 nodes federating over mutual TLS** on loopback,
@@ -39,7 +39,7 @@ assertions instead of adjectives:
 ```
 
 No cloud account, no Docker, no network egress, no `sudo`. Prereqs are
-`openssl`, `curl`, `jq`, `sqlite3`. The kit writes only inside its own
+`python3` (3.9 or later), `openssl` and `bash`. The kit writes only inside its own
 directory and cleans up after itself — including on Ctrl-C.
 
 **Honest by construction.** The lab runs every `asi-hard` posture
