@@ -69,9 +69,6 @@ CENSUS_SECTION = "## Prime directive"
 CENSUS_DIGITS = re.compile(
     r"\b\d+(?=\s+(?:MCP tools|production HTTP route registrations|unique URL paths|CLI subcommands|"
     r"in the default build)\b)", re.ASCII)  # R5 (#5165): ASCII digits only; any other digit is rule text
-# #5376: the mask that stands in for a census number while comparing base and head. NUL cannot be typed into rule
-# text, so a head line that already holds "#" (or any printable stand-in) where the base had a number differs.
-CENSUS_MASK = "\0"
 # R4 (#4507): the code and configuration that judge a rule change. A change to any of them is reported and needs
 # the trailer, so a guard weakened in one PR cannot silently judge the next one. The manifest is not listed: the
 # section comparison above already judges it against the base.
@@ -230,8 +227,10 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
             continue
         old = base_bodies.get(key)
         new = head_bodies.get(key)
+        # #5404: split on the census digit runs and compare the text BETWEEN them; no stand-in character is
+        # substituted, so no byte the head holds (U+0000 included) can imitate a number.
         if old is not None and new is not None and key.startswith(CENSUS_SECTION) and (
-                CENSUS_DIGITS.sub(CENSUS_MASK, old) == CENSUS_DIGITS.sub(CENSUS_MASK, new)):
+                CENSUS_DIGITS.split(old) == CENSUS_DIGITS.split(new)):
             count_changed = True
             lines += [f"### COUNT CHANGED: {span(key)}", "", "Only census counts differ.", ""] + fenced(
                 unified(old, new, key)) + [""]
@@ -869,6 +868,14 @@ def _self_test_cases() -> int:
         reseal(root)
 
     case("a census number replaced by a literal # is a rule change, not COUNT CHANGED (#5376)", hash_for_count,
+         True, "RULE TEXT CHANGED")
+
+    # #5404: a head census line that holds U+0000 where the base had a number is a rule change, not a count.
+    def hash_for_nul(root):
+        edit("The surface has 103 MCP tools", "The surface has \x00 MCP tools")(root)
+        reseal(root)
+
+    case("a census number replaced by U+0000 is a rule change, not COUNT CHANGED (#5404)", hash_for_nul,
          True, "RULE TEXT CHANGED")
 
     # #5375: the docstring says what the code does: the census exemption is a heading PREFIX match.
