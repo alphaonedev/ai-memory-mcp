@@ -725,6 +725,16 @@ def selftest():
         s.g('rm', '-q', 'src/lib.rs'); s.commit('test: drop the const'); return t0 + '..HEAD'
     case('the defining file deleted leaves the assertion unresolved', c_del, True, ['?EXPECTED_N#unresolved'])
 
+    # ---- #5580: the changelog sentence "the same expression added in two new files of one commit is skipped in both" ----
+    def c_two_new(s, b):
+        s.w('tests/n1.rs', 'fn t() { assert_eq!(builds.len(), 1); }\n'); s.w('tests/n2.rs', 'fn t() { assert_eq!(builds.len(), 1); }\n')
+        s.commit('test: two new files, same expression'); return b + '..HEAD'
+    case('the same expression added in two NEW files of one commit is skipped in both (changelog pin)', c_two_new, False)
+    def c_two_new_then(s, b):
+        s.w('tests/n1.rs', 'fn t() { assert_eq!(builds.len(), 1); }\n'); s.commit('test: add'); t0 = s.g('rev-parse', 'HEAD')
+        s.w('tests/n2.rs', 'fn t() { assert_eq!(builds.len(), 2); }\n'); s.commit('test: new file, same expression, other value'); return t0 + '..HEAD'
+    case('a new file repeating an expression of the parent tree is NOT skipped', c_two_new_then, True, ['builds.len()  (none) -> 2'])
+
     # ---- #5499: late declaration -------------------------------------------------------------
     def offender(s, b, two=False):
         (two_hits if two else bump_f)(s); return s.commit('test: bump without a declaration')
