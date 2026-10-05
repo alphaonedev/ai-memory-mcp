@@ -906,6 +906,35 @@ MDEOF
     anchor_green 5531 "a generic opener attached to the anchor after a spaced word" \
         "See a <$R::RecallTool<T>> here."
 
+    # #5532: the only `?` bound is `?Sized`, and every bound AFTER the type of
+    # a trait-object or impl bound list is checked like the type: a missing
+    # name is reported, an unverifiable bound is refused.
+    anchor_red_cites 5532 QUAL "a dyn self type with a missing trait after the live one" \
+        "$R::NoSuch" \
+        "See \`$R::<dyn RecallTool + NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5532 QUAL "a dyn self type with an unspaced plus and a missing trait" \
+        "$R::NoSuch" \
+        "See \`$R::<dyn RecallTool+NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5532 QUAL "an impl self type with a missing trait after the live one" \
+        "$R::NoSuch" \
+        "See \`$R::<impl RecallTool + NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5532 QUAL "a dyn self type with a missing trait behind a path of modules" \
+        "$R::NoSuch" \
+        "See \`$R::<dyn RecallTool + a::NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5532 QUAL "a dyn self type with a missing trait behind a higher-ranked binder" \
+        "$R::NoSuch" \
+        "See \`$R::<dyn RecallTool + for<'a> NoSuch>::decorate_memory_many\`."
+    anchor_red 5532 QUAL "a dyn self type whose leading ? bound is not Sized is refused" \
+        "See \`$R::<dyn ?NoSuch + RecallTool>::decorate_memory_many\`."
+    anchor_red 5532 QUAL "a dyn self type whose trailing ? bound is not Sized is refused" \
+        "See \`$R::<dyn RecallTool + ?NoSuch>::decorate_memory_many\`."
+    anchor_red 5532 QUAL "a dyn self type with a sugared bound is refused" \
+        "See \`$R::<dyn RecallTool + Fn(u8)>::decorate_memory_many\`."
+    anchor_green 5532 "a dyn self type with a lifetime, a ?Sized bound and a trailing plus" \
+        "See \`$R::<dyn RecallTool + 'a + ?Sized + >::decorate_memory_many\`."
+    anchor_green 5532 "a dyn self type with two live traits" \
+        "See \`$R::<dyn RecallTool + RecallTool>::decorate_memory_many\`."
+
     # #5497: the header, ABSENT_DEST and the CLAUDE.md gate paragraph state the
     # same destination wording and the same never-exempt cases.
     for wording in "split into" "split up into" "split across" "split out" "renamed to" "a link or a fragment"; do
@@ -1808,21 +1837,77 @@ AS_WORD = re.compile(r"\bas\b")
 # #5457: a self type may open with a reference or a trait-object keyword
 # (`<dyn Trait>::m`, `<&mut T>::m`); those are not the type's name.
 # #5493: a leading lifetime or ?Trait bound of a bound list (`dyn 'a + T`,
-# `dyn ?Sized + T`) is skipped too; it is not the type either.
+# `dyn ?Sized + T`) is skipped too; it is not the type either. #5532: the only
+# `?` bound Rust has is `?Sized`, so any other name after `?` is not skipped
+# (the self type is then refused) and the bounds after the type are checked.
 SELF_PREFIX = re.compile(
     r"(?:&\s*(?:'[A-Za-z_]\w*\s+)?(?:mut\s+)?|\*\s*(?:const|mut)\s+|\b(?:dyn|impl|mut)\s+"
-    r"|(?:'[A-Za-z_]\w*|\?\s*[A-Za-z_]\w*)\s*\+\s*)+")
+    r"|(?:'[A-Za-z_]\w*|\?\s*Sized\b)\s*\+\s*)+")
+_LIFETIME_BOUND = re.compile(r"^'[A-Za-z_]\w*$")
+_SIZED_BOUND = re.compile(r"^\?\s*Sized$")
+_HRTB = re.compile(r"^for\s*<[^<>]*>\s*")
+_BOUND_PATH = re.compile(r"^(?:::)?" + _ID + r"(?:::" + _ID + r")*$")
+
+
+def _split_bounds(body):
+    """Split a bound list at its top-level `+` (a `+` inside a generic group
+    or parentheses is not a separator) and cut it at a top-level `as`."""
+    pieces, cur, depth = [], "", 0
+    j = 0
+    while j < len(body):
+        ch = body[j]
+        if ch in "<(":
+            depth += 1
+        elif ch in ">)" and not (ch == ">" and j and body[j - 1] == "-"):
+            depth = max(0, depth - 1)
+        if depth == 0 and ch == "+":
+            pieces.append(cur)
+            cur = ""
+        elif depth == 0 and AS_WORD.match(body, j):
+            break
+        else:
+            cur += ch
+        j += 1
+    pieces.append(cur)
+    return pieces
+
+
+def _bound_tokens(body):
+    """The extra bounds after the first type of a trait-object or impl bound
+    list as symbol tokens (#5532); None when a bound cannot be checked (a
+    `?` bound other than `?Sized`, a parenthesised or sugared bound), which
+    the caller refuses. Lifetimes, `?Sized` and a trailing `+` name no type."""
+    pieces = _split_bounds(body)
+    toks = []
+    for idx, piece in enumerate(pieces[1:], start=1):
+        piece = piece.strip()
+        if not piece:
+            if idx == len(pieces) - 1:
+                continue
+            return None
+        if _LIFETIME_BOUND.match(piece) or _SIZED_BOUND.match(piece):
+            continue
+        piece = _HRTB.sub("", piece)
+        path = strip_generics(piece).strip()
+        if "<" in path or ">" in path or not _BOUND_PATH.match(path):
+            return None
+        toks.append(path.lstrip(":"))
+    return toks
+
+
 def unwrap_self_type(tok):
     """`<Type<T> as Trait>::m` -> `Type<T>::m` (the type is the claim); an
     `as` inside a nested argument (`<Vec<<T as Tr>::X>>::new`) counts too, and
     so does a group with no `as` that is followed by `::` (`<Type<T>>::m`).
-    Returns None when the group is a self type that names no type to check
-    (#5493): the caller reports the token instead of accepting it."""
+    Returns a list of the tokens to check (the type, then each further bound
+    of a bound list, #5532), or None when the group is a self type that names
+    no type to check (#5493): the caller reports the token instead of
+    accepting it."""
     if not tok.startswith("<"):
-        return tok
+        return [tok]
     end = scan_group(tok, 0)
     if end is None:
-        return tok
+        return [tok]
     inner = tok[1:end - 1]
     head = inner.lstrip()
     pm = SELF_PREFIX.match(head)
@@ -1832,12 +1917,18 @@ def unwrap_self_type(tok):
     # type is the claim; a placeholder with nothing behind it is not.
     if AS_WORD.search(inner) or tok.startswith("::", end):
         if m:
-            return m.group(0) + tok[end:]
+            toks = [m.group(0) + tok[end:]]
+            if pm and re.search(r"\b(?:dyn|impl)\b|\+", pm.group(0)):
+                extra = _bound_tokens(head[pos:])
+                if extra is None:
+                    return None
+                toks += extra
+            return toks
         # #5493/#5495: a self type with no identifier after its prefix (a
         # bare bound, a pointer-free tuple, slice or nested group) names no
         # type to check, so it is refused, never accepted.
         return None
-    return tok
+    return [tok]
 
 
 def split_items(raw):
@@ -2013,35 +2104,36 @@ for doc in seen_docs:
                 # Trait>::m` checks `Type` and `m`.
                 tok = tok.replace("&lt;", "<").replace("&gt;", ">")
                 whole = tok
-                tok = unwrap_self_type(tok)
-                if tok is None:
+                toks = unwrap_self_type(tok)
+                if toks is None:
                     # #5493: a self type that names no type cannot be
                     # resolved: report it rather than accept it.
                     emit(rule, doc, ln, f"{f}::{whole}".replace(" ", ""), ctx)
                     continue
-                tok = strip_generics(tok).strip().rstrip("(){}[].,;")
-                if "<" in tok or ">" in tok:
-                    # An unbalanced group cannot be resolved: report it
-                    # rather than skip a component that may be missing.
-                    emit(rule, doc, ln, f"{f}::{tok}".replace(" ", ""), ctx)
-                    continue
-                if not tok:
-                    continue
-                for part in tok.split("::"):
-                    part = part.split("(")[0].strip()
-                    # `…`, `*`, `_`, generics and other prose fillers are
-                    # not symbol claims.
-                    if not part or not IDENT.match(part):
+                for tok in toks:
+                    tok = strip_generics(tok).strip().rstrip("(){}[].,;")
+                    if "<" in tok or ">" in tok:
+                        # An unbalanced group cannot be resolved: report it
+                        # rather than skip a component that may be missing.
+                        emit(rule, doc, ln, f"{f}::{tok}".replace(" ", ""), ctx)
                         continue
-                    if part in per_file[f]:
+                    if not tok:
                         continue
-                    # A trailing `_` is a PREFIX citation of a test/fn
-                    # family (`issue_965_audit_*`); it resolves if any
-                    # symbol in that file starts with it.
-                    if part.endswith("_") and any(
-                            n.startswith(part) for n in per_file[f]):
-                        continue
-                    emit(rule, doc, ln, f"{f}::{part}", ctx)
+                    for part in tok.split("::"):
+                        part = part.split("(")[0].strip()
+                        # `…`, `*`, `_`, generics and other prose fillers are
+                        # not symbol claims.
+                        if not part or not IDENT.match(part):
+                            continue
+                        if part in per_file[f]:
+                            continue
+                        # A trailing `_` is a PREFIX citation of a test/fn
+                        # family (`issue_965_audit_*`); it resolves if any
+                        # symbol in that file starts with it.
+                        if part.endswith("_") and any(
+                                n.startswith(part) for n in per_file[f]):
+                            continue
+                        emit(rule, doc, ln, f"{f}::{part}", ctx)
 
         # #5431: the joined line feeds MDLINK too, so a symbol label whose
         # destination is on the next line is checked like the one-line form.
