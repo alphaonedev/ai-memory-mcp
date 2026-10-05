@@ -367,6 +367,15 @@ if [[ -n "${checked_literal_hits}" ]]; then
     violations=$(( violations + 1 ))
 fi
 
+# #5084 / #5241 — every SQLite write transaction must open BEGIN IMMEDIATE
+# (WriteTxn::begin); a DEFERRED read-then-write upgrade fails with
+# SQLITE_BUSY_SNAPSHOT (517) that busy_timeout never retries. Allowlist and
+# rules live in the gate itself.
+if ! python3 "${ROOT}/scripts/check-sqlite-write-txn-immediate.py" >&2; then
+    echo "C8 HARD-BLOCK (#5084): a SQLite transaction opened without BEGIN IMMEDIATE." >&2
+    violations=$(( violations + 1 ))
+fi
+
 if (( violations > 0 )); then
     echo "" >&2
     echo "C8 precheck FAILED with ${violations} category/categories of violation." >&2
