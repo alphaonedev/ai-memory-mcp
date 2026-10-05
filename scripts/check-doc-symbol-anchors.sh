@@ -1788,6 +1788,16 @@ PYEOF
         "$R::NoSuch" "See [\`NoSuch\`](src/mcp/tools/recall&#46;rs) here."
     anchor_red_cites 5782 UNDECIDABLE_REF "a path the two readings decode differently" \
         "src/no_such.rs" "See \`src/no&#95such.rs\`."
+    # #5782: an undecidable line reports only the refusal, never a
+    # finding that one reading alone makes.
+    write_clean
+    printf '\n\nSee `%s::NoSuch&#95x`.\n' "$R" >> "$FIX/README.md"
+    und_out="$(run_fixture_out)"
+    grep -qF "[UNDECIDABLE_REF]: README.md" <<<"$und_out" \
+        && ! grep -qF "[QUAL]: README.md" <<<"$und_out" || {
+        echo "FAIL: self-test #5782 — an undecidable line reported a finding only one reading makes" >&2
+        printf '%s\n' "$und_out" | sed 's/^/       /' >&2; exit 1; }
+    echo "PASS: self-test #5782 — an undecidable line reports only UNDECIDABLE_REF, never a one-reading finding"
     anchor_red_cites 5782 MDLINK "a symbol link whose target continues on the next line with a character reference" \
         "$R::NoSuch" "See [\`NoSuch\`](
 src/mcp/tools/recall&#46;rs) here."
