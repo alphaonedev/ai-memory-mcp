@@ -1135,6 +1135,8 @@ GREEN_PROBES_4600 = {
     "5448-psql-v-substituted-value-only": 'psql -v role="$ROLE_NAME" -f x.sql',
     "5482-split-word-not-psql": 'p\\sqlx -v role=aimemory -f x.sql',
     "5482-quoted-psql-no-secret": 'echo "psql" -v role=aimemory -f x.sql',
+    "5482-trailing-backslash-word-not-psql": 'psql\\x -c "ALTER USER a PASSWORD \'hunter2x\'"',
+    "5482-prefixed-split-word-not-psql": 'a\\psq\\l -c "ALTER USER a PASSWORD \'hunter2x\'"',
     "5483-psql-v-neutral-value-expansion": 'psql -v x="$DB_NAME" -f x.sql',
     "5483-psql-v-neutral-value-dollar-only": 'psql -v n=$ROWS -f x.sql',
     "5483-psql-v-ascii-name-literal-value": 'psql -v role=aimemory -v n=3 -f x.sql',
