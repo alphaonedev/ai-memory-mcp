@@ -798,4 +798,3 @@ step**, with no `needs: classify`, no `paths:` filter and no job-level
 definitions that can disagree teach reviewers to ignore both. Run it as
 `( umask 022; cargo test --test doc_claims_integrity )` — the bare
 `cargo test` umask trap is #2628.
-

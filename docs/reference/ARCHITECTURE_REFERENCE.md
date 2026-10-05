@@ -741,4 +741,3 @@ shared or upstream database, set `--agent-id` or `AI_MEMORY_AGENT_ID` to
 something scrubbed (an opaque identifier, `alice`, etc.), or set
 `AI_MEMORY_ANONYMIZE=1` to use the `anonymous:pid-…` fallback instead.
 Tracking issue: #198.
-
