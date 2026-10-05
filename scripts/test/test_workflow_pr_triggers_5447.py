@@ -2021,6 +2021,53 @@ class ReasonTruth5732(unittest.TestCase):
         self.assertNotIn("``types`` may also be one plain word", doc)
 
 
+class RoundFourMutants5665(unittest.TestCase):
+    """Cases that pin reader lines round 4 changed, each named for the mutant it kills.
+
+    The round-4 mutation run over 71fe391b..f321cc6b left eight mutants alive
+    (N01, N02, N13, N18, N19, N20, N31, M08); each case below fails under one of
+    them.  Each PyYAML 6.0.1 view quoted in a comment was measured with
+    yaml.safe_load on the same text.
+    """
+
+    def _reason(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5748_strip_comment_keeps_unicode_space_as_text(self) -> None:
+        # N01, N02. PyYAML: {'x': 'a #b'}; a '#' after U+2003 starts no comment.
+        self.assertEqual("a #b", _strip_comment("a #b"))
+        self.assertEqual("--- ", _strip_comment("--- "))
+        # PyYAML: ScannerError; ---U+2003 is no document marker.
+        self._reason("--- \nname: x\non:\n" + GOOD_PR, "row is neither a mapping key")
+
+    def test_5748_unicode_space_on_value_is_a_scalar_on_form(self) -> None:
+        # N31. PyYAML: {True: ' '}; the on: value is a string, not an empty block.
+        self._reason("name: x\non:  \n", "flow/scalar on: form")
+
+    def test_5733_flow_mapping_entry_with_no_value_before_a_comma(self) -> None:
+        # N13. PyYAML: {'a': None, 'b': 'c'}; the reader refuses the null value.
+        self._reason("name: x\non:\n" + GOOD_PR + "x: {a: , b: c}\n", "flow mapping entry with no value (#5733)")
+
+    def test_5733_comment_after_a_quoted_flow_entry(self) -> None:
+        # M08. PyYAML: ParserError; ' #' starts a comment, so the collection stays open.
+        self._reason("name: x\non:\n" + GOOD_PR + "x: ['a' #c]\n", "flow collection does not close on its row")
+        branches = "on:\n  pull_request:\n    branches: [main, 'rehearsal/**' # c]\n"
+        self._reason(branches, "flow collection does not close on its row")
+
+    def test_5750_longest_leading_blank_line_counts(self) -> None:
+        # N18, N19. PyYAML: ParserError for both; the deepest leading blank line
+        # sets the indentation, even when a shallower one follows it.
+        why = "leading blank line of a block scalar holds more spaces than its first line (#5750)"
+        self._reason("name: x\non:\n" + GOOD_PR + "x: |\n      \n  \n    a\n", why)
+        self._reason("name: x\non:\n" + GOOD_PR + "x: |\n     \n    a\n", why)
+
+    def test_5750_blank_count_resets_for_each_block_scalar(self) -> None:
+        # N20. PyYAML: {'x': '\na\n', 'z': 'b\n'}.
+        tail = "x: |\n      \n      a\nz: |\n  b\n"
+        self.assertEqual([], violations("x.yml", "name: x\non:\n" + GOOD_PR + tail))
+
+
 class GlobSemantics5447(unittest.TestCase):
     def test_5447_glob_rules(self) -> None:
         self.assertTrue(glob_match("rehearsal/**", CARRIER))
