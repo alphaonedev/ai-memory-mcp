@@ -1207,6 +1207,41 @@ PYEOF
     anchor_green 5608 "a prose generic with a lifetime argument before the anchor" \
         "See Vec<'a, $R::RecallTool<T>> here."
 
+    # #5609: whitespace before or after `::` continues a path, as Rust
+    # reads it; it never ends the anchor before a missing component.
+    anchor_red_cites 5609 BARE_QUAL "a space between a group closer and the path separator" \
+        "$R::NoSuch" "See $R::RecallTool<T> ::NoSuch here."
+    anchor_red_cites 5609 BARE_QUAL "a tab between a group closer and the path separator" \
+        "$R::NoSuch" "See $R::RecallTool<T>	::NoSuch here."
+    anchor_red_cites 5609 BARE_QUAL "a no-break space entity before the path separator" \
+        "$R::NoSuch" "See $R::RecallTool<T>&nbsp;::NoSuch here."
+    anchor_red_cites 5609 BARE_QUAL "a decimal space reference before the path separator" \
+        "$R::NoSuch" "See $R::RecallTool<T>&#32;::NoSuch here."
+    anchor_red_cites 5609 BARE_QUAL "a hex space reference before the path separator" \
+        "$R::NoSuch" "See $R::RecallTool<T>&#x20;::NoSuch here."
+    anchor_red_cites 5609 BARE_QUAL "a tab entity before the path separator" \
+        "$R::NoSuch" "See $R::RecallTool<T>&Tab;::NoSuch here."
+    anchor_red_cites 5609 QUAL "a backticked anchor with a space before the separator" \
+        "$R::NoSuch" "See \`$R::RecallTool<T> ::NoSuch\`."
+    anchor_red_cites 5609 QUAL "a self type followed by two spaces and the separator" \
+        "$R::NoSuch" "See \`$R::<dyn RecallTool>  ::NoSuch\`."
+    anchor_red_cites 5609 BARE_QUAL "a plain component with a space before the separator" \
+        "$R::NoSuch" "See $R::RecallTool ::NoSuch here."
+    anchor_red_cites 5609 BARE_QUAL "spaces on both sides of the separator" \
+        "$R::NoSuch" "See $R::decorate_memory_many :: NoSuch here."
+    anchor_red_cites 5609 BARE_QUAL "a space after the separator" \
+        "$R::NoSuch" "See $R::RecallTool<T>:: NoSuch here."
+    anchor_red_cites 5609 BARE_QUAL "a space after the file separator" \
+        "$R::NoSuch" "See $R:: NoSuch here."
+    anchor_red_cites 5609 BARE_QUAL "a space between the file and its separator" \
+        "$R::NoSuch" "See $R ::NoSuch here."
+    anchor_red_cites 5609 QUAL "a placeholder-shaped self type with a spaced separator" \
+        "$R::NoSuchType" "See \`$R::<NoSuchType> ::decorate_memory_many\`."
+    anchor_green 5609 "a live path with a space before the separator" \
+        "See $R::RecallTool<T> ::decorate_memory_many here."
+    anchor_green 5609 "a path followed by a spaced separator in prose" \
+        "See $R::RecallTool and :: in C++."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
@@ -1800,12 +1835,13 @@ LABEL_HTML = re.compile(r"^[^<\n]*</a>")
 # nesting level and so hid every component after a deeper group.
 _ID = r"[A-Za-z_][A-Za-z0-9_]*"
 ID_RE = re.compile(_ID)
-QUAL_HEAD = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs)::")
+# #5609: whitespace between the file and `::` does not end the anchor.
+QUAL_HEAD = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs)\s*::")
 # #5191: an UNBACKTICKED `src/x.rs::symbol` anchor (prose, an HTML code
 # element, a code-block comment) is a symbol claim too, and is the very form
 # the BARE_LN failure text tells authors to use. Same lookbehind as BARE_LN,
 # so a URL path segment is never matched.
-BARE_QUAL_HEAD = re.compile(r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs)::")
+BARE_QUAL_HEAD = re.compile(r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs)\s*::")
 BRACE_BODY = re.compile(r"\{([^}]*)\}")
 
 
@@ -2009,6 +2045,13 @@ def _skip_space(text, j):
     return j
 
 
+def _spaced_path(text, i):
+    """Index of the `::` that follows whitespace at `i`, or None (#5609): a
+    path continues across whitespace before `::`, as Rust reads it."""
+    k = _skip_space(text, i)
+    return k if k > i and text.startswith("::", k) else None
+
+
 def _closer_run(text, i):
     """Closers at `i`: (attached count, index after them, count of closers
     when whitespace between them is skipped, index after those and the
@@ -2065,7 +2108,7 @@ def scan_sym(text, i, outer=0):
     components behind it. `outer` is the count of prose groups still open
     before the anchor (#5456): that many closers after the path close those
     groups and end the capture instead of over-closing the anchor's own."""
-    pos = i
+    pos = _skip_space(text, i)
     if _opens_group(text, pos):
         end = scan_group(text, pos)
         if end is None:
@@ -2074,10 +2117,14 @@ def scan_sym(text, i, outer=0):
         if stray is not None:
             return _token_end(text, stray)
         if not text.startswith("::", end):
-            # #5535: a lone balanced group is a self type with no method: the
-            # caller checks (or refuses) it, it is never silently dropped.
-            return end
-        pos = end + 2
+            # #5609: whitespace before `::` continues the path.
+            sp = _spaced_path(text, end)
+            if sp is None:
+                # #5535: a lone balanced group is a self type with no method:
+                # the caller checks (or refuses) it, never silently drops it.
+                return end
+            end = sp
+        pos = _skip_space(text, end + 2)
     m = ID_RE.match(text, pos)
     if not m:
         return None
@@ -2097,14 +2144,19 @@ def scan_sym(text, i, outer=0):
             past = _closer_then_path(text, pos)
             if past is not None:
                 return _token_end(text, past)
-            return pos
-        m = ID_RE.match(text, pos + 2)
+            sp = _spaced_path(text, pos)
+            if sp is None:
+                return pos
+            pos = sp
+        # #5609: whitespace after `::` does not end the path either.
+        nxt = _skip_space(text, pos + 2)
+        m = ID_RE.match(text, nxt)
         if m:
             pos = m.end()
-        elif _opens_group(text, pos + 2):
-            end = scan_group(text, pos + 2)
+        elif _opens_group(text, nxt):
+            end = scan_group(text, nxt)
             if end is None:
-                return _token_end(text, pos + 2)
+                return _token_end(text, nxt)
             pos = end
             stray = _stray_close(text, pos, outer)
             if stray is not None:
@@ -2125,7 +2177,7 @@ def iter_quals(line):
             hm = head.search(line, pos)
             if not hm:
                 break
-            pos = hm.end()
+            pos = _skip_space(line, hm.end())
             bm = BRACE_BODY.match(line, pos) if line.startswith("{", pos) else None
             if bm:
                 yield rule, hm.group(1), bm.group(1)
@@ -2292,6 +2344,22 @@ def unwrap_self_type(tok):
     return [tok]
 
 
+def _scan_items(raw):
+    """The symbol items of a scanned (non-brace) payload: whitespace outside
+    a generic group is dropped first, so `T<U> ::m` is the one path
+    `T<U>::m` (#5609), never two unrelated items."""
+    out, depth = [], 0
+    for idx, ch in enumerate(raw):
+        if ch == "<":
+            depth += 1
+        elif ch == ">" and depth > 0 and not (idx and raw[idx - 1] == "-"):
+            depth -= 1
+        if depth == 0 and ch.isspace():
+            continue
+        out.append(ch)
+    return split_items("".join(out))
+
+
 def split_items(raw):
     """Split a qualified-anchor payload into symbol tokens at commas and
     whitespace that are NOT inside a generic group (`{A<T, U>::m, B}` is two
@@ -2441,7 +2509,7 @@ def qual_findings(line):
             continue
         # #5608: an undecidable `<` before the anchor leaves more than one
         # scan; when they are judged differently the anchor is refused.
-        judged = [[x for tok in split_items(r) for x in _item_findings(rule, f, tok)]
+        judged = [[x for tok in _scan_items(r) for x in _item_findings(rule, f, tok)]
                   for r in raw]
         if all(j == judged[0] for j in judged):
             out += judged[0]
