@@ -498,7 +498,7 @@ def refusal_prefix_gap(source: bytes) -> str:
     source = bytes(source)
     try:
         encoding = tokenize.detect_encoding(iter(source.splitlines(keepends=True)).__next__)[0]
-    except Exception as exc:  # fail closed: detect_encoding raises only SyntaxError (measured), but ANY failure refuses (#5588)
+    except Exception as exc:  # fail closed: ANY failure refuses (#5588); pin_5588 shows SyntaxError for three inputs (#5626)
         return f"the source encoding cannot be determined: {exc}"
     if encoding not in ("utf-8", "utf8"):
         return f"the source declares the encoding {encoding}, not plain utf-8 (a BOM or a coding cookie)"
@@ -989,8 +989,9 @@ def _self_test_cases() -> int:
         return ""
 
     def pin_5588():
-        # #5588: ANY exception from tokenize.detect_encoding refuses, not only the SyntaxError it raises today for an
-        # unknown codec (measured on 3.12). The injected LookupError, StopIteration and RuntimeError make the broad
+        # #5588/#5626: ANY exception from tokenize.detect_encoding refuses, not only the SyntaxError it raises for an unknown
+        # codec, a BOM with a different cookie and an undecodable first line (asserted below on the running
+        # interpreter; no other input was checked). The injected LookupError, StopIteration and RuntimeError make the broad
         # catch load-bearing: narrowing it back to SyntaxError turns this pin red.
         refusal, hidden, plain = pin_sources()
         real = tokenize.detect_encoding
@@ -1008,6 +1009,14 @@ def _self_test_cases() -> int:
                     return f"a {type(injected).__name__} from detect_encoding did not refuse (#5588)"
         finally:
             tokenize.detect_encoding = real
+        for label, data in (("an unknown codec", b"# coding: nope\n" + plain), ("a BOM with a different cookie", b"\xef\xbb\xbf# coding: latin-1\n" + plain),
+                            ("an undecodable first line", b"# \xff\n" + plain)):
+            try:
+                tokenize.detect_encoding(iter(data.splitlines(keepends=True)).__next__)
+                return f"detect_encoding accepted {label}, so the comment's SyntaxError claim is untested (#5626)"
+            except Exception as exc:  # the type is the claim
+                if type(exc) is not SyntaxError:
+                    return f"detect_encoding raised {type(exc).__name__}, not SyntaxError, for {label} (#5626)"
         if "the source encoding cannot be determined: unknown encoding" not in refusal_prefix_gap(b"# coding: nope\n" + plain):
             return "an unknown coding cookie was not refused with the encoding reason (#5588)"
         if refusal_prefix_gap(plain):
