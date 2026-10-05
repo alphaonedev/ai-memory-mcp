@@ -263,6 +263,12 @@ def main(argv):
             return 2
     new_unread = sorted(set(unreadable) - set(listed))
     stale_unread = sorted(set(listed) - set(unreadable))
+    # #5552: a listed skip whose raw bytes hold a mention (or that has no binary magic number) is refused by the gate; agree
+    refused_skips = [rel for rel in sorted(listed) if rel in unreadable and gate.skip_problem(unreadable[rel])]
+    if refused_skips:
+        for rel in refused_skips:
+            print("regen: FAULT: skip entry for %s is refused: %s" % (rel, gate.skip_problem(unreadable[rel])), file=sys.stderr)
+        return 2
     for (rel, text, ctx), n in sorted(stale.items()):
         print("STALE x%d: %s | %s | ctx:%s" % (n, rel, text[:160], ctx))
     for (rel, text, ctx), n in sorted(new.items()):
@@ -289,9 +295,9 @@ def main(argv):
             sum(stale.values()), sum(new.values()), len(stale_unread), len(new_unread),
             "--check" if a.check else "pass --drop-stale / --accept-new after reading each line above"))
         return 1
-    # #5367 suffix, #5478 magic number: both must hold before a file is excused
+    # #5367 suffix, #5478 magic number, #5552 no raw mention: all must hold before a file is excused
     text_named = [rel for rel in new_unread if Path(rel).suffix.lower() not in gate.BINARY_SUFFIXES
-                  or not unreadable[rel].startswith(gate.MAGIC_REASON)]
+                  or gate.skip_problem(unreadable[rel])]
     if text_named:
         # #5367: the skip list excuses declared binary types only; a text file that will not read is fixed, not listed
         for rel in text_named:

@@ -225,7 +225,8 @@ FORBIDDEN_ENTRY = (
     re.compile(r"(?:^|\s)(?:export|env|set|-e|--env|--set|--set-string)(?:\s+[^\s=\"']+){0,4}?(?:\s+|=)[\"']?[a-z0-9_.]*pool[_-]?mode[\"']?(?:\s*=\s*|\s+)[\"']?(?:transaction|statement)\b"),
     re.compile(r"[\"'][a-z0-9_.]*pool[_-]?mode[\"']\s*:\s*[\"'](?:transaction|statement)[\"']"),
     # #5477: a flow mapping or inline table, an env prefix on a command, a stream editor or echo that writes the key
-    re.compile(r"\{[^{}]*?[\"']?[a-z0-9_.]*pool[_-]?mode[\"']?\s*[:=]\s*[\"']?(?:transaction|statement)\b"),
+    # (#5555, N03: the lazy [^{}]*? prefix already absorbs a dotted key such as pgbouncer.pool_mode, so no [a-z0-9_.]* is needed)
+    re.compile(r"\{[^{}]*?[\"']?pool[_-]?mode[\"']?\s*[:=]\s*[\"']?(?:transaction|statement)\b"),
     re.compile(r"^[a-z0-9_]*pool[_-]?mode=[\"']?(?:transaction|statement)[\"']?\s+(?:\.{1,2}/|/\w|~/|\$|exec\b|sudo\b|bash\b|pgbouncer\b)"),
     re.compile(r"(?:^|[\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\b.*pool[_-]?mode\s*[=:]\s*[\"']?(?:transaction|statement)\b"),
 )
@@ -585,6 +586,10 @@ def scan_stream(rel: str, raw_lines: Iterable[str]) -> List[Unit]:
 
 
 MAGIC_REASON = "binary or compressed content"  # the one Unreadable reason a skip entry may excuse (#5478)
+# #5478, #5552: a magic number is not proof of binary content (GIF8, %PDF, BZh, Rar!, wOFF, OTTO, SQLite format 3 are
+# printable). A file the gate cannot read as text is excused only when its raw bytes hold no pool-mode mention.
+RAW_MENTION_MARK = "raw bytes hold a pool-mode mention"
+RAW_LINE_CAP, RAW_OVERLAP = 1 << 22, 4096  # an overlong raw line is cut in segments that overlap, so no word is lost
 
 
 class Unreadable(Exception):
@@ -654,6 +659,50 @@ def read_lines(path: Path) -> Iterator[str]:
             chunk = handle.read(CHUNK_BYTES)  # the final empty read flushes the decoder and keeps no carry
 
 
+def _raw_lines(path: Path, drop_nul: bool) -> Iterator[str]:
+    """The raw bytes of a file as latin-1 lines (every byte value decodes, nothing is replaced). With drop_nul the NUL
+    bytes are removed (a word cut by NULs, text in another width); otherwise each NUL ends a line."""
+    carry = b""
+    with open(str(path), "rb") as handle:
+        while True:
+            chunk = handle.read(CHUNK_BYTES)
+            data = carry + (chunk.replace(b"\0", b"") if drop_nul else chunk.replace(b"\0", b"\n"))
+            parts = data.splitlines()
+            carry = parts.pop() if chunk and parts else b""
+            for part in parts:
+                yield part.decode("latin-1")
+            while len(carry) > RAW_LINE_CAP:
+                yield carry[:RAW_LINE_CAP].decode("latin-1")
+                carry = carry[RAW_LINE_CAP - RAW_OVERLAP:]
+            if not chunk:
+                if carry:
+                    yield carry.decode("latin-1")
+                return
+
+
+def raw_mention(path: Path) -> Optional[int]:
+    """#5552: the 1-based line of the first pool-mode mention in the raw bytes of a file the gate cannot read as text,
+    under the gate's own rules R1/R2/R4 (a line, or a line joined to the next), or None. Two views: NUL as a line
+    break, and NUL removed. The first bytes of the file decide nothing."""
+    for drop_nul in (False, True):
+        before = ""
+        for number, raw in enumerate(_raw_lines(path, drop_nul), 1):
+            text = normalise(raw)
+            if text and (mentions(text) or (before and mentions(before + " " + text))):
+                return number
+            before = text
+    return None
+
+
+def skip_problem(reason: str) -> Optional[str]:
+    """Why a skip entry may not excuse a file whose Unreadable reason is `reason`, or None (shared with regen)."""
+    if RAW_MENTION_MARK in reason:
+        return "its %s: it is text-like and is read, never skipped" % RAW_MENTION_MARK
+    if not reason.startswith(MAGIC_REASON):
+        return "it has no binary magic number (%s): it is text and is read, never skipped" % reason
+    return None
+
+
 def scan_detail(root: Path) -> Tuple[List[Unit], int, Dict[str, str]]:
     """(mention units, files read, {path: why} of files that could not be read as text)."""
     units: List[Unit] = []
@@ -668,7 +717,8 @@ def scan_detail(root: Path) -> Tuple[List[Unit], int, Dict[str, str]]:
         try:
             found = scan_stream(rel, read_lines(path))  # an OSError propagates: run() reports a FAULT
         except Unreadable as exc:
-            unread[rel] = str(exc)
+            line = raw_mention(path)  # an OSError propagates: run() reports a FAULT
+            unread[rel] = str(exc) + ("" if line is None else "; %s (line %d)" % (RAW_MENTION_MARK, line))
             continue
         read += 1
         units += found
@@ -721,8 +771,10 @@ def scan(root: Path) -> Tuple[List[Unit], int]:
     stale = ["%s: skip entry for a file that is readable or no longer tracked" % rel for rel in sorted(listed) if rel not in unread]
     # #5478: a suffix alone proves nothing. Only a file that opens with a known binary magic number may be skipped;
     # text that holds a NUL byte under a binary suffix is still text (PgBouncer %include takes any file name).
-    stale += ["%s: skip entry for a file with no binary magic number (%s): it is text and is read, never skipped" % (rel, unread[rel])
-              for rel in sorted(listed) if rel in unread and not unread[rel].startswith(MAGIC_REASON)]
+    # #5552: a magic number alone proves nothing either (several are printable): a file whose raw bytes hold a
+    # pool-mode mention is refused whatever its first bytes are.
+    stale += ["%s: skip entry refused: %s" % (rel, skip_problem(unread[rel]))
+              for rel in sorted(listed) if rel in unread and skip_problem(unread[rel])]
     problems = errors + ["files the gate cannot read as text and that %s does not name with a reason: %s"
                          % (UNREAD_REL, "; ".join(missing[:5]))] * bool(missing) + stale
     if problems:
@@ -1041,6 +1093,8 @@ GREEN: List[Tuple[str, str, str]] = [
     ("R1 #5480: two underscore emphasis on the session value is stripped", "docs/a.md", "pool_mode = __session__\n"),
     ("R1 #5480: three underscore emphasis on the session value is stripped", "docs/a.md", "pool_mode = ___session___\n"),
     ("R1 #5480: four underscore emphasis on the session value is stripped", "docs/a.md", "pool_mode = ____session____\n"),
+    ("R1 #5555: five underscore emphasis on the session value is stripped", "docs/a.md", "pool_mode = _____session_____\n"),
+    ("R1 #5555: eight underscore emphasis on the session value is stripped", "docs/a.md", "pool_mode = ________session________\n"),
     ("A1 ini assignment", "docs/a.md", "pool_mode = session\n"),
     ("A1 yaml assignment", "deploy/pgb.yaml", "pool_mode: session\n"),
     ("A1 env assignment", "deploy/.env", "PGBOUNCER_POOL_MODE=session\n"),
@@ -1097,6 +1151,14 @@ def entry_case(label: str, line: str, ok: bool = False) -> Tuple[str, Dict[str, 
     """An allowlist entry for `line` in a shell script: refused (rc 2) when it sets the mode, accepted when it only quotes it."""
     rel = "infra/x/setup.sh"
     return (label, tree({rel: line + "\n"}, REASON + ent(rel, line + "\n", normalise(line))), EXIT_OK if ok else EXIT_FAULT)
+
+
+def skip_tree(rel: str, body: bytes) -> Dict[str, object]:
+    """A tree whose one tracked file `rel` is named in the skip list with a reason."""
+    return tree({rel: body}, unread=UNREAD_REASON + rel + "\n")
+
+
+MENTION = b"pool_mode = transaction\n"  # a claim that must never hide in a skipped file (#5552)
 
 
 def run_quiet(root: Path) -> int:
@@ -1261,7 +1323,8 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
                            "old a x b transaction mode is not supported.")), EXIT_OK),
         # #5477: shapes that set the mode and were not refused (round-7 review, F3)
         entry_case("an entry with kubectl set env is refused", "kubectl set env deploy/pgbouncer pool_mode=transaction"),
-        entry_case("an entry with oc set env and four arguments is refused", "oc set env dc/pgbouncer -c pgbouncer pool_mode=transaction"),
+        entry_case("an entry with oc set env and three arguments is refused", "oc set env dc/pgbouncer -c pgbouncer pool_mode=transaction"),
+        entry_case("an entry with env and exactly four arguments is refused (#5554)", "oc env dc/pgbouncer -c pgbouncer -n pool_mode=transaction"),
         entry_case("an entry with an env prefix on a script is refused", "POOL_MODE=transaction ./entrypoint.sh"),
         entry_case("an entry with an env prefix on a parent path is refused", "pool_mode=statement ../run.sh"),
         entry_case("an entry with an env prefix on an absolute path is refused", "pool_mode=transaction /usr/bin/pgbouncer pgbouncer.ini"),
@@ -1335,6 +1398,40 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
          tree({"infra/pgbouncer/override.bin": b"pool_mode = transaction\n\0\n"}), EXIT_FAULT),
         ("a .bin file that opens with a binary magic number may be skipped (#5478)",
          tree({"assets/blob.bin": b"\x7fELF\x02\x01\x01\0zzz"}, unread=UNREAD_REASON + "assets/blob.bin\n"), EXIT_OK),
+        # #5552 (#5552): a printable magic number is not proof of binary content; a skipped file must hold no mention at all
+        ("GIF8 and a NUL byte over a mention cannot be skipped (#5552)", skip_tree("infra/pgbouncer/override.bin", b"GIF8 = 1\n" + MENTION + b"\0"), EXIT_FAULT),
+        ("%PDF and a NUL byte over a mention cannot be skipped (#5552)", skip_tree("infra/pgbouncer/override.bin", b"%PDF\n" + MENTION + b"\0"), EXIT_FAULT),
+        ("BZh and a NUL byte over a mention cannot be skipped (#5552)", skip_tree("infra/pgbouncer/override.bin", b"BZh\n" + MENTION + b"\0"), EXIT_FAULT),
+        ("Rar! and a NUL byte over a mention cannot be skipped (#5552)", skip_tree("infra/pgbouncer/override.bin", b"Rar!\n" + MENTION + b"\0"), EXIT_FAULT),
+        ("wOFF and a NUL byte over a mention cannot be skipped (#5552)", skip_tree("infra/pgbouncer/override.bin", b"wOFF\n" + MENTION + b"\0"), EXIT_FAULT),
+        ("OTTO and a NUL byte over a mention cannot be skipped (#5552)", skip_tree("infra/pgbouncer/override.bin", b"OTTO\n" + MENTION + b"\0"), EXIT_FAULT),
+        ("SQLite format 3 over a mention cannot be skipped (#5552)", skip_tree("docs/notes.db", b"SQLite format 3\0\n" + MENTION), EXIT_FAULT),
+        ("UTF-16 text with a BOM under a binary suffix is read, not skipped (#5552)",
+         skip_tree("infra/pgbouncer/override.bin", b"\xff\xfe" + MENTION.decode("ascii").encode("utf-16-le")), EXIT_FAULT),
+        ("a mention cut by a NUL byte cannot be skipped (#5552)", skip_tree("infra/pgbouncer/override.bin", b"GIF8\npool_\0mode = transaction\n"), EXIT_FAULT),
+        ("a word cut in two by a NUL byte cannot be skipped (#5552)", skip_tree("infra/pgbouncer/override.bin", b"GIF8\npo\0ol_mode = session\n"), EXIT_FAULT),
+        ("a mention that only exists with each NUL byte read as a line break cannot be skipped (#5552)",
+         skip_tree("docs/z.bin", b"GIF8\npgbouncer statement\0x\n"), EXIT_FAULT),
+        ("a product and a mode word split by a NUL byte cannot be skipped (#5552)",
+         skip_tree("docs/z.bin", b"GIF8\npgbouncer\0session\n"), EXIT_FAULT),
+        ("a NUL-only file with no mention cannot be skipped (#5478)", skip_tree("assets/blob.bin", b"hello\n\0\n"), EXIT_FAULT),
+        ("a mention after 1 MiB of padding cannot be skipped (#5552)",
+         skip_tree("infra/pgbouncer/override.bin", b"GIF89a\0" + b"\0" * (1 << 20) + MENTION), EXIT_FAULT),
+        ("a mention in CRLF lines cannot be skipped (#5552)", skip_tree("infra/pgbouncer/override.bin", b"GIF8\r\n" + MENTION[:-1] + b"\r\n\0"), EXIT_FAULT),
+        ("a gzip magic number followed by plain text cannot be skipped (#5552)", skip_tree("docs/z.gz", b"\x1f\x8b" + MENTION), EXIT_FAULT),
+        ("a prose mention behind a magic number cannot be skipped (#5552)",
+         skip_tree("docs/z.bin", b"%PDF\nRun PgBouncer in transaction mode.\n\0"), EXIT_FAULT),
+        ("a mention wrapped across two lines cannot be skipped (#5552)", skip_tree("docs/z.bin", b"GIF8\nuse pool\nmode here\n\0"), EXIT_FAULT),
+        ("an upper-case mention cannot be skipped (#5552)", skip_tree("docs/z.bin", b"GIF8\nPOOL_MODE = TRANSACTION\n\0"), EXIT_FAULT),
+        ("a mention that straddles a read chunk boundary cannot be skipped (#5552)",
+         skip_tree("docs/z.bin", b"GIF8\0" + b"x" * (CHUNK_BYTES - 12) + b"pool_mo" + b"de = session\n"), EXIT_FAULT),
+        ("a mention that straddles a raw segment cut cannot be skipped (#5552)",
+         skip_tree("docs/z.bin", b"GIF8\0" + b"x" * (RAW_LINE_CAP - 7) + b"pool_mo" + b"de = session\n"), EXIT_FAULT),
+        ("an unlisted GIF8 file with a NUL byte over a mention is a fault (#5552)",
+         tree({"infra/pgbouncer/override.bin": b"GIF8\n" + MENTION + b"\0"}), EXIT_FAULT),
+        ("an empty file under a binary suffix cannot be skipped (#5552)", skip_tree("infra/pgbouncer/override.bin", b""), EXIT_FAULT),
+        ("a real GIF with no mention may be skipped (#5552)", skip_tree("docs/logo.gif", b"GIF89a\x01\0\x01\0\x80\0\0"), EXIT_OK),
+        ("a real PDF with binary bytes and no mention may be skipped (#5552)", skip_tree("docs/l.pdf", b"%PDF-1.6\n\x93\xff\0\0endobj\n"), EXIT_OK),
         ("a skip entry does not hide another unreadable file",
          tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz", "docs/y.bin": b"\0\0\0"}, unread=UNREAD_REASON + "docs/z.md.gz\n"), EXIT_FAULT),
         ("a file past the old 4 MiB cap, many windows, is scanned to its end",
@@ -1441,9 +1538,54 @@ def binary_suffix_failures() -> int:
     return bad
 
 
+# #5555: each rule below was shown unpinned by a surviving mutant (round-8 review). forbidden_entry is judged directly,
+# so a rule is pinned even where normalise() (one space, lower case) would hide the difference from an allowlist case.
+FORBIDDEN_PINS = (
+    ("N01 env with four arguments", "oc env dc/pgbouncer -c pgbouncer -n pool_mode=transaction", True),
+    ("N02 a prefixed key before a command", "pgb_pool_mode=transaction ./run.sh", True),
+    ("N03 a dotted key in a flow mapping", '{ "pgbouncer.pool_mode": transaction }', True),
+    ("N03 a bare dotted key in a flow mapping", "{ pgbouncer.pool_mode: transaction }", True),
+    ("N04 a writer after a semicolon", "true;echo pool_mode=transaction >> p.ini", True),
+    ("N04 a writer after an ampersand", "true&echo pool_mode=transaction >> p.ini", True),
+    ("N04 a writer after a pipe", "true|tee pool_mode=transaction", True),
+    ("N05 the dash spelling with a writer", "echo pool-mode=transaction >> p.ini", True),
+    ("N06 a quoted key in a flow mapping", 'environment: { "pool_mode": transaction }', True),
+    ("N10 two spaces before the command", "pool_mode=transaction  ./entrypoint.sh", True),
+    ("N10 a tab before the command", "pool_mode=transaction\t./entrypoint.sh", True),
+    ("a quoted sentence stays allowed", "withdrawn: pool_mode=transaction / was required", False),
+)
+SKIP_PINS = (
+    ("a magic reason with a magic number is excused", MAGIC_REASON + " (magic number 1f8b0800)", False),
+    ("N09 a reason that only starts like the magic reason is not excused", "binary other", True),
+    ("a NUL reason is not excused", "NUL bytes in a file that is not UTF-16/32 text", True),
+    ("a raw mention is not excused", MAGIC_REASON + " (magic number 47494638); " + RAW_MENTION_MARK + " (line 2)", True),
+)
+
+
+def pin_failures() -> int:
+    """Direct pins: forbidden_entry (N01-N06, N10), skip_problem (N09), a symlink under a skip path (#5552)."""
+    bad = 0
+    for label, text, want in FORBIDDEN_PINS:
+        if forbidden_entry(normalise(text) if want is False else text) is not want:
+            bad += 1
+            print("self-test FAIL pin %s: forbidden_entry(%r) is not %s" % (label, text, want))
+    for label, reason, want in SKIP_PINS:
+        if (skip_problem(reason) is not None) is not want:
+            bad += 1
+            print("self-test FAIL pin %s: skip_problem(%r)" % (label, reason))
+    with tempfile.TemporaryDirectory(dir=_scratch_base()) as tmp:
+        root = Path(tmp)
+        write_tree(root, tree({"infra/real.md": "Plain text.\n"}, unread=UNREAD_REASON + "infra/link.bin\n"))
+        (root / "infra" / "link.bin").symlink_to("real.md")
+        if run_quiet(root) != EXIT_FAULT:  # a symlink is never read, so a skip entry for it is stale
+            bad += 1
+            print("self-test FAIL pin a symlink under a skip path is accepted (#5552)")
+    return bad
+
+
 def run_cases(verbose: bool) -> int:
     scratch_base = _scratch_base()
-    failures = stream_failures() + binary_suffix_failures()
+    failures = stream_failures() + binary_suffix_failures() + pin_failures()
     for name, files, want in cases():
         with tempfile.TemporaryDirectory(dir=scratch_base) as tmp:
             root = Path(tmp)
@@ -1485,7 +1627,31 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("F1 skip entry needs a reason", "        problem = reason_problem(reason or \"\")\n        if not problem and Path(line).suffix", "        problem = None\n        if not problem and Path(line).suffix"),
     ("F1 binary magic numbers", "        if chunk.startswith(BINARY_MAGIC) and not _plain_text(chunk):", "        if False:"),
     ("F1 magic number on plain text is text", "        if chunk.startswith(BINARY_MAGIC) and not _plain_text(chunk):", "        if chunk.startswith(BINARY_MAGIC):"),
-    ("F4 a skip entry needs a binary magic number (#5478)", "if rel in unread and not unread[rel].startswith(MAGIC_REASON)]", "if rel in unread and False]"),
+    ("F4 a skip entry needs a binary magic number and no raw mention (#5478, #5552)", "if rel in unread and skip_problem(unread[rel])]", "if rel in unread and False]"),
+    # #5552: the raw-byte rule (twelve mutants over its lines)
+    ("F1 #5552 a raw mention refuses the skip", "    if RAW_MENTION_MARK in reason:", "    if False:"),
+    ("F1 #5552 a missing magic number refuses the skip", "    if not reason.startswith(MAGIC_REASON):\n        return \"it has", "    if False:\n        return \"it has"),
+    ("F1 #5552 the mention is recorded in the reason", '("" if line is None else "; %s (line %d)" % (RAW_MENTION_MARK, line))', '""'),
+    ("F1 #5552 the raw mention is looked for", "            line = raw_mention(path)", "            line = None"),
+    ("F1 #5552 the NUL-as-break view", "    for drop_nul in (False, True):", "    for drop_nul in (True,):"),
+    ("F1 #5552 the NUL-removed view", "    for drop_nul in (False, True):", "    for drop_nul in (False,):"),
+    ("F1 #5552 a NUL ends a raw line", 'chunk.replace(b"\\0", b"\\n"))', "chunk)"),
+    ("F1 #5552 a NUL is removed in its view", 'data = carry + (chunk.replace(b"\\0", b"") if drop_nul else', "data = carry + (chunk if drop_nul else"),
+    ("F1 #5552 an overlong raw line overlaps its segments", "carry = carry[RAW_LINE_CAP - RAW_OVERLAP:]", "carry = carry[RAW_LINE_CAP:]"),
+    ("F1 #5552 a raw line is carried across a chunk", 'carry = parts.pop() if chunk and parts else b""', 'carry = b""'),
+    ("F1 #5552 a mention wrapped over two raw lines", ' or (before and mentions(before + " " + text))', ""),
+    ("F1 #5552 a raw line is normalised", "            text = normalise(raw)\n", "            text = raw\n"),
+    # #5554, #5555: rules shown unpinned by mutants N01-N12 (round-8 review)
+    ("N01 #5554 set-env reach of four arguments", "[^\\s=\\\"']+){0,4}?", "[^\\s=\\\"']+){0,3}?"),
+    ("N02 #5555 a prefixed key before a command", 're.compile(r"^[a-z0-9_]*pool[_-]?mode=', 're.compile(r"^pool[_-]?mode='),
+    ("N04 #5555 a writer after ; & or |", "(?:^|[\\s;&|])(?:sed|awk", "(?:^|\\s)(?:sed|awk"),
+    ("N05 #5555 the dash spelling with a writer", "\\b.*pool[_-]?mode\\s*[=:]", "\\b.*pool_mode\\s*[=:]"),
+    ("N06 #5555 the closing quote of a flow mapping key", 'pool[_-]?mode[\\"\']?\\s*[:=]', 'pool[_-]?mode\\s*[:=]'),
+    ("N07 #5555 five or more underscores of emphasis", "_EMPHASIS = re.compile(r\"(?<![^\\W_])(_+)", "_EMPHASIS = re.compile(r\"(?<![^\\W_])(_{1,4})"),
+    ("N09 #5555 the magic reason is matched whole", "if not reason.startswith(MAGIC_REASON):", "if not reason.startswith(MAGIC_REASON[:6]):"),
+    ("N10 #5555 any whitespace before the command", '[\\"\']?\\s+(?:\\.{1,2}/', '[\\"\']?\\s(?:\\.{1,2}/'),
+    ("N11 #5555 set is a set-env verb", "(?:export|env|set|-e|", "(?:export|env|-e|"),
+    ("N12 #5555 GIF8 is a binary magic number", 'b"SQLite format 3\\0", b"GIF8", b"wOFF"', 'b"SQLite format 3\\0", b"wOFF"'),
     ("F4 the skip reason names the magic number (#5478)", 'raise Unreadable("%s (magic number %s)" % (MAGIC_REASON, chunk[:4].hex()))', 'raise Unreadable("%s (magic number %s)" % ("", chunk[:4].hex()))'),
     ("F4 a NUL-only file is not binary content (#5478)", 'raise Unreadable("NUL bytes in a file that is not UTF-16/32 text")', 'raise Unreadable("%s NUL bytes in a file that is not UTF-16/32 text" % MAGIC_REASON)'),
     ("F6 #5480 M3 stroked Latin letters fold to their base letter", '(?: WITH [A-Z ]+)?$")', '$")'),
@@ -1560,11 +1726,11 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ('A1 command write with tee (#5477)', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
     ('A1 command write with crudini (#5477)', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
     ('A1 command write with yq (#5477)', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini|yq)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"(?:^|[\\s;&|])(?:sed|awk|perl|echo|printf|tee|crudini)\\b.*pool[_-]?mode\\s*[=:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
-    ('A1 flow mapping opens on a brace (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\[[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
-    ('A1 flow mapping holds other keys before the key (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\{[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
-    ('A1 flow mapping with an equals sign (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
-    ('A1 flow mapping with a colon (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[=]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
-    ('A1 flow mapping statement (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\{[^{}]*?[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction)\\b"),'),
+    ('A1 flow mapping opens on a brace (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\[[^{}]*?[\\"\']?pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 flow mapping holds other keys before the key (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\{[\\"\']?pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 flow mapping with an equals sign (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\{[^{}]*?[\\"\']?pool[_-]?mode[\\"\']?\\s*[:]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 flow mapping with a colon (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\{[^{}]*?[\\"\']?pool[_-]?mode[\\"\']?\\s*[=]\\s*[\\"\']?(?:transaction|statement)\\b"),'),
+    ('A1 flow mapping statement (#5477)', 're.compile(r"\\{[^{}]*?[\\"\']?pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction|statement)\\b"),', 're.compile(r"\\{[^{}]*?[\\"\']?pool[_-]?mode[\\"\']?\\s*[:=]\\s*[\\"\']?(?:transaction)\\b"),'),
     ("A1 forbidden shapes read the shadow view (#5366)", "    views = (text, shadow(text))\n", "    views = (text,)\n"),
     ("A1 filler reasons", "    if FILLER.search(reason.casefold()) or", "    if False and"),
     ("R3 path tokens", "    text = TOOL_PATH.sub(_path_words, text)\n", ""),
