@@ -935,6 +935,30 @@ MDEOF
     anchor_green 5532 "a dyn self type with two live traits" \
         "See \`$R::<dyn RecallTool + RecallTool>::decorate_memory_many\`."
 
+    # #5535: a self type group with nothing after it (no method) is still a
+    # self type: its type is checked, and one that names no type is refused.
+    anchor_red_cites 5535 QUAL "a lone pointer self type whose type is missing" \
+        "$R::NoSuch" \
+        "See \`$R::<*const NoSuch>\`."
+    anchor_red_cites 5535 QUAL "a lone as-cast self type with a missing type" \
+        "$R::NoSuch" \
+        "See \`$R::<NoSuch as RecallTool>\`."
+    anchor_red_cites 5535 QUAL "a lone dyn self type with a missing bound after the live trait" \
+        "$R::NoSuch" \
+        "See \`$R::<dyn RecallTool + NoSuch>\`."
+    anchor_red 5535 QUAL "a lone tuple self type is refused" \
+        "See \`$R::<(A, B)>\`."
+    anchor_red 5535 QUAL "a lone slice self type is refused" \
+        "See \`$R::<[u8]>\`."
+    anchor_red 5535 QUAL "a lone lifetime self type is refused" \
+        "See \`$R::<'a>\`."
+    anchor_green 5535 "a lone self type that is a live type" \
+        "See \`$R::<RecallTool>\`."
+    anchor_green 5535 "a lone pointer self type with a live type" \
+        "See \`$R::<*const RecallTool>\`."
+    anchor_green 5535 "a lone dyn self type with a live trait" \
+        "See \`$R::<dyn RecallTool>\`."
+
     # #5497: the header, ABSENT_DEST and the CLAUDE.md gate paragraph state the
     # same destination wording and the same never-exempt cases.
     for wording in "split into" "split up into" "split across" "split out" "renamed to" "a link or a fragment"; do
@@ -1732,7 +1756,9 @@ def scan_sym(text, i, outer=0):
         if _stray_close(text, end, outer):
             return _token_end(text, end)
         if not text.startswith("::", end):
-            return None
+            # #5535: a lone balanced group is a self type with no method: the
+            # caller checks (or refuses) it, it is never silently dropped.
+            return end
         pos = end + 2
     m = ID_RE.match(text, pos)
     if not m:
@@ -1843,6 +1869,9 @@ AS_WORD = re.compile(r"\bas\b")
 SELF_PREFIX = re.compile(
     r"(?:&\s*(?:'[A-Za-z_]\w*\s+)?(?:mut\s+)?|\*\s*(?:const|mut)\s+|\b(?:dyn|impl|mut)\s+"
     r"|(?:'[A-Za-z_]\w*|\?\s*Sized\b)\s*\+\s*)+")
+# #5393/#5433 pin a lone `<name>` and `<name<T>>` (an identifier head, no
+# prefix, no `as`) as a placeholder, not a symbol claim; every other lone
+# group (a prefixed type, a tuple, a slice, a lifetime) is a self type (#5535).
 _LIFETIME_BOUND = re.compile(r"^'[A-Za-z_]\w*$")
 _SIZED_BOUND = re.compile(r"^\?\s*Sized$")
 _HRTB = re.compile(r"^for\s*<[^<>]*>\s*")
@@ -1915,7 +1944,8 @@ def unwrap_self_type(tok):
     m = ID_RE.match(head, pos)
     # #5433: with no `as`, `<Type<T>>::m` is still a qualified path whose
     # type is the claim; a placeholder with nothing behind it is not.
-    if AS_WORD.search(inner) or tok.startswith("::", end):
+    if AS_WORD.search(inner) or tok.startswith("::", end) or (
+            end == len(tok) and (pm is not None or m is None)):
         if m:
             toks = [m.group(0) + tok[end:]]
             if pm and re.search(r"\b(?:dyn|impl)\b|\+", pm.group(0)):
