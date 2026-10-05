@@ -80,10 +80,11 @@
 # reported when absence wording ("no longer exists", "formerly",
 # "monolithic", "pre-split", "was split from", "removed in", ...) is on its
 # line or the line above or below, because such a line says the file is
-# gone. A qualified `path::symbol` anchor and a link target are never
-# exempt (#5201, #5250). Wording that names a DESTINATION ("split into",
-# "split out", "renamed to", an arrow before a `src/` path) exempts only an
-# anchor BEFORE it on the same line (#5264, #5341, #5344).
+# gone. A qualified `path::symbol` anchor, a link or a fragment is never
+# exempt (#5201, #5250). Wording that names a DESTINATION ("split
+# into", "split up into", "split across", "split out", "renamed to", an arrow
+# before a `src/` path) exempts only an anchor BEFORE it on the same line
+# (#5264, #5341, #5344).
 #
 # WHAT IS DELIBERATELY *NOT* A RULE. A bare backticked identifier
 # sharing a line with a `src/` path is NOT checked. Measured against
@@ -831,6 +832,24 @@ MDEOF
         "See a <= b and $R::RecallTool<T>> here."
     anchor_green 5498 "a live generic anchor inside a prose generic after a comparison" \
         "If a < b then see Vec<$R::RecallTool<T>> here."
+
+    # #5497: the header, ABSENT_DEST and the CLAUDE.md gate paragraph state the
+    # same destination wording and the same never-exempt cases.
+    for wording in "split into" "split up into" "split across" "split out" "renamed to" "a link or a fragment"; do
+        python3 - "$SELF" "$ROOT/CLAUDE.md" "$wording" <<'PYEOF' || { echo "FAIL: self-test #5497 — \"$wording\" is missing from the header, ABSENT_DEST or CLAUDE.md" >&2; exit 1; }
+import re, sys
+self_path, claude_path, wording = sys.argv[1:4]
+src = open(self_path, encoding="utf-8").read()
+header = re.sub(r"\s+", " ", re.sub(r"(?m)^#", "", src.split("\nset -", 1)[0]))
+dest = re.search(r"^ABSENT_DEST = re\.compile\(\n(.*?)re\.IGNORECASE\)", src, re.S | re.M)
+claude = re.sub(r"\s+", " ", open(claude_path, encoding="utf-8").read())
+ok = ('"%s"' % wording in header or wording in header) and wording in claude
+if wording != "a link or a fragment":
+    ok = ok and bool(dest) and all(w in dest.group(1) for w in wording.split())
+sys.exit(0 if ok else 1)
+PYEOF
+        echo "PASS: self-test #5497 — the header and CLAUDE.md name \"$wording\""
+    done
 
     # #5460: the type of an as group inside a brace item is a claim.
     anchor_red_cites 5460 QUAL "an as group with a missing type inside a brace item" \
