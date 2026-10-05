@@ -1172,6 +1172,61 @@ class StructuralPinCase(unittest.TestCase):
         for blocker in ("UF_IMMUTABLE", "FS_IMMUTABLE_FL", "UF_APPEND", "FS_APPEND_FL"):
             self.assertIn(blocker, blocking, "BLOCKING must notice %s" % blocker)
 
+    def test_no_claim_site_asserts_containment_the_code_does_not_deliver_6007(self):
+        """#6007 - the docstring claims are checked against the AST, not read.
+
+        A widen the module docstring does not account for is how the
+        "one mutation ... see `Widener`" claim came to be false while three
+        byte-identical copies of it shipped."""
+        doc = ast.get_docstring(self.tree)
+        self.assertTrue(doc, "the module docstring is itself a claim site")
+        classes = [node.name for node in self.tree.body if isinstance(node, ast.ClassDef)]
+        parent = {}
+        for node in ast.walk(self.tree):
+            for child in ast.iter_child_nodes(node):
+                parent[child] = node
+        performers = {}
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name not in ("chmod", "fchmod"):
+                continue
+            if not any(isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.BitOr)
+                       for arg in node.args):
+                continue
+            performer = None
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) \
+                    and func.value.id != "os":
+                for known in classes:
+                    if known.lower() == func.value.id.lower():
+                        performer = known
+            if performer is None:
+                walker = node
+                while walker in parent:
+                    walker = parent[walker]
+                    if isinstance(walker, ast.ClassDef):
+                        performer = walker.name
+                        break
+            performers.setdefault(performer, []).append(ast.unparse(node))
+        self.assertGreaterEqual(len(performers), 2,
+                                "a detector that finds no widen pins nothing: %r" % performers)
+        self.assertIn("Widener", performers, "the mode-blocked widen must go through `Widener`")
+        for performer, calls in sorted(performers.items()):
+            self.assertIsNotNone(performer, "a widen outside any class: %r" % calls)
+            self.assertIn("`%s`" % performer, doc,
+                          "`%s` widens a mode (%s) and the module docstring does not name it, so "
+                          "the docstring accounts for fewer widens than the code performs"
+                          % (performer, "; ".join(calls)))
+        claims = [para for para in doc.split("\n\n") if "nothing this walk widened" in para]
+        self.assertTrue(claims, "the restore claim is load-bearing and must stay stated")
+        for claim in claims:
+            self.assertIn("REFUSED", claim,
+                          "a restore the kernel refuses leaves the mode applied on BOTH "
+                          "platforms, so an unqualified claim here is false (#6002): %r" % claim)
+            self.assertIn("#6002", claim, "the refused-restore case has an issue to point at")
+
     def test_platform_errnos_are_named_not_numbered_5657(self):
         """95 is ENOTSUP on Linux and EMULTIHOP on macOS (#5747 SEC-F5)."""
         src = SCRIPT.read_text()

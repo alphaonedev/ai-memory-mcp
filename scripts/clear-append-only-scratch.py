@@ -35,7 +35,17 @@ every flag clear happens on that descriptor.
 
 Widening a mode is the one mutation the walk performs on an entry it has not
 proven anything about yet (see `Widener`, #5813), so it is made as narrow as the
-platform allows. What that buys differs by platform, and the difference matters:
+platform allows. There are two widens in this file and no others, and only the
+first is on an entry nothing is known about yet:
+
+* `Widener`'s, reached when a mode hides the inode flags. It is bracketed by an
+  identity check, and what that is worth is the platform difference below.
+* `Search`'s, on a directory this walk already holds open and has already proven
+  to be the inode that was scanned. It adds `S_IXUSR` alone, through the held
+  descriptor, for ONE lookup by name, and it is written down before it happens
+  so a kill cannot leave it unaccounted for (#5995, #6006).
+
+What `Widener`'s widen buys differs by platform, and the difference matters:
 
 * Linux (`O_PATH`). The entry is pinned with `O_PATH|O_NOFOLLOW` - which
   succeeds whatever the mode is - and the pinned inode is compared with the
@@ -66,11 +76,16 @@ platform allows. What that buys differs by platform, and the difference matters:
 * Neither mechanism. `Widener` refuses with EPERM rather than widen through a
   name it would have to re-resolve unprotected.
 
-Every exit from the widen puts the widened mode back - a reopen that raised, an
-inode that turns out to have been swapped, and the ordinary success. What that
-is worth, again, differs by platform. Where the inode is pinned, the restore
-addresses the INODE that was scanned, so nothing this walk widened is left
-widened (#5812). Where it is not, the restore after a SUCCESSFUL reopen goes
+Every exit from the widen ATTEMPTS to put the widened mode back - a reopen that
+raised, an inode that turns out to have been swapped, and the ordinary success -
+and what the attempt is worth differs by platform AND by whether the kernel
+takes it. Where the inode is pinned, the attempt addresses the INODE that was
+scanned, so a restore that is accepted leaves nothing this walk widened still
+widened (#5812); a restore that is REFUSED leaves the mode applied on either
+platform, and is reported with the path, the mode that is applied and the mode
+the walk found, which reds the leg - never swallowed (#6002).
+
+Where the inode is NOT pinned, the restore after a SUCCESSFUL reopen goes
 through the descriptor that was proven to be the scanned inode - so the common
 path is inode-bound on both platforms - but on the failure exits the name is all
 there is, and if the name was taken away inside the bracket around the widening
@@ -585,10 +600,14 @@ class Cleaner:
         during the caller's descent finds no widened mode to leave behind
         (#6006).
 
-        Every widen here goes through `Widener` and is undone before EVERY exit
-        from this frame, by the same route it took. What that is worth depends
-        on the platform (module docstring, #5852): where the inode can be
-        pinned, the widen and its undo both address the INODE that was scanned,
+        Every widen in this frame goes through `Widener` and is undone before
+        EVERY exit from this frame, by the same route it took. The only other
+        widen in the file is `Search`'s, which this frame never performs: it is
+        taken on a directory already proven and already held, by the caller.
+
+        What `Widener`'s widen is worth depends on the platform (module
+        docstring, #5852): where the inode can be pinned, the widen and its
+        undo both address the INODE that was scanned,
         and an entry swapped underneath the walk is refused by `Widener` with
         nothing mutated at all; where it cannot, both address the NAME, so a
         swap between the scan and the widen means some other inode is widened
