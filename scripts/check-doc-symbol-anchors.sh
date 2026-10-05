@@ -1688,6 +1688,14 @@ PYEOF
         "$R::r#no_such" "See \`$R::RecallTool::r#no_such\`."
     anchor_red_cites 5778 UNMODELLED "a raw identifier Rust rejects" \
         "$R::r#crate::RecallTool" "See \`$R::r#crate::RecallTool\`."
+    anchor_red_cites 5778 UNMODELLED "the raw identifier r#self, which Rust rejects" \
+        "$R::r#self::RecallTool" "See \`$R::r#self::RecallTool\`."
+    anchor_red_cites 5778 UNMODELLED "the raw identifier r#super, which Rust rejects" \
+        "$R::r#super::RecallTool" "See \`$R::r#super::RecallTool\`."
+    anchor_red_cites 5778 UNMODELLED "the raw identifier r#Self, which Rust rejects" \
+        "$R::r#Self::RecallTool" "See \`$R::r#Self::RecallTool\`."
+    anchor_red_cites 5778 UNMODELLED "the raw identifier r#_, which Rust rejects" \
+        "$R::r#_::RecallTool" "See \`$R::r#_::RecallTool\`."
     anchor_red_cites 5778 MDLINK "a raw link label that does not resolve" \
         "$R::r#no_such" "See [\`r#no_such\`]($R)."
     anchor_green 5778 "a raw link label that resolves" "See [\`r#match\`](src/store/raw.rs)."
