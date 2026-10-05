@@ -394,8 +394,8 @@ lab_shell_state_proven() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 277 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 271
+# 283 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 277
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), eight probe-matcher legs (lab_probe_refusal_names_knob against generated logs, each
 # checking the exact child status: 10, 11, or 4 for an unreadable log, #5662), three structural legs (the matcher body
@@ -419,14 +419,16 @@ lab_shell_state_proven() {
 # run.sh pin and four run.sh branch legs (#5664: run.sh's own probe-verdict lines run with stub ok and no reach ok,
 # not-detected, and refused for a missing awk and a shadowed exec), a run.sh pin leg (run.sh turns on no trace route,
 # #5663), a probe-region pin, eleven probe-block legs and an attribute pin (#5739: run.sh's own probe region, run at top
-# level with stand-in state, fails the run whenever a verdict could not be written), fifty-one start-state legs (#5740, #5741, #5744:
+# level with stand-in state, fails the run whenever a verdict could not be written), fifty-seven start-state legs (#5740, #5741, #5744:
 # run.sh --help from a clean environment: three controls (clean, an ignored SIGHUP, bash -p), refused for the F2 BASH_ENV
 # DEBUG trap, POSIXLY_CORRECT, a self-unsetting BASH_ENV that leaves a DEBUG, RETURN, ERR or EXIT trap, a readonly,
 # integer or nameref variable, an alias, a function, IFS, a disabled builtin or a hashed path, an exported function named
 # source, ., command, builtin, declare, export, exec, printf, :, unset, trap, set, eval, echo, shopt or [ (bash -p, which
 # ignores one, starts), an exported CDPATH, GLOBIGNORE, EXECIGNORE, FUNCNEST, BASH_COMPAT, TMOUT or GLOBSORT, an ENV
-# file that is never run, IFS from the environment that never arrives, an exported SHELLOPTS or BASHOPTS, and bash -x, -e, -T and -E, and two stated-limit legs, noexec
-# and bash -t, that exit 0 with no output), sixteen port legs (#5745: a valid PORT_B, 65533 and 1 reach the next check;
+# file that is never run, IFS from the environment that never arrives, an exported SHELLOPTS or BASHOPTS, and bash -x, -e, -T and -E; five legs each refused
+# by exactly one check (a lone shell option, a lone alias with expansion off, a kept BASH_ENV that shadows builtin,
+# exported export and builtin functions together, and a call without the trap list); and three stated-limit legs, noexec,
+# bash -t and bash -n, that exit 0 with no output, #5756), sixteen port legs (#5745: a valid PORT_B, 65533 and 1 reach the next check;
 # 1/0, PORT_A+1, an array subscript, abc, -1, 0, a leading zero, 65534, 99999, 123456, a leading or trailing space and
 # PORT_A=abc exit 2 with the named line), four scratch legs (#5743: lab_scratch_dir gives an absolute directory with TMPDIR
 # unset, relative and absolute, set by the leg itself, and it is the only directory maker in this file), and one layout leg (this comment sits directly on the function).
@@ -917,6 +919,11 @@ lab_posture_selftest() {
   _start "a BASH_ENV that unsets itself and leaves a nameref is refused" refused 'unset BASH_ENV; declare -n LAB_PROBE_VERDICT=PATH' || bad=1
   _start "a BASH_ENV that unsets itself and leaves an alias is refused" refused 'unset BASH_ENV; shopt -s expand_aliases; alias ok=:' || bad=1
   _start "a BASH_ENV that unsets itself and leaves a function is refused" refused 'unset BASH_ENV; lab_probe_report() { :; }' || bad=1
+  # Round-6 mutation legs: each start state below is refused by exactly one check, so dropping that check fails a leg.
+  _start "a BASH_ENV that unsets itself and leaves only a shell option on is refused" refused 'unset BASH_ENV; shopt -s extglob' || bad=1
+  _start "a BASH_ENV that unsets itself and leaves only an alias, alias expansion off, is refused" refused 'unset BASH_ENV; alias ok=:' || bad=1
+  _start "a BASH_ENV kept set that shadows builtin and leaves a DEBUG trap is refused by the BASH_ENV check (#5740)" refused 'trap ": planted" DEBUG; builtin() { case $1 in declare|trap) return 0;; esac; command "$@"; }' || bad=1
+  _start "exported functions named export and builtin together are refused in posix mode (#5741)" refused - 'BASH_FUNC_export%%=() { :; }' 'BASH_FUNC_builtin%%=() { :; }' || bad=1
   _start "a BASH_ENV that unsets itself and leaves IFS changed is refused" refused 'unset BASH_ENV; IFS=:' || bad=1
   _start "a BASH_ENV that unsets itself and leaves a disabled builtin is refused" refused 'unset BASH_ENV; enable -n echo' || bad=1
   _start "a BASH_ENV that unsets itself and leaves a hashed path is refused" refused 'unset BASH_ENV; hash -p /bin/true awk' || bad=1
@@ -925,6 +932,10 @@ lab_posture_selftest() {
   for k in -x -e -T -E; do _start "bash $k is refused" refused - "$k" || bad=1; done
   _start "an exported SHELLOPTS=noexec runs nothing" silent - SHELLOPTS=noexec || bad=1
   _start "bash -t runs one command" silent - -t || bad=1
+  _start "bash -n runs nothing" silent - -n || bad=1
+  if ( lab_shell_state_proven; [[ $? != 0 && $LAB_SHELL_WHY == *'the trap list was not passed'* ]] ); then
+    echo "  PASS start state: the shell-state check refuses a call without the trap list"
+  else echo "  FAIL start state: the shell-state check accepted a call without the trap list"; bad=1; fi
   # #5745: a port must be a plain decimal from 1 to 65533 before it reaches arithmetic; run.sh exits 2 with a named line.
   # The control reaches the next check (the --probe-mutation and --no-caveat-probe combination), so no lab starts.
   _port() {  # <label> <VAR=value> <wanted text>
