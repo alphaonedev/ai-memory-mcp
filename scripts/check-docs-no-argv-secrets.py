@@ -2357,8 +2357,9 @@ def shape_operands(text: str, words: List[Word], array: bool) -> List[Word]:
         raw = text[words[k][0]:words[k][1]]
         if raw.startswith("#"):
             return []
+        # DOC_MARKERS holds the YAML list marker "-".
         if (ASSIGN_RE.match(raw) or raw in SKIPPED_KEYWORDS or raw == "time" or raw in DOC_MARKERS
-                or LIST_NUMBER_RE.fullmatch(raw) or raw.endswith(":") or raw == "-"):
+                or LIST_NUMBER_RE.fullmatch(raw) or raw.endswith(":")):
             k += 1
             continue
         break
@@ -4050,6 +4051,12 @@ def self_test() -> int:
     if len(cont_hit) != 1 or cont_hit[0][1] != 1 or " tool " not in " %s " % cont_hit[0][2]:
         print("SELF-TEST FAIL: a continued shape hit is not at its logical line: %r" % (cont_hit,),
               file=sys.stderr)
+        bad += 1
+    # #5725: a YAML list marker is not a program; the command after it is read as a command, so a
+    # runcmd entry of the echo builtin carries no argv (pins the "-" skip in shape_operands).
+    green += 1
+    if scan_text("probe.md", "```yaml\nruncmd:\n  - echo --password S3cr3tPass\n```\n"):
+        print("SELF-TEST FAIL: a YAML list item of the echo builtin was flagged", file=sys.stderr)
         bad += 1
     for name, text in R11_ARRAY_NESTED_UNKNOWN.items():
         for label, suffix, body in r9_variants(text):
