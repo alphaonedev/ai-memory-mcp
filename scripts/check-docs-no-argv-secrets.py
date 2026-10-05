@@ -221,7 +221,7 @@ PSQL_VAR_OPT_RE = re.compile(
 # a psql word spelled with backslashes or quotes (\psql, p\sql, ps''ql, "ps"ql) is
 # normalised to psql before BOTH psql rules run; a non-ASCII -v name is flagged
 # whatever it spells; a -v VALUE that expands a secret-named variable ($PGPASSWORD,
-# ${PG_PW}, $(cat<no space>pw)) is flagged under any name.
+# ${PG_PW}, $(cat<no space>pw), `cat<no space>pw`) is flagged under any name.
 # STATED LIMITS (a text gate cannot decide these; each is recorded in its issue):
 #   * options that reach psql through an array or another variable
 #     (args=(-v pw=$X); psql "${args[@]}") are not after the psql word and a text gate
@@ -926,7 +926,10 @@ def word_literal(pieces: List[WordPiece]) -> Optional[str]:
 def word_view(text: str, pieces: List[WordPiece]) -> str:
     """The word as the shell passes it where that is known: literals resolved, each
     undecidable expansion kept as written."""
-    return "".join(str(v) if k == "l" else text[v[0]:v[1]] for k, v in pieces)  # type: ignore[index]
+    # An expansion is ONE word to the shell whatever spaces it holds, so its whitespace is
+    # masked (the -v operand rule reads an operand to its first space).
+    return "".join(str(v) if k == "l" else re.sub(r"\s", "\x01", text[v[0]:v[1]])  # type: ignore[index]
+                   for k, v in pieces)
 
 
 def glob_class_admits(raw: str, ch: str) -> bool:
@@ -1076,7 +1079,11 @@ def psql_var_operand_flagged(operand: str) -> bool:
         return True
     # #5483: a neutral name does not hide a value that expands a secret-named variable
     # ($PGPASSWORD, ${PG_PW}); the operand is one word, so the value is read to its first space.
-    if "$" in value and PSQL_SECRET_VAR_NAME_RE.search(value[value.index("$"):]):
+    # #5514: a backtick command substitution expands at run time exactly like $(...), so
+    # the value is read from the first $ or backtick (a plain pw$ROWS suffix is not scanned
+    # from its start, so x=pw$ROWS stays clean).
+    marks = [value.index(c) for c in "$`" if c in value]
+    if marks and PSQL_SECRET_VAR_NAME_RE.search(value[min(marks):]):
         return True
     return False
 
@@ -1510,6 +1517,11 @@ RED_PROBES_4600 = {
     "5512-17-undecidable-wrapper-head": 'run_ps$(printf q)l -f x.sql',
     "5512-18-undecidable-head-inside-string": 'bash -c "ps$(printf q)l -f x.sql"',
     "5512-19-split-head-inside-string": "ssh h 'p\\sql -v pw=\"$PG_PW\"'",
+    "5514-01-backtick-redirect-value": 'psql -v x=`<pw_file` -f x.sql',
+    "5514-02-backtick-cat-value": 'psql -v x=`cat<pw_file` -f x.sql',
+    "5514-03-backtick-after-prefix": 'psql -v x=a`cat /run/pgpassword` -f x.sql',
+    "5514-04-backtick-set-long": 'psql --set=x=`cat /run/pg_pw` -f x.sql',
+    "5514-05-backtick-in-quotes": 'psql -v "x=`cat /run/pg_pw`" -f x.sql',
     "5513-01-ansi-c-dash-v": "psql $'-v' pw=\"$PG_PW\"",
     "5513-02-ansi-c-hex-dash-v": "psql $'\\x2dv' pw=\"$PG_PW\"",
     "5513-03-ansi-c-octal-dash-v": "psql $'\\055v' pw=\"$PG_PW\"",
@@ -1590,6 +1602,9 @@ GREEN_PROBES_4600 = {
     "5448-psql-v-bare-name": "psql -v ON_ERROR_STOP -f x.sql",
     "5448-psql-v-value-holds-equals-and-pw": "psql -v role=pw=x -f x.sql",
     "5448-psql-v-substituted-value-only": 'psql -v role="$ROLE_NAME" -f x.sql',
+    "5514-neutral-backtick-value": 'psql -v x=`date +%s` -f x.sql',
+    "5514-secret-name-after-dollar-not-in-prefix": 'psql -v x=pw$ROWS -f x.sql',
+    "5514-secret-looking-prefix-before-backtick": 'psql -v x=pwd`date` -f x.sql',
     "5513-host-flag-then-expansion": 'psql -h"$HOST" -d "$DB" -f x.sql',
     "5513-dbname-expansion": 'psql -d "$DB" -f x.sql',
     "5513-long-host-expansion": 'psql --host="$HOST" --port=5432 -f x.sql',
@@ -1749,17 +1764,17 @@ def self_test() -> int:
         if got:
             print("SELF-TEST FAIL: green probe (#4600 set) %r was flagged: %r" % (name, got), file=sys.stderr)
             bad += 1
-    # The #5512 and #5513 word probes are file-type independent: the same spellings in a prose
+    # The #5512, #5513 and #5514 probes are file-type independent: the same spellings in a prose
     # file and a script are read by the same resolver.
     for suffix in ("probe.md", "probe.sh"):
         for name, text in RED_PROBES_4600.items():
-            if name.startswith(("5512-", "5513-")):
+            if name.startswith(("5512-", "5513-", "5514-")):
                 red += 1
                 if not scan_text(suffix, text):
                     print("SELF-TEST FAIL: red probe %r (%s) was not flagged" % (name, suffix), file=sys.stderr)
                     bad += 1
         for name, text in GREEN_PROBES_4600.items():
-            if name.startswith(("5512-", "5513-")):
+            if name.startswith(("5512-", "5513-", "5514-")):
                 green += 1
                 if scan_text(suffix, text):
                     print("SELF-TEST FAIL: green probe %r (%s) was flagged" % (name, suffix), file=sys.stderr)
