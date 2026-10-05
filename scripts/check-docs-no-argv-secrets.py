@@ -4510,6 +4510,12 @@ def self_test() -> int:
            for h in scan_text("probe.md", "```text\ntool --password S3cr3tPass\n```\n")):
         print("SELF-TEST FAIL: the shape rule read a fence that is not shell-like", file=sys.stderr)
         bad += 1
+    # #5842: an untagged fence is read as shell (MD_SHELL_FENCES holds "").
+    red += 1
+    if not any(h[2].startswith("[%s]" % SHAPE_TAG)
+               for h in scan_text("probe.md", "```\nmytool --api-key S3cr3tTok\n```\n")):
+        print("SELF-TEST FAIL: the shape rule did not read an untagged fence", file=sys.stderr)
+        bad += 1
     # #5725: a hit on a continued command is reported at its first line with the whole command,
     # so a PENDING needle and an allowlist key see the command word.
     red += 1
