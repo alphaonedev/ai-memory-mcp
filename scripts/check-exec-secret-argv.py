@@ -2096,6 +2096,7 @@ ROUND3_GREEN = [
     ('5690 mutant pin: clean 1: a command substitution that closes ends the command', 'v=$(mysql -N --foo=r) $X'),
     ('5694 mutant pin: clean 1: the target of a redirect is not an operand', 'mysql db < "$FILE"'),
     ('5694 mutant pin: clean 2: the target of a redirect is not an operand', 'mysqldump -u r db > "$OUT"'),
+    ("5695 mutant pin: clean 1: a literal value glued to -p is not this arm's concern", 'mysql -pSecret db'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
