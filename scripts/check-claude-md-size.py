@@ -568,8 +568,10 @@ def stale_citation_errors(root: Path) -> list:
                         f"FAIL: {path.relative_to(root)}:{line} links CLAUDE.md#{match.group(1)}, which moved to a "
                         "docs/reference file; cite the reference file (#4507 R4)")
             for match in CLAUDE_CITATION.finditer(text):
-                # #5181: the pattern ignores case, so the heading comparison does too.
-                if match.group(1).strip().casefold() in {sub.casefold() for sub in moved}:
+                # #5181: the pattern ignores case, so the heading comparison does too. #5574: the capture may keep a
+                # leading heading sigil and a line break, which the moved set never carries, so both are removed first.
+                cited = re.sub(r"\s*\n\s*", " ", match.group(1)).lstrip("#").strip()
+                if cited.casefold() in {sub.casefold() for sub in moved}:
                     line = text.count("\n", 0, match.start()) + 1
                     errors.append(
                         f"FAIL: {path.relative_to(root)}:{line} cites CLAUDE.md {match.group(1).strip()!r}, "
@@ -1297,6 +1299,10 @@ def run_citation_cases(fresh) -> bool:
             ("the word rule", 'See CLAUDE.md rule "{h}".', True),
             # #5181: CLAUDE_CITATION ignores case, so the heading comparison does too (probe P-G11).
             ("lower-case heading text", 'See CLAUDE.md "{h}".'.replace("{h}", heading.lower()), True),
+            # #5574: a retained heading sigil and a heading wrapped across a line break are the same citation.
+            ("heading text with a ### sigil", 'See CLAUDE.md "### {h}".', True),
+            ("heading text with a ## sigil", 'See CLAUDE.md "## {h}".', True),
+            ("heading text wrapped across a line break", 'See CLAUDE.md "{h}".'.replace("{h}", heading.replace(" ", "\n", 1)), True),
             ("upper-case anchor", "See CLAUDE.md#KEY-MODULES.", True),
             ("anchor of a heading with punctuation and an em dash",
              "See CLAUDE.md#config-schema-v07x-1146--sectioned-llm--embeddings--reranker--storage--limits.", True),
