@@ -193,6 +193,15 @@ ENV_ARGV_RE = re.compile(
 # continuation. Every option after the psql word is checked, not the first.
 # #5448: _ and - also precede psql (run_psql, my-psql: a wrapper still runs psql).
 PSQL_HEAD_RE = re.compile(r"(?:^|[\s;|&(`/\"'${_-])psql[A-Za-z0-9_]*\b", re.IGNORECASE | re.MULTILINE)
+# #5482 (round-6 F2): the shell strips backslashes and quotes inside a word, so
+# \psql, p\sql, ps''ql and "ps"ql all run psql. This matches a psql word spelled with
+# those characters; normalise_psql_heads() rewrites it to a plain psql word of the
+# SAME length (padding with spaces) so every offset, and so every reported line,
+# stays valid for both psql rules.
+PSQL_SPLIT_HEAD_RE = re.compile(
+    r"(?<![A-Za-z0-9\\'\"])[\\'\"]*p[\\'\"]*s[\\'\"]*q[\\'\"]*l[\\'\"]*(?P<tail>[A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
 PSQL_VAR_OPT_RE = re.compile(
     r"\s(?:-[A-Za-z0-9]*v\s*|--(?:set?|va[a-z]*)(?:=|\s+))"
     r"(?P<operand>[^\s]+)",
@@ -610,6 +619,19 @@ def scan_xtrace(rel: str, text: str) -> List[Hit]:
     return hits
 
 
+def normalise_psql_heads(text: str) -> str:
+    """Rewrite every shell-split psql word (\\psql, p\\sql, ps''ql, "ps"ql) to a plain
+    psql word of the same length, so the head rule and the psql -c rule see what the
+    shell runs (#5482). Offsets are preserved: removed characters become spaces."""
+    def plain(m: "re.Match[str]") -> str:
+        word = m.group(0)
+        tail = m.group("tail")
+        if len(word) == 4 + len(tail) and word[: 4].lower() == "psql":
+            return word
+        return "psql" + tail + " " * (len(word) - 4 - len(tail))
+    return PSQL_SPLIT_HEAD_RE.sub(plain, text)
+
+
 def psql_var_operand_flagged(operand: str) -> bool:
     """A psql -v operand is flagged when its name is secret-like or undecidable (#5448)."""
     name = operand.split("=", 1)[0]
@@ -627,7 +649,7 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
     for m in EXPANSION_RE.finditer(text):
         line, snippet = _line_of(text, m.start())
         hits.append((rel, line, "[store-url-expansion] " + snippet))
-    for m in PSQL_ARGV_RE.finditer(text):
+    for m in PSQL_ARGV_RE.finditer(normalise_psql_heads(text)):
         if is_redaction(m.group("pw") or m.group("pwd") or ""):
             continue
         line, snippet = _line_of(text, m.start())
@@ -639,7 +661,7 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
         hits.append((rel, line, "[env-password-argv] " + snippet))
     # A backslash-newline is two characters; two spaces keep every offset, so
     # _line_of on the original text still names the right line.
-    joined = text.replace("\\\n", "  ")
+    joined = normalise_psql_heads(text.replace("\\\n", "  "))
     for head in PSQL_HEAD_RE.finditer(joined):
         eol = joined.find("\n", head.end())
         segment = joined[head.end():eol if eol >= 0 else len(joined)]
@@ -1007,6 +1029,16 @@ RED_PROBES_4600 = {
     "5481-02-cluster-zero-before-v": 'psql -0v pw="$PG_PW" -f x.sql',
     "5481-03-cluster-letters-digit-v": 'psql -Xq1v pw="$PG_PW" -f x.sql',
     "5481-04-cluster-digit-v-joined": 'psql -1vpw="$PG_PW" -f x.sql',
+    # #5482 (PR 4810 round-6 F2): the shell strips backslashes and quotes inside a word, so
+    # these all run psql; a backslash inside the -v name pins the shell-view step (M11).
+    "5482-01-leading-backslash-head": '\\psql -v pw="$PG_PW" -f x.sql',
+    "5482-02-backslash-inside-head": 'p\\sql -v pw="$PG_PW" -f x.sql',
+    "5482-03-empty-quotes-inside-head": "ps''ql -v pw=\"$PG_PW\" -f x.sql",
+    "5482-04-quoted-head-prefix": '"ps"ql -v pw="$PG_PW" -f x.sql',
+    "5482-05-backslash-inside-v-name": 'psql -v p\\w="$PG_PW" -f x.sql',
+    "5482-06-split-head-c-password": "p\\sql -c \"ALTER USER a PASSWORD 'hunter2x'\"",
+    "5482-07-quoted-wrapper-head": '"run_ps"ql -v pw="$PG_PW" -f x.sql',
+    "5482-08-split-head-after-semicolon": 'true;\\psql -v pw="$PG_PW" -f x.sql',
     # #4808: the forms the #4782 gate missed.
     "4808-docker-e-dsn-literal": "docker run -e DATABASE_URL=postgres://u:hunter2@h/d img",
     "4808-psql-set-equals-pw": 'psql --set=pw="$PG_PW" -f bootstrap.sql',
@@ -1065,6 +1097,8 @@ GREEN_PROBES_4600 = {
     "5448-psql-v-bare-name": "psql -v ON_ERROR_STOP -f x.sql",
     "5448-psql-v-value-holds-equals-and-pw": "psql -v role=pw=x -f x.sql",
     "5448-psql-v-substituted-value-only": 'psql -v role="$ROLE_NAME" -f x.sql',
+    "5482-split-word-not-psql": 'p\\sqlx -v role=aimemory -f x.sql',
+    "5482-quoted-psql-no-secret": 'echo "psql" -v role=aimemory -f x.sql',
     "5481-psql-cluster-digit-non-secret-name": "psql -1v role=aimemory -f x.sql",
     "4808-docker-e-dsn-inherit": "docker run -e DATABASE_URL img",
     "4808-docker-e-dsn-no-password": "docker run -e DATABASE_URL=postgres://u@h/d img",
