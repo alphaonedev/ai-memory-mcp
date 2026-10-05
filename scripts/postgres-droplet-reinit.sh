@@ -73,6 +73,10 @@
 #     with sslmode=verify-full&sslrootcert=<PG_SSLROOTCERT> (#5143, #3705).
 #     No default: an unset, unreadable or oddly spelled path is refused before
 #     the backup and the first DROP.
+#   * `PG_DUMP_SSLROOTCERT` (#5402): the CA file for the pg_dump backup, on THIS
+#     host (pg_dump connects to PG_HOST over TCP with sslmode=verify-full).
+#     Defaults to PG_SSLROOTCERT when AI_MEMORY_SSH_HOST is unset; required when
+#     it is set. Refused (exit 7) before the backup and the first DROP.
 #
 # USAGE
 # -----
@@ -121,6 +125,11 @@ PG_PASSWORD_FILE="${PG_PASSWORD_FILE:-/root/aimemory-pg-password.txt}"
 # sslmode=verify-full (#3705, loopback included), so schema-init needs the CA
 # bundle that signed the server certificate. No default: unset is refused.
 PG_SSLROOTCERT="${PG_SSLROOTCERT:-}"
+# #5402: pg_dump runs on THIS host and connects to PG_HOST over TCP, so it needs
+# a CA file on this host: PG_DUMP_SSLROOTCERT, defaulting to PG_SSLROOTCERT when
+# no AI_MEMORY_SSH_HOST is set (one host runs both). With an ssh host the
+# PG_SSLROOTCERT path is remote, so PG_DUMP_SSLROOTCERT must be set explicitly.
+PG_DUMP_SSLROOTCERT="${PG_DUMP_SSLROOTCERT:-}"
 
 BACKUP_DIR="${BACKUP_DIR:-/var/backups}"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
@@ -211,6 +220,26 @@ require_sslrootcert() {
     fi
 }
 
+# #5402: the pg_dump backup is a TCP connection to PG_HOST; refuse BEFORE the
+# backup and any DROP unless it can run with sslmode=verify-full and a local CA.
+require_dump_sslrootcert() {
+    if [[ -z "$PG_DUMP_SSLROOTCERT" && -z "$AI_MEMORY_SSH_HOST" ]]; then
+        PG_DUMP_SSLROOTCERT="$PG_SSLROOTCERT"
+    fi
+    if [[ -z "$PG_DUMP_SSLROOTCERT" ]]; then
+        echo "FATAL: PG_DUMP_SSLROOTCERT is unset: pg_dump runs on this host and needs a local CA file for sslmode=verify-full (AI_MEMORY_SSH_HOST is set, so PG_SSLROOTCERT is a remote path) (#5402)" >&2
+        exit 7
+    fi
+    if [[ ! "$PG_DUMP_SSLROOTCERT" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+        echo "FATAL: PG_DUMP_SSLROOTCERT must be an absolute path of [A-Za-z0-9._/-] characters (#5402)" >&2
+        exit 7
+    fi
+    if [[ "$DRY_RUN" -ne 1 && ! -r "$PG_DUMP_SSLROOTCERT" ]]; then
+        echo "FATAL: PG_DUMP_SSLROOTCERT $PG_DUMP_SSLROOTCERT is not readable on this host (#5402)" >&2
+        exit 7
+    fi
+}
+
 # #1785 — interactive confirmation gate on the LIVE (non-dry-run)
 # destructive path. The operator must TYPE the primary db name to confirm
 # before any `DROP DATABASE` runs (step 2 primary + step 4 disposables).
@@ -297,6 +326,7 @@ run_schema_init() {
 log "postgres-droplet-reinit.sh starting (dry_run=${DRY_RUN}, skip_disposable=${SKIP_DISPOSABLE})"
 require_password
 require_sslrootcert
+require_dump_sslrootcert
 
 if [[ -z "$AI_MEMORY_SSH_HOST" && ! -x "$AI_MEMORY_BIN" ]]; then
     echo "FATAL: ai-memory binary not found at $AI_MEMORY_BIN — set AI_MEMORY_BIN or AI_MEMORY_SSH_HOST" >&2
@@ -310,9 +340,11 @@ fi
 run mkdir -p "$BACKUP_DIR"
 log "step 1: pg_dump ${PG_PRIMARY_DB} -> ${BACKUP_FILE}"
 if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: pg_dump -h ${PG_HOST} -U ${PG_USER} -d ${PG_PRIMARY_DB} -F c -f ${BACKUP_FILE}"
+    log "DRY-RUN: PGSSLMODE=verify-full PGSSLROOTCERT=${PG_DUMP_SSLROOTCERT} pg_dump -h ${PG_HOST} -U ${PG_USER} -d ${PG_PRIMARY_DB} -F c -f ${BACKUP_FILE}"
 else
-    pg_dump -h "$PG_HOST" -U "$PG_USER" -d "$PG_PRIMARY_DB" -F c -f "$BACKUP_FILE"
+    # #5402: verify-full against a pinned CA; PGPASSWORD stays in the environment.
+    PGSSLMODE=verify-full PGSSLROOTCERT="$PG_DUMP_SSLROOTCERT" \
+        pg_dump -h "$PG_HOST" -U "$PG_USER" -d "$PG_PRIMARY_DB" -F c -f "$BACKUP_FILE"
     if [[ ! -s "$BACKUP_FILE" ]]; then
         echo "FATAL: backup file is empty — aborting before destructive step" >&2
         exit 5
