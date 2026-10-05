@@ -866,11 +866,13 @@ def _replace_once(text: str, old: str, new: str) -> str:
 
 
 def named_cells() -> List[Tuple[str, str, str]]:
-    """(name, text, refusal reason) for each known-bad shape of PR #5665 rounds 3 to 5.
+    """(name, text, refusal reason) for each known-bad shape of PR #5665 rounds 3 to 6.
 
-    Each cell is a reproducer from the round-3 review (F1 #5730, F2 #5731, F3
+    Sixteen cells are reproducers from the round-3 review (F1 #5730, F2 #5731, F3
     #5732), from the round-4 differential (#5733-#5736, #5748-#5750) or from the
-    round-4 review (F2, an indented first row, #5777).  The
+    round-4 review (F2, an indented first row, #5777).  Six are the class items of
+    round 6 (#5853, #5854); PyYAML 6.0.1 reads each as the same plain string the
+    reader hands to the glob.  The
     test below runs every cell each time; the round-4 PyYAML probe runs the same
     cells as fixed cases beside its seeded random ones.
     """
@@ -900,15 +902,25 @@ def named_cells() -> List[Tuple[str, str, str]]:
         ("5750-deeper-leading-blank", "name: x\n" + pr + "x: |-\n    \n  contents: read\n",
          "leading blank line of a block scalar"),
         ("R4-F2-indented-first-row", "  name: x\n" + pr, "less indented than the first row"),
+    ] + [
+        ("R6-" + tag + "-class-item", "on:\n  pull_request:\n    branches: [main, 'rehearsal/**', '" + item + "']\n", why)
+        for tag, item, why in (
+            ("5853-empty-class", "a[]b", "empty character class"),
+            ("5853-reversed-range", "[z-a]", "range is not ascending letters or digits"),
+            ("5854-bang-led", "[!a]", "form not proven to read like GitHub"),
+            ("5854-caret-led", "[^a]", "form not proven to read like GitHub"),
+            ("5854-close-bracket-first", "[]a]", "empty character class"),
+            ("5854-underscore", "[_]", "form not proven to read like GitHub"),
+        )
     ]
 
 
 class NamedCells5665(unittest.TestCase):
-    """Every named known-bad cell is refused with its own reason (rounds 3 to 5)."""
+    """Every named known-bad cell is refused with its own reason (rounds 3 to 6)."""
 
     def test_5665_named_cells_refused(self) -> None:
         cells = named_cells()
-        self.assertEqual(16, len(cells))
+        self.assertEqual(22, len(cells))
         for name, text, why in cells:
             got = violations("x.yml", text)
             self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (name, why, got))
