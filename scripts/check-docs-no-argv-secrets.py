@@ -193,15 +193,13 @@ ENV_ARGV_RE = re.compile(
 # continuation. Every option after the psql word is checked, not the first.
 # #5448: _ and - also precede psql (run_psql, my-psql: a wrapper still runs psql).
 PSQL_HEAD_RE = re.compile(r"(?:^|[\s;|&(`/\"'${_-])(?P<word>psql[A-Za-z0-9_]*)\b", re.IGNORECASE | re.MULTILINE)
-# #5482 (round-6 F2): the shell strips backslashes and quotes inside a word, so
-# \psql, p\sql, ps''ql and "ps"ql all run psql. This matches a psql word spelled with
-# those characters; normalise_psql_heads() rewrites it to a plain psql word of the
-# SAME length (padding with spaces) so every offset, and so every reported line,
-# stays valid for both psql rules.
-PSQL_SPLIT_HEAD_RE = re.compile(
-    r"(?<![A-Za-z0-9\\'\"])[\\'\"]*p[\\'\"]*s[\\'\"]*q[\\'\"]*l[\\'\"]*(?P<tail>[A-Za-z0-9_]*)",
-    re.IGNORECASE,
-)
+# #5482 / #5512 (round-6): the shell strips backslashes and quotes inside a word and
+# builds it from ANSI-C segments and empty substitutions, so \psql, p\sql, ps''ql,
+# "ps"ql, ps$'q'l, $'ps\x71l' and ps$()ql all run psql. psql_head_view() resolves each
+# shell word (the resolver below) and rewrites a psql word to the plain psql word of
+# the SAME length (padding with spaces) so every offset, and so every reported line,
+# stays valid for both psql rules; a word that still holds an expansion, substitution,
+# glob or brace and could spell psql is refused as undecidable.
 PSQL_VAR_OPT_RE = re.compile(
     r"\s(?:-[A-Za-z0-9]*v\s*|--(?:set?|va[a-z]*)(?:=|\s+))"
     r"(?P<operand>[^\s]+)",
@@ -631,17 +629,396 @@ def scan_xtrace(rel: str, text: str) -> List[Hit]:
     return hits
 
 
+# --- #5512 / #5513 (PR 4810 round-6 F1, F2): a shell word resolver ----------------
+# The shell builds the word psql (and the option -v) from quotes, backslashes, a
+# backslash-newline, an ANSI-C segment ($'ps\x71l'), an empty substitution ($(), ``),
+# and, undecidably, a non-empty substitution, an expansion, a glob or a brace. Naming
+# the spellings one at a time is an open-ended denylist; this follows the closed-world
+# fail-closed shape of #4869: every word is resolved to a plain literal when it can be,
+# and a word that still holds an expansion and could spell psql is refused.
+# A piece is ("l", text) for a literal, or ("h", (start, end)) for an expansion the gate
+# cannot decide; a word is (start, end, pieces) and offsets index the scanned text.
+WordPiece = Tuple[str, object]
+Word = Tuple[int, int, List[WordPiece]]
+WORD_DELIMS = " \t\r\n;|&<>()"
+SCAN_LIMIT = 4000
+# A word made only of these characters resolves to itself: the resolver skips it.
+PLAIN_WORD_RE = re.compile(r"[A-Za-z0-9_./:=@%+,#~^!-]+")
+MAX_NEST = 6
+NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ANSI_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r",
+               "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+
+
+def ansi_c_decode(body: str) -> Optional[str]:
+    """Decode the inside of $'...' as bash does (\\xHH, octal, \\uHHHH, \\cX and the
+    single-letter escapes). None when the result holds a NUL (bash cuts the word there,
+    so the gate calls it undecidable)."""
+    out: List[str] = []
+    i = 0
+    while i < len(body):
+        c = body[i]
+        if c != "\\" or i + 1 >= len(body):
+            out.append(c)
+            i += 1
+            continue
+        d = body[i + 1]
+        if d in ANSI_SIMPLE:
+            out.append(ANSI_SIMPLE[d])
+            i += 2
+            continue
+        num = re.match(r"x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|[0-7]{1,3}", body[i + 1:])
+        if num:
+            tok = num.group(0)
+            value = int(tok[1:], 16) if tok[0] in "xuU" else int(tok, 8) & 0xFF
+            try:
+                out.append(chr(value))
+            except (ValueError, OverflowError):
+                return None
+            i += 1 + len(tok)
+        elif d == "c" and i + 2 < len(body):
+            out.append(chr(ord(body[i + 2]) & 0x1F))
+            i += 3
+        else:
+            out.append("\\" + d)
+            i += 2
+    decoded = "".join(out)
+    return None if "\x00" in decoded else decoded
+
+
+def match_close(text: str, i: int, hi: int, open_c: str, close_c: str) -> int:
+    """Index of the bracket closing text[i], or -1 (naive nesting, quotes skipped)."""
+    depth = 0
+    k = i
+    stop = min(hi, i + SCAN_LIMIT)
+    while k < stop:
+        c = text[k]
+        if c == "\\":
+            k += 2
+            continue
+        if c in "'\"":
+            end = text.find(c, k + 1, stop)
+            k = (end if end >= 0 else k) + 1
+            continue
+        if c == open_c:
+            depth += 1
+        elif c == close_c:
+            depth -= 1
+            if depth == 0:
+                return k
+        k += 1
+    return -1
+
+
+def consume_dollar(text: str, j: int, hi: int, in_dq: bool) -> Tuple[int, WordPiece, Optional[Tuple[int, int]]]:
+    """One expansion starting at text[j] == "$": (end, piece, inner span to rescan)."""
+    nxt = text[j + 1:j + 2] if j + 1 < hi else ""
+    if nxt in ("(", "{"):
+        k = match_close(text, j + 1, hi, nxt, ")" if nxt == "(" else "}")
+        if k < 0:
+            eol = text.find("\n", j, hi)
+            return (hi if eol < 0 else eol), ("h", (j, hi if eol < 0 else eol)), None
+        if nxt == "(" and not text[j + 2:k].strip():
+            return k + 1, ("l", ""), None
+        return k + 1, ("h", (j, k + 1)), ((j + 2, k) if nxt == "(" else None)
+    if nxt == "'" and not in_dq:
+        k = j + 2
+        while k < hi and text[k] != "\n":
+            if text[k] == "\\":
+                k += 2
+                continue
+            if text[k] == "'":
+                decoded = ansi_c_decode(text[j + 2:k])
+                piece: WordPiece = ("l", decoded) if decoded is not None else ("h", (j, k + 1))
+                return k + 1, piece, None
+            k += 1
+        return j + 1, ("l", "$"), None
+    if nxt == '"' and not in_dq:
+        return j + 1, ("l", ""), None
+    m = NAME_RE.match(text, j + 1)
+    if m and m.end() <= hi:
+        return m.end(), ("h", (j, m.end())), None
+    if nxt and nxt in "0123456789?$!#@*-":
+        return j + 2, ("h", (j, j + 2)), None
+    return j + 1, ("l", "$"), None
+
+
+def backtick_close(text: str, j: int, hi: int) -> int:
+    """Index of the backtick closing the one at text[j] on the SAME line, else -1: prose
+    pairs backticks across lines (`a` ... `b`), so a span is never allowed to cross a newline."""
+    k = j + 1
+    stop = min(hi, j + SCAN_LIMIT)
+    while k < stop:
+        if text[k] == "\\":
+            k += 2
+            continue
+        if text[k] == "\n":
+            return -1
+        if text[k] == "`":
+            return k
+        k += 1
+    return -1
+
+
+def parse_dq(text: str, j: int, hi: int, subs: List[Tuple[int, int]]) -> Optional[Tuple[int, List[WordPiece]]]:
+    """A double-quoted string on ONE line starting at text[j]; None when it is not closed
+    on this line (the quote is then read as a literal, never as a span that could swallow
+    later commands)."""
+    pieces: List[WordPiece] = []
+    buf: List[str] = []
+    local: List[Tuple[int, int]] = []
+    k = j + 1
+    while k < hi:
+        c = text[k]
+        if c == "\\":
+            d = text[k + 1:k + 2]
+            if d == "\n":
+                k += 2
+            elif d in ("$", "`", '"', "\\"):
+                buf.append(d)
+                k += 2
+            else:
+                buf.append("\\")
+                k += 1
+            continue
+        if c == "\n":
+            return None
+        if c == '"':
+            if buf:
+                pieces.append(("l", "".join(buf)))
+            subs.extend(local)
+            subs.append((j + 1, k))
+            return k + 1, pieces
+        if c in "$`":
+            if buf:
+                pieces.append(("l", "".join(buf)))
+                buf = []
+            if c == "$":
+                k, piece, inner = consume_dollar(text, k, hi, True)
+            else:
+                close = backtick_close(text, k, hi)
+                if close < 0:
+                    buf.append("`")
+                    k += 1
+                    continue
+                inner = (k + 1, close) if text[k + 1:close].strip() else None
+                piece = ("h", (k, close + 1)) if inner else ("l", "")
+                k = close + 1
+            pieces.append(piece)
+            if inner:
+                local.append(inner)
+            continue
+        buf.append(c)
+        k += 1
+    return None
+
+
+def parse_word(text: str, i: int, hi: int, subs: List[Tuple[int, int]]) -> Tuple[int, List[WordPiece]]:
+    """One shell word from text[i]; spans to scan again (substitutions and quoted
+    strings, where another command may start) are appended to subs."""
+    pieces: List[WordPiece] = []
+    j = i
+    while j < hi:
+        c = text[j]
+        if c in WORD_DELIMS:
+            break
+        if c == "\\":
+            if text.startswith("\n", j + 1):
+                j += 2
+            elif text.startswith("\r\n", j + 1):
+                j += 3
+            elif j + 1 < hi:
+                pieces.append(("l", text[j + 1]))
+                j += 2
+            else:
+                pieces.append(("l", "\\"))
+                j += 1
+        elif c == "'":
+            k = text.find("'", j + 1, hi)
+            eol = text.find("\n", j + 1, hi)
+            if k >= 0 and (eol < 0 or k < eol):
+                pieces.append(("l", text[j + 1:k]))
+                subs.append((j + 1, k))
+                j = k + 1
+            else:
+                pieces.append(("l", "'"))
+                j += 1
+        elif c == '"':
+            parsed = parse_dq(text, j, hi, subs)
+            if parsed is None:
+                pieces.append(("l", '"'))
+                j += 1
+            else:
+                j = parsed[0]
+                pieces.extend(parsed[1])
+        elif c == "$":
+            j, piece, inner = consume_dollar(text, j, hi, False)
+            pieces.append(piece)
+            if inner:
+                subs.append(inner)
+        elif c == "`":
+            close = backtick_close(text, j, hi)
+            if close < 0:
+                pieces.append(("l", "`"))
+                j += 1
+            else:
+                inner = (j + 1, close) if text[j + 1:close].strip() else None
+                pieces.append(("h", (j, close + 1)) if inner else ("l", ""))
+                if inner:
+                    subs.append(inner)
+                j = close + 1
+        elif c in "*?":
+            pieces.append(("h", (j, j + 1)))
+            j += 1
+        elif c in "[{":
+            close_c = "]" if c == "[" else "}"
+            k = text.find(close_c, j + 1, hi)
+            body = text[j + 1:k] if k >= 0 else ""
+            if k >= 0 and body and not re.search(r"[\s;|&<>()]", body) and (c == "[" or "," in body or ".." in body):
+                pieces.append(("h", (j, k + 1)))
+                j = k + 1
+            else:
+                pieces.append(("l", c))
+                j += 1
+        else:
+            pieces.append(("l", c))
+            j += 1
+    return j, pieces
+
+
+def scan_words(text: str, lo: int = 0, hi: Optional[int] = None, nested: bool = True,
+               depth: int = 0) -> List[Word]:
+    """Every shell word of text[lo:hi]; with nested, also the words inside quoted strings
+    and command substitutions (offsets always index text)."""
+    hi = len(text) if hi is None else hi
+    out: List[Word] = []
+    i = lo
+    while i < hi:
+        if text[i] in WORD_DELIMS:
+            i += 1
+            continue
+        plain = PLAIN_WORD_RE.match(text, i, hi)
+        if plain and (plain.end() >= hi or text[plain.end()] in WORD_DELIMS):
+            i = plain.end()
+            continue
+        subs: List[Tuple[int, int]] = []
+        j, pieces = parse_word(text, i, hi, subs)
+        if j <= i:
+            i += 1
+            continue
+        if pieces:
+            out.append((i, j, pieces))
+        if nested and depth < MAX_NEST:
+            for a, b in subs:
+                if b > a:
+                    out.extend(scan_words(text, a, b, True, depth + 1))
+        i = j
+    return out
+
+
+def word_literal(pieces: List[WordPiece]) -> Optional[str]:
+    """The plain string a word resolves to, or None when any piece is undecidable."""
+    if any(kind == "h" for kind, _ in pieces):
+        return None
+    return "".join(str(value) for _, value in pieces)
+
+
+def word_view(text: str, pieces: List[WordPiece]) -> str:
+    """The word as the shell passes it where that is known: literals resolved, each
+    undecidable expansion kept as written."""
+    return "".join(str(v) if k == "l" else text[v[0]:v[1]] for k, v in pieces)  # type: ignore[index]
+
+
+def glob_class_admits(raw: str, ch: str) -> bool:
+    """Whether the bracket expression raw ([abc], [a-z]) can match ch; a negated or POSIX
+    class is treated as matching anything (undecidable stays refused)."""
+    body = raw[1:-1]
+    if not body or body[0] in "!^" or "[:" in body:
+        return True
+    pos = 0
+    while pos < len(body):
+        if pos + 2 < len(body) and body[pos + 1] == "-":
+            if body[pos].lower() <= ch <= body[pos + 2].lower():
+                return True
+            pos += 3
+        else:
+            if body[pos].lower() == ch:
+                return True
+            pos += 1
+    return False
+
+
+def psql_word_possible(text: str, pieces: List[WordPiece]) -> bool:
+    """True when a word that holds an undecidable piece could still spell psql (or a
+    wrapper such as run_psql): some expansion of every hole makes it psql[A-Za-z0-9_]*
+    with at least two literals standing for letters of the fixed four (one alone is prose such as **loss**). A ? or [..] glob
+    stands for exactly one character, anything else for any string."""
+    chars: List[Tuple[str, str]] = []
+    for kind, value in pieces:
+        if kind == "l":
+            chars.extend(("L", ch) for ch in str(value))
+        else:
+            raw = text[value[0]:value[1]]  # type: ignore[index]
+            chars.append(("1", raw) if raw[:1] in ("?", "[") else ("W", raw))
+    starts = [0] + [k + 1 for k, (kind, ch) in enumerate(chars) if kind == "L" and ch in "/_-"]
+    target = "psql"
+    seen: dict = {}
+
+    def fits(pos: int, tp: int, used: int) -> bool:
+        """Can chars[pos:] finish a psql word, given tp of its 4 fixed letters are placed
+        and `used` (capped at 2) counts the literals that stood for them?"""
+        key = (pos, tp, used)
+        if key not in seen:
+            seen[key] = False
+            if pos == len(chars):
+                seen[key] = tp >= 4 and used >= 2
+            elif chars[pos][0] == "W":
+                takes = range(0, max(0, 4 - tp) + 1)
+                seen[key] = any(fits(pos + 1, tp + take, used) for take in takes)
+            elif chars[pos][0] == "1":
+                raw = chars[pos][1]
+                ok = tp >= 4 or raw[0] == "?" or glob_class_admits(raw, target[tp])
+                seen[key] = ok and fits(pos + 1, min(tp + 1, 4), used)
+            else:
+                ch = chars[pos][1]
+                if tp < 4:
+                    seen[key] = ch.lower() == target[tp] and fits(pos + 1, tp + 1, min(used + 1, 2))
+                else:
+                    seen[key] = ch.isascii() and (ch.isalnum() or ch == "_") and fits(pos + 1, tp, used)
+        return seen[key]
+
+    for s in starts:
+        if any(kind != "L" for kind, _ in chars[s:]) and fits(s, 0, 0):
+            return True
+    return False
+
+
+def psql_head_view(text: str) -> Tuple[str, List[int]]:
+    """The text with every shell-spelled psql word rewritten to the plain word, same
+    length (removed characters become spaces), so every offset and line stays valid for
+    the psql rules; and the offsets of psql-looking words the gate cannot decide.
+    Words are resolved with scan_words, replacing the single-spelling regex of #5482."""
+    chars = list(text)
+    undecidable: List[int] = []
+    for start, end, pieces in scan_words(text):
+        literal = word_literal(pieces)
+        if literal is None:
+            # A word that opens with a glob (*psql*, *l, ?x) is prose emphasis or a file
+            # glob, not a spelling of the command word; every other hole is refused.
+            opens_glob = pieces[0][0] == "h" and text[start] in "*?["
+            if not opens_glob and psql_word_possible(text, pieces):
+                undecidable.append(start)
+            continue
+        if (literal != text[start:end] and len(literal) <= end - start and not re.search(r"\s", literal)
+                and PSQL_HEAD_RE.search(" " + literal)):
+            chars[start:end] = list(literal.ljust(end - start))
+    return "".join(chars), undecidable
+
+
 def normalise_psql_heads(text: str) -> str:
-    """Rewrite every shell-split psql word (\\psql, p\\sql, ps''ql, "ps"ql) to a plain
-    psql word of the same length, so the head rule and the psql -c rule see what the
-    shell runs (#5482). Offsets are preserved: removed characters become spaces."""
-    def plain(m: "re.Match[str]") -> str:
-        word = m.group(0)
-        tail = m.group("tail")
-        if len(word) == 4 + len(tail) and word[: 4].lower() == "psql":
-            return word
-        return "psql" + tail + " " * (len(word) - 4 - len(tail))
-    return PSQL_SPLIT_HEAD_RE.sub(plain, text)
+    """Rewrite every shell-spelled psql word (\\psql, p\\sql, ps''ql, "ps"ql, ps$'q'l,
+    $'ps\\x71l', ps$()ql) to a plain psql word of the same length (#5482, #5512)."""
+    return psql_head_view(text)[0]
 
 
 def psql_var_operand_flagged(operand: str) -> bool:
@@ -670,7 +1047,11 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
     for m in EXPANSION_RE.finditer(text):
         line, snippet = _line_of(text, m.start())
         hits.append((rel, line, "[store-url-expansion] " + snippet))
-    for m in PSQL_ARGV_RE.finditer(normalise_psql_heads(text)):
+    norm, undecidable_words = psql_head_view(text)
+    for pos in undecidable_words:
+        line, snippet = _line_of(text, pos)
+        hits.append((rel, line, "[psql-undecidable-word] " + snippet))
+    for m in PSQL_ARGV_RE.finditer(norm):
         if is_redaction(m.group("pw") or m.group("pwd") or ""):
             continue
         line, snippet = _line_of(text, m.start())
@@ -682,7 +1063,7 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
         hits.append((rel, line, "[env-password-argv] " + snippet))
     # A backslash-newline is two characters; two spaces keep every offset, so
     # _line_of on the original text still names the right line.
-    joined = normalise_psql_heads(text.replace("\\\n", "  "))
+    joined = norm.replace("\\\n", "  ")
     for head in PSQL_HEAD_RE.finditer(joined):
         eol = joined.find("\n", head.end())
         segment = joined[head.end():eol if eol >= 0 else len(joined)]
@@ -1064,6 +1445,28 @@ RED_PROBES_4600 = {
     "5482-08-split-head-after-semicolon": 'true;\\psql -v pw="$PG_PW" -f x.sql',
     "5482-09-uppercase-split-head": 'P\\SQL -v pw="$PG_PW" -f x.sql',
     "5482-10-backslash-before-last-letter": 'psq\\l -v pw="$PG_PW" -f x.sql',
+    # #5512 (PR 4810 round-6 F1): more spellings of the psql word, and the closed-world
+    # refusal of a word that holds an expansion and could still spell psql.
+    "5512-01-ansi-c-segment-in-head": 'ps$\'q\'l -v pw="$PG_PW" -f x.sql',
+    "5512-02-ansi-c-hex-inside-head": "$'ps\\x71l' -v pw=\"$PG_PW\" -f x.sql",
+    "5512-03-ansi-c-hex-first-letter": "$'\\x70sql' -v pw=\"$PG_PW\" -f x.sql",
+    "5512-04-backslash-newline-inside-head": 'ps\\\nql -v pw="$PG_PW" -f x.sql',
+    "5512-05-empty-backtick-inside-head": 'ps``ql -v pw="$PG_PW" -f x.sql',
+    "5512-06-empty-substitution-inside-head": 'ps$()ql -v pw="$PG_PW" -f x.sql',
+    "5512-07-ansi-c-head-c-password": "ps$'q'l -c \"ALTER USER a PASSWORD 'hunter2x'\"",
+    "5512-08-octal-escape-head": "$'\\160sql' -v pw=\"$PG_PW\" -f x.sql",
+    "5512-09-unicode-escape-head": "$'ps\\u0071l' -v pw=\"$PG_PW\" -f x.sql",
+    "5512-10-ansi-c-head-after-semicolon": "true; ps$'q'l -v pw=\"$PG_PW\" -f x.sql",
+    "5512-11-undecidable-substitution-head": 'ps$(printf q)l -f x.sql',
+    "5512-12-undecidable-parameter-head": 'ps${Q}l -f x.sql',
+    "5512-13-undecidable-glob-head": 'p[s]ql -f x.sql',
+    "5512-14-undecidable-brace-head": 'p{s,s}ql -f x.sql',
+    "5512-15-undecidable-star-head": 'ps*l -f x.sql',
+    "5512-16-undecidable-backtick-head": 'ps`printf q`l -f x.sql',
+    "5512-17-undecidable-wrapper-head": 'run_ps$(printf q)l -f x.sql',
+    "5512-18-undecidable-head-inside-string": 'bash -c "ps$(printf q)l -f x.sql"',
+    "5512-19-split-head-inside-string": "ssh h 'p\\sql -v pw=\"$PG_PW\"'",
+    "5512-20-path-then-ansi-c-head": "/usr/bin/ps$'q'l -v pw=\"$PG_PW\" -f x.sql",
     # #5483 (PR 4810 round-6 F3): a neutral variable name does not hide a value that expands
     # a secret-named variable, and a non-ASCII name can spell a secret with a look-alike letter.
     "5483-01-neutral-name-pgpassword": 'psql -v x="$PGPASSWORD" -f x.sql',
@@ -1133,6 +1536,13 @@ GREEN_PROBES_4600 = {
     "5448-psql-v-bare-name": "psql -v ON_ERROR_STOP -f x.sql",
     "5448-psql-v-value-holds-equals-and-pw": "psql -v role=pw=x -f x.sql",
     "5448-psql-v-substituted-value-only": 'psql -v role="$ROLE_NAME" -f x.sql',
+    "5512-ansi-c-word-not-psql": "ps$'x'l -c \"ALTER USER a PASSWORD 'hunter2x'\"",
+    "5512-hole-word-cannot-be-psql": 'ls$(date)x.txt -f x.sql',
+    "5512-glob-word-cannot-be-psql": 'rm ps*.txt',
+    "5512-parameter-word-not-psql-shaped": 'foo$BAR -v role=aimemory',
+    "5512-plain-parameter-word": '"$BIN" serve --listen 127.0.0.1:9077',
+    "5512-command-substitution-word": 'x=$(command -v psql)',
+    "5512-empty-substitution-word-not-psql": 'ps$()x -v role=aimemory -f x.sql',
     "5482-split-word-not-psql": 'p\\sqlx -v role=aimemory -f x.sql',
     "5482-quoted-psql-no-secret": 'echo "psql" -v role=aimemory -f x.sql',
     "5482-trailing-backslash-word-not-psql": 'psql\\x -c "ALTER USER a PASSWORD \'hunter2x\'"',
@@ -1280,6 +1690,21 @@ def self_test() -> int:
         if got:
             print("SELF-TEST FAIL: green probe (#4600 set) %r was flagged: %r" % (name, got), file=sys.stderr)
             bad += 1
+    # The #5512 word probes are file-type independent: the same spellings in a prose
+    # file and a script are read by the same resolver.
+    for suffix in ("probe.md", "probe.sh"):
+        for name, text in RED_PROBES_4600.items():
+            if name.startswith("5512-"):
+                red += 1
+                if not scan_text(suffix, text):
+                    print("SELF-TEST FAIL: red probe %r (%s) was not flagged" % (name, suffix), file=sys.stderr)
+                    bad += 1
+        for name, text in GREEN_PROBES_4600.items():
+            if name.startswith("5512-"):
+                green += 1
+                if scan_text(suffix, text):
+                    print("SELF-TEST FAIL: green probe %r (%s) was flagged" % (name, suffix), file=sys.stderr)
+                    bad += 1
     for name, text in RED_PROBES.items():
         red += 1
         if not scan_text("probe.md", text):
