@@ -239,10 +239,10 @@ lab_probe_refusal_names_knob() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 17 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 12
+# 18 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 13
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
-# const in a scratch src tree), six probe-matcher legs (lab_probe_refusal_names_knob against
+# const in a scratch src tree), seven probe-matcher legs (lab_probe_refusal_names_knob against
 # generated logs), one structural leg (the matcher has no here-string, here-document or pipe)
 # and one layout leg (this comment sits directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
@@ -287,6 +287,7 @@ lab_posture_selftest() {
   printf 'boot\nINFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/info-only.log"
   printf 'INFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\nfatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n' > "$plog/info-then-refusal.log"
   printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\nINFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/refusal-then-info.log"
+  printf '2026-01-01T00:00:00Z INFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/info-prefixed.log"
   # The refusal is printed in END, after the filler (#5292). /dev/null is the input so END
   # runs without reading stdin (an awk program with only an END block reads stdin).
   awk 'END { for (i = 0; i < 200000; i++) print "filler line to fill the pipe buffer"
@@ -300,6 +301,9 @@ lab_posture_selftest() {
   ( lab_probe_refusal_names_knob "$plog/info-only.log" ) \
     && { echo "  FAIL probe matcher: an INFO pin line was counted"; bad=1; } \
     || echo "  PASS probe matcher: an INFO pin line is not counted"
+  ( lab_probe_refusal_names_knob "$plog/info-prefixed.log" ) \
+    && { echo "  FAIL probe matcher: an INFO pin line with a timestamp prefix was counted"; bad=1; } \
+    || echo "  PASS probe matcher: an INFO pin line with a timestamp prefix is not counted"
   ( lab_probe_refusal_names_knob "$plog/info-then-refusal.log" ) \
     && echo "  PASS probe matcher: a refusal after an INFO line naming the knob is detected" \
     || { echo "  FAIL probe matcher: a refusal after an INFO line naming the knob not detected"; bad=1; }
