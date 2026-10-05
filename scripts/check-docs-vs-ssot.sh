@@ -231,13 +231,18 @@ CANONICAL_AGE_FLOOR="$(
 AGE_VERSION_RS="src/store/postgres/age_version.rs"
 
 # Profile::full().expected_tool_count() — count of RegisteredTool::of::<>() entries
-CANONICAL_FULL_TOOL_COUNT=$(grep -cE '^\s*RegisteredTool::of::<' src/mcp/registry.rs 2>/dev/null || echo 0)
+# grep -c prints its count AND exits 1 on zero matches, so `|| echo 0` would
+# append a second 0 ("0<newline>0"); `|| true` keeps the one count, and an
+# absent file (no output) reads as 0 (#5811).
+CANONICAL_FULL_TOOL_COUNT=$(grep -cE '^\s*RegisteredTool::of::<' src/mcp/registry.rs 2>/dev/null || true)
+CANONICAL_FULL_TOOL_COUNT="${CANONICAL_FULL_TOOL_COUNT:-0}"
 # asi-hard pinned-knob count (#3113). SSOT = the `KnobSpec` entries in the
 # `KNOBS` table (mirrored by the derived const
 # `security_profile::PINNED_KNOB_COUNT`). Counted from source for the same
 # reason as the tool count above: the entries ARE the definition, so a knob
 # cannot be added without moving this number.
-CANONICAL_ASI_HARD_KNOBS=$(grep -cE '^[[:space:]]*KnobSpec \{' src/security_profile.rs 2>/dev/null || echo 0)
+CANONICAL_ASI_HARD_KNOBS=$(grep -cE '^[[:space:]]*KnobSpec \{' src/security_profile.rs 2>/dev/null || true)
+CANONICAL_ASI_HARD_KNOBS="${CANONICAL_ASI_HARD_KNOBS:-0}"  # same grep -c shape as above (#5811)
 
 # Profile::core().expected_tool_count() — count of tn::* refs in the
 # `Self::Core => &[ ... ]` arm of Profile::tool_names(). 7 at v0.7.0.
@@ -481,20 +486,67 @@ CERT_CHECK_DOC_FILES=(
     docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md
 )
 
-# Every hand-enrolled doc must exist (#5702). The rules below skip a file that is
-# not there, so before this check a renamed, moved or deleted enrolled doc shrank
-# the closed world each rule claims to police and the gate still printed PASS. A
-# deliberate removal is a one-line edit to the list it is enrolled in. A self-test
-# fixture enrols a subset of these, so under AI_MEMORY_DOCS_GATE_ROOT the check
-# runs only when AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 (the #2444 precedent).
+# Surfaces the asi-hard pinned-knob count rule walks (the rule's own list; the
+# coverage note at its call site says what each one carries). Hoisted into a
+# named array so the enrolled-input check below sees it (#5811).
+ASI_HARD_DOC_FILES=(
+    CLAUDE.md
+    README.md
+    SECURITY.md
+    PERFORMANCE.md
+    docs/deploy/README.md
+    docs/deploy/asi-hard.env
+    docs/deploy/enterprise-federation.env
+    docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md
+    docs/enterprise-deployment.md
+    src/security_profile.rs
+    src/enterprise_federation_posture.rs
+    scripts/check-bootstrap-cert-gate.sh
+)
+
+# Every hand-enrolled input must exist, be readable and hold text (#5702, #5811).
+# Before #5702 a rule skipped an enrolled file that was not there, so a renamed,
+# moved or deleted input shrank the closed world each rule claims to police and
+# the gate still printed PASS. No rule skips an absent input any more: outside a
+# self-test fixture every enrolled list (and the AGE comparator mirror) is checked
+# here, and a missing, unreadable or whitespace-only input is refused by name. A
+# deliberate removal is a one-line edit to the list it is enrolled in. An empty
+# boot-banner scan set is refused here too (its pages come from a glob). A
+# self-test fixture enrols a subset, so under AI_MEMORY_DOCS_GATE_ROOT the check
+# runs only when AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 (the #2444 precedent), and
+# otherwise each list drops its absent entries before any rule reads it.
 if [[ -z "${AI_MEMORY_DOCS_GATE_ROOT:-}" || "${AI_MEMORY_DOCS_GATE_REQUIRE_DOCS:-}" == 1 ]]; then
     for _ed in "${DOC_FILES[@]}" "${WIDENED_DOC_FILES[@]}" "${HOOK_EXTRA_DOC_FILES[@]}" \
-               "${PGVECTOR_DOC_FILES[@]}" "${CERT_CHECK_DOC_FILES[@]}"; do
-        [[ -f "$_ed" ]] && continue
-        printf 'FAIL: check-docs-vs-ssot: enrolled doc %s is missing — refusing to report PASS on a shrunken closed world (#5702 fail-closed)\n' \
-            "$_ed" >&2
+               "${PGVECTOR_DOC_FILES[@]}" "${CERT_CHECK_DOC_FILES[@]}" "${ASI_HARD_DOC_FILES[@]}" \
+               "$AGE_VERSION_RS"; do
+        if [[ ! -f "$_ed" ]]; then
+            _why=missing
+        elif [[ ! -r "$_ed" ]]; then
+            _why=unreadable
+        elif ! grep -q '[^[:space:]]' "$_ed"; then
+            _why=empty
+        else
+            continue
+        fi
+        printf 'FAIL: check-docs-vs-ssot: enrolled doc %s is %s — refusing to report PASS on a shrunken closed world (#5702, #5811 fail-closed)\n' \
+            "$_ed" "$_why" >&2
         exit 1
     done
+    if [[ ${#BANNER_DOC_FILES[@]} -eq 0 ]]; then
+        printf 'FAIL: check-docs-vs-ssot: the boot-banner scan set resolved ZERO docs (docs/integrations/*.md outside DOC_FILES, docs/QUICKSTART.md) — the banner check would be a silent no-op (#5811 fail-closed)\n' >&2
+        exit 1
+    fi
+else
+    _kept=(); for _p in "${DOC_FILES[@]}"; do [[ -f "$_p" ]] && _kept+=("$_p"); done
+    DOC_FILES=(${_kept[@]+"${_kept[@]}"})
+    _kept=(); for _p in "${HOOK_DOC_FILES[@]}"; do [[ -f "$_p" ]] && _kept+=("$_p"); done
+    HOOK_DOC_FILES=(${_kept[@]+"${_kept[@]}"})
+    _kept=(); for _p in "${PGVECTOR_DOC_FILES[@]}"; do [[ -f "$_p" ]] && _kept+=("$_p"); done
+    PGVECTOR_DOC_FILES=(${_kept[@]+"${_kept[@]}"})
+    _kept=(); for _p in "${CERT_CHECK_DOC_FILES[@]}"; do [[ -f "$_p" ]] && _kept+=("$_p"); done
+    CERT_CHECK_DOC_FILES=(${_kept[@]+"${_kept[@]}"})
+    _kept=(); for _p in "${ASI_HARD_DOC_FILES[@]}"; do [[ -f "$_p" ]] && _kept+=("$_p"); done
+    ASI_HARD_DOC_FILES=(${_kept[@]+"${_kept[@]}"})
 fi
 
 # CHANGELOG.md is intentionally excluded — every entry is a historical
@@ -572,7 +624,7 @@ check_schema_version_rule() {
     fi
     local scan_files=() f
     for f in "${DOC_FILES[@]}" "${HTML_DOC_FILES[@]:-}"; do
-        [[ -n "$f" && -f "$f" ]] && scan_files+=("$f")
+        [[ -n "$f" ]] && scan_files+=("$f")
     done
     if [[ ${#scan_files[@]} -eq 0 && -z "${AI_MEMORY_DOCS_GATE_ROOT:-}" ]]; then
         printf 'FAIL: check-docs-vs-ssot: the CURRENT_SCHEMA_VERSION sweep resolved ZERO files — refusing to report PASS (#2444 fail-closed)\n' >&2
@@ -1007,8 +1059,6 @@ def html_window_historical(window):
 
 
 for f in os.environ["GATE_NC_FILES"].split():
-    if not os.path.isfile(f):
-        continue
     is_html = f.endswith(".html")
     markdownish = f.endswith((".md", ".html"))
     lines = open(f, encoding="utf-8").read().splitlines()
@@ -1072,7 +1122,6 @@ check_pgvector_version_rule() {
     local rule_name="PGVECTOR_APT_VERSION (certified pgvector patch)"
     local canonical="$CANONICAL_PGVECTOR_PATCH"
     for f in "${PGVECTOR_DOC_FILES[@]}"; do
-        [[ -f "$f" ]] || continue
         # Empty canonical + a doc to validate = the SSOT file was
         # unreadable. FAIL CLOSED (#2713 discipline) rather than flag
         # every citation as drift OR silently pass.
@@ -1174,8 +1223,10 @@ for ln, line in enumerate(open('$f', encoding='utf-8').read().splitlines(), 1):
 # HTML_DOC_FILES by HTML_FROZEN_EXEMPT at the top of this script, which is
 # exactly why a `whats-new-v0.8.0` page may keep stamping v0.8.0.
 # #3756 — bind the Rust AGE-version pins to their SSOTs. Fails CLOSED when
-# the mirror exists but a SSOT is unreadable; skips cleanly when the mirror
-# is absent (a fixture tree). A mismatch names both values.
+# the mirror exists but a SSOT is unreadable. An absent mirror is refused
+# by name at the enrolled-input check (#5811); the skip below is reached
+# only in a self-test fixture that does not enrol it. A mismatch names both
+# values.
 check_age_version_consts_rule() {
     local rule_name="AGE_VERSION_* (comparator pins mirror the SSOT)"
     [[ -f "$AGE_VERSION_RS" ]] || return 0
@@ -1246,8 +1297,6 @@ INSTALL_REF = re.compile(
 )
 
 for path in os.environ.get("GATE_STAMP_FILES", "").split():
-    if not os.path.isfile(path):
-        continue
     lines = open(path, encoding="utf-8").read().splitlines()
     depth = 0
     for ln, line in enumerate(lines, 1):
@@ -1345,6 +1394,13 @@ check_env_var_census_rule() {
         _census_production_lines | grep -oE 'const [A-Z][A-Z0-9_]*: *&str *= *"AI_MEMORY_[A-Z0-9_]+"'; \
         _census_production_lines | grep -oE 'env *= *"AI_MEMORY_[A-Z0-9_]+"'; } \
         | grep -oE 'AI_MEMORY_[A-Z0-9_]+' | LC_ALL=C sort -u) || true
+    # Zero vars is legitimate only in a self-test fixture that enrols no src tree;
+    # outside one (or under AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1) it means the census
+    # read nothing, so it is refused by name rather than passed (#5811).
+    if [[ -z "$code_vars" ]] && [[ -z "${AI_MEMORY_DOCS_GATE_ROOT:-}" || "${AI_MEMORY_DOCS_GATE_REQUIRE_DOCS:-}" == 1 ]]; then
+        printf 'FAIL: %s: resolved ZERO AI_MEMORY_* env vars from the production src/ tree — the census would be a silent no-op (#5811 fail-closed)\n' "$rule_name" >&2
+        exit 1
+    fi
     for var in $code_vars; do
         # Word-boundaried: a bare `grep -q` lets a LONGER var's mention
         # satisfy a shorter one (`AI_MEMORY_STORE_URL` would be answered
@@ -1670,19 +1726,13 @@ def banner_scan(f, ln, text, hist_window):
 
 
 def scan_banner_only(f):
-    try:
-        text = open(f, encoding="utf-8").read()
-    except OSError:
-        return
+    text = open(f, encoding="utf-8").read()
     for ln, line in enumerate(text.splitlines(), 1):
         banner_scan(f, ln, line, False)
 
 
 def scan(f, is_html):
-    try:
-        text = open(f, encoding="utf-8").read()
-    except OSError:
-        return
+    text = open(f, encoding="utf-8").read()
     lines = text.splitlines()
     for ln, line in enumerate(lines, 1):
         ctx = line.strip()[:160].replace("\t", " ")
@@ -1844,18 +1894,7 @@ run_all_rules() {
         "ASI_HARD_PINNED_KNOB_COUNT" \
         "$CANONICAL_ASI_HARD_KNOBS" \
         '([0-9]+)-knob|(?:auto-)?[Pp]ins the ([0-9]+)(?: asi-hard)? knobs|holds \*\*([0-9]+)\*\* entries|names all ([0-9]+) correctly|SSOT for the ([0-9]+)|\*\*([0-9]+)\*\* post-#|shows `([0-9]+)/[0-9]+`|`PINNED_KNOB_COUNT` \(([0-9]+)\)|is \*\*([0-9]+) knobs\*\*|PINS \*\*([0-9]+)\*\* security env knobs|([0-9]+)-entry pin-and-refuse|all \*\*([0-9]+)\*\* `KNOBS` entries|All \*\*([0-9]+)\*\* of them' \
-        CLAUDE.md \
-        README.md \
-        SECURITY.md \
-        PERFORMANCE.md \
-        docs/deploy/README.md \
-        docs/deploy/asi-hard.env \
-        docs/deploy/enterprise-federation.env \
-        docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md \
-        docs/enterprise-deployment.md \
-        src/security_profile.rs \
-        src/enterprise_federation_posture.rs \
-        scripts/check-bootstrap-cert-gate.sh
+        "${ASI_HARD_DOC_FILES[@]}"
     check_generalised_numeric_claims
     check_pgvector_version_rule
     check_age_version_consts_rule
@@ -3375,20 +3414,42 @@ R5808MD
 
     # ---- #5702: every hand-enrolled doc must exist. The fixture enrols a subset, so
     # the arm opts in with AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1, fills the enrolled set
-    # with empty files, then moves one entry of each list away: the gate must refuse
-    # by name. The control (all present) must not raise the refusal. Every pgvector
-    # entry is also on another list today, so that list has no entry of its own to move.
+    # with one line of text each (an empty input is refused too, #5811), then moves
+    # one entry of each list away: the gate must refuse by name. The control (all
+    # present) must not raise the refusal. Every pgvector entry is also on another
+    # list today, so that list has no entry of its own to move. The control also
+    # holds one boot-banner doc and one production env var, so the #5811 empty-set
+    # refusals stay quiet until an arm below takes them away.
     _made=()
     for _ed in "${DOC_FILES[@]}" "${WIDENED_DOC_FILES[@]}" "${HOOK_EXTRA_DOC_FILES[@]}" \
-               "${PGVECTOR_DOC_FILES[@]}" "${CERT_CHECK_DOC_FILES[@]}"; do
+               "${PGVECTOR_DOC_FILES[@]}" "${CERT_CHECK_DOC_FILES[@]}" "${ASI_HARD_DOC_FILES[@]}" \
+               "$AGE_VERSION_RS" docs/QUICKSTART.md src/fixture_env_5811.rs; do
         [[ -e "$tmpdir/$_ed" ]] && continue
         mkdir -p "$(dirname "$tmpdir/$_ed")"
-        : > "$tmpdir/$_ed"
+        printf 'fixture enrolled input\n' > "$tmpdir/$_ed"
         _made+=("$_ed")
     done
+    printf 'fn f() { let _ = std::env::var("AI_MEMORY_FIXTURE_5811"); }\n' > "$tmpdir/src/fixture_env_5811.rs"
     _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) || true
-    grep -qF 'enrolled doc ' <<<"$_e_out" && {
-        echo "FAIL: self-test #5702 - the enrolled-doc check refused a complete enrolled set" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _not in 'enrolled doc ' 'boot-banner scan set resolved ZERO' 'resolved ZERO AI_MEMORY_'; do
+        grep -qF "$_not" <<<"$_e_out" && {
+            echo "FAIL: self-test #5702 - a complete enrolled set raised a refusal: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    # A knob SSOT that holds no KnobSpec, and a tool registry that holds no
+    # RegisteredTool entry, each read as one 0, not grep -c's 0 plus a fallback 0
+    # (#5811); the run's ENV_VAR_CENSUS and AGE refusals print the canonical
+    # summary this greps.
+    cp "$tmpdir/src/security_profile.rs" "$tmpdir/src/security_profile.rs.keep"
+    cp "$tmpdir/src/mcp/registry.rs" "$tmpdir/src/mcp/registry.rs.keep"
+    printf 'no knob entries here\n' > "$tmpdir/src/security_profile.rs"
+    printf 'no registered tools here\n' > "$tmpdir/src/mcp/registry.rs"
+    _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) || true
+    mv "$tmpdir/src/security_profile.rs.keep" "$tmpdir/src/security_profile.rs"
+    mv "$tmpdir/src/mcp/registry.rs.keep" "$tmpdir/src/mcp/registry.rs"
+    grep -qF 'asi-hard pinned knobs = 0 (' <<<"$_e_out" || {
+        echo "FAIL: self-test #5811 - a knob SSOT with zero KnobSpec entries did not read as one 0" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'Profile::full() tool count = 0 (' <<<"$_e_out" || {
+        echo "FAIL: self-test #5811 - a tool registry with zero RegisteredTool entries did not read as one 0" >&2; cd "$REPO_ROOT"; exit 1; }
     for _ed in docs/v1.0.0/nhi-playbook-P0-P11.md docs/USER_GUIDE.md docs/postgres-age-guide.md \
                docs/strategy/coala-mapping.md docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md; do
         mv "$tmpdir/$_ed" "$tmpdir/$_ed.away"
@@ -3398,6 +3459,51 @@ R5808MD
             echo "FAIL: self-test #5702 - the refusal for a missing enrolled doc does not name $_ed" >&2; cd "$REPO_ROOT"; exit 1; }
         mv "$tmpdir/$_ed.away" "$tmpdir/$_ed"
     done
+    # ---- #5811: every input the rules read is enrolled and checked, not skipped.
+    # Each asi-hard surface and the AGE comparator mirror, moved away, fails the gate
+    # by name (docs/deploy/enterprise-federation.env is the file whose 17-vs-current
+    # drift once went unseen); a whitespace-only input and an unreadable one fail by
+    # name; an empty boot-banner scan set and an empty env-var census fail by name.
+    for _ed in "${ASI_HARD_DOC_FILES[@]}" "$AGE_VERSION_RS"; do
+        mv "$tmpdir/$_ed" "$tmpdir/$_ed.away"
+        _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) && {
+            echo "FAIL: self-test #5811 - a missing enrolled input ($_ed) did not fail the gate" >&2; cd "$REPO_ROOT"; exit 1; }
+        grep -qF "enrolled doc $_ed is missing" <<<"$_e_out" || {
+            echo "FAIL: self-test #5811 - the refusal for a missing enrolled input does not name $_ed" >&2; cd "$REPO_ROOT"; exit 1; }
+        mv "$tmpdir/$_ed.away" "$tmpdir/$_ed"
+    done
+    _ed=docs/deploy/enterprise-federation.env
+    cp "$tmpdir/$_ed" "$tmpdir/$_ed.keep"
+    printf '  \n\t\n' > "$tmpdir/$_ed"
+    _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) && {
+        echo "FAIL: self-test #5811 - a whitespace-only enrolled input did not fail the gate" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF "enrolled doc $_ed is empty" <<<"$_e_out" || {
+        echo "FAIL: self-test #5811 - the refusal for an empty enrolled input does not name $_ed" >&2; cd "$REPO_ROOT"; exit 1; }
+    mv "$tmpdir/$_ed.keep" "$tmpdir/$_ed"
+    chmod 000 "$tmpdir/$_ed"
+    if [[ -r "$tmpdir/$_ed" ]]; then
+        chmod 644 "$tmpdir/$_ed"
+        echo "NOTE: self-test #5811 - the unreadable-input arm needs a user that file modes bind (uid $(id -u) reads a mode-000 file); the missing and empty arms ran"
+    else
+        _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) && {
+            chmod 644 "$tmpdir/$_ed"; echo "FAIL: self-test #5811 - an unreadable enrolled input did not fail the gate" >&2; cd "$REPO_ROOT"; exit 1; }
+        chmod 644 "$tmpdir/$_ed"
+        grep -qF "enrolled doc $_ed is unreadable" <<<"$_e_out" || {
+            echo "FAIL: self-test #5811 - the refusal for an unreadable enrolled input does not name $_ed" >&2; cd "$REPO_ROOT"; exit 1; }
+    fi
+    mv "$tmpdir/docs/QUICKSTART.md" "$tmpdir/docs/QUICKSTART.md.away"
+    _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) && {
+        echo "FAIL: self-test #5811 - an empty boot-banner scan set did not fail the gate" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'boot-banner scan set resolved ZERO' <<<"$_e_out" || {
+        echo "FAIL: self-test #5811 - the refusal for an empty boot-banner scan set is not named" >&2; cd "$REPO_ROOT"; exit 1; }
+    mv "$tmpdir/docs/QUICKSTART.md.away" "$tmpdir/docs/QUICKSTART.md"
+    mv "$tmpdir/src/fixture_env_5811.rs" "$tmpdir/src/fixture_env_5811.rs.away"
+    _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) && {
+        echo "FAIL: self-test #5811 - an empty env-var census did not fail the gate" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'resolved ZERO AI_MEMORY_' <<<"$_e_out" || {
+        echo "FAIL: self-test #5811 - the refusal for an empty env-var census is not named" >&2; cd "$REPO_ROOT"; exit 1; }
+    mv "$tmpdir/src/fixture_env_5811.rs.away" "$tmpdir/src/fixture_env_5811.rs"
+    echo "PASS: self-test #5811 - every asi-hard surface and the AGE comparator mirror, moved away, FAILS the gate by name (enterprise-federation.env among them); a whitespace-only and an unreadable enrolled input fail by name; an empty boot-banner scan set and an empty env-var census fail by name; a knob SSOT and a tool registry with zero entries each read as one 0"
     for _ed in "${_made[@]}"; do rm -f "$tmpdir/$_ed"; done
     echo "PASS: self-test #5702 - a missing hand-enrolled doc FAILS the gate and names the path: one entry each of curated DOC_FILES (nhi-playbook), the widened list (USER_GUIDE, and postgres-age-guide, also on the pgvector list), the hook extras (coala-mapping) and the cert list (ENTERPRISE-FEDERATION-CERTIFICATION, also on the pgvector list); a complete enrolled set does not raise it"
 
