@@ -1190,9 +1190,30 @@ def reads_a_file_silent(stage):
 
 
 # #5418: a command that is not a listed file printer may still print a file; a command outside this set that names a
-# file the script wrote, and does not end in a file redirect or a silent consumer, is reported.
+# file the script wrote, and does not end in a file redirect or a silent consumer, is reported. cp, install and
+# cmp are in the set but silent only per silent_file_cmd (#5524): a terminal or undecidable operand, or cmp -b/-l.
 SILENT_FILE_CMDS = frozenset(("rm", "mv", "cp", "chmod", "chown", "scp", "mkdir", "touch", "test", "[", "wc", "curl",
                               "mktemp", "stat", "ln", "sync", "rmdir", "install", "exec", "trap", "cmp", "ls", "true"))
+
+
+def silent_file_cmd(words):
+    """#5524: True when the command prints no file content. cp and install print one when an operand is the
+    terminal (/dev/tty, /dev/stdout, a dotdot path) or cannot be decided (a bare variable, a glob); cmp prints
+    differing bytes with -b or -l. ln only links, so it stays silent."""
+    if not words or words[0] not in SILENT_FILE_CMDS:
+        return False
+    ops = [w.strip("\"'") for w in words[1:]]
+    if words[0] in ("cp", "install"):
+        for o in ops:
+            if o.startswith("-") or o == "/dev/null":
+                continue
+            if o.startswith(("/dev/", "/proc/")) or ".." in o.split("/"):
+                return False
+            if re.search(r"[$~*?\[{`]", o) and not re.fullmatch(VAR_PATH, o):
+                return False
+    if words[0] == "cmp" and any(re.fullmatch(r"-\w*[bl]\w*|--print-bytes|--verbose", o) for o in ops):
+        return False
+    return True
 
 
 def unlisted_reader_findings(text):
@@ -1210,7 +1231,7 @@ def unlisted_reader_findings(text):
         for stage, _ in pipeline_stages(line):
             words = stage_words(stage).split()
             word = words[0] if words else ""
-            if not word or word in FILE_PRINTERS or word in SILENT_FILE_CMDS or word in ("printf", "echo"):
+            if not word or word in FILE_PRINTERS or silent_file_cmd(words) or word in ("printf", "echo"):
                 continue
             body = re.sub(r"(?:\d*>>?|&>>?|>\|)&?\s*(?:\"[^\"]*\"|'[^']*'|\S+)", "", stage)
             if any(t in body for t in targets) and not stdout_to_file(stage):
@@ -1454,6 +1475,14 @@ def closed_world_taint(fs):
                         ("a write through a segment held in a variable", 'x=../../../../dev/stderr\nprintf %s "$qjson" > "$OUT_DIR/$x"'),
                         ("a write through a dotdot after a variable", 'printf %s "$qjson" > "$OUT_DIR/..$n/x"'),
                         ("a literal path with a dotdot segment", 'printf %s "$qjson" > /var/../dev/tty'),
+                        # #5524: cp, install and cmp can print a file.
+                        ("cp of a written file to the tty", 'printf %s x > "$OUT_DIR/r9"\ncp "$OUT_DIR/r9" /dev/tty'),
+                        ("install of a written file to stdout", 'printf %s x > "$OUT_DIR/r9"\ninstall -m 0644 "$OUT_DIR/r9" /dev/stdout'),
+                        ("cp of a written file to a bare variable", 'printf %s x > "$OUT_DIR/r9"\ncp "$OUT_DIR/r9" "$dest"'),
+                        ("install of a written file under a dotdot path", 'printf %s x > "$OUT_DIR/r9"\ninstall "$OUT_DIR/r9" "$OUT_DIR/../../dev/tty"'),
+                        ("cmp -b of a written file", 'printf %s x > "$OUT_DIR/r9"\ncmp -b "$OUT_DIR/r9" "$OUT_DIR/author.id"'),
+                        ("cmp -l of a written file", 'printf %s x > "$OUT_DIR/r9"\ncmp -l "$OUT_DIR/r9" "$OUT_DIR/author.id"'),
+                        ("cmp --verbose of a written file", 'printf %s x > "$OUT_DIR/r9"\ncmp --verbose "$OUT_DIR/r9" "$OUT_DIR/author.id"'),
                         ("a write to a glob target", 'printf %s "$qjson" > /dev/tty[0-9]*'),
                         ("a write to a brace-expanded target", 'printf %s "$qjson" > /dev/{stderr,null}'),
                         ("an append to a target held in a variable", 'dest=/dev/stderr\nprintf %s "$qjson" >> "$dest"'),
@@ -1538,6 +1567,12 @@ def closed_world_taint(fs):
                         ("printf of a written file path", 'printf %s x > "$OUT_DIR/r9"\nprintf \'%s\\n\' "$OUT_DIR/r9"'),
                         ("a file with a variable inside a segment", 'printf %s "$qjson" > "$OUT_DIR/a$n.txt"'),
                         ("a literal file whose name starts with dots", 'printf %s "$qjson" > "$OUT_DIR/..hidden"'),
+                        ("cp of a written file to a file", 'printf %s x > "$OUT_DIR/r9"\ncp -f -- "$OUT_DIR/r9" "$OUT_DIR/r8"'),
+                        ("install of a written file to a file", 'printf %s x > "$OUT_DIR/r9"\ninstall -m 0600 "$OUT_DIR/r9" "$run_dir/client.crt"'),
+                        ("cp of a written file to /dev/null", 'printf %s x > "$OUT_DIR/r9"\ncp "$OUT_DIR/r9" /dev/null'),
+                        ("cmp -s of a written file", 'printf %s x > "$OUT_DIR/r9"\ncmp -s "$OUT_DIR/r9" "$OUT_DIR/author.id"'),
+                        ("cmp of a written file", 'printf %s x > "$OUT_DIR/r9"\ncmp "$OUT_DIR/r9" "$OUT_DIR/author.id" >/dev/null'),
+                        ("ln of a written file", 'printf %s x > "$OUT_DIR/r9"\nln -sf "$OUT_DIR/r9" "$OUT_DIR/r8"'),
                         ("a file under a nested directory", 'printf %s "$qjson" > "$OUT_DIR/sub/r.txt"'),
                         ("a reader with only stderr sent to a written file", 'printf %s x > "$OUT_DIR/r9"\nbat /etc/hostname 2> "$OUT_DIR/r9"'),
                         ("a here-document to a file", 'cat > "$OUT_DIR/r" <<EOT\nx $qjson\nEOT'),
