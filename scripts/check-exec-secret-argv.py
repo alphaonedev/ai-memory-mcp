@@ -1385,9 +1385,10 @@ def _git_exec(root: Path, args: Sequence[str]) -> "subprocess.CompletedProcess[b
     # from ls-files and status, core.hooksPath would point git at hooks; log.showSignature would make every log
     # read run the signature verifier of each signed commit, so it is off and every verifier program (gpg,
     # openpgp, x509, ssh) is the null device as well (#5822); the history log passes --no-ext-diff and
-    # --no-textconv itself, the blob reads pass --no-textconv (a blob read does not diff) (#5825)
-    argv =["git", "-C", str(root), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull,
-            "-c", "log.showSignature=false"]
+    # --no-textconv itself, the blob reads pass --no-textconv (a blob read does not diff) (#5825); the advice
+    # that the null graft file prints is off, so a fault quotes git's reason and not the hint (#5846)
+    argv = ["git", "-C", str(root), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull,
+            "-c", "log.showSignature=false", "-c", "advice.graftFileDeprecated=false"]
     for key in GIT_VERIFIER_KEYS:
         argv += ["-c", key + "=" + os.devnull]
     return subprocess.run(argv + list(args), check=True, capture_output=True, env=_git_child_env())
@@ -3318,8 +3319,11 @@ def _git_funnel_cases(t: Path) -> Tuple[List[str], int]:
     _GIT_PROVEN.clear()
     try:
         removed_pending_rows(partial)
-    except (RuntimeError, subprocess.CalledProcessError):
-        pass
+    except (RuntimeError, subprocess.CalledProcessError) as exc:
+        # the fault names git's reason, not the advice hint the null graft file would print first (#5846)
+        n += 1
+        if "hint:" in str(exc):
+            bad.append("a history fault shows a git advice hint instead of its reason: %s (#5846)" % str(exc)[:80])
     if lmark.exists():
         bad.append("a partial clone ran a repo-configured transport program during the gate's git reads (#5823)")
     shutil.rmtree(str(partial), ignore_errors=True)
