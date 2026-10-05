@@ -586,6 +586,28 @@ MDEOF
         "$R::no_such" \
         "See \`$R::{RecallTool&lt;F: Fn() -&gt; u8&gt;::no_such}\`."
 
+    # #5430: a balanced group followed by a stray closer is unbalanced and is
+    # REPORTED; it used to end the capture, hiding every component behind it.
+    # Every component is live, so only the unbalanced rule can make these red.
+    anchor_red 5430 QUAL "an over-closed generic group before a live method" \
+        "See \`$R::RecallTool<T>>::decorate_memory_many\`."
+    anchor_red 5430 BARE_QUAL "an unbackticked over-closed generic group before a live method" \
+        "See $R::RecallTool<T>>::decorate_memory_many prose."
+    anchor_red 5430 QUAL "an over-closed HTML-entity generic group" \
+        "See \`$R::RecallTool&lt;T&gt;&gt;::decorate_memory_many\`."
+    anchor_red 5430 QUAL "an over-closed mixed entity and angle group" \
+        "See \`$R::RecallTool<T&gt;>::decorate_memory_many\`."
+    anchor_red 5430 QUAL "an over-closed turbofish group" \
+        "See \`$R::RecallTool::<T>>::decorate_memory_many\`."
+    anchor_red 5430 QUAL "an over-closed leading <Type as Trait> group" \
+        "See \`$R::<RecallTool as Tr>>::decorate_memory_many\`."
+    anchor_red 5430 QUAL "an over-closed nested generic group with a missing method" \
+        "See \`$R::RecallTool<Vec<T>>>::no_such\`."
+    anchor_red 5430 QUAL "an over-closed group ending the anchor" \
+        "See \`$R::RecallTool<T>>\`."
+    anchor_green 5430 "a live symbol closed by a prose angle bracket, no group of its own" \
+        "See Option<$R::RecallTool> here."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
@@ -1213,18 +1235,26 @@ def _token_end(text, i):
     return j
 
 
+def _stray_close(text, i):
+    """True when `text` has an extra group closer (`>` or `&gt;`) at `i`."""
+    return i < len(text) and _group_step(text, i)[0] == "close"
+
+
 def scan_sym(text, i):
     """Scan the symbol path starting at `i`; returns its end index, or None
     when no symbol starts there. Path components are identifiers, each with an
     optional balanced group, joined by `::` (a bare group after `::` is a
     turbofish), after an optional leading `<Type as Trait>::`. A group that
-    never balances captures to the end of the token (#5393), so the caller
-    reports it instead of skipping the components behind it."""
+    never balances, or is followed by an extra closer (#5430), captures to the
+    end of the token (#5393), so the caller reports it instead of skipping the
+    components behind it."""
     pos = i
     if _opens_group(text, pos):
         end = scan_group(text, pos)
         if end is None:
             return _token_end(text, pos)
+        if _stray_close(text, end):
+            return _token_end(text, end)
         if not text.startswith("::", end):
             return None
         pos = end + 2
@@ -1238,6 +1268,8 @@ def scan_sym(text, i):
             if end is None:
                 return _token_end(text, pos)
             pos = end
+            if _stray_close(text, pos):
+                return _token_end(text, pos)
         if not text.startswith("::", pos):
             return pos
         m = ID_RE.match(text, pos + 2)
@@ -1248,6 +1280,8 @@ def scan_sym(text, i):
             if end is None:
                 return _token_end(text, pos + 2)
             pos = end
+            if _stray_close(text, pos):
+                return _token_end(text, pos)
         else:
             return pos
 
