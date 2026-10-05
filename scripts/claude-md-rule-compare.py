@@ -831,9 +831,29 @@ def _self_test_cases() -> int:
             "backslash in the docstring slot": b'"""doc \\\nmore"""\n' + refusal.encode(),
             "a str instead of bytes": '"""doc"""\n' + refusal,
         }
-        for label, data in encodings.items():
+        # The structure check also sees most of these, because ast.parse of the bytes honours the cookie. Each gate is
+        # therefore also pinned on a source that is structurally valid, so no gate is carried by another one.
+        benign = {
+            "a benign utf-7 cookie": b"# coding: utf-7\n" + plain,
+            "a benign utf-7 cookie on line 2 under a shebang": b"#!/usr/bin/env python3\n# coding: utf-7\n" + plain,
+            "a benign vim style cookie": b"# vim: set fileencoding=utf-7 :\n" + plain,
+            "a benign emacs style cookie": b"# -*- coding: utf-7 -*-\n" + plain,
+            "a benign latin-1 cookie": b"# coding: latin-1\n" + plain,
+            "a benign latin-1 cookie on line 2": b"#!/usr/bin/env python3\n# coding: iso-8859-1\n" + plain,
+            "all CR line ends": ('"""doc"""\n' + refusal).replace("\n", "\r").encode("utf-8"),
+            "an invalid utf-8 byte after line 2": b'"""doc"""\n# note\n# \xff\n' + refusal.encode(),
+            "a CRLF line continuation backslash": b'"""doc"""\r\nimport sys\r\n\\\r\n' + refusal.split("import sys\n", 1)[1].replace("\n", "\r\n").encode(),
+        }
+        for byte in [*range(0, 9), 11, 12, *range(14, 32), 127]:
+            benign[f"control byte {byte:#04x} in a comment"] = b'"""doc"""\nimport sys\n#' + bytes([byte]) + b"\n" + refusal.split("import sys\n", 1)[1].encode()
+        for label, data in {**encodings, **benign}.items():
             if not refusal_prefix_gap(data):
                 return f"a source with {label} was not refused (#5560)"
+        # imported_modules reads the bytes the way the interpreter does: a utf-7 comment that hides an import is seen.
+        hidden_import = base_dir / "hidden-import.py"
+        hidden_import.write_bytes(b"# coding: utf-7\n#+AAo-import colorsys\nimport sys\n")
+        if "colorsys" not in imported_modules(hidden_import):
+            return "imported_modules did not see an import hidden behind a coding cookie (#5560)"
         # #5562: only a real docstring (a str constant) is stripped from the front. Any other first statement must be
         # refused, however harmless it looks, so it cannot be mistaken for the docstring.
         tail = refusal
@@ -882,7 +902,7 @@ def _self_test_cases() -> int:
         fake = "zz_rule_compare_5565_absent"
         control_ok = plant_probe(fake, base_dir / "implant-fake", [])
         exit_three = plant_probe(fake, base_dir / "implant-fake-exit", [], exit_code=3)
-        if not (control_ok.ok and control_ok.planted_ran and control_ok.shadowable):
+        if not (control_ok.ok and control_ok.shadowable):  # ok already requires PLANTED exactly once
             return "the planted file of an absent module did not run cleanly (#5565)"
         if exit_three.ok:
             return "a probe child that exited non-zero was accepted (#5509, #5565)"
