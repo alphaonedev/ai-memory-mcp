@@ -630,59 +630,6 @@ def _my_long_kind(name: str) -> Optional[str]:
     return next(iter(kinds))
 
 
-def _my_words(text: str) -> List[str]:
-    """The shell words of one command (quotes and backslashes removed), up to its terminator: an unquoted pipe,
-    semicolon, ampersand (not the one of a redirection) or unmatched closing parenthesis, a newline, or a quote that
-    has no partner (the closing quote of an enclosing sh -c string)."""
-    words: List[str] = []
-    cur: List[str] = []
-    started = False
-    depth = 0
-    i = 0
-    n = len(text)
-    while i < n:
-        c = text[i]
-        if c in "\"'":
-            j = text.find(c, i + 1)
-            if j < 0:
-                break
-            piece = text[i + 1:j]
-            cur.append(piece.replace("\\" + c, c) if c == '"' else piece)
-            started = True
-            i = j + 1
-            continue
-        if c == "\\" and i + 1 < n:
-            if text[i + 1] != "\n":
-                cur.append(text[i + 1])
-                started = True
-            i += 2
-            continue
-        if c == "$" and text[i + 1:i + 2] == "(":
-            depth += 1
-            cur.append("$(")
-            started = True
-            i += 2
-            continue
-        if c == ")":
-            if depth == 0:
-                break
-            depth -= 1
-        elif depth == 0 and (c in "|;\n" or (c == "&" and not (cur and cur[-1][-1:] in "<>") and text[i + 1:i + 2] != ">")):
-            break
-        if c.isspace() and depth == 0:
-            if started:
-                words.append("".join(cur))
-                cur, started = [], False
-            i += 1
-            continue
-        cur.append(c)
-        started = True
-        i += 1
-    if started:
-        words.append("".join(cur))
-    return words
-
-
 def _my_words_hit(words: Sequence[str]) -> bool:
     """True when a word of one command carries an expansion that the closed world does not clear (see above)."""
     expect = ""
@@ -745,111 +692,368 @@ def _my_words_hit(words: Sequence[str]) -> bool:
     return False
 
 
-def _my_head_command(text: str, start: int, directory: str) -> bool:
-    """Whether the head matched at text[start:] is a command word: not a word of an echo string, not a package or
-    path operand. One rule for every head (#5820): it is a command unless a word before it in its command is a
-    verb of _MY_NONCMD_PREV. Its command starts after the last pipe, semicolon, ampersand or parenthesis; for a
-    head inside a quote that is the quote's own text when the quote opens a command substitution, and otherwise
-    the command around the quote followed by the quote's text, so a wrapper inside a payload (sudo, exec,
-    timeout, an assignment) is read like the same wrapper outside it. The first word of a quote is a command."""
-    if directory and not _MY_BIN_DIR_RE.search(directory):
-        return False
-    quote = ""
-    opener = -1
-    for k in range(start):
-        c = text[k]
-        if quote:
-            if c == quote:
-                quote = ""
-        elif c in "\"'":
-            quote, opener = c, k
-    if quote:
-        inner = text[opener + 1:start]
-        tail = re.split(r"[|;&(`]", inner)[-1]
-        if not tail.strip():
-            return True
-        before = tail if "(" in inner or "`" in inner else re.split(r"[|;&(]", text[:opener])[-1] + " " + tail
-    else:
-        before = re.split(r"[|;&(]", text[:start])[-1]
-    words = before.replace("\"", " ").replace("'", " ").split()
-    return not any(w.lower() in _MY_NONCMD_PREV for w in words)
+# The shell reader of the mysql family rule (#5820, #5821, round 11): ONE state machine reads the shell text of a
+# unit. States: plain text, single quote, ANSI-C quote, double quote, backslash escape, dollar-paren substitution
+# and plain parenthesis (with nesting), backtick substitution, parameter expansion. Every substitution body, every
+# parenthesis group and every quoted string (read as the payload an ssh, sh -c or docker exec shell runs) is read
+# again, recursively, by the same machine. An escaped opener (backslash dollar paren, backslash backtick) is read
+# as a substitution: one level of quoting removes the backslash and a far-side shell runs it. Closed world: when
+# the machine cannot resolve where a construct ends (an unclosed quote, substitution, parenthesis or backtick, an
+# escaped backtick without an escaped partner, a backslash that ends the unit, a case statement inside a
+# substitution, or readings nested deeper than _SH_MAX_DEPTH), the unit FAILS with that named reason, it is never
+# read on with a guess. A here-document body is not part of a unit (dockerfile_units reads it as units of its own).
+# A number sign is read as text, never as a comment: not every runner of a unit is a shell (a systemd ExecStart
+# line passes it on as a word), so the text after it is read like any other text of the unit.
+# An unmatched closing parenthesis at the top of a reading is a command boundary (a case pattern, or a group
+# opened on an earlier line): the text on both sides is read.
+_SH_MAX_DEPTH = 8
+_SH_ASSIGN_RE = re.compile(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=")
+_MY_CANDIDATE_RE = re.compile(r"(?i)mysql|mariadb")
 
 
-def _my_substitutions(text: str, pos: int) -> List[Tuple[int, int]]:
-    """(index of the dollar sign, index of the closing parenthesis or -1) of every $( ... ) around text[pos],
-    innermost first. Quotes are transparent (a quoted sh -c payload runs its substitutions); an escaped character
-    is skipped, except before a dollar sign, because an escaped \\$( in an ssh or sh -c payload runs on the far side;
-    a plain parenthesis nests (#5821)."""
-    stack: List[Tuple[int, bool]] = []
-    i = 0
-    while i < pos:
-        c = text[i]
-        if c == "\\":
-            i += 1 if text[i + 1:i + 2] == "$" else 2
-            continue
-        if c == "$" and text[i + 1:i + 2] == "(":
-            stack.append((i, True))
+class _ShUnreadable(Exception):
+    """The reader cannot resolve where a construct of the unit starts or ends: the unit FAILS (closed world)."""
+
+
+class _ShWord:
+    """One shell word: its characters with quotes and escapes removed (a substitution kept as its source text),
+    per character whether it is the word's own text (False inside a substitution, parameter or group) and the
+    index of the quote or expansion group it came from (-1 for plain text)."""
+    __slots__ = ("chars", "own", "grp", "groups")
+
+    def __init__(self) -> None:
+        self.chars: List[str] = []
+        self.own: List[bool] = []
+        self.grp: List[int] = []
+        self.groups: List[Tuple[str, List[list], Optional[list]]] = []
+
+    def add(self, text: str, own: bool, g: int) -> None:
+        for ch in text:
+            self.chars.append(ch)
+            self.own.append(own)
+            self.grp.append(g)
+
+    def group(self, kind: str, readings: List[list], payload: Optional[list] = None) -> int:
+        self.groups.append((kind, readings, payload))
+        return len(self.groups) - 1
+
+    @property
+    def value(self) -> str:
+        return "".join(self.chars)
+
+
+def _sh_bt_end(text: str, i: int) -> int:
+    """Index of the backtick that closes a backtick substitution opened before text[i], or -1."""
+    while i < len(text):
+        if text[i] == "\\":
             i += 2
             continue
-        elif c == "(":
-            stack.append((i, False))
-        elif c == ")" and stack:
-            stack.pop()
+        if text[i] == "`":
+            return i
         i += 1
-    out: List[Tuple[int, int]] = []
-    depth = 0
-    k = pos
-    opened = [o for o, sub in stack]
-    subs = {o for o, sub in stack if sub}
-    while opened and k < len(text):
-        c = text[k]
-        if c == "(":
-            depth += 1
-        elif c == ")":
-            if depth:
-                depth -= 1
+    return -1
+
+
+def _sh_escaped_bt_end(text: str, i: int) -> int:
+    """Index of the backslash of the escaped backtick that closes an escaped backtick opener, or -1."""
+    while i < len(text):
+        if text[i] == "\\":
+            if text[i + 1:i + 2] == "`":
+                return i
+            i += 2
+            continue
+        i += 1
+    return -1
+
+
+def _sh_unescape(body: str, keep: Optional[str]) -> str:
+    """One level of backslash removal: before any character (keep None, plain text) or before one of keep."""
+    out: List[str] = []
+    i = 0
+    while i < len(body):
+        c = body[i]
+        nxt = body[i + 1:i + 2]
+        if c == "\\" and nxt and (keep is None or nxt in keep):
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _sh_read(text: str, depth: int) -> List[List[_ShWord]]:
+    """The commands of one shell text, each a list of words (raises _ShUnreadable)."""
+    return _sh_commands(text, 0, depth, False)[0]
+
+
+def _sh_commands(text: str, i: int, depth: int, closer: bool) -> Tuple[List[List[_ShWord]], int]:
+    """Read commands from text[i:] to the end of the text, or (closer) to the parenthesis that closes the
+    substitution or group opened before text[i]; returns the commands and the index after the stop."""
+    if depth > _SH_MAX_DEPTH:
+        raise _ShUnreadable("readings nested deeper than %d" % _SH_MAX_DEPTH)
+    cmds: List[List[_ShWord]] = []
+    cmd: List[_ShWord] = []
+    word: Optional[_ShWord] = None
+    n = len(text)
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1:i + 2]
+        sep = c in ";|\n)" or (c == "&" and nxt != ">" and not (word is not None and word.chars[-1:] in (["<"], [">"])))
+        if sep or c in " \t\r":
+            if word is not None:
+                cmd.append(word)
+                word = None
+            i += 1
+            if not sep:
+                continue
+            if cmd:
+                cmds.append(cmd)
+                cmd = []
+            if c == ")" and closer:
+                if any(cm[0].value == "case" for cm in cmds):
+                    raise _ShUnreadable("a case statement inside a substitution or group")
+                return cmds, i
+            continue
+        if word is None:
+            word = _ShWord()
+        i = _sh_part(text, i, depth, word)
+    if closer:
+        raise _ShUnreadable("an unclosed command substitution or parenthesis")
+    if word is not None:
+        cmd.append(word)
+    if cmd:
+        cmds.append(cmd)
+    return cmds, n
+
+
+def _sh_dquote(text: str, i: int, depth: int) -> Tuple[int, List[Tuple[str, bool]], List[list], str]:
+    """Read a double-quoted string from text[i:] (after its opening quote): the index after its closing quote,
+    its value chunks (text, own), the readings of its substitutions and its payload text (the text a shell that
+    runs the string reads: backslash removed before a dollar sign, backtick, double quote or backslash)."""
+    chunks: List[Tuple[str, bool]] = []
+    readings: List[list] = []
+    pay: List[str] = []
+    n = len(text)
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1:i + 2]
+        if c == '"':
+            return i + 1, chunks, readings, "".join(pay)
+        if c == "\\" and nxt == "\n":
+            i += 2
+            continue
+        if c == "\\" and nxt and nxt in '$`"\\':
+            chunks.append((nxt, True))
+            pay.append(nxt)
+            i += 2
+            continue
+        if c == "$" and nxt in ("(", "{") or c == "`":
+            if c == "`":
+                j = _sh_bt_end(text, i + 1)
+                if j < 0:
+                    raise _ShUnreadable("an unclosed backtick substitution")
+                readings.append(_sh_read(_sh_unescape(text[i + 1:j], '$`"\\'), depth + 1))
+                j += 1
+            elif nxt == "(":
+                body, j = _sh_commands(text, i + 2, depth + 1, True)
+                readings.append(body)
             else:
-                o = opened.pop()
-                if o in subs:
-                    out.append((o, k))
-        k += 1
-    out.extend((o, -1) for o in reversed(opened) if o in subs)
+                j, rs = _sh_param(text, i + 2, depth)
+                readings.extend(rs)
+            chunks.append((text[i:j], False))
+            pay.append(text[i:j])
+            i = j
+            continue
+        chunks.append((c, True))
+        pay.append(c)
+        i += 1
+    raise _ShUnreadable("an unclosed double quote")
+
+
+def _sh_param(text: str, i: int, depth: int) -> Tuple[int, List[list]]:
+    """Read a parameter expansion from text[i:] (after its dollar brace): the index after its closing brace and
+    the readings of the substitutions inside it."""
+    readings: List[list] = []
+    count = 1
+    n = len(text)
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1:i + 2]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            if j < 0:
+                raise _ShUnreadable("an unclosed single quote")
+            i = j + 1
+            continue
+        if c == '"':
+            i, _chunks, rs, _pay = _sh_dquote(text, i + 1, depth + 1)
+            readings.extend(rs)
+            continue
+        if c == "$" and nxt == "(":
+            body, i = _sh_commands(text, i + 2, depth + 1, True)
+            readings.append(body)
+            continue
+        if c == "`":
+            j = _sh_bt_end(text, i + 1)
+            if j < 0:
+                raise _ShUnreadable("an unclosed backtick substitution")
+            readings.append(_sh_read(_sh_unescape(text[i + 1:j], "$`\\"), depth + 1))
+            i = j + 1
+            continue
+        if c == "{":
+            count += 1
+        elif c == "}":
+            count -= 1
+            if not count:
+                return i + 1, readings
+        i += 1
+    raise _ShUnreadable("an unclosed parameter expansion")
+
+
+def _sh_part(text: str, i: int, depth: int, word: _ShWord) -> int:
+    """Read one part of a word at text[i] into word; returns the index after it."""
+    c = text[i]
+    nxt = text[i + 1:i + 2]
+    if c == "\\":
+        if not nxt:
+            raise _ShUnreadable("a backslash ends the unit")
+        if nxt == "\n":
+            return i + 2
+        if nxt == "$" and text[i + 2:i + 3] == "(":
+            body, j = _sh_commands(text, i + 3, depth + 1, True)
+            word.add(text[i + 1:j], False, word.group("sub", [body]))
+            return j
+        if nxt == "`":
+            j = _sh_escaped_bt_end(text, i + 2)
+            if j < 0:
+                raise _ShUnreadable("an escaped backtick without an escaped partner")
+            reading = _sh_read(_sh_unescape(text[i + 2:j], None), depth + 1)
+            word.add("`" + text[i + 2:j] + "`", False, word.group("bt", [reading]))
+            return j + 2
+        word.add(nxt, True, -1)
+        return i + 2
+    if c == "'" or (c == "$" and nxt == "'"):
+        k = i + 1 if c == "'" else i + 2
+        if c == "'":
+            k = text.find("'", k)
+        else:
+            while k < len(text) and text[k] != "'":
+                k += 2 if text[k] == "\\" else 1
+            k = k if k < len(text) else -1
+        if k < 0:
+            raise _ShUnreadable("an unclosed single quote" if c == "'" else "an unclosed ANSI-C quote")
+        content = text[i + 1 if c == "'" else i + 2:k]
+        g = word.group("sq", [], _sh_read(content, depth + 1))
+        word.add(content if c == "'" else "$" + content, True, g)
+        return k + 1
+    if c == '"':
+        j, chunks, readings, payload = _sh_dquote(text, i + 1, depth)
+        g = word.group("dq", readings, _sh_read(payload, depth + 1))
+        for chunk, own in chunks:
+            word.add(chunk, own, g)
+        return j
+    if c == "$" and nxt == "(" or c == "(":
+        body, j = _sh_commands(text, i + 2 if c == "$" else i + 1, depth + 1, True)
+        word.add(text[i:j], False, word.group("sub" if c == "$" else "group", [body]))
+        return j
+    if c == "$" and nxt == "{":
+        j, readings = _sh_param(text, i + 2, depth)
+        word.add(text[i:j], False, word.group("param", readings))
+        return j
+    if c == "`":
+        j = _sh_bt_end(text, i + 1)
+        if j < 0:
+            raise _ShUnreadable("an unclosed backtick substitution")
+        reading = _sh_read(_sh_unescape(text[i + 1:j], "$`\\"), depth + 1)
+        word.add(text[i:j + 1], False, word.group("bt", [reading]))
+        return j + 1
+    word.add(c, True, -1)
+    return i + 1
+
+
+def _sh_sole_reading(w: _ShWord) -> Optional[list]:
+    """The reading of the substitution that is the whole word (quoted or not, escaped or not), or None."""
+    if not w.grp or len(set(w.grp)) != 1 or w.grp[0] < 0:
+        return None
+    kind, readings, payload = w.groups[w.grp[0]]
+    if kind in ("sub", "bt"):
+        return readings[0]
+    if kind in ("sq", "dq") and payload is not None and len(payload) == 1 and len(payload[0]) == 1:
+        return _sh_sole_reading(payload[0][0])
+    return None
+
+
+def _sh_head_rests(cmd: List[_ShWord], idx: int, outer_verb: bool) -> List[List[str]]:
+    """The words after every head at a command position in word idx of a command. A head is a command unless a
+    word before it in its command is a verb of _MY_NONCMD_PREV, or (outer_verb) it is no first word of a payload
+    whose command around the quote is such a verb (an echoed or printed string). A head quoted on its own is the
+    first word of a quote and always a command. A substitution that is the whole word and runs a head is the
+    command word (#5821): $(command -v mysql), "$(which mysqldump)", \\$(which mysql) in an ssh payload."""
+    w = cmd[idx]
+    v = w.value
+    prev: List[str] = []
+    for x in cmd[:idx]:
+        prev.extend(x.value.replace('"', " ").replace("'", " ").split())
+    out: List[List[str]] = []
+    after = [x.value for x in cmd[idx + 1:]]
+    for m in _MY_HEAD_RE.finditer(v):
+        s, e = m.span()
+        if not all(w.own[s:e]) or re.fullmatch(r"[A-Z0-9_]+", m.group("name")):
+            continue  # inside a substitution (read on its own), or MYSQL_ROOT_PASSWORD: an environment name
+        if m.group("dir") and not _MY_BIN_DIR_RE.search(m.group("dir")):
+            continue
+        gs = set(w.grp[s:e])
+        alone = len(gs) == 1 and min(gs) >= 0
+        if alone and "".join(ch for ch, g in zip(w.chars, w.grp) if g == min(gs)) != m.group(0):
+            continue  # a head inside a longer quote is read in the quote's payload
+        if not alone:
+            before = prev + v[:s].replace('"', " ").replace("'", " ").split()
+            if any(x.lower() in _MY_NONCMD_PREV for x in before) or (outer_verb and (idx or s)):
+                continue
+        out.append(v[e:].split() + after)
+    reading = _sh_sole_reading(w)
+    if reading is not None and not any(x.lower() in _MY_NONCMD_PREV for x in prev) and not (outer_verb and idx):
+        if any(True for _ in _sh_walk(reading, False)):
+            out.append(after)
     return out
 
 
-def _my_substitution_hit(raw: str, pos: int) -> bool:
-    """A head inside a command substitution that is itself the command word (#5821): $(command -v mysql),
-    "$(which mysqldump)". The substitution prints the command, so the words after it are the client's words and
-    are read as such. A substitution glued to a word before it (v=$(mysql ...), x$(...)) is no command word."""
-    for opener, close in _my_substitutions(raw, pos):
-        if close < 0:
-            continue
-        word = opener - 1 if opener > 0 and raw[opener - 1] in "\"'\\" else opener
-        if word > 0 and not (raw[word - 1].isspace() or raw[word - 1] in "|;&(`"):
-            continue
-        if not _my_head_command(raw, word, ""):
-            continue
-        rest = raw[close + 1:]
-        if word != opener and rest[:1] == raw[word]:
-            rest = rest[1:]
-        if _my_words_hit(_my_words(rest)):
-            return True
-    return False
+def _sh_walk(cmds: List[List[_ShWord]], outer_verb: bool) -> Iterable[List[str]]:
+    """The words after every head at a command position anywhere in a reading and in its nested readings."""
+    for cmd in cmds:
+        for idx, w in enumerate(cmd):
+            verb = any(x.value.lower() in _MY_NONCMD_PREV for x in cmd[:idx])
+            for _kind, readings, payload in w.groups:
+                for r in readings:
+                    yield from _sh_walk(r, False)
+                if payload is not None:
+                    yield from _sh_walk(payload, verb)
+            yield from _sh_head_rests(cmd, idx, outer_verb)
+
+
+def mysql_family_verdict(raw: str) -> Optional[str]:
+    """None when a unit is clean; a named reason when a mysql family command of it carries a credential the gate
+    cannot clear, or when the reader cannot resolve the shell text of a unit that names the family."""
+    if not _MY_CANDIDATE_RE.search(re.sub(r"[\"'\\]", "", raw)):
+        return None
+    try:
+        cmds = _sh_read(raw, 0)
+    except _ShUnreadable as exc:
+        return "unreadable shell: %s" % exc
+    for rest in _sh_walk(cmds, False):
+        if _my_words_hit(rest):
+            return "mysql credential"
+    return None
 
 
 def mysql_family_hit(raw: str) -> bool:
-    """True when a mysql family command of one logical line carries a credential the gate cannot clear."""
-    for m in _MY_HEAD_RE.finditer(raw):
-        if re.fullmatch(r"[A-Z0-9_]+", m.group("name")):
-            continue  # MYSQL_ROOT_PASSWORD, MYSQL_HOST: an environment variable name, not a command
-        if not _my_head_command(raw, m.start(), m.group("dir")):
-            continue
-        rest = raw[m.end():]
-        if m.start() > 0 and rest[:1] in ("\"", "'") and raw[m.start() - 1] == rest[:1]:
-            rest = rest[1:]  # the head was quoted on its own: "/usr/bin/mysql" --password="$X"
-        if _my_words_hit(_my_words(rest)) or _my_substitution_hit(raw, m.start()):
-            return True
-    return False
+    """True when a mysql family command of one logical line carries a credential the gate cannot clear, or the
+    line names the family and the reader cannot resolve its shell text (fail closed)."""
+    return mysql_family_verdict(raw) is not None
 
 
 # A credential-taking flag of a known tool fed from any expansion: the value is on argv
@@ -963,7 +1167,10 @@ def scan_exec_file(dl, rel: str, text: str) -> Optional[List[Found]]:
     for start, end, raw in units:
         reasons = trigger_reasons(raw, is_make)
         flagged = [deny[k] for k in range(start, end + 1) if k in deny]
-        if flagged or CRED_TOOL_RE.search(raw) or mysql_family_hit(raw) or WGET_PW_LONG_RE.search(raw) or wgetrc_credential(raw):
+        my = mysql_family_verdict(raw)
+        if my is not None and my.startswith("unreadable"):
+            reasons.insert(0, my)  # the named reason the reader could not resolve is shown first (closed world)
+        if flagged or CRED_TOOL_RE.search(raw) or my is not None or WGET_PW_LONG_RE.search(raw) or wgetrc_credential(raw):
             reasons.append("denylist")
         if reasons:
             found.append((start, norm(raw), reasons))
@@ -2143,6 +2350,14 @@ ROUND3_RED = [
     ('5859 mutant pin: reported 1: a backtick substitution in a quote is read like $(', 'echo "`sudo mysql -uroot -p$X`"'),
     ('5858 mutant pin: reported 1: a verb outside a quote does not hide a head that the substitution in the quote runs', 'echo "$(sudo mysql -uroot -p$X)"'),
     ('5683 mutant pin: reported 2: the password command word of mysqladmin is matched in any letter case', 'mysqladmin PASSWORD "x$NEW"'),
+    # Round 11: the 5868 row was green (an unclosed substitution named no command word); the closed-world reader
+    # cannot resolve where that substitution ends, so the line now FAILS as unreadable shell (#5821 neighbours).
+    ('5868 mutant pin: unreadable 1: a substitution that does not close is unreadable shell', 'printf \'%s\' "$X" | $(command -v mysql'),
+    ('5954 escaped-substitution pin: reported 1: an escaped dollar paren in a double-quoted ssh payload', 'ssh h "\\$(command -v mysql) -p\\$X"'),
+    ('5954 escaped-substitution pin: reported 2: an escaped dollar paren in a sh -c payload', 'sh -c "\\$(command -v mysql) -p\\$X"'),
+    ('5954 escaped-substitution pin: reported 3: an escaped dollar paren in a single-quoted ssh payload', "ssh h '\\$(command -v mysql) -p\\$X'"),
+    ('5954 escaped-substitution pin: reported 4: an escaped backtick pair in a double-quoted ssh payload', 'ssh h "\\`command -v mysql\\` -p\\$X"'),
+    ('5954 escaped-substitution pin: reported 5: a quoted escaped substitution in a docker exec payload', 'docker exec db sh -c "\\"\\$(command -v mariadb)\\" -p\\$X"'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
@@ -2218,7 +2433,6 @@ ROUND3_GREEN = [
     ('5821 substitution pin: clean 1: a substitution glued to a word is no command word', 'x$(command -v mysql) "$X"'),
     ('5821 substitution pin: clean 2: a substitution head with clean words', '$(command -v mysql) -uroot -h "$H" app'),
     ('5821 substitution pin: clean 3: a substitution that is an echo operand', 'echo "$(mysql --version)" "$X"'),
-    ('5868 mutant pin: clean 1: a substitution that does not close names no command word', 'printf \'%s\' "$X" | $(command -v mysql'),
     ('5863 mutant pin: clean 1: a verb in another letter case hides the head', 'Echo mysql -uroot -p"$X"'),
     ('5862 mutant pin: clean 1: a quoted verb hides the head', '"echo" mysql -uroot -p"$X"'),
     ('5860 mutant pin: clean 1: a verb inside a remote payload hides the head', 'ssh db1 "echo mysql -uroot -p$X"'),
@@ -2226,6 +2440,23 @@ ROUND3_GREEN = [
 
 # Raw logical-line text that holds a newline (the arm is a function of text; every unit the gate builds today is
 # joined with spaces): a newline ends the command like a semicolon does (#5691).
+# Round 11 (#5954): the shell reader FAILS a unit that names the mysql family when it cannot resolve where a
+# construct ends; each row is (the named reason the verdict must carry, the unit text).
+ROUND11_UNREADABLE = [
+    ("an unclosed double quote", 'mysql -uroot -p"$X'),
+    ("an unclosed single quote", "mysql -uroot -h 'db"),
+    ("an unclosed ANSI-C quote", "mysql -uroot $'-p"),
+    ("an unclosed backtick substitution", 'x=`command -v mysql'),
+    ("an escaped backtick without an escaped partner", 'ssh h \\`command -v mysql -p$X'),
+    ("an unclosed command substitution or parenthesis", '$(command -v mysql -uroot'),
+    ("an unclosed command substitution or parenthesis", 'echo x # $(mysql -p$X'),
+    ("an unclosed parameter expansion", 'mysql -uroot -p${X'),
+    ("a backslash ends the unit", 'mysql -uroot -p"$X" \\'),
+    ("readings nested deeper than 8", '$(' * 9 + 'command -v mysql' + ')' * 9 + ' -p"$X"'),
+    ("a case statement inside a substitution or group", 'x=$(case $y in a) mysql -p"$X";; esac)'),
+]
+# Text the reader cannot resolve but that names no mysql family client is not this arm's concern.
+ROUND11_UNREADABLE_GREEN = ['echo "unclosed', "printf '%s' $(date"]
 ROUND3_MYSQL_RAW_GREEN = [
     ("5691 mutant pin: a newline ends the mysql command", 'mysql -u r db\necho "$X"'),
     ("5695 mutant pin: a literal value glued to -p is not this arm's concern", 'mysql ' + '-p' + 'Secret db'),
@@ -2262,6 +2493,18 @@ def round3_probe_cases(dl) -> Tuple[List[str], int]:
         if any("denylist" in r[2] for r in res) or check_allow_vs_denylist({"c.sh": res}, ent) or \
                 judge({"c.sh": res}, ent, [], dl)[0]:
             bad.append("round-3 green probe is not allow-able: %s" % label)
+    for reason, text in ROUND11_UNREADABLE:
+        n += 1
+        if mysql_family_verdict(text) != "unreadable shell: " + reason:
+            bad.append("round-11 unreadable unit does not fail with its named reason: %s" % reason)
+    res = scan_exec_file(dl, "c.sh", "#!/bin/bash\n%s\n" % ROUND11_UNREADABLE[0][1]) or []
+    n += 1
+    if not res or res[0][2][:1] != ["unreadable shell: " + ROUND11_UNREADABLE[0][0]] or "denylist" not in res[0][2]:
+        bad.append("round-11 unreadable unit does not show its named reason first in the scan")
+    for text in ROUND11_UNREADABLE_GREEN:
+        n += 1
+        if mysql_family_verdict(text) is not None:
+            bad.append("round-11 unreadable text with no mysql family name was reported: %s" % text)
     for label, text in ROUND3_MYSQL_RAW_GREEN:
         n += 1
         if mysql_family_hit(text):
