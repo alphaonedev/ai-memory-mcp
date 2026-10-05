@@ -124,17 +124,36 @@ extract_const_value() {
 # a count against a stale prior-release attribution (e.g. citing the
 # v1.0.0 103/102 full-tool-count split but attributing it "at v0.9.0",
 # the release that actually shipped 101/100).
-CANONICAL_RELEASE_VERSION=$(grep -oE '^version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml \
-    | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+# A constant that cannot be read (file missing, file empty, constant renamed)
+# FAILS CLOSED and names itself. Before #5703 the failing pipeline ended the
+# script under set -e with no output at all, which reads like a crash.
+require_const() {
+    # $1 = file, $2 = const name, $3 = type pattern; prints the value.
+    local value
+    value="$(extract_const_value "$1" "$2" "$3" || true)"
+    if [[ -z "$value" ]]; then
+        printf 'FAIL: check-docs-vs-ssot: cannot resolve SSOT constant %s from %s (missing file, empty, or renamed) — refusing to run (#5703 fail-closed)\n' \
+            "$2" "$1" >&2
+        exit 1
+    fi
+    printf '%s\n' "$value"
+}
 
-CANONICAL_SCHEMA_VERSION=$(extract_const_value src/storage/migrations.rs CURRENT_SCHEMA_VERSION 'i64|usize|i32')
-CANONICAL_ROUTES_COUNT=$(extract_const_value src/lib.rs EXPECTED_PRODUCTION_ROUTES_COUNT 'usize')
-CANONICAL_UNIQUE_PATHS_COUNT=$(extract_const_value src/lib.rs EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT 'usize')
-CANONICAL_CLI_DEFAULT=$(extract_const_value src/lib.rs EXPECTED_CLI_SUBCOMMANDS_DEFAULT 'usize')
-CANONICAL_CLI_SAL=$(extract_const_value src/lib.rs EXPECTED_CLI_SUBCOMMANDS_SAL 'usize')
-CANONICAL_MEMORY_FIELDS=$(extract_const_value src/models/memory.rs FIELD_COUNT 'usize')
-CANONICAL_LINK_COUNT=$(extract_const_value src/models/link.rs COUNT 'usize')
-CANONICAL_SCOPE_COUNT=$(extract_const_value src/models/namespace.rs COUNT 'usize')
+CANONICAL_RELEASE_VERSION=$(grep -oE '^version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml 2>/dev/null \
+    | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+if [[ -z "$CANONICAL_RELEASE_VERSION" ]]; then
+    printf 'FAIL: check-docs-vs-ssot: cannot resolve SSOT constant version from Cargo.toml (missing file, empty, or renamed) — refusing to run (#5703 fail-closed)\n' >&2
+    exit 1
+fi
+
+CANONICAL_SCHEMA_VERSION=$(require_const src/storage/migrations.rs CURRENT_SCHEMA_VERSION 'i64|usize|i32')
+CANONICAL_ROUTES_COUNT=$(require_const src/lib.rs EXPECTED_PRODUCTION_ROUTES_COUNT 'usize')
+CANONICAL_UNIQUE_PATHS_COUNT=$(require_const src/lib.rs EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT 'usize')
+CANONICAL_CLI_DEFAULT=$(require_const src/lib.rs EXPECTED_CLI_SUBCOMMANDS_DEFAULT 'usize')
+CANONICAL_CLI_SAL=$(require_const src/lib.rs EXPECTED_CLI_SUBCOMMANDS_SAL 'usize')
+CANONICAL_MEMORY_FIELDS=$(require_const src/models/memory.rs FIELD_COUNT 'usize')
+CANONICAL_LINK_COUNT=$(require_const src/models/link.rs COUNT 'usize')
+CANONICAL_SCOPE_COUNT=$(require_const src/models/namespace.rs COUNT 'usize')
 
 # asi-hard pinned-knob count — the `KnobSpec` entries in
 # `src/security_profile.rs::KNOBS`, which IS the no-disable contract:
@@ -3305,6 +3324,39 @@ R5MD
     for _ed in "${_made[@]}"; do rm -f "$tmpdir/$_ed"; done
     echo "PASS: self-test #5702 - a missing hand-enrolled doc FAILS the gate and names the path: one entry each of curated DOC_FILES (nhi-playbook), the widened list (USER_GUIDE, and postgres-age-guide, also on the pgvector list), the hook extras (coala-mapping) and the cert list (ENTERPRISE-FEDERATION-CERTIFICATION, also on the pgvector list); a complete enrolled set does not raise it"
 
+    # ---- #5703: an SSOT constant that cannot be read FAILS CLOSED and names the
+    # constant and its file: the file missing, the file empty, the constant renamed,
+    # and the Cargo.toml version renamed.
+    for _sf in src/storage/migrations.rs src/lib.rs src/models/memory.rs Cargo.toml; do
+        cp "$tmpdir/$_sf" "$tmpdir/$_sf.keep"
+    done
+    _c_arm() {
+        # $1 = arm label, $2 = text the refusal must carry
+        local out
+        out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
+            echo "FAIL: self-test #5703 - $1 did not fail the gate" >&2; return 1; }
+        grep -qF "$2" <<<"$out" || {
+            echo "FAIL: self-test #5703 - $1 failed without naming it ($2)" >&2; return 1; }
+    }
+    rm -f "$tmpdir/src/storage/migrations.rs"
+    _c_arm 'missing migrations.rs' 'cannot resolve SSOT constant CURRENT_SCHEMA_VERSION from src/storage/migrations.rs' \
+        || { cd "$REPO_ROOT"; exit 1; }
+    cp "$tmpdir/src/storage/migrations.rs.keep" "$tmpdir/src/storage/migrations.rs"
+    : > "$tmpdir/src/lib.rs"
+    _c_arm 'empty lib.rs' 'cannot resolve SSOT constant EXPECTED_PRODUCTION_ROUTES_COUNT from src/lib.rs' \
+        || { cd "$REPO_ROOT"; exit 1; }
+    cp "$tmpdir/src/lib.rs.keep" "$tmpdir/src/lib.rs"
+    sed 's/FIELD_COUNT/FIELD_COUNTX/' "$tmpdir/src/models/memory.rs.keep" > "$tmpdir/src/models/memory.rs"
+    _c_arm 'renamed FIELD_COUNT' 'cannot resolve SSOT constant FIELD_COUNT from src/models/memory.rs' \
+        || { cd "$REPO_ROOT"; exit 1; }
+    cp "$tmpdir/src/models/memory.rs.keep" "$tmpdir/src/models/memory.rs"
+    sed 's/^version = /versionx = /' "$tmpdir/Cargo.toml.keep" > "$tmpdir/Cargo.toml"
+    _c_arm 'renamed Cargo.toml version' 'cannot resolve SSOT constant version from Cargo.toml' \
+        || { cd "$REPO_ROOT"; exit 1; }
+    for _sf in src/storage/migrations.rs src/lib.rs src/models/memory.rs Cargo.toml; do
+        mv "$tmpdir/$_sf.keep" "$tmpdir/$_sf"
+    done
+    echo "PASS: self-test #5703 - an SSOT constant that cannot be read (migrations.rs missing, lib.rs empty, FIELD_COUNT renamed, the Cargo.toml version renamed) FAILS CLOSED and names the constant and its file"
 
     # ---- FAIL-CLOSED-ONLY-WITH-A-CLAIM: remove both SSOTs. A doc that
     # narrates NO count has nothing to validate and must stay green;
