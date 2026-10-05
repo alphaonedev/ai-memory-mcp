@@ -339,6 +339,12 @@ lab_probe_body_allowed() {
   [ "$norm" = "$(${2:-lab_probe_expected_body})" ]
 }
 
+# lab_scratch_dir <prefix> (#5743): make a scratch directory under ${TMPDIR:-.} and print its absolute physical path, so an
+# unset or relative TMPDIR never gives the self-test a relative path (#5709). Fails when either step fails.
+lab_scratch_dir() {
+  local d; d="$(mktemp -d "${TMPDIR:-.}/$1.XXXXXX")" && (cd -P -- "$d" && pwd -P)
+}
+
 # lab_shell_state_proven <trap -p text> (#5740): run.sh calls this right after it sources its libraries, before it runs anything else.
 # It proves, positively, that run.sh's own shell is in the state a plain `bash run.sh` gives, because code that ran in this
 # shell before line 1 (a BASH_ENV file that unsets itself, for example) could have left a trap, alias or attribute that
@@ -388,8 +394,8 @@ lab_shell_state_proven() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 273 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 267
+# 277 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 271
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), eight probe-matcher legs (lab_probe_refusal_names_knob against generated logs, each
 # checking the exact child status: 10, 11, or 4 for an unreadable log, #5662), three structural legs (the matcher body
@@ -422,7 +428,8 @@ lab_shell_state_proven() {
 # file that is never run, IFS from the environment that never arrives, an exported SHELLOPTS or BASHOPTS, and bash -x, -e, -T and -E, and two stated-limit legs, noexec
 # and bash -t, that exit 0 with no output), sixteen port legs (#5745: a valid PORT_B, 65533 and 1 reach the next check;
 # 1/0, PORT_A+1, an array subscript, abc, -1, 0, a leading zero, 65534, 99999, 123456, a leading or trailing space and
-# PORT_A=abc exit 2 with the named line), and one layout leg (this comment sits directly on the function).
+# PORT_A=abc exit 2 with the named line), four scratch legs (#5743: lab_scratch_dir gives an absolute directory with TMPDIR
+# unset, relative and absolute, set by the leg itself, and it is the only directory maker in this file), and one layout leg (this comment sits directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
   local root="$1" bad=0 rc name want v1 v2 v3 v4 vr1 vr2 vr3 vok
@@ -445,7 +452,7 @@ lab_posture_selftest() {
   # #5124: a const resolves from the file the KNOBS row names; a shadowing duplicate elsewhere
   # in src must neither change a named-path result nor be picked by file order when the
   # const has to be found by name alone (then two distinct values are "cannot check", rc 2).
-  local shadow; shadow="$(mktemp -d "${TMPDIR:-.}/posture-shadow.XXXXXX")" || return 1
+  local shadow; shadow="$(lab_scratch_dir posture-shadow)" || return 1
   mkdir -p "$shadow/src" && local e
   for e in "$root"/src/*; do ln -s "$e" "$shadow/src/$(basename "$e")"; done
   printf 'pub const MODE_REFUSE: &str = "warn";\n' > "$shadow/src/aaa_shadow.rs"
@@ -460,14 +467,23 @@ lab_posture_selftest() {
   # #5155: the probe-mutation matcher names the knob WITH its trailing colon, ignores INFO pin
   # lines, and reads the whole log (a large log must not turn a detection into "inconclusive").
   # #5662: the matcher's status is the child's: 10 detected, 11 not detected, any other status refused.
-  local plog; plog="$(mktemp -d "${TMPDIR:-.}/probe-matcher.XXXXXX")" || return 1
-  plog="$(cd -- "$plog" && pwd -P)" || return 1
+  local plog; plog="$(lab_scratch_dir probe-matcher)" || return 1
   # #5709: the stand-in awk and bash files below live in this directory and the matcher refuses a relative table path, so
   # the directory must be absolute whatever TMPDIR is (unset, relative or absolute).
   case "$plog" in
     /*) echo "  PASS probe scratch: the probe scratch directory is absolute whatever TMPDIR is (#5709)" ;;
     *) echo "  FAIL probe scratch: the probe scratch directory [$plog] is relative (#5709)"; bad=1 ;;
   esac
+  # #5743: both scratch directories come from lab_scratch_dir; these legs set TMPDIR themselves (unset, relative, absolute),
+  # so they bite whatever TMPDIR the caller runs the self-test with.
+  local sd
+  for k in unset relative absolute; do
+    sd="$(cd -- "$plog" && case $k in unset) unset TMPDIR ;; relative) TMPDIR=. ;; absolute) TMPDIR=$plog ;; esac && lab_scratch_dir scratch-leg)"
+    if [[ $sd == /* && -d $sd ]]; then echo "  PASS probe scratch: lab_scratch_dir with TMPDIR $k gives an absolute directory (#5743)"
+    else echo "  FAIL probe scratch: lab_scratch_dir with TMPDIR $k gave [$sd] (#5743)"; bad=1; fi
+  done
+  if [ "$(grep -cE 'mktemp[[:space:]]+-d' "${BASH_SOURCE[0]}")" = 1 ]; then echo "  PASS probe scratch: lab_scratch_dir is the only scratch-directory maker in posture.sh (#5743)"
+  else echo "  FAIL probe scratch: a second directory maker in posture.sh bypasses lab_scratch_dir (#5743)"; bad=1; fi
   printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n' > "$plog/ok.log"
   printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK_STRICT: nope\n' > "$plog/other-knob.log"
   printf 'boot\nINFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/info-only.log"
