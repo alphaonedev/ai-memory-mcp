@@ -1966,7 +1966,6 @@ mod tests {
                 for (i, line) in text.lines().enumerate() {
                     if line.contains("execute_batch")
                         && (line.contains("SQL_BEGIN_IMMEDIATE")
-                            || line.contains("SQL_BEGIN_DEFERRED")
                             || line.contains("SQL_BEGIN_EXCLUSIVE"))
                     {
                         hits.push(format!("{rel}:{}:{line}", i + 1));
@@ -1979,6 +1978,18 @@ mod tests {
             hits.is_empty(),
             "raw execute_batch(SQL_BEGIN_*) outside allow-listed sites (#3163):\n{}",
             hits.join("\n")
+        );
+        // #5461: the DEFERRED verb constant was removed by #5084, so the walk
+        // above can no longer match it. The primitive file is allow-listed, so
+        // pin its absence directly; the needle is split so this test does not
+        // match itself.
+        let own = std::fs::read_to_string(root.join("storage/connection.rs"))
+            .expect("read storage/connection.rs");
+        let needle = ["SQL_BEGIN_", "DEFERRED"].concat();
+        assert!(
+            !own.contains(&needle),
+            "{needle} was removed by #5084; re-introducing a DEFERRED transaction \
+             verb needs a fresh allowlist decision (#3163, #5084, #5461)"
         );
     }
 
