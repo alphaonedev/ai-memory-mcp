@@ -55,6 +55,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tokenize
 from pathlib import Path
 from typing import NamedTuple
 
@@ -442,7 +443,7 @@ def plant_coverage_gap(probed: list, names: list, rounds: int) -> bool:
 # truth that does not come from imported_modules() itself. Adding or removing an import without updating this tuple
 # makes the self-test red.
 EXPECTED_IMPORTS = ("argparse", "ast", "difflib", "importlib", "os", "pathlib", "py_compile", "re", "shutil", "stat",
-                    "subprocess", "typing")
+                    "subprocess", "tokenize", "typing")
 
 
 def import_pin_gap(found: list, pinned) -> tuple:
@@ -459,7 +460,7 @@ def imported_modules(path: Path) -> list:
     this ast scan (#5405). They cannot run before the refusal: refusal_prefix_gap (#5510) requires the code above it to
     be the docstring and `import sys`; the self-test applies it to this file."""
     names = set()
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+    for node in ast.walk(ast.parse(path.read_bytes())):
         if isinstance(node, ast.Import):
             names.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
@@ -468,15 +469,39 @@ def imported_modules(path: Path) -> list:
     return sorted(names)
 
 
-def refusal_prefix_gap(source: str) -> str:
-    """#5510: "" when the only statements that execute above the isolation refusal in `source` are the docstring and
-    `import sys`, and the refusal is exactly `if __name__ == "__main__" and not sys.flags.isolated:` whose body is
-    calls to print and sys.exit with constant arguments; otherwise why not. Parsed with ast, never executed. Module
-    level statements are the only code that runs when the file is started, so a dynamic import, eval, exec, a branch,
-    a class body or a decorator above the refusal cannot hide: any statement outside this whitelist is refused."""
+CONTROL_BYTES = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\r(?!\n)")
+
+
+def refusal_prefix_gap(source: bytes) -> str:
+    """#5510/#5560: "" when `source` (the file BYTES, never a str) is plain strict utf-8 and the only statements that
+    execute above the isolation refusal are the docstring and `import sys`, and the refusal is exactly
+    `if __name__ == "__main__" and not sys.flags.isolated:` whose body is calls to print and sys.exit with constant
+    arguments; otherwise why not. Parsed with ast from the bytes, never executed, so the check reads the file the way
+    the interpreter does. It is closed-world and fails closed: it refuses a non-bytes argument; any coding cookie or
+    BOM other than plain utf-8 spelled utf-8 or utf8 (tokenize.detect_encoding follows the PEP 263 rule the
+    interpreter uses, so a cookie in any spelling on line 1 or 2 is covered); bytes that are not strict utf-8; any
+    control byte other than tab, LF and CRLF line ends (NUL, form feed, a lone CR and the rest) anywhere in the file;
+    and a line ending in a line-continuation backslash above the refusal. Module level statements are the only code
+    that runs when the file is started, so a dynamic import, eval, exec, a branch, a class body or a decorator above
+    the refusal cannot hide: any statement outside this whitelist is refused."""
+    if not isinstance(source, (bytes, bytearray)):
+        return "the source is not bytes"
+    source = bytes(source)
+    try:
+        encoding = tokenize.detect_encoding(iter(source.splitlines(keepends=True)).__next__)[0]
+    except (SyntaxError, StopIteration, LookupError) as exc:
+        return f"the source encoding cannot be determined: {exc}"
+    if encoding not in ("utf-8", "utf8"):
+        return f"the source declares the encoding {encoding}, not plain utf-8 (a BOM or a coding cookie)"
+    try:
+        source.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        return f"the source is not strict utf-8: {exc}"
+    if CONTROL_BYTES.search(source):
+        return "the source has a control byte other than tab, LF and CRLF line ends"
     try:
         body = ast.parse(source).body
-    except SyntaxError as exc:
+    except (SyntaxError, ValueError) as exc:
         return f"the source does not parse: {exc}"
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
             and isinstance(body[0].value.value, str):
@@ -486,6 +511,8 @@ def refusal_prefix_gap(source: str) -> str:
     if len(body) < 2 or not isinstance(body[1], ast.If) or body[1].orelse:
         return "the statement after `import sys` is not the refusal if"
     refusal = body[1]
+    if any(line.rstrip(b"\r").endswith(b"\\") for line in source.split(b"\n")[:refusal.lineno - 1]):
+        return "a line above the refusal ends with a line-continuation backslash"
     want = ast.dump(ast.parse('__name__ == "__main__" and not sys.flags.isolated', mode="eval").body)
     if ast.dump(refusal.test) != want:
         return "the refusal test is not `__name__ == \"__main__\" and not sys.flags.isolated`"
@@ -740,15 +767,20 @@ def _self_test_cases() -> int:
         # #5510: nothing may execute above the refusal except `import sys`. The real source must pass; each synthetic
         # source (mutant M05b and siblings: a dynamic import, an eval, an import in a branch, a class body, a decorator,
         # a second imported name, a call inside the refusal, a weakened refusal test) must be refused.
-        source = Path(__file__).read_text(encoding="utf-8")
-        if refusal_prefix_gap(source):
-            return f"the source has code above the isolation refusal: {refusal_prefix_gap(source)} (#5510)"
+        raw = Path(__file__).read_bytes()
+        source = raw.decode("utf-8")
+
+        def gap(text: str) -> str:
+            return refusal_prefix_gap(text.encode("utf-8"))
+
+        if refusal_prefix_gap(raw):
+            return f"the source has code above the isolation refusal: {refusal_prefix_gap(raw)} (#5510)"
         marker = "if __name__ == \"__main__\" and not sys.flags.isolated:"
         before = {"__import__('colorsys')\n", "import json\n", "if False:\n    import json\n", "x = eval('1')\n",
                   "class C:\n    import json\n", "@(lambda f: f)\ndef g():\n    pass\n", "exec('pass')\n",
                   "import importlib\nimportlib.import_module('colorsys')\n", "x = 1\n", "from os import path\n"}
         for inserted in sorted(before):
-            if not refusal_prefix_gap(source.replace(marker, inserted + marker, 1)):
+            if not gap(source.replace(marker, inserted + marker, 1)):
                 return f"code above the isolation refusal was not refused: {inserted!r} (#5510)"
         for old, new in (("import sys\n\nif __name__", "import sys, json\n\nif __name__"),
                          ("import sys\n\nif __name__", "import sys as s\nimport sys\n\nif __name__"),
@@ -757,10 +789,43 @@ def _self_test_cases() -> int:
                          ("import sys\n\nif __name__", "import sys as s\n\nif __name__"), ("sys.exit(1)", "sys.exit(1, **{})"),
                          ("    sys.exit(1)\n", "    sys.exit(1)\nelse:\n    x = 1\n"), ("not sys.flags.isolated:", "not sys.flags.isolated or __import__('colorsys'):"),
                          (marker, "if True:"), ("import sys\n\nif __name__", "import sys\n\nx = 1\nif __name__")):
-            if old not in source or not refusal_prefix_gap(source.replace(old, new, 1)):
+            if old not in source or not gap(source.replace(old, new, 1)):
                 return f"a changed refusal or import line was not refused: {new!r} (#5510)"
-        if not refusal_prefix_gap("") or not refusal_prefix_gap("import sys\n"):
+        if not gap("") or not gap("import sys\n"):
             return "a source without the refusal was not refused (#5510)"
+        # #5560: the check works on the BYTES and is closed-world about encoding and control bytes. Each source below
+        # was accepted by the text based check of f95e295a0 (the utf-7 spellings even ran hidden code) or only
+        # refused by accident; each must be refused with a stated reason.
+        refusal = 'import sys\nif __name__ == "__main__" and not sys.flags.isolated:\n    print("refused")\n    sys.exit(1)\n'
+        hidden = 'import sys\n#+AAo-print("hidden")\nif __name__ == "__main__" and not sys.flags.isolated:\n    print("refused")\n    sys.exit(1)\n'
+        plain = ('"""doc"""\n' + refusal).encode("utf-8")
+        if refusal_prefix_gap(plain) or refusal_prefix_gap(b"#!/usr/bin/env python3\n# coding: utf-8\n" + plain) \
+                or refusal_prefix_gap(b"# -*- coding: utf8 -*-\n" + plain) or refusal_prefix_gap(b'"""doc"""\r\n' + refusal.encode().replace(b"\n", b"\r\n")):
+            return "a plain utf-8 source (shebang, utf-8 cookie, CRLF) was refused (#5560)"
+        encodings = {
+            "utf-7 cookie on line 1": b"# coding: utf-7\n" + b'"""doc"""\n' + hidden.encode(),
+            "utf-7 cookie on line 2 under a shebang": b"#!/usr/bin/env python3\n# coding: utf-7\n" + b'"""doc"""\n' + hidden.encode(),
+            "utf-16 with BOM": ('"""doc"""\n' + refusal).encode("utf-16"),
+            "utf-8 BOM and a latin-1 cookie": b"\xef\xbb\xbf# coding: latin-1\n" + plain,
+            "utf-8 BOM alone": b"\xef\xbb\xbf" + plain,
+            "vim style utf-7 cookie": b"# vim: set fileencoding=utf-7 :\n" + b'"""doc"""\n' + hidden.encode(),
+            "emacs style utf-7 cookie": b"# -*- coding: utf-7 -*-\n" + b'"""doc"""\n' + hidden.encode(),
+            "latin-1 cookie with a latin-1 byte": b"# coding: latin-1\n" + '"""d\xe9"""\n'.encode("latin-1") + refusal.encode(),
+            "unknown cookie": b"# coding: no-such-codec\n" + plain,
+            "bytes that are not utf-8": b'"""d\xff"""\n' + refusal.encode(),
+            "CR-only line ends": ('"""doc"""\rimport sys\r# note\rimport json\r' + refusal.split("import sys\n", 1)[1]).replace("\n", "\r").encode(),
+            "a lone CR inside a comment": b'"""doc"""\nimport sys\n# note\rimport json\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "form feed": b'"""doc"""\nimport sys\n\x0c\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "NUL": b'"""doc"""\nimport sys\n#\x00\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "vertical tab": b'"""doc"""\nimport sys\n\x0b\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "DEL": b'"""doc"""\nimport sys\n#\x7f\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "line continuation backslash": b'"""doc"""\nimport sys\n\\\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "backslash in the docstring slot": b'"""doc \\\nmore"""\n' + refusal.encode(),
+            "a str instead of bytes": '"""doc"""\n' + refusal,
+        }
+        for label, data in encodings.items():
+            if not refusal_prefix_gap(data):
+                return f"a source with {label} was not refused (#5560)"
         names = list(EXPECTED_IMPORTS)  # the probe set is the pin, never the output of imported_modules (#5472)
         if "importlib" not in names:
             return "importlib is not in the plant set"
