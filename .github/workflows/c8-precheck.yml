@@ -545,7 +545,7 @@ jobs:
     # declaration's SHA-256 (scripts/qc-allowlists/declaration.sha256), refuses
     # a change without a `revision:` bump and a dated "revised after miss"
     # line, refuses a re-pin that does not raise the revision (D1b, against
-    # the PR base), refuses placeholders, and checks that every N-id the
+    # the base of the helper's range), refuses placeholders, and checks that every N-id the
     # standard's §6 cites is indexed to a filed issue (§7.4). No toolchain.
     name: "Declaration hash gate (#3557)"
     runs-on: ubuntu-latest
@@ -556,10 +556,16 @@ jobs:
           fetch-depth: 0
       - name: Run declaration hash gate
         env:
-          # D1b compares the pin against its content at the PR base (a push
-          # compares against the previous head); an absent ref is tolerated
-          # only by SKIPPING D1b, never the hash check itself.
-          DECLARATION_GATE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # D1b compares the pin against its content at the base of the range,
+          # which the script takes only from scripts/ci-commit-range.py (#5604):
+          # an undecidable base (creation push, force-push, merge_group without
+          # base_sha, unknown event) is a red job, never a skipped D1b.
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
         run: bash scripts/check-declaration-hash.sh
       - name: Self-test the gate (regression evidence)
         # Plants a softened target without a re-pin (D1), a re-pin without a

@@ -12,9 +12,10 @@
 #       AND the file's `revision:` equals the pinned revision — so the file cannot change
 #       without the pin moving in the same commit;
 #   D1b the pin may move only with a revision bump: when the pin differs from its
-#       PREVIOUS committed content (the PR base — `DECLARATION_GATE_BASE`, a git ref/sha,
-#       default HEAD; or the file named by `DECLARATION_GATE_PREVIOUS_PIN` in the
-#       self-test), the new pinned revision must be strictly greater than the old one —
+#       PREVIOUS committed content (the base side of scripts/ci-commit-range.py, or the
+#       commit named by `DECLARATION_GATE_BASE`; or the file named by
+#       `DECLARATION_GATE_PREVIOUS_PIN` in the self-test; there is no default base and an
+#       undecidable or unresolvable base is a red gate, never a skip — #5604), the new pinned revision must be strictly greater than the old one —
 #       so "edit, re-hash, same revision" is refused as loudly as "edit, no re-hash";
 #   D2  a pinned revision N > 1 requires at least N-1 dated
 #       `revised after miss (YYYY-MM-DD): <reason>` lines in the file — so a re-pin
@@ -44,6 +45,7 @@ sed_i() {
 }
 
 ROOT="${DECLARATION_GATE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+RANGE_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ci-commit-range.py"
 DECL="${ROOT}/docs/compliance/v1.0.0-DECLARATION.md"
 PIN="${ROOT}/scripts/qc-allowlists/declaration.sha256"
 STD="${ROOT}/docs/compliance/MISSION-CRITICAL-CERTIFICATION-STANDARD-v1.md"
@@ -70,19 +72,36 @@ run_gate() {
     fail "declaration changed without re-pinning (D1): file sha $actual_sha != pinned $pinned_sha. A change is legal ONLY with a 'revision:' bump, a dated 'revised after miss (YYYY-MM-DD): <reason>' line in §5, and the new sha + revision in $PIN — a target is never revised after a miss (§0.2)."
   fi
   [ "$file_rev" = "$pinned_rev" ] || fail "declaration revision $file_rev != pinned revision $pinned_rev (D1)"
-  # D1b — the pin moved: the revision must have moved up with it.
+  # D1b — the pin moved: the revision must have moved up with it. The previous pin is
+  # never skipped (#5604): its base comes from scripts/ci-commit-range.py (base side
+  # only), an explicit DECLARATION_GATE_BASE names a commit by hand, and an
+  # undecidable or unresolvable base is a red gate. There is no default base.
   local prev_line="" prev_sha="" prev_rev=""
   if [ -n "${DECLARATION_GATE_PREVIOUS_PIN:-}" ]; then
-    [ -f "$DECLARATION_GATE_PREVIOUS_PIN" ] && prev_line=$(grep -vE '^\s*(#|$)' "$DECLARATION_GATE_PREVIOUS_PIN" | tail -1 || true)
-  elif git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    local base="${DECLARATION_GATE_BASE:-HEAD}"
-    prev_line=$(git -C "$ROOT" show "${base}:scripts/qc-allowlists/declaration.sha256" 2>/dev/null | grep -vE '^\s*(#|$)' | tail -1 || true)
-  fi
-  if [ -n "$prev_line" ]; then
-    prev_sha=$(echo "$prev_line" | awk '{print $1}'); prev_rev=$(echo "$prev_line" | awk '{print $2}')
-    if [ "$prev_sha" != "$pinned_sha" ] && [ "${pinned_rev}" -le "${prev_rev:-0}" ]; then
-      fail "the pin moved ($prev_sha -> $pinned_sha) but the revision did not (${prev_rev} -> ${pinned_rev}) (D1b): a re-pin is legal only with a 'revision:' bump and a dated 'revised after miss' line"
+    [ -f "$DECLARATION_GATE_PREVIOUS_PIN" ] || fail "DECLARATION_GATE_PREVIOUS_PIN names no file: $DECLARATION_GATE_PREVIOUS_PIN (D1b)"
+    prev_line=$(grep -vE '^\s*(#|$)' "$DECLARATION_GATE_PREVIOUS_PIN" | tail -1 || true)
+  else
+    local base=""
+    if [ -n "${DECLARATION_GATE_BASE:-}" ]; then
+      base="$DECLARATION_GATE_BASE"
+    elif [ -n "${GITHUB_EVENT_NAME:-}" ]; then
+      base=$(python3 "$RANGE_HELPER" --repo "$ROOT" --base-only) \
+        || fail "the base of the previous pin cannot be decided (D1b, fail-closed); the helper refusal is above"
+    else
+      fail "no base for the previous pin (D1b, fail-closed): set DECLARATION_GATE_BASE to a commit, or run under a pull_request, merge_group or push event"
     fi
+    git -C "$ROOT" rev-parse --verify --quiet "${base}^{commit}" >/dev/null 2>&1 \
+      || fail "the D1b base '$base' does not resolve to a commit in this checkout (fail-closed)"
+    git -C "$ROOT" cat-file -e "${base}:scripts/qc-allowlists/declaration.sha256" 2>/dev/null \
+      || fail "the pin file does not exist at the D1b base $base (fail-closed)"
+    prev_line=$(git -C "$ROOT" show "${base}:scripts/qc-allowlists/declaration.sha256" | grep -vE '^\s*(#|$)' | tail -1 || true)
+  fi
+  [ -n "$prev_line" ] || fail "the previous pin carries no <sha256>  <revision> line (D1b, fail-closed)"
+  prev_sha=$(echo "$prev_line" | awk '{print $1}'); prev_rev=$(echo "$prev_line" | awk '{print $2}')
+  [[ "$prev_sha" =~ ^[0-9a-f]{64}$ && "$prev_rev" =~ ^[0-9]+$ ]] \
+    || fail "the previous pin is malformed (D1b, fail-closed): $prev_line"
+  if [ "$prev_sha" != "$pinned_sha" ] && [ "$pinned_rev" -le "$prev_rev" ]; then
+    fail "the pin moved ($prev_sha -> $pinned_sha) but the revision did not (${prev_rev} -> ${pinned_rev}) (D1b): a re-pin is legal only with a 'revision:' bump and a dated 'revised after miss' line"
   fi
   if [ "$pinned_rev" -gt 1 ]; then
     local reasons
@@ -151,6 +170,46 @@ self_test() {
   cp "$DECL" "$D"; cp "$PIN" "$P"
   leg "clean control (restored)" pass
   unset DECLARATION_GATE_PREVIOUS_PIN
+  # D1b base legs (#5604): the previous pin comes from a real git base, never from a
+  # skip. The scratch is its own repo: c1 = pin at revision 1; c2 = a re-pin that kept
+  # revision 1 (the defect). Each refusal must come from the named cause.
+  git -C "$scratch" init -q -b main
+  local g=(git -C "$scratch" -c user.name=t -c user.email=t@e.invalid -c commit.gpgsign=false)
+  "${g[@]}" add -A >/dev/null && "${g[@]}" commit -q -m c1
+  local c1 c2 zero ab
+  c1=$("${g[@]}" rev-parse HEAD)
+  printf '\nsoftened\n' >> "$D"; repin 1
+  "${g[@]}" add -A >/dev/null && "${g[@]}" commit -q -m c2
+  c2=$("${g[@]}" rev-parse HEAD)
+  zero=$(printf '0%.0s' $(seq 1 40)); ab=$(printf 'ab%.0s' $(seq 1 20))
+  bleg() { # $1 name, $2 expect, $3 reason text the output must contain, rest: env assignments
+    total=$((total+1)); local name="$1" want="$2" text="$3" out r; shift 3
+    if out=$(env -u DECLARATION_GATE_PREVIOUS_PIN -u DECLARATION_GATE_BASE -u GITHUB_EVENT_NAME \
+        -u GITHUB_EVENT_BEFORE -u PR_BASE_SHA -u PR_HEAD_SHA -u MG_BASE_SHA -u MG_HEAD_SHA \
+        DECLARATION_GATE_ROOT="$scratch" "$@" bash "$me" 2>&1); then r=pass; else r=fail; fi
+    if [ "$r" != "$want" ]; then echo "  FAIL $name: expected $want, got $r: $(echo "$out" | head -1 | cut -c1-140)"; return; fi
+    if [ -n "$text" ] && ! grep -qF -- "$text" <<<"$out"; then echo "  FAIL $name: wrong reason, wanted '$text': $(echo "$out" | head -1 | cut -c1-140)"; return; fi
+    echo "  ok   $name (expected $want)"; ok=$((ok+1))
+  }
+  bleg "D1b base leg: re-pin without a bump vs a real base is red" fail "(D1b)" DECLARATION_GATE_BASE="$c1"
+  bleg "D1b base leg: pull_request base=c1 head=c2 is red by D1b" fail "(D1b)" GITHUB_EVENT_NAME=pull_request PR_BASE_SHA="$c1" PR_HEAD_SHA="$c2"
+  bleg "D1b base leg: merge_group base_sha=c1 head_sha=c2 is red by D1b" fail "(D1b)" GITHUB_EVENT_NAME=merge_group MG_BASE_SHA="$c1" MG_HEAD_SHA="$c2"
+  bleg "D1b base leg: push before=c1 sha=c2 is red by D1b" fail "(D1b)" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$c1" GITHUB_SHA="$c2"
+  bleg "D1b base leg: unchanged pin vs its own commit passes" pass "" DECLARATION_GATE_BASE="$c2"
+  bleg "D1b base leg: all-zero push before is red, not skipped" fail "cannot be decided" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$zero" GITHUB_SHA="$c2"
+  bleg "D1b base leg: empty push before is red, not skipped" fail "cannot be decided" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="" GITHUB_SHA="$c2"
+  bleg "D1b base leg: unreachable push before is red, not skipped" fail "cannot be decided" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$ab" GITHUB_SHA="$c2"
+  bleg "D1b base leg: merge_group without base_sha is red, not skipped" fail "cannot be decided" GITHUB_EVENT_NAME=merge_group MG_HEAD_SHA="$c2"
+  bleg "D1b base leg: unknown event is red, not skipped" fail "cannot be decided" GITHUB_EVENT_NAME=schedule
+  bleg "D1b base leg: no event and no base is red (no default HEAD)" fail "no base for the previous pin" GITHUB_ACTIONS=
+  bleg "D1b base leg: explicit unresolvable base is red" fail "does not resolve to a commit" DECLARATION_GATE_BASE="$ab"
+  bleg "D1b base leg: explicit all-zero base is red" fail "does not resolve to a commit" DECLARATION_GATE_BASE="$zero"
+  printf '# only a comment\n' > "$scratch/empty.pin"; printf 'zz  1\n' > "$scratch/bad.pin"
+  bleg "D1b previous-pin leg: a previous pin with no line is red" fail "carries no <sha256>" DECLARATION_GATE_PREVIOUS_PIN="$scratch/empty.pin"
+  bleg "D1b previous-pin leg: a malformed previous pin is red" fail "previous pin is malformed" DECLARATION_GATE_PREVIOUS_PIN="$scratch/bad.pin"
+  bleg "D1b previous-pin leg: a missing previous-pin file is red" fail "names no file" DECLARATION_GATE_PREVIOUS_PIN="$scratch/none.pin"
+  "${g[@]}" rm -q --cached scripts/qc-allowlists/declaration.sha256 && "${g[@]}" commit -q -m c3-no-pin
+  bleg "D1b base leg: pin file absent at the base is red" fail "does not exist at the D1b base" DECLARATION_GATE_BASE="$("${g[@]}" rev-parse HEAD)"
   rm -rf "$scratch"
   echo "declaration-hash gate self-test: $ok/$total"
   [ "$ok" = "$total" ] || exit 1

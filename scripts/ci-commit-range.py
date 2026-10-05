@@ -56,11 +56,12 @@ EVENTS = ("pull_request", "merge_group", "push")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 ZERO_SHA = "0" * 40
 WORKFLOW = Path(".github/workflows/c8-precheck.yml")
-# The two jobs that call the helper in the workflow, and the two jobs whose
-# SCRIPT calls it (the workflow only passes the event inputs to the script).
-SCRIPT_GATE_JOBS = {"cert-expiry-gate": "check-cert-expiry.sh"}
+# The two jobs that call the helper in the workflow, and the two jobs (cert-expiry,
+# declaration-hash) whose SCRIPT calls it (the workflow only passes the event inputs to the script).
+SCRIPT_GATE_JOBS = {"cert-expiry-gate": "check-cert-expiry.sh",
+                    "declaration-hash-gate": "check-declaration-hash.sh"}
 GATE_JOBS = ("stale-contract-assertions-gate", "count-assertion-declared-gate",
-             "cert-expiry-gate")
+             "cert-expiry-gate", "declaration-hash-gate")
 # The only expressions a script-gate step may use: each one exactly once.
 SCRIPT_GATE_ENV = (
     "GITHUB_EVENT_NAME: ${{ github.event_name }}",
@@ -431,6 +432,11 @@ def pin_violations(text):
 
 
 SCRIPT_PINS = {
+    "check-declaration-hash.sh": {
+        "need": (HELPER_NAME, "--base-only"),
+        "forbid": ("DECLARATION_GATE_BASE:-HEAD", "N/A", "2>/dev/null | grep", ":-HEAD}"),
+        "regex": (r"\$\{?GITHUB_EVENT_BEFORE", r"DECLARATION_GATE_BASE:-[^}]"),
+    },
     "check-cert-expiry.sh": {
         "need": (HELPER_NAME,),
         "forbid": ("ZERO_SHA_RE", "return 3", "rc == 3", "N/A", "workflow_dispatch)", "rc=3"),
@@ -731,6 +737,11 @@ def script_mutations(name, text):
                 ("return 3 skip restored", text + "\n# return 3\n"),
                 ("event before read in the script", text + '\nbefore="${GITHUB_EVENT_BEFORE:-}"\n'),
                 ("workflow_dispatch skip arm restored", text + "\n        workflow_dispatch)\n")]
+    if name == "check-declaration-hash.sh":
+        out += [("default HEAD base restored", text + "\nbase=\"${DECLARATION_GATE_BASE:-HEAD}\"\n"),
+                ("--base-only dropped", text.replace("--base-only", "")),
+                ("event before read in the script", text + '\nbefore="${GITHUB_EVENT_BEFORE:-}"\n'),
+                ("quiet git show skip restored", text + "\ngit show x 2>/dev/null | grep y\n")]
     return out
 
 
