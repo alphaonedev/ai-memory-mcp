@@ -336,7 +336,7 @@ lab_probe_body_allowed() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 191 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# 192 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
 # value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 186
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), eight probe-matcher legs (lab_probe_refusal_names_knob against generated logs, each
@@ -400,6 +400,13 @@ lab_posture_selftest() {
   # lines, and reads the whole log (a large log must not turn a detection into "inconclusive").
   # #5662: the matcher's status is the child's: 10 detected, 11 not detected, any other status refused.
   local plog; plog="$(mktemp -d "${TMPDIR:-.}/probe-matcher.XXXXXX")" || return 1
+  plog="$(cd -- "$plog" && pwd -P)" || return 1
+  # #5709: the stand-in awk and bash files below live in this directory and the matcher refuses a relative table path, so
+  # the directory must be absolute whatever TMPDIR is (unset, relative or absolute).
+  case "$plog" in
+    /*) echo "  PASS probe scratch: the probe scratch directory is absolute whatever TMPDIR is (#5709)" ;;
+    *) echo "  FAIL probe scratch: the probe scratch directory [$plog] is relative (#5709)"; bad=1 ;;
+  esac
   printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n' > "$plog/ok.log"
   printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK_STRICT: nope\n' > "$plog/other-knob.log"
   printf 'boot\nINFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/info-only.log"
