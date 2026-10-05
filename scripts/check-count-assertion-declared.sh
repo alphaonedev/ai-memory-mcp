@@ -55,10 +55,12 @@
 #     exact match, so the gate stays fail-closed. An offender outside the range
 #     (a stacked PR) is neither examined nor required.
 #
-# HOW A CHANGE IS FOUND — whole-file, not diff-line. rustfmt splits any
-# `assert_eq!` past ~100 columns onto three lines, so the number sits on a line
-# of its own and, when ONLY the number changes, the `.len()` line is not in the
-# diff at all; a per-line regex over `git show` misses exactly the shape the
+# HOW A CHANGE IS FOUND — whole-file, not diff-line. rustfmt breaks an
+# `assert_eq!` that does not fit on one line so that each argument starts a line
+# of its own (a long receiver chain is broken further), so the number sits on a line
+# of its own and, when ONLY the number changes, the `.len()` line is not a
+# changed line of the diff (at most a context line); a per-line regex over the
+# changed lines of `git show` misses exactly the shape the
 # gate exists for. So for every .rs file a commit touches under the
 # repository-root src/ and tests/ directories (#5711, #5716; tools/*/src, examples/,
 # benches/ and fuzz/ are not checked),
@@ -90,7 +92,8 @@
 #     call, never an argument). That operand
 #     runs back from the `==` to the nearest `&&`, `||`, `==`, `!=`, `=>`, `,`
 #     or `;` at the same depth, or to the bracket that opens that depth, so
-#     nothing between the call and the `==` hides it: a cast to any type, braces,
+#     nothing between the call and the `==` other than one of those stops hides
+#     it: a cast to any type, braces,
 #     a block comment, a generic argument list, a method chain such as
 #     `.into()`, a line break or arithmetic. Every shape the reader does not
 #     bind is decided by this rule alone: a comparison inside a closure only,
@@ -106,7 +109,8 @@
 #     so a comma, `&&` or `||` inside it never ends an operand or splits an
 #     argument, and the `>` of a `->` inside it closes nothing. A `<` opens such
 #     a list after `::` (a turbofish `f::<A, B>()`), after the type path that
-#     follows `as` (`x as W<A, B>`, also `x as ::m::W<A, B>` and `x as r#W<A, B>`),
+#     follows `as` (`x as W<A, B>`, also `x as ::m::W<A, B>` and `x as r#W<A, B>`;
+#     a `&`, a lifetime, `mut`, `*const`, `*mut` or `dyn` may stand before the path),
 #     and at the start of an operand (a qualified path `<T as Tr<A, B>>::C`); any
 #     other `<` is a comparison or a shift.
 #   * BLOCK COMMENTS AND UNREADABLE ASSERTIONS (#5872; 5-agent vote (4d3ea1c5)
@@ -855,6 +859,8 @@ def selftest():
     case('what = a good token plus a punctuation-only word is refused', one_decl('sections ..'), True)
     case('what = the hit path plus a token', one_decl('tests/f.rs sections'), False)
     case('what = the hit path alone names nothing', one_decl('tests/f.rs'), True)
+    case('what = the hit file name plus a token', one_decl('f.rs sections'), False)
+    case('what = the hit file name alone names nothing', one_decl('f.rs'), True, ['sections.len()  18 -> 19'], ['IGNORED Count'])
     case('what = a token plus a two-letter word is refused', one_decl('sections to'), True)
     # #5760: ONE word that holds a short chunk beside a good token refuses the item (the header's "a word with a chunk of
     # one or two characters ... refuses the whole item"); the same bump named by the good token alone is the control
@@ -1143,6 +1149,8 @@ def selftest():
                    ('a generic cast with a leading ::', 'ok && v.len() as ::m::W<u8, u16> == %s'),
                    ('a generic cast to a raw identifier', 'ok && v.len() as r#W<u8, u16> == %s'),
                    ('a generic cast to a raw-identifier path', 'ok && v.len() as r#m::W<u8, u16> == %s'),
+                   ('a generic cast behind a reference with a lifetime', "ok && v.len() as &'static W<u8, u16> == %s"),
+                   ('a generic cast behind a pointer', 'ok && v.len() as *const W<u8, u16> == %s'),
                    ('a qualified-path cast with a comma', 'ok && v.len() as <usize as Tr<u8, u16>>::O == %s'),
                    ('a qualified-path operand with a comma', 'ok && v.len() + <usize as Tr<u8, u16>>::O::default() == %s'),
                    ('a shift left', 'ok && v.len() << 1 == %s'), ('a shift right after a turbofish', 'ok && v.len() + g::<u8>() >> 1 == %s'),
