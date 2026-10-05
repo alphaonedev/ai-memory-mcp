@@ -1401,6 +1401,10 @@ def run_citation_cases(fresh) -> bool:
             ("anchor that names no heading", "See CLAUDE.md#no-such-heading.", True),
             ("possessive of a section that stayed", "See CLAUDE.md's \"" + STAYED + "\".", False),
             ("possessive of a section that stayed, cut short", 'See CLAUDE.md\'s "Hard rule".', True),
+            # #5772: the curly-apostrophe possessive is the same marker as the straight one. Read as anything else,
+            # U+2019 opens an unterminated quote, so the exact stayed heading after it is refused and the case is red.
+            ("curly possessive of a section that stayed", "See CLAUDE.md\u2019s \"" + STAYED + "\".", False),
+            ("curly possessive of a section that stayed, cut short", 'See CLAUDE.md\u2019s "Hard rule".', True),
             ("section word with a section that stayed", 'See CLAUDE.md section "Build & Test Commands".', False)):
         root = fresh()
         doc = root / "docs" / "internal" / "form.md"
