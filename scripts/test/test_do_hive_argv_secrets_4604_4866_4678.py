@@ -1440,7 +1440,7 @@ ROOT_INDIRECT = (
     (r"(?<![\w./-])eval(?![\w-])", "eval"), (r"(?<![\w./-])source(?![\w-])", "source"),
     (r"(?:^|[;&|({!]\s*|(?<![\w-])(?:then|do|else|command|builtin|exec)\s+)\.(?=\s)", "source"),
     (r"(?<![\w./-])alias(?![\w-])", "alias"),
-    (r"(?<![\w-])(?:declare|local|typeset)\s+(?:-\S+\s+)*-\w*n", "nameref"),
+    (r"(?<![\w-])(?:declare|local|typeset)\s+(?:[-+]\S+\s+)*[-+]\w*n", "nameref"),
 )
 # Builtins that assign the variable a name operand names. A literal root name among the operands is a mention of the
 # root (reported below); a computed operand (an expansion, a quote or a backslash) may spell one, so it is reported.
@@ -1631,6 +1631,19 @@ def _command_findings(stmt):
         return ([] if re.search(r"[$`]", words[k]) else ["computed command %s" % words[k]]), []
     if cw in _INDIRECT_WORDS:
         why.append(_INDIRECT_WORDS[cw])
+    if cw in ("declare", "local", "typeset"):
+        # #5895: a nameref in any run of option words (+i -n, -gn, -"n"); a computed option word may be -n.
+        for w, p in zip(words[k + 1:], plain[k + 1:]):
+            if p is None and re.match(r"\w+(?:\[[^]]*\])?\+?=", w):
+                break   # an operand with a literal name and a computed value
+            if p is None:
+                why.append("computed option")
+                break
+            if p == "--" or not re.match(r"[-+]", p):
+                break
+            if "n" in p[1:]:
+                why.append("nameref")
+                break
     if cw in DECLARATORS | {"unset"} and any(re.search(r"[$`\"'\\]", w.split("=", 1)[0])
                                              for w in words[k + 1:] if not w.startswith("-")):
         why.append("computed name")
@@ -3711,12 +3724,22 @@ ROOT_SPELLINGS = (
     ("#5896", "a quoted trap with a computed action", '"trap" "$x" EXIT', "roots:computed trap action"),
     ("#5896", "a computed command after a redirection", '2>/dev/null "$c" x', "roots:computed command \"$c\""),
     ("#5896", "a quoted eval in a case item", 'case "$1" in a) "eval" "$c" ;; esac', "roots:eval"),
+    # #5895: a nameref after any run of option words, in any spelling of its option.
+    ("#5895", "declare +i -n (S1)", 'n=OUT_""DIR; declare +i -n r="$n"; r=/dev', "roots:nameref"),
+    ("#5895", "typeset +x -n", 'typeset +x -n r="$n"', "roots:nameref"),
+    ("#5895", "local +r -n", 'local +r -n r="$n"', "roots:nameref"),
+    ("#5895", "declare -i +x -n", 'declare -i +x -n r="$n"', "roots:nameref"),
+    ("#5895", "a quoted -n", 'declare -"n" r="$n"', "roots:nameref"),
+    ("#5895", "a split +i and -n", 'declare "+"i -""n r="$n"', "roots:nameref"),
+    ("#5895", "a computed option word", 'declare "$o" r="$n"', "roots:computed option"),
 )
 # Spellings that leave every root proven: a builtin name as a literal argument of another command.
 ROOT_SPELLINGS_CLEAN = (
     ("#5897", "a dot as a literal argument", 'ls -d . "$OUT_DIR"'),
     ("#5896", "builtin names inside a quoted message", 'echo "please source the env and eval it"'),
     ("#5896", "a glob in a case pattern", 'case "$1" in ev?l | [e]val) : ;; *) : ;; esac'),
+    ("#5895", "declare +i with no nameref", 'declare +i -a list=()'),
+    ("#5895", "a name n after --", 'local -- n=1'),
 )
 
 
