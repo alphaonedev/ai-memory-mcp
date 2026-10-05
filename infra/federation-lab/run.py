@@ -2641,6 +2641,12 @@ def selftest_start_state(T, base):
     T.leg("5908: the ctypes command-line reader (Python 3.9 path) agrees with sys.orig_argv",
           ctypes_now == list(orig_now) if orig_now is not None else ctypes_now is not None and len(ctypes_now) >= 1, True,
           "%r vs %r" % (ctypes_now, orig_now))
+    with open(os.path.join(LAB, "README.md"), "rb") as fh:
+        readme = fh.read().decode("utf-8", "replace")
+    first = source.decode("utf-8").split("\n", 1)[0]
+    T.leg("5940: the README quotes the real first line of run.py, the env -S requirement and the plain-python3 refusal",
+          (("`%s`" % first) in readme, "env -S" in readme or "`env` that supports `-S`" in readme,
+           "plain `python3 run.py`" in readme and "`78`" in readme), (True, True, True))
     import ast
     tree = ast.parse(source.decode("utf-8"))
     named = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and hasattr(__import__("builtins"), n.id)}
