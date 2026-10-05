@@ -3775,6 +3775,23 @@ ROOT_SPELLINGS = (
     ("#5899", "a split PS4", 'declare P""S4="$p"', "roots:code variable"),
     ("#5899", "an indirect default assignment", ': "${!n:=/dev}"', "roots:indirect default assignment"),
     ("#5899", "an indirect assignment without a colon", ": ${!n=/dev}", "roots:indirect default assignment"),
+    # #5763 round 18: neighbouring spellings of S1-S4, each measured in bash 5.2 to reassign OUT_DIR.
+    ("#5896", "backslashes in every letter of eval", '\\e\\v\\a\\l "$c"', "roots:eval"),
+    ("#5896", "a partly quoted eval", '"ev"al "$c"', "roots:eval"),
+    ("#5896", "a single quote inside eval", "ev'a'l \"$c\"", "roots:eval"),
+    ("#5896", "a quoted eval in a group", '{ "eval" "$c"; }', "roots:eval"),
+    ("#5896", "a quoted eval after if", 'if "eval" "$c"; then :; fi', "roots:eval"),
+    ("#5896", "a quoted eval after time -p", 'time -p "eval" "$c"', "roots:eval"),
+    ("#5896", "command -- quoted eval", 'command -- "eval" "$c"', "roots:eval"),
+    ("#5897", "builtin with a quoted source", 'builtin "source" "$HERE/x"', "roots:source"),
+    ("#5897", "a leading redirection then a quoted dot", '</dev/null "." "$HERE/x"', "roots:source"),
+    ("#5895", "a quoted typeset with +x -n", '"typeset" +x -n r="$n"', "roots:nameref"),
+    ("#5895", "declare -g +x -n", 'declare -g +x -n r="$n"', "roots:nameref"),
+    ("#5895", "a split -n", 'declare -""n r="$n"', "roots:nameref"),
+    ("#5898", "wait -fpOUT_DIR", "sleep 0 & wait -fpOUT_DIR", "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5898", "a single-quoted attached printf -v name", "printf -v'OUT_DIR' %s /dev",
+     "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5896", "a quoted let with a split name", "let 'OUT_''DIR=7'", "OUT_DIR:named outside its one reviewed assignment"),
 )
 # Spellings that leave every root proven: a builtin name as a literal argument of another command.
 ROOT_SPELLINGS_CLEAN = (
