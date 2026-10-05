@@ -482,6 +482,46 @@ MDEOF
     anchor_green 5393 "a live symbol followed by an unrelated less-than in prose" \
         "See \`$R::RecallTool\` when a < b holds."
 
+    # #5396: CommonMark lets whitespace, a tab or one line ending sit between
+    # `](` and the destination (and whitespace before `)`), and the destination
+    # may be angle-bracketed. A link with any of these is still a link: a
+    # missing file is reported, and an escape-token target (src/../x.rs) keeps
+    # NO absence exemption.
+    anchor_red 5396 PATH "a link with one space after the opening parenthesis" \
+        'See [h]( src/gone.rs) held it.'
+    anchor_red 5396 PATH "a link with spaces on both sides of the destination" \
+        'See [h](  src/gone.rs  ) held it.'
+    anchor_red 5396 PATH "a link with an angle destination and spaces around it" \
+        'See [h]( <src/gone.rs> ) x'
+    anchor_red 5396 PATH "an escape-token link target on a formerly line, space after the parenthesis" \
+        'Formerly [h]( src/../gone.rs) held it.'
+    anchor_red 5396 PATH "a link whose destination is on the next line" \
+        $'See [the handler](\nsrc/gone.rs) for it.'
+    anchor_red 5396 PATH "a link with a tab after the opening parenthesis" \
+        $'See [h](\tsrc/gone.rs) x'
+    anchor_red 5396 PATH "a link with an angle destination and a title, spaces around" \
+        'See [h]( <src/gone.rs> "the file" ) x'
+    anchor_red 5396 PATH "a backticked-label link with a space after the opening parenthesis" \
+        'See [`gone`]( src/gone.rs) x'
+    anchor_red 5396 PATH "an escape-token link target on the next line" \
+        $'Formerly [h](\nsrc/../gone.rs) x'
+    anchor_red 5396 PATH "an escape-token reference definition target on the next line" \
+        $'Formerly [h]:\nsrc/../gone.rs'
+    anchor_red 5396 PATH "a missing file after a space, behind a live link on the same line" \
+        'See [a](src/mcp/tools/recall.rs) and [b]( src/gone.rs) x'
+    anchor_red 5396 LINE "a spaced link whose line fragment passes end-of-file" \
+        'See [h]( src/mcp/tools/recall.rs#L9999 ) x'
+    anchor_green 5396 "a spaced link to a live file" \
+        'See [h]( src/mcp/tools/recall.rs ) x'
+    anchor_green 5396 "a spaced angle link to a live file with a title" \
+        'See [h]( <src/mcp/tools/recall.rs> "title" ) x'
+    anchor_green 5396 "a next-line destination that is a live file" \
+        $'See [h](\nsrc/mcp/tools/recall.rs) x'
+    anchor_green 5396 "a spaced backticked-label link to the module (file stem)" \
+        'See [`recall`]( src/mcp/tools/recall.rs) x'
+    anchor_green 5396 "an open link whose next line is plain prose" \
+        $'See [h](\nthe docs) x'
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
@@ -1184,7 +1224,7 @@ def strip_generics(tok):
     return "".join(out)
 
 
-MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(<?([^)]*src/[A-Za-z0-9_/]+\.rs)[^)]*\)")
+MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(\s*<?([^)]*src/[A-Za-z0-9_/]+\.rs)[^)]*\)")
 # #5190: ANY relative markdown link to a src/ file, whatever its label
 # (MDLINK only sees a backticked-identifier label). canon() has already
 # removed a ./ or ../ prefix, so the target starts with src/.
@@ -1193,7 +1233,12 @@ MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(<?([^)]*src/[A-Za-z0-9_/]+
 # title in double quotes, single quotes or parentheses.
 _TITLE = r"(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?"
 _SRC = r"(src/[A-Za-z0-9_/]+\.rs)(?:\?[^)#\s>\"']*)?"
-RELLINK = re.compile(r"\]\(<?" + _SRC + r"(#[^)\s>]*)?>?" + _TITLE + r"\)")
+# #5396: CommonMark allows spaces, tabs and one line ending between `(` and the
+# destination and again before `)`; a line ending after `(` is joined in the
+# loop below (LINK_OPEN).
+RELLINK = re.compile(r"\]\(\s*<?" + _SRC + r"(#[^)\s>]*)?>?" + _TITLE + r"\s*\)")
+LINK_OPEN = re.compile(r"\]\(\s*$")
+PREV_HEAD_OPEN = re.compile(r"(?:\]\(|\]:)\s*$")
 # #5269/#5343: two more relative-link forms to a src/ file: a markdown
 # reference definition (`[h]: src/x.rs "title"`, also inside a blockquote or a
 # list item; a destination on the NEXT line is joined in the loop below) and
@@ -1280,7 +1325,7 @@ ABSENT_DEST = re.compile(
 # #5346: text that ends right before a link destination: `](`, `](<`,
 # `href=`, `href="` or a reference definition `]:`.
 ESCAPE_LINK_HEAD = re.compile(
-    r"(?:\]\(<?|\b(?i:href)\s*=\s*[\"']?|\]:\s*<?)$")
+    r"(?:\]\(\s*<?|\b(?i:href)\s*=\s*[\"']?|\]:\s*<?)$")
 
 
 PIN_TARGET = re.compile(
@@ -1353,9 +1398,14 @@ for doc in seen_docs:
             # whatever wording is nearby: either one reports the token.
             for tm in re.finditer(re.escape(tok), line):
                 at = tm.start()
+                # #5396: a destination on the line after an open `](` or
+                # `]:` is a link target too.
+                next_line_dest = (ln > 1 and not line[:at].strip(" \t<")
+                                  and bool(PREV_HEAD_OPEN.search(doc_lines[ln - 2])))
                 if (not absent_ok_at(at)
                         or line.startswith(tok + "::", at)
-                        or ESCAPE_LINK_HEAD.search(line[:at])):
+                        or ESCAPE_LINK_HEAD.search(line[:at])
+                        or next_line_dest):
                     emit("PATH", doc, ln, tok, ctx)
                     break
 
@@ -1417,7 +1467,7 @@ for doc in seen_docs:
 
         for m in MDLINK.finditer(line):
             sym = m.group(1)
-            tgt = m.group(2).split("#")[0]
+            tgt = m.group(2).split("#")[0].strip()
             if tgt not in per_file:
                 # A link to a missing file is a dead link whatever the
                 # surrounding wording says: no absence exemption.
@@ -1427,9 +1477,14 @@ for doc in seen_docs:
 
         # #5190: a relative link with a plain-text label must still point at
         # a file that exists. MDLINK already reported a backticked-label link.
-        md_starts = {m.start(2) for m in MDLINK.finditer(line)}
+        md_spans = [(m.start(2), m.end(2)) for m in MDLINK.finditer(line)]
+        # #5396: a line that ends in an open `](` takes its destination from
+        # the next line, as CommonMark does.
+        link_line = line
+        if LINK_OPEN.search(line) and ln < len(doc_lines):
+            link_line = line.rstrip() + " " + canon(doc_lines[ln])[0].lstrip()
         rel_hits = [(m.group(1), m.group(2), m.start(1), True)
-                    for m in RELLINK.finditer(line)]
+                    for m in RELLINK.finditer(link_line)]
         # #5343: a reference definition may carry its destination on the
         # NEXT line (`[h]:` then `src/x.rs`); join the two before matching.
         refdef_line = line
@@ -1447,7 +1502,7 @@ for doc in seen_docs:
                     last = int(fm.group(2)) if fm.group(2) else n
                     if n < 1 or last < n or last > line_count[tgt]:
                         emit("LINE", doc, ln, f"{tgt}{frag}", ctx)
-            if is_md and start in md_starts:
+            if is_md and any(a <= start < b for a, b in md_spans):
                 continue
             if tgt not in per_file:
                 emit("PATH", doc, ln, tgt, ctx)
