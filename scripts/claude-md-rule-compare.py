@@ -480,7 +480,7 @@ def refusal_prefix_gap(source: bytes) -> str:
     the interpreter does. It is closed-world and fails closed, so it over-refuses rather than risk a miss. The exact rule,
     each numbered rule is asserted by pin_5590 (#5590, #5622), and pin_5590 fails if a numbered rule has no assertion
     group; the structure paragraph above is pinned by pin_5510, pin_5562 and pin_5563:
-    R1: a non-bytes argument is refused.
+    R1: an argument that is neither bytes nor bytearray is refused; a bytearray is judged as the bytes it holds.
     R2: A utf-8 BOM is refused (detect_encoding reports it as utf-8-sig), alone or with any cookie.
     R3: A coding cookie on line 1 or 2 is judged after tokenize.detect_encoding's PEP 263 normalisation (the rule the
     interpreter uses, so a cookie in any spelling on line 1 or 2 is covered). Accepted: utf-8 in any letter case, utf_8,
@@ -1051,6 +1051,10 @@ def _self_test_cases() -> int:
         for label, arg in (("a str", plain.decode("utf-8")), ("None", None), ("an int", 7)):  # R1
             if refusal_prefix_gap(arg) != "the source is not bytes":
                 return f"the docstring says {label} is refused as not bytes but the reason was {refusal_prefix_gap(arg)!r} (R1)"
+        if refusal_prefix_gap(bytearray(plain)) or refusal_prefix_gap(bytearray(b"# coding: nope\n" + plain)) == "":
+            return "the docstring says a bytearray is judged as the bytes it holds but its verdict differs from the bytes verdict (R1, #5623)"
+        if refusal_prefix_gap(memoryview(plain)) != "the source is not bytes":
+            return "the docstring says an argument that is neither bytes nor bytearray is refused but a memoryview was not (R1, #5623)"
         asserted.add("R1")
         bom = b"\xef\xbb\xbf"  # R2
         for cookie in (b"", b"# coding: utf-8\n", b"# coding: utf8\n", b"# coding: utf-8-sig\n", b"# coding: latin-1\n",
