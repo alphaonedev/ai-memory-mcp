@@ -1312,7 +1312,7 @@ def self_test() -> int:
     # #5482: the split-head rewrite keeps every offset, so a hit that follows split
     # heads with tails is still reported on its own line (line 4 here).
     red += 1
-    pad = "psql_" + "x" * 30 + " -X -f a.sql\n"
+    pad = "p" + "''" * 3 + "s" + "''" * 3 + "ql_" + "x" * 30 + " -X -f a.sql\n"
     pinned = [h for h in scan_text("probe.sh", pad * 3 + 'psql -v pw="$PG_PW" -f x.sql\n')
               if h[2].startswith("[env-password-argv]")]
     if [h[1] for h in pinned] != [4]:
