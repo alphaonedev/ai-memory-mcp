@@ -864,10 +864,13 @@ def heredoc_findings(text, names):
     return bad
 
 
-# #5361: commands that may take a node-derived argument. Test builtins and filters read their input and
-# print nothing of it; the node channels and their wrappers send it to a node.
-SILENT_CONSUMERS = frozenset(("[", "[[", "test", "case", "for", "local", "return", "exit", "true", "false", ":",
-                              "grep", "sed", "seq", "shift", "unset", "wc", "tr", "export", "readonly", "plain_id"))
+# #5361, #5406: commands that may take a node-derived argument. Only the test builtins, the loop and case
+# keywords, true, false, : and plain_id print none of their operands. A reply reaches grep, sed, tr, wc and
+# the like on STDIN only (the printf or echo that feeds them is a sink and is checked on its own): as an
+# ARGUMENT they print it (a file name, a format, a replacement, an invalid-identifier or numeric error).
+SILENT_CONSUMERS = frozenset(("[", "[[", "test", "case", "for", "true", "false", ":", "plain_id"))
+# A declaration takes name=value words: the reply may be the VALUE (nothing is printed), never the name.
+DECLARATORS = frozenset(("local", "export", "readonly", "declare", "typeset"))
 KEYWORDS = r"(?:(?:if|then|elif|else|while|until|do|time|!)\s+)*"
 
 
@@ -922,6 +925,13 @@ def consumer_findings(text, names):
         for seg in command_segments(line):
             body = re.sub(KEYWORDS, "", seg.lstrip())
             body = re.sub(r"^(?:\w+\+?=(?:\"[^\"]*\"|'[^']*'|\S*)\s*)+", "", body)
+            if body.split()[:1] and body.split()[0] in DECLARATORS:
+                body = re.sub(r"(?<=\s)\w+\+?=(?:\"[^\"]*\"|'[^']*'|\S*)", "", body)
+                word = body.split()[0]
+                hit = [v for v in names if re.search(r"\$\{?[#!]?%s\b" % re.escape(v), body)]
+                if hit:
+                    bad.append("%d:%s:%s" % (n, word, ",".join(sorted(hit))))
+                continue
             hit = [v for v in names if re.search(r"\$\{?[#!]?%s\b" % re.escape(v), body)]
             word = body.split(None, 1)[0] if body.split() else ""
             if hit and word and word not in known and not re.match(r"^\w+\+?=", word):
@@ -1068,7 +1078,21 @@ def closed_world_taint(fs):
                         ("a reply file read by head in a failure line", "printf '%s' \"$qjson\" > \"$OUT_DIR/r\"\nno \"x $(head -c 99 \"$OUT_DIR/r\")\""),
                         ("a reply file read by sed in a failure line", 'no "x $(sed -n 1p "$OUT_DIR/r")"'),
                         ("a reply file read by redirect-cat", 'cat < "$OUT_DIR/r"'),
-                        ("a command substitution in a PASS line", 'ok "x $(od -c "$OUT_DIR/r")"')):
+                        ("a command substitution in a PASS line", 'ok "x $(od -c "$OUT_DIR/r")"'),
+                        # #5406: commands that print an ARGUMENT are not silent consumers of a reply.
+                        ("sed with the reply in the replacement", 'printf x | sed "s/x/$qjson/"'),
+                        ("seq with the reply as the format", 'seq -f "$qjson" 1'),
+                        ("wc with the reply as a file name", 'wc -c "$qjson"'),
+                        ("grep with the reply as a file name", 'grep -q x "$qjson"'),
+                        ("grep with the reply as the pattern", 'grep -q "$qjson" "$OUT_DIR/r"'),
+                        ("shift with the reply", 'shift "$qjson"'),
+                        ("return with the reply", 'return "$qjson"'),
+                        ("exit with the reply", 'exit "$qjson"'),
+                        ("export with the reply as the name", 'export "$qjson"'),
+                        ("local with the reply as the name", 'local "$qjson"'),
+                        ("tr with the reply as a set", 'echo abc | tr abc "$qjson"'),
+                        ("unset with the reply", 'unset "$qjson"'),
+                        ("readonly with the reply as the name", 'readonly "$qjson"')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
         probe("V1 closed-world negative control is flagged: %s" % label, len(b2) > len(bad), str(b2[len(bad):][:2]))
     # #5236: constructs a name-based scan cannot follow are not allowed in federate.sh at all.
@@ -1095,6 +1119,11 @@ def closed_world_taint(fs):
                         ("a reply captured through sed", "age_ver=\"$(printf '%s\\n' \"$versions\" | sed -n 's/^age=//p')\""),
                         ("the status helper given a reply body", 'no "x $(reply_status "$qjson")"'),
                         ("a test after then", 'if true; then [ "$qjson" = x ] && :; fi'),
+                        # #5406: a reply is a VALUE of a declaration, or reaches a filter on stdin: both print nothing.
+                        ("local with the reply as a value", 'local v="$qjson"'),
+                        ("export with the reply as a value", 'export v="$qjson"'),
+                        ("readonly with the reply as a value", 'readonly v=$qjson'),
+                        ("a filter fed the reply on stdin", "nb=\"$(printf '%s' \"$qjson\" | tr -d x | wc -c)\""),
                         ("a test after elif, else and while", 'if false; then :; elif [ "$qjson" = x ]; then :; else [[ "$qjson" == y ]]; fi\nwhile [ "$qjson" = z ]; do :; done')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
         probe("V1 closed-world control is accepted: %s" % label, len(b2) == len(bad), str(b2[len(bad):][:2]))
