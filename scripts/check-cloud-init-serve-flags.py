@@ -2151,23 +2151,94 @@ def dsn_problems(dsn: str, ctx: str) -> list:
 
 
 def redact(dsn: str) -> str:
-    # redact first, cut after: a cut before the scrub drops the "@" the scrub keys on (#5506)
     return scrub(dsn)[:70]
 
 
-# a postgres URL up to its last "@" (a password can hold "/" or "@"), and a URL cut before
-# its "@" that still holds "user:password": both are userinfo, never printed (#5438)
-SCRUB_UPTO_AT = re.compile(r"(postgres(?:ql)?://)[^\s\"']*@", re.I)
-SCRUB_CUT = re.compile(r"(postgres(?:ql)?://)[^\s\"'/@]*:[^\s\"'/@]*(?=[\s\"']|$)", re.I)
+# a postgres URL up to the last "@" on its line (a password can hold "/", "@", a quote or any
+# whitespace, so nothing but the line end bounds it), and a URL cut before its "@" that still
+# holds "user:password": the rest of the line is printed as nothing, never as a part of the
+# password (#5438, #5486)
+SCRUB_UPTO_AT = re.compile(r"(postgres(?:ql)?://)[^\n]*@", re.I)
+SCRUB_CUT = re.compile(r"(postgres(?:ql)?://)[^\s\"'/@]*:[^\n]*", re.I)
+
+
+CRED_MASK = "<redacted>"
+# every credential text found in the raw templates, before any word splitting or cutting:
+# the one set that scrub() and mask_credentials() hide wherever it is printed (#5487, #5488)
+CRED_PIECES: set = set()
+_CRED_RE = [None, None]  # the (pieces, compiled alternation) pair, rebuilt when the set changes
+CRED_URL_RE = re.compile(r"postgres(?:ql)?://", re.I)
+# a shell word end, a quote, a redirect, an escape: the characters a word splitter cuts at
+CRED_SPLIT_RE = re.compile(r"[\s;&|()<>'\"\\`$]+")
+CRED_RUN_RE = re.compile(r"[A-Za-z0-9]{3,}")
+CRED_QUOTED = r"(\"[^\"\n]*\"|'[^'\n]*'|[^\s;&|()<>'\"]+)"
+# the non-URL forms a password is written in: any *password= / *passwd= key (PGPASSWORD=v,
+# libpq conninfo, a URL query key), and a SQL PASSWORD 'v' literal
+CRED_FORMS = (
+    re.compile(r"[\w-]*pass(?:word|wd)\w*\s*=\s*" + CRED_QUOTED, re.I),
+    re.compile(r"\bPASSWORD\s+'((?:[^']|'')*)'", re.I),
+)
+# the placeholder, template, shell and terraform variable references carry no secret
+CRED_FREE_RE = re.compile(r"CHANGEME|\$\{?[A-Za-z_]\w*\}?|\$\(.*\)|(?:var|local|module|data)\.[\w.\[\]-]+", re.I)
+
+
+def credential_pieces(value: str) -> set:
+    """The strings that print `value`: it as written, unquoted, percent-decoded, each part
+    between word-splitting characters (a word cut from the middle of a password is one of
+    them), and each alphanumeric run of three or more (#5487)."""
+    forms = {value, value.strip("'\""), urllib.parse.unquote(value), urllib.parse.unquote(value.strip("'\""))}
+    out = set()
+    for v in forms:
+        out.add(v)
+        out.update(t for t in CRED_SPLIT_RE.split(v) if t)
+        out.update(CRED_RUN_RE.findall(v))
+    return {x for x in out if x and not CRED_FREE_RE.fullmatch(x)}
+
+
+def register_credentials(text: str) -> None:
+    """Record every password written in `text` (a template, the allowlist or main.tf), on the
+    whole raw text and before it is split into words: the password of every postgres URL (any
+    "@" may end the userinfo, and the password may hold a quote, whitespace, ";" or "/"), and
+    each value of the non-URL forms in CRED_FORMS (#5487, #5488). A secret written in none of
+    those forms (computed or read at run time, encoded, a bare .pgpass line) is not derivable
+    from the text and is not masked."""
+    found = []
+    for line in text.split("\n"):
+        for m in CRED_URL_RE.finditer(line):
+            rest = line[m.end():]
+            for k, ch in enumerate(rest):
+                if ch == "@" and ":" in rest[:k]:
+                    found.append(rest[:k].split(":", 1)[1])
+        for rx in CRED_FORMS:
+            found.extend(m.group(1) for m in rx.finditer(line))
+    new = set()
+    for v in found:
+        if v.strip("'\"") and not CRED_FREE_RE.fullmatch(v.strip("'\"")):
+            new |= credential_pieces(v)
+    if not new <= CRED_PIECES:
+        CRED_PIECES.update(new)
+
+
+def mask_credentials(text: str) -> str:
+    """`text` with every registered credential piece replaced by one fixed placeholder, in a
+    single pass so a placeholder is never itself matched (#5487)."""
+    if not CRED_PIECES:
+        return text
+    if _CRED_RE[1] is None or _CRED_RE[0] != CRED_PIECES:
+        _CRED_RE[0] = frozenset(CRED_PIECES)
+        _CRED_RE[1] = re.compile("|".join(re.escape(x) for x in sorted(CRED_PIECES, key=lambda x: (-len(x), x))))
+    return _CRED_RE[1].sub(CRED_MASK, text)
 
 
 def scrub(text: str) -> str:
-    """Text safe to print: the userinfo of every postgres URL in it is replaced (#5438).
-    The only password the gate tolerates is the store-url placeholder, but a template can
-    carry a real one, and a failure line that quotes the line or a word cut from it would
-    put that password in the CI log. Applied to every hit before it is printed, and
-    before any cut to a fixed width, so a cut cannot drop the "@" that marks the userinfo."""
-    return SCRUB_CUT.sub(r"\1<userinfo>", SCRUB_UPTO_AT.sub(r"\1<userinfo>@", text))
+    """Text safe to print: registered credential text and the userinfo of every postgres URL
+    in it are replaced (#5438). The only password the gate tolerates is the store-url
+    placeholder, but a template can carry a real one, and a failure line that quotes the line
+    or a word cut from it would put that password in the CI log. Every print of template-
+    derived text goes through this function, before any cut to a fixed width, so a cut cannot
+    drop the "@" that marks the userinfo. What cannot be proven free of a credential is
+    replaced, never shortened: a URL cut before its "@" loses the rest of its line."""
+    return SCRUB_CUT.sub(r"\1<userinfo>", SCRUB_UPTO_AT.sub(r"\1<userinfo>@", mask_credentials(text)))
 
 
 def printable(lines, prefix: str = "") -> str:
@@ -2649,6 +2720,7 @@ def binary_vars(stmts: list) -> frozenset:
 
 
 def analyse(name: str, text: str, cache: dict):
+    register_credentials(text)  # on every call, so a scan answered from the cache still masks
     key = (name, text)
     if key not in cache:
         # the R5 reasons this scan adds are kept with the entry, so a scan answered from
@@ -2693,6 +2765,9 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
     """Scan templates (name -> text). Returns (hits, faults, stats)."""
     cache = {} if cache is None else cache
     faults, hits = [], []
+    CRED_PIECES.clear()
+    for text in list(templates.values()) + list(maintfs.values()) + [allow_text, pending_text]:
+        register_credentials(text)
     if len(templates) < 2:
         faults.append("expected at least 2 templates, found %d" % len(templates))
     scopes = {}
@@ -2780,7 +2855,7 @@ def list_triggers(templates: dict, cache: dict) -> list:
     for nm, text in sorted(templates.items()):
         lines, _, _, trig, _ = analyse(nm, text, cache)
         for ln in trig:
-            out.append("%s | %s | %s" % (scope_of(nm), ln.ctx, ln.text))
+            out.append("%s | %s | %s" % (scope_of(nm), ln.ctx, mask_credentials(ln.text)))
     return out
 
 
@@ -3468,9 +3543,29 @@ SCRUB_CASES = [
     ("postgres://u:p/w@h/db", "postgres://<userinfo>@h/db"),
     ("postgresql://u:p@w@h/db", "postgresql://<userinfo>@h/db"),
     ("POSTGRES://u:pw@h/db", "POSTGRES://<userinfo>@h/db"),
-    ("'postgres://aimemory:Cut'", "'postgres://<userinfo>'"),
+    ("'postgres://aimemory:Cut'", "'postgres://<userinfo>"),
+    ("postgres://aimemory:Aq7Zk'Bq7Zk@h/db", "postgres://<userinfo>@h/db"),
+    ("postgres://aimemory:Aq7Zk Bq7Zk@h/db", "postgres://<userinfo>@h/db"),
+    ("postgres://aimemory:Aq7Zk\u2028Bq7Zk@h/db", "postgres://<userinfo>@h/db"),
+    ("postgres://aimemory:Exp/Mark9xyzExpMark9", "postgres://<userinfo>"),
+    ("postgres://aimemory:Aq7Zk\"Bq7Zk", "postgres://<userinfo>"),
     ("postgres://localhost/db?sslmode=verify-full", "postgres://localhost/db?sslmode=verify-full"),
 ]
+
+
+def printed_for(base: tuple, known: set, muts: list, **spec):
+    """Scan the real templates with `muts` applied to the aws template and return its hits
+    and everything main() would print for them: faults, hits and a probe-failure line."""
+    t, mt, a, p, auto, extra = case_inputs(base, dict(spec, aws=muts))
+    hits, faults, _ = run_scan(t, mt, a, p, known, cache={})
+    return hits, printable(faults, "FAULT: ") + "\n" + printable(hits) + "\n" + probe_failure("p", "green", "red", faults + hits)
+
+
+NAMEREF_DEC = "      systemctl daemon-reload\n"
+NAMEREF_LINE = "      A=/etc/ai-memory/run.conf; declare -n R=A; bash \"$R\"\n"
+
+
+PW_FIXTURES = ("SecretMark9xyz", "Secret/Mark9/xyz/Secret/Mark9/xyz/Secret/Mark9/xyz", "Secret$Mark9$xyz$Secret$Mark9$xyz", "Secret/Mark9/" * 20)
 
 
 def secret_output_problems(base: tuple, known: set) -> list:
@@ -3483,30 +3578,80 @@ def secret_output_problems(base: tuple, known: set) -> list:
             bad.append("scrub(%r) gave %r, not %r" % (raw, scrub(raw), want))
     dec = "      systemctl daemon-reload\n"
     nameref = "      A=/etc/ai-memory/run.conf; declare -n R=A; bash \"$R\"\n"
-    for pw in ("SecretMark9xyz", "Secret/Mark9/xyz/Secret/Mark9/xyz/Secret/Mark9/xyz", "Secret$Mark9$xyz$Secret$Mark9$xyz", "Secret/Mark9/" * 20):
+    for pw in PW_FIXTURES:
         spec = {"aws": [("aimemory:CHANGEME@", "aimemory:%s@" % pw), (dec, nameref + dec)]}
         t, mt, a, p, auto, extra = case_inputs(base, spec)
         hits, faults, _ = run_scan(t, mt, a, p, known, cache={})
         out = printable(faults, "FAULT: ") + "\n" + printable(hits) + "\n" + probe_failure("p", "green", "red", faults + hits)
         if not hits:
-            bad.append("a store-url password with a nameref was not refused (%r)" % pw[:12])
+            bad.append("a store-url password with a nameref was not refused (fixture %d)" % PW_FIXTURES.index(pw))
         if "Mark9" in out:
-            bad.append("failure output carries a store-url password (%r)" % pw[:12])
-    # redact() redacts before it cuts: a slash password longer than the 70-character cut keeps its
-    # tail out of the dsn_problems text, and a no-password control keeps its marker (#5506)
-    long_pw = "Sec/Mark9x/" * 8
-    shown = " ".join(dsn_problems("postgres://aimemory:%s@h/db?sslmode=disable" % long_pw, "aws"))
-    if "Mark9" in scrub(shown):
-        bad.append("a long slash password leaks through the dsn_problems text")
-    if "Ctl7" not in " ".join(dsn_problems("postgres://aimemory:CHANGEME@h/Ctl7?sslmode=disable", "aws")):
-        bad.append("the redact control lost its path marker")
+            bad.append("failure output carries a store-url password (fixture %d)" % PW_FIXTURES.index(pw))
+    # a password with a quote or any whitespace is printed nowhere, line echoes included (#5486)
+    for sep in ("'", '"', " ", "\t", "\u00a0", "\u0085", "\u2028"):
+        hits, out = printed_for(base, known, [("aimemory:CHANGEME@", "aimemory:Aq7Zk%sBq7Zk@" % sep)])
+        if not hits:
+            bad.append("a store-url password holding U+%04X was not refused" % ord(sep))
+        if "Bq7Zk" in out:
+            bad.append("failure output carries the tail of a store-url password holding U+%04X" % ord(sep))
+    # a password with a shell operator is split into words, and a word cut from its middle has
+    # no postgres:// prefix: neither half is printed, with and without rule R5 reading the
+    # store-url file as script (#5487)
+    for op in (";", "|", "&", "(", "<", ">", "`", "\\", ".*(\\1", "$(", ";;", "@"):
+        for extra in ([], [(NAMEREF_DEC, NAMEREF_LINE + NAMEREF_DEC)]):
+            hits, out = printed_for(base, known, [("aimemory:CHANGEME@", "aimemory:Aq7Zk%sBq7Zk@" % op)] + extra)
+            if not hits:
+                bad.append("a store-url password holding %r was not refused" % op)
+            if "Bq7Zk" in out or "Aq7Zk" in out:
+                bad.append("failure output carries a part of a store-url password holding %r (nameref %s)" % (op, bool(extra)))
+    # a part of a password shorter than three characters is cut as a word too
+    for pw in ("Ab;cD;eF", "Ab|cD|eF", "Ab&cD&eF"):
+        hits, out = printed_for(base, known, [("aimemory:CHANGEME@", "aimemory:%s@" % pw), (NAMEREF_DEC, NAMEREF_LINE + NAMEREF_DEC)])
+        if not hits or "cD" in out or "eF" in out:
+            bad.append("a store-url password with short parts was not refused or was printed (%d chars)" % len(pw))
+    # redact() of a DSN whose password holds "/" and which is refused for its sslmode (#5487)
+    hits, out = printed_for(base, known, [("aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full", "aimemory:Red/Mark9xyz/Red/Mark9xyz/Red/Mark9xyz@localhost/aimemory?sslmode=disable")])
+    if not hits or "Mark9" in out:
+        bad.append("a DSN with a '/' in its password was not refused or was printed")
+    # the registry holds this scan's credential text only, and no ordinary word (#5487)
+    CRED_PIECES.clear()
+    t, mt, a, p, auto, extra = case_inputs(base, {"aws": []})
+    run_scan(t, mt, a, p, known, cache={})
+    if any(x.isalpha() or "Bq7Zk" in x or "Mark9" in x for x in CRED_PIECES):
+        bad.append("the credential registry kept stale text or holds a plain word: %d pieces" % len(CRED_PIECES))
+    # an allowlist or pending entry that holds a password is masked when it is shown (#5488)
+    hits, out = printed_for(base, known, [], allow_add="aws-gpu-burst | top | PGPASSWORD=Aq7ZkBq7Zk psql -d aimemory")
+    if not hits or "Bq7Zk" in out:
+        bad.append("an allowlist entry that holds a password was not refused or was printed")
+    # a password written without a URL (PGPASSWORD, conninfo, query key, SQL literal) is
+    # refused, and the refusal prints no part of it (#5488)
+    for form in ("      PGPASSWORD=Aq7ZkBq7Zk psql -d aimemory\n",
+                 "      psql 'host=localhost password=Aq7ZkBq7Zk'\n",
+                 "      psql \"host=localhost password='Aq7Zk Bq7Zk'\"\n",
+                 "      psql \"postgres://aimemory@localhost/aimemory?password=Aq7ZkBq7Zk\"\n",
+                 "      psql -c \"ALTER ROLE aimemory PASSWORD 'Aq7ZkBq7Zk';\"\n"):
+        hits, out = printed_for(base, known, [(NAMEREF_DEC, form + NAMEREF_DEC)])
+        if not hits:
+            bad.append("a non-URL password form was not refused: %s" % form[:20])
+        if "Bq7Zk" in out:
+            bad.append("failure output carries a non-URL password: %s" % form[:20])
+    # --list-triggers prints lines too: a real password is masked, the placeholder is kept (#5488)
+    CRED_PIECES.clear()
+    t, mt, a, p, auto, extra = case_inputs(base, {"aws": [("aimemory:CHANGEME@", "aimemory:Aq7Zk'Bq7Zk@")]})
+    listed = "\n".join(list_triggers(t, {}))
+    if "Bq7Zk" in listed or CRED_MASK not in listed:
+        bad.append("--list-triggers printed a store-url password or did not mask it")
+    CRED_PIECES.clear()
+    t, mt, a, p, auto, extra = case_inputs(base, {"aws": []})
+    if "aimemory:CHANGEME@" not in "\n".join(list_triggers(t, {})):
+        bad.append("--list-triggers masked the store-url placeholder")
     # the expansion hit cuts the command word at 40 bytes: scrub first, or the cut drops the @
-    spec = {"aws": [(dec, "      postgres://aimemory:ExpMark9xyzExpMark9xyzExpMark9xyz@h/$X a\n" + dec)]}
+    spec = {"aws": [(dec, "      postgres://aimemory:Exp/Mark9xyz/ExpMark9xyzExpMark9xyz@h/$X a\n" + dec)]}
     t, mt, a, p, auto, extra = case_inputs(base, spec)
     hits, faults, _ = run_scan(t, mt, a, p, known, cache={})
     if not any("expansion or command substitution" in h for h in hits):
         bad.append("an expanded command word that quotes a store url was not refused")
-    if "ExpMark9" in "\n".join(faults + hits):
+    if "Mark9" in "\n".join(faults + hits):
         bad.append("an expansion hit carries a store-url password")
     # main() itself prints through printable: stub the scan so that its hit and fault both
     # quote a password, and read what reaches stderr (a fault path and a hit path)
