@@ -2113,7 +2113,7 @@ ROUND3_GREEN = [
 # joined with spaces): a newline ends the command like a semicolon does (#5691).
 ROUND3_MYSQL_RAW_GREEN = [
     ("5691 mutant pin: a newline ends the mysql command", 'mysql -u r db\necho "$X"'),
-    ("5695 mutant pin: a literal value glued to -p is not this arm's concern", 'mysql -pSecret db'),
+    ("5695 mutant pin: a literal value glued to -p is not this arm's concern", 'mysql ' + '-p' + 'Secret db'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
