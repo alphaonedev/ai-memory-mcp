@@ -699,9 +699,9 @@ def _my_words_hit(words: Sequence[str]) -> bool:
 # parenthesis group and every quoted string (read as the payload an ssh, sh -c or docker exec shell runs) is read
 # again, recursively, by the same machine. An escaped opener (backslash dollar paren, backslash backtick) is read
 # as a substitution: one level of quoting removes the backslash and a far-side shell runs it. Closed world: when
-# the machine cannot resolve where a construct ends (an unclosed quote, substitution, parenthesis or backtick, an
-# escaped backtick without an escaped partner, a backslash that ends the unit, a case statement inside a
-# substitution, or readings nested deeper than _SH_MAX_DEPTH), the unit FAILS with that named reason, it is never
+# the machine cannot resolve where a construct ends (an unclosed quote, substitution, parenthesis, parameter
+# expansion or backtick, an escaped backtick without an escaped partner, a backslash that ends the unit, a case
+# statement inside a substitution or group, or readings nested deeper than _SH_MAX_DEPTH), the unit FAILS with that named reason, it is never
 # read on with a guess. A quoted string that cannot be read as shell is plain text when it names no mysql family
 # client (echo "x(" runs no head, so it neither hides one nor fails the unit); one that names the family FAILS like
 # any other unreadable text (#5955). A here-document body is not part of a unit (dockerfile_units reads it as units of its own).
