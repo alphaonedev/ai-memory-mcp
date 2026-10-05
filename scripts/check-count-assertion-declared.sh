@@ -207,8 +207,9 @@ HEAD = re.compile(r'assert(?P<eq>_eq)?!\s*\(')
 TAIL = re.compile(r'^(?P<expr>\S.*)\.(?P<m>len|count)\(\)$', re.S)     # a WHOLE operand that ends in .len() or .count()
 # a count call: `.len()` or `.count()`, spaces allowed around the name and inside the parentheses
 COUNT_CALL = re.compile(r'\.\s*(?:len|count)\s*\(\s*\)')
-# what ends the left operand of a `==` at its own bracket depth (scanning back from the `==`)
-OPERAND_STOPS = ('&&', '||', '==', '!=', '=>')
+# what ends the left operand of a `==` at its own bracket depth (scanning back from the `==`); `==` itself also ends
+# one, in its own branch of compares_count, and a `,` or `;` ends one as well
+OPERAND_STOPS = ('&&', '||', '!=', '=>')
 CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]*)\s*:\s*(?:usize|u\d+|i\d+)\s*=\s*(?P<val>[^;]+?)\s*;')
 UNREAD = '?count#unreadable'
 UNREADABLE = '!unreadable'      # the key prefix of an undecidable assertion: red in every commit that reads its file
@@ -1169,9 +1170,14 @@ def selftest():
                 'fn t() { assert!(v.iter().all(|x| x.len() > 0 && x[0] == 19)); }\n'), False)
     case('a count call compared with >, with == on another operand behind &&, is not read',
          scoped('tests/scope.rs', 'fn t() { assert!(v.len() > 0 && n == 18); }\n', 'fn t() { assert!(v.len() > 0 && n == 19); }\n'), False)
-    # every operand stop is pinned: a count call before the stop, with == after it on another operand, is not read
+    # every operand stop is pinned: && by the leg above, and each of these with a count call before the stop and == after
+    # it on another operand (not read). == ends the left operand of a later == in its own branch of compares_count; that
+    # reset changes no reading (a count call cannot hold `=`), and the leg '== after &&' pins that the left operand of the
+    # second == never reaches back past the first. The != and '== after &&' legs are textual: rustc refuses a chained
+    # compare, the gate reads text and must still stop there (#5874)
     for l_, a0_ in (('a comma', 'assert!(f(v.len(), n == %s))'), ('a semicolon', 'assert!({ let k = v.len(); n == %s })'),
-                    ('||', 'assert!(v.len() > 0 || n == %s)'), ('a match arm =>', 'assert!(match k { _ if v.len() > 0 => n == %s, _ => true })')):
+                    ('||', 'assert!(v.len() > 0 || n == %s)'), ('a match arm =>', 'assert!(match k { _ if v.len() > 0 => n == %s, _ => true })'),
+                    ('!=', 'assert!(v.len() != 0 == %s)'), ('== after &&', 'assert!(v.len() > 0 && n == 1 == %s)')):
         case('operand stop %s: a count call before it, with == after it, is not read' % l_,
              scoped('tests/scope.rs', 'fn t() { %s; }\n' % (a0_ % 18), 'fn t() { %s; }\n' % (a0_ % 19)), False)
     case('an assert! comparing the count with <= is not read',
