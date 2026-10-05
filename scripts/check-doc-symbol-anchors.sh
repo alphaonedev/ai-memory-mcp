@@ -790,6 +790,17 @@ MDEOF
     anchor_red 5493 QUAL "a dyn self type that is only a lifetime bound is refused" \
         "See \`$R::<dyn 'a>::decorate_memory_many\`."
 
+    # #5533: the plus of a bound list needs no space around it.
+    anchor_green 5533 "a dyn self type with an unspaced plus after a lifetime and a live trait" \
+        "See \`$R::<dyn 'a+RecallTool>::decorate_memory_many\`."
+    anchor_green 5533 "a dyn self type with a plus spaced on the left only" \
+        "See \`$R::<dyn 'a +RecallTool>::decorate_memory_many\`."
+    anchor_green 5533 "a dyn self type with a plus spaced on the right only" \
+        "See \`$R::<dyn 'a+ RecallTool>::decorate_memory_many\`."
+    anchor_red_cites 5533 QUAL "a dyn self type with an unspaced plus and a missing trait" \
+        "$R::NoSuch" \
+        "See \`$R::<dyn 'a+NoSuch>::decorate_memory_many\`."
+
     # #5495: a pointer self type names the type behind `*const`/`*mut`; a
     # tuple, slice or other head with no leading type names none the gate can
     # check, so the anchor is refused rather than accepted.
