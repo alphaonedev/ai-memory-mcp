@@ -92,12 +92,33 @@ def _parse_inline_list(text: str) -> List[str]:
     return [_unquote(p) for p in inner.split(",") if p.strip()]
 
 
-def _meaningful(text: str) -> List[Tuple[int, str]]:
-    rows: List[Tuple[int, str]] = []
+# Characters YAML 1.1 parsers treat as a line break besides LF/CR (PyYAML does).
+_EXOTIC_BREAKS = "\x0b\x0c\x1c\x1d\x1e\x1f\x85\u2028\u2029"
+
+
+def _suspect(raw: str, line: str) -> str:
+    """Reason a non-blank line cannot be trusted to keep its column, else ''."""
+    lead = raw[: len(raw) - len(raw.lstrip())]
+    if any(ch != " " for ch in lead):
+        return "non-space leading whitespace"
+    first = line.lstrip()[:1]
+    if first and not (" " < first <= "~"):
+        return "non-ASCII or control first character"
+    return ""
+
+
+def _meaningful(text: str) -> List[Tuple[int, str, str]]:
+    """(indent, body, suspect) per non-blank, non-comment line (#5660)."""
+    if re.search(r"\r(?!\n)", text):
+        raise Unparsed("lone carriage return line break")
+    if any(ch in _EXOTIC_BREAKS for ch in text):
+        raise Unparsed("YAML 1.1 line-break character (form feed, NEL, U+2028/9, ...)")
+    rows: List[Tuple[int, str, str]] = []
     for raw in text.split("\n"):
+        raw = raw.rstrip("\r")
         line = _strip_comment(raw)
         if line.strip():
-            rows.append((_indent(line), line.strip()))
+            rows.append((_indent(line), line.strip(), _suspect(raw, line)))
     return rows
 
 
@@ -105,7 +126,7 @@ def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
     """Return {trigger: {filter_key: [items]}} for the workflow's ``on:`` block."""
     rows = _meaningful(text)
     start = None
-    for idx, (ind, body) in enumerate(rows):
+    for idx, (ind, body, _sus) in enumerate(rows):
         if ind == 0 and re.match(r"""^("on"|'on'|on|true)\s*:""", body):
             start = idx
             break
@@ -116,7 +137,10 @@ def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
     if head.group(2).strip():
         raise Unparsed("flow/scalar on: form: " + head.group(2).strip())
     block: List[Tuple[int, str]] = []
-    for ind, body in rows[start + 1:]:
+    for ind, body, sus in rows[start + 1:]:
+        if sus:
+            # Includes the line that would otherwise silently END the block (#5660).
+            raise Unparsed("on: block line is untrustworthy (" + sus + "): " + repr(body))
         if ind == 0:
             break
         block.append((ind, body))
@@ -411,6 +435,60 @@ class Mutants5447(unittest.TestCase):
     def test_5447_m17_pull_request_target_checked(self) -> None:
         t = "name: x\non:\n  pull_request_target:\n    branches: [main]\njobs: {}\n"
         self._assert_killed("x.yml", t, "R-PR")
+
+
+def _with_on_block(body: str) -> str:
+    return "name: x\non:\n" + body + "jobs: {}\n"
+
+
+GOOD_PR = "  pull_request:\n    branches: [main, 'rehearsal/**']\n"
+GOOD_PUSH = "  push:\n    branches: [main]\n"
+
+
+class LeadingWhitespace5660(unittest.TestCase):
+    """#5660: a non-space leading character must fail closed, never end the on: block."""
+
+    def _red(self, text: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v for v in got), got)
+
+    def test_5660_control_clean(self) -> None:
+        self.assertEqual([], violations("x.yml", _with_on_block(GOOD_PUSH + GOOD_PR)))
+
+    def test_5660_tab_before_trigger(self) -> None:
+        self._red(_with_on_block(GOOD_PUSH + "\tpull_request:\n    branches: [main]\n"))
+
+    def test_5660_tab_before_filter_key(self) -> None:
+        self._red(_with_on_block("  pull_request:\n\tbranches: [main]\n" + GOOD_PUSH))
+
+    def test_5660_mixed_space_tab(self) -> None:
+        self._red(_with_on_block(GOOD_PUSH + " \tpull_request:\n    branches: [main]\n"))
+
+    def test_5660_nbsp_leading(self) -> None:
+        self._red(_with_on_block(GOOD_PUSH + "\u00a0pull_request:\n    branches: [main]\n"))
+
+    def test_5660_form_feed_leading(self) -> None:
+        self._red(_with_on_block(GOOD_PUSH + "\x0cpull_request:\n    branches: [main]\n"))
+
+    def test_5660_bom_led_line(self) -> None:
+        self._red(_with_on_block(GOOD_PUSH + "\ufeff  pull_request:\n    branches: [main]\n"))
+
+    def test_5660_lone_cr_line_break(self) -> None:
+        self._red(_with_on_block(GOOD_PUSH + GOOD_PR).replace("\n  push:", "\r  push:", 1))
+
+    def test_5660_unicode_line_separator(self) -> None:
+        self._red(_with_on_block(GOOD_PUSH + GOOD_PR + "  # x\u2028  y\n"))
+
+    def test_5660_crlf_file_stays_clean(self) -> None:
+        text = _with_on_block(GOOD_PUSH + GOOD_PR).replace("\n", "\r\n")
+        self.assertEqual([], violations("x.yml", text))
+
+    def test_5660_bom_at_stream_start_stays_clean(self) -> None:
+        self.assertEqual([], violations("x.yml", "\ufeff" + _with_on_block(GOOD_PUSH + GOOD_PR)))
+
+    def test_5660_tab_in_later_block_scalar_is_not_inspected(self) -> None:
+        text = _with_on_block(GOOD_PUSH + GOOD_PR) + "x:\n  run: |\n\t\techo hi\n"
+        self.assertEqual([], violations("x.yml", text))
 
 
 class GlobSemantics5447(unittest.TestCase):
