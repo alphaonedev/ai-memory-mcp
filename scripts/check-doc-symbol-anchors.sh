@@ -1088,6 +1088,27 @@ PYEOF
         echo "PASS: self-test #5497 — the header and CLAUDE.md name \"$wording\""
     done
 
+    # #5615: a changelog entry for this gate states what is decoded, refused
+    # and unmodelled, not a closure the code does not have. The entry is read
+    # from changelog.d, or from CHANGELOG.md once the fragments are compiled.
+    changelog_wording() {  # <issue> <required text> <forbidden text>
+        python3 - "$ROOT" "$1" "$2" "$3" <<'PYEOF' || { echo "FAIL: self-test #$1 — the changelog entry lacks \"$2\" or still says \"$3\"" >&2; exit 1; }
+import os, re, sys
+root, issue, need, ban = sys.argv[1:5]
+frag = os.path.join(root, "changelog.d", issue + ".fixed.md")
+src = frag if os.path.exists(frag) else os.path.join(root, "CHANGELOG.md")
+try:
+    text = open(src, encoding="utf-8").read()
+except OSError:
+    sys.exit(1)
+entries = [e for e in re.split(r"\n\s*\n", text) if "(#" + issue + ")" in e]
+ok = bool(entries) and all(need in e and ban not in e for e in entries)
+sys.exit(0 if ok else 1)
+PYEOF
+        echo "PASS: self-test #$1 — the changelog entry names \"$2\" and not \"$3\""
+    }
+    changelog_wording 5531 "refused as \`UNDECIDABLE_LT\` (#5608)" "whitespace entities are read as whitespace"
+
     # #5538: the word check above proves the wording is NAMED; these cases
     # prove ABSENT_DEST does not match wording it does not name, so a pattern
     # that keeps the words and changes the match is killed.
