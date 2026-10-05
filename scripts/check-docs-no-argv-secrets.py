@@ -967,6 +967,8 @@ RED_PROBES_4600 = {
     "5399-09-pw-name-digit": 'psql -v admin_pw1="$PG_PW" -f x.sql',
     "5399-10-locator-suffix": 'psql -v pw_id="$PG_PW" -f x.sql',
     "5399-11-redaction-suffixed-value": "psql -v pw=${PG_PW}xxxx -f x.sql",
+    "5399-12-auth-name": 'psql -v auth="$DB_SECRET_VALUE" -f x.sql',
+    "5399-13-leading-underscore-name": 'psql -v _pw="$PG_PW" -f x.sql',
     # #4808: the forms the #4782 gate missed.
     "4808-docker-e-dsn-literal": "docker run -e DATABASE_URL=postgres://u:hunter2@h/d img",
     "4808-psql-set-equals-pw": 'psql --set=pw="$PG_PW" -f bootstrap.sql',
