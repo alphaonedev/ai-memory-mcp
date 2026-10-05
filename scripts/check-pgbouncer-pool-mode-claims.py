@@ -1690,6 +1690,9 @@ RAW_LINE_PINS: List[Tuple[bytes, str, int, bool, Tuple[int, ...], List[str]]] = 
     (b"abcdefghijklmnopqrstuvwxyz\ntail", "latin-1", 0, False, (1, 2, 3, 5, 26),
      ["abcdef", "efghij", "ijklmn", "mnopqr", "qrstuv", "uvwxyz", "tail"]),
     (b"abcdefghijklmnopqrstuvwxyz\ntail", "latin-1", 0, False, (27, 64), ["abcdefghijklmnopqrstuvwxyz", "tail"]),
+    (b"ab\r\ncd\ref\x0bg\x1ch\x85i\nj\0k\r\n", "latin-1", 0, False, ANY_CHUNK,
+     ["ab", "cd", "ef", "g", "h", "i", "j", "k"]),
+    (b"ab\r\ncd\ref\x0bg\x1ch\x85i\nj\0k\r\n", "latin-1", 0, True, ANY_CHUNK, ["ab", "cd", "ef", "g", "h", "i", "jk"]),
     (b"t\xe0s\xc3\xa0\nio\xffn", "latin-1", 0, False, ANY_CHUNK, ["t\u00e0s\u00c3\u00a0", "io\u00ffn"]),
     (b"t\xe0s\xc3\xa0\nio\xffn", "utf-8", 0, False, ANY_CHUNK, ["t\ufffds\u00e0", "io\ufffdn"]),
     (b"\xc3\0\xa0b\xc3", "utf-8", 0, True, ANY_CHUNK, ["\u00e0b\ufffd"]),
@@ -1699,6 +1702,9 @@ RAW_LINE_PINS: List[Tuple[bytes, str, int, bool, Tuple[int, ...], List[str]]] = 
 ]
 # #5721: the exact place raw_mention reports, line numbers counted from 1.
 RAW_MENTION_PINS: List[Tuple[bytes, str]] = [
+    (b"\x89PNG\nintro\npool_mode = transaction\n", "latin-1+0 view, line 3"),
+    (b"\x89PNG\nintro\nuse transac\0tion mode\n", "latin-1+0 view, NUL removed, line 3"),
+    (b"\x89PNG\n\0" + "a\nb\nuse trаnsаction mоde".encode("utf-16-be"), "utf-16-be+0 view, line 3"),
 ]
 
 
@@ -1899,6 +1905,15 @@ MUTANTS: List[Tuple[str, str, str]] = [
      'getincrementaldecoder("ascii" if codec == "latin-1" else codec)("replace")'),
     ("F3b #5720 a cut sequence at the end of the file is not flushed", "decoder.decode(data, final=not chunk)",
      "decoder.decode(data, final=False)"),
+    ("F3c #5721 a NUL read as a space", 'nul = "" if drop_nul else "\\n"', 'nul = "" if drop_nul else " "'),
+    ("F3c #5721 raw line numbers from 0", "enumerate(_raw_lines(path, codec, offset, drop_nul), 1)",
+     "enumerate(_raw_lines(path, codec, offset, drop_nul), 0)"),
+    ("F3c #5721 raw lines split on LF only", '.replace("\\0", nul)\n            lines = text.splitlines(keepends=True)',
+     '.replace("\\0", nul)\n            lines = [part for part in re.split("(?<=\\n)", text) if part]'),
+    ("F3c #5721 a CR at a chunk end is not carried", ' or lines[-1].endswith("\\r")):\n                carry = lines.pop()  # #5717',
+     '):\n                carry = lines.pop()  # #5717'),
+    ("F3c #5721 a raw line keeps its CR", "                yield line.splitlines()[0]\n            while len(carry)",
+     '                yield line.rstrip("\\n")\n            while len(carry)'),
     # #5554, #5555: rules shown unpinned by mutants N01-N12 (round-8 review)
     ("N01 #5554 set-env reach of four arguments", "[^\\s=\\\"']+){0,4}?", "[^\\s=\\\"']+){0,3}?"),
     ("N02 #5555 a prefixed key before a command", 're.compile(r"^[a-z0-9_]*pool[_-]?mode=', 're.compile(r"^pool[_-]?mode='),
