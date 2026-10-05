@@ -32,7 +32,8 @@ changelog.d/4667.fixed.md | (ci job pgbouncer pool-mode claim gate (#4667), not 
 # context re-read on 2026-10-04: The entry's own text is unchanged; only the self-test counts in the same changelog paragraph changed (86 to 87 mutants, 204 to 205 cases), and they name no pool mode.
 # context re-read on 2026-10-05: Round 8 re-bind (#5471): each line sits in the 4667 changelog fragment, quotes the withdrawn transaction pooling or session-mode wording as prose, sets no pooler mode, and moved only because the fragment was re-wrapped
 # context re-read on 2026-10-05: Round 9 (#5552): the changelog gained a Round 9 paragraph and the Round 8 sentence was corrected, so the neighbourhood of this unchanged line moved; the text is the same and still describes the pooler mode claim gate, never a pool-mode setting.
-changelog.d/4667.fixed.md | making the adapter safe under transaction pooling is tracked in #4679. | ctx:cc8f540a762e
+# context re-read on 2026-10-05: round 10 (#5718): the 4667 changelog paragraph above this line was rewritten to state the raw-bytes views and limits truthfully; the line itself is unchanged
+changelog.d/4667.fixed.md | making the adapter safe under transaction pooling is tracked in #4679. | ctx:40dbcd9ef6a4
 
 # guide 5.6: states which modes are unsupported, the probe results and migration steps; session mode is the supported mode and is stated in the same section
 docs/enterprise-deployment.md | > status (#4667). the supported pool mode behind the postgres adapter is | ctx:51f8076f07ce
