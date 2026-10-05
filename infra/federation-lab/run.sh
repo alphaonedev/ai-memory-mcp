@@ -421,15 +421,11 @@ if [ "$CAVEAT_PROBE" -eq 1 ]; then
         # The mutation is detected only when the refusal names the lowered knob. Any other refusal
         # (port, config, a different knob) proves nothing about this probe, and the profile's INFO
         # pin line names the knob on every boot, so it is excluded.
-        # #5662: lab_probe_verdict reports by assignment (no output command on the verdict path), so it runs in this shell.
-        lab_probe_verdict "$PROBE"; PROBE_VERDICT="$LAB_PROBE_VERDICT"
-        case "$PROBE_VERDICT" in
-          detected) ok "probe mutation detected: the boot refused (exit $PROBE_RC) and the refusal names AI_MEMORY_REQUIRE_ROLLBACK_CHECK" ;;
-          not-detected) no "probe mutation inconclusive: the boot refused (exit $PROBE_RC) but not for the lowered rollback-check knob" ;;
-          # #5588, #5662: refused: the guard could not prove its commands (the child never started), or the child exited
-          # with a status that is not a verdict (no awk file, an unreadable log, an awk error, a killed child).
-          *) no "probe mutation inconclusive: the probe matcher ${PROBE_VERDICT}" ;;
-        esac
+        # #5662, #5664: lab_probe_verdict reports by assignment (no output command on the verdict path), and
+        # lab_probe_report turns the verdict into the line and the outcome: only detected is ok; not-detected and
+        # every refused verdict (the guard refused, or the child exited with a status that is not a verdict) are no.
+        lab_probe_verdict "$PROBE"
+        if lab_probe_report "$LAB_PROBE_VERDICT" "$PROBE_RC"; then ok "$LAB_PROBE_LINE"; else no "$LAB_PROBE_LINE"; fi
       else
         no "full asi-hard cold boot on a fresh DB did NOT come up (exit $PROBE_RC): the lab runs this posture, so a refusal is a failure (#2942 regression or a new refusal)"
       fi

@@ -302,6 +302,17 @@ lab_probe_verdict() {
   esac
 }
 
+# lab_probe_report <verdict> <boot exit> (#5664): the probe line run.sh prints, in LAB_PROBE_LINE, and the outcome: true
+# only for detected. not-detected and every refused verdict return false, so run.sh reports them with no, never ok.
+lab_probe_report() {
+  case "$1" in
+    detected) LAB_PROBE_LINE="probe mutation detected: the boot refused (exit $2) and the refusal names AI_MEMORY_REQUIRE_ROLLBACK_CHECK" ;;
+    not-detected) LAB_PROBE_LINE="probe mutation inconclusive: the boot refused (exit $2) but not for the lowered rollback-check knob" ;;
+    *) LAB_PROBE_LINE="probe mutation inconclusive: the probe matcher $1" ;;
+  esac
+  [[ $1 == detected ]]
+}
+
 # #5539, #5540, #5541, #5588: the two function bodies the structural self-test leg accepts, as `declare -f` prints them with every
 # run of whitespace collapsed to one space. Closed world: a body is allowed only when it EQUALS this text, so any other
 # command, redirect, substitution, second statement or awk program is refused without being named (a denylist cannot be closed).
@@ -325,8 +336,8 @@ lab_probe_body_allowed() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 182 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 177
+# 191 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 186
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), eight probe-matcher legs (lab_probe_refusal_names_knob against generated logs, each
 # checking the exact child status: 10, 11, or 4 for an unreadable log, #5662), three structural legs (the matcher body
@@ -346,7 +357,10 @@ lab_probe_body_allowed() {
 # neighbour commands by function and by PATH file, eight IFS values, eleven shell options, thirteen trace-route cells
 # (#5663: xtrace, xtrace with an assigning PS4, functrace, errtrace, extdebug, the trace attribute, enable -n declare, a
 # function named declare, reproducer a, and DEBUG, RETURN and ERR traps with no trace option), reproducer b, and the
-# LAB_PROBE_WHY reason), a run.sh pin leg (run.sh turns on no trace route, #5663), and one layout leg (this comment sits
+# LAB_PROBE_WHY reason), four probe-report legs (#5664: detected is ok, not-detected, refused and empty are no), a
+# run.sh pin and four run.sh branch legs (#5664: run.sh's own probe-verdict lines run with stub ok and no reach ok,
+# not-detected, and refused for a missing awk and a shadowed exec), a run.sh pin leg (run.sh turns on no trace route,
+# #5663), and one layout leg (this comment sits
 # directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
@@ -680,6 +694,48 @@ lab_posture_selftest() {
     "refused: xtrace, functrace, errtrace or extdebug is on; "*) echo "  PASS probe verdict: a DEBUG trap under functrace that forces status 10 reads as refused, never detected (#5663)" ;;
     *) echo "  FAIL probe verdict: a DEBUG trap under functrace that forces status 10 gave [$v1] (#5663)"; bad=1 ;;
   esac
+  # #5664: lab_probe_report, the outcome run.sh prints. Only detected is ok; not-detected, every refused verdict and any
+  # other text return false with the line naming why.
+  local rl
+  rl="$( lab_probe_report detected 75 && printf 'ok|%s' "$LAB_PROBE_LINE" || printf 'no|%s' "$LAB_PROBE_LINE" )"
+  if [ "$rl" = "ok|probe mutation detected: the boot refused (exit 75) and the refusal names AI_MEMORY_REQUIRE_ROLLBACK_CHECK" ]; then
+    echo "  PASS probe report: detected is ok with the boot exit and the knob named"
+  else echo "  FAIL probe report: detected gave [$rl]"; bad=1; fi
+  rl="$( lab_probe_report not-detected 75 && printf 'ok|%s' "$LAB_PROBE_LINE" || printf 'no|%s' "$LAB_PROBE_LINE" )"
+  if [ "$rl" = "no|probe mutation inconclusive: the boot refused (exit 75) but not for the lowered rollback-check knob" ]; then
+    echo "  PASS probe report: not-detected is no, inconclusive"
+  else echo "  FAIL probe report: not-detected gave [$rl]"; bad=1; fi
+  rl="$( lab_probe_report 'refused: exec is not the builtin the matcher needs; ' 75 && printf 'ok|%s' "$LAB_PROBE_LINE" || printf 'no|%s' "$LAB_PROBE_LINE" )"
+  if [ "$rl" = "no|probe mutation inconclusive: the probe matcher refused: exec is not the builtin the matcher needs; " ]; then
+    echo "  PASS probe report: a refused verdict is no and names the reason, never ok"
+  else echo "  FAIL probe report: a refused verdict gave [$rl]"; bad=1; fi
+  rl="$( lab_probe_report '' 75 && printf 'ok|%s' "$LAB_PROBE_LINE" || printf 'no|%s' "$LAB_PROBE_LINE" )"
+  if [ "${rl%%|*}" = no ]; then echo "  PASS probe report: an empty verdict is no"
+  else echo "  FAIL probe report: an empty verdict gave [$rl]"; bad=1; fi
+  # #5664: run.sh's own probe-verdict lines, taken from run.sh and run with stub ok and no, reach each branch: a refusal
+  # line gives ok, a log with none gives no, and a refused matcher (no awk file, child exit 3) gives no naming the reason.
+  local rb
+  rb="$(grep -E '^[[:space:]]*(lab_probe_verdict "\$PROBE"$|if lab_probe_report "\$LAB_PROBE_VERDICT" "\$PROBE_RC"; then )' "$root/infra/federation-lab/run.sh")"
+  if [ "$(printf '%s\n' "$rb" | grep -c .)" = 2 ] && [ "$(grep -cF 'if lab_probe_report "$LAB_PROBE_VERDICT" "$PROBE_RC"; then ok "$LAB_PROBE_LINE"; else no "$LAB_PROBE_LINE"; fi' "$root/infra/federation-lab/run.sh")" = 1 ]; then
+    echo "  PASS run.sh pin: run.sh calls lab_probe_verdict and reports through lab_probe_report, ok only when it returns true"
+  else echo "  FAIL run.sh pin: run.sh's probe-verdict lines changed"; bad=1; fi
+  _runsh_branch() {  # <log> [setup] — runs run.sh's probe-verdict lines with stub ok and no
+    ( ok() { printf 'ok|%s' "$1"; }; no() { printf 'no|%s' "$1"; }; PROBE="$1"; PROBE_RC=75; eval "${2:-:}"; eval "$rb" )
+  }
+  rl="$(_runsh_branch "$plog/ok.log")"
+  case "$rl" in "ok|probe mutation detected: the boot refused (exit 75)"*) echo "  PASS run.sh branch: a refusal naming the knob reaches ok" ;;
+    *) echo "  FAIL run.sh branch: a refusal naming the knob gave [$rl]"; bad=1 ;; esac
+  rl="$(_runsh_branch "$plog/no.log")"
+  case "$rl" in "no|probe mutation inconclusive: the boot refused (exit 75) but not for"*) echo "  PASS run.sh branch: a log with no refusal line reaches no" ;;
+    *) echo "  FAIL run.sh branch: a log with no refusal line gave [$rl]"; bad=1 ;; esac
+  rl="$(_runsh_branch "$plog/ok.log" 'LAB_PROBE_AWK_PATHS=(/nonexistent/awk)')"
+  if [ "$rl" = "no|probe mutation inconclusive: the probe matcher refused: the probe child exited 3, which is not a verdict" ]; then
+    echo "  PASS run.sh branch: a refused matcher reaches no and names the reason, even for a log holding the refusal line"
+  else echo "  FAIL run.sh branch: a refused matcher gave [$rl]"; bad=1; fi
+  rl="$(_runsh_branch "$plog/ok.log" 'exec() { return 10; }')"
+  case "$rl" in "no|probe mutation inconclusive: the probe matcher refused: exec is not the builtin the matcher needs; "*) echo "  PASS run.sh branch: a shadowed exec reaches no with the guard's reason" ;;
+    *) echo "  FAIL run.sh branch: a shadowed exec gave [$rl]"; bad=1 ;; esac
+  unset -f _runsh_branch
   # #5663: run.sh (and the common.sh it sources) must not itself turn on xtrace, functrace, errtrace or extdebug, set a
   # DEBUG, RETURN or ERR trap, or give a function the trace attribute, or every real probe would be refused.
   if [ -r "$root/infra/federation-lab/run.sh" ] && ! grep -nE 'trap .*(DEBUG|RETURN|ERR)|set -[a-zA-Z]*[xTE]|extdebug|functrace|errtrace|xtrace|declare -[a-z]*t' "$root/infra/federation-lab/run.sh" "$root/infra/federation-lab/lib/common.sh" >/dev/null; then
