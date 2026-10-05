@@ -333,9 +333,9 @@ def non_isolated_child(script: Path, flags: list, scratch: Path):
                           capture_output=True, text=True, check=False)
 
 
-def plant_probe(name: str, probe: Path, xopts: list, env=None):
+def plant_probe(name: str, probe: Path, xopts: list, env=None, isolate=("-S", "-E")):
     """#5441: plant `name`.py beside a child run under -S -E (plus the interpreter options `xopts`) that imports
-    `name`; `env` (None: inherit) is the child's environment. The CHILD reports, before importing, whether it is already loaded, built-in or frozen (read through
+    `name`; `env` (None: inherit) is the child's environment, `isolate` its isolation flags. The CHILD reports, before importing, whether it is already loaded, built-in or frozen (read through
     _frozen_importlib), so the verdict never depends on the parent's -X options or Python version. Returns
     (shadowable, preloaded, planted_ran, ok): ok is False when the child did not report or the planted file ran
     and was not expected to (or the reverse)."""
@@ -349,7 +349,7 @@ def plant_probe(name: str, probe: Path, xopts: list, env=None):
         "or fi.FrozenImporter.find_spec(name) is not None))\n"
         "__import__(name)\n"
         "print('REAL')\n", encoding="utf-8")
-    result = subprocess.run([sys.executable, *xopts, "-S", "-E", str(probe / "probe.py")],
+    result = subprocess.run([sys.executable, *xopts, *isolate, str(probe / "probe.py")],
                             capture_output=True, text=True, check=False, cwd=str(probe), env=env)
     verdict = [line.split() for line in result.stdout.splitlines() if line.startswith("VERDICT ")]
     if len(verdict) != 1 or len(verdict[0]) != 3:
@@ -621,6 +621,13 @@ def _self_test_cases() -> int:
         _, _, _, safe_ok = plant_probe("importlib", base_dir / "implant", [], {**os.environ, "PYTHONSAFEPATH": "1"})
         if not safe_ok:
             return "the probe child honours PYTHONSAFEPATH, so its result depends on the environment"
+        # Negative control: without -E the same variable makes the planted file inert on 3.11+, and the probe must
+        # say so (ok False); this shows the PYTHONSAFEPATH case above can fail, and that ok is not always True.
+        if sys.version_info >= (3, 11):
+            control = plant_probe("importlib", base_dir / "implant", [],
+                                  {**os.environ, "PYTHONSAFEPATH": "1"}, ("-S",))
+            if control[3]:
+                return "the probe cannot tell an inert planted file from a live one"
         return ""
 
     plant_failure = importlib_plant()
