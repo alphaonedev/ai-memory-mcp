@@ -898,6 +898,10 @@ MDEOF
         $'See a <\tb and '"$R"'::RecallTool<T>> here.'
     anchor_green 5498 "a live generic anchor inside a prose generic after a comparison" \
         "If a < b then see Vec<$R::RecallTool<T>> here."
+    # The unspaced a<b cannot be told from a prose generic: it is counted as
+    # an opener, so the extra closer after the anchor belongs to it.
+    anchor_green 5498 "an unspaced comparison counted as a prose generic before an extra closer" \
+        "If a<b then see $R::RecallTool<T>> here."
 
     # #5530: a `<` is a comparison only with whitespace on both sides, so a
     # `<` attached to a word with whitespace after it is never read as a
