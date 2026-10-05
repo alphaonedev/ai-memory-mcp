@@ -2535,10 +2535,12 @@ MD_SHELL_FENCES = frozenset({"", "bash", "sh", "shell", "console", "zsh", "shell
                              "dockerfile", "yaml", "yml"})
 
 
-def md_shell_view(text: str) -> str:
+def md_shell_view(text: str) -> Tuple[str, List[Tuple[int, int]]]:
     """#5725: the .md text with every character outside a shell-like fenced block blanked (newlines
-    kept), so offsets and lines stay valid; an unclosed fence runs to the end of the file."""
+    kept), so offsets and lines stay valid; an unclosed fence runs to the end of the file. #5902:
+    with the (start, end) span of each fence body, a shell text of its own."""
     keep = bytearray(len(text))
+    spans: List[Tuple[int, int]] = []
     pos = 0
     while True:
         m = MD_FENCE_RE.search(text, pos)
@@ -2548,8 +2550,9 @@ def md_shell_view(text: str) -> str:
         body_end = close.start() if close else len(text)
         if m.group(2).lower() in MD_SHELL_FENCES:
             keep[m.end():body_end] = b"\x01" * (body_end - m.end())
+            spans.append((m.end(), body_end))
         pos = close.end() if close else len(text)
-    return "".join(c if keep[i] or c == "\n" else " " for i, c in enumerate(text))
+    return "".join(c if keep[i] or c == "\n" else " " for i, c in enumerate(text)), spans
 
 
 def blank_shell_comments(text: str) -> str:
@@ -2680,12 +2683,17 @@ def shape_hits(rel: str, text: str) -> List[Hit]:
     file; one hit per line, the value masked in the snippet."""
     suffix = Path(rel).suffix.lower()
     if suffix == ".md":
-        view = md_shell_view(text)
+        view, spans = md_shell_view(text)
     elif suffix in SHELL_SUFFIXES:
-        view = text
+        view, spans = text, [(0, len(text))]
     else:
         return []
-    view = blank_shell_comments(view)
+    # #5902: each span is a shell text of its own; no quote or comment state crosses a span. (The
+    # command split needs no span: it ends every command at a newline, inside a quote too.)
+    chars = list(view)
+    for a, b in spans:
+        chars[a:b] = blank_shell_comments(view[a:b])
+    view = "".join(chars)
     # A hit is reported at the start line of its logical (backslash-joined) line, like every
     # other rule, so a PENDING needle and an allowlist key see the whole command.
     logical = logical_lines(text)
@@ -4574,6 +4582,16 @@ def self_test() -> int:
             print("SELF-TEST FAIL: the #5845 stated false positive is no longer flagged (%s); update the"
                   " header" % label, file=sys.stderr)
             bad += 1
+    # #5902: a quote left open in one fence does not reach the next fence: a comment there is
+    # blanked, and a credential there is still read.
+    green += 1
+    if scan_text("probe.md", "```bash\necho don't\n```\n\n```bash\n# mytool --token S3cr3tTok\n```\n"):
+        print("SELF-TEST FAIL: a quote left open in one fence reached the next fence", file=sys.stderr)
+        bad += 1
+    red += 1
+    if not scan_text("probe.md", "```bash\necho don't\n```\n\n```bash\nmytool --token S3cr3tTok # it's\n```\n"):
+        print("SELF-TEST FAIL: a credential after a fence with an open quote was not read", file=sys.stderr)
+        bad += 1
     # #5842: an untagged fence is read as shell (MD_SHELL_FENCES holds "").
     red += 1
     if not any(h[2].startswith("[%s]" % SHAPE_TAG)
