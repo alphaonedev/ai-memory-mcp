@@ -144,6 +144,7 @@ SELF_EXEMPT = {"scripts/check-docs-no-argv-secrets.py"}
 ALLOW_REL = "scripts/qc-allowlists/argv-secrets-operand-allow.txt"
 UNKNOWN_TAG = "unknown-head-operand"
 ARRAY_TAG = "array-element-operand"
+SHAPE_TAG = "argv-credential-shape"
 WAIVABLE_TAGS = (UNKNOWN_TAG, ARRAY_TAG)
 WAIVABLE_RE = re.compile(r"\[(?P<tag>[a-z-]+)\] h=(?P<h>[0-9a-f]{32}) (?P<preview>.*)\Z")
 ALLOW_LINE_RE = re.compile(r"(?P<rel>[^|\s][^|]*?) \| (?P<tag>[a-z-]+) \| (?P<h>[0-9a-f]{32}) \| (?P<preview>.*)\Z")
@@ -158,7 +159,17 @@ SKIP_FILES = {"CHANGELOG.md"}
 # count of hits, so a second matching line is a new failing hit (#4791). A listed hit is reported as PENDING and does not fail the
 # gate; an entry that matches no hit is stale and fails it, so the entry must
 # go when the defect is fixed.
-PENDING = ()
+PENDING = (
+    # #5725 (round 11): the credential-shape rule reads these known argv defects. Each needle
+    # names the flag and the URL user, never the credential.
+    ("docs/CLI_REFERENCE.md", "--to postgres://ai_memory", "#4600"),
+    ("docs/RUNBOOK-digitalocean-testing.md", '--to "postgres://ai_memory', "#4600"),
+    ("docs/migration-v0.7.0-postgres.md", "--to   postgres://aimemory", "#4600", 3),
+    ("docs/migration-v0.7.0-postgres.md", "--from postgres://aimemory", "#4600"),
+    ("docs/CLI_REFERENCE.md", "ai-memory capability attenuate --token", "#4864"),
+    ("docs/CLI_REFERENCE.md", "ai-memory capability inspect --token", "#4864"),
+    ("docs/CLI_REFERENCE.md", "ai-memory capability verify  --token", "#4864"),
+)
 
 TEXT_SUFFIXES = {
     ".md", ".html", ".yaml", ".yml", ".tpl", ".sh", ".bash", ".py", ".toml",
@@ -2104,6 +2115,167 @@ def operand_rule_hit(hit: Hit) -> bool:
     return hit[2].startswith(("[env-password-argv]", "[%s]" % UNKNOWN_TAG, "[%s]" % ARRAY_TAG))
 
 
+# #5725 (round 11): the closed credential shapes, read on every command of a shell-like file and
+# of a shell fence in a .md file, whatever its program (STATED LIMITS: a short flag that is a
+# password only by one program's convention, a bare positional secret, user:pass after -u, a
+# credential inside a non-shell -c string, and prose outside a fence are not read).
+SECRET_WORD = r"(?:password|passwd|secret|token)"
+SHAPE_FLAG_RE = re.compile(r"--?(?:[A-Za-z0-9]+[_.-])*" + SECRET_WORD + r"(?:=(?P<v>.*))?\Z", re.I)
+SHAPE_ASSIGN_RE = re.compile(r"(?:--?[A-Za-z][\w.-]*=)?[A-Za-z_][\w.-]*?" + SECRET_WORD + r"=(?P<v>.+)\Z", re.I)
+SHAPE_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/@:]*:(?P<v>[^\s/@]+)@")
+SHAPE_AUTH_RE = re.compile(r"(?:--?[A-Za-z][\w.-]*=)?(?:proxy-)?authorization:\s*(?P<v>\S.*)\Z", re.I)
+# Builtins and keywords whose words never reach an exec argv.
+SHAPE_NON_EXEC_HEADS = frozenset({"echo", "printf", "export", "local", "declare", "typeset", "readonly",
+                                  "unset", "read", "test", "[", "[[", ":", "true", "false", "alias",
+                                  "return", "exit", "set", "shift", "cd"}) | UNMODELLED_KEYWORDS
+SHAPE_PLACEHOLDER_RE = re.compile(r"<[^>]*>|\.\.\.|\*+|[xX]+")
+MD_FENCE_RE = re.compile(r"^ {0,3}(```|~~~)[ \t]*([A-Za-z0-9_+-]*)[^\n]*$", re.M)
+MD_SHELL_FENCES = frozenset({"", "bash", "sh", "shell", "console", "zsh", "shell-session", "sh-session",
+                             "dockerfile", "yaml", "yml"})
+
+
+def md_shell_view(text: str) -> str:
+    """#5725: the .md text with every character outside a shell-like fenced block blanked (newlines
+    kept), so offsets and lines stay valid; an unclosed fence runs to the end of the file."""
+    keep = bytearray(len(text))
+    pos = 0
+    while True:
+        m = MD_FENCE_RE.search(text, pos)
+        if not m:
+            break
+        close = re.compile(r"^ {0,3}" + re.escape(m.group(1)) + r"[ \t]*$", re.M).search(text, m.end())
+        body_end = close.start() if close else len(text)
+        if m.group(2).lower() in MD_SHELL_FENCES:
+            keep[m.end():body_end] = b"\x01" * (body_end - m.end())
+        pos = close.end() if close else len(text)
+    return "".join(c if keep[i] or c == "\n" else " " for i, c in enumerate(text))
+
+
+def blank_shell_comments(text: str) -> str:
+    """#5725: text with every shell comment blanked (newlines kept): a '#' that starts a word
+    outside quotes runs to the end of its line. shell_commands does not model comments, and a
+    comment that quotes a refused flag ('# --token on argv is refused') is not a command."""
+    out = list(text)
+    quote = ""
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+        elif c == "\\":
+            i += 2
+            continue
+        elif c in "'\"":
+            quote = c
+        elif c == "#" and (i == 0 or text[i - 1] in " \t\n;|&()"):
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+            out[i:end] = " " * (end - i)
+            i = end
+            continue
+        i += 1
+    return "".join(out)
+
+
+def shape_value(v: Optional[str]) -> bool:
+    """A value that is a credential candidate: not empty, not a redaction or placeholder token,
+    not a regular expression (a sed capture group or a bracket negation), literal or expansion."""
+    if v is None:
+        return False
+    v = v.strip("\"'")
+    if not v or "[^" in v or "\\(" in v:
+        return False
+    return not is_redaction(v) and not is_url_redaction(v) and not SHAPE_PLACEHOLDER_RE.fullmatch(v)
+
+
+def shape_word(text: str, word: Word) -> str:
+    lit = plain_literal(text, word)
+    return lit if lit is not None else text[word[0]:word[1]]
+
+
+def shape_operands(text: str, words: List[Word], array: bool) -> List[Word]:
+    """The words of a command that reach an exec argv as operands: after the reserved words, the
+    assignments and the document markers before the head, and never past a comment."""
+    if array:
+        return words
+    k = 0
+    while k < len(words):
+        raw = text[words[k][0]:words[k][1]]
+        if raw.startswith("#"):
+            return []
+        if (ASSIGN_RE.match(raw) or raw in SKIPPED_KEYWORDS or raw == "time" or raw in DOC_MARKERS
+                or LIST_NUMBER_RE.fullmatch(raw) or raw.endswith(":") or raw == "-"):
+            k += 1
+            continue
+        break
+    if k >= len(words):
+        return []
+    first = shape_word(text, words[k])
+    if first.rstrip("/").rsplit("/", 1)[-1] in SHAPE_NON_EXEC_HEADS:
+        return []
+    # No program is named with a leading dash: a first word that is an option is an argument
+    # list item (a YAML args: entry), so it is an operand itself.
+    ops = words[k:] if first.startswith("-") else words[k + 1:]
+    for n, w in enumerate(ops):
+        if text[w[0]:w[1]].startswith("#"):
+            return ops[:n]
+    return ops
+
+
+def shape_hit(text: str, ops: List[Word]) -> Optional[Tuple[int, str]]:
+    """(word offset, value) of the first credential-shaped operand, or None."""
+    for n, w in enumerate(ops):
+        t = shape_word(text, w)
+        m = SHAPE_FLAG_RE.match(t)
+        if m:
+            v = m.group("v")
+            if v is None and n + 1 < len(ops):
+                nxt = shape_word(text, ops[n + 1])
+                v = None if nxt.startswith("-") else nxt
+            if shape_value(v):
+                return w[0], str(v)
+        for rx in (SHAPE_ASSIGN_RE, SHAPE_URL_RE, SHAPE_AUTH_RE):
+            m = rx.match(t) if rx is not SHAPE_URL_RE else rx.search(t)
+            if m and shape_value(m.group("v")):
+                return w[0], m.group("v")
+    return None
+
+
+def shape_hits(rel: str, text: str) -> List[Hit]:
+    """#5725: [argv-credential-shape] hits of a shell-like file, or of the shell fences of a .md
+    file; one hit per line, the value masked in the snippet."""
+    suffix = Path(rel).suffix.lower()
+    if suffix == ".md":
+        view = md_shell_view(text)
+    elif suffix in SHELL_SUFFIXES:
+        view = text
+    else:
+        return []
+    view = blank_shell_comments(view)
+    # A hit is reported at the start line of its logical (backslash-joined) line, like every
+    # other rule, so a PENDING needle and an allowlist key see the whole command.
+    logical = logical_lines(text)
+    hits: List[Hit] = []
+    lines = set()
+    for words, _forced, array in shell_commands(view.replace("\\\n", "  ")):
+        found = shape_hit(view, shape_operands(view, words, array))
+        if found is None:
+            continue
+        phys = text.count("\n", 0, found[0]) + 1
+        line, joined = max((x for x in logical if x[0] <= phys), key=lambda x: x[0], default=(phys, ""))
+        if line in lines:
+            continue
+        lines.add(line)
+        value = found[1].strip("\"'")
+        hits.append((rel, line, "[%s] %s" % (SHAPE_TAG, mask_preview(redact(joined.strip().replace(value, "***"))))))
+    return hits
+
+
 def text_rule_hits(rel: str, text: str) -> List[Hit]:
     """The #4600-line text rules: expansion, psql -c password, docker -e / psql
     -v runtime-expanded password, readable cloud-init secret, traced secret."""
@@ -2189,6 +2361,8 @@ def scan_text(rel: str, text: str) -> List[Hit]:
         hits.extend(h for h in shell_hits(rel, text) if h[:2] not in seen)
     seen = {h[:2] for h in hits}
     hits.extend(h for h in text_rule_hits(rel, text) if h[:2] not in seen)
+    seen = {h[:2] for h in hits}
+    hits.extend(h for h in shape_hits(rel, text) if h[:2] not in seen)
     return hits
 
 
@@ -3293,6 +3467,58 @@ R11_ARRAY_GREEN = {
     '5723-g02-comment-holds-shape': 'opts=(\n  # was: -v pw=$PGPASSWORD (removed)\n  -n 3\n)',
     '5723-g03-neutral-v-element': 'args=(-v n=3 -f x.sql)',
 }
+# #5725: the closed credential shapes, in a script and in a shell fence of a .md file, whatever
+# the program: a URL with a userinfo password, a flag whose last name part is password, passwd,
+# secret or token with a value, a NAME=VALUE operand whose NAME ends in one of those words
+# (dotted names too), and an Authorization header value.
+R11_SHAPE_RED = {
+    '5725-r01-mongodb-url': 'mongosh "mongodb://admin:S3cr3tPass@db:27017/app"',
+    '5725-r02-redis-url': 'redis-cli -u redis://u:S3cr3tPass@cache:6379 PING',
+    '5725-r03-long-flag-space': 'helm repo add priv https://c.example --username u --password S3cr3tPass',
+    '5725-r04-long-flag-equals': 'mariadb --password=S3cr3tPass appdb',
+    '5725-r05-compound-flag': 'site-cli --client-secret "$CLIENT_SECRET" sync',
+    '5725-r06-token-flag-expansion': 'gh-tool --api-token "$GH_TOKEN" list',
+    '5725-r07-name-value-operand': 'ansible-playbook site.yml -e db_password=S3cr3tPass',
+    '5725-r08-dotted-name': 'kcat -X sasl.password=S3cr3tPass -b broker:9092 -L',
+    '5725-r09-opt-name-value': 'tool --conf=api.token=S3cr3tTok run',
+    '5725-r10-authorization-bearer': 'curl -H "Authorization: Bearer ghp_S3cr3tToken" https://api.example.com',
+    '5725-r11-authorization-basic': "wget --header='Authorization: Basic dTpw' https://x.example",
+    '5725-r12-url-in-yaml-args': '- --db-url=mysql://app:S3cr3tPass@db/app',
+    '5725-r13-after-keyword': 'if site-cli --token S3cr3tTok ping; then :; fi',
+    '5725-r14-array-element': 'args=(--password S3cr3tPass)',
+    '5725-r15-hash-inside-word': 'tool x#y --password S3cr3tPass',
+    '5725-r16-hash-inside-quotes': 'tool "a #b" --password S3cr3tPass',
+    '5725-r17-continued-line': 'tool \\\n  --password S3cr3tPass',
+}
+R11_SHAPE_GREEN = {
+    '5725-g01-password-stdin': 'docker login -u u --password-stdin registry.example.com',
+    '5725-g02-token-file': 'ai-memory agents bind-api-key --agent-id a --token-file /run/secrets/t',
+    '5725-g03-redaction-value': 'tool --password "<redacted>" --token *** run',
+    '5725-g04-flag-then-option': 'tool --token --verbose run',
+    '5725-g05-env-prefix': 'DB_PASSWORD=x tool run',
+    '5725-g06-export-builtin': 'export DB_PASSWORD="$X"',
+    '5725-g07-echo-builtin': 'echo "--password=x is refused"',
+    '5725-g08-comment': '# tool --password S3cr3tPass',
+    '5725-g09-sed-regex': "sed -n 's#^postgres://u:\\([^@]*\\)@.*#\\1#p' /etc/x/store-url",
+    '5725-g10-url-no-password': 'psql "postgres://app@db:5432/app?sslmode=verify-full"',
+    '5725-g11-empty-value': "grep -c 'password=' x.conf",
+    '5725-g12-name-without-secret-word': 'tool -e db_user=app --limit tokens_max=3 run',
+    '5725-g13-comment-with-subshell-text': '# a 0600 file (or KEY_FILE): --token on argv is refused',
+    '5725-g14-trailing-comment': 'tool run # --password S3cr3tPass',
+}
+# #5725 STATED LIMITS: shapes the rule does not read, each pinned as missed so the limit text in
+# the header and the changelog stays measured (a rule that closes one must update both).
+R11_SHAPE_LIMITS = {
+    '5725-l01-mysql-short-p': 'mysql -u root -pS3cr3tPass appdb',
+    '5725-l02-redis-a': 'redis-cli -a S3cr3tToken PING',
+    '5725-l03-curl-u-userpass': 'curl -u admin:S3cr3tPass https://api.example.com/v1',
+    '5725-l04-skopeo-p': 'skopeo login -u u -p S3cr3tPass registry.example.com',
+    '5725-l05-az-p': 'az login -u u -p S3cr3tPass',
+    '5725-l06-positional-token': 'vault login s.S3cr3tToken',
+    '5725-l07-positional-secret': 'mc alias set s3 https://s3.example.com AKIAKEY S3cr3tSecretKey',
+    '5725-l08-python-c-string': 'python3 -c "import psycopg; psycopg.connect(password=\'S3cr3tPass\')"',
+}
+SHAPE_PROBE_SECRETS = ("S3cr3tPass", "S3cr3tTok", "ghp_S3cr3tToken", "dTpw")
 # #5723: a command substitution inside an array body is still a command of its own.
 R11_ARRAY_NESTED_UNKNOWN = {
     '5723-n01-cmdsubst-in-body': 'args=( "$(site-tool --set token=$TOKEN)" )',
@@ -3552,6 +3778,38 @@ def self_test() -> int:
                 print("SELF-TEST FAIL: array clean probe %r (%s) was flagged: %r" % (name, label, got),
                       file=sys.stderr)
                 bad += 1
+    # #5725: the credential shapes in a script and in a shell fence; the hit never prints the value.
+    # A line an older rule already flags (r04 in a script: the --password flag rule) keeps that
+    # rule's hit, so any hit counts; every other row is flagged by the shape rule alone.
+    for name, text in R11_SHAPE_RED.items():
+        for label, suffix, body in r9_variants(text)[0::2]:
+            red += 1
+            got = scan_text(suffix, body)
+            if not got or any(sec in h[2] for h in got for sec in SHAPE_PROBE_SECRETS):
+                print("SELF-TEST FAIL: shape probe %r (%s) not flagged or prints the value: %r" % (name, label, got),
+                      file=sys.stderr)
+                bad += 1
+    for name, text in R11_SHAPE_GREEN.items():
+        for label, suffix, body in r9_variants(text)[0::2]:
+            green += 1
+            got = scan_text(suffix, body)
+            if got:
+                print("SELF-TEST FAIL: shape clean probe %r (%s) was flagged: %r" % (name, label, got),
+                      file=sys.stderr)
+                bad += 1
+    for name, text in R11_SHAPE_LIMITS.items():
+        for label, suffix, body in r9_variants(text)[0::2]:
+            green += 1
+            got = scan_text(suffix, body)
+            if got:
+                print("SELF-TEST FAIL: stated-limit probe %r (%s) is now flagged; update the STATED LIMITS: %r"
+                      % (name, label, got), file=sys.stderr)
+                bad += 1
+    # #5725: prose outside a shell fence is not read by the shape rule (a stated limit).
+    green += 1
+    if any(h[2].startswith("[%s]" % SHAPE_TAG) for h in scan_text("probe.md", "Run tool --password S3cr3tPass.\n")):
+        print("SELF-TEST FAIL: the shape rule read prose outside a fence", file=sys.stderr)
+        bad += 1
     for name, text in R11_ARRAY_NESTED_UNKNOWN.items():
         for label, suffix, body in r9_variants(text):
             red += 1
