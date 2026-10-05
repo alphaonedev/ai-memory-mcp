@@ -994,6 +994,8 @@ BANNED_CONSTRUCTS = (
     (r"(?<![\w$])\w+\[[^\]]*\]\+?=", "indexed assignment"),
     (r"(?<![\w$])\w+\+?=[^\s]*\\\s", "escaped space in an assignment"),
     (r"\$\{\w+:?=", "default-assign expansion"),
+    # #5410: let and the (( command evaluate their operand as arithmetic and print it in a syntax error.
+    (r"(?<![\w-])let(?![\w-])", "let"), (r"(?<![\w$])\(\(", "arithmetic command"),
 )
 
 
@@ -1110,7 +1112,12 @@ def closed_world_taint(fs):
                         ("an indexed append assignment", 'arr[1]+=$qjson\nno "x ${arr[1]}"'),
                         ("an escaped space in an assignment", 't=x\\ $qjson\nno "x $t"'),
                         ("a default-assign expansion", ': "${t:=$qjson}"\nno "x $t"'),
-                        ("a default-assign expansion without the colon", ': "${t=$qjson}"\nno "x $t"')):
+                        ("a default-assign expansion without the colon", ': "${t=$qjson}"\nno "x $t"'),
+                        # #5410: arithmetic evaluation of a reply prints it in a syntax error.
+                        ("let", 'let t=qjson'), ("let with a space", 'let "t = $qjson"'),
+                        ("an arithmetic command", '(( t = qjson ))'),
+                        ("an arithmetic command after a keyword", 'if (( qjson )); then :; fi'),
+                        ("an arithmetic for loop", 'for (( t = 0; t < qjson; t++ )); do :; done')):
         probe("V1 construct negative control is flagged: %s" % label, len(construct_findings(wrap(body))) > len(cb))
     # Accepted by design (#5236): reply_status prints only a 3-digit status or the word non-status, so a
     # reply body passed to it reaches the terminal as one of those 1001 closed values, never as its bytes.
