@@ -608,7 +608,9 @@ emit_fail() {
 #     per hit, so it never shields a real claim sharing the line. The FROM side
 #     of a version transition (`CURRENT_SCHEMA_VERSION 71→72`) is history by
 #     construction; its TO side is a claim like any other.
-#     A malformed entry FAILS, a STALE entry (it shields no hit) FAILS, an
+#     A malformed entry FAILS (a needle with no subject text beyond the value,
+#     #5808, or with a character that does not read as written, #5809), a
+#     STALE entry (it shields no hit) FAILS, an
 #     entry that shields two or more hits FAILS naming each file:line, a hit
 #     that two entries shield FAILS naming both (one entry, one hit; #5809),
 #     a missing ledger FAILS, and a scan that reads zero files FAILS outside
@@ -815,12 +817,17 @@ for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8')
     # control, a combining mark, a non-ASCII space or a non-ASCII digit can glue a
     # word to the value, or change the value, without showing it, so a reviewer
     # reads a needle that is not the one shields() matches. It is refused by name.
-    bad = [ch for ch in parts[1] if not (' ' <= ch <= '~' or (ord(ch) > 0x7f
-           and unicodedata.category(ch)[0] in 'LPS'))]
+    # The message spells each such character as \uXXXX, so the log shows what the
+    # needle really holds and never carries a control character itself.
+    def readable(ch):
+        return ' ' <= ch <= '~' or (ord(ch) > 0x7f and unicodedata.category(ch)[0] in 'LPS')
+    bad = [ch for ch in parts[1] if not readable(ch)]
     if bad:
+        shown = ''.join(ch if ch == '\t' or readable(ch) else '\\u%04x' % ord(ch)
+                        for ch in raw.strip())
         rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-',
                      'needle carries a character that does not read as written (U+%04X %s, #5809): %s'
-                     % (ord(bad[0]), unicodedata.category(bad[0]), raw.strip()[:100])))
+                     % (ord(bad[0]), unicodedata.category(bad[0]), shown[:120])))
         continue
     ledger.setdefault(parts[0].strip(), {})[parts[1]] = [n, set()]
 
@@ -3534,8 +3541,11 @@ R5809MD
         'malformed entry at line 5 "needle carries a character that does not read as written (U+0301 Mn' \
         'malformed entry at line 6 "needle carries a character that does not read as written (U+FEFF Cf' \
         'docs/postgres-age-guide.md:1 claims "51"' 'docs/postgres-age-guide.md:4 claims "51"' \
-        'docs/postgres-age-guide.md:5 claims "51"' 'docs/postgres-age-guide.md:6 claims "51"'
+        'docs/postgres-age-guide.md:5 claims "51"' 'docs/postgres-age-guide.md:6 claims "51"' \
+        'was\u200b51' 'schema_version\u00a0was 51' 'wa\u0301s 51' 'schema_version\ufeff was 51'
     do grep -qF "$_want" <<<"$_s_out" || { echo "FAIL: self-test #5809 - not refused or not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
+    grep -F 'malformed entry' <<<"$_s_out" | grep -qF "$(printf '\xe2\x80\x8b')" \
+        && { echo "FAIL: self-test #5809 - the refusal echoed a zero-width space instead of spelling it" >&2; cd "$REPO_ROOT"; exit 1; }
     for _not in 'malformed entry at line 2 ' 'malformed entry at line 3 ' 'docs/postgres-age-guide.md:2 ' \
         'docs/postgres-age-guide.md:3 ' 'STALE entry' 'exactly one is allowed'
     do grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5809 - a readable needle was refused or its history flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }

@@ -14,11 +14,15 @@
 # characters between, and the number, html tag-stripped), so it exempts that
 # one hit and never a real claim on the same line, and a reflow of the
 # surrounding text does not silently re-open or widen it. A MALFORMED entry
-# FAILS the gate. A STALE entry (it suppresses no hit any more) FAILS the gate:
+# FAILS the gate; a needle is malformed when it carries no subject text beyond
+# the value (#5808), or a character that does not read as written: anything but
+# printable ASCII or a non-ASCII letter, punctuation mark or symbol (a zero-width
+# or no-break space, a combining mark, a BOM; #5809). A STALE entry (it suppresses no hit any more) FAILS the gate:
 # delete it. A missing ledger FAILS the gate.
 #
 # One entry exempts exactly ONE hit (#5809). A hit is one number on one line,
-# however many views of the line (raw, marker-folded, wrapped-line join) see it.
+# however many views of the line (raw, marker-folded, anchor, wrapped-line join,
+# html pill) see it.
 # An entry that shields two or more hits FAILS the gate and names each file:line;
 # a hit that two entries shield FAILS the gate and names both entry lines. When
 # the same history phrase is written twice, reword one occurrence in the doc so
