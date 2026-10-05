@@ -235,8 +235,8 @@ CTX = re.compile(r" \| ctx:([0-9a-f]{12})$")  # R7: an allowlist entry is bound 
 
 # #5365: markdown underscore emphasis (_word_, __two words__) is markup like the backtick and the asterisk: a span that
 # opens at a word edge and closes at a word edge loses its underscores (never one inside a word: pool_mode, sqlx_s_)
-# so the word boundary \b sees the word.
-_EMPHASIS = re.compile(r"(?<![^\W_])(_{1,2})(?=[^\W_])(.+?)(?<=[^\W_])\1(?![^\W_])")
+# so the word boundary \b sees the word. Up to three underscores: ___word___ is bold italic (#5476).
+_EMPHASIS = re.compile(r"(?<![^\W_])(_{1,3})(?=[^\W_])(.+?)(?<=[^\W_])\1(?![^\W_])")
 
 
 def normalise(line: str) -> str:
@@ -874,6 +874,8 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("R1 #5365: single underscore emphasis on the mode word", "docs/a.md", "Run PgBouncer in _transaction_ mode.\n"),
     ("R1 #5365: double underscore emphasis over mode and pooling", "docs/a.md", "Use __transaction pooling__.\n"),
     ("R1 #5365: underscore emphasis on the second word only", "docs/a.md", "Use pooling _transaction_ everywhere.\n"),
+    ("R1 #5476: triple underscore emphasis on the mode word", "docs/a.md", "Run PgBouncer in ___transaction___ mode.\n"),
+    ("R1 #5476: triple underscore emphasis over two words", "docs/a.md", "Use ___transaction pooling___ here.\n"),
     ("R9 #5363: a letter the fold does not know, spaced, on a pool line", "docs/a.md", "Run PgBouncer in \u0434\u0436\u0437\u0438\u044f mode.\n"),
     ("R9 #5363: small capitals on a config context line fold to the mode word", "docs/a.md",
      "```ini\npool_mode = session\ndefault = \u1d1b\u0280\u1d00\u0274s\u1d00\u1d04\u1d1b\u026a\u1d0f\u0274\n```\n"),
@@ -1482,9 +1484,12 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("R9 needs a pool word", "or bool(_QUICK.search(shadow(text))) or _lookalike", "or True or _lookalike"),
     ("R9 colour codes dropped", '    plain = _ANSI_CSI.sub("", text)', "    plain = text"),
     ("R9 a character touching a letter", "        elif (i and _ascii_letter(view[i - 1])) or (i + 1 < len(view) and _ascii_letter(view[i + 1])):", "        elif False:"),
-    ("R1 #5365 emphasis opens at a word edge", "(?<![^\\W_])(_{1,2})", "(_{1,2})"),
+    ("R1 #5365 emphasis opens at a word edge", "(?<![^\\W_])(_{1,3})", "(_{1,3})"),
     ("R1 #5365 emphasis closes at a word edge", "\\1(?![^\\W_])", "\\1"),
-    ("R1 #5365 emphasis may use two underscores", "(_{1,2})(?=", "(_)(?="),
+    ("R1 #5365 emphasis may use two underscores", "(_{1,3})(?=", "(_)(?="),
+    ("R1 #5476 emphasis may use three underscores", "(_{1,3})(?=", "(_{1,2})(?="),
+    ("R1 #5476 emphasis may use one underscore", "(_{1,3})(?=", "(_{2,3})(?="),
+    ("R1 #5476 emphasis needs no more than three underscores", "(_{1,3})(?=", "(_{1,4})(?="),
     ("R1 #5365 emphasis is stripped", '    text = _EMPHASIS.sub(r"\\2", re.sub(r"[`*]", "", text))', '    text = re.sub(r"[`*]", "", text)'),
     ("R9 #5364 bidi controls are reported", "    found |= {c for c in plain if c in BIDI}", "    found |= set()"),
     ("R9 #5364 a bidi control makes a line unreadable on its own", 'or any(c in BIDI for c in hidden) or', "or"),
