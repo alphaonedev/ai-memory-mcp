@@ -79,7 +79,7 @@ ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
               block list indented past the key (a block list at the key's own
               column is refused, #5730, #5732) whose every row is ``- `` and
               one plain or simply quoted scalar (#5730); ``types`` may also be
-              one plain word.  A plain item is never a form YAML 1.1 may read as
+              one word, plain or simply quoted.  A plain item is never a form YAML 1.1 may read as
               other than a string: empty, a null or boolean word in any case, a
               number or date (#5734), ``<<`` or ``=`` (#5749).  A filter key with
               neither a list nor a word is refused: its YAML value is null, not a
@@ -281,7 +281,7 @@ def _flow_node(s: str, j: int) -> Tuple[int, object]:
     if ch in "'\"":
         end = _quoted_end(s, j)
         if "," in s[j:end]:
-            raise Unparsed("quoted flow item with an embedded comma or quote: " + repr(s))
+            raise Unparsed("quoted flow item with an embedded comma (#5733): " + repr(s))
         return end, s[j + 1:end - 1]
     return _flow_plain(s, j, False)
 
@@ -441,8 +441,9 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
     """(indent, row text, mapping key or '') per structure row; closed world (#5660, #5705).
 
     Every line must be accepted by a positive rule: a blank line, a comment line, a
-    content line of a block scalar (indented past its owner, no whitespace other
-    than ASCII space before its first character), a column-0 ``---`` or ``...``
+    content line of a block scalar (indented past its owner by ASCII spaces, its
+    first character no tab or Unicode space, separator, control or format
+    character, #5732), a column-0 ``---`` or ``...``
     row (which _check_top_level accepts only as one leading ``---``), or a
     structure row that _scan_row accepts. A structure row starts with printable
     ASCII after ASCII-space indentation and holds no tab.
@@ -473,7 +474,8 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
                 continue
             if ind > owner:
                 if _space_like(rest[0]):
-                    raise Unparsed("block scalar line starts with non-space whitespace: " + repr(raw))
+                    raise Unparsed("block scalar line starts with a tab or a Unicode space, separator, control or format"
+                               " character (#5732): " + repr(raw))
                 if content is None:
                     if blank > ind:
                         raise Unparsed("leading blank line of a block scalar holds more spaces than its first"
@@ -1449,8 +1451,8 @@ class ClosedWorld5705(unittest.TestCase):
     def test_5705_block_scalar_lines_led_by_tab_or_nbsp(self) -> None:
         base = "name: x\non:\n" + GOOD_PR + "x:\n  run: |\n"
         self._shape(base + "\t\techo hi\n", self.LEAD)
-        self._shape(base + "    echo a\n    \techo hi\n", "block scalar line starts with non-space")
-        self._shape(base + "    \u00a0echo hi\n", "block scalar line starts with non-space")
+        self._shape(base + "    echo a\n    \techo hi\n", "block scalar line starts with a tab or a Unicode space")
+        self._shape(base + "    \u00a0echo hi\n", "block scalar line starts with a tab or a Unicode space")
 
     def test_5705_block_scalar_line_less_indented_than_first(self) -> None:
         self._shape("name: x\non:\n" + GOOD_PR + "x:\n  run: |\n      echo a\n    echo b\n", "less indented")
@@ -1984,6 +1986,39 @@ class BlockScalarLeadingBlank5750(unittest.TestCase):
         # PyYAML: '\nb' for the first; the blank lines after content are content.
         for tail in ("x: |-\n    \n    b\n", "x: |\n  \n    b\n", "x: |\n  b\n      \n  c\n", "x: |-\n   \n  \nz: c\n"):
             self.assertEqual([], violations("x.yml", "name: x\non:\n" + GOOD_PR + tail), tail)
+
+
+class ReasonTruth5732(unittest.TestCase):
+    """#5732: each refusal reason and grammar row names only what the reader checks.
+
+    Measured at 04e75e0e: a quoted flow item was refused as holding "an embedded
+    comma or quote" though only a comma is checked there (a quote of the other
+    kind is accepted); a block-scalar line led by U+200D (a format character, not
+    white space) was refused as "non-space whitespace"; and the filter row said a
+    types value is "one plain word" though a quoted word is accepted.
+    """
+
+    def _reason(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5732_embedded_comma_reason_names_the_comma_only(self) -> None:
+        text = "on:\n  pull_request:\n    branches: [main, 'rehearsal/**', 'a,b']\n"
+        self._reason(text, "quoted flow item with an embedded comma (#5733): ")
+        quote = "on:\n  pull_request:\n    branches: [main, 'rehearsal/**', 'a\"b']\n"
+        self.assertEqual({"pull_request": {"branches": ["main", "rehearsal/**", 'a"b']}}, parse_triggers(quote))
+
+    def test_5732_block_scalar_lead_reason_names_what_is_refused(self) -> None:
+        why = "block scalar line starts with a tab or a Unicode space, separator, control or format character"
+        for ch in ("‍", " ", "\t"):
+            self._reason("name: x\non:\n" + GOOD_PR + "x: |\n  " + ch + "a\n", why)
+
+    def test_5732_types_row_says_a_quoted_word_is_accepted(self) -> None:
+        text = "on:\n  pull_request:\n    branches: [main, 'rehearsal/**']\n    types: 'opened'\n"
+        self.assertEqual(["opened"], parse_triggers(text)["pull_request"]["types"])
+        doc = " ".join((__doc__ or "").split())
+        self.assertIn("``types`` may also be one word, plain or simply quoted", doc)
+        self.assertNotIn("``types`` may also be one plain word", doc)
 
 
 class GlobSemantics5447(unittest.TestCase):
