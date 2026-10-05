@@ -4061,6 +4061,8 @@ R11_SHAPE_RED = {
     # #5840: an expanded value is flagged too, as the c8-precheck.yml comment states.
     '5840-r41-password-flag-expansion': 'mytool --password "$PW" run',
     '5837-r39-bash-c-positional-pw': 'bash -c \'env -i\' $X -v pw="$PG_PW"',
+    # #5843: [ is a command (a builtin and /usr/bin/[), not the [[ keyword; its operands are read.
+    '5843-r42-test-bracket-operand': '[ -v pw=S3cr3tPass ]',
 }
 R11_SHAPE_GREEN = {
     '5725-g01-password-stdin': 'docker login -u u --password-stdin registry.example.com',
