@@ -1309,7 +1309,7 @@ jobs:
     # allowlisted verb is schema-init (#4600); PENDING lists the #4762 sites.
     name: No-credentials-on-argv gate (#4577)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run no-credentials-on-argv gate
@@ -1320,6 +1320,14 @@ jobs:
         # file walk. Green near-misses: assignments, env prefixes, echo/printf,
         # YAML values, redaction tokens, bare -e NAME, the schema-init verb.
         run: python3 scripts/check-docs-no-argv-secrets.py --self-test
+      - name: Operand allowlist is current and regen-written (#5722)
+        # 5-agent vote (4d3ea1c5): the reviewed-line allowlist of the
+        # unknown-head operand rule is written only by the regen script; this
+        # fails when a rewrite (a stale entry, an order change) or a NEW entry
+        # is pending, and on a form fault.
+        run: python3 scripts/regen-argv-secrets-allow.py --check
+      - name: Self-test the allowlist regen script (#5722)
+        run: python3 scripts/regen-argv-secrets-allow.py --self-test
       - name: Reinit script against stubbed binaries (#5143, #5402, #5600)
         # Runs scripts/postgres-droplet-reinit.sh with stub ssh, psql, pg_dump,
         # sudo and ai-memory on PATH: the dry-run store URL pins verify-full and

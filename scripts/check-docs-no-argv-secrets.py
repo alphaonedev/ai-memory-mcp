@@ -51,6 +51,14 @@ template file):
                      POSTGRES_PASSWORD=$X`` or ``psql -v pw=$X`` (#4617).
                      ``-e NAME`` with no value and ``--env-file`` are the
                      sanctioned forms.
+  unknown-head-operand  a credential-shaped ``-v`` / ``--set`` /
+                     ``--variable`` operand under a literal program the gate
+                     does not model (#5722, 5-agent vote (4d3ea1c5)). The one
+                     exemption is a reviewed line in
+                     scripts/qc-allowlists/argv-secrets-operand-allow.txt, keyed
+                     by file and the sha256 of the whole command, written only
+                     by scripts/regen-argv-secrets-allow.py; an entry that
+                     claims no hit fails the gate.
   cloud-init-readable-secret  a cloud-init ``write_files`` entry left group or
                      world readable (or with no ``permissions``) whose content
                      interpolates a ``${..password|secret|token|key|cred..}``
@@ -100,13 +108,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import shlex
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from collections import Counter
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -119,6 +129,17 @@ REDACTION_TOKENS = frozenset({"...", "…", "***", "redacted", "<redacted>", "xx
 
 # Files that quote the patterns on purpose: this gate.
 SELF_EXEMPT = {"scripts/check-docs-no-argv-secrets.py"}
+
+# #5722 (5-agent vote (4d3ea1c5)): the reviewed-line allowlist. Only a hit of a class in
+# WAIVABLE_TAGS can be listed there, one entry per hit, keyed by file, class and the sha256 of
+# the whole command text, so an entry never names a program and any edit of the line
+# invalidates it. The file is written only by scripts/regen-argv-secrets-allow.py; the gate
+# reads it, and a form fault (exit 2) or an entry that claims no hit (exit 1) fails the run.
+ALLOW_REL = "scripts/qc-allowlists/argv-secrets-operand-allow.txt"
+UNKNOWN_TAG = "unknown-head-operand"
+WAIVABLE_TAGS = (UNKNOWN_TAG,)
+WAIVABLE_RE = re.compile(r"\[(?P<tag>[a-z-]+)\] h=(?P<h>[0-9a-f]{32}) (?P<preview>.*)\Z")
+ALLOW_LINE_RE = re.compile(r"(?P<rel>[^|\s][^|]*?) \| (?P<tag>[a-z-]+) \| (?P<h>[0-9a-f]{32}) \| (?P<preview>.*)\Z")
 
 # Historical or machine-generated trees where quoted old commands are a record,
 # not a recommendation: the changelog fragments and the per-PR review evidence.
@@ -343,6 +364,69 @@ def redact(text: str) -> str:
     text = re.sub(r"(://[^\s/@:\"']*:)[^\s/@\"']+@", r"\1***@", text)
     text = re.sub(r"(?i)((?:password|%70assword|pass\w*|secret\w*|token\w*)\s*=\s*)[^\s&\"']+", r"\1***", text)
     return text[:140]
+
+
+def command_hash(text: str, start: int, end: int) -> str:
+    """#5722: the allowlist key of one command: the sha256 (32 hex) of its text with every
+    backslash-newline and whitespace run read as one space."""
+    one = re.sub(r"\\\r?\n\s*", " ", text[start:end])
+    return hashlib.sha256(re.sub(r"\s+", " ", one).strip().encode("utf-8")).hexdigest()[:32]
+
+
+def mask_preview(text: str) -> str:
+    """#5722: the preview printed in a hit and stored in the allowlist: every =VALUE, every
+    URL password and every | (the allowlist field separator) is masked, at most 100 chars."""
+    text = re.sub(r"(://[^\s/@:\"']*:)[^\s/@\"']+@", r"\1*@", text)
+    text = re.sub(r"=[^\s\"']+", "=*", text)
+    return text.replace("|", "/")[:100]
+
+
+def load_allow(text: str) -> Tuple[List[Tuple[str, str, str, str]], List[str]]:
+    """(entries, faults) of the allowlist text. Comment and blank lines are skipped; any
+    other line must be 'path | tag | hash | preview' with a waivable tag (#5722)."""
+    entries: List[Tuple[str, str, str, str]] = []
+    faults: List[str] = []
+    for n, ln in enumerate(text.splitlines(), 1):
+        if not ln.strip() or ln.startswith("#"):
+            continue
+        m = ALLOW_LINE_RE.fullmatch(ln)
+        if not m:
+            faults.append("line %d is not 'path | tag | hash | preview'" % n)
+        elif m.group("tag") not in WAIVABLE_TAGS:
+            faults.append("line %d: class %s cannot be allowlisted" % (n, m.group("tag")))
+        elif mask_preview(m.group("preview")) != m.group("preview"):
+            faults.append("line %d: preview is not masked" % n)
+        else:
+            entries.append((m.group("rel"), m.group("tag"), m.group("h"), m.group("preview")))
+    return entries, faults
+
+
+def waivable_key(hit: Hit) -> Optional[Tuple[str, str, str, str]]:
+    m = WAIVABLE_RE.match(hit[2])
+    if not m or m.group("tag") not in WAIVABLE_TAGS:
+        return None
+    return (hit[0], m.group("tag"), m.group("h"), m.group("preview"))
+
+
+def split_allowed(hits: List[Hit], entries) -> Tuple[List[Hit], int, List[str]]:
+    """(failing hits, allowlisted count, stale entry lines). Each entry claims at most one
+    hit with the same file, class, hash and preview; an entry that claims none is stale.
+    Entries must stand in the order of the hits they claim (the order the regen script
+    writes), so a reordered or hand-placed entry is reported as an order fault."""
+    want = Counter(entries)
+    left: List[Hit] = []
+    claimed = []
+    for h in hits:
+        k = waivable_key(h)
+        if k is not None and want[k] > 0:
+            want[k] -= 1
+            claimed.append(k)
+        else:
+            left.append(h)
+    stale = ["%s | %s | %s | %s" % k for k in sorted(want.elements())]
+    if not stale and claimed != list(entries):
+        stale.append("entries are not in tree order; run scripts/regen-argv-secrets-allow.py")
+    return left, len(claimed), stale
 
 
 def logical_lines(text: str) -> List[Tuple[int, str]]:
@@ -1309,10 +1393,12 @@ def psql_segment_end(joined: str, head_end: int) -> int:
 
 # #5556 #5557 #5558 (round 8) and round 9 (the unresolved-head class, B-operand shape):
 # the proof obligation is inverted. A credential-shaped -v / --set / --variable operand is
-# CLEAN only when the command it belongs to provably has a fully literal head that is not
-# psql. Every other command (a non-literal head, a psql head, a head behind a wrapper,
-# keyword, option or redirection form the model below does not know) is undecidable, and an
-# undecidable command with a credential operand is flagged. There is no word-count cap: the
+# flagged under every head: a non-literal head, a psql head, a head behind a wrapper,
+# keyword, option or redirection form the model below does not know (undecidable), and,
+# since #5722 (5-agent vote (4d3ea1c5)), a fully literal head that is none of psql, a known
+# runner, a shell or a modelled wrapper (UNKNOWN, an unmodelled program). Only an UNKNOWN
+# hit can be waived, by a reviewed line in ALLOW_REL. A command with no head, a bash [[ ]]
+# test, and a command -v / -V lookup are clean. There is no word-count cap: the
 # walk is bounded by the command, and the command comes from a tokenisation of the text.
 #
 # Command starts (shell_commands): the text start, a newline, an unquoted ; & | ( and ) (so
@@ -1340,9 +1426,10 @@ def psql_segment_end(joined: str, head_end: int) -> int:
 # rejects a variable name that holds a colon, and an = that only an expansion could add is
 # the #5398 indirection limit. A literal psql head keeps the full operand rule.
 #
-# STATED LIMITS: a fully literal head that is neither psql, a known runner nor a modelled
-# wrapper is a different program and its arguments are not read (a site-specific script that
-# itself runs "$@" is not followed); a word in prose that the tokeniser reads as a
+# STATED LIMITS: under an unknown head only the -v / --set / --variable operand shape is
+# read (the rest of that program's argv grammar is not modelled); a site-specific script that
+# itself runs "$@" is not followed; test -v NAME and [ -v NAME ] are over-reported (a
+# variable lookup reads as an operand); a word in prose that the tokeniser reads as a
 # redirection target (an HTML tag such as <code>) is not a command word.
 Grammar = Tuple[frozenset, frozenset, int, frozenset, frozenset, bool]
 # name -> (flags, options with one argument, positional operands, command-string options,
@@ -1420,6 +1507,11 @@ REDIR_OP_RE = re.compile(r"&>>?|<<<|<<-?|<>|<&|>&|>>|>\||<|>")
 FD_PREFIX_RE = re.compile(r"\d+|\{[A-Za-z_][A-Za-z0-9_]*\}")
 NEST_LIMIT = 8
 CLEAN, UNDECIDED, PSQL, STRING_HIT, RUNNER = "clean", "undecidable", "psql", "string-hit", "runner"
+# #5722 (round 11, 5-agent vote (4d3ea1c5), decision eda8d8fb): a fully literal head that is
+# none of psql, a known runner, a shell or a modelled wrapper is a program the gate does not
+# model. Its argv is still an argv, so a credential-shaped operand under it is red; the only
+# exemption is a reviewed line in ALLOW_FILE (never a program name).
+UNKNOWN = "unknown-head"
 Command = Tuple[List[Word], bool]
 
 
@@ -1776,6 +1868,10 @@ def head_verdict(text: str, words: List[Word], depth: int = 0) -> Tuple[str, int
                 or LIST_NUMBER_RE.fullmatch(lit):
             i += 1
             continue
+        if lit == "[[":
+            # #5722: [[ .. ]] is bash grammar, not a program: its words never reach an argv
+            # (a $( ) inside it is a command of its own and is read as one).
+            return CLEAN, i
         if re.search(r"psql", lit, re.IGNORECASE):
             return PSQL, i
         base = lit.rstrip("/").rsplit("/", 1)[-1]
@@ -1795,7 +1891,7 @@ def head_verdict(text: str, words: List[Word], depth: int = 0) -> Tuple[str, int
             return alias_verdict(text, words, i, depth)
         grammar = TRANSPARENT_WRAPPERS.get(base)
         if grammar is None:
-            return CLEAN, i
+            return UNKNOWN, i
         verdict, nxt_i = walk_wrapper(text, words, i, grammar, depth)
         if verdict == "next" and base == "sudo" and nxt_i < n and sudo_shell_mode(text, words, i, nxt_i):
             return RUNNER, nxt_i
@@ -1875,10 +1971,12 @@ def inside_wrapper(text: str, words: List[Word], at: int) -> bool:
     return False
 
 
-def unproven_operand_commands(text: str, depth: int = 0) -> List[Tuple[int, int, int]]:
-    """(report offset, start, end) of every command of text that is not proven clean and
-    carries a credential-shaped -v / --set / --variable operand."""
-    found: List[Tuple[int, int, int]] = []
+def unproven_operand_commands(text: str, depth: int = 0) -> List[Tuple[int, int, int, str]]:
+    """(report offset, start, end, class) of every command of text that is not proven clean
+    and carries a credential-shaped -v / --set / --variable operand. class is UNKNOWN when the
+    head is a literal program the gate does not model (#5722): only that class may be waived,
+    line by line, by ALLOW_FILE; every other class is "" and is never waived."""
+    found: List[Tuple[int, int, int, str]] = []
     seen = set()
     for words, forced in shell_commands(text):
         key = (words[0][0], words[-1][1])
@@ -1886,14 +1984,15 @@ def unproven_operand_commands(text: str, depth: int = 0) -> List[Tuple[int, int,
             continue
         seen.add(key)
         verdict, at = head_verdict(text, words, depth)
-        if forced and verdict == CLEAN:
+        if forced and verdict in (CLEAN, UNKNOWN):
+            # #5722: a command the walker could not finish is undecidable, never waivable.
             verdict = UNDECIDED
         report = words[min(at, len(words) - 1)][0]
-        if verdict == STRING_HIT or (verdict in (UNDECIDED, RUNNER, PSQL)
+        if verdict == STRING_HIT or (verdict in (UNDECIDED, UNKNOWN, RUNNER, PSQL)
                                      and credential_operand(text, words, verdict != PSQL,
-                                                         verdict == RUNNER or (verdict == UNDECIDED
+                                                         verdict == RUNNER or (verdict in (UNDECIDED, UNKNOWN)
                                                                                and inside_wrapper(text, words, at)))):
-            found.append((report, words[0][0], words[-1][1]))
+            found.append((report, words[0][0], words[-1][1], UNKNOWN if verdict == UNKNOWN else ""))
     return found
 
 
@@ -1925,6 +2024,11 @@ def psql_var_operand_flagged(operand: str) -> bool:
     if marks and PSQL_SECRET_VAR_NAME_RE.search(value[min(marks):]):
         return True
     return False
+
+
+def operand_rule_hit(hit: Hit) -> bool:
+    """#5722: a hit of the credential-operand rule, waivable (unknown head) or not."""
+    return hit[2].startswith(("[env-password-argv]", "[%s]" % UNKNOWN_TAG))
 
 
 def text_rule_hits(rel: str, text: str) -> List[Hit]:
@@ -1967,11 +2071,16 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
     # #5556 #5557 #5558 and round 9: a credential operand is clean only under a command whose
     # head is proven literal and not psql (unproven_operand_commands); one hit per line.
     argv_lines = {hit[1] for hit in hits if hit[2].startswith("[env-password-argv] ")}
-    for report, start, end in unproven_operand_commands(joined):
+    for report, start, end, cls in unproven_operand_commands(joined):
         line = _line_of(text, report)[0]
         if line in argv_lines:
             continue
         argv_lines.add(line)
+        if cls == UNKNOWN:
+            # #5722: an unknown head is waivable, so its hit carries the allowlist key.
+            hits.append((rel, line, "[%s] h=%s %s" % (UNKNOWN_TAG, command_hash(text, start, end),
+                                                       mask_preview(psql_command_snippet(text, start, end)))))
+            continue
         hits.append((rel, line, "[env-password-argv] " + psql_command_snippet(text, start, end)))
     for rule, tag in ((PSQL_URL_RE, "psql-url-password"), (DOCKER_ENV_DSN_RE, "env-dsn-argv"),
                       (SSH_REMOTE_URL_RE, "ssh-remote-url-password")):
@@ -2065,6 +2174,13 @@ def run() -> int:
         files = tracked_files()
         hits, scanned = scan_paths(ROOT, files)
         hits, listed, stale = split_pending(ROOT, hits)
+        allow_path = ROOT / ALLOW_REL
+        if not allow_path.is_file():
+            raise RuntimeError("%s is missing (#5722)" % ALLOW_REL)
+        entries, faults = load_allow(allow_path.read_text(encoding="utf-8"))
+        if faults:
+            raise RuntimeError("%s: %s (#5722)" % (ALLOW_REL, "; ".join(faults)))
+        hits, allowed, stale_allow = split_allowed(hits, entries)
     except (RuntimeError, OSError, UnicodeDecodeError) as exc:
         print("FAIL: check-docs-no-argv-secrets: scanner fault: %s" % exc, file=sys.stderr)
         return 2
@@ -2075,8 +2191,12 @@ def run() -> int:
         print("PENDING %s" % item)
     for item in stale:
         print("STALE pending entry (matches no hit; remove it): %s" % item, file=sys.stderr)
-    if stale and not hits:
-        print("FAIL: check-docs-no-argv-secrets: %d stale pending entr(ies)" % len(stale), file=sys.stderr)
+    for item in stale_allow:
+        print("STALE allowlist entry (matches no hit; run scripts/regen-argv-secrets-allow.py): %s" % item,
+              file=sys.stderr)
+    if (stale or stale_allow) and not hits:
+        print("FAIL: check-docs-no-argv-secrets: %d stale pending and %d stale allowlist entr(ies)"
+              % (len(stale), len(stale_allow)), file=sys.stderr)
         return 1
     if hits:
         for rel, line, snippet in hits:
@@ -2088,8 +2208,8 @@ def run() -> int:
             file=sys.stderr,
         )
         return 1
-    print("PASS: check-docs-no-argv-secrets: %d files scanned, 0 argv credentials, %d pending (listed, not approved)"
-          % (scanned, len(listed)))
+    print("PASS: check-docs-no-argv-secrets: %d files scanned, 0 argv credentials, %d pending (listed, not approved), "
+          "%d allowlisted (reviewed lines, %s)" % (scanned, len(listed), allowed, ALLOW_REL))
     return 0
 
 
@@ -2699,17 +2819,15 @@ GREEN_HEAD_PROBES = {
     "5556-g2-neutral-variable": "p$X -v verbose=1 -f x.sql",
     "5556-g4-lookalike-long-option": '"${example_bin}" --variant "${variant}" --report "${report}"',
     "5556-g5-volume-mount-of-other-tool": "$COMPOSE run -v /host:/ct img",
-    "5556-g6-literal-other-head": 'echo "$X" -v pw=1',
     "5556-g7-literal-head-keeps-meaning": "docker run -v $KEYS_DIR:/k $IMG",  # #5651: path-named
     "5556-g9-one-word-with-suffix-after-quote": '"$X -v pw=$PG_PW"c',
-    "5556-g10-quoted-literal-head-with-space": '"env -i" $X -v pw="$PG_PW"',
     # 5556-g11 (nohup --foo=bar true $X) is red since #5593: nohup takes no option, so the
     # head is undecidable (5593-n45); the clean form is 5593-g19 (env --unset=FOO true $X).
     "5556-g12-command-string-ends-at-its-close": "bash -c 'env -i' $X -v pw=\"$PG_PW\"",
-    "5556-g8-prose-quote-no-command": "Set the **loss** value to 3 -v pw is not run here",
 }
 
-# #5593 (round 9): a credential operand is clean only under a proven literal non-psql head;
+# #5593 (round 9): a credential operand is clean only under a proven literal non-psql head
+# (until #5722, round 11: an unknown head is red; the probes it turned are in R11_UNKNOWN_RED);
 # S1-S8 are the round-8 review's reproducers, n01-n72 the neighbours (wrappers with operands,
 # fd redirections, assignment runs, case arms, coproc, function bodies, groups, conditions,
 # pipelines, continuations, substitutions). #5594: the operand is psql's NAME=VALUE (a mount
@@ -2844,30 +2962,8 @@ R9_RED_PROBES = {
 }
 # 5593 / 5594 green: no hit of any kind.
 R9_GREEN_PROBES = {
-    '5593-g01-timeout-literal': 'timeout 5 echo' + R9_NEUTRAL_TAIL,
-    '5593-g02-taskset-literal': 'taskset 0x1 echo' + R9_NEUTRAL_TAIL,
-    '5593-g03-nice-literal': 'nice -n 10 echo' + R9_NEUTRAL_TAIL,
-    '5593-g04-ionice-literal': 'ionice -c 3 echo' + R9_NEUTRAL_TAIL,
-    '5593-g05-chrt-literal': 'chrt -f 10 echo' + R9_NEUTRAL_TAIL,
-    '5593-g06-flock-literal': 'flock -w 5 /run/l.lock echo' + R9_NEUTRAL_TAIL,
-    '5593-g07-chroot-literal': 'chroot /srv/root echo' + R9_NEUTRAL_TAIL,
-    '5593-g08-stdbuf-literal': 'stdbuf -oL echo' + R9_NEUTRAL_TAIL,
-    '5593-g09-setsid-literal': 'setsid -f echo' + R9_NEUTRAL_TAIL,
-    '5593-g10-env-literal': 'env -i FOO=1 echo' + R9_NEUTRAL_TAIL,
-    '5593-g11-sudo-literal': 'sudo -u postgres echo' + R9_NEUTRAL_TAIL,
-    '5593-g12-doas-literal': 'doas -u postgres echo' + R9_NEUTRAL_TAIL,
-    '5593-g13-exec-redirect-literal': 'exec 3<f echo' + R9_NEUTRAL_TAIL,
-    '5593-g14-redirect-first-literal': '2>/dev/null echo' + R9_NEUTRAL_TAIL,
-    '5593-g15-time-literal': 'time -p echo' + R9_NEUTRAL_TAIL,
-    '5593-g16-nohup-literal': 'nohup echo' + R9_NEUTRAL_TAIL,
-    '5593-g17-command-p-literal': 'command -p echo' + R9_NEUTRAL_TAIL,
-    '5593-g18-sudo-E-no-argument': 'sudo -E true $X' + R9_NEUTRAL_TAIL,
-    '5593-g19-env-unset-equals': 'env --unset=FOO true $X' + R9_NEUTRAL_TAIL,
     '5593-g26-test-v-keyword': '[[ -v PGPASSWORD ]] && echo set',
-    '5593-g27-case-literal-arm': 'case a in a) echo' + R9_NEUTRAL_TAIL + ' ;; esac',
-    '5593-g28-timeout-signal-literal': 'timeout -s KILL 5 echo' + R9_NEUTRAL_TAIL,
     '5593-g29-bash-c-literal-then-args': "bash -c 'env -i' $X" + R9_NEUTRAL_TAIL,
-    '5593-g30-taskset-cpu-list-literal': 'taskset -c 0,1 echo' + R9_NEUTRAL_TAIL,
     '5594-g20-FP1-docker-secret-dir-mount': '"$DOCKER" run -v "$SECRET_DIR:/s" img',
     '5594-g21-docker-secret-path-mount': '$DOCKER run -v /run/secrets/pgpass:/s:ro img',
     '5594-g22-compose-token-mount': '$COMPOSE run -v "$TOKEN_PATH":/t img',
@@ -2877,7 +2973,6 @@ R9_GREEN_PROBES = {
     '5594-g31-command-v-lookup': 'if ! command -v "$BIN" >/dev/null; then exit 1; fi',
     '5594-g32-command-V-cluster': 'command -pV "$TOKEN_TOOL"',
     '5593-g33-shell-o-takes-an-argument': "bash -o pipefail -c 'env -i'" + R9_NEUTRAL_TAIL,
-    '5593-g34-unit-exec-literal-head': 'ExecStart=/usr/bin/env -i echo' + R9_NEUTRAL_TAIL,
     '5594-g35-mount-target-holds-equals': '$DOCKER run -v "$SECRET_DIR:/opt/a=b" img',
 }
 # Round 10 red: some hit of any kind, as a script, a prose file and a fenced block.
@@ -2945,8 +3040,6 @@ R10_GREEN_PROBES = {
     # naming a program (no shell joins it, so its -v is not an operand).
     '5652-g01-env-S-no-credential': 'env -S "echo hi"',
     '5652-g02-sudo-s-no-credential': 'sudo -s "echo hi"',
-    '5652-g03-nohup-one-field-program': 'nohup "\\$CLI -v pw=\\$PG_PW"',
-    '5652-g04-sudo-u-arg-holds-s': 'sudo -u s "\\$CLI -v pw=\\$PG_PW"',
     # #5653: alias and assignment values with no credential operand.
     '5653-g01': "alias ll='ls -la'",
     '5653-g02': "alias q='psql -h db'",
@@ -3055,11 +3148,112 @@ R10_XTRACE_GREEN = {
     '5727-g20-shebang-env-S-attached-no-x': '#!/usr/bin/env -Sexpect -f\n',
 }
 
+# #5722 (round 11, 5-agent vote (4d3ea1c5)): these were clean probes up to round 10, because a
+# literal head the gate does not model (echo, true, a quoted one-field program, a prose word)
+# was proven clean. An unknown head is now red: each must be flagged, as a script, a prose file
+# and a fenced block, with the waivable [unknown-head-operand] class.
+R11_UNKNOWN_RED = {
+    '5722-5556-g6-literal-other-head': 'echo "$X" -v pw=1',
+    '5722-5556-g10-quoted-literal-head-with-space': '"env -i" $X -v pw="$PG_PW"',
+    '5722-5556-g8-prose-quote-no-command': "Set the **loss** value to 3 -v pw is not run here",
+    '5722-5593-g01-timeout-literal': 'timeout 5 echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g02-taskset-literal': 'taskset 0x1 echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g03-nice-literal': 'nice -n 10 echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g04-ionice-literal': 'ionice -c 3 echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g05-chrt-literal': 'chrt -f 10 echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g06-flock-literal': 'flock -w 5 /run/l.lock echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g07-chroot-literal': 'chroot /srv/root echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g08-stdbuf-literal': 'stdbuf -oL echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g09-setsid-literal': 'setsid -f echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g10-env-literal': 'env -i FOO=1 echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g11-sudo-literal': 'sudo -u postgres echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g12-doas-literal': 'doas -u postgres echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g13-exec-redirect-literal': 'exec 3<f echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g14-redirect-first-literal': '2>/dev/null echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g15-time-literal': 'time -p echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g16-nohup-literal': 'nohup echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g17-command-p-literal': 'command -p echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g18-sudo-E-no-argument': 'sudo -E true $X' + R9_NEUTRAL_TAIL,
+    '5722-5593-g19-env-unset-equals': 'env --unset=FOO true $X' + R9_NEUTRAL_TAIL,
+    '5722-5593-g27-case-literal-arm': 'case a in a) echo' + R9_NEUTRAL_TAIL + ' ;; esac',
+    '5722-5593-g28-timeout-signal-literal': 'timeout -s KILL 5 echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g30-taskset-cpu-list-literal': 'taskset -c 0,1 echo' + R9_NEUTRAL_TAIL,
+    '5722-5593-g34-unit-exec-literal-head': 'ExecStart=/usr/bin/env -i echo' + R9_NEUTRAL_TAIL,
+    '5722-5652-g03-nohup-one-field-program': 'nohup "\\$CLI -v pw=\\$PG_PW"',
+    '5722-5652-g04-sudo-u-arg-holds-s': 'sudo -u s "\\$CLI -v pw=\\$PG_PW"',
+    '5722-r01-unlisted-benchmark-tool': 'pgbench -v db_password="$X" -f x.sql',
+    '5722-r02-unlisted-site-wrapper': 'site-dbctl --set token=abc123 apply',
+    '5722-r03-unlisted-variable-tool': 'awk -v pw="$PGPASSWORD" 1 x.txt',
+    '5722-r04-test-v-is-over-reported': 'test -v PGPASSWORD',
+}
+# #5722: an unknown head that is clean: no credential-shaped operand.
+R11_UNKNOWN_GREEN = {
+    '5722-g01-grep-v-neutral': "grep -v '^#' x.conf",
+    '5722-g02-awk-v-neutral': 'awk -v n=3 1 x.txt',
+    '5722-g03-printf-v-neutral': 'printf -v line %s "$X"',
+    '5722-g04-test-keyword-v': '[[ -v PGPASSWORD ]] && echo set',
+}
+# #5722: classes that are never waivable even though the head is a literal unknown program:
+# a command the walker could not finish (nesting limit) is undecidable.
+R11_NOT_WAIVABLE = ('5593-m36-nesting-limit-literal-head',)
+
 
 def r9_variants(text: str) -> List[Tuple[str, str, str]]:
     """(label, file name, text): the probe as a script, as prose and inside a fenced block."""
     return [("sh", "probe.sh", text), ("md", "probe.md", text),
             ("fence", "probe.md", "```bash\n" + text + "\n```\n")]
+
+
+def allow_self_test(bad: int, red: int, green: int) -> Tuple[int, int, int]:
+    """#5722: the allowlist loader and matcher. Red: a fault or a stale entry is reported;
+    green: a well-formed entry claims exactly one matching hit."""
+    hit = text_rule_hits("probe.sh", "pgbench -v db_" + "password=x1 -f a.sql\n")
+    key = waivable_key(hit[0]) if hit else None
+    if key is None:
+        print("SELF-TEST FAIL: allowlist: the probe hit has no waivable key: %r" % (hit,), file=sys.stderr)
+        return bad + 1, red, green
+    good = "# header\n\n%s | %s | %s | %s\n" % key
+    cases = [
+        ("well-formed entry", good, 0),
+        ("missing field", "%s | %s | %s\n" % key[:3], 1),
+        ("short hash", good.replace(key[2], key[2][:31]), 1),
+        ("class that is never waivable", good.replace(UNKNOWN_TAG, "env-password-argv"), 1),
+        ("unmasked preview", good.replace("=*", "=x1"), 1),
+        ("a program name instead of a line", "pgbench\n", 1),
+    ]
+    for label, text, want in cases:
+        entries, faults = load_allow(text)
+        if want:
+            red += 1
+        else:
+            green += 1
+        if len(faults) != want or (not want and entries != [key]):
+            print("SELF-TEST FAIL: allowlist loader %r: entries %r faults %r" % (label, entries, faults),
+                  file=sys.stderr)
+            bad += 1
+    other = ("probe.sh", 2, "[env-password-argv] x")
+    hit2 = text_rule_hits("probe.sh", "\nsite-dbctl --set tok" + "en=y2 apply\n")
+    key2 = waivable_key(hit2[0]) if hit2 else None
+    if key2 is None:
+        print("SELF-TEST FAIL: allowlist: the second probe hit has no waivable key: %r" % (hit2,), file=sys.stderr)
+        return bad + 1, red, green
+    checks = [
+        ("one entry claims one hit", [hit[0]], [key], 0, 1, 0),
+        ("one entry leaves a second identical hit", [hit[0], hit[0]], [key], 1, 1, 0),
+        ("an entry with no hit is stale", [], [key], 0, 0, 1),
+        ("an entry for another file claims nothing", [hit[0]], [("x.sh",) + key[1:]], 1, 0, 1),
+        ("a non-waivable hit is never claimed", [other], [key], 1, 0, 1),
+        ("entries out of hit order are an order fault", [hit[0], hit2[0]], [key2, key], 0, 2, 1),
+        ("entries in hit order are clean", [hit[0], hit2[0]], [key, key2], 0, 2, 0),
+    ]
+    for label, hits, entries, n_left, n_used, n_stale in checks:
+        red += 1
+        left, used, stale = split_allowed(hits, entries)
+        if (len(left), used, len(stale)) != (n_left, n_used, n_stale):
+            print("SELF-TEST FAIL: allowlist matcher %r: left %r used %d stale %r" % (label, left, used, stale),
+                  file=sys.stderr)
+            bad += 1
+    return bad, red, green
 
 
 def self_test() -> int:
@@ -3163,7 +3357,7 @@ def self_test() -> int:
             red += 1
             # text_rule_hits, not scan_text: scan_text drops a text hit on a line another
             # layer already reported, which would hide a regression of this rule.
-            if not any(h[2].startswith("[env-password-argv]") for h in text_rule_hits(suffix, text)):
+            if not any(operand_rule_hit(h) for h in text_rule_hits(suffix, text)):
                 print("SELF-TEST FAIL: red probe %r (%s) was not flagged" % (name, suffix), file=sys.stderr)
                 bad += 1
         for name, text in GREEN_HEAD_PROBES.items():
@@ -3173,7 +3367,7 @@ def self_test() -> int:
                 bad += 1
     for name, text, want_lines in HEAD_LINE_PROBES:
         red += 1
-        got = [h[1] for h in text_rule_hits("probe.md", text) if h[2].startswith("[env-password-argv]")]
+        got = [h[1] for h in text_rule_hits("probe.md", text) if operand_rule_hit(h)]
         if got != want_lines:
             print("SELF-TEST FAIL: head line probe %r gave lines %r (want %r)" % (name, got, want_lines), file=sys.stderr)
             bad += 1
@@ -3181,7 +3375,7 @@ def self_test() -> int:
     for name, text in R9_RED_PROBES.items():
         for label, suffix, body in r9_variants(text):
             red += 1
-            if not any(h[2].startswith("[env-password-argv]") for h in text_rule_hits(suffix, body)):
+            if not any(operand_rule_hit(h) for h in text_rule_hits(suffix, body)):
                 print("SELF-TEST FAIL: red probe %r (%s) was not flagged" % (name, label), file=sys.stderr)
                 bad += 1
     for name, text in R9_GREEN_PROBES.items():
@@ -3218,6 +3412,29 @@ def self_test() -> int:
             if got:
                 print("SELF-TEST FAIL: xtrace probe %r (%s) was flagged: %r" % (name, suffix, got), file=sys.stderr)
                 bad += 1
+    # #5722: an unknown head with a credential operand is red and carries the waivable class.
+    for name, text in R11_UNKNOWN_RED.items():
+        for label, suffix, body in r9_variants(text):
+            red += 1
+            if not any(h[2].startswith("[%s] h=" % UNKNOWN_TAG) for h in text_rule_hits(suffix, body)):
+                print("SELF-TEST FAIL: unknown-head probe %r (%s) not flagged as %s" % (name, label, UNKNOWN_TAG),
+                      file=sys.stderr)
+                bad += 1
+    for name, text in R11_UNKNOWN_GREEN.items():
+        for label, suffix, body in r9_variants(text):
+            green += 1
+            got = scan_text(suffix, body)
+            if got:
+                print("SELF-TEST FAIL: unknown-head clean probe %r (%s) was flagged: %r" % (name, label, got),
+                      file=sys.stderr)
+                bad += 1
+    for name in R11_NOT_WAIVABLE:
+        red += 1
+        got = text_rule_hits("probe.sh", R9_RED_PROBES[name])
+        if not got or any(waivable_key(h) for h in got):
+            print("SELF-TEST FAIL: %r must be flagged and not waivable: %r" % (name, got), file=sys.stderr)
+            bad += 1
+    bad, red, green = allow_self_test(bad, red, green)
     # A glob head with no credential option is emphasis in prose; a script refuses it as undecidable.
     green += 1
     if scan_text("probe.md", "```bash\n[p]sql -f x.sql\n```\n"):
