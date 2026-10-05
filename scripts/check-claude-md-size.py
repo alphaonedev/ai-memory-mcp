@@ -1468,7 +1468,9 @@ def run_closed_world_citation_cases(fresh, heading: str) -> bool:
         "anchor with a trailing dash": "CLAUDE.md#key-modules-",
         "anchor with a percent escape": "CLAUDE.md#key%20modules",
         "empty anchor": "CLAUDE.md# here",
-        "anchor of a stayed heading in upper case": "CLAUDE.md#BUILD--TEST-COMMANDS"}
+        "anchor of a stayed heading in upper case": "CLAUDE.md#BUILD--TEST-COMMANDS",
+        "stayed heading in lower case": 'CLAUDE.md "build & test commands"',
+        "stayed heading split by a blank line": 'CLAUDE.md "Build &\n\nTest Commands"'}
     accepted = {
         "plain prose": "See CLAUDE.md for the rules.",
         "prose after backticks": "`CLAUDE.md` (operator-cadence) is tracked.",
@@ -1477,6 +1479,7 @@ def run_closed_world_citation_cases(fresh, heading: str) -> bool:
         "exact stayed heading, smart quotes": "CLAUDE.md \u201c" + STAYED + "\u201d",
         "exact stayed heading across a line break": 'CLAUDE.md "' + STAYED.replace(" ", "\n", 1) + '"',
         "exact stayed heading, no-break space": 'CLAUDE.md section "Build &\u00a0Test Commands"',
+        "exact stayed heading wrapped with indentation": 'CLAUDE.md "Build &\n    Test Commands"',
         "list of exact stayed headings": 'CLAUDE.md sections "Build & Test Commands" and "Code Style"',
         "exact anchor of a stayed heading": "CLAUDE.md#build--test-commands."}
     for label, form in list(refused.items()) + list(accepted.items()):
@@ -1485,6 +1488,15 @@ def run_closed_world_citation_cases(fresh, heading: str) -> bool:
         doc.parent.mkdir(parents=True, exist_ok=True)
         doc.write_text("See " + form.replace("{h}", heading) + " now.\n", encoding="utf-8")
         ok &= expect(root, f"#5676 closed-world citation: {label}", label in refused, "#5676")
+    for label, form, needle in (("a moved heading", 'CLAUDE.md "{h}"', "which moved to a docs/reference file"),
+                                ("an unknown heading", 'CLAUDE.md "No such heading"', "is not an exact pinned"),
+                                ("a moved anchor", "CLAUDE.md#key-modules", "which moved to a docs/reference file"),
+                                ("an unknown anchor", "CLAUDE.md#no-such", "names no pinned CLAUDE.md heading")):
+        root = fresh()
+        doc = root / "docs" / "internal" / "why.md"
+        doc.parent.mkdir(parents=True, exist_ok=True)
+        doc.write_text("See " + form.replace("{h}", heading) + ".\n", encoding="utf-8")
+        ok &= expect(root, f"#5676 the message says why: {label}", True, needle)
     return ok
 
 
