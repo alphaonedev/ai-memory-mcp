@@ -238,13 +238,32 @@ lab_probe_refusal_names_knob() {
        END { exit (f ? 0 : 1) }' "$1" 2>/dev/null
 }
 
+# #5539, #5540, #5541: the one matcher statement the structural self-test leg accepts, as `declare -f` prints it with every
+# run of whitespace collapsed to one space. Closed world: a body is allowed only when it EQUALS this text, so any other
+# command, redirect, substitution, second statement or awk program is refused without being named (a denylist cannot be closed).
+# Changing the matcher means changing this text in the same commit.
+lab_probe_expected_body() {
+  local q="'"
+  printf '%s' "lab_probe_refusal_names_knob () { awk ${q}index(\$0, \"INFO\") == 0 && index(\$0, \"refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:\") { f = 1 } END { exit (f ? 0 : 1) }${q} \"\$1\" 2> /dev/null }"
+}
+
+# lab_probe_body_allowed <declare -f text> — true only when the text, whitespace-normalized, equals the expected body.
+lab_probe_body_allowed() {
+  local norm IFS=$' \t\n'
+  norm="$(set -f; set -- $1; printf '%s' "$*")"
+  [ "$norm" = "$(lab_probe_expected_body)" ]
+}
+
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 18 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 13
+# 42 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 37
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), seven probe-matcher legs (lab_probe_refusal_names_knob against
-# generated logs), one structural leg (the matcher has no here-string, here-document, pipe or temp file)
-# and one layout leg (this comment sits directly on the function).
+# generated logs), one structural leg (the matcher body equals the one allowed awk statement, #5539), a globbing-and-IFS leg, a mutant-builder control, twenty-two
+# closed-world legs (a mutated matcher body of each spelling must be refused: spill by cp, dd, install, sort -o or
+# tee, a stderr redirect to a near name, process substitution, here-string, here-document, pipe, coproc, command
+# substitution, extra statement, function call, eval, exec redirect, a changed awk program, ...) and one layout
+# leg (this comment sits directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
   local root="$1" bad=0 rc name want
@@ -313,14 +332,57 @@ lab_posture_selftest() {
   ( set -o pipefail; lab_probe_refusal_names_knob "$plog/big.log" ) \
     && echo "  PASS probe matcher: detection in a large log survives pipefail" \
     || { echo "  FAIL probe matcher: detection in a large log lost"; bad=1; }
-  # #5197, #5259, #5519: the matcher must not feed the log through a here-string or a here-document (bash
-  # spills a large one to a temp file under $TMPDIR, /tmp when unset), a pipe (SIGPIPE under pipefail) or a
-  # temp file it makes itself (mktemp, $TMPDIR, /tmp or any output redirect). Its one allowed redirect is 2>/dev/null.
-  local body; body="$(declare -f lab_probe_refusal_names_knob)"; body="${body//2> \/dev\/null/}"; body="${body//2>\/dev\/null/}"
-  case "$body" in
-    *'<<'*|*' | '*|*mktemp*|*TMPDIR*|*/tmp*|*'>'*) echo "  FAIL probe matcher: reads the log through a here-string, a here-document, a pipe or a temp file"; bad=1 ;;
-    *) echo "  PASS probe matcher: reads the log without a here-string, a here-document, a pipe or a temp file" ;;
-  esac
+  # #5197, #5259, #5519, #5539: the matcher is ONE awk statement reading "$1" with one stderr redirect to /dev/null.
+  # The leg is an allowlist: the normalized body must equal lab_probe_expected_body. A here-string, here-document,
+  # pipe, process substitution, temp file (mktemp, cp, dd, install, sort -o, tee, an exec or output redirect) and any
+  # other extra command are refused because they are not that one statement.
+  if lab_probe_body_allowed "$(declare -f lab_probe_refusal_names_knob)"; then
+    echo "  PASS probe matcher: the body is exactly the one allowed awk statement (one awk command, its program, \"\$1\", one 2> /dev/null)"
+  else
+    echo "  FAIL probe matcher: the body is not exactly the one allowed awk statement"; bad=1
+  fi
+  # #5539: the comparison must not depend on the caller's globbing or IFS: a one-character file name would expand the
+  # standalone ? of the awk program, and a changed IFS would split the words differently.
+  : > "$plog/x"
+  if ( cd "$plog" && IFS=: && lab_probe_body_allowed "$(declare -f lab_probe_refusal_names_knob)" ); then
+    echo "  PASS probe matcher: the allowlist compare ignores a one-character file name and a changed IFS"
+  else
+    echo "  FAIL probe matcher: the allowlist compare depends on globbing or IFS"; bad=1
+  fi
+  # #5539, #5540, #5541: each spelling below is a way to read the log other than that statement; every one must be refused.
+  local exp head core tail
+  exp="$(lab_probe_expected_body)"; head="lab_probe_refusal_names_knob () { "
+  core="${exp#"$head"}"; core="${core% \}}"; tail=' "$1" 2> /dev/null'
+  _refuse() {  # <spelling> <mutated body> — the allowlist must say no
+    if lab_probe_body_allowed "$2"; then echo "  FAIL probe matcher: a matcher that $1 is accepted"; return 1
+    else echo "  PASS probe matcher: a matcher that $1 is refused"; fi
+  }
+  # Builder control: the unmutated pieces reassembled must be ALLOWED, so a refusal below is the mutation's doing.
+  if lab_probe_body_allowed "${head}${core} }"; then echo "  PASS probe matcher: the mutant builder reassembles the allowed body unchanged (control)"
+  else echo "  FAIL probe matcher: the mutant builder does not reassemble the allowed body (control)"; bad=1; fi
+  _refuse "copies the log with cp into a spill file (M3)" "${head}"'cp "$1" /dev/shm/lab-probe.$$ ; '"${core} }" || bad=1
+  _refuse "copies the log with cp into \$TMP (M4)" "${head}"'cp "$1" "$TMP/lab-probe.$$" ; '"${core} }" || bad=1
+  _refuse "copies the log with dd into \$HOME (M8)" "${head}"'dd if="$1" of="${HOME}/.lab-probe.$$" status=none ; '"${core} }" || bad=1
+  _refuse "redirects stderr to /dev/null.spill (M5)" "${head}${core%"$tail"}"' "$1" 2> /dev/null.spill }' || bad=1
+  _refuse "reads the log through process substitution (M7)" "${head}${core%"$tail"}"' < <(cat "$1" 2> /dev/null) }' || bad=1
+  _refuse "copies the log with tee into \$TEMP" "${head}"'tee "$TEMP/lab-probe.$$" < "$1" ; '"${core} }" || bad=1
+  _refuse "copies the log with install into \$TEMP" "${head}"'install -m 600 "$1" "$TEMP/lab-probe.$$" ; '"${core} }" || bad=1
+  _refuse "writes a sorted copy with sort -o" "${head}"'sort -o "$HOME/lab-probe.$$" "$1" ; '"${core} }" || bad=1
+  _refuse "opens an exec redirect to a file" "${head}"'exec 3> /tmp/lab-probe.$$ ; '"${core} }" || bad=1
+  _refuse "reads the log through a here-string" "${head}${core%"$tail"}"' <<< "$(cat "$1")" }' || bad=1
+  _refuse "reads the log through a here-document" "${head}${core%"$tail"}"' <<EOF $(cat "$1") EOF }' || bad=1
+  _refuse "pipes the log into awk" "${head}"'cat "$1" | '"${core%"$tail"}"' 2> /dev/null }' || bad=1
+  _refuse "pipes with |& into awk" "${head}"'cat "$1" |& '"${core%"$tail"}"' 2> /dev/null }' || bad=1
+  _refuse "starts a coproc" "${head}"'coproc cat "$1" ; '"${core} }" || bad=1
+  _refuse "captures the log with a command substitution" "${head}"'x="$(cat "$1")" ; '"${core} }" || bad=1
+  _refuse "runs a second statement after a semicolon" "${head}${core} ; true }" || bad=1
+  _refuse "calls a helper function" "${head}"'lab_helper "$1" ; '"${core} }" || bad=1
+  _refuse "evals a copy command" "${head}"'eval "cp $1 /dev/shm/lab-probe.$$" ; '"${core} }" || bad=1
+  _refuse "makes a temp file with mktemp" "${head}"'t=$(mktemp) ; cp "$1" "$t" ; '"${core} }" || bad=1
+  _refuse "duplicates stderr instead of discarding it" "${head}${core%"$tail"}"' "$1" 2>&1 > /dev/null }' || bad=1
+  _refuse "has awk write a file from its own program" "${head}${core/\{ f = 1 \}/\{ f = 1; print \$0 > \"/dev/shm/lab-probe\" \}}"' }' || bad=1
+  _refuse "changes the awk program (the INFO skip anchored)" "${head}${core/index(\$0, \"INFO\") == 0/\$0 !~ /^INFO/} }" || bad=1
+  unset -f _refuse
   rm -rf "$plog"
   # #5198: the doc comment sits on the function it describes (a helper between them is drift).
   if [ "$(grep -B1 '^lab_posture_selftest() {' "${BASH_SOURCE[0]}" | head -n 1)" = "# Prints one line per leg; returns 0 only if every leg behaved." ]; then
