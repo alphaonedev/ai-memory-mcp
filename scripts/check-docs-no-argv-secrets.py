@@ -2768,7 +2768,8 @@ def shape_hit(text: str, ops: List[Word]) -> Optional[Tuple[int, str]]:
 #                           "literal", NAME => "literal" (perl, php; #5924) and URL passwords;
 #   ("htpasswd",)           the password operand of htpasswd -b (-nb: the second, else the third).
 # A value is read like every shape value (shape_value): a literal or an expansion, never a
-# placeholder; "-" (stdin, or rar -p- for no password) is not a value.
+# placeholder; "-" (stdin, or rar -p- for no password) and a NEXT word that starts with "-" (the
+# next option, as for the shape rule; #5925) are not a value; a glued value (-p-x) is.
 _MYSQL_HEADS = frozenset({"mysql", "mariadb", "mysqldump", "mariadb-dump", "mysqladmin", "mariadb-admin",
                           "mysqlimport", "mysqlshow", "mysqlcheck", "mysqlpump", "mysqlslap", "mysqlbinlog"})
 _LDAP_HEADS = frozenset({"ldapsearch", "ldapmodify", "ldapadd", "ldapdelete", "ldapwhoami", "ldapcompare",
@@ -2873,13 +2874,13 @@ def head_table_read(ts: List[str], offs: List[int], row) -> Optional[Tuple[int, 
                 name, eq, val = t.partition("=")
                 if read[1].search(name):
                     v = val if eq else (ts[n + 1] if n + 1 < len(ts) else None)
-                    if v is not None and shape_value(v):
+                    if v is not None and not v.startswith("-") and shape_value(v):
                         return offs[n], v
                 continue
             for flag in read[1]:
                 form = "both" if kind in ("split", "prefix", "code") else read[2]
                 v = _flag_value(ts, n, flag, form)
-                if v is None or v == "-":
+                if v is None or v == "-" or (ts[n] == flag and v.startswith("-")):
                     continue
                 if kind == "split":
                     v = v.split(read[2], 1)[1] if read[2] in v else None
@@ -4393,6 +4394,8 @@ R11_SHAPE_RED = {
     # #5924: a perl or php code string names a key with =>.
     '5924-r93-perl-fat-arrow': "perl -E 'login(password => \"S3cr3tPass\")'",
     '5924-r94-php-fat-arrow': "php -r 'login([\"password\" => \"S3cr3tPass\"]);'",
+    # #5925: a glued value that starts with - is still the value.
+    '5925-r95-mysql-glued-dash-value': 'mysql -u bob -p-S3cr3tPass appdb',
 }
 R11_SHAPE_GREEN = {
     '5725-g01-password-stdin': 'docker login -u u --password-stdin registry.example.com',
@@ -4449,6 +4452,9 @@ R11_SHAPE_GREEN = {
     '4816-g46-redis-a-placeholder': 'redis-cli -a "<redacted>" ping',
     '5788-g47-mc-alias-ls': 'mc alias ls s3',
     '5924-g48-php-getenv': "php -r 'login([\"password\" => getenv(\"PW\")]);'",
+    # #5925: a word that starts with - after a credential option is the next option.
+    '5925-g49-redis-a-then-option': 'redis-cli -a --no-auth-warning ping',
+    '5925-g50-aws-pair-then-option': 'aws configure set aws_secret_access_key --profile x',
 }
 # #5725 STATED LIMITS: shapes the rule does not read, each pinned as missed so the limit text in
 # the header and the changelog stays measured (a rule that closes one must update both).
