@@ -3003,7 +3003,10 @@ R4HTML
                /p /div /li /ul /ol /tr /table /h1 /h2 /h3 /h4 /h5 /h6 /section /DIV; do
         printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-fixture.html"
     done
-    for _bt in em span strong a code b br td th /td /th /em /span /strong /br; do
+    # pre, link and track (lines 48, 51, 54) begin with p, li and tr but are not block
+    # tags: they pin the trailing \b of BLOCK_TAG, without which each would stop the
+    # look-back and hide the inline subject's 52 (#5419).
+    for _bt in em span strong a code b br td th /td /th /em /span /strong /br pre link track; do
         printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-control.html"
     done
     # #5700: a label/value card is one claim across two block elements. A value block
@@ -3074,6 +3077,8 @@ R4CARD
         'docs/block-control.html:39 claims "52"' \
         'docs/block-control.html:42 claims "52"' \
         'docs/block-control.html:45 claims "52"' \
+        'docs/block-control.html:48 claims "52"' 'docs/block-control.html:51 claims "52"' \
+        'docs/block-control.html:54 claims "52"' \
         'docs/schema-fixture.html:79 claims "52"' \
         'docs/schema-fixture.html:83 claims "52"' \
         'docs/schema-fixture.html:91 claims "52"' \
@@ -3137,6 +3142,7 @@ R4CARD
     echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, any case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
     echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag, and when the previous line ends with a closing block tag and the next line carries no tag); a closing tag in the MIDDLE of the previous line does not cut a claim wrapped inside the next paragraph; a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
     echo "PASS: self-test #5200/#5339 - ident-less anchors (re-stamped to v1.0.0 (schema vN), Schema vN (was vM), Current version: N at v1.0.0) each match a markdown claim in BOTH a doubled-space and a tab variant: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5419 - a tag-only line whose tag only begins like a block tag (pre, link, track) does not stop the look-back from the inline subject (52 REJECTED); pins the trailing \\b of BLOCK_TAG"
     echo "PASS: self-test #5700 - a label/value card is one claim: a value block that is only a ladder number (52, v52) after the identifier block is joined (52 REJECTED, 53 ACCEPTED; a bare-number list item is refused the same way, fail-closed); a steps transition split over two blocks is joined by its anchor (52 REJECTED, 53 ACCEPTED); a block with words after its number keeps the #5199 reset"
     echo "PASS: self-test #5337 - join boundaries pinned: a line ending with an OPENING block tag still joins (52 REJECTED), markdown is not tag-aware (a closing tag at the end of a markdown line, or an opening tag at the start of the next, still joins; 52 REJECTED), html literal backticks are not folded (documented bound)"
     echo "PASS: self-test #5340 - a markdown transition in bold or a code span wrapped across a line break (steps **v40 -> / v52**): planted 52 REJECTED, 53 ACCEPTED"
