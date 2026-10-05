@@ -34,7 +34,10 @@
 #     of the file-name stem; a one-letter word, a punctuation-only word, a directory
 #     name and a bare `len`/`count` name nothing. EVERY changed assertion of the commit must be
 #     covered; a declaration that covers only some of them leaves the commit red.
-#     Several correct declarations (own line plus later ones) are unioned.
+#     Several correct declarations (own line plus later ones) are pooled, and the
+#     items are CONSUMED ONE-TO-ONE against the hits (#5576): each changed
+#     assertion needs its own item, so one item can never stand for two
+#     assertions that merely share old and new values.
 #   * LATE DECLARATION. A missed declaration cannot be added by rewriting the
 #     history (force-push and rebase are forbidden), so a LATER commit of the same
 #     range may declare for the offender, in its own trailer block:
@@ -81,6 +84,8 @@ while [ $# -gt 0 ]; do case "$1" in
 gate_py() {
   python3 - "$@" <<'PY'
 import os, re, shutil, subprocess, sys
+
+sys.setrecursionlimit(20000)       # covers() recurses once per hit of a commit
 
 REPO = None                      # directory every git call runs in (None = the current one)
 DIFF_FLAGS = ['-M', '-C', '--find-copies-harder']
@@ -264,6 +269,23 @@ def item_matches(item, hit):
     return old == hit[2] and new == hit[3] and names_assertion(what, hit)
 
 
+def covers(items, hits):
+    """True when EVERY hit can be given its OWN item (one-to-one assignment, augmenting paths) (#5576).
+
+    One item names one assertion: it can never stand for two hits that merely share old and new values.
+    """
+    owner = {}                                            # item index -> hit index
+
+    def place(h, seen):
+        for i, it in enumerate(items):
+            if i in seen or not item_matches(it, hits[h]): continue
+            seen.add(i)
+            if i not in owner or place(owner[i], seen):
+                owner[i] = h; return True
+        return False
+    return all(place(h, set()) for h in range(len(hits)))
+
+
 def short(c):
     return c[:9]
 
@@ -315,7 +337,7 @@ def check_range(rng):
                 if any(item_matches(it, h) for h in hits[c]): own.append(it)
                 else: err.append(f'count-assertion-declared: IGNORED Count in {short(c)}: "{it[0]} {it[1]} -> {it[2]}" matches no change of this commit')
         declared = own + accepted.get(c, [])
-        if all(any(item_matches(it, h) for it in declared) for h in hits[c]): continue
+        if covers(declared, hits[c]): continue
         subj = msgs[c].split('\n', 1)[0]
         out.append(f'  {short(c)}  {subj[:70]}')
         for h in hits[c][:8]: out.append(f'      {h[0]}  {h[1]}  {h[2]} -> {h[3]}')
@@ -478,6 +500,33 @@ def selftest():
     def c_late_short(s, b):
         bump_f(s); o = s.commit('test: bump without a declaration'); s.touch(msg('docs: declare', late(o, 'e 18 -> 19 (fixture)'))); return b + '..HEAD'
     case('late declaration with a one-letter what', c_late_short, True, ['sections.len()  18 -> 19'])
+
+    # ---- #5576: items are consumed one-to-one against hits -----------------------------------------------
+    def two_same(s): bump_f(s); s.w('tests/named.rs', named_rs(19))       # two different assertions, both 18 -> 19, both name `sections`
+    def decl_two(items):
+        def f_(s, b): two_same(s); s.commit(msg('test: bump two', 'Count: %s (fixture)' % items)); return b + '..HEAD'
+        return f_
+    case('one item for two assertions sharing old and new (#5576)', decl_two('sections 18 -> 19'), True, ['EXPECTED_SECTIONS', 'sections.len()  18 -> 19'])
+    case('the same item twice covers two assertions', decl_two('sections 18 -> 19, sections 18 -> 19'), False)
+    case('two distinct items, token then const', decl_two('sections 18 -> 19, EXPECTED_SECTIONS 18 -> 19'), False)
+    case('two distinct items, const then token (assignment order)', decl_two('EXPECTED_SECTIONS 18 -> 19, sections 18 -> 19'), False)
+    case('the const item alone leaves the other assertion uncovered', decl_two('EXPECTED_SECTIONS 18 -> 19'), True, ['sections.len()  18 -> 19'])
+    case('an item that matches nothing plus one real item for two hits', decl_two('zzzz 18 -> 19, sections 18 -> 19'), True)
+    def c_pool(s, b):                                     # own item plus a late item are pooled and consumed once each
+        two_same(s); o = s.commit(msg('test: bump two', 'Count: sections 18 -> 19 (fixture)'))
+        s.touch(msg('docs: declare the other', late(o, 'EXPECTED_SECTIONS 18 -> 19 (fixture)'))); return b + '..HEAD'
+    case('own item plus a late item cover two assertions', c_pool, False)
+    def c_pool_dup(s, b):                                 # the same item declared twice (own and late) covers ONE hit twice
+        two_same(s); o = s.commit(msg('test: bump two', 'Count: sections 18 -> 19 (fixture)'))
+        s.touch(msg('docs: declare again', late(o, 'sections 18 -> 19 (fixture)'))); return b + '..HEAD'
+    case('own and late item with the SAME value pair cover two assertions (one each)', c_pool_dup, False)
+    def c_late_one(s, b):
+        two_same(s); o = s.commit('test: bump two without a declaration')
+        s.touch(msg('docs: declare once', late(o, 'sections 18 -> 19 (fixture)'))); return b + '..HEAD'
+    case('one late item for two assertions sharing old and new', c_late_one, True, ['EXPECTED_SECTIONS'])
+    def c_three(s, b):
+        two_same(s); s.w('tests/multi.rs', multi_rs(6)); s.commit(msg('test: bump three', 'Count: sections 18 -> 19, minimal 5 -> 6 (fixture)')); return b + '..HEAD'
+    case('three assertions, two items', c_three, True)
 
     # ---- #5499: late declaration -------------------------------------------------------------
     def offender(s, b, two=False):
