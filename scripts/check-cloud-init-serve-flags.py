@@ -3918,10 +3918,34 @@ def spelling_outputs(base: tuple, text: str) -> list:
     return outs
 
 
+SPELL_REGISTRY_ONLY = frozenset({"yaml-folded"})  # a block scalar line has no keyword on it, only the registry can hide it
+
+
+def layer_problems() -> list:
+    """Each of the two defences hides every spelling on its own, so a fault in one cannot hide
+    behind the other: the registry alone (register_credentials then mask_credentials), and
+    scrub() with an empty registry (the keyword and URL rules) on the displayed text, where a
+    continuation is a backslash and U+23CE; the registry is also tried on the raw text (#5546-#5550)."""
+    bad = []
+    try:
+        for cls, label, text in CRED_SPELLINGS:
+            shown = text.replace("\\\n", "\\\u23ce")
+            CRED_PIECES.clear()
+            register_credentials(text)
+            if any(n in mask_credentials(v) for v in (text, shown) for n in CRED_NEEDLES):
+                bad.append("%s %s: the registry alone left a byte of the password" % (cls, label))
+            CRED_PIECES.clear()
+            if label not in SPELL_REGISTRY_ONLY and any(n in scrub(shown) for n in CRED_NEEDLES):
+                bad.append("%s %s: the keyword and URL rules alone left a byte of the password" % (cls, label))
+    finally:
+        CRED_PIECES.clear()
+    return bad
+
+
 def spelling_problems(base: tuple) -> list:
     """No spelling in CRED_SPELLINGS puts a byte of the secret on the gate scan or the listing,
     and the scan refuses each one (#5546-#5550)."""
-    bad = []
+    bad = layer_problems()
     for cls, label, text in CRED_SPELLINGS:
         outs = spelling_outputs(base, text)
         for path, rc, out in outs:

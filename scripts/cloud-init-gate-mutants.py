@@ -23,6 +23,15 @@ from pathlib import Path
 G = "scripts/check-cloud-init-serve-flags.py"
 R = "scripts/regen-cloud-init-token-allow.py"
 
+# the spelling, layer and funnel pins alone (seconds), before the 2.5 minute gate self-test
+PINS = (
+    "import importlib.util, sys\n"
+    "s = importlib.util.spec_from_file_location('g', 'scripts/check-cloud-init-serve-flags.py')\n"
+    "g = importlib.util.module_from_spec(s); s.loader.exec_module(g)\n"
+    "bad = g.spelling_problems(g.load_repo()) + g.print_funnel_problems((g.__file__, 'scripts/regen-cloud-init-token-allow.py'))\n"
+    "sys.exit(1 if bad else 0)\n"
+)
+
 # (id, file, old text, new text, why it matters)
 MUTANTS = (
     ("M01", G, "masked = mask_keyword_values(mask_credentials(text))", "masked = mask_credentials(text)", "scrub skips the keyword over-approximation"),
@@ -71,7 +80,7 @@ def run(dest: Path, cmd: list) -> int:
 
 def kill_check(dest: Path) -> str:
     """The first check that fails, or empty when the copy is green."""
-    for name, cmd in (("scan", [G]), ("regen", [R, "."]), ("gate-self-test", [G, "--self-test"]), ("regen-self-test", [R, "--self-test", "."])):
+    for name, cmd in (("scan", [G]), ("regen", [R, "."]), ("pins", ["-c", PINS]), ("regen-self-test", [R, "--self-test", "."]), ("gate-self-test", [G, "--self-test"])):
         if run(dest, cmd) != 0:
             return name
     return ""
