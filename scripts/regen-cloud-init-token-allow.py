@@ -81,6 +81,8 @@ def spelling_problems(g, templates, maintfs, allow, pend) -> list:
             if any(n in out for n in g.CRED_NEEDLES):
                 bad.append("%s %s: %s printed a byte of the password" % (cls, label, what))
     g.CRED_PIECES.clear()
+    if g.CRED_PIECES:
+        bad.append("the spelling run left credential pieces registered")
     return bad
 
 
@@ -107,6 +109,10 @@ def self_test(g, templates, maintfs, allow, pend) -> int:
                                          {("aws-gpu-burst", "top"): [leak]}, {("aws-gpu-burst", "top"): ["+" + leak]}))
     if "Bq7Zk" in rep_lines or rep_lines.count("REMOVED") != 1 or rep_lines.count("NEW") != 1 or "CHANGED" not in rep_lines:
         bad.append("the rewrite report printed a password, or lost a line")
+    # a fault quotes the head of its line: a password there is masked in the refusal itself (#5549)
+    fault = "\n".join(pending_refusals(g, templates, allow, pend + "postgres://u:Zk7secretXY@h/d | top | x\n"))
+    if "FAULT:" not in fault or any(n in fault for n in g.CRED_NEEDLES):
+        bad.append("a fault line printed a password, or was not refused")
     bad.extend(spelling_problems(g, templates, maintfs, allow, pend))
     bad.extend(g.print_funnel_problems((g.__file__, __file__)))
     for lbl in bad:

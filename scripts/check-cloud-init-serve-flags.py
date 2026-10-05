@@ -3887,6 +3887,10 @@ CRED_SPELLINGS = (
     ('F5', 'placeholder-plus-tail', 'PGPASSWORD=${PW}Zk7secretXY psql -h h -c x'),
     ('F5', 'command-substitution-literal', 'PGPASSWORD=$(echo Zk7secretXY) psql -h h -c x'),
     ('F5', 'changeme-plus-tail', 'PGPASSWORD=CHANGEMEZk7secretXY psql -h h -c x'),
+    ('F1', 'passphrase-key', 'SSL_PASSPHRASE=Zk7secretXY psql -h h -c x'),
+    ('F1', 'passphrase-colon', 'ssl_passphrase: Zk7secretXY'),
+    ('F1', 'json-quoted-key', 'echo \'{"password": "Zk7secretXY"}\' > /etc/x.json'),
+    ('F1', 'json-quoted-passphrase', 'echo \'{"passphrase":"Zk7secretXY"}\' > /etc/x.json'),
     ('F1', 'crlf-line-end', 'PGPASSWORD=Zk7secretXY\r psql -h h -c x'),
 )
 SPELL_ANCHOR = "      echo \"=== ai-memory postgres+AGE+pgvector provision $(date -u) ===\"\n"
@@ -3969,6 +3973,10 @@ def reader_problems() -> list:
         bad.append("F2 credential_values does not use the libpq reader")
     if "Zk7secretXY" not in credential_values("password=a Zk7secretXY")[3:]:
         bad.append("F1 the mixed run of a line tail is not read")
+    CRED_PIECES.clear()
+    for kept in ("PGPASSWORD=${PW} psql -h h", 'PGPASSWORD="${PW}" psql -h h', "password=${DB_PW}"):
+        if scrub(kept) != kept:
+            bad.append("F5 an exact brace placeholder was masked: %r became %r" % (kept, scrub(kept)))
     spelled = "PGPASSWORD=Zk7\\\nsecretXY psql -h h"
     try:
         CRED_PIECES.clear()
@@ -3992,6 +4000,8 @@ def spelling_problems(base: tuple) -> list:
                 bad.append("%s %s: %s printed a byte of the password" % (cls, label, path))
         if outs[0][1] != 1:
             bad.append("%s %s: the scan exited %r, not 1" % (cls, label, outs[0][1]))
+    if CRED_PIECES:
+        bad.append("the spelling run left credential pieces registered")
     return bad
 
 
