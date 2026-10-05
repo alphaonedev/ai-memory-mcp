@@ -1722,6 +1722,26 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
                     bad.append("run() passed when the base pending list could not be read (#5297)")
             finally:
                 aside.rename(loose)
+        # a missing TREE object: show fails and so does ls-tree, which must not read as "absent" (#5297).
+        # The change touches nothing under scripts/, so the diff of the two trees does not descend into it.
+        git("reset", "-q", "--hard", base2)
+        git("commit", "-q", "--allow-empty", "-m", "nothing under scripts")
+        tree = git("rev-parse", "%s:scripts" % base2).strip()
+        lost = t / ".git" / "objects" / tree[:2] / tree[2:]
+        if not lost.is_file():
+            bad.append("the missing-tree case could not find the loose tree object (#5297)")
+        else:
+            aside = t / ".git" / "missing-tree"
+            lost.rename(aside)
+            try:
+                rc, out = gate(EXEC_SECRET_ARGV_BASE=base2)
+                # the message names the merge base: the history scan (#5299) also faults on this repository,
+                # and only the message tells the two apart
+                if rc != 2 or "cannot resolve the merge base" not in out:
+                    bad.append("run() read a base whose tree object is missing as an absent list (%d): %s"
+                               % (rc, out.strip()[:160]))
+            finally:
+                aside.rename(lost)
         # a base without the list files is proven absent, not unreadable: green (#5297)
         git("rm", "-q", "--", ALLOW_FILE, PENDING_FILE)
         commit_all("lists absent")
