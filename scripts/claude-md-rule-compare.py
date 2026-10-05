@@ -758,6 +758,14 @@ def _self_test_cases() -> int:
         for out, xo, want in synth:
             if parse_plant(out, xo, ("-S", "-E")).ok != want:
                 return f"parse_plant gave the wrong ok for {out!r} with options {xo} (#5473)"
+        # #5561: every numeric field of the VERDICT row is 0 or 1. A 2 in field 2, 3, 4 or 5 must give the all-failed
+        # Plant, compared as a whole: fields 3 to 5 are not all part of `ok`, so comparing ok alone cannot see them.
+        failed_plant = Plant(False, False, False, False, -1, -1, -1, "?")
+        for row in ("VERDICT 0 2 1 1 0 -\nREAL\n", "VERDICT 0 0 2 1 0 -\nPLANTED\n", "VERDICT 0 0 1 2 0 -\nPLANTED\n",
+                    "VERDICT 0 0 1 1 2 -\nPLANTED\n", "VERDICT 0 1 2 1 0 -\nREAL\n", "VERDICT 0 1 1 2 0 -\nREAL\n",
+                    "VERDICT 0 1 1 1 2 -\nREAL\n", "VERDICT 2 1 1 1 0 -\nREAL\n", "VERDICT 0 1 1 1 10 -\nREAL\n"):
+            if parse_plant(row, [], ("-S", "-E")) != failed_plant:
+                return f"parse_plant accepted a VERDICT field outside 0 and 1: {row!r} (#5561)"
         # #5509: a child that exited non-zero is never ok, even when its output reads as a pass.
         if parse_plant("VERDICT 0 1 1 1 0 -\nREAL\n", [], ("-S", "-E"), 1).ok \
                 or parse_plant("VERDICT 0 0 1 1 0 -\nPLANTED\n", [], ("-S", "-E"), 1).ok:
