@@ -27,7 +27,7 @@ RULES ENFORCED (all closed-world: a trigger the reader cannot parse is a FAILURE
          ``*name`` items are undecidable and fail.  A push trigger with no
          ``branches`` and no ``tags`` key matches every branch and counts.
   R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730, #5731, #5733,
-         #5734, #5735) the whole file is
+         #5734, #5735, #5736) the whole file is
          read closed-world by the grammar below.  A file the reader cannot read
          is a failure whatever words it holds (#5731).
 
@@ -75,7 +75,8 @@ ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
               one plain or simply quoted scalar (#5730); ``types`` may also be
               one plain word.  A plain item is never a form YAML 1.1 may read as
               other than a string: empty, a null or boolean word in any case, a
-              number or date, ``<<`` or ``=`` (#5734).
+              number or date, ``<<`` or ``=`` (#5734).  A filter key with neither is
+              refused: its YAML value is null, not a list (#5736).
 
 The reader is the Python standard library only (no PyYAML) so it runs on any CI
 image.  The mutation legs at the bottom prove the reader is not vacuous: each
@@ -630,6 +631,8 @@ def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[s
                 items = [word]
             else:
                 items = _parse_inline_list(rest)
+        elif not items:
+            raise Unparsed(trigger + "." + key + ": filter key with no value (#5736)")
         filters[key] = items
         k = n
     return filters
@@ -1767,6 +1770,27 @@ class TriggerNames5735(unittest.TestCase):
     def test_5735_other_trigger_names_stay_clean(self) -> None:
         body = "on:\n  workflow_dispatch:\n  schedule:\n    - cron: '0 1 * * *'\n  nightly:\n" + GOOD_PR
         self.assertEqual([], violations("x.yml", body))
+
+
+class EmptyFilterValue5736(unittest.TestCase):
+    """#5736: a filter key with no value is refused; its YAML value is null.
+
+    Measured at 25af8bc7 (round-4 differential, seed 5665): every refusal case here
+    was accepted there with the key read as an empty list. PyYAML 6.0.1 reads each
+    such key as None.
+    """
+
+    def _shape(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5736_filter_key_with_no_value(self) -> None:
+        for body in ("  push:\n    branches:\n    tags: [v1]\n", "  push:\n    tags: [v1]\n    branches: # c\n",
+                     GOOD_PR + "    paths:\n"):
+            self._shape("on:\n" + body, "filter key with no value")
+
+    def test_5736_empty_lists_stay_clean(self) -> None:
+        self.assertEqual([], violations("x.yml", "on:\n" + GOOD_PR + "    paths: []\n"))
 
 
 class GlobSemantics5447(unittest.TestCase):
