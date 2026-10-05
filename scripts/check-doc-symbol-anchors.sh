@@ -1298,6 +1298,30 @@ PYEOF
         "See $R::RecallTool&amp; here."
     anchor_green 5607 "an escaped angle reference is decoded once, never twice" \
         "See $R::RecallTool&amp;lt;T&amp;gt; here."
+    # #5607: CommonMark keeps a backslash-escaped reference literal while HTML
+    # decodes it, so the two readings differ and the anchor is refused.
+    anchor_red 5607 UNDECIDABLE_REF "a backslash-escaped opener reference before an over-closed anchor" \
+        "See \&lt;$R::RecallTool<T>> here."
+    anchor_red_cites 5607 UNDECIDABLE_REF "a refused anchor with a space after its separator" \
+        "$R::\&lt;NoSuch" "See $R:: \&lt;NoSuch here."
+    # A decoded backtick is text, never a code-span delimiter, and a decoded
+    # line feed inside a group is whitespace, never the end of the anchor.
+    anchor_red 5607 BARE_QUAL "a backtick reference around an anchor" \
+        "See &#96;$R::NoSuch&#96; here."
+    anchor_red_cites 5607 BARE_QUAL "a line-feed reference inside a generic group" \
+        "$R::NoSuch" "See $R::RecallTool<T&#10;>::NoSuch here."
+    # An .html doc has the HTML reading only: a legacy closer with no
+    # semicolon is decoded and reported, never refused as undecidable.
+    write_clean
+    mkdir -p "$FIX/docs"
+    printf 'See %s::RecallTool<T>&gt::NoSuch here.\n' "$R" > "$FIX/docs/x.html"
+    html_out="$(run_fixture_out)"; html_rc="$(run_fixture)"
+    rm -f "$FIX/docs/x.html"
+    [[ "$html_rc" != "0" ]] || {
+        echo "FAIL: self-test #5607 — a legacy closer in an .html doc was ACCEPTED" >&2; exit 1; }
+    grep -Fq "[BARE_QUAL]: docs/x.html" <<<"$html_out" && ! grep -Fq "[UNDECIDABLE_REF]" <<<"$html_out" || {
+        echo "FAIL: self-test #5607 — a legacy closer in an .html doc was not read the HTML way" >&2; exit 1; }
+    echo "PASS: self-test #5607 — a legacy closer in an .html doc is REJECTED as BARE_QUAL"
 
 
     # #5608: a `<` written in a closed code span is atomic code, never a
