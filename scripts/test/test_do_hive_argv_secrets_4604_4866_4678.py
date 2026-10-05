@@ -1666,8 +1666,9 @@ def _normalised(stmt):
 
 
 def _names_root(name, stmt):
-    """#5763: True when `stmt` names root `name` other than to read it, as written or after quote removal."""
-    reads, mention = _root_reads(name), r"(?<!\w)%s(?!\w)" % name
+    """#5763: True when `stmt` names root `name` other than to read it, as written or after quote removal; #5898: an
+    option word that ends with the name (wait -pOUT_DIR, printf -vOUT_DIR) names it too."""
+    reads, mention = _root_reads(name), r"(?<!\w)(?:[-+][A-Za-z]*)?%s(?!\w)" % name
     return any(re.search(mention, re.sub(reads, "", s)) for s in (stmt, _normalised(stmt)))
 
 
@@ -3732,6 +3733,18 @@ ROOT_SPELLINGS = (
     ("#5895", "a quoted -n", 'declare -"n" r="$n"', "roots:nameref"),
     ("#5895", "a split +i and -n", 'declare "+"i -""n r="$n"', "roots:nameref"),
     ("#5895", "a computed option word", 'declare "$o" r="$n"', "roots:computed option"),
+    # #5898: a root name attached to its option letter.
+    ("#5898", "wait -pOUT_DIR (S4)", "sleep 0 & wait -pOUT_DIR", "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5898", "wait -npOUT_DIR", "sleep 0 & wait -npOUT_DIR", "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5898", "printf -vOUT_DIR", "printf -vOUT_DIR %s /dev", "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5898", "read -raOUT_DIR", "read -raOUT_DIR <<< /dev", "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5898", "mapfile -tOUT_DIR", "mapfile -tOUT_DIR <<< /dev", "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5898", "unset -vOUT_DIR", "unset -vOUT_DIR", "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5898", "export -nOUT_DIR", "export -nOUT_DIR", "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5898", "a quoted attached name", 'wait -p"OUT_DIR"', "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5898", "a split attached name", 'printf -vOUT_""DIR %s /dev', "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5898", "an option word that ends with the root name after an upper-case flag", "read -NOUT_DIR",
+     "OUT_DIR:named outside its one reviewed assignment"),
 )
 # Spellings that leave every root proven: a builtin name as a literal argument of another command.
 ROOT_SPELLINGS_CLEAN = (
@@ -3740,6 +3753,8 @@ ROOT_SPELLINGS_CLEAN = (
     ("#5896", "a glob in a case pattern", 'case "$1" in ev?l | [e]val) : ;; *) : ;; esac'),
     ("#5895", "declare +i with no nameref", 'declare +i -a list=()'),
     ("#5895", "a name n after --", 'local -- n=1'),
+    ("#5898", "a root read attached to an option", 'ls -d"$OUT_DIR" -x'),
+    ("#5898", "a longer name that starts with the root name", 'wait -pOUT_DIRX'),
 )
 
 
