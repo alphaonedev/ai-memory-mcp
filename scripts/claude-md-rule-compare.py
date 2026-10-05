@@ -334,8 +334,10 @@ def non_isolated_child(script: Path, flags: list, scratch: Path):
 
 def imported_modules(path: Path) -> list:
     """#5379: the top-level names of every module `path` imports (parsed, never executed), except the built-in
-    `sys`. The self-test plants one file per name beside its non-isolated child, so an import of ANY module
-    placed before the module-top refusal runs a planted file instead of going unnoticed."""
+    `sys`. The self-test plants one file per name beside its non-isolated child, so an import of any module
+    not already loaded at interpreter start (os, stat and importlib are, so a planted file of those names never
+    runs) placed before the module-top refusal runs a planted file instead of going unnoticed. Dynamic imports
+    (importlib.import_module, __import__) are not found by this AST scan (#5405); the script has none."""
     names = set()
     for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Import):
