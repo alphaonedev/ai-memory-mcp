@@ -81,10 +81,18 @@
 #     is not read.
 #   * assert!: read only when the first argument has exactly one `==` outside
 #     every bracket, no `&&` and no `|` outside every bracket, and the left
-#     operand ends in `.len()` or `.count()`. Any other first argument that holds
-#     a `.len()`/`.count()` call followed by `==` (through spaces, `)` and
-#     `as <type>` casts) is AMBIGUOUS: a comparison inside a closure only, behind
-#     `&&` or `||`, negated, parenthesised or cast. It is never guessed: it is
+#     operand ends in `.len()` or `.count()`.
+#   * AMBIGUOUS assert! (#5797, #5798): any other first argument in which the
+#     LEFT OPERAND of some `==`, at any bracket depth, holds a count call
+#     (`.len()` or `.count()`, spaces allowed inside the call). That operand
+#     runs back from the `==` to the nearest `&&`, `||`, `==`, `!=`, `=>`, `,`
+#     or `;` at the same depth, or to the bracket that opens that depth, so
+#     nothing between the call and the `==` hides it: a cast to any type, braces,
+#     a block comment, a method chain such as `.into()`, a line break or
+#     arithmetic. Every shape the reader does not bind is decided by this rule
+#     alone: a comparison inside a closure only, behind `&&` or `||`, negated,
+#     parenthesised or chained with a second `==` is ambiguous exactly when such
+#     a left operand holds the count call. It is never guessed: it is
 #     tracked under its whole spelling with the value `?count#ambiguous`, which
 #     is never exempt (so adding, removing or rewording it is a count change),
 #     and every const name in it is tracked as `<spelling> [NAME]` with the
@@ -167,9 +175,10 @@ def int_value(tok):
 # cut out with balanced brackets, so a right-hand side of ANY shape is seen (a typed literal, an expression, a path).
 HEAD = re.compile(r'assert(?P<eq>_eq)?!\s*\(')
 TAIL = re.compile(r'^(?P<expr>\S.*)\.(?P<m>len|count)\(\)$', re.S)     # a WHOLE operand that ends in .len() or .count()
-# a count comparison anywhere in an argument: a .len()/.count() call followed by `==` through spaces, closing
-# parentheses and `as <type>` casts only
-CMP = re.compile(r'\.(?:len|count)\(\)(?:\s|\)|\bas\s+[A-Za-z0-9_]+)*==')
+# a count call: `.len()` or `.count()`, spaces allowed around the name and inside the parentheses
+COUNT_CALL = re.compile(r'\.\s*(?:len|count)\s*\(\s*\)')
+# what ends the left operand of a `==` at its own bracket depth (scanning back from the `==`)
+OPERAND_STOPS = ('&&', '||', '==', '!=', '=>')
 CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]*)\s*:\s*(?:usize|u\d+|i\d+)\s*=\s*(?P<val>[^;]+?)\s*;')
 
 
@@ -225,16 +234,36 @@ def top_ops(arg):
 AMBIG = '?count#ambiguous'
 
 
+def compares_count(arg):
+    """True when the LEFT OPERAND of some `==` of `arg`, at ANY bracket depth, holds a count call (#5797, #5798).
+    The left operand runs back from the `==` to the nearest `&&`, `||`, `==`, `!=`, `=>`, `,` or `;` at the same
+    depth, or to the bracket that opens that depth; whatever else sits between the call and the `==` (a cast to any
+    type, braces, a block comment, a method chain, a line break, arithmetic) keeps the call in the operand."""
+    starts, j, n = [0], 0, len(arg)                       # starts[-1]: where the current operand begins at this depth
+    while j < n:
+        ch, two = arg[j], arg[j:j + 2]
+        if ch in '([{': starts.append(j + 1)
+        elif ch in ')]}':
+            if len(starts) > 1: starts.pop()
+        elif two == '==':
+            if COUNT_CALL.search(arg, starts[-1], j): return True
+            starts[-1] = j + 2; j += 2; continue
+        elif two in OPERAND_STOPS: starts[-1] = j + 2; j += 2; continue
+        elif ch in ',;': starts[-1] = j + 1
+        j += 1
+    return False
+
+
 def read_cond(arg):
     """assert!'s first argument -> (expr, method, rhs) when the WHOLE argument is `<expr>.len()|.count() == <rhs>`: one
     `==` at depth 0, no depth-0 `&&` or `|`, and the left operand ends in the count call (#5710, #5759). Any other
-    argument in which CMP finds a count call followed by `==` (inside a closure only, behind `&&`/`||`, negated,
-    parenthesised, cast, more than one depth-0 `==`) -> AMBIG, never a guess; otherwise -> None."""
+    argument in which the left operand of some `==`, at any bracket depth, holds a count call (compares_count) ->
+    AMBIG, never a guess (#5797, #5798); otherwise -> None."""
     eqs, logic = top_ops(arg)
     if len(eqs) == 1 and not logic:
         m = TAIL.match(arg[:eqs[0]].strip())
         if m: return m.group('expr'), m.group('m'), arg[eqs[0] + 2:].strip()
-    return AMBIG if CMP.search(arg) else None
+    return AMBIG if compares_count(arg) else None
 
 
 # A const-shaped name (NAME, a::NAME, <T as Tr>::NAME) anywhere in an ambiguous assert!'s first argument; a name right
@@ -902,6 +931,26 @@ def selftest():
         case('an assert!(%s) is ambiguous and its literal bump is flagged' % (a_ % 'N'),
              scoped('tests/scope.rs', 'fn t() { assert!(%s); }\n' % (a_ % 18), 'fn t() { assert!(%s); }\n' % (a_ % 19)), True,
              [(k_ % 18) + '  ?count#ambiguous -> (none)', (k_ % 19) + '  (none) -> ?count#ambiguous'])
+    def amb_leg(label, a_):                               # assert!(a_ % 18) -> assert!(a_ % 19), undeclared: both spellings flagged
+        k_ = re.sub(r'\s+', '', a_)
+        case('%s: assert!(%s) is ambiguous and its literal bump is flagged' % (label, a_ % 'N'),
+             scoped('tests/scope.rs', 'fn t() { assert!(%s); }\n' % (a_ % 18), 'fn t() { assert!(%s); }\n' % (a_ % 19)), True,
+             [(k_ % 18) + '  ?count#ambiguous -> (none)', (k_ % 19) + '  (none) -> ?count#ambiguous'])
+    # #5797 (round-6 F1): a cast to ANY type between the count call and == leaves the call in the left operand
+    for l_, a_ in (('M1 path cast behind &&', 'ok && v.len() as core::primitive::usize == %s'),
+                   ('M7 generic cast behind &&', 'ok && v.len() as Wrapping<usize> == %s'),
+                   ('path cast', 'v.len() as core::primitive::usize == %s'), ('reference cast', 'v.len() as &usize == %s'),
+                   ('pointer cast', 'v.len() as *const usize == %s'), ('nested generic cast', 'v.len() as Option<Vec<usize>> == %s'),
+                   ('double cast', 'v.len() as usize as u64 == %s'), ('negated path cast', '!(v.len() as core::primitive::usize == %s)'),
+                   ('closure-only path cast', 'v.iter().any(|x| x.len() as core::primitive::usize == %s)'),
+                   ('closure without parameters, path cast', '(|| v.len() as a::T == %s)()'),
+                   ('a second count behind &&, path cast', 'v.len() > 0 && v.len() as a::T == %s')):
+        amb_leg(l_, a_)
+    case('a count call behind && in a closure, with == on another operand, is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(v.iter().all(|x| x.len() > 0 && x[0] == 18)); }\n',
+                'fn t() { assert!(v.iter().all(|x| x.len() > 0 && x[0] == 19)); }\n'), False)
+    case('a count call compared with >, with == on another operand behind &&, is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(v.len() > 0 && n == 18); }\n', 'fn t() { assert!(v.len() > 0 && n == 19); }\n'), False)
     case('an assert! with a closure count comparison that is not == is not read',
          scoped('tests/scope.rs', 'fn t() { assert!(v.iter().all(|x| x.len() > 2)); }\n', 'fn t() { assert!(v.iter().all(|x| x.len() > 3)); }\n'), False)
     # #5761 (S2): which comparison an assert! binds to is pinned: only ONE == outside every bracket ((), [] and {}) binds
