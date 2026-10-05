@@ -243,7 +243,7 @@ lab_probe_refusal_names_knob() {
 # value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 13
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), seven probe-matcher legs (lab_probe_refusal_names_knob against
-# generated logs), one structural leg (the matcher has no here-string, here-document or pipe)
+# generated logs), one structural leg (the matcher has no here-string, here-document, pipe or temp file)
 # and one layout leg (this comment sits directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
@@ -313,11 +313,13 @@ lab_posture_selftest() {
   ( set -o pipefail; lab_probe_refusal_names_knob "$plog/big.log" ) \
     && echo "  PASS probe matcher: detection in a large log survives pipefail" \
     || { echo "  FAIL probe matcher: detection in a large log lost"; bad=1; }
-  # #5197, #5259: the matcher must not feed the log through a here-string or a here-document (bash
-  # spills a large one to a temp file under $TMPDIR, /tmp when unset) or a pipe (SIGPIPE under pipefail).
-  case "$(declare -f lab_probe_refusal_names_knob)" in
-    *'<<'*|*' | '*) echo "  FAIL probe matcher: reads the log through a here-string, a here-document or a pipe"; bad=1 ;;
-    *) echo "  PASS probe matcher: reads the log without a here-string, a here-document or a pipe" ;;
+  # #5197, #5259, #5519: the matcher must not feed the log through a here-string or a here-document (bash
+  # spills a large one to a temp file under $TMPDIR, /tmp when unset), a pipe (SIGPIPE under pipefail) or a
+  # temp file it makes itself (mktemp, $TMPDIR, /tmp or any output redirect). Its one allowed redirect is 2>/dev/null.
+  local body; body="$(declare -f lab_probe_refusal_names_knob)"; body="${body//2> \/dev\/null/}"; body="${body//2>\/dev\/null/}"
+  case "$body" in
+    *'<<'*|*' | '*|*mktemp*|*TMPDIR*|*/tmp*|*'>'*) echo "  FAIL probe matcher: reads the log through a here-string, a here-document, a pipe or a temp file"; bad=1 ;;
+    *) echo "  PASS probe matcher: reads the log without a here-string, a here-document, a pipe or a temp file" ;;
   esac
   rm -rf "$plog"
   # #5198: the doc comment sits on the function it describes (a helper between them is drift).
