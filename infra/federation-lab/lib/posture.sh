@@ -233,8 +233,14 @@ lab_posture_ssot_check() {
 # under pipefail) and no here-string or here-document (bash spills a large one to a temp file
 # under $TMPDIR, /tmp when unset; #5197, #5259). Lines naming INFO are the profile's pin line, never a refusal.
 # The trailing colon pins the whole knob name. An unreadable file is "not detected".
+# Trust root (#5586): PATH. The matcher runs only when awk resolves to an external file at call time
+# (a shell function, an enabled builtin, or an alias with expand_aliases on, named awk, is refused with
+# rc 2, never run), and it runs that file as `command awk`. [[ ]] is a shell keyword, so a function named
+# [ cannot fake the guard; `builtin` and `type` are checked by the self-test, not here. An awk file that
+# an earlier PATH entry or a hash -p entry supplies IS an external file and is not detected here.
 lab_probe_refusal_names_knob() {
-  awk 'index($0, "INFO") == 0 && index($0, "refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:") { f = 1 }
+  [[ $(builtin type -t awk) == file ]] || return 2
+  command awk 'index($0, "INFO") == 0 && index($0, "refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:") { f = 1 }
        END { exit (f ? 0 : 1) }' "$1" 2>/dev/null
 }
 
@@ -244,7 +250,7 @@ lab_probe_refusal_names_knob() {
 # Changing the matcher means changing this text in the same commit.
 lab_probe_expected_body() {
   local q="'"
-  printf '%s' "lab_probe_refusal_names_knob () { awk ${q}index(\$0, \"INFO\") == 0 && index(\$0, \"refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:\") { f = 1 } END { exit (f ? 0 : 1) }${q} \"\$1\" 2> /dev/null }"
+  printf '%s' "lab_probe_refusal_names_knob () { [[ \$(builtin type -t awk) == file ]] || return 2; command awk ${q}index(\$0, \"INFO\") == 0 && index(\$0, \"refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:\") { f = 1 } END { exit (f ? 0 : 1) }${q} \"\$1\" 2> /dev/null }"
 }
 
 # lab_probe_body_allowed <declare -f text> — true only when the text, whitespace-normalized, equals the expected body.
@@ -255,14 +261,18 @@ lab_probe_body_allowed() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 42 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 37
+# 56 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 51
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), seven probe-matcher legs (lab_probe_refusal_names_knob against
-# generated logs), one structural leg (the matcher body equals the one allowed awk statement, #5539), a globbing-and-IFS leg, a mutant-builder control, twenty-two
-# closed-world legs (a mutated matcher body of each spelling must be refused: spill by cp, dd, install, sort -o or
-# tee, a stderr redirect to a near name, process substitution, here-string, here-document, pipe, coproc, command
-# substitution, extra statement, function call, eval, exec redirect, a changed awk program, ...) and one layout
+# generated logs), one structural leg (the matcher body equals the one allowed statement, #5539), a
+# globbing-and-IFS leg, a mutant-builder control, twenty-six closed-world legs (a mutated body of
+# each spelling must be refused: twenty-two spill spellings (cp, dd, install, sort -o or tee, a stderr
+# redirect to a near name, process substitution, here-string, here-document, pipe, coproc, command
+# substitution, extra statement, function call, eval, exec redirect, a changed awk program, ...), four
+# guard spellings (guard dropped, plain awk, guard returning 0, guard weakened, #5586)), ten shadow legs (#5586: an awk-resolves-to-file
+# control, an awk function, an awk alias, a shell function named cat, mktemp, grep, sed, tr or printf that
+# the matcher must never call, and no function named builtin, type or command), and one layout
 # leg (this comment sits directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
@@ -382,7 +392,41 @@ lab_posture_selftest() {
   _refuse "duplicates stderr instead of discarding it" "${head}${core%"$tail"}"' "$1" 2>&1 > /dev/null }' || bad=1
   _refuse "has awk write a file from its own program" "${head}${core/\{ f = 1 \}/\{ f = 1; print \$0 > \"/dev/shm/lab-probe\" \}}"' }' || bad=1
   _refuse "changes the awk program (the INFO skip anchored)" "${head}${core/index(\$0, \"INFO\") == 0/\$0 !~ /^INFO/} }" || bad=1
+  _refuse "drops the external-awk guard" "${head}${core#*return 2; }"' }' || bad=1
+  _refuse "calls awk by bare name instead of command awk" "${head}${core/command awk/awk} }" || bad=1
+  _refuse "makes the guard return 0 for a shadowed awk" "${head}${core/return 2/return 0} }" || bad=1
+  _refuse "weakens the guard to refuse only a function" "${head}${core/== file/!= function} }" || bad=1
   unset -f _refuse
+  # #5586: the matcher must refuse a shadowed awk and must call no other external command.
+  local canary="$plog/canary"
+  if [[ $(builtin type -t awk) == file ]]; then
+    echo "  PASS probe matcher: control - awk resolves to an external file here, so each shadow leg starts from the accepted state"
+  else echo "  FAIL probe matcher: control - awk does not resolve to an external file here"; bad=1; fi
+  ( rm -f "$canary"; awk() { : > "$canary"; command awk "$@"; }
+    lab_probe_refusal_names_knob "$plog/ok.log"; rc=$?
+    [ "$rc" -eq 2 ] && [ ! -e "$canary" ] ) \
+    && echo "  PASS probe matcher: an awk shell function is refused (rc 2) and never called" \
+    || { echo "  FAIL probe matcher: an awk shell function was run or accepted"; bad=1; }
+  ( rm -f "$canary"; shopt -s expand_aliases; alias awk="${plog}/canary-awk"
+    lab_probe_refusal_names_knob "$plog/ok.log"; rc=$?
+    [ "$rc" -eq 2 ] && [ ! -e "$canary" ] ) \
+    && echo "  PASS probe matcher: an awk alias (expand_aliases on) is refused (rc 2) and never run" \
+    || { echo "  FAIL probe matcher: an awk alias was run or accepted"; bad=1; }
+  # An enable -f builtin named awk needs a loadable module and is not expressible here; type -t reports it as builtin,
+  # which is not file, so the same guard refuses it. That is a statement about the guard, not a leg.
+  local nb
+  for nb in cat mktemp grep sed tr printf; do
+    ( rm -f "$canary"
+      eval "$nb() { : > \"\$canary\"; command $nb \"\$@\"; }"
+      lab_probe_refusal_names_knob "$plog/ok.log"; r1=$?
+      lab_probe_refusal_names_knob "$plog/info-only.log"; r2=$?
+      [ "$r1" -eq 0 ] && [ "$r2" -eq 1 ] && [ ! -e "$canary" ] ) \
+      && echo "  PASS probe matcher: a shell function named $nb is never called by the matcher, the verdicts are unchanged" \
+      || { echo "  FAIL probe matcher: the matcher called a shell function named $nb or changed its verdict"; bad=1; }
+  done
+  if [[ -z $(declare -F builtin type command) ]]; then
+    echo "  PASS probe matcher: no shell function shadows builtin, type or command at matcher time"
+  else echo "  FAIL probe matcher: a shell function shadows builtin, type or command"; bad=1; fi
   rm -rf "$plog"
   # #5198: the doc comment sits on the function it describes (a helper between them is drift).
   if [ "$(grep -B1 '^lab_posture_selftest() {' "${BASH_SOURCE[0]}" | head -n 1)" = "# Prints one line per leg; returns 0 only if every leg behaved." ]; then
