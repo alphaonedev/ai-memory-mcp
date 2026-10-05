@@ -191,10 +191,11 @@ ENV_ARGV_RE = re.compile(
 # combined short flags (-qv, -Xqv), getopt_long abbreviations (--se, --va..),
 # psql reached through a variable ($PSQL, ${PSQL_BIN}) and a backslash-newline
 # continuation. Every option after the psql word is checked, not the first.
-PSQL_HEAD_RE = re.compile(r"(?:^|[\s;|&(`/\"'${])psql[A-Za-z0-9_]*\b", re.IGNORECASE | re.MULTILINE)
+# #5448: _ and - also precede psql (run_psql, my-psql: a wrapper still runs psql).
+PSQL_HEAD_RE = re.compile(r"(?:^|[\s;|&(`/\"'${_-])psql[A-Za-z0-9_]*\b", re.IGNORECASE | re.MULTILINE)
 PSQL_VAR_OPT_RE = re.compile(
     r"\s(?:-[A-Za-z]*v\s*|--(?:set?|va[a-z]*)(?:=|\s+))"
-    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<pw2>[^\s]+)",
+    r"(?P<operand>[^\s]+)",
     re.IGNORECASE,
 )
 # #5399 (PR 4810 round-4 security re-review): the shell removes quotes and
@@ -204,6 +205,11 @@ PSQL_VAR_OPT_RE = re.compile(
 # (pw2, pwnew, admin_pw1 are secrets), and neither the locator exemption (pw_id)
 # nor a redaction-token suffix (${PW}xxxx) clears a value: a variable whose name
 # says it is a credential is flagged whatever its value looks like.
+# #5448 (round-5 review F1): psql accepts digits anywhere and any high-bit byte in a
+# variable name, so the name is everything before the first = (not an ASCII
+# identifier) and a -v operand a text gate cannot decide (a shell expansion or
+# substitution in the name part, or an operand that is only an expansion) is
+# flagged, never skipped.
 # STATED LIMIT: options that reach psql through an array or another variable
 # (args=(-v pw=$X); psql "${args[@]}") are not after the psql word and a text gate
 # cannot follow them; that form is tracked by its own open issue, #5398.
@@ -604,6 +610,16 @@ def scan_xtrace(rel: str, text: str) -> List[Hit]:
     return hits
 
 
+def psql_var_operand_flagged(operand: str) -> bool:
+    """A psql -v operand is flagged when its name is secret-like or undecidable (#5448)."""
+    name = operand.split("=", 1)[0]
+    if PSQL_SECRET_VAR_NAME_RE.search(name):
+        return True
+    if any(ch in name for ch in "$`(){}"):
+        return True
+    return False
+
+
 def text_rule_hits(rel: str, text: str) -> List[Hit]:
     """The #4600-line text rules: expansion, psql -c password, docker -e / psql
     -v runtime-expanded password, readable cloud-init secret, traced secret."""
@@ -628,7 +644,7 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
         eol = joined.find("\n", head.end())
         segment = joined[head.end():eol if eol >= 0 else len(joined)]
         shell_view = segment.replace("\\", "").replace('"', "").replace("'", "")
-        if any(PSQL_SECRET_VAR_NAME_RE.search(m.group("name"))
+        if any(psql_var_operand_flagged(m.group("operand"))
                for m in PSQL_VAR_OPT_RE.finditer(shell_view)):
             line, snippet = _line_of(text, head.start())
             hits.append((rel, line, "[env-password-argv] " + snippet))
@@ -969,6 +985,18 @@ RED_PROBES_4600 = {
     "5399-11-redaction-suffixed-value": "psql -v pw=${PG_PW}xxxx -f x.sql",
     "5399-12-auth-name": 'psql -v auth="$DB_SECRET_VALUE" -f x.sql',
     "5399-13-leading-underscore-name": 'psql -v _pw="$PG_PW" -f x.sql',
+    # #5448 (PR 4810 round-5 cloud review F1): names psql accepts that the old
+    # ASCII-identifier name group could not match, and -v forms undecidable by text.
+    "5448-01-leading-digit-name": 'psql -v 1pw="$PG_PW" -f x.sql',
+    "5448-02-non-ascii-tail": 'psql -v pw\u00e9="$PG_PW" -f x.sql',
+    "5448-03-non-ascii-head": 'psql -v \u00e9pw="$PG_PW" -f x.sql',
+    "5448-04-ansi-c-quoted-name": "psql -v $'pw'=\"$PG_PW\" -f x.sql",
+    "5448-05-expansion-in-name": 'psql -v p${E}w="$PG_PW" -f x.sql',
+    "5448-06-wrapper-function-head": 'run_psql -v pw="$PG_PW" -f x.sql',
+    "5448-07-name-from-variable": 'psql -v "$VARSPEC" -f x.sql',
+    "5448-08-name-from-substitution": 'psql -v "$(printf pw)=$PG_PW" -f x.sql',
+    "5448-09-long-option-leading-digit": 'psql --set 1pw="$PG_PW" -f x.sql',
+    "5448-10-wrapper-hyphen-head": 'my-psql -v pw="$PG_PW" -f x.sql',
     # #4808: the forms the #4782 gate missed.
     "4808-docker-e-dsn-literal": "docker run -e DATABASE_URL=postgres://u:hunter2@h/d img",
     "4808-psql-set-equals-pw": 'psql --set=pw="$PG_PW" -f bootstrap.sql',
@@ -1023,6 +1051,9 @@ GREEN_PROBES_4600 = {
     "docker-env-file": "docker run -d --env-file /run/s/su.env img",
     "psql-v-no-secret": "psql -v ON_ERROR_STOP=1 -f -",
     "4859-psql-v-non-secret-name": "psql -v ON_ERROR_STOP=1 -v role=aimemory -f x.sql",
+    "5448-psql-v-digit-non-secret-name": "psql -v 1x=1 -f x.sql",
+    "5448-psql-v-bare-name": "psql -v ON_ERROR_STOP -f x.sql",
+    "5448-psql-v-substituted-value-only": 'psql -v role="$ROLE_NAME" -f x.sql',
     "4808-docker-e-dsn-inherit": "docker run -e DATABASE_URL img",
     "4808-docker-e-dsn-no-password": "docker run -e DATABASE_URL=postgres://u@h/d img",
     "4808-psql-set-no-secret": "psql --set=ON_ERROR_STOP=1 -f bootstrap.sql",
