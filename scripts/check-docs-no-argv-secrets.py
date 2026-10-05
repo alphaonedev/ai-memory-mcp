@@ -996,20 +996,20 @@ def psql_word_possible(text: str, pieces: List[WordPiece]) -> bool:
     return False
 
 
-def psql_head_view(text: str) -> Tuple[str, List[int]]:
+def psql_head_view(text: str, strict: bool = True) -> Tuple[str, List[int]]:
     """The text with every shell-spelled psql word rewritten to the plain word, same
     length (removed characters become spaces), so every offset and line stays valid for
     the psql rules; and the offsets of psql-looking words the gate cannot decide.
-    Words are resolved with scan_words, replacing the single-spelling regex of #5482."""
+    Words are resolved with scan_words, replacing the single-spelling regex of #5482.
+    strict is False for a prose or source file (not a shell script), where a word that
+    opens with a glob (**sqlite**, *SQL_NAME) is emphasis or a dereference, not a command."""
     chars = list(text)
     undecidable: List[int] = []
     for start, end, pieces in scan_words(text):
         literal = word_literal(pieces)
         if literal is None:
-            # A word that opens with a glob (*psql*, *l, ?x) is prose emphasis or a file
-            # glob, not a spelling of the command word; every other hole is refused.
             opens_glob = pieces[0][0] == "h" and text[start] in "*?["
-            if not opens_glob and psql_word_possible(text, pieces):
+            if (strict or not opens_glob) and psql_word_possible(text, pieces):
                 undecidable.append(start)
             continue
         if (literal != text[start:end] and len(literal) <= end - start and not re.search(r"\s", literal)
@@ -1179,7 +1179,7 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
     for m in EXPANSION_RE.finditer(text):
         line, snippet = _line_of(text, m.start())
         hits.append((rel, line, "[store-url-expansion] " + snippet))
-    norm, undecidable_words = psql_head_view(text)
+    norm, undecidable_words = psql_head_view(text, Path(rel).suffix.lower() in SHELL_SUFFIXES)
     for pos in undecidable_words:
         line, snippet = _line_of(text, pos)
         hits.append((rel, line, "[psql-undecidable-word] " + snippet))
@@ -1405,6 +1405,10 @@ GREEN_SHELL_PROBES = {
     "4689 Environment= without a credential": "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url",
 }
 RED_SHELL_PROBES.update({
+    # #5512: in a script a leading glob can still expand to the psql word.
+    "5512 leading star glob head": "*sql -f x.sql",
+    "5512 leading bracket glob head": '[p]sql -v pw="$PG_PW" -f x.sql',
+    "5512 leading question glob head": "?sql -f x.sql",
     # round 3, security reviewer A-series (#4792): wrapper and abbreviated-name forms
     "r3-S docker run --env NAME=val": "docker run --env POSTGRES_PASSWORD=%s img" % PW,
     "r3-S psql with a URL password": "psql \"postgres://u:%s@h/db\" -c 'select 1'" % PW,
@@ -1479,6 +1483,10 @@ GREEN_SHELL_PROBES.update({
     "r4 kubectl --env locator name": "kubectl run t --image=i --env=AI_MEMORY_KEY_FILE=/k",
 })
 GREEN_PROBES = {
+    "5512 prose question-mark glob word": "what ?sql means here\n",
+    "5512 prose bold sqlite": "the **sqlite** and **SQL NULL** cells\n",
+    "5512 prose key-loss emphasis": "| G13 rotation lineage | **SHIPPED** | key-**loss** recovery OPEN |\n",
+    "5512 rust deref of an SQL constant": "format!(\"{} FOR UPDATE\", *SQL_SELECT_ROW_BY_ID);\n",
     "file-form": "AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory serve",
     "no-password": "ai-memory serve %s postgres://u@h/d" % SU,
     "no-userinfo": "ai-memory serve %s postgres://h:5432/d" % SU,
@@ -1606,6 +1614,8 @@ RED_PROBES_4600 = {
     "5514-03-backtick-after-prefix": 'psql -v x=a`cat /run/pgpassword` -f x.sql',
     "5514-04-backtick-set-long": 'psql --set=x=`cat /run/pg_pw` -f x.sql',
     "5514-05-backtick-in-quotes": 'psql -v "x=`cat /run/pg_pw`" -f x.sql',
+    "5514-06-backtick-then-dollar-value": 'psql -v x=`cat /run/pg_pw`$ROWS -f x.sql',
+    "5514-07-dollar-then-backtick-value": 'psql -v x=$PG_PW`date` -f x.sql',
     "5513-01-ansi-c-dash-v": "psql $'-v' pw=\"$PG_PW\"",
     "5513-02-ansi-c-hex-dash-v": "psql $'\\x2dv' pw=\"$PG_PW\"",
     "5513-03-ansi-c-octal-dash-v": "psql $'\\055v' pw=\"$PG_PW\"",
@@ -1616,6 +1626,8 @@ RED_PROBES_4600 = {
     "5513-08-set-prefix-expansion": 'psql --s$x pw="$PG_PW"',
     "5513-09-variable-prefix-expansion": 'psql --var$x pw="$PG_PW"',
     "5513-10-ansi-c-cluster": "psql $'-Xv' pw=\"$PG_PW\"",
+    "5512-24-negated-class-head": 'p[^x]ql -f x.sql',
+    "5512-25-octal-wraps-to-low-byte": "$'\\560sql' -v pw=\"$PG_PW\" -f x.sql",
     "5512-20-path-then-ansi-c-head": "/usr/bin/ps$'q'l -v pw=\"$PG_PW\" -f x.sql",
     # #5483 (PR 4810 round-6 F3): a neutral variable name does not hide a value that expands
     # a secret-named variable, and a non-ASCII name can spell a secret with a look-alike letter.
@@ -1694,6 +1706,8 @@ GREEN_PROBES_4600 = {
     "5513-long-host-expansion": 'psql --host="$HOST" --port=5432 -f x.sql',
     "5513-ansi-c-neutral-option": "psql $'-X' -v role=aimemory -f x.sql",
     "5513-user-flag-expansion": 'psql -U"$USER_NAME" -f x.sql',
+    "5512-multiline-prose-backticks": "// the `chunks(0)` panics here a\n// `LIMIT 0` scan would return\n",
+    "5512-prose-backtick-across-lines": "see `foo\nbar`sql here\n",
     "5512-ansi-c-word-not-psql": "ps$'x'l -c \"ALTER USER a PASSWORD 'hunter2x'\"",
     "5512-hole-word-cannot-be-psql": 'ls$(date)x.txt -f x.sql',
     "5512-glob-word-cannot-be-psql": 'rm ps*.txt',
@@ -1848,6 +1862,9 @@ PSQL_SEGMENT_PROBES = (
     ("5516-16-or-list", 'psql -X || foo -v pw="$PG_PW"', [], ""),
     ("5516-17-quoted-variable-head-keeps-segment", '"$PSQL" -v pw="$PG_PW" -f x.sql', [1], "-v pw="),
     ("5516-18-quoted-head-word-keeps-segment", '"psql" -v pw="$PG_PW" -f x.sql', [1], "-v pw="),
+    ("5516-19-last-char-before-newline-kept", 'psql -v x=$PW\necho a\n', [1], "-v x="),
+    ("5516-20-head-in-subshell-keeps-nested-separator", '(psql -X $(true; echo) -v pw="$PG_PW")', [1], "-v pw="),
+    ("5516-21-snippet-redacts-the-literal", "psql -v pw=postgres://u:hunter2x@h/d -f x.sql", [1], "-v pw="),
 )
 
 
@@ -1931,7 +1948,7 @@ def self_test() -> int:
     for name, text, want_lines, must_show in PSQL_SEGMENT_PROBES:
         red += 1
         got = [h for h in scan_text("probe.md", text) if h[2].startswith("[env-password-argv]")]
-        if [h[1] for h in got] != want_lines or any(must_show not in h[2] for h in got):
+        if [h[1] for h in got] != want_lines or any(must_show not in h[2] or "\\" in h[2] or "hunter2x" in h[2] for h in got):
             print("SELF-TEST FAIL: psql segment probe %r gave %r (want lines %r showing %r)"
                   % (name, got, want_lines, must_show), file=sys.stderr)
             bad += 1
