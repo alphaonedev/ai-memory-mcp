@@ -2358,6 +2358,20 @@ def _history_cases(t: Path) -> Tuple[List[str], int]:
             bad.append("the removal of an allow row was read as a removed pending row (#5299)")
     except RuntimeError as exc:
         bad.append("the history scan faulted on an allow row with an issue reason: %s" % exc)
+    # a deleted allow list: its header pair ends in /dev/null, which must not become a path whose rows are
+    # collected (#5504, mutant M15: taking the path from any header line)
+    repo = fresh("allow-deleted")
+    put(repo, ALLOW_FILE, "#123 | a.sh | 1 | export ALLOW_ONLY\n")
+    commit(repo, "an allow row with an issue reason")
+    (repo / ALLOW_FILE).unlink()
+    commit(repo, "delete the allow list")
+    judge_repo("a deleted allow list", repo, False)
+    n += 1
+    try:
+        if "export ALLOW_ONLY" in removed_pending_rows(repo):
+            bad.append("the deletion of the allow list was read as removed pending rows (#5504)")
+    except RuntimeError as exc:
+        bad.append("the history scan faulted on a deleted allow list: %s" % exc)
     # a replace ref that hides the removing commit from every default git view (#5463)
     repo = fresh("replace")
     drop(repo)
