@@ -34,23 +34,38 @@ as a bare name relative to an already-open parent fd, with `O_NOFOLLOW`, and
 every flag clear happens on that descriptor.
 
 Widening a mode is the one mutation the walk performs on an entry it has not
-proven anything about yet, so it is bound to an INODE and never to a name (see
-`Widener`, #5813). On Linux the entry is pinned with `O_PATH|O_NOFOLLOW` - which
-succeeds whatever the mode is - and the pinned inode is compared with the
-scanned one BEFORE anything changes, so an entry swapped underneath the walk is
-refused with nothing mutated at all; the chmod then addresses that descriptor
-through `/proc/self/fd`, so it can neither follow a symlink nor land on a name
-that has since been replaced. Where there is no `O_PATH` (macOS) the chmod is
-`fchmodat` with `AT_SYMLINK_NOFOLLOW` relative to the already-open parent
-descriptor: it cannot traverse a symlink either, and cannot leave the directory
-the walk is standing in. A platform with neither mechanism gets no widen at all.
+proven anything about yet (see `Widener`, #5813), so it is made as narrow as the
+platform allows. What that buys differs by platform, and the difference matters:
+
+* Linux (`O_PATH`). The entry is pinned with `O_PATH|O_NOFOLLOW` - which
+  succeeds whatever the mode is - and the pinned inode is compared with the
+  scanned one BEFORE anything changes, so an entry swapped underneath the walk
+  is refused with nothing mutated at all. The chmod then addresses that
+  descriptor through `/proc/self/fd`: it is bound to the INODE that was scanned,
+  and can neither follow a symlink nor land on a name that has since been
+  replaced.
+* macOS/BSD (no `O_PATH`). The chmod is `fchmodat` with `AT_SYMLINK_NOFOLLOW`
+  relative to the already-open parent descriptor. Nothing is pinned and no
+  identity check is taken, so this is strictly weaker: the lookup cannot be
+  redirected by an ancestor component, and a symlink at the final component is
+  chmod'ed as the symlink rather than as its target, but the NAME is resolved
+  again at chmod time. An entry swapped between the scan and the widen is
+  widened as whatever now holds that name, and a hardlink planted there shares
+  an inode that may also live outside the scratch tree - staying inside this
+  directory is a property of the namespace, not of the inode. The exposure is
+  bounded (only owner bits are added, only to an inode this euid owns, and the
+  mode is put back on the way out); narrowing this leg is tracked as #5852.
+* Neither mechanism. `Widener` refuses with EPERM rather than widen through a
+  name it would have to re-resolve unprotected.
 
 The widened mode is put back on EVERY exit from the widen - a reopen that
 raised, an inode that turns out to have been swapped, and the ordinary success
-- so no inode is ever left more permissive than the walk found it (#5812). A
-reopen after a widening chmod is still checked against the inode that was
-scanned. Symlinks are never followed and their flags are never cleared (a clear
-would have to go back through a path); a flagged symlink is reported instead. A
+- so nothing this walk widened is left widened (#5812). The restore takes the
+same route as the widen: the pinned descriptor on Linux, the same name - with
+the caveat above - where there is no `O_PATH`. A reopen after a widening chmod
+is still checked against the inode that was scanned. Symlinks are never
+followed and their flags are never cleared (a clear would have to go back
+through a path); a flagged symlink is reported instead. A
 flagged regular file with more than one link is refused, because its inode may
 also live outside the scratch tree.
 
@@ -107,12 +122,14 @@ _OPEN_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
 _LIBC_FCHFLAGS = None
 
 # Widening a mode is the only mutation the walk performs on an entry it has not
-# proven anything about yet, so it has to address an inode rather than a name.
-# `O_PATH` opens an entry whatever its mode and `/proc/self/fd/N` then addresses
-# THAT inode (Linux). macOS has no `O_PATH`, but it does have
+# proven anything about yet, so it addresses an inode wherever the platform lets
+# it. `O_PATH` opens an entry whatever its mode and `/proc/self/fd/N` then
+# addresses THAT inode (Linux). macOS has no `O_PATH`, only
 # `fchmodat(AT_SYMLINK_NOFOLLOW)`, which `os.chmod(..., follow_symlinks=False)`
-# reaches; `os.supports_follow_symlinks` is the capability test, because the
-# same call raises `NotImplementedError` on Linux (#5813).
+# reaches; that one is non-following but still by NAME, which is weaker - see
+# the `Widener` docstring and #5852. `os.supports_follow_symlinks` is the
+# capability test, because the same call raises `NotImplementedError` on
+# Linux (#5813).
 HAS_O_PATH = hasattr(os, "O_PATH")
 FD_DIR = "/proc/self/fd"
 CAN_CHMOD_NOFOLLOW = os.chmod in os.supports_follow_symlinks and os.chmod in os.supports_dir_fd
@@ -205,8 +222,12 @@ class Widener:
     `/proc/self/fd/N`, which addresses the pinned inode.
 
     Where there is no `O_PATH`, `fchmodat(AT_SYMLINK_NOFOLLOW)` relative to the
-    already-open parent descriptor cannot traverse a symlink either, and cannot
-    leave the directory the walk is standing in. A platform with neither
+    already-open parent descriptor cannot traverse a symlink either, but it
+    addresses a NAME and not the scanned inode: nothing is pinned, no identity
+    check is taken, and an entry swapped between the scan and the widen - or a
+    hardlink planted at that name - is mutated instead. Not leaving this
+    directory is a property of the namespace, not of the inode, so this leg is
+    strictly weaker than the Linux one (#5852). A platform with neither
     mechanism gets no widen: the entry is reported, never mutated through a
     resolvable path."""
 
