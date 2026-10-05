@@ -789,6 +789,26 @@ MDEOF
     anchor_red 5493 QUAL "a dyn self type that is only a lifetime bound is refused" \
         "See \`$R::<dyn 'a>::decorate_memory_many\`."
 
+    # #5495: a pointer self type names the type behind `*const`/`*mut`; a
+    # tuple, slice or other head with no leading type names none the gate can
+    # check, so the anchor is refused rather than accepted.
+    anchor_red_cites 5495 QUAL "a const pointer self type whose type is missing" \
+        "$R::NoSuch" \
+        "See \`$R::<*const NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5495 QUAL "a mutable pointer self type whose type is missing" \
+        "$R::NoSuch" \
+        "See \`$R::<*mut NoSuch>::decorate_memory_many\`."
+    anchor_green 5495 "a const pointer self type with live parts" \
+        "See \`$R::<*const RecallTool>::decorate_memory_many\`."
+    anchor_red 5495 QUAL "a parenthesised self type is refused" \
+        "See \`$R::<(NoSuch)>::decorate_memory_many\`."
+    anchor_red 5495 QUAL "a slice self type is refused" \
+        "See \`$R::<[NoSuch]>::decorate_memory_many\`."
+    anchor_red 5495 QUAL "a tuple self type with an as clause is refused" \
+        "See \`$R::<(NoSuch, u8) as Tr>::decorate_memory_many\`."
+    anchor_red 5495 QUAL "a self type that opens with a nested group is refused" \
+        "See \`$R::<<NoSuch as Tr>::X>::decorate_memory_many\`."
+
     # #5460: the type of an as group inside a brace item is a claim.
     anchor_red_cites 5460 QUAL "an as group with a missing type inside a brace item" \
         "$R::NoSuch" \
@@ -1603,13 +1623,8 @@ AS_WORD = re.compile(r"\bas\b")
 # #5493: a leading lifetime or ?Trait bound of a bound list (`dyn 'a + T`,
 # `dyn ?Sized + T`) is skipped too; it is not the type either.
 SELF_PREFIX = re.compile(
-    r"(?:&\s*(?:'[A-Za-z_]\w*\s+)?(?:mut\s+)?|\b(?:dyn|impl|mut)\s+"
+    r"(?:&\s*(?:'[A-Za-z_]\w*\s+)?(?:mut\s+)?|\*\s*(?:const|mut)\s+|\b(?:dyn|impl|mut)\s+"
     r"|(?:'[A-Za-z_]\w*|\?\s*[A-Za-z_]\w*)\s*\+\s*)+")
-# #5493: after the prefix, a head that is a lifetime or a ?Trait bound with
-# no type behind it names no type; the anchor is refused, never accepted.
-BOUND_ONLY = re.compile(r"['?]")
-
-
 def unwrap_self_type(tok):
     """`<Type<T> as Trait>::m` -> `Type<T>::m` (the type is the claim); an
     `as` inside a nested argument (`<Vec<<T as Tr>::X>>::new`) counts too, and
@@ -1631,8 +1646,10 @@ def unwrap_self_type(tok):
     if AS_WORD.search(inner) or tok.startswith("::", end):
         if m:
             return m.group(0) + tok[end:]
-        if BOUND_ONLY.match(head, pos):
-            return None
+        # #5493/#5495: a self type with no identifier after its prefix (a
+        # bare bound, a pointer-free tuple, slice or nested group) names no
+        # type to check, so it is refused, never accepted.
+        return None
     return tok
 
 
