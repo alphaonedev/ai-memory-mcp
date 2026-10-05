@@ -153,9 +153,9 @@ def _parse_inline_list(text: str) -> List[str]:
     text = text.strip(" ")
     if not text.startswith("["):
         raise Unparsed("unterminated or non-list flow value: " + text)
-    end, items = _flow(text, 0)
-    if end != len(text):
-        raise Unparsed("unterminated or non-list flow value: " + text)
+    # _value already read this flow collection to its end and refused any text after
+    # it (_tail), so nothing follows it here (#5777).
+    items = _flow(text, 0)[1]
     for item in items:  # type: ignore[attr-defined]
         if not isinstance(item, str):
             raise Unparsed("inline list item is not one scalar (#5733): " + text)
@@ -578,9 +578,9 @@ def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
     seen_triggers: Set[str] = set()
     i = 0
     while i < len(block):
-        ind, body = block[i]
-        if ind != trig_indent:
-            raise Unparsed("unexpected indentation in on: block: " + body)
+        # Deeper rows are read below as the trigger's filters; _nest refuses a row
+        # between column 0 and the trigger column (no open block there, #5777).
+        body = block[i][1]
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*) *:(?: +(.*))?$", body)
         if not m:
             raise Unparsed("unreadable trigger line: " + body)
@@ -633,9 +633,9 @@ def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[s
     seen_keys: Set[str] = set()
     k = 0
     while k < len(sub):
-        ind, body = sub[k]
-        if ind != key_indent:
-            raise Unparsed(trigger + ": unexpected indentation: " + body)
+        # Deeper rows are read below as the key's list items; _nest refuses a row
+        # between the trigger column and the key column (no open block there, #5777).
+        body = sub[k][1]
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*) *:(?: +(.*))?$", body)
         if not m:
             raise Unparsed(trigger + ": unreadable filter line: " + body)
@@ -651,8 +651,8 @@ def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[s
             items.append(_filter_item(trigger + "." + key, sub[n][1]))
             n += 1
         if rest:
-            if items:
-                raise Unparsed(trigger + "." + key + ": mixed inline and block list")
+            # items is empty here: _nest refuses a deeper row after a row whose
+            # value is not empty (it would continue that scalar, #5730, #5777).
             if key == "types" and not rest.startswith("["):
                 word = _unquote(rest)
                 if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", word):
@@ -774,6 +774,16 @@ def violations(name: str, text: str) -> List[str]:
         # Closed world (#5731): a file the reader cannot read is a failure, whatever
         # words its raw text holds; an escaped key spells a trigger with none of them.
         return [f"{name}: R-SHAPE cannot parse triggers ({exc})"]
+    try:
+        return _rule_violations(name, triggers)
+    except Unparsed as exc:
+        # A filter item the glob reader cannot read (an unterminated [ class) is a
+        # named failure too, not an exception out of violations() (#5777).
+        return [f"{name}: R-SHAPE cannot match filters ({exc})"]
+
+
+def _rule_violations(name: str, triggers: Dict[str, Dict[str, List[str]]]) -> List[str]:
+    """R-PR and R-PUSH violations for one file's parsed triggers."""
     found: List[str] = []
     for trig in PR_TRIGGERS:
         if trig not in triggers:
@@ -815,10 +825,11 @@ def _replace_once(text: str, old: str, new: str) -> str:
 
 
 def named_cells() -> List[Tuple[str, str, str]]:
-    """(name, text, refusal reason) for each known-bad shape of PR #5665 rounds 3 and 4.
+    """(name, text, refusal reason) for each known-bad shape of PR #5665 rounds 3 to 5.
 
     Each cell is a reproducer from the round-3 review (F1 #5730, F2 #5731, F3
-    #5732) or from the round-4 differential (#5733-#5736, #5748-#5750).  The
+    #5732), from the round-4 differential (#5733-#5736, #5748-#5750) or from the
+    round-4 review (F2, an indented first row, #5777).  The
     test below runs every cell each time; the round-4 PyYAML probe runs the same
     cells as fixed cases beside its seeded random ones.
     """
@@ -847,15 +858,16 @@ def named_cells() -> List[Tuple[str, str, str]]:
         ("5749-merge-key-list-entry", "name: x\n" + pr + "x:\n  - a\n  - <<\n", "plain << or ="),
         ("5750-deeper-leading-blank", "name: x\n" + pr + "x: |-\n    \n  contents: read\n",
          "leading blank line of a block scalar"),
+        ("R4-F2-indented-first-row", "  name: x\n" + pr, "less indented than the first row"),
     ]
 
 
 class NamedCells5665(unittest.TestCase):
-    """Every named known-bad cell is refused with its own reason (rounds 3 and 4)."""
+    """Every named known-bad cell is refused with its own reason (rounds 3 to 5)."""
 
     def test_5665_named_cells_refused(self) -> None:
         cells = named_cells()
-        self.assertEqual(15, len(cells))
+        self.assertEqual(16, len(cells))
         for name, text, why in cells:
             got = violations("x.yml", text)
             self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (name, why, got))
@@ -2066,6 +2078,52 @@ class RoundFourMutants5665(unittest.TestCase):
         # N20. PyYAML: {'x': '\na\n', 'z': 'b\n'}.
         tail = "x: |\n      \n      a\nz: |\n  b\n"
         self.assertEqual([], violations("x.yml", "name: x\non:\n" + GOOD_PR + tail))
+
+
+class RefusalBranches5665(unittest.TestCase):
+    """#5777: every refusal branch of the reader is reached by a case that names it.
+
+    The round-5 census at 528c2195 found ten branches no case reached.  Six are
+    reachable and each case below asserts its reason; the other four were dead
+    (an earlier rule refuses their input) and were removed.  Each PyYAML 6.0.1
+    view quoted in a comment was measured with yaml.safe_load on the same text.
+    """
+
+    def _reason(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5665_first_row_indented(self) -> None:
+        # Round-4 review F2. PyYAML: ParserError for both ("expected '<document
+        # start>', but found '<block mapping start>'" at the on: row).
+        why = "row is less indented than the first row"
+        self._reason("  name: x\non:\n" + GOOD_PR, why)
+        self._reason("  name: x\non:\n  push:\n    branches: ['rehearsal/**']\n", why)
+
+    def test_5665_comment_after_a_space_inside_a_plain_flow_entry(self) -> None:
+        # PyYAML: ParserError; ' #' starts a comment, so the collection stays open.
+        self._reason("name: x\non:\n  pull_request:\n    branches: [main #c, 'rehearsal/**']\n",
+                     "flow collection does not close on its row")
+
+    def test_5665_no_on_block(self) -> None:
+        # PyYAML: {'name': 'x', 'jobs': {...}}; the file has no on key at all.
+        self._reason("name: x\njobs:\n  a:\n    runs-on: x\n", "no top-level on: block")
+
+    def test_5665_empty_on_block(self) -> None:
+        # PyYAML: the on key (True) holds None.
+        self._reason("name: x\non:\njobs:\n  a:\n    runs-on: x\n", "empty on: block")
+
+    def test_5665_mapping_under_a_filter_key(self) -> None:
+        # PyYAML: branches is {'main': 'x'}, a mapping and not a list.
+        self._reason("name: x\non:\n  pull_request:\n    branches:\n      main: x\n",
+                     "pull_request.branches: non-list item")
+
+    def test_5665_unterminated_class_in_a_branches_item(self) -> None:
+        # PyYAML: branches is ['main', 'rehearsal/**', 'a[b'] in both texts.
+        why = "R-SHAPE cannot match filters (unterminated character class"
+        for branches in (" [main, 'rehearsal/**', 'a[b']\n", "\n      - main\n      - rehearsal/**\n      - a[b\n"):
+            got = violations("x.yml", "name: x\non:\n  pull_request:\n    branches:" + branches)
+            self.assertTrue(any(why in v for v in got), got)
 
 
 class GlobSemantics5447(unittest.TestCase):
