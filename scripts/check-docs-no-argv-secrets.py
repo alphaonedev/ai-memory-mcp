@@ -70,7 +70,9 @@ template file):
                      and the gate refuses an entry that claims one (#5835).
   array-element-operand  the same operand shape among the elements of a bash
                      array body ``NAME=( ... )`` / ``NAME+=( ... )``, read as
-                     one element list with no head, comments skipped (#5723):
+                     one element list with no head, comments skipped (#5723);
+                     an indexed element ``NAME[idx]=VALUE`` and a ``[k]=v``
+                     body element are read by their VALUE (#5838):
                      the elements reach an argv only through ``"${NAME[@]}"``,
                      which a text gate cannot follow. Waived only by a
                      reviewed line in the same allowlist.
@@ -1773,6 +1775,11 @@ UNKNOWN = "unknown-head"
 ARRAY = "array-body"
 # Declaration builtins that take NAME=( ... ) array assignments as operands.
 ARRAY_DECL_BUILTINS = frozenset({"declare", "local", "typeset", "readonly", "export"})
+# #5838 (round 12): an indexed element assignment NAME[idx]=VALUE (or +=) sets one element of
+# the same array, and a [k]=v word inside an array body is one element too: the VALUE after
+# the first = is read as an array element, class ARRAY, and by the shape rule.
+INDEXED_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\[[^\]]*\]\+?=")
+BODY_INDEX_RE = re.compile(r"\[[^\]]*\]\+?=")
 # (words, forced, array): array marks the element list of an array body.
 Command = Tuple[List[Word], bool, bool]
 
@@ -1835,9 +1842,27 @@ def shell_commands(text: str, lo: int = 0, hi: Optional[int] = None, depth: int 
     forced = depth >= NEST_LIMIT
     cmd: List[Word] = []
 
+    def element_value(word: Word, rx: "re.Pattern[str]") -> Optional[Word]:
+        """#5838: the VALUE of an indexed element word (NAME[idx]=VALUE, or [k]=v in an array
+        body) as a word of its own, or None when the word is not one or its value is empty."""
+        m = rx.match(text, word[0], word[1])
+        if not m or m.end() >= word[1]:
+            return None
+        k, pieces = parse_word(text, m.end(), word[1], [])
+        return (m.end(), k, pieces) if k > m.end() else None
+
     def flush() -> None:
         if cmd:
             out.append((list(cmd), forced, False))
+            # #5838: the indexed element assignments of the command (its assignment prefix, or
+            # every operand of a declaration builtin) are array elements of their own.
+            decl = plain_literal(text, cmd[0]) in ARRAY_DECL_BUILTINS
+            for w in cmd[1:] if decl else cmd:
+                if not decl and not ASSIGN_RE.match(text[w[0]:w[1]]):
+                    break
+                sub = element_value(w, INDEXED_ASSIGN_RE)
+                if sub is not None:
+                    out.append(([sub], forced, True))
             cmd.clear()
 
     def nest(a: int, b: int) -> None:
@@ -1887,7 +1912,9 @@ def shell_commands(text: str, lo: int = 0, hi: Optional[int] = None, depth: int 
             k, pieces = parse_word(text, j, hi, subs)
             if k <= j:
                 break
-            elems.append((j, k, pieces))
+            # #5838: a [k]=v element is read by its value v.
+            sub = element_value((j, k, pieces), BODY_INDEX_RE)
+            elems.append(sub if sub is not None else (j, k, pieces))
             walk_word(j, k, pieces, subs)
             j = k
         if elems:
@@ -3811,6 +3838,33 @@ R11_ARRAY_GREEN = {
     '5723-g01-mount-elements': 'args=(\n  -v "${DATA_DIR}:/data"\n  --rm\n)',
     '5723-g02-comment-holds-shape': 'opts=(\n  # was: -v pw=$PGPASSWORD (removed)\n  -n 3\n)',
     '5723-g03-neutral-v-element': 'args=(-v n=3 -f x.sql)',
+    '5838-g01-indexed-neutral-flag': 'ARGS[1]=--verbose',
+    '5838-g02-indexed-neutral-name': 'ARGS[1]=n=3',
+    '5838-g03-body-index-neutral': 'args=([0]=-n [1]=3)',
+    '5838-g04-indexed-mount': 'ARGS[1]="${DATA_DIR}:/data"',
+    '5838-g05-assoc-neutral': 'declare -A m=([k]=1 [j]=2)',
+    '5838-g06-indexed-bypass': 'ARGS[1]=bypass=1',
+    '5838-g07-indexed-password-file': 'ARGS[1]=--password-file=/run/x',
+    '5838-g08-indexed-empty': 'ARGS[1]=',
+    '5838-g09-indexed-comment': 'ARGS[1]=x # --password=S3cr3tPass',
+    '5838-g10-indexed-in-test': '[[ ${ARGS[1]} == x ]]',
+}
+# #5838 (round 12): an indexed element assignment NAME[idx]=VALUE and a [k]=v element of an
+# array body set one element of an argv array, so the VALUE is read as an array element: by
+# the array operand rule and by the shape rule. Each row is flagged as a script and in a fence.
+R12_INDEXED_RED = {
+    '5838-r01-indexed-pw-name': 'ARGS[0]=-v; ARGS[1]=pw=S3cr3tPass\nmytool "${ARGS[@]}"',
+    '5838-r02-indexed-flag-equals': 'ARGS[1]=--password=S3cr3tPass',
+    '5838-r03-body-index-pw': 'args=([0]=-v [1]=pw=S3cr3tPass)',
+    '5838-r04-indexed-append': 'ARGS[2]+=db_token=S3cr3tTok',
+    '5838-r05-indexed-expansion': 'ARGS[1]=pw="$PGPASSWORD"',
+    '5838-r06-variable-index': 'ARGS[$i]=--token=S3cr3tTok',
+    '5838-r07-indexed-quoted-value': "ARGS[1]='--password=S3cr3tPass'",
+    '5838-r08-after-assignment': 'X=1 ARGS[1]=pw=S3cr3tPass',
+    '5838-r09-declaration-builtin': 'local ARGS[1]=--password=S3cr3tPass',
+    '5838-r10-body-index-expansion': 'args=([k]=--token=$TOKEN)',
+    '5838-r11-indexed-url': 'ARGS[1]=mysql://u:S3cr3tPass@db/x',
+    '5838-r12-body-index-flag': 'args=([3]=--password=S3cr3tPass)',
 }
 # #5725: the closed credential shapes, in a script and in a shell fence of a .md file, whatever
 # the program: a URL with a userinfo password, a flag whose last name part is a credential word
@@ -4236,6 +4290,14 @@ def self_test() -> int:
             got = scan_text(suffix, body)
             if got:
                 print("SELF-TEST FAIL: array clean probe %r (%s) was flagged: %r" % (name, label, got),
+                      file=sys.stderr)
+                bad += 1
+    # #5838: an indexed element is an array element, in a script and in a shell fence.
+    for name, text in R12_INDEXED_RED.items():
+        for label, suffix, body in r9_variants(text.replace("\\n", "\n"))[0::2]:
+            red += 1
+            if not scan_text(suffix, body):
+                print("SELF-TEST FAIL: indexed element probe %r (%s) not flagged" % (name, label),
                       file=sys.stderr)
                 bad += 1
     # #5725: the credential shapes in a script and in a shell fence; the hit never prints the value.
