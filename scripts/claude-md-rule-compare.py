@@ -485,7 +485,9 @@ def refusal_prefix_gap(source: bytes) -> str:
     normalisation: on line 1, or on line 2 when line 1 is blank or a comment; a cookie after a code line is not judged.
     Accepted: utf-8 in any letter case, utf_8, utf-8- followed by anything (so utf-8-sig WITHOUT a BOM is accepted, and
     compile() accepts it too), and exactly lower-case utf8. Refused: every other name, including UTF8 and Utf8 (compile()
-    accepts them; this check does not), utf-7, latin-1 and an unknown codec (compile() rejects it).
+    accepts them; this check does not), utf-7, latin-1, utf-16 and an unknown codec (compile() rejects it). A utf-16
+    cookie is refused as a declared encoding where detect_encoding returns utf-16 (3.13 and older) and as an
+    encoding that cannot be determined where it raises SyntaxError (3.14).
     R4: Bytes that are not strict utf-8 are refused.
     R5: Any control byte other than tab, LF and CRLF line ends (NUL, form feed, a lone CR and the rest) is refused
     anywhere in the file.
@@ -1105,7 +1107,6 @@ def _self_test_cases() -> int:
         refused = {"UTF8 cookie": (b"# coding: UTF8\n" + plain, "declares the encoding UTF8"),
                    "Utf8 cookie": (b"# coding: Utf8\n" + plain, "declares the encoding Utf8"),
                    "utf-7 cookie": (b"# coding: utf-7\n" + plain, "declares the encoding utf-7"),
-                   "utf-16 cookie": (b"# coding: utf-16\n" + plain, "declares the encoding utf-16"),
                    "latin-1 cookie": (b"# coding: latin-1\n" + plain, "declares the encoding iso-8859-1"),
                    "unknown codec": (b"# coding: nope\n" + plain, "the source encoding cannot be determined"),
                    "utf-8 BOM alone": (bom + plain, "declares the encoding utf-8-sig"),
@@ -1114,6 +1115,29 @@ def _self_test_cases() -> int:
             why = refusal_prefix_gap(data)
             if needle not in why:
                 return f"the docstring says {label} is refused with {needle!r} but the reason was {why!r} (R3, #5590)"
+        # #5675: detect_encoding returns utf-16 for a utf-16 cookie on 3.13 and older and raises SyntaxError on 3.14.
+        # Both are refusals; the case runs with the real detect_encoding and with one that raises the way 3.14 does.
+        real_detect, utf16 = tokenize.detect_encoding, b"# coding: utf-16\n" + plain
+
+        def detect_like_314(readline):
+            first = readline()
+            if first == b"# coding: utf-16\n":
+                raise SyntaxError("invalid or missing encoding declaration")
+            lines = iter([first])
+            return real_detect(lambda: next(lines, b"") or readline())
+
+        try:
+            for label, detect in (("the running detect_encoding", real_detect), ("a 3.14-style detect_encoding", detect_like_314)):
+                tokenize.detect_encoding = detect
+                try:
+                    needle = f"declares the encoding {detect(iter(utf16.splitlines(keepends=True)).__next__)[0]}"
+                except SyntaxError:
+                    needle = "the source encoding cannot be determined"
+                why = refusal_prefix_gap(utf16)
+                if needle not in why:
+                    return f"the docstring says a utf-16 cookie is refused with {needle!r} under {label} but the reason was {why!r} (R3, #5675)"
+        finally:
+            tokenize.detect_encoding = real_detect
         for label, spelling in (("UTF8", b"UTF8"), ("Utf8", b"Utf8"), ("utf-8-sig without a BOM", b"utf-8-sig"), ("utf_8", b"utf_8")):
             try:
                 compile(b"# coding: " + spelling + b"\nx = 1\n", "f", "exec")
