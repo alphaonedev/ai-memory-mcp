@@ -1172,6 +1172,16 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
          tree({"infra/x/setup.sh": "docker run -e pool_mode=transaction edoburu/pgbouncer\n"}, REASON + ent("infra/x/setup.sh", "docker run -e pool_mode=transaction edoburu/pgbouncer\n", "docker run -e pool_mode=transaction edoburu/pgbouncer")), EXIT_FAULT),
         ("an entry with look-alike letter sets the mode and is refused",
          tree({"infra/x/setup.sh": "pool_mode = tr\u0430nsaction\n"}, REASON + ent("infra/x/setup.sh", "pool_mode = tr\u0430nsaction\n", "pool_mode = tr\u0430nsaction")), EXIT_FAULT),
+        # #5368: the fold paths of _fold_word, each on a config-shaped context line that names no pool word, so R9
+        # stays quiet and only the fold decides. U+0578 (Armenian) is outside CONFUSABLE on purpose.
+        ("fold by wildcard: one foreign letter replaces a letter of the mode word",
+         tree({"docs/a.md": "```ini\npool_mode = session\ndefault = tr\u0578nsaction\n```\n"}), EXIT_FINDING),
+        ("fold by drop: one foreign letter is inserted into the mode word",
+         tree({"docs/a.md": "```ini\npool_mode = session\ndefault = transa\u0578ction\n```\n"}), EXIT_FINDING),
+        ("fold by wildcard with two foreign letters",
+         tree({"docs/a.md": "```ini\npool_mode = session\ndefault = tr\u0578\u0578saction\n```\n"}), EXIT_FINDING),
+        ("a mode word with three foreign letters is not folded",
+         tree({"docs/a.md": "```ini\npool_mode = session\ndefault = tr\u0578\u0578\u0578action\n```\n"}), EXIT_OK),
         # files read, not skipped (#5086, #5090)
         ("NUL bytes in a markdown file fail closed", tree({"docs/n.md": "\0\nRun PgBouncer in transaction mode.\n"}), EXIT_FAULT),
         ("a gzip document fails closed", tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}), EXIT_FAULT),
@@ -1347,6 +1357,10 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("F1 only a declared binary suffix is skipped (#5367)", "        if not problem and Path(line).suffix.lower() not in BINARY_SUFFIXES:", "        if False:"),
     ("F1 pdf is a declared binary suffix (#5367)", '".pdf", ".jpg", ".jpeg", ".png"', '".jpg", ".jpeg", ".png"'),
     ("F1 a text type is not declared binary (#5367)", '".mov", ".webm"', '".mov", ".tpl", ".webm"'),
+    ("R9 fold: two foreign letters still fold (#5368)", "    if not other or other > 2 or len(word) - other < 3:", "    if not other or other > 1 or len(word) - other < 3:"),
+    ("R9 fold: three foreign letters never fold (#5368)", "    if not other or other > 2 or len(word) - other < 3:", "    if not other or other > 3 or len(word) - other < 3:"),
+    ("R9 fold: wildcard match (#5368)", "        if dropped == key or wild.fullmatch(key):", "        if dropped == key:"),
+    ("R9 fold: inserted-letter drop match (#5368)", "        if dropped == key or wild.fullmatch(key):", "        if wild.fullmatch(key):"),
     ("F1 the suffix is read case-blind (#5367)", "Path(line).suffix.lower() not in BINARY_SUFFIXES", "Path(line).suffix not in BINARY_SUFFIXES"),
     ("F1 NUL bytes in non-UTF-16 text", "            if utf8 and b\"\\0\" in chunk:", "            if False:"),
     ("F1 BOM-less UTF-16", "    if len(zeros) * 4 >= min(len(head), CHUNK_BYTES) > 0:", "    if False:"),
