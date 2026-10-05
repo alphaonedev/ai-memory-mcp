@@ -2151,7 +2151,8 @@ def dsn_problems(dsn: str, ctx: str) -> list:
 
 
 def redact(dsn: str) -> str:
-    return re.sub(r"//[^@/]*@", "//<userinfo>@", dsn)[:70]
+    # redact first, cut after: a cut before the scrub drops the "@" the scrub keys on (#5506)
+    return scrub(dsn)[:70]
 
 
 # a postgres URL up to its last "@" (a password can hold "/" or "@"), and a URL cut before
@@ -3491,6 +3492,14 @@ def secret_output_problems(base: tuple, known: set) -> list:
             bad.append("a store-url password with a nameref was not refused (%r)" % pw[:12])
         if "Mark9" in out:
             bad.append("failure output carries a store-url password (%r)" % pw[:12])
+    # redact() redacts before it cuts: a slash password longer than the 70-character cut keeps its
+    # tail out of the dsn_problems text, and a no-password control keeps its marker (#5506)
+    long_pw = "Sec/Mark9x/" * 8
+    shown = " ".join(dsn_problems("postgres://aimemory:%s@h/db?sslmode=disable" % long_pw, "aws"))
+    if "Mark9" in scrub(shown):
+        bad.append("a long slash password leaks through the dsn_problems text")
+    if "Ctl7" not in " ".join(dsn_problems("postgres://aimemory:CHANGEME@h/Ctl7?sslmode=disable", "aws")):
+        bad.append("the redact control lost its path marker")
     # the expansion hit cuts the command word at 40 bytes: scrub first, or the cut drops the @
     spec = {"aws": [(dec, "      postgres://aimemory:ExpMark9xyzExpMark9xyzExpMark9xyz@h/$X a\n" + dec)]}
     t, mt, a, p, auto, extra = case_inputs(base, spec)
