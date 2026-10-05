@@ -566,7 +566,7 @@ CRED_TOOL_RE = re.compile(
     # or an ANSI-C quote in a value is one word (#5304)
     r"|(?:(?<![\w-])-[A-Za-z]*H|--(?:proxy-)?header)[\s=]*\\?\$?[\"']?"
     r"(?i:(?:x-)?api-key|authorization|proxy-authorization|x-auth-token)\s*:"
-    r"[^\"'$]*(?:[\"'](?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?)?\$")
+    r"[^\"'$]*(?:[\"'](?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?)?(?:\$|`)")
 
 
 # wget -e/--execute runs a wgetrc command; getopt takes any unique prefix of the long name, so --exe
@@ -1475,6 +1475,11 @@ ROUND3_RED = [
     ("curl -u ANSI-C quoted user part", "curl -u $'u:'$X h"),
     ("curl -H ANSI-C quoted header", "curl -H $'Authorization: Bearer '$X h"),
     ("curl --proxy-header", 'curl --proxy-header "Proxy-Authorization: Basic $X" h'),
+    # a command substitution in a credential header value is on argv as well (#5304)
+    ("curl -H backtick bearer", 'curl -H "Authorization: Bearer `cat f`" h'),
+    ("curl -H backtick api key", 'curl -H "X-API-KEY: `cat f`" h'),
+    ("curl -H backtick after the quote", "curl -H 'Authorization: Bearer '`cat f` h"),
+    ("wget --header= backtick", 'wget --header="Authorization: token `cat f`" h'),
 ]
 ROUND3_GREEN = [
     ("mysql --password-file is not --password", 'mysql -u r --password-file="$PW_FILE" db'),
