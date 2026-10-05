@@ -41,7 +41,8 @@ written reason. No list of bad or negating words decides anything.
                ASCII and a short typographic set) next to an ASCII letter, and
                that names a pool, mode or product word, is a unit of its own;
                a line with U+FFFD (an invalid byte in the file) is one whatever
-               its words. Such a character can hide a word from every pattern,
+               its words, so undecodable text with no NUL byte exits 1 (a
+               finding), while a NUL byte outside UTF-16/32 exits 2 (a fault). Such a character can hide a word from every pattern,
                so the line is red unless an allowlist entry, written by regen
                with a reason, names it. Approved shapes hold DECLARED
                characters only.
@@ -1323,6 +1324,13 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
         ("an ini template that is not UTF-8 is a FAULT", tree(ini=b"[pgbouncer]\npool_mode = session\n; \xff\n"), EXIT_FAULT),
         ("a UTF-32 file is decoded and judged", tree({"docs/u.txt": "Run PgBouncer in transaction mode.\n".encode("utf-32")}), EXIT_FINDING),
         # R9 (#4667 round 6): closed world over characters
+        # #5479: undecodable text with no NUL byte is read (decoder replacement) and reported as a finding (rc 1), not a fault
+        ("R9 #5479: a markdown file with invalid UTF-8 and no NUL is a finding (rc 1), not a fault",
+         tree({"docs/u.md": b"Hello \xff\xfe pool notes\n"}), EXIT_FINDING),
+        ("R9 #5479: a template with invalid UTF-8 and no NUL is a finding (rc 1), not a fault",
+         tree({"infra/x/u.tpl": b"\xc3\x28\n"}), EXIT_FINDING),
+        ("R9 #5479: the same bytes with a NUL byte are a fault (rc 2)",
+         tree({"infra/x/u.tpl": b"\xc3\x28\n\0\n"}), EXIT_FAULT),
         ("R9: an invalid UTF-8 byte inside the mode word is red", tree({"docs/a.md": b"Run PgBouncer in tr\xffansaction mode.\n"}), EXIT_FINDING),
         ("R9: an invalid UTF-8 byte is red on a line with no pool word", tree({"docs/a.md": b"Our tr\xffansaction notes.\n"}), EXIT_FINDING),
         ("R9: an approved shape with a digit outside DECLARED is not approved",
