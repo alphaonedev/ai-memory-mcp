@@ -75,8 +75,9 @@ while read -r ip; do
   scp_to "$BOOTSTRAP" "$ip" "/opt/hive/pg-age/bootstrap.sql"
   # #5401: the build context is an EMPTY directory and the Dockerfile comes in
   # through -f, so the CA key (tls-ca/) and the secret files (.secrets/) under
-  # /opt/hive/pg-age are never tarred and sent to the docker daemon.
-  ssh_node "$ip" "mkdir -p /opt/hive/pg-age/build-ctx && docker build --build-arg AGE_IMAGE='$AGE_IMAGE' -f /opt/hive/pg-age/Dockerfile -t hive-pg-age:local /opt/hive/pg-age/build-ctx" >/dev/null
+  # /opt/hive/pg-age are never tarred and sent to the docker daemon. A context
+  # directory that is not empty is refused before docker runs.
+  ssh_node "$ip" "mkdir -p /opt/hive/pg-age/build-ctx && if [ -n \"\$(ls -A /opt/hive/pg-age/build-ctx)\" ]; then echo 'FATAL: /opt/hive/pg-age/build-ctx is not empty; refusing to send it to the docker daemon (#5401)' >&2; exit 1; fi && docker build --build-arg AGE_IMAGE='$AGE_IMAGE' -f /opt/hive/pg-age/Dockerfile -t hive-pg-age:local /opt/hive/pg-age/build-ctx" >/dev/null
 
   ssh_node "$ip" "umask 077; mkdir -p '$SECRET_DIR'; chmod 0700 '$SECRET_DIR'"
   printf 'POSTGRES_PASSWORD=%s\n' "$SU_PW" | put_secret "$ip" "$SECRET_DIR/su-init.env"

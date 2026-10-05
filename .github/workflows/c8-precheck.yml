@@ -1327,6 +1327,12 @@ jobs:
         # run proves a remote verify-full psql connection first, and a refusal
         # (exit 7) comes before any pg_dump or DROP DATABASE.
         run: python3 scripts/test/test_postgres_droplet_reinit.py
+      - name: hive-1461 pg-age docker build context holds no secret (#5401)
+        # Runs the real docker build line of deploy/hive-1461/provision/20_pg_age.sh
+        # against a fixture /opt/hive/pg-age holding tls-ca/ca.key and .secrets/,
+        # with a stub docker that lists the build context: the context is empty,
+        # and a context directory that is not empty is refused before docker runs.
+        run: python3 scripts/test/test_hive_pg_age_build_context.py
 
   cloud-init-serve-flags-gate:
     # #4616/#4657 - the cloud-init memory templates, as a fail-closed token
