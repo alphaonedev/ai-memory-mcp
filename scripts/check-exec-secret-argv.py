@@ -547,14 +547,14 @@ def deny_lines(dl, rel: str, text: str) -> Dict[int, str]:
 # and its value is an expansion. --pa is a unique prefix of --password in the non-interactive clients (and
 # ambiguous with --pager in the bare interactive mysql and mariadb, which keep --pas as the shortest prefix);
 # every other family client reads --pa and up. No client list: a new family client is read by its head shape.
-_MY_HEAD = r"(?:mysql\w*|mariadb\w*(?:-\w+)*|(?i:(?:mysql\w*|mariadb\w*(?:-\w+)*)\.exe))(?![\w-]*=)"
-_MY_BARE = r"(?!(?i:mysql|mariadb)(?:\.exe)?(?![\w-]))"
+_MY_HEAD = r"(?:mysql|mariadb|(?i:(?:mysql|mariadb)[\w-]*\.exe))(?![\w-]*=)"
+_MY_BARE = r"(?!(?i:mysql|mariadb)(?![\w-]))"
 _MY_PW = r"(?:loose[-_])?pa(?:s(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?)?"
 _MY_PW_LONG = r"(?:loose[-_])?pas(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?"
 _MY_TAIL = r"[\"']?(?:\$|`)"
 MYSQL_FAMILY_RE = (
-    r"\b" + _MY_HEAD + r"[^|;&]*\s(?:-p|--" + _MY_PW_LONG + r"(?![\w-])[\s=]*)" + _MY_TAIL
-    + r"|\b" + _MY_BARE + _MY_HEAD + r"[^|;&]*\s(?:-p|--" + _MY_PW + r"(?![\w-])[\s=]*)" + _MY_TAIL)
+    r"\b" + _MY_HEAD + r"[^|;&]*\s(?:-p|--" + _MY_PW_LONG + r"[\s=]*)" + _MY_TAIL
+    + r"|\b" + _MY_BARE + _MY_HEAD + r"[^|;&]*\s(?:-p|--" + _MY_PW + r"[\s=]*)" + _MY_TAIL)
 
 # A credential-taking flag of a known tool fed from any expansion: the value is on argv
 # whatever the variable is called, so such a line is never allow-able (pending + issue only).
@@ -1746,6 +1746,10 @@ def round3_probe_cases(dl) -> Tuple[List[str], int]:
     when triggered, an allow entry approves them through the real gate checks."""
     bad: List[str] = []
     n = 0
+    ("5583 a tool whose name only ends in a client name is no client", 'xmysql -p"$DB_PASSWORD"'),
+    ("5583 a later command after && is not an argument of the client", 'mysqldump db && echo -p"$DB_PASSWORD"'),
+    ("5583 an assignment named like a client is no command", 'mysql_args=(-x -p"$DB_PASSWORD")'),
+    ("5583 a mariadb-named assignment is no command", 'mariadb_opts="-x --password=$DB_PASSWORD"'),
     for label, line in ROUND3_RED:
         n += 1
         res = scan_exec_file(dl, "c.sh", "#!/bin/bash\n%s\n" % line) or []
