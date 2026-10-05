@@ -1229,12 +1229,18 @@ def _self_test_cases() -> int:
         for label, form in (("3.13 dedented", dedented), ("3.12 indented", indented)):
             if numbered_rules(form) != numbered:
                 return f"the {label} docstring numbers the rules {sorted(numbered_rules(form))}, not {sorted(numbered)} (#5674)"
-        doc_node = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)
-                        and node.name == "refusal_prefix_gap").body[0]
-        wide = [(doc_node.lineno + index, len(line)) for index, line in
-                enumerate(source.split("\n")[doc_node.lineno - 1:doc_node.end_lineno]) if len(line) > 120]
-        if wide or doc_node.end_lineno <= doc_node.lineno:
-            return f"the docstring has lines over 120 characters (line, length): {wide} (#5678)"
+        def wide_doc_lines(text):
+            doc_node = next(node for node in ast.parse(text).body if isinstance(node, ast.FunctionDef)
+                            and node.name == "refusal_prefix_gap").body[0]
+            return [(doc_node.lineno + index, len(line)) for index, line in
+                    enumerate(text.split("\n")[doc_node.lineno - 1:doc_node.end_lineno]) if len(line) > 120]
+
+        # #5678: a planted 121-character docstring line is reported and a 120-character one is not.
+        plant = 'def refusal_prefix_gap(source):\n    """{}\n    """\n'
+        if wide_doc_lines(plant.format("x" * 114)) != [(2, 121)] or wide_doc_lines(plant.format("x" * 113)):
+            return "the docstring width check does not report exactly the planted 121-character line (#5678)"
+        if wide_doc_lines(source):
+            return f"the docstring has lines over 120 characters (line, length): {wide_doc_lines(source)} (#5678)"
         if not numbered or numbered != asserted:
             return f"the docstring numbers the rules {sorted(numbered)} but pin_5590 asserts {sorted(asserted)} (#5622)"
         return ""
