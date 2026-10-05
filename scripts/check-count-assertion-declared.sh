@@ -244,6 +244,8 @@ def check_range(rng):
         h, _, body = rec.partition('\x1f'); h = h.strip()
         if h: commits.append(h); msgs[h] = body
     in_range = set(commits)
+    # Only non-merge commits are offenders. diff-tree without -m prints nothing for a merge, so --no-merges is also
+    # what a future -m would need; the self-test leg 'merge commit whose tree moves a shared count' pins the pair (#5499).
     offenders = git('rev-list', '--no-merges', rng).split()
     hits = {}
     for c in offenders:
@@ -465,6 +467,13 @@ def selftest():
         s.g('checkout', '-q', '-b', 'side', b); s.touch(msg('docs: declare early', late(o, S_FF)))
         s.g('checkout', '-q', 'main'); s.g('merge', '-q', '--no-ff', '-m', 'merge side', 'side'); return b + '..HEAD'
     case('declaration in a commit that is not a descendant of the offender', c_late_earlier, True, ['18 -> 19'], ['not an ancestor'])
+    def c_evil_merge(s, b):                               # a merge whose tree moves a shared count is not an offender (only non-merge commits are)
+        s.g('checkout', '-q', '-b', 'side', b); s.w('side.txt', '1\n'); s.commit('side work')
+        s.g('checkout', '-q', 'main'); s.touch('main work')
+        s.g('merge', '-q', '--no-ff', '--no-commit', 'side'); bump_f(s); s.commit('merge side with a bump in the merge tree'); return b + '..HEAD'
+    case('merge commit whose tree moves a shared count is not an offender (#5499)', c_evil_merge, False)
+    def c_plain_same(s, b): bump_f(s); s.commit('test: same bump as a plain commit'); return b + '..HEAD'
+    case('non-merge commit with the same bump is an offender (#5499)', c_plain_same, True, ['sections.len()  18 -> 19'])
     def c_late_merge(s, b):                               # declaration read from a MERGE commit
         o = offender(s, b)
         s.g('checkout', '-q', '-b', 'side', b); s.touch('docs: side work'); s.g('checkout', '-q', 'main')
