@@ -308,6 +308,8 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
             rows.append((0, _strip_comment(rest), ""))
             continue
         body, key, node, header = _scan_row(rest)
+        if key[:1] in ("'", '"') and ind > 0:
+            raise Unparsed("quoted mapping key below the top level (#5731): " + repr(raw))
         rows.append((ind, body, key))
         if header:
             owner, content = ind + node, None
@@ -345,6 +347,8 @@ def _check_top_level(rows: List[Tuple[int, str, str]]) -> None:
         name = key.strip("\"'").lower()
         if name in YAML11_BOOLEANS and key not in ON_KEYS:
             raise Unparsed("top-level key is a YAML 1.1 boolean other than on (#5708): " + body)
+        if key[0] in ("'", '"') and key not in ON_KEYS:
+            raise Unparsed("quoted mapping key other than a top-level on (#5731): " + body)
         if name in seen:
             raise Unparsed("repeated top-level key (#5667): " + body)
         seen.add(name)
@@ -386,6 +390,8 @@ def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
         if not m:
             raise Unparsed("unreadable trigger line: " + body)
         name, rest = m.group(1), (m.group(2) or "").strip()
+        if name.lower() in PR_TRIGGERS + ("push",) and name not in PR_TRIGGERS + ("push",):
+            raise Unparsed("gated trigger name in another case (#5731): " + name)
         if name.lower() in seen_triggers:
             raise Unparsed("repeated trigger key in on: block (#5666): " + name)
         seen_triggers.add(name.lower())
@@ -547,11 +553,9 @@ def violations(name: str, text: str) -> List[str]:
     try:
         triggers = parse_triggers(text)
     except Unparsed as exc:
-        # Closed-world: only a workflow that does not mention a PR/push trigger at
-        # all may be unparseable; otherwise the reader failing is itself a failure.
-        if re.search(r"\b(pull_request|pull_request_target|push)\b", text):
-            return [f"{name}: R-SHAPE cannot parse triggers ({exc})"]
-        return []
+        # Closed world (#5731): a file the reader cannot read is a failure, whatever
+        # words its raw text holds; an escaped key spells a trigger with none of them.
+        return [f"{name}: R-SHAPE cannot parse triggers ({exc})"]
     found: List[str] = []
     for trig in PR_TRIGGERS:
         if trig not in triggers:
@@ -1351,6 +1355,45 @@ class ReaderMutants5705(unittest.TestCase):
         # PyYAML 6 reads "a"#c as "a" plus a comment; YAML 1.2 needs a space before #.
         self._shape("name: x\non:\n" + GOOD_PR + 'x: "a"#c\n', "text after a quoted scalar")
         self._shape("name: x\non:\n" + GOOD_PR + "x: [a]#c\n", "text after a flow collection")
+
+
+class FailClosed5731(unittest.TestCase):
+    """#5731: a file the reader cannot read is a failure whatever words it holds.
+
+    Measured at 71fe391b4: each escaped-key text below was clean there, because the
+    old escape hatch let an unreadable file pass when the literal words
+    pull_request, pull_request_target and push were absent. PyYAML 6.0.1 reads the
+    escaped key as push, pull_request or on.
+    """
+
+    def _shape(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5731_escaped_trigger_keys(self) -> None:
+        for text in ('on:\n  "pu\\x73h":\n    branches: ["rehearsal/**"]\n',
+                     'on:\n  "pull\\x5frequest":\n    branches: [main]\n',
+                     '"o\\x6e":\n  "pu\\x73h":\n    branches: ["rehearsal/**"]\n'):
+            self._shape(text + ClosedWorld5705.J, "cannot parse")
+
+    def test_5731_unreadable_file_without_trigger_words(self) -> None:
+        self._shape("name: x\non:\n  workflow_dispatch:\nzz: [a,\n", "cannot parse")
+
+    def test_5731_gated_trigger_name_in_another_case(self) -> None:
+        # PyYAML keeps Push and PULL_REQUEST as distinct keys; how GitHub matches
+        # event names by case is not measured here, so the reader refuses them.
+        for name in ("Push", "PUSH", "Pull_Request", "pull_request_TARGET"):
+            self._shape("on:\n  " + name + ":\n    branches: [main]\n", "gated trigger name in another case")
+
+    def test_5731_quoted_mapping_keys_below_the_top_level(self) -> None:
+        for row in ('  "push":\n', "  'push':\n", '  "x":\n', "  - 'k': v\n"):
+            self._shape("name: x\non:\n" + GOOD_PR + "x:\n" + row, "quoted mapping key")
+        for row in ('"jobs": 1\n', "'x': 1\n"):
+            self._shape("name: x\non:\n" + GOOD_PR + row, "quoted mapping key other than a top-level on")
+
+    def test_5731_top_level_on_spellings_stay_clean(self) -> None:
+        for key in ("on", '"on"', "'on'"):
+            self.assertEqual([], violations("x.yml", key + ":\n" + GOOD_PR), key)
 
 
 class GlobSemantics5447(unittest.TestCase):
