@@ -94,19 +94,27 @@ def f4_sed():
         ("rotated file is unchanged", "postgres://aimemory:abc123@localhost/aimemory?sslmode=verify-full\n", "keep"),
         ("empty file is minted", "", "fresh"),
         ("non-URL file is minted", "garbage\n", "fresh"),
+        # The refusal is reachable only when the mint yields no usable value: a stub that prints the placeholder
+        # or nothing must make the block exit 1 and leave no running node with a placeholder password.
+        ("a mint that yields the placeholder is refused", "garbage\n", "refuse:CHANGEME"),
+        ("a mint that yields nothing is refused", "garbage\n", "refuse:"),
     ]
     for label, start, want in cases:
         with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
             d = pathlib.Path(t)
             (d / "sed").write_text('#!/bin/bash\nprintf "%s\\n" "$@" >> "$LOGDIR/argv.log"\nexec /usr/bin/sed "$@"\n')
             (d / "sed").chmod(0o755)
-            (d / "openssl").write_text('#!/bin/bash\nprintf "%s\\n" "$@" >> "$LOGDIR/argv.log"\nprintf "%s\\n" "' + SECRET + '"\n')
+            (d / "openssl").write_text('#!/bin/bash\nprintf "%s\\n" "$@" >> "$LOGDIR/argv.log"\nprintf "%s\\n" "' + (want[7:] if want.startswith("refuse:") else SECRET) + '"\n')
             (d / "openssl").chmod(0o755)
             f = d / "store-url"
             f.write_text(start)
             r = run_bash(block.replace("/etc/ai-memory/store-url", str(f)), d)
             got = f.read_text()
             argv = (d / "argv.log").read_text() if (d / "argv.log").exists() else ""
+            if want.startswith("refuse:"):
+                probe("F4 " + label + ": rc 1 with the placeholder message",
+                      r.returncode == 1 and "placeholder db password still in" in r.stdout, "rc=%d %r" % (r.returncode, r.stdout[:60]))
+                continue
             probe("F4 " + label + ": rc 0", r.returncode == 0, r.stderr[:80])
             if want == "keep":
                 probe("F4 " + label + ": file bytes unchanged", got == start, repr(got[:60]))
@@ -1187,8 +1195,8 @@ def unlisted_reader_findings(text):
             word = words[0] if words else ""
             if not word or word in FILE_PRINTERS or word in SILENT_FILE_CMDS or word in ("printf", "echo"):
                 continue
-            body = re.sub(r"\d*>&?\S*|&>>?\S*", "", stage)
-            if any(t in body.replace("\"", "").replace("'", "") for t in targets) and not stdout_to_file(stage):
+            body = re.sub(r"(?:\d*>>?|&>>?|>\|)&?\s*(?:\"[^\"]*\"|'[^']*'|\S+)", "", stage)
+            if any(t in body for t in targets) and not stdout_to_file(stage):
                 bad.append("%d:%s:unlisted file reader" % (n, word))
     return bad
 
@@ -1503,6 +1511,11 @@ def closed_world_taint(fs):
                         ("mv of a written file", 'printf %s x > "$OUT_DIR/r9"\nmv -f -- "$OUT_DIR/r9" "$OUT_DIR/r8"'),
                         ("a reader that writes to a file", 'printf %s x > "$OUT_DIR/r9"\nbat "$OUT_DIR/r9" > "$OUT_DIR/o"'),
                         ("a reader of an unrelated path", 'bat /etc/hostname'),
+                        # Pins for the unlisted-reader check: each control differs from a flagged form in one point.
+                        ("a listed printer into a silent consumer", 'printf %s x > "$OUT_DIR/r9"\nhead -c 1 -- "$OUT_DIR/r9" | LC_ALL=C grep -q x'),
+                        ("printf of a written file path", 'printf %s x > "$OUT_DIR/r9"\nprintf \'%s\\n\' "$OUT_DIR/r9"'),
+                        ("a file under a nested directory", 'printf %s "$qjson" > "$OUT_DIR/sub/r.txt"'),
+                        ("a reader with only stderr sent to a written file", 'printf %s x > "$OUT_DIR/r9"\nbat /etc/hostname 2> "$OUT_DIR/r9"'),
                         ("a here-document to a file", 'cat > "$OUT_DIR/r" <<EOT\nx $qjson\nEOT'),
                         # #5406: a reply is a VALUE of a declaration, or reaches a filter on stdin: both print nothing.
                         ("arithmetic on a counter", 'c=$((c + 1))\n[ "$c" -gt 3 ] && :'),
