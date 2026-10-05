@@ -1930,6 +1930,25 @@ MATCHER_LOGS = (
 )
 
 
+def _matcher_calls():
+    """The sorted call names and the open() mode literals inside probe_verdict, read from this file's own source."""
+    import ast
+    with open(os.path.realpath(__file__), "rb") as fh:
+        tree = ast.parse(fh.read())
+    calls, modes = set(), []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "probe_verdict":
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call):
+                    func = sub.func
+                    name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else "?"
+                    calls.add(name)
+                    if name == "open":
+                        modes.extend(a.value for a in sub.args[1:] if isinstance(a, ast.Constant))
+                        modes.extend("kw" for _ in sub.keywords)
+    return sorted(calls), modes
+
+
 def selftest_matcher(T, base):
     """Matcher and report legs, and the bar (b) potency leg."""
     for i, (label, text, want) in enumerate(MATCHER_LOGS):
@@ -1951,6 +1970,8 @@ def selftest_matcher(T, base):
     good, line = probe_report("refused: the probe log could not be read (OSError)", 1)
     T.leg("probe report: a refused verdict is no and names the reason, never ok", (good, "could not be read" in line), (False, True))
     T.leg("probe report: an empty verdict is no", probe_report("", 1)[0], False)
+    T.leg("probe matcher: probe_verdict starts no child and writes nothing (it calls only open in rb mode, read, type "
+          "and split)", _matcher_calls(), (["open", "read", "split", "type"], ["rb"]))
     clean = os.path.join(base, "matcher-1.log")
     builtins_mod = sys.modules["builtins"]
     real_open = builtins_mod.open
@@ -2116,8 +2137,8 @@ def selftest_inputs(T, base):
     """Ports, arguments, scratch directory, environments and program resolution."""
     for text, want in (("19482", 19482), ("65533", 65533), ("1", 1)):
         T.leg("port check: PORT_B=[%s] is accepted" % text, parse_port(text), want)
-    for text in ("1/0", "PORT_A+1", "a[0]", "x[$(:)]", "abc", "-1", "0", "01", "65534", "99999", "123456", " 1", "1 ",
-                 "1\n", "\u0661", "+1", "1_000", "0x10", "1e3", ""):
+    for text in ("1/0", "PORT_A+1", "a[0]", "x[$(:)]", "abc", "-1", "0", "01", "019482", "65534", "99999", "123456", " 1",
+                 "1 ", " 19482", "19482 ", "1\n", "\u0661", "+1", "1_000", "0x10", "1e3", ""):
         T.leg("port check: PORT_B=[%s] is refused" % text.replace("\n", "\\n"), parse_port(text), None)
     for text, want in (("2000", 2000), ("0", None), ("-5", None), ("2k", None), ("1000000000", None), ("\u0662", None)):
         T.leg("rows check: CORPUS_ROWS=[%s]" % text, parse_rows(text), want)
@@ -2275,6 +2296,9 @@ def selftest_start_state(T, base):
          None, cwd_dir),
         ("start state: shadow modules in the script directory never load under -I (control)", [py, "-I"] + help_, None, copy_dir),
         ("start state: the shebang start runs (control)", help_, {"PATH": os.path.dirname(py) + ":/usr/bin:/bin"}, None),
+        ("start state: an inherited ignored SIGHUP (nohup) runs (control)",
+         [py, "-I", "-S", "-c", "import os, signal; signal.signal(signal.SIGHUP, signal.SIG_IGN); "
+          "os.execv(%r, [%r, '-I', '-S', %r, '--help'])" % (py, py, copy)], None, None),
     ]
     if vi >= (3, 11):
         controls.append(("start state: -I -P -S runs (control, Python 3.11+)", [py, "-I", "-P", "-S"] + help_, None, None))
