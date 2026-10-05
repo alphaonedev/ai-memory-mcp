@@ -367,24 +367,34 @@ def plant_probe(name: str, probe: Path, xopts: list, env=None, isolate=("-S", "-
         "print('REAL')\n", encoding="utf-8")
     result = subprocess.run([sys.executable, *xopts, *isolate, str(probe / "probe.py")],
                             capture_output=True, text=True, check=False, cwd=str(probe), env=env)
-    return parse_plant(result.stdout, xopts, isolate)
+    return parse_plant(result.stdout, xopts, isolate, result.returncode)
 
 
-def parse_plant(stdout: str, xopts: list, isolate) -> Plant:
-    """#5473: turn the output of a probe child into a Plant. Pure (no process), so the self-test feeds it synthetic
-    output: exactly one well-formed VERDICT line is required, and `ok` needs the planted file to have run exactly when
-    the child said the module was not loaded, built-in or frozen, and the reported flags to equal the requested ones."""
-    verdict = [line.split() for line in stdout.splitlines() if line.startswith("VERDICT ")]
-    if len(verdict) != 1 or len(verdict[0]) != 7 or not all(word.isdigit() for word in verdict[0][1:6]):
+VERDICT_LINE = re.compile(r"VERDICT ([01]) ([01]) ([01]) ([01]) ([01]) (-|on|off)")
+
+
+def parse_plant(stdout: str, xopts: list, isolate, returncode: int = 0) -> Plant:
+    """#5473/#5509: turn the output of a probe child into a Plant. Pure (no process), so the self-test feeds it
+    synthetic output. Exactly one line whose text starts with VERDICT (after stripping blanks) must exist, and it must
+    match VERDICT_LINE exactly (five fields in {0,1}, then -, on or off; a preloaded module is also built-in or
+    frozen). The child must have exited 0. `ok` needs, as WHOLE lines: PLANTED exactly once and no REAL when the
+    module is not loaded, built-in or frozen; REAL exactly once and no PLANTED when it is; and the reported flags to
+    equal the requested ones."""
+    lines = stdout.splitlines()
+    verdict = [VERDICT_LINE.fullmatch(line) for line in lines if line.strip().startswith("VERDICT")]
+    if returncode != 0 or len(verdict) != 1 or verdict[0] is None:
         return Plant(False, False, False, False, -1, -1, -1, "?")
-    preloaded, inert = verdict[0][1] == "1", verdict[0][2] == "1"
-    no_site, ignore_env, safe_path, frozen_xopt = int(verdict[0][3]), int(verdict[0][4]), int(verdict[0][5]), verdict[0][6]
+    preloaded, inert, no_site, ignore_env, safe_path, frozen_xopt = verdict[0].groups()
+    if preloaded == "1" and inert != "1":
+        return Plant(False, False, False, False, -1, -1, -1, "?")
+    shadowable = inert == "0"
     want_frozen = next((xopts[i + 1].split("=", 1)[1] for i in range(len(xopts) - 1)
                         if xopts[i] == "-X" and xopts[i + 1].startswith("frozen_modules=")), "-")
-    flags_ok = (no_site, ignore_env, frozen_xopt) == (int("-S" in isolate), int("-E" in isolate), want_frozen)
-    planted = "PLANTED" in stdout
-    return Plant(not inert, preloaded, planted, planted == (not inert) and flags_ok, no_site, ignore_env, safe_path,
-                 frozen_xopt)
+    flags_ok = (int(no_site), int(ignore_env), frozen_xopt) == (int("-S" in isolate), int("-E" in isolate), want_frozen)
+    planted, real = lines.count("PLANTED"), lines.count("REAL")
+    outcome_ok = (planted, real) == ((1, 0) if shadowable else (0, 1))
+    return Plant(shadowable, preloaded == "1", planted > 0, outcome_ok and flags_ok, int(no_site), int(ignore_env),
+                 int(safe_path), frozen_xopt)
 
 
 def plant_coverage_gap(probed: list, names: list, rounds: int) -> bool:
@@ -638,10 +648,21 @@ def _self_test_cases() -> int:
                  ("VERDICT 0 1 1 1 0 -\nREAL\n", [], True), ("VERDICT 0 1 1 1 0 -\nPLANTED\n", [], False),
                  ("VERDICT 0 0 1 1 0 -\nREAL\n", [], False), ("PLANTED\n", [], False),
                  ("VERDICT 0 0 1 1 0 -\nVERDICT 0 0 1 1 0 -\nPLANTED\n", [], False),
-                 ("VERDICT 0 0 1 1 x -\nPLANTED\n", [], False)]
+                 ("VERDICT 0 0 1 1 x -\nPLANTED\n", [], False),
+                 # #5509: the loose cases measured at 8328fbb65, each now refused
+                 ("VERDICT 0 7 1 1 0 -\nPLANTED\n", [], False), ("VERDICT 0 1 1 1 0 -\nTraceback\nImportError\n", [], False),
+                 ("VERDICT 0 0 1 1 0 -\nxPLANTEDx\n", [], False),
+                 ("VERDICT 0 0 1 1 0 -\n VERDICT 0 0 1 1 0 -\nPLANTED\n", [], False),
+                 ("VERDICT 0 1 1 1 0 -\nREAL\nREAL\n", [], False), ("VERDICT 0 0 1 1 0 -\nPLANTED\nREAL\n", [], False),
+                 ("VERDICT 1 0 1 1 0 -\nREAL\n", [], False), ("VERDICT 0 1 1 1 0 - \nREAL\n", [], False),
+                 ("VERDICT 0 1 1 1 0 bad\nREAL\n", [], False), ("VERDICT 0 1 1 1 0 -\nREAL\n", [], True)]
         for out, xo, want in synth:
             if parse_plant(out, xo, ("-S", "-E")).ok != want:
                 return f"parse_plant gave the wrong ok for {out!r} with options {xo} (#5473)"
+        # #5509: a child that exited non-zero is never ok, even when its output reads as a pass.
+        if parse_plant("VERDICT 0 1 1 1 0 -\nREAL\n", [], ("-S", "-E"), 1).ok \
+                or parse_plant("VERDICT 0 0 1 1 0 -\nPLANTED\n", [], ("-S", "-E"), 1).ok:
+            return "parse_plant accepted a probe child that exited non-zero (#5509)"
         if not parse_plant("VERDICT 0 0 1 1 0 -\nPLANTED\n", [], ("-S", "-E")).planted_ran:
             return "parse_plant did not read the planted marker (#5473)"
         names = list(EXPECTED_IMPORTS)  # the probe set is the pin, never the output of imported_modules (#5472)
