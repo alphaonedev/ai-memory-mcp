@@ -2303,20 +2303,22 @@ def _history_cases(t: Path) -> Tuple[List[str], int]:
     except RuntimeError as exc:
         bad.append("the history scan faulted on a list renamed and rewritten in one commit: %s" % exc)
     # a pure rename of the list keeps every row: nothing is removed, so nothing is named (#5466 precision pin)
-    repo = t / "rename-pure"
-    repo.mkdir(parents=True)
-    git(repo, "init", "-q", "-b", "develop")
-    put(repo, old, "".join("#1 | a.sh | 1 | %s\n" % x for x in (gone_row, kept_row)))
-    commit(repo, "the list at its old path")
-    (repo / PENDING_FILE).parent.mkdir(parents=True, exist_ok=True)
-    git(repo, "mv", old, PENDING_FILE)
-    commit(repo, "pure rename")
-    n += 1
-    try:
-        if removed_pending_rows(repo):
-            bad.append("a pure rename of the list named a row as removed (#5466)")
-    except RuntimeError as exc:
-        bad.append("the history scan faulted on a pure rename of the list: %s" % exc)
+    # (both orders: git lists the deleted old path before or after the new one, #5505, mutant R7-24)
+    for tag, from_path in (("after", old), ("before", "scripts/qc-allowlists/aa-pending.txt")):
+        repo = t / ("rename-pure-" + tag)
+        repo.mkdir(parents=True)
+        git(repo, "init", "-q", "-b", "develop")
+        put(repo, from_path, "".join("#1 | a.sh | 1 | %s\n" % x for x in (gone_row, kept_row)))
+        commit(repo, "the list at its old path")
+        (repo / PENDING_FILE).parent.mkdir(parents=True, exist_ok=True)
+        git(repo, "mv", from_path, PENDING_FILE)
+        commit(repo, "pure rename")
+        n += 1
+        try:
+            if removed_pending_rows(repo):
+                bad.append("a pure rename of the list (old path sorted %s) named a row as removed (#5466)" % tag)
+        except RuntimeError as exc:
+            bad.append("the history scan faulted on a pure rename of the list: %s" % exc)
     # the list renamed onto the allow list path with one row dropped, then both files restored: git rename
     # detection shows the removed row under the allow path, which the scan skips (#5500)
     repo = t / "rename-onto-allow"
@@ -2372,6 +2374,37 @@ def _history_cases(t: Path) -> Tuple[List[str], int]:
             bad.append("the deletion of the allow list was read as removed pending rows (#5504)")
     except RuntimeError as exc:
         bad.append("the history scan faulted on a deleted allow list: %s" % exc)
+    # a row removed from the list while the same text is added in another file: the move is not netted, so the
+    # removal is named (#5505, mutant R7-03: netting under any path)
+    repo = fresh("moved-elsewhere")
+    drop(repo)
+    put(repo, "docs/elsewhere.txt", "#1 | a.sh | 1 | %s\n" % gone_row)
+    commit(repo, "remove the row and add its text in another file")
+    judge_repo("a row moved into another file", repo)
+    # one commit that edits the allow list and drops a pending row: the pending file's rows must not be read
+    # under the allow list path (#5505, mutant R7-24: the hunk state kept across files)
+    repo = fresh("two-files")
+    put(repo, ALLOW_FILE, "reason: x | z.sh | 1 | echo hi\n")
+    commit(repo, "an allow row")
+    put(repo, ALLOW_FILE, "reason: x | z.sh | 1 | echo hi\nreason: y | y.sh | 1 | echo yo\n")
+    drop(repo)
+    commit(repo, "edit the allow list and drop a pending row in one commit")
+    judge_repo("a row dropped in a commit that also edits the allow list", repo)
+    # a row removed twice names the newest removing commit (#5505, mutant M16: assignment for setdefault)
+    repo = fresh("twice")
+    drop(repo)
+    commit(repo, "first removal")
+    rows(repo, gone_row, kept_row)
+    commit(repo, "the row returns")
+    drop(repo)
+    commit(repo, "second removal")
+    newest = git(repo, "log", "-1", "--format=%h").strip()
+    n += 1
+    try:
+        if removed_pending_rows(repo).get(gone_row) != newest:
+            bad.append("a row removed twice did not name the newest removing commit (#5505)")
+    except RuntimeError as exc:
+        bad.append("the history scan faulted on a row removed twice: %s" % exc)
     # a replace ref that hides the removing commit from every default git view (#5463)
     repo = fresh("replace")
     drop(repo)
@@ -2488,6 +2521,25 @@ def _terminator_cases(root: Path, t: Path) -> Tuple[List[str], int]:
             elif rc != 2 or "FAULT" not in out:
                 bad.append("a list in the %s form was accepted at the tip (%d): %s" % (tag, rc, out.strip()[:140]))
             shutil.rmtree(str(t / ".git"))
+        # every terminator of the class, one by one (#5505): the tip refuses it, a diff line holding it reads
+        # as two rows, and the LF control is clean
+        for ch in "\r\v\f\x1c\x1d\x1e\x85\u2028\u2029":  # spelled out: not the constant under test
+            n += 1
+            if not terminator_faults("x" + ch + "y\n", "t"):
+                bad.append("the tip accepted line terminator U+%04X in a list (#5501)" % ord(ch))
+            n += 1
+            if len(diff_rows("#1 | b.sh | 1 | one" + ch + "#2 | c.sh | 2 | two")) != 2:
+                bad.append("a diff line holding line terminator U+%04X did not read as two rows (#5501)" % ord(ch))
+        n += 1
+        if terminator_faults("x\ny\n", "t") or len(diff_rows("#1 | b.sh | 1 | one")) != 1:
+            bad.append("the LF control was refused or misread (#5501)")
+        # a row read from git that does not parse is a fault, never a silent skip (#5501, mutant R7-07)
+        n += 1
+        try:
+            parse_git_list("#1 | b.sh | many | export SERVICE_PASSWORD\n", "base-pending", True)
+            bad.append("a malformed row read from git was skipped instead of raised (#5501)")
+        except RuntimeError:
+            pass
     finally:
         for k, v in saved.items():
             if v is None:
