@@ -398,19 +398,12 @@ def import_pin_gap(found: list, pinned) -> tuple:
 
 
 def imported_modules(path: Path) -> list:
-    """#5379: the top-level names of every module `path` imports (parsed, never executed), except the built-in
-    `sys`. The self-test plants one file per name beside its non-isolated child, so an import of any of them
-    placed before the module-top refusal runs a planted file instead of going unnoticed. Measured on CPython
-    3.12.7: os and stat are frozen stdlib modules (FrozenImporter.find_spec returns a spec for both) and
-    FrozenImporter precedes PathFinder on sys.meta_path, so a planted os.py or stat.py is never resolved from
-    the script directory, whether or not the module is already loaded; the frozen set varies by Python version.
-    importlib is NOT frozen: its planted file is load-bearing. Under -S (no site import) an `import importlib`
-    resolves the planted importlib.py. Whether the site startup (no -S) has already loaded importlib depends on
-    the installation's .pth files, not on the Python version (measured on one node: 3.12.3 no, an anaconda 3.12.7
-    yes), so the probe runs under -S and the self-test requires importlib not to be preloaded there (#5442). The
-    importlib plant is pinned by the self-test.
-    Dynamic imports (importlib.import_module, __import__) are not found by this AST scan (#5405); the script
-    has none."""
+    """#5379: the top-level names of every module `path` imports (parsed with ast, never executed), except `sys`.
+    The self-test plants one file per name beside its non-isolated child. What a planted file does on a given
+    interpreter is not stated here: plant_probe has the child report whether each name is loaded, built-in or
+    frozen, and the self-test requires the planted file to run exactly when the child says it is not (#5441).
+    EXPECTED_IMPORTS pins the set (#5472). Dynamic imports (importlib.import_module, __import__) are not found by
+    this ast scan (#5405); the script has none."""
     names = set()
     for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Import):
@@ -590,21 +583,20 @@ def _self_test_cases() -> int:
          base_mutate=weakened_pyc)
 
     def isolated_refusal():
-        # #5163/#5313: without -I the script directory heads sys.path, so the comparison must refuse to run, and
-        # the non-isolated child is started from a COPY of the script in an empty scratch directory (never from
-        # the real scripts/ directory, where a merged sibling named like a standard module would run inside the
-        # trusted job). Standard-module files are planted beside the copy; none may run.
+        # #5163/#5313/#5474: the comparison must refuse to run without -I. The non-isolated child is started from a
+        # COPY of the script in an empty scratch directory (never from the real scripts/ directory, #5380), with a file
+        # planted beside the copy for every imported name; none may run before the refusal, under each flag set below.
         iso = base_dir / "iso"
         iso.mkdir(parents=True, exist_ok=True)
         copy = iso / "claude-md-rule-compare.py"
         shutil.copyfile(Path(__file__).resolve(), copy)
         for name in sorted(set(EXPECTED_IMPORTS) | set(imported_modules(Path(__file__).resolve()))):
             (iso / f"{name}.py").write_text("print('PLANTED')\nraise SystemExit(0)\n", encoding="utf-8")
-        # #5283: the refusal must hold for every partial isolation, not only for a bare interpreter: -E (ignore
-        # PYTHON* variables) and -s (no user site) each leave the script directory on sys.path. #5373: so do both
-        # together (-I is exactly -E plus -s plus the path rule) and -S, -B, -O; none is isolation. -P (safe path)
-        # is deliberately not pinned here: it removes the script directory, so a refusal under it is a posture choice.
-        for flags in ([], ["-E"], ["-s"], ["-E", "-s"], ["-E", "-s", "-S", "-B", "-O"]):
+        # #5283/#5373/#5474: the refusal is pinned for every partial isolation (-E, -s, both, plus -S -B -O) and under
+        # -X frozen_modules=off and =on, alone and combined. -P is not pinned here.
+        for flags in ([], ["-E"], ["-s"], ["-E", "-s"], ["-E", "-s", "-S", "-B", "-O"],
+                      ["-X", "frozen_modules=off"], ["-X", "frozen_modules=off", "-S", "-E"],
+                      ["-X", "frozen_modules=off", "-E", "-s", "-S", "-B", "-O"], ["-X", "frozen_modules=on", "-S", "-E"]):
             result = non_isolated_child(copy, flags, iso / "s")
             if result is None or not (result.returncode == 1 and "isolated mode" in result.stdout
                                       and "PLANTED" not in result.stdout + result.stderr):
@@ -619,9 +611,10 @@ def _self_test_cases() -> int:
         print("FAIL: self-test - a comparison run without -I did not fail closed (R5, #5163)", file=sys.stderr)
 
     def importlib_plant():
-        # #5424/#5441/#5442/#5443: importlib is in the plant set (it is not frozen, so its plant is load-bearing), the
-        # docstring says so, and for EVERY name the script imports a planted file runs exactly when the child finds
-        # the module neither preloaded, built-in nor frozen; also under -X frozen_modules=off. Returns "" or why.
+        # #5424/#5441/#5442/#5443/#5473: importlib is in the plant set, the imported set equals the pin, and for EVERY
+        # pinned name a planted file runs exactly when the child finds the module neither preloaded, built-in nor
+        # frozen, under default interpreter options and under -X frozen_modules=off, with the child's own flag report
+        # equal to what is required. Returns "" or why.
         found = imported_modules(Path(__file__).resolve())
         missing, extra = import_pin_gap(found, EXPECTED_IMPORTS)
         if missing or extra:
@@ -633,13 +626,9 @@ def _self_test_cases() -> int:
         names = list(EXPECTED_IMPORTS)  # the probe set is the pin, never the output of imported_modules (#5472)
         if "importlib" not in names:
             return "importlib is not in the plant set"
-        words = " ".join((imported_modules.__doc__ or "").split())
-        if "never runs" in words or "importlib is NOT frozen" not in words or "frozen stdlib modules" not in words:
-            return "the docstring is wrong"
-        if "inert there" in words or "depends on the installation's .pth files" not in words:
-            return "the docstring generalises the site-import fact to a Python version (#5442)"
         probed = []
         for xopts in ([], ["-X", "frozen_modules=off"]):
+            live = []
             for name in names:
                 plant = plant_probe(name, base_dir / "implant", xopts)
                 # #5473: the flags the CHILD reports must be the ones this check relies on (-S -E, no safe path, and
@@ -654,6 +643,9 @@ def _self_test_cases() -> int:
                 if not plant.ok:
                     return f"the planted {name}.py behaved differently from the child's own verdict (xopts {xopts})"
                 probed.append(name)
+                if plant.planted_ran:
+                    live.append(name)
+            print(f"INFO: self-test - planted file ran (measured) for {live} with options {xopts}")
         if plant_coverage_gap(probed, names, 2):
             return "not every imported name was probed"
         if plant_coverage_gap(names + names, names, 2) or not plant_coverage_gap(names[:1], names, 1) \
@@ -692,7 +684,7 @@ def _self_test_cases() -> int:
 
     plant_failure = importlib_plant()
     if not plant_failure:
-        print("PASS: self-test - the importlib plant is in the plant set and the docstring states why (#5424)")
+        print("PASS: self-test - the plant set equals the pinned imports and every planted file ran as the child reported (#5424)")
     else:
         failures.append("importlib plant")
         print(f"FAIL: self-test - the importlib plant check failed: {plant_failure} (#5424, #5441)", file=sys.stderr)
