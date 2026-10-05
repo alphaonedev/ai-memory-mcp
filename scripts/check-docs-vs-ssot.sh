@@ -286,21 +286,24 @@ DOC_FILES=(
 # phrasing first (a follow-up on the gate's core rule logic, deliberately not
 # bundled into this doc-perfection wave). The list below is de-duped against
 # the curated entries above so their inline rationale survives.
-for _wf in \
-    docs/USER_GUIDE.md \
-    docs/CLI_REFERENCE.md \
-    docs/GLOSSARY.md \
-    docs/SECURITY.md \
-    docs/INSTALL.md \
-    docs/install-quickstart.md \
-    docs/integration-guide.md \
-    docs/postgres-age-guide.md \
-    docs/compliance/honest-limitations.md \
-    docs/hook-pipeline.md \
-    docs/agent-skills.md \
-    docs/batman-active-mode.md \
+WIDENED_DOC_FILES=(
+    docs/USER_GUIDE.md
+    docs/CLI_REFERENCE.md
+    docs/GLOSSARY.md
+    docs/SECURITY.md
+    docs/INSTALL.md
+    docs/install-quickstart.md
+    docs/integration-guide.md
+    docs/postgres-age-guide.md
+    docs/compliance/honest-limitations.md
+    docs/hook-pipeline.md
+    docs/agent-skills.md
+    docs/batman-active-mode.md
     docs/governance.md
-do
+)
+for _wf in "${WIDENED_DOC_FILES[@]}"; do
+    # Skipped here only to keep the merge total; a missing entry FAILS at the
+    # enrolled-doc check below (#5702) unless a self-test fixture enrols a subset.
     [[ -f "$_wf" ]] || continue
     _dup=0
     for _e in "${DOC_FILES[@]}"; do [[ "$_e" == "$_wf" ]] && { _dup=1; break; }; done
@@ -406,15 +409,14 @@ fi
 # docs/essays/brass-tacks-3-why.html were hand-added here when
 # HTML_DOC_FILES held one file; the widened glob now already carries
 # them, and a duplicate entry would report the same drift twice.
-HOOK_DOC_FILES=()
-for _hd in \
-    "${DOC_FILES[@]}" \
-    "${HTML_DOC_FILES[@]}" \
-    docs/production-deployment.md \
-    docs/strategy/coala-mapping.md \
-    docs/audience/developer.html \
+HOOK_EXTRA_DOC_FILES=(
+    docs/production-deployment.md
+    docs/strategy/coala-mapping.md
+    docs/audience/developer.html
     docs/essays/brass-tacks-3-why.html
-do
+)
+HOOK_DOC_FILES=()
+for _hd in "${DOC_FILES[@]}" "${HTML_DOC_FILES[@]}" "${HOOK_EXTRA_DOC_FILES[@]}"; do
     _dup=0
     for _e in "${HOOK_DOC_FILES[@]:-}"; do [[ "$_e" == "$_hd" ]] && { _dup=1; break; }; done
     [[ "$_dup" == 0 ]] && HOOK_DOC_FILES+=("$_hd")
@@ -459,6 +461,22 @@ PGVECTOR_DOC_FILES=(
 CERT_CHECK_DOC_FILES=(
     docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md
 )
+
+# Every hand-enrolled doc must exist (#5702). The rules below skip a file that is
+# not there, so before this check a renamed, moved or deleted enrolled doc shrank
+# the closed world each rule claims to police and the gate still printed PASS. A
+# deliberate removal is a one-line edit to the list it is enrolled in. A self-test
+# fixture enrols a subset of these, so under AI_MEMORY_DOCS_GATE_ROOT the check
+# runs only when AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 (the #2444 precedent).
+if [[ -z "${AI_MEMORY_DOCS_GATE_ROOT:-}" || "${AI_MEMORY_DOCS_GATE_REQUIRE_DOCS:-}" == 1 ]]; then
+    for _ed in "${DOC_FILES[@]}" "${WIDENED_DOC_FILES[@]}" "${HOOK_EXTRA_DOC_FILES[@]}" \
+               "${PGVECTOR_DOC_FILES[@]}" "${CERT_CHECK_DOC_FILES[@]}"; do
+        [[ -f "$_ed" ]] && continue
+        printf 'FAIL: check-docs-vs-ssot: enrolled doc %s is missing — refusing to report PASS on a shrunken closed world (#5702 fail-closed)\n' \
+            "$_ed" >&2
+        exit 1
+    done
+fi
 
 # CHANGELOG.md is intentionally excluded — every entry is a historical
 # snapshot at landing time, so claims like "Both adapters now at
@@ -3258,6 +3276,35 @@ R5MD
     echo "PASS: self-test #5390 - the whitespace-folded needle form is pinned: Schema version  | **v60** (doubled space) exempts its table row only through the whitespace fold"
     rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/vacuous-fixture.html"
     printf '# fixture ledger (comment-only)\n' > scripts/qc-allowlists/schema-claim-history.txt
+
+    # ---- #5702: every hand-enrolled doc must exist. The fixture enrols a subset, so
+    # the arm opts in with AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1, fills the enrolled set
+    # with empty files, then moves one entry of each list away: the gate must refuse
+    # by name. The control (all present) must not raise the refusal. Every pgvector
+    # entry is also on another list today, so that list has no entry of its own to move.
+    _made=()
+    for _ed in "${DOC_FILES[@]}" "${WIDENED_DOC_FILES[@]}" "${HOOK_EXTRA_DOC_FILES[@]}" \
+               "${PGVECTOR_DOC_FILES[@]}" "${CERT_CHECK_DOC_FILES[@]}"; do
+        [[ -e "$tmpdir/$_ed" ]] && continue
+        mkdir -p "$(dirname "$tmpdir/$_ed")"
+        : > "$tmpdir/$_ed"
+        _made+=("$_ed")
+    done
+    _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) || true
+    grep -qF 'enrolled doc ' <<<"$_e_out" && {
+        echo "FAIL: self-test #5702 - the enrolled-doc check refused a complete enrolled set" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _ed in docs/v1.0.0/nhi-playbook-P0-P11.md docs/USER_GUIDE.md docs/postgres-age-guide.md \
+               docs/strategy/coala-mapping.md docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md; do
+        mv "$tmpdir/$_ed" "$tmpdir/$_ed.away"
+        _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) && {
+            echo "FAIL: self-test #5702 - a missing enrolled doc ($_ed) did not fail the gate" >&2; cd "$REPO_ROOT"; exit 1; }
+        grep -qF "enrolled doc $_ed is missing" <<<"$_e_out" || {
+            echo "FAIL: self-test #5702 - the refusal for a missing enrolled doc does not name $_ed" >&2; cd "$REPO_ROOT"; exit 1; }
+        mv "$tmpdir/$_ed.away" "$tmpdir/$_ed"
+    done
+    for _ed in "${_made[@]}"; do rm -f "$tmpdir/$_ed"; done
+    echo "PASS: self-test #5702 - a missing hand-enrolled doc FAILS the gate and names the path: one entry each of curated DOC_FILES (nhi-playbook), the widened list (USER_GUIDE, and postgres-age-guide, also on the pgvector list), the hook extras (coala-mapping) and the cert list (ENTERPRISE-FEDERATION-CERTIFICATION, also on the pgvector list); a complete enrolled set does not raise it"
+
 
     # ---- FAIL-CLOSED-ONLY-WITH-A-CLAIM: remove both SSOTs. A doc that
     # narrates NO count has nothing to validate and must stay green;
