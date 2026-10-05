@@ -525,6 +525,8 @@ MDEOF
         'See [`gone`]( src/gone.rs) x'
     anchor_red 5396 PATH "an escape-token link target on the next line" \
         $'Formerly [h](\nsrc/../gone.rs) x'
+    # (Kept red conservatively: CommonMark lets a definition interrupt no paragraph, so
+    # this head after a prose line is not strictly a definition; #5459.)
     anchor_red 5396 PATH "an escape-token reference definition target on the next line" \
         $'Formerly it lived here.\n[h]:\nsrc/../gone.rs'
     anchor_red 5396 PATH "a missing file after a space, behind a live link on the same line" \
@@ -753,6 +755,14 @@ MDEOF
         "See \`$R::{<NoSuch as Tr>}\` x"
     anchor_green 5460 "an as group with a live type inside a brace item" \
         "See \`$R::{<RecallTool as Tr>}\` x"
+
+    # #5459: a reference-definition head indented 4 or more spaces (or a tab) is
+    # an indented code block, like the same-line form pinned by #5343, so the
+    # line below it is not a link target; a tab head stays a head (red).
+    anchor_green 5459 "a 4-space indented definition head, then an absent escape path" \
+        $'    [x]:\nsrc/../gone.rs no longer exists'
+    anchor_red 5459 PATH "a tab-indented definition head (conservative: one tab counts as one space), then an escape path" \
+        $'\t[x]:\nsrc/../gone.rs no longer exists'
 
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
