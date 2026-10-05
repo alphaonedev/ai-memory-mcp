@@ -1125,6 +1125,43 @@ PYEOF
     anchor_red 5538 PATH "a missing path before \"renamed it later to\" is not exempt" \
         'See `src/handlers.rs` renamed it later to x here.'
 
+    # #5616: a path in the doc or source set that cannot be read was never
+    # checked, so the gate refuses it by name instead of passing it.
+    unreadable_red() {  # <description> <relative path> <dir|mode0> <message>
+        write_clean
+        if [[ "$3" == dir ]]; then
+            mkdir -p "$FIX/$2"
+        else
+            [[ -e "$FIX/$2" ]] || printf 'x\n' > "$FIX/$2"
+            chmod 000 "$FIX/$2"
+        fi
+        local out rc
+        out="$(run_fixture_out)"; rc="$(run_fixture)"
+        if [[ "$3" == dir ]]; then rmdir "$FIX/$2"; else chmod 644 "$FIX/$2"; fi
+        [[ "$rc" != "0" ]] || {
+            echo "FAIL: self-test #5616 — $1 was ACCEPTED" >&2; exit 1; }
+        grep -Fq "$4" <<<"$out" || {
+            echo "FAIL: self-test #5616 — $1 rejected without naming it ($4)" >&2; exit 1; }
+        echo "PASS: self-test #5616 — $1 is REJECTED"
+    }
+    unreadable_red "a directory in place of a top-level doc" ROADMAP.md dir \
+        "cannot read ROADMAP.md"
+    unreadable_red "a directory matched by the docs glob" docs/x.md dir \
+        "cannot read docs/x.md"
+    unreadable_red "a directory matched by a recursive docs glob" docs/integrations/y.md dir \
+        "cannot read docs/integrations/y.md"
+    unreadable_red "a directory matched by the sdk glob" sdk/a/README.md dir \
+        "cannot read sdk/a/README.md"
+    unreadable_red "a directory matched by the source glob" src/z.rs dir \
+        "cannot read src/z.rs"
+    if [[ "$(id -u)" != "0" ]]; then
+        unreadable_red "a doc with no read permission" SECURITY.md mode0 \
+            "cannot read SECURITY.md"
+        unreadable_red "a source file with no read permission" src/store/postgres.rs mode0 \
+            "cannot read src/store/postgres.rs"
+        rm -f "$FIX/SECURITY.md"
+    fi
+
     # #5460: the type of an as group inside a brace item is a claim.
     anchor_red_cites 5460 QUAL "an as group with a missing type inside a brace item" \
         "$R::NoSuch" \
@@ -1858,7 +1895,10 @@ for p in sorted(glob.glob(os.path.join(root, "src/**/*.rs"), recursive=True)):
     rel = p[len(root) + 1:]
     try:
         text = open(p, encoding="utf-8", errors="replace").read()
-    except OSError:
+    except OSError as e:
+        # #5616: an unreadable source file is not an empty one; refuse it
+        # rather than report its anchors under a misleading rule.
+        print(f"SETUP\t-\t0\t-\tcannot read {rel}: {e.strerror or e}")
         continue
     # #4700: the number of lines, not newlines + 1 (a trailing newline
     # does not start a line, so `N+1` of an N-line file was accepted).
@@ -2741,7 +2781,11 @@ def emit(rule, doc, ln, token, ctx):
 for doc in seen_docs:
     try:
         text = open(os.path.join(root, doc), encoding="utf-8", errors="replace").read()
-    except OSError:
+    except OSError as e:
+        # #5616: a doc in the set that cannot be read was never checked, so
+        # the gate must not pass it (a directory named like a doc, or a file
+        # with no read permission, was skipped silently).
+        emit("SETUP", doc, 0, "-", f"cannot read {doc}: {e.strerror or e}")
         continue
     doc_lines = text.splitlines()
     for ln, line in enumerate(doc_lines, 1):
