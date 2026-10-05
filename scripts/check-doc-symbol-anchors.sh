@@ -727,6 +727,26 @@ MDEOF
     anchor_red 5456 BARE_QUAL "a path that continues past a closer inside a prose generic" \
         "See Vec<$R::RecallTool<T>>::decorate_memory_many> here."
 
+    # #5457: a self type that opens with dyn, impl or a reference names the
+    # type behind that word, not the keyword.
+    anchor_green 5457 "a dyn trait-object self type with live parts" \
+        "See \`$R::<dyn RecallTool>::decorate_memory_many\`."
+    anchor_green 5457 "a dyn self type with an as clause and live parts" \
+        "See \`$R::<dyn RecallTool as Tr>::decorate_memory_many\`."
+    anchor_green 5457 "a mutable reference self type with live parts" \
+        "See \`$R::<&mut RecallTool>::decorate_memory_many\`."
+    anchor_green 5457 "a lifetime reference self type with live parts" \
+        "See \`$R::<&'a RecallTool>::decorate_memory_many\`."
+    anchor_red_cites 5457 QUAL "a dyn self type whose trait is missing" \
+        "$R::NoSuch" \
+        "See \`$R::<dyn NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5457 QUAL "a lifetime mutable reference self type whose type is missing" \
+        "$R::NoSuch" \
+        "See \`$R::<&'a mut NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5457 QUAL "a dyn self type with a live trait but a missing method" \
+        "$R::no_such" \
+        "See \`$R::<dyn RecallTool>::no_such\`."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
@@ -1499,6 +1519,9 @@ HREF = re.compile(
 LINEFRAG = re.compile(r"^#L(\d+)(?:C\d+)?(?:-L?(\d+)(?:C\d+)?)?$")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 AS_WORD = re.compile(r"\bas\b")
+# #5457: a self type may open with a reference or a trait-object keyword
+# (`<dyn Trait>::m`, `<&mut T>::m`); those are not the type's name.
+SELF_PREFIX = re.compile(r"(?:&\s*(?:'[A-Za-z_]\w*\s+)?(?:mut\s+)?|\b(?:dyn|impl|mut)\s+)+")
 
 
 def unwrap_self_type(tok):
@@ -1511,7 +1534,9 @@ def unwrap_self_type(tok):
     if end is None:
         return tok
     inner = tok[1:end - 1]
-    m = ID_RE.match(inner.lstrip())
+    head = inner.lstrip()
+    pm = SELF_PREFIX.match(head)
+    m = ID_RE.match(head, pm.end() if pm else 0)
     # #5433: with no `as`, `<Type<T>>::m` is still a qualified path whose
     # type is the claim; a placeholder with nothing behind it is not.
     if m and (AS_WORD.search(inner) or tok.startswith("::", end)):
