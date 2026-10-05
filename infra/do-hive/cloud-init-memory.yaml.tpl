@@ -499,15 +499,24 @@ write_files:
       chmod 0750 /etc/ai-memory
       # The role password is minted here, on the node, from the placeholder
       # (hex, so it needs no URL or SQL quoting); a re-run keeps the one the
-      # file already carries.
-      if grep -q CHANGEME /etc/ai-memory/store-url; then
-        NEW_SECRET="$(openssl rand -hex 24)"
-        # The script reaches sed on stdin: the secret is never on an argv.
-        printf 's/CHANGEME/%s/\n' "$NEW_SECRET" | sed -i -f - /etc/ai-memory/store-url
-        unset NEW_SECRET
+      # file already carries. The file is only ever read with a fixed sed -n
+      # expression and written with the shell's own printf, so the gate can show
+      # (rule R5) that no command runs it, and the secret is on no argv (#5428).
+      # A file that is empty or holds no URL is minted again from the template URL.
+      URL="$(sed -n 's#^\(.*CHANGEME.*\)#\1#p' /etc/ai-memory/store-url)"
+      CUR="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+      if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ]; then
+        NEW_HEX="$(openssl rand -hex 24)"
+        if [ "$CUR" = CHANGEME ]; then
+          printf '%s\n' "$${URL/CHANGEME/$NEW_HEX}" > /etc/ai-memory/store-url
+        else
+          printf 'postgres://%s@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt\n' "aimemory:$NEW_HEX" > /etc/ai-memory/store-url
+        fi
+        unset NEW_HEX
       fi
       # Fail closed: the shipped placeholder must never reach a running node.
-      if grep -q CHANGEME /etc/ai-memory/store-url; then
+      CUR="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+      if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ]; then
         echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1
       fi
       chown aimemory:aimemory /etc/ai-memory/store-url

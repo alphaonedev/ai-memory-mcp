@@ -72,22 +72,48 @@ def assert_off_argv(name, d, prog, want_in_stdin):
     probe(name + ": secret reaches %s on stdin" % prog, want_in_stdin in stdin, repr(stdin[:60]))
 
 
-def f4_sed():
+def mint_block():
+    """The provision.sh role-password rotation statements (from the URL read to the placeholder refusal), with the
+    Terraform escape $${ turned into the shell text ${ and the store-url path left for the caller to replace."""
     tpl = TPL.read_text()
-    m = re.search(r"^[ ]*# The script reaches sed on stdin.*?^[ ]*unset NEW_SECRET\n", tpl, re.S | re.M)
-    probe("F4 sed mint block present", bool(m))
-    if not m:
+    m = re.search(r"^[ ]*URL=\"\$\(sed -n .*?^[ ]*echo \"placeholder db password still in /etc/ai-memory/store-url\"; exit 1\n[ ]*fi\n", tpl, re.S | re.M)
+    return None if not m else m.group(0).replace("$${", "${")
+
+
+def f4_sed():
+    """#5428: the rotation reads the store-url with fixed sed -n, writes it with the bash printf builtin, and the
+    new secret is on no argv. CHANGEME is replaced, a rotated file is unchanged, an empty or non-URL file is minted."""
+    block = mint_block()
+    probe("F4 mint block present", bool(block))
+    if not block:
         return
-    with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
-        d = pathlib.Path(t)
-        stub_dir(d, "sed", real="/usr/bin/sed")
-        f = d / "store-url"
-        f.write_text("postgres://aimemory:CHANGEME@localhost/aimemory\n")
-        block = m.group(0).replace("/etc/ai-memory/store-url", str(f))
-        r = run_bash("NEW_SECRET=%s\n%s" % (SECRET, block), d)
-        probe("F4 sed rc 0", r.returncode == 0, r.stderr[:80])
-        probe("F4 store-url holds the minted value", SECRET in f.read_text() and "CHANGEME" not in f.read_text())
-        assert_off_argv("F4 sed", d, "sed", SECRET)
+    probe("F4 no grep on the store-url", "grep" not in block)
+    probe("F4 no sed -i or script on stdin", not re.search(r"sed\s+(-\S*i|-f)", block))
+    cases = [
+        ("CHANGEME is replaced", "postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full\n", "mint"),
+        ("rotated file is unchanged", "postgres://aimemory:abc123@localhost/aimemory?sslmode=verify-full\n", "keep"),
+        ("empty file is minted", "", "fresh"),
+        ("non-URL file is minted", "garbage\n", "fresh"),
+    ]
+    for label, start, want in cases:
+        with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+            d = pathlib.Path(t)
+            (d / "sed").write_text('#!/bin/bash\nprintf "%s\\n" "$@" >> "$LOGDIR/argv.log"\nexec /usr/bin/sed "$@"\n')
+            (d / "sed").chmod(0o755)
+            (d / "openssl").write_text('#!/bin/bash\nprintf "%s\\n" "$@" >> "$LOGDIR/argv.log"\nprintf "%s\\n" "' + SECRET + '"\n')
+            (d / "openssl").chmod(0o755)
+            f = d / "store-url"
+            f.write_text(start)
+            r = run_bash(block.replace("/etc/ai-memory/store-url", str(f)), d)
+            got = f.read_text()
+            argv = (d / "argv.log").read_text() if (d / "argv.log").exists() else ""
+            probe("F4 " + label + ": rc 0", r.returncode == 0, r.stderr[:80])
+            if want == "keep":
+                probe("F4 " + label + ": file bytes unchanged", got == start, repr(got[:60]))
+            else:
+                probe("F4 " + label + ": minted value in a URL, no placeholder", SECRET in got and "CHANGEME" not in got
+                      and got.startswith("postgres://aimemory:" + SECRET + "@localhost/"), repr(got[:60]))
+            probe("F4 " + label + ": secret on no external argv", SECRET not in argv)
 
 
 def f5_admin_call():
