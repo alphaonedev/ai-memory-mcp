@@ -1079,7 +1079,10 @@ def _git_child_env() -> Dict[str, str]:
 
 def _git_exec(root: Path, args: Sequence[str]) -> "subprocess.CompletedProcess[bytes]":
     """The only subprocess call of git in the gate (the self-test checks this by reading this file)."""
-    argv = ["git", "-C", str(root)]
+    # repo-local config that runs a command is pinned off for every read (#5633): core.fsmonitor runs its value
+    # from ls-files and status, core.hooksPath would point git at hooks; the history log and the blob reads also
+    # pass --no-ext-diff and --no-textconv themselves
+    argv = ["git", "-C", str(root), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull]
     return subprocess.run(argv + list(args), check=True, capture_output=True, env=_git_child_env())
 
 
@@ -1161,7 +1164,7 @@ def _show_or_absent(root: Path, mb: str, path: str) -> str:
     error, never an empty list: unresolved means red (#5297)."""
     spec = "%s:%s" % (mb, path)
     try:
-        return _git(root, "show", spec)
+        return _git(root, "show", "--no-textconv", spec)
     except subprocess.CalledProcessError:
         pass
     # show failed: it is "absent" only if the base tree has no such path (a failing ls-tree raises)
@@ -2724,6 +2727,16 @@ def _git_funnel_cases(t: Path) -> Tuple[List[str], int]:
     with open(str(repo / ".git" / "config"), "a") as fh:
         fh.write("[diff]\n\tmnemonicPrefix = true\n[log]\n\tshowSignature = true\n")
     check("a repo-local diff.mnemonicPrefix and log.showSignature", repo, shas)
+    repo, shas = build("local-fsmonitor")
+    marker = t / "fsmonitor-ran"
+    hook = t / "fsmonitor-hook.py"
+    hook.write_text("import pathlib, sys\npathlib.Path(%r).write_text('ran')\nsys.exit(1)\n" % str(marker))
+    with open(str(repo / ".git" / "config"), "a") as fh:
+        fh.write("[core]\n\tfsmonitor = %s %s\n" % (sys.executable, hook))
+    check("a repo-local core.fsmonitor program", repo, shas)
+    n += 1
+    if marker.exists():
+        bad.append("a repo-local core.fsmonitor program ran during the gate's git reads (#5633)")
     repo, shas = build("attr-info")
     (repo / ".git" / "info").mkdir(parents=True, exist_ok=True)
     (repo / ".git" / "info" / "attributes").write_text("%s -diff\n" % PENDING_FILE)
