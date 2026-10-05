@@ -1776,7 +1776,11 @@ def ext_pin_5275():
              ("both labels repeated empty and last", "18.6\nage=1.8.0\nage=\nvector=0.8.6\nvector=\n\n", False, False),
              # #5358: a label in the middle of a line is not a labelled line.
              ("a mid-line vector label", "18.6 (Ubuntu)\nage=1.8.0\n0.8.vector=6\n", True, False),
-             ("a mid-line age label", "18.6 (Ubuntu)\n1.8.age=0\nvector=0.8.6\n", False, True))
+             ("a mid-line age label", "18.6 (Ubuntu)\n1.8.age=0\nvector=0.8.6\n", False, True),
+             # #5415: label text in the middle of a line beside a valid labelled line must not fail a healthy node.
+             ("a mid-line age label beside a valid age line", "18.6\nage=1.8.0\nx age=1.8.0\nvector=0.8.6\n", True, True),
+             ("a mid-line vector label beside a valid vector line", "18.6\nage=1.8.0\nvector=0.8.6\nx vector=0.8.6\n", True, True),
+             ("a mid-line age label beside a valid age line, other order", "18.6\nx age=1.7.0\nage=1.8.0\nvector=0.8.6\n", True, True))
     with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
         d = pathlib.Path(t)
         for label, reply, want_age, want_vec in cases:
