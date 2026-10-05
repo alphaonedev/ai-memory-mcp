@@ -70,7 +70,7 @@ import subprocess
 import sys
 from collections import Counter, OrderedDict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 DENYLIST = "scripts/check-docs-no-argv-secrets.py"
@@ -968,7 +968,7 @@ def by_key(found: Dict[str, List[Found]], rel: str, text: str) -> List[Found]:
 
 # ---------------------------------------------------------------- repo walk
 def tracked_files(root: Path) -> List[str]:
-    out = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], check=True, capture_output=True).stdout
+    out = _git_raw(root, "ls-files", "-z")
     files = [f for f in out.decode("utf-8", "replace").split("\0") if f]
     if not files:
         raise RuntimeError("git ls-files returned no files; refusing to pass on an empty scan")
@@ -977,8 +977,7 @@ def tracked_files(root: Path) -> List[str]:
 
 def tracked_exec_bit(root: Path) -> List[str]:
     """Tracked files carrying the executable bit (git mode 100755)."""
-    out = subprocess.run(["git", "-C", str(root), "ls-files", "-s", "-z"], check=True,
-                         capture_output=True).stdout.decode("utf-8", "replace")
+    out = _git_raw(root, "ls-files", "-s", "-z").decode("utf-8", "replace")
     res = []
     for rec in out.split("\0"):
         if rec.startswith("100755 ") and "\t" in rec:
@@ -1062,13 +1061,54 @@ def check_allow_vs_denylist(found: Dict[str, List[Found]], allow: List[Entry]) -
     return bad
 
 
+# The ONE funnel of every git read of the gate (#5581). Closed world: the child gets a short allowlist of the
+# parent's environment, so no GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY,
+# GIT_ALTERNATE_OBJECT_DIRECTORIES, GIT_REPLACE_REF_BASE, GIT_SHALLOW_FILE, GIT_CONFIG_COUNT/KEY_n/VALUE_n or
+# GIT_CONFIG_PARAMETERS of the caller reaches it, and the entries below are set by the gate itself.
+GIT_ENV_KEEP = ("PATH", "SYSTEMROOT", "TMPDIR", "TEMP", "TMP")
+_GIT_PROVEN: set = set()
+
+
+def _git_child_env() -> Dict[str, str]:
+    """The environment of every git child: the allowlist plus the gate's own settings (#5581, #5503)."""
+    env = {k: os.environ[k] for k in GIT_ENV_KEEP if k in os.environ}
+    env.update({"GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull, "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+    return env
+
+
+def _git_exec(root: Path, args: Sequence[str]) -> "subprocess.CompletedProcess[bytes]":
+    """The only subprocess call of git in the gate (the self-test checks this by reading this file)."""
+    argv = ["git", "-C", str(root)]
+    return subprocess.run(argv + list(args), check=True, capture_output=True, env=_git_child_env())
+
+
+def _git_prove(root: Path) -> None:
+    """Prove once per repository that no global or system config is in reach of the funnel; git that cannot
+    show config scopes, or a scope that is still reachable, is a FAULT, not a hope (#5581)."""
+    key = str(root)
+    if key in _GIT_PROVEN:
+        return
+    try:
+        rows = _git_exec(root, ["config", "--list", "--show-scope"]).stdout.decode("utf-8", "replace")
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise RuntimeError("cannot prove the git reads are isolated from global config (%s): %s"
+                           % (str(exc)[:100], HISTORY_REMEDY))
+    leaks = sorted({ln.split("\t", 1)[0] for ln in rows.split("\n") if ln.split("\t", 1)[0] in ("system", "global")})
+    if leaks:
+        raise RuntimeError("git reads are not isolated: %s config is in reach of the gate (fail closed)"
+                           % "/".join(leaks))
+    _GIT_PROVEN.add(key)
+
+
+def _git_raw(root: Path, *args: str) -> bytes:
+    """git stdout as bytes, through the funnel."""
+    _git_prove(root)
+    return _git_exec(root, args).stdout
+
+
 def _git(root: Path, *args: str) -> str:
-    # GIT_GRAFT_FILE points at the null device: .git/info/grafts is honoured even under
-    # --no-replace-objects and could make a row-dropping commit a root, so no read of the history
-    # follows a graft (#5503; replace refs are switched off per call with --no-replace-objects)
-    env = dict(os.environ, GIT_GRAFT_FILE=os.devnull)
-    return subprocess.run(["git", "-C", str(root)] + list(args), check=True, capture_output=True,
-                          env=env).stdout.decode("utf-8", "replace")
+    return _git_raw(root, *args).decode("utf-8", "replace")
 
 
 def allow_from_pending(allow: List[Entry], base_pending: List[Entry], renames: Dict[str, str]) -> List[str]:
@@ -1189,8 +1229,8 @@ def removed_pending_rows(root: Path) -> Dict[str, str]:
     if _git(root, "rev-parse", "--is-shallow-repository").strip() != "false":
         raise RuntimeError("the history of %s is incomplete (shallow clone): %s" % (PENDING_FILE, HISTORY_REMEDY))
     try:
-        log = _git(root, "--no-replace-objects", "-c", "core.quotepath=false", "log", "-m", "--no-ext-diff",
-                   "--no-textconv", "--no-renames", "-p", "-U0", "--no-color", "--format=commit %h",
+        log = _git(root, "-c", "core.quotepath=false", "log", "-m", "--no-ext-diff", "--no-textconv", "--text",
+                   "--encoding=UTF-8", "--no-renames", "-p", "-U0", "--no-color", "--format=commit %h",
                    "-G" + PENDING_ROW_PICKAXE)
         listed = _git(root, "log", "-1", "--format=%h", "--full-history", "--", PENDING_FILE).strip()
         at_head = _show_or_absent(root, "HEAD", PENDING_FILE)
@@ -1706,6 +1746,10 @@ ROUND3_GREEN = [
     ("5583 an environment variable name is not a family client", 'docker run -e MYSQL_ROOT_PASSWORD -p"$HOST_PORT:3306" img'),
     ("5583 an interactive mariadb --pa is ambiguous", 'mariadb --pa="$X" db'),
     ("5583 an interactive mysql.exe --loose_pa is ambiguous", 'mysql.exe --loose_pa="$X" db'),
+    ("5583 a tool whose name only ends in a client name is no client", 'xmysql -p"$DB_PASSWORD"'),
+    ("5583 a later command after && is not an argument of the client", 'mysqldump db && echo -p"$DB_PASSWORD"'),
+    ("5583 an assignment named like a client is no command", 'mysql_args=(-x -p"$DB_PASSWORD")'),
+    ("5583 a mariadb-named assignment is no command", 'mariadb_opts="-x --password=$DB_PASSWORD"'),
     ("5582 mysql --loose_pa is ambiguous, not --password", 'mysql --loose_pa="$X" db'),
     ("5582 mysqldump --loose_password-file is not --password", 'mysqldump --loose_password-file="$PW_FILE" db'),
     ("5582 mysql --loose_pager is not --password", 'mysql --loose_pager="$PAGER_CMD" db'),
@@ -1746,10 +1790,6 @@ def round3_probe_cases(dl) -> Tuple[List[str], int]:
     when triggered, an allow entry approves them through the real gate checks."""
     bad: List[str] = []
     n = 0
-    ("5583 a tool whose name only ends in a client name is no client", 'xmysql -p"$DB_PASSWORD"'),
-    ("5583 a later command after && is not an argument of the client", 'mysqldump db && echo -p"$DB_PASSWORD"'),
-    ("5583 an assignment named like a client is no command", 'mysql_args=(-x -p"$DB_PASSWORD")'),
-    ("5583 a mariadb-named assignment is no command", 'mariadb_opts="-x --password=$DB_PASSWORD"'),
     for label, line in ROUND3_RED:
         n += 1
         res = scan_exec_file(dl, "c.sh", "#!/bin/bash\n%s\n" % line) or []
@@ -2533,6 +2573,304 @@ def _history_cases(t: Path) -> Tuple[List[str], int]:
     return bad, n
 
 
+def _git_funnel_cases(t: Path) -> Tuple[List[str], int]:
+    """Every git read of the gate runs in the closed-world funnel (#5581): replace refs of a blob and of a
+    commit, grafts (file and env), alternate or other object directories, GIT_DIR and GIT_WORK_TREE elsewhere,
+    another index, injected config (env, global, system, repo-local), attributes that mark the list binary and
+    a GIT_SHALLOW_FILE that hides a shallow clone each leave the answer unchanged or make it a fault."""
+    import shutil
+    gone_row, kept_row = "export SERVICE_PASSWORD", "export KEPT_TOKEN"
+    bad: List[str] = []
+    n = 0
+
+    def git(repo: Path, *a: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), "-c", "user.name=self-test", "-c",
+                               "user.email=self-test@invalid", "-c", "commit.gpgsign=false"] + list(a),
+                              check=True, capture_output=True).stdout.decode("utf-8", "replace")
+
+    def put(repo: Path, rel: str, text: str) -> None:
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_bytes(text.encode("utf-8"))
+
+    def rows(*texts: str) -> str:
+        return "".join("#1 | a.sh | 1 | %s\n" % x for x in texts)
+
+    def build(name: str) -> Tuple[Path, Dict[str, str]]:
+        repo = t / name
+        repo.mkdir(parents=True)
+        git(repo, "init", "-q", "-b", "develop")
+        shas: Dict[str, str] = {}
+        put(repo, PENDING_FILE, rows(gone_row, kept_row))
+        put(repo, "n.txt", "x\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "A")
+        shas["A"] = git(repo, "rev-parse", "HEAD").strip()
+        put(repo, "m.txt", "y\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "B")
+        shas["B"] = git(repo, "rev-parse", "HEAD").strip()
+        git(repo, "branch", "base")
+        put(repo, PENDING_FILE, rows(kept_row))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "C")
+        shas["C"] = git(repo, "rev-parse", "HEAD").strip()
+        return repo, shas
+
+    def check(label: str, repo: Path, shas: Dict[str, str], env: Optional[Dict[str, str]] = None) -> None:
+        """The three readers of the gate (merge base state, history scan, file list) answer as on a clean repo."""
+        nonlocal n
+        n += 1
+        env = env or {}
+        _GIT_PROVEN.clear()  # the isolation proof is per process; every case proves it again under its own environment
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            mb, _ren, pend, _al = base_state(repo, "base")
+            gone = removed_pending_rows(repo)
+            files = tracked_files(repo)
+        except (RuntimeError, subprocess.CalledProcessError) as exc:
+            bad.append("the gate's git reads faulted on %s: %s (#5581)" % (label, str(exc)[:100]))
+            return
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        if mb != shas["B"]:
+            bad.append("the merge base followed %s: %s, not %s (#5581)" % (label, mb[:9], shas["B"][:9]))
+        elif not any(e[3] == gone_row for e in pend):
+            bad.append("the merge-base list read through %s lost the pending row (#5581)" % label)
+        elif gone_row not in gone or kept_row in gone:
+            bad.append("the history scan was misled by %s (%s) (#5581)" % (label, sorted(gone)))
+        elif PENDING_FILE not in files or "n.txt" not in files or "m.txt" not in files:
+            bad.append("the tracked file list was misled by %s (#5581)" % label)
+
+    repo, shas = build("control")
+    check("an untouched repo (control)", repo, shas)
+    repo, shas = build("blob")
+    blob_b = git(repo, "rev-parse", "%s:%s" % (shas["B"], PENDING_FILE)).strip()
+    edited = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], check=True,
+                            capture_output=True, input=rows(kept_row).encode("utf-8")).stdout.decode().strip()
+    git(repo, "replace", blob_b, edited)
+    check("a replace ref on the base list blob", repo, shas)
+    repo, shas = build("graft-ref")
+    git(repo, "replace", "--graft", shas["C"], shas["A"])
+    check("git replace --graft of the head commit", repo, shas)
+    repo, shas = build("graft-file")
+    (repo / ".git" / "info").mkdir(parents=True, exist_ok=True)
+    (repo / ".git" / "info" / "grafts").write_text("%s %s\n" % (shas["C"], shas["A"]))
+    check("a .git/info/grafts entry", repo, shas)
+    graft_env = t / "graft-env.txt"
+    graft_env.write_text("%s %s\n" % (shas["C"], shas["A"]))
+    check("GIT_GRAFT_FILE", repo, shas, {"GIT_GRAFT_FILE": str(graft_env)})
+    empty_dir = t / "empty-objects"
+    empty_dir.mkdir()
+    repo, shas = build("env-objects")
+    check("GIT_ALTERNATE_OBJECT_DIRECTORIES", repo, shas, {"GIT_ALTERNATE_OBJECT_DIRECTORIES": str(empty_dir)})
+    check("GIT_OBJECT_DIRECTORY", repo, shas, {"GIT_OBJECT_DIRECTORY": str(empty_dir)})
+    # an object the repository lacks is not supplied by the caller's GIT_ALTERNATE_OBJECT_DIRECTORIES: unresolved is red
+    arepo, ashas = build("alt-supplied")
+    alt = t / "alt-objects"
+    shutil.copytree(str(arepo / ".git" / "objects"), str(alt))
+    blob = git(arepo, "rev-parse", "%s:%s" % (ashas["B"], PENDING_FILE)).strip()
+    (arepo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+    n += 1
+    os.environ["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(alt)
+    try:
+        base_state(arepo, "base")
+        bad.append("an object missing from the repository was supplied by GIT_ALTERNATE_OBJECT_DIRECTORIES (#5581)")
+    except RuntimeError:
+        pass
+    finally:
+        os.environ.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
+    decoy = t / "decoy"
+    decoy.mkdir()
+    git(decoy, "init", "-q", "-b", "develop")
+    put(decoy, PENDING_FILE, rows("export DECOY_ONLY"))
+    git(decoy, "add", "-A")
+    git(decoy, "commit", "-q", "-m", "decoy")
+    check("GIT_DIR and GIT_WORK_TREE elsewhere", repo, shas,
+          {"GIT_DIR": str(decoy / ".git"), "GIT_WORK_TREE": str(decoy)})
+    shallow_list = t / "shallow-list"
+    shallow_list.write_text(shas["C"] + "\n")
+    check("GIT_SHALLOW_FILE naming a commit of a complete repo", repo, shas, {"GIT_SHALLOW_FILE": str(shallow_list)})
+    check("GIT_INDEX_FILE elsewhere", repo, shas, {"GIT_INDEX_FILE": str(t / "no-such-index")})
+    check("GIT_CONFIG_COUNT injecting i18n.logOutputEncoding", repo, shas,
+          {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "i18n.logOutputEncoding", "GIT_CONFIG_VALUE_0": "UTF-16"})
+    check("GIT_CONFIG_COUNT injecting diff.mnemonicPrefix", repo, shas,
+          {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "diff.mnemonicPrefix", "GIT_CONFIG_VALUE_0": "true"})
+    glob = t / "global.cfg"
+    glob.write_text("[i18n]\n\tlogOutputEncoding = UTF-16\n")
+    check("GIT_CONFIG_GLOBAL injecting i18n.logOutputEncoding", repo, shas, {"GIT_CONFIG_GLOBAL": str(glob)})
+    check("GIT_CONFIG_SYSTEM injecting i18n.logOutputEncoding", repo, shas, {"GIT_CONFIG_SYSTEM": str(glob)})
+    home = t / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text("[i18n]\n\tlogOutputEncoding = UTF-16\n[core]\n\tuseReplaceRefs = true\n")
+    check("a global ~/.gitconfig injecting i18n.logOutputEncoding", repo, shas, {"HOME": str(home)})
+    repo, shas = build("local-config")
+    with open(str(repo / ".git" / "config"), "a") as fh:
+        fh.write("[i18n]\n\tlogOutputEncoding = UTF-16\n")
+    check("a repo-local i18n.logOutputEncoding", repo, shas)
+    repo, shas = build("local-prefix")
+    with open(str(repo / ".git" / "config"), "a") as fh:
+        fh.write("[diff]\n\tnoprefix = true\n")
+    check("a repo-local diff.noprefix", repo, shas)
+    repo, shas = build("local-oddprefix")
+    with open(str(repo / ".git" / "config"), "a") as fh:
+        fh.write("[diff]\n\tsrcPrefix = zz\n\tdstPrefix = yy\n")
+    check("a repo-local diff.srcPrefix and diff.dstPrefix", repo, shas)
+    repo, shas = build("local-mnemonic")
+    with open(str(repo / ".git" / "config"), "a") as fh:
+        fh.write("[diff]\n\tmnemonicPrefix = true\n[log]\n\tshowSignature = true\n")
+    check("a repo-local diff.mnemonicPrefix and log.showSignature", repo, shas)
+    repo, shas = build("attr-info")
+    (repo / ".git" / "info").mkdir(parents=True, exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("%s -diff\n" % PENDING_FILE)
+    check("a -diff attribute on the list (.git/info/attributes)", repo, shas)
+    repo, shas = build("attr-tree")
+    put(repo, ".gitattributes", "%s -diff\n" % PENDING_FILE)
+    check("a -diff attribute on the list (.gitattributes)", repo, shas)
+    # a shallow clone stays a shallow fault when GIT_SHALLOW_FILE names an empty file
+    repo, shas = build("shallow-src")
+    shallow = t / "shallow-clone"
+    subprocess.run(["git", "clone", "-q", "--depth", "1", "file://" + str(repo), str(shallow)], check=True,
+                   capture_output=True)
+    empty_file = t / "empty-shallow"
+    empty_file.write_text("")
+    for label, env in (("a shallow clone (control)", {}), ("GIT_SHALLOW_FILE hiding a shallow clone",
+                                                          {"GIT_SHALLOW_FILE": str(empty_file)})):
+        n += 1
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        _GIT_PROVEN.clear()
+        try:
+            removed_pending_rows(shallow)
+            bad.append("%s was read as a complete history (#5581)" % label)
+        except RuntimeError as exc:
+            if "shallow" not in str(exc):
+                bad.append("%s faulted with the wrong message: %s (#5581)" % (label, str(exc)[:100]))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    shutil.rmtree(str(shallow), ignore_errors=True)
+    # the isolation is proven, not assumed: a child environment that leaves a global or system config in reach is
+    # a fault, and the proof runs once per repository, not once per call
+    repo, shas = build("proof")
+    sysconf = t / "system.cfg"
+    sysconf.write_text("[i18n]\n\tlogOutputEncoding = UTF-16\n")
+    real_env, real_exec = globals()["_git_child_env"], globals()["_git_exec"]
+    for label, leaked, child_env in (
+            ("global", "global", {"PATH": os.environ.get("PATH", ""), "HOME": str(home)}),
+            ("system", "system", {"PATH": os.environ.get("PATH", ""), "GIT_CONFIG_SYSTEM": str(sysconf),
+                                  "GIT_CONFIG_GLOBAL": os.devnull})):
+        n += 1
+        globals()["_git_child_env"] = lambda ce=child_env: dict(ce)
+        globals()["_GIT_PROVEN"].clear()
+        try:
+            _git(repo, "rev-parse", "HEAD")
+            bad.append("a child environment that reads a %s config was accepted (#5581)" % label)
+        except RuntimeError as exc:
+            if "not isolated" not in str(exc) or leaked not in str(exc):
+                bad.append("the isolation proof faulted with the wrong message: %s (#5581)" % str(exc)[:100])
+        finally:
+            globals()["_git_child_env"] = real_env
+    n += 1
+    calls: List[str] = []
+
+    def counting_exec(r: Path, a: Sequence[str]) -> "subprocess.CompletedProcess[bytes]":
+        calls.append(a[0])
+        return real_exec(r, a)
+
+    globals()["_git_exec"] = counting_exec
+    globals()["_GIT_PROVEN"].clear()
+    try:
+        _git(repo, "rev-parse", "HEAD")
+        _git(repo, "rev-parse", "HEAD")
+    finally:
+        globals()["_git_exec"] = real_exec
+    if calls.count("config") != 1 or calls.count("rev-parse") != 2:
+        bad.append("the isolation proof did not run exactly once per repository: %s (#5581)" % calls)
+    return bad, n
+
+
+# Functions that may spawn a process: the funnel itself, and the self-test fixtures that build their own
+# throwaway repositories (they are never part of a scan of the checkout).
+FUNNEL_SPAWNERS = frozenset({"_git_exec", "_run_wiring_cases", "_history_cases", "_git_funnel_cases",
+                             "_terminator_cases"})
+_SPAWN_ATTRS = frozenset({"system", "popen", "execv", "execve", "execvp", "execvpe", "execl", "execle",
+                          "execlp", "execlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe", "spawnl", "spawnle",
+                          "spawnlp", "spawnlpe", "posix_spawn", "posix_spawnp"})
+
+
+def funnel_bypasses(source: str) -> List[str]:
+    """Every place that can start a process outside the funnel (#5581): a subprocess call, an os spawn or exec
+    call, or an import of a subprocess name or alias, outside FUNNEL_SPAWNERS. Closed world: any new way to
+    run git must go through _git_exec, so a new caller is refused here, not found by a review."""
+    import ast
+    tree = ast.parse(source)
+    out: List[str] = []
+
+    def walk(node: "ast.AST", owner: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            sub = owner
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and not owner:
+                sub = child.name
+            if isinstance(child, ast.ImportFrom) and (child.module or "").split(".")[0] in ("subprocess", "os") \
+                    and any(a.name in _SPAWN_ATTRS or child.module == "subprocess" for a in child.names):
+                out.append("line %d: from %s import (hides a process start from this check)" % (child.lineno, child.module))
+            if isinstance(child, ast.Import) and any(a.name == "subprocess" and a.asname for a in child.names):
+                out.append("line %d: import subprocess as an alias" % child.lineno)
+            if isinstance(child, ast.Call) and owner not in FUNNEL_SPAWNERS:
+                f = child.func
+                if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and (
+                        f.value.id == "subprocess" or (f.value.id == "os" and f.attr in _SPAWN_ATTRS)):
+                    out.append("line %d: %s.%s outside the git funnel (in %s)" % (
+                        child.lineno, f.value.id, f.attr, owner or "module level"))
+                elif isinstance(f, ast.Name) and f.id in ("__import__", "eval", "exec"):
+                    out.append("line %d: %s() can start a process unseen" % (child.lineno, f.id))
+            walk(child, sub)
+
+    walk(tree, "")
+    return out
+
+
+def _funnel_structure_cases() -> Tuple[List[str], int]:
+    """The gate's own source has no process start outside the funnel (#5581), and the check itself sees every
+    bypass form it names."""
+    bad: List[str] = []
+    n = 0
+    n += 1
+    own = funnel_bypasses(Path(__file__).read_text(encoding="utf-8"))
+    if own:
+        bad.append("a process is started outside the git funnel: %s (#5581)" % own[0])
+    for label, src in (
+            ("subprocess.run in a helper", "import subprocess\ndef f():\n    subprocess.run(['git'])\n"),
+            ("subprocess.check_output at module level", "import subprocess\nx = subprocess.check_output(['git'])\n"),
+            ("subprocess.Popen in a nested def", "import subprocess\ndef f():\n    def g():\n        subprocess.Popen(['git'])\n"),
+            ("os.system", "import os\ndef f():\n    os.system('git log')\n"),
+            ("os.popen", "import os\ndef f():\n    os.popen('git log')\n"),
+            ("from subprocess import run", "from subprocess import run\n"),
+            ("import subprocess as alias", "import subprocess as sp\n"),
+            ("from os import system", "from os import system\n"),
+            ("__import__", "def f():\n    __import__('subprocess')\n"),
+            ("a funnel name reused as a nested def", "import subprocess\ndef f():\n    def _git_exec():\n        subprocess.run(['git'])\n")):
+        n += 1
+        if not funnel_bypasses(src):
+            bad.append("the funnel check missed a bypass: %s (#5581)" % label)
+    for label, src in (
+            ("the funnel itself", "import subprocess\ndef _git_exec():\n    subprocess.run(['git'])\n"),
+            ("a fixture helper nested in a spawner", "import subprocess\ndef _history_cases():\n    def git():\n        subprocess.run(['git'])\n"),
+            ("only the exception name", "import subprocess\ndef f():\n    try:\n        pass\n    except subprocess.CalledProcessError:\n        pass\n")):
+        n += 1
+        if funnel_bypasses(src):
+            bad.append("the funnel check refused a clean source: %s (#5581)" % label)
+    return bad, n
+
+
 def _terminator_cases(root: Path, t: Path) -> Tuple[List[str], int]:
     """The real gate path on lists with line-terminator and trailing-whitespace forms (#5501): at the tip any
     form other than LF is a fault; at the merge base every form is read as the row, so a row cannot be
@@ -2799,11 +3137,17 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
     with tempfile.TemporaryDirectory(dir=str(scratch)) as td:
         hb, hn = _history_cases(Path(td))
     bad.extend(hb)
+    # every git read in the closed-world funnel (#5581)
+    with tempfile.TemporaryDirectory(dir=str(scratch)) as td:
+        fb, fn = _git_funnel_cases(Path(td))
+    bad.extend(fb)
+    sb, sn = _funnel_structure_cases()
+    bad.extend(sb)
     # the lists read with every line-terminator and trailing-whitespace form (#5501)
     with tempfile.TemporaryDirectory(dir=str(scratch)) as td:
         tb, tn = _terminator_cases(root, Path(td))
     bad.extend(tb)
-    return bad, n + wn + hn + tn
+    return bad, n + wn + hn + fn + sn + tn
 
 
 def self_test(root: Path) -> int:
