@@ -95,25 +95,9 @@ def self_test(g, templates, allow, pend) -> int:
     return 1 if bad else 0
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("root")
-    ap.add_argument("--accept-new", action="store_true",
-                    help="write added, removed or reordered lines (each change is printed)")
-    ap.add_argument("--self-test", action="store_true",
-                    help="check that a stale or faulty pending entry refuses a rewrite (#5116)")
-    a = ap.parse_args()
-    root = Path(a.root)
-    spec = importlib.util.spec_from_file_location("g", str(root / "scripts/check-cloud-init-serve-flags.py"))
-    g = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(g)
-    templates, _, allow, pend = g.load_repo()
-    if a.self_test:
-        return self_test(g, templates, allow, pend)
-    refusals = pending_refusals(g, templates, allow, pend)
-    if refusals:
-        print("\n".join(refusals), file=sys.stderr)
-        return 1
+def plan(g, templates, allow, pend):
+    """The rewrite: (entries to write, existing entries, report lines, changed sequences, added, removed).
+    It reads and writes no file; main() was split so the report can be pinned (#5549)."""
     faults = []
     old = g.load_entries(allow, False, faults, "allow")
     pe = g.load_entries(pend, True, faults, "pending")
@@ -169,6 +153,29 @@ def main():
     new_seq = seqs_of(out)
     changed = [k for k in sorted(set(old_seq) | set(new_seq)) if old_seq.get(k, []) != new_seq.get(k, [])]
     lines = change_report(g, removed, added, changed, old_seq, new_seq)
+    return out, old, lines, changed, added, removed
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("root")
+    ap.add_argument("--accept-new", action="store_true",
+                    help="write added, removed or reordered lines (each change is printed)")
+    ap.add_argument("--self-test", action="store_true",
+                    help="check that a stale or faulty pending entry refuses a rewrite (#5116)")
+    a = ap.parse_args()
+    root = Path(a.root)
+    spec = importlib.util.spec_from_file_location("g", str(root / "scripts/check-cloud-init-serve-flags.py"))
+    g = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(g)
+    templates, _, allow, pend = g.load_repo()
+    if a.self_test:
+        return self_test(g, templates, allow, pend)
+    refusals = pending_refusals(g, templates, allow, pend)
+    if refusals:
+        print("\n".join(refusals), file=sys.stderr)
+        return 1
+    out, old, lines, changed, added, removed = plan(g, templates, allow, pend)
     if lines:
         print("\n".join(lines))
     if changed and not a.accept_new:
