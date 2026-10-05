@@ -73,7 +73,10 @@ while read -r ip; do
   ssh_node "$ip" "mkdir -p /opt/hive/pg-age"
   scp_to "$DOCKERFILE" "$ip" "/opt/hive/pg-age/Dockerfile"
   scp_to "$BOOTSTRAP" "$ip" "/opt/hive/pg-age/bootstrap.sql"
-  ssh_node "$ip" "docker build --build-arg AGE_IMAGE='$AGE_IMAGE' -t hive-pg-age:local /opt/hive/pg-age" >/dev/null
+  # #5401: the build context is an EMPTY directory and the Dockerfile comes in
+  # through -f, so the CA key (tls-ca/) and the secret files (.secrets/) under
+  # /opt/hive/pg-age are never tarred and sent to the docker daemon.
+  ssh_node "$ip" "mkdir -p /opt/hive/pg-age/build-ctx && docker build --build-arg AGE_IMAGE='$AGE_IMAGE' -f /opt/hive/pg-age/Dockerfile -t hive-pg-age:local /opt/hive/pg-age/build-ctx" >/dev/null
 
   ssh_node "$ip" "umask 077; mkdir -p '$SECRET_DIR'; chmod 0700 '$SECRET_DIR'"
   printf 'POSTGRES_PASSWORD=%s\n' "$SU_PW" | put_secret "$ip" "$SECRET_DIR/su-init.env"
