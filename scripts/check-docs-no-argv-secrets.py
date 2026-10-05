@@ -1062,6 +1062,8 @@ RED_PROBES_4600 = {
     "5482-06-split-head-c-password": "p\\sql -c \"ALTER USER a PASSWORD 'hunter2x'\"",
     "5482-07-quoted-wrapper-head": '"run_ps"ql -v pw="$PG_PW" -f x.sql',
     "5482-08-split-head-after-semicolon": 'true;\\psql -v pw="$PG_PW" -f x.sql',
+    "5482-09-uppercase-split-head": 'P\\SQL -v pw="$PG_PW" -f x.sql',
+    "5482-10-backslash-before-last-letter": 'psq\\l -v pw="$PG_PW" -f x.sql',
     # #5483 (PR 4810 round-6 F3): a neutral variable name does not hide a value that expands
     # a secret-named variable, and a non-ASCII name can spell a secret with a look-alike letter.
     "5483-01-neutral-name-pgpassword": 'psql -v x="$PGPASSWORD" -f x.sql',
@@ -1072,6 +1074,7 @@ RED_PROBES_4600 = {
     "5483-06-neutral-name-literal-prefix": 'psql -v x=pre-${TOKEN_VALUE} -f x.sql',
     "5483-07-neutral-name-joined-cluster": 'psql -qvx="$PGPASSWORD" -f x.sql',
     "5483-08-neutral-name-key-value": 'psql --variable=x=$API_KEY -f x.sql',
+    "5483-09-non-ascii-name-only": 'psql -v \u0440=1 -f x.sql',
     # #4808: the forms the #4782 gate missed.
     "4808-docker-e-dsn-literal": "docker run -e DATABASE_URL=postgres://u:hunter2@h/d img",
     "4808-psql-set-equals-pw": 'psql --set=pw="$PG_PW" -f bootstrap.sql',
