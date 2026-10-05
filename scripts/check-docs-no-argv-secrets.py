@@ -192,7 +192,7 @@ ENV_ARGV_RE = re.compile(
 # psql reached through a variable ($PSQL, ${PSQL_BIN}) and a backslash-newline
 # continuation. Every option after the psql word is checked, not the first.
 # #5448: _ and - also precede psql (run_psql, my-psql: a wrapper still runs psql).
-PSQL_HEAD_RE = re.compile(r"(?:^|[\s;|&(`/\"'${_-])psql[A-Za-z0-9_]*\b", re.IGNORECASE | re.MULTILINE)
+PSQL_HEAD_RE = re.compile(r"(?:^|[\s;|&(`/\"'${_-])(?P<word>psql[A-Za-z0-9_]*)\b", re.IGNORECASE | re.MULTILINE)
 # #5482 (round-6 F2): the shell strips backslashes and quotes inside a word, so
 # \psql, p\sql, ps''ql and "ps"ql all run psql. This matches a psql word spelled with
 # those characters; normalise_psql_heads() rewrites it to a plain psql word of the
@@ -689,7 +689,9 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
         shell_view = segment.replace("\\", "").replace('"', "").replace("'", "")
         if any(psql_var_operand_flagged(m.group("operand"))
                for m in PSQL_VAR_OPT_RE.finditer(shell_view)):
-            line, snippet = _line_of(text, head.start())
+            # head.start() is the PREFIX character, a newline when psql opens a line, which
+            # reported the previous line; the word itself names the line (#5485).
+            line, snippet = _line_of(text, head.start("word"))
             hits.append((rel, line, "[env-password-argv] " + snippet))
     for rule, tag in ((PSQL_URL_RE, "psql-url-password"), (DOCKER_ENV_DSN_RE, "env-dsn-argv"),
                       (SSH_REMOTE_URL_RE, "ssh-remote-url-password")):
@@ -1303,6 +1305,15 @@ def self_test() -> int:
     red += 1
     if scan_text("scripts/check-docs-no-argv-secrets.py", RED_PROBES["inline"]):
         print("SELF-TEST FAIL: self-exempt path was flagged", file=sys.stderr)
+        bad += 1
+    # #5482: the split-head rewrite keeps every offset, so a hit that follows split
+    # heads with tails is still reported on its own line (line 4 here).
+    red += 1
+    pad = "psql_" + "x" * 30 + " -X -f a.sql\n"
+    pinned = [h for h in scan_text("probe.sh", pad * 3 + 'psql -v pw="$PG_PW" -f x.sql\n')
+              if h[2].startswith("[env-password-argv]")]
+    if [h[1] for h in pinned] != [4]:
+        print("SELF-TEST FAIL: a psql -v hit after split heads is not reported on line 4: %r" % pinned, file=sys.stderr)
         bad += 1
     # A reported snippet never carries the placeholder secret.
     red += 1
