@@ -26,14 +26,15 @@ RULES ENFORCED (all closed-world: a trigger the reader cannot parse is a FAILURE
          quotes inside, tags, ``?``, ``+``, ``[``, backslash and alias-like
          ``*name`` items are undecidable and fail.  A push trigger with no
          ``branches`` and no ``tags`` key matches every branch and counts.
-  R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730, #5731, #5733,
-         #5734, #5735, #5736) the whole file is
+  R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730-#5736) the whole file is
          read closed-world by the grammar below.  A file the reader cannot read
          is a failure whatever words it holds (#5731).
 
 ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
   stream      the text, minus one leading BOM, holds no lone CR, no line break
-              other than LF or CR LF, and no control character or inner BOM.
+              other than LF or CR LF, no control character other than tab, LF
+              and CR, none of the 66 Unicode noncharacters (#5732) and no inner
+              BOM.
   line        blank | comment | block-scalar content | one leading ``---`` |
               structure row.
   comment     ASCII-space indentation, then ``#``.
@@ -71,7 +72,8 @@ ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
               gated trigger is empty, ``~``, ``null`` or a block of the filter
               keys branches, tags, paths, paths-ignore, types, each once.
   filter      an inline (flow) list of scalars on the key's row (#5733), or a
-              block list indented past the key whose every row is ``- `` and
+              block list indented past the key (a block list at the key's own
+              column is refused, #5730, #5732) whose every row is ``- `` and
               one plain or simply quoted scalar (#5730); ``types`` may also be
               one plain word.  A plain item is never a form YAML 1.1 may read as
               other than a string: empty, a null or boolean word in any case, a
@@ -155,8 +157,14 @@ def _parse_inline_list(text: str) -> List[str]:
 # U+2028 and U+2029 as line breaks and refuses the other six as non-printable;
 # the reader refuses all nine (#5707).
 _EXOTIC_BREAKS = "\x0b\x0c\x1c\x1d\x1e\x1f\x85  "
-# Control characters, noncharacters, and a BOM anywhere but the stream start.
-_FORBIDDEN = re.compile("[\x00-\x08\x0e-\x1f\x7f-\x9f﻿￾￿]")
+# C0 and C1 control characters other than tab, LF and CR; all 66 Unicode
+# noncharacters (U+FDD0-U+FDEF and the last two code points of each of the 17
+# planes); and a BOM anywhere but the stream start (#5732). PyYAML 6 refuses
+# U+FFFE and U+FFFF and accepts the other 64 noncharacters; the reader refuses
+# all 66 so no file it reads holds one.
+_NONCHARACTERS = "\ufdd0-\ufdef" + "".join(chr(plane << 16 | 0xFFFE) + chr(plane << 16 | 0xFFFF)
+                                          for plane in range(17))
+_FORBIDDEN = re.compile("[\x00-\x08\x0e-\x1f\x7f-\x9f\ufeff" + _NONCHARACTERS + "]")
 # Characters that start an anchor, alias, tag or reserved token.
 _NODE_PROPERTY = "&*!%@`"
 # Characters that end a plain scalar inside a flow collection.
@@ -1791,6 +1799,34 @@ class EmptyFilterValue5736(unittest.TestCase):
 
     def test_5736_empty_lists_stay_clean(self) -> None:
         self.assertEqual([], violations("x.yml", "on:\n" + GOOD_PR + "    paths: []\n"))
+
+
+class CommentTruth5732(unittest.TestCase):
+    """#5732: the stream comment and the filter row say only what the reader does.
+
+    Measured at 252d250e: U+FDD0 and U+1FFFE in a comment were accepted, so the
+    comment "noncharacters" was untrue; PyYAML 6.0.1 accepts 64 of the 66
+    noncharacters and refuses U+FFFE and U+FFFF.  A block list at its key's own
+    column (valid YAML) is refused, as the filter row now states.
+    """
+
+    def _shape(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5732_every_noncharacter_is_refused(self) -> None:
+        for ch in ("﷐", "﷯", "\U0001fffe", "\U0010ffff"):
+            self._shape("name: x  # " + ch + "\non:\n" + GOOD_PR, "noncharacter")
+
+    def test_5732_other_non_ascii_in_a_comment_stays_clean(self) -> None:
+        for ch in ("﷏", "ﷰ", "\U0001fffd", "é"):
+            self.assertEqual([], violations("x.yml", "name: x  # " + ch + "\non:\n" + GOOD_PR))
+
+    def test_5732_block_list_at_the_key_column_is_refused(self) -> None:
+        body = GOOD_PR.replace("    branches: [main, 'rehearsal/**']\n", "    branches:\n    - main\n")
+        self.assertNotEqual(body, GOOD_PR)
+        got = violations("x.yml", "on:\n" + body)
+        self.assertTrue(any("R-SHAPE" in v for v in got), got)
 
 
 class GlobSemantics5447(unittest.TestCase):
