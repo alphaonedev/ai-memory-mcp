@@ -2711,6 +2711,21 @@ def _git_funnel_cases(t: Path) -> Tuple[List[str], int]:
     home.mkdir()
     (home / ".gitconfig").write_text("[i18n]\n\tlogOutputEncoding = UTF-16\n[core]\n\tuseReplaceRefs = true\n")
     check("a global ~/.gitconfig injecting i18n.logOutputEncoding", repo, shas, {"HOME": str(home)})
+    # the pins hold even when the caller's HOME and XDG_CONFIG_HOME would reach git (#5634): the global scope is
+    # named by GIT_CONFIG_GLOBAL, not only hidden by stripping HOME
+    kept_before = GIT_ENV_KEEP
+    globals()["GIT_ENV_KEEP"] = tuple(kept_before) + ("HOME", "XDG_CONFIG_HOME")
+    try:
+        check("a global ~/.gitconfig with HOME on the keep list", repo, shas, {"HOME": str(home)})
+        pins = _git_child_env()
+        n += 1
+        for name, want in (("GIT_CONFIG_GLOBAL", os.devnull), ("GIT_CONFIG_SYSTEM", os.devnull),
+                           ("GIT_CONFIG_NOSYSTEM", "1"), ("GIT_NO_REPLACE_OBJECTS", "1"),
+                           ("GIT_GRAFT_FILE", os.devnull)):
+            if pins.get(name) != want:
+                bad.append("the git child environment does not pin %s to %r (#5634)" % (name, want))
+    finally:
+        globals()["GIT_ENV_KEEP"] = kept_before
     repo, shas = build("local-config")
     with open(str(repo / ".git" / "config"), "a") as fh:
         fh.write("[i18n]\n\tlogOutputEncoding = UTF-16\n")
