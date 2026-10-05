@@ -2593,6 +2593,13 @@ ROUND3_DOCKER_GREEN = [
 ]
 
 
+def _round3_unreadable_only(rows: List[Tuple[str, str]]) -> List[str]:
+    """A reported row is reported through a reading: only a row named unreadable may fail on unreadable shell
+    (#5955); every other row that the reader cannot read is named here."""
+    return ["round-3 red probe is reported only as unreadable shell: %s" % label for label, line in rows
+            if (mysql_family_verdict(line) or "").startswith("unreadable") and "unreadable" not in label]
+
+
 def round3_probe_cases(dl) -> Tuple[List[str], int]:
     """Red probes are denylist-tagged and refused for allow; green probes are not tagged and,
     when triggered, an allow entry approves them through the real gate checks."""
@@ -2612,11 +2619,10 @@ def round3_probe_cases(dl) -> Tuple[List[str], int]:
         if any("denylist" in r[2] for r in res) or check_allow_vs_denylist({"c.sh": res}, ent) or \
                 judge({"c.sh": res}, ent, [], dl)[0]:
             bad.append("round-3 green probe is not allow-able: %s" % label)
-    n += 1
-    # a reported row is reported through a reading: only a row named unreadable may fail on unreadable shell (#5955)
-    for label, line in ROUND3_RED:
-        if (mysql_family_verdict(line) or "").startswith("unreadable") and "unreadable" not in label:
-            bad.append("round-3 red probe is reported only as unreadable shell: %s" % label)
+    n += 2
+    bad.extend(_round3_unreadable_only(ROUND3_RED))
+    if not _round3_unreadable_only([("reported: a sentinel", 'mysql -p"$X')]):
+        bad.append("round-3 unreadable-only check does not flag a reported row that is only unreadable")
     for reason, text in ROUND11_UNREADABLE:
         n += 1
         if mysql_family_verdict(text) != "unreadable shell: " + reason:
