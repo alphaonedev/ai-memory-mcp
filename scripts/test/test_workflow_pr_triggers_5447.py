@@ -26,7 +26,8 @@ RULES ENFORCED (all closed-world: a trigger the reader cannot parse is a FAILURE
          quotes inside, tags, ``?``, ``+``, ``[``, backslash and alias-like
          ``*name`` items are undecidable and fail.  A push trigger with no
          ``branches`` and no ``tags`` key matches every branch and counts.
-  R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730, #5731, #5733) the whole file is
+  R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730, #5731, #5733,
+         #5734) the whole file is
          read closed-world by the grammar below.  A file the reader cannot read
          is a failure whatever words it holds (#5731).
 
@@ -71,7 +72,9 @@ ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
   filter      an inline (flow) list of scalars on the key's row (#5733), or a
               block list indented past the key whose every row is ``- `` and
               one plain or simply quoted scalar (#5730); ``types`` may also be
-              one plain word.
+              one plain word.  A plain item is never a form YAML 1.1 may read as
+              other than a string: empty, a null or boolean word in any case, a
+              number or date, ``<<`` or ``=`` (#5734).
 
 The reader is the Python standard library only (no PyYAML) so it runs on any CI
 image.  The mutation legs at the bottom prove the reader is not vacuous: each
@@ -141,7 +144,9 @@ def _parse_inline_list(text: str) -> List[str]:
     for item in items:  # type: ignore[attr-defined]
         if not isinstance(item, str):
             raise Unparsed("inline list item is not one scalar (#5733): " + text)
-    return list(items)
+        if isinstance(item, _Plain) and _typed_plain(item):
+            raise Unparsed("plain scalar YAML 1.1 reads as other than a string (#5734): " + text)
+    return [str(item) for item in items]  # type: ignore[attr-defined]
 
 
 # Line-break and separator characters other than LF and CR. PyYAML 6 reads NEL,
@@ -154,6 +159,23 @@ _FORBIDDEN = re.compile("[\x00-\x08\x0e-\x1f\x7f-\x9f﻿￾￿]")
 _NODE_PROPERTY = "&*!%@`"
 # Characters that end a plain scalar inside a flow collection.
 _FLOW_STOPS = ",[]{}"
+# A plain scalar YAML 1.1 may resolve to a number or a date: an optional sign, then
+# a digit or a dot and a digit; or the .inf and .nan forms (#5734).
+_NUMERIC_PLAIN = re.compile(r"[-+]?\.?[0-9].*|[-+]?\.(?:inf|nan)", re.IGNORECASE | re.DOTALL)
+
+
+class _Plain(str):
+    """A plain (unquoted) scalar read from a flow collection."""
+
+
+def _typed_plain(text: str) -> bool:
+    """True when YAML 1.1 may read the plain scalar as other than a string (#5734).
+
+    That is: empty, a null or YAML 1.1 boolean word in any case, a number or date
+    form, the merge key ``<<`` or the value key ``=``.
+    """
+    return (not text or text.lower() in YAML11_BOOLEANS + ("null", "~") or text in ("<<", "=")
+            or _NUMERIC_PLAIN.fullmatch(text) is not None)
 
 
 def _space_like(ch: str) -> bool:
@@ -224,7 +246,7 @@ def _flow_plain(s: str, j: int, key: bool) -> Tuple[int, str]:
         if not " " <= ch <= "~":
             raise Unparsed("non-ASCII or control character in a flow scalar (#5733): " + repr(s))
         k += 1
-    return k, s[j:k].rstrip(" ")
+    return k, _Plain(s[j:k].rstrip(" "))
 
 
 def _flow_node(s: str, j: int) -> Tuple[int, object]:
@@ -562,6 +584,8 @@ def _filter_item(where: str, line: str) -> str:
         return text[1:-1]
     if not text or text[0] in "-?:,[]{}#&*!|>'\"%@`" or ": " in text or text.endswith(":"):
         raise Unparsed(where + ": list item is not one scalar: " + line)
+    if _typed_plain(text):
+        raise Unparsed(where + ": plain scalar YAML 1.1 reads as other than a string (#5734): " + line)
     return text
 
 
@@ -597,6 +621,9 @@ def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[s
                 word = _unquote(rest)
                 if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", word):
                     raise Unparsed(trigger + ".types: scalar is not one plain word (#5669): " + rest)
+                if word == rest and _typed_plain(word):
+                    raise Unparsed(trigger + ".types: plain scalar YAML 1.1 reads as other than a string (#5734): "
+                                   + rest)
                 items = [word]
             else:
                 items = _parse_inline_list(rest)
@@ -1673,6 +1700,47 @@ class FlowCollections5733(unittest.TestCase):
         self.assertEqual([], _parse_inline_list("[ ]"))
         text = "name: x\non:\n" + GOOD_PR + "x:\n  with: { fetch-depth: 2 }\n  y: {}\n  z: [{a: [b, 'c']}, []]\n"
         self.assertEqual([], violations("x.yml", text))
+
+
+class TypedPlainItems5734(unittest.TestCase):
+    """#5734: a plain filter item YAML 1.1 reads as other than a string is refused.
+
+    Measured at 25af8bc7 (round-4 differential, seed 5665): every refusal case here
+    was accepted there. PyYAML 6.0.1 reads every plain word below as None, a
+    bool, an int, a float or a date, or refuses it (<< and = in a sequence are a
+    ConstructorError), except 0o7 and +.5, which it keeps as strings and YAML 1.2
+    reads as numbers; the reader refuses them all.
+    """
+
+    WORDS = ("~", "null", "Null", "NULL", "yes", "No", "TRUE", "on", "Off", "1", "+1", "0x1f", "0o7",
+             "1_000", "1:20", "1.5", ".5", "+.5", ".inf", "+.Inf", ".NaN", "2026-10-05", "<<", "=")
+
+    def _shape(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5734_plain_block_items(self) -> None:
+        for word in self.WORDS:
+            self._shape("on:\n  push:\n    branches: [main]\n    paths:\n      - " + word + "\n",
+                        "plain scalar YAML 1.1 reads as other than a string")
+
+    def test_5734_plain_inline_items(self) -> None:
+        # 1:20 is refused inside a flow collection by the #5733 colon rule.
+        for word in (w for w in self.WORDS if ":" not in w):
+            self._shape("on:\n  pull_request:\n    branches: [main, 'rehearsal/**', " + word + "]\n",
+                        "plain scalar YAML 1.1 reads as other than a string")
+
+    def test_5734_plain_types_word(self) -> None:
+        for word in ("on", "yes", "Null", "NO"):
+            self._shape("on:\n  pull_request:\n    types: " + word + "\n",
+                        "plain scalar YAML 1.1 reads as other than a string")
+
+    def test_5734_strings_stay_clean(self) -> None:
+        # PyYAML: every item below is a string (quoted, or plain and not a typed form).
+        body = ("on:\n  pull_request:\n    branches: [main, 'rehearsal/**', 'yes', \"1\"]\n"
+                "    paths:\n      - .github/workflows/x.yml\n      - '~'\n      - v1.0\n      - nope\n"
+                "    types: 'on'\n  push:\n    tags: ['1.0', v1.*]\n")
+        self.assertEqual([], violations("x.yml", body))
 
 
 class GlobSemantics5447(unittest.TestCase):
