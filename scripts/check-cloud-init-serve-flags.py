@@ -2650,7 +2650,16 @@ def binary_vars(stmts: list) -> frozenset:
 def analyse(name: str, text: str, cache: dict):
     key = (name, text)
     if key not in cache:
-        lines, hits, entries, stmts = classify(name, text)
+        # the R5 reasons this scan adds are kept with the entry, so a scan answered from
+        # the cache puts them back (#5439)
+        saved = dict(R5_READ_AS_SCRIPT)
+        R5_READ_AS_SCRIPT.clear()
+        try:
+            lines, hits, entries, stmts = classify(name, text)
+            cache[("r5",) + key] = dict(R5_READ_AS_SCRIPT)
+        finally:
+            R5_READ_AS_SCRIPT.clear()
+            R5_READ_AS_SCRIPT.update(saved)
         bins = binary_vars(stmts)
         comp = []
         for where, stmt, st in stmts:
@@ -2673,6 +2682,8 @@ def analyse(name: str, text: str, cache: dict):
         homes = service_homes(lines)
         trig = [ln for ln in lines if triggered(ln)]
         cache[key] = (lines, hits + comp, entries, trig, homes)
+    for path, use in cache[("r5",) + key].items():
+        R5_READ_AS_SCRIPT.setdefault(path, use)
     return cache[key]
 
 
@@ -3494,6 +3505,21 @@ def secret_output_problems(base: tuple, known: set) -> list:
     return bad
 
 
+def r5_cache_problems(base: tuple, known: set) -> list:
+    """A scan answered from the cache keeps the R5 reason (#5439)."""
+    dec = "      systemctl daemon-reload\n"
+    spec = {"aws": [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      foo /\n" + dec)], "autolist": True}
+    t, mt, a, p, auto, extra = case_inputs(base, spec)
+    cache, seen = {}, []
+    for _ in range(2):
+        R5_READ_AS_SCRIPT.clear()
+        run_scan(t, mt, a, p, known, autolist=auto, extra=extra, cache=cache)
+        seen.append(dict(R5_READ_AS_SCRIPT))
+    if not seen[0].get("/etc/ai-memory/run.conf") or seen[0] != seen[1]:
+        return ["the R5 reason is lost or differs when a scan is answered from the cache: %r then %r" % tuple(seen)]
+    return []
+
+
 def self_test(known: set) -> int:
     base = load_repo()
     cache = {}
@@ -3526,6 +3552,7 @@ def self_test(known: set) -> int:
     long_hit = "x" * 150 + " the reason"
     if long_hit not in probe_failure("p", "green", "red", ["a", long_hit, "b", "c"]):
         bad.append("a probe failure line cut a hit")
+    bad.extend(r5_cache_problems(base, known))
     bad.extend(secret_output_problems(base, known))
     with contextlib.redirect_stderr(io.StringIO()):
         try:
