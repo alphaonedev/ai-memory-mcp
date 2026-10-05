@@ -22,9 +22,10 @@ The BASE guard (scripts/check-claude-md-size.py of the base checkout) and the BA
 This is TAMPERING EVIDENCE, not authority. The trailer is data an agent can also write, and the head also
 carries its own manifest, so the comparison deliberately uses the base one. What enforces is the two
 independent reviews and the sole merger. Fail closed: a missing, unreadable or symlinked base guard, base
-manifest or base CLAUDE.md is a failure. The comparison runs only in isolated mode (`python3 -I`): the script
-directory is then not on the import path, so no file beside the script can stand in for a standard module, and
-the base guard is compiled from its source, never from a cached .pyc (#5163). Bootstrap: pull_request_target
+manifest or base CLAUDE.md is a failure. The comparison runs only in isolated mode (`python3 -I`); the self-test
+runs a non-isolated copy beside planted files named like every module this script imports, under several interpreter
+flag sets, and fails if one runs (#5163). The base guard is compiled from its source bytes; the self-test plants a
+weakened cached .pyc beside it and fails if it is used (#5163). Bootstrap: pull_request_target
 runs only once this workflow is on the base branch, so the PR that introduces it is judged by review.
 
 Python 3.9 standard library only.
@@ -37,9 +38,8 @@ Usage (the comparison refuses to run without -I):
 import sys
 
 if __name__ == "__main__" and not sys.flags.isolated:
-    # R6 (#5163): checked before any other import. Without -I the script directory heads sys.path, so a
-    # file there named like a standard module (argparse, difflib, ...) would run at its import, before any
-    # check inside main() or run() could refuse. sys is built in and cannot be shadowed.
+    # R6 (#5163): checked before any other import. The self-test plants a file named like each imported module
+    # beside a non-isolated copy and fails if one runs.
     print("## CLAUDE.md rule-change comparison\n\nRESULT: FAIL (closed) - run the comparison as "
           "`python3 -I scripts/claude-md-rule-compare.py` (isolated mode)")
     sys.exit(1)
@@ -103,8 +103,8 @@ def regular_file(path: Path, label: str) -> None:
 
 
 def load_source_module(name: str, path: Path):
-    """R5 (#5163): execute `path` compiled from its source bytes. A cached bytecode file beside it (an
-    unchecked-hash .pyc is loaded without comparing it to the source) is never consulted."""
+    """R5 (#5163): execute `path` compiled from its source bytes with compile(); no cached bytecode file is
+    read. The self-test plants a weakened unchecked-hash .pyc beside the guard and fails if it is used."""
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None:
         raise RuntimeError(f"cannot load {path}")
@@ -651,8 +651,9 @@ def _self_test_cases() -> int:
         if plant_coverage_gap(names + names, names, 2) or not plant_coverage_gap(names[:1], names, 1) \
                 or not plant_coverage_gap(names + names, names, 1):
             return "the coverage check does not tell a narrowed probe from a full one"
-        # #5441: encodings is loaded at every interpreter start and is not frozen, so its plant must stay inert
-        # and the child must say it was preloaded, on every Python version.
+        # #5441: measured, not assumed: the child must report encodings as already loaded and the planted file must
+        # stay inert; this fails on an interpreter where that is not the case, which would leave the preloaded
+        # branch of the probe unexercised.
         enc = plant_probe("encodings", base_dir / "implant", [])
         if not (enc.preloaded and not enc.planted_ran and enc.ok):
             return "a preloaded module's planted file ran, or the child did not report it preloaded"
