@@ -638,6 +638,26 @@ MDEOF
     anchor_red 5432 PATH "an open link head, then an escape path on the next line" \
         $'See [h](\nsrc/../gone.rs) no longer exists'
 
+    # #5433: a leading group with no `as` (<Type<T>>::m, a real qualified path)
+    # names its type as a symbol claim; a placeholder with no path behind it is
+    # still not a claim.
+    anchor_red 5433 QUAL "a leading generic type group with no as and a missing type" \
+        "See \`$R::<NoSuch<T>>::decorate_memory_many\`."
+    anchor_red 5433 QUAL "a leading plain type group with no as and a missing type" \
+        "See \`$R::<NoSuch>::decorate_memory_many\`."
+    anchor_red 5433 BARE_QUAL "an unbackticked leading type group with a missing type" \
+        "See $R::<NoSuch<T>>::decorate_memory_many here."
+    anchor_red 5433 QUAL "a leading entity type group with a missing type" \
+        "See \`$R::&lt;NoSuch&lt;T&gt;&gt;::decorate_memory_many\`."
+    anchor_red 5433 QUAL "a live type in a leading group but a missing method" \
+        "See \`$R::<RecallTool<T>>::no_such\`."
+    anchor_green 5433 "a leading generic type group with no as and live parts" \
+        "See \`$R::<RecallTool<T>>::decorate_memory_many\`."
+    anchor_green 5433 "a leading plain type group with no as and live parts" \
+        "See \`$R::<RecallTool>::decorate_memory_many\`."
+    anchor_green 5433 "a placeholder group with no path behind it, with a nested group" \
+        "See \`$R::<name<T>>\` here."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
@@ -1388,7 +1408,8 @@ AS_WORD = re.compile(r"\bas\b")
 
 def unwrap_self_type(tok):
     """`<Type<T> as Trait>::m` -> `Type<T>::m` (the type is the claim); an
-    `as` inside a nested argument (`<Vec<<T as Tr>::X>>::new`) counts too."""
+    `as` inside a nested argument (`<Vec<<T as Tr>::X>>::new`) counts too, and
+    so does a group with no `as` that is followed by `::` (`<Type<T>>::m`)."""
     if not tok.startswith("<"):
         return tok
     end = scan_group(tok, 0)
@@ -1396,7 +1417,9 @@ def unwrap_self_type(tok):
         return tok
     inner = tok[1:end - 1]
     m = ID_RE.match(inner.lstrip())
-    if m and AS_WORD.search(inner):
+    # #5433: with no `as`, `<Type<T>>::m` is still a qualified path whose
+    # type is the claim; a placeholder with nothing behind it is not.
+    if m and (AS_WORD.search(inner) or tok.startswith("::", end)):
         return m.group(0) + tok[end:]
     return tok
 
