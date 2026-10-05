@@ -125,15 +125,15 @@ pub fn create_guarded(
     // quota-row read precede the INSERT, so a DEFERRED upgrade could fail with
     // SQLITE_BUSY_SNAPSHOT (not retried by busy_timeout) when another
     // connection committed in between.
-    let tx = crate::storage::connection::WriteTxn::begin(conn)?;
-    let action = create_guarded_in_transaction(conn, action)?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let action = create_guarded_in_transaction(&tx, action)?;
     tx.commit()?;
     Ok(action)
 }
 
 /// Shared insertion funnel for direct creates and a whole routine transaction.
 pub(crate) fn create_guarded_in_transaction(
-    tx: &Connection,
+    tx: &rusqlite::Transaction<'_>,
     action: Action,
 ) -> Result<Action, crate::errors::MemoryError> {
     use crate::errors::MemoryError;

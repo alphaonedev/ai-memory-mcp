@@ -331,17 +331,18 @@ pub(crate) fn materialize_template_for_caller(
     let plan = plan(routine, arguments, now, caller)?;
     // BEGIN IMMEDIATE (#5084, the #2250 class): create_guarded_in_transaction
     // reads (record-stop gate, quota row) before it writes.
-    let tx = crate::storage::connection::WriteTxn::begin(conn).map_err(|e| e.to_string())?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
     let mut ids = Vec::with_capacity(plan.actions.len());
     for action in plan.actions {
         ids.push(
-            crate::actions::create_guarded_in_transaction(conn, action)
+            crate::actions::create_guarded_in_transaction(&tx, action)
                 .map_err(|e| e.message())?
                 .id,
         );
     }
     for (from, to, edge_type) in plan.edges {
-        match crate::actions::add_edge(conn, &from, &to, edge_type, now)
+        match crate::actions::add_edge(&tx, &from, &to, edge_type, now)
             .map_err(|e| e.to_string())?
         {
             crate::actions::AddEdgeOutcome::Added => {}
