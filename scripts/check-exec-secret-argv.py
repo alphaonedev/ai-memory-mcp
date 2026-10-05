@@ -709,6 +709,7 @@ def _my_words_hit(words: Sequence[str]) -> bool:
 _SH_MAX_DEPTH = 8
 _SH_ASSIGN_RE = re.compile(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=")
 _MY_CANDIDATE_RE = re.compile(r"(?i)mysql|mariadb")
+_SH_ANSI_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.S)
 
 
 class _ShUnreadable(Exception):
@@ -740,6 +741,52 @@ class _ShWord:
     @property
     def value(self) -> str:
         return "".join(self.chars)
+
+    def args_from(self, start: int) -> str:
+        """The word's text from index start as an argument: an ANSI-C quoted part keeps a leading dollar sign, so
+        its value counts as an expansion (reported, the conservative side), as it did before it was decoded."""
+        out: List[str] = []
+        for k in range(start, len(self.chars)):
+            g = self.grp[k]
+            if g >= 0 and self.groups[g][0] == "ansi" and (k == start or self.grp[k - 1] != g):
+                out.append("$")
+            out.append(self.chars[k])
+        return "".join(out)
+
+
+_SH_ANSI_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+                   "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+_SH_ANSI_NUM_RE = re.compile(r"[0-7]{1,3}|x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}")
+
+
+def _sh_ansi_decode(body: str) -> str:
+    """The text of an ANSI-C quote ($'...') as bash decodes it (#5832: $'my\\x73ql' is the word mysql): the
+    letter escapes, octal, hex and unicode numbers and control characters; an unknown escape keeps its backslash."""
+    out: List[str] = []
+    i = 0
+    while i < len(body):
+        c = body[i]
+        nxt = body[i + 1:i + 2]
+        if c != "\\" or not nxt:
+            out.append(c)
+            i += 1
+            continue
+        m = _SH_ANSI_NUM_RE.match(body, i + 1)
+        if nxt in _SH_ANSI_SIMPLE:
+            out.append(_SH_ANSI_SIMPLE[nxt])
+            i += 2
+        elif m:
+            num = m.group(0)
+            code = int(num, 8) if num[0] in "01234567" else int(num[1:], 16)
+            out.append(chr(code & 0xFF) if num[0] in "01234567x" else (chr(code) if code < 0x110000 else "\ufffd"))
+            i = m.end()
+        elif nxt == "c" and body[i + 2:i + 3]:
+            out.append(chr(ord(body[i + 2]) & 0x1F))
+            i += 3
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 
 def _sh_bt_end(text: str, i: int) -> int:
@@ -946,12 +993,12 @@ def _sh_part(text: str, i: int, depth: int, word: _ShWord) -> int:
             k = k if k < len(text) else -1
         if k < 0:
             raise _ShUnreadable("an unclosed single quote" if c == "'" else "an unclosed ANSI-C quote")
-        content = text[i + 1 if c == "'" else i + 2:k]
-        g = word.group("sq", [], _sh_read(content, depth + 1))
-        word.add(content if c == "'" else "$" + content, True, g)
+        content = text[i + 1:k] if c == "'" else _sh_ansi_decode(text[i + 2:k])
+        g = word.group("sq" if c == "'" else "ansi", [], _sh_read(content, depth + 1))
+        word.add(content, True, g)
         return k + 1
-    if c == '"':
-        j, chunks, readings, payload = _sh_dquote(text, i + 1, depth)
+    if c == '"' or (c == "$" and nxt == '"'):  # $"..." is a double-quoted string (a locale translation)
+        j, chunks, readings, payload = _sh_dquote(text, i + 1 if c == '"' else i + 2, depth)
         g = word.group("dq", readings, _sh_read(payload, depth + 1))
         for chunk, own in chunks:
             word.add(chunk, own, g)
@@ -992,7 +1039,7 @@ def _sh_sole_reading(w: _ShWord) -> Optional[list]:
     kind, readings, payload = w.groups[w.grp[0]]
     if kind in ("sub", "bt"):
         return readings[0]
-    if kind in ("sq", "dq") and payload is not None and len(payload) == 1 and len(payload[0]) == 1:
+    if kind in ("sq", "dq", "ansi") and payload is not None and len(payload) == 1 and len(payload[0]) == 1:
         return _sh_sole_reading(payload[0][0])
     return None
 
@@ -1009,7 +1056,7 @@ def _sh_head_rests(cmd: List[_ShWord], idx: int, outer_verb: bool) -> List[List[
     for x in cmd[:idx]:
         prev.extend(x.value.replace('"', " ").replace("'", " ").split())
     out: List[List[str]] = []
-    after = [x.value for x in cmd[idx + 1:]]
+    after = [x.args_from(0) for x in cmd[idx + 1:]]
     for m in _MY_HEAD_RE.finditer(v):
         s, e = m.span()
         if not all(w.own[s:e]) or re.fullmatch(r"[A-Z0-9_]+", m.group("name")):
@@ -1024,7 +1071,7 @@ def _sh_head_rests(cmd: List[_ShWord], idx: int, outer_verb: bool) -> List[List[
             before = prev + v[:s].replace('"', " ").replace("'", " ").split()
             if any(x.lower() in _MY_NONCMD_PREV for x in before) or (outer_verb and (idx or s)):
                 continue
-        out.append(v[e:].split() + after)
+        out.append(w.args_from(e).split() + after)
     reading = _sh_sole_reading(w)
     if reading is not None and not any(x.lower() in _MY_NONCMD_PREV for x in prev) and not (outer_verb and idx):
         if any(True for _ in _sh_walk(reading, False)):
@@ -1048,8 +1095,9 @@ def _sh_walk(cmds: List[List[_ShWord]], outer_verb: bool) -> Iterable[List[str]]
 def mysql_family_verdict(raw: str) -> Optional[str]:
     """None when a unit is clean; a named reason when a mysql family command of it carries a credential the gate
     cannot clear, or when the reader cannot resolve the shell text of a unit that names the family."""
-    if not _MY_CANDIDATE_RE.search(re.sub(r"[\"'\\]", "", raw)):
-        return None
+    ansi = "".join(_sh_ansi_decode(m.group(1)) for m in _SH_ANSI_RE.finditer(raw))
+    if not _MY_CANDIDATE_RE.search(re.sub(r"[\"'\\]", "", raw + " " + ansi)):
+        return None  # names no mysql family client, also not through quotes, backslashes or ANSI-C escapes
     try:
         cmds = _sh_read(raw, 0)
     except _ShUnreadable as exc:
@@ -2376,6 +2424,14 @@ ROUND3_RED = [
     ('5956 operand-verb pin: reported 2: an ssh login named like a verb does not hide a wrapped head', 'ssh -l test h "sudo mysql -p$X"'),
     ('5956 operand-verb pin: reported 3: a container named like a verb does not hide an exec payload', 'docker exec status sh -c "exec mysql -p$X"'),
     ('5956 operand-verb pin: reported 4: an operand named like a verb before a timeout wrapper', 'kubectl exec start -- sh -c "timeout 5 mysqladmin -uroot -p$X ping"'),
+    ('5832 split-head pin: reported 1: a head split by an empty double-quoted string', 'my""sql -uroot -p"$X"'),
+    ('5832 split-head pin: reported 2: a head split by an empty single-quoted string', "my''sql -uroot -p\"$X\""),
+    ('5832 split-head pin: reported 3: a head with a backslash before a letter', 'm\\ysql -uroot -p"$X"'),
+    ('5832 split-head pin: reported 4: a head quoted in two parts', '"my"sql -uroot -p"$X"'),
+    ('5832 split-head pin: reported 5: a split head inside an ssh payload', 'ssh h "mysql\\"\\"dump -uroot -p\\$X app"'),
+    ('5832 split-head pin: reported 6: a head spelled with a hex escape in an ANSI-C quote', "$'my\\x73ql' -uroot -p\"$X\""),
+    ('5832 split-head pin: reported 7: a head spelled with an octal escape in an ANSI-C quote', "$'\\155ysql' -uroot -p\"$X\""),
+    ('5832 split-head pin: reported 8: a head spelled with a unicode escape in an ANSI-C quote', "$'mariadb\\u002ddump' -uroot -p\"$X\" app"),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
@@ -2457,6 +2513,8 @@ ROUND3_GREEN = [
     ('5956 operand-verb pin: clean 1: a verb inside the payload still hides the head', 'ssh test "echo mysql -uroot -p$X"'),
     ('5956 operand-verb pin: clean 2: the outer command word still hides a head after the payload start', 'printf "%s %s" "x" "run sudo mysql -p$X"'),
     ('5956 operand-verb pin: clean 3: an assignment before an outer verb still hides the head', 'LC_ALL=C echo "now mysql -p$X"'),
+    ('5832 split-head pin: clean 1: a split head with clean words', 'my""sql -uroot -h "$H" app'),
+    ('5832 split-head pin: clean 2: an ANSI-C spelled head with clean words', "$'my\\x73ql' -uroot -h \"$H\" app"),
 ]
 
 # Raw logical-line text that holds a newline (the arm is a function of text; every unit the gate builds today is
