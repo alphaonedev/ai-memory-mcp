@@ -915,6 +915,18 @@ MDEOF
         "See Vec<&nbsp;$R::RecallTool<T>> here."
     anchor_green 5531 "a generic opener attached to the anchor after a spaced word" \
         "See a <$R::RecallTool<T>> here."
+    anchor_green 5531 "a word-attached less-than is a generic opener, not an operator token" \
+        "See a <b and $R::RecallTool<T>> here."
+    anchor_red 5531 BARE_QUAL "an over-closed anchor after an HTML comment opener" \
+        "See <!-- a and $R::RecallTool<T>> here."
+    anchor_red 5531 BARE_QUAL "an over-closed anchor after a comparison spaced with a thin-space entity" \
+        "See a <&thinsp;b and $R::RecallTool<T>> here."
+    anchor_red 5531 BARE_QUAL "an over-closed anchor after a comparison spaced with an en-space entity" \
+        "See a <&ensp;b and $R::RecallTool<T>> here."
+    anchor_red 5531 BARE_QUAL "an over-closed anchor after a comparison spaced with an em-space entity" \
+        "See a <&emsp;b and $R::RecallTool<T>> here."
+    anchor_green 5531 "a decimal-entity angle bracket is not whitespace and opens a prose generic" \
+        "See Vec&#60;$R::RecallTool<T>> here."
 
     # #5532: the only `?` bound is `?Sized`, and every bound AFTER the type of
     # a trait-object or impl bound list is checked like the type: a missing
@@ -944,6 +956,12 @@ MDEOF
         "See \`$R::<dyn RecallTool + 'a + ?Sized + >::decorate_memory_many\`."
     anchor_green 5532 "a dyn self type with two live traits" \
         "See \`$R::<dyn RecallTool + RecallTool>::decorate_memory_many\`."
+    anchor_red 5532 QUAL "a dyn self type with an empty bound between two pluses is refused" \
+        "See \`$R::<dyn RecallTool + + 'a>::decorate_memory_many\`."
+    anchor_red 5532 QUAL "a dyn self type with a lifetime followed by a name is refused" \
+        "See \`$R::<dyn RecallTool + 'a NoSuch>::decorate_memory_many\`."
+    anchor_green 5532 "a dyn self type with two live traits and an as clause" \
+        "See \`$R::<dyn RecallTool + RecallTool as RecallTool>::decorate_memory_many\`."
 
     # #5535: a self type group with nothing after it (no method) is still a
     # self type: its type is checked, and one that names no type is refused.
@@ -968,6 +986,12 @@ MDEOF
         "See \`$R::<*const RecallTool>\`."
     anchor_green 5535 "a lone dyn self type with a live trait" \
         "See \`$R::<dyn RecallTool>\`."
+    anchor_red_cites 5535 BARE_QUAL "a lone dyn self type followed by a period names its missing trait" \
+        "$R::NoSuch" \
+        "See $R::<dyn NoSuch>. Next."
+    anchor_red_cites 5535 BARE_QUAL "a lone pointer self type followed by a comma names its missing type" \
+        "$R::NoSuch" \
+        "See $R::<*const NoSuch>, next."
 
     # #5536: a group closer is a closer however it is written or spaced: a
     # numeric or upper-case entity is an angle bracket, and whitespace (space,
@@ -1003,6 +1027,20 @@ MDEOF
         "See Vec&LT;$R::RecallTool&GT; here."
     anchor_green 5536 "a group followed by a spaced greater-than comparison" \
         "See $R::RecallTool<T> > 3 here."
+    anchor_green 5536 "a prose generic opened with a hexadecimal entity" \
+        "See Vec&#x3c;$R::RecallTool<T>> here."
+    anchor_green 5536 "a prose generic opened with a zero-padded decimal entity" \
+        "See Vec&#060;$R::RecallTool<T>> here."
+    anchor_green 5536 "a decimal-entity group with a comma and a space inside" \
+        "See $R::RecallTool&#60;T, U&#62;::decorate_memory_many here."
+    anchor_green 5536 "a decimal-entity as clause self type with live names" \
+        "See $R::&#60;RecallTool as RecallTool&#62;::decorate_memory_many here."
+    anchor_red_cites 5536 BARE_QUAL "a decimal-entity as clause self type with a missing type names it" \
+        "$R::NoSuch" \
+        "See $R::&#60;NoSuch as RecallTool&#62;::decorate_memory_many here."
+    anchor_red_cites 5536 BARE_QUAL "a missing type before a decimal-entity group names the type" \
+        "$R::NoSuch" \
+        "See $R::NoSuch&#60;T&#62;::decorate_memory_many here."
 
     # #5537: a higher-ranked binder (`for<'a>`) before a bound is skipped, so
     # the trait behind it is the name that is checked, not the word `for`.
