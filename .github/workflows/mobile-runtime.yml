@@ -19,14 +19,21 @@ name: Mobile runtime (iOS Simulator + Android emulator)
 #
 # Trigger matrix (cost-conscious):
 #   - `push` to `release/**`     → run both arms
-#   - `pull_request` to `main`   → run iOS Simulator only (Android
-#                                  is too expensive per-PR)
+#   - `pull_request` to `main` or `rehearsal/**` (#5447; path-filtered)
+#                                → run iOS Simulator only (Android
+#                                  is too expensive per-PR; its job
+#                                  condition admits only push and
+#                                  workflow_dispatch)
 #   - `workflow_dispatch`        → run both arms on demand
 #
 # Estimated cost: ~$0.40 / iOS run + ~$0.04 / Android run when both
 # arms execute. With release/** push frequency of ~5 / month + a
 # weekly manual dispatch, total is ~$10/month — well under the
-# $50-150 ceiling the #1068 spec set.
+# $50-150 ceiling the #1068 spec set. That figure counts push and
+# dispatch runs ONLY. Pull-request runs (iOS arm only, ~$0.40 each on
+# macos-latest, 45 min timeout) are additional: one per push to a PR
+# branch whose base is main or rehearsal/** and whose diff touches the
+# path list below; the monthly total grows with that PR-push count.
 
 on:
   push:
