@@ -1515,12 +1515,7 @@ def _computed_command(stmt, text):
     path: such a word may run a builtin that assigns a variable."""
     if re.match(r"\s*\w+\+?=\(", stmt):
         return None   # an array assignment: its parenthesised words are values, not a command
-    words = shell_words(stmt)
-    k = 0
-    while k < len(words) and (words[k] in ("if", "then", "elif", "else", "while", "until", "do", "!", "time", "{",
-                                             "command", "builtin", "exec")
-                              or re.match(r"\w+\+?=", words[k])):
-        k += 1
+    words, _, k = _command_word(stmt)   # #5896: a leading redirection or a quoted wrapper does not hide it
     if k >= len(words) or not re.search(r"[$`]", words[k]):
         return None
     alts = expand(words[k], text)
@@ -1530,19 +1525,14 @@ def _computed_command(stmt, text):
 
 
 def _name_writer(stmt):
-    """The builtin of `stmt` when it assigns a variable named by an operand (read, mapfile, readarray, getopts,
-    printf -v, wait -p) and some operand other than a redirection is computed; else None."""
-    words = shell_words(REDIRECTION.sub(" ", stmt))
-    k = 0
-    while k < len(words) and (words[k] in ("if", "then", "elif", "else", "while", "until", "do", "!", "time", "{",
-                                             "command", "builtin", "exec")
-                              or re.match(r"\w+\+?=", words[k])):
-        k += 1
+    """The builtin of `stmt` when it assigns a variable named by an operand (read, mapfile, readarray, getopts, let,
+    printf -v, wait -p) and some operand other than a redirection is computed or quoted; else None."""
+    words, plain, k = _command_word(stmt)   # #5896: the command word after quote removal
     if k >= len(words):
         return None
-    cmd, rest = re.sub(r"[\\'\"]", "", words[k]), words[k + 1:]
-    flags = "".join(w[1:] for w in rest if re.fullmatch(r"-\w+", w))
-    if cmd in NAME_WRITERS or (cmd == "printf" and "v" in flags) or (cmd == "wait" and "p" in flags):
+    cmd, rest = plain[k], words[k + 1:]
+    flags = "".join(p[1:] for p in plain[k + 1:] if p and re.fullmatch(r"-\w+", p))
+    if cmd in NAME_WRITERS or cmd == "let" or (cmd == "printf" and "v" in flags) or (cmd == "wait" and "p" in flags):
         if any(re.search(r"[$`'\"\\]", w) for w in rest):
             return cmd
     return None
@@ -1624,16 +1614,139 @@ def _command_word(stmt):
     return words, plain, min(k, len(words))
 
 
+_INDIRECT_WORDS = {".": "source", "source": "source", "eval": "eval", "alias": "alias"}
+
+
 def _command_findings(stmt):
-    """#5763: the reasons the command word of `stmt` may write a root it does not name, after quote removal: the
-    source and dot builtins in any spelling."""
+    """#5763: (reasons, code) for simple command `stmt`, read after quote removal. reasons: the command word is an
+    indirect writer (source or the dot builtin, eval, alias) in any spelling (#5897, #5896), a word bash computes
+    from a glob, a brace or an ANSI-C escape (#5896; an expansion is _computed_command's), a trap whose action is
+    computed, or a declarator or unset whose name is computed or quoted. code: the text of a literal trap action,
+    which bash runs as code and the caller scans like a line."""
     words, plain, k = _command_word(stmt)
     if k >= len(words):
-        return []
-    cw = plain[k]
-    if cw in (".", "source"):
-        return ["source"]
-    return []
+        return [], []
+    cw, why, code = plain[k], [], []
+    if cw is None:
+        return ([] if re.search(r"[$`]", words[k]) else ["computed command %s" % words[k]]), []
+    if cw in _INDIRECT_WORDS:
+        why.append(_INDIRECT_WORDS[cw])
+    if cw in DECLARATORS | {"unset"} and any(re.search(r"[$`\"'\\]", w.split("=", 1)[0])
+                                             for w in words[k + 1:] if not w.startswith("-")):
+        why.append("computed name")
+    if cw == "trap":
+        ops = plain[k + 1:]
+        while ops and ops[0] is not None and ops[0].startswith("-") and ops[0] != "-":
+            ops = ops[1:]
+        if ops and ops[0] is None:
+            why.append("computed trap action")
+        elif len(ops) > 1 and ops[0] != "-":
+            code.append(ops[0])
+    return why, code
+
+
+def _normalised(stmt):
+    """#5896: `stmt` with every word bash does not compute replaced by its quote-removed text, white space inside a
+    word turned into _ (a quoted message is one word, not a command line); a computed word stays as written."""
+    return " ".join(w if p is None else re.sub(r"\s", "_", p) for w, p in zip(shell_words(stmt),
+                                                                             map(_dequote, shell_words(stmt))))
+
+
+def _names_root(name, stmt):
+    """#5763: True when `stmt` names root `name` other than to read it, as written or after quote removal."""
+    reads, mention = _root_reads(name), r"(?<!\w)%s(?!\w)" % name
+    return any(re.search(mention, re.sub(reads, "", s)) for s in (stmt, _normalised(stmt)))
+
+
+_CASE_WORD = r"""(?:[^\s|()'"\\]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+"""
+_CASE_ITEM = re.compile(r"\s*\(?\s*%s(?:\s*\|\s*%s)*\s*\)" % (_CASE_WORD, _CASE_WORD))
+
+
+def _shell_tokens(code):
+    """#5896: (start, end, text) of each unquoted word and control operator of `code`; quotes, ${ } and $( ) stay
+    inside their word."""
+    out, i = [], 0
+    while i < len(code):
+        if code[i].isspace():
+            i += 1
+            continue
+        op = re.match(r";;&|;;|;&|\|\||&&|\|&|[;&|()]", code[i:])
+        if op:
+            out.append((i, i + op.end(), op.group()))
+            i += op.end()
+            continue
+        start, quote = i, None
+        while i < len(code):
+            c = code[i]
+            if c == "\\" and quote != "'":
+                i += 2
+            elif quote:
+                if quote == '"' and c == "$" and code[i + 1:i + 2] in ("(", "{"):
+                    i = _close(code, i)
+                    continue
+                quote = None if c == quote else quote
+                i += 1
+            elif c in "'\"":
+                quote, i = c, i + 1
+            elif c == "$" and code[i + 1:i + 2] in ("(", "{"):
+                i = _close(code, i)
+            elif c.isspace() or c in ";&|()":
+                break
+            else:
+                i += 1
+        out.append((start, i, code[start:i]))
+    return out
+
+
+_CMD_LEAD = frozenset((None, ";", "&", "|", "||", "&&", "|&", "(", ")", ";;", ";&", ";;&", "{", "!", "then", "do",
+                       "else", "elif", "if", "while", "until", "time"))
+
+
+def _case_patterns_removed(lines):
+    """#5896: `lines` with the pattern list of each case item blanked: a pattern is matched, not run, so a glob in
+    it is no command word. A case is followed across lines from case ... in to esac; a pattern list is removed only
+    where an item may start (after in, ;; ;& or ;;&) and only in its plain form (words joined by |, no parenthesis
+    inside); a pattern in any other form is scanned as written, which can only add findings."""
+    out, stack = [], []
+    for n, line, func in lines:
+        code = strip_comment(line)
+        chars, prev, skip = list(code), None, 0
+        for start, end, tok in _shell_tokens(code):
+            if start < skip:
+                continue
+            if stack and stack[-1] == "pat" and tok != "esac":
+                m = _CASE_ITEM.match(code, start)
+                stack[-1] = "body"
+                if m:
+                    chars[start:m.end()] = " " * (m.end() - start)
+                    skip, prev = m.end(), ")"
+                    continue
+            if tok == "case" and prev in _CMD_LEAD:
+                stack.append("word")
+            elif tok == "in" and stack and stack[-1] == "word":
+                stack[-1] = "pat"
+            elif tok == "esac" and stack and prev in _CMD_LEAD | {"in"}:
+                stack.pop()
+            elif tok in (";;", ";&", ";;&") and stack:
+                stack[-1] = "pat"
+            prev = tok
+        out.append((n, "".join(chars), func))
+    return out
+
+
+def _code_lines(lines):
+    """#5896: `lines` plus the text of every literal trap action as a line of its own (same number and function),
+    followed into a trap inside such a text; past 8 levels the line is a finding."""
+    out, todo, depth = list(lines), list(lines), 0
+    while todo and depth < 8:
+        nxt = []
+        for n, line, func in todo:
+            for stmt in statements(strip_comment(line)):
+                nxt.extend((n, c, func) for c in _command_findings(stmt)[1])
+        out.extend(nxt)
+        todo, depth = nxt, depth + 1
+    out.extend((n, None, func) for n, _, func in todo)
+    return out
 
 
 def _root_pass(name, stmt):
@@ -1652,20 +1765,21 @@ def root_findings(text):
     if text in _ROOT_CACHE:
         return _ROOT_CACHE[text]
     bad, lines = [], logical_lines(text)
-    for n, line, func in lines:
-        code = re.sub(r'"[^"$`]*"', '""', strip_comment(line))
-        for rx, label in ROOT_INDIRECT:
-            if re.search(rx, code):
-                bad.append("%d:roots:%s" % (n, label))
+    # #5896: a case pattern is no command; a literal trap action is code and is scanned like a line.
+    scan = _code_lines(_case_patterns_removed(lines))
+    for n, line, func in scan:
+        if line is None:
+            bad.append("%d:roots:a trap action nested past 8 levels" % n)
+            continue
+        raw = strip_comment(line)
+        code = re.sub(r'"[^"$`]*"', '""', raw)
+        # #5896: the patterns run on the line as written and on each statement after quote removal.
+        for form in [code] + [_normalised(stmt) for stmt in statements(raw)]:
+            bad.extend("%d:roots:%s" % (n, label) for rx, label in ROOT_INDIRECT if re.search(rx, form))
         if re.search(r"(?<![\w-])trap\s+(?!-\s|'[^']*'\s|\"\"\s)", code):
             bad.append("%d:roots:computed trap action" % n)
-        for stmt in statements(strip_comment(line)):
-            bad.extend("%d:roots:%s" % (n, why) for why in _command_findings(stmt))
-        for stmt in statements(code):
-            words = shell_words(stmt)
-            if words and words[0] in DECLARATORS | {"unset"} and any(
-                    re.search(r"[$`\"'\\]", w.split("=", 1)[0]) for w in words[1:] if not w.startswith("-")):
-                bad.append("%d:roots:computed name" % n)
+        for stmt in statements(raw):
+            bad.extend("%d:roots:%s" % (n, why) for why in _command_findings(stmt)[0])
             cmd = _computed_command(stmt, text)
             if cmd:
                 bad.append("%d:roots:computed command %s" % (n, cmd))
@@ -1673,17 +1787,16 @@ def root_findings(text):
             if writer:
                 bad.append("%d:roots:computed operand of %s" % (n, writer))
     for name, scope, stmt in ROOT_DEFS:
-        defs, reads = [], _root_reads(name)
-        mention = r"(?<!\w)%s(?!\w)" % name
-        for n, line, func in lines:
-            code = strip_comment(line)
-            if not re.search(mention, re.sub(reads, "", code)):
+        defs = []
+        for n, line, func in scan:
+            code = strip_comment(line or "")
+            if not _names_root(name, code):
                 continue
             if code.strip() == stmt and func == scope:
                 defs.append(n)
                 continue
             for st in statements(code):
-                if re.search(mention, re.sub(reads, "", st)) and not _root_pass(name, st):
+                if _names_root(name, st) and not _root_pass(name, st):
                     bad.append("%d:%s:named outside its one reviewed assignment" % (n, name))
                     break
         if len(defs) != 1:
@@ -1707,10 +1820,11 @@ def root_findings(text):
             chained = bool(re.search(r"(?:&&|\|\||\||!)\s*$", code))
         if depth != 0 or chained:
             bad.append("%d:%s:assignment is not unconditional in its scope" % (at, name))
-        for n, line, func in lines:
-            if re.search(_root_reads(name), strip_comment(line)) and n != at \
+        for n, line, func in scan:
+            if re.search(_root_reads(name), strip_comment(line or "")) and n != at \
                     and (n < at or (scope and func != scope)):
                 bad.append("%d:%s:read before its assignment or outside its function" % (n, name))
+    bad = list(dict.fromkeys(bad))
     if len(_ROOT_CACHE) > 8:
         _ROOT_CACHE.clear()
     _ROOT_CACHE[text] = bad
@@ -3576,10 +3690,33 @@ ROOT_SPELLINGS = (
     ("#5897", "a dot in a subshell", '( . "$HERE/x" )', "roots:source"),
     ("#5897", "a split source", 'sou""rce "$HERE/x"', "roots:source"),
     ("#5897", "a dot after a redirection", '2>/dev/null . "$HERE/x"', "roots:source"),
+    # #5896: a quoted, escaped or split command word, and the code of a literal trap action.
+    ("#5896", "a double-quoted eval (S2)", 'c=OUT_""DIR=/dev; "eval" "$c"', "roots:eval"),
+    ("#5896", "a single-quoted eval", "'eval' \"$c\"", "roots:eval"),
+    ("#5896", "a backslash in eval", 'e\\val "$c"', "roots:eval"),
+    ("#5896", "a split eval", 'ev""al "$c"', "roots:eval"),
+    ("#5896", "a dollar-quoted eval", "$'\\x65val' \"$c\"", "roots:computed command $'\\x65val'"),
+    ("#5896", "a glob command word", 'ev?l "$c"', "roots:computed command ev?l"),
+    ("#5896", "a bracket command word", '[e]val "$c"', "roots:computed command [e]val"),
+    ("#5896", "a quoted alias", '"alias" q=x', "roots:alias"),
+    ("#5896", "a quoted export of a split root name", '"export" OUT_""DIR=/dev',
+     "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5896", "let with a quoted split root name", 'let "OUT_""DIR=1"',
+     "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5896", "a quoted declare with a computed name", '"declare" "$n=/dev"', "roots:computed name"),
+    ("#5896", "let with a computed operand", 'let "$n=1"', "roots:computed operand of let"),
+    ("#5896", "a split eval in a literal trap action", 'trap \'e""val "$c"\' RETURN', "roots:eval"),
+    ("#5896", "a split root name in a literal trap action", "trap 'OUT_\"\"DIR=/dev' RETURN",
+     "OUT_DIR:named outside its one reviewed assignment"),
+    ("#5896", "a quoted trap with a computed action", '"trap" "$x" EXIT', "roots:computed trap action"),
+    ("#5896", "a computed command after a redirection", '2>/dev/null "$c" x', "roots:computed command \"$c\""),
+    ("#5896", "a quoted eval in a case item", 'case "$1" in a) "eval" "$c" ;; esac', "roots:eval"),
 )
 # Spellings that leave every root proven: a builtin name as a literal argument of another command.
 ROOT_SPELLINGS_CLEAN = (
     ("#5897", "a dot as a literal argument", 'ls -d . "$OUT_DIR"'),
+    ("#5896", "builtin names inside a quoted message", 'echo "please source the env and eval it"'),
+    ("#5896", "a glob in a case pattern", 'case "$1" in ev?l | [e]val) : ;; *) : ;; esac'),
 )
 
 
