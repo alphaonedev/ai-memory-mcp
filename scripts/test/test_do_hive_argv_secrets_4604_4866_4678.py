@@ -19,6 +19,7 @@ import functools
 import re
 import signal
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1426,10 +1427,18 @@ def could_equal(a, b):
 # variable is proven when the script names it in that statement exactly once, outside it only to read it or to
 # pass the same value to one command (V="$V" cmd), the statement runs unconditionally (no open if, loop, case,
 # group, subshell or && || | chain before it in its scope), and every read is after it (a function root: in its
-# function). No indirect writer may exist anywhere in the script: eval, source or ., alias, a nameref, a read,
-# mapfile, readarray, getopts, printf -v or wait -p with a computed operand, a trap whose action is computed, a
-# declarator or unset with a computed name, or a computed command word that is not a path. Any other spelling
-# leaves every root unproven: each target under one is then the terminal, and the line is reported.
+# function). A name split by quotes or attached to an option letter (wait -pOUT_DIR) is a mention (#5898). Each
+# simple command is read as written and after quote removal, and a literal trap action is read as code; a line
+# that holds an indirect writer leaves every root unproven: eval, source or ., alias or enable as the command word
+# after quote removal, a command word bash computes that is not a path, a nameref after any run of option words
+# (#5895, #5896, #5897), a read, mapfile, readarray, getopts, let, printf -v or wait -p with a computed operand, a
+# mapfile callback, a prompt, alias-table, command-table or startup-file variable, an indirect expansion that
+# assigns (#5899), a trap whose action is computed, a declarator or unset with a computed name, or a declarator
+# with a computed option word. Each such line is reported and each target under a root is then the terminal. The
+# forms read as code are themselves a closed list: the rule moves the enumeration from the forms that write to the
+# forms recognised as code, and a word the normaliser cannot decide fails the proof. It proves a root only against
+# that list and does not show that no other indirect writer exists. An integer that bash arithmetic assigns while
+# it evaluates the text of a variable is a stated limit (#5901).
 ROOT_DEFS = (
     ("HERE", "", 'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'),
     ("REPO_ROOT", "", 'REPO_ROOT="$(cd "${HERE}/../.." && pwd)"'),
@@ -1624,9 +1633,9 @@ _INDIRECT_WORDS = {".": "source", "source": "source", "eval": "eval", "alias": "
 
 def _command_findings(stmt):
     """#5763: (reasons, code) for simple command `stmt`, read after quote removal. reasons: the command word is an
-    indirect writer (source or the dot builtin, eval, alias) in any spelling (#5897, #5896), a word bash computes
-    from a glob, a brace or an ANSI-C escape (#5896; an expansion is _computed_command's), a trap whose action is
-    computed, or a declarator or unset whose name is computed or quoted. code: the text of a literal trap action,
+    indirect writer (source or the dot builtin, eval, alias, enable) after quote removal (#5897, #5896), a word
+    bash computes from a glob, a brace or an ANSI-C escape (#5896; an expansion is _computed_command's), a trap
+    whose action is computed, or a declarator or unset whose name is computed or quoted. code: the text of a literal trap action,
     which bash runs as code and the caller scans like a line."""
     words, plain, k = _command_word(stmt)
     if k >= len(words):
@@ -1792,7 +1801,9 @@ def _root_pass(name, stmt):
 
 
 def root_findings(text):
-    """#5763: every line that keeps a FILE_ROOTS value from being proven (see ROOT_DEFS), as line:name:reason."""
+    """#5763: every line that keeps a FILE_ROOTS value from being proven (see ROOT_DEFS), as line:name:reason.
+    The normaliser is itself a membership list of forms recognised as code; an empty result proves the roots only
+    against that list, and a word it cannot decide is a finding, never a pass."""
     if text in _ROOT_CACHE:
         return _ROOT_CACHE[text]
     bad, lines = [], logical_lines(text)
@@ -3710,7 +3721,7 @@ def file_roots_5763():
 # Round 18 (#5763 survivors): each spelling reassigns OUT_DIR in bash 5.2 (or runs code that may), and is reported on
 # its first line with the reason given; a write under OUT_DIR after it is then the terminal.
 ROOT_SPELLINGS = (
-    # #5897: the dot and source builtins in every spelling.
+    # #5897: the dot and source builtins quoted, escaped, split or after a prefix word.
     ("#5897", "a backslash-escaped dot", '\\. "$HERE/x"', "roots:source"),
     ("#5897", "a double-quoted dot", '"." "$HERE/x"', "roots:source"),
     ("#5897", "a single-quoted dot", "'.' \"$HERE/x\"", "roots:source"),
@@ -3742,7 +3753,7 @@ ROOT_SPELLINGS = (
     ("#5896", "a quoted trap with a computed action", '"trap" "$x" EXIT', "roots:computed trap action"),
     ("#5896", "a computed command after a redirection", '2>/dev/null "$c" x', "roots:computed command \"$c\""),
     ("#5896", "a quoted eval in a case item", 'case "$1" in a) "eval" "$c" ;; esac', "roots:eval"),
-    # #5895: a nameref after any run of option words, in any spelling of its option.
+    # #5895: a nameref after any run of option words, its option quoted or split.
     ("#5895", "declare +i -n (S1)", 'n=OUT_""DIR; declare +i -n r="$n"; r=/dev', "roots:nameref"),
     ("#5895", "typeset +x -n", 'typeset +x -n r="$n"', "roots:nameref"),
     ("#5895", "local +r -n", 'local +r -n r="$n"', "roots:nameref"),
@@ -3792,6 +3803,21 @@ ROOT_SPELLINGS = (
     ("#5898", "a single-quoted attached printf -v name", "printf -v'OUT_DIR' %s /dev",
      "OUT_DIR:named outside its one reviewed assignment"),
     ("#5896", "a quoted let with a split name", "let 'OUT_''DIR=7'", "OUT_DIR:named outside its one reviewed assignment"),
+    # #5763 round 18 mutation survivors: each spelling below kills one mutant of the normaliser.
+    ("#5895", "an option word from a command substitution", 'declare `printf %s -n` r="$n"', "roots:computed option"),
+    ("#5895", "an option word with an ANSI-C hex escape", "declare $'-\\x6e' r=\"$n\"", "roots:computed option"),
+    ("#5896", "a brace-expanded eval", '{ev,ev}al "$c"', "roots:computed command {ev,ev}al"),
+    ("#5899", "a mapfile callback after if", 'if mapfile -tC "$cb" -c 1 a <<< x; then :; fi', "roots:callback of mapfile"),
+    ("#5896", "a split eval in a trap action after --", "trap -- 'e\"\"val \"$c\"' RETURN", "roots:eval"),
+    ("#5895", "a nameref option after a plus word and a g", 'declare +i -gn r="$n"', "roots:nameref"),
+)
+# #5763: the canonical corpus. The four round-17 survivors exactly as the review spelled them; with the forms of
+# file_roots_5763 (the earlier rounds) and ROOT_SPELLINGS they are the writer forms the self-test asserts.
+ROUND17_SURVIVORS = (
+    ("S1", 'n=OUT_""DIR; declare +i -n r="$n"; r=/dev'),
+    ("S2", 'c=OUT_""DIR=/dev; "eval" "$c"'),
+    ("S3", '\\. "$HERE/x"'),
+    ("S4", "sleep 0 & wait -pOUT_DIR"),
 )
 # Spellings that leave every root proven: a builtin name as a literal argument of another command.
 ROOT_SPELLINGS_CLEAN = (
@@ -3804,6 +3830,8 @@ ROOT_SPELLINGS_CLEAN = (
     ("#5898", "a longer name that starts with the root name", 'wait -pOUT_DIRX'),
     ("#5899", "an indirect read", 'echo "${!n}" "${!n:-x}"'),
     ("#5899", "mapfile without a callback", "mapfile -t arr <<< x"),
+    ("#5896", "a double-quoted e backslash v al, which bash runs as e\\val", '"e\\val" x'),
+    ("#5896", "a builtin name given to exec -a as the program name", "exec -a enable /usr/bin/env"),
 )
 
 
@@ -3826,6 +3854,24 @@ def root_spellings_5763():
               " ".join(root_findings(text)[:3]))
         probe("%s %s keeps a target under OUT_DIR a file" % (issue, label),
               target_kind('"$OUT_DIR/a"', text) == "file", target_kind('"$OUT_DIR/a"', text))
+    for sid, body in ROUND17_SURVIVORS:
+        text = head + body + "\n" + W + "\n}\n"
+        roots = root_findings(text)
+        probe("#5763 canonical corpus: round-17 survivor %s leaves the roots unproven" % sid,
+              any(r.startswith("%d:" % first) for r in roots) and target_kind('"$OUT_DIR/a"', text) == "terminal",
+              " ".join(roots[:3]))
+    core = 'eval "$c"'
+    nested = {}
+    for depth in range(1, 10):
+        core = "trap %s RETURN" % shlex.quote(core)
+        nested[depth] = core
+    for depth, want in ((7, "roots:eval"), (9, "roots:a trap action nested past 8 levels")):
+        roots = root_findings(head + nested[depth] + "\n" + W + "\n}\n")
+        probe("#5896 a trap action nested %d levels is reported as %s" % (depth, want),
+              "%d:%s" % (first, want) in roots, " ".join(roots[:3]))
+    roots = root_findings(head + '( case "$1" in a) : ;; esac\n"eval"|cat )\n' + W + "\n}\n")
+    probe("#5896 the line after an esac is read as code, not as a case pattern",
+          "%d:roots:eval" % (first + 1) in roots, " ".join(roots[:3]))
 
 
 def heredoc_5655():

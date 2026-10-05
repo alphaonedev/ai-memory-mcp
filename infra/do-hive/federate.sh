@@ -312,16 +312,23 @@ node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; 
 #    included, is the terminal, and a cp, install, scp download or ln to it is refused (#5602);
 #  - $OUT_DIR and $run_dir are roots only while the scan proves their value (#5763): each of them, and
 #    HERE and REPO_ROOT that they are built from, has one reviewed assignment that runs unconditionally
-#    in its scope, every read comes after it (run_dir: inside loadgen), no other line names it except
-#    to read it or to pass the same value to one command, and no indirect writer exists anywhere
-#    (eval, source or ., alias, a nameref, a read, mapfile, readarray, getopts, printf -v or wait -p
-#    with a computed operand, a computed trap action, a declarator or unset with a computed name, a
-#    computed command word); any other spelling is reported on its line and every target under a
-#    root is then the terminal;
+#    in its scope, every read comes after it (run_dir: inside loadgen), and no other line names it
+#    except to read it or to pass the same value to one command; a name split by quotes or attached
+#    to an option letter (wait -pOUT_DIR) names it (#5898). Each simple command is also read after
+#    quote removal, and the root is not proven when the scan finds an indirect writer on any line or
+#    in a literal trap action: eval, source or ., alias or enable as the command word after
+#    quote removal, a command word bash computes that is not a path, a nameref after any run of option
+#    words (#5895, #5896, #5897), a read, mapfile, readarray, getopts, let, printf -v or wait -p with
+#    a computed operand, a mapfile callback, a prompt, alias-table, command-table or startup-file
+#    variable, an indirect expansion that assigns (#5899), a computed trap action, a declarator or
+#    unset with a computed name, or a declarator with a computed option word; such a line is
+#    reported and every target under a root is then the terminal. The forms read as code are a
+#    closed list and a word the scan cannot decide fails the proof, so a root is proven only
+#    against that list, not against every indirect writer bash has;
 #  - a pipe into base64 is exempt only when it continues into curl, and the b64 helper only while its
 #    body is exactly the pinned one (#5413);
-#  - a function that wraps a node channel is followed as a source, in every spelling of the definition
-#    (#5360, #5414);
+#  - a function that wraps a node channel is followed as a source, in each definition spelling the
+#    scan lists (#5360, #5414);
 #  - outside main the scan refuses eval, read, mapfile, printf -v, indirect expansion, here-strings,
 #    here-documents not fed to a node, indexed and escaped-space assignments, default-assign and :?
 #    expansions, let, ((, process substitution and backticks (#5236, #5359, #5407, #5408, #5410).
@@ -338,8 +345,8 @@ node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; 
 # directory are reported, and so is a capture or a trap handler that reads a written file.
 # Stated limits: a root moved by the environment (inside V="${V:-x}" V is taken as x), a literal
 # absolute spelling of a directory above a computed root, symbolic links, an integer that bash
-# arithmetic assigns while it evaluates the text of a variable, and a path that reaches a command
-# only as a function argument or as a value with no literal spelling are not decided.
+# arithmetic assigns while it evaluates the text of a variable (#5901), and a path that reaches a
+# command only as a function argument or as a value with no literal spelling are not decided.
 # Whole-verify probes check the printed bytes.
 # reply_status prints a 3-digit HTTP
 # status, or the word non-status for anything else. reply_len prints the reply's byte count.
