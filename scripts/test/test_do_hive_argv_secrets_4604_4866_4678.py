@@ -2204,8 +2204,16 @@ def construct_findings(text):
             if re.search(rx, code):
                 bad.append("%d:%s" % (n, label))
         # A here-document is allowed only as a script fed to a node (node_sh); any other reader may print it.
-        if re.search(r"<<-?\s*'?\w+'?", code) and "<<<" not in code and not re.search(r"(?<![\w-])node_sh\s[^<]*<<", code):
+        # #5655: every operator counts, whatever the spelling of its delimiter, and one per line.
+        ops = heredoc_ops(line)
+        if ops and (len(ops) > 1 or not re.search(r"(?<![\w-])node_sh\s[^<]*<<", line)):
             bad.append("%d:here-document" % n)
+    # #5655: an unterminated body is read as code (see heredoc_scan) and is itself a finding.
+    bad += ["%d:unterminated here-document %s" % (at, delim) for at, delim in heredoc_scan(text)[1]]
+    # #5655: bash runs a command substitution of an unquoted body on this machine before the body is sent.
+    for k, raw, quoted, _ in heredoc_body_lines(text):
+        if not quoted and re.search(r"(?<!\\)(?:\\\\)*(?:\$\((?!\()|`)", raw):
+            bad.append("%d:command substitution in a here-document" % k)
     return bad
 
 
@@ -2731,17 +2739,133 @@ CHANNEL_DEFS = re.compile(r"^\s*(on_node|node_sh|lg_curl)\(\) \{")
 FUNC_DEF = re.compile(r"^(\s*)(?:function\s+(\w+)(?:\s*\(\s*\))?|(\w+)\s*\(\s*\))\s*(\{.*)?$")
 
 
+def heredoc_ops(line):
+    """#5655: (delimiter, quoted, strip_tabs) of every here-document operator of one logical line, in order.
+    An operator counts outside single quotes and outside double quotes (a $( ) capture inside double quotes opens
+    a fresh context), never inside $(( )) arithmetic, and never as <<< (a here-string). Any quote or backslash in
+    the delimiter word makes the body literal; <<- strips leading tabs from the body and the terminator."""
+    ops, stack, i = [], [["top", 0]], 0   # context and its open parenthesis depth
+    while i < len(line):
+        c, top = line[i], stack[-1]
+        ctx = top[0]
+        if ctx == "ar":
+            if c == "(":
+                top[1] += 1
+            elif c == ")" and top[1]:
+                top[1] -= 1
+            elif line.startswith("))", i):
+                stack.pop()
+                i += 1
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if line.startswith("$((", i):
+            stack.append(["ar", 0])
+            i += 3
+            continue
+        if line.startswith("$(", i):
+            stack.append(["cs", 0])
+            i += 2
+            continue
+        if ctx == "dq":
+            if c == '"':
+                stack.pop()
+            i += 1
+            continue
+        if c == "'":
+            j = line.find("'", i + 1)
+            i = len(line) if j < 0 else j + 1
+            continue
+        if c == "#" and (i == 0 or line[i - 1] in " \t;&|("):
+            break   # a comment: the rest of the line is no code
+        if c == '"':
+            stack.append(["dq", 0])
+        elif c == "(" and ctx == "cs":
+            top[1] += 1
+        elif c == ")" and ctx == "cs":
+            if top[1]:
+                top[1] -= 1
+            else:
+                stack.pop()
+        elif line.startswith("<<", i) and not line.startswith("<<<", i) and line[i - 1:i] != "<":
+            j = i + 2
+            strip = line[j:j + 1] == "-"
+            j += 1 if strip else 0
+            while j < len(line) and line[j] in " \t":
+                j += 1
+            word = ""
+            while j < len(line) and line[j] not in " \t;&|<>()":
+                if line[j] in "'\"":
+                    k = line.find(line[j], j + 1)
+                    k = len(line) - 1 if k < 0 else k
+                    word += line[j:k + 1]
+                    j = k + 1
+                else:
+                    word += line[j:j + 2] if line[j] == "\\" else line[j]
+                    j += 2 if line[j] == "\\" else 1
+            if word:
+                ops.append((re.sub(r"[\\'\"]", "", word), bool(re.search(r"[\\'\"]", word)), strip))
+            i = j
+            continue
+        i += 1
+    return ops
+
+
+_HEREDOC_CACHE = {}
+
+
+def heredoc_scan(text):
+    """#5655: ({body line number: (delimiter, quoted, operator line)}, [(operator line, delimiter)] unterminated,
+    {terminator line numbers}).
+    Bodies follow the logical line that opens them, one after another when a line opens several. A body whose
+    terminator never comes is not a body: bash would read the rest of the script as text, so the scan reads it
+    as code and reports the operator, rather than hide every following line."""
+    if text in _HEREDOC_CACHE:
+        return _HEREDOC_CACHE[text]
+    lines = text.splitlines()
+    body, open_, ends, buf, n = {}, [], set(), "", 0
+    while n < len(lines):
+        raw = lines[n]
+        n += 1
+        if not buf and raw.lstrip().startswith("#"):
+            continue
+        buf += raw[:-1] + " " if raw.endswith("\\") else raw
+        if raw.endswith("\\"):
+            continue
+        at, ops, buf = n, heredoc_ops(buf), ""
+        for delim, quoted, strip in ops:
+            end = next((k for k in range(n, len(lines))
+                        if (lines[k].lstrip("\t") if strip else lines[k]) == delim), None)
+            if end is None:
+                open_.append((at, delim))
+                break
+            for k in range(n, end):
+                body[k + 1] = (delim, quoted, at)
+            ends.add(end + 1)
+            n = end + 1
+    _HEREDOC_CACHE[text] = (body, open_, ends)
+    return body, open_, ends
+
+
+def heredoc_body_lines(text):
+    """#5655: (line number, text, quoted, operator line) of every here-document body line."""
+    body = heredoc_scan(text)[0]
+    lines = text.splitlines()
+    return [(k, lines[k - 1], q, at) for k, (_, q, at) in sorted(body.items())]
+
+
 def logical_lines(text):
     """(first line number, joined text, enclosing function) per logical line, outside heredoc bodies and comments.
     #5414: a function is recorded in every spelling (name() {, name () {, function name {, function name() {,
     a brace on the next line), indented or not; a one-line definition names only its own line; a multi-line one
     is open until a closing brace at its own indent."""
-    out, buf, start, heredoc = [], "", 0, None
+    out, buf, start = [], "", 0
+    body, _, ends = heredoc_scan(text)   # #5655: every operator of a line, <<- tabs, quoted delimiters, never <<<
     stack, pending = [], None   # open functions (name, indent); a definition whose brace has not opened yet
     for n, raw in enumerate(text.splitlines(), 1):
-        if heredoc is not None:
-            if raw == heredoc:
-                heredoc = None
+        if n in body or n in ends:
             continue
         if not buf and raw.lstrip().startswith("#"):
             continue
@@ -2762,9 +2886,6 @@ def logical_lines(text):
         buf += raw[:-1] + " " if raw.endswith("\\") else raw
         if raw.endswith("\\"):
             continue
-        h = re.search(r"<<-?\s*'?(\w+)'?", buf)
-        if h:
-            heredoc = h.group(1)
         func = name if oneliner else (name or (pending[0] if pending else (stack[-1][0] if stack else "")))
         out.append((start, buf, func))
         if stack and raw.lstrip().startswith("}") and len(raw) - len(raw.lstrip()) == stack[-1][1] and not (name and not oneliner):
@@ -2831,6 +2952,10 @@ def ssh_batch_findings(text):
         for m in SSH_CALL.finditer(code):
             if not re.match(r"\s+\$SSH_BATCH\s", code[m.end():]):
                 bad.append("%d:%s" % (n, m.group(1)))
+    # #5655: a here-document body is a script some shell runs; no body line may name ssh or scp at all.
+    for k, raw, _, _ in heredoc_body_lines(text):
+        for m in SSH_CALL.finditer(raw):
+            bad.append("%d:%s in a here-document" % (k, m.group(1)))
     return bad
 
 
@@ -2859,6 +2984,13 @@ def ssh_batch_5274():
     probe("#5274 every ssh and scp call in federate.sh passes $SSH_BATCH first", not bad, " ".join(bad[:12]))
     lines = [(l, f) for _, l, f in logical_lines(fs) if SSH_CALL.search(strip_messages(l))]
     probe("#5274 the ssh/scp check sees the 10 call sites (not vacuous)", len(lines) == 10, str(len(lines)))
+    # #5655: the census also reads every here-document body, and none of the 7 bodies names ssh or scp.
+    bodies = heredoc_body_lines(fs)
+    probe("#5655 the census reads the 7 here-document bodies of federate.sh (not vacuous)",
+          len({at for _, _, _, at in bodies}) == 7 and len(bodies) >= 20 and not heredoc_scan(fs)[1],
+          "%d bodies, %d lines" % (len({at for _, _, _, at in bodies}), len(bodies)))
+    probe("#5655 no here-document body in federate.sh names ssh or scp",
+          not [k for k, raw, _, _ in bodies if SSH_CALL.search(raw)])
     assigns = "\n".join(l for l in fs.splitlines() if re.match(r"^SSH_\w+=", l))
     pre = ('%s\nSSH_USER=root\nOUT_DIR=o\nFED_DIR=/f\nn=1\nhost=h\npub=p\nj=0\nFED_IDS=(a)\nPUBLIC_IPS=(h)\n'
            'die() { echo "DIE $*"; }\n' % assigns)
@@ -2893,6 +3025,72 @@ def ssh_batch_5274():
           not ssh_batch_findings('scp $SSH_BATCH $SSH_OPTS -q a "$h:/x" >/dev/null 2>&1 || die "scp failed"\n'))
     probe("#5274 the BatchMode parser takes the first value given", first_batchmode(["-oBatchMode yes", "-o", "BatchMode=no"]) == "yes"
           and first_batchmode(["-o", "batchmode=No", "-o", "BatchMode=yes"]) == "no" and first_batchmode(["-q"]) is None)
+
+
+def heredoc_5655():
+    """#5655: here-document bodies are read: an ssh or scp in a body is a finding, a <<- body ends at its
+    tab-indented terminator, every operator of a line counts in any delimiter spelling, <<< and $(( << )) are no
+    operator, and an unterminated body is read as code. The #5274 comment states the rule and is pinned."""
+    fs = FED.read_text()
+    m = re.search(r"((?:^#.*\n)+)SSH_BATCH=\"-o BatchMode=yes\"\n", fs, re.M)
+    block = m.group(1) if m else ""
+    probe("#5655 the #5274 comment above SSH_BATCH states the rule and the here-document case",
+          "#5274: every ssh and scp call passes SSH_BATCH first" in block
+          and "ssh uses the first value given for an\n# option, so no SSH_OPTS override can turn batch mode off" in block
+          and "No here-document body runs ssh or scp (#5655)" in block, block[-200:])
+    B = "$SSH_BATCH"
+    for label, snip in (
+            ("an ssh in an unquoted node_sh body", "node_sh 0 <<EOS >/dev/null 2>&1\nssh h true\nEOS"),
+            ("an ssh with SSH_BATCH in a quoted body", "node_sh 0 <<'EOS' >/dev/null 2>&1\nssh %s h true\nEOS" % B),
+            ("an scp in a body", "node_sh 0 <<'EOS' >/dev/null 2>&1\nscp %s a h:/b\nEOS" % B),
+            ("an ssh with SSH_BATCH in a double-quoted delimiter body", 'node_sh 0 <<"EOS" >/dev/null 2>&1\nssh %s h true\nEOS' % B),
+            ("an ssh with SSH_BATCH in a backslash delimiter body", "node_sh 0 <<\\EOS >/dev/null 2>&1\nssh %s h true\nEOS" % B),
+            ("an ssh with SSH_BATCH in a split-quote delimiter body", 'node_sh 0 <<E"O"S >/dev/null 2>&1\nssh %s h true\nEOS' % B),
+            ("an ssh in a <<- body", "node_sh 0 <<-EOS >/dev/null 2>&1\n\tssh %s h true\n\tEOS" % B),
+            ("an ssh after a <<- body with a tab terminator", "node_sh 0 <<-EOS >/dev/null 2>&1\n\ttrue\n\tEOS\nssh h true"),
+            ("an ssh after a here-string read as an operator", "x=$(cat <<<EOS)\nssh h true\nEOS"),
+            ("an ssh after an arithmetic shift", "x=$((1<<y))\nssh h true\ny"),
+            ("an ssh after a here-document word in a comment", "true # <<E\nssh h true\nE"),
+            ("an ssh in the second body of a line", "node_sh 0 <<A <<B >/dev/null 2>&1\na\nA\nssh %s h true\nB" % B),
+            ("an ssh after a terminator with a trailing space", "node_sh 0 <<EOS >/dev/null 2>&1\ntrue\nEOS \nssh h true"),
+            ("an ssh in a capture in an unquoted body", "node_sh 0 <<EOS >/dev/null 2>&1\necho \\$(ssh %s h id)\nEOS" % B),
+            ("an scp in a body inside a capture", "v=\"$(node_sh 0 <<'EOS' 2>/dev/null\nscp %s a h:/b\nEOS\n)\"" % B),
+            ("an indented ssh in a body", "node_sh 0 <<'EOS' >/dev/null 2>&1\n    ssh %s h true\nEOS" % B),
+            ("an ssh after an empty delimiter body", "node_sh 0 <<'' >/dev/null 2>&1\ntrue\n\nssh h true"),
+            ("an ssh after a body opened in a continued line", "node_sh 0 \\\n  <<-EOS >/dev/null 2>&1\n\ttrue\n\tEOS\nssh h true")):
+        probe("#5655 ssh census negative control is flagged: %s" % label, bool(ssh_batch_findings(snip + "\n")),
+              str(ssh_batch_findings(snip + "\n")))
+    wrap = lambda body: fs + "\nprobe_fn() {\n%s\n}\n" % body
+    cb = construct_findings(fs)
+    for label, body in (
+            ("a double-quoted delimiter here-document to cat", 'cat <<"EOF"\nx\nEOF'),
+            ("a backslash delimiter here-document to cat", "cat <<\\EOF\nx\nEOF"),
+            ("a quoted here-document to cat", "cat <<'EOF'\nx\nEOF"),
+            ("a <<- here-document to cat", "cat <<-EOF\n\tx $qjson\n\tEOF"),
+            ("a here-document to cat after a node_sh operator", "node_sh 0 <<A >/dev/null 2>&1; cat <<B\na\nA\n$qjson\nB"),
+            ("an unterminated body", "node_sh 0 <<EOS >/dev/null 2>&1\ntrue"),
+            ("a command substitution in an unquoted body", "node_sh 0 <<EOS >/dev/null 2>&1\necho $(id)\nEOS"),
+            ("a backtick in an unquoted body", "node_sh 0 <<EOS >/dev/null 2>&1\necho `id`\nEOS"),
+            ("a command substitution after an escaped backslash", "node_sh 0 <<EOS >/dev/null 2>&1\necho \\\\$(id)\nEOS"),
+            ("a command substitution in a <<- body", "node_sh 0 <<-EOS >/dev/null 2>&1\n\techo $(id)\n\tEOS"),
+            ("a command substitution in a quoted-in-the-middle body", "node_sh 0 <<EOS >/dev/null 2>&1\necho \"$(id)\"\nEOS")):
+        got = construct_findings(wrap(body))
+        probe("#5655 construct negative control is flagged: %s" % label, len(got) > len(cb), str(got[len(cb):][:3]))
+    for label, snip in (
+            ("an escaped capture in an unquoted body", "node_sh 0 <<EOS >/dev/null 2>&1\necho \\$(id)\nEOS"),
+            ("a capture in a quoted body", "node_sh 0 <<'EOS' >/dev/null 2>&1\necho $(id)\nEOS"),
+            ("an arithmetic expansion in an unquoted body", "node_sh 0 <<EOS >/dev/null 2>&1\necho $((1 + 2))\nEOS"),
+            ("sshd named in a body", "node_sh 0 <<'EOS' >/dev/null 2>&1\nsystemctl restart sshd\nEOS"),
+            ("an ssh with SSH_BATCH after a <<- body", "node_sh 0 <<-EOS >/dev/null 2>&1\n\ttrue\n\tEOS\nssh %s h true" % B),
+            ("an ssh with SSH_BATCH after a double-quoted delimiter body", 'node_sh 0 <<"EOS" >/dev/null 2>&1\ntrue\nEOS\nssh %s h true' % B),
+            ("an ssh with SSH_BATCH after an empty delimiter body", "node_sh 0 <<'' >/dev/null 2>&1\ntrue\n\nssh %s h true" % B),
+            ("a message naming <<", 'die "a << b"\nssh %s h true' % B),
+            ("an arithmetic shift", "x=$(( (1 + 2) << 3 ))\nssh %s h true" % B),
+            ("a here-document word in a comment", "true # <<E\nssh %s h true" % B)):
+        txt = snip + "\n"
+        bad = ssh_batch_findings(txt) + construct_findings(txt)
+        seen = sum(1 for _, l, _ in logical_lines(txt) if re.search(r"(?<![\w$/.-])ssh\s+\$SSH_BATCH", l))
+        probe("#5655 control is accepted: %s" % label, not bad and seen == snip.count("ssh " + B), str(bad))
 
 
 def version_block(fs):
@@ -3075,6 +3273,7 @@ def main():
     comment_pin_5416()
     node_streams_5171()
     ssh_batch_5274()
+    heredoc_5655()
     verify_cost_5247()
     verify_trace_5237()
     f3_static_pins()

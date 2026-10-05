@@ -67,6 +67,8 @@ SSH_OPTS="${SSH_OPTS:--o StrictHostKeyChecking=accept-new -o ConnectTimeout=15}"
 # #5274: every ssh and scp call passes SSH_BATCH first. ssh uses the first value given for an
 # option, so no SSH_OPTS override can turn batch mode off: a node cannot put a password or
 # keyboard-interactive prompt on the operator terminal or hang the run waiting for input.
+# No here-document body runs ssh or scp (#5655): the lane test reads every body line and the
+# call sites outside them, so the count of calls it checks is the count bash would run.
 SSH_BATCH="-o BatchMode=yes"
 FED_DIR=/etc/ai-memory/fed
 NS="${NS:-fed-cert}"
