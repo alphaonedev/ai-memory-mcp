@@ -163,9 +163,12 @@ EXPANSION_RE = re.compile(
 # must sit between `set +x` and `set -x`.
 # #4802: also `set -o xtrace` / `set +o xtrace`, a `#!/bin/bash -x` shebang,
 # and names ending in pw / pass ($PGPW, $DB_PASS).
-XTRACE_ON_RE = re.compile(r"^\s*set\s+(?:-[a-z]*x|-o\s+xtrace\b)")
-SHEBANG_X_RE = re.compile(r"^#!\S+(?:\s+\S+)?\s+-[a-z]*x")
-XTRACE_OFF_RE = re.compile(r"^\s*set\s+(?:\+[a-z]*x|\+o\s+xtrace\b)")
+# #5597: the spellings are read by a parser (xtrace_effect), not by a pattern: every option
+# cluster of set, shopt -o and the shebang is walked, and an option word the gate cannot read
+# (an expansion) counts as xtrace on.
+XTRACE_PREFIX_WORDS = frozenset({"-", "!", "{", "}", "if", "then", "else", "elif", "do",
+                                 "while", "until", "time", "builtin", "command", "exec"})
+XTRACE_UNREAD = ("$", "`")
 TRACED_SECRET_RE = re.compile(
     r"\$\{?[A-Za-z0-9_]*(?:password|passwd|pass|secret|token|pw)(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -617,21 +620,118 @@ def scan_write_files(rel: str, text: str) -> List[Hit]:
     return hits
 
 
+def set_xtrace(args: List[str]) -> Optional[bool]:
+    """#5597: the xtrace state after the set builtin's arguments, or None when they do not
+    touch it. Every cluster is walked (set -e -x, set -u -o xtrace); each o takes the next
+    word as an option name; set - turns tracing off; -- or a first operand ends the options;
+    an expansion where an option or an option name can stand counts as on (fail closed)."""
+    state: Optional[bool] = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            break
+        if arg == "-":
+            return False
+        if any(c in arg for c in XTRACE_UNREAD):
+            return True
+        if len(arg) < 2 or arg[0] not in "-+":
+            break
+        on = arg[0] == "-"
+        for ch in arg[1:]:
+            if ch == "x":
+                state = on
+            elif ch == "o" and i < len(args):
+                name = args[i]
+                i += 1
+                if any(c in name for c in XTRACE_UNREAD):
+                    return True
+                if name == "xtrace":
+                    state = on
+    return state
+
+
+def shopt_xtrace(args: List[str]) -> Optional[bool]:
+    """#5597: shopt -so xtrace / shopt -s -o xtrace turn tracing on, -uo turns it off; an
+    expansion in a flag or a name under -o counts as on."""
+    flags = ""
+    names: List[str] = []
+    for arg in args:
+        if any(c in arg for c in XTRACE_UNREAD):
+            return True
+        if arg.startswith("-") and len(arg) > 1 and not names:
+            flags += arg[1:]
+        else:
+            names.append(arg)
+    if "o" not in flags or "xtrace" not in names:
+        return None
+    if "s" in flags:
+        return True
+    return False if "u" in flags else None
+
+
+def xtrace_effect(line: str, depth: int = 0) -> Optional[bool]:
+    """#5597: the xtrace state a script line leaves (True on, False off, None unchanged).
+    Every simple command is read; a quoted word holding a command string (eval, trap, sh -c)
+    is read as a line of its own, so a nested set -x is never missed (a nested one in a
+    subshell or child shell is counted too: fail closed)."""
+    state: Optional[bool] = None
+    for cmd in commands(split_words(line)):
+        i = 0
+        while i < len(cmd) and cmd[i].lstrip("\\") in XTRACE_PREFIX_WORDS:
+            i += 1
+        head = cmd[i].lstrip("\\") if i < len(cmd) else ""
+        effect: Optional[bool] = None
+        if head == "set":
+            effect = set_xtrace(cmd[i + 1:])
+        elif head == "shopt":
+            effect = shopt_xtrace(cmd[i + 1:])
+        if effect is not None:
+            state = effect
+        if depth < 3:
+            for w in cmd[i:]:
+                if any(c.isspace() for c in w):
+                    nested = xtrace_effect(w, depth + 1)
+                    if nested is not None:
+                        state = nested
+    return state
+
+
+def shebang_xtrace(line: str) -> bool:
+    """#5597: a shebang whose interpreter options turn xtrace on: an x in any - cluster or
+    an o cluster followed by xtrace, after any number of words, env -S split strings
+    included (#!/usr/bin/env -S bash -x, #!/bin/bash -o xtrace, #!/bin/bash -e -x)."""
+    words: List[str] = []
+    for w in line[2:].split():
+        if w.startswith("-S") and len(w) > 2:
+            words.extend(["-S", w[2:]])
+        elif w.startswith("--split-string="):
+            words.extend(["-S", w.split("=", 1)[1]])
+        else:
+            words.append(w)
+    for k, w in enumerate(words[1:], 1):
+        if w.startswith("-") and not w.startswith("--"):
+            if "x" in w[1:]:
+                return True
+            if "o" in w[1:] and k + 1 < len(words) and words[k + 1] == "xtrace":
+                return True
+    return False
+
+
 def scan_xtrace(rel: str, text: str) -> List[Hit]:
     """Credential-bearing lines executed while xtrace is on (#4609)."""
     hits: List[Hit] = []
     traced = False
     for n, ln in enumerate(text.splitlines(), 1):
-        if n == 1 and SHEBANG_X_RE.match(ln):
-            traced = True
+        if n == 1 and ln.startswith("#!"):
+            traced = shebang_xtrace(ln)
             continue
         if ln.lstrip().startswith("#"):
             continue
-        if XTRACE_OFF_RE.match(ln):
-            traced = False
-            continue
-        if XTRACE_ON_RE.match(ln):
-            traced = True
+        effect = xtrace_effect(ln)
+        if effect is not None:
+            traced = effect
             continue
         if traced and TRACED_SECRET_RE.search(ln):
             hits.append((rel, n, "[xtrace-secret] " + ln.strip()[:120]))
@@ -2673,6 +2773,51 @@ for _i, _word in enumerate(("CHANGEME", "PASSWORD", "<password>", "&lt;password&
 R10_RED_PROBES['5620-r01-docker-env-encoded-stars'] = 'docker run -e PGPASSWORD=%2A%2A%2A img'
 R10_RED_PROBES['5620-r02-psql-v-listed-token'] = 'psql -v pw=REDACTED -f x.sql'
 
+# #5597: xtrace spellings, read in a script (probe.sh and probe.tpl); the line after the
+# switch handles a password-named variable, so a red probe is an [xtrace-secret] hit.
+XTRACE_SECRET_LINE = 'printf "%s" "$DB_PASS" | x\n'
+R10_XTRACE_RED = {
+    '5597-x01-set-later-cluster': 'set -e -x\n',
+    '5597-x02-set-later-cluster-2': 'set -eu -x\n',
+    '5597-x03-set-later-o': 'set -u -o xtrace\n',
+    '5597-x04-set-second-o': 'set -o errexit -o xtrace\n',
+    '5597-x05-set-o-then-x': 'set -eo pipefail -x\n',
+    '5597-x06-shopt-so': 'shopt -so xtrace\n',
+    '5597-x07-shopt-s-o': 'shopt -s -o xtrace\n',
+    '5597-x08-shopt-os': 'shopt -os xtrace\n',
+    '5597-x09-shebang-env-S': '#!/usr/bin/env -S bash -x\n',
+    '5597-x10-shebang-env-S-cluster': '#!/usr/bin/env -S bash -eux\n',
+    '5597-x11-shebang-env-S-attached': '#!/usr/bin/env -Sbash -x\n',
+    '5597-x12-shebang-o-xtrace': '#!/bin/bash -o xtrace\n',
+    '5597-x13-shebang-env-split-string': '#!/usr/bin/env --split-string=bash -x\n',
+    '5597-x14-and-list': '[ -n "$D" ] && set -x\n',
+    '5597-x15-if-then': 'if true; then set -x; fi\n',
+    '5597-x16-brace-group': '{ set -x; } 2>/dev/null\n',
+    '5597-x17-builtin-set': 'builtin set -x\n',
+    '5597-x18-command-set': 'command set -x\n',
+    '5597-x19-escaped-set': '\\set -x\n',
+    '5597-x20-eval-string': 'eval "set -x"\n',
+    '5597-x21-unread-cluster': 'set -$OPTS\n',
+    '5597-x22-unread-o-name': 'set -o $OPT\n',
+    '5597-x23-unread-shopt-name': 'shopt -so $OPT\n',
+    '5597-x24-plus-then-minus': 'set +e -x\n',
+    '5597-x25-off-then-on-one-line': 'set +x; set -x\n',
+    '5597-x26-unread-operand': 'set $OPTS\n',
+}
+R10_XTRACE_GREEN = {
+    '5597-g01-set-off-later-cluster': 'set -x\nset -e +x\n',
+    '5597-g02-set-dash': 'set -x\nset -\n',
+    '5597-g03-shopt-uo': 'set -x\nshopt -uo xtrace\n',
+    '5597-g04-shopt-u-o': 'set -o xtrace\nshopt -u -o xtrace\n',
+    '5597-g05-positional-after-dashdash': 'set -- -x\n',
+    '5597-g06-operand-ends-options': 'set -e foo -x\n',
+    '5597-g07-shopt-without-o': 'shopt -s xtrace\n',
+    '5597-g08-shebang-env-S-no-x': '#!/usr/bin/env -S bash -eu\n',
+    '5597-g09-set-o-other': 'set -o pipefail\n',
+    '5597-g10-on-then-off-one-line': 'set -x; set +x\n',
+    '5597-g11-o-takes-the-x-word': 'set -o xtrace +o xtrace\n',
+}
+
 
 def r9_variants(text: str) -> List[Tuple[str, str, str]]:
     """(label, file name, text): the probe as a script, as prose and inside a fenced block."""
@@ -2821,6 +2966,20 @@ def self_test() -> int:
             got = scan_text(suffix, body)
             if got:
                 print("SELF-TEST FAIL: green probe %r (%s) was flagged: %r" % (name, label, got), file=sys.stderr)
+                bad += 1
+    for name, text in R10_XTRACE_RED.items():
+        for suffix in ("probe.sh", "probe.tpl"):
+            red += 1
+            got = [h for h in scan_text(suffix, text + XTRACE_SECRET_LINE) if "[xtrace-secret]" in h[2]]
+            if not got:
+                print("SELF-TEST FAIL: xtrace probe %r (%s) not flagged" % (name, suffix), file=sys.stderr)
+                bad += 1
+    for name, text in R10_XTRACE_GREEN.items():
+        for suffix in ("probe.sh", "probe.tpl"):
+            green += 1
+            got = [h for h in scan_text(suffix, text + XTRACE_SECRET_LINE) if "[xtrace-secret]" in h[2]]
+            if got:
+                print("SELF-TEST FAIL: xtrace probe %r (%s) was flagged: %r" % (name, suffix, got), file=sys.stderr)
                 bad += 1
     # A glob head with no credential option is emphasis in prose; a script refuses it as undecidable.
     green += 1
