@@ -2097,7 +2097,6 @@ ROUND3_GREEN = [
     ('5690 mutant pin: clean 1: a command substitution that closes ends the command', 'v=$(mysql -N --foo=r) $X'),
     ('5694 mutant pin: clean 1: the target of a redirect is not an operand', 'mysql db < "$FILE"'),
     ('5694 mutant pin: clean 2: the target of a redirect is not an operand', 'mysqldump -u r db > "$OUT"'),
-    ("5695 mutant pin: clean 1: a literal value glued to -p is not this arm's concern", 'mysql -pSecret db'),
     ('5696 mutant pin: clean 1: an escaped space stays inside its word', 'mysql -u r x\\ "$Y"'),
     ('5697 mutant pin: clean 1: a head inside an echoed quoted string is not a command', 'echo "restoring mysql $DB"'),
     ('5697 mutant pin: clean 2: a head inside an echoed quoted string is not a command', 'echo "see mysql -p$X"'),
@@ -2107,6 +2106,7 @@ ROUND3_GREEN = [
 # joined with spaces): a newline ends the command like a semicolon does (#5691).
 ROUND3_MYSQL_RAW_GREEN = [
     ("5691 mutant pin: a newline ends the mysql command", 'mysql -u r db\necho "$X"'),
+    ("5695 mutant pin: a literal value glued to -p is not this arm's concern", 'mysql -pSecret db'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
