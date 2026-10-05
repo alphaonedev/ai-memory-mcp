@@ -26,7 +26,7 @@ RULES ENFORCED (all closed-world: a trigger the reader cannot parse is a FAILURE
          quotes inside, tags, ``?``, ``+``, ``[``, backslash and alias-like
          ``*name`` items are undecidable and fail.  A push trigger with no
          ``branches`` and no ``tags`` key matches every branch and counts.
-  R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730, #5731) the whole file is
+  R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730, #5731, #5733) the whole file is
          read closed-world by the grammar below.  A file the reader cannot read
          is a failure whatever words it holds (#5731).
 
@@ -44,9 +44,16 @@ ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
   value       empty (a comment may follow) | a plain scalar on one line with no
               ``: `` and no trailing ``:`` | a quoted scalar that closes on its
               row (no backslash in double quotes, no doubled single quote) | a
-              flow collection that closes on its row | a block-scalar header
-              ``|`` or ``>`` with an optional ``-`` or ``+``.  Anchors, aliases,
-              tags and reserved indicators are refused.
+              flow collection (below) | a block-scalar header ``|`` or ``>``
+              with an optional ``-`` or ``+``.  Anchors, aliases, tags and
+              reserved indicators are refused.
+  flow        ``[`` entries ``]`` or ``{`` pairs ``}``, closed on its row.  An
+              entry is a flow collection, a quoted scalar with no comma inside,
+              or a plain scalar of printable ASCII that starts with no indicator
+              and holds no quote, ``#`` or ``:``; a pair is a plain key, ``: ``
+              and an entry.  Commas separate entries and only ASCII spaces
+              surround them; an empty entry and a trailing comma are refused
+              (#5733).
   nesting     a row sits at the column of an open block of its own kind (key
               row or sequence entry).  Only a row whose value is empty may be
               followed by a deeper row, which opens a nested block; a deeper row
@@ -61,9 +68,10 @@ ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
               (pull_request, pull_request_target, push) spelled exactly so.  A
               gated trigger is empty, ``~``, ``null`` or a block of the filter
               keys branches, tags, paths, paths-ignore, types, each once.
-  filter      an inline (flow) list on the key's row, or a block list indented
-              past the key whose every row is ``- `` and one plain or simply
-              quoted scalar (#5730); ``types`` may also be one plain word.
+  filter      an inline (flow) list of scalars on the key's row (#5733), or a
+              block list indented past the key whose every row is ``- `` and
+              one plain or simply quoted scalar (#5730); ``types`` may also be
+              one plain word.
 
 The reader is the Python standard library only (no PyYAML) so it runs on any CI
 image.  The mutation legs at the bottom prove the reader is not vacuous: each
@@ -123,19 +131,17 @@ def _unquote(item: str) -> str:
 
 
 def _parse_inline_list(text: str) -> List[str]:
-    text = text.strip()
-    if not (text.startswith("[") and text.endswith("]")):
+    """The items of an inline filter list; each must be one scalar (#5733)."""
+    text = text.strip(" ")
+    if not text.startswith("["):
         raise Unparsed("unterminated or non-list flow value: " + text)
-    inner = text[1:-1].strip()
-    if not inner:
-        return []
-    pieces = [p.strip() for p in inner.split(",") if p.strip()]
-    for piece in pieces:
-        if piece[0] in ("'", '"') and not (len(piece) >= 2 and piece[-1] == piece[0]):
-            raise Unparsed("quoted flow item with an embedded comma or quote: " + piece)
-        if piece[-1] in ("'", '"') and piece[0] != piece[-1]:
-            raise Unparsed("unbalanced quote in flow item: " + piece)
-    return [_unquote(p) for p in pieces]
+    end, items = _flow(text, 0)
+    if end != len(text):
+        raise Unparsed("unterminated or non-list flow value: " + text)
+    for item in items:  # type: ignore[attr-defined]
+        if not isinstance(item, str):
+            raise Unparsed("inline list item is not one scalar (#5733): " + text)
+    return list(items)
 
 
 # Line-break and separator characters other than LF and CR. PyYAML 6 reads NEL,
@@ -146,8 +152,8 @@ _EXOTIC_BREAKS = "\x0b\x0c\x1c\x1d\x1e\x1f\x85  "
 _FORBIDDEN = re.compile("[\x00-\x08\x0e-\x1f\x7f-\x9f﻿￾￿]")
 # Characters that start an anchor, alias, tag or reserved token.
 _NODE_PROPERTY = "&*!%@`"
-# Characters that may stand directly before a quoted scalar inside a flow collection.
-_FLOW_OPENERS = ("", "[", "{", ",", ":")
+# Characters that end a plain scalar inside a flow collection.
+_FLOW_STOPS = ",[]{}"
 
 
 def _space_like(ch: str) -> bool:
@@ -180,31 +186,95 @@ def _tail(s: str, i: int, what: str) -> str:
     raise Unparsed("text after " + what + ": " + repr(s))
 
 
-def _flow_end(s: str, i: int) -> int:
-    """Index just past the flow collection that opens at s[i]; it must close on its row."""
-    depth = 0
-    prev = ""
-    j = i
-    while j < len(s):
-        ch = s[j]
-        if ch in "'\"":
-            if prev not in _FLOW_OPENERS:
-                raise Unparsed("quote inside a plain flow scalar: " + repr(s))
-            j = _quoted_end(s, j)
-            prev = ch
-            continue
-        if ch == "#" and s[j - 1] == " ":
-            break
-        if ch in "[{":
-            depth += 1
-        elif ch in "]}":
-            depth -= 1
-            if depth == 0:
-                return j + 1
-        if ch != " ":
-            prev = ch
+def _flow_space(s: str, j: int) -> int:
+    """Index of the next non-space in a flow collection; a comment or the row end is Unparsed."""
+    while j < len(s) and s[j] == " ":
         j += 1
-    raise Unparsed("flow collection does not close on its row: " + repr(s))
+    if j == len(s) or (s[j] == "#" and s[j - 1] == " "):
+        raise Unparsed("flow collection does not close on its row: " + repr(s))
+    return j
+
+
+def _flow_plain(s: str, j: int, key: bool) -> Tuple[int, str]:
+    """(stop index, text) of a plain scalar inside a flow collection (#5733).
+
+    It starts with no indicator and holds printable ASCII only, with no quote, no
+    ``#`` and no ``:`` except the one that ends a mapping key.
+    """
+    ch = s[j]
+    if ch in ",]}":
+        raise Unparsed("empty flow entry or trailing comma (#5733): " + repr(s))
+    if ch in _NODE_PROPERTY:
+        raise Unparsed("anchor, alias, tag or reserved indicator in a flow collection (#5733): " + repr(s))
+    if ch in "-?:|>[{":
+        raise Unparsed("flow entry starts with an indicator (#5733): " + repr(s))
+    k = j
+    while k < len(s) and s[k] not in _FLOW_STOPS:
+        ch = s[k]
+        if ch in "'\"":
+            raise Unparsed("quote inside a plain flow scalar: " + repr(s))
+        if ch == ":":
+            if key:
+                break
+            raise Unparsed("':' inside a plain flow scalar (#5733): " + repr(s))
+        if ch == "#":
+            if s[k - 1] == " ":
+                raise Unparsed("flow collection does not close on its row: " + repr(s))
+            raise Unparsed("'#' inside a plain flow scalar (#5733): " + repr(s))
+        if not " " <= ch <= "~":
+            raise Unparsed("non-ASCII or control character in a flow scalar (#5733): " + repr(s))
+        k += 1
+    return k, s[j:k].rstrip(" ")
+
+
+def _flow_node(s: str, j: int) -> Tuple[int, object]:
+    """(index past, value) of one flow entry: a flow collection, quoted or plain scalar."""
+    ch = s[j]
+    if ch in "[{":
+        return _flow(s, j)
+    if ch in "'\"":
+        end = _quoted_end(s, j)
+        if "," in s[j:end]:
+            raise Unparsed("quoted flow item with an embedded comma or quote: " + repr(s))
+        return end, s[j + 1:end - 1]
+    return _flow_plain(s, j, False)
+
+
+def _flow(s: str, i: int) -> Tuple[int, object]:
+    """(index past, value) of the flow collection that opens at s[i] (#5733).
+
+    It must close on its row. A sequence holds entries; a mapping holds
+    ``key: value`` entries with a plain key. Entries are separated by a comma, and
+    only ASCII spaces may stand around them; an empty entry, a trailing comma and
+    any other text are refused.
+    """
+    close = "]" if s[i] == "[" else "}"
+    items: List[object] = []
+    pairs: Dict[str, object] = {}
+    j = _flow_space(s, i + 1)
+    if s[j] == close:
+        return j + 1, (items if close == "]" else pairs)
+    while True:
+        if close == "]":
+            j, value = _flow_node(s, j)
+            items.append(value)
+        else:
+            if s[j] in "'\"":
+                raise Unparsed("flow mapping entry with a quoted key (#5733): " + repr(s))
+            j, key = _flow_plain(s, j, True)
+            if s[j:j + 2] != ": ":
+                raise Unparsed("flow mapping entry is not key: value (#5733): " + repr(s))
+            j = _flow_space(s, j + 1)
+            if s[j] in ",}":
+                raise Unparsed("flow mapping entry with no value (#5733): " + repr(s))
+            j, value = _flow_node(s, j)
+            pairs[key] = value
+        j = _flow_space(s, j)
+        if s[j] == close:
+            return j + 1, (items if close == "]" else pairs)
+        if s[j] != ",":
+            raise Unparsed("text after a flow entry (#5733): " + repr(s))
+        j = _flow_space(s, j + 1)
 
 
 def _value(s: str, i: int) -> Tuple[str, bool]:
@@ -217,7 +287,7 @@ def _value(s: str, i: int) -> Tuple[str, bool]:
     if ch in "'\"":
         return _tail(s, _quoted_end(s, i), "a quoted scalar"), False
     if ch in "[{":
-        return _tail(s, _flow_end(s, i), "a flow collection"), False
+        return _tail(s, _flow(s, i)[0], "a flow collection"), False
     if ch in "|>":
         header = re.compile(r"[|>][-+]?").match(s, i)
         assert header is not None
@@ -971,8 +1041,12 @@ class PushNeverRehearsal5659(unittest.TestCase):
             self._red("[main, '" + pat + "']")
 
     def test_5659_yaml_tag_and_alias_forms_fail_closed(self) -> None:
-        self._red("[main, !!str rehearsal/landing]")
-        self._red("[main, *prb]")
+        # Since #5733 a plain tag or alias inside a flow list is an R-SHAPE refusal
+        # (PyYAML: a str tag, and a ComposerError for the undefined alias); a quoted
+        # one stays an R-PUSH failure of the plain glob charset.
+        for entries in ("[main, !!str rehearsal/landing]", "[main, *prb]"):
+            got = violations("x.yml", _push_text(entries))
+            self.assertTrue(any("R-SHAPE" in v and "anchor, alias, tag" in v for v in got), (entries, got))
         self._red("[main, '!!str x']")
 
     def test_5659_branches_ignore_interplay_is_shape_red(self) -> None:
@@ -1526,6 +1600,79 @@ class BlockStructure5730(unittest.TestCase):
         body = ("x:\n  - a\n  -\n    - b\n  - - c\n    - d\n  - k: v\n    l:\n      - m\n"
                 "    n: |\n      o\n  -\n    p: q\nw:\n  z: 1\n")
         self.assertEqual([], violations("x.yml", "name: x\non:\n" + GOOD_PR + body))
+
+
+class FlowCollections5733(unittest.TestCase):
+    """#5733: a flow collection is parsed entry by entry, not split on commas.
+
+    Measured at 25af8bc7 (round-4 differential, seed 5665): every refusal case here
+    was accepted there. Each PyYAML 6.0.1 view quoted in a comment was measured with
+    yaml.safe_load on the same text.
+    """
+
+    def _shape(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def _branches(self, flow: str, why: str) -> None:
+        self._shape("on:\n  pull_request:\n    branches: " + flow + "\n", why)
+
+    def test_5733_empty_entries(self) -> None:
+        # PyYAML: ParserError for the first two; a trailing comma ends the list and the
+        # mapping with no further entry. The reader refuses all four.
+        for flow in ("[main,, 'rehearsal/**']", "[,main, 'rehearsal/**']", "[main, 'rehearsal/**', ]"):
+            self._branches(flow, "empty flow entry or trailing comma")
+        self._shape("name: x\non:\n" + GOOD_PR + "x: {a: b, }\n", "empty flow entry or trailing comma")
+
+    def test_5733_node_properties_inside_a_flow_collection(self) -> None:
+        # PyYAML: ConstructorError (unknown tag), ComposerError (undefined alias), and
+        # the anchored entry is the string 'rehearsal/**'.
+        self._branches("[main, !x develop, 'rehearsal/**']", "anchor, alias, tag or reserved indicator")
+        self._shape("name: x\non:\n" + GOOD_PR + "x: [a, *a]\n", "anchor, alias, tag or reserved indicator")
+        self._branches("[main, &a rehearsal/**]", "anchor, alias, tag or reserved indicator")
+
+    def test_5733_indicator_at_the_start_of_a_flow_entry(self) -> None:
+        # PyYAML: ParserError for "- a"; "? a" is the one-pair mapping {'a': None} and
+        # "-a" the string '-a'. The reader models none of them and refuses all three.
+        for flow in ("[main, - a, 'rehearsal/**']", "[main, ? a, 'rehearsal/**']", "[main, -a, 'rehearsal/**']"):
+            self._branches(flow, "flow entry starts with an indicator")
+
+    def test_5733_colon_inside_a_plain_flow_scalar(self) -> None:
+        # PyYAML: [..., {'ma': 'in'}] for the pair; 'a:b' is one plain scalar.
+        for flow in ("[main, 'rehearsal/**', ma: in]", "[main, 'rehearsal/**', a:b]"):
+            self._branches(flow, "':' inside a plain flow scalar")
+
+    def test_5733_hash_inside_a_plain_flow_scalar(self) -> None:
+        # PyYAML: 'a#b' is one plain scalar; the reader refuses it.
+        self._branches("[main, a#b, 'rehearsal/**']", "'#' inside a plain flow scalar")
+
+    def test_5733_non_ascii_inside_a_flow_collection(self) -> None:
+        # PyYAML: 'rehearsal/**\xa0' and '\xa0rehearsal/**'; Python's str.strip() dropped
+        # the no-break space, so the old reader read 'rehearsal/**' both times.
+        self._branches("[main, rehearsal/**\u00a0]", "non-ASCII or control character in a flow scalar")
+        self._branches("[main,\u00a0rehearsal/**]", "non-ASCII or control character in a flow scalar")
+
+    def test_5733_text_after_a_flow_entry(self) -> None:
+        # PyYAML: ParserError.
+        self._branches("[main, [a] b, 'rehearsal/**']", "text after a flow entry")
+
+    def test_5733_flow_mapping_entries(self) -> None:
+        # PyYAML: {'a': None}, {'a:b': None}, {'a': 'b'} and {'a': None}; the reader
+        # accepts only a plain key, ': ' and a value.
+        for flow in ("{a}", "{a:b}", "{'a': b}", "{a: }"):
+            self._shape("name: x\non:\n" + GOOD_PR + "x: " + flow + "\n", "flow mapping entry")
+
+    def test_5733_inline_filter_list_holds_scalars_only(self) -> None:
+        # PyYAML: [..., ['x']] and [..., {'a': 'b'}].
+        for flow in ("[main, 'rehearsal/**', [x]]", "[main, 'rehearsal/**', {a: b}]"):
+            self._branches(flow, "inline list item is not one scalar")
+
+    def test_5733_flow_values_match_yaml(self) -> None:
+        self.assertEqual(["main", "rehearsal/**"], _parse_inline_list("[ main ,  'rehearsal/**' ]"))
+        self.assertEqual(["a b", "c"], _parse_inline_list("[a b, c]"))
+        self.assertEqual([], _parse_inline_list("[ ]"))
+        text = "name: x\non:\n" + GOOD_PR + "x:\n  with: { fetch-depth: 2 }\n  y: {}\n  z: [{a: [b, 'c']}, []]\n"
+        self.assertEqual([], violations("x.yml", text))
 
 
 class GlobSemantics5447(unittest.TestCase):
