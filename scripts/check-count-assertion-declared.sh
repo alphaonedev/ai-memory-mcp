@@ -106,8 +106,9 @@
 #     so a comma, `&&` or `||` inside it never ends an operand or splits an
 #     argument, and the `>` of a `->` inside it closes nothing. A `<` opens such
 #     a list after `::` (a turbofish `f::<A, B>()`), after the type path that
-#     follows `as` (`x as W<A, B>`), and at the start of an operand (a qualified
-#     path `<T as Tr<A, B>>::C`); any other `<` is a comparison or a shift.
+#     follows `as` (`x as W<A, B>`, also `x as ::m::W<A, B>` and `x as r#W<A, B>`),
+#     and at the start of an operand (a qualified path `<T as Tr<A, B>>::C`); any
+#     other `<` is a comparison or a shift.
 #   * BLOCK COMMENTS AND UNREADABLE ASSERTIONS (#5872; 5-agent vote (4d3ea1c5)
 #     on #5715): inside the arguments of an assert! or assert_eq! a `/* */`
 #     block comment, nested ones too, is blank space, so an operator, a comma,
@@ -214,10 +215,10 @@ CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]*)\s*:\s*(?:usize|u\d+|i\d
 UNREAD = '?count#unreadable'
 UNREADABLE = '!unreadable'      # the key prefix of an undecidable assertion: red in every commit that reads its file
 # The `<` that opens a generic argument list (#5873), as rustc reads it: after `::` (a turbofish, also `Vec::<u8>`),
-# after the type path that follows `as` (`x as W<A, B>`), and at the start of an operand (a qualified path
-# `<T as Tr<A, B>>::C`, also right after `as`). Any other `<` is a comparison or a shift.
+# after the type path that follows `as` (`x as W<A, B>`, a leading `::` and raw identifiers too), and at the start of
+# an operand (a qualified path `<T as Tr<A, B>>::C`, also right after `as`). Any other `<` is a comparison or a shift.
 TURBOFISH = re.compile(r'::\s*<')
-AS_GENERIC = re.compile(r"as\s+(?:(?:&|\*\s*(?:const|mut)\b|mut\b|dyn\b|'[A-Za-z_]\w*)\s*)*(?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*\s*<")
+AS_GENERIC = re.compile(r"as\s+(?:(?:&|\*\s*(?:const|mut)\b|mut\b|dyn\b|'[A-Za-z_]\w*)\s*)*(?:::\s*)?(?:(?:r#)?[A-Za-z_]\w*\s*::\s*)*(?:r#)?[A-Za-z_]\w*\s*<")
 NO_CLOSER = 'a generic argument list `<` with no closing `>`'
 NOT_OPERAND = {'as', 'return', 'in', 'if', 'while', 'match', 'else', 'mut', 'move', 'break', 'let', 'yield', 'box', 'dyn'}
 
@@ -1139,6 +1140,9 @@ def selftest():
                    ('a comment holding > inside a turbofish', 'ok && v.len() + g::<u8 /* > */>() == %s'),
                    ('a turbofish on a method', 'ok && v.iter().map(|x| *x as usize).sum::<usize>() + v.len() + f::<u8, u16>() == %s'),
                    ('a generic cast with a comma', 'ok && v.len() as W<u8, u16> == %s'),
+                   ('a generic cast with a leading ::', 'ok && v.len() as ::m::W<u8, u16> == %s'),
+                   ('a generic cast to a raw identifier', 'ok && v.len() as r#W<u8, u16> == %s'),
+                   ('a generic cast to a raw-identifier path', 'ok && v.len() as r#m::W<u8, u16> == %s'),
                    ('a qualified-path cast with a comma', 'ok && v.len() as <usize as Tr<u8, u16>>::O == %s'),
                    ('a qualified-path operand with a comma', 'ok && v.len() + <usize as Tr<u8, u16>>::O::default() == %s'),
                    ('a shift left', 'ok && v.len() << 1 == %s'), ('a shift right after a turbofish', 'ok && v.len() + g::<u8>() >> 1 == %s'),
