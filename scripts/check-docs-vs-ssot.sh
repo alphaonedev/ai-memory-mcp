@@ -749,6 +749,20 @@ def occ(prefix):
     return len(DIGITS.findall(TYPED.sub('', MARKS.sub('', WS.sub(' ', TAG.sub(' ', prefix))))))
 
 
+def raw_cut(raw, upre):
+    # The raw prefix that decodes to upre (#5809). The pill is matched on the
+    # decoded line, but its count must read the raw prefix as the sweep reads the
+    # line (tags out, then entities decoded once): a second decode would turn an
+    # escaped entity (&amp;#49;) into a digit the sweep never sees, or an escaped
+    # &amp;#1234; into a letter where the sweep sees a digit run. upre ends just
+    # before the pill's value, after a whole decoded character, so a raw prefix
+    # that decodes to it exists; were none found, the decoded text is read.
+    for j in range(len(upre), len(raw) + 1):
+        if htmlmod.unescape(raw[:j]) == upre:
+            return raw[:j]
+    return upre
+
+
 def shields(nd, val, span, src):
     # Does ledger needle nd exempt the hit (val, span)? src is None for a hit
     # matched in a raw view, else the unfolded text of the marker-folded view it
@@ -941,7 +955,7 @@ for path in files:
                 hits.extend((m.group(1), m.group(0), src, occ(view[:m.start(1)])) for m in rx.finditer(view))
         if is_html:
             uraw = htmlmod.unescape(raw)
-            hits.extend((m.group(1), m.group(0), None, occ(plain(uraw[:m.start(1)])))
+            hits.extend((m.group(1), m.group(0), None, occ(plain(raw_cut(raw, uraw[:m.start(1)]))))
                         for m in PILL.finditer(uraw))
         seen = set()
         for val, span, src, k in hits:
@@ -3528,14 +3542,15 @@ R5809MD
         || { echo "FAIL: self-test #5809 - expected exactly 3 one-hit refusals" >&2; cd "$REPO_ROOT"; exit 1; }
     rm -f "$tmpdir/docs/schema-fixture.html"
     echo "PASS: self-test #5809 - a ledger row that shields the same phrase on two lines, or twice on one line, FAILS naming every file:line; a hit two rows shield FAILS naming both rows; one hit seen in two views (raw and folded, sweep and anchor, wrapped-line join, html pill and sweep) counts once; a stale claim beside them is still flagged"
-    # ---- #5809 item 2: a needle must read as written. Rows 1, 4, 5, 6 and 8 each
+    # ---- #5809 item 2: a needle must read as written. Rows 1, 4, 5, 6, 8 and 13 each
     # carry subject text and a ladder number, but a zero-width space glues the word
     # to the value, or a no-break space (with a later zero-width space: the first
-    # is named), a combining mark, a BOM or a DEL hides inside: each is refused by
-    # name and its claim stays flagged. Rows 2, 3 and 7 (arrow, em dash, tilde) are
-    # accepted. Rows 9 to 12 are refused for another reason (two fields, no digit,
-    # no subject text, a duplicate with a zero-width space in its note); every
-    # refusal spells the unreadable character as \uXXXX and never echoes it.
+    # is named), a combining mark, a BOM, a DEL or a non-ASCII digit hides inside:
+    # each is refused by name and its claim stays flagged. Rows 2, 3 and 7 (arrow,
+    # em dash, tilde) are accepted. Rows 9 to 12 are refused for another reason (two
+    # fields, no digit, no subject text, a duplicate with a zero-width space in its
+    # note); every refusal spells the unreadable character as \uXXXX and never
+    # echoes it.
     {
         printf 'docs/postgres-age-guide.md\twas\xe2\x80\x8b51\t#5809 zero-width space\n'
         printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 50\xe2\x86\x9251\t#5809 arrow, accepted\n'
@@ -3549,8 +3564,9 @@ R5809MD
         printf 'docs/postgres-age-guide.md\twas\xe2\x80\x8b\t#5809 no digit\n'
         printf 'docs/postgres-age-guide.md\t\xe2\x80\x8b52\t#5809 no subject text\n'
         printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 50\xe2\x86\x9251\t#5809 arrow\xe2\x80\x8b dup\n'
+        printf 'docs/postgres-age-guide.md\tschema_version was\xd9\xa3 51\t#5809 non-ASCII digit\n'
     } > "$_s"
-    printf 'the schema_version was\xe2\x80\x8b51 then\na CURRENT_SCHEMA_VERSION 50\xe2\x86\x9251 past bump\nv51 \xe2\x80\x94 the schema_version of v0.5\nthe schema_version\xc2\xa0was 51 then\nthe schema_version wa\xcc\x81s 51 then\nthe schema_version\xef\xbb\xbf was 51 then\nthe schema_version ~51 then\nthe schema_version was\x7f 51 then\n' \
+    printf 'the schema_version was\xe2\x80\x8b51 then\na CURRENT_SCHEMA_VERSION 50\xe2\x86\x9251 past bump\nv51 \xe2\x80\x94 the schema_version of v0.5\nthe schema_version\xc2\xa0was 51 then\nthe schema_version wa\xcc\x81s 51 then\nthe schema_version\xef\xbb\xbf was 51 then\nthe schema_version ~51 then\nthe schema_version was\x7f 51 then\nthe schema_version was\xd9\xa3 51 then\n' \
         > "$tmpdir/docs/postgres-age-guide.md"
     _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
         && { echo "FAIL: self-test #5809 - needles that do not read as written were accepted (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -3562,14 +3578,16 @@ R5809MD
         'malformed entry at line 8 "needle carries a character that does not read as written (U+007F Cc' \
         'docs/postgres-age-guide.md:5 claims "51"' 'docs/postgres-age-guide.md:6 claims "51"' \
         'docs/postgres-age-guide.md:8 claims "51"' \
+        'malformed entry at line 13 "needle carries a character that does not read as written (U+0663 Nd' \
+        'docs/postgres-age-guide.md:9 claims "51"' \
         $'docs/postgres-age-guide.md\twas\\u200b51\t#5809' 'schema_version\u00a0was\u200b 51' 'wa\u0301s 51' \
-        'schema_version\ufeff was 51' 'schema_version was\u007f 51' \
+        'schema_version\ufeff was 51' 'schema_version was\u007f 51' 'schema_version was\u0663 51' \
         $'malformed entry at line 9 "docs/postgres-age-guide.md\twas\\u200b52"' \
         $'vacuous needle, names no ladder number (#5699): docs/postgres-age-guide.md\twas\\u200b\t#5809' \
         $'needle carries no subject text beyond the value (#5808): docs/postgres-age-guide.md\t\\u200b52\t#5809' \
         $'duplicate entry: docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 50\xe2\x86\x9251\t#5809 arrow\\u200b dup'
     do grep -qF "$_want" <<<"$_s_out" || { echo "FAIL: self-test #5809 - not refused or not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
-    for _raw in '\xe2\x80\x8b' '\xc2\xa0' '\xcc\x81' '\xef\xbb\xbf' '\x7f'; do
+    for _raw in '\xe2\x80\x8b' '\xc2\xa0' '\xcc\x81' '\xef\xbb\xbf' '\x7f' '\xd9\xa3'; do
         grep -F 'malformed entry' <<<"$_s_out" | grep -qF "$(printf "$_raw")" \
             && { echo "FAIL: self-test #5809 - a ledger refusal echoed $_raw instead of spelling it" >&2; cd "$REPO_ROOT"; exit 1; }
     done
@@ -3578,7 +3596,52 @@ R5809MD
         'STALE entry' 'exactly one is allowed'
     do grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5809 - a readable needle was refused or its history flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
-    echo "PASS: self-test #5809 - a ledger needle with a zero-width space, a no-break space, a combining mark, a BOM or a DEL is refused naming its first such character and its claim stays flagged; an arrow, an em dash or a tilde is accepted; every ledger refusal spells such characters and never echoes them"
+    echo "PASS: self-test #5809 - a ledger needle with a zero-width space, a no-break space, a combining mark, a BOM, a DEL or a non-ASCII digit is refused naming its first such character and its claim stays flagged; an arrow, an em dash or a tilde is accepted; every ledger refusal spells such characters and never echoes them"
+    rm -f "$tmpdir/docs/postgres-age-guide.md"
+    printf '# fixture ledger (comment-only)\n' > "$_s"
+    # ---- #5809 views: one number seen in two views is one hit even when the text
+    # before it differs between the views. Line 1: a transition sweep whose span
+    # carries the FROM number, and the steps anchor. Line 2: digits split by bold
+    # markers before the value (raw and marker-folded views). Lines 3 and 4: a width
+    # suffix before the value, spaced and tab-spaced (the sweep reads the line with
+    # the suffix folded out, the anchor reads it whitespace-folded). Line 1 of the
+    # html: an escaped entity before the pill, decoded once as the sweep decodes it;
+    # line 2: an entity before the pill, decoded as the sweep decodes it.
+    # Every row shields one hit, so the gate passes (rc 0).
+    {
+        printf 'docs/postgres-age-guide.md\tsteps v40 -> v45\t#5809 transition sweep and anchor\n'
+        printf 'docs/postgres-age-guide.md\tsteps v40 -> v46\t#5809 marker-split digits before\n'
+        printf 'docs/postgres-age-guide.md\tv47** (`CURRENT_SCHEMA_VERSION\t#5809 width suffix before\n'
+        printf 'docs/postgres-age-guide.md\tv48** (`CURRENT_SCHEMA_VERSION\t#5809 tab-spaced width suffix before\n'
+        printf 'docs/schema-fixture.html\tv49 schema\t#5809 escaped entity before the pill\n'
+        printf 'docs/schema-fixture.html\tv50 schema\t#5809 entity before the pill\n'
+    } > "$_s"
+    printf 'a v0.6 DB schema_version steps v40 -> v45 on boot\na v0.6 DB with 1**2** rows steps v40 -> v46 on boot\n| x: u64 | Schema | **v47** (`CURRENT_SCHEMA_VERSION`, both) |\n| x:\tu64 | Schema | **v48** (`CURRENT_SCHEMA_VERSION`, both) |\n' \
+        > "$tmpdir/docs/postgres-age-guide.md"
+    printf '<p>&amp;#49;&amp;#50; <span class="pill">v49 schema</span> was the schema_version then</p>\n<p>&#65; <span class="pill">v50 schema</span> was the schema_version then</p>\n' \
+        > "$tmpdir/docs/schema-fixture.html"
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        || { echo "FAIL: self-test #5809 - one hit seen in two views was refused (rc $?): $(grep -F 'FAIL' <<<"$_s_out" | head -3)" >&2; cd "$REPO_ROOT"; exit 1; }
+    # ---- #5809 arms: a row shielding two hits, alone, and a hit two rows shield,
+    # alone, each fail the gate (rc 1); neither is only printed.
+    printf 'docs/postgres-age-guide.md\tschema_version was 54\t#5809 one row, two hits, alone\n' > "$_s"
+    printf 'the schema_version was 54 at v0.6\nagain, the schema_version was 54 at v0.6\n' \
+        > "$tmpdir/docs/postgres-age-guide.md"
+    rm -f "$tmpdir/docs/schema-fixture.html"
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5809 - a row shielding two hits, alone, passed (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'entry at line 1 shields 2 hits' <<<"$_s_out" \
+        || { echo "FAIL: self-test #5809 - the lone two-hit row was not named" >&2; cd "$REPO_ROOT"; exit 1; }
+    {
+        printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION` set 48\t#5809 two rows, one hit, alone (A)\n'
+        printf 'docs/postgres-age-guide.md\tSCHEMA_VERSION` set 48\t#5809 two rows, one hit, alone (B)\n'
+    } > "$_s"
+    printf 'the `CURRENT_SCHEMA_VERSION` set 48 then\n' > "$tmpdir/docs/postgres-age-guide.md"
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5809 - a hit two rows shield, alone, passed (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'is shielded by the entries at lines 1 and 2' <<<"$_s_out" \
+        || { echo "FAIL: self-test #5809 - the lone shared hit was not named" >&2; cd "$REPO_ROOT"; exit 1; }
+    echo "PASS: self-test #5809 - one hit seen in two views counts once when the views read different text before it (a transition span, marker-split digits, a width suffix, an escaped entity before an html pill); a row shielding two hits, or a hit two rows shield, fails the gate on its own"
     rm -f "$tmpdir/docs/postgres-age-guide.md"
     printf '# fixture ledger (comment-only)\n' > "$_s"
 
