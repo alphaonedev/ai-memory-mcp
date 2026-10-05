@@ -1483,6 +1483,8 @@ PYEOF
         "$R::NoSuch" "See <code>$R::&lt;dyn RecallTool &#43; NoSuch&gt;::decorate_memory_many</code> here."
     anchor_red_cites 5612 BARE_QUAL "a named plus entity between bounds" \
         "$R::NoSuch" "See <code>$R::&lt;dyn RecallTool &plus; NoSuch&gt;::decorate_memory_many</code> here."
+    anchor_red_cites 5612 QUAL "an unclosed self type keeps the component behind a spaced separator" \
+        "$R::<RecallTool::NoSuch" "See \`$R::<RecallTool:: NoSuch\` here."
 
     # #5613 (review item N-2): pin the #5536 repro and its self-type sibling
     # so that every spaced closer is counted and a spaced extra closer after a
