@@ -294,6 +294,14 @@ jobs:
               refused here, with nothing changed at all. Every later chmod goes through
               `/proc/self/fd/N`, which addresses the pinned inode.
 
+              That route is also a dependency, and a dependency that is missing is a
+              REFUSAL here, never an absence: `FD_DIR` is checked before the entry is
+              opened, and a chmod through it that fails is reported as `EPERM` rather
+              than as the `ENOENT` of an entry that went away - which the caller treats
+              as "nothing to do here" and does not report at all (#5996). The mode is
+              then read back off the pinned descriptor, so a widen this class says it
+              performed is one the inode actually carries.
+
               Where there is no `O_PATH`, `fchmodat(AT_SYMLINK_NOFOLLOW)` relative to the
               already-open parent descriptor cannot traverse a symlink either, but it
               addresses a NAME and not the scanned inode: nothing is pinned, no identity
@@ -309,6 +317,13 @@ jobs:
                   self._name = name
                   self._fd = None
                   if HAS_O_PATH:
+                      if not os.path.isdir(FD_DIR):
+                          # Every mode this leg sets is addressed THROUGH this directory.
+                          # Without it there is no inode-bound chmod here at all, so the
+                          # entry gets the same refusal a platform with no safe route
+                          # gets below - taken now, before anything is opened or changed.
+                          raise OSError(errno.EPERM,
+                                        "%s is unavailable, so no mode can be set on a pinned inode" % FD_DIR)
                       flags = _OPEN_FLAGS | os.O_PATH | (os.O_DIRECTORY if want_dir else 0)
                       fd = os.open(name, flags, dir_fd=dirfd)
                       pinned = os.fstat(fd)
@@ -331,7 +346,19 @@ jobs:
                           # so the entry is reported instead of being mutated.
                           raise OSError(errno.EPERM, "no way to widen a mode here without re-resolving the name")
                   else:
-                      os.chmod("%s/%d" % (FD_DIR, self._fd), mode)
+                      try:
+                          os.chmod("%s/%d" % (FD_DIR, self._fd), mode)
+                      except OSError as err:
+                          # Never `FileNotFoundError` out of here. The caller reads that
+                          # as "the entry went away" and returns WITHOUT reporting
+                          # anything, so a procfs that is missing or refusing would print
+                          # `0 cleared, 0 failed` over a flag that is still set (#5996).
+                          raise OSError(errno.EPERM, "could not set mode 0o%03o on the pinned inode "
+                                                     "through %s: %s" % (mode, FD_DIR, err))
+                      landed = stat.S_IMODE(os.fstat(self._fd).st_mode)
+                      if landed != mode:
+                          raise OSError(errno.EPERM, "mode 0o%03o did not take on the pinned inode, "
+                                                     "which reads 0o%03o" % (mode, landed))
 
               def close(self):
                   if self._fd is not None:

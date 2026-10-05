@@ -764,6 +764,38 @@ class ScratchTreeCase(unittest.TestCase):
             self.assertNotEqual(rc, 0, "a replaced entry is not a pass:\n" + out + err)
             self.assertIn(".tmpS", err)
 
+    @unittest.skipUnless(hasattr(os, "O_PATH"), "only the O_PATH leg widens through /proc/self/fd")
+    def test_an_unusable_fd_dir_is_reported_not_skipped_5996(self):
+        """#5996. On the `O_PATH` leg every widen is addressed through
+        `/proc/self/fd/N`, so that path is a DEPENDENCY of the only way this
+        leg can look inside an unreadable directory. When it is unavailable -
+        no procfs, a container that hides it, a hardened mount - the chmod
+        raises `ENOENT`, which leaves `Widener.chmod` as `FileNotFoundError`;
+        `_visit` catches `FileNotFoundError` and returns, because an entry that
+        genuinely went away is not a failure. So the flagged file underneath
+        was never reached, nothing was reported, and the run printed
+        `0 cleared, 0 failed` with the append-only flag still set - which is
+        the #5657 defect itself, handed back by a dependency failure.
+
+        The flag survives either way: without that path there is no way in.
+        What must not survive is the SILENCE."""
+        mod = load_script_module()
+        shut = self.scratch / ".tmpNoProc"
+        shut.mkdir()
+        inner = shut / "inner.log"
+        inner.write_text("{}\n")
+        with flagged(inner):
+            with restrictive(shut, 0o000):
+                with mock.patch.object(mod, "FD_DIR", str(self.ws / "no-such-fd-dir")):
+                    rc, out, err = run_clear_in_process(mod, self.ws)
+            self.assertNotEqual(rc, 0,
+                                "a widen that could not happen over a flag that is still set is "
+                                "not a pass:\n" + out + err)
+            self.assertIn(str(shut), err, "the entry that could not be inspected is not named")
+            self.assertNotIn("0 cleared, 0 failed", out,
+                             "the run reported a clean sweep over an unreadable flagged leftover")
+            self.assertTrue(is_flagged(inner), "the fixture itself did not survive the run")
+
 
 # --------------------------------------------------------------------------
 # structural pins: the containment primitives the behaviour tests cannot race
