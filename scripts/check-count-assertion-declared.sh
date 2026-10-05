@@ -57,7 +57,9 @@
 # `assert_eq!` past ~100 columns onto three lines, so the number sits on a line
 # of its own and, when ONLY the number changes, the `.len()` line is not in the
 # diff at all; a per-line regex over `git show` misses exactly the shape the
-# gate exists for. So for every file a commit touches under src/ and tests/,
+# gate exists for. So for every .rs file a commit touches under the
+# repository-root src/ and tests/ directories (#5711; tools/*/src, examples/,
+# benches/ and fuzz/ are not checked),
 # the OLD and NEW contents are parsed whole (comments stripped, string
 # literals blanked), every count assertion is extracted as
 # (normalised expression, numeric literal), and the two sets are compared:
@@ -765,6 +767,11 @@ def selftest():
     case('a .rs file under benches/ is not checked', scoped('benches/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
     case('a non-.rs file under tests/ is not checked', scoped('tests/scope.txt', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
     case('a .rs file under src/ is checked', scoped('src/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), True, ['items.len()  18 -> 19'])
+    # #5711: eligibility is anchored at the REPOSITORY ROOT: src/ and tests/ at any depth below it, nothing nested elsewhere
+    case('a .rs file in a subdirectory of tests/ is checked', scoped('tests/sub/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), True, ['items.len()  18 -> 19'])
+    for p_ in ('tools/x/src/scope.rs', 'tools/x/tests/scope.rs', 'examples/scope.rs', 'fuzz/fuzz_targets/scope.rs'):
+        case('a .rs file under %s is not checked (not the repository-root src/ or tests/)' % p_.rsplit('/', 1)[0],
+             scoped(p_, E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
     def c_ren(s, b):                                       # the defining file is renamed with the bump
         s.w('src/lib.rs', L(18) + PAD); s.w(SH, A('crate::EXPECTED_N')); t0 = s.commit('test: add')
         s.g('mv', 'src/lib.rs', 'src/consts.rs'); s.w('src/consts.rs', L(19) + PAD); s.commit('test: move and bump'); return t0 + '..HEAD'
