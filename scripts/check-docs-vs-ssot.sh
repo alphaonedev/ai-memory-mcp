@@ -124,17 +124,36 @@ extract_const_value() {
 # a count against a stale prior-release attribution (e.g. citing the
 # v1.0.0 103/102 full-tool-count split but attributing it "at v0.9.0",
 # the release that actually shipped 101/100).
-CANONICAL_RELEASE_VERSION=$(grep -oE '^version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml \
-    | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+# A constant that cannot be read (file missing, file empty, constant renamed)
+# FAILS CLOSED and names itself. Before #5703 the failing pipeline ended the
+# script under set -e with no output at all, which reads like a crash.
+require_const() {
+    # $1 = file, $2 = const name, $3 = type pattern; prints the value.
+    local value
+    value="$(extract_const_value "$1" "$2" "$3" || true)"
+    if [[ -z "$value" ]]; then
+        printf 'FAIL: check-docs-vs-ssot: cannot resolve SSOT constant %s from %s (missing file, empty, or renamed) — refusing to run (#5703 fail-closed)\n' \
+            "$2" "$1" >&2
+        exit 1
+    fi
+    printf '%s\n' "$value"
+}
 
-CANONICAL_SCHEMA_VERSION=$(extract_const_value src/storage/migrations.rs CURRENT_SCHEMA_VERSION 'i64|usize|i32')
-CANONICAL_ROUTES_COUNT=$(extract_const_value src/lib.rs EXPECTED_PRODUCTION_ROUTES_COUNT 'usize')
-CANONICAL_UNIQUE_PATHS_COUNT=$(extract_const_value src/lib.rs EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT 'usize')
-CANONICAL_CLI_DEFAULT=$(extract_const_value src/lib.rs EXPECTED_CLI_SUBCOMMANDS_DEFAULT 'usize')
-CANONICAL_CLI_SAL=$(extract_const_value src/lib.rs EXPECTED_CLI_SUBCOMMANDS_SAL 'usize')
-CANONICAL_MEMORY_FIELDS=$(extract_const_value src/models/memory.rs FIELD_COUNT 'usize')
-CANONICAL_LINK_COUNT=$(extract_const_value src/models/link.rs COUNT 'usize')
-CANONICAL_SCOPE_COUNT=$(extract_const_value src/models/namespace.rs COUNT 'usize')
+CANONICAL_RELEASE_VERSION=$(grep -oE '^version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml 2>/dev/null \
+    | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+if [[ -z "$CANONICAL_RELEASE_VERSION" ]]; then
+    printf 'FAIL: check-docs-vs-ssot: cannot resolve SSOT constant version from Cargo.toml (missing file, empty, or renamed) — refusing to run (#5703 fail-closed)\n' >&2
+    exit 1
+fi
+
+CANONICAL_SCHEMA_VERSION=$(require_const src/storage/migrations.rs CURRENT_SCHEMA_VERSION 'i64|usize|i32')
+CANONICAL_ROUTES_COUNT=$(require_const src/lib.rs EXPECTED_PRODUCTION_ROUTES_COUNT 'usize')
+CANONICAL_UNIQUE_PATHS_COUNT=$(require_const src/lib.rs EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT 'usize')
+CANONICAL_CLI_DEFAULT=$(require_const src/lib.rs EXPECTED_CLI_SUBCOMMANDS_DEFAULT 'usize')
+CANONICAL_CLI_SAL=$(require_const src/lib.rs EXPECTED_CLI_SUBCOMMANDS_SAL 'usize')
+CANONICAL_MEMORY_FIELDS=$(require_const src/models/memory.rs FIELD_COUNT 'usize')
+CANONICAL_LINK_COUNT=$(require_const src/models/link.rs COUNT 'usize')
+CANONICAL_SCOPE_COUNT=$(require_const src/models/namespace.rs COUNT 'usize')
 
 # asi-hard pinned-knob count — the `KnobSpec` entries in
 # `src/security_profile.rs::KNOBS`, which IS the no-disable contract:
@@ -212,13 +231,18 @@ CANONICAL_AGE_FLOOR="$(
 AGE_VERSION_RS="src/store/postgres/age_version.rs"
 
 # Profile::full().expected_tool_count() — count of RegisteredTool::of::<>() entries
-CANONICAL_FULL_TOOL_COUNT=$(grep -cE '^\s*RegisteredTool::of::<' src/mcp/registry.rs 2>/dev/null || echo 0)
+# grep -c prints its count AND exits 1 on zero matches, so `|| echo 0` would
+# append a second 0 ("0<newline>0"); `|| true` keeps the one count, and an
+# absent file (no output) reads as 0 (#5811).
+CANONICAL_FULL_TOOL_COUNT=$(grep -cE '^\s*RegisteredTool::of::<' src/mcp/registry.rs 2>/dev/null || true)
+CANONICAL_FULL_TOOL_COUNT="${CANONICAL_FULL_TOOL_COUNT:-0}"
 # asi-hard pinned-knob count (#3113). SSOT = the `KnobSpec` entries in the
 # `KNOBS` table (mirrored by the derived const
 # `security_profile::PINNED_KNOB_COUNT`). Counted from source for the same
 # reason as the tool count above: the entries ARE the definition, so a knob
 # cannot be added without moving this number.
-CANONICAL_ASI_HARD_KNOBS=$(grep -cE '^[[:space:]]*KnobSpec \{' src/security_profile.rs 2>/dev/null || echo 0)
+CANONICAL_ASI_HARD_KNOBS=$(grep -cE '^[[:space:]]*KnobSpec \{' src/security_profile.rs 2>/dev/null || true)
+CANONICAL_ASI_HARD_KNOBS="${CANONICAL_ASI_HARD_KNOBS:-0}"  # same grep -c shape as above (#5811)
 
 # Profile::core().expected_tool_count() — count of tn::* refs in the
 # `Self::Core => &[ ... ]` arm of Profile::tool_names(). 7 at v0.7.0.
@@ -286,21 +310,24 @@ DOC_FILES=(
 # phrasing first (a follow-up on the gate's core rule logic, deliberately not
 # bundled into this doc-perfection wave). The list below is de-duped against
 # the curated entries above so their inline rationale survives.
-for _wf in \
-    docs/USER_GUIDE.md \
-    docs/CLI_REFERENCE.md \
-    docs/GLOSSARY.md \
-    docs/SECURITY.md \
-    docs/INSTALL.md \
-    docs/install-quickstart.md \
-    docs/integration-guide.md \
-    docs/postgres-age-guide.md \
-    docs/compliance/honest-limitations.md \
-    docs/hook-pipeline.md \
-    docs/agent-skills.md \
-    docs/batman-active-mode.md \
+WIDENED_DOC_FILES=(
+    docs/USER_GUIDE.md
+    docs/CLI_REFERENCE.md
+    docs/GLOSSARY.md
+    docs/SECURITY.md
+    docs/INSTALL.md
+    docs/install-quickstart.md
+    docs/integration-guide.md
+    docs/postgres-age-guide.md
+    docs/compliance/honest-limitations.md
+    docs/hook-pipeline.md
+    docs/agent-skills.md
+    docs/batman-active-mode.md
     docs/governance.md
-do
+)
+for _wf in "${WIDENED_DOC_FILES[@]}"; do
+    # Skipped here only to keep the merge total; a missing entry FAILS at the
+    # enrolled-doc check below (#5702) unless a self-test fixture enrols a subset.
     [[ -f "$_wf" ]] || continue
     _dup=0
     for _e in "${DOC_FILES[@]}"; do [[ "$_e" == "$_wf" ]] && { _dup=1; break; }; done
@@ -406,15 +433,14 @@ fi
 # docs/essays/brass-tacks-3-why.html were hand-added here when
 # HTML_DOC_FILES held one file; the widened glob now already carries
 # them, and a duplicate entry would report the same drift twice.
-HOOK_DOC_FILES=()
-for _hd in \
-    "${DOC_FILES[@]}" \
-    "${HTML_DOC_FILES[@]}" \
-    docs/production-deployment.md \
-    docs/strategy/coala-mapping.md \
-    docs/audience/developer.html \
+HOOK_EXTRA_DOC_FILES=(
+    docs/production-deployment.md
+    docs/strategy/coala-mapping.md
+    docs/audience/developer.html
     docs/essays/brass-tacks-3-why.html
-do
+)
+HOOK_DOC_FILES=()
+for _hd in "${DOC_FILES[@]}" "${HTML_DOC_FILES[@]}" "${HOOK_EXTRA_DOC_FILES[@]}"; do
     _dup=0
     for _e in "${HOOK_DOC_FILES[@]:-}"; do [[ "$_e" == "$_hd" ]] && { _dup=1; break; }; done
     [[ "$_dup" == 0 ]] && HOOK_DOC_FILES+=("$_hd")
@@ -459,6 +485,69 @@ PGVECTOR_DOC_FILES=(
 CERT_CHECK_DOC_FILES=(
     docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md
 )
+
+# Surfaces the asi-hard pinned-knob count rule walks (the rule's own list; the
+# coverage note at its call site says what each one carries). Hoisted into a
+# named array so the enrolled-input check below sees it (#5811).
+ASI_HARD_DOC_FILES=(
+    CLAUDE.md
+    README.md
+    SECURITY.md
+    PERFORMANCE.md
+    docs/deploy/README.md
+    docs/deploy/asi-hard.env
+    docs/deploy/enterprise-federation.env
+    docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md
+    docs/enterprise-deployment.md
+    src/security_profile.rs
+    src/enterprise_federation_posture.rs
+    scripts/check-bootstrap-cert-gate.sh
+)
+
+# Every hand-enrolled input must exist, be readable and hold text (#5702, #5811).
+# Before #5702 a rule skipped an enrolled file that was not there, so a renamed,
+# moved or deleted input shrank the closed world each rule claims to police and
+# the gate still printed PASS. No rule skips an absent input any more: outside a
+# self-test fixture every enrolled list (and the AGE comparator mirror) is checked
+# here, and a missing, unreadable or whitespace-only input is refused by name. A
+# deliberate removal is a one-line edit to the list it is enrolled in. An empty
+# boot-banner scan set is refused here too (its pages come from a glob). A
+# self-test fixture enrols a subset, so under AI_MEMORY_DOCS_GATE_ROOT the check
+# runs only when AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 (the #2444 precedent), and
+# otherwise each list drops its absent entries before any rule reads it.
+if [[ -z "${AI_MEMORY_DOCS_GATE_ROOT:-}" || "${AI_MEMORY_DOCS_GATE_REQUIRE_DOCS:-}" == 1 ]]; then
+    for _ed in "${DOC_FILES[@]}" "${WIDENED_DOC_FILES[@]}" "${HOOK_EXTRA_DOC_FILES[@]}" \
+               "${PGVECTOR_DOC_FILES[@]}" "${CERT_CHECK_DOC_FILES[@]}" "${ASI_HARD_DOC_FILES[@]}" \
+               "$AGE_VERSION_RS"; do
+        if [[ ! -f "$_ed" ]]; then
+            _why=missing
+        elif [[ ! -r "$_ed" ]]; then
+            _why=unreadable
+        elif ! grep -q '[^[:space:]]' "$_ed"; then
+            _why=empty
+        else
+            continue
+        fi
+        printf 'FAIL: check-docs-vs-ssot: enrolled doc %s is %s — refusing to report PASS on a shrunken closed world (#5702, #5811 fail-closed)\n' \
+            "$_ed" "$_why" >&2
+        exit 1
+    done
+    if [[ ${#BANNER_DOC_FILES[@]} -eq 0 ]]; then
+        printf 'FAIL: check-docs-vs-ssot: the boot-banner scan set resolved ZERO docs (docs/integrations/*.md outside DOC_FILES, docs/QUICKSTART.md) — the banner check would be a silent no-op (#5811 fail-closed)\n' >&2
+        exit 1
+    fi
+else
+    _kept=(); for _p in "${DOC_FILES[@]}"; do [[ -f "$_p" ]] && _kept+=("$_p"); done
+    DOC_FILES=(${_kept[@]+"${_kept[@]}"})
+    _kept=(); for _p in "${HOOK_DOC_FILES[@]}"; do [[ -f "$_p" ]] && _kept+=("$_p"); done
+    HOOK_DOC_FILES=(${_kept[@]+"${_kept[@]}"})
+    _kept=(); for _p in "${PGVECTOR_DOC_FILES[@]}"; do [[ -f "$_p" ]] && _kept+=("$_p"); done
+    PGVECTOR_DOC_FILES=(${_kept[@]+"${_kept[@]}"})
+    _kept=(); for _p in "${CERT_CHECK_DOC_FILES[@]}"; do [[ -f "$_p" ]] && _kept+=("$_p"); done
+    CERT_CHECK_DOC_FILES=(${_kept[@]+"${_kept[@]}"})
+    _kept=(); for _p in "${ASI_HARD_DOC_FILES[@]}"; do [[ -f "$_p" ]] && _kept+=("$_p"); done
+    ASI_HARD_DOC_FILES=(${_kept[@]+"${_kept[@]}"})
+fi
 
 # CHANGELOG.md is intentionally excluded — every entry is a historical
 # snapshot at landing time, so claims like "Both adapters now at
@@ -516,11 +605,16 @@ emit_fail() {
 #     scripts/qc-allowlists/schema-claim-history.txt (tab-separated `file`,
 #     `needle`, `#issue note`). A hit whose matched span (identifier, the gap
 #     and the number) contains the needle is true history; the exemption is
-#     per hit, so it never shields a real claim sharing the line. A version
-#     transition (`CURRENT_SCHEMA_VERSION 71→72`) is history by construction.
-#     A malformed entry FAILS, a STALE entry (file or needle no longer
-#     present) FAILS, a missing ledger FAILS, and a scan that reads zero files
-#     FAILS outside --self-test.
+#     per hit, so it never shields a real claim sharing the line. The FROM side
+#     of a version transition (`CURRENT_SCHEMA_VERSION 71→72`) is history by
+#     construction; its TO side is a claim like any other.
+#     A malformed entry FAILS (a needle with no subject text beyond the value,
+#     #5808, or with a character that does not read as written, #5809), a
+#     STALE entry (it shields no hit) FAILS, an
+#     entry that shields two or more hits FAILS naming each file:line, a hit
+#     that two entries shield FAILS naming both (one entry, one hit; #5809),
+#     a missing ledger FAILS, and a scan that reads zero files FAILS outside
+#     --self-test.
 # Ident-less phrasings (prose that says "schema" and a number without naming
 # the identifier) cannot be swept closed-world, because the ladder history is
 # narrated everywhere; they are covered by the explicit ANCHORS list in the
@@ -535,7 +629,7 @@ check_schema_version_rule() {
     fi
     local scan_files=() f
     for f in "${DOC_FILES[@]}" "${HTML_DOC_FILES[@]:-}"; do
-        [[ -n "$f" && -f "$f" ]] && scan_files+=("$f")
+        [[ -n "$f" ]] && scan_files+=("$f")
     done
     if [[ ${#scan_files[@]} -eq 0 && -z "${AI_MEMORY_DOCS_GATE_ROOT:-}" ]]; then
         printf 'FAIL: check-docs-vs-ssot: the CURRENT_SCHEMA_VERSION sweep resolved ZERO files — refusing to report PASS (#2444 fail-closed)\n' >&2
@@ -555,6 +649,7 @@ check_schema_version_rule() {
 import html as htmlmod
 import os
 import re
+import unicodedata
 
 # Characters either side of the identifier in which a number still belongs to
 # the claim (the longest real wording, the schema.html version row, is ~35).
@@ -617,14 +712,77 @@ PILL = re.compile(r'class="pill"[^>]*>\s*v([0-9]+)\s+schema\s*<')
 
 TAG = re.compile(r'<[^>]+>')
 WS = re.compile(r'\s+')
+# Markdown emphasis and code-span markers (\x60 is the backtick). An underscore is
+# a marker only at a word edge: between alphanumerics it is part of an identifier
+# (CURRENT_SCHEMA_VERSION, v4_0) and the folded view must not rewrite it (#5338).
+MARKS = re.compile(r'[*\x60]+|(?<![A-Za-z0-9])_+|_+(?![A-Za-z0-9])')
 PRIOR = re.compile(r'PRIOR RELEASE', re.IGNORECASE)
 # A block that ends a claim's paragraph. Not `br` (a break inside the paragraph)
 # and not `td`/`th` (a subject cell and its value cell are one row's claim; #5195).
 BLOCK_TAG = re.compile(r'</?(?:p|div|li|ul|ol|tr|table|h[1-6]|section)\b', re.IGNORECASE)
+# Two adjacent block elements are two claims (#5199): the previous raw line ends
+# with a closing block tag, or this raw line opens with a block tag.
+BLOCK_END = re.compile(r'</(?:p|div|li|ul|ol|tr|table|h[1-6]|section)\s*>\s*$', re.IGNORECASE)
+BLOCK_OPEN = re.compile(r'\s*</?(?:p|div|li|ul|ol|tr|table|h[1-6]|section)\b', re.IGNORECASE)
+# A value block: an html line whose whole text is one ladder number
+# (`<div class="value">52</div>`). It has no subject of its own, so the #5199
+# reset does not apply to it: it is read as the value of the block before it,
+# a label/value card's two lines (#5700). Fail-closed: a list item that is only
+# a number after an identifier item is read the same way.
+BARE = re.compile(r'v?[0-9]{2,3}')
 
 
 def plain(s):
     return WS.sub(' ', htmlmod.unescape(TAG.sub(' ', s))).strip()
+
+
+DIGITS = re.compile(r'[0-9]+')
+
+
+def occ(prefix):
+    # Which number of its line a hit's value is (#5809): the count of digit runs
+    # before it, read with whitespace, markers and width suffixes folded out.
+    # Every view of a line (raw, marker-folded, anchor, wrapped-line join, the html
+    # pill read with its entities decoded once) gives the same count for the same
+    # number, so one number seen in several views is one hit, and two copies of a
+    # phrase on one line are two. Tags are not folded (#5947): every view carries
+    # the same tag text (html views read the line after plain() strips real tags),
+    # and a copy inside markup (a tag attribute, escaped markup) is still a number
+    # of its line, so the copy after it counts as a second hit.
+    return len(DIGITS.findall(TYPED.sub('', MARKS.sub('', WS.sub(' ', prefix)))))
+
+
+def raw_cut(raw, upre):
+    # The raw prefix that decodes to upre (#5809). The pill is matched on the
+    # decoded line, but its count must read the raw prefix as the sweep reads the
+    # line (tags out, then entities decoded once): a second decode would turn an
+    # escaped entity (&amp;#49;) into a digit the sweep never sees, or an escaped
+    # &amp;#1234; into a letter where the sweep sees a digit run. upre ends just
+    # before the pill's value, after a whole decoded character, so a raw prefix
+    # that decodes to it exists; were none found, the decoded text is read.
+    for j in range(len(upre), len(raw) + 1):
+        if htmlmod.unescape(raw[:j]) == upre:
+            return raw[:j]
+    return upre
+
+
+def shields(nd, val, span, src):
+    # Does ledger needle nd exempt the hit (val, span)? src is None for a hit
+    # matched in a raw view, else the unfolded text of the marker-folded view it
+    # was matched in. A raw hit is shielded by the needle as written or whitespace
+    # folded (#5334); a folded hit only by the marker-folded needle (#5335), and
+    # only when the whitespace-folded needle occurs in src, so a bold needle never
+    # shields a plain claim elsewhere in its file (#5699). The shielding form must
+    # also name the hit's value as a whole number.
+    ws = WS.sub(' ', nd)
+    if src is None:
+        forms = (nd, ws)
+    elif ws in src:
+        forms = (MARKS.sub('', ws),)
+    else:
+        return False
+    num = re.compile(r'(?<![0-9])' + re.escape(val) + r'(?![0-9])')
+    return any(f in span and num.search(f) for f in forms)
 
 
 canon = os.environ['GATE_SCHEMA_CANON']
@@ -635,6 +793,21 @@ ARROW = re.compile(r'\s*(?:→|->)')
 
 rows = []
 # ---- the history ledger -------------------------------------------------
+
+
+def readable(ch):
+    # A character a reviewer reads as written (#5809): printable ASCII, or a
+    # non-ASCII letter, punctuation mark or symbol.
+    return ' ' <= ch <= '~' or (ord(ch) > 0x7f and unicodedata.category(ch)[0] in 'LPS')
+
+
+def spell(text):
+    # Every other character is spelled as \uXXXX (tabs kept) in a refusal, so the
+    # log shows what the ledger line really holds and never carries a control
+    # or format character itself (#5809).
+    return ''.join(ch if ch == '\t' or readable(ch) else '\\u%04x' % ord(ch) for ch in text)
+
+
 ledger = {}
 for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8').read().splitlines(), 1):
     if not raw.strip() or raw.lstrip().startswith('#'):
@@ -642,14 +815,50 @@ for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8')
     parts = raw.split('\t')
     if len(parts) != 3 or not parts[0].strip() or not parts[1].strip() \
             or not re.search(r'#[0-9]+', parts[2]):
-        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', raw.strip()[:160]))
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', spell(raw.strip())[:160]))
         continue
     if parts[1] in ledger.get(parts[0].strip(), {}):
-        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', 'duplicate entry: ' + raw.strip()[:140]))
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', 'duplicate entry: ' + spell(raw.strip())[:140]))
         continue
-    ledger.setdefault(parts[0].strip(), {})[parts[1]] = [n, False]
+    # A needle must name the ladder number it exempts. One with no ASCII digit
+    # (markers, whitespace, format characters, punctuation or words only) names
+    # none: an all-marker needle folds to '', sat inside every span of its file
+    # and could never go stale. Folding never adds a digit, so the raw needle is
+    # tested (#5699).
+    if not re.search(r'[0-9]', parts[1]):
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-',
+                     'vacuous needle, names no ladder number (#5699): ' + spell(raw.strip())[:120]))
+        continue
+    # A needle must also carry subject text beyond the value (#5808). A needle that
+    # is the bare value sits inside every span that claims that value, so one row
+    # shielded every stale claim of it in its file. The rule is positive: in both
+    # forms shields() can match (whitespace folded, and also marker folded) the
+    # needle must hold a word token, a maximal run of ASCII letters, digits and
+    # underscores, that has three or more letters and no digit. Anything else
+    # (v52, 52a, two letters, two numbers, markers or padding around the value)
+    # is refused by name.
+    if not all(any(len(re.findall(r'[A-Za-z]', t)) >= 3 and not re.search(r'[0-9]', t)
+                   for t in re.findall(r'[A-Za-z0-9_]+', v))
+               for v in (WS.sub(' ', parts[1]), MARKS.sub('', WS.sub(' ', parts[1])))):
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-',
+                     'needle carries no subject text beyond the value (#5808): ' + spell(raw.strip())[:120]))
+        continue
+    # A needle must read as written (#5809). The rule is positive: every character
+    # is printable ASCII, or a non-ASCII letter, punctuation or symbol (the real
+    # entries use an em dash and an arrow). A format character (ZWSP, a BOM), a
+    # control, a combining mark, a non-ASCII space or a non-ASCII digit can glue a
+    # word to the value, or change the value, without showing it, so a reviewer
+    # reads a needle that is not the one shields() matches. It is refused by name.
+    bad = [ch for ch in parts[1] if not readable(ch)]
+    if bad:
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-',
+                     'needle carries a character that does not read as written (U+%04X %s, #5809): %s'
+                     % (ord(bad[0]), unicodedata.category(bad[0]), spell(raw.strip())[:120])))
+        continue
+    ledger.setdefault(parts[0].strip(), {})[parts[1]] = [n, set()]
 
 files = os.environ.get('GATE_SCHEMA_FILES', '').split()
+owners = {}  # (path, line, occ) -> (value, ledger lines of the rows that shield it)
 for path in files:
     is_html = path.endswith('.html')
     lines = open(path, encoding='utf-8').read().splitlines()
@@ -663,12 +872,12 @@ for path in files:
             if PRIOR.search(window):
                 continue
         probe = TYPED.sub('', line)
-        hits = []  # (value, matched span)
+        hits = []  # (value, matched span, unfolded source of a marker-folded view, occ)
         for rx in SWEEP:
             for m in rx.finditer(probe):
                 if ARROW.match(probe, m.end(1)):
                     continue
-                hits.append((m.group(1), m.group(0)))
+                hits.append((m.group(1), m.group(0), None, occ(probe[:m.start(1)])))
         # A claim wrapped across two source lines: the subject ends the previous
         # line, the value opens this one. Only values on THIS line count.
         if ln > 1:
@@ -686,8 +895,15 @@ for path in files:
                 prev = plain(lines[back])
             # Whitespace at the wrap point is not part of the claim: markdown
             # hard-break spaces, list-continuation indents and tabs are folded.
-            prev = WS.sub(' ', TYPED.sub('', prev)).strip()
             body = WS.sub(' ', probe).strip()
+            # The anchor form below joins across the #5199 reset: its subject words
+            # (a v0.8.x DB steps / v40 -> v52) name the claim on their own, so a
+            # transition split over two blocks is still one claim (#5700).
+            aprev = WS.sub(' ', TYPED.sub('', prev)).strip()
+            if is_html and (BLOCK_END.search(lines[back]) or BLOCK_OPEN.match(raw)) \
+                    and not BARE.fullmatch(body):
+                prev = ''
+            prev = WS.sub(' ', TYPED.sub('', prev)).strip()
             # Identifier form (#4850, window per #5080): the last identifier on
             # the previous line stands alone and the SUBJECT_WINDOW is counted
             # from the START of this line, so the previous line's tail (a
@@ -704,39 +920,78 @@ for path in files:
                 for m in SWEEP[0].finditer(stub + body):
                     if m.start() == 0 and m.start(1) >= len(stub) \
                             and not ARROW.match(stub + body, m.end(1)):
-                        hits.append((m.group(1), m.group(0)))
+                        hits.append((m.group(1), m.group(0), None, occ(body[:m.start(1) - len(stub)])))
             # Anchor form (#5026): an anchor whose subject words end the previous
             # line and whose value opens this one (docs/index.html "a v0.8.x DB
             # steps" / "v70 -> v100"). The match must start on the previous line
             # and its value on this one; same-line matches are counted below.
-            joined = prev + ' ' + body
+            joined = aprev + ' ' + body
             for rx in ANCHORS:
                 for m in rx.finditer(joined):
-                    if m.start() < len(prev) < m.start(1):
-                        hits.append((m.group(1), m.group(0)))
+                    if m.start() < len(aprev) < m.start(1):
+                        hits.append((m.group(1), m.group(0), None, occ(body[:m.start(1) - len(aprev) - 1])))
+            # Markdown only: the same join with the emphasis / code-span markers
+            # folded out of both lines, so a bold or code-span transition wrapped
+            # across the line break is seen too (#5340). The marker fold reaches one
+            # line back, like the join itself.
+            if not is_html:
+                fprev = MARKS.sub('', prev)
+                fbody = MARKS.sub('', body)
+                fjoined = fprev + ' ' + fbody
+                for rx in ANCHORS:
+                    for m in rx.finditer(fjoined):
+                        if m.start() < len(fprev) < m.start(1):
+                            hits.append((m.group(1), m.group(0), joined, occ(fbody[:m.start(1) - len(fprev) - 1])))
+        # Every anchor spells a gap as one space, so match it against the
+        # whitespace-folded line (html is already folded by plain(); #5200).
+        aline = WS.sub(' ', line)
+        # A markdown claim wrapped in emphasis or a code span (`steps **v40 -> v52**`)
+        # is also matched with those markers folded out (#5261); html lost its
+        # tags in plain(). The raw view stays, so anchors that spell markers still match.
+        # Same-line view; the wrapped-across-a-line view is the markdown fold in the
+        # join block above (#5340).
+        # Bounds pinned by the self-test (#5337): html literal markers (a backtick span
+        # typed into html text) are NOT folded, and the html join reset above is html-only.
+        views = [(aline, None)] if is_html else [(aline, None), (MARKS.sub('', aline), aline)]
         for rx in ANCHORS:
-            hits.extend((m.group(1), m.group(0)) for m in rx.finditer(line))
+            for view, src in views:
+                hits.extend((m.group(1), m.group(0), src, occ(view[:m.start(1)])) for m in rx.finditer(view))
         if is_html:
-            hits.extend((m.group(1), m.group(0)) for m in PILL.finditer(htmlmod.unescape(raw)))
+            uraw = htmlmod.unescape(raw)
+            hits.extend((m.group(1), m.group(0), None, occ(plain(raw_cut(raw, uraw[:m.start(1)]))))
+                        for m in PILL.finditer(uraw))
         seen = set()
-        for val, span in hits:
+        for val, span, src, k in hits:
             if val == canon or val in seen:
                 continue
-            # The ledger exempts ONE hit: the needle must sit inside the
-            # matched span, so a history phrase never shields a real claim
-            # that shares its line (schema.html carries both on one line).
-            hit_entry = [st for nd, st in entries.items() if nd in span]
+            # A ledger row exempts a hit only when its needle sits inside the
+            # hit's matched span, so a history phrase never shields a real claim
+            # that shares its line (schema.html carries both on one line). A row
+            # exempts exactly one hit (#5809): a hit is one number of one line (occ),
+            # however many views see it; a row that shields two or more hits, on one
+            # line or on several, FAILS and names each, and so does a hit that two
+            # rows shield. A needle with a doubled space or a marker still sits
+            # inside the folded span it exempts (#5334, #5335); shields() bounds the
+            # fold (#5699).
+            hit_entry = [st for nd, st in entries.items() if shields(nd, val, span, src)]
             if hit_entry:
                 for st in hit_entry:
-                    st[1] = True
+                    st[1].add((ln, k))
+                    owners.setdefault((path, ln, k), (val, set()))[1].add(st[0])
                 continue
             seen.add(val)
             rows.append(('CLAIM', path, ln, val, line.strip()[:160]))
 
+for (path, ln, k), (val, ns) in sorted(owners.items()):
+    if len(ns) > 1:
+        rows.append(('LEDGER_SHARED', path, ln, val, ' and '.join(str(x) for x in sorted(ns))))
 for path, entries in ledger.items():
     for needle, (n, used) in entries.items():
         if not used:
             rows.append(('LEDGER_STALE', path, n, '-', needle[:160]))
+        elif len(used) > 1:
+            rows.append(('LEDGER_MULTI', path, n, len(used), '"%s" at %s' % (
+                needle[:120], ', '.join('%s:%d' % (path, x) for x, _ in sorted(used)))))
 for r in rows:
     print('\t'.join(str(c) for c in r))
 SCHEMAPY
@@ -759,6 +1014,18 @@ SCHEMAPY
                 ;;
             LEDGER_STALE)
                 printf 'FAIL: schema-claim-history ledger: STALE entry at line %s (%s no longer carries "%s") — delete it\n' "$ln" "$file" "$context" >&2
+                fail_count=$((fail_count + 1))
+                ;;
+            LEDGER_MULTI)
+                printf 'FAIL: schema-claim-history ledger: entry at line %s shields %s hits, exactly one is allowed (#5809): %s — reword all but one occurrence in the doc and give each its own entry\n' "$ln" "$val" "$context" >&2
+                fail_count=$((fail_count + 1))
+                ;;
+            LEDGER_SHARED)
+                printf 'FAIL: schema-claim-history ledger: the hit "%s" at %s:%s is shielded by the entries at lines %s, exactly one is allowed (#5809) — delete or narrow the extra entry\n' "$val" "$file" "$ln" "$context" >&2
+                fail_count=$((fail_count + 1))
+                ;;
+            *)
+                printf 'FAIL: check-docs-vs-ssot: CURRENT_SCHEMA_VERSION engine emitted an unknown row kind "%s" — refusing to report PASS (#5809 fail-closed)\n' "$kind" >&2
                 fail_count=$((fail_count + 1))
                 ;;
         esac
@@ -880,8 +1147,6 @@ def html_window_historical(window):
 
 
 for f in os.environ["GATE_NC_FILES"].split():
-    if not os.path.isfile(f):
-        continue
     is_html = f.endswith(".html")
     markdownish = f.endswith((".md", ".html"))
     lines = open(f, encoding="utf-8").read().splitlines()
@@ -945,7 +1210,6 @@ check_pgvector_version_rule() {
     local rule_name="PGVECTOR_APT_VERSION (certified pgvector patch)"
     local canonical="$CANONICAL_PGVECTOR_PATCH"
     for f in "${PGVECTOR_DOC_FILES[@]}"; do
-        [[ -f "$f" ]] || continue
         # Empty canonical + a doc to validate = the SSOT file was
         # unreadable. FAIL CLOSED (#2713 discipline) rather than flag
         # every citation as drift OR silently pass.
@@ -1047,8 +1311,10 @@ for ln, line in enumerate(open('$f', encoding='utf-8').read().splitlines(), 1):
 # HTML_DOC_FILES by HTML_FROZEN_EXEMPT at the top of this script, which is
 # exactly why a `whats-new-v0.8.0` page may keep stamping v0.8.0.
 # #3756 — bind the Rust AGE-version pins to their SSOTs. Fails CLOSED when
-# the mirror exists but a SSOT is unreadable; skips cleanly when the mirror
-# is absent (a fixture tree). A mismatch names both values.
+# the mirror exists but a SSOT is unreadable. An absent mirror is refused
+# by name at the enrolled-input check (#5811); the skip below is reached
+# only in a self-test fixture that does not enrol it. A mismatch names both
+# values.
 check_age_version_consts_rule() {
     local rule_name="AGE_VERSION_* (comparator pins mirror the SSOT)"
     [[ -f "$AGE_VERSION_RS" ]] || return 0
@@ -1119,8 +1385,6 @@ INSTALL_REF = re.compile(
 )
 
 for path in os.environ.get("GATE_STAMP_FILES", "").split():
-    if not os.path.isfile(path):
-        continue
     lines = open(path, encoding="utf-8").read().splitlines()
     depth = 0
     for ln, line in enumerate(lines, 1):
@@ -1218,6 +1482,13 @@ check_env_var_census_rule() {
         _census_production_lines | grep -oE 'const [A-Z][A-Z0-9_]*: *&str *= *"AI_MEMORY_[A-Z0-9_]+"'; \
         _census_production_lines | grep -oE 'env *= *"AI_MEMORY_[A-Z0-9_]+"'; } \
         | grep -oE 'AI_MEMORY_[A-Z0-9_]+' | LC_ALL=C sort -u) || true
+    # Zero vars is legitimate only in a self-test fixture that enrols no src tree;
+    # outside one (or under AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1) it means the census
+    # read nothing, so it is refused by name rather than passed (#5811).
+    if [[ -z "$code_vars" ]] && [[ -z "${AI_MEMORY_DOCS_GATE_ROOT:-}" || "${AI_MEMORY_DOCS_GATE_REQUIRE_DOCS:-}" == 1 ]]; then
+        printf 'FAIL: %s: resolved ZERO AI_MEMORY_* env vars from the production src/ tree — the census would be a silent no-op (#5811 fail-closed)\n' "$rule_name" >&2
+        exit 1
+    fi
     for var in $code_vars; do
         # Word-boundaried: a bare `grep -q` lets a LONGER var's mention
         # satisfy a shorter one (`AI_MEMORY_STORE_URL` would be answered
@@ -1543,19 +1814,13 @@ def banner_scan(f, ln, text, hist_window):
 
 
 def scan_banner_only(f):
-    try:
-        text = open(f, encoding="utf-8").read()
-    except OSError:
-        return
+    text = open(f, encoding="utf-8").read()
     for ln, line in enumerate(text.splitlines(), 1):
         banner_scan(f, ln, line, False)
 
 
 def scan(f, is_html):
-    try:
-        text = open(f, encoding="utf-8").read()
-    except OSError:
-        return
+    text = open(f, encoding="utf-8").read()
     lines = text.splitlines()
     for ln, line in enumerate(lines, 1):
         ctx = line.strip()[:160].replace("\t", " ")
@@ -1717,18 +1982,7 @@ run_all_rules() {
         "ASI_HARD_PINNED_KNOB_COUNT" \
         "$CANONICAL_ASI_HARD_KNOBS" \
         '([0-9]+)-knob|(?:auto-)?[Pp]ins the ([0-9]+)(?: asi-hard)? knobs|holds \*\*([0-9]+)\*\* entries|names all ([0-9]+) correctly|SSOT for the ([0-9]+)|\*\*([0-9]+)\*\* post-#|shows `([0-9]+)/[0-9]+`|`PINNED_KNOB_COUNT` \(([0-9]+)\)|is \*\*([0-9]+) knobs\*\*|PINS \*\*([0-9]+)\*\* security env knobs|([0-9]+)-entry pin-and-refuse|all \*\*([0-9]+)\*\* `KNOBS` entries|All \*\*([0-9]+)\*\* of them' \
-        CLAUDE.md \
-        README.md \
-        SECURITY.md \
-        PERFORMANCE.md \
-        docs/deploy/README.md \
-        docs/deploy/asi-hard.env \
-        docs/deploy/enterprise-federation.env \
-        docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md \
-        docs/enterprise-deployment.md \
-        src/security_profile.rs \
-        src/enterprise_federation_posture.rs \
-        scripts/check-bootstrap-cert-gate.sh
+        "${ASI_HARD_DOC_FILES[@]}"
     check_generalised_numeric_claims
     check_pgvector_version_rule
     check_age_version_consts_rule
@@ -2688,7 +2942,8 @@ SCHEMAHTML
     grep -qF 'malformed entry' <<<"$_led_out" \
         || { echo "FAIL: self-test #3248 - malformed ledger entry not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
     cp "$_led.keep" "$_led"
-    printf 'docs/postgres-age-guide.md\tno such span anywhere\t#3248 stale on purpose\n' >> "$_led"
+    # The needle names a number (v4242) so it is refused as stale, not as vacuous (#5699).
+    printf 'docs/postgres-age-guide.md\tno such span anywhere v4242\t#3248 stale on purpose\n' >> "$_led"
     _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 || true)
     grep -qF 'STALE entry' <<<"$_led_out" \
         || { echo "FAIL: self-test #3248 - stale ledger entry not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -2719,6 +2974,23 @@ SCHEMAHTML
     # changes: each REJECT line passed green before them.
     printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 49→50\t#3248 fixture past bump\n' \
         > scripts/qc-allowlists/schema-claim-history.txt
+    # Ledgered history written in a shape the engine folds before matching must stay
+    # exempt in every view (#5334 doubled space; the ledger needle is matched against the
+    # span as the engine saw it, folded the same way). A needle cannot hold a tab: the
+    # ledger is tab-separated.
+    printf 'docs/postgres-age-guide.md\tsteps  v40 → v57\t#5334 ledgered doubled-space history\n' \
+        >> scripts/qc-allowlists/schema-claim-history.txt
+    # The marker-folded markdown view (#5261) must keep the exemption too (#5335): a
+    # needle with a code span or bold markers sits inside the span only once folded.
+    printf 'docs/postgres-age-guide.md\tsteps `v40 -> v59`\t#5335 ledgered code-span history\n' \
+        >> scripts/qc-allowlists/schema-claim-history.txt
+    printf 'docs/postgres-age-guide.md\t| Schema version | **v58** |\t#5335 ledgered bold history\n' \
+        >> scripts/qc-allowlists/schema-claim-history.txt
+    # A needle with BOTH a doubled space and a marker is exempt only when the whitespace
+    # fold runs before the marker fold: the folded view has one space, so folding markers
+    # out of the raw needle (two spaces) would not sit inside it (#5390).
+    printf 'docs/postgres-age-guide.md\tsteps  **v40** → v60\t#5390 ledgered doubled-space bold history\n' \
+        >> scripts/qc-allowlists/schema-claim-history.txt
     cat > "$tmpdir/docs/postgres-age-guide.md" <<'R4MD'
 The current `CURRENT_SCHEMA_VERSION` is
 52 on both backends.
@@ -2760,6 +3032,48 @@ a v0.8.x DB steps  v40 → v52 on boot.
 a v0.8.x DB steps  v40 → v53 on boot.
 a v0.8.x DB steps	v40 → v52 on boot.
 a v0.8.x DB steps	v40 → v53 on boot.
+re-stamped to v1.0.0  (schema v52)
+re-stamped to v1.0.0  (schema v53)
+Schema v52  (was v51)
+Schema v53  (was v51)
+Current version:	52 at v1.0.0
+Current version:	53 at v1.0.0
+a v0.8.x DB steps **v40 → v52** on boot.
+a v0.8.x DB steps **v40 → v53** on boot.
+a v0.8.x DB steps `v40 -> v52` on boot.
+a v0.8.x DB steps `v40 -> v53` on boot.
+a v0.6 DB steps  v40 → v57 on boot.
+a v0.6 DB steps `v40 -> v59` on boot.
+| Schema version | **v58** |
+See CURRENT_SCHEMA_VERSION</p>
+52 tools ship here.
+See CURRENT_SCHEMA_VERSION
+<p>52 tools ship here.</p>
+a v0.8.x DB steps _v40 -> v52_ on boot.
+a v0.8.x DB steps _v40 -> v53_ on boot.
+a v0.8.x DB steps v4_0 -> v52 on boot.
+a v0.8.x DB steps __v40 -> v52__ on boot.
+re-stamped to v1.0.0	(schema v52)
+re-stamped to v1.0.0	(schema v53)
+Schema v52	(was v51)
+Schema v53	(was v51)
+Current version:  52 at v1.0.0
+Current version:  53 at v1.0.0
+a v0.8.x DB steps **v40 →
+v52** on boot.
+a v0.8.x DB steps **v40 →
+v53** on boot.
+a v0.8.x DB steps `v40 ->
+v52` on boot.
+a v0.8.x DB steps `v40 ->
+v53` on boot.
+| Schema version | _v52_ |
+| Schema version | _v53_ |
+a v0.8.x DB steps **v40** →
+**v52** on boot.
+a v0.8.x DB steps **v40** →
+**v53** on boot.
+a v0.6 DB steps  **v40** → v60 on boot.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2841,6 +3155,25 @@ v52</a></span></em></strong>)</p>
 <em>
 <span>
 v52</span></em></strong>)</p>
+<p>See CURRENT_SCHEMA_VERSION</p>
+<p>52 tools ship today.</p>
+<p>The CURRENT_SCHEMA_VERSION is
+52 on both backends.</p>
+<p>The CURRENT_SCHEMA_VERSION is
+53 on both backends.</p>
+See CURRENT_SCHEMA_VERSION
+<p>52 tools ship here.</p>
+<p>See CURRENT_SCHEMA_VERSION</p>
+52 tools ship today.
+<p>a</p><p>The CURRENT_SCHEMA_VERSION is
+52 on both backends.</p>
+See CURRENT_SCHEMA_VERSION<p>
+52 tools ship here.
+<p>a v0.8.x DB steps `v40 -> v52` on boot.</p>
+<p>a v0.8.x DB steps `v40 ->
+v52` on boot.</p>
+<p>See CURRENT_SCHEMA_VERSION
+</p>52 tools ship here.
 R4HTML
     # #5196: every block tag, opening and closing, stops the look-back; every inline or
     # in-row tag does not. One triple per tag (subject, tag-only line, value). block-fixture.html
@@ -2850,9 +3183,47 @@ R4HTML
                /p /div /li /ul /ol /tr /table /h1 /h2 /h3 /h4 /h5 /h6 /section /DIV; do
         printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-fixture.html"
     done
-    for _bt in em span strong a code b br td th /td /th /em /span /strong /br; do
+    # pre, link and track (lines 48, 51, 54) begin with p, li and tr but are not block
+    # tags: they pin the trailing \b of BLOCK_TAG, without which each would stop the
+    # look-back and hide the inline subject's 52 (#5419).
+    for _bt in em span strong a code b br td th /td /th /em /span /strong /br pre link track; do
         printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-control.html"
     done
+    # The same inline subject followed by a value line that OPENS with pre, link or track
+    # (lines 56, 58, 60): none is a block tag, so the #5199 reset must not fire and the
+    # 52 is joined. They pin the trailing \b of BLOCK_OPEN (#5701).
+    for _bt in pre link track; do
+        printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>52 rows.\n' "$_bt" >> "$tmpdir/docs/block-control.html"
+    done
+    # dd and dt (lines 61-72, values on 63, 66, 69, 72) are not in BLOCK_TAG: a tag-only
+    # dd / dt line does not stop the look-back, so the inline subject's 52 is still joined
+    # and flagged. This pins the current fail-closed reading; moving dd / dt into
+    # BLOCK_TAG is the open #5229 question and must change these cells deliberately.
+    for _bt in dd dt /dd /dt; do
+        printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-control.html"
+    done
+    # #5700: a label/value card is one claim across two block elements. A value block
+    # whose whole text is one ladder number (52, v52) is read with the block before it
+    # (lines 2, 4, 14 flag; a list item that is only a number is refused the same way,
+    # fail-closed); a transition split over two blocks is still joined by its anchor
+    # (line 6 flags, line 8 is canon). A block with words after its number is a new
+    # claim of its own, so the #5199 reset holds for it (line 12).
+    cat > "$tmpdir/docs/card-fixture.html" <<'R4CARD'
+<div class="stat"><div class="label">CURRENT_SCHEMA_VERSION</div>
+<div class="value">52</div></div>
+<li><strong>CURRENT_SCHEMA_VERSION</strong></li>
+<li>52</li>
+<div>a v0.8.x DB steps</div>
+<div>v40 -&gt; v52 on boot.</div>
+<div>a v0.8.x DB steps</div>
+<div>v40 -&gt; v53 on boot.</div>
+<div class="label">CURRENT_SCHEMA_VERSION</div>
+<div class="value">53</div>
+<p>See CURRENT_SCHEMA_VERSION</p>
+<p>52 tools ship today.</p>
+<div class="label">CURRENT_SCHEMA_VERSION</div>
+<div class="value">v52</div>
+R4CARD
     r4_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test #3248 r4 - stale wordings not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
     for _want in \
@@ -2899,7 +3270,34 @@ R4HTML
         'docs/block-control.html:39 claims "52"' \
         'docs/block-control.html:42 claims "52"' \
         'docs/block-control.html:45 claims "52"' \
-        'docs/schema-fixture.html:79 claims "52"'
+        'docs/block-control.html:48 claims "52"' 'docs/block-control.html:51 claims "52"' \
+        'docs/block-control.html:54 claims "52"' \
+        'docs/block-control.html:56 claims "52"' 'docs/block-control.html:58 claims "52"' \
+        'docs/block-control.html:60 claims "52"' \
+        'docs/block-control.html:63 claims "52"' 'docs/block-control.html:66 claims "52"' \
+        'docs/block-control.html:69 claims "52"' 'docs/block-control.html:72 claims "52"' \
+        'docs/schema-fixture.html:79 claims "52"' \
+        'docs/schema-fixture.html:83 claims "52"' \
+        'docs/schema-fixture.html:91 claims "52"' \
+        'docs/schema-fixture.html:93 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:55 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:57 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:58 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:61 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:62 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:64 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:66 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:69 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:73 claims "52"' \
+        'docs/postgres-age-guide.md:76 claims "52"' \
+        'docs/postgres-age-guide.md:79 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:41 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:43 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:45 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:47 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:49 claims "52"' \
+        'docs/card-fixture.html:2 claims "52"' 'docs/card-fixture.html:4 claims "52"' \
+        'docs/card-fixture.html:6 claims "52"' 'docs/card-fixture.html:14 claims "52"'
     do grep -qF "$_want" <<<"$r4_out" || { echo "FAIL: self-test #3248 r4 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
     for _not in \
         'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:4 ' \
@@ -2918,14 +3316,41 @@ R4HTML
         'docs/schema-fixture.html:42 ' \
         'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 ' 'docs/schema-fixture.html:46 ' \
         'docs/schema-fixture.html:52 ' 'docs/schema-fixture.html:62 ' 'docs/schema-fixture.html:68 ' \
-        'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:'
+        'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' \
+        'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 ' 'docs/schema-fixture.html:89 ' 'docs/schema-fixture.html:94 ' 'docs/postgres-age-guide.md:59 ' 'docs/postgres-age-guide.md:60 ' \
+        'docs/postgres-age-guide.md:63 ' 'docs/postgres-age-guide.md:65 ' 'docs/postgres-age-guide.md:67 ' \
+        'docs/postgres-age-guide.md:71 ' 'docs/postgres-age-guide.md:75 ' \
+        'docs/postgres-age-guide.md:42 ' 'docs/postgres-age-guide.md:44 ' 'docs/postgres-age-guide.md:46 ' \
+        'docs/postgres-age-guide.md:48 ' 'docs/postgres-age-guide.md:50 ' 'docs/postgres-age-guide.md:51 ' \
+        'docs/postgres-age-guide.md:52 ' 'docs/postgres-age-guide.md:53 ' \
+        'docs/postgres-age-guide.md:77 ' \
+        'docs/postgres-age-guide.md:81 ' \
+        'docs/postgres-age-guide.md:82 ' \
+        'docs/schema-fixture.html:96 ' \
+        'docs/schema-fixture.html:98 ' \
+        'docs/card-fixture.html:8 ' 'docs/card-fixture.html:10 ' 'docs/card-fixture.html:12 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
+    grep -qF 'STALE entry' <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - a ledger entry reported STALE although its line is present" >&2; cd "$REPO_ROOT"; exit 1; }
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5026/#5080 - anchor wrapped across two lines (steps / v40 -> v52) and identifier value more than 60 chars after the identifier: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #4511-R5 - wrapped claim with an issue ref / release triple in the subject tail, whitespace at the wrap point, and a tag-only middle line: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5140 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, any case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
+    echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag, and when the previous line ends with a closing block tag and the next line carries no tag); a closing tag in the MIDDLE of the previous line does not cut a claim wrapped inside the next paragraph; a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
+    echo "PASS: self-test #5200/#5339 - ident-less anchors (re-stamped to v1.0.0 (schema vN), Schema vN (was vM), Current version: N at v1.0.0) each match a markdown claim in BOTH a doubled-space and a tab variant: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5419 - a tag-only line whose tag only begins like a block tag (pre, link, track) does not stop the look-back from the inline subject (52 REJECTED); pins the trailing \\b of BLOCK_TAG"
+    echo "PASS: self-test #5701 - a value line that opens with a tag that only begins like a block tag (pre, link, track) is not a new block: the inline subject is joined (52 REJECTED); pins the trailing \\b of BLOCK_OPEN"
+    echo "PASS: self-test #5229 pin - a tag-only dd / dt line (open or closing) does not stop the look-back from the inline subject (52 REJECTED): the fail-closed reading of dd and dt is pinned until #5229 is decided"
+    echo "PASS: self-test #5700 - a label/value card is one claim: a value block that is only a ladder number (52, v52) after the identifier block is joined (52 REJECTED, 53 ACCEPTED; a bare-number list item is refused the same way, fail-closed); a steps transition split over two blocks is joined by its anchor (52 REJECTED, 53 ACCEPTED); a block with words after its number keeps the #5199 reset"
+    echo "PASS: self-test #5337 - join boundaries pinned: a line ending with an OPENING block tag still joins (52 REJECTED), markdown is not tag-aware (a closing tag at the end of a markdown line, or an opening tag at the start of the next, still joins; 52 REJECTED), html literal backticks are not folded (documented bound)"
+    echo "PASS: self-test #5340 - a markdown transition in bold or a code span wrapped across a line break (steps **v40 -> / v52**): planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5386 - a bare underscore-emphasis table cell (| Schema version | _v52_ |): planted 52 REJECTED, 53 ACCEPTED; pins the trailing underscore arm of MARKS"
+    echo "PASS: self-test #5387 - a markdown transition with markers on BOTH versions wrapped across a line break (steps **v40** -> / **v52**): planted 52 REJECTED, 53 ACCEPTED; pins the fold of the continuation line"
+    echo "PASS: self-test #5390 - a ledger needle with BOTH a doubled space and a marker stays exempt (the whitespace fold runs before the marker fold); no STALE row"
+    echo "PASS: self-test #5388 - html literal backticks wrapped across a line break are NOT joined (the marker fold of the join is markdown-only)"
+    echo "PASS: self-test #5389 - a line that OPENS with a closing block tag (</p>52 tools) does not join the previous line's identifier"
+    echo "PASS: self-test #5261/#5338 - markdown steps anchor wrapped in bold, a code span or underscore emphasis (steps **v40 -> v52**, a backtick span, _v40 -> v52_, __v40 -> v52__): planted 52 REJECTED, 53 ACCEPTED; an identifier with an inner underscore (v4_0) is not rewritten by the fold"
     echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5196 - the look-back bound is pinned both ways: 3 inline tag-only lines join (52 REJECTED), 4 do not"
     echo "PASS: self-test #4511-R6 - html look-back skips up to 3 tag-only lines (52 REJECTED, 53 ACCEPTED), stops past 3, and markdown never looks back past a blank line"
@@ -2937,9 +3362,439 @@ R4HTML
     echo "PASS: self-test #4849 - drifted current-state wording (v1.0.0 substrate, bold value) REJECTED, canonical ACCEPTED"
     echo "PASS: self-test #4844/#4845/#4846 - ROADMAP header parenthetical, at-a-glance card + stat tile, compliance tagline, index upgrade paragraph: stale REJECTED, canonical ACCEPTED"
     rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/schema-fixture.html"
-    rm -f "$tmpdir/docs/block-fixture.html" "$tmpdir/docs/block-control.html"
+    rm -f "$tmpdir/docs/block-fixture.html" "$tmpdir/docs/block-control.html" "$tmpdir/docs/card-fixture.html"
     rm -f "$tmpdir/docs/CONFIG_SCHEMA.md" "$tmpdir/docs/schema-fixture.html"
+
+    # ---- #5699: a ledger needle must name the ladder number it exempts. A needle
+    # that folds to nothing (markers, whitespace, format characters) once sat inside
+    # every span of its file, so one such row exempted every claim and could never
+    # go stale. Rows 1-3, 19-21 and 22-23 are real needles; rows 4-18 are each refused by
+    # line number (row 17 is a fullwidth digit, not an ASCII one; row 18 is an empty
+    # needle cell, the format validator's arm). The planted claim on line 1 must still
+    # be flagged; a bold needle must not shield the plain claim on line 3; a needle
+    # without the hit's number as a whole number (Schema v5, #152, #521) must not shield 52;
+    # a bold history wrapped across two lines (lines 8-9) stays exempt. Rows 22-23
+    # are bold needles whose only candidate is a claim the bold needle does not
+    # spell: a code-span v59 seen only in the marker-folded view (line 10), and a
+    # plain v58 in an html file, which has no folded view. Both are flagged and both
+    # rows are reported STALE.
+    _v=scripts/qc-allowlists/schema-claim-history.txt
+    {
+        printf 'docs/postgres-age-guide.md\tSchema **v58**\t#5699 ledgered bold history\n'
+        printf 'docs/postgres-age-guide.md\tSchema version  | **v60**\t#5390 doubled-space table history\n'
+        printf 'docs/postgres-age-guide.md\tSchema v5\t#5699 a digit that is not the value\n'
+        printf 'docs/postgres-age-guide.md\t**\t#5699 vacuous\n'
+        printf 'docs/postgres-age-guide.md\t``\t#5699 vacuous\n'
+        printf 'docs/postgres-age-guide.md\t_\t#5699 vacuous\n'
+        printf 'docs/postgres-age-guide.md\t__\t#5699 vacuous\n'
+        printf 'docs/postgres-age-guide.md\t*_*\t#5699 vacuous\n'
+        printf 'docs/postgres-age-guide.md\t** **\t#5699 vacuous\n'
+        printf 'docs/postgres-age-guide.md\t**\xc2\xa0**\t#5699 vacuous NBSP\n'
+        printf 'docs/postgres-age-guide.md\t**\xe2\x80\x8b**\t#5699 vacuous ZWSP\n'
+        printf 'docs/postgres-age-guide.md\t`\xe3\x80\x80`\t#5699 vacuous ideographic space\n'
+        printf 'docs/postgres-age-guide.md\t\xef\xbb\xbf\t#5699 vacuous BOM\n'
+        printf 'docs/postgres-age-guide.md\t...\t#5699 vacuous punctuation\n'
+        printf 'docs/postgres-age-guide.md\t\xe2\x86\x92\t#5699 vacuous arrow\n'
+        printf 'docs/postgres-age-guide.md\tschema\t#5699 vacuous word\n'
+        printf 'docs/postgres-age-guide.md\t**\xef\xbc\x95**\t#5699 vacuous fullwidth digit\n'
+        printf 'docs/postgres-age-guide.md\t\t#5699 empty needle cell\n'
+        printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION constant (#152)\t#5699 52 only inside 152\n'
+        printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION constant (#521)\t#5699 52 only inside 521\n'
+        printf 'docs/postgres-age-guide.md\tsteps **v40 -> v61**\t#5699 ledgered bold history wrapped\n'
+        printf 'docs/postgres-age-guide.md\tSchema **v59**\t#5699 bold needle, code-span line\n'
+        printf 'docs/vacuous-fixture.html\tSchema **v58**\t#5699 bold needle, html line\n'
+    } > "$_v"
+    cat > "$tmpdir/docs/postgres-age-guide.md" <<'R5MD'
+The CURRENT_SCHEMA_VERSION is 52 here.
+Schema **v58** (was v51)
+Schema v58 (was v51)
+| Schema version  | **v60** |
+Schema v52 (was v51)
+the CURRENT_SCHEMA_VERSION constant (#152) is 52
+the CURRENT_SCHEMA_VERSION constant (#521) is 52
+a v0.6 DB steps **v40 ->
+v61** on boot.
+Schema `v59` (was v51)
+R5MD
+    printf '<p>Schema v58 (was v51)</p>\n' > "$tmpdir/docs/vacuous-fixture.html"
+    _v_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5699 - vacuous ledger needles not rejected (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in \
+        'docs/postgres-age-guide.md:1 claims "52"' \
+        'docs/postgres-age-guide.md:3 claims "58"' \
+        'docs/postgres-age-guide.md:5 claims "52"' \
+        'docs/postgres-age-guide.md:6 claims "52"' \
+        'docs/postgres-age-guide.md:7 claims "52"' \
+        'docs/postgres-age-guide.md:10 claims "59"' 'docs/vacuous-fixture.html:1 claims "58"' \
+        'line 22 (docs/postgres-age-guide.md no longer carries "Schema **v59**")' \
+        'line 23 (docs/vacuous-fixture.html no longer carries "Schema **v58**")' \
+        'no longer carries "Schema v5")' \
+        'no longer carries "CURRENT_SCHEMA_VERSION constant (#152)")' \
+        'no longer carries "CURRENT_SCHEMA_VERSION constant (#521)")'
+    do grep -qF "$_want" <<<"$_v_out" || { echo "FAIL: self-test #5699 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
+    for _n in 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do
+        grep -qF "malformed entry at line $_n \"vacuous needle" <<<"$_v_out" \
+            || { echo "FAIL: self-test #5699 - vacuous ledger needle at line $_n not refused by name" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    grep -qF 'malformed entry at line 18 ' <<<"$_v_out" \
+        || { echo "FAIL: self-test #5699 - empty needle cell at line 18 not refused" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _not in 'docs/postgres-age-guide.md:2 ' 'docs/postgres-age-guide.md:4 ' \
+        'docs/postgres-age-guide.md:8 ' 'docs/postgres-age-guide.md:9 ' \
+        'docs/postgres-age-guide.md no longer carries "Schema **v58**")' 'no longer carries "Schema version  | **v60**")' \
+        'no longer carries "steps **v40 -> v61**")'
+    do grep -qF "$_not" <<<"$_v_out" && { echo "FAIL: self-test #5699 - ledgered history flagged or reported stale: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test #5699 - a ledger needle that names no ladder number (markers only, mixed markers, markers with a space / NBSP / ZWSP / ideographic space, a BOM, punctuation, an arrow, a bare word) is REFUSED by line number; the planted 52 is still REJECTED; a bold needle shields its own bold line but not a plain v58 on another line, a code-span v59, or a plain v58 in an html file; a needle without the hit's number as a whole number (Schema v5, #152, #521) does not shield it and is reported STALE; a ledgered bold transition wrapped across two lines stays exempt"
+    echo "PASS: self-test #5390 - the whitespace-folded needle form is pinned: Schema version  | **v60** (doubled space) exempts its table row only through the whitespace fold"
+    rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/vacuous-fixture.html"
     printf '# fixture ledger (comment-only)\n' > scripts/qc-allowlists/schema-claim-history.txt
+
+    # ---- #5808: a ledger needle must carry subject text beyond the value. A needle
+    # that is the bare value (or the value with a prefix letter, punctuation, markers,
+    # padding, a second number or a short word) sits inside every span that claims
+    # that value, so one row shielded every stale claim in its file. Rows 1-19 are
+    # such needles and each is refused by line number; row 20 (fullwidth digits) is
+    # refused by the #5699 rule first; row 21 carries a subject word and is accepted.
+    # Row 22 has a word only before marker folding (the fold glues it to the value),
+    # so it is refused; row 23's one subject word has exactly three letters and is
+    # accepted. Rows 21 and 23 each shield their own line (3 and 5), one hit each (#5809).
+    # The stale claims on lines 1, 2 and 4 must be flagged; the history on lines 3 and 5 stays exempt.
+    _s=scripts/qc-allowlists/schema-claim-history.txt
+    {
+        for _nd in '52' 'v52' 'V52' '52.' '(52)' '**52**' '`52`' '   52   ' '** 52 **' \
+                   '52a' 'v52a' '52 ab' '52 51' '52→53' '#52' 'abc52' '52_abc' '52 **ab**' 'a*b*c 52'; do
+            printf 'docs/postgres-age-guide.md\t%s\t#5808 no subject text\n' "$_nd"
+        done
+        printf 'docs/postgres-age-guide.md\t\xef\xbc\x95\xef\xbc\x92 abc\t#5808 fullwidth digits\n'
+        printf 'docs/postgres-age-guide.md\tschema_version was 54\t#5808 subject text, accepted\n'
+        printf 'docs/postgres-age-guide.md\tabc`52\t#5808 word glued to the value by the fold\n'
+        printf 'docs/postgres-age-guide.md\twas 51\t#5808 a three-letter subject word, accepted\n'
+    } > "$_s"
+    cat > "$tmpdir/docs/postgres-age-guide.md" <<'R5808MD'
+The CURRENT_SCHEMA_VERSION is 52 here.
+CURRENT_SCHEMA_VERSION = 52
+the schema_version was 54 at v0.6
+a `CURRENT_SCHEMA_VERSION` of **52**
+the schema_version was 51 at v0.5
+R5808MD
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5808 - subject-less ledger needles not refused (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in 'docs/postgres-age-guide.md:1 claims "52"' 'docs/postgres-age-guide.md:2 claims "52"' \
+                 'docs/postgres-age-guide.md:4 claims "52"' 'malformed entry at line 20 "vacuous needle'; do
+        grep -qF "$_want" <<<"$_s_out" || { echo "FAIL: self-test #5808 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    for _n in {1..19} 22; do
+        grep -qF "malformed entry at line $_n \"needle carries no subject text" <<<"$_s_out" \
+            || { echo "FAIL: self-test #5808 - subject-less ledger needle at line $_n not refused by name" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    for _not in 'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:5 ' 'line 21 ' 'malformed entry at line 21 ' \
+                'line 23 ' 'malformed entry at line 23 ' 'exactly one is allowed'; do
+        grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5808 - a needle with subject text was refused or its history flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test #5808 - a ledger needle without subject text beyond the value (the bare value, v52, V52, 52., (52), bold, code span, padding, bold padding, a number plus a letter, two letters, two numbers, an arrow, an issue ref, a word glued to the number by letters or an underscore, a short bold word, single letters split by markers, a word the marker fold glues to the value) is REFUSED by line number and the stale claims it would have shielded are flagged; fullwidth digits are refused by the #5699 rule; a needle with a subject word (three letters is enough) is accepted"
+    # ---- #5809 (5-agent vote 4d3ea1c5): one ledger row exempts exactly ONE hit, one
+    # number on one line however many views see it. Row 1 shields the same phrase on
+    # two lines and row 2 the same phrase twice on one line: each FAILS and names
+    # every file:line. Rows 6 and 7 shield one hit together: it FAILS naming both
+    # rows. Rows 3, 4 and 5 each shield one hit that two views see (raw and
+    # marker-folded, a sweep and an anchor, a wrapped-line join raw and folded):
+    # one hit each, so they pass; so does row 8, one html hit that the pill and the
+    # sweep both see after escaped markup that carries a digit. The stale claim on
+    # line 3 is still flagged.
+    # This replaces the #5810 pin of the old unbounded rule.
+    {
+        printf 'docs/postgres-age-guide.md\tschema_version was 54\t#5809 one row, two lines\n'
+        printf 'docs/postgres-age-guide.md\tschema_version was 44\t#5809 one row, two hits on one line\n'
+        printf 'docs/postgres-age-guide.md\tsteps v40 -> v45\t#5809 one hit, raw and folded views\n'
+        printf 'docs/postgres-age-guide.md\tv46** (`CURRENT_SCHEMA_VERSION\t#5809 one hit, a sweep and an anchor\n'
+        printf 'docs/postgres-age-guide.md\tsteps v40 -> v47\t#5809 one hit, wrapped-line join in two views\n'
+        printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION` set 48\t#5809 two rows, one hit (A)\n'
+        printf 'docs/postgres-age-guide.md\tSCHEMA_VERSION` set 48\t#5809 two rows, one hit (B)\n'
+        printf 'docs/schema-fixture.html\tv47 schema\t#5809 one hit, html pill and sweep after escaped markup\n'
+    } > "$_s"
+    printf '<p>&lt;h2&gt; <span class="pill">v47 schema</span> was the schema_version then</p>\n' \
+        > "$tmpdir/docs/schema-fixture.html"
+    cat > "$tmpdir/docs/postgres-age-guide.md" <<'R5809MD'
+the schema_version was 54 at v0.6
+again, the schema_version was 54 at v0.6
+CURRENT_SCHEMA_VERSION = 52
+a schema_version was 44 and then, well past the claim window, in a different clause of the same line, b schema_version was 44
+a v0.6 DB steps v40 -> v45 on boot
+| Schema | **v46** (`CURRENT_SCHEMA_VERSION`, both) |
+a v0.6 DB steps v40 ->
+v47 on boot
+the `CURRENT_SCHEMA_VERSION` set 48 then
+R5809MD
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5809 - a ledger row shielding two hits passed (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in 'docs/postgres-age-guide.md:3 claims "52"' \
+        'entry at line 1 shields 2 hits, exactly one is allowed (#5809): "schema_version was 54" at docs/postgres-age-guide.md:1, docs/postgres-age-guide.md:2 ' \
+        'entry at line 2 shields 2 hits, exactly one is allowed (#5809): "schema_version was 44" at docs/postgres-age-guide.md:4, docs/postgres-age-guide.md:4 ' \
+        'the hit "48" at docs/postgres-age-guide.md:9 is shielded by the entries at lines 6 and 7, exactly one is allowed'
+    do grep -qF "$_want" <<<"$_s_out" || { echo "FAIL: self-test #5809 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
+    for _n in 1 2 4 5 6 7 8 9; do
+        grep -qF "docs/postgres-age-guide.md:$_n claims" <<<"$_s_out" \
+            && { echo "FAIL: self-test #5809 - a ledgered hit was flagged as a claim: line $_n" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    for _not in 'malformed entry' 'STALE entry' \
+        'entry at line 3 ' 'entry at line 4 ' 'entry at line 5 ' 'entry at line 6 ' 'entry at line 7 ' \
+        'entry at line 8 ' 'docs/schema-fixture.html:1 '
+    do grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5809 - a one-hit row was refused or a ledgered hit flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    [[ $(grep -c 'exactly one is allowed' <<<"$_s_out") -eq 3 ]] \
+        || { echo "FAIL: self-test #5809 - expected exactly 3 one-hit refusals" >&2; cd "$REPO_ROOT"; exit 1; }
+    rm -f "$tmpdir/docs/schema-fixture.html"
+    echo "PASS: self-test #5809 - a ledger row that shields the same phrase on two lines, or twice on one line, FAILS naming every file:line; a hit two rows shield FAILS naming both rows; one hit seen in two views (raw and folded, sweep and anchor, wrapped-line join, html pill and sweep) counts once; a stale claim beside them is still flagged"
+    # ---- #5809 item 2: a needle must read as written. Rows 1, 4, 5, 6, 8 and 13 each
+    # carry subject text and a ladder number, but a zero-width space glues the word
+    # to the value, or a no-break space (with a later zero-width space: the first
+    # is named), a combining mark, a BOM, a DEL or a non-ASCII digit hides inside:
+    # each is refused by name and its claim stays flagged. Rows 2, 3 and 7 (arrow,
+    # em dash, tilde) are accepted. Rows 9 to 12 are refused for another reason (two
+    # fields, no digit, no subject text, a duplicate with a zero-width space in its
+    # note); every refusal spells the unreadable character as \uXXXX and never
+    # echoes it.
+    {
+        printf 'docs/postgres-age-guide.md\twas\xe2\x80\x8b51\t#5809 zero-width space\n'
+        printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 50\xe2\x86\x9251\t#5809 arrow, accepted\n'
+        printf 'docs/postgres-age-guide.md\tv51 \xe2\x80\x94 the schema_version\t#5809 em dash, accepted\n'
+        printf 'docs/postgres-age-guide.md\tschema_version\xc2\xa0was\xe2\x80\x8b 51\t#5809 no-break space, then a zero-width space\n'
+        printf 'docs/postgres-age-guide.md\tschema_version wa\xcc\x81s 51\t#5809 combining mark\n'
+        printf 'docs/postgres-age-guide.md\tschema_version\xef\xbb\xbf was 51\t#5809 BOM\n'
+        printf 'docs/postgres-age-guide.md\tschema_version ~51\t#5809 tilde, accepted\n'
+        printf 'docs/postgres-age-guide.md\tschema_version was\x7f 51\t#5809 DEL\n'
+        printf 'docs/postgres-age-guide.md\twas\xe2\x80\x8b52\n'
+        printf 'docs/postgres-age-guide.md\twas\xe2\x80\x8b\t#5809 no digit\n'
+        printf 'docs/postgres-age-guide.md\t\xe2\x80\x8b52\t#5809 no subject text\n'
+        printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 50\xe2\x86\x9251\t#5809 arrow\xe2\x80\x8b dup\n'
+        printf 'docs/postgres-age-guide.md\tschema_version was\xd9\xa3 51\t#5809 non-ASCII digit\n'
+    } > "$_s"
+    printf 'the schema_version was\xe2\x80\x8b51 then\na CURRENT_SCHEMA_VERSION 50\xe2\x86\x9251 past bump\nv51 \xe2\x80\x94 the schema_version of v0.5\nthe schema_version\xc2\xa0was 51 then\nthe schema_version wa\xcc\x81s 51 then\nthe schema_version\xef\xbb\xbf was 51 then\nthe schema_version ~51 then\nthe schema_version was\x7f 51 then\nthe schema_version was\xd9\xa3 51 then\n' \
+        > "$tmpdir/docs/postgres-age-guide.md"
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5809 - needles that do not read as written were accepted (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in 'malformed entry at line 1 "needle carries a character that does not read as written (U+200B Cf' \
+        'malformed entry at line 4 "needle carries a character that does not read as written (U+00A0 Zs' \
+        'malformed entry at line 5 "needle carries a character that does not read as written (U+0301 Mn' \
+        'malformed entry at line 6 "needle carries a character that does not read as written (U+FEFF Cf' \
+        'docs/postgres-age-guide.md:1 claims "51"' 'docs/postgres-age-guide.md:4 claims "51"' \
+        'malformed entry at line 8 "needle carries a character that does not read as written (U+007F Cc' \
+        'docs/postgres-age-guide.md:5 claims "51"' 'docs/postgres-age-guide.md:6 claims "51"' \
+        'docs/postgres-age-guide.md:8 claims "51"' \
+        'malformed entry at line 13 "needle carries a character that does not read as written (U+0663 Nd' \
+        'docs/postgres-age-guide.md:9 claims "51"' \
+        $'docs/postgres-age-guide.md\twas\\u200b51\t#5809' 'schema_version\u00a0was\u200b 51' 'wa\u0301s 51' \
+        'schema_version\ufeff was 51' 'schema_version was\u007f 51' 'schema_version was\u0663 51' \
+        $'malformed entry at line 9 "docs/postgres-age-guide.md\twas\\u200b52"' \
+        $'vacuous needle, names no ladder number (#5699): docs/postgres-age-guide.md\twas\\u200b\t#5809' \
+        $'needle carries no subject text beyond the value (#5808): docs/postgres-age-guide.md\t\\u200b52\t#5809' \
+        $'duplicate entry: docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 50\xe2\x86\x9251\t#5809 arrow\\u200b dup'
+    do grep -qF "$_want" <<<"$_s_out" || { echo "FAIL: self-test #5809 - not refused or not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
+    for _raw in '\xe2\x80\x8b' '\xc2\xa0' '\xcc\x81' '\xef\xbb\xbf' '\x7f' '\xd9\xa3'; do
+        grep -F 'malformed entry' <<<"$_s_out" | grep -qF "$(printf "$_raw")" \
+            && { echo "FAIL: self-test #5809 - a ledger refusal echoed $_raw instead of spelling it" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    for _not in 'malformed entry at line 2 ' 'malformed entry at line 3 ' 'malformed entry at line 7 ' \
+        'docs/postgres-age-guide.md:2 ' 'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:7 ' \
+        'STALE entry' 'exactly one is allowed'
+    do grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5809 - a readable needle was refused or its history flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test #5809 - a ledger needle with a zero-width space, a no-break space, a combining mark, a BOM, a DEL or a non-ASCII digit is refused naming its first such character and its claim stays flagged; an arrow, an em dash or a tilde is accepted; every ledger refusal spells such characters and never echoes them"
+    rm -f "$tmpdir/docs/postgres-age-guide.md"
+    printf '# fixture ledger (comment-only)\n' > "$_s"
+    # ---- #5809 views: one number seen in two views is one hit even when the text
+    # before it differs between the views. Line 1: a transition sweep whose span
+    # carries the FROM number, and the steps anchor. Line 2: digits split by bold
+    # markers before the value (raw and marker-folded views). Lines 3 and 4: a width
+    # suffix before the value, spaced and tab-spaced (the sweep reads the line with
+    # the suffix folded out, the anchor reads it whitespace-folded). Line 1 of the
+    # html: an escaped entity before the pill, decoded once as the sweep decodes it;
+    # line 2: an entity before the pill, decoded as the sweep decodes it.
+    # Every row shields one hit, so the gate passes (rc 0).
+    {
+        printf 'docs/postgres-age-guide.md\tsteps v40 -> v45\t#5809 transition sweep and anchor\n'
+        printf 'docs/postgres-age-guide.md\tsteps v40 -> v46\t#5809 marker-split digits before\n'
+        printf 'docs/postgres-age-guide.md\tv47** (`CURRENT_SCHEMA_VERSION\t#5809 width suffix before\n'
+        printf 'docs/postgres-age-guide.md\tv48** (`CURRENT_SCHEMA_VERSION\t#5809 tab-spaced width suffix before\n'
+        printf 'docs/schema-fixture.html\tv49 schema\t#5809 escaped entity before the pill\n'
+        printf 'docs/schema-fixture.html\tv50 schema\t#5809 entity before the pill\n'
+    } > "$_s"
+    printf 'a v0.6 DB schema_version steps v40 -> v45 on boot\na v0.6 DB with 1**2** rows steps v40 -> v46 on boot\n| x: u64 | Schema | **v47** (`CURRENT_SCHEMA_VERSION`, both) |\n| x:\tu64 | Schema | **v48** (`CURRENT_SCHEMA_VERSION`, both) |\n' \
+        > "$tmpdir/docs/postgres-age-guide.md"
+    printf '<p>&amp;#49;&amp;#50; <span class="pill">v49 schema</span> was the schema_version then</p>\n<p>&#65; <span class="pill">v50 schema</span> was the schema_version then</p>\n' \
+        > "$tmpdir/docs/schema-fixture.html"
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        || { echo "FAIL: self-test #5809 - one hit seen in two views was refused (rc $?): $(grep -F 'FAIL' <<<"$_s_out" | head -3)" >&2; cd "$REPO_ROOT"; exit 1; }
+    # ---- #5809 arms: a row shielding two hits, alone, and a hit two rows shield,
+    # alone, each fail the gate (rc 1); neither is only printed.
+    printf 'docs/postgres-age-guide.md\tschema_version was 54\t#5809 one row, two hits, alone\n' > "$_s"
+    printf 'the schema_version was 54 at v0.6\nagain, the schema_version was 54 at v0.6\n' \
+        > "$tmpdir/docs/postgres-age-guide.md"
+    rm -f "$tmpdir/docs/schema-fixture.html"
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5809 - a row shielding two hits, alone, passed (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'entry at line 1 shields 2 hits' <<<"$_s_out" \
+        || { echo "FAIL: self-test #5809 - the lone two-hit row was not named" >&2; cd "$REPO_ROOT"; exit 1; }
+    {
+        printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION` set 48\t#5809 two rows, one hit, alone (A)\n'
+        printf 'docs/postgres-age-guide.md\tSCHEMA_VERSION` set 48\t#5809 two rows, one hit, alone (B)\n'
+    } > "$_s"
+    printf 'the `CURRENT_SCHEMA_VERSION` set 48 then\n' > "$tmpdir/docs/postgres-age-guide.md"
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5809 - a hit two rows shield, alone, passed (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'is shielded by the entries at lines 1 and 2' <<<"$_s_out" \
+        || { echo "FAIL: self-test #5809 - the lone shared hit was not named" >&2; cd "$REPO_ROOT"; exit 1; }
+    # ---- #5947: a copy inside markup is still a number of its line. One row against
+    # a markdown line whose first copy sits in a tag attribute, and an html line whose
+    # first copy sits in escaped markup, shields 2 hits on each line and fails.
+    {
+        printf 'docs/postgres-age-guide.md\tschema_version was 54\t#5947 first copy inside a tag\n'
+        printf 'docs/schema-fixture.html\tschema_version was 54\t#5947 first copy inside escaped markup\n'
+    } > "$_s"
+    printf '<a title="the schema_version was 54 at v0.6">and then, well past the claim window, in a different clause of the same line, the schema_version was 54</a> then\n' \
+        > "$tmpdir/docs/postgres-age-guide.md"
+    printf '<p>&lt;a title="the schema_version was 54 at v0.6"&gt; and then, well past the claim window, in a different clause of the same line, the schema_version was 54&lt;/a&gt;</p>\n' \
+        > "$tmpdir/docs/schema-fixture.html"
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5947 - a row shielding a copy inside markup and a copy after it passed (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in 'entry at line 1 shields 2 hits, exactly one is allowed (#5809): "schema_version was 54" at docs/postgres-age-guide.md:1, docs/postgres-age-guide.md:1 ' \
+        'entry at line 2 shields 2 hits, exactly one is allowed (#5809): "schema_version was 54" at docs/schema-fixture.html:1, docs/schema-fixture.html:1 '; do
+        grep -qF "$_want" <<<"$_s_out" \
+            || { echo "FAIL: self-test #5947 - missing: $_want" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    rm -f "$tmpdir/docs/schema-fixture.html"
+    echo "PASS: self-test #5809 - one hit seen in two views counts once when the views read different text before it (a transition span, marker-split digits, a width suffix, an escaped entity before an html pill); a row shielding two hits, or a hit two rows shield, fails the gate on its own, and so does a row shielding a copy inside markup and a copy after it (#5947)"
+    rm -f "$tmpdir/docs/postgres-age-guide.md"
+    printf '# fixture ledger (comment-only)\n' > "$_s"
+
+    # ---- #5702: every hand-enrolled doc must exist. The fixture enrols a subset, so
+    # the arm opts in with AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1, fills the enrolled set
+    # with one line of text each (an empty input is refused too, #5811), then moves
+    # one entry of each list away: the gate must refuse by name. The control (all
+    # present) must not raise the refusal. Every pgvector entry is also on another
+    # list today, so that list has no entry of its own to move. The control also
+    # holds one boot-banner doc and one production env var, so the #5811 empty-set
+    # refusals stay quiet until an arm below takes them away.
+    _made=()
+    for _ed in "${DOC_FILES[@]}" "${WIDENED_DOC_FILES[@]}" "${HOOK_EXTRA_DOC_FILES[@]}" \
+               "${PGVECTOR_DOC_FILES[@]}" "${CERT_CHECK_DOC_FILES[@]}" "${ASI_HARD_DOC_FILES[@]}" \
+               "$AGE_VERSION_RS" docs/QUICKSTART.md src/fixture_env_5811.rs; do
+        [[ -e "$tmpdir/$_ed" ]] && continue
+        mkdir -p "$(dirname "$tmpdir/$_ed")"
+        printf 'fixture enrolled input\n' > "$tmpdir/$_ed"
+        _made+=("$_ed")
+    done
+    printf 'fn f() { let _ = std::env::var("AI_MEMORY_FIXTURE_5811"); }\n' > "$tmpdir/src/fixture_env_5811.rs"
+    _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) || true
+    for _not in 'enrolled doc ' 'boot-banner scan set resolved ZERO' 'resolved ZERO AI_MEMORY_'; do
+        grep -qF "$_not" <<<"$_e_out" && {
+            echo "FAIL: self-test #5702 - a complete enrolled set raised a refusal: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    # A knob SSOT that holds no KnobSpec, and a tool registry that holds no
+    # RegisteredTool entry, each read as one 0, not grep -c's 0 plus a fallback 0
+    # (#5811); the run's ENV_VAR_CENSUS and AGE refusals print the canonical
+    # summary this greps.
+    cp "$tmpdir/src/security_profile.rs" "$tmpdir/src/security_profile.rs.keep"
+    cp "$tmpdir/src/mcp/registry.rs" "$tmpdir/src/mcp/registry.rs.keep"
+    printf 'no knob entries here\n' > "$tmpdir/src/security_profile.rs"
+    printf 'no registered tools here\n' > "$tmpdir/src/mcp/registry.rs"
+    _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) || true
+    mv "$tmpdir/src/security_profile.rs.keep" "$tmpdir/src/security_profile.rs"
+    mv "$tmpdir/src/mcp/registry.rs.keep" "$tmpdir/src/mcp/registry.rs"
+    grep -qF 'asi-hard pinned knobs = 0 (' <<<"$_e_out" || {
+        echo "FAIL: self-test #5811 - a knob SSOT with zero KnobSpec entries did not read as one 0" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'Profile::full() tool count = 0 (' <<<"$_e_out" || {
+        echo "FAIL: self-test #5811 - a tool registry with zero RegisteredTool entries did not read as one 0" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _ed in docs/v1.0.0/nhi-playbook-P0-P11.md docs/USER_GUIDE.md docs/postgres-age-guide.md \
+               docs/strategy/coala-mapping.md docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md; do
+        mv "$tmpdir/$_ed" "$tmpdir/$_ed.away"
+        _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) && {
+            echo "FAIL: self-test #5702 - a missing enrolled doc ($_ed) did not fail the gate" >&2; cd "$REPO_ROOT"; exit 1; }
+        grep -qF "enrolled doc $_ed is missing" <<<"$_e_out" || {
+            echo "FAIL: self-test #5702 - the refusal for a missing enrolled doc does not name $_ed" >&2; cd "$REPO_ROOT"; exit 1; }
+        mv "$tmpdir/$_ed.away" "$tmpdir/$_ed"
+    done
+    # ---- #5811: every input the rules read is enrolled and checked, not skipped.
+    # Each asi-hard surface and the AGE comparator mirror, moved away, fails the gate
+    # by name (docs/deploy/enterprise-federation.env is the file whose 17-vs-current
+    # drift once went unseen); a whitespace-only input and an unreadable one fail by
+    # name; an empty boot-banner scan set and an empty env-var census fail by name.
+    for _ed in "${ASI_HARD_DOC_FILES[@]}" "$AGE_VERSION_RS"; do
+        mv "$tmpdir/$_ed" "$tmpdir/$_ed.away"
+        _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) && {
+            echo "FAIL: self-test #5811 - a missing enrolled input ($_ed) did not fail the gate" >&2; cd "$REPO_ROOT"; exit 1; }
+        grep -qF "enrolled doc $_ed is missing" <<<"$_e_out" || {
+            echo "FAIL: self-test #5811 - the refusal for a missing enrolled input does not name $_ed" >&2; cd "$REPO_ROOT"; exit 1; }
+        mv "$tmpdir/$_ed.away" "$tmpdir/$_ed"
+    done
+    _ed=docs/deploy/enterprise-federation.env
+    cp "$tmpdir/$_ed" "$tmpdir/$_ed.keep"
+    printf '  \n\t\n' > "$tmpdir/$_ed"
+    _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) && {
+        echo "FAIL: self-test #5811 - a whitespace-only enrolled input did not fail the gate" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF "enrolled doc $_ed is empty" <<<"$_e_out" || {
+        echo "FAIL: self-test #5811 - the refusal for an empty enrolled input does not name $_ed" >&2; cd "$REPO_ROOT"; exit 1; }
+    mv "$tmpdir/$_ed.keep" "$tmpdir/$_ed"
+    chmod 000 "$tmpdir/$_ed"
+    if [[ -r "$tmpdir/$_ed" ]]; then
+        chmod 644 "$tmpdir/$_ed"
+        echo "NOTE: self-test #5811 - the unreadable-input arm needs a user that file modes bind (uid $(id -u) reads a mode-000 file); the missing and empty arms ran"
+    else
+        _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) && {
+            chmod 644 "$tmpdir/$_ed"; echo "FAIL: self-test #5811 - an unreadable enrolled input did not fail the gate" >&2; cd "$REPO_ROOT"; exit 1; }
+        chmod 644 "$tmpdir/$_ed"
+        grep -qF "enrolled doc $_ed is unreadable" <<<"$_e_out" || {
+            echo "FAIL: self-test #5811 - the refusal for an unreadable enrolled input does not name $_ed" >&2; cd "$REPO_ROOT"; exit 1; }
+    fi
+    mv "$tmpdir/docs/QUICKSTART.md" "$tmpdir/docs/QUICKSTART.md.away"
+    _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) && {
+        echo "FAIL: self-test #5811 - an empty boot-banner scan set did not fail the gate" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'boot-banner scan set resolved ZERO' <<<"$_e_out" || {
+        echo "FAIL: self-test #5811 - the refusal for an empty boot-banner scan set is not named" >&2; cd "$REPO_ROOT"; exit 1; }
+    mv "$tmpdir/docs/QUICKSTART.md.away" "$tmpdir/docs/QUICKSTART.md"
+    mv "$tmpdir/src/fixture_env_5811.rs" "$tmpdir/src/fixture_env_5811.rs.away"
+    _e_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1 "$GATE_SELF" 2>&1) && {
+        echo "FAIL: self-test #5811 - an empty env-var census did not fail the gate" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'resolved ZERO AI_MEMORY_' <<<"$_e_out" || {
+        echo "FAIL: self-test #5811 - the refusal for an empty env-var census is not named" >&2; cd "$REPO_ROOT"; exit 1; }
+    mv "$tmpdir/src/fixture_env_5811.rs.away" "$tmpdir/src/fixture_env_5811.rs"
+    echo "PASS: self-test #5811 - every asi-hard surface and the AGE comparator mirror, moved away, FAILS the gate by name (enterprise-federation.env among them); a whitespace-only and an unreadable enrolled input fail by name; an empty boot-banner scan set and an empty env-var census fail by name; a knob SSOT and a tool registry with zero entries each read as one 0"
+    for _ed in "${_made[@]}"; do rm -f "$tmpdir/$_ed"; done
+    echo "PASS: self-test #5702 - a missing hand-enrolled doc FAILS the gate and names the path: one entry each of curated DOC_FILES (nhi-playbook), the widened list (USER_GUIDE, and postgres-age-guide, also on the pgvector list), the hook extras (coala-mapping) and the cert list (ENTERPRISE-FEDERATION-CERTIFICATION, also on the pgvector list); a complete enrolled set does not raise it"
+
+    # ---- #5703: an SSOT constant that cannot be read FAILS CLOSED and names the
+    # constant and its file: the file missing, the file empty, the constant renamed,
+    # and the Cargo.toml version renamed.
+    for _sf in src/storage/migrations.rs src/lib.rs src/models/memory.rs Cargo.toml; do
+        cp "$tmpdir/$_sf" "$tmpdir/$_sf.keep"
+    done
+    _c_arm() {
+        # $1 = arm label, $2 = text the refusal must carry
+        local out
+        out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
+            echo "FAIL: self-test #5703 - $1 did not fail the gate" >&2; return 1; }
+        grep -qF "$2" <<<"$out" || {
+            echo "FAIL: self-test #5703 - $1 failed without naming it ($2)" >&2; return 1; }
+    }
+    rm -f "$tmpdir/src/storage/migrations.rs"
+    _c_arm 'missing migrations.rs' 'cannot resolve SSOT constant CURRENT_SCHEMA_VERSION from src/storage/migrations.rs' \
+        || { cd "$REPO_ROOT"; exit 1; }
+    cp "$tmpdir/src/storage/migrations.rs.keep" "$tmpdir/src/storage/migrations.rs"
+    : > "$tmpdir/src/lib.rs"
+    _c_arm 'empty lib.rs' 'cannot resolve SSOT constant EXPECTED_PRODUCTION_ROUTES_COUNT from src/lib.rs' \
+        || { cd "$REPO_ROOT"; exit 1; }
+    cp "$tmpdir/src/lib.rs.keep" "$tmpdir/src/lib.rs"
+    sed 's/FIELD_COUNT/FIELD_COUNTX/' "$tmpdir/src/models/memory.rs.keep" > "$tmpdir/src/models/memory.rs"
+    _c_arm 'renamed FIELD_COUNT' 'cannot resolve SSOT constant FIELD_COUNT from src/models/memory.rs' \
+        || { cd "$REPO_ROOT"; exit 1; }
+    cp "$tmpdir/src/models/memory.rs.keep" "$tmpdir/src/models/memory.rs"
+    sed 's/^version = /versionx = /' "$tmpdir/Cargo.toml.keep" > "$tmpdir/Cargo.toml"
+    _c_arm 'renamed Cargo.toml version' 'cannot resolve SSOT constant version from Cargo.toml' \
+        || { cd "$REPO_ROOT"; exit 1; }
+    for _sf in src/storage/migrations.rs src/lib.rs src/models/memory.rs Cargo.toml; do
+        mv "$tmpdir/$_sf.keep" "$tmpdir/$_sf"
+    done
+    echo "PASS: self-test #5703 - an SSOT constant that cannot be read (migrations.rs missing, lib.rs empty, FIELD_COUNT renamed, the Cargo.toml version renamed) FAILS CLOSED and names the constant and its file"
 
     # ---- FAIL-CLOSED-ONLY-WITH-A-CLAIM: remove both SSOTs. A doc that
     # narrates NO count has nothing to validate and must stay green;

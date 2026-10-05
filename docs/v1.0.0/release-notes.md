@@ -94,7 +94,7 @@ discipline the v0.10.0 `warn-carrier` release delivered. The release also
 advances the schema **v78 → v100**. The ladder is not uniformly additive:
 v86/v87 normalize stored timestamp renderings, v97 rewrites existing
 agent-registration memory rows (take a backup before upgrading), v89 rebuilds the derived
-PostgreSQL FTS column, v92 rebuilds SQLite's `schema_version` table to add
+PostgreSQL FTS column, v92 rebuilds the SQLite `schema_version` table to add
 its bound, and v100 replaces the title-slot unique index with a partial
 index. Other additions and backfills are described per rung in
 §"Schema ladder v78 → v100"; historical migration trials attest only their

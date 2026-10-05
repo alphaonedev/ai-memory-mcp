@@ -230,8 +230,8 @@ lab_posture_ssot_check() {
 
 # #5155: true when a boot refusal in <file> names the lowered rollback-check knob.
 # One awk pass reads the whole file: no pipe (a `grep -q` reader closing early returns 141
-# under pipefail) and no here-string (bash spills a large one to a temp file under $TMPDIR,
-# /tmp when unset; #5197). Lines naming INFO are the profile's pin line, never a refusal.
+# under pipefail) and no here-string or here-document (bash spills a large one to a temp file
+# under $TMPDIR, /tmp when unset; #5197, #5259). Lines naming INFO are the profile's pin line, never a refusal.
 # The trailing colon pins the whole knob name. An unreadable file is "not detected".
 lab_probe_refusal_names_knob() {
   awk 'index($0, "INFO") == 0 && index($0, "refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:") { f = 1 }
@@ -239,10 +239,10 @@ lab_probe_refusal_names_knob() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 16 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 11
+# 17 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 12
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
-# const in a scratch src tree), five probe-matcher legs (lab_probe_refusal_names_knob against
+# const in a scratch src tree), six probe-matcher legs (lab_probe_refusal_names_knob against
 # generated logs), one structural leg (the matcher has no here-string, here-document or pipe)
 # and one layout leg (this comment sits directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
@@ -286,8 +286,11 @@ lab_posture_selftest() {
   printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK_STRICT: nope\n' > "$plog/other-knob.log"
   printf 'boot\nINFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/info-only.log"
   printf 'INFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\nfatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n' > "$plog/info-then-refusal.log"
-  awk 'BEGIN { print "fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1"
-               for (i = 0; i < 200000; i++) print "filler line to fill the pipe buffer" }' > "$plog/big.log"
+  printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\nINFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/refusal-then-info.log"
+  # The refusal is printed in END, after the filler (#5292). /dev/null is the input so END
+  # runs without reading stdin (an awk program with only an END block reads stdin).
+  awk 'END { for (i = 0; i < 200000; i++) print "filler line to fill the pipe buffer"
+             print "fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1" }' /dev/null > "$plog/big.log"
   ( lab_probe_refusal_names_knob "$plog/ok.log" ) \
     && echo "  PASS probe matcher: refusal naming the knob is detected" \
     || { echo "  FAIL probe matcher: refusal naming the knob not detected"; bad=1; }
@@ -300,6 +303,9 @@ lab_posture_selftest() {
   ( lab_probe_refusal_names_knob "$plog/info-then-refusal.log" ) \
     && echo "  PASS probe matcher: a refusal after an INFO line naming the knob is detected" \
     || { echo "  FAIL probe matcher: a refusal after an INFO line naming the knob not detected"; bad=1; }
+  ( lab_probe_refusal_names_knob "$plog/refusal-then-info.log" ) \
+    && echo "  PASS probe matcher: a refusal followed by an INFO line naming the knob is detected" \
+    || { echo "  FAIL probe matcher: a refusal followed by an INFO line naming the knob not detected"; bad=1; }
   ( set -o pipefail; lab_probe_refusal_names_knob "$plog/big.log" ) \
     && echo "  PASS probe matcher: detection in a large log survives pipefail" \
     || { echo "  FAIL probe matcher: detection in a large log lost"; bad=1; }
