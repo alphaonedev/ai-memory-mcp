@@ -27,7 +27,7 @@ RULES ENFORCED (all closed-world: a trigger the reader cannot parse is a FAILURE
          ``*name`` items are undecidable and fail.  A push trigger with no
          ``branches`` and no ``tags`` key matches every branch and counts.
   R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730-#5736,
-         #5748, #5749) the whole file is
+         #5748-#5750) the whole file is
          read closed-world by the grammar below.  A file the reader cannot read
          is a failure whatever words it holds (#5731).
 
@@ -66,7 +66,8 @@ ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
               a row between two open columns and a sequence at its key's column
               (#5730).
   block-scalar every line indented past the node that owns the header, led by
-  content     an ASCII space, none less indented than the first.
+  content     an ASCII space, none less indented than the first; no blank line
+              before the first holds more spaces than it (#5750).
   top level   mapping keys at column 0, each once (folded and unquoted); a YAML
               1.1 boolean key only as on, "on" or 'on'.
   on block    trigger keys at one indentation, each once, none a YAML 1.1
@@ -451,6 +452,7 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
     rows: List[Tuple[int, str, str]] = []
     owner: Optional[int] = None  # column of the node that owns an open block scalar
     content: Optional[int] = None  # indentation of that block scalar's first line
+    blank = 0  # spaces on its longest blank line before that first line (#5750)
     stack: List[Tuple[int, str]] = []  # open block collections (#5730)
     opened: Optional[int] = None  # column of the node above whose value is empty
     for raw in text.split("\n"):
@@ -460,11 +462,16 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
         rest = raw[ind:]
         if owner is not None:
             if not rest:
+                if content is None:
+                    blank = max(blank, ind)
                 continue
             if ind > owner:
                 if _space_like(rest[0]):
                     raise Unparsed("block scalar line starts with non-space whitespace: " + repr(raw))
                 if content is None:
+                    if blank > ind:
+                        raise Unparsed("leading blank line of a block scalar holds more spaces than its first"
+                                       " line (#5750): " + repr(raw))
                     content = ind
                 elif ind < content:
                     raise Unparsed("block scalar line less indented than its first line: " + repr(raw))
@@ -492,7 +499,7 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
             raise Unparsed("quoted mapping key below the top level (#5731): " + repr(raw))
         rows.append((ind, body, key))
         if header:
-            owner, content = ind + node, None
+            owner, content, blank = ind + node, None, 0
     return rows
 
 
@@ -1894,6 +1901,30 @@ class MergeAndValueScalars5749(unittest.TestCase):
 
     def test_5749_quoted_or_longer_forms_stay_clean(self) -> None:
         for tail in ("x: '<<'\n", "x: \"=\"\n", "x: << b\n", "x: a=b\n", "x: [==, '<<']\n", "x:\n  =: y\n"):
+            self.assertEqual([], violations("x.yml", "name: x\non:\n" + GOOD_PR + tail), tail)
+
+
+class BlockScalarLeadingBlank5750(unittest.TestCase):
+    """#5750: a leading blank line of a block scalar may not hold more spaces than its first line.
+
+    Measured at 90a3f698 (round-4 differential, seed 5665, text 2130): the refusal
+    case here was accepted there.  PyYAML 6.0.1 takes the block scalar's indentation
+    from the longest leading blank line, so a shallower first content line ends the
+    scalar and the row after it is a ParserError.
+    """
+
+    def _shape(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5750_deeper_leading_blank_line(self) -> None:
+        why = "leading blank line of a block scalar holds more spaces than its first line"
+        self._shape("name: x\non:\n" + GOOD_PR + "x: |-\n    \n  contents: read\n", why)
+        self._shape("name: x\non:\n" + GOOD_PR + "x: >\n\n     \n   a\n   b\n", why)
+
+    def test_5750_equal_or_shallower_blank_lines_stay_clean(self) -> None:
+        # PyYAML: '\nb' for the first; the blank lines after content are content.
+        for tail in ("x: |-\n    \n    b\n", "x: |\n  \n    b\n", "x: |\n  b\n      \n  c\n", "x: |-\n   \n  \nz: c\n"):
             self.assertEqual([], violations("x.yml", "name: x\non:\n" + GOOD_PR + tail), tail)
 
 
