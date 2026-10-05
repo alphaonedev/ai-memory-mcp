@@ -119,7 +119,7 @@
 #     `>` the gate cannot find) is
 #     tracked as `!unreadable line <N> (<reason>): <spelling>` with the value
 #     `?count#unreadable`. It is red in every commit that changes its file (or
-#     moves a const that file names) and cannot be declared; one that leaves
+#     moves a const that file names, #5888) and cannot be declared; one that leaves
 #     the tree is a count change `?count#unreadable -> (none)`, declared as usual.
 #   * NOT READ assert! (stated limits): a count call only on the right of every
 #     `==` (reversed operands, `18 == v.len()`, also behind `&&`; #5714); a count
@@ -425,6 +425,8 @@ def extract(text):
                 val = '?' + re.sub(r'\s+', '', rhs)         # undecidable: neither a literal nor a const (#5577)
         out.setdefault(expr, set()).add(val)
     refs = {v[1:] for vs in out.values() for v in vs if v.startswith('@')}
+    if any(k.startswith(UNREADABLE) for k in out):       # an unreadable assertion names whatever it names: every const name
+        refs |= {nm.group('name') for nm in NAMES.finditer(text)}   # of the file, so moving one re-reads it (#5888)
     return out, consts, refs
 
 
@@ -1107,6 +1109,13 @@ def selftest():
     case('#5872 an unterminated block comment is unreadable with no count call in the arguments',
          scoped('tests/scope.rs', 'fn t() { assert!(ok /* == 18); }\n', 'fn t() { assert!(ok /* == 19); }\n'), True,
          ['!unreadable line 1 (an unterminated block comment): assert!(ok/*==19);}'])
+    # ---- #5888: a file that holds an unreadable assertion names every const it mentions, so a commit that moves one of
+    # them in another file re-reads it and the unreadable finding is red; a const the file does not name moves nothing
+    UR_ = 'fn t(v: &[u8]) { assert!(v.len() == crate::%s /* x ); }\n'
+    case('#5888 an unreadable assertion is red when only a const it names moves in another file',
+         shared(UR_ % 'EXPECTED_N', L(18), L(19)), True, ['!unreadable line 1 (an unterminated block comment)'])
+    case('#5888 an unreadable assertion is not re-read when a const its file does not name moves',
+         shared(UR_ % 'OTHER_N', L(18), L(19)), False)
     # stated limits (#5715 brings a lexer): a quote or a // inside a block comment is read as the start of a string or of
     # a line comment, so such an assertion is unreadable (red with its line), never silently skipped
     case('#5872 a quote inside a block comment, with a string after it, is unreadable (#5715)',
