@@ -2035,6 +2035,7 @@ ROUND3_RED = [
     ('5684 mutant pin: reported 2: an operand after old-password or pass is a credential when it is not led by a dollar sign', 'mariadb-admin pass "x$X"'),
     ('5685 mutant pin: reported 1: an expansion inside a long option name is reported', 'mysql --$OPT db'),
     ('5689 mutant pin: reported 1: a head under a libexec directory is a command', '/usr/libexec/mysqlcheck --password="$X"'),
+    ('5737 mutant pin: reported 1: a head under a libexec directory is a command even when no other pattern tags the line', '/usr/libexec/mysqlcheck -u r "$X"'),
     ('5683 mutant pin: reported 2: the password command word of mysqladmin is matched in any letter case', 'mysqladmin PASSWORD "x$NEW"'),
 ]
 ROUND3_GREEN = [
