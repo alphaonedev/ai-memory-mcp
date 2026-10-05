@@ -865,9 +865,10 @@ def _self_test_cases() -> int:
         print(f"INFO: self-test - importlib already loaded without -S: {no_s.preloaded} (measured, not assumed)")
         return ""
 
-    # #5510/#5560/#5562/#5563: the refusal_prefix_gap pins. They are byte-level checks with no child process and no
-    # environment dependence, so each has its own function and its own PASS/FAIL line (#5591); they are not part of
-    # importlib_plant, whose banner and issue tags they would otherwise borrow.
+    # The refusal_prefix_gap pins (#5628): the refusal_pins table below lists them, and a check after the loop requires the
+    # table to equal the pin_<number> functions defined here. They start no child process (also checked after the
+    # loop). Each has its own function and its own PASS/FAIL line (#5591), separate from importlib_plant, whose banner
+    # and issue tags they would otherwise borrow.
     raw = Path(__file__).read_bytes()
     source = raw.decode("utf-8")
 
@@ -881,9 +882,9 @@ def _self_test_cases() -> int:
         return refusal, hidden, plain
 
     def pin_5510():
-        # #5510: nothing may execute above the refusal except `import sys`. The real source must pass; each synthetic
-        # source (mutant M05b and siblings: a dynamic import, an eval, an import in a branch, a class body, a decorator,
-        # a second imported name, a call inside the refusal, a weakened refusal test) must be refused.
+        # #5510/#5628: nothing may execute above the refusal except `import sys`. The real source must pass; each
+        # synthetic source below (code above the refusal, a second or aliased imported name, a changed refusal test, a
+        # call or keyword in the refusal body, an else branch) must be refused.
         if refusal_prefix_gap(raw):
             return f"the source has code above the isolation refusal: {refusal_prefix_gap(raw)} (#5510)"
         marker = "if __name__ == \"__main__\" and not sys.flags.isolated:"
@@ -978,7 +979,7 @@ def _self_test_cases() -> int:
 
     def pin_5563():
         # #5563: the refusal body may call only print and sys.exit. Each other callable, with constant arguments and
-        # followed by the valid print and sys.exit, must be refused, so the whitelist cannot grow unseen.
+        # followed by the valid print and sys.exit, must be refused: each callee listed below is shown to be outside the whitelist.
         head = 'import sys\nif __name__ == "__main__" and not sys.flags.isolated:\n'
         for callee in ("exec", "eval", "compile", "getattr", "setattr", "open", "globals", "vars", "input", "breakpoint",
                        "type", "os._exit", "sys.exit.__call__", "print.__call__"):
@@ -1180,8 +1181,21 @@ def _self_test_cases() -> int:
         raise TypeError("planted")
 
     refusal_pins = {"#5510": pin_5510, "#5560": pin_5560, "#5562": pin_5562, "#5563": pin_5563, "#5588": pin_5588, "#5589": pin_5589, "#5590": pin_5590}
-    for pin_issue, pin_check in refusal_pins.items():
-        pin_failure = run_pin(pin_issue, pin_check)
+    real_popen, popen_calls = subprocess.Popen, []
+
+    def counting_popen(*args, **kwargs):
+        popen_calls.append(args)
+        return real_popen(*args, **kwargs)
+
+    subprocess.Popen = counting_popen
+    try:
+        pin_results = {pin_issue: run_pin(pin_issue, pin_check) for pin_issue, pin_check in refusal_pins.items()}
+    finally:
+        subprocess.Popen = real_popen
+    if popen_calls or set(refusal_pins) != {"#" + n for n in re.findall(r"^    def pin_(\d+)\(", source, re.M)}:
+        failures.append("refusal pin table")
+        print(f"FAIL: self-test - the refusal_pins table is not the pin_<number> functions, or a pin started a child process ({len(popen_calls)}) (#5628)", file=sys.stderr)
+    for pin_issue, pin_failure in pin_results.items():
         if not pin_failure:
             print(f"PASS: self-test - the refusal_prefix_gap pin {pin_issue} is green")
         else:
