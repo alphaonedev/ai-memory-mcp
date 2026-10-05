@@ -3278,7 +3278,9 @@ def _git_funnel_cases(t: Path) -> Tuple[List[str], int]:
             bad.append("a repo-local %s ran during the gate's git reads of a signed history (#5822)" % key)
     # the verifier pins are visible to git itself: a config read through the funnel names them (#5822)
     n += 1
-    for key, want in (("log.showsignature", "false"),) + tuple((k, os.devnull) for k in GIT_VERIFIER_KEYS):
+    # the verifier keys are named here, not taken from GIT_VERIFIER_KEYS, so a key dropped there is seen (#5870)
+    verifiers = ("gpg.program", "gpg.openpgp.program", "gpg.x509.program", "gpg.ssh.program")
+    for key, want in (("log.showsignature", "false"),) + tuple((k, os.devnull) for k in verifiers):
         try:
             got = _git_exec(repo, ["config", "--get", key]).stdout.decode("utf-8", "replace").strip()
         except subprocess.CalledProcessError:
