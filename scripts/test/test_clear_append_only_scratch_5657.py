@@ -1165,6 +1165,40 @@ class ScratchTreeCase(ScratchTree):
         self.assertFalse([l for l in lines if "\x1b" in l], "a control character reached the report")
         self.assertNotEqual(rc, 0, out + err)
 
+    def test_every_character_that_hides_or_reorders_a_name_is_escaped_6037(self):
+        """#6037. LF and ESC are not the only characters that make a report
+        line lie: CR and BS overwrite it, the bidi controls reorder it, a
+        zero-width character hides in it, and a name holding the literal text
+        `\\x0a` printed exactly as a real newline does. A workflow command also
+        decodes `%0A` in its data. Each is shown as a visible escape, the
+        backslash is doubled, and `%` is `%25` on a command line."""
+        mod = load_script_module()
+        stream = io.StringIO()
+        table = [("\r", "\\x0d"), ("\b", "\\x08"), ("\t", "\\x09"), ("\x7f", "\\x7f"),
+                 ("\x9b", "\\x9b"), ("\x85", "\\x85"), (" ", "\\u2028"), (" ", "\\u2029"),
+                 ("‮", "\\u202e"), ("؜", "\\u061c"), ("​", "\\u200b"),
+                 ("﻿", "\\ufeff"), ("\\", "\\\\")]
+        for raw, shown in table:
+            got = mod._shown("a%sb" % raw, stream)
+            self.assertEqual(got, "a%sb" % shown, "%r is shown as %r" % (raw, got))
+        self.assertNotEqual(mod._shown("a\nb", stream), mod._shown("a\\x0ab", stream),
+                            "a newline and the text of its escape print the same")
+        line = io.StringIO()
+        mod._say("::error::x%0A::warning::forged", line, command=True)
+        self.assertEqual(line.getvalue(), "::error::x%250A::warning::forged\n")
+        line = io.StringIO()
+        mod._say("50% done", line)
+        self.assertEqual(line.getvalue(), "50% done\n", "a line that is not a command was changed")
+        # And through the real report: a name the runner would show reversed.
+        entry = self.audit / "x‮gol%0A.txt"
+        entry.write_text("{}\n")
+        with restrictive(entry, 0o000):
+            with foreign_euid(mod):
+                rc, out, err = run_clear_in_process(mod, self.ws)
+        self.assertNotIn("‮", out + err, "a bidi control reached the report")
+        self.assertIn("x\\u202egol%250A.txt", err, out + err)
+        self.assertNotEqual(rc, 0, out + err)
+
 # --------------------------------------------------------------------------
 # the pending-restore journal: one line per outstanding widen (#6006, #6013,
 # #6015, #6020) and the input it must refuse (#6016, #6018, #6019)
@@ -1492,9 +1526,10 @@ class JournalCase(ScratchTree):
     def test_a_torn_journal_tail_is_cut_off_and_the_walk_proceeds_6026(self):
         """#6026. Every line is fsynced before the chmod it describes, so a
         trailing line that never became whole describes a chmod that was never
-        made. Cutting it off loses nothing; keeping it refused every widen of
-        every later run, for good. The run that finds it says so, and the run
-        after it is clean."""
+        made, and keeping it refused every widen of every later run, for good.
+        The cut is safe only because the run that makes it holds the journal's
+        lock (#6034): a line another run appended meanwhile would be cut with
+        it. The run that finds it says so, and the run after it is clean."""
         d = self.scratch / ".tmpT"
         d.mkdir()
         (d / "x.log").write_text("{}\n")
@@ -1583,6 +1618,250 @@ class JournalCase(ScratchTree):
         tallies = [l for l in lines if re.fullmatch(r"clear-append-only-scratch: \d+ cleared, \d+ failed", l)]
         self.assertEqual(len(tallies), 1, "the run's tally was forged:\n" + r.stdout + r.stderr)
         self.assertEqual(len([l for l in lines if "gone" in l]), 1, r.stdout + r.stderr)
+
+
+    def test_a_journal_another_run_holds_is_neither_cut_nor_written_6032(self):
+        """#6032 and #6034. Two runs on one scratch tree that both read and
+        rewrite the journal can each delete a line the other fsynced. A run
+        that finds the journal locked by another run does not read it, cut it
+        or append to it: it refuses every widen it would record - the
+        precedent a journal it cannot trust already sets - and says why."""
+        d = self.scratch / ".tmpL"
+        d.mkdir()
+        (d / "x.log").write_text("{}\n")
+        torn = b"+ 0123abcd.1 1 2 0 4"
+        fd = os.open(str(self.journal()), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, torn)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with restrictive(d, 0o000):
+                r = run_clear(self.ws)
+                self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o000, r.stdout + r.stderr)
+                self.assertEqual(self.journal().read_bytes(), torn,
+                                 "a run that does not own the journal changed it:\n" + r.stdout + r.stderr)
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("held by another run", r.stderr, r.stdout + r.stderr)
+                self.assertIn(str(d), r.stderr, "the widen it refused is not reported:\n" + r.stdout + r.stderr)
+        finally:
+            os.close(fd)
+        again = run_clear(self.ws)
+        self.assertNotIn(torn, self.journal().read_bytes(),
+                         "once the lock is free the torn tail is the next run's to cut:\n"
+                         + again.stdout + again.stderr)
+
+    def test_a_line_another_run_appends_is_never_cut_with_a_torn_tail_6034(self):
+        """#6034. A run that finds a torn tail cuts the file at a length it
+        read. A second run that appends and fsyncs a whole line of its own in
+        between would lose that line to the cut - and its widen would then be
+        left applied with no record. The second run is made to append at
+        exactly that instant: it must be refused, or find its line intact."""
+        mod = load_script_module()
+        top = str(self.scratch)
+        target = self.scratch / ".tmpR"
+        target.mkdir()
+        torn = b"+ 0123abcd.1 1 2 0 4"
+        fd = os.open(str(self.journal()), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, torn)
+        finally:
+            os.close(fd)
+        first, second = mod.Journal(top), mod.Journal(top)
+        real, race = os.pread, {}
+
+        def pread(fd, size, offset):
+            chunk = real(fd, size, offset)
+            if not chunk and not race:
+                race["reached"] = True
+                try:
+                    race["ident"] = second.hold(str(target), os.lstat(str(target)), 0o400, 0o500)
+                except OSError as err:
+                    race["refused"] = err
+            return chunk
+
+        try:
+            with mock.patch.object(mod.os, "pread", pread):
+                with contextlib.suppress(OSError):
+                    first.load()
+        finally:
+            for journal in (first, second):
+                if journal._fd is not None:
+                    os.close(journal._fd)
+                    journal._fd = None
+        self.assertTrue(race, "the second run never got to append while the first one was reading")
+        if "ident" in race:
+            self.assertIn(("+ %s " % race["ident"]).encode("ascii"), self.journal().read_bytes(),
+                          "the torn-tail cut deleted a line another run had fsynced")
+        else:
+            self.assertIn("refused", race, race)
+
+    def test_a_link_made_inside_the_replay_is_put_back_and_kept_6033(self):
+        """#6033, the replay's own window. The replay refuses an inode with a
+        second name, but reads the link count before its `fchmod`; a name made
+        in between gets the recorded mode too. The count is read again after
+        the change: the mode the inode carried goes back, the line is kept and
+        the run fails, naming the links."""
+        mod = load_script_module()
+        f = self.audit / "replayed-6033.log"
+        f.write_text("{}\n")
+        outside = self.ws / "outside-6033.log"
+        with restrictive(f, 0o000):
+            out = self.kill_at("chmod", 1, 0, f)
+            self.assertIn("replayed-6033.log=0o400", out, "the widen had not landed when the kill did")
+            ino = os.lstat(f).st_ino
+            real, fired = os.fchmod, []
+
+            def fchmod(fd, mode):
+                if not fired and os.fstat(fd).st_ino == ino:
+                    fired.append(mode)
+                    os.link(str(f), str(outside))
+                return real(fd, mode)
+
+            try:
+                with mock.patch.object(mod.os, "fchmod", fchmod):
+                    rc, o, e = run_clear_in_process(mod, self.ws)
+                self.assertEqual(fired, [0o000], "the replay never reached its fchmod:\n" + o + e)
+                self.assertEqual(stat.S_IMODE(os.lstat(outside).st_mode), 0o400,
+                                 "the replay left the recorded mode on an inode with a name outside the "
+                                 "scratch tree:\n" + o + e)
+                self.assertNotIn("put mode", o, o + e)
+                self.assertNotEqual(rc, 0, "a refused replay is not a pass:\n" + o + e)
+                self.assertIn("2 links", e, o + e)
+                self.assertEqual(self.outstanding(), [(ino, 0o000, 0o400)],
+                                 "the record of a widen that is still applied was dropped:\n" + o + e)
+            finally:
+                if os.path.lexists(str(outside)):
+                    os.unlink(str(outside))
+
+    def test_released_lines_do_not_pile_up_behind_one_kept_line_6031(self):
+        """#6031. A line no run can resolve - here a mode changed since the
+        kill (#6014) - keeps the journal from being emptied. Every later run's
+        released `+`/`-` pairs used to stay behind it until the file passed its
+        size limit and refused every widen. A run that cannot empty the
+        journal drops the pairs it can prove released, and keeps the rest."""
+        d = self.scratch / ".tmpK"
+        d.mkdir()
+        e = self.scratch / ".tmpW"
+        e.mkdir()
+        (e / "x.log").write_text("{}\n")
+        st = os.lstat(d)
+        kept = ("+ 0123abcd.1 %d %d 400 500 %s\n" % (st.st_dev, st.st_ino, os.fsencode(".tmpK").hex())).encode()
+        fd = os.open(str(self.journal()), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, kept)
+        finally:
+            os.close(fd)
+        # A rewrite a kill interrupted leaves its sibling behind, longer than
+        # what the next rewrite writes: it is emptied before it is reused.
+        stale = os.open(str(self.journal()) + ".compact", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(stale, b"- stale.1\n" * 64)
+        finally:
+            os.close(stale)
+        with restrictive(e, 0o400):
+            for attempt in (1, 2, 3):
+                r = run_clear(self.ws)
+                self.assertNotEqual(r.returncode, 0, "run %d: a kept line is not a pass:\n%s%s"
+                                    % (attempt, r.stdout, r.stderr))
+                self.assertEqual(self.journal().read_bytes(), kept,
+                                 "run %d left released lines behind the kept one:\n%s%s"
+                                 % (attempt, r.stdout, r.stderr))
+                self.assertFalse(os.path.lexists(str(self.journal()) + ".compact"),
+                                 "run %d left its rewrite behind" % attempt)
+
+
+    def test_a_journal_replaced_while_it_is_opened_is_refused_not_written_6032(self):
+        """#6032. A run that rewrites the journal puts a new inode at its name.
+        A run that opened the name just before that would lock the OLD inode -
+        a lock that excludes nobody - and fsync its lines into a file no later
+        run reads. Once the lock is held the name is read again, and a journal
+        replaced meanwhile is refused."""
+        mod = load_script_module()
+        top = str(self.scratch)
+        target = self.scratch / ".tmpQ"
+        target.mkdir()
+        journal = self.journal()
+        os.close(os.open(str(journal), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        fresh = str(journal) + ".fresh"
+        real, fired, race = fcntl.flock, [], {}
+
+        def flock(fd, op):
+            if not fired:
+                fired.append(op)
+                os.close(os.open(fresh, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+                os.replace(fresh, str(journal))
+            return real(fd, op)
+
+        run = mod.Journal(top)
+        try:
+            with mock.patch.object(fcntl, "flock", flock):
+                try:
+                    race["ident"] = run.hold(str(target), os.lstat(str(target)), 0o400, 0o500)
+                except OSError as err:
+                    race["refused"] = err
+        finally:
+            if run._fd is not None:
+                os.close(run._fd)
+                run._fd = None
+        self.assertTrue(fired, "the journal was never locked")
+        if "ident" in race:
+            self.assertIn(("+ %s " % race["ident"]).encode("ascii"), journal.read_bytes(),
+                          "a line was fsynced into a journal no later run reads")
+        else:
+            self.assertIn("replaced", str(race["refused"]), race)
+
+    def test_a_rewrite_never_writes_through_a_planted_sibling_6031(self):
+        """#6031. The rewrite goes to a sibling name first. A name planted
+        there - a second link to a file outside the scratch tree - is refused
+        like a journal that cannot be trusted: it is never truncated or
+        written through, the run says so and the journal keeps its line."""
+        d = self.scratch / ".tmpK"
+        d.mkdir()
+        e = self.scratch / ".tmpW"
+        e.mkdir()
+        (e / "x.log").write_text("{}\n")
+        st = os.lstat(d)
+        kept = ("+ 0123abcd.1 %d %d 400 500 %s\n" % (st.st_dev, st.st_ino, os.fsencode(".tmpK").hex())).encode()
+        fd = os.open(str(self.journal()), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, kept)
+        finally:
+            os.close(fd)
+        outside = self.ws / "outside-6031.txt"
+        outside.write_bytes(b"not the journal's\n")
+        os.chmod(str(outside), 0o600)
+        os.link(str(outside), str(self.journal()) + ".compact")
+        with restrictive(e, 0o400):
+            r = run_clear(self.ws)
+        self.assertEqual(outside.read_bytes(), b"not the journal's\n",
+                         "the rewrite wrote through a name it did not create:\n" + r.stdout + r.stderr)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(self.journal().read_bytes().startswith(kept), r.stdout + r.stderr)
+        self.assertIn("rewrite", r.stderr, r.stdout + r.stderr)
+
+
+    def test_a_rewrite_keeps_every_line_the_replay_reports_6031(self):
+        """#6031. The rewrite drops only `+`/`-` pairs it can prove released.
+        A line the replay cannot use - here a release of an entry no line
+        holds - is reported, not resolved: it is kept byte for byte, and the
+        run's own released pairs are dropped around it."""
+        e = self.scratch / ".tmpW"
+        e.mkdir()
+        (e / "x.log").write_text("{}\n")
+        stray = b"- 0123abcd.9\n"
+        fd = os.open(str(self.journal()), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, stray)
+        finally:
+            os.close(fd)
+        with restrictive(e, 0o400):
+            for attempt in (1, 2):
+                r = run_clear(self.ws)
+                self.assertNotEqual(r.returncode, 0, "run %d: a line the replay cannot use is not a "
+                                                     "pass:\n%s%s" % (attempt, r.stdout, r.stderr))
+                self.assertIn("releases an entry no earlier line holds", r.stderr, r.stdout + r.stderr)
+                self.assertEqual(self.journal().read_bytes(), stray,
+                                 "run %d did not keep exactly the line it reported:\n%s%s"
+                                 % (attempt, r.stdout, r.stderr))
 
 
 class WidenFailureCase(ScratchTree):
@@ -2076,6 +2355,173 @@ class WidenFailureCase(ScratchTree):
                 held.pop(fields[1], None)
         self.assertEqual(held, {}, "a widen that never landed is still outstanding:\n" + out + err)
 
+    def test_a_widen_that_lands_and_then_errors_is_put_back_6035(self):
+        """#6035. A filesystem may apply a chmod and then report an error (a
+        soft NFS mount, a FUSE server). A chmod that raised is not proof that
+        nothing changed: the mode is read back, and a widen that landed is put
+        back and reported - never released as a widen that was never made."""
+        mod = load_script_module()
+        entry = self.audit / "landed-6035.log"
+        entry.write_text("{}\n")
+        journal = self.scratch / mod.PENDING_RESTORE_FILE
+        real, calls = os.chmod, []
+
+        def chmod(path, mode, *args, **kwargs):
+            real(path, mode, *args, **kwargs)
+            if kwargs.get("dir_fd") is not None or str(path).startswith(mod.FD_DIR + "/"):
+                calls.append(mode)
+                if len(calls) == 1:
+                    raise OSError(errno.EIO, "Input/output error (injected after the change, #6035)")
+
+        with restrictive(entry, 0o000):
+            with mock.patch.object(mod.os, "chmod", chmod):
+                rc, out, err = run_clear_in_process(mod, self.ws)
+            self.assertEqual(calls[:1], [0o400], "the widen was never reached: %r\n%s%s" % (calls, out, err))
+            self.assertEqual(stat.S_IMODE(os.lstat(entry).st_mode), 0o000,
+                             "a widen that landed before its error was left applied:\n" + out + err)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn(str(entry), err, out + err)
+        held = {}
+        for line in (journal.read_bytes().decode("ascii").splitlines() if journal.exists() else ()):
+            fields = line.split(" ")
+            if fields[0] == "+":
+                held[fields[1]] = line
+            elif fields[0] == "-":
+                held.pop(fields[1], None)
+        self.assertEqual(held, {}, "a widen that was put back is still outstanding:\n" + out + err)
+
+    def test_an_interrupt_inside_the_widen_chmod_puts_the_mode_back_6036(self):
+        """#6036. A `KeyboardInterrupt` raised as the widen's chmod returns is
+        not an `OSError`, so nothing reads the mode back: the widen must count
+        as possibly landed from the instant the chmod is issued, or the frame
+        releases its line with the mode still applied and nothing left to say
+        so. Each platform's widen route is pinned on its own leg."""
+        mod = load_script_module()
+        entry = self.audit / "interrupted-6036.log"
+        entry.write_text("{}\n")
+        real, calls = os.chmod, []
+
+        def chmod(path, mode, *args, **kwargs):
+            real(path, mode, *args, **kwargs)
+            if kwargs.get("dir_fd") is not None or str(path).startswith(mod.FD_DIR + "/"):
+                calls.append(mode)
+                if len(calls) == 1:
+                    raise KeyboardInterrupt
+
+        with restrictive(entry, 0o000):
+            with mock.patch.object(mod.os, "chmod", chmod):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_clear_in_process(mod, self.ws)
+            self.assertEqual(calls[:1], [0o400], "the widen was never reached: %r" % calls)
+            self.assertEqual(stat.S_IMODE(os.lstat(entry).st_mode), 0o000,
+                             "an interrupted widen was left applied")
+
+    @unittest.skipUnless(hasattr(os, "O_PATH"), "Linux: the widen goes through the pinned inode")
+    def test_a_link_made_inside_the_pinned_widen_is_refused_and_put_back_6029(self):
+        """#6029. The pin's link count is read once, before the widen; a second
+        name made while the chmod lands carries the widened mode too. The count
+        is read again off the pin after the chmod: the found mode goes back by
+        the same route and the shared inode is refused and reported."""
+        mod = load_script_module()
+        entry = self.audit / "pinned-6029.log"
+        entry.write_text("{}\n")
+        outside = self.ws / "outside-6029.log"
+        real, fired = os.chmod, []
+
+        def chmod(path, mode, *args, **kwargs):
+            real(path, mode, *args, **kwargs)
+            if str(path).startswith(mod.FD_DIR + "/") and not fired:
+                fired.append(mode)
+                os.link(str(entry), str(outside))
+
+        try:
+            with restrictive(entry, 0o000):
+                with mock.patch.object(mod.os, "chmod", chmod):
+                    rc, out, err = run_clear_in_process(mod, self.ws)
+                self.assertEqual(fired, [0o400], "the widen was never reached:\n" + out + err)
+                self.assertEqual(stat.S_IMODE(os.lstat(outside).st_mode), 0o000,
+                                 "the widen was left on an inode with a name outside the scratch tree:\n"
+                                 + out + err)
+        finally:
+            if os.path.lexists(str(outside)):
+                os.unlink(str(outside))
+        self.assertNotEqual(rc, 0, "a shared inode is not a pass:\n" + out + err)
+        self.assertIn("2 links", err, out + err)
+        self.assertIn(str(entry), err, out + err)
+
+    @unittest.skipIf(hasattr(os, "O_PATH") or not IS_BSD, "macOS/BSD: the widen goes through the name")
+    def test_a_link_made_inside_the_named_widen_is_refused_not_called_a_replacement_6030(self):
+        """#6030. Without a pin, a second name made while the chmod lands was
+        reported as the entry being REPLACED, with the mode left applied. The
+        name still leads to the scanned inode, so it is a link: the found mode
+        goes back by the same no-follow name and the shared inode is refused."""
+        mod = load_script_module()
+        entry = self.audit / "named-6030.log"
+        entry.write_text("{}\n")
+        outside = self.ws / "outside-6030.log"
+        real, fired = os.chmod, []
+
+        def chmod(path, mode, *args, **kwargs):
+            real(path, mode, *args, **kwargs)
+            if kwargs.get("dir_fd") is not None and not fired:
+                fired.append(mode)
+                os.link(str(entry), str(outside))
+
+        try:
+            with restrictive(entry, 0o000):
+                with mock.patch.object(mod.os, "chmod", chmod):
+                    rc, out, err = run_clear_in_process(mod, self.ws)
+                self.assertEqual(fired, [0o400], "the widen was never reached:\n" + out + err)
+                self.assertEqual(stat.S_IMODE(os.lstat(outside).st_mode), 0o000,
+                                 "the widen was left on an inode with a name outside the scratch tree:\n"
+                                 + out + err)
+        finally:
+            if os.path.lexists(str(outside)):
+                os.unlink(str(outside))
+        self.assertNotEqual(rc, 0, "a shared inode is not a pass:\n" + out + err)
+        self.assertIn("2 links", err, out + err)
+        self.assertNotIn("replaced", err, out + err)
+
+    def test_a_widen_refused_for_a_new_link_has_already_put_the_mode_back_6029_6030(self):
+        """#6029, #6030. The refusal of a widen that landed on an inode which
+        gained a second name is raised only after the found mode is back on
+        it, by the widen's own route, and with the widen recorded as undone:
+        the class does not lean on its caller to undo what it refuses."""
+        mod = load_script_module()
+        if not (mod.HAS_O_PATH or mod.CAN_CHMOD_NOFOLLOW):
+            self.skipTest("no inode-bound or no-follow chmod here: nothing is widened")
+        entry = self.audit / "unit-6029.log"
+        entry.write_text("{}\n")
+        outside = self.ws / "outside-unit-6029.log"
+        real, fired = os.chmod, []
+
+        def chmod(path, mode, *args, **kwargs):
+            real(path, mode, *args, **kwargs)
+            if not fired:
+                fired.append(mode)
+                os.link(str(entry), str(outside))
+
+        dirfd = os.open(str(self.audit), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with restrictive(entry, 0o000):
+                widener = mod.Widener(dirfd, entry.name, os.lstat(str(entry)), False)
+                try:
+                    with mock.patch.object(mod.os, "chmod", chmod):
+                        with self.assertRaises(OSError) as refused:
+                            widener.chmod(0o400)
+                    self.assertEqual(fired, [0o400], "the widen was never reached")
+                    self.assertEqual(stat.S_IMODE(os.lstat(str(outside)).st_mode), 0o000,
+                                     "the refusal left the widen for its caller to undo")
+                    self.assertFalse(widener.may_have_landed,
+                                     "a widen read back as undone is still recorded as landed")
+                    self.assertIn("2 links", str(refused.exception))
+                finally:
+                    widener.close()
+        finally:
+            os.close(dirfd)
+            if os.path.lexists(str(outside)):
+                os.unlink(str(outside))
+
     @unittest.skipIf(IS_BSD, "Linux: macOS/BSD refuses this case up front from the lstat (#6022)")
     def test_a_chattr_append_only_file_behind_mode_0o000_is_reported_once_with_its_remedy_6023(self):
         """#6023. Linux refuses a mode change on an append-only inode, and the
@@ -2191,6 +2637,19 @@ class StructuralPinCase(unittest.TestCase):
 
     def setUp(self):
         self.tree = ast.parse(SCRIPT.read_text())
+
+    def test_the_journal_rewrite_is_durable_before_and_after_the_rename_6031(self):
+        """#6031. A kill or a power cut must leave the old journal or the new
+        one, never a part of either: the rewrite is fsynced before it is
+        renamed over the journal, and the directory after. No test short of a
+        power cut sees a missing fsync, so the order is pinned by shape."""
+        tree = ast.parse(SCRIPT.read_text())
+        fn = _named_method(tree, "Journal", "_compact")
+        self.assertIsNotNone(fn, "Journal._compact is gone")
+        calls = sorted((c.lineno, c.col_offset, ast.unparse(c.func)) for c in ast.walk(fn)
+                       if isinstance(c, ast.Call))
+        order = [name for _l, _c, name in calls if name in ("os.fsync", "os.replace")]
+        self.assertEqual(order, ["os.fsync", "os.replace", "os.fsync"], order)
 
     def test_the_macos_step_comment_says_the_janitor_puts_widened_modes_back_6001(self):
         """The comment on the macOS self-test step is read by whoever debugs
@@ -3050,6 +3509,47 @@ class WorkflowPinCase(unittest.TestCase):
                                    "ci.yml/%s runs the suite before checkout" % job_id)
                 found.append((job_id, leg.get("leg")))
         self.assertTrue(found, "no self-hosted macOS leg in ci.yml runs %s" % SELFTEST_REL)
+
+    def test_the_fork_pr_refusal_runs_before_every_self_hosted_checkout_6038(self):
+        """#6038. The refusal is the step that keeps a fork pull request's tree
+        off the self-hosted nodes, and the checkout after it is unconditional.
+        A refusal skipped on a docs-only change let exactly that tree through.
+        Evaluated, not grepped: on every self-hosted leg of every job that
+        checks out, the refusal comes first and fires for a fork, docs-only or
+        not, and stays quiet for a branch of this repository."""
+        upstream, fork = "alphaonedev/ai-memory-mcp", "someone/ai-memory-mcp"
+        doc = load_workflow(WF_DIR / "ci.yml")
+        evaluated = 0
+        for job_id, job in (doc.get("jobs") or {}).items():
+            if not isinstance(job, dict) or "self-hosted" not in job_runner_labels(job):
+                continue
+            steps = job.get("steps") or []
+            checkout_at = step_index(steps, is_checkout)
+            if checkout_at is None:
+                continue
+            refusal_at = step_index(steps, lambda s: str(s.get("name") or "").startswith("Fork-PR refusal"))
+            self.assertIsNotNone(refusal_at, "ci.yml/%s checks out on a self-hosted leg with no Fork-PR "
+                                 "refusal" % job_id)
+            self.assertLess(refusal_at, checkout_at, "ci.yml/%s refuses a fork only after checking it out"
+                            % job_id)
+            condition = str(steps[refusal_at].get("if"))
+            for leg in matrix_legs(job):
+                labels = set()
+                for value in leg.values():
+                    labels.update(_as_labels(value))
+                if "self-hosted" not in labels:
+                    continue
+                for docs_only in ("true", "false"):
+                    for head, want in ((fork, True), (upstream, False)):
+                        ctx = leg_context(leg, docs_only)
+                        ctx["github.event.pull_request.head.repo.full_name"] = head
+                        ctx["github.repository"] = upstream
+                        got = gh_truthy(GhExpr(condition, ctx).evaluate())
+                        evaluated += 1
+                        self.assertEqual(got, want, "ci.yml/%s leg %r, docs_only=%r, head %s: the refusal "
+                                         "%s" % (job_id, leg, docs_only, head,
+                                                 "is skipped" if want else "fires"))
+        self.assertGreater(evaluated, 0, "no self-hosted leg was evaluated, so this asserted nothing")
 
     def test_live_audit_flag_is_still_set_5657(self):
         src = (ROOT / "src" / "audit.rs").read_text()

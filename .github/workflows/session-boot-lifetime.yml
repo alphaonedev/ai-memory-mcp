@@ -224,6 +224,7 @@ jobs:
           import stat
           import struct
           import sys
+          import unicodedata
 
           SCRATCH_DIR = ".local-runs"
           IS_BSD = hasattr(os, "lchflags")
@@ -376,13 +377,30 @@ jobs:
                                                       "tree; its mode is not %s" % (st.st_nlink, change))
 
 
-          # Every C0 and C1 control character, DEL and the two Unicode line separators,
-          # each as a visible escape. A name may hold any of them, and a report line is
-          # read by the runner: a newline would start a line of its own - a workflow
-          # command, a forged tally - and an escape sequence would rewrite what the log
-          # shows (#6027).
-          _UNPRINTABLE = dict((code, "\\x%02x" % code) for code in list(range(0x20)) + list(range(0x7f, 0xa0)))
-          _UNPRINTABLE.update({0x2028: "\\u2028", 0x2029: "\\u2029"})
+          class _Unprintable(dict):
+              """The `str.translate` table for a report line, filled as code points are met.
+
+              Every control character (C0, DEL, C1), every format character - the bidi
+              controls such as U+202E and U+061C, U+200B, U+FEFF - and the two Unicode
+              line separators are shown as a visible escape. A name may hold any of them,
+              and a report line is read by the runner and by a person: a newline would
+              start a line of its own - a workflow command, a forged tally - an escape
+              sequence would rewrite what the log shows, and a format character would
+              reorder or hide what a path reads as (#6027, #6037). The backslash itself
+              is shown doubled, so no name can print the same as another name's escape."""
+
+              def __missing__(self, code):
+                  if code == 0x5C:
+                      shown = "\\\\"
+                  elif unicodedata.category(chr(code)) in ("Cc", "Cf", "Zl", "Zp"):
+                      shown = ("\\x%02x" if code < 0x100 else "\\u%04x" if code < 0x10000 else "\\U%08x") % code
+                  else:
+                      shown = chr(code)
+                  self[code] = shown
+                  return shown
+
+
+          _UNPRINTABLE = _Unprintable()
 
 
           def _shown(text, stream):
@@ -441,9 +459,12 @@ jobs:
                   self._st = st
                   self._want_dir = want_dir
                   self._fd = None
-                  # True from the instant a chmod is issued until it is known to have
-                  # failed. A chmod that raised did not happen, so a widen that fails
-                  # with this False left the mode exactly as the walk found it (#6023).
+                  self._found = stat.S_IMODE(st.st_mode)
+                  # True from the instant a chmod is issued until the inode is READ to
+                  # carry the mode the walk found. A chmod that raised is not proof that
+                  # nothing changed: a filesystem may apply the change and then report an
+                  # error (a soft NFS mount, a FUSE server), so the mode is read back
+                  # before a widen is treated as never made (#6023, #6035).
                   self.may_have_landed = False
                   if HAS_O_PATH:
                       if not os.path.isdir(FD_DIR):
@@ -484,9 +505,41 @@ jobs:
                   swap that lands inside it (#5852). A failure of the lookup itself is
                   left to propagate as what it is - an entry that went away is not an
                   entry that was replaced."""
+                  now = self._same_inode()
+                  _refuse_a_shared_file(now)
+
+              def _same_inode(self):
+                  """The `lstat` of the NAME, refused unless it is the scanned inode."""
                   now = os.lstat(self._name, dir_fd=self._dirfd)
                   if (now.st_dev, now.st_ino) != (self._st.st_dev, self._st.st_ino):
                       raise OSError(errno.EIO, "the entry no longer resolves to the inode that was scanned")
+                  return now
+
+              def _still_found(self):
+                  """True only when the inode is READ to carry the mode the walk found -
+                  off the pin on Linux, off the name inside the identity check
+                  elsewhere. A read that fails, or a name that resolves to another
+                  inode, proves nothing, so it answers False (#6035)."""
+                  try:
+                      now = os.fstat(self._fd) if self._fd is not None else self._same_inode()
+                  except OSError:
+                      return False
+                  return stat.S_IMODE(now.st_mode) == self._found
+
+              def _gained_a_link(self, now, mode, put_back):
+                  """Refuse a widen that landed on an inode which gained a second name
+                  meanwhile: the mode the walk found goes back first, by the same route,
+                  so the widen this class refuses is never left applied (#6029, #6030).
+                  Putting the found mode back is not refused this way - it is the remedy."""
+                  if mode == self._found or not (stat.S_ISREG(now.st_mode) and now.st_nlink > 1):
+                      return
+                  try:
+                      put_back()
+                  except OSError as err:
+                      raise OSError(errno.EIO, "gained a second link while its mode was being set to 0o%03o, "
+                                               "and putting back the 0o%03o the walk found failed: %s"
+                                               % (mode, self._found, err))
+                  self.may_have_landed = not self._still_found()
                   _refuse_a_shared_file(now)
 
               def chmod(self, mode):
@@ -506,10 +559,10 @@ jobs:
                           self.may_have_landed = False
                           raise OSError(errno.EPERM, "no way to widen a mode here without re-resolving the name")
                       except OSError:
-                          self.may_have_landed = False
+                          self.may_have_landed = not self._still_found()
                           raise
                       try:
-                          self._identity()
+                          now = self._same_inode()
                       except OSError as err:
                           # After: the mode landed on the inode that was scanned, and the
                           # name it was reached by now belongs to something else. This
@@ -519,12 +572,17 @@ jobs:
                                                    "0o%03o, so that mode landed on the inode that was scanned "
                                                    "and is left applied: it can only be reached by the name it "
                                                    "no longer has (%s)" % (mode, err))
+                      # The name is still the scanned inode, so a second link made inside
+                      # the bracket is reported as the link it is - not as a replacement -
+                      # and the found mode goes back by the same no-follow name (#6030).
+                      self._gained_a_link(now, mode, lambda: os.chmod(self._name, self._found, dir_fd=self._dirfd,
+                                                                      follow_symlinks=False))
                   else:
                       self.may_have_landed = True
                       try:
                           os.chmod("%s/%d" % (FD_DIR, self._fd), mode)
                       except OSError as err:
-                          self.may_have_landed = False
+                          self.may_have_landed = not self._still_found()
                           # Never `FileNotFoundError` out of here. The caller reads that
                           # as "the entry went away" and returns WITHOUT reporting
                           # anything, so a procfs that is missing or refusing would print
@@ -541,10 +599,14 @@ jobs:
                                         "run this again")
                           raise OSError(errno.EPERM, "could not set mode 0o%03o on the pinned inode "
                                                      "through %s: %s%s" % (mode, FD_DIR, err, remedy))
-                      landed = stat.S_IMODE(os.fstat(self._fd).st_mode)
+                      pinned = os.fstat(self._fd)
+                      landed = stat.S_IMODE(pinned.st_mode)
                       if landed != mode:
                           raise OSError(errno.EPERM, "mode 0o%03o did not take on the pinned inode, "
                                                      "which reads 0o%03o" % (mode, landed))
+                      # The pin's link count was read once, before the widen; a second
+                      # name made since then would carry the widened mode too (#6029).
+                      self._gained_a_link(pinned, mode, lambda: os.chmod("%s/%d" % (FD_DIR, self._fd), self._found))
 
               def close(self):
                   if self._fd is not None:
@@ -672,7 +734,14 @@ jobs:
               It is trusted only as far as its own inode can be: a regular file with ONE
               link, owned by this process's euid and writable by nobody else. Anything
               else is refused before a byte of it is read or written (#6018, #6019), and
-              a widen whose line cannot be written is refused with it."""
+              a widen whose line cannot be written is refused with it.
+
+              One run at a time owns it. An exclusive `flock` is taken on it before a
+              byte of it is read - and on the path that creates it - and held until the
+              run lets it go. A run that cannot take it does not read, cut or write the
+              journal and refuses every widen it would have recorded, exactly as for a
+              journal it cannot trust (#6032, #6034): two runs reading and rewriting one
+              journal can each delete a line the other fsynced."""
 
               def __init__(self, top):
                   self.top = top
@@ -690,23 +759,76 @@ jobs:
                   flags = _OPEN_FLAGS | os.O_RDWR | os.O_APPEND | (os.O_CREAT if create else 0)
                   fd = os.open(self.path, flags, stat.S_IRUSR | stat.S_IWUSR)
                   try:
-                      st = os.fstat(fd)
-                      why = None
-                      if not stat.S_ISREG(st.st_mode):
-                          why = "is not a regular file"
-                      elif st.st_nlink != 1:
-                          why = "has %d links, so its inode may also live outside the scratch tree" % st.st_nlink
-                      elif st.st_uid != os.geteuid():
-                          why = "is owned by uid %d, not by this process (euid %d)" % (st.st_uid, os.geteuid())
-                      elif st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-                          why = "is writable by group or other (0o%03o)" % stat.S_IMODE(st.st_mode)
-                      if why is not None:
-                          raise OSError(errno.EPERM, "the pending-restore journal %s, so it is neither read "
-                                                     "nor written" % why)
+                      st = self._trusted(fd, "the pending-restore journal")
+                      self._lock(fd, st)
                   except BaseException:
                       os.close(fd)
                       raise
                   self._fd = fd
+
+              @staticmethod
+              def _trusted(fd, what):
+                  """The `fstat` of `fd`, refused unless it is a regular file with one
+                  link, owned by this process's euid and writable by nobody else."""
+                  st = os.fstat(fd)
+                  why = None
+                  if not stat.S_ISREG(st.st_mode):
+                      why = "is not a regular file"
+                  elif st.st_nlink != 1:
+                      why = "has %d links, so its inode may also live outside the scratch tree" % st.st_nlink
+                  elif st.st_uid != os.geteuid():
+                      why = "is owned by uid %d, not by this process (euid %d)" % (st.st_uid, os.geteuid())
+                  elif st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                      why = "is writable by group or other (0o%03o)" % stat.S_IMODE(st.st_mode)
+                  if why is not None:
+                      raise OSError(errno.EPERM, "%s %s, so it is neither read nor written" % (what, why))
+                  return st
+
+              def _lock(self, fd, st):
+                  """Own the journal for this run, or refuse it for this run (#6032).
+
+                  Never waits: a run that finds the journal held refuses its widens, the
+                  precedent a journal that cannot be trusted already sets. Once the lock
+                  is held the name must still lead to the locked inode - a run that
+                  rewrote the journal (`_compact`) put a new inode at the name, and a lock
+                  on the old one excludes nobody."""
+                  import fcntl
+
+                  why = None
+                  try:
+                      fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                  except OSError as err:
+                      if err.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                          why = "is held by another run of this script"
+                      else:
+                          why = "could not be locked against another run of this script (%s)" % err
+                  else:
+                      try:
+                          now = os.lstat(self.path)
+                      except OSError as err:
+                          why = "could not be found again once it was locked (%s)" % err
+                      else:
+                          if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+                              why = "was replaced by another run of this script while it was being opened"
+                  if why is not None:
+                      self.refused = why
+                      raise OSError(errno.EAGAIN, "the pending-restore journal %s, so this run neither reads nor "
+                                                  "writes it and refuses every widen it would record" % why)
+
+              def _read(self):
+                  """Every byte of the journal, refused past `_PENDING_LIMIT`."""
+                  raw = b""
+                  while True:
+                      chunk = os.pread(self._fd, 1 << 16, len(raw))
+                      if not chunk:
+                          return raw
+                      raw += chunk
+                      if len(raw) > _PENDING_LIMIT:
+                          raise OSError(errno.EFBIG, "the pending-restore journal is larger than %d bytes, so "
+                                                     "it is not read: once every `+ <id>` line in it has a "
+                                                     "matching `- <id>` line, or the inode each unmatched `+` "
+                                                     "line names has been checked by hand, delete it and run "
+                                                     "this again (#6026)" % _PENDING_LIMIT)
 
               def load(self):
                   """The entries no release matched, in the order they were held, and a
@@ -716,18 +838,7 @@ jobs:
                       self._attach(create=False)
                   except FileNotFoundError:
                       return [], []  # no run has widened anything here
-                  raw = b""
-                  while True:
-                      chunk = os.pread(self._fd, 1 << 16, len(raw))
-                      if not chunk:
-                          break
-                      raw += chunk
-                      if len(raw) > _PENDING_LIMIT:
-                          raise OSError(errno.EFBIG, "the pending-restore journal is larger than %d bytes, so "
-                                                     "it is not read: once every `+ <id>` line in it has a "
-                                                     "matching `- <id>` line, or the inode each unmatched `+` "
-                                                     "line names has been checked by hand, delete it and run "
-                                                     "this again (#6026)" % _PENDING_LIMIT)
+                  raw = self._read()
                   lines = raw.split(b"\n")
                   tail = lines.pop()
                   held = {}
@@ -738,11 +849,13 @@ jobs:
                           problems.append("line %d (%r) %s" % (number, line[:160], why))
                   if tail:
                       # Every line is fsynced BEFORE the chmod it describes, so a line
-                      # that never became whole describes a chmod that was never made:
-                      # cutting it off loses nothing, and keeping it refused every widen
-                      # of every later run (#6026). Nothing may be appended after it
-                      # meanwhile - it would be glued to it - so if it cannot be cut off
-                      # the journal is refused, as before.
+                      # that never became whole describes a chmod that was never made,
+                      # and keeping it refused every widen of every later run (#6026).
+                      # The cut is at a length this run read, so it is safe only while no
+                      # other run can append: this run holds the journal's lock, taken
+                      # before the read (`_lock`), and without it nothing here is reached
+                      # (#6034). Nothing may be appended after the torn line - it would be
+                      # glued to it - so if it cannot be cut off the journal is refused.
                       try:
                           os.ftruncate(self._fd, len(raw) - len(tail))
                           os.fsync(self._fd)
@@ -867,12 +980,70 @@ jobs:
                   if self._fd is None:
                       return
                   try:
-                      if settled and not self._open and self.refused is None:
-                          os.ftruncate(self._fd, 0)
-                          os.fsync(self._fd)
+                      if not self._open and self.refused is None:
+                          if settled:
+                              os.ftruncate(self._fd, 0)
+                              os.fsync(self._fd)
+                          else:
+                              self._compact()
                   finally:
                       os.close(self._fd)
                       self._fd = None
+
+              def _compact(self):
+                  """Drop every `+` line a later `-` line released, and that `-` line (#6031).
+
+                  Without this, one line that stays unresolved - a mode changed since the
+                  kill, a shared inode - keeps every later run's released pairs in the
+                  file until it passes `_PENDING_LIMIT` and refuses every widen. What is
+                  dropped is decided by the same reading `load` does (`_take`), so a line
+                  `load` reports - one it cannot use, a release of nothing - and every
+                  `+` line nothing released are all kept, byte for byte, in order.
+
+                  The file is rewritten, never edited in place: the kept lines go to a
+                  sibling name - opened without following a symlink and held to the
+                  journal's own checks, and emptied first, because a rewrite a kill
+                  interrupted can have left it behind - which is fsynced, renamed over
+                  the journal and then made durable with a fsync of the directory. A
+                  kill at any point leaves either the old journal or the new one, never
+                  a part of either. This run holds the lock throughout."""
+                  raw = self._read()
+                  lines = raw.split(b"\n")
+                  if lines.pop():
+                      return  # not a file this run left whole; `load` judges it next time
+                  keep = [True] * len(lines)
+                  held, at = {}, {}
+                  for number, line in enumerate(lines):
+                      if self._take(line, held) is not None:
+                          continue
+                      sign, ident = line.decode("ascii").split(" ")[:2]
+                      if sign == "+":
+                          at[ident] = number
+                      else:
+                          keep[at.pop(ident)] = keep[number] = False
+                  if all(keep):
+                      return
+                  data = b"".join(line + b"\n" for line, kept in zip(lines, keep) if kept)
+                  sibling = self.path + ".compact"
+                  fd = os.open(sibling, _OPEN_FLAGS | os.O_WRONLY | os.O_CREAT, stat.S_IRUSR | stat.S_IWUSR)
+                  try:
+                      self._trusted(fd, "the pending-restore journal's rewrite")
+                      os.ftruncate(fd, 0)
+                      done = 0
+                      while done < len(data):
+                          written = os.write(fd, data[done:])
+                          if not written:
+                              raise OSError(errno.EIO, "the rewrite stopped after %d of %d bytes" % (done, len(data)))
+                          done += written
+                      os.fsync(fd)
+                      os.replace(sibling, self.path)
+                  finally:
+                      os.close(fd)
+                  top = os.open(self.top, _OPEN_FLAGS | os.O_DIRECTORY)
+                  try:
+                      os.fsync(top)
+                  finally:
+                      os.close(top)
 
 
           class Cleaner:
@@ -1006,6 +1177,18 @@ jobs:
                           return current
                   if target != current:
                       os.fchmod(fd, target)
+                      # The link count above was read before `_ownable` and the fchmod; a
+                      # second name made in between got the mode too. It is read again
+                      # here, and a shared inode gets its mode back and keeps its line,
+                      # the same refusal as above (#6033).
+                      after = os.fstat(fd)
+                      if stat.S_ISREG(after.st_mode) and after.st_nlink > 1:
+                          os.fchmod(fd, current)
+                          self.fail(path, "a previous run recorded widening this inode, and it gained a second "
+                                          "link (%d links) while its recorded mode was being put back, so its inode "
+                                          "may live outside the scratch tree: the mode it carried, 0o%03o, is "
+                                          "put back and the journal line is kept" % (after.st_nlink, current))
+                          return current
                       self.repaired.append((path, current, target))
                   for entry in entries:
                       entry.resolved = True
@@ -1049,8 +1232,9 @@ jobs:
                   try:
                       self._journal.finish(not kept)
                   except OSError as err:
-                      self.fail(self._journal.path, "could not empty the pending-restore journal after a run "
-                                                    "that left nothing in it outstanding: %s" % err)
+                      self.fail(self._journal.path, "could not empty the pending-restore journal, or rewrite it "
+                                                    "without the lines this run released; every line still "
+                                                    "outstanding in it is kept: %s" % err)
 
               @staticmethod
               def _ownable(st):
@@ -1135,11 +1319,11 @@ jobs:
                                       raise
                               except BaseException:
                                   if not widened and not widener.may_have_landed:
-                                      # The widen was refused before its chmod, or by the
-                                      # chmod itself: the inode carries exactly the mode
-                                      # the walk found, so there is nothing to put back,
-                                      # nothing to report twice and no widen for the line
-                                      # to describe (#6023, #6028).
+                                      # The widen was refused before its chmod, or the
+                                      # chmod failed and the inode was READ to carry
+                                      # exactly the mode the walk found: there is nothing
+                                      # to put back, nothing to report twice and no widen
+                                      # for the line to describe (#6023, #6028, #6035).
                                       self.release(held, path)
                                       raise
                                   # The widen is never abandoned. A widen that raised, a
@@ -1285,9 +1469,15 @@ jobs:
               return cleaner.cleared, cleaner.repaired, cleaner.failures, cleaner.notes
 
 
-          def _say(text, stream=None):
+          def _say(text, stream=None, command=False):
+              """Print one report line. A workflow command's data is read by the runner
+              with `%25`, `%0D` and `%0A` decoded, so on such a line `%` is written as
+              `%25` - CR and LF never reach it, `_shown` escapes them (#6037)."""
               stream = sys.stdout if stream is None else stream
-              print(_shown(text, stream), file=stream)
+              line = _shown(text, stream)
+              if command:
+                  line = line.replace("%", "%25")
+              print(line, file=stream)
 
 
           def main(argv=None):
@@ -1312,7 +1502,8 @@ jobs:
               for path, why in notes:
                   _say("clear-append-only-scratch: %s: %s" % (path, why))
               for path, why in failures:
-                  _say("::error::clear-append-only-scratch: could not clear %s: %s" % (path, why), sys.stderr)
+                  _say("::error::clear-append-only-scratch: could not clear %s: %s" % (path, why), sys.stderr,
+                       command=True)
               _say("clear-append-only-scratch: %d cleared, %d failed" % (len(cleared), len(failures)))
               return 1 if failures else 0
 
