@@ -113,8 +113,8 @@ mutations of the live files at seed 5665 and 20,000 at seed 5666, plus the named
 cells of that round as fixed cases.  Each run gave 0 disagreements and 0 of 20
 live files refused: round 4 at 528c2195 ran 15 named cells, round 5 at 0e5758dc
 ran 16, round 6 at 3d953877 ran 22, round 7 at 1452e37f ran 38 (16 refused by this
-reader and 22 read the same as PyYAML) and round 8 ran 51 (see the round-8 line
-below).  The differential compares
+reader and 22 read the same as PyYAML) and round 8 at e325ddfb ran 51 (16 refused
+by this reader and 35 read the same as PyYAML).  The differential compares
 parse_triggers() with yaml.SafeLoader only: it never calls violations(),
 filter_matches() or glob_match(), so it is no evidence on how a branches pattern
 is matched.  Where GitHub's parser and PyYAML differ, it does not see it.
@@ -2477,7 +2477,7 @@ class DifferentialTruth5945(unittest.TestCase):
         doc = self._doc()
         self.assertNotIn("plus the named_cells() below as fixed cases", doc)
         for run in ("round 4 at 528c2195 ran 15 named cells", "round 5 at 0e5758dc ran 16",
-                    "round 6 at 3d953877 ran 22", "round 7 at 1452e37f ran 38", "round 8 ran " + str(len(named_cells()))):
+                    "round 6 at 3d953877 ran 22", "round 7 at 1452e37f ran 38", "round 8 at e325ddfb ran " + str(len(named_cells()))):
             self.assertIn(run, doc)
 
     def test_5945_the_parse_only_limit_is_stated(self) -> None:
