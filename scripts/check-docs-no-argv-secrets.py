@@ -997,6 +997,10 @@ RED_PROBES_4600 = {
     "5448-08-name-from-substitution": 'psql -v "$(printf pw)=$PG_PW" -f x.sql',
     "5448-09-long-option-leading-digit": 'psql --set 1pw="$PG_PW" -f x.sql',
     "5448-10-wrapper-hyphen-head": 'my-psql -v pw="$PG_PW" -f x.sql',
+    "5448-11-uppercase-name": 'psql -v PGPW="$PG_PW" -f x.sql',
+    "5448-12-backtick-name": 'psql -v `n`="$PG_PW" -f x.sql',
+    "5448-13-brace-expansion-name": 'psql -v p{w,x}="$PG_PW" -f x.sql',
+    "5448-14-extglob-paren-name": 'psql -v p@(w)="$PG_PW" -f x.sql',
     # #4808: the forms the #4782 gate missed.
     "4808-docker-e-dsn-literal": "docker run -e DATABASE_URL=postgres://u:hunter2@h/d img",
     "4808-psql-set-equals-pw": 'psql --set=pw="$PG_PW" -f bootstrap.sql',
@@ -1053,6 +1057,7 @@ GREEN_PROBES_4600 = {
     "4859-psql-v-non-secret-name": "psql -v ON_ERROR_STOP=1 -v role=aimemory -f x.sql",
     "5448-psql-v-digit-non-secret-name": "psql -v 1x=1 -f x.sql",
     "5448-psql-v-bare-name": "psql -v ON_ERROR_STOP -f x.sql",
+    "5448-psql-v-value-holds-equals-and-pw": "psql -v role=pw=x -f x.sql",
     "5448-psql-v-substituted-value-only": 'psql -v role="$ROLE_NAME" -f x.sql',
     "4808-docker-e-dsn-inherit": "docker run -e DATABASE_URL img",
     "4808-docker-e-dsn-no-password": "docker run -e DATABASE_URL=postgres://u@h/d img",
