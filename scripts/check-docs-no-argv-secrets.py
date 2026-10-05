@@ -1021,6 +1021,47 @@ def normalise_psql_heads(text: str) -> str:
     return psql_head_view(text)[0]
 
 
+PSQL_FLAG_LETTERS = frozenset("AabEeHlnqstVWwXxz0123456789")
+
+
+def option_word_undecidable(pieces: List[WordPiece]) -> bool:
+    """True for a word that opens like a psql option and then holds an expansion, so the
+    shell may build -v or --set from it at run time (-$o, -X$o, --$o, --s$x): the
+    literal prefix is dashes plus only argument-less flag letters, or is a prefix of
+    set or variable."""
+    prefix = ""
+    for kind, value in pieces:
+        if kind != "l":
+            break
+        prefix += str(value)
+    else:
+        return False
+    if not prefix.startswith("-"):
+        return False
+    if prefix.startswith("--"):
+        tail = prefix[2:].lower()
+        return "set".startswith(tail) or "variable".startswith(tail)
+    return all(ch in PSQL_FLAG_LETTERS for ch in prefix[1:])
+
+
+def segment_view(segment: str) -> Tuple[str, List[int]]:
+    """The text a psql head passes on its argv as far as it can be known: each word is
+    resolved (quotes, backslashes, ANSI-C and empty substitutions removed, so $'-v' and
+    -v read the same), an expansion stays as written; and the offsets of option words
+    that hold an expansion after an option-like prefix (an undecidable option)."""
+    out: List[str] = []
+    undecided: List[int] = []
+    last = 0
+    for start, end, pieces in scan_words(segment, nested=False):
+        out.append(segment[last:start])
+        out.append(word_view(segment, pieces))
+        last = end
+        if word_literal(pieces) is None and option_word_undecidable(pieces):
+            undecided.append(start)
+    out.append(segment[last:])
+    return "".join(out), undecided
+
+
 def psql_var_operand_flagged(operand: str) -> bool:
     """A psql -v operand is flagged when its name is secret-like, non-ASCII or
     undecidable (#5448), or when its VALUE expands a secret-named variable (#5483)."""
@@ -1067,7 +1108,10 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
     for head in PSQL_HEAD_RE.finditer(joined):
         eol = joined.find("\n", head.end())
         segment = joined[head.end():eol if eol >= 0 else len(joined)]
-        shell_view = segment.replace("\\", "").replace('"', "").replace("'", "")
+        shell_view, undecided = segment_view(segment)
+        for off in undecided:
+            line, snippet = _line_of(text, head.end() + off)
+            hits.append((rel, line, "[psql-undecidable-option] " + snippet))
         if any(psql_var_operand_flagged(m.group("operand"))
                for m in PSQL_VAR_OPT_RE.finditer(shell_view)):
             # head.start() is the PREFIX character, a newline when psql opens a line, which
@@ -1466,6 +1510,16 @@ RED_PROBES_4600 = {
     "5512-17-undecidable-wrapper-head": 'run_ps$(printf q)l -f x.sql',
     "5512-18-undecidable-head-inside-string": 'bash -c "ps$(printf q)l -f x.sql"',
     "5512-19-split-head-inside-string": "ssh h 'p\\sql -v pw=\"$PG_PW\"'",
+    "5513-01-ansi-c-dash-v": "psql $'-v' pw=\"$PG_PW\"",
+    "5513-02-ansi-c-hex-dash-v": "psql $'\\x2dv' pw=\"$PG_PW\"",
+    "5513-03-ansi-c-octal-dash-v": "psql $'\\055v' pw=\"$PG_PW\"",
+    "5513-04-ansi-c-set": "psql $'--set' pw=\"$PG_PW\"",
+    "5513-05-dash-then-expansion": 'psql -$o pw="$PG_PW"',
+    "5513-06-flag-then-expansion": 'psql -X$o pw="$PG_PW"',
+    "5513-07-long-then-expansion": 'psql --$o pw="$PG_PW"',
+    "5513-08-set-prefix-expansion": 'psql --s$x pw="$PG_PW"',
+    "5513-09-variable-prefix-expansion": 'psql --var$x pw="$PG_PW"',
+    "5513-10-ansi-c-cluster": "psql $'-Xv' pw=\"$PG_PW\"",
     "5512-20-path-then-ansi-c-head": "/usr/bin/ps$'q'l -v pw=\"$PG_PW\" -f x.sql",
     # #5483 (PR 4810 round-6 F3): a neutral variable name does not hide a value that expands
     # a secret-named variable, and a non-ASCII name can spell a secret with a look-alike letter.
@@ -1536,6 +1590,11 @@ GREEN_PROBES_4600 = {
     "5448-psql-v-bare-name": "psql -v ON_ERROR_STOP -f x.sql",
     "5448-psql-v-value-holds-equals-and-pw": "psql -v role=pw=x -f x.sql",
     "5448-psql-v-substituted-value-only": 'psql -v role="$ROLE_NAME" -f x.sql',
+    "5513-host-flag-then-expansion": 'psql -h"$HOST" -d "$DB" -f x.sql',
+    "5513-dbname-expansion": 'psql -d "$DB" -f x.sql',
+    "5513-long-host-expansion": 'psql --host="$HOST" --port=5432 -f x.sql',
+    "5513-ansi-c-neutral-option": "psql $'-X' -v role=aimemory -f x.sql",
+    "5513-user-flag-expansion": 'psql -U"$USER_NAME" -f x.sql',
     "5512-ansi-c-word-not-psql": "ps$'x'l -c \"ALTER USER a PASSWORD 'hunter2x'\"",
     "5512-hole-word-cannot-be-psql": 'ls$(date)x.txt -f x.sql',
     "5512-glob-word-cannot-be-psql": 'rm ps*.txt',
@@ -1690,17 +1749,17 @@ def self_test() -> int:
         if got:
             print("SELF-TEST FAIL: green probe (#4600 set) %r was flagged: %r" % (name, got), file=sys.stderr)
             bad += 1
-    # The #5512 word probes are file-type independent: the same spellings in a prose
+    # The #5512 and #5513 word probes are file-type independent: the same spellings in a prose
     # file and a script are read by the same resolver.
     for suffix in ("probe.md", "probe.sh"):
         for name, text in RED_PROBES_4600.items():
-            if name.startswith("5512-"):
+            if name.startswith(("5512-", "5513-")):
                 red += 1
                 if not scan_text(suffix, text):
                     print("SELF-TEST FAIL: red probe %r (%s) was not flagged" % (name, suffix), file=sys.stderr)
                     bad += 1
         for name, text in GREEN_PROBES_4600.items():
-            if name.startswith("5512-"):
+            if name.startswith(("5512-", "5513-")):
                 green += 1
                 if scan_text(suffix, text):
                     print("SELF-TEST FAIL: green probe %r (%s) was flagged" % (name, suffix), file=sys.stderr)
