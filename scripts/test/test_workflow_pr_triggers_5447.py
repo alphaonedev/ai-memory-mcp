@@ -26,19 +26,44 @@ RULES ENFORCED (all closed-world: a trigger the reader cannot parse is a FAILURE
          quotes inside, tags, ``?``, ``+``, ``[``, backslash and alias-like
          ``*name`` items are undecidable and fail.  A push trigger with no
          ``branches`` and no ``tags`` key matches every branch and counts.
-  R-SHAPE (#5660, #5667, #5668, #5705-#5708) the whole file is read closed-world:
-         each line must be blank, a comment, a block scalar content line, one
-         leading ``---``, or a mapping-key row or sequence entry whose quoted
-         scalars and flow collections close on that row, with no backslash in
-         a double-quoted and no doubled quote in a single-quoted scalar.  Any
-         other line fails, and so do a lone CR, another line-break character,
-         a control character or inner BOM, a repeated top-level key and a
-         top-level YAML 1.1 boolean key other than ``on`` (bare or quoted).
-         Under ``on:`` a ``pull_request`` / ``push`` trigger fails when it
-         does not use only the keys branches, tags, paths, paths-ignore,
-         types; ``branches`` must be an
-         inline list or a block list.  Anything else (branches-ignore, scalar
-         ``on:`` forms, flow-style ``on:``, an unterminated list) fails.
+  R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730, #5731) the whole file is
+         read closed-world by the grammar below.  A file the reader cannot read
+         is a failure whatever words it holds (#5731).
+
+ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
+  stream      the text, minus one leading BOM, holds no lone CR, no line break
+              other than LF or CR LF, and no control character or inner BOM.
+  line        blank | comment | block-scalar content | one leading ``---`` |
+              structure row.
+  comment     ASCII-space indentation, then ``#``.
+  structure   ASCII-space indentation, a printable ASCII first character, no
+  row         tab; then zero or more ``- `` prefixes and either a mapping key
+              row ``key: value`` or a sequence entry ``value``.
+  key         a plain scalar that does not start with an indicator and is not
+              ``<<``; a quoted key only as a top-level on spelling (#5731).
+  value       empty (a comment may follow) | a plain scalar on one line with no
+              ``: `` and no trailing ``:`` | a quoted scalar that closes on its
+              row (no backslash in double quotes, no doubled single quote) | a
+              flow collection that closes on its row | a block-scalar header
+              ``|`` or ``>`` with an optional ``-`` or ``+``.  Anchors, aliases,
+              tags and reserved indicators are refused.
+  nesting     a row sits at the column of an open block of its own kind (key
+              row or sequence entry).  Only a row whose value is empty may be
+              followed by a deeper row, which opens a nested block; a deeper row
+              after any other row would continue a scalar and is refused, as are
+              a row between two open columns and a sequence at its key's column
+              (#5730).
+  block-scalar every line indented past the node that owns the header, led by
+  content     an ASCII space, none less indented than the first.
+  top level   mapping keys at column 0, each once (folded and unquoted); a YAML
+              1.1 boolean key only as on, "on" or 'on'.
+  on block    trigger keys at one indentation, each once; a gated trigger
+              (pull_request, pull_request_target, push) spelled exactly so.  A
+              gated trigger is empty, ``~``, ``null`` or a block of the filter
+              keys branches, tags, paths, paths-ignore, types, each once.
+  filter      an inline (flow) list on the key's row, or a block list indented
+              past the key whose every row is ``- `` and one plain or simply
+              quoted scalar (#5730); ``types`` may also be one plain word.
 
 The reader is the Python standard library only (no PyYAML) so it runs on any CI
 image.  The mutation legs at the bottom prove the reader is not vacuous: each
@@ -221,18 +246,24 @@ def _plain_key_colon(s: str, i: int) -> int:
     return -1
 
 
-def _scan_row(rest: str) -> Tuple[str, str, int, bool]:
+def _opens_block(s: str, i: int) -> bool:
+    """True when the node at s[i:] is empty (only spaces and a comment follow)."""
+    after = s[i:].lstrip(" ")
+    return not after or after[0] == "#"
+
+
+def _scan_row(rest: str) -> Tuple[str, str, int, bool, List[int], bool]:
     """Positive rules for one structure row (text after its ASCII-space indentation).
 
     Returns (row text without comment, mapping key or '', column offset of the node
-    that owns a block scalar, opens-a-block-scalar). A row is accepted only as a
-    mapping key row or a sequence entry, each optionally after ``- `` prefixes;
-    anything else is Unparsed.
+    that owns a block scalar, opens-a-block-scalar, column offset of each ``- ``
+    prefix, value-is-empty). A row is accepted only as a mapping key row or a
+    sequence entry, each optionally after ``- `` prefixes; anything else is Unparsed.
     """
     i = 0
-    dash = -1
+    dashes: List[int] = []
     while rest.startswith("-", i) and rest[i + 1:i + 2] in ("", " "):
-        dash = i
+        dashes.append(i)
         i += 1
         while i < len(rest) and rest[i] == " ":
             i += 1
@@ -243,7 +274,7 @@ def _scan_row(rest: str) -> Tuple[str, str, int, bool]:
             j += 1
         if rest.startswith(":", j) and rest[j + 1:j + 2] in ("", " "):
             body, header = _value(rest, j + 1)
-            return body, rest[i:end], i, header
+            return body, rest[i:end], i, header, dashes, _opens_block(rest, j + 1)
     elif i < len(rest) and rest[i] not in "[{|>,]}#?:" + _NODE_PROPERTY:
         colon = _plain_key_colon(rest, i)
         if colon >= 0:
@@ -251,11 +282,41 @@ def _scan_row(rest: str) -> Tuple[str, str, int, bool]:
             if key == "<<":
                 raise Unparsed("merge key: " + repr(rest))
             body, header = _value(rest, colon + 1)
-            return body, key, i, header
-    if dash < 0:
+            return body, key, i, header, dashes, _opens_block(rest, colon + 1)
+    if not dashes:
         raise Unparsed("row is neither a mapping key, a sequence entry nor a comment: " + repr(rest))
     body, header = _value(rest, i)
-    return body, "", dash, header
+    return body, "", dashes[-1], header, dashes, _opens_block(rest, i)
+
+
+def _nest(stack: List[Tuple[int, str]], opened: Optional[int], ind: int, kind: str, raw: str) -> None:
+    """Place a structure row that starts a node of ``kind`` at column ``ind`` (#5730).
+
+    ``stack`` holds (column, "map" or "seq") for every open block collection, and
+    ``opened`` is the column of the node on the row above when its value is empty.
+    Only such a row may be followed by a deeper row, which opens a nested block. A
+    row is otherwise placed at the column of an open block of its own kind; a
+    deeper row continues the scalar above it in YAML and is refused, and so is a
+    row between two open columns or a sequence at its own key's column.
+    """
+    if opened is not None and ind > opened:
+        stack.append((ind, kind))
+        return
+    if opened is not None and ind == opened and kind == "seq" and stack and stack[-1] == (ind, "map"):
+        raise Unparsed("indentless sequence (a sequence at its key's column): " + repr(raw))
+    if not stack:
+        stack.append((ind, kind))
+        return
+    if ind > stack[-1][0]:
+        raise Unparsed("row indented past its block continues the scalar above it: " + repr(raw))
+    while stack[-1][0] > ind:
+        stack.pop()
+        if not stack:
+            raise Unparsed("row is less indented than the first row: " + repr(raw))
+    if stack[-1][0] != ind:
+        raise Unparsed("row is indented to no open block's column: " + repr(raw))
+    if stack[-1][1] != kind:
+        raise Unparsed("row is of the other kind than its block (key row or sequence entry): " + repr(raw))
 
 
 def _meaningful(text: str) -> List[Tuple[int, str, str]]:
@@ -279,6 +340,8 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
     rows: List[Tuple[int, str, str]] = []
     owner: Optional[int] = None  # column of the node that owns an open block scalar
     content: Optional[int] = None  # indentation of that block scalar's first line
+    stack: List[Tuple[int, str]] = []  # open block collections (#5730)
+    opened: Optional[int] = None  # column of the node above whose value is empty
     for raw in text.split("\n"):
         if raw.endswith("\r"):
             raw = raw[:-1]
@@ -307,7 +370,13 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
         if ind == 0 and _strip_comment(rest) in ("---", "..."):
             rows.append((0, _strip_comment(rest), ""))
             continue
-        body, key, node, header = _scan_row(rest)
+        body, key, node, header, dashes, empty = _scan_row(rest)
+        _nest(stack, opened, ind, "seq" if dashes and dashes[0] == 0 else "map", raw)
+        for d in dashes[1:]:
+            stack.append((ind + d, "seq"))
+        if key and dashes:
+            stack.append((ind + node, "map"))
+        opened = ind + node if empty else None
         if key[:1] in ("'", '"') and ind > 0:
             raise Unparsed("quoted mapping key below the top level (#5731): " + repr(raw))
         rows.append((ind, body, key))
@@ -409,6 +478,23 @@ def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
     return triggers
 
 
+def _filter_item(where: str, line: str) -> str:
+    """The scalar of one block-list row under a filter key (#5730).
+
+    The row must be ``- `` and one single-line plain or simply quoted scalar: a
+    nested sequence, a mapping, a flow collection, a block scalar or an empty
+    entry is refused, because its YAML value is not the row's text.
+    """
+    if not line.startswith("- ") and line != "-":
+        raise Unparsed(where + ": non-list item: " + line)
+    text = line[2:].lstrip(" ")
+    if text[:1] in ("'", '"') and _quoted_end(text, 0) == len(text):
+        return text[1:-1]
+    if not text or text[0] in "-?:,[]{}#&*!|>'\"%@`" or ": " in text or text.endswith(":"):
+        raise Unparsed(where + ": list item is not one scalar: " + line)
+    return text
+
+
 def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[str]]:
     filters: Dict[str, List[str]] = {}
     if not sub:
@@ -432,10 +518,7 @@ def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[s
         n = k + 1
         items: List[str] = []
         while n < len(sub) and sub[n][0] > key_indent:
-            line = sub[n][1]
-            if not line.startswith("- ") and line != "-":
-                raise Unparsed(trigger + "." + key + ": non-list item: " + line)
-            items.append(_unquote(line[1:].strip()))
+            items.append(_filter_item(trigger + "." + key, sub[n][1]))
             n += 1
         if rest:
             if items:
@@ -1394,6 +1477,55 @@ class FailClosed5731(unittest.TestCase):
     def test_5731_top_level_on_spellings_stay_clean(self) -> None:
         for key in ("on", '"on"', "'on'"):
             self.assertEqual([], violations("x.yml", key + ":\n" + GOOD_PR), key)
+
+
+class BlockStructure5730(unittest.TestCase):
+    """#5730: a row must sit at the column of an open block of its own kind.
+
+    Measured at 71fe391b4: every refusal case here was accepted there. Each PyYAML
+    6.0.1 view quoted in a comment was measured with yaml.safe_load on the same text.
+    """
+
+    def _shape(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5730_deeper_dash_row_continues_a_plain_entry(self) -> None:
+        # The round-3 reproducer. PyYAML: [..., 'release/v1.0.0 - rehearsal/**'].
+        ci = load_all()["ci.yml"]
+        old = '    branches: [main, develop, "release/**", "rehearsal/**"]\n'
+        new = ('    branches:\n      - main\n      - develop\n      - "release/**"\n'
+               '      - release/v1.0.0\n        - rehearsal/**\n')
+        self._shape(_replace_once(ci, old, new), "continues the scalar")
+
+    def test_5730_deeper_rows_after_a_scalar_value(self) -> None:
+        # PyYAML: the first two are one plain scalar each ('a - b'); the others are errors.
+        for body in ("x:\n  - a\n\n    - b\n", "x:\n  - a\n    # c\n    - b\n",
+                     "x: a\n  b: c\n", "x: 'a'\n  b: c\n", "x: [a]\n  - b\n", "x: |\n  a\ny: b\n   c: d\n"):
+            self._shape("name: x\non:\n" + GOOD_PR + body, "continues the scalar")
+
+    def test_5730_row_between_two_open_blocks(self) -> None:
+        self._shape("name: x\non:\n" + GOOD_PR + "x:\n    a: 1\n  b: 2\n", "no open block")
+        self._shape("name: x\non:\n  pull_request:\n      branches: [main]\n    types: [opened]\n", "no open block")
+
+    def test_5730_row_of_the_other_kind(self) -> None:
+        self._shape("name: x\non:\n" + GOOD_PR + "x:\n  - a\n  b: c\n", "other kind")
+        self._shape("name: x\non:\n" + GOOD_PR + "x:\n  b: c\n  - a\n", "other kind")
+
+    def test_5730_indentless_sequence(self) -> None:
+        # PyYAML: x is ['a']. The reader names no rule for a sequence at its key's column.
+        self._shape("name: x\non:\n" + GOOD_PR + "x:\n- a\n", "indentless sequence")
+        self._shape("name: x\non:\n" + GOOD_PR + "x:\n  - k:\n    - a\n", "indentless sequence")
+
+    def test_5730_filter_item_is_one_scalar(self) -> None:
+        # PyYAML: [['a']], [{'a': 'b'}], [['a']], ['x\n'], [None] respectively.
+        for item in ("- - a\n", "- a: b\n", "- [a]\n", "- |\n        x\n", "-\n"):
+            self._shape("on:\n  pull_request:\n    branches:\n      " + item, "not one scalar")
+
+    def test_5730_nested_blocks_stay_clean(self) -> None:
+        body = ("x:\n  - a\n  -\n    - b\n  - - c\n    - d\n  - k: v\n    l:\n      - m\n"
+                "    n: |\n      o\n  -\n    p: q\nw:\n  z: 1\n")
+        self.assertEqual([], violations("x.yml", "name: x\non:\n" + GOOD_PR + body))
 
 
 class GlobSemantics5447(unittest.TestCase):
