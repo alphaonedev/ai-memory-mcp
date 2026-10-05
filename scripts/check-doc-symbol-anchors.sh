@@ -871,6 +871,17 @@ MDEOF
     anchor_green 5498 "a live generic anchor inside a prose generic after a comparison" \
         "If a < b then see Vec<$R::RecallTool<T>> here."
 
+    # #5530: a `<` is a comparison only with whitespace on both sides; a
+    # generic opener written with a space or tab after it is still an opener.
+    anchor_green 5530 "a generic opener with a space before the anchor" \
+        "See Vec< $R::RecallTool<T>> here."
+    anchor_green 5530 "a generic opener with a tab before the anchor" \
+        $'See Vec<\t'"$R"'::RecallTool<T>> here.'
+    anchor_green 5530 "a generic opener with two spaces before the anchor" \
+        "See Vec<  $R::RecallTool<T>> here."
+    anchor_red 5530 BARE_QUAL "an over-closed anchor right after a spaced comparison" \
+        "See a < $R::RecallTool<T>> here."
+
     # #5497: the header, ABSENT_DEST and the CLAUDE.md gate paragraph state the
     # same destination wording and the same never-exempt cases.
     for wording in "split into" "split up into" "split across" "split out" "renamed to" "a link or a fragment"; do
@@ -1571,8 +1582,13 @@ def _outer_depth(prefix):
     while j < len(prefix):
         kind, width = _group_step(prefix, j)
         if kind == "open":
-            # #5498: `a < b` and `a <= b` are comparisons, not generic opens.
-            if not (j + width < len(prefix) and prefix[j + width] in " \t="):
+            # #5498/#5530: `a < b` and `a <= b` are comparisons, not generic
+            # opens, but only with whitespace on BOTH sides of the sign: a `<`
+            # attached to a word (`Vec< T`, `Vec<\tT`) is a generic opener
+            # whose spacing is unusual, not a comparison.
+            before_ws = j == 0 or prefix[j - 1] in " \t"
+            after_ws = j + width < len(prefix) and prefix[j + width] in " \t="
+            if not (before_ws and after_ws):
                 depth += 1
         elif kind == "close":
             depth = max(0, depth - 1)
