@@ -53,8 +53,10 @@ platform allows. What that buys differs by platform, and the difference matters:
   widened as whatever now holds that name, and a hardlink planted there shares
   an inode that may also live outside the scratch tree - staying inside this
   directory is a property of the namespace, not of the inode. The exposure is
-  bounded (only owner bits are added, only to an inode this euid owns, and the
-  mode is put back on the way out); narrowing this leg is tracked as #5852.
+  bounded - only owner bits are added, only where `_ownable` says this process
+  may chmod the inode back (its own euid owns it, or the euid is 0, which does
+  not bound by ownership at all), and the mode is put back on the way out.
+  Narrowing this leg is tracked as #5852.
 * Neither mechanism. `Widener` refuses with EPERM rather than widen through a
   name it would have to re-resolve unprotected.
 
@@ -295,14 +297,19 @@ class Cleaner:
         """Open `name` under `dirfd` without following symlinks.
 
         Returns `(fd, mode_to_restore)`. A mode that hides the inode flags is
-        answered by widening it - the owner can always chmod its way back in -
-        and the caller restores the original mode through the descriptor. The
-        widen is bound to the inode that was scanned and never to the name (see
-        `Widener`, #5813), and the original mode is put back before EVERY
-        failure exit from here, so neither a swapped entry nor a failed reopen
-        can leave an inode more permissive than the walk found it (#5812). The
-        reopened inode is compared with the one that was scanned, so an entry
-        swapped underneath the walk is reported instead of being cleared."""
+        answered by widening it - the scanning process can chmod its way back
+        in, see `_ownable` - and the caller restores the original mode through
+        the descriptor. Every widen here goes through `Widener` and is undone
+        before EVERY failure exit from this frame, by the same route it took.
+        What that is worth depends on the platform (module docstring, #5852):
+        where the inode can be pinned, the widen and its undo both address the
+        INODE that was scanned, and an entry swapped underneath the walk is
+        refused by `Widener` with nothing mutated at all; where it cannot, both
+        address the NAME, so a swap between the scan and the widen means some
+        other inode is widened and is then set to the SCANNED entry's mode
+        rather than to its own (#5812, #5813). The reopened inode is compared
+        with the one that was scanned, so a swapped entry is reported instead
+        of being cleared."""
         flags = _OPEN_FLAGS | (os.O_DIRECTORY if want_dir else 0)
         mode = stat.S_IMODE(st.st_mode)
         needed = (stat.S_IRUSR | stat.S_IXUSR) if want_dir else stat.S_IRUSR
@@ -327,7 +334,8 @@ class Cleaner:
                     # inode that turns out to have been swapped both put the
                     # original mode back before the failure leaves this frame;
                     # a restore that itself fails replaces the error, so a
-                    # widened inode is never left behind silently.
+                    # widen abandoned HERE is never silent. The caller's own
+                    # restore is quieter on purpose - see `_visit`.
                     widener.chmod(mode)
                     raise
             finally:
@@ -392,6 +400,14 @@ class Cleaner:
             self.fail(path, "could not clear or descend: %s" % err)
         finally:
             if restore is not None:
+                # Quiet, unlike the restore inside `_open_at`: by this point
+                # `_clear_fd` has re-read the flags from this same descriptor
+                # and has already `fail`ed on anything it could not prove
+                # unlinkable, and raising out of a `finally` would replace that
+                # verdict with a mode-restore error. A mode is not what poisons
+                # the next checkout - a flag is - so a restore that fails here
+                # leaves a widened mode on a dead scratch tree and says nothing
+                # rather than redding the leg over it.
                 try:
                     os.fchmod(fd, restore)
                 except OSError:
