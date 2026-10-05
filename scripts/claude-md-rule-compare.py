@@ -844,6 +844,15 @@ def _self_test_cases() -> int:
                 return f"{label} in the docstring slot was not refused (#5562)"
         if gap('"""doc"""\n' + tail) or gap(tail):
             return "a plain docstring or no docstring was refused (#5562)"
+        # #5563: the refusal body may call only print and sys.exit. Each other callable, with constant arguments and
+        # followed by the valid print and sys.exit, must be refused, so the whitelist cannot grow unseen.
+        head = 'import sys\nif __name__ == "__main__" and not sys.flags.isolated:\n'
+        for callee in ("exec", "eval", "compile", "getattr", "setattr", "open", "globals", "vars", "input", "breakpoint",
+                       "type", "os._exit", "sys.exit.__call__", "print.__call__"):
+            if not gap(f'{head}    {callee}("import colorsys")\n    print("refused")\n    sys.exit(1)\n'):
+                return f"a refusal body that calls {callee} was not refused (#5563)"
+        if gap(f'{head}    print("refused")\n    sys.exit(1)\n') or gap(f'{head}    print("a", "b")\n    sys.exit(2)\n'):
+            return "a refusal body of print and sys.exit calls was refused (#5563)"
         names = list(EXPECTED_IMPORTS)  # the probe set is the pin, never the output of imported_modules (#5472)
         if "importlib" not in names:
             return "importlib is not in the plant set"
