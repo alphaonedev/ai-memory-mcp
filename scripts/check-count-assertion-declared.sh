@@ -90,8 +90,11 @@ sys.setrecursionlimit(20000)       # covers() recurses once per hit of a commit
 REPO = None                      # directory every git call runs in (None = the current one)
 DIFF_FLAGS = ['-M', '-C', '--find-copies-harder']
 FULL_SHA = re.compile(r'^[0-9a-f]{40}$')
-ITEM_RE = re.compile(r'^(?P<what>\S.*?)\s+(?P<old>\(none\)|[0-9][0-9,]*)\s*->\s*(?P<new>\(none\)|[0-9][0-9,]*)$')
-WHY_RE = re.compile(r'\s*\((?!none\))[^()]*\)\s*$')
+# a value is `(none)`, or comma-joined decimal integers and/or `?<spelling>` undecidable right-hand sides (#5577)
+VALTOK = r'(?:[0-9]+|\?[^\s,]+?)'
+VAL = r'(?:\(none\)|' + VALTOK + r'(?:,' + VALTOK + r')*)(?=\s|,|->|$)'
+ITEM_RE = re.compile(r'^(?P<what>\S.*?)\s+(?P<old>' + VAL + r')\s*->\s*(?P<new>' + VAL + r')$')
+WHY_RE = re.compile(r'\s*\((?!none\))[^()]+\)\s*$')
 
 
 def git(*a, inp=None):
@@ -106,31 +109,89 @@ def git_rc(*a):
 
 
 LIT = re.compile(r'"(?:[^"\\]|\\.)*"', re.S)
+CHR = re.compile(r"'(?:[^'\\\n]|\\[^\n]|\\u\{[0-9a-fA-F_]+\})'")
 
 
 def clean(t):
     t = re.sub(r'//[^\n]*', '', t)                       # line comments
-    return LIT.sub('""', t)                              # string literals are not code
+    return CHR.sub("''", LIT.sub('""', t))               # string and char literals are not code
 
 
-# assert!(...) / assert_eq!(...) whose LEFT side is `<expr>.len()` / `.count()` and whose
-# RIGHT side is a numeric literal or an UPPER_CASE const — across line breaks.
-ASSERT = re.compile(
-    r'assert(?:_eq)?!\s*\(\s*(?P<expr>[^;{}]*?)\.(?P<m>len|count)\(\)\s*,\s*(?P<rhs>[0-9][0-9_]*|[A-Z][A-Z0-9_]{2,})\s*[,)]', re.S)
-CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]{2,})\s*:\s*(?:usize|u\d+|i\d+)\s*=\s*(?P<val>[0-9][0-9_]*)\s*;')
+# The full Rust integer literal grammar (#5577): decimal, 0x, 0o, 0b, underscores, a type suffix. Normalised to decimal.
+INT_RE = re.compile(r'^(?P<body>0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*)'
+                    r'(?:_?(?:u8|u16|u32|u64|u128|usize|i8|i16|i32|i64|i128|isize))?$')
+PATH_CONST = re.compile(r'^(?:[A-Za-z_][A-Za-z0-9_]*::)*(?P<name>[A-Z][A-Z0-9_]*)$')   # NAME, crate::NAME, a::b::NAME
+
+
+def int_value(tok):
+    """-> decimal string of an integer literal, or None when tok is not exactly one."""
+    m = INT_RE.match(tok.strip())
+    if not m: return None
+    body = m.group('body'); base = {'0x': 16, '0o': 8, '0b': 2}.get(body[:2], 10)
+    digits = body[2:] if base != 10 else body
+    digits = digits.replace('_', '')
+    return str(int(digits, base)) if digits else None
+
+
+# assert!(...) / assert_eq!(...): the macro arguments are cut out with balanced brackets, so a right-hand side of ANY
+# shape is seen (a typed literal, an expression, a path); the LEFT side must be `<expr>.len()` / `.count()`.
+HEAD = re.compile(r'assert(?:_eq)?!\s*\(')
+LEFT = re.compile(r'^\s*(?P<expr>[^;{}]*?)\.(?P<m>len|count)\(\)\s*,(?P<rest>.*)$', re.S)
+CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]*)\s*:\s*(?:usize|u\d+|i\d+)\s*=\s*(?P<val>[^;]+?)\s*;')
+
+
+def macro_args(t, i):
+    """t[i:] follows a macro's '('. -> the text up to the matching ')', or None when unbalanced."""
+    depth, angle, j, n = 0, 0, i, len(t)
+    while j < n:
+        ch = t[j]
+        if ch in '([{': depth += 1
+        elif ch in ')]}':
+            if depth == 0: return t[i:j] if ch == ')' else None
+            depth -= 1
+        elif ch == ';' and depth == 0: return None
+        j += 1
+    return None
+
+
+def first_arg(rest):
+    """The first top-level comma-separated argument of `rest` (turbofish commas do not split)."""
+    depth, angle, j, n = 0, 0, 0, len(rest)
+    while j < n:
+        ch = rest[j]
+        if rest.startswith('::<', j): angle += 1; j += 3; continue
+        if angle and ch == '<': angle += 1
+        elif angle and ch == '>' and rest[j - 1:j] != '-': angle -= 1
+        elif ch in '([{': depth += 1
+        elif ch in ')]}': depth -= 1
+        elif ch == ',' and depth == 0 and angle == 0: break
+        j += 1
+    return rest[:j].strip()
 
 
 def extract(text):
-    """-> ({expr-key: {literal, ...}}, {const names defined})"""
+    """-> ({expr-key: {value, ...}}, {const names defined}); a value is a decimal integer or `?<spelling>` (undecidable)."""
     text = clean(text)
-    consts = {m.group('name'): m.group('val').replace('_', '') for m in CONST.finditer(text)}
+    consts = {}
+    for m in CONST.finditer(text):
+        v = int_value(m.group('val'))
+        if v is not None: consts[m.group('name')] = v
     out = {}
-    for m in ASSERT.finditer(text):
+    for h in HEAD.finditer(text):
+        args = macro_args(text, h.end())
+        m = LEFT.match(args) if args is not None else None
+        if not m: continue
         expr = re.sub(r'\s+', '', m.group('expr')) + '.' + m.group('m') + '()'
-        rhs = m.group('rhs')
-        val = rhs.replace('_', '') if rhs[0].isdigit() else consts.get(rhs)
-        if val is None: continue                         # a const defined elsewhere: not a literal count
-        if not rhs[0].isdigit(): expr += f' [{rhs}]'        # name the const the count is spelled through
+        rhs = first_arg(m.group('rest'))
+        val = int_value(rhs)
+        if val is None:
+            pc = PATH_CONST.match(rhs)
+            if pc:                                        # a named const: resolved inside this file
+                val = consts.get(pc.group('name'))
+                if val is None: continue                  # a const defined elsewhere: not a literal count (F4 closes this)
+                expr += f" [{pc.group('name')}]"          # name the const the count is spelled through
+            else:
+                val = '?' + re.sub(r'\s+', '', rhs)         # undecidable: neither a literal nor a const (#5577)
         out.setdefault(expr, set()).add(val)
     return out, set(consts)
 
@@ -206,6 +267,8 @@ def count_changes(c):
         for expr in sorted(set(old) | set(new)):
             o, n = old.get(expr, set()), new.get(expr, set())
             if o == n: continue
+            if (not o and all(v.startswith('?') for v in n)) or (not n and all(v.startswith('?') for v in o)):
+                continue                                 # an assertion with no literal count on either side moves no count (#5577)
             if st == 'A' and not exists_elsewhere(parent, expr):
                 continue                                 # a brand-new assertion in a brand-new file (#5499)
             hits.append((np_ or op, expr, ','.join(sorted(o)) or '(none)', ','.join(sorted(n)) or '(none)'))
@@ -237,9 +300,9 @@ def parse_items(s):
 # a whole token of the asserted expression or of the file-name stem names nothing. Two accepted forms:
 #   (1) the whole asserted expression, whitespace ignored (with or without its `[CONST]` suffix) — the only form that can
 #       name a short variable such as `v.len()`; it cannot be met by accident;
-#   (2) words, each holding identifier chunks of at least MIN_WHAT_CHUNK characters, every chunk a whole token of the
-#       expression or of the file-name STEM (a directory name never counts), and at least one chunk that is not a bare
-#       method name every hit carries (len, count).
+#   (2) words, none holding an identifier chunk shorter than MIN_WHAT_CHUNK characters or no identifier at all, with
+#       at least one chunk that is a whole token of the expression or of the file-name STEM (a directory name never
+#       counts) and is not a bare method name every hit carries (len, count). The hit's own path may appear as a word.
 MIN_WHAT_CHUNK = 3
 WHAT_STOP = frozenset({'len', 'count'})
 CHUNK = re.compile(r'[A-Za-z0-9_]+')
@@ -256,12 +319,16 @@ def tokens_of(text):
 def names_assertion(what, hit):
     key = re.sub(r'\s+', '', hit[1]); w = re.sub(r'\s+', '', what)
     if w and w in (key, key.split('[', 1)[0]): return True        # form (1): the whole expression
-    words = what.split()
-    if not words or any(not CHUNK.search(x) for x in words): return False   # a punctuation-only word names nothing
-    chunks = CHUNK.findall(what)
-    if any(len(c) < MIN_WHAT_CHUNK for c in chunks): return False
-    toks = tokens_of(hit[1]) | tokens_of(os.path.basename(hit[0]).split('.', 1)[0])
-    return all(c.lower() in toks for c in chunks) and any(c.lower() not in WHAT_STOP for c in chunks)
+    path, base = hit[0], os.path.basename(hit[0])
+    toks = tokens_of(hit[1]) | tokens_of(base.split('.', 1)[0])
+    named = False
+    for word in what.split():
+        if word in (path, base): continue                         # the file the assertion lives in: context, names nothing alone
+        chunks = CHUNK.findall(word)
+        if not chunks: return False                               # a punctuation-only word names nothing
+        if any(len(c) < MIN_WHAT_CHUNK for c in chunks): return False   # a one- or two-character word is never accepted
+        if any(c.lower() in toks and c.lower() not in WHAT_STOP for c in chunks): named = True   # a whole-token match
+    return named                                                  # other (>= 3 character) words are free prose
 
 
 def item_matches(item, hit):
@@ -495,6 +562,10 @@ def selftest():
                         ('the whole expression', 'sections.len()', False), ('a token and the method name', 'sections len', False),
                         ('a token in upper case', 'SECTIONS', False)]:
         case('what = %s (%s)' % (w, lbl), one_decl(w), red, ['sections.len()  18 -> 19'] if red else ())
+    case('what = a token plus free prose of 3+ characters', one_decl('sections trail test'), False)
+    case('what = the hit path plus a token', one_decl('tests/f.rs sections'), False)
+    case('what = the hit path alone names nothing', one_decl('tests/f.rs'), True)
+    case('what = a token plus a two-letter word is refused', one_decl('sections to'), True)
     def c_stem(s, b): s.w('tests/multi.rs', multi_rs(6)); s.commit(msg('test: bump', 'Count: multi 5 -> 6 (fixture)')); return b + '..HEAD'
     case('what = a token of the file-name stem', c_stem, False)
     def c_late_short(s, b):
@@ -527,6 +598,40 @@ def selftest():
     def c_three(s, b):
         two_same(s); s.w('tests/multi.rs', multi_rs(6)); s.commit(msg('test: bump three', 'Count: sections 18 -> 19, minimal 5 -> 6 (fixture)')); return b + '..HEAD'
     case('three assertions, two items', c_three, True)
+
+    # ---- #5577: any right-hand-side spelling is seen (typed, based, underscored, expression); undecidable never silent -------------
+    def typed(old_rhs, new_rhs, decl=None, expr='sections.len()'):
+        def f_(s, b):
+            s.w('tests/typed.rs', 'fn t() { assert_eq!(%s, %s); }\n' % (expr, old_rhs)); t0 = s.commit('test: add typed fixture')
+            s.w('tests/typed.rs', 'fn t() { assert_eq!(%s, %s); }\n' % (expr, new_rhs))
+            s.commit(msg('test: bump', 'Count: %s (fixture)' % decl) if decl else 'test: bump without a declaration'); return t0 + '..HEAD'
+        return f_
+    for o_, n_ in [('18usize', '19usize'), ('1_8', '1_9'), ('0x12', '0x13'), ('0o22', '0o23'), ('0b10010', '0b10011'),
+                   ('18_usize', '19_usize'), ('18u8', '19u8'), ('0x12_usize', '0x13_usize'), ('18i64', '19i64'), ('18_u32', '19_u32')]:
+        case('undeclared %s -> %s is a move' % (o_, n_), typed(o_, n_), True, ['sections.len()  18 -> 19'])
+        case('declared %s -> %s is accepted' % (o_, n_), typed(o_, n_, 'sections 18 -> 19'), False)
+    case('a spelling change only (18 -> 18usize) is no count move', typed('18', '18usize'), False)
+    case('a spelling change only (0x12 -> 18) is no count move', typed('0x12', '18'), False)
+    case('an expression right-hand side that changes is a move, undecidable', typed('18 + 1', '18 + 2'), True, ['sections.len()  ?18+1 -> ?18+2'])
+    case('an expression right-hand side declared with its spelling', typed('18 + 1', '18 + 2', 'sections ?18+1 -> ?18+2'), False)
+    case('an expression right-hand side declared with decimal values does not match', typed('18 + 1', '18 + 2', 'sections 18 -> 19'), True)
+    case('a literal replaced by an expression is a move', typed('18', 'N as usize'), True, ['sections.len()  18 -> ?Nasusize'])
+    case('a parenthesised right-hand side is seen', typed('(18)', '(19)'), True, ['?(18) -> ?(19)'])
+    case('a nested-call left side with a comma is seen', typed('18', '19', None, 'f(a, b).len()'), True, ['f(a,b).len()  18 -> 19'])
+    case('a turbofish left side with a comma is seen', typed('18', '19', None, 'v.iter().collect::<HashMap<K, V>>().len()'), True)
+    case('a trailing message argument does not hide the literal', typed('18', '19', None, 'sections.len()'), True)
+    def c_added_expr(s, b):
+        s.w('tests/typed.rs', 'fn t() { assert_eq!(a.len(), 1); }\n'); t0 = s.commit('test: add')
+        s.w('tests/typed.rs', 'fn t() { assert_eq!(a.len(), 1); assert_eq!(x.len(), y.len()); }\n'); s.commit('test: add a length comparison'); return t0 + '..HEAD'
+    case('a newly added length comparison with no literal is no count move', c_added_expr, False)
+    def c_removed_expr(s, b):
+        s.w('tests/typed.rs', 'fn t() { assert_eq!(a.len(), 1); assert_eq!(x.len(), y.len()); }\n'); t0 = s.commit('test: add')
+        s.w('tests/typed.rs', 'fn t() { assert_eq!(a.len(), 1); }\n'); s.commit('test: drop a length comparison'); return t0 + '..HEAD'
+    case('a removed length comparison with no literal is no count move', c_removed_expr, False)
+    def c_msgarg(s, b):
+        s.w('tests/typed.rs', 'fn t() { assert_eq!(sections.len(), 18, "a, b"); }\n'); t0 = s.commit('test: add')
+        s.w('tests/typed.rs', 'fn t() { assert_eq!(sections.len(), 19, "a, b"); }\n'); s.commit('test: bump'); return t0 + '..HEAD'
+    case('a trailing message argument with a comma does not hide the literal', c_msgarg, True, ['sections.len()  18 -> 19'])
 
     # ---- #5499: late declaration -------------------------------------------------------------
     def offender(s, b, two=False):
