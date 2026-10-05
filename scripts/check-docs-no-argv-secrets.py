@@ -113,8 +113,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 Hit = Tuple[str, int, str]
 
-# Redaction tokens that are not a credential.
-REDACTION_TOKENS = ("...", "…", "***", "redacted", "<redacted>", "xxxx")
+# Redaction tokens that are not a credential: a closed list of whole values, shared by every
+# rule that asks whether a password is a placeholder (is_redaction).
+REDACTION_TOKENS = frozenset({"...", "…", "***", "redacted", "<redacted>", "xxxx"})
 
 # Files that quote the patterns on purpose: this gate.
 SELF_EXEMPT = {"scripts/check-docs-no-argv-secrets.py"}
@@ -293,8 +294,9 @@ SEPARATORS = set(";|&()<>")
 
 
 def is_redaction(value: str) -> bool:
-    low = value.lower()
-    return any(tok in low for tok in REDACTION_TOKENS)
+    """#4612 item 3: a placeholder is the WHOLE password (case-insensitive), never a part of
+    it: hunterREDACTEDx and a***b are credentials."""
+    return value.lower() in REDACTION_TOKENS
 
 
 def url_credential(url: str) -> str:
@@ -2628,6 +2630,22 @@ R9_GREEN_PROBES = {
     '5593-g34-unit-exec-literal-head': 'ExecStart=/usr/bin/env -i echo' + R9_NEUTRAL_TAIL,
     '5594-g35-mount-target-holds-equals': '$DOCKER run -v "$SECRET_DIR:/opt/a=b" img',
 }
+# Round 10 red: some hit of any kind, as a script, a prose file and a fenced block.
+R10_RED_PROBES = {
+    # #4612 item 3: a placeholder is the WHOLE decoded password, never a substring of it.
+    '4612-r01-psql-url-redacted-inside': 'psql postgres://u:hunterREDACTEDx@h/d',
+    '4612-r02-psql-url-stars-inside': 'psql "postgresql://app:a***b@db.example/app"',
+    '4612-r03-psql-url-dots-inside': 'psql "postgresql://app:pw...1@db.example/app"',
+    '4612-r04-psql-url-xxxx-inside': 'psql "postgresql://app:xxxxx@db.example/app"',
+    '4612-r05-store-url-redacted-inside': 'ai-memory serve --store-url postgres://u:hunterREDACTEDx@h/d',
+    '4612-r06-store-url-angle-redacted-inside': 'ai-memory serve --store-url "postgres://u:<redacted>2@h/d"',
+    '4612-r07-store-url-query-redacted-inside': 'ai-memory serve --store-url "postgres://u@h/d?password=hunterREDACTEDx"',
+    '4612-r08-psql-c-sql-redacted-inside': 'psql -c "ALTER ROLE x PASSWORD \'hunterREDACTEDx\'"',
+    '4612-r09-docker-env-stars-inside': 'docker run -e PGPASSWORD=hunter***x img',
+}
+# Round 10 green: no hit of any kind.
+R10_GREEN_PROBES = {
+}
 
 
 def r9_variants(text: str) -> List[Tuple[str, str, str]]:
@@ -2763,6 +2781,20 @@ def self_test() -> int:
             green += 1
             if scan_text(suffix, body):
                 print("SELF-TEST FAIL: green probe %r (%s) was flagged" % (name, label), file=sys.stderr)
+                bad += 1
+    # Round 10: every probe as a script, a prose file and a fenced block.
+    for name, text in R10_RED_PROBES.items():
+        for label, suffix, body in r9_variants(text):
+            red += 1
+            if not scan_text(suffix, body):
+                print("SELF-TEST FAIL: red probe %r (%s) was not flagged" % (name, label), file=sys.stderr)
+                bad += 1
+    for name, text in R10_GREEN_PROBES.items():
+        for label, suffix, body in r9_variants(text):
+            green += 1
+            got = scan_text(suffix, body)
+            if got:
+                print("SELF-TEST FAIL: green probe %r (%s) was flagged: %r" % (name, label, got), file=sys.stderr)
                 bad += 1
     # A glob head with no credential option is emphasis in prose; a script refuses it as undecidable.
     green += 1
