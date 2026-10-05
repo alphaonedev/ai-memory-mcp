@@ -966,8 +966,10 @@ def _self_test_cases() -> int:
     def hostile_parent_env():
         # #5508: the self-test children get a controlled environment (child_env), so a parent that exports the variables
         # below must not change any result. Rerun the three child-spawning checks with those variables set in THIS
-        # process; each must still pass. PYTHONINSPECT is left out here only because a child that honoured it would
-        # wait on stdin; child_env never passes it either.
+        # process; each must still pass. PYTHONINSPECT, PYTHONUSERBASE and PYTHONUTF8 are in the set too (#5564):
+        # every child has stdin=DEVNULL, so a child that honoured PYTHONINSPECT would read EOF and exit, not hang; the
+        # pin below therefore does not rely on a hang, it checks that child_env passes no PYTHON* name and that a bare
+        # child reports sys.flags.inspect 0 and the default user base.
         hostile_dir = base_dir / "hostile"
         hostile_dir.mkdir(parents=True, exist_ok=True)
         for name in EXPECTED_IMPORTS:
@@ -975,20 +977,26 @@ def _self_test_cases() -> int:
         startup = hostile_dir / "startup.py"
         startup.write_text("print('PLANTED')\n", encoding="utf-8")
         hostile = {"PYTHONPATH": str(hostile_dir), "PYTHONHOME": str(hostile_dir / "no-home"), "PYTHONSAFEPATH": "1",
-                   "PYTHONSTARTUP": str(startup), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONWARNINGS": "error"}
+                   "PYTHONSTARTUP": str(startup), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONWARNINGS": "error",
+                   "PYTHONINSPECT": "1", "PYTHONUSERBASE": str(hostile_dir / "userbase"), "PYTHONUTF8": "1"}
         saved = {key: os.environ.get(key) for key in hostile}
         os.environ.update(hostile)
         try:
             refusal_ok = isolated_refusal()
             plant_why = importlib_plant()
             importer_ok = importer_refusal()
+            leaked = sorted(key for key in child_env() if key.startswith("PYTHON"))
+            bare = subprocess.run([sys.executable, "-c", "import site, sys; print(sys.flags.inspect, site.getuserbase())"],
+                                  capture_output=True, text=True, check=False, env=child_env(), stdin=subprocess.DEVNULL)
+            env_ok = not leaked and bare.returncode == 0 and bare.stdout.startswith("0 ") \
+                and str(hostile_dir) not in bare.stdout
         finally:
             for key, value in saved.items():
                 if value is None:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-        return refusal_ok and not plant_why and importer_ok
+        return refusal_ok and not plant_why and importer_ok and env_ok
 
     if hostile_parent_env():
         print("PASS: self-test - the probe, refusal and importer checks are green under a hostile parent environment (#5508)")
