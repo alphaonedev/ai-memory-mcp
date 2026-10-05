@@ -401,7 +401,7 @@ pub fn resolve(
     // first-resolution-wins — every retry then answered `Conflict` FOREVER,
     // permanently stranding the anchor unsigned so every peer running
     // `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` rejects it. Wrapping both writes in
-    // one `unchecked_transaction` makes the whole resolve fail closed: a signing
+    // one `WriteTxn` (BEGIN IMMEDIATE) makes the whole resolve fail closed: a signing
     // failure rolls the state-flip back (the `?` drops `tx`), so a resolved
     // checkpoint can NEVER persist with an empty/absent attestation.
     // BEGIN IMMEDIATE (#5084): write-first, but one rule for every write path

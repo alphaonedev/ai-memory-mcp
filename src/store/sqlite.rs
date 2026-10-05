@@ -4547,7 +4547,7 @@ impl MemoryStore for SqliteStore {
 // `UnsupportedCapability` trait default), but a future override would
 // have handed callers a transaction that doesn't transact — the
 // classic loaded-footgun. When real SAL transactions land, implement
-// them honestly (rusqlite `unchecked_transaction` through the mutex)
+// them honestly (`crate::storage::connection::WriteTxn`, BEGIN IMMEDIATE, through the mutex)
 // rather than resurrecting the no-op.
 
 #[cfg(test)]
