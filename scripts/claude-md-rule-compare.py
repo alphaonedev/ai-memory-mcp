@@ -46,6 +46,7 @@ if __name__ == "__main__" and not sys.flags.isolated:
 
 import argparse  # noqa: E402 - after the isolated-mode refusal on purpose (#5163)
 import ast
+import codecs
 import difflib
 import importlib.machinery
 import importlib.util
@@ -442,8 +443,8 @@ def plant_coverage_gap(probed: list, names: list, rounds: int) -> bool:
 # #5472: the top-level modules this script imports (except sys), pinned as a literal so the self-test has a source of
 # truth that does not come from imported_modules() itself. Adding or removing an import without updating this tuple
 # makes the self-test red.
-EXPECTED_IMPORTS = ("argparse", "ast", "difflib", "importlib", "os", "pathlib", "py_compile", "re", "shutil", "stat",
-                    "subprocess", "tokenize", "typing")
+EXPECTED_IMPORTS = ("argparse", "ast", "codecs", "difflib", "importlib", "os", "pathlib", "py_compile", "re", "shutil",
+                    "stat", "subprocess", "tokenize", "typing")
 
 
 def import_pin_gap(found: list, pinned) -> tuple:
@@ -470,26 +471,85 @@ def imported_modules(path: Path) -> list:
 
 
 CONTROL_BYTES = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\r(?!\n)")
+# #5771: the PEP 263 cookie and blank-line patterns of tokenize, on bytes (so \w is ASCII, as tokenize's re.ASCII).
+COOKIE_LINE = re.compile(rb"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+COOKIE_BLANK = re.compile(rb"^[ \t\f]*(?:[#\r\n]|$)")
+
+
+def cookie_gap(source: bytes) -> str:
+    """#5771: the refusal for the PEP 263 cookie lines, judged before detect_encoding so the reason does not depend on
+    the interpreter. The lines judged are line 1, and line 2 when line 1 is blank or a comment. A judged line that is
+    not utf-8 is refused. A cookie is normalised the way tokenize does (utf-8 and utf-8-* to utf-8, the latin-1
+    spellings to iso-8859-1, any other name as written); a name other than utf-8 and utf8 that the codec registry
+    knows is refused as declared. "" when the source starts with a utf-8 BOM, has no cookie, the cookie is utf-8, or
+    the registry does not know the name (detect_encoding then judges those)."""
+    if source.startswith(b"\xef\xbb\xbf"):
+        return ""
+    for number, line in enumerate(source.splitlines(keepends=True)[:2], start=1):
+        try:
+            line.decode("utf-8")
+        except UnicodeDecodeError:
+            return f"the source encoding cannot be determined: line {number} can hold a coding cookie and is not utf-8"
+        match = COOKIE_LINE.match(line)
+        if match:
+            name = match.group(1).decode("ascii")
+            enc = name[:12].lower().replace("_", "-")
+            if enc == "utf-8" or enc.startswith("utf-8-") or name == "utf8":
+                return ""
+            if enc in ("latin-1", "iso-8859-1", "iso-latin-1") or enc.startswith(("latin-1-", "iso-8859-1-",
+                                                                                  "iso-latin-1-")):
+                name = "iso-8859-1"
+            try:
+                codecs.lookup(name)
+            except LookupError:
+                return ""
+            return f"the source declares the encoding {name}, not plain utf-8 (a BOM or a coding cookie)"
+        if number == 1 and not COOKIE_BLANK.match(line):
+            return ""
+    return ""
 
 
 def refusal_prefix_gap(source: bytes) -> str:
-    """#5510/#5560: "" when `source` (the file BYTES, never a str) is plain strict utf-8 and the only statements that
-    execute above the isolation refusal are the docstring and `import sys`, and the refusal is exactly
+    """#5510/#5560/#5590: "" when `source` (the file BYTES, never a str) is plain strict utf-8 and the only
+    statements that execute above the isolation refusal are the docstring and `import sys`, and the refusal is exactly
     `if __name__ == "__main__" and not sys.flags.isolated:` whose body is calls to print and sys.exit with constant
-    arguments; otherwise why not. Parsed with ast from the bytes, never executed, so the check reads the file the way
-    the interpreter does. It is closed-world and fails closed: it refuses a non-bytes argument; any coding cookie or
-    BOM other than plain utf-8 spelled utf-8 or utf8 (tokenize.detect_encoding follows the PEP 263 rule the
-    interpreter uses, so a cookie in any spelling on line 1 or 2 is covered); bytes that are not strict utf-8; any
-    control byte other than tab, LF and CRLF line ends (NUL, form feed, a lone CR and the rest) anywhere in the file;
-    and a line ending in a line-continuation backslash above the refusal. Module level statements are the only code
-    that runs when the file is started, so a dynamic import, eval, exec, a branch, a class body or a decorator above
-    the refusal cannot hide: any statement outside this whitelist is refused."""
+    arguments; otherwise why not. Parsed with ast from the bytes and never executed. It is closed-world and fails
+    closed, so it over-refuses rather than risk a miss. The exact rule is R1 to R7 below. pin_5590 asserts each
+    numbered rule and fails if a numbered rule has no assertion group (#5590, #5622). pin_5510, pin_5562 and pin_5563
+    pin the structure this paragraph describes. Every line of this docstring fits in 120 characters (#5678).
+    R1: an argument that is neither bytes nor bytearray is refused; a bytearray is judged as the bytes it holds.
+    R2: A utf-8 BOM is refused (detect_encoding reports it as utf-8-sig), alone or with any cookie.
+    R3: A coding cookie is judged where tokenize.detect_encoding (the stdlib PEP 263 implementation) finds one, after
+    its normalisation: on line 1, or on line 2 when line 1 is blank or a comment; a cookie after a code line is not
+    judged. Accepted: utf-8 in any letter case, utf_8, utf-8- followed by anything (so utf-8-sig WITHOUT a BOM is
+    accepted, and compile() accepts it too), and exactly lower-case utf8. Refused: every other name, including UTF8 and
+    Utf8 (compile() accepts them; this check does not), utf-7, latin-1, utf-16 and an unknown codec (compile() rejects
+    it). The cookie lines are judged before detect_encoding (cookie_gap, #5771): a cookie naming a codec the registry
+    knows is refused as that declared encoding, so utf-16 gives the same reason on every interpreter; a line where a
+    cookie can be that is not utf-8 is refused as undeterminable; an unknown codec is refused as undeterminable.
+    R4: Bytes that are not strict utf-8 are refused.
+    R5: Any control byte other than tab, LF and CRLF line ends (NUL, form feed, a lone CR and the rest) is refused
+    anywhere in the file.
+    R6: Any line above the refusal that ends in a backslash is refused, whether it is a real line continuation or only
+    the last character of a comment.
+    R7: Any statement above the refusal other than the docstring and `import sys` is refused, so a dynamic import, eval,
+    exec, a branch, a class body, a decorator or a def cannot hide."""
     if not isinstance(source, (bytes, bytearray)):
         return "the source is not bytes"
     source = bytes(source)
+    # #5681: before detect_encoding, which raises for a NUL on line 1 or 2 on 3.14.8 and not on 3.9.25 to 3.13.16, so
+    # the reason for a control byte is the same on every interpreter.
+    if CONTROL_BYTES.search(source):
+        return "the source has a control byte other than tab, LF and CRLF line ends"
+    # #5771: the cookie lines are judged here, before detect_encoding, which returns utf-16 for a utf-16 cookie on 3.9.25
+    # to 3.13.16 and raises on 3.14.8, and reads a non-utf-8 cookie line differently on 3.14.8, so neither reason
+    # depends on the interpreter.
+    why = cookie_gap(source)
+    if why:
+        return why
     try:
         encoding = tokenize.detect_encoding(iter(source.splitlines(keepends=True)).__next__)[0]
-    except (SyntaxError, StopIteration, LookupError) as exc:
+    except Exception as exc:  # fail closed: ANY failure refuses (#5588); pin_5588 shows SyntaxError for three inputs (#5626)
         return f"the source encoding cannot be determined: {exc}"
     if encoding not in ("utf-8", "utf8"):
         return f"the source declares the encoding {encoding}, not plain utf-8 (a BOM or a coding cookie)"
@@ -497,10 +557,12 @@ def refusal_prefix_gap(source: bytes) -> str:
         source.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
         return f"the source is not strict utf-8: {exc}"
-    if CONTROL_BYTES.search(source):
-        return "the source has a control byte other than tab, LF and CRLF line ends"
     try:
         body = ast.parse(source).body
+    # ValueError (#5589, #5625): for a NUL byte ast.parse raised ValueError on 3.10.22 and SyntaxError on 3.11.17, 3.12.3
+    # and 3.12.7 (the only releases measured; reproducer: python3.10 -c 'import ast; ast.parse(b"x=1\x00\n")').
+    # CONTROL_BYTES refuses NUL above, so a NUL does not reach this arm. The arm stays as the fail-closed reaction and
+    # pin_5589 exercises it with an injected ValueError and with a real NUL once CONTROL_BYTES is disabled.
     except (SyntaxError, ValueError) as exc:
         return f"the source does not parse: {exc}"
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
@@ -522,6 +584,14 @@ def refusal_prefix_gap(source: bytes) -> str:
         if name not in ("print", "sys.exit") or call.keywords or not all(isinstance(a, ast.Constant) for a in call.args):
             return "the refusal body is not print and sys.exit calls with constant arguments"
     return ""
+
+
+def numbered_rules(doc) -> set:
+    """#5622/#5674: the R<n> rule numbers of a docstring: every line that starts with `R<n>:` once its own leading and
+    trailing whitespace is removed. Each line is stripped on its own, so the result does not depend on whether the
+    compiler removed the common indentation (3.13 and later do, 3.12 and older do not)."""
+    found = (re.match(r"(R\d+):", line.strip()) for line in (doc or "").split("\n"))
+    return {match.group(1) for match in found if match}
 
 
 def selftest_dir() -> Path:
@@ -772,107 +842,6 @@ def _self_test_cases() -> int:
             return "parse_plant accepted a probe child that exited non-zero (#5509)"
         if not parse_plant("VERDICT 0 0 1 1 0 -\nPLANTED\n", [], ("-S", "-E")).planted_ran:
             return "parse_plant did not read the planted marker (#5473)"
-        # #5510: nothing may execute above the refusal except `import sys`. The real source must pass; each synthetic
-        # source (mutant M05b and siblings: a dynamic import, an eval, an import in a branch, a class body, a decorator,
-        # a second imported name, a call inside the refusal, a weakened refusal test) must be refused.
-        raw = Path(__file__).read_bytes()
-        source = raw.decode("utf-8")
-
-        def gap(text: str) -> str:
-            return refusal_prefix_gap(text.encode("utf-8"))
-
-        if refusal_prefix_gap(raw):
-            return f"the source has code above the isolation refusal: {refusal_prefix_gap(raw)} (#5510)"
-        marker = "if __name__ == \"__main__\" and not sys.flags.isolated:"
-        before = {"__import__('colorsys')\n", "import json\n", "if False:\n    import json\n", "x = eval('1')\n",
-                  "class C:\n    import json\n", "@(lambda f: f)\ndef g():\n    pass\n", "exec('pass')\n",
-                  "import importlib\nimportlib.import_module('colorsys')\n", "x = 1\n", "from os import path\n"}
-        for inserted in sorted(before):
-            if not gap(source.replace(marker, inserted + marker, 1)):
-                return f"code above the isolation refusal was not refused: {inserted!r} (#5510)"
-        for old, new in (("import sys\n\nif __name__", "import sys, json\n\nif __name__"),
-                         ("import sys\n\nif __name__", "import sys as s\nimport sys\n\nif __name__"),
-                         ("sys.exit(1)", "sys.exit(__import__('colorsys'))"), ("    print(\"## CLAUDE.md rule-change", "    __import__('colorsys')\n    print(\"## CLAUDE.md rule-change"),
-                         ("not sys.flags.isolated:", "not sys.flags.isolated or True:"),
-                         ("import sys\n\nif __name__", "import sys as s\n\nif __name__"), ("sys.exit(1)", "sys.exit(1, **{})"),
-                         ("    sys.exit(1)\n", "    sys.exit(1)\nelse:\n    x = 1\n"), ("not sys.flags.isolated:", "not sys.flags.isolated or __import__('colorsys'):"),
-                         (marker, "if True:"), ("import sys\n\nif __name__", "import sys\n\nx = 1\nif __name__")):
-            if old not in source or not gap(source.replace(old, new, 1)):
-                return f"a changed refusal or import line was not refused: {new!r} (#5510)"
-        if not gap("") or not gap("import sys\n"):
-            return "a source without the refusal was not refused (#5510)"
-        # #5560: the check works on the BYTES and is closed-world about encoding and control bytes. Each source below
-        # was accepted by the text based check of f95e295a0 (the utf-7 spellings even ran hidden code) or only
-        # refused by accident; each must be refused with a stated reason.
-        refusal = 'import sys\nif __name__ == "__main__" and not sys.flags.isolated:\n    print("refused")\n    sys.exit(1)\n'
-        hidden = 'import sys\n#+AAo-print("hidden")\nif __name__ == "__main__" and not sys.flags.isolated:\n    print("refused")\n    sys.exit(1)\n'
-        plain = ('"""doc"""\n' + refusal).encode("utf-8")
-        if refusal_prefix_gap(plain) or refusal_prefix_gap(b"#!/usr/bin/env python3\n# coding: utf-8\n" + plain) \
-                or refusal_prefix_gap(b"# -*- coding: utf8 -*-\n" + plain) or refusal_prefix_gap(b'"""doc"""\r\n' + refusal.encode().replace(b"\n", b"\r\n")):
-            return "a plain utf-8 source (shebang, utf-8 cookie, CRLF) was refused (#5560)"
-        encodings = {
-            "utf-7 cookie on line 1": b"# coding: utf-7\n" + b'"""doc"""\n' + hidden.encode(),
-            "utf-7 cookie on line 2 under a shebang": b"#!/usr/bin/env python3\n# coding: utf-7\n" + b'"""doc"""\n' + hidden.encode(),
-            "utf-16 with BOM": ('"""doc"""\n' + refusal).encode("utf-16"),
-            "utf-8 BOM and a latin-1 cookie": b"\xef\xbb\xbf# coding: latin-1\n" + plain,
-            "utf-8 BOM alone": b"\xef\xbb\xbf" + plain,
-            "vim style utf-7 cookie": b"# vim: set fileencoding=utf-7 :\n" + b'"""doc"""\n' + hidden.encode(),
-            "emacs style utf-7 cookie": b"# -*- coding: utf-7 -*-\n" + b'"""doc"""\n' + hidden.encode(),
-            "latin-1 cookie with a latin-1 byte": b"# coding: latin-1\n" + '"""d\xe9"""\n'.encode("latin-1") + refusal.encode(),
-            "unknown cookie": b"# coding: no-such-codec\n" + plain,
-            "bytes that are not utf-8": b'"""d\xff"""\n' + refusal.encode(),
-            "CR-only line ends": ('"""doc"""\rimport sys\r# note\rimport json\r' + refusal.split("import sys\n", 1)[1]).replace("\n", "\r").encode(),
-            "a lone CR inside a comment": b'"""doc"""\nimport sys\n# note\rimport json\n' + refusal.split("import sys\n", 1)[1].encode(),
-            "form feed": b'"""doc"""\nimport sys\n\x0c\n' + refusal.split("import sys\n", 1)[1].encode(),
-            "NUL": b'"""doc"""\nimport sys\n#\x00\n' + refusal.split("import sys\n", 1)[1].encode(),
-            "vertical tab": b'"""doc"""\nimport sys\n\x0b\n' + refusal.split("import sys\n", 1)[1].encode(),
-            "DEL": b'"""doc"""\nimport sys\n#\x7f\n' + refusal.split("import sys\n", 1)[1].encode(),
-            "line continuation backslash": b'"""doc"""\nimport sys\n\\\n' + refusal.split("import sys\n", 1)[1].encode(),
-            "backslash in the docstring slot": b'"""doc \\\nmore"""\n' + refusal.encode(),
-            "a str instead of bytes": '"""doc"""\n' + refusal,
-        }
-        # The structure check also sees most of these, because ast.parse of the bytes honours the cookie. Each gate is
-        # therefore also pinned on a source that is structurally valid, so no gate is carried by another one.
-        benign = {
-            "a benign utf-7 cookie": b"# coding: utf-7\n" + plain,
-            "a benign utf-7 cookie on line 2 under a shebang": b"#!/usr/bin/env python3\n# coding: utf-7\n" + plain,
-            "a benign vim style cookie": b"# vim: set fileencoding=utf-7 :\n" + plain,
-            "a benign emacs style cookie": b"# -*- coding: utf-7 -*-\n" + plain,
-            "a benign latin-1 cookie": b"# coding: latin-1\n" + plain,
-            "a benign latin-1 cookie on line 2": b"#!/usr/bin/env python3\n# coding: iso-8859-1\n" + plain,
-            "all CR line ends": ('"""doc"""\n' + refusal).replace("\n", "\r").encode("utf-8"),
-            "an invalid utf-8 byte after line 2": b'"""doc"""\n# note\n# \xff\n' + refusal.encode(),
-            "a CRLF line continuation backslash": b'"""doc"""\r\nimport sys\r\n\\\r\n' + refusal.split("import sys\n", 1)[1].replace("\n", "\r\n").encode(),
-        }
-        for byte in [*range(0, 9), 11, 12, *range(14, 32), 127]:
-            benign[f"control byte {byte:#04x} in a comment"] = b'"""doc"""\nimport sys\n#' + bytes([byte]) + b"\n" + refusal.split("import sys\n", 1)[1].encode()
-        for label, data in {**encodings, **benign}.items():
-            if not refusal_prefix_gap(data):
-                return f"a source with {label} was not refused (#5560)"
-        # imported_modules reads the bytes the way the interpreter does: a utf-7 comment that hides an import is seen.
-        hidden_import = base_dir / "hidden-import.py"
-        hidden_import.write_bytes(b"# coding: utf-7\n#+AAo-import colorsys\nimport sys\n")
-        if "colorsys" not in imported_modules(hidden_import):
-            return "imported_modules did not see an import hidden behind a coding cookie (#5560)"
-        # #5562: only a real docstring (a str constant) is stripped from the front. Any other first statement must be
-        # refused, however harmless it looks, so it cannot be mistaken for the docstring.
-        tail = refusal
-        for label, first in (("a call", "__import__('colorsys')\n"), ("a number", "1\n"), ("a bytes literal", "b'doc'\n"),
-                             ("an f-string", "f'{__import__(\"colorsys\")}'\n"), ("a name", "x\n"),
-                             ("a docstring-like call", "str('doc')\n"), ("an ellipsis", "...\n"), ("None", "None\n")):
-            if not gap(first + tail):
-                return f"{label} in the docstring slot was not refused (#5562)"
-        if gap('"""doc"""\n' + tail) or gap(tail):
-            return "a plain docstring or no docstring was refused (#5562)"
-        # #5563: the refusal body may call only print and sys.exit. Each other callable, with constant arguments and
-        # followed by the valid print and sys.exit, must be refused, so the whitelist cannot grow unseen.
-        head = 'import sys\nif __name__ == "__main__" and not sys.flags.isolated:\n'
-        for callee in ("exec", "eval", "compile", "getattr", "setattr", "open", "globals", "vars", "input", "breakpoint",
-                       "type", "os._exit", "sys.exit.__call__", "print.__call__"):
-            if not gap(f'{head}    {callee}("import colorsys")\n    print("refused")\n    sys.exit(1)\n'):
-                return f"a refusal body that calls {callee} was not refused (#5563)"
-        if gap(f'{head}    print("refused")\n    sys.exit(1)\n') or gap(f'{head}    print("a", "b")\n    sys.exit(2)\n'):
-            return "a refusal body of print and sys.exit calls was refused (#5563)"
         names = list(EXPECTED_IMPORTS)  # the probe set is the pin, never the output of imported_modules (#5472)
         if "importlib" not in names:
             return "importlib is not in the plant set"
@@ -952,6 +921,463 @@ def _self_test_cases() -> int:
             return "the probe child's flag report does not follow the flags it was started with (#5473)"
         print(f"INFO: self-test - importlib already loaded without -S: {no_s.preloaded} (measured, not assumed)")
         return ""
+
+    # The refusal_prefix_gap pins (#5628): the refusal_pins table below lists them. run_refusal_pins requires the table
+    # to equal the pin_<number> functions and names in this file (found by ast at any depth) and requires that no pin
+    # starts a child process; planted cases prove each half trips (#5677). Each pin has its own function and its own
+    # PASS/FAIL line (#5591), separate from importlib_plant, whose banner and issue tags they would otherwise borrow.
+    raw = Path(__file__).read_bytes()
+    source = raw.decode("utf-8")
+
+    def gap(text: str) -> str:
+        return refusal_prefix_gap(text.encode("utf-8"))
+
+    def pin_sources():
+        refusal = 'import sys\nif __name__ == "__main__" and not sys.flags.isolated:\n    print("refused")\n    sys.exit(1)\n'
+        hidden = 'import sys\n#+AAo-print("hidden")\nif __name__ == "__main__" and not sys.flags.isolated:\n    print("refused")\n    sys.exit(1)\n'
+        plain = ('"""doc"""\n' + refusal).encode("utf-8")
+        return refusal, hidden, plain
+
+    def pin_5510():
+        # #5510/#5628: nothing may execute above the refusal except `import sys`. The real source must pass; each
+        # synthetic source below (code above the refusal, a second or aliased imported name, a changed refusal test, a
+        # call or keyword in the refusal body, an else branch) must be refused.
+        if refusal_prefix_gap(raw):
+            return f"the source has code above the isolation refusal: {refusal_prefix_gap(raw)} (#5510)"
+        marker = "if __name__ == \"__main__\" and not sys.flags.isolated:"
+        before = {"__import__('colorsys')\n", "import json\n", "if False:\n    import json\n", "x = eval('1')\n",
+                  "class C:\n    import json\n", "@(lambda f: f)\ndef g():\n    pass\n", "exec('pass')\n",
+                  "import importlib\nimportlib.import_module('colorsys')\n", "x = 1\n", "from os import path\n"}
+        for inserted in sorted(before):
+            if not gap(source.replace(marker, inserted + marker, 1)):
+                return f"code above the isolation refusal was not refused: {inserted!r} (#5510)"
+        for old, new in (("import sys\n\nif __name__", "import sys, json\n\nif __name__"),
+                         ("import sys\n\nif __name__", "import sys as s\nimport sys\n\nif __name__"),
+                         ("sys.exit(1)", "sys.exit(__import__('colorsys'))"), ("    print(\"## CLAUDE.md rule-change", "    __import__('colorsys')\n    print(\"## CLAUDE.md rule-change"),
+                         ("not sys.flags.isolated:", "not sys.flags.isolated or True:"),
+                         ("import sys\n\nif __name__", "import sys as s\n\nif __name__"), ("sys.exit(1)", "sys.exit(1, **{})"),
+                         ("    sys.exit(1)\n", "    sys.exit(1)\nelse:\n    x = 1\n"), ("not sys.flags.isolated:", "not sys.flags.isolated or __import__('colorsys'):"),
+                         (marker, "if True:"), ("import sys\n\nif __name__", "import sys\n\nx = 1\nif __name__")):
+            if old not in source or not gap(source.replace(old, new, 1)):
+                return f"a changed refusal or import line was not refused: {new!r} (#5510)"
+        if not gap("") or not gap("import sys\n"):
+            return "a source without the refusal was not refused (#5510)"
+        return ""
+
+    def pin_5560():
+        # #5560: the check works on the BYTES and is closed-world about encoding and control bytes. Each source below
+        # was accepted by the text based check of f95e295a0 (the utf-7 spellings even ran hidden code) or only
+        # refused by accident; each must be refused with a stated reason.
+        refusal, hidden, plain = pin_sources()
+        if refusal_prefix_gap(plain) or refusal_prefix_gap(b"#!/usr/bin/env python3\n# coding: utf-8\n" + plain) \
+                or refusal_prefix_gap(b"# -*- coding: utf8 -*-\n" + plain) or refusal_prefix_gap(b'"""doc"""\r\n' + refusal.encode().replace(b"\n", b"\r\n")):
+            return "a plain utf-8 source (shebang, utf-8 cookie, CRLF) was refused (#5560)"
+        encodings = {
+            "utf-7 cookie on line 1": b"# coding: utf-7\n" + b'"""doc"""\n' + hidden.encode(),
+            "utf-7 cookie on line 2 under a shebang": b"#!/usr/bin/env python3\n# coding: utf-7\n" + b'"""doc"""\n' + hidden.encode(),
+            "utf-16 with BOM": ('"""doc"""\n' + refusal).encode("utf-16"),
+            "utf-8 BOM and a latin-1 cookie": b"\xef\xbb\xbf# coding: latin-1\n" + plain,
+            "utf-8 BOM alone": b"\xef\xbb\xbf" + plain,
+            "vim style utf-7 cookie": b"# vim: set fileencoding=utf-7 :\n" + b'"""doc"""\n' + hidden.encode(),
+            "emacs style utf-7 cookie": b"# -*- coding: utf-7 -*-\n" + b'"""doc"""\n' + hidden.encode(),
+            "latin-1 cookie with a latin-1 byte": b"# coding: latin-1\n" + '"""d\xe9"""\n'.encode("latin-1") + refusal.encode(),
+            "unknown cookie": b"# coding: no-such-codec\n" + plain,
+            "bytes that are not utf-8": b'"""d\xff"""\n' + refusal.encode(),
+            "CR-only line ends": ('"""doc"""\rimport sys\r# note\rimport json\r' + refusal.split("import sys\n", 1)[1]).replace("\n", "\r").encode(),
+            "a lone CR inside a comment": b'"""doc"""\nimport sys\n# note\rimport json\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "form feed": b'"""doc"""\nimport sys\n\x0c\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "NUL": b'"""doc"""\nimport sys\n#\x00\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "vertical tab": b'"""doc"""\nimport sys\n\x0b\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "DEL": b'"""doc"""\nimport sys\n#\x7f\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "line continuation backslash": b'"""doc"""\nimport sys\n\\\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "backslash in the docstring slot": b'"""doc \\\nmore"""\n' + refusal.encode(),
+            "a str instead of bytes": '"""doc"""\n' + refusal,
+        }
+        # The structure check also sees most of these, because ast.parse of the bytes honours the cookie. Each gate is
+        # therefore also pinned on a source that is structurally valid, so no gate is carried by another one.
+        benign = {
+            "a benign utf-7 cookie": b"# coding: utf-7\n" + plain,
+            "a benign utf-7 cookie on line 2 under a shebang": b"#!/usr/bin/env python3\n# coding: utf-7\n" + plain,
+            "a benign vim style cookie": b"# vim: set fileencoding=utf-7 :\n" + plain,
+            "a benign emacs style cookie": b"# -*- coding: utf-7 -*-\n" + plain,
+            "a benign latin-1 cookie": b"# coding: latin-1\n" + plain,
+            "a benign latin-1 cookie on line 2": b"#!/usr/bin/env python3\n# coding: iso-8859-1\n" + plain,
+            "all CR line ends": ('"""doc"""\n' + refusal).replace("\n", "\r").encode("utf-8"),
+            "an invalid utf-8 byte after line 2": b'"""doc"""\n# note\n# \xff\n' + refusal.encode(),
+            "a CRLF line continuation backslash": b'"""doc"""\r\nimport sys\r\n\\\r\n' + refusal.split("import sys\n", 1)[1].replace("\n", "\r\n").encode(),
+        }
+        for byte in [*range(0, 9), 11, 12, *range(14, 32), 127]:
+            benign[f"control byte {byte:#04x} in a comment"] = b'"""doc"""\nimport sys\n#' + bytes([byte]) + b"\n" + refusal.split("import sys\n", 1)[1].encode()
+        for label, data in {**encodings, **benign}.items():
+            if not refusal_prefix_gap(data):
+                return f"a source with {label} was not refused (#5560)"
+        # imported_modules reads the bytes the way the interpreter does: a utf-7 comment that hides an import is seen.
+        hidden_import = base_dir / "hidden-import.py"
+        hidden_import.write_bytes(b"# coding: utf-7\n#+AAo-import colorsys\nimport sys\n")
+        if "colorsys" not in imported_modules(hidden_import):
+            return "imported_modules did not see an import hidden behind a coding cookie (#5560)"
+        return ""
+
+    def pin_5562():
+        # #5562: only a real docstring (a str constant) is stripped from the front. Any other first statement must be
+        # refused, however harmless it looks, so it cannot be mistaken for the docstring.
+        refusal, hidden, plain = pin_sources()
+        tail = refusal
+        for label, first in (("a call", "__import__('colorsys')\n"), ("a number", "1\n"), ("a bytes literal", "b'doc'\n"),
+                             ("an f-string", "f'{__import__(\"colorsys\")}'\n"), ("a name", "x\n"),
+                             ("a docstring-like call", "str('doc')\n"), ("an ellipsis", "...\n"), ("None", "None\n")):
+            if not gap(first + tail):
+                return f"{label} in the docstring slot was not refused (#5562)"
+        if gap('"""doc"""\n' + tail) or gap(tail):
+            return "a plain docstring or no docstring was refused (#5562)"
+        return ""
+
+    def pin_5563():
+        # #5563: the refusal body may call only print and sys.exit. Each other callable, with constant arguments and
+        # followed by the valid print and sys.exit, must be refused: each callee listed below is shown to be outside the whitelist.
+        head = 'import sys\nif __name__ == "__main__" and not sys.flags.isolated:\n'
+        for callee in ("exec", "eval", "compile", "getattr", "setattr", "open", "globals", "vars", "input", "breakpoint",
+                       "type", "os._exit", "sys.exit.__call__", "print.__call__"):
+            if not gap(f'{head}    {callee}("import colorsys")\n    print("refused")\n    sys.exit(1)\n'):
+                return f"a refusal body that calls {callee} was not refused (#5563)"
+        if gap(f'{head}    print("refused")\n    sys.exit(1)\n') or gap(f'{head}    print("a", "b")\n    sys.exit(2)\n'):
+            return "a refusal body of print and sys.exit calls was refused (#5563)"
+        return ""
+
+    def pin_5588():
+        # #5588/#5626: ANY exception from tokenize.detect_encoding refuses, not only the SyntaxError it raises for an unknown
+        # codec, a BOM with a different cookie and an undecodable first line (asserted below on the running
+        # interpreter; no other input was checked). The injected LookupError, StopIteration and RuntimeError make the broad
+        # catch load-bearing: narrowing it back to SyntaxError turns this pin red.
+        refusal, hidden, plain = pin_sources()
+        real = tokenize.detect_encoding
+        try:
+            for injected in (LookupError("injected"), StopIteration(), RuntimeError("injected")):
+                def boom(readline, injected=injected):
+                    raise injected
+
+                tokenize.detect_encoding = boom
+                try:
+                    why = refusal_prefix_gap(plain)
+                except Exception as exc:  # the injected failure must not escape: an escape is a fail-open crash path
+                    return f"a {type(injected).__name__} from detect_encoding escaped refusal_prefix_gap as {exc!r} (#5588)"
+                if "the source encoding cannot be determined" not in why:
+                    return f"a {type(injected).__name__} from detect_encoding did not refuse (#5588)"
+        finally:
+            tokenize.detect_encoding = real
+        for label, data in (("an unknown codec", b"# coding: nope\n" + plain), ("a BOM with a different cookie", b"\xef\xbb\xbf# coding: latin-1\n" + plain),
+                            ("an undecodable first line", b"# \xff\n" + plain)):
+            try:
+                tokenize.detect_encoding(iter(data.splitlines(keepends=True)).__next__)
+                return f"detect_encoding accepted {label}, so the comment's SyntaxError claim is untested (#5626)"
+            except Exception as exc:  # the type is the claim
+                if type(exc) is not SyntaxError:
+                    return f"detect_encoding raised {type(exc).__name__}, not SyntaxError, for {label} (#5626)"
+        if "the source encoding cannot be determined: unknown encoding" not in refusal_prefix_gap(b"# coding: nope\n" + plain):
+            return "an unknown coding cookie was not refused with the encoding reason (#5588)"
+        if refusal_prefix_gap(plain):
+            return "a plain utf-8 source was refused after the injected detect_encoding was restored (#5588)"
+        return ""
+
+    def pin_5589():
+        # #5589/#5625: a ValueError from ast.parse refuses. For a NUL byte ast.parse raised ValueError on 3.10.22 and
+        # SyntaxError on 3.11.17, 3.12.3 and 3.12.7 (measured); CONTROL_BYTES refuses NUL first. The injected ValueError
+        # keeps the arm load-bearing: dropping ValueError from the except turns this pin red. A real NUL is also run with
+        # CONTROL_BYTES disabled, so the arm is shown to catch whatever this interpreter raises for it. A real NUL and a
+        # real syntax error are pinned with their own reasons.
+        refusal, hidden, plain = pin_sources()
+        real = ast.parse
+        try:
+            def boom(*args, **kwargs):
+                raise ValueError("injected")
+
+            ast.parse = boom
+            try:
+                why = refusal_prefix_gap(plain)
+            except Exception as exc:  # an escaping ValueError would be a crash path, not a refusal
+                return f"a ValueError from ast.parse escaped refusal_prefix_gap as {exc!r} (#5589)"
+            if "the source does not parse: injected" not in why:
+                return f"a ValueError from ast.parse was not refused with the parse reason (#5589): {why!r}"
+        finally:
+            ast.parse = real
+        if "control byte" not in refusal_prefix_gap(plain + b"#\x00\n"):
+            return "a NUL byte was not refused with the control byte reason (#5589)"
+        try:
+            ast.parse(plain + b"#\x00\n")
+            return "ast.parse accepted a NUL byte, so the arm cannot be shown to catch it (#5625)"
+        except (SyntaxError, ValueError) as nul_exc:
+            print(f"INFO: self-test - ast.parse of a NUL byte raises {type(nul_exc).__name__} on {sys.version.split()[0]} (measured)")
+        real_control = CONTROL_BYTES
+        try:
+            globals()["CONTROL_BYTES"] = re.compile(rb"(?!)")
+            try:
+                why = refusal_prefix_gap(plain + b"#\x00\n")
+            except Exception as exc:  # the real exception of this interpreter must be caught by the arm
+                return f"a real NUL byte reached ast.parse and its {type(exc).__name__} escaped refusal_prefix_gap (#5625)"
+        finally:
+            globals()["CONTROL_BYTES"] = real_control
+        if "the source does not parse" not in why:
+            return f"a real NUL byte with CONTROL_BYTES disabled was not refused with the parse reason: {why!r} (#5625)"
+        if "the source does not parse" not in refusal_prefix_gap(b"def (\n" + plain):
+            return "a syntax error was not refused with the parse reason (#5589)"
+        if refusal_prefix_gap(plain):
+            return "a plain utf-8 source was refused after the injected ast.parse was restored (#5589)"
+        return ""
+
+    def pin_5590():
+        # #5590/#5622: every numbered rule R<n> of the refusal_prefix_gap docstring has an assertion group below, and the
+        # last check fails when the docstring numbers a rule that no group asserts.
+        refusal, hidden, plain = pin_sources()
+        tail = refusal.split("import sys\n", 1)[1].encode()
+        asserted = set()
+        for label, arg in (("a str", plain.decode("utf-8")), ("None", None), ("an int", 7)):  # R1
+            if refusal_prefix_gap(arg) != "the source is not bytes":
+                return f"the docstring says {label} is refused as not bytes but the reason was {refusal_prefix_gap(arg)!r} (R1)"
+        if refusal_prefix_gap(bytearray(plain)) or refusal_prefix_gap(bytearray(b"# coding: nope\n" + plain)) == "":
+            return "the docstring says a bytearray is judged as the bytes it holds but its verdict differs from the bytes verdict (R1, #5623)"
+        if refusal_prefix_gap(memoryview(plain)) != "the source is not bytes":
+            return "the docstring says an argument that is neither bytes nor bytearray is refused but a memoryview was not (R1, #5623)"
+        asserted.add("R1")
+        bom = b"\xef\xbb\xbf"  # R2
+        for cookie in (b"", b"# coding: utf-8\n", b"# coding: utf8\n", b"# coding: utf-8-sig\n", b"# coding: latin-1\n",
+                       b"# coding: utf-7\n", b"# coding: nope\n"):
+            if not refusal_prefix_gap(bom + cookie + plain):
+                return f"the docstring says a utf-8 BOM with cookie {cookie!r} is refused but it was accepted (R2)"
+        asserted.add("R2")
+        accepted = {"UTF_8 cookie": b"# coding: UTF_8\n", "utf-8-sig cookie without a BOM": b"# coding: utf-8-sig\n",
+                    "utf-8-x cookie": b"# coding: utf-8-x\n", "upper-case UTF-8 cookie": b"# coding: UTF-8\n",
+                    "lower-case utf8 cookie": b"# coding: utf8\n", "utf_8 cookie": b"# coding: utf_8\n",
+                    "mixed-case Utf-8 cookie": b"# coding: Utf-8\n", "utf-8 cookie on line 2 under a shebang": b"#!/usr/bin/env python3\n# coding: utf-8\n"}
+        for label, prefix in accepted.items():  # R3
+            if refusal_prefix_gap(prefix + plain):
+                return f"the docstring says a {label} is accepted but it was refused (R3, #5590)"
+        refused = {"UTF8 cookie": (b"# coding: UTF8\n" + plain, "declares the encoding UTF8"),
+                   "Utf8 cookie": (b"# coding: Utf8\n" + plain, "declares the encoding Utf8"),
+                   "utf-7 cookie": (b"# coding: utf-7\n" + plain, "declares the encoding utf-7"),
+                   "latin-1 cookie": (b"# coding: latin-1\n" + plain, "declares the encoding iso-8859-1"),
+                   "unknown codec": (b"# coding: nope\n" + plain, "the source encoding cannot be determined"),
+                   "utf-8 BOM alone": (bom + plain, "declares the encoding utf-8-sig"),
+                   "utf-8 BOM and a utf-8-sig cookie": (bom + b"# coding: utf-8-sig\n" + plain, "declares the encoding utf-8-sig")}
+        for label, (data, needle) in refused.items():
+            why = refusal_prefix_gap(data)
+            if needle not in why:
+                return f"the docstring says {label} is refused with {needle!r} but the reason was {why!r} (R3, #5590)"
+        # #5675, #5771: detect_encoding returns utf-16 for a utf-16 cookie on 3.9.25 to 3.13.16 and raises SyntaxError on
+        # 3.14.8. The cookie is judged before detect_encoding, so the reason is the same under the real detect_encoding
+        # and under one that raises the way 3.14.8 does.
+        real_detect, utf16 = tokenize.detect_encoding, b"# coding: utf-16\n" + plain
+
+        def detect_like_314(readline):
+            first = readline()
+            if b"utf-16" in first:
+                raise SyntaxError("invalid or missing encoding declaration")
+            lines = iter([first])
+            return real_detect(lambda: next(lines, b"") or readline())
+
+        try:
+            for label, detect in (("the running detect_encoding", real_detect), ("a 3.14-style detect_encoding", detect_like_314)):
+                tokenize.detect_encoding = detect
+                for data in (utf16, b"#!/usr/bin/env python3\n" + utf16, b"\n" + utf16,
+                             b"# vim: set fileencoding=utf-16 :\n" + plain):
+                    why = refusal_prefix_gap(data)
+                    if "the source declares the encoding utf-16, not plain utf-8" not in why:
+                        return f"a utf-16 cookie gave {why!r} under {label}, not the declared-encoding reason (R3, #5771)"
+                # #5771: a non-utf-8 cookie line was read differently by 3.14.8; it is refused before detect_encoding.
+                for data, needle in ((b"# \xff coding: latin-1\n" + plain, "line 1 can hold a coding cookie and is not"),
+                                     (b"\n# \xff\n" + plain, "line 2 can hold a coding cookie and is not utf-8"),
+                                     (b"x = 1\n# \xff\n" + plain, "the source is not strict utf-8")):
+                    why = refusal_prefix_gap(data)
+                    if needle not in why:
+                        return f"{data[:12]!r} gave {why!r} under {label}, not {needle!r} (R3, #5771)"
+        finally:
+            tokenize.detect_encoding = real_detect
+        # #5771: a source that starts with a utf-8 BOM is left to detect_encoding (the same reason on 3.9.25 to 3.14.8).
+        if cookie_gap(bom + b"# \xff\n" + plain) or cookie_gap(bom + b"# coding: latin-1\n" + plain):
+            return "the docstring says cookie_gap leaves a source that starts with a BOM to detect_encoding (R3, #5771)"
+        for label, spelling in (("UTF8", b"UTF8"), ("Utf8", b"Utf8"), ("utf-8-sig without a BOM", b"utf-8-sig"), ("utf_8", b"utf_8")):
+            try:
+                compile(b"# coding: " + spelling + b"\nx = 1\n", "f", "exec")
+            except SyntaxError as exc:
+                return f"the docstring says compile() accepts the cookie {label} but it raised {exc!r} (R3, #5624)"
+        try:
+            compile(b"# coding: nope\nx = 1\n", "f", "exec")
+            return "the docstring says compile() rejects an unknown codec but it accepted one (R3, #5624)"
+        except SyntaxError:
+            pass
+        for label, prefix, judged in (("blank line 1", b"\n", True), ("comment line 1", b"# note\n", True), ("a shebang", b"#!/usr/bin/env python3\n", True),
+                                      ("a CRLF blank line 1", b"\r\n", True), ("a code line 1", b"x = 1\n", False)):
+            why = refusal_prefix_gap(prefix + b"# coding: utf-7\n" + plain)
+            if ("declares the encoding utf-7" in why) != judged:
+                return f"the docstring says a cookie on line 2 after {label} is {'judged' if judged else 'not judged'} but the reason was {why!r} (R3, #5624)"
+        # #5771: cookie_gap itself (not detect_encoding) judges line 2 after a CRLF blank line 1.
+        if "utf-7" not in cookie_gap(b"\r\n# coding: utf-7\n" + plain):
+            return "the docstring says cookie_gap judges line 2 after a blank line 1 that ends in CRLF (R3, #5771)"
+        asserted.add("R3")
+        for label, data in {"a byte after line 2": b'"""doc"""\n# note\n# \xff\n' + refusal.encode(), "an overlong form": b'"""doc"""\n# note\n# \xc0\xaf\n' + refusal.encode(),
+                            "an encoded surrogate": b'"""doc"""\n# note\n# \xed\xa0\x80\n' + refusal.encode()}.items():  # R4
+            why = refusal_prefix_gap(data)
+            if "the source is not strict utf-8" not in why:
+                return f"the docstring says {label} that is not strict utf-8 is refused with that reason but it was {why!r} (R4)"
+        asserted.add("R4")
+        for byte in [*range(0, 9), 11, 12, *range(14, 32), 127]:  # R5: refused wherever it is
+            for where, data in (("at the end", plain + b"#" + bytes([byte]) + b"\n"), ("in the docstring", b'"""d' + bytes([byte]) + b'"""\n' + refusal.encode()),
+                                ("on line 1", b"#" + bytes([byte]) + b"\n" + plain)):
+                if "control byte" not in refusal_prefix_gap(data):
+                    return f"the docstring says control byte {byte:#04x} {where} is refused with the control byte reason but it was not (R5)"
+        # #5681: on 3.14 detect_encoding raises SyntaxError for a NUL on line 1 or 2 (3.13 and older return utf-8). The
+        # control-byte reason must not depend on that, so the NUL cases run again under a detect_encoding that does it.
+        def detect_nul_like_314(readline):
+            seen = [readline(), readline()]
+            if any(b"\x00" in line for line in seen):
+                raise SyntaxError("source code cannot contain null bytes")
+            lines = iter(seen)
+            return real_detect(lambda: next(lines, b"") or readline())
+
+        try:
+            tokenize.detect_encoding = detect_nul_like_314
+            for where, data in (("in the docstring on line 1", b'"""d\x00"""\n' + refusal.encode()), ("on line 1", b"#\x00\n" + plain),
+                                ("on line 2", b"# note\n#\x00\n" + plain)):
+                if "control byte" not in refusal_prefix_gap(data):
+                    return f"a NUL {where} under a 3.14-style detect_encoding was refused with {refusal_prefix_gap(data)!r}, not the control byte reason (R5, #5681)"
+            if refusal_prefix_gap(plain):
+                return "a plain source was refused under the 3.14-style detect_encoding (R5, #5681)"
+        finally:
+            tokenize.detect_encoding = real_detect
+        for label, data in {"a lone CR at the end": plain + b"#\r", "a CR before CR LF": plain.replace(b"\n", b"\r\r\n", 1)}.items():
+            if "control byte" not in refusal_prefix_gap(data):
+                return f"the docstring says {label} is refused with the control byte reason but it was not (R5)"
+        for label, data in {"a tab in a comment": plain + b"#\t\n", "CRLF line ends": plain.replace(b"\n", b"\r\n")}.items():
+            if refusal_prefix_gap(data):
+                return f"the docstring says {label} is not a refused control byte but it was refused: {refusal_prefix_gap(data)!r} (R5)"
+        asserted.add("R5")
+        bs = "ends with a line-continuation backslash"
+        for label, data in {"a comment ending in a backslash": b"# path C:\\\n" + plain,
+                            "a comment ending in a backslash after a cookie": b"# coding: utf-8\n# path C:\\\n" + plain,
+                            "a comment ending in a backslash with CRLF": b'"""doc"""\r\n# C:\\\r\n' + refusal.encode().replace(b"\n", b"\r\n"),
+                            "a real line continuation": b'"""doc"""\nimport sys\n\\\n' + tail,
+                            "a backslash that ends the docstring slot line": b'"""doc \\\nmore"""\n' + refusal.encode()}.items():  # R6
+            why = refusal_prefix_gap(data)
+            if bs not in why:
+                return f"the docstring says {label} is refused with the backslash reason but it was {why!r} (R6)"
+        below = plain.replace(b'print("refused")', b'print("refused", \\\n    "x")')
+        if b"\\\n" not in below or refusal_prefix_gap(below):
+            return "the docstring says only a line ABOVE the refusal is refused for a backslash, but a backslash line inside the refusal body was refused (R6)"
+        asserted.add("R6")
+        for label, first in (("a dynamic import", "__import__('colorsys')\n"), ("an eval", "x = eval('1')\n"), ("an exec", "exec('pass')\n"),
+                             ("a branch", "if False:\n    import json\n"), ("a class body", "class C:\n    import json\n"),
+                             ("a decorator", "@(lambda f: f)\ndef g():\n    pass\n"), ("a def", "def g():\n    pass\n")):  # R7
+            if not refusal_prefix_gap(('"""doc"""\nimport sys\n' + first + refusal.split("import sys\n", 1)[1]).encode()):
+                return f"the docstring says {label} above the refusal is refused but it was accepted (R7)"
+        asserted.add("R7")
+        marker = base_dir / "never-executed-5624.txt"  # the first paragraph: parsed with ast, never executed
+        marker.unlink(missing_ok=True)
+        if not refusal_prefix_gap(f'"""doc"""\nopen({str(marker)!r}, "w").close()\nimport sys\n'.encode() + tail) or marker.exists():
+            return "the docstring says the source is never executed but a statement above the refusal ran or was not refused (#5624)"
+        # #5674: 3.13 and later remove the common indentation of a docstring at compile time (3.12 and older keep it),
+        # so the rule numbers must read the same from both forms. Both forms are built here on every interpreter.
+        doc_lines = (refusal_prefix_gap.__doc__ or "").split("\n")
+        indents = [len(line) - len(line.lstrip()) for line in doc_lines[1:] if line.strip()]
+        dedented = "\n".join(doc_lines[:1] + [line[min(indents or [0]):] for line in doc_lines[1:]])
+        indented = "\n".join(dedented.split("\n")[:1] + ["    " + line for line in dedented.split("\n")[1:]])
+        if not re.search(r"^R1:", dedented, re.M) or not re.search(r"^    R1:", indented, re.M):
+            return "the 3.13-form and 3.12-form docstrings were not built with R1 at column 0 and at column 4 (#5674)"
+        numbered = numbered_rules(refusal_prefix_gap.__doc__)
+        for label, form in (("3.13 dedented", dedented), ("3.12 indented", indented)):
+            if numbered_rules(form) != numbered:
+                return f"the {label} docstring numbers the rules {sorted(numbered_rules(form))}, not {sorted(numbered)} (#5674)"
+        def wide_doc_lines(text):
+            doc_node = next(node for node in ast.parse(text).body if isinstance(node, ast.FunctionDef)
+                            and node.name == "refusal_prefix_gap").body[0]
+            return [(doc_node.lineno + index, len(line)) for index, line in
+                    enumerate(text.split("\n")[doc_node.lineno - 1:doc_node.end_lineno]) if len(line) > 120]
+
+        # #5678: a planted 121-character docstring line is reported and a 120-character one is not.
+        plant = 'def refusal_prefix_gap(source):\n    """{}\n    """\n'
+        if wide_doc_lines(plant.format("x" * 114)) != [(2, 121)] or wide_doc_lines(plant.format("x" * 113)):
+            return "the docstring width check does not report exactly the planted 121-character line (#5678)"
+        if wide_doc_lines(source):
+            return f"the docstring has lines over 120 characters (line, length): {wide_doc_lines(source)} (#5678)"
+        if not numbered or numbered != asserted:
+            return f"the docstring numbers the rules {sorted(numbered)} but pin_5590 asserts {sorted(asserted)} (#5622)"
+        return ""
+
+    def run_pin(issue, check):
+        # #5627: a pin that raises is a failed pin named after itself, not a traceback that hides the pins after it.
+        try:
+            return check()
+        except Exception as exc:  # Exception only: KeyboardInterrupt and SystemExit still stop the self-test
+            return f"the pin {issue} raised {type(exc).__name__}: {exc}"
+
+    def raising_pin():
+        raise TypeError("planted")
+
+    def run_refusal_pins(table, pin_source):
+        """#5628, #5677: run every pin in the table while counting subprocess.Popen calls, then return the results
+        and the gap: the child processes the pins started, and any difference between the table and the pin_<number>
+        functions or names bound anywhere in pin_source (any depth, any indent, found by ast, not by a pattern)."""
+        real_popen, popen_calls = subprocess.Popen, []
+
+        def counting_popen(*args, **kwargs):
+            popen_calls.append(args)
+            return real_popen(*args, **kwargs)
+
+        subprocess.Popen = counting_popen
+        try:
+            results = {pin_issue: run_pin(pin_issue, pin_check) for pin_issue, pin_check in table.items()}
+        finally:
+            subprocess.Popen = real_popen
+        defined = set()
+        for node in ast.walk(ast.parse(pin_source)):
+            name = node.name if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else \
+                node.id if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) else ""
+            if re.fullmatch(r"pin_\d+", name):
+                defined.add("#" + name[4:])
+        gap = [f"a pin started {len(popen_calls)} child process(es)"] if popen_calls else []
+        if set(table) != defined:
+            gap.append(f"the refusal_pins table {sorted(table)} is not the pin_<number> functions {sorted(defined)}")
+        return results, "; ".join(gap)
+
+    def popen_pin():
+        subprocess.Popen([sys.executable, "-I", "-c", ""], stdin=subprocess.DEVNULL).wait()
+        return ""
+
+    refusal_pins = {"#5510": pin_5510, "#5560": pin_5560, "#5562": pin_5562, "#5563": pin_5563, "#5588": pin_5588, "#5589": pin_5589, "#5590": pin_5590}
+    pin_results, pin_gap = run_refusal_pins(refusal_pins, source)
+    if pin_gap:
+        failures.append("refusal pin table")
+        print(f"FAIL: self-test - {pin_gap} (#5628)", file=sys.stderr)
+    # #5677: each half of the gap check has a planted case that must trip it, and only it.
+    green = {pin_issue: (lambda: "") for pin_issue in refusal_pins}
+    nested = source + "\nif True:\n    if True:\n        def pin_9998():\n            return ''\n"
+    plants = (("a table missing a pin", dict(list(green.items())[1:]), source, "is not the pin_<number>"),
+              ("a table with an extra pin", dict(green, **{"#9999": lambda: ""}), source, "is not the pin_<number>"),
+              ("a pin defined at a deeper indent", green, nested, "is not the pin_<number>"),
+              ("a pin bound by assignment", green, source + "\npin_9997 = None\n", "is not the pin_<number>"),
+              ("a pin that starts a child process", {"#9996": popen_pin}, "def pin_9996():\n    pass\n",
+               "child process"))
+    for plant_label, plant_table, plant_source, needle in plants:
+        plant_gap = run_refusal_pins(plant_table, plant_source)[1]
+        other = "child process" if needle != "child process" else "is not the pin_<number>"
+        if needle not in plant_gap or other in plant_gap:
+            failures.append(f"refusal pin plant {plant_label}")
+            print(f"FAIL: self-test - {plant_label} gave the gap {plant_gap!r}, not one naming {needle!r} (#5677)",
+                  file=sys.stderr)
+        else:
+            print(f"PASS: self-test - {plant_label} is reported by the refusal pin check (#5677)")
+    for pin_issue, pin_failure in pin_results.items():
+        if not pin_failure:
+            print(f"PASS: self-test - the refusal_prefix_gap pin {pin_issue} is green")
+        else:
+            failures.append(f"refusal pin {pin_issue}")
+            print(f"FAIL: self-test - the refusal_prefix_gap pin {pin_issue} failed: {pin_failure}", file=sys.stderr)
+
+    ran_after = []
+    planted_raise, after_result = [run_pin("#5627", c) for c in (raising_pin, lambda: ran_after.append(1) or "")]
+    if "raised TypeError: planted" not in planted_raise or after_result != "" or ran_after != [1]:
+        failures.append("refusal pin runner")
+        print(f"FAIL: self-test - a raising pin was not reported as a failed pin: {planted_raise!r} (#5627)", file=sys.stderr)
+    else:
+        print("PASS: self-test - a refusal pin that raises is reported as a failed pin and the later pins still run (#5627)")
 
     plant_failure = importlib_plant()
     if not plant_failure:

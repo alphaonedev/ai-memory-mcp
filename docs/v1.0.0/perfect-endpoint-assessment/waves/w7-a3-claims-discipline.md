@@ -199,7 +199,7 @@ Before any ban-row flips on ROADMAP / release notes / site:
 
 1. **Code green:** feature default or named procurement profile holds the claim.  
 2. **Test pin:** named regression (sqlite + postgres where dual-backend).  
-3. **Codegraph / SSOT:** schema version + env default documented in CLAUDE.md env table if operator-visible.  
+3. **Codegraph / SSOT:** schema version + env default documented in the Environment Variables table of docs/reference/ARCHITECTURE_REFERENCE.md if operator-visible.
 4. **5-agent vote cite** when T1–T6 (public contract / security posture).  
 5. **Edit this table** + ROADMAP §26.5 in the **same** change set (no doc lag).  
 6. **Capabilities honesty:** `memory_capabilities` / TRACT manifest declares residual non-conformance.  
