@@ -861,27 +861,41 @@ jobs:
             and can neither follow a symlink nor land on a name that has since been
             replaced.
           * macOS/BSD (no `O_PATH`). The chmod is `fchmodat` with `AT_SYMLINK_NOFOLLOW`
-            relative to the already-open parent descriptor. Nothing is pinned and no
-            identity check is taken, so this is strictly weaker: the lookup cannot be
-            redirected by an ancestor component, and a symlink at the final component is
-            chmod'ed as the symlink rather than as its target, but the NAME is resolved
-            again at chmod time. An entry swapped between the scan and the widen is
-            widened as whatever now holds that name, and a hardlink planted there shares
-            an inode that may also live outside the scratch tree - staying inside this
-            directory is a property of the namespace, not of the inode. The exposure is
-            bounded - only owner bits are added, only where `_ownable` says this process
-            may chmod the inode back (its own euid owns it, or the euid is 0, which does
-            not bound by ownership at all), and the mode is put back on the way out.
-            Narrowing this leg is tracked as #5852.
+            relative to the already-open parent descriptor, bracketed by an `lstat` of the
+            same name immediately before it and immediately after it. This is narrower
+            than the Linux leg and is NOT equivalent to it. What the bracket buys: the
+            lookup cannot be redirected by an ancestor component, a symlink at the final
+            component is chmod'ed as the symlink rather than as its target, a swap that
+            has already landed when the widen is reached is refused with nothing mutated,
+            and a swap that lands inside the bracket is reported rather than silent. What
+            it does not buy: the NAME is still resolved again at chmod time, so a swap
+            inside the bracket still puts the mode on whatever holds that name at that
+            instant, and a hardlink planted there shares an inode that may also live
+            outside the scratch tree - staying inside this directory is a property of the
+            namespace, not of the inode. The window is narrowed to one syscall, not
+            closed. The exposure is bounded - only owner bits are added, only where
+            `_ownable` says this process may chmod the inode back (its own euid owns it,
+            or the euid is 0, which does not bound by ownership at all). Closing the
+            window would need a way to address an inode with no name, and this platform
+            offers none: `O_EVTONLY` was measured on the macOS leg as an `O_PATH`
+            analogue and refused a mode-0o000 file and directory with EACCES (#5852).
           * Neither mechanism. `Widener` refuses with EPERM rather than widen through a
             name it would have to re-resolve unprotected.
 
-          The widened mode is put back on EVERY exit from the widen - a reopen that
-          raised, an inode that turns out to have been swapped, and the ordinary success
-          - so nothing this walk widened is left widened (#5812). The restore takes the
-          same route as the widen: the pinned descriptor on Linux, the same name - with
-          the caveat above - where there is no `O_PATH`. A reopen after a widening chmod
-          is still checked against the inode that was scanned. Symlinks are never
+          Every exit from the widen puts the widened mode back - a reopen that raised, an
+          inode that turns out to have been swapped, and the ordinary success. What that
+          is worth, again, differs by platform. Where the inode is pinned, the restore
+          addresses the INODE that was scanned, so nothing this walk widened is left
+          widened (#5812). Where it is not, the restore after a SUCCESSFUL reopen goes
+          through the descriptor that was proven to be the scanned inode - so the common
+          path is inode-bound on both platforms - but on the failure exits the name is all
+          there is, and if the name was taken away inside the bracket around the widening
+          chmod, the inode that was widened can no longer be addressed at all. That mode
+          is then left applied, and the run SAYS so: the path and the mode go to stderr as
+          a workflow `::error::` and the exit code is non-zero, because an abandoned widen
+          that is named is recoverable and one that is silent is not (#5812, #5852). A
+          reopen after a widening chmod is still checked against the inode that was
+          scanned. Symlinks are never
           followed and their flags are never cleared (a clear would have to go back
           through a path); a flagged symlink is reported instead. A
           flagged regular file with more than one link is refused, because its inode may
@@ -1060,6 +1074,7 @@ jobs:
               def __init__(self, dirfd, name, st, want_dir):
                   self._dirfd = dirfd
                   self._name = name
+                  self._st = st
                   self._fd = None
                   if HAS_O_PATH:
                       if not os.path.isdir(FD_DIR):
@@ -1079,10 +1094,26 @@ jobs:
                   elif not CAN_CHMOD_NOFOLLOW:
                       raise OSError(errno.EPERM, "no way to widen a mode here without re-resolving the name")
 
+              def _identity(self):
+                  """Read the entry's identity off the NAME and refuse a mismatch.
+
+                  This is the no-`O_PATH` leg's stand-in for a pin, and it is strictly
+                  weaker than one: it brackets a single chmod rather than binding it to an
+                  inode, so it narrows the window to one syscall and can only REPORT a
+                  swap that lands inside it (#5852). A failure of the lookup itself is
+                  left to propagate as what it is - an entry that went away is not an
+                  entry that was replaced."""
+                  now = os.lstat(self._name, dir_fd=self._dirfd)
+                  if (now.st_dev, now.st_ino) != (self._st.st_dev, self._st.st_ino):
+                      raise OSError(errno.EIO, "the entry no longer resolves to the inode that was scanned")
+
               def chmod(self, mode):
                   """Set `mode` on the pinned inode, or - with no `O_PATH` - on the entry
-                  itself without following a symlink."""
+                  itself without following a symlink, bracketed by two identity reads."""
                   if self._fd is None:
+                      # Before: nothing has been mutated yet, so a mismatch is a clean
+                      # refusal and the error is allowed to say exactly that.
+                      self._identity()
                       try:
                           os.chmod(self._name, mode, dir_fd=self._dirfd, follow_symlinks=False)
                       except NotImplementedError:
@@ -1090,6 +1121,17 @@ jobs:
                           # name that would be re-resolved is not an acceptable fallback,
                           # so the entry is reported instead of being mutated.
                           raise OSError(errno.EPERM, "no way to widen a mode here without re-resolving the name")
+                      try:
+                          self._identity()
+                      except OSError as err:
+                          # After: the mode landed on the inode that was scanned, and the
+                          # name it was reached by now belongs to something else. This
+                          # platform cannot address an inode except by a name, so that
+                          # mode cannot be put back - it is named instead of abandoned.
+                          raise OSError(errno.EIO, "the entry was replaced while its mode was being set to "
+                                                   "0o%03o, so that mode landed on the inode that was scanned "
+                                                   "and is left applied: it can only be reached by the name it "
+                                                   "no longer has (%s)" % (mode, err))
                   else:
                       try:
                           os.chmod("%s/%d" % (FD_DIR, self._fd), mode)

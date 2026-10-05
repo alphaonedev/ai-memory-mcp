@@ -668,9 +668,19 @@ class ScratchTreeCase(unittest.TestCase):
 
     def test_a_widened_mode_is_restored_when_the_reopen_fails_5657(self):
         """#5812, the other exit. The widen lands on the right inode, and only
-        THEN is the name replaced, so the reopen fails. The inode the janitor
-        widened must be back at the mode the walk found it at - it is still in
-        the tree, just under a different name."""
+        THEN is the name replaced, so the reopen fails.
+
+        What happens next is not the same on both legs, and this test used to
+        assert only the stronger half - which is why it was green where the
+        inode can be pinned and red on the leg the issue exists to protect
+        (#5812, #5852). Where the inode is pinned, the restore addresses the
+        INODE and the mode comes back off it. Where it is not, the mode was
+        reached by a name that now belongs to something else, and this platform
+        offers no way to address an inode without a name: the mode is left
+        applied, and the one thing the janitor can still do is SAY so. Both
+        halves are pinned here, each on the leg it describes, because a widened
+        mode left behind in silence is the #5657 defect itself and one reported
+        with its path and its mode is recoverable by hand."""
         mod = load_script_module()
         entry = self.audit / "unreadable.key"
         entry.write_text("k")
@@ -685,9 +695,25 @@ class ScratchTreeCase(unittest.TestCase):
             with swap_after_the_widen(mod, swap) as fired:
                 rc, out, err = run_clear_in_process(mod, self.ws)
             self.assertTrue(fired, "the seam never fired: nothing was ever widened")
-        self.assertEqual(stat.S_IMODE(os.lstat(kept).st_mode), 0o000,
-                         "the widened mode was abandoned on the failure path")
+        left = stat.S_IMODE(os.lstat(kept).st_mode)
         self.assertNotEqual(rc, 0, "a failed reopen is not a pass:\n" + out + err)
+        if mod.HAS_O_PATH:
+            self.assertEqual(left, 0o000,
+                             "the widened mode was abandoned on the failure path")
+        else:
+            # The widened inode is unreachable: its only address was a name it
+            # no longer has. Pinning the mode exactly is what makes a future
+            # narrowing of this leg visible as a CHANGE rather than as drift.
+            self.assertEqual(left, stat.S_IRUSR,
+                             "the mode this leg leaves on the inode it widened is not the one "
+                             "it was widened to, so neither half of this test describes it")
+            self.assertIn("left applied", err,
+                          "a widen this leg cannot undo must be reported, never abandoned "
+                          "quietly:\n" + out + err)
+            self.assertIn("0o%03o" % stat.S_IRUSR, err,
+                          "the report must name the mode that was left applied:\n" + out + err)
+            self.assertIn("unreadable.key", err,
+                          "the report must name the entry it was left on:\n" + out + err)
 
     def test_an_unsearchable_directory_is_widened_through_its_own_descriptor_5657(self):
         """The mutant the first three reviews let through: widen by path
@@ -972,10 +998,18 @@ class StructuralPinCase(unittest.TestCase):
         self.assertTrue(any("EPERM" in ast.unparse(n) for n in raises),
                         "no safe route must be a refusal, never a widen by name")
 
-    def test_the_widen_is_restored_on_every_exit_from_the_open_5657(self):
+    def test_every_failure_exit_from_the_open_attempts_the_restore_and_still_raises_5657(self):
         """#5812. The widened mode escaped the old `_open_at` only on the
         success return: a reopen that raised and the deliberate "the entry was
-        replaced" refusal both left the inode permanently more permissive."""
+        replaced" refusal both left the inode permanently more permissive.
+
+        This is a STRUCTURAL test and its name now says only what it proves:
+        that every failure exit from the frame attempts the restore and still
+        raises the failure it came from. Whether the attempt REACHES the inode
+        that was widened is a runtime property of the platform, and only the
+        leg that can pin an inode delivers it - that half is pinned behaviourally
+        by `test_a_widened_mode_is_restored_when_the_reopen_fails_5657`, which
+        is split by platform for exactly this reason (#5852)."""
         node = _named_def(self.tree, "_open_at")
         handlers = [
             h for h in ast.walk(node)
