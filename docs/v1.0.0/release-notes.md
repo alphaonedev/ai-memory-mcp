@@ -705,8 +705,8 @@ those two review lanes raised, and no tag has been cut.
 ## Schema ladder v78 → v100
 
 `CURRENT_SCHEMA_VERSION = 100` on both adapters
-(`src/storage/migrations.rs`, `src/store/postgres.rs`); CLAUDE.md
-§Database is the SSOT. Both adapters mirror via
+(`src/storage/migrations.rs`, `src/store/postgres.rs`); the "Database" subsection of
+`docs/reference/ARCHITECTURE_REFERENCE.md` is the SSOT. Both adapters mirror via
 `src/store/postgres.rs::{migrate_v79 … migrate_v100}`.
 
 **The ladder is not uniformly additive, and this document previously
