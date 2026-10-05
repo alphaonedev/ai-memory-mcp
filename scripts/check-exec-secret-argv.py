@@ -1478,6 +1478,11 @@ ROUND3_RED = [
     # a command substitution in a credential header value is on argv as well (#5304)
     ("wget --https-password backtick", 'wget --https-password `cat f` h'),
     ("wget --proxy-passwd backtick", 'wget --proxy-passwd `cat f` h'),
+    # two- and three-letter prefixes are ambiguous in wget (it refuses them) and are flagged all the
+    # same: the generated alternation starts at two letters, and a shorter start would pass them (#5300)
+    ("wget --pa two-letter prefix", 'wget --pa "$X" h'),
+    ("wget --pas three-letter prefix", 'wget --pas="$X" h'),
+    ("wget --ht two-letter http prefix", 'wget --ht "$X" h'),
     ("wget --passwo= backtick prefix", 'wget --passwo=`cat f` h'),
     ("wget --password= backtick", 'wget --password=`cat f` h'),
     ("sshpass -p backtick", 'sshpass -p `cat $F` ssh h'),
