@@ -27,7 +27,7 @@ RULES ENFORCED (all closed-world: a trigger the reader cannot parse is a FAILURE
          ``*name`` items are undecidable and fail.  A push trigger with no
          ``branches`` and no ``tags`` key matches every branch and counts.
   R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730-#5736,
-         #5748-#5750) the whole file is
+         #5748-#5750, #5968) the whole file is
          read closed-world by the grammar below.  A file the reader cannot read
          is a failure whatever words it holds (#5731).
 
@@ -84,26 +84,23 @@ ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
               number or date (#5734), ``<<`` or ``=`` (#5749).  A filter key with
               neither a list nor a word is refused: its YAML value is null, not a
               list (#5736).
-  class       a ``[...]`` class inside a branches item is read only when its
-              body is one or more of: a letter or digit, or an ascending range
-              of two letters of one case or two digits (``a-z``, ``A-Z``,
-              ``0-9``; ``a-a`` is refused).  Every other body is refused with R-SHAPE cannot match
-              filters: ``!`` or ``^`` first, empty, ``]`` first, a backslash, a
-              ``-`` that ends or starts the body, a reversed or mixed range, and
-              any other character (#5853, #5854).
   pattern     a ``pull_request`` or ``pull_request_target`` branches item is
-              matched only in these modelled constructs: one leading ``!``
-              (negation; items are read in order and the last match wins),
-              then letters, digits, ``.``, ``_``, ``/`` and ``-`` as
-              themselves, ``*`` (any run without ``/``), ``**`` (any run) and a
-              class as above.  Every other character or construct is refused
-              with R-SHAPE cannot match filters, naming the trigger and the
-              item: ``?``, ``+``, a backslash, a ``]`` or ``!`` outside those
-              places, braces, parentheses, a space, a non-ASCII character, a
-              run of three or more ``*`` and an empty item among them (#5943,
-              #5856, #5857).  The read constructs follow GitHub's documented
+              matched only in these modelled constructs: letters, digits,
+              ``.``, ``_``, ``/`` and ``-`` as themselves, ``*`` (any run
+              without ``/``) and ``**`` (any run).  Every other character or
+              construct is refused with R-SHAPE cannot match filters, naming
+              the trigger and the item: a ``[`` character class (whatever its
+              body) and a ``!`` anywhere in the item, a leading negation
+              included (#5968, #5854, #5943, 5-agent vote 4d3ea1c5); ``?``,
+              ``+``, a backslash, a ``]``, braces, parentheses, a space, a
+              non-ASCII character, a run of three or more ``*`` and an empty
+              item (#5943, #5856, #5857).  The refusal of a class and of a
+              negation names the way out: list the base branches positively
+              as plain patterns in ``branches``.  ``branches-ignore`` is no
+              way out, this reader refuses it as an unsupported filter key.
+              The read constructs ``*`` and ``**`` follow GitHub's documented
               filter pattern cheat sheet; they were not measured against
-              GitHub's own evaluator.
+              GitHub's own evaluator (open tracker entry: #5969).
 
 The reader is the Python standard library only (no PyYAML) so it runs on any CI
 image.  The mutation legs at the bottom prove the reader is not vacuous: each
@@ -111,12 +108,13 @@ mutant of the LIVE workflow files must be rejected, and the unmutated control
 must be accepted first.
 
 PyYAML 6.0.1 (yaml.SafeLoader) stood in for GitHub's own workflow parser in a
-differential that runs outside this file (PR #5665 rounds 4 to 7): 20,000 seeded
+differential that runs outside this file (PR #5665 rounds 4 to 8): 20,000 seeded
 mutations of the live files at seed 5665 and 20,000 at seed 5666, plus the named
 cells of that round as fixed cases.  Each run gave 0 disagreements and 0 of 20
 live files refused: round 4 at 528c2195 ran 15 named cells, round 5 at 0e5758dc
-ran 16, round 6 at 3d953877 ran 22 and round 7 ran 38 (at 1452e37f, 16 refused
-by this reader and 22 read the same as PyYAML).  The differential compares
+ran 16, round 6 at 3d953877 ran 22, round 7 at 1452e37f ran 38 (16 refused by this
+reader and 22 read the same as PyYAML) and round 8 ran 51 (see the round-8 line
+below).  The differential compares
 parse_triggers() with yaml.SafeLoader only: it never calls violations(),
 filter_matches() or glob_match(), so it is no evidence on how a branches pattern
 is matched.  Where GitHub's parser and PyYAML differ, it does not see it.
@@ -126,6 +124,7 @@ Run:  python3 scripts/test/test_workflow_pr_triggers_5447.py
 from __future__ import annotations
 
 import re
+import string
 import sys
 import unicodedata
 import unittest
@@ -695,52 +694,33 @@ def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[s
     return filters
 
 
-_CLASS_LOWER = "abcdefghijklmnopqrstuvwxyz"
-_CLASS_UPPER = _CLASS_LOWER.upper()
-_CLASS_DIGIT = "0123456789"
-# Outside a class, the only characters glob_match reads as themselves (#5943).
-_PATTERN_LITERALS = frozenset(_CLASS_LOWER + _CLASS_UPPER + _CLASS_DIGIT + "._/-")
-
-
-def _class_regex(body: str, pattern: str) -> str:
-    """Regex for a class body made only of proven forms; any other body is Unparsed (#5854)."""
-    out: List[str] = []
-    i = 0
-    while i < len(body):
-        lo = body[i]
-        if lo not in _CLASS_LOWER + _CLASS_UPPER + _CLASS_DIGIT:
-            raise Unparsed("character class holds a form not proven to read like GitHub: " + pattern)
-        if body[i + 1:i + 2] == "-":
-            hi = body[i + 2:i + 3]
-            for kind in (_CLASS_LOWER, _CLASS_UPPER, _CLASS_DIGIT):
-                if lo in kind and hi and hi in kind and kind.index(hi) > kind.index(lo):
-                    break
-            else:
-                raise Unparsed("character class range is not ascending letters or digits: " + pattern)
-            out.append(lo + "-" + hi)
-            i += 3
-        else:
-            out.append(lo)
-            i += 1
-    if not out:
-        raise Unparsed("empty character class: " + pattern)
-    return "[" + "".join(out) + "]"
+# The only characters glob_match reads as themselves (#5943); '*' and '**' are read
+# separately.  A '[' class and a '!' negation are refused, not read (#5968).
+_PATTERN_LITERALS = frozenset(string.ascii_letters + string.digits + "._/-")
+# What a contributor can do instead of a class or a negation.  branches-ignore is no
+# way out: this reader refuses it as an unsupported filter key (KNOWN_FILTER_KEYS).
+WAY_OUT = ("list the base branches positively as plain patterns in branches "
+           "(branches-ignore is refused too: unsupported filter key)")
+_REFUSED_READS = {
+    "[": "a character class is not read",
+    "!": "a negation is not read",
+}
 
 
 def glob_match(pattern: str, ref: str) -> bool:
-    """True when one branches pattern (its leading '!' already removed) matches ref.
+    """True when one branches pattern matches ref.
 
     The pattern is translated to a Python regex and must match the whole ref.
     Read, each pinned by a test:
       ``**``     regex ``.*``: any run of characters, '/' included.
       ``*``      regex ``[^/]*``: any run of characters other than '/'.
-      ``[...]``  a class whose body is a proven form (_class_regex).
       a letter, a digit, ``.``, ``_``, ``/`` or ``-``: itself.
     Refused with Unparsed: an empty pattern, a run of three or more '*', and
-    every other character, for example ``?``, ``+``, a backslash, ``]``, ``!``,
-    ``{``, ``(``, ``@``, ``^``, ``$``, ``|``, a space or a non-ASCII letter.
-    The read forms follow GitHub's documented filter pattern cheat sheet; this
-    function was not compared with GitHub's own evaluator.
+    every other character, for example ``[`` (a class), ``!`` (a negation),
+    ``?``, ``+``, a backslash, ``]``, ``{``, ``(``, ``@``, ``^``, ``$``, ``|``, a
+    space or a non-ASCII letter.  The refusal of a class and of a negation names
+    the way out (WAY_OUT).  The read forms follow GitHub's documented filter pattern
+    cheat sheet; this function was not compared with GitHub's own evaluator.
     """
     if not pattern:
         raise Unparsed("empty pattern has no modelled GitHub meaning (#5943)")
@@ -755,14 +735,11 @@ def glob_match(pattern: str, ref: str) -> bool:
             regex.append(".*" if run == 2 else "[^/]*")
             i += run
             continue
-        if ch == "[":
-            end = pattern.find("]", i + 1)
-            if end == -1:
-                raise Unparsed("unterminated character class: " + pattern)
-            regex.append(_class_regex(pattern[i + 1:end], pattern))
-            i = end + 1
-            continue
         if ch not in _PATTERN_LITERALS:
+            why = _REFUSED_READS.get(ch)
+            if why:
+                raise Unparsed("pattern character " + repr(ch) + " has no modelled GitHub meaning (" + why
+                               + ", #5968): " + pattern + "; " + WAY_OUT)
             raise Unparsed("pattern character " + repr(ch) + " has no modelled GitHub meaning (#5943): " + pattern)
         regex.append(re.escape(ch))
         i += 1
@@ -770,13 +747,14 @@ def glob_match(pattern: str, ref: str) -> bool:
 
 
 def filter_matches(patterns: List[str], ref: str) -> bool:
-    """Ordered include/exclude evaluation; a leading '!' negates (last match wins)."""
+    """True when any branches item matches ref.
+
+    Every item is read, so a refused item (a ``[`` class or a ``!`` negation
+    among them) raises Unparsed even after an earlier item matched.
+    """
     matched = False
     for pat in patterns:
-        if pat.startswith("!"):
-            if glob_match(pat[1:], ref):
-                matched = False
-        elif glob_match(pat, ref):
+        if glob_match(pat, ref):
             matched = True
     return matched
 
@@ -849,10 +827,10 @@ def violations(name: str, text: str) -> List[str]:
     try:
         return _rule_violations(name, triggers)
     except Unparsed as exc:
-        # A filter item the glob reader cannot read (an unterminated [ class, a
-        # class body that is not a proven form, an empty item, or any character
-        # or construct outside the modelled set) is a named failure too, not an
-        # exception out of violations() (#5777, #5853, #5854, #5943).
+        # A filter item the glob reader cannot read (a [ class, a ! negation, an
+        # empty item, or any character or construct outside the modelled set) is
+        # a named failure too, not an exception out of violations() (#5777,
+        # #5853, #5854, #5943, #5968).
         return [f"{name}: R-SHAPE cannot match filters ({exc})"]
 
 
@@ -870,7 +848,7 @@ def _rule_violations(name: str, triggers: Dict[str, Dict[str, List[str]]]) -> Li
             # Every item is read before any verdict, so one the matcher does not
             # model is refused by its trigger and its full spelling (#5943).
             try:
-                glob_match(pat[1:] if pat.startswith("!") else pat, CARRIER)
+                glob_match(pat, CARRIER)
             except Unparsed as exc:
                 raise Unparsed(f"{trig}.branches item {pat!r}: {exc}") from exc
         if any(filter_matches(branches, base) for base in GATED_BASES):
@@ -905,18 +883,21 @@ def _replace_once(text: str, old: str, new: str) -> str:
 
 
 def named_cells() -> List[Tuple[str, str, str]]:
-    """(name, text, refusal reason) for each known-bad shape of PR #5665 rounds 3 to 7.
+    """(name, text, refusal reason) for each known-bad shape of PR #5665 rounds 3 to 8.
 
     Sixteen cells are reproducers from the round-3 review (F1 #5730, F2 #5731, F3
     #5732), from the round-4 differential (#5733-#5736, #5748-#5750) or from the
     round-4 review (F2, an indented first row, #5777).  Six are the class items of
     round 6 (#5853, #5854).  Sixteen are the pattern items of round 7 (#5943,
-    #5856, #5857).  PyYAML 6.0.1 reads each round-6 and round-7 item as the same
-    plain string the reader hands to the glob.  The test below runs every cell
-    each time.  The PyYAML differential of each round ran the cells that existed
-    then as fixed cases (see the module docstring); it compares parse_triggers()
-    only, so for the round-6 and round-7 cells, which are refused by the glob and
-    not by the parse, it checks the item text and not the refusal.
+    #5856, #5857).  Thirteen are the class and negation items of round 8 (#5968;
+    a class in each position, a negated class, a '!' before and after a positive
+    item, a list of only '!' items, '!!x', '!' with '**').  PyYAML 6.0.1 reads each
+    round-6, round-7 and round-8 item as the same plain string the reader hands to
+    the glob.  The test below runs every cell each time.  The PyYAML differential
+    of each round ran the cells that existed then as fixed cases (see the module
+    docstring); it compares parse_triggers() only, so for the round-6, round-7 and
+    round-8 cells, which are refused by the glob and not by the parse, it checks
+    the item text and not the refusal.
     """
     jobs = "jobs:\n  a:\n    runs-on: x\n"
     ci = _replace_once(load_all()["ci.yml"], '    branches: [main, develop, "release/**", "rehearsal/**"]\n',
@@ -947,12 +928,12 @@ def named_cells() -> List[Tuple[str, str, str]]:
     ] + [
         ("R6-" + tag + "-class-item", "on:\n  pull_request:\n    branches: [main, 'rehearsal/**', '" + item + "']\n", why)
         for tag, item, why in (
-            ("5853-empty-class", "a[]b", "empty character class"),
-            ("5853-reversed-range", "[z-a]", "range is not ascending letters or digits"),
-            ("5854-bang-led", "[!a]", "form not proven to read like GitHub"),
-            ("5854-caret-led", "[^a]", "form not proven to read like GitHub"),
-            ("5854-close-bracket-first", "[]a]", "empty character class"),
-            ("5854-underscore", "[_]", "form not proven to read like GitHub"),
+            ("5853-empty-class", "a[]b", "a character class is not read"),
+            ("5853-reversed-range", "[z-a]", "a character class is not read"),
+            ("5854-bang-led", "[!a]", "a character class is not read"),
+            ("5854-caret-led", "[^a]", "a character class is not read"),
+            ("5854-close-bracket-first", "[]a]", "a character class is not read"),
+            ("5854-underscore", "[_]", "a character class is not read"),
         )
     ] + [
         ("R7-" + tag, "on:\n  pull_request:\n    branches: [main, 'rehearsal/**', '" + item + "']\n",
@@ -976,16 +957,35 @@ def named_cells() -> List[Tuple[str, str, str]]:
         ("R7-5943-brace-block-list", "on:\n  pull_request:\n    branches:\n      - main\n      - 'rehearsal/**'\n"
          "      - 'rehearsal/{audit,x}-wip'\n", "no modelled GitHub meaning"),
         ("R7-5943-empty-item", "on:\n  pull_request:\n    branches: [main, 'rehearsal/**', '']\n", "empty pattern"),
-        ("R7-5943-bare-bang", "on:\n  pull_request:\n    branches: [main, 'rehearsal/**', '!']\n", "empty pattern"),
+        ("R7-5943-bare-bang", "on:\n  pull_request:\n    branches: [main, 'rehearsal/**', '!']\n",
+         "a negation is not read"),
+    ] + [
+        ("R8-5968-" + tag, "on:\n  pull_request:\n    branches: " + flow + "\n", why)
+        for tag, flow, why in (
+            ("class-leading", "[main, 'rehearsal/**', '[a-c]x']", "a character class is not read"),
+            ("class-middle", "[main, 'rehearsal/**', 'x[a-c]y']", "a character class is not read"),
+            ("class-trailing", "[main, 'rehearsal/**', 'x[a-c]']", "a character class is not read"),
+            ("class-whole-item", "[main, 'rehearsal/**', '[a-c]']", "a character class is not read"),
+            ("class-after-double-star", "[main, 'rehearsal/**', 'rehearsal/**/[a-c]']",
+             "a character class is not read"),
+            ("negated-class-bang", "[main, 'rehearsal/**', 'rehearsal/[!a]']", "a character class is not read"),
+            ("negated-class-caret", "[main, 'rehearsal/**', 'rehearsal/[^a]']", "a character class is not read"),
+            ("bang-before-positive", "['!rehearsal/audit-wip', main, 'rehearsal/**']", "a negation is not read"),
+            ("bang-after-positive", "[main, 'rehearsal/**', '!rehearsal/audit-wip']", "a negation is not read"),
+            ("only-bang-items", "['!main', '!develop']", "a negation is not read"),
+            ("double-bang", "[main, 'rehearsal/**', '!!x']", "a negation is not read"),
+            ("bang-with-double-star", "[main, 'rehearsal/**', '!rehearsal/**']", "a negation is not read"),
+            ("bang-then-class", "[main, 'rehearsal/**', '![a-z]x']", "a negation is not read"),
+        )
     ]
 
 
 class NamedCells5665(unittest.TestCase):
-    """Every named known-bad cell is refused with its own reason (rounds 3 to 7)."""
+    """Every named known-bad cell is refused with its own reason (rounds 3 to 8)."""
 
     def test_5665_named_cells_refused(self) -> None:
         cells = named_cells()
-        self.assertEqual(38, len(cells))
+        self.assertEqual(51, len(cells))
         for name, text, why in cells:
             got = violations("x.yml", text)
             self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (name, why, got))
@@ -1106,12 +1106,14 @@ class Mutants5447(unittest.TestCase):
         self._assert_killed("ci.yml", m, "R-SHAPE")
 
     def test_5447_m13_negated_entry_excludes_carrier(self) -> None:
+        # A leading '!' is refused, not read (#5968, 5-agent vote 4d3ea1c5): the
+        # mutant is killed by the R-SHAPE refusal, not by an R-PR finding.
         t = self.live["c8-precheck.yml"]
         m = re.sub(
             r'(pull_request:\s*\n\s*branches: \[[^\]]*?)\]', r'\1, "!rehearsal/audit-wip"]', t, count=1
         )
         self.assertNotEqual(t, m)
-        self._assert_killed("c8-precheck.yml", m, "R-PR")
+        self._assert_killed("c8-precheck.yml", m, "R-SHAPE cannot match filters")
 
     def test_5447_m14_block_list_form_without_entry(self) -> None:
         t = (
@@ -2238,99 +2240,65 @@ class RefusalBranches5665(unittest.TestCase):
 
     def test_5665_unterminated_class_in_a_branches_item(self) -> None:
         # PyYAML: branches is ['main', 'rehearsal/**', 'a[b'] in both texts.
-        why = "R-SHAPE cannot match filters (pull_request.branches item 'a[b': unterminated character class"
+        why = "R-SHAPE cannot match filters (pull_request.branches item 'a[b': pattern character '[' "
         for branches in (" [main, 'rehearsal/**', 'a[b']\n", "\n      - main\n      - rehearsal/**\n      - a[b\n"):
             got = violations("x.yml", "name: x\non:\n  pull_request:\n    branches:" + branches)
             self.assertTrue(any(why in v for v in got), got)
 
 
-class UnreadableClass5853(unittest.TestCase):
-    """#5853: a class shape the glob reader cannot read is a named refusal, not re.error.
-
-    Measured at 0e5758dc with the text below: both items raised re.error out of
-    violations().  PyYAML 6.0.1 reads each as a plain string list item.
-    """
-
-    def _refused(self, item: str) -> None:
-        text = "name: x\non:\n  pull_request:\n    branches: [main, 'rehearsal/**', '" + item + "']\n"
-        got = violations("x.yml", text)
-        self.assertTrue(any("R-SHAPE cannot match filters" in v and item in v for v in got), (item, got))
-
-    def test_5853_empty_class_is_a_named_refusal(self) -> None:
-        self._refused("a[]b")
-
-    def test_5853_reversed_range_is_a_named_refusal(self) -> None:
-        self._refused("[z-a]")
-
-
 class ClosedWorldClass5854(unittest.TestCase):
-    """#5854: a [...] class is read only when its body is made of proven forms.
+    """#5854, #5968: a [...] class is refused whatever its body.
 
     Measured at 0e5758dc: '[!a]' returned no finding because Python reads '!' in
     a class as a literal and '^' as negation, so the checker gave a definite
-    answer for spellings it had not proven it reads like GitHub.  The neighbour
-    table below holds every probed spelling and its verdict.
+    answer for spellings it had not proven it reads like GitHub.  Round 6 read a
+    class only for a proven body; round 8 refuses every class (5-agent vote
+    4d3ea1c5, decision 602cec39): the proven-body list is a grammar, not a finite
+    set, and no live workflow uses a class.  The table below holds every probed
+    spelling, the proven bodies of round 6 included.
     """
 
-    # (item, True when the class body is a proven form and no finding is expected)
     NEIGHBOURS = (
-        ("[!a]", False), ("[^a]", False), ("[]a]", False), ("[a\\]]", False),
-        ("[a-]", False), ("[-a]", False), ("[[]", False), ("[!]", False),
-        ("[a-Z]", False), ("[a-9]", False), ("[z-a]", False), ("[a-a]", False),
-        ("[[a]]", False), ("[a-c-e]", False), ("[a b]", False), ("[a/b]", False),
-        ("[._]", False), ("[a.b]", False), ("[_]", False), ("[a_b]", False), ("[a-z-]", False), ("[*]", False),
-        ("[?]", False), ("rehearsal/**/[!a]", False), ("![!a]", False),
-        ("a[]b", False), ("a[b", False),
-        ("[a-z0-9]", True), ("[ab]", True), ("[A-Z]", True), ("[0-9]", True),
-        ("[a-cx-z]", True), ("[aZ9]", True), ("[a-b]", True), ("[y-z]", True), ("a[bc]d", True),
-        ("rehearsal/[a-z]*/**", True), ("**/[a-z]", True), ("[a-z]-[0-9]", True),
+        "[!a]", "[^a]", "[]a]", "[a\\]]", "[a-]", "[-a]", "[[]", "[!]", "[a-Z]", "[a-9]", "[z-a]", "[a-a]",
+        "[[a]]", "[a-c-e]", "[a b]", "[a/b]", "[._]", "[a.b]", "[_]", "[a_b]", "[a-z-]", "[*]", "[?]",
+        "rehearsal/**/[!a]", "![!a]", "a[]b", "a[b",
+        "[a-z0-9]", "[ab]", "[A-Z]", "[0-9]", "[a-cx-z]", "[aZ9]", "[a-b]", "[y-z]", "a[bc]d",
+        "rehearsal/[a-z]*/**", "**/[a-z]", "[a-z]-[0-9]", "![a-z]x",
     )
 
     def _verdict(self, item: str) -> List[str]:
         text = "name: x\non:\n  pull_request:\n    branches: [main, 'rehearsal/**', '" + item + "']\n"
         return violations("x.yml", text)
 
-    def test_5854_neighbour_table(self) -> None:
-        for item, readable in self.NEIGHBOURS:
+    def test_5854_every_neighbour_is_refused_with_the_class_reason(self) -> None:
+        for item in self.NEIGHBOURS:
             got = self._verdict(item)
-            if readable:
-                self.assertEqual([], got, item)
-            else:
-                named = item[1:] if item.startswith("!") else item
-                self.assertTrue(any("R-SHAPE cannot match filters" in v and named in v for v in got), (item, got))
+            reason = "a negation is not read" if item.startswith("!") else "a character class is not read"
+            self.assertTrue(any("R-SHAPE cannot match filters" in v and reason in v and repr(item) in v
+                                for v in got), (item, got))
 
-    def test_5854_each_refusal_names_its_reason(self) -> None:
-        for item, why in (
-            ("a[]b", "empty character class"),
-            ("a[b", "unterminated character class"),
-            ("[!a]", "form not proven to read like GitHub"),
-            ("[a-]", "range is not ascending letters or digits"),
-            ("[a-Z]", "range is not ascending letters or digits"),
-            ("[a-a]", "range is not ascending letters or digits"),
-            ("[]a]", "empty character class"),
-            ("[a\\]]", "form not proven to read like GitHub"),
-        ):
+    def test_5854_a_class_is_refused_by_the_glob_itself(self) -> None:
+        for pat in ("a[b-d]e", "[a-cx-z]1", "[ab]", "[0-9]", "[A-C]", "[!a]", "a[]b", "a[b"):
+            with self.assertRaises(Unparsed, msg=pat):
+                glob_match(pat, "ace")
+
+    def test_5854_the_refusal_names_the_way_out(self) -> None:
+        for item in ("[a-c]", "!x"):
             got = self._verdict(item)
-            self.assertTrue(any("R-SHAPE cannot match filters" in v and why in v for v in got), (item, why, got))
+            self.assertTrue(any(WAY_OUT in v for v in got), (item, got))
+        self.assertIn("branches-ignore", WAY_OUT)
+        # The way out must be true: branches-ignore is itself refused today.
+        got = violations("x.yml", "name: x\non:\n  pull_request:\n    branches-ignore: [main]\n")
+        self.assertTrue(any("unsupported filter key: branches-ignore" in v for v in got), got)
+        # ... and a positive list of the same bases is accepted.
+        self.assertEqual([], violations(
+            "x.yml", "name: x\non:\n  pull_request:\n    branches: [main, 'rehearsal/**']\n"))
 
-    def test_5854_bang_and_caret_led_class_are_refused(self) -> None:
-        for item in ("[!a]", "[^a]"):
-            self.assertTrue(any("R-SHAPE cannot match filters" in v for v in self._verdict(item)), item)
-
-    def test_5854_class_is_refused_after_a_negation(self) -> None:
-        # The leading '!' of the item negates; the class after it is read the same way.
-        self.assertTrue(any("R-SHAPE" in v for v in self._verdict("![!a]")))
-        self.assertEqual([], self._verdict("![a-z]x"))
-
-    def test_5854_proven_class_still_matches(self) -> None:
-        self.assertTrue(glob_match("a[b-d]e", "ace"))
-        self.assertFalse(glob_match("a[b-d]e", "aee"))
-        self.assertTrue(glob_match("[a-cx-z]1", "y1"))
-        self.assertFalse(glob_match("[a-cx-z]1", "m1"))
-        self.assertTrue(glob_match("[ab]", "b"))
-        self.assertFalse(glob_match("[ab]", "!"))
-        self.assertTrue(glob_match("[0-9]", "7"))
-        self.assertFalse(glob_match("[A-C]", "d"))
+    def test_5853_empty_and_reversed_classes_are_named_refusals_not_re_error(self) -> None:
+        # #5853: both raised re.error out of violations() at 0e5758dc.
+        for item in ("a[]b", "[z-a]"):
+            self.assertTrue(any("R-SHAPE cannot match filters" in v and item in v for v in self._verdict(item)),
+                            item)
 
 
 class ClosedWorldPattern5943(unittest.TestCase):
@@ -2339,8 +2307,8 @@ class ClosedWorldPattern5943(unittest.TestCase):
     Measured at 3d953877: '!rehearsal/audi?t-wip', '!rehearsal/audit+-wip' and
     '!rehearsal/\\audit-wip' returned no finding, and so did every other character
     outside a class ('?' was read as one non-'/' character, the rest as literals).
-    The modelled constructs are letters, digits, '.', '_', '/', '-', '*', '**', a
-    proven class and one leading '!' (filter_matches).  Everything else is refused.
+    The modelled constructs are letters, digits, '.', '_', '/', '-', '*' and '**'.
+    Everything else is refused, a '[' class and a '!' negation included (#5968).
     """
 
     REFUSED = (
@@ -2351,9 +2319,10 @@ class ClosedWorldPattern5943(unittest.TestCase):
         "^rehearsal/**", "rehearsal/a|b", "rehearsal/~x", "rehearsal/a b", "rehearsal/a%b", "rehearsal/a=b",
         "rehearsal/a;b", "rehearsal/a(b)", "rehearsal/***", "!rehearsal/***", "rehearsal/é",
         "rehearsal/a​b", "!rehearsal/a]b", "rehearsal/a]", "rehearsal/{audit}-wip",
+        "!rehearsal/x", "a[b-d]e", "![a-z]x", "!**", "!rehearsal/**", "![a]", "x!", "!x!",
     )
     READ = (
-        "rehearsal/**", "!rehearsal/x", "release/v1.0.0", "release/**", "a[b-d]e", "![a-z]x", "rehearsal/*",
+        "rehearsal/**", "release/v1.0.0", "release/**", "rehearsal/*",
         "feature/a_b.c-d", "**", "*", "-x", ".x",
     )
 
@@ -2384,11 +2353,14 @@ class ClosedWorldPattern5943(unittest.TestCase):
         # A flow list refuses the comma first (#5733); the block list reaches the glob.
         self._assert_refused("rehearsal/{audit,x}-wip", self._block("rehearsal/{audit,x}-wip"))
 
-    def test_5943_empty_and_bare_negation_items_are_refused(self) -> None:
-        for item in ("", "!"):
-            got = self._flow(item)
-            self.assertTrue(any("R-SHAPE cannot match filters" in v and "empty pattern" in v for v in got),
-                            (item, got))
+    def test_5943_empty_item_is_refused(self) -> None:
+        got = self._flow("")
+        self.assertTrue(any("R-SHAPE cannot match filters" in v and "empty pattern" in v for v in got), got)
+
+    def test_5968_a_bare_negation_is_refused_as_a_negation(self) -> None:
+        got = self._flow("!")
+        self.assertTrue(any("R-SHAPE cannot match filters" in v and "a negation is not read" in v for v in got),
+                        got)
 
     def test_5943_modelled_items_keep_a_definite_verdict(self) -> None:
         for item in self.READ:
@@ -2402,9 +2374,9 @@ class ClosedWorldPattern5943(unittest.TestCase):
         self.assertTrue(glob_match("a**b", "a/x/b"))
         self.assertTrue(glob_match("x.y_z-1/2", "x.y_z-1/2"))
         self.assertFalse(glob_match("x.y", "xzy"))
-        self.assertFalse(filter_matches(["!a"], "a"))
-        self.assertFalse(filter_matches(["a", "!a"], "a"))
-        self.assertTrue(filter_matches(["!a", "a"], "a"))
+        self.assertTrue(filter_matches(["a", "b"], "b"))
+        self.assertFalse(filter_matches(["a", "b"], "c"))
+        self.assertFalse(filter_matches([], "a"))
 
     def test_5943_text_after_a_star_is_still_matched(self) -> None:
         # Mutation M08 of round 7 (skip one character after '*') survived the
@@ -2415,16 +2387,25 @@ class ClosedWorldPattern5943(unittest.TestCase):
         self.assertTrue(glob_match("a**b", "a/x/b"))
         self.assertFalse(glob_match("a**b", "a/x/c"))
 
-    def test_5943_filter_matches_refuses_a_double_negation(self) -> None:
-        # Mutation M38 of round 7 (strip every leading '!') survived: '!!x' must
-        # stay refused in filter_matches itself, not only through violations().
-        for items in (["!!main"], ["main", "!!main"], ["!!"]):
+    def test_5968_filter_matches_refuses_every_negation_in_any_position(self) -> None:
+        # Mutations M33 and M38 of round 7 targeted the removed negation reading.
+        # Retargeted: a '!' item raises from filter_matches itself, first, last,
+        # alone, doubled, with '**', and after a positive item that matches.
+        for items in (["!main"], ["main", "!main"], ["!main", "main"], ["!!main"], ["main", "!!main"], ["!!"],
+                      ["!"], ["!a", "!b"], ["main", "!**"], ["main", "!rehearsal/**"], ["!x", "main"]):
+            with self.assertRaises(Unparsed, msg=items):
+                filter_matches(items, "main")
+
+    def test_5968_filter_matches_refuses_a_class_even_after_a_match(self) -> None:
+        # A refused item is red, never a no-match: the earlier matching item must
+        # not hide it (any() would stop early; the loop reads every item).
+        for items in (["main", "[a-z]"], ["[a-z]", "main"], ["main", "a[b"]):
             with self.assertRaises(Unparsed, msg=items):
                 filter_matches(items, "main")
 
     def test_5943_each_reproducer_refused_where_github_excludes_the_carrier(self) -> None:
         # Under the documented reading each of these excludes the carrier; the
-        # checker must refuse, never pass.
+        # checker must refuse, never pass (a negation is refused outright, #5968).
         for item in ("!rehearsal/audit+-wip", "!rehearsal/audi?t-wip", "!rehearsal/\\audit-wip"):
             got = self._flow(item)
             self.assertNotEqual([], got, item)
@@ -2452,7 +2433,7 @@ class GlobDocTruth5944(unittest.TestCase):
         self.assertIn("Refused with Unparsed:", doc)
         refused = doc.split("Refused with Unparsed:", 1)[1].split("The read forms", 1)[0]
         tokens = re.findall(r"``([^`]+)``", refused)
-        self.assertEqual(["?", "+", "]", "!", "{", "(", "@", "^", "$", "|"], tokens)
+        self.assertEqual(["[", "!", "?", "+", "]", "{", "(", "@", "^", "$", "|"], tokens)
         for phrase, ch in (("a backslash", "\\"), ("a space", " "), ("a non-ASCII letter", "é")):
             self.assertIn(phrase, refused)
             tokens.append(ch)
@@ -2473,8 +2454,8 @@ class GlobDocTruth5944(unittest.TestCase):
         self.assertIn("``*`` regex ``[^/]*``: any run of characters other than '/'.", doc)
         self.assertTrue(glob_match("a*", "abc") and glob_match("a*", "a"))
         self.assertFalse(glob_match("a*", "a/b"))
-        self.assertIn("``[...]`` a class whose body is a proven form (_class_regex).", doc)
-        self.assertTrue(glob_match("[a-c]", "b"))
+        self.assertNotIn("class whose body", doc)
+        self.assertNotIn("_class_regex", doc)
         self.assertIn("a letter, a digit, ``.``, ``_``, ``/`` or ``-``: itself.", doc)
         for ch in "aZ7._/-":
             self.assertTrue(glob_match("x" + ch, "x" + ch), ch)
@@ -2496,7 +2477,7 @@ class DifferentialTruth5945(unittest.TestCase):
         doc = self._doc()
         self.assertNotIn("plus the named_cells() below as fixed cases", doc)
         for run in ("round 4 at 528c2195 ran 15 named cells", "round 5 at 0e5758dc ran 16",
-                    "round 6 at 3d953877 ran 22", "round 7 ran " + str(len(named_cells()))):
+                    "round 6 at 3d953877 ran 22", "round 7 at 1452e37f ran 38", "round 8 ran " + str(len(named_cells()))):
             self.assertIn(run, doc)
 
     def test_5945_the_parse_only_limit_is_stated(self) -> None:
@@ -2509,13 +2490,15 @@ class DifferentialTruth5945(unittest.TestCase):
 
     def test_5945_cell_rounds_add_up(self) -> None:
         names = [n for n, _t, _w in named_cells()]
-        self.assertEqual(16, sum(1 for n in names if not n.startswith(("R6-", "R7-"))))
+        self.assertEqual(16, sum(1 for n in names if not n.startswith(("R6-", "R7-", "R8-"))))
         self.assertEqual(6, sum(1 for n in names if n.startswith("R6-")))
         self.assertEqual(16, sum(1 for n in names if n.startswith("R7-")))
+        self.assertEqual(13, sum(1 for n in names if n.startswith("R8-")))
         cells = " ".join((named_cells.__doc__ or "").split())
         self.assertIn("Sixteen cells are reproducers", cells)
         self.assertIn("Six are the class items of round 6", cells)
         self.assertIn("Sixteen are the pattern items of round 7", cells)
+        self.assertIn("Thirteen are the class and negation items of round 8", cells)
 
 
 class GlobSemantics5447(unittest.TestCase):
@@ -2525,8 +2508,10 @@ class GlobSemantics5447(unittest.TestCase):
         self.assertFalse(glob_match("release/**", CARRIER))
         self.assertFalse(glob_match("rehearsal/*", "rehearsal/a/b"))
         self.assertTrue(glob_match("rehearsal/*", CARRIER))
-        self.assertTrue(filter_matches(["rehearsal/**", "!rehearsal/audit-wip"], "rehearsal/x") )
-        self.assertFalse(filter_matches(["rehearsal/**", "!rehearsal/audit-wip"], CARRIER))
+        self.assertTrue(filter_matches(["rehearsal/**", "release/**"], CARRIER))
+        self.assertFalse(filter_matches(["release/**"], CARRIER))
+        with self.assertRaises(Unparsed):
+            filter_matches(["rehearsal/**", "!rehearsal/audit-wip"], CARRIER)
 
 
 if __name__ == "__main__":
