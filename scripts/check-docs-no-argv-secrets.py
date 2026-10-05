@@ -299,6 +299,13 @@ def is_redaction(value: str) -> bool:
     return value.lower() in REDACTION_TOKENS
 
 
+def is_url_redaction(value: str) -> bool:
+    """#5620: a URL password is percent-decoded by libpq and sqlx before use, so the WHOLE
+    decoded value is compared with the same closed list (%2A%2A%2A is ***). Other paths
+    (an env value, an SQL literal) are not decoded and use is_redaction."""
+    return is_redaction(unquote(value))
+
+
 def url_credential(url: str) -> str:
     """The credential a URL carries: the userinfo password, or the value of a
     query key that percent-decodes (case-insensitively) to ``password``
@@ -310,13 +317,13 @@ def url_credential(url: str) -> str:
         userinfo = authority.rsplit("@", 1)[0]
         if ":" in userinfo:
             pw = userinfo.split(":", 1)[1]
-            if pw and not is_redaction(pw):
+            if pw and not is_url_redaction(pw):
                 return pw
     if "?" in rest:
         query = rest.split("?", 1)[1].split("#", 1)[0]
         for pair in query.split("&"):
             key, _, value = pair.partition("=")
-            if unquote(key).strip().lower() == "password" and value and not is_redaction(value):
+            if unquote(key).strip().lower() == "password" and value and not is_url_redaction(value):
                 return value
     return ""
 
@@ -1726,7 +1733,7 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
     for rule, tag in ((PSQL_URL_RE, "psql-url-password"), (DOCKER_ENV_DSN_RE, "env-dsn-argv"),
                       (SSH_REMOTE_URL_RE, "ssh-remote-url-password")):
         for m in rule.finditer(text):
-            if is_redaction(m.group("pw")):
+            if is_url_redaction(m.group("pw")):
                 continue
             line, snippet = _line_of(text, m.start())
             hits.append((rel, line, "[%s] %s" % (tag, snippet)))
@@ -2645,7 +2652,26 @@ R10_RED_PROBES = {
 }
 # Round 10 green: no hit of any kind.
 R10_GREEN_PROBES = {
+    # #5620: a URL password is compared after percent-decoding, as libpq and sqlx read it.
+    '5620-g01-psql-url-encoded-stars': 'psql "postgresql://app:%2A%2A%2A@db.example/app"',
+    '5620-g02-store-url-encoded-stars': 'ai-memory serve --store-url postgres://u:%2a%2a%2a@h/d',
+    '5620-g03-store-url-query-encoded-redacted': 'ai-memory serve --store-url "postgres://u@h/d?password=REDACTE%44"',
+    '5620-g04-psql-url-encoded-ellipsis': 'psql "postgresql://app:%E2%80%A6@db.example/app"',
 }
+# #5620: the closed list, pinned per token on the psql URL path and the store URL path. The
+# whole token is clean; one extra character before and after is a credential, so the list
+# cannot turn back into a substring test. Spellings outside the list stay credentials.
+for _i, _tok in enumerate(sorted(REDACTION_TOKENS)):
+    R10_GREEN_PROBES['5620-t%d-psql-url-token' % _i] = 'psql "postgresql://app:%s@db.example/app"' % _tok
+    R10_GREEN_PROBES['5620-t%d-store-url-token' % _i] = 'ai-memory serve --store-url postgres://u:%s@h/d' % _tok
+    R10_RED_PROBES['5620-t%d-psql-url-token-padded' % _i] = 'psql "postgresql://app:q%sq@db.example/app"' % _tok
+    R10_RED_PROBES['5620-t%d-store-url-token-padded' % _i] = 'ai-memory serve --store-url postgres://u:q%sq@h/d' % _tok
+for _i, _word in enumerate(("CHANGEME", "PASSWORD", "<password>", "&lt;password&gt;", "%2A%2A%2Aq")):
+    R10_RED_PROBES['5620-u%d-psql-url-unlisted' % _i] = 'psql "postgresql://app:%s@db.example/app"' % _word
+    R10_RED_PROBES['5620-u%d-store-url-unlisted' % _i] = 'ai-memory serve --store-url postgres://u:%s@h/d' % _word
+# A docker -e value and a psql -v value are not decoded: an encoded placeholder there is literal.
+R10_RED_PROBES['5620-r01-docker-env-encoded-stars'] = 'docker run -e PGPASSWORD=%2A%2A%2A img'
+R10_RED_PROBES['5620-r02-psql-v-listed-token'] = 'psql -v pw=REDACTED -f x.sql'
 
 
 def r9_variants(text: str) -> List[Tuple[str, str, str]]:
