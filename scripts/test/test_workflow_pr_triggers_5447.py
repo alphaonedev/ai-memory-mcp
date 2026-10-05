@@ -46,7 +46,7 @@ import re
 import sys
 import unittest
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -159,6 +159,7 @@ def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
         raise Unparsed("empty on: block")
     trig_indent = block[0][0]
     triggers: Dict[str, Dict[str, List[str]]] = {}
+    seen_triggers: Set[str] = set()
     i = 0
     while i < len(block):
         ind, body = block[i]
@@ -168,6 +169,9 @@ def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
         if not m:
             raise Unparsed("unreadable trigger line: " + body)
         name, rest = m.group(1), m.group(2).strip()
+        if name.lower() in seen_triggers:
+            raise Unparsed("repeated trigger key in on: block (#5666): " + name)
+        seen_triggers.add(name.lower())
         j = i + 1
         while j < len(block) and block[j][0] > trig_indent:
             j += 1
@@ -187,6 +191,7 @@ def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[s
     if not sub:
         return filters
     key_indent = sub[0][0]
+    seen_keys: Set[str] = set()
     k = 0
     while k < len(sub):
         ind, body = sub[k]
@@ -196,6 +201,9 @@ def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[s
         if not m:
             raise Unparsed(trigger + ": unreadable filter line: " + body)
         key, rest = m.group(1), m.group(2).strip()
+        if key.lower() in seen_keys:
+            raise Unparsed(trigger + ": repeated filter key (#5666): " + key)
+        seen_keys.add(key.lower())
         if key not in KNOWN_FILTER_KEYS:
             raise Unparsed(trigger + ": unsupported filter key: " + key)
         n = k + 1
@@ -672,6 +680,53 @@ class PushNeverRehearsal5659(unittest.TestCase):
         self._clean("[main, develop, 'release/**']")
         self._clean("[main, 'release/v0.6.3.1', feat/v0.7.0-grand-slam]")
         self._clean("[release/**]")
+
+
+class DuplicateKeys5666(unittest.TestCase):
+    """#5666: a repeated trigger name or filter key under on: is Unparsed, never last-wins."""
+
+    BAD = "    branches: ['rehearsal/x']\n"
+
+    def _shape(self, text: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v for v in got), got)
+
+    def test_5666_duplicate_push_first_is_bad(self) -> None:
+        self._shape(_with_on_block("  push:\n" + self.BAD + GOOD_PUSH + GOOD_PR))
+
+    def test_5666_duplicate_push_last_is_bad(self) -> None:
+        self._shape(_with_on_block(GOOD_PUSH + "  push:\n" + self.BAD + GOOD_PR))
+
+    def test_5666_duplicate_push_clean_twice(self) -> None:
+        self._shape(_with_on_block(GOOD_PUSH + GOOD_PUSH + GOOD_PR))
+
+    def test_5666_duplicate_push_other_case(self) -> None:
+        self._shape(_with_on_block("  push:\n" + self.BAD + "  Push:\n    branches: [main]\n" + GOOD_PR))
+
+    def test_5666_duplicate_pull_request(self) -> None:
+        self._shape(_with_on_block(GOOD_PUSH + GOOD_PR + GOOD_PR))
+
+    def test_5666_duplicate_branches_under_push(self) -> None:
+        self._shape(_with_on_block("  push:\n" + self.BAD + "    branches: [main]\n" + GOOD_PR))
+
+    def test_5666_duplicate_branches_under_pull_request(self) -> None:
+        self._shape(_with_on_block(GOOD_PUSH + GOOD_PR + "    branches: [main]\n"))
+
+    def test_5666_duplicate_filter_key_other_case(self) -> None:
+        self._shape(_with_on_block("  push:\n    branches: [main]\n    Branches: [x]\n" + GOOD_PR))
+
+    def test_5666_duplicate_paths_filter(self) -> None:
+        self._shape(_with_on_block(GOOD_PUSH + GOOD_PR + "    paths: [a]\n    paths: [b]\n"))
+
+    def test_5666_duplicate_non_gated_trigger(self) -> None:
+        self._shape(_with_on_block(GOOD_PUSH + GOOD_PR + "  workflow_dispatch:\n  workflow_dispatch:\n"))
+
+    def test_5666_branches_and_branches_ignore_together(self) -> None:
+        self._shape(_with_on_block("  push:\n    branches: [main]\n    branches-ignore: [x]\n" + GOOD_PR))
+
+    def test_5666_distinct_keys_stay_clean(self) -> None:
+        text = _with_on_block(GOOD_PUSH + GOOD_PR + "    paths: [a]\n  workflow_dispatch:\n")
+        self.assertEqual([], violations("x.yml", text))
 
 
 class GlobSemantics5447(unittest.TestCase):
