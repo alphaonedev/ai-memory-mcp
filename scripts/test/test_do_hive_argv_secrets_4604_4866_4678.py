@@ -31,12 +31,18 @@ SPAWN = ROOT / "infra/do-hive/spawn.sh"
 # 64 lowercase hex: the shape the sites now require before building a curl config line.
 SECRET = "5ec4e7" + "0123456789abcdef" * 3 + "a1b2c3d4e5"
 FAILS = []
+# #5900: the UTF-8 locales whose cases run only where the locale is installed. A passing probe whose name holds one
+# of them is counted apart, so the COUNT line states the ok probes that run on every host.
+OPTIONAL_LOCALES = ("en_US.UTF-8",)
+COUNTS = {"every": 0, "optional": 0}
 
 
 def probe(name, ok, detail=""):
     print("%s: %s %s" % ("ok" if ok else "FAIL", name, detail))
     if not ok:
         FAILS.append(name)
+    else:
+        COUNTS["optional" if any(lc in name for lc in OPTIONAL_LOCALES) else "every"] += 1
 
 
 def section(text, start, end):
@@ -195,7 +201,7 @@ def utf8_locales():
     skip), en_US.UTF-8 when it is installed."""
     r = subprocess.run(["locale", "-a"], capture_output=True, text=True)
     have = {l.strip().lower().replace("-", "") for l in r.stdout.splitlines()}
-    return ["C.UTF-8"] + (["en_US.UTF-8"] if "en_us.utf8" in have else [])
+    return ["C.UTF-8"] + [lc for lc in OPTIONAL_LOCALES if lc.lower().replace("-", "") in have]
 
 
 def store_url_shape_locale_5764():
@@ -3874,6 +3880,17 @@ def root_spellings_5763():
           "%d:roots:eval" % (first + 1) in roots, " ".join(roots[:3]))
 
 
+def count_stream_5900():
+    """#5900: the ok count depends on the locales a host has installed, so the count the changelog states is the
+    COUNT line's every-host figure, taken under LC_ALL=C and LANG=C. Every lane-test ok count the changelog states
+    names that figure."""
+    probe("#5900 the counting step runs under LC_ALL=C and LANG=C",
+          os.environ.get("LC_ALL") == "C" and os.environ.get("LANG") == "C", "")
+    text = (ROOT / "changelog.d/4654.fixed.md").read_text()
+    bad = [m.group(0) for m in re.finditer(r"lane test prints \d+ ok [^.]*", text) if "on every host" not in m.group(0)]
+    probe("#5900 every lane-test ok count in the changelog is the every-host figure", not bad, repr(bad[:2]))
+
+
 def heredoc_5655():
     """#5655: here-document bodies are read: an ssh or scp in a body is a finding, a <<- body ends at its
     tab-indented terminator, every operator of a line counts in any delimiter spelling, <<< and $(( << )) are no
@@ -4119,6 +4136,9 @@ def n3_main_tf():
 
 
 def main():
+    # #5900: every case runs under the C locale unless it names its own, so the count does not follow the caller's.
+    os.environ["LC_ALL"] = "C"
+    os.environ["LANG"] = "C"
     (ROOT / ".local-runs").mkdir(exist_ok=True)
     f4_sed()
     store_url_shape_locale_5764()
@@ -4146,6 +4166,9 @@ def main():
     verify_cost_5247()
     verify_trace_5237()
     f3_static_pins()
+    count_stream_5900()
+    print("COUNT: %d ok probes run on every host (LC_ALL=C, LANG=C); %d more ran because %s is installed here"
+          % (COUNTS["every"], COUNTS["optional"], " ".join(utf8_locales()[1:]) or "no optional locale"))
     print("RESULT: %s (%d failed)" % ("FAIL" if FAILS else "PASS", len(FAILS)))
     return 1 if FAILS else 0
 
