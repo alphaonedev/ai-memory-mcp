@@ -188,11 +188,26 @@ def build_fixture(root):
     return repo, shallow, shas
 
 
+def empty_range_cases(shas):
+    """(label, event, kwargs, expected) for every empty range the docstring promises (#5671)."""
+    c1, c3 = shas["c1"], shas["c3"]
+    return [
+        ("empty: push moving a branch backward", "push", {"before": c3, "head": c1}, "%s..%s" % (c3, c1)),
+        ("empty: pull_request base equals head", "pull_request", {"pr_base": c3, "pr_head": c3}, "%s..%s" % (c3, c3)),
+        ("empty: pull_request head is an ancestor of base", "pull_request", {"pr_base": c3, "pr_head": c1},
+         "%s..%s" % (c1, c1)),
+        ("empty: merge_group base_sha equals head_sha", "merge_group", {"mg_base": c3, "mg_head": c3},
+         "%s..%s" % (c3, c3)),
+    ]
+
+
 def cases(shas):
     """(label, event, kwargs, expected) ; expected None = refusal, str = range."""
     c1, c2, c3, b1 = shas["c1"], shas["c2"], shas["c3"], shas["b1"]
     ghost = shas["ghost"]
     out = []
+    for label, event, kw, expected in empty_range_cases(shas):
+        out.append((label, event, kw, expected))
 
     def case(label, event, expected, **kw):
         out.append((label, event, kw, expected))
@@ -235,6 +250,8 @@ def cases(shas):
     case("push ignores merge_group/pr inputs", "push", "%s..%s" % (c1, c3),
          before=c1, head=c3, mg_base=ghost, pr_base=ghost)
     case("merge_group good", "merge_group", "%s..%s" % (c1, c3), mg_base=c1, mg_head=c3)
+    case("merge_group base is not an ancestor of head (not checked)", "merge_group",
+         "%s..%s" % (b1, c3), mg_base=b1, mg_head=c3)
     case("merge_group missing base", "merge_group", None, mg_head=c3)
     case("merge_group empty base", "merge_group", None, mg_base="", mg_head=c3)
     case("merge_group zero base", "merge_group", None, mg_base=ZERO_SHA, mg_head=c3)
@@ -436,6 +453,13 @@ def self_test():
             if not good:
                 failures += 1
                 print("FAIL %s: exit=%s out=%r err=%r want=%r" % (label, code, out, err, expected))
+        # Each promised empty range really holds no commit (git rev-list --count A..B is 0) (#5671).
+        for label, event, kw, expected in empty_range_cases(shas):
+            total += 1
+            counted = run_git(repo, "rev-list", "--count", expected)
+            if counted != "0":
+                failures += 1
+                print("FAIL %s: rev-list --count %s is %s, not 0" % (label, expected, counted))
         # Shallow clone: the previous tip is not present, so a push must refuse.
         total += 1
         code, out, err = invoke(shallow, "push", {"before": shas["c1"], "head": run_git(shallow, "rev-parse", "HEAD")})
