@@ -16,11 +16,15 @@ file pins BOTH at once (#5747 round 2):
   possible outcome, because it hands a poisoned runner to the next job with a
   green tick.
 
-The script runs as the UNPRIVILEGED runner user in CI, so these tests run it
-unprivileged too. Only the FIXTURES escalate: `chflags uappnd` (macOS/BSD, owner
-may set and clear) needs nothing, `chattr +a` (Linux) needs CAP_LINUX_IMMUTABLE
-and therefore `sudo -n`. When a mechanism is unavailable the test that needs it
-SKIPS with a message; the workflow pin tests always run.
+The script runs as the UNPRIVILEGED runner user in CI. These tests run it
+unprivileged too, with one exception: on Linux, clearing `chattr +a` needs
+CAP_LINUX_IMMUTABLE, so the tests that need a flag actually CLEARED run it under
+`sudo -n` there (`run_clear(..., privileged=True)`); on macOS/BSD the owner may
+clear `uappnd` and those tests run it unprivileged like every other. Setting,
+reading and clearing an inode flag are the only other things that escalate
+(`chattr`/`lsattr` on Linux); no fixture is created, widened or removed with
+privilege (#6003). When a mechanism is unavailable the test that needs it SKIPS
+with a message; the workflow pin tests always run.
 
 The workflow pins parse the YAML and evaluate the step `if:` expressions with a
 small GitHub-expression evaluator, so a guard that is rewritten to skip the step
@@ -356,7 +360,7 @@ def restore_that_fails(mod, nth=2):
         mod.os.fchmod = real
 
 
-class ScratchTreeCase(unittest.TestCase):
+class ScratchTree(unittest.TestCase):
     """Every case gets `<repo>/.local-runs/.ws5657-*/` as a fake workspace whose
     own `.local-runs/.tmpAbC123/audit/audit.log` is the poisoned leftover."""
 
@@ -407,19 +411,29 @@ class ScratchTreeCase(unittest.TestCase):
         self.assertFalse(_LEAKED_FLAGS, "an inode flag outlived the test that set it: %r" % (_LEAKED_FLAGS,))
 
     def _teardown(self):
-        # `a+rwX`, not `u+rwX`: a root-owned fixture is not ours to widen for
-        # the OWNER, and the flags must come off before anything can be removed.
-        subprocess.run(_priv() + ["chmod", "-R", "a+rwX", str(self.ws)], capture_output=True)
+        # Unprivileged, and `u+rwX` only (#6003): no fixture here is owned by
+        # anyone but this process (#5814), so widening for group and other buys
+        # nothing and, if the removal below never happens, leaves a world-
+        # writable tree in a shared runner workspace. The flags come off first
+        # - the one step that needs privilege, and only on Linux. On BSD a
+        # symlink carries flags of its own and `drop_flags` uses `lchflags`,
+        # which never follows it; Linux has no flags on a symlink.
+        subprocess.run(["chmod", "-R", "u+rwX", str(self.ws)], capture_output=True)
         try:
             for path in self.ws.rglob("*"):
-                if not path.is_symlink():
+                if IS_BSD or not path.is_symlink():
                     drop_flags(path)
         except OSError:
             pass
-        subprocess.run(_priv() + ["rm", "-rf", str(self.ws)], capture_output=True)
+        subprocess.run(["chmod", "-R", "u+rwX", str(self.ws)], capture_output=True)
         shutil.rmtree(self.ws, ignore_errors=True)
 
     # -- the defect itself -------------------------------------------------
+
+
+class ScratchTreeCase(ScratchTree):
+    """The walk: what it clears, what it refuses, and what it reports."""
+
     def test_flagged_leftover_blocks_removal_then_clear_makes_it_removable_5657(self):
         set_flag(self.log)
         with self.assertRaises(PermissionError):  # the macOS leg's EPERM on unlink
@@ -1068,6 +1082,22 @@ class StructuralPinCase(unittest.TestCase):
     def setUp(self):
         self.tree = ast.parse(SCRIPT.read_text())
 
+    def test_the_macos_step_comment_says_the_janitor_puts_widened_modes_back_6001(self):
+        """The comment on the macOS self-test step is read by whoever debugs
+        that leg, so it must not deny what the janitor does: every mode it
+        widens is put back (`_open_at`, `Search`, and the journal's repair
+        after a kill)."""
+        lines = (WF_DIR / "ci.yml").read_text().splitlines()
+        step = [i for i, line in enumerate(lines)
+                if "Append-only scratch janitor self-test (#5657, macOS fleet leg)" in line]
+        self.assertEqual(len(step), 1, "the macOS self-test step is not where this pin looks")
+        start = step[0]
+        while start > 0 and lines[start - 1].strip().startswith("#"):
+            start -= 1
+        comment = " ".join(line.strip().lstrip("#").strip() for line in lines[start:step[0]])
+        self.assertNotIn("never restores a mode", comment)
+        self.assertIn("puts back every mode it widens", comment)
+
     def test_script_never_follows_a_symlink_or_reresolves_a_path_5657(self):
         self.assertIn("O_NOFOLLOW", _module_assign(self.tree, "_OPEN_FLAGS"))
         opens = 0
@@ -1282,20 +1312,64 @@ class FixtureSafetyCase(unittest.TestCase):
         root-owned directory in the runner workspace that `git clean -ffdx`
         cannot remove and this janitor cannot heal. Privilege is for SETTING
         AN INODE FLAG - which the owner can clear again - never for creating
-        an inode."""
+        an inode.
+
+        Every function in this file is scanned - helpers, `setUp`, `_teardown`
+        and the reaper included, not only `test_*` bodies (#6003) - and the
+        only escalations allowed are the flag helpers' `chattr`/`lsattr`, the
+        janitor's own privileged run, and the `sudo -n true` probe."""
         tree = ast.parse(Path(__file__).resolve().read_text())
-        offenders = []
+        allowed = {"set_flag": ("chattr",), "drop_flags": ("chattr",), "is_flagged": ("lsattr",),
+                   "run_clear": ("SCRIPT",), "_sudo_available": ("'true'",), "_priv": ("'sudo'",)}
+        offenders, scanned = [], 0
         for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
+            scanned += 1
+            if node.name == "test_no_test_body_builds_a_fixture_it_cannot_remove_5657":
+                continue  # this scan names the words it looks for
             for call in ast.walk(node):
-                if not isinstance(call, ast.Call):
+                # Simple statements only: each escalation is judged with the
+                # whole command it builds in view.
+                if not isinstance(call, (ast.Assign, ast.AugAssign, ast.Expr, ast.Return)):
                     continue
                 text = ast.unparse(call)
-                if "_priv()" in text or "'sudo'" in text or '"sudo"' in text:
-                    offenders.append("%s: %s" % (node.name, text.splitlines()[0]))
-        self.assertFalse(offenders, "a test body escalates privilege to build a fixture: "
-                                    + "; ".join(sorted(set(offenders))))
+                if not ("_priv()" in text or "'sudo'" in text or '"sudo"' in text):
+                    continue
+                if any(word in text for word in allowed.get(node.name, ())):
+                    continue
+                offenders.append("%s: %s" % (node.name, text.splitlines()[0]))
+        self.assertGreater(scanned, 50, "the scan reached too few functions to pin anything")
+        self.assertIn("_teardown", [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)])
+        self.assertFalse(offenders, "a function in this file escalates privilege for something "
+                                    "other than an inode flag: " + "; ".join(sorted(set(offenders))))
+
+    def test_no_chmod_command_in_this_file_widens_for_group_or_other_6003(self):
+        """Every fixture here is owned by this process (#5814), so a cleanup
+        that widens for group or other buys nothing - and if the removal after
+        it never happens, it leaves a world-writable tree in a shared runner
+        workspace. Every symbolic mode handed to a `chmod` command in this
+        file names the owner only."""
+        tree = ast.parse(Path(__file__).resolve().read_text())
+        symbolic = re.compile(r"^([ugoa]*)[-+=][rwxXst]+(,[ugoa]*[-+=][rwxXst]+)*$")
+        offenders, seen = [], 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.List):
+                continue
+            words = [e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+            if "chmod" not in words:
+                continue
+            for word in words:
+                if not symbolic.match(word):
+                    continue
+                seen += 1
+                for clause in word.split(","):
+                    who = re.match(r"^([ugoa]*)", clause).group(1)
+                    if clause[len(who)] == "+" and who != "u":
+                        offenders.append("%s (line %d)" % (word, node.lineno))
+        self.assertGreater(seen, 0, "no chmod command was found, so this scan pins nothing")
+        self.assertFalse(offenders, "a chmod command in this file widens beyond the owner: "
+                                    + "; ".join(offenders))
 
     def test_a_cancelled_run_restores_every_mode_it_changed_5657(self):
         """The reaper is the difference between "this suite was interrupted"
@@ -1309,8 +1383,19 @@ class FixtureSafetyCase(unittest.TestCase):
         (victim / "inner").mkdir(parents=True)
         (victim / "inner" / "x.log").write_text("{}\n")
         before = stat.S_IMODE(os.lstat(victim).st_mode)
+        # The child's OWN handler is installed before the suite is imported, so
+        # the reaper chains to it and it runs LAST - and it leaves through
+        # `os._exit`, which runs no generator finaliser, no `finally` and no
+        # `atexit`. Whatever mode it prints is what the registry and the
+        # handler's drain restored, and nothing else (#6000): a `restrictive()`
+        # that stops registering, or a handler that stops draining, both leave
+        # 0o444 here.
         child = (
-            "import importlib.util as u, os, signal, stat, sys\n"
+            "import importlib.util as u, os, signal, stat, sys, time\n"
+            "def last(signum, frame):\n"
+            "    print('LEFT 0o%03o' % stat.S_IMODE(os.lstat(sys.argv[2]).st_mode), flush=True)\n"
+            "    os._exit(0)\n"
+            "signal.signal(signal.SIGTERM, last)\n"
             "spec = u.spec_from_file_location('selftest5657', sys.argv[1])\n"
             "mod = u.module_from_spec(spec)\n"
             "spec.loader.exec_module(mod)\n"
@@ -1318,17 +1403,27 @@ class FixtureSafetyCase(unittest.TestCase):
             "held.__enter__()\n"
             "print('HELD 0o%03o' % stat.S_IMODE(os.lstat(sys.argv[2]).st_mode), flush=True)\n"
             "os.kill(os.getpid(), signal.SIGTERM)\n"
+            "time.sleep(10)\n"
+            "os._exit(3)\n"
         )
-        r = subprocess.run([sys.executable, "-c", child, str(Path(__file__).resolve()), str(victim)],
-                           capture_output=True, text=True)
-        # Without this the test is vacuous (#2444): a child that dies before it
-        # changes anything leaves the mode untouched and "restored" trivially.
-        self.assertIn("HELD 0o444", r.stdout,
-                      "the child never reached the held state, so nothing was restored:\n%s%s"
-                      % (r.stdout, r.stderr))
-        after = stat.S_IMODE(os.lstat(victim).st_mode)
-        self.assertEqual(after, before,
-                         "a cancelled run left %s at mode 0o%03o:\n%s%s" % (victim, after, r.stdout, r.stderr))
+        try:
+            r = subprocess.run([sys.executable, "-c", child, str(Path(__file__).resolve()), str(victim)],
+                               capture_output=True, text=True)
+            # Without this the test is vacuous (#2444): a child that dies before it
+            # changes anything leaves the mode untouched and "restored" trivially.
+            self.assertIn("HELD 0o444", r.stdout,
+                          "the child never reached the held state, so nothing was restored:\n%s%s"
+                          % (r.stdout, r.stderr))
+            self.assertEqual(r.returncode, 0, "the child did not leave through its own handler, so "
+                             "something other than the reaper ran:\n%s%s" % (r.stdout, r.stderr))
+            self.assertIn("LEFT 0o%03o" % before, r.stdout,
+                          "the reaper's registry and drain did not restore the mode before the "
+                          "process left:\n%s%s" % (r.stdout, r.stderr))
+            after = stat.S_IMODE(os.lstat(victim).st_mode)
+            self.assertEqual(after, before,
+                             "a cancelled run left %s at mode 0o%03o:\n%s%s" % (victim, after, r.stdout, r.stderr))
+        finally:
+            os.chmod(str(victim), before)
         shutil.rmtree(victim)  # must not raise: this is what git clean does
 
 

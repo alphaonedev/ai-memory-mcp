@@ -1615,10 +1615,13 @@ jobs:
       # the workspace, and they are not interchangeable (#5814):
       #   FLAGS — the inode flags its fixtures set are cleared by the
       #           pre-checkout clear step above on the NEXT run.
-      #   MODES — the janitor never restores a mode, so the suite restores its
-      #           own: every fixture mode goes through `restrictive()`, which an
-      #           atexit hook and SIGINT/SIGTERM/SIGHUP handlers drain when a run
-      #           is cancelled. No fixture is built with privilege, so nothing it
+      #   MODES — the janitor puts back every mode it widens (and a widen a
+      #           kill interrupts is put back by its next run, from the
+      #           journal), so it leaves a fixture the suite NARROWED at that
+      #           narrowed mode, and the suite restores its own (#6001): every
+      #           fixture mode goes through `restrictive()`, which an atexit hook
+      #           and SIGINT/SIGTERM/SIGHUP handlers drain when a run is
+      #           cancelled. No fixture is built with privilege, so nothing it
       #           can leave behind is beyond `git clean -ffdx`.
       # The `docs_only` guard is rule (b3) of scripts/check-required-contexts.sh
       # (every step of an unguarded `needs: classify` job carries one).
