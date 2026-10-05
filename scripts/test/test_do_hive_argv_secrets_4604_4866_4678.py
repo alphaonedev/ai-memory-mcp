@@ -1032,6 +1032,8 @@ BANNED_CONSTRUCTS = (
     (r"\$\{\w+:?=", "default-assign expansion"),
     # #5410: let and the (( command evaluate their operand as arithmetic and print it in a syntax error.
     (r"\$\{\w+:?\?", "error expansion"),
+    # #5407: a process substitution runs a command the scan does not follow, and its redirect is no file.
+    (r"(?<![\w$\\])[<>]\(", "process substitution"),
     (r"(?<![\w-])let(?![\w-])", "let"), (r"(?<![\w$])\(\(", "arithmetic command"),
 )
 
@@ -1166,6 +1168,11 @@ def closed_world_taint(fs):
                         ("an escaped space in an assignment", 't=x\\ $qjson\nno "x $t"'),
                         ("a default-assign expansion", ': "${t:=$qjson}"\nno "x $t"'),
                         ("a default-assign expansion without the colon", ': "${t=$qjson}"\nno "x $t"'),
+                        # #5407: a process substitution runs a command the scan does not follow.
+                        ("a process substitution as a redirect target", 'printf %s "$qjson" > >(cat)'),
+                        ("a process substitution as a tee target", 'printf %s "$qjson" > >(cat >&2)'),
+                        ("a process substitution as an input", 'cat <(printf %s "$qjson")'),
+                        ("a process substitution fed to sed", 'sed p <(printf %s "$qjson")'),
                         # #5411: the error expansion prints its word.
                         ("an error expansion", ': "${t:?$qjson}"'), ("an error expansion without the colon", ': "${t?$qjson}"'),
                         # #5410: arithmetic evaluation of a reply prints it in a syntax error.
