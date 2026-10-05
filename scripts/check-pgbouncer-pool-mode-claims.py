@@ -412,7 +412,12 @@ def other_mode(text: str) -> bool:
 
 
 def neutral(text: str) -> bool:
-    """A context line that cannot qualify an approved line (R6): fence, section, short config line."""
+    """A context line that cannot qualify an approved line (R6): fence, section, short config line.
+
+    #5211 / F6: the other_mode() clause here is an equivalent of the R5 branch in the caller. A context line with a
+    mode word makes neutral() False, so R6 pairs it; if neutral() ignored the mode word, the elif R5 branch tests the
+    same other_mode() on the same line and pairs it too. neutral() is only reached for an approved mention, so no
+    case can tell the two apart: the mutant that reads raw text here is recorded as equivalent, not pinned."""
     return not other_mode(text) and any(shape.match(text) for shape in NEUTRAL_SHAPES)
 
 
@@ -843,6 +848,9 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("R9: three look-alikes the fold does not know", "docs/a.md", "Run PgBouncer in tr\u0251ns\u0251cti\u0254n mode.\n"),
     ("R9: a control character inside a word", "docs/a.md", "Run PgBouncer in tra\x01nsaction mode.\n"),
     ("R9: a symbol joined to the words of a pooler line", "docs/a.md", "Set the pooler to tr\u2016ansaction.\n"),
+    # #5370: R9 reads the neighbour on each side of a hiding symbol on its own
+    ("R9 #5370: a symbol touching an ASCII letter on its left only", "docs/a.md", "Our pgbouncer runs ab\u2016 for the api tier.\n"),
+    ("R9 #5370: a symbol touching an ASCII letter on its right only", "docs/a.md", "Our pgbouncer runs \u2016ab for the api tier.\n"),
     # #5363: a mode word made only of letters the fold does not know (small capitals), with or without an ASCII neighbour
     ("R9 #5363: a mode word of small capitals only", "docs/a.md", "Run PgBouncer in \u1d1b\u0280\u1d00\u0274\ua731\u1d00\u1d04\u1d1b\u026a\u1d0f\u0274 \u1d0d\u1d0f\u1d05\u1d07.\n"),
     ("R9 #5363: small capitals pooling after an ASCII-touching letter", "docs/a.md", "Use \u1d1b\u0280\u1d00\u0274s\u1d00\u1d04\u1d1b\u026a\u1d0f\u0274 \u1d18\u1d0f\u1d0f\u029f\u026a\u0274\u0262.\n"),
@@ -981,6 +989,9 @@ PLANTED: List[Tuple[str, str, str]] = [
 
 # Green probes: one per approved shape, plus neutral context and path tokens.
 GREEN: List[Tuple[str, str, str]] = [
+    ("R9 #5370: a symbol set apart by spaces hides no word", "docs/a.md", "Our pgbouncer runs \u2016 ab for the api tier.\n"),
+    ("R9 #5370: a symbol first on the line does not read the last letter", "docs/a.md", "\u2016 our pgbouncer runs the api\n"),
+    ("R9 #5370: a symbol last on the line reads no neighbour past the end", "docs/a.md", "our pgbouncer runs the api \u2016\n"),
     ("A1 ini assignment", "docs/a.md", "pool_mode = session\n"),
     ("A1 yaml assignment", "deploy/pgb.yaml", "pool_mode: session\n"),
     ("A1 env assignment", "deploy/.env", "PGBOUNCER_POOL_MODE=session\n"),
@@ -1361,6 +1372,12 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("R9 fold: three foreign letters never fold (#5368)", "    if not other or other > 2 or len(word) - other < 3:", "    if not other or other > 3 or len(word) - other < 3:"),
     ("R9 fold: wildcard match (#5368)", "        if dropped == key or wild.fullmatch(key):", "        if dropped == key:"),
     ("R9 fold: inserted-letter drop match (#5368)", "        if dropped == key or wild.fullmatch(key):", "        if wild.fullmatch(key):"),
+    ("R9 left neighbour of a symbol (#5370)", "        elif (i and _ascii_letter(view[i - 1])) or (i + 1 < len(view) and _ascii_letter(view[i + 1])):",
+     "        elif (i + 1 < len(view) and _ascii_letter(view[i + 1])):"),
+    ("R9 right neighbour of a symbol (#5370)", "        elif (i and _ascii_letter(view[i - 1])) or (i + 1 < len(view) and _ascii_letter(view[i + 1])):",
+     "        elif (i and _ascii_letter(view[i - 1])):"),
+    ("R9 first character has no left neighbour (#5370)", "        elif (i and _ascii_letter(view[i - 1]))", "        elif (_ascii_letter(view[i - 1]))"),
+    ("R9 last character has no right neighbour (#5370)", "or (i + 1 < len(view) and _ascii_letter(view[i + 1])):", "or (_ascii_letter(view[i + 1])):"),
     ("F1 the suffix is read case-blind (#5367)", "Path(line).suffix.lower() not in BINARY_SUFFIXES", "Path(line).suffix not in BINARY_SUFFIXES"),
     ("F1 NUL bytes in non-UTF-16 text", "            if utf8 and b\"\\0\" in chunk:", "            if False:"),
     ("F1 BOM-less UTF-16", "    if len(zeros) * 4 >= min(len(head), CHUNK_BYTES) > 0:", "    if False:"),
