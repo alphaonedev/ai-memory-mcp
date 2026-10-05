@@ -1320,6 +1320,12 @@ jobs:
         # file walk. Green near-misses: assignments, env prefixes, echo/printf,
         # YAML values, redaction tokens, bare -e NAME, the schema-init verb.
         run: python3 scripts/check-docs-no-argv-secrets.py --self-test
+      - name: Reinit script against stubbed binaries (#5143, #5402)
+        # Runs scripts/postgres-droplet-reinit.sh with stub ssh, psql, pg_dump,
+        # sudo and ai-memory on PATH: the dry-run store URL pins verify-full and
+        # hides the password, pg_dump pins verify-full and the CA, and a refusal
+        # (exit 7) comes before any pg_dump or DROP DATABASE.
+        run: python3 scripts/test/test_postgres_droplet_reinit.py
 
   cloud-init-serve-flags-gate:
     # #4616/#4657 - the cloud-init memory templates, as a fail-closed token
