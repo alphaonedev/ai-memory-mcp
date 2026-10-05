@@ -877,8 +877,15 @@ def _self_test_cases() -> int:
                     live.append(name)
             print(f"INFO: self-test - planted file ran (measured) for {live} with options {xopts}")
         # #5509: the child's exit code reaches parse_plant: a planted file that ran and exited 3 is never ok.
-        if live and plant_probe(live[0], base_dir / "implant-exit", [], exit_code=3).ok:
-            return "a probe child that exited non-zero was accepted (#5509)"
+        # #5565: run on a module name no interpreter provides, so the planted file always runs and the pin cannot be
+        # skipped on an interpreter where every probed name is inert. exit_code 0 is the positive control.
+        fake = "zz_rule_compare_5565_absent"
+        control_ok = plant_probe(fake, base_dir / "implant-fake", [])
+        exit_three = plant_probe(fake, base_dir / "implant-fake-exit", [], exit_code=3)
+        if not (control_ok.ok and control_ok.planted_ran and control_ok.shadowable):
+            return "the planted file of an absent module did not run cleanly (#5565)"
+        if exit_three.ok:
+            return "a probe child that exited non-zero was accepted (#5509, #5565)"
         if plant_coverage_gap(probed, names, 2):
             return "not every imported name was probed"
         if plant_coverage_gap(names + names, names, 2) or not plant_coverage_gap(names[:1], names, 1) \
