@@ -31,7 +31,8 @@ changelog.d/4667.fixed.md | (ci job pgbouncer pool-mode claim gate (#4667), not 
 # context re-read on 2026-10-04: The entry's own text is unchanged; the round-6 summary was added to the same changelog paragraph, and it names no pool mode to configure other than session.
 # context re-read on 2026-10-04: The entry's own text is unchanged; only the self-test counts in the same changelog paragraph changed (86 to 87 mutants, 204 to 205 cases), and they name no pool mode.
 # context re-read on 2026-10-05: Round 8 re-bind (#5471): each line sits in the 4667 changelog fragment, quotes the withdrawn transaction pooling or session-mode wording as prose, sets no pooler mode, and moved only because the fragment was re-wrapped
-changelog.d/4667.fixed.md | making the adapter safe under transaction pooling is tracked in #4679. | ctx:64f8d305e716
+# context re-read on 2026-10-05: Round 9 (#5552): the changelog gained a Round 9 paragraph and the Round 8 sentence was corrected, so the neighbourhood of this unchanged line moved; the text is the same and still describes the pooler mode claim gate, never a pool-mode setting.
+changelog.d/4667.fixed.md | making the adapter safe under transaction pooling is tracked in #4679. | ctx:cc8f540a762e
 
 # guide 5.6: states which modes are unsupported, the probe results and migration steps; session mode is the supported mode and is stated in the same section
 docs/enterprise-deployment.md | > status (#4667). the supported pool mode behind the postgres adapter is | ctx:51f8076f07ce
@@ -255,12 +256,14 @@ CHANGELOG.md | probe and the on conflict do nothing insert as two independent po
 # context re-read on 2026-10-04: The entry's own text is unchanged; the round-6 summary was added to the same changelog paragraph, and it names no pool mode to configure other than session.
 # context re-read on 2026-10-04: The entry's own text is unchanged; only the self-test counts in the same changelog paragraph changed (86 to 87 mutants, 204 to 205 cases), and they name no pool mode.
 # context re-read on 2026-10-05: Round 8 re-bind (#5471): each line sits in the 4667 changelog fragment, quotes the withdrawn transaction pooling or session-mode wording as prose, sets no pooler mode, and moved only because the fragment was re-wrapped
-changelog.d/4667.fixed.md | (plurals, tx/xact, session next to a pool word, a bare mode = key) must be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:f6dc59c34318
+# context re-read on 2026-10-05: Round 9 (#5552): the changelog gained a Round 9 paragraph and the Round 8 sentence was corrected, so the neighbourhood of this unchanged line moved; the text is the same and still describes the pooler mode claim gate, never a pool-mode setting.
+changelog.d/4667.fixed.md | (plurals, tx/xact, session next to a pool word, a bare mode = key) must be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:11778b61ef02
 # this PR's own changelog fragment: it states session mode is the only supported mode and describes how the gate rejects the other modes
 # context re-read on 2026-10-04: The entry's own text is unchanged; the round-6 summary was added to the same changelog paragraph, and it names no pool mode to configure other than session.
 # context re-read on 2026-10-04: The entry's own text is unchanged; only the self-test counts in the same changelog paragraph changed (86 to 87 mutants, 204 to 205 cases), and they name no pool mode.
 # context re-read on 2026-10-05: Round 8 re-bind (#5471): each line sits in the 4667 changelog fragment, quotes the withdrawn transaction pooling or session-mode wording as prose, sets no pooler mode, and moved only because the fragment was re-wrapped
-changelog.d/4667.fixed.md | be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:307567ad9fcf
+# context re-read on 2026-10-05: Round 9 (#5552): the changelog gained a Round 9 paragraph and the Round 8 sentence was corrected, so the neighbourhood of this unchanged line moved; the text is the same and still describes the pooler mode claim gate, never a pool-mode setting.
+changelog.d/4667.fixed.md | be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:36c8bb9b8532
 # this PR's own changelog fragment: it states session mode is the only supported mode and describes how the gate rejects the other modes
 changelog.d/4667.fixed.md | infra/pgbouncer ships pool_mode = session, scram, server_reset_query = | ctx:f2324c27bbd4
 changelog.d/4667.fixed.md | lines and paragraph neighbourhood that mentions a pooler mode in any spelling (plurals, tx/xact, session next to a pool word, a bare mode = key) must | ctx:d96ecbbdb579
