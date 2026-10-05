@@ -2803,38 +2803,68 @@ FUNNEL_SPAWNERS = frozenset({"_git_exec", "_run_wiring_cases", "_history_cases",
                              "_terminator_cases"})
 _SPAWN_ATTRS = frozenset({"system", "popen", "execv", "execve", "execvp", "execvpe", "execl", "execle",
                           "execlp", "execlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe", "spawnl", "spawnle",
-                          "spawnlp", "spawnlpe", "posix_spawn", "posix_spawnp"})
+                          "spawnlp", "spawnlpe", "posix_spawn", "posix_spawnp", "fork", "forkpty", "startfile"})
+# The only names of subprocess that may appear outside the funnel: constants and exception types, never a callable (#5632).
+_SUBPROCESS_PLAIN = frozenset({"PIPE", "DEVNULL", "STDOUT", "CalledProcessError", "TimeoutExpired",
+                               "CompletedProcess", "SubprocessError"})
+_PROCESS_MODULES = frozenset({"pty", "ctypes", "multiprocessing", "asyncio", "commands", "popen2", "pexpect"})
+# importlib may load a module from a path (the denylist import); import_module and __import__ are the bypass.
+_IMPORTLIB_PLAIN = frozenset({"util", "machinery"})
+_DYNAMIC_NAMES = frozenset({"__import__", "eval", "exec", "compile", "getattr", "setattr", "vars", "globals",
+                            "locals", "__builtins__"})
 
 
 def funnel_bypasses(source: str) -> List[str]:
-    """Every place that can start a process outside the funnel (#5581): a subprocess call, an os spawn or exec
-    call, or an import of a subprocess name or alias, outside FUNNEL_SPAWNERS. Closed world: any new way to
-    run git must go through _git_exec, so a new caller is refused here, not found by a review."""
+    """Every place that can start a process outside the funnel (#5581, #5632): any use of the name subprocess other
+    than a constant or an exception type, an os spawn, exec or fork name (called or not), a bare os or sys.modules
+    reference, an import of a process module (pty, ctypes, multiprocessing, asyncio, ...), and a dynamic
+    lookup (getattr, vars, globals, eval, exec, __import__), all outside FUNNEL_SPAWNERS. Closed world: any new way to
+    run git must go through _git_exec, so a new caller is refused here, not found by a review. This is a regression
+    guard, not a security boundary: a name built from strings at run time is not seen."""
     import ast
     tree = ast.parse(source)
     out: List[str] = []
 
-    def walk(node: "ast.AST", owner: str) -> None:
+    def add(node: "ast.AST", what: str, owner: str) -> None:
+        out.append("line %d: %s outside the git funnel (in %s)" % (node.lineno, what, owner or "module level"))
+
+    def walk(node: "ast.AST", owner: str, parent: "Optional[ast.AST]") -> None:
         for child in ast.iter_child_nodes(node):
             sub = owner
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and not owner:
                 sub = child.name
-            if isinstance(child, ast.ImportFrom) and (child.module or "").split(".")[0] in ("subprocess", "os") \
-                    and any(a.name in _SPAWN_ATTRS or child.module == "subprocess" for a in child.names):
+            top = (child.module or "").split(".")[0] if isinstance(child, ast.ImportFrom) else ""
+            if isinstance(child, ast.ImportFrom) and (top in ("subprocess", "os", "sys") or top in _PROCESS_MODULES) \
+                    and (top in ("subprocess",) or top in _PROCESS_MODULES or any(
+                        a.name in _SPAWN_ATTRS or a.name in ("*", "modules") for a in child.names)):
                 out.append("line %d: from %s import (hides a process start from this check)" % (child.lineno, child.module))
-            if isinstance(child, ast.Import) and any(a.name == "subprocess" and a.asname for a in child.names):
-                out.append("line %d: import subprocess as an alias" % child.lineno)
-            if isinstance(child, ast.Call) and owner not in FUNNEL_SPAWNERS:
-                f = child.func
-                if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and (
-                        f.value.id == "subprocess" or (f.value.id == "os" and f.attr in _SPAWN_ATTRS)):
-                    out.append("line %d: %s.%s outside the git funnel (in %s)" % (
-                        child.lineno, f.value.id, f.attr, owner or "module level"))
-                elif isinstance(f, ast.Name) and f.id in ("__import__", "eval", "exec"):
-                    out.append("line %d: %s() can start a process unseen" % (child.lineno, f.id))
-            walk(child, sub)
+            if isinstance(child, ast.Import):
+                for a in child.names:
+                    if a.name == "subprocess" and a.asname:
+                        out.append("line %d: import subprocess as an alias" % child.lineno)
+                    if a.name.split(".")[0] in _PROCESS_MODULES:
+                        out.append("line %d: import %s (a process start this check cannot follow)" % (child.lineno, a.name))
+            if owner not in FUNNEL_SPAWNERS:
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                    base_of = parent if isinstance(parent, ast.Attribute) and parent.value is child else None
+                    if child.id == "subprocess" and not (base_of is not None and base_of.attr in _SUBPROCESS_PLAIN):
+                        add(child, "the name subprocess is used" + (" (.%s)" % base_of.attr if base_of is not None else ""), owner)
+                    elif child.id == "os" and base_of is None:
+                        add(child, "the name os is used as a value", owner)
+                    elif child.id in _PROCESS_MODULES:
+                        add(child, "the name %s is used" % child.id, owner)
+                    elif child.id == "importlib" and not (base_of is not None and base_of.attr in _IMPORTLIB_PLAIN):
+                        add(child, "importlib is used beyond importlib.util", owner)
+                    elif child.id in _DYNAMIC_NAMES:
+                        add(child, "%s can start a process unseen" % child.id, owner)
+                elif isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name):
+                    if child.value.id == "os" and child.attr in _SPAWN_ATTRS:
+                        add(child, "os.%s" % child.attr, owner)
+                    elif child.value.id == "sys" and child.attr == "modules":
+                        add(child, "sys.modules", owner)
+            walk(child, sub, child)
 
-    walk(tree, "")
+    walk(tree, "", None)
     return out
 
 
@@ -2857,14 +2887,28 @@ def _funnel_structure_cases() -> Tuple[List[str], int]:
             ("import subprocess as alias", "import subprocess as sp\n"),
             ("from os import system", "from os import system\n"),
             ("__import__", "def f():\n    __import__('subprocess')\n"),
-            ("a funnel name reused as a nested def", "import subprocess\ndef f():\n    def _git_exec():\n        subprocess.run(['git'])\n")):
+            ("a funnel name reused as a nested def", "import subprocess\ndef f():\n    def _git_exec():\n        subprocess.run(['git'])\n"),
+            ("5632 subprocess bound to another name", "import subprocess\ndef f():\n    sp = subprocess\n    sp.run(['git'])\n"),
+            ("5632 getattr on subprocess", "import subprocess\ndef f():\n    getattr(subprocess, 'run')(['git'])\n"),
+            ("5632 importlib import_module", "import importlib\ndef f():\n    importlib.import_module('subprocess').run(['git'])\n"),
+            ("5632 pty.spawn", "import pty\ndef f():\n    pty.spawn(['git', 'log'])\n"),
+            ("5632 pty imported from", "from pty import spawn\n"),
+            ("5632 a method of the run function", "import subprocess\ndef f():\n    subprocess.run.__call__(['git'])\n"),
+            ("5632 os.system taken without a call", "import os\ndef f():\n    g = os.system\n"),
+            ("5632 os bound to another name", "import os\ndef f():\n    o = os\n    o.system('git log')\n"),
+            ("5632 sys.modules lookup", "import sys\ndef f():\n    sys.modules['subprocess'].run(['git'])\n"),
+            ("5632 os.fork", "import os\ndef f():\n    os.fork()\n"),
+            ("5632 vars lookup", "def f():\n    vars()['x']\n")):
         n += 1
         if not funnel_bypasses(src):
             bad.append("the funnel check missed a bypass: %s (#5581)" % label)
     for label, src in (
             ("the funnel itself", "import subprocess\ndef _git_exec():\n    subprocess.run(['git'])\n"),
             ("a fixture helper nested in a spawner", "import subprocess\ndef _history_cases():\n    def git():\n        subprocess.run(['git'])\n"),
-            ("only the exception name", "import subprocess\ndef f():\n    try:\n        pass\n    except subprocess.CalledProcessError:\n        pass\n")):
+            ("only the exception name", "import subprocess\ndef f():\n    try:\n        pass\n    except subprocess.CalledProcessError:\n        pass\n"),
+            ("5632 a constant of subprocess", "import subprocess\ndef f():\n    return subprocess.PIPE\n"),
+            ("5632 os.environ and os.path are no spawn", "import os\ndef f():\n    return os.environ.get('A'), os.path.join('a')\n"),
+            ("5632 importlib.util loads a module from a path", "import importlib.util\ndef f():\n    return importlib.util.spec_from_file_location('a', 'b')\n")):
         n += 1
         if funnel_bypasses(src):
             bad.append("the funnel check refused a clean source: %s (#5581)" % label)
