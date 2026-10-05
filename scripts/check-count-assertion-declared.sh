@@ -72,7 +72,8 @@
 # sets are compared: an assertion whose value moved, appeared or disappeared is a
 # count change, except that an assertion whose values are all undecidable
 # `?<spelling>` values holding no `#` neither appears nor disappears (a
-# `?NAME#unresolved`, `?NAME#ambiguous(..)` or `?count#ambiguous` value is
+# `?NAME#unresolved`, `?NAME#ambiguous(..)` or `?count#ambiguous` value, and a
+# spelling that names a const of the tree and so carries `#NAME=<value>`, is
 # never exempt). Reversed operands and `assert_ne!`
 # are not read (#5714).
 # WHAT IS READ (#5759) — the WHOLE first argument decides, never the first count
@@ -110,9 +111,12 @@
 #     argument, and the `>` of a `->` inside it closes nothing. A `<` opens such
 #     a list after `::` (a turbofish `f::<A, B>()`), after the type path that
 #     follows `as` (`x as W<A, B>`, also `x as ::m::W<A, B>` and `x as r#W<A, B>`;
-#     a `&`, a lifetime, `mut`, `*const`, `*mut` or `dyn` may stand before the path),
-#     and at the start of an operand (a qualified path `<T as Tr<A, B>>::C`); any
-#     other `<` is a comparison or a shift.
+#     a `&`, a lifetime, `mut`, `*const`, `*mut`, `dyn` or `impl` may stand before
+#     the path) or `->` (`f as fn() -> W<A, B>`; #5961), and at the start of an
+#     operand (a qualified path `<T as Tr<A, B>>::C`). As rustc reads them, a `<=`
+#     or `<<=` never opens one, nor does a `<` after `as _` (`_` is not a type
+#     path) or right after the `>` that closes a generic list: those compare
+#     (#5960). Any other `<` is a comparison or a shift.
 #   * BLOCK COMMENTS AND UNREADABLE ASSERTIONS (#5872; 5-agent vote (4d3ea1c5)
 #     on #5715): inside the arguments of an assert! or assert_eq! a `/* */`
 #     block comment, nested ones too, is blank space, so an operator, a comma,
@@ -124,7 +128,9 @@
 #     `>` the gate cannot find) is
 #     tracked as `!unreadable line <N> (<reason>): <spelling>` with the value
 #     `?count#unreadable`. It is red in every commit that changes its file (or
-#     moves a const that file names, #5888) and cannot be declared; one that leaves
+#     moves a const or static, of any type and name case, that file names, or a
+#     const defined through one of those; #5888, #5963, #5965) and cannot be
+#     declared; one that leaves
 #     the tree is a count change `?count#unreadable -> (none)`, declared as usual.
 #   * NOT READ assert! (stated limits): a count call only on the right of every
 #     `==` (reversed operands, `18 == v.len()`, also behind `&&`; #5714); a count
@@ -132,8 +138,13 @@
 #     a count spelled as a path call (`<[u8]>::len(v) == 18`), a free function
 #     (`row_count() == 18`) or a call with an argument (`m.count(k) == 18`; #5801).
 # The named-const spelling — `assert_eq!(x.len(), EXPECTED)` with
-# `const EXPECTED: usize = 19;` — is resolved the same way: a const that a
-# count assertion names, whose literal moved, is a count change.
+# `const EXPECTED: usize = 19;`, or a const or static of any type (#5963) — is
+# resolved the same way: a const that a count assertion names, whose value moved,
+# is a count change. A right-hand side that is neither a literal nor a bare const
+# (a cast, `.get()`, arithmetic) is the spelling `?<spelling>` followed by
+# `#NAME=<value>` for every const of the tree it names, expanded the same way
+# (transitively, a cycle as `#NAME=cycle`), so moving that const, or a const it
+# is defined through, is a count change too (#5964, #5965).
 #
 # FILE LISTING (#5518) — `git diff-tree -M -C --find-copies-harder`. A renamed or
 # copied file is compared with its SOURCE path, so rename-plus-bump and
@@ -160,7 +171,9 @@ sys.setrecursionlimit(20000)       # covers() recurses once per hit of a commit
 REPO = None                      # directory every git call runs in (None = the current one)
 DIFF_FLAGS = ['-M', '-C', '--find-copies-harder']
 FULL_SHA = re.compile(r'^[0-9a-f]{40}$')
-# a value is `(none)`, or comma-joined decimal integers and/or `?<spelling>` undecidable right-hand sides (#5577)
+# a value is `(none)`, or comma-joined decimal integers and/or `?<spelling>` undecidable right-hand sides (#5577); a
+# spelling holds no space (`~` between two word characters) and no comma (written `;`; ambiguous values are joined by
+# `|`), and a (why) follows a space, so every value is one declarable token (#5966)
 VALTOK = r'(?:[0-9]+|\?[^\s,]+?)'
 VAL = r'(?:\(none\)|' + VALTOK + r'(?:,' + VALTOK + r')*)(?=\s|,|->|$)'
 ITEM_RE = re.compile(r'^(?P<what>\S.*?)\s+(?P<old>' + VAL + r')\s*->\s*(?P<new>' + VAL + r')$')
