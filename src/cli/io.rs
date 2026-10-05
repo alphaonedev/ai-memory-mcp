@@ -1266,6 +1266,11 @@ pub fn mine(
     // reads the title slot before it writes, so a DEFERRED chunk fails with
     // SQLITE_BUSY_SNAPSHOT (never retried by busy_timeout) when the daemon
     // commits to the same file between the first read and the first write.
+    // This supersedes the #3163 rationale that DEFERRED was correct here because
+    // the importer owns a process-private connection: the daemon is a second
+    // writer on the same file, and the first-write lock upgrade is not retried
+    // by busy_timeout. The chunk takes the write lock at BEGIN, where contention
+    // is retried (#5462). The trade is a write lock held for the whole chunk.
     let mut write_txn = crate::storage::connection::WriteTxn::begin(&conn)?;
 
     for conv in &filtered {
@@ -1348,7 +1353,8 @@ pub fn mine(
 
         if imported.is_multiple_of(100) && imported > 0 {
             // Close the chunk and open the next one. `commit` consumes the
-            // guard, so the reassignment is what keeps the loop guarded.
+            // guard, so the reassignment is what keeps the loop guarded. The
+            // next chunk is IMMEDIATE for the same #5084 reason as the first.
             write_txn.commit()?;
             write_txn = crate::storage::connection::WriteTxn::begin(&conn)?;
         }
