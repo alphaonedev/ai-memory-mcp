@@ -543,9 +543,9 @@ def deny_lines(dl, rel: str, text: str) -> Dict[int, str]:
 # whatever the variable is called, so such a line is never allow-able (pending + issue only).
 CRED_TOOL_RE = re.compile(
     # mysql family: -p glued to the value, or --password with a space or an equals sign (#4920)
-    r"\b(?:mysql|mariadb|mysqladmin|mysqldump)\b[^|;&]*\s(?:-p|--password(?![\w-])[\s=]*)[\"']?\$"
-    r"|\bsshpass\s+-p\s*[\"']?\$"
-    r"|\bredis-cli\b[^|;&]*\s(?:-a|--pass(?![\w-]))[\s=]*[\"']?\$"
+    r"\b(?:mysql|mariadb|mysqladmin|mysqldump)\b[^|;&]*\s(?:-p|--password(?![\w-])[\s=]*)[\"']?(?:\$|`)"
+    r"|\bsshpass\s+-p\s*[\"']?(?:\$|`)"
+    r"|\bredis-cli\b[^|;&]*\s(?:-a|--pass(?![\w-]))[\s=]*[\"']?(?:\$|`)"
     # one shell word after the flag that expands a variable, however its user part is quoted:
     # u:$X, "u:$X", u:"$X", 'u':"$X", "u":"$X" (#5101). A short flag may close a group of
     # combined short flags (-su, -fsSU) (#4993); a long flag is matched whole (not --user-agent).
@@ -557,7 +557,7 @@ CRED_TOOL_RE = re.compile(
     # variable that names the file alone is not (#4891 round 3)
     r"|\bcurl\b[^|;&]*\s(?:-[A-Za-z]*E|--(?:proxy-)?cert(?![\w-]))[\s=]*"
     r"(?:[^\s\"':]|\"[^\":]*\"|'[^':]*')*(?:[\"'][^\"':]*)?:"
-    r"(?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:[\"'][^\"'$]*)?\$"
+    r"(?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:[\"'][^\"'$]*)?(?:\$|`)"
     # --password-stdin is the safe form and is not matched (#4994)
     r"|\b(?:docker|podman)\s+login\b[^|;&]*\s(?:-p|--password)(?![\w-])"
     # a credential header in any letter case (#4997), after a combined short flag or --header=
@@ -1480,6 +1480,15 @@ ROUND3_RED = [
     ("wget --proxy-passwd backtick", 'wget --proxy-passwd `cat f` h'),
     ("wget --passwo= backtick prefix", 'wget --passwo=`cat f` h'),
     ("wget --password= backtick", 'wget --password=`cat f` h'),
+    ("sshpass -p backtick", 'sshpass -p `cat $F` ssh h'),
+    ("sshpass -p backtick no dollar", 'sshpass -p `cat f` ssh h'),
+    ("redis-cli -a backtick", 'redis-cli -a `cat f` ping'),
+    ("redis-cli --pass backtick", 'redis-cli --pass `cat f` ping'),
+    ("mysql --password= backtick", 'mysql --password=`cat f` db'),
+    ("mysql -p glued backtick", 'mysql -p`cat f` db'),
+    ("mysqldump -p quoted backtick", 'mysqldump -u r -p"`cat f`" db'),
+    ("curl -E key password backtick", 'curl -E c.pem:`cat f` h'),
+    ("curl --cert key password backtick", 'curl --cert c.pem:`cat f` h'),
     ("curl -H backtick bearer", 'curl -H "Authorization: Bearer `cat f`" h'),
     ("curl -H backtick api key", 'curl -H "X-API-KEY: `cat f`" h'),
     ("curl -H backtick after the quote", "curl -H 'Authorization: Bearer '`cat f` h"),
