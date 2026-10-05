@@ -1744,8 +1744,8 @@ THAT FILE — each `::` component is checked, so
 `VectorIndex::build_with_capacity` resolves only if both do; the
 unbackticked form, and a `Type<T, U>::method` or `<Type as Trait>::method`
 path with one balanced generic group per component, nested to any depth
-(commas, lifetimes, `dyn Fn(u8) -> u8` and `&lt;...&gt;` entities included; an unbalanced group is
-reported, never skipped), are checked too, the former
+(commas, lifetimes, `dyn Fn(u8) -> u8` and `&lt;...&gt;` entities and `-&gt;` included; an unbalanced or doubly closed group is
+reported, never skipped; a leading `<Type<T>>::m` group names its type with or without `as`), are checked too, the former
 reported as **BARE_QUAL**, and a qualified anchor always asserts that
 its file exists), **MDLINK** (a ``[`sym`](../src/<p>.rs)`` link must resolve, or `sym`
 must BE the module's file stem, which is a legitimate module citation; a relative link to a `src/` file must point at an existing file, whatever its form: a double-quoted, single-quoted or parenthesised title, an angle-bracket destination, a `?query`, a reference definition (also inside a blockquote or list item, or with the destination on the next line) or an HTML href (any case, spaces around `=`, quoted or not)),
