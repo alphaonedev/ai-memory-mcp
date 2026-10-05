@@ -1980,6 +1980,17 @@ ROUND3_RED = [
     ('5630 closed world: reported 4: short clusters ending in -p are read letter by letter', 'mysql -vvp"$P" db'),
     ('5630 closed world: reported 5: short clusters ending in -p are read letter by letter', 'mysql -Bsp"${DB_PASSWORD}"'),
     ('5630 closed world: reported 6: short clusters ending in -p are read letter by letter', 'mysqlcheck -Aqp"$X"'),
+    ('5635 closed world: reported 1: a long option is clean only when it is a measured non-password option', 'mysql --password1="$X" db'),
+    ('5635 closed world: reported 2: a long option is clean only when it is a measured non-password option', 'mysql --encrypt-key="$X" db'),
+    ('5635 closed world: reported 3: a long option is clean only when it is a measured non-password option', 'mysql -u r --loose_pass "$X" db'),
+    ('5635 closed world: reported 4: a long option is clean only when it is a measured non-password option', 'mysql --LOOSE-password="$X" db'),
+    ('5635 closed world: reported 5: a long option is clean only when it is a measured non-password option', 'mysql --enable-loose-password="$X" db'),
+    ('5635 closed world: reported 6: a long option is clean only when it is a measured non-password option', 'mysql --skip-password="$X" db'),
+    ('5635 closed world: reported 7: a long option is clean only when it is a measured non-password option', 'mysql --pager="$X" db'),
+    ('5635 closed world: reported 8: a long option is clean only when it is a measured non-password option', 'mysql --uri "$URI"'),
+    ('5635 closed world: reported 9: a long option is clean only when it is a measured non-password option', 'mysqldump --pa "$X" db'),
+    ('5635 closed world: reported 10: a long option is clean only when it is a measured non-password option', 'mysqldump --p="$X" db'),
+    ('5635 closed world: reported 11: a long option is clean only when it is a measured non-password option', 'mysql --password-file="$F" db'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
@@ -2010,6 +2021,14 @@ ROUND3_GREEN = [
     ('5630 closed world: clean 2: short clusters ending in -p are read letter by letter', 'mysql -sh"$H" db'),
     ('5630 closed world: clean 3: short clusters ending in -p are read letter by letter', 'mysql -u"$U" -h"$H" db'),
     ('5630 closed world: clean 4: short clusters ending in -p are read letter by letter', 'mysql -Bs db'),
+    ('5635 closed world: clean 1: a long option is clean only when it is a measured non-password option', 'mysql --host "$H" --user "$U" --port "$P" db'),
+    ('5635 closed world: clean 2: a long option is clean only when it is a measured non-password option', 'mysql --defaults-file="$F" db'),
+    ('5635 closed world: clean 3: a long option is clean only when it is a measured non-password option', 'mysql --login-path="$LP" db'),
+    ('5635 closed world: clean 4: a long option is clean only when it is a measured non-password option', 'mysql --defaults-extra-file="$F" db'),
+    ('5635 closed world: clean 5: a long option is clean only when it is a measured non-password option', 'mysql --po="$P" db'),
+    ('5635 closed world: clean 6: a long option is clean only when it is a measured non-password option', 'mysql --loose-port="$P" db'),
+    ('5635 closed world: clean 7: a long option is clean only when it is a measured non-password option', 'mysql --skip-ssl --ssl-key="$K" db'),
+    ('5635 closed world: clean 8: a long option is clean only when it is a measured non-password option', 'mysql --user="$U" --database="$D"'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
