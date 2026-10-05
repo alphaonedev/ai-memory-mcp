@@ -991,6 +991,15 @@ def arith_findings(text, names):
     return bad
 
 
+# #5413: b64 encodes its argument for a node (it is only ever called inside a command substitution that feeds a
+# node channel); its pipe through base64 is exempt only while its definition is exactly this line.
+B64_DEF = "b64() { printf '%s' \"$1\" | base64 | tr -d '\\n'; }"
+
+
+def b64_pinned(line):
+    return line.strip() == B64_DEF
+
+
 def taint_findings(text, names):
     """Sink commands whose arguments name a node-derived variable other than through an allowed helper.
     #5236: a positional parameter, an indirect expansion, a pipe into anything but a silent or node-bound
@@ -998,7 +1007,7 @@ def taint_findings(text, names):
     bad, checked = [], 0
     helper = r"\$\((?:%s)(?: \"\$\{?\w+\}?\")+\)" % "|".join(sorted(ALLOWED))
     for n, line, func in logical_lines(text):
-        if func in ALLOWED or re.match(r"^\s*(?:ok|no|die)\(\) \{", line):
+        if func in ALLOWED or re.match(r"^\s*(?:ok|no|die)\(\) \{", line) or b64_pinned(line):
             continue
         for cmd, args, after, before in _segments(line, "|".join(SINKS)):
             if cmd in ("echo", "printf", "cat"):
@@ -1007,7 +1016,7 @@ def taint_findings(text, names):
                     continue
                 # A pipe is not the terminal only when it feeds a silent or node-bound consumer.
                 if after.startswith("|") and not after.startswith("||") \
-                        and re.match(r"\|\s*(?:grep\s+-q\w*\s|curl\s|base64\b)", after):
+                        and re.match(r"\|\s*(?:grep\s+-q\w*\s|curl\s|base64\b[^|]*\|\s*curl\s)", after):
                     continue
                 # A file is not the terminal; the last output redirect decides (#5412).
                 if stdout_to_file(args):
@@ -1155,6 +1164,12 @@ def closed_world_taint(fs):
                         ("tr with the reply as a set", 'echo abc | tr abc "$qjson"'),
                         ("unset with the reply", 'unset "$qjson"'),
                         ("readonly with the reply as the name", 'readonly "$qjson"'),
+                        # #5413: base64 is a filter, not a node-bound consumer: only a pipe on into curl is.
+                        ("a bare pipe into base64", 'printf %s "$qjson" | base64'),
+                        ("a pipe into base64 -w0", 'echo "$qjson" | base64 -w0'),
+                        ("a pipe through base64 into cat", 'printf %s "$qjson" | base64 | cat'),
+                        ("a pipe through base64 into tr", "printf %s \"$qjson\" | base64 | tr -d '\\n'"),
+                        ("a b64 helper that prints its argument", "b64() { printf '%s' \"$1\" | base64; }"),
                         # #5408: a backtick command substitution is a command substitution.
                         ("a backtick substitution in a PASS line", 'ok "x `head -c 9 \\"$OUT_DIR/r\\"`"'),
                         ("a backtick substitution in a failure line", 'no "x `sed -n 1p "$OUT_DIR/r"`"'),
@@ -1231,6 +1246,8 @@ def closed_world_taint(fs):
                         ("a reply captured through sed", "age_ver=\"$(printf '%s\\n' \"$versions\" | sed -n 's/^age=//p')\""),
                         ("the status helper given a reply body", 'no "x $(reply_status "$qjson")"'),
                         ("a test after then", 'if true; then [ "$qjson" = x ] && :; fi'),
+                        # #5413: a pipe through base64 that goes on into curl is node-bound; b64 is pinned below.
+                        ("a pipe through base64 into curl", 'printf %s "$qjson" | base64 | curl -s -d @- https://x'),
                         # #5412: a plain path or /dev/null is a file whatever the order of the other redirects.
                         ("a write to a file", 'printf %s "$qjson" > "$OUT_DIR/r"'),
                         ("an append to a file", 'printf %s "$qjson" >> "$OUT_DIR/r"'),
