@@ -60,7 +60,7 @@ MUTANTS = (
     ("M24", G, "        out.append(text[i:m.end()])\n        ph = CRED_PLACEHOLDER_RE.match(text, m.end())", "        out.append(text[i:m.end()])\n        ph = None", "no placeholder exemption (masks too much, shown value lost)"),
     ("M25", G, "        end = CRED_LINE_RE.match(text, m.end()).end()\n        if end > m.end():\n            out.append(CRED_MASK)", "        end = CRED_LINE_RE.match(text, m.end()).end()", "keyword tail dropped instead of masked"),
     ("M26", G, "        globals()[\"load_repo\"] = real\n        CRED_PIECES.clear()", "        globals()[\"load_repo\"] = real", "spelling run leaves its pieces registered"),
-    ("M27", R, "    g.CRED_PIECES.clear()\n    return bad", "    return bad", "regen spelling loop leaves pieces registered"),
+    ("M27", R, "    g.CRED_PIECES.clear()\n    if g.CRED_PIECES:", "    if g.CRED_PIECES:", "regen spelling loop leaves pieces registered"),
     ("M28", G, "out.append(\"%s | %s | %s\" % (scope_of(nm), ln.ctx, scrub(ln.text)))", "out.append(\"%s | %s | %s\" % (scope_of(nm), ln.ctx, ln.text))", "list_triggers returns unscrubbed text (say() also scrubs)"),
     ("M29", G, "SCRUB_PLACEHOLDER = r\"(?![\\w.-]*:CHANGEME@[^@\\n]*(?:\\n|$))\"", "SCRUB_PLACEHOLDER = r\"\"", "the CHANGEME userinfo is masked too"),
     ("M30", G, "and not (hcl and HCL_REFERENCE_RE.fullmatch(w))", "and not (False and HCL_REFERENCE_RE.fullmatch(w))", "main.tf var.X reference registered as a secret"),
