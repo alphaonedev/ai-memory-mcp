@@ -1000,6 +1000,107 @@ def b64_pinned(line):
     return line.strip() == B64_DEF
 
 
+# #5409: filters and dump commands that print the content of a file operand or of an input redirect.
+FILE_PRINTERS = frozenset(("head", "tail", "xxd", "od", "hexdump", "strings", "more", "less", "cut", "sort", "uniq", "nl",
+                           "fold", "rev", "tac", "paste", "column", "awk", "sed", "tr", "grep", "egrep", "fgrep", "zcat",
+                           "bzcat", "xzcat", "diff", "comm", "join", "pr", "fmt", "expand", "unexpand", "base64", "base32",
+                           "dd", "jq", "look", "cat"))
+
+
+def pipeline_stages(line):
+    """(stage text, operator that follows it) for the statements of a logical line outside $( ) captures and
+    quotes. A stage followed by | is not the last of its pipeline."""
+    out, cur, i, depth, quote = [], "", 0, 0, None
+    while i < len(line):
+        c = line[i]
+        if c == "\\":
+            cur += line[i:i + 2] if not depth else ""
+            i += 2
+            continue
+        if quote:
+            if not depth:
+                cur += c
+            quote = None if c == quote else quote
+            i += 1
+            continue
+        if line.startswith("$(", i):
+            depth += 1
+            i += 2
+            continue
+        if depth:
+            depth += {"(": 1, ")": -1}.get(c, 0)
+            i += 1
+            continue
+        if c in "\"'":
+            quote = c
+            cur += c
+        elif line.startswith("${", i):
+            j = line.find("}", i)
+            j = len(line) - 1 if j < 0 else j
+            cur += line[i:j + 1]
+            i = j
+        elif c in "|;&()\n" and not ((c == "&" and (line[i - 1:i] in (">", "<") or line[i + 1:i + 2] == ">"))
+                                      or (c in "()" and line[i - 1:i] == "=")):
+            op = line[i:i + 2] if line[i:i + 2] in ("||", "&&", ";;") else c
+            out.append((cur, op))
+            cur, i = "", i + len(op) - 1
+        else:
+            cur += c
+        i += 1
+    out.append((cur, ""))
+    return [(t, o) for t, o in out if t.strip()]
+
+
+def stage_words(stage):
+    """Words of a simple command with keywords and leading name=value words dropped."""
+    body = re.sub(KEYWORDS, "", stage.lstrip())
+    return re.sub(r"^(?:\w+\+?=(?:\"[^\"]*\"|'[^']*'|\S*)\s*)+", "", body)
+
+
+def reads_a_file(stage):
+    """The command word of a file printer stage that reads a file operand or an input redirect, else None."""
+    body = stage_words(stage)
+    words = body.split()
+    if not words or words[0] not in FILE_PRINTERS:
+        return None
+    word = words[0]
+    if word == "grep" and any(re.fullmatch(r"-\w*[qclL]\w*", w) for w in words[1:]):
+        return None   # prints no content of the file: a status, a count or a name
+    if re.search(r"(?<![<])<(?![<(])\s*\S", body):
+        return word
+    args = [w for w in re.sub(r"\d*>&?\S*|&>>?\S*|<<-?\S*", "", body).split()[1:] if not w.startswith("-")]
+    need = 2 if word in ("sed", "awk", "grep", "egrep", "fgrep", "jq") else 1
+    return word if len(args) >= need and word != "tr" else None
+
+
+def file_printer_findings(text):
+    """#5409: a file printer that reads a file and is not the end of a capture, a file redirect or a silent
+    consumer: head, xxd, od, sed -n p, tr < FILE, grep -h . FILE ... print what a node reply left in a file."""
+    bad = []
+    for n, line, func in logical_lines(text):
+        if func in ALLOWED or re.match(r"^\s*(?:ok|no|die)\(\) \{", line) or b64_pinned(line):
+            continue
+        stages, k = pipeline_stages(line), 0
+        while k < len(stages):
+            j = k
+            while j < len(stages) - 1 and stages[j][1] == "|":
+                j += 1
+            pipe = [t for t, _ in stages[k:j + 1]]
+            k = j + 1
+            printers = [w for w in (reads_a_file(t) for t in pipe) if w]
+            last = stage_words(pipe[-1]).split()
+            last_word = last[0] if last else ""
+            silent_end = stdout_to_file(pipe[-1]) or last_word in ("wc", "curl") or reads_a_file_silent(pipe[-1])
+            if printers and not silent_end:
+                bad.append("%d:%s:file read" % (n, printers[0]))
+    return bad
+
+
+def reads_a_file_silent(stage):
+    words = stage_words(stage).split()
+    return bool(words) and words[0] in ("grep", "egrep", "fgrep") and any(re.fullmatch(r"-\w*[qclL]\w*", w) for w in words[1:])
+
+
 def taint_findings(text, names):
     """Sink commands whose arguments name a node-derived variable other than through an allowed helper.
     #5236: a positional parameter, an indirect expansion, a pipe into anything but a silent or node-bound
@@ -1046,6 +1147,7 @@ def taint_findings(text, names):
     bad += heredoc_findings(text, names)
     bad += consumer_findings(text, names)
     bad += arith_findings(text, names)
+    bad += file_printer_findings(text)
     return bad, checked
 
 
@@ -1164,6 +1266,16 @@ def closed_world_taint(fs):
                         ("tr with the reply as a set", 'echo abc | tr abc "$qjson"'),
                         ("unset with the reply", 'unset "$qjson"'),
                         ("readonly with the reply as the name", 'readonly "$qjson"'),
+                        # #5409: a file printed by a command other than cat, as a line of its own or at the end of a pipeline.
+                        ("head of a reply file", 'head -c 99 "$OUT_DIR/r"'), ("xxd of a reply file", 'xxd "$OUT_DIR/r"'),
+                        ("sed -n p of a reply file", 'sed -n p "$OUT_DIR/r"'), ("tr from a reply file", 'tr a b < "$OUT_DIR/r"'),
+                        ("grep -h of a reply file", 'grep -h . "$OUT_DIR/r"'), ("awk of a reply file", "awk 1 \"$OUT_DIR/r\""),
+                        ("cut of a reply file", 'cut -c1-9 "$OUT_DIR/r"'), ("sort of a reply file", 'sort "$OUT_DIR/r"'),
+                        ("jq of a reply file", 'jq . "$OUT_DIR/r"'), ("od of a reply file after then", 'if true; then od -c "$OUT_DIR/r"; fi'),
+                        ("head after &&", 'true && head -c 9 "$OUT_DIR/r"'), ("head after ||", 'false || head -c 9 "$OUT_DIR/r"'),
+                        ("head piped into cat", 'head -c 9 "$OUT_DIR/r" | cat'),
+                        ("head piped into tr", "head -c 9 \"$OUT_DIR/r\" | tr -d x"),
+                        ("a subshell printing a file", '( strings "$OUT_DIR/r" )'),
                         # #5414: a wrapper around a node channel in every function spelling is a taint source.
                         ("a function keyword wrapper", 'function pf { node_sh 0 </dev/null; }\nt=$(pf)\nno "x $t"'),
                         ("a spaced name () wrapper", 'pf2 () { node_sh 0 </dev/null; }\nt=$(pf2)\nno "x $t"'),
@@ -1254,6 +1366,15 @@ def closed_world_taint(fs):
                         ("a reply captured through sed", "age_ver=\"$(printf '%s\\n' \"$versions\" | sed -n 's/^age=//p')\""),
                         ("the status helper given a reply body", 'no "x $(reply_status "$qjson")"'),
                         ("a test after then", 'if true; then [ "$qjson" = x ] && :; fi'),
+                        # #5409: a file read whose output is a file, a count, a status or a capture.
+                        ("head into a file", 'head -c 9 "$OUT_DIR/r" > "$OUT_DIR/o"'),
+                        ("head into wc", 'head -c 9 "$OUT_DIR/r" | wc -c'),
+                        ("grep -q of a file", 'grep -q x "$OUT_DIR/r"'),
+                        ("grep -qx of a file with stderr discarded", 'if grep -qx pat "$OUT_DIR/r" 2>/dev/null; then :; fi'),
+                        ("grep -c of a file in a capture", 'k="$(LC_ALL=C grep -aEcx x "$OUT_DIR/r")"'),
+                        ("head in a capture", 'k="$(head -c 9 "$OUT_DIR/r" | wc -c)"'),
+                        ("sed from a file to /dev/null", 'sed -n p < "$OUT_DIR/r" > /dev/null'),
+                        ("head into grep -q", 'head -c 1 -- "$OUT_DIR/r" | LC_ALL=C grep -q x'),
                         # #5413: a pipe through base64 that goes on into curl is node-bound; b64 is pinned below.
                         ("a pipe through base64 into curl", 'printf %s "$qjson" | base64 | curl -s -d @- https://x'),
                         # #5412: a plain path or /dev/null is a file whatever the order of the other redirects.
