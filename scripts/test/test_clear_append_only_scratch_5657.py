@@ -709,10 +709,15 @@ class ScratchTreeCase(ScratchTree):
                              "an inode outside the scratch tree was chmod'ed and then put back")
 
     def test_a_replaced_entry_is_refused_with_nothing_widened_5852(self):
-        """#5852, the pre-chmod half of the bracket. The entry is replaced by
-        a different inode before the widen; the janitor must notice and refuse,
-        and the inode that is left standing in the tree must not have been
-        widened on the way out."""
+        """#5852, the pre-chmod half of the bracket, and #5997. The entry is
+        replaced by a different inode before the widen; the janitor must notice
+        and refuse, and the inode that is left standing in the tree must not
+        have been widened on the way out.
+
+        The decoy's mode DIFFERS from the scanned entry's (#5997): a widen that
+        lands on the decoy and is then "put back" leaves it at the SCANNED mode,
+        which a decoy at the same mode would hide. Its ctime is read after the
+        swap, so a widen that is put back to the very same mode is still seen."""
         mod = load_script_module()
         entry = self.audit / "unreadable.key"
         entry.write_text("k")
@@ -720,13 +725,21 @@ class ScratchTreeCase(ScratchTree):
         # and the only entry that races is the one the test is about.
         decoy = self.ws / "decoy.key"
         decoy.write_text("d")
-        with restrictive(entry, 0o000), restrictive(decoy, 0o000):
+        seen = {}
+
+        def swap():
+            os.replace(str(decoy), str(entry))
+            seen["ctime"] = os.lstat(entry).st_ctime_ns
+
+        with restrictive(entry, 0o000), restrictive(decoy, 0o200):
             inode = os.lstat(entry).st_ino
-            with swap_when_inspected(mod, inode, lambda: os.replace(decoy, entry)) as fired:
+            with swap_when_inspected(mod, inode, swap) as fired:
                 rc, out, err = run_clear_in_process(mod, self.ws)
             self.assertTrue(fired, "the seam never fired: the race window was never reached")
-            self.assertEqual(stat.S_IMODE(os.lstat(entry).st_mode), 0o000,
-                             "the replacement inode was left widened by a refusal")
+            self.assertEqual(stat.S_IMODE(os.lstat(entry).st_mode), 0o200,
+                             "the replacement inode was given the scanned entry's mode:\n" + out + err)
+            self.assertEqual(os.lstat(entry).st_ctime_ns, seen["ctime"],
+                             "the replacement inode was chmod'ed by a refusal:\n" + out + err)
             self.assertNotEqual(rc, 0, "a replaced entry is not a pass:\n" + out + err)
 
     def test_a_widened_mode_is_restored_or_reported_when_the_reopen_fails_5812(self):
@@ -1001,6 +1014,609 @@ class ScratchTreeCase(ScratchTree):
                              "a leftover this run repaired is not a failure:\n" + r.stdout + r.stderr)
 
 # --------------------------------------------------------------------------
+# the pending-restore journal: one line per outstanding widen (#6006, #6013,
+# #6015, #6020) and the input it must refuse (#6016, #6018, #6019)
+# --------------------------------------------------------------------------
+# Run the janitor and SIGKILL it right after the Nth call of one `os` seam has
+# changed a mode. The kill is sent from inside the process, so no handler, no
+# `finally` and no `atexit` runs: that is the whole of what this reproduces.
+# argv: <this file> <workspace> <seam> <n> <inode or 0> <path to report>...
+# With an inode, only an `fchmod` on that inode that ADDS `S_IXUSR` counts, so
+# the Nth widen of one directory is reached with no timing assumption.
+_KILLED_AT_NTH = (
+    "import importlib.util as u, os, signal, stat, sys\n"
+    "spec = u.spec_from_file_location('selftest5657', sys.argv[1])\n"
+    "mod = u.module_from_spec(spec)\n"
+    "spec.loader.exec_module(mod)\n"
+    "script = mod.load_script_module()\n"
+    "seam, nth, ino, watch = sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6:]\n"
+    "real, calls = getattr(script.os, seam), []\n"
+    "def wrapped(*args, **kwargs):\n"
+    "    real(*args, **kwargs)\n"
+    "    if ino and not (os.fstat(args[0]).st_ino == ino and args[1] & stat.S_IXUSR):\n"
+    "        return\n"
+    "    calls.append(args)\n"
+    "    if len(calls) == nth:\n"
+    "        print('KILLED ' + ' '.join('%s=0o%03o' % (os.path.basename(p), stat.S_IMODE(os.lstat(p).st_mode))\n"
+    "                                   for p in watch), flush=True)\n"
+    "        os.kill(os.getpid(), signal.SIGKILL)\n"
+    "setattr(script.os, seam, wrapped)\n"
+    "sys.exit(script.main(['--root', sys.argv[2]]))\n"
+)
+
+
+class JournalCase(ScratchTree):
+    """A widen that a `SIGKILL` interrupts is put back by the NEXT run, every
+    one of them, and nothing else is ever changed on the journal's say-so."""
+
+    def journal(self):
+        return self.scratch / load_script_module().PENDING_RESTORE_FILE
+
+    def kill_at(self, seam, nth, ino, *watch):
+        killed = subprocess.run(
+            [sys.executable, "-c", _KILLED_AT_NTH, str(Path(__file__).resolve()), str(self.ws),
+             seam, str(nth), str(ino)] + [str(p) for p in watch],
+            capture_output=True, text=True)
+        # Without these two the test is vacuous (#2444): a child that dies
+        # before the Nth widen leaves nothing widened, and a child that EXITS
+        # has run the code a kill skips.
+        self.assertIn("KILLED", killed.stdout,
+                      "the child never reached the widen it is killed at:\n" + killed.stdout + killed.stderr)
+        self.assertEqual(killed.returncode, -signal.SIGKILL,
+                         "the janitor exited instead of being killed:\n" + killed.stdout + killed.stderr)
+        return killed.stdout
+
+    def test_a_kill_with_two_widens_outstanding_is_put_back_on_both_6020(self):
+        """#6020 and #6006 mechanism 2. A `0o000` directory holding a `0o000`
+        directory: when the inner one is widened, the outer one is widened
+        too - its search window is open around the lookup - so a kill there
+        leaves TWO modes applied. A record with one slot cannot describe that,
+        and the `Widener` widen was not recorded at all."""
+        d = self.scratch / ".tmpD"
+        e = d / "E"
+        e.mkdir(parents=True)
+        (e / "inner.log").write_text("{}\n")
+        with restrictive(e, 0o000), restrictive(d, 0o000):
+            out = self.kill_at("chmod", 2, 0, d, e)
+            self.assertIn("E=0o500", out, "the inner directory was not widened when the kill landed")
+            self.assertIn("D=0o100", out, "the outer directory's search window was not open")
+            r = run_clear(self.ws)
+            self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o000,
+                             "the outer widen was left applied:\n" + r.stdout + r.stderr)
+            with restrictive(d, 0o700):
+                self.assertEqual(stat.S_IMODE(os.lstat(e).st_mode), 0o000,
+                                 "the inner widen was left applied:\n" + r.stdout + r.stderr)
+            for path, left in ((d, "0o100"), (e, "0o500")):
+                self.assertIn("put mode 0o000 back on %s, which a previous run left at %s" % (path, left),
+                              r.stdout, "a repair is unreported:\n" + r.stdout + r.stderr)
+            self.assertEqual(r.returncode, 0, "a leftover this run repaired is not a failure:\n"
+                             + r.stdout + r.stderr)
+            again = run_clear(self.ws)
+            self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+            self.assertNotIn("put mode", again.stdout, "a repair was made twice:\n" + again.stdout)
+
+    def test_a_widen_after_an_inner_search_released_is_still_recorded_6013(self):
+        """#6013. The outer directory's search window opens once per lookup.
+        After the inner directory's descent is over and ITS line is released,
+        the outer directory widens again for the next name - and a release
+        that emptied the whole record, or a hold made on the first widen
+        only, leaves that widen with nothing written down."""
+        d = self.scratch / ".tmpP"
+        (d / "A").mkdir(parents=True)
+        (d / "A" / "a.log").write_text("{}\n")
+        (d / "B").mkdir()
+        with restrictive(d / "A", 0o400), restrictive(d, 0o400):
+            # 1: the lookup of A; 2: the open of A; 3: the lookup of B.
+            out = self.kill_at("fchmod", 3, os.lstat(d).st_ino, d)
+            self.assertIn("P=0o500", out, "the outer directory was not widened when the kill landed")
+            r = run_clear(self.ws)
+            self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o400,
+                             "a widen made after an inner release was left applied:\n" + r.stdout + r.stderr)
+            self.assertIn("put mode 0o400 back on %s, which a previous run left at 0o500" % d, r.stdout,
+                          "the repair is unreported:\n" + r.stdout + r.stderr)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_a_clean_run_leaves_no_journal_line_behind_6013(self):
+        """Every line a run holds is released by that run, so a run that
+        finished leaves the journal empty: a line per widen and a release per
+        line, not a line per lookup with only the last one released."""
+        d = self.scratch / ".tmpC"
+        for name in ("A", "B", "C"):
+            (d / name).mkdir(parents=True)
+            (d / name / "x.log").write_text("{}\n")
+        with restrictive(d / "A", 0o400), restrictive(d / "B", 0o000), restrictive(d, 0o400):
+            r = run_clear(self.ws)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            journal = self.journal()
+            self.assertTrue(journal.exists(), "the widens this run made were never written down")
+            self.assertEqual(journal.read_bytes(), b"",
+                             "a run that finished left lines in the journal:\n%r" % journal.read_bytes())
+
+    def test_a_mode_changed_since_the_kill_is_left_alone_and_reported_6014(self):
+        """#6014. The journal says what was widened and from what. A mode that
+        is neither of those now was set by somebody after the kill, and putting
+        the recorded mode on it would undo THEIR change: it is reported, the
+        line is kept, and nothing is changed."""
+        d = self.scratch / ".tmpM"
+        d.mkdir()
+        (d / "x.log").write_text("{}\n")
+        with restrictive(d, 0o400):
+            self.kill_at("fchmod", 1, os.lstat(d).st_ino, d)
+            os.chmod(str(d), 0o700)
+            for attempt in (1, 2):
+                r = run_clear(self.ws)
+                self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o700,
+                                 "run %d put the recorded mode over a later change:\n%s%s"
+                                 % (attempt, r.stdout, r.stderr))
+                self.assertNotEqual(r.returncode, 0, "run %d: a widen it could not settle is not a "
+                                    "pass:\n%s%s" % (attempt, r.stdout, r.stderr))
+                for text in ("0o400", "0o500", "0o700", str(d)):
+                    self.assertIn(text, r.stderr, "run %d's report does not name %s:\n%s"
+                                  % (attempt, text, r.stderr))
+                self.assertNotIn("put mode", r.stdout, r.stdout)
+
+    def test_a_widened_directory_replaced_since_the_kill_is_reported_by_every_run_6015(self):
+        """#6015 and the inode half of #6014. The recorded name now holds a
+        different directory: the recorded mode is not that directory's to
+        receive, and the widen it describes is still on an inode this run
+        cannot reach. Every run says so - the walk's own widens append lines of
+        their own and never overwrite this one."""
+        d = self.scratch / ".tmpR"
+        d.mkdir()
+        (d / "x.log").write_text("{}\n")
+        moved = self.ws / "moved-out.d"
+        with restrictive(d, 0o400):
+            self.kill_at("fchmod", 1, os.lstat(d).st_ino, d)
+            os.chmod(str(d), 0o700)
+            os.rename(str(d), str(moved))
+            os.chmod(str(moved), 0o500)
+            try:
+                d.mkdir()
+                (d / "y.log").write_text("{}\n")
+                with restrictive(d, 0o400):
+                    for attempt in (1, 2, 3):
+                        r = run_clear(self.ws)
+                        self.assertNotEqual(r.returncode, 0, "run %d forgot a widen it never settled:\n%s%s"
+                                            % (attempt, r.stdout, r.stderr))
+                        self.assertIn("different inode", r.stderr, "run %d:\n%s" % (attempt, r.stderr))
+                        self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o400,
+                                         "the replacement was given the recorded mode")
+                    self.assertEqual(stat.S_IMODE(os.lstat(moved).st_mode), 0o500,
+                                     "the moved-out directory was reached and changed")
+            finally:
+                os.chmod(str(moved), 0o700)
+
+    def test_a_record_in_the_old_format_is_never_acted_on_6018(self):
+        """#6018. A record naming an inode outside the scratch tree, with its
+        true device and inode numbers and a mode no widen produces, used to be
+        applied and reported as a repair. A line is accepted only in the form
+        this script writes, naming a path inside the tree, describing a widen
+        this script makes; anything else is reported and changes nothing."""
+        outside = self.ws / "outside.d"
+        outside.mkdir(mode=0o700)
+        os.chmod(str(outside), 0o700)
+        st = os.lstat(outside)
+        self.journal().write_text("%d %d %o %s\n" % (st.st_dev, st.st_ino, 0o777, outside))
+        os.chmod(str(self.journal()), 0o600)
+        r = run_clear(self.ws)
+        self.assertEqual(stat.S_IMODE(os.lstat(outside).st_mode), 0o700,
+                         "an inode outside the scratch tree was chmod'ed on a record's say-so:\n"
+                         + r.stdout + r.stderr)
+        self.assertEqual(os.lstat(outside).st_ctime_ns, st.st_ctime_ns,
+                         "an inode outside the scratch tree was touched")
+        self.assertNotIn("put mode", r.stdout, r.stdout)
+        self.assertNotEqual(r.returncode, 0, "a record that cannot be used is not a pass:\n"
+                            + r.stdout + r.stderr)
+
+    def test_a_journal_line_outside_the_tree_or_beyond_a_widen_is_refused_6018(self):
+        """The line format this script writes, forged: a relative path that
+        climbs out of the tree, and a 'widen' that would add bits no widen in
+        this file ever adds. Neither is applied; both are reported."""
+        outside = self.ws / "outside.d"
+        outside.mkdir()
+        inside = self.scratch / ".tmpF"
+        inside.mkdir()
+        with restrictive(outside, 0o300), restrictive(inside, 0o777):
+            so, si = os.lstat(outside), os.lstat(inside)
+            self.journal().write_text(
+                # 0o300 -> 0o700 is a widen this script makes, at a path it is not given.
+                "+ 00.1 %d %d %o %o %s\n" % (so.st_dev, so.st_ino, 0o300, 0o700,
+                                             os.fsencode("../outside.d").hex())
+                # inside the tree, and a 'widen' that adds bits no widen here adds.
+                + "+ 00.2 %d %d %o %o %s\n" % (si.st_dev, si.st_ino, 0o000, 0o777,
+                                               os.fsencode(".tmpF").hex()))
+            os.chmod(str(self.journal()), 0o600)
+            r = run_clear(self.ws)
+            self.assertEqual(stat.S_IMODE(os.lstat(outside).st_mode), 0o300, r.stdout + r.stderr)
+            self.assertEqual(os.lstat(outside).st_ctime_ns, so.st_ctime_ns, r.stdout + r.stderr)
+            self.assertEqual(stat.S_IMODE(os.lstat(inside).st_mode), 0o777, r.stdout + r.stderr)
+            self.assertNotIn("put mode", r.stdout, r.stdout)
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("not inside the scratch tree", r.stderr, r.stderr)
+            self.assertIn("not a widen this script makes", r.stderr, r.stderr)
+
+    def test_a_hardlinked_journal_is_refused_not_written_through_6019(self):
+        """#6019. `O_NOFOLLOW` refuses a symlink at the journal's name and not
+        a hardlink, and a hardlink is the same inode as a file outside the
+        tree. The journal is trusted only as a single-link regular file owned
+        by this process; anything else is refused before a byte is written."""
+        victim = self.ws / "precious.txt"
+        victim.write_text("precious\n")
+        os.link(str(victim), str(self.journal()))
+        d = self.scratch / ".tmpH"
+        d.mkdir()
+        (d / "x.log").write_text("{}\n")
+        with restrictive(d, 0o400):
+            r = run_clear(self.ws)
+            self.assertEqual(victim.read_text(), "precious\n",
+                             "a file outside the scratch tree was written through the journal")
+            self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o400, r.stdout + r.stderr)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("links", r.stderr, r.stderr)
+
+    def test_a_name_that_is_not_utf8_is_journalled_and_put_back_6016(self):
+        """#6016. A directory name is bytes, and the journal stores the bytes:
+        a name that is not UTF-8 is held, released and repaired like any other
+        instead of crashing the walk. Linux only - APFS refuses such a name."""
+        raw = os.path.join(os.fsencode(str(self.scratch)), b"\xff\xfe-dir")
+        try:
+            os.mkdir(raw)
+        except OSError as err:
+            if err.errno in (errno.EILSEQ, errno.EINVAL):
+                self.skipTest("this filesystem refuses a name that is not UTF-8: %s" % err)
+            raise
+        name = os.fsdecode(raw)
+        with open(os.path.join(raw, b"x.log"), "w") as handle:
+            handle.write("{}\n")
+        with restrictive(name, 0o400):
+            r = run_clear(self.ws)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(stat.S_IMODE(os.lstat(raw).st_mode), 0o400, r.stdout + r.stderr)
+            self.assertEqual(self.journal().read_bytes(), b"")
+            out = self.kill_at("fchmod", 1, os.lstat(raw).st_ino)
+            self.assertIn("KILLED", out)
+            self.assertEqual(stat.S_IMODE(os.lstat(raw).st_mode), 0o500)
+            r = run_clear(self.ws)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(stat.S_IMODE(os.lstat(raw).st_mode), 0o400,
+                             "a widen on a non-UTF-8 name was not put back:\n" + r.stdout + r.stderr)
+
+
+class WidenFailureCase(ScratchTree):
+    """What every exit from the widen in `_open_at` leaves behind, and what it
+    says about it - each pinned by a behaviour, not by the text of the code."""
+
+    def test_an_entry_renamed_out_before_the_reopen_is_restored_or_reported_6017(self):
+        """#6017 and #5812. The widen lands, the identity read after it passes,
+        and only then does the name leave the tree, so the reopen fails. Where
+        the inode is pinned the mode comes back off it; where it is not, the
+        restore cannot reach it and must SAY so with both modes - it used to
+        replace the error with its own `ENOENT`, which the walk treats as an
+        entry that went away, and exit 0."""
+        mod = load_script_module()
+        entry = self.audit / "unreadable.key"
+        entry.write_text("k")
+        kept = self.ws / "kept-original.key"
+        real = os.open
+        opens = []
+
+        def opener(path, flags, *args, **kwargs):
+            if path == "unreadable.key" and not flags & getattr(os, "O_PATH", 0):
+                opens.append(flags)
+                if len(opens) == 2:
+                    os.rename(str(entry), str(kept))
+            return real(path, flags, *args, **kwargs)
+
+        with restrictive(entry, 0o000):
+            with mock.patch.object(mod.os, "open", opener):
+                rc, out, err = run_clear_in_process(mod, self.ws)
+        self.assertEqual(len(opens), 2, "the reopen after the widen was never reached: %r" % opens)
+        left = stat.S_IMODE(os.lstat(kept).st_mode)
+        if mod.HAS_O_PATH:
+            self.assertEqual(left, 0o000, "the pinned inode kept the widened mode")
+        else:
+            self.assertEqual(left, stat.S_IRUSR)
+            self.assertNotEqual(rc, 0, "a widen left applied is not a pass:\n" + out + err)
+            self.assertIn("left applied", err, out + err)
+            self.assertIn("0o400", err, out + err)
+            self.assertIn("0o000", err, out + err)
+            self.assertIn("unreadable.key", err, out + err)
+
+    def test_a_shared_inode_is_never_widened_5936(self):
+        """#5936. A regular file with a second link outside the scratch tree is
+        an inode this janitor was never pointed at. Widening it to read its
+        flags changes that other file too - its ctime says so even when the
+        mode is put back - so it is refused before anything changes."""
+        shared = self.audit / "shared.log"
+        shared.write_text("{}\n")
+        outside = self.ws / "outside-link.log"
+        os.link(str(shared), str(outside))
+        with restrictive(outside, 0o000):
+            before = os.lstat(outside).st_ctime_ns
+            r = run_clear(self.ws)
+            self.assertEqual(os.lstat(outside).st_ctime_ns, before,
+                             "an inode reachable from outside the scratch tree was chmod'ed:\n"
+                             + r.stdout + r.stderr)
+            self.assertEqual(stat.S_IMODE(os.lstat(outside).st_mode), 0o000)
+            if not IS_BSD:
+                # Linux's `lstat` carries no flags, so nothing short of the
+                # widen can say whether this inode is flagged: it is reported.
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("links", r.stderr, r.stderr)
+
+    def test_a_link_made_after_the_scan_is_refused_before_the_widen_5936(self):
+        """#5936 on both legs, for the link the scan never saw. The entry has
+        one link when it is classified, and a second name outside the scratch
+        tree appears the instant the janitor decides it may widen it. The
+        widen step re-reads the inode it is about to change - the pin's
+        `fstat` with `O_PATH` (Linux), the bracket's `lstat` without it
+        (macOS/BSD) - and refuses the shared inode there, so the outside name
+        keeps its mode and its ctime. On macOS the `lstat` flags already skip
+        a shared, unflagged file that the scan sees, so this race is the one
+        path where only the widen step's own check stands in the way."""
+        mod = load_script_module()
+        entry = self.audit / "single.log"
+        entry.write_text("{}\n")
+        outside = self.ws / "late-outside-link.log"
+        seen = {}
+
+        def link():
+            os.link(str(entry), str(outside))
+            seen["ctime"] = os.lstat(outside).st_ctime_ns
+
+        with restrictive(entry, 0o000):
+            with swap_when_inspected(mod, os.lstat(entry).st_ino, link) as fired:
+                rc, out, err = run_clear_in_process(mod, self.ws)
+            self.assertTrue(fired, "the seam never fired: the entry was never a widen candidate")
+            self.assertEqual(os.lstat(outside).st_ctime_ns, seen["ctime"],
+                             "an inode reachable from outside the scratch tree was chmod'ed:\n" + out + err)
+            self.assertEqual(stat.S_IMODE(os.lstat(outside).st_mode), 0o000)
+            os.unlink(str(outside))
+        self.assertNotEqual(rc, 0, "a shared inode left uninspected is not a pass:\n" + out + err)
+        self.assertIn("links", err, out + err)
+
+    @unittest.skipUnless(IS_BSD, "macOS/BSD: the lstat carries the inode flags (Linux: #6022 notes)")
+    def test_an_append_only_file_behind_mode_0o000_names_the_remedy_6022(self):
+        """#6022. macOS refuses a mode change on an append-only inode, so a
+        flag hidden behind mode 0o000 cannot be reached by widening. The
+        janitor cannot clear it; it must say what blocks it and how."""
+        f = self.audit / "single.log"
+        f.write_text("{}\n")
+        with restrictive(f, 0o000):
+            with flagged(f):
+                r = run_clear(self.ws)
+                self.assertTrue(is_flagged(f))
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("chflags nouappnd", r.stderr, r.stderr)
+            self.assertIn("0o000", r.stderr, r.stderr)
+            self.assertIn(str(f), r.stderr, r.stderr)
+
+    @unittest.skipUnless(hasattr(os, "O_PATH"), "Linux only: the O_PATH pin")
+    def test_a_failed_pin_never_leaks_its_descriptor_6004(self):
+        """#6004. The `O_PATH` pin is closed on every failure after it is
+        opened, including an `fstat` that raises."""
+        mod = load_script_module()
+        entry = self.audit / "unreadable.key"
+        entry.write_text("k")
+        pins, real_open, real_fstat = set(), os.open, os.fstat
+        failed = []
+
+        def opener(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if flags & os.O_PATH:
+                pins.add(fd)
+            return fd
+
+        def fstat(fd):
+            if fd in pins and not failed:
+                failed.append(fd)
+                raise OSError(errno.EIO, "fstat refused")
+            return real_fstat(fd)
+
+        def open_fds():
+            return len(os.listdir("/proc/self/fd"))
+
+        with restrictive(entry, 0o000):
+            before = open_fds()
+            with mock.patch.object(mod.os, "open", opener), mock.patch.object(mod.os, "fstat", fstat):
+                rc, out, err = run_clear_in_process(mod, self.ws)
+            after = open_fds()
+        self.assertTrue(failed, "the pin's fstat was never reached")
+        self.assertEqual(after, before, "the pinning descriptor leaked: %d -> %d" % (before, after))
+        self.assertNotEqual(rc, 0, out + err)
+
+    def test_a_swap_inside_the_bracket_is_refused_before_the_replacement_is_opened_5812(self):
+        """#5812 on the leg with no `O_PATH` (macOS/BSD): the widen is by name,
+        and the name is replaced the instant the chmod lands. The identity read
+        that closes the bracket must refuse right there - the replacement is a
+        readable inode the walk never classified, and it is never opened, never
+        chmod'ed, and the mode left on the scanned inode is reported. Where the
+        inode is pinned (Linux) there is no bracket - the reopen compare refuses
+        a replacement instead, pinned by `..._5998` - so this leg-specific pin
+        skips there."""
+        mod = load_script_module()
+        if mod.HAS_O_PATH:
+            self.skipTest("the widen is inode-bound here; the bracket exists only without O_PATH")
+        entry = self.audit / "unreadable.key"
+        entry.write_text("k")
+        stranger = self.ws / "stranger.key"   # outside the scratch tree: never walked
+        stranger.write_text("s")
+        kept = self.ws / "kept-original.key"
+        seen = {}
+        opened = []
+        real_open = mod.os.open
+
+        def opener(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            with contextlib.suppress(OSError):
+                opened.append(os.fstat(fd).st_ino)
+            return fd
+
+        def swap():
+            os.rename(str(entry), str(kept))
+            os.replace(str(stranger), str(entry))
+            st = os.lstat(entry)
+            seen["ino"], seen["ctime"] = st.st_ino, st.st_ctime_ns
+
+        with restrictive(entry, 0o000), restrictive(stranger, 0o644):
+            mod.os.open = opener
+            try:
+                with swap_after_the_widen(mod, swap) as fired:
+                    rc, out, err = run_clear_in_process(mod, self.ws)
+            finally:
+                mod.os.open = real_open
+            self.assertTrue(fired, "the seam never fired: nothing was ever widened")
+            self.assertNotIn(seen["ino"], opened,
+                             "the replacement was opened after a swap inside the bracket:\n" + out + err)
+            self.assertEqual(os.lstat(entry).st_ctime_ns, seen["ctime"],
+                             "the replacement was chmod'ed:\n" + out + err)
+            self.assertEqual(stat.S_IMODE(os.lstat(entry).st_mode), 0o644)
+        self.assertNotEqual(rc, 0, "a swap inside the bracket is not a pass:\n" + out + err)
+        self.assertIn("left applied", err, out + err)
+        self.assertIn("0o%03o" % stat.S_IRUSR, err, out + err)
+        self.assertEqual(stat.S_IMODE(os.lstat(kept).st_mode), stat.S_IRUSR,
+                         "the mode left on the scanned inode is not the one reported")
+
+    def test_a_readable_replacement_at_the_reopen_is_refused_untouched_5998(self):
+        """#5998. The reopen after the widen is compared against the scanned
+        inode. A replacement that is READABLE gets past the open, so only that
+        compare stands between it and having the scanned entry's mode put on
+        it. The swap lands inside the reopen itself - after the widen and
+        after the macOS bracket's second identity read - so both legs reach
+        the compare and nothing else can refuse first."""
+        mod = load_script_module()
+        entry = self.audit / "unreadable.key"
+        entry.write_text("k")
+        stranger = self.ws / "stranger.key"
+        stranger.write_text("s")
+        kept = self.ws / "kept-original.key"
+        real, opens, seen = os.open, [], {}
+
+        def opener(path, flags, *args, **kwargs):
+            if path == "unreadable.key" and not flags & getattr(os, "O_PATH", 0):
+                opens.append(flags)
+                if len(opens) == 2:
+                    os.rename(str(entry), str(kept))
+                    os.rename(str(stranger), str(entry))
+                    seen["ctime"] = os.lstat(entry).st_ctime_ns
+            return real(path, flags, *args, **kwargs)
+
+        with restrictive(stranger, 0o644), restrictive(entry, 0o000):
+            with mock.patch.object(mod.os, "open", opener):
+                rc, out, err = run_clear_in_process(mod, self.ws)
+            self.assertEqual(len(opens), 2, "the reopen after the widen was never reached: %r" % opens)
+            self.assertEqual(stat.S_IMODE(os.lstat(entry).st_mode), 0o644,
+                             "the replacement was given the scanned entry's mode:\n" + out + err)
+            self.assertEqual(os.lstat(entry).st_ctime_ns, seen["ctime"],
+                             "the replacement was chmod'ed:\n" + out + err)
+            self.assertNotEqual(rc, 0, out + err)
+            self.assertIn("replaced", err, out + err)
+            if mod.HAS_O_PATH:
+                self.assertEqual(stat.S_IMODE(os.lstat(kept).st_mode), 0o000,
+                                 "the scanned inode was not put back through its pin")
+
+    def test_an_interrupt_at_the_reopen_puts_the_mode_back_and_propagates_5999(self):
+        """#5999 M3. A `KeyboardInterrupt` between the widen and the return is
+        not an `OSError`; the restore still runs, and the interrupt still
+        stops the run."""
+        mod = load_script_module()
+        entry = self.audit / "unreadable.key"
+        entry.write_text("k")
+        real, opens = os.open, []
+
+        def opener(path, flags, *args, **kwargs):
+            if path == "unreadable.key" and not flags & getattr(os, "O_PATH", 0):
+                opens.append(flags)
+                if len(opens) == 2:
+                    raise KeyboardInterrupt()
+            return real(path, flags, *args, **kwargs)
+
+        with restrictive(entry, 0o000):
+            with mock.patch.object(mod.os, "open", opener):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_clear_in_process(mod, self.ws)
+            self.assertEqual(len(opens), 2)
+            self.assertEqual(stat.S_IMODE(os.lstat(entry).st_mode), 0o000,
+                             "an interrupt at the reopen left the widened mode applied")
+
+    def test_a_refused_restore_at_the_reopen_is_reported_with_its_modes_5999(self):
+        """#5999 M4. The reopen fails and the restore is refused: the run must
+        say that the widened mode is left applied, with the entry's path."""
+        mod = load_script_module()
+        entry = self.audit / "unreadable.key"
+        entry.write_text("k")
+        real_open, real_chmod, opens, chmods = os.open, os.chmod, [], []
+
+        def opener(path, flags, *args, **kwargs):
+            if path == "unreadable.key" and not flags & getattr(os, "O_PATH", 0):
+                opens.append(flags)
+                if len(opens) == 2:
+                    raise OSError(errno.EIO, "reopen refused")
+            return real_open(path, flags, *args, **kwargs)
+
+        def chmod(*args, **kwargs):
+            chmods.append(args)
+            if len(chmods) == 2:
+                raise OSError(errno.EPERM, "restore refused")
+            return real_chmod(*args, **kwargs)
+
+        with restrictive(entry, 0o000):
+            with mock.patch.object(mod.os, "open", opener), mock.patch.object(mod.os, "chmod", chmod):
+                rc, out, err = run_clear_in_process(mod, self.ws)
+            self.assertEqual(len(chmods), 2, "the widen and its restore: %r" % chmods)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn("left applied", err, out + err)
+        self.assertIn("0o400", err, out + err)
+        self.assertIn("unreadable.key", err, out + err)
+
+    def test_no_safe_chmod_route_is_a_refusal_with_nothing_changed_6005(self):
+        """#6005 M9. With neither an `O_PATH` pin nor a no-follow chmod there
+        is no widen that cannot be redirected, so the entry is refused and
+        nothing about it changes - its ctime included."""
+        mod = load_script_module()
+        entry = self.audit / "unreadable.key"
+        entry.write_text("k")
+        with restrictive(entry, 0o000):
+            before = os.lstat(entry).st_ctime_ns
+            with mock.patch.object(mod, "HAS_O_PATH", False), \
+                    mock.patch.object(mod, "CAN_CHMOD_NOFOLLOW", False):
+                rc, out, err = run_clear_in_process(mod, self.ws)
+            self.assertEqual(os.lstat(entry).st_ctime_ns, before,
+                             "an entry was chmod'ed with no safe route:\n" + out + err)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn("unreadable.key", err, out + err)
+        self.assertIn("re-resolving", err, out + err)
+
+    @unittest.skipUnless(hasattr(os, "O_PATH"), "Linux only: the /proc/self/fd route")
+    def test_a_chmod_through_fd_dir_that_raises_enoent_is_reported_6021(self):
+        """#6021. `FD_DIR` exists, so the up-front refusal does not fire, and
+        the chmod through it raises `ENOENT` anyway. That must be reported as
+        an entry that could not be inspected, never read as one that went
+        away."""
+        mod = load_script_module()
+        shut = self.scratch / ".tmpEnoent"
+        shut.mkdir()
+        inner = shut / "inner.log"
+        inner.write_text("{}\n")
+        real, seen = os.chmod, []
+
+        def chmod(path, *args, **kwargs):
+            if isinstance(path, str) and path.startswith(mod.FD_DIR + "/"):
+                seen.append(path)
+                raise FileNotFoundError(errno.ENOENT, "no such entry", path)
+            return real(path, *args, **kwargs)
+
+        with restrictive(shut, 0o000):
+            with mock.patch.object(mod.os, "chmod", chmod):
+                rc, out, err = run_clear_in_process(mod, self.ws)
+        self.assertTrue(seen, "no chmod went through FD_DIR")
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn("could not inspect", err, out + err)
+        self.assertIn(str(shut), err, out + err)
+        self.assertNotIn("0 cleared, 0 failed", out, out)
+
+
+# --------------------------------------------------------------------------
 # structural pins: the containment primitives the behaviour tests cannot race
 # --------------------------------------------------------------------------
 _BANNED_CALLS = frozenset({
@@ -1151,9 +1767,11 @@ class StructuralPinCase(unittest.TestCase):
             self.assertNotIn(platform_name, capability,
                              "a platform name is not a capability test")
 
-    def test_the_widener_pins_the_inode_before_it_changes_anything_5657(self):
-        """Every widen goes through this class, so the class itself has to be
-        incapable of addressing a name that can be re-resolved (#5813)."""
+    def test_structural_the_widener_source_takes_a_pin_or_a_nofollow_route_5852(self):
+        """STRUCTURAL ONLY: this reads the source, it runs nothing. It checks
+        that `Widener` takes an `O_PATH` pin where one exists and a no-follow
+        chmod where it does not; whether a swap is actually refused is pinned
+        by behaviour, per leg, in `..._5852` and `..._5812` (#5852, #5813)."""
         init = _named_method(self.tree, "Widener", "__init__")
         source = ast.unparse(init)
         self.assertIn("os.O_PATH", source, "the entry must be pinned open before anything changes")
@@ -1291,6 +1909,60 @@ class StructuralPinCase(unittest.TestCase):
                           "a restore the kernel refuses leaves the mode applied on BOTH "
                           "platforms, so an unqualified claim here is false (#6002): %r" % claim)
             self.assertIn("#6002", claim, "the refused-restore case has an issue to point at")
+
+    def test_every_widen_is_journalled_before_it_lands_and_the_kill_claim_names_each_6007(self):
+        """#6007 and #5852: the kill-safety claim is checked against the set of
+        widens that are actually RECORDED, resolved from the AST, not against
+        how often a class is mentioned.
+
+        Every call that widens a mode (a `chmod`/`fchmod` whose mode is OR-ed
+        with something) must be preceded, in its own function, by a `.hold(`
+        that appends its journal line; the docstring paragraph that claims an
+        exit running no code is covered must name every class that performs
+        such a widen; and the two phrasings that claimed coverage for widens
+        nothing recorded must not come back."""
+        source = SCRIPT.read_text()
+        doc = ast.get_docstring(self.tree)
+        functions = [n for n in ast.walk(self.tree) if isinstance(n, ast.FunctionDef)]
+        owner = {}
+        for fn in functions:
+            for node in ast.walk(fn):
+                owner.setdefault(node, fn)
+        widens, unrecorded, performers = 0, [], set()
+        for fn in functions:
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call) or owner.get(node) is not fn:
+                    continue
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name not in ("chmod", "fchmod"):
+                    continue
+                if not any(isinstance(a, ast.BinOp) and isinstance(a.op, ast.BitOr) for a in node.args):
+                    continue
+                widens += 1
+                held = [c for c in ast.walk(fn) if isinstance(c, ast.Call)
+                        and isinstance(c.func, ast.Attribute) and c.func.attr == "hold"
+                        and c.lineno < node.lineno]
+                if not held:
+                    unrecorded.append("%s:%d %s" % (fn.name, node.lineno, ast.unparse(node)))
+                if isinstance(func.value, ast.Name) and func.value.id == "widener":
+                    performers.add("Widener")
+                    continue
+                for cls in (n for n in self.tree.body if isinstance(n, ast.ClassDef)):
+                    if cls.lineno <= node.lineno <= cls.end_lineno:
+                        performers.add(cls.name)
+        self.assertGreaterEqual(widens, 2, "a detector that finds no widen pins nothing")
+        self.assertFalse(unrecorded, "a widen is made with no journal line held before it, so a "
+                                     "kill inside it is unaccounted for: %r" % unrecorded)
+        claims = [p for p in doc.split("\n\n") if "SIGKILL" in p]
+        self.assertTrue(claims, "the kill-safety claim is load-bearing and must stay stated")
+        for claim in claims:
+            self.assertIn("journal", claim, "the claim must say what covers a kill: %r" % claim)
+            for performer in sorted(performers):
+                self.assertIn("`%s`" % performer, claim,
+                              "`%s` widens a mode and the kill-safety claim does not name it" % performer)
+        for phrase in ("cannot leave it unaccounted", "single durable record"):
+            self.assertNotIn(phrase, source, "a claim that covered only the first widen is back: %r" % phrase)
 
     def test_platform_errnos_are_named_not_numbered_5657(self):
         """95 is ENOTSUP on Linux and EMULTIHOP on macOS (#5747 SEC-F5)."""
