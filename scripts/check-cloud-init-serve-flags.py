@@ -3984,7 +3984,7 @@ def reader_problems() -> list:
 def spelling_problems(base: tuple) -> list:
     """No spelling in CRED_SPELLINGS puts a byte of the secret on the gate scan or the listing,
     and the scan refuses each one (#5546-#5550)."""
-    bad = layer_problems() + reader_problems()
+    bad = layer_problems() + reader_problems() + funnel_detector_problems()
     for cls, label, text in CRED_SPELLINGS:
         outs = spelling_outputs(base, text)
         for path, rc, out in outs:
@@ -4007,6 +4007,19 @@ def writes_output(call: ast.Call) -> bool:
         return not (arg is None or (isinstance(arg, ast.Constant) and isinstance(arg.value, int))
                     or (isinstance(arg, ast.Call) and ast.unparse(arg.func) == "main"))
     return False
+
+
+def funnel_detector_problems() -> list:
+    """The detector itself is pinned on synthetic calls, because no script outside say() prints
+    today, so a detector that saw nothing would pass the scripts (#5549)."""
+    bad = []
+    for src, want in (("print(x)", True), ("sys.stderr.write(x)", True), ("sys.stdout.writelines(x)", True),
+                      ("sys.exit('m')", True), ("sys.exit(1)", False), ("sys.exit(main())", False),
+                      ("buf.write(x)", False), ("len(x)", False)):
+        call = ast.parse(src).body[0].value
+        if writes_output(call) is not want:
+            bad.append("writes_output(%r) is not %r" % (src, want))
+    return bad
 
 
 def print_funnel_problems(paths: tuple) -> list:
