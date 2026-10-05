@@ -114,6 +114,7 @@ def f4_sed():
         ("a mint that yields nothing is refused", "garbage\n", "refuse::" + MSG_SHAPE),
         # #5522: any file without a postgres://aimemory:...@ line is replaced, whatever else it holds.
         ("another scheme is minted", "postgresql://aimemory:keepme@db/aimemory\n", "fresh"),
+        ("another user is minted", "postgres://admin:keepme@db/aimemory\n", "fresh"),
         # #5521: a file with more than one URL line is undecidable, so it is refused, never kept or half-minted.
         ("two placeholder lines are refused", PLACEHOLDER_URL + PLACEHOLDER_URL, "refuse:" + SECRET + ":" + MSG_LINES),
         ("a placeholder line after a rotated line is refused", "postgres://aimemory:abc123@h/x\n" + PLACEHOLDER_URL,
@@ -144,6 +145,20 @@ def f4_sed():
     ]
     # #5640: every case runs in the C locale too, where a high byte is a character and the shape check must still
     # refuse it.
+    # #5640: the checks after the mint refuse on their own, whatever the mint left: an empty file, a file of blank
+    # lines and another user are each refused with the message that names the cause, and a rotated file passes.
+    checks = block[block.find("printf -v NL"):] if "printf -v NL" in block else ""
+    probe("#5640 the checks after the mint are found", bool(checks))
+    for label, start, rc, why in (("an empty file", "", 1, MSG_LINES), ("a file of blank lines", "\n\n", 1, MSG_LINES),
+                                  ("another user", "postgres://admin:keepme@db/aimemory\n", 1, MSG_SHAPE),
+                                  ("a rotated file", ROTATED, 0, "")):
+        with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
+            f = pathlib.Path(t) / "store-url"
+            f.write_text(start)
+            r = run_bash(checks.replace("/etc/ai-memory/store-url", str(f)), pathlib.Path(t))
+            probe("#5640 the checks alone on %s: rc %d %s" % (label, rc, why or "and no message"),
+                  r.returncode == rc and r.stdout.startswith(why) and r.stdout.count("\n") == rc,
+                  "rc=%d %r" % (r.returncode, r.stdout[:60]))
     for label, start, want, lc in [c + (l,) for c in cases for l in ("", "C")]:
         label = label + (" [LC_ALL=C]" if lc else "")
         with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
@@ -2458,6 +2473,10 @@ def closed_world_taint(fs):
                         ('a relative .. operand', 'printf %s x > "$OUT_DIR/r9"\ncd "$OUT_DIR/sub" 2>/dev/null; iconv ../r9'),
                         ('a bare glob after cd', 'printf %s x > "$OUT_DIR/r9"\ncd "$OUT_DIR" && iconv *'),
                         ('a ? glob of the written name', 'printf %s x > "$OUT_DIR/r9"\niconv "$OUT_DIR"/r?'),
+                        ('M9 cmp -sl of a written file', 'printf %s x > "$OUT_DIR/r9"\ncmp -sl "$OUT_DIR/r9" "$OUT_DIR/author.id"'),
+                        ('M11 a dot-dot-segment read after cd', 'printf %s x > "$OUT_DIR/r9"\ncd "$OUT_DIR/" && iconv ././r9'),
+                        ('a [ ] class under an opaque directory', 'printf %s x > "$OUT_DIR/r9"\niconv "$1"/[$2]'),
+                        ('a [ ] class after cd into an opaque directory', 'printf %s x > "$OUT_DIR/r9"\ncd "$1" && iconv [$2]'),
                         ('tar of the working directory', 'printf %s x > "$OUT_DIR/r9"\ncd "$OUT_DIR" && tar -cf - .'),
                         ('a default expansion of the root', 'printf %s x > "$OUT_DIR/r9"\niconv "${OUT_DIR:-x}/r9"'),
                         ('diff of a written file', 'printf %s x > "$OUT_DIR/r9"\ndiff "$OUT_DIR/r9" /dev/null'),
@@ -3057,7 +3076,12 @@ def heredoc_5655():
             ("an scp in a body inside a capture", "v=\"$(node_sh 0 <<'EOS' 2>/dev/null\nscp %s a h:/b\nEOS\n)\"" % B),
             ("an indented ssh in a body", "node_sh 0 <<'EOS' >/dev/null 2>&1\n    ssh %s h true\nEOS" % B),
             ("an ssh after an empty delimiter body", "node_sh 0 <<'' >/dev/null 2>&1\ntrue\n\nssh h true"),
-            ("an ssh after a body opened in a continued line", "node_sh 0 \\\n  <<-EOS >/dev/null 2>&1\n\ttrue\n\tEOS\nssh h true")):
+            ("an ssh after a body opened in a continued line", "node_sh 0 \\\n  <<-EOS >/dev/null 2>&1\n\ttrue\n\tEOS\nssh h true"),
+            ('an ssh with SSH_BATCH in a body whose word follows a blank', "node_sh 0 << 'EOS' >/dev/null 2>&1\nssh %s h true\nEOS" % B),
+            ('an ssh with SSH_BATCH in a body whose word touches a redirect', "node_sh 0 <<'EOS'>/dev/null 2>&1\nssh %s h true\nEOS" % B),
+            ('an ssh with SSH_BATCH in a body opened after a closed capture', 'v="$(true)"; node_sh 0 <<\'EOS\' >/dev/null 2>&1\nssh %s h true\nEOS' % B),
+            ('an ssh with SSH_BATCH in a body opened after a closed arithmetic expansion', "n=$((1 + 1)); node_sh 0 <<'EOS' >/dev/null 2>&1\nssh %s h true\nEOS" % B),
+            ('an ssh with SSH_BATCH in a body opened after an escaped quote', 'echo \\"; node_sh 0 <<\'EOS\' >/dev/null 2>&1\nssh %s h true\nEOS' % B)):
         probe("#5655 ssh census negative control is flagged: %s" % label, bool(ssh_batch_findings(snip + "\n")),
               str(ssh_batch_findings(snip + "\n")))
     wrap = lambda body: fs + "\nprobe_fn() {\n%s\n}\n" % body
@@ -3086,11 +3110,19 @@ def heredoc_5655():
             ("an ssh with SSH_BATCH after an empty delimiter body", "node_sh 0 <<'' >/dev/null 2>&1\ntrue\n\nssh %s h true" % B),
             ("a message naming <<", 'die "a << b"\nssh %s h true' % B),
             ("an arithmetic shift", "x=$(( (1 + 2) << 3 ))\nssh %s h true" % B),
-            ("a here-document word in a comment", "true # <<E\nssh %s h true" % B)):
+            ("a here-document word in a comment", "true # <<E\nssh %s h true" % B),
+            ("a terminator spelled like an operator", "node_sh 0 <<'<<X' >/dev/null 2>&1\ntrue\n<<X\nssh %s h true\nX" % B),
+            ("a here-document word in single quotes", "printf '%%s' '<<E'\nssh %s h true\nE" % B)):
         txt = snip + "\n"
         bad = ssh_batch_findings(txt) + construct_findings(txt)
         seen = sum(1 for _, l, _ in logical_lines(txt) if re.search(r"(?<![\w$/.-])ssh\s+\$SSH_BATCH", l))
         probe("#5655 control is accepted: %s" % label, not bad and seen == snip.count("ssh " + B), str(bad))
+    # <<< is no operator: the word after its first << is empty, since < ends a word, and the scan resumes after it
+    # (mutants D1 and D1b of round 16). The here-string itself is a construct finding, so only the census is read.
+    hs = "x=$(cat <<<EOS)\nssh %s h true\n<EOS\n" % B
+    seen = sum(1 for _, l, _ in logical_lines(hs) if re.search(r"(?<![\w$/.-])ssh\s+\$SSH_BATCH", l))
+    probe("#5655 the census reads an ssh after a here-string as code", not ssh_batch_findings(hs) and seen == 1,
+          str(ssh_batch_findings(hs)))
 
 
 def version_block(fs):
