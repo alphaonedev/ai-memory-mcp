@@ -1242,6 +1242,31 @@ PYEOF
     anchor_green 5609 "a path followed by a spaced separator in prose" \
         "See $R::RecallTool and :: in C++."
 
+    # #5610: every bound of a self type is checked whatever its prefix, the
+    # type is a whole path, and a form the reader does not model is refused.
+    anchor_red_cites 5610 QUAL "a bare trait-object self type with a missing second bound" \
+        "$R::NoSuch" "See \`$R::<RecallTool + NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5610 QUAL "a bare bound list with a lifetime before the missing bound" \
+        "$R::NoSuch" "See \`$R::<RecallTool + 'a + NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5610 QUAL "a lone bare bound list" \
+        "$R::NoSuch" "See \`$R::<RecallTool + NoSuch>\`."
+    anchor_red_cites 5610 QUAL "an unspaced bare bound list" \
+        "$R::NoSuch" "See \`$R::<RecallTool+NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5610 QUAL "a generic first bound before a missing bound" \
+        "$R::NoSuch" "See \`$R::<RecallTool<T> + NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5610 QUAL "a rooted first bound before a missing bound" \
+        "$R::NoSuch" "See \`$R::<::RecallTool + NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5610 QUAL "a missing component inside the self type path" \
+        "$R::NoSuch" "See \`$R::<RecallTool::NoSuch>::decorate_memory_many\`."
+    anchor_red 5610 UNMODELLED "two words in a self type" \
+        "See \`$R::<RecallTool NoSuch>::decorate_memory_many\`."
+    anchor_red 5610 UNMODELLED "a sugared Fn self type" \
+        "See \`$R::<dyn Fn(NoSuch)>::decorate_memory_many\`."
+    anchor_green 5610 "a spaced lone self type naming a live type" \
+        "See \`$R::< RecallTool >\`."
+    anchor_green 5610 "a bare bound list of live types" \
+        "See \`$R::<RecallTool + RecallTool>::decorate_memory_many\`."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
@@ -2307,41 +2332,72 @@ def _bound_tokens(body):
     return toks
 
 
+# #5610: the type of a self type is a whole path, every component of which
+# is checked; a lone placeholder is exactly `<Name>` or `<Name<...>>`.
+_TYPE_PATH = re.compile(r"(?:::)?" + _ID + r"(?:\s*::\s*" + _ID + r")*")
+_PLACEHOLDER_HEAD = re.compile(_ID)
+# A form the self-type reader does not model (sugared `Fn(..)` bounds, a
+# function pointer, text after the type it cannot place): refused as
+# UNMODELLED, never read as a placeholder or a checked type (#5610).
+UNMODELLED = object()
+
+
+def _is_placeholder(inner):
+    """True for the inner text of a lone `<Name>` or `<Name<...>>` (#5393,
+    #5433): an identifier with at most one balanced generic group and
+    nothing else, not even whitespace (#5610)."""
+    m = _PLACEHOLDER_HEAD.match(inner)
+    if not m:
+        return False
+    if m.end() == len(inner):
+        return True
+    return inner[m.end()] == "<" and scan_group(inner, m.end()) == len(inner)
+
+
 def unwrap_self_type(tok):
     """`<Type<T> as Trait>::m` -> `Type<T>::m` (the type is the claim); an
     `as` inside a nested argument (`<Vec<<T as Tr>::X>>::new`) counts too, and
     so does a group with no `as` that is followed by `::` (`<Type<T>>::m`).
-    Returns a list of the tokens to check (the type, then each further bound
-    of a bound list, #5532), or None when the group is a self type that names
-    no type to check (#5493): the caller reports the token instead of
-    accepting it."""
+    Returns a list of the tokens to check (the type path, then each further
+    bound of a bound list, #5532, whatever the prefix, #5610), None when the
+    group is a self type that names no type to check (#5493), or UNMODELLED
+    when the group holds a form this reader does not model (#5610)."""
     if not tok.startswith("<"):
         return [tok]
     end = scan_group(tok, 0)
     if end is None:
         return [tok]
     inner = tok[1:end - 1]
-    head = inner.lstrip()
+    lone = end == len(tok)
+    if lone and _is_placeholder(inner):
+        # #5393/#5433: a lone `<name>` is a placeholder, not a symbol claim.
+        return [tok]
+    if not (AS_WORD.search(inner) or tok.startswith("::", end) or lone):
+        return [tok]
+    head = inner.strip()
     pm = SELF_PREFIX.match(head)
     pos = pm.end() if pm else 0
-    m = ID_RE.match(head, pos)
-    # #5433: with no `as`, `<Type<T>>::m` is still a qualified path whose
-    # type is the claim; a placeholder with nothing behind it is not.
-    if AS_WORD.search(inner) or tok.startswith("::", end) or (
-            end == len(tok) and (pm is not None or m is None)):
-        if m:
-            toks = [m.group(0) + tok[end:]]
-            if pm and re.search(r"\b(?:dyn|impl)\b|\+", pm.group(0)):
-                extra = _bound_tokens(head[pos:])
-                if extra is None:
-                    return None
-                toks += extra
-            return toks
+    tm = _TYPE_PATH.match(head, pos)
+    if not tm:
         # #5493/#5495: a self type with no identifier after its prefix (a
         # bare bound, a pointer-free tuple, slice or nested group) names no
         # type to check, so it is refused, never accepted.
         return None
-    return [tok]
+    q = tm.end()
+    if head.startswith("<", q):
+        q = scan_group(head, q)
+        if q is None:
+            return UNMODELLED
+    q = _skip_space(head, q)
+    if q < len(head) and not (head.startswith("+", q) or AS_WORD.match(head, q)):
+        # #5610: the first bound is not fully read (a `Fn(..)` sugar, a
+        # function pointer, two words): refuse it, never check a prefix.
+        return UNMODELLED
+    toks = [re.sub(r"\s+", "", tm.group(0)).lstrip(":") + tok[end:]]
+    extra = _bound_tokens(head[pos:])
+    if extra is None:
+        return None
+    return toks + extra
 
 
 def _scan_items(raw):
@@ -2462,6 +2518,9 @@ def _item_findings(rule, f, tok):
     # Trait>::m` checks `Type` and `m`.
     whole = tok
     toks = unwrap_self_type(tok)
+    if toks is UNMODELLED:
+        out.append(("UNMODELLED", f"{f}::{whole}".replace(" ", "")))
+        return out
     if toks is None:
         # #5493: a self type that names no type cannot be
         # resolved: report it rather than accept it.
@@ -2727,6 +2786,7 @@ if [[ -n "$violations" ]]; then
             BARE_QUAL) detail="symbol is not defined in the file it is qualified against (unbackticked anchor)" ;;
             BARE_LN) detail="bare file:line anchor in a live doc (rots silently); cite \`path::symbol\`, or pin a commit permalink" ;;
             UNDECIDABLE_REF) detail="anchor is refused: its character references decode differently in CommonMark and HTML, so the anchor cannot be resolved; write the characters plainly" ;;
+            UNMODELLED) detail="anchor is refused: its self type is written in a form this gate does not model, so no component can be checked; name the type and method plainly (src/x.rs::Type::method)" ;;
             UNDECIDABLE_LT) detail="anchor is refused: a \`<\` before it may or may not open a group, and the anchor is judged differently either way; write a comparison spaced (a < b) or in code" ;;
             LADDER_TIP) detail="claimed ladder tip disagrees with the tip scripts/check-migration-ladder.sh computes (left=cited, right=actual)" ;;
             *)     detail="unresolved anchor" ;;
