@@ -2013,6 +2013,16 @@ ROUND3_RED = [
     ('5639 closed world: reported 5: an expansion-led operand before -- may be an option; after -- it is not', 'mysql -h "$H" -u "$U" "$DB"'),
     ('5639 closed world: reported 6: an expansion-led operand before -- may be an option; after -- it is not', 'mysql -u r -p "$DB_NAME" f'),
     ('5639 closed world: reported 7: an expansion-led operand before -- may be an option; after -- it is not', 'mysqldump -- db "$X" password "$Y"'),
+    ('5631 closed world: reported 1: quoted words are read as the shell reads them', 'mysql "-p$P" db'),
+    ('5631 closed world: reported 2: quoted words are read as the shell reads them', 'mysql "-p${DB_PASSWORD}" db'),
+    ('5631 closed world: reported 3: quoted words are read as the shell reads them', 'mysqldump "--password=$DB_PASSWORD" db'),
+    ('5631 closed world: reported 4: quoted words are read as the shell reads them', "mysql '-p$P' db"),
+    ('5631 closed world: reported 5: quoted words are read as the shell reads them', 'mysql --pas"sword"="$X" db'),
+    ('5631 closed world: reported 6: quoted words are read as the shell reads them', 'mysql --"password"="$X" db'),
+    ('5631 closed world: reported 7: quoted words are read as the shell reads them', 'mysql -p"$X"'),
+    ('5631 closed world: reported 8: quoted words are read as the shell reads them', 'ssh h "mysql -u r -p$X"'),
+    ('5631 closed world: reported 9: quoted words are read as the shell reads them', 'bash -c "mysqldump -u r -p\\"$X\\" db | gzip"'),
+    ('5631 closed world: reported 10: quoted words are read as the shell reads them', "sh -c 'mysql -p$P db'"),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
@@ -2063,6 +2073,9 @@ ROUND3_GREEN = [
     ('5639 closed world: clean 1: an expansion-led operand before -- may be an option; after -- it is not', 'mysql -h "$H" -- "$DB"'),
     ('5639 closed world: clean 2: an expansion-led operand before -- may be an option; after -- it is not', 'mysql -h h -- "$DB" "$TABLE"'),
     ('5639 closed world: clean 3: an expansion-led operand before -- may be an option; after -- it is not', 'mysql -h "$H" db'),
+    ('5631 closed world: clean 1: quoted words are read as the shell reads them', 'apt-get install -y mysql-client "$PKG"'),
+    ('5631 closed world: clean 2: quoted words are read as the shell reads them', 'chown -R mysql:mysql "$DIR"'),
+    ('5631 closed world: clean 3: quoted words are read as the shell reads them', 'curl http://mysql:3306/$X'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
