@@ -33,10 +33,11 @@ and exit 0. merge_group does not check that base_sha is an ancestor of
 head_sha: a non-ancestor base prints base..head and exits 0.
 
 Every sha must be exactly 40 lowercase hex characters, must not be all zeros
-and must resolve to a commit here before it reaches git as an argument (the
-range path calls git only through git() and run_git(), each with an argument
-list and no shell; only the --red-proof mode runs the frozen pre-fix workflow
-block through bash -c, #5713).
+and must resolve to a commit here before it reaches git as an argument (computing
+a range, through main(), choose(), checked_sha() and env_or(), calls git only
+through git(), with an argument list and no shell; run_git() is the self-test's
+fixture helper; only the --red-proof mode runs the frozen pre-fix workflow
+block through bash -c, #5713, #5601).
 
 Output: one line "A..B" on stdout and exit 0, or one "ci-commit-range: REFUSED: <why>"
 line on stderr, nothing on stdout, and exit 1. Usage errors (argparse) exit 2.
@@ -549,6 +550,13 @@ def self_test():
         contract.append(("git() and run_git() pass an argument list and never a shell",
                          all("shell" not in inspect.getsource(f) and '["git", "-C", str(repo)] + list(args)' in inspect.getsource(f)
                              for f in (git, run_git))))
+        # N1 of #5601 (Refs #5713): computing a range reaches git only through git(); run_git() is fixture-only
+        contract.append(("computing a range (main, choose, checked_sha, env_or) reaches git only through git(), never run_git()",
+                         all("run_git(" not in inspect.getsource(f) for f in (main, choose, checked_sha, env_or))
+                         and all("subprocess" not in inspect.getsource(f) for f in (choose, checked_sha, env_or))
+                         and "git() and run_git()" not in (__doc__ or "")))
+        shell_fns = sorted(n for n, f in globals().items() if inspect.isfunction(f) and '"ba' 'sh", "-c"' in inspect.getsource(f))
+        contract.append(("only red_proof() runs bash -c", shell_fns == ["red_proof"]))
         for label, good in contract:
             total += 1
             if not good:
