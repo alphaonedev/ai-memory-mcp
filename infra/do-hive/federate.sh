@@ -318,13 +318,18 @@ node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; 
 # It is a static aid and not a proof; a form it cannot decide is reported, not trusted (#5418, #5523):
 # a variable in a target is followed through every value this script assigns it, and a value it
 # cannot read (a parameter, the environment, a command substitution other than date, mktemp or seq)
-# is not proven; ${V:-x} is taken as x, so a root moved by the environment is not decided, and nor
-# are symbolic links. An identity in FED_IDS is a plain name because read_nodes checks it. A command it does not list that
-# names a file this script writes is reported unless it ends in a file redirect or is a silent file
-# command (#5525): a written file is a "$VAR/..." target or a literal path with a slash, compared in one
-# spelling (braced variables, no quotes), and after a cd into its directory its bare name counts. A file
-# written by a relative name alone, or reached through a link, is not decided. Whole-verify probes check
-# the printed bytes.
+# is not proven; ${V:-x} is each value of V and x. An identity in FED_IDS is a plain name because
+# read_nodes checks it. A command it does not list that names a file this script may write is
+# reported unless its output goes to a file or it is a silent file command (#5525, #5621): the
+# written set is every output redirect at any fd and every cp, install, mv, ln, scp download and dd
+# destination, each followed through its assigned values, and an operand is compared with it by
+# name, so neither its spelling (a . segment, a glob, a variable) nor the working directory (cd,
+# pushd, popd, a subshell, env --chdir) decides; a relative . or .. operand and a glob under another
+# directory are reported, and so is a capture or a trap handler that reads a written file.
+# Stated limits: a root moved by the environment (inside V="${V:-x}" V is taken as x), a literal
+# absolute spelling of a directory above a computed root, symbolic links, and a path that reaches a
+# command only as a function argument or as a value with no literal spelling are not decided.
+# Whole-verify probes check the printed bytes.
 # reply_status prints a 3-digit HTTP
 # status, or the word non-status for anything else. reply_len prints the reply's byte count.
 # reply_version prints a version token only when it is 1 to 3 dot-separated groups of 1 to 3 ASCII

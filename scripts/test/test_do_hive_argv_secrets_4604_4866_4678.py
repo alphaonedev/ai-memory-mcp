@@ -15,6 +15,7 @@ import os
 import time
 import threading
 import pathlib
+import functools
 import re
 import signal
 import shutil
@@ -1129,8 +1130,8 @@ def _capture_value(body, text, keep, depth):
 def expand(word, text, keep=(), depth=0):
     """The alternatives a shell word can expand to, as strings with the markers above. A variable is replaced by
     each value the script assigns it; `keep` names stay OPEN name CLOSE, and so does a variable with no readable
-    value (a parameter, the environment, an unmodelled command substitution). ${V:-X} is X: the scan does not
-    follow a value given in the environment. Unquoted glob and brace characters are ANY; a leading ~ is opaque.
+    value (a parameter, the environment, an unmodelled command substitution). ${V:-X} is each value of V and X
+    (#5621). Unquoted glob and brace characters are ANY; a leading ~ is opaque.
     Inside a variable's value an unmodelled command substitution makes the whole value None."""
     alts, i, quote = [""], 0, None
 
@@ -1177,7 +1178,11 @@ def expand(word, text, keep=(), depth=0):
             if not m or m.group(3) in ("+", ":+", "=", ":=", "?", ":?"):
                 got = [ANY]
             elif m.group(3):
-                got = expand(m.group(4), text, keep, depth + 1)
+                # #5621: ${V:-X} is X when V is unset or empty, else V's value: both alternatives
+                dflt = expand(m.group(4), text, keep, depth + 1)
+                # inside V's own value (V="${V:-X}") V is an environment override: a stated limit
+                val = [] if m.group(1) in _EXPANDING else _var_value(m.group(1), m.group(2), text, keep, depth)
+                got = None if dflt is None or val is None else list(dict.fromkeys(val + dflt))
             else:
                 got = _var_value(m.group(1), m.group(2), text, keep, depth)
             if got is None:
@@ -1214,12 +1219,19 @@ def _var_value(var, index, text, keep, depth):
     if not vals or any(v is None for v in vals):
         return [OPEN + var + CLOSE]
     out = []
-    for v in vals:
-        got = expand(v, text, keep, depth + 1)
-        if got is None:
-            return [OPEN + var + CLOSE]
-        out += got
+    _EXPANDING.append(var)
+    try:
+        for v in vals:
+            got = expand(v, text, keep, depth + 1)
+            if got is None:
+                return [OPEN + var + CLOSE]
+            out += got
+    finally:
+        _EXPANDING.pop()
     return list(dict.fromkeys(out))[:64]
+
+
+_EXPANDING = []
 
 
 def seg_atoms(seg):
@@ -1637,56 +1649,437 @@ def dd_to_file(stage, text=""):
     return words[:1] == ["dd"] and bool(of) and target_kind(of[-1], text) != "terminal"
 
 
-def canon_path(t):
-    """#5525: one spelling of a path for the unlisted-reader comparison: quotes dropped, every variable in its
-    braced form (so $D/r and ${D}/r agree), repeated slashes and a leading ./ collapsed."""
-    t = re.sub(r"\$(\w+)", r"${\1}", t.replace("\"", "").replace("'", ""))
-    return re.sub(r"/{2,}", "/", t[2:] if t.startswith("./") else t)
+OUTPUT_OPS = (">", ">>", ">|", "&>", "&>>", "<>")
 
 
-def names_path(body, path, bare=False):
-    """True when `body` names `path` (canonical). A bare name (after a cd) must be a whole word or ./word."""
-    if not bare:
-        return path in body if "${" in path else bool(re.search(r"(?<![\w.$}/-])" + re.escape(path) + r"(?![\w.$-])", body))
-    return bool(re.search(r"(?:(?<![\w.$}/-])|(?<=\./))" + re.escape(path) + r"(?![\w.$/-])", body))
+def redirect_pairs(stage):
+    """(operator, target word) for every redirect of `stage` outside quotes and $( ) captures; a here-document or
+    here-string operator is returned with an empty word."""
+    out, i, quote = [], 0, None
+    while i < len(stage):
+        c = stage[i]
+        if c == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = None
+            elif quote == '"' and c == "$" and stage[i + 1:i + 2] in ("(", "{"):
+                i = _close(stage, i)
+                continue
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+        elif c == "$" and stage[i + 1:i + 2] in ("(", "{"):
+            i = _close(stage, i)
+            continue
+        elif c in "<>" and stage[i + 1:i + 2] != "(":
+            m = re.match(r"&>>|&>|>>|>\||>&|<&|<>|<<<|<<-?|>|<", stage[i - 1:] if c == ">" and stage[i - 1:i] == "&" else stage[i:])
+            op = m.group(0)
+            start = i - 1 if op.startswith("&") and c == ">" else i
+            i = start + len(op)
+            if op.startswith("<<"):
+                out.append((op, ""))
+                continue
+            rest = stage[i:].lstrip()
+            words = shell_words(rest)
+            out.append((op, words[0] if words and rest[:1] not in ";&|<>()" else ""))
+            continue
+        i += 1
+    return out
+
+
+def statements_ops(line):
+    """(simple command, the operator after it) for a logical line; an operator | (not ||) joins a pipeline."""
+    out, cur, i, quote = [], "", 0, None
+    while i < len(line):
+        c = line[i]
+        if c == "\\" and quote != "'":
+            cur += line[i:i + 2]
+            i += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = None
+            elif quote == '"' and c == "$" and line[i + 1:i + 2] in ("(", "{"):
+                j = _close(line, i)
+                cur, i = cur + line[i:j], j
+                continue
+            cur += c
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+        elif c == "$" and line[i + 1:i + 2] in ("(", "{"):
+            j = _close(line, i)
+            cur, i = cur + line[i:j], j
+            continue
+        elif (c in ";&|\n" or (c in "()" and line[i - 1:i] != "=")) and not (c in "&|" and line[i - 1:i] in (">", "<")) \
+                and not (c == "&" and line[i + 1:i + 2] == ">") and not (c == "(" and line[i - 1:i] in ("<", ">")):
+            op = line[i:i + 2] if line[i:i + 2] in ("||", "&&", ";;", "|&") else c
+            out.append((cur, op))
+            cur, i = "", i + len(op)
+            continue
+        cur += c
+        i += 1
+    out.append((cur, ""))
+    return [(t, o) for t, o in out if t.strip()]
+
+
+def strip_comment(line):
+    """`line` without a trailing comment: a # that starts a word outside quotes and captures."""
+    i, quote = 0, None
+    while i < len(line):
+        c = line[i]
+        if c == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote:
+            quote = None if c == quote else quote
+        elif c in "'\"":
+            quote = c
+        elif c == "$" and line[i + 1:i + 2] in ("(", "{"):
+            i = _close(line, i)
+            continue
+        elif c == "#" and (i == 0 or line[i - 1] in " \t;&|("):
+            return line[:i]
+        i += 1
+    return line
+
+
+def capture_bodies(s):
+    """The bodies of the $( ) command substitutions in `s`, nested ones included; arithmetic is not a capture."""
+    out, i, quote = [], 0, None
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote == "'":
+            quote = None if c == "'" else quote
+            i += 1
+            continue
+        if c == "'" and quote is None:
+            quote = "'"
+        elif c == '"':
+            quote = None if quote == '"' else '"'
+        elif c == "$" and s[i + 1:i + 2] == "(":
+            j = _close(s, i)
+            if not s.startswith("$((", i):
+                body = s[i + 2:j - 1] if s[j - 1:j] == ")" else s[i + 2:j]
+                out.append(body)
+                out += capture_bodies(body)
+            i = j
+            continue
+        i += 1
+    return out
+
+
+def path_parts(alt):
+    """(base, segments, wide) of an expanded path. The base is a leading opaque variable's name, "/" for an
+    absolute path, "~" for a tilde and "" for a relative path; empty and . segments are dropped and an
+    absolute .. is resolved. A segment holding an opaque variable may span several segments: `wide` lists
+    those indexes. None when a relative or opaque path holds a .. segment (undecidable)."""
+    m = re.match(OPEN + "([^" + CLOSE + "]*)" + CLOSE, alt)
+    if m and (alt[m.end():] == "" or alt[m.end()] == "/"):
+        base, rest = m.group(1), alt[m.end():]
+        base = "~" if base == "~" else base
+    elif alt.startswith("/"):
+        base, rest = "/", alt
+    else:
+        base, rest = "", alt
+    segs = []
+    for seg in rest.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if base != "/":
+                return None
+            segs = segs[:-1]
+            continue
+        if re.match(r"\.\.(?![\w.\-])", seg) and base != "/":
+            return None
+        segs.append(seg)
+    return base, segs
+
+
+def _literal(segs):
+    """True when one of `segs` holds a character that is not a marker: a match that rests only on opaque or
+    any-name segments says nothing about which file an operand names."""
+    return any(re.search(r"[^\x01-\x07]", re.sub(OPEN + "[^" + CLOSE + "]*" + CLOSE, "", x)) for x in segs)
+
+
+SEP = "\x08"
+
+
+def _wide(seg):
+    return OPEN in seg
+
+
+@functools.lru_cache(maxsize=65536)
+def _seg_equal(a, b):
+    return could_equal(seg_atoms(a), seg_atoms(b))
+
+
+@functools.lru_cache(maxsize=65536)
+def _seg_equal_lit(a, b):
+    """True when some string matches both segments with at least one literal character of `a` spelled by a
+    literal character of `b` (not by a marker or a glob)."""
+    x, y = seg_atoms(a), seg_atoms(b)
+    seen, todo = set(), [(0, 0, False)]
+    while todo:
+        st = todo.pop()
+        if st in seen:
+            continue
+        seen.add(st)
+        i, j, h = st
+        if i == len(x) and j == len(y):
+            if h:
+                return True
+            continue
+        if i < len(x) and x[i][1]:
+            todo.append((i + 1, j, h))
+        if j < len(y) and y[j][1]:
+            todo.append((i, j + 1, h))
+        if i < len(x) and j < len(y):
+            sa, sb = x[i][0], y[j][0]
+            if sa is None or sb is None or sa & sb:
+                lit = sa is not None and sb is not None and len(sa) == 1 and len(sb) == 1 and not x[i][1] and not y[j][1]
+                todo.append((i if x[i][1] else i + 1, j if y[j][1] else j + 1, h or lit))
+    return False
+
+
+def seq_match(o, p, lit=False):
+    """True when the segment list o can spell exactly the segment list p; a segment holding an opaque variable
+    may stand for one or more segments on either side, and its spelling must fit the segments it spans."""
+    memo = {}
+
+    def pair(a, b, h):
+        if not _seg_equal(a, b):
+            return None
+        return h or (lit and _seg_equal_lit(a, b))
+
+    def go(i, j, h):
+        if (i, j, h) in memo:
+            return memo[(i, j, h)]
+        if i == len(o) or j == len(p):
+            r = i == len(o) and j == len(p) and (h or not lit)
+        else:
+            # spanned segments are joined by SEP, a character only an opaque span can spell
+            if _wide(o[i]):
+                steps = [(i + 1, k, pair(o[i], SEP.join(p[j:k]), h)) for k in range(j + 1, len(p) + 1)]
+            elif _wide(p[j]):
+                steps = [(k, j + 1, pair(SEP.join(o[i:k]), p[j], h)) for k in range(i + 1, len(o) + 1)]
+            else:
+                steps = [(i + 1, j + 1, pair(o[i], p[j], h))]
+            r = any(nh is not None and go(a, b, nh) for a, b, nh in steps)
+        memo[(i, j, h)] = r
+        return r
+
+    return go(0, 0, False)
+
+
+def has_glob(word):
+    """True when a shell word holds an unquoted glob character (* ? or a [ ] class) outside $( ) and ${ }."""
+    i, quote, bare = 0, None, ""
+    while i < len(word):
+        c = word[i]
+        if c == "\\" and quote != "'":
+            i += 2
+            continue
+        if c == "$" and word[i + 1:i + 2] in ("(", "{") and quote != "'":
+            i = _close(word, i)
+            continue
+        if quote:
+            quote = None if c == quote else quote
+        elif c in "'\"":
+            quote = c
+        else:
+            bare += c
+        i += 1
+    return bool(re.search(r"[*?]|\[[^\]]+\]", bare))
+
+
+def names_written(op, written, glob=False):
+    """#5621: True when the operand path `op` (base, segments) may name a written path or a directory above one,
+    whatever the working directory is: with the same base, op is the path or one of its ancestors; an absolute op
+    against a computed base must end in a leading run of the path's segments; a relative op, or a different
+    computed base, must fit wholly inside the path or end in a leading run of it. A relative . is every directory.
+    An opaque base with no segments (a parameter) is a stated limit."""
+    if op is None:
+        return True
+    base, o = op
+    if not o:
+        return base == ""
+    key = (base, tuple(o))
+    return any(_names_one(key, (wbase, tuple(w)), glob) for wbase, w in written)
+
+
+@functools.lru_cache(maxsize=262144)
+def _names_one(op, wpath, glob):
+    """names_written for one written path (cached: the same operands recur in every control)."""
+    (base, o), (wbase, w) = op, wpath
+    if base == wbase:
+        return any(seq_match(o, w[:n]) for n in range(1, len(w) + 1))
+    if not _literal(o):
+        # a glob is undecidable under another base; a value with no literal spelling (a parameter, the
+        # environment, a fetched value) is a stated limit
+        return glob
+    if base == "/" and wbase == "/":
+        return False
+    heads = range(1, len(o)) if base == "/" else range(0, len(o))
+    if any(seq_match(o[j:], w[:n], True) for j in heads for n in range(1, len(w) + 1)):
+        return True
+    return base != "/" and any(seq_match(o, w[k:k + n], True) for k in range(len(w)) for n in range(1, len(w) - k + 1))
+
+
+_WRITTEN_CACHE = {}
+
+
+def _all_statements(text):
+    """Every simple command of `text` outside heredoc bodies and comments, the bodies of its $( ) captures and of
+    its trap handlers included, with die/echo/ok/no message text dropped."""
+    out = []
+    todo = [strip_comment(strip_messages(line)) for _, line, _ in logical_lines(text)]
+    while todo:
+        line = todo.pop()
+        for st, _ in statements_ops(line):
+            out.append(st)
+            words = operand_words(st)
+            if words[:1] == ["trap"] and len(words) > 1:
+                body = expand(words[1], "")
+                todo += body or []
+        todo += capture_bodies(line)
+    return out
+
+
+def written_paths(text):
+    """#5621: (base, segments) of every path this script may write: every output redirect at any fd (not a dup,
+    not /dev/null), a cp, install, mv or ln destination (and the destination joined with each source name), an
+    scp download destination and a dd of= operand; each word is expanded through the values the script assigns."""
+    if text in _WRITTEN_CACHE:
+        return _WRITTEN_CACHE[text]
+    words = []
+    for st in _all_statements(text):
+        for op, w in redirect_pairs(st):
+            if op in OUTPUT_OPS and w and not re.fullmatch(r"\d+|-", w):
+                words.append(w)
+        ow = operand_words(st)
+        if ow[:1] in (["cp"], ["install"], ["mv"], ["ln"], ["scp"]):
+            opts, ops = _operands(ow)
+            names = [o for o, _ in opts]
+            if ow[0] == "install" and ("-d" in names or "--directory" in names):
+                continue
+            dirs = [v for o, v in opts if o == "-t"]
+            dests, srcs = (dirs, ops) if dirs else (ops[-1:], ops[:-1])
+            for d in dests:
+                if ow[0] == "scp" and re.match(r"[^/]*:", d.replace('"', "").replace("'", "")) \
+                        or expand(d, text) == ["/dev/null"]:
+                    continue
+                words.append(d)
+                for x in srcs:
+                    for alt in expand(x, text) or []:
+                        name = re.sub(OPEN + "[^" + CLOSE + "]*" + CLOSE, ANY, re.split(r"[/:]", alt)[-1])
+                        if name and not name.startswith("-") and name not in (".", ".."):
+                            words.append(d + "/" + name.replace(ANY, "*"))
+        if ow[:1] == ["dd"]:
+            words += [x[3:] for x in ow[1:] if x.startswith("of=")]
+    out = []
+    for w in words:
+        for alt in expand(w, text) or [OPEN + "?" + CLOSE]:
+            if alt == "/dev/null":
+                continue
+            parts = path_parts(alt)
+            if parts is None:
+                parts = (OPEN + "?" + CLOSE, [OPEN + "?" + CLOSE])
+            if parts[1] and parts not in out:
+                out.append(parts)
+    if len(_WRITTEN_CACHE) > 8:
+        _WRITTEN_CACHE.clear()
+    _WRITTEN_CACHE[text] = out
+    return out
+
+
+def stage_operands(stage, text):
+    """The operand paths of a simple command: every word after the command word (input redirects included,
+    output redirects dropped), expanded, then split again at white space, quotes and = < > | ; & ( ); an
+    option word -xVALUE is also read as VALUE."""
+    words = operand_words(stage)[1:]
+    words += [w for op, w in redirect_pairs(stage) if op in ("<", "<>") and w]
+    out = []
+    for w in words:
+        alts = expand(w, text)
+        glob = has_glob(w)
+        for alt in alts if alts is not None else [OPEN + "?" + CLOSE]:
+            pieces = [x for x in re.split(r"[\s'\"=<>|;&()]+", alt) if x]
+            pieces += [x[2:] for x in pieces if re.match(r"-\w[^/.]*[/.]", x)]
+            out += [(path_parts(x), glob) for x in pieces]
+    return out
+
+
+DIR_CHANGES = ("cd", "pushd", "popd")
+QUIET = ("printf", "echo", "ok", "no", "die", "case", "[", "[[", "test", "local", "export", "readonly", "declare",
+         "typeset") + DIR_CHANGES
+
+
+def reads_written(stage, text, written):
+    return any(names_written(o, written, g) for o, g in stage_operands(stage, text))
 
 
 def unlisted_reader_findings(text):
-    """#5418, #5525: a stage outside FILE_PRINTERS and SILENT_FILE_CMDS that names a file this script redirects
-    output to (as an operand or an input redirect) is a reader the scan does not model, so it is reported. The
-    written files are the "$VAR/..." targets and the literal plain-file targets; each is compared in one canonical
-    spelling (braced variables, no quotes); after a cd into a written file's directory its bare name counts."""
-    targets = set()
-    code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
-    for m in OUT_REDIRECT.finditer(code):
-        t = m.group(2).strip("\"'")
-        # a proven file target, and every literal path with a slash (#5602: no prefix is excluded)
-        kind = target_kind(redirect_word(code, m.end(1)), text)
-        if kind == "file" or kind == "terminal" and re.fullmatch(r"[\w.\-]*(?:/+[\w.\-]+)+", t):
-            targets.add(canon_path(t))
-    cds = []
+    """#5418, #5525, #5621: a stage outside FILE_PRINTERS and the silent commands whose operands may name a path
+    this script writes (written_paths) is a reader the scan does not model, so it is reported unless its output
+    goes to a proven file. Paths are compared by name, so no change of directory (cd, pushd, popd, env --chdir,
+    a subshell) can hide one. In a $( ) capture, a printer or an unlisted reader of a written path is reported
+    unless its pipeline ends in a file redirect or a silent consumer: the captured text may be printed."""
+    written = written_paths(text)
     bad = []
-    for n, line, func in logical_lines(text):
-        for m in re.finditer(r"(?:^|[;&|(]\s*)cd\s+(?:--\s+)?(\"[^\"]*\"|'[^']*'|[^\s;&|)]+)", line):
-            cds.append((n, canon_path(m.group(1)).rstrip("/")))
     for n, line, func in logical_lines(text):
         if func in ALLOWED or re.match(r"^\s*(?:ok|no|die)\(\) \{", line) or b64_pinned(line):
             continue
-        bare = {t.rsplit("/", 1)[1] for t in targets if "/" in t
-                and any(cn <= n and cd == t.rsplit("/", 1)[0] for cn, cd in cds)}
-        for stage, _ in pipeline_stages(line):
+        stages = statements_ops(strip_comment(strip_messages(line)))
+        for stage, _ in list(stages):
+            tw = operand_words(stage)
+            if tw[:1] == ["trap"] and len(tw) > 1:
+                # a trap handler runs later as code: its statements are judged like the line's own
+                for body in expand(tw[1], "") or []:
+                    stages += statements_ops(strip_comment(body))
+        for stage, _ in stages:
             words = stage_words(stage).split()
             word = words[0] if words else ""
+            if word == "exec" and any(op in ("<", "<>") and w and any(names_written(o, written, has_glob(w))
+                                                                       for o, _ in stage_operands("x " + w, text))
+                                      for op, w in redirect_pairs(stage)):
+                # #5621: exec opens a written file on a descriptor a later command reads
+                bad.append("%d:exec:written file opened for reading" % n)
+                continue
             if word in ("cp", "install", "scp", "ln") and not silent_file_cmd(stage, text):
                 # #5602: whatever it copies, a destination not proven a file is the terminal
                 bad.append("%d:%s:copy to a target not proven a file" % (n, word))
                 continue
-            if not word or word in FILE_PRINTERS or silent_file_cmd(stage, text) or word in ("printf", "echo"):
+            if not word or word in FILE_PRINTERS or silent_file_cmd(stage, text) or word in QUIET \
+                    or not operand_words(stage):
                 continue
-            body = canon_path(re.sub(r"(?:\d*>>?|&>>?|>\|)&?\s*(?:\"[^\"]*\"|'[^']*'|\S+)", "", stage))
-            if (any(names_path(body, t) for t in targets) or any(names_path(body, b, True) for b in bare)) \
-                    and not stdout_to_file(stage, text):
+            if reads_written(stage, text, written) and not stdout_to_file(stage, text):
                 bad.append("%d:%s:unlisted file reader" % (n, word))
+        for body in capture_bodies(strip_comment(strip_messages(line))):
+            pipe = []
+            for stage, op in statements_ops(body):
+                pipe.append(stage)
+                if op in ("|", "|&"):
+                    continue
+                last = operand_words(pipe[-1])
+                silent_end = stdout_to_file(pipe[-1], text) or last[:1] in (["wc"], ["curl"]) \
+                    or reads_a_file_silent(pipe[-1]) or dd_to_file(pipe[-1], text)
+                for st in pipe:
+                    w = operand_words(st)
+                    if not w or w[0] in QUIET or (w[0] not in FILE_PRINTERS and silent_file_cmd(st, text)):
+                        continue
+                    if not silent_end and reads_written(st, text, written):
+                        bad.append("%d:%s:capture of a written file" % (n, w[0]))
+                        break
+                pipe = []
     return bad
 
 
@@ -1986,7 +2379,55 @@ def closed_world_taint(fs):
                         ("an scp download named by an array the script does not check", 'ARR=(a)\nscp -q h:/x "$OUT_DIR/${ARR[0]}.pub"'),
                         ("an append to the checked identity array", 'FED_IDS+=(x)\nscp -q h:/x "$OUT_DIR/${FED_IDS[0]}.pub"'),
                         ("a trap whose handler prints a written file", 'printf %s x > "$OUT_DIR/r9"\ntrap \'iconv "$OUT_DIR/r9"\' EXIT'),
-                        ("exec of a command on a written file", 'printf %s x > "$OUT_DIR/r9"\nexec iconv "$OUT_DIR/r9"')):
+                        ("exec of a command on a written file", 'printf %s x > "$OUT_DIR/r9"\nexec iconv "$OUT_DIR/r9"'),
+                        # #5621: a read of a written file is decided by name against every written path, whatever the spelling and
+                        # whatever the working directory. The round-15 review mutants M5-M7, the reproducers, then neighbours.
+                        ('M5 a dot segment in the operand', 'printf %s x > "$OUT_DIR/r9"\niconv "$OUT_DIR/./r9"'),
+                        ('M6 a glob that matches the written name', 'printf %s x > "$OUT_DIR/r9"\niconv "$OUT_DIR"/r[9]'),
+                        ('M7 pushd into the written directory', 'printf %s x > "$OUT_DIR/r9"\npushd "$OUT_DIR" >/dev/null && iconv r9'),
+                        ('a variable holding the written path', 'printf %s x > "$OUT_DIR/r9"\nf="$OUT_DIR/r9"\niconv "$f"'),
+                        ('a variable built from a variable', 'printf %s x > "$OUT_DIR/r9"\nd="$OUT_DIR"\nf="$d/r9"\niconv "$f"'),
+                        ('find over the written directory', 'printf %s x > "$OUT_DIR/r9"\nfind "$OUT_DIR" -type f -exec iconv {} +'),
+                        ('a relative path after cd into a parent', 'cd "$HERE" && iconv crypto/out/author.id'),
+                        ('a relative path after cd into the next directory', 'printf %s x > "$OUT_DIR/r9"\ncd "$HERE/crypto" && iconv out/r9'),
+                        ('a read after cd into another directory', 'printf %s x > "$OUT_DIR/r9"\ncd "$HERE" && iconv r9'),
+                        ('a capture of a written file by cat', 'printf %s x > "$OUT_DIR/r9"\nt="$(cat "$OUT_DIR/r9")"\nno "x $t"'),
+                        ('a capture of a written file by iconv', 'printf %s x > "$OUT_DIR/r9"\nt="$(iconv "$OUT_DIR/r9")"'),
+                        ('a capture by head', 'printf %s x > "$OUT_DIR/r9"\nt="$(head -c 9 "$OUT_DIR/r9")"'),
+                        ('a capture by tail', 'printf %s x > "$OUT_DIR/r9"\nt="$(tail -n 1 "$OUT_DIR/r9")"'),
+                        ('a capture by od', 'printf %s x > "$OUT_DIR/r9"\nt="$(od -c "$OUT_DIR/r9")"'),
+                        ('a capture by xxd', 'printf %s x > "$OUT_DIR/r9"\nt="$(xxd "$OUT_DIR/r9")"'),
+                        ('a capture by strings', 'printf %s x > "$OUT_DIR/r9"\nt="$(strings "$OUT_DIR/r9")"'),
+                        ('a capture by base64', 'printf %s x > "$OUT_DIR/r9"\nt="$(base64 "$OUT_DIR/r9")"'),
+                        ('a capture by tr with an input redirect', 'printf %s x > "$OUT_DIR/r9"\nt="$(tr -d x < "$OUT_DIR/r9")"'),
+                        ('a capture through a pipe of readers', 'printf %s x > "$OUT_DIR/r9"\nt="$(iconv "$OUT_DIR/r9" | tr a b)"'),
+                        ('a while read loop over a written file', 'printf %s x > "$OUT_DIR/r9"\nwhile read -r l; do :; done < "$OUT_DIR/r9"'),
+                        ('mapfile from a written file', 'printf %s x > "$OUT_DIR/r9"\nmapfile -t a < "$OUT_DIR/r9"'),
+                        ('source of a written file', 'printf %s x > "$OUT_DIR/r9"\nsource "$OUT_DIR/r9"'),
+                        ('a dot source of a written file', 'printf %s x > "$OUT_DIR/r9"\n. "$OUT_DIR/r9"'),
+                        ('cd - back into the written directory', 'printf %s x > "$OUT_DIR/r9"\ncd "$OUT_DIR"\ncd /\ncd - >/dev/null && iconv r9'),
+                        ('pushd +1 into the written directory', 'printf %s x > "$OUT_DIR/r9"\npushd "$OUT_DIR" >/dev/null\npushd / >/dev/null\npushd +1 >/dev/null && iconv r9'),
+                        ('a subshell cd into the written directory', 'printf %s x > "$OUT_DIR/r9"\n(cd "$OUT_DIR" && iconv r9)'),
+                        ('env --chdir into the written directory', 'printf %s x > "$OUT_DIR/r9"\nenv --chdir="$OUT_DIR" iconv r9'),
+                        ('env -C into the written directory', 'printf %s x > "$OUT_DIR/r9"\nenv -C "$OUT_DIR" iconv r9'),
+                        ('a relative .. operand', 'printf %s x > "$OUT_DIR/r9"\ncd "$OUT_DIR/sub" 2>/dev/null; iconv ../r9'),
+                        ('a bare glob after cd', 'printf %s x > "$OUT_DIR/r9"\ncd "$OUT_DIR" && iconv *'),
+                        ('a ? glob of the written name', 'printf %s x > "$OUT_DIR/r9"\niconv "$OUT_DIR"/r?'),
+                        ('tar of the working directory', 'printf %s x > "$OUT_DIR/r9"\ncd "$OUT_DIR" && tar -cf - .'),
+                        ('a default expansion of the root', 'printf %s x > "$OUT_DIR/r9"\niconv "${OUT_DIR:-x}/r9"'),
+                        ('diff of a written file', 'printf %s x > "$OUT_DIR/r9"\ndiff "$OUT_DIR/r9" /dev/null'),
+                        ('a numbered input redirect', 'printf %s x > "$OUT_DIR/r9"\niconv 0< "$OUT_DIR/r9"'),
+                        ('exec that opens a written file for reading', 'printf %s x > "$OUT_DIR/r9"\nexec 3< "$OUT_DIR/r9"\niconv <&3'),
+                        ('a read of a cp destination', 'printf %s x > "$OUT_DIR/r9"\ncp "$OUT_DIR/r9" "$OUT_DIR/r8"\niconv "$OUT_DIR/r8"'),
+                        ('a read of an mv destination', 'printf %s x > "$OUT_DIR/r9"\nmv "$OUT_DIR/r9" "$OUT_DIR/r7"\niconv "$OUT_DIR/r7"'),
+                        ('a read of an ln name', 'printf %s x > "$OUT_DIR/r9"\nln -s "$OUT_DIR/r9" "$OUT_DIR/l"\niconv "$OUT_DIR/l"'),
+                        ('a read of a dd destination', 'printf %s x > "$OUT_DIR/r9"\ndd if="$OUT_DIR/r9" of="$OUT_DIR/r8" 2>/dev/null\niconv "$OUT_DIR/r8"'),
+                        ('dd of a written file to stdout', 'printf %s x > "$OUT_DIR/r9"\ndd if="$OUT_DIR/r9" 2>/dev/null'),
+                        ('a read of an scp download', 'scp -q h:/x "$OUT_DIR/k" >/dev/null 2>&1\niconv "$OUT_DIR/k"'),
+                        ('a read of a file written at fd 2', 'bat /etc/hostname 2> "$OUT_DIR/e"\niconv "$OUT_DIR/e"'),
+                        ('a read under a tilde', 'printf %s x > ~/r9\niconv ~/r9'),
+                        ('a script function given a written path', 'printf %s x > "$OUT_DIR/r9"\nrd() { iconv "$1"; }\nrd "$OUT_DIR/r9"'),
+                        ('an option value naming a written file', 'printf %s x > "$OUT_DIR/r9"\nopenssl enc -in"$OUT_DIR/r9"')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
         probe("V1 closed-world negative control is flagged: %s" % label, len(b2) > len(bad), str(b2[len(bad):][:2]))
     # #5236: constructs a name-based scan cannot follow are not allowed in federate.sh at all.
@@ -2068,7 +2509,6 @@ def closed_world_taint(fs):
                         ("ln of a written file", 'printf %s x > "$OUT_DIR/r9"\nln -sf "$OUT_DIR/r9" "$OUT_DIR/r8"'),
                         ("a listed printer of a braced written path", 'printf %s x > "$OUT_DIR/r9"\nhead -c 1 -- "${OUT_DIR}/r9" | LC_ALL=C grep -q x'),
                         ("a reader of another literal path", 'printf %s x > /var/tmp/r9\niconv /var/tmp/r90'),
-                        ("a read after cd into another directory", 'printf %s x > "$OUT_DIR/r9"\ncd "$HERE" && iconv r9'),
                         ("a read of a different name after cd", 'printf %s x > "$OUT_DIR/r9"\ncd "$OUT_DIR" && iconv r90'),
                         ("a file under a nested directory", 'printf %s "$qjson" > "$OUT_DIR/sub/r.txt"'),
                         ("a reader with only stderr sent to a written file", 'printf %s x > "$OUT_DIR/r9"\nbat /etc/hostname 2> "$OUT_DIR/r9"'),
@@ -2093,7 +2533,22 @@ def closed_world_taint(fs):
                         ("cp -t into a proven directory", 'printf %s x > "$OUT_DIR/r9"\ncp -t "$run_dir" "$OUT_DIR/r9"'),
                         ("dd of a written file to a proven file", 'printf %s x > "$OUT_DIR/r9"\ndd if="$OUT_DIR/r9" of="$OUT_DIR/r8" 2>/dev/null'),
                         ("a trap that removes a written file", 'printf %s x > "$OUT_DIR/r9"\ntrap \'rm -f -- "$OUT_DIR/r9"; exit 130\' INT'),
-                        ("exec that opens a proven file", 'exec 8> "$OUT_DIR/r9"')):
+                        ("exec that opens a proven file", 'exec 8> "$OUT_DIR/r9"'),
+                        # #5621: commands that name a written file and print nothing of it, and reads of other files.
+                        ('rm of a written file', 'printf %s x > "$OUT_DIR/r9"\nrm -f -- "$OUT_DIR/r9"'),
+                        ('a reader whose output is a proven file', 'printf %s x > "$OUT_DIR/r9"\niconv "$OUT_DIR/r9" > "$OUT_DIR/o"'),
+                        ('chmod of a written file', 'printf %s x > "$OUT_DIR/r9"\nchmod 600 "$OUT_DIR/r9"'),
+                        ('a test of a written file', 'printf %s x > "$OUT_DIR/r9"\n[ -s "$OUT_DIR/r9" ] && :'),
+                        ('a count of a written file in a capture', 'printf %s x > "$OUT_DIR/r9"\nk="$(wc -c < "$OUT_DIR/r9")"'),
+                        ('grep -c of a written file in a capture', 'printf %s x > "$OUT_DIR/r9"\nk="$(grep -c x "$OUT_DIR/r9")"'),
+                        ('a read of a file the script does not write', 'printf %s x > "$OUT_DIR/r9"\niconv /etc/hostname'),
+                        ('a read of a near name', 'printf %s x > "$OUT_DIR/r9"\niconv "$OUT_DIR/r90"'),
+                        ('a capture that reads no file', 'printf %s x > "$OUT_DIR/r9"\nt="$(date -u +%s)"'),
+                        ('a declaration of a written path', 'printf %s x > "$OUT_DIR/r9"\nlocal v="$OUT_DIR/r9"'),
+                        ('a subshell rm after cd', 'printf %s x > "$OUT_DIR/r9"\n(cd "$OUT_DIR" && rm -f r9)'),
+                        ('pushd and popd around an rm', 'printf %s x > "$OUT_DIR/r9"\npushd "$OUT_DIR" >/dev/null && rm -f r9 && popd >/dev/null'),
+                        ('a while read loop over another file', 'printf %s x > "$OUT_DIR/r9"\nwhile read -r l; do :; done < /etc/hostname'),
+                        ('exec that opens a proven file for writing', 'exec 8> "$OUT_DIR/r9"\nprintf x >&8')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
         probe("V1 closed-world control is accepted: %s" % label, len(b2) == len(bad), str(b2[len(bad):][:2]))
 
@@ -2509,6 +2964,10 @@ def comment_pin_5416():
     probe("#5602 the closed-world comment states the proven-file rule for targets", "#5602" in block
           and "every literal path\n#    included, is the terminal" in block and "only a plain path" not in block
           and "starts with a literal character" not in block, "")
+    probe("#5621 the closed-world comment states the by-name reader rule and its limits", "#5621" in block
+          and "nor the working directory (cd,\n# pushd, popd, a subshell, env --chdir) decides" in block
+          and "Stated limits:" in block and "bare name counts" not in block
+          and "is taken as x, so" not in block and "relative name alone" not in block, "")
     changelog = (ROOT / "changelog.d" / "4654.fixed.md").read_text()
     probe("#5416 the changelog does not call any member of the allowed set a known silent consumer",
           "known silent consumer" not in changelog and "#5418" in changelog, "")
