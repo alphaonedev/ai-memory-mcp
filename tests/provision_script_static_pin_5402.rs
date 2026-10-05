@@ -322,7 +322,7 @@ fn reinit_refuses_a_bad_pg_port_before_any_step_5454() {
 /// case name would dump one database and drop another, so it is refused.
 #[test]
 fn reinit_refuses_an_uppercase_primary_db_f4() {
-    for bad in ["AiMem", "aiMem", "AIMEM", "aimemoryX"] {
+    for bad in ["AiMem", "aiMem", "AIMEM", "aimemoryX", "Aimem", "Aimem_2"] {
         let o = dry_run(&[
             ("PG_PRIMARY_DB", bad),
             ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem"),
@@ -343,4 +343,15 @@ fn reinit_refuses_an_uppercase_primary_db_f4() {
         ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem"),
     ]);
     assert_eq!(ok.status.code(), Some(0), "{}", stderr_of(&ok));
+}
+
+/// #5454: the dry run only prints the local psql line, so the live line is pinned in the
+/// source: the DROP and CREATE must reach the same server the backup dumped.
+#[test]
+fn reinit_live_local_psql_passes_the_port_5454() {
+    let script = read("scripts/postgres-droplet-reinit.sh");
+    assert!(
+        script.contains(r#"sudo -u postgres psql -p "$PG_PORT" "$@""#),
+        "#5454: psql_postgres must pass -p \"$PG_PORT\" on the live path"
+    );
 }
