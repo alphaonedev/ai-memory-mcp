@@ -882,6 +882,30 @@ MDEOF
     anchor_red 5530 BARE_QUAL "an over-closed anchor right after a spaced comparison" \
         "See a < $R::RecallTool<T>> here."
 
+    # #5531: a whitespace-delimited operator token made of the characters
+    # `< > = - !` (`<<`, `<<=`, `<-`, an entity or non-breaking-space spacing)
+    # is a comparison-like spelling that opens no generic group; a `<` attached
+    # to a word, or whitespace written as an entity before an anchor, is still a
+    # generic opener.
+    anchor_red 5531 BARE_QUAL "an over-closed anchor after a shift operator" \
+        "See a << b and $R::RecallTool<T>> here."
+    anchor_red 5531 BARE_QUAL "an over-closed anchor after a shift-assign operator" \
+        "See a <<= b and $R::RecallTool<T>> here."
+    anchor_red 5531 BARE_QUAL "an over-closed anchor after a left-arrow operator" \
+        "See a <- b and $R::RecallTool<T>> here."
+    anchor_red 5531 BARE_QUAL "an over-closed anchor after a comparison spaced with a named entity" \
+        "See a <&nbsp;b and $R::RecallTool<T>> here."
+    anchor_red 5531 BARE_QUAL "an over-closed anchor after a comparison spaced with a numeric entity" \
+        "See a <&#32;b and $R::RecallTool<T>> here."
+    anchor_red 5531 BARE_QUAL "an over-closed anchor after a comparison spaced with a non-breaking space" \
+        $'See a <\xc2\xa0b and '"$R"'::RecallTool<T>> here.'
+    anchor_red 5531 BARE_QUAL "an over-closed anchor after an entity-spelled shift operator" \
+        "See a &lt;&lt; b and $R::RecallTool<T>> here."
+    anchor_green 5531 "a generic opener with a non-breaking-space entity before the anchor" \
+        "See Vec<&nbsp;$R::RecallTool<T>> here."
+    anchor_green 5531 "a generic opener attached to the anchor after a spaced word" \
+        "See a <$R::RecallTool<T>> here."
+
     # #5497: the header, ABSENT_DEST and the CLAUDE.md gate paragraph state the
     # same destination wording and the same never-exempt cases.
     for wording in "split into" "split up into" "split across" "split out" "renamed to" "a link or a fragment"; do
@@ -1574,22 +1598,62 @@ def _token_end(text, i):
     return j
 
 
+_WS_ENTITY = re.compile(r"&(nbsp|ensp|emsp|thinsp|#[0-9]+|#[xX][0-9a-fA-F]+);")
+_WS_NAMED = {"nbsp": "\u00a0", "ensp": "\u2002", "emsp": "\u2003",
+             "thinsp": "\u2009"}
+_OP_CHARS = frozenset("<>=-!")
+
+
+def _ws_entity(m):
+    """A whitespace HTML entity (named or numeric) as a space; any other
+    entity is left exactly as written (#5531)."""
+    name = m.group(1)
+    if name in _WS_NAMED:
+        return " "
+    try:
+        ch = chr(int(name[2:], 16) if name[1] in "xX" else int(name[1:]))
+    except (ValueError, OverflowError):
+        return m.group(0)
+    return " " if ch.isspace() else m.group(0)
+
+
+def _operator_token_end(prefix, j):
+    """End of the comparison-like operator token that starts the open at `j`,
+    or None when that open is a generic opener (#5531). The token is the
+    whitespace-delimited run around `j`; it is an operator (`<`, `<=`, `<<`,
+    `<-`, `<>` ...) only when it is terminated by whitespace inside `prefix`,
+    holds nothing but the characters `< > = - !` (an entity `&lt;`/`&gt;`
+    counts as its sign) and begins at `j`: anything attached to a word is a
+    generic opener, spaced oddly."""
+    if j > 0 and not prefix[j - 1].isspace():
+        return None
+    e = j
+    while e < len(prefix) and not prefix[e].isspace():
+        e += 1
+    if e >= len(prefix):
+        return None
+    tok = prefix[j:e].replace("&lt;", "<").replace("&gt;", ">")
+    return e if tok and set(tok) <= _OP_CHARS else None
+
+
 def _outer_depth(prefix):
     """Number of angle groups (`<` or `&lt;`) still open at the end of
     `prefix` (#5456): prose such as `Vec<src/x.rs::T<U>>` opens a group of its
     own before the anchor, and the last closer belongs to it."""
+    prefix = _WS_ENTITY.sub(_ws_entity, prefix)
     depth, j = 0, 0
     while j < len(prefix):
         kind, width = _group_step(prefix, j)
         if kind == "open":
-            # #5498/#5530: `a < b` and `a <= b` are comparisons, not generic
-            # opens, but only with whitespace on BOTH sides of the sign: a `<`
-            # attached to a word (`Vec< T`, `Vec<\tT`) is a generic opener
-            # whose spacing is unusual, not a comparison.
-            before_ws = j == 0 or prefix[j - 1] in " \t"
-            after_ws = j + width < len(prefix) and prefix[j + width] in " \t="
-            if not (before_ws and after_ws):
+            # #5498/#5530/#5531: a whitespace-delimited operator token such as
+            # `a < b`, `a <= b`, `a << b` or `a <- b` is a comparison, not a
+            # generic open; a `<` attached to a word is a generic opener.
+            end = _operator_token_end(prefix, j)
+            if end is None:
                 depth += 1
+            else:
+                j = end
+                continue
         elif kind == "close":
             depth = max(0, depth - 1)
         j += width
