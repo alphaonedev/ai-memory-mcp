@@ -1293,7 +1293,8 @@ Grammar = Tuple[frozenset, frozenset, int, frozenset, frozenset, bool]
 #          long options with an optional =argument, obsolete -NUM accepted)
 TRANSPARENT_WRAPPERS = {
     "env": (frozenset({"-", "-i", "-0", "-v", "--ignore-environment", "--null", "--debug"}),
-            frozenset({"-u", "--unset", "-C", "--chdir"}), 0, frozenset(), frozenset(), False),
+            frozenset({"-u", "--unset", "-C", "--chdir"}), 0, frozenset({"-S", "--split-string"}),
+            frozenset(), False),
     "nice": (frozenset(), frozenset({"-n", "--adjustment"}), 0, frozenset(), frozenset(), True),
     "nohup": (frozenset(), frozenset(), 0, frozenset(), frozenset(), False),
     "timeout": (frozenset({"-v", "--verbose", "--foreground", "--preserve-status"}),
@@ -1637,6 +1638,34 @@ def command_lookup(text: str, words: List[Word], i: int) -> bool:
     return lookup
 
 
+# #5652: sudo options that hand the command to a shell (-s, -i and their long forms): the
+# command words are joined into a shell command line, a runner.
+SUDO_SHELL_MODE = frozenset({"-s", "-i", "--shell", "--login"})
+
+
+def sudo_shell_mode(text: str, words: List[Word], i: int, j: int) -> bool:
+    """#5652: whether the sudo options in words[i+1:j] select shell mode."""
+    takes_arg = TRANSPARENT_WRAPPERS["sudo"][1]
+    k = i + 1
+    while k < j:
+        lit = plain_literal(text, words[k]) or ""
+        k += 1
+        if lit.startswith("--"):
+            if lit.partition("=")[0] in SUDO_SHELL_MODE:
+                return True
+            continue
+        if not lit.startswith("-"):
+            continue
+        for pos, ch in enumerate(lit[1:], 1):
+            if "-" + ch in SUDO_SHELL_MODE:
+                return True
+            if "-" + ch in takes_arg:
+                if pos == len(lit) - 1:
+                    k += 1
+                break
+    return False
+
+
 def head_verdict(text: str, words: List[Word], depth: int = 0) -> Tuple[str, int]:
     """(verdict, index of the deciding word). CLEAN only for a proven fully literal head that
     is not psql (or a command with no head at all); PSQL for a literal psql head; UNDECIDED
@@ -1683,6 +1712,8 @@ def head_verdict(text: str, words: List[Word], depth: int = 0) -> Tuple[str, int
         if grammar is None:
             return CLEAN, i
         verdict, nxt_i = walk_wrapper(text, words, i, grammar, depth)
+        if verdict == "next" and base == "sudo" and nxt_i < n and sudo_shell_mode(text, words, i, nxt_i):
+            return RUNNER, nxt_i
         if verdict != "next":
             return verdict, nxt_i
         i = nxt_i
@@ -1748,6 +1779,17 @@ def credential_operand(text: str, words: List[Word], narrow: bool, resplit: bool
     return False
 
 
+def inside_wrapper(text: str, words: List[Word], at: int) -> bool:
+    """#5652: the undecided word follows a literal wrapper or shell word, so it may be an
+    option that takes a command string (env -Q "..."): its operands are re-split."""
+    for k in range(min(at, len(words))):
+        lit = plain_literal(text, words[k])
+        base = lit.rstrip("/").rsplit("/", 1)[-1] if lit else ""
+        if base in TRANSPARENT_WRAPPERS or base in SHELLS or base in KNOWN_RUNNERS:
+            return True
+    return False
+
+
 def unproven_operand_commands(text: str, depth: int = 0) -> List[Tuple[int, int, int]]:
     """(report offset, start, end) of every command of text that is not proven clean and
     carries a credential-shaped -v / --set / --variable operand."""
@@ -1763,7 +1805,9 @@ def unproven_operand_commands(text: str, depth: int = 0) -> List[Tuple[int, int,
             verdict = UNDECIDED
         report = words[min(at, len(words) - 1)][0]
         if verdict == STRING_HIT or (verdict in (UNDECIDED, RUNNER, PSQL)
-                                     and credential_operand(text, words, verdict != PSQL, verdict == RUNNER)):
+                                     and credential_operand(text, words, verdict != PSQL,
+                                                         verdict == RUNNER or (verdict == UNDECIDED
+                                                                               and inside_wrapper(text, words, at)))):
             found.append((report, words[0][0], words[-1][1]))
     return found
 
@@ -2774,9 +2818,31 @@ R10_RED_PROBES = {
     '5651-r08-path-name-then-other': '"$CLI" -v "$HOME$PW:y"',
     '5651-r09-literal-between': '"$CLI" -v "${HOME}x$CRED:y"',
     '5651-r10-unnamed-var-mount-source': 'docker run -v $KEYS:/k $IMG',
+    # #5652: a credential operand inside a command string that env -S or sudo shell mode
+    # runs, or behind a wrapper option the gate does not know.
+    '5652-r01-env-S': 'env -S "\\$CLI -v pw=\\$PG_PW"',
+    '5652-r02-env-split-string-eq': 'env --split-string="\\$CLI -v pw=\\$PG_PW"',
+    '5652-r03-env-S-attached': 'env -S"\\$CLI -v pw=\\$PG_PW"',
+    '5652-r04-env-iS-cluster': 'env -iS "\\$CLI -v pw=\\$PG_PW"',
+    '5652-r05-env-vS-cluster': 'env -vS "\\$CLI -v pw=\\$PG_PW"',
+    '5652-r06-env-split-string-word': 'env --split-string "\\$CLI -v pw=\\$PG_PW"',
+    '5652-r07-sudo-s': 'sudo -s "\\$CLI -v pw=\\$PG_PW"',
+    '5652-r08-sudo-i': 'sudo -i "\\$CLI -v pw=\\$PG_PW"',
+    '5652-r09-sudo-s-dashdash': 'sudo -s -- "\\$CLI -v pw=\\$PG_PW"',
+    '5652-r10-sudo-u-then-s': 'sudo -u postgres -s "\\$CLI -v pw=\\$PG_PW"',
+    '5652-r11-sudo-long-shell': 'sudo --shell "\\$CLI -v pw=\\$PG_PW"',
+    '5652-r12-sudo-long-login': 'sudo --login "\\$CLI -v pw=\\$PG_PW"',
+    '5652-r13-env-unknown-option': 'env -Q "\\$CLI -v pw=\\$PG_PW"',
+    '5652-r14-sudo-unknown-option': 'sudo -Z "\\$CLI -v pw=\\$PG_PW"',
 }
 # Round 10 green: no hit of any kind.
 R10_GREEN_PROBES = {
+    # #5652: the same wrappers with no credential, and a quoted word that is one argv field
+    # naming a program (no shell joins it, so its -v is not an operand).
+    '5652-g01-env-S-no-credential': 'env -S "echo hi"',
+    '5652-g02-sudo-s-no-credential': 'sudo -s "echo hi"',
+    '5652-g03-nohup-one-field-program': 'nohup "\\$CLI -v pw=\\$PG_PW"',
+    '5652-g04-sudo-u-arg-holds-s': 'sudo -u s "\\$CLI -v pw=\\$PG_PW"',
     # #5651: the real-tree mount shapes stay clean.
     '5651-g01-home-mount': 'docker run -v "$HOME/.ai-memory:/data" img',
     '5651-g02-dir-mount-ro': 'docker run -v "$TLS_DIR:/certs-src:ro" img',
