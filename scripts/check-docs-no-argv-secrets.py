@@ -169,6 +169,11 @@ EXPANSION_RE = re.compile(
 XTRACE_PREFIX_WORDS = frozenset({"-", "!", "{", "}", "if", "then", "else", "elif", "do",
                                  "while", "until", "time", "builtin", "command", "exec"})
 XTRACE_UNREAD = ("$", "`")
+# #5597: a set +x on a line holding one of these words may not run, or runs in a body
+# defined for later, so it does not turn tracing off (off_in_current_shell).
+XTRACE_CONDITIONAL_WORDS = frozenset({"if", "then", "elif", "else", "fi", "while", "until",
+                                      "do", "done", "case", "esac", "for", "select",
+                                      "function"})
 TRACED_SECRET_RE = re.compile(
     r"\$\{?[A-Za-z0-9_]*(?:password|passwd|pass|secret|token|pw)(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -675,8 +680,12 @@ def xtrace_effect(line: str, depth: int = 0) -> Optional[bool]:
     """#5597: the xtrace state a script line leaves (True on, False off, None unchanged).
     Every simple command is read; a quoted word holding a command string (eval, trap, sh -c)
     is read as a line of its own, so a nested set -x is never missed (a nested one in a
-    subshell or child shell is counted too: fail closed)."""
+    subshell or child shell is counted too: fail closed). Tracing OFF counts only from a
+    top-level command of a line that surely runs in the current shell (off_in_current_shell);
+    an off in a quoted string, a subshell, a pipeline, a background job or after && or || is
+    ignored, because the shell that traces the next line may still trace."""
     state: Optional[bool] = None
+    off_ok = depth == 0 and off_in_current_shell(line)
     for cmd in commands(split_words(line)):
         i = 0
         while i < len(cmd) and cmd[i].lstrip("\\") in XTRACE_PREFIX_WORDS:
@@ -687,15 +696,34 @@ def xtrace_effect(line: str, depth: int = 0) -> Optional[bool]:
             effect = set_xtrace(cmd[i + 1:])
         elif head == "shopt":
             effect = shopt_xtrace(cmd[i + 1:])
-        if effect is not None:
+        if effect is True or (effect is False and off_ok):
             state = effect
         if depth < 3:
             for w in cmd[i:]:
                 if any(c.isspace() for c in w):
-                    nested = xtrace_effect(w, depth + 1)
-                    if nested is not None:
-                        state = nested
+                    if xtrace_effect(w, depth + 1) is True:
+                        state = True
     return state
+
+
+def off_in_current_shell(line: str) -> bool:
+    """#5597: True when every separator of a line is ; or a redirection and no word is a
+    compound-command keyword, so each of its commands runs, unconditionally, in the current
+    shell. A |, &, &&, ||, ( or ) (a pipeline element, a background job, a conditional, a
+    subshell, $(..) or a function body), a keyword from XTRACE_CONDITIONAL_WORDS and a line
+    the shell lexer cannot split give False."""
+    try:
+        lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        words = list(lex)
+    except ValueError:
+        return False
+    for w in words:
+        if w and all(c in SEPARATORS for c in w) and any(c in "|&()" for c in w):
+            return False
+        if w.lstrip("\\") in XTRACE_CONDITIONAL_WORDS:
+            return False
+    return True
 
 
 def shebang_xtrace(line: str) -> bool:
@@ -2942,6 +2970,21 @@ R10_XTRACE_RED = {
     '5597-x24-plus-then-minus': 'set +e -x\n',
     '5597-x25-off-then-on-one-line': 'set +x; set -x\n',
     '5597-x26-unread-operand': 'set $OPTS\n',
+    '5597-x27-off-in-bash-c': 'set -x\nbash -c "set +x; true"\n',
+    '5597-x28-off-in-sh-c-single': "set -x\nsh -c 'set +x'\n",
+    '5597-x29-off-in-subshell': 'set -x\n(set +x)\n',
+    '5597-x30-off-in-spaced-subshell': 'set -x\n( set +x; true )\n',
+    '5597-x31-off-in-cmdsubst': 'set -x\n$(set +x)\n',
+    '5597-x32-off-in-pipeline': 'set -x\ntrue | set +x\n',
+    '5597-x33-off-in-argument-string': 'set -x\nfoo "set +x now"\n',
+    '5597-x34-off-in-eval-string': 'set -x\neval "set +x"\n',
+    '5597-x35-off-in-background': 'set -x\nset +x &\n',
+    '5597-x36-off-after-and': 'set -x\ntrue && set +x\n',
+    '5597-x37-off-after-or': 'set -x\nfalse || set +x\n',
+    '5597-x38-off-in-if-body': 'set -x\nif false; then set +x; fi\n',
+    '5597-x39-off-in-while-body': 'set -x\nwhile false; do set +x; done\n',
+    '5597-x40-off-in-function-body': 'set -x\nf() { set +x; }\n',
+    '5597-x41-off-in-trap-string': 'set -x\ntrap "set +x" EXIT\n',
 }
 R10_XTRACE_GREEN = {
     '5597-g01-set-off-later-cluster': 'set -x\nset -e +x\n',
@@ -2955,6 +2998,12 @@ R10_XTRACE_GREEN = {
     '5597-g09-set-o-other': 'set -o pipefail\n',
     '5597-g10-on-then-off-one-line': 'set -x; set +x\n',
     '5597-g11-o-takes-the-x-word': 'set -o xtrace +o xtrace\n',
+    '5597-g12-off-in-brace-group': 'set -x\n{ set +x; }\n',
+    '5597-g13-off-redirected': 'set -x\nset +x 2>/dev/null\n',
+    '5597-g14-off-then-command': 'set -x\nset +x; true\n',
+    '5597-g15-off-negated': 'set -x\n! set +x\n',
+    '5597-g16-off-brace-redirected': 'set -x\n{ set +x; } 2>/dev/null\n',
+    '5597-g17-off-with-comment': 'set -x\nset +x # done\n',
 }
 
 
