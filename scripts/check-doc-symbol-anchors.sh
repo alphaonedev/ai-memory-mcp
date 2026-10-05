@@ -1423,6 +1423,8 @@ PYEOF
         "See \`$R::< RecallTool >\`."
     anchor_green 5610 "a bare bound list of live types" \
         "See \`$R::<RecallTool + RecallTool>::decorate_memory_many\`."
+    anchor_red_cites 5610 QUAL "a placeholder with a trailing space is a self type" \
+        "$R::NoSuch" "See \`$R::<NoSuch >\` here."
 
     # #5611: a keyword is never a symbol: an anchor with one in its path is
     # refused as UNMODELLED, and a precise-capturing use bound is skipped.
