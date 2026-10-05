@@ -115,8 +115,8 @@ pub struct CuratorArgs {
     /// #5218 / #3431 — set by the dispatcher (never parsed from argv): `--db`
     /// (or `AI_MEMORY_DB`) was given explicitly. An explicit `--db` plus a
     /// store URL that arrives only through the env channels keeps its
-    /// historical meaning: the operator's `--db` is still opened as the local
-    /// sidecar while the sweep runs against the store.
+    /// historical meaning: the operator's `--db` is still opened (created and
+    /// migrated, see `build_store_with_explicit_db`) on every store-backed arm.
     #[arg(skip)]
     pub db_was_explicit: bool,
 }
@@ -510,6 +510,31 @@ fn curator_store_url(args: &CuratorArgs) -> Option<&str> {
     }
 }
 
+/// #5218 / #3431 - build the store handle for every store-backed curator arm
+/// (`--once` / `--daemon`, `--reflect`, `--prune-reports`, `--rollback[-last]`).
+///
+/// An explicit `--db` (argv or `AI_MEMORY_DB`) alongside a store URL that
+/// arrives only through the env channels keeps its historical meaning, as
+/// `resolve_store_binding` documents: the operator's `--db` still binds the
+/// local path. The file is opened here, which creates it and runs the schema
+/// migrations, so the path the operator named exists and is a valid database
+/// instead of being silently skipped when the curator routes to the store.
+/// The open exists only to keep that contract: the curator reads and writes
+/// memories through the SAL store alone, and nothing reads the local handle
+/// afterwards. A failure to open it fails closed before any store handle is
+/// built (ERRORS-02).
+#[cfg(feature = "sal")]
+async fn build_store_with_explicit_db(
+    db_path: &Path,
+    args: &CuratorArgs,
+    app_config: &config::AppConfig,
+) -> Result<std::sync::Arc<dyn crate::store::MemoryStore>> {
+    if args.db_was_explicit {
+        drop(db::open(db_path)?);
+    }
+    crate::daemon_runtime::build_curator_store(curator_store_url(args), db_path, app_config).await
+}
+
 /// #4603 / #4820 — whether the curator takes the store-backed (SAL) arm.
 /// Resolves the SAME channel ladder `build_store_handle` binds the store from
 /// (`AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > `--store-url`), so a
@@ -544,17 +569,7 @@ async fn run_store_backed_sweep(
     app_config: &config::AppConfig,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    // #5218 / #3431 - an explicit `--db` alongside an env-channel store URL
-    // still binds its local path: the file is opened (created and migrated)
-    // as the local sidecar, exactly as `resolve_store_binding` documents,
-    // instead of being silently skipped when the sweep routes to the store.
-    // A failure to open it fails closed (ERRORS-02).
-    if args.db_was_explicit {
-        drop(db::open(db_path)?);
-    }
-    let store =
-        crate::daemon_runtime::build_curator_store(curator_store_url(args), db_path, app_config)
-            .await?;
+    let store = build_store_with_explicit_db(db_path, args, app_config).await?;
 
     let keypair = load_curator_keypair_best_effort();
     let feature_tier = app_config.effective_tier(None);
@@ -1198,7 +1213,7 @@ async fn build_reflect_store(
     args: &CuratorArgs,
     app_config: &config::AppConfig,
 ) -> Result<std::sync::Arc<dyn crate::store::MemoryStore>> {
-    crate::daemon_runtime::build_curator_store(curator_store_url(args), db_path, app_config).await
+    build_store_with_explicit_db(db_path, args, app_config).await
 }
 
 /// Load the curator's per-process signing keypair. Best-effort — if the
@@ -1451,9 +1466,7 @@ async fn run_store_backed_prune_reports(
     app_config: &config::AppConfig,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    let store =
-        crate::daemon_runtime::build_curator_store(curator_store_url(args), db_path, app_config)
-            .await?;
+    let store = build_store_with_explicit_db(db_path, args, app_config).await?;
     let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_CURATOR);
     let report = store
         .prune_curator_reports(&ctx, args.apply)
@@ -1481,9 +1494,7 @@ async fn run_store_backed_rollback(
     app_config: &config::AppConfig,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    let store =
-        crate::daemon_runtime::build_curator_store(curator_store_url(args), db_path, app_config)
-            .await?;
+    let store = build_store_with_explicit_db(db_path, args, app_config).await?;
     let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_CURATOR);
 
     if let Some(id) = &args.rollback {
