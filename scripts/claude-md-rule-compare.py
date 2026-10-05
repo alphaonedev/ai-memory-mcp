@@ -364,6 +364,18 @@ def plant_coverage_gap(probed: list, names: list, rounds: int) -> bool:
     return probed != names * rounds
 
 
+# #5472: the top-level modules this script imports (except sys), pinned as a literal so the self-test has a source of
+# truth that does not come from imported_modules() itself. Adding or removing an import without updating this tuple
+# makes the self-test red.
+EXPECTED_IMPORTS = ("argparse", "ast", "difflib", "importlib", "os", "pathlib", "py_compile", "re", "shutil", "stat",
+                    "subprocess")
+
+
+def import_pin_gap(found: list, pinned) -> tuple:
+    """#5472: (missing, extra): the pinned names `found` lacks, and the names in `found` that are not pinned."""
+    return (sorted(set(pinned) - set(found)), sorted(set(found) - set(pinned)))
+
+
 def imported_modules(path: Path) -> list:
     """#5379: the top-level names of every module `path` imports (parsed, never executed), except the built-in
     `sys`. The self-test plants one file per name beside its non-isolated child, so an import of any of them
@@ -565,7 +577,7 @@ def _self_test_cases() -> int:
         iso.mkdir(parents=True, exist_ok=True)
         copy = iso / "claude-md-rule-compare.py"
         shutil.copyfile(Path(__file__).resolve(), copy)
-        for name in imported_modules(Path(__file__).resolve()):
+        for name in sorted(set(EXPECTED_IMPORTS) | set(imported_modules(Path(__file__).resolve()))):
             (iso / f"{name}.py").write_text("print('PLANTED')\nraise SystemExit(0)\n", encoding="utf-8")
         # #5283: the refusal must hold for every partial isolation, not only for a bare interpreter: -E (ignore
         # PYTHON* variables) and -s (no user site) each leave the script directory on sys.path. #5373: so do both
@@ -589,7 +601,15 @@ def _self_test_cases() -> int:
         # #5424/#5441/#5442/#5443: importlib is in the plant set (it is not frozen, so its plant is load-bearing), the
         # docstring says so, and for EVERY name the script imports a planted file runs exactly when the child finds
         # the module neither preloaded, built-in nor frozen; also under -X frozen_modules=off. Returns "" or why.
-        names = imported_modules(Path(__file__).resolve())
+        found = imported_modules(Path(__file__).resolve())
+        missing, extra = import_pin_gap(found, EXPECTED_IMPORTS)
+        if missing or extra:
+            return f"imported_modules() and EXPECTED_IMPORTS disagree: missing {missing}, extra {extra} (#5472)"
+        if not import_pin_gap(found[1:], EXPECTED_IMPORTS)[0] or not import_pin_gap(found + ["zz_unpinned"],
+                                                                                     EXPECTED_IMPORTS)[1] \
+                or any(import_pin_gap(list(EXPECTED_IMPORTS), EXPECTED_IMPORTS)):
+            return "the import pin check does not tell a narrowed or widened list from the pin (#5472)"
+        names = list(EXPECTED_IMPORTS)  # the probe set is the pin, never the output of imported_modules (#5472)
         if "importlib" not in names:
             return "importlib is not in the plant set"
         words = " ".join((imported_modules.__doc__ or "").split())
