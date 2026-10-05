@@ -1369,10 +1369,12 @@ GIT_VERIFIER_KEYS = ("gpg.program", "gpg.openpgp.program", "gpg.x509.program", "
 
 
 def _git_child_env() -> Dict[str, str]:
-    """The environment of every git child: the allowlist plus the gate's own settings (#5581, #5503)."""
+    """The environment of every git child: the allowlist plus the gate's own settings (#5581, #5503). An empty
+    GIT_ALLOW_PROTOCOL allows no transport, so a partial clone cannot fetch a missing object through a
+    repo-configured program (remote.<name>.uploadpack, core.sshCommand): the read faults closed (#5823)."""
     env = {k: os.environ[k] for k in GIT_ENV_KEEP if k in os.environ}
     env.update({"GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull, "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+                "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_ALLOW_PROTOCOL": ""})
     return env
 
 
@@ -3288,6 +3290,24 @@ def _git_funnel_cases(t: Path) -> Tuple[List[str], int]:
                 else:
                     os.environ[k] = v
     shutil.rmtree(str(shallow), ignore_errors=True)
+    # a partial clone faults closed and runs no transport program of its config when a read needs a missing
+    # object (#5823): the lazy fetch would run remote.origin.uploadpack
+    repo, shas = build("partial-src")
+    git(repo, "config", "uploadpack.allowFilter", "true")
+    partial = t / "partial-clone"
+    subprocess.run(["git", "clone", "-q", "--filter=blob:none", "--no-checkout", "file://" + str(repo), str(partial)],
+                   check=True, capture_output=True)
+    lmark, lprog = marker_prog("transport")
+    git(partial, "config", "remote.origin.uploadpack", str(lprog))
+    n += 1
+    _GIT_PROVEN.clear()
+    try:
+        removed_pending_rows(partial)
+    except (RuntimeError, subprocess.CalledProcessError):
+        pass
+    if lmark.exists():
+        bad.append("a partial clone ran a repo-configured transport program during the gate's git reads (#5823)")
+    shutil.rmtree(str(partial), ignore_errors=True)
     # the isolation is proven, not assumed: a child environment that leaves a global or system config in reach is
     # a fault, and the proof runs once per repository, not once per call
     repo, shas = build("proof")
