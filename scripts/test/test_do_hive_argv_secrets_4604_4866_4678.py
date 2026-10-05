@@ -925,26 +925,383 @@ def tainted_names(text):
 OUT_REDIRECT = re.compile(r"(?:(?<![0-9&<>])|(?<=[\s;]1))(&>>|&>|>>|>\||>)(?!\()\s*(\"[^\"]*\"|'[^']*'|\S+)")
 
 
-VAR_SEG = r"(?!\.\.(?![\w.\-]))[\w.\-]+(?:\$\{?\w+\}?[\w.\-]*)*"
-VAR_PATH = r"\$\{?\w+\}?(?:/+" + VAR_SEG + r")+"
+# #5602: an output target is a file only when the scan proves it. A write, copy or install target is a file when it
+# sits under one of these variable roots with a canonical remainder: no empty, . or .. segment, no glob, brace or
+# tilde, and no expansion the scan does not model. Every other target, every literal absolute path among them, is
+# the terminal; /dev/null is the null device. There is no list of terminal paths to keep complete.
+FILE_ROOTS = ("OUT_DIR", "run_dir")
+# Markers for the parts of an expanded word whose text the scan models as a class of strings, never as a value:
+# a counter ($(( )), seq), a name the script checked against NAME_CHARS, anything (an unmodelled expansion or a
+# glob), the X run of a mktemp template, one digit (a date field), and an opaque variable OPEN name CLOSE.
+DIGITS, NAME, ANY, ALNUM, ONE_DIGIT, OPEN, CLOSE = "\x01", "\x02", "\x03", "\x04", "\x05", "\x06", "\x07"
+NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_:-")
+_DIGITS = frozenset("0123456789")
+_ALNUM = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 
 
-def stdout_to_file(text):
-    """True when the last fd-1 output redirect in `text` targets a plain file (or /dev/null)."""
+def _close(s, i):
+    """Index just past the $( ... ) or ${ ... } that opens at s[i], quotes and nesting followed."""
+    want, opener = (")", "(") if s[i + 1] == "(" else ("}", "{")
+    depth, j, quote = 1, i + 2, None
+    while j < len(s):
+        c = s[j]
+        if c == "\\" and quote != "'":
+            j += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = None
+            elif quote == '"' and c == "$" and s[j + 1:j + 2] in ("(", "{"):
+                j = _close(s, j)
+                continue
+            j += 1
+            continue
+        if c in "'\"":
+            quote = c
+        elif c == "$" and s[j + 1:j + 2] in ("(", "{"):
+            j = _close(s, j)
+            continue
+        elif c == opener:
+            depth += 1
+        elif c == want:
+            depth -= 1
+            if not depth:
+                return j + 1
+        j += 1
+    return len(s)
+
+
+def shell_words(s):
+    """The shell words of `s`: a word ends at unquoted white space or one of ; & | < > ( ); quotes, ${ } and
+    $( ) stay whole inside it."""
+    out, i = [], 0
+    while i < len(s):
+        if s[i].isspace() or s[i] in ";&|<>()":
+            i += 1
+            continue
+        st, quote = i, None
+        while i < len(s):
+            c = s[i]
+            if c == "\\" and quote != "'":
+                i += 2
+                continue
+            if quote:
+                if c == quote:
+                    quote = None
+                elif quote == '"' and c == "$" and s[i + 1:i + 2] in ("(", "{"):
+                    i = _close(s, i)
+                    continue
+                i += 1
+                continue
+            if c in "'\"":
+                quote = c
+            elif c == "$" and s[i + 1:i + 2] in ("(", "{"):
+                i = _close(s, i)
+                continue
+            elif c.isspace() or c in ";&|<>()":
+                break
+            i += 1
+        out.append(s[st:i])
+    return out
+
+
+def statements(line):
+    """The simple commands of a logical line: split at unquoted ; & | and at ( ) that do not open an array value;
+    quotes, ${ } and $( ) stay whole."""
+    out, cur, i, quote = [], "", 0, None
+    while i < len(line):
+        c = line[i]
+        if c == "\\" and quote != "'":
+            cur += line[i:i + 2]
+            i += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = None
+            elif quote == '"' and c == "$" and line[i + 1:i + 2] in ("(", "{"):
+                j = _close(line, i)
+                cur, i = cur + line[i:j], j
+                continue
+            cur += c
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+        elif c == "$" and line[i + 1:i + 2] in ("(", "{"):
+            j = _close(line, i)
+            cur, i = cur + line[i:j], j
+            continue
+        elif c in ";&|\n" or (c in "()" and line[i - 1:i] != "="):
+            if not (c == "&" and (line[i - 1:i] in (">", "<") or line[i + 1:i + 2] == ">")):
+                out.append(cur)
+                cur, i = "", i + 1
+                continue
+        cur += c
+        i += 1
+    out.append(cur)
+    return [s for s in out if s.strip()]
+
+
+def _assignment_map(text):
+    """{variable: [value word, ...]} for every assignment in `text`: name=value in command position or after a
+    declarator, a declaration with no value (the empty string), and the words of a for loop. None stands for a
+    value the scan cannot read (an append, an array). A name=value prefix of a command only sets that command's
+    environment, so it is not recorded."""
+    vals = {}
+    for _, line, _ in logical_lines(text):
+        for stage in statements(line):
+            words = shell_words(stage)
+            k = 0
+            while k < len(words) and words[k] in ("if", "then", "elif", "else", "while", "until", "do", "!", "time", "{"):
+                k += 1
+            if words[k:k + 1] == ["for"] and words[k + 2:k + 3] == ["in"]:
+                vals.setdefault(words[k + 1], []).extend(words[k + 3:] or [""])
+                continue
+            arr = re.match(r"\s*(?:(?:if|then|else|do|!)\s+)*(?:(?:%s)\s+(?:-\w+\s+)*)?(\w+)\+?=\(" % "|".join(DECLARATORS), stage)
+            if arr:
+                vals.setdefault(arr.group(1), []).append(None)
+                continue
+            decl = k < len(words) and words[k] in DECLARATORS
+            if decl:
+                k += 1
+                while k < len(words) and words[k].startswith("-"):
+                    k += 1
+            start = k
+            while k < len(words):
+                m = re.match(r"(\w+)(\+?)=(\(?)(.*)$", words[k], re.S)
+                if m:
+                    vals.setdefault(m.group(1), []).append(None if m.group(2) or m.group(3) else m.group(4))
+                elif decl and re.fullmatch(r"\w+", words[k]):
+                    vals.setdefault(words[k], []).append("")
+                elif not decl:
+                    break
+                k += 1
+            if not decl and k < len(words) and k > start:
+                for w in words[start:k]:   # a prefix of a command: that command's environment only
+                    vals[w.split("=", 1)[0]].pop()
+    return vals
+
+
+_ASSIGN_CACHE = {}
+
+
+def assigned_values(text, var):
+    if text not in _ASSIGN_CACHE:
+        if len(_ASSIGN_CACHE) > 8:
+            _ASSIGN_CACHE.clear()
+        _ASSIGN_CACHE[text] = (_assignment_map(text), _name_checked_arrays(text))
+    return _ASSIGN_CACHE[text][0].get(var, [])
+
+
+def _name_checked_arrays(text):
+    """Arrays whose every element the script checks against a subset of NAME_CHARS right after each assignment:
+    ARR=( ... ) on one line, then for x in "${ARR[@]}"; do [[ "$x" =~ ^[chars]{1,N}$ ]] || die "..."; done."""
+    names = set(re.findall(r"(?m)^\s*(\w+)\+?=\(", text))
+    out = set()
+    for arr in names:
+        loop = (r"[^\n]*\n(?:\s*#[^\n]*\n)*\s*for (\w+) in \"\$\{%s\[@\]\}\"; do\n\s*\[\[ \"\$\1\" =~ \^\[([^\]\n]+)\]\{1,\d+\}\$ \]\]"
+                r" \|\| die \"[^\"$`\\]*\"\n\s*done\n") % re.escape(arr)
+        sites = [m.start() for m in re.finditer(r"(?m)^\s*%s\+?=" % re.escape(arr), text)]
+        good = [m for m in (re.match(r"\s*%s=\(" % re.escape(arr) + loop, text[s:]) for s in sites) if m]
+        if sites and len(good) == len(sites) and all(set(m.group(2)) <= NAME_CHARS for m in good) \
+                and not re.search(r"%s\[[^\]]*\]\+?=" % re.escape(arr), text):
+            out.add(arr)
+    return out
+
+
+def _capture_value(body, text, keep, depth):
+    """The expansion of a command substitution the scan models (seq, date +FORMAT, mktemp TEMPLATE), else None."""
+    words = shell_words(body)
+    if not words:
+        return None
+    if words[0] == "seq":
+        return [DIGITS]
+    if words[0] == "date" and words[-1].strip("\"'").startswith("+"):
+        fmt = words[-1].strip("\"'")[1:]
+        fmt = re.sub(r"%[mdHMS]", ONE_DIGIT * 2, fmt.replace("%Y", ONE_DIGIT * 4))
+        return [re.sub(r"%.", ANY, fmt)]
+    if words[0] == "mktemp" and not words[-1].startswith("-") and len(words) > 1:
+        alts = expand(words[-1], text, keep, depth + 1)
+        return None if alts is None else [re.sub(r"X{3,}$", ALNUM, a) for a in alts]
+    return None
+
+
+def expand(word, text, keep=(), depth=0):
+    """The alternatives a shell word can expand to, as strings with the markers above. A variable is replaced by
+    each value the script assigns it; `keep` names stay OPEN name CLOSE, and so does a variable with no readable
+    value (a parameter, the environment, an unmodelled command substitution). ${V:-X} is X: the scan does not
+    follow a value given in the environment. Unquoted glob and brace characters are ANY; a leading ~ is opaque.
+    Inside a variable's value an unmodelled command substitution makes the whole value None."""
+    alts, i, quote = [""], 0, None
+
+    def add(parts):
+        nonlocal alts
+        alts = list(dict.fromkeys(a + p for a in alts for p in parts))[:64]
+
+    while i < len(word):
+        c = word[i]
+        if c == "\\" and quote != "'":
+            add([word[i + 1:i + 2]])
+            i += 2
+            continue
+        if quote == "'":
+            quote = None if c == "'" else quote
+            if c != "'":
+                add([c])
+            i += 1
+            continue
+        if c == "'" and quote is None:
+            quote = "'"
+            i += 1
+            continue
+        if c == '"':
+            quote = None if quote == '"' else '"'
+            i += 1
+            continue
+        if c == "$" and word.startswith("$((", i):
+            j = _close(word, i)
+            add([DIGITS])
+            i = j
+            continue
+        if c == "$" and word[i + 1:i + 2] == "(":
+            j = _close(word, i)
+            got = _capture_value(word[i + 2:j - 1], text, keep, depth)
+            if got is None and depth:
+                return None
+            add(got if got is not None else [OPEN + "$()" + CLOSE])
+            i = j
+            continue
+        if c == "$" and word[i + 1:i + 2] == "{":
+            j = _close(word, i)
+            m = re.fullmatch(r"(\w+|[@*#?$!-])(\[[^\]]*\])?(?:(:?[-+=?])(.*))?", word[i + 2:j - 1], re.S)
+            if not m or m.group(3) in ("+", ":+", "=", ":=", "?", ":?"):
+                got = [ANY]
+            elif m.group(3):
+                got = expand(m.group(4), text, keep, depth + 1)
+            else:
+                got = _var_value(m.group(1), m.group(2), text, keep, depth)
+            if got is None:
+                return None
+            add(got)
+            i = j
+            continue
+        if c == "$" and re.match(r"\$(\w+|[@*#?$!-])", word[i:]):
+            m = re.match(r"\$(\w+|[@*#?$!-])", word[i:])
+            got = _var_value(m.group(1), None, text, keep, depth)
+            if got is None:
+                return None
+            add(got)
+            i += m.end()
+            continue
+        if quote is None and (c in "*?[]{}" or (c == "~" and i == 0)):
+            add([OPEN + "~" + CLOSE] if c == "~" else [ANY])
+            i += 1
+            continue
+        add([c])
+        i += 1
+    return alts
+
+
+def _var_value(var, index, text, keep, depth):
+    """The alternatives of $var (or ${var[index]}): OPEN var CLOSE when kept or unreadable, NAME for an element of a
+    name-checked array, else every assigned value expanded."""
+    if var in keep or depth > 6 or not re.fullmatch(r"\w+", var) or var.isdigit():
+        return [OPEN + var + CLOSE]
+    assigned_values(text, var)
+    if index is not None:
+        return [NAME] if var in _ASSIGN_CACHE[text][1] else [OPEN + var + CLOSE]
+    vals = assigned_values(text, var)
+    if not vals or any(v is None for v in vals):
+        return [OPEN + var + CLOSE]
+    out = []
+    for v in vals:
+        got = expand(v, text, keep, depth + 1)
+        if got is None:
+            return [OPEN + var + CLOSE]
+        out += got
+    return list(dict.fromkeys(out))[:64]
+
+
+def seg_atoms(seg):
+    """A path segment as a list of (char set or None for any character but /, repeat) atoms."""
+    out = []
+    for c in re.sub(OPEN + "[^" + CLOSE + "]*" + CLOSE, ANY, seg):
+        if c == DIGITS:
+            out += [(_DIGITS | {"-"}, False), (_DIGITS, True)]
+        elif c == NAME:
+            out += [(NAME_CHARS, False), (NAME_CHARS, True)]
+        elif c == ALNUM:
+            out += [(_ALNUM, False), (_ALNUM, True)]
+        elif c == ONE_DIGIT:
+            out.append((_DIGITS, False))
+        elif c in (ANY, OPEN, CLOSE) or c == "/":
+            if not out or out[-1] != (None, True):
+                out.append((None, True))
+        else:
+            out.append((frozenset(c), False))
+    return out
+
+
+def could_equal(a, b):
+    """True when some string matches both atom lists a and b (a product walk of the two patterns)."""
+    seen, todo = set(), [(0, 0)]
+    while todo:
+        i, j = todo.pop()
+        if (i, j) in seen:
+            continue
+        seen.add((i, j))
+        if i == len(a) and j == len(b):
+            return True
+        if i < len(a) and a[i][1]:
+            todo.append((i + 1, j))
+        if j < len(b) and b[j][1]:
+            todo.append((i, j + 1))
+        if i < len(a) and j < len(b):
+            sa, sb = a[i][0], b[j][0]
+            if sa is None or sb is None or sa & sb:
+                todo.append((i if a[i][1] else i + 1, j if b[j][1] else j + 1))
+    return False
+
+
+def _opaque_segment(seg):
+    return OPEN in seg or ANY in seg
+
+
+def target_kind(word, text, directory=False):
+    """#5602: "null" for /dev/null, "file" when every expansion of `word` is under a FILE_ROOTS root with a canonical
+    remainder (a directory target may be the root itself), else "terminal"."""
+    alts = expand(word, text, keep=FILE_ROOTS)
+    if alts == ["/dev/null"]:
+        return "null"
+    if not alts:
+        return "terminal"
+    for a in alts:
+        m = re.fullmatch(OPEN + r"(\w+)" + CLOSE + r"((?:/[^/]+)*)", a)
+        if not m or m.group(1) not in FILE_ROOTS or not (m.group(2) or directory):
+            return "terminal"
+        for seg in m.group(2).split("/")[1:]:
+            atoms = seg_atoms(seg)
+            if _opaque_segment(seg) or re.match(r"\.\.(?![\w.\-])", seg) \
+                    or could_equal(atoms, seg_atoms(".")) or could_equal(atoms, seg_atoms("..")):
+                return "terminal"
+    return "file"
+
+
+def redirect_word(text, end):
+    """The shell word a redirect operator ending at `end` points at."""
+    rest = text[end:].lstrip()
+    words = shell_words(rest)
+    return words[0] if words and rest[:1] not in ";&|<>()" else ""
+
+
+def stdout_to_file(stage, text=""):
+    """True when the last fd-1 output redirect in `stage` targets a proven file or /dev/null (#5602)."""
     last = None
-    for m in OUT_REDIRECT.finditer(text):
-        last = m.group(2).strip("\"'")
-    if last is None:
+    for m in OUT_REDIRECT.finditer(stage):
+        last = redirect_word(stage, m.end(1))
+    if last is None or not last or last.startswith("&"):
         return False
-    if last.startswith("&") or "$(" in last or "`" in last or last.startswith(">("):
-        return False
-    if last.startswith("/dev/") and last != "/dev/null":
-        return False
-    if ".." in last.split("/"):
-        return False
-    if re.search(r"[$~*?\[{]", last) and not re.fullmatch(VAR_PATH, last):
-        return False
-    return not re.match(r"/proc/", last)
+    return target_kind(last, text) != "terminal"
 
 
 def heredoc_findings(text, names):
@@ -960,7 +1317,7 @@ def heredoc_findings(text, names):
         while j < len(lines) and lines[j].strip() != delim:
             body.append(lines[j])
             j += 1
-        to_file = stdout_to_file(opener[m.start():]) or "$(" in opener[:m.start()]
+        to_file = stdout_to_file(opener[m.start():], text) or "$(" in opener[:m.start()]
         if not quoted and not to_file:
             hit = [v for v in names if re.search(r"\$\{?[#!]?%s\b" % re.escape(v), "\n".join(body))]
             if hit:
@@ -1178,7 +1535,8 @@ def file_printer_findings(text):
             printers = [w for w in (reads_a_file(t) for t in pipe) if w]
             last = stage_words(pipe[-1]).split()
             last_word = last[0] if last else ""
-            silent_end = stdout_to_file(pipe[-1]) or last_word in ("wc", "curl") or reads_a_file_silent(pipe[-1])
+            silent_end = stdout_to_file(pipe[-1], text) or last_word in ("wc", "curl") or reads_a_file_silent(pipe[-1]) \
+                or dd_to_file(pipe[-1], text)
             if printers and not silent_end:
                 bad.append("%d:%s:file read" % (n, printers[0]))
     return bad
@@ -1196,24 +1554,87 @@ SILENT_FILE_CMDS = frozenset(("rm", "mv", "cp", "chmod", "chown", "scp", "mkdir"
                               "mktemp", "stat", "ln", "sync", "rmdir", "install", "exec", "trap", "cmp", "ls", "true"))
 
 
-def silent_file_cmd(words):
-    """#5524: True when the command prints no file content. cp and install print one when an operand is the
-    terminal (/dev/tty, /dev/stdout, a dotdot path) or cannot be decided (a bare variable, a glob); cmp prints
-    differing bytes with -b or -l. ln only links, so it stays silent."""
+REDIRECT = re.compile(r"(?:\d+|&)?(?:&>>|&>|>>|>\||>&|<&|<>|>|(?<!<)<(?!<))(?!\()\s*(?:\"[^\"]*\"|'[^']*'|[^\s;&|<>()]+)")
+
+
+def operand_words(stage):
+    """The words of a simple command (keywords and name=value prefixes dropped) with every redirect removed."""
+    return shell_words(REDIRECT.sub(" ", stage_words(stage)))
+
+
+# Options of cp, install, ln and scp that take a separate argument.
+OPT_ARGS = {"cp": "S", "install": "mogS", "ln": "S", "scp": "cFiJlOoPSX"}
+
+
+def _operands(words):
+    """(options, operands) of a cp/install/ln/scp/mv command: -- ends the options; a short option that takes an
+    argument consumes the rest of its word or the next word; -t/--target-directory is reported as ("-t", DIR)."""
+    cmd, opts, ops, k, done = words[0], [], [], 1, False
+    while k < len(words):
+        w = words[k]
+        k += 1
+        if done or not w.startswith("-") or w == "-":
+            ops.append(w)
+        elif w == "--":
+            done = True
+        elif w.startswith("--"):
+            name, eq, val = w.partition("=")
+            if name == "--target-directory":
+                opts.append(("-t", val if eq else (words[k] if k < len(words) else "")))
+                k += 0 if eq else 1
+            else:
+                opts.append((name, val))
+        else:
+            for p, ch in enumerate(w[1:], 1):
+                if ch == "t" and cmd != "scp" or ch in OPT_ARGS.get(cmd, ""):
+                    val = w[p + 1:] or (words[k] if k < len(words) else "")
+                    k += 0 if w[p + 1:] else 1
+                    opts.append(("-" + ch, val))
+                    break
+                opts.append(("-" + ch, ""))
+    return opts, ops
+
+
+def silent_file_cmd(stage, text=""):
+    """#5524, #5602: True when the command prints no file content. A cp, install, scp download or dd destination
+    must be a proven file (target_kind); install -d makes directories; ln is silent only when what it links to is
+    a proven file, so no later write through the link reaches the terminal; exec only with redirects and no
+    command; trap only when its handler is silent; cmp prints differing bytes with -b or -l."""
+    words = operand_words(stage)
     if not words or words[0] not in SILENT_FILE_CMDS:
         return False
-    ops = [w.strip("\"'") for w in words[1:]]
-    if words[0] in ("cp", "install"):
-        for o in ops:
-            if o.startswith("-") or o == "/dev/null":
-                continue
-            if o.startswith(("/dev/", "/proc/")) or ".." in o.split("/"):
-                return False
-            if re.search(r"[$~*?\[{`]", o) and not re.fullmatch(VAR_PATH, o):
-                return False
-    if words[0] == "cmp" and any(re.fullmatch(r"-\w*[bl]\w*|--print-bytes|--verbose", o) for o in ops):
+    cmd = words[0]
+    if cmd in ("cp", "install", "scp", "ln"):
+        opts, ops = _operands(words)
+        names = [o for o, _ in opts]
+        if cmd == "install" and ("-d" in names or "--directory" in names):
+            return True
+        dirs = [v for o, v in opts if o == "-t"]
+        if cmd == "ln":
+            srcs = ops if dirs else ops[:-1] if len(ops) > 1 else ops
+            return bool(srcs) and all(target_kind(o, text) != "terminal" for o in srcs)
+        if cmd == "scp" and not dirs and ops and re.match(r"[^/]*:", ops[-1].replace("\"", "").replace("'", "")):
+            return True   # an upload: nothing is written on this host
+        dests = dirs or ops[-1:]
+        return bool(dests) and len(ops) > (0 if dirs else 1) \
+            and all(target_kind(d, text, directory=True) != "terminal" for d in dests)
+    if cmd == "exec":
+        return len(words) == 1
+    if cmd == "trap":
+        body = expand(words[1], "") if len(words) > 1 else [""]
+        return len(words) > 1 and body is not None and len(body) == 1 and all(
+            not (sw := operand_words(st)) or sw[0] in ("exit", "return", ":", "true") or silent_file_cmd(st, text)
+            for st in statements(body[0]))
+    if cmd == "cmp" and any(re.fullmatch(r"-\w*[bl]\w*|--print-bytes|--verbose", o) for o in words[1:]):
         return False
     return True
+
+
+def dd_to_file(stage, text=""):
+    """#5602: dd writes its input to of= and prints nothing when of= is a proven file or /dev/null."""
+    words = operand_words(stage)
+    of = [w[3:] for w in words[1:] if w.startswith("of=")]
+    return words[:1] == ["dd"] and bool(of) and target_kind(of[-1], text) != "terminal"
 
 
 def canon_path(t):
@@ -1239,10 +1660,9 @@ def unlisted_reader_findings(text):
     code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
     for m in OUT_REDIRECT.finditer(code):
         t = m.group(2).strip("\"'")
-        # a literal target is a path with a slash (an absolute path or dir/name); /dev, /proc and dotdot are the terminal
-        plain = bool(re.fullmatch(r"[\w.\-]*(?:/+[\w.\-]+)+", t)) and not t.startswith(("/dev/", "/proc/")) \
-            and ".." not in t.split("/")
-        if re.fullmatch(VAR_PATH, t) or plain:
+        # a proven file target, and every literal path with a slash (#5602: no prefix is excluded)
+        kind = target_kind(redirect_word(code, m.end(1)), text)
+        if kind == "file" or kind == "terminal" and re.fullmatch(r"[\w.\-]*(?:/+[\w.\-]+)+", t):
             targets.add(canon_path(t))
     cds = []
     bad = []
@@ -1257,11 +1677,15 @@ def unlisted_reader_findings(text):
         for stage, _ in pipeline_stages(line):
             words = stage_words(stage).split()
             word = words[0] if words else ""
-            if not word or word in FILE_PRINTERS or silent_file_cmd(words) or word in ("printf", "echo"):
+            if word in ("cp", "install", "scp", "ln") and not silent_file_cmd(stage, text):
+                # #5602: whatever it copies, a destination not proven a file is the terminal
+                bad.append("%d:%s:copy to a target not proven a file" % (n, word))
+                continue
+            if not word or word in FILE_PRINTERS or silent_file_cmd(stage, text) or word in ("printf", "echo"):
                 continue
             body = canon_path(re.sub(r"(?:\d*>>?|&>>?|>\|)&?\s*(?:\"[^\"]*\"|'[^']*'|\S+)", "", stage))
             if (any(names_path(body, t) for t in targets) or any(names_path(body, b, True) for b in bare)) \
-                    and not stdout_to_file(stage):
+                    and not stdout_to_file(stage, text):
                 bad.append("%d:%s:unlisted file reader" % (n, word))
     return bad
 
@@ -1285,7 +1709,7 @@ def taint_findings(text, names):
                         and re.match(r"\|\s*(?:grep\s+-q\w*\s|curl\s|base64\b[^|]*\|\s*curl\s)", after):
                     continue
                 # A file is not the terminal; the last output redirect decides (#5412).
-                if stdout_to_file(args):
+                if stdout_to_file(args, text):
                     continue
             checked += 1
             rest = re.sub(helper, "", args)
@@ -1526,7 +1950,43 @@ def closed_world_taint(fs):
                         ("a read by an input redirect", 'lolcat < "$OUT_DIR/author.id"'),
                         ("a read of a file the probe wrote", 'printf %s x > "$OUT_DIR/r9"\nbat "$OUT_DIR/r9"'),
                         ("a read of a peers file", 'batcat "$OUT_DIR/peers.conf.node$n"'),
-                        ("an unlisted reader at the end of a pipe", 'true | perl -pe 1 "$OUT_DIR/author.id"')):
+                        ("an unlisted reader at the end of a pipe", 'true | perl -pe 1 "$OUT_DIR/author.id"'),
+                        # #5602: a target is a file only when it is proven under a FILE_ROOTS root with a canonical
+                        # remainder. The round-15 review mutants M1-M4, M8, M10, M12, then neighbours of the class.
+                        ("M1 cp to a doubled-slash tty", 'printf %s x > "$OUT_DIR/r9"\ncp "$OUT_DIR/r9" //dev/tty'),
+                        ("M2 cp to a dot-segment stdout", 'printf %s x > "$OUT_DIR/r9"\ncp "$OUT_DIR/r9" /./dev/stdout'),
+                        ("M3 a write to a doubled-slash tty", 'printf %s "$qjson" > //dev/tty'),
+                        ("M4 a write to a dot-segment tty", 'printf %s "$qjson" > /./dev/tty'),
+                        ("M8 cp into a doubled-slash fd directory", 'printf %s x > "$OUT_DIR/r9"\ncp --target-directory=//dev/fd "$OUT_DIR/r9"'),
+                        ("M10 a write to a doubled-slash proc fd", 'printf %s "$qjson" > //proc/self/fd/2'),
+                        ("M12 install to a doubled-slash stdout", 'printf %s x > "$OUT_DIR/r9"\ninstall -m 0644 "$OUT_DIR/r9" //dev/stdout'),
+                        ("a write to /dev/fd/2", 'printf %s "$qjson" > /dev/fd/2'),
+                        ("a write to /proc/self/fd/1", 'printf %s "$qjson" > /proc/self/fd/1'),
+                        ("a write to a quoted /dev/stderr", 'printf %s "$qjson" > "/dev/stderr"'),
+                        ("a write to an unquoted /dev/stderr", 'printf %s "$qjson" > /dev/stderr'),
+                        ("a write to a variable never assigned", 'printf %s "$qjson" > "$LOGF"'),
+                        ("a write to a variable holding a doubled-slash path", 'd=//dev\nprintf %s "$qjson" > "$d/tty"'),
+                        ("an append to a doubled-slash tty", 'printf %s "$qjson" >> //dev/tty'),
+                        ("a clobber write to a dot-segment tty", 'printf %s "$qjson" >| /./dev/tty'),
+                        ("an &> to a doubled-slash stderr", 'printf %s "$qjson" &> //dev/stderr'),
+                        ("a here-document to a doubled-slash tty", 'cat > //dev/tty <<EOT\nx $qjson\nEOT'),
+                        ("a write to a dot segment under the root", 'printf %s "$qjson" > "$OUT_DIR/./r"'),
+                        ("a write to an empty segment under the root", 'printf %s "$qjson" > "$OUT_DIR//r"'),
+                        ("a write to the root itself", 'printf %s "$qjson" > "$OUT_DIR"'),
+                        ("a write under a directory that is not a root", 'printf %s "$qjson" > "$HERE/r"'),
+                        ("a write through a segment that may be dot", 'x=.\nprintf %s "$qjson" > "$OUT_DIR/$x"'),
+                        ("a write through a glob segment", 'printf %s "$qjson" > "$OUT_DIR"/r*'),
+                        ("dd of a written file to a doubled-slash tty", 'printf %s x > "$OUT_DIR/r9"\ndd if="$OUT_DIR/r9" of=//dev/tty'),
+                        ("dd from stdin to the tty", 'printf %s "$qjson" | dd of=/dev/tty'),
+                        ("cp -t into the fd directory", 'printf %s x > "$OUT_DIR/r9"\ncp -t /dev/fd "$OUT_DIR/r9"'),
+                        ("install -D to a dot-segment stdout", 'printf %s x > "$OUT_DIR/r9"\ninstall -D "$OUT_DIR/r9" /./dev/stdout'),
+                        ("ln of the tty into a written path", 'ln -sf /dev/tty "$OUT_DIR/r9"\nprintf %s "$qjson" > "$OUT_DIR/r9"'),
+                        ("an scp download to the tty", 'scp -q h:/etc/x //dev/tty'),
+                        ("an scp download to a variable never assigned", 'scp -q h:/etc/x "$DESTF"'),
+                        ("an scp download named by an array the script does not check", 'ARR=(a)\nscp -q h:/x "$OUT_DIR/${ARR[0]}.pub"'),
+                        ("an append to the checked identity array", 'FED_IDS+=(x)\nscp -q h:/x "$OUT_DIR/${FED_IDS[0]}.pub"'),
+                        ("a trap whose handler prints a written file", 'printf %s x > "$OUT_DIR/r9"\ntrap \'iconv "$OUT_DIR/r9"\' EXIT'),
+                        ("exec of a command on a written file", 'printf %s x > "$OUT_DIR/r9"\nexec iconv "$OUT_DIR/r9"')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
         probe("V1 closed-world negative control is flagged: %s" % label, len(b2) > len(bad), str(b2[len(bad):][:2]))
     # #5236: constructs a name-based scan cannot follow are not allowed in federate.sh at all.
@@ -1620,7 +2080,20 @@ def closed_world_taint(fs):
                         ("export with the reply as a value", 'export v="$qjson"'),
                         ("readonly with the reply as a value", 'readonly v=$qjson'),
                         ("a filter fed the reply on stdin", "nb=\"$(printf '%s' \"$qjson\" | tr -d x | wc -c)\""),
-                        ("a test after elif, else and while", 'if false; then :; elif [ "$qjson" = x ]; then :; else [[ "$qjson" == y ]]; fi\nwhile [ "$qjson" = z ]; do :; done')):
+                        ("a test after elif, else and while", 'if false; then :; elif [ "$qjson" = x ]; then :; else [[ "$qjson" == y ]]; fi\nwhile [ "$qjson" = z ]; do :; done'),
+                        # #5602: proven file targets stay files.
+                        ("a write under a nested proven path", 'printf %s "$qjson" > "$OUT_DIR/peers/r"'),
+                        ("a write through a variable holding a proven path", 'f="$OUT_DIR/r9"\nprintf %s "$qjson" > "$f"'),
+                        ("a write to a dated name", 'printf %s "$qjson" > "$OUT_DIR/r.$(date -u +%Y%m%d)"'),
+                        ("a write to a mktemp name under a root", 'k="$(mktemp -u "$run_dir/.k.XXXXXXXX")"\nprintf %s "$qjson" > "$k"'),
+                        ("an scp download to a proven file", 'scp -q h:/x "$OUT_DIR/r9" >/dev/null 2>&1'),
+                        ("an scp download named by the checked identity array", 'scp -q h:/x "$OUT_DIR/${FED_IDS[0]}.pub"'),
+                        ("install -d of the run directory", 'install -d -m 0700 "$run_dir"'),
+                        ("install -D to a proven nested file", 'printf %s x > "$OUT_DIR/r9"\ninstall -D -m 0600 "$OUT_DIR/r9" "$run_dir/sub/r"'),
+                        ("cp -t into a proven directory", 'printf %s x > "$OUT_DIR/r9"\ncp -t "$run_dir" "$OUT_DIR/r9"'),
+                        ("dd of a written file to a proven file", 'printf %s x > "$OUT_DIR/r9"\ndd if="$OUT_DIR/r9" of="$OUT_DIR/r8" 2>/dev/null'),
+                        ("a trap that removes a written file", 'printf %s x > "$OUT_DIR/r9"\ntrap \'rm -f -- "$OUT_DIR/r9"; exit 130\' INT'),
+                        ("exec that opens a proven file", 'exec 8> "$OUT_DIR/r9"')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
         probe("V1 closed-world control is accepted: %s" % label, len(b2) == len(bad), str(b2[len(bad):][:2]))
 
@@ -1631,9 +2104,10 @@ def n1_no_locale_ranges():
     for g in guards:
         probe("N1 guard has no locale-dependent range: " + g.strip()[:60], re.search(r"\[[^\]]*\w-\w[^\]]*\]", g) is None)
     # Every bash =~ check in the three shipped shell surfaces (the key guards, the node_get id
-    # check, the spawn.sh URL check): a range matches non-ASCII code points under UTF-8 locales.
+    # check, the spawn.sh URL check, the #5602 fed_identity check): a range matches non-ASCII code points under
+    # UTF-8 locales.
     allre = [l for l in (TPL.read_text() + FED.read_text() + SPAWN.read_text()).splitlines() if "=~" in l and not l.lstrip().startswith("#")]
-    probe("N1 seven =~ checks found", len(allre) == 7, str(len(allre)))
+    probe("N1 eight =~ checks found", len(allre) == 8, str(len(allre)))
     for g in allre:
         probe("N1 =~ check has no locale-dependent range: " + g.strip()[:60], re.search(r"\[[^\]]*\w-\w[^\]]*\]", g) is None)
 
@@ -2032,6 +2506,9 @@ def comment_pin_5416():
     probe("#5418 the closed-world comment states that an undecidable form is reported", "#5418" in block
           and "a form it cannot decide is reported" in block and "is not resolved" not in block
           and "is not followed" not in block, "")
+    probe("#5602 the closed-world comment states the proven-file rule for targets", "#5602" in block
+          and "every literal path\n#    included, is the terminal" in block and "only a plain path" not in block
+          and "starts with a literal character" not in block, "")
     changelog = (ROOT / "changelog.d" / "4654.fixed.md").read_text()
     probe("#5416 the changelog does not call any member of the allowed set a known silent consumer",
           "known silent consumer" not in changelog and "#5418" in changelog, "")
@@ -2039,7 +2516,9 @@ def comment_pin_5416():
 
 def f2_id_lists_agree():
     fs = FED.read_text()
-    lists = re.findall(r"\^(\[[^\]]*\])\{1,64\}\$", "\n".join(l for l in fs.splitlines() if "=~" in l and "1,64" in l))
+    # the #5602 fed_identity check also allows ":" (a federation identity is ai:<name>); it is not an id check
+    lists = re.findall(r"\^(\[[^\]]*\])\{1,64\}\$", "\n".join(l for l in fs.splitlines() if "=~" in l and "1,64" in l
+                                                             and '"$fid"' not in l))
     probe("F2 plain_id and node_get accept the same id characters", len(lists) == 2 and set(lists[0]) == set(lists[1]), str(len(lists)))
 
 

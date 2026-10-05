@@ -94,6 +94,10 @@ read_nodes() {
   PUBLIC_IPS=($(echo "$NODES_JSON" | jq -r '.[].public_ip'))
   PRIVATE_IPS=($(echo "$NODES_JSON" | jq -r '.[].private_ip'))
   FED_IDS=($(echo "$NODES_JSON" | jq -r '.[].fed_identity'))
+  # #5602: an identity names the peer key file under $OUT_DIR, so it must be a plain name (no /, . or glob).
+  for fid in "${FED_IDS[@]}"; do
+    [[ "$fid" =~ ^[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_:-]{1,64}$ ]] || die "a fed_identity in the terraform outputs is not a plain name"
+  done
   PEER_URLS=($(echo "$NODES_JSON" | jq -r '.[].peer_url'))
   echo "[federate] ${NODE_COUNT} memory nodes:"
   for i in $(seq 0 $((NODE_COUNT - 1))); do
@@ -298,9 +302,12 @@ node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; 
 #  - a command that reads a file or an input redirect and is the last stage of a pipeline prints that
 #    file, so it is refused unless its output goes to a file, it is wc or curl, or it is grep with a
 #    -q, -c, -l or -L style flag (#5409);
-#  - a redirect decides where output goes by the LAST fd-1 redirect: only a plain path or /dev/null is a
-#    file; a dup, any other /dev path, /proc, or a target computed by a command substitution, a
-#    backtick or a process substitution is the terminal (#5412);
+#  - a redirect decides where output goes by the LAST fd-1 redirect; a dup, or a target computed by a
+#    command substitution, a backtick or a process substitution, is the terminal (#5412);
+#  - a write, cp, install, scp download, ln or dd target is a file only when it is proven to sit under
+#    $OUT_DIR or $run_dir with a canonical remainder (no empty, . or .. segment, no glob, brace or tilde,
+#    no expansion the scan does not model), or is /dev/null; every other target, every literal path
+#    included, is the terminal, and a cp, install, scp download or ln to it is refused (#5602);
 #  - a pipe into base64 is exempt only when it continues into curl, and the b64 helper only while its
 #    body is exactly the pinned one (#5413);
 #  - a function that wraps a node channel is followed as a source, in every spelling of the definition
@@ -309,10 +316,10 @@ node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; 
 #    here-documents not fed to a node, indexed and escaped-space assignments, default-assign and :?
 #    expansions, let, ((, process substitution and backticks (#5236, #5359, #5407, #5408, #5410).
 # It is a static aid and not a proof; a form it cannot decide is reported, not trusted (#5418, #5523):
-# a redirect target with an expansion or a glob is a
-# file only as "$VAR/<segments>" where each segment starts with a literal character, so a target held in a
-# variable, a segment held in a variable, and any ".." segment count as the terminal; the VALUE of a
-# variable inside a segment (r$n) and symbolic links are not decided. A command it does not list that
+# a variable in a target is followed through every value this script assigns it, and a value it
+# cannot read (a parameter, the environment, a command substitution other than date, mktemp or seq)
+# is not proven; ${V:-x} is taken as x, so a root moved by the environment is not decided, and nor
+# are symbolic links. An identity in FED_IDS is a plain name because read_nodes checks it. A command it does not list that
 # names a file this script writes is reported unless it ends in a file redirect or is a silent file
 # command (#5525): a written file is a "$VAR/..." target or a literal path with a slash, compared in one
 # spelling (braced variables, no quotes), and after a cd into its directory its bare name counts. A file
