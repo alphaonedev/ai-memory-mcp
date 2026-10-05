@@ -227,12 +227,18 @@ Entry = Tuple[str, str, str]  # (relative path, normalised text, context fingerp
 CTX = re.compile(r" \| ctx:([0-9a-f]{12})$")  # R7: an allowlist entry is bound to its neighbourhood
 
 
+# #5365: markdown underscore emphasis (_word_, __two words__) is markup like the backtick and the asterisk: a span that
+# opens at a word edge and closes at a word edge loses its underscores (never one inside a word: pool_mode, sqlx_s_)
+# so the word boundary \b sees the word.
+_EMPHASIS = re.compile(r"(?<![^\W_])(_{1,2})(?=[^\W_])(.+?)(?<=[^\W_])\1(?![^\W_])")
+
+
 def normalise(line: str) -> str:
     fence = line.strip()
     if FENCE.match(fence):
         return fence.casefold()  # kept whole: a fence is a neutral context line (R6)
     text = (TAG_LONG if len(line) > LONG_LINE else TAG).sub("", html.unescape(line))
-    text = re.sub(r"[`*]", "", text)
+    text = _EMPHASIS.sub(r"\2", re.sub(r"[`*]", "", text))
     return " ".join(text.split()).casefold()
 
 
@@ -841,6 +847,10 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("R9 #5364: the last override control on a line with no pool word", "docs/a.md", "Use it\u202e now.\n"),
     ("R9 #5364: the last isolate control on a line with no pool word", "docs/a.md", "Use it\u2069 now.\n"),
     ("R9 #5364: the first isolate control on a line with no pool word", "docs/a.md", "Use it\u2066 now.\n"),
+    # #5365: markdown underscore emphasis wraps the mode word
+    ("R1 #5365: single underscore emphasis on the mode word", "docs/a.md", "Run PgBouncer in _transaction_ mode.\n"),
+    ("R1 #5365: double underscore emphasis over mode and pooling", "docs/a.md", "Use __transaction pooling__.\n"),
+    ("R1 #5365: underscore emphasis on the second word only", "docs/a.md", "Use pooling _transaction_ everywhere.\n"),
     ("R9 #5363: a letter the fold does not know, spaced, on a pool line", "docs/a.md", "Run PgBouncer in \u0434\u0436\u0437\u0438\u044f mode.\n"),
     ("R9 #5363: small capitals on a config context line fold to the mode word", "docs/a.md",
      "```ini\npool_mode = session\ndefault = \u1d1b\u0280\u1d00\u0274s\u1d00\u1d04\u1d1b\u026a\u1d0f\u0274\n```\n"),
@@ -1107,6 +1117,15 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
          tree({"docs/a.md": one}, REASON + ent("docs/a.md", one, "transaction mode is not supported.") * 2), EXIT_FAULT),
         ("one entry does not cover a second occurrence",
          tree({"docs/a.md": dup}, REASON + ent("docs/a.md", dup, "transaction mode is not supported.")), EXIT_FINDING),
+        # #5365: an underscore inside a word (sqlx_s_, _b_c) is not emphasis, so the entry keeps it
+        ("an underscore at the end of a word stays in the entry text",
+         tree({"docs/a.md": "Old sqlx_s_ transaction mode is not supported.\n"},
+              REASON + ent("docs/a.md", "Old sqlx_s_ transaction mode is not supported.",
+                           "old sqlx_s_ transaction mode is not supported.")), EXIT_OK),
+        ("an underscore at the start of a word stays in the entry text",
+         tree({"docs/a.md": "Old _b_c transaction mode is not supported.\n"},
+              REASON + ent("docs/a.md", "Old _b_c transaction mode is not supported.",
+                           "old _b_c transaction mode is not supported.")), EXIT_OK),
         ("non-normalised allowlist text fails",
          tree({"docs/a.md": one}, REASON + ent("docs/a.md", one, "transaction mode is not supported.").replace("| t", "| T")), EXIT_FAULT),
         ("an entry without a context fingerprint fails",
@@ -1352,6 +1371,10 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("R9 needs a pool word", "or bool(_QUICK.search(shadow(text))) or _lookalike", "or True or _lookalike"),
     ("R9 colour codes dropped", '    plain = _ANSI_CSI.sub("", text)', "    plain = text"),
     ("R9 a character touching a letter", "        elif (i and _ascii_letter(view[i - 1])) or (i + 1 < len(view) and _ascii_letter(view[i + 1])):", "        elif False:"),
+    ("R1 #5365 emphasis opens at a word edge", "(?<![^\\W_])(_{1,2})", "(_{1,2})"),
+    ("R1 #5365 emphasis closes at a word edge", "\\1(?![^\\W_])", "\\1"),
+    ("R1 #5365 emphasis may use two underscores", "(_{1,2})(?=", "(_)(?="),
+    ("R1 #5365 emphasis is stripped", '    text = _EMPHASIS.sub(r"\\2", re.sub(r"[`*]", "", text))', '    text = re.sub(r"[`*]", "", text)'),
     ("R9 #5364 bidi controls are reported", "    found |= {c for c in plain if c in BIDI}", "    found |= set()"),
     ("R9 #5364 a bidi control makes a line unreadable on its own", 'or any(c in BIDI for c in hidden) or', "or"),
     ("R9 #5364 bidi set keeps the overrides", "list(range(0x202A, 0x202F))", "list(range(0x202A, 0x202A))"),

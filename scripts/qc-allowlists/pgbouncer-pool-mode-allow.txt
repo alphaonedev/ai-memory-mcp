@@ -209,7 +209,10 @@ infra/pgbouncer/smoke-test.py | if r.get("pool_mode") not in (none, "", "session
 infra/pgbouncer/smoke-test.py | if row[0]["pool_mode"] != "session": | ctx:9587a486ef34
 infra/pgbouncer/smoke-test.py | print(" effective pool_mode for %s@ai_memory = %s" % (app_role, row[0]["pool_mode"])) | ctx:6aa68c3ff64d
 infra/pgbouncer/smoke-test.py | print("[4/6] pooler is in session mode (show config as the stats role) ...") | ctx:4595c7a5018d
-infra/pgbouncer/smoke-test.py | print("pass: pgbouncer pooler validated (session mode, scram, tls on both hops, age cypher through the pooler).") | ctx:bb61c2c73e20
+# #4710 R3 (regen --accept-new, reviewed line by line): smoke test (#4742 effective-mode checks, #4954): code and messages that read the observed mode or fail unless it is session; none selects another mode
+# context re-read on 2026-10-04: Neighbourhood now strips markdown underscore emphasis, so the nearby __name__ guard line normalises to name (#5365); the unit text is unchanged and states session mode.
+infra/pgbouncer/smoke-test.py | print("pass: pgbouncer pooler validated (session mode, scram, tls on both hops, age cypher through the pooler).") | ctx:675ee1365f42
+# #4710 R3 (regen --accept-new, reviewed line by line): smoke test (#4742 effective-mode checks, #4954): code and messages that read the observed mode or fail unless it is session; none selects another mode
 infra/pgbouncer/smoke-test.py | raise failure("show %s: %s overrides pool_mode to %r, want 'session' (#4742)" % ( | ctx:8c83f56c09e9
 infra/pgbouncer/smoke-test.py | raise failure("show pools has no ai_memory/%s row with a pool_mode column (#4742)" % app_role) | ctx:0daf68cff44a
 infra/pgbouncer/smoke-test.py | raise failure("the ai_memory pool runs pool_mode %r, want 'session' (#4742)" % row[0]["pool_mode"]) | ctx:8d2776367ed8
