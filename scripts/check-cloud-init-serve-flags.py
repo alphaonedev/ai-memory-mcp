@@ -3918,6 +3918,7 @@ def spelling_outputs(base: tuple, text: str) -> list:
     return outs
 
 
+SPELL_DISPLAY_ONLY = frozenset({"continuation-url-userinfo"})  # a URL rule reads one line; only the displayed form is printed
 SPELL_REGISTRY_ONLY = frozenset({"yaml-folded"})  # a block scalar line has no keyword on it, only the registry can hide it
 
 
@@ -3937,6 +3938,15 @@ def layer_problems() -> list:
             CRED_PIECES.clear()
             if label not in SPELL_REGISTRY_ONLY and any(n in scrub(shown) for n in CRED_NEEDLES):
                 bad.append("%s %s: the keyword and URL rules alone left a byte of the password" % (cls, label))
+            if label not in SPELL_REGISTRY_ONLY | SPELL_DISPLAY_ONLY and any(n in scrub(text) for n in CRED_NEEDLES):
+                bad.append("%s %s: the keyword rule alone left a byte of the raw continuation" % (cls, label))
+        # a reference-shaped value whose parts are all shorter than three characters is not covered
+        # by the alphanumeric runs: only the whole value can be registered
+        for secret in ("data.a-b-c", "local.d-e-f", "var.g-h-i", "module.j-k-l"):
+            CRED_PIECES.clear()
+            register_credentials("PGPASSWORD=%s psql -h h" % secret)
+            if secret in mask_credentials("PGPASSWORD=%s psql -h h" % secret):
+                bad.append("F5 short reference %s: the registry kept the whole value readable" % secret)
     finally:
         CRED_PIECES.clear()
     return bad
