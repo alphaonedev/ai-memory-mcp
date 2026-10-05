@@ -174,6 +174,11 @@ def build_fixture(root):
     # Objects that exist but are not commits.
     shas["tree"] = run_git(repo, "rev-parse", "main^{tree}")
     shas["blob"] = run_git(repo, "rev-parse", "main:c1.txt")
+    # A commit object that is present but contained in no branch or tag: what a force-push leaves behind
+    # on a reused checkout after the old branch is deleted and the reflog is expired (#5670).
+    shas["orphan"] = run_git(repo, "commit-tree", shas["tree"], "-p", shas["c1"], "-m", "orphan")
+    if run_git(repo, "for-each-ref", "--contains", shas["orphan"]) != "":
+        raise RuntimeError("fixture orphan commit is reachable from a ref")
     shallow = root / "shallow"
     proc = subprocess.run(
         ["git", "clone", "-q", "--depth", "1", "file://" + str(repo), str(shallow)],
@@ -195,6 +200,11 @@ def cases(shas):
     case("push normal", "push", "%s..%s" % (c1, c3), before=c1, head=c3)
     case("push empty range (before == head)", "push", "%s..%s" % (c3, c3), before=c3, head=c3)
     case("push all-zero before", "push", None, before=ZERO_SHA, head=c3)
+    case("push force (before is not an ancestor of head)", "push", "%s..%s" % (b1, c3), before=b1, head=c3)
+    case("push before present but contained in no branch or tag", "push",
+         "%s..%s" % (shas["orphan"], c3), before=shas["orphan"], head=c3)
+    case("push head present but contained in no branch or tag", "push",
+         "%s..%s" % (c1, shas["orphan"]), before=c1, head=shas["orphan"])
     case("push unreachable before", "push", None, before=ghost, head=c3)
     case("push missing before", "push", None, head=c3)
     case("push empty before", "push", None, before="", head=c3)
