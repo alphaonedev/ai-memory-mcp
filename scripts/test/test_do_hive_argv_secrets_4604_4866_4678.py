@@ -1216,25 +1216,52 @@ def silent_file_cmd(words):
     return True
 
 
+def canon_path(t):
+    """#5525: one spelling of a path for the unlisted-reader comparison: quotes dropped, every variable in its
+    braced form (so $D/r and ${D}/r agree), repeated slashes and a leading ./ collapsed."""
+    t = re.sub(r"\$(\w+)", r"${\1}", t.replace("\"", "").replace("'", ""))
+    return re.sub(r"/{2,}", "/", t[2:] if t.startswith("./") else t)
+
+
+def names_path(body, path, bare=False):
+    """True when `body` names `path` (canonical). A bare name (after a cd) must be a whole word or ./word."""
+    if not bare:
+        return path in body if "${" in path else bool(re.search(r"(?<![\w.$}/-])" + re.escape(path) + r"(?![\w.$-])", body))
+    return bool(re.search(r"(?:(?<![\w.$}/-])|(?<=\./))" + re.escape(path) + r"(?![\w.$/-])", body))
+
+
 def unlisted_reader_findings(text):
-    """#5418: a stage outside FILE_PRINTERS and SILENT_FILE_CMDS that names a file this script redirects output to
-    (as an operand or as an input redirect) is a reader the scan does not model, so it is reported."""
+    """#5418, #5525: a stage outside FILE_PRINTERS and SILENT_FILE_CMDS that names a file this script redirects
+    output to (as an operand or an input redirect) is a reader the scan does not model, so it is reported. The
+    written files are the "$VAR/..." targets and the literal plain-file targets; each is compared in one canonical
+    spelling (braced variables, no quotes); after a cd into a written file's directory its bare name counts."""
     targets = set()
-    for m in OUT_REDIRECT.finditer(text):
+    code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    for m in OUT_REDIRECT.finditer(code):
         t = m.group(2).strip("\"'")
-        if re.fullmatch(VAR_PATH, t):
-            targets.add(t)
+        # a literal target is a path with a slash (an absolute path or dir/name); /dev, /proc and dotdot are the terminal
+        plain = bool(re.fullmatch(r"[\w.\-]*(?:/+[\w.\-]+)+", t)) and not t.startswith(("/dev/", "/proc/")) \
+            and ".." not in t.split("/")
+        if re.fullmatch(VAR_PATH, t) or plain:
+            targets.add(canon_path(t))
+    cds = []
     bad = []
+    for n, line, func in logical_lines(text):
+        for m in re.finditer(r"(?:^|[;&|(]\s*)cd\s+(?:--\s+)?(\"[^\"]*\"|'[^']*'|[^\s;&|)]+)", line):
+            cds.append((n, canon_path(m.group(1)).rstrip("/")))
     for n, line, func in logical_lines(text):
         if func in ALLOWED or re.match(r"^\s*(?:ok|no|die)\(\) \{", line) or b64_pinned(line):
             continue
+        bare = {t.rsplit("/", 1)[1] for t in targets if "/" in t
+                and any(cn <= n and cd == t.rsplit("/", 1)[0] for cn, cd in cds)}
         for stage, _ in pipeline_stages(line):
             words = stage_words(stage).split()
             word = words[0] if words else ""
             if not word or word in FILE_PRINTERS or silent_file_cmd(words) or word in ("printf", "echo"):
                 continue
-            body = re.sub(r"(?:\d*>>?|&>>?|>\|)&?\s*(?:\"[^\"]*\"|'[^']*'|\S+)", "", stage)
-            if any(t in body for t in targets) and not stdout_to_file(stage):
+            body = canon_path(re.sub(r"(?:\d*>>?|&>>?|>\|)&?\s*(?:\"[^\"]*\"|'[^']*'|\S+)", "", stage))
+            if (any(names_path(body, t) for t in targets) or any(names_path(body, b, True) for b in bare)) \
+                    and not stdout_to_file(stage):
                 bad.append("%d:%s:unlisted file reader" % (n, word))
     return bad
 
@@ -1487,6 +1514,12 @@ def closed_world_taint(fs):
                         ("a write to a brace-expanded target", 'printf %s "$qjson" > /dev/{stderr,null}'),
                         ("an append to a target held in a variable", 'dest=/dev/stderr\nprintf %s "$qjson" >> "$dest"'),
                         ("a here-document to a target held in a variable", 'dest=/dev/pts/1\ncat > "$dest" <<EOT\nx $qjson\nEOT'),
+                        # #5525: other spellings of a written path.
+                        ("a braced spelling of a written path", 'printf %s x > "$OUT_DIR/r9"\niconv "${OUT_DIR}/r9"'),
+                        ("a split-quote spelling of a written path", 'printf %s x > "$OUT_DIR/r9"\niconv "$OUT_DIR"/r9'),
+                        ("a read of a literal written path", 'printf %s x > /var/tmp/r9\niconv /var/tmp/r9'),
+                        ("a read after cd into the written directory", 'printf %s x > "$OUT_DIR/r9"\ncd "$OUT_DIR" && iconv r9'),
+                        ("a ./ read after cd into the written directory", 'printf %s x > "$OUT_DIR/r9"\ncd -- "$OUT_DIR"\niconv ./r9'),
                         ("a read by perl", 'perl -pe 1 "$OUT_DIR/author.id"'),
                         ("a read by python", "python3 -c 'import sys;print(open(sys.argv[1]).read())' \"$OUT_DIR/author.pub\""),
                         ("a read by bat", 'bat "$OUT_DIR/author.id"'),
@@ -1573,6 +1606,10 @@ def closed_world_taint(fs):
                         ("cmp -s of a written file", 'printf %s x > "$OUT_DIR/r9"\ncmp -s "$OUT_DIR/r9" "$OUT_DIR/author.id"'),
                         ("cmp of a written file", 'printf %s x > "$OUT_DIR/r9"\ncmp "$OUT_DIR/r9" "$OUT_DIR/author.id" >/dev/null'),
                         ("ln of a written file", 'printf %s x > "$OUT_DIR/r9"\nln -sf "$OUT_DIR/r9" "$OUT_DIR/r8"'),
+                        ("a listed printer of a braced written path", 'printf %s x > "$OUT_DIR/r9"\nhead -c 1 -- "${OUT_DIR}/r9" | LC_ALL=C grep -q x'),
+                        ("a reader of another literal path", 'printf %s x > /var/tmp/r9\niconv /var/tmp/r90'),
+                        ("a read after cd into another directory", 'printf %s x > "$OUT_DIR/r9"\ncd "$HERE" && iconv r9'),
+                        ("a read of a different name after cd", 'printf %s x > "$OUT_DIR/r9"\ncd "$OUT_DIR" && iconv r90'),
                         ("a file under a nested directory", 'printf %s "$qjson" > "$OUT_DIR/sub/r.txt"'),
                         ("a reader with only stderr sent to a written file", 'printf %s x > "$OUT_DIR/r9"\nbat /etc/hostname 2> "$OUT_DIR/r9"'),
                         ("a here-document to a file", 'cat > "$OUT_DIR/r" <<EOT\nx $qjson\nEOT'),

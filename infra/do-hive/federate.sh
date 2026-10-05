@@ -314,7 +314,10 @@ node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; 
 # variable, a segment held in a variable, and any ".." segment count as the terminal; the VALUE of a
 # variable inside a segment (r$n) and symbolic links are not decided. A command it does not list that
 # names a file this script writes is reported unless it ends in a file redirect or is a silent file
-# command. Whole-verify probes check the printed bytes.
+# command (#5525): a written file is a "$VAR/..." target or a literal path with a slash, compared in one
+# spelling (braced variables, no quotes), and after a cd into its directory its bare name counts. A file
+# written by a relative name alone, or reached through a link, is not decided. Whole-verify probes check
+# the printed bytes.
 # reply_status prints a 3-digit HTTP
 # status, or the word non-status for anything else. reply_len prints the reply's byte count.
 # reply_version prints a version token only when it is 1 to 3 dot-separated groups of 1 to 3 ASCII
