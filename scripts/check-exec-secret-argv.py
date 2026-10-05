@@ -2034,6 +2034,7 @@ ROUND3_RED = [
     ('5684 mutant pin: reported 1: an operand after old-password or pass is a credential when it is not led by a dollar sign', 'mysqladmin old-password "x$NEW"'),
     ('5684 mutant pin: reported 2: an operand after old-password or pass is a credential when it is not led by a dollar sign', 'mariadb-admin pass "x$X"'),
     ('5685 mutant pin: reported 1: an expansion inside a long option name is reported', 'mysql --$OPT db'),
+    ('5689 mutant pin: reported 1: a head under a libexec directory is a command', '/usr/libexec/mysqlcheck --password="$X"'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
