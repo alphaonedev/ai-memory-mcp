@@ -848,6 +848,11 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("R9: three look-alikes the fold does not know", "docs/a.md", "Run PgBouncer in tr\u0251ns\u0251cti\u0254n mode.\n"),
     ("R9: a control character inside a word", "docs/a.md", "Run PgBouncer in tra\x01nsaction mode.\n"),
     ("R9: a symbol joined to the words of a pooler line", "docs/a.md", "Set the pooler to tr\u2016ansaction.\n"),
+    # round-7 sweep: look-alike scripts, markup inside a word, a pool word hidden behind a look-alike letter
+    ("R9 sweep: a four-letter Coptic word", "docs/a.md", "Use \u2ca6\u2ca2\u2c80\u2c9a here.\n"),
+    ("R9 sweep: a four-letter Cherokee word", "docs/a.md", "Use \u13a2\u13a3\u13a4\u13a5 here.\n"),
+    ("R9 sweep: a pool word spelled with look-alike letters on a line with a hiding symbol", "docs/a.md", "Use p\u043e\u043el ab\u2016 here.\n"),
+    ("R1 sweep: asterisks inside the mode word", "docs/a.md", "Run PgBouncer in tran*sac*tion mode.\n"),
     # #5370: R9 reads the neighbour on each side of a hiding symbol on its own
     ("R9 #5370: a symbol touching an ASCII letter on its left only", "docs/a.md", "Our pgbouncer runs ab\u2016 for the api tier.\n"),
     ("R9 #5370: a symbol touching an ASCII letter on its right only", "docs/a.md", "Our pgbouncer runs \u2016ab for the api tier.\n"),
@@ -989,6 +994,7 @@ PLANTED: List[Tuple[str, str, str]] = [
 
 # Green probes: one per approved shape, plus neutral context and path tokens.
 GREEN: List[Tuple[str, str, str]] = [
+    ("R9 sweep: a private-mode terminal code on a pooler line renders as nothing", "docs/a.md", "\x1b[?25lour pgbouncer runs the api\x1b[?25h\n"),
     ("R9 #5370: a symbol set apart by spaces hides no word", "docs/a.md", "Our pgbouncer runs \u2016 ab for the api tier.\n"),
     ("R9 #5370: a symbol first on the line does not read the last letter", "docs/a.md", "\u2016 our pgbouncer runs the api\n"),
     ("R9 #5370: a symbol last on the line reads no neighbour past the end", "docs/a.md", "our pgbouncer runs the api \u2016\n"),
@@ -1193,6 +1199,17 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
          tree({"docs/a.md": "```ini\npool_mode = session\ndefault = tr\u0578\u0578saction\n```\n"}), EXIT_FINDING),
         ("a mode word with three foreign letters is not folded",
          tree({"docs/a.md": "```ini\npool_mode = session\ndefault = tr\u0578\u0578\u0578action\n```\n"}), EXIT_OK),
+        # round-7 sweep: alternatives of the forbidden shapes, the spaced skip path, and lazy emphasis spans
+        ("an entry with a statement export is refused",
+         tree({"infra/x/setup.sh": "export pgbouncer_pool_mode=statement\n"}, REASON + ent("infra/x/setup.sh", "export pgbouncer_pool_mode=statement\n", "export pgbouncer_pool_mode=statement")), EXIT_FAULT),
+        ("an entry with a poolmode export is refused",
+         tree({"infra/x/setup.sh": "export poolmode=transaction\n"}, REASON + ent("infra/x/setup.sh", "export poolmode=transaction\n", "export poolmode=transaction")), EXIT_FAULT),
+        ("a skip entry names one exact path without spaces",
+         tree({"docs/a b.pdf": b"%PDF-1.7\n\x93\xff\0"}, unread=UNREAD_REASON + "docs/a b.pdf\n"), EXIT_FAULT),
+        ("two emphasis spans on one line lose their underscores separately",
+         tree({"docs/a.md": "Old _a_ x _b_ transaction mode is not supported.\n"},
+              REASON + ent("docs/a.md", "Old _a_ x _b_ transaction mode is not supported.",
+                           "old a x b transaction mode is not supported.")), EXIT_OK),
         # files read, not skipped (#5086, #5090)
         ("NUL bytes in a markdown file fail closed", tree({"docs/n.md": "\0\nRun PgBouncer in transaction mode.\n"}), EXIT_FAULT),
         ("a gzip document fails closed", tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}), EXIT_FAULT),
@@ -1378,6 +1395,15 @@ MUTANTS: List[Tuple[str, str, str]] = [
      "        elif (i and _ascii_letter(view[i - 1])):"),
     ("R9 first character has no left neighbour (#5370)", "        elif (i and _ascii_letter(view[i - 1]))", "        elif (_ascii_letter(view[i - 1]))"),
     ("R9 last character has no right neighbour (#5370)", "or (i + 1 < len(view) and _ascii_letter(view[i + 1])):", "or (_ascii_letter(view[i + 1])):"),
+    ("R9 Coptic is a look-alike script (sweep)", ', "COPTIC"))', "))"),
+    ("R9 Cherokee is a look-alike script (sweep)", '"ARMENIAN", "CHEROKEE", "COPTIC"', '"ARMENIAN", "COPTIC"'),
+    ("R9 pool word read on the shadow view (sweep)", "or bool(_QUICK.search(shadow(text)))", "or bool(_QUICK.search(text))"),
+    ("R1 asterisks stripped (sweep)", 're.sub(r"[`*]", "", text)', 're.sub(r"[`]", "", text)'),
+    ("R9 private-mode terminal codes (sweep)", "[0-9;?]*[A-Za-z]", "[0-9;]*[A-Za-z]"),
+    ("A1 forbidden statement alternative (sweep)", '[\\"\']?(?:transaction|statement)\\b"),\n    re.compile(r"[\\"\'][a-z0-9_.]*pool', '[\\"\']?(?:transaction)\\b"),\n    re.compile(r"[\\"\'][a-z0-9_.]*pool'),
+    ("A1 forbidden key without separator (sweep)", '[\\"\']?[a-z0-9_.]*pool[_-]?mode[\\"\']?[=\\s]', '[\\"\']?[a-z0-9_.]*pool_mode[\\"\']?[=\\s]'),
+    ("F1 skip entry has no spaces (sweep)", '        if " " in line or problem or line in listed:', '        if problem or line in listed:'),
+    ("R1 emphasis span is lazy (sweep)", "(.+?)(?<=[^\\W_])\\1", "(.+)(?<=[^\\W_])\\1"),
     ("F1 the suffix is read case-blind (#5367)", "Path(line).suffix.lower() not in BINARY_SUFFIXES", "Path(line).suffix not in BINARY_SUFFIXES"),
     ("F1 NUL bytes in non-UTF-16 text", "            if utf8 and b\"\\0\" in chunk:", "            if False:"),
     ("F1 BOM-less UTF-16", "    if len(zeros) * 4 >= min(len(head), CHUNK_BYTES) > 0:", "    if False:"),
