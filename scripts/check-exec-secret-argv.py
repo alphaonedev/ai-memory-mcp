@@ -2093,6 +2093,7 @@ ROUND3_GREEN = [
     ('5686 mutant pin: clean 1: the maximum- prefix of a long option is read', 'mysql --maximum-max-allowed-packet="$X" db'),
     ('5687 mutant pin: clean 1: the -v letter takes no value', 'mysqldump -v "pre$DB"'),
     ('5688 mutant pin: clean 1: the -S letter takes a socket value', 'mysql -S "$SOCK" db'),
+    ('5690 mutant pin: clean 1: a command substitution that closes ends the command', 'v=$(mysql -N --foo=r) $X'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
