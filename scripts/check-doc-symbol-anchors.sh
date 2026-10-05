@@ -1324,6 +1324,20 @@ PYEOF
     anchor_red_cites 5612 BARE_QUAL "a named plus entity between bounds" \
         "$R::NoSuch" "See <code>$R::&lt;dyn RecallTool &plus; NoSuch&gt;::decorate_memory_many</code> here."
 
+    # #5613 (review item N-2): pin the #5536 repro and its self-type sibling
+    # so that every spaced closer is counted and a spaced extra closer after a
+    # self type still continues the path.
+    anchor_red 5613 BARE_QUAL "the #5536 repro: a spaced extra closer and a spaced separator" \
+        "See $R::RecallTool<T> > ::NoSuch here."
+    anchor_red 5613 BARE_QUAL "a plain component, a spaced closer and a spaced separator" \
+        "See $R::RecallTool > ::NoSuch here."
+    anchor_red 5613 BARE_QUAL "two spaced extra closers" \
+        "See $R::RecallTool<T> > > ::NoSuch here."
+    anchor_red 5613 QUAL "a spaced extra closer after a self type" \
+        "See \`$R::<dyn RecallTool> >::NoSuch\`."
+    anchor_red 5613 QUAL "a tab before an extra closer after a self type" \
+        "See \`$R::<dyn RecallTool>	>::NoSuch\`."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
