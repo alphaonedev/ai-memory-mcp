@@ -2284,7 +2284,7 @@ def _history_cases(t: Path) -> Tuple[List[str], int]:
     diverge(repo, "dev")
     git(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
     judge_repo("a removal behind a revert pair", repo)
-    # the list renamed and rewritten in one commit: git detects no rename, a path-limited log stops there (#5466)
+    # the list renamed and rewritten in one commit: no rename is detected, so the old path shows its rows as removed (#5466)
     repo = t / "rename-rewrite"
     repo.mkdir(parents=True)
     git(repo, "init", "-q", "-b", "develop")
