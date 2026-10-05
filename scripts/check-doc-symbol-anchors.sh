@@ -809,6 +809,20 @@ MDEOF
     anchor_red 5495 QUAL "a self type that opens with a nested group is refused" \
         "See \`$R::<<NoSuch as Tr>::X>::decorate_memory_many\`."
 
+    # #5496: a `::` right after a closer continues the path past the closer
+    # whether or not the anchor has a generic of its own; the component behind
+    # it is a claim, so the token is reported, not skipped.
+    anchor_red 5496 BARE_QUAL "a path with no generic of its own, a closer inside a prose generic, then :: and a missing name" \
+        "See Vec<$R::RecallTool>::NoSuch here."
+    anchor_red 5496 BARE_QUAL "a path with no generic of its own, a lone closer, then :: and a missing name" \
+        "See $R::RecallTool>::NoSuch here."
+    anchor_red 5496 BARE_QUAL "a nested path component with no generic of its own, a closer, then :: and a missing name" \
+        "See Vec<$R::RecallTool::decorate_memory_many>::NoSuch here."
+    anchor_green 5496 "a path with no generic of its own inside a prose generic and no :: after the closer" \
+        "See Vec<$R::RecallTool> here."
+    anchor_green 5496 "a path with no generic of its own followed by a closer and prose" \
+        "See $R::RecallTool> and then more."
+
     # #5460: the type of an as group inside a brace item is a claim.
     anchor_red_cites 5460 QUAL "an as group with a missing type inside a brace item" \
         "$R::NoSuch" \
@@ -1488,6 +1502,17 @@ def _outer_depth(prefix):
     return depth
 
 
+def _closer_then_path(text, i):
+    """True when one or more group closers at `i` are followed by `::` (#5496)."""
+    n, j = 0, i
+    while j < len(text):
+        kind, width = _group_step(text, j)
+        if kind != "close":
+            break
+        n, j = n + 1, j + width
+    return n > 0 and text.startswith("::", j)
+
+
 def _stray_close(text, i, outer=0):
     """True when `text` has more extra group closers (`>` or `&gt;`) at `i`
     than the `outer` groups opened before the anchor can take (#5456). Closers
@@ -1535,6 +1560,10 @@ def scan_sym(text, i, outer=0):
             if _stray_close(text, pos, outer):
                 return _token_end(text, pos)
         if not text.startswith("::", pos):
+            # #5496: a closer followed by `::` continues the path past the
+            # closer even when the anchor has no group of its own.
+            if _closer_then_path(text, pos):
+                return _token_end(text, pos)
             return pos
         m = ID_RE.match(text, pos + 2)
         if m:
