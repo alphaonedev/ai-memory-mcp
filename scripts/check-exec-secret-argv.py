@@ -2006,6 +2006,13 @@ ROUND3_RED = [
     ('5638 closed world: reported 3: a family head is read in any letter case', 'MYSQL.EXE -p"$X"'),
     ('5638 closed world: reported 4: a family head is read in any letter case', 'MySql -sp"$X"'),
     ('5638 closed world: reported 5: a family head is read in any letter case', 'Mysqladmin password "$X"'),
+    ('5639 closed world: reported 1: an expansion-led operand before -- may be an option; after -- it is not', 'mysql ${ARGS} db'),
+    ('5639 closed world: reported 2: an expansion-led operand before -- may be an option; after -- it is not', 'mysql $ARGS'),
+    ('5639 closed world: reported 3: an expansion-led operand before -- may be an option; after -- it is not', 'mysql "$@"'),
+    ('5639 closed world: reported 4: an expansion-led operand before -- may be an option; after -- it is not', 'mysql -h h $(cat args)'),
+    ('5639 closed world: reported 5: an expansion-led operand before -- may be an option; after -- it is not', 'mysql -h "$H" -u "$U" "$DB"'),
+    ('5639 closed world: reported 6: an expansion-led operand before -- may be an option; after -- it is not', 'mysql -u r -p "$DB_NAME" f'),
+    ('5639 closed world: reported 7: an expansion-led operand before -- may be an option; after -- it is not', 'mysqldump -- db "$X" password "$Y"'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
@@ -2053,6 +2060,9 @@ ROUND3_GREEN = [
     ('5638 closed world: clean 1: a family head is read in any letter case', 'MYSQL_PWD="$PW" mysql -u root db'),
     ('5638 closed world: clean 2: a family head is read in any letter case', 'MYSQL_HOST="$H" ./run.sh'),
     ('5638 closed world: clean 3: a family head is read in any letter case', 'export MYSQL_ROOT_PASSWORD="$X"'),
+    ('5639 closed world: clean 1: an expansion-led operand before -- may be an option; after -- it is not', 'mysql -h "$H" -- "$DB"'),
+    ('5639 closed world: clean 2: an expansion-led operand before -- may be an option; after -- it is not', 'mysql -h h -- "$DB" "$TABLE"'),
+    ('5639 closed world: clean 3: an expansion-led operand before -- may be an option; after -- it is not', 'mysql -h "$H" db'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
