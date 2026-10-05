@@ -1688,7 +1688,7 @@ class BlockStructure5730(unittest.TestCase):
         self._shape(_replace_once(ci, old, new), "continues the scalar")
 
     def test_5730_deeper_rows_after_a_scalar_value(self) -> None:
-        # PyYAML: the first two are one plain scalar each ('a - b'); the others are errors.
+        # PyYAML: the first is one plain scalar ('a\n- b'); the others are errors (#5776).
         for body in ("x:\n  - a\n\n    - b\n", "x:\n  - a\n    # c\n    - b\n",
                      "x: a\n  b: c\n", "x: 'a'\n  b: c\n", "x: [a]\n  - b\n", "x: |\n  a\nz: b\n   c: d\n"):
             self._shape("name: x\non:\n" + GOOD_PR + body, "continues the scalar")
