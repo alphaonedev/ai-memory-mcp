@@ -975,6 +975,16 @@ def _sh_part(text: str, i: int, depth: int, word: _ShWord) -> int:
     return i + 1
 
 
+def _sh_command_verb(cmd: List[_ShWord]) -> bool:
+    """Whether the command word of a command (its first word after assignments) is a verb of _MY_NONCMD_PREV. Only
+    the command word around a quoted payload hides a head in it (#5956): an operand of the outer command, such as
+    an ssh host or a container named test or status, is not a verb of that command."""
+    for w in cmd:
+        if not _SH_ASSIGN_RE.match(w.value):
+            return w.value.lower() in _MY_NONCMD_PREV
+    return False
+
+
 def _sh_sole_reading(w: _ShWord) -> Optional[list]:
     """The reading of the substitution that is the whole word (quoted or not, escaped or not), or None."""
     if not w.grp or len(set(w.grp)) != 1 or w.grp[0] < 0:
@@ -990,7 +1000,7 @@ def _sh_sole_reading(w: _ShWord) -> Optional[list]:
 def _sh_head_rests(cmd: List[_ShWord], idx: int, outer_verb: bool) -> List[List[str]]:
     """The words after every head at a command position in word idx of a command. A head is a command unless a
     word before it in its command is a verb of _MY_NONCMD_PREV, or (outer_verb) it is no first word of a payload
-    whose command around the quote is such a verb (an echoed or printed string). A head quoted on its own is the
+    whose command word around the quote is such a verb (an echoed or printed string). A head quoted on its own is the
     first word of a quote and always a command. A substitution that is the whole word and runs a head is the
     command word (#5821): $(command -v mysql), "$(which mysqldump)", \\$(which mysql) in an ssh payload."""
     w = cmd[idx]
@@ -1025,8 +1035,8 @@ def _sh_head_rests(cmd: List[_ShWord], idx: int, outer_verb: bool) -> List[List[
 def _sh_walk(cmds: List[List[_ShWord]], outer_verb: bool) -> Iterable[List[str]]:
     """The words after every head at a command position anywhere in a reading and in its nested readings."""
     for cmd in cmds:
+        verb = _sh_command_verb(cmd)
         for idx, w in enumerate(cmd):
-            verb = any(x.value.lower() in _MY_NONCMD_PREV for x in cmd[:idx])
             for _kind, readings, payload in w.groups:
                 for r in readings:
                     yield from _sh_walk(r, False)
@@ -2362,6 +2372,10 @@ ROUND3_RED = [
     ('5955 quoted-paren pin: reported 2: a single-quoted closing parenthesis does not end the substitution', "$(command -v mysql || echo ')') -p\"$X\""),
     ('5955 quoted-paren pin: reported 3: a quoted opening parenthesis does not nest', '$(echo "(" >&2; command -v mysql) -uroot -p"$X"'),
     ('5955 quoted-paren pin: reported 4: a quoted parenthesis inside a quoted substitution', '"$(command -v mysql || echo ")")" -p"$X"'),
+    ('5956 operand-verb pin: reported 1: an ssh host named like a verb does not hide a wrapped head', 'ssh test "sudo mysql -uroot -p$X"'),
+    ('5956 operand-verb pin: reported 2: an ssh login named like a verb does not hide a wrapped head', 'ssh -l test h "sudo mysql -p$X"'),
+    ('5956 operand-verb pin: reported 3: a container named like a verb does not hide an exec payload', 'docker exec status sh -c "exec mysql -p$X"'),
+    ('5956 operand-verb pin: reported 4: an operand named like a verb before a timeout wrapper', 'kubectl exec start -- sh -c "timeout 5 mysqladmin -uroot -p$X ping"'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
@@ -2440,6 +2454,9 @@ ROUND3_GREEN = [
     ('5863 mutant pin: clean 1: a verb in another letter case hides the head', 'Echo mysql -uroot -p"$X"'),
     ('5862 mutant pin: clean 1: a quoted verb hides the head', '"echo" mysql -uroot -p"$X"'),
     ('5860 mutant pin: clean 1: a verb inside a remote payload hides the head', 'ssh db1 "echo mysql -uroot -p$X"'),
+    ('5956 operand-verb pin: clean 1: a verb inside the payload still hides the head', 'ssh test "echo mysql -uroot -p$X"'),
+    ('5956 operand-verb pin: clean 2: the outer command word still hides a head after the payload start', 'printf "%s %s" "x" "run sudo mysql -p$X"'),
+    ('5956 operand-verb pin: clean 3: an assignment before an outer verb still hides the head', 'LC_ALL=C echo "now mysql -p$X"'),
 ]
 
 # Raw logical-line text that holds a newline (the arm is a function of text; every unit the gate builds today is
