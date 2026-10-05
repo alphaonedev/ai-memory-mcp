@@ -726,6 +726,20 @@ for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8')
         rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-',
                      'vacuous needle, names no ladder number (#5699): ' + raw.strip()[:120]))
         continue
+    # A needle must also carry subject text beyond the value (#5808). A needle that
+    # is the bare value sits inside every span that claims that value, so one row
+    # shielded every stale claim of it in its file. The rule is positive: in both
+    # forms shields() can match (whitespace folded, and also marker folded) the
+    # needle must hold a word token, a maximal run of ASCII letters, digits and
+    # underscores, that has three or more letters and no digit. Anything else
+    # (v52, 52a, two letters, two numbers, markers or padding around the value)
+    # is refused by name.
+    if not all(any(len(re.findall(r'[A-Za-z]', t)) >= 3 and not re.search(r'[0-9]', t)
+                   for t in re.findall(r'[A-Za-z0-9_]+', v))
+               for v in (WS.sub(' ', parts[1]), MARKS.sub('', WS.sub(' ', parts[1])))):
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-',
+                     'needle carries no subject text beyond the value (#5808): ' + raw.strip()[:120]))
+        continue
     ledger.setdefault(parts[0].strip(), {})[parts[1]] = [n, False]
 
 files = os.environ.get('GATE_SCHEMA_FILES', '').split()
@@ -3229,7 +3243,7 @@ R4CARD
     # line number (row 17 is a fullwidth digit, not an ASCII one; row 18 is an empty
     # needle cell, the format validator's arm). The planted claim on line 1 must still
     # be flagged; a bold needle must not shield the plain claim on line 3; a needle
-    # without the hit's number as a whole number (5, #152, #521) must not shield 52;
+    # without the hit's number as a whole number (Schema v5, #152, #521) must not shield 52;
     # a bold history wrapped across two lines (lines 8-9) stays exempt. Rows 22-23
     # are bold needles whose only candidate is a claim the bold needle does not
     # spell: a code-span v59 seen only in the marker-folded view (line 10), and a
@@ -3237,9 +3251,9 @@ R4CARD
     # rows are reported STALE.
     _v=scripts/qc-allowlists/schema-claim-history.txt
     {
-        printf 'docs/postgres-age-guide.md\t**v58**\t#5699 ledgered bold history\n'
+        printf 'docs/postgres-age-guide.md\tSchema **v58**\t#5699 ledgered bold history\n'
         printf 'docs/postgres-age-guide.md\tSchema version  | **v60**\t#5390 doubled-space table history\n'
-        printf 'docs/postgres-age-guide.md\t5\t#5699 a digit that is not the value\n'
+        printf 'docs/postgres-age-guide.md\tSchema v5\t#5699 a digit that is not the value\n'
         printf 'docs/postgres-age-guide.md\t**\t#5699 vacuous\n'
         printf 'docs/postgres-age-guide.md\t``\t#5699 vacuous\n'
         printf 'docs/postgres-age-guide.md\t_\t#5699 vacuous\n'
@@ -3258,8 +3272,8 @@ R4CARD
         printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION constant (#152)\t#5699 52 only inside 152\n'
         printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION constant (#521)\t#5699 52 only inside 521\n'
         printf 'docs/postgres-age-guide.md\tsteps **v40 -> v61**\t#5699 ledgered bold history wrapped\n'
-        printf 'docs/postgres-age-guide.md\t**v59**\t#5699 bold needle, code-span line\n'
-        printf 'docs/vacuous-fixture.html\t**v58**\t#5699 bold needle, html line\n'
+        printf 'docs/postgres-age-guide.md\tSchema **v59**\t#5699 bold needle, code-span line\n'
+        printf 'docs/vacuous-fixture.html\tSchema **v58**\t#5699 bold needle, html line\n'
     } > "$_v"
     cat > "$tmpdir/docs/postgres-age-guide.md" <<'R5MD'
 The CURRENT_SCHEMA_VERSION is 52 here.
@@ -3283,9 +3297,9 @@ R5MD
         'docs/postgres-age-guide.md:6 claims "52"' \
         'docs/postgres-age-guide.md:7 claims "52"' \
         'docs/postgres-age-guide.md:10 claims "59"' 'docs/vacuous-fixture.html:1 claims "58"' \
-        'line 22 (docs/postgres-age-guide.md no longer carries "**v59**")' \
-        'line 23 (docs/vacuous-fixture.html no longer carries "**v58**")' \
-        'no longer carries "5")' \
+        'line 22 (docs/postgres-age-guide.md no longer carries "Schema **v59**")' \
+        'line 23 (docs/vacuous-fixture.html no longer carries "Schema **v58**")' \
+        'no longer carries "Schema v5")' \
         'no longer carries "CURRENT_SCHEMA_VERSION constant (#152)")' \
         'no longer carries "CURRENT_SCHEMA_VERSION constant (#521)")'
     do grep -qF "$_want" <<<"$_v_out" || { echo "FAIL: self-test #5699 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
@@ -3297,14 +3311,53 @@ R5MD
         || { echo "FAIL: self-test #5699 - empty needle cell at line 18 not refused" >&2; cd "$REPO_ROOT"; exit 1; }
     for _not in 'docs/postgres-age-guide.md:2 ' 'docs/postgres-age-guide.md:4 ' \
         'docs/postgres-age-guide.md:8 ' 'docs/postgres-age-guide.md:9 ' \
-        'docs/postgres-age-guide.md no longer carries "**v58**")' 'no longer carries "Schema version  | **v60**")' \
+        'docs/postgres-age-guide.md no longer carries "Schema **v58**")' 'no longer carries "Schema version  | **v60**")' \
         'no longer carries "steps **v40 -> v61**")'
     do grep -qF "$_not" <<<"$_v_out" && { echo "FAIL: self-test #5699 - ledgered history flagged or reported stale: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
-    echo "PASS: self-test #5699 - a ledger needle that names no ladder number (markers only, mixed markers, markers with a space / NBSP / ZWSP / ideographic space, a BOM, punctuation, an arrow, a bare word) is REFUSED by line number; the planted 52 is still REJECTED; a bold needle shields its own bold line but not a plain v58 on another line, a code-span v59, or a plain v58 in an html file; a needle without the hit's number as a whole number (5, #152, #521) does not shield it and is reported STALE; a ledgered bold transition wrapped across two lines stays exempt"
+    echo "PASS: self-test #5699 - a ledger needle that names no ladder number (markers only, mixed markers, markers with a space / NBSP / ZWSP / ideographic space, a BOM, punctuation, an arrow, a bare word) is REFUSED by line number; the planted 52 is still REJECTED; a bold needle shields its own bold line but not a plain v58 on another line, a code-span v59, or a plain v58 in an html file; a needle without the hit's number as a whole number (Schema v5, #152, #521) does not shield it and is reported STALE; a ledgered bold transition wrapped across two lines stays exempt"
     echo "PASS: self-test #5390 - the whitespace-folded needle form is pinned: Schema version  | **v60** (doubled space) exempts its table row only through the whitespace fold"
     rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/vacuous-fixture.html"
     printf '# fixture ledger (comment-only)\n' > scripts/qc-allowlists/schema-claim-history.txt
+
+    # ---- #5808: a ledger needle must carry subject text beyond the value. A needle
+    # that is the bare value (or the value with a prefix letter, punctuation, markers,
+    # padding, a second number or a short word) sits inside every span that claims
+    # that value, so one row shielded every stale claim in its file. Rows 1-19 are
+    # such needles and each is refused by line number; row 20 (fullwidth digits) is
+    # refused by the #5699 rule first; row 21 carries a subject word and is accepted.
+    # The stale claims on lines 1, 2 and 4 must be flagged; the history on line 3 stays exempt.
+    _s=scripts/qc-allowlists/schema-claim-history.txt
+    {
+        for _nd in '52' 'v52' 'V52' '52.' '(52)' '**52**' '`52`' '   52   ' '** 52 **' \
+                   '52a' 'v52a' '52 ab' '52 51' '52→53' '#52' 'abc52' '52_abc' '52 **ab**' 'a*b*c 52'; do
+            printf 'docs/postgres-age-guide.md\t%s\t#5808 no subject text\n' "$_nd"
+        done
+        printf 'docs/postgres-age-guide.md\t\xef\xbc\x95\xef\xbc\x92 abc\t#5808 fullwidth digits\n'
+        printf 'docs/postgres-age-guide.md\tschema_version was 54\t#5808 subject text, accepted\n'
+    } > "$_s"
+    cat > "$tmpdir/docs/postgres-age-guide.md" <<'R5808MD'
+The CURRENT_SCHEMA_VERSION is 52 here.
+CURRENT_SCHEMA_VERSION = 52
+the schema_version was 54 at v0.6
+a `CURRENT_SCHEMA_VERSION` of **52**
+R5808MD
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5808 - subject-less ledger needles not refused (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in 'docs/postgres-age-guide.md:1 claims "52"' 'docs/postgres-age-guide.md:2 claims "52"' \
+                 'docs/postgres-age-guide.md:4 claims "52"' 'malformed entry at line 20 "vacuous needle'; do
+        grep -qF "$_want" <<<"$_s_out" || { echo "FAIL: self-test #5808 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    for _n in {1..19}; do
+        grep -qF "malformed entry at line $_n \"needle carries no subject text" <<<"$_s_out" \
+            || { echo "FAIL: self-test #5808 - subject-less ledger needle at line $_n not refused by name" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    for _not in 'docs/postgres-age-guide.md:3 ' 'line 21 ' 'malformed entry at line 21 '; do
+        grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5808 - a needle with subject text was refused or its history flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test #5808 - a ledger needle without subject text beyond the value (the bare value, v52, V52, 52., (52), bold, code span, padding, bold padding, a number plus a letter, two letters, two numbers, an arrow, an issue ref, a word glued to the number by letters or an underscore, a short bold word, single letters split by markers) is REFUSED by line number and the stale claims it would have shielded are flagged; fullwidth digits are refused by the #5699 rule; a needle with a subject word is accepted"
+    rm -f "$tmpdir/docs/postgres-age-guide.md"
+    printf '# fixture ledger (comment-only)\n' > "$_s"
 
     # ---- #5702: every hand-enrolled doc must exist. The fixture enrols a subset, so
     # the arm opts in with AI_MEMORY_DOCS_GATE_REQUIRE_DOCS=1, fills the enrolled set
