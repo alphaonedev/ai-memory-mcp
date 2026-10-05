@@ -26,15 +26,17 @@ START STATE. Before it imports anything but sys, the program refuses to run (one
 "run.py: REFUSED: <reasons>" line on stderr, exit 78) unless the interpreter was started
 isolated (-I) on a script file: no -c, -m or stdin entry, no -i, -O, -v, -b, -d, -x, -W or -X
 option other than -X frozen_modules=on|off, no trace, profile or monitoring hook, no global,
-module or import hook that a plain start does not have, none of 23 builtin functions and 10 core types replaced (the
-exception classes, enumerate, range and super are the names it uses that are not checked), and no LD_* or DYLD_*
-variable. A start with -I but without -S re-executes itself once with -I -S, so the program
-runs in a process where no .pth file or sitecustomize of the installation ran; where that site
-code already replaced a sys hook (Ubuntu's apport replaces sys.excepthook) the start is refused
-like any other replacement, so start it with -I -S as the first line does. Stated limits: code
-that runs inside the interpreter before line 1 (an LD_PRELOAD library already loaded, an audit
-hook, a modified installation) can forge any check; the python3 found on PATH and its installation are trusted; on Python 3.9, which has no
-sys.orig_argv, the interpreter command line is read through ctypes (Py_GetArgcArgv), and a start where it cannot be read is refused.
+module or import hook that a plain start does not have, none of 23 builtin functions and 10
+core types replaced (the exception classes, enumerate, range and super are the names it uses
+that are not checked), and no LD_* or DYLD_* variable. A start with -I but without -S
+re-executes itself once with -I -S, so the program runs in a process where no .pth file or
+sitecustomize of the installation ran; where that site code already replaced a sys hook
+(Ubuntu's apport replaces sys.excepthook) the start is refused like any other replacement, so
+start it with -I -S as the first line does. Stated limits: code that runs inside the
+interpreter before line 1 (an LD_PRELOAD library already loaded, an audit hook, a modified
+installation) can forge any check; the python3 found on PATH and its installation are
+trusted; on Python 3.9, which has no sys.orig_argv, the interpreter command line is read
+through ctypes (Py_GetArgcArgv), and a start where it cannot be read is refused.
 
 EXIT CODES. 0 only when at least one PASS was recorded, no FAIL was, and the summary and every
 output stream were written; --help is 0. 1: a preflight failure, a RED run, a missing option
@@ -2219,6 +2221,119 @@ def _selftest_signal_window(T, base, window, signum):
           (rc, all(gone) and (bool(gone) or window == "install"), os.path.exists(sig_dir), err), (want, True, False, ""))
 
 
+def _selftest_r8_units(T):
+    """5527 r8: unit legs for the command-line reader, spawn and _finish (each pinned by a runtime assertion)."""
+    glb = globals()
+    had_orig = hasattr(sys, "orig_argv")
+    saved_orig = getattr(sys, "orig_argv", None)
+    real_ctypes_argv = glb["_lab_ctypes_argv"]
+    saved_ctypes = sys.modules.get("ctypes", "absent")
+    try:
+        sys.modules["ctypes"] = None
+        unusable = real_ctypes_argv()
+    finally:
+        if saved_ctypes == "absent":
+            sys.modules.pop("ctypes", None)
+        else:
+            sys.modules["ctypes"] = saved_ctypes
+    T.leg("5908: the ctypes reader returns None, not an empty line, when ctypes cannot be used", unusable, None)
+    try:
+        sys.orig_argv = ["p", 5]
+        bad_token = bool(_lab_argv_reasons())
+        sys.orig_argv = ["p", "-I", "-S", "x"]
+        glb["_lab_ctypes_argv"] = lambda: ["zzz"]
+        preferred = _lab_orig_argv()
+        del sys.orig_argv
+        glb["_lab_ctypes_argv"] = lambda: None
+        none_line = _lab_orig_argv()
+        stage1 = [r for r in _lab_stage1_reasons(glb) if "command line cannot be read" in r]
+    finally:
+        glb["_lab_ctypes_argv"] = real_ctypes_argv
+        if had_orig:
+            sys.orig_argv = saved_orig
+        elif hasattr(sys, "orig_argv"):
+            del sys.orig_argv
+    T.leg("5908: a non-str token on the command line is refused", bad_token, True)
+    T.leg("5908: sys.orig_argv is preferred when it exists", preferred, ["p", "-I", "-S", "x"])
+    T.leg("5908: with neither source readable the line is None and the second stage refuses", (none_line, len(stage1)), (None, 1))
+    old_int = signal.signal(signal.SIGINT, _interrupt)
+    old_term = signal.signal(signal.SIGTERM, _interrupt)
+    try:
+        quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     env={"PATH": "/usr/bin:/bin"})
+        done = spawn([sys.executable, "-I", "-S", "-c", "pass"], None, **quiet)
+        done.wait()
+        restored = (signal.getsignal(signal.SIGINT) is _interrupt, signal.getsignal(signal.SIGTERM) is _interrupt)
+        real_popen = subprocess.Popen
+        kept = []
+
+        def popen_then_term(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            kept.append(proc)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return proc
+
+        subprocess.Popen = popen_then_term
+        raised = None
+        try:
+            spawn([sys.executable, "-I", "-S", "-c", "import time\ntime.sleep(60)\n"], None, **quiet)
+        except LabInterrupted as exc:
+            raised = exc.signum
+        finally:
+            subprocess.Popen = real_popen
+        stopped = bool(kept) and _pid_gone(kept[0])
+        for proc in kept:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+    T.leg("5946: spawn restores both handlers after a clean start", restored, (True, True))
+    T.leg("5946: a signal held during a short tool's spawn stops that tool before LabInterrupted is raised",
+          (raised, stopped), (signal.SIGTERM, True))
+
+    class _Stuck:
+        def cleanup(self):
+            raise LabInterrupted(signal.SIGINT)
+
+    class _Seen:
+        lines = []
+
+        def no(self, text):
+            self.lines.append(text)
+
+    seen = _Seen()
+    old_int = signal.getsignal(signal.SIGINT)
+    old_term = signal.getsignal(signal.SIGTERM)
+    try:
+        got = _finish(_Stuck(), seen, 0)
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+    T.leg("5946: a cleanup that is interrupted every time exits non-zero and names it", (got, len(seen.lines)),
+          (130, 1), seen.lines)
+
+    class _Probe:
+        handlers = None
+
+        def cleanup(self):
+            self.handlers = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+
+    probe = _Probe()
+    old_int = signal.getsignal(signal.SIGINT)
+    old_term = signal.getsignal(signal.SIGTERM)
+    try:
+        signal.signal(signal.SIGINT, _interrupt)
+        signal.signal(signal.SIGTERM, _interrupt)
+        got = _finish(probe, seen, 0)
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+    T.leg("5946: both signals are ignored while cleanup runs, and a clean cleanup returns the run's exit code",
+          (probe.handlers, got), ((signal.SIG_IGN, signal.SIG_IGN), 0))
+
+
 def _pid_gone(proc):
     """True only when the child was already reaped (returncode set, no poll here) and its pid no longer answers."""
     if proc.returncode is None:
@@ -2641,6 +2756,7 @@ def selftest_start_state(T, base):
     T.leg("5908: the ctypes command-line reader (Python 3.9 path) agrees with sys.orig_argv",
           ctypes_now == list(orig_now) if orig_now is not None else ctypes_now is not None and len(ctypes_now) >= 1, True,
           "%r vs %r" % (ctypes_now, orig_now))
+    _selftest_r8_units(T)
     with open(os.path.join(LAB, "README.md"), "rb") as fh:
         readme = fh.read().decode("utf-8", "replace")
     first = source.decode("utf-8").split("\n", 1)[0]
@@ -2732,6 +2848,16 @@ def selftest_start_state(T, base):
          "sys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n",
          "; ".join("builtin %s replaced" % n for n in _LAB_BUILTIN_NAMES) if len(_LAB_BUILTIN_NAMES) == 23
          else "23 names, not %d" % len(_LAB_BUILTIN_NAMES)),)
+    type_driver = (
+        "import builtins, runpy, sys\ndef hook(event, args):\n"
+        "    if event == 'exec' and args and getattr(args[0], 'co_filename', '') == F:\n"
+        "        real = getattr(builtins, 'TYPE')\n"
+        "        setattr(builtins, 'TYPE', lambda *a, **k: real(*a, **k))\n"
+        "sys.addaudithook(hook)\nsys.argv = [F, '--help']\nrunpy.run_path(F, run_name='__main__')\n")
+    drivers += tuple(
+        ("5941: a core type replaced at the moment the file starts (%s) is refused" % t,
+         "F = %r\nG = %r\n" + type_driver.replace("TYPE", t), "builtin %s replaced" % t)
+        for t in _LAB_CORE_TYPE_NAMES)
     for i, (label, body, why) in enumerate(drivers):
         driver = os.path.join(base, "driver-%d.py" % i)
         _write(driver, body % (copy, copy))
