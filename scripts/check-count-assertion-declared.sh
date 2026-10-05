@@ -1314,6 +1314,20 @@ def selftest():
          'fn t() { assert_eq!(sections.len(), max(18, 20)); }\n', msg('test: bump', 'Count: sections ?max(18;19) -> ?max(18;20)')), False)
     case('#5966 an ambiguous value is declared with | between its values',
          shared(A('crate::EXPECTED_N'), L(18), L(18), {'src/other.rs': L(3)}, {'src/other.rs': 'pub fn x() {}\n'}, 'sections ?EXPECTED_N#ambiguous(18|3) -> 18'), False)
+    # ---- round-9 mutant survivors S07, S13, S15, S19: each is killed by the leg below (all valid Rust, rustc 1.98) ------
+    BRK = 'fn t(v: &[u8]) { loop { assert!(v.len() == 3 || (break <= break)); } }\n'
+    case('#5960 <= after break compares (break <= break), never opens a generic list', scoped('tests/scope.rs', BRK, BRK + '// t\n'), False)
+    def cg(s, b):
+        s.w('tests/a.rs', 'fn t(v: &[u8]) { assert_eq!(v.len(), crate::k::BAR); }\n'); s.w('src/k.rs', 'pub const BAR: usize = 1;\n'); t0 = s.commit('test: add')
+        s.w('src/g.rs', 'pub struct G<const BAR: usize = 3>;\n'); s.commit('test: add a const generic parameter named BAR'); return t0 + '..HEAD'
+    case('#5963 a const generic parameter with a default, named like a const of the tree, is no definition of it', cg, False)
+    TQ = 'pub trait Tr { type O; }\nimpl Tr for dyn Iterator<Item = u8> { type O = usize; }\npub const BAR: <dyn Iterator<Item = u8> as Tr>::O = %s;\n'
+    case('#5963 the = of an associated type binding in a const type is not the = of the const', rd('crate::k::BAR', TQ % 3, TQ % 4), True, ['v.len() [BAR]  3 -> 4'])
+    LC = '#[allow(non_upper_case_globals)]\npub const bar: usize = %s;\n'
+    def lc(s, b):
+        s.w('tests/a.rs', 'fn t(x: u32, v: &[u8]) { assert!(x > 0 && v.len() == crate::k::bar); }\n'); s.w('src/k.rs', LC % 3); t0 = s.commit('test: add')
+        s.w('src/k.rs', LC % 4); s.commit('test: bump'); return t0 + '..HEAD'
+    case('#5963 an ambiguous assert! is re-read when a lowercase const it names moves', lc, True, ['[bar]  3 -> 4'])
     # stated limits (#5715 brings a lexer): a quote or a // inside a block comment is read as the start of a string or of
     # a line comment, so such an assertion is unreadable (red with its line), never silently skipped
     case('#5872 a quote inside a block comment, with a string after it, is unreadable (#5715)',
