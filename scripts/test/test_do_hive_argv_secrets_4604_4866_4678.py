@@ -917,13 +917,16 @@ def tainted_names(text):
 # #5236, #5412: where does a command's stdout go? Every output redirect (> >> >| &> &>> >&N 1>...) is parsed and
 # the LAST one decides, as in bash. Only a plain path (a literal or a "$VAR/..." path) or /dev/null is a file:
 # a dup (&N), any other /dev path (stderr, stdout, tty, console, pts, fd, vcs ...), /proc, a target computed by
-# $( ), backticks or >( ) is the terminal. #5418: a target the scan cannot decide is reported, not trusted: any
-# target with an expansion or a glob is a file only in the form "$VAR/<literal segments>" (a variable may end a
-# segment), so a target held wholly in a variable, or in a computed one, counts as the terminal.
+# $( ), backticks or >( ) is the terminal. #5418, #5523: a target the scan cannot decide is reported, not trusted:
+# any target with an expansion or a glob is a file only in the form "$VAR/<segments>" where every segment starts
+# with a literal character (not a variable, not ".."), and any ".." segment makes a target the terminal. A target
+# held wholly in a variable, a segment held wholly in a variable, and a computed one count as the terminal. The
+# VALUE of a variable inside a segment (r$n) and symbolic links are not decided by a static scan.
 OUT_REDIRECT = re.compile(r"(?:(?<![0-9&<>])|(?<=[\s;]1))(&>>|&>|>>|>\||>)(?!\()\s*(\"[^\"]*\"|'[^']*'|\S+)")
 
 
-VAR_PATH = r"\$\{?\w+\}?/[\w.\-/]*(?:\$\{?\w+\}?[\w.\-]*)*"
+VAR_SEG = r"(?!\.\.(?![\w.\-]))[\w.\-]+(?:\$\{?\w+\}?[\w.\-]*)*"
+VAR_PATH = r"\$\{?\w+\}?(?:/+" + VAR_SEG + r")+"
 
 
 def stdout_to_file(text):
@@ -936,6 +939,8 @@ def stdout_to_file(text):
     if last.startswith("&") or "$(" in last or "`" in last or last.startswith(">("):
         return False
     if last.startswith("/dev/") and last != "/dev/null":
+        return False
+    if ".." in last.split("/"):
         return False
     if re.search(r"[$~*?\[{]", last) and not re.fullmatch(VAR_PATH, last):
         return False
@@ -1444,6 +1449,11 @@ def closed_world_taint(fs):
                         ("a write to a braced variable target", 'dest=/dev/stderr\nprintf %s "$qjson" >"${dest}"'),
                         ("a write to a variable target with a suffix", 'printf %s "$qjson" > "$dest.log"'),
                         ("a write to a tilde target", 'printf %s "$qjson" > ~/r'),
+                        # #5523: a target the scan cannot decide is the terminal.
+                        ("a write through a dotdot segment", 'printf %s "$qjson" > "$OUT_DIR/../../../../dev/tty"'),
+                        ("a write through a segment held in a variable", 'x=../../../../dev/stderr\nprintf %s "$qjson" > "$OUT_DIR/$x"'),
+                        ("a write through a dotdot after a variable", 'printf %s "$qjson" > "$OUT_DIR/..$n/x"'),
+                        ("a literal path with a dotdot segment", 'printf %s "$qjson" > /var/../dev/tty'),
                         ("a write to a glob target", 'printf %s "$qjson" > /dev/tty[0-9]*'),
                         ("a write to a brace-expanded target", 'printf %s "$qjson" > /dev/{stderr,null}'),
                         ("an append to a target held in a variable", 'dest=/dev/stderr\nprintf %s "$qjson" >> "$dest"'),
@@ -1526,6 +1536,8 @@ def closed_world_taint(fs):
                         # Pins for the unlisted-reader check: each control differs from a flagged form in one point.
                         ("a listed printer into a silent consumer", 'printf %s x > "$OUT_DIR/r9"\nhead -c 1 -- "$OUT_DIR/r9" | LC_ALL=C grep -q x'),
                         ("printf of a written file path", 'printf %s x > "$OUT_DIR/r9"\nprintf \'%s\\n\' "$OUT_DIR/r9"'),
+                        ("a file with a variable inside a segment", 'printf %s "$qjson" > "$OUT_DIR/a$n.txt"'),
+                        ("a literal file whose name starts with dots", 'printf %s "$qjson" > "$OUT_DIR/..hidden"'),
                         ("a file under a nested directory", 'printf %s "$qjson" > "$OUT_DIR/sub/r.txt"'),
                         ("a reader with only stderr sent to a written file", 'printf %s x > "$OUT_DIR/r9"\nbat /etc/hostname 2> "$OUT_DIR/r9"'),
                         ("a here-document to a file", 'cat > "$OUT_DIR/r" <<EOT\nx $qjson\nEOT'),
