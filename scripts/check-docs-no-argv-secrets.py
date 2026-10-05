@@ -2549,9 +2549,12 @@ def md_shell_view(text: str) -> str:
 def blank_shell_comments(text: str) -> str:
     """#5725: text with every shell comment blanked (newlines kept): a '#' that starts a word
     outside quotes runs to the end of its line. shell_commands does not model comments, and a
-    comment that quotes a refused flag ('# --token on argv is refused') is not a command."""
+    comment that quotes a refused flag ('# --token on argv is refused') is not a command.
+    #5883: bash removes a backslash-newline pair before it reads words, so the character before
+    the pair decides (a#x after 'a\\<newline>' is one word, not a comment)."""
     out = list(text)
     quote = ""
+    prev = "\n"
     i = 0
     n = len(text)
     while i < n:
@@ -2563,16 +2566,19 @@ def blank_shell_comments(text: str) -> str:
             if c == quote:
                 quote = ""
         elif c == "\\":
+            if text[i + 1:i + 2] != "\n":
+                prev = c
             i += 2
             continue
         elif c in "'\"":
             quote = c
-        elif c == "#" and (i == 0 or text[i - 1] in " \t\n;|&()"):
+        elif c == "#" and prev in " \t\n;|&()":
             end = text.find("\n", i)
             end = n if end < 0 else end
             out[i:end] = " " * (end - i)
             i = end
             continue
+        prev = c
         i += 1
     return "".join(out)
 
@@ -2598,13 +2604,15 @@ def shape_word(text: str, word: Word) -> str:
 
 def shape_operands(text: str, words: List[Word], array: bool) -> List[Word]:
     """The words of a command that reach an exec argv as operands: after the reserved words, the
-    assignments and the document markers before the head, and never past a comment."""
+    assignments and the document markers before the head. Every comment is blanked first
+    (blank_shell_comments) except one at the head of a backtick command (echo `#x ..`), cut here;
+    a # word glued to the word before by a line continuation (#5883) is not a comment."""
     if array:
         return words
     k = 0
     while k < len(words):
         raw = text[words[k][0]:words[k][1]]
-        if raw.startswith("#"):
+        if raw.startswith("#") and not text.endswith("\\\n", 0, words[k][0]):
             return []
         # DOC_MARKERS holds the YAML list marker "-".
         if (ASSIGN_RE.match(raw) or raw in SKIPPED_KEYWORDS or raw == "time" or raw in DOC_MARKERS
@@ -2623,11 +2631,7 @@ def shape_operands(text: str, words: List[Word], array: bool) -> List[Word]:
         return []
     # No program is named with a leading dash: a first word that is an option is an argument
     # list item (a YAML args: entry), so it is an operand itself.
-    ops = words[k:] if first.startswith("-") else words[k + 1:]
-    for n, w in enumerate(ops):
-        if text[w[0]:w[1]].startswith("#"):
-            return ops[:n]
-    return ops
+    return words[k:] if first.startswith("-") else words[k + 1:]
 
 
 def shape_hit(text: str, ops: List[Word]) -> Optional[Tuple[int, str]]:
@@ -4063,6 +4067,13 @@ R11_SHAPE_RED = {
     '5837-r39-bash-c-positional-pw': 'bash -c \'env -i\' $X -v pw="$PG_PW"',
     # #5843: [ is a command (a builtin and /usr/bin/[), not the [[ keyword; its operands are read.
     '5843-r42-test-bracket-operand': '[ -v pw=S3cr3tPass ]',
+    # #5883: bash removes a backslash-newline pair first, so a # right after it inside a word is
+    # part of the word (mytool a#x --token VALUE), not a comment.
+    '5883-r43-continued-hash-mid-word': 'mytool a\\\n#x --token S3cr3tTok',
+    '5883-r44-two-continuations': 'mytool a\\\n\\\n#x --token S3cr3tTok',
+    '5883-r45-continued-hash-in-name': 'mytool --api\\\n#key S3cr3tTok --token S3cr3tTok',
+    '5883-r46-continued-hash-assignment': 'A=1 B=\\\n#c mytool --token S3cr3tTok',
+    '5883-r47-escaped-char-then-hash': 'mytool \\a#x --token S3cr3tTok',
 }
 R11_SHAPE_GREEN = {
     '5725-g01-password-stdin': 'docker login -u u --password-stdin registry.example.com',
@@ -4095,6 +4106,9 @@ R11_SHAPE_GREEN = {
     '5844-g25-comment-holding-a-paren': 'true;# (--token S3cr3tTok)',
     '5844-g26-comment-after-ampersand': 'true &# --token S3cr3tTok',
     '5844-g27-comment-in-backticks': 'echo `#x --token S3cr3tTok`',
+    # #5883: a continuation after a blank, or followed by a blank, still leaves a real comment.
+    '5883-g28-blank-then-continuation': 'mytool a \\\n#x --token S3cr3tTok',
+    '5883-g29-continuation-then-blank': 'mytool a\\\n  #x --token S3cr3tTok',
 }
 # #5725 STATED LIMITS: shapes the rule does not read, each pinned as missed so the limit text in
 # the header and the changelog stays measured (a rule that closes one must update both).
