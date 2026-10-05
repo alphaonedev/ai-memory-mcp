@@ -731,8 +731,9 @@ MDEOF
         "See \`Arc<$R::RecallTool<T>>\`."
     anchor_green 5456 "a live generic anchor inside two prose generics" \
         "See Option<Vec<$R::RecallTool<T>>> here."
+    # #5612: an unbalanced anchor is cited as written, generics kept.
     anchor_red_cites 5456 BARE_QUAL "a generic anchor over-closed beyond the prose generic" \
-        "$R::RecallTool>>" \
+        "$R::RecallTool<T>>>" \
         "See Vec<$R::RecallTool<T>>> here."
     anchor_red_cites 5456 BARE_QUAL "a missing symbol is still named inside a prose generic" \
         "$R::NoSuch" \
@@ -1299,6 +1300,29 @@ PYEOF
         "$R::<Self>::decorate_memory_many" "See \`$R::<Self>::decorate_memory_many\`."
     anchor_red_cites 5611 UNMODELLED "a keyword brace item" \
         "$R::fn" "See \`$R::{RecallTool, fn}\`."
+
+    # #5612 (and review item N-3): a cited token is the anchor as written,
+    # whitespace removed, generics kept, never cut at a tab or a separator.
+    anchor_red_cites 5612 BARE_QUAL "a spaced over-closer is cited with its type" \
+        "$R::RecallTool>::NoSuch" "See $R::RecallTool >::NoSuch here."
+    anchor_red_cites 5612 BARE_QUAL "a no-break space entity before an over-closer" \
+        "$R::RecallTool>::NoSuch" "See $R::RecallTool&nbsp;>::NoSuch here."
+    anchor_red_cites 5612 BARE_QUAL "an entity over-closer keeps the generic in the citation" \
+        "$R::RecallTool<T>>::NoSuch" "See $R::RecallTool<T>&#62;::NoSuch here."
+    anchor_red_cites 5612 BARE_QUAL "a space after the separator behind an over-closer" \
+        "$R::RecallTool<T>>::NoSuch" "See $R::RecallTool<T> >:: NoSuch here."
+    anchor_red_cites 5612 BARE_QUAL "a closer then a spaced separator names the component" \
+        "$R::RecallTool>::NoSuch" "See $R::RecallTool> ::NoSuch here."
+    anchor_red_cites 5612 BARE_QUAL "a tab before an over-closer" \
+        "$R::RecallTool<T>>::NoSuch" "See $R::RecallTool<T>	>::NoSuch here."
+    anchor_red_cites 5612 QUAL "tabs inside a refused self type" \
+        "$R::<(NoSuch)>::decorate_memory_many" "See \`$R::<(	NoSuch	)>::decorate_memory_many\`."
+    anchor_red_cites 5612 QUAL "tabs inside a lone refused self type" \
+        "$R::<(NoSuch)>" "See \`$R::<(	NoSuch	)>\`."
+    anchor_red_cites 5612 BARE_QUAL "a numeric plus entity between bounds" \
+        "$R::NoSuch" "See <code>$R::&lt;dyn RecallTool &#43; NoSuch&gt;::decorate_memory_many</code> here."
+    anchor_red_cites 5612 BARE_QUAL "a named plus entity between bounds" \
+        "$R::NoSuch" "See <code>$R::&lt;dyn RecallTool &plus; NoSuch&gt;::decorate_memory_many</code> here."
 
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
@@ -2110,6 +2134,24 @@ def _spaced_path(text, i):
     return k if k > i and text.startswith("::", k) else None
 
 
+def _path_end(text, i):
+    """End of an unresolvable anchor's text from `i`: the token, continued
+    across whitespace after a trailing `::` or before a `::` (#5612), so the
+    citation holds the component behind the separator."""
+    j = _token_end(text, i)
+    while j < len(text) and text[j] != "`":
+        if text.endswith("::", 0, j):
+            k = _skip_space(text, j)
+            if k < len(text) and text[k] != "`":
+                j = _token_end(text, k)
+                continue
+        sp = _spaced_path(text, j)
+        if sp is None:
+            break
+        j = _token_end(text, sp)
+    return j
+
+
 def _closer_run(text, i):
     """Closers at `i`: (attached count, index after them, count of closers
     when whitespace between them is skipped, index after those and the
@@ -2170,10 +2212,10 @@ def scan_sym(text, i, outer=0):
     if _opens_group(text, pos):
         end = scan_group(text, pos)
         if end is None:
-            return _token_end(text, pos)
+            return _path_end(text, pos)
         stray = _stray_close(text, end, outer)
         if stray is not None:
-            return _token_end(text, stray)
+            return _path_end(text, stray)
         if not text.startswith("::", end):
             # #5609: whitespace before `::` continues the path.
             sp = _spaced_path(text, end)
@@ -2191,17 +2233,17 @@ def scan_sym(text, i, outer=0):
         if _opens_group(text, pos):
             end = scan_group(text, pos)
             if end is None:
-                return _token_end(text, pos)
+                return _path_end(text, pos)
             pos = end
             stray = _stray_close(text, pos, outer)
             if stray is not None:
-                return _token_end(text, stray)
+                return _path_end(text, stray)
         if not text.startswith("::", pos):
             # #5496: a closer followed by `::` continues the path past the
             # closer even when the anchor has no group of its own.
             past = _closer_then_path(text, pos)
             if past is not None:
-                return _token_end(text, past)
+                return _path_end(text, past)
             sp = _spaced_path(text, pos)
             if sp is None:
                 return pos
@@ -2214,11 +2256,11 @@ def scan_sym(text, i, outer=0):
         elif _opens_group(text, nxt):
             end = scan_group(text, nxt)
             if end is None:
-                return _token_end(text, nxt)
+                return _path_end(text, nxt)
             pos = end
             stray = _stray_close(text, pos, outer)
             if stray is not None:
-                return _token_end(text, stray)
+                return _path_end(text, stray)
         else:
             return pos
 
@@ -2580,8 +2622,9 @@ def _item_findings(rule, f, tok):
             return out
         if "<" in tok or ">" in tok:
             # An unbalanced group cannot be resolved: report it
-            # rather than skip a component that may be missing.
-            out.append((rule, f"{f}::{tok}".replace(" ", "")))
+            # rather than skip a component that may be missing; cite the
+            # anchor as written, generics kept (#5612).
+            out.append((rule, f"{f}::{whole}"))
             continue
         if not tok:
             continue
@@ -2635,14 +2678,19 @@ def undecidable_extents(line, readings):
     for text in [line] + readings[-1:]:
         for head in (QUAL_HEAD, BARE_QUAL_HEAD):
             for hm in head.finditer(text):
+                start = _skip_space(text, hm.end())
                 out.append(("UNDECIDABLE_REF",
-                            hm.group(1) + "::" + text[hm.end():_token_end(text, hm.end())]))
+                            hm.group(1) + "::" + text[start:_path_end(text, start)]))
         if out:
             break
     return out or [("UNDECIDABLE_REF", "-")]
 
 
 def emit(rule, doc, ln, token, ctx):
+    # #5612: a cited token never holds whitespace (a tab would split the
+    # record, a space the allowlist key) and shows a decoded backtick as
+    # written.
+    token = re.sub(r"\s+", "", token).replace(CODE_TICK, "`")
     print(f"{rule}\t{doc}\t{ln}\t{token}\t{ctx[:150]}")
 
 
