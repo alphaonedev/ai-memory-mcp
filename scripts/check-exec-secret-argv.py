@@ -2103,6 +2103,8 @@ ROUND3_GREEN = [
     ('5697 mutant pin: clean 2: a head inside an echoed quoted string is not a command', 'echo "see mysql -p$X"'),
     ('5729 mutant pin: clean 1: a semicolon ends the mysql command', 'mysql -u r db; echo "$X"'),
     ('5729 mutant pin: clean 2: a pipe ends the mysql command', 'mysql -u r db | grep "$X"'),
+    ('5738 mutant pin: clean 1: a semicolon ends the wget command', 'wget -q URL; ls -e "http_password=$X"'),
+    ('5738 mutant pin: clean 2: a pipe ends the wget command', 'wget URL | tee -e "http_password=$X"'),
 ]
 
 # Raw logical-line text that holds a newline (the arm is a function of text; every unit the gate builds today is
