@@ -333,6 +333,32 @@ def non_isolated_child(script: Path, flags: list, scratch: Path):
                           capture_output=True, text=True, check=False)
 
 
+def plant_probe(name: str, probe: Path, xopts: list):
+    """#5441: plant `name`.py beside a child run under -S -E (plus the interpreter options `xopts`) that imports
+    `name`. The CHILD reports, before importing, whether it is already loaded, built-in or frozen (read through
+    _frozen_importlib), so the verdict never depends on the parent's -X options or Python version. Returns
+    (shadowable, preloaded, planted_ran, ok): ok is False when the child did not report or the planted file ran
+    and was not expected to (or the reverse)."""
+    probe.mkdir(parents=True, exist_ok=True)
+    (probe / f"{name}.py").write_text("print('PLANTED')\nraise SystemExit(0)\n", encoding="utf-8")
+    (probe / "probe.py").write_text(
+        "import sys, _frozen_importlib as fi\n"
+        f"name = {name!r}\n"
+        "pre = name in sys.modules\n"
+        "print('VERDICT', int(pre), int(pre or name in sys.builtin_module_names "
+        "or fi.FrozenImporter.find_spec(name) is not None))\n"
+        "__import__(name)\n"
+        "print('REAL')\n", encoding="utf-8")
+    result = subprocess.run([sys.executable, *xopts, "-S", "-E", str(probe / "probe.py")],
+                            capture_output=True, text=True, check=False, cwd=str(probe))
+    verdict = [line.split() for line in result.stdout.splitlines() if line.startswith("VERDICT ")]
+    if len(verdict) != 1 or len(verdict[0]) != 3:
+        return (False, False, False, False)
+    preloaded, inert = verdict[0][1] == "1", verdict[0][2] == "1"
+    planted = "PLANTED" in result.stdout
+    return (not inert, preloaded, planted, planted == (not inert))
+
+
 def imported_modules(path: Path) -> list:
     """#5379: the top-level names of every module `path` imports (parsed, never executed), except the built-in
     `sys`. The self-test plants one file per name beside its non-isolated child, so an import of any of them
@@ -553,32 +579,30 @@ def _self_test_cases() -> int:
         print("FAIL: self-test - a comparison run without -I did not fail closed (R5, #5163)", file=sys.stderr)
 
     def importlib_plant():
-        # #5424: importlib is in the plant set (it is not frozen, so its plant is load-bearing), os and stat are in
-        # it too, and the docstring says so. The behavioural probe imports importlib under -S (no site import) with
-        # a planted importlib.py beside it: the plant must run exactly when FrozenImporter does not own importlib.
-        if "importlib" not in imported_modules(Path(__file__).resolve()):
-            return False
+        # #5424/#5441: importlib is in the plant set (it is not frozen, so its plant is load-bearing), the
+        # docstring says so, and for importlib, os and stat a planted file runs exactly when the child finds
+        # the module neither preloaded, built-in nor frozen; also under -X frozen_modules=off. Returns "" or why.
+        names = imported_modules(Path(__file__).resolve())
+        if "importlib" not in names:
+            return "importlib is not in the plant set"
         words = " ".join((imported_modules.__doc__ or "").split())
         if "never runs" in words or "importlib is NOT frozen" not in words or "frozen stdlib modules" not in words:
-            return False
-        probe = base_dir / "implant"
-        probe.mkdir(parents=True, exist_ok=True)
-        for name in ("importlib", "os", "stat"):
-            (probe / f"{name}.py").write_text("print('PLANTED')\nraise SystemExit(0)\n", encoding="utf-8")
-            (probe / "probe.py").write_text(f"import {name}\nprint('REAL')\n", encoding="utf-8")
-            frozen = importlib.machinery.FrozenImporter.find_spec(name) is not None
-            result = subprocess.run([sys.executable, "-S", "-E", str(probe / "probe.py")],
-                                    capture_output=True, text=True, check=False, cwd=str(probe))
-            if ("PLANTED" in result.stdout) == frozen:
-                return False
-        return True
+            return "the docstring is wrong"
+        probed = []
+        for xopts in ([], ["-X", "frozen_modules=off"]):
+            for name in ("importlib", "os", "stat"):
+                shadowable, _, _, ok = plant_probe(name, base_dir / "implant", xopts)
+                if not ok:
+                    return f"the planted {name}.py behaved differently from the child's own verdict (xopts {xopts})"
+                probed.append(name)
+        return ""
 
-    if importlib_plant():
+    plant_failure = importlib_plant()
+    if not plant_failure:
         print("PASS: self-test - the importlib plant is in the plant set and the docstring states why (#5424)")
     else:
         failures.append("importlib plant")
-        print("FAIL: self-test - the importlib plant is missing from the plant set or the docstring is wrong "
-              "(#5424)", file=sys.stderr)
+        print(f"FAIL: self-test - the importlib plant check failed: {plant_failure} (#5424, #5441)", file=sys.stderr)
 
     def importer_refusal():
         # #5377: a caller that imports the module skips the module-top refusal (it is gated on __name__ ==
