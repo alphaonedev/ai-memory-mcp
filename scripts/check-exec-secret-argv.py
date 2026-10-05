@@ -1832,6 +1832,16 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
         if rc != 0:
             bad.append("run() judged an unchanged allow entry again in a renamed frozen file (%d): %s"
                        % (rc, out.strip()[:160]))
+        # #5420: an allow entry that is unchanged except for its file's rename is not judged again, also
+        # when its text is pending in another file (the rename map in allow_text_pending_elsewhere)
+        from_base2("rename unchanged elsewhere")
+        git("mv", "c.sh", "e.sh")
+        rows([("a.sh", ok_line), ("e.sh", pl)], [("a.sh", pl)])
+        commit_all("the file that allows a text pending elsewhere is renamed")
+        rc, out = gate(EXEC_SECRET_ARGV_BASE=base2)
+        if rc != 0:
+            bad.append("run() judged an unchanged allow entry again after a rename (text pending elsewhere) "
+                       "(%d): %s" % (rc, out.strip()[:160]))
         # #5295: the text of a pending row added in THIS change (pending at head, not at the base) is
         # not approved by a new allow entry in another file either
         from_base2("head pending")
@@ -2003,6 +2013,16 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
         bad.append("a runaway array was joined without a fault (#4901)")
     except RuntimeError:
         pass
+    # #5420: the rename map keeps an unchanged entry of a renamed file out of the judgement
+    n += 1
+    moved = [("reason: r", "e.sh", 1, "x --token $T", 5)]
+    had = [("reason: r", "c.sh", 1, "x --token $T", 2)]
+    row = [("#1", "a.sh", 1, "x --token $T", 3)]
+    if allow_text_pending_elsewhere(moved, had, row, row, {"c.sh": "e.sh"}):
+        bad.append("an unchanged entry of a renamed file was judged again (#5420)")
+    n += 1
+    if len(allow_text_pending_elsewhere(moved, had, row, row, {})) != 1:
+        bad.append("without the rename an entry in a new file was not judged (#5420)")
     # #5295: allow_text_pending_elsewhere reads the pending rows at the base AND at head (each half alone)
     n += 1
     ent = [("reason: r", "b.sh", 1, "x --token $T", 5)]
