@@ -741,6 +741,9 @@ class DuplicateKeys5666(unittest.TestCase):
     def test_5666_duplicate_push_other_case(self) -> None:
         self._shape(_with_on_block("  push:\n" + self.BAD + "  Push:\n    branches: [main]\n" + GOOD_PR))
 
+    def test_5666_duplicate_push_capital_first(self) -> None:
+        self._shape(_with_on_block("  Push:\n    branches: [main]\n" + "  push:\n" + self.BAD + GOOD_PR))
+
     def test_5666_duplicate_pull_request(self) -> None:
         self._shape(_with_on_block(GOOD_PUSH + GOOD_PR + GOOD_PR))
 
@@ -877,6 +880,9 @@ class TopLevelShapes5668(unittest.TestCase):
 
     def test_5668_multiline_single_quoted_value(self) -> None:
         self._shape("name: 'x\n" + self._base()[len("name: x\n"):] + "extra: '\n")
+
+    def test_5668_non_ascii_first_character_row(self) -> None:
+        self._shape(self._base() + "\u00e9: 1\n")
 
     def test_5668_scalar_document(self) -> None:
         self._shape("just text\n" + self._base())
