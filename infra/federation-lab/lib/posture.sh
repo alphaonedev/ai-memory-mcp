@@ -232,56 +232,64 @@ lab_posture_ssot_check() {
 # One awk pass reads the whole file: no pipe (a `grep -q` reader closing early returns 141
 # under pipefail) and no here-string or here-document (bash spills a large one to a temp file
 # under $TMPDIR, /tmp when unset; #5197, #5259). Lines naming INFO are the profile's pin line, never a refusal.
-# The trailing colon pins the whole knob name. An unreadable file is "not detected".
+# The trailing colon pins the whole knob name. An unreadable file is refused (exit 4), never "not detected".
 #
-# Closed world (#5586, #5588, #5591): the matcher and its guard run EVERY command from ONE table, LAB_PROBE_CMDS, and
-# the guard lab_probe_cmds_proven refuses (rc 2, reason in LAB_PROBE_WHY, nothing run) unless each row resolves, at call
-# time, to the kind the row names. Rows: the keyword [[ , and the builtins builtin, type and return. Each name is
-# probed twice, by plain `type -t` and by `builtin type -t`, so a function shadowing type or builtin is seen by the
-# other probe. awk is never looked up by name: it is run from the first absolute path in LAB_PROBE_AWK_PATHS that is a
-# regular executable file and is not itself shadowed by a function, so PATH, the hash table, an awk function, an awk
-# alias, an exported awk function and an awk earlier on PATH are not consulted. No other command is called, and no
-# redirect, here-string or substitution reads the log (the structural leg pins both bodies).
-# COVERED routes (each has a self-test leg): a function, an exported function (BASH_FUNC_), an alias defined
-# before the call with expand_aliases on, `enable -n`, a PATH entry and a changed IFS or shell option, for every table row; and for awk a
-# function, alias, exported function and PATH entry (ignored) or a function named by the absolute path (skipped).
-# NOT covered, said plainly: (1) a caller that shadows BOTH probe commands (a function type AND a function builtin) and
-# answers both falsely; bash has no in-shell defence against that. (2) an alias that existed only while this file was
-# sourced and was removed before the call: it is in the parsed body, and only the structural leg of --posture-selftest sees it.
-# (3) a hostile regular file at one of the absolute awk paths, or a replaced guard or matcher function. (4) an enabled loadable
-# builtin named after a row is refused as not-the-row-kind; one named awk is not consulted. bash 3.2 was not run.
-LAB_PROBE_CMDS=('[[:keyword' 'builtin:builtin' 'type:builtin' 'return:builtin')
+# Closed world by a fresh interpreter (#5586, #5588, #5591, #5662). The caller's shell can rebind any command name it
+# runs (a function, an alias, an exported function, `enable -n`, PATH, hash), and four rounds of in-process guards each
+# missed one name (command, builtin, type, return). So the match runs in a CHILD bash that inherits none of that state:
+# lab_probe_refusal_names_knob runs, in a subshell switched to posix mode (POSIXLY_CORRECT=1, so the special builtin exec
+# is found before any function named exec), `exec -c` of the first absolute path in LAB_PROBE_BASH_PATHS that is a
+# regular executable file. exec looks up no function for a path and replaces the process, so no function, alias, trap or
+# shell option of the caller survives; -c empties the environment, so no exported function (BASH_FUNC_), BASH_ENV, ENV,
+# SHELLOPTS, BASHOPTS or PS4 reaches the child. The child runs awk from the first absolute path in LAB_PROBE_AWK_PATHS that
+# is a regular executable file, with the program and the log passed as arguments; the program exits 10 when a refusal line
+# names the knob and 11 when none does. The verdict is that exit status alone: 10 detected, 11 not detected, and EVERY other
+# status (a guard refusal, a failed exec, no awk file (3), an unreadable log (4), an awk error, a killed child) is refused.
+# Nothing on the verdict path calls return, printf or echo: lab_probe_verdict sets LAB_PROBE_VERDICT by assignment.
+# In-process, before the exec, the guard lab_probe_cmds_proven refuses (reason in LAB_PROBE_WHY) unless each row of
+# LAB_PROBE_CMDS resolves, at call time, to the kind the row names by both plain `type -t` and `builtin type -t` (rows: the
+# keyword [[, and the builtins builtin, type and exec), and an absolute bash file exists.
+# Covered (each is a self-test leg): a function, exported function, alias, `enable -n`, or `enable -n` with a PATH file
+# for every builtin row; a lying type or builtin; lying type and builtin together with a function named exec (posix mode
+# runs the builtin); a function named return, exit, local, set, shopt or any other neighbour; awk or bash by function,
+# exported function, alias, PATH file, hash -p, or a function named by an absolute path; a caller-set LAB_PROBE_BASH;
+# BASH_ENV, ENV, exported SHELLOPTS and BASHOPTS; a relative path in either path table; eight IFS values; twelve shell
+# options; an alias for exec present while this file is sourced (the structural leg refuses the changed body).
+# Not covered: a DEBUG, RETURN or ERR trap that the caller's functrace, errtrace or extdebug lets run inside the guard or
+# the subshell (#5663); lying type and builtin together with `enable -n exec` and a function named exec; a hostile regular
+# file at an absolute bash or awk path, or a replaced guard, matcher or table (LAB_PROBE_CMDS, LAB_PROBE_BASH_PATHS,
+# LAB_PROBE_AWK_PATHS); ignored signals, umask, cwd, open fds and ulimits cross exec (they can only make the child fail,
+# which reads as refused); a log path that begins with "-" is passed to awk as before.
+LAB_PROBE_CMDS=('[[:keyword' 'builtin:builtin' 'type:builtin' 'exec:builtin')
+LAB_PROBE_BASH_PATHS=(/bin/bash /usr/bin/bash)
 LAB_PROBE_AWK_PATHS=(/usr/bin/awk /bin/awk)
 lab_probe_cmds_proven() {
-  LAB_PROBE_AWK=""; LAB_PROBE_WHY=""
+  LAB_PROBE_BASH=""; LAB_PROBE_WHY=""
   for _lab_row in "${LAB_PROBE_CMDS[@]}"; do
     _lab_n=${_lab_row%%:*}; _lab_k=${_lab_row#*:}
     [[ $(type -t "$_lab_n") == "$_lab_k" && $(builtin type -t "$_lab_n") == "$_lab_k" ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}${_lab_n} is not the ${_lab_k} the matcher needs; "
   done
-  for _lab_a in "${LAB_PROBE_AWK_PATHS[@]}"; do
-    [[ -z $LAB_PROBE_AWK && -f $_lab_a && -x $_lab_a && $(builtin type -t "$_lab_a") == file ]] && LAB_PROBE_AWK=$_lab_a
+  for _lab_b in "${LAB_PROBE_BASH_PATHS[@]}"; do
+    [[ -z $LAB_PROBE_BASH && $_lab_b == /* && -f $_lab_b && -x $_lab_b ]] && LAB_PROBE_BASH=$_lab_b
   done
-  [[ -n $LAB_PROBE_AWK ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}no trusted awk file in ${LAB_PROBE_AWK_PATHS[*]}; "
-  [[ -z $LAB_PROBE_WHY ]] || LAB_PROBE_AWK=""
+  [[ -n $LAB_PROBE_BASH ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}no bash file in ${LAB_PROBE_BASH_PATHS[*]}; "
   [[ -z $LAB_PROBE_WHY ]]
 }
 lab_probe_refusal_names_knob() {
-  lab_probe_cmds_proven || return 2
-  "$LAB_PROBE_AWK" 'index($0, "INFO") == 0 && index($0, "refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:") { f = 1 }
-       END { exit (f ? 0 : 1) }' "$1" 2>/dev/null
+  lab_probe_cmds_proven && ( POSIXLY_CORRECT=1; exec -c "$LAB_PROBE_BASH" --noprofile --norc -c '[[ -r $1 ]] || exit 4; for a in "${@:3}"; do if [[ $a == /* && -f $a && -x $a ]]; then "$a" "$2" "$1"; exit; fi; done; exit 3' lab-probe "$1" 'index($0, "INFO") == 0 && index($0, "refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:") { f = 1 }
+       END { exit (f ? 10 : 11) }' "${LAB_PROBE_AWK_PATHS[@]}" ) 2>/dev/null
 }
 
-# #5588: the report a caller prints. Prints `detected`, `not-detected` or `refused: <reason>` and returns the matcher's rc (0, 1,
-# 2), so a matcher that could not prove its commands is never reported as "not detected" for the lowered knob.
+# #5588, #5662: the report a caller reads. Sets LAB_PROBE_VERDICT to `detected` (child status 10), `not-detected` (11) or
+# `refused: <reason>` (any other status, or any reason recorded), so a matcher that could not run its child is never
+# reported as "not detected" for the lowered knob. It calls no command after the matcher: only assignments and case.
 lab_probe_verdict() {
-  local rc=0
-  lab_probe_refusal_names_knob "$1" || rc=$?
-  case "$rc" in
-    0) printf 'detected\n' ;;
-    1) printf 'not-detected\n' ;;
-    *) printf 'refused: %s\n' "${LAB_PROBE_WHY:-no reason recorded}" ;;
+  _lab_s=0; lab_probe_refusal_names_knob "$1" || _lab_s=$?
+  case "$_lab_s:$LAB_PROBE_WHY" in
+    10:) LAB_PROBE_VERDICT=detected ;;
+    11:) LAB_PROBE_VERDICT=not-detected ;;
+    *) LAB_PROBE_VERDICT="refused: ${LAB_PROBE_WHY:-the probe child exited $_lab_s, which is not a verdict}" ;;
   esac
-  return "$rc"
 }
 
 # #5539, #5540, #5541, #5588: the two function bodies the structural self-test leg accepts, as `declare -f` prints them with every
@@ -290,10 +298,10 @@ lab_probe_verdict() {
 # Changing the matcher or the guard means changing this text in the same commit.
 lab_probe_expected_body() {
   local q="'"
-  printf '%s' "lab_probe_refusal_names_knob () { lab_probe_cmds_proven || return 2; \"\$LAB_PROBE_AWK\" ${q}index(\$0, \"INFO\") == 0 && index(\$0, \"refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:\") { f = 1 } END { exit (f ? 0 : 1) }${q} \"\$1\" 2> /dev/null }"
+  printf '%s' "lab_probe_refusal_names_knob () { lab_probe_cmds_proven && ( POSIXLY_CORRECT=1; exec -c \"\$LAB_PROBE_BASH\" --noprofile --norc -c ${q}[[ -r \$1 ]] || exit 4; for a in \"\${@:3}\"; do if [[ \$a == /* && -f \$a && -x \$a ]]; then \"\$a\" \"\$2\" \"\$1\"; exit; fi; done; exit 3${q} lab-probe \"\$1\" ${q}index(\$0, \"INFO\") == 0 && index(\$0, \"refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:\") { f = 1 } END { exit (f ? 10 : 11) }${q} \"\${LAB_PROBE_AWK_PATHS[@]}\" ) 2> /dev/null }"
 }
 lab_probe_expected_guard_body() {
-  printf '%s' 'lab_probe_cmds_proven () { LAB_PROBE_AWK=""; LAB_PROBE_WHY=""; for _lab_row in "${LAB_PROBE_CMDS[@]}"; do _lab_n=${_lab_row%%:*}; _lab_k=${_lab_row#*:}; [[ $(type -t "$_lab_n") == "$_lab_k" && $(builtin type -t "$_lab_n") == "$_lab_k" ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}${_lab_n} is not the ${_lab_k} the matcher needs; "; done; for _lab_a in "${LAB_PROBE_AWK_PATHS[@]}"; do [[ -z $LAB_PROBE_AWK && -f $_lab_a && -x $_lab_a && $(builtin type -t "$_lab_a") == file ]] && LAB_PROBE_AWK=$_lab_a; done; [[ -n $LAB_PROBE_AWK ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}no trusted awk file in ${LAB_PROBE_AWK_PATHS[*]}; "; [[ -z $LAB_PROBE_WHY ]] || LAB_PROBE_AWK=""; [[ -z $LAB_PROBE_WHY ]] }'
+  printf '%s' 'lab_probe_cmds_proven () { LAB_PROBE_BASH=""; LAB_PROBE_WHY=""; for _lab_row in "${LAB_PROBE_CMDS[@]}"; do _lab_n=${_lab_row%%:*}; _lab_k=${_lab_row#*:}; [[ $(type -t "$_lab_n") == "$_lab_k" && $(builtin type -t "$_lab_n") == "$_lab_k" ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}${_lab_n} is not the ${_lab_k} the matcher needs; "; done; for _lab_b in "${LAB_PROBE_BASH_PATHS[@]}"; do [[ -z $LAB_PROBE_BASH && $_lab_b == /* && -f $_lab_b && -x $_lab_b ]] && LAB_PROBE_BASH=$_lab_b; done; [[ -n $LAB_PROBE_BASH ]] || LAB_PROBE_WHY="${LAB_PROBE_WHY}no bash file in ${LAB_PROBE_BASH_PATHS[*]}; "; [[ -z $LAB_PROBE_WHY ]] }'
 }
 
 # lab_probe_body_allowed <declare -f text> [expected-generator] — true only when the text, whitespace-normalized, equals the expected body.
@@ -307,21 +315,26 @@ lab_probe_body_allowed() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 131 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 126
+# 164 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 159
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
-# const in a scratch src tree), seven probe-matcher legs (lab_probe_refusal_names_knob against
-# generated logs), three structural legs (the matcher body and the guard body each equal the one allowed text, #5539 and
-# #5588, and the command table equals its literal), a globbing-and-IFS leg, a mutant-builder control, twenty-seven
-# closed-world matcher legs (a mutated body of each spelling must be refused: twenty-two spill spellings (cp, dd,
-# install, sort -o or tee, a stderr redirect to a near name, process substitution, here-string, here-document, pipe,
-# coproc, command substitution, extra statement, function call, eval, exec redirect, a changed awk program, ...), three
-# guard-call spellings (guard dropped, bare awk, guard returning 0, #5586) and two extra-text spellings (text after, text
-# before, #5587)), seven closed-world guard-body mutants (#5588), two probe-verdict legs, seventy-three shadow-matrix legs (#5588: the control, one
-# cell per table row per route (function, exported function, alias, enable -n, enable -n with a PATH file, a lying
-# function for builtin and type), the keyword row, awk by every bare-name route and by the absolute paths (with a guard-only no-trusted-awk refusal and first-path-wins), eleven neighbour
-# commands by function and by PATH file, eight IFS values, twelve shell options, and the LAB_PROBE_WHY reason), and one layout
-# leg (this comment sits directly on the function).
+# const in a scratch src tree), eight probe-matcher legs (lab_probe_refusal_names_knob against generated logs, each
+# checking the exact child status: 10, 11, or 4 for an unreadable log, #5662), three structural legs (the matcher body
+# and the guard body each equal the one allowed text, #5539 and #5588, and the command and path tables equal their
+# literals), a globbing-and-IFS leg, a source-time alias leg, a mutant-builder control, thirty-four closed-world matcher
+# legs (a mutated body must be refused: twenty-one spill spellings (cp twice, dd, install, sort -o, tee, a stderr
+# redirect to a near name or to stdout's target, process substitution, here-string, here-document, pipe, |&, coproc,
+# command substitution, extra statement, function call, eval, mktemp, exec redirect, awk writing a file), a changed awk
+# program, ten child spellings (guard dropped or not chained, bash by bare name, no exec, exec without -c, no posix
+# mode, awk exits 0 or 1, awk by bare name, a relative awk path accepted, no readability check) and two extra-text
+# spellings (#5587)), nine closed-world guard-body mutants (#5588, #5662), five probe-verdict legs (the two verdicts, a
+# shadowed builtin, every non-verdict status, a recorded reason over status 10, the #5662 return reproducer),
+# ninety-two shadow-matrix legs (#5588: the control, one cell per table row per route (function, exported function,
+# alias, enable -n, enable -n with a PATH file, a lying function for builtin and type), the keyword row, lying type and
+# builtin with a function named exec, ten awk and bash cells (bare-name routes, absolute-path functions, caller-set
+# LAB_PROBE_BASH, relative path), four environment cells, three missing-file cells, two first-path-wins cells, sixteen
+# neighbour commands by function and by PATH file, eight IFS values, twelve shell options, and the LAB_PROBE_WHY
+# reason), and one layout leg (this comment sits directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
   local root="$1" bad=0 rc name want v1 v2 v3 v4 vr1 vr2 vr3 vok
@@ -358,6 +371,7 @@ lab_posture_selftest() {
   root="$real_root"; rm -rf "$shadow"
   # #5155: the probe-mutation matcher names the knob WITH its trailing colon, ignores INFO pin
   # lines, and reads the whole log (a large log must not turn a detection into "inconclusive").
+  # #5662: the matcher's status is the child's: 10 detected, 11 not detected, any other status refused.
   local plog; plog="$(mktemp -d "${TMPDIR:-.}/probe-matcher.XXXXXX")" || return 1
   printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n' > "$plog/ok.log"
   printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK_STRICT: nope\n' > "$plog/other-knob.log"
@@ -369,47 +383,41 @@ lab_posture_selftest() {
   # runs without reading stdin (an awk program with only an END block reads stdin).
   awk 'END { for (i = 0; i < 200000; i++) print "filler line to fill the pipe buffer"
              print "fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1" }' /dev/null > "$plog/big.log"
-  ( lab_probe_refusal_names_knob "$plog/ok.log" ) \
-    && echo "  PASS probe matcher: refusal naming the knob is detected" \
-    || { echo "  FAIL probe matcher: refusal naming the knob not detected"; bad=1; }
-  ( lab_probe_refusal_names_knob "$plog/other-knob.log" ) \
-    && { echo "  FAIL probe matcher: a refusal for a longer knob name was counted"; bad=1; } \
-    || echo "  PASS probe matcher: a refusal for a longer knob name is not counted"
-  ( lab_probe_refusal_names_knob "$plog/info-only.log" ) \
-    && { echo "  FAIL probe matcher: an INFO pin line was counted"; bad=1; } \
-    || echo "  PASS probe matcher: an INFO pin line is not counted"
-  ( lab_probe_refusal_names_knob "$plog/info-prefixed.log" ) \
-    && { echo "  FAIL probe matcher: an INFO pin line with a timestamp prefix was counted"; bad=1; } \
-    || echo "  PASS probe matcher: an INFO pin line with a timestamp prefix is not counted"
-  ( lab_probe_refusal_names_knob "$plog/info-then-refusal.log" ) \
-    && echo "  PASS probe matcher: a refusal after an INFO line naming the knob is detected" \
-    || { echo "  FAIL probe matcher: a refusal after an INFO line naming the knob not detected"; bad=1; }
-  ( lab_probe_refusal_names_knob "$plog/refusal-then-info.log" ) \
-    && echo "  PASS probe matcher: a refusal followed by an INFO line naming the knob is detected" \
-    || { echo "  FAIL probe matcher: a refusal followed by an INFO line naming the knob not detected"; bad=1; }
-  ( set -o pipefail; lab_probe_refusal_names_knob "$plog/big.log" ) \
-    && echo "  PASS probe matcher: detection in a large log survives pipefail" \
-    || { echo "  FAIL probe matcher: detection in a large log lost"; bad=1; }
-  # #5197, #5259, #5519, #5539, #5588: the matcher is a guard call plus ONE awk statement reading "$1" with one stderr redirect to /dev/null.
-  # The leg is an allowlist: the normalized body must equal lab_probe_expected_body. A here-string, here-document,
-  # pipe, process substitution, temp file (mktemp, cp, dd, install, sort -o, tee, an exec or output redirect) and any
-  # other extra command are refused because they are not that one statement. The guard body is pinned the same way.
+  _det() {  # <label> <log> <wanted status> [shell option]
+    ( ${4:+set -o $4}; lab_probe_refusal_names_knob "$2" ); rc=$?
+    if [ "$rc" -eq "$3" ]; then echo "  PASS probe matcher: $1 (status $rc)"; return 0; fi
+    echo "  FAIL probe matcher: $1: status $rc, wanted $3"; return 1
+  }
+  _det "a refusal naming the knob is detected" "$plog/ok.log" 10 || bad=1
+  _det "a refusal for a longer knob name is not counted" "$plog/other-knob.log" 11 || bad=1
+  _det "an INFO pin line is not counted" "$plog/info-only.log" 11 || bad=1
+  _det "an INFO pin line with a timestamp prefix is not counted" "$plog/info-prefixed.log" 11 || bad=1
+  _det "a refusal after an INFO line naming the knob is detected" "$plog/info-then-refusal.log" 10 || bad=1
+  _det "a refusal followed by an INFO line naming the knob is detected" "$plog/refusal-then-info.log" 10 || bad=1
+  _det "detection in a large log survives pipefail" "$plog/big.log" 10 pipefail || bad=1
+  _det "an unreadable log is refused by the child (exit 4), never not-detected" "$plog/missing.log" 4 || bad=1
+  unset -f _det
+  # #5197, #5259, #5519, #5539, #5588, #5662: the matcher is the guard call, then ONE exec of a fresh child bash in a posix-mode
+  # subshell, with one stderr redirect to /dev/null. The leg is an allowlist: the normalized body must equal
+  # lab_probe_expected_body. A here-string, here-document, pipe, process substitution, temp file (mktemp, cp, dd, install,
+  # sort -o, tee, an exec or output redirect) and any other extra command are refused because they are not that one
+  # statement. The guard body is pinned the same way.
   if lab_probe_body_allowed "$(declare -f lab_probe_refusal_names_knob)"; then
-    echo "  PASS probe matcher: the body is exactly the guard call plus the one allowed awk statement (its program, \"\$1\", one 2> /dev/null)"
+    echo "  PASS probe matcher: the body is exactly the guard call plus the one exec of a fresh child bash (its program, the awk program, \"\$1\", one 2> /dev/null)"
   else
-    echo "  FAIL probe matcher: the body is not exactly the guard call plus the one allowed awk statement"; bad=1
+    echo "  FAIL probe matcher: the body is not exactly the guard call plus the one exec of a fresh child bash"; bad=1
   fi
   if lab_probe_body_allowed "$(declare -f lab_probe_cmds_proven)" lab_probe_expected_guard_body; then
-    echo "  PASS probe matcher: the guard body is exactly the allowed table walk (type and builtin type per row, absolute awk file)"
+    echo "  PASS probe matcher: the guard body is exactly the allowed table walk (type and builtin type per row, absolute bash file)"
   else
     echo "  FAIL probe matcher: the guard body is not exactly the allowed table walk"; bad=1
   fi
-  # #5588: ONE table. These two rows are the whole inventory of commands the matcher and the guard use; a row removed from
-  # LAB_PROBE_CMDS would silently drop its legs from the loop below, so the table and the awk paths are compared to the literals.
-  if [ "${LAB_PROBE_CMDS[*]}" = "[[:keyword builtin:builtin type:builtin return:builtin" ] && [ "${LAB_PROBE_AWK_PATHS[*]}" = "/usr/bin/awk /bin/awk" ]; then
-    echo "  PASS probe matcher: the command table is exactly [[ (keyword), builtin, type, return (builtins) and the awk paths /usr/bin/awk /bin/awk"
+  # #5588: ONE table. These rows are the whole inventory of commands the guard and the matcher run in the caller's shell; a
+  # row removed from LAB_PROBE_CMDS would silently drop its legs from the loop below, so the tables are compared to the literals.
+  if [ "${LAB_PROBE_CMDS[*]}" = "[[:keyword builtin:builtin type:builtin exec:builtin" ] && [ "${LAB_PROBE_BASH_PATHS[*]}" = "/bin/bash /usr/bin/bash" ] && [ "${LAB_PROBE_AWK_PATHS[*]}" = "/usr/bin/awk /bin/awk" ]; then
+    echo "  PASS probe matcher: the command table is exactly [[ (keyword), builtin, type, exec (builtins), the bash paths /bin/bash /usr/bin/bash and the awk paths /usr/bin/awk /bin/awk"
   else
-    echo "  FAIL probe matcher: the command table or the awk paths changed"; bad=1
+    echo "  FAIL probe matcher: the command table, the bash paths or the awk paths changed"; bad=1
   fi
   # #5539: the comparison must not depend on the caller's globbing or IFS: a one-character file name would expand the
   # standalone ? of the awk program, and a changed IFS would split the words differently.
@@ -419,10 +427,17 @@ lab_posture_selftest() {
   else
     echo "  FAIL probe matcher: the allowlist compare depends on globbing or IFS"; bad=1
   fi
-  # #5539, #5540, #5541: each spelling below is a way to read the log other than that statement; every one must be refused.
-  local exp head core tail
+  # #5662: an alias present while the file is sourced is expanded into the parsed body; the structural compare refuses it.
+  if "$BASH" -c 'shopt -s expand_aliases; alias exec="exec /bin/true"; . "$1"; lab_probe_body_allowed "$(declare -f lab_probe_refusal_names_knob)"' _ "${BASH_SOURCE[0]}" 2>/dev/null; then
+    echo "  FAIL probe matcher: an alias for exec defined while the file is sourced is accepted by the structural compare"; bad=1
+  else
+    echo "  PASS probe matcher: an alias for exec defined while the file is sourced is refused by the structural compare"
+  fi
+  # #5539, #5540, #5541, #5662: each spelling below is a way to read the log other than that statement, or a way to let the
+  # caller's shell reach the match; every one must be refused.
+  local exp head core
   exp="$(lab_probe_expected_body)"; head="lab_probe_refusal_names_knob () { "
-  core="${exp#"$head"}"; core="${core% \}}"; tail=' "$1" 2> /dev/null'
+  core="${exp#"$head"}"; core="${core% \}}"
   _refuse() {  # <spelling> <mutated body> — the allowlist must say no
     if lab_probe_body_allowed "$2"; then echo "  FAIL probe matcher: a matcher that $1 is accepted"; return 1
     else echo "  PASS probe matcher: a matcher that $1 is refused"; fi
@@ -433,29 +448,37 @@ lab_posture_selftest() {
   _refuse "copies the log with cp into a spill file (M3)" "${head}"'cp "$1" /dev/shm/lab-probe.$$ ; '"${core} }" || bad=1
   _refuse "copies the log with cp into \$TMP (M4)" "${head}"'cp "$1" "$TMP/lab-probe.$$" ; '"${core} }" || bad=1
   _refuse "copies the log with dd into \$HOME (M8)" "${head}"'dd if="$1" of="${HOME}/.lab-probe.$$" status=none ; '"${core} }" || bad=1
-  _refuse "redirects stderr to /dev/null.spill (M5)" "${head}${core%"$tail"}"' "$1" 2> /dev/null.spill }' || bad=1
-  _refuse "reads the log through process substitution (M7)" "${head}${core%"$tail"}"' < <(cat "$1" 2> /dev/null) }' || bad=1
+  _refuse "redirects stderr to /dev/null.spill (M5)" "${head}${core% 2> /dev/null} 2> /dev/null.spill }" || bad=1
+  local psub='<(cat "$1")'
+  _refuse "reads the log through process substitution (M7)" "${head}${core/lab-probe \"\$1\"/lab-probe $psub} }" || bad=1
   _refuse "copies the log with tee into \$TEMP" "${head}"'tee "$TEMP/lab-probe.$$" < "$1" ; '"${core} }" || bad=1
   _refuse "copies the log with install into \$TEMP" "${head}"'install -m 600 "$1" "$TEMP/lab-probe.$$" ; '"${core} }" || bad=1
   _refuse "writes a sorted copy with sort -o" "${head}"'sort -o "$HOME/lab-probe.$$" "$1" ; '"${core} }" || bad=1
   _refuse "opens an exec redirect to a file" "${head}"'exec 3> /tmp/lab-probe.$$ ; '"${core} }" || bad=1
-  _refuse "reads the log through a here-string" "${head}${core%"$tail"}"' <<< "$(cat "$1")" }' || bad=1
-  _refuse "reads the log through a here-document" "${head}${core%"$tail"}"' <<EOF $(cat "$1") EOF }' || bad=1
-  _refuse "pipes the log into awk" "${head}"'cat "$1" | '"${core%"$tail"}"' 2> /dev/null }' || bad=1
-  _refuse "pipes with |& into awk" "${head}"'cat "$1" |& '"${core%"$tail"}"' 2> /dev/null }' || bad=1
+  _refuse "reads the log through a here-string" "${head}${core% 2> /dev/null}"' <<< "$(cat "$1")" 2> /dev/null }' || bad=1
+  _refuse "reads the log through a here-document" "${head}${core% 2> /dev/null}"' <<EOF $(cat "$1") EOF 2> /dev/null }' || bad=1
+  _refuse "pipes the log into the child" "${head}"'cat "$1" | '"${core} }" || bad=1
+  _refuse "pipes with |& into the child" "${head}"'cat "$1" |& '"${core} }" || bad=1
   _refuse "starts a coproc" "${head}"'coproc cat "$1" ; '"${core} }" || bad=1
   _refuse "captures the log with a command substitution" "${head}"'x="$(cat "$1")" ; '"${core} }" || bad=1
   _refuse "runs a second statement after a semicolon" "${head}${core} ; true }" || bad=1
   _refuse "calls a helper function" "${head}"'lab_helper "$1" ; '"${core} }" || bad=1
   _refuse "evals a copy command" "${head}"'eval "cp $1 /dev/shm/lab-probe.$$" ; '"${core} }" || bad=1
   _refuse "makes a temp file with mktemp" "${head}"'t=$(mktemp) ; cp "$1" "$t" ; '"${core} }" || bad=1
-  _refuse "duplicates stderr instead of discarding it" "${head}${core%"$tail"}"' "$1" 2>&1 > /dev/null }' || bad=1
-  _refuse "has awk write a file from its own program" "${head}${core/\{ f = 1 \}/\{ f = 1; print \$0 > \"/dev/shm/lab-probe\" \}}"' }' || bad=1
+  _refuse "duplicates stderr instead of discarding it" "${head}${core% 2> /dev/null} 2>&1 > /dev/null }" || bad=1
+  _refuse "has awk write a file from its own program" "${head}${core/\{ f = 1 \}/\{ f = 1; print \$0 > \"/dev/shm/lab-probe\" \}} }" || bad=1
   _refuse "changes the awk program (the INFO skip anchored)" "${head}${core/index(\$0, \"INFO\") == 0/\$0 !~ /^INFO/} }" || bad=1
-  _refuse "drops the external-awk guard" "${head}${core#*return 2; }"' }' || bad=1
-  _refuse "calls awk by bare name instead of the guarded absolute path" "${head}${core/\"\$LAB_PROBE_AWK\"/awk} }" || bad=1
-  _refuse "makes the guard return 0 for a shadowed awk" "${head}${core/return 2/return 0} }" || bad=1
-  # #5588: mutants of the guard body, refused by the same equality (the behavioural matrix below kills them as well).
+  _refuse "drops the guard call" "${head}${core#lab_probe_cmds_proven && } }" || bad=1
+  _refuse "runs the child even when the guard refuses" "${head}${core/lab_probe_cmds_proven &&/lab_probe_cmds_proven ;} }" || bad=1
+  _refuse "starts the child by the bare name bash (PATH, hash and functions decide)" "${head}${core/exec -c \"\$LAB_PROBE_BASH\"/exec -c bash} }" || bad=1
+  _refuse "runs the child bash without exec (a function named by its path would run)" "${head}${core/exec -c /} }" || bad=1
+  _refuse "keeps the caller's environment (exec without -c)" "${head}${core/exec -c/exec} }" || bad=1
+  _refuse "leaves posix mode off (a function named exec would win)" "${head}${core/POSIXLY_CORRECT=1; /} }" || bad=1
+  _refuse "has awk exit 0 or 1 (a failing child would read as a verdict)" "${head}${core/f ? 10 : 11/f ? 0 : 1} }" || bad=1
+  _refuse "has the child run awk by bare name" "${head}${core/\"\$a\" \"\$2\" \"\$1\"/awk \"\$2\" \"\$1\"} }" || bad=1
+  _refuse "has the child accept a relative awk path" "${head}${core/\$a == \/\* \&\& /} }" || bad=1
+  _refuse "has the child read an unreadable log as not detected" "${head}${core/\[\[ -r \$1 \]\] || exit 4; /} }" || bad=1
+  # #5588, #5662: mutants of the guard body, refused by the same equality (the behavioural legs below kill them as well).
   local gexp; gexp="$(lab_probe_expected_guard_body)"
   _refuse_guard() {  # <spelling> <mutated guard body>
     if lab_probe_body_allowed "$2" lab_probe_expected_guard_body; then echo "  FAIL probe matcher: a guard that $1 is accepted"; return 1
@@ -464,38 +487,56 @@ lab_posture_selftest() {
   _refuse_guard "probes only with plain type" "${gexp/ && \$(builtin type -t \"\$_lab_n\") == \"\$_lab_k\"/}" || bad=1
   _refuse_guard "probes only with builtin type" "${gexp/\$(type -t \"\$_lab_n\") == \"\$_lab_k\" && /}" || bad=1
   _refuse_guard "accepts a row when either probe agrees" "${gexp/\"\$_lab_k\" && /\"\$_lab_k\" || }" || bad=1
-  _refuse_guard "drops the regular-file test on the awk path" "${gexp/ -f \$_lab_a \&\&/}" || bad=1
-  _refuse_guard "drops the executable test on the awk path" "${gexp/ -x \$_lab_a \&\&/}" || bad=1
-  _refuse_guard "accepts an awk path that a function shadows" "${gexp/== file ]]/!= function ]]}" || bad=1
-  _refuse_guard "keeps the awk path when it refuses" "${gexp/ || LAB_PROBE_AWK=\"\"; /; }" || bad=1
+  _refuse_guard "drops the regular-file test on the bash path" "${gexp/ -f \$_lab_b \&\&/}" || bad=1
+  _refuse_guard "drops the executable test on the bash path" "${gexp/ \&\& -x \$_lab_b/}" || bad=1
+  _refuse_guard "accepts a relative bash path" "${gexp/ \$_lab_b == \/\* \&\&/}" || bad=1
+  _refuse_guard "lets the last bash path win" "${gexp/-z \$LAB_PROBE_BASH \&\& /}" || bad=1
+  _refuse_guard "keeps a caller-set LAB_PROBE_BASH" "${gexp/LAB_PROBE_BASH=\"\"; /}" || bad=1
+  _refuse_guard "keeps a caller-set LAB_PROBE_WHY" "${gexp/ LAB_PROBE_WHY=\"\";/}" || bad=1
   unset -f _refuse_guard
   # #5587: lab_probe_body_allowed is equality, not a substring, prefix or suffix compare.
   _refuse "has extra text after the allowed body (kills a prefix or substring compare)" "${exp} ; cp \"\$1\" /dev/shm/lab-probe" || bad=1
   _refuse "has extra text before the allowed body (kills a suffix or substring compare)" "cp \"\$1\" /dev/shm/lab-probe ; ${exp}" || bad=1
   unset -f _refuse
   : > "$plog/no.log"
-  # #5588: lab_probe_verdict, the report run.sh prints, says detected, not-detected, or refused with the reason.
-  v1="$(lab_probe_verdict "$plog/ok.log")"; vr1=$?; v2="$(lab_probe_verdict "$plog/no.log")"; vr2=$?
-  if [ "$v1" = detected ] && [ "$vr1" -eq 0 ] && [ "$v2" = not-detected ] && [ "$vr2" -eq 1 ]; then
-    echo "  PASS probe verdict: detected (rc 0) for a refusal line, not-detected (rc 1) for none"
-  else echo "  FAIL probe verdict: got [$v1] rc $vr1 and [$v2] rc $vr2"; bad=1; fi
-  v3="$( builtin() { command builtin "$@"; }; lab_probe_verdict "$plog/ok.log" )"; vr3=$?
-  v4="$( builtin() { command builtin "$@"; }; lab_probe_verdict "$plog/ok.log" >/dev/null; echo $? )"
+  # #5588, #5662: lab_probe_verdict, the report run.sh reads, sets LAB_PROBE_VERDICT to detected, not-detected, or refused with
+  # the reason. Only status 10 and 11 with no reason recorded are verdicts; every other status reads as refused.
+  v1="$(lab_probe_verdict "$plog/ok.log"; printf '%s' "$LAB_PROBE_VERDICT")"; v2="$(lab_probe_verdict "$plog/no.log"; printf '%s' "$LAB_PROBE_VERDICT")"
+  if [ "$v1" = detected ] && [ "$v2" = not-detected ]; then
+    echo "  PASS probe verdict: detected for a refusal line, not-detected for none"
+  else echo "  FAIL probe verdict: got [$v1] and [$v2]"; bad=1; fi
+  v3="$( builtin() { command builtin "$@"; }; lab_probe_verdict "$plog/ok.log"; command printf '%s' "$LAB_PROBE_VERDICT" )"
   case "$v3" in "refused: builtin is not the builtin the matcher needs; "*) vok=1 ;; *) vok=0 ;; esac
-  if [ "$vok" -eq 1 ] && [ "$v4" -eq 2 ]; then
-    echo "  PASS probe verdict: a shadowed builtin reports refused with the reason (rc 2), never not-detected"
-  else echo "  FAIL probe verdict: a shadowed builtin gave [$v3] rc $v4"; bad=1; fi
+  if [ "$vok" -eq 1 ]; then
+    echo "  PASS probe verdict: a shadowed builtin reports refused with the reason, never not-detected"
+  else echo "  FAIL probe verdict: a shadowed builtin gave [$v3]"; bad=1; fi
+  vok=1
+  for v4 in 0 1 2 3 4 9 12 126 127 137; do
+    v3="$( lab_probe_refusal_names_knob() { LAB_PROBE_WHY=""; return "$v4"; }; LAB_PROBE_VERDICT=stale; lab_probe_verdict "$plog/ok.log"; printf '%s' "$LAB_PROBE_VERDICT" )"
+    [ "$v3" = "refused: the probe child exited $v4, which is not a verdict" ] || { echo "  FAIL probe verdict: status $v4 gave [$v3]"; vok=0; }
+  done
+  if [ "$vok" -eq 1 ]; then echo "  PASS probe verdict: every status other than 10 and 11 (0 1 2 3 4 9 12 126 127 137) reads as refused"; else bad=1; fi
+  v3="$( lab_probe_refusal_names_knob() { LAB_PROBE_WHY="a recorded reason; "; return 10; }; lab_probe_verdict "$plog/ok.log"; printf '%s' "$LAB_PROBE_VERDICT" )"
+  if [ "$v3" = "refused: a recorded reason; " ]; then echo "  PASS probe verdict: a recorded reason wins over a child status of 10"
+  else echo "  FAIL probe verdict: a recorded reason with status 10 gave [$v3]"; bad=1; fi
+  # #5662: the reported reproducer. One function named return (no second function) used to make the matcher run awk after the
+  # guard refused, reporting not-detected for a log that holds the refusal line. No return is called on the verdict path now.
+  v1="$( return() { LAB_PROBE_AWK=/bin/false; }; lab_probe_verdict "$plog/ok.log"; command printf '%s' "$LAB_PROBE_VERDICT" )"
+  v2="$( return() { LAB_PROBE_AWK=/usr/bin/awk; }; lab_probe_verdict "$plog/no.log"; command printf '%s' "$LAB_PROBE_VERDICT" )"
+  if [ "$v1" = detected ] && [ "$v2" = not-detected ]; then echo "  PASS probe verdict: a function named return changes no verdict (#5662)"
+  else echo "  FAIL probe verdict: a function named return gave [$v1] and [$v2] (#5662)"; bad=1; fi
   # #5588: the shadow matrix. One loop over the SAME table the guard walks. Each cell shadows one command by one route in a
   # fresh subshell (or child bash, for an exported function) and runs the matcher on a log it must detect and on one it must not.
-  # "refused" means rc >= 2 on both (the matcher said it cannot prove its commands; for a shadowed return the refusal path
-  # itself is the shadow, which falls through to a failing empty command, never to a detection). "unchanged" means rc 0 and 1.
-  # No cell may report a detection for the log without a refusal line, and no hostile awk may ever run.
+  # "refused" means a status other than 10 and 11 on both (the matcher did not produce a verdict). "unchanged" means 10 and 11.
+  # No cell may report a detection for the log without a refusal line, and no hostile command may ever run.
   local canary="$plog/canary" ph="$plog/hostile-bin" self="${BASH_SOURCE[0]}" r1 r2
   mkdir -p "$ph"
   local hn
-  for hn in awk cat mktemp grep sed tr printf command declare echo env rm builtin type return '['; do
+  for hn in awk bash cat mktemp grep sed tr printf command declare echo env rm builtin type return exec exit local set shopt '['; do
     printf '#!/bin/sh\n: > "%s"\nexit 0\n' "$canary" > "$ph/$hn"; chmod +x "$ph/$hn"
   done
+  printf ': > "%s"\n' "$canary" > "$ph/bashenv"
+  printf '#!/bin/sh\n: > "%s"\nexit 10\n' "$canary" > "$plog/awk-rel"; chmod +x "$plog/awk-rel"
   _cell() {  # <label> <expect: refused|unchanged> <setup> [child] — setup runs in a fresh shell before the matcher
     local label="$1" want="$2" setup="$3" child="${4:-}" got
     rm -f "$canary"
@@ -508,9 +549,9 @@ lab_posture_selftest() {
       ( eval "$setup"; lab_probe_refusal_names_knob "$plog/no.log" ) 2>/dev/null; r2=$?
     fi
     if [ "$want" = unchanged ]; then
-      [ "$r1" = 0 ] && [ "$r2" = 1 ] && got=ok || got=bad
+      [ "$r1" = 10 ] && [ "$r2" = 11 ] && got=ok || got=bad
     else
-      { [ "$r1" -ge 2 ] && [ "$r2" -ge 2 ]; } && got=ok || got=bad
+      case "$r1:$r2" in 10:*|11:*|*:10|*:11) got=bad ;; *) got=ok ;; esac
     fi
     if [ "$got" = ok ]; then echo "  PASS shadow matrix: $label ($want, rc $r1 $r2)"; return 0; fi
     echo "  FAIL shadow matrix: $label wanted $want, got rc $r1 $r2"; return 1
@@ -537,27 +578,44 @@ lab_posture_selftest() {
       _cell "a shell function named $n that answers $k to every probe" refused "eval \"$n() { echo $k; }\"" || bad=1 ;;
     esac
   done
-  # awk is run by absolute path and never looked up by name: every bare-name route is unchanged and never runs.
+  # #5662: two coordinated lying probes (type and builtin answer each row's kind) plus a function named exec: posix mode finds the
+  # special builtin exec before the function, so the function never runs and the child gives the true verdict.
+  _cell_clean "lying type and builtin plus a function named exec (posix mode runs the builtin exec)" "type() { case \$2 in '[[') echo keyword ;; *) echo builtin ;; esac; }; builtin() { case \$3 in '[[') echo keyword ;; *) echo builtin ;; esac; }; exec() { : > \"\$canary\"; return 10; }" || bad=1
+  # awk and bash run in the child by absolute path and are never looked up by name: every bare-name route is unchanged and never runs.
   _cell_clean "a shell function named awk" "awk() { : > \"\$canary\"; command awk \"\$@\"; }" || bad=1
   _cell_clean "a shell function named awk (exported to a child bash)" "awk() { : > \"\$canary\"; command awk \"\$@\"; }; export -f awk" child || bad=1
   _cell_clean "an alias named awk (expand_aliases on) to an existing script that writes the canary" "shopt -s expand_aliases; alias awk='$ph/awk'" || bad=1
-  _cell_clean "an awk file earlier on PATH" "PATH=\"$ph:\$PATH\"" || bad=1
-  _cell_clean "hash -p pointing awk at a hostile file" "hash -p $ph/awk awk" || bad=1
-  _cell_clean "a function named by the first absolute awk path (the second path is used)" "function ${LAB_PROBE_AWK_PATHS[0]} { : > \"\$canary\"; }" || bad=1
-  _cell_clean "a caller-set LAB_PROBE_AWK pointing at a hostile file is reset by the guard" "LAB_PROBE_AWK=$ph/awk" || bad=1
-  _cell "functions named by every absolute awk path" refused "function ${LAB_PROBE_AWK_PATHS[0]} { :; }; function ${LAB_PROBE_AWK_PATHS[1]} { :; }" || bad=1
+  _cell_clean "an awk file and a bash file earlier on PATH" "PATH=\"$ph:\$PATH\"" || bad=1
+  _cell_clean "hash -p pointing awk and bash at hostile files" "hash -p $ph/awk awk; hash -p $ph/bash bash" || bad=1
+  _cell_clean "a function named by the first absolute awk path (the child never sees it)" "function ${LAB_PROBE_AWK_PATHS[0]} { : > \"\$canary\"; }" || bad=1
+  _cell_clean "functions named by every absolute awk path (the child never sees them)" "function ${LAB_PROBE_AWK_PATHS[0]} { : > \"\$canary\"; }; function ${LAB_PROBE_AWK_PATHS[1]} { : > \"\$canary\"; }" || bad=1
+  _cell_clean "functions named by every absolute bash path (exec looks up no function)" "function ${LAB_PROBE_BASH_PATHS[0]} { : > \"\$canary\"; return 10; }; function ${LAB_PROBE_BASH_PATHS[1]} { : > \"\$canary\"; return 10; }" || bad=1
+  _cell_clean "a caller-set LAB_PROBE_BASH pointing at a hostile file is reset by the guard" "LAB_PROBE_BASH=$ph/bash" || bad=1
+  _cell_clean "a relative awk path in the table is never run (the next absolute path is used)" "cd \"$plog\"; LAB_PROBE_AWK_PATHS=(awk-rel \"\${LAB_PROBE_AWK_PATHS[@]}\")" || bad=1
+  # The child's environment is empty (exec -c): nothing the caller exports reaches it.
+  _cell_clean "BASH_ENV naming a script that writes the canary never reaches the child" "export BASH_ENV=$ph/bashenv" || bad=1
+  _cell_clean "ENV naming a script that writes the canary never reaches the child" "export ENV=$ph/bashenv" || bad=1
+  _cell_clean "an exported function named exit (used only inside the child) never reaches the child" "exit() { : > \"\$canary\"; builtin exit 10; }; export -f exit" || bad=1
+  _cell_clean "exported SHELLOPTS and BASHOPTS never reach the child" "set -o noclobber; shopt -s nocasematch; export SHELLOPTS BASHOPTS" || bad=1
   _cell "no absolute awk path is an executable file" refused "LAB_PROBE_AWK_PATHS=(/nonexistent/awk $plog)" || bad=1
-  # The refusal for "no trusted awk" must come from the guard itself (rc exactly 2, a reason recorded), not from a failed exec.
+  # The refusal for "no awk file" comes from the child (exit 3, no awk run), and "no bash file" from the guard with its reason.
   ( LAB_PROBE_AWK_PATHS=(/nonexistent/awk); lab_probe_refusal_names_knob "$plog/ok.log"; exit $? ) 2>/dev/null; r1=$?
-  if [ "$r1" = 2 ]; then echo "  PASS shadow matrix: no trusted awk is refused by the guard with rc 2"; else echo "  FAIL shadow matrix: no trusted awk gave rc $r1, wanted 2 from the guard"; bad=1; fi
-  # The FIRST trusted awk path wins: a later executable path must never run.
+  if [ "$r1" = 3 ]; then echo "  PASS shadow matrix: no awk file is refused by the child with exit 3"; else echo "  FAIL shadow matrix: no awk file gave rc $r1, wanted 3 from the child"; bad=1; fi
+  v1="$( LAB_PROBE_BASH_PATHS=(bash /nonexistent/bash); lab_probe_verdict "$plog/ok.log"; printf '%s' "$LAB_PROBE_VERDICT" )"
+  if [ "$v1" = "refused: no bash file in bash /nonexistent/bash; " ]; then echo "  PASS shadow matrix: no absolute bash file is refused by the guard with its reason"; else echo "  FAIL shadow matrix: no bash file gave [$v1]"; bad=1; fi
+  # The FIRST usable awk path and the FIRST usable bash path win: a later executable path must never run.
   printf '#!/bin/sh\n: > "%s"\nexec /usr/bin/awk "$@"\n' "$plog/first.mark" > "$ph/awk-first"; chmod +x "$ph/awk-first"
   printf '#!/bin/sh\n: > "%s"\nexec /usr/bin/awk "$@"\n' "$plog/second.mark" > "$ph/awk-second"; chmod +x "$ph/awk-second"
   rm -f "$plog/first.mark" "$plog/second.mark"
   ( LAB_PROBE_AWK_PATHS=("$ph/awk-first" "$ph/awk-second"); lab_probe_refusal_names_knob "$plog/ok.log"; exit $? ) 2>/dev/null; r1=$?
-  if [ "$r1" = 0 ] && [ -e "$plog/first.mark" ] && [ ! -e "$plog/second.mark" ]; then echo "  PASS shadow matrix: the first trusted awk path wins and the second never runs"; else echo "  FAIL shadow matrix: first-path-wins rc $r1"; bad=1; fi
-  # Neighbour commands the matcher must never call, shadowed by a function and by a PATH file.
-  for hn in cat mktemp grep sed tr printf command declare echo env rm; do
+  if [ "$r1" = 10 ] && [ -e "$plog/first.mark" ] && [ ! -e "$plog/second.mark" ]; then echo "  PASS shadow matrix: the first awk path wins and the second never runs"; else echo "  FAIL shadow matrix: awk first-path-wins rc $r1"; bad=1; fi
+  printf '#!/bin/sh\n: > "%s"\nexec %s "$@"\n' "$plog/first.mark" "${LAB_PROBE_BASH_PATHS[0]}" > "$ph/bash-first"; chmod +x "$ph/bash-first"
+  printf '#!/bin/sh\n: > "%s"\nexec %s "$@"\n' "$plog/second.mark" "${LAB_PROBE_BASH_PATHS[0]}" > "$ph/bash-second"; chmod +x "$ph/bash-second"
+  rm -f "$plog/first.mark" "$plog/second.mark"
+  ( LAB_PROBE_BASH_PATHS=("$ph/bash-first" "$ph/bash-second"); lab_probe_refusal_names_knob "$plog/ok.log"; exit $? ) 2>/dev/null; r1=$?
+  if [ "$r1" = 10 ] && [ -e "$plog/first.mark" ] && [ ! -e "$plog/second.mark" ]; then echo "  PASS shadow matrix: the first bash path wins and the second never runs"; else echo "  FAIL shadow matrix: bash first-path-wins rc $r1"; bad=1; fi
+  # Neighbour commands the matcher must never call in the caller's shell, shadowed by a function and by a PATH file.
+  for hn in cat mktemp grep sed tr printf command declare echo env rm return exit local set shopt; do
     _cell_clean "a shell function named $hn is never called" "eval \"$hn() { : > \\\"\$canary\\\"; command $hn \\\"\\\$@\\\"; }\"" || bad=1
     _cell_clean "a $hn file earlier on PATH is never run" "PATH=\"$ph:\$PATH\"" || bad=1
   done
