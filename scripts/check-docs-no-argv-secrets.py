@@ -219,9 +219,21 @@ PSQL_VAR_OPT_RE = re.compile(
 # identifier) and a -v operand a text gate cannot decide (a shell expansion or
 # substitution in the name part, or an operand that is only an expansion) is
 # flagged, never skipped.
-# STATED LIMIT: options that reach psql through an array or another variable
-# (args=(-v pw=$X); psql "${args[@]}") are not after the psql word and a text gate
-# cannot follow them; that form is tracked by its own open issue, #5398.
+# #5481-#5483 round-6 (F1, F2, F3): -v clusters may carry digits before v (-1v, -0v, -Xq1v);
+# a psql word spelled with backslashes or quotes (\psql, p\sql, ps''ql, "ps"ql) is
+# normalised to psql before BOTH psql rules run; a non-ASCII -v name is flagged
+# whatever it spells; a -v VALUE that expands a secret-named variable ($PGPASSWORD,
+# ${PG_PW}, $(cat<no space>pw)) is flagged under any name.
+# STATED LIMITS (a text gate cannot decide these; each is recorded in its issue):
+#   * options that reach psql through an array or another variable
+#     (args=(-v pw=$X); psql "${args[@]}") are not after the psql word and a text gate
+#     cannot follow them; that form is tracked by its own open issue, #5398.
+#   * a secret held in a variable whose own NAME is neutral and passed to psql -v
+#     under a neutral name (x=$A where A=$PGPASSWORD was assigned on another line),
+#     and a secret written as a literal under a neutral name (-v x=hunter2), carry no
+#     secret-like token on the psql line; the gate decides by the names on the line.
+#   * the -v operand is one shell word, so a command substitution value with a space
+#     (x=$(cat /run/pw)) is read only up to its first space.
 PSQL_SECRET_VAR_NAME_RE = re.compile(r"pass|secret|token|key|cred|pw|auth", re.IGNORECASE)
 SECRET_VAR_RE = re.compile(
     r"\$\{[A-Za-z0-9_]*(?:(?:password|passwd|secret|token|key|cred)[A-Za-z0-9_]*|pw|pass)\}",
@@ -633,11 +645,20 @@ def normalise_psql_heads(text: str) -> str:
 
 
 def psql_var_operand_flagged(operand: str) -> bool:
-    """A psql -v operand is flagged when its name is secret-like or undecidable (#5448)."""
-    name = operand.split("=", 1)[0]
+    """A psql -v operand is flagged when its name is secret-like, non-ASCII or
+    undecidable (#5448), or when its VALUE expands a secret-named variable (#5483)."""
+    name, _, value = operand.partition("=")
     if PSQL_SECRET_VAR_NAME_RE.search(name):
         return True
     if any(ch in name for ch in "$`(){}"):
+        return True
+    # #5483 (round-6 F3): a name psql takes as high-bit bytes can spell a secret name
+    # with a look-alike letter (a Cyrillic p), so any non-ASCII name is flagged.
+    if not name.isascii():
+        return True
+    # #5483: a neutral name does not hide a value that expands a secret-named variable
+    # ($PGPASSWORD, ${PG_PW}); the operand is one word, so the value is read to its first space.
+    if "$" in value and PSQL_SECRET_VAR_NAME_RE.search(value[value.index("$"):]):
         return True
     return False
 
@@ -1039,6 +1060,16 @@ RED_PROBES_4600 = {
     "5482-06-split-head-c-password": "p\\sql -c \"ALTER USER a PASSWORD 'hunter2x'\"",
     "5482-07-quoted-wrapper-head": '"run_ps"ql -v pw="$PG_PW" -f x.sql',
     "5482-08-split-head-after-semicolon": 'true;\\psql -v pw="$PG_PW" -f x.sql',
+    # #5483 (PR 4810 round-6 F3): a neutral variable name does not hide a value that expands
+    # a secret-named variable, and a non-ASCII name can spell a secret with a look-alike letter.
+    "5483-01-neutral-name-pgpassword": 'psql -v x="$PGPASSWORD" -f x.sql',
+    "5483-02-neutral-name-braced-pw": 'psql -v x="${PG_PW}" -f x.sql',
+    "5483-03-neutral-name-unquoted-pw": 'psql -v x=$PG_PW -f x.sql',
+    "5483-04-homoglyph-name": 'psql -v \u0440w="$PG_PW" -f x.sql',
+    "5483-05-neutral-name-set-long": 'psql --set x="$DB_SECRET" -f x.sql',
+    "5483-06-neutral-name-literal-prefix": 'psql -v x=pre-${TOKEN_VALUE} -f x.sql',
+    "5483-07-neutral-name-joined-cluster": 'psql -qvx="$PGPASSWORD" -f x.sql',
+    "5483-08-neutral-name-key-value": 'psql --variable=x=$API_KEY -f x.sql',
     # #4808: the forms the #4782 gate missed.
     "4808-docker-e-dsn-literal": "docker run -e DATABASE_URL=postgres://u:hunter2@h/d img",
     "4808-psql-set-equals-pw": 'psql --set=pw="$PG_PW" -f bootstrap.sql',
@@ -1099,6 +1130,9 @@ GREEN_PROBES_4600 = {
     "5448-psql-v-substituted-value-only": 'psql -v role="$ROLE_NAME" -f x.sql',
     "5482-split-word-not-psql": 'p\\sqlx -v role=aimemory -f x.sql',
     "5482-quoted-psql-no-secret": 'echo "psql" -v role=aimemory -f x.sql',
+    "5483-psql-v-neutral-value-expansion": 'psql -v x="$DB_NAME" -f x.sql',
+    "5483-psql-v-neutral-value-dollar-only": 'psql -v n=$ROWS -f x.sql',
+    "5483-psql-v-ascii-name-literal-value": 'psql -v role=aimemory -v n=3 -f x.sql',
     "5481-psql-cluster-digit-non-secret-name": "psql -1v role=aimemory -f x.sql",
     "4808-docker-e-dsn-inherit": "docker run -e DATABASE_URL img",
     "4808-docker-e-dsn-no-password": "docker run -e DATABASE_URL=postgres://u@h/d img",
