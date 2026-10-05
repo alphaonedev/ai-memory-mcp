@@ -679,6 +679,20 @@ MDEOF
         run_fixture_out | sed 's/^/       /' >&2; exit 1; }
     echo "PASS: self-test #5436 — a brace item with a second src path is reported exactly once"
 
+    # Round-6 mutant pins: a missing file under a next-line symbol-label link is
+    # reported exactly once (MDLINK owns it; the file-link scan must skip it),
+    # and a placeholder group inside a brace item is not a symbol claim.
+    write_clean
+    printf '\n\n%s\n' $'See [`recall`](\nsrc/gone.rs) x' >> "$FIX/README.md"
+    [[ "$(run_fixture)" != "0" ]] || {
+        echo "FAIL: self-test #5431 — a next-line destination to a missing file was ACCEPTED" >&2; exit 1; }
+    [[ "$(run_fixture_out | grep -c 'cites "')" = "1" ]] || {
+        echo "FAIL: self-test #5431 — a next-line symbol-label link to a missing file must be reported exactly once" >&2
+        run_fixture_out | sed 's/^/       /' >&2; exit 1; }
+    echo "PASS: self-test #5431 — a next-line symbol-label link to a missing file is reported exactly once"
+    anchor_green 5433 "a placeholder group with a nested group inside a brace item" \
+        "See \`$R::{<name<T>>}\` here."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
