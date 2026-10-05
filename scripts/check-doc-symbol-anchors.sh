@@ -45,6 +45,16 @@
 #            form is checked too (reported as BARE_QUAL, #5191), and a
 #            qualified anchor never gets the absent-path exemption: it
 #            asserts the file exists (#5201).
+#            Self types and closers (#5457, #5493, #5498, #5530-#5537): the
+#            type and every bound of `<dyn A + B>::m`, `<&mut T>::m` or a lone
+#            `<*const T>` are checked (only `?Sized` is skipped) and a self
+#            type naming no type is refused; a closer after the anchor's own
+#            group (attached, spaced, or an entity) is reported; a `<` that
+#            is a whitespace-delimited operator token (`a < b`, `a << b`,
+#            `a <- b`) opens no prose group. The turbofish spellings
+#            `Vec::<src/x.rs::T>::new`, `Arc<src/x.rs::T>::clone` and
+#            `HashMap<u8, src/x.rs::T>::NoSuch` are all reported (fail
+#            closed: the name after the closer may belong to Vec or Arc).
 #   BARE_LN — (#4651) a BARE `src/<path>.rs:<N>` (no backtick: prose, a
 #            link label, HTML text) is a finding unless it labels a
 #            commit-pinned permalink (`/blob/<hex sha>/`, immutable).
@@ -993,6 +1003,29 @@ MDEOF
         "See Vec&LT;$R::RecallTool&GT; here."
     anchor_green 5536 "a group followed by a spaced greater-than comparison" \
         "See $R::RecallTool<T> > 3 here."
+
+    # #5537: a higher-ranked binder (`for<'a>`) before a bound is skipped, so
+    # the trait behind it is the name that is checked, not the word `for`.
+    anchor_red_cites 5537 QUAL "a dyn self type behind a binder with a missing trait" \
+        "$R::NoSuch" \
+        "See \`$R::<dyn for<'a> NoSuch>::decorate_memory_many\`."
+    anchor_green 5537 "a dyn self type behind a binder with a live trait" \
+        "See \`$R::<dyn for<'a> RecallTool>::decorate_memory_many\`."
+    anchor_green 5537 "a dyn self type behind a spaced binder with two lifetimes" \
+        "See \`$R::<dyn for <'a, 'b> RecallTool>::decorate_memory_many\`."
+    anchor_green 5537 "an impl self type behind a binder with a live trait" \
+        "See \`$R::<impl for<'a> RecallTool>::decorate_memory_many\`."
+    anchor_green 5537 "a reference to a dyn self type behind a binder" \
+        "See \`$R::<&dyn for<'a> RecallTool>::decorate_memory_many\`."
+    # #5537: a turbofish or an own-generic spelling around the anchor is
+    # reported, consistently: the name after the closer may belong to Vec or
+    # Arc, so the gate cannot tell it from a claim about the cited file.
+    anchor_red 5537 BARE_QUAL "a turbofish around the anchor is reported" \
+        "See Vec::<$R::RecallTool>::new here."
+    anchor_red 5537 BARE_QUAL "an own-generic spelling around the anchor is reported" \
+        "See Arc<$R::RecallTool>::clone here."
+    anchor_red 5537 BARE_QUAL "a generic with a leading argument around the anchor is reported" \
+        "See HashMap<u8, $R::RecallTool>::NoSuch here."
 
     # #5497: the header, ABSENT_DEST and the CLAUDE.md gate paragraph state the
     # same destination wording and the same never-exempt cases.
@@ -1954,8 +1987,11 @@ AS_WORD = re.compile(r"\bas\b")
 # `dyn ?Sized + T`) is skipped too; it is not the type either. #5532: the only
 # `?` bound Rust has is `?Sized`, so any other name after `?` is not skipped
 # (the self type is then refused) and the bounds after the type are checked.
+# #5537: a higher-ranked binder (`dyn for<'a> Tr`) is skipped too, so the
+# trait behind it is the checked name and `for` is never cited as a symbol.
 SELF_PREFIX = re.compile(
     r"(?:&\s*(?:'[A-Za-z_]\w*\s+)?(?:mut\s+)?|\*\s*(?:const|mut)\s+|\b(?:dyn|impl|mut)\s+"
+    r"|\bfor\s*<[^<>]*>\s*"
     r"|(?:'[A-Za-z_]\w*|\?\s*Sized\b)\s*\+\s*)+")
 # #5393/#5433 pin a lone `<name>` and `<name<T>>` (an identifier head, no
 # prefix, no `as`) as a placeholder, not a symbol claim; every other lone
