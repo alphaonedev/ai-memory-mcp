@@ -12,7 +12,7 @@
 #
 # This cannot be prevented inside a branch. It is a merge property. So the
 # rule has two halves:
-#   DECLARE  — a commit that changes a `.len()` count assertion says so, in a
+#   DECLARE  — a commit that changes a `.len()`/`.count()` count assertion says so, in a
 #              trailer of its OWN message, so the merger knows a shared count moved:
 #                  Count: <what> <old> -> <new> (<why>)
 #              several changes may share one line, separated by ", ":
@@ -29,10 +29,12 @@
 #     contain `count:`, a declaration line in the middle of the body, a `# count:`
 #     line and a declaration in the subject line are NOT declarations.
 #   * <old> and <new> must equal the gate's own finding, and <what> must name the
-#     assertion (#5575): the whole asserted expression, or words of at least 3
-#     characters that are each a WHOLE token (case-insensitive) of the expression or
-#     of the file-name stem; a one-letter word, a punctuation-only word, a directory
-#     name and a bare `len`/`count` name nothing. EVERY changed assertion of the commit must be
+#     assertion (#5575): either the whole asserted expression, or words of which AT
+#     LEAST ONE is a whole token (case-insensitive) of the expression or of the
+#     file-name stem, other than `len`/`count`; the other words are free prose of at
+#     least 3 characters. A word with a chunk of one or two characters, or a
+#     punctuation-only word, refuses the whole item; the file path or file name of
+#     the assertion is skipped as context (#5712). EVERY changed assertion of the commit must be
 #     covered; a declaration that covers only some of them leaves the commit red.
 #     Several correct declarations (own line plus later ones) are pooled, and the
 #     items are CONSUMED ONE-TO-ONE against the hits (#5576): each changed
@@ -58,12 +60,16 @@
 # of its own and, when ONLY the number changes, the `.len()` line is not in the
 # diff at all; a per-line regex over `git show` misses exactly the shape the
 # gate exists for. So for every .rs file a commit touches under the
-# repository-root src/ and tests/ directories (#5711; tools/*/src, examples/,
+# repository-root src/ and tests/ directories (#5711, #5716; tools/*/src, examples/,
 # benches/ and fuzz/ are not checked),
-# the OLD and NEW contents are parsed whole (comments stripped, string
-# literals blanked), every count assertion is extracted as
-# (normalised expression, numeric literal), and the two sets are compared:
-# an assertion whose literal moved, appeared or disappeared is a count change.
+# the OLD and NEW contents are parsed whole (`//` line comments stripped and
+# double-quoted string literals blanked; a `/* */` block comment is read as code,
+# and a raw string is blanked only up to its first inner quote, #5712, #5715), every
+# count assertion is extracted as (normalised expression, value), and the two
+# sets are compared: an assertion whose value moved, appeared or disappeared is a
+# count change, except that an assertion whose values are all undecidable
+# spellings neither appears nor disappears. Reversed operands and `assert_ne!`
+# are not read (#5714).
 # The named-const spelling — `assert_eq!(x.len(), EXPECTED)` with
 # `const EXPECTED: usize = 19;` — is resolved the same way: a const that a
 # count assertion names, whose literal moved, is a count change.
@@ -72,8 +78,9 @@
 # copied file is compared with its SOURCE path, so rename-plus-bump and
 # copy-plus-bump stay red. An assertion is skipped as new (no earlier count
 # exists to drift from; #5499) only when its file has status A in that same
-# commit AND the asserted expression or constant exists in no other file of the
-# parent tree. A new assertion in an EXISTING file stays red until declared.
+# commit AND the asserted expression or constant exists in no checked (src/ or
+# tests/) .rs file of the parent tree. A new assertion in an EXISTING file stays
+# red until declared.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 RANGE="HEAD~1..HEAD"; SELF_TEST=0
@@ -145,7 +152,8 @@ CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]*)\s*:\s*(?:usize|u\d+|i\d
 
 
 def macro_args(t, i):
-    """t[i:] follows a macro's '('. -> the text up to the matching ')', or None when unbalanced."""
+    """t[i:] follows a macro's '('. -> the text up to the matching ')', or None when unbalanced, when a ';' is met at
+    depth 0, or when the first depth-0 closer is not ')'."""
     depth, angle, j, n = 0, 0, i, len(t)
     while j < n:
         ch = t[j]
@@ -175,8 +183,8 @@ def first_arg(rest):
 
 def extract(text):
     """-> ({expr-key: {value, ...}}, {const name: value}, {const names referenced from another file}).
-    A value is a decimal integer, `?<spelling>` (undecidable right-hand side) or `@NAME` (a const defined in another
-    file: resolved against the whole tree by resolve(), never guessed here)."""
+    A value is a decimal integer, `?<spelling>` (undecidable right-hand side) or `@NAME` (a name not defined as a const in
+    this file: resolved by resolve() against every eligible .rs file of the tree, never guessed here)."""
     text = clean(text)
     consts = {}
     for m in CONST.finditer(text):
@@ -247,7 +255,7 @@ def build_state(rev):
 
 
 def defs_of(rev):
-    """{const name: [(path, value)]} over the whole tree of rev."""
+    """{const name: [(path, value)]} over every eligible (src/, tests/) .rs file of rev."""
     if rev not in _DEFS:
         d = {}
         for path, (_, consts, _r) in _STATE[rev].items():
@@ -257,9 +265,9 @@ def defs_of(rev):
 
 
 def resolve(rev, assertions):
-    """Replace every `@NAME` with the tree-wide value: exactly one definition -> its value; none -> `?NAME#unresolved`;
+    """Replace every `@NAME` with its value over the eligible files of the tree: exactly one definition -> its value; none -> `?NAME#unresolved`;
     several (two files define the name) -> `?NAME#ambiguous(<every value>)`, so a bump of either definition still moves it. Closed-world: a name that cannot be resolved to ONE integer
-    is never read as 'unchanged' (#5578)."""
+    stays a `?` state, which is a move unless the state is identical on both sides (#5578, #5672)."""
     out = {}
     for k, vals in assertions.items():
         rv = set()
@@ -300,7 +308,7 @@ def changed_files(c):
 
 
 def count_changes(c):
-    """-> [(file, expr, old, new)] one per changed count assertion of commit c, consts resolved over the whole tree."""
+    """-> [(file, expr, old, new)] one per changed count assertion of commit c, consts resolved over the eligible files of the tree."""
     parent = git('rev-parse', '--verify', '--quiet', c + '^').strip()
     entries = [e for e in changed_files(c)
                if (e[1] and eligible(e[1])) or (e[2] and eligible(e[2]))]
@@ -772,6 +780,24 @@ def selftest():
     for p_ in ('tools/x/src/scope.rs', 'tools/x/tests/scope.rs', 'examples/scope.rs', 'fuzz/fuzz_targets/scope.rs'):
         case('a .rs file under %s is not checked (not the repository-root src/ or tests/)' % p_.rsplit('/', 1)[0],
              scoped(p_, E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
+    # ---- #5712: clause pins from the sentence sweep of the changelog and this header (#5714 #5715 #5716 pin the limits) ----
+    case('a reversed operand order assert_eq!(<rhs>, <expr>.len()) is not read',
+         scoped('tests/scope.rs', 'fn t() { assert_eq!(18, items.len()); }\n', 'fn t() { assert_eq!(19, items.len()); }\n'), False)
+    case('a reversed operand order assert!(<rhs> == <expr>.len()) is not read', scoped('tests/scope.rs', 'fn t() { assert!(18 == items.len()); }\n', 'fn t() { assert!(19 == items.len()); }\n'), False)
+    case('assert_ne! is not read', scoped('tests/scope.rs', E('assert_ne', 'len', 18), E('assert_ne', 'len', 19)), False)
+    case('an assertion inside a block comment is read as code', scoped('tests/scope.rs', '/* ' + E('assert_eq', 'len', 18) + ' */\n', '/* ' + E('assert_eq', 'len', 19) + ' */\n'), True, ['items.len()  18 -> 19'])
+    case('an assertion after a line comment marker is not read', scoped('tests/scope.rs', '// ' + E('assert_eq', 'len', 18), '// ' + E('assert_eq', 'len', 19)), False)
+    case('an assertion inside a double-quoted string literal is not read', scoped('tests/scope.rs', 'const S: &str = "%s";\n' % E('assert_eq', 'len', 18).strip(), 'const S: &str = "%s";\n' % E('assert_eq', 'len', 19).strip()), False)
+    case('a raw string is blanked only up to its first inner quote', scoped('tests/scope.rs', 'const S: &str = r#"q " %s "#;\n' % E('assert_eq', 'len', 18).strip(), 'const S: &str = r#"q " %s "#;\n' % E('assert_eq', 'len', 19).strip()), True, ['items.len()  18 -> 19'])
+    def c_parent_tools(s, b):                              # the parent holds the expression only in a file that is not checked
+        s.w('tools/x/src/old.rs', 'fn t() { assert_eq!(builds.len(), 1); }\n'); t0 = s.commit('test: tools file')
+        s.w('tests/n1.rs', 'fn t() { assert_eq!(builds.len(), 2); }\n'); s.commit('test: new file'); return t0 + '..HEAD'
+    case('a new file whose expression exists in the parent only in an unchecked file is skipped as new', c_parent_tools, False)
+    case('a const of the same name in an unchecked file is not a second definition',
+         shared(A('crate::EXPECTED_N'), L(18), L(19), {'tools/x/src/lib.rs': L(3)}), True, ['sections.len() [EXPECTED_N]  18 -> 19'])
+    case('a const defined only in an unchecked file stays unresolved, so its bump there moves nothing',
+         shared(A('crate::OTHER_N') + '// a\n', L(18), L(18), {'tools/x/src/lib.rs': 'pub const OTHER_N: usize = 1;\n'},
+                {'tools/x/src/lib.rs': 'pub const OTHER_N: usize = 2;\n', SH: A('crate::OTHER_N') + '// b\n'}), False)
     def c_ren(s, b):                                       # the defining file is renamed with the bump
         s.w('src/lib.rs', L(18) + PAD); s.w(SH, A('crate::EXPECTED_N')); t0 = s.commit('test: add')
         s.g('mv', 'src/lib.rs', 'src/consts.rs'); s.w('src/consts.rs', L(19) + PAD); s.commit('test: move and bump'); return t0 + '..HEAD'
@@ -812,6 +838,9 @@ def selftest():
     def c_late_abbrev(s, b):
         o = offender(s, b); s.touch(msg('docs: declare', late(o, S_FF, sha=o[:12]))); return b + '..HEAD'
     case('late declaration with an abbreviated sha', c_late_abbrev, True, ['18 -> 19'], ['40-character'])
+    def c_late_upper(s, b):
+        o = offender(s, b); s.touch(msg('docs: declare', late(o, S_FF, sha=o.upper()))); return b + '..HEAD'
+    case('late declaration with an upper-case sha', c_late_upper, True, ['18 -> 19'], ['40-character'])
     def c_late_partial(s, b):
         o = offender(s, b, two=True); s.touch(msg('docs: declare', late(o, S_FF))); return b + '..HEAD'
     case('late declaration covering one of two hits', c_late_partial, True, ['long_name.len()  5 -> 6'])
