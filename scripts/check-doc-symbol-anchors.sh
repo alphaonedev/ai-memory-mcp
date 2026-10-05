@@ -82,7 +82,7 @@
 # REFUSALS. Where the gate cannot positively read an anchor it refuses
 # it rather than pass it (fail closed, #5680):
 #   UNDECIDABLE_REF — the anchor's character references decode
-#            differently in CommonMark and HTML (#5606).
+#            differently in CommonMark and HTML (#5607).
 #   UNDECIDABLE_LT — a prose `<` before it may or may not open a group,
 #            and the anchor is judged differently either way (#5608).
 #   UNMODELLED — a self type the gate cannot read, any Rust keyword
@@ -1127,6 +1127,33 @@ if len(rules) < 11 or missing:
     sys.exit(1)
 PYEOF
     echo "PASS: self-test #5680 — every rule the gate can print has a header line"
+
+    # #5765: every issue a refusal line of the header cites has a self-test
+    # case of that rule filed under that issue, so a refusal cannot cite an
+    # issue that never pinned it.
+    python3 - "$SELF" <<'PYEOF' || { echo "FAIL: self-test #5765 — a refusal line cites an issue with no case of that rule" >&2; exit 1; }
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+head, body = src.split("\nset -", 1)
+block = head.split("# REFUSALS.", 1)[1].split("# PATH FORMS.", 1)[0]
+cited = {}
+rule = None
+for line in block.splitlines():
+    m = re.match(r"#   ([A-Z][A-Z_]+) +—", line)
+    if m:
+        rule = m.group(1)
+    if rule:
+        cited.setdefault(rule, set()).update(re.findall(r"#(\d{4,})", line))
+pairs = set(re.findall(r"anchor_red\w*\s+(\d+)\s+([A-Z][A-Z_]+)", body))
+unread = re.search(r"unreadable_red\(\) \{.*?\n    \}", body, re.S)
+if unread:
+    pairs |= {(n, "SETUP") for n in re.findall(r"self-test #(\d+) — \$1 is REJECTED", unread.group(0))}
+bad = sorted((r, n) for r, ns in cited.items() for n in ns if (n, r) not in pairs)
+if len(cited) < 4 or bad:
+    print("refusal citations with no case:", bad, "rules:", sorted(cited), file=sys.stderr)
+    sys.exit(1)
+PYEOF
+    echo "PASS: self-test #5765 — every issue a refusal line cites has a case of that rule"
 
     # #5615: a changelog entry for this gate states what is decoded, refused
     # and unmodelled, not a closure the code does not have. The entry is read
