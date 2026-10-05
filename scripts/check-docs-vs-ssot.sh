@@ -3367,6 +3367,9 @@ R5MD
     # that value, so one row shielded every stale claim in its file. Rows 1-19 are
     # such needles and each is refused by line number; row 20 (fullwidth digits) is
     # refused by the #5699 rule first; row 21 carries a subject word and is accepted.
+    # Row 22 has a word only before marker folding (the fold glues it to the value),
+    # so it is refused; row 23's one subject word has exactly three letters and is
+    # accepted.
     # The stale claims on lines 1, 2 and 4 must be flagged; the history on line 3 stays exempt.
     _s=scripts/qc-allowlists/schema-claim-history.txt
     {
@@ -3376,6 +3379,8 @@ R5MD
         done
         printf 'docs/postgres-age-guide.md\t\xef\xbc\x95\xef\xbc\x92 abc\t#5808 fullwidth digits\n'
         printf 'docs/postgres-age-guide.md\tschema_version was 54\t#5808 subject text, accepted\n'
+        printf 'docs/postgres-age-guide.md\tabc`52\t#5808 word glued to the value by the fold\n'
+        printf 'docs/postgres-age-guide.md\twas 54\t#5808 a three-letter subject word, accepted\n'
     } > "$_s"
     cat > "$tmpdir/docs/postgres-age-guide.md" <<'R5808MD'
 The CURRENT_SCHEMA_VERSION is 52 here.
@@ -3389,14 +3394,14 @@ R5808MD
                  'docs/postgres-age-guide.md:4 claims "52"' 'malformed entry at line 20 "vacuous needle'; do
         grep -qF "$_want" <<<"$_s_out" || { echo "FAIL: self-test #5808 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }
     done
-    for _n in {1..19}; do
+    for _n in {1..19} 22; do
         grep -qF "malformed entry at line $_n \"needle carries no subject text" <<<"$_s_out" \
             || { echo "FAIL: self-test #5808 - subject-less ledger needle at line $_n not refused by name" >&2; cd "$REPO_ROOT"; exit 1; }
     done
-    for _not in 'docs/postgres-age-guide.md:3 ' 'line 21 ' 'malformed entry at line 21 '; do
+    for _not in 'docs/postgres-age-guide.md:3 ' 'line 21 ' 'malformed entry at line 21 ' 'line 23 ' 'malformed entry at line 23 '; do
         grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5808 - a needle with subject text was refused or its history flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
-    echo "PASS: self-test #5808 - a ledger needle without subject text beyond the value (the bare value, v52, V52, 52., (52), bold, code span, padding, bold padding, a number plus a letter, two letters, two numbers, an arrow, an issue ref, a word glued to the number by letters or an underscore, a short bold word, single letters split by markers) is REFUSED by line number and the stale claims it would have shielded are flagged; fullwidth digits are refused by the #5699 rule; a needle with a subject word is accepted"
+    echo "PASS: self-test #5808 - a ledger needle without subject text beyond the value (the bare value, v52, V52, 52., (52), bold, code span, padding, bold padding, a number plus a letter, two letters, two numbers, an arrow, an issue ref, a word glued to the number by letters or an underscore, a short bold word, single letters split by markers, a word the marker fold glues to the value) is REFUSED by line number and the stale claims it would have shielded are flagged; fullwidth digits are refused by the #5699 rule; a needle with a subject word (three letters is enough) is accepted"
     # ---- #5810: a ledger row is not bounded to one hit. One row exempts the same
     # history phrase on two lines, and a stale claim on a third line is still flagged.
     printf 'docs/postgres-age-guide.md\tschema_version was 54\t#5810 one row, two lines\n' > "$_s"
