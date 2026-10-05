@@ -263,6 +263,9 @@ self_test() {
   bleg "override leg: a local previous pin under GITHUB_ACTIONS=true is refused" fail "DECLARATION_GATE_LOCAL_PREVIOUS_PIN (a local override|$src" GITHUB_ACTIONS=true DECLARATION_GATE_LOCAL_PREVIOUS_PIN="$scratch/previous.pin"
   bleg "override leg: a local base with a local previous pin is refused" fail "two previous-pin sources|$src" DECLARATION_GATE_LOCAL_BASE="$c2" DECLARATION_GATE_LOCAL_PREVIOUS_PIN="$scratch/previous.pin"
   bleg "override leg: a lowercase look-alike is not an input and changes nothing" pass "" declaration_gate_base="$c1" DECLARATION_GATE_LOCAL_BASE="$c2"
+  bleg "override leg: a name with a non-letter after the prefix is refused" fail "DECLARATION_GATE__BASE|$src" DECLARATION_GATE__BASE="$c2"
+  bleg "D1b local-base leg: an empty local base is red, the event cannot fill it in" fail "does not resolve to a commit" DECLARATION_GATE_LOCAL_BASE= GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$c1" GITHUB_SHA="$c2"
+  bleg "D1b previous-pin leg: an empty local previous pin is red, the event cannot fill it in" fail "names no file" DECLARATION_GATE_LOCAL_PREVIOUS_PIN= GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$c1" GITHUB_SHA="$c2"
   # A shell variable that is set but not exported (for example by a BASH_ENV file) is read
   # by the gate exactly like an exported one, so the refusal lists every shell variable.
   printf 'DECLARATION_GATE_LOCAL_BASE=%s\n' "$c2" > "$scratch/bashenv-local"

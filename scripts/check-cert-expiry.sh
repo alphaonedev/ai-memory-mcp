@@ -1336,6 +1336,8 @@ self_test() {
         CERT_EXPIRY_LOCAL_BASE= CERT_EXPIRY_LOCAL_HEAD="$docs_sha"
     gate_leg "ov10 a lowercase look-alike is not an input (control)" green "" \
         cert_expiry_base="$viol_sha" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$base_sha" GITHUB_SHA="$docs_sha"
+    gate_leg "ov11 a name with a non-letter after the prefix is refused" red "CERT_EXPIRY__BASE|$src" \
+        CERT_EXPIRY__BASE="$docs_sha" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$base_sha" GITHUB_SHA="$docs_sha"
     # Workflow-env runtime legs (#5970 F1, #5851): plant the variable in a copy
     # of the real workflow at job level or workflow level, resolve the env that
     # reaches the gate step with ci-commit-range.py --gate-step-env, and run the

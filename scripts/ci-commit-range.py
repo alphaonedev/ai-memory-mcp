@@ -850,6 +850,44 @@ def self_test():
             names = sorted(line.split("=", 1)[0] for line in proc.stdout.splitlines())
             contract.append(("--gate-step-env: " + label, proc.returncode == want_code and names == want_names
                              and (want_code == 0 or proc.stderr.startswith("ci-commit-range: REFUSED: "))))
+        # Values and the forms at the edge of the reader: a wrong value or a silently
+        # dropped form would hand the gate a different env than Actions does.
+        dj = "  declaration-hash-gate:\n"
+        step_anchor = "        run: bash scripts/check-declaration-hash.sh\n"
+        for label, mutated, want_code, want_lines in (
+                ("a quoted value reaches the step unquoted",
+                 wf_text.replace(dj, dj + "    env:\n      DECLARATION_GATE_BASE: 'HEAD'\n", 1), 0,
+                 ["DECLARATION_GATE_BASE=HEAD"]),
+                ("a job env under a quoted env key is read",
+                 wf_text.replace(dj, dj + "    \"env\":\n      DECLARATION_GATE_BASE: HEAD\n", 1), 0,
+                 ["DECLARATION_GATE_BASE=HEAD"]),
+                ("a step env overrides a job env of the same name",
+                 wf_text.replace(dj, dj + "    env:\n      GITHUB_EVENT_NAME: job\n", 1), 0,
+                 ["GITHUB_EVENT_NAME=${{ github.event_name }}"]),
+                ("two workflow-level env blocks are refused",
+                 wf_text.replace("\njobs:\n", "\nenv:\n  A: 1\nenv:\n  B: 2\njobs:\n", 1), 1, []),
+                ("an env key at an unexpected indent is refused",
+                 wf_text.replace(dj, dj + "    steps2:\n      env:\n        X: 1\n", 1), 1, []),
+                ("a block entry deeper than one level is refused",
+                 wf_text.replace(dj, dj + "    env:\n        X: 1\n", 1), 1, []),
+                ("an unreadable env on another step of the job is refused",
+                 wf_text.replace(step_anchor, step_anchor + "      - name: Another step\n"
+                                 "        env: ${{ fromJSON(vars.X) }}\n        run: true\n", 1), 1, []),
+                ("a block env ends at the next key of its own level",
+                 wf_text.replace(dj, dj + "    env:\n      X: 1\n    timeout-minutes: 5\n", 1), 0, ["X=1"]),
+                ("a flow env with an item that is not a key is refused",
+                 wf_text.replace(dj, dj + "    env: {A: 1, B}\n", 1), 1, []),
+                ("the gate step is read when it is the last step of its job",
+                 wf_text.replace(wf_text[wf_text.find(step_anchor) + len(step_anchor):
+                                         wf_text.find("check-declaration-hash.sh --self-test\n") + 38], "", 1), 0,
+                 ["GITHUB_EVENT_NAME=${{ github.event_name }}"])):
+            wf_file = Path(tmp) / "wf.yml"
+            wf_file.write_text(mutated)
+            proc = cli(["--gate-step-env", "declaration-hash-gate", "--workflow", str(wf_file)])
+            lines = proc.stdout.splitlines()
+            contract.append(("--gate-step-env: " + label, mutated != wf_text and proc.returncode == want_code
+                             and all(w in lines for w in want_lines)
+                             and (want_code == 0 or proc.stderr.startswith("ci-commit-range: REFUSED: "))))
         for label, good in contract:
             total += 1
             if not good:
@@ -889,6 +927,24 @@ def self_test():
     if checked != len(muts):
         failures += 1
         print("FAIL checked %d of %d pin mutants" % (checked, len(muts)))
+    # Pin refusals that must come from their own rule (#5970): a gate-input name
+    # anywhere in the workflow, and a GITHUB_PATH write in a script-gate job.
+    selftest_step = "        run: bash scripts/check-declaration-hash.sh --self-test\n"
+    for label, mutate, wanted in (
+            ("a DECLARATION_GATE_ name outside any gate step",
+             text.replace("\njobs:\n", "\n# DECLARATION_GATE_BASE set by hand\njobs:\n", 1),
+             "DECLARATION_GATE_ appears in the workflow"),
+            ("a CERT_EXPIRY_ name outside any gate step",
+             text.replace("\njobs:\n", "\n# CERT_EXPIRY_BASE set by hand\njobs:\n", 1),
+             "CERT_EXPIRY_ appears in the workflow"),
+            ("a GITHUB_PATH write in a script-gate job",
+             text.replace(selftest_step, selftest_step + "      - run: echo bin >> \"$GITHUB_PATH\"\n", 1),
+             "the job contains 'GITHUB_PATH'")):
+        total += 1
+        found = "; ".join(pin_violations(mutate))
+        if mutate == text or wanted not in found:
+            failures += 1
+            print("FAIL pin refusal %s: wanted %r, got %r" % (label, wanted, found))
     # Static pin on the gate scripts themselves, with text mutants.
     scripts_dir = Path(__file__).resolve().parent
     for name in SCRIPT_PINS:
