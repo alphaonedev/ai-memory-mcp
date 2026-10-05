@@ -2098,6 +2098,8 @@ ROUND3_GREEN = [
     ('5694 mutant pin: clean 2: the target of a redirect is not an operand', 'mysqldump -u r db > "$OUT"'),
     ("5695 mutant pin: clean 1: a literal value glued to -p is not this arm's concern", 'mysql -pSecret db'),
     ('5696 mutant pin: clean 1: an escaped space stays inside its word', 'mysql -u r x\\ "$Y"'),
+    ('5697 mutant pin: clean 1: a head inside an echoed quoted string is not a command', 'echo "restoring mysql $DB"'),
+    ('5697 mutant pin: clean 2: a head inside an echoed quoted string is not a command', 'echo "see mysql -p$X"'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
