@@ -4087,6 +4087,14 @@ R11_SHAPE_GREEN = {
     '5837-g19-accept-header': "curl -H 'Accept: application/json' https://x.example",
     '5837-g20-pass-stdin': 'mytool --pass-stdin run',
     '5837-g21-keyboard-name': 'mytool -e keyboard=us run',
+    # #5844: a comment after a separator or a paren (blank_shell_comments), after an assignment
+    # word and at the head of a backtick command (the leading-# head cut in shape_operands).
+    '5844-g22-comment-after-semicolon': 'true;# --token S3cr3tTok x',
+    '5844-g23-comment-after-assignment': 'x=1 #--token S3cr3tTok',
+    '5844-g24-comment-holding-a-pipe': 'true;# a | mytool --token S3cr3tTok',
+    '5844-g25-comment-holding-a-paren': 'true;# (--token S3cr3tTok)',
+    '5844-g26-comment-after-ampersand': 'true &# --token S3cr3tTok',
+    '5844-g27-comment-in-backticks': 'echo `#x --token S3cr3tTok`',
 }
 # #5725 STATED LIMITS: shapes the rule does not read, each pinned as missed so the limit text in
 # the header and the changelog stays measured (a rule that closes one must update both).
