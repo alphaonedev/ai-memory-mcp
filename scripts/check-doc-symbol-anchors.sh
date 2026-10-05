@@ -707,6 +707,26 @@ MDEOF
     anchor_green 5433 "a placeholder group with a nested group inside a brace item" \
         "See \`$R::{<name<T>>}\` here."
 
+    # #5456: prose that opens a generic BEFORE the anchor owns the closers
+    # that follow the anchor's own groups; one closer more than the open
+    # prose groups, or a `::` behind a closer, is still an over-closed group.
+    anchor_green 5456 "a live generic anchor inside a prose generic" \
+        "See Vec<$R::RecallTool<T>> here."
+    anchor_green 5456 "a live generic anchor inside a prose generic, HTML entities" \
+        "See Vec&lt;$R::RecallTool&lt;T&gt;&gt; here."
+    anchor_green 5456 "a live generic anchor inside a prose generic opened in the same code span" \
+        "See \`Arc<$R::RecallTool<T>>\`."
+    anchor_green 5456 "a live generic anchor inside two prose generics" \
+        "See Option<Vec<$R::RecallTool<T>>> here."
+    anchor_red_cites 5456 BARE_QUAL "a generic anchor over-closed beyond the prose generic" \
+        "$R::RecallTool>>" \
+        "See Vec<$R::RecallTool<T>>> here."
+    anchor_red_cites 5456 BARE_QUAL "a missing symbol is still named inside a prose generic" \
+        "$R::NoSuch" \
+        "See Vec<$R::NoSuch<T>> here."
+    anchor_red 5456 BARE_QUAL "a path that continues past a closer inside a prose generic" \
+        "See Vec<$R::RecallTool<T>>::decorate_memory_many> here."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
@@ -1334,25 +1354,51 @@ def _token_end(text, i):
     return j
 
 
-def _stray_close(text, i):
-    """True when `text` has an extra group closer (`>` or `&gt;`) at `i`."""
-    return i < len(text) and _group_step(text, i)[0] == "close"
+def _outer_depth(prefix):
+    """Number of angle groups (`<` or `&lt;`) still open at the end of
+    `prefix` (#5456): prose such as `Vec<src/x.rs::T<U>>` opens a group of its
+    own before the anchor, and the last closer belongs to it."""
+    depth, j = 0, 0
+    while j < len(prefix):
+        kind, width = _group_step(prefix, j)
+        if kind == "open":
+            depth += 1
+        elif kind == "close":
+            depth = max(0, depth - 1)
+        j += width
+    return depth
 
 
-def scan_sym(text, i):
+def _stray_close(text, i, outer=0):
+    """True when `text` has more extra group closers (`>` or `&gt;`) at `i`
+    than the `outer` groups opened before the anchor can take (#5456). Closers
+    that fit the outer groups still count as an over-close when a `::` follows
+    them: the path then continues past a closer, which is the #5430 shape."""
+    n, j = 0, i
+    while j < len(text):
+        kind, width = _group_step(text, j)
+        if kind != "close":
+            break
+        n, j = n + 1, j + width
+    return n > outer or (n > 0 and text.startswith("::", j))
+
+
+def scan_sym(text, i, outer=0):
     """Scan the symbol path starting at `i`; returns its end index, or None
     when no symbol starts there. Path components are identifiers, each with an
     optional balanced group, joined by `::` (a bare group after `::` is a
     turbofish), after an optional leading `<Type as Trait>::`. A group that
     never balances, or is followed by an extra closer (#5430), captures to the
     end of the token (#5393), so the caller reports it instead of skipping the
-    components behind it."""
+    components behind it. `outer` is the count of prose groups still open
+    before the anchor (#5456): that many closers after the path close those
+    groups and end the capture instead of over-closing the anchor's own."""
     pos = i
     if _opens_group(text, pos):
         end = scan_group(text, pos)
         if end is None:
             return _token_end(text, pos)
-        if _stray_close(text, end):
+        if _stray_close(text, end, outer):
             return _token_end(text, end)
         if not text.startswith("::", end):
             return None
@@ -1367,7 +1413,7 @@ def scan_sym(text, i):
             if end is None:
                 return _token_end(text, pos)
             pos = end
-            if _stray_close(text, pos):
+            if _stray_close(text, pos, outer):
                 return _token_end(text, pos)
         if not text.startswith("::", pos):
             return pos
@@ -1379,7 +1425,7 @@ def scan_sym(text, i):
             if end is None:
                 return _token_end(text, pos + 2)
             pos = end
-            if _stray_close(text, pos):
+            if _stray_close(text, pos, outer):
                 return _token_end(text, pos)
         else:
             return pos
@@ -1400,7 +1446,7 @@ def iter_quals(line):
                 yield rule, hm.group(1), bm.group(1)
                 pos = bm.end()
                 continue
-            end = scan_sym(line, pos)
+            end = scan_sym(line, pos, _outer_depth(line[:hm.start()]))
             if end is not None:
                 yield rule, hm.group(1), line[pos:end]
                 pos = end
