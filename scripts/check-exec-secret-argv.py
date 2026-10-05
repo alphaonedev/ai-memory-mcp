@@ -2030,6 +2030,7 @@ ROUND3_RED = [
     ('5682 red 2: every -e and --execute option of a wget command is read', 'wget -e robots=off --execute "ftp_password=$X" URL'),
     ('5682 red 3: every -e and --execute option of a wget command is read', 'wget --exe robots=off --exec "http_password=$X" URL'),
     ('5682 red 4: every -e and --execute option of a wget command is read', 'wget -q -e robots=off -e timestamping=on -e "proxy_password=$X" URL'),
+    ('5683 mutant pin: reported 1: the password command word of mysqladmin is matched in any letter case', 'mysqladmin PASSWORD "$X"'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
