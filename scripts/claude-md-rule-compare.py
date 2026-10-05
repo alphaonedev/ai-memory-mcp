@@ -336,6 +336,16 @@ def child_env(extra=None) -> dict:
     return env
 
 
+REFUSAL_ISOLATION_SETS = ([], ["-E"], ["-s"], ["-E", "-s"], ["-E", "-s", "-S", "-B", "-O"], ["-S", "-E"])
+
+
+def refusal_flag_sets() -> list:
+    """#5507: the interpreter flag sets the non-isolated refusal is run under: every -X frozen_modules option (none,
+    off, on) in front of every isolation set of REFUSAL_ISOLATION_SETS."""
+    return [xopt + isolation for xopt in ([], ["-X", "frozen_modules=off"], ["-X", "frozen_modules=on"])
+            for isolation in REFUSAL_ISOLATION_SETS]
+
+
 def non_isolated_child(script: Path, flags: list, scratch: Path):
     """#5380: run `script` with the interpreter flags `flags` (never -I) and the comparison arguments. Returns None
     without starting anything when `script` is inside the real scripts/ directory: there a merged sibling named
@@ -635,11 +645,16 @@ def _self_test_cases() -> int:
         shutil.copyfile(Path(__file__).resolve(), copy)
         for name in sorted(set(EXPECTED_IMPORTS) | set(imported_modules(Path(__file__).resolve()))):
             (iso / f"{name}.py").write_text("print('PLANTED')\nraise SystemExit(0)\n", encoding="utf-8")
-        # #5283/#5373/#5474: the refusal is pinned for every partial isolation (-E, -s, both, plus -S -B -O) and under
-        # -X frozen_modules=off and =on, alone and combined. -P is not pinned here.
-        for flags in ([], ["-E"], ["-s"], ["-E", "-s"], ["-E", "-s", "-S", "-B", "-O"],
-                      ["-X", "frozen_modules=off"], ["-X", "frozen_modules=off", "-S", "-E"],
-                      ["-X", "frozen_modules=off", "-E", "-s", "-S", "-B", "-O"], ["-X", "frozen_modules=on", "-S", "-E"]):
+        # #5507: the set covers every frozen_modules option, alone and with every isolation set.
+        flag_sets = refusal_flag_sets()
+        for xopt in ([], ["-X", "frozen_modules=off"], ["-X", "frozen_modules=on"]):
+            for isolation in REFUSAL_ISOLATION_SETS:
+                if xopt + isolation not in flag_sets:
+                    return False
+        # #5283/#5373/#5474/#5507: the refusal is pinned for every flag set in refusal_flag_sets(): each of no -X option,
+        # -X frozen_modules=off and -X frozen_modules=on, alone and crossed with each isolation set in
+        # REFUSAL_ISOLATION_SETS (partial isolation -E, -s, both, plus -S -B -O, and -S -E). -P is not pinned here.
+        for flags in flag_sets:
             result = non_isolated_child(copy, flags, iso / "s")
             if result is None or not (result.returncode == 1 and "isolated mode" in result.stdout
                                       and "PLANTED" not in result.stdout + result.stderr):
