@@ -371,7 +371,14 @@ fi
 # (WriteTxn::begin); a DEFERRED read-then-write upgrade fails with
 # SQLITE_BUSY_SNAPSHOT (517) that busy_timeout never retries. Allowlist and
 # rules live in the gate itself.
-if ! python3 "${ROOT}/scripts/check-sqlite-write-txn-immediate.py" >&2; then
+# The gate's allowlist names real sites in src/. The #3623 scenario harness runs
+# this precheck in a fixture tree that copies scripts/ but has an empty src/, where
+# every allowlist entry is "stale" and the gate would fail for reasons unrelated
+# to the probe (#5877). A real checkout always has the WriteTxn home
+# (src/storage/connection.rs); the gate runs whenever it exists and a tree
+# without it has no SQLite write transaction to guard.
+if [[ -f "${ROOT}/src/storage/connection.rs" ]] \
+    && ! python3 "${ROOT}/scripts/check-sqlite-write-txn-immediate.py" >&2; then
     echo "C8 HARD-BLOCK (#5084): a SQLite transaction opened without BEGIN IMMEDIATE." >&2
     violations=$(( violations + 1 ))
 fi
