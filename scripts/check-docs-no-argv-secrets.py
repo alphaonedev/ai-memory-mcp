@@ -2767,6 +2767,8 @@ def shape_hit(text: str, ops: List[Word]) -> Optional[Tuple[int, str]]:
 #   ("code", flags)         the program text of the flag, read for NAME = "literal", NAME:
 #                           "literal", NAME => "literal" (perl, php; #5924) and URL passwords;
 #   ("htpasswd",)           the password operand of htpasswd -b (-nb: the second, else the third).
+#                           Options are read as getopt does: -C and -r take a value, glued or the
+#                           next word, also at the end of a bundle (-bBC 12; #5928).
 # A value is read like every shape value (shape_value): a literal or an expansion, never a
 # placeholder; "-" (stdin, or rar -p- for no password) and a NEXT word that starts with "-" (the
 # next option, as for the shape rule; #5925) are not a value; a glued value (-p-x) is.
@@ -2839,8 +2841,13 @@ def _htpasswd_value(ts: List[str]) -> Optional[str]:
         if skip:
             skip = False
         elif t.startswith("-") and len(t) > 1:
-            letters += t[1:]
-            skip = t in ("-C", "-r")
+            # #5928: getopt order: the first letter that takes an argument (-C cost, -r rounds)
+            # ends the bundle; its value is the rest of the word, or else the next word.
+            for k, c in enumerate(t[1:], 2):
+                letters += c
+                if c in "Cr":
+                    skip = k == len(t)
+                    break
         else:
             pos.append(t)
     if "b" not in letters:
@@ -4396,6 +4403,15 @@ R11_SHAPE_RED = {
     '5924-r94-php-fat-arrow': "php -r 'login([\"password\" => \"S3cr3tPass\"]);'",
     # #5925: a glued value that starts with - is still the value.
     '5925-r95-mysql-glued-dash-value': 'mysql -u bob -p-S3cr3tPass appdb',
+    # #5928: an htpasswd option that takes an argument consumes the next word, alone or at the end
+    # of a bundle; the password is still the operand that is read and masked.
+    '5793-r96-htpasswd-C-own-word': 'htpasswd -b -C 12 users bob S3cr3tPass',
+    '5928-r97-htpasswd-bundle-C': 'htpasswd -bBC 12 users bob S3cr3tPass',
+    '5928-r98-htpasswd-nb-bundle-C': 'htpasswd -nbBC 10 bob S3cr3tPass',
+    '5928-r99-htpasswd-bundle-r': 'htpasswd -bBr 9 users bob S3cr3tPass',
+    '5928-r100-htpasswd-glued-cost': 'htpasswd -bC12 users bob S3cr3tPass',
+    # A lone - is an operand to getopt, not an option.
+    '5928-r101-htpasswd-dash-operand': 'htpasswd -b - bob S3cr3tPass',
 }
 R11_SHAPE_GREEN = {
     '5725-g01-password-stdin': 'docker login -u u --password-stdin registry.example.com',
@@ -4455,6 +4471,11 @@ R11_SHAPE_GREEN = {
     # #5925: a word that starts with - after a credential option is the next option.
     '5925-g49-redis-a-then-option': 'redis-cli -a --no-auth-warning ping',
     '5925-g50-aws-pair-then-option': 'aws configure set aws_secret_access_key --profile x',
+    # The split read takes the part after the separator: an empty password is no credential.
+    '4813-g51-curl-u-empty-password': 'curl -u admin: https://h/x',
+    '5803-g52-smbclient-U-empty-password': 'smbclient -U bob% //h/s',
+    # Without -b htpasswd prompts for the password; no operand is read.
+    '5793-g53-htpasswd-n-prompt': 'htpasswd -n bob',
 }
 # #5725 STATED LIMITS: shapes the rule does not read, each pinned as missed so the limit text in
 # the header and the changelog stays measured (a rule that closes one must update both).
@@ -4486,6 +4507,7 @@ R12_MD_CODE_GREEN = {
     '5789-m11-span-cut-by-blank-line': 'Run `mytool --token\n\nS3cr3tTok` now.\n',
     '5789-m12-span-placeholder': 'Run `mytool --token <TOKEN>` now.\n',
     '5789-m13-apostrophe-before-a-fence': "It's here.\n\n```bash\n# mytool --token S3cr3tTok\n```\n",
+    '5789-m14-span-into-a-text-fence': "Use a ` mark.\n```text\nmytool --token S3cr3tTok` and more\n```\n",
 }
 # #5723: a command substitution inside an array body is still a command of its own.
 R11_ARRAY_NESTED_UNKNOWN = {
