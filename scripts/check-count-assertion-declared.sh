@@ -170,12 +170,14 @@ def first_arg(rest):
 
 
 def extract(text):
-    """-> ({expr-key: {value, ...}}, {const names defined}); a value is a decimal integer or `?<spelling>` (undecidable)."""
+    """-> ({expr-key: {value, ...}}, {const name: value}, {const names referenced from another file}).
+    A value is a decimal integer, `?<spelling>` (undecidable right-hand side) or `@NAME` (a const defined in another
+    file: resolved against the whole tree by resolve(), never guessed here)."""
     text = clean(text)
     consts = {}
     for m in CONST.finditer(text):
         v = int_value(m.group('val'))
-        if v is not None: consts[m.group('name')] = v
+        consts[m.group('name')] = v if v is not None else '?' + re.sub(r'\s+', '', m.group('val'))   # a non-literal value is undecidable, never dropped (#5578)
     out = {}
     for h in HEAD.finditer(text):
         args = macro_args(text, h.end())
@@ -186,14 +188,16 @@ def extract(text):
         val = int_value(rhs)
         if val is None:
             pc = PATH_CONST.match(rhs)
-            if pc:                                        # a named const: resolved inside this file
-                val = consts.get(pc.group('name'))
-                if val is None: continue                  # a const defined elsewhere: not a literal count (F4 closes this)
-                expr += f" [{pc.group('name')}]"          # name the const the count is spelled through
+            if pc:                                        # a named const: this file first, else the whole tree (#5578)
+                name = pc.group('name')
+                val = consts.get(name) if '::' not in rhs else None
+                if val is None: val = '@' + name
+                expr += f' [{name}]'                      # name the const the count is spelled through
             else:
                 val = '?' + re.sub(r'\s+', '', rhs)         # undecidable: neither a literal nor a const (#5577)
         out.setdefault(expr, set()).add(val)
-    return out, set(consts)
+    refs = {v[1:] for vs in out.values() for v in vs if v.startswith('@')}
+    return out, consts, refs
 
 
 def eligible(p):
@@ -216,25 +220,58 @@ def read_blobs(specs):
     return out
 
 
-_PARENT_INDEX = {}
+# ---- tree-wide state (#5578): every eligible file's assertions and consts, kept incrementally commit to commit ------
+_STATE = {}     # rev -> {path: (assertions, consts)}
+_DEFS = {}      # rev -> {const name: [(path, value), ...]}
+_KEYS = {}      # rev -> (all assertion keys, all const names)
 
 
-def parent_index(parent):
-    """Every count-assertion key and every const name that exists in ANY eligible file of the parent tree."""
-    if parent in _PARENT_INDEX: return _PARENT_INDEX[parent]
-    paths = [p for p in git('ls-tree', '-r', '--name-only', parent, '--', 'src', 'tests').split('\n') if eligible(p)]
-    keys, names = set(), set()
-    for text in read_blobs([f'{parent}:{p}' for p in paths]).values():
-        ex, cn = extract(text)
-        for k in ex:
-            keys.add(k); keys.add(k.split(' [', 1)[0])
-        names |= cn
-    _PARENT_INDEX[parent] = (keys, names)
-    return keys, names
+def build_state(rev):
+    """Full state of one tree: ONE cat-file batch over every eligible file."""
+    if rev in _STATE: return _STATE[rev]
+    paths = [p for p in git('ls-tree', '-r', '--name-only', rev, '--', 'src', 'tests').split('\n') if eligible(p)]
+    st = {}
+    for spec, text in read_blobs([f'{rev}:{p}' for p in paths]).items():
+        st[spec.split(':', 1)[1]] = extract(text)
+    _STATE[rev] = st
+    return st
+
+
+def defs_of(rev):
+    """{const name: [(path, value)]} over the whole tree of rev."""
+    if rev not in _DEFS:
+        d = {}
+        for path, (_, consts, _r) in _STATE[rev].items():
+            for n, v in consts.items(): d.setdefault(n, []).append((path, v))
+        _DEFS[rev] = d
+    return _DEFS[rev]
+
+
+def resolve(rev, assertions):
+    """Replace every `@NAME` with the tree-wide value: exactly one definition -> its value; none -> `?NAME#unresolved`;
+    several (two files define the name) -> `?NAME#ambiguous`. Closed-world: a name that cannot be resolved to ONE integer
+    is never read as 'unchanged' (#5578)."""
+    out = {}
+    for k, vals in assertions.items():
+        rv = set()
+        for v in vals:
+            if v.startswith('@'):
+                ds = defs_of(rev).get(v[1:], [])
+                v = ds[0][1] if len(ds) == 1 else (f'?{v[1:]}#ambiguous' if ds else f'?{v[1:]}#unresolved')
+            rv.add(v)
+        out[k] = rv
+    return out
 
 
 def exists_elsewhere(parent, expr):
-    keys, names = parent_index(parent)
+    if parent not in _KEYS:
+        keys, names = set(), set()
+        for ex, cn, _r in build_state(parent).values():
+            for k in ex:
+                keys.add(k); keys.add(k.split(' [', 1)[0])
+            names |= set(cn)
+        _KEYS[parent] = (keys, names)
+    keys, names = _KEYS[parent]
     if expr in keys or expr.split(' [', 1)[0] in keys: return True
     return '[' in expr and expr.rsplit('[', 1)[1].rstrip(']') in names
 
@@ -254,20 +291,38 @@ def changed_files(c):
 
 
 def count_changes(c):
-    """-> [(file, expr, old, new)] one per changed count assertion of commit c."""
+    """-> [(file, expr, old, new)] one per changed count assertion of commit c, consts resolved over the whole tree."""
     parent = git('rev-parse', '--verify', '--quiet', c + '^').strip()
     entries = [e for e in changed_files(c)
                if (e[1] and eligible(e[1])) or (e[2] and eligible(e[2]))]
-    specs = [f'{parent}:{e[1]}' for e in entries if parent and e[1]] + [f'{c}:{e[2]}' for e in entries if e[2]]
+    old_st = build_state(parent) if parent else {}
+    if parent: _STATE.setdefault(parent, old_st)
+    specs = [f'{c}:{e[2]}' for e in entries if e[2] and eligible(e[2])]
     blobs = read_blobs(list(dict.fromkeys(specs)))
-    hits = []
+    new_st = dict(old_st)
     for st, op, np_ in entries:
-        old, _ = extract(blobs.get(f'{parent}:{op}', '') if (parent and op) else '')
-        new, _ = extract(blobs.get(f'{c}:{np_}', '') if np_ else '')
+        if st in 'RD' and op: new_st.pop(op, None)
+        if np_ and eligible(np_): new_st[np_] = extract(blobs.get(f'{c}:{np_}', ''))
+    _STATE[c] = new_st
+    pairs = [(st, op, np_) for st, op, np_ in entries]
+    # a const defined elsewhere that moved: every assertion spelled through its name is re-read (M12)
+    moved = set()
+    for st, op, np_ in entries:
+        o = old_st.get(op, ({}, {}, set()))[1] if op else {}
+        n = new_st.get(np_, ({}, {}, set()))[1] if np_ else {}
+        moved |= {k for k in set(o) | set(n) if o.get(k) != n.get(k)}
+    touched = {e[2] for e in entries if e[2]}
+    if moved:
+        for path, (_e, _c, refs) in new_st.items():
+            if path not in touched and not moved.isdisjoint(refs): pairs.append(('M', path, path))
+    hits = []
+    for st, op, np_ in pairs:
+        old = resolve(parent, old_st[op][0]) if (parent and op and op in old_st) else {}
+        new = resolve(c, new_st[np_][0]) if (np_ and np_ in new_st) else {}
         for expr in sorted(set(old) | set(new)):
             o, n = old.get(expr, set()), new.get(expr, set())
             if o == n: continue
-            if (not o and all(v.startswith('?') for v in n)) or (not n and all(v.startswith('?') for v in o)):
+            if (not o and all(v.startswith('?') and '#' not in v for v in n)) or (not n and all(v.startswith('?') and '#' not in v for v in o)):
                 continue                                 # an assertion with no literal count on either side moves no count (#5577)
             if st == 'A' and not exists_elsewhere(parent, expr):
                 continue                                 # a brand-new assertion in a brand-new file (#5499)
@@ -369,7 +424,7 @@ def check_range(rng):
     # what a future -m would need; the self-test leg 'merge commit whose tree moves a shared count' pins the pair (#5499).
     offenders = git('rev-list', '--no-merges', rng).split()
     hits = {}
-    for c in offenders:
+    for c in reversed(offenders):                         # oldest first: each commit's tree state is built from its parent's
         h = count_changes(c)
         if h: hits[c] = h
     accepted = {}                                         # offender sha -> [items that match a hit]
@@ -632,6 +687,43 @@ def selftest():
         s.w('tests/typed.rs', 'fn t() { assert_eq!(sections.len(), 18, "a, b"); }\n'); t0 = s.commit('test: add')
         s.w('tests/typed.rs', 'fn t() { assert_eq!(sections.len(), 19, "a, b"); }\n'); s.commit('test: bump'); return t0 + '..HEAD'
     case('a trailing message argument with a comma does not hide the literal', c_msgarg, True, ['sections.len()  18 -> 19'])
+
+    # ---- #5578: a const defined in ANOTHER file is resolved over the whole tree; unresolvable is never 'unchanged' --------------
+    SH = 'tests/shared_use.rs'
+    def shared(use_rs, lib0, lib1, extra0=None, extra1=None, decl=None):
+        def f_(s, b):
+            s.w('src/lib.rs', lib0); s.w(SH, use_rs)
+            for k, v in (extra0 or {}).items(): s.w(k, v)
+            t0 = s.commit('test: add shared fixture')
+            s.w('src/lib.rs', lib1)
+            for k, v in (extra1 or {}).items(): s.w(k, v)
+            s.commit(msg('test: bump', 'Count: %s (fixture)' % decl) if decl else 'test: bump without a declaration'); return t0 + '..HEAD'
+        return f_
+    A = lambda rhs: 'fn t() { assert_eq!(report.sections.len(), %s); }\n' % rhs
+    L = lambda n: 'pub const EXPECTED_N: usize = %s;\n' % n
+    case('shared const bumped in src/lib.rs, assertion in tests/ via crate::NAME', shared(A('crate::EXPECTED_N'), L(18), L(19)), True, ['sections.len() [EXPECTED_N]  18 -> 19'])
+    case('the same, declared', shared(A('crate::EXPECTED_N'), L(18), L(19), decl='sections 18 -> 19'), False)
+    case('the same through a bare imported name', shared('use ai_memory::EXPECTED_N;\n' + A('EXPECTED_N'), L(18), L(19)), True, ['18 -> 19'])
+    case('the same through a deep path module::NAME', shared(A('ai_memory::cfg::EXPECTED_N'), L(18), L(19)), True, ['18 -> 19'])
+    case('the same through a typed const value', shared(A('crate::EXPECTED_N'), L('18usize'), L('19usize')), True, ['18 -> 19'])
+    case('the same through a hex const value', shared(A('crate::EXPECTED_N'), L('0x12'), L('0x13')), True, ['18 -> 19'])
+    case('a second definition of the name makes it ambiguous (assertion unchanged)',
+         shared(A('crate::EXPECTED_N'), L(18), L(18), None, {'src/other.rs': L(3)}), True, ['?EXPECTED_N#ambiguous'])
+    case('a name defined nowhere, newly asserted, is flagged unresolved', shared('fn t() {}\n', L(18), L(18), None, {SH: A('ext::MISSING_N')}), True, ['?MISSING_N#unresolved'])
+    case('a const whose value is an expression moves as an undecidable spelling',
+         shared(A('crate::EXPECTED_N'), 'pub const EXPECTED_N: usize = 9 + 9;\n', 'pub const EXPECTED_N: usize = 9 + 10;\n'), True, ['?9+9 -> ?9+10'])
+    case('a shared const bumped that no assertion uses is no move', shared('fn t() {}\n', L(18), L(19)), False)
+    case('a local const of the same name shadows the shared one',
+         shared('const EXPECTED_N: usize = 5;\n' + A('EXPECTED_N'), L(18), L(19)), False)
+    case('a shared const unchanged while its file changes is no move', shared(A('crate::EXPECTED_N'), L(18) + '// a\n', L(18) + '// b\n'), False)
+    def c_ren(s, b):                                       # the defining file is renamed with the bump
+        s.w('src/lib.rs', L(18) + PAD); s.w(SH, A('crate::EXPECTED_N')); t0 = s.commit('test: add')
+        s.g('mv', 'src/lib.rs', 'src/consts.rs'); s.w('src/consts.rs', L(19) + PAD); s.commit('test: move and bump'); return t0 + '..HEAD'
+    case('the defining file renamed with the bump is a move', c_ren, True, ['18 -> 19'])
+    def c_del(s, b):                                       # the defining file is deleted: the assertion no longer resolves
+        s.w('src/lib.rs', L(18)); s.w(SH, A('crate::EXPECTED_N')); t0 = s.commit('test: add')
+        s.g('rm', '-q', 'src/lib.rs'); s.commit('test: drop the const'); return t0 + '..HEAD'
+    case('the defining file deleted leaves the assertion unresolved', c_del, True, ['?EXPECTED_N#unresolved'])
 
     # ---- #5499: late declaration -------------------------------------------------------------
     def offender(s, b, two=False):
