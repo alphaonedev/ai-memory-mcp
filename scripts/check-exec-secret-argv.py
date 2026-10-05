@@ -2102,6 +2102,12 @@ ROUND3_GREEN = [
     ('5697 mutant pin: clean 1: a head inside an echoed quoted string is not a command', 'echo "restoring mysql $DB"'),
     ('5697 mutant pin: clean 2: a head inside an echoed quoted string is not a command', 'echo "see mysql -p$X"'),
 ]
+
+# Raw logical-line text that holds a newline (the arm is a function of text; every unit the gate builds today is
+# joined with spaces): a newline ends the command like a semicolon does (#5691).
+ROUND3_MYSQL_RAW_GREEN = [
+    ("5691 mutant pin: a newline ends the mysql command", 'mysql -u r db\necho "$X"'),
+]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
     ("CRLF continuation", 'FROM x\r\nRUN apk add y \\\r\n  && curl -u "u:$X" h\r\n'),
@@ -2134,6 +2140,10 @@ def round3_probe_cases(dl) -> Tuple[List[str], int]:
         if any("denylist" in r[2] for r in res) or check_allow_vs_denylist({"c.sh": res}, ent) or \
                 judge({"c.sh": res}, ent, [], dl)[0]:
             bad.append("round-3 green probe is not allow-able: %s" % label)
+    for label, text in ROUND3_MYSQL_RAW_GREEN:
+        n += 1
+        if mysql_family_hit(text):
+            bad.append("round-3 raw mysql green probe was reported: %s" % label)
     for label, text in ROUND3_DOCKER_RED:
         n += 1
         if not any("denylist" in r[2] for r in scan_exec_file(dl, "Dockerfile", text) or []):
