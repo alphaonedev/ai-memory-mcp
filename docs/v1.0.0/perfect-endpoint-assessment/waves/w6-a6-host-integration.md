@@ -5,7 +5,7 @@
 **Date:** 2026-07-08  
 **Assessor:** W6-A6 (code + docs evidence; not live multi-host dogfood)
 
-**Sources:** `CLAUDE.md` §L1 hard-rule; `docs/integrations/{README,claude-code}.md`; `docs/rfc/RFC-0001-mcp-turn-capture.md`; `ROADMAP.md` §11.3/§11.4.H; `src/recover/{mod,nag,transcript_paths,parsers/*}.rs`; `src/mcp/tools/{session_start,capture_turn}.rs`; `src/handlers/capture_turn.rs`; `src/cli/{boot,install}.rs`; `src/cli/commands/recover_previous_session.rs`; `clients/host-adapter-shim/**`
+**Sources:** `CLAUDE.md` section "Hard rule — `memory_store` FIRST on operator multi-step directives (L1 of #1389 layered-capture architecture)"; `docs/integrations/{README,claude-code}.md`; `docs/rfc/RFC-0001-mcp-turn-capture.md`; `ROADMAP.md` §11.3/§11.4.H; `src/recover/{mod,nag,transcript_paths,parsers/*}.rs`; `src/mcp/tools/{session_start,capture_turn}.rs`; `src/handlers/capture_turn.rs`; `src/cli/{boot,install}.rs`; `src/cli/commands/recover_previous_session.rs`; `clients/host-adapter-shim/**`
 
 ---
 

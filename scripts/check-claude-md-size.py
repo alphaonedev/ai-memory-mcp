@@ -531,12 +531,36 @@ def refs_errors(root: Path) -> list:
 # R3-F9: live docs (docs/internal, docs/v1.0.0) must not cite a moved section as a CLAUDE.md section. The frozen
 # per-release records (docs/v0.7.0 and older, CHANGELOG.md) quote history and are not scanned.
 CITATION_DIRS = ("docs/internal", "docs/v1.0.0")
-# R4 (#4507): also the possessive (`CLAUDE.md's "X"`), the word form (`CLAUDE.md section "X"`) and a heading
-# anchor link (`CLAUDE.md#x-y`, matched against the GitHub slug of each moved heading below).
-CLAUDE_CITATION = re.compile(
-    r'CLAUDE\.md`?(?:\u2019s|\'s)?\s+(?:(?:section|heading|rule)\s+)?(?:\u00a7\s*)?[\u201c"]([^"\u201d]+)[\u201d"]',
-    re.IGNORECASE)
-CLAUDE_ANCHOR = re.compile(r'CLAUDE\.md#([a-z0-9_-]+)', re.IGNORECASE)
+# R4 (#4507), #5676: the scan is a closed world. Every mention of the file name (any case, format characters such as a
+# zero-width space removed first) is read as a citation when what follows it is citation-shaped: a heading anchor
+# (`CLAUDE.md#x`), or, after an optional closing wrapper, possessive, the word section/heading/rule and a section
+# sign or hash, a quoted heading or a list of them. A quoted heading is accepted only when, after ONE normalization
+# (format characters removed, every run of Unicode whitespace made one space, ends trimmed), it equals a pinned
+# `## ` heading of CLAUDE.md exactly; an anchor only when it equals the GitHub slug of one exactly. Anything else that
+# is citation-shaped is refused: a moved heading, an unknown heading, a near spelling, an unterminated or unknown
+# quote, or a section word or sign with no quoted heading after it. Limit: a homoglyph or combining-mark spelling of
+# the file name is not recognised as the file name.
+CLAUDE_NAME = re.compile(r"claude\.md(?![\w])", re.IGNORECASE)
+CITE_WRAPPERS = "*_)]"
+CITE_QUOTES = {'"': '"', "'": "'", "`": "`", "\u201c": "\u201d\u201c", "\u201d": "\u201d", "\u2018": "\u2019\u2018",
+               "\u2019": "\u2019", "\u00ab": "\u00bb", "\u00bb": "\u00ab", "\u201e": "\u201c\u201d",
+               "\u201a": "\u2018\u2019", "\u2039": "\u203a", "\u203a": "\u2039", "\uff02": "\uff02",
+               "\uff07": "\uff07", "\u300c": "\u300d", "\u300e": "\u300f"}
+CITE_MARKER = re.compile(r"\s*(?:(?:sections?|headings?|rules?)(?![\w]))?[^\S\n]*\n?[^\S\n]*[\u00a7#]*",
+                         re.IGNORECASE)
+CITE_JOIN = re.compile(r"\s*(?:,\s*(?:and\s+|or\s+)?|and\s+|or\s+|&\s*)", re.IGNORECASE)
+ANCHOR_END = re.compile(r"[\s)\]>\"'`<]")
+
+
+def drop_format(text: str) -> str:
+    """Remove every Unicode format character (category Cf: zero-width space and joiners, BOM, bidi controls)."""
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+
+
+def cite_normal(text: str) -> str:
+    """#5676: the ONE canonical normalization of a quoted heading: format characters removed, every run of Unicode
+    whitespace (line breaks included) made one space, ends trimmed. Case, sigils and punctuation are kept."""
+    return " ".join(drop_format(text).split())
 
 
 def github_slug(heading: str) -> str:
@@ -544,9 +568,38 @@ def github_slug(heading: str) -> str:
     return re.sub(r"[^\w\- ]", "", heading.strip().lower()).replace(" ", "-")
 
 
+def quoted_citations(text: str, pos: int):
+    """Read a quoted heading or a list of them at text[pos:]. Yields (value, None) per heading, or (None, reason)
+    once for a quote the scan cannot read; stops at the first non-quote."""
+    while pos < len(text):
+        opener = text[pos]
+        if opener not in CITE_QUOTES:
+            if unicodedata.category(opener) in ("Pi", "Pf"):
+                yield None, f"an unknown quote mark U+{ord(opener):04X}"
+            return
+        closers = CITE_QUOTES[opener]
+        end = pos + 1
+        while end < len(text) and text[end] not in closers:
+            if text.startswith("\n", end) and not text[end + 1:].split("\n", 1)[0].strip():
+                end = len(text)
+                break
+            end += 1
+        if end >= len(text):
+            yield None, "an unterminated quote"
+            return
+        yield text[pos + 1:end], None
+        join = CITE_JOIN.match(text, end + 1)
+        if not join or join.end() >= len(text) or text[join.end()] not in CITE_QUOTES:
+            return
+        pos = join.end()
+
+
 def stale_citation_errors(root: Path) -> list:
-    """One message per cited `CLAUDE.md "<heading>"` whose heading now lives in a reference file."""
+    """#5676: one message per citation-shaped mention of CLAUDE.md that is not, exactly, a pinned heading of it."""
     moved = {sub.lstrip("#").strip() for subs in REFERENCE_SUBSECTIONS.values() for sub in subs}
+    allowed = {heading[3:] for heading in CLAUDE_MD_REQUIRED_HEADINGS}
+    slugs = {github_slug(heading) for heading in allowed}
+    loose = {" ".join(sub.split()).casefold() for sub in moved}
     errors = []
     for directory in CITATION_DIRS:
         base = root / directory
@@ -556,26 +609,60 @@ def stale_citation_errors(root: Path) -> list:
             if path.is_symlink() or not path.is_file():
                 continue
             try:
-                text = path.read_text(encoding="utf-8", errors="replace")
+                text = drop_format(path.read_text(encoding="utf-8", errors="replace"))
             except OSError as exc:
                 errors.append(f"FAIL: cannot read {path.relative_to(root)}: {exc}")
                 continue
-            slugs = {github_slug(sub): sub for sub in moved}
-            for match in CLAUDE_ANCHOR.finditer(text):
-                if match.group(1).lower() in slugs:
-                    line = text.count("\n", 0, match.start()) + 1
-                    errors.append(
-                        f"FAIL: {path.relative_to(root)}:{line} links CLAUDE.md#{match.group(1)}, which moved to a "
-                        "docs/reference file; cite the reference file (#4507 R4)")
-            for match in CLAUDE_CITATION.finditer(text):
-                # #5181: the pattern ignores case, so the heading comparison does too. #5574: the capture may keep a
-                # leading heading sigil and a line break, which the moved set never carries, so both are removed first.
-                cited = re.sub(r"\s*\n\s*", " ", match.group(1)).lstrip("#").strip()
-                if cited.casefold() in {sub.casefold() for sub in moved}:
-                    line = text.count("\n", 0, match.start()) + 1
-                    errors.append(
-                        f"FAIL: {path.relative_to(root)}:{line} cites CLAUDE.md {match.group(1).strip()!r}, "
-                        "which moved to a docs/reference file; cite the reference file (#4507 R3-F9)")
+            for name in CLAUDE_NAME.finditer(text):
+                where = f"{path.relative_to(root)}:{text.count(chr(10), 0, name.start()) + 1}"
+                errors += citation_errors(text, name, where, allowed, slugs, loose)
+    return errors
+
+
+def citation_errors(text: str, name, where: str, allowed: set, slugs: set, loose: set) -> list:
+    """The messages for one mention of the file name (empty when it is plain prose or an exact pinned citation)."""
+    pos = name.end()
+    if text.startswith("#", pos):
+        cut = ANCHOR_END.search(text, pos + 1)
+        anchor = text[pos + 1:cut.start() if cut else len(text)].rstrip(".,;:!?")
+        if anchor in slugs:
+            return []
+        state = "moved to a docs/reference file" if anchor.lower() in {github_slug(s) for s in loose} else \
+            "names no pinned CLAUDE.md heading"
+        return [f"FAIL: {where} links CLAUDE.md#{anchor}, which {state}; link an exact pinned heading or the "
+                "reference file (#4507 R4, #5676)"]
+    before = text[name.start() - 1] if name.start() else ""
+    while pos < len(text) and text[pos] in CITE_WRAPPERS:
+        pos += 1
+    if before in CITE_QUOTES and text[pos:pos + 1] and text[pos] in CITE_QUOTES[before]:
+        pos += 1
+        while pos < len(text) and text[pos] in CITE_WRAPPERS:
+            pos += 1
+    possessive = re.compile(r"['\u2019]s(?![\w])", re.IGNORECASE).match(text, pos)
+    if possessive:
+        pos = possessive.end()
+    marker = CITE_MARKER.match(text, pos)
+    marked = bool(marker.group(0).strip())
+    pos = marker.end()
+    if not marked and marker.group(0) == "" and text[pos:pos + 1] not in CITE_QUOTES:
+        return []
+    found, errors = False, []
+    for value, reason in quoted_citations(text, pos):
+        found = True
+        if reason:
+            errors.append(f"FAIL: {where} cites CLAUDE.md with {reason}; quote an exact pinned heading (#4507 R3-F9, "
+                          "#5676)")
+            continue
+        cited = cite_normal(value)
+        if cited in allowed:
+            continue
+        loosened = " ".join(cited.lstrip("#\u00a7").strip(" `*_.:;,!?").split()).casefold()
+        state = "moved to a docs/reference file" if loosened in loose else "is not an exact pinned CLAUDE.md heading"
+        errors.append(f"FAIL: {where} cites CLAUDE.md {value!r}, which {state}; cite the reference file or quote an "
+                      "exact pinned heading (#4507 R3-F9, #5676)")
+    if not found and marked:
+        errors.append(f"FAIL: {where} cites CLAUDE.md by {marker.group(0).strip()!r} with no quoted heading after it; "
+                      "quote an exact pinned heading (#4507 R3-F9, #5676)")
     return errors
 
 
@@ -1308,9 +1395,12 @@ def run_citation_cases(fresh) -> bool:
              "See CLAUDE.md#config-schema-v07x-1146--sectioned-llm--embeddings--reranker--storage--limits.", True),
             ("anchor of a heading with parentheses", "See CLAUDE.md#mobile-target-support-v070-posture-1a-issue-1068.",
              True),
-            ("anchor of a heading that did not move", "See [rule](CLAUDE.md#hard-rule).", False),
-            ("anchor that names no heading", "See CLAUDE.md#no-such-heading.", False),
-            ("possessive of a section that stayed", 'See CLAUDE.md\'s "Hard rule".', False),
+            # #5676: a stayed heading is accepted only by its exact anchor or its exact full text.
+            ("anchor of a heading that did not move", "See [rule](CLAUDE.md#build--test-commands).", False),
+            ("anchor of a heading that did not move, cut short", "See [rule](CLAUDE.md#hard-rule).", True),
+            ("anchor that names no heading", "See CLAUDE.md#no-such-heading.", True),
+            ("possessive of a section that stayed", "See CLAUDE.md's \"" + STAYED + "\".", False),
+            ("possessive of a section that stayed, cut short", 'See CLAUDE.md\'s "Hard rule".', True),
             ("section word with a section that stayed", 'See CLAUDE.md section "Build & Test Commands".', False)):
         root = fresh()
         doc = root / "docs" / "internal" / "form.md"
@@ -1320,7 +1410,7 @@ def run_citation_cases(fresh) -> bool:
     root = fresh()
     doc = root / "docs" / "internal" / "note.md"
     doc.parent.mkdir(parents=True)
-    doc.write_text(f'See docs/reference/ARCHITECTURE_REFERENCE.md "{heading}"; CLAUDE.md "Hard rule".\n',
+    doc.write_text(f'See docs/reference/ARCHITECTURE_REFERENCE.md "{heading}"; CLAUDE.md "{STAYED}".\n',
                    encoding="utf-8")
     ok &= expect(root, "R3-F9 a citation of the reference file is accepted", False)
     root = fresh()
@@ -1328,6 +1418,73 @@ def run_citation_cases(fresh) -> bool:
     doc.parent.mkdir(parents=True)
     doc.write_text(f'CLAUDE.md "{heading}" (frozen record)\n', encoding="utf-8")
     ok &= expect(root, "R3-F9 a frozen release record is not scanned", False)
+    return ok & run_closed_world_citation_cases(fresh, heading)
+
+
+# #5676: the one stayed heading the closed-world cases cite (a literal, so a broken pin table fails them).
+STAYED = ("Hard rule \u2014 `memory_store` FIRST on operator multi-step directives "
+          "(L1 of #1389 layered-capture architecture)")
+
+
+def run_closed_world_citation_cases(fresh, heading: str) -> bool:
+    """#5676: every citation-shaped spelling of a moved heading is refused; only an exact pinned heading passes."""
+    ok = True
+    spaced = heading.replace(" ", "{s}")
+    refused = {
+        "two spaces": 'CLAUDE.md "' + spaced.format(s="  ") + '"',
+        "tab": 'CLAUDE.md "' + spaced.format(s="\t") + '"',
+        "no-break space": 'CLAUDE.md "' + spaced.format(s="\u00a0") + '"',
+        "ideographic space": 'CLAUDE.md "' + spaced.format(s="\u3000") + '"',
+        "zero-width space for the space": 'CLAUDE.md "' + spaced.format(s="\u200b") + '"',
+        "zero-width space before the quote": 'CLAUDE.md\u200b"{h}"',
+        "zero-width joiner in the name": 'CLAUDE\u200d.md "{h}"',
+        "sigil inside the quotes": 'CLAUDE.md "\u00a7{h}"',
+        "sigil and space inside": 'CLAUDE.md "\u00a7 {h}"',
+        "period inside": 'CLAUDE.md "{h}."',
+        "colon inside": 'CLAUDE.md "{h}:"',
+        "backticks inside": 'CLAUDE.md "`{h}`"',
+        "bold inside": 'CLAUDE.md "**{h}**"',
+        "single quotes": "CLAUDE.md '{h}'",
+        "smart single": "CLAUDE.md \u2018{h}\u2019",
+        "guillemets": "CLAUDE.md \u00ab{h}\u00bb",
+        "low-9 quote": "CLAUDE.md \u201e{h}\u201c",
+        "fullwidth quote": "CLAUDE.md \uff02{h}\uff02",
+        "backtick quoted": "CLAUDE.md `{h}`",
+        "no space": 'CLAUDE.md"{h}"',
+        "unquoted section word": "CLAUDE.md section {h}",
+        "unquoted section sign": "CLAUDE.md \u00a7{h}",
+        "unquoted hash": "CLAUDE.md #{h}",
+        "section sign on the next line": "CLAUDE.md\n\u00a7{h} is the SSOT",
+        "link then section word": '[CLAUDE.md](../CLAUDE.md) section "{h}"',
+        "bold name": '**CLAUDE.md** "{h}"',
+        "possessive after backticks": "`CLAUDE.md`'s \"{h}\"",
+        "second of a list": 'CLAUDE.md sections "Build & Test Commands" and "{h}"',
+        "unknown second of a list": 'CLAUDE.md sections "Build & Test Commands", "No such heading"',
+        "unterminated quote": 'CLAUDE.md "{h}\n\nnext paragraph',
+        "unknown quote mark": "CLAUDE.md \u2e02{h}\u2e03",
+        "em space before the quote": 'CLAUDE.md\u2003"{h}"',
+        "quote right after a quoted name": '"CLAUDE.md""{h}"',
+        "section word after an em space": 'CLAUDE.md\u2003section "{h}"',
+        "anchor with a trailing dash": "CLAUDE.md#key-modules-",
+        "anchor with a percent escape": "CLAUDE.md#key%20modules",
+        "empty anchor": "CLAUDE.md# here",
+        "anchor of a stayed heading in upper case": "CLAUDE.md#BUILD--TEST-COMMANDS"}
+    accepted = {
+        "plain prose": "See CLAUDE.md for the rules.",
+        "prose after backticks": "`CLAUDE.md` (operator-cadence) is tracked.",
+        "unmarked prose word": "CLAUDE.md env table",
+        "exact stayed heading": 'CLAUDE.md "' + STAYED + '"',
+        "exact stayed heading, smart quotes": "CLAUDE.md \u201c" + STAYED + "\u201d",
+        "exact stayed heading across a line break": 'CLAUDE.md "' + STAYED.replace(" ", "\n", 1) + '"',
+        "exact stayed heading, no-break space": 'CLAUDE.md section "Build &\u00a0Test Commands"',
+        "list of exact stayed headings": 'CLAUDE.md sections "Build & Test Commands" and "Code Style"',
+        "exact anchor of a stayed heading": "CLAUDE.md#build--test-commands."}
+    for label, form in list(refused.items()) + list(accepted.items()):
+        root = fresh()
+        doc = root / "docs" / "v1.0.0" / "cite.md"
+        doc.parent.mkdir(parents=True, exist_ok=True)
+        doc.write_text("See " + form.replace("{h}", heading) + " now.\n", encoding="utf-8")
+        ok &= expect(root, f"#5676 closed-world citation: {label}", label in refused, "#5676")
     return ok
 
 
