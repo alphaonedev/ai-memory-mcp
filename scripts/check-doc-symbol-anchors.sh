@@ -773,6 +773,22 @@ MDEOF
         "$R::NoSuch" \
         "See \`$R::<&dyn NoSuch>::decorate_memory_many\`."
 
+    # #5493: a lifetime or a ?Trait bound cannot stand in for the type of a
+    # dyn self type; the type behind the bounds is checked, and a bound list
+    # with no type at all is refused.
+    anchor_red_cites 5493 QUAL "a dyn self type with a lifetime bound first and a missing trait" \
+        "$R::NoSuch" \
+        "See \`$R::<dyn 'a + NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5493 QUAL "a dyn self type with a ?Sized bound first and a missing trait" \
+        "$R::NoSuch" \
+        "See \`$R::<dyn ?Sized + NoSuch>::decorate_memory_many\`."
+    anchor_green 5493 "a dyn self type with a lifetime bound first and a live trait" \
+        "See \`$R::<dyn 'a + RecallTool>::decorate_memory_many\`."
+    anchor_green 5493 "a dyn self type with a live trait and a lifetime bound last" \
+        "See \`$R::<dyn RecallTool + 'a>::decorate_memory_many\`."
+    anchor_red 5493 QUAL "a dyn self type that is only a lifetime bound is refused" \
+        "See \`$R::<dyn 'a>::decorate_memory_many\`."
+
     # #5460: the type of an as group inside a brace item is a claim.
     anchor_red_cites 5460 QUAL "an as group with a missing type inside a brace item" \
         "$R::NoSuch" \
@@ -1584,13 +1600,22 @@ IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 AS_WORD = re.compile(r"\bas\b")
 # #5457: a self type may open with a reference or a trait-object keyword
 # (`<dyn Trait>::m`, `<&mut T>::m`); those are not the type's name.
-SELF_PREFIX = re.compile(r"(?:&\s*(?:'[A-Za-z_]\w*\s+)?(?:mut\s+)?|\b(?:dyn|impl|mut)\s+)+")
+# #5493: a leading lifetime or ?Trait bound of a bound list (`dyn 'a + T`,
+# `dyn ?Sized + T`) is skipped too; it is not the type either.
+SELF_PREFIX = re.compile(
+    r"(?:&\s*(?:'[A-Za-z_]\w*\s+)?(?:mut\s+)?|\b(?:dyn|impl|mut)\s+"
+    r"|(?:'[A-Za-z_]\w*|\?\s*[A-Za-z_]\w*)\s*\+\s*)+")
+# #5493: after the prefix, a head that is a lifetime or a ?Trait bound with
+# no type behind it names no type; the anchor is refused, never accepted.
+BOUND_ONLY = re.compile(r"['?]")
 
 
 def unwrap_self_type(tok):
     """`<Type<T> as Trait>::m` -> `Type<T>::m` (the type is the claim); an
     `as` inside a nested argument (`<Vec<<T as Tr>::X>>::new`) counts too, and
-    so does a group with no `as` that is followed by `::` (`<Type<T>>::m`)."""
+    so does a group with no `as` that is followed by `::` (`<Type<T>>::m`).
+    Returns None when the group is a self type that names no type to check
+    (#5493): the caller reports the token instead of accepting it."""
     if not tok.startswith("<"):
         return tok
     end = scan_group(tok, 0)
@@ -1599,11 +1624,15 @@ def unwrap_self_type(tok):
     inner = tok[1:end - 1]
     head = inner.lstrip()
     pm = SELF_PREFIX.match(head)
-    m = ID_RE.match(head, pm.end() if pm else 0)
+    pos = pm.end() if pm else 0
+    m = ID_RE.match(head, pos)
     # #5433: with no `as`, `<Type<T>>::m` is still a qualified path whose
     # type is the claim; a placeholder with nothing behind it is not.
-    if m and (AS_WORD.search(inner) or tok.startswith("::", end)):
-        return m.group(0) + tok[end:]
+    if AS_WORD.search(inner) or tok.startswith("::", end):
+        if m:
+            return m.group(0) + tok[end:]
+        if BOUND_ONLY.match(head, pos):
+            return None
     return tok
 
 
@@ -1779,7 +1808,13 @@ for doc in seen_docs:
                 # generic arguments are not symbol claims. `<Type as
                 # Trait>::m` checks `Type` and `m`.
                 tok = tok.replace("&lt;", "<").replace("&gt;", ">")
+                whole = tok
                 tok = unwrap_self_type(tok)
+                if tok is None:
+                    # #5493: a self type that names no type cannot be
+                    # resolved: report it rather than accept it.
+                    emit(rule, doc, ln, f"{f}::{whole}".replace(" ", ""), ctx)
+                    continue
                 tok = strip_generics(tok).strip().rstrip("(){}[].,;")
                 if "<" in tok or ">" in tok:
                     # An unbalanced group cannot be resolved: report it
