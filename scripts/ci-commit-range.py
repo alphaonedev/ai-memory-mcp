@@ -449,6 +449,41 @@ def self_test():
                 and proc.stdout == "%s..%s\n" % (shas["c1"], shas["c3"])):
             failures += 1
             print("FAIL flag override: %r %r" % (proc.returncode, proc.stdout))
+        # An EMPTY flag is still a flag: it overrides a valid environment variable and is refused,
+        # never replaced by the environment (#5645). The control runs the same environment with no flag.
+        env_all = {"PATH": os.environ.get("PATH", ""), "GITHUB_SHA": shas["c3"], "GITHUB_EVENT_BEFORE": shas["c1"],
+                   "PR_BASE_SHA": shas["c1"], "PR_HEAD_SHA": shas["c3"], "MG_BASE_SHA": shas["c1"], "MG_HEAD_SHA": shas["c3"]}
+        want_pr = "%s..%s" % (run_git(repo, "merge-base", shas["c1"], shas["c3"]), shas["c3"])
+        for event, flag in (("push", "--event"), ("push", "--head-sha"), ("push", "--before"),
+                            ("pull_request", "--pr-base"), ("pull_request", "--pr-head"),
+                            ("merge_group", "--mg-base"), ("merge_group", "--mg-head")):
+            env = dict(env_all, GITHUB_EVENT_NAME=event)
+            want = want_pr if event == "pull_request" else "%s..%s" % (shas["c1"], shas["c3"])
+            for label, extra, ok_code in (("empty %s" % flag, [flag, ""], 1), ("control for %s" % flag, [], 0)):
+                total += 1
+                proc = subprocess.run([sys.executable, os.path.abspath(__file__), "--repo", str(repo)] + extra,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, env=env)
+                good = proc.returncode == ok_code and (proc.stdout == want + "\n" if ok_code == 0 else proc.stdout == "")
+                if not good:
+                    failures += 1
+                    print("FAIL %s (%s): exit=%s out=%r" % (label, event, proc.returncode, proc.stdout))
+        probe = "CI_COMMIT_RANGE_SELFTEST_PROBE"
+        saved = os.environ.get(probe)
+        os.environ[probe] = "from-env"
+        try:
+            for label, got, want in (("empty flag beats env", env_or("", probe), ""),
+                                     ("unset flag reads env", env_or(None, probe), "from-env"),
+                                     ("flag beats env", env_or("flag", probe), "flag"),
+                                     ("unset flag, unset env", env_or(None, probe + "_UNSET"), None)):
+                total += 1
+                if got != want:
+                    failures += 1
+                    print("FAIL env_or %s: got %r want %r" % (label, got, want))
+        finally:
+            if saved is None:
+                del os.environ[probe]
+            else:
+                os.environ[probe] = saved
         # Frozen old block: the cases whose answer changed are accepted by it.
         # (Covered by --red-proof; the self-test only needs the new behaviour.)
     total += 1
