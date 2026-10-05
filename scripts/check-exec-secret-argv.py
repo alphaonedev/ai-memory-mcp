@@ -2001,6 +2001,11 @@ ROUND3_RED = [
     ('5637 closed world: reported 3: the value of -e, --execute and --init-command is not read as safe', 'mysql --init-command="SET PASSWORD=\'$P\'" db'),
     ('5637 closed world: reported 4: the value of -e, --execute and --init-command is not read as safe', 'mysql -e"SELECT \'$P\'"'),
     ('5637 closed world: reported 5: the value of -e, --execute and --init-command is not read as safe', 'mysql -u r -e "CREATE USER y IDENTIFIED BY \'${PW}\'" db'),
+    ('5638 closed world: reported 1: a family head is read in any letter case', 'MySQLDump -p"$X" db'),
+    ('5638 closed world: reported 2: a family head is read in any letter case', 'MariaDB-Dump --pa="$X" db'),
+    ('5638 closed world: reported 3: a family head is read in any letter case', 'MYSQL.EXE -p"$X"'),
+    ('5638 closed world: reported 4: a family head is read in any letter case', 'MySql -sp"$X"'),
+    ('5638 closed world: reported 5: a family head is read in any letter case', 'Mysqladmin password "$X"'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
@@ -2045,6 +2050,9 @@ ROUND3_GREEN = [
     ('5637 closed world: clean 1: the value of -e, --execute and --init-command is not read as safe', 'mysql -e "SELECT 1" db'),
     ('5637 closed world: clean 2: the value of -e, --execute and --init-command is not read as safe', "mysql --execute='SELECT 1' db"),
     ('5637 closed world: clean 3: the value of -e, --execute and --init-command is not read as safe', 'mysql -u "$U" -e "SHOW TABLES" db'),
+    ('5638 closed world: clean 1: a family head is read in any letter case', 'MYSQL_PWD="$PW" mysql -u root db'),
+    ('5638 closed world: clean 2: a family head is read in any letter case', 'MYSQL_HOST="$H" ./run.sh'),
+    ('5638 closed world: clean 3: a family head is read in any letter case', 'export MYSQL_ROOT_PASSWORD="$X"'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
