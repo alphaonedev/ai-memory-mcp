@@ -2159,8 +2159,10 @@ def redact(dsn: str) -> str:
 # whitespace, so nothing but the line end bounds it), and a URL cut before its "@" that still
 # holds "user:password": the rest of the line is printed as nothing, never as a part of the
 # password (#5438, #5486)
-SCRUB_UPTO_AT = re.compile(r"(postgres(?:ql)?://)[^\n]*@", re.I)
-SCRUB_CUT = re.compile(r"(postgres(?:ql)?://)[^\s\"'/@]*:[^\n]*", re.I)
+# a userinfo that is exactly user:CHANGEME@ with no other "@" on the line carries no secret and stays readable
+SCRUB_PLACEHOLDER = r"(?![\w.-]*:CHANGEME@[^@\n]*(?:\n|$))"
+SCRUB_UPTO_AT = re.compile(r"(postgres(?:ql)?://)" + SCRUB_PLACEHOLDER + r"[^\n]*@", re.I)
+SCRUB_CUT = re.compile(r"(postgres(?:ql)?://)" + SCRUB_PLACEHOLDER + r"[^\s\"'/@]*:[^\n]*", re.I)
 
 
 CRED_MASK = "<redacted>"
@@ -2172,15 +2174,30 @@ CRED_URL_RE = re.compile(r"postgres(?:ql)?://", re.I)
 # a shell word end, a quote, a redirect, an escape: the characters a word splitter cuts at
 CRED_SPLIT_RE = re.compile(r"[\s;&|()<>'\"\\`$]+")
 CRED_RUN_RE = re.compile(r"[A-Za-z0-9]{3,}")
+# an alphanumeric run that mixes a letter and a digit: it reads like a secret, so it is
+# registered from the tail of a credential line whatever the value syntax (#5546)
+CRED_MIXED_RE = re.compile(r"(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{3,}")
 CRED_QUOTED = r"(\"[^\"\n]*\"|'[^'\n]*'|[^\s;&|()<>'\"]+)"
 # the non-URL forms a password is written in: any *password= / *passwd= key (PGPASSWORD=v,
 # libpq conninfo, a URL query key), and a SQL PASSWORD 'v' literal
 CRED_FORMS = (
-    re.compile(r"[\w-]*pass(?:word|wd)\w*\s*=\s*" + CRED_QUOTED, re.I),
-    re.compile(r"\bPASSWORD\s+'((?:[^']|'')*)'", re.I),
+    re.compile(r"[\w-]*pass(?:word|wd|phrase)\w*\s*=\s*" + CRED_QUOTED, re.I),
+    re.compile(r"\bPASSWORD\s+E?'((?:[^'\\]|\\.|'')*)'", re.I),
+    re.compile(r"\bPASSWORD\s+(\$[A-Za-z_]*\$.*?\$[A-Za-z_]*\$)", re.I),
 )
-# the placeholder, template, shell and terraform variable references carry no secret
-CRED_FREE_RE = re.compile(r"CHANGEME|\$\{?[A-Za-z_]\w*\}?|\$\(.*\)|(?:var|local|module|data)\.[\w.\[\]-]+", re.I)
+# a credential keyword and its separator: "=" anywhere, ":" for a YAML or JSON key, or a
+# SQL PASSWORD followed by a quote. What follows it, to the end of the logical line, is
+# masked by scrub() unless it is exactly one bare placeholder (#5546-#5550)
+CRED_KEY_RE = re.compile(
+    r"(?:[\w-]*pass(?:word|wd|phrase)\w*[\"']?\s*[=:]|\bpass(?:word|wd)(?=\s+(?:E|U&)?['\"$]))\s*", re.I)
+# the one value that carries no secret: a single terraform or shell placeholder in braces,
+# bare or in double quotes, and ended by a word boundary
+CRED_PLACEHOLDER = r"\$\{[A-Za-z_]\w*\}"
+CRED_PLACEHOLDER_RE = re.compile(r"(?:%s|\"%s\")(?=[\s;&|)⏎\\]|$)" % (CRED_PLACEHOLDER, CRED_PLACEHOLDER))
+CRED_LINE_RE = re.compile(r"(?:\\\n|[^\n])*")
+# the placeholder text and a plain variable name carry no secret of their own
+CRED_FREE_RE = re.compile(r"CHANGEME|\$\{[A-Za-z_]\w*\}|\$[A-Za-z_]\w*", re.I)
+CRED_YAML_KEY_RE = re.compile(r"^(\s*(?:-\s+)?)[\w-]*pass(?:word|wd|phrase)\w*[\"']?\s*:\s*([>|][-+0-9]*)?\s*(?:#.*)?$", re.I)
 
 
 def credential_pieces(value: str) -> set:
@@ -2196,25 +2213,103 @@ def credential_pieces(value: str) -> set:
     return {x for x in out if x and not CRED_FREE_RE.fullmatch(x)}
 
 
-def register_credentials(text: str) -> None:
-    """Record every password written in `text` (a template, the allowlist or main.tf), on the
-    whole raw text and before it is split into words: the password of every postgres URL (any
-    "@" may end the userinfo, and the password may hold a quote, whitespace, ";" or "/"), and
-    each value of the non-URL forms in CRED_FORMS (#5487, #5488). A secret written in none of
-    those forms (computed or read at run time, encoded, a bare .pgpass line) is not derivable
-    from the text and is not masked."""
+def read_shell_word(text: str, i: int) -> tuple:
+    """The shell word that starts at text[i]: (as written, quotes and escapes removed). Quote
+    concatenation (abc'def'), ANSI-C quoting, backslash escapes, a continuation, and an
+    expansion in braces or parentheses are one word; an unquoted blank or operator ends it (#5546)."""
+    n, j, val = len(text), i, []
+    while j < n:
+        c = text[j]
+        if c == "\\":
+            if text[j + 1:j + 2] != "\n":
+                val.append(text[j + 1:j + 2])
+            j += 2
+        elif c in "'\"" or (c == "$" and text[j + 1:j + 2] == "'"):
+            q, k = ("'", j + 2) if c == "$" else (c, j + 1)
+            while k < n and text[k] != q:
+                k += 2 if (text[k] == "\\" and (c == "$" or q == '"')) else 1
+            val.append(text[(j + 2 if c == "$" else j + 1):k])
+            j = k + 1
+        elif c == "$" and text[j + 1:j + 2] in ("(", "{"):
+            close = ")" if text[j + 1] == "(" else "}"
+            depth, k = 0, j + 1
+            while k < n:
+                depth += text[k] == text[j + 1]
+                depth -= text[k] == close
+                k += 1
+                if depth == 0:
+                    break
+            val.append(text[j:k])
+            j = k
+        elif c in " \t\r\n;&|()<>":
+            break
+        else:
+            val.append(c)
+            j += 1
+    return text[i:min(j, n)], "".join(val)
+
+
+def libpq_value(text: str, i: int) -> list:
+    """The libpq conninfo value at text[i] when it is single-quoted: a backslash escapes the
+    next character, so an escaped quote does not end it. Returns the value as written and unescaped (#5547)."""
+    m = re.compile(r"'((?:\\.|[^'\\])*)'").match(text, i)
+    if not m:
+        return []
+    return [m.group(1), re.sub(r"\\(.)", r"\1", m.group(1), flags=re.S)]
+
+
+def credential_values(text: str) -> list:
+    """Every credential value written in `text` (one logical text: continuations as written or
+    already joined): URL userinfo passwords, the value of each credential keyword read three
+    ways (shell word, libpq quoted value, the pieces of the line tail that read like a secret),
+    SQL PASSWORD literals, and the lines of a YAML block scalar under a password key."""
     found = []
-    for line in text.split("\n"):
+    lines = text.split("\n")
+    for k, line in enumerate(lines):
         for m in CRED_URL_RE.finditer(line):
             rest = line[m.end():]
-            for k, ch in enumerate(rest):
-                if ch == "@" and ":" in rest[:k]:
-                    found.append(rest[:k].split(":", 1)[1])
+            for e, ch in enumerate(rest):
+                if ch == "@" and ":" in rest[:e]:
+                    found.append(rest[:e].split(":", 1)[1])
         for rx in CRED_FORMS:
             found.extend(m.group(1) for m in rx.finditer(line))
+        for m in CRED_KEY_RE.finditer(line):
+            if m.group(0).rstrip()[-1:] not in "=:" and line[m.end():m.end() + 1] == '"':
+                continue  # PASSWORD then a double quote is program text (a quoted shell or python word), not a SQL literal
+            found.extend(libpq_value(line, m.end()))
+            found.extend(read_shell_word(line, m.end()))
+            found.extend(CRED_MIXED_RE.findall(line[m.end():]))
+        y = CRED_YAML_KEY_RE.match(line)
+        if y:
+            indent = len(y.group(1).replace("-", " "))
+            for nxt in lines[k + 1:]:
+                if nxt.strip() and len(nxt) - len(nxt.lstrip()) <= indent:
+                    break
+                if nxt.strip():
+                    found.append(nxt.strip())
+    return found
+
+
+HCL_REFERENCE_RE = re.compile(r"(?:var|local|module|data)\.[\w.\[\]-]+")
+
+
+def register_credentials(text: str, hcl: bool = False) -> None:
+    """Record every password written in `text` (a template, the allowlist or main.tf) before it
+    is split into words, on the raw text and on the logical text (a backslash continuation
+    joined, or shown as the gate prints it, backslash and U+23CE): the password of every
+    postgres URL (any "@" may end the userinfo, and the password may hold a quote, whitespace,
+    ";" or "/"), and each value of the credential keywords (#5487, #5488, #5546-#5548). Only an
+    exact brace placeholder, CHANGEME and a plain $NAME carry no secret (#5550); main.tf alone (hcl=True)
+    may also write a value as a var./local./module./data. reference. A secret
+    that is not written next to a keyword or in a URL (computed at run time, encoded, a bare
+    .pgpass line) is not derivable from the text and is not masked."""
+    found = []
+    for variant in (text, text.replace("\\\n", ""), text.replace("\\\n", "\\⏎")):
+        found.extend(credential_values(variant))
     new = set()
     for v in found:
-        if v.strip("'\"") and not CRED_FREE_RE.fullmatch(v.strip("'\"")):
+        w = v.strip("'\"")
+        if w and not CRED_FREE_RE.fullmatch(w) and not (hcl and HCL_REFERENCE_RE.fullmatch(w)):
             new |= credential_pieces(v)
     if not new <= CRED_PIECES:
         CRED_PIECES.update(new)
@@ -2231,20 +2326,54 @@ def mask_credentials(text: str) -> str:
     return _CRED_RE[1].sub(CRED_MASK, text)
 
 
+def mask_keyword_values(text: str) -> str:
+    """Over-approximate masking (#5546-#5548, #5550): after every credential keyword the text
+    is replaced by one placeholder through the end of the logical line (a continuation joined),
+    unless the value is exactly one bare brace placeholder. The mask does not try to read where
+    the value ends, so a quoting, escaping or continuation form it cannot read still hides
+    the secret; what it shows is less, never more."""
+    out, i = [], 0
+    while True:
+        m = CRED_KEY_RE.search(text, i)
+        if not m:
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:m.end()])
+        ph = CRED_PLACEHOLDER_RE.match(text, m.end())
+        if ph:
+            out.append(ph.group(0))
+            i = ph.end()
+            continue
+        end = CRED_LINE_RE.match(text, m.end()).end()
+        if end > m.end():
+            out.append(CRED_MASK)
+        i = end
+
+
 def scrub(text: str) -> str:
-    """Text safe to print: registered credential text and the userinfo of every postgres URL
-    in it are replaced (#5438). The only password the gate tolerates is the store-url
-    placeholder, but a template can carry a real one, and a failure line that quotes the line
-    or a word cut from it would put that password in the CI log. Every print of template-
-    derived text goes through this function, before any cut to a fixed width, so a cut cannot
-    drop the "@" that marks the userinfo. What cannot be proven free of a credential is
-    replaced, never shortened: a URL cut before its "@" loses the rest of its line."""
-    return SCRUB_CUT.sub(r"\1<userinfo>", SCRUB_UPTO_AT.sub(r"\1<userinfo>@", mask_credentials(text)))
+    """Text safe to print: registered credential text, the value after every credential keyword
+    and the userinfo of every postgres URL in it are replaced (#5438). The only password the
+    gate tolerates is the store-url placeholder, but a template can carry a real one, and a
+    failure line that quotes the line or a word cut from it would put that password in the CI
+    log. Every print of template-derived text goes through this function (say() calls it), before
+    any cut to a fixed width, so a cut cannot drop the "@" that marks the userinfo. What cannot be
+    proven free of a credential is replaced, never shortened: a URL cut before its "@" loses
+    the rest of its line."""
+    masked = mask_keyword_values(mask_credentials(text))
+    return SCRUB_CUT.sub(r"\1<userinfo>", SCRUB_UPTO_AT.sub(r"\1<userinfo>@", masked))
 
 
 def printable(lines, prefix: str = "") -> str:
     """The text main() prints for hits or faults: every line scrubbed (#5438)."""
     return "\n".join(prefix + scrub(x) for x in lines)
+
+
+def say(text: str, file=None) -> None:
+    """The one function that writes output (#5549). Every line the gate or the regen script
+    prints, template or allowlist text and exception text included, goes through it and is
+    scrubbed on the way; print_funnel_problems() fails the self-test when a print call
+    stands anywhere else in either script."""
+    print(scrub(text), file=sys.stdout if file is None else file)
 
 
 def validate_line(ln: Line, homes: set, binaries: set) -> list:
@@ -2767,8 +2896,10 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
     cache = {} if cache is None else cache
     faults, hits = [], []
     CRED_PIECES.clear()
-    for text in list(templates.values()) + list(maintfs.values()) + [allow_text, pending_text]:
+    for text in list(templates.values()) + [allow_text, pending_text]:
         register_credentials(text)
+    for text in maintfs.values():
+        register_credentials(text, hcl=True)  # HCL writes a reference as var.X; only main.tf may do so
     if len(templates) < 2:
         faults.append("expected at least 2 templates, found %d" % len(templates))
     scopes = {}
@@ -2856,7 +2987,7 @@ def list_triggers(templates: dict, cache: dict) -> list:
     for nm, text in sorted(templates.items()):
         lines, _, _, trig, _ = analyse(nm, text, cache)
         for ln in trig:
-            out.append("%s | %s | %s" % (scope_of(nm), ln.ctx, mask_credentials(ln.text)))
+            out.append("%s | %s | %s" % (scope_of(nm), ln.ctx, scrub(ln.text)))
     return out
 
 
@@ -3881,7 +4012,7 @@ def pin_problems() -> list:
 
 def emit_self_test_failures(bad: list) -> None:
     """Print the self-test failure lines to stderr, each through printable (#5491)."""
-    print(printable(bad, "SELF-TEST FAIL: "), file=sys.stderr)
+    say(printable(bad, "SELF-TEST FAIL: "), file=sys.stderr)
 
 
 def self_test(known: set) -> int:
@@ -3931,7 +4062,7 @@ def self_test(known: set) -> int:
     if bad:
         emit_self_test_failures(bad)
         return 1
-    print("SELF-TEST PASS: %d red probes flagged, %d green probes clean, %d form faults raised, %d/%d allow-entry mutations red, append chain past the cap collapses, mistyped argument exits 2"
+    say("SELF-TEST PASS: %d red probes flagged, %d green probes clean, %d form faults raised, %d/%d allow-entry mutations red, append chain past the cap collapses, mistyped argument exits 2"
           % (counts["red"], counts["green"], counts["fault"], len(muts), len(muts)))
     return 0
 
@@ -3944,23 +4075,23 @@ def main(argv: list) -> int:
             return self_test(known)
         templates, maintfs, allow, pend = load_repo()
         if args.list_triggers:
-            print("\n".join(list_triggers(templates, {})))
+            say("\n".join(list_triggers(templates, {})))
             return 0
         hits, faults, stats = run_scan(templates, maintfs, allow, pend, known)
     except (OSError, RuntimeError, UnicodeDecodeError) as exc:
-        print("FAULT: %s" % scrub(str(exc)), file=sys.stderr)
+        say("FAULT: %s" % str(exc), file=sys.stderr)
         return 2
     if faults:
-        print(printable(faults, "FAULT: "), file=sys.stderr)
+        say(printable(faults, "FAULT: "), file=sys.stderr)
         if hits:
-            print(printable(hits), file=sys.stderr)
+            say(printable(hits), file=sys.stderr)
         return 2
     if hits:
-        print(printable(hits), file=sys.stderr)
-        print("FAIL: %d cloud-init template defect(s)" % len(hits), file=sys.stderr)
-        print("  list the changed approved lines: scripts/regen-cloud-init-token-allow.py <repo-root>; after review, rerun it with --accept-new and review its diff", file=sys.stderr)
+        say(printable(hits), file=sys.stderr)
+        say("FAIL: %d cloud-init template defect(s)" % len(hits), file=sys.stderr)
+        say("  list the changed approved lines: scripts/regen-cloud-init-token-allow.py <repo-root>; after review, rerun it with --accept-new and review its diff", file=sys.stderr)
         return 1
-    print("PASS: %d templates, %d allow entries, %d pending entries, %d triggered lines, %d serve flags known"
+    say("PASS: %d templates, %d allow entries, %d pending entries, %d triggered lines, %d serve flags known"
           % (stats["templates"], stats["allow"], stats["pending"], stats["triggered"], len(known)))
     return 0
 

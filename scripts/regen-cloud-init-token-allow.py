@@ -31,7 +31,7 @@ def pending_refusals(g, templates, allow, pend) -> list:
     g.register_credentials(pend)
     g.load_entries(allow, False, faults, "allow")
     pe = g.load_entries(pend, True, faults, "pending")
-    out = ["FAULT: " + g.mask_credentials(f) for f in faults]
+    out = ["FAULT: " + g.scrub(f) for f in faults]
     per = {}
     cache = {}
     for nm, text in sorted(templates.items()):
@@ -45,7 +45,7 @@ def pending_refusals(g, templates, allow, pend) -> list:
             return bool(per) and all(k in v for v in per.values())
         return k in per.get(e[0], set())
 
-    out += ["STALE PENDING: %s %s | %s | %s" % (e[0], e[1], e[2], g.mask_credentials(e[3])) for e in pe if not live(e)]
+    out += ["STALE PENDING: %s %s | %s | %s" % (e[0], e[1], e[2], g.scrub(e[3])) for e in pe if not live(e)]
     if out:
         out.append("refused: fix the allow or pending list first (%d problem(s)); nothing was written" % len(out))
     return out
@@ -55,13 +55,13 @@ def change_report(g, removed, added, changed, old_seq, new_seq) -> list:
     """The REMOVED, NEW and CHANGED lines the rewrite prints. Each carries template text, so
     each goes through g.scrub, and main() prints it through g.say: a template line that holds a password is shown with
     it masked (#5488). Credential text must be registered first (g.analyse does it)."""
-    out = ["REMOVED: %s | %s | %s" % (k[0], k[1], g.mask_credentials(k[2])) for k in sorted(removed.elements())]
-    out += ["NEW: %s | %s | %s" % (k[0], k[1], g.mask_credentials(k[2])) for k in sorted(added.elements())]
+    out = ["REMOVED: %s | %s | %s" % (k[0], k[1], g.scrub(k[2])) for k in sorted(removed.elements())]
+    out += ["NEW: %s | %s | %s" % (k[0], k[1], g.scrub(k[2])) for k in sorted(added.elements())]
     for k in changed:
         out.append("CHANGED: %s | %s" % k)
         for d in difflib.unified_diff(old_seq.get(k, []), new_seq.get(k, []), lineterm="", n=0):
             if d[:1] in "+-" and not d.startswith(("+++", "---")):
-                out.append("    " + g.mask_credentials(d))
+                out.append("    " + g.scrub(d))
     return out
 
 
@@ -110,9 +110,9 @@ def self_test(g, templates, maintfs, allow, pend) -> int:
     bad.extend(spelling_problems(g, templates, maintfs, allow, pend))
     bad.extend(g.print_funnel_problems((g.__file__, __file__)))
     for lbl in bad:
-        print("REGEN SELF-TEST FAIL: " + lbl, file=sys.stderr)
+        g.say("REGEN SELF-TEST FAIL: " + lbl, file=sys.stderr)
     if not bad:
-        print("REGEN SELF-TEST PASS: %d cases, %d credential spellings kept off the report" % (len(cases), len(g.CRED_SPELLINGS)))
+        g.say("REGEN SELF-TEST PASS: %d cases, %d credential spellings kept off the report" % (len(cases), len(g.CRED_SPELLINGS)))
     return 1 if bad else 0
 
 
@@ -194,13 +194,13 @@ def main():
         return self_test(g, templates, maintfs, allow, pend)
     refusals = pending_refusals(g, templates, allow, pend)
     if refusals:
-        print("\n".join(refusals), file=sys.stderr)
+        g.say("\n".join(refusals), file=sys.stderr)
         return 1
     out, old, lines, changed, added, removed = plan(g, templates, allow, pend)
     if lines:
-        print("\n".join(lines))
+        g.say("\n".join(lines))
     if changed and not a.accept_new:
-        print("refused: %d approved sequence(s) changed (%d line(s) added, %d removed); review them, "
+        g.say("refused: %d approved sequence(s) changed (%d line(s) added, %d removed); review them, "
               "then rerun with --accept-new" % (len(changed), sum(added.values()), sum(removed.values())),
               file=sys.stderr)
         return 1
@@ -208,7 +208,7 @@ def main():
     head = head[:next((k for k, x in enumerate(allow.splitlines()) if x and not x.startswith("#")), len(head))]
     body = ["%s | %s | %s" % e for e in out]
     (root / "scripts/qc-allowlists/cloud-init-token-allow.txt").write_text("\n".join(head + body) + "\n", encoding="utf-8")
-    print("entries %d (was %d), both %d" % (len(body), len(old), sum(1 for e in out if e[0] == "both")))
+    g.say("entries %d (was %d), both %d" % (len(body), len(old), sum(1 for e in out if e[0] == "both")))
     return 0
 
 
