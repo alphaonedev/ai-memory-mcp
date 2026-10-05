@@ -729,12 +729,20 @@ MDEOF
     anchor_red 5456 BARE_QUAL "a path that continues past a closer inside a prose generic" \
         "See Vec<$R::RecallTool<T>>::decorate_memory_many> here."
 
+    anchor_green 5456 "a live generic anchor after a stray closer in the prose" \
+        "If a > b then see $R::RecallTool<T> here."
+
     # #5457: a self type that opens with dyn, impl or a reference names the
     # type behind that word, not the keyword.
     anchor_green 5457 "a dyn trait-object self type with live parts" \
         "See \`$R::<dyn RecallTool>::decorate_memory_many\`."
     anchor_green 5457 "a dyn self type with an as clause and live parts" \
         "See \`$R::<dyn RecallTool as Tr>::decorate_memory_many\`."
+    anchor_green 5457 "an impl self type with live parts" \
+        "See \`$R::<impl RecallTool>::decorate_memory_many\`."
+    anchor_red_cites 5457 QUAL "an impl self type whose trait is missing" \
+        "$R::NoSuch" \
+        "See \`$R::<impl NoSuch>::decorate_memory_many\`."
     anchor_green 5457 "a mutable reference self type with live parts" \
         "See \`$R::<&mut RecallTool>::decorate_memory_many\`."
     anchor_green 5457 "a lifetime reference self type with live parts" \
@@ -1020,6 +1028,28 @@ MDEOF
         'The loop `src/missing_5201.rs` was renamed to `src/mcp/tools/recall.rs`.'
     anchor_green 5201 "a plain path with 'pre-split' wording" \
         'It was `src/missing_5201.rs` pre-split.'
+    # #5251: every wording alternative of ABSENT_ASSERTION has its own killing
+    # cell: a plain path next to it is exempt.
+    anchor_green 5251 "a plain path with 'test ! -f' wording" \
+        'The pre-flight runs test ! -f `src/missing_5251.rs` first.'
+    anchor_green 5251 "a plain path with 'modularisation' wording" \
+        'After the modularisation `src/missing_5251.rs` is gone.'
+    anchor_green 5251 "a plain path with 'modularization' wording" \
+        'After the modularization `src/missing_5251.rs` is gone.'
+    anchor_green 5251 "a plain path with 'monolithic' wording" \
+        'The monolithic `src/missing_5251.rs` is gone.'
+    anchor_green 5251 "a plain path with 'split from' wording" \
+        'It is `src/missing_5251.rs` split from the rest.'
+    anchor_green 5251 "a plain path with 'split off' wording" \
+        'It is `src/missing_5251.rs` split off the rest.'
+    anchor_green 5251 "a plain path with 'removed in' wording" \
+        'The file `src/missing_5251.rs` was removed in 1.0.'
+    anchor_green 5251 "a plain path with 'deleted in' wording" \
+        'The file `src/missing_5251.rs` was deleted in 1.0.'
+    anchor_green 5251 "a plain path with 'STALE BASE' wording" \
+        'STALE BASE: `src/missing_5251.rs` is absent.'
+    anchor_green 5251 "a plain path with 'does not exist' wording" \
+        'The file `src/missing_5251.rs` does not exist here.'
     # #5264: wording that names a DESTINATION never exempts the file after it.
     anchor_red 5264 PATH "a plain path after 'was split into'" \
         'The module was split into `src/missing_5264.rs` for it.'
