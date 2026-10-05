@@ -609,6 +609,12 @@ ANCHORS = [
     # self-test: steps ** v40 -> v52 REJECTED (kills a single space), stepsv40 -> v52 ACCEPTED (kills
     # ` *` after steps), v40->v52 REJECTED (kills a required space around the arrow), v40 ** -> v52 and
     # v40 -> ** v52 REJECTED (kill an at-most-one space on either side of the arrow).
+    # EQUIVALENT MUTANT (#5650): reverting the spaces to the backslash-s form changes no verdict, because
+    # the only characters the two spellings treat differently (a tab, a newline, a non-breaking space) never
+    # reach an anchor: WS.sub(' ', ...) (the html view, the cross-line join and the same-line aline) turns each
+    # run of them into one space first. The paired mutants that DO change a verdict are killed by the legs
+    # named above (a single space, a dropped space, a dropped fold). The tab leg (steps<TAB>v40 -> v52) and the
+    # nbsp-and-entity html legs (v40&nbsp;&rarr;&nbsp;v52) pin the fold that makes this so.
     re.compile(r'\bsteps +v[0-9]+ *(?:→|->) *v([0-9]+)'),
     # CONFIG_SCHEMA postgres row: | ai-memory postgres schema | **v93** |
     re.compile(r'ai-memory postgres schema *\| *\*\*v([0-9]+)\*\*'),
