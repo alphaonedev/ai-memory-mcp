@@ -1105,9 +1105,12 @@ PYEOF
     anchor_green 5460 "an as group with a live type inside a brace item" \
         "See \`$R::{<RecallTool as Tr>}\` x"
 
-    # #5459: a reference-definition head indented 4 or more spaces (or a tab) is
-    # an indented code block, like the same-line form pinned by #5343, so the
-    # line below it is not a link target; a tab head stays a head (red).
+    # #5459: a reference-definition head indented 4 or more spaces is an
+    # indented code block, like the same-line form pinned by #5343, so the
+    # line below it is not a link target (green). A tab-indented head is
+    # still read as a head: the gate counts one tab as one column, stricter
+    # than CommonMark's tab stop of 4, so the line below it is checked (red;
+    # #5614 corrects this comment, which used to call both a code block).
     anchor_green 5459 "a 4-space indented definition head, then an absent escape path" \
         $'    [x]:\nsrc/../gone.rs no longer exists'
     anchor_red 5459 PATH "a tab-indented definition head (conservative: one tab counts as one space), then an escape path" \
