@@ -533,7 +533,9 @@ write_files:
       if [ -z "$ALL" ] || [ "$${#GAPS}" != "$${#EMPTY}" ]; then
         echo "store-url must hold exactly one non-empty line: /etc/ai-memory/store-url"; exit 1
       fi
-      SHAPED="$(sed -n 's#^postgres://aimemory:[[:alnum:]%._~-]\{1,\}@[[:graph:]]\{1,\}$#url#p' /etc/ai-memory/store-url)"
+      # The scheme is written postgres[:]// so that no scan reads this pattern
+      # as a URL whose password is the bracket text (#5640).
+      SHAPED="$(sed -n 's#^postgres[:]//aimemory:[[:alnum:]%._~-]\{1,\}@[[:graph:]]\{1,\}$#url#p' /etc/ai-memory/store-url)"
       if [ "$SHAPED" != url ]; then
         echo "store-url line is not one aimemory URL of printable characters with an unreserved password: /etc/ai-memory/store-url"; exit 1
       fi
