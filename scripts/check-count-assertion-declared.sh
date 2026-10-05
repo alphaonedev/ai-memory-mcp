@@ -164,7 +164,7 @@ FULL_SHA = re.compile(r'^[0-9a-f]{40}$')
 VALTOK = r'(?:[0-9]+|\?[^\s,]+?)'
 VAL = r'(?:\(none\)|' + VALTOK + r'(?:,' + VALTOK + r')*)(?=\s|,|->|$)'
 ITEM_RE = re.compile(r'^(?P<what>\S.*?)\s+(?P<old>' + VAL + r')\s*->\s*(?P<new>' + VAL + r')$')
-WHY_RE = re.compile(r'\s*\((?!none\))[^()]+\)\s*$')
+WHY_RE = re.compile(r'\s+\((?!none\))[^()]+\)\s*$')     # a (why) follows a space: a value never holds one (#5966)
 
 
 def git(*a, inp=None):
@@ -215,7 +215,11 @@ COUNT_CALL = re.compile(r'\.\s*(?:len|count)\s*\(\s*\)')
 # what ends the left operand of a `==` at its own bracket depth (scanning back from the `==`); `==` itself also ends
 # one, in its own branch of compares_count, and a `,` or `;` ends one as well
 OPERAND_STOPS = ('&&', '||', '!=', '=>')
-CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]*)\s*:\s*(?:usize|u\d+|i\d+)\s*=\s*(?P<val>[^;]+?)\s*;')
+# The head of a `const` or `static` (also `static mut`) item of ANY type and any name (#5963); its type runs to the `=`
+# at generic depth 0 and its value to the `;` at bracket depth 0 (const_items). A const generic parameter
+# (`<const N: usize>`) and a `'static` lifetime are not items.
+CONST_HEAD = re.compile(r"(?<![\w'])(?:const|static)\s+(?:mut\s+)?(?P<name>[A-Za-z_]\w*)\s*:")
+IDENT = re.compile(r'(?<![\w.])(?:r#)?(?P<name>[A-Za-z_]\w*)')   # an identifier that is not a field or a method
 UNREAD = '?count#unreadable'
 UNREADABLE = '!unreadable'      # the key prefix of an undecidable assertion: red in every commit that reads its file
 # The `<` that opens a generic argument list (#5873), as rustc reads it: after `::` (a turbofish, also `Vec::<u8>`),
@@ -387,15 +391,64 @@ def named(consts, name, qualified):
     return v if v is not None else '@' + name
 
 
+def spelled(x):
+    """-> the undecidable value `?<spelling>` of source text x: whitespace dropped (kept as `~` between two word
+    characters, so `BAR as usize` still names BAR; #5964), and a comma written as `;` so the value stays one declarable
+    token (#5966)."""
+    x = re.sub(r'(?<=\w)\s+(?=\w)', '~', x.strip())
+    return '?' + re.sub(r'\s+', '', x).replace(',', ';')
+
+
+def const_items(text):
+    """-> [(name, value text)] for every `const` or `static` item of text (a cleaned file), of ANY type (#5963): the type
+    runs to the `=` at generic depth 0, the value to the `;` at bracket depth 0 (a block value may hold `;`). A const
+    generic parameter (`<const N: usize>`, also with a default) is not an item: `<` or `,` stands before it."""
+    out, n = [], len(text)
+    for h in CONST_HEAD.finditer(text):
+        k = h.start() - 1
+        while k >= 0 and text[k].isspace(): k -= 1
+        if k >= 0 and text[k] in '<,': continue
+        j, angle, depth = h.end(), 0, 0
+        while j < n:                                      # the type: up to the `=` at generic and bracket depth 0
+            ch = text[j]
+            if ch in '([{': depth += 1
+            elif ch in ')]}':
+                depth -= 1
+                if depth < 0: j = n; break
+            elif depth: pass
+            elif ch == '<': angle += 1
+            elif ch == '>' and text[j - 1] != '-': angle -= 1
+            elif ch == '=' and angle <= 0 and text[j + 1:j + 2] not in ('=', '>'): break
+            elif ch == ';': j = n; break
+            j += 1
+        if j >= n: continue
+        a, depth, j = j + 1, 0, j + 1
+        while j < n:                                      # the value: up to the `;` at bracket depth 0
+            ch = text[j]
+            if ch in '([{': depth += 1
+            elif ch in ')]}':
+                depth -= 1
+                if depth < 0: break
+            elif ch == ';' and depth == 0: break
+            j += 1
+        if j < n and text[j] == ';': out.append((h.group('name'), text[a:j].strip()))
+    return out
+
+
+def idents(x):
+    """Every identifier of x that is not a field or a method name (`.name`)."""
+    return {m.group('name') for m in IDENT.finditer(x)}
+
+
 def extract(text):
     """-> ({expr-key: {value, ...}}, {const name: value}, {const names referenced from another file}).
     A value is a decimal integer, `?<spelling>` (undecidable right-hand side) or `@NAME` (a name not defined as a const in
     this file: resolved by resolve() against every eligible .rs file of the tree, never guessed here)."""
     text = clean(text)
     consts = {}
-    for m in CONST.finditer(text):
-        v = int_value(m.group('val'))
-        consts[m.group('name')] = v if v is not None else '?' + re.sub(r'\s+', '', m.group('val'))   # a non-literal value is undecidable, never dropped (#5578)
+    for name, val in const_items(text):
+        v = int_value(val)
+        consts[name] = v if v is not None else spelled(val)   # a non-literal value is undecidable, never dropped (#5578)
     out = {}
     for h in HEAD.finditer(text):
         args = macro_args(text, h.end())
@@ -422,6 +475,9 @@ def extract(text):
                 out.setdefault(key, set()).add(AMBIG)
                 for nm in NAMES.finditer(first):          # and every const it names, so a bump of one moves it
                     out.setdefault(f"{key} [{nm.group('name')}]", set()).add(named(consts, nm.group('name'), nm.group('path') or first[:nm.start()].endswith('::')))
+                for nme in idents(first) - {nm.group('name') for nm in NAMES.finditer(first)}:   # any other name: only
+                    v = consts.get(nme)                   # when it is a const of the tree (`@~`; #5963)
+                    out.setdefault(f'{key} [{nme}]', set()).add(v if v is not None else '@~' + nme)
                 continue
             got, rhs = got[:2], got[2]
         expr = re.sub(r'\s+', '', got[0]) + '.' + got[1] + '()'
@@ -433,11 +489,12 @@ def extract(text):
                 val = named(consts, name, '::' in rhs)
                 expr += f' [{name}]'                      # name the const the count is spelled through
             else:
-                val = '?' + re.sub(r'\s+', '', rhs)         # undecidable: neither a literal nor a const (#5577)
-        out.setdefault(expr, set()).add(val)
-    refs = {v[1:] for vs in out.values() for v in vs if v.startswith('@')}
-    if any(k.startswith(UNREADABLE) for k in out):       # an unreadable assertion names whatever it names: every const name
-        refs |= {nm.group('name') for nm in NAMES.finditer(text)}   # of the file, so moving one re-reads it (#5888)
+                val = spelled(rhs)                        # undecidable: neither a literal nor a const (#5577); resolve()
+        out.setdefault(expr, set()).add(val)              # adds the value of every const it names (#5964)
+    refs = {v.lstrip('@~') for vs in out.values() for v in vs if v.startswith('@')}
+    refs |= {n for vs in out.values() for v in vs if v.startswith('?') and '#' not in v for n in idents(v[1:])}
+    if any(k.startswith(UNREADABLE) for k in out):       # an unreadable assertion names whatever it names: every name
+        refs |= idents(text)                              # of the file, of any case, so moving one re-reads it (#5888, #5963)
     return out, consts, refs
 
 
@@ -488,19 +545,41 @@ def defs_of(rev):
     return _DEFS[rev]
 
 
+def expand(rev, v, seen):
+    """A `?<spelling>` value -> the same value followed by `#NAME=<value>` for every const of the tree that the spelling
+    names, recursively (a cycle is `#NAME=cycle`), so a const spelled through another const, a cast, a method call or
+    arithmetic moves when that const moves (#5964, #5965). Any other value is returned as it is."""
+    if not v.startswith('?') or v in (AMBIG, UNREAD): return v
+    parts = []
+    for name in sorted(idents(v[1:])):
+        ds = defs_of(rev).get(name)
+        if not ds: continue
+        if name in seen: parts.append(f'#{name}=cycle'); continue
+        vals = sorted(expand(rev, x[1], seen | {name}) for x in ds)
+        parts.append(f'#{name}=' + (vals[0] if len(vals) == 1 else 'ambiguous(' + '|'.join(vals) + ')'))
+    return v + ''.join(parts)
+
+
 def resolve(rev, assertions):
     """Replace every `@NAME` with its value over the eligible files of the tree: exactly one definition -> its value; none -> `?NAME#unresolved`;
-    several (two files define the name) -> `?NAME#ambiguous(<every value>)`, so a bump of either definition still moves it. Closed-world: a name that cannot be resolved to ONE integer
-    stays a `?` state, which is a move unless the state is identical on both sides (#5578, #5672)."""
+    several (two files define the name) -> `?NAME#ambiguous(<every value, joined by |>)`, so a bump of either definition still moves it. Closed-world: a name that cannot be resolved to ONE integer
+    stays a `?` state, which is a move unless the state is identical on both sides (#5578, #5672). A `@~name` (a name of
+    any other case in an ambiguous assert!) counts only when the tree defines it; every `?<spelling>` value is expanded."""
     out = {}
     for k, vals in assertions.items():
         rv = set()
         for v in vals:
             if v.startswith('@'):
-                ds = defs_of(rev).get(v[1:], [])
-                v = ds[0][1] if len(ds) == 1 else (f"?{v[1:]}#ambiguous({','.join(sorted(x[1] for x in ds))})" if ds else f'?{v[1:]}#unresolved')
+                loose = v.startswith('@~'); name = v[2:] if loose else v[1:]
+                ds = defs_of(rev).get(name, [])
+                if not ds and loose: continue
+                if len(ds) == 1: v = expand(rev, ds[0][1], {name})
+                elif ds: v = f"?{name}#ambiguous({'|'.join(sorted(expand(rev, x[1], {name}) for x in ds))})"
+                else: v = f'?{name}#unresolved'
+            else:
+                v = expand(rev, v, set())
             rv.add(v)
-        out[k] = rv
+        if rv: out[k] = rv
     return out
 
 
@@ -553,7 +632,16 @@ def count_changes(c):
         n = new_st.get(np_, ({}, {}, set()))[1] if np_ else {}
         moved |= {k for k in set(o) | set(n) if o.get(k) != n.get(k)}
     touched = {e[2] for e in entries if e[2]}
-    if moved:
+    if moved:                                             # a const spelled through a moved const has moved too (#5965)
+        deps = {}
+        for tree in (old_st, new_st):
+            for _e, cs, _r in tree.values():
+                for nme, v in cs.items():
+                    if v.startswith('?'): deps.setdefault(nme, set()).update(idents(v[1:]))
+        grow = moved
+        while grow:
+            grow = {nme for nme, d in deps.items() if nme not in moved and not grow.isdisjoint(d)}
+            moved |= grow
         for path, (_e, _c, refs) in new_st.items():
             if path not in touched and not moved.isdisjoint(refs): pairs.append(('M', path, path))
     hits = []
@@ -922,13 +1010,13 @@ def selftest():
     case('an expression right-hand side that changes is a move, undecidable', typed('18 + 1', '18 + 2'), True, ['sections.len()  ?18+1 -> ?18+2'])
     case('an expression right-hand side declared with its spelling', typed('18 + 1', '18 + 2', 'sections ?18+1 -> ?18+2'), False)
     case('an expression right-hand side declared with decimal values does not match', typed('18 + 1', '18 + 2', 'sections 18 -> 19'), True)
-    case('a literal replaced by an expression is a move', typed('18', 'N as usize'), True, ['sections.len()  18 -> ?Nasusize'])
+    case('a literal replaced by an expression is a move', typed('18', 'N as usize'), True, ['sections.len()  18 -> ?N~as~usize'])
     case('a parenthesised right-hand side is seen', typed('(18)', '(19)'), True, ['?(18) -> ?(19)'])
     case('a nested-call left side with a comma is seen', typed('18', '19', None, 'f(a, b).len()'), True, ['f(a,b).len()  18 -> 19'])
     case('a turbofish left side with a comma is seen', typed('18', '19', None, 'v.iter().collect::<HashMap<K, V>>().len()'), True)
     case('a trailing message argument does not hide the literal', typed('18', '19', None, 'sections.len()'), True)
-    case('a call right-hand side with a comma is read whole', typed('max(18, 19)', 'max(18, 20)'), True, ['?max(18,19) -> ?max(18,20)'])
-    case('a turbofish right-hand side with a comma is read whole', typed('size_of::<HashMap<K, V>>()', 'size_of::<HashMap<K, W>>()'), True, ['K,V', 'K,W'])
+    case('a call right-hand side with a comma is read whole', typed('max(18, 19)', 'max(18, 20)'), True, ['?max(18;19) -> ?max(18;20)'])
+    case('a turbofish right-hand side with a comma is read whole', typed('size_of::<HashMap<K, V>>()', 'size_of::<HashMap<K, W>>()'), True, ['K;V', 'K;W'])
     def c_added_expr(s, b):
         s.w('tests/typed.rs', 'fn t() { assert_eq!(a.len(), 1); }\n'); t0 = s.commit('test: add')
         s.w('tests/typed.rs', 'fn t() { assert_eq!(a.len(), 1); assert_eq!(x.len(), y.len()); }\n'); s.commit('test: add a length comparison'); return t0 + '..HEAD'
@@ -968,7 +1056,7 @@ def selftest():
          shared(A('crate::EXPECTED_N'), 'pub const EXPECTED_N: usize = 9 + 9;\n', 'pub const EXPECTED_N: usize = 9 + 10;\n'), True, ['?9+9 -> ?9+10'])
     case('a shared const bumped that no assertion uses is no move', shared('fn t() {}\n', L(18), L(19)), False)
     case('a QUALIFIED name is never the local const of the same spelling',
-         shared('const EXPECTED_N: usize = 5;\n' + A('crate::EXPECTED_N'), L(18), L(19)), True, ['#ambiguous(18,5) -> ?EXPECTED_N#ambiguous(19,5)'])
+         shared('const EXPECTED_N: usize = 5;\n' + A('crate::EXPECTED_N'), L(18), L(19)), True, ['#ambiguous(18|5) -> ?EXPECTED_N#ambiguous(19|5)'])
     case('a shared const bumped while the asserting file is also edited is ONE move, declared once',
          shared(A('crate::EXPECTED_N') + '// a\n', L(18), L(19), None, {SH: A('crate::EXPECTED_N') + '// b\n'}, 'sections 18 -> 19'), False)
     case('a local const of the same name shadows the shared one',
@@ -984,7 +1072,7 @@ def selftest():
     case('an unresolved name that becomes resolved is a move',
          shared(A('crate::MISSING_N'), L(18), L(18) + 'pub const MISSING_N: usize = 4;\n'), True, ['?MISSING_N#unresolved -> 4'])
     case('an ambiguous name that becomes resolved is a move',
-         shared(A('crate::EXPECTED_N'), L(18), L(18), {'src/other.rs': L(3)}, {'src/other.rs': 'pub fn x() {}\n'}), True, ['?EXPECTED_N#ambiguous(18,3) -> 18'])
+         shared(A('crate::EXPECTED_N'), L(18), L(18), {'src/other.rs': L(3)}, {'src/other.rs': 'pub fn x() {}\n'}), True, ['?EXPECTED_N#ambiguous(18|3) -> 18'])
     # ---- #5673: the changelog scope clause: assert(_eq)!(<expr>.len()|.count(), <rhs>) in an eligible src/ or tests/ .rs file ----
     def scoped(path, body0, body1):
         def f_(s, b):
@@ -1157,6 +1245,62 @@ def selftest():
     case('#5961 the same, declared', scoped_m('tests/scope.rs', FR(3), FR(4), msg('test: bump',
          'Count: fasfn()->W<u8,u8>==g&&v.len()==3 ?count#ambiguous -> (none), fasfn()->W<u8,u8>==g&&v.len()==4 (none) -> ?count#ambiguous, '
          'fasfn()->W<u8,u8>==g&&v.len()==3 ?W#unresolved -> (none), fasfn()->W<u8,u8>==g&&v.len()==4 (none) -> ?W#unresolved (fixture)')), False)
+    # ---- #5963: an unreadable file names a const of ANY type, const or static, any case; moving it re-reads the file ----
+    def ur_form(body0, body1, name='BAR', extra=None):
+        def f_(s, b):
+            s.w('tests/u.rs', 'fn t(v: &[u8]) { assert!(v.len() == crate::k::%s /* x ); }\n' % name); s.w('src/k.rs', body0)
+            for k, v in (extra or {}).items(): s.w(k, v)
+            t0 = s.commit('test: add unreadable fixture'); s.w('src/k.rs', body1); s.commit('test: move the const'); return t0 + '..HEAD'
+        return f_
+    for l_, f_ in (('an isize const (M12)', 'pub const BAR: isize = %s;\n'), ('a u128 const', 'pub const BAR: u128 = %s;\n'),
+                   ('an i128 const', 'pub const BAR: i128 = %s;\n'), ('a const of an alias type', 'pub type Count = usize;\npub const BAR: Count = %s;\n'),
+                   ('a NonZeroUsize const', 'pub const BAR: core::num::NonZeroUsize = core::num::NonZeroUsize::new(%s).unwrap();\n'),
+                   ('a NonZero<usize> const', 'pub const BAR: core::num::NonZero<usize> = core::num::NonZero::new(%s).unwrap();\n'),
+                   ('a static', 'pub static BAR: usize = %s;\n'), ('a static mut', 'pub static mut BAR: usize = %s;\n'),
+                   ('an associated const', 'pub struct K;\nimpl K { pub const BAR: usize = %s; }\n'), ('a multi-line const', 'pub const BAR:\n    usize =\n    %s;\n'),
+                   ('a const with a block value', 'pub const BAR: usize = { let a = 1; a + %s };\n'), ('an expression const', 'pub const BAR: usize = 1 + %s;\n')):
+        case('#5963 an unreadable assertion is red when %s it names moves' % l_, ur_form(f_ % 1, f_ % 2), True, ['!unreadable line 1 (an unterminated block comment)'])
+    case('#5963 an unreadable assertion is red when a lowercase const it names moves',
+         ur_form('pub const bar: usize = 1;\n', 'pub const bar: usize = 2;\n', 'bar'), True, ['!unreadable line 1'])
+    case('#5963 an unreadable assertion is red when the const its const is defined by moves (#5965)',
+         ur_form('pub const BASE: usize = 1;\n', 'pub const BASE: usize = 2;\n', 'BAR', {'src/j.rs': 'pub const BAR: usize = crate::k::BASE;\n'}), True, ['!unreadable line 1'])
+    case('#5963 control: an isize const the unreadable file does not name moves nothing',
+         ur_form('pub const BAR: isize = 1;\npub const OTHER: isize = 1;\n', 'pub const BAR: isize = 1;\npub const OTHER: isize = 2;\n'), False)
+    case('#5963 a const generic parameter is not a const item', scoped('src/g.rs', 'pub struct G<const N: usize>;\npub const BAR: usize = 1;\n' + E('assert_eq', 'len', 'BAR'),
+         'pub struct G<const N: usize = 3>;\npub const BAR: usize = 2;\n' + E('assert_eq', 'len', 'BAR')), True, ['items.len() [BAR]  1 -> 2'])
+    # ---- #5964: a count spelled through a const behind a cast, .get() or arithmetic carries that const's value ----------
+    def rd(rhs, k0, k1, decl=None, extra=None):
+        def f_(s, b):
+            s.w('tests/a.rs', 'fn t(v: &[u8]) { assert_eq!(v.len(), %s); }\n' % rhs); s.w('src/k.rs', k0)
+            for k, v in (extra or {}).items(): s.w(k, v)
+            t0 = s.commit('test: add fixture'); s.w('src/k.rs', k1)
+            s.commit(msg('test: bump', 'Count: %s (fixture)' % decl) if decl else 'test: bump without a declaration'); return t0 + '..HEAD'
+        return f_
+    case('#5964 a count through an isize const cast moves with the const', rd('crate::k::BAR as usize', 'pub const BAR: isize = 3;\n', 'pub const BAR: isize = 4;\n'),
+         True, ['v.len()  ?crate::k::BAR~as~usize#BAR=3 -> ?crate::k::BAR~as~usize#BAR=4'])
+    case('#5964 the same, declared', rd('crate::k::BAR as usize', 'pub const BAR: isize = 3;\n', 'pub const BAR: isize = 4;\n',
+         'v.len() ?crate::k::BAR~as~usize#BAR=3 -> ?crate::k::BAR~as~usize#BAR=4'), False)
+    case('#5964 a count through NonZero .get() moves with the const', rd('crate::k::BAR.get()', 'pub const BAR: core::num::NonZeroUsize = core::num::NonZeroUsize::new(3).unwrap();\n',
+         'pub const BAR: core::num::NonZeroUsize = core::num::NonZeroUsize::new(4).unwrap();\n'), True, ['#BAR=?core::num::NonZeroUsize::new(3).unwrap()'])
+    case('#5964 a count through BAR + 1 moves with the const', rd('crate::k::BAR + 1', 'pub const BAR: usize = 3;\n', 'pub const BAR: usize = 4;\n'),
+         True, ['v.len()  ?crate::k::BAR+1#BAR=3 -> ?crate::k::BAR+1#BAR=4'])
+    case('#5964 a count through a static moves with the static', rd('crate::k::BAR', 'pub static BAR: usize = 3;\n', 'pub static BAR: usize = 4;\n'), True, ['v.len() [BAR]  3 -> 4'])
+    case('#5964 control: a cast const that does not change is no move', rd('crate::k::BAR as usize', 'pub const BAR: isize = 3;\n', 'pub const BAR: isize = 3;\n// t\n'), False)
+    # ---- #5965: a const defined by another const carries that const's value, transitively; a cycle is named, never looped
+    case('#5965 a count through BAR = BASE moves when BASE moves', rd('crate::k::BAR', 'pub const BASE: usize = 3;\n', 'pub const BASE: usize = 4;\n',
+         extra={'src/j.rs': 'pub const BAR: usize = crate::k::BASE;\n'}), True, ['v.len() [BAR]  ?crate::k::BASE#BASE=3 -> ?crate::k::BASE#BASE=4'])
+    case('#5965 two links: BAR = MID, MID = BASE + 1, BASE moves', rd('crate::k::BAR', 'pub const BASE: usize = 3;\n', 'pub const BASE: usize = 4;\n',
+         extra={'src/j.rs': 'pub const BAR: usize = crate::m::MID;\n', 'src/m.rs': 'pub const MID: usize = crate::k::BASE + 1;\n'}), True, ['#BASE=3', '#BASE=4'])
+    def c_cycle(s, b):
+        s.w('src/k.rs', 'pub const A: usize = B;\npub const B: usize = A;\n'); s.w('tests/a.rs', 'fn t() {}\n'); t0 = s.commit('test: add')
+        s.w('tests/a.rs', 'fn t(v: &[u8]) { assert_eq!(v.len(), crate::k::A); }\n'); s.commit('test: assert through a cycle'); return t0 + '..HEAD'
+    case('#5965 a const cycle is named, never followed for ever', c_cycle, True, ['=cycle'])
+    # ---- #5966: a value whose spelling holds a comma or an ambiguous value is still one declarable token -------------
+    case('#5966 a comma value is declared with ; for its comma', typed('max(18, 19)', 'max(18, 20)', 'sections ?max(18;19) -> ?max(18;20)'), False)
+    case('#5966 a comma value declared with no (why)', scoped_m('tests/typed.rs', 'fn t() { assert_eq!(sections.len(), max(18, 19)); }\n',
+         'fn t() { assert_eq!(sections.len(), max(18, 20)); }\n', msg('test: bump', 'Count: sections ?max(18;19) -> ?max(18;20)')), False)
+    case('#5966 an ambiguous value is declared with | between its values',
+         shared(A('crate::EXPECTED_N'), L(18), L(18), {'src/other.rs': L(3)}, {'src/other.rs': 'pub fn x() {}\n'}, 'sections ?EXPECTED_N#ambiguous(18|3) -> 18'), False)
     # stated limits (#5715 brings a lexer): a quote or a // inside a block comment is read as the start of a string or of
     # a line comment, so such an assertion is unreadable (red with its line), never silently skipped
     case('#5872 a quote inside a block comment, with a string after it, is unreadable (#5715)',
@@ -1204,7 +1348,7 @@ def selftest():
     case('#5873 assert_eq! with a qualified path holding a comma in the value keeps the whole value',
          scoped('tests/scope.rs', 'fn t() { assert_eq!(v.len(), 18 + <usize as Tr<u8, u16>>::O::default()); }\n',
                 'fn t() { assert_eq!(v.len(), 19 + <usize as Tr<u8, u16>>::O::default()); }\n'), True,
-         ['v.len()  ?18+<usizeasTr<u8,u16>>::O::default() -> ?19+<usizeasTr<u8,u16>>::O::default()'])
+         ['v.len()  ?18+<usize~as~Tr<u8;u16>>::O::default() -> ?19+<usize~as~Tr<u8;u16>>::O::default()'])
     TF = lambda n: 'fn t() { assert!(ok && v.len() + f::<u8, u16() == %s); }\n' % n
     case('#5873 a turbofish with no closing > in a count assertion is unreadable, red with its line',
          scoped('tests/scope.rs', TF(18), TF(19)), True,
@@ -1283,10 +1427,10 @@ def selftest():
          scoped('tests/scope.rs', 'fn t() {}\n', 'fn t() { assert!(v.iter().any(|x| x.chars().count() == 2)); }\n'), True, ['v.iter().any(|x|x.chars().count()==2)  (none) -> ?count#ambiguous'])
     case('a path-qualified const in an ambiguous assert! is resolved over the tree, not to a same-named local const',
          shared('const EXPECTED_N: usize = 5;\nfn u(v: &[u8], k: usize) { assert!(k > 0 && v.len() == crate::EXPECTED_N); }\n', L(18), L(19)), True,
-         ['k>0&&v.len()==crate::EXPECTED_N [EXPECTED_N]  ?EXPECTED_N#ambiguous(18,5) -> ?EXPECTED_N#ambiguous(19,5)'])
+         ['k>0&&v.len()==crate::EXPECTED_N [EXPECTED_N]  ?EXPECTED_N#ambiguous(18|5) -> ?EXPECTED_N#ambiguous(19|5)'])
     case('a const named through <T as Tr>:: in an ambiguous assert! is tracked and resolved over the tree',
          shared('const EXPECTED_N: usize = 5;\nfn u(v: &[u8], k: usize) { assert!(k > 0 && v.len() == <S as Tr>::EXPECTED_N); }\n', L(18), L(19)), True,
-         ['k>0&&v.len()==<SasTr>::EXPECTED_N [EXPECTED_N]  ?EXPECTED_N#ambiguous(18,5) -> ?EXPECTED_N#ambiguous(19,5)'])
+         ['k>0&&v.len()==<SasTr>::EXPECTED_N [EXPECTED_N]  ?EXPECTED_N#ambiguous(18|5) -> ?EXPECTED_N#ambiguous(19|5)'])
     # ---- end #5759 ----
     case('a .rs file under benches/ is not checked', scoped('benches/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
     case('a non-.rs file under tests/ is not checked', scoped('tests/scope.txt', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
