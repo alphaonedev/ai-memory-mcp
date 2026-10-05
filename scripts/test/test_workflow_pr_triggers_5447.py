@@ -19,10 +19,16 @@ RULES ENFORCED (all closed-world: a trigger the reader cannot parse is a FAILURE
   R-PR   every workflow whose ``pull_request`` filter can match main, develop or
          release/v1.0.0 lists the literal entry ``rehearsal/**`` and its filter
          matches ``rehearsal/audit-wip``.
-  R-PUSH no workflow's ``push`` filter lists ``rehearsal/**`` or any pattern
-         matching ``rehearsal/audit-wip`` (a push trigger with no ``branches``
-         and no ``tags`` key matches every branch and counts).
-  R-SHAPE a ``pull_request`` / ``push`` trigger must use only the keys
+  R-PUSH no workflow's ``push`` filter lists any pattern that can match the
+         branch ``rehearsal`` or any ref under ``rehearsal/`` (literal, glob or
+         wildcard form; #5659), and every ``push.branches`` item must stay in the
+         plain glob charset (letters, digits, ``._/*-``, optional leading ``!``):
+         quotes inside, tags, ``?``, ``+``, ``[``, backslash and alias-like
+         ``*name`` items are undecidable and fail.  A push trigger with no
+         ``branches`` and no ``tags`` key matches every branch and counts.
+  R-SHAPE (#5660) a tab, NBSP, form feed or BOM-led line, a lone CR or a YAML 1.1
+         line-break character inside the ``on:`` block fails; so does a
+         ``pull_request`` / ``push`` trigger that does not use only the keys
          branches, tags, paths, paths-ignore, types; ``branches`` must be an
          inline list or a block list.  Anything else (branches-ignore, scalar
          ``on:`` forms, flow-style ``on:``, an unterminated list) fails.
@@ -89,7 +95,13 @@ def _parse_inline_list(text: str) -> List[str]:
     inner = text[1:-1].strip()
     if not inner:
         return []
-    return [_unquote(p) for p in inner.split(",") if p.strip()]
+    pieces = [p.strip() for p in inner.split(",") if p.strip()]
+    for piece in pieces:
+        if piece[0] in ("'", '"') and not (len(piece) >= 2 and piece[-1] == piece[0]):
+            raise Unparsed("quoted flow item with an embedded comma or quote: " + piece)
+        if piece[-1] in ("'", '"') and piece[0] != piece[-1]:
+            raise Unparsed("unbalanced quote in flow item: " + piece)
+    return [_unquote(p) for p in pieces]
 
 
 # Characters YAML 1.1 parsers treat as a line break besides LF/CR (PyYAML does).
@@ -115,7 +127,6 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
         raise Unparsed("YAML 1.1 line-break character (form feed, NEL, U+2028/9, ...)")
     rows: List[Tuple[int, str, str]] = []
     for raw in text.split("\n"):
-        raw = raw.rstrip("\r")
         line = _strip_comment(raw)
         if line.strip():
             rows.append((_indent(line), line.strip(), _suspect(raw, line)))
@@ -246,6 +257,63 @@ def filter_matches(patterns: List[str], ref: str) -> bool:
     return matched
 
 
+PUSH_ITEM_ALLOWED = re.compile(r"^[A-Za-z0-9._/*-]+$")
+PUSH_ITEM_ALIAS_LIKE = re.compile(r"^\*[A-Za-z0-9_-]+$")
+REHEARSAL_PREFIX = "rehearsal/"
+REHEARSAL_BRANCH = "rehearsal"
+
+
+def _push_item_problem(pat: str) -> str:
+    """Why a push.branches item cannot be decided (allowlist: plain glob charset only)."""
+    body = pat[1:] if pat.startswith("!") else pat
+    if not PUSH_ITEM_ALLOWED.match(body):
+        return "uses a form outside the plain glob allowlist (quote, tag, ?, +, [, backslash, ...)"
+    if PUSH_ITEM_ALIAS_LIKE.match(body):
+        return "is indistinguishable from a YAML alias"
+    return ""
+
+
+def _push_can_match_rehearsal(pat: str) -> bool:
+    """True when a decidable push glob can match the branch ``rehearsal`` or any ref under ``rehearsal/``."""
+    if "rehearsal" in pat:
+        return True
+    tokens: List[str] = []
+    i = 0
+    while i < len(pat):
+        if pat[i:i + 2] == "**":
+            tokens.append("**")
+            i += 2
+        else:
+            tokens.append(pat[i])
+            i += 1
+
+    def close(states: set) -> set:
+        out = set(states)
+        stack = list(states)
+        while stack:
+            st = stack.pop()
+            if st < len(tokens) and tokens[st] in ("*", "**") and st + 1 not in out:
+                out.add(st + 1)
+                stack.append(st + 1)
+        return out
+
+    states = close({0})
+    for ch in REHEARSAL_PREFIX:
+        nxt = set()
+        for st in states:
+            if st >= len(tokens):
+                continue
+            tok = tokens[st]
+            if tok == "**" or (tok == "*" and ch != "/") or tok == ch:
+                nxt.add(st if tok in ("*", "**") else st + 1)
+        states = close(nxt)
+        if not states:
+            break
+    # Any live state after the whole prefix can still complete: literals extend the
+    # ref and stars match empty, so some ref under rehearsal/ matches.
+    return bool(states) or glob_match(pat, REHEARSAL_BRANCH)
+
+
 def violations(name: str, text: str) -> List[str]:
     """Every rule violation for one workflow file's text (empty list = clean)."""
     try:
@@ -274,8 +342,12 @@ def violations(name: str, text: str) -> List[str]:
         flt = triggers["push"]
         if "branches" in flt:
             patterns = flt["branches"]
-            if CARRIER_PATTERN in patterns or filter_matches(patterns, CARRIER):
-                found.append(f"{name}: R-PUSH push.branches matches {CARRIER}")
+            for pat in patterns:
+                problem = _push_item_problem(pat)
+                if problem:
+                    found.append(f"{name}: R-PUSH push.branches item {pat!r} {problem}")
+                elif not pat.startswith("!") and _push_can_match_rehearsal(pat):
+                    found.append(f"{name}: R-PUSH push.branches item {pat!r} can match a rehearsal ref")
         elif "tags" not in flt:
             found.append(f"{name}: R-PUSH push has no branches and no tags filter (matches every branch)")
     return found
@@ -476,6 +548,13 @@ class LeadingWhitespace5660(unittest.TestCase):
     def test_5660_lone_cr_line_break(self) -> None:
         self._red(_with_on_block(GOOD_PUSH + GOOD_PR).replace("\n  push:", "\r  push:", 1))
 
+    def test_5660_lone_cr_hides_a_trigger_in_a_comment(self) -> None:
+        # Without the lone-CR rule the CR-separated trigger vanishes into a comment.
+        self._red(_with_on_block(GOOD_PUSH + "  # note\r  pull_request:\n    branches: [main]\n"))
+
+    def test_5660_crlf_trailing_whitespace_stripped(self) -> None:
+        self.assertEqual("x: y", _strip_comment("x: y \r"))
+
     def test_5660_unicode_line_separator(self) -> None:
         self._red(_with_on_block(GOOD_PUSH + GOOD_PR + "  # x\u2028  y\n"))
 
@@ -489,6 +568,110 @@ class LeadingWhitespace5660(unittest.TestCase):
     def test_5660_tab_in_later_block_scalar_is_not_inspected(self) -> None:
         text = _with_on_block(GOOD_PUSH + GOOD_PR) + "x:\n  run: |\n\t\techo hi\n"
         self.assertEqual([], violations("x.yml", text))
+
+
+def _push_text(entries: str) -> str:
+    return _with_on_block("  push:\n    branches: " + entries + "\n" + GOOD_PR)
+
+
+class PushNeverRehearsal5659(unittest.TestCase):
+    """#5659: push.branches may never match any ref under rehearsal/ (closed-world)."""
+
+    def _red(self, entries: str) -> None:
+        got = violations("x.yml", _push_text(entries))
+        self.assertTrue(any("R-PUSH" in v for v in got), (entries, got))
+
+    def _clean(self, entries: str) -> None:
+        self.assertEqual([], violations("x.yml", _push_text(entries)), entries)
+
+    def test_5659_live_sweep_has_no_rehearsal_push_entry(self) -> None:
+        for name, text in load_all().items():
+            flt = parse_triggers(text).get("push") or {}
+            for pat in flt.get("branches", []):
+                self.assertNotIn("rehearsal", pat, name)
+                self.assertFalse(_push_can_match_rehearsal(pat), (name, pat))
+
+    def test_5659_other_rehearsal_branch_literal(self) -> None:
+        self._red("[main, develop, 'release/**', 'rehearsal/landing']")
+
+    def test_5659_double_quoted_literal(self) -> None:
+        self._red('[main, "rehearsal/landing"]')
+
+    def test_5659_bare_rehearsal_branch_name(self) -> None:
+        self._red("[main, rehearsal]")
+
+    def test_5659_single_star_under_rehearsal(self) -> None:
+        self._red("[main, 'rehearsal/*']")
+
+    def test_5659_wildcard_prefix_re_star(self) -> None:
+        self._red("[main, 're*']")
+
+    def test_5659_star_star_everything(self) -> None:
+        self._red("[main, '**']")
+
+    def test_5659_slash_star_pairs(self) -> None:
+        self._red("[main, '*/*']")
+
+    def test_5659_star_slash_carrier_tail(self) -> None:
+        self._red("[main, '*/audit-wip']")
+
+    def test_5659_r_star_star(self) -> None:
+        self._red("[main, 'r*/**']")
+
+    def test_5659_rehearsal_word_anywhere_is_listed(self) -> None:
+        for pat in ("rehearsalx", "xrehearsal", "rehearsal-landing"):
+            self._red("[main, '" + pat + "']")
+
+    def test_5659_wildcards_not_matching_the_carrier_literal(self) -> None:
+        # None of these match rehearsal/audit-wip; each can match another rehearsal ref.
+        for pat in ("*/landing", "**/landing", "r*/land*", "*/land**", "re*/x"):
+            self.assertFalse(filter_matches([pat], CARRIER), pat)
+            self._red("[main, '" + pat + "']")
+
+    def test_5659_cannot_match_under_rehearsal_slash_is_clean(self) -> None:
+        # Star never crosses '/', so this cannot match a ref UNDER rehearsal/.
+        self._clean("[main, 'rehear*-x']")
+        self._clean("[main, 'release/*', 'rel*/**', 'main*']")
+
+    def test_5659_inline_list_quote_rules(self) -> None:
+        for bad in ("[a, 'b,c']", "[a, b']", "[a, 'b]", "['a, b']"):
+            with self.assertRaises(Unparsed):
+                _parse_inline_list(bad)
+        self.assertEqual(["a", "b"], _parse_inline_list("[a, 'b']"))
+
+    def test_5659_pull_request_wildcard_without_literal_entry_is_red(self) -> None:
+        text = _with_on_block("  pull_request:\n    branches: [main, 'rehearsal/*']\n" + GOOD_PUSH)
+        got = violations("x.yml", text)
+        self.assertTrue(any("lacks" in v for v in got), got)
+
+    def test_5659_block_list_form(self) -> None:
+        text = _with_on_block("  push:\n    branches:\n      - main\n      - rehearsal/landing\n" + GOOD_PR)
+        self.assertTrue(any("R-PUSH" in v for v in violations("x.yml", text)))
+
+    def test_5659_undecidable_special_forms_fail_closed(self) -> None:
+        for pat in ("re+hearsal/**", "r[e]hearsal/**", "re?hearsal/x", "rehearsal\\\\/x"):
+            self._red("[main, '" + pat + "']")
+
+    def test_5659_yaml_tag_and_alias_forms_fail_closed(self) -> None:
+        self._red("[main, !!str rehearsal/landing]")
+        self._red("[main, *prb]")
+        self._red("[main, '!!str x']")
+
+    def test_5659_branches_ignore_interplay_is_shape_red(self) -> None:
+        text = _with_on_block("  push:\n    branches-ignore: ['rehearsal/**']\n" + GOOD_PR)
+        self.assertTrue(any("R-SHAPE" in v for v in violations("x.yml", text)))
+
+    def test_5659_quoted_comma_is_unparsed(self) -> None:
+        got = violations("x.yml", _push_text("[main, 'a,rehearsal/x']"))
+        self.assertTrue(got, got)
+
+    def test_5659_negation_only_entry_is_clean(self) -> None:
+        self._clean("[main, '!rehearsal/**']")
+
+    def test_5659_benign_lists_stay_clean(self) -> None:
+        self._clean("[main, develop, 'release/**']")
+        self._clean("[main, 'release/v0.6.3.1', feat/v0.7.0-grand-slam]")
+        self._clean("[release/**]")
 
 
 class GlobSemantics5447(unittest.TestCase):
