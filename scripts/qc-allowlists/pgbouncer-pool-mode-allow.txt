@@ -30,7 +30,8 @@ changelog.d/4667.fixed.md | (ci job pgbouncer pool-mode claim gate (#4667), not 
 # this fix's changelog: names the retired setting to say it is withdrawn
 # context re-read on 2026-10-04: The entry's own text is unchanged; the round-6 summary was added to the same changelog paragraph, and it names no pool mode to configure other than session.
 # context re-read on 2026-10-04: The entry's own text is unchanged; only the self-test counts in the same changelog paragraph changed (86 to 87 mutants, 204 to 205 cases), and they name no pool mode.
-changelog.d/4667.fixed.md | making the adapter safe under transaction pooling is tracked in #4679. | ctx:fd35733d71f4
+# context re-read on 2026-10-05: Round 8 re-bind (#5471): each line sits in the 4667 changelog fragment, quotes the withdrawn transaction pooling or session-mode wording as prose, sets no pooler mode, and moved only because the fragment was re-wrapped
+changelog.d/4667.fixed.md | making the adapter safe under transaction pooling is tracked in #4679. | ctx:64f8d305e716
 
 # guide 5.6: states which modes are unsupported, the probe results and migration steps; session mode is the supported mode and is stated in the same section
 docs/enterprise-deployment.md | > status (#4667). the supported pool mode behind the postgres adapter is | ctx:51f8076f07ce
@@ -253,11 +254,13 @@ CHANGELOG.md | probe and the on conflict do nothing insert as two independent po
 # this PR's own changelog fragment: it states session mode is the only supported mode and describes how the gate rejects the other modes
 # context re-read on 2026-10-04: The entry's own text is unchanged; the round-6 summary was added to the same changelog paragraph, and it names no pool mode to configure other than session.
 # context re-read on 2026-10-04: The entry's own text is unchanged; only the self-test counts in the same changelog paragraph changed (86 to 87 mutants, 204 to 205 cases), and they name no pool mode.
-changelog.d/4667.fixed.md | (plurals, tx/xact, session next to a pool word, a bare mode = key) must be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:42d1f1081f11
+# context re-read on 2026-10-05: Round 8 re-bind (#5471): each line sits in the 4667 changelog fragment, quotes the withdrawn transaction pooling or session-mode wording as prose, sets no pooler mode, and moved only because the fragment was re-wrapped
+changelog.d/4667.fixed.md | (plurals, tx/xact, session next to a pool word, a bare mode = key) must be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:f6dc59c34318
 # this PR's own changelog fragment: it states session mode is the only supported mode and describes how the gate rejects the other modes
 # context re-read on 2026-10-04: The entry's own text is unchanged; the round-6 summary was added to the same changelog paragraph, and it names no pool mode to configure other than session.
 # context re-read on 2026-10-04: The entry's own text is unchanged; only the self-test counts in the same changelog paragraph changed (86 to 87 mutants, 204 to 205 cases), and they name no pool mode.
-changelog.d/4667.fixed.md | be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:7182d047f5d1
+# context re-read on 2026-10-05: Round 8 re-bind (#5471): each line sits in the 4667 changelog fragment, quotes the withdrawn transaction pooling or session-mode wording as prose, sets no pooler mode, and moved only because the fragment was re-wrapped
+changelog.d/4667.fixed.md | be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:307567ad9fcf
 # this PR's own changelog fragment: it states session mode is the only supported mode and describes how the gate rejects the other modes
 changelog.d/4667.fixed.md | infra/pgbouncer ships pool_mode = session, scram, server_reset_query = | ctx:f2324c27bbd4
 changelog.d/4667.fixed.md | lines and paragraph neighbourhood that mentions a pooler mode in any spelling (plurals, tx/xact, session next to a pool word, a bare mode = key) must | ctx:d96ecbbdb579
@@ -695,16 +698,13 @@ ROADMAP.md | that runs the suite through pgbouncer. the sqlx layer uses named pr
 infra/pgbouncer/README.md | | pgbouncer.ini | pooler config. pool_mode = session is required (pinned to the guide by scripts/check-pgbouncer-pool-mode-claims.py); max_prepared_statements = 256 (pgbouncer ≥ 1.21). server_reset_query = discard all (with server_reset_query_always = 0) is the guard for sequential reuse: in session mode a server connection passes to the next client only after this reset, so keep it set (sequential-reuse test leg: #4736). default_pool_size = 16 covers one daemon at default_max_connections = 16; for n daemons use the sizing rule in guide §5.6.5. | | ctx:bddc0be3bdb4
 
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
-# Fragment 4667 round-6 summary paired with its closing line: the summary lists the round-6 fixes and the closing line names transaction pooling only as the open work tracked in #4679, not as a supported mode.
-# context re-read on 2026-10-04: The entry's own text is unchanged; only the self-test counts in the same changelog paragraph changed (86 to 87 mutants, 204 to 205 cases), and they name no pool mode.
-changelog.d/4667.fixed.md | (#5210). roadmap 4.b scopes the plan-cache statement to src/ (#5077) and names making the adapter safe under transaction pooling is tracked in #4679. | ctx:e56c14ab7fd4
-
-# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
 # Fragment 4667 round-6 summary: the wrapped pair says ROADMAP 4.B names server_reset_query = DISCARD ALL as the guard for session-mode reuse (#5213); it names session mode and no other mode to configure.
 # context re-read on 2026-10-04: The entry's own text is unchanged; only the self-test counts in the same changelog paragraph changed (86 to 87 mutants, 204 to 205 cases), and they name no pool mode.
-changelog.d/4667.fixed.md | (#5210). roadmap 4.b scopes the plan-cache statement to src/ (#5077) and names server_reset_query = discard all as the guard for session-mode reuse (#5213). | ctx:f096ca8f914b
+# context re-read on 2026-10-05: Round 8 re-bind (#5471): each line sits in the 4667 changelog fragment, quotes the withdrawn transaction pooling or session-mode wording as prose, sets no pooler mode, and moved only because the fragment was re-wrapped
+changelog.d/4667.fixed.md | (#5210). roadmap 4.b scopes the plan-cache statement to src/ (#5077) and names server_reset_query = discard all as the guard for session-mode reuse (#5213). | ctx:861fc1937ed8
 
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
 # Fragment 4667 round-6 summary: the line says ROADMAP 4.B names server_reset_query = DISCARD ALL as the guard for session-mode reuse (#5213); it names session mode and no other mode to configure.
 # context re-read on 2026-10-04: The entry's own text is unchanged; only the self-test counts in the same changelog paragraph changed (86 to 87 mutants, 204 to 205 cases), and they name no pool mode.
-changelog.d/4667.fixed.md | server_reset_query = discard all as the guard for session-mode reuse (#5213). | ctx:466b33fa74bf
+# context re-read on 2026-10-05: Round 8 re-bind (#5471): each line sits in the 4667 changelog fragment, quotes the withdrawn transaction pooling or session-mode wording as prose, sets no pooler mode, and moved only because the fragment was re-wrapped
+changelog.d/4667.fixed.md | server_reset_query = discard all as the guard for session-mode reuse (#5213). | ctx:cd843b87d204
