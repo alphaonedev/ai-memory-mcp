@@ -1366,6 +1366,14 @@ def run_cases(base: Path) -> bool:
 def run_citation_cases(fresh) -> bool:
     """R3-F9: a live doc citing a moved section as a CLAUDE.md section is refused."""
     ok = True
+    # #5773: cite_normal is called directly, so its own format-character removal is pinned; stale_citation_errors
+    # also strips them from the whole file first, so a case through the scan alone cannot see this call.
+    for raw, want in (("Build\u200b &\tTest\n  Commands ", "Build & Test Commands"), ("Key\u200bModules", "KeyModules"),
+                      ("\ufeff Code\u2060 Style\u200d", "Code Style")):
+        if cite_normal(raw) != want:
+            print(f"FAIL: self-test - cite_normal({raw!r}) is {cite_normal(raw)!r}, not {want!r} (#5773)",
+                  file=sys.stderr)
+            ok = False
     heading = next(iter(REFERENCE_SUBSECTIONS["ARCHITECTURE_REFERENCE"])).lstrip("#").strip()
     for directory in CITATION_DIRS:
         for form in ('CLAUDE.md "{h}" 2', 'CLAUDE.md \u00a7"{h}"', 'CLAUDE.md` \u00a7\u201c{h}\u201d',
