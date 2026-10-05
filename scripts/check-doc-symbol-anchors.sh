@@ -823,6 +823,15 @@ MDEOF
     anchor_green 5496 "a path with no generic of its own followed by a closer and prose" \
         "See $R::RecallTool> and then more."
 
+    # #5498: a prose comparison (`a < b`, `a <= b`) opens no generic group, so
+    # it cannot absorb a real over-closing closer after the anchor.
+    anchor_red 5498 BARE_QUAL "an over-closed anchor after a spaced less-than comparison" \
+        "See a < b and $R::RecallTool<T>> here."
+    anchor_red 5498 BARE_QUAL "an over-closed anchor after a less-or-equal comparison" \
+        "See a <= b and $R::RecallTool<T>> here."
+    anchor_green 5498 "a live generic anchor inside a prose generic after a comparison" \
+        "If a < b then see Vec<$R::RecallTool<T>> here."
+
     # #5460: the type of an as group inside a brace item is a claim.
     anchor_red_cites 5460 QUAL "an as group with a missing type inside a brace item" \
         "$R::NoSuch" \
@@ -1495,7 +1504,9 @@ def _outer_depth(prefix):
     while j < len(prefix):
         kind, width = _group_step(prefix, j)
         if kind == "open":
-            depth += 1
+            # #5498: `a < b` and `a <= b` are comparisons, not generic opens.
+            if not (j + width < len(prefix) and prefix[j + width] in " \t="):
+                depth += 1
         elif kind == "close":
             depth = max(0, depth - 1)
         j += width
