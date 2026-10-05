@@ -545,8 +545,9 @@ CRED_TOOL_RE = re.compile(
     # mysql family: -p glued to the value, or --password with a space or an equals sign (#4920). Every
     # client accepts each unique prefix from --pas up, with an optional --loose- prefix. --pa is a
     # unique prefix of --password in the dump and admin tools but ambiguous with --pager in the
-    # interactive mysql and mariadb clients (the interactive arm excludes it) (#5464, #5502).
-    r"\b(?:mysql|mariadb)(?!\w)(?!-(?:dump|admin)(?!\w))[^|;&]*\s(?:-p|--(?:loose-)?pas(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?(?![\w-])[\s=]*)[\"']?(?:\$|`)"
+    # interactive mysql and mariadb clients (the first arm excludes it; mariadb-dump and mariadb-admin
+    # also match the first arm at the word boundary, and the second arm reads their --pa) (#5464, #5502).
+    r"\b(?:mysql|mariadb)\b[^|;&]*\s(?:-p|--(?:loose-)?pas(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?(?![\w-])[\s=]*)[\"']?(?:\$|`)"
     r"|\b(?:mysqladmin|mysqldump|mariadb-admin|mariadb-dump)\b[^|;&]*\s(?:-p|--(?:loose-)?pa(?:s(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?)?(?![\w-])[\s=]*)[\"']?(?:\$|`)"
     r"|\bsshpass\s+-p\s*[\"']?(?:\$|`)"
     r"|\bredis-cli\b[^|;&]*\s(?:-a|--pass(?![\w-]))[\s=]*[\"']?(?:\$|`)"
