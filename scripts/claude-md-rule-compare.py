@@ -579,8 +579,8 @@ def _self_test_cases() -> int:
         print("FAIL: self-test - a comparison run without -I did not fail closed (R5, #5163)", file=sys.stderr)
 
     def importlib_plant():
-        # #5424/#5441: importlib is in the plant set (it is not frozen, so its plant is load-bearing), the
-        # docstring says so, and for importlib, os and stat a planted file runs exactly when the child finds
+        # #5424/#5441/#5443: importlib is in the plant set (it is not frozen, so its plant is load-bearing), the
+        # docstring says so, and for EVERY name the script imports a planted file runs exactly when the child finds
         # the module neither preloaded, built-in nor frozen; also under -X frozen_modules=off. Returns "" or why.
         names = imported_modules(Path(__file__).resolve())
         if "importlib" not in names:
@@ -590,11 +590,13 @@ def _self_test_cases() -> int:
             return "the docstring is wrong"
         probed = []
         for xopts in ([], ["-X", "frozen_modules=off"]):
-            for name in ("importlib", "os", "stat"):
+            for name in names:
                 shadowable, _, _, ok = plant_probe(name, base_dir / "implant", xopts)
                 if not ok:
                     return f"the planted {name}.py behaved differently from the child's own verdict (xopts {xopts})"
                 probed.append(name)
+        if probed != names + names:
+            return "not every imported name was probed"
         return ""
 
     plant_failure = importlib_plant()
