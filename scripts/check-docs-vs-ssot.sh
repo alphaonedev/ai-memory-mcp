@@ -605,11 +605,14 @@ emit_fail() {
 #     scripts/qc-allowlists/schema-claim-history.txt (tab-separated `file`,
 #     `needle`, `#issue note`). A hit whose matched span (identifier, the gap
 #     and the number) contains the needle is true history; the exemption is
-#     per hit, so it never shields a real claim sharing the line. A version
-#     transition (`CURRENT_SCHEMA_VERSION 71→72`) is history by construction.
-#     A malformed entry FAILS, a STALE entry (file or needle no longer
-#     present) FAILS, a missing ledger FAILS, and a scan that reads zero files
-#     FAILS outside --self-test.
+#     per hit, so it never shields a real claim sharing the line. The FROM side
+#     of a version transition (`CURRENT_SCHEMA_VERSION 71→72`) is history by
+#     construction; its TO side is a claim like any other.
+#     A malformed entry FAILS, a STALE entry (it shields no hit) FAILS, an
+#     entry that shields two or more hits FAILS naming each file:line, a hit
+#     that two entries shield FAILS naming both (one entry, one hit; #5809),
+#     a missing ledger FAILS, and a scan that reads zero files FAILS outside
+#     --self-test.
 # Ident-less phrasings (prose that says "schema" and a number without naming
 # the identifier) cannot be swept closed-world, because the ladder history is
 # narrated everywhere; they are covered by the explicit ANCHORS list in the
@@ -730,6 +733,19 @@ def plain(s):
     return WS.sub(' ', htmlmod.unescape(TAG.sub(' ', s))).strip()
 
 
+DIGITS = re.compile(r'[0-9]+')
+
+
+def occ(prefix):
+    # Which number of its line a hit's value is (#5809): the count of digit runs
+    # before it, read with tags, whitespace, markers and width suffixes folded out.
+    # Every view of a line (raw, marker-folded, anchor, wrapped-line join, the html
+    # pill read before or after unescaping) gives the same count for the same
+    # number, so one number seen in several views is one hit, and two copies of a
+    # phrase on one line are two.
+    return len(DIGITS.findall(TYPED.sub('', MARKS.sub('', WS.sub(' ', TAG.sub(' ', prefix))))))
+
+
 def shields(nd, val, span, src):
     # Does ledger needle nd exempt the hit (val, span)? src is None for a hit
     # matched in a raw view, else the unfolded text of the marker-folded view it
@@ -792,9 +808,10 @@ for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8')
         rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-',
                      'needle carries no subject text beyond the value (#5808): ' + raw.strip()[:120]))
         continue
-    ledger.setdefault(parts[0].strip(), {})[parts[1]] = [n, False]
+    ledger.setdefault(parts[0].strip(), {})[parts[1]] = [n, set()]
 
 files = os.environ.get('GATE_SCHEMA_FILES', '').split()
+owners = {}  # (path, line, occ) -> (value, ledger lines of the rows that shield it)
 for path in files:
     is_html = path.endswith('.html')
     lines = open(path, encoding='utf-8').read().splitlines()
@@ -808,12 +825,12 @@ for path in files:
             if PRIOR.search(window):
                 continue
         probe = TYPED.sub('', line)
-        hits = []  # (value, matched span, unfolded source of a marker-folded view)
+        hits = []  # (value, matched span, unfolded source of a marker-folded view, occ)
         for rx in SWEEP:
             for m in rx.finditer(probe):
                 if ARROW.match(probe, m.end(1)):
                     continue
-                hits.append((m.group(1), m.group(0), None))
+                hits.append((m.group(1), m.group(0), None, occ(probe[:m.start(1)])))
         # A claim wrapped across two source lines: the subject ends the previous
         # line, the value opens this one. Only values on THIS line count.
         if ln > 1:
@@ -856,7 +873,7 @@ for path in files:
                 for m in SWEEP[0].finditer(stub + body):
                     if m.start() == 0 and m.start(1) >= len(stub) \
                             and not ARROW.match(stub + body, m.end(1)):
-                        hits.append((m.group(1), m.group(0), None))
+                        hits.append((m.group(1), m.group(0), None, occ(body[:m.start(1) - len(stub)])))
             # Anchor form (#5026): an anchor whose subject words end the previous
             # line and whose value opens this one (docs/index.html "a v0.8.x DB
             # steps" / "v70 -> v100"). The match must start on the previous line
@@ -865,18 +882,19 @@ for path in files:
             for rx in ANCHORS:
                 for m in rx.finditer(joined):
                     if m.start() < len(aprev) < m.start(1):
-                        hits.append((m.group(1), m.group(0), None))
+                        hits.append((m.group(1), m.group(0), None, occ(body[:m.start(1) - len(aprev) - 1])))
             # Markdown only: the same join with the emphasis / code-span markers
             # folded out of both lines, so a bold or code-span transition wrapped
             # across the line break is seen too (#5340). The marker fold reaches one
             # line back, like the join itself.
             if not is_html:
                 fprev = MARKS.sub('', prev)
-                fjoined = fprev + ' ' + MARKS.sub('', body)
+                fbody = MARKS.sub('', body)
+                fjoined = fprev + ' ' + fbody
                 for rx in ANCHORS:
                     for m in rx.finditer(fjoined):
                         if m.start() < len(fprev) < m.start(1):
-                            hits.append((m.group(1), m.group(0), joined))
+                            hits.append((m.group(1), m.group(0), joined, occ(fbody[:m.start(1) - len(fprev) - 1])))
         # Every anchor spells a gap as one space, so match it against the
         # whitespace-folded line (html is already folded by plain(); #5200).
         aline = WS.sub(' ', line)
@@ -890,32 +908,43 @@ for path in files:
         views = [(aline, None)] if is_html else [(aline, None), (MARKS.sub('', aline), aline)]
         for rx in ANCHORS:
             for view, src in views:
-                hits.extend((m.group(1), m.group(0), src) for m in rx.finditer(view))
+                hits.extend((m.group(1), m.group(0), src, occ(view[:m.start(1)])) for m in rx.finditer(view))
         if is_html:
-            hits.extend((m.group(1), m.group(0), None) for m in PILL.finditer(htmlmod.unescape(raw)))
+            uraw = htmlmod.unescape(raw)
+            hits.extend((m.group(1), m.group(0), None, occ(plain(uraw[:m.start(1)])))
+                        for m in PILL.finditer(uraw))
         seen = set()
-        for val, span, src in hits:
+        for val, span, src, k in hits:
             if val == canon or val in seen:
                 continue
             # A ledger row exempts a hit only when its needle sits inside the
             # hit's matched span, so a history phrase never shields a real claim
             # that shares its line (schema.html carries both on one line). A row
-            # is not bounded to one hit: the same phrase on two lines is exempt on
-            # both (two real rows do this today; a per-row bound waits on #5809).
-            # A needle with a doubled space or a marker still sits inside the
-            # folded span it exempts (#5334, #5335); shields() bounds the fold (#5699).
+            # exempts exactly one hit (#5809): a hit is one number of one line (occ),
+            # however many views see it; a row that shields two or more hits, on one
+            # line or on several, FAILS and names each, and so does a hit that two
+            # rows shield. A needle with a doubled space or a marker still sits
+            # inside the folded span it exempts (#5334, #5335); shields() bounds the
+            # fold (#5699).
             hit_entry = [st for nd, st in entries.items() if shields(nd, val, span, src)]
             if hit_entry:
                 for st in hit_entry:
-                    st[1] = True
+                    st[1].add((ln, k))
+                    owners.setdefault((path, ln, k), (val, set()))[1].add(st[0])
                 continue
             seen.add(val)
             rows.append(('CLAIM', path, ln, val, line.strip()[:160]))
 
+for (path, ln, k), (val, ns) in sorted(owners.items()):
+    if len(ns) > 1:
+        rows.append(('LEDGER_SHARED', path, ln, val, ' and '.join(str(x) for x in sorted(ns))))
 for path, entries in ledger.items():
     for needle, (n, used) in entries.items():
         if not used:
             rows.append(('LEDGER_STALE', path, n, '-', needle[:160]))
+        elif len(used) > 1:
+            rows.append(('LEDGER_MULTI', path, n, len(used), '"%s" at %s' % (
+                needle[:120], ', '.join('%s:%d' % (path, x) for x, _ in sorted(used)))))
 for r in rows:
     print('\t'.join(str(c) for c in r))
 SCHEMAPY
@@ -938,6 +967,18 @@ SCHEMAPY
                 ;;
             LEDGER_STALE)
                 printf 'FAIL: schema-claim-history ledger: STALE entry at line %s (%s no longer carries "%s") — delete it\n' "$ln" "$file" "$context" >&2
+                fail_count=$((fail_count + 1))
+                ;;
+            LEDGER_MULTI)
+                printf 'FAIL: schema-claim-history ledger: entry at line %s shields %s hits, exactly one is allowed (#5809): %s — reword all but one occurrence in the doc and give each its own entry\n' "$ln" "$val" "$context" >&2
+                fail_count=$((fail_count + 1))
+                ;;
+            LEDGER_SHARED)
+                printf 'FAIL: schema-claim-history ledger: the hit "%s" at %s:%s is shielded by the entries at lines %s, exactly one is allowed (#5809) — delete or narrow the extra entry\n' "$val" "$file" "$ln" "$context" >&2
+                fail_count=$((fail_count + 1))
+                ;;
+            *)
+                printf 'FAIL: check-docs-vs-ssot: CURRENT_SCHEMA_VERSION engine emitted an unknown row kind "%s" — refusing to report PASS (#5809 fail-closed)\n' "$kind" >&2
                 fail_count=$((fail_count + 1))
                 ;;
         esac
@@ -3369,8 +3410,8 @@ R5MD
     # refused by the #5699 rule first; row 21 carries a subject word and is accepted.
     # Row 22 has a word only before marker folding (the fold glues it to the value),
     # so it is refused; row 23's one subject word has exactly three letters and is
-    # accepted.
-    # The stale claims on lines 1, 2 and 4 must be flagged; the history on line 3 stays exempt.
+    # accepted. Rows 21 and 23 each shield their own line (3 and 5), one hit each (#5809).
+    # The stale claims on lines 1, 2 and 4 must be flagged; the history on lines 3 and 5 stays exempt.
     _s=scripts/qc-allowlists/schema-claim-history.txt
     {
         for _nd in '52' 'v52' 'V52' '52.' '(52)' '**52**' '`52`' '   52   ' '** 52 **' \
@@ -3380,13 +3421,14 @@ R5MD
         printf 'docs/postgres-age-guide.md\t\xef\xbc\x95\xef\xbc\x92 abc\t#5808 fullwidth digits\n'
         printf 'docs/postgres-age-guide.md\tschema_version was 54\t#5808 subject text, accepted\n'
         printf 'docs/postgres-age-guide.md\tabc`52\t#5808 word glued to the value by the fold\n'
-        printf 'docs/postgres-age-guide.md\twas 54\t#5808 a three-letter subject word, accepted\n'
+        printf 'docs/postgres-age-guide.md\twas 51\t#5808 a three-letter subject word, accepted\n'
     } > "$_s"
     cat > "$tmpdir/docs/postgres-age-guide.md" <<'R5808MD'
 The CURRENT_SCHEMA_VERSION is 52 here.
 CURRENT_SCHEMA_VERSION = 52
 the schema_version was 54 at v0.6
 a `CURRENT_SCHEMA_VERSION` of **52**
+the schema_version was 51 at v0.5
 R5808MD
     _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
         && { echo "FAIL: self-test #5808 - subject-less ledger needles not refused (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -3398,22 +3440,64 @@ R5808MD
         grep -qF "malformed entry at line $_n \"needle carries no subject text" <<<"$_s_out" \
             || { echo "FAIL: self-test #5808 - subject-less ledger needle at line $_n not refused by name" >&2; cd "$REPO_ROOT"; exit 1; }
     done
-    for _not in 'docs/postgres-age-guide.md:3 ' 'line 21 ' 'malformed entry at line 21 ' 'line 23 ' 'malformed entry at line 23 '; do
+    for _not in 'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:5 ' 'line 21 ' 'malformed entry at line 21 ' \
+                'line 23 ' 'malformed entry at line 23 ' 'exactly one is allowed'; do
         grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5808 - a needle with subject text was refused or its history flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     echo "PASS: self-test #5808 - a ledger needle without subject text beyond the value (the bare value, v52, V52, 52., (52), bold, code span, padding, bold padding, a number plus a letter, two letters, two numbers, an arrow, an issue ref, a word glued to the number by letters or an underscore, a short bold word, single letters split by markers, a word the marker fold glues to the value) is REFUSED by line number and the stale claims it would have shielded are flagged; fullwidth digits are refused by the #5699 rule; a needle with a subject word (three letters is enough) is accepted"
-    # ---- #5810: a ledger row is not bounded to one hit. One row exempts the same
-    # history phrase on two lines, and a stale claim on a third line is still flagged.
-    printf 'docs/postgres-age-guide.md\tschema_version was 54\t#5810 one row, two lines\n' > "$_s"
-    printf 'the schema_version was 54 at v0.6\nagain, the schema_version was 54 at v0.6\nCURRENT_SCHEMA_VERSION = 52\n' \
-        > "$tmpdir/docs/postgres-age-guide.md"
-    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) || true
-    grep -qF 'docs/postgres-age-guide.md:3 claims "52"' <<<"$_s_out" \
-        || { echo "FAIL: self-test #5810 - the stale claim beside a twice-used ledger row was not flagged" >&2; cd "$REPO_ROOT"; exit 1; }
-    for _not in 'docs/postgres-age-guide.md:1 ' 'docs/postgres-age-guide.md:2 ' 'line 1 ' 'malformed entry'; do
-        grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5810 - a twice-used ledger row did not exempt both lines: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    # ---- #5809 (5-agent vote 4d3ea1c5): one ledger row exempts exactly ONE hit, one
+    # number on one line however many views see it. Row 1 shields the same phrase on
+    # two lines and row 2 the same phrase twice on one line: each FAILS and names
+    # every file:line. Rows 6 and 7 shield one hit together: it FAILS naming both
+    # rows. Rows 3, 4 and 5 each shield one hit that two views see (raw and
+    # marker-folded, a sweep and an anchor, a wrapped-line join raw and folded):
+    # one hit each, so they pass; so does row 8, one html hit that the pill and the
+    # sweep both see after escaped markup that carries a digit. The stale claim on
+    # line 3 is still flagged.
+    # This replaces the #5810 pin of the old unbounded rule.
+    {
+        printf 'docs/postgres-age-guide.md\tschema_version was 54\t#5809 one row, two lines\n'
+        printf 'docs/postgres-age-guide.md\tschema_version was 44\t#5809 one row, two hits on one line\n'
+        printf 'docs/postgres-age-guide.md\tsteps v40 -> v45\t#5809 one hit, raw and folded views\n'
+        printf 'docs/postgres-age-guide.md\tv46** (`CURRENT_SCHEMA_VERSION\t#5809 one hit, a sweep and an anchor\n'
+        printf 'docs/postgres-age-guide.md\tsteps v40 -> v47\t#5809 one hit, wrapped-line join in two views\n'
+        printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION` set 48\t#5809 two rows, one hit (A)\n'
+        printf 'docs/postgres-age-guide.md\tSCHEMA_VERSION` set 48\t#5809 two rows, one hit (B)\n'
+        printf 'docs/schema-fixture.html\tv47 schema\t#5809 one hit, html pill and sweep after escaped markup\n'
+    } > "$_s"
+    printf '<p>&lt;h2&gt; <span class="pill">v47 schema</span> was the schema_version then</p>\n' \
+        > "$tmpdir/docs/schema-fixture.html"
+    cat > "$tmpdir/docs/postgres-age-guide.md" <<'R5809MD'
+the schema_version was 54 at v0.6
+again, the schema_version was 54 at v0.6
+CURRENT_SCHEMA_VERSION = 52
+a schema_version was 44 and then, well past the claim window, in a different clause of the same line, b schema_version was 44
+a v0.6 DB steps v40 -> v45 on boot
+| Schema | **v46** (`CURRENT_SCHEMA_VERSION`, both) |
+a v0.6 DB steps v40 ->
+v47 on boot
+the `CURRENT_SCHEMA_VERSION` set 48 then
+R5809MD
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5809 - a ledger row shielding two hits passed (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in 'docs/postgres-age-guide.md:3 claims "52"' \
+        'entry at line 1 shields 2 hits, exactly one is allowed (#5809): "schema_version was 54" at docs/postgres-age-guide.md:1, docs/postgres-age-guide.md:2 ' \
+        'entry at line 2 shields 2 hits, exactly one is allowed (#5809): "schema_version was 44" at docs/postgres-age-guide.md:4, docs/postgres-age-guide.md:4 ' \
+        'the hit "48" at docs/postgres-age-guide.md:9 is shielded by the entries at lines 6 and 7, exactly one is allowed'
+    do grep -qF "$_want" <<<"$_s_out" || { echo "FAIL: self-test #5809 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
+    for _n in 1 2 4 5 6 7 8 9; do
+        grep -qF "docs/postgres-age-guide.md:$_n claims" <<<"$_s_out" \
+            && { echo "FAIL: self-test #5809 - a ledgered hit was flagged as a claim: line $_n" >&2; cd "$REPO_ROOT"; exit 1; }
     done
-    echo "PASS: self-test #5810 - one ledger row exempts the same history phrase on two lines (no per-row bound; #5809) and a stale claim on a third line is still flagged"
+    for _not in 'malformed entry' 'STALE entry' \
+        'entry at line 3 ' 'entry at line 4 ' 'entry at line 5 ' 'entry at line 6 ' 'entry at line 7 ' \
+        'entry at line 8 ' 'docs/schema-fixture.html:1 '
+    do grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5809 - a one-hit row was refused or a ledgered hit flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    [[ $(grep -c 'exactly one is allowed' <<<"$_s_out") -eq 3 ]] \
+        || { echo "FAIL: self-test #5809 - expected exactly 3 one-hit refusals" >&2; cd "$REPO_ROOT"; exit 1; }
+    rm -f "$tmpdir/docs/schema-fixture.html"
+    echo "PASS: self-test #5809 - a ledger row that shields the same phrase on two lines, or twice on one line, FAILS naming every file:line; a hit two rows shield FAILS naming both rows; one hit seen in two views (raw and folded, sweep and anchor, wrapped-line join, html pill and sweep) counts once; a stale claim beside them is still flagged"
     rm -f "$tmpdir/docs/postgres-age-guide.md"
     printf '# fixture ledger (comment-only)\n' > "$_s"
 

@@ -17,6 +17,14 @@
 # FAILS the gate. A STALE entry (it suppresses no hit any more) FAILS the gate:
 # delete it. A missing ledger FAILS the gate.
 #
+# One entry exempts exactly ONE hit (#5809). A hit is one number on one line,
+# however many views of the line (raw, marker-folded, wrapped-line join) see it.
+# An entry that shields two or more hits FAILS the gate and names each file:line;
+# a hit that two entries shield FAILS the gate and names both entry lines. When
+# the same history phrase is written twice, reword one occurrence in the doc so
+# the two spans differ and give each its own entry; a longer needle cannot tell
+# byte-identical spans apart.
+#
 # Needles match the line after the width suffix is removed: write "CURRENT_SCHEMA_VERSION = 50", not "CURRENT_SCHEMA_VERSION: i64 = 50".
 # A second entry with the same file and needle FAILS the gate as a duplicate.
 #
@@ -26,11 +34,11 @@
 # fixed in the doc, never listed here.
 README.md	CURRENT_SCHEMA_VERSION` was 57	#3248 v0.7.0 release narrative (the sentence continues to the current ladder)
 README.md	v57, where `CURRENT_SCHEMA_VERSION	#3248 v0.7.0 release narrative
-ROADMAP.md	CURRENT_SCHEMA_VERSION` was 57	#3248 frozen v0.7.1 baseline row and ship-state note
+ROADMAP.md	CURRENT_SCHEMA_VERSION` was 57	#3248 frozen v0.7.1 baseline row
 docs/spec/PORTABILITY-V2.md	80` at this spec's anchor	#3248 the value at the PORTABILITY-V2 spec anchor, stated as such
 docs/compliance/_inventory/v0.7.x-code-changes-test-plan.md	CURRENT_SCHEMA_VERSION = 50	#3248 expected output at the pinned v0.7.0 verification commit
 docs/v1.0.0/release-notes.md	Not uniformly additive: v79	#3248 per-version ladder narrative inside the v1.0.0 schema row
-docs/v1.0.0/release-notes.md	v92 rebuilds SQLite's `schema_version	#3248 per-version ladder narrative
+docs/v1.0.0/release-notes.md	v92 rebuilds SQLite's `schema_version	#3248 per-version ladder narrative inside the v1.0.0 schema row
 docs/schema.html	v91), the schema_version	#3248 per-version ladder narrative (the same line also carries the live v100 claim, which stays policed)
 ROADMAP.md	v57** (postgres) — the v0.7.1 `CURRENT_SCHEMA_VERSION	#3248 v0.7.1 release HEAD row (frozen baseline value)
 ROADMAP.md	v57 sqlite + postgres lockstep (the v0.7.1 `CURRENT_SCHEMA_VERSION	#3248 v0.7.1 history
@@ -52,3 +60,5 @@ CLAUDE.md	CURRENT_SCHEMA_VERSION 83→84	#2167 past bump v84 (history, the TO si
 CLAUDE.md	CURRENT_SCHEMA_VERSION 84→85	#2035 past bump v85 (history, the TO side is a past ladder value)
 CLAUDE.md	CURRENT_SCHEMA_VERSION 85→86	#1834 past bump v86 (history, the TO side is a past ladder value)
 CLAUDE.md	CURRENT_SCHEMA_VERSION 86→87	#2333 past bump v87 (history, the TO side is a past ladder value)
+ROADMAP.md	CURRENT_SCHEMA_VERSION` held 57	#5809 v0.7.1 ship-state note (the baseline row says "was 57")
+docs/v1.0.0/release-notes.md	v92 rebuilds the SQLite `schema_version	#5809 per-version ladder narrative in the upgrade prose
