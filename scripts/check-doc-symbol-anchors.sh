@@ -69,7 +69,21 @@
 # and repeated slashes collapse, so `src/x.rs`, `./src/x.rs`,
 # `.//src/x.rs`, `././src/x.rs`, `../src/x.rs` and `src//x.rs` are one
 # anchor. A token preceded by a letter, digit, dot or slash has an
-# unknown root and is not a `src/` anchor.
+# unknown root and is not a `src/` anchor. Dot segments INSIDE the path
+# (`src/./mcp/x.rs`, `src/mcp/../mcp/x.rs`) resolve before any rule runs
+# (#4714). A token whose `..` segments climb out of `src/` (`src/../x.rs`)
+# names no file under `src/`: it is reported as a PATH finding, and a
+# qualified or link-target occurrence of it is reported whatever the wording
+# nearby (#5346).
+#
+# THE ABSENT-PATH EXEMPTION. A plain path or `path:line` anchor is not
+# reported when absence wording ("no longer exists", "formerly",
+# "monolithic", "pre-split", "was split from", "removed in", ...) is on its
+# line or the line above or below, because such a line says the file is
+# gone. A qualified `path::symbol` anchor and a link target are never
+# exempt (#5201, #5250). Wording that names a DESTINATION ("split into",
+# "split out", "renamed to", an arrow before a `src/` path) exempts only an
+# anchor BEFORE it on the same line (#5264, #5341, #5344).
 #
 # WHAT IS DELIBERATELY *NOT* A RULE. A bare backticked identifier
 # sharing a line with a `src/` path is NOT checked. Measured against

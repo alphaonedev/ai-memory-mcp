@@ -1732,7 +1732,7 @@ the reviewer trust they cannot get back."* The class is worse than
 value drift because a wrong VALUE is falsifiable in one grep, while a
 wrong ANCHOR sends the reader to the wrong place and then makes them
 doubt everything else. SIX rules, all keyed on PATH-QUALIFIED grammar:
-**PATH** (a cited `src/<p>.rs` must exist — this is what caught the
+**PATH** (a cited `src/<p>.rs` must exist; `.` and `..` segments inside the path resolve first (#4714), and a token that climbs out of `src/` is a PATH finding — this is what caught the
 pre-modularisation `src/handlers.rs` / `src/mcp.rs` / `src/db.rs`
 anchors still live in the operator guides), **LINE** (a `src/<p>.rs:<N>`
 anchor must name a line the file has; the range separator may be a
