@@ -2212,6 +2212,7 @@ ROUND3_GREEN = [
     ('5821 substitution pin: clean 1: a substitution glued to a word is no command word', 'x$(command -v mysql) "$X"'),
     ('5821 substitution pin: clean 2: a substitution head with clean words', '$(command -v mysql) -uroot -h "$H" app'),
     ('5821 substitution pin: clean 3: a substitution that is an echo operand', 'echo "$(mysql --version)" "$X"'),
+    ('5860 mutant pin: clean 1: a verb inside a remote payload hides the head', 'ssh db1 "echo mysql -uroot -p$X"'),
 ]
 
 # Raw logical-line text that holds a newline (the arm is a function of text; every unit the gate builds today is
