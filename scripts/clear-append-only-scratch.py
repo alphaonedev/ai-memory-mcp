@@ -569,6 +569,7 @@ class Journal:
         self.top = top
         self.path = os.path.join(top, PENDING_RESTORE_FILE)
         self.refused = None
+        self.recovered = None
         self._fd = None
         self._run = os.urandom(8).hex()
         self._seq = 0
@@ -614,7 +615,10 @@ class Journal:
             raw += chunk
             if len(raw) > _PENDING_LIMIT:
                 raise OSError(errno.EFBIG, "the pending-restore journal is larger than %d bytes, so "
-                                           "it is not read" % _PENDING_LIMIT)
+                                           "it is not read: once every `+ <id>` line in it has a "
+                                           "matching `- <id>` line, or the inode each unmatched `+` "
+                                           "line names has been checked by hand, delete it and run "
+                                           "this again (#6026)" % _PENDING_LIMIT)
         lines = raw.split(b"\n")
         tail = lines.pop()
         held = {}
@@ -624,10 +628,23 @@ class Journal:
             if why is not None:
                 problems.append("line %d (%r) %s" % (number, line[:160], why))
         if tail:
-            # Nothing may be appended after a torn line: it would be glued to it.
-            self.refused = "its last line is incomplete"
-            problems.append("ends in an incomplete line (%r), so a widen it began to describe "
-                            "cannot be ruled out" % tail[:160])
+            # Every line is fsynced BEFORE the chmod it describes, so a line
+            # that never became whole describes a chmod that was never made:
+            # cutting it off loses nothing, and keeping it refused every widen
+            # of every later run (#6026). Nothing may be appended after it
+            # meanwhile - it would be glued to it - so if it cannot be cut off
+            # the journal is refused, as before.
+            try:
+                os.ftruncate(self._fd, len(raw) - len(tail))
+                os.fsync(self._fd)
+            except OSError as err:
+                self.refused = "its last line is incomplete"
+                problems.append("ends in an incomplete line (%r) that could not be cut off (%s), so "
+                                "a widen it began to describe cannot be ruled out" % (tail[:160], err))
+            else:
+                self.recovered = ("ended in an incomplete line (%r), which is cut off: every line is "
+                                  "fsynced before the chmod it describes, so that line describes a "
+                                  "chmod that was never made" % tail[:160])
         return list(held.values()), problems
 
     def _take(self, line, held):
@@ -704,14 +721,34 @@ class Journal:
 
     def _append(self, text):
         data = text.encode("ascii")
+        end, written = None, 0
         try:
+            end = os.fstat(self._fd).st_size
             written = os.write(self._fd, data)
             if written != len(data):
                 raise OSError(errno.EIO, "only %d of %d bytes reached it" % (written, len(data)))
             os.fsync(self._fd)
         except OSError as err:
             self.refused = "an append to it failed: %s" % err
+            if written:
+                self._take_back(end, written)
             raise
+
+    def _take_back(self, end, written):
+        """Cut off what a failed append wrote (#6026). The append raised, so the
+        widen its line describes is refused and never made; left in the file,
+        those bytes would be read by every later run as a torn line. Only bytes
+        this append wrote are cut: a file that has grown by anything else is
+        left as it is, and the journal stays refused."""
+        try:
+            if os.fstat(self._fd).st_size == end + written:
+                os.ftruncate(self._fd, end)
+                os.fsync(self._fd)
+                return
+            why = "the file changed size meanwhile"
+        except OSError as err:
+            why = str(err)
+        self.refused += "; the %d bytes it wrote could not be taken back (%s)" % (written, why)
 
     def finish(self, settled):
         """Empty the journal if nothing in it is outstanding, then let it go.
@@ -799,6 +836,8 @@ class Cleaner:
                                           "cannot be ruled out, so neither can a mode a previous run "
                                           "left widened: %s" % err)
             return
+        if self._journal.recovered is not None:
+            self.fail(self._journal.path, "the pending-restore journal %s" % self._journal.recovered)
         for why in problems:
             self.fail(self._journal.path, "the pending-restore journal's %s; it is kept for "
                                           "whoever resolves it" % why)

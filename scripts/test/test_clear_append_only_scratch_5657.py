@@ -1470,6 +1470,81 @@ class JournalCase(ScratchTree):
                           r.stdout + r.stderr)
             self.assertEqual(self.outstanding(), [], r.stdout + r.stderr)
 
+    def test_a_torn_journal_tail_is_cut_off_and_the_walk_proceeds_6026(self):
+        """#6026. Every line is fsynced before the chmod it describes, so a
+        trailing line that never became whole describes a chmod that was never
+        made. Cutting it off loses nothing; keeping it refused every widen of
+        every later run, for good. The run that finds it says so, and the run
+        after it is clean."""
+        d = self.scratch / ".tmpT"
+        d.mkdir()
+        (d / "x.log").write_text("{}\n")
+        torn = b"+ 0123abcd.1 1 2 0 4"
+        fd = os.open(str(self.journal()), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, torn)
+        finally:
+            os.close(fd)
+        with restrictive(d, 0o000):
+            first = run_clear(self.ws)
+            self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o000, first.stdout + first.stderr)
+            self.assertNotIn(str(d), first.stderr,
+                             "a widen was refused over a torn line that describes nothing:\n"
+                             + first.stdout + first.stderr)
+            self.assertIn("incomplete line", first.stderr, first.stdout + first.stderr)
+            self.assertEqual(len([l for l in first.stderr.splitlines() if "::error::" in l]), 1,
+                             first.stdout + first.stderr)
+            self.assertNotIn(torn, self.journal().read_bytes(), "the torn line is still there")
+            again = run_clear(self.ws)
+            self.assertEqual(again.returncode, 0, "a torn tail wedged every later run:\n"
+                             + again.stdout + again.stderr)
+            self.assertEqual(self.journal().read_bytes(), b"", again.stdout + again.stderr)
+
+    def test_a_failed_append_leaves_no_torn_line_behind_6026(self):
+        """#6026. A short write - ENOSPC on a runner's scratch disk - used to
+        leave the bytes that did land at the end of the journal, which every
+        later run then refused. The append that fails takes its partial bytes
+        back off, its widen is refused, and the next run is clean."""
+        mod = load_script_module()
+        d = self.scratch / ".tmpS"
+        d.mkdir()
+        (d / "x.log").write_text("{}\n")
+        real = os.write
+        short = []
+
+        def write(fd, data):
+            if not short and bytes(data[:2]) == b"+ ":
+                short.append(bytes(data))
+                return real(fd, bytes(data[:len(data) // 2]))
+            return real(fd, data)
+
+        with restrictive(d, 0o000):
+            with mock.patch.object(mod.os, "write", write):
+                rc, out, err = run_clear_in_process(mod, self.ws)
+            self.assertTrue(short, "no journal append was ever made, so nothing was cut short")
+            self.assertNotEqual(rc, 0, "a widen whose line could not be written is a refusal:\n" + out + err)
+            data = self.journal().read_bytes()
+            self.assertTrue(data == b"" or data.endswith(b"\n"),
+                            "a failed append left a torn line: %r" % data)
+            self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o000, out + err)
+            again = run_clear(self.ws)
+            self.assertEqual(again.returncode, 0, "a failed append wedged the next run:\n"
+                             + again.stdout + again.stderr)
+
+    def test_an_oversize_journal_names_its_remedy_6026(self):
+        """#6026. A journal too large to read is refused, and the run has to say
+        what to do about it rather than report the same refusal for ever."""
+        mod = load_script_module()
+        fd = os.open(str(self.journal()), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, b"- 0123abcd.1\n" * (mod._PENDING_LIMIT // 13 + 2))
+        finally:
+            os.close(fd)
+        r = run_clear(self.ws)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(str(self.journal()), r.stderr, r.stderr)
+        self.assertIn("delete it", r.stderr, r.stderr)
+
 
 class WidenFailureCase(ScratchTree):
     """What every exit from the widen in `_open_at` leaves behind, and what it
