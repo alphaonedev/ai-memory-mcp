@@ -60,12 +60,8 @@ fi
 if [[ "${1:-}" == "--self-test" ]]; then
     # The load-bearing DETECTOR probes (#1651 for_admin, #3943
     # for_admin_checked) run FIRST so a failure in the #3623 scenario harness
-    # below cannot stop them from running. The harness used to run here under
-    # `set -e`; on this base it fails cases 19/20/22 (a PRE-EXISTING
-    # GOVERNANCE_INTERNAL carve-out line-pin staleness after the carrier moved
-    # store/postgres.rs — unrelated to #3943, reported separately) and aborted
-    # the whole self-test before any probe ran. It now runs LAST, so its status
-    # is still the self-test's exit while the detector probes stay reachable.
+    # below cannot stop them from running. The harness runs LAST, so its status
+    # is the self-test's exit while the detector probes stay reachable.
     PROBE="${ROOT}/src/c8_probe_1651.rs"
     trap 'rm -f "${PROBE}"' EXIT
     cat > "${PROBE}" <<'PROBE_EOF'
@@ -151,14 +147,54 @@ PROBE3943_EOF
     echo "C8 SELF-TEST PASS (#3943): production literal second-arg HARD-BLOCKed; threaded / #[cfg(test)] / comment forms accepted"
 
     # #3623 production-boundary scenario harness runs LAST (see the note at the
-    # top of this block). Its exit status is the self-test's. On this base it
-    # fails cases 19/20/22 (pre-existing, unrelated to #3943).
+    # top of this block). Its exit status is the self-test's. Its #5884 cases
+    # pin the GOVERNANCE_INTERNAL exemption (content, enclosing function,
+    # exactly one site) with fixtures built from the constants above.
     set +e
     python3 "${ROOT}/scripts/tests/gate-production-3623.py" "$(basename "$0")"
     harness_rc=$?
     set -e
     exit "${harness_rc}"
 fi
+
+# #5884 — the one #3638-adjudicated for_admin(GOVERNANCE_INTERNAL) site is
+# exempt by CONTENT: file, the exact source line, and the function that encloses
+# it. No line number is pinned (a pin goes stale on every edit above it and then
+# silently stops matching). Closed world: the exemption applies only when the
+# file holds EXACTLY ONE copy of the line and that copy sits inside the anchor
+# function. Zero copies (moved or reworded), two or more (duplicated), or a copy
+# in another function is a HARD-BLOCK that names the file and the count; the
+# site is then not exempt. scripts/tests/gate-production-3623.py reads these
+# three constants from this file so the fixtures cannot drift from the gate.
+C8_EXEMPT_FILE='src/store/postgres.rs'
+C8_EXEMPT_FN='resolve_governance_policy'
+C8_EXEMPT_LINE='            let ctx = CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);'
+C8_EXEMPT_LINENO=""
+C8_EXEMPT_ERR=""
+
+exempt_precheck () {
+    local f="${ROOT}/${C8_EXEMPT_FILE}"
+    [[ -f "${f}" ]] || return 0
+    local res count lineno fn
+    res="$(production_lines "$f" | EXEMPT_LINE="${C8_EXEMPT_LINE}" "${AWK_BIN:-awk}" '
+        /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?((async|unsafe|const)[[:space:]]+)*fn[[:space:]]+[A-Za-z_]/ {
+            t = $0
+            sub(/^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?((async|unsafe|const)[[:space:]]+)*fn[[:space:]]+/, "", t)
+            match(t, /^[A-Za-z0-9_]+/)
+            cur = substr(t, 1, RLENGTH)
+        }
+        $0 == ENVIRON["EXEMPT_LINE"] { n++; ln = NR; fn = cur }
+        END { printf "%d %d %s\n", n + 0, ln + 0, fn }')"
+    read -r count lineno fn <<< "${res}"
+    if [[ "${count}" != "1" ]]; then
+        C8_EXEMPT_ERR="exemption for ${C8_EXEMPT_FILE} needs exactly 1 match of the pinned line, found ${count}"
+    elif [[ "${fn}" != "${C8_EXEMPT_FN}" ]]; then
+        C8_EXEMPT_ERR="exemption for ${C8_EXEMPT_FILE} needs exactly 1 match inside fn ${C8_EXEMPT_FN}, found ${count} (inside fn ${fn:-none})"
+    else
+        C8_EXEMPT_LINENO="${lineno}"
+    fi
+}
+exempt_precheck
 
 # Enumerate production sites through the shared #3623 item filter.
 collect_sites () {
@@ -228,12 +264,12 @@ collect_sites () {
                 # #3623 Conductor ruling: this one tenant-reachable governance
                 # read is adjudicated separately by #3638 (policy disclosure
                 # redaction). It is NOT an approved system-internal bypass.
-                # Re-pinned at release e8d8eb67a after the authorized rebase.
-                # Pin the exact release-base site, not the file/principal: a
-                # moved, changed, or additional call must be reviewed again.
-                if [[ "$mode" == "any-arg" && "$rel" == "src/store/postgres.rs" \
-                    && "$lineno" == 31500 \
-                    && "$content" == '            let ctx = CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);' ]]; then
+                # #5884: the exemption is identified by file + exact content
+                # line + enclosing function, and exempt_precheck proved that
+                # exactly ONE such site exists (no line-number pin).
+                if [[ "$mode" == "any-arg" && "$rel" == "${C8_EXEMPT_FILE}" \
+                    && -n "${C8_EXEMPT_LINENO}" && "$lineno" == "${C8_EXEMPT_LINENO}" \
+                    && "$content" == "${C8_EXEMPT_LINE}" ]]; then
                     continue
                 fi
                 out+="${rel}:${lineno}:${literal}"$'\n'
@@ -306,6 +342,11 @@ ALLOW_FOR_AGENT_BODY="$(strip_comments "$ALLOW_FOR_AGENT")"
 ALLOW_FOR_ADMIN_BODY="$(strip_comments "$ALLOW_FOR_ADMIN")"
 
 violations=0
+
+if [[ -n "${C8_EXEMPT_ERR}" ]]; then
+    echo "C8 HARD-BLOCK (#5884): ${C8_EXEMPT_ERR}; the GOVERNANCE_INTERNAL site is not exempt." >&2
+    violations=$(( violations + 1 ))
+fi
 
 check_diff () {
     local label="$1"
