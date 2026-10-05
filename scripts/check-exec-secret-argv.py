@@ -543,8 +543,9 @@ def deny_lines(dl, rel: str, text: str) -> Dict[int, str]:
 # mysql or mariadb in any letter case (mysqldump, mysql_upgrade, mariadb-dump, MySQLDump, mysql.exe ...) with no
 # path, or after a path that has a bin, sbin or libexec directory or starts with ./ ../ ~/ or a dollar sign
 # (_MY_BIN_DIR_RE, #5824; any other path is not read, #5831), at a command position; it is not a head when an
-# assignment, a URL, a user:group pair or a path component continues it. The words after the head up to the next pipe, semicolon, ampersand or unmatched parenthesis are
-# read by shell word, quotes removed. A word is clean only when it is positively recognised as no credential:
+# assignment, a URL, a user:group pair or a path component continues it. The words after the head up to the next pipe,
+# semicolon, newline, ampersand that is no redirect (&>, >& and <& are redirects) or closing parenthesis are read by
+# shell word, quotes removed (the shell reader below). A word is clean only when it is positively recognised as no credential:
 # a word without any expansion, a flag of the measured set, a short cluster read letter by letter, the value of
 # a measured value option, an operand that is not led by an expansion, or any operand after --. Everything else
 # that carries an expansion is reported: the value of -p or of any prefix of --password (with or without a loose,
@@ -701,7 +702,9 @@ def _my_words_hit(words: Sequence[str]) -> bool:
 # the machine cannot resolve where a construct ends (an unclosed quote, substitution, parenthesis or backtick, an
 # escaped backtick without an escaped partner, a backslash that ends the unit, a case statement inside a
 # substitution, or readings nested deeper than _SH_MAX_DEPTH), the unit FAILS with that named reason, it is never
-# read on with a guess. A here-document body is not part of a unit (dockerfile_units reads it as units of its own).
+# read on with a guess. A quoted string that cannot be read as shell is plain text when it names no mysql family
+# client (echo "x(" runs no head, so it neither hides one nor fails the unit); one that names the family FAILS like
+# any other unreadable text (#5955). A here-document body is not part of a unit (dockerfile_units reads it as units of its own).
 # A number sign is read as text, never as a comment: not every runner of a unit is a shell (a systemd ExecStart
 # line passes it on as a word), so the text after it is read like any other text of the unit.
 # An unmatched closing parenthesis at the top of a reading is a command boundary (a case pattern, or a group
@@ -961,6 +964,24 @@ def _sh_param(text: str, i: int, depth: int) -> Tuple[int, List[list]]:
     raise _ShUnreadable("an unclosed parameter expansion")
 
 
+def _sh_names_family(text: str) -> bool:
+    """True when text names a mysql family client, also through quotes, backslashes or ANSI-C escapes."""
+    ansi = "".join(_sh_ansi_decode(m.group(1)) for m in _SH_ANSI_RE.finditer(text))
+    return bool(_MY_CANDIDATE_RE.search(re.sub(r"[\"'\\]", "", text + " " + ansi)))
+
+
+def _sh_payload(content: str, depth: int) -> List[List[_ShWord]]:
+    """The reading of a quoted payload as shell (an ssh or sh -c argument runs it). A payload that is no shell, like
+    the text "x(", is plain text and has no reading when it names no mysql family client, so no head can hide in it;
+    a payload that names the family and cannot be read fails closed."""
+    try:
+        return _sh_read(content, depth)
+    except _ShUnreadable:
+        if _sh_names_family(content):
+            raise
+        return []
+
+
 def _sh_part(text: str, i: int, depth: int, word: _ShWord) -> int:
     """Read one part of a word at text[i] into word; returns the index after it."""
     c = text[i]
@@ -994,12 +1015,12 @@ def _sh_part(text: str, i: int, depth: int, word: _ShWord) -> int:
         if k < 0:
             raise _ShUnreadable("an unclosed single quote" if c == "'" else "an unclosed ANSI-C quote")
         content = text[i + 1:k] if c == "'" else _sh_ansi_decode(text[i + 2:k])
-        g = word.group("sq" if c == "'" else "ansi", [], _sh_read(content, depth + 1))
+        g = word.group("sq" if c == "'" else "ansi", [], _sh_payload(content, depth + 1))
         word.add(content, True, g)
         return k + 1
     if c == '"' or (c == "$" and nxt == '"'):  # $"..." is a double-quoted string (a locale translation)
         j, chunks, readings, payload = _sh_dquote(text, i + 1 if c == '"' else i + 2, depth)
-        g = word.group("dq", readings, _sh_read(payload, depth + 1))
+        g = word.group("dq", readings, _sh_payload(payload, depth + 1))
         for chunk, own in chunks:
             word.add(chunk, own, g)
         return j
@@ -1059,7 +1080,7 @@ def _sh_head_rests(cmd: List[_ShWord], idx: int, outer_verb: bool) -> List[List[
     after = [x.args_from(0) for x in cmd[idx + 1:]]
     for m in _MY_HEAD_RE.finditer(v):
         s, e = m.span()
-        if not all(w.own[s:e]) or re.fullmatch(r"[A-Z0-9_]+", m.group("name")):
+        if not all(w.own[m.start("name"):e]) or re.fullmatch(r"[A-Z0-9_]+", m.group("name")):
             continue  # inside a substitution (read on its own), or MYSQL_ROOT_PASSWORD: an environment name
         if m.group("dir") and not _MY_BIN_DIR_RE.search(m.group("dir")):
             continue
@@ -1095,8 +1116,7 @@ def _sh_walk(cmds: List[List[_ShWord]], outer_verb: bool) -> Iterable[List[str]]
 def mysql_family_verdict(raw: str) -> Optional[str]:
     """None when a unit is clean; a named reason when a mysql family command of it carries a credential the gate
     cannot clear, or when the reader cannot resolve the shell text of a unit that names the family."""
-    ansi = "".join(_sh_ansi_decode(m.group(1)) for m in _SH_ANSI_RE.finditer(raw))
-    if not _MY_CANDIDATE_RE.search(re.sub(r"[\"'\\]", "", raw + " " + ansi)):
+    if not _sh_names_family(raw):
         return None  # names no mysql family client, also not through quotes, backslashes or ANSI-C escapes
     try:
         cmds = _sh_read(raw, 0)
@@ -2420,6 +2440,18 @@ ROUND3_RED = [
     ('5955 quoted-paren pin: reported 2: a single-quoted closing parenthesis does not end the substitution', "$(command -v mysql || echo ')') -p\"$X\""),
     ('5955 quoted-paren pin: reported 3: a quoted opening parenthesis does not nest', '$(echo "(" >&2; command -v mysql) -uroot -p"$X"'),
     ('5955 quoted-paren pin: reported 4: a quoted parenthesis inside a quoted substitution', '"$(command -v mysql || echo ")")" -p"$X"'),
+    ('5955 quoted-paren pin: reported 5: a quoted text payload with an open parenthesis is text', '$(command -v mysql || echo "x(") -p"$X"'),
+    ('5954 reader mutant pin: reported 1: an &> redirect does not end the command', 'mysql -uroot &>/dev/null -p"$X" app'),
+    ('5954 reader mutant pin: reported 2: a double-quoted payload unescapes a backtick', 'ssh h "echo \\"\\`mysql -p\\$X\\`\\""'),
+    ('5954 reader mutant pin: reported 3: a double-quoted payload unescapes a dollar sign', 'ssh h "\\$\'my\\x73ql\' -uroot -p\\$X"'),
+    ('5954 reader mutant pin: reported 4: a backtick inside a double quote holds its own quotes', 'echo "`mysql -uroot -p"$X"`"'),
+    ('5954 reader mutant pin: reported 5: a backtick in a double quote unescapes a double quote', 'echo "`mysql -uroot \\"-p$X\\"`"'),
+    ('5954 reader mutant pin: reported 6: an escaped backtick inside a backtick body is skipped whole', 'x=`echo \\`date\\` ; mysql -uroot -p"$X"`'),
+    ('5954 reader mutant pin: reported 7: an escaped backtick pair outside quotes is a substitution', 'ssh h \\`command -v mysql\\` -p$X'),
+    ('5954 reader mutant pin: reported 8: a dollar double quote is a double quote', '$"mysql" -uroot -p"$X"'),
+    ('5954 reader mutant pin: reported 9: a head quoted alone is a command after an operand verb', 'ssh test "mysql" -uroot -p"$X"'),
+    ('5954 reader mutant pin: reported 10: the first word of a find -exec sh -c payload is a command', 'find /srv -name x -exec sh -c "mysql -uroot -p$X" \\;'),
+    ('5954 reader mutant pin: reported 11: a parameter expansion in the head path is no part of the name', '${D}/mysql -uroot -p"$X"'),
     ('5956 operand-verb pin: reported 1: an ssh host named like a verb does not hide a wrapped head', 'ssh test "sudo mysql -uroot -p$X"'),
     ('5956 operand-verb pin: reported 2: an ssh login named like a verb does not hide a wrapped head', 'ssh -l test h "sudo mysql -p$X"'),
     ('5956 operand-verb pin: reported 3: a container named like a verb does not hide an exec payload', 'docker exec status sh -c "exec mysql -p$X"'),
@@ -2538,12 +2570,15 @@ ROUND11_UNREADABLE = [
     ("a backslash ends the unit", 'mysql -uroot -p"$X" \\'),
     ("readings nested deeper than 8", '$(' * 9 + 'command -v mysql' + ')' * 9 + ' -p"$X"'),
     ("a case statement inside a substitution or group", 'x=$(case $y in a) mysql -p"$X";; esac)'),
+    ("an unclosed single quote", 'ssh h "mysql -uroot -p\'$X"'),
 ]
 # Text the reader cannot resolve but that names no mysql family client is not this arm's concern.
 ROUND11_UNREADABLE_GREEN = ['echo "unclosed', "printf '%s' $(date"]
 ROUND3_MYSQL_RAW_GREEN = [
     ("5691 mutant pin: a newline ends the mysql command", 'mysql -u r db\necho "$X"'),
     ("5695 mutant pin: a literal value glued to -p is not this arm's concern", 'mysql ' + '-p' + 'Secret db'),
+    ("5955 text payload: a quoted parenthesis that names no client is text", 'mysql -uroot -h "$H" app; echo "x("'),
+    ("5954 reader mutant pin: a substitution that prints no mysql head is no head", '$(command -v psql) -h mysql.example -p"$X"'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
@@ -2577,6 +2612,11 @@ def round3_probe_cases(dl) -> Tuple[List[str], int]:
         if any("denylist" in r[2] for r in res) or check_allow_vs_denylist({"c.sh": res}, ent) or \
                 judge({"c.sh": res}, ent, [], dl)[0]:
             bad.append("round-3 green probe is not allow-able: %s" % label)
+    n += 1
+    # a reported row is reported through a reading: only a row named unreadable may fail on unreadable shell (#5955)
+    for label, line in ROUND3_RED:
+        if (mysql_family_verdict(line) or "").startswith("unreadable") and "unreadable" not in label:
+            bad.append("round-3 red probe is reported only as unreadable shell: %s" % label)
     for reason, text in ROUND11_UNREADABLE:
         n += 1
         if mysql_family_verdict(text) != "unreadable shell: " + reason:
