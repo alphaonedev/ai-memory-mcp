@@ -2117,6 +2117,8 @@ ROUND3_RED = [
     ('5737 mutant pin: reported 1: a head under a libexec directory is a command even when no other pattern tags the line', '/usr/libexec/mysqlcheck -u r "$X"'),
     ('5746 mutant pin: reported 1: -p followed by a value-option letter still carries the password', 'mysql -ph$X db'),
     ('5746 mutant pin: reported 2: -p followed by a value-option letter still carries the password', 'mysql -pP"$X" db'),
+    ('5827 mutant pin: reported 1: an input duplication redirect does not end the command', 'mysql 0<&3 -uroot -p"$X"'),
+    ('5827 mutant pin: reported 2: closing the input does not end the command', 'mysql <&- -p"$X"'),
     ('5826 mutant pin: reported 1: a head under ~/ is a command when no other pattern tags the line', '~/mysql -uroot -p"$X"'),
     ('5820 wrapper pin: reported 1: sudo inside an ssh payload is read like sudo outside it', 'ssh dbhost "sudo mysql -uroot -p$X app"'),
     ('5820 wrapper pin: reported 2: exec inside a sh -c payload', 'sh -c "exec mysql -uroot -p$X"'),
