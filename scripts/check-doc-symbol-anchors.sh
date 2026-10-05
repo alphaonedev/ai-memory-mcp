@@ -404,6 +404,55 @@ MDEOF
     anchor_green 5347 "a live type with a doubly nested generic before a live method" \
         "See \`$R::RecallTool<Vec<Option<T>>>::decorate_memory_many\` here."
 
+    # #5392: the generic group is a real balanced scan, so a group nested to
+    # ANY depth still lets every later path component be checked. Each red
+    # case has a missing component AFTER a nested group (a one-level capture
+    # ends at the bare identifier and never sees it); the greens beside them
+    # keep the live shapes from passing vacuously.
+    anchor_red 5392 QUAL "a missing method after a three-deep generic" \
+        "See \`$R::RecallTool<Vec<Option<T>>>::no_such\`."
+    anchor_red 5392 BARE_QUAL "an unbackticked missing method after HashMap<String, Vec<u8>>" \
+        "See $R::RecallTool<HashMap<String, Vec<u8>>>::no_such here."
+    anchor_red 5392 QUAL "a missing method after a two-deep generic" \
+        "See \`$R::RecallTool<Vec<T>>::no_such\`."
+    anchor_red 5392 QUAL "a missing type behind a five-deep generic" \
+        "See \`$R::NoSuch<A<B<C<D<E>>>>>::decorate_memory_many\`."
+    anchor_red 5392 QUAL "a missing method after a five-deep generic" \
+        "See \`$R::RecallTool<A<B<C<D<E>>>>>::no_such\`."
+    anchor_red 5392 QUAL "a brace item with a three-deep generic and a missing method" \
+        "See \`$R::{RecallTool<Vec<Option<T>>>::no_such, RecallTool}\`."
+    anchor_red 5392 QUAL "a missing method after a generic holding a fn arrow" \
+        "See \`$R::RecallTool<dyn Fn(u8) -> Vec<u8>>::no_such\`."
+    anchor_red 5392 QUAL "a missing method after a turbofish group" \
+        "See \`$R::RecallTool::<Vec<T>>::no_such\`."
+    anchor_red 5392 QUAL "a missing method of a nested <Type<T> as Trait> path" \
+        "See \`$R::<RecallTool<Vec<T>> as Trait>::no_such\`."
+    anchor_red 5392 QUAL "a missing type of a nested <Type<T> as Trait> path" \
+        "See \`$R::<NoSuch<Vec<T>> as Trait>::decorate_memory_many\`."
+    anchor_green 5392 "a live method after a five-deep generic" \
+        "See \`$R::RecallTool<A<B<C<D<E>>>>>::decorate_memory_many\`."
+    anchor_green 5392 "a live method after a generic holding a fn arrow" \
+        "See \`$R::RecallTool<dyn Fn(u8) -> Vec<u8>>::decorate_memory_many\`."
+    anchor_green 5392 "a live method after a turbofish group" \
+        "See \`$R::RecallTool::<Vec<T>>::decorate_memory_many\`."
+    anchor_green 5392 "a live nested <Type<T> as Trait> path" \
+        "See \`$R::<RecallTool<Vec<T>> as Trait>::decorate_memory_many\`."
+    anchor_green 5392 "an unbackticked three-deep generic with live parts, then prose" \
+        "See $R::RecallTool<Vec<Option<T>>>::decorate_memory_many, and more."
+
+    # #5394: the HTML-entity spelling nests the same way, and mixes with real
+    # angle brackets; a valid anchor is never a false red.
+    anchor_green 5394 "a live method after doubly nested HTML-entity generics" \
+        "See \`$R::RecallTool&lt;Vec&lt;T&gt;&gt;::decorate_memory_many\`."
+    anchor_green 5394 "a live method after three-deep HTML-entity generics" \
+        "See \`$R::RecallTool&lt;Vec&lt;Option&lt;T&gt;&gt;&gt;::decorate_memory_many\`."
+    anchor_green 5394 "a live method after mixed entity and angle generics" \
+        "See \`$R::RecallTool&lt;Vec<T>&gt;::decorate_memory_many\`."
+    anchor_red 5394 QUAL "a missing method after doubly nested HTML-entity generics" \
+        "See \`$R::RecallTool&lt;Vec&lt;T&gt;&gt;::no_such\`."
+    anchor_red 5394 QUAL "a missing method after mixed entity and angle generics" \
+        "See \`$R::RecallTool&lt;Vec<T>&gt;::no_such\`."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
@@ -962,25 +1011,138 @@ BARE_LN = re.compile(r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs):(\d+)")
 # PIN_TARGET below is the single owner of that pin rule (#5214).
 LABEL_MD = re.compile(r"^[^\]\n]*\]\(([^)\s]*)")
 LABEL_HTML = re.compile(r"^[^<\n]*</a>")
-# #5342: the symbol after `::` is path components, each optionally followed
-# by ONE balanced generic group (one nesting level; commas, spaces, quotes,
-# `&` and parentheses inside it are fine: `<T, U>`, `<'a>`, `<dyn Fn(u8)>`),
-# with an optional leading `<Type as Trait>`. A group may be written with HTML
-# entities (`&lt;T&gt;`). The old character class stopped at the first comma
-# or space and left an unbalanced `Name<T` that was skipped, hiding a missing
-# type.
-_G = (r"(?:<[^<>`\n]*(?:<[^<>`\n]*>[^<>`\n]*)*>"
-      r"|&lt;(?:(?!&gt;)[^`\n])*&gt;)")
+# #5342/#5392: the symbol after `::` is path components, each optionally
+# followed by ONE balanced generic group, nested to ANY depth (commas, spaces,
+# quotes, `&`, `->` and parentheses inside it are fine: `<T, U>`, `<'a>`,
+# `<dyn Fn(u8) -> u8>`), with an optional leading `<Type as Trait>`. A group
+# may be written with HTML entities (`&lt;T&gt;`), and the two spellings mix.
+# A real depth-counting scan (scan_group / scan_sym below) replaces the old
+# fixed-depth regex, which stopped at the first comma or space and then at one
+# nesting level and so hid every component after a deeper group.
 _ID = r"[A-Za-z_][A-Za-z0-9_]*"
-SYM = r"(?:" + _G + r"::)?" + _ID + _G + r"?(?:::(?:" + _ID + _G + r"?|" + _G + r"))*"
-QUAL = re.compile(
-    r"`(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|(" + SYM + r"))")
+ID_RE = re.compile(_ID)
+QUAL_HEAD = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs)::")
 # #5191: an UNBACKTICKED `src/x.rs::symbol` anchor (prose, an HTML code
 # element, a code-block comment) is a symbol claim too, and is the very form
 # the BARE_LN failure text tells authors to use. Same lookbehind as BARE_LN,
 # so a URL path segment is never matched.
-BARE_QUAL = re.compile(
-    r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|(" + SYM + r"))")
+BARE_QUAL_HEAD = re.compile(r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs)::")
+BRACE_BODY = re.compile(r"\{([^}]*)\}")
+
+
+def _group_step(text, j):
+    """Classify the text at `j`: ('open'|'close', width) for an angle bracket
+    or its HTML entity, ('stop', 1) for a character a group may not contain,
+    else ('other', 1). The `>` of an arrow (`->`) is not a closer."""
+    if text.startswith("&lt;", j):
+        return "open", 4
+    if text.startswith("&gt;", j):
+        return "close", 4
+    ch = text[j]
+    if ch == "<":
+        return "open", 1
+    if ch == ">":
+        return ("other", 1) if j > 0 and text[j - 1] == "-" else ("close", 1)
+    if ch in "`\n":
+        return "stop", 1
+    return "other", 1
+
+
+def scan_group(text, i):
+    """End index (exclusive) of the balanced generic group opening at `i`
+    (`<` or `&lt;`), any nesting depth; None when it never balances before a
+    backtick or the end of the text."""
+    depth, j = 0, i
+    while j < len(text):
+        kind, width = _group_step(text, j)
+        if kind == "stop":
+            return None
+        if kind == "open":
+            depth += 1
+        elif kind == "close":
+            depth -= 1
+            if depth == 0:
+                return j + width
+        j += width
+    return None
+
+
+def _opens_group(text, i):
+    return text.startswith("<", i) or text.startswith("&lt;", i)
+
+
+def scan_sym(text, i):
+    """Scan the symbol path starting at `i`; returns its end index, or None
+    when no symbol starts there. Path components are identifiers, each with an
+    optional balanced group, joined by `::` (a bare group after `::` is a
+    turbofish), after an optional leading `<Type as Trait>::`."""
+    pos = i
+    if _opens_group(text, pos):
+        end = scan_group(text, pos)
+        if end is None or not text.startswith("::", end):
+            return None
+        pos = end + 2
+    m = ID_RE.match(text, pos)
+    if not m:
+        return None
+    pos = m.end()
+    while True:
+        if _opens_group(text, pos):
+            end = scan_group(text, pos)
+            if end is None:
+                return pos
+            pos = end
+        if not text.startswith("::", pos):
+            return pos
+        m = ID_RE.match(text, pos + 2)
+        if m:
+            pos = m.end()
+        elif _opens_group(text, pos + 2):
+            end = scan_group(text, pos + 2)
+            if end is None:
+                return pos
+            pos = end
+        else:
+            return pos
+
+
+def iter_quals(line):
+    """Yield (rule, file, payload) for every qualified anchor on `line`:
+    backticked `src/x.rs::sym` (QUAL) and unbackticked (BARE_QUAL)."""
+    for rule, head in (("QUAL", QUAL_HEAD), ("BARE_QUAL", BARE_QUAL_HEAD)):
+        pos = 0
+        while True:
+            hm = head.search(line, pos)
+            if not hm:
+                break
+            pos = hm.end()
+            bm = BRACE_BODY.match(line, pos) if line.startswith("{", pos) else None
+            if bm:
+                yield rule, hm.group(1), bm.group(1)
+                pos = bm.end()
+                continue
+            end = scan_sym(line, pos)
+            if end is not None:
+                yield rule, hm.group(1), line[pos:end]
+                pos = end
+
+
+def strip_generics(tok):
+    """Remove every balanced generic group (any depth) from a token that has
+    already had its HTML entities turned into angle brackets. A group that
+    never balances stays, so the caller can report it."""
+    out, j = [], 0
+    while j < len(tok):
+        if tok[j] == "<":
+            end = scan_group(tok, j)
+            if end is not None:
+                j = end
+                continue
+        out.append(tok[j])
+        j += 1
+    return "".join(out)
+
+
 MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(<?([^)]*src/[A-Za-z0-9_/]+\.rs)[^)]*\)")
 # #5190: ANY relative markdown link to a src/ file, whatever its label
 # (MDLINK only sees a backticked-identifier label). canon() has already
@@ -1007,8 +1169,21 @@ HREF = re.compile(
 # https URL) is immutable and never reaches this rule.
 LINEFRAG = re.compile(r"^#L(\d+)(?:C\d+)?(?:-L?(\d+)(?:C\d+)?)?$")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-GENERICS = re.compile(r"<[^<>]*>")
-SELF_TYPE = re.compile(r"^<\s*(" + _ID + r")[^<>]*?\bas\b[^<>]*>")
+AS_WORD = re.compile(r"\bas\b")
+
+
+def unwrap_self_type(tok):
+    """`<Type<T> as Trait>::m` -> `Type<T>::m` (the type is the claim)."""
+    if not tok.startswith("<"):
+        return tok
+    end = scan_group(tok, 0)
+    if end is None:
+        return tok
+    inner = tok[1:end - 1]
+    m = ID_RE.match(inner.lstrip())
+    if m and AS_WORD.search(strip_generics(inner)):
+        return m.group(0) + tok[end:]
+    return tok
 
 
 def split_items(raw):
@@ -1016,10 +1191,11 @@ def split_items(raw):
     whitespace that are NOT inside a generic group (`{A<T, U>::m, B}` is two
     items, not four)."""
     items, cur, depth = [], "", 0
-    for ch in raw.replace("&lt;", "<").replace("&gt;", ">"):
+    norm = raw.replace("&lt;", "<").replace("&gt;", ">")
+    for idx, ch in enumerate(norm):
         if ch == "<":
             depth += 1
-        elif ch == ">" and depth > 0:
+        elif ch == ">" and depth > 0 and not (idx and norm[idx - 1] == "-"):
             depth -= 1
         if depth == 0 and (ch == "," or ch.isspace()):
             if cur:
@@ -1162,11 +1338,7 @@ for doc in seen_docs:
                 continue
             emit("BARE_LN", doc, ln, f"{m.group(1)}:{m.group(2)}", ctx)
 
-        quals = [("QUAL", m) for m in QUAL.finditer(line)]
-        quals += [("BARE_QUAL", m) for m in BARE_QUAL.finditer(line)]
-        for rule, m in quals:
-            f = m.group(1)
-            raw = m.group(2) if m.group(2) is not None else (m.group(3) or "")
+        for rule, f, raw in iter_quals(line):
             if f not in per_file:
                 # #5201: a qualified anchor asserts the file exists, so the
                 # absence-wording exemption never applies to it.
@@ -1177,11 +1349,8 @@ for doc in seen_docs:
                 # generic arguments are not symbol claims. `<Type as
                 # Trait>::m` checks `Type` and `m`.
                 tok = tok.replace("&lt;", "<").replace("&gt;", ">")
-                tok = SELF_TYPE.sub(r"\1", tok)
-                prev = None
-                while prev != tok:
-                    prev, tok = tok, GENERICS.sub("", tok)
-                tok = tok.strip().rstrip("(){}[]<>.,;")
+                tok = unwrap_self_type(tok)
+                tok = strip_generics(tok).strip().rstrip("(){}[].,;")
                 if "<" in tok or ">" in tok:
                     # An unbalanced group cannot be resolved: report it
                     # rather than skip a component that may be missing.

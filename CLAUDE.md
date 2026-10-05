@@ -1743,8 +1743,8 @@ same way, column suffix included), **QUAL** (every identifier in
 THAT FILE — each `::` component is checked, so
 `VectorIndex::build_with_capacity` resolves only if both do; the
 unbackticked form, and a `Type<T, U>::method` or `<Type as Trait>::method`
-path with one balanced generic group per component (commas, lifetimes,
-`dyn Fn(u8)` and `&lt;...&gt;` entities included; an unbalanced group is
+path with one balanced generic group per component, nested to any depth
+(commas, lifetimes, `dyn Fn(u8) -> u8` and `&lt;...&gt;` entities included; an unbalanced group is
 reported, never skipped), are checked too, the former
 reported as **BARE_QUAL**, and a qualified anchor always asserts that
 its file exists), **MDLINK** (a ``[`sym`](../src/<p>.rs)`` link must resolve, or `sym`
