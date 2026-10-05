@@ -1403,6 +1403,10 @@ KNOWN_RUNNERS = frozenset({
     "torsocks", "proxychains", "proxychains4", "catchsegv", "chronic", "sem", "rlwrap", "ip",
     "trap", "expect", "screen", "tmux", "busybox", "toybox", "aws-vault", "op", "doppler", "direnv",
     "dotenv", "nix-shell", "bundle", "poetry", "pipenv", "uv", "uvx", "npx", "pipx",
+    # #5654 (round-9 mutants M1, M2, M10): shells outside SHELLS, and retry/daemontools/s6
+    # runners, run their arguments as a command.
+    "fish", "csh", "tcsh", "nu", "xonsh", "elvish", "pwsh", "retry", "envdir", "softlimit",
+    "setuidgid", "envuidgid", "s6-envdir", "s6-softlimit", "s6-setuidgid",
 })
 UNMODELLED_KEYWORDS = frozenset({"case", "for", "select", "function", "in"})
 SKIPPED_KEYWORDS = frozenset({"!", "{", "}", "then", "do", "else", "elif", "if", "while", "until",
@@ -2928,6 +2932,12 @@ R10_RED_PROBES = {
     '5653-r10': "alias -- q='$CLI -v pw=$PG_PW'",
     '5653-r11': "PROMPT_COMMAND='$CLI -v pw=$PG_PW'",
     '5653-r12': "export PROMPT_COMMAND='$CLI -v pw=$PG_PW'",
+    '5654-r01-retry-runner': 'retry -- "$CLI" -v pw="$PG_PW"',
+    '5654-r02-fish-c': 'fish -c "\\$CLI -v pw=\\$PG_PW"',
+    '5654-r03-envdir': 'envdir ./env "$CLI" -v pw="$PG_PW"',
+    '5654-r04-tcsh-c': 'tcsh -c "\\$CLI -v pw=\\$PG_PW"',
+    '5654-r05-pwsh-c': 'pwsh -c "\\$CLI -v pw=\\$PG_PW"',
+    '5654-r06-setuidgid': 'setuidgid pg "$CLI" -v pw="$PG_PW"',
 }
 # Round 10 green: no hit of any kind.
 R10_GREEN_PROBES = {
