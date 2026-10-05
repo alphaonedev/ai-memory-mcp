@@ -1466,6 +1466,7 @@ def run_closed_world_citation_cases(fresh, heading: str) -> bool:
         "quote right after a quoted name": '"CLAUDE.md""{h}"',
         "section word after an em space": 'CLAUDE.md\u2003section "{h}"',
         "anchor with a trailing dash": "CLAUDE.md#key-modules-",
+        "anchor of a stayed heading with a trailing dash": "CLAUDE.md#build--test-commands-",
         "anchor with a percent escape": "CLAUDE.md#key%20modules",
         "empty anchor": "CLAUDE.md# here",
         "anchor of a stayed heading in upper case": "CLAUDE.md#BUILD--TEST-COMMANDS",
