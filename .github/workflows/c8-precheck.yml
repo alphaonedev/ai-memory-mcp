@@ -1347,3 +1347,18 @@ jobs:
         # Green near-misses: file form, no password, redaction tokens,
         # shell expansion, the schema-init allowlist.
         run: python3 scripts/check-docs-no-argv-secrets.py --self-test
+
+  sqlite-write-txn-immediate-gate:
+    # #5084 / #5241: a rusqlite DEFERRED transaction that reads then writes
+    # fails with SQLITE_BUSY_SNAPSHOT (517), which busy_timeout never retries.
+    # Every SQLite write transaction in src/ must open via WriteTxn::begin
+    # (BEGIN IMMEDIATE). Fails closed on an unknown or unparseable open.
+    name: SQLite write-transaction IMMEDIATE gate (#5084)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run SQLite write-transaction IMMEDIATE gate
+        run: python3 scripts/check-sqlite-write-txn-immediate.py
+      - name: Self-test the gate (regression evidence)
+        run: python3 scripts/check-sqlite-write-txn-immediate.py --self-test
