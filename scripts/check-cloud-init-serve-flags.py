@@ -3376,7 +3376,7 @@ def build_probes() -> list:
     P.append(("A empty allowlist", "fault", dict(allow_text="# only a comment\n")))
     P.append(("A stale entry", "red", dict(allow_add="aws-gpu-burst | top | nothing-matches:", autolist=False)))
     P.append(("A stale both entry (one template only)", "red", dict(allow_add="both | " + PROV_PATH + " | echo only-in-aws > /x", aws=[ins(RELOAD, ["echo only-in-aws > /x"], before=True)], autolist=False)))
-    P.append(("A stale pending entry", "red", dict(pend_sub=("do-hive #4671 | /etc/ai-memory/store-url | ", "do-hive #4671 | top | nothing-matches: "), autolist=False)))
+    P.append(("A stale pending entry", "red", dict(pend_sub=("aws-gpu-burst #4610 | /etc/ai-memory/store-url | ", "aws-gpu-burst #4610 | top | nothing-matches: "), autolist=False)))
     # an approved line moved to the pending list skips the validators: the tracker must be known and under its ceiling (#5098)
     P.append(("A approved line moved under a tracker over its ceiling (#5098)", "fault", dict(pend_move="#4671", autolist=False)))
     P.append(("A approved line moved under a placeholder tracker #0 (#5098)", "fault", dict(pend_move="#0", autolist=False)))
