@@ -254,6 +254,9 @@ lab_probe_expected_body() {
 }
 
 # lab_probe_body_allowed <declare -f text> — true only when the text, whitespace-normalized, equals the expected body.
+# The comparison is EQUALITY of the whole text (#5587). A substring, prefix or suffix compare is NOT equivalent to it:
+# each accepts the allowed body with extra text around it. The self-test pins that with two legs (extra text after the
+# allowed body, extra text before it), so the substring, prefix and suffix mutants of this line are killed, not tolerated.
 lab_probe_body_allowed() {
   local norm IFS=$' \t\n'
   norm="$(set -f; set -- $1; printf '%s' "$*")"
@@ -261,16 +264,17 @@ lab_probe_body_allowed() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 56 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 51
+# 58 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 53
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), seven probe-matcher legs (lab_probe_refusal_names_knob against
 # generated logs), one structural leg (the matcher body equals the one allowed statement, #5539), a
-# globbing-and-IFS leg, a mutant-builder control, twenty-six closed-world legs (a mutated body of
+# globbing-and-IFS leg, a mutant-builder control, twenty-eight closed-world legs (a mutated body of
 # each spelling must be refused: twenty-two spill spellings (cp, dd, install, sort -o or tee, a stderr
 # redirect to a near name, process substitution, here-string, here-document, pipe, coproc, command
 # substitution, extra statement, function call, eval, exec redirect, a changed awk program, ...), four
-# guard spellings (guard dropped, plain awk, guard returning 0, guard weakened, #5586)), ten shadow legs (#5586: an awk-resolves-to-file
+# guard spellings (guard dropped, plain awk, guard returning 0, guard weakened, #5586) and two
+# extra-text spellings (text after, text before, #5587)), ten shadow legs (#5586: an awk-resolves-to-file
 # control, an awk function, an awk alias, a shell function named cat, mktemp, grep, sed, tr or printf that
 # the matcher must never call, and no function named builtin, type or command), and one layout
 # leg (this comment sits directly on the function).
@@ -396,6 +400,9 @@ lab_posture_selftest() {
   _refuse "calls awk by bare name instead of command awk" "${head}${core/command awk/awk} }" || bad=1
   _refuse "makes the guard return 0 for a shadowed awk" "${head}${core/return 2/return 0} }" || bad=1
   _refuse "weakens the guard to refuse only a function" "${head}${core/== file/!= function} }" || bad=1
+  # #5587: lab_probe_body_allowed is equality, not a substring, prefix or suffix compare.
+  _refuse "has extra text after the allowed body (kills a prefix or substring compare)" "${exp} ; cp \"\$1\" /dev/shm/lab-probe" || bad=1
+  _refuse "has extra text before the allowed body (kills a suffix or substring compare)" "cp \"\$1\" /dev/shm/lab-probe ; ${exp}" || bad=1
   unset -f _refuse
   # #5586: the matcher must refuse a shadowed awk and must call no other external command.
   local canary="$plog/canary"
