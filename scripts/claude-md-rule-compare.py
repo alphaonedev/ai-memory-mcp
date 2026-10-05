@@ -473,21 +473,22 @@ CONTROL_BYTES = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\r(?!\n)")
 
 
 def refusal_prefix_gap(source: bytes) -> str:
-    """#5510/#5560/#5590: "" when `source` (the file BYTES, never a str) is plain strict utf-8 and the only statements that
-    execute above the isolation refusal are the docstring and `import sys`, and the refusal is exactly
+    """#5510/#5560/#5590: "" when `source` (the file BYTES, never a str) is plain strict utf-8 and the only
+    statements that execute above the isolation refusal are the docstring and `import sys`, and the refusal is exactly
     `if __name__ == "__main__" and not sys.flags.isolated:` whose body is calls to print and sys.exit with constant
-    arguments; otherwise why not. Parsed with ast from the bytes and never executed. It is closed-world and fails closed, so it over-refuses rather than risk a miss. The exact rule,
-    each numbered rule is asserted by pin_5590 (#5590, #5622), and pin_5590 fails if a numbered rule has no assertion
-    group; the structure paragraph above is pinned by pin_5510, pin_5562 and pin_5563:
+    arguments; otherwise why not. Parsed with ast from the bytes and never executed. It is closed-world and fails
+    closed, so it over-refuses rather than risk a miss. The exact rule is R1 to R7 below. pin_5590 asserts each
+    numbered rule and fails if a numbered rule has no assertion group (#5590, #5622). pin_5510, pin_5562 and pin_5563
+    pin the structure this paragraph describes. Every line of this docstring fits in 120 characters (#5678).
     R1: an argument that is neither bytes nor bytearray is refused; a bytearray is judged as the bytes it holds.
     R2: A utf-8 BOM is refused (detect_encoding reports it as utf-8-sig), alone or with any cookie.
-    R3: A coding cookie is judged where tokenize.detect_encoding (the stdlib PEP 263 implementation) finds one, after its
-    normalisation: on line 1, or on line 2 when line 1 is blank or a comment; a cookie after a code line is not judged.
-    Accepted: utf-8 in any letter case, utf_8, utf-8- followed by anything (so utf-8-sig WITHOUT a BOM is accepted, and
-    compile() accepts it too), and exactly lower-case utf8. Refused: every other name, including UTF8 and Utf8 (compile()
-    accepts them; this check does not), utf-7, latin-1, utf-16 and an unknown codec (compile() rejects it). A utf-16
-    cookie is refused as a declared encoding where detect_encoding returns utf-16 (3.13 and older) and as an
-    encoding that cannot be determined where it raises SyntaxError (3.14).
+    R3: A coding cookie is judged where tokenize.detect_encoding (the stdlib PEP 263 implementation) finds one, after
+    its normalisation: on line 1, or on line 2 when line 1 is blank or a comment; a cookie after a code line is not
+    judged. Accepted: utf-8 in any letter case, utf_8, utf-8- followed by anything (so utf-8-sig WITHOUT a BOM is
+    accepted, and compile() accepts it too), and exactly lower-case utf8. Refused: every other name, including UTF8 and
+    Utf8 (compile() accepts them; this check does not), utf-7, latin-1, utf-16 and an unknown codec (compile() rejects
+    it). A utf-16 cookie is refused as a declared encoding where detect_encoding returns utf-16 (3.13 and older) and
+    as an encoding that cannot be determined where it raises SyntaxError (3.14).
     R4: Bytes that are not strict utf-8 are refused.
     R5: Any control byte other than tab, LF and CRLF line ends (NUL, form feed, a lone CR and the rest) is refused
     anywhere in the file.
@@ -1228,6 +1229,12 @@ def _self_test_cases() -> int:
         for label, form in (("3.13 dedented", dedented), ("3.12 indented", indented)):
             if numbered_rules(form) != numbered:
                 return f"the {label} docstring numbers the rules {sorted(numbered_rules(form))}, not {sorted(numbered)} (#5674)"
+        doc_node = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)
+                        and node.name == "refusal_prefix_gap").body[0]
+        wide = [(doc_node.lineno + index, len(line)) for index, line in
+                enumerate(source.split("\n")[doc_node.lineno - 1:doc_node.end_lineno]) if len(line) > 120]
+        if wide or doc_node.end_lineno <= doc_node.lineno:
+            return f"the docstring has lines over 120 characters (line, length): {wide} (#5678)"
         if not numbered or numbered != asserted:
             return f"the docstring numbers the rules {sorted(numbered)} but pin_5590 asserts {sorted(asserted)} (#5622)"
         return ""
