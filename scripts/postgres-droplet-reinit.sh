@@ -223,9 +223,12 @@ require_sslrootcert() {
 # #5449: PG_PRIMARY_DB is spliced into the pg_dump connection string and into
 # DROP/CREATE DATABASE, so only a plain identifier is accepted; a conninfo such
 # as "dbname=x sslmode=disable" would otherwise outrank the PGSSLMODE pin.
+# #5484: lower case only. DROP/CREATE DATABASE below are unquoted, so PostgreSQL folds
+# the name to lower case, while the pg_dump dbname is case-sensitive: an upper case name
+# would back up one database and drop another.
 require_primary_db_identifier() {
-    if [[ ! "$PG_PRIMARY_DB" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-        echo "FATAL: PG_PRIMARY_DB must be a plain identifier ([A-Za-z_][A-Za-z0-9_]*) (#5449)" >&2
+    if [[ ! "$PG_PRIMARY_DB" =~ ^[a-z_][a-z0-9_]*$ ]]; then
+        echo "FATAL: PG_PRIMARY_DB must be a plain identifier in lower case ([a-z_][a-z0-9_]*) (#5449, #5484)" >&2
         exit 7
     fi
 }

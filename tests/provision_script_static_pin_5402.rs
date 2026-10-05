@@ -247,3 +247,25 @@ fn reinit_dump_ca_fallback_guard_is_pinned_5450() {
         "#5450: the FATAL text naming the ssh-host case must stay"
     );
 }
+
+/// #5484 (round-5 F4): PG_PRIMARY_DB is spliced UNQUOTED into DROP/CREATE DATABASE, where
+/// PostgreSQL folds it to lower case, while the pg_dump dbname is case-sensitive; an upper
+/// case name would dump one database and drop another, so it is refused.
+#[test]
+fn reinit_refuses_an_uppercase_primary_db_f4() {
+    for bad in ["AiMem", "aiMem", "AIMEM", "aimemoryX"] {
+        let o = dry_run(&[("PG_PRIMARY_DB", bad), ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem")]);
+        assert_eq!(
+            o.status.code(),
+            Some(7),
+            "F4: PG_PRIMARY_DB {bad:?} must exit 7: {}",
+            stderr_of(&o)
+        );
+        assert!(
+            !stdout_of(&o).contains("pg_dump"),
+            "F4: nothing may be planned for {bad:?}"
+        );
+    }
+    let ok = dry_run(&[("PG_PRIMARY_DB", "ai_mem_2"), ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem")]);
+    assert_eq!(ok.status.code(), Some(0), "{}", stderr_of(&ok));
+}
