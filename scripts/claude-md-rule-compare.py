@@ -47,6 +47,7 @@ if __name__ == "__main__" and not sys.flags.isolated:
 import argparse  # noqa: E402 - after the isolated-mode refusal on purpose (#5163)
 import ast
 import difflib
+import importlib.machinery
 import importlib.util
 import os
 import py_compile
@@ -334,10 +335,16 @@ def non_isolated_child(script: Path, flags: list, scratch: Path):
 
 def imported_modules(path: Path) -> list:
     """#5379: the top-level names of every module `path` imports (parsed, never executed), except the built-in
-    `sys`. The self-test plants one file per name beside its non-isolated child, so an import of any module
-    not already loaded at interpreter start (os, stat and importlib are, so a planted file of those names never
-    runs) placed before the module-top refusal runs a planted file instead of going unnoticed. Dynamic imports
-    (importlib.import_module, __import__) are not found by this AST scan (#5405); the script has none."""
+    `sys`. The self-test plants one file per name beside its non-isolated child, so an import of any of them
+    placed before the module-top refusal runs a planted file instead of going unnoticed. Measured on CPython
+    3.12.7: os and stat are frozen stdlib modules (FrozenImporter.find_spec returns a spec for both) and
+    FrozenImporter precedes PathFinder on sys.meta_path, so a planted os.py or stat.py is never resolved from
+    the script directory, whether or not the module is already loaded; the frozen set varies by Python version.
+    importlib is NOT frozen: its planted file is load-bearing. Under -S (no site import) an `import importlib`
+    resolves the planted importlib.py; without -S the site startup has already loaded importlib, so the plant is
+    inert there on 3.12.7 but is not relied on (#5424). The importlib plant is pinned by the self-test.
+    Dynamic imports (importlib.import_module, __import__) are not found by this AST scan (#5405); the script
+    has none."""
     names = set()
     for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Import):
@@ -544,6 +551,34 @@ def _self_test_cases() -> int:
     else:
         failures.append("non-isolated run")
         print("FAIL: self-test - a comparison run without -I did not fail closed (R5, #5163)", file=sys.stderr)
+
+    def importlib_plant():
+        # #5424: importlib is in the plant set (it is not frozen, so its plant is load-bearing), os and stat are in
+        # it too, and the docstring says so. The behavioural probe imports importlib under -S (no site import) with
+        # a planted importlib.py beside it: the plant must run exactly when FrozenImporter does not own importlib.
+        if "importlib" not in imported_modules(Path(__file__).resolve()):
+            return False
+        words = " ".join((imported_modules.__doc__ or "").split())
+        if "never runs" in words or "importlib is NOT frozen" not in words or "frozen stdlib modules" not in words:
+            return False
+        probe = base_dir / "implant"
+        probe.mkdir(parents=True, exist_ok=True)
+        for name in ("importlib", "os", "stat"):
+            (probe / f"{name}.py").write_text("print('PLANTED')\nraise SystemExit(0)\n", encoding="utf-8")
+            (probe / "probe.py").write_text(f"import {name}\nprint('REAL')\n", encoding="utf-8")
+            frozen = importlib.machinery.FrozenImporter.find_spec(name) is not None
+            result = subprocess.run([sys.executable, "-S", "-E", str(probe / "probe.py")],
+                                    capture_output=True, text=True, check=False, cwd=str(probe))
+            if ("PLANTED" in result.stdout) == frozen:
+                return False
+        return True
+
+    if importlib_plant():
+        print("PASS: self-test - the importlib plant is in the plant set and the docstring states why (#5424)")
+    else:
+        failures.append("importlib plant")
+        print("FAIL: self-test - the importlib plant is missing from the plant set or the docstring is wrong "
+              "(#5424)", file=sys.stderr)
 
     def importer_refusal():
         # #5377: a caller that imports the module skips the module-top refusal (it is gated on __name__ ==
