@@ -70,9 +70,11 @@ on:
     branches: [main, develop, "release/**"]
   # Merge Queue (#3089) — this workflow carries several REQUIRED gate contexts,
   # so it MUST report on the `merge_group` ref or the queue wedges. Its jobs
-  # have no docs-only/event `if:` gating (the two event-scoped gates —
-  # cert-expiry and commit-signing-posture — N/A-skip to exit 0 on a non-PR
-  # event, staying green), so every context reports on merge_group unchanged.
+  # have no docs-only/event `if:` gating, so every context reports on
+  # merge_group unchanged. cert-expiry takes its range from
+  # scripts/ci-commit-range.py on pull_request, merge_group and push and is red
+  # on an event or sha it cannot decide (#5603); commit-signing-posture still
+  # N/A-skips to exit 0 on a non-PR event.
   # No `name:` changed. See ci.yml for the full merge-queue rationale.
   merge_group:
     types: [checks_requested]
@@ -1112,6 +1114,8 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
         run: bash scripts/check-cert-expiry.sh
       - name: Self-test the gate (regression evidence)
         # --self-test builds a throwaway repo under .local-runs/ (never a
@@ -1120,7 +1124,9 @@ jobs:
         # plus a cert-doc touch is GREEN; an AI_MEMORY_FED_* identifier
         # add/rename outside the path watches is RED; docs-only and
         # unrelated src edits are GREEN; pull_request-without-base
-        # fail-closes; workflow_dispatch and a zero-SHA push skip;
+        # fail-closes; workflow_dispatch, an empty or zero-SHA push base,
+        # an unreachable base, merge_group without a base and an unknown event
+        # are each RED (#5603);
         # THIS checkout vs origin/release/v1.0.0 is GREEN; and (#3556) an
         # incidental cert-doc edit does NOT satisfy the hatch, a LIVE
         # banner over wire drift since its bound SHA is RED on an

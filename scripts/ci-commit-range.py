@@ -16,6 +16,8 @@ Inputs (a flag overrides the environment variable of the same role):
     --mg-base SHA     MG_BASE_SHA          merge_group: base_sha
     --mg-head SHA     MG_HEAD_SHA          merge_group: head_sha
     --repo DIR        repository to resolve against (default: cwd)
+    --base-only       print only the base side of the range (#5604): the one
+                      older commit a gate compares a file against
 
 Rules:
 
@@ -25,11 +27,17 @@ Rules:
                   resolves to a commit in this repository
     anything else refuse
 
+A refusal for a push whose previous tip is missing, all-zero or not in this
+checkout names its cause (the creation push or force-push of a protected branch
+has no comparable previous tip) and says the next ordinary push produces a
+comparable range; a refused run is red and a re-run cannot turn it green
+(#5603, #5604). A merge_group refusal for a missing base_sha says the same.
+
 Every sha must be exactly 40 lowercase hex characters, must not be all zeros
 and must resolve to a commit here before it reaches git as an argument (git is
 always called with an argument list, never a shell).
 
-Output: one line "A..B" on stdout and exit 0, or one "ci-commit-range: REFUSED"
+Output: one line "A..B" (or just "A" with --base-only) on stdout and exit 0, or one "ci-commit-range: REFUSED"
 line on stderr and exit 1. Usage errors exit 2. A failed --self-test exits 3.
 
     python3 scripts/ci-commit-range.py --self-test
@@ -48,13 +56,43 @@ EVENTS = ("pull_request", "merge_group", "push")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 ZERO_SHA = "0" * 40
 WORKFLOW = Path(".github/workflows/c8-precheck.yml")
-GATE_JOBS = ("stale-contract-assertions-gate", "count-assertion-declared-gate")
+# The two jobs that call the helper in the workflow, and the two jobs whose
+# SCRIPT calls it (the workflow only passes the event inputs to the script).
+SCRIPT_GATE_JOBS = {"cert-expiry-gate": "check-cert-expiry.sh"}
+GATE_JOBS = ("stale-contract-assertions-gate", "count-assertion-declared-gate",
+             "cert-expiry-gate")
+# The only expressions a script-gate step may use: each one exactly once.
+SCRIPT_GATE_ENV = (
+    "GITHUB_EVENT_NAME: ${{ github.event_name }}",
+    "GITHUB_EVENT_BEFORE: ${{ github.event.before }}",
+    "PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}",
+    "PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+    "MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}",
+    "MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}",
+)
+HELPER_NAME = "ci-commit-range.py"
 LAYER_ATTEMPTS = [0]
 CALL = 'range="$(python3 scripts/ci-commit-range.py)"'
 
 
+NEXT_PUSH = ("; the next ordinary push produces a comparable range "
+             "(this run is red and a re-run cannot turn it green)")
+PUSH_CAUSE = (" (a creation push or a force-push of a protected branch has no "
+              "comparable previous tip)")
+MG_CAUSE = " (the merge_group event carries no usable base_sha)"
+
+
 class Refused(Exception):
-    """The range cannot be decided; the message says why."""
+    """The range cannot be decided; the message says why.
+
+    kind is "absent" (missing, empty, all-zero), "unresolved" (a well-formed sha
+    that is not a commit here) or "malformed"; callers add a cause text to the
+    first two only.
+    """
+
+    def __init__(self, message, kind="malformed"):
+        Exception.__init__(self, message)
+        self.kind = kind
 
 
 def git(repo, *args):
@@ -73,15 +111,25 @@ def git(repo, *args):
 def checked_sha(repo, role, value):
     """Return value when it is a strict, non-zero sha naming a local commit."""
     if value is None or value == "":
-        raise Refused("%s is missing or empty" % role)
+        raise Refused("%s is missing or empty" % role, "absent")
     if SHA_RE.fullmatch(value) is None:
         raise Refused("%s is not a full 40-char lowercase hex sha" % role)
     if value == ZERO_SHA:
-        raise Refused("%s is the all-zero sha" % role)
+        raise Refused("%s is the all-zero sha" % role, "absent")
     code, out = git(repo, "rev-parse", "--verify", "--quiet", value + "^{commit}")
     if code != 0 or out != value:
-        raise Refused("%s %s does not resolve to a commit here" % (role, value))
+        raise Refused("%s %s does not resolve to a commit here" % (role, value), "unresolved")
     return value
+
+
+def with_cause(check, cause, repo, role, value):
+    """Run a sha check; name the cause on an absent or unresolved sha (D6)."""
+    try:
+        return check(repo, role, value)
+    except Refused as exc:
+        if exc.kind in ("absent", "unresolved"):
+            raise Refused("%s%s%s" % (exc, cause, NEXT_PUSH), exc.kind)
+        raise
 
 
 def choose(repo, event, head, before, pr_base, pr_head, mg_base, mg_head):
@@ -96,12 +144,20 @@ def choose(repo, event, head, before, pr_base, pr_head, mg_base, mg_head):
             raise Refused("no merge-base between the pull_request base and head")
         return "%s..%s" % (out, tip)
     if event == "merge_group":
-        base = checked_sha(repo, "merge_group base_sha", mg_base)
+        base = with_cause(checked_sha, MG_CAUSE, repo, "merge_group base_sha", mg_base)
         tip = checked_sha(repo, "merge_group head_sha", mg_head)
         return "%s..%s" % (base, tip)
-    prev = checked_sha(repo, "push before sha", before)
+    prev = with_cause(checked_sha, PUSH_CAUSE, repo, "push before sha", before)
     tip = checked_sha(repo, "push head sha", head)
     return "%s..%s" % (prev, tip)
+
+
+def base_of(rng):
+    """The base side of an "A..B" range (the one older commit to compare with)."""
+    left = rng.split("..", 1)[0]
+    if SHA_RE.fullmatch(left) is None:
+        raise Refused("internal: range %r has no 40-char base" % rng)
+    return left
 
 
 def env_or(value, name):
@@ -300,8 +356,39 @@ def step_run_body(block):
     return picked
 
 
+def script_gate_violations(job, block):
+    """Pin for a job whose script calls the helper (#5603, #5604): closed-world."""
+    problems = []
+    script = SCRIPT_GATE_JOBS[job]
+    run_line = "        run: bash scripts/%s" % script
+    steps = [st for st in re.split(r"\n      - ", block)
+             if re.search(r"(?m)^%s$" % re.escape(run_line), st)]
+    if len(steps) != 1:
+        return ["%s: expected exactly one step running %s, found %d" % (job, script, len(steps))]
+    step = steps[0]
+    if len(re.findall(r"(?m)^          fetch-depth: 0$", block)) != 1:
+        problems.append("%s: checkout lacks fetch-depth: 0" % job)
+    for line in SCRIPT_GATE_ENV:
+        if step.count(line) != 1:
+            problems.append("%s: the step must pass %r exactly once" % (job, line))
+    exprs = re.findall(r"\$\{\{.*?\}\}", step)
+    allowed = [line.split(": ", 1)[1] for line in SCRIPT_GATE_ENV]
+    for expr in exprs:
+        if expr not in allowed:
+            problems.append("%s: expression %s is not an allowed event input" % (job, expr))
+    keys = re.findall(r"(?m)^          ([A-Za-z_]+):", step)
+    if sorted(keys) != sorted(line.split(":", 1)[0] for line in SCRIPT_GATE_ENV):
+        problems.append("%s: env keys are %s, expected exactly the six event inputs" % (job, sorted(keys)))
+    for bad in ("||", "&&", "HEAD~", "CERT_EXPIRY_", "DECLARATION_GATE_", "N/A"):
+        if bad in step:
+            problems.append("%s: the step contains %r" % (job, bad))
+    if re.search(r"HEAD(?!_SHA)", step):
+        problems.append("%s: the step names HEAD (no default base)" % job)
+    return problems
+
+
 def pin_violations(text):
-    """Static pin: both jobs take the range only from the helper. Returns problems."""
+    """Static pin: every gate job takes its range only from the helper. Returns problems."""
     problems = []
     if "HEAD~1" in text:
         problems.append("HEAD~1 appears in the workflow")
@@ -309,6 +396,9 @@ def pin_violations(text):
         block = job_block(text, job)
         if block is None:
             problems.append("%s: job not found" % job)
+            continue
+        if job in SCRIPT_GATE_JOBS:
+            problems.extend(script_gate_violations(job, block))
             continue
         steps = step_run_body(block)
         if len(steps) != 1:
@@ -337,6 +427,31 @@ def pin_violations(text):
                 problems.append("%s: the range step does not pass %s" % (job, why))
         if "set -euo pipefail" not in run_part:
             problems.append("%s: range step lacks set -euo pipefail" % job)
+    return problems
+
+
+SCRIPT_PINS = {
+    "check-cert-expiry.sh": {
+        "need": (HELPER_NAME,),
+        "forbid": ("ZERO_SHA_RE", "return 3", "rc == 3", "N/A", "workflow_dispatch)", "rc=3"),
+        "regex": (r"\$\{?GITHUB_EVENT_BEFORE",),
+    },
+}
+
+
+def script_text_violations(name, text):
+    """Static pin on a gate script: no event-before read, no default base, no skip."""
+    problems = []
+    pins = SCRIPT_PINS[name]
+    for needed in pins["need"]:
+        if needed not in text:
+            problems.append("%s: does not call %s" % (name, needed))
+    for bad in pins["forbid"]:
+        if bad in text:
+            problems.append("%s: contains %r" % (name, bad))
+    for pattern in pins["regex"]:
+        if re.search(pattern, text):
+            problems.append("%s: matches %s" % (name, pattern))
     return problems
 
 
@@ -442,6 +557,32 @@ def self_test():
                 and proc.stdout == "%s..%s\n" % (shas["c1"], shas["c3"])):
             failures += 1
             print("FAIL flag override: %r %r" % (proc.returncode, proc.stdout))
+        # D6: a refusal names its cause and says what produces a comparable range.
+        c1, c3 = shas["c1"], shas["c3"]
+        for label, event, kw, words in (
+                ("push all-zero before", "push", {"before": ZERO_SHA, "head": c3},
+                 ("creation push", "force-push", "no comparable previous tip",
+                  "next ordinary push", "cannot turn it green")),
+                ("push empty before", "push", {"before": "", "head": c3},
+                 ("creation push", "next ordinary push")),
+                ("push unreachable before", "push", {"before": shas["ghost"], "head": c3},
+                 ("force-push", "next ordinary push")),
+                ("merge_group missing base", "merge_group", {"mg_head": c3},
+                 ("merge_group base_sha", "next ordinary push")),
+                ("merge_group empty base", "merge_group", {"mg_base": "", "mg_head": c3},
+                 ("merge_group", "next ordinary push"))):
+            total += 1
+            code, out, err = invoke(repo, event, kw)
+            missing = [w for w in words if w not in err]
+            if code != 1 or out != "" or missing:
+                failures += 1
+                print("FAIL refusal text %s: exit=%s missing=%s err=%r" % (label, code, missing, err))
+        # A malformed value is not a creation push: no misleading cause text.
+        total += 1
+        code, out, err = invoke(repo, "push", {"before": c1[:39], "head": c3})
+        if code != 1 or "creation push" in err:
+            failures += 1
+            print("FAIL malformed before must not claim a creation push: %r" % err)
         # Frozen old block: the cases whose answer changed are accepted by it.
         # (Covered by --red-proof; the self-test only needs the new behaviour.)
     total += 1
@@ -458,8 +599,11 @@ def self_test():
     if problems:
         failures += 1
         print("FAIL workflow pin: " + "; ".join(problems))
-    muts = pin_mutations(text)
+    # Mutants are only meaningful against a clean pin (the anchors exist).
+    muts = [] if problems else pin_mutations(text)
     total += 1
+    if problems:
+        muts = [("pin is not clean; no mutants generated", text)] * 15
     if len(muts) < 15:
         failures += 1
         print("FAIL only %d pin mutants generated (expected at least 15)" % len(muts))
@@ -473,6 +617,25 @@ def self_test():
     if checked != len(muts):
         failures += 1
         print("FAIL checked %d of %d pin mutants" % (checked, len(muts)))
+    # Static pin on the gate scripts themselves, with text mutants.
+    scripts_dir = Path(__file__).resolve().parent
+    for name in SCRIPT_PINS:
+        stext = (scripts_dir / name).read_text()
+        total += 1
+        bad = script_text_violations(name, stext)
+        if bad:
+            failures += 1
+            print("FAIL script pin %s: %s" % (name, "; ".join(bad)))
+        smuts = script_mutations(name, stext)
+        total += 1
+        if len(smuts) < 5:
+            failures += 1
+            print("FAIL only %d script mutants for %s" % (len(smuts), name))
+        for label, mutate in smuts:
+            total += 1
+            if not script_text_violations(name, mutate):
+                failures += 1
+                print("FAIL script mutant not detected (%s): %s" % (name, label))
     print("ci-commit-range self-test: %d cases, %d failed" % (total, failures))
     return failures
 
@@ -514,6 +677,60 @@ def pin_mutations(text):
     out.append(("else branch added", text.replace(CALL, CALL + "\n          else", 1)))
     out.append(("job renamed away", text.replace(
         "  count-assertion-declared-gate:", "  count-assertion-declared-gate-x:", 1)))
+    for job, script in SCRIPT_GATE_JOBS.items():
+        out.extend(script_job_mutations(text, job, script))
+    return out
+
+
+def in_job(text, job, old, new, count=1):
+    """Replace old by new inside one job block only; the mutant must differ."""
+    block = job_block(text, job)
+    if block is None or old not in block:
+        raise RuntimeError("mutation anchor %r missing in %s" % (old, job))
+    return text.replace(block, block.replace(old, new, count), 1)
+
+
+def script_job_mutations(text, job, script):
+    """Mutants of a script-gate job: inlined before, added base env, dropped inputs."""
+    out = []
+    env_anchor = "          GITHUB_EVENT_NAME: ${{ github.event_name }}\n"
+    run_anchor = "        run: bash scripts/%s\n" % script
+    for label, key in (("CERT_EXPIRY_BASE", "CERT_EXPIRY_BASE"), ("DECLARATION_GATE_BASE", "DECLARATION_GATE_BASE"),
+                       ("CERT_EXPIRY_HEAD", "CERT_EXPIRY_HEAD"), ("DECLARATION_GATE_PREVIOUS_PIN", "DECLARATION_GATE_PREVIOUS_PIN")):
+        out.append(("%s: %s override added" % (job, label),
+                    in_job(text, job, env_anchor, env_anchor + "          %s: x\n" % key)))
+    out.append(("%s: inlined github.event.before with a default" % job,
+                in_job(text, job, env_anchor, env_anchor + "          X_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}\n")))
+    out.append(("%s: HEAD default env added" % job,
+                in_job(text, job, env_anchor, env_anchor + "          X_BASE: HEAD\n")))
+    out.append(("%s: HEAD~1 env added" % job,
+                in_job(text, job, env_anchor, env_anchor + "          X_BASE: HEAD~1\n")))
+    out.append(("%s: event.before wrapped in a fallback" % job,
+                in_job(text, job, "${{ github.event.before }}", "${{ github.event.before || 'x' }}")))
+    out.append(("%s: extra event input" % job,
+                in_job(text, job, env_anchor, env_anchor + "          X_REF: ${{ github.ref }}\n")))
+    for line in SCRIPT_GATE_ENV:
+        out.append(("%s: %s dropped" % (job, line.split(":", 1)[0]),
+                    in_job(text, job, "          " + line + "\n", "")))
+    out.append(("%s: fetch-depth dropped" % job, in_job(text, job, "          fetch-depth: 0\n", "          fetch-depth: 1\n")))
+    out.append(("%s: script call guarded by || true" % job,
+                in_job(text, job, run_anchor, run_anchor.rstrip("\n") + " || true\n")))
+    out.append(("%s: script call guarded by an if" % job,
+                in_job(text, job, run_anchor, "        run: |\n          if [ \"$GITHUB_EVENT_NAME\" = pull_request ]; then bash scripts/%s; fi\n" % script)))
+    out.append(("%s: job renamed away" % job,
+                text.replace("  %s:\n" % job, "  %s-x:\n" % job, 1)))
+    return out
+
+
+def script_mutations(name, text):
+    """Text mutants of a gate script that the static script pin must reject."""
+    out = [("helper call removed", text.replace(HELPER_NAME, "helper-removed.py")),
+           ("N/A skip text restored", text + "\n# echo 'N/A skip'\n")]
+    if name == "check-cert-expiry.sh":
+        out += [("zero-sha regex restored", text + "\nZERO_SHA_RE='^0+$'\n"),
+                ("return 3 skip restored", text + "\n# return 3\n"),
+                ("event before read in the script", text + '\nbefore="${GITHUB_EVENT_BEFORE:-}"\n'),
+                ("workflow_dispatch skip arm restored", text + "\n        workflow_dispatch)\n")]
     return out
 
 
@@ -557,6 +774,7 @@ def main(argv):
     ap.add_argument("--mg-base")
     ap.add_argument("--mg-head")
     ap.add_argument("--repo", default=".")
+    ap.add_argument("--base-only", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--red-proof", action="store_true")
     args = ap.parse_args(argv)
@@ -578,6 +796,12 @@ def main(argv):
     except Refused as exc:
         sys.stderr.write("ci-commit-range: REFUSED: %s\n" % exc)
         return 1
+    if args.base_only:
+        try:
+            rng = base_of(rng)
+        except Refused as exc:
+            sys.stderr.write("ci-commit-range: REFUSED: %s\n" % exc)
+            return 1
     sys.stdout.write(rng + "\n")
     return 0
 
