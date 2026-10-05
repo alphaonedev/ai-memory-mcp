@@ -128,9 +128,10 @@
 # (category Cf: a zero-width space, a word joiner, a soft hyphen, a bidi
 # control) is dropped from the doc, the same as from a decoded character
 # reference, and a line ends only at CR, LF or CRLF (#5781). Every rule
-# then runs on the text a reader sees: a line holding a character
-# reference is read as CommonMark and as HTML (an .html doc as HTML only),
-# and a finding both readings make is reported (#5607, #5782).
+# then runs on the text a reader sees: a line is read as CommonMark and
+# as HTML (an .html doc as HTML only) when it, or the line before or after
+# it, holds a character reference, and a finding both readings make is
+# reported (#5607, #5782).
 #
 # THE ABSENT-PATH EXEMPTION. A plain path or `path:line` anchor is not
 # reported when absence wording ("no longer exists", "formerly",
@@ -1760,6 +1761,9 @@ PYEOF
         "$R::NoSuch" "See [\`NoSuch\`](src/mcp/tools/recall&#46;rs) here."
     anchor_red_cites 5782 UNDECIDABLE_REF "a path the two readings decode differently" \
         "src/no_such.rs" "See \`src/no&#95such.rs\`."
+    anchor_red_cites 5782 MDLINK "a symbol link whose target continues on the next line with a character reference" \
+        "$R::NoSuch" "See [\`NoSuch\`](
+src/mcp/tools/recall&#46;rs) here."
     anchor_green 5782 "an entity-spelled dot in a live path" \
         "See \`src/mcp/tools/recall&#46;rs\`."
 
@@ -3458,14 +3462,16 @@ for doc in seen_docs:
     for ln, raw in enumerate(doc_lines, 1):
         ctx = raw.strip()
         # #5607/#5782: EVERY per-line rule runs on every reading of the
-        # line: the raw line when it holds no character reference, else the
-        # CommonMark and HTML readings (an .html doc has the HTML reading
-        # only). A finding every reading makes is reported; when the
-        # readings disagree the line is undecidable and its anchors (or, with
-        # no qualified anchor, the tokens the readings disagree on) are
-        # refused as UNDECIDABLE_REF.
+        # line: the raw text when the line and the lines before and after it
+        # (the window a link destination may continue into) hold no
+        # character reference, else the CommonMark and HTML readings (an
+        # .html doc has the HTML reading only). A finding every reading makes
+        # is reported; when the readings disagree the line is undecidable and
+        # its anchors (or, with no qualified anchor, the tokens the readings
+        # disagree on) are refused as UNDECIDABLE_REF.
         line = canon(raw)[0]
-        if "&" in line:
+        near = "\n".join(canon(x)[0] for x in doc_lines[max(0, ln - 2):ln + 1])
+        if "&" in near:
             decs = [decode_html] if doc.endswith(".html") else [decode_cm, decode_html]
         else:
             decs = [None]
