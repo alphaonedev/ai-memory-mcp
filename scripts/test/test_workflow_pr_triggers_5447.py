@@ -27,7 +27,7 @@ RULES ENFORCED (all closed-world: a trigger the reader cannot parse is a FAILURE
          ``*name`` items are undecidable and fail.  A push trigger with no
          ``branches`` and no ``tags`` key matches every branch and counts.
   R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730-#5736,
-         #5748) the whole file is
+         #5748, #5749) the whole file is
          read closed-world by the grammar below.  A file the reader cannot read
          is a failure whatever words it holds (#5731).
 
@@ -49,11 +49,13 @@ ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
               row (no backslash in double quotes, no doubled single quote) | a
               flow collection (below) | a block-scalar header ``|`` or ``>``
               with an optional ``-`` or ``+``.  Anchors, aliases, tags and
-              reserved indicators are refused.
+              reserved indicators are refused, and so is a plain ``<<`` or
+              ``=``, which YAML 1.1 reads as the merge or value tag (#5749).
   flow        ``[`` entries ``]`` or ``{`` pairs ``}``, closed on its row.  An
               entry is a flow collection, a quoted scalar with no comma inside,
               or a plain scalar of printable ASCII that starts with no indicator
-              and holds no quote, ``#`` or ``:``; a pair is a plain key, ``: ``
+              and holds no quote, ``#`` or ``:`` and is not ``<<`` or ``=``
+              (#5749); a pair is a plain key, ``: ``
               and an entry.  Commas separate entries and only ASCII spaces
               surround them; an empty entry and a trailing comma are refused
               (#5733).
@@ -78,8 +80,9 @@ ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
               one plain or simply quoted scalar (#5730); ``types`` may also be
               one plain word.  A plain item is never a form YAML 1.1 may read as
               other than a string: empty, a null or boolean word in any case, a
-              number or date, ``<<`` or ``=`` (#5734).  A filter key with neither is
-              refused: its YAML value is null, not a list (#5736).
+              number or date (#5734), ``<<`` or ``=`` (#5749).  A filter key with
+              neither a list nor a word is refused: its YAML value is null, not a
+              list (#5736).
 
 The reader is the Python standard library only (no PyYAML) so it runs on any CI
 image.  The mutation legs at the bottom prove the reader is not vacuous: each
@@ -182,11 +185,11 @@ class _Plain(str):
 def _typed_plain(text: str) -> bool:
     """True when YAML 1.1 may read the plain scalar as other than a string (#5734).
 
-    That is: empty, a null or YAML 1.1 boolean word in any case, a number or date
-    form, the merge key ``<<`` or the value key ``=``.
+    That is: a null or YAML 1.1 boolean word in any case, or a number or date
+    form.  An empty item, the merge key ``<<`` and the value key ``=`` are refused
+    before this check, wherever they stand (#5733, #5749).
     """
-    return (not text or text.lower() in YAML11_BOOLEANS + ("null", "~") or text in ("<<", "=")
-            or _NUMERIC_PLAIN.fullmatch(text) is not None)
+    return text.lower() in YAML11_BOOLEANS + ("null", "~") or _NUMERIC_PLAIN.fullmatch(text) is not None
 
 
 def _space_like(ch: str) -> bool:
@@ -257,7 +260,10 @@ def _flow_plain(s: str, j: int, key: bool) -> Tuple[int, str]:
         if not " " <= ch <= "~":
             raise Unparsed("non-ASCII or control character in a flow scalar (#5733): " + repr(s))
         k += 1
-    return k, _Plain(s[j:k].rstrip(" "))
+    text = s[j:k].rstrip(" ")
+    if text in ("<<", "="):
+        raise Unparsed("plain << or = (merge or value tag) in a flow collection (#5749): " + repr(s))
+    return k, _Plain(text)
 
 
 def _flow_node(s: str, j: int) -> Tuple[int, object]:
@@ -334,6 +340,8 @@ def _value(s: str, i: int) -> Tuple[str, bool]:
     plain = s[i:end].rstrip(" ")
     if ": " in plain or plain.endswith(":"):
         raise Unparsed("nested mapping on one row: " + repr(s))
+    if plain in ("<<", "="):
+        raise Unparsed("plain << or = (merge or value tag) as a value (#5749): " + repr(s))
     return s[:end].rstrip(" "), False
 
 
@@ -1734,16 +1742,22 @@ class TypedPlainItems5734(unittest.TestCase):
         got = violations("x.yml", text)
         self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
 
+    @staticmethod
+    def _why(word: str) -> str:
+        # << and = are refused wherever they stand, before the #5734 rule (#5749).
+        if word in ("<<", "="):
+            return "plain << or = (merge or value tag)"
+        return "plain scalar YAML 1.1 reads as other than a string"
+
     def test_5734_plain_block_items(self) -> None:
         for word in self.WORDS:
-            self._shape("on:\n  push:\n    branches: [main]\n    paths:\n      - " + word + "\n",
-                        "plain scalar YAML 1.1 reads as other than a string")
+            self._shape("on:\n  push:\n    branches: [main]\n    paths:\n      - " + word + "\n", self._why(word))
 
     def test_5734_plain_inline_items(self) -> None:
         # 1:20 is refused inside a flow collection by the #5733 colon rule.
         for word in (w for w in self.WORDS if ":" not in w):
             self._shape("on:\n  pull_request:\n    branches: [main, 'rehearsal/**', " + word + "]\n",
-                        "plain scalar YAML 1.1 reads as other than a string")
+                        self._why(word))
 
     def test_5734_plain_types_word(self) -> None:
         for word in ("on", "yes", "Null", "NO"):
@@ -1857,6 +1871,30 @@ class UnicodeSpaceIsText5748(unittest.TestCase):
     def test_5748_ascii_space_still_stripped(self) -> None:
         got = parse_triggers("on:\n  push:   ~  \n" + GOOD_PR + "    types:  opened  \n")
         self.assertEqual({"push": {}, "pull_request": {"branches": ["main", "rehearsal/**"], "types": ["opened"]}}, got)
+
+
+class MergeAndValueScalars5749(unittest.TestCase):
+    """#5749: a plain << or = is refused wherever it stands as a value or flow key.
+
+    Measured at 90a3f698 (round-4 differential, seed 5665, texts 4721 and 15559):
+    each refusal case here was accepted there.  PyYAML 6.0.1 resolves a plain << to
+    the merge tag and a plain = to the value tag; as a value either raises
+    ConstructorError, and {<<: {b: c}} merges to {b: c}.  Quoted, both are strings.
+    """
+
+    def _shape(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5749_plain_merge_or_value_scalar(self) -> None:
+        why = "plain << or = (merge or value tag)"
+        for tail in ("x: <<\n", "x: =\n", "x:\n  - a\n  - <<\n", "x:\n  - =\n", "x: [a, <<]\n",
+                     "x: {a: =}\n", "x: {<<: {b: c}}\n"):
+            self._shape("name: x\non:\n" + GOOD_PR + tail, why)
+
+    def test_5749_quoted_or_longer_forms_stay_clean(self) -> None:
+        for tail in ("x: '<<'\n", "x: \"=\"\n", "x: << b\n", "x: a=b\n", "x: [==, '<<']\n", "x:\n  =: y\n"):
+            self.assertEqual([], violations("x.yml", "name: x\non:\n" + GOOD_PR + tail), tail)
 
 
 class GlobSemantics5447(unittest.TestCase):
