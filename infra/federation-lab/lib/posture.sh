@@ -252,7 +252,10 @@ lab_posture_ssot_check() {
 # xtrace, functrace, errtrace or extdebug is on, or any function carries the trace attribute (read with builtin declare
 # -F; a failed read refuses): only those let caller code run INSIDE the guard and the subshell (a DEBUG or RETURN trap
 # runs inside a function only under functrace, extdebug or the trace attribute, an ERR trap only under errtrace, and PS4
-# is expanded before each command only under xtrace). An untraced trap runs only at the caller's own level.
+# is expanded before each command only under xtrace). An untraced trap does not run inside, but it does run at the
+# caller's own level, between run.sh's own probe lines, where it can rewrite LAB_PROBE_VERDICT: the guard cannot see that.
+# run.sh therefore refuses to start (#5740) when BASH_ENV or POSIXLY_CORRECT is set or a function is defined, and
+# lab_shell_state_proven refuses any trap, alias, option or attribute left behind by code that ran before line 1.
 # Covered (each is a self-test leg): a function, exported function, alias, `enable -n`, or `enable -n` with a PATH file
 # for every builtin row; a lying type or builtin; lying type and builtin together with a function named exec (posix mode
 # runs the builtin); a function named return, exit, local, set, shopt or any other neighbour; awk or bash by function,
@@ -260,7 +263,8 @@ lab_posture_ssot_check() {
 # BASH_ENV, ENV, exported SHELLOPTS and BASHOPTS; a relative path in either path table; eight IFS values; twelve shell
 # options; an alias for exec present while this file is sourced (the structural leg refuses the changed body); xtrace
 # (also with a PS4 that assigns), functrace, errtrace, extdebug and the trace attribute, each refused; DEBUG, RETURN and
-# ERR traps with none of those on, which never run inside; both #5663 reproducers.
+# ERR traps with none of those on, which never run inside (their effect at the caller's own level is what #5740 refuses
+# at start); both #5663 reproducers.
 # Not covered: a trap that runs before the guard's first check (bash runs a DEBUG trap before the command it traces, so
 # a trap written against the matcher's own steps, for example one that clears LAB_PROBE_WHY and sets the status, or a
 # RETURN trap that rewrites LAB_PROBE_VERDICT after lab_probe_verdict returns, is not stopped: no in-shell check can
@@ -335,9 +339,57 @@ lab_probe_body_allowed() {
   [ "$norm" = "$(${2:-lab_probe_expected_body})" ]
 }
 
+# lab_shell_state_proven <trap -p text> (#5740): run.sh calls this right after it sources its libraries, before it runs anything else.
+# It proves, positively, that run.sh's own shell is in the state a plain `bash run.sh` gives, because code that ran in this
+# shell before line 1 (a BASH_ENV file that unsets itself, for example) could have left a trap, alias or attribute that
+# rewrites a verdict at run.sh's own level, where the probe guard cannot see. True only when: the shell options are exactly
+# braceexpand:hashall:interactive-comments:nounset:pipefail (bash -p adds privileged); every shopt that is on is one bash
+# turns on by itself; every line of the trap list (read by run.sh at top level) is an inherited ignored signal; there is no alias, no disabled builtin and no hashed
+# path; IFS is space, tab, newline; and no variable carries an attribute other than array, associative array or export,
+# except bash's own (BASHOPTS, SHELLOPTS and BASH_VERSINFO readonly; EUID, PPID and UID readonly integer; BASHPID,
+# HISTCMD, OPTIND, RANDOM and SRANDOM integer). Each failed check, or a failed read, appends a reason to LAB_SHELL_WHY.
+lab_shell_state_proven() {
+  LAB_SHELL_WHY=""
+  local o rest line t
+  [[ $# == 1 ]] || LAB_SHELL_WHY="the trap list was not passed; "
+  o=":$SHELLOPTS:"; o=${o/:privileged:/:}
+  [[ $o == :braceexpand:hashall:interactive-comments:nounset:pipefail: ]] || LAB_SHELL_WHY="${LAB_SHELL_WHY}set -o is [$SHELLOPTS]; "
+  rest="$BASHOPTS:"
+  while [[ -n $rest ]]; do
+    o=${rest%%:*}; rest=${rest#*:}
+    case "$o" in
+      ''|checkwinsize|cmdhist|complete_fullquote|extquote|force_fignore|globasciiranges|globskipdots|hostcomplete) ;;
+      interactive_comments|patsub_replacement|progcomp|promptvars|sourcepath) ;;
+      *) LAB_SHELL_WHY="${LAB_SHELL_WHY}shopt $o is on; " ;;
+    esac
+  done
+  rest="${1-}"$'\n'
+  while [[ -n $rest ]]; do
+    line=${rest%%$'\n'*}; rest=${rest#*$'\n'}
+    [[ -z $line || $line =~ ^trap\ --\ \'\'\ SIG[A-Z0-9+-]+$ ]] || LAB_SHELL_WHY="${LAB_SHELL_WHY}a trap is set [$line]; "
+  done
+  t=$(builtin alias -p) && [[ -z $t ]] || LAB_SHELL_WHY="${LAB_SHELL_WHY}an alias is defined (or alias -p failed); "
+  t=$(builtin enable -n) && [[ -z $t ]] || LAB_SHELL_WHY="${LAB_SHELL_WHY}a builtin is disabled (or enable -n failed); "
+  t=$(builtin hash -l 2>&1) && [[ -z $t ]] || LAB_SHELL_WHY="${LAB_SHELL_WHY}a command path is hashed (or hash -l failed); "
+  [[ ${IFS-unset} == $' \t\n' ]] || LAB_SHELL_WHY="${LAB_SHELL_WHY}IFS is not space, tab, newline; "
+  t=$(builtin declare -p) || LAB_SHELL_WHY="${LAB_SHELL_WHY}declare -p failed; "
+  rest="$t"$'\n'
+  while [[ -n $rest ]]; do
+    line=${rest%%$'\n'*}; rest=${rest#*$'\n'}
+    [[ $line == 'declare -'* ]] || continue
+    line=${line#declare -}; o=${line%% *}; line=${line#* }; line=${line%%=*}
+    case "$o" in *[!aAx-]*) ;; *) continue ;; esac
+    case "$line:$o" in
+      BASHOPTS:r|SHELLOPTS:r|BASH_VERSINFO:ar|EUID:ir|PPID:ir|UID:ir|BASHPID:i|HISTCMD:i|OPTIND:i|RANDOM:i|SRANDOM:i) ;;
+      *) LAB_SHELL_WHY="${LAB_SHELL_WHY}$line carries attributes -$o; " ;;
+    esac
+  done
+  [[ -z $LAB_SHELL_WHY ]]
+}
+
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 205 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 199
+# 230 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 224
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), eight probe-matcher legs (lab_probe_refusal_names_knob against generated logs, each
 # checking the exact child status: 10, 11, or 4 for an unreadable log, #5662), three structural legs (the matcher body
@@ -361,8 +413,12 @@ lab_probe_body_allowed() {
 # run.sh pin and four run.sh branch legs (#5664: run.sh's own probe-verdict lines run with stub ok and no reach ok,
 # not-detected, and refused for a missing awk and a shadowed exec), a run.sh pin leg (run.sh turns on no trace route,
 # #5663), a probe-region pin, eleven probe-block legs and an attribute pin (#5739: run.sh's own probe region, run at top
-# level with stand-in state, fails the run whenever a verdict could not be written), and one layout leg (this comment sits
-# directly on the function).
+# level with stand-in state, fails the run whenever a verdict could not be written), twenty-five start-state legs (#5740:
+# run.sh --help from a clean environment: three controls (clean, an ignored SIGHUP, bash -p), refused for the F2 BASH_ENV
+# DEBUG trap, POSIXLY_CORRECT, a self-unsetting BASH_ENV that leaves a DEBUG, RETURN, ERR or EXIT trap, a readonly,
+# integer or nameref variable, an alias, a function, IFS, a disabled builtin or a hashed path, an exported SHELLOPTS or
+# BASHOPTS, and bash -x, -e, -T and -E, and two stated-limit legs, noexec and bash -t, that exit 0 with no output), and
+# one layout leg (this comment sits directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
   local root="$1" bad=0 rc name want v1 v2 v3 v4 vr1 vr2 vr3 vok
@@ -672,7 +728,8 @@ lab_posture_selftest() {
   done
   # #5663: caller code that runs INSIDE the guard and the subshell. A DEBUG or RETURN trap runs inside a function only under
   # functrace, extdebug or the function's trace attribute, an ERR trap only under errtrace, and PS4 is expanded before every
-  # command only under xtrace; each of those is refused. An untraced trap runs only at the caller's own level, never inside.
+  # command only under xtrace; each of those is refused. An untraced trap never runs inside, but runs at the caller's own
+  # level, which this matrix does not cover: run.sh refuses such a trap at start (#5740, the start-state legs below).
   _cell "xtrace (set -x)" refused 'set -x' || bad=1
   _cell "xtrace with a PS4 that assigns the matcher's status" refused 'PS4="\$((_lab_s=10))"; set -x' || bad=1
   _cell "functrace (set -T)" refused 'set -T' || bad=1
@@ -794,6 +851,46 @@ lab_posture_selftest() {
   if ( type() { echo builtin; }; builtin() { command builtin "$@"; }; lab_probe_refusal_names_knob "$plog/ok.log"; [ -n "$LAB_PROBE_WHY" ] ); then
     echo "  PASS shadow matrix: a refusal names the shadowed command in LAB_PROBE_WHY"
   else echo "  FAIL shadow matrix: a refusal left LAB_PROBE_WHY empty"; bad=1; fi
+  # #5740: run.sh --help started in a clean environment by "$BASH", with an optional BASH_ENV file, extra variables and bash
+  # flags. ok wants exit 0 and the usage text; refused wants a non-zero exit, a "refuses to start" line and no usage;
+  # silent pins a stated limit (bash runs nothing, or one command, and exits 0 with no output).
+  mkdir -p "$plog/start"
+  _start() {  # <label> <ok|refused|silent> <BASH_ENV file text or -> [VAR=value | -flag]...
+    local label=$1 want=$2 out envs=() flags=() a; shift 2
+    if [ "$1" != - ]; then printf '%s\n' "$1" > "$plog/start/be"; envs=(BASH_ENV="$plog/start/be"); fi; shift
+    for a in "$@"; do case $a in -*) flags+=("$a") ;; *) envs+=("$a") ;; esac; done
+    out="$(env -i PATH="$PATH" HOME="${HOME-}" "${envs[@]}" "$BASH" "${flags[@]}" "$runsh" --help 2>&1)"; rc=$?
+    case "$want:$rc" in
+      ok:0) [[ $out == *'usage: run.sh'* ]] && { echo "  PASS start state: $label (exit 0, usage)"; return 0; } ;;
+      silent:0) [[ -z $out ]] && { echo "  PASS start state: $label (exit 0, no output: a stated limit)"; return 0; } ;;
+      refused:0) ;;
+      refused:*) [[ $out == *'run.sh refuses to start'* && $out != *'usage: run.sh'* ]] && { echo "  PASS start state: $label (exit $rc, refused)"; return 0; } ;;
+    esac
+    echo "  FAIL start state: $label: exit $rc, wanted $want: $(printf '%s' "$out" | head -c 300)"; return 1
+  }
+  _start "a clean start runs (control)" ok - || bad=1
+  ( trap '' HUP; _start "an inherited ignored SIGHUP (nohup) runs" ok - ) || bad=1
+  _start "bash -p runs" ok - -p || bad=1
+  _start "a BASH_ENV untraced DEBUG trap that forges the verdict is refused (#5740 F2)" refused 'trap "[[ \$BASH_COMMAND == lab_probe_report* ]] && LAB_PROBE_VERDICT=detected; :" DEBUG' || bad=1
+  _start "POSIXLY_CORRECT is refused" refused - POSIXLY_CORRECT=1 || bad=1
+  local k
+  for k in DEBUG RETURN ERR EXIT; do
+    _start "a BASH_ENV that unsets itself and leaves a $k trap is refused" refused "unset BASH_ENV; trap ': x' $k" || bad=1
+  done
+  _start "a BASH_ENV that unsets itself and leaves a readonly variable is refused" refused 'unset BASH_ENV; readonly LAB_PROBE_VERDICT=detected' || bad=1
+  _start "a BASH_ENV that unsets itself and leaves an integer variable is refused" refused 'unset BASH_ENV; declare -i LAB_FAIL' || bad=1
+  _start "a BASH_ENV that unsets itself and leaves a nameref is refused" refused 'unset BASH_ENV; declare -n LAB_PROBE_VERDICT=PATH' || bad=1
+  _start "a BASH_ENV that unsets itself and leaves an alias is refused" refused 'unset BASH_ENV; shopt -s expand_aliases; alias ok=:' || bad=1
+  _start "a BASH_ENV that unsets itself and leaves a function is refused" refused 'unset BASH_ENV; lab_probe_report() { :; }' || bad=1
+  _start "a BASH_ENV that unsets itself and leaves IFS changed is refused" refused 'unset BASH_ENV; IFS=:' || bad=1
+  _start "a BASH_ENV that unsets itself and leaves a disabled builtin is refused" refused 'unset BASH_ENV; enable -n echo' || bad=1
+  _start "a BASH_ENV that unsets itself and leaves a hashed path is refused" refused 'unset BASH_ENV; hash -p /bin/true awk' || bad=1
+  _start "an exported SHELLOPTS=xtrace is refused" refused - SHELLOPTS=xtrace || bad=1
+  _start "an exported BASHOPTS=extglob is refused" refused - BASHOPTS=extglob || bad=1
+  for k in -x -e -T -E; do _start "bash $k is refused" refused - "$k" || bad=1; done
+  _start "an exported SHELLOPTS=noexec runs nothing" silent - SHELLOPTS=noexec || bad=1
+  _start "bash -t runs one command" silent - -t || bad=1
+  unset -f _start
   rm -rf "$plog"
   # #5198: the doc comment sits on the function it describes (a helper between them is drift).
   if [ "$(grep -B1 '^lab_posture_selftest() {' "${BASH_SOURCE[0]}" | head -n 1)" = "# Prints one line per leg; returns 0 only if every leg behaved." ]; then

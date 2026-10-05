@@ -29,6 +29,16 @@
 # v1.0.0 enterprise-federation certification scope is 500-1000 agents and at
 # most 50 peers; nothing here extends it.
 # =============================================================================
+# START STATE (#5740). A variable that makes bash run code in this shell before line 1 (BASH_ENV) or changes how it
+# parses (POSIXLY_CORRECT) is refused, as is any function already defined. Posix mode makes the refusal itself safe from
+# functions: the special builtins export and : are found before any function, and the ${..:?} expansion exits without a
+# command lookup. lab_shell_state_proven (lib/posture.sh) then proves the traps, aliases, options and attributes.
+_lab_pre="${BASH_ENV+BASH_ENV }${POSIXLY_CORRECT+POSIXLY_CORRECT }"
+POSIXLY_CORRECT=1
+_lab_pre="$_lab_pre$(builtin declare -F)"
+_lab_r=
+[[ -z $_lab_pre ]] || : "${_lab_r:?run.sh refuses to start (#5740): the start environment sets or defines [$_lab_pre]; unset each one (bash -p run.sh ignores an exported function)}"
+unset POSIXLY_CORRECT _lab_pre _lab_r
 set -uo pipefail
 
 LAB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,6 +49,12 @@ RUN="$LAB/run"
 source "$LAB/lib/common.sh"
 # shellcheck source=lib/posture.sh
 source "$LAB/lib/posture.sh"
+# #5740: refuse a shell whose traps, aliases, options or attributes are not the ones a plain bash run.sh gives.
+# bash lists a DEBUG, RETURN or ERR trap only to a top-level trap -p, so the list is read here and passed in. The verdict
+# is set only by the last command of a chain on its own line, so an abort or errexit anywhere in it reads as refused.
+_lab_ok=0
+_lab_traps=$(builtin trap -p) && lab_shell_state_proven "$_lab_traps" && _lab_ok=1
+case $_lab_ok in 1) ;; *) printf 'run.sh refuses to start (#5740): %s\n' "${LAB_SHELL_WHY:-the shell-state check did not complete}" >&2; exit 78 ;; esac
 
 # ── options ────────────────────────────────────────────────────────────────
 BIN="${BIN:-}"
