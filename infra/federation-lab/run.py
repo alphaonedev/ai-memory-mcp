@@ -2371,6 +2371,10 @@ def selftest_start_state(T, base):
          "import runpy, sys, types\nrunpy.run_path('/dev/null')\nsys.modules['re'] = types.ModuleType('re')\n"
          "sys.argv = [%r, '--help']\n"
          "runpy.run_path(%r, run_name='__main__')\n", "module re loaded from outside"),
+        ("bar-c: a module posing as built-in under another name (re in sys.modules) is refused before any import",
+         "import importlib.machinery, runpy, sys, types\nrunpy.run_path('/dev/null')\nm = types.ModuleType('re')\n"
+         "m.__spec__ = importlib.machinery.ModuleSpec('not_re', None, origin='built-in')\nsys.modules['re'] = m\n"
+         "sys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n", "module re loaded from outside"),
         ("bar-c: an import hook added before the file runs is refused",
          "import runpy, sys\nclass F:\n    @staticmethod\n    def find_spec(*a):\n        return None\nsys.meta_path.insert(0, F)\n"
          "sys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n", "sys.meta_path"),
