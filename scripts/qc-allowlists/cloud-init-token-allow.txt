@@ -359,7 +359,7 @@ do-hive | /usr/local/sbin/ai-memory-provision.sh | fi
 do-hive | /usr/local/sbin/ai-memory-provision.sh | unset NEW_HEX
 do-hive | /usr/local/sbin/ai-memory-provision.sh | fi
 do-hive | /usr/local/sbin/ai-memory-provision.sh | CUR="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
-do-hive | /usr/local/sbin/ai-memory-provision.sh | if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ]; then
+do-hive | /usr/local/sbin/ai-memory-provision.sh | if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ] || [[ "$CUR" == *[[:space:]]* ]]; then
 do-hive | /usr/local/sbin/ai-memory-provision.sh | echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1
 do-hive | /usr/local/sbin/ai-memory-provision.sh | fi
 do-hive | /usr/local/sbin/ai-memory-provision.sh | chown aimemory:aimemory /etc/ai-memory/store-url

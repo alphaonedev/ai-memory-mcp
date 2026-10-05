@@ -515,8 +515,9 @@ write_files:
         unset NEW_HEX
       fi
       # Fail closed: the shipped placeholder must never reach a running node.
+      # More than one URL line leaves CUR holding a newline: that is refused too (#5521).
       CUR="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
-      if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ]; then
+      if [ -z "$CUR" ] || [ "$CUR" = CHANGEME ] || [[ "$CUR" == *[[:space:]]* ]]; then
         echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1
       fi
       chown aimemory:aimemory /etc/ai-memory/store-url

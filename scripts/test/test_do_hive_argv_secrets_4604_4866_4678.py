@@ -80,6 +80,9 @@ def mint_block():
     return None if not m else m.group(0).replace("$${", "${")
 
 
+PLACEHOLDER_URL = "postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full\n"
+
+
 def f4_sed():
     """#5428: the rotation reads the store-url with fixed sed -n, writes it with the bash printf builtin, and the
     new secret is on no argv. CHANGEME is replaced, a rotated file is unchanged, an empty or non-URL file is minted."""
@@ -98,6 +101,10 @@ def f4_sed():
         # or nothing must make the block exit 1 and leave no running node with a placeholder password.
         ("a mint that yields the placeholder is refused", "garbage\n", "refuse:CHANGEME"),
         ("a mint that yields nothing is refused", "garbage\n", "refuse:"),
+        # #5521: a file with more than one URL line is undecidable, so it is refused, never kept or half-minted.
+        ("two placeholder lines are refused", PLACEHOLDER_URL + PLACEHOLDER_URL, "refuse:" + SECRET),
+        ("a placeholder line after a rotated line is refused", "postgres://aimemory:abc123@h/x\n" + PLACEHOLDER_URL, "refuse:" + SECRET),
+        ("two rotated lines are refused", "postgres://aimemory:abc123@h/x\npostgres://aimemory:def456@h/x\n", "refuse:" + SECRET),
     ]
     for label, start, want in cases:
         with tempfile.TemporaryDirectory(dir=str(ROOT / ".local-runs")) as t:
