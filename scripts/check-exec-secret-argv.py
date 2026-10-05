@@ -1087,6 +1087,48 @@ def allow_added_in_pending_file(allow: List[Entry], base_allow: List[Entry], bas
             for e in allow if e[1] in frozen and e[2] > had.get((e[1], e[3]), 0)]
 
 
+HISTORY_REMEDY = ("fetch full history (git fetch --unshallow, or actions/checkout with fetch-depth: 0) "
+                  "and run the gate again (#5299)")
+
+
+def removed_pending_rows(root: Path) -> Dict[str, str]:
+    """text -> short sha of a commit that removed a pending row with that text, over the whole history
+    of the pending list (renames of the list followed). Fail closed (#5299): a shallow clone, a git
+    failure, or a list that exists at HEAD but has no history is a RuntimeError, never an empty answer."""
+    if _git(root, "rev-parse", "--is-shallow-repository").strip() != "false":
+        raise RuntimeError("the history of %s is incomplete (shallow clone): %s" % (PENDING_FILE, HISTORY_REMEDY))
+    try:
+        log = _git(root, "log", "--follow", "-M", "-p", "-U0", "--no-color", "--format=commit %h", "--",
+                   PENDING_FILE)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError("cannot read the history of %s (%s): %s" % (
+            PENDING_FILE, exc.stderr.decode("utf-8", "replace").strip()[:120], HISTORY_REMEDY))
+    gone: Dict[str, str] = {}
+    sha = ""
+    commits = 0
+    for raw in log.split("\n"):
+        if raw.startswith("commit "):
+            sha, commits = raw[7:].strip(), commits + 1
+        elif raw.startswith("-#"):
+            parts = raw[1:].split(" | ", 3)
+            if len(parts) == 4 and parts[3] == norm(parts[3]):
+                gone.setdefault(parts[3], sha)
+    if commits == 0 and (root / PENDING_FILE).is_file():
+        raise RuntimeError("the history of %s is empty although the file exists: %s" % (PENDING_FILE, HISTORY_REMEDY))
+    return gone
+
+
+def allow_text_once_pending(allow: List[Entry], base_allow: List[Entry], renames: Dict[str, str],
+                            gone: Dict[str, str]) -> List[str]:
+    """#5299 (5-agent vote 4d3ea1c5): a new or raised allow entry may not carry the exact text of a
+    pending row that an earlier change removed. The merge base is a real ancestor that no longer has
+    the row, so only the history can see it. A respelling is not caught here: #4929 Part 1."""
+    had = {(renames.get(e[1], e[1]), e[3]): e[2] for e in base_allow}
+    return ["allow:%d: entry carries the text of a pending row removed in commit %s (change the line, not "
+            "the list; #5299): %s: %s" % (e[4], gone[e[3]], e[1], e[3][:80])
+            for e in allow if e[3] in gone and e[2] > had.get((e[1], e[3]), 0)]
+
+
 def base_ref() -> str:
     """The base named by EXEC_SECRET_ARGV_BASE (any ref) or GITHUB_BASE_REF (a pull request); empty
     when none is named."""
@@ -1115,7 +1157,7 @@ def base_state(root: Path, ref: str) -> Tuple[str, Dict[str, str], List[Entry], 
 
 
 def merge_base_hits(root: Path, allow: List[Entry], pend: Optional[List[Entry]] = None) -> Optional[List[str]]:
-    """Run the merge-base rules (#4919, #4996, #5103, #5298) against the base named by
+    """Run the merge-base rules (#4919, #4996, #5103, #5298, #5299) against the base named by
     EXEC_SECRET_ARGV_BASE (any ref) or GITHUB_BASE_REF (a pull request). Unresolved means red:
     in CI a missing base, or a named base that cannot be resolved, is a FAULT (fail closed).
     Outside CI with no base named, returns None: the rule was not evaluated, and run() says so."""
@@ -1130,6 +1172,7 @@ def merge_base_hits(root: Path, allow: List[Entry], pend: Optional[List[Entry]] 
     hits.extend(allow_like_vanished_pending(allow, base_allow, base_pend, pend or []))
     hits.extend(allow_text_pending_elsewhere(allow, base_allow, base_pend, pend or [], renames))
     hits.extend(allow_added_in_pending_file(allow, base_allow, base_pend, renames))
+    hits.extend(allow_text_once_pending(allow, base_allow, renames, removed_pending_rows(root)))
     return hits
 
 
@@ -1765,6 +1808,96 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
         if rc != 0:
             bad.append("run() judged an unchanged allow entry again in a renamed frozen file (%d): %s"
                        % (rc, out.strip()[:160]))
+        # #5299 (5-agent vote 4d3ea1c5): a pending row that an earlier change removed may not come back
+        # as an allow entry with its exact text; the merge base no longer has the row, only history does
+        from_base2("hist fix")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n" % ok_line)
+        rows([("a.sh", ok_line), ("c.sh", pl)], [])
+        commit_all("the pending row is removed with a real fix")
+        hist_base = "refs/remotes/origin/self-test-hist"
+        git("update-ref", hist_base, "HEAD")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n" % (ok_line, pl))
+        rows([("a.sh", ok_line), ("c.sh", pl), ("a.sh", pl)], [])
+        commit_all("the removed pending text comes back as an allow entry")
+        rc, out = gate(EXEC_SECRET_ARGV_BASE=hist_base)
+        if rc != 1 or "removed in commit" not in out:
+            bad.append("run() let the exact text of a removed pending row back in as an allow entry "
+                       "(%d): %s" % (rc, out.strip()[:160]))
+        # ... an unrelated new allow entry is green
+        git("reset", "-q", "--hard", hist_base)
+        (t / "d.sh").write_text("#!/bin/bash\n%s\n" % nl)
+        rows([("a.sh", ok_line), ("c.sh", pl), ("d.sh", nl)], [])
+        commit_all("an unrelated allow entry")
+        rc, out = gate(EXEC_SECRET_ARGV_BASE=hist_base)
+        if rc != 0:
+            bad.append("run() refused an allow entry unrelated to any removed pending row (%d): %s"
+                       % (rc, out.strip()[:160]))
+        # ... an entry whose text was pending once, unchanged except that its file was renamed, is not judged again
+        git("reset", "-q", "--hard", hist_base)
+        git("mv", "c.sh", "e.sh")
+        rows([("a.sh", ok_line), ("e.sh", pl)], [])
+        commit_all("a renamed file keeps an allow entry whose text was pending once")
+        rc, out = gate(EXEC_SECRET_ARGV_BASE=hist_base)
+        if rc != 0:
+            bad.append("run() judged an unchanged allow entry again after its file was renamed (%d): %s"
+                       % (rc, out.strip()[:160]))
+        # ... a shallow clone cannot answer, so the run is red and says how to fetch the history
+        shallow = t.parent / (t.name + "-shallow")
+        shutil.rmtree(str(shallow), ignore_errors=True)
+        subprocess.run(["git", "clone", "-q", "--depth", "1", "file://" + str(t), str(shallow)],
+                       check=True, capture_output=True)
+        shutil.copy(str(root / DENYLIST), str(shallow / DENYLIST))
+        shutil.copy(str(root / "scripts" / "check-exec-secret-argv.py"), str(shallow / "scripts"))
+        cases[0] += 1
+        for k in keys:
+            os.environ.pop(k, None)
+        os.environ["EXEC_SECRET_ARGV_BASE"] = "HEAD"
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out), contextlib.redirect_stdout(out):
+            rc = run(shallow)
+        if rc != 2 or "shallow" not in out.getvalue() or "fetch" not in out.getvalue():
+            bad.append("run() passed or gave no remedy on a shallow clone (%d): %s" % (rc, out.getvalue().strip()[:160]))
+        shutil.rmtree(str(shallow), ignore_errors=True)
+        # the scan itself: the list renamed between two paths is followed, and a list with no history is a fault
+        hist = t.parent / (t.name + "-hist")
+        shutil.rmtree(str(hist), ignore_errors=True)
+        hist.mkdir(parents=True)
+
+        def h(*a: str) -> None:
+            subprocess.run(["git", "-C", str(hist), "-c", "user.name=self-test", "-c", "user.email=self-test@invalid",
+                            "-c", "commit.gpgsign=false"] + list(a), check=True, capture_output=True)
+
+        h("init", "-q")
+        (hist / "README").write_text("x\n")
+        (hist / "old-pending.txt").write_text("".join("#1 | a%d.sh | 1 | %s%d\n" % (i, pl, i) for i in range(4)))
+        h("add", "-A")
+        h("commit", "-q", "-m", "one")
+        (hist / "old-pending.txt").write_text("".join("#1 | a%d.sh | 1 | %s%d\n" % (i, pl, i) for i in range(1, 4)))
+        h("commit", "-q", "-a", "-m", "two")
+        (hist / PENDING_FILE).parent.mkdir(parents=True, exist_ok=True)
+        h("mv", "old-pending.txt", PENDING_FILE)
+        h("commit", "-q", "-m", "three")
+        cases[0] += 1
+        try:
+            gone = removed_pending_rows(hist)
+        except RuntimeError as exc:
+            gone = {}
+            bad.append("the history scan faulted on a renamed list (%s)" % exc)
+        if pl + "0" not in gone or pl + "1" in gone:
+            bad.append("the history scan did not follow the renamed list or named a kept row (%s)" % sorted(gone))
+        cases[0] += 1
+        shutil.rmtree(str(hist / ".git"))
+        h("init", "-q")
+        (hist / "README").write_text("x\n")
+        h("add", "README")
+        h("commit", "-q", "-m", "no history for the list")
+        try:
+            removed_pending_rows(hist)
+            bad.append("a list with no history was an empty answer, not a fault (#5299)")
+        except RuntimeError as exc:
+            if "empty" not in str(exc):
+                bad.append("a list with no history faulted with the wrong message (%s)" % exc)
+        shutil.rmtree(str(hist), ignore_errors=True)
         # regen main(): a pending row pruned from the working tree but committed at HEAD is still
         # refused for allow by --accept-new (#4996), through the real argument path
         from_base2("regen")
