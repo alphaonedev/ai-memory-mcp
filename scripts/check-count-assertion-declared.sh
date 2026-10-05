@@ -237,8 +237,9 @@ def read_cond(arg):
     return AMBIG if CMP.search(arg) else None
 
 
-# A const-shaped name (NAME, a::NAME) anywhere in an ambiguous assert!'s first argument.
-NAMES = re.compile(r'(?<![A-Za-z0-9_:])(?P<path>(?:[A-Za-z_][A-Za-z0-9_]*::)*)(?P<name>[A-Z][A-Z0-9_]*)(?![A-Za-z0-9_])')
+# A const-shaped name (NAME, a::NAME, <T as Tr>::NAME) anywhere in an ambiguous assert!'s first argument; a name right
+# after `::` is qualified even when no path word precedes it.
+NAMES = re.compile(r'(?<![A-Za-z0-9_])(?P<path>(?:[A-Za-z_][A-Za-z0-9_]*::)*)(?P<name>[A-Z][A-Z0-9_]*)(?![A-Za-z0-9_])')
 
 
 def named(consts, name, qualified):
@@ -272,7 +273,7 @@ def extract(text):
                 key = re.sub(r'\s+', '', first)
                 out.setdefault(key, set()).add(AMBIG)
                 for nm in NAMES.finditer(first):          # and every const it names, so a bump of one moves it
-                    out.setdefault(f"{key} [{nm.group('name')}]", set()).add(named(consts, nm.group('name'), nm.group('path')))
+                    out.setdefault(f"{key} [{nm.group('name')}]", set()).add(named(consts, nm.group('name'), nm.group('path') or first[:nm.start()].endswith('::')))
                 continue
             got, rhs = got[:2], got[2]
         expr = re.sub(r'\s+', '', got[0]) + '.' + got[1] + '()'
@@ -929,6 +930,9 @@ def selftest():
     case('a path-qualified const in an ambiguous assert! is resolved over the tree, not to a same-named local const',
          shared('const EXPECTED_N: usize = 5;\nfn u(v: &[u8], k: usize) { assert!(k > 0 && v.len() == crate::EXPECTED_N); }\n', L(18), L(19)), True,
          ['k>0&&v.len()==crate::EXPECTED_N [EXPECTED_N]  ?EXPECTED_N#ambiguous(18,5) -> ?EXPECTED_N#ambiguous(19,5)'])
+    case('a const named through <T as Tr>:: in an ambiguous assert! is tracked and resolved over the tree',
+         shared('const EXPECTED_N: usize = 5;\nfn u(v: &[u8], k: usize) { assert!(k > 0 && v.len() == <S as Tr>::EXPECTED_N); }\n', L(18), L(19)), True,
+         ['k>0&&v.len()==<SasTr>::EXPECTED_N [EXPECTED_N]  ?EXPECTED_N#ambiguous(18,5) -> ?EXPECTED_N#ambiguous(19,5)'])
     # ---- end #5759 ----
     case('a .rs file under benches/ is not checked', scoped('benches/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
     case('a non-.rs file under tests/ is not checked', scoped('tests/scope.txt', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
