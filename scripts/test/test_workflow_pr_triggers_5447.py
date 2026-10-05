@@ -2406,6 +2406,22 @@ class ClosedWorldPattern5943(unittest.TestCase):
         self.assertFalse(filter_matches(["a", "!a"], "a"))
         self.assertTrue(filter_matches(["!a", "a"], "a"))
 
+    def test_5943_text_after_a_star_is_still_matched(self) -> None:
+        # Mutation M08 of round 7 (skip one character after '*') survived the
+        # tests above: no pattern had a literal after a single '*'.
+        self.assertTrue(glob_match("rehearsal/*-wip", "rehearsal/audit-wip"))
+        self.assertFalse(glob_match("rehearsal/*-wip", "rehearsal/audit_wip"))
+        self.assertFalse(glob_match("a*b", "axxc"))
+        self.assertTrue(glob_match("a**b", "a/x/b"))
+        self.assertFalse(glob_match("a**b", "a/x/c"))
+
+    def test_5943_filter_matches_refuses_a_double_negation(self) -> None:
+        # Mutation M38 of round 7 (strip every leading '!') survived: '!!x' must
+        # stay refused in filter_matches itself, not only through violations().
+        for items in (["!!main"], ["main", "!!main"], ["!!"]):
+            with self.assertRaises(Unparsed, msg=items):
+                filter_matches(items, "main")
+
     def test_5943_each_reproducer_refused_where_github_excludes_the_carrier(self) -> None:
         # Under the documented reading each of these excludes the carrier; the
         # checker must refuse, never pass.
