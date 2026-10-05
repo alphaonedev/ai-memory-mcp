@@ -22,8 +22,9 @@
 # falsifiable by a reader in one grep, while a wrong ANCHOR sends the
 # reader to the wrong place and then makes them doubt the rest.
 #
-# SIX RULES, all conservative, all keyed on PATH-QUALIFIED grammar so
-# a bare backticked identifier in prose is never guessed at:
+# SIX CHECKING RULES, all conservative, all keyed on PATH-QUALIFIED
+# grammar so a bare backticked identifier in prose is never guessed at,
+# and four REFUSALS (below) for what the gate cannot decide (#5680):
 #
 #   PATH   — a cited `src/<path>.rs` must EXIST. This is what caught the
 #            pre-modularisation `src/handlers.rs` / `src/mcp.rs` /
@@ -45,16 +46,20 @@
 #            form is checked too (reported as BARE_QUAL, #5191), and a
 #            qualified anchor never gets the absent-path exemption: it
 #            asserts the file exists (#5201).
-#            Self types and closers (#5457, #5493, #5498, #5530-#5537): the
-#            type and every bound of `<dyn A + B>::m`, `<&mut T>::m` or a lone
-#            `<*const T>` are checked (only `?Sized` is skipped) and a self
+#            Self types and closers (#5457, #5493, #5498, #5530-#5537,
+#            #5608-#5612): the type and every bound of `<dyn A + B>::m`,
+#            `<A + B>::m`, `<&mut T>::m` or a lone `<*const T>` are checked
+#            (only `?Sized` and a `use<..>` bound are skipped) and a self
 #            type naming no type is refused; a closer after the anchor's own
-#            group (attached, spaced, or an entity) is reported; a `<` that
-#            is a whitespace-delimited operator token (`a < b`, `a << b`,
-#            `a <- b`) opens no prose group. The turbofish spellings
+#            group (attached, spaced, or an entity) is reported; whitespace
+#            before or after any `::` is followed (#5609). A prose `<` opens
+#            a group only when a type provably follows it; a closed code
+#            span before the anchor is atomic text (#5608). The turbofish spellings
 #            `Vec::<src/x.rs::T>::new`, `Arc<src/x.rs::T>::clone` and
 #            `HashMap<u8, src/x.rs::T>::NoSuch` are all reported (fail
 #            closed: the name after the closer may belong to Vec or Arc).
+#   BARE_QUAL — the QUAL check on an UNBACKTICKED anchor (#5191),
+#            reported under its own name; it is part of QUAL, not a seventh rule.
 #   BARE_LN — (#4651) a BARE `src/<path>.rs:<N>` (no backtick: prose, a
 #            link label, HTML text) is a finding unless it labels a
 #            commit-pinned permalink (`/blob/<hex sha>/`, immutable).
@@ -73,6 +78,17 @@
 #            not) (#5269, #5343).
 #   LADDER_TIP — a claimed end of the migration ladder
 #            (`migrate_vNN`) must be the real tip.
+#
+# REFUSALS. Where the gate cannot positively read an anchor it refuses
+# it rather than pass it (fail closed, #5680):
+#   UNDECIDABLE_REF — the anchor's character references decode
+#            differently in CommonMark and HTML (#5606).
+#   UNDECIDABLE_LT — a prose `<` before it may or may not open a group,
+#            and the anchor is judged differently either way (#5608).
+#   UNMODELLED — a self type the gate cannot read, or any Rust keyword
+#            in a checked path (#5610, #5611).
+#   SETUP  — the gate cannot do its job: a doc or source file in the
+#            checked set cannot be read (#5616), or src/ has no Rust file.
 #
 # PATH FORMS. Before any rule runs, a `src/<path>.rs` token is
 # normalised (#4699/#4701): any leading ./ and ../ segments are stripped
@@ -1087,6 +1103,25 @@ sys.exit(0 if ok else 1)
 PYEOF
         echo "PASS: self-test #5497 — the header and CLAUDE.md name \"$wording\""
     done
+
+    # #5680: every rule the gate can print has a line of its own in the
+    # header (a rule name at the start of a header rule line), so a rule
+    # added to the engine without one fails here. The rule set is read from
+    # the detail table and every literal rule the engine emits or prints.
+    python3 - "$SELF" <<'PYEOF' || { echo "FAIL: self-test #5680 — a rule the gate can print has no header line" >&2; exit 1; }
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+head, body = src.split("\nset -", 1)
+rules = set(re.findall(r"(?m)^ +([A-Z][A-Z_]+)\) +detail=", body))
+rules |= set(re.findall(r'emit\("([A-Z][A-Z_]+)"', body))
+rules |= set(re.findall(r'print\(f?"([A-Z][A-Z_]+)\\t', body))
+named = set(re.findall(r"(?m)^#   ([A-Z][A-Z_]+) +—", head))
+missing = sorted(rules - named)
+if len(rules) < 11 or missing:
+    print("missing from the header:", missing, "rules seen:", sorted(rules), file=sys.stderr)
+    sys.exit(1)
+PYEOF
+    echo "PASS: self-test #5680 — every rule the gate can print has a header line"
 
     # #5615: a changelog entry for this gate states what is decoded, refused
     # and unmodelled, not a closure the code does not have. The entry is read
