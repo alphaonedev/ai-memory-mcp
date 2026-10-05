@@ -903,6 +903,32 @@ def selftest():
              [(k_ % 18) + '  ?count#ambiguous -> (none)', (k_ % 19) + '  (none) -> ?count#ambiguous'])
     case('an assert! with a closure count comparison that is not == is not read',
          scoped('tests/scope.rs', 'fn t() { assert!(v.iter().all(|x| x.len() > 2)); }\n', 'fn t() { assert!(v.iter().all(|x| x.len() > 3)); }\n'), False)
+    # #5761 (S2): which comparison an assert! binds to is pinned: only ONE == outside every bracket ((), [] and {}) binds
+    case('an inner comparison in the RIGHT operand does not bind: the left count is the assertion',
+         scoped('tests/scope.rs', 'fn t() { assert!(items.len() == v.iter().filter(|x| x.len() == 2).count()); }\n',
+                'fn t() { assert!(items.len() == v.iter().filter(|x| x.len() == 3).count()); }\n'), True,
+         ['items.len()  ?v.iter().filter(|x|x.len()==2).count() -> ?v.iter().filter(|x|x.len()==3).count()'])
+    case('two == outside every bracket are ambiguous (not bound to the first)',
+         scoped('tests/scope.rs', 'fn t() { assert!(items.len() == 18 == ok); }\n', 'fn t() { assert!(items.len() == 19 == ok); }\n'), True,
+         ['items.len()==18==ok  ?count#ambiguous -> (none)', 'items.len()==19==ok  (none) -> ?count#ambiguous'])
+    case('two == outside every bracket are ambiguous (not bound to the last)',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok == items.len() == 18); }\n', 'fn t() { assert!(ok == items.len() == 19); }\n'), True,
+         ['ok==items.len()==18  ?count#ambiguous -> (none)', 'ok==items.len()==19  (none) -> ?count#ambiguous'])
+    case('a == inside braces (a struct literal) is inside a bracket and does not bind',
+         scoped('tests/scope.rs', 'fn t() { assert!(S { a: k == 1 }.n.len() == 3); }\n', 'fn t() { assert!(S { a: k == 1 }.n.len() == 4); }\n'), True,
+         ['S{a:k==1}.n.len()  3 -> 4'])
+    case('a closure outside every bracket makes the assert! ambiguous',
+         scoped('tests/scope.rs', 'fn t() { assert!(|x: &[u8]| x.len() == 18); }\n', 'fn t() { assert!(|x: &[u8]| x.len() == 19); }\n'), True,
+         ['|x:&[u8]|x.len()==18  ?count#ambiguous -> (none)'])
+    case('assert_eq! with two inner .len() calls binds to the outer count',
+         scoped('tests/scope.rs', 'fn t() { assert_eq!(v.iter().filter(|x| x.len() == w.len()).count(), 3); }\n',
+                'fn t() { assert_eq!(v.iter().filter(|x| x.len() == w.len()).count(), 4); }\n'), True, ['v.iter().filter(|x|x.len()==w.len()).count()  3 -> 4'])
+    case('assert_eq! with a parenthesised receiver is read', scoped('tests/scope.rs', 'fn t() { assert_eq!((items).len(), 18); }\n', 'fn t() { assert_eq!((items).len(), 19); }\n'), True, ['(items).len()  18 -> 19'])
+    case('an ambiguous assert! whose closure compares a .count() is flagged when it appears',
+         scoped('tests/scope.rs', 'fn t() {}\n', 'fn t() { assert!(v.iter().any(|x| x.chars().count() == 2)); }\n'), True, ['v.iter().any(|x|x.chars().count()==2)  (none) -> ?count#ambiguous'])
+    case('a path-qualified const in an ambiguous assert! is resolved over the tree, not to a same-named local const',
+         shared('const EXPECTED_N: usize = 5;\nfn u(v: &[u8], k: usize) { assert!(k > 0 && v.len() == crate::EXPECTED_N); }\n', L(18), L(19)), True,
+         ['k>0&&v.len()==crate::EXPECTED_N [EXPECTED_N]  ?EXPECTED_N#ambiguous(18,5) -> ?EXPECTED_N#ambiguous(19,5)'])
     # ---- end #5759 ----
     case('a .rs file under benches/ is not checked', scoped('benches/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
     case('a non-.rs file under tests/ is not checked', scoped('tests/scope.txt', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
