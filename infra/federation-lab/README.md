@@ -108,8 +108,8 @@ they never load or download an embedding model.
 
 Run it as `./run.py` or as `python3 -I -S run.py`. The first line of `run.py` is
 `#!/usr/bin/env -S python3 -I -S`. `./run.py` needs an `env` that supports `-S`
-(GNU coreutils 8.30 or later, or the BSD and macOS `env`); on an older `env` or
-busybox the start fails with an `env` error and no lab verdict, so start it as
+(GNU coreutils 8.30 or later, or the BSD and macOS `env`); on an `env` without `-S` the
+start fails with an `env` error and no lab verdict, so start it as
 `python3 -I -S run.py` there. The first line is only a comment to the
 interpreter, so a plain `python3 run.py` does not read it: it is refused with
 exit `78` (without `-I` the interpreter reads `PYTHON*` variables and the user
