@@ -1357,6 +1357,8 @@ PYEOF
         "See \`Vec<$R::RecallTool<T>>\` here."
     anchor_green 5608 "a prose generic with a lifetime argument before the anchor" \
         "See Vec<'a, $R::RecallTool<T>> here."
+    anchor_green 5608 "a prose generic whose argument is a reference type" \
+        "See x<&y and $R::RecallTool<T>> here."
 
     # #5609: whitespace before or after `::` continues a path, as Rust
     # reads it; it never ends the anchor before a missing component.
