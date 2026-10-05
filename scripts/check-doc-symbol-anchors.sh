@@ -1174,6 +1174,8 @@ sys.exit(0 if ok else 1)
 PYEOF
         echo "PASS: self-test #$1 — the changelog entry names \"$2\" and not \"$3\""
     }
+    # #5766: the 5530 entry names no mutant the script cannot have.
+    changelog_wording 5530 "gains 4 cases (#5530)." "width-guard"
     changelog_wording 5531 "refused as \`UNDECIDABLE_LT\` (#5608)" "whitespace entities are read as whitespace"
     # #5617: the #5532 entry no longer overstates the fix.
     changelog_wording 5532 "checked from #5610" "every bound of a trait-object or impl self type"
