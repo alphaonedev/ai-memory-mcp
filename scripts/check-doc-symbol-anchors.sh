@@ -1713,6 +1713,8 @@ PYEOF
         "$R::RecallTool::*" "See \`$R::{decorate_memory_many, RecallTool::*}\`."
     anchor_red_cites 5779 UNMODELLED "an empty brace item" \
         "$R::{RecallTool,,NoSuch}" "See \`$R::{RecallTool, , NoSuch}\`."
+    anchor_red_cites 5779 UNMODELLED "an empty first item in a nested brace list" \
+        "$R::RecallTool::{,RecallTool}" "See \`$R::RecallTool::{,RecallTool}\`."
     anchor_red_cites 5779 UNMODELLED "a path after a brace list" \
         "$R::{RecallTool,decorate_memory_many}::NoSuch" "See \`$R::{RecallTool, decorate_memory_many}::NoSuch\`."
     anchor_green 5779 "an elision brace item" "See \`$R::{RecallTool, …}\`."
