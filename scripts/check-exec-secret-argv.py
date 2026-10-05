@@ -2134,6 +2134,7 @@ ROUND3_RED = [
     ('5821 substitution pin: reported 4: a substitution inside a sh -c payload', 'sh -c "$(which mysql) -p$X"'),
     ('5821 substitution pin: reported 5: an escaped substitution in an ssh payload runs on the far side', 'ssh h "sudo \\$(which mysql) -p$X"'),
     ('5821 substitution pin: reported 6: nested substitutions', '$(realpath $(command -v mysql)) -p"$X"'),
+    ('5869 mutant pin: reported 1: a substitution right after a pipe is a command word', 'printf x|$(command -v mysql) -uroot -p"$X"'),
     ('5867 mutant pin: reported 1: a parenthesis closed before the head does not end the substitution', '$( (true); command -v mysql) -uroot -p"$X"'),
     ('5866 mutant pin: reported 1: a parenthesis opened after the head nests', '$(command -v mysql || (echo none)) -uroot -p"$X"'),
     ('5865 mutant pin: reported 1: a plain parenthesis opened before the head nests', '$( (command -v mysql) ) -uroot -p"$X"'),
