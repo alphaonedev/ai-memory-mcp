@@ -253,7 +253,10 @@ def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[s
             if items:
                 raise Unparsed(trigger + "." + key + ": mixed inline and block list")
             if key == "types" and not rest.startswith("["):
-                items = [_unquote(rest)]
+                word = _unquote(rest)
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", word):
+                    raise Unparsed(trigger + ".types: scalar is not one plain word (#5669): " + rest)
+                items = [word]
             else:
                 items = _parse_inline_list(rest)
         filters[key] = items
@@ -880,6 +883,36 @@ class TopLevelShapes5668(unittest.TestCase):
 
     def test_5668_block_scalar_value_stays_clean(self) -> None:
         self.assertEqual([], violations("x.yml", "name: |\n  text\n" + self._base()[len("name: x\n"):]))
+
+
+class TypesScalar5669(unittest.TestCase):
+    """#5669: a scalar after types: must be one plain or quoted word, else Unparsed."""
+
+    def _pr(self, types_line: str) -> str:
+        return _with_on_block(GOOD_PUSH + GOOD_PR + "    " + types_line + "\n")
+
+    def _shape(self, types_line: str) -> None:
+        got = violations("x.yml", self._pr(types_line))
+        self.assertTrue(any("R-SHAPE" in v for v in got), (types_line, got))
+
+    def test_5669_plain_and_quoted_words_stay_clean(self) -> None:
+        for line in ("types: opened", "types: 'opened'", 'types: "synchronize"', "types: [opened, closed]"):
+            self.assertEqual([], violations("x.yml", self._pr(line)), line)
+
+    def test_5669_block_scalar_indicators(self) -> None:
+        for line in ("types: |", "types: >", "types: |-", "types: >+"):
+            self._shape(line)
+
+    def test_5669_anchor_alias_tag(self) -> None:
+        for line in ("types: &a", "types: &a opened", "types: *a", "types: !!str opened"):
+            self._shape(line)
+
+    def test_5669_flow_mapping(self) -> None:
+        self._shape("types: {a: b}")
+
+    def test_5669_unbalanced_or_spaced_scalar(self) -> None:
+        for line in ("types: 'opened", 'types: opened"', "types: opened closed", "types: -"):
+            self._shape(line)
 
 
 class GlobSemantics5447(unittest.TestCase):
