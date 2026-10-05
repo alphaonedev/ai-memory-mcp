@@ -133,9 +133,31 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
     return rows
 
 
+TOP_KEY = re.compile(r"""^("[^"\\]*"|'[^']*'|[A-Za-z_][A-Za-z0-9_-]*)\s*:(\s|$)""")
+ON_SPELLINGS = ("on", "true", "yes")  # all resolve to the boolean True key (YAML 1.1)
+
+
+def _refuse_repeated_top_level(rows: List[Tuple[int, str, str]]) -> None:
+    """A top-level key may appear once (#5667); a YAML reader would keep the last."""
+    seen: Set[str] = set()
+    for ind, body, _sus in rows:
+        if ind != 0:
+            continue
+        m = TOP_KEY.match(body)
+        if not m:
+            continue
+        key = m.group(1).strip("\"'").lower()
+        if key in ON_SPELLINGS:
+            key = "on"
+        if key in seen:
+            raise Unparsed("repeated top-level key (#5667): " + body)
+        seen.add(key)
+
+
 def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
     """Return {trigger: {filter_key: [items]}} for the workflow's ``on:`` block."""
     rows = _meaningful(text)
+    _refuse_repeated_top_level(rows)
     start = None
     for idx, (ind, body, _sus) in enumerate(rows):
         if ind == 0 and re.match(r"""^("on"|'on'|on|true)\s*:""", body):
@@ -727,6 +749,54 @@ class DuplicateKeys5666(unittest.TestCase):
     def test_5666_distinct_keys_stay_clean(self) -> None:
         text = _with_on_block(GOOD_PUSH + GOOD_PR + "    paths: [a]\n  workflow_dispatch:\n")
         self.assertEqual([], violations("x.yml", text))
+
+
+class DuplicateTopLevel5667(unittest.TestCase):
+    """#5667: a repeated top-level key (any quoting or case; on/true/yes are one key) is Unparsed."""
+
+    TAIL = "  push:\n    branches: ['rehearsal/x']\n"
+
+    def _shape(self, text: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v for v in got), got)
+
+    def _base(self) -> str:
+        return _with_on_block(GOOD_PUSH + GOOD_PR)
+
+    def test_5667_control_clean(self) -> None:
+        self.assertEqual([], violations("x.yml", self._base()))
+
+    def test_5667_second_on_after_jobs(self) -> None:
+        self._shape(self._base() + "on:\n" + self.TAIL)
+
+    def test_5667_second_on_double_quoted(self) -> None:
+        self._shape(self._base() + '"on":\n' + self.TAIL)
+
+    def test_5667_second_on_single_quoted(self) -> None:
+        self._shape(self._base() + "'on':\n" + self.TAIL)
+
+    def test_5667_second_on_spelled_true(self) -> None:
+        self._shape(self._base() + "true:\n" + self.TAIL)
+
+    def test_5667_second_on_spelled_yes(self) -> None:
+        self._shape(self._base() + "yes:\n" + self.TAIL)
+
+    def test_5667_second_on_other_case(self) -> None:
+        self._shape(self._base() + "On:\n" + self.TAIL)
+        self._shape(self._base() + "ON:\n" + self.TAIL)
+
+    def test_5667_repeated_unrelated_top_level_key(self) -> None:
+        self._shape(self._base() + "name: y\n")
+
+    def test_5667_repeated_key_other_case(self) -> None:
+        self._shape(self._base() + "Name: y\n")
+
+    def test_5667_repeated_key_quoted_and_bare(self) -> None:
+        self._shape(self._base() + '"name": y\n')
+
+    def test_5667_first_on_quoted_second_bare(self) -> None:
+        text = 'name: x\n"on":\n' + GOOD_PUSH + GOOD_PR + "jobs: {}\non:\n" + self.TAIL
+        self._shape(text)
 
 
 class GlobSemantics5447(unittest.TestCase):
