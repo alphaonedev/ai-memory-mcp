@@ -38,17 +38,40 @@
 #   certification expires per its §7 → re-issue or void the cert doc
 #   in this same change.
 #
-# RANGE RESOLUTION.
-#   pull_request     — PR_BASE_SHA + PR_HEAD_SHA (fail-closed if base
-#                      is missing or merge-base is unresolvable after
-#                      a shallow deepen).
-#   push             — github.event.before .. GITHUB_SHA. An all-zero
-#                      `before` (new branch / first push) is N/A-skip,
-#                      never a false-fail.
-#   workflow_dispatch / other / empty
-#                    — CERT_EXPIRY_BASE[/HEAD] override if set; else
-#                      (local convenience) merge-base with @{upstream}
-#                      or origin/release/v1.0.0; else N/A-skip.
+# RANGE RESOLUTION (#5603; closed-world, fail-closed, never a skip).
+#   pull_request / merge_group / push
+#                    — the range comes ONLY from scripts/ci-commit-range.py
+#                      (#5579): merge-base(base, head)..head, base_sha..head_sha,
+#                      before..sha. An empty, all-zero, malformed or unreachable
+#                      sha (an all-zero before is a creation push; an
+#                      unreachable one is a force-push or a checkout that
+#                      lacks the previous tip) or a merge_group without
+#                      base_sha is RED; the next ordinary push produces a
+#                      comparable range, and a re-run of the red run cannot
+#                      turn it green.
+#   any other event  — RED.
+#   empty event      — local convenience only: merge-base with @{upstream} or
+#                      origin/release/v1.0.0; RED when neither exists, and
+#                      RED whenever GITHUB_ACTIONS is set (even empty).
+#   BASE SOURCE (#5970; GOD ruling 2026-10-05; 5-agent vote 4d3ea1c5,
+#   decision 424172a1) — in CI the range comes ONLY from
+#                      scripts/ci-commit-range.py. Closed-world on the
+#                      environment: every CERT_EXPIRY_* shell variable,
+#                      exported or only set in the shell (a BASH_ENV
+#                      file), other than CERT_EXPIRY_LOCAL_BASE and
+#                      CERT_EXPIRY_LOCAL_HEAD is refused wherever it is set,
+#                      even when empty; the two local overrides name a range
+#                      by hand outside CI only and are refused whenever
+#                      GITHUB_ACTIONS is set; CERT_EXPIRY_LOCAL_HEAD alone or
+#                      an empty CERT_EXPIRY_LOCAL_BASE is refused. A refusal
+#                      is RED and names the variable.
+#   CREATION PUSH (#5851) — a push that creates a branch carries an
+#                      all-zero before, so this gate is RED on that run,
+#                      never not-applicable and never a skip. The verdict is ADVISORY by
+#                      construction: a required status check does not gate a
+#                      branch-creation push (the branch already exists when
+#                      the job runs); only a repository ruleset that
+#                      restricts branch creation can stop one.
 #   Shallow checkout — if merge-base fails and the repo is shallow,
 #                      unshallow / deepen + fetch the missing tip,
 #                      then retry. Still-unresolvable on a
@@ -101,7 +124,7 @@
 #                                             # scratch clone (never a
 #                                             # real branch)
 #
-# Exit codes: 0 clean / N/A-skip · 1 violation · 2 usage / self-test fail.
+# Exit codes: 0 clean · 1 violation or undecidable range · 2 usage / self-test fail.
 
 set -euo pipefail
 
@@ -213,7 +236,7 @@ extract_fed_ids() {
 # Range resolution + shallow recovery
 # ---------------------------------------------------------------------------
 
-ZERO_SHA_RE='^0+$'
+RANGE_HELPER="$REPO_ROOT/scripts/ci-commit-range.py"
 
 # ensure_commit REPO SHA — fetch SHA if it is not yet a local commit.
 ensure_commit() {
@@ -251,52 +274,78 @@ resolve_merge_base() {
 # resolve_range REPO
 # Prints "BASE HEAD" on stdout.
 #   0 = have a range to check
-#   3 = N/A skip (no range; not a failure)
-#   1 = fail-closed (PR event with an unresolvable range)
+#   1 = fail-closed: the range cannot be decided (the reason is on stderr)
+# There is no skip: a gate that cannot name its range is red (#5603).
+# pull_request, merge_group and push take the range ONLY from
+# scripts/ci-commit-range.py (#5579), which refuses an empty, all-zero,
+# malformed or unreachable sha and every other event.
+# refuse_overrides — the environment cannot name the range in CI (#5970).
+# Returns 0 when no override is refused, 1 (the reason on stderr) otherwise.
+refuse_overrides() {
+    local name
+    local -a bad=()
+    while IFS= read -r name; do
+        case "$name" in
+            CERT_EXPIRY_LOCAL_BASE | CERT_EXPIRY_LOCAL_HEAD)
+                [[ -z "${GITHUB_ACTIONS+set}" ]] || bad+=("$name (a local override; GITHUB_ACTIONS is set)")
+                ;;
+            CERT_EXPIRY_*) bad+=("$name") ;;
+        esac
+    done < <(compgen -v)
+    if [[ -n "${CERT_EXPIRY_LOCAL_HEAD+set}" && -z "${CERT_EXPIRY_LOCAL_BASE+set}" ]]; then
+        bad+=("CERT_EXPIRY_LOCAL_HEAD without CERT_EXPIRY_LOCAL_BASE")
+    fi
+    if [[ -n "${CERT_EXPIRY_LOCAL_BASE+set}" && -z "${CERT_EXPIRY_LOCAL_BASE}" ]]; then
+        bad+=("an empty CERT_EXPIRY_LOCAL_BASE")
+    fi
+    if ((${#bad[@]} != 0)); then
+        echo "check-cert-expiry: ERROR — refused (#5970, fail-closed): ${bad[*]} set in the gate's environment; the range comes only from scripts/ci-commit-range.py" >&2
+        return 1
+    fi
+    return 0
+}
+
 resolve_range() {
     local repo="$1"
     local event="${GITHUB_EVENT_NAME:-}"
 
-    if [[ -n "${CERT_EXPIRY_BASE:-}" ]]; then
-        printf '%s %s\n' "$CERT_EXPIRY_BASE" "${CERT_EXPIRY_HEAD:-HEAD}"
+    refuse_overrides || return 1
+    if [[ -n "${CERT_EXPIRY_LOCAL_BASE+set}" ]]; then
+        printf '%s %s\n' "$CERT_EXPIRY_LOCAL_BASE" "${CERT_EXPIRY_LOCAL_HEAD:-HEAD}"
         return 0
     fi
 
     case "$event" in
-        pull_request)
-            if [[ -z "${PR_BASE_SHA:-}" ]]; then
-                echo "check-cert-expiry: ERROR — PR_BASE_SHA is unset on a pull_request event (fail-closed)" >&2
+        pull_request | merge_group | push)
+            local rng
+            if ! rng="$(python3 "$RANGE_HELPER" --repo "$repo")"; then
+                echo "check-cert-expiry: ERROR — the range for a '$event' event cannot be decided (fail-closed)" >&2
                 return 1
             fi
-            printf '%s %s\n' "$PR_BASE_SHA" "${PR_HEAD_SHA:-HEAD}"
-            return 0
-            ;;
-        push)
-            local before="${GITHUB_EVENT_BEFORE:-}"
-            local after="${GITHUB_SHA:-HEAD}"
-            if [[ -z "$before" || "$before" =~ $ZERO_SHA_RE ]]; then
-                echo "check-cert-expiry: N/A — push has no previous tip (new branch / first push); skip" >&2
-                return 3
+            if ! [[ "$rng" =~ ^[0-9a-f]{40}\.\.[0-9a-f]{40}$ ]]; then
+                echo "check-cert-expiry: ERROR — range helper returned '$rng', not BASE..HEAD (fail-closed)" >&2
+                return 1
             fi
-            printf '%s %s\n' "$before" "$after"
+            printf '%s %s\n' "${rng%%..*}" "${rng##*..}"
             return 0
-            ;;
-        workflow_dispatch)
-            echo "check-cert-expiry: N/A — workflow_dispatch has no PR/push range (set CERT_EXPIRY_BASE to force a check); skip" >&2
-            return 3
             ;;
         "")
-            # Local convenience: standard PR-shaped range vs the tracking
+            # Local convenience only: standard PR-shaped range vs the tracking
             # branch or origin/release/v1.0.0. Never invent a range against
-            # the cert pinned SHA.
+            # the cert pinned SHA. A CI run always has an event name, so an
+            # empty one with GITHUB_ACTIONS set (to any value) is refused.
+            if [[ -n "${GITHUB_ACTIONS+set}" ]]; then
+                echo "check-cert-expiry: ERROR — GITHUB_EVENT_NAME is empty in a CI run (fail-closed)" >&2
+                return 1
+            fi
             local base_ref=""
             if git -C "$repo" rev-parse --verify --quiet '@{upstream}' >/dev/null 2>&1; then
                 base_ref='@{upstream}'
             elif git -C "$repo" rev-parse --verify --quiet origin/release/v1.0.0 >/dev/null 2>&1; then
                 base_ref='origin/release/v1.0.0'
             else
-                echo "check-cert-expiry: N/A — no CERT_EXPIRY_BASE, no @{upstream}, no origin/release/v1.0.0; skip" >&2
-                return 3
+                echo "check-cert-expiry: ERROR — no CERT_EXPIRY_LOCAL_BASE, no @{upstream}, no origin/release/v1.0.0; outside CI set CERT_EXPIRY_LOCAL_BASE to name the range (fail-closed)" >&2
+                return 1
             fi
             local base_sha
             base_sha="$(git -C "$repo" rev-parse --verify "$base_ref")"
@@ -304,8 +353,8 @@ resolve_range() {
             return 0
             ;;
         *)
-            echo "check-cert-expiry: N/A — event '$event' has no PR/push range; skip" >&2
-            return 3
+            echo "check-cert-expiry: ERROR — event '$event' is not one of pull_request, merge_group, push; outside CI set CERT_EXPIRY_LOCAL_BASE to check a range by hand (fail-closed)" >&2
+            return 1
             ;;
     esac
 }
@@ -315,10 +364,20 @@ resolve_range() {
 # ---------------------------------------------------------------------------
 
 # check_change REPO BASE HEAD
-# Returns 0 pass, 1 fail (violation OR unresolvable range).
-# Prints the verdict (and, on fail, the required expiry sentence) to stdout
-# so the caller can capture + re-emit.
+# Returns 0 pass, 1 fail (violation OR unresolvable range OR a false LIVE
+# banner at HEAD). The change-shape rule (check_shape), then the banner
+# consistency rule (#3556 C). Prints the verdict (and, on fail, the required
+# expiry sentence) to stdout so the caller can capture + re-emit.
 check_change() {
+    check_shape "$@" || return 1
+    check_banner_consistency "$1" "$3"
+}
+
+# check_shape REPO BASE HEAD
+# The change-shape rule alone (#5850): 0 when the range does not touch the
+# wire set, or touches it together with a real re-issue / voiding of the
+# cert doc; 1 on a violation or an unresolvable range.
+check_shape() {
     local repo="$1" base="$2" head="$3"
 
     if ! git -C "$repo" rev-parse --verify --quiet "${base}^{commit}" >/dev/null \
@@ -363,8 +422,7 @@ check_change() {
 
     if ((${#watched[@]} == 0)) && ((id_changed == 0)); then
         echo "check-cert-expiry: PASS — federation-wire surface unchanged in ${mb}..${head}"
-        check_banner_consistency "$repo" "$head"
-        return
+        return 0
     fi
 
     # (B) #3556 — the hatch is a REAL re-issue/voiding only if the banner
@@ -393,8 +451,7 @@ check_change() {
 
     if ((cert_touched == 1)) && ((incidental == 0)) && ((deleted == 0)) && ((malformed == 0)); then
         echo "check-cert-expiry: PASS — federation-wire surface changed AND cert doc re-issued/voided in the same change (${mb}..${head}; banner ${banner_mb} → ${banner_head})"
-        check_banner_consistency "$repo" "$head"
-        return
+        return 0
     fi
 
     echo "federation-wire surface changed → the enterprise-federation certification expires per its §7 → re-issue or void the cert doc in this same change."
@@ -475,7 +532,7 @@ check_banner_consistency() {
     # tree-to-tree comparison, so a squash-merge whose watched surface
     # equals the bound tree passes on zero drift, and a bind pointed at
     # some unrelated commit (an evasion) reds on the drift it carries. An
-    # ancestry-based N/A hatch was cut first and withdrawn — it was a
+    # ancestry-based skip hatch was cut first and withdrawn — it was a
     # defeat: any existing side commit would have silenced (C).
     local drift
     drift="$(wire_drift "$repo" "$binds" "$head")"
@@ -502,9 +559,6 @@ run_gate() {
     pair="$(resolve_range "$repo")"
     rc=$?
     set -e
-    if ((rc == 3)); then
-        return 0
-    fi
     if ((rc != 0)); then
         return 1
     fi
@@ -963,7 +1017,7 @@ self_test() {
 
     # (v2) RED — LIVE bound to a non-ancestor commit whose watched tree
     #      DIFFERS from HEAD's (a bind pointed somewhere convenient): the
-    #      ancestry-N/A hatch would have silenced this; the tree diff reds it.
+    #      ancestry-skip hatch would have silenced this; the tree diff reds it.
     git -C "$repo" checkout -q -b side2 "$genesis_sha"
     echo "// side wire" >>"$repo/src/federation/mod.rs"
     git -C "$repo" add src/federation/mod.rs
@@ -1134,37 +1188,218 @@ self_test() {
 
     git -C "$repo" reset -q --hard "$base_sha"
 
-    # (k) fail-closed — pull_request with missing PR_BASE_SHA.
-    if (
-        unset CERT_EXPIRY_BASE CERT_EXPIRY_HEAD PR_BASE_SHA PR_HEAD_SHA GITHUB_EVENT_BEFORE
-        export GITHUB_EVENT_NAME=pull_request
-        run_gate "$repo"
-    ) >/dev/null 2>&1; then
-        echo "self-test FAILED (k): pull_request with unset PR_BASE_SHA did not fail closed" >&2
-        failed=1
-    fi
+    # Range-selection legs (#5603). gate_leg LABEL EXPECT WANT [VAR=value ...]
+    # runs run_gate in a subshell with a clean event environment. EXPECT is
+    # green (rc 0) or red (rc != 0); a red leg must also print WANT, so it is
+    # red for the stated reason and not by accident of another rule.
+    gate_leg() {
+        local label="$1" expect="$2" want="$3"
+        shift 3
+        local rc=0 text
+        text="$(
+            unset PR_BASE_SHA PR_HEAD_SHA MG_BASE_SHA MG_HEAD_SHA \
+                GITHUB_EVENT_BEFORE GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS
+            while IFS= read -r kv; do
+                case "$kv" in CERT_EXPIRY_*) unset "$kv" ;; esac
+            done < <(compgen -v)
+            kv=""
+            for kv in "$@"; do export "${kv?}"; done
+            run_gate "$repo" 2>&1
+        )" || rc=$?
+        if [[ "$expect" == green && $rc -ne 0 ]]; then
+            echo "self-test FAILED ($label): expected GREEN, got rc=$rc: $text" >&2
+            failed=1
+        elif [[ "$expect" == red && $rc -eq 0 ]]; then
+            echo "self-test FAILED ($label): expected RED, got GREEN (a quiet skip): $text" >&2
+            failed=1
+        else
+            local -a wants=()
+            local w
+            [[ "$expect" != red || -z "$want" ]] || IFS='|' read -r -a wants <<<"$want"
+            for w in "${wants[@]}"; do
+                if [[ "$text" != *"$w"* ]]; then
+                    echo "self-test FAILED ($label): RED but not for the stated reason '$w': $text" >&2
+                    failed=1
+                    break
+                fi
+            done
+        fi
+    }
+    local zero="0000000000000000000000000000000000000000" ghost
+    ghost="abababababababababababababababababababab"
 
-    # (l) N/A-skip — workflow_dispatch with no override (must not false-fail).
-    if ! (
-        unset CERT_EXPIRY_BASE CERT_EXPIRY_HEAD PR_BASE_SHA PR_HEAD_SHA GITHUB_EVENT_BEFORE
-        export GITHUB_EVENT_NAME=workflow_dispatch
-        run_gate "$repo"
-    ) >/dev/null 2>&1; then
-        echo "self-test FAILED (l): workflow_dispatch without CERT_EXPIRY_BASE did not skip" >&2
-        failed=1
-    fi
+    # (k) pull_request: missing base is RED; base..docs is GREEN; base..viol RED.
+    gate_leg "k pull_request without PR_BASE_SHA" red "pull_request base sha is missing" \
+        GITHUB_EVENT_NAME=pull_request PR_HEAD_SHA="$docs_sha"
+    gate_leg "k2 pull_request docs-only change" green "" \
+        GITHUB_EVENT_NAME=pull_request PR_BASE_SHA="$base_sha" PR_HEAD_SHA="$docs_sha"
+    gate_leg "k3 pull_request wire change" red "federation-wire surface changed" \
+        GITHUB_EVENT_NAME=pull_request PR_BASE_SHA="$base_sha" PR_HEAD_SHA="$viol_sha"
 
-    # (m) N/A-skip — push with all-zero before (new branch / first push).
-    if ! (
-        unset CERT_EXPIRY_BASE CERT_EXPIRY_HEAD PR_BASE_SHA PR_HEAD_SHA
-        export GITHUB_EVENT_NAME=push
-        export GITHUB_EVENT_BEFORE=0000000000000000000000000000000000000000
-        export GITHUB_SHA="$base_sha"
-        run_gate "$repo"
-    ) >/dev/null 2>&1; then
-        echo "self-test FAILED (m): push with zero before-SHA did not skip" >&2
-        failed=1
-    fi
+    # (l) merge_group: checked, never skipped; a missing base is RED.
+    gate_leg "l merge_group docs-only change" green "" \
+        GITHUB_EVENT_NAME=merge_group MG_BASE_SHA="$base_sha" MG_HEAD_SHA="$docs_sha"
+    gate_leg "l2 merge_group wire change" red "federation-wire surface changed" \
+        GITHUB_EVENT_NAME=merge_group MG_BASE_SHA="$base_sha" MG_HEAD_SHA="$viol_sha"
+    gate_leg "l3 merge_group without base_sha" red "merge_group base_sha" \
+        GITHUB_EVENT_NAME=merge_group MG_HEAD_SHA="$docs_sha"
+    gate_leg "l4 merge_group with empty base_sha" red "next ordinary push" \
+        GITHUB_EVENT_NAME=merge_group MG_BASE_SHA= MG_HEAD_SHA="$docs_sha"
+    gate_leg "l5 merge_group without head_sha" red "merge_group head_sha" \
+        GITHUB_EVENT_NAME=merge_group MG_BASE_SHA="$base_sha"
+    gate_leg "l6 merge_group does not borrow the push before" red "merge_group base_sha" \
+        GITHUB_EVENT_NAME=merge_group GITHUB_EVENT_BEFORE="$base_sha" MG_HEAD_SHA="$docs_sha"
+
+    # (m) push: before..sha only for a full, non-zero, reachable before.
+    gate_leg "m push all-zero before (creation push)" red "creation push" \
+        GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$zero" GITHUB_SHA="$base_sha"
+    gate_leg "m2 push empty before" red "creation push" \
+        GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE= GITHUB_SHA="$base_sha"
+    gate_leg "m3 push unset before" red "creation push" \
+        GITHUB_EVENT_NAME=push GITHUB_SHA="$base_sha"
+    gate_leg "m4 push unreachable before (force-push)" red "force-push" \
+        GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$ghost" GITHUB_SHA="$viol_sha"
+    gate_leg "m5 push 39-char before" red "40-char" \
+        GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="${base_sha:0:39}" GITHUB_SHA="$viol_sha"
+    gate_leg "m6 push 41-char before" red "40-char" \
+        GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="${base_sha}a" GITHUB_SHA="$viol_sha"
+    gate_leg "m7 push upper-case before" red "40-char" \
+        GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$(printf '%s' "$base_sha" | tr 'a-f' 'A-F')" GITHUB_SHA="$viol_sha"
+    gate_leg "m8 push before with whitespace" red "40-char" \
+        GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE=" $base_sha" GITHUB_SHA="$viol_sha"
+    gate_leg "m9 push ref name as before" red "40-char" \
+        GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE=HEAD GITHUB_SHA="$viol_sha"
+    gate_leg "m10 push normal docs-only range" green "" \
+        GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$base_sha" GITHUB_SHA="$docs_sha"
+    gate_leg "m11 push normal wire-change range" red "federation-wire surface changed" \
+        GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$base_sha" GITHUB_SHA="$viol_sha"
+
+    # (m12) every other event is RED: no event-name allowlist gap.
+    gate_leg "m12 workflow_dispatch" red "is not one of pull_request, merge_group, push" \
+        GITHUB_EVENT_NAME=workflow_dispatch
+    gate_leg "m13 schedule" red "is not one of pull_request, merge_group, push" \
+        GITHUB_EVENT_NAME=schedule
+    gate_leg "m14 upper-case PUSH" red "is not one of pull_request, merge_group, push" \
+        GITHUB_EVENT_NAME=PUSH GITHUB_EVENT_BEFORE="$base_sha" GITHUB_SHA="$docs_sha"
+    gate_leg "m15 empty event under GITHUB_ACTIONS" red "empty in a CI run" \
+        GITHUB_ACTIONS=true
+    gate_leg "m15b empty event under an empty GITHUB_ACTIONS" red "empty in a CI run" \
+        GITHUB_ACTIONS=
+    gate_leg "m17 empty event, no upstream, no CERT_EXPIRY_LOCAL_BASE" red "no CERT_EXPIRY_LOCAL_BASE"
+    # The helper's answer is validated, not trusted: garbage, silence and a
+    # missing helper are each RED (RANGE_HELPER is the script's own variable).
+    local stub_dir="$tmp/stubs"
+    mkdir -p "$stub_dir"
+    printf 'print("not-a-range")\n' >"$stub_dir/garbage.py"
+    printf 'import sys\nsys.exit(0)\n' >"$stub_dir/silent.py"
+    printf 'import sys\nsys.stderr.write("ci-commit-range: REFUSED: stub\\n")\nsys.exit(1)\n' >"$stub_dir/refuse.py"
+    printf 'print("%s..%s")\n' "$base_sha" "$docs_sha" >"$stub_dir/good.py"
+    local saved_helper="$RANGE_HELPER"
+    RANGE_HELPER="$stub_dir/garbage.py"
+    gate_leg "n1 helper prints garbage" red "not BASE..HEAD" GITHUB_EVENT_NAME=push
+    RANGE_HELPER="$stub_dir/silent.py"
+    gate_leg "n2 helper prints nothing" red "not BASE..HEAD" GITHUB_EVENT_NAME=push
+    RANGE_HELPER="$stub_dir/refuse.py"
+    gate_leg "n3 helper refuses" red "cannot be decided" GITHUB_EVENT_NAME=push
+    RANGE_HELPER="$stub_dir/missing.py"
+    gate_leg "n4 helper missing" red "cannot be decided" GITHUB_EVENT_NAME=push
+    RANGE_HELPER="$stub_dir/good.py"
+    gate_leg "n5 stub helper with a good range (control)" green "" GITHUB_EVENT_NAME=push
+    RANGE_HELPER="$saved_helper"
+    # An explicit local range still works outside CI (the workflow never sets
+    # it: the static pin in scripts/ci-commit-range.py rejects the prefix, and
+    # the gate refuses it whenever GITHUB_ACTIONS is set).
+    gate_leg "m16 CERT_EXPIRY_LOCAL_BASE override outside CI" red "federation-wire surface changed" \
+        CERT_EXPIRY_LOCAL_BASE="$base_sha" CERT_EXPIRY_LOCAL_HEAD="$viol_sha"
+    gate_leg "m16b CERT_EXPIRY_LOCAL_BASE docs range outside CI (control)" green "" \
+        CERT_EXPIRY_LOCAL_BASE="$base_sha" CERT_EXPIRY_LOCAL_HEAD="$docs_sha"
+    # Override legs (#5970; GOD ruling 2026-10-05; 5-agent vote 4d3ea1c5,
+    # decision 424172a1): each is RED, names the variable and names the helper.
+    local src="ci-commit-range.py"
+    gate_leg "ov1 CERT_EXPIRY_BASE is refused" red "CERT_EXPIRY_BASE|$src" \
+        CERT_EXPIRY_BASE="$base_sha" CERT_EXPIRY_HEAD="$docs_sha"
+    gate_leg "ov2 empty CERT_EXPIRY_BASE is refused" red "CERT_EXPIRY_BASE|$src" \
+        CERT_EXPIRY_BASE= GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$base_sha" GITHUB_SHA="$docs_sha"
+    gate_leg "ov3 CERT_EXPIRY_HEAD is refused" red "CERT_EXPIRY_HEAD|$src" \
+        CERT_EXPIRY_HEAD="$base_sha" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$base_sha" GITHUB_SHA="$docs_sha"
+    gate_leg "ov4 an unknown CERT_EXPIRY_ name is refused" red "CERT_EXPIRY_RANGE|$src" \
+        CERT_EXPIRY_RANGE="$base_sha..$docs_sha" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$base_sha" GITHUB_SHA="$docs_sha"
+    gate_leg "ov5 CERT_EXPIRY_BASE under a creation push in CI is refused" red "CERT_EXPIRY_BASE|$src" \
+        GITHUB_ACTIONS=true GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$zero" GITHUB_SHA="$docs_sha" CERT_EXPIRY_BASE="$docs_sha"
+    gate_leg "ov6 a local base under GITHUB_ACTIONS=true is refused" red "CERT_EXPIRY_LOCAL_BASE (a local override|$src" \
+        GITHUB_ACTIONS=true CERT_EXPIRY_LOCAL_BASE="$base_sha" CERT_EXPIRY_LOCAL_HEAD="$docs_sha"
+    gate_leg "ov7 a local base under an empty GITHUB_ACTIONS is refused" red "CERT_EXPIRY_LOCAL_BASE (a local override|$src" \
+        GITHUB_ACTIONS= CERT_EXPIRY_LOCAL_BASE="$base_sha" CERT_EXPIRY_LOCAL_HEAD="$docs_sha"
+    gate_leg "ov8 a local head without a local base is refused" red "CERT_EXPIRY_LOCAL_HEAD without CERT_EXPIRY_LOCAL_BASE|$src" \
+        CERT_EXPIRY_LOCAL_HEAD="$docs_sha" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$base_sha" GITHUB_SHA="$docs_sha"
+    gate_leg "ov9 an empty local base is refused" red "an empty CERT_EXPIRY_LOCAL_BASE|$src" \
+        CERT_EXPIRY_LOCAL_BASE= CERT_EXPIRY_LOCAL_HEAD="$docs_sha"
+    gate_leg "ov10 a lowercase look-alike is not an input (control)" green "" \
+        cert_expiry_base="$viol_sha" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$base_sha" GITHUB_SHA="$docs_sha"
+    gate_leg "ov11 a name with a non-letter after the prefix is refused" red "CERT_EXPIRY__BASE|$src" \
+        CERT_EXPIRY__BASE="$docs_sha" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$base_sha" GITHUB_SHA="$docs_sha"
+    # Workflow-env runtime legs (#5970 F1, #5851): plant the variable in a copy
+    # of the real workflow at job level or workflow level, resolve the env that
+    # reaches the gate step with ci-commit-range.py --gate-step-env, and run the
+    # gate as its own process with exactly that env under GITHUB_ACTIONS=true and
+    # a creation push (all-zero before). Every leg must be red, never not-applicable.
+    local wf="$REPO_ROOT/.github/workflows/c8-precheck.yml" mwf="$tmp/wf.yml" me="${BASH_SOURCE[0]}" own
+    own="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+    wleg() { # LABEL LEVEL(none|job|workflow|bashenv) NAME VALUE WANT('|'-separated)
+        local label="$1" level="$2" var="$3" val="$4" want="$5" rc=0 text line w
+        local -a resolved=() wants=()
+        case "$level" in
+            none) cp "$wf" "$mwf" ;;
+            bashenv) cp "$wf" "$mwf" && printf '%s=%s\n' "$var" "$val" >"$tmp/bashenv" ;;
+            job) awk -v k="$var" -v v="$val" '{print} $0=="  cert-expiry-gate:"{print "    env:"; print "      " k ": " v}' "$wf" >"$mwf" ;;
+            workflow) awk -v k="$var" -v v="$val" '$0=="jobs:"{print "env:"; print "  " k ": " v} {print}' "$wf" >"$mwf" ;;
+        esac
+        if ! text="$(python3 "$RANGE_HELPER" --gate-step-env cert-expiry-gate --workflow "$mwf" 2>&1)"; then
+            echo "self-test FAILED ($label): the step env cannot be resolved: $text" >&2
+            failed=1
+            return
+        fi
+        while IFS= read -r line; do
+            case "$line" in *'${{'*) ;; *) resolved+=("$line") ;; esac
+        done <<<"$text"
+        [[ "$level" != bashenv ]] || resolved+=("BASH_ENV=$tmp/bashenv")
+        if [[ "$level" == job || "$level" == workflow ]] && ! printf '%s\n' "${resolved[@]}" | grep -q "^$var="; then
+            echo "self-test FAILED ($label): $var did not reach the gate step" >&2
+            failed=1
+            return
+        fi
+        text="$(env -i PATH="$PATH" HOME="$HOME" GITHUB_ACTIONS=true GITHUB_EVENT_NAME=push \
+            GITHUB_EVENT_BEFORE="$zero" GITHUB_SHA="$own" "${resolved[@]}" bash "$me" 2>&1)" || rc=$?
+        if ((rc == 0)); then
+            echo "self-test FAILED ($label): expected RED, got GREEN: $text" >&2
+            failed=1
+            return
+        fi
+        if [[ "$text" == *N[/]A* || "$text" == *[Ss]kip* ]]; then
+            echo "self-test FAILED ($label): the refusal reads as not-applicable or a skip: $text" >&2
+            failed=1
+            return
+        fi
+        IFS='|' read -r -a wants <<<"$want"
+        for w in "${wants[@]}"; do
+            if [[ "$text" != *"$w"* ]]; then
+                echo "self-test FAILED ($label): RED but not for the stated reason '$w': $text" >&2
+                failed=1
+                return
+            fi
+        done
+    }
+    wleg "wf0 creation push with the unmutated workflow (#5851)" none "" "" "cannot be decided"
+    wleg "wf1 job-level CERT_EXPIRY_BASE reaches the gate" job CERT_EXPIRY_BASE HEAD "CERT_EXPIRY_BASE|$src"
+    wleg "wf2 workflow-level CERT_EXPIRY_BASE reaches the gate" workflow CERT_EXPIRY_BASE HEAD "CERT_EXPIRY_BASE|$src"
+    wleg "wf3 job-level empty CERT_EXPIRY_BASE" job CERT_EXPIRY_BASE '""' "CERT_EXPIRY_BASE|$src"
+    wleg "wf4 job-level CERT_EXPIRY_HEAD" job CERT_EXPIRY_HEAD HEAD "CERT_EXPIRY_HEAD|$src"
+    wleg "wf5 workflow-level CERT_EXPIRY_HEAD" workflow CERT_EXPIRY_HEAD HEAD "CERT_EXPIRY_HEAD|$src"
+    wleg "wf6 job-level CERT_EXPIRY_LOCAL_BASE under CI" job CERT_EXPIRY_LOCAL_BASE HEAD "CERT_EXPIRY_LOCAL_BASE (a local override|$src"
+    # A shell variable set but not exported (a BASH_ENV file) is read like an
+    # exported one, so the refusal lists every shell variable, not only the env.
+    wleg "wf7 an unexported CERT_EXPIRY_LOCAL_BASE under CI" bashenv CERT_EXPIRY_LOCAL_BASE "$own" "CERT_EXPIRY_LOCAL_BASE (a local override|$src"
+    wleg "wf8 an unexported CERT_EXPIRY_BASE under CI" bashenv CERT_EXPIRY_BASE "$own" "CERT_EXPIRY_BASE|$src"
 
     # (n) fail-closed — unresolvable range.
     if check_change "$repo" "0000000000000000000000000000000000000000" "$base_sha" >/dev/null 2>&1; then
@@ -1173,9 +1408,12 @@ self_test() {
     fi
 
     # (o) GREEN — this PR itself (scripts / workflow / allowlist / CHANGELOG
-    #     only; must not trip the gate). Runs against the REAL worktree so a
-    #     future edit that accidentally touches the watched surface turns
-    #     the self-test red before CI does.
+    #     only; must not trip the change-shape rule). Runs check_shape against
+    #     the REAL worktree so a future edit that accidentally touches the
+    #     watched surface turns the self-test red before CI does. The live
+    #     banner is not read here (#5850): whether the checked-in LIVE banner
+    #     is still true is the gate's own verdict on its main step, and its
+    #     rule is proven by legs (s)-(v2) on scratch trees.
     local own_base="" own_head
     own_head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
     if git -C "$REPO_ROOT" rev-parse --verify --quiet origin/release/v1.0.0 >/dev/null 2>&1; then
@@ -1184,7 +1422,7 @@ self_test() {
         own_base="$(git -C "$REPO_ROOT" rev-parse '@{upstream}')"
     fi
     if [[ -n "$own_base" ]]; then
-        if ! out="$(check_change "$REPO_ROOT" "$own_base" "$own_head")"; then
+        if ! out="$(check_shape "$REPO_ROOT" "$own_base" "$own_head")"; then
             echo "self-test FAILED (o): THIS change trips the cert-expiry gate without touching the cert doc:" >&2
             echo "$out" >&2
             failed=1
@@ -1197,7 +1435,7 @@ self_test() {
         echo "check-cert-expiry self-test: FAIL" >&2
         exit 2
     fi
-    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request missing PR_BASE_SHA fail-closed; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; (p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated change over a LIVE banner with wire drift since the bind RED (#3556 C, names the bound SHA and the drift); (t) unrelated change over a VOID banner GREEN; (u) stale LIVE healed by recording EXPIRED GREEN; (v1) LIVE bound to a non-ancestor with an identical watched tree GREEN (squash-merge shape, tree diff); (v2) LIVE bound to a non-ancestor whose watched tree differs RED (the ancestry hatch would have silenced it); (w) unparseable STATUS line fail-closed; (x1) decoy STATUS line above the banner RED (exactly-one rule); (x2) decoy Binds-to line RED; (y) cert doc deleted alongside a wire change RED (ABSENT fails closed); (z) pure banner reformat on a docs-only change GREEN (tolerant parse); (z2) reformat + wire change RED as incidental, not unparseable."
+    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request base missing RED, docs-only GREEN, wire change RED; (l) merge_group checked, missing base RED; (m) push all-zero, empty, unset, unreachable, malformed (39/41-char, upper-case, whitespace, ref name) before RED, normal ranges checked, other events and an empty event with GITHUB_ACTIONS set RED (#5603, no skip); (ov) every CERT_EXPIRY_ variable but the two local overrides RED by name, local overrides RED with GITHUB_ACTIONS set (#5970); (wf) job-level and workflow-level CERT_EXPIRY_ env from a mutated workflow and an unexported CERT_EXPIRY_ shell variable from a BASH_ENV file RED by name in a creation push, and the unmutated creation push RED, never not-applicable (#5970, #5851); (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 passes the change-shape rule (#5850); (p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated change over a LIVE banner with wire drift since the bind RED (#3556 C, names the bound SHA and the drift); (t) unrelated change over a VOID banner GREEN; (u) stale LIVE healed by recording EXPIRED GREEN; (v1) LIVE bound to a non-ancestor with an identical watched tree GREEN (squash-merge shape, tree diff); (v2) LIVE bound to a non-ancestor whose watched tree differs RED (the ancestry hatch would have silenced it); (w) unparseable STATUS line fail-closed; (x1) decoy STATUS line above the banner RED (exactly-one rule); (x2) decoy Binds-to line RED; (y) cert doc deleted alongside a wire change RED (ABSENT fails closed); (z) pure banner reformat on a docs-only change GREEN (tolerant parse); (z2) reformat + wire change RED as incidental, not unparseable."
 }
 
 case "${1:-}" in

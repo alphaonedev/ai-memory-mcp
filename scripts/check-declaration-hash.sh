@@ -12,10 +12,11 @@
 #       AND the file's `revision:` equals the pinned revision — so the file cannot change
 #       without the pin moving in the same commit;
 #   D1b the pin may move only with a revision bump: when the pin differs from its
-#       PREVIOUS committed content (the PR base — `DECLARATION_GATE_BASE`, a git ref/sha,
-#       default HEAD; or the file named by `DECLARATION_GATE_PREVIOUS_PIN` in the
-#       self-test), the new pinned revision must be strictly greater than the old one —
-#       so "edit, re-hash, same revision" is refused as loudly as "edit, no re-hash";
+#       PREVIOUS committed content, the new pinned revision must be strictly greater
+#       than the old one — so "edit, re-hash, same revision" is refused as loudly as
+#       "edit, no re-hash". The previous pin is read at the base side of
+#       scripts/ci-commit-range.py (--base-only); there is no default base, and an
+#       undecidable or unresolvable base is a red gate, never a skip (#5604);
 #   D2  a pinned revision N > 1 requires at least N-1 dated
 #       `revised after miss (YYYY-MM-DD): <reason>` lines in the file — so a re-pin
 #       without the bump AND the reason is refused (HARD-FAIL, never allowlistable);
@@ -23,6 +24,23 @@
 #       declared target is a number, not a promise to pick one;
 #   D4  every N-id cited in §6 of the adopted standard has a row in the declaration's
 #       §6 N-id → issue table (§7.4 of the standard: the ids match the filed issues).
+#
+# BASE SOURCE (#5970; GOD ruling 2026-10-05; 5-agent vote 4d3ea1c5, decision 424172a1).
+# In CI the base comes ONLY from scripts/ci-commit-range.py. Closed-world on the
+# environment: every DECLARATION_GATE_* shell variable, exported or only set in the
+# shell (a BASH_ENV file), other than the three local overrides
+# (DECLARATION_GATE_LOCAL_BASE, DECLARATION_GATE_LOCAL_PREVIOUS_PIN,
+# DECLARATION_GATE_LOCAL_ROOT) is refused wherever it is set, even when empty; the
+# local overrides are refused whenever GITHUB_ACTIONS is set (even to an empty
+# string), and setting both LOCAL_BASE and LOCAL_PREVIOUS_PIN is refused. A refusal
+# exits 1 and names the variable.
+#
+# CREATION PUSH (#5851). A push that creates a branch carries an all-zero before;
+# ci-commit-range.py has no base for it, so this gate is RED on that run, never
+# not-applicable and never a skip. The verdict is ADVISORY by construction: a
+# required status check does not gate a branch-creation push (the branch already
+# exists when the job runs), so only a repository ruleset that restricts branch
+# creation can stop one.
 #
 # Two-disposition rule: D1–D4 are FAIL. There is no pending ledger for this gate: a
 # declaration that does not hash is not a declaration.
@@ -43,7 +61,8 @@ sed_i() {
     sed "$__expr" "$__file" >"$__tmp" && mv "$__tmp" "$__file"
 }
 
-ROOT="${DECLARATION_GATE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+ROOT="${DECLARATION_GATE_LOCAL_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+RANGE_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ci-commit-range.py"
 DECL="${ROOT}/docs/compliance/v1.0.0-DECLARATION.md"
 PIN="${ROOT}/scripts/qc-allowlists/declaration.sha256"
 STD="${ROOT}/docs/compliance/MISSION-CRITICAL-CERTIFICATION-STANDARD-v1.md"
@@ -52,7 +71,24 @@ fail() { echo "::error::declaration-hash gate: $*" >&2; exit 1; }
 
 sha_of() { sha256sum "$1" | cut -d' ' -f1; }
 
+# refuse_overrides — the environment cannot name the D1b base in CI (#5970).
+refuse_overrides() {
+  local name bad=()
+  while IFS= read -r name; do
+    case "$name" in
+      DECLARATION_GATE_LOCAL_BASE | DECLARATION_GATE_LOCAL_PREVIOUS_PIN | DECLARATION_GATE_LOCAL_ROOT)
+        [ -z "${GITHUB_ACTIONS+set}" ] || bad+=("$name (a local override; GITHUB_ACTIONS is set)") ;;
+      DECLARATION_GATE_*) bad+=("$name") ;;
+    esac
+  done < <(compgen -v)
+  if [ -n "${DECLARATION_GATE_LOCAL_BASE+set}" ] && [ -n "${DECLARATION_GATE_LOCAL_PREVIOUS_PIN+set}" ]; then
+    bad+=("DECLARATION_GATE_LOCAL_BASE with DECLARATION_GATE_LOCAL_PREVIOUS_PIN (two previous-pin sources)")
+  fi
+  [ "${#bad[@]}" -eq 0 ] || fail "refused (#5970, fail-closed): ${bad[*]} set in the gate's environment; the D1b base comes only from scripts/ci-commit-range.py"
+}
+
 run_gate() {
+  refuse_overrides
   [ -f "$DECL" ] || fail "missing $DECL (D1)"
   [ -f "$PIN" ]  || fail "missing $PIN (D1)"
   [ -f "$STD" ]  || fail "missing $STD (D4)"
@@ -70,19 +106,36 @@ run_gate() {
     fail "declaration changed without re-pinning (D1): file sha $actual_sha != pinned $pinned_sha. A change is legal ONLY with a 'revision:' bump, a dated 'revised after miss (YYYY-MM-DD): <reason>' line in §5, and the new sha + revision in $PIN — a target is never revised after a miss (§0.2)."
   fi
   [ "$file_rev" = "$pinned_rev" ] || fail "declaration revision $file_rev != pinned revision $pinned_rev (D1)"
-  # D1b — the pin moved: the revision must have moved up with it.
+  # D1b — the pin moved: the revision must have moved up with it. The previous pin is
+  # never skipped (#5604): its base comes from scripts/ci-commit-range.py (base side
+  # only); outside CI a local override may name a commit or a pin file by hand
+  # (#5970); an undecidable or unresolvable base is a red gate. There is no default base.
   local prev_line="" prev_sha="" prev_rev=""
-  if [ -n "${DECLARATION_GATE_PREVIOUS_PIN:-}" ]; then
-    [ -f "$DECLARATION_GATE_PREVIOUS_PIN" ] && prev_line=$(grep -vE '^\s*(#|$)' "$DECLARATION_GATE_PREVIOUS_PIN" | tail -1 || true)
-  elif git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    local base="${DECLARATION_GATE_BASE:-HEAD}"
-    prev_line=$(git -C "$ROOT" show "${base}:scripts/qc-allowlists/declaration.sha256" 2>/dev/null | grep -vE '^\s*(#|$)' | tail -1 || true)
-  fi
-  if [ -n "$prev_line" ]; then
-    prev_sha=$(echo "$prev_line" | awk '{print $1}'); prev_rev=$(echo "$prev_line" | awk '{print $2}')
-    if [ "$prev_sha" != "$pinned_sha" ] && [ "${pinned_rev}" -le "${prev_rev:-0}" ]; then
-      fail "the pin moved ($prev_sha -> $pinned_sha) but the revision did not (${prev_rev} -> ${pinned_rev}) (D1b): a re-pin is legal only with a 'revision:' bump and a dated 'revised after miss' line"
+  if [ -n "${DECLARATION_GATE_LOCAL_PREVIOUS_PIN+set}" ]; then
+    [ -f "$DECLARATION_GATE_LOCAL_PREVIOUS_PIN" ] || fail "DECLARATION_GATE_LOCAL_PREVIOUS_PIN names no file: $DECLARATION_GATE_LOCAL_PREVIOUS_PIN (D1b)"
+    prev_line=$(grep -vE '^\s*(#|$)' "$DECLARATION_GATE_LOCAL_PREVIOUS_PIN" | tail -1 || true)
+  else
+    local base=""
+    if [ -n "${DECLARATION_GATE_LOCAL_BASE+set}" ]; then
+      base="$DECLARATION_GATE_LOCAL_BASE"
+    elif [ -n "${GITHUB_EVENT_NAME:-}" ]; then
+      base=$(python3 "$RANGE_HELPER" --repo "$ROOT" --base-only) \
+        || fail "the base of the previous pin cannot be decided (D1b, fail-closed); the helper refusal is above"
+    else
+      fail "no base for the previous pin (D1b, fail-closed): run under a pull_request, merge_group or push event, or outside CI set DECLARATION_GATE_LOCAL_BASE to a commit"
     fi
+    git -C "$ROOT" rev-parse --verify --quiet "${base}^{commit}" >/dev/null 2>&1 \
+      || fail "the D1b base '$base' does not resolve to a commit in this checkout (fail-closed)"
+    git -C "$ROOT" cat-file -e "${base}:scripts/qc-allowlists/declaration.sha256" 2>/dev/null \
+      || fail "the pin file does not exist at the D1b base $base (fail-closed)"
+    prev_line=$(git -C "$ROOT" show "${base}:scripts/qc-allowlists/declaration.sha256" | grep -vE '^\s*(#|$)' | tail -1 || true)
+  fi
+  [ -n "$prev_line" ] || fail "the previous pin carries no <sha256>  <revision> line (D1b, fail-closed)"
+  prev_sha=$(echo "$prev_line" | awk '{print $1}'); prev_rev=$(echo "$prev_line" | awk '{print $2}')
+  [[ "$prev_sha" =~ ^[0-9a-f]{64}$ && "$prev_rev" =~ ^[0-9]+$ ]] \
+    || fail "the previous pin is malformed (D1b, fail-closed): $prev_line"
+  if [ "$prev_sha" != "$pinned_sha" ] && [ "$pinned_rev" -le "$prev_rev" ]; then
+    fail "the pin moved ($prev_sha -> $pinned_sha) but the revision did not (${prev_rev} -> ${pinned_rev}) (D1b): a re-pin is legal only with a 'revision:' bump and a dated 'revised after miss' line"
   fi
   if [ "$pinned_rev" -gt 1 ]; then
     local reasons
@@ -113,10 +166,10 @@ self_test() {
   # Every leg sees the PRISTINE pin as "previous", so D1b is exercised deliberately
   # and never by accident of the repo's committed pin.
   cp "$PIN" "$scratch/previous.pin"
-  export DECLARATION_GATE_PREVIOUS_PIN="$scratch/previous.pin"
+  export DECLARATION_GATE_LOCAL_PREVIOUS_PIN="$scratch/previous.pin"
   leg() { # $1 name, $2 expect (pass|fail), $3 rule tag the refusal must name (optional)
     total=$((total+1)); local out r
-    if out=$(DECLARATION_GATE_ROOT="$scratch" bash "$me" 2>&1); then r=pass; else r=fail; fi
+    if out=$(env -u GITHUB_ACTIONS DECLARATION_GATE_LOCAL_ROOT="$scratch" bash "$me" 2>&1); then r=pass; else r=fail; fi
     if [ "$r" != "$2" ]; then echo "  FAIL $1: expected $2, got $r"; return; fi
     if [ -n "${3:-}" ] && ! grep -q "($3)" <<<"$out"; then echo "  FAIL $1: refused, but not by $3: $(echo "$out" | head -1 | cut -c1-120)"; return; fi
     echo "  ok   $1 (expected $2${3:+ by $3})"; ok=$((ok+1))
@@ -150,7 +203,116 @@ self_test() {
   leg "D4 standard cites N16 but the declaration index lost its row" fail D4
   cp "$DECL" "$D"; cp "$PIN" "$P"
   leg "clean control (restored)" pass
-  unset DECLARATION_GATE_PREVIOUS_PIN
+  unset DECLARATION_GATE_LOCAL_PREVIOUS_PIN
+  # D1b base legs (#5604): the previous pin comes from a real git base, never from a
+  # skip. The scratch is its own repo: c1 = pin at revision 1; c2 = a re-pin that kept
+  # revision 1 (the defect). Each refusal must come from the named cause.
+  git -C "$scratch" init -q -b main
+  local g=(git -C "$scratch" -c user.name=t -c user.email=t@e.invalid -c commit.gpgsign=false)
+  "${g[@]}" add -A >/dev/null && "${g[@]}" commit -q -m c1
+  local c1 c2 zero ab
+  c1=$("${g[@]}" rev-parse HEAD)
+  printf '\nsoftened\n' >> "$D"; repin 1
+  "${g[@]}" add -A >/dev/null && "${g[@]}" commit -q -m c2
+  c2=$("${g[@]}" rev-parse HEAD)
+  zero=$(printf '0%.0s' $(seq 1 40)); ab=$(printf 'ab%.0s' $(seq 1 20))
+  bleg() { # $1 name, $2 expect, $3 reason text the output must contain, rest: env assignments
+    total=$((total+1)); local name="$1" want="$2" text="$3" out r; shift 3
+    if out=$(env -u DECLARATION_GATE_LOCAL_PREVIOUS_PIN -u DECLARATION_GATE_LOCAL_BASE -u GITHUB_EVENT_NAME \
+        -u GITHUB_EVENT_BEFORE -u PR_BASE_SHA -u PR_HEAD_SHA -u MG_BASE_SHA -u MG_HEAD_SHA -u GITHUB_ACTIONS \
+        DECLARATION_GATE_LOCAL_ROOT="$scratch" "$@" bash "$me" 2>&1); then r=pass; else r=fail; fi
+    if [ "$r" != "$want" ]; then echo "  FAIL $name: expected $want, got $r: $(echo "$out" | head -1 | cut -c1-140)"; return; fi
+    local want_text; local -a wants=()
+    [ -z "$text" ] || IFS='|' read -r -a wants <<<"$text"
+    for want_text in "${wants[@]}"; do
+      if ! grep -qF -- "$want_text" <<<"$out"; then echo "  FAIL $name: wrong reason, wanted '$want_text': $(echo "$out" | head -1 | cut -c1-140)"; return; fi
+    done
+    echo "  ok   $name (expected $want)"; ok=$((ok+1))
+  }
+  bleg "D1b base leg: re-pin without a bump vs a real base is red" fail "(D1b)" DECLARATION_GATE_LOCAL_BASE="$c1"
+  bleg "D1b base leg: pull_request base=c1 head=c2 is red by D1b" fail "(D1b)" GITHUB_EVENT_NAME=pull_request PR_BASE_SHA="$c1" PR_HEAD_SHA="$c2"
+  bleg "D1b base leg: merge_group base_sha=c1 head_sha=c2 is red by D1b" fail "(D1b)" GITHUB_EVENT_NAME=merge_group MG_BASE_SHA="$c1" MG_HEAD_SHA="$c2"
+  bleg "D1b base leg: push before=c1 sha=c2 is red by D1b" fail "(D1b)" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$c1" GITHUB_SHA="$c2"
+  bleg "D1b base leg: unchanged pin vs its own commit passes" pass "" DECLARATION_GATE_LOCAL_BASE="$c2"
+  bleg "D1b base leg: all-zero push before is red, not skipped" fail "cannot be decided" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$zero" GITHUB_SHA="$c2"
+  bleg "D1b base leg: empty push before is red, not skipped" fail "cannot be decided" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="" GITHUB_SHA="$c2"
+  bleg "D1b base leg: unreachable push before is red, not skipped" fail "cannot be decided" GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$ab" GITHUB_SHA="$c2"
+  bleg "D1b base leg: merge_group without base_sha is red, not skipped" fail "cannot be decided" GITHUB_EVENT_NAME=merge_group MG_HEAD_SHA="$c2"
+  bleg "D1b base leg: unknown event is red, not skipped" fail "cannot be decided" GITHUB_EVENT_NAME=schedule
+  bleg "D1b base leg: no event and no base is red (no default HEAD)" fail "no base for the previous pin"
+  bleg "D1b base leg: explicit unresolvable base is red" fail "does not resolve to a commit" DECLARATION_GATE_LOCAL_BASE="$ab"
+  bleg "D1b base leg: explicit all-zero base is red" fail "does not resolve to a commit" DECLARATION_GATE_LOCAL_BASE="$zero"
+  printf '# only a comment\n' > "$scratch/empty.pin"; printf 'zz  1\n' > "$scratch/bad.pin"
+  bleg "D1b previous-pin leg: a previous pin with no line is red" fail "carries no <sha256>" DECLARATION_GATE_LOCAL_PREVIOUS_PIN="$scratch/empty.pin"
+  bleg "D1b previous-pin leg: a malformed previous pin is red" fail "previous pin is malformed" DECLARATION_GATE_LOCAL_PREVIOUS_PIN="$scratch/bad.pin"
+  bleg "D1b previous-pin leg: a missing previous-pin file is red" fail "names no file" DECLARATION_GATE_LOCAL_PREVIOUS_PIN="$scratch/none.pin"
+  "${g[@]}" rm -q --cached scripts/qc-allowlists/declaration.sha256 && "${g[@]}" commit -q -m c3-no-pin
+  bleg "D1b base leg: pin file absent at the base is red" fail "does not exist at the D1b base" DECLARATION_GATE_LOCAL_BASE="$("${g[@]}" rev-parse HEAD)"
+  # Override legs (#5970; GOD ruling 2026-10-05; 5-agent vote 4d3ea1c5, decision 424172a1):
+  # every DECLARATION_GATE_* name other than the local overrides is refused wherever it is
+  # set, even empty; a local override is refused whenever GITHUB_ACTIONS is set.
+  local src="ci-commit-range.py"
+  bleg "override leg: DECLARATION_GATE_BASE is refused" fail "DECLARATION_GATE_BASE|$src" DECLARATION_GATE_BASE="$c2"
+  bleg "override leg: empty DECLARATION_GATE_BASE is refused" fail "DECLARATION_GATE_BASE|$src" DECLARATION_GATE_BASE=
+  bleg "override leg: DECLARATION_GATE_PREVIOUS_PIN is refused" fail "DECLARATION_GATE_PREVIOUS_PIN|$src" DECLARATION_GATE_PREVIOUS_PIN="$scratch/previous.pin"
+  bleg "override leg: DECLARATION_GATE_ROOT is refused" fail "DECLARATION_GATE_ROOT|$src" DECLARATION_GATE_ROOT="$scratch"
+  bleg "override leg: an unknown DECLARATION_GATE_ name is refused" fail "DECLARATION_GATE_HEAD|$src" DECLARATION_GATE_HEAD=HEAD
+  bleg "override leg: DECLARATION_GATE_BASE wins nothing under a creation push" fail "DECLARATION_GATE_BASE|$src" GITHUB_ACTIONS=true GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$zero" GITHUB_SHA="$c2" DECLARATION_GATE_BASE="$c2"
+  bleg "override leg: a local base under GITHUB_ACTIONS=true is refused" fail "DECLARATION_GATE_LOCAL_BASE (a local override|$src" GITHUB_ACTIONS=true DECLARATION_GATE_LOCAL_BASE="$c2"
+  bleg "override leg: a local base under an empty GITHUB_ACTIONS is refused" fail "DECLARATION_GATE_LOCAL_BASE (a local override|$src" GITHUB_ACTIONS= DECLARATION_GATE_LOCAL_BASE="$c2"
+  bleg "override leg: a local previous pin under GITHUB_ACTIONS=true is refused" fail "DECLARATION_GATE_LOCAL_PREVIOUS_PIN (a local override|$src" GITHUB_ACTIONS=true DECLARATION_GATE_LOCAL_PREVIOUS_PIN="$scratch/previous.pin"
+  bleg "override leg: a local base with a local previous pin is refused" fail "two previous-pin sources|$src" DECLARATION_GATE_LOCAL_BASE="$c2" DECLARATION_GATE_LOCAL_PREVIOUS_PIN="$scratch/previous.pin"
+  bleg "override leg: a lowercase look-alike is not an input and changes nothing" pass "" declaration_gate_base="$c1" DECLARATION_GATE_LOCAL_BASE="$c2"
+  bleg "override leg: a name with a non-letter after the prefix is refused" fail "DECLARATION_GATE__BASE|$src" DECLARATION_GATE__BASE="$c2"
+  bleg "D1b local-base leg: an empty local base is red, the event cannot fill it in" fail "does not resolve to a commit" DECLARATION_GATE_LOCAL_BASE= GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$c1" GITHUB_SHA="$c2"
+  bleg "D1b previous-pin leg: an empty local previous pin is red, the event cannot fill it in" fail "names no file" DECLARATION_GATE_LOCAL_PREVIOUS_PIN= GITHUB_EVENT_NAME=push GITHUB_EVENT_BEFORE="$c1" GITHUB_SHA="$c2"
+  # A shell variable that is set but not exported (for example by a BASH_ENV file) is read
+  # by the gate exactly like an exported one, so the refusal lists every shell variable.
+  printf 'DECLARATION_GATE_LOCAL_BASE=%s\n' "$c2" > "$scratch/bashenv-local"
+  printf 'DECLARATION_GATE_BASE=%s\n' "$c2" > "$scratch/bashenv-base"
+  bleg "override leg: an unexported local base under GITHUB_ACTIONS=true is refused" fail "DECLARATION_GATE_LOCAL_BASE (a local override|$src" GITHUB_ACTIONS=true BASH_ENV="$scratch/bashenv-local"
+  bleg "override leg: an unexported DECLARATION_GATE_BASE is refused" fail "DECLARATION_GATE_BASE|$src" BASH_ENV="$scratch/bashenv-base"
+  # Workflow-env runtime legs (#5970 F1, #5851): plant the variable in a copy of the real
+  # workflow at job level or workflow level, resolve the env that reaches the gate step
+  # with ci-commit-range.py --gate-step-env, and run the gate with exactly that env under
+  # GITHUB_ACTIONS=true and a creation push (all-zero before). Every leg must be red.
+  local wf="$ROOT/.github/workflows/c8-precheck.yml" mwf="$scratch/wf.yml" head
+  head=$(git -C "$ROOT" rev-parse HEAD)
+  wleg() { # $1 name, $2 level (none|job|workflow), $3 NAME, $4 YAML value, $5 '|'-separated texts
+    total=$((total+1)); local name="$1" level="$2" var="$3" val="$4" text="$5" out r line want_text
+    local -a resolved=() wants=()
+    case "$level" in
+      none) cp "$wf" "$mwf" ;;
+      job) awk -v k="$var" -v v="$val" '{print} $0=="  declaration-hash-gate:"{print "    env:"; print "      " k ": " v}' "$wf" > "$mwf" ;;
+      workflow) awk -v k="$var" -v v="$val" '$0=="jobs:"{print "env:"; print "  " k ": " v} {print}' "$wf" > "$mwf" ;;
+    esac
+    if ! out=$(python3 "$RANGE_HELPER" --gate-step-env declaration-hash-gate --workflow "$mwf" 2>&1); then
+      echo "  FAIL $name: the step env cannot be resolved: $(echo "$out" | head -1 | cut -c1-140)"; return
+    fi
+    while IFS= read -r line; do
+      case "$line" in *'${{'*) ;; *) resolved+=("$line") ;; esac
+    done <<<"$out"
+    if [ "$level" != none ] && ! printf '%s\n' "${resolved[@]}" | grep -q "^$var="; then
+      echo "  FAIL $name: $var did not reach the gate step"; return
+    fi
+    if out=$(env -i PATH="$PATH" HOME="$HOME" GITHUB_ACTIONS=true GITHUB_EVENT_NAME=push \
+        GITHUB_EVENT_BEFORE="$zero" GITHUB_SHA="$head" "${resolved[@]}" bash "$me" 2>&1); then r=pass; else r=fail; fi
+    if [ "$r" != fail ]; then echo "  FAIL $name: expected a red gate, got $r: $(echo "$out" | head -1 | cut -c1-140)"; return; fi
+    if grep -qE 'N[/]A|[Ss]kip' <<<"$out"; then echo "  FAIL $name: the refusal reads as not-applicable or a skip: $(echo "$out" | head -1 | cut -c1-140)"; return; fi
+    IFS='|' read -r -a wants <<<"$text"
+    for want_text in "${wants[@]}"; do
+      if ! grep -qF -- "$want_text" <<<"$out"; then echo "  FAIL $name: wrong reason, wanted '$want_text': $(echo "$out" | head -1 | cut -c1-140)"; return; fi
+    done
+    ok=$((ok+1)); echo "  ok   $name (expected fail)"
+  }
+  wleg "workflow leg: creation push with the unmutated workflow is red (#5851)" none "" "" "cannot be decided"
+  wleg "workflow leg: job-level DECLARATION_GATE_BASE reaches the gate and is refused" job DECLARATION_GATE_BASE HEAD "DECLARATION_GATE_BASE|$src"
+  wleg "workflow leg: workflow-level DECLARATION_GATE_BASE reaches the gate and is refused" workflow DECLARATION_GATE_BASE HEAD "DECLARATION_GATE_BASE|$src"
+  wleg "workflow leg: job-level empty DECLARATION_GATE_BASE is refused" job DECLARATION_GATE_BASE '""' "DECLARATION_GATE_BASE|$src"
+  wleg "workflow leg: job-level DECLARATION_GATE_PREVIOUS_PIN is refused" job DECLARATION_GATE_PREVIOUS_PIN scripts/qc-allowlists/declaration.sha256 "DECLARATION_GATE_PREVIOUS_PIN|$src"
+  wleg "workflow leg: workflow-level DECLARATION_GATE_PREVIOUS_PIN is refused" workflow DECLARATION_GATE_PREVIOUS_PIN scripts/qc-allowlists/declaration.sha256 "DECLARATION_GATE_PREVIOUS_PIN|$src"
+  wleg "workflow leg: job-level DECLARATION_GATE_LOCAL_BASE is refused under CI" job DECLARATION_GATE_LOCAL_BASE HEAD "DECLARATION_GATE_LOCAL_BASE (a local override|$src"
+  wleg "workflow leg: job-level DECLARATION_GATE_ROOT is refused" job DECLARATION_GATE_ROOT . "DECLARATION_GATE_ROOT|$src"
   rm -rf "$scratch"
   echo "declaration-hash gate self-test: $ok/$total"
   [ "$ok" = "$total" ] || exit 1
