@@ -734,6 +734,18 @@ def selftest():
          shared(A('crate::MISSING_N'), L(18), L(18) + 'pub const MISSING_N: usize = 4;\n'), True, ['?MISSING_N#unresolved -> 4'])
     case('an ambiguous name that becomes resolved is a move',
          shared(A('crate::EXPECTED_N'), L(18), L(18), {'src/other.rs': L(3)}, {'src/other.rs': 'pub fn x() {}\n'}), True, ['?EXPECTED_N#ambiguous(18,3) -> 18'])
+    # ---- #5673: the changelog scope clause: assert(_eq)!(<expr>.len()|.count(), <rhs>) in an eligible src/ or tests/ .rs file ----
+    def scoped(path, body0, body1):
+        def f_(s, b):
+            s.w(path, body0); t0 = s.commit('test: add scope fixture'); s.w(path, body1)
+            s.commit('test: bump scope fixture'); return t0 + '..HEAD'
+        return f_
+    E = lambda macro, meth, n: 'fn t() { %s!(items.%s(), %s); }\n' % (macro, meth, n)
+    case('a .count() left side is seen', scoped('tests/scope.rs', E('assert_eq', 'count', 18), E('assert_eq', 'count', 19)), True, ['items.count()  18 -> 19'])
+    case('an assert! macro is seen', scoped('tests/scope.rs', E('assert', 'len', 18), E('assert', 'len', 19)), True, ['items.len()  18 -> 19'])
+    case('a .rs file under benches/ is not checked', scoped('benches/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
+    case('a non-.rs file under tests/ is not checked', scoped('tests/scope.txt', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
+    case('a .rs file under src/ is checked', scoped('src/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), True, ['items.len()  18 -> 19'])
     def c_ren(s, b):                                       # the defining file is renamed with the bump
         s.w('src/lib.rs', L(18) + PAD); s.w(SH, A('crate::EXPECTED_N')); t0 = s.commit('test: add')
         s.g('mv', 'src/lib.rs', 'src/consts.rs'); s.w('src/consts.rs', L(19) + PAD); s.commit('test: move and bump'); return t0 + '..HEAD'
