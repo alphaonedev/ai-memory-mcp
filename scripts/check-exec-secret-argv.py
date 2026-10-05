@@ -1991,6 +1991,11 @@ ROUND3_RED = [
     ('5635 closed world: reported 9: a long option is clean only when it is a measured non-password option', 'mysqldump --pa "$X" db'),
     ('5635 closed world: reported 10: a long option is clean only when it is a measured non-password option', 'mysqldump --p="$X" db'),
     ('5635 closed world: reported 11: a long option is clean only when it is a measured non-password option', 'mysql --password-file="$F" db'),
+    ('5636 closed world: reported 1: an operand that follows a password command word is a credential', 'mysqladmin -u root password "$NEW"'),
+    ('5636 closed world: reported 2: an operand that follows a password command word is a credential', 'mysqladmin password "x$NEW"'),
+    ('5636 closed world: reported 3: an operand that follows a password command word is a credential', 'mysqladmin old-password "$X"'),
+    ('5636 closed world: reported 4: an operand that follows a password command word is a credential', 'mariadb-admin pass "$X"'),
+    ('5636 closed world: reported 5: an operand that follows a password command word is a credential', 'mysqladmin -u root password "new-${SUFFIX}"'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
@@ -2029,6 +2034,9 @@ ROUND3_GREEN = [
     ('5635 closed world: clean 6: a long option is clean only when it is a measured non-password option', 'mysql --loose-port="$P" db'),
     ('5635 closed world: clean 7: a long option is clean only when it is a measured non-password option', 'mysql --skip-ssl --ssl-key="$K" db'),
     ('5635 closed world: clean 8: a long option is clean only when it is a measured non-password option', 'mysql --user="$U" --database="$D"'),
+    ('5636 closed world: clean 1: an operand that follows a password command word is a credential', 'mysqladmin -u root status'),
+    ('5636 closed world: clean 2: an operand that follows a password command word is a credential', 'mysqladmin ping -h "$H"'),
+    ('5636 closed world: clean 3: an operand that follows a password command word is a credential', 'mysqladmin -h "$H" -- status'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
