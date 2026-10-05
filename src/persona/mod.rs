@@ -994,6 +994,31 @@ mod tests {
         db::insert(conn, &mem).unwrap()
     }
 
+    /// #5084 / #5243 — `generate_in_scope` opens its write transaction
+    /// `BEGIN IMMEDIATE`: a second writer cannot commit inside its
+    /// read-then-write window, and the lock upgrade does not fail with
+    /// `SQLITE_BUSY_SNAPSHOT`.
+    #[test]
+    fn generate_in_scope_is_immediate_5084() {
+        use crate::storage::txn_immediate_5084_tests::{arm_interleaved_writer_5084, disarm_5084};
+        let (mut conn, dir) = fresh_db();
+        seed_two_alice_reflections(&conn, "team/alpha");
+        let committed = arm_interleaved_writer_5084(&mut conn, &dir.path().join("ai-memory.db"));
+        let llm = StubLlm {
+            canned: "Alice is methodical.".into(),
+        };
+        let out = {
+            let generator = PersonaGenerator::new(&conn, &llm, None, PersonaConfig::default());
+            generator.generate("alice", "team/alpha")
+        };
+        assert!(disarm_5084(&mut conn), "interleaving hook never fired");
+        assert!(out.is_ok(), "#5084 generate_in_scope failed: {out:?}");
+        assert!(
+            !committed.get(),
+            "#5084 generate_in_scope: a concurrent writer committed inside the window"
+        );
+    }
+
     #[test]
     fn validate_entity_id_rejects_empty() {
         assert!(matches!(

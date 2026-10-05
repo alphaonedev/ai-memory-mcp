@@ -965,7 +965,30 @@ pub fn open_unmigrated(path: &Path) -> Result<Connection> {
     apply_sqlcipher_key(&conn)?;
     register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
     apply_writer_pragmas(&conn)?;
-    Ok(conn)
+    Ok(test_trace_on_open(conn))
+}
+
+// Test seam (#5243): lets a race test trace a connection that a function under
+// test opens for itself (`mine`, `doctor --repair-schema-version`), where the
+// test has no handle to arm it. A no-op unless a test armed it on this thread.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OPEN_TRACE_5084: std::cell::Cell<Option<fn(&str)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn test_trace_on_open(mut conn: Connection) -> Connection {
+    if let Some(cb) = OPEN_TRACE_5084.with(std::cell::Cell::get) {
+        conn.trace(Some(cb));
+    }
+    conn
+}
+
+#[cfg(not(test))]
+#[inline]
+fn test_trace_on_open(conn: Connection) -> Connection {
+    conn
 }
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -1032,7 +1055,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     // check withholds (Unknown) and this is a silent no-op.
     crate::governance::audit::enforce_rollback_check_at_open(&conn)
         .context("open-time rollback-evidence check")?;
-    Ok(conn)
+    Ok(test_trace_on_open(conn))
 }
 
 /// #1580 — open a **read-only** connection to an already-initialized
