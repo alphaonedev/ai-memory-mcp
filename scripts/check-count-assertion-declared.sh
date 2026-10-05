@@ -85,7 +85,8 @@
 #     operand ends in `.len()` or `.count()`.
 #   * AMBIGUOUS assert! (#5797, #5798): any other first argument in which the
 #     LEFT OPERAND of some `==`, at any bracket depth, holds a count call
-#     (`.len()` or `.count()`, spaces allowed inside the call). That operand
+#     (`.len()` or `.count()`, spaces allowed after the dot and inside the
+#     call, never an argument). That operand
 #     runs back from the `==` to the nearest `&&`, `||`, `==`, `!=`, `=>`, `,`
 #     or `;` at the same depth, or to the bracket that opens that depth, so
 #     nothing between the call and the `==` hides it: a cast to any type, braces,
@@ -101,7 +102,8 @@
 #   * NOT READ assert! (stated limits): a count call only on the right of every
 #     `==` (reversed operands, `18 == v.len()`, also behind `&&`; #5714); a count
 #     compared without `==` (`v.len().eq(&18)`, `matches!(v.len(), 18)`; #5800);
-#     a count call spelled as a path call (`<[u8]>::len(v) == 18`; #5801).
+#     a count spelled as a path call (`<[u8]>::len(v) == 18`), a free function
+#     (`row_count() == 18`) or a call with an argument (`m.count(k) == 18`; #5801).
 # The named-const spelling — `assert_eq!(x.len(), EXPECTED)` with
 # `const EXPECTED: usize = 19;` — is resolved the same way: a const that a
 # count assertion names, whose literal moved, is a count change.
@@ -960,7 +962,8 @@ def selftest():
                    ('count call as a call argument', 'f(v.len(), 2) == %s'), ('if-expression operand', 'if ok { v.len() } else { 0 } == %s'),
                    ('arithmetic after a cast', 'ok && v.len() as u64 + 0 == %s'), ('closure-only braces', 'v.iter().any(|x| { x.len() } == %s)'),
                    ('match arm after =>', 'match k { _ => v.len() as a::T == %s }'), ('tuple operand', '(v.len(), 2) == (%s, 2)'),
-                   ('a block with a statement', '{ let n = v.len(); n } == %s')):
+                   ('a block with a statement', '{ let n = v.len(); n } == %s'),
+                   ('an array operand', '[v.len(), 0][0] == %s'), ('space after the dot', 'v. len() == %s')):
         amb_leg(l_, a_)
     # stated limits, pinned with today's reading (a move here is NOT flagged): #5799 #5800 #5801 #5714
     for l_, a0_ in (('M3 an assert_eq! tuple first argument (#5799)', 'assert_eq!((v.len(), v.len()), (2, %s))'),
@@ -970,13 +973,22 @@ def selftest():
                     ('an assert! with a path-call count (#5801)', 'assert!(<[u8]>::len(v) == %s)'),
                     ('an assert_eq! with a path-call count (#5801)', 'assert_eq!(<[u8]>::len(v), %s)'),
                     ('an assert_eq! with a space inside the count call (#5801)', 'assert_eq!(v.len (), %s)'),
-                    ('a reversed operand behind && (#5714)', 'assert!(ok && %s == v.len())')):
+                    ('a reversed operand behind && (#5714)', 'assert!(ok && %s == v.len())'),
+                    ('a free-function count such as row_count() (#5801)', 'assert!(row_count() == %s)'),
+                    ('a .count(..) call with an argument (#5801)', 'assert!(m.count(k) == %s)')):
         case('stays unread: %s' % l_, scoped('tests/scope.rs', 'fn t() { %s; }\n' % (a0_ % 18), 'fn t() { %s; }\n' % (a0_ % 19)), False)
     case('a count call behind && in a closure, with == on another operand, is not read',
          scoped('tests/scope.rs', 'fn t() { assert!(v.iter().all(|x| x.len() > 0 && x[0] == 18)); }\n',
                 'fn t() { assert!(v.iter().all(|x| x.len() > 0 && x[0] == 19)); }\n'), False)
     case('a count call compared with >, with == on another operand behind &&, is not read',
          scoped('tests/scope.rs', 'fn t() { assert!(v.len() > 0 && n == 18); }\n', 'fn t() { assert!(v.len() > 0 && n == 19); }\n'), False)
+    # every operand stop is pinned: a count call before the stop, with == after it on another operand, is not read
+    for l_, a0_ in (('a comma', 'assert!(f(v.len(), n == %s))'), ('a semicolon', 'assert!({ let k = v.len(); n == %s })'),
+                    ('||', 'assert!(v.len() > 0 || n == %s)'), ('a match arm =>', 'assert!(match k { _ if v.len() > 0 => n == %s, _ => true })')):
+        case('operand stop %s: a count call before it, with == after it, is not read' % l_,
+             scoped('tests/scope.rs', 'fn t() { %s; }\n' % (a0_ % 18), 'fn t() { %s; }\n' % (a0_ % 19)), False)
+    case('an assert! comparing the count with <= is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(v.len() <= 18); }\n', 'fn t() { assert!(v.len() <= 19); }\n'), False)
     case('an assert! with a closure count comparison that is not == is not read',
          scoped('tests/scope.rs', 'fn t() { assert!(v.iter().all(|x| x.len() > 2)); }\n', 'fn t() { assert!(v.iter().all(|x| x.len() > 3)); }\n'), False)
     # #5761 (S2): which comparison an assert! binds to is pinned: only ONE == outside every bracket ((), [] and {}) binds
