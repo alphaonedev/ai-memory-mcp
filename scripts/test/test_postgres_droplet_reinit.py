@@ -62,6 +62,10 @@ env = {
     "STUB_PW_FILE": os.environ["STUB_PW_FILE"],
     "STUB_PSQL_RC": os.environ.get("STUB_PSQL_RC", "0"),
 }
+# A remote login environment may export a libpq service; the remote command must unset it.
+for key in ("STUB_REMOTE_PGSERVICE", "STUB_REMOTE_PGSERVICEFILE"):
+    if key in os.environ:
+        env[key[len("STUB_REMOTE_"):]] = os.environ[key]
 sys.exit(subprocess.run(["bash", "-c", remote], env=env).returncode)
 ''',
     "psql": STUB_COMMON + r'''
@@ -89,7 +93,8 @@ with open(out, "w", encoding="utf-8") as fh:
 log({})
 ''',
     "ai-memory": STUB_COMMON + r'''
-log({"store_url_env": "AI_MEMORY_STORE_URL" in os.environ})
+url = os.environ.get("AI_MEMORY_STORE_URL", "")
+log({"store_url_env": bool(url), "store_url_query": url.split("?", 1)[1] if "?" in url else ""})
 print("{}")
 ''',
 }
@@ -180,6 +185,22 @@ class TestReinitDryRunUrl5143(ReinitHarness):
         self.assertEqual((proc.stdout + proc.stderr).count(self.password), 0)
 
 
+    def assert_live_store_url(self, **extra):
+        proc = self.run_script(["--yes", "--skip-disposable"], **extra)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        inits = [c for c in self.calls() if c["argv0"] == "ai-memory"]
+        self.assertEqual(len(inits), 1, self.calls())
+        self.assertTrue(inits[0]["store_url_env"])
+        self.assertEqual(inits[0]["store_url_query"], "sslmode=verify-full&sslrootcert=" + str(self.ca))
+        self.assert_password_off_argv(proc)
+
+    def test_live_store_url_pins_verify_full_5143(self):
+        self.assert_live_store_url()
+
+    def test_live_store_url_over_ssh_pins_verify_full_5143(self):
+        self.assert_live_store_url(AI_MEMORY_SSH_HOST="h1", PG_DUMP_SSLROOTCERT=str(self.ca))
+
+
 class TestReinitPgDump5402(ReinitHarness):
     def test_live_pg_dump_pins_verify_full_and_ca_5402(self):
         proc = self.run_script(["--yes", "--skip-disposable"], PGSERVICE="evil", PGSERVICEFILE="/nonexistent")
@@ -251,6 +272,23 @@ class TestReinitSshProbe5600(ReinitHarness):
         self.assertLess(names.index("psql"), names.index("pg_dump"), "probe before the backup")
         self.assertLess(names.index("pg_dump"), names.index("sudo"), "backup before the DROP")
         self.assert_password_off_argv(proc)
+
+    def test_remote_probe_unsets_a_remote_libpq_service_5600(self):
+        proc = self.run_script(
+            ["--yes", "--skip-disposable"],
+            **self.ssh_env(STUB_REMOTE_PGSERVICE="evil", STUB_REMOTE_PGSERVICEFILE="/nonexistent"),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        probes = [c for c in self.calls() if c["argv0"] == "psql"]
+        self.assertEqual(len(probes), 1)
+        self.assertFalse(probes[0]["pgservice"], "PGSERVICE/PGSERVICEFILE must be unset on the ssh host")
+
+    def test_remote_probe_quotes_conninfo_values_5600(self):
+        proc = self.run_script(["--yes", "--skip-disposable"], **self.ssh_env(PG_USER="o'b\\x"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        probes = [c for c in self.calls() if c["argv0"] == "psql"]
+        self.assertEqual(len(probes), 1)
+        self.assertIn("user='o\\'b\\\\x' ", probes[0]["argv"][0])
 
     def test_dry_run_runs_no_remote_probe_5600(self):
         proc = self.run_script(["--dry-run", "--skip-disposable"], **self.ssh_env())
