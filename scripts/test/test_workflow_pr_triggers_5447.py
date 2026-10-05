@@ -27,7 +27,7 @@ RULES ENFORCED (all closed-world: a trigger the reader cannot parse is a FAILURE
          ``*name`` items are undecidable and fail.  A push trigger with no
          ``branches`` and no ``tags`` key matches every branch and counts.
   R-SHAPE (#5660, #5667, #5668, #5705-#5708, #5730, #5731, #5733,
-         #5734) the whole file is
+         #5734, #5735) the whole file is
          read closed-world by the grammar below.  A file the reader cannot read
          is a failure whatever words it holds (#5731).
 
@@ -65,7 +65,8 @@ ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
   content     an ASCII space, none less indented than the first.
   top level   mapping keys at column 0, each once (folded and unquoted); a YAML
               1.1 boolean key only as on, "on" or 'on'.
-  on block    trigger keys at one indentation, each once; a gated trigger
+  on block    trigger keys at one indentation, each once, none a YAML 1.1
+              boolean or null word in any case (#5735); a gated trigger
               (pull_request, pull_request_target, push) spelled exactly so.  A
               gated trigger is empty, ``~``, ``null`` or a block of the filter
               keys branches, tags, paths, paths-ignore, types, each once.
@@ -551,6 +552,8 @@ def parse_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
         if not m:
             raise Unparsed("unreadable trigger line: " + body)
         name, rest = m.group(1), (m.group(2) or "").strip()
+        if name.lower() in YAML11_BOOLEANS + ("null",):
+            raise Unparsed("trigger name YAML 1.1 reads as a boolean or null (#5735): " + name)
         if name.lower() in PR_TRIGGERS + ("push",) and name not in PR_TRIGGERS + ("push",):
             raise Unparsed("gated trigger name in another case (#5731): " + name)
         if name.lower() in seen_triggers:
@@ -1740,6 +1743,29 @@ class TypedPlainItems5734(unittest.TestCase):
         body = ("on:\n  pull_request:\n    branches: [main, 'rehearsal/**', 'yes', \"1\"]\n"
                 "    paths:\n      - .github/workflows/x.yml\n      - '~'\n      - v1.0\n      - nope\n"
                 "    types: 'on'\n  push:\n    tags: ['1.0', v1.*]\n")
+        self.assertEqual([], violations("x.yml", body))
+
+
+class TriggerNames5735(unittest.TestCase):
+    """#5735: a trigger name YAML 1.1 reads as a boolean or null is refused.
+
+    Measured at 25af8bc7 (round-4 differential, seed 5665): every refusal case here
+    was accepted there. PyYAML 6.0.1 reads ON, Yes, off and True as the key True or
+    False, and null and NULL as the key None; it keeps y and n as strings, which the
+    reader refuses too so every YAML11_BOOLEANS word is treated alike.
+    """
+
+    def _shape(self, text: str, why: str) -> None:
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (why, got))
+
+    def test_5735_boolean_or_null_trigger_names(self) -> None:
+        for name in ("ON", "Yes", "off", "True", "null", "NULL", "y"):
+            self._shape("on:\n  " + name + ":\n    branches: [x]\n  push:\n    branches: [main]\n",
+                        "trigger name YAML 1.1 reads as a boolean or null")
+
+    def test_5735_other_trigger_names_stay_clean(self) -> None:
+        body = "on:\n  workflow_dispatch:\n  schedule:\n    - cron: '0 1 * * *'\n  nightly:\n" + GOOD_PR
         self.assertEqual([], violations("x.yml", body))
 
 
