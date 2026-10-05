@@ -747,6 +747,13 @@ MDEOF
         "$R::no_such" \
         "See \`$R::<dyn RecallTool>::no_such\`."
 
+    # #5460: the type of an as group inside a brace item is a claim.
+    anchor_red_cites 5460 QUAL "an as group with a missing type inside a brace item" \
+        "$R::NoSuch" \
+        "See \`$R::{<NoSuch as Tr>}\` x"
+    anchor_green 5460 "an as group with a live type inside a brace item" \
+        "See \`$R::{<RecallTool as Tr>}\` x"
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
