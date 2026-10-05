@@ -1613,7 +1613,10 @@ class FailClosed5731(unittest.TestCase):
 class BlockStructure5730(unittest.TestCase):
     """#5730: a row must sit at the column of an open block of its own kind.
 
-    Measured at 71fe391b4: every refusal case here was accepted there. Each PyYAML
+    Measured at 71fe391b4: 18 of the 20 refusal cases here were accepted there. The
+    other two were refused there for another reason and now carry the #5730 one:
+    x: then - a at column 0 (a column-0 row that is not a key) and the pull_request
+    filter row between two columns (an unexpected filter indentation).  Each PyYAML
     6.0.1 view quoted in a comment was measured with yaml.safe_load on the same text.
     """
 
@@ -1632,20 +1635,22 @@ class BlockStructure5730(unittest.TestCase):
     def test_5730_deeper_rows_after_a_scalar_value(self) -> None:
         # PyYAML: the first two are one plain scalar each ('a - b'); the others are errors.
         for body in ("x:\n  - a\n\n    - b\n", "x:\n  - a\n    # c\n    - b\n",
-                     "x: a\n  b: c\n", "x: 'a'\n  b: c\n", "x: [a]\n  - b\n", "x: |\n  a\ny: b\n   c: d\n"):
+                     "x: a\n  b: c\n", "x: 'a'\n  b: c\n", "x: [a]\n  - b\n", "x: |\n  a\nz: b\n   c: d\n"):
             self._shape("name: x\non:\n" + GOOD_PR + body, "continues the scalar")
 
     def test_5730_row_between_two_open_blocks(self) -> None:
         self._shape("name: x\non:\n" + GOOD_PR + "x:\n    a: 1\n  b: 2\n", "no open block")
         self._shape("name: x\non:\n  pull_request:\n      branches: [main]\n    types: [opened]\n", "no open block")
+        self._shape("name: x\non:\n" + GOOD_PR + "x:\n  k:\n      a: b\n    c: d\n", "no open block")
 
     def test_5730_row_of_the_other_kind(self) -> None:
         self._shape("name: x\non:\n" + GOOD_PR + "x:\n  - a\n  b: c\n", "other kind")
         self._shape("name: x\non:\n" + GOOD_PR + "x:\n  b: c\n  - a\n", "other kind")
 
     def test_5730_indentless_sequence(self) -> None:
-        # PyYAML: x is ['a']. The reader names no rule for a sequence at its key's column.
+        # PyYAML: x is ['a'], then k is ['a']. The reader refuses a sequence at its key's column.
         self._shape("name: x\non:\n" + GOOD_PR + "x:\n- a\n", "indentless sequence")
+        self._shape("name: x\non:\n" + GOOD_PR + "x:\n  k:\n  - a\n", "indentless sequence")
         self._shape("name: x\non:\n" + GOOD_PR + "x:\n  - k:\n    - a\n", "indentless sequence")
 
     def test_5730_filter_item_is_one_scalar(self) -> None:
