@@ -363,10 +363,20 @@ resolve_range() {
 # ---------------------------------------------------------------------------
 
 # check_change REPO BASE HEAD
-# Returns 0 pass, 1 fail (violation OR unresolvable range).
-# Prints the verdict (and, on fail, the required expiry sentence) to stdout
-# so the caller can capture + re-emit.
+# Returns 0 pass, 1 fail (violation OR unresolvable range OR a false LIVE
+# banner at HEAD). The change-shape rule (check_shape), then the banner
+# consistency rule (#3556 C). Prints the verdict (and, on fail, the required
+# expiry sentence) to stdout so the caller can capture + re-emit.
 check_change() {
+    check_shape "$@" || return 1
+    check_banner_consistency "$1" "$3"
+}
+
+# check_shape REPO BASE HEAD
+# The change-shape rule alone (#5850): 0 when the range does not touch the
+# wire set, or touches it together with a real re-issue / voiding of the
+# cert doc; 1 on a violation or an unresolvable range.
+check_shape() {
     local repo="$1" base="$2" head="$3"
 
     if ! git -C "$repo" rev-parse --verify --quiet "${base}^{commit}" >/dev/null \
@@ -411,8 +421,7 @@ check_change() {
 
     if ((${#watched[@]} == 0)) && ((id_changed == 0)); then
         echo "check-cert-expiry: PASS — federation-wire surface unchanged in ${mb}..${head}"
-        check_banner_consistency "$repo" "$head"
-        return
+        return 0
     fi
 
     # (B) #3556 — the hatch is a REAL re-issue/voiding only if the banner
@@ -441,8 +450,7 @@ check_change() {
 
     if ((cert_touched == 1)) && ((incidental == 0)) && ((deleted == 0)) && ((malformed == 0)); then
         echo "check-cert-expiry: PASS — federation-wire surface changed AND cert doc re-issued/voided in the same change (${mb}..${head}; banner ${banner_mb} → ${banner_head})"
-        check_banner_consistency "$repo" "$head"
-        return
+        return 0
     fi
 
     echo "federation-wire surface changed → the enterprise-federation certification expires per its §7 → re-issue or void the cert doc in this same change."
@@ -1391,9 +1399,12 @@ self_test() {
     fi
 
     # (o) GREEN — this PR itself (scripts / workflow / allowlist / CHANGELOG
-    #     only; must not trip the gate). Runs against the REAL worktree so a
-    #     future edit that accidentally touches the watched surface turns
-    #     the self-test red before CI does.
+    #     only; must not trip the change-shape rule). Runs check_shape against
+    #     the REAL worktree so a future edit that accidentally touches the
+    #     watched surface turns the self-test red before CI does. The live
+    #     banner is not read here (#5850): whether the checked-in LIVE banner
+    #     is still true is the gate's own verdict on its main step, and its
+    #     rule is proven by legs (s)-(v2) on scratch trees.
     local own_base="" own_head
     own_head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
     if git -C "$REPO_ROOT" rev-parse --verify --quiet origin/release/v1.0.0 >/dev/null 2>&1; then
@@ -1402,7 +1413,7 @@ self_test() {
         own_base="$(git -C "$REPO_ROOT" rev-parse '@{upstream}')"
     fi
     if [[ -n "$own_base" ]]; then
-        if ! out="$(check_change "$REPO_ROOT" "$own_base" "$own_head")"; then
+        if ! out="$(check_shape "$REPO_ROOT" "$own_base" "$own_head")"; then
             echo "self-test FAILED (o): THIS change trips the cert-expiry gate without touching the cert doc:" >&2
             echo "$out" >&2
             failed=1
@@ -1415,7 +1426,7 @@ self_test() {
         echo "check-cert-expiry self-test: FAIL" >&2
         exit 2
     fi
-    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request base missing RED, docs-only GREEN, wire change RED; (l) merge_group checked, missing base RED; (m) push all-zero, empty, unset, unreachable, malformed (39/41-char, upper-case, whitespace, ref name) before RED, normal ranges checked, other events and an empty event with GITHUB_ACTIONS set RED (#5603, no skip); (ov) every CERT_EXPIRY_ variable but the two local overrides RED by name, local overrides RED with GITHUB_ACTIONS set (#5970); (wf) job-level and workflow-level CERT_EXPIRY_ env from a mutated workflow RED by name in a creation push, and the unmutated creation push RED, never not-applicable (#5970, #5851); (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; (p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated change over a LIVE banner with wire drift since the bind RED (#3556 C, names the bound SHA and the drift); (t) unrelated change over a VOID banner GREEN; (u) stale LIVE healed by recording EXPIRED GREEN; (v1) LIVE bound to a non-ancestor with an identical watched tree GREEN (squash-merge shape, tree diff); (v2) LIVE bound to a non-ancestor whose watched tree differs RED (the ancestry hatch would have silenced it); (w) unparseable STATUS line fail-closed; (x1) decoy STATUS line above the banner RED (exactly-one rule); (x2) decoy Binds-to line RED; (y) cert doc deleted alongside a wire change RED (ABSENT fails closed); (z) pure banner reformat on a docs-only change GREEN (tolerant parse); (z2) reformat + wire change RED as incidental, not unparseable."
+    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request base missing RED, docs-only GREEN, wire change RED; (l) merge_group checked, missing base RED; (m) push all-zero, empty, unset, unreachable, malformed (39/41-char, upper-case, whitespace, ref name) before RED, normal ranges checked, other events and an empty event with GITHUB_ACTIONS set RED (#5603, no skip); (ov) every CERT_EXPIRY_ variable but the two local overrides RED by name, local overrides RED with GITHUB_ACTIONS set (#5970); (wf) job-level and workflow-level CERT_EXPIRY_ env from a mutated workflow RED by name in a creation push, and the unmutated creation push RED, never not-applicable (#5970, #5851); (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 passes the change-shape rule (#5850); (p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated change over a LIVE banner with wire drift since the bind RED (#3556 C, names the bound SHA and the drift); (t) unrelated change over a VOID banner GREEN; (u) stale LIVE healed by recording EXPIRED GREEN; (v1) LIVE bound to a non-ancestor with an identical watched tree GREEN (squash-merge shape, tree diff); (v2) LIVE bound to a non-ancestor whose watched tree differs RED (the ancestry hatch would have silenced it); (w) unparseable STATUS line fail-closed; (x1) decoy STATUS line above the banner RED (exactly-one rule); (x2) decoy Binds-to line RED; (y) cert doc deleted alongside a wire change RED (ABSENT fails closed); (z) pure banner reformat on a docs-only change GREEN (tolerant parse); (z2) reformat + wire change RED as incidental, not unparseable."
 }
 
 case "${1:-}" in
