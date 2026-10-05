@@ -476,24 +476,23 @@ def refusal_prefix_gap(source: bytes) -> str:
     """#5510/#5560/#5590: "" when `source` (the file BYTES, never a str) is plain strict utf-8 and the only statements that
     execute above the isolation refusal are the docstring and `import sys`, and the refusal is exactly
     `if __name__ == "__main__" and not sys.flags.isolated:` whose body is calls to print and sys.exit with constant
-    arguments; otherwise why not. Parsed with ast from the bytes, never executed, so the check reads the file the way
-    the interpreter does. It is closed-world and fails closed, so it over-refuses rather than risk a miss. The exact rule,
+    arguments; otherwise why not. Parsed with ast from the bytes and never executed. It is closed-world and fails closed, so it over-refuses rather than risk a miss. The exact rule,
     each numbered rule is asserted by pin_5590 (#5590, #5622), and pin_5590 fails if a numbered rule has no assertion
     group; the structure paragraph above is pinned by pin_5510, pin_5562 and pin_5563:
     R1: an argument that is neither bytes nor bytearray is refused; a bytearray is judged as the bytes it holds.
     R2: A utf-8 BOM is refused (detect_encoding reports it as utf-8-sig), alone or with any cookie.
-    R3: A coding cookie on line 1 or 2 is judged after tokenize.detect_encoding's PEP 263 normalisation (the rule the
-    interpreter uses, so a cookie in any spelling on line 1 or 2 is covered). Accepted: utf-8 in any letter case, utf_8,
-    utf-8- followed by anything (so utf-8-sig WITHOUT a BOM is accepted: it names utf-8 for the interpreter too), and
-    exactly lower-case utf8. Refused: every other name, including UTF8 and Utf8 (the interpreter accepts them; this
-    check does not), utf-7, latin-1 and an unknown codec.
+    R3: A coding cookie is judged where tokenize.detect_encoding (the stdlib PEP 263 implementation) finds one, after its
+    normalisation: on line 1, or on line 2 when line 1 is blank or a comment; a cookie after a code line is not judged.
+    Accepted: utf-8 in any letter case, utf_8, utf-8- followed by anything (so utf-8-sig WITHOUT a BOM is accepted, and
+    compile() accepts it too), and exactly lower-case utf8. Refused: every other name, including UTF8 and Utf8 (compile()
+    accepts them; this check does not), utf-7, latin-1 and an unknown codec (compile() rejects it).
     R4: Bytes that are not strict utf-8 are refused.
     R5: Any control byte other than tab, LF and CRLF line ends (NUL, form feed, a lone CR and the rest) is refused
     anywhere in the file.
     R6: Any line above the refusal that ends in a backslash is refused, whether it is a real line continuation or only
     the last character of a comment.
-    R7: Module level statements are the only code that runs when the file is started, so a dynamic import, eval, exec, a
-    branch, a class body or a decorator above the refusal cannot hide: any statement outside this whitelist is refused."""
+    R7: Any statement above the refusal other than the docstring and `import sys` is refused, so a dynamic import, eval,
+    exec, a branch, a class body, a decorator or a def cannot hide."""
     if not isinstance(source, (bytes, bytearray)):
         return "the source is not bytes"
     source = bytes(source)
@@ -1081,6 +1080,21 @@ def _self_test_cases() -> int:
             why = refusal_prefix_gap(data)
             if needle not in why:
                 return f"the docstring says {label} is refused with {needle!r} but the reason was {why!r} (R3, #5590)"
+        for label, spelling in (("UTF8", b"UTF8"), ("Utf8", b"Utf8"), ("utf-8-sig without a BOM", b"utf-8-sig"), ("utf_8", b"utf_8")):
+            try:
+                compile(b"# coding: " + spelling + b"\nx = 1\n", "f", "exec")
+            except SyntaxError as exc:
+                return f"the docstring says compile() accepts the cookie {label} but it raised {exc!r} (R3, #5624)"
+        try:
+            compile(b"# coding: nope\nx = 1\n", "f", "exec")
+            return "the docstring says compile() rejects an unknown codec but it accepted one (R3, #5624)"
+        except SyntaxError:
+            pass
+        for label, prefix, judged in (("blank line 1", b"\n", True), ("comment line 1", b"# note\n", True), ("a shebang", b"#!/usr/bin/env python3\n", True),
+                                      ("a code line 1", b"x = 1\n", False)):
+            why = refusal_prefix_gap(prefix + b"# coding: utf-7\n" + plain)
+            if ("declares the encoding utf-7" in why) != judged:
+                return f"the docstring says a cookie on line 2 after {label} is {'judged' if judged else 'not judged'} but the reason was {why!r} (R3, #5624)"
         asserted.add("R3")
         for label, data in {"a byte after line 2": b'"""doc"""\n# note\n# \xff\n' + refusal.encode(), "an overlong form": b'"""doc"""\n# note\n# \xc0\xaf\n' + refusal.encode(),
                             "an encoded surrogate": b'"""doc"""\n# note\n# \xed\xa0\x80\n' + refusal.encode()}.items():  # R4
@@ -1115,10 +1129,14 @@ def _self_test_cases() -> int:
         asserted.add("R6")
         for label, first in (("a dynamic import", "__import__('colorsys')\n"), ("an eval", "x = eval('1')\n"), ("an exec", "exec('pass')\n"),
                              ("a branch", "if False:\n    import json\n"), ("a class body", "class C:\n    import json\n"),
-                             ("a decorator", "@(lambda f: f)\ndef g():\n    pass\n")):  # R7
+                             ("a decorator", "@(lambda f: f)\ndef g():\n    pass\n"), ("a def", "def g():\n    pass\n")):  # R7
             if not refusal_prefix_gap(('"""doc"""\nimport sys\n' + first + refusal.split("import sys\n", 1)[1]).encode()):
                 return f"the docstring says {label} above the refusal is refused but it was accepted (R7)"
         asserted.add("R7")
+        marker = base_dir / "never-executed-5624.txt"  # the first paragraph: parsed with ast, never executed
+        marker.unlink(missing_ok=True)
+        if not refusal_prefix_gap(f'"""doc"""\nopen({str(marker)!r}, "w").close()\nimport sys\n'.encode() + tail) or marker.exists():
+            return "the docstring says the source is never executed but a statement above the refusal ran or was not refused (#5624)"
         numbered = set(re.findall(r"^\s+(R\d+):", refusal_prefix_gap.__doc__ or "", re.M))
         if not numbered or numbered != asserted:
             return f"the docstring numbers the rules {sorted(numbered)} but pin_5590 asserts {sorted(asserted)} (#5622)"
