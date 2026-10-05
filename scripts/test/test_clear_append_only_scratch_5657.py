@@ -1804,6 +1804,88 @@ class WidenFailureCase(ScratchTree):
         self.assertIn(str(shut), err, out + err)
         self.assertNotIn("0 cleared, 0 failed", out, out)
 
+    @unittest.skipIf(IS_BSD, "Linux: on macOS/BSD the scan skips a shared unflagged file (see the BSD pin)")
+    def test_a_link_gone_before_the_pin_is_still_refused_on_the_scan_5936(self):
+        """#5936, the Linux distinguisher for the scan's own refusal. The two
+        refusals read different things: the open path reads the walk's `lstat`,
+        the pin reads a fresh `fstat`. An entry that has an outside name at the
+        scan, loses it before the pin and gets it back after, passes the pin's
+        check and is then widened - on an inode that has a name outside the
+        scratch tree again. The scan saw the link, so the run refuses there,
+        and nothing is recorded or widened at all."""
+        mod = load_script_module()
+        entry = self.audit / "shared-at-scan.log"
+        entry.write_text("{}\n")
+        outside = self.ws / "outside-5936.log"
+        os.link(str(entry), str(outside))
+        seen = {}
+
+        def unlink():
+            os.unlink(str(outside))
+            seen["ctime"] = os.lstat(entry).st_ctime_ns
+
+        original = mod.Cleaner.hold
+
+        def hold(cleaner, path, st, want, widened):
+            ident = original(cleaner, path, st, want, widened)
+            if st.st_ino == os.lstat(entry).st_ino and not os.path.lexists(str(outside)):
+                os.link(str(entry), str(outside))
+                seen["ctime"] = os.lstat(entry).st_ctime_ns
+                seen["relinked"] = True
+            return ident
+
+        try:
+            with restrictive(entry, 0o000):
+                with swap_when_inspected(mod, os.lstat(entry).st_ino, unlink) as fired, \
+                        mock.patch.object(mod.Cleaner, "hold", hold):
+                    rc, out, err = run_clear_in_process(mod, self.ws)
+                self.assertTrue(fired, "the seam never fired: the entry was never a widen candidate")
+                self.assertEqual(os.lstat(entry).st_ctime_ns, seen["ctime"],
+                                 "an inode the scan found with a second name was chmod'ed%s:\n"
+                                 % (" after that name came back" if seen.get("relinked") else "")
+                                 + out + err)
+                self.assertEqual(stat.S_IMODE(os.lstat(entry).st_mode), 0o000, out + err)
+        finally:
+            if os.path.lexists(str(outside)):
+                os.unlink(str(outside))
+        self.assertNotEqual(rc, 0, "a shared inode left uninspected is not a pass:\n" + out + err)
+        self.assertIn("2 links", err, out + err)
+
+    @unittest.skipUnless(IS_BSD, "macOS/BSD: the lstat carries the inode flags")
+    def test_a_shared_append_only_file_is_refused_for_its_links_not_its_flag_5936(self):
+        """#5936, the macOS distinguisher. A flagged file behind mode 0o000 with
+        a second name outside the scratch tree is refused because of that name.
+        Refused for its flag instead, the report tells the operator to clear a
+        flag on an inode that also lives outside the tree. Once that flag is
+        gone the run leaves the shared inode exactly as it is."""
+        f = self.audit / "shared-flagged.log"
+        f.write_text("{}\n")
+        outside = self.ws / "outside-flagged-5936.log"
+        os.link(str(f), str(outside))
+        try:
+            with restrictive(f, 0o000):
+                with flagged(f):
+                    before = os.lstat(outside)
+                    r = run_clear(self.ws)
+                    after = os.lstat(outside)
+                    self.assertTrue(is_flagged(outside), r.stdout + r.stderr)
+                self.assertEqual(after.st_ctime_ns, before.st_ctime_ns, r.stdout + r.stderr)
+                self.assertEqual(stat.S_IMODE(after.st_mode), 0o000, r.stdout + r.stderr)
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("2 links", r.stderr, r.stdout + r.stderr)
+                self.assertNotIn("chflags", r.stderr,
+                                 "the report names a flag remedy for an inode that lives outside the tree:\n"
+                                 + r.stdout + r.stderr)
+                # The flag is off: nothing in the tree blocks an unlink, and
+                # the shared inode is not touched by the next run either.
+                before = os.lstat(outside)
+                r = run_clear(self.ws)
+                self.assertEqual(os.lstat(outside).st_ctime_ns, before.st_ctime_ns, r.stdout + r.stderr)
+                self.assertEqual(stat.S_IMODE(os.lstat(outside).st_mode), 0o000, r.stdout + r.stderr)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        finally:
+            os.unlink(str(outside))
+
 
 # --------------------------------------------------------------------------
 # structural pins: the containment primitives the behaviour tests cannot race
