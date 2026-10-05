@@ -91,22 +91,32 @@
 #     runs back from the `==` to the nearest `&&`, `||`, `==`, `!=`, `=>`, `,`
 #     or `;` at the same depth, or to the bracket that opens that depth, so
 #     nothing between the call and the `==` hides it: a cast to any type, braces,
-#     a block comment, a method chain such as `.into()`, a line break or
-#     arithmetic. Every shape the reader does not bind is decided by this rule
-#     alone: a comparison inside a closure only, behind `&&` or `||`, negated,
-#     parenthesised or chained with a second `==` is ambiguous exactly when such
-#     a left operand holds the count call. It is never guessed: it is
-#     tracked under its whole spelling with the value `?count#ambiguous`, which
+#     a block comment, a generic argument list, a method chain such as
+#     `.into()`, a line break or arithmetic. Every shape the reader does not
+#     bind is decided by this rule alone: a comparison inside a closure only,
+#     behind `&&` or `||`, negated, parenthesised or chained with a second `==`
+#     is ambiguous exactly when such a left operand holds the count call. It is
+#     never guessed: it is tracked under its whole spelling with the value
+#     `?count#ambiguous`, which
 #     is never exempt (so adding, removing or rewording it is a count change),
 #     and every const name in it is tracked as `<spelling> [NAME]` with the
 #     const's value, so bumping that const is a count change too.
+#   * GENERIC ARGUMENT LISTS (#5873): inside the arguments of an assert! or
+#     assert_eq! a generic argument list `<..>` is a bracket, nested ones too,
+#     so a comma, `&&` or `||` inside it never ends an operand or splits an
+#     argument, and the `>` of a `->` inside it closes nothing. A `<` opens such
+#     a list after `::` (a turbofish `f::<A, B>()`), after the type path that
+#     follows `as` (`x as W<A, B>`), and at the start of an operand (a qualified
+#     path `<T as Tr<A, B>>::C`); any other `<` is a comparison or a shift.
 #   * BLOCK COMMENTS AND UNREADABLE ASSERTIONS (#5872; 5-agent vote (4d3ea1c5)
 #     on #5715): inside the arguments of an assert! or assert_eq! a `/* */`
 #     block comment, nested ones too, is blank space, so an operator, a comma,
 #     a semicolon or a bracket inside it never ends an operand, splits an
 #     argument or hides a compare. An assertion whose arguments the gate cannot
 #     read (a block comment with no closing `*/`, which is also what a quote or
-#     a `//` inside a block comment becomes until #5715 brings a lexer) is
+#     a `//` inside a block comment becomes until #5715 brings a lexer; or, in
+#     arguments that hold a count call, a generic argument list whose closing
+#     `>` the gate cannot find) is
 #     tracked as `!unreadable line <N> (<reason>): <spelling>` with the value
 #     `?count#unreadable`. It is red in every commit that changes its file (or
 #     moves a const that file names) and cannot be declared; one that leaves
@@ -202,6 +212,13 @@ OPERAND_STOPS = ('&&', '||', '==', '!=', '=>')
 CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]*)\s*:\s*(?:usize|u\d+|i\d+)\s*=\s*(?P<val>[^;]+?)\s*;')
 UNREAD = '?count#unreadable'
 UNREADABLE = '!unreadable'      # the key prefix of an undecidable assertion: red in every commit that reads its file
+# The `<` that opens a generic argument list (#5873), as rustc reads it: after `::` (a turbofish, also `Vec::<u8>`),
+# after the type path that follows `as` (`x as W<A, B>`), and at the start of an operand (a qualified path
+# `<T as Tr<A, B>>::C`, also right after `as`). Any other `<` is a comparison or a shift.
+TURBOFISH = re.compile(r'::\s*<')
+AS_GENERIC = re.compile(r"as\s+(?:(?:&|\*\s*(?:const|mut)\b|mut\b|dyn\b|'[A-Za-z_]\w*)\s*)*(?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*\s*<")
+NO_CLOSER = 'a generic argument list `<` with no closing `>`'
+NOT_OPERAND = {'as', 'return', 'in', 'if', 'while', 'match', 'else', 'mut', 'move', 'break', 'let', 'yield', 'box', 'dyn'}
 
 
 def block_end(t, j):
@@ -216,12 +233,23 @@ def block_end(t, j):
     return None
 
 
+def angle_opens(m, j):
+    """m[j] == '<' outside every generic list -> True when it opens one (a qualified path at the start of an operand),
+    False when it is a comparison or a shift (an operand ends right before it)."""
+    k = j - 1
+    while k >= 0 and m[k].isspace(): k -= 1
+    if k < 0 or m[k] in '([{,;=!&|+-*/%^<>:@': return True
+    w = re.search(r'[A-Za-z_]\w*$', m[:k + 1])
+    return bool(w) and w.group() in NOT_OPERAND and not m[:w.start()].endswith(('.', '::'))
+
+
 def macro_args(t, i):
     """t[i:] follows a macro's '('. -> (orig, shape): orig is the text up to the matching ')'; shape is the same text,
-    the same length, with every block comment blanked (nested ones too),
-    so a comment is never read as an operator, a comma or a stop (#5872).
+    the same length, with every block comment blanked (nested ones too) and every generic argument list `<..>` turned
+    into `(..)`, so a comment or a generic list is never read as an operator, a comma or a stop (#5872, #5873).
     -> None when unbalanced, when a ';' is met at depth 0, or when the first depth-0 closer is not ')'.
-    -> a reason string when the arguments are undecidable: an unterminated block comment."""
+    -> a reason string when the arguments are undecidable: an unterminated block comment, or a generic list whose
+    closing `>` cannot be found."""
     out, depth, j, n = [], 0, i, len(t)
     while j < n:                                          # pass 1: the extent of the arguments, comments blanked
         if t.startswith('/*', j):
@@ -239,7 +267,28 @@ def macro_args(t, i):
         out.append(ch); j += 1
     else:
         return None
-    return t[i:j], ''.join(out)
+    orig, m = t[i:j], ''.join(out)
+    s, stack, j, n = list(m), [], 0, len(m)
+    while j < n:                                          # pass 2: generic argument lists become brackets
+        ch = m[j]
+        if stack and stack[-1] == '<':
+            if ch == '<': stack.append('<'); s[j] = '('
+            elif ch == '>' and m[j - 1] != '-': stack.pop(); s[j] = ')'      # `->` (a fn type's arrow) closes nothing
+            elif ch in '([{': stack.append(ch)
+            elif ch in ')]};': return NO_CLOSER if COUNT_CALL.search(m) else None
+            j += 1; continue
+        t2 = TURBOFISH.match(m, j)
+        a2 = AS_GENERIC.match(m, j) if (m.startswith('as', j) and not re.match(r'\w', m[j - 1:j])) else None
+        if t2 or a2:
+            j = (t2 or a2).end() - 1; stack.append('<'); s[j] = '('; j += 1; continue
+        if ch == '<':
+            if angle_opens(m, j): stack.append('<'); s[j] = '('
+            elif m.startswith(('<<', '<='), j): j += 2; continue
+        elif ch in '([{': stack.append(ch)
+        elif ch in ')]}' and stack: stack.pop()
+        j += 1
+    if '<' in stack: return NO_CLOSER if COUNT_CALL.search(m) else None
+    return orig, ''.join(s)
 
 
 def trim(s, a, b):
@@ -251,17 +300,13 @@ def trim(s, a, b):
 
 def split_arg(s, a=0):
     """-> (end of the first top-level comma-separated argument of s[a:], offset just past its comma or None when there
-    is no further argument). s is a shape (macro_args), so a comma inside a comment never splits; turbofish commas do
-    not split."""
-    depth, angle, j, n = 0, 0, a, len(s)
+    is no further argument). s is a shape (macro_args), so a comma inside a generic list or a comment never splits."""
+    depth, j, n = 0, a, len(s)
     while j < n:
         ch = s[j]
-        if s.startswith('::<', j): angle += 1; j += 3; continue
-        if angle and ch == '<': angle += 1
-        elif angle and ch == '>' and s[j - 1:j] != '-': angle -= 1
-        elif ch in '([{': depth += 1
+        if ch in '([{': depth += 1
         elif ch in ')]}': depth -= 1
-        elif ch == ',' and depth == 0 and angle == 0: return j, j + 1
+        elif ch == ',' and depth == 0: return j, j + 1
         j += 1
     return n, None
 
@@ -287,7 +332,7 @@ def compares_count(arg):
     """True when the LEFT OPERAND of some `==` of `arg` (a shape), at ANY bracket depth, holds a count call (#5797,
     #5798). The left operand runs back from the `==` to the nearest `&&`, `||`, `==`, `!=`, `=>`, `,` or `;` at the same
     depth, or to the bracket that opens that depth; whatever else sits between the call and the `==` (a cast to any
-    type, braces, a block comment, a method chain, a line break, arithmetic) keeps the call in the
+    type, braces, a block comment, a generic list, a method chain, a line break, arithmetic) keeps the call in the
     operand."""
     starts, j, n = [0], 0, len(arg)                       # starts[-1]: where the current operand begins at this depth
     while j < n:
@@ -343,7 +388,7 @@ def extract(text):
     for h in HEAD.finditer(text):
         args = macro_args(text, h.end())
         if args is None: continue
-        if isinstance(args, str):                         # undecidable arguments: red with a named line (#5872)
+        if isinstance(args, str):                         # undecidable arguments: red with a named line (#5872, #5873)
             line = text.count('\n', 0, h.start()) + 1
             src = re.sub(r'\s+', '', text[h.start():].split('\n', 1)[0])[:80]
             out.setdefault(f'{UNREADABLE} line {line} ({args}): {src}', set()).add(UNREAD)
@@ -1069,6 +1114,44 @@ def selftest():
     case('#5872 a // inside a block comment is unreadable (#5715)',
          scoped('tests/scope.rs', 'fn t() { assert!(ok && v.len() /* a // b */ == 18); }\n', 'fn t() { assert!(ok && v.len() /* a // b */ == 19); }\n'),
          True, ['!unreadable line 1 (an unterminated block comment)'])
+    # ---- #5873: a generic argument list (after ::, after the type path that follows as, or a qualified path at the start
+    # of an operand) is a bracket: a comma, && or || inside it never ends an operand, the > of an -> inside it closes
+    # nothing, and a list whose > the gate cannot find in an assertion holding a count call is red with a named line ----
+    for l_, a_ in (('a turbofish with a comma behind &&', 'ok && v.len() + f::<u8, u16>() == %s'),
+                   ('a turbofish with a comma', 'v.len() + f::<u8, u16>() == %s'),
+                   ('a turbofish with one argument behind &&', 'ok && v.len() + g::<u8>() == %s'),
+                   ('a turbofish with a space after ::', 'ok && v.len() + f:: <u8, u16>() == %s'),
+                   ('a comment between :: and <', 'ok && v.len() + f::/* , */<u8, u16>() == %s'),
+                   ('a nested turbofish', 'ok && v.len() + f::<Vec<(u8, u16)>, W<u8, u16>>() == %s'),
+                   ('a turbofish holding a fn arrow and a comma', 'ok && v.len() + f::<fn(u8) -> u8, u16>() == %s'),
+                   ('a turbofish holding &&', 'v.len() + g::<&&u8>() == %s'),
+                   ('a turbofish holding a const block with <', 'ok && v.len() + h::<{ 1 < 2 }, u8>() == %s'),
+                   ('a comment holding > inside a turbofish', 'ok && v.len() + g::<u8 /* > */>() == %s'),
+                   ('a turbofish on a method', 'ok && v.iter().map(|x| *x as usize).sum::<usize>() + v.len() + f::<u8, u16>() == %s'),
+                   ('a generic cast with a comma', 'ok && v.len() as W<u8, u16> == %s'),
+                   ('a qualified-path cast with a comma', 'ok && v.len() as <usize as Tr<u8, u16>>::O == %s'),
+                   ('a qualified-path operand with a comma', 'ok && v.len() + <usize as Tr<u8, u16>>::O::default() == %s'),
+                   ('a shift left', 'ok && v.len() << 1 == %s'), ('a shift right after a turbofish', 'ok && v.len() + g::<u8>() >> 1 == %s'),
+                   ('a less-than compare before the count', '0 < v.len() && v.len() == %s'),
+                   ('a less-or-equal compare after a cast', 'ok && (v.len() as usize) <= 20 && v.len() == %s')):
+        amb_leg('#5873 ' + l_, a_)
+    case('#5873 assert_eq! with a turbofish in the count expression is read',
+         scoped('tests/scope.rs', 'fn t() { assert_eq!(v.iter().collect::<Vec<u8>>().len(), 18); }\n',
+                'fn t() { assert_eq!(v.iter().collect::<Vec<u8>>().len(), 19); }\n'), True, ['v.iter().collect::<Vec<u8>>().len()  18 -> 19'])
+    case('#5873 assert_eq! with a qualified path holding a comma in the value keeps the whole value',
+         scoped('tests/scope.rs', 'fn t() { assert_eq!(v.len(), 18 + <usize as Tr<u8, u16>>::O::default()); }\n',
+                'fn t() { assert_eq!(v.len(), 19 + <usize as Tr<u8, u16>>::O::default()); }\n'), True,
+         ['v.len()  ?18+<usizeasTr<u8,u16>>::O::default() -> ?19+<usizeasTr<u8,u16>>::O::default()'])
+    TF = lambda n: 'fn t() { assert!(ok && v.len() + f::<u8, u16() == %s); }\n' % n
+    case('#5873 a turbofish with no closing > in a count assertion is unreadable, red with its line',
+         scoped('tests/scope.rs', TF(18), TF(19)), True,
+         ['!unreadable line 1 (a generic argument list `<` with no closing `>`): assert!(ok&&v.len()+f::<u8,u16()==19);}  (none) -> ?count#unreadable'])
+    case('#5873 a turbofish with no closing > and no count call is not read',
+         scoped('tests/scope.rs', 'fn t() { assert!(ok && k == f::<u8, u16() + 18); }\n', 'fn t() { assert!(ok && k == f::<u8, u16() + 19); }\n'), False)
+    case('#5873 a turbofish count assertion, declared, is green',
+         scoped_m('tests/scope.rs', 'fn t() { assert!(v.len() + f::<u8, u16>() == 18); }\n', 'fn t() { assert!(v.len() + f::<u8, u16>() == 19); }\n',
+                  msg('test: bump', 'Count: v.len()+f::<u8,u16>()==18 ?count#ambiguous -> (none), v.len()+f::<u8,u16>()==19 (none) -> ?count#ambiguous (fixture)')),
+         False, noerrs=['IGNORED'])
     # stated limits, pinned with today's reading (a move here is NOT flagged): #5799 #5800 #5801 #5714
     for l_, a0_ in (('M3 an assert_eq! tuple first argument (#5799)', 'assert_eq!((v.len(), v.len()), (2, %s))'),
                     ('an assert_eq! first argument cast to a path type (#5799)', 'assert_eq!(v.len() as core::primitive::usize, %s)'),
