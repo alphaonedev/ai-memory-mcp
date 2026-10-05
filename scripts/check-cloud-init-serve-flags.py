@@ -3440,7 +3440,7 @@ def build_probes() -> list:
 def apply_muts(text: str, muts) -> str:
     for old, new in muts:
         if old not in text:
-            raise RuntimeError("self-test fixture drift: %r not in the template" % old[:60])
+            raise RuntimeError("self-test fixture drift: %r not in the template" % scrub(old)[:60])
         text = text.replace(old, new, 1)
     return text
 
@@ -3523,7 +3523,7 @@ def entry_mutations(base: tuple, cache: dict) -> list:
         lines, _, _, trig, _ = analyse(nm, templates[nm], cache)
         ln = next((x for x in trig if x.ctx == ctx and x.text == line), None)
         if ln is None:
-            raise RuntimeError("self-test: allow entry matches nothing: " + raw[:80])
+            raise RuntimeError("self-test: allow entry matches nothing: " + scrub(raw)[:80])
         phys = templates[nm].split("\n")
         phys[ln.last - 1] = phys[ln.last - 1] + " #m"
         out.append((raw, nm, "\n".join(phys)))
@@ -3725,6 +3725,13 @@ def pin_problems() -> list:
 def self_test(known: set) -> int:
     base = load_repo()
     cache = {}
+    # no template or fixture text is cut before it is scrubbed: a cut inside scrub() drops the
+    # "@" that marks the userinfo (#5489, #5490)
+    src = Path(__file__).read_text(encoding="utf-8")
+    cut_first = re.compile(r"scrub\([^()]*\[:\d+\]\)|\b(?:raw|old)\[:\d+\]")
+    for no, line in enumerate(src.splitlines(), 1):
+        if cut_first.search(line):
+            bad.append("line %d cuts text before scrub() or prints it uncut-scrubbed" % no)
     bad, counts = [], {"red": 0, "green": 0, "fault": 0}
     for label, expect, spec in build_probes():
         t, mt, a, p, auto, extra = case_inputs(base, spec)
@@ -3744,7 +3751,7 @@ def self_test(known: set) -> int:
         hits, faults, _ = run_scan(t, base[1], base[2], base[3], known, cache=cache)
         want = "| tf-region: " if " | tf-region | " in raw else "not in the allowlist"
         if faults or not any(want in h for h in hits):
-            bad.append("entry mutation stayed green: " + raw[:100])
+            bad.append("entry mutation stayed green: " + scrub(raw)[:100])
     # each append at least doubles the value set: past EXPAND_CAP it collapses, so a chain
     # stays linear (#5329); a chain this short passes the cap and keeps a mutant fast
     chain = [(0, "F+=a%d" % i, 0) for i in range(EXPAND_CAP.bit_length())]
