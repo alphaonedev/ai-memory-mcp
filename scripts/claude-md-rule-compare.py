@@ -370,7 +370,7 @@ class Plant(NamedTuple):
     frozen_xopt: str
 
 
-def plant_probe(name: str, probe: Path, xopts: list, env=None, isolate=("-S", "-E")) -> Plant:
+def plant_probe(name: str, probe: Path, xopts: list, env=None, isolate=("-S", "-E"), exit_code: int = 0) -> Plant:
     """#5441: plant `name`.py beside a child that imports `name`, run with the isolation flags `isolate` (default
     -S -E) plus the interpreter options `xopts`; `env` (None: child_env(), never the inherited environment) is the child's environment. Before importing,
     the CHILD prints its own verdict (through _frozen_importlib): whether `name` is already loaded, and whether it is
@@ -378,7 +378,7 @@ def plant_probe(name: str, probe: Path, xopts: list, env=None, isolate=("-S", "-
     sys.flags.ignore_environment, sys.flags.safe_path where the interpreter has it, and the frozen_modules -X
     option). Nothing is assumed about the interpreter: the callers compare these reports with what they require."""
     probe.mkdir(parents=True, exist_ok=True)
-    (probe / f"{name}.py").write_text("print('PLANTED')\nraise SystemExit(0)\n", encoding="utf-8")
+    (probe / f"{name}.py").write_text(f"print('PLANTED')\nraise SystemExit({exit_code})\n", encoding="utf-8")
     (probe / "probe.py").write_text(
         "import sys, _frozen_importlib as fi\n"
         f"name = {name!r}\n"
@@ -678,7 +678,7 @@ def _self_test_cases() -> int:
         # #5507: the set covers every frozen_modules option, alone and with every isolation set.
         flag_sets = refusal_flag_sets()
         for xopt in ([], ["-X", "frozen_modules=off"], ["-X", "frozen_modules=on"]):
-            for isolation in REFUSAL_ISOLATION_SETS:
+            for isolation in ([], ["-E"], ["-s"], ["-E", "-s"], ["-E", "-s", "-S", "-B", "-O"], ["-S", "-E"]):
                 if xopt + isolation not in flag_sets:
                     return False
         # #5283/#5373/#5474/#5507: the refusal is pinned for every flag set in refusal_flag_sets(): each of no -X option,
@@ -726,7 +726,8 @@ def _self_test_cases() -> int:
                  ("VERDICT 0 0 1 1 0 -\n VERDICT 0 0 1 1 0 -\nPLANTED\n", [], False),
                  ("VERDICT 0 1 1 1 0 -\nREAL\nREAL\n", [], False), ("VERDICT 0 0 1 1 0 -\nPLANTED\nREAL\n", [], False),
                  ("VERDICT 1 0 1 1 0 -\nREAL\n", [], False), ("VERDICT 0 1 1 1 0 - \nREAL\n", [], False),
-                 ("VERDICT 0 1 1 1 0 bad\nREAL\n", [], False), ("VERDICT 0 1 1 1 0 -\nREAL\n", [], True)]
+                 ("VERDICT 0 1 1 1 0 bad\nREAL\n", [], False),
+                 ("VERDICT 7 0 1 1 0 -\nPLANTED\n", [], False), ("VERDICT 1 0 1 1 0 -\nPLANTED\n", [], False), ("VERDICT 0 1 1 1 0 -\nREAL\n", [], True)]
         for out, xo, want in synth:
             if parse_plant(out, xo, ("-S", "-E")).ok != want:
                 return f"parse_plant gave the wrong ok for {out!r} with options {xo} (#5473)"
@@ -752,7 +753,9 @@ def _self_test_cases() -> int:
         for old, new in (("import sys\n\nif __name__", "import sys, json\n\nif __name__"),
                          ("import sys\n\nif __name__", "import sys as s\nimport sys\n\nif __name__"),
                          ("sys.exit(1)", "sys.exit(__import__('colorsys'))"), ("    print(\"## CLAUDE.md rule-change", "    __import__('colorsys')\n    print(\"## CLAUDE.md rule-change"),
-                         ("not sys.flags.isolated:", "not sys.flags.isolated or True:"), ("not sys.flags.isolated:", "not sys.flags.isolated or __import__('colorsys'):"),
+                         ("not sys.flags.isolated:", "not sys.flags.isolated or True:"),
+                         ("import sys\n\nif __name__", "import sys as s\n\nif __name__"), ("sys.exit(1)", "sys.exit(1, **{})"),
+                         ("    sys.exit(1)\n", "    sys.exit(1)\nelse:\n    x = 1\n"), ("not sys.flags.isolated:", "not sys.flags.isolated or __import__('colorsys'):"),
                          (marker, "if True:"), ("import sys\n\nif __name__", "import sys\n\nx = 1\nif __name__")):
             if old not in source or not refusal_prefix_gap(source.replace(old, new, 1)):
                 return f"a changed refusal or import line was not refused: {new!r} (#5510)"
@@ -781,6 +784,9 @@ def _self_test_cases() -> int:
                 if plant.planted_ran:
                     live.append(name)
             print(f"INFO: self-test - planted file ran (measured) for {live} with options {xopts}")
+        # #5509: the child's exit code reaches parse_plant: a planted file that ran and exited 3 is never ok.
+        if live and plant_probe(live[0], base_dir / "implant-exit", [], exit_code=3).ok:
+            return "a probe child that exited non-zero was accepted (#5509)"
         if plant_coverage_gap(probed, names, 2):
             return "not every imported name was probed"
         if plant_coverage_gap(names + names, names, 2) or not plant_coverage_gap(names[:1], names, 1) \
