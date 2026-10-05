@@ -2036,6 +2036,8 @@ ROUND3_RED = [
     ('5685 mutant pin: reported 1: an expansion inside a long option name is reported', 'mysql --$OPT db'),
     ('5689 mutant pin: reported 1: a head under a libexec directory is a command', '/usr/libexec/mysqlcheck --password="$X"'),
     ('5737 mutant pin: reported 1: a head under a libexec directory is a command even when no other pattern tags the line', '/usr/libexec/mysqlcheck -u r "$X"'),
+    ('5746 mutant pin: reported 1: -p followed by a value-option letter still carries the password', 'mysql -ph$X db'),
+    ('5746 mutant pin: reported 2: -p followed by a value-option letter still carries the password', 'mysql -pP"$X" db'),
     ('5683 mutant pin: reported 2: the password command word of mysqladmin is matched in any letter case', 'mysqladmin PASSWORD "x$NEW"'),
 ]
 ROUND3_GREEN = [
