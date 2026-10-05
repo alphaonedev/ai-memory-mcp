@@ -838,8 +838,25 @@ def tainted_names(text):
         names |= new
 
 
-# /dev/stderr, /dev/stdout, /dev/tty, /dev/fd/N and /proc/*/fd/N are the terminal, not a file (#5236).
-TERMINAL = r"/dev/(?:stderr|stdout|tty|fd/)|/proc/"
+# #5236, #5412: where does a command's stdout go? Every output redirect (> >> >| &> &>> >&N 1>...) is parsed and
+# the LAST one decides, as in bash. Only a plain path (a literal or a "$VAR/..." path) or /dev/null is a file:
+# a dup (&N), any other /dev path (stderr, stdout, tty, console, pts, fd, vcs ...), /proc, a target computed by
+# $( ), backticks or >( ) is the terminal. A redirect target held wholly in a variable is a stated limit (#5418).
+OUT_REDIRECT = re.compile(r"(?:(?<![0-9&<>])|(?<=[\s;]1))(&>>|&>|>>|>\||>)(?!\()\s*(\"[^\"]*\"|'[^']*'|\S+)")
+
+
+def stdout_to_file(text):
+    """True when the last fd-1 output redirect in `text` targets a plain file (or /dev/null)."""
+    last = None
+    for m in OUT_REDIRECT.finditer(text):
+        last = m.group(2).strip("\"'")
+    if last is None:
+        return False
+    if last.startswith("&") or "$(" in last or "`" in last or last.startswith(">("):
+        return False
+    if last.startswith("/dev/") and last != "/dev/null":
+        return False
+    return not re.match(r"/proc/", last)
 
 
 def heredoc_findings(text, names):
@@ -855,7 +872,7 @@ def heredoc_findings(text, names):
         while j < len(lines) and lines[j].strip() != delim:
             body.append(lines[j])
             j += 1
-        to_file = re.search(r"(?<![0-9&])>\s*(?!&)(?!%s)\S" % TERMINAL, opener[m.start():]) or "$(" in opener[:m.start()]
+        to_file = stdout_to_file(opener[m.start():]) or "$(" in opener[:m.start()]
         if not quoted and not to_file:
             hit = [v for v in names if re.search(r"\$\{?[#!]?%s\b" % re.escape(v), "\n".join(body))]
             if hit:
@@ -992,8 +1009,8 @@ def taint_findings(text, names):
                 if after.startswith("|") and not after.startswith("||") \
                         and re.match(r"\|\s*(?:grep\s+-q\w*\s|curl\s|base64\b)", after):
                     continue
-                # A file is not the terminal; /dev/stderr, /dev/tty, /dev/fd/N and /proc/*/fd are.
-                if re.search(r"(?<![0-9&])>\s*(?!&)(?!%s)\S" % TERMINAL, args):
+                # A file is not the terminal; the last output redirect decides (#5412).
+                if stdout_to_file(args):
                     continue
             checked += 1
             rest = re.sub(helper, "", args)
@@ -1134,6 +1151,21 @@ def closed_world_taint(fs):
                         ("tr with the reply as a set", 'echo abc | tr abc "$qjson"'),
                         ("unset with the reply", 'unset "$qjson"'),
                         ("readonly with the reply as the name", 'readonly "$qjson"'),
+                        # #5412: the LAST output redirect decides, >> and >| are redirects, and only a plain path is a file.
+                        ("an append to /dev/stderr", 'printf %s "$qjson" >> /dev/stderr'),
+                        ("a clobber to /dev/stderr", 'printf %s "$qjson" >| /dev/stderr'),
+                        ("a file and then a dup to stderr", 'printf %s "$qjson" >/dev/null >&2'),
+                        ("a file and then 1>&2", 'printf %s "$qjson" > "$OUT_DIR/r" 1>&2'),
+                        ("a write to a pty", "printf '%s\\n' \"$qjson\" > /dev/pts/0"),
+                        ("a write to the console", 'printf %s "$qjson" > /dev/console'),
+                        ("a write to a serial tty", 'printf %s "$qjson" > /dev/ttyS0'),
+                        ("a write to a virtual console", 'printf %s "$qjson" > /dev/vcs1'),
+                        ("a write to a command-computed tty", "printf '%s\\n' \"$qjson\" > \"$(tty)\""),
+                        ("a write to a backtick-computed tty", 'printf %s "$qjson" > `tty`'),
+                        ("an &> to /dev/stderr", 'printf %s "$qjson" &> /dev/stderr'),
+                        ("an &>> to /dev/stderr", 'printf %s "$qjson" &>> /dev/stderr'),
+                        ("a here-document appended to /dev/stderr", 'cat >> /dev/stderr <<EOT\nx $qjson\nEOT'),
+                        ("a here-document to a pty", 'cat > /dev/pts/1 <<EOT\nx $qjson\nEOT'),
                         # #5411: arithmetic and expansion-error contexts print the operand that fails.
                         ("an arithmetic expansion", ': $((qjson + 0))'),
                         ("an arithmetic expansion with a dollar", 'n=$(( $qjson * 2 ))'),
@@ -1188,6 +1220,15 @@ def closed_world_taint(fs):
                         ("a reply captured through sed", "age_ver=\"$(printf '%s\\n' \"$versions\" | sed -n 's/^age=//p')\""),
                         ("the status helper given a reply body", 'no "x $(reply_status "$qjson")"'),
                         ("a test after then", 'if true; then [ "$qjson" = x ] && :; fi'),
+                        # #5412: a plain path or /dev/null is a file whatever the order of the other redirects.
+                        ("a write to a file", 'printf %s "$qjson" > "$OUT_DIR/r"'),
+                        ("an append to a file", 'printf %s "$qjson" >> "$OUT_DIR/r"'),
+                        ("a write to /dev/null", 'printf %s "$qjson" > /dev/null'),
+                        ("a file and stderr to the file", 'printf %s "$qjson" >"$OUT_DIR/r" 2>&1'),
+                        ("stderr to the terminal, then a file", 'printf %s "$qjson" 2>&1 >"$OUT_DIR/r"'),
+                        ("an &> to a file", 'printf %s "$qjson" &>"$OUT_DIR/r"'),
+                        ("a dup to stderr, then a file", 'printf %s "$qjson" >&2 >"$OUT_DIR/r"'),
+                        ("a here-document to a file", 'cat > "$OUT_DIR/r" <<EOT\nx $qjson\nEOT'),
                         # #5406: a reply is a VALUE of a declaration, or reaches a filter on stdin: both print nothing.
                         ("arithmetic on a counter", 'c=$((c + 1))\n[ "$c" -gt 3 ] && :'),
                         ("a constant substring of a reply", 'x="${qjson:0:8}"'),
