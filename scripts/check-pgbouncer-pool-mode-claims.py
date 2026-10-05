@@ -675,7 +675,8 @@ def _raw_lines(path: Path, codec: str, offset: int, drop_nul: bool) -> Iterator[
     """The bytes of a file from `offset` on, decoded as `codec` with each invalid sequence replaced, as the lines
     str.splitlines() gives. With drop_nul each NUL is removed (a word cut by NULs; in latin-1 and UTF-8 the NUL bytes
     go before decoding, so a multi-byte sequence cut by them is whole again); otherwise each NUL ends a line. A line
-    longer than RAW_LINE_CAP is cut in segments that overlap by RAW_OVERLAP characters, so no word is lost."""
+    still open at the end of a chunk and longer than RAW_LINE_CAP is cut in segments that overlap by RAW_OVERLAP
+    characters, so no word is lost; a line that ends inside its chunk is given whole."""
     decoder = codecs.getincrementaldecoder(codec)("replace")
     nul = "" if drop_nul else "\n"
     carry = ""
@@ -1681,6 +1682,52 @@ def stream_failures() -> int:
     return bad
 
 
+# #5719, #5720, #5721: exact lines of the raw reader with RAW_LINE_CAP 6 and RAW_OVERLAP 2, at chunk sizes that cut
+# the input everywhere: (bytes, codec, offset, drop_nul, chunk sizes, lines it must give). A line is cut only while
+# it is still open at the end of a chunk; a long line that ends inside its chunk is given whole.
+ANY_CHUNK = (1, 2, 3, 5, 26, 64)
+RAW_LINE_PINS: List[Tuple[bytes, str, int, bool, Tuple[int, ...], List[str]]] = [
+    (b"abcdefghijklmnopqrstuvwxyz\ntail", "latin-1", 0, False, (1, 2, 3, 5, 26),
+     ["abcdef", "efghij", "ijklmn", "mnopqr", "qrstuv", "uvwxyz", "tail"]),
+    (b"abcdefghijklmnopqrstuvwxyz\ntail", "latin-1", 0, False, (27, 64), ["abcdefghijklmnopqrstuvwxyz", "tail"]),
+]
+# #5721: the exact place raw_mention reports, line numbers counted from 1.
+RAW_MENTION_PINS: List[Tuple[bytes, str]] = [
+]
+
+
+def raw_line_failures() -> int:
+    """#5719, #5720, #5721: _raw_lines gives the exact lines above at every chunk size (cut segments overlap, \\r\\n
+    split across chunks is one break, NUL is a break or removed, every byte decodes with replacement), and
+    raw_mention reports the exact view and line."""
+    global CHUNK_BYTES, RAW_LINE_CAP, RAW_OVERLAP
+    bad = 0
+    saved = (CHUNK_BYTES, RAW_LINE_CAP, RAW_OVERLAP)
+    with tempfile.TemporaryDirectory(dir=_scratch_base()) as tmp:
+        sample = Path(tmp) / "r.bin"
+        try:
+            RAW_LINE_CAP, RAW_OVERLAP = 6, 2
+            for body, codec, offset, drop_nul, sizes, want in RAW_LINE_PINS:
+                sample.write_bytes(body)
+                for size in sizes:
+                    CHUNK_BYTES = size
+                    got = list(_raw_lines(sample, codec, offset, drop_nul))
+                    if got != want:
+                        bad += 1
+                        print("self-test FAIL raw lines of %r as %s+%d at CHUNK_BYTES=%d: %r" % (body, codec, offset, size, got))
+            CHUNK_BYTES, RAW_LINE_CAP, RAW_OVERLAP = saved
+            for body, want_at in RAW_MENTION_PINS:
+                sample.write_bytes(body)
+                got_at = raw_mention(sample)
+                if got_at != want_at:
+                    bad += 1
+                    print("self-test FAIL raw_mention of %r: %r, want %r" % (body, got_at, want_at))
+        finally:
+            CHUNK_BYTES, RAW_LINE_CAP, RAW_OVERLAP = saved
+    print("self-test %s raw reader lines and raw_mention places are exact" % ("ok  " if not bad else "FAIL"))
+    return bad
+
+
 # #5367: the reviewed set of binary suffixes the skip list may name, written out here on purpose: the pin must not
 # be derived from BINARY_SUFFIXES itself, or narrowing the set would narrow the pin with it.
 REVIEWED_BINARY_SUFFIXES = frozenset(
@@ -1744,7 +1791,7 @@ def pin_failures() -> int:
 
 def run_cases(verbose: bool) -> int:
     scratch_base = _scratch_base()
-    failures = stream_failures() + binary_suffix_failures() + pin_failures()
+    failures = stream_failures() + raw_line_failures() + binary_suffix_failures() + pin_failures()
     for name, files, want in cases():
         with tempfile.TemporaryDirectory(dir=scratch_base) as tmp:
             root = Path(tmp)
@@ -1836,6 +1883,10 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("F1 #5717 ascii shortcut wrong way", '    if text.isascii():\n        return False  # no reordering', '    if not text.isascii():\n        return False  # no reordering'),
     ("F1 #5717 junk floor removed", 'junk = max(0, (len(key) - 5) // 2)', 'junk = (len(key) - 5) // 2'),
     ("F1 #5717 junk floor one", 'junk = max(0, (len(key) - 5) // 2)', 'junk = max(1, (len(key) - 5) // 2)'),
+    ("F3a #5719 the raw overlap shorter than a word", "RAW_LINE_CAP, RAW_OVERLAP = 1 << 22, 4096", "RAW_LINE_CAP, RAW_OVERLAP = 1 << 22, 8"),
+    ("F3a #5719 one raw cut per chunk", "            while len(carry) > RAW_LINE_CAP:", "            if len(carry) > RAW_LINE_CAP:"),
+    ("F3a #5719 a raw segment one short", "yield carry[:RAW_LINE_CAP]", "yield carry[:RAW_LINE_CAP - 1]"),
+    ("F3a #5719 the raw overlap one short", "carry = carry[RAW_LINE_CAP - RAW_OVERLAP:]", "carry = carry[RAW_LINE_CAP - RAW_OVERLAP + 1:]"),
     # #5554, #5555: rules shown unpinned by mutants N01-N12 (round-8 review)
     ("N01 #5554 set-env reach of four arguments", "[^\\s=\\\"']+){0,4}?", "[^\\s=\\\"']+){0,3}?"),
     ("N02 #5555 a prefixed key before a command", 're.compile(r"^[a-z0-9_]*pool[_-]?mode=', 're.compile(r"^pool[_-]?mode='),
