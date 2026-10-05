@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/docs/compliance/evidence/cert-3607"
-FIX="$ROOT/.local-runs/cert-3607-fixtures"
+export FIX="$ROOT/.local-runs/cert-3607-fixtures"
 DEFAULT_BIN="${DEFAULT_BIN:-/mnt/t9/v07/cargo-target-gate-tip/release/ai-memory}"
 SQLCIPHER_BIN="${SQLCIPHER_BIN:-/mnt/t9/v07/cargo-target-gate-live/release/ai-memory}"
 export TMPDIR="${TMPDIR:-$ROOT/.local-runs/tmp}"
@@ -18,7 +18,7 @@ import os, base64
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption
 
-fix = Path(os.environ.get("FIX") or Path.cwd() / ".local-runs/cert-3607-fixtures")
+fix = Path(os.environ["FIX"])
 fix.mkdir(parents=True, exist_ok=True)
 keys = fix / "keys"
 keys.mkdir(mode=0o700, exist_ok=True)
@@ -66,7 +66,8 @@ run_posture() {
     AI_MEMORY_AGENT_ID=ai-memory \
     AI_MEMORY_KEY_DIR="$FIX/keys" \
     "$@" \
-    "$bin" doctor --posture enterprise-federation
+    bash -c 'if [ -n "${POSTURE_PASSFILE:-}" ]; then k="$(cat "$POSTURE_PASSFILE")" || exit 70; export AI_MEMORY_DB_PASSPHRASE="$k"; fi; unset POSTURE_PASSFILE; exec "$@"' \
+    _ "$bin" doctor --posture enterprise-federation
 }
 
 # --- leg 1: bare ---
@@ -125,11 +126,12 @@ else
   [[ -f "$FIX/db-passphrase" ]] || { umask 077; od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$FIX/db-passphrase"; }
   # doctor opens the store read-only and refuses to create it: seed the encrypted fixture store first (schema-init).
   [[ -f "$FIX/leg4-sqlcipher.db" ]] || env -i PATH="/usr/bin:/bin:$HOME/.cargo/bin" HOME="$HOME" TMPDIR="$TMPDIR" AI_MEMORY_NO_CONFIG=1 \
-    AI_MEMORY_DB="$FIX/leg4-sqlcipher.db" AI_MEMORY_DB_PASSPHRASE="$(cat "$FIX/db-passphrase")" "$SQLCIPHER_BIN" stats --json >/dev/null 2>&1 || true
+    AI_MEMORY_DB="$FIX/leg4-sqlcipher.db" \
+    bash -c 'k="$(cat "$1")" || exit 70; export AI_MEMORY_DB_PASSPHRASE="$k"; shift; exec "$@"' _ "$FIX/db-passphrase" "$SQLCIPHER_BIN" stats --json >/dev/null 2>&1 || true
   set +e
   run_posture "$SQLCIPHER_BIN" "${HARD[@]}" \
     AI_MEMORY_DB="$FIX/leg4-sqlcipher.db" \
-    AI_MEMORY_DB_PASSPHRASE="$(cat "$FIX/db-passphrase")" \
+    POSTURE_PASSFILE="$FIX/db-passphrase" \
     AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1 \
     >"$OUT/posture-sqlcipher-pass.out.raw" 2>&1
   e4=$?

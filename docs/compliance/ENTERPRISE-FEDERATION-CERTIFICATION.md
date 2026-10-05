@@ -117,6 +117,8 @@ certification and triggers re-cert** (see §7).
 > recorded in `cert-385da3a05/posture-legs-exit-codes.txt`; the bare and
 > hardened legs fail exactly the same checks as at `eba96b307`.
 >
+> The recapture script was amended after this issue so the leg-4 passphrase is on no argv (#4792); the amendment is recorded in the `recapture-posture.sh` row of `cert-385da3a05/SANITIZATION.md`, and no figure above changed.
+>
 > **§5.4(4)/(7) acceptance battery** — 11 invocations, default features, one
 > filter each; **11/11 green, zero failures**:
 > `boot_fail_closed_config_3166` 15 · `doctor_posture_exit_code_3003` 2 ·
