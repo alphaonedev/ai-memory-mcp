@@ -569,9 +569,10 @@ CRED_TOOL_RE = re.compile(
     r"[^\"'$]*(?:[\"'](?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?)?\$")
 
 
-# wget -e/--execute runs a wgetrc command. wgetrc ignores case, dashes and underscores in a
+# wget -e/--execute runs a wgetrc command; getopt takes any unique prefix of the long name, so --exe
+# .. --execute all run it (--ex is ambiguous and wget refuses it). wgetrc ignores case, dashes and underscores in a
 # command name and allows spaces around "=", so the name is folded and read, not matched (#5293).
-WGET_EXEC_RE = re.compile(r"\bwget\b[^|;&]*?(?:(?<![\w-])-[A-Za-z]*e|--execute(?![\w-]))[\s=]*")
+WGET_EXEC_RE = re.compile(r"\bwget\b[^|;&]*?(?:(?<![\w-])-[A-Za-z]*e|--exe(?:c(?:u(?:te?)?)?)?(?![\w-]))[\s=]*")
 WGETRC_PASSWORD_RE = re.compile(r"(?:https?|ftp|proxy)?passw(?:or)?d")
 
 
@@ -1450,6 +1451,11 @@ ROUND3_RED = [
     ("wget -e doubled separators", 'wget --execute "HTTP__PASS-WORD=$X" h'),
     ("wget -e name from an expansion", 'wget -e "$K=$V" h'),
     ("wget -e inside sh -c", 'sh -c "wget -e \\"HTTP_PASSWORD=$X\\" h"'),
+    # getopt takes any unique prefix of --execute: --exe is the shortest (#5293)
+    ("wget --exe prefix", 'wget --exe "http_password=$X" h'),
+    ("wget --exec prefix", 'wget --exec "http_password=$X" h'),
+    ("wget --execu prefix", 'wget --execu "http_password=$X" h'),
+    ("wget --execut prefix, =", 'wget --execut="https_password=$X" h'),
     # quoted and partly quoted user parts (#5101)
     ("curl -u single-quoted user", "curl -u 'u':\"$X\" h"),
     ("curl -u double-quoted user", 'curl -u "u":"$X" h'),
