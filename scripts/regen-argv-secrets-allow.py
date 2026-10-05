@@ -6,8 +6,10 @@
 5-agent vote (4d3ea1c5), decision eda8d8fb: scripts/check-docs-no-argv-secrets.py flags a
 credential-shaped operand under a head it does not model (an unknown program), or in a
 bash array body (#5723). The only exemption is a reviewed line in the allowlist, keyed by
-file, class and the sha256 of the whole command text, never a program name. This script is
-the only writer of that file.
+file, class and the sha256 of the whole command text, never a program name. This script
+renders that file with the gate's allow_render, and the gate fails unless the file is
+byte-identical to that render (#5836). Neither can tell who typed a line: a hand-typed line
+that this script would write the same way passes, so the approval is the reviewed diff.
 
 By default it only deletes and reorders: an entry that no longer matches a hit is removed,
 the rest are written in tree order (file, then line), and a hit with no entry is printed as
@@ -30,14 +32,6 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-HEADER = [
-    "# Reviewed lines exempt from the unknown-head credential-operand rule of",
-    "# scripts/check-docs-no-argv-secrets.py (#5722, 5-agent vote (4d3ea1c5)).",
-    "# Written ONLY by scripts/regen-argv-secrets-allow.py; adding an entry needs --accept-new.",
-    "# Format: path | class | sha256 of the whole command (32 hex) | value kind | masked preview.",
-    "# A literal value is never written: the regen script refuses it by name (F1, round 12).",
-    "# An entry claims one hit; any edit of the command changes its hash and voids the entry.",
-]
 
 
 def load_gate(root: Path):
@@ -47,8 +41,9 @@ def load_gate(root: Path):
     return g
 
 
-def render(header, keys) -> str:
-    return "\n".join(list(header) + ["%s | %s | %s | %s | %s" % k for k in keys]) + "\n"
+def render(g, keys) -> str:
+    """#5836: the gate's own render (its ALLOW_HEADER), so the gate can require byte identity."""
+    return g.allow_render(keys)
 
 
 def refused_lines(refused) -> list:
@@ -62,7 +57,6 @@ def plan(g, old_text: str, now, accept: bool):
     entries, faults = g.load_allow(old_text)
     if faults:
         return None, ["FAULT: " + f for f in faults], 0
-    header = [x for x in old_text.splitlines() if x.startswith("#")] or HEADER
     have = Counter(entries)
     want = Counter(now)
     removed = have - want
@@ -75,7 +69,7 @@ def plan(g, old_text: str, now, accept: bool):
             keep[k] -= 1
     lines = ["REMOVED: %s | %s | %s | %s | %s" % k for k in sorted(removed.elements())]
     lines += ["NEW: %s | %s | %s | %s | %s" % k for k in sorted(added.elements())]
-    return render(header, out), lines, sum(added.values())
+    return render(g, out), lines, sum(added.values())
 
 
 def self_test(g) -> int:
@@ -84,22 +78,26 @@ def self_test(g) -> int:
     b = ("docs/b.md", g.UNKNOWN_TAG, "b" * 32, g.VALUE_NONE, "tool -v m=*")
     c = ("scripts/c.sh", g.UNKNOWN_TAG, "c" * 32, g.VALUE_PLACEHOLDER, "tool --set k=*")
     d = ("scripts/d.sh", g.ARRAY_TAG, "d" * 32, g.VALUE_EXPANSION, "-v k=*")
-    base = render(HEADER, [a, b])
+    base = render(g, [a, b])
     cases = [
         # label, old text, tree keys, accept, want text keys (None: fault), want NEW count
         ("clean file is unchanged", base, [a, b], False, [a, b], 0),
-        ("stale entry is deleted", render(HEADER, [a, b, c]), [a, b], False, [a, b], 0),
+        ("stale entry is deleted", render(g, [a, b, c]), [a, b], False, [a, b], 0),
         ("new entry is refused without accept", base, [a, b, c], False, [a, b], 1),
         ("new entry is written with accept", base, [a, b, c], True, [a, b, c], 1),
-        ("entries are reordered to tree order", render(HEADER, [b, a]), [a, b], False, [a, b], 0),
-        ("a duplicate hit needs its own entry", render(HEADER, [a]), [a, a], False, [a], 1),
-        ("a duplicate entry with one hit is deleted", render(HEADER, [a, a]), [a], False, [a], 0),
+        ("entries are reordered to tree order", render(g, [b, a]), [a, b], False, [a, b], 0),
+        ("a duplicate hit needs its own entry", render(g, [a]), [a, a], False, [a], 1),
+        ("a duplicate entry with one hit is deleted", render(g, [a, a]), [a], False, [a], 0),
+        # #5836: a hand-edited or extra header line is rewritten to the gate's header.
+        ("a hand-edited header is restored", base.replace("byte-identical", "regen-written", 1), [a, b], False,
+         [a, b], 0),
+        ("an extra comment line is removed", "# hand note\n" + base, [a, b], False, [a, b], 0),
         ("malformed line refuses any rewrite", base + "tool\n", [a, b], True, None, 0),
         ("unmasked preview refuses any rewrite", base.replace("n=*", "n=hunter2"), [a, b], True, None, 0),
         ("non-waivable class refuses any rewrite", base.replace(g.UNKNOWN_TAG, "env-password-argv", 1),
          [a, b], True, None, 0),
         ("missing file starts from the header", "", [a], True, [a], 1),
-        ("an array-body entry is a waivable class", render(HEADER, [a, d]), [a, d], False, [a, d], 0),
+        ("an array-body entry is a waivable class", render(g, [a, d]), [a, d], False, [a, d], 0),
         # F1 (round 12): a literal value kind in the file refuses any rewrite.
         ("a literal value entry refuses any rewrite", base.replace(g.VALUE_EXPANSION, g.VALUE_LITERAL, 1),
          [a, b], True, None, 0),
@@ -109,8 +107,7 @@ def self_test(g) -> int:
     bad = 0
     for label, old, now, accept, want, want_new in cases:
         text, lines, n_new = plan(g, old, now, accept)
-        ok = (text is None) if want is None else (text == render(
-            [x for x in old.splitlines() if x.startswith("#")] or HEADER, want) and n_new == want_new)
+        ok = (text is None) if want is None else (text == render(g, want) and n_new == want_new)
         if want is not None and any("hunter2" in x for x in lines):
             ok = False
         if not ok:
@@ -158,9 +155,9 @@ def literal_self_test(g) -> int:
         hits = g.scan_text(rel, body)
         refused = [k for k in (g.literal_waivable_key(h) for h in hits) if k is not None]
         keys = [k for k in (g.waivable_key(h) for h in hits) if k is not None]
-        text, _lines, _n = plan(g, render(HEADER, []), keys, True)
+        text, _lines, _n = plan(g, render(g, []), keys, True)
         named = refused_lines(refused)
-        if (len(refused) != 1 or keys or text != render(HEADER, []) or not named[0].startswith(
+        if (len(refused) != 1 or keys or text != render(g, []) or not named[0].startswith(
                 "REFUSED-LITERAL: %s | " % rel) or "| literal |" not in named[0]
                 or any(FAKE_VALUE in x for x in named + [h[2] for h in hits])):
             print("REGEN SELF-TEST FAIL: literal probe %r: hits %r refused %r" % (body, hits, named),

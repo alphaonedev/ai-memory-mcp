@@ -1329,11 +1329,13 @@ jobs:
         # prefixes, the bare echo/printf builtins, YAML values, redaction
         # tokens, bare -e NAME, the schema-init file channel.
         run: python3 scripts/check-docs-no-argv-secrets.py --self-test
-      - name: Operand allowlist is current and regen-written (#5722)
+      - name: Operand allowlist matches the regen output (#5722, #5836)
         # 5-agent vote (4d3ea1c5): the reviewed-line allowlist of the
-        # unknown-head operand rule is written only by the regen script; this
-        # fails when a rewrite (a stale entry, an order change) or a NEW entry
-        # is pending, and on a form fault.
+        # unknown-head operand rule must be byte-identical to what the regen
+        # script writes for the tree; this fails when a rewrite (a stale entry,
+        # an order change, a changed header) or a NEW entry is pending, on a
+        # form fault, and on a literal value (#5835). It cannot tell who typed
+        # a line: the approval is the reviewed diff of the file.
         run: python3 scripts/regen-argv-secrets-allow.py --check
       - name: Self-test the allowlist regen script (#5722)
         run: python3 scripts/regen-argv-secrets-allow.py --self-test

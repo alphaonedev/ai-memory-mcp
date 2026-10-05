@@ -56,9 +56,12 @@ template file):
                      does not model (#5722, 5-agent vote (4d3ea1c5)). The one
                      exemption is a reviewed line in
                      scripts/qc-allowlists/argv-secrets-operand-allow.txt, keyed
-                     by file and the sha256 of the whole command, written only
-                     by scripts/regen-argv-secrets-allow.py; an entry that
-                     claims no hit fails the gate. The hit names the value
+                     by file and the sha256 of the whole command. The gate
+                     fails unless the file is byte-identical to what
+                     scripts/regen-argv-secrets-allow.py writes for the tree
+                     (#5836); it cannot tell who typed a line, so the approval
+                     is the reviewed diff of that file. An entry that claims
+                     no hit fails the gate. The hit names the value
                      kind of the flagged operand (``value=literal``,
                      ``placeholder``, ``expansion`` or ``none``) and never
                      the value; a literal value (any character left after
@@ -186,9 +189,21 @@ SELF_EXEMPT = {"scripts/check-docs-no-argv-secrets.py"}
 # #5722 (5-agent vote (4d3ea1c5)): the reviewed-line allowlist. Only a hit of a class in
 # WAIVABLE_TAGS can be listed there, one entry per hit, keyed by file, class and the sha256 of
 # the whole command text, so an entry never names a program and any edit of the line
-# invalidates it. The file is written only by scripts/regen-argv-secrets-allow.py; the gate
-# reads it, and a form fault (exit 2) or an entry that claims no hit (exit 1) fails the run.
+# invalidates it. The gate reads it, and a form fault (exit 2: a malformed line, or a file
+# that is not byte-identical to allow_render of its own entries, #5836) or an entry that claims
+# no hit (exit 1) fails the run. scripts/regen-argv-secrets-allow.py renders it with
+# allow_render; a hand-typed line that regen would write the same way cannot be told apart, so
+# the approval is the reviewed diff, not the writer.
 ALLOW_REL = "scripts/qc-allowlists/argv-secrets-operand-allow.txt"
+ALLOW_HEADER = (
+    "# Reviewed lines exempt from the unknown-head credential-operand rule of",
+    "# scripts/check-docs-no-argv-secrets.py (#5722, 5-agent vote (4d3ea1c5)).",
+    "# The gate fails unless this file is byte-identical to what scripts/regen-argv-secrets-allow.py",
+    "# writes for the tree (#5836); adding an entry needs --accept-new and a reviewed diff.",
+    "# Format: path | class | sha256 of the whole command (32 hex) | value kind | masked preview.",
+    "# A literal value is never written: the regen script refuses it by name (#5835).",
+    "# An entry claims one hit; any edit of the command changes its hash and voids the entry.",
+)
 UNKNOWN_TAG = "unknown-head-operand"
 ARRAY_TAG = "array-element-operand"
 SHAPE_TAG = "argv-credential-shape"
@@ -477,6 +492,21 @@ def load_allow(text: str) -> Tuple[List[Tuple[str, str, str, str, str]], List[st
         else:
             entries.append((m.group("rel"), m.group("tag"), m.group("h"), m.group("kind"), m.group("preview")))
     return entries, faults
+
+
+def allow_render(keys) -> str:
+    """#5836: the exact allowlist text for these keys, in this order: ALLOW_HEADER, one
+    'path | class | hash | value kind | preview' line per key, a final newline."""
+    return "\n".join(list(ALLOW_HEADER) + ["%s | %s | %s | %s | %s" % tuple(k) for k in keys]) + "\n"
+
+
+def allow_form_faults(text: str, entries) -> List[str]:
+    """#5836: a well-formed file is still refused unless it is byte-identical to its render (a
+    changed header, a blank or extra comment line, CRLF, a missing final newline)."""
+    if text != allow_render(entries):
+        return ["not byte-identical to the regen output (header, line form or final newline);"
+                " run scripts/regen-argv-secrets-allow.py"]
+    return []
 
 
 def waivable_key(hit: Hit) -> Optional[Tuple[str, str, str, str, str]]:
@@ -2651,7 +2681,9 @@ def run() -> int:
         allow_path = ROOT / ALLOW_REL
         if not allow_path.is_file():
             raise RuntimeError("%s is missing (#5722)" % ALLOW_REL)
-        entries, faults = load_allow(allow_path.read_text(encoding="utf-8"))
+        allow_text = allow_path.read_text(encoding="utf-8")
+        entries, faults = load_allow(allow_text)
+        faults = faults or allow_form_faults(allow_text, entries)
         if faults:
             raise RuntimeError("%s: %s (#5722)" % (ALLOW_REL, "; ".join(faults)))
         hits, allowed, stale_allow = split_allowed(hits, entries)
@@ -3824,6 +3856,28 @@ def allow_self_test(bad: int, red: int, green: int) -> Tuple[int, int, int]:
         ("an unknown value kind", good.replace(" | expansion | ", " | secret | "), 1),
         ("a program name instead of a line", "pgbench\n", 1),
     ]
+    # #5836: the file must be byte-identical to allow_render of its entries.
+    rendered = allow_render([key])
+    form_cases = [
+        ("the rendered file", rendered, 0),
+        ("a hand-edited header line", rendered.replace("byte-identical", "identical", 1), 1),
+        ("a header line removed", rendered.split("\n", 1)[1], 1),
+        ("an extra comment line", "# hand note\n" + rendered, 1),
+        ("a blank line", rendered.replace(ALLOW_HEADER[-1] + "\n", ALLOW_HEADER[-1] + "\n\n", 1), 1),
+        ("no final newline", rendered[:-1], 1),
+        ("CRLF line ends", rendered.replace("\n", "\r\n"), 1),
+        ("two spaces around a separator", rendered.replace(" | ", "  | ", 1), 1),
+    ]
+    for label, text, want in form_cases:
+        entries, faults = load_allow(text)
+        faults = faults or allow_form_faults(text, entries)
+        if want:
+            red += 1
+        else:
+            green += 1
+        if bool(faults) != bool(want):
+            print("SELF-TEST FAIL: allowlist form %r: faults %r" % (label, faults), file=sys.stderr)
+            bad += 1
     for label, text, want in cases:
         entries, faults = load_allow(text)
         if want:
