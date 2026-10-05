@@ -570,6 +570,9 @@ def scan_stream(rel: str, raw_lines: Iterable[str]) -> List[Unit]:
     return units
 
 
+MAGIC_REASON = "binary or compressed content"  # the one Unreadable reason a skip entry may excuse (#5478)
+
+
 class Unreadable(Exception):
     """A tracked file the gate cannot read as text (named with a reason in UNREAD_REL, or a FAULT)."""
 
@@ -604,6 +607,7 @@ def _plain_text(chunk: bytes) -> bool:
 # R5 (#4667, #5367): the skip list may name only a file whose suffix is on this closed list of binary types. Every
 # other file (a .tpl or .service template, a Dockerfile or Makefile with no suffix, a .ts or .hcl source) is text and
 # is read: a NUL byte in it is a defect to fix, not a reason to stop reading it. The set may only grow by review.
+# #5478: the suffix is necessary, not sufficient: the file must also open with a binary magic number (MAGIC_REASON).
 BINARY_SUFFIXES = frozenset((".pdf", ".jpg", ".jpeg", ".png", ".gif", ".ico", ".webp", ".bmp", ".tif", ".tiff", ".woff",
                              ".woff2", ".ttf", ".otf", ".eot", ".zip", ".gz", ".tgz", ".bz2", ".xz", ".zst", ".7z", ".tar",
                              ".jar", ".wasm", ".so", ".dylib", ".dll", ".exe", ".bin", ".db", ".sqlite", ".mp3", ".mp4",
@@ -615,7 +619,7 @@ def read_lines(path: Path) -> Iterator[str]:
     with open(str(path), "rb") as handle:
         chunk = handle.read(CHUNK_BYTES)
         if chunk.startswith(BINARY_MAGIC) and not _plain_text(chunk):
-            raise Unreadable("binary or compressed content (magic number %s)" % chunk[:4].hex())
+            raise Unreadable("%s (magic number %s)" % (MAGIC_REASON, chunk[:4].hex()))
         decoder = _decoder_for(chunk)
         utf8 = decoder is None
         if utf8:
@@ -701,6 +705,10 @@ def scan(root: Path) -> Tuple[List[Unit], int]:
     listed, errors = load_unread(root)
     missing = ["%s: %s" % (rel, why) for rel, why in sorted(unread.items()) if rel not in listed]
     stale = ["%s: skip entry for a file that is readable or no longer tracked" % rel for rel in sorted(listed) if rel not in unread]
+    # #5478: a suffix alone proves nothing. Only a file that opens with a known binary magic number may be skipped;
+    # text that holds a NUL byte under a binary suffix is still text (PgBouncer %include takes any file name).
+    stale += ["%s: skip entry for a file with no binary magic number (%s): it is text and is read, never skipped" % (rel, unread[rel])
+              for rel in sorted(listed) if rel in unread and not unread[rel].startswith(MAGIC_REASON)]
     problems = errors + ["files the gate cannot read as text and that %s does not name with a reason: %s"
                          % (UNREAD_REL, "; ".join(missing[:5]))] * bool(missing) + stale
     if problems:
@@ -1287,6 +1295,15 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
         ("a skip entry for an untracked path fails", tree({}, unread=UNREAD_REASON + "docs/gone.md\n"), EXIT_FAULT),
         ("a text file is never excused by the skip list (R5)",
          tree({"docs/n.md": "\0\nRun PgBouncer in transaction mode.\n"}, unread=UNREAD_REASON + "docs/n.md\n"), EXIT_FAULT),
+        # #5478: the suffix is not proof of binary content; a NUL-only file under a binary suffix is text with a hidden claim
+        ("a .bin file with a NUL byte and no magic number cannot be skipped (#5478)",
+         tree({"infra/pgbouncer/override.bin": b"pool_mode = transaction\n\0\n"}, unread=UNREAD_REASON + "infra/pgbouncer/override.bin\n"), EXIT_FAULT),
+        ("a .db file with a NUL byte and no magic number cannot be skipped (#5478)",
+         tree({"docs/notes.db": b"pool_mode = transaction\n\0\n"}, unread=UNREAD_REASON + "docs/notes.db\n"), EXIT_FAULT),
+        ("a .bin file with a NUL byte and no magic number is a fault with no skip entry (#5478)",
+         tree({"infra/pgbouncer/override.bin": b"pool_mode = transaction\n\0\n"}), EXIT_FAULT),
+        ("a .bin file that opens with a binary magic number may be skipped (#5478)",
+         tree({"assets/blob.bin": b"\x7fELF\x02\x01\x01\0zzz"}, unread=UNREAD_REASON + "assets/blob.bin\n"), EXIT_OK),
         ("a skip entry does not hide another unreadable file",
          tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz", "docs/y.bin": b"\0\0\0"}, unread=UNREAD_REASON + "docs/z.md.gz\n"), EXIT_FAULT),
         ("a file past the old 4 MiB cap, many windows, is scanned to its end",
@@ -1430,6 +1447,9 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("F1 skip entry needs a reason", "        problem = reason_problem(reason or \"\")\n        if not problem and Path(line).suffix", "        problem = None\n        if not problem and Path(line).suffix"),
     ("F1 binary magic numbers", "        if chunk.startswith(BINARY_MAGIC) and not _plain_text(chunk):", "        if False:"),
     ("F1 magic number on plain text is text", "        if chunk.startswith(BINARY_MAGIC) and not _plain_text(chunk):", "        if chunk.startswith(BINARY_MAGIC):"),
+    ("F4 a skip entry needs a binary magic number (#5478)", "if rel in unread and not unread[rel].startswith(MAGIC_REASON)]", "if rel in unread and False]"),
+    ("F4 the skip reason names the magic number (#5478)", 'raise Unreadable("%s (magic number %s)" % (MAGIC_REASON, chunk[:4].hex()))', 'raise Unreadable("%s (magic number %s)" % ("", chunk[:4].hex()))'),
+    ("F4 a NUL-only file is not binary content (#5478)", 'raise Unreadable("NUL bytes in a file that is not UTF-16/32 text")', 'raise Unreadable("%s NUL bytes in a file that is not UTF-16/32 text" % MAGIC_REASON)'),
     ("F1 only a declared binary suffix is skipped (#5367)", "        if not problem and Path(line).suffix.lower() not in BINARY_SUFFIXES:", "        if False:"),
     ("F1 pdf is a declared binary suffix (#5367)", '".pdf", ".jpg", ".jpeg", ".png"', '".jpg", ".jpeg", ".png"'),
     ("F1 a text type is not declared binary (#5367)", '".mov", ".webm"', '".mov", ".tpl", ".webm"'),
