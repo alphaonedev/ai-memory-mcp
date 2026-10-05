@@ -269,6 +269,22 @@ PENDING = (
     ("docs/API_REFERENCE.md", '-H "X-API-Key: KEY"', "#4878"),
     ("docs/TROUBLESHOOTING.md", '-H "X-API-Key: YOUR_KEY"', "#4878"),
     ("infra/do-hive/federate.sh", "x-api-key: \\$(cat /etc/ai-memory/api-key)", "#4866", 2),
+    # #5875 (round 12): a quoted header or flag word that holds an expansion is read without
+    # its quotes; these lines put an API key or a bearer token on a curl argv.
+    ("README.md", '"Authorization: Bearer $XAI_API_KEY"', "#4877"),
+    ("docs/INSTALL.md", '"Authorization: Bearer $XAI_API_KEY"', "#4877"),
+    ("docs/v0.7.0/test-config.md", '"Authorization: Bearer $OPENROUTER_API_KEY"', "#4877"),
+    ("scripts/update-adoption-metrics.sh", '"Authorization: Bearer $GITHUB_TOKEN"', "#4875"),
+    ("deploy/docker-1461/docker-compose.yml", '"X-API-Key: $$AI_MEMORY_API_KEY"', "#5876", 2),
+    ("deploy/docker-1461/test/run.sh", 'KEY_HDR=(-H "X-API-Key: $EFFECTIVE_KEY")', "#4874"),
+    ("docs/ADMIN_GUIDE.md", '"x-api-key: $KEY"', "#4878", 2),
+    ("docs/a2a-integration.md", '"X-API-Key: $API_KEY"', "#4878"),
+    ("docs/enterprise-deployment.md", '"X-API-Key: $(cat /etc/ai-memory/api.key)"', "#4878", 2),
+    ("docs/k10-sse-approvals.md", '"X-API-Key: $API_KEY"', "#4878", 2),
+    ("docs/k8-quotas.md", '"X-API-Key: $API_KEY"', "#4878"),
+    ("docs/production-deployment.md", '"x-api-key: $KEY"', "#4878"),
+    ("infra/do-hive/cloud-init-memory.yaml.tpl", '"x-api-key: $API_KEY"', "#4866"),
+    ("infra/do-hive/federate.sh", '"X-API-Key: $api_key"', "#4866"),
 )
 
 TEXT_SUFFIXES = {
@@ -2505,8 +2521,11 @@ def shape_value(v: Optional[str]) -> bool:
 
 
 def shape_word(text: str, word: Word) -> str:
+    """The text of a word as the shape rule reads it: its literal value, or (#5875) its raw text
+    without quote characters, so a quoted word that holds an expansion ("X-API-Key: $KEY",
+    "--token=$T") is read like its unquoted spelling."""
     lit = plain_literal(text, word)
-    return lit if lit is not None else text[word[0]:word[1]]
+    return lit if lit is not None else re.sub(r"[\"']", "", text[word[0]:word[1]])
 
 
 def shape_operands(text: str, words: List[Word], array: bool) -> List[Word]:
@@ -2528,6 +2547,9 @@ def shape_operands(text: str, words: List[Word], array: bool) -> List[Word]:
     if k >= len(words):
         return []
     first = shape_word(text, words[k])
+    # #5875: eval runs its operands as a command line; they are not an argv of their own.
+    if first == "eval":
+        return shape_operands(text, words[k + 1:], False)
     # A builtin only as a bare command word: /bin/echo is a program, and its argv is visible.
     if first in SHAPE_NON_EXEC_HEADS:
         return []
@@ -3866,6 +3888,26 @@ R12_INDEXED_RED = {
     '5838-r11-indexed-url': 'ARGS[1]=mysql://u:S3cr3tPass@db/x',
     '5838-r12-body-index-flag': 'args=([3]=--password=S3cr3tPass)',
 }
+# #5875 (round 12): a whole quoted word that holds an expansion is read without its quotes by
+# the shape rule; eval reads its operands as a command line. Flagged as a script and in a fence.
+R12_QUOTED_RED = {
+    '5875-r01-quoted-bearer-header': 'curl -H "Authorization: Bearer $TOKEN" https://x.example',
+    '5875-r02-quoted-api-key-header': 'curl -H "X-API-Key: $KEY" https://x.example',
+    '5875-r03-quoted-flag-equals': 'mytool "--token=$TOKEN" run',
+    '5875-r04-quoted-name-value': 'mytool "db_pw=$PW" run',
+    '5875-r05-single-quoted-header': "curl -H 'X-Auth-Token: '\"$T\" https://x.example",
+    '5875-r06-cmdsubst-header': 'curl -H "X-API-Key: $(cat /run/k)" https://x.example',
+    '5875-r07-array-quoted-header': 'H+=(-H "Authorization: Bearer $GITHUB_TOKEN")',
+    '5875-r08-eval-command': 'eval curl --token "$T" https://x.example',
+}
+R12_QUOTED_GREEN = {
+    '5875-g01-quoted-neutral-header': 'curl -H "Accept: $TYPE" https://x.example',
+    '5875-g02-quoted-file-flag': 'mytool "--password-file=$F" run',
+    '5875-g03-eval-assignment': 'eval "llm_secret=\\${$NAME:-}"',
+    '5875-g04-quoted-header-from-file': 'curl -H "@$HDR_FILE" https://x.example',
+    '5875-g05-quoted-placeholder': 'curl -H "X-API-Key: <key>" https://x.example',
+    '5875-g06-eval-neutral': 'eval "$(ssh-agent -s)"',
+}
 # #5725: the closed credential shapes, in a script and in a shell fence of a .md file, whatever
 # the program: a URL with a userinfo password, a flag whose last name part is a credential word
 # (SECRET_WORD, widened by #5837) with a value, a NAME=VALUE operand whose NAME ends in one
@@ -4290,6 +4332,21 @@ def self_test() -> int:
             got = scan_text(suffix, body)
             if got:
                 print("SELF-TEST FAIL: array clean probe %r (%s) was flagged: %r" % (name, label, got),
+                      file=sys.stderr)
+                bad += 1
+    # #5875: a quoted word is read without its quotes by the shape rule.
+    for name, text in R12_QUOTED_RED.items():
+        for label, suffix, body in r9_variants(text)[0::2]:
+            red += 1
+            if not scan_text(suffix, body):
+                print("SELF-TEST FAIL: quoted word probe %r (%s) not flagged" % (name, label), file=sys.stderr)
+                bad += 1
+    for name, text in R12_QUOTED_GREEN.items():
+        for label, suffix, body in r9_variants(text)[0::2]:
+            green += 1
+            got = scan_text(suffix, body)
+            if got:
+                print("SELF-TEST FAIL: quoted word clean probe %r (%s) was flagged: %r" % (name, label, got),
                       file=sys.stderr)
                 bad += 1
     # #5838: an indexed element is an array element, in a script and in a shell fence.
