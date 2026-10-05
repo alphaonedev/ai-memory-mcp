@@ -100,13 +100,16 @@ def is_prose(rel: str) -> bool:
 def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, pending: bool,
          why: Optional[str], prune: bool, match: Optional[str] = None, dl=None,
          committed_pending: Optional[List[Entry]] = None,
-         frozen: Optional[Set[str]] = None) -> Tuple[int, List[Entry], List[Entry], List[str]]:
+         frozen: Optional[Set[str]] = None,
+         gone: Optional[Dict[str, str]] = None) -> Tuple[int, List[Entry], List[Entry], List[str]]:
     """Pure core. Returns (exit code, new allow, new pending, messages). ``committed_pending`` is
     the pending list as committed at HEAD: a line pruned from pending in an earlier, uncommitted
     run is still refused for allow (#4996), and so is a lightly edited copy of it (#5103).
     ``frozen`` is the set of files that have a pending row at the merge base, at HEAD or now: no allow
     entry is added or raised in such a file (#5298, 5-agent vote 4d3ea1c5). The set is built from the
-    current pending rows too, so it needs no argument to hold for the working tree."""
+    current pending rows too, so it needs no argument to hold for the working tree. ``gone`` maps the text
+    of every pending row that an earlier commit removed to that commit: no allow entry may carry such a
+    text (#5299, 5-agent vote 4d3ea1c5)."""
     msgs: List[str] = []
     if accept_new and (why is None or not (gate.PEND_WHY_RE if pending else gate.WHY_RE).match(why)):
         return 2, allow, pend, ["--accept-new needs --why '#<issue>' (pending: an issue number only) or --why 'reason: <text>'"]
@@ -194,6 +197,12 @@ def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, p
                 msgs.append("REFUSED %s:%d: the prose rules flag this line (%s); it can only be pending: %s" % (
                     rel, extra[0][0], ",".join(hits[:3]), text[:120]))
                 continue
+        if not pending and text in (gone or {}):
+            rc = 1
+            msgs.append("REFUSED %s:%d: the text of a pending row removed in commit %s cannot come back as an "
+                        "allow entry; change the line, not the list (#5299): %s" % (
+                            rel, extra[0][0], (gone or {})[text], text[:120]))
+            continue
         if not pending and rel in frozen_files:
             rc = 1
             msgs.append("REFUSED %s:%d: the file has a pending row (at the merge base, at HEAD or now), so no "
@@ -247,7 +256,7 @@ def retag(gate, allow: List[Entry], pend: List[Entry], source: str, match: Optio
 
 
 # ---------------------------------------------------------------- refusal cases
-REFUSAL_CASE_COUNT = 31
+REFUSAL_CASE_COUNT = 33
 
 
 def _f(gate, rel: str, line: str, flagged: bool = False):
@@ -333,6 +342,15 @@ def refusal_cases(root: Path) -> List[str]:
     rc, na, _np, _m = plan(gate, fx, had, [], True, False, "reason: r", False, None, dl, None, {"x.sh"})
     if rc != 0 or na != had:
         bad.append("regen: an unchanged allow entry in a frozen file was judged again (#5298)")
+    # #5299 (5-agent vote 4d3ea1c5): the text of a pending row that an earlier commit removed cannot return
+    rc, na, _np, msgs = plan(gate, _f(gate, "y.sh", fresh_line), [], [], True, False, "reason: r", False, None, dl,
+                             None, None, {gate.norm(fresh_line): "abc1234"})
+    if rc != 1 or na or "abc1234" not in " ".join(msgs):
+        bad.append("regen: the text of a removed pending row was added as an allow entry (#5299)")
+    rc, na, _np, _m = plan(gate, _f(gate, "y.sh", fresh_line), [], [], True, False, "reason: r", False, None, dl,
+                           None, None, {"some other text": "abc1234"})
+    if rc != 0 or len(na) != 1:
+        bad.append("regen: an allow entry unrelated to any removed pending row was refused (#5299)")
     # the #5298 report: --prune and --accept-new in one run. The pruned pending row still froze its file
     stale_pend: List[Entry] = [("#1", "x.sh", 1, "x --gone $T", 1)]
     rc, na, np_, _m = plan(gate, fx, [], stale_pend, True, False, "reason: r", True, None, dl)
@@ -431,7 +449,13 @@ def main(argv: List[str]) -> int:
         return 2
     committed: List[Entry] = []
     frozen: Set[str] = set()
+    gone: Dict[str, str] = {}
     if args.accept_new and not args.pending:
+        try:
+            gone = gate.removed_pending_rows(root)
+        except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
+            print("FAULT: %s" % exc, file=sys.stderr)
+            return 2
         try:
             old = gate._git(root, "show", "HEAD:" + gate.PENDING_FILE)
         except (OSError, subprocess.CalledProcessError) as exc:
@@ -451,7 +475,7 @@ def main(argv: List[str]) -> int:
         rc, na, np_, msgs = retag(gate, allow, pend, args.retag, args.match, args.why, args.to_pending)
     else:
         rc, na, np_, msgs = plan(gate, found, allow, pend, args.accept_new, args.pending, args.why, args.prune,
-                                 args.match, dl, committed, frozen)
+                                 args.match, dl, committed, frozen, gone)
     for m in msgs:
         print(m, file=sys.stderr if m.startswith(("NEW", "STALE", "REFUSED")) else sys.stdout)
     if rc == 2:

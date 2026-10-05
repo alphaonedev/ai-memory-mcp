@@ -2012,6 +2012,28 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
             if rc != want or (want == 1 and "pending row" not in out.getvalue()):
                 bad.append("regen --accept-new ignored the pending row at the merge base (#5298; base %r, %d): %s"
                            % (base_env, rc, out.getvalue().strip()[:160]))
+        # regen --accept-new reads the same history (#5299): no base is named here, and the exact text of the
+        # pending row removed earlier in this history is still refused for allow
+        git("checkout", "-q", "--", ".")  # the run above may have written the lists
+        bk = "export BACKFILL_TOKEN"
+        (t / "d.sh").write_text("#!/bin/bash\n%s\n" % bk)
+        rows([("a.sh", ok_line), ("c.sh", pl)], [("d.sh", bk)])
+        commit_all("a pending row for the history scan of regen")
+        rows([("a.sh", ok_line), ("c.sh", pl)], [])
+        (t / "d.sh").write_text("#!/bin/bash\n:\n")
+        commit_all("the pending row is removed again")
+        (t / "d.sh").write_text("#!/bin/bash\n%s\n" % bk)
+        shutil.copy(str(root / "scripts" / "check-exec-secret-argv.py"), str(t / "scripts"))
+        cases[0] += 1
+        for k in keys:
+            os.environ.pop(k, None)
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out), contextlib.redirect_stdout(out):
+            rc = regen.main(["regen", "--accept-new", "--why", "reason: self-test", "--match", "BACKFILL",
+                             "--root", str(t)])
+        if rc != 1 or "removed in commit" not in out.getvalue():
+            bad.append("regen --accept-new did not read the history of the pending list (#5299; %d): %s"
+                       % (rc, out.getvalue().strip()[:160]))
     finally:
         for k, v in saved.items():
             if v is None:
