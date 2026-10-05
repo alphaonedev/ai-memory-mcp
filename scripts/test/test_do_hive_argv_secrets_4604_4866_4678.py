@@ -3441,7 +3441,22 @@ def file_roots_5763():
             ("getopts with a computed name", head + 'getopts a: "$n"\n}\n', "%d:roots:computed operand of getopts" % first),
             ("an escaped OUT_DIR assignment through declare", head + 'declare O\\UT_DIR=/dev\n}\n',
              "%d:roots:computed name" % first),
-            ("an alias", head + "alias x=y\n}\n", "%d:roots:alias" % first)):
+            ("an alias", head + "alias x=y\n}\n", "%d:roots:alias" % first),
+            ("eval of a string that names no root", head + 'eval "$cmd"\n}\n', "%d:roots:eval" % first),
+            ("source of a literal file", head + "source ./env\n}\n", "%d:roots:source" % first),
+            ("the dot builtin on a literal file", head + ". ./env\n}\n", "%d:roots:source" % first),
+            ("the assignment moved into a function", fs.replace(D, "mv_fn() {\n" + D + "\n}"),
+             "0:OUT_DIR:0 reviewed assignments, not one"),
+            ("an || chain into the assignment", fs.replace(D, "false ||\n" + D),
+             "%d:OUT_DIR:assignment is not unconditional in its scope" % (at + 1)),
+            ("a pipe into the assignment", fs.replace(D, "true |\n" + D),
+             "%d:OUT_DIR:assignment is not unconditional in its scope" % (at + 1)),
+            ("a subshell opened on its own line around the assignment", fs.replace(D, "(\n" + D + "\n)"),
+             "%d:OUT_DIR:a case, subshell or function definition before its assignment" % at),
+            ("a same-value pass-through into a declarator", head + 'OUT_DIR="$OUT_DIR" local y\n}\n',
+             "%d:OUT_DIR:named outside its one reviewed assignment" % first),
+            ("a bare same-value assignment", head + 'OUT_DIR="$OUT_DIR"\n}\n',
+             "%d:OUT_DIR:named outside its one reviewed assignment" % first)):
         roots = root_findings(text)
         probe("#5763 %s is reported as %s" % (label, want), want in roots, " ".join(roots[:4]))
         probe("#5763 %s leaves a root target the terminal" % label,
