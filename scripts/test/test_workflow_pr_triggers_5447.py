@@ -91,6 +91,19 @@ ACCEPTED GRAMMAR (every other line or form is refused with a named reason):
               filters: ``!`` or ``^`` first, empty, ``]`` first, a backslash, a
               ``-`` that ends or starts the body, a reversed or mixed range, and
               any other character (#5853, #5854).
+  pattern     a ``pull_request`` or ``pull_request_target`` branches item is
+              matched only in these modelled constructs: one leading ``!``
+              (negation; items are read in order and the last match wins),
+              then letters, digits, ``.``, ``_``, ``/`` and ``-`` as
+              themselves, ``*`` (any run without ``/``), ``**`` (any run) and a
+              class as above.  Every other character or construct is refused
+              with R-SHAPE cannot match filters, naming the trigger and the
+              item: ``?``, ``+``, a backslash, a ``]`` or ``!`` outside those
+              places, braces, parentheses, a space, a non-ASCII character, a
+              run of three or more ``*`` and an empty item among them (#5943,
+              #5856, #5857).  The read constructs follow GitHub's documented
+              filter pattern cheat sheet; they were not measured against
+              GitHub's own evaluator.
 
 The reader is the Python standard library only (no PyYAML) so it runs on any CI
 image.  The mutation legs at the bottom prove the reader is not vacuous: each
@@ -680,6 +693,8 @@ def _parse_filters(trigger: str, sub: List[Tuple[int, str]]) -> Dict[str, List[s
 _CLASS_LOWER = "abcdefghijklmnopqrstuvwxyz"
 _CLASS_UPPER = _CLASS_LOWER.upper()
 _CLASS_DIGIT = "0123456789"
+# Outside a class, the only characters glob_match reads as themselves (#5943).
+_PATTERN_LITERALS = frozenset(_CLASS_LOWER + _CLASS_UPPER + _CLASS_DIGIT + "._/-")
 
 
 def _class_regex(body: str, pattern: str) -> str:
@@ -712,27 +727,29 @@ def glob_match(pattern: str, ref: str) -> bool:
 
     A [...] class is read only when its body is a proven form (_class_regex).
     """
+    if not pattern:
+        raise Unparsed("empty pattern has no modelled GitHub meaning (#5943)")
     regex: List[str] = []
     i = 0
     while i < len(pattern):
         ch = pattern[i]
         if ch == "*":
-            if pattern[i:i + 2] == "**":
-                regex.append(".*")
-                i += 2
-                continue
-            regex.append("[^/]*")
-        elif ch == "?":
-            regex.append("[^/]")
-        elif ch == "[":
+            run = len(pattern) - i - len(pattern[i:].lstrip("*"))
+            if run > 2:
+                raise Unparsed("a run of three or more '*' has no modelled GitHub meaning (#5943): " + pattern)
+            regex.append(".*" if run == 2 else "[^/]*")
+            i += run
+            continue
+        if ch == "[":
             end = pattern.find("]", i + 1)
             if end == -1:
                 raise Unparsed("unterminated character class: " + pattern)
             regex.append(_class_regex(pattern[i + 1:end], pattern))
             i = end + 1
             continue
-        else:
-            regex.append(re.escape(ch))
+        if ch not in _PATTERN_LITERALS:
+            raise Unparsed("pattern character " + repr(ch) + " has no modelled GitHub meaning (#5943): " + pattern)
+        regex.append(re.escape(ch))
         i += 1
     return re.fullmatch("".join(regex), ref) is not None
 
@@ -817,9 +834,10 @@ def violations(name: str, text: str) -> List[str]:
     try:
         return _rule_violations(name, triggers)
     except Unparsed as exc:
-        # A filter item the glob reader cannot read (a [ class that is unterminated
-        # or whose body is not a proven form) is a named failure too, not an
-        # exception out of violations() (#5777, #5853, #5854).
+        # A filter item the glob reader cannot read (an unterminated [ class, a
+        # class body that is not a proven form, an empty item, or any character
+        # or construct outside the modelled set) is a named failure too, not an
+        # exception out of violations() (#5777, #5853, #5854, #5943).
         return [f"{name}: R-SHAPE cannot match filters ({exc})"]
 
 
@@ -833,8 +851,14 @@ def _rule_violations(name: str, triggers: Dict[str, Dict[str, List[str]]]) -> Li
         if "branches" not in flt:
             continue  # no base filter: matches every base, carrier included
         branches = flt["branches"]
-        gates = any(filter_matches(branches, base) for base in GATED_BASES)
-        if gates:
+        for pat in branches:
+            # Every item is read before any verdict, so one the matcher does not
+            # model is refused by its trigger and its full spelling (#5943).
+            try:
+                glob_match(pat[1:] if pat.startswith("!") else pat, CARRIER)
+            except Unparsed as exc:
+                raise Unparsed(f"{trig}.branches item {pat!r}: {exc}") from exc
+        if any(filter_matches(branches, base) for base in GATED_BASES):
             if CARRIER_PATTERN not in branches:
                 found.append(f"{name}: R-PR {trig}.branches lacks {CARRIER_PATTERN}")
             if not filter_matches(branches, CARRIER):
@@ -912,6 +936,29 @@ def named_cells() -> List[Tuple[str, str, str]]:
             ("5854-close-bracket-first", "[]a]", "empty character class"),
             ("5854-underscore", "[_]", "form not proven to read like GitHub"),
         )
+    ] + [
+        ("R7-" + tag, "on:\n  pull_request:\n    branches: [main, 'rehearsal/**', '" + item + "']\n",
+         "no modelled GitHub meaning")
+        for tag, item in (
+            ("5943-plus-excludes-carrier", "!rehearsal/audit+-wip"),
+            ("5943-question-excludes-carrier", "!rehearsal/audi?t-wip"),
+            ("5943-backslash-excludes-carrier", "!rehearsal/\\audit-wip"),
+            ("5856-question", "a?b"),
+            ("5856-plus", "a+b"),
+            ("5857-backslash", "a\\b"),
+            ("5857-lone-close-bracket", "a]b"),
+            ("5857-mid-pattern-bang", "a!b"),
+            ("5943-double-bang", "!!rehearsal/audit-wip"),
+            ("5943-extglob", "rehearsal/@(audit)-wip"),
+            ("5943-three-stars", "rehearsal/***"),
+            ("5943-space", "rehearsal/a b"),
+            ("5943-non-ascii", "rehearsal/é"),
+        )
+    ] + [
+        ("R7-5943-brace-block-list", "on:\n  pull_request:\n    branches:\n      - main\n      - 'rehearsal/**'\n"
+         "      - 'rehearsal/{audit,x}-wip'\n", "no modelled GitHub meaning"),
+        ("R7-5943-empty-item", "on:\n  pull_request:\n    branches: [main, 'rehearsal/**', '']\n", "empty pattern"),
+        ("R7-5943-bare-bang", "on:\n  pull_request:\n    branches: [main, 'rehearsal/**', '!']\n", "empty pattern"),
     ]
 
 
@@ -920,7 +967,7 @@ class NamedCells5665(unittest.TestCase):
 
     def test_5665_named_cells_refused(self) -> None:
         cells = named_cells()
-        self.assertEqual(22, len(cells))
+        self.assertEqual(38, len(cells))
         for name, text, why in cells:
             got = violations("x.yml", text)
             self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (name, why, got))
@@ -2173,7 +2220,7 @@ class RefusalBranches5665(unittest.TestCase):
 
     def test_5665_unterminated_class_in_a_branches_item(self) -> None:
         # PyYAML: branches is ['main', 'rehearsal/**', 'a[b'] in both texts.
-        why = "R-SHAPE cannot match filters (unterminated character class"
+        why = "R-SHAPE cannot match filters (pull_request.branches item 'a[b': unterminated character class"
         for branches in (" [main, 'rehearsal/**', 'a[b']\n", "\n      - main\n      - rehearsal/**\n      - a[b\n"):
             got = violations("x.yml", "name: x\non:\n  pull_request:\n    branches:" + branches)
             self.assertTrue(any(why in v for v in got), got)
@@ -2266,6 +2313,88 @@ class ClosedWorldClass5854(unittest.TestCase):
         self.assertFalse(glob_match("[ab]", "!"))
         self.assertTrue(glob_match("[0-9]", "7"))
         self.assertFalse(glob_match("[A-C]", "d"))
+
+
+class ClosedWorldPattern5943(unittest.TestCase):
+    """#5943 (with #5856, #5857): a branches item is read only in the modelled constructs.
+
+    Measured at 3d953877: '!rehearsal/audi?t-wip', '!rehearsal/audit+-wip' and
+    '!rehearsal/\\audit-wip' returned no finding, and so did every other character
+    outside a class ('?' was read as one non-'/' character, the rest as literals).
+    The modelled constructs are letters, digits, '.', '_', '/', '-', '*', '**', a
+    proven class and one leading '!' (filter_matches).  Everything else is refused.
+    """
+
+    REFUSED = (
+        "!rehearsal/audit+-wip", "!rehearsal/audi?t-wip", "!rehearsal/\\audit-wip",
+        "a?b", "a+b", "a\\b", "a]b", "a!b", "?", "+", "\\", "rehearsal/?", "rehearsal/**?",
+        "re?hearsal/**", "rehearsal/audit-wi+p", "!rehearsal/audit-wip\\", "!!rehearsal/audit-wip",
+        "!rehearsal/audit-wip!", "rehearsal/@(audit)-wip", "!rehearsal/*(x)audit-wip", "rehearsal/audit-wip$",
+        "^rehearsal/**", "rehearsal/a|b", "rehearsal/~x", "rehearsal/a b", "rehearsal/a%b", "rehearsal/a=b",
+        "rehearsal/a;b", "rehearsal/a(b)", "rehearsal/***", "!rehearsal/***", "rehearsal/é",
+        "rehearsal/a​b", "!rehearsal/a]b", "rehearsal/a]", "rehearsal/{audit}-wip",
+    )
+    READ = (
+        "rehearsal/**", "!rehearsal/x", "release/v1.0.0", "release/**", "a[b-d]e", "![a-z]x", "rehearsal/*",
+        "feature/a_b.c-d", "**", "*", "-x", ".x",
+    )
+
+    def _flow(self, item: str, trigger: str = "pull_request") -> List[str]:
+        text = "name: x\non:\n  " + trigger + ":\n    branches: [main, 'rehearsal/**', '" + item + "']\n"
+        return violations("x.yml", text)
+
+    def _block(self, item: str) -> List[str]:
+        text = "name: x\non:\n  pull_request:\n    branches:\n      - main\n      - 'rehearsal/**'\n      - '" \
+               + item + "'\n"
+        return violations("x.yml", text)
+
+    def _assert_refused(self, item: str, got: List[str]) -> None:
+        self.assertTrue(any("R-SHAPE cannot match filters" in v and "no modelled GitHub meaning" in v
+                            and ".branches item " + repr(item) + ": " in v for v in got), (item, got))
+
+    def test_5943_unmodelled_items_are_refused_in_flow_and_block_lists(self) -> None:
+        for item in self.REFUSED:
+            self._assert_refused(item, self._flow(item))
+            self._assert_refused(item, self._block(item))
+            self._assert_refused(item, self._flow(item, "pull_request_target"))
+
+    def test_5943_refusal_names_the_trigger(self) -> None:
+        got = self._flow("a?b", "pull_request_target")
+        self.assertTrue(any("pull_request_target.branches" in v for v in got), got)
+
+    def test_5943_brace_item_in_a_block_list_is_refused(self) -> None:
+        # A flow list refuses the comma first (#5733); the block list reaches the glob.
+        self._assert_refused("rehearsal/{audit,x}-wip", self._block("rehearsal/{audit,x}-wip"))
+
+    def test_5943_empty_and_bare_negation_items_are_refused(self) -> None:
+        for item in ("", "!"):
+            got = self._flow(item)
+            self.assertTrue(any("R-SHAPE cannot match filters" in v and "empty pattern" in v for v in got),
+                            (item, got))
+
+    def test_5943_modelled_items_keep_a_definite_verdict(self) -> None:
+        for item in self.READ:
+            self.assertEqual([], self._flow(item), item)
+            self.assertEqual([], self._block(item), item)
+
+    def test_5943_modelled_constructs_match_as_stated(self) -> None:
+        self.assertTrue(glob_match("a*", "abc"))
+        self.assertFalse(glob_match("a*", "a/b"))
+        self.assertTrue(glob_match("a**", "a/b/c"))
+        self.assertTrue(glob_match("a**b", "a/x/b"))
+        self.assertTrue(glob_match("x.y_z-1/2", "x.y_z-1/2"))
+        self.assertFalse(glob_match("x.y", "xzy"))
+        self.assertFalse(filter_matches(["!a"], "a"))
+        self.assertFalse(filter_matches(["a", "!a"], "a"))
+        self.assertTrue(filter_matches(["!a", "a"], "a"))
+
+    def test_5943_each_reproducer_refused_where_github_excludes_the_carrier(self) -> None:
+        # Under the documented reading each of these excludes the carrier; the
+        # checker must refuse, never pass.
+        for item in ("!rehearsal/audit+-wip", "!rehearsal/audi?t-wip", "!rehearsal/\\audit-wip"):
+            got = self._flow(item)
+            self.assertNotEqual([], got, item)
+            self.assertTrue(all("R-SHAPE" in v for v in got), (item, got))
 
 
 class GlobSemantics5447(unittest.TestCase):
