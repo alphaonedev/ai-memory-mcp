@@ -27,8 +27,10 @@ START STATE. Before it imports anything but sys, the program refuses to run (one
 isolated (-I) on a script file: no -c, -m or stdin entry, no -i, -O, -v, -b, -d, -x, -W or -X
 option other than -X frozen_modules=on|off, no trace, profile or monitoring hook, no global,
 module, import hook or builtin that a plain start does not have, and no LD_* or DYLD_*
-variable. A start with -I but without -S re-executes itself once with -I -S, so no .pth file
-of the installation runs. Stated limits: code that runs inside the interpreter before line 1
+variable. A start with -I but without -S re-executes itself once with -I -S, so the program
+runs in a process where no .pth file or sitecustomize of the installation ran; where that site
+code already replaced a sys hook (Ubuntu's apport replaces sys.excepthook) the start is refused
+like any other replacement, so start it with -I -S as the first line does. Stated limits: code that runs inside the interpreter before line 1
 (an LD_PRELOAD library already loaded, an audit hook, a modified installation) can forge any
 check; the python3 found on PATH and its installation are trusted; Python 3.9 has no
 sys.orig_argv, so there the entry check rests on __file__, __spec__ and sys.argv[0].
@@ -2010,6 +2012,47 @@ def _fake_lab(base, name, mutation, script):
     return lab, port
 
 
+def _selftest_signal_exit(T, base, signum, want):
+    """main under a real signal: the handler is installed, the daemons stop, run/ is removed and the exit is 128+n."""
+    sig_dir = os.path.join(base, "signal-%d" % signum)
+    started = []
+
+    class _SignalLab(Lab):
+        def __init__(self, opts, ledger, environ):
+            super().__init__(opts, ledger, environ, run_dir=sig_dir)
+
+        def run(self):
+            os.makedirs(self.rdir)
+            self.owned = True
+            proc = subprocess.Popen([sys.executable, "-I", "-S", "-c", "import time\ntime.sleep(60)\n"],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    env={"PATH": "/usr/bin:/bin"})
+            self.daemons.append(proc)
+            started.append(proc)
+            if signal.getsignal(signum) is not _interrupt:
+                return 99
+            os.kill(os.getpid(), signum)
+            for _ in range(500):
+                time.sleep(0.01)
+            return 98
+
+    saved = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM), globals()["Lab"])
+    globals()["Lab"] = _SignalLab
+    try:
+        rc = main([], {"PATH": "/usr/bin:/bin"})
+    finally:
+        globals()["Lab"] = saved[2]
+        signal.signal(signal.SIGINT, saved[0])
+        signal.signal(signal.SIGTERM, saved[1])
+        for proc in started:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    stopped = [proc.returncode is not None for proc in started]
+    T.leg("signal: %s stops the daemons, removes run/ and exits %d" % (signal.Signals(signum).name, want),
+          (rc, stopped, os.path.exists(sig_dir)), (want, [True], False))
+
+
 def selftest_probe_block(T, base):
     """Bar (a): the probe block records exactly one verdict or the run fails; the real block over a fake serve."""
     cases = (
@@ -2067,8 +2110,10 @@ def selftest_probe_block(T, base):
         got = "returned"
     except LabInterrupted as exc:
         got = exc.signum
-    T.leg("signal: an interrupt inside the probe block propagates out of the probe guard (main exits 128+signum)", got,
+    T.leg("signal: an interrupt inside the probe block propagates out of the probe guard", got,
           signal.SIGTERM, lab.led.out.value())
+    for signum, want in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+        _selftest_signal_exit(T, base, signum, want)
     try:
         try:
             raise LabInterrupted(signal.SIGINT)
@@ -2278,23 +2323,23 @@ def selftest_start_state(T, base):
     help_ = [copy, "--help"]
     controls = [
         ("start state: -I -S runs (control)", [py, "-I", "-S"] + help_, None, None),
-        ("start state: -I alone re-executes with -I -S and runs (control)", [py, "-I"] + help_, None, None),
+        ("start state: -I alone re-executes with -I -S and runs (control; refused where the installation's site replaced a sys hook)", [py, "-I"] + help_, None, None),
         ("start state: the cluster -IS runs (control)", [py, "-IS"] + help_, None, None),
         ("start state: the cluster -SI runs (control)", [py, "-SI"] + help_, None, None),
         ("start state: -I -S -X frozen_modules=off runs (control)", [py, "-I", "-S", "-X", "frozen_modules=off"] + help_, None, None),
         ("start state: -I -S -Xfrozen_modules=on runs (control)", [py, "-I", "-S", "-Xfrozen_modules=on"] + help_, None, None),
-        ("start state: -I -X frozen_modules=off re-executes and runs (control)", [py, "-I", "-X", "frozen_modules=off"] + help_,
+        ("start state: -I -X frozen_modules=off re-executes and runs (control; refused where the installation's site replaced a sys hook)", [py, "-I", "-X", "frozen_modules=off"] + help_,
          None, None),
         ("start state: -I -s -E -B -q -S runs (control)", [py, "-I", "-s", "-E", "-B", "-q", "-S"] + help_, None, None),
         ("start state: PYTHONPATH with a sitecustomize under -I -S never runs it (control)", [py, "-I", "-S"] + help_,
          {"PYTHONPATH": site_dir}, None),
-        ("start state: PYTHONPATH with a sitecustomize under -I never runs it (control)", [py, "-I"] + help_,
+        ("start state: PYTHONPATH with a sitecustomize under -I never runs it (control; refused where the installation's site replaced a sys hook)", [py, "-I"] + help_,
          {"PYTHONPATH": site_dir}, None),
-        ("start state: PYTHONWARNINGS=error under -I is ignored (control)", [py, "-I"] + help_, {"PYTHONWARNINGS": "error"}, None),
-        ("start state: PYTHONINSPECT=1 under -I is ignored (control)", [py, "-I"] + help_, {"PYTHONINSPECT": "1"}, None),
+        ("start state: PYTHONWARNINGS=error under -I is ignored (control; refused where the installation's site replaced a sys hook)", [py, "-I"] + help_, {"PYTHONWARNINGS": "error"}, None),
+        ("start state: PYTHONINSPECT=1 under -I is ignored (control; refused where the installation's site replaced a sys hook)", [py, "-I"] + help_, {"PYTHONINSPECT": "1"}, None),
         ("start state: shadow modules in the current directory never load under -I -S (control)", [py, "-I", "-S"] + help_,
          None, cwd_dir),
-        ("start state: shadow modules in the script directory never load under -I (control)", [py, "-I"] + help_, None, copy_dir),
+        ("start state: shadow modules in the script directory never load under -I (control; refused where the installation's site replaced a sys hook)", [py, "-I"] + help_, None, copy_dir),
         ("start state: the shebang start runs (control)", help_, {"PATH": os.path.dirname(py) + ":/usr/bin:/bin"}, None),
         ("start state: an inherited ignored SIGHUP (nohup) runs (control)",
          [py, "-I", "-S", "-c", "import os, signal; signal.signal(signal.SIGHUP, signal.SIG_IGN); "
@@ -2302,8 +2347,21 @@ def selftest_start_state(T, base):
     ]
     if vi >= (3, 11):
         controls.append(("start state: -I -P -S runs (control, Python 3.11+)", [py, "-I", "-P", "-S"] + help_, None, None))
+    probe = subprocess.run([py, "-I", "-c", "import sys\nfor h in ('excepthook', 'displayhook', 'unraisablehook', "
+                            "'breakpointhook'):\n    if getattr(sys, h) is not getattr(sys, '__' + h + '__'):\n"
+                            "        print(h)\n"], stdin=subprocess.DEVNULL, capture_output=True,
+                           env={"PATH": "/usr/bin:/bin", "HOME": base}, timeout=120)
+    site_hooks = probe.stdout.decode("ascii", "replace").split()
+    T.leg("start state: the probe of the installation's site under -I ran (control)", probe.returncode, 0,
+          probe.stderr[-200:])
+    if site_hooks:
+        T.emit("  info: this installation's site replaces sys.%s under -I, so a start with -I but without -S is "
+               "refused here (exit 78) instead of re-executing\n" % site_hooks[0])
     for label, argv, extra, cwd in controls:
-        _child(T, base, label, argv, 0, usage, extra, cwd)
+        if argv[0] == py and "-S" not in argv and "-IS" not in argv and "-SI" not in argv and site_hooks:
+            _child(T, base, label, argv, _LAB_REFUSED_RC, "sys.%s is replaced" % site_hooks[0], extra, cwd)
+        else:
+            _child(T, base, label, argv, 0, usage, extra, cwd)
     refusals = (
         ("start state: a plain start is refused", [py] + help_, None, None, "not started isolated"),
         ("start state: -E -s without -I is refused", [py, "-E", "-s"] + help_, None, None, "not started isolated"),
@@ -2358,7 +2416,8 @@ def selftest_start_state(T, base):
                [py, "-I", "-S", "-X", "frozen_modules=maybe"] + help_, 1, "bad value for option -X frozen_modules", marker_ok=True)
     _child(T, base, "start state: -I -S -m run with the script directory on PYTHONPATH never finds the program",
            [py, "-I", "-S", "-m", "run", "--help"], 1, "No module named run", {"PYTHONPATH": copy_dir}, marker_ok=True)
-    _child(T, base, "start state: entry from stdin is refused", [py, "-I", "-S", "-", "--help"], _LAB_REFUSED_RC, "run.py: REFUSED: ",
+    _child(T, base, "start state: entry from stdin is refused", [py, "-I", "-S", "-", "--help"], _LAB_REFUSED_RC,
+           "run.py: REFUSED: entry from stdin is not allowed",
            stdin_path=copy, marker_ok=True)
     drivers = (
         ("bar-b: a driver that replaces open before running the file is refused",
@@ -2387,7 +2446,35 @@ def selftest_start_state(T, base):
         ("start state: a replaced sys.excepthook is refused",
          "import runpy, sys\nsys.excepthook = lambda *a: None\nsys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n",
          "sys.excepthook is replaced"),
+        ("start state: a replaced sys.displayhook is refused",
+         "import runpy, sys\nsys.displayhook = lambda *a: None\nsys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n",
+         "sys.displayhook is replaced"),
+        ("start state: a replaced sys.unraisablehook is refused",
+         "import runpy, sys\nsys.unraisablehook = lambda *a: None\nsys.argv = [%r, '--help']\n"
+         "runpy.run_path(%r, run_name='__main__')\n", "sys.unraisablehook is replaced"),
+        ("start state: a replaced sys.breakpointhook is refused",
+         "import runpy, sys\nsys.breakpointhook = lambda *a: None\nsys.argv = [%r, '--help']\n"
+         "runpy.run_path(%r, run_name='__main__')\n", "sys.breakpointhook is replaced"),
+        ("start state: a profile hook set before the file runs is refused",
+         "import runpy, sys\nsys.setprofile(lambda *a: None)\nsys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n",
+         "trace or profile hook"),
     )
+    if vi >= (3, 12):
+        drivers += (
+            ("start state: a sys.monitoring tool registered before the file runs is refused (Python 3.12+)",
+             "import runpy, sys\nsys.monitoring.use_tool_id(3, 'x')\nsys.argv = [%r, '--help']\n"
+             "runpy.run_path(%r, run_name='__main__')\n", "sys.monitoring tool is registered"),)
+    names = "[" + ", ".join(repr(n) for n in _LAB_BUILTIN_NAMES) + "]"
+    drivers += (
+        ("start state: each of the twenty builtins run.py calls (open, __import__ and eighteen more) is refused when "
+         "replaced",
+         "import builtins, runpy, sys\nreal_dir = builtins.dir\nfor n in " + names + ":\n    f = getattr(builtins, n)\n"
+         "    setattr(builtins, n, (lambda g: lambda *a, **k: g(*a, **k))(f))\n"
+         "builtins.globals = lambda: sys._getframe(1).f_globals\n"
+         "builtins.dir = lambda *a: real_dir(*a) if a else sorted(sys._getframe(1).f_locals)\n"
+         "sys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n",
+         "; ".join("builtin %s replaced" % n for n in _LAB_BUILTIN_NAMES) if len(_LAB_BUILTIN_NAMES) == 20
+         else "twenty names, not %d" % len(_LAB_BUILTIN_NAMES)),)
     for i, (label, body, why) in enumerate(drivers):
         driver = os.path.join(base, "driver-%d.py" % i)
         _write(driver, body % (copy, copy))
