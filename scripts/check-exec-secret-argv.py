@@ -746,7 +746,11 @@ def _my_words_hit(words: Sequence[str]) -> bool:
 
 def _my_head_command(text: str, start: int, directory: str) -> bool:
     """Whether the head matched at text[start:] is a command word: not a word of an echo string, not a package or
-    path operand. A head inside a quote opened before it counts only as the first word of that quote."""
+    path operand. One rule for every head (#5820): it is a command unless a word before it in its command is a
+    verb of _MY_NONCMD_PREV. Its command starts after the last pipe, semicolon, ampersand or parenthesis; for a
+    head inside a quote that is the quote's own text when the quote opens a command substitution, and otherwise
+    the command around the quote followed by the quote's text, so a wrapper inside a payload (sudo, exec,
+    timeout, an assignment) is read like the same wrapper outside it. The first word of a quote is a command."""
     if directory and not _MY_BIN_DIR_RE.search(directory):
         return False
     quote = ""
@@ -758,11 +762,15 @@ def _my_head_command(text: str, start: int, directory: str) -> bool:
                 quote = ""
         elif c in "\"'":
             quote, opener = c, k
-    before = text[opener + 1:start] if quote else text[:start]
     if quote:
-        tail = re.split(r"[|;&(]", before)[-1]
-        return not tail.strip()
-    words = re.split(r"[|;&(]", before)[-1].replace("\"", " ").replace("'", " ").split()
+        inner = text[opener + 1:start]
+        tail = re.split(r"[|;&(`]", inner)[-1]
+        if not tail.strip():
+            return True
+        before = tail if "(" in inner or "`" in inner else re.split(r"[|;&(]", text[:opener])[-1] + " " + tail
+    else:
+        before = re.split(r"[|;&(]", text[:start])[-1]
+    words = before.replace("\"", " ").replace("'", " ").split()
     return not any(w.lower() in _MY_NONCMD_PREV for w in words)
 
 
@@ -2038,6 +2046,11 @@ ROUND3_RED = [
     ('5737 mutant pin: reported 1: a head under a libexec directory is a command even when no other pattern tags the line', '/usr/libexec/mysqlcheck -u r "$X"'),
     ('5746 mutant pin: reported 1: -p followed by a value-option letter still carries the password', 'mysql -ph$X db'),
     ('5746 mutant pin: reported 2: -p followed by a value-option letter still carries the password', 'mysql -pP"$X" db'),
+    ('5820 wrapper pin: reported 1: sudo inside an ssh payload is read like sudo outside it', 'ssh dbhost "sudo mysql -uroot -p$X app"'),
+    ('5820 wrapper pin: reported 2: exec inside a sh -c payload', 'sh -c "exec mysql -uroot -p$X"'),
+    ('5820 wrapper pin: reported 3: sudo after a semicolon inside a single-quoted payload', "sh -c 'cd /x; sudo mysql -p$X'"),
+    ('5820 wrapper pin: reported 4: timeout inside a docker exec payload', 'docker exec db bash -c "timeout 5 mysqladmin -uroot -p$X ping"'),
+    ('5820 wrapper pin: reported 5: an env assignment inside a kubectl exec payload', "kubectl exec db -- sh -c 'FOO=x mysql -p$X'"),
     ('5683 mutant pin: reported 2: the password command word of mysqladmin is matched in any letter case', 'mysqladmin PASSWORD "x$NEW"'),
 ]
 ROUND3_GREEN = [
@@ -2107,6 +2120,9 @@ ROUND3_GREEN = [
     ('5729 mutant pin: clean 2: a pipe ends the mysql command', 'mysql -u r db | grep "$X"'),
     ('5738 mutant pin: clean 1: a semicolon ends the wget command', 'wget -q URL; ls -e "http_password=$X"'),
     ('5738 mutant pin: clean 2: a pipe ends the wget command', 'wget URL | tee -e "http_password=$X"'),
+    ('5820 wrapper pin: clean 1: a wrapper inside an echoed string is no command', 'echo "run sudo mysql -p$X"'),
+    ('5820 wrapper pin: clean 2: a wrapper inside a printf operand is no command', "printf '%s\\n' \"now sudo mysql -p$X\""),
+    ('5820 wrapper pin: clean 3: a wrapped head in a payload with clean words', 'ssh h "sudo mysql -uroot -h $H app"'),
 ]
 
 # Raw logical-line text that holds a newline (the arm is a function of text; every unit the gate builds today is
