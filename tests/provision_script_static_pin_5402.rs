@@ -176,3 +176,74 @@ fn reinit_live_pg_dump_uses_pinned_conninfo_and_unsets_service_5449() {
         "#5449: the identifier check runs first"
     );
 }
+
+/// #5450: with AI_MEMORY_SSH_HOST set, PG_SSLROOTCERT is a REMOTE path, so it must
+/// never become the local pg_dump CA; an unset PG_DUMP_SSLROOTCERT is refused.
+#[test]
+fn reinit_ssh_host_without_dump_ca_is_refused_5450() {
+    let o = dry_run(&[("AI_MEMORY_SSH_HOST", "droplet.example")]);
+    assert_eq!(
+        o.status.code(),
+        Some(7),
+        "#5450: must exit 7: {}",
+        stderr_of(&o)
+    );
+    assert!(
+        stderr_of(&o).contains("PG_DUMP_SSLROOTCERT is unset")
+            && stderr_of(&o).contains("AI_MEMORY_SSH_HOST is set"),
+        "#5450: refusal text: {}",
+        stderr_of(&o)
+    );
+    assert!(
+        !stdout_of(&o).contains("pg_dump"),
+        "#5450: nothing may be planned"
+    );
+}
+
+/// The planned pg_dump line of a dry run (the store URL of schema-init also carries a CA).
+fn dump_line(o: &Output) -> String {
+    stdout_of(o)
+        .lines()
+        .find(|l| l.contains("DRY-RUN: pg_dump"))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// #5450: the fallback to PG_SSLROOTCERT stays available when pg_dump and the CA are
+/// on the same host (no ssh host), and an explicit local CA is honoured with an ssh host.
+#[test]
+fn reinit_dump_ca_fallback_only_without_ssh_host_5450() {
+    let local = dry_run(&[]);
+    assert_eq!(local.status.code(), Some(0), "{}", stderr_of(&local));
+    assert!(
+        dump_line(&local).contains("sslrootcert=/nonexistent/ca.pem"),
+        "#5450: local fallback to PG_SSLROOTCERT: {}",
+        dump_line(&local)
+    );
+    let remote = dry_run(&[
+        ("AI_MEMORY_SSH_HOST", "droplet.example"),
+        ("PG_DUMP_SSLROOTCERT", "/etc/ca/local.pem"),
+    ]);
+    assert_eq!(remote.status.code(), Some(0), "{}", stderr_of(&remote));
+    assert!(
+        dump_line(&remote).contains("sslrootcert=/etc/ca/local.pem")
+            && !dump_line(&remote).contains("sslrootcert=/nonexistent/ca.pem"),
+        "#5450: the local CA is used, never the remote path: {}",
+        dump_line(&remote)
+    );
+}
+
+/// #5450: the guard itself is pinned in the source, so a text-level rewrite is caught
+/// even where the behavioural runs cannot reach.
+#[test]
+fn reinit_dump_ca_fallback_guard_is_pinned_5450() {
+    let script = read("scripts/postgres-droplet-reinit.sh");
+    assert!(
+        script.contains("if [[ -z \"$PG_DUMP_SSLROOTCERT\" && -z \"$AI_MEMORY_SSH_HOST\" ]]; then"),
+        "#5450: the fallback must be guarded by -z AI_MEMORY_SSH_HOST"
+    );
+    assert!(
+        script.contains("AI_MEMORY_SSH_HOST is set, so PG_SSLROOTCERT is a remote path"),
+        "#5450: the FATAL text naming the ssh-host case must stay"
+    );
+}
