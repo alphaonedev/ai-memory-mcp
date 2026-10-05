@@ -1548,6 +1548,94 @@ def _name_writer(stmt):
     return None
 
 
+_ANSI_C = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v", "e": "\x1b", "E": "\x1b",
+           "\\": "\\", "'": "'", '"': '"', "?": "?"}
+
+
+def _dequote(word):
+    """#5763: `word` after shell quote removal (single quotes, double quotes, $'...' and $"...", backslashes, empty
+    strings such as OUT_""DIR), or None when bash computes it: an expansion or a backtick outside single quotes, an
+    ANSI-C escape other than a one-letter one, or an unquoted glob (* ? [...]) or brace pattern ({a,b} {a..b})."""
+    out, i, quote = [], 0, None
+    while i < len(word):
+        c = word[i]
+        if quote == "'":
+            quote = None if c == "'" else quote
+            out.append("" if c == "'" else c)
+            i += 1
+        elif quote == "$'":
+            if c == "\\":
+                if word[i + 1:i + 2] not in _ANSI_C:
+                    return None
+                out.append(_ANSI_C[word[i + 1]])
+                i += 2
+                continue
+            quote = None if c == "'" else quote
+            out.append("" if c == "'" else c)
+            i += 1
+        elif c == "\\":
+            nxt = word[i + 1:i + 2]
+            out.append(c + nxt if quote == '"' and nxt not in '$`"\\' else nxt)
+            i += 2
+        elif c == "`":
+            return None
+        elif c == "$" and quote is None and word[i + 1:i + 2] in ("'", '"'):
+            quote = "$'" if word[i + 1] == "'" else '"'
+            i += 2
+        elif c == "$" and re.match(r"[\w{(@*#?$!-]", word[i + 1:i + 2]):
+            return None
+        elif quote == '"':
+            quote = None if c == '"' else quote
+            out.append("" if c == '"' else c)
+            i += 1
+        elif c in "'\"":
+            quote = c
+            i += 1
+        elif c in "*?" or (c == "[" and "]" in word[i + 1:]) or (c == "{" and re.match(r"[^}]*(?:,|\.\.)[^}]*}",
+                                                                                         word[i + 1:])):
+            return None
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+_PREFIX_WORDS = frozenset(("if", "then", "elif", "else", "while", "until", "do", "!", "time", "{", "coproc"))
+_WRAPPERS = frozenset(("command", "builtin", "exec"))
+
+
+def _command_word(stmt):
+    """#5763: (words, plain, k) for simple command `stmt` with its redirections removed: its shell words, each
+    word after quote removal (None where bash computes it), and the index of its command word after assignments,
+    reserved words, time -p, and command, builtin and exec with their options (exec -a takes a name); k is
+    len(words) when the statement runs no command."""
+    words = shell_words(REDIRECTION.sub(" ", stmt))
+    plain = [_dequote(w) for w in words]
+    k = 0
+    while k < len(words):
+        if re.match(r"\w+(?:\[[^]]*\])?\+?=", words[k]):
+            k += 1
+        elif plain[k] in _PREFIX_WORDS or plain[k] in _WRAPPERS:
+            wrapper, k = plain[k], k + 1
+            while wrapper in _WRAPPERS | {"time"} and k < len(words) and (plain[k] or "").startswith("-"):
+                k += 2 if wrapper == "exec" and "a" in plain[k] else 1
+        else:
+            break
+    return words, plain, min(k, len(words))
+
+
+def _command_findings(stmt):
+    """#5763: the reasons the command word of `stmt` may write a root it does not name, after quote removal: the
+    source and dot builtins in any spelling."""
+    words, plain, k = _command_word(stmt)
+    if k >= len(words):
+        return []
+    cw = plain[k]
+    if cw in (".", "source"):
+        return ["source"]
+    return []
+
+
 def _root_pass(name, stmt):
     """True when `stmt` names `name` only as name="$name" before a command word: the same value, passed to that
     command's environment."""
@@ -1571,6 +1659,8 @@ def root_findings(text):
                 bad.append("%d:roots:%s" % (n, label))
         if re.search(r"(?<![\w-])trap\s+(?!-\s|'[^']*'\s|\"\"\s)", code):
             bad.append("%d:roots:computed trap action" % n)
+        for stmt in statements(strip_comment(line)):
+            bad.extend("%d:roots:%s" % (n, why) for why in _command_findings(stmt))
         for stmt in statements(code):
             words = shell_words(stmt)
             if words and words[0] in DECLARATORS | {"unset"} and any(
@@ -3472,6 +3562,48 @@ def file_roots_5763():
               target_kind('"$OUT_DIR/a"', text) == "file", target_kind('"$OUT_DIR/a"', text))
 
 
+# Round 18 (#5763 survivors): each spelling reassigns OUT_DIR in bash 5.2 (or runs code that may), and is reported on
+# its first line with the reason given; a write under OUT_DIR after it is then the terminal.
+ROOT_SPELLINGS = (
+    # #5897: the dot and source builtins in every spelling.
+    ("#5897", "a backslash-escaped dot", '\\. "$HERE/x"', "roots:source"),
+    ("#5897", "a double-quoted dot", '"." "$HERE/x"', "roots:source"),
+    ("#5897", "a single-quoted dot", "'.' \"$HERE/x\"", "roots:source"),
+    ("#5897", "command -p dot", 'command -p . "$HERE/x"', "roots:source"),
+    ("#5897", "builtin -- source", 'builtin -- source "$HERE/x"', "roots:source"),
+    ("#5897", "a dot after a tab", '.\t"$HERE/x"', "roots:source"),
+    ("#5897", "a dot in a group", '{ . "$HERE/x"; }', "roots:source"),
+    ("#5897", "a dot in a subshell", '( . "$HERE/x" )', "roots:source"),
+    ("#5897", "a split source", 'sou""rce "$HERE/x"', "roots:source"),
+    ("#5897", "a dot after a redirection", '2>/dev/null . "$HERE/x"', "roots:source"),
+)
+# Spellings that leave every root proven: a builtin name as a literal argument of another command.
+ROOT_SPELLINGS_CLEAN = (
+    ("#5897", "a dot as a literal argument", 'ls -d . "$OUT_DIR"'),
+)
+
+
+def root_spellings_5763():
+    """#5763 round 18: a quoted, escaped, split or attached spelling of an indirect writer leaves the roots unproven
+    (S1-S4 of the round-17 review and their neighbours); the clean spellings keep them proven."""
+    fs = FED.read_text()
+    W = 'printf %s "$qjson" > "$OUT_DIR/stdout"'
+    head = fs + "\nprobe_fn() {\n"
+    first = head.count("\n") + 1
+    for issue, label, body, want in ROOT_SPELLINGS:
+        text = head + body + "\n" + W + "\n}\n"
+        roots = root_findings(text)
+        probe("%s %s is reported as %s" % (issue, label, want), "%d:%s" % (first, want) in roots, " ".join(roots[:3]))
+        probe("%s %s leaves a root target the terminal" % (issue, label),
+              target_kind('"$OUT_DIR/a"', text) == "terminal", target_kind('"$OUT_DIR/a"', text))
+    for issue, label, body in ROOT_SPELLINGS_CLEAN:
+        text = head + body + "\n" + W + "\n}\n"
+        probe("%s %s keeps every root proven" % (issue, label), root_findings(text) == [],
+              " ".join(root_findings(text)[:3]))
+        probe("%s %s keeps a target under OUT_DIR a file" % (issue, label),
+              target_kind('"$OUT_DIR/a"', text) == "file", target_kind('"$OUT_DIR/a"', text))
+
+
 def heredoc_5655():
     """#5655: here-document bodies are read: an ssh or scp in a body is a finding, a <<- body ends at its
     tab-indented terminator, every operator of a line counts in any delimiter spelling, <<< and $(( << )) are no
@@ -3740,6 +3872,7 @@ def main():
     ssh_batch_5274()
     heredoc_5655()
     file_roots_5763()
+    root_spellings_5763()
     verify_cost_5247()
     verify_trace_5237()
     f3_static_pins()
