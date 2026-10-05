@@ -133,10 +133,12 @@ def int_value(tok):
     return str(int(digits, base)) if digits else None
 
 
-# assert!(...) / assert_eq!(...): the macro arguments are cut out with balanced brackets, so a right-hand side of ANY
-# shape is seen (a typed literal, an expression, a path); the LEFT side must be `<expr>.len()` / `.count()`.
-HEAD = re.compile(r'assert(?:_eq)?!\s*\(')
+# assert_eq!(<expr>.len()|.count(), <rhs>[, message]) and assert!(<expr>.len()|.count() == <rhs>[, message]) (#5710);
+# HEAD has no word boundary, so a prefixed name (debug_assert_eq!, debug_assert!) matches too. The macro arguments are
+# cut out with balanced brackets, so a right-hand side of ANY shape is seen (a typed literal, an expression, a path).
+HEAD = re.compile(r'assert(?P<eq>_eq)?!\s*\(')
 LEFT = re.compile(r'^\s*(?P<expr>[^;{}]*?)\.(?P<m>len|count)\(\)\s*,(?P<rest>.*)$', re.S)
+COND = re.compile(r'^\s*(?P<expr>[^;{}]*?)\.(?P<m>len|count)\(\)\s*==(?P<rest>.*)$', re.S)
 CONST = re.compile(r'\bconst\s+(?P<name>[A-Z][A-Z0-9_]*)\s*:\s*(?:usize|u\d+|i\d+)\s*=\s*(?P<val>[^;]+?)\s*;')
 
 
@@ -181,10 +183,15 @@ def extract(text):
     out = {}
     for h in HEAD.finditer(text):
         args = macro_args(text, h.end())
-        m = LEFT.match(args) if args is not None else None
+        if args is None: continue
+        if h.group('eq'):                                 # assert_eq!: the right-hand side is the second argument
+            m = LEFT.match(args)
+            rhs = first_arg(m.group('rest')) if m else None
+        else:                                             # assert!: the first argument is `<expr>.len() == <rhs>` (#5710)
+            m = COND.match(first_arg(args))
+            rhs = m.group('rest').strip() if m else None
         if not m: continue
         expr = re.sub(r'\s+', '', m.group('expr')) + '.' + m.group('m') + '()'
-        rhs = first_arg(m.group('rest'))
         val = int_value(rhs)
         if val is None:
             pc = PATH_CONST.match(rhs)
@@ -742,7 +749,19 @@ def selftest():
         return f_
     E = lambda macro, meth, n: 'fn t() { %s!(items.%s(), %s); }\n' % (macro, meth, n)
     case('a .count() left side is seen', scoped('tests/scope.rs', E('assert_eq', 'count', 18), E('assert_eq', 'count', 19)), True, ['items.count()  18 -> 19'])
-    case('an assert! macro is seen', scoped('tests/scope.rs', E('assert', 'len', 18), E('assert', 'len', 19)), True, ['items.len()  18 -> 19'])
+    # #5710: assert! is read only in its compiling count form assert!(<expr>.len()|.count() == <rhs>[, message])
+    Q = lambda n, tail='': 'fn t() { assert!(items.len() == %s%s); }\n' % (n, tail)
+    case('an assert!(<expr>.len() == <rhs>) is seen', scoped('tests/scope.rs', Q(18), Q(19)), True, ['items.len()  18 -> 19'])
+    case('an assert!(<expr>.len() == <rhs>, message) is seen', scoped('tests/scope.rs', Q(18, ', "m {}", 1'), Q(19, ', "m {}", 1')), True, ['items.len()  18 -> 19'])
+    case('an assert!(<expr>.count() == <rhs>) is seen', scoped('tests/scope.rs', E('assert', 'count', 18).replace('(), 18', '() == 18'), E('assert', 'count', 19).replace('(), 19', '() == 19')), True, ['items.count()  18 -> 19'])
+    case('an assert!(<expr>.len() != <rhs>) is not a count assertion', scoped('tests/scope.rs', Q(18).replace('==', '!='), Q(19).replace('==', '!=')), False)
+    case('the non-compiling comma form assert!(<expr>.len(), <rhs>) is not a count assertion', scoped('tests/scope.rs', E('assert', 'len', 18), E('assert', 'len', 19)), False)
+    case('a non-count assert!(i < b.len(), message) whose message spelling changes is no move',
+         scoped('tests/scope.rs', 'fn t() { assert!(i < b.len(), "m"); }\n', 'fn t() { assert!(i < b.len(), M); }\n'), False)
+    case('assert_eq! and assert! with the same expression and value are one assertion (a rewrite is no move)',
+         scoped('tests/scope.rs', E('assert_eq', 'len', 18), Q(18)), False)
+    case('a prefixed macro name (debug_assert_eq!) is seen', scoped('tests/scope.rs', E('debug_assert_eq', 'len', 18), E('debug_assert_eq', 'len', 19)), True, ['items.len()  18 -> 19'])
+    case('a prefixed macro name (debug_assert!) is seen', scoped('tests/scope.rs', Q(18).replace('assert!', 'debug_assert!'), Q(19).replace('assert!', 'debug_assert!')), True, ['items.len()  18 -> 19'])
     case('a .rs file under benches/ is not checked', scoped('benches/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
     case('a non-.rs file under tests/ is not checked', scoped('tests/scope.txt', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), False)
     case('a .rs file under src/ is checked', scoped('src/scope.rs', E('assert_eq', 'len', 18), E('assert_eq', 'len', 19)), True, ['items.len()  18 -> 19'])
