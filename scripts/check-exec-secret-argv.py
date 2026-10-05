@@ -2206,6 +2206,42 @@ def _history_cases(t: Path) -> Tuple[List[str], int]:
             bad.append("the history scan missed a row removed before the list was renamed and rewritten (#5466)")
     except RuntimeError as exc:
         bad.append("the history scan faulted on a list renamed and rewritten in one commit: %s" % exc)
+    # a pure rename of the list keeps every row: nothing is removed, so nothing is named (#5466 precision pin)
+    repo = t / "rename-pure"
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q", "-b", "develop")
+    put(repo, old, "".join("#1 | a.sh | 1 | %s\n" % x for x in (gone_row, kept_row)))
+    commit(repo, "the list at its old path")
+    (repo / PENDING_FILE).parent.mkdir(parents=True, exist_ok=True)
+    git(repo, "mv", old, PENDING_FILE)
+    commit(repo, "pure rename")
+    n += 1
+    try:
+        if removed_pending_rows(repo):
+            bad.append("a pure rename of the list named a row as removed (#5466)")
+    except RuntimeError as exc:
+        bad.append("the history scan faulted on a pure rename of the list: %s" % exc)
+    # a removed content line that reads like a diff header must not retarget the scan at the allow list (#5463)
+    repo = t / "forged-header"
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q", "-b", "develop")
+    put(repo, PENDING_FILE, "-- a/%s\n" % ALLOW_FILE + "".join("#1 | a.sh | 1 | %s\n" % x for x in (gone_row, kept_row)))
+    commit(repo, "the list with a header-like line")
+    rows(repo, kept_row)
+    commit(repo, "remove the header-like line and a row")
+    judge_repo("a row removed right after a header-like content line", repo)
+    # an allow row whose reason is an issue number is not a pending row: its removal names nothing (#5299)
+    repo = fresh("allow-reason")
+    put(repo, ALLOW_FILE, "#123 | a.sh | 1 | export ALLOW_ONLY\n")
+    commit(repo, "an allow row with an issue reason")
+    put(repo, ALLOW_FILE, "")
+    commit(repo, "drop it")
+    n += 1
+    try:
+        if "export ALLOW_ONLY" in removed_pending_rows(repo):
+            bad.append("the removal of an allow row was read as a removed pending row (#5299)")
+    except RuntimeError as exc:
+        bad.append("the history scan faulted on an allow row with an issue reason: %s" % exc)
     # a replace ref that hides the removing commit from every default git view (#5463)
     repo = fresh("replace")
     drop(repo)
