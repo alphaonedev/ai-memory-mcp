@@ -723,9 +723,19 @@ def _class_regex(body: str, pattern: str) -> str:
 
 
 def glob_match(pattern: str, ref: str) -> bool:
-    """GitHub Actions filter glob: ** crosses '/', * does not, ? is one non-/ char.
+    """True when one branches pattern (its leading '!' already removed) matches ref.
 
-    A [...] class is read only when its body is a proven form (_class_regex).
+    The pattern is translated to a Python regex and must match the whole ref.
+    Read, each pinned by a test:
+      ``**``     regex ``.*``: any run of characters, '/' included.
+      ``*``      regex ``[^/]*``: any run of characters other than '/'.
+      ``[...]``  a class whose body is a proven form (_class_regex).
+      a letter, a digit, ``.``, ``_``, ``/`` or ``-``: itself.
+    Refused with Unparsed: an empty pattern, a run of three or more '*', and
+    every other character, for example ``?``, ``+``, a backslash, ``]``, ``!``,
+    ``{``, ``(``, ``@``, ``^``, ``$``, ``|``, a space or a non-ASCII letter.
+    The read forms follow GitHub's documented filter pattern cheat sheet; this
+    function was not compared with GitHub's own evaluator.
     """
     if not pattern:
         raise Unparsed("empty pattern has no modelled GitHub meaning (#5943)")
@@ -2395,6 +2405,56 @@ class ClosedWorldPattern5943(unittest.TestCase):
             got = self._flow(item)
             self.assertNotEqual([], got, item)
             self.assertTrue(all("R-SHAPE" in v for v in got), (item, got))
+
+
+class GlobDocTruth5944(unittest.TestCase):
+    """#5944: the glob_match docstring states only what the function does.
+
+    Measured at 3d953877: the docstring said "GitHub Actions filter glob: ... ? is
+    one non-/ char", presenting the function's own '?' reading as GitHub's.
+    """
+
+    def _doc(self) -> str:
+        return " ".join((glob_match.__doc__ or "").split())
+
+    def test_5944_no_sentence_presents_the_reading_as_githubs(self) -> None:
+        doc = self._doc()
+        self.assertNotIn("GitHub Actions filter glob", doc)
+        self.assertNotIn("? is one", doc)
+        self.assertIn("was not compared with GitHub's own evaluator", doc)
+
+    def test_5944_every_refused_form_in_the_docstring_is_refused(self) -> None:
+        doc = self._doc()
+        self.assertIn("Refused with Unparsed:", doc)
+        refused = doc.split("Refused with Unparsed:", 1)[1].split("The read forms", 1)[0]
+        tokens = re.findall(r"``([^`]+)``", refused)
+        self.assertEqual(["?", "+", "]", "!", "{", "(", "@", "^", "$", "|"], tokens)
+        for phrase, ch in (("a backslash", "\\"), ("a space", " "), ("a non-ASCII letter", "é")):
+            self.assertIn(phrase, refused)
+            tokens.append(ch)
+        for ch in tokens:
+            with self.assertRaises(Unparsed, msg=ch):
+                glob_match("a" + ch + "b", "ab")
+        self.assertIn("an empty pattern", refused)
+        with self.assertRaises(Unparsed):
+            glob_match("", "")
+        self.assertIn("a run of three or more '*'", refused)
+        with self.assertRaises(Unparsed):
+            glob_match("a***", "a")
+
+    def test_5944_every_read_form_in_the_docstring_reads_as_stated(self) -> None:
+        doc = self._doc()
+        self.assertIn("``**`` regex ``.*``: any run of characters, '/' included.", doc)
+        self.assertTrue(glob_match("a**", "a/b/c") and glob_match("a**", "a"))
+        self.assertIn("``*`` regex ``[^/]*``: any run of characters other than '/'.", doc)
+        self.assertTrue(glob_match("a*", "abc") and glob_match("a*", "a"))
+        self.assertFalse(glob_match("a*", "a/b"))
+        self.assertIn("``[...]`` a class whose body is a proven form (_class_regex).", doc)
+        self.assertTrue(glob_match("[a-c]", "b"))
+        self.assertIn("a letter, a digit, ``.``, ``_``, ``/`` or ``-``: itself.", doc)
+        for ch in "aZ7._/-":
+            self.assertTrue(glob_match("x" + ch, "x" + ch), ch)
+            self.assertFalse(glob_match("x" + ch, "xq" if ch != "q" else "xr"), ch)
 
 
 class GlobSemantics5447(unittest.TestCase):
