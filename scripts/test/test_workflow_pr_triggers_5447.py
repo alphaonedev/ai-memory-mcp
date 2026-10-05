@@ -694,7 +694,12 @@ def glob_match(pattern: str, ref: str) -> bool:
         else:
             regex.append(re.escape(ch))
         i += 1
-    return re.fullmatch("".join(regex), ref) is not None
+    try:
+        return re.fullmatch("".join(regex), ref) is not None
+    except re.error as exc:
+        # A class the regex engine cannot compile (empty, reversed range) is a
+        # named refusal, not an exception out of violations() (#5853).
+        raise Unparsed("unreadable character class (" + str(exc) + "): " + pattern) from exc
 
 
 def filter_matches(patterns: List[str], ref: str) -> bool:
@@ -777,8 +782,9 @@ def violations(name: str, text: str) -> List[str]:
     try:
         return _rule_violations(name, triggers)
     except Unparsed as exc:
-        # A filter item the glob reader cannot read (an unterminated [ class) is a
-        # named failure too, not an exception out of violations() (#5777).
+        # A filter item the glob reader cannot read (an unterminated, empty or
+        # reversed-range [ class) is a named failure too, not an exception out of
+        # violations() (#5777, #5853).
         return [f"{name}: R-SHAPE cannot match filters ({exc})"]
 
 
@@ -2124,6 +2130,25 @@ class RefusalBranches5665(unittest.TestCase):
         for branches in (" [main, 'rehearsal/**', 'a[b']\n", "\n      - main\n      - rehearsal/**\n      - a[b\n"):
             got = violations("x.yml", "name: x\non:\n  pull_request:\n    branches:" + branches)
             self.assertTrue(any(why in v for v in got), got)
+
+
+class UnreadableClass5853(unittest.TestCase):
+    """#5853: a class shape the glob reader cannot read is a named refusal, not re.error.
+
+    Measured at 0e5758dc with the text below: both items raised re.error out of
+    violations().  PyYAML 6.0.1 reads each as a plain string list item.
+    """
+
+    def _refused(self, item: str) -> None:
+        text = "name: x\non:\n  pull_request:\n    branches: [main, 'rehearsal/**', '" + item + "']\n"
+        got = violations("x.yml", text)
+        self.assertTrue(any("R-SHAPE cannot match filters" in v and item in v for v in got), (item, got))
+
+    def test_5853_empty_class_is_a_named_refusal(self) -> None:
+        self._refused("a[]b")
+
+    def test_5853_reversed_range_is_a_named_refusal(self) -> None:
+        self._refused("[z-a]")
 
 
 class GlobSemantics5447(unittest.TestCase):
