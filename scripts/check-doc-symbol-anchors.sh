@@ -1458,6 +1458,8 @@ PYEOF
         "$R::<Self>::decorate_memory_many" "See \`$R::<Self>::decorate_memory_many\`."
     anchor_red_cites 5611 UNMODELLED "a keyword brace item" \
         "$R::fn" "See \`$R::{RecallTool, fn}\`."
+    anchor_red_cites 5611 UNMODELLED "a lone use keyword is not a placeholder" \
+        "$R::<use>" "See \`$R::<use>\` here."
 
     # #5612 (and review item N-3): a cited token is the anchor as written,
     # whitespace removed, generics kept, never cut at a tab or a separator.
