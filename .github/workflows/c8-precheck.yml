@@ -504,7 +504,7 @@ jobs:
         run: python3 scripts/check-pgbouncer-pool-mode-claims.py --self-test
       - name: Behaviour test of the allowlist regen tool (round-5 code review)
         # The regen tool writes the allowlist the gate trusts: refuse without a flag,
-        # --check never writes, no stock reason, forbidden lines never written,
+        # --check never writes, no stock reason, lines the A1 shapes refuse never written,
         # --drop-stale / --refresh-context / --reasons-file / skip-list reason
         # promises; each promise has a mutant that must be killed.
         run: python3 scripts/test-regen-pool-allow.py --mutants

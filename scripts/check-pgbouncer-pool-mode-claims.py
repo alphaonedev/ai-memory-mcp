@@ -209,13 +209,19 @@ NEUTRAL_SHAPES = (
 # ------------------------------------------------------------------ reasons
 
 PLACEHOLDER = "REASON REQUIRED"
-# A1 (#4667 R4): an allowlist entry may describe a non-session mode, never set one. A whole-line
-# assignment of transaction/statement (any key spelling, ini/yaml/env/json/toml/compose form) or a
-# config line carrying a pool_mode=transaction token is refused (rc 2), whatever its reason says.
+# A1 (#4667 R4, #5366): an allowlist entry may describe a non-session mode, never set one. A whole-line
+# assignment of transaction/statement (any key spelling, ini/yaml/env/json/toml/compose form), a config
+# line carrying a pool_mode=transaction token, or a pool_mode key assigned transaction/statement by a command
+# (shell export, Dockerfile ENV, docker -e) or a quoted JSON key is refused (rc 2), whatever its reason says.
+# Prose that quotes the withdrawn setting (a retirement note) stays allowlistable: a bare key=value inside a
+# sentence is not refused. The shapes are matched on the entry text and on its shadow view, so a look-alike
+# letter does not slip past.
 FORBIDDEN_ENTRY = (
     re.compile(r"^(?:[-*>]\s*)*[\"']?[a-z0-9_.]*mode(?:[_-]?type)?[\"']?\s*[=:]\s*[\"']?(?:transaction|statement)[\"']?,?\s*(?:[;#].*)?$"),
     re.compile(r"^[a-z_][a-z0-9_.]*\s*=\s*(?:[a-z_][a-z0-9_.-]*=[^\s;#]*\s*)*pool_mode=(?:transaction|statement)\b"),
     re.compile(r"^pool\s+[\"']?(?:transaction|statement)[\"']?$"),
+    re.compile(r"(?:^|\s)(?:export|env|set|-e|--env)[=\s]\s*[\"']?[a-z0-9_.]*pool[_-]?mode[\"']?[=\s]\s*[\"']?(?:transaction|statement)\b"),
+    re.compile(r"[\"'][a-z0-9_.]*pool[_-]?mode[\"']\s*:\s*[\"'](?:transaction|statement)[\"']"),
 )
 FILLER = re.compile(r"\b(?:todo|tbd|fixme|xxx|lorem|ipsum|placeholder|n/?a|tk)\b")
 MIN_DISTINCT_WORDS = 5
@@ -427,7 +433,8 @@ def reason_problem(reason: str) -> Optional[str]:
 
 def forbidden_entry(text: str) -> bool:
     """An entry text that sets a non-session mode (A1 R4): never allowlistable."""
-    return any(shape.match(text) for shape in FORBIDDEN_ENTRY)
+    views = (text, shadow(text))
+    return any(shape.search(view) for shape in FORBIDDEN_ENTRY for view in views)
 
 
 def tracked_files(root: Path) -> List[str]:
@@ -1151,6 +1158,17 @@ def cases() -> List[Tuple[str, Dict[str, object], int]]:
          tree({"infra/x/setup.sh": "pool_mode = transaction\n"}, REASON + ent("infra/x/setup.sh", "pool_mode = transaction\n", "pool_mode = transaction")), EXIT_FAULT),
         ("a per-db override entry is refused",
          tree({"infra/x/pgb.ini": "ai = host=pg pool_mode=transaction\n"}, REASON + ent("infra/x/pgb.ini", "ai = host=pg pool_mode=transaction\n", "ai = host=pg pool_mode=transaction")), EXIT_FAULT),
+        # #5366: a pool_mode key assigned transaction anywhere on the line is refused, in any spelling
+        ("an entry with shell export sets the mode and is refused",
+         tree({"infra/x/setup.sh": "export pgbouncer_pool_mode=transaction\n"}, REASON + ent("infra/x/setup.sh", "export pgbouncer_pool_mode=transaction\n", "export pgbouncer_pool_mode=transaction")), EXIT_FAULT),
+        ("an entry with inline json sets the mode and is refused",
+         tree({"infra/x/setup.sh": "{\"pool_mode\": \"transaction\"}\n"}, REASON + ent("infra/x/setup.sh", "{\"pool_mode\": \"transaction\"}\n", "{\"pool_mode\": \"transaction\"}")), EXIT_FAULT),
+        ("an entry with dockerfile env sets the mode and is refused",
+         tree({"infra/x/setup.sh": "env pool_mode=transaction\n"}, REASON + ent("infra/x/setup.sh", "env pool_mode=transaction\n", "env pool_mode=transaction")), EXIT_FAULT),
+        ("an entry with docker run -e sets the mode and is refused",
+         tree({"infra/x/setup.sh": "docker run -e pool_mode=transaction edoburu/pgbouncer\n"}, REASON + ent("infra/x/setup.sh", "docker run -e pool_mode=transaction edoburu/pgbouncer\n", "docker run -e pool_mode=transaction edoburu/pgbouncer")), EXIT_FAULT),
+        ("an entry with look-alike letter sets the mode and is refused",
+         tree({"infra/x/setup.sh": "pool_mode = tr\u0430nsaction\n"}, REASON + ent("infra/x/setup.sh", "pool_mode = tr\u0430nsaction\n", "pool_mode = tr\u0430nsaction")), EXIT_FAULT),
         # files read, not skipped (#5086, #5090)
         ("NUL bytes in a markdown file fail closed", tree({"docs/n.md": "\0\nRun PgBouncer in transaction mode.\n"}), EXIT_FAULT),
         ("a gzip document fails closed", tree({"docs/z.md.gz": b"\x1f\x8b\x08\x00zzz"}), EXIT_FAULT),
@@ -1305,6 +1323,10 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("F2 window margin", "WINDOW_MARGIN = 2 * PARAGRAPH_MAX + 2 * NEIGHBOURS", "WINDOW_MARGIN = 1"),
     ("F2 chunk-boundary carriage return", " or lines[-1].endswith(\"\\r\")", ""),
     ("A1 forbidden entries", "        if forbidden_entry(text):\n", "        if False:\n"),
+    ("A1 forbidden command assignment (#5366)", '(?:^|\\s)(?:export|env|set|-e|--env)[=\\s]', "(?:^|\\s)(?:zzexport)[=\\s]"),
+    ("A1 forbidden command words (#5366)", "(?:export|env|set|-e|--env)[=\\s]", "(?:export)[=\\s]"),
+    ("A1 forbidden quoted json key (#5366)", '[\\"\'][a-z0-9_.]*pool[_-]?mode[\\"\']\\s*:', '[\\"\'][a-z0-9_.]*pool[_-]?zzmode[\\"\']\\s*:'),
+    ("A1 forbidden shapes read the shadow view (#5366)", "    views = (text, shadow(text))\n", "    views = (text,)\n"),
     ("A1 filler reasons", "    if FILLER.search(reason.casefold()) or", "    if False and"),
     ("R3 path tokens", "    text = TOOL_PATH.sub(_path_words, text)\n", ""),
     ("R3 path keeps product words", 'return " " + " ".join(_PATH_KEEP.findall(match.group(0))) + " "', 'return " "'),

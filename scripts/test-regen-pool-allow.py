@@ -56,6 +56,7 @@ RECORD = "# context re-read on "
 DOC = r13("CtObhapre cbby zbqr abgrf sbe bcrengbef ner xrcg va guvf frpgvba.\n") + "Filler one.\nFiller two.\n"
 DOC2 = r13("Nabgure svyr fnlf gur ctobhapre cbby zbqr vf erivrjrq ryfrjurer.\n") + "Filler.\n"
 FORBIDDEN = "Example:\n\n" + r13("cbby_zbqr = genafnpgvba\n")
+FORBIDDEN_EXPORT = "Example:\n\n" + r13("rkcbeg CTOBHAPRE_CBBY_ZBQR=genafnpgvba\n")  # #5366: a shell export
 BASE = {
     "infra/pgbouncer/pgbouncer.ini": "[pgbouncer]\n" + r13("cbby_zbqr = frffvba\n"),
     "docs/enterprise-deployment.md": "```ini\n" + r13("cbby_zbqr = frffvba\n") + "```\n",
@@ -250,6 +251,8 @@ CASES: List[Tuple[str, Dict[str, Body], Callable[[Tree], bool]]] = [
     ("a short --reason is refused", {"docs/a.md": DOC},
      lambda t: t.regen("--accept-new", "--reason", "ok fine") == 2 and t.read(ALLOW) == ""),
     ("a forbidden line is never written", {"docs/a.md": FORBIDDEN},
+     lambda t: t.regen("--accept-new", "--reason", GOOD) == 2 and t.read(ALLOW) == ""),
+    ("a forbidden shell export is never written (#5366)", {"docs/a.md": FORBIDDEN_EXPORT},
      lambda t: t.regen("--accept-new", "--reason", GOOD) == 2 and t.read(ALLOW) == ""),
     ("--check never writes", {"docs/a.md": DOC},
      lambda t: t.regen("--check", "--accept-new", "--reason", GOOD) == 1 and t.read(ALLOW) == ""),
