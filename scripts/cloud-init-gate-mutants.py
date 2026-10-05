@@ -2,7 +2,7 @@
 """Mutation run for the cloud-init redaction code (#5551; PR #4655 round 16).
 
 Each mutant is one text substitution in scripts/check-cloud-init-serve-flags.py or
-scripts/regen-cloud-init-token-allow.py, applied to a copy of scripts/ and infra/ taken from a
+scripts/regen-cloud-init-token-allow.py, applied to a copy of scripts/, infra/ and src/daemon_runtime.rs taken from a
 git revision. A mutant is killed when the gate self-test, the regen self-test, or the gate
 scan or the regen run on the copy exits non-zero. The unmutated control runs before and after
 and must be green. At most 2 copies run at once (each self-test takes about 2.5 minutes).
@@ -52,13 +52,17 @@ MUTANTS = (
     ("M25", G, "        end = CRED_LINE_RE.match(text, m.end()).end()\n        if end > m.end():\n            out.append(CRED_MASK)", "        end = CRED_LINE_RE.match(text, m.end()).end()", "keyword tail dropped instead of masked"),
     ("M26", G, "        globals()[\"load_repo\"] = real\n        CRED_PIECES.clear()", "        globals()[\"load_repo\"] = real", "spelling run leaves its pieces registered"),
     ("M27", R, "    g.CRED_PIECES.clear()\n    return bad", "    return bad", "regen spelling loop leaves pieces registered"),
+    ("M28", G, "out.append(\"%s | %s | %s\" % (scope_of(nm), ln.ctx, scrub(ln.text)))", "out.append(\"%s | %s | %s\" % (scope_of(nm), ln.ctx, ln.text))", "list_triggers returns unscrubbed text (say() also scrubs)"),
+    ("M29", G, "SCRUB_PLACEHOLDER = r\"(?![\\w.-]*:CHANGEME@[^@\\n]*(?:\\n|$))\"", "SCRUB_PLACEHOLDER = r\"\"", "the CHANGEME userinfo is masked too"),
+    ("M30", G, "and not (hcl and HCL_REFERENCE_RE.fullmatch(w))", "and not (False and HCL_REFERENCE_RE.fullmatch(w))", "main.tf var.X reference registered as a secret"),
+    ("M31", G, "and line[m.end():m.end() + 1] == '\"':", "and False:", "PASSWORD then a double quote registered as a secret"),
 )
 
 
 def snapshot(rev: str, dest: Path) -> None:
-    raw = subprocess.run(["git", "archive", rev, "scripts", "infra"], check=True, capture_output=True).stdout
+    raw = subprocess.run(["git", "archive", rev, "scripts", "infra", "src/daemon_runtime.rs"], check=True, capture_output=True).stdout
     with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
-        tf.extractall(str(dest))
+        tf.extractall(str(dest), **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
 
 
 def run(dest: Path, cmd: list) -> int:
@@ -105,6 +109,9 @@ def main() -> int:
     for tag in ("control-before",):
         controls[tag] = one(tag, G, "", "", "unmutated copy", args, root)[2]
         print(tag, "green" if controls[tag] == "SURVIVED" else "RED " + controls[tag], flush=True)
+    if controls["control-before"] != "SURVIVED":
+        print("the unmutated control is not green, so no mutant result would mean anything")
+        return 1
     pool = [m for m in MUTANTS if not only or m[0] in only]
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(2, args.jobs))) as ex:
