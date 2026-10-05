@@ -510,9 +510,10 @@ def refusal_prefix_gap(source: bytes) -> str:
         return "the source has a control byte other than tab, LF and CRLF line ends"
     try:
         body = ast.parse(source).body
-    # ValueError (#5589): interpreters before 3.12 raised ValueError, not SyntaxError, for a NUL byte; CONTROL_BYTES
-    # refuses NUL above, so on every version the arm is unreachable by input. Measured only on 3.12.7 and 3.12.3
-    # (SyntaxError); no older interpreter is installed here. It stays as the fail-closed reaction and is pinned.
+    # ValueError (#5589, #5625): for a NUL byte ast.parse raised ValueError on 3.10.22 and SyntaxError on 3.11.17, 3.12.3
+    # and 3.12.7 (the only releases measured; reproducer: python3.10 -c 'import ast; ast.parse(b"x=1\x00\n")').
+    # CONTROL_BYTES refuses NUL above, so a NUL does not reach this arm. The arm stays as the fail-closed reaction and
+    # pin_5589 exercises it with an injected ValueError and with a real NUL once CONTROL_BYTES is disabled.
     except (SyntaxError, ValueError) as exc:
         return f"the source does not parse: {exc}"
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
@@ -1014,10 +1015,11 @@ def _self_test_cases() -> int:
         return ""
 
     def pin_5589():
-        # #5589: a ValueError from ast.parse refuses. CPython before 3.12 raised it for a NUL byte; CONTROL_BYTES refuses
-        # NUL first, so no real input reaches the arm on 3.12 (measured). The injected ValueError keeps the arm
-        # load-bearing: dropping ValueError from the except turns this pin red. A real NUL and a real syntax error are
-        # pinned with their own reasons.
+        # #5589/#5625: a ValueError from ast.parse refuses. For a NUL byte ast.parse raised ValueError on 3.10.22 and
+        # SyntaxError on 3.11.17, 3.12.3 and 3.12.7 (measured); CONTROL_BYTES refuses NUL first. The injected ValueError
+        # keeps the arm load-bearing: dropping ValueError from the except turns this pin red. A real NUL is also run with
+        # CONTROL_BYTES disabled, so the arm is shown to catch whatever this interpreter raises for it. A real NUL and a
+        # real syntax error are pinned with their own reasons.
         refusal, hidden, plain = pin_sources()
         real = ast.parse
         try:
@@ -1035,6 +1037,22 @@ def _self_test_cases() -> int:
             ast.parse = real
         if "control byte" not in refusal_prefix_gap(plain + b"#\x00\n"):
             return "a NUL byte was not refused with the control byte reason (#5589)"
+        try:
+            ast.parse(plain + b"#\x00\n")
+            return "ast.parse accepted a NUL byte, so the arm cannot be shown to catch it (#5625)"
+        except (SyntaxError, ValueError) as nul_exc:
+            print(f"INFO: self-test - ast.parse of a NUL byte raises {type(nul_exc).__name__} on {sys.version.split()[0]} (measured)")
+        real_control = CONTROL_BYTES
+        try:
+            globals()["CONTROL_BYTES"] = re.compile(rb"(?!)")
+            try:
+                why = refusal_prefix_gap(plain + b"#\x00\n")
+            except Exception as exc:  # the real exception of this interpreter must be caught by the arm
+                return f"a real NUL byte reached ast.parse and its {type(exc).__name__} escaped refusal_prefix_gap (#5625)"
+        finally:
+            globals()["CONTROL_BYTES"] = real_control
+        if "the source does not parse" not in why:
+            return f"a real NUL byte with CONTROL_BYTES disabled was not refused with the parse reason: {why!r} (#5625)"
         if "the source does not parse" not in refusal_prefix_gap(b"def (\n" + plain):
             return "a syntax error was not refused with the parse reason (#5589)"
         if refusal_prefix_gap(plain):
