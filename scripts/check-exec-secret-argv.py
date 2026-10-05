@@ -1364,6 +1364,8 @@ def check_allow_vs_denylist(found: Dict[str, List[Found]], allow: List[Entry]) -
 # GIT_CONFIG_PARAMETERS of the caller reaches it, and the entries below are set by the gate itself.
 GIT_ENV_KEEP = ("PATH", "SYSTEMROOT", "TMPDIR", "TEMP", "TMP")
 _GIT_PROVEN: set = set()
+# the signature verifier programs a repo-local config can name (#5822)
+GIT_VERIFIER_KEYS = ("gpg.program", "gpg.openpgp.program", "gpg.x509.program", "gpg.ssh.program")
 
 
 def _git_child_env() -> Dict[str, str]:
@@ -1377,9 +1379,14 @@ def _git_child_env() -> Dict[str, str]:
 def _git_exec(root: Path, args: Sequence[str]) -> "subprocess.CompletedProcess[bytes]":
     """The only subprocess call of git in the gate (the self-test checks this by reading this file)."""
     # repo-local config that runs a command is pinned off for every read (#5633): core.fsmonitor runs its value
-    # from ls-files and status, core.hooksPath would point git at hooks; the history log and the blob reads also
+    # from ls-files and status, core.hooksPath would point git at hooks; log.showSignature would make every log
+    # read run the signature verifier of each signed commit, so it is off and every verifier program (gpg,
+    # openpgp, x509, ssh) is the null device as well (#5822); the history log and the blob reads also
     # pass --no-ext-diff and --no-textconv themselves
-    argv = ["git", "-C", str(root), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull]
+    argv =["git", "-C", str(root), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull,
+            "-c", "log.showSignature=false"]
+    for key in GIT_VERIFIER_KEYS:
+        argv += ["-c", key + "=" + os.devnull]
     return subprocess.run(argv + list(args), check=True, capture_output=True, env=_git_child_env())
 
 
@@ -3050,6 +3057,14 @@ def _git_funnel_cases(t: Path) -> Tuple[List[str], int]:
         shas["C"] = git(repo, "rev-parse", "HEAD").strip()
         return repo, shas
 
+    def marker_prog(name: str) -> Tuple[Path, Path]:
+        """An executable that records that it ran and fails; git runs it without a shell for some keys."""
+        mark, prog = t / (name + "-ran"), t / (name + "-prog")
+        prog.write_text("#!%s\nimport pathlib\npathlib.Path(%r).write_text('ran')\nraise SystemExit(1)\n"
+                        % (sys.executable, str(mark)))
+        prog.chmod(0o755)
+        return mark, prog
+
     def check(label: str, repo: Path, shas: Dict[str, str], env: Optional[Dict[str, str]] = None) -> None:
         """The three readers of the gate (merge base state, history scan, file list) answer as on a clean repo."""
         nonlocal n
@@ -3205,6 +3220,41 @@ def _git_funnel_cases(t: Path) -> Tuple[List[str], int]:
         pass
     if tmark.exists():
         bad.append("a repo-local textconv program ran during the gate's git reads (#5693)")
+    # a signed history read with a repo-local log.showSignature runs no verifier program (#5822): every commit of
+    # the case repo gets a gpgsig header of the kind each verifier key serves
+    for kind, key, armor in (("ssh", "gpg.ssh.program", "SSH SIGNATURE"), ("pgp", "gpg.program", "PGP SIGNATURE"),
+                             ("openpgp", "gpg.openpgp.program", "PGP SIGNATURE"),
+                             ("x509", "gpg.x509.program", "SIGNED MESSAGE")):
+        repo, shas = build("signed-" + kind)
+        new: Dict[str, str] = {}
+        prev = ""
+        for name in ("A", "B", "C"):
+            head, _sep, msg = git(repo, "cat-file", "commit", shas[name]).partition("\n\n")
+            head = re.sub(r"^parent \S+$", "parent " + prev, head, flags=re.M)
+            body = t / ("signed-%s-%s.commit" % (kind, name))
+            body.write_text("%s\ngpgsig -----BEGIN %s-----\n U0lH\n -----END %s-----\n\n%s" % (head, armor, armor, msg))
+            new[name] = prev = git(repo, "hash-object", "-t", "commit", "-w", str(body)).strip()
+        git(repo, "update-ref", "refs/heads/develop", new["C"])
+        git(repo, "update-ref", "refs/heads/base", new["B"])
+        mark, prog = marker_prog("verifier-" + kind)
+        group = "gpg" if kind == "pgp" else 'gpg "%s"' % kind
+        with open(str(repo / ".git" / "config"), "a") as fh:
+            fh.write("[log]\n\tshowSignature = true\n[%s]\n\tprogram = %s\n" % (group, prog))
+            if kind == "ssh":
+                fh.write("\tallowedSignersFile = %s\n" % os.devnull)
+        check("a repo-local log.showSignature and %s on a signed history" % key, repo, new)
+        n += 1
+        if mark.exists():
+            bad.append("a repo-local %s ran during the gate's git reads of a signed history (#5822)" % key)
+    # the verifier pins are visible to git itself: a config read through the funnel names them (#5822)
+    n += 1
+    for key, want in (("log.showsignature", "false"),) + tuple((k, os.devnull) for k in GIT_VERIFIER_KEYS):
+        try:
+            got = _git_exec(repo, ["config", "--get", key]).stdout.decode("utf-8", "replace").strip()
+        except subprocess.CalledProcessError:
+            got = ""
+        if got != want:
+            bad.append("the funnel does not pin %s to %r (read back %r) (#5822)" % (key, want, got))
     repo, shas = build("attr-info")
     (repo / ".git" / "info").mkdir(parents=True, exist_ok=True)
     (repo / ".git" / "info" / "attributes").write_text("%s -diff\n" % PENDING_FILE)
