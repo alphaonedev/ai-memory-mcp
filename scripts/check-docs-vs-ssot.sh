@@ -629,6 +629,12 @@ BLOCK_TAG = re.compile(r'</?(?:p|div|li|ul|ol|tr|table|h[1-6]|section)\b', re.IG
 # with a closing block tag, or this raw line opens with a block tag.
 BLOCK_END = re.compile(r'</(?:p|div|li|ul|ol|tr|table|h[1-6]|section)\s*>\s*$', re.IGNORECASE)
 BLOCK_OPEN = re.compile(r'\s*</?(?:p|div|li|ul|ol|tr|table|h[1-6]|section)\b', re.IGNORECASE)
+# A value block: an html line whose whole text is one ladder number
+# (`<div class="value">52</div>`). It has no subject of its own, so the #5199
+# reset does not apply to it: it is read as the value of the block before it,
+# a label/value card's two lines (#5700). Fail-closed: a list item that is only
+# a number after an identifier item is read the same way.
+BARE = re.compile(r'v?[0-9]{2,3}')
 
 
 def plain(s):
@@ -720,12 +726,17 @@ for path in files:
                     and not BLOCK_TAG.search(lines[back]):
                 back -= 1
                 prev = plain(lines[back])
-            if is_html and (BLOCK_END.search(lines[back]) or BLOCK_OPEN.match(raw)):
-                prev = ''
             # Whitespace at the wrap point is not part of the claim: markdown
             # hard-break spaces, list-continuation indents and tabs are folded.
-            prev = WS.sub(' ', TYPED.sub('', prev)).strip()
             body = WS.sub(' ', probe).strip()
+            # The anchor form below joins across the #5199 reset: its subject words
+            # (a v0.8.x DB steps / v40 -> v52) name the claim on their own, so a
+            # transition split over two blocks is still one claim (#5700).
+            aprev = WS.sub(' ', TYPED.sub('', prev)).strip()
+            if is_html and (BLOCK_END.search(lines[back]) or BLOCK_OPEN.match(raw)) \
+                    and not BARE.fullmatch(body):
+                prev = ''
+            prev = WS.sub(' ', TYPED.sub('', prev)).strip()
             # Identifier form (#4850, window per #5080): the last identifier on
             # the previous line stands alone and the SUBJECT_WINDOW is counted
             # from the START of this line, so the previous line's tail (a
@@ -747,10 +758,10 @@ for path in files:
             # line and whose value opens this one (docs/index.html "a v0.8.x DB
             # steps" / "v70 -> v100"). The match must start on the previous line
             # and its value on this one; same-line matches are counted below.
-            joined = prev + ' ' + body
+            joined = aprev + ' ' + body
             for rx in ANCHORS:
                 for m in rx.finditer(joined):
-                    if m.start() < len(prev) < m.start(1):
+                    if m.start() < len(aprev) < m.start(1):
                         hits.append((m.group(1), m.group(0), None))
             # Markdown only: the same join with the emphasis / code-span markers
             # folded out of both lines, so a bold or code-span transition wrapped
@@ -2995,6 +3006,28 @@ R4HTML
     for _bt in em span strong a code b br td th /td /th /em /span /strong /br; do
         printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-control.html"
     done
+    # #5700: a label/value card is one claim across two block elements. A value block
+    # whose whole text is one ladder number (52, v52) is read with the block before it
+    # (lines 2, 4, 14 flag; a list item that is only a number is refused the same way,
+    # fail-closed); a transition split over two blocks is still joined by its anchor
+    # (line 6 flags, line 8 is canon). A block with words after its number is a new
+    # claim of its own, so the #5199 reset holds for it (line 12).
+    cat > "$tmpdir/docs/card-fixture.html" <<'R4CARD'
+<div class="stat"><div class="label">CURRENT_SCHEMA_VERSION</div>
+<div class="value">52</div></div>
+<li><strong>CURRENT_SCHEMA_VERSION</strong></li>
+<li>52</li>
+<div>a v0.8.x DB steps</div>
+<div>v40 -&gt; v52 on boot.</div>
+<div>a v0.8.x DB steps</div>
+<div>v40 -&gt; v53 on boot.</div>
+<div class="label">CURRENT_SCHEMA_VERSION</div>
+<div class="value">53</div>
+<p>See CURRENT_SCHEMA_VERSION</p>
+<p>52 tools ship today.</p>
+<div class="label">CURRENT_SCHEMA_VERSION</div>
+<div class="value">v52</div>
+R4CARD
     r4_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test #3248 r4 - stale wordings not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
     for _want in \
@@ -3060,7 +3093,9 @@ R4HTML
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:43 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:45 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:47 claims "52"' \
-        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:49 claims "52"'
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:49 claims "52"' \
+        'docs/card-fixture.html:2 claims "52"' 'docs/card-fixture.html:4 claims "52"' \
+        'docs/card-fixture.html:6 claims "52"' 'docs/card-fixture.html:14 claims "52"'
     do grep -qF "$_want" <<<"$r4_out" || { echo "FAIL: self-test #3248 r4 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
     for _not in \
         'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:4 ' \
@@ -3090,7 +3125,8 @@ R4HTML
         'docs/postgres-age-guide.md:81 ' \
         'docs/postgres-age-guide.md:82 ' \
         'docs/schema-fixture.html:96 ' \
-        'docs/schema-fixture.html:98 '
+        'docs/schema-fixture.html:98 ' \
+        'docs/card-fixture.html:8 ' 'docs/card-fixture.html:10 ' 'docs/card-fixture.html:12 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     grep -qF 'STALE entry' <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - a ledger entry reported STALE although its line is present" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -3101,6 +3137,7 @@ R4HTML
     echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, any case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
     echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag, and when the previous line ends with a closing block tag and the next line carries no tag); a closing tag in the MIDDLE of the previous line does not cut a claim wrapped inside the next paragraph; a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
     echo "PASS: self-test #5200/#5339 - ident-less anchors (re-stamped to v1.0.0 (schema vN), Schema vN (was vM), Current version: N at v1.0.0) each match a markdown claim in BOTH a doubled-space and a tab variant: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5700 - a label/value card is one claim: a value block that is only a ladder number (52, v52) after the identifier block is joined (52 REJECTED, 53 ACCEPTED; a bare-number list item is refused the same way, fail-closed); a steps transition split over two blocks is joined by its anchor (52 REJECTED, 53 ACCEPTED); a block with words after its number keeps the #5199 reset"
     echo "PASS: self-test #5337 - join boundaries pinned: a line ending with an OPENING block tag still joins (52 REJECTED), markdown is not tag-aware (a closing tag at the end of a markdown line, or an opening tag at the start of the next, still joins; 52 REJECTED), html literal backticks are not folded (documented bound)"
     echo "PASS: self-test #5340 - a markdown transition in bold or a code span wrapped across a line break (steps **v40 -> / v52**): planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5386 - a bare underscore-emphasis table cell (| Schema version | _v52_ |): planted 52 REJECTED, 53 ACCEPTED; pins the trailing underscore arm of MARKS"
@@ -3120,7 +3157,7 @@ R4HTML
     echo "PASS: self-test #4849 - drifted current-state wording (v1.0.0 substrate, bold value) REJECTED, canonical ACCEPTED"
     echo "PASS: self-test #4844/#4845/#4846 - ROADMAP header parenthetical, at-a-glance card + stat tile, compliance tagline, index upgrade paragraph: stale REJECTED, canonical ACCEPTED"
     rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/schema-fixture.html"
-    rm -f "$tmpdir/docs/block-fixture.html" "$tmpdir/docs/block-control.html"
+    rm -f "$tmpdir/docs/block-fixture.html" "$tmpdir/docs/block-control.html" "$tmpdir/docs/card-fixture.html"
     rm -f "$tmpdir/docs/CONFIG_SCHEMA.md" "$tmpdir/docs/schema-fixture.html"
 
     # ---- #5699: a ledger needle must name the ladder number it exempts. A needle
