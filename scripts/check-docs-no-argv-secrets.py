@@ -4058,6 +4058,8 @@ R11_SHAPE_RED = {
     '5837-r37-client-secret-header': "curl -H 'X-Client-Secret: S3cr3tTok' https://x.example",
     '5837-r38-account-key': 'mytool --account-key S3cr3tTok',
     '5837-r40-db-pass-name': 'mytool -e db_pass=S3cr3tPass',
+    # #5840: an expanded value is flagged too, as the c8-precheck.yml comment states.
+    '5840-r41-password-flag-expansion': 'mytool --password "$PW" run',
     '5837-r39-bash-c-positional-pw': 'bash -c \'env -i\' $X -v pw="$PG_PW"',
 }
 R11_SHAPE_GREEN = {

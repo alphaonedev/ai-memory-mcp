@@ -1307,8 +1307,10 @@ jobs:
     # Environment= credential URL (#4689-#4694); a credential operand under a
     # head the gate does not model or in a bash array body (#5722, #5723);
     # and, inside shell-like fences and files, the argv-credential-shape rule
-    # (#5725: a password/token-named flag with a literal value, a NAME=secret
-    # operand, a URL with userinfo, an Authorization header). No verb is
+    # (#5725, widened by #5837 and #5875: a flag or NAME=VALUE operand named by
+    # a credential word with a literal or expanded value, quoted or not, a URL
+    # with userinfo, a credential header such as Authorization or X-API-Key;
+    # #5840). No verb is
     # exempt (schema-init is checked like any other, #4600). PENDING lists the
     # #4600 and #4864 sites; the operand allowlist holds reviewed lines only.
     # Not claimed: the STATED LIMITS in the script header (runtime-assembled
