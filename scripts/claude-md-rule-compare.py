@@ -367,7 +367,14 @@ def plant_probe(name: str, probe: Path, xopts: list, env=None, isolate=("-S", "-
         "print('REAL')\n", encoding="utf-8")
     result = subprocess.run([sys.executable, *xopts, *isolate, str(probe / "probe.py")],
                             capture_output=True, text=True, check=False, cwd=str(probe), env=env)
-    verdict = [line.split() for line in result.stdout.splitlines() if line.startswith("VERDICT ")]
+    return parse_plant(result.stdout, xopts, isolate)
+
+
+def parse_plant(stdout: str, xopts: list, isolate) -> Plant:
+    """#5473: turn the output of a probe child into a Plant. Pure (no process), so the self-test feeds it synthetic
+    output: exactly one well-formed VERDICT line is required, and `ok` needs the planted file to have run exactly when
+    the child said the module was not loaded, built-in or frozen, and the reported flags to equal the requested ones."""
+    verdict = [line.split() for line in stdout.splitlines() if line.startswith("VERDICT ")]
     if len(verdict) != 1 or len(verdict[0]) != 7 or not all(word.isdigit() for word in verdict[0][1:6]):
         return Plant(False, False, False, False, -1, -1, -1, "?")
     preloaded, inert = verdict[0][1] == "1", verdict[0][2] == "1"
@@ -375,7 +382,7 @@ def plant_probe(name: str, probe: Path, xopts: list, env=None, isolate=("-S", "-
     want_frozen = next((xopts[i + 1].split("=", 1)[1] for i in range(len(xopts) - 1)
                         if xopts[i] == "-X" and xopts[i + 1].startswith("frozen_modules=")), "-")
     flags_ok = (no_site, ignore_env, frozen_xopt) == (int("-S" in isolate), int("-E" in isolate), want_frozen)
-    planted = "PLANTED" in result.stdout
+    planted = "PLANTED" in stdout
     return Plant(not inert, preloaded, planted, planted == (not inert) and flags_ok, no_site, ignore_env, safe_path,
                  frozen_xopt)
 
@@ -623,6 +630,20 @@ def _self_test_cases() -> int:
                                                                                      EXPECTED_IMPORTS)[1] \
                 or any(import_pin_gap(list(EXPECTED_IMPORTS), EXPECTED_IMPORTS)):
             return "the import pin check does not tell a narrowed or widened list from the pin (#5472)"
+        # #5473: parse_plant on synthetic child output: ok needs a matching planted/shadowable pair AND matching flags.
+        synth = [("VERDICT 0 0 1 1 0 -\nPLANTED\n", [], True), ("VERDICT 0 0 0 1 0 -\nPLANTED\n", [], False),
+                 ("VERDICT 0 0 1 0 0 -\nPLANTED\n", [], False), ("VERDICT 0 0 1 1 0 off\nPLANTED\n", [], False),
+                 ("VERDICT 0 0 1 1 0 off\nPLANTED\n", ["-X", "frozen_modules=off"], True),
+                 ("VERDICT 0 0 1 1 0 -\nPLANTED\n", ["-X", "frozen_modules=off"], False),
+                 ("VERDICT 0 1 1 1 0 -\nREAL\n", [], True), ("VERDICT 0 1 1 1 0 -\nPLANTED\n", [], False),
+                 ("VERDICT 0 0 1 1 0 -\nREAL\n", [], False), ("PLANTED\n", [], False),
+                 ("VERDICT 0 0 1 1 0 -\nVERDICT 0 0 1 1 0 -\nPLANTED\n", [], False),
+                 ("VERDICT 0 0 1 1 x -\nPLANTED\n", [], False)]
+        for out, xo, want in synth:
+            if parse_plant(out, xo, ("-S", "-E")).ok != want:
+                return f"parse_plant gave the wrong ok for {out!r} with options {xo} (#5473)"
+        if not parse_plant("VERDICT 0 0 1 1 0 -\nPLANTED\n", [], ("-S", "-E")).planted_ran:
+            return "parse_plant did not read the planted marker (#5473)"
         names = list(EXPECTED_IMPORTS)  # the probe set is the pin, never the output of imported_modules (#5472)
         if "importlib" not in names:
             return "importlib is not in the plant set"
