@@ -60,12 +60,13 @@ range scan via Index Scan Backward, so `migrate_v55()` is a
 version-stamp no-op on the postgres side).
 The v34 → v55 deltas land via in-process
 `migrate_v34() … migrate_v55()` async functions that run as a side
-effect of `ai-memory schema-init --store-url <url>` opening the store
-(there is no `--upgrade` flag); they are NOT separate `.sql` files.
+effect of `ai-memory schema-init` opening the store (the URL channel is
+shown under "In-place v15 → v55" below; there is no `--upgrade` flag); they are NOT separate `.sql` files.
 
 If you migrated from sqlite to postgres on v0.7-alpha, your
-postgres db is at v15. Run `ai-memory schema-init --store-url <url>`
-with the v0.7.0 binary (see "In-place v15 → v55" below) before
+postgres db is at v15. Run `ai-memory schema-init` with the v0.7.0
+binary (see "In-place v15 → v55" below; that binary accepts the URL
+only as `--store-url`, so run it from a single-user admin host) before
 pointing a v0.7.0 daemon at it.
 
 ## Pre-flight checklist
@@ -94,11 +95,12 @@ Before you start:
 ## Step 1 — Bootstrap the postgres schema
 
 ```bash
-ai-memory schema-init \
-  --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
+# /etc/ai-memory/store-url: one line, mode 0600, owned by the user running this command:
+#   postgres://aimemory:PASSWORD@HOST:5432/aimemory
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
+From ai-memory 1.0.0, `schema-init` resolves its URL like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:312`, `src/store_url.rs:137`, [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)). Passing `--store-url` together with a disagreeing env or file channel is refused as an ambiguous store ([#4887](https://github.com/alphaonedev/ai-memory-mcp/issues/4887)). Earlier releases, including the v0.7.0 binary this guide installs, accept only `--store-url`; run that form from a single-user admin host, because the password is visible to every local account while the command runs.
 
 Idempotent on rerun. Exit code 0 + the human summary reporting
 `schema_version: 57` is the success signal (pass `--json` for the
@@ -194,7 +196,10 @@ sqlite3 ~/.local/share/ai-memory/memory.db \
    UNION ALL SELECT 'signed_events', COUNT(*) FROM signed_events
    UNION ALL SELECT 'memory_transcripts', COUNT(*) FROM memory_transcripts;"
 
-psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' -c "
+# psql reads the password from ~/.pgpass (mode 0600), one line:
+#   HOST:5432:aimemory:aimemory:<password>
+# so the URI below carries no password (#4804).
+psql 'postgres://aimemory@HOST:5432/aimemory' -c "
   SELECT 'memories' AS tbl, COUNT(*) FROM memories
   UNION ALL SELECT 'memory_links', COUNT(*) FROM memory_links
   UNION ALL SELECT 'namespaces', COUNT(*) FROM namespaces
@@ -210,8 +215,8 @@ pre-Wave-1 binary — re-run with the v0.7.0 binary that has Stream A's
 `migrate.rs` link-walk.
 
 ```bash
-# Schema parity.
-psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' \
+# Schema parity (password from ~/.pgpass, as above).
+psql 'postgres://aimemory@HOST:5432/aimemory' \
   -tAc "SELECT MAX(version) FROM schema_version;"
 # → 55
 ```
@@ -291,11 +296,12 @@ If you're upgrading an existing v0.7-alpha postgres db (schema v15)
 to v0.7.0's v55 parity:
 
 ```bash
-ai-memory schema-init \
-  --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
+# /etc/ai-memory/store-url: one line, mode 0600, owned by the user running this command:
+#   postgres://aimemory:PASSWORD@HOST:5432/aimemory
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
+From ai-memory 1.0.0, `schema-init` resolves its URL like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:312`, `src/store_url.rs:137`, [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)). Passing `--store-url` together with a disagreeing env or file channel is refused as an ambiguous store ([#4887](https://github.com/alphaonedev/ai-memory-mcp/issues/4887)). Earlier releases, including the v0.7.0 binary this guide installs, accept only `--store-url`; run that form from a single-user admin host, because the password is visible to every local account while the command runs.
 
 Opening the store walks the v15 → v55 deltas idempotently (the
 v34 → v55 layer lands via in-process `migrate_v34()…migrate_v55()`
@@ -356,7 +362,9 @@ with AGE enabled it bootstraps the `memory_graph` projection at
 connect time, and link writes `MERGE` nodes/edges into it lazily. The
 first heavy `kg_query` on a large KG may take 10-60 seconds —
 subsequent queries are fast. Pre-prime by running
-`ai-memory schema-init --store-url <url>` once (it issues the
+`AI_MEMORY_STORE_URL_FILE=<0600 file> ai-memory schema-init` once on
+1.0.0 or later (earlier binaries: see the note under "In-place v15 → v55";
+it issues the
 idempotent `SELECT create_graph('memory_graph')` when AGE is
 installed).
 

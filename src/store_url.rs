@@ -137,16 +137,20 @@ pub fn store_url_from_file(path: &Path) -> Result<String> {
 pub fn resolve_store_url(cli_arg: Option<&str>) -> Result<Option<String>> {
     if let Ok(path) = std::env::var(STORE_URL_FILE_ENV) {
         if !path.trim().is_empty() {
-            return Ok(Some(store_url_from_file(Path::new(path.trim()))?));
+            let url = store_url_from_file(Path::new(path.trim()))?;
+            crate::url_display::log_store_url_channel(STORE_URL_FILE_ENV, cli_arg.is_some());
+            return Ok(Some(url));
         }
     }
     if let Ok(url) = std::env::var(STORE_URL_ENV) {
         let trimmed = url.trim();
         if !trimmed.is_empty() {
+            crate::url_display::log_store_url_channel(STORE_URL_ENV, cli_arg.is_some());
             return Ok(Some(trimmed.to_string()));
         }
     }
     if let Some(url) = cli_arg {
+        crate::url_display::log_store_url_channel("--store-url", false);
         if url_carries_credentials(url) {
             tracing::warn!(
                 "--store-url carries a password in argv, which is exposed via world-readable \

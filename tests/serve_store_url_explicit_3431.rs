@@ -382,12 +382,20 @@ fn explicit_db_with_env_store_url_keeps_the_explicit_db_3431() {
             "--once",
             "--json",
         ],
-        &[("AI_MEMORY_STORE_URL", &sqlite_url(&target))],
+        &[
+            ("AI_MEMORY_STORE_URL", &sqlite_url(&target)),
+            ("RUST_LOG", "info"),
+        ],
     );
     let stderr = stderr_of(&out);
     assert!(
         !stderr.contains("mutually exclusive"),
         "the env channel is not the --store-url flag: {stderr}"
+    );
+    // #5218 item 3: pin both halves, the SAL store (log line) and the local path.
+    assert!(
+        stderr.contains(&format!("opening SQLite SAL store at {}", target.display())),
+        "#5218: the SAL store must open at the env-channel target; stderr={stderr}"
     );
     assert!(
         explicit.exists(),
@@ -398,4 +406,65 @@ fn explicit_db_with_env_store_url_keeps_the_explicit_db_3431() {
         "#3431: no stray CWD store ({})",
         sb.stray_db().display()
     );
+}
+
+/// #5218: the explicit `--db` is opened on EVERY store-backed curator arm, not
+/// only `--once`. Runs `curator <mode>` with `--db explicit.db` and an env-only
+/// store URL, then pins both halves of the contract: the SAL store opened at the
+/// env target AND the explicit local path exists (opened and migrated).
+#[cfg(feature = "sal")]
+fn assert_curator_arm_keeps_explicit_db_5218(label: &str, mode: &[&str]) {
+    let sb = Sandbox::new(label, None);
+    let explicit = sb.store("explicit.db");
+    let target = sb.store("env-target.db");
+
+    let mut args = vec!["--db", explicit.to_str().expect("utf8"), "curator"];
+    args.extend_from_slice(mode);
+    let out = sb.run(&args, &[("AI_MEMORY_STORE_URL", &sqlite_url(&target))]);
+    let stderr = stderr_of(&out);
+    assert!(
+        out.status.success(),
+        "#5218: curator {mode:?} must succeed; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("mutually exclusive"),
+        "the env channel is not the --store-url flag: {stderr}"
+    );
+    assert!(
+        target.exists(),
+        "#5218: the SAL store must open at the env-channel target for {mode:?}; stderr={stderr}"
+    );
+    assert!(
+        explicit.exists(),
+        "#5218: an explicit --db must still bind the local path for {mode:?}; stderr={stderr}"
+    );
+    assert!(
+        !sb.stray_db().exists(),
+        "#3431: no stray CWD store ({})",
+        sb.stray_db().display()
+    );
+}
+
+#[cfg(feature = "sal")]
+#[test]
+fn explicit_db_is_opened_on_the_store_backed_rollback_last_arm_5218() {
+    assert_curator_arm_keeps_explicit_db_5218("db-env-rollback", &["--rollback-last", "1"]);
+}
+
+#[cfg(feature = "sal")]
+#[test]
+fn explicit_db_is_opened_on_the_store_backed_prune_reports_arm_5218() {
+    assert_curator_arm_keeps_explicit_db_5218("db-env-prune", &["--prune-reports"]);
+}
+
+#[cfg(feature = "sal")]
+#[test]
+fn explicit_db_is_opened_on_the_store_backed_reflect_arm_5218() {
+    assert_curator_arm_keeps_explicit_db_5218("db-env-reflect", &["--reflect", "--namespace", "x"]);
+}
+
+#[cfg(feature = "sal")]
+#[test]
+fn explicit_db_is_opened_on_the_store_backed_once_arm_5218() {
+    assert_curator_arm_keeps_explicit_db_5218("db-env-once", &["--once", "--json"]);
 }

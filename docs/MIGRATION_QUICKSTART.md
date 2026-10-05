@@ -213,7 +213,8 @@ for H in $FLEET; do ssh "$H" 'systemctl --user restart ai-memory && ai-memory do
 
 If you run `ai-memory serve --store-url postgres://…` with the
 `sal-postgres` feature, the schema upgrade happens via
-`ai-memory schema-init --store-url postgres://…` — opening the
+`AI_MEMORY_STORE_URL_FILE=<0600 file> ai-memory schema-init` (1.0.0+, see
+the example below) — opening the
 store walks the in-process `migrate_v34()…migrate_v55()` async
 ladder as a side effect (there is no `--upgrade` flag). Apache AGE
 (`memory_graph`) is provisioned by the same command if the `age`
@@ -285,8 +286,10 @@ ai-memory config migrate || true
 
 # --- 3. Postgres schema migration (idempotent — schema-init re-runs safely;
 #         requires a --features sal,sal-postgres build of the binary)
-if [ -n "${AI_MEMORY_STORE_URL:-}" ]; then
-  ai-memory schema-init --store-url "$AI_MEMORY_STORE_URL" || true
+# schema-init reads AI_MEMORY_STORE_URL_FILE, then AI_MEMORY_STORE_URL, on its own
+# (src/cli/schema_init.rs:312, src/store_url.rs:137): no --store-url, so no argv password.
+if [ -n "${AI_MEMORY_STORE_URL_FILE:-}" ] || [ -n "${AI_MEMORY_STORE_URL:-}" ]; then
+  ai-memory schema-init || true
 fi
 
 # --- 4. Governance → permissions (idempotent — in-place merge)

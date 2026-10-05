@@ -1,0 +1,357 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! Static pin for #5402 (PR 4810 round-4 security note): `scripts/postgres-droplet-reinit.sh`
+//! must run `pg_dump` with `PGSSLMODE=verify-full` and a pinned local CA, and refuse (exit 7)
+//! before the backup and the first DROP when that CA is not usable.
+
+use std::path::PathBuf;
+use std::process::{Command, Output};
+
+fn read(rel: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read provisioning script {}: {e}", path.display()))
+}
+
+#[test]
+fn reinit_pg_dump_pins_verify_full_and_refuses_before_the_backup_5402() {
+    let script = read("scripts/postgres-droplet-reinit.sh");
+    let code: Vec<(usize, &str)> = script
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim_start().starts_with('#'))
+        .collect();
+    let dump_call = code
+        .iter()
+        .find(|(_, l)| l.contains("pg_dump -h \"$PG_HOST\""))
+        .map(|(i, _)| *i)
+        .expect("the live pg_dump call is present");
+    let env_pin = script
+        .lines()
+        .nth(dump_call - 1)
+        .expect("a line precedes the pg_dump call");
+    assert!(
+        env_pin.contains("PGSSLMODE=verify-full")
+            && env_pin.contains("PGSSLROOTCERT=\"$PG_DUMP_SSLROOTCERT\""),
+        "#5402: pg_dump must run with verify-full and the pinned CA: {env_pin}"
+    );
+    let check_call = code
+        .iter()
+        .find(|(_, l)| l.trim() == "require_dump_sslrootcert")
+        .map(|(i, _)| *i)
+        .expect("#5402: require_dump_sslrootcert is called in the preflight");
+    assert!(
+        check_call < dump_call,
+        "#5402: the CA check must run before the backup"
+    );
+    let first_drop = code
+        .iter()
+        .find(|(_, l)| l.contains("psql_postgres -c \"DROP DATABASE"))
+        .map(|(i, _)| *i)
+        .expect("a DROP DATABASE statement is present");
+    assert!(
+        check_call < first_drop,
+        "#5402: the CA check must run before the first DROP"
+    );
+}
+
+/// Run the reinit script with `--dry-run` and a minimal valid environment plus `extra`.
+/// No file is created: the password file is /dev/null and the CA paths are only
+/// regex-checked in dry-run mode.
+fn dry_run(extra: &[(&str, &str)]) -> Output {
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/postgres-droplet-reinit.sh");
+    let mut cmd = Command::new("bash");
+    cmd.arg(&script)
+        .arg("--dry-run")
+        .env_remove("AI_MEMORY_SSH_HOST")
+        .env_remove("PG_DUMP_SSLROOTCERT")
+        .env_remove("PG_PRIMARY_DB")
+        .env_remove("PG_PORT")
+        .env("PG_PASSWORD_FILE", "/dev/null")
+        .env("PG_SSLROOTCERT", "/nonexistent/ca.pem")
+        .env("AI_MEMORY_BIN", "/bin/sh");
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("run bash on the reinit script")
+}
+
+fn stdout_of(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+fn stderr_of(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// #5449: libpq ranks a connection string above PGSSLMODE/PGSSLROOTCERT, so a
+/// PG_PRIMARY_DB that is a conninfo must be refused before anything runs.
+#[test]
+fn reinit_refuses_a_conninfo_primary_db_before_any_step_5449() {
+    for bad in [
+        "dbname=aimemory sslmode=disable",
+        "aimemory sslmode=disable",
+        "1aimemory",
+        "ai memory",
+        "aimemory;DROP",
+        "service=evil",
+    ] {
+        let o = dry_run(&[("PG_PRIMARY_DB", bad)]);
+        assert_eq!(
+            o.status.code(),
+            Some(7),
+            "#5449: {bad:?} must exit 7: {}",
+            stderr_of(&o)
+        );
+        assert!(
+            stderr_of(&o).contains("PG_PRIMARY_DB must be a plain identifier"),
+            "#5449: refusal text for {bad:?}: {}",
+            stderr_of(&o)
+        );
+        assert!(
+            !stdout_of(&o).contains("pg_dump"),
+            "#5449: nothing may be planned for {bad:?}"
+        );
+    }
+}
+
+/// #5449: the verify-full pin and the CA travel IN the pg_dump connection string.
+#[test]
+fn reinit_pg_dump_pin_is_inside_the_connection_string_5449() {
+    let o = dry_run(&[
+        ("PG_PRIMARY_DB", "aimemory"),
+        ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem"),
+    ]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "dry-run must pass: {}",
+        stderr_of(&o)
+    );
+    let out = stdout_of(&o);
+    assert!(
+        out.contains(
+            "-d 'dbname=aimemory port=5432 sslmode=verify-full sslrootcert=/etc/ca/root.pem'"
+        ),
+        "#5449: the pin must be inside the -d connection string: {out}"
+    );
+}
+
+/// #5449: the live call carries the pinned conninfo and unsets the service sources first.
+#[test]
+fn reinit_live_pg_dump_uses_pinned_conninfo_and_unsets_service_5449() {
+    let script = read("scripts/postgres-droplet-reinit.sh");
+    let code: Vec<&str> = script
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect();
+    let dump = code
+        .iter()
+        .position(|l| l.contains("pg_dump -h \"$PG_HOST\""))
+        .expect("the live pg_dump call is present");
+    let call = code[dump..dump + 3].join(" ");
+    assert!(
+        call.contains(
+            "-d \"dbname=${PG_PRIMARY_DB} port=${PG_PORT} sslmode=verify-full sslrootcert=${PG_DUMP_SSLROOTCERT}\""
+        ),
+        "#5449: the live -d argument must carry the pin: {call}"
+    );
+    let unset = code
+        .iter()
+        .position(|l| l.trim() == "unset PGSERVICE PGSERVICEFILE")
+        .expect("#5449: PGSERVICE and PGSERVICEFILE are unset before pg_dump");
+    assert!(
+        unset < dump,
+        "#5449: the unset must precede the pg_dump call"
+    );
+    let ident = code
+        .iter()
+        .position(|l| l.trim() == "require_primary_db_identifier")
+        .expect("#5449: the identifier check is called in the preflight");
+    let password = code
+        .iter()
+        .position(|l| l.trim() == "require_password")
+        .expect("require_password is called");
+    assert!(
+        ident < password && ident < dump,
+        "#5449: the identifier check runs first"
+    );
+}
+
+/// #5450: with AI_MEMORY_SSH_HOST set, PG_SSLROOTCERT is a REMOTE path, so it must
+/// never become the local pg_dump CA; an unset PG_DUMP_SSLROOTCERT is refused.
+#[test]
+fn reinit_ssh_host_without_dump_ca_is_refused_5450() {
+    let o = dry_run(&[("AI_MEMORY_SSH_HOST", "droplet.example")]);
+    assert_eq!(
+        o.status.code(),
+        Some(7),
+        "#5450: must exit 7: {}",
+        stderr_of(&o)
+    );
+    assert!(
+        stderr_of(&o).contains("PG_DUMP_SSLROOTCERT is unset")
+            && stderr_of(&o).contains("AI_MEMORY_SSH_HOST is set"),
+        "#5450: refusal text: {}",
+        stderr_of(&o)
+    );
+    assert!(
+        !stdout_of(&o).contains("pg_dump"),
+        "#5450: nothing may be planned"
+    );
+}
+
+/// The planned pg_dump line of a dry run (the store URL of schema-init also carries a CA).
+fn dump_line(o: &Output) -> String {
+    stdout_of(o)
+        .lines()
+        .find(|l| l.contains("DRY-RUN: pg_dump"))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// #5450: the fallback to PG_SSLROOTCERT stays available when pg_dump and the CA are
+/// on the same host (no ssh host), and an explicit local CA is honoured with an ssh host.
+#[test]
+fn reinit_dump_ca_fallback_only_without_ssh_host_5450() {
+    let local = dry_run(&[]);
+    assert_eq!(local.status.code(), Some(0), "{}", stderr_of(&local));
+    assert!(
+        dump_line(&local).contains("sslrootcert=/nonexistent/ca.pem"),
+        "#5450: local fallback to PG_SSLROOTCERT: {}",
+        dump_line(&local)
+    );
+    let remote = dry_run(&[
+        ("AI_MEMORY_SSH_HOST", "droplet.example"),
+        ("PG_DUMP_SSLROOTCERT", "/etc/ca/local.pem"),
+    ]);
+    assert_eq!(remote.status.code(), Some(0), "{}", stderr_of(&remote));
+    assert!(
+        dump_line(&remote).contains("sslrootcert=/etc/ca/local.pem")
+            && !dump_line(&remote).contains("sslrootcert=/nonexistent/ca.pem"),
+        "#5450: the local CA is used, never the remote path: {}",
+        dump_line(&remote)
+    );
+}
+
+/// #5450: the guard itself is pinned in the source, so a text-level rewrite is caught
+/// even where the behavioural runs cannot reach.
+#[test]
+fn reinit_dump_ca_fallback_guard_is_pinned_5450() {
+    let script = read("scripts/postgres-droplet-reinit.sh");
+    assert!(
+        script.contains("if [[ -z \"$PG_DUMP_SSLROOTCERT\" && -z \"$AI_MEMORY_SSH_HOST\" ]]; then"),
+        "#5450: the fallback must be guarded by -z AI_MEMORY_SSH_HOST"
+    );
+    assert!(
+        script.contains("AI_MEMORY_SSH_HOST is set, so PG_SSLROOTCERT is a remote path"),
+        "#5450: the FATAL text naming the ssh-host case must stay"
+    );
+}
+
+/// #5454: the pre-DROP backup connects to the same port the store URL and the DROP use.
+#[test]
+fn reinit_pg_dump_and_drop_honour_pg_port_5454() {
+    let o = dry_run(&[
+        ("PG_PORT", "5445"),
+        ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem"),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr_of(&o));
+    let dump = dump_line(&o);
+    assert!(
+        dump.contains("dbname=aimemory port=5445 sslmode=verify-full"),
+        "#5454: the planned pg_dump must carry port=5445: {dump}"
+    );
+    assert!(
+        stdout_of(&o)
+            .contains("sudo -u postgres psql -p 5445 -c DROP DATABASE IF EXISTS aimemory;"),
+        "#5454: the DROP must target the same port as the backup: {}",
+        stdout_of(&o)
+    );
+    let default = dry_run(&[("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem")]);
+    assert!(
+        dump_line(&default).contains("port=5432 sslmode=verify-full"),
+        "#5454: the default port is 5432: {}",
+        dump_line(&default)
+    );
+}
+
+/// #5454: PG_PORT is spliced into a connection string, so only 1..=65535 digits pass,
+/// and the refusal comes before any step is planned.
+#[test]
+fn reinit_refuses_a_bad_pg_port_before_any_step_5454() {
+    for bad in [
+        "0",
+        "65536",
+        "99999",
+        "123456",
+        "05432",
+        "54 32",
+        "5432 sslmode=disable",
+        "5432;x",
+        "-1",
+        "abc",
+        "5432\n",
+    ] {
+        let o = dry_run(&[
+            ("PG_PORT", bad),
+            ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem"),
+        ]);
+        assert_eq!(
+            o.status.code(),
+            Some(7),
+            "#5454: PG_PORT {bad:?} must exit 7: {}",
+            stderr_of(&o)
+        );
+        assert!(
+            stderr_of(&o).contains("PG_PORT must be a port number"),
+            "#5454: refusal text for {bad:?}: {}",
+            stderr_of(&o)
+        );
+        assert!(
+            !stdout_of(&o).contains("pg_dump"),
+            "#5454: nothing may be planned for {bad:?}"
+        );
+    }
+}
+
+/// #5454 / round-5 F4: PG_PRIMARY_DB is spliced UNQUOTED into DROP/CREATE DATABASE, where
+/// PostgreSQL folds it to lower case, while the pg_dump dbname is case-sensitive; an upper
+/// case name would dump one database and drop another, so it is refused.
+#[test]
+fn reinit_refuses_an_uppercase_primary_db_f4() {
+    for bad in ["AiMem", "aiMem", "AIMEM", "aimemoryX", "Aimem", "Aimem_2"] {
+        let o = dry_run(&[
+            ("PG_PRIMARY_DB", bad),
+            ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem"),
+        ]);
+        assert_eq!(
+            o.status.code(),
+            Some(7),
+            "F4: PG_PRIMARY_DB {bad:?} must exit 7: {}",
+            stderr_of(&o)
+        );
+        assert!(
+            !stdout_of(&o).contains("pg_dump"),
+            "F4: nothing may be planned for {bad:?}"
+        );
+    }
+    let ok = dry_run(&[
+        ("PG_PRIMARY_DB", "ai_mem_2"),
+        ("PG_DUMP_SSLROOTCERT", "/etc/ca/root.pem"),
+    ]);
+    assert_eq!(ok.status.code(), Some(0), "{}", stderr_of(&ok));
+}
+
+/// #5454: the dry run only prints the local psql line, so the live line is pinned in the
+/// source: the DROP and CREATE must reach the same server the backup dumped.
+#[test]
+fn reinit_live_local_psql_passes_the_port_5454() {
+    let script = read("scripts/postgres-droplet-reinit.sh");
+    assert!(
+        script.contains(r#"sudo -u postgres psql -p "$PG_PORT" "$@""#),
+        "#5454: psql_postgres must pass -p \"$PG_PORT\" on the live path"
+    );
+}

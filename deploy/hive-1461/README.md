@@ -108,6 +108,17 @@ SSH command line.
 - **Pinned artifacts** (`provision/lib.sh`): binary `sha256`, version `0.7.0`,
   schema `v55`, `ollama/ollama:0.6.8`, `apache/age:release_PG16_1.6.0`, embedder/LLM
   model ids — all single-source constants, overridable by env for forks.
+
+  > **Version floor (#4799).** The provision scripts refuse any `EXPECTED_VERSION`
+  > that is not a strict `X.Y.Z` release at or above the step's floor
+  > (`require_min_version` in `provision/lib.sh`): 1.0.0 for `20_pg_age.sh`,
+  > because `schema-init` reads `AI_MEMORY_STORE_URL_FILE` only from 1.0.0 (#4600),
+  > and 0.9.0 for `50_federation.sh` (the `AI_MEMORY_STORE_URL` env channel, #4603).
+  > The default pin `0.7.0` therefore stops at step 20 by design. Set
+  > `EXPECTED_VERSION` and `GOLDEN_SHA256` together to a release at or above the
+  > floor before running. Bump the default pin when the 1.0.0 golden artifact
+  > exists.
+
 - **Deterministic inventory**: `inventory.json` is a pure projection of
   Terraform state; the whole toolkit drives off it.
 - **Idempotent**: every step is safe to re-run. The campaign CA and per-node

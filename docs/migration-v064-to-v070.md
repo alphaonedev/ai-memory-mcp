@@ -318,8 +318,8 @@ operators wait at least 7 days of clean runtime before deleting.
 ## 5. Step-by-step migration — postgres deployments
 
 If you run ai-memory against PostgreSQL (with or without Apache AGE), the
-upgrade path differs because schema bumps land via the `ai-memory schema-init
---store-url <url>` command (opening the store runs the migration ladder as a
+upgrade path differs because schema bumps land via the `ai-memory schema-init`
+command (opening the store runs the migration ladder as a
 side effect; there is no `--upgrade` flag) rather than via the daemon's
 first-boot ladder. Note `schema-init`/`migrate` exist only in
 `--features sal` / `sal,sal-postgres` builds — the pre-built release
@@ -334,22 +334,26 @@ the AGE projection prime, and the cutover dance.
 1. **Snapshot the postgres database first.** `pg_dump` of the database
    schema + data:
    ```bash
+   # the password comes from ~/.pgpass or PGPASSFILE (mode 0600), never from the URL on argv
    pg_dump --format=custom --file=ai-memory.pre-v07.dump \
-     postgres://aimemory:PASSWORD@HOST:5432/aimemory
+     postgres://aimemory@HOST:5432/aimemory
    ```
 2. **Stop the daemon.** `systemctl stop ai-memory` or your service manager.
 3. **Install the v0.7.0 binary** (per §4.3 above).
 4. **Run the in-place upgrade** against the live postgres URL:
    ```bash
-   ai-memory schema-init \
-     --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
+   # /etc/ai-memory/store-url: one line, mode 0600, owned by the user running this command:
+   #   postgres://aimemory:PASSWORD@HOST:5432/aimemory
+   AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
    ```
-   `schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
+   From ai-memory 1.0.0, `schema-init` resolves its URL like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:312`, `src/store_url.rs:137`, [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)). Passing `--store-url` together with a disagreeing env or file channel is refused as an ambiguous store ([#4887](https://github.com/alphaonedev/ai-memory-mcp/issues/4887)). Earlier releases, including the v0.7.0 binary this guide installs, accept only `--store-url`; run that form from a single-user admin host, because the password is visible to every local account while the command runs.
    Opening the store walks the postgres ladder up to schema v57
    idempotently, preserving data.
 5. **Verify schema parity:**
    ```bash
-   psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' \
+   # Password from ~/.pgpass (mode 0600): HOST:5432:aimemory:aimemory:<password>
+   # (#4804), so the URI carries none.
+   psql 'postgres://aimemory@HOST:5432/aimemory' \
      -tAc "SELECT MAX(version) FROM schema_version;"
    # → 55
    ```

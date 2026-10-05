@@ -6,9 +6,9 @@ do-hive #4671 | /etc/ai-memory/store-url | postgres://aimemory:${db_password}@12
 do-hive #4712 | /etc/systemd/system/ai-memory.service | ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist
 do-hive #4712 | /etc/systemd/system/ai-memory.service.d/10-federation.conf | ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist%{ if federation_enabled } --quorum-writes ${quorum_writes} --quorum-peers $${AI_MEMORY_QUORUM_PEERS} --quorum-client-cert /etc/ai-memory/fed/node.crt --quorum-client-key /etc/ai-memory/fed/node.key --quorum-ca-cert /etc/ai-memory/fed/ca.crt --quorum-timeout-ms 8000%{ endif }
 do-hive #4712 | /etc/systemd/system/ai-memory-fed-bootstrap.service | ExecStart=/opt/ai-memory/fed-bootstrap.sh
-do-hive #4671 | /opt/ai-memory/provision.sh | sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1 || \⏎ sudo -u postgres psql -c "CREATE USER aimemory WITH PASSWORD '${db_password}';"
-do-hive #4671 | /opt/ai-memory/provision.sh | printf '"aimemory" "${db_password}"\n' > /etc/pgbouncer/userlist.txt
 do-hive #4671 | /opt/ai-memory/provision.sh | curl -fsSL "${ai_memory_image_url}" -o /opt/ai-memory/ai-memory.tar.gz || true
 do-hive #4671 | /opt/ai-memory/provision.sh | tar -xzf /opt/ai-memory/ai-memory.tar.gz -C /opt/ai-memory/bin || true
 do-hive #4671 | /opt/ai-memory/provision.sh | chmod 0755 /opt/ai-memory/bin/ai-memory || true
+do-hive #4671 | /opt/ai-memory/provision.sh | ( umask 077; printf "CREATE USER aimemory WITH PASSWORD '%s';\n" '${db_password}' > /root/.aimemory-role.sql )
+do-hive #4671 | /opt/ai-memory/provision.sh | ( umask 077; printf '"aimemory" "${db_password}"\n' > /etc/pgbouncer/userlist.txt )
 aws-gpu-burst #4610 | /etc/ai-memory/store-url | postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt

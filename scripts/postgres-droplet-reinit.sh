@@ -67,6 +67,18 @@
 #     and the script will run schema-init via SSH.
 #   * `PG_PASSWORD_FILE` must contain the postgres role password (mode
 #     0600). Default: /root/aimemory-pg-password.txt.
+#   * `PG_SSLROOTCERT` must name the CA certificate file that signed the
+#     postgres server certificate (on the host that runs schema-init, so on
+#     the AI_MEMORY_SSH_HOST host when that is set). schema-init connects
+#     with sslmode=verify-full&sslrootcert=<PG_SSLROOTCERT> (#5143, #3705).
+#     No default: an unset, unreadable or oddly spelled path is refused before
+#     the backup and the first DROP. With AI_MEMORY_SSH_HOST set, one
+#     verify-full psql connection from that host (psql must be installed
+#     there) must also succeed before the backup, or the run exits 7 (#5600).
+#   * `PG_DUMP_SSLROOTCERT` (#5402): the CA file for the pg_dump backup, on THIS
+#     host (pg_dump connects to PG_HOST over TCP with sslmode=verify-full).
+#     Defaults to PG_SSLROOTCERT when AI_MEMORY_SSH_HOST is unset; required when
+#     it is set. Refused (exit 7) before the backup and the first DROP.
 #
 # USAGE
 # -----
@@ -111,6 +123,15 @@ PG_PORT="${PG_PORT:-5432}"
 PG_USER="${PG_USER:-aimemory}"
 PG_PRIMARY_DB="${PG_PRIMARY_DB:-aimemory}"
 PG_PASSWORD_FILE="${PG_PASSWORD_FILE:-/root/aimemory-pg-password.txt}"
+# #5143: every 1.0.0 binary refuses a PostgreSQL store DSN that does not pin
+# sslmode=verify-full (#3705, loopback included), so schema-init needs the CA
+# bundle that signed the server certificate. No default: unset is refused.
+PG_SSLROOTCERT="${PG_SSLROOTCERT:-}"
+# #5402: pg_dump runs on THIS host and connects to PG_HOST over TCP, so it needs
+# a CA file on this host: PG_DUMP_SSLROOTCERT, defaulting to PG_SSLROOTCERT when
+# no AI_MEMORY_SSH_HOST is set (one host runs both). With an ssh host the
+# PG_SSLROOTCERT path is remote, so PG_DUMP_SSLROOTCERT must be set explicitly.
+PG_DUMP_SSLROOTCERT="${PG_DUMP_SSLROOTCERT:-}"
 
 BACKUP_DIR="${BACKUP_DIR:-/var/backups}"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
@@ -176,6 +197,100 @@ require_password() {
     export PGPASSWORD="$PG_PWD"
 }
 
+# libpq conninfo value: backslash and single quote escaped, the value single-quoted.
+conninfo_quote() {
+    local v="$1"
+    v="${v//\\/\\\\}"
+    v="${v//\'/\\\'}"
+    printf "'%s'" "$v"
+}
+
+# #5600: with AI_MEMORY_SSH_HOST, schema-init connects from the remote host with
+# the remote CA path, which pg_dump (on this host) does not prove. Before the
+# backup and any DROP, make one sslmode=verify-full psql connection from the
+# remote host to the same host, port, user and database as the store URL, with
+# the same CA path, and refuse (exit 7) when it fails. The password and the
+# connection string go over ssh stdin, never argv (#4603). psql must be
+# installed on the remote host; without it the probe fails and the run stops.
+require_remote_verify_full() {
+    local conninfo
+    conninfo="host=$(conninfo_quote "$PG_HOST") port=${PG_PORT} user=$(conninfo_quote "$PG_USER") dbname=${PG_PRIMARY_DB} sslmode=verify-full sslrootcert=${PG_SSLROOTCERT}"
+    if ! printf '%s\n%s\n' "$PG_PWD" "$conninfo" | ssh "$AI_MEMORY_SSH_HOST" \
+        "unset PGSERVICE PGSERVICEFILE; IFS= read -r PGPASSWORD; IFS= read -r c; export PGPASSWORD PGSSLMODE=verify-full PGSSLROOTCERT='$PG_SSLROOTCERT'; exec psql \"\$c\" -X -q -t -A -c 'select 1'" >/dev/null; then
+        echo "FATAL: a sslmode=verify-full connection from $AI_MEMORY_SSH_HOST to ${PG_HOST}:${PG_PORT} with sslrootcert=$PG_SSLROOTCERT failed; refusing before the backup and any DROP (#5600)" >&2
+        exit 7
+    fi
+}
+
+# #5143: refuse BEFORE the backup and any DROP unless the CA path is usable.
+# Plain path characters only: the path is spliced into the store URL query.
+require_sslrootcert() {
+    if [[ -z "$PG_SSLROOTCERT" ]]; then
+        echo "FATAL: PG_SSLROOTCERT is unset: schema-init needs the CA file for sslmode=verify-full (#3705, #5143)" >&2
+        exit 7
+    fi
+    if [[ ! "$PG_SSLROOTCERT" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+        echo "FATAL: PG_SSLROOTCERT must be an absolute path of [A-Za-z0-9._/-] characters" >&2
+        exit 7
+    fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        return 0
+    fi
+    if [[ -n "$AI_MEMORY_SSH_HOST" ]]; then
+        if ! ssh "$AI_MEMORY_SSH_HOST" "test -r '$PG_SSLROOTCERT'"; then
+            echo "FATAL: PG_SSLROOTCERT $PG_SSLROOTCERT is not readable on $AI_MEMORY_SSH_HOST" >&2
+            exit 7
+        fi
+        require_remote_verify_full
+    elif [[ ! -r "$PG_SSLROOTCERT" ]]; then
+        echo "FATAL: PG_SSLROOTCERT $PG_SSLROOTCERT is not readable" >&2
+        exit 7
+    fi
+}
+
+# #5449: PG_PRIMARY_DB is spliced into the pg_dump connection string and into
+# DROP/CREATE DATABASE, so only a plain identifier is accepted; a conninfo such
+# as "dbname=x sslmode=disable" would otherwise outrank the PGSSLMODE pin.
+# #5484: lower case only. DROP/CREATE DATABASE below are unquoted, so PostgreSQL folds
+# the name to lower case, while the pg_dump dbname is case-sensitive: an upper case name
+# would back up one database and drop another.
+require_primary_db_identifier() {
+    if [[ ! "$PG_PRIMARY_DB" =~ ^[a-z_][a-z0-9_]*$ ]]; then
+        echo "FATAL: PG_PRIMARY_DB must be a plain identifier in lower case ([a-z_][a-z0-9_]*) (#5449, #5484)" >&2
+        exit 7
+    fi
+}
+
+# #5454: PG_PORT is spliced into the pg_dump connection string and passed to the local
+# psql, so it must be a port number (no leading zero, 1..65535); the backup, the DROP and
+# the store URL then name the same server.
+require_pg_port() {
+    if [[ ! "$PG_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || (( PG_PORT > 65535 )); then
+        echo "FATAL: PG_PORT must be a port number from 1 to 65535 (#5454)" >&2
+        exit 7
+    fi
+}
+
+# #5402: the pg_dump backup is a TCP connection to PG_HOST; refuse BEFORE the
+# backup and any DROP unless it can run with sslmode=verify-full and a local CA.
+require_dump_sslrootcert() {
+    if [[ -z "$PG_DUMP_SSLROOTCERT" && -z "$AI_MEMORY_SSH_HOST" ]]; then
+        PG_DUMP_SSLROOTCERT="$PG_SSLROOTCERT"
+    fi
+    if [[ -z "$PG_DUMP_SSLROOTCERT" ]]; then
+        echo "FATAL: PG_DUMP_SSLROOTCERT is unset: pg_dump runs on this host and needs a local CA file for sslmode=verify-full (AI_MEMORY_SSH_HOST is set, so PG_SSLROOTCERT is a remote path) (#5402)" >&2
+        exit 7
+    fi
+    if [[ ! "$PG_DUMP_SSLROOTCERT" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+        echo "FATAL: PG_DUMP_SSLROOTCERT must be an absolute path of [A-Za-z0-9._/-] characters (#5402)" >&2
+        exit 7
+    fi
+    if [[ "$DRY_RUN" -ne 1 && ! -r "$PG_DUMP_SSLROOTCERT" ]]; then
+        echo "FATAL: PG_DUMP_SSLROOTCERT $PG_DUMP_SSLROOTCERT is not readable on this host (#5402)" >&2
+        exit 7
+    fi
+}
+
 # #1785 — interactive confirmation gate on the LIVE (non-dry-run)
 # destructive path. The operator must TYPE the primary db name to confirm
 # before any `DROP DATABASE` runs (step 2 primary + step 4 disposables).
@@ -214,30 +329,36 @@ psql_postgres() {
     # password required. Use this for DROP / CREATE DATABASE and
     # CREATE EXTENSION since `aimemory` role is not a superuser.
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        log "DRY-RUN: sudo -u postgres psql $*"
+        log "DRY-RUN: sudo -u postgres psql -p ${PG_PORT} $*"
     else
-        sudo -u postgres psql "$@"
+        sudo -u postgres psql -p "$PG_PORT" "$@"
     fi
 }
 
 run_schema_init() {
     local db="$1"
-    local url="postgres://${PG_USER}:${PG_PWD}@${PG_HOST}:${PG_PORT}/${db}"
+    # #5143: pin sslmode=verify-full (the #3705 floor refuses any other DSN).
+    local url="postgres://${PG_USER}:${PG_PWD}@${PG_HOST}:${PG_PORT}/${db}?sslmode=verify-full&sslrootcert=${PG_SSLROOTCERT}"
     local out="${SCHEMA_INIT_JSON%.json}-${db}.json"
-    local cmd
-
-    if [[ -n "$AI_MEMORY_SSH_HOST" ]]; then
-        cmd=(ssh "$AI_MEMORY_SSH_HOST" "$AI_MEMORY_BIN" schema-init --store-url "$url" --json)
-    else
-        cmd=("$AI_MEMORY_BIN" schema-init --store-url "$url" --json)
-    fi
-
+    # #4603: the store URL carries the db password, so it never goes on argv
+    # (local /proc/<pid>/cmdline, nor the ssh remote command string, which is
+    # argv on the remote host). It reaches schema-init through the
+    # AI_MEMORY_STORE_URL env channel (src/store_url.rs resolve_store_url): set
+    # in the local process env, or piped over ssh stdin and exported remotely.
+    # #4796: AI_MEMORY_STORE_URL_FILE outranks the env channel, so an exported
+    # FILE from the caller would initialise the wrong database. Both forms
+    # unset it (the local form in a subshell, so the caller's export stays).
     log "schema-init -> ${db} (output: ${out})"
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        log "DRY-RUN: ${cmd[*]} | tee ${out}"
+        log "DRY-RUN: schema-init --json for ${db} via ${AI_MEMORY_SSH_HOST:-local} (store URL postgres://${PG_USER}:***@${PG_HOST}:${PG_PORT}/${db}?sslmode=verify-full&sslrootcert=${PG_SSLROOTCERT}) | tee ${out}"
         return 0
     fi
-    "${cmd[@]}" | tee "$out"
+    if [[ -n "$AI_MEMORY_SSH_HOST" ]]; then
+        printf '%s\n' "$url" | ssh "$AI_MEMORY_SSH_HOST" \
+            "unset AI_MEMORY_STORE_URL_FILE; IFS= read -r AI_MEMORY_STORE_URL; export AI_MEMORY_STORE_URL; exec '$AI_MEMORY_BIN' schema-init --json" | tee "$out"
+    else
+        ( unset AI_MEMORY_STORE_URL_FILE; AI_MEMORY_STORE_URL="$url" "$AI_MEMORY_BIN" schema-init --json ) | tee "$out"
+    fi
     echo
     # Quick sanity check
     if command -v jq >/dev/null 2>&1; then
@@ -254,7 +375,11 @@ run_schema_init() {
 # ---------------------------------------------------------------------------
 
 log "postgres-droplet-reinit.sh starting (dry_run=${DRY_RUN}, skip_disposable=${SKIP_DISPOSABLE})"
+require_primary_db_identifier
+require_pg_port
 require_password
+require_sslrootcert
+require_dump_sslrootcert
 
 if [[ -z "$AI_MEMORY_SSH_HOST" && ! -x "$AI_MEMORY_BIN" ]]; then
     echo "FATAL: ai-memory binary not found at $AI_MEMORY_BIN — set AI_MEMORY_BIN or AI_MEMORY_SSH_HOST" >&2
@@ -268,9 +393,18 @@ fi
 run mkdir -p "$BACKUP_DIR"
 log "step 1: pg_dump ${PG_PRIMARY_DB} -> ${BACKUP_FILE}"
 if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: pg_dump -h ${PG_HOST} -U ${PG_USER} -d ${PG_PRIMARY_DB} -F c -f ${BACKUP_FILE}"
+    log "DRY-RUN: pg_dump -h ${PG_HOST} -U ${PG_USER} -d 'dbname=${PG_PRIMARY_DB} port=${PG_PORT} sslmode=verify-full sslrootcert=${PG_DUMP_SSLROOTCERT}' -F c -f ${BACKUP_FILE}"
 else
-    pg_dump -h "$PG_HOST" -U "$PG_USER" -d "$PG_PRIMARY_DB" -F c -f "$BACKUP_FILE"
+    # #5402 / #5449: libpq ranks a connection string above PGSSLMODE/PGSSLROOTCERT and
+    # above a PGSERVICE file, so the pin is IN the connection string (measured: a
+    # conninfo sslmode=disable and a service-file sslmode=disable both beat the env
+    # pin; the conninfo pin beats a service file) and the service sources are
+    # unset. PGPASSWORD stays in the environment, never on the argv.
+    unset PGSERVICE PGSERVICEFILE
+    PGSSLMODE=verify-full PGSSLROOTCERT="$PG_DUMP_SSLROOTCERT" \
+        pg_dump -h "$PG_HOST" -U "$PG_USER" \
+        -d "dbname=${PG_PRIMARY_DB} port=${PG_PORT} sslmode=verify-full sslrootcert=${PG_DUMP_SSLROOTCERT}" \
+        -F c -f "$BACKUP_FILE"
     if [[ ! -s "$BACKUP_FILE" ]]; then
         echo "FATAL: backup file is empty — aborting before destructive step" >&2
         exit 5

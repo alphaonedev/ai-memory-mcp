@@ -233,8 +233,10 @@ unset AI_MEMORY_DB
 # `resolve_agent_id` step 2.
 export RUST_LOG="${RUST_LOG:-ai_memory=info}"
 
+# #4603: the store URL (it carries the db password) reaches serve through the
+# exported AI_MEMORY_STORE_URL env channel (src/store_url.rs resolve_store_url),
+# never as a --store-url argv word readable in /proc/<pid>/cmdline.
 exec /usr/local/bin/ai-memory serve \
   --host "$AI_MEMORY_LISTEN_HOST" --port "$AI_MEMORY_LISTEN_PORT" \
-  --store-url "$AI_MEMORY_STORE_URL" \
   $TLS_FLAGS \
   $QUORUM_FLAGS

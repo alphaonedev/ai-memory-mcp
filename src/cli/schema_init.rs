@@ -107,9 +107,14 @@ const CTX_PGVECTOR_PREFLIGHT: &str = "probe pgvector / role / ag_catalog preflig
 pub struct SchemaInitArgs {
     /// Target store URL. `sqlite:///path/to/file.db` or
     /// `postgres://user:pass@host:port/dbname`. Same shape as
-    /// `ai-memory migrate --from / --to`.
+    /// `ai-memory migrate --from / --to`. Optional (#4600): when omitted
+    /// the URL comes from `AI_MEMORY_STORE_URL_FILE` (a `0600` file), then
+    /// `AI_MEMORY_STORE_URL`, exactly as `serve` resolves it
+    /// (`crate::store_url::resolve_store_url`; FILE > ENV > flag). Keep a
+    /// password-bearing URL off argv: `--store-url` is readable from
+    /// `/proc/<pid>/cmdline` and `ps` by any local UID.
     #[arg(long, value_name = "URL")]
-    pub store_url: String,
+    pub store_url: Option<String>,
     /// Emit the summary as JSON (machine-parseable). Without this
     /// flag the verb prints a six-line human summary suitable for
     /// CI logs and operator scripts.
@@ -263,8 +268,8 @@ pub struct SchemaInitReport {
 // Entry point — invoked from `daemon_runtime::run` dispatch
 // ---------------------------------------------------------------------------
 
-/// Run `schema-init`. Opens the store at `args.store_url` (the open
-/// itself runs `INIT_SCHEMA` + migrations as a side effect),
+/// Run `schema-init`. Opens the store at the resolved store URL (`args.store_url`, or
+/// the #4600 non-argv channels; the open itself runs `INIT_SCHEMA` + migrations as a side effect),
 /// enumerates the resulting catalog, optionally bootstraps the AGE
 /// `memory_graph` projection on Postgres, and emits a summary.
 ///
@@ -280,6 +285,38 @@ pub async fn run(
     config_default_dim: Option<u32>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // #4600 + #2444 precedent (src/cli/backup.rs `resolve_sqlite_store`):
+    // `resolve_store_url` lets the env channels win over the flag, so an
+    // explicit `--store-url` that DISAGREES with AI_MEMORY_STORE_URL(_FILE)
+    // would otherwise initialise (and, with --force-reembed, rewrite) a store
+    // the operator did not name. Ambiguity is refused, never resolved.
+    if let Some(arg) = args.store_url.as_deref()
+        && let Some(env_url) = crate::store_url::resolve_store_url(None)?
+        && env_url.trim() != arg.trim()
+    {
+        anyhow::bail!(
+            "ambiguous store: --store-url names {} but the environment \
+             (AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE) names {}. \
+             Refusing to guess which store schema-init should initialise; \
+             unset one of them (#4600, #2444).",
+            crate::url_display::store_url_display(arg),
+            crate::url_display::store_url_display(&env_url),
+        );
+    }
+
+    // #4600 (CWE-214) — same non-argv channels `serve` has: FILE > ENV > flag
+    // (precedent copied: src/store_url.rs `resolve_store_url`). Fail closed
+    // when no channel supplies a URL; the message names no URL, so no
+    // credential can reach it.
+    let store_url =
+        crate::store_url::resolve_store_url(args.store_url.as_deref())?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no store URL: pass --store-url, or set AI_MEMORY_STORE_URL_FILE \
+                 (a 0600 file) or AI_MEMORY_STORE_URL (#4600)"
+            )
+        })?;
+    let store_url = store_url.as_str();
+
     // #1882 — effective embedding-dim precedence:
     //   1. explicit `--embedding-dim` flag (operator override),
     //   2. the daemon's config-resolved dim (`config_default_dim`, the
@@ -301,8 +338,8 @@ pub async fn run(
     // (vs the SQLite branch which has no column-level dim). For
     // SQLite we go through the standard `open_store` path which
     // triggers INIT_SCHEMA as a side effect.
-    let report = if is_sqlite_url(&args.store_url) {
-        let _store = migrate::open_store(&args.store_url)
+    let report = if is_sqlite_url(store_url) {
+        let _store = migrate::open_store(store_url)
             .await
             // #1579 A3 (SECURITY) — sqlite URLs carry no credential
             // today, but route through the redactor anyway so a
@@ -310,18 +347,18 @@ pub async fn run(
             .with_context(|| {
                 format!(
                     "open store at {}",
-                    crate::url_display::store_url_display(&args.store_url)
+                    crate::url_display::store_url_display(store_url)
                 )
             })?;
-        let mut r = enumerate_sqlite(&args.store_url)?;
+        let mut r = enumerate_sqlite(store_url)?;
         // SQLite has no column-level vector dim — echo the flag
         // value as a metadata hint for downstream tools.
         r.embedding_dim = Some(i32::try_from(effective_dim).unwrap_or(384));
         r
-    } else if is_postgres_url(&args.store_url) {
+    } else if is_postgres_url(store_url) {
         #[cfg(feature = "sal-postgres")]
         {
-            init_and_enumerate_postgres(&args.store_url, effective_dim, args.force_reembed).await?
+            init_and_enumerate_postgres(store_url, effective_dim, args.force_reembed).await?
         }
         #[cfg(not(feature = "sal-postgres"))]
         {
@@ -335,7 +372,7 @@ pub async fn run(
         // credentials in the userinfo; redact before echoing.
         anyhow::bail!(
             "unrecognised store URL: {} (expected sqlite:///path or postgres://...)",
-            crate::url_display::store_url_display(&args.store_url)
+            crate::url_display::store_url_display(store_url)
         );
     };
 
@@ -907,7 +944,7 @@ mod tests {
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
 
         let args = SchemaInitArgs {
-            store_url: url.clone(),
+            store_url: Some(url.clone()),
             json: true,
             embedding_dim: Some(384),
             force_reembed: false,
@@ -968,7 +1005,7 @@ mod tests {
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
 
         let args = SchemaInitArgs {
-            store_url: url.clone(),
+            store_url: Some(url.clone()),
             json: true,
             embedding_dim: Some(768),
             force_reembed: false,
@@ -995,7 +1032,7 @@ mod tests {
         let mut stderr = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
         let args = SchemaInitArgs {
-            store_url: url,
+            store_url: Some(url),
             json: false,
             embedding_dim: Some(384),
             force_reembed: false,
@@ -1018,7 +1055,7 @@ mod tests {
         let mut stderr = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
         let args = SchemaInitArgs {
-            store_url: "mysql://user:secret@host/db".to_string(),
+            store_url: Some("mysql://user:secret@host/db".to_string()),
             json: false,
             embedding_dim: Some(384),
             force_reembed: false,
@@ -1318,7 +1355,7 @@ mod tests {
         let mut stderr = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
         let args = SchemaInitArgs {
-            store_url: url.clone(),
+            store_url: Some(url.clone()),
             json: true,
             embedding_dim: Some(384),
             force_reembed: false,
@@ -1370,7 +1407,7 @@ mod tests {
         let mut stderr = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
         let args = SchemaInitArgs {
-            store_url: url.clone(),
+            store_url: Some(url.clone()),
             json: true,
             embedding_dim: Some(768),
             force_reembed: true,
@@ -1442,7 +1479,7 @@ mod tests {
         let mut stderr = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
         let args = SchemaInitArgs {
-            store_url: url.clone(),
+            store_url: Some(url.clone()),
             json: true,
             embedding_dim: Some(768),
             force_reembed: false,
@@ -1510,7 +1547,7 @@ mod tests {
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
 
         let args = SchemaInitArgs {
-            store_url: url.clone(),
+            store_url: Some(url.clone()),
             json: false,
             embedding_dim: Some(384),
             force_reembed: false,
@@ -1542,7 +1579,7 @@ mod tests {
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
 
         let args = SchemaInitArgs {
-            store_url: "nosql://nope".to_string(),
+            store_url: Some("nosql://nope".to_string()),
             json: false,
             embedding_dim: Some(384),
             force_reembed: false,
@@ -1577,7 +1614,7 @@ mod tests {
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
 
         let args = SchemaInitArgs {
-            store_url: "postgres://nobody:nope@127.0.0.1:1/no_db".to_string(),
+            store_url: Some("postgres://nobody:nope@127.0.0.1:1/no_db".to_string()),
             json: true,
             embedding_dim: Some(384),
             force_reembed: false,
@@ -1602,7 +1639,7 @@ mod tests {
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
 
         let args = SchemaInitArgs {
-            store_url: "postgresql://nobody:nope@127.0.0.1:1/x".to_string(),
+            store_url: Some("postgresql://nobody:nope@127.0.0.1:1/x".to_string()),
             json: false,
             embedding_dim: Some(384),
             force_reembed: false,

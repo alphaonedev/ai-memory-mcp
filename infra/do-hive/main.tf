@@ -197,10 +197,18 @@ variable "vpc_ip_range" {
 }
 
 variable "db_password" {
-  description = "PostgreSQL password for the ai-memory role (substrate-local; the daemon connects over localhost only — postgres is not exposed to the network). Pass via TF_VAR_db_password."
+  description = "PostgreSQL password for the ai-memory role (substrate-local; the daemon connects over localhost only — postgres is not exposed to the network). Required, no default (#4809): pass via TF_VAR_db_password; at least 24 characters from [A-Za-z0-9._~-]."
   type        = string
-  default     = "aimem-do-substrate"
   sensitive   = true
+  # #4809 / #4654: the value is spliced into the cloud-init role block inside
+  # single quotes (shell and SQL). This alphabet cannot close either quote,
+  # cannot start a substitution and cannot carry a newline, so a crafted value
+  # can neither run a command as root nor produce a SQL error that echoes the
+  # password into cloud-init-output.log. Refused at plan time.
+  validation {
+    condition     = can(regex("^[A-Za-z0-9._~-]{24,}$", var.db_password))
+    error_message = "db_password must be at least 24 characters from [A-Za-z0-9._~-] (URL-safe, shell-safe and SQL-literal-safe)."
+  }
 }
 
 variable "ai_memory_image_url" {

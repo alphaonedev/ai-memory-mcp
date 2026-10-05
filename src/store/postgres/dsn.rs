@@ -215,8 +215,15 @@ fn evaluate(dsn: &str) -> Result<PgConnectOptions, FlooredConnectError> {
         SslmodeFloor::Pinned { host } => host,
         refused => return Err(FlooredConnectError::Refused(refused)),
     };
-    let options = connect_options(dsn).map_err(|e| {
-        FlooredConnectError::Parse(crate::logging::redact_urls_in_message(&e.to_string()))
+    // #4934 (CWE-532) — the driver's parse error can echo query values
+    // (`password=`, `sslpassword=`) that a userinfo-only masker leaves in
+    // place, so its text is dropped; the detail names only the allowlisted
+    // scheme://host:port/database rendering (#3711).
+    let options = connect_options(dsn).map_err(|_| {
+        FlooredConnectError::Parse(format!(
+            "invalid connection string for {}",
+            crate::url_display::store_url_display(dsn)
+        ))
     })?;
     // The driver's own transport predicate (`fetch_socket`): a socket is set,
     // or the host starts with `/`. The path-host arm is reachable: `PGHOST=/dir`

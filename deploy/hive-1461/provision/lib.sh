@@ -65,6 +65,32 @@ SSH_OPTS="-i $SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o Co
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die()  { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
 
+# require_min_version <floor> <reason>: EXPECTED_VERSION must be a strict
+# MAJOR.MINOR.PATCH release (no v prefix, no pre-release suffix, no partial
+# 7.0 that a substring check would match inside 0.7.0) at or above <floor>.
+# Unset or empty is refused, never skipped (#4798). Fail closed.
+require_min_version() {
+  local floor="$1" reason="$2" lowest
+  [[ "${EXPECTED_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || die "EXPECTED_VERSION='${EXPECTED_VERSION:-}' is not a strict X.Y.Z release version; refusing ($reason)"
+  lowest="$(printf '%s\n%s\n' "$floor" "$EXPECTED_VERSION" | sort -V | head -n1)"
+  [ "$lowest" = "$floor" ] || die "EXPECTED_VERSION=$EXPECTED_VERSION is below $floor: $reason"
+}
+
+# #4603: the units pass the store URL through AI_MEMORY_STORE_URL (the
+# EnvironmentFile), never as a `--store-url` argv word. That env channel
+# exists from 0.9.0 (#1927); an older pinned binary would ignore it and fall
+# back to the default sqlite store, so refuse (fail closed) instead.
+require_store_url_env_channel() {
+  require_min_version 0.9.0 "no AI_MEMORY_STORE_URL env channel (#4603); refusing to render a unit that would silently fall back to sqlite"
+}
+
+# #4600 / #4797: schema-init reads AI_MEMORY_STORE_URL_FILE only from 1.0.0.
+# Refuse before any Postgres secret is staged for a binary that cannot read it.
+require_schema_init_store_url_channel() {
+  require_min_version 1.0.0 "schema-init reads AI_MEMORY_STORE_URL_FILE only from 1.0.0 (#4600); refusing to stage Postgres secrets for a binary that cannot read them"
+}
+
 # ssh_node <ip> <remote-command-string>
 # -n protects stdin so loops over `inv_*` output don't get consumed by ssh.
 ssh_node() {

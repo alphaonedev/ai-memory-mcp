@@ -823,7 +823,7 @@ async fn schema_init_postgres_embedding_dim_conversion_round_trip() {
             let mut stderr = Vec::<u8>::new();
             let mut out = ai_memory::cli::CliOutput::from_std(&mut stdout, &mut stderr);
             let args = ai_memory::cli::schema_init::SchemaInitArgs {
-                store_url: url,
+                store_url: Some(url),
                 json: true,
                 embedding_dim: Some(dim),
                 // This test deliberately drives the destructive in-place
@@ -891,7 +891,7 @@ async fn schema_init_postgres_reports_age_projection_field() {
     let mut stderr = Vec::<u8>::new();
     let mut out = ai_memory::cli::CliOutput::from_std(&mut stdout, &mut stderr);
     let args = ai_memory::cli::schema_init::SchemaInitArgs {
-        store_url: url,
+        store_url: Some(url),
         json: true,
         embedding_dim: Some(384),
         force_reembed: false,

@@ -24,13 +24,14 @@
 #     client_auth_mandatory over the entire HTTPS port (src/tls.rs).
 #
 # Secret handling: the PG password (20_pg_age.sh) is composed into a store URL
-# that lives ONLY in the per-node EnvironmentFile (mode 0400, root-only) and is
-# pulled into ExecStart via systemd ${AI_MEMORY_STORE_URL} expansion — the unit
-# file itself carries NO secret. The daemon's `--store-url` has no env binding
-# in the pinned golden binary, so the expanded argv is visible to root via
-# `ps`; on these single-tenant, firewall-closed (5432 localhost-bound) hosts
-# that residual is acceptable and documented rather than hidden.
+# that lives ONLY in the per-node EnvironmentFile (mode 0400, root-only) and
+# reaches the daemon as the AI_MEMORY_STORE_URL environment variable — the unit
+# file carries NO secret and ExecStart carries no `--store-url` (#4603), so the
+# DSN is never on argv. `serve` resolves the env channel in src/store_url.rs
+# resolve_store_url (src/daemon_runtime.rs:5090); that channel needs a binary
+# >= 0.9.0 (require_store_url_env_channel in lib.sh refuses an older pin).
 source "$(dirname "$0")/lib.sh"
+require_store_url_env_channel   # #4603: no --store-url on argv; env channel needs >= 0.9.0
 
 RENDER_DIR="$RUN_DIR/render"; mkdir -p "$RENDER_DIR"
 SECRETS_DIR="$RUN_DIR/secrets"
@@ -59,7 +60,9 @@ inv_all | while IFS="$(printf '\t')" read -r host role region pub priv; do
 
   fed_id="$CAMPAIGN/$region/$host"          # stable, trust-domain-scoped federation identity
   agent_id="ai:$host@$CAMPAIGN"             # stable, NON-reserved (never the reserved 'daemon', #1231)
-  store_url="postgres://aimemory:$PG_PW@127.0.0.1:5432/aimemory"
+  # #4860 / #3705: ai-memory refuses a Postgres DSN that does not pin
+  # sslmode=verify-full (loopback included); 20_pg_age.sh issues the peer-local CA.
+  store_url="postgres://aimemory:$PG_PW@127.0.0.1:5432/aimemory?sslmode=verify-full&sslrootcert=/opt/hive/pg-age/tls/ca.crt"
   peers_csv="$(build_peers_csv "$pub")"
   [ -n "$peers_csv" ] || die "[$host] no other peers resolved for quorum — inventory must list >=2 peers"
 
@@ -81,7 +84,7 @@ inv_all | while IFS="$(printf '\t')" read -r host role region pub priv; do
   scp_to "$local_env" "$pub" "$REMOTE_ENVFILE"
   ssh_node "$pub" "chmod 0400 '$REMOTE_ENVFILE'"
 
-  # --- systemd unit (no secret in the unit; store URL via ${VAR} expansion) ----
+  # --- systemd unit (no secret in the unit; store URL via the EnvironmentFile channel) ----
   outdir="$RENDER_DIR/$host"; mkdir -p "$outdir"
   unit="$outdir/ai-memory.service"
   cat > "$unit" <<UNIT
@@ -100,7 +103,6 @@ EnvironmentFile=$REMOTE_ENVFILE
 ExecStart=$BIN serve \\
   --host 0.0.0.0 \\
   --port $FEDERATION_PORT \\
-  --store-url \${AI_MEMORY_STORE_URL} \\
   --tls-cert $REMOTE_TLS/server.pem \\
   --tls-key $REMOTE_TLS/server.key \\
   --mtls-allowlist $REMOTE_TLS/mtls-allowlist.txt \\

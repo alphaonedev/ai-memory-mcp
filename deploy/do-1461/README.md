@@ -212,6 +212,16 @@ SSH command line.
   node count, or `$QUORUM_WRITES`), and the zero-touch credential TTL
   (`$FED_CRED_TTL_SECS`) — all single-source constants, overridable by env for
   forks.
+
+  > **Version floor (#4799).** The provision scripts refuse any `EXPECTED_VERSION`
+  > that is not a strict `X.Y.Z` release at or above 0.9.0 (`require_min_version`
+  > in `provision/lib.sh`), because the `AI_MEMORY_STORE_URL` env channel that keeps
+  > the store password off argv first ships in 0.9.0 (#4603). The default pin
+  > `0.7.0` therefore stops, by design, at the first step that needs that
+  > channel (the curator install in `46_batman.sh`, or `50_federation.sh`). Set `EXPECTED_VERSION` and `GOLDEN_SHA256` together to a release at
+  > or above the floor before running. Bump the default pin when the 1.0.0 golden
+  > artifact exists.
+
 - **Deterministic inventory**: `inventory.json` is a pure projection of
   Terraform state; the whole toolkit drives off it.
 - **Idempotent**: every step is safe to re-run. The campaign CA and per-node

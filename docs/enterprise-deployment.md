@@ -260,8 +260,9 @@ snapshot ([#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444)).
 Export `AI_MEMORY_STORE_URL_FILE` (or `AI_MEMORY_STORE_URL`) in the environment of
 any backup cron on a host that might be re-pointed at Postgres, so the command
 fails loudly on the day it is: `backup` resolves the store from those channels
-itself (`src/cli/backup.rs:1112`). Do not copy the variable onto the command line
-as `--store-url "$AI_MEMORY_STORE_URL"`; that puts the password in argv.
+itself (`src/cli/backup.rs:1112`). Do not expand the variable onto the command line
+through the `--store-url` flag: the shell puts the expanded value, password included, in argv
+(the resolver ignores the flag when either channel is set, `src/store_url.rs:137`).
 
 ### 2.7 When to graduate
 
@@ -462,10 +463,11 @@ production Dockerfile. Quick summary:
 Bootstrap a fresh postgres backend with:
 
 ```bash
-ai-memory schema-init --store-url postgres://aimemory:PWD@hub.dc1.internal:5432/aimemory
+# /etc/ai-memory/store-url: one line, mode 0600:  postgres://aimemory:PWD@hub.dc1.internal:5432/aimemory
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
+`schema-init` resolves its URL exactly like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:312`, `src/store_url.rs:137`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
 
 Opening the store runs the idempotent `postgres_schema.sql` bootstrap
 plus the in-process upgrade ladder to schema v91 as a side effect. The
