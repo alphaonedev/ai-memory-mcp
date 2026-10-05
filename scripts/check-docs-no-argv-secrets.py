@@ -201,7 +201,7 @@ PSQL_HEAD_RE = re.compile(r"(?:^|[\s;|&(`/\"'${_-])(?P<word>psql[A-Za-z0-9_]*)\b
 # stays valid for both psql rules; a word that still holds an expansion, substitution,
 # glob or brace and could spell psql is refused as undecidable.
 PSQL_VAR_OPT_RE = re.compile(
-    r"\s(?:-[A-Za-z0-9]*v\s*|--(?:set?|va[a-z]*)(?:=|\s+))"
+    r"\s(?:-[A-Za-z0-9]*v\s*|--(?:set?|va(?:r(?:i(?:a(?:b(?:le?)?)?)?)?)?)(?:=|\s+))"
     r"(?P<operand>[^\s]+)",
     re.IGNORECASE,
 )
@@ -1142,6 +1142,72 @@ def psql_segment_end(joined: str, head_end: int) -> int:
     return n
 
 
+# #5556 #5557 #5558 (round-8): the gate does not guess whether an unresolved first word of a
+# command spells psql. The words that may stand before the real command (an assignment, an
+# option and its argument, a redirection target, and these wrappers and keywords) are skipped;
+# a first word that is then not fully literal is read as a psql head.
+# Closed world: the operand decides, never a spelling list of heads. The rule is the same in
+# every file type (script, prose, fenced block, indented block, inline code). STATED LIMITS of
+# this rule: a first word that IS fully literal and is not psql (docker, foo) is a different
+# command and is not read; a non-literal word that stands after such a literal word is an
+# argument, not a head; a head that carries no credential -v operand is not flagged by this
+# rule (a script still refuses an undecidable psql-like word, a prose file does not).
+HEAD_PREFIX_WORDS = frozenset({
+    "env", "command", "exec", "sudo", "doas", "time", "nohup", "nice", "ionice", "builtin",
+    "xargs", "stdbuf", "timeout", "runuser", "setsid", "eval", "watch", "unbuffer", "taskset",
+    "then", "do", "else", "elif", "if", "while", "until", "!", "$", "{",
+})
+HEAD_START_CHARS = frozenset("\n;|&({")
+HEAD_QUOTES = frozenset("\"'`")
+
+
+def undecidable_head_candidates(joined: str) -> List[Tuple[int, int]]:
+    """(start, end) of every command whose first word is not fully literal (any expansion,
+    substitution, backtick span, glob, brace, ANSI-C or locale quoting; any number of literal
+    letters, zero or one included). A command starts at the text start, after a newline or
+    an ; | & ( {, and at the first word of a quoted string or backtick span that holds a
+    space (a command string); the words that may stand before the real command are skipped."""
+    n = len(joined)
+    found: List[Tuple[int, int]] = []
+    limits = {0: n}
+    limits.update((i + 1, n) for i, c in enumerate(joined) if c in HEAD_START_CHARS)
+    for start, end, _pieces in scan_words(joined):
+        if joined[start] in HEAD_QUOTES and end - start > 2 and joined[end - 1] == joined[start]:
+            if re.search(r"\s", joined[start + 1:end - 1]):
+                limits[start + 1] = end - 1
+    for first in sorted(limits):
+        hi = limits[first]
+        pos = first
+        tight = hi < n
+        skip_arg = False
+        for _ in range(16):
+            while not tight and pos < hi and joined[pos] in " \t":
+                pos += 1
+            tight = False
+            if pos < hi and joined[pos] in "<>":
+                pos += 1
+                skip_arg = True
+                continue
+            if pos >= hi or joined[pos] in "\n;|&)( \t":
+                break
+            end, pieces = parse_word(joined, pos, hi, [])
+            if end <= pos:
+                break
+            raw = joined[pos:end]
+            literal = word_literal(pieces)
+            if skip_arg and literal is not None:
+                skip_arg = False
+            elif raw[:1] == "-" or ASSIGN_RE.match(raw):
+                skip_arg = raw[:1] == "-" and "=" not in raw
+            elif literal is None:
+                found.append((pos, end))
+                break
+            elif literal not in HEAD_PREFIX_WORDS:
+                break
+            pos = end
+    return sorted(set(found))
+
+
 def psql_command_snippet(text: str, start: int, end: int) -> str:
     """The whole (continued) psql command from its word to the segment end, on one
     line, so a hit shows the offending option (#5516)."""
@@ -1209,6 +1275,17 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
             line = _line_of(text, head.start("word"))[0]
             hits.append((rel, line, "[env-password-argv] "
                          + psql_command_snippet(text, head.start("word"), end)))
+    # #5556 #5557 #5558: a command whose first word is not fully literal is read as psql, so
+    # the -v rule never depends on a guess about what the word spells.
+    seen_heads = [(h.start("word"), psql_segment_end(joined, h.end())) for h in PSQL_HEAD_RE.finditer(joined)]
+    for wstart, wend in undecidable_head_candidates(joined):
+        if any(wstart <= hs < wend and wend <= he for hs, he in seen_heads):
+            continue
+        end = psql_segment_end(joined, wend)
+        if any(psql_var_operand_flagged(m.group("operand"))
+               for m in PSQL_VAR_OPT_RE.finditer(segment_view(joined[wend:end])[0])):
+            hits.append((rel, _line_of(text, wstart)[0], "[env-password-argv] "
+                         + psql_command_snippet(text, wstart, end)))
     for rule, tag in ((PSQL_URL_RE, "psql-url-password"), (DOCKER_ENV_DSN_RE, "env-dsn-argv"),
                       (SSH_REMOTE_URL_RE, "ssh-remote-url-password")):
         for m in rule.finditer(text):
@@ -1867,6 +1944,83 @@ PSQL_SEGMENT_PROBES = (
     ("5516-21-snippet-redacts-the-literal", "psql -v pw=postgres://u:hunter2x@h/d -f x.sql", [1], "-v pw="),
 )
 
+# #5556 / #5557 / #5558 (round 8): a command whose first word is not fully literal is read as
+# psql whatever it might spell, so a credential -v operand is flagged in every file type.
+HEAD_TAIL = ' -v pw="$PG_PW" -f x.sql'
+RED_HEAD_PROBES = {
+    # #5556: zero and one literal letter beside an expansion
+    "5556-01-zero-literal-variable": "$X" + HEAD_TAIL,
+    "5556-02-one-literal-then-variable": "p$X" + HEAD_TAIL,
+    "5556-03-variable-then-one-literal": "${X}l" + HEAD_TAIL,
+    "5556-04-two-variables": "${X}${Y}" + HEAD_TAIL,
+    "5556-05-unrelated-letter-then-variable": "s$X" + HEAD_TAIL,
+    "5556-06-quoted-variable-head": '"$X"' + HEAD_TAIL,
+    "5556-07-one-literal-set-form": 'p$X --set=pw="$PG_PW" -f x.sql',
+    "5556-08-one-literal-variable-form": 'p$X --variable pw="$PG_PW" -f x.sql',
+    "5556-09-one-literal-secret-value": "p$X -X -v x=$PGPASSWORD -f x.sql",
+    "5556-10-array-expansion-head": '"${CMD[@]}"' + HEAD_TAIL,
+    "5556-11-assignment-then-head": "FOO=1 $X" + HEAD_TAIL,
+    "5556-12-env-prefix": "env -i FOO=1 p$X" + HEAD_TAIL,
+    "5556-13-command-prefix": "command $X" + HEAD_TAIL,
+    "5556-14-exec-prefix": "exec ${X}l" + HEAD_TAIL,
+    "5556-15-sudo-prefix": "sudo -u postgres $X" + HEAD_TAIL,
+    "5556-16-time-prefix": "time $X" + HEAD_TAIL,
+    "5556-17-eval-word": "eval $X" + HEAD_TAIL,
+    "5556-18-eval-string": 'eval "$X' + HEAD_TAIL + '"',
+    "5556-19-pipe-before": "cat q.sql | p$X" + HEAD_TAIL,
+    "5556-20-here-string-before": '<<< "$IN" $X' + HEAD_TAIL,
+    "5556-21-head-on-continued-line": "FOO=1 \\\n  $X" + HEAD_TAIL,
+    "5556-22-head-after-continued-options": "env \\\n  -i \\\n  p$X" + HEAD_TAIL,
+    "5556-23-bash-c-string": "bash -c '$X" + HEAD_TAIL + "'",
+    # #5557: a substitution or backtick span that is itself the head word
+    "5557-01-command-v-psql": '"$(command -v psql)"' + HEAD_TAIL,
+    "5557-02-command-v-bare": "$(command -v psql)" + HEAD_TAIL,
+    "5557-03-which-psql": "$(which psql)" + HEAD_TAIL,
+    "5557-04-echo-psql": "$(echo psql)" + HEAD_TAIL,
+    "5557-05-backtick-bare": "`echo psql`" + HEAD_TAIL,
+    "5557-06-backtick-quoted": '"`which psql`"' + HEAD_TAIL,
+    "5557-07-nested-substitution": '"$(echo $(which psql))"' + HEAD_TAIL,
+    "5557-08-substitution-inside-prefix": "sudo -u postgres $(which psql)" + HEAD_TAIL,
+    "5557-09-substitution-after-pipe": "cat q.sql | $(which psql)" + HEAD_TAIL,
+    "5557-10-substitution-after-semicolon": "true; $(which psql)" + HEAD_TAIL,
+    "5557-11-substitution-with-set-form": '$(which psql) --set pw="$PG_PW" -f x.sql',
+    "5557-12-substitution-continued": "$(which psql) \\\n  -X \\\n  -v pw=\"$PG_PW\" -f x.sql",
+    "5557-13-eval-substitution": 'eval "$(which psql)' + HEAD_TAIL + '"',
+    "5557-14-substitution-in-subshell": "( $(which psql)" + HEAD_TAIL + " )",
+    # #5558: a glob or brace head in prose, fenced, indented and inline text
+    "5558-01-bracket-glob-fenced": "```bash\n[p]sql" + HEAD_TAIL + "\n```\n",
+    "5558-02-star-glob-fenced": "```sh\n*sql" + HEAD_TAIL + "\n```\n",
+    "5558-03-question-glob-fenced": "```\n?sql" + HEAD_TAIL + "\n```\n",
+    "5558-04-star-psql-fenced": "```bash\n*psql" + HEAD_TAIL + "\n```\n",
+    "5558-05-indented-block": "Run:\n\n    [p]sql" + HEAD_TAIL + "\n",
+    "5558-06-inline-prose": "Run `*sql" + HEAD_TAIL + "` to load it.\n",
+    "5558-07-brace-head-fenced": "```bash\n{x,y}" + HEAD_TAIL + "\n```\n",
+    "5558-08-glob-line-start": "[p]sql" + HEAD_TAIL,
+    "5558-09-glob-after-prompt": "$ ?sql" + HEAD_TAIL,
+    "5558-10-glob-after-sudo": "sudo *sql" + HEAD_TAIL,
+}
+# (name, text, lines of the env-password-argv hits the text rule reports)
+HEAD_LINE_PROBES = (
+    ("5556-l1-head-on-line-two", 'echo a\n$X' + HEAD_TAIL + "\n", [2]),
+    ("5557-l2-substitution-head-on-line-three", "echo a\necho b\n$(which psql)" + HEAD_TAIL + "\n", [3]),
+    ("5556-l3-continued-head-reports-its-own-line", "echo a \\\n  ; p$X" + HEAD_TAIL + "\n", [2]),
+    ("5558-l4-fenced-head-line", "text\n```bash\n[p]sql" + HEAD_TAIL + "\n```\n", [3]),
+    ("5556-l5-two-commands-two-lines", "$X" + HEAD_TAIL + "\n$Y" + HEAD_TAIL + "\n", [1, 2]),
+)
+GREEN_HEAD_PROBES = {
+    "5556-g1-no-credential": '$X -h "$HOST" -d "$DB" -f x.sql',
+    "5556-g2-neutral-variable": "p$X -v verbose=1 -f x.sql",
+    "5556-g4-lookalike-long-option": '"${example_bin}" --variant "${variant}" --report "${report}"',
+    "5556-g5-volume-mount-of-other-tool": "$COMPOSE run -v /host:/ct img",
+    "5556-g6-literal-other-head": 'echo "$X" -v pw=1',
+    "5556-g7-literal-head-keeps-meaning": "docker run -v $KEYS:/k $IMG",
+    "5556-g9-one-word-with-suffix-after-quote": '"$X -v pw=$PG_PW"c',
+    "5556-g10-quoted-literal-head-with-space": '"env -i" $X -v pw="$PG_PW"',
+    "5556-g11-equals-option-takes-no-argument": 'nohup --foo=bar true $X -v pw="$PG_PW"',
+    "5556-g12-command-string-ends-at-its-close": "bash -c 'env -i' $X -v pw=\"$PG_PW\"",
+    "5556-g8-prose-quote-no-command": "Set the **loss** value to 3 -v pw is not run here",
+}
+
 
 def self_test() -> int:
     bad = 0
@@ -1945,13 +2099,49 @@ def self_test() -> int:
         bad += 1
     # #5516: one real command is one hit, on its own line, with a snippet that shows
     # the offending option; a separator ends the psql segment.
+    red_before = red
     for name, text, want_lines, must_show in PSQL_SEGMENT_PROBES:
-        red += 1
+        # A probe with no wanted line asserts that there is NO hit: a clean case, not a red one.
+        if want_lines:
+            red += 1
+        else:
+            green += 1
         got = [h for h in scan_text("probe.md", text) if h[2].startswith("[env-password-argv]")]
         if [h[1] for h in got] != want_lines or any(must_show not in h[2] or "\\" in h[2] or "hunter2x" in h[2] for h in got):
             print("SELF-TEST FAIL: psql segment probe %r gave %r (want lines %r showing %r)"
                   % (name, got, want_lines, must_show), file=sys.stderr)
             bad += 1
+    # #5559: a probe that wants no hit is counted as a clean case, so the red total is the
+    # number of probes that want a hit (the changelog quotes these totals).
+    if red - red_before != sum(1 for _n, _t, wanted, _m in PSQL_SEGMENT_PROBES if wanted):
+        print("SELF-TEST FAIL: a no-hit segment probe was counted as a red case (#5559)", file=sys.stderr)
+        bad += 1
+    # #5556-#5558: the undecidable-head rule is file-type independent; each probe is run as a
+    # prose file and as a script.
+    for suffix in ("probe.md", "probe.sh"):
+        for name, text in RED_HEAD_PROBES.items():
+            red += 1
+            # text_rule_hits, not scan_text: scan_text drops a text hit on a line another
+            # layer already reported, which would hide a regression of this rule.
+            if not any(h[2].startswith("[env-password-argv]") for h in text_rule_hits(suffix, text)):
+                print("SELF-TEST FAIL: red probe %r (%s) was not flagged" % (name, suffix), file=sys.stderr)
+                bad += 1
+        for name, text in GREEN_HEAD_PROBES.items():
+            green += 1
+            if scan_text(suffix, text):
+                print("SELF-TEST FAIL: green probe %r (%s) was flagged" % (name, suffix), file=sys.stderr)
+                bad += 1
+    for name, text, want_lines in HEAD_LINE_PROBES:
+        red += 1
+        got = [h[1] for h in text_rule_hits("probe.md", text) if h[2].startswith("[env-password-argv]")]
+        if got != want_lines:
+            print("SELF-TEST FAIL: head line probe %r gave lines %r (want %r)" % (name, got, want_lines), file=sys.stderr)
+            bad += 1
+    # A glob head with no credential option is emphasis in prose; a script refuses it as undecidable.
+    green += 1
+    if scan_text("probe.md", "```bash\n[p]sql -f x.sql\n```\n"):
+        print("SELF-TEST FAIL: a credential-free glob head in prose was flagged", file=sys.stderr)
+        bad += 1
     # A reported snippet never carries the placeholder secret.
     red += 1
     reported = scan_text("probe.sh", RED_SHELL_PROBES["4692 keyword conninfo with spaces around ="])
