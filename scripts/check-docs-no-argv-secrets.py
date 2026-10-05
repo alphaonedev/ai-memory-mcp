@@ -170,6 +170,12 @@ and the changelog (Refs #5725):
   * a credential inside a non-shell ``-c`` string (``python3 -c``);
   * .md prose outside a fenced block, for argv-credential-shape.
 
+STATED FALSE POSITIVE (fail closed, kept by the 5-agent vote (4d3ea1c5) on
+#5845): under a head the gate cannot decide (``$RSYNC``), the word after a
+short-option cluster ending in ``v`` is read as a ``-v`` variable operand, so
+``$RSYNC -av --password-file=/run/x src dst`` is reported. Name the program,
+or split the cluster (``-a -v``). A self-test row pins it as flagged.
+
 So a PASS means that no tracked line matches a rule above outside the PENDING
 list and the reviewed allowlist. It is not a proof that no credential reaches
 a process argv.
@@ -4560,6 +4566,14 @@ def self_test() -> int:
            for h in scan_text("probe.md", "```text\ntool --password S3cr3tPass\n```\n")):
         print("SELF-TEST FAIL: the shape rule read a fence that is not shell-like", file=sys.stderr)
         bad += 1
+    # #5845 STATED FALSE POSITIVE: an option word after a -v cluster under an undecidable head
+    # is read as a variable operand and flagged (fail closed, kept by the 5-agent vote).
+    for label, suffix, body in r9_variants("$RSYNC -av --password-file=/run/x src dst")[0::2]:
+        red += 1
+        if not scan_text(suffix, body):
+            print("SELF-TEST FAIL: the #5845 stated false positive is no longer flagged (%s); update the"
+                  " header" % label, file=sys.stderr)
+            bad += 1
     # #5842: an untagged fence is read as shell (MD_SHELL_FENCES holds "").
     red += 1
     if not any(h[2].startswith("[%s]" % SHAPE_TAG)
