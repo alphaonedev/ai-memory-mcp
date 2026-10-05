@@ -915,6 +915,38 @@ def _self_test_cases() -> int:
     case("a census number replaced by U+0000 is a rule change, not COUNT CHANGED (#5404)", hash_for_nul,
          True, "RULE TEXT CHANGED")
 
+    # #5425: the CENSUS_DIGITS split comparison is pinned against every weakening of its pattern. Each case is a
+    # head (or base and head) change that must be a rule change; the comment names the mutant it kills.
+    def census_case(name, old, new, base_old=None, base_new=None, want_fail=True):
+        base_edit = None
+        if base_old is not None:
+            def base_edit(root):
+                edit(base_old, base_new)(root)
+                reseal(root)
+        case(name, census_edit(old, new), want_fail, "RULE TEXT CHANGED" if want_fail else "COUNT CHANGED",
+             base_mutate=base_edit)
+
+    # M4 (join the pieces): a census number deleted while its spaces stay.
+    census_case("a census number deleted with its spaces kept is a rule change (#5425)",
+                "has 103 MCP tools", "has  MCP tools")
+    # M5 (drop the first piece): text before the first census number edited.
+    census_case("text before the first census number edited is a rule change (#5425)",
+                "The surface has 103 MCP", "The surface lacks 103 MCP")
+    # M8 (drop the word boundary): a base number glued to a letter changes with the letter kept.
+    census_case("a census number glued to a letter v103 to v104 is a rule change (#5425)",
+                "has 103 MCP tools", "has v104 MCP tools", "has 103 MCP tools", "has v103 MCP tools")
+    # M9 (lookahead whitespace optional): a base number glued to the census words.
+    census_case("a census number glued to the census words 103MCP to 104MCP is a rule change (#5425)",
+                "has 103 MCP tools", "has 104MCP tools", "has 103 MCP tools", "has 103MCP tools")
+    # M12 (any non-space run instead of digits): a number replaced by a word.
+    census_case("a census number replaced by a word is a rule change (#5425)",
+                "has 103 MCP tools", "has many MCP tools")
+    # M10 (digit class widened with NUL and #): the byte follows a digit, where the word boundary does not block it.
+    census_case("a census number followed by a literal # is a rule change (#5425)",
+                "has 103 MCP tools", "has 10# MCP tools")
+    census_case("a census number followed by U+0000 is a rule change (#5425)",
+                "has 103 MCP tools", "has 10\x00 MCP tools")
+
     # #5375: the docstring says what the code does: the census exemption is a heading PREFIX match.
     doc_words = " ".join((__doc__ or "").split())
     if f"inside a section whose heading starts with `{CENSUS_SECTION}`" in doc_words:
