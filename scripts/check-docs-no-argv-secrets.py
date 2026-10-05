@@ -918,7 +918,8 @@ def xtrace_top_level(lines: List[str], yaml_indent: bool = False) -> List[bool]:
     """#5726: for each line, True only when it is proven a top-level command line of the current
     shell: it starts outside every quote, ( / $( / backtick / ${ , heredoc body, function header
     and continuation of the previous line (trailing backslash, |, |&, && or ||), it closes every
-    construct it opens, opens no heredoc and does not itself end in a continuation. A set +x on
+    construct it opens and does not itself end in a continuation (a heredoc it opens does not
+    stop it: the line runs in the current shell, and the body lines after it are never proven). A set +x on
     any other line does not end a traced region (fail closed). yaml_indent: the script is a YAML
     block scalar (.tpl, .yaml, .yml), whose space indentation the shell never sees, so a heredoc
     terminator is matched after it."""
@@ -999,7 +1000,7 @@ def xtrace_top_level(lines: List[str], yaml_indent: bool = False) -> List[bool]:
         code = ln[:code_end]
         if not stack and (XTRACE_CONT_TAIL_RE.search(code) or XTRACE_FUNC_HEADER_RE.search(code.rstrip())):
             cont = True
-        proven[n] = start_top and not stack and not pending and not cont
+        proven[n] = start_top and not stack and not cont
         n += 1
         for delim, strip in pending:
             while n < len(lines):
@@ -3583,6 +3584,10 @@ R10_XTRACE_GREEN = {
     '5726-g32-after-one-line-pipe': 'set -x\ntrue | cat\nset +x\n',
     '5726-g33-shift-in-arith-subst': 'set -x\nv=$((1 << 2))\nset +x\n',
     '5726-g34-shift-in-arith-command': 'set -x\n(( v = 1<<2 ))\nset +x\n',
+    # #5726 (round-11 mutant X10): a line that opens a heredoc still runs in the current shell,
+    # so its set +x ends tracing (bash 5.2 does not trace the next line); the body is skipped.
+    '5726-g35-off-with-heredoc-on-line': "set -x\nset +x <<'EOF'\nbody\nEOF\n",
+    '5726-g36-heredoc-then-off-on-line': 'set -x\ncat <<EOF; set +x\nbody\nEOF\n',
 }
 
 # #5722 (round 11, 5-agent vote (4d3ea1c5)): these were clean probes up to round 10, because a
@@ -3751,12 +3756,26 @@ def allow_self_test(bad: int, red: int, green: int) -> Tuple[int, int, int]:
     if key2 is None:
         print("SELF-TEST FAIL: allowlist: the second probe hit has no waivable key: %r" % (hit2,), file=sys.stderr)
         return bad + 1, red, green
+    other_key = ("probe.sh", "env-password-argv", "a" * 32, "x")
+    other_h = ("probe.sh", 2, "[env-password-argv] h=%s x" % ("a" * 32))
+    # #5722: the key hashes the command with whitespace runs and backslash-newlines read as one
+    # space, so a re-wrapped or re-spaced line keeps its reviewed entry; any other edit voids it.
+    red += 1
+    respaced = text_rule_hits("probe.sh", "pgbench  -v \\\n    db_" + "password=x1 -f a.sql\n")
+    edited = text_rule_hits("probe.sh", "pgbench -v db_" + "password=x2 -f a.sql\n")
+    if not respaced or waivable_key(respaced[0])[2] != key[2] or not edited \
+            or waivable_key(edited[0])[2] == key[2]:
+        print("SELF-TEST FAIL: allowlist: command hash normalisation: %r %r" % (respaced, edited),
+              file=sys.stderr)
+        bad += 1
     checks = [
         ("one entry claims one hit", [hit[0]], [key], 0, 1, 0),
         ("one entry leaves a second identical hit", [hit[0], hit[0]], [key], 1, 1, 0),
         ("an entry with no hit is stale", [], [key], 0, 0, 1),
         ("an entry for another file claims nothing", [hit[0]], [("x.sh",) + key[1:]], 1, 0, 1),
         ("a non-waivable hit is never claimed", [other], [key], 1, 0, 1),
+        # A hash-shaped snippet under a class that is never waivable is not a key (waivable_key).
+        ("a non-waivable class with a hash is never claimed", [other_h], [other_key], 1, 0, 1),
         ("entries out of hit order are an order fault", [hit[0], hit2[0]], [key2, key], 0, 2, 1),
         ("entries in hit order are clean", [hit[0], hit2[0]], [key, key2], 0, 2, 0),
     ]
@@ -4008,6 +4027,21 @@ def self_test() -> int:
     green += 1
     if any(h[2].startswith("[%s]" % SHAPE_TAG) for h in scan_text("probe.md", "Run tool --password S3cr3tPass.\n")):
         print("SELF-TEST FAIL: the shape rule read prose outside a fence", file=sys.stderr)
+        bad += 1
+    # #5725: a fence tagged with a language that is not shell-like is not read (MD_SHELL_FENCES).
+    green += 1
+    if any(h[2].startswith("[%s]" % SHAPE_TAG)
+           for h in scan_text("probe.md", "```text\ntool --password S3cr3tPass\n```\n")):
+        print("SELF-TEST FAIL: the shape rule read a fence that is not shell-like", file=sys.stderr)
+        bad += 1
+    # #5725: a hit on a continued command is reported at its first line with the whole command,
+    # so a PENDING needle and an allowlist key see the command word.
+    red += 1
+    cont_hit = [h for h in scan_text("probe.sh", R11_SHAPE_RED["5725-r17-continued-line"])
+                if h[2].startswith("[%s]" % SHAPE_TAG)]
+    if len(cont_hit) != 1 or cont_hit[0][1] != 1 or " tool " not in " %s " % cont_hit[0][2]:
+        print("SELF-TEST FAIL: a continued shape hit is not at its logical line: %r" % (cont_hit,),
+              file=sys.stderr)
         bad += 1
     for name, text in R11_ARRAY_NESTED_UNKNOWN.items():
         for label, suffix, body in r9_variants(text):
