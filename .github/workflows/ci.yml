@@ -1295,18 +1295,24 @@ jobs:
                       self.fail(path, "could not clear or descend: %s" % err)
                   finally:
                       if restore is not None:
-                          # Quiet, unlike the restore inside `_open_at`: by this point
-                          # `_clear_fd` has re-read the flags from this same descriptor
-                          # and has already `fail`ed on anything it could not prove
-                          # unlinkable, and raising out of a `finally` would replace that
-                          # verdict with a mode-restore error. A mode is not what poisons
-                          # the next checkout - a flag is - so a restore that fails here
-                          # leaves a widened mode on a dead scratch tree and says nothing
-                          # rather than redding the leg over it.
+                          # Reported, like the restore inside `_open_at`, and for the
+                          # same reason: a mode this walk added and could not take off is
+                          # something it changed and cannot account for. `fail` only
+                          # appends, so it cannot replace the verdict `_clear_fd` already
+                          # reached from this same descriptor - which was the whole
+                          # objection to reporting from a `finally` - and it makes `main`
+                          # exit non-zero. Silence here was "0 failed" over an inode left
+                          # more permissive than the walk found it, which is the #5657
+                          # shape with a mode in place of a flag (#6002).
                           try:
                               os.fchmod(fd, restore)
-                          except OSError:
-                              pass
+                          except OSError as err:
+                              try:
+                                  applied = "0o%03o" % stat.S_IMODE(os.fstat(fd).st_mode)
+                              except OSError:
+                                  applied = "a mode that could no longer be read back"
+                              self.fail(path, "the mode this walk widened is left applied (%s, not the "
+                                              "0o%03o the walk found): %s" % (applied, restore, err))
                       os.close(fd)
 
               def _walk(self, dirfd, path):

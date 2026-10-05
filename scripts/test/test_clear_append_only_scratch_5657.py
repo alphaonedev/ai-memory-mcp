@@ -307,6 +307,31 @@ def swap_before_the_open(mod, name, swap):
         mod.os.open = real
 
 
+@contextlib.contextmanager
+def restore_that_fails(mod, nth=2):
+    """Break the Nth `os.fchmod` of a run with EPERM (#6002).
+
+    On the path this seam is used with - a directory readable but not searchable
+    - `os.fchmod` is called exactly twice: once to widen, once to put the mode
+    back after the descent. Breaking the second one is the restore failing, with
+    no timing assumption and no patched filesystem. Yields the modes it saw, so
+    a test cannot pass by never reaching the restore at all."""
+    real = mod.os.fchmod
+    calls = []
+
+    def fchmod(fd, mode):
+        calls.append(mode)
+        if len(calls) == nth:
+            raise OSError(errno.EPERM, "the restore was refused")
+        return real(fd, mode)
+
+    mod.os.fchmod = fchmod
+    try:
+        yield calls
+    finally:
+        mod.os.fchmod = real
+
+
 class ScratchTreeCase(unittest.TestCase):
     """Every case gets `<repo>/.local-runs/.ws5657-*/` as a fake workspace whose
     own `.local-runs/.tmpAbC123/audit/audit.log` is the poisoned leftover."""
@@ -821,6 +846,42 @@ class ScratchTreeCase(unittest.TestCase):
             self.assertNotIn("0 cleared, 0 failed", out,
                              "the run reported a clean sweep over an unreadable flagged leftover")
             self.assertTrue(is_flagged(inner), "the fixture itself did not survive the run")
+
+    def test_a_restore_that_fails_is_reported_and_reds_the_leg_6002(self):
+        """#6002. The walk widens a directory it cannot search, descends, and
+        puts the mode back on the way out. That restore used to be allowed to
+        fail in silence: the inode kept the owner bits this run added, and the
+        run still printed "0 failed" and exited 0.
+
+        That is the #5657 failure shape with a mode in place of a flag - a
+        janitor reporting a clean sweep over something it left behind - and the
+        reason it is not merely cosmetic is that the mode is the only evidence
+        that the widen happened at all. A leftover that is named can be fixed by
+        hand; one that is swallowed is found by the next job that trips over
+        it."""
+        mod = load_script_module()
+        shut = self.scratch / ".tmpQ"
+        shut.mkdir()
+        (shut / "inner.log").write_text("{}\n")
+        widened = 0o400 | stat.S_IXUSR
+        with restrictive(shut, 0o400):
+            with restore_that_fails(mod) as calls:
+                rc, out, err = run_clear_in_process(mod, self.ws)
+            self.assertEqual(calls, [widened, 0o400],
+                             "this path is the widen and its restore, in that order: %r" % (calls,))
+            self.assertEqual(stat.S_IMODE(os.lstat(shut).st_mode), widened,
+                             "the fixture did not actually keep the widened mode, so the "
+                             "reporting this test pins is not the reporting of a leftover")
+            self.assertNotEqual(rc, 0,
+                                "a mode this run added and could not remove is not a pass:\n"
+                                + out + err)
+            self.assertIn(str(shut), err, "the entry left widened is not named")
+            self.assertIn("0o%03o" % widened, err,
+                          "the report does not name the mode that is left applied:\n" + out + err)
+            self.assertIn("0o400", err,
+                          "the report does not name the mode the walk found:\n" + out + err)
+            self.assertNotIn(" 0 failed", out,
+                             "the run reported no failures while leaving a mode it added:\n" + out)
 
 
 # --------------------------------------------------------------------------
