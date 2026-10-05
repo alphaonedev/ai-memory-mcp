@@ -377,6 +377,9 @@ lab_posture_render | tee "$RUN/evidence/posture.env" | sed 's/^/   /'
 info "$(lab_posture_count) pinned knobs at their hard floor."
 info "AI_MEMORY_SECURITY_PROFILE is deliberately NOT set (every knob is pinned directly) — see README §asi-hard."
 
+# #5739: the probe block must record exactly one verdict. A failed assignment (a readonly or integer variable, an
+# arithmetic error) aborts a whole top-level compound in bash, which would skip the block's ok or no silently.
+LAB_PROBE_AT=$((LAB_PASS + LAB_FAIL))
 if [ "$CAVEAT_PROBE" -eq 1 ]; then
   # PROVE the full profile cold-boots (#2942 fixed, #4938): boot a throwaway node
   # under the FULL asi-hard profile and record what actually happens.
@@ -434,6 +437,11 @@ if [ "$CAVEAT_PROBE" -eq 1 ]; then
     rm -f "$RUN/probe.db"*
   fi
 fi
+# #5739: exactly one verdict, counted on variables that carry no attribute. This is its own top-level statement, and the
+# next one reads its status, so an abort of the check itself (status 1) fails the run too.
+[[ $CAVEAT_PROBE != 1 || ( -z ${LAB_PROBE_AT@a}${LAB_PASS@a}${LAB_FAIL@a} && $((LAB_PASS + LAB_FAIL - LAB_PROBE_AT)) == 1 ) ]]
+case $? in 0) ;; *) printf '   FAIL the cold-boot probe did not record exactly one verdict (PASS %s, FAIL %s, %s before it): a verdict that could not be written fails the run (#5739)\n' "${LAB_PASS-?}" "${LAB_FAIL-?}" "${LAB_PROBE_AT-?}"; exit 1 ;; esac
+# end of the cold-boot probe verdict count (#5739)
 
 # ===========================================================================
 step "6 · launch the two-node mTLS federation"

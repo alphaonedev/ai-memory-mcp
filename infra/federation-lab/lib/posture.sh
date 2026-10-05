@@ -336,8 +336,8 @@ lab_probe_body_allowed() {
 }
 
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# 192 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
-# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 186
+# 205 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 199
 # leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
 # const in a scratch src tree), eight probe-matcher legs (lab_probe_refusal_names_knob against generated logs, each
 # checking the exact child status: 10, 11, or 4 for an unreadable log, #5662), three structural legs (the matcher body
@@ -360,7 +360,8 @@ lab_probe_body_allowed() {
 # LAB_PROBE_WHY reason), four probe-report legs (#5664: detected is ok, not-detected, refused and empty are no), a
 # run.sh pin and four run.sh branch legs (#5664: run.sh's own probe-verdict lines run with stub ok and no reach ok,
 # not-detected, and refused for a missing awk and a shadowed exec), a run.sh pin leg (run.sh turns on no trace route,
-# #5663), and one layout leg (this comment sits
+# #5663), a probe-region pin, eleven probe-block legs and an attribute pin (#5739: run.sh's own probe region, run at top
+# level with stand-in state, fails the run whenever a verdict could not be written), and one layout leg (this comment sits
 # directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
@@ -746,6 +747,44 @@ lab_posture_selftest() {
   case "$rl" in "no|probe mutation inconclusive: the probe matcher refused: exec is not the builtin the matcher needs; "*) echo "  PASS run.sh branch: a shadowed exec reaches no with the guard's reason" ;;
     *) echo "  FAIL run.sh branch: a shadowed exec gave [$rl]"; bad=1 ;; esac
   unset -f _runsh_branch
+  # #5739: run.sh's whole probe region (the LAB_PROBE_AT line through the end marker), taken from run.sh and run at top level
+  # in a child bash with the real common.sh, a stand-in boot binary and run.sh's summary and exit tail. A failed assignment
+  # aborts the whole top-level probe block, so the count check after it must turn a missing verdict into a FAIL and exit 1.
+  local runsh="$root/infra/federation-lab/run.sh" pb
+  pb="$(sed -n '/^LAB_PROBE_AT=\$((LAB_PASS + LAB_FAIL))$/,/^# end of the cold-boot probe verdict count (#5739)$/p' "$runsh")"
+  if [ "$(grep -cx 'LAB_PROBE_AT=$((LAB_PASS + LAB_FAIL))' "$runsh"):$(grep -cxF '# end of the cold-boot probe verdict count (#5739)' "$runsh")" = 1:1 ] \
+    && [ "$(printf '%s\n' "$pb" | grep -cF 'lab_probe_verdict "$PROBE"')" = 1 ]; then
+    echo "  PASS run.sh pin: the probe region has one start line and one end marker and holds the probe-verdict call (#5739)"
+  else echo "  FAIL run.sh pin: run.sh's probe region markers changed (#5739)"; bad=1; fi
+  mkdir -p "$plog/blk/evidence" && printf '#!/bin/sh\ncat "$BLK_LOG"\nexit "$BLK_RC"\n' > "$plog/blk/fake-boot" && chmod +x "$plog/blk/fake-boot"
+  _blk() {  # <label> <log> <setup> <want rc: 0, 1 or nz> <wanted text or -> <refused text or -> [port-free status]
+    printf '%s\n' 'set -uo pipefail' "source \"\$BLK_ROOT/infra/federation-lab/lib/common.sh\"" "source \"\$BLK_ROOT/infra/federation-lab/lib/posture.sh\"" \
+      'lab_port_free() { return "$BLK_PORT"; }' 'RUN=$BLK_DIR OUT=$BLK_DIR BIN=$BLK_DIR/fake-boot AGENT_A=ai:a FED_NS=n PORT_B=19482 PROBE_MUTATION=1 CAVEAT_PROBE=1' \
+      "$3" "$pb" 'summary' 'rc=$?' 'exit "$rc"' > "$plog/blk/blk.sh"
+    local out; out="$(env BLK_ROOT="$root" BLK_DIR="$plog/blk" BLK_LOG="$2" BLK_RC=75 BLK_PORT="${7:-0}" "$BASH" --noprofile --norc "$plog/blk/blk.sh" 2>&1)"; rc=$?
+    case "$4:$rc" in 0:0|1:1|nz:[1-9]*) ;; *) echo "  FAIL probe block: $1: exit $rc, wanted $4"; return 1 ;; esac
+    if [ "$5" != - ] && [[ $out != *"$5"* ]]; then echo "  FAIL probe block: $1: no [$5] in the output (exit $rc)"; return 1; fi
+    if [ "$6" != - ] && [[ $out == *"$6"* ]]; then echo "  FAIL probe block: $1: [$6] in the output (exit $rc)"; return 1; fi
+    echo "  PASS probe block: $1 (exit $rc)"
+  }
+  local n5739='did not record exactly one verdict' okrow='PASS probe mutation detected'
+  _blk "a refusal naming the knob records ok and the run passes" "$plog/ok.log" : 0 "$okrow" "$n5739" || bad=1
+  _blk "a log with no refusal line records no and the run fails" "$plog/no.log" : 1 'FAIL probe mutation inconclusive' "$n5739" || bad=1
+  _blk "a readonly LAB_PROBE_VERDICT=detected fails the run, never ok (#5739 F1)" "$plog/no.log" 'readonly LAB_PROBE_VERDICT=detected' 1 "$n5739" "$okrow" || bad=1
+  _blk "a readonly LAB_PROBE_LINE fails the run" "$plog/ok.log" 'readonly LAB_PROBE_LINE=x' 1 "$n5739" "$okrow" || bad=1
+  _blk "an integer LAB_PROBE_VERDICT fails the run" "$plog/no.log" 'declare -i LAB_PROBE_VERDICT' nz - "$okrow" || bad=1
+  _blk "a nameref LAB_PROBE_VERDICT fails the run" "$plog/no.log" 'declare -n LAB_PROBE_VERDICT=LAB_PASS' nz - "$okrow" || bad=1
+  _blk "a readonly LAB_FAIL fails the run" "$plog/no.log" 'readonly LAB_FAIL' 1 "$n5739" - || bad=1
+  _blk "a readonly LAB_PROBE_AT that balances a skipped verdict fails the run" "$plog/no.log" 'readonly LAB_PROBE_AT=-1 LAB_PROBE_VERDICT=detected' 1 "$n5739" "$okrow" || bad=1
+  _blk "a PORT_B that aborts the block in arithmetic fails the run" "$plog/ok.log" 'PORT_B=1/0' 1 "$n5739" "$okrow" || bad=1
+  _blk "an occupied probe port records one no and the count passes" "$plog/ok.log" : 1 'is occupied' "$n5739" 1 || bad=1
+  _blk "a skipped probe records nothing and the count does not apply" "$plog/ok.log" 'CAVEAT_PROBE=0' 0 - "$n5739" || bad=1
+  unset -f _blk
+  # #5739: run.sh and lib/common.sh set no variable attribute (readonly, typeset, or declare or local with r, i, n, l or u), so
+  # no line of their own can make a verdict assignment fail.
+  if ! grep -vhE '^[[:space:]]*#' "$runsh" "$root/infra/federation-lab/lib/common.sh" | grep -qE '(^|[^[:alnum:]_])(readonly|typeset)([^[:alnum:]_]|$)|(^|[^[:alnum:]_])(declare|local)[[:space:]]+-[[:alpha:]]*[rinlu]'; then
+    echo "  PASS run.sh pin: run.sh and lib/common.sh set no variable attribute (#5739)"
+  else echo "  FAIL run.sh pin: run.sh or lib/common.sh sets a variable attribute (#5739)"; bad=1; fi
   # #5663: run.sh (and the common.sh it sources) must not itself turn on xtrace, functrace, errtrace or extdebug, set a
   # DEBUG, RETURN or ERR trap, or give a function the trace attribute, or every real probe would be refused.
   if [ -r "$root/infra/federation-lab/run.sh" ] && ! grep -nE 'trap .*(DEBUG|RETURN|ERR)|set -[a-zA-Z]*[xTE]|extdebug|functrace|errtrace|xtrace|declare -[a-z]*t' "$root/infra/federation-lab/run.sh" "$root/infra/federation-lab/lib/common.sh" >/dev/null; then
