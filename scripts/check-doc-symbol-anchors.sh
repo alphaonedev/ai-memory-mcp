@@ -801,7 +801,8 @@ MDEOF
         "See \`$R::<*mut NoSuch>::decorate_memory_many\`."
     anchor_green 5495 "a const pointer self type with live parts" \
         "See \`$R::<*const RecallTool>::decorate_memory_many\`."
-    anchor_red 5495 QUAL "a parenthesised self type is refused" \
+    anchor_red_cites 5495 QUAL "a parenthesised self type is refused and reported with its whole token" \
+        "$R::<(NoSuch)>::decorate_memory_many" \
         "See \`$R::<(NoSuch)>::decorate_memory_many\`."
     anchor_red 5495 QUAL "a slice self type is refused" \
         "See \`$R::<[NoSuch]>::decorate_memory_many\`."
@@ -819,6 +820,8 @@ MDEOF
         "See $R::RecallTool>::NoSuch here."
     anchor_red 5496 BARE_QUAL "a nested path component with no generic of its own, a closer, then :: and a missing name" \
         "See Vec<$R::RecallTool::decorate_memory_many>::NoSuch here."
+    anchor_red 5496 BARE_QUAL "a path with no generic of its own, an entity closer, then :: and a missing name" \
+        "See Vec&lt;$R::RecallTool&gt;::NoSuch here."
     anchor_green 5496 "a path with no generic of its own inside a prose generic and no :: after the closer" \
         "See Vec<$R::RecallTool> here."
     anchor_green 5496 "a path with no generic of its own followed by a closer and prose" \
@@ -830,6 +833,8 @@ MDEOF
         "See a < b and $R::RecallTool<T>> here."
     anchor_red 5498 BARE_QUAL "an over-closed anchor after a less-or-equal comparison" \
         "See a <= b and $R::RecallTool<T>> here."
+    anchor_red 5498 BARE_QUAL "an over-closed anchor after a tab-spaced comparison" \
+        $'See a <\tb and '"$R"'::RecallTool<T>> here.'
     anchor_green 5498 "a live generic anchor inside a prose generic after a comparison" \
         "If a < b then see Vec<$R::RecallTool<T>> here."
 
@@ -843,7 +848,7 @@ src = open(self_path, encoding="utf-8").read()
 header = re.sub(r"\s+", " ", re.sub(r"(?m)^#", "", src.split("\nset -", 1)[0]))
 dest = re.search(r"^ABSENT_DEST = re\.compile\(\n(.*?)re\.IGNORECASE\)", src, re.S | re.M)
 claude = re.sub(r"\s+", " ", open(claude_path, encoding="utf-8").read())
-ok = ('"%s"' % wording in header or wording in header) and wording in claude
+ok = wording in header and wording in claude
 if wording != "a link or a fragment":
     ok = ok and bool(dest) and all(w in dest.group(1) for w in wording.split())
 sys.exit(0 if ok else 1)
