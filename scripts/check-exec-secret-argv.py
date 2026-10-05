@@ -542,8 +542,9 @@ def deny_lines(dl, rel: str, text: str) -> Dict[int, str]:
 # A credential-taking flag of a known tool fed from any expansion: the value is on argv
 # whatever the variable is called, so such a line is never allow-able (pending + issue only).
 CRED_TOOL_RE = re.compile(
-    # mysql family: -p glued to the value, or --password with a space or an equals sign (#4920)
-    r"\b(?:mysql|mariadb|mysqladmin|mysqldump)\b[^|;&]*\s(?:-p|--password(?![\w-])[\s=]*)[\"']?(?:\$|`)"
+    # mysql family: -p glued to the value, or --password with a space or an equals sign (#4920); the
+    # client accepts every unique prefix from --pas up (--pa is ambiguous with --pager) (#5464)
+    r"\b(?:mysql|mariadb|mysqladmin|mysqldump)\b[^|;&]*\s(?:-p|--pas(?:s(?:w(?:o(?:r(?:d)?)?)?)?)?(?![\w-])[\s=]*)[\"']?(?:\$|`)"
     r"|\bsshpass\s+-p\s*[\"']?(?:\$|`)"
     r"|\bredis-cli\b[^|;&]*\s(?:-a|--pass(?![\w-]))[\s=]*[\"']?(?:\$|`)"
     # one shell word after the flag that expands a variable, however its user part is quoted:
@@ -1455,6 +1456,13 @@ ROUND3_RED = [
     ("curl --oauth2-bearer", 'curl --oauth2-bearer "$X" h'),
     ("curl --pass", 'curl --pass "$X" --key k.pem h'),
     ("mysql --password with a space", 'mysql -u r --password "$X" db'),
+    ("5464 mariadb --pas space", 'mariadb -u r --pas "$X" db'),
+    ("5464 mysql --pass= glued", 'mysql -u r --pass="$X" db'),
+    ("5464 mysqladmin --passw= glued", 'mysqladmin --passw=$X status'),
+    ("5464 mysqldump --passwo space", 'mysqldump --passwo $X db'),
+    ("5464 mariadb --passwor= glued", 'mariadb --passwor="$X" db'),
+    ("5464 mysql --pass= backtick", 'mysql --pass=`cat f` db'),
+    ("5464 mysqldump --pas backtick", 'mysqldump --pas "`cat f`" db'),
     ("mysqldump --password unquoted", 'mysqldump --password $X db'),
     ("mariadb --password=", 'mariadb -u r --password="$X" db'),
     ("redis-cli --pass=", 'redis-cli --pass="$X" ping'),
@@ -1529,6 +1537,8 @@ ROUND3_RED = [
 ]
 ROUND3_GREEN = [
     ("mysql --password-file is not --password", 'mysql -u r --password-file="$PW_FILE" db'),
+    ("5464 mysql --pa is ambiguous, not --password", 'mysql -u r --pa="$X" db'),
+    ("5464 mysql --pass-file is not --pass", 'mysql -u r --pass-file="$PW_FILE" db'),
     ("redis-cli --pass-file is not --pass", 'redis-cli --pass-file "$PW_FILE" ping'),
     ("wget -e non-credential settings", 'wget -e robots=off -e "https_proxy=$PROXY_HOST" -O "$TOKEN_FILE" h'),
     ("wget --passive-ftp is not a password option", 'wget --passive-ftp -O "$TOKEN_FILE" h'),
