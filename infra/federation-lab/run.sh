@@ -421,11 +421,13 @@ if [ "$CAVEAT_PROBE" -eq 1 ]; then
         # The mutation is detected only when the refusal names the lowered knob. Any other refusal
         # (port, config, a different knob) proves nothing about this probe, and the profile's INFO
         # pin line names the knob on every boot, so it is excluded.
-        if lab_probe_refusal_names_knob "$PROBE"; then
-          ok "probe mutation detected: the boot refused (exit $PROBE_RC) and the refusal names AI_MEMORY_REQUIRE_ROLLBACK_CHECK"
-        else
-          no "probe mutation inconclusive: the boot refused (exit $PROBE_RC) but not for the lowered rollback-check knob"
-        fi
+        PROBE_VERDICT="$(lab_probe_verdict "$PROBE")"
+        case "$PROBE_VERDICT" in
+          detected) ok "probe mutation detected: the boot refused (exit $PROBE_RC) and the refusal names AI_MEMORY_REQUIRE_ROLLBACK_CHECK" ;;
+          not-detected) no "probe mutation inconclusive: the boot refused (exit $PROBE_RC) but not for the lowered rollback-check knob" ;;
+          # #5588: the matcher could not prove its commands (a shadowed builtin, no usable awk file) and ran nothing.
+          *) no "probe mutation inconclusive: the probe matcher ${PROBE_VERDICT}" ;;
+        esac
       else
         no "full asi-hard cold boot on a fresh DB did NOT come up (exit $PROBE_RC): the lab runs this posture, so a refusal is a failure (#2942 regression or a new refusal)"
       fi
