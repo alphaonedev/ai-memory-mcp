@@ -827,6 +827,16 @@ MDEOF
     anchor_green 5496 "a path with no generic of its own followed by a closer and prose" \
         "See $R::RecallTool> and then more."
 
+    # #5529: every closer in a run of closers counts before `::`, so a mutant
+    # that stops after the first closer is killed by the nested prefix and by
+    # the lone double closer.
+    anchor_red 5529 BARE_QUAL "two closers inside a nested prose generic, then :: and a missing name" \
+        "See Vec<Vec<$R::RecallTool>>::NoSuch here."
+    anchor_red 5529 BARE_QUAL "a lone double closer, then :: and a missing name" \
+        "See $R::RecallTool>>::NoSuch here."
+    anchor_red 5529 BARE_QUAL "a lone triple closer, then :: and a missing name" \
+        "See $R::RecallTool>>>::NoSuch here."
+
     # #5498: a prose comparison (`a < b`, `a <= b`) opens no generic group, so
     # it cannot absorb a real over-closing closer after the anchor.
     anchor_red 5498 BARE_QUAL "an over-closed anchor after a spaced less-than comparison" \
