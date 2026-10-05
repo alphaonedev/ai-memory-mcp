@@ -1169,14 +1169,32 @@ def _self_test_cases() -> int:
             return f"the docstring numbers the rules {sorted(numbered)} but pin_5590 asserts {sorted(asserted)} (#5622)"
         return ""
 
+    def run_pin(issue, check):
+        # #5627: a pin that raises is a failed pin named after itself, not a traceback that hides the pins after it.
+        try:
+            return check()
+        except Exception as exc:  # Exception only: KeyboardInterrupt and SystemExit still stop the self-test
+            return f"the pin {issue} raised {type(exc).__name__}: {exc}"
+
+    def raising_pin():
+        raise TypeError("planted")
+
     refusal_pins = {"#5510": pin_5510, "#5560": pin_5560, "#5562": pin_5562, "#5563": pin_5563, "#5588": pin_5588, "#5589": pin_5589, "#5590": pin_5590}
     for pin_issue, pin_check in refusal_pins.items():
-        pin_failure = pin_check()
+        pin_failure = run_pin(pin_issue, pin_check)
         if not pin_failure:
             print(f"PASS: self-test - the refusal_prefix_gap pin {pin_issue} is green")
         else:
             failures.append(f"refusal pin {pin_issue}")
             print(f"FAIL: self-test - the refusal_prefix_gap pin {pin_issue} failed: {pin_failure}", file=sys.stderr)
+
+    ran_after = []
+    planted_raise, after_result = [run_pin("#5627", c) for c in (raising_pin, lambda: ran_after.append(1) or "")]
+    if "raised TypeError: planted" not in planted_raise or after_result != "" or ran_after != [1]:
+        failures.append("refusal pin runner")
+        print(f"FAIL: self-test - a raising pin was not reported as a failed pin: {planted_raise!r} (#5627)", file=sys.stderr)
+    else:
+        print("PASS: self-test - a refusal pin that raises is reported as a failed pin and the later pins still run (#5627)")
 
     plant_failure = importlib_plant()
     if not plant_failure:
