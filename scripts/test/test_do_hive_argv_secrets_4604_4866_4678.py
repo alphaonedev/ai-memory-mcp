@@ -934,8 +934,43 @@ def consumer_findings(text, names):
                 continue
             hit = [v for v in names if re.search(r"\$\{?[#!]?%s\b" % re.escape(v), body)]
             word = body.split(None, 1)[0] if body.split() else ""
+            # #5411: a numeric test evaluates its operand as arithmetic and prints it when it is not a number.
+            if hit and word in ("[", "[[", "test") and re.search(r"\s-(?:eq|ne|lt|le|gt|ge)\s", body):
+                bad.append("%d:%s:%s numeric" % (n, word, ",".join(sorted(hit))))
+                continue
             if hit and word and word not in known and not re.match(r"^\w+\+?=", word):
                 bad.append("%d:%s:%s" % (n, word, ",".join(sorted(hit))))
+    return bad
+
+
+def arith_bodies(line):
+    """Text of each $(( ... )) arithmetic expansion of a logical line, balanced on parentheses."""
+    out, i = [], 0
+    while True:
+        i = line.find("$((", i)
+        if i < 0:
+            return out
+        depth, j = 2, i + 3
+        while j < len(line) and depth:
+            depth += {"(": 1, ")": -1}.get(line[j], 0)
+            j += 1
+        out.append(line[i + 3:j - 2] if depth == 0 else line[i + 3:])
+        i += 3
+
+
+def arith_findings(text, names):
+    """#5411: a node-derived name inside an arithmetic expansion, a substring offset or length, or an array
+    subscript. Bash evaluates each as arithmetic and prints the operand when it is not a number."""
+    bad = []
+    for n, line, func in logical_lines(text):
+        if func in ALLOWED or re.match(r"^\s*(?:ok|no|die)\(\) \{", line):
+            continue
+        for v in sorted(names):
+            nm = re.escape(v)
+            if any(re.search(r"\b%s\b" % nm, b) for b in arith_bodies(line)) \
+                    or re.search(r"\$\{\w+(?:\[[^\]]*\])?:(?![-=?+])[^}]*(?:\$\{?%s\b|\b%s\b)" % (nm, nm), line) \
+                    or re.search(r"[\w}]\[[^\]\s]*\$?\{?%s\b[^\]\s]*\]" % nm, line):
+                bad.append("%d:arithmetic:%s" % (n, v))
     return bad
 
 
@@ -982,6 +1017,7 @@ def taint_findings(text, names):
                 bad.append("%d:%s:%s" % (n, cmd, ",".join(sorted(hit))))
     bad += heredoc_findings(text, names)
     bad += consumer_findings(text, names)
+    bad += arith_findings(text, names)
     return bad, checked
 
 
@@ -995,6 +1031,7 @@ BANNED_CONSTRUCTS = (
     (r"(?<![\w$])\w+\+?=[^\s]*\\\s", "escaped space in an assignment"),
     (r"\$\{\w+:?=", "default-assign expansion"),
     # #5410: let and the (( command evaluate their operand as arithmetic and print it in a syntax error.
+    (r"\$\{\w+:?\?", "error expansion"),
     (r"(?<![\w-])let(?![\w-])", "let"), (r"(?<![\w$])\(\(", "arithmetic command"),
 )
 
@@ -1094,7 +1131,23 @@ def closed_world_taint(fs):
                         ("local with the reply as the name", 'local "$qjson"'),
                         ("tr with the reply as a set", 'echo abc | tr abc "$qjson"'),
                         ("unset with the reply", 'unset "$qjson"'),
-                        ("readonly with the reply as the name", 'readonly "$qjson"')):
+                        ("readonly with the reply as the name", 'readonly "$qjson"'),
+                        # #5411: arithmetic and expansion-error contexts print the operand that fails.
+                        ("an arithmetic expansion", ': $((qjson + 0))'),
+                        ("an arithmetic expansion with a dollar", 'n=$(( $qjson * 2 ))'),
+                        ("a substring offset", 's=abcdef\n: "${s:$qjson:1}"'),
+                        ("a substring length", 's=abcdef\n: "${s:0:${qjson}}"'),
+                        ("an array subscript", 'a=(1 2)\n: "${a[$qjson]}"'),
+                        ("a numeric test with [", '[ "$qjson" -eq 1 ]'),
+                        ("a numeric test with [[", '[[ $qjson -lt 1 ]]'),
+                        ("a numeric test with the reply as the right operand", '[ 1 -ne "$qjson" ]'),
+                        # #5411: further probes of the class (own, measured in bash): each prints the reply.
+                        ("trap with the reply", 'trap "$qjson" EXIT'), ("cd with the reply", 'cd "$qjson"'),
+                        ("kill with the reply", 'kill "$qjson"'), ("sleep with the reply", 'sleep "$qjson"'),
+                        ("type with the reply", 'type "$qjson"'), ("alias with the reply", 'alias "$qjson"'),
+                        ("printf with the reply as the format", 'printf "$qjson"'),
+                        ("command -v with the reply", 'command -v "$qjson"'),
+                        ("declare with the reply as the name", 'declare "$qjson"')):
         b2, _ = taint_findings(wrap(body), tainted_names(wrap(body)))
         probe("V1 closed-world negative control is flagged: %s" % label, len(b2) > len(bad), str(b2[len(bad):][:2]))
     # #5236: constructs a name-based scan cannot follow are not allowed in federate.sh at all.
@@ -1113,6 +1166,8 @@ def closed_world_taint(fs):
                         ("an escaped space in an assignment", 't=x\\ $qjson\nno "x $t"'),
                         ("a default-assign expansion", ': "${t:=$qjson}"\nno "x $t"'),
                         ("a default-assign expansion without the colon", ': "${t=$qjson}"\nno "x $t"'),
+                        # #5411: the error expansion prints its word.
+                        ("an error expansion", ': "${t:?$qjson}"'), ("an error expansion without the colon", ': "${t?$qjson}"'),
                         # #5410: arithmetic evaluation of a reply prints it in a syntax error.
                         ("let", 'let t=qjson'), ("let with a space", 'let "t = $qjson"'),
                         ("an arithmetic command", '(( t = qjson ))'),
@@ -1127,6 +1182,8 @@ def closed_world_taint(fs):
                         ("the status helper given a reply body", 'no "x $(reply_status "$qjson")"'),
                         ("a test after then", 'if true; then [ "$qjson" = x ] && :; fi'),
                         # #5406: a reply is a VALUE of a declaration, or reaches a filter on stdin: both print nothing.
+                        ("arithmetic on a counter", 'c=$((c + 1))\n[ "$c" -gt 3 ] && :'),
+                        ("a constant substring of a reply", 'x="${qjson:0:8}"'),
                         ("local with the reply as a value", 'local v="$qjson"'),
                         ("export with the reply as a value", 'export v="$qjson"'),
                         ("readonly with the reply as a value", 'readonly v=$qjson'),
