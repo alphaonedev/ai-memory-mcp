@@ -333,9 +333,9 @@ def non_isolated_child(script: Path, flags: list, scratch: Path):
                           capture_output=True, text=True, check=False)
 
 
-def plant_probe(name: str, probe: Path, xopts: list):
+def plant_probe(name: str, probe: Path, xopts: list, env=None):
     """#5441: plant `name`.py beside a child run under -S -E (plus the interpreter options `xopts`) that imports
-    `name`. The CHILD reports, before importing, whether it is already loaded, built-in or frozen (read through
+    `name`; `env` (None: inherit) is the child's environment. The CHILD reports, before importing, whether it is already loaded, built-in or frozen (read through
     _frozen_importlib), so the verdict never depends on the parent's -X options or Python version. Returns
     (shadowable, preloaded, planted_ran, ok): ok is False when the child did not report or the planted file ran
     and was not expected to (or the reverse)."""
@@ -350,13 +350,18 @@ def plant_probe(name: str, probe: Path, xopts: list):
         "__import__(name)\n"
         "print('REAL')\n", encoding="utf-8")
     result = subprocess.run([sys.executable, *xopts, "-S", "-E", str(probe / "probe.py")],
-                            capture_output=True, text=True, check=False, cwd=str(probe))
+                            capture_output=True, text=True, check=False, cwd=str(probe), env=env)
     verdict = [line.split() for line in result.stdout.splitlines() if line.startswith("VERDICT ")]
     if len(verdict) != 1 or len(verdict[0]) != 3:
         return (False, False, False, False)
     preloaded, inert = verdict[0][1] == "1", verdict[0][2] == "1"
     planted = "PLANTED" in result.stdout
     return (not inert, preloaded, planted, planted == (not inert))
+
+
+def plant_coverage_gap(probed: list, names: list, rounds: int) -> bool:
+    """#5443: True when `probed` is not exactly `names` once per round."""
+    return probed != names * rounds
 
 
 def imported_modules(path: Path) -> list:
@@ -601,8 +606,21 @@ def _self_test_cases() -> int:
                 if not ok:
                     return f"the planted {name}.py behaved differently from the child's own verdict (xopts {xopts})"
                 probed.append(name)
-        if probed != names + names:
+        if plant_coverage_gap(probed, names, 2):
             return "not every imported name was probed"
+        if plant_coverage_gap(names + names, names, 2) or not plant_coverage_gap(names[:1], names, 1) \
+                or not plant_coverage_gap(names + names, names, 1):
+            return "the coverage check does not tell a narrowed probe from a full one"
+        # #5441: encodings is loaded at every interpreter start and is not frozen, so its plant must stay inert
+        # and the child must say it was preloaded, on every Python version.
+        _, enc_pre, enc_ran, enc_ok = plant_probe("encodings", base_dir / "implant", [])
+        if not (enc_pre and not enc_ran and enc_ok):
+            return "a preloaded module's planted file ran, or the child did not report it preloaded"
+        # #5441: -E keeps the child independent of PYTHON* variables; PYTHONSAFEPATH=1 (3.11+) would drop the
+        # script directory from sys.path and make the planted file inert while the child reports it shadowable.
+        _, _, _, safe_ok = plant_probe("importlib", base_dir / "implant", [], {**os.environ, "PYTHONSAFEPATH": "1"})
+        if not safe_ok:
+            return "the probe child honours PYTHONSAFEPATH, so its result depends on the environment"
         return ""
 
     plant_failure = importlib_plant()
