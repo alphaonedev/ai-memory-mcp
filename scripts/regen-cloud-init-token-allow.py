@@ -53,7 +53,7 @@ def pending_refusals(g, templates, allow, pend) -> list:
 
 def change_report(g, removed, added, changed, old_seq, new_seq) -> list:
     """The REMOVED, NEW and CHANGED lines the rewrite prints. Each carries template text, so
-    each goes through g.mask_credentials: a template line that holds a password is shown with
+    each goes through g.scrub, and main() prints it through g.say: a template line that holds a password is shown with
     it masked (#5488). Credential text must be registered first (g.analyse does it)."""
     out = ["REMOVED: %s | %s | %s" % (k[0], k[1], g.mask_credentials(k[2])) for k in sorted(removed.elements())]
     out += ["NEW: %s | %s | %s" % (k[0], k[1], g.mask_credentials(k[2])) for k in sorted(added.elements())]
@@ -65,7 +65,26 @@ def change_report(g, removed, added, changed, old_seq, new_seq) -> list:
     return out
 
 
-def self_test(g, templates, allow, pend) -> int:
+def spelling_problems(g, templates, maintfs, allow, pend) -> list:
+    """No credential spelling of g.CRED_SPELLINGS reaches the rewrite report or a stale pending
+    line with a byte of the secret, and the report lists the added line (#5546-#5550)."""
+    bad = []
+    for cls, label, text in g.CRED_SPELLINGS:
+        g.CRED_PIECES.clear()
+        t, _, a, p, _, _ = g.spelling_templates((templates, maintfs, allow, pend), text)
+        _, _, lines, _, _, _ = plan(g, t, a, p)
+        shown = "\n".join(lines)
+        stale = "\n".join(pending_refusals(g, t, a, p + "aws-gpu-burst #4671 | top | " + text.split("\n")[0] + "\n"))
+        if "NEW:" not in shown:
+            bad.append("%s %s: the rewrite report did not list the added line" % (cls, label))
+        for what, out in (("the rewrite report", shown), ("a stale pending line", stale)):
+            if any(n in out for n in g.CRED_NEEDLES):
+                bad.append("%s %s: %s printed a byte of the password" % (cls, label, what))
+    g.CRED_PIECES.clear()
+    return bad
+
+
+def self_test(g, templates, maintfs, allow, pend) -> int:
     """The clean lists give no refusal; a stale pending entry and an unknown tracker each do."""
     first = next(x for x in pend.splitlines() if x and not x.startswith("#"))
     head, rest = first.split(" | ", 1)
@@ -88,10 +107,12 @@ def self_test(g, templates, allow, pend) -> int:
                                          {("aws-gpu-burst", "top"): [leak]}, {("aws-gpu-burst", "top"): ["+" + leak]}))
     if "Bq7Zk" in rep_lines or rep_lines.count("REMOVED") != 1 or rep_lines.count("NEW") != 1 or "CHANGED" not in rep_lines:
         bad.append("the rewrite report printed a password, or lost a line")
+    bad.extend(spelling_problems(g, templates, maintfs, allow, pend))
+    bad.extend(g.print_funnel_problems((g.__file__, __file__)))
     for lbl in bad:
         print("REGEN SELF-TEST FAIL: " + lbl, file=sys.stderr)
     if not bad:
-        print("REGEN SELF-TEST PASS: %d cases" % len(cases))
+        print("REGEN SELF-TEST PASS: %d cases, %d credential spellings kept off the report" % (len(cases), len(g.CRED_SPELLINGS)))
     return 1 if bad else 0
 
 
@@ -168,9 +189,9 @@ def main():
     spec = importlib.util.spec_from_file_location("g", str(root / "scripts/check-cloud-init-serve-flags.py"))
     g = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(g)
-    templates, _, allow, pend = g.load_repo()
+    templates, maintfs, allow, pend = g.load_repo()
     if a.self_test:
-        return self_test(g, templates, allow, pend)
+        return self_test(g, templates, maintfs, allow, pend)
     refusals = pending_refusals(g, templates, allow, pend)
     if refusals:
         print("\n".join(refusals), file=sys.stderr)

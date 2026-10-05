@@ -104,6 +104,7 @@ Usage (any other argument exits 2):
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import fnmatch
 import gzip
@@ -3702,6 +3703,135 @@ def secret_output_problems(base: tuple, known: set) -> list:
     return bad
 
 
+# One synthetic secret, written in every spelling the self-test and the probe script inject into
+# the AWS template (F1 to F5 of PR #4655 round 16, #5546-#5550, and their neighbours). The
+# first field is the finding class, the last the script text; each line is indented by the
+# harness. Each spelling must reach no output (the gate scan, --list-triggers, the regen
+# report) with a byte of CRED_NEEDLES in it.
+CRED_NEEDLES = ("Zk7", "retXY")
+CRED_SPELLINGS = (
+    ('F1', 'concat-single', "PGPASSWORD=abc'Zk7secretXY' psql -h h -c 'select 1'"),
+    ('F1', 'concat-double', 'PGPASSWORD=abc"Zk7secretXY" psql -h h -c \'select 1\''),
+    ('F1', 'quote-then-bare', "PGPASSWORD='ab'Zk7secretXY psql -h h -c x"),
+    ('F1', 'ansi-c', "PGPASSWORD=$'Zk7secretXY' psql -h h -c x"),
+    ('F1', 'default-expansion', 'PGPASSWORD=${PW:-Zk7secretXY} psql -h h -c x'),
+    ('F1', 'export-previous-line', 'export PGPASSWORD=Zk7secretXY\npsql -h h -c x'),
+    ('F1', 'env-prefix', 'env PGPASSWORD=Zk7secretXY psql -h h -c x'),
+    ('F1', 'mixed-case', 'PgPassWord=Zk7secretXY psql -h h -c x'),
+    ('F1', 'lower-case', 'pgpassword=Zk7secretXY psql -h h -c x'),
+    ('F1', 'tab-after', 'PGPASSWORD=Zk7secretXY\tpsql -h h -c x'),
+    ('F1', 'tab-before-value', 'PGPASSWORD=\tZk7secretXY psql -h h -c x'),
+    ('F1', 'here-doc-body', 'psql -h h <<EOF\nhost=h password=Zk7secretXY\nEOF'),
+    ('F1', 'yaml-folded', 'password: >\n  Zk7secretXY'),
+    ('F1', 'yaml-inline', 'password: Zk7secretXY'),
+    ('F1', 'sql-escaped-quote', 'psql -c "ALTER ROLE r PASSWORD \'ab\'\'Zk7secretXY\'"'),
+    ('F1', 'sql-e-string', 'psql -c "ALTER ROLE r PASSWORD E\'ab\\\'Zk7secretXY\'"'),
+    ('F2', 'conninfo-escaped-quote', 'psql "host=h password=\'ab\\\'Zk7secretXY\'" -c x'),
+    ('F2', 'conninfo-escaped-space', 'psql "host=h password=ab\\ Zk7secretXY" -c x'),
+    ('F2', 'conninfo-spaces-around-equals', 'psql "host=h password = \'a b Zk7secretXY\'" -c x'),
+    ('F2', 'conninfo-double-backslash', 'psql "host=h password=\'ab\\\\\'Zk7secretXY\'" -c x'),
+    ('F2', 'query-percent-quote', 'psql "postgres://u@h/d?password=ab%27Zk7secretXY" -c x'),
+    ('F2', 'conninfo-passwd-key', 'psql "host=h passwd=\'ab\\\'Zk7secretXY\'" -c x'),
+    ('F2', 'conninfo-upper-key', 'psql "host=h PASSWORD=\'ab\\\'Zk7secretXY\'" -c x'),
+    ('F3', 'continuation-after-equals', 'PGPASSWORD=\\\nZk7secretXY psql -h h -c x'),
+    ('F3', 'continuation-mid-word', 'PGPASSWORD=Zk7\\\nsecretXY psql -h h -c x'),
+    ('F3', 'continuation-in-double-quotes', 'PGPASSWORD="Zk7\\\nsecretXY" psql -h h -c x'),
+    ('F3', 'continuation-in-single-quotes', "PGPASSWORD='Zk7\\\nsecretXY' psql -h h -c x"),
+    ('F3', 'continuation-conninfo', 'psql "host=h password=Zk7\\\nsecretXY" -c x'),
+    ('F3', 'continuation-before-keyword', 'psql -h h \\\n  PGPASSWORD=Zk7secretXY -c x'),
+    ('F3', 'continuation-url-userinfo', 'psql postgres://u:Zk7\\\nsecretXY@h/d -c x'),
+    ('F3', 'continuation-two-lines', 'PGPASSWORD=Zk7\\\nsec\\\nretXY psql -h h -c x'),
+    ('F4', 'url-userinfo', 'psql postgres://u:Zk7secretXY@h/d -c x'),
+    ('F4', 'url-percent-encoded', 'psql postgres://u:Zk7%73ecretXY@h/d -c x'),
+    ('F4', 'url-at-in-password', 'psql postgres://u:Zk7@secretXY@h/d -c x'),
+    ('F4', 'url-upper-scheme', 'psql POSTGRESQL://u:Zk7secretXY@h/d -c x'),
+    ('F4', 'url-in-double-quotes', 'psql "postgres://u:Zk7secretXY@h/d" -c x'),
+    ('F4', 'url-exported', 'export DATABASE_URL=postgres://u:Zk7secretXY@h/d'),
+    ('F4', 'url-long-prefix', 'psql postgres://u:Zk7secretXY@h/d?application_name=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -c x'),
+    ('F4', 'url-password-key', 'psql "postgres://u@h/d?password=Zk7secretXY" -c x'),
+    ('F5', 'terraform-data-ref', 'PGPASSWORD=data.Zk7secretXY psql -h h -c x'),
+    ('F5', 'terraform-local-ref', 'PGPASSWORD=local.Zk7secretXY psql -h h -c x'),
+    ('F5', 'terraform-var-ref', 'PGPASSWORD=var.Zk7secretXY psql -h h -c x'),
+    ('F5', 'terraform-module-ref', 'PGPASSWORD=module.Zk7secretXY psql -h h -c x'),
+    ('F5', 'placeholder-plus-tail', 'PGPASSWORD=${PW}Zk7secretXY psql -h h -c x'),
+    ('F5', 'command-substitution-literal', 'PGPASSWORD=$(echo Zk7secretXY) psql -h h -c x'),
+    ('F5', 'changeme-plus-tail', 'PGPASSWORD=CHANGEMEZk7secretXY psql -h h -c x'),
+    ('F1', 'crlf-line-end', 'PGPASSWORD=Zk7secretXY\r psql -h h -c x'),
+)
+SPELL_ANCHOR = "      echo \"=== ai-memory postgres+AGE+pgvector provision $(date -u) ===\"\n"
+
+
+def spelling_templates(base: tuple, text: str) -> tuple:
+    """The base inputs with the script text of one spelling added after the provision banner."""
+    body = "".join("      " + x + "\n" for x in text.split("\n"))
+    return case_inputs(base, {"aws": [(SPELL_ANCHOR, SPELL_ANCHOR + body)]})
+
+
+def spelling_outputs(base: tuple, text: str) -> list:
+    """What main() prints for the spelling on its three output paths: the scan (stderr), the
+    --list-triggers listing (stdout) and the exit codes of both. load_repo is stubbed so the
+    real print paths run on the injected templates."""
+    t, mt, a, p, _, _ = spelling_templates(base, text)
+    real = globals()["load_repo"]
+    outs = []
+    try:
+        globals()["load_repo"] = lambda: (t, mt, a, p)
+        for argv, stream in ((["check"], "stderr"), (["check", "--list-triggers"], "stdout")):
+            buf = io.StringIO()
+            with getattr(contextlib, "redirect_" + stream)(buf):
+                rc = main(argv)
+            outs.append((argv[-1], rc, buf.getvalue()))
+    finally:
+        globals()["load_repo"] = real
+        CRED_PIECES.clear()
+    return outs
+
+
+def spelling_problems(base: tuple) -> list:
+    """No spelling in CRED_SPELLINGS puts a byte of the secret on the gate scan or the listing,
+    and the scan refuses each one (#5546-#5550)."""
+    bad = []
+    for cls, label, text in CRED_SPELLINGS:
+        outs = spelling_outputs(base, text)
+        for path, rc, out in outs:
+            if any(n in out for n in CRED_NEEDLES):
+                bad.append("%s %s: %s printed a byte of the password" % (cls, label, path))
+        if outs[0][1] != 1:
+            bad.append("%s %s: the scan exited %r, not 1" % (cls, label, outs[0][1]))
+    return bad
+
+
+def writes_output(call: ast.Call) -> bool:
+    """A call that puts text on stdout or stderr: print, a stream write, or an exit with a message."""
+    f = call.func
+    if isinstance(f, ast.Name) and f.id == "print":
+        return True
+    if isinstance(f, ast.Attribute) and f.attr in ("write", "writelines"):
+        return ast.unparse(f.value) in ("sys.stderr", "sys.stdout", "sys.__stderr__", "sys.__stdout__")
+    if isinstance(f, ast.Attribute) and f.attr == "exit" and ast.unparse(f.value) == "sys":
+        arg = call.args[0] if call.args else None
+        return not (arg is None or (isinstance(arg, ast.Constant) and isinstance(arg.value, int))
+                    or (isinstance(arg, ast.Call) and ast.unparse(arg.func) == "main"))
+    return False
+
+
+def print_funnel_problems(paths: tuple) -> list:
+    """Every print of template or allowlist text goes through say() (#5549): no call that
+    writes output outside the body of say(), in any script of `paths` (a structural check on
+    the parsed source, so a new print path that skips the funnel fails the self-test)."""
+    bad = []
+    for path in paths:
+        tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+        funnel = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "say":
+                funnel.update(id(c) for c in ast.walk(n))
+        for c in ast.walk(tree):
+            if isinstance(c, ast.Call) and id(c) not in funnel and writes_output(c):
+                bad.append("%s:%d writes output outside say()" % (Path(path).name, c.lineno))
+    return sorted(bad)
+
+
 def r5_cache_problems(base: tuple, known: set) -> list:
     """A scan answered from the cache keeps the R5 reason (#5439)."""
     dec = "      systemctl daemon-reload\n"
@@ -3789,6 +3919,8 @@ def self_test(known: set) -> int:
     bad.extend(r5_cache_problems(base, known))
     bad.extend(pin_problems())
     bad.extend(secret_output_problems(base, known))
+    bad.extend(spelling_problems(base))
+    bad.extend(print_funnel_problems((__file__, str(Path(__file__).with_name("regen-cloud-init-token-allow.py")))))
     with contextlib.redirect_stderr(io.StringIO()):
         try:
             build_parser().parse_args(["--bogus"])
