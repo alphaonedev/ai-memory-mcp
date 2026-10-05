@@ -46,7 +46,7 @@ fn reinit_pg_dump_pins_verify_full_and_refuses_before_the_backup_5402() {
     );
     let first_drop = code
         .iter()
-        .find(|(_, l)| l.contains("DROP DATABASE"))
+        .find(|(_, l)| l.contains("psql_postgres -c \"DROP DATABASE"))
         .map(|(i, _)| *i)
         .expect("a DROP DATABASE statement is present");
     assert!(
