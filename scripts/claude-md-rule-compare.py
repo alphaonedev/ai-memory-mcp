@@ -772,107 +772,6 @@ def _self_test_cases() -> int:
             return "parse_plant accepted a probe child that exited non-zero (#5509)"
         if not parse_plant("VERDICT 0 0 1 1 0 -\nPLANTED\n", [], ("-S", "-E")).planted_ran:
             return "parse_plant did not read the planted marker (#5473)"
-        # #5510: nothing may execute above the refusal except `import sys`. The real source must pass; each synthetic
-        # source (mutant M05b and siblings: a dynamic import, an eval, an import in a branch, a class body, a decorator,
-        # a second imported name, a call inside the refusal, a weakened refusal test) must be refused.
-        raw = Path(__file__).read_bytes()
-        source = raw.decode("utf-8")
-
-        def gap(text: str) -> str:
-            return refusal_prefix_gap(text.encode("utf-8"))
-
-        if refusal_prefix_gap(raw):
-            return f"the source has code above the isolation refusal: {refusal_prefix_gap(raw)} (#5510)"
-        marker = "if __name__ == \"__main__\" and not sys.flags.isolated:"
-        before = {"__import__('colorsys')\n", "import json\n", "if False:\n    import json\n", "x = eval('1')\n",
-                  "class C:\n    import json\n", "@(lambda f: f)\ndef g():\n    pass\n", "exec('pass')\n",
-                  "import importlib\nimportlib.import_module('colorsys')\n", "x = 1\n", "from os import path\n"}
-        for inserted in sorted(before):
-            if not gap(source.replace(marker, inserted + marker, 1)):
-                return f"code above the isolation refusal was not refused: {inserted!r} (#5510)"
-        for old, new in (("import sys\n\nif __name__", "import sys, json\n\nif __name__"),
-                         ("import sys\n\nif __name__", "import sys as s\nimport sys\n\nif __name__"),
-                         ("sys.exit(1)", "sys.exit(__import__('colorsys'))"), ("    print(\"## CLAUDE.md rule-change", "    __import__('colorsys')\n    print(\"## CLAUDE.md rule-change"),
-                         ("not sys.flags.isolated:", "not sys.flags.isolated or True:"),
-                         ("import sys\n\nif __name__", "import sys as s\n\nif __name__"), ("sys.exit(1)", "sys.exit(1, **{})"),
-                         ("    sys.exit(1)\n", "    sys.exit(1)\nelse:\n    x = 1\n"), ("not sys.flags.isolated:", "not sys.flags.isolated or __import__('colorsys'):"),
-                         (marker, "if True:"), ("import sys\n\nif __name__", "import sys\n\nx = 1\nif __name__")):
-            if old not in source or not gap(source.replace(old, new, 1)):
-                return f"a changed refusal or import line was not refused: {new!r} (#5510)"
-        if not gap("") or not gap("import sys\n"):
-            return "a source without the refusal was not refused (#5510)"
-        # #5560: the check works on the BYTES and is closed-world about encoding and control bytes. Each source below
-        # was accepted by the text based check of f95e295a0 (the utf-7 spellings even ran hidden code) or only
-        # refused by accident; each must be refused with a stated reason.
-        refusal = 'import sys\nif __name__ == "__main__" and not sys.flags.isolated:\n    print("refused")\n    sys.exit(1)\n'
-        hidden = 'import sys\n#+AAo-print("hidden")\nif __name__ == "__main__" and not sys.flags.isolated:\n    print("refused")\n    sys.exit(1)\n'
-        plain = ('"""doc"""\n' + refusal).encode("utf-8")
-        if refusal_prefix_gap(plain) or refusal_prefix_gap(b"#!/usr/bin/env python3\n# coding: utf-8\n" + plain) \
-                or refusal_prefix_gap(b"# -*- coding: utf8 -*-\n" + plain) or refusal_prefix_gap(b'"""doc"""\r\n' + refusal.encode().replace(b"\n", b"\r\n")):
-            return "a plain utf-8 source (shebang, utf-8 cookie, CRLF) was refused (#5560)"
-        encodings = {
-            "utf-7 cookie on line 1": b"# coding: utf-7\n" + b'"""doc"""\n' + hidden.encode(),
-            "utf-7 cookie on line 2 under a shebang": b"#!/usr/bin/env python3\n# coding: utf-7\n" + b'"""doc"""\n' + hidden.encode(),
-            "utf-16 with BOM": ('"""doc"""\n' + refusal).encode("utf-16"),
-            "utf-8 BOM and a latin-1 cookie": b"\xef\xbb\xbf# coding: latin-1\n" + plain,
-            "utf-8 BOM alone": b"\xef\xbb\xbf" + plain,
-            "vim style utf-7 cookie": b"# vim: set fileencoding=utf-7 :\n" + b'"""doc"""\n' + hidden.encode(),
-            "emacs style utf-7 cookie": b"# -*- coding: utf-7 -*-\n" + b'"""doc"""\n' + hidden.encode(),
-            "latin-1 cookie with a latin-1 byte": b"# coding: latin-1\n" + '"""d\xe9"""\n'.encode("latin-1") + refusal.encode(),
-            "unknown cookie": b"# coding: no-such-codec\n" + plain,
-            "bytes that are not utf-8": b'"""d\xff"""\n' + refusal.encode(),
-            "CR-only line ends": ('"""doc"""\rimport sys\r# note\rimport json\r' + refusal.split("import sys\n", 1)[1]).replace("\n", "\r").encode(),
-            "a lone CR inside a comment": b'"""doc"""\nimport sys\n# note\rimport json\n' + refusal.split("import sys\n", 1)[1].encode(),
-            "form feed": b'"""doc"""\nimport sys\n\x0c\n' + refusal.split("import sys\n", 1)[1].encode(),
-            "NUL": b'"""doc"""\nimport sys\n#\x00\n' + refusal.split("import sys\n", 1)[1].encode(),
-            "vertical tab": b'"""doc"""\nimport sys\n\x0b\n' + refusal.split("import sys\n", 1)[1].encode(),
-            "DEL": b'"""doc"""\nimport sys\n#\x7f\n' + refusal.split("import sys\n", 1)[1].encode(),
-            "line continuation backslash": b'"""doc"""\nimport sys\n\\\n' + refusal.split("import sys\n", 1)[1].encode(),
-            "backslash in the docstring slot": b'"""doc \\\nmore"""\n' + refusal.encode(),
-            "a str instead of bytes": '"""doc"""\n' + refusal,
-        }
-        # The structure check also sees most of these, because ast.parse of the bytes honours the cookie. Each gate is
-        # therefore also pinned on a source that is structurally valid, so no gate is carried by another one.
-        benign = {
-            "a benign utf-7 cookie": b"# coding: utf-7\n" + plain,
-            "a benign utf-7 cookie on line 2 under a shebang": b"#!/usr/bin/env python3\n# coding: utf-7\n" + plain,
-            "a benign vim style cookie": b"# vim: set fileencoding=utf-7 :\n" + plain,
-            "a benign emacs style cookie": b"# -*- coding: utf-7 -*-\n" + plain,
-            "a benign latin-1 cookie": b"# coding: latin-1\n" + plain,
-            "a benign latin-1 cookie on line 2": b"#!/usr/bin/env python3\n# coding: iso-8859-1\n" + plain,
-            "all CR line ends": ('"""doc"""\n' + refusal).replace("\n", "\r").encode("utf-8"),
-            "an invalid utf-8 byte after line 2": b'"""doc"""\n# note\n# \xff\n' + refusal.encode(),
-            "a CRLF line continuation backslash": b'"""doc"""\r\nimport sys\r\n\\\r\n' + refusal.split("import sys\n", 1)[1].replace("\n", "\r\n").encode(),
-        }
-        for byte in [*range(0, 9), 11, 12, *range(14, 32), 127]:
-            benign[f"control byte {byte:#04x} in a comment"] = b'"""doc"""\nimport sys\n#' + bytes([byte]) + b"\n" + refusal.split("import sys\n", 1)[1].encode()
-        for label, data in {**encodings, **benign}.items():
-            if not refusal_prefix_gap(data):
-                return f"a source with {label} was not refused (#5560)"
-        # imported_modules reads the bytes the way the interpreter does: a utf-7 comment that hides an import is seen.
-        hidden_import = base_dir / "hidden-import.py"
-        hidden_import.write_bytes(b"# coding: utf-7\n#+AAo-import colorsys\nimport sys\n")
-        if "colorsys" not in imported_modules(hidden_import):
-            return "imported_modules did not see an import hidden behind a coding cookie (#5560)"
-        # #5562: only a real docstring (a str constant) is stripped from the front. Any other first statement must be
-        # refused, however harmless it looks, so it cannot be mistaken for the docstring.
-        tail = refusal
-        for label, first in (("a call", "__import__('colorsys')\n"), ("a number", "1\n"), ("a bytes literal", "b'doc'\n"),
-                             ("an f-string", "f'{__import__(\"colorsys\")}'\n"), ("a name", "x\n"),
-                             ("a docstring-like call", "str('doc')\n"), ("an ellipsis", "...\n"), ("None", "None\n")):
-            if not gap(first + tail):
-                return f"{label} in the docstring slot was not refused (#5562)"
-        if gap('"""doc"""\n' + tail) or gap(tail):
-            return "a plain docstring or no docstring was refused (#5562)"
-        # #5563: the refusal body may call only print and sys.exit. Each other callable, with constant arguments and
-        # followed by the valid print and sys.exit, must be refused, so the whitelist cannot grow unseen.
-        head = 'import sys\nif __name__ == "__main__" and not sys.flags.isolated:\n'
-        for callee in ("exec", "eval", "compile", "getattr", "setattr", "open", "globals", "vars", "input", "breakpoint",
-                       "type", "os._exit", "sys.exit.__call__", "print.__call__"):
-            if not gap(f'{head}    {callee}("import colorsys")\n    print("refused")\n    sys.exit(1)\n'):
-                return f"a refusal body that calls {callee} was not refused (#5563)"
-        if gap(f'{head}    print("refused")\n    sys.exit(1)\n') or gap(f'{head}    print("a", "b")\n    sys.exit(2)\n'):
-            return "a refusal body of print and sys.exit calls was refused (#5563)"
         names = list(EXPECTED_IMPORTS)  # the probe set is the pin, never the output of imported_modules (#5472)
         if "importlib" not in names:
             return "importlib is not in the plant set"
@@ -952,6 +851,138 @@ def _self_test_cases() -> int:
             return "the probe child's flag report does not follow the flags it was started with (#5473)"
         print(f"INFO: self-test - importlib already loaded without -S: {no_s.preloaded} (measured, not assumed)")
         return ""
+
+    # #5510/#5560/#5562/#5563: the refusal_prefix_gap pins. They are byte-level checks with no child process and no
+    # environment dependence, so each has its own function and its own PASS/FAIL line (#5591); they are not part of
+    # importlib_plant, whose banner and issue tags they would otherwise borrow.
+    raw = Path(__file__).read_bytes()
+    source = raw.decode("utf-8")
+
+    def gap(text: str) -> str:
+        return refusal_prefix_gap(text.encode("utf-8"))
+
+    def pin_sources():
+        refusal = 'import sys\nif __name__ == "__main__" and not sys.flags.isolated:\n    print("refused")\n    sys.exit(1)\n'
+        hidden = 'import sys\n#+AAo-print("hidden")\nif __name__ == "__main__" and not sys.flags.isolated:\n    print("refused")\n    sys.exit(1)\n'
+        plain = ('"""doc"""\n' + refusal).encode("utf-8")
+        return refusal, hidden, plain
+
+    def pin_5510():
+        # #5510: nothing may execute above the refusal except `import sys`. The real source must pass; each synthetic
+        # source (mutant M05b and siblings: a dynamic import, an eval, an import in a branch, a class body, a decorator,
+        # a second imported name, a call inside the refusal, a weakened refusal test) must be refused.
+        if refusal_prefix_gap(raw):
+            return f"the source has code above the isolation refusal: {refusal_prefix_gap(raw)} (#5510)"
+        marker = "if __name__ == \"__main__\" and not sys.flags.isolated:"
+        before = {"__import__('colorsys')\n", "import json\n", "if False:\n    import json\n", "x = eval('1')\n",
+                  "class C:\n    import json\n", "@(lambda f: f)\ndef g():\n    pass\n", "exec('pass')\n",
+                  "import importlib\nimportlib.import_module('colorsys')\n", "x = 1\n", "from os import path\n"}
+        for inserted in sorted(before):
+            if not gap(source.replace(marker, inserted + marker, 1)):
+                return f"code above the isolation refusal was not refused: {inserted!r} (#5510)"
+        for old, new in (("import sys\n\nif __name__", "import sys, json\n\nif __name__"),
+                         ("import sys\n\nif __name__", "import sys as s\nimport sys\n\nif __name__"),
+                         ("sys.exit(1)", "sys.exit(__import__('colorsys'))"), ("    print(\"## CLAUDE.md rule-change", "    __import__('colorsys')\n    print(\"## CLAUDE.md rule-change"),
+                         ("not sys.flags.isolated:", "not sys.flags.isolated or True:"),
+                         ("import sys\n\nif __name__", "import sys as s\n\nif __name__"), ("sys.exit(1)", "sys.exit(1, **{})"),
+                         ("    sys.exit(1)\n", "    sys.exit(1)\nelse:\n    x = 1\n"), ("not sys.flags.isolated:", "not sys.flags.isolated or __import__('colorsys'):"),
+                         (marker, "if True:"), ("import sys\n\nif __name__", "import sys\n\nx = 1\nif __name__")):
+            if old not in source or not gap(source.replace(old, new, 1)):
+                return f"a changed refusal or import line was not refused: {new!r} (#5510)"
+        if not gap("") or not gap("import sys\n"):
+            return "a source without the refusal was not refused (#5510)"
+        return ""
+
+    def pin_5560():
+        # #5560: the check works on the bytes (see below).
+        # #5560: the check works on the BYTES and is closed-world about encoding and control bytes. Each source below
+        # was accepted by the text based check of f95e295a0 (the utf-7 spellings even ran hidden code) or only
+        # refused by accident; each must be refused with a stated reason.
+        refusal, hidden, plain = pin_sources()
+        if refusal_prefix_gap(plain) or refusal_prefix_gap(b"#!/usr/bin/env python3\n# coding: utf-8\n" + plain) \
+                or refusal_prefix_gap(b"# -*- coding: utf8 -*-\n" + plain) or refusal_prefix_gap(b'"""doc"""\r\n' + refusal.encode().replace(b"\n", b"\r\n")):
+            return "a plain utf-8 source (shebang, utf-8 cookie, CRLF) was refused (#5560)"
+        encodings = {
+            "utf-7 cookie on line 1": b"# coding: utf-7\n" + b'"""doc"""\n' + hidden.encode(),
+            "utf-7 cookie on line 2 under a shebang": b"#!/usr/bin/env python3\n# coding: utf-7\n" + b'"""doc"""\n' + hidden.encode(),
+            "utf-16 with BOM": ('"""doc"""\n' + refusal).encode("utf-16"),
+            "utf-8 BOM and a latin-1 cookie": b"\xef\xbb\xbf# coding: latin-1\n" + plain,
+            "utf-8 BOM alone": b"\xef\xbb\xbf" + plain,
+            "vim style utf-7 cookie": b"# vim: set fileencoding=utf-7 :\n" + b'"""doc"""\n' + hidden.encode(),
+            "emacs style utf-7 cookie": b"# -*- coding: utf-7 -*-\n" + b'"""doc"""\n' + hidden.encode(),
+            "latin-1 cookie with a latin-1 byte": b"# coding: latin-1\n" + '"""d\xe9"""\n'.encode("latin-1") + refusal.encode(),
+            "unknown cookie": b"# coding: no-such-codec\n" + plain,
+            "bytes that are not utf-8": b'"""d\xff"""\n' + refusal.encode(),
+            "CR-only line ends": ('"""doc"""\rimport sys\r# note\rimport json\r' + refusal.split("import sys\n", 1)[1]).replace("\n", "\r").encode(),
+            "a lone CR inside a comment": b'"""doc"""\nimport sys\n# note\rimport json\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "form feed": b'"""doc"""\nimport sys\n\x0c\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "NUL": b'"""doc"""\nimport sys\n#\x00\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "vertical tab": b'"""doc"""\nimport sys\n\x0b\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "DEL": b'"""doc"""\nimport sys\n#\x7f\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "line continuation backslash": b'"""doc"""\nimport sys\n\\\n' + refusal.split("import sys\n", 1)[1].encode(),
+            "backslash in the docstring slot": b'"""doc \\\nmore"""\n' + refusal.encode(),
+            "a str instead of bytes": '"""doc"""\n' + refusal,
+        }
+        # The structure check also sees most of these, because ast.parse of the bytes honours the cookie. Each gate is
+        # therefore also pinned on a source that is structurally valid, so no gate is carried by another one.
+        benign = {
+            "a benign utf-7 cookie": b"# coding: utf-7\n" + plain,
+            "a benign utf-7 cookie on line 2 under a shebang": b"#!/usr/bin/env python3\n# coding: utf-7\n" + plain,
+            "a benign vim style cookie": b"# vim: set fileencoding=utf-7 :\n" + plain,
+            "a benign emacs style cookie": b"# -*- coding: utf-7 -*-\n" + plain,
+            "a benign latin-1 cookie": b"# coding: latin-1\n" + plain,
+            "a benign latin-1 cookie on line 2": b"#!/usr/bin/env python3\n# coding: iso-8859-1\n" + plain,
+            "all CR line ends": ('"""doc"""\n' + refusal).replace("\n", "\r").encode("utf-8"),
+            "an invalid utf-8 byte after line 2": b'"""doc"""\n# note\n# \xff\n' + refusal.encode(),
+            "a CRLF line continuation backslash": b'"""doc"""\r\nimport sys\r\n\\\r\n' + refusal.split("import sys\n", 1)[1].replace("\n", "\r\n").encode(),
+        }
+        for byte in [*range(0, 9), 11, 12, *range(14, 32), 127]:
+            benign[f"control byte {byte:#04x} in a comment"] = b'"""doc"""\nimport sys\n#' + bytes([byte]) + b"\n" + refusal.split("import sys\n", 1)[1].encode()
+        for label, data in {**encodings, **benign}.items():
+            if not refusal_prefix_gap(data):
+                return f"a source with {label} was not refused (#5560)"
+        # imported_modules reads the bytes the way the interpreter does: a utf-7 comment that hides an import is seen.
+        hidden_import = base_dir / "hidden-import.py"
+        hidden_import.write_bytes(b"# coding: utf-7\n#+AAo-import colorsys\nimport sys\n")
+        if "colorsys" not in imported_modules(hidden_import):
+            return "imported_modules did not see an import hidden behind a coding cookie (#5560)"
+        return ""
+
+    def pin_5562():
+        # #5562: only a real docstring is stripped from the front.
+        # #5562: only a real docstring (a str constant) is stripped from the front. Any other first statement must be
+        # refused, however harmless it looks, so it cannot be mistaken for the docstring.
+        refusal, hidden, plain = pin_sources()
+        tail = refusal
+        for label, first in (("a call", "__import__('colorsys')\n"), ("a number", "1\n"), ("a bytes literal", "b'doc'\n"),
+                             ("an f-string", "f'{__import__(\"colorsys\")}'\n"), ("a name", "x\n"),
+                             ("a docstring-like call", "str('doc')\n"), ("an ellipsis", "...\n"), ("None", "None\n")):
+            if not gap(first + tail):
+                return f"{label} in the docstring slot was not refused (#5562)"
+        if gap('"""doc"""\n' + tail) or gap(tail):
+            return "a plain docstring or no docstring was refused (#5562)"
+        return ""
+
+    def pin_5563():
+        # #5563: the refusal body may call only print and sys.exit. Each other callable, with constant arguments and
+        # followed by the valid print and sys.exit, must be refused, so the whitelist cannot grow unseen.
+        head = 'import sys\nif __name__ == "__main__" and not sys.flags.isolated:\n'
+        for callee in ("exec", "eval", "compile", "getattr", "setattr", "open", "globals", "vars", "input", "breakpoint",
+                       "type", "os._exit", "sys.exit.__call__", "print.__call__"):
+            if not gap(f'{head}    {callee}("import colorsys")\n    print("refused")\n    sys.exit(1)\n'):
+                return f"a refusal body that calls {callee} was not refused (#5563)"
+        if gap(f'{head}    print("refused")\n    sys.exit(1)\n') or gap(f'{head}    print("a", "b")\n    sys.exit(2)\n'):
+            return "a refusal body of print and sys.exit calls was refused (#5563)"
+        return ""
+
+    refusal_pins = {"#5510": pin_5510, "#5560": pin_5560, "#5562": pin_5562, "#5563": pin_5563}
+    for pin_issue, pin_check in refusal_pins.items():
+        pin_failure = pin_check()
+        if not pin_failure:
+            print(f"PASS: self-test - the refusal_prefix_gap pin {pin_issue} is green")
+        else:
+            failures.append(f"refusal pin {pin_issue}")
+            print(f"FAIL: self-test - the refusal_prefix_gap pin {pin_issue} failed: {pin_failure}", file=sys.stderr)
 
     plant_failure = importlib_plant()
     if not plant_failure:
