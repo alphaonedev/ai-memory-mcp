@@ -1094,28 +1094,41 @@ HISTORY_REMEDY = ("fetch full history (git fetch --unshallow, or actions/checkou
 
 def removed_pending_rows(root: Path) -> Dict[str, str]:
     """text -> short sha of a commit that removed a pending row with that text, over the whole history
-    of the pending list (renames of the list followed). Fail closed (#5299): a shallow clone, a git
-    failure, or a list that exists at HEAD but has no history is a RuntimeError, never an empty answer."""
+    of the pending list (renames of the list followed). Fail closed (#5299, #5463; 5-agent vote 4d3ea1c5,
+    decision memory bf29bdb2): every merge is diffed against each of its parents (-m: a merge, an evil
+    merge and an octopus merge included), side branches are not simplified away (--full-history), replace
+    refs and grafts are ignored. A shallow clone, a git failure, a list that exists at HEAD but has no
+    history, or a committed row that no scanned commit ever added (history this scan cannot follow) is a
+    RuntimeError, never an empty answer."""
     if _git(root, "rev-parse", "--is-shallow-repository").strip() != "false":
         raise RuntimeError("the history of %s is incomplete (shallow clone): %s" % (PENDING_FILE, HISTORY_REMEDY))
     try:
-        log = _git(root, "log", "--follow", "-M", "-p", "-U0", "--no-color", "--format=commit %h", "--",
-                   PENDING_FILE)
+        log = _git(root, "--no-replace-objects", "log", "--follow", "-M", "-m", "--full-history", "-p", "-U0",
+                   "--no-color", "--no-ext-diff", "--no-textconv", "--format=commit %h", "--", PENDING_FILE)
+        at_head = _show_or_absent(root, "HEAD", PENDING_FILE)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError("cannot read the history of %s (%s): %s" % (
             PENDING_FILE, exc.stderr.decode("utf-8", "replace").strip()[:120], HISTORY_REMEDY))
     gone: Dict[str, str] = {}
+    added = set()
     sha = ""
     commits = 0
     for raw in log.split("\n"):
         if raw.startswith("commit "):
             sha, commits = raw[7:].strip(), commits + 1
-        elif raw.startswith("-#"):
+        elif raw[:2] in ("-#", "+#"):
             parts = raw[1:].split(" | ", 3)
             if len(parts) == 4 and parts[3] == norm(parts[3]):
-                gone.setdefault(parts[3], sha)
+                if raw[0] == "-":
+                    gone.setdefault(parts[3], sha)
+                else:
+                    added.add(parts[3])
     if commits == 0 and (root / PENDING_FILE).is_file():
         raise RuntimeError("the history of %s is empty although the file exists: %s" % (PENDING_FILE, HISTORY_REMEDY))
+    unseen = sorted(r[3] for r in parse_entries(at_head, "head-pending", True, []) if r[3] not in added)
+    if unseen:
+        raise RuntimeError("the history of %s cannot be followed: no commit added the row %r: %s" % (
+            PENDING_FILE, unseen[0][:60], HISTORY_REMEDY))
     return gone
 
 
@@ -2043,6 +2056,140 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
     return bad, cases[0]
 
 
+def _history_cases(t: Path) -> Tuple[List[str], int]:
+    """removed_pending_rows on synthetic histories (#5299, #5463): a pending row removed by a linear
+    commit, by a merge (against either parent, an evil merge, an octopus merge), behind a revert pair or
+    behind a replace ref is named; a row that stays is not; history the scan cannot follow is a fault."""
+    gone_row, kept_row = "export SERVICE_PASSWORD", "export KEPT_TOKEN"
+    bad: List[str] = []
+    n = 0
+
+    def git(repo: Path, *a: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), "-c", "user.name=self-test", "-c",
+                               "user.email=self-test@invalid", "-c", "commit.gpgsign=false"] + list(a),
+                              check=True, capture_output=True).stdout.decode("utf-8", "replace")
+
+    def put(repo: Path, rel: str, text: str) -> None:
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(text)
+
+    def rows(repo: Path, *texts: str) -> None:
+        put(repo, PENDING_FILE, "".join("#1 | a.sh | 1 | %s\n" % x for x in texts))
+
+    def commit(repo: Path, msg: str) -> None:
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", msg)
+
+    def fresh(name: str) -> Path:
+        repo = t / name
+        repo.mkdir(parents=True)
+        git(repo, "init", "-q", "-b", "develop")
+        rows(repo, gone_row, kept_row)
+        commit(repo, "the list")
+        return repo
+
+    def diverge(repo: Path, tag: str) -> None:
+        put(repo, "n-%s.txt" % tag, "x\n")
+        commit(repo, "diverge " + tag)
+
+    def drop(repo: Path) -> None:
+        rows(repo, kept_row)
+
+    def judge_repo(label: str, repo: Path, want_gone: bool = True) -> None:
+        nonlocal n
+        n += 1
+        try:
+            found = removed_pending_rows(repo)
+        except RuntimeError as exc:
+            bad.append("the history scan faulted on %s: %s" % (label, exc))
+            return
+        if (gone_row in found) != want_gone or kept_row in found:
+            bad.append("the history scan %s for %s (%s)" % (
+                "missed the removed row" if want_gone else "named a row that stayed", label, sorted(found)))
+
+    repo = fresh("linear")
+    drop(repo)
+    commit(repo, "remove")
+    judge_repo("a linear removal", repo)
+    repo = fresh("keep")
+    diverge(repo, "keep")
+    judge_repo("a list that never lost a row", repo, False)
+    # an evil merge: both parents carry the row and the merge drops it (#5463)
+    repo = fresh("evil")
+    git(repo, "checkout", "-q", "-b", "side")
+    diverge(repo, "side")
+    git(repo, "checkout", "-q", "develop")
+    diverge(repo, "dev")
+    git(repo, "merge", "-q", "--no-ff", "--no-commit", "side")
+    drop(repo)
+    commit(repo, "evil merge")
+    judge_repo("a row dropped in an evil merge", repo)
+    # a clean merge that brings in a removal made on the other parent (#5463)
+    repo = fresh("clean-side")
+    git(repo, "checkout", "-q", "-b", "side")
+    drop(repo)
+    commit(repo, "side removes")
+    git(repo, "checkout", "-q", "develop")
+    diverge(repo, "dev")
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    judge_repo("a removal merged from the second parent", repo)
+    # ... and a removal made on the first parent while the second parent still carries the row
+    repo = fresh("clean-first")
+    git(repo, "checkout", "-q", "-b", "side")
+    diverge(repo, "side")
+    git(repo, "checkout", "-q", "develop")
+    drop(repo)
+    commit(repo, "develop removes")
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    judge_repo("a removal on the first parent of a merge", repo)
+    # an octopus merge that drops the row (#5463)
+    repo = fresh("octopus")
+    for b in ("s1", "s2"):
+        git(repo, "checkout", "-q", "-b", b, "develop")
+        diverge(repo, b)
+    git(repo, "checkout", "-q", "develop")
+    diverge(repo, "dev")
+    git(repo, "merge", "-q", "-s", "octopus", "--no-commit", "s1", "s2")
+    drop(repo)
+    commit(repo, "octopus drops the row")
+    judge_repo("a row dropped in an octopus merge", repo)
+    # a removal and its revert on a side branch: the merge is identical to its first parent for the list (#5463)
+    repo = fresh("revert-pair")
+    git(repo, "checkout", "-q", "-b", "side")
+    drop(repo)
+    commit(repo, "side removes")
+    git(repo, "revert", "--no-edit", "HEAD")
+    git(repo, "checkout", "-q", "develop")
+    diverge(repo, "dev")
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    judge_repo("a removal behind a revert pair", repo)
+    # a replace ref that hides the removing commit from every default git view (#5463)
+    repo = fresh("replace")
+    drop(repo)
+    commit(repo, "remove")
+    git(repo, "replace", "HEAD", "HEAD~1")
+    judge_repo("a removal hidden behind a replace ref", repo)
+    # history the scan cannot follow is a fault: a committed row no scanned commit added (#5463)
+    repo = fresh("unfollowable")
+    n += 1
+    real_git = globals()["_git"]
+
+    def blind_git(r: Path, *a: str) -> str:
+        out = real_git(r, *a)
+        return "\n".join(x for x in out.split("\n") if not x.startswith("+#")) if "log" in a else out
+
+    globals()["_git"] = blind_git
+    try:
+        removed_pending_rows(repo)
+        bad.append("a committed row that no scanned commit added was an answer, not a fault (#5463)")
+    except RuntimeError as exc:
+        if "cannot be followed" not in str(exc):
+            bad.append("an unfollowable history faulted with the wrong message (%s)" % exc)
+    finally:
+        globals()["_git"] = real_git
+    return bad, n
+
+
 def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
     """Fail-closed cases of the gate itself (#4901, #4909, #4919, #4920, #4922). Returns
     (failures, case count)."""
@@ -2209,7 +2356,11 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
     with tempfile.TemporaryDirectory(dir=str(scratch)) as td:
         wb, wn = _run_wiring_cases(root, Path(td))
     bad.extend(wb)
-    return bad, n + wn
+    # the history scan on merge, revert and replace-ref histories (#5299, #5463)
+    with tempfile.TemporaryDirectory(dir=str(scratch)) as td:
+        hb, hn = _history_cases(Path(td))
+    bad.extend(hb)
+    return bad, n + wn + hn
 
 
 def self_test(root: Path) -> int:
