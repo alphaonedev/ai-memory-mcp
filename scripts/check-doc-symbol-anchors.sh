@@ -453,6 +453,35 @@ MDEOF
     anchor_red 5394 QUAL "a missing method after mixed entity and angle generics" \
         "See \`$R::RecallTool&lt;Vec<T>&gt;::no_such\`."
 
+    # #5393: a generic group that never balances captures to the end of its
+    # token and is REPORTED (it used to fall off the capture, skipping every
+    # component behind it). Every component below is live, so only the
+    # unbalanced-group rule can make these red.
+    anchor_red 5393 QUAL "an unbalanced generic group before a live method" \
+        "See \`$R::RecallTool<T::decorate_memory_many\`."
+    anchor_red 5393 BARE_QUAL "an unbackticked unbalanced generic group before a live method" \
+        "See $R::RecallTool<T::decorate_memory_many here."
+    anchor_red 5393 QUAL "an unbalanced outer group around a balanced inner group" \
+        "See \`$R::RecallTool<Vec<T>::decorate_memory_many\`."
+    anchor_red 5393 QUAL "an unbalanced HTML-entity generic group" \
+        "See \`$R::RecallTool&lt;T::decorate_memory_many\`."
+    anchor_red 5393 QUAL "an unbalanced leading <Type as Trait> group" \
+        "See \`$R::<RecallTool as Trait::decorate_memory_many\`."
+    anchor_red 5393 QUAL "an unbalanced turbofish group" \
+        "See \`$R::RecallTool::<T::decorate_memory_many\`."
+    anchor_red 5393 QUAL "a lone trailing angle bracket after a live type" \
+        "See \`$R::RecallTool<\`."
+    anchor_red 5393 QUAL "a brace item with an unbalanced generic group" \
+        "See \`$R::{RecallTool<T, decorate_memory_many}\`."
+    anchor_red 5393 QUAL "an unbalanced group after a balanced one on a live method" \
+        "See \`$R::RecallTool<T>::decorate_memory_many<U\`."
+    anchor_green 5393 "a balanced group before a live method" \
+        "See \`$R::RecallTool<T>::decorate_memory_many\`."
+    anchor_green 5393 "a placeholder group with no path behind it is not a symbol claim" \
+        "See \`$R::<name>\`."
+    anchor_green 5393 "a live symbol followed by an unrelated less-than in prose" \
+        "See \`$R::RecallTool\` when a < b holds."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
@@ -1071,15 +1100,27 @@ def _opens_group(text, i):
     return text.startswith("<", i) or text.startswith("&lt;", i)
 
 
+def _token_end(text, i):
+    """End of the whitespace- and backtick-delimited token containing `i`."""
+    j = i
+    while j < len(text) and not text[j].isspace() and text[j] != "`":
+        j += 1
+    return j
+
+
 def scan_sym(text, i):
     """Scan the symbol path starting at `i`; returns its end index, or None
     when no symbol starts there. Path components are identifiers, each with an
     optional balanced group, joined by `::` (a bare group after `::` is a
-    turbofish), after an optional leading `<Type as Trait>::`."""
+    turbofish), after an optional leading `<Type as Trait>::`. A group that
+    never balances captures to the end of the token (#5393), so the caller
+    reports it instead of skipping the components behind it."""
     pos = i
     if _opens_group(text, pos):
         end = scan_group(text, pos)
-        if end is None or not text.startswith("::", end):
+        if end is None:
+            return _token_end(text, pos)
+        if not text.startswith("::", end):
             return None
         pos = end + 2
     m = ID_RE.match(text, pos)
@@ -1090,7 +1131,7 @@ def scan_sym(text, i):
         if _opens_group(text, pos):
             end = scan_group(text, pos)
             if end is None:
-                return pos
+                return _token_end(text, pos)
             pos = end
         if not text.startswith("::", pos):
             return pos
@@ -1100,7 +1141,7 @@ def scan_sym(text, i):
         elif _opens_group(text, pos + 2):
             end = scan_group(text, pos + 2)
             if end is None:
-                return pos
+                return _token_end(text, pos + 2)
             pos = end
         else:
             return pos
