@@ -1996,6 +1996,11 @@ ROUND3_RED = [
     ('5636 closed world: reported 3: an operand that follows a password command word is a credential', 'mysqladmin old-password "$X"'),
     ('5636 closed world: reported 4: an operand that follows a password command word is a credential', 'mariadb-admin pass "$X"'),
     ('5636 closed world: reported 5: an operand that follows a password command word is a credential', 'mysqladmin -u root password "new-${SUFFIX}"'),
+    ('5637 closed world: reported 1: the value of -e, --execute and --init-command is not read as safe', 'mysql -e "ALTER USER x IDENTIFIED BY \'$P\'"'),
+    ('5637 closed world: reported 2: the value of -e, --execute and --init-command is not read as safe', 'mysql --execute="SET PASSWORD=\'$P\'" db'),
+    ('5637 closed world: reported 3: the value of -e, --execute and --init-command is not read as safe', 'mysql --init-command="SET PASSWORD=\'$P\'" db'),
+    ('5637 closed world: reported 4: the value of -e, --execute and --init-command is not read as safe', 'mysql -e"SELECT \'$P\'"'),
+    ('5637 closed world: reported 5: the value of -e, --execute and --init-command is not read as safe', 'mysql -u r -e "CREATE USER y IDENTIFIED BY \'${PW}\'" db'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
@@ -2037,6 +2042,9 @@ ROUND3_GREEN = [
     ('5636 closed world: clean 1: an operand that follows a password command word is a credential', 'mysqladmin -u root status'),
     ('5636 closed world: clean 2: an operand that follows a password command word is a credential', 'mysqladmin ping -h "$H"'),
     ('5636 closed world: clean 3: an operand that follows a password command word is a credential', 'mysqladmin -h "$H" -- status'),
+    ('5637 closed world: clean 1: the value of -e, --execute and --init-command is not read as safe', 'mysql -e "SELECT 1" db'),
+    ('5637 closed world: clean 2: the value of -e, --execute and --init-command is not read as safe', "mysql --execute='SELECT 1' db"),
+    ('5637 closed world: clean 3: the value of -e, --execute and --init-command is not read as safe', 'mysql -u "$U" -e "SHOW TABLES" db'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
