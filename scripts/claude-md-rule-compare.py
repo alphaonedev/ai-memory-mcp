@@ -908,7 +908,6 @@ def _self_test_cases() -> int:
         return ""
 
     def pin_5560():
-        # #5560: the check works on the bytes (see below).
         # #5560: the check works on the BYTES and is closed-world about encoding and control bytes. Each source below
         # was accepted by the text based check of f95e295a0 (the utf-7 spellings even ran hidden code) or only
         # refused by accident; each must be refused with a stated reason.
@@ -963,7 +962,6 @@ def _self_test_cases() -> int:
         return ""
 
     def pin_5562():
-        # #5562: only a real docstring is stripped from the front.
         # #5562: only a real docstring (a str constant) is stripped from the front. Any other first statement must be
         # refused, however harmless it looks, so it cannot be mistaken for the docstring.
         refusal, hidden, plain = pin_sources()
