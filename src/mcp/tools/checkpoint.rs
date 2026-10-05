@@ -205,15 +205,20 @@ pub fn handle_checkpoint_resolve(
             )
         })
         .ok_or_else(|| "state must be one of: resolved, rejected".to_string())?;
-    let resolved_by_raw = crate::mcp::param_guard::require_str(params, param_names::RESOLVED_BY)?;
-    // #3368 — shape-validate (and, under the multi-tenant posture, bind to the
-    // enforced caller) the resolver BEFORE any lookup, state change or audit
-    // emit, via the SAME funnel the create path uses for `created_by` (#2998 /
-    // #3363). Pre-#3368 a control-character value (`"ai:x\nINJECTED"`) reached
-    // the persisted row, the signed audit row and the log line (the #3009
-    // vector, closed for `claimed_by`). Fail closed: any refusal returns here.
-    let resolved_by_owned = crate::coordination_guard::resolve_actor(Some(resolved_by_raw))?;
-    let resolved_by = resolved_by_owned.as_str();
+    let resolved_by = crate::mcp::param_guard::require_str(params, param_names::RESOLVED_BY)?;
+    // #3368 — shape-validate the resolver BEFORE any lookup, state change or
+    // audit emit. Pre-#3368 a control-character value (`"ai:x\nINJECTED"`)
+    // reached the persisted row, the signed audit row and the log line (the
+    // #3009 vector, closed for `claimed_by`). SHAPE ONLY, never a caller
+    // binding: on the `epoch_advance` lane `resolved_by` is the OPERATOR,
+    // authenticated by its detached signature against its enrolled key (the
+    // #3007 gate below), so it legitimately differs from the node's own
+    // `AI_MEMORY_AGENT_ID`; binding it here refused a valid operator-signed
+    // resolve (the regression pinned by
+    // `epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007_3368`). Same shape-only precedent as
+    // `claimed_by` (#3009). Fail closed: any refusal returns here.
+    crate::validate::validate_agent_id(resolved_by)
+        .map_err(|e| format!("invalid agent_id: {e}"))?;
     let resolution = params.get(param_names::RESOLUTION).and_then(Value::as_str);
     let resolution_note = params
         .get(param_names::RESOLUTION_NOTE)
@@ -1188,9 +1193,9 @@ mod handler_tests {
     /// `resolved_by`'s enrolled operator key is accepted + signed (verify:true),
     /// attested to the operator (PeerAttested), never the daemon.
     #[test]
-    fn epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007() {
+    fn epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007_3368() {
         if crate::config::run_env_isolated_child_or_spawn(
-            "mcp::checkpoint::handler_tests::epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007",
+            "mcp::checkpoint::handler_tests::epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007_3368",
         ) {
             return;
         }
@@ -1205,60 +1210,72 @@ mod handler_tests {
             std::env::set_var(crate::identity::keypair::KEY_DIR_ENV, key_dir.path());
         }
 
-        let (conn, id, ns) = fresh_epoch_anchor();
-
         // Enroll the operator key (full keypair) so `lookup_peer_public_key`
         // finds its public half in the key dir; keep the in-memory handle to
         // sign with.
         let operator = crate::identity::keypair::generate("operator-x").expect("op key");
         crate::identity::keypair::save(&operator, key_dir.path()).expect("enroll operator key");
 
-        // Sign the EXACT canonical resolution bytes the handler will re-derive:
-        // reuse `SignableCheckpointResolution` + `sign_checkpoint_resolution`.
-        use base64::Engine as _;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let signed_at: i64 = 1_800_000_000;
-        let signable = crate::identity::sign::SignableCheckpointResolution {
-            checkpoint_id: &id,
-            namespace: &ns,
-            state: "resolved",
-            resolved_by: "operator-x",
-            resolution: Some("approved"),
-            resolved_at: signed_at,
-        };
-        let sig = crate::identity::sign::sign_checkpoint_resolution(&operator, &signable)
-            .expect("operator signs");
-        let sig_b64 = URL_SAFE_NO_PAD.encode(&sig);
+        // #3368 — run the SAME operator-signed resolve under each enforced-caller
+        // posture. The operator (`resolved_by`) is authenticated by its detached
+        // signature, so it must be accepted whether the node has no enforced
+        // caller (`None`) or runs as a DIFFERENT principal (`ai:node`): the
+        // shape check on `resolved_by` must never bind it to the caller. The
+        // override is scoped to the resolve call only (the anchor is created
+        // as `attacker` before it, which a bound caller would refuse).
+        for caller in [None, Some("ai:node")] {
+            let (conn, id, ns) = fresh_epoch_anchor();
+            // Sign the EXACT canonical resolution bytes the handler will re-derive:
+            // reuse `SignableCheckpointResolution` + `sign_checkpoint_resolution`.
+            use base64::Engine as _;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let signed_at: i64 = 1_800_000_000;
+            let signable = crate::identity::sign::SignableCheckpointResolution {
+                checkpoint_id: &id,
+                namespace: &ns,
+                state: "resolved",
+                resolved_by: "operator-x",
+                resolution: Some("approved"),
+                resolved_at: signed_at,
+            };
+            let sig = crate::identity::sign::sign_checkpoint_resolution(&operator, &signable)
+                .expect("operator signs");
+            let sig_b64 = URL_SAFE_NO_PAD.encode(&sig);
 
-        // A daemon key is ALSO available — the gate must sign with the OPERATOR
-        // attestation, not the daemon key.
-        let daemon_kp = crate::identity::keypair::generate("daemon").expect("daemon key");
-        let out = handle_checkpoint_resolve(
-            &conn,
-            &json!({ "id": id, "state": "resolved", "resolved_by": "operator-x",
-                     "resolution": "approved", "resolved_at": signed_at,
-                     "signature": sig_b64 }),
-            Some(&daemon_kp),
-        )
-        .expect("resolve ok");
-        assert_eq!(
-            out["attest_level"].as_str(),
-            Some(crate::models::AttestLevel::PeerAttested.as_str()),
-            "an enrolled-operator-signed epoch_advance resolution is operator-attested"
-        );
-        let stored = crate::checkpoints::get(&conn, &id)
-            .expect("get")
-            .expect("row");
-        assert!(!stored.signature.is_empty(), "operator signature persisted");
-        assert_eq!(
-            stored.resolver_pubkey,
-            operator.public.to_bytes().to_vec(),
-            "attested under the OPERATOR's enrolled key, never the daemon key"
-        );
-        assert!(
-            crate::checkpoints::verify(&stored),
-            "the operator-attested freeze anchor must verify"
-        );
+            // A daemon key is ALSO available — the gate must sign with the OPERATOR
+            // attestation, not the daemon key.
+            let daemon_kp = crate::identity::keypair::generate("daemon").expect("daemon key");
+            let _caller = match caller {
+                Some(c) => crate::identity::test_agent_id::AgentIdOverride::set(c),
+                None => crate::identity::test_agent_id::AgentIdOverride::unset(),
+            };
+            let out = handle_checkpoint_resolve(
+                &conn,
+                &json!({ "id": id, "state": "resolved", "resolved_by": "operator-x",
+                         "resolution": "approved", "resolved_at": signed_at,
+                         "signature": sig_b64 }),
+                Some(&daemon_kp),
+            )
+            .expect("resolve ok");
+            assert_eq!(
+                out["attest_level"].as_str(),
+                Some(crate::models::AttestLevel::PeerAttested.as_str()),
+                "an enrolled-operator-signed epoch_advance resolution is operator-attested"
+            );
+            let stored = crate::checkpoints::get(&conn, &id)
+                .expect("get")
+                .expect("row");
+            assert!(!stored.signature.is_empty(), "operator signature persisted");
+            assert_eq!(
+                stored.resolver_pubkey,
+                operator.public.to_bytes().to_vec(),
+                "attested under the OPERATOR's enrolled key, never the daemon key"
+            );
+            assert!(
+                crate::checkpoints::verify(&stored),
+                "the operator-attested freeze anchor must verify"
+            );
+        }
 
         unsafe {
             std::env::remove_var(
