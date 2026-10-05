@@ -26,7 +26,8 @@ START STATE. Before it imports anything but sys, the program refuses to run (one
 "run.py: REFUSED: <reasons>" line on stderr, exit 78) unless the interpreter was started
 isolated (-I) on a script file: no -c, -m or stdin entry, no -i, -O, -v, -b, -d, -x, -W or -X
 option other than -X frozen_modules=on|off, no trace, profile or monitoring hook, no global,
-module, import hook or builtin that a plain start does not have, and no LD_* or DYLD_*
+module or import hook that a plain start does not have, none of 23 builtin functions and 10 core types replaced (the
+exception classes, enumerate, range and super are the names it uses that are not checked), and no LD_* or DYLD_*
 variable. A start with -I but without -S re-executes itself once with -I -S, so the program
 runs in a process where no .pth file or sitecustomize of the installation ran; where that site
 code already replaced a sys hook (Ubuntu's apport replaces sys.excepthook) the start is refused
@@ -62,12 +63,20 @@ _LAB_START_GLOBALS = (
     "__builtins__", "__file__", "__cached__", "sys", "_LAB_REFUSED_RC",
     "_LAB_ALLOWED_OPTION_LETTERS", "_LAB_ALLOWED_XOPTIONS", "_LAB_REQUIRED_FLAGS",
     "_LAB_TOLERATED_FLAGS", "_LAB_STRUCTSEQ_ATTRS", "_LAB_START_GLOBALS", "_LAB_BUILTIN_NAMES",
+    "_LAB_CORE_TYPE_NAMES", "_LAB_UNCHECKED_BUILTINS",
     "_lab_refuse", "_lab_flag_reasons", "_lab_ctypes_argv", "_lab_orig_argv", "_lab_argv_reasons", "_lab_entry_reasons",
     "_lab_hook_reasons", "_lab_world_reasons", "_lab_start_state",
 )
 _LAB_BUILTIN_NAMES = (
     "open", "__import__", "len", "print", "isinstance", "getattr", "hasattr", "repr", "sorted",
-    "compile", "exec", "eval", "dir", "iter", "next", "globals", "setattr", "id", "min", "max",
+    "compile", "exec", "eval", "dir", "iter", "next", "globals", "setattr", "id", "min", "max", "abs", "all", "any",
+)
+# The core types, compared by identity with the class of a literal (no name lookup can forge a literal's class).
+_LAB_CORE_TYPE_NAMES = ("str", "int", "float", "bool", "bytes", "list", "dict", "set", "tuple", "type")
+# Builtins the program names that are NOT identity-checked: exception classes and three constructors.
+_LAB_UNCHECKED_BUILTINS = (
+    "BaseException", "ConnectionRefusedError", "Exception", "OSError", "ProcessLookupError", "RecursionError",
+    "RuntimeError", "SystemExit", "TypeError", "ValueError", "enumerate", "range", "super",
 )
 
 
@@ -199,7 +208,7 @@ def _lab_entry_reasons(names):
 
 
 def _lab_hook_reasons():
-    """Trace, profile and monitoring hooks, the sys hooks, loader variables and the builtins the program calls."""
+    """Trace, profile and monitoring hooks, the sys hooks, loader variables, builtin functions and core types."""
     reasons = []
     if sys.gettrace() is not None or sys.getprofile() is not None:
         reasons.append("a trace or profile hook is set")
@@ -226,6 +235,12 @@ def _lab_hook_reasons():
         owner = io_mod if name == "open" else bi
         if (type(obj).__name__ != "builtin_function_or_method" or getattr(obj, "__name__", None) != name
                 or getattr(obj, "__self__", None) is not owner):
+            reasons.append("builtin %s replaced" % name)
+    literals = (("str", ""), ("int", 0), ("float", 1.0), ("bool", True), ("bytes", b""), ("list", []),
+                ("dict", {}), ("set", {1}), ("tuple", ()), ("type", 0))
+    for name, literal in literals:
+        want = literal.__class__.__class__ if name == "type" else literal.__class__
+        if getattr(bi, name, None) is not want:
             reasons.append("builtin %s replaced" % name)
     return reasons
 
@@ -2626,6 +2641,16 @@ def selftest_start_state(T, base):
     T.leg("5908: the ctypes command-line reader (Python 3.9 path) agrees with sys.orig_argv",
           ctypes_now == list(orig_now) if orig_now is not None else ctypes_now is not None and len(ctypes_now) >= 1, True,
           "%r vs %r" % (ctypes_now, orig_now))
+    import ast
+    tree = ast.parse(source.decode("utf-8"))
+    named = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and hasattr(__import__("builtins"), n.id)}
+    local = {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+    local |= {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    local |= {n.arg for n in ast.walk(tree) if isinstance(n, ast.arg)}
+    checked = set(_LAB_BUILTIN_NAMES) | set(_LAB_CORE_TYPE_NAMES)
+    listed = checked | set(_LAB_UNCHECKED_BUILTINS) | {"__name__"}
+    T.leg("5941: every builtin name run.py uses is identity-checked or named in the unchecked list",
+          (sorted(named - local - listed), sorted(checked & set(_LAB_UNCHECKED_BUILTINS))), ([], []))
     drivers = (
         ("bar-b: a driver that replaces open before running the file is refused",
          "import builtins, runpy, sys\nreal = builtins.open\nbuiltins.open = lambda *a, **k: real(*a, **k)\n"
@@ -2660,6 +2685,12 @@ def selftest_start_state(T, base):
         ("5908: a command line that cannot be read (no sys.orig_argv, ctypes unusable) is refused",
          "import runpy, sys\nif hasattr(sys, 'orig_argv'):\n    del sys.orig_argv\nsys.modules['ctypes'] = None\n"
          "sys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n", "command line cannot be read"),
+        ("5941: a driver that replaces the builtin all is refused",
+         "import builtins, runpy, sys\nbuiltins.all = lambda *a: True\nsys.argv = [%r, '--help']\n"
+         "runpy.run_path(%r, run_name='__main__')\n", "builtin all replaced"),
+        ("5941: a driver that replaces the builtin float is refused",
+         "import builtins, runpy, sys\nreal = builtins.float\nbuiltins.float = lambda *a: real(*a)\nsys.argv = [%r, '--help']\n"
+         "runpy.run_path(%r, run_name='__main__')\n", "builtin float replaced"),
         ("start state: a trace hook set before the file runs is refused",
          "import runpy, sys\nsys.settrace(lambda *a: None)\nsys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n",
          "trace or profile hook"),
@@ -2686,15 +2717,15 @@ def selftest_start_state(T, base):
              "runpy.run_path(%r, run_name='__main__')\n", "sys.monitoring tool is registered"),)
     names = "[" + ", ".join(repr(n) for n in _LAB_BUILTIN_NAMES) + "]"
     drivers += (
-        ("start state: each of the twenty builtins run.py calls (open, __import__ and eighteen more) is refused when "
+        ("start state: each of the 23 checked builtin functions (open, __import__ and 21 more) is refused when "
          "replaced",
          "import builtins, runpy, sys\nreal_dir = builtins.dir\nfor n in " + names + ":\n    f = getattr(builtins, n)\n"
          "    setattr(builtins, n, (lambda g: lambda *a, **k: g(*a, **k))(f))\n"
          "builtins.globals = lambda: sys._getframe(1).f_globals\n"
          "builtins.dir = lambda *a: real_dir(*a) if a else sorted(sys._getframe(1).f_locals)\n"
          "sys.argv = [%r, '--help']\nrunpy.run_path(%r, run_name='__main__')\n",
-         "; ".join("builtin %s replaced" % n for n in _LAB_BUILTIN_NAMES) if len(_LAB_BUILTIN_NAMES) == 20
-         else "twenty names, not %d" % len(_LAB_BUILTIN_NAMES)),)
+         "; ".join("builtin %s replaced" % n for n in _LAB_BUILTIN_NAMES) if len(_LAB_BUILTIN_NAMES) == 23
+         else "23 names, not %d" % len(_LAB_BUILTIN_NAMES)),)
     for i, (label, body, why) in enumerate(drivers):
         driver = os.path.join(base, "driver-%d.py" % i)
         _write(driver, body % (copy, copy))
