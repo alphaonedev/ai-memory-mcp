@@ -1974,6 +1974,12 @@ ROUND3_RED = [
     ("5582 mysql --loose_pager is not --password (closed world: reported)", 'mysql --loose_pager="$PAGER_CMD" db'),
     ("5502 mysqldump --pass-file is not --pass (closed world: reported)", 'mysqldump --pass-file="$PW_FILE" db'),
     ("5502 mariadb-dump --loose-password-file is not --password (closed world: reported)", 'mariadb-dump --loose-password-file="$PW_FILE" db'),
+    ('5630 closed world: reported 1: short clusters ending in -p are read letter by letter', 'mysqldump -uroot -hdb -Bp"$DB_PASSWORD" db'),
+    ('5630 closed world: reported 2: short clusters ending in -p are read letter by letter', 'mysql -sp$P'),
+    ('5630 closed world: reported 3: short clusters ending in -p are read letter by letter', 'mysql -sp"$P" db'),
+    ('5630 closed world: reported 4: short clusters ending in -p are read letter by letter', 'mysql -vvp"$P" db'),
+    ('5630 closed world: reported 5: short clusters ending in -p are read letter by letter', 'mysql -Bsp"${DB_PASSWORD}"'),
+    ('5630 closed world: reported 6: short clusters ending in -p are read letter by letter', 'mysqlcheck -Aqp"$X"'),
 ]
 ROUND3_GREEN = [
     ("5583 mysqlpump --parallel-schemas is not --password", 'mysqlpump --parallel-schemas="$SCHEMA_LIST"'),
@@ -2000,6 +2006,10 @@ ROUND3_GREEN = [
     ("curl -sH non-credential header", 'curl -sH "X-Request-Id: $REQ_ID" h'),
     ("sort -u after curl", 'curl -o "$OUT" h && sort -u "$TOKEN_FILE"'),
     ("curl --cert-type is not --cert", 'curl --cert-type=P12:$CERT_TYPE -o "$TOKEN_FILE" h'),
+    ('5630 closed world: clean 1: short clusters ending in -p are read letter by letter', 'mysql -hp$P db'),
+    ('5630 closed world: clean 2: short clusters ending in -p are read letter by letter', 'mysql -sh"$H" db'),
+    ('5630 closed world: clean 3: short clusters ending in -p are read letter by letter', 'mysql -u"$U" -h"$H" db'),
+    ('5630 closed world: clean 4: short clusters ending in -p are read letter by letter', 'mysql -Bs db'),
 ]
 # Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
 ROUND3_DOCKER_RED = [
