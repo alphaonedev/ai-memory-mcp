@@ -85,8 +85,9 @@
 #            differently in CommonMark and HTML (#5606).
 #   UNDECIDABLE_LT — a prose `<` before it may or may not open a group,
 #            and the anchor is judged differently either way (#5608).
-#   UNMODELLED — a self type the gate cannot read, or any Rust keyword
-#            in a checked path (#5610, #5611).
+#   UNMODELLED — a self type the gate cannot read, any Rust keyword
+#            in a checked path (#5610, #5611), or a `::` followed by
+#            nothing the gate can read or by an empty brace list (#5698).
 #   SETUP  — the gate cannot do its job: a doc or source file in the
 #            checked set cannot be read (#5616), or src/ has no Rust file.
 #
@@ -1179,6 +1180,25 @@ PYEOF
             echo "FAIL: self-test #5616 — $1 rejected without naming it ($4)" >&2; exit 1; }
         echo "PASS: self-test #5616 — $1 is REJECTED"
     }
+    # #5698: a qualified head followed by nothing the scanner reads is a
+    # claim the gate has not understood; it is refused, not dropped.
+    anchor_red_cites 5698 UNMODELLED "a qualified head at the end of a code span" \
+        "$R::" "See \`$R::\` here."
+    anchor_red_cites 5698 UNMODELLED "a glob after a qualified head" \
+        "$R::*" "See \`$R::*\` here."
+    anchor_red_cites 5698 UNMODELLED "an ampersand before a name after a qualified head" \
+        "$R::&NoSuch" "See \`$R::&NoSuch\` here."
+    anchor_red_cites 5698 UNMODELLED "a parenthesised name after a qualified head" \
+        "$R::(NoSuch)" "See \`$R::(NoSuch)\` here."
+    anchor_red_cites 5698 UNMODELLED "a name starting with a digit after a qualified head" \
+        "$R::0NoSuch" "See \`$R::0NoSuch\` here."
+    anchor_red_cites 5698 UNMODELLED "an empty brace list after a qualified head" \
+        "$R::{}" "See \`$R::{}\` here."
+    anchor_red_cites 5698 UNMODELLED "an unbackticked qualified head before a minus" \
+        "$R::-NoSuch" "See $R::-NoSuch here."
+    anchor_green 5698 "a live name after a qualified head" "See \`$R::RecallTool\` here."
+    anchor_green 5698 "a live name in a one-item brace list" "See \`$R::{RecallTool}\` here."
+
     unreadable_red "a directory in place of a top-level doc" ROADMAP.md dir \
         "cannot read ROADMAP.md"
     unreadable_red "a directory matched by the docs glob" docs/x.md dir \
@@ -2399,7 +2419,11 @@ def iter_quals(line):
             pos = _skip_space(line, hm.end())
             bm = BRACE_BODY.match(line, pos) if line.startswith("{", pos) else None
             if bm:
-                yield rule, hm.group(1), bm.group(1)
+                if split_items(bm.group(1)):
+                    yield rule, hm.group(1), bm.group(1)
+                else:
+                    # #5698: an empty brace list names nothing to check.
+                    yield rule, hm.group(1), (UNMODELLED, line[pos:bm.end()])
                 pos = bm.end()
                 continue
             p0 = hm.start(1)
@@ -2410,6 +2434,13 @@ def iter_quals(line):
                 # refuses the anchor when they are judged differently.
                 yield rule, hm.group(1), [line[pos:e] for e in dict.fromkeys(ends)]
                 pos = min(ends)
+            else:
+                # #5698: a head whose separator is followed by nothing the
+                # scanner reads (end of text, a glob, punctuation, a digit) is
+                # a claim the gate has not understood, so it is refused, cited
+                # as written up to the next whitespace or backtick.
+                tail = re.match(r"[^\s`]*", line[pos:]).group(0)
+                yield rule, hm.group(1), (UNMODELLED, tail)
 
 
 def strip_generics(tok):
@@ -2774,6 +2805,9 @@ def qual_findings(line):
             # absence-wording exemption never applies to it.
             out.append(("PATH", f))
             continue
+        if isinstance(raw, tuple):
+            out.append(("UNMODELLED", f"{f}::{raw[1]}"))
+            continue
         if isinstance(raw, str):
             for tok in split_items(raw):
                 out += _item_findings(rule, f, tok)
@@ -3007,7 +3041,7 @@ if [[ -n "$violations" ]]; then
             BARE_QUAL) detail="symbol is not defined in the file it is qualified against (unbackticked anchor)" ;;
             BARE_LN) detail="bare file:line anchor in a live doc (rots silently); cite \`path::symbol\`, or pin a commit permalink" ;;
             UNDECIDABLE_REF) detail="anchor is refused: its character references decode differently in CommonMark and HTML, so the anchor cannot be resolved; write the characters plainly" ;;
-            UNMODELLED) detail="anchor is refused: it is written in a form this gate does not model (a self type it cannot read, or a Rust keyword in its path), so it cannot be checked; name the type and method plainly (src/x.rs::Type::method)" ;;
+            UNMODELLED) detail="anchor is refused: it is written in a form this gate does not model (a self type it cannot read, a Rust keyword in its path, or nothing it can read after the ::), so it cannot be checked; name the type and method plainly (src/x.rs::Type::method)" ;;
             UNDECIDABLE_LT) detail="anchor is refused: a \`<\` before it may or may not open a group, and the anchor is judged differently either way; write a comparison spaced (a < b) or in code" ;;
             LADDER_TIP) detail="claimed ladder tip disagrees with the tip scripts/check-migration-ladder.sh computes (left=cited, right=actual)" ;;
             *)     detail="unresolved anchor" ;;
