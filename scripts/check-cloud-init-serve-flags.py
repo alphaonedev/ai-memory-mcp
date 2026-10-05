@@ -3619,6 +3619,20 @@ def secret_output_problems(base: tuple, known: set) -> list:
     run_scan(t, mt, a, p, known, cache={})
     if any(x.isalpha() or "Bq7Zk" in x or "Mark9" in x for x in CRED_PIECES):
         bad.append("the credential registry kept stale text or holds a plain word: %d pieces" % len(CRED_PIECES))
+    # each piece of a password is masked on its own: an "@" inside it (every "@" may end the
+    # userinfo), a bare alphanumeric run, the longer of two overlapping pieces, and the
+    # percent-decoded text (#5487)
+    for src, shown, left in (
+        ("postgres://u:Aq7@Zk7xq@h/db", "postgres://u:Aq7@Zk7xq@h/db", "Zk7xq"),
+        ("postgres://u:Ab1/Mark9xyz@h/d", "a word Mark9xyz is cut", "Mark9xyz"),
+        ("PGPASSWORD=Zk7/Zk7abcd", "word Zk7abcd here", "abcd"),
+        ("postgres://u:Xy%2BQz%2F@h/d", "the decoded Xy+Qz/ text", "Xy+Qz"),
+    ):
+        CRED_PIECES.clear()
+        register_credentials(src)
+        if left in mask_credentials(shown):
+            bad.append("a registered password piece was printed unmasked (%s)" % src[:12])
+    CRED_PIECES.clear()
     # an allowlist or pending entry that holds a password is masked when it is shown (#5488)
     hits, out = printed_for(base, known, [], allow_add="aws-gpu-burst | top | PGPASSWORD=Aq7ZkBq7Zk psql -d aimemory")
     if not hits or "Bq7Zk" in out:
