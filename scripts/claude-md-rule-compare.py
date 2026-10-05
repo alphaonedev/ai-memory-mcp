@@ -498,6 +498,10 @@ def refusal_prefix_gap(source: bytes) -> str:
     if not isinstance(source, (bytes, bytearray)):
         return "the source is not bytes"
     source = bytes(source)
+    # #5681: before detect_encoding, which raises for a NUL on line 1 or 2 on 3.14 and not on 3.13 and older, so the
+    # reason for a control byte is the same on every interpreter.
+    if CONTROL_BYTES.search(source):
+        return "the source has a control byte other than tab, LF and CRLF line ends"
     try:
         encoding = tokenize.detect_encoding(iter(source.splitlines(keepends=True)).__next__)[0]
     except Exception as exc:  # fail closed: ANY failure refuses (#5588); pin_5588 shows SyntaxError for three inputs (#5626)
@@ -508,8 +512,6 @@ def refusal_prefix_gap(source: bytes) -> str:
         source.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
         return f"the source is not strict utf-8: {exc}"
-    if CONTROL_BYTES.search(source):
-        return "the source has a control byte other than tab, LF and CRLF line ends"
     try:
         body = ast.parse(source).body
     # ValueError (#5589, #5625): for a NUL byte ast.parse raised ValueError on 3.10.22 and SyntaxError on 3.11.17, 3.12.3
@@ -1165,6 +1167,25 @@ def _self_test_cases() -> int:
                                 ("on line 1", b"#" + bytes([byte]) + b"\n" + plain)):
                 if "control byte" not in refusal_prefix_gap(data):
                     return f"the docstring says control byte {byte:#04x} {where} is refused with the control byte reason but it was not (R5)"
+        # #5681: on 3.14 detect_encoding raises SyntaxError for a NUL on line 1 or 2 (3.13 and older return utf-8). The
+        # control-byte reason must not depend on that, so the NUL cases run again under a detect_encoding that does it.
+        def detect_nul_like_314(readline):
+            seen = [readline(), readline()]
+            if any(b"\x00" in line for line in seen):
+                raise SyntaxError("source code cannot contain null bytes")
+            lines = iter(seen)
+            return real_detect(lambda: next(lines, b"") or readline())
+
+        try:
+            tokenize.detect_encoding = detect_nul_like_314
+            for where, data in (("in the docstring on line 1", b'"""d\x00"""\n' + refusal.encode()), ("on line 1", b"#\x00\n" + plain),
+                                ("on line 2", b"# note\n#\x00\n" + plain)):
+                if "control byte" not in refusal_prefix_gap(data):
+                    return f"a NUL {where} under a 3.14-style detect_encoding was refused with {refusal_prefix_gap(data)!r}, not the control byte reason (R5, #5681)"
+            if refusal_prefix_gap(plain):
+                return "a plain source was refused under the 3.14-style detect_encoding (R5, #5681)"
+        finally:
+            tokenize.detect_encoding = real_detect
         for label, data in {"a lone CR at the end": plain + b"#\r", "a CR before CR LF": plain.replace(b"\n", b"\r\r\n", 1)}.items():
             if "control byte" not in refusal_prefix_gap(data):
                 return f"the docstring says {label} is refused with the control byte reason but it was not (R5)"
