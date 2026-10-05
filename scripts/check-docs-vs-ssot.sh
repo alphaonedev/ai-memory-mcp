@@ -647,6 +647,7 @@ check_schema_version_rule() {
 import html as htmlmod
 import os
 import re
+import unicodedata
 
 # Characters either side of the identifier in which a number still belongs to
 # the claim (the longest real wording, the schema.html version row, is ~35).
@@ -807,6 +808,19 @@ for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8')
                for v in (WS.sub(' ', parts[1]), MARKS.sub('', WS.sub(' ', parts[1])))):
         rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-',
                      'needle carries no subject text beyond the value (#5808): ' + raw.strip()[:120]))
+        continue
+    # A needle must read as written (#5809). The rule is positive: every character
+    # is printable ASCII, or a non-ASCII letter, punctuation or symbol (the real
+    # entries use an em dash and an arrow). A format character (ZWSP, a BOM), a
+    # control, a combining mark, a non-ASCII space or a non-ASCII digit can glue a
+    # word to the value, or change the value, without showing it, so a reviewer
+    # reads a needle that is not the one shields() matches. It is refused by name.
+    bad = [ch for ch in parts[1] if not (' ' <= ch <= '~' or (ord(ch) > 0x7f
+           and unicodedata.category(ch)[0] in 'LPS'))]
+    if bad:
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-',
+                     'needle carries a character that does not read as written (U+%04X %s, #5809): %s'
+                     % (ord(bad[0]), unicodedata.category(bad[0]), raw.strip()[:100])))
         continue
     ledger.setdefault(parts[0].strip(), {})[parts[1]] = [n, set()]
 
@@ -3498,6 +3512,35 @@ R5809MD
         || { echo "FAIL: self-test #5809 - expected exactly 3 one-hit refusals" >&2; cd "$REPO_ROOT"; exit 1; }
     rm -f "$tmpdir/docs/schema-fixture.html"
     echo "PASS: self-test #5809 - a ledger row that shields the same phrase on two lines, or twice on one line, FAILS naming every file:line; a hit two rows shield FAILS naming both rows; one hit seen in two views (raw and folded, sweep and anchor, wrapped-line join, html pill and sweep) counts once; a stale claim beside them is still flagged"
+    # ---- #5809 item 2: a needle must read as written. Rows 1, 4, 5 and 6 each
+    # carry subject text and a ladder number, but a zero-width space glues the word
+    # to the value, or a no-break space, a combining mark or a BOM hides inside: each
+    # is refused by name and its claim stays flagged. Rows 2 and 3 use the arrow and
+    # the em dash the real entries use and are accepted.
+    {
+        printf 'docs/postgres-age-guide.md\twas\xe2\x80\x8b51\t#5809 zero-width space\n'
+        printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 50\xe2\x86\x9251\t#5809 arrow, accepted\n'
+        printf 'docs/postgres-age-guide.md\tv51 \xe2\x80\x94 the schema_version\t#5809 em dash, accepted\n'
+        printf 'docs/postgres-age-guide.md\tschema_version\xc2\xa0was 51\t#5809 no-break space\n'
+        printf 'docs/postgres-age-guide.md\tschema_version wa\xcc\x81s 51\t#5809 combining mark\n'
+        printf 'docs/postgres-age-guide.md\tschema_version\xef\xbb\xbf was 51\t#5809 BOM\n'
+    } > "$_s"
+    printf 'the schema_version was\xe2\x80\x8b51 then\na CURRENT_SCHEMA_VERSION 50\xe2\x86\x9251 past bump\nv51 \xe2\x80\x94 the schema_version of v0.5\nthe schema_version\xc2\xa0was 51 then\nthe schema_version wa\xcc\x81s 51 then\nthe schema_version\xef\xbb\xbf was 51 then\n' \
+        > "$tmpdir/docs/postgres-age-guide.md"
+    _s_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #5809 - needles that do not read as written were accepted (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in 'malformed entry at line 1 "needle carries a character that does not read as written (U+200B Cf' \
+        'malformed entry at line 4 "needle carries a character that does not read as written (U+00A0 Zs' \
+        'malformed entry at line 5 "needle carries a character that does not read as written (U+0301 Mn' \
+        'malformed entry at line 6 "needle carries a character that does not read as written (U+FEFF Cf' \
+        'docs/postgres-age-guide.md:1 claims "51"' 'docs/postgres-age-guide.md:4 claims "51"' \
+        'docs/postgres-age-guide.md:5 claims "51"' 'docs/postgres-age-guide.md:6 claims "51"'
+    do grep -qF "$_want" <<<"$_s_out" || { echo "FAIL: self-test #5809 - not refused or not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
+    for _not in 'malformed entry at line 2 ' 'malformed entry at line 3 ' 'docs/postgres-age-guide.md:2 ' \
+        'docs/postgres-age-guide.md:3 ' 'STALE entry' 'exactly one is allowed'
+    do grep -qF "$_not" <<<"$_s_out" && { echo "FAIL: self-test #5809 - a readable needle was refused or its history flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test #5809 - a ledger needle with a zero-width space, a no-break space, a combining mark or a BOM is refused by name and its claim stays flagged; an arrow or an em dash is accepted"
     rm -f "$tmpdir/docs/postgres-age-guide.md"
     printf '# fixture ledger (comment-only)\n' > "$_s"
 
