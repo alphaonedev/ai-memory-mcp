@@ -3965,6 +3965,8 @@ def reader_problems() -> list:
     want = ["ab\\'Zk7secretXY", "ab'Zk7secretXY"]
     if libpq_value("'ab\\'Zk7secretXY' x", 0) != want:
         bad.append("F2 libpq_value is %r, not %r" % (libpq_value("'ab\\'Zk7secretXY' x", 0), want))
+    if "ab'Zk7secretXY" not in credential_values("psql \"host=h password='ab\\'Zk7secretXY'\" -c x"):
+        bad.append("F2 credential_values does not use the libpq reader")
     if "Zk7secretXY" not in credential_values("password=a Zk7secretXY")[3:]:
         bad.append("F1 the mixed run of a line tail is not read")
     spelled = "PGPASSWORD=Zk7\\\nsecretXY psql -h h"

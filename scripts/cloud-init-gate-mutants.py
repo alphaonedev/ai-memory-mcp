@@ -38,7 +38,7 @@ MUTANTS = (
     ("M02", G, "(?=[\\s;&|)⏎\\\\]|$)\" % (CRED_PLACEHOLDER", "\" % (CRED_PLACEHOLDER", "placeholder exemption loses its word boundary"),
     ("M03", G, 'CRED_LINE_RE = re.compile(r"(?:\\\\\\n|[^\\n])*")', 'CRED_LINE_RE = re.compile(r"[^\\n]*")', "mask stops at a backslash continuation"),
     ("M04", G, 'CRED_FREE_RE = re.compile(r"CHANGEME|', 'CRED_FREE_RE = re.compile(r"(?:var|local|module|data)\\.[\\w.\\[\\]-]+|CHANGEME|', "terraform-looking value is exempt again (F5)"),
-    ("M05", G, "        elif c in \" \\t\\r\\n;&|()<>\":\n            break", "        elif c in \" \\t\\r\\n;&|()<>'\\\"\":\n            break", "a quote ends the shell word (F1)"),
+    ("M05", G, "        elif c in \"'\\\"\" or (c == \"$\" and text[j + 1:j + 2] == \"'\"):", "        elif c == \"$\" and text[j + 1:j + 2] == \"'\":", "a quote does not join the shell word (F1)"),
     ("M06", G, "return [m.group(1), re.sub(r\"\\\\(.)\", r\"\\1\", m.group(1), flags=re.S)]", "return [m.group(1)]", "libpq value not unescaped (F2)"),
     ("M07", G, "r\"'((?:\\\\.|[^'\\\\])*)'\"", "r\"'([^']*)'\"", "libpq escaped quote ends the value (F2)"),
     ("M08", G, "for variant in (text, text.replace(\"\\\\\\n\", \"\"), text.replace(\"\\\\\\n\", \"\\\\⏎\")):", "for variant in (text, text.replace(\"\\\\\\n\", \"\\\\⏎\")):", "joined continuation not registered (F3)"),
