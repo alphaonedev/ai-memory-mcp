@@ -1507,6 +1507,10 @@ PYEOF
         "See \`$R::<dyn RecallTool + crate::RecallTool>::decorate_memory_many\`."
     anchor_red_cites 5611 UNMODELLED "a keyword as the last component" \
         "$R::RecallTool::fn" "See \`$R::RecallTool::fn\`."
+    anchor_red_cites 5768 UNMODELLED "a lone 2024 gen keyword is not a placeholder" \
+        "$R::<gen>" "See \`$R::<gen>\`."
+    anchor_red_cites 5768 UNMODELLED "the 2024 gen keyword as the last component" \
+        "$R::RecallTool::gen" "See \`$R::RecallTool::gen\`."
     anchor_red_cites 5611 UNMODELLED "a self-rooted bare path" \
         "$R::self::RecallTool" "See $R::self::RecallTool here."
     anchor_red_cites 5611 UNMODELLED "a Self self type" \
