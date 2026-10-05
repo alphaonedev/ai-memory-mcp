@@ -2286,7 +2286,7 @@ class ClosedWorldClass5854(unittest.TestCase):
         for item in ("[a-c]", "!x"):
             got = self._verdict(item)
             self.assertTrue(any(WAY_OUT in v for v in got), (item, got))
-        self.assertIn("branches-ignore", WAY_OUT)
+        self.assertIn("branches-ignore is refused too: unsupported filter key", WAY_OUT)
         # The way out must be true: branches-ignore is itself refused today.
         got = violations("x.yml", "name: x\non:\n  pull_request:\n    branches-ignore: [main]\n")
         self.assertTrue(any("unsupported filter key: branches-ignore" in v for v in got), got)
@@ -2499,6 +2499,55 @@ class DifferentialTruth5945(unittest.TestCase):
         self.assertIn("Six are the class items of round 6", cells)
         self.assertIn("Sixteen are the pattern items of round 7", cells)
         self.assertIn("Thirteen are the class and negation items of round 8", cells)
+
+
+class DocTruth5968(unittest.TestCase):
+    """#5968: the docstring rows for classes and negation say what the code does."""
+
+    def _doc(self) -> str:
+        return " ".join((sys.modules[__name__].__doc__ or "").split())
+
+    def test_5968_pattern_row_states_the_refusals_and_the_way_out(self) -> None:
+        doc = self._doc()
+        self.assertIn("a ``[`` character class (whatever its body) and a ``!`` anywhere in the item, "
+                      "a leading negation included", doc)
+        self.assertIn("5-agent vote 4d3ea1c5", doc)
+        self.assertIn("list the base branches positively as plain patterns in ``branches``", doc)
+        self.assertIn("``branches-ignore`` is no way out, this reader refuses it as an unsupported filter key", doc)
+        # The stated limit stays and names its open tracker entry.
+        self.assertIn("they were not measured against GitHub's own evaluator (open tracker entry: #5969)", doc)
+
+    def test_5968_no_sentence_still_says_a_class_or_negation_is_read(self) -> None:
+        doc = self._doc()
+        for gone in ("is read only when its body", "last match wins", "and a class as above", "one leading ``!``",
+                     "proven class", "proven form"):
+            self.assertNotIn(gone, doc)
+        for func in (glob_match, filter_matches):
+            text = " ".join((func.__doc__ or "").split())
+            for gone in ("last match wins", "a leading '!' negates", "proven form", "_class_regex"):
+                self.assertNotIn(gone, text)
+
+    def test_5968_the_removed_class_reader_leaves_nothing_behind(self) -> None:
+        for name in ("_class_regex", "_CLASS_LOWER", "_CLASS_UPPER", "_CLASS_DIGIT"):
+            self.assertNotIn(name, globals())
+        self.assertEqual(frozenset(string.ascii_letters + string.digits + "._/-"), _PATTERN_LITERALS)
+        self.assertEqual({"[", "!"}, set(_REFUSED_READS))
+        self.assertIn("negation", " ".join((filter_matches.__doc__ or "").split()))
+
+    def test_5968_each_refusal_reason_names_its_own_form(self) -> None:
+        with self.assertRaises(Unparsed) as cls:
+            glob_match("a[b]", "ab")
+        self.assertIn("a character class is not read", str(cls.exception))
+        self.assertNotIn("a negation is not read", str(cls.exception))
+        with self.assertRaises(Unparsed) as neg:
+            glob_match("!a", "a")
+        self.assertIn("a negation is not read", str(neg.exception))
+        self.assertNotIn("a character class is not read", str(neg.exception))
+        for exc in (cls.exception, neg.exception):
+            self.assertIn(WAY_OUT, str(exc))
+        with self.assertRaises(Unparsed) as other:
+            glob_match("a?b", "ab")
+        self.assertNotIn(WAY_OUT, str(other.exception))
 
 
 class GlobSemantics5447(unittest.TestCase):
