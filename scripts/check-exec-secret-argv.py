@@ -1092,38 +1092,53 @@ HISTORY_REMEDY = ("fetch full history (git fetch --unshallow, or actions/checkou
                   "and run the gate again (#5299)")
 
 
+# A pending row is "#<issue> | <file> | <count> | <text>". The history scan matches that shape in every file
+# at every path (#5299, #5466): the list may have been renamed and rewritten in one commit, where git
+# detects no rename and a log limited to the path of the list goes blind to the old path.
+PENDING_ROW_PICKAXE = r"^#[0-9]+ [|] "
+
+
 def removed_pending_rows(root: Path) -> Dict[str, str]:
-    """text -> short sha of a commit that removed a pending row with that text, over the whole history
-    of the pending list (renames of the list followed). Fail closed (#5299, #5463; 5-agent vote 4d3ea1c5,
-    decision memory bf29bdb2): every merge is diffed against each of its parents (-m: a merge, an evil
-    merge and an octopus merge included), side branches are not simplified away (--full-history), replace
-    refs and grafts are ignored. A shallow clone, a git failure, a list that exists at HEAD but has no
-    history, or a committed row that no scanned commit ever added (history this scan cannot follow) is a
-    RuntimeError, never an empty answer."""
+    """text -> short sha of a commit that removed a pending row with that text. Fail closed (#5299,
+    #5463, #5466; 5-agent vote 4d3ea1c5, decision memory bf29bdb2): the whole history is read with no
+    path limit, so a list renamed and rewritten in one commit is followed (the deleted old file shows
+    its rows as removed: over-collecting fails closed), every merge is diffed against each of its
+    parents (-m: a merge, an evil merge and an octopus merge included), and replace refs and grafts are
+    ignored. A shallow clone, a git failure, a list that exists but has no history, or a committed row
+    that no scanned commit ever added (history this scan cannot follow) is a RuntimeError, never an
+    empty answer. The allow list is skipped: an allow row may carry a #<issue> reason."""
     if _git(root, "rev-parse", "--is-shallow-repository").strip() != "false":
         raise RuntimeError("the history of %s is incomplete (shallow clone): %s" % (PENDING_FILE, HISTORY_REMEDY))
     try:
-        log = _git(root, "--no-replace-objects", "log", "--follow", "-M", "-m", "--full-history", "-p", "-U0",
-                   "--no-color", "--no-ext-diff", "--no-textconv", "--format=commit %h", "--", PENDING_FILE)
+        log = _git(root, "--no-replace-objects", "-c", "core.quotepath=false", "log", "-m", "--no-ext-diff",
+                   "--no-textconv", "-M", "-p", "-U0", "--no-color", "--format=commit %h",
+                   "-G" + PENDING_ROW_PICKAXE)
+        listed = _git(root, "log", "-1", "--format=%h", "--full-history", "--", PENDING_FILE).strip()
         at_head = _show_or_absent(root, "HEAD", PENDING_FILE)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError("cannot read the history of %s (%s): %s" % (
             PENDING_FILE, exc.stderr.decode("utf-8", "replace").strip()[:120], HISTORY_REMEDY))
     gone: Dict[str, str] = {}
     added = set()
-    sha = ""
-    commits = 0
+    sha = path = ""
+    in_hunk = False
     for raw in log.split("\n"):
         if raw.startswith("commit "):
-            sha, commits = raw[7:].strip(), commits + 1
-        elif raw[:2] in ("-#", "+#"):
+            sha, path, in_hunk = raw[7:].strip(), "", False
+        elif raw.startswith("diff --git "):
+            path, in_hunk = "", False
+        elif raw.startswith("@@"):
+            in_hunk = True
+        elif not in_hunk and (raw.startswith("--- ") or raw.startswith("+++ ")):
+            path = raw[6:] if raw[4:6] in ("a/", "b/") else path
+        elif in_hunk and raw[:2] in ("-#", "+#") and path != ALLOW_FILE:
             parts = raw[1:].split(" | ", 3)
             if len(parts) == 4 and parts[3] == norm(parts[3]):
                 if raw[0] == "-":
                     gone.setdefault(parts[3], sha)
                 else:
                     added.add(parts[3])
-    if commits == 0 and (root / PENDING_FILE).is_file():
+    if not listed and (root / PENDING_FILE).is_file():
         raise RuntimeError("the history of %s is empty although the file exists: %s" % (PENDING_FILE, HISTORY_REMEDY))
     unseen = sorted(r[3] for r in parse_entries(at_head, "head-pending", True, []) if r[3] not in added)
     if unseen:
@@ -2163,6 +2178,24 @@ def _history_cases(t: Path) -> Tuple[List[str], int]:
     diverge(repo, "dev")
     git(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
     judge_repo("a removal behind a revert pair", repo)
+    # the list renamed and rewritten in one commit: git detects no rename, a path-limited log stops there (#5466)
+    repo = t / "rename-rewrite"
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q", "-b", "develop")
+    old = "scripts/qc-allowlists/old-pending.txt"
+    put(repo, old, "".join("#1 | a.sh | 1 | %s\n" % x for x in (gone_row, kept_row)))
+    commit(repo, "the list at its old path")
+    put(repo, old, "#1 | a.sh | 1 | %s\n" % kept_row)
+    commit(repo, "remove the row at the old path")
+    (repo / old).unlink()
+    rows(repo, *("export OTHER_TOKEN_%d" % i for i in range(6)))
+    commit(repo, "move and rewrite the list in one commit")
+    n += 1
+    try:
+        if gone_row not in removed_pending_rows(repo):
+            bad.append("the history scan missed a row removed before the list was renamed and rewritten (#5466)")
+    except RuntimeError as exc:
+        bad.append("the history scan faulted on a list renamed and rewritten in one commit: %s" % exc)
     # a replace ref that hides the removing commit from every default git view (#5463)
     repo = fresh("replace")
     drop(repo)
