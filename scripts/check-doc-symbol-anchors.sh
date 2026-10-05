@@ -22,6 +22,11 @@
 # falsifiable by a reader in one grep, while a wrong ANCHOR sends the
 # reader to the wrong place and then makes them doubt the rest.
 #
+# RULE TABLE. Every rule below is a row of the engine's RULES table, which
+# also holds the detail text the gate prints for it; a rule that is not a
+# row makes the engine error, and the --self-test census matches the table
+# with this header both ways, counts included (#5680, #5783).
+#
 # SIX CHECKING RULES, all conservative, all keyed on PATH-QUALIFIED
 # grammar so a bare backticked identifier in prose is never guessed at,
 # and four REFUSALS (below) for what the gate cannot decide (#5680):
@@ -1134,24 +1139,113 @@ PYEOF
         echo "PASS: self-test #5497 — the header and CLAUDE.md name \"$wording\""
     done
 
-    # #5680: every rule the gate can print has a line of its own in the
-    # header (a rule name at the start of a header rule line), so a rule
-    # added to the engine without one fails here. The rule set is read from
-    # the detail table and every literal rule the engine emits or prints.
-    python3 - "$SELF" <<'PYEOF' || { echo "FAIL: self-test #5680 — a rule the gate can print has no header line" >&2; exit 1; }
-import re, sys
+    # #5680/#5783: the census. The rules come from the engine's RULES table
+    # (the one table emit() and the reporter use), read as Python, plus every
+    # rule literal the engine emits or builds a finding with. The table and
+    # the header rule lines must name the same rules both ways, the refusal
+    # rows must be the header REFUSALS block, every literal must be a row,
+    # and the header's counts of checking rules and refusals must equal the
+    # table's.
+    census_5680() {  # <script>
+        python3 - "$1" <<'PYEOF'
+import ast, re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
 head, body = src.split("\nset -", 1)
-rules = set(re.findall(r"(?m)^ +([A-Z][A-Z_]+)\) +detail=", body))
-rules |= set(re.findall(r'emit\("([A-Z][A-Z_]+)"', body))
-rules |= set(re.findall(r'print\(f?"([A-Z][A-Z_]+)\\t', body))
+engine = body.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+table = None
+for node in ast.parse(engine).body:
+    if (isinstance(node, ast.Assign) and len(node.targets) == 1
+            and getattr(node.targets[0], "id", None) == "RULES"):
+        table = ast.literal_eval(node.value)
+if not table:
+    print("no RULES table in the engine", file=sys.stderr)
+    sys.exit(1)
+used = set(re.findall(r'emit\("([A-Z][A-Z_]+)"', engine))
+used |= set(re.findall(r'(?<![A-Za-z_])\("([A-Z][A-Z_]{2,})",\s', engine))
 named = set(re.findall(r"(?m)^#   ([A-Z][A-Z_]+) +—", head))
-missing = sorted(rules - named)
-if len(rules) < 11 or missing:
-    print("missing from the header:", missing, "rules seen:", sorted(rules), file=sys.stderr)
+refusal_block = head.split("# REFUSALS.", 1)[1].split("# PATH FORMS.", 1)[0]
+refusals = set(re.findall(r"(?m)^#   ([A-Z][A-Z_]+) +—", refusal_block))
+words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+         "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+checks_word = re.search(r"(?m)^# ([A-Z]+) CHECKING RULES", head)
+refusals_word = re.search(r"and ([a-z]+) REFUSALS", head)
+kinds = {k: v[0] for k, v in table.items()}
+bad = []
+if set(table) != named:
+    bad.append(("table not in header", sorted(set(table) - named)))
+    bad.append(("header not in table", sorted(named - set(table))))
+if {k for k, v in kinds.items() if v == "refusal"} != refusals:
+    bad.append(("refusal rows vs REFUSALS block", sorted(refusals)))
+if not used <= set(table):
+    bad.append(("emitted but not in table", sorted(used - set(table))))
+if set(kinds.values()) - {"check", "part", "refusal"}:
+    bad.append(("unknown kind", sorted(set(kinds.values()))))
+if not checks_word or words.get(checks_word.group(1).lower()) != list(kinds.values()).count("check"):
+    bad.append(("checking-rule count", checks_word and checks_word.group(1)))
+if not refusals_word or words.get(refusals_word.group(1)) != list(kinds.values()).count("refusal"):
+    bad.append(("refusal count", refusals_word and refusals_word.group(1)))
+if len(table) < 11 or len(used) < 11:
+    bad.append(("too few rules read", len(table), len(used)))
+if bad:
+    print("census:", bad, file=sys.stderr)
     sys.exit(1)
 PYEOF
-    echo "PASS: self-test #5680 — every rule the gate can print has a header line"
+    }
+    census_5680 "$SELF" || { echo "FAIL: self-test #5680 — the RULES table and the header disagree" >&2; exit 1; }
+    echo "PASS: self-test #5680 — the RULES table and the header name the same rules and counts"
+
+    # #5783: the census and emit() fail on each planted disagreement.
+    plant_5783() {  # <old text> <new text> <out file>
+        # The text is replaced where it occurs in the header (before the
+        # self-test) or else in the engine (after the self-test), never in
+        # the self-test's own arguments.
+        python3 - "$SELF" "$1" "$2" "$3" <<'PYEOF'
+import sys
+s = open(sys.argv[1], encoding="utf-8").read()
+head, rest = s.split("\nset -", 1)
+pre, engine = rest.split("<<'PY'\n", 1)
+if sys.argv[2] in head:
+    head = head.replace(sys.argv[2], sys.argv[3], 1)
+elif sys.argv[2] in engine:
+    engine = engine.replace(sys.argv[2], sys.argv[3], 1)
+else:
+    sys.exit("plant_5783: text not found: " + sys.argv[2])
+open(sys.argv[4], "w", encoding="utf-8").write(head + "\nset -" + pre + "<<'PY'\n" + engine)
+PYEOF
+    }
+    census_red_5783() {  # <description> <old text> <new text>
+        plant_5783 "$2" "$3" "$FIX/planted-5783.sh" || exit 1
+        if census_5680 "$FIX/planted-5783.sh" 2>/dev/null; then
+            echo "FAIL: self-test #5783 — the census passed $1" >&2; exit 1
+        fi
+        echo "PASS: self-test #5783 — the census fails $1"
+    }
+    census_red_5783 "a table row with no header line" \
+        '    "SETUP": ("refusal",' '    "ZZ_EXTRA": ("part", "planted"),
+    "SETUP": ("refusal",'
+    census_red_5783 "a header line with no table row" \
+        '#   SETUP  — the gate' '#   ZZ_EXTRA — planted.
+#   SETUP  — the gate'
+    census_red_5783 "a refusal row listed as a check" \
+        '"SETUP": ("refusal",' '"SETUP": ("check",'
+    census_red_5783 "a wrong count of checking rules" \
+        '# SIX CHECKING RULES' '# FIVE CHECKING RULES'
+    census_red_5783 "a wrong count of refusals" \
+        'and four REFUSALS' 'and five REFUSALS'
+    census_red_5783 "a finding built with a rule that is not a row" \
+        'out.append(("BARE_LN",' 'out.append(("ZZ_UNLISTED",'
+    plant_5783 'out.append(("BARE_LN",' 'out.append(("ZZ_UNLISTED",' "$FIX/planted-5783.sh" || exit 1
+    chmod +x "$FIX/planted-5783.sh"
+    write_clean
+    printf '\n\nSee %s:1 here.\n' "$R" >> "$FIX/README.md"
+    unl_rc=0
+    unl_out="$(AI_MEMORY_SYMBOL_GATE_ROOT="$FIX" "$FIX/planted-5783.sh" 2>&1)" || unl_rc=$?
+    [[ "$unl_rc" -eq 2 ]] && grep -q 'analysis engine errored' <<<"$unl_out" \
+        && ! grep -q 'gate: PASS' <<<"$unl_out" || {
+        echo "FAIL: self-test #5783 — a rule outside the RULES table did not fail closed (exit $unl_rc)" >&2
+        printf '%s\n' "$unl_out" | sed 's/^/       /' >&2; exit 1; }
+    rm -f "$FIX/planted-5783.sh"
+    echo "PASS: self-test #5783 — a rule outside the RULES table FAILS CLOSED (exit 2, no PASS banner)"
 
     # #5765: every issue a refusal line of the header cites has a self-test
     # case of that rule filed under that issue, so a refusal cannot cite an
@@ -2158,6 +2252,43 @@ ladder_tip = os.environ.get("LADDER_TIP", "").strip()
 if os.environ.get("AI_MEMORY_SYMBOL_GATE_SELFTEST_FAULT"):
     raise RuntimeError("check-doc-symbol-anchors self-test: injected analysis-engine fault (#2713)")
 
+# #5783: the ONE rule table. Every record the engine prints names a rule in
+# it and carries that rule's detail text, so the reporter prints what the
+# table says and has no table of its own; emit() refuses any other rule (the
+# engine errors and the gate fails closed), and the --self-test census reads
+# this table and matches it with the header both ways. The kind says where
+# the header lists the rule: "check" (a checking rule), "part" (reported
+# under its own name, part of the check named in its header line) or
+# "refusal".
+RULES = {
+    "PATH": ("check", "cited src/ path does not exist"),
+    "LINE": ("check", "file:line anchor is out of range (line numbers are 1-based and must not pass end-of-file)"),
+    "QUAL": ("check", "symbol is not defined in the file it is qualified against"),
+    "BARE_QUAL": ("part", "symbol is not defined in the file it is qualified against (unbackticked anchor)"),
+    "BARE_LN": ("check", "bare file:line anchor in a live doc (rots silently); cite `path::symbol`, or pin a commit permalink"),
+    "MDLINK": ("check", "markdown symbol link does not resolve in its target file"),
+    "LADDER_TIP": ("check", "claimed ladder tip disagrees with the tip scripts/check-migration-ladder.sh computes (left=cited, right=actual)"),
+    "UNDECIDABLE_REF": ("refusal", "anchor is refused: its character references decode differently in CommonMark and HTML, so the anchor cannot be resolved; write the characters plainly"),
+    "UNDECIDABLE_LT": ("refusal", "anchor is refused: a `<` before it may or may not open a group, and the anchor is judged differently either way; write a comparison spaced (a < b) or in code"),
+    "UNMODELLED": ("refusal", "anchor is refused: it is written in a form this gate does not model (a self type it cannot read, a Rust keyword in its path, or a component that is not an identifier), so it cannot be checked; name the type and method plainly (src/x.rs::Type::method)"),
+    "SETUP": ("refusal", "the gate cannot do its job"),
+}
+# A decoded backtick never opens a code span; it is this private-use
+# character until emit() shows it as written (#5607).
+CODE_TICK = "\ue060"
+
+
+def emit(rule, doc, ln, token, ctx):
+    """Print one record: rule, doc, line, token, detail, context (#5783)."""
+    if rule not in RULES:
+        raise RuntimeError(f"rule {rule!r} is not in the RULES table (#5783)")
+    # #5612: a cited token never holds whitespace (a tab would split the
+    # record, a space the allowlist key) and shows a decoded backtick as
+    # written.
+    token = re.sub(r"\s+", "", token).replace(CODE_TICK, "`")
+    print(f"{rule}\t{doc}\t{ln}\t{token}\t{RULES[rule][1]}\t{ctx[:150]}")
+
+
 # ---- symbol index over src/ ------------------------------------------
 DEF = re.compile(
     r"\b(?:pub(?:\([^)]*\))?\s+)?(?:async\s+|unsafe\s+|extern\s+\"[^\"]*\"\s+)*"
@@ -2177,7 +2308,7 @@ for p in sorted(glob.glob(os.path.join(root, "src/**/*.rs"), recursive=True)):
     except OSError as e:
         # #5616: an unreadable source file is not an empty one; refuse it
         # rather than report its anchors under a misleading rule.
-        print(f"SETUP\t-\t0\t-\tcannot read {rel}: {e.strerror or e}")
+        emit("SETUP", "-", 0, "-", f"cannot read {rel}: {e.strerror or e}")
         continue
     # #4700: the number of lines, not newlines + 1 (a trailing newline
     # does not start a line, so `N+1` of an N-line file was accepted).
@@ -2191,7 +2322,7 @@ for p in sorted(glob.glob(os.path.join(root, "src/**/*.rs"), recursive=True)):
     per_file[rel] = names
 
 if not per_file:
-    print("SETUP\t-\t0\t-\tsrc/ yielded ZERO rust files; the gate would be a no-op")
+    emit("SETUP", "-", 0, "-", "src/ yielded ZERO rust files; the gate would be a no-op")
     raise SystemExit(0)
 
 # ---- scoped doc set ---------------------------------------------------
@@ -2303,7 +2434,6 @@ BRACE_BODY = re.compile(r"\{([^}]*)\}")
 # decoded backtick never opens a code span (it becomes CODE_TICK), a decoded
 # line ending is a space, and a decoded format character (Unicode Cf, such
 # as a zero-width space) is dropped: it renders as nothing.
-CODE_TICK = "\ue060"
 _REF_HTML = re.compile(r"&(?:#[xX][0-9A-Fa-f]+;?|#[0-9]+;?|[A-Za-z][A-Za-z0-9]*;?)")
 _REF_CM = re.compile(r"(?<!\\)&(?:#[xX][0-9A-Fa-f]{1,6};|#[0-9]{1,7};|[A-Za-z][A-Za-z0-9]*;)")
 
@@ -3170,14 +3300,6 @@ def undecidable_extents(line, readings, differing):
     return out or [("UNDECIDABLE_REF", tok) for tok in differing]
 
 
-def emit(rule, doc, ln, token, ctx):
-    # #5612: a cited token never holds whitespace (a tab would split the
-    # record, a space the allowlist key) and shows a decoded backtick as
-    # written.
-    token = re.sub(r"\s+", "", token).replace(CODE_TICK, "`")
-    print(f"{rule}\t{doc}\t{ln}\t{token}\t{ctx[:150]}")
-
-
 def line_findings(doc, doc_lines, ln, dec):
     """Every finding the per-line rules make on ONE reading of line `ln`
     (#5782): the raw line when `dec` is None, else the line decoded by `dec`
@@ -3397,7 +3519,7 @@ if [[ -f "$ALLOWLIST" ]]; then
 fi
 
 if [[ -n "$violations" ]]; then
-    while IFS=$'\t' read -r rule doc ln token ctx; do
+    while IFS=$'\t' read -r rule doc ln token detail ctx; do
         [[ -z "${rule:-}" ]] && continue
         if [[ "$rule" == "SETUP" ]]; then
             printf 'FAIL: doc-symbol-anchors: %s\n' "$ctx" >&2
@@ -3409,19 +3531,6 @@ if [[ -n "$violations" ]]; then
             allow_used="${allow_used}${key}"$'\n'
             continue
         fi
-        case "$rule" in
-            PATH)  detail="cited src/ path does not exist" ;;
-            LINE)  detail="file:line anchor is out of range (line numbers are 1-based and must not pass end-of-file)" ;;
-            QUAL)  detail="symbol is not defined in the file it is qualified against" ;;
-            MDLINK) detail="markdown symbol link does not resolve in its target file" ;;
-            BARE_QUAL) detail="symbol is not defined in the file it is qualified against (unbackticked anchor)" ;;
-            BARE_LN) detail="bare file:line anchor in a live doc (rots silently); cite \`path::symbol\`, or pin a commit permalink" ;;
-            UNDECIDABLE_REF) detail="anchor is refused: its character references decode differently in CommonMark and HTML, so the anchor cannot be resolved; write the characters plainly" ;;
-            UNMODELLED) detail="anchor is refused: it is written in a form this gate does not model (a self type it cannot read, a Rust keyword in its path, or a component that is not an identifier), so it cannot be checked; name the type and method plainly (src/x.rs::Type::method)" ;;
-            UNDECIDABLE_LT) detail="anchor is refused: a \`<\` before it may or may not open a group, and the anchor is judged differently either way; write a comparison spaced (a < b) or in code" ;;
-            LADDER_TIP) detail="claimed ladder tip disagrees with the tip scripts/check-migration-ladder.sh computes (left=cited, right=actual)" ;;
-            *)     detail="unresolved anchor" ;;
-        esac
         printf 'FAIL: doc-symbol-anchors [%s]: %s:%s cites "%s" — %s\n' \
             "$rule" "$doc" "$ln" "$token" "$detail" >&2
         printf '       context: %s\n' "$ctx" >&2
