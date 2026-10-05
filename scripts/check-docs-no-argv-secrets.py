@@ -873,19 +873,126 @@ def block_delta(line: str) -> int:
     return delta
 
 
+# #5726: a line whose last code ends with one of these continues on the next line.
+XTRACE_CONT_TAIL_RE = re.compile(r"(?:\|\|?|&&|\|&)[ \t]*\Z")
+# #5726: a function header whose body opens on a later line (f(), function f, function f()).
+XTRACE_FUNC_HEADER_RE = re.compile(
+    r"(?:\A|[;&|{(][ \t]*)(?:function[ \t]+[^\s;&|()]+(?:[ \t]*\([ \t]*\))?|[^\s;&|()<>]+[ \t]*\([ \t]*\))[ \t]*\Z")
+XTRACE_HEREDOC_RE = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|\\?([^\s;&|()<>'\"]+))")
+
+
+def xtrace_top_level(lines: List[str], yaml_indent: bool = False) -> List[bool]:
+    """#5726: for each line, True only when it is proven a top-level command line of the current
+    shell: it starts outside every quote, ( / $( / backtick / ${ , heredoc body, function header
+    and continuation of the previous line (trailing backslash, |, |&, && or ||), it closes every
+    construct it opens, opens no heredoc and does not itself end in a continuation. A set +x on
+    any other line does not end a traced region (fail closed). yaml_indent: the script is a YAML
+    block scalar (.tpl, .yaml, .yml), whose space indentation the shell never sees, so a heredoc
+    terminator is matched after it."""
+    proven = [False] * len(lines)
+    stack: List[str] = []
+    cont = False
+    n = 0
+    while n < len(lines):
+        ln = lines[n]
+        start_top = not stack and not cont
+        cont = False
+        pending: List[Tuple[str, bool]] = []
+        code_end = len(ln)
+        i = 0
+        while i < len(ln):
+            c = ln[i]
+            top = stack[-1] if stack else ""
+            if top == "'":
+                if c == "'":
+                    stack.pop()
+                i += 1
+                continue
+            if c == "\\":
+                if i + 1 >= len(ln):
+                    cont = True
+                i += 2
+                continue
+            if top == '"':
+                if c == '"':
+                    stack.pop()
+                elif c == "`":
+                    stack.append("`")
+                elif ln.startswith("$(", i) or ln.startswith("${", i):
+                    stack.append(ln[i + 1])
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if c == "`" and top == "`":
+                stack.pop()
+            elif c == "#" and (i == 0 or ln[i - 1] in " \t;|&()"):
+                code_end = i
+                break
+            elif c in "'\"`":
+                stack.append(c)
+            elif ln.startswith("${", i):
+                stack.append("{")
+                i += 2
+                continue
+            elif ln.startswith("((", i) or ln.startswith("$((", i):
+                # Arithmetic: << is a shift there, never a heredoc.
+                stack.append("A")
+                i += 3 if c == "$" else 2
+                continue
+            elif top == "A" and ln.startswith("))", i):
+                stack.pop()
+                i += 2
+                continue
+            elif c == "(":
+                stack.append("(")
+            elif c == ")" and top == "(":
+                stack.pop()
+            elif c == "}" and top == "{":
+                stack.pop()
+            elif "A" in stack:
+                pass
+            elif ln.startswith("<<<", i):
+                i += 3
+                continue
+            elif ln.startswith("<<", i):
+                m = XTRACE_HEREDOC_RE.match(ln, i)
+                if m:
+                    delim = next(g for g in (m.group(2), m.group(3), m.group(4), "") if g is not None)
+                    pending.append((delim, m.group(1) == "-"))
+                    i = m.end()
+                    continue
+            i += 1
+        code = ln[:code_end]
+        if not stack and (XTRACE_CONT_TAIL_RE.search(code) or XTRACE_FUNC_HEADER_RE.search(code.rstrip())):
+            cont = True
+        proven[n] = start_top and not stack and not pending and not cont
+        n += 1
+        for delim, strip in pending:
+            while n < len(lines):
+                term = lines[n].lstrip(" ") if yaml_indent else lines[n]
+                if (term.lstrip("\t") if strip else term) == delim:
+                    break
+                n += 1
+            n += 1
+    return proven
+
+
 def scan_xtrace(rel: str, text: str) -> List[Hit]:
     """Credential-bearing lines executed while xtrace is on (#4609)."""
     hits: List[Hit] = []
     traced = False
     block = 0
-    for n, ln in enumerate(text.splitlines(), 1):
+    lines = text.splitlines()
+    proven = xtrace_top_level(lines, Path(rel).suffix.lower() in (".tpl", ".yaml", ".yml"))
+    for n, ln in enumerate(lines, 1):
         if n == 1 and ln.startswith("#!"):
             traced = shebang_xtrace(ln)
             continue
         if ln.lstrip().startswith("#"):
             continue
         effect = xtrace_effect(ln)
-        if effect is False and block > 0:
+        if effect is False and (block > 0 or not proven[n - 1]):
             effect = None
         block = max(0, block + block_delta(ln))
         if effect is not None:
@@ -3375,6 +3482,31 @@ R10_XTRACE_RED = {
     '5597-x45-off-in-case-arm': 'set -x\ncase $a in\n  b) set +x ;;\nesac\n',
     # #5727: the function keyword form; pins function in XTRACE_CONDITIONAL_WORDS.
     '5727-x46-off-in-function-keyword-body': 'set -x\nfunction f { echo; set +x; }\n',
+    # #5726: a set +x ends tracing only on a line proven to be a top-level command of the
+    # current shell; in each placement below bash 5 still traces the next line (measured), except
+    # the eval row, which the gate does not read and so keeps traced (fail closed).
+    '5726-x47-multiline-subshell': 'set -x\n(\n  set +x\n)\n',
+    '5726-x48-multiline-cmdsubst': 'set -x\nv=$(\n  set +x\n)\n',
+    '5726-x49-heredoc-body': 'set -x\ncat <<EOF\nset +x\nEOF\n',
+    '5726-x50-heredoc-dash-tab': 'set -x\ncat <<-EOF\n\tset +x\n\tEOF\n',
+    '5726-x51-trailing-and': 'set -x\nfalse &&\n  set +x\n',
+    '5726-x52-trailing-pipe': 'set -x\ntrue |\n  set +x\n',
+    '5726-x53-trailing-pipe-amp': 'set -x\ntrue |&\n  set +x\n',
+    '5726-x54-backslash-or': 'set -x\ntrue || \\\n  set +x\n',
+    '5726-x55-backslash-argument': 'set -x\necho \\\n  set +x\n',
+    '5726-x56-double-quoted-lines': 'set -x\necho "\nset +x\n"\n',
+    '5726-x57-single-quoted-lines': "set -x\necho '\nset +x\n'\n",
+    '5726-x58-backtick-lines': 'set -x\nv=`\nset +x\n`\n',
+    '5726-x59-brace-expansion-lines': 'set -x\n: ${v:-\nset +x\n}\n',
+    '5726-x60-function-header-then-body': 'set -x\nf()\n{ set +x; }\n',
+    '5726-x61-function-keyword-header': 'set -x\nfunction f\n{ set +x; }\n',
+    '5726-x62-set-dashdash-plus-x': 'set -x\nset -- +x\n',
+    '5726-x63-coproc': 'set -x\ncoproc set +x\n',
+    # eval runs its words in the current shell; the gate does not read them, so it stays traced.
+    '5726-x64-eval-words-not-read': 'set -x\neval set +x\n',
+    '5726-x65-brace-after-and': 'set -x\nfalse && { set +x; }\n',
+    '5726-x66-brace-after-or-next-line': 'set -x\ntrue ||\n{ set +x; }\n',
+    '5726-x67-case-arm-one-line': 'set -x\ncase a in b) set +x;; esac\n',
 }
 R10_XTRACE_GREEN = {
     '5597-g01-set-off-later-cluster': 'set -x\nset -e +x\n',
@@ -3399,6 +3531,21 @@ R10_XTRACE_GREEN = {
     # #5727 (reviewer M6): an attached -S word is split, so -Sexpect is not read as a cluster
     # holding an x; pins the split in shebang_xtrace.
     '5727-g20-shebang-env-S-attached-no-x': '#!/usr/bin/env -Sexpect -f\n',
+    # #5726: a top-level set +x after every construct is closed still ends tracing.
+    '5726-g21-set-plus-o-xtrace': 'set -x\nset +o xtrace\n',
+    '5726-g22-set-plus-xv': 'set -x\nset +xv\n',
+    '5726-g23-here-string-then-off': 'set -x\ncat <<< "x"; set +x\n',
+    '5726-g24-after-closed-heredoc': 'set -x\ncat <<EOF\nx\nEOF\nset +x\n',
+    '5726-g25-after-closed-string': 'set -x\necho "a\nb"\nset +x\n',
+    '5726-g26-after-closed-subshell': 'set -x\n(\n  true\n)\nset +x\n',
+    '5726-g27-after-ended-continuation': 'set -x\necho a \\\n  b\nset +x\n',
+    '5726-g28-hash-inside-word': "set -x\necho a#'b'\nset +x\n",
+    '5726-g29-quote-in-comment': "set -x\ntrue # don't\nset +x\n",
+    '5726-g30-here-string-is-no-heredoc': 'set -x\ncat <<<EOF\nset +x\n',
+    '5726-g31-after-closed-dash-heredoc': 'set -x\ncat <<-EOF\n\tx\n\tEOF\nset +x\n',
+    '5726-g32-after-one-line-pipe': 'set -x\ntrue | cat\nset +x\n',
+    '5726-g33-shift-in-arith-subst': 'set -x\nv=$((1 << 2))\nset +x\n',
+    '5726-g34-shift-in-arith-command': 'set -x\n(( v = 1<<2 ))\nset +x\n',
 }
 
 # #5722 (round 11, 5-agent vote (4d3ea1c5)): these were clean probes up to round 10, because a
@@ -3732,6 +3879,18 @@ def self_test() -> int:
             if not got:
                 print("SELF-TEST FAIL: xtrace probe %r (%s) not flagged" % (name, suffix), file=sys.stderr)
                 bad += 1
+    # #5726: an indented heredoc terminator ends the body only in a YAML block scalar.
+    for suffix, want in (("probe.sh", True), ("probe.tpl", True), ("probe.yaml", False)):
+        red += 1 if want else 0
+        green += 0 if want else 1
+        body = "set -x\ncat <<EOF\nx\n  EOF\nset +x\nEOF\n" if suffix == "probe.sh" else \
+            "set -x\ncat <<EOF\nx\n  EOF\nset +x\n"
+        if suffix == "probe.tpl":
+            body = "set -x\ncat <<EOF\nx\nEOFX\nset +x\nEOF\n"
+        got = [h for h in scan_text(suffix, body + XTRACE_SECRET_LINE) if "[xtrace-secret]" in h[2]]
+        if bool(got) != want:
+            print("SELF-TEST FAIL: heredoc terminator probe (%s): %r" % (suffix, got), file=sys.stderr)
+            bad += 1
     for name, text in R10_XTRACE_GREEN.items():
         for suffix in ("probe.sh", "probe.tpl"):
             green += 1
