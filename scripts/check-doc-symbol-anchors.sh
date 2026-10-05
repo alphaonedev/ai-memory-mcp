@@ -1267,6 +1267,39 @@ PYEOF
     anchor_green 5610 "a bare bound list of live types" \
         "See \`$R::<RecallTool + RecallTool>::decorate_memory_many\`."
 
+    # #5611: a keyword is never a symbol: an anchor with one in its path is
+    # refused as UNMODELLED, and a precise-capturing use bound is skipped.
+    anchor_green 5611 "a precise-capturing bound after an impl self type" \
+        "See \`$R::<impl RecallTool + use<'a>>::decorate_memory_many\`."
+    anchor_green 5611 "an empty precise-capturing bound" \
+        "See \`$R::<impl RecallTool + use<>>::decorate_memory_many\`."
+    anchor_red_cites 5611 QUAL "a missing bound after a precise-capturing bound" \
+        "$R::NoSuch" "See \`$R::<impl RecallTool + use<'a, T> + NoSuch>::decorate_memory_many\`."
+    anchor_red_cites 5611 UNMODELLED "a function-pointer self type" \
+        "$R::<fn(u8)>::decorate_memory_many" "See \`$R::<fn(u8)>::decorate_memory_many\`."
+    anchor_red 5611 UNMODELLED "a lone function-pointer self type" \
+        "See \`$R::<fn(NoSuch)>\`."
+    anchor_red 5611 UNMODELLED "a lone unsafe function-pointer self type" \
+        "See \`$R::<unsafe fn(NoSuch)>\`."
+    anchor_red 5611 UNMODELLED "a lone extern function-pointer self type" \
+        "See \`$R::<extern \"C\" fn(NoSuch)>\`."
+    anchor_red_cites 5611 UNMODELLED "a lone keyword is not a placeholder" \
+        "$R::<fn>" "See \`$R::<fn>\`."
+    anchor_red_cites 5611 UNMODELLED "a crate-rooted path" \
+        "$R::crate::RecallTool" "See \`$R::crate::RecallTool\`."
+    anchor_red_cites 5611 UNMODELLED "a crate-rooted self type" \
+        "$R::<crate::RecallTool>::decorate_memory_many" "See \`$R::<crate::RecallTool>::decorate_memory_many\`."
+    anchor_red 5611 UNMODELLED "a crate-rooted bound" \
+        "See \`$R::<dyn RecallTool + crate::RecallTool>::decorate_memory_many\`."
+    anchor_red_cites 5611 UNMODELLED "a keyword as the last component" \
+        "$R::RecallTool::fn" "See \`$R::RecallTool::fn\`."
+    anchor_red_cites 5611 UNMODELLED "a self-rooted bare path" \
+        "$R::self::RecallTool" "See $R::self::RecallTool here."
+    anchor_red_cites 5611 UNMODELLED "a Self self type" \
+        "$R::<Self>::decorate_memory_many" "See \`$R::<Self>::decorate_memory_many\`."
+    anchor_red_cites 5611 UNMODELLED "a keyword brace item" \
+        "$R::fn" "See \`$R::{RecallTool, fn}\`."
+
     # #5190: a relative link with a plain-text label to a src/ file.
     anchor_red 5190 PATH "a plain-label link to a missing file" \
         'See [the handler](src/nope.rs) for it.'
@@ -2324,6 +2357,8 @@ def _bound_tokens(body):
             return None
         if _LIFETIME_BOUND.match(piece) or _SIZED_BOUND.match(piece):
             continue
+        if _USE_BOUND.match(piece):
+            continue
         piece = _HRTB.sub("", piece)
         path = strip_generics(piece).strip()
         if "<" in path or ">" in path or not _BOUND_PATH.match(path):
@@ -2340,6 +2375,17 @@ _PLACEHOLDER_HEAD = re.compile(_ID)
 # function pointer, text after the type it cannot place): refused as
 # UNMODELLED, never read as a placeholder or a checked type (#5610).
 UNMODELLED = object()
+# #5611: Rust's strict and reserved keywords (2024 edition). A keyword is
+# never a symbol name, so one in a checked path is refused as UNMODELLED,
+# never cited as a missing symbol and never read as a placeholder.
+KEYWORDS = frozenset(
+    "as break const continue crate else enum extern false fn for if impl in "
+    "let loop match mod move mut pub ref return self Self static struct super "
+    "trait true type unsafe use where while async await dyn "
+    "abstract become box do final macro override priv typeof unsized virtual "
+    "yield try gen".split())
+# #5611: a precise-capturing bound (`use<'a, T>`) names no type to check.
+_USE_BOUND = re.compile(r"^use\s*<[^<>]*>$")
 
 
 def _is_placeholder(inner):
@@ -2347,7 +2393,7 @@ def _is_placeholder(inner):
     #5433): an identifier with at most one balanced generic group and
     nothing else, not even whitespace (#5610)."""
     m = _PLACEHOLDER_HEAD.match(inner)
-    if not m:
+    if not m or m.group(0) in KEYWORDS:
         return False
     if m.end() == len(inner):
         return True
@@ -2528,6 +2574,10 @@ def _item_findings(rule, f, tok):
         return out
     for tok in toks:
         tok = strip_generics(tok).strip().rstrip("(){}[].,;")
+        if any(part.split("(")[0].strip() in KEYWORDS for part in tok.split("::")):
+            # #5611: a keyword is not a symbol: refuse the whole anchor.
+            out.append(("UNMODELLED", f"{f}::{whole}".replace(" ", "")))
+            return out
         if "<" in tok or ">" in tok:
             # An unbalanced group cannot be resolved: report it
             # rather than skip a component that may be missing.
@@ -2786,7 +2836,7 @@ if [[ -n "$violations" ]]; then
             BARE_QUAL) detail="symbol is not defined in the file it is qualified against (unbackticked anchor)" ;;
             BARE_LN) detail="bare file:line anchor in a live doc (rots silently); cite \`path::symbol\`, or pin a commit permalink" ;;
             UNDECIDABLE_REF) detail="anchor is refused: its character references decode differently in CommonMark and HTML, so the anchor cannot be resolved; write the characters plainly" ;;
-            UNMODELLED) detail="anchor is refused: its self type is written in a form this gate does not model, so no component can be checked; name the type and method plainly (src/x.rs::Type::method)" ;;
+            UNMODELLED) detail="anchor is refused: it is written in a form this gate does not model (a self type it cannot read, or a Rust keyword in its path), so it cannot be checked; name the type and method plainly (src/x.rs::Type::method)" ;;
             UNDECIDABLE_LT) detail="anchor is refused: a \`<\` before it may or may not open a group, and the anchor is judged differently either way; write a comparison spaced (a < b) or in code" ;;
             LADDER_TIP) detail="claimed ladder tip disagrees with the tip scripts/check-migration-ladder.sh computes (left=cited, right=actual)" ;;
             *)     detail="unresolved anchor" ;;
