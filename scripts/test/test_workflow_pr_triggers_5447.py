@@ -90,6 +90,12 @@ image.  The mutation legs at the bottom prove the reader is not vacuous: each
 mutant of the LIVE workflow files must be rejected, and the unmutated control
 must be accepted first.
 
+PyYAML 6.0.1 (yaml.SafeLoader) stood in for GitHub's own workflow parser in the
+round-4 differential, which ran outside this file: 20,000 seeded mutations of the
+live files at seed 5665 and 20,000 at seed 5666, plus the named_cells() below as
+fixed cases, gave 0 disagreements and 0 live files refused.  Where GitHub's parser
+and PyYAML differ, that probe does not see it.
+
 Run:  python3 scripts/test/test_workflow_pr_triggers_5447.py
 """
 from __future__ import annotations
@@ -804,6 +810,53 @@ def _replace_once(text: str, old: str, new: str) -> str:
     if text.count(old) < 1:
         raise AssertionError("mutation anchor not found: " + old)
     return text.replace(old, new, 1)
+
+
+def named_cells() -> List[Tuple[str, str, str]]:
+    """(name, text, refusal reason) for each known-bad shape of PR #5665 rounds 3 and 4.
+
+    Each cell is a reproducer from the round-3 review (F1 #5730, F2 #5731, F3
+    #5732) or from the round-4 differential (#5733-#5736, #5748-#5750).  The
+    test below runs every cell each time; the round-4 PyYAML probe runs the same
+    cells as fixed cases beside its seeded random ones.
+    """
+    jobs = "jobs:\n  a:\n    runs-on: x\n"
+    ci = _replace_once(load_all()["ci.yml"], '    branches: [main, develop, "release/**", "rehearsal/**"]\n',
+                       '    branches:\n      - main\n      - develop\n      - "release/**"\n'
+                       '      - release/v1.0.0\n        - rehearsal/**\n')
+    escape = "double-quoted scalar holds a backslash"
+    pr = "on:\n" + GOOD_PR
+    return [
+        ("F1-5730-block-list-continuation", ci, "continues the scalar"),
+        ("F2-5731-escaped-push-key", 'on:\n  "pu\\x73h":\n    branches: ["rehearsal/**"]\n' + jobs, escape),
+        ("F2-5731-escaped-pull-request-key", 'on:\n  "pull\\x5frequest":\n    branches: [main]\n' + jobs, escape),
+        ("F2-5731-escaped-on-key", '"o\\x6e":\n  "pu\\x73h":\n    branches: ["rehearsal/**"]\n' + jobs, escape),
+        ("F3-5732-noncharacter-fdd0", "name: x  # \ufdd0\n" + pr, "noncharacter"),
+        ("F3-5732-noncharacter-1fffe", "name: x  # \U0001fffe\n" + pr, "noncharacter"),
+        ("F3-5732-block-list-at-key-column", "on:\n  pull_request:\n    branches:\n    - main\n", "indentless sequence"),
+        ("5733-empty-flow-entry", "on:\n  pull_request:\n    branches: [main,, 'rehearsal/**']\n", "empty flow entry"),
+        ("5733-colon-in-flow-scalar", "on:\n  pull_request:\n    branches: [main, 'rehearsal/**', a:b]\n",
+         "':' inside a plain flow scalar"),
+        ("5734-typed-block-item", pr + "    paths:\n      - yes\n", "reads as other than a string"),
+        ("5735-boolean-trigger-name", "on:\n  ON:\n    branches: [x]\n" + GOOD_PR, "reads as a boolean or null"),
+        ("5736-filter-key-no-value", "on:\n  push:\n    branches:\n    tags: [v1]\n", "filter key with no value"),
+        ("5748-unicode-space-before-flow", "on:\n  push:\n    branches: \u2003[main]\n" + GOOD_PR,
+         "unterminated or non-list flow value"),
+        ("5749-merge-key-list-entry", "name: x\n" + pr + "x:\n  - a\n  - <<\n", "plain << or ="),
+        ("5750-deeper-leading-blank", "name: x\n" + pr + "x: |-\n    \n  contents: read\n",
+         "leading blank line of a block scalar"),
+    ]
+
+
+class NamedCells5665(unittest.TestCase):
+    """Every named known-bad cell is refused with its own reason (rounds 3 and 4)."""
+
+    def test_5665_named_cells_refused(self) -> None:
+        cells = named_cells()
+        self.assertEqual(15, len(cells))
+        for name, text, why in cells:
+            got = violations("x.yml", text)
+            self.assertTrue(any("R-SHAPE" in v and why in v for v in got), (name, why, got))
 
 
 class LiveWorkflows5447(unittest.TestCase):
