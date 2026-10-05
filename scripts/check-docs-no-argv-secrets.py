@@ -1450,8 +1450,10 @@ def shell_commands(text: str, lo: int = 0, hi: Optional[int] = None, depth: int 
         for a, b in subs:
             quote = text[a - 1:a]
             if quote in ("'", '"') and text[b:b + 1] == quote:
-                # A quoted string is a command string only when it is the whole word and holds a space.
-                if a - 1 == i and b + 1 == j and re.search(r"\s", text[a:b]):
+                # A quoted string is a command string only when it is the whole word, or the value
+                # of a NAME= word (#5653: PROMPT_COMMAND='...', alias q='...'), and holds a space.
+                whole = a - 1 == i or bool(ALIAS_VALUE_PREFIX_RE.fullmatch(text, i, a - 1))
+                if whole and b + 1 == j and re.search(r"\s", text[a:b]):
                     nest(a, b)
             else:
                 nest(a, b)
@@ -1638,6 +1640,9 @@ def command_lookup(text: str, words: List[Word], i: int) -> bool:
     return lookup
 
 
+# #5653: the NAME= prefix of an alias definition or an assignment whose quoted value is read
+# as a nested command string.
+ALIAS_VALUE_PREFIX_RE = re.compile(r"[^\s=/$`'\"\\]+=")
 # #5652: sudo options that hand the command to a shell (-s, -i and their long forms): the
 # command words are joined into a shell command line, a runner.
 SUDO_SHELL_MODE = frozenset({"-s", "-i", "--shell", "--login"})
@@ -1664,6 +1669,24 @@ def sudo_shell_mode(text: str, words: List[Word], i: int, j: int) -> bool:
                     k += 1
                 break
     return False
+
+
+def alias_verdict(text: str, words: List[Word], i: int, depth: int) -> Tuple[str, int]:
+    """#5653: alias NAME=VALUE defines a command line the shell re-splits when NAME runs, so
+    each literal VALUE is a command string (string_verdict). A word the gate cannot resolve
+    is a RUNNER operand: it is re-split and its credential operands are read."""
+    for k in range(i + 1, len(words)):
+        lit = plain_literal(text, words[k])
+        if lit is None:
+            return RUNNER, k
+        if lit in ("-p", "--"):
+            continue
+        name, eq, value = lit.partition("=")
+        if eq and name:
+            verdict = string_verdict(value, depth)
+            if verdict != CLEAN:
+                return verdict, k
+    return CLEAN, len(words)
 
 
 def head_verdict(text: str, words: List[Word], depth: int = 0) -> Tuple[str, int]:
@@ -1708,6 +1731,8 @@ def head_verdict(text: str, words: List[Word], depth: int = 0) -> Tuple[str, int
             return walk_shell(text, words, i, depth)
         if base == "command" and command_lookup(text, words, i):
             return CLEAN, i
+        if base == "alias":
+            return alias_verdict(text, words, i, depth)
         grammar = TRANSPARENT_WRAPPERS.get(base)
         if grammar is None:
             return CLEAN, i
@@ -2834,6 +2859,19 @@ R10_RED_PROBES = {
     '5652-r12-sudo-long-login': 'sudo --login "\\$CLI -v pw=\\$PG_PW"',
     '5652-r13-env-unknown-option': 'env -Q "\\$CLI -v pw=\\$PG_PW"',
     '5652-r14-sudo-unknown-option': 'sudo -Z "\\$CLI -v pw=\\$PG_PW"',
+    # #5653: an alias value or a NAME='...' value is a command line the shell runs later.
+    '5653-r01': 'alias q=\'"$CLI" -v pw="$PG_PW"\'',
+    '5653-r02': "alias q='$CLI -v pw=$PG_PW'",
+    '5653-r03': "alias -p q='$CLI -v pw=$PG_PW'",
+    '5653-r04': "\\alias q='$CLI -v pw=$PG_PW'",
+    '5653-r05': "builtin alias q='$CLI -v pw=$PG_PW'",
+    '5653-r06': "command alias q='$CLI -v pw=$PG_PW'",
+    '5653-r07': 'alias q=psql\\ -v\\ pw=hunter2',
+    '5653-r08': 'alias q="$CLI -v pw=$PG_PW"',
+    '5653-r09': "alias a=ls q='$CLI -v pw=$PG_PW'",
+    '5653-r10': "alias -- q='$CLI -v pw=$PG_PW'",
+    '5653-r11': "PROMPT_COMMAND='$CLI -v pw=$PG_PW'",
+    '5653-r12': "export PROMPT_COMMAND='$CLI -v pw=$PG_PW'",
 }
 # Round 10 green: no hit of any kind.
 R10_GREEN_PROBES = {
@@ -2843,6 +2881,11 @@ R10_GREEN_PROBES = {
     '5652-g02-sudo-s-no-credential': 'sudo -s "echo hi"',
     '5652-g03-nohup-one-field-program': 'nohup "\\$CLI -v pw=\\$PG_PW"',
     '5652-g04-sudo-u-arg-holds-s': 'sudo -u s "\\$CLI -v pw=\\$PG_PW"',
+    # #5653: alias and assignment values with no credential operand.
+    '5653-g01': "alias ll='ls -la'",
+    '5653-g02': "alias q='psql -h db'",
+    '5653-g03': "PROMPT_COMMAND='history -a'",
+    '5653-g04': 'MSG="see the docs for details"',
     # #5651: the real-tree mount shapes stay clean.
     '5651-g01-home-mount': 'docker run -v "$HOME/.ai-memory:/data" img',
     '5651-g02-dir-mount-ro': 'docker run -v "$TLS_DIR:/certs-src:ro" img',
