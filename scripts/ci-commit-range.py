@@ -33,11 +33,14 @@ and exit 0. merge_group does not check that base_sha is an ancestor of
 head_sha: a non-ancestor base prints base..head and exits 0.
 
 Every sha must be exactly 40 lowercase hex characters, must not be all zeros
-and must resolve to a commit here before it reaches git as an argument (git is
-always called with an argument list, never a shell).
+and must resolve to a commit here before it reaches git as an argument (the
+range path calls git only through git() and run_git(), each with an argument
+list and no shell; only the --red-proof mode runs the frozen pre-fix workflow
+block through bash -c, #5713).
 
-Output: one line "A..B" on stdout and exit 0, or one "ci-commit-range: REFUSED"
-line on stderr and exit 1. Usage errors exit 2. A failed --self-test exits 3.
+Output: one line "A..B" on stdout and exit 0, or one "ci-commit-range: REFUSED: <why>"
+line on stderr, nothing on stdout, and exit 1. Usage errors (argparse) exit 2.
+A failed --self-test exits 3. Each of these is a named self-test case (#5713).
 
     python3 scripts/ci-commit-range.py --self-test
     python3 scripts/ci-commit-range.py --red-proof   # old YAML block vs fixtures
@@ -150,7 +153,7 @@ def run_git(repo, *args):
 
 
 def build_fixture(root):
-    """Return (repo, shas): main c1..c3, a branch off c1 (b1), a shallow clone."""
+    """Return (repo, shallow, shas): repo has main c1..c3 and a branch off c1 (b1); shallow is a depth-1 clone."""
     repo = root / "repo"
     repo.mkdir()
     run_git(repo, "init", "-q", "-b", "main")
@@ -328,7 +331,7 @@ FORBIDDEN_IN_RANGE_STEP = ("HEAD~1", "merge-base", "GITHUB_EVENT_BEFORE", "rev-p
 
 
 def step_run_body(block):
-    """The run body of the step that obtains the range (the one with CALL)."""
+    """Every step of the job block whose text contains "range=" (the caller requires exactly one)."""
     steps = re.split(r"\n      - ", block)
     picked = [s for s in steps if "range=" in s]
     return picked
@@ -518,6 +521,39 @@ def self_test():
                 del os.environ[probe]
             else:
                 os.environ[probe] = saved
+        # #5713: the CLI contract stated in the module docstring, one named case each.
+        def cli(args, cwd=None, env=None):
+            return subprocess.run([sys.executable, os.path.abspath(__file__)] + args, cwd=cwd, env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        push_env = dict(os.environ, GITHUB_EVENT_NAME="push", GITHUB_EVENT_BEFORE=shas["c1"], GITHUB_SHA=shas["c3"])
+        contract = []
+        proc = cli(["--repo", str(repo)], env=dict(push_env, GITHUB_EVENT_BEFORE=shas["ghost"]))
+        contract.append(("a refusal is exactly one ci-commit-range: REFUSED: line on stderr and nothing on stdout",
+                         proc.returncode == 1 and proc.stdout == "" and len(proc.stderr.splitlines()) == 1
+                         and proc.stderr.startswith("ci-commit-range: REFUSED: ") and proc.stderr.endswith("\n")))
+        proc = cli([], cwd=str(repo), env=push_env)
+        contract.append(("--repo defaults to the current directory",
+                         proc.returncode == 0 and proc.stdout == "%s..%s\n" % (shas["c1"], shas["c3"])))
+        proc = cli(["--repo", str(repo), "--no-such-flag"], env=push_env)
+        contract.append(("an unknown flag is a usage error, exit 2", proc.returncode == 2 and proc.stdout == ""))
+        saved_st = globals()["self_test"]
+        try:
+            globals()["self_test"] = lambda: 1
+            failed_exit = main(["--self-test"])
+            globals()["self_test"] = lambda: 0
+            passed_exit = main(["--self-test"])
+        finally:
+            globals()["self_test"] = saved_st
+        contract.append(("a failed --self-test exits 3 and a passing one exits 0", failed_exit == 3 and passed_exit == 0))
+        import inspect
+        contract.append(("git() and run_git() pass an argument list and never a shell",
+                         all("shell" not in inspect.getsource(f) and '["git", "-C", str(repo)] + list(args)' in inspect.getsource(f)
+                             for f in (git, run_git))))
+        for label, good in contract:
+            total += 1
+            if not good:
+                failures += 1
+                print("FAIL %s" % label)
         # Frozen old block: the cases whose answer changed are accepted by it.
         # (Covered by --red-proof; the self-test only needs the new behaviour.)
     total += 1
