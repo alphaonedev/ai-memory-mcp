@@ -633,7 +633,7 @@ def _wget_password_options() -> str:
 
 WGET_PW_LONG_RE = re.compile(
     r"\bwget\b[^|;&]*\s--(?:" + _wget_password_options() + r")(?![\w-])[\s=]*"
-    r"(?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?\$")
+    r"(?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?(?:\$|`)")
 
 
 def scan_exec_file(dl, rel: str, text: str) -> Optional[List[Found]]:
@@ -1476,6 +1476,10 @@ ROUND3_RED = [
     ("curl -H ANSI-C quoted header", "curl -H $'Authorization: Bearer '$X h"),
     ("curl --proxy-header", 'curl --proxy-header "Proxy-Authorization: Basic $X" h'),
     # a command substitution in a credential header value is on argv as well (#5304)
+    ("wget --https-password backtick", 'wget --https-password `cat f` h'),
+    ("wget --proxy-passwd backtick", 'wget --proxy-passwd `cat f` h'),
+    ("wget --passwo= backtick prefix", 'wget --passwo=`cat f` h'),
+    ("wget --password= backtick", 'wget --password=`cat f` h'),
     ("curl -H backtick bearer", 'curl -H "Authorization: Bearer `cat f`" h'),
     ("curl -H backtick api key", 'curl -H "X-API-KEY: `cat f`" h'),
     ("curl -H backtick after the quote", "curl -H 'Authorization: Bearer '`cat f` h"),
