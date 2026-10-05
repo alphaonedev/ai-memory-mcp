@@ -3069,6 +3069,22 @@ def _git_funnel_cases(t: Path) -> Tuple[List[str], int]:
         got = _git_exec(repo, ["config", "--get", key]).stdout.decode("utf-8", "replace").strip()
         if got != want:
             bad.append("the funnel does not pin %s to %r (read back %r) (#5692)" % (key, want, got))
+    repo, shas = build("local-textconv")
+    tconv = t / "textconv-hook.py"
+    tmark = t / "textconv-ran"
+    tconv.write_text("import pathlib, sys\npathlib.Path(%r).write_text('ran')\nsys.stdout.write(open(sys.argv[1]).read())\n"
+                     % str(tmark))
+    put(repo, ".gitattributes", "%s diff=tc\n*.sh diff=tc\n" % PENDING_FILE)
+    with open(str(repo / ".git" / "config"), "a") as fh:
+        fh.write("[diff \"tc\"]\n\ttextconv = %s %s\n" % (sys.executable, tconv))
+    check("a repo-local textconv driver on the list and on scripts", repo, shas)
+    n += 1
+    try:
+        _show_or_absent(repo, "HEAD", PENDING_FILE)
+    except (RuntimeError, subprocess.CalledProcessError, OSError):
+        pass
+    if tmark.exists():
+        bad.append("a repo-local textconv program ran during the gate's git reads (#5693)")
     repo, shas = build("attr-info")
     (repo / ".git" / "info").mkdir(parents=True, exist_ok=True)
     (repo / ".git" / "info" / "attributes").write_text("%s -diff\n" % PENDING_FILE)
