@@ -2551,10 +2551,14 @@ def blank_shell_comments(text: str) -> str:
     outside quotes runs to the end of its line. shell_commands does not model comments, and a
     comment that quotes a refused flag ('# --token on argv is refused') is not a command.
     #5883: bash removes a backslash-newline pair before it reads words, so the character before
-    the pair decides (a#x after 'a\\<newline>' is one word, not a comment)."""
+    the pair decides (a#x after 'a\\<newline>' is one word, not a comment).
+    #5887: a ')' that closes $( $(( <( or >( ends an expansion inside a word ($(cmd)#x is one
+    word); one that closes a subshell or group is an operator. An unmatched ')' (a case pattern)
+    counts as a word character, so a misread keeps the text scanned (fail closed)."""
     out = list(text)
     quote = ""
     prev = "\n"
+    parens: List[bool] = []
     i = 0
     n = len(text)
     while i < n:
@@ -2572,6 +2576,12 @@ def blank_shell_comments(text: str) -> str:
             continue
         elif c in "'\"":
             quote = c
+        elif c == "(":
+            parens.append(prev in "$<>")
+        elif c == ")":
+            prev = ")" if parens and not parens.pop() else "a"
+            i += 1
+            continue
         elif c == "#" and prev in " \t\n;|&()":
             end = text.find("\n", i)
             end = n if end < 0 else end
@@ -2605,14 +2615,17 @@ def shape_word(text: str, word: Word) -> str:
 def shape_operands(text: str, words: List[Word], array: bool) -> List[Word]:
     """The words of a command that reach an exec argv as operands: after the reserved words, the
     assignments and the document markers before the head. Every comment is blanked first
-    (blank_shell_comments) except one at the head of a backtick command (echo `#x ..`), cut here;
-    a # word glued to the word before by a line continuation (#5883) is not a comment."""
+    (blank_shell_comments) except one at the head of a backtick command (echo `#x ..`), cut here:
+    a # word right after a backtick (the tokenizer keeps a word whole after a closing one, so
+    that one never heads a command). Any other # word is glued to the text before it (a
+    line continuation, #5883, or a ')' the tokenizer splits at, #5887) and is not a comment."""
     if array:
         return words
     k = 0
     while k < len(words):
         raw = text[words[k][0]:words[k][1]]
-        if raw.startswith("#") and not text.endswith("\\\n", 0, words[k][0]):
+        w0 = words[k][0]
+        if raw.startswith("#") and text[w0 - 1:w0] == "`":
             return []
         # DOC_MARKERS holds the YAML list marker "-".
         if (ASSIGN_RE.match(raw) or raw in SKIPPED_KEYWORDS or raw == "time" or raw in DOC_MARKERS
@@ -4074,6 +4087,16 @@ R11_SHAPE_RED = {
     '5883-r45-continued-hash-in-name': 'mytool --api\\\n#key S3cr3tTok --token S3cr3tTok',
     '5883-r46-continued-hash-assignment': 'A=1 B=\\\n#c mytool --token S3cr3tTok',
     '5883-r47-escaped-char-then-hash': 'mytool \\a#x --token S3cr3tTok',
+    # #5887: a ')' that closes an expansion inside a word is not an operator, so a # after it
+    # is part of the word, not a comment.
+    '5887-r48-cmdsubst-then-hash': 'mytool $(echo a)#x --token S3cr3tTok',
+    '5887-r49-arith-then-hash': 'mytool a$((1))#x --token S3cr3tTok',
+    '5887-r50-procsubst-then-hash': 'mytool <(true)#x --token S3cr3tTok',
+    '5887-r51-case-in-cmdsubst': 'mytool $(case a in a) echo z;; esac)#x --token S3cr3tTok',
+    '5887-r52-nested-subshell-in-cmdsubst': 'mytool a$( (echo b) )#x --token S3cr3tTok',
+    # #5887: only a # word right after an OPENING backtick heads a comment.
+    '5887-r53-closing-backtick-then-hash': '`echo mytool`#x --token S3cr3tTok',
+    '5887-r54-glued-hash-inside-backticks': 'echo `B=\\\n#c mytool --token S3cr3tTok`',
 }
 R11_SHAPE_GREEN = {
     '5725-g01-password-stdin': 'docker login -u u --password-stdin registry.example.com',
@@ -4109,6 +4132,9 @@ R11_SHAPE_GREEN = {
     # #5883: a continuation after a blank, or followed by a blank, still leaves a real comment.
     '5883-g28-blank-then-continuation': 'mytool a \\\n#x --token S3cr3tTok',
     '5883-g29-continuation-then-blank': 'mytool a\\\n  #x --token S3cr3tTok',
+    # #5887: a ')' that closes a subshell or a group is an operator; a # after it is a comment.
+    '5887-g30-subshell-then-comment': '(true)#x | mytool --token S3cr3tTok',
+    '5887-g31-nested-subshell-then-comment': '( (true) )#x | mytool --token S3cr3tTok',
 }
 # #5725 STATED LIMITS: shapes the rule does not read, each pinned as missed so the limit text in
 # the header and the changelog stays measured (a rule that closes one must update both).
