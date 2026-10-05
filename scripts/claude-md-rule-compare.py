@@ -1169,7 +1169,7 @@ def _self_test_cases() -> int:
 
         def detect_like_314(readline):
             first = readline()
-            if first == b"# coding: utf-16\n":
+            if b"utf-16" in first:
                 raise SyntaxError("invalid or missing encoding declaration")
             lines = iter([first])
             return real_detect(lambda: next(lines, b"") or readline())
@@ -1177,7 +1177,8 @@ def _self_test_cases() -> int:
         try:
             for label, detect in (("the running detect_encoding", real_detect), ("a 3.14-style detect_encoding", detect_like_314)):
                 tokenize.detect_encoding = detect
-                for data in (utf16, b"#!/usr/bin/env python3\n" + utf16, b"\n" + utf16):
+                for data in (utf16, b"#!/usr/bin/env python3\n" + utf16, b"\n" + utf16,
+                             b"# vim: set fileencoding=utf-16 :\n" + plain):
                     why = refusal_prefix_gap(data)
                     if "the source declares the encoding utf-16, not plain utf-8" not in why:
                         return f"a utf-16 cookie gave {why!r} under {label}, not the declared-encoding reason (R3, #5771)"
@@ -1190,6 +1191,9 @@ def _self_test_cases() -> int:
                         return f"{data[:12]!r} gave {why!r} under {label}, not {needle!r} (R3, #5771)"
         finally:
             tokenize.detect_encoding = real_detect
+        # #5771: a source that starts with a utf-8 BOM is left to detect_encoding (the same reason on 3.9.25 to 3.14.8).
+        if cookie_gap(bom + b"# \xff\n" + plain) or cookie_gap(bom + b"# coding: latin-1\n" + plain):
+            return "the docstring says cookie_gap leaves a source that starts with a BOM to detect_encoding (R3, #5771)"
         for label, spelling in (("UTF8", b"UTF8"), ("Utf8", b"Utf8"), ("utf-8-sig without a BOM", b"utf-8-sig"), ("utf_8", b"utf_8")):
             try:
                 compile(b"# coding: " + spelling + b"\nx = 1\n", "f", "exec")
@@ -1201,10 +1205,13 @@ def _self_test_cases() -> int:
         except SyntaxError:
             pass
         for label, prefix, judged in (("blank line 1", b"\n", True), ("comment line 1", b"# note\n", True), ("a shebang", b"#!/usr/bin/env python3\n", True),
-                                      ("a code line 1", b"x = 1\n", False)):
+                                      ("a CRLF blank line 1", b"\r\n", True), ("a code line 1", b"x = 1\n", False)):
             why = refusal_prefix_gap(prefix + b"# coding: utf-7\n" + plain)
             if ("declares the encoding utf-7" in why) != judged:
                 return f"the docstring says a cookie on line 2 after {label} is {'judged' if judged else 'not judged'} but the reason was {why!r} (R3, #5624)"
+        # #5771: cookie_gap itself (not detect_encoding) judges line 2 after a CRLF blank line 1.
+        if "utf-7" not in cookie_gap(b"\r\n# coding: utf-7\n" + plain):
+            return "the docstring says cookie_gap judges line 2 after a blank line 1 that ends in CRLF (R3, #5771)"
         asserted.add("R3")
         for label, data in {"a byte after line 2": b'"""doc"""\n# note\n# \xff\n' + refusal.encode(), "an overlong form": b'"""doc"""\n# note\n# \xc0\xaf\n' + refusal.encode(),
                             "an encoded surrogate": b'"""doc"""\n# note\n# \xed\xa0\x80\n' + refusal.encode()}.items():  # R4
