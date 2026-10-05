@@ -56,6 +56,7 @@ import shutil
 import stat
 import subprocess
 from pathlib import Path
+from typing import NamedTuple
 
 GUARD_REL = "scripts/check-claude-md-size.py"
 MANIFEST_REL = "scripts/qc-allowlists/claude-md-rule-sections.sha256"
@@ -333,12 +334,26 @@ def non_isolated_child(script: Path, flags: list, scratch: Path):
                           capture_output=True, text=True, check=False)
 
 
-def plant_probe(name: str, probe: Path, xopts: list, env=None, isolate=("-S", "-E")):
-    """#5441: plant `name`.py beside a child run under -S -E (plus the interpreter options `xopts`) that imports
-    `name`; `env` (None: inherit) is the child's environment, `isolate` its isolation flags. The CHILD reports, before importing, whether it is already loaded, built-in or frozen (read through
-    _frozen_importlib), so the verdict never depends on the parent's -X options or Python version. Returns
-    (shadowable, preloaded, planted_ran, ok): ok is False when the child did not report or the planted file ran
-    and was not expected to (or the reverse)."""
+class Plant(NamedTuple):
+    """#5473: what plant_probe measured. `ok` is False when the child did not report, the planted file ran and was not
+    expected to (or the reverse), or the flags the child reports differ from the flags plant_probe passed it."""
+    shadowable: bool
+    preloaded: bool
+    planted_ran: bool
+    ok: bool
+    no_site: int
+    ignore_env: int
+    safe_path: int
+    frozen_xopt: str
+
+
+def plant_probe(name: str, probe: Path, xopts: list, env=None, isolate=("-S", "-E")) -> Plant:
+    """#5441: plant `name`.py beside a child that imports `name`, run with the isolation flags `isolate` (default
+    -S -E) plus the interpreter options `xopts`; `env` (None: inherit) is the child's environment. Before importing,
+    the CHILD prints its own verdict (through _frozen_importlib): whether `name` is already loaded, and whether it is
+    loaded, built-in or frozen, together with the flags it was started with (#5473: sys.flags.no_site,
+    sys.flags.ignore_environment, sys.flags.safe_path where the interpreter has it, and the frozen_modules -X
+    option). Nothing is assumed about the interpreter: the callers compare these reports with what they require."""
     probe.mkdir(parents=True, exist_ok=True)
     (probe / f"{name}.py").write_text("print('PLANTED')\nraise SystemExit(0)\n", encoding="utf-8")
     (probe / "probe.py").write_text(
@@ -346,17 +361,23 @@ def plant_probe(name: str, probe: Path, xopts: list, env=None, isolate=("-S", "-
         f"name = {name!r}\n"
         "pre = name in sys.modules\n"
         "print('VERDICT', int(pre), int(pre or name in sys.builtin_module_names "
-        "or fi.FrozenImporter.find_spec(name) is not None))\n"
+        "or fi.FrozenImporter.find_spec(name) is not None), sys.flags.no_site, sys.flags.ignore_environment, "
+        "int(getattr(sys.flags, 'safe_path', 0)), sys._xoptions.get('frozen_modules') or '-')\n"
         "__import__(name)\n"
         "print('REAL')\n", encoding="utf-8")
     result = subprocess.run([sys.executable, *xopts, *isolate, str(probe / "probe.py")],
                             capture_output=True, text=True, check=False, cwd=str(probe), env=env)
     verdict = [line.split() for line in result.stdout.splitlines() if line.startswith("VERDICT ")]
-    if len(verdict) != 1 or len(verdict[0]) != 3:
-        return (False, False, False, False)
+    if len(verdict) != 1 or len(verdict[0]) != 7 or not all(word.isdigit() for word in verdict[0][1:6]):
+        return Plant(False, False, False, False, -1, -1, -1, "?")
     preloaded, inert = verdict[0][1] == "1", verdict[0][2] == "1"
+    no_site, ignore_env, safe_path, frozen_xopt = int(verdict[0][3]), int(verdict[0][4]), int(verdict[0][5]), verdict[0][6]
+    want_frozen = next((xopts[i + 1].split("=", 1)[1] for i in range(len(xopts) - 1)
+                        if xopts[i] == "-X" and xopts[i + 1].startswith("frozen_modules=")), "-")
+    flags_ok = (no_site, ignore_env, frozen_xopt) == (int("-S" in isolate), int("-E" in isolate), want_frozen)
     planted = "PLANTED" in result.stdout
-    return (not inert, preloaded, planted, planted == (not inert))
+    return Plant(not inert, preloaded, planted, planted == (not inert) and flags_ok, no_site, ignore_env, safe_path,
+                 frozen_xopt)
 
 
 def plant_coverage_gap(probed: list, names: list, rounds: int) -> bool:
@@ -368,7 +389,7 @@ def plant_coverage_gap(probed: list, names: list, rounds: int) -> bool:
 # truth that does not come from imported_modules() itself. Adding or removing an import without updating this tuple
 # makes the self-test red.
 EXPECTED_IMPORTS = ("argparse", "ast", "difflib", "importlib", "os", "pathlib", "py_compile", "re", "shutil", "stat",
-                    "subprocess")
+                    "subprocess", "typing")
 
 
 def import_pin_gap(found: list, pinned) -> tuple:
@@ -620,10 +641,17 @@ def _self_test_cases() -> int:
         probed = []
         for xopts in ([], ["-X", "frozen_modules=off"]):
             for name in names:
-                _, preloaded, _, ok = plant_probe(name, base_dir / "implant", xopts)
-                if name == "importlib" and preloaded:
+                plant = plant_probe(name, base_dir / "implant", xopts)
+                # #5473: the flags the CHILD reports must be the ones this check relies on (-S -E, no safe path, and
+                # the frozen_modules option asked for), whatever the interpreter or its site start-up does.
+                if (plant.no_site, plant.ignore_env, plant.safe_path) != (1, 1, 0) \
+                        or plant.frozen_xopt != ("off" if xopts else "-"):
+                    return (f"the probe child reported no_site/ignore_environment/safe_path/frozen_modules "
+                            f"{(plant.no_site, plant.ignore_env, plant.safe_path, plant.frozen_xopt)} for {name} "
+                            f"(xopts {xopts}), not (1, 1, 0, {'off' if xopts else '-'}) (#5473)")
+                if name == "importlib" and plant.preloaded:
                     return "importlib was already loaded under -S -E, so the probe is not independent of site (#5442)"
-                if not ok:
+                if not plant.ok:
                     return f"the planted {name}.py behaved differently from the child's own verdict (xopts {xopts})"
                 probed.append(name)
         if plant_coverage_gap(probed, names, 2):
@@ -633,21 +661,27 @@ def _self_test_cases() -> int:
             return "the coverage check does not tell a narrowed probe from a full one"
         # #5441: encodings is loaded at every interpreter start and is not frozen, so its plant must stay inert
         # and the child must say it was preloaded, on every Python version.
-        _, enc_pre, enc_ran, enc_ok = plant_probe("encodings", base_dir / "implant", [])
-        if not (enc_pre and not enc_ran and enc_ok):
+        enc = plant_probe("encodings", base_dir / "implant", [])
+        if not (enc.preloaded and not enc.planted_ran and enc.ok):
             return "a preloaded module's planted file ran, or the child did not report it preloaded"
         # #5441: -E keeps the child independent of PYTHON* variables; PYTHONSAFEPATH=1 (3.11+) would drop the
         # script directory from sys.path and make the planted file inert while the child reports it shadowable.
-        _, _, _, safe_ok = plant_probe("importlib", base_dir / "implant", [], {**os.environ, "PYTHONSAFEPATH": "1"})
-        if not safe_ok:
+        if not plant_probe("importlib", base_dir / "implant", [], {**os.environ, "PYTHONSAFEPATH": "1"}).ok:
             return "the probe child honours PYTHONSAFEPATH, so its result depends on the environment"
         # Negative control: without -E the same variable makes the planted file inert on 3.11+, and the probe must
         # say so (ok False); this shows the PYTHONSAFEPATH case above can fail, and that ok is not always True.
         if sys.version_info >= (3, 11):
             control = plant_probe("importlib", base_dir / "implant", [],
                                   {**os.environ, "PYTHONSAFEPATH": "1"}, ("-S",))
-            if control[3]:
+            if control.ok:
                 return "the probe cannot tell an inert planted file from a live one"
+        # #5473: the flag report can say 0. A child started without -S must report no_site 0 (and -E still 1), and a
+        # child started without -E must report ignore_environment 0; an always-1 report is red.
+        no_s = plant_probe("importlib", base_dir / "implant", [], isolate=("-E",))
+        no_e = plant_probe("importlib", base_dir / "implant", [], isolate=("-S",))
+        if (no_s.no_site, no_s.ignore_env, no_e.no_site, no_e.ignore_env) != (0, 1, 1, 0) or not (no_s.ok and no_e.ok):
+            return "the probe child's flag report does not follow the flags it was started with (#5473)"
+        print(f"INFO: self-test - importlib already loaded without -S: {no_s.preloaded} (measured, not assumed)")
         return ""
 
     plant_failure = importlib_plant()
