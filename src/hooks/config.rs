@@ -42,9 +42,9 @@
 //   checked here; the executor (G3) is the right layer for that
 //   so a missing binary surfaces as an executor error with full
 //   context, not a config-parse error before the daemon boots.
-// * `namespace` — non-empty string. A real glob/pattern matcher
-//   does not yet exist in this crate; G2/G3 will swap in the
-//   real one when it ships. See the TODO below.
+// * `namespace` — non-empty string. Shape-only check here; the
+//   runtime matcher is `HookConfig::matches_namespace` (`*`,
+//   exact, or `prefix/*` glob), so no pattern is parsed at load.
 // * Parse errors include the failing TOML span (line:col) via
 //   `toml::de::Error::span()` when the underlying error carries
 //   one.
@@ -139,7 +139,7 @@ pub const MAX_TIMEOUT_MS: u32 = 30_000;
 
 /// v0.7.0 R3-S3 — default execution mode for a given event.
 ///
-/// CLAUDE.md and ROADMAP §4.7 both call out that hot-path events
+/// `docs/hook-pipeline.md` ("Hot-path constraint") requires that hot-path events
 /// must default to `mode = "daemon"` so a configured-but-unspecified
 /// hook does not pay subprocess spawn cost on every recall / search.
 /// Pre-R3 this was a documentation-only assertion: `HookConfig.mode`
@@ -200,9 +200,10 @@ impl HookConfig {
     /// contrary to explicit scope. This restores the intended semantics.
     ///
     /// Matching (mirrors [`crate::config::TranscriptsConfig::auto_extract_for`]):
-    /// a `*` (or empty) pattern matches everything — the schema default, so a
-    /// config that already uses `namespace = "*"` is byte-identical to the
-    /// pre-fix behaviour. A non-wildcard pattern matches EXACTLY, or as a
+    /// a `*` pattern matches everything (the field is required, so there is no schema
+    /// default; load-time validation rejects empty, and an empty pattern would match
+    /// all anyway), so a config that already uses `namespace = "*"` is byte-identical
+    /// to the pre-fix behaviour. A non-wildcard pattern matches EXACTLY, or as a
     /// `prefix/*` glob (the prefix itself and any child under `prefix/`). A
     /// scoped hook fired against a payload that carries NO namespace (`None` —
     /// eviction / some recall shapes) does NOT fire: the operator scoped it to
@@ -384,11 +385,10 @@ fn validate_hook(idx: usize, h: &HookConfig) -> Result<(), HooksConfigError> {
             reason: "must be a non-empty path".into(),
         });
     }
-    // TODO(G2/G3): validate namespace against the real
-    // pattern matcher once it ships. Today no glob matcher
-    // exists in src/ — `db::matches_subtree` is prefix-only
-    // and not callable from this layer. For now we accept any
-    // non-empty string.
+    // Shape-only validation: any non-empty string is accepted here. The runtime
+    // matcher, `HookConfig::matches_namespace` (`*`, exact match, or `prefix/*`
+    // glob), decides at fire time whether a hook covers a namespace; load does
+    // not parse the pattern.
     if h.namespace.trim().is_empty() {
         return Err(HooksConfigError::Validation {
             field: format!("hook[{idx}].namespace"),
@@ -724,7 +724,7 @@ namespace = "*"
 
     /// `test_post_recall_default_mode_is_daemon` — when a `post_recall`
     /// hook block omits `mode`, the loader fills it in with `Daemon`
-    /// per CLAUDE.md + ROADMAP §4.7. Pre-R3 this was a doc-only
+    /// per `docs/hook-pipeline.md` ("Hot-path constraint"). Pre-R3 this was a doc-only
     /// claim: `mode` was a required field, so an unspecified `mode`
     /// produced a parse error rather than the documented daemon
     /// default. R3-S3 closes the gap.
@@ -976,7 +976,7 @@ namespace = "team/*"
             fail_mode: FailMode::Open,
         };
 
-        // Wildcard (schema default) matches every namespace AND a
+        // Wildcard (explicit; the field is required) matches every namespace AND a
         // namespace-less payload (byte-identical to the pre-fix behaviour).
         assert!(mk("*").matches_namespace(Some("anything")));
         assert!(mk("*").matches_namespace(None));
