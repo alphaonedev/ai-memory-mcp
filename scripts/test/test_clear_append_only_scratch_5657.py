@@ -49,6 +49,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -56,7 +57,22 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "clear-append-only-scratch.py"
 WF_DIR = ROOT / ".github" / "workflows"
+# The hardcoded FLOOR, not the list of copies: at least these two workflows must
+# carry a janitor copy. The copies themselves are DISCOVERED from their bodies by
+# `janitor_steps()`, so a third workflow that inlines one cannot hide (#6041).
 WORKFLOWS = [WF_DIR / "ci.yml", WF_DIR / "session-boot-lifetime.yml"]
+# Three strings every copy of the janitor carries and nothing else in the workflow
+# tree does: the script's own path, its journal constant, and its entry point.
+JANITOR_MARKERS = ("clear-append-only-scratch", "PENDING_RESTORE_FILE", "def main(")
+# A janitor step that has not finished by now is blocked, not slow: it must be a
+# failure with a reason, never a wait (#6040).
+CLEAR_TIMEOUT_SECONDS = 180.0
+# The same bound for a seam this process holds open itself: a `flock` that waits
+# instead of refusing is not reachable by a child's `timeout=` (#6040).
+IN_PROCESS_TIMEOUT_SECONDS = 30.0
+HELPER_TIMEOUT_SECONDS = 60.0
+CHILD_TIMEOUT_SECONDS = 180.0
+JANITOR_STEP_TIMEOUT_CEILING_MINUTES = 15
 CLEAR_STEP = "Clear stale append-only scratch (#5657)"
 SELFTEST_REL = "scripts/test/test_clear_append_only_scratch_5657.py"
 CHECKOUT_PREFIX = "actions/checkout@"
@@ -74,7 +90,8 @@ def _priv():
 def _sudo_available():
     if os.geteuid() == 0:
         return True
-    return subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0
+    return subprocess.run(["sudo", "-n", "true"], capture_output=True,
+                          timeout=HELPER_TIMEOUT_SECONDS).returncode == 0
 
 
 def set_flag(path, immutable=False):
@@ -84,7 +101,7 @@ def set_flag(path, immutable=False):
         os.lchflags(str(path), os.lstat(str(path)).st_flags | bit)
         return
     r = subprocess.run(_priv() + ["chattr", "+i" if immutable else "+a", str(path)],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, timeout=HELPER_TIMEOUT_SECONDS)
     if r.returncode != 0:
         raise unittest.SkipTest("cannot set an inode flag on this host: %s" % r.stderr.strip())
 
@@ -94,14 +111,16 @@ def drop_flags(path):
     if IS_BSD:
         os.lchflags(str(path), 0)
     else:
-        subprocess.run(_priv() + ["chattr", "-a", "-i", str(path)], capture_output=True)
+        subprocess.run(_priv() + ["chattr", "-a", "-i", str(path)], capture_output=True,
+                       timeout=HELPER_TIMEOUT_SECONDS)
 
 
 def is_flagged(path):
     """True when an append-only / immutable flag is still set on path."""
     if IS_BSD:
         return bool(os.lstat(str(path)).st_flags & (stat.UF_APPEND | stat.UF_IMMUTABLE))
-    r = subprocess.run(_priv() + ["lsattr", "-d", str(path)], capture_output=True, text=True)
+    r = subprocess.run(_priv() + ["lsattr", "-d", str(path)], capture_output=True, text=True,
+                       timeout=HELPER_TIMEOUT_SECONDS)
     if r.returncode != 0 or not r.stdout.strip():
         raise unittest.SkipTest("cannot read inode flags on this host: %s" % r.stderr.strip())
     return any(c in r.stdout.split()[0] for c in "ai")
@@ -270,7 +289,8 @@ def _heal_stranded_fixtures(base=None):
             for ws in workspaces:
                 if not os.path.lexists(ws):
                     continue
-                subprocess.run(["chmod", "-R", "u+rwX", ws], capture_output=True)
+                subprocess.run(["chmod", "-R", "u+rwX", ws], capture_output=True,
+                               timeout=HELPER_TIMEOUT_SECONDS)
                 shutil.rmtree(ws, ignore_errors=True)
                 if os.path.lexists(ws):
                     problems.append("%s: could not be removed" % ws)
@@ -342,18 +362,50 @@ def load_script_module():
     return mod
 
 
-def run_clear(root, privileged=False):
-    """Run the janitor. Unprivileged by default: that is how CI runs it."""
+def run_clear(root, privileged=False, timeout=CLEAR_TIMEOUT_SECONDS):
+    """Run the janitor. Unprivileged by default: that is how CI runs it.
+
+    The wait is bounded and its expiry is a FAILURE that names itself: a janitor
+    that blocks on the journal's lock instead of refusing it used to produce no
+    result line at all, which hangs the suite rather than reding it (#6040)."""
     cmd = ([] if (IS_BSD or not privileged) else _priv()) + [sys.executable, str(SCRIPT), "--root", str(root)]
-    return subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as expiry:
+        raise AssertionError(
+            "the janitor did not finish within %gs, so it is blocked and not merely slow - a run "
+            "that waits on the journal's lock instead of refusing it never reports at all (#6040). "
+            "stdout=%r stderr=%r" % (timeout, expiry.stdout, expiry.stderr))
+
+
+@contextlib.contextmanager
+def bounded(seconds, why):
+    """Bound a seam this process runs itself, and make its expiry a FAILURE.
+
+    `subprocess.run` has `timeout=`; an in-process `flock` that WAITS instead of
+    refusing has no such bound, and an unbounded wait is a suite that never
+    reports at all rather than a red test (#6040). The handler raises, so the
+    blocked call is not retried on EINTR."""
+    def ring(signum, frame):
+        raise AssertionError("%s did not finish within %gs, so it is blocked and not merely slow "
+                             "(#6040)" % (why, seconds))
+
+    previous = signal.signal(signal.SIGALRM, ring)
+    remaining = signal.setitimer(signal.ITIMER_REAL, seconds)[0]
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, remaining if remaining > 0 else 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def run_clear_in_process(mod, root):
     """Run the janitor inside this process, so a seam can be held open across
     it. Returns `(rc, stdout, stderr)`."""
     out, err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        rc = mod.main(["--root", str(root)])
+    with bounded(IN_PROCESS_TIMEOUT_SECONDS, "the janitor running in this process"):
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = mod.main(["--root", str(root)])
     return rc, out.getvalue(), err.getvalue()
 
 
@@ -551,14 +603,16 @@ class ScratchTree(unittest.TestCase):
         # - the one step that needs privilege, and only on Linux. On BSD a
         # symlink carries flags of its own and `drop_flags` uses `lchflags`,
         # which never follows it; Linux has no flags on a symlink.
-        subprocess.run(["chmod", "-R", "u+rwX", str(self.ws)], capture_output=True)
+        subprocess.run(["chmod", "-R", "u+rwX", str(self.ws)], capture_output=True,
+                       timeout=HELPER_TIMEOUT_SECONDS)
         try:
             for path in self.ws.rglob("*"):
                 if IS_BSD or not path.is_symlink():
                     drop_flags(path)
         except OSError:
             pass
-        subprocess.run(["chmod", "-R", "u+rwX", str(self.ws)], capture_output=True)
+        subprocess.run(["chmod", "-R", "u+rwX", str(self.ws)], capture_output=True,
+                       timeout=HELPER_TIMEOUT_SECONDS)
         shutil.rmtree(self.ws, ignore_errors=True)
 
     # -- the defect itself -------------------------------------------------
@@ -1123,7 +1177,7 @@ class ScratchTreeCase(ScratchTree):
             killed = subprocess.run(
                 [sys.executable, "-c", _KILLED_MID_WIDEN, str(Path(__file__).resolve()),
                  str(self.ws), str(d)],
-                capture_output=True, text=True)
+                capture_output=True, text=True, timeout=CHILD_TIMEOUT_SECONDS)
             # Without these two the test is vacuous (#2444): a child that dies
             # before it widens anything leaves a mode that was never changed,
             # and a child that EXITS has run the code the defect is about.
@@ -1242,7 +1296,7 @@ class JournalCase(ScratchTree):
         killed = subprocess.run(
             [sys.executable, "-c", _KILLED_AT_NTH, str(Path(__file__).resolve()), str(self.ws),
              seam, str(nth), str(ino)] + [str(p) for p in watch],
-            capture_output=True, text=True)
+            capture_output=True, text=True, timeout=CHILD_TIMEOUT_SECONDS)
         # Without these two the test is vacuous (#2444): a child that dies
         # before the Nth widen leaves nothing widened, and a child that EXITS
         # has run the code a kill skips.
@@ -1679,20 +1733,246 @@ class JournalCase(ScratchTree):
             return chunk
 
         try:
-            with mock.patch.object(mod.os, "pread", pread):
-                with contextlib.suppress(OSError):
-                    first.load()
+            with bounded(IN_PROCESS_TIMEOUT_SECONDS, "the two runs racing over the journal"):
+                with mock.patch.object(mod.os, "pread", pread):
+                    with contextlib.suppress(OSError):
+                        first.load()
         finally:
             for journal in (first, second):
                 if journal._fd is not None:
                     os.close(journal._fd)
                     journal._fd = None
         self.assertTrue(race, "the second run never got to append while the first one was reading")
-        if "ident" in race:
-            self.assertIn(("+ %s " % race["ident"]).encode("ascii"), self.journal().read_bytes(),
-                          "the torn-tail cut deleted a line another run had fsynced")
-        else:
-            self.assertIn("refused", race, race)
+        # #6039: this tail used to accept EITHER outcome, and the refusal leg was
+        # the one taken in every green run - so the data-loss assertion under it
+        # never executed, and an ordering that takes the lock AFTER the first
+        # read left the whole suite green while losing the line. The refusal is
+        # required now: the first run owns the journal from before the length it
+        # cuts to is measured until the cut lands, so a second run in that window
+        # CANNOT have appended. The data-loss leg itself is driven, reached and
+        # asserted by `test_a_line_appended_without_the_lock_is_never_cut_away_6042`,
+        # where the appending writer does not go through the lock at all.
+        self.assertNotIn("ident", race,
+                         "the second run appended a whole line while the first one was still "
+                         "reading the journal, so the first run did not own the journal before the "
+                         "length it cuts to was measured (#6039): journal=%r"
+                         % (self.journal().read_bytes(),))
+        self.assertIn("refused", race, race)
+        self.assertIn(getattr(race["refused"], "errno", None), (errno.EAGAIN, errno.EWOULDBLOCK),
+                      "the second run was turned away for something other than the journal's lock, "
+                      "so this test no longer pins the lock: %r" % (race["refused"],))
+        # Without this the test is vacuous (#2444): a first run that never
+        # reached its cut would never have opened the window at all.
+        self.assertEqual(self.journal().read_bytes(), b"",
+                         "the first run did not cut the torn tail it owns, so the window this test "
+                         "is about was never opened")
+
+    def test_the_journal_is_owned_before_its_first_byte_is_read_6039(self):
+        """#6039. The torn-tail cut truncates to a length this run READ, so the
+        journal must be this run's alone from before that length is measured
+        until the cut has landed; every append and the final empty-out are in
+        the same window. An independent descriptor probes the lock at each of
+        those seams: an ordering that takes the lock later than the first read
+        leaves the probe able to take it, and that is the window #6034 lost a
+        fsynced line in. `flock` is per open file description, so the probe is
+        refused by this process's own lock exactly as another process would be."""
+        mod = load_script_module()
+        torn = b"+ 0123abcd.1 1 2 0 4"
+        fd = os.open(str(self.journal()), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, torn)
+        finally:
+            os.close(fd)
+        target = self.scratch / ".tmpO"
+        target.mkdir()
+        seen = []
+        real = {"pread": os.pread, "ftruncate": os.ftruncate, "write": os.write}
+        first = os.stat(str(self.journal()))
+        origin = (first.st_dev, first.st_ino)
+
+        def probe(where):
+            try:
+                opened = os.open(str(self.journal()), os.O_RDONLY)
+            except OSError as err:
+                seen.append((where, "could not be probed: %r" % (err,)))
+                return
+            try:
+                fcntl.flock(opened, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as err:
+                seen.append((where, err.errno))
+            else:
+                fcntl.flock(opened, fcntl.LOCK_UN)
+                seen.append((where, "TAKEN"))
+            finally:
+                os.close(opened)
+
+        def is_journal(fd):
+            """The journal by identity, never by `journal._fd`: the descriptor is
+            read from before `_fd` is assigned, so keying off `_fd` cannot see an
+            ordering whose first read happens there - which is the ordering this
+            test exists to refuse (#6039)."""
+            try:
+                st = os.fstat(fd)
+            except OSError:
+                return False
+            if (st.st_dev, st.st_ino) == origin:
+                return True
+            try:
+                now = os.stat(str(self.journal()))
+            except OSError:
+                return False
+            return (st.st_dev, st.st_ino) == (now.st_dev, now.st_ino)
+
+        def watched(where):
+            def call(fd, *args):
+                if is_journal(fd):
+                    probe(where)
+                return real[where](fd, *args)
+            return call
+
+        journal = mod.Journal(str(self.scratch))
+        try:
+            with bounded(IN_PROCESS_TIMEOUT_SECONDS, "the run that must own the journal"), \
+                    mock.patch.object(mod.os, "pread", watched("pread")), \
+                    mock.patch.object(mod.os, "ftruncate", watched("ftruncate")), \
+                    mock.patch.object(mod.os, "write", watched("write")):
+                journal.load()
+                ident = journal.hold(str(target), os.lstat(str(target)), 0o400, 0o500)
+                journal.release(ident)
+                journal.finish(True)
+        finally:
+            if journal._fd is not None:
+                os.close(journal._fd)
+                journal._fd = None
+        self.assertEqual([row for row in seen if row[1] == "TAKEN"], [],
+                         "the journal's lock was free at a seam that reads, cuts or appends to it, "
+                         "so the length those seams trust is not this run's alone (#6039): %r"
+                         % (seen,))
+        for where, outcome in seen:
+            self.assertIn(outcome, (errno.EAGAIN, errno.EWOULDBLOCK),
+                          "the probe at %r neither took the journal's lock nor was refused it, so "
+                          "it pins nothing: %r" % (where, seen))
+        # Without this the test is vacuous (#2444): a run that reached none of
+        # those seams leaves `seen` empty and passes having probed nothing.
+        self.assertEqual(sorted(set(where for where, _ in seen)), ["ftruncate", "pread", "write"],
+                         "a seam this test is about was never reached: %r" % (seen,))
+
+    def test_a_line_appended_without_the_lock_is_never_cut_away_6042(self):
+        """#6042, and the data-loss leg of #6034 driven so that it is REACHED.
+        The cut's only protection was the advisory lock: it truncates to a
+        length read earlier and nothing re-checked it against the file. Here the
+        writer that appends inside that window does not take the lock at all -
+        the shape of a run with the #6039 ordering, of a filesystem where
+        `flock` does not exclude, or of any other process - so the cut cannot be
+        made at a length that is no longer the file's. The journal is refused
+        instead, and the bytes that were already fsynced are still there."""
+        mod = load_script_module()
+        torn = b"+ 0123abcd.1 1 2 0 4"
+        fd = os.open(str(self.journal()), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, torn)
+        finally:
+            os.close(fd)
+        glued = b"\n+ 89abcdef.1 1 2 0 4\n"
+        real, race = os.pread, {}
+
+        def pread(fd, size, offset):
+            chunk = real(fd, size, offset)
+            if not chunk and not race:
+                other = os.open(str(self.journal()), os.O_WRONLY | os.O_APPEND)
+                try:
+                    race["wrote"] = os.write(other, glued)
+                    os.fsync(other)
+                finally:
+                    os.close(other)
+            return chunk
+
+        journal = mod.Journal(str(self.scratch))
+        try:
+            with bounded(IN_PROCESS_TIMEOUT_SECONDS, "the run that must not cut a stale length"), \
+                    mock.patch.object(mod.os, "pread", pread):
+                held, problems = journal.load()
+        finally:
+            if journal._fd is not None:
+                os.close(journal._fd)
+                journal._fd = None
+        self.assertEqual(race.get("wrote"), len(glued),
+                         "nothing was appended inside the read, so the window this test is about "
+                         "never opened")
+        self.assertIn(glued, self.journal().read_bytes(),
+                      "the torn-tail cut truncated to a length read before another writer appended, "
+                      "deleting bytes that were already fsynced (#6042)")
+        self.assertIsNotNone(journal.refused,
+                             "the journal grew under the cut and was neither cut nor refused, so a "
+                             "widen its torn line may describe is neither applied nor reported "
+                             "(#6042)")
+        self.assertTrue(any("incomplete line" in problem for problem in problems),
+                        "the line that could not be cut off is not reported: %r" % (problems,))
+        self.assertEqual(held, [], "a torn journal that is refused holds nothing: %r" % (held,))
+
+    def test_a_janitor_that_blocks_is_a_failure_and_not_a_wait_6040(self):
+        """#6040. `run_clear` ran the janitor with no `timeout=`, so a janitor
+        that blocks - the shape a waiting `flock` has - produced no result line
+        at all on either leg: the suite hung instead of failing. The wait is
+        bounded, and its expiry is a failure that names its own reason."""
+        stub = self.ws / "blocks.py"
+        stub.write_text("import time\ntime.sleep(%d)\n" % int(CLEAR_TIMEOUT_SECONDS))
+        saved = globals()["SCRIPT"]
+        globals()["SCRIPT"] = stub
+        started = time.monotonic()
+        try:
+            with self.assertRaises(AssertionError) as caught:
+                run_clear(self.ws, timeout=1)
+        finally:
+            globals()["SCRIPT"] = saved
+        waited = time.monotonic() - started
+        self.assertIn("#6040", str(caught.exception))
+        self.assertIn("did not finish", str(caught.exception))
+        # Without this the test is vacuous (#2444): a failure raised after the
+        # child had already exited would prove nothing was bounded.
+        self.assertLess(waited, CLEAR_TIMEOUT_SECONDS / 2.0,
+                        "the wait was not bounded by the timeout it was given: %.1fs" % waited)
+
+    def test_the_in_process_bound_fires_on_a_seam_that_blocks_6040(self):
+        """#6040 by construction: a watchdog that cannot fire bounds nothing.
+        `bounded` is given a seam that will not finish in time, and its expiry
+        must be a failure that names itself - the same shape `run_clear`'s
+        `timeout=` produces for a child. A `flock` that waits instead of
+        refusing is in-process here, where no child timeout can reach it."""
+        started = time.monotonic()
+        with self.assertRaises(AssertionError) as caught:
+            with bounded(0.05, "a seam that never finishes"):
+                time.sleep(IN_PROCESS_TIMEOUT_SECONDS)
+        waited = time.monotonic() - started
+        self.assertIn("#6040", str(caught.exception))
+        self.assertIn("a seam that never finishes", str(caught.exception))
+        self.assertLess(waited, IN_PROCESS_TIMEOUT_SECONDS / 2.0,
+                        "the seam was not bounded by the bound it was given: %.2fs" % waited)
+        # A watchdog left armed reds the NEXT test instead of this one.
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0.0,
+                         "the bound was still armed after it fired")
+
+    def test_every_subprocess_this_suite_runs_is_bounded_6040(self):
+        """#6040 as a class and not as one site: a `subprocess.run` anywhere in
+        this file with no `timeout=` turns the next blocked child into a suite
+        that never reports, which is strictly worse than a red test."""
+        unbounded, checked = [], 0
+        for node in ast.walk(ast.parse(Path(__file__).resolve().read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr == "run"
+                    and isinstance(func.value, ast.Name) and func.value.id == "subprocess"):
+                continue
+            checked += 1
+            if not any(keyword.arg == "timeout" for keyword in node.keywords):
+                unbounded.append(node.lineno)
+        self.assertEqual(unbounded, [],
+                         "subprocess.run with no timeout= at line(s) %r of %s"
+                         % (unbounded, Path(__file__).name))
+        # Without this the test is vacuous (#2444): a parse that found no calls
+        # at all would pass having examined nothing.
+        self.assertGreater(checked, 10, "only %d subprocess.run call(s) were examined" % checked)
 
     def test_a_link_made_inside_the_replay_is_put_back_and_kept_6033(self):
         """#6033, the replay's own window. The replay refuses an inode with a
@@ -3033,7 +3313,7 @@ class FixtureSafetyCase(unittest.TestCase):
         )
         try:
             r = subprocess.run([sys.executable, "-c", child, str(Path(__file__).resolve()), str(victim)],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, timeout=CHILD_TIMEOUT_SECONDS)
             # Without this the test is vacuous (#2444): a child that dies before it
             # changes anything leaves the mode untouched and "restored" trivially.
             self.assertIn("HELD 0o444", r.stdout,
@@ -3061,7 +3341,8 @@ class FixtureSafetyCase(unittest.TestCase):
         base.mkdir(exist_ok=True)
         ws = Path(tempfile.mkdtemp(prefix=".ws5657-", dir=str(base)))
         self.addCleanup(shutil.rmtree, str(ws), True)
-        self.addCleanup(subprocess.run, ["chmod", "-R", "u+rwX", str(ws)], capture_output=True)
+        self.addCleanup(subprocess.run, ["chmod", "-R", "u+rwX", str(ws)], capture_output=True,
+                        timeout=HELPER_TIMEOUT_SECONDS)
         fixture = ws / ".local-runs" / ".tmpK" / "audit"
         fixture.mkdir(parents=True)
         (fixture / "audit.log").write_text("{}\n")
@@ -3076,7 +3357,7 @@ class FixtureSafetyCase(unittest.TestCase):
             "os.kill(os.getpid(), signal.SIGKILL)\n"
         )
         r = subprocess.run([sys.executable, "-c", child, str(Path(__file__).resolve()), str(fixture)],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, timeout=CHILD_TIMEOUT_SECONDS)
         # Without these the test is vacuous (#2444): a child that never held
         # the fixture, or that exited and ran its reaper, strands nothing.
         self.assertIn("HELD 0o000", r.stdout, r.stdout + r.stderr)
@@ -3361,22 +3642,111 @@ def leg_context(leg, docs_only):
     return ctx
 
 
+def janitor_steps():
+    """Every `(path, job_id, step)` in the repository whose `run:` body is a copy
+    of the janitor, found by the BODY - never by the step's name and never from a
+    list of file names. A copy in a third workflow, or under another name, is
+    still a copy of a script whose lock is load-bearing (#6041)."""
+    for path, job_id, step in _all_steps():
+        body = str(step.get("run") or "")
+        if all(marker in body for marker in JANITOR_MARKERS):
+            yield path, job_id, step
+
+
+def janitor_copy_workflows():
+    """The workflow FILES that carry a janitor copy, discovered from the bodies."""
+    by_name = {}
+    for path, _, _ in janitor_steps():
+        by_name[path.name] = path
+    return [by_name[name] for name in sorted(by_name)]
+
+
+def janitor_copy_complaints():
+    """Every reason a DISCOVERED janitor copy is not the script, and how many
+    copies each workflow carries. Returned rather than asserted so the #6041
+    tripwire can prove this check still fails on a copy that has drifted - the
+    equivalence is built, not argued."""
+    want = SCRIPT.read_text().rstrip("\n")
+    complaints, copies = [], {}
+    for path, job_id, step in janitor_steps():
+        copies[path.name] = copies.get(path.name, 0) + 1
+        where = "%s/%s" % (path.name, job_id)
+        if not is_clear_step(step):
+            complaints.append("%s carries a janitor copy in a step named %r, not %r"
+                              % (where, step.get("name"), CLEAR_STEP))
+        if step.get("shell") != "python3 {0}":
+            complaints.append("%s must run the copy as a python3 script" % where)
+        if str(step.get("run") or "").rstrip("\n") != want:
+            complaints.append("%s inline copy drifted from %s" % (where, SCRIPT.name))
+    for path in WORKFLOWS:
+        if copies.get(path.name) != 1:
+            complaints.append("%s carries %d janitor copies, expected exactly 1"
+                              % (path.name, copies.get(path.name, 0)))
+    return complaints, copies
+
+
 class WorkflowPinCase(unittest.TestCase):
     def test_inline_copy_is_byte_identical_to_the_script_5657(self):
-        want = SCRIPT.read_text().rstrip("\n")
+        """#5657, widened in #6041: the copies are DISCOVERED from their bodies
+        instead of read off a hardcoded pair of file names, so a third workflow
+        that inlines a janitor whose lock has been removed is compared too."""
+        complaints, copies = janitor_copy_complaints()
+        self.assertEqual(complaints, [], "\n".join(complaints))
+        # Without these the test is vacuous (#2444): discovery that matched
+        # nothing leaves `complaints` empty and passes having compared nothing,
+        # and the floor is hardcoded so discovery cannot shrink silently either.
         for path in WORKFLOWS:
-            doc = load_workflow(path)
-            found = 0
-            for job_id, job in (doc.get("jobs") or {}).items():
-                for step in job.get("steps") or []:
-                    if not is_clear_step(step):
-                        continue
-                    found += 1
-                    self.assertEqual(step.get("shell"), "python3 {0}",
-                                     "%s/%s must run the copy as a python3 script" % (path.name, job_id))
-                    self.assertEqual(str(step.get("run", "")).rstrip("\n"), want,
-                                     "%s/%s inline copy drifted from %s" % (path.name, job_id, SCRIPT.name))
-            self.assertEqual(found, 1, "%s needs exactly one #5657 clear step" % path.name)
+            self.assertEqual(copies.get(path.name), 1,
+                             "%s was not discovered as a janitor copy at all: %r"
+                             % (path.name, copies))
+        self.assertGreaterEqual(len(copies), len(WORKFLOWS), copies)
+
+    def test_a_third_copy_of_the_janitor_is_discovered_and_rejected_6041(self):
+        """#6041, proven by construction and not argued. A third workflow that
+        inlines a janitor with the lock removed used to pass green: the identity
+        pin walked a hardcoded pair of file names, and the repo-wide pin looked
+        at the clear step's name and position only, never at its body. The
+        tripwire builds that exact copy in a workflow directory of its own and
+        requires discovery to see it and the check to reject it."""
+        drifted = SCRIPT.read_text().replace("fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+                                             "pass  # a third copy with no lock at all")
+        self.assertNotEqual(drifted, SCRIPT.read_text(), "the drift was not applied")
+        bench = Path(tempfile.mkdtemp(prefix=".wf6041-", dir=str(ROOT / ".local-runs")))
+        self.addCleanup(shutil.rmtree, str(bench), True)
+        for path in sorted(WF_DIR.glob("*.yml")) + sorted(WF_DIR.glob("*.yaml")):
+            shutil.copy2(str(path), str(bench / path.name))
+        body = "\n".join(("          " + line).rstrip() if line.strip() else ""
+                         for line in drifted.rstrip("\n").split("\n"))
+        (bench / "third-janitor-copy.yml").write_text(
+            "name: third janitor copy\n"
+            "on:\n  push:\n"
+            "jobs:\n  third:\n"
+            '    runs-on: ["self-hosted", "macos-fed"]\n'
+            "    steps:\n"
+            "      - name: %s\n"
+            "        shell: python3 {0}\n"
+            "        timeout-minutes: 5\n"
+            "        run: |\n%s\n"
+            "      - uses: %s11d5960a326750d5838078e36cf38b85af677262 # v4\n"
+            % (CLEAR_STEP, body, CHECKOUT_PREFIX))
+        saved = globals()["WF_DIR"]
+        globals()["WF_DIR"] = bench
+        try:
+            discovered = [path.name for path in janitor_copy_workflows()]
+            complaints, copies = janitor_copy_complaints()
+        finally:
+            globals()["WF_DIR"] = saved
+        self.assertIn("third-janitor-copy.yml", discovered,
+                      "a third workflow carrying a janitor copy was not discovered: %r" % (discovered,))
+        self.assertEqual(copies.get("third-janitor-copy.yml"), 1, copies)
+        self.assertTrue(any("third-janitor-copy.yml" in complaint and "drifted" in complaint
+                            for complaint in complaints),
+                        "the third copy drifted from the script and was not rejected: %r"
+                        % (complaints,))
+        # And the tripwire must not pass by rejecting everything: the two real
+        # copies in the same directory are still accepted.
+        self.assertEqual([complaint for complaint in complaints
+                          if "third-janitor-copy.yml" not in complaint], [], complaints)
 
     def test_clear_step_condition_runs_on_every_self_hosted_leg_5657(self):
         """Evaluated, not grepped: a guard rewritten to `== 'true'`, to
@@ -3385,10 +3755,19 @@ class WorkflowPinCase(unittest.TestCase):
 
         The `continue` below is the #2444 vacuity shape: with no clear step
         anywhere, every job is skipped and the test passes having asserted
-        nothing. `evaluated` is what makes the pass mean something."""
+        nothing. `evaluated` is what makes the pass mean something.
+
+        The guard at the end used to build `covered` INSIDE a loop over the same
+        hardcoded list it was compared against, so it was a subset by
+        construction and would have become a tautology the moment the list was
+        globbed (#6041). It now compares what was EVALUATED (a step found by its
+        exact name, whose `if:` was exercised) against what was DISCOVERED (a
+        workflow carrying the janitor's body) - two different predicates over
+        the same tree - and against the hardcoded floor underneath both."""
         evaluated = 0
         covered = set()
-        for path in WORKFLOWS:
+        discovered = set(path.name for path in janitor_copy_workflows())
+        for path in janitor_copy_workflows():
             doc = load_workflow(path)
             for job_id, job in (doc.get("jobs") or {}).items():
                 steps = job.get("steps") or []
@@ -3417,10 +3796,17 @@ class WorkflowPinCase(unittest.TestCase):
                             self.assertFalse(got, "%s/%s: hosted leg %r runs the clear step"
                                              % (path.name, job_id, leg))
                 self.assertGreater(self_hosted, 0, "%s/%s has no self-hosted leg" % (path.name, job_id))
-        self.assertEqual(covered, set(p.name for p in WORKFLOWS),
-                         "a workflow carries no clear step at all, so this test asserted nothing "
-                         "about it: %d guard(s) evaluated across %r"
-                         % (evaluated, sorted(covered)))
+        self.assertEqual(covered, discovered,
+                         "a workflow carries a copy of the janitor and no step named %r, so this "
+                         "test asserted nothing about its guard: %d guard(s) evaluated across %r, "
+                         "discovered in %r"
+                         % (CLEAR_STEP, evaluated, sorted(covered), sorted(discovered)))
+        for path in WORKFLOWS:
+            self.assertIn(path.name, covered,
+                          "%s is the floor and its guard was not evaluated: %r"
+                          % (path.name, sorted(covered)))
+        self.assertGreaterEqual(evaluated, len(WORKFLOWS),
+                                "only %d guard(s) were evaluated" % evaluated)
 
     def test_a_step_that_is_not_the_clear_step_is_not_named_like_it_5657(self):
         """Every pin in this file finds the clear step by EXACT name. A
@@ -3467,10 +3853,36 @@ class WorkflowPinCase(unittest.TestCase):
                     clear_at,
                     "%s/%s runs on self-hosted macOS and checks out, with no #5657 clear step"
                     % (path.name, job_id))
+                body = str(steps[clear_at].get("run") or "")
+                self.assertEqual([marker for marker in JANITOR_MARKERS if marker not in body], [],
+                                 "%s/%s has a step named like the clear step that does not carry "
+                                 "the janitor at all (#6041)" % (path.name, job_id))
                 self.assertLess(clear_at, checkout_at,
                                 "%s/%s clears the scratch AFTER actions/checkout, which is where it dies"
                                 % (path.name, job_id))
         self.assertGreaterEqual(checked, 2, "expected at least the ci.yml and session-boot macOS jobs")
+
+    def test_every_janitor_step_in_ci_is_bounded_6040(self):
+        """#6040 in CI. A janitor that waits on the journal's lock instead of
+        refusing it would hold the job for GitHub's 360-minute default, and
+        `session-boot-lifetime.yml` has no `concurrency:` block that would
+        cancel it. Every discovered copy's step carries its own bound."""
+        checked = 0
+        for path, job_id, step in janitor_steps():
+            checked += 1
+            bound = step.get("timeout-minutes")
+            self.assertIsInstance(bound, int,
+                                  "%s/%s runs the janitor with no `timeout-minutes:`, so a blocked "
+                                  "run holds the runner for the 360-minute default (#6040)"
+                                  % (path.name, job_id))
+            self.assertGreater(bound, 0, "%s/%s" % (path.name, job_id))
+            self.assertLessEqual(bound, JANITOR_STEP_TIMEOUT_CEILING_MINUTES,
+                                 "%s/%s bounds the janitor at %d minutes, which is not a bound"
+                                 % (path.name, job_id, bound))
+        # Without this the test is vacuous (#2444): discovery that matched no
+        # step would pass having checked nothing.
+        self.assertGreaterEqual(checked, len(WORKFLOWS),
+                                "only %d janitor step(s) were examined" % checked)
 
     def test_classify_job_runs_these_tests_5657(self):
         doc = load_workflow(WF_DIR / "ci.yml")
