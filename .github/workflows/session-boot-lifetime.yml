@@ -67,6 +67,9 @@ jobs:
       # pins the two equal. The live-log flag in src/audit.rs is untouched.
       - name: Clear stale append-only scratch (#5657)
         if: contains(matrix.runner, 'self-hosted')
+        # A janitor that waits on the journal's lock instead of refusing it would
+        # otherwise hold this runner for the 360-minute default (#6040).
+        timeout-minutes: 10
         shell: python3 {0}
         run: |
           #!/usr/bin/env python3
@@ -854,9 +857,19 @@ jobs:
                       # The cut is at a length this run read, so it is safe only while no
                       # other run can append: this run holds the journal's lock, taken
                       # before the read (`_lock`), and without it nothing here is reached
-                      # (#6034). Nothing may be appended after the torn line - it would be
-                      # glued to it - so if it cannot be cut off the journal is refused.
+                      # (#6034). The lock is advisory, so the length is rechecked against
+                      # the file immediately before the cut, exactly as `_take_back` does:
+                      # a journal that grew after this run read it is refused, never cut,
+                      # so no line another run fsynced can be truncated away even if the
+                      # lock is bypassed or taken out of order (#6042). Nothing may be
+                      # appended after the torn line - it would be glued to it - so if it
+                      # cannot be cut off the journal is refused.
                       try:
+                          grown = os.fstat(self._fd).st_size
+                          if grown != len(raw):
+                              raise OSError(errno.EBUSY, "the journal was %d bytes when this run read it and "
+                                                         "is %d bytes now, so the length to cut to is not this "
+                                                         "run's to trust" % (len(raw), grown))
                           os.ftruncate(self._fd, len(raw) - len(tail))
                           os.fsync(self._fd)
                       except OSError as err:
