@@ -166,7 +166,7 @@ AiMemoryClient(
 ### Agent identity (NHI)
 
 Set `agent_id` to stamp the `X-Agent-Id` header on every request. The
-server writes `metadata.agent_id` accordingly (see CLAUDE.md §Agent
+server writes `metadata.agent_id` accordingly (see docs/reference/ARCHITECTURE_REFERENCE.md §Agent
 Identity).
 
 ```python

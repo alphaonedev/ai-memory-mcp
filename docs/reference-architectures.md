@@ -119,7 +119,7 @@ default — every `ai-memory install claude-code` lands you here.
 
 Several AI agents share the same physical machine and the same
 sqlite database. Each agent is namespaced by its `agent_id` (see
-`CLAUDE.md` §Agent Identity for the resolution ladder). MCP agents
+`docs/reference/ARCHITECTURE_REFERENCE.md` §Agent Identity for the resolution ladder). MCP agents
 spawn their own `ai-memory mcp` child; HTTP agents talk to a single
 `ai-memory serve` daemon. The HTTP daemon serializes writes through
 the `Arc<Mutex<Connection>>` (`src/handlers/transport.rs:22`); the

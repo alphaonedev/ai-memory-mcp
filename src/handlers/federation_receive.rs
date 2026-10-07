@@ -48,7 +48,7 @@ pub(crate) const ATTESTATION_TRACE_TARGET: &str = "federation::attestation";
 /// outcome as the header being absent.
 pub(super) fn extract_peer_id(headers: &HeaderMap) -> Option<&str> {
     let raw = headers.get(PEER_ID_HEADER).and_then(|v| v.to_str().ok())?;
-    // Reject anything that fails the agent_id shape per CLAUDE.md
+    // Reject anything that fails the agent_id shape per ARCHITECTURE_REFERENCE.md
     // §"Agent Identity": `^[A-Za-z0-9_\-:@./]{1,128}$`. The strict
     // shape is the load-bearing property — no whitespace, no nulls,
     // no control chars (CRLF), no shell metacharacters.

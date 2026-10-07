@@ -202,7 +202,7 @@ vector_index_hard_fail_at_cap = false  # #1005 G2 opt-in: reject inserts AT cap
                                    # Env: AI_MEMORY_VECTOR_INDEX_HARD_FAIL.
 
 # ---------------------------------------------------------------------
-# Existing sections at v0.7.x — see env-var table in CLAUDE.md.
+# Existing sections at v0.7.x — see env-var table in docs/reference/ARCHITECTURE_REFERENCE.md.
 # ---------------------------------------------------------------------
 [mcp]
 profile = "full"
@@ -267,7 +267,7 @@ the SSOT struct declares them.
 > `[reranker].score_floor`, and the `[storage]` data-integrity switches
 > `append_only` / `lineage_dag` / `consolidate_tombstone_sources` /
 > `age_projection_mode`. Every one of them IS documented per-knob in the
-> CLAUDE.md environment-variable table (each names its `[section].field`
+> docs/reference/ARCHITECTURE_REFERENCE.md environment-variable table (each names its `[section].field`
 > twin); treat that table as the exhaustive index until these sections
 > land here.
 
@@ -834,7 +834,7 @@ outside the Rust dependency graph:
    export AI_MEMORY_VECTORLITE_EXTENSION=/opt/ai-memory/vectorlite.so
    ```
 
-   (env-var row #145 in the CLAUDE.md environment-variable table.)
+   (env-var row #145 in the docs/reference/ARCHITECTURE_REFERENCE.md environment-variable table.)
 
 **Fail-closed-to-pure-Rust-HNSW behaviour.** This is the data-integrity
 guarantee: when the feature is compiled AND the path is set, the
@@ -1084,6 +1084,6 @@ source, not a config section.
 - [#1055](https://github.com/alphaonedev/ai-memory-mcp/issues/1055) —
   the `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS` escape hatch
   reused by `api_key_file`.
-- CLAUDE.md `### Environment Variables` — full env-var table with
+- docs/reference/ARCHITECTURE_REFERENCE.md `### Environment Variables` — full env-var table with
   precedence ladder and classification (`secret` / `config` /
   `test-only`).
