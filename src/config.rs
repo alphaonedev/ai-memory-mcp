@@ -806,9 +806,9 @@ pub struct CapabilityFeatures {
     /// - **Column** (Task 1/8, commit `f5d8a9e`) —
     ///   `memories.reflection_depth INTEGER NOT NULL DEFAULT 0`,
     ///   first added in the recursive-learning schema bump (column
-    ///   inventory lives in `docs/MIGRATION_v0.7.md`; the current
-    ///   `CURRENT_SCHEMA_VERSION` is 53 in lockstep on both sqlite
-    ///   and postgres ladders as of v0.7.0 — v48 added
+    ///   inventory lives in `docs/MIGRATION_v0.7.md`; the v0.7.0
+    ///   `CURRENT_SCHEMA_VERSION` was 57 in lockstep on both sqlite
+    ///   and postgres ladders — v48 added
     ///   `federation_push_dlq` (#933), v49 added 14 nullable
     ///   `archived_memories` columns (#1025), v50 extended
     ///   `agent_quotas` PK with `namespace` (#1156), v51 added
