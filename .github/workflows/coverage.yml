@@ -40,8 +40,12 @@
 name: Per-Module Coverage Thresholds
 
 on:
+  # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
+  # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
+  # together), #2523 and #2508 (push must not overlap a PR head such as
+  # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: [main, develop, "release/**", "feat/v0.7.0-grand-slam"]
+    branches: [main, develop, "release/**", "feat/v0.7.0-grand-slam", "rehearsal/**"]
   push:
     branches: [main, develop, "feat/v0.7.0-grand-slam", "release/**"]
   # Merge Queue (#3089) — `Per-Module Coverage Thresholds` (+ the sibling

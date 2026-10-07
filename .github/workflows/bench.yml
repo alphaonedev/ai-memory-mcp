@@ -13,8 +13,12 @@
 name: Bench
 
 on:
+  # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
+  # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
+  # together), #2523 and #2508 (push must not overlap a PR head such as
+  # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: [main, develop, "release/**"]
+    branches: [main, develop, "release/**", "rehearsal/**"]
     # Bench is advisory (not in required-status-checks). Trigger-level
     # paths-ignore is safe here and saves a full release build (~6-8 min)
     # on every docs-only PR.

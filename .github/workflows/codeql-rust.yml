@@ -13,8 +13,12 @@ name: CodeQL
 on:
   push:
     branches: [main, "release/**"]
+  # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
+  # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
+  # together), #2523 and #2508 (push must not overlap a PR head such as
+  # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: [main, "release/**"]
+    branches: [main, "release/**", "rehearsal/**"]
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
