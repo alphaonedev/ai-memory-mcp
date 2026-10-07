@@ -20,7 +20,23 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-10-02** (re-issued at the re-assembled batch-6 tip `385da3a05` at 22 checks after 3 §7-watched federation-wire files changed by REAL CODE — #4023, #4408, #4400/#4464 and #4300; supersedes the 2026-09-26 bind at `eba96b307`)
+> ## STATUS — **EXPIRED as of 2026-10-07** (§7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
+>
+> **Amendment (2026-10-07, #6063 WP-B1 — §7 EXPIRY RECORD, certification EXPIRED).**
+> The federation certification **expired** per §7 when four §7-watched
+> federation-wire files changed after the bind `385da3a05`
+> (`src/federation/mod.rs`, `src/federation/ns_meta_ancestor_gate.rs`,
+> `src/handlers/federation_receive.rs`, `src/handlers/federation_signing_check.rs`;
+> +620/−35 lines, 484 code lines, from #4447, #4478, #4495, #4499, #4356 et al.).
+> The `AI_MEMORY_FED_*` identifier NAME set is unchanged. **No live claim is made
+> for the post-`385da3a05` wire path.** The `385da3a05` evidence under
+> `docs/compliance/evidence/cert-385da3a05/` remains a historical record of that
+> bind only. This amendment does **not** re-measure anything and does **not**
+> re-bind: the §5.4(2)–(5) re-measurement (posture legs, acceptance battery,
+> removal proof) at the post-freeze SHA, and the re-issue to `LIVE`, are work
+> package WP-B1 ([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)),
+> run after code freeze. Re-binding to a newer SHA without that re-measurement is
+> forbidden (#3899).
 >
 > Re-validated and re-bound against `f32c18dadf8a659567960747cc2802186bac9de9`
 > at the v1.0.0 promotion tip on 2026-09-21: §5.4(2) posture legs re-measured at 22 checks
