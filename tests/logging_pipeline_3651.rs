@@ -30,8 +30,23 @@ fn run_with_logging(home: &Path, logging_toml: &str, args: &[&str]) -> Output {
     run_with_section(home, "logging", logging_toml, args)
 }
 
+/// #5752 — the audit sink's compiled default is `append_only = true`, which
+/// sets the platform append-only flag on `audit.log` (`chflags uappnd` on
+/// macOS). A flagged file cannot be unlinked, so one left in this scratch
+/// directory makes the next `actions/checkout` on a self-hosted runner fail
+/// with EPERM. These tests assert the hash chain, not the inode flag, so an
+/// `[audit]` body that does not say otherwise gets `append_only = false`.
+fn with_scratch_safe_audit(section: &str, body: &str) -> String {
+    if section == "audit" && !body.contains("append_only") {
+        format!("{body}append_only = false\n")
+    } else {
+        body.to_string()
+    }
+}
+
 /// Write one `[section]` of config into an isolated HOME and run the binary.
 fn run_with_section(home: &Path, section: &str, body: &str, args: &[&str]) -> Output {
+    let body = with_scratch_safe_audit(section, body);
     let config_root = home.join(".config").join("ai-memory");
     std::fs::create_dir_all(&config_root).expect("create config root");
     std::fs::write(
@@ -446,5 +461,81 @@ fn an_intact_audit_trail_boots_and_appends_to_its_tail_4190() {
         recs[1]["sequence"].as_u64(),
         recs[0]["sequence"].as_u64().map(|s| s + 1),
         "the sequence continues across the restart"
+    );
+}
+
+// #5752 — a test that boots the audit sink in a scratch directory must leave
+// that directory removable, or the next checkout on a self-hosted runner dies
+// with EPERM (#5657). The sink's production default stays append-only; the
+// test harness opts its scratch trails out.
+
+/// `true` when the platform append-only flag is set on `path`: `UF_APPEND`
+/// from `st_flags` on macOS, `FS_APPEND_FL` from `FS_IOC_GETFLAGS` on Linux.
+/// Other platforms have no such flag.
+fn has_append_only_flag(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        const UF_APPEND: u32 = 0x0000_0004;
+        std::fs::metadata(path).is_ok_and(|m| m.st_flags() & UF_APPEND != 0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        const FS_APPEND_FL: libc::c_int = 0x0000_0020;
+        const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+        let Ok(file) = std::fs::File::open(path) else {
+            return false;
+        };
+        let mut flags: libc::c_int = 0;
+        // SAFETY: the descriptor is open for the call and GETFLAGS writes one
+        // `int` through the pointer to `flags`.
+        let rc = unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_GETFLAGS, &mut flags) };
+        rc == 0 && flags & FS_APPEND_FL != 0
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+#[test]
+fn audit_scratch_boot_opts_out_of_the_flag_and_leaves_removable_scratch_5752() {
+    let home = sandbox();
+    let dir = home.path().join("audit");
+    let out = run_with_section(
+        home.path(),
+        "audit",
+        &format!("enabled = true\npath = \"{}\"\n", dir.display()),
+        &["store", "--title", "scratch", "--content", "5752"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    // The harness config, not the inode, is what a Linux user without
+    // CAP_LINUX_IMMUTABLE can observe: the scratch trail opts out.
+    let config = std::fs::read_to_string(home.path().join(".config/ai-memory/config.toml"))
+        .expect("read the written config");
+    assert!(
+        config.contains("append_only = false"),
+        "a scratch audit trail must opt out of the append-only flag:\n{config}"
+    );
+    assert!(trail_file(&dir).exists(), "the trail was written");
+    assert!(
+        !has_append_only_flag(&trail_file(&dir)),
+        "the scratch audit.log must not carry the append-only flag"
+    );
+    home.close()
+        .expect("the scratch directory, audit.log included, must be removable");
+}
+
+#[test]
+fn an_explicit_append_only_setting_is_not_overridden_5752() {
+    assert_eq!(
+        with_scratch_safe_audit("audit", "enabled = true\nappend_only = true\n"),
+        "enabled = true\nappend_only = true\n"
+    );
+    assert_eq!(
+        with_scratch_safe_audit("logging", "level = \"info\"\n"),
+        "level = \"info\"\n"
     );
 }
