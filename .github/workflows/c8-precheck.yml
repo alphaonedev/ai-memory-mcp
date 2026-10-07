@@ -258,6 +258,10 @@ jobs:
         # in a tmpdir + invokes the gate against AI_MEMORY_DOCS_GATE_ROOT
         # = tmpdir; the gate must catch the drift.
         run: bash scripts/check-docs-vs-ssot.sh --self-test
+      - name: CLAUDE.md size ceiling (#4507)
+        run: python3 scripts/check-claude-md-size.py
+      - name: Self-test the CLAUDE.md size guard
+        run: python3 scripts/check-claude-md-size.py --self-test
 
   doc-symbol-anchor-gate:
     # Issue #2629 / 3x7 claims register. `check-docs-vs-ssot.sh` pins

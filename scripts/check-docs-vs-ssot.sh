@@ -106,6 +106,19 @@ else
 fi
 cd "$REPO_ROOT"
 
+# #4507 R3-6 - FAIL CLOSED on a missing reference file. The Architecture and
+# Code Style bodies moved out of CLAUDE.md into these two files; the DOC_FILES
+# loop below skips an absent file (`[[ -f ]] || continue`) and the env-var
+# census greps one of them, so deleting either made this gate exit 0 (or fail
+# only by accident). Unconditional, fixture included: a check waived under the
+# --self-test is a check the self-test cannot prove.
+# R3-F7: the shared reference check refuses a symlink at EVERY level of each path
+# (docs, docs/reference, the file), not only the leaf.
+if ! python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-claude-md-size.py" "$REPO_ROOT" --refs-only >&2; then
+    printf 'FAIL: check-docs-vs-ssot: reference file check failed (#4507 fail-closed)\n' >&2
+    exit 1
+fi
+
 # --------------------------------------------------------------------
 # Resolve canonical SSOT values from Rust source
 # --------------------------------------------------------------------
@@ -239,6 +252,11 @@ CANONICAL_HOOK_EVENTS=$(
 
 DOC_FILES=(
     CLAUDE.md
+    # #4507 — the Architecture / Code Style bodies moved out of CLAUDE.md
+    # (eager-loaded into every agent session) into these two files, verbatim.
+    # They are walked here so the narrative-count rules still see that content.
+    docs/reference/ARCHITECTURE_REFERENCE.md
+    docs/reference/CODE_STYLE.md
     README.md
     ROADMAP.md
     docs/spec/PORTABILITY-V2.md
@@ -1155,9 +1173,11 @@ PY
 
 # Env-var census rule (#836 3B / 2026-06-09 GA drive). Every
 # AI_MEMORY_* env var READ by production code must appear somewhere in
-# CLAUDE.md (the env-var table is the operator-facing contract; 13
+# docs/reference/ARCHITECTURE_REFERENCE.md (the env-var table moved there from
+# CLAUDE.md in #4507; it is the operator-facing contract; 13
 # missing rows were found by hand on 2026-06-09 — this makes the class
-# mechanical). Intentionally one-directional — extra rows in CLAUDE.md
+# mechanical). Intentionally one-directional — extra rows in
+# docs/reference/ARCHITECTURE_REFERENCE.md
 # for removed vars are caught by the symbol census, and vars only set
 # (not read) by code are not operator knobs.
 #
@@ -1222,8 +1242,8 @@ check_env_var_census_rule() {
         # Word-boundaried: a bare `grep -q` lets a LONGER var's mention
         # satisfy a shorter one (`AI_MEMORY_STORE_URL` would be answered
         # by `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS`).
-        if ! grep -qE "${var}([^A-Z0-9_]|\$)" "$REPO_ROOT/CLAUDE.md"; then
-            printf 'FAIL: %s: src reads %s but CLAUDE.md never mentions it (env-var table drift)\n' \
+        if ! grep -qE "${var}([^A-Z0-9_]|\$)" "$REPO_ROOT/docs/reference/ARCHITECTURE_REFERENCE.md"; then
+            printf 'FAIL: %s: src reads %s but docs/reference/ARCHITECTURE_REFERENCE.md never mentions it (env-var table drift)\n' \
                 "$rule_name" "$var" >&2
             fail_count=$((fail_count + 1))
         fi
@@ -1697,7 +1717,8 @@ run_all_rules() {
     # in a listed file is a no-op that still reports PASS, so this is stated
     # rather than assumed, and re-verified whenever a file is enrolled):
     # 17 anchored citations across 11 of the 12 surfaces, all reading the
-    # canonical — CLAUDE.md 3, README.md 1, SECURITY.md 2, PERFORMANCE.md 1,
+    # canonical — CLAUDE.md + docs/reference/ARCHITECTURE_REFERENCE.md (the
+    # citations moved there in #4507) 3, README.md 1, SECURITY.md 2, PERFORMANCE.md 1,
     # docs/deploy/README.md 1, docs/deploy/enterprise-federation.env 1, the
     # certification doc 2, docs/enterprise-deployment.md 1,
     # src/security_profile.rs 2, src/enterprise_federation_posture.rs 2,
@@ -1718,6 +1739,7 @@ run_all_rules() {
         "$CANONICAL_ASI_HARD_KNOBS" \
         '([0-9]+)-knob|(?:auto-)?[Pp]ins the ([0-9]+)(?: asi-hard)? knobs|holds \*\*([0-9]+)\*\* entries|names all ([0-9]+) correctly|SSOT for the ([0-9]+)|\*\*([0-9]+)\*\* post-#|shows `([0-9]+)/[0-9]+`|`PINNED_KNOB_COUNT` \(([0-9]+)\)|is \*\*([0-9]+) knobs\*\*|PINS \*\*([0-9]+)\*\* security env knobs|([0-9]+)-entry pin-and-refuse|all \*\*([0-9]+)\*\* `KNOBS` entries|All \*\*([0-9]+)\*\* of them' \
         CLAUDE.md \
+        docs/reference/ARCHITECTURE_REFERENCE.md \
         README.md \
         SECURITY.md \
         PERFORMANCE.md \
@@ -1912,6 +1934,12 @@ run_self_test() {
     # #2977 — the frozen-page exemption SSOT the html scan set resolves
     # against. A REAL one (not an empty stub) so the html legs below can
     # prove BOTH directions of the boundary.
+    # #4507 R3-6 - the gate refuses a tree without the two reference files, so
+    # the fixture carries real (stub) ones; the missing/symlink cases below
+    # remove or replace them one at a time.
+    mkdir -p docs/reference
+    printf '# Architecture reference (fixture)\nFixture body line.\n' > docs/reference/ARCHITECTURE_REFERENCE.md
+    printf '# Code style reference (fixture)\nFixture body line.\n' > docs/reference/CODE_STYLE.md
     mkdir -p scripts/qc-allowlists
     cat > scripts/qc-allowlists/html-doc-frozen-exempt.txt <<'FROZENEOF'
 # fixture exemption SSOT
@@ -3173,6 +3201,73 @@ HTMLSTAMPFROZEN
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #2977 — a frozen per-release page keeps its own historical chrome stamp"
+
+    # ---- #4507 R3-6: a missing or symlinked reference file FAILS CLOSED.
+    local _rf _out _rc
+    for _rf in ARCHITECTURE_REFERENCE CODE_STYLE; do
+        mv "$tmpdir/docs/reference/$_rf.md" "$tmpdir/docs/reference/$_rf.md.aside"
+        _rc=0
+        _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+        if [[ "$_rc" == 0 ]] || ! grep -q "docs/reference/$_rf.md" <<<"$_out"; then
+            echo "FAIL: self-test #4507 R3-6 — a MISSING $_rf.md did not fail closed (rc=$_rc)" >&2
+            cd "$REPO_ROOT"; exit 1
+        fi
+        echo "PASS: self-test #4507 R3-6 — a missing $_rf.md FAILS CLOSED (rc=$_rc, names the file)"
+        ln -s "$_rf.md.aside" "$tmpdir/docs/reference/$_rf.md"
+        _rc=0
+        _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+        if [[ "$_rc" == 0 ]] || ! grep -q "docs/reference/$_rf.md" <<<"$_out"; then
+            echo "FAIL: self-test #4507 R3-6 — a SYMLINKED $_rf.md did not fail closed (rc=$_rc)" >&2
+            cd "$REPO_ROOT"; exit 1
+        fi
+        echo "PASS: self-test #4507 R3-6 — a symlinked $_rf.md FAILS CLOSED (rc=$_rc)"
+        rm -f "$tmpdir/docs/reference/$_rf.md"
+        mv "$tmpdir/docs/reference/$_rf.md.aside" "$tmpdir/docs/reference/$_rf.md"
+    done
+
+    # ---- #4507 R3-F8: an empty, heading-only or unreadable reference file FAILS CLOSED (clean FAIL, no traceback).
+    for _rf in ARCHITECTURE_REFERENCE CODE_STYLE; do
+        cp "$tmpdir/docs/reference/$_rf.md" "$tmpdir/docs/reference/$_rf.md.aside"
+        : > "$tmpdir/docs/reference/$_rf.md"
+        _rc=0
+        _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+        if [[ "$_rc" == 0 ]] || ! grep -q "$_rf.md is empty" <<<"$_out"; then
+            echo "FAIL: self-test #4507 R3-F8 — an EMPTY $_rf.md did not fail closed (rc=$_rc)" >&2
+            cd "$REPO_ROOT"; exit 1
+        fi
+        printf '# Heading only\n\n## Sub\n' > "$tmpdir/docs/reference/$_rf.md"
+        _rc=0
+        _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+        if [[ "$_rc" == 0 ]] || ! grep -q "$_rf.md has only headings" <<<"$_out"; then
+            echo "FAIL: self-test #4507 R3-F8 — a HEADING-ONLY $_rf.md did not fail closed (rc=$_rc)" >&2
+            cd "$REPO_ROOT"; exit 1
+        fi
+        if [[ "$(id -u)" != 0 ]]; then
+            chmod 000 "$tmpdir/docs/reference/$_rf.md"
+            _rc=0
+            _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+            chmod 644 "$tmpdir/docs/reference/$_rf.md"
+            if [[ "$_rc" == 0 ]] || grep -q "Traceback" <<<"$_out" || ! grep -q "cannot read docs/reference/$_rf.md" <<<"$_out"; then
+                echo "FAIL: self-test #4507 R3-F8 — an UNREADABLE $_rf.md did not fail cleanly (rc=$_rc)" >&2
+                cd "$REPO_ROOT"; exit 1
+            fi
+        fi
+        mv "$tmpdir/docs/reference/$_rf.md.aside" "$tmpdir/docs/reference/$_rf.md"
+        echo "PASS: self-test #4507 R3-F8 — an empty, heading-only and unreadable $_rf.md FAIL CLOSED with a clean message"
+    done
+
+    # ---- #4507 R3-F7: a symlink ABOVE the file (docs/reference -> elsewhere) FAILS CLOSED.
+    mv "$tmpdir/docs/reference" "$tmpdir/docs/reference.aside"
+    ln -s reference.aside "$tmpdir/docs/reference"
+    _rc=0
+    _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+    if [[ "$_rc" == 0 ]] || ! grep -q "is a symlink" <<<"$_out"; then
+        echo "FAIL: self-test #4507 R3-F7 — a SYMLINKED docs/reference did not fail closed (rc=$_rc)" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #4507 R3-F7 — a symlinked docs/reference FAILS CLOSED (rc=$_rc)"
+    rm -f "$tmpdir/docs/reference"
+    mv "$tmpdir/docs/reference.aside" "$tmpdir/docs/reference"
 
     cd "$REPO_ROOT"
 }

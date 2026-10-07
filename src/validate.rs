@@ -2076,7 +2076,7 @@ mod tests {
     /// set didn't accidentally swallow a legitimate prefix family.
     #[test]
     fn test_legitimate_agent_ids_still_pass_after_977() {
-        // These are the shapes documented in CLAUDE.md "Agent Identity
+        // These are the shapes documented in docs/reference/ARCHITECTURE_REFERENCE.md "Agent Identity
         // (NHI)" and exercised across the integration suite.
         for legitimate in [
             "alice",

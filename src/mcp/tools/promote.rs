@@ -336,7 +336,7 @@ pub(super) fn handle_promote(
     // on `mid` as an intermediate step instead of jumping straight to
     // `long`. Omitting `target_tier` preserves the historical
     // highest-reachable-tier behaviour (short→long / mid→long in a
-    // single call), which the v0.7.0 CLAUDE.md docs pin under
+    // single call), which the v0.7.0 ARCHITECTURE_REFERENCE.md docs pin under
     // "Data Model" + "Recall Pipeline → Touch operations".
     //
     // The string literals in the match arms below are the canonical
