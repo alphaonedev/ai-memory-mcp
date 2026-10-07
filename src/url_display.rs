@@ -37,6 +37,12 @@ const UNPARSEABLE: &str = "<unparseable>";
 /// path instead and never reaches this).
 const NO_HOST: &str = "<no host>";
 
+/// Marker for a store URL whose authority is ambiguous (#6096): the
+/// userinfo holds an unencoded `/`, `?` or `#`, so the WHATWG parser ended
+/// the authority early and read the credential remainder as host, port or
+/// path. Nothing parsed from such a URL is safe to show.
+const REDACTED_AUTHORITY: &str = "<redacted-authority>";
+
 /// The scheme token of `url` (up to the first `://`), or [`NO_SCHEME`].
 fn scheme_token(url: &str) -> &str {
     url.trim().split_once("://").map_or(NO_SCHEME, |(s, _)| s)
@@ -93,6 +99,27 @@ pub fn url_origin_and_path(url: &str) -> String {
     }
 }
 
+/// `true` when `url` has an `@` after the point where the WHATWG parser
+/// ended the authority (#6096).
+///
+/// The authority ends at the first `/`, `?` or `#` after `scheme://`. A
+/// userinfo that carries one of those unencoded makes the parser stop inside
+/// the credential, so the rest of the credential (and the real `@host`) land
+/// in the path, query or fragment and the parsed host / port / path are
+/// credential bytes. A well-formed URL has its `@` (if any) inside the
+/// authority; an `@` past the authority is the ambiguous shape. This errs on
+/// the side of redaction: a literal `@` in a query value also trips it, and
+/// the cost is only a less specific log line (ERRORS-01, fail closed).
+fn authority_is_ambiguous(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    match rest.find(['/', '?', '#']) {
+        Some(end) => rest[end..].contains('@'),
+        None => false,
+    }
+}
+
 /// A store URL (`--store-url`, `AI_MEMORY_STORE_URL[_FILE]`) for every
 /// human- and machine-readable sink: the boot `info!` line, doctor,
 /// `schema-init --json`, `migrate --json`, refusals.
@@ -104,6 +131,9 @@ pub fn url_origin_and_path(url: &str) -> String {
 ///   thing an operator needs to tell two stores apart and is not a
 ///   secret. The query string (`sslpassword=`, `sslkey=`, `options=`,
 ///   `password=`) and the userinfo are never rendered.
+/// - A URL whose authority is ambiguous (an unencoded `/`, `?` or `#` in the
+///   userinfo, #6096) renders `scheme://<redacted-authority>`: the parsed
+///   host, port and path of such a URL are credential bytes.
 #[must_use]
 pub fn store_url_display(url: &str) -> String {
     let trimmed = url.trim();
@@ -112,6 +142,9 @@ pub fn store_url_display(url: &str) -> String {
     }
     match reqwest::Url::parse(trimmed) {
         Ok(parsed) => {
+            if authority_is_ambiguous(trimmed) {
+                return format!("{}://{REDACTED_AUTHORITY}", parsed.scheme());
+            }
             let mut out = url_origin(trimmed);
             // The database is the FIRST path segment; libpq allows nothing
             // deeper, so a longer path is simply not rendered.
@@ -264,6 +297,57 @@ mod tests {
         assert_eq!(
             store_url_display("postgres://db.example:5432"),
             "postgres://db.example:5432"
+        );
+    }
+
+    /// #6096 — one DSN per (delimiter, position) shape: the unencoded
+    /// delimiter sits in the password (leading, numeric-prefixed) or in the
+    /// username, so the WHATWG authority ends inside the credential.
+    fn ambiguous_userinfo_dsns_6096() -> Vec<String> {
+        let mut out = Vec::new();
+        for d in ['/', '?', '#'] {
+            out.push(format!(
+                "postgres://svc:{d}SECRET6096pw@db.example:5432/mem"
+            ));
+            out.push(format!("postgres://svc:123{d}SECRET6096pw@db.example/mem"));
+            out.push(format!("postgres://svc{d}SECRET6096user:pw@db.example/mem"));
+        }
+        out
+    }
+
+    #[test]
+    fn store_url_redacts_an_ambiguous_authority_6096() {
+        for dsn in ambiguous_userinfo_dsns_6096() {
+            let r = store_url_display(&dsn);
+            assert!(
+                !r.contains("SECRET6096"),
+                "#6096: credential bytes reached the rendering of {dsn:?}: {r:?}"
+            );
+            assert_eq!(r, "postgres://<redacted-authority>", "{dsn:?}");
+        }
+    }
+
+    #[test]
+    fn store_url_keeps_well_formed_shapes_unchanged_6096() {
+        // Percent-encoded delimiters in the userinfo are well-formed: the
+        // host is still named and the credential is still absent.
+        for dsn in [
+            "postgres://svc:%2FSECRET6096pw@db.example:5432/mem",
+            "postgres://svc:123%3FSECRET6096pw@db.example:5432/mem",
+            "postgres://svc%23SECRET6096user:pw@db.example:5432/mem",
+            "postgres://svc:SECRET6096pw@db.example:5432/mem?sslmode=verify-full",
+        ] {
+            let r = store_url_display(dsn);
+            assert_eq!(r, "postgres://db.example:5432/mem", "{dsn:?}");
+            assert!(!r.contains("SECRET6096"), "{r:?}");
+        }
+        assert_eq!(
+            store_url_display("postgres://db.example/mem?sslmode=verify-full"),
+            "postgres://db.example/mem"
+        );
+        assert_eq!(
+            store_url_display("postgres://svc:pw@[::1]:5432/mem"),
+            "postgres://[::1]:5432/mem"
         );
     }
 
