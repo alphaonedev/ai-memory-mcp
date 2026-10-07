@@ -261,7 +261,7 @@ the `x-peer-id` HTTP header) to a `PeerScope`
   namespace. A declared nonempty scope is always enforced. The default-on
   `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` also refuses an absent
   allowlist or an enrolled peer with no namespaces. See env row 147 in
-  `CLAUDE.md` and the Standard opt-out contract above.
+  `docs/reference/ARCHITECTURE_REFERENCE.md` and the Standard opt-out contract above.
 
 > ✅ **Inbound write lanes are namespace-confined.**
 > Every inbound write lane routes through the shared

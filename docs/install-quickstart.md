@@ -166,7 +166,7 @@ might want to set once and forget:
 Put any of those in `~/.bashrc` / `~/.zshrc` (or `~/.config/fish/config.fish`)
 and every new shell session picks them up. For
 the full env-var ladder, see the **Environment Variables** section
-of the project [`CLAUDE.md`](../CLAUDE.md).
+of [`docs/reference/ARCHITECTURE_REFERENCE.md`](reference/ARCHITECTURE_REFERENCE.md).
 
 You can also put settings in `~/.config/ai-memory/config.toml`
 instead of env vars — useful when you want one config for both

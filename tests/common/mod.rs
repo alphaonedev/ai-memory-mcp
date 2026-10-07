@@ -101,7 +101,7 @@ pub const PG_TEST_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// The HTTP daemon (`POST /api/v1/*`) is multi-tenant and resolves the
 /// caller's identity via, in order: the request body's `agent_id`
 /// field, the `X-Agent-Id` header, or a per-request anonymous
-/// fallback `anonymous:req-<uuid8>` (see `CLAUDE.md` §"Agent Identity").
+/// fallback `anonymous:req-<uuid8>` (see `docs/reference/ARCHITECTURE_REFERENCE.md` §"Agent Identity").
 ///
 /// The #910 SAL-level visibility filter (path-traversal flavour in
 /// `PostgresStore::find_paths`, and the parallel guards on `recall`,

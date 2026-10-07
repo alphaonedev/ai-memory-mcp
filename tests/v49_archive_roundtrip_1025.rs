@@ -3,7 +3,7 @@
 
 //! v0.7.0 #1025 + #1100 — v49 archive→restore lossless round-trip pin.
 //!
-//! Per CLAUDE.md §Architecture and §Data Model, v0.7.0 introduces the
+//! Per `docs/reference/ARCHITECTURE_REFERENCE.md` §Architecture and §Data Model, v0.7.0 introduces the
 //! 26-field [`Memory`] struct (15 v0.6.x columns + 11 new v0.7.0
 //! columns: `reflection_depth`, `memory_kind`, `entity_id`,
 //! `persona_version`, `citations`, `source_uri`, `source_span`,
