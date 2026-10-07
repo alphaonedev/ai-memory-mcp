@@ -1603,6 +1603,8 @@ WORKFLOW_PATH = ".github/workflows/claude-md-guard.yml"
 
 
 WORKFLOW_BASE_BRANCHES = ("main", "develop", "release/**", "rehearsal/**")
+# `push` must NOT name rehearsal/** (#5447 R-PUSH, #5659): the carrier gets the guard on its pull_request runs.
+WORKFLOW_PUSH_BRANCHES = ("main", "develop", "release/**")
 WORKFLOW_FORBIDDEN_KEYS = ("pull_request_target", "continue-on-error", "paths", "paths-ignore",
                            "branches-ignore", "tags", "tags-ignore", "if", "shell", "working-directory",
                            "defaults", "env", "container", "services", "strategy", "needs")
@@ -1619,7 +1621,7 @@ WORKFLOW_CANONICAL_LINES = (
     'name: CLAUDE.md guard',
     'on:',
     '  push:',
-    '    branches: [main, develop, "release/**", "rehearsal/**"]',
+    '    branches: [main, develop, "release/**"]',
     '  pull_request:',
     '    branches: [main, develop, "release/**", "rehearsal/**"]',
     '  merge_group:',
@@ -1691,11 +1693,14 @@ def workflow_errors(path: Path, label: str = WORKFLOW_PATH) -> list:
         listed = set()
         if len(branches) == 1:
             listed = {item.strip().strip("\"'") for item in branches[0].split("[", 1)[-1].rstrip("]").split(",")}
-        missing = [b for b in WORKFLOW_BASE_BRANCHES if b not in listed]
+        required = WORKFLOW_PUSH_BRANCHES if trigger == "push" else WORKFLOW_BASE_BRANCHES
+        missing = [b for b in required if b not in listed]
         if len(branches) != 1 or missing:
             errors.append(
-                f"FAIL: {label} `{trigger}` branches must list {', '.join(WORKFLOW_BASE_BRANCHES)}; "
+                f"FAIL: {label} `{trigger}` branches must list {', '.join(required)}; "
                 f"missing {missing or 'a single branches: list'} (#4507 R3-F4)")
+        if trigger == "push" and any("rehearsal" in item for item in listed):
+            errors.append(f"FAIL: {label} `push` branches must not name rehearsal/** (#5447 R-PUSH, #5659)")
     types = [t for _i, t in blocks.get("pull_request", []) if t.startswith("types:")]
     if types and not all(kind in types[0] for kind in WORKFLOW_PR_TYPES):
         errors.append(f"FAIL: {label} pull_request types must include {', '.join(WORKFLOW_PR_TYPES)} (#4507 R3-F4)")
@@ -1900,9 +1905,12 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
     ok &= case("R3-F4 rehearsal/** removed from pull_request", good.replace(
         '  pull_request:\n    branches: [main, develop, "release/**", "rehearsal/**"]',
         '  pull_request:\n    branches: [main, develop, "release/**"]', 1), "pull_request")
-    ok &= case("R3-F4 rehearsal/** removed from push", good.replace(
-        '  push:\n    branches: [main, develop, "release/**", "rehearsal/**"]',
-        '  push:\n    branches: [main, develop, "release/**"]', 1), "push")
+    ok &= case("R3-F4 rehearsal/** added to push", good.replace(
+        '  push:\n    branches: [main, develop, "release/**"]',
+        '  push:\n    branches: [main, develop, "release/**", "rehearsal/**"]', 1), "must not name rehearsal")
+    ok &= case("R3-F4 release/** removed from push", good.replace(
+        '  push:\n    branches: [main, develop, "release/**"]',
+        '  push:\n    branches: [main, develop]', 1), "push")
     ok &= case("R3-F4 pull_request branches filter removed", good.replace(
         '  pull_request:\n    branches: [main, develop, "release/**", "rehearsal/**"]',
         '  pull_request:', 1), "pull_request")
@@ -1966,7 +1974,7 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
     ok &= case("R3-F4 pull_request types closed only", good.replace(
         '  pull_request:\n', '  pull_request:\n    types: [closed]\n', 1), "pull_request types must include")
     ok &= case("R4 push trigger deleted", good.replace(
-        '  push:\n    branches: [main, develop, "release/**", "rehearsal/**"]\n', "", 1), "no `push` trigger")
+        '  push:\n    branches: [main, develop, "release/**"]\n', "", 1), "no `push` trigger")
     ok &= case("R5 merge_group trigger deleted", good.replace(
         "  merge_group:\n    types: [checks_requested]\n", "", 1), "pinned form")
     (wf / "bad.yml").write_bytes(good.encode("utf-8") + b"# \xff\n")
@@ -2149,7 +2157,7 @@ def run_main_wiring_case(repo_root: Path, base: Path) -> bool:
         print(f"FAIL: self-test - the wiring fixture was rejected: {errors[0]}", file=sys.stderr)
         return False
     edits = (
-        (WORKFLOW_PATH, '  push:\n    branches: [main, develop, "release/**", "rehearsal/**"]',
+        (WORKFLOW_PATH, '  push:\n    branches: [main, develop, "release/**"]',
          "  push:\n    branches: [main]", "push"),
         (COMPARE_WORKFLOW_PATH, "    timeout-minutes: 10", "    timeout-minutes: 10\n    if: false", "`if:`"),
     )
