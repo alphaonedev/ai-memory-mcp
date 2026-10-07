@@ -182,10 +182,12 @@ pub enum FlooredConnectError {
     /// operator-facing refusal, which never echoes the DSN. No socket was
     /// opened.
     Refused(SslmodeFloor),
-    /// sqlx could not parse the DSN. The text is already URL-redacted.
-    /// ERRORS-15 exception: the `sqlx::Error` is not chained as `source()`
-    /// because its `Display` can interpolate the raw DSN (credential
-    /// included), and redaction has to run on text.
+    /// sqlx could not parse the DSN. Carries the allowlist rendering of the
+    /// DSN ([`crate::url_display::store_url_display`]) and nothing of the
+    /// driver's own text. ERRORS-15 exception: the `sqlx::Error` is neither
+    /// chained as `source()` nor rendered, because its `Display` can
+    /// interpolate the raw DSN (credential included) and masking that text
+    /// is a denylist the query string walks straight past (#3711 / #4934).
     Parse(String),
 }
 
@@ -380,14 +382,51 @@ mod tests {
         assert_eq!(opts.get_database(), Some("mem"));
     }
 
+    /// #4934 / #3711 — a sqlx parse failure reaches the operator as the
+    /// allowlist rendering of the DSN and NOTHING of the driver's own text.
+    ///
+    /// sqlx honours the `ssl-mode` ALIAS of the `sslmode` key the text floor
+    /// pins on, and its parse error interpolates the VALUE it rejected, so a
+    /// credential pasted there was echoed by the dependency. The userinfo-only
+    /// masker this replaced never touched that text. Restoring it fails the
+    /// secret-ABSENCE loop below.
     #[test]
     fn parse_error_never_renders_query_secrets_4934() {
+        let dsn = "postgres://svc-alice:userinfo-s3cr3t@db.internal:5432/mem\
+                   ?sslmode=verify-full&ssl-mode=pasted-s3cr3t-4934\
+                   &sslpassword=ssl-p4ss&password=query-p4ssw0rd";
+        let Err(err) = floored_connect_options(dsn) else {
+            panic!("an unknown ssl-mode value is refused");
+        };
+        assert!(
+            matches!(err, FlooredConnectError::Parse(_)),
+            "the text floor pinned the host, so sqlx's parse is what failed: {err:?}"
+        );
+        for rendering in [format!("{err}"), format!("{err:?}")] {
+            for secret in [
+                "pasted-s3cr3t-4934",
+                "userinfo-s3cr3t",
+                "ssl-p4ss",
+                "query-p4ssw0rd",
+                "sslpassword",
+                "password",
+                "svc-alice",
+                "?",
+            ] {
+                assert!(
+                    !rendering.contains(secret),
+                    "#4934: {secret} reached the parse error: {rendering}"
+                );
+            }
+            assert!(
+                rendering.contains("db.internal"),
+                "the host an operator needs is still named: {rendering}"
+            );
+        }
+        // Non-numeric port: a second parse-failure shape stays clean.
         let dsn = "postgres://u:pw4934@db.internal/mem?sslmode=verify-full&sslpassword=SECRETQ4934&port=notaport";
         let err = evaluate(dsn).expect_err("a non-numeric port must not parse");
-        let FlooredConnectError::Parse(detail) = &err else {
-            panic!("expected Parse, got {err:?}");
-        };
-        let shown = format!("{err} {detail}");
+        let shown = format!("{err}");
         assert!(shown.contains("db.internal"), "{shown}");
         for secret in ["SECRETQ4934", "pw4934", "sslpassword", "notaport"] {
             assert!(!shown.contains(secret), "leaked {secret}: {shown}");
