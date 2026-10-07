@@ -17,8 +17,10 @@
 name: CLAUDE.md guard
 
 on:
+  # `push` does not name rehearsal/** (#5447 R-PUSH, #5659): the carrier is
+  # covered by the pull_request trigger below, which does.
   push:
-    branches: [main, develop, "release/**", "rehearsal/**"]
+    branches: [main, develop, "release/**"]
   pull_request:
     branches: [main, develop, "release/**", "rehearsal/**"]
   # Merge Queue (#3089): report on the merge_group ref so the queue never wedges
