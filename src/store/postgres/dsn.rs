@@ -153,8 +153,8 @@ pub fn screen_dsn(dsn: &str) -> ScreenedDsn<'_> {
 /// # Errors
 ///
 /// sqlx's own parse error for a malformed DSN. Its `Display` can interpolate
-/// the connection target, so callers redact it with
-/// [`crate::logging::redact_urls_in_message`] before it leaves the process.
+/// the connection target, so callers never render it; [`evaluate`] drops it
+/// and renders only `url_display::store_url_display` (#4934).
 pub fn connect_options(dsn: &str) -> Result<PgConnectOptions, sqlx::Error> {
     let screened = screen_dsn(dsn);
     if !screened.removed_positions.is_empty() {
@@ -215,8 +215,14 @@ fn evaluate(dsn: &str) -> Result<PgConnectOptions, FlooredConnectError> {
         SslmodeFloor::Pinned { host } => host,
         refused => return Err(FlooredConnectError::Refused(refused)),
     };
-    let options = connect_options(dsn).map_err(|e| {
-        FlooredConnectError::Parse(crate::logging::redact_urls_in_message(&e.to_string()))
+    // #4934 / #3711: the driver text can echo query values (`password=`,
+    // `sslpassword=`) a userinfo-only masker leaves intact, so it is dropped
+    // (CWE-532); only the allowlisted `scheme://host/db` rendering is kept.
+    let options = connect_options(dsn).map_err(|_| {
+        FlooredConnectError::Parse(format!(
+            "invalid connection string for {}",
+            crate::url_display::store_url_display(dsn)
+        ))
     })?;
     // The driver's own transport predicate (`fetch_socket`): a socket is set,
     // or the host starts with `/`. The path-host arm is reachable: `PGHOST=/dir`
@@ -372,5 +378,19 @@ mod tests {
         assert_eq!(opts.get_host(), "db.internal");
         assert_eq!(opts.get_username(), "u");
         assert_eq!(opts.get_database(), Some("mem"));
+    }
+
+    #[test]
+    fn parse_error_never_renders_query_secrets_4934() {
+        let dsn = "postgres://u:pw4934@db.internal/mem?sslmode=verify-full&sslpassword=SECRETQ4934&port=notaport";
+        let err = evaluate(dsn).expect_err("a non-numeric port must not parse");
+        let FlooredConnectError::Parse(detail) = &err else {
+            panic!("expected Parse, got {err:?}");
+        };
+        let shown = format!("{err} {detail}");
+        assert!(shown.contains("db.internal"), "{shown}");
+        for secret in ["SECRETQ4934", "pw4934", "sslpassword", "notaport"] {
+            assert!(!shown.contains(secret), "leaked {secret}: {shown}");
+        }
     }
 }
