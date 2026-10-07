@@ -601,7 +601,7 @@ ANCHORS = [
     # index.html upgrade paragraph: "steps up to v100 on the first ..." and
     # "a v0.8.x DB steps v70 -> v100" (tag-stripped, entity-decoded).
     re.compile(r'\bv([0-9]+) on the first ai-memory serve after the upgrade'),
-    re.compile(r'\bsteps v[0-9]+\s*(?:→|->)\s*v([0-9]+)'),
+    re.compile(r'\bsteps\s+v[0-9]+\s*(?:→|->)\s*v([0-9]+)'),
     # CONFIG_SCHEMA postgres row: | ai-memory postgres schema | **v93** |
     re.compile(r'ai-memory postgres schema *\| *\*\*v([0-9]+)\*\*'),
     # schema.html phrasings.
@@ -618,6 +618,9 @@ PILL = re.compile(r'class="pill"[^>]*>\s*v([0-9]+)\s+schema\s*<')
 TAG = re.compile(r'<[^>]+>')
 WS = re.compile(r'\s+')
 PRIOR = re.compile(r'PRIOR RELEASE', re.IGNORECASE)
+# A block that ends a claim's paragraph. Not `br` (a break inside the paragraph)
+# and not `td`/`th` (a subject cell and its value cell are one row's claim; #5195).
+BLOCK_TAG = re.compile(r'</?(?:p|div|li|ul|ol|tr|table|h[1-6]|section)\b', re.IGNORECASE)
 
 
 def plain(s):
@@ -675,7 +678,10 @@ for path in files:
             # markdown line is a paragraph break (#4511-R6 pins both).
             back = ln - 2
             prev = plain(lines[back]) if is_html else lines[back]
-            while is_html and not prev and back > 0 and ln - 2 - back < 3:
+            # A block-boundary line (`</div>`, `<p>`, `<li>`) ends the claim's
+            # paragraph: the walk stops there (#5154).
+            while is_html and not prev and back > 0 and ln - 2 - back < 3 \
+                    and not BLOCK_TAG.search(lines[back]):
                 back -= 1
                 prev = plain(lines[back])
             # Whitespace at the wrap point is not part of the claim: markdown
@@ -2750,6 +2756,10 @@ a v0.8.x DB steps v40->v53 on boot.
 probe: `CURRENT_SCHEMA_VERSION` is
 
 v52 was the schema before #2555.
+a v0.8.x DB steps  v40 → v52 on boot.
+a v0.8.x DB steps  v40 → v53 on boot.
+a v0.8.x DB steps	v40 → v52 on boot.
+a v0.8.x DB steps	v40 → v53 on boot.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2794,7 +2804,55 @@ v40&nbsp;&rarr;&nbsp;v53</span></em></strong>)</p>
 <li>
 <p>
 v52 added the audit table.</p>
+<p>See CURRENT_SCHEMA_VERSION</p>
+</div>
+<div>
+<p>52 tools ship today.</p>
+<p>The live CURRENT_SCHEMA_VERSION is
+<br>
+52 on both backends.</p>
+<p>The live CURRENT_SCHEMA_VERSION is
+<br>
+53 on both backends.</p>
+<td>
+<code>CURRENT_SCHEMA_VERSION</code>
+</td>
+<td>
+52</td>
+<td>
+<code>CURRENT_SCHEMA_VERSION</code>
+</td>
+<td>
+53</td>
+<p>(a v0.8.x DB steps
+<br>
+v40&nbsp;&rarr;&nbsp;v52 on boot.)</p>
+<p>(a v0.8.x DB steps
+<br>
+v40&nbsp;&rarr;&nbsp;v53 on boot.)</p>
+<p>(CURRENT_SCHEMA_VERSION is
+<strong>
+<em>
+<span>
+<a>
+v52</a></span></em></strong>)</p>
+<p>(CURRENT_SCHEMA_VERSION is
+<strong>
+<em>
+<span>
+v52</span></em></strong>)</p>
 R4HTML
+    # #5196: every block tag, opening and closing, stops the look-back; every inline or
+    # in-row tag does not. One triple per tag (subject, tag-only line, value). block-fixture.html
+    # must raise nothing; block-control.html (same triples, inline tags) must flag every value.
+    : > "$tmpdir/docs/block-fixture.html"; : > "$tmpdir/docs/block-control.html"
+    for _bt in p div li ul ol tr table h1 h2 h3 h4 h5 h6 section P 'div class="x"' \
+               /p /div /li /ul /ol /tr /table /h1 /h2 /h3 /h4 /h5 /h6 /section /DIV; do
+        printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-fixture.html"
+    done
+    for _bt in em span strong a code b br td th /td /th /em /span /strong /br; do
+        printf '<i>See CURRENT_SCHEMA_VERSION</i>\n<%s>\n52 rows.\n' "$_bt" >> "$tmpdir/docs/block-control.html"
+    done
     r4_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test #3248 r4 - stale wordings not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
     for _want in \
@@ -2819,8 +2877,29 @@ R4HTML
         'docs/postgres-age-guide.md:29 claims "52"' \
         'docs/schema-fixture.html:21 claims "52"' \
         'docs/postgres-age-guide.md:32 claims "52"' \
+        'docs/postgres-age-guide.md:37 claims "52"' \
+        'docs/postgres-age-guide.md:39 claims "52"' \
         'docs/schema-fixture.html:25 claims "52"' \
-        'docs/schema-fixture.html:31 claims "52"'
+        'docs/schema-fixture.html:31 claims "52"' \
+        'docs/schema-fixture.html:49 claims "52"' \
+        'docs/schema-fixture.html:57 claims "52"' \
+        'docs/schema-fixture.html:65 claims "52"' \
+        'docs/block-control.html:3 claims "52"' \
+        'docs/block-control.html:6 claims "52"' \
+        'docs/block-control.html:9 claims "52"' \
+        'docs/block-control.html:12 claims "52"' \
+        'docs/block-control.html:15 claims "52"' \
+        'docs/block-control.html:18 claims "52"' \
+        'docs/block-control.html:21 claims "52"' \
+        'docs/block-control.html:24 claims "52"' \
+        'docs/block-control.html:27 claims "52"' \
+        'docs/block-control.html:30 claims "52"' \
+        'docs/block-control.html:33 claims "52"' \
+        'docs/block-control.html:36 claims "52"' \
+        'docs/block-control.html:39 claims "52"' \
+        'docs/block-control.html:42 claims "52"' \
+        'docs/block-control.html:45 claims "52"' \
+        'docs/schema-fixture.html:79 claims "52"'
     do grep -qF "$_want" <<<"$r4_out" || { echo "FAIL: self-test #3248 r4 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
     for _not in \
         'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:4 ' \
@@ -2836,12 +2915,19 @@ R4HTML
         'docs/postgres-age-guide.md:27 ' 'docs/postgres-age-guide.md:31 ' 'docs/schema-fixture.html:24 ' \
         'docs/postgres-age-guide.md:33 ' 'docs/schema-fixture.html:26 ' \
         'docs/postgres-age-guide.md:36 ' 'docs/schema-fixture.html:36 ' \
-        'docs/schema-fixture.html:42 '
+        'docs/schema-fixture.html:42 ' \
+        'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 ' 'docs/schema-fixture.html:46 ' \
+        'docs/schema-fixture.html:52 ' 'docs/schema-fixture.html:62 ' 'docs/schema-fixture.html:68 ' \
+        'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:'
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5026/#5080 - anchor wrapped across two lines (steps / v40 -> v52) and identifier value more than 60 chars after the identifier: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #4511-R5 - wrapped claim with an issue ref / release triple in the subject tail, whitespace at the wrap point, and a tag-only middle line: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5140 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, any case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
+    echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5196 - the look-back bound is pinned both ways: 3 inline tag-only lines join (52 REJECTED), 4 do not"
     echo "PASS: self-test #4511-R6 - html look-back skips up to 3 tag-only lines (52 REJECTED, 53 ACCEPTED), stops past 3, and markdown never looks back past a blank line"
     echo "PASS: self-test #4851 - compact json schema_version:52 REJECTED, :53 ACCEPTED"
     echo "PASS: self-test #4852 - issue ref / release triple between identifier and value: planted 52 REJECTED, 53 ACCEPTED"
@@ -2851,6 +2937,7 @@ R4HTML
     echo "PASS: self-test #4849 - drifted current-state wording (v1.0.0 substrate, bold value) REJECTED, canonical ACCEPTED"
     echo "PASS: self-test #4844/#4845/#4846 - ROADMAP header parenthetical, at-a-glance card + stat tile, compliance tagline, index upgrade paragraph: stale REJECTED, canonical ACCEPTED"
     rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/schema-fixture.html"
+    rm -f "$tmpdir/docs/block-fixture.html" "$tmpdir/docs/block-control.html"
     rm -f "$tmpdir/docs/CONFIG_SCHEMA.md" "$tmpdir/docs/schema-fixture.html"
     printf '# fixture ledger (comment-only)\n' > scripts/qc-allowlists/schema-claim-history.txt
 

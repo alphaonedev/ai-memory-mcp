@@ -228,10 +228,23 @@ lab_posture_ssot_check() {
   return 0
 }
 
+# #5155: true when a boot refusal in <file> names the lowered rollback-check knob.
+# One awk pass reads the whole file: no pipe (a `grep -q` reader closing early returns 141
+# under pipefail) and no here-string (bash spills a large one to a temp file under $TMPDIR,
+# /tmp when unset; #5197). Lines naming INFO are the profile's pin line, never a refusal.
+# The trailing colon pins the whole knob name. An unreadable file is "not detected".
+lab_probe_refusal_names_knob() {
+  awk 'index($0, "INFO") == 0 && index($0, "refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:") { f = 1 }
+       END { exit (f ? 0 : 1) }' "$1" 2>/dev/null
+}
+
 # lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
-# Each leg mutates the lab posture arrays in a subshell and the check must
-# return the expected code: the control passes; a weakened value (plain and
-# const-valued), a dropped name and a SET knob moved to UNSET all go red.
+# 16 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 11
+# leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
+# const in a scratch src tree), five probe-matcher legs (lab_probe_refusal_names_knob against
+# generated logs), one structural leg (the matcher has no here-string, here-document or pipe)
+# and one layout leg (this comment sits directly on the function).
 # Prints one line per leg; returns 0 only if every leg behaved.
 lab_posture_selftest() {
   local root="$1" bad=0 rc name want
@@ -266,6 +279,43 @@ lab_posture_selftest() {
   printf 'pub const ENV_DB_SYNCHRONOUS: &str = "SHADOW_ENV";\n' >> "$shadow/src/aaa_shadow.rs"
   ( _leg "a name-only const with two distinct values is cannot-check, not first-match" 2 ) || bad=1
   root="$real_root"; rm -rf "$shadow"
+  # #5155: the probe-mutation matcher names the knob WITH its trailing colon, ignores INFO pin
+  # lines, and reads the whole log (a large log must not turn a detection into "inconclusive").
+  local plog; plog="$(mktemp -d "${TMPDIR:-.}/probe-matcher.XXXXXX")" || return 1
+  printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n' > "$plog/ok.log"
+  printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK_STRICT: nope\n' > "$plog/other-knob.log"
+  printf 'boot\nINFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/info-only.log"
+  printf 'INFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\nfatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n' > "$plog/info-then-refusal.log"
+  awk 'BEGIN { print "fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1"
+               for (i = 0; i < 200000; i++) print "filler line to fill the pipe buffer" }' > "$plog/big.log"
+  ( lab_probe_refusal_names_knob "$plog/ok.log" ) \
+    && echo "  PASS probe matcher: refusal naming the knob is detected" \
+    || { echo "  FAIL probe matcher: refusal naming the knob not detected"; bad=1; }
+  ( lab_probe_refusal_names_knob "$plog/other-knob.log" ) \
+    && { echo "  FAIL probe matcher: a refusal for a longer knob name was counted"; bad=1; } \
+    || echo "  PASS probe matcher: a refusal for a longer knob name is not counted"
+  ( lab_probe_refusal_names_knob "$plog/info-only.log" ) \
+    && { echo "  FAIL probe matcher: an INFO pin line was counted"; bad=1; } \
+    || echo "  PASS probe matcher: an INFO pin line is not counted"
+  ( lab_probe_refusal_names_knob "$plog/info-then-refusal.log" ) \
+    && echo "  PASS probe matcher: a refusal after an INFO line naming the knob is detected" \
+    || { echo "  FAIL probe matcher: a refusal after an INFO line naming the knob not detected"; bad=1; }
+  ( set -o pipefail; lab_probe_refusal_names_knob "$plog/big.log" ) \
+    && echo "  PASS probe matcher: detection in a large log survives pipefail" \
+    || { echo "  FAIL probe matcher: detection in a large log lost"; bad=1; }
+  # #5197, #5259: the matcher must not feed the log through a here-string or a here-document (bash
+  # spills a large one to a temp file under $TMPDIR, /tmp when unset) or a pipe (SIGPIPE under pipefail).
+  case "$(declare -f lab_probe_refusal_names_knob)" in
+    *'<<'*|*' | '*) echo "  FAIL probe matcher: reads the log through a here-string, a here-document or a pipe"; bad=1 ;;
+    *) echo "  PASS probe matcher: reads the log without a here-string, a here-document or a pipe" ;;
+  esac
+  rm -rf "$plog"
+  # #5198: the doc comment sits on the function it describes (a helper between them is drift).
+  if [ "$(grep -B1 '^lab_posture_selftest() {' "${BASH_SOURCE[0]}" | head -n 1)" = "# Prints one line per leg; returns 0 only if every leg behaved." ]; then
+    echo "  PASS doc comment: lab_posture_selftest is documented by the comment directly above it"
+  else
+    echo "  FAIL doc comment: another function sits between the lab_posture_selftest comment and the function"; bad=1
+  fi
   unset -f _leg
   return "$bad"
 }
