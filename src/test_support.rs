@@ -678,15 +678,20 @@ pub(crate) fn error_debug_capture() -> (impl tracing::Subscriber + Send + Sync, 
     (subscriber, sink)
 }
 
-/// The (ERROR, DEBUG) line counts a [`error_debug_capture`] sink received.
-pub(crate) fn count_error_and_debug_lines(sink: &CapturedLines) -> (usize, usize) {
-    let text = String::from_utf8_lossy(
+/// Everything a [`error_debug_capture`] sink received, as text.
+pub(crate) fn captured_text(sink: &CapturedLines) -> String {
+    String::from_utf8_lossy(
         &sink
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     )
-    .into_owned();
+    .into_owned()
+}
+
+/// The (ERROR, DEBUG) line counts a [`error_debug_capture`] sink received.
+pub(crate) fn count_error_and_debug_lines(sink: &CapturedLines) -> (usize, usize) {
+    let text = captured_text(sink);
     let count = |level: &str| text.lines().filter(|l| l.contains(level)).count();
     (count("ERROR"), count("DEBUG"))
 }
