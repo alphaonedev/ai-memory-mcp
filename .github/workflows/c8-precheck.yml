@@ -66,8 +66,12 @@ on:
   # scripts/check-required-contexts.sh, which runs in this very workflow.
   push:
     branches: [main, develop, "release/**"]
+  # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
+  # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
+  # together), #2523 and #2508 (push must not overlap a PR head such as
+  # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: [main, develop, "release/**"]
+    branches: [main, develop, "release/**", "rehearsal/**"]
   # Merge Queue (#3089) — this workflow carries several REQUIRED gate contexts,
   # so it MUST report on the `merge_group` ref or the queue wedges. Its jobs
   # have no docs-only/event `if:` gating (the two event-scoped gates —

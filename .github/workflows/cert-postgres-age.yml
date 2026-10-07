@@ -76,8 +76,12 @@
 name: "Certified Postgres + AGE + pgvector tier (#2548)"
 
 on:
+  # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
+  # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
+  # together), #2523 and #2508 (push must not overlap a PR head such as
+  # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: ["release/**"]
+    branches: ["release/**", "rehearsal/**"]
   push:
     branches: ["release/**"]
   workflow_dispatch:
