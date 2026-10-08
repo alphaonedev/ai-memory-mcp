@@ -405,10 +405,34 @@ pub async fn skill_promote_route(
     match crate::mcp::handle_skill_promote_for_caller(&lock.0, &params, kp, &caller, read_caller) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
+            // #3707 / #6115 - the chain may carry a store or driver `Display`
+            // (SQL fragments, paths); the caller gets a fixed message per
+            // status, the detail goes to a tracing line for the operator.
             let status = promote_error_status(&e);
-            (status, Json(json!({"error": e.to_string()}))).into_response()
+            tracing::warn!(
+                target: SKILLS_TRACE_TARGET,
+                error = %e,
+                status = status.as_u16(),
+                "skill_promote_route: refused (detail withheld from wire response, #3707)"
+            );
+            // The typed `ReflectionNotFound` root is OUR value, keyed only to
+            // the id the caller sent (#3551: hidden and missing share one
+            // envelope), so its text is safe to render; anything else is
+            // flattened.
+            (status, Json(json!({"error": promote_error_message(&e)}))).into_response()
         }
     }
+}
+
+/// #3707 / #6115 - fixed caller message for a failed skill-promote whose
+/// root is not our typed not-found verdict; store or driver text never
+/// crosses to the wire.
+const SKILL_PROMOTE_FAILED_MSG: &str = "skill promote failed";
+
+/// #3707 / #6115 - caller-facing message for a failed skill-promote.
+fn promote_error_message(e: &anyhow::Error) -> String {
+    e.downcast_ref::<crate::errors::ReflectionNotFound>()
+        .map_or_else(|| SKILL_PROMOTE_FAILED_MSG.to_owned(), ToString::to_string)
 }
 
 /// #4622 - HTTP status for a failed skill-promote: 404 only when the chain
@@ -593,7 +617,7 @@ pub async fn skill_delete_route(
 
 #[cfg(test)]
 mod promote_status_4622_tests {
-    use super::promote_error_status;
+    use super::{promote_error_message, promote_error_status};
     use crate::errors::{MemoryError, ReflectionNotFound};
     use crate::models::{Memory, MemoryKind, Tier};
     use axum::http::StatusCode;
@@ -668,6 +692,15 @@ mod promote_status_4622_tests {
         let err = promote(&conn, &id, "not found").expect_err("bad skill name");
         assert!(err.to_string().contains("not found"), "{err}");
         assert_eq!(promote_error_status(&err), StatusCode::BAD_REQUEST);
+    }
+
+    /// #6115: a foreign (store or driver) root never reaches the caller body.
+    #[test]
+    fn issue_6115_foreign_error_text_is_withheld_from_the_body() {
+        let err = anyhow::anyhow!("no such table: skills (SQLITE_ERROR) at /var/db/x.sqlite");
+        assert_eq!(promote_error_message(&err), "skill promote failed");
+        let rnf = anyhow::Error::new(ReflectionNotFound::new("abc"));
+        assert_eq!(promote_error_message(&rnf), "reflection not found: abc");
     }
 
     /// Pin 3: the 404 follows the type, not the Display text.
