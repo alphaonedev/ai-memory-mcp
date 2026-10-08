@@ -348,6 +348,68 @@ async fn http_skill_promote_route_rejects_non_reflection_400() {
     );
 }
 
+/// POST a promote body for `id` as the enrolled admin and return `(status, body)`.
+async fn post_promote(router: axum::Router, id: &str, body: &Value) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/skill/{id}/promote"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", "ops:admin")
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    read_body_json(resp).await
+}
+
+/// #6125 - a first-party refusal (bad skill name) keeps its typed text in the
+/// 400 body, exactly as the MCP path of the same operation does.
+#[tokio::test]
+async fn issue_6125_http_promote_400_body_keeps_first_party_name_refusal() {
+    let (_dir, db_path) = fresh_db();
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let (status, v) = post_promote(
+        router,
+        "any-reflection",
+        &json!({"name": "BadName", "description": "d"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    let msg = v["error"].as_str().expect("error string");
+    assert!(msg.contains("spec §3.1"), "typed refusal text lost: {msg}");
+    assert_ne!(msg, "skill promote failed");
+}
+
+/// #6125 - the over-long description refusal is first-party text too.
+#[tokio::test]
+async fn issue_6125_http_promote_400_body_keeps_first_party_description_refusal() {
+    let (_dir, db_path) = fresh_db();
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let (status, v) = post_promote(
+        router,
+        "any-reflection",
+        &json!({"name": "good-name", "description": "x".repeat(1025)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    let msg = v["error"].as_str().expect("error string");
+    assert!(msg.contains("1024"), "typed refusal text lost: {msg}");
+}
+
+/// #6125 - the 404 body for a missing reflection stays the typed text.
+#[tokio::test]
+async fn issue_6125_http_promote_404_body_is_unchanged() {
+    let (_dir, db_path) = fresh_db();
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let (status, v) = post_promote(
+        router,
+        "no-such-reflection",
+        &json!({"name": "good-name", "description": "d"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["error"], "reflection not found: no-such-reflection");
+}
+
 // ---------------------------------------------------------------------------
 // #2024 — retire HTTP admin gate + CLI parity
 // ---------------------------------------------------------------------------
