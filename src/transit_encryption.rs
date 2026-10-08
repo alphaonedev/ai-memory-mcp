@@ -522,8 +522,10 @@ pub fn pg_unix_socket_refusal(dir: &str) -> String {
 pub fn pg_dsn_unparseable_refusal() -> String {
     format!(
         "{ISSUE_TAG}: refusing the PostgreSQL store DSN: it is not a `postgres://` URL the \
-         driver parses (a userinfo with no host, another scheme, or malformed), so its transport \
-         cannot be established ({MANDATE}). Fix: `postgres://user:pass@host:port/db?` and \
+         driver parses (a userinfo with no host, another scheme, malformed, or an `@` outside the \
+         userinfo: percent-encode a literal `@` in a password or query value as `%40`, and an \
+         unencoded `/`, `?` or `#` in a password likewise), so its transport cannot be \
+         established ({MANDATE}). Fix: `postgres://user:pass@host:port/db?` and \
          {REMEDY_PG_SSLMODE}."
     )
 }

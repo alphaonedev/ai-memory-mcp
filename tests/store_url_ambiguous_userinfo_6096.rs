@@ -326,3 +326,30 @@ fn config_show_effective_redacts_a_case_variant_store_scheme_6102() {
         assert!(text.contains("<redacted-authority>"), "{scheme}: {text}");
     }
 }
+
+/// r2 code F1: a literal `@` in a QUERY value is refused at the transit floor
+/// (the shared ambiguity predicate stays conservative: narrowing it to "no
+/// parsed userinfo" would accept `svc:a@SECRET?x@db`). The refusal must tell
+/// the user to percent-encode it, and the encoded form must still pass.
+#[cfg(feature = "sal-postgres")]
+#[test]
+fn query_at_sign_refusal_says_to_percent_encode_6096() {
+    use ai_memory::transit_encryption::{
+        SslmodeFloor, dsn_floor_verdict, pg_dsn_unparseable_refusal,
+    };
+    let raw = "postgres://svc:pw@db.example:5432/mem?sslmode=verify-full&application_name=svc@prod";
+    assert!(
+        matches!(dsn_floor_verdict(raw), SslmodeFloor::Unparseable),
+        "query `@` must stay fail-closed"
+    );
+    let text = pg_dsn_unparseable_refusal();
+    assert!(
+        text.contains("%40") && text.contains("percent-encode"),
+        "#6096 F1: refusal must name the %40 remedy: {text}"
+    );
+    let encoded = raw.replace("svc@prod", "svc%40prod");
+    assert!(
+        matches!(dsn_floor_verdict(&encoded), SslmodeFloor::Pinned { .. }),
+        "percent-encoded `@` must pass the floor"
+    );
+}
