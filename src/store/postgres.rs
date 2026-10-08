@@ -23727,8 +23727,11 @@ impl MemoryStore for PostgresStore {
         // snapshot block (~L3722). The DELETE only ever removes a stale
         // in_place_edit snapshot of this id (supersede forks a new id +
         // deletes the old live row; GC deletes the live row; restore
-        // removes the archive row on success — so a live, in-place-
-        // editable row can never collide with a different archive_reason).
+        // removes the archive row on success). The per-id slot holds ONE
+        // pre-image regardless of reason: a `federation_merge` snapshot
+        // (#1773/#3961 same-id lane, #4206 title-slot lane) can occupy it,
+        // so this DELETE may remove that record too. The newest pre-image
+        // is the one kept; per-reason retention is tracked under #6048.
         if content_changed {
             sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
                 .bind(id)

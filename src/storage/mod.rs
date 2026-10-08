@@ -5568,12 +5568,17 @@ pub fn delete_archive_first(conn: &Connection, id: &str) -> Result<bool> {
 /// MOST-RECENT pre-edit snapshot (the "immediately-prior content"). A
 /// second edit replaces the first snapshot — by design (#1725 archives
 /// the immediately-prior content, not a per-edit history; full lineage
-/// is the #888 supersede fork). The only same-id archive row a live,
-/// in-place-editable row can collide with is a PRIOR `in_place_edit`
-/// snapshot: supersede forks a new id + deletes the old live row, GC
-/// deletes the live row, and restore removes the archive row on
-/// success — so this `REPLACE` never clobbers a different
-/// `archive_reason`'s record. Callers MUST already hold a transaction
+/// is the #888 supersede fork). The per-id archive slot holds ONE
+/// pre-image regardless of reason, so a live row's slot can collide
+/// with a prior `in_place_edit` snapshot AND with a prior
+/// `federation_merge` snapshot: the same-id federation merge (#1773,
+/// [`overwrite_full_row_by_id`]) and the title-slot federation merge
+/// (#4206, `snapshot_title_slot_preimage_if_overwritten`) write
+/// `federation_merge` into the same slot, so each of these writers can
+/// replace the other's record. The newest pre-image is the one kept;
+/// per-reason retention is the WP-ERASURE design (#6048). Supersede
+/// forks a new id + deletes the old live row, GC deletes the live row,
+/// and restore removes the archive row on success. Callers MUST already hold a transaction
 /// (the caller wraps archive + UPDATE in one `BEGIN IMMEDIATE` so a
 /// mid-failure rolls both back, leaving the OLD content live).
 ///
