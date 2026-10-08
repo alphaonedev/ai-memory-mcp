@@ -179,6 +179,21 @@ fn ok_response(id: Value, result: Value) -> RpcResponse {
     }
 }
 
+/// #4347 (F-4) — write one reply, but only when the stop has not fenced the
+/// request: EVERY reply goes through [`shutdown::ShutdownGate::commit_ack`], so
+/// "no reply after a stop" is uniform (parse-error and oversize replies carry
+/// no write, but the invariant must not depend on that). `false`: the request
+/// was fenced, nothing was written and the caller stops serving.
+fn reply_unless_fenced(stdout: &mut io::Stdout, resp: &RpcResponse) -> anyhow::Result<bool> {
+    if !shutdown::gate().commit_ack() {
+        return Ok(false);
+    }
+    let out = serde_json::to_string(resp)?;
+    writeln!(stdout, "{out}")?;
+    stdout.flush()?;
+    Ok(true)
+}
+
 fn err_response(id: Value, code: i64, message: String) -> RpcResponse {
     RpcResponse {
         jsonrpc: jsonrpc::VERSION.into(),
@@ -5263,9 +5278,9 @@ pub fn run_mcp_server(
                          and drain ceiling {MCP_MAX_DRAIN_BYTES} hit; closing stream"
                     ),
                 );
-                let out = serde_json::to_string(&resp)?;
-                writeln!(stdout, "{out}")?;
-                stdout.flush()?;
+                if !reply_unless_fenced(&mut stdout, &resp)? {
+                    break;
+                }
                 let _ = db::checkpoint(&conn);
                 eprintln!("ai-memory MCP server stopped (drain ceiling exceeded)");
                 return Ok(());
@@ -5275,9 +5290,9 @@ pub fn run_mcp_server(
                 jsonrpc::PARSE_ERROR,
                 format!("parse error: line exceeded {MCP_MAX_LINE_BYTES} bytes"),
             );
-            let out = serde_json::to_string(&resp)?;
-            writeln!(stdout, "{out}")?;
-            stdout.flush()?;
+            if !reply_unless_fenced(&mut stdout, &resp)? {
+                break;
+            }
             continue;
         }
         // Trim trailing newline (and optional \r) before decoding.
@@ -5295,9 +5310,9 @@ pub fn run_mcp_server(
                     jsonrpc::PARSE_ERROR,
                     format!("parse error: invalid UTF-8: {e}"),
                 );
-                let out = serde_json::to_string(&resp)?;
-                writeln!(stdout, "{out}")?;
-                stdout.flush()?;
+                if !reply_unless_fenced(&mut stdout, &resp)? {
+                    break;
+                }
                 continue;
             }
         };
@@ -5313,9 +5328,9 @@ pub fn run_mcp_server(
                     jsonrpc::PARSE_ERROR,
                     format!("parse error: {e}"),
                 );
-                let out = serde_json::to_string(&resp)?;
-                writeln!(stdout, "{out}")?;
-                stdout.flush()?;
+                if !reply_unless_fenced(&mut stdout, &resp)? {
+                    break;
+                }
                 continue;
             }
         };
@@ -5468,12 +5483,9 @@ pub fn run_mcp_server(
         // to acknowledging it BEFORE the stop path can start its drain; once
         // the stop fenced this request (its in-flight budget expired) it is
         // never acknowledged, so no acknowledged request lacks its row.
-        if !shutdown::gate().commit_ack() {
+        if !reply_unless_fenced(&mut stdout, &resp)? {
             break;
         }
-        let out = serde_json::to_string(&resp)?;
-        writeln!(stdout, "{out}")?;
-        stdout.flush()?;
     }
 
     let _ = db::checkpoint(&conn);

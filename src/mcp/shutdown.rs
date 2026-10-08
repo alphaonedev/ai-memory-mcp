@@ -382,7 +382,18 @@ fn install_one(
             source,
         });
     }
-    tokio::signal::unix::signal(kind).map_err(|source| StopInstallError {
+    map_install(name, || tokio::signal::unix::signal(kind))
+}
+
+/// Map a registration failure to the fail-closed [`StopInstallError`]. The
+/// registration is a parameter so a unit test can drive the mapping without
+/// installing a real process-wide listener (#6108 F-5).
+#[cfg(unix)]
+fn map_install<T>(
+    name: &'static str,
+    register: impl FnOnce() -> std::io::Result<T>,
+) -> Result<T, StopInstallError> {
+    register().map_err(|source| StopInstallError {
         signal: name,
         source,
     })
@@ -715,12 +726,17 @@ mod tests {
         assert_eq!(StopSignal::Hup.exit_code(), 129);
     }
 
-    /// B1 — an install failure is an error, not a degraded start.
+    /// B1 — an install failure is an error, not a degraded start. Driven
+    /// through `map_install` with a stub registration: a real SIGTERM
+    /// listener would persist for the whole lib test binary (F-5); the real
+    /// install is pinned by the integration file, in a child process.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn an_install_failure_is_an_error_not_a_degraded_start_4347() {
-        let err = install_one(tokio::signal::unix::SignalKind::terminate(), "SIGTERM");
-        assert!(err.is_ok(), "a real install works in a runtime");
+    #[test]
+    fn an_install_failure_is_an_error_not_a_degraded_start_4347() {
+        assert_eq!(map_install("SIGTERM", || Ok(7_u8)).ok(), Some(7));
+        let refused = map_install::<()>("SIGTERM", || Err(std::io::Error::other("no")))
+            .expect_err("a failed registration is an error");
+        assert_eq!(refused.signal, "SIGTERM");
         let failure = StopInstallError {
             signal: "SIGHUP",
             source: std::io::Error::other("boom"),
