@@ -289,7 +289,7 @@ fn floor_refuses_every_ambiguous_dsn_6096() {
 #[test]
 fn config_show_effective_redacts_a_case_variant_store_scheme_6102() {
     for scheme in ["POSTGRES", "Postgres", "postgres"] {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = scratch("cfg-show");
         let keys = root.path().join("keys");
         key_dir_sandbox::mkdir_0700(&keys);
         let xdg = root.path().join("home/.config");
