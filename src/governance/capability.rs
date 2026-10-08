@@ -2081,6 +2081,12 @@ mod tests {
     #[test]
     fn apply_at_gate_operator_deny_terminal_pending_flips() {
         use crate::models::{GovernanceDecision, GovernedAction};
+        // #6119: the pending-lift below emits a `capability-grant` row via
+        // `audit_grant_outcome`; hold the forensic sink lock (taken before the
+        // capability-config lock; no test takes them in the reverse order).
+        let _sink = crate::governance::audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _cap = crate::config::lock_capability_config_for_test();
         let (tok, cfg, _, _) = mint_fixture(vec![
             Caveat::OpCeiling(OpLevel::Write),
@@ -2255,6 +2261,12 @@ mod tests {
 
     #[test]
     fn audit_grant_outcome_noop_emits_nothing() {
+        // #6119: the Granted / Rejected calls below append rows to the
+        // process-global forensic sink when a sibling `governance::audit`
+        // test has it initialised. Serialise against those tests.
+        let _sink = crate::governance::audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // The forensic sink is not initialised in unit tests, so the
         // assertion here is behavioural: NoOp must not panic and must
         // not attempt any I/O (record_decision is a no-op sink-less).
