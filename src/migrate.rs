@@ -206,12 +206,13 @@ pub async fn open_source_store(url: &str) -> Result<Box<dyn MemoryStore>> {
     }
 
     // The URL failed BOTH scheme matches, so nothing about its shape is
-    // known — it may carry a query-form password (#3667) or anything else a
-    // userinfo-only masker cannot see. Render from an allowlist: the scheme
-    // token and nothing else.
+    // known — it may carry a query-form password (#3667) or a libpq key/value
+    // DSN whose password precedes a `://` option (#6096 r2 N1, #6100). Render
+    // through the one url_display allowlist (ERRORS-09), never a local
+    // "everything before ://" copy.
     anyhow::bail!(
-        "unrecognised store URL scheme {:?} (expected sqlite:///path or postgres://...)",
-        url.split_once("://").map_or("<none>", |(scheme, _)| scheme)
+        "unrecognised store URL: {} (expected sqlite:///path or postgres://...)",
+        crate::url_display::store_url_display(url)
     )
 }
 

@@ -237,6 +237,27 @@ fn kv_dsn_with_a_url_valued_option_is_never_echoed_6100() {
     }
 }
 
+/// r2 security N1: the `migrate` unrecognised-scheme refusal rendered every
+/// byte before the first `://`, so a key/value DSN password reached it.
+#[test]
+fn migrate_kv_dsn_scheme_refusal_never_echoes_the_password_6100() {
+    let dsn = kv_dsn();
+    let dir = scratch("kv-migrate");
+    let dst = dir.path().join("dst.db");
+    let to = format!("sqlite://{}", dst.display());
+    for (from, to) in [(dsn.as_str(), to.as_str()), (to.as_str(), dsn.as_str())] {
+        let (out, err) = run_bin(
+            dir.path(),
+            &["migrate", "--from", from, "--to", to, "--json"],
+            &[],
+        );
+        assert!(
+            !out.contains(KV_MARKER) && !err.contains(KV_MARKER),
+            "#6100 N1: key/value DSN password reached migrate --from {from:?} --to {to:?}:\n{out}\n{err}"
+        );
+    }
+}
+
 /// F2: the transit floor refuses an ambiguous DSN before any connection or
 /// DNS lookup; it never returns `Pinned` with a credential as the host.
 #[test]
