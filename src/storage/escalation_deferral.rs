@@ -47,7 +47,11 @@
 //! A frame that still holds deferred intents when a later `WriteTxn` opens on
 //! the same thread and database, a settle of an unknown frame, and frames
 //! still holding intents when the thread exits (a `mem::forget`-ed
-//! `WriteTxn`) all log at ERROR; the first two also trip a `debug_assert!`.
+//! `WriteTxn`) are all reported at ERROR. The first two go through `tracing`
+//! and also trip a `debug_assert!`; the thread-exit case is written directly
+//! to stderr (an `ERROR #4116: ...` line), because the `tracing` fmt layer's
+//! own thread-local buffer may already be destroyed at thread exit and
+//! logging through it would abort the process.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,18 +133,26 @@ impl Drop for Frames {
     fn drop(&mut self) {
         let lost: usize = self.0.iter().map(|f| f.deferred.len()).sum();
         if lost > 0 {
-            // No debug_assert here: a panic in a TLS destructor aborts. The
-            // tracing dispatcher is itself thread-local and may already be
-            // destroyed at thread exit (`AccessError` -> abort), so the log
-            // call is isolated: losing the log line is acceptable, aborting
-            // the process is not (per ERRORS-02, fail closed without abort).
-            let _ = std::panic::catch_unwind(|| {
-                tracing::error!(
-                    lost,
-                    "#4116: thread exited with unsettled escalation frame(s) (a leaked \
-                     WriteTxn); those escalated writes stay REFUSED but were NOT queued"
-                );
-            });
+            // No debug_assert here: a panic in a TLS destructor aborts. This
+            // runs at thread exit, in thread-local destructor order (reverse
+            // of registration). `tracing::error!` is NOT usable here: the
+            // product's `tracing-subscriber` fmt layer keeps a thread-local
+            // formatting buffer (`BUF.with`, `fmt_layer.rs`) that is already
+            // destroyed when it was registered after this stack, and its
+            // access panics ("cannot access a Thread Local Storage value
+            // during or after destruction"), which aborts the process
+            // ("thread local panicked on drop"). Catching that panic keeps the
+            // process alive but loses the diagnostic. Write the ERROR line
+            // straight to stderr instead: no thread-local is touched, so it
+            // can neither panic nor be lost, and a failed write is discarded
+            // on purpose (nothing left to report to; ERRORS-19).
+            let _ = std::io::Write::write_fmt(
+                &mut std::io::stderr(),
+                format_args!(
+                    "ERROR #4116: thread exited with {lost} unsettled escalation frame(s) \
+                     (a leaked WriteTxn); those escalated writes stay REFUSED but were NOT queued\n"
+                ),
+            );
         }
     }
 }
@@ -424,5 +436,71 @@ mod tests {
         assert!(super::defer_to_open_txn(a.path(), intent).is_ok());
         std::mem::forget(leaked);
         let _next = super::super::connection::WriteTxn::begin_deferred(&b).expect("begin b");
+    }
+
+    /// #4116 F1 — the thread-exit leak report is an ERROR line on stderr and
+    /// never aborts the process. The child leaks a frame on a thread that then
+    /// logs through the product's global fmt subscriber (registering the fmt
+    /// layer's thread-local buffer AFTER the frame stack, so it is destroyed
+    /// first); `tracing::error!` from `Frames::drop` used to panic there and
+    /// abort (SIGABRT, "thread local panicked on drop").
+    #[test]
+    fn issue_4116_thread_exit_leak_is_reported_on_stderr_and_does_not_abort() {
+        const ROLE: &str = "AI_MEMORY_TEST_4116_THREAD_EXIT_LEAK";
+        const PATH: &str = "storage::escalation_deferral::tests::issue_4116_thread_exit_leak_is_reported_on_stderr_and_does_not_abort";
+        if std::env::var(ROLE).as_deref() != Ok("child") {
+            let out = crate::spawn_audit::audited_command(
+                std::env::current_exe().expect("current_exe"),
+                "escalation_deferral::issue_4116_thread_exit_leak",
+            )
+            .args(["--exact", PATH, "--nocapture", "--test-threads=1"])
+            .env(ROLE, "child")
+            .output()
+            .expect("spawn child");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "child must exit 0, got {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                out.status
+            );
+            assert!(
+                stdout.contains("1 passed") && !stdout.contains("0 passed"),
+                "child did not run:\n{stdout}"
+            );
+            assert!(
+                stderr.contains("ERROR #4116: thread exited with 1 unsettled escalation frame(s)"),
+                "the leak ERROR line must be on stderr:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains("fatal runtime error"),
+                "must not abort:\n{stderr}"
+            );
+            return;
+        }
+        crate::logging::init_console_tracing(&[]);
+        std::thread::spawn(|| {
+            let dir = tempfile::Builder::new()
+                .prefix("issue-4116-exit-")
+                .tempdir()
+                .expect("tempdir");
+            let conn = crate::db::open(&dir.path().join("ai-memory.db")).expect("open");
+            let leaked = super::super::connection::WriteTxn::begin_deferred(&conn).expect("begin");
+            let intent = super::DeferredEscalation {
+                pending_id: "exit-4116".to_string(),
+                action: crate::models::GovernedAction::Store,
+                namespace: "gov4116/exit".to_string(),
+                memory_id: None,
+                requested_by: "ai:worker".to_string(),
+                rule_id: "R-exit".to_string(),
+                payload: serde_json::json!({}),
+            };
+            assert!(super::defer_to_open_txn(conn.path(), intent).is_ok());
+            std::mem::forget(leaked);
+            // Registers the fmt layer's thread-local buffer after the frames.
+            tracing::error!("issue 4116 probe: log after the leak");
+        })
+        .join()
+        .expect("leaking thread must not abort or panic");
     }
 }
