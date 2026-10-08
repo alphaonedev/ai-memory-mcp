@@ -546,31 +546,64 @@ fn register_exit_drain() {
 
 #[cfg(unix)]
 extern "C" fn drain_forensic_writer_at_exit() {
-    let _ = std::panic::catch_unwind(exit_drain_hook);
+    // The outcome is already logged inside the hook; only a panic is left.
+    if std::panic::catch_unwind(exit_drain_hook).is_err() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "ai-memory: the forensic exit drain panicked; rows may be missing (#4347)"
+        );
+    }
 }
 
-/// #4347 — what the `atexit` hook runs: the once-only drain, plus ONE more
-/// barrier when that drain already ran earlier in this process (the `mcp`
-/// signal path). A request acknowledged after the first drain began can have
-/// queued its row behind it; a barrier on an empty queue costs microseconds.
-/// Skipped when the first drain timed out (the writer is stuck: bounded
-/// shutdown wins).
-fn exit_drain_hook() {
+/// #4347 — what the `atexit` hook runs (unix) and what the non-unix
+/// signal-exit path in `main` calls before `process::exit`: the once-only
+/// drain, plus ONE more barrier when that drain already ran earlier in this
+/// process (the `mcp` signal path). A request acknowledged after the first
+/// drain began can have queued its row behind it; a barrier on an empty queue
+/// costs microseconds. Skipped when the first drain timed out (the writer is
+/// stuck: bounded shutdown wins). Returns the outcome of the last drain that
+/// ran. A timeout, or a writer that vanished after a successful first drain,
+/// is logged at WARN: rows may be missing and the operator must be told
+/// (per ERRORS-19). `NoWriter` on the first drain is the normal case for a
+/// process that never queued a forensic row, so it is not a warning.
+pub fn exit_drain_hook() -> DrainOutcome {
     let ran_before = exit_drain_runs() > 0;
-    if drain_at_exit_once() != DrainOutcome::TimedOut && ran_before {
-        let _ = drain_bounded(EXIT_DRAIN_BUDGET);
+    let first = drain_at_exit_once();
+    if first == DrainOutcome::TimedOut || !ran_before {
+        return first;
     }
+    let barrier = drain_bounded(EXIT_DRAIN_BUDGET);
+    if barrier == DrainOutcome::TimedOut
+        || (barrier == DrainOutcome::NoWriter && first == DrainOutcome::Drained)
+    {
+        tracing::warn!(
+            target: AUDIT_TRACE_TARGET,
+            outcome = ?barrier,
+            "forensic: the exit barrier after the first drain did not complete; \
+             rows queued after the first drain may not be on disk (#4347)"
+        );
+    }
+    barrier
 }
 
 /// #4347 — the bounded exit drain, run AT MOST ONCE per process. The `atexit`
 /// hook and the `mcp` signal-stop path both call it; whichever arrives first
 /// drains, the other waits for that drain and gets its outcome, so a signal
-/// racing a normal exit is one drain, not two.
+/// racing a normal exit is one drain, not two. A timeout is logged at WARN by
+/// the one caller that ran the drain.
 pub fn drain_at_exit_once() -> DrainOutcome {
     static OUTCOME: OnceLock<DrainOutcome> = OnceLock::new();
     *OUTCOME.get_or_init(|| {
         EXIT_DRAIN_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        drain_bounded(EXIT_DRAIN_BUDGET)
+        let outcome = drain_bounded(EXIT_DRAIN_BUDGET);
+        if outcome == DrainOutcome::TimedOut {
+            tracing::warn!(
+                target: AUDIT_TRACE_TARGET,
+                "forensic: the exit drain timed out; rows still queued were not \
+                 written (#4347)"
+            );
+        }
+        outcome
     })
 }
 
@@ -6598,7 +6631,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("forensic-2026-10-01.jsonl");
         enqueue_append_for_test(path.clone(), "{\"late\":1}".to_string());
-        exit_drain_hook();
+        let outcome = exit_drain_hook();
+        assert_ne!(
+            outcome,
+            DrainOutcome::TimedOut,
+            "the follow-up barrier completes (F-2/F-3, platform-neutral)"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"late\":1}\n");
     }
 

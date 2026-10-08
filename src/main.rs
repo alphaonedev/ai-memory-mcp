@@ -471,6 +471,11 @@ fn main() -> Result<()> {
         .and_then(|e| e.downcast_ref::<ai_memory::mcp::shutdown::SignalExit>())
     {
         let code = stop.code();
+        // #4347 F-2 — non-unix has no `atexit` hook, so run the follow-up
+        // drain barrier here (unix runs the same function from its hook).
+        #[cfg(not(unix))]
+        // The outcome is logged inside the hook.
+        let _ = ai_memory::governance::audit::exit_drain_hook();
         // `process::exit` skips destructors: flush the buffered file log.
         drop(log_guard);
         std::process::exit(code);
@@ -478,7 +483,8 @@ fn main() -> Result<()> {
     // #4319 — on unix the exit drain is an `atexit` hook (it also covers every
     // `std::process::exit` inside the commands); elsewhere drain here, bounded.
     #[cfg(not(unix))]
-    let _ = ai_memory::governance::audit::drain_at_exit_once();
+    // The outcome is logged inside the hook.
+    let _ = ai_memory::governance::audit::exit_drain_hook();
     if result.as_ref().err().is_some_and(|error| {
         error
             .downcast_ref::<daemon_runtime::FatalShutdownError>()
