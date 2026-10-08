@@ -1602,8 +1602,9 @@ def run_limit_cases() -> bool:
 WORKFLOW_PATH = ".github/workflows/claude-md-guard.yml"
 
 
-WORKFLOW_BASE_BRANCHES = ("main", "develop", "release/**", "rehearsal/**")
-# `push` must NOT name rehearsal/** (#5447 R-PUSH, #5659): the carrier gets the guard on its pull_request runs.
+WORKFLOW_BASE_BRANCHES = ("main", "develop", "release/**", "rehearsal/**", "chain/**")
+# `push` must NOT name rehearsal/** or chain/** (#5447 R-PUSH, #5659, #6105): the carrier and the chain
+# branches get the guard on their pull_request runs.
 WORKFLOW_PUSH_BRANCHES = ("main", "develop", "release/**")
 WORKFLOW_FORBIDDEN_KEYS = ("pull_request_target", "continue-on-error", "paths", "paths-ignore",
                            "branches-ignore", "tags", "tags-ignore", "if", "shell", "working-directory",
@@ -1623,7 +1624,7 @@ WORKFLOW_CANONICAL_LINES = (
     '  push:',
     '    branches: [main, develop, "release/**"]',
     '  pull_request:',
-    '    branches: [main, develop, "release/**", "rehearsal/**"]',
+    '    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]',
     '  merge_group:',
     '    types: [checks_requested]',
     'permissions:',
@@ -1699,8 +1700,8 @@ def workflow_errors(path: Path, label: str = WORKFLOW_PATH) -> list:
             errors.append(
                 f"FAIL: {label} `{trigger}` branches must list {', '.join(required)}; "
                 f"missing {missing or 'a single branches: list'} (#4507 R3-F4)")
-        if trigger == "push" and any("rehearsal" in item for item in listed):
-            errors.append(f"FAIL: {label} `push` branches must not name rehearsal/** (#5447 R-PUSH, #5659)")
+        if trigger == "push" and any("rehearsal" in item or "chain" in item for item in listed):
+            errors.append(f"FAIL: {label} `push` branches must not name rehearsal/** or chain/** (#5447 R-PUSH, #5659, #6105)")
     types = [t for _i, t in blocks.get("pull_request", []) if t.startswith("types:")]
     if types and not all(kind in types[0] for kind in WORKFLOW_PR_TYPES):
         errors.append(f"FAIL: {label} pull_request types must include {', '.join(WORKFLOW_PR_TYPES)} (#4507 R3-F4)")
@@ -1746,7 +1747,7 @@ COMPARE_WORKFLOW_LINES = (
     "name: CLAUDE.md rule-change comparison",
     "on:",
     "pull_request_target:",
-    'branches: [main, develop, "release/**", "rehearsal/**"]',
+    'branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]',
     "types: [opened, synchronize, reopened, edited]",
     "permissions:",
     "contents: read",
@@ -1903,16 +1904,22 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
         return True
 
     ok &= case("R3-F4 rehearsal/** removed from pull_request", good.replace(
-        '  pull_request:\n    branches: [main, develop, "release/**", "rehearsal/**"]',
-        '  pull_request:\n    branches: [main, develop, "release/**"]', 1), "pull_request")
+        '  pull_request:\n    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]',
+        '  pull_request:\n    branches: [main, develop, "release/**", "chain/**"]', 1), "pull_request")
     ok &= case("R3-F4 rehearsal/** added to push", good.replace(
         '  push:\n    branches: [main, develop, "release/**"]',
         '  push:\n    branches: [main, develop, "release/**", "rehearsal/**"]', 1), "must not name rehearsal")
+    ok &= case("R3-F4 chain/** added to push", good.replace(
+        '  push:\n    branches: [main, develop, "release/**"]',
+        '  push:\n    branches: [main, develop, "release/**", "chain/**"]', 1), "must not name rehearsal/** or chain/**")
+    ok &= case("R3-F4 chain/** removed from pull_request", good.replace(
+        '  pull_request:\n    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]',
+        '  pull_request:\n    branches: [main, develop, "release/**", "rehearsal/**"]', 1), "pull_request")
     ok &= case("R3-F4 release/** removed from push", good.replace(
         '  push:\n    branches: [main, develop, "release/**"]',
         '  push:\n    branches: [main, develop]', 1), "push")
     ok &= case("R3-F4 pull_request branches filter removed", good.replace(
-        '  pull_request:\n    branches: [main, develop, "release/**", "rehearsal/**"]',
+        '  pull_request:\n    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]',
         '  pull_request:', 1), "pull_request")
     ok &= case("R3-F4 paths filter added", good.replace(
         '  pull_request:\n', '  pull_request:\n    paths: ["src/**"]\n', 1), "paths")
@@ -2026,7 +2033,7 @@ def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
                "meaningful lines")
     ok &= case("R3-F3 job-level if", good.replace("    timeout-minutes: 10", "    timeout-minutes: 10\n    if: false", 1), "`if:`")
     ok &= case("R3-F3 paths filter", good.replace("    branches:", "    paths: [\"src/**\"]\n    branches:", 1), "`paths:`")
-    ok &= case("R3-F3 branch removed", good.replace(', "rehearsal/**"]', "]", 1), "differs from the pinned form")
+    ok &= case("R3-F3 branch removed", good.replace(', "rehearsal/**", "chain/**"]', ', "chain/**"]', 1), "differs from the pinned form")
     ok &= case("R3-F3 unpinned action", good.replace(
         "@11d5960a326750d5838078e36cf38b85af677262", "@v4", 1), "action is not pinned")  # #5177: exact refusal
     ok &= case("R3-F3 step removed", good.replace(
