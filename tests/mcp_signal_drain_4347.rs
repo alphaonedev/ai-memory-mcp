@@ -34,8 +34,18 @@ use serde_json::{Value, json};
 /// Writer delay that makes a queued row certainly outlive a signalled process.
 const WRITER_DELAY_MS: &str = "600";
 
-/// How long a signalled child may take to exit before the cell fails.
-const EXIT_BOUND: Duration = Duration::from_secs(30);
+/// Steady-state hang guard: how long a child that is already serving may take
+/// to exit after a signal before the cell fails. Generous because eleven cells
+/// share one loaded host, but still a bound (a hung drain must fail the cell).
+const EXIT_BOUND: Duration = Duration::from_secs(60);
+
+/// Start-up limit: how long a freshly spawned debug binary may take to reach
+/// its first observable point (initialize response, held request, a stderr
+/// line, the start-up refusal exit). Child start-up is scheduler-bound, not
+/// product-bound, so it gets its own far larger but still finite limit (#6108
+/// F-1/F-6: a fixed 30 s overran on a loaded host and failed the burst cell
+/// before it reached the behaviour under test).
+const STARTUP_BOUND: Duration = Duration::from_secs(300);
 
 /// Title of the acknowledged write each cell must find durable.
 const ACKED_TITLE: &str = "acked-before-signal-4347";
@@ -240,7 +250,7 @@ impl Session {
 
     /// Wait (bounded) until the child has written `needle` to stderr.
     fn wait_stderr_contains(&self, needle: &str) {
-        let deadline = Instant::now() + EXIT_BOUND;
+        let deadline = Instant::now() + STARTUP_BOUND;
         loop {
             if self.stderr_buf.lock().is_ok_and(|b| b.contains(needle)) {
                 return;
@@ -417,7 +427,7 @@ fn barrier_dir(home: &Path) -> PathBuf {
 
 /// Wait (bounded) for the child to reach the held point.
 fn wait_entered(dir: &Path) {
-    let deadline = Instant::now() + EXIT_BOUND;
+    let deadline = Instant::now() + STARTUP_BOUND;
     while !dir.join("entered").exists() {
         assert!(
             Instant::now() < deadline,
@@ -609,7 +619,7 @@ fn an_unavailable_stop_handler_refuses_to_start_4347() {
                     "clientInfo":{"name":"probe4347","version":"1"}}})
             );
         }
-        let deadline = Instant::now() + EXIT_BOUND;
+        let deadline = Instant::now() + STARTUP_BOUND;
         let status = loop {
             if let Some(st) = child.try_wait().expect("try_wait") {
                 break st;
@@ -721,7 +731,7 @@ fn a_pipelined_burst_cut_by_sigterm_loses_no_acknowledged_write_4347() {
         )
         .expect("write initialize");
         stdin.flush().expect("flush");
-        let init_deadline = Instant::now() + EXIT_BOUND;
+        let init_deadline = Instant::now() + STARTUP_BOUND;
         while !responses.lock().is_ok_and(|m| m.contains_key(&1)) {
             assert!(Instant::now() < init_deadline, "no initialize response");
             std::thread::sleep(Duration::from_millis(5));
