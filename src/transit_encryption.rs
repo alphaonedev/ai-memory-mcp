@@ -340,6 +340,14 @@ pub fn dsn_transport(dsn: &str) -> DsnTransport {
     if scheme != "postgres" && scheme != "postgresql" {
         return DsnTransport::Unparseable;
     }
+    // #6096 - an ambiguous authority (an unencoded `/`, `?`, `#` or `\` in
+    // the userinfo) parses to a "host" that is credential bytes. Refuse it
+    // before any socket or DNS lookup, the same fail-closed `Unparseable`
+    // the floor already returns for a shape the drivers would read
+    // differently from the text (#3866, #4434).
+    if crate::url_display::store_url_is_ambiguous(dsn) {
+        return DsnTransport::Unparseable;
+    }
     // The last `host` / `hostaddr` parameter wins (libpq precedence);
     // `query_pairs` percent-decodes, so `host=%2Fvar%2Frun` is a socket
     // directory too.
