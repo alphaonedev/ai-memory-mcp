@@ -704,6 +704,51 @@ mod promote_status_4622_tests {
         assert_eq!(promote_error_message(rnf), "reflection not found: abc");
     }
 
+    /// #6126: table-driven body pins beyond the plain-string case - our own
+    /// typed refusals survive verbatim, wrapped db / io errors carrying a
+    /// path or DSN are replaced by their class constant.
+    #[test]
+    fn issue_6126_typed_refusal_survives_and_wrapped_foreign_error_is_withheld() {
+        use crate::mcp::error_text::DB_ERROR_TEXT;
+        let dsn = "postgres://svc:hunter2@db.internal:5432/ai_memory";
+        let cases: Vec<(&str, anyhow::Error, String)> = vec![
+            (
+                "typed invalid-input refusal",
+                crate::errors::invalid_input("skill 'description' must be <= 1024 characters"),
+                "skill 'description' must be <= 1024 characters".to_owned(),
+            ),
+            (
+                "typed own-text refusal",
+                crate::errors::refusal("reflection depth 0 is below the promote minimum 1"),
+                "reflection depth 0 is below the promote minimum 1".to_owned(),
+            ),
+            (
+                "wrapped database error with DSN and path",
+                anyhow::Error::new(rusqlite::Error::InvalidPath("/var/db/x.sqlite".into()))
+                    .context(format!("connect {dsn} failed")),
+                DB_ERROR_TEXT.to_owned(),
+            ),
+            (
+                "wrapped io error with path",
+                anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "/srv/tenant/skills: EACCES",
+                ))
+                .context("write skill bundle"),
+                // The `anyhow` classifier has no io arm: a wrapped io root is the
+                // storage constant, identical to the MCP wire text.
+                DB_ERROR_TEXT.to_owned(),
+            ),
+        ];
+        for (label, err, expected) in cases {
+            let body = promote_error_message(err);
+            assert_eq!(body, expected, "{label}");
+            for leak in ["hunter2", "postgres://", "/var/db", "/srv/tenant", "EACCES"] {
+                assert!(!body.contains(leak), "{label}: {leak} leaked into {body}");
+            }
+        }
+    }
+
     /// #6125: for every refusal shape the HTTP body text equals the MCP wire
     /// text of the same chain (both go through `mcp_foreign_err`), and the
     /// first-party refusals are present in it.
