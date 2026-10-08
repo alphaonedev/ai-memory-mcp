@@ -142,7 +142,13 @@ impl Session {
     }
 
     fn start_full(home: &Path, extra_env: &[(&str, String)], ignored: &[libc::c_int]) -> Self {
-        let mut child = spawn_mcp(home, extra_env, ignored);
+        let mut s = Self::attach(spawn_mcp(home, extra_env, ignored));
+        s.handshake();
+        s
+    }
+
+    /// Wrap a spawned child: capture its stderr on a reader thread.
+    fn attach(mut child: Child) -> Self {
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         let stderr_buf = Arc::new(Mutex::new(String::new()));
@@ -159,13 +165,18 @@ impl Session {
                 }
             }
         });
-        let mut s = Self {
+        Self {
             child,
             stdin: Some(stdin),
             stdout,
             stderr_buf,
             stderr_thread: Some(stderr_thread),
-        };
+        }
+    }
+
+    /// Initialize, make one acknowledged write and one forensic row.
+    fn handshake(&mut self) {
+        let s = self;
         let init = s.request(
             &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
             "protocolVersion":"2024-11-05","capabilities":{},
@@ -185,7 +196,6 @@ impl Session {
             &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
             "name":"memory_delete","arguments":{"id":"00000000-0000-4000-8000-000000004347"}}}),
         );
-        s
     }
 
     /// Send one request line without waiting for its response.
@@ -248,16 +258,45 @@ impl Session {
             .unwrap_or_default()
     }
 
-    /// Wait (bounded) until the child has written `needle` to stderr.
-    fn wait_stderr_contains(&self, needle: &str) {
+    /// Fail at once, with the exit status and all captured stderr, when the
+    /// child has already exited while a start-up wait is still polling: a
+    /// child that crashed at start-up must not cost the full `STARTUP_BOUND`
+    /// (#4347 L-2, TEST-02).
+    fn fail_if_exited(&mut self, waiting_for: &str) {
+        if let Some(status) = self.child.try_wait().expect("try_wait") {
+            let stderr = self.stderr_text();
+            panic!(
+                "the child exited ({status:?}) while waiting for {waiting_for}; stderr:\n{stderr}"
+            );
+        }
+    }
+
+    /// Wait (bounded) until the child has written `needle` to stderr; fails
+    /// fast if the child exits first.
+    fn wait_stderr_contains(&mut self, needle: &str) {
         let deadline = Instant::now() + STARTUP_BOUND;
         loop {
             if self.stderr_buf.lock().is_ok_and(|b| b.contains(needle)) {
                 return;
             }
+            self.fail_if_exited(&format!("{needle:?} on stderr"));
             assert!(
                 Instant::now() < deadline,
                 "the child never wrote {needle:?} to stderr"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Wait (bounded) for the child to reach the held point; fails fast if
+    /// the child exits first.
+    fn wait_entered(&mut self, dir: &Path) {
+        let deadline = Instant::now() + STARTUP_BOUND;
+        while !dir.join("entered").exists() {
+            self.fail_if_exited("the held request");
+            assert!(
+                Instant::now() < deadline,
+                "the child never reached the held request"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -425,18 +464,6 @@ fn barrier_dir(home: &Path) -> PathBuf {
     dir
 }
 
-/// Wait (bounded) for the child to reach the held point.
-fn wait_entered(dir: &Path) {
-    let deadline = Instant::now() + STARTUP_BOUND;
-    while !dir.join("entered").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "the child never reached the held request"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
 fn hold_env(id: u64, dir: &Path) -> (&'static str, String) {
     (
         "AI_MEMORY_TEST_HOLD_IN_FLIGHT",
@@ -465,7 +492,7 @@ fn an_in_flight_request_is_acknowledged_and_durable_after_the_signal_4347() {
     let dir = barrier_dir(home.path());
     let mut s = Session::start_with(home.path(), &[hold_env(HELD_ID, &dir)]);
     s.send(&store_request(HELD_ID, HELD_TITLE));
-    wait_entered(&dir);
+    s.wait_entered(&dir);
     s.signal("TERM");
     // Wait for the stop claim, so the line sent next is certainly read after
     // it (event-driven, not a sleep).
@@ -522,7 +549,7 @@ fn a_request_past_its_budget_is_never_acknowledged_and_keeps_its_row_4347() {
         &json!({"jsonrpc":"2.0","id":HELD_ID,"method":"tools/call","params":{
         "name":"memory_delete","arguments":{"id":"00000000-0000-4000-8000-000000007777"}}}),
     );
-    wait_entered(&dir);
+    s.wait_entered(&dir);
     s.signal("TERM");
     let status = s.wait_bounded();
     let stderr = s.stderr_text();
@@ -570,7 +597,7 @@ fn a_fenced_request_released_mid_drain_is_never_acknowledged_4347() {
         &json!({"jsonrpc":"2.0","id":HELD_ID,"method":"tools/call","params":{
         "name":"memory_delete","arguments":{"id":"00000000-0000-4000-8000-000000007777"}}}),
     );
-    wait_entered(&dir);
+    s.wait_entered(&dir);
     s.signal("TERM");
     // The fence has fired and the (slowed) drain is running: release now.
     s.wait_stderr_contains("the in-flight request did not finish within");
@@ -733,6 +760,18 @@ fn a_pipelined_burst_cut_by_sigterm_loses_no_acknowledged_write_4347() {
         stdin.flush().expect("flush");
         let init_deadline = Instant::now() + STARTUP_BOUND;
         while !responses.lock().is_ok_and(|m| m.contains_key(&1)) {
+            // A child that exited at start-up fails now, with its status and
+            // stderr, instead of after the full STARTUP_BOUND (#4347 L-2).
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                let mut err = String::new();
+                if let Some(mut e) = child.stderr.take() {
+                    let _ = e.read_to_string(&mut err);
+                }
+                panic!(
+                    "round {round}: the child exited ({status:?}) before answering \
+                     initialize; stderr:\n{err}"
+                );
+            }
             assert!(Instant::now() < init_deadline, "no initialize response");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -815,6 +854,52 @@ fn a_pipelined_burst_cut_by_sigterm_loses_no_acknowledged_write_4347() {
             delete_rows(&recs),
             acked_deletes,
             "round {round}: forensic delete rows must equal acknowledged deletes; {err}"
+        );
+    }
+}
+
+/// #4347 L-2 (negative check) - a child that exits at start-up makes each
+/// start-up wait fail at once, with its exit status and stderr, instead of
+/// burning the full `STARTUP_BOUND`. The child is the stop-handler refusal
+/// (exits at start-up). Elapsed seconds are printed (`--nocapture`).
+#[test]
+fn a_child_that_exits_at_start_up_fails_every_start_up_wait_fast_4347() {
+    for wait in ["stderr", "entered"] {
+        let home = sandbox();
+        let mut s = Session::attach(spawn_mcp(
+            home.path(),
+            &[(
+                "AI_MEMORY_TEST_FAIL_STOP_SIGNAL_INSTALL",
+                "SIGTERM".to_string(),
+            )],
+            &[],
+        ));
+        let dir = barrier_dir(home.path());
+        let started = Instant::now();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if wait == "stderr" {
+                s.wait_stderr_contains("never-written-needle-4347");
+            } else {
+                s.wait_entered(&dir);
+            }
+        }));
+        let elapsed = started.elapsed();
+        let msg = match caught {
+            Ok(()) => panic!("{wait}: the wait returned although the child exited"),
+            Err(p) => p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|m| (*m).to_string()))
+                .unwrap_or_default(),
+        };
+        println!("L-2 negative check ({wait}): failed after {elapsed:?}: {msg}");
+        assert!(
+            msg.contains("the child exited"),
+            "{wait}: must name the exit, not a timeout: {msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "{wait}: took {elapsed:?}; STARTUP_BOUND is {STARTUP_BOUND:?}"
         );
     }
 }
