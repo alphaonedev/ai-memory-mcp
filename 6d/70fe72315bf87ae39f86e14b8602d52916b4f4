@@ -1,0 +1,6 @@
+resign: D5 cutover (vote 45b7d967 / W1), 2026-10-08T15:11:29Z
+original: c4844cf25894702a94185dd7cd76df0f67d42a68
+original-signature: status=U key=B5690EEEBB952194 signer=GitHub <noreply@github.com>
+new-signer: ssh-ed25519 SHA256:tkfDATcb8+hjhJeI3LvDbwAaks/8QqBMRr6oOWz6iBA (Justin@alpha-one.mobi)
+archive: refs/tags/archive/audit-wip-gpg-2883a3cde
+committer-override: 'GitHub <noreply@github.com> 1791062424 -0400' -> 'Justin <Justin@alpha-one.mobi> 1791062424 -0400' (W1: platform-bot committer re-attributed; author unchanged)
