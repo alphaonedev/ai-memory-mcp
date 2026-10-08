@@ -8622,19 +8622,20 @@ impl PostgresStore {
         // overwrites it, under archive_reason='in_place_edit', SAME
         // memory_id (no fork). DELETE+INSERT mirrors sqlite's
         // `INSERT OR REPLACE`, keeping the MOST-RECENT pre-edit snapshot
-        // (the "immediately-prior content"). The DELETE only ever removes
-        // a prior in_place_edit snapshot of this id: supersede forks a new
-        // id + deletes the old live row, GC deletes the live row, and
-        // restore removes the archive row on success — so a live,
-        // in-place-editable row can never collide with a different
-        // archive_reason's record. Runs inside the tx; a 0-row UPDATE
-        // below rolls it back.
+        // (the "immediately-prior content"). The per-id archive slot holds
+        // ONE pre-image regardless of reason: a `federation_merge` snapshot
+        // of this id (written by src/store/postgres/merge_inbound_4023.rs:219, the
+        // #1773/#3961 same-id lane, and by the title-slot lane at
+        // postgres.rs ~25062, #4206) can occupy it, so this DELETE may
+        // remove that record too. The newest pre-image is the one kept;
+        // per-reason retention is tracked under #6048. Runs inside the tx;
+        // a 0-row UPDATE below rolls it back.
         if content_changed {
             sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
                 .bind(id)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("clear prior in_place_edit snapshot", e))?;
+                .map_err(|e| to_store_err("clear prior archive record for this id", e))?;
             sqlx::query(SQL_ARCHIVE_SNAPSHOT_LIVE_ROW)
                 .bind(id)
                 .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
@@ -23724,10 +23725,7 @@ impl MemoryStore for PostgresStore {
         // #1799 — DELETE+INSERT the prior content into `archived_memories`
         // under archive_reason='in_place_edit', SAME memory_id (no fork),
         // copying the exact 37-column list from the optimistic path's
-        // snapshot block (~L3722). The DELETE only ever removes a stale
-        // in_place_edit snapshot of this id (supersede forks a new id +
-        // deletes the old live row; GC deletes the live row; restore
-        // removes the archive row on success). The per-id slot holds ONE
+        // snapshot block (~L3722). The per-id slot holds ONE
         // pre-image regardless of reason: a `federation_merge` snapshot
         // (#1773/#3961 same-id lane, #4206 title-slot lane) can occupy it,
         // so this DELETE may remove that record too. The newest pre-image
@@ -23737,7 +23735,7 @@ impl MemoryStore for PostgresStore {
                 .bind(id)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("clear prior in_place_edit snapshot", e))?;
+                .map_err(|e| to_store_err("clear prior archive record for this id", e))?;
             sqlx::query(SQL_ARCHIVE_SNAPSHOT_LIVE_ROW)
                 .bind(id)
                 .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
