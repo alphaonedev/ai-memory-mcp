@@ -1,0 +1,5 @@
+resign: D5 cutover (vote 45b7d967 / W1), 2026-10-08T15:11:29Z
+original: 9f68ea41a978d6db14bc98e86b47b8a4152a52a0
+original-signature: status=G key=SHA256:tkfDATcb8+hjhJeI3LvDbwAaks/8QqBMRr6oOWz6iBA signer=Justin@alpha-one.mobi
+new-signer: ssh-ed25519 SHA256:tkfDATcb8+hjhJeI3LvDbwAaks/8QqBMRr6oOWz6iBA (Justin@alpha-one.mobi)
+archive: refs/tags/archive/audit-wip-gpg-2883a3cde
