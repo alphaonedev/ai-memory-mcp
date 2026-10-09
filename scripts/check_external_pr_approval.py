@@ -15,6 +15,14 @@ this evaluator lists the OPEN pull requests of the repository, keeps every one
 whose head sha is the run's sha, and applies the same rule to each. No PR heads the
 sha: pass. Any API error, unparsable page or malformed entry: FAIL (fail closed).
 
+#6227: on merge_group GITHUB_SHA is the queue commit, which is never a PR head, so
+the "heads this sha" lookup would pass vacuously. The PR under test is instead named
+by the event payload: merge_group.head_ref is
+refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>. The evaluator parses N, finds the
+OPEN pull request N and judges it at its own current head sha by the same rule. A
+payload that is unreadable, a head_ref it cannot parse, or a PR that is not open:
+FAIL (fail closed). Mirrors the pull_request arm (the event names the PR).
+
 Exit 0: pass. Exit 1: approval missing, or the verdict cannot be established.
 Standard library only; Python 3.9+.
 """
@@ -29,6 +37,7 @@ import sys
 TEAM_ASSOCIATIONS = frozenset(("OWNER", "MEMBER", "COLLABORATOR"))
 SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+QUEUE_REF_RE = re.compile(r"refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]{40,64}")
 
 
 class GateError(Exception):
@@ -129,6 +138,18 @@ def pr_verdict(pr, repo, operator, api):
         f"job. Any new push voids the approval.")
 
 
+def merge_group_pr_number(event):
+    """The PR number named by merge_group.head_ref; GateError when it cannot be derived."""
+    group = event.get("merge_group") if isinstance(event, dict) else None
+    ref = group.get("head_ref") if isinstance(group, dict) else None
+    match = QUEUE_REF_RE.fullmatch(ref) if isinstance(ref, str) else None
+    number = int(match.group(1)) if match else 0
+    if number <= 0:
+        raise GateError(f"merge_group head_ref {ref!r} does not name a pull request "
+                        "(expected refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>)")
+    return number
+
+
 def run_gate(event_name, event, repo, sha, operator, api):
     """Return (exit code, output lines). Never raises on a malformed input: fails closed."""
     lines = []
@@ -143,6 +164,13 @@ def run_gate(event_name, event, repo, sha, operator, api):
                 raise GateError("pull_request event has no pull_request payload")
             prs = [pr]
             lines.append("event=pull_request: judging the event's pull request")
+        elif event_name == "merge_group":
+            number = merge_group_pr_number(event)
+            open_prs = api(f"repos/{repo}/pulls?state=open&per_page=100")
+            prs = [pr for pr in open_prs if _head(pr)[0] == number]
+            if len(prs) != 1:
+                raise GateError(f"merge_group names PR #{number}, which is not an open pull request")
+            lines.append(f"event=merge_group: judging PR #{number} named by the queue ref")
         else:
             if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
                 raise GateError(f"event={event_name}: run sha {sha!r} is not a full commit sha")
@@ -188,11 +216,15 @@ def self_test():
         ("push-team-same-repo", 0, "push", a, api_for([pr(2, a, "MEMBER", repo)])),
         ("push-no-pr-heads-sha", 0, "push", a, api_for([pr(1, b)])),
         ("push-api-error", 1, "push", a, api_for([], fail=True)),
-        ("merge-group-unapproved", 1, "merge_group", a, api_for([pr(1, a)])),
+        ("merge-group-unapproved", 1, "merge_group", "c" * 40, api_for([pr(1, a)])),
+        ("merge-group-approved", 0, "merge_group", "c" * 40, api_for([pr(1, a)], {1: [approved]})),
+        ("merge-group-no-pr-in-ref", 1, "merge_group", "c" * 40, api_for([pr(1, a)])),
     ]
     failures = 0
+    queue = {"merge_group": {"head_ref": "refs/heads/gh-readonly-queue/main/pr-1-" + "c" * 40}}
     for name, want, event_name, sha, api in cases:
-        rc, _lines = run_gate(event_name, {}, repo, sha, op, api)
+        event = {} if name == "merge-group-no-pr-in-ref" else (queue if event_name == "merge_group" else {})
+        rc, _lines = run_gate(event_name, event, repo, sha, op, api)
         ok = rc == want
         failures += 0 if ok else 1
         print(f"self-test {'PASS' if ok else 'FAIL'}: {name} (exit {rc}, want {want})")
@@ -217,12 +249,12 @@ def main():
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
     event = {}
     path = os.environ.get("GITHUB_EVENT_PATH", "")
-    if event_name == "pull_request":
+    if event_name in ("pull_request", "merge_group"):
         try:
             with open(path, encoding="utf-8") as fh:
                 event = json.load(fh)
         except (OSError, ValueError) as exc:
-            print(f"::error::cannot read the pull_request event payload ({exc}); failing closed")
+            print(f"::error::cannot read the {event_name} event payload ({exc}); failing closed")
             return 1
     rc, lines = run_gate(event_name, event, os.environ.get("GITHUB_REPOSITORY", ""),
                          os.environ.get("GITHUB_SHA", ""),
