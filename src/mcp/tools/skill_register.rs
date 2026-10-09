@@ -1001,10 +1001,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// #6148: the retired-lineage refusal text is spelled ONCE in production
-    /// code across the skill register / promote modules, inside the named
-    /// `retired_lineage_refusal` helper every site renders through (the
-    /// pm-v3.1 hardcoded-literal class).
     /// #6148: the typed variant renders exactly the shared helper's text.
     #[test]
     fn issue_6148_variant_renders_the_shared_refusal() {
@@ -1016,6 +1012,10 @@ mod tests {
         assert_eq!(String::from(refused), retired_lineage_refusal("ns", "n"));
     }
 
+    /// #6148: the retired-lineage refusal text is spelled ONCE in production
+    /// code across the skill register / promote modules, inside the named
+    /// `retired_lineage_refusal` helper every site renders through (the
+    /// pm-v3.1 hardcoded-literal class).
     #[test]
     fn issue_6148_retired_lineage_refusal_text_has_one_named_home() {
         fn production(src: &str) -> &str {
