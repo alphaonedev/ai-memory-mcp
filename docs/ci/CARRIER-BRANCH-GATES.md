@@ -40,3 +40,34 @@ A per-test-binary budget (for example 1200 s per binary) was proposed in #6202
 item 2. It needs the suite split into one `cargo test` call per binary, which
 breaks the single `cargo test --no-fail-fast "$@"` shape the #2500/#2657
 invariant gates pin, so it is tracked separately.
+
+## Sharded enterprise-fed suite (#6344)
+
+The serial full suite (about 13,100 s measured/extrapolated over 1,005 test
+executables) outgrew every watchdog raise, so tier `enterprise-fed` now builds
+once and runs three concurrent shards inside the same `Run tests
+(impact-aware)` step (job names, matrix legs and the step name are unchanged):
+
+| Shard | Holds | Threads |
+|---|---|---|
+| serial | class (a): Postgres, `#[serial]`, `federat*` names, binaries with unknown source, the lib tests matching `scripts/ci/lib_pg_prefixes.txt`, doc tests | 1 |
+| parallel_1 | lib tests with `--skip` of those prefixes, plus a balanced share of self-contained binaries | 3 |
+| parallel_2 | the remaining self-contained binaries | 3 |
+
+`scripts/ci/partition_test_binaries.py` reads the `cargo test --no-run
+--message-format=json-render-diagnostics` artifact list, classifies each binary
+by its source, balances class (b) by the measured seconds in
+`scripts/ci/test_binary_weights.json` (class mean for unmeasured binaries) and
+fails if the three sets are not disjoint and complete. A new `tests/*.rs` is
+picked up automatically; an unreadable or unclassifiable source goes to the
+serial shard. Only the serial shard touches the per-job Postgres database.
+
+Each shard is a chain of `run_tests` calls, so the #1492 watchdog, `--no-fail-fast`
+(#2500) and the prebuild (#2657) invariants hold. The step waits on each shard
+PID separately and fails if any shard failed.
+
+Estimated wall time (ideal, from the measured weights): serial 3,891 s,
+parallel 1,620 s and 1,516 s, so about 65 min against about 218 min before. The
+federation-name rule keeps 47 binaries (about 437 s) in the serial shard on
+purpose. Real wall time is not verified until a CI run completes; refresh the
+weights when it does.

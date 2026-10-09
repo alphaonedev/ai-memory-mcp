@@ -1389,6 +1389,142 @@ jobs:
             fi
           }
 
+          # #6344 — SHARDED enterprise-fed suite. The serial 1,005-executable
+          # run (~13,100 s measured/extrapolated, CI-SHARD-SCOUT-2026-10-09)
+          # outgrew every watchdog raise, so on tier enterprise-fed the same
+          # test set runs as three concurrent shards, each a `run_tests` chain
+          # (so the #1492 watchdog, #2500 --no-fail-fast and #2657 prebuild
+          # shapes are unchanged):
+          #   serial      class (a): Postgres / #[serial] / federat* / unknown
+          #               source binaries + the lib Postgres test-name prefixes
+          #               + doc tests, --test-threads=1. The ONLY shard that
+          #               touches the per-job Postgres database.
+          #   parallel_1  lib unittests with --skip of those prefixes, plus a
+          #               balanced share of the self-contained binaries, -t 3.
+          #   parallel_2  the other share of the self-contained binaries, -t 3.
+          # scripts/ci/partition_test_binaries.py computes the partition from
+          # the compiled artifact list (so a new tests/*.rs can never be
+          # missed, unknown source -> serial) and asserts the three sets are
+          # disjoint and complete. Union build once, outside every watchdog
+          # (#1989); each shard bounds its whole chain by $WATCHDOG_SECS.
+          # Every shard has its own log and PID; each PID is waited on
+          # separately and the step fails if ANY shard failed.
+          shard_left() {
+            echo $(( WATCHDOG_SECS - ($(date +%s) - $1) ))
+          }
+          run_doc_tests() {
+            local label="$1"; shift
+            local rc=0 started elapsed
+            # `cargo test --doc --no-run` is rejected by cargo, so the prebuild
+            # is the plain `--no-run` of the same feature set (lib + doc deps).
+            cargo test --no-run "$@" || return "$?"
+            started=$(date +%s)
+            if [ -n "$TIMEOUT_BIN" ]; then
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --doc --no-fail-fast "$@" || rc=$?
+            else
+              cargo test --doc --no-fail-fast "$@" || rc=$?
+            fi
+            elapsed=$(( $(date +%s) - started ))
+            echo "::notice::[#1492] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget (tier=${TIER:-sqlite} node=${CI_NODE:-unknown})"
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+              echo "::error::[#1492 watchdog] '${label}' exceeded the ${WATCHDOG_SECS}s per-invocation timeout (tier=${TIER:-sqlite}) and was terminated."
+            fi
+            return "$rc"
+          }
+          # run_shard <name> <shard-dir> <threads> <lib-mode: pg|skip> <with-doc: 0|1>
+          run_shard() {
+            local name="$1" sd="$2" threads="$3" libmode="$4" with_doc="$5"
+            local list="$sd/$1.txt" t0 remaining rc=0 l has_lib=0 n_it=0 n_lib=0
+            local -a itargs libargs
+            itargs=(); libargs=()
+            t0=$(date +%s)
+            while IFS= read -r l; do
+              [ -n "$l" ] || continue
+              if [ "$l" = "--lib" ]; then
+                has_lib=1
+              else
+                itargs+=($l); n_it=$((n_it + 1))
+              fi
+            done < "$list"
+            if [ "$has_lib" -eq 1 ]; then
+              # Same prefixes on both sides: positional filter in the serial
+              # shard, --skip in the parallel one. libtest substring matching
+              # makes the two exact complements.
+              while IFS= read -r l; do
+                [ -n "$l" ] || continue
+                n_lib=$((n_lib + 1))
+                if [ "$libmode" = "skip" ]; then libargs+=(--skip "$l"); else libargs+=("$l"); fi
+              done < "$sd/lib_pg_filters.txt"
+              if [ "$n_lib" -eq 0 ]; then
+                echo "::error::[#6344 shard] ${name}: lib Postgres filter list is empty (refusing to run the lib unfiltered)"
+                return 2
+              fi
+              remaining=$(shard_left "$t0")
+              if [ "$remaining" -lt 60 ]; then
+                echo "::error::[#6344 shard] ${name}: ${WATCHDOG_SECS}s shard budget exhausted before the lib run"
+                return 124
+              fi
+              WATCHDOG_SECS="$remaining" run_tests "[${name}] lib unittests" $FEAT --lib -- --test-threads="$threads" ${libargs[@]+"${libargs[@]}"} || rc=$?
+            fi
+            if [ "$n_it" -gt 0 ]; then
+              remaining=$(shard_left "$t0")
+              if [ "$remaining" -lt 60 ]; then
+                echo "::error::[#6344 shard] ${name}: ${WATCHDOG_SECS}s shard budget exhausted before the binaries run"
+                return 124
+              fi
+              WATCHDOG_SECS="$remaining" run_tests "[${name}] test binaries" $FEAT "${itargs[@]}" -- --test-threads="$threads" || rc=$?
+            fi
+            if [ "$with_doc" = "1" ]; then
+              remaining=$(shard_left "$t0")
+              if [ "$remaining" -lt 60 ]; then
+                echo "::error::[#6344 shard] ${name}: ${WATCHDOG_SECS}s shard budget exhausted before the doc tests"
+                return 124
+              fi
+              WATCHDOG_SECS="$remaining" run_doc_tests "[${name}] doc tests" $FEAT -- --test-threads="$threads" || rc=$?
+            fi
+            return "$rc"
+          }
+          # run_sharded <label> <with-doc: 0|1> [cargo selection args...]
+          run_sharded() {
+            local label="$1" with_doc="$2"; shift 2
+            local sd="${RUNNER_TEMP:-$PWD/.local-runs}/ci-shard"
+            local pid_s pid_1 pid_2 hb rc_s=0 rc_1=0 rc_2=0 rc=0 n
+            rm -rf "$sd"; mkdir -p "$sd"
+            echo "::notice::[#6344] '${label}': compile once, partition, then run serial + 2 parallel shards"
+            cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || return "$?"
+            python3 scripts/ci/partition_test_binaries.py --build-json "$sd/build.jsonl" --repo-root . --out-dir "$sd" || return "$?"
+            ( run_shard serial "$sd" 1 pg "$with_doc" ) > "$sd/serial.log" 2>&1 &
+            pid_s=$!
+            ( run_shard parallel_1 "$sd" 3 skip 0 ) > "$sd/parallel_1.log" 2>&1 &
+            pid_1=$!
+            ( run_shard parallel_2 "$sd" 3 skip 0 ) > "$sd/parallel_2.log" 2>&1 &
+            pid_2=$!
+            ( while true; do
+                sleep 300 >/dev/null 2>&1
+                echo "::notice::[#6344] progress | serial: $(tail -n 1 "$sd/serial.log" 2>/dev/null | cut -c1-90) | parallel_1: $(tail -n 1 "$sd/parallel_1.log" 2>/dev/null | cut -c1-90) | parallel_2: $(tail -n 1 "$sd/parallel_2.log" 2>/dev/null | cut -c1-90)"
+              done ) &
+            hb=$!
+            # Wait on each PID separately: a bare `wait` discards the exit codes.
+            wait "$pid_s" || rc_s=$?
+            wait "$pid_1" || rc_1=$?
+            wait "$pid_2" || rc_2=$?
+            kill "$hb" 2>/dev/null || true
+            wait "$hb" 2>/dev/null || true
+            for n in serial parallel_1 parallel_2; do
+              echo "::group::[#6344] ${n} shard output"
+              cat "$sd/$n.log"
+              echo "::endgroup::"
+            done
+            echo "::notice::[#6344] shard exit codes: serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}"
+            for n in "$rc_s" "$rc_1" "$rc_2"; do
+              if [ "$n" -ne 0 ]; then rc="$n"; fi
+            done
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::[#6344] sharded '${label}' FAILED (serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}); see the shard output groups above"
+            fi
+            return "$rc"
+          }
+
           case "${TEST_IMPACT:-__ALL__}" in
             __SKIP__)
               echo "::notice::docs-only diff — test step is a no-op"
@@ -1398,18 +1534,31 @@ jobs:
               # $FEAT/$TAIL are UNQUOTED on purpose: on enterprise-fed they
               # word-split into `--features sal-postgres` before and
               # `-- --test-threads=1` after "$@"; on sqlite both are empty.
-              run_tests "full suite (cargo test)" $FEAT $TAIL
+              if [ "${TIER:-sqlite}" = "enterprise-fed" ]; then
+                run_sharded "full suite (sharded cargo test)" 1
+              else
+                run_tests "full suite (cargo test)" $FEAT $TAIL
+              fi
               ;;
             *)
               # Always run --lib first (catches every inline unit test)
               echo "::notice::running cargo test --lib + impact-selected integration binaries (tier=${TIER:-sqlite})"
-              run_tests "cargo test --lib" $FEAT --lib $TAIL
-              # Dispatch each impacted tests/*.rs binary
-              ARGS=()
-              for t in $TEST_IMPACT; do
-                ARGS+=(--test "$t")
-              done
-              run_tests "impact-selected integration binaries (${TEST_IMPACT})" $FEAT "${ARGS[@]}" $TAIL
+              if [ "${TIER:-sqlite}" = "enterprise-fed" ]; then
+                # #6344: same lib + impacted-binaries set, sharded.
+                ARGS=(--lib)
+                for t in $TEST_IMPACT; do
+                  ARGS+=(--test "$t")
+                done
+                run_sharded "impact-selected (sharded: ${TEST_IMPACT})" 0 "${ARGS[@]}"
+              else
+                run_tests "cargo test --lib" $FEAT --lib $TAIL
+                # Dispatch each impacted tests/*.rs binary
+                ARGS=()
+                for t in $TEST_IMPACT; do
+                  ARGS+=(--test "$t")
+                done
+                run_tests "impact-selected integration binaries (${TEST_IMPACT})" $FEAT "${ARGS[@]}" $TAIL
+              fi
               ;;
           esac
           }
