@@ -406,6 +406,24 @@ unaddressable recipient, unencodable frame, hub queue or egress overflow,
 offline-coalesced, offline-unknown, hand-off channel full, hub down, and bus
 lag. A hub that silently stopped waking anyone must not look like a quiet fleet.
 
+Those counters are scrapable (#3657). The installer parks the one installed
+sink's handle in `wake_sink::installed_sink_metrics`, and the daemon's
+`/metrics` renders it at scrape time as `ai_memory_wake_sink_active` (`1`
+while a sink is installed), `ai_memory_wake_sink_{wakes_seen,delivered,
+written,coalesced,meta_shed}_total` and `ai_memory_wake_sink_dropped_total`
+with a closed `cause` label — `unknown`, `overflow`, `unaddressable`,
+`unencodable`, `transport_full`, `hub_down`, `bus_lagged` — whose values sum to
+the snapshot's `total_dropped`. The counters are present only while a sink is
+installed: with none, the gauge reads `0` and nothing else is rendered, so a
+number nothing measured is never exposed as `0`. An alert on
+`rate(ai_memory_wake_sink_dropped_total{cause="hub_down"}[5m]) > 0` is the
+"the forwarder lost its hub" signal; `written` rising while the hub's own
+`frames_in_total` (below) does not is the "frames leave the daemon and never
+arrive" signal. The hub process's own counters are a separate surface, read
+through `wake-hub --health --json` / `--posture --json`; they are not on the
+daemon's `/metrics`, because the hub is a separate process with no HTTP
+listener.
+
 ## Certification: transport-only, and provably removable
 
 The enterprise-federation certification

@@ -158,6 +158,9 @@ pub fn install_in_process(router: Arc<Router>) -> Option<Arc<SinkMetrics>> {
     let sink = InProcessWakeSink::for_router(router);
     let metrics = sink.metrics();
     if crate::inbox_wake::install_sink(Arc::new(sink)) {
+        // #3657 — the bus now delivers to this sink; make its counters
+        // scrapable.
+        super::remember_installed_sink_metrics(&metrics);
         tracing::info!(
             "wake sink: co-hosted wake-hub attached to the agent_notified bus; clients \
              must still poll their inbox at least every {:?}",

@@ -128,6 +128,8 @@ pub fn install_with_key_dir(app_config: &AppConfig, key_dir: &Path) -> Result<Wa
     };
     let socket = cfg.socket_path.clone();
     let hub_id = cfg.hub_id.clone();
+    // The returned counters are not needed here: `install_uds` parks them in
+    // `wake_sink::installed_sink_metrics` for the `/metrics` scrape (#3657).
     install_uds(cfg, Arc::new(credential))?;
     Ok(WakeSinkBoot::Installed { socket, hub_id })
 }

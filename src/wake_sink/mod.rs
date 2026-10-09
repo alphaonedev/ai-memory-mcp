@@ -78,6 +78,7 @@
 //! sees a gap collapse that wait to ONE catch-up inbox read.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 
@@ -407,6 +408,36 @@ impl SinkMetrics {
             meta_shed: self.meta_shed.load(Ordering::Relaxed),
         }
     }
+}
+
+/// #3657 — the counters of the ONE sink this process installed.
+///
+/// [`crate::inbox_wake::install_sink`] admits exactly one sink for the life
+/// of the process, and both installers ([`uds::install_uds`],
+/// [`in_process::install_in_process`]) hand its counters back to their
+/// caller. In `serve` that caller has nothing to do with the handle, so it
+/// dropped it (`boot.rs`) and the counters were readable only by library tests
+/// that kept their own `Arc`: an operator scraping `/metrics` could not tell a
+/// quiet fleet from a hub that silently stopped waking anyone. The installers
+/// now ALSO park the handle here, where the scrape-time collector in
+/// [`crate::metrics`] reads it. The sink stays the only writer; the scrape
+/// only ever loads the atomics.
+static INSTALLED_SINK_METRICS: OnceLock<Arc<SinkMetrics>> = OnceLock::new();
+
+/// Park the installed sink's counters for the scrape (#3657). Called by an
+/// installer ONLY after `install_sink` accepted its sink.
+pub(crate) fn remember_installed_sink_metrics(metrics: &Arc<SinkMetrics>) {
+    // `install_sink` admits one sink per process, so this runs at most once
+    // per process; a second `set` cannot happen. The result is discarded
+    // deliberately (ERRORS-19): were it ever `Err`, the first installer's
+    // handle is still the one the bus delivers to, and keeping it is correct.
+    let _ = INSTALLED_SINK_METRICS.set(Arc::clone(metrics));
+}
+
+/// The installed sink's counters, or `None` while no sink is installed.
+#[must_use]
+pub fn installed_sink_metrics() -> Option<Arc<SinkMetrics>> {
+    INSTALLED_SINK_METRICS.get().cloned()
 }
 
 /// A recipient id that is safe to put in a log line.

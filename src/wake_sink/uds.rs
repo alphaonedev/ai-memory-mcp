@@ -340,6 +340,8 @@ pub fn install_uds(
              Tokio runtime; refusing to replace it"
         );
     }
+    // #3657 — the bus now delivers to this sink; make its counters scrapable.
+    super::remember_installed_sink_metrics(&metrics);
     tracing::info!(
         "wake sink: wake-hub forwarder attached to the agent_notified bus; clients must \
          still poll their inbox at least every {BACKSTOP_POLL_MAX:?}"

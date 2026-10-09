@@ -1539,6 +1539,8 @@ impl Metrics {
         registry.register(Box::new(LogPipelineCollector::new()?))?;
         // #3975 — the flat audit trail's delivery, read at scrape time.
         registry.register(Box::new(AuditTrailCollector::new()?))?;
+        // #3657 — the installed wake sink's counters, read at scrape time.
+        registry.register(Box::new(WakeSinkCollector::new()?))?;
 
         Ok(Self {
             registry,
@@ -2201,6 +2203,161 @@ impl Collector for AuditTrailCollector {
     }
 }
 
+/// #3657 — `1` while a wake sink is installed on this process, `0` otherwise.
+pub const WAKE_SINK_ACTIVE: &str = "ai_memory_wake_sink_active";
+
+/// #3657 — the installed wake sink's drops, by cause (closed label set, see
+/// [`wake_drop_causes`]).
+pub const WAKE_SINK_DROPPED_TOTAL: &str = "ai_memory_wake_sink_dropped_total";
+
+/// #3657 — the daemon-side wake sink's counters. Like the #3651 log and the
+/// #3975 audit collectors, it reads a snapshot at scrape time from the
+/// counters the owner keeps ([`crate::wake_sink::installed_sink_metrics`],
+/// parked there by the installer), so nothing is mirrored and nothing can
+/// drift. Only the `active` gauge is rendered while no sink is installed: a
+/// number nothing measured is never exposed as `0`.
+struct WakeSinkCollector {
+    active: IntGauge,
+    wakes_seen: IntCounter,
+    delivered: IntCounter,
+    written: IntCounter,
+    coalesced: IntCounter,
+    meta_shed: IntCounter,
+    dropped: IntCounterVec,
+    // Serialises scrapes: a counter is reset and re-set per collect.
+    scrape: std::sync::Mutex<()>,
+}
+
+impl WakeSinkCollector {
+    fn new() -> prometheus::Result<Self> {
+        Ok(Self {
+            active: IntGauge::new(
+                WAKE_SINK_ACTIVE,
+                "1 when a wake sink (the `[wake_hub].sink_socket` forwarder, or a \
+                 co-hosted hub) is installed on this process and attached to the \
+                 agent_notified bus; 0 when this daemon pushes no wakes and its \
+                 recipients rely on their backstop poll (#3657).",
+            )?,
+            wakes_seen: IntCounter::new(
+                "ai_memory_wake_sink_wakes_seen_total",
+                "Bus wakes handed to the installed wake sink. Present only while a \
+                 sink is installed (#3657).",
+            )?,
+            delivered: IntCounter::new(
+                "ai_memory_wake_sink_delivered_total",
+                "Wakes a co-hosted hub handed to a live recipient's writer queue \
+                 (#3657).",
+            )?,
+            written: IntCounter::new(
+                "ai_memory_wake_sink_written_total",
+                "Wake frames the forwarder wrote to the wake-hub socket. Fire-and-\
+                 forget: a frame the hub later refuses stays counted here and moves \
+                 one of the hub's own drop counters (#3657).",
+            )?,
+            coalesced: IntCounter::new(
+                "ai_memory_wake_sink_coalesced_total",
+                "Wakes for an offline but known recipient, coalesced into its pending \
+                 set by a co-hosted hub (#3657).",
+            )?,
+            meta_shed: IntCounter::new(
+                "ai_memory_wake_sink_meta_shed_total",
+                "Wake hints that shed a field (sender, then namespace, then digest) \
+                 to fit the wire metadata cap; the row id and watermark always stay \
+                 (#3657).",
+            )?,
+            dropped: IntCounterVec::new(
+                prometheus::Opts::new(
+                    WAKE_SINK_DROPPED_TOTAL,
+                    "Wakes the installed sink failed to hand onward, by cause: \
+                     unknown (recipient never authenticated to the hub), overflow \
+                     (hub queue or egress budget full), unaddressable, unencodable, \
+                     transport_full (hand-off channel to the forwarder full), \
+                     hub_down (no hub connection), bus_lagged (dropped by the bus \
+                     before the sink saw them). Every one degraded to the \
+                     recipient's backstop poll, never to a lost message (#3657).",
+                ),
+                &["cause"],
+            )?,
+            scrape: std::sync::Mutex::new(()),
+        })
+    }
+
+    /// Render `snapshot` as metric families. `None` means no sink is
+    /// installed: the gauge says so and no counter is rendered.
+    fn families_for(
+        &self,
+        snapshot: Option<&crate::wake_sink::SinkMetricsSnapshot>,
+    ) -> Vec<MetricFamily> {
+        let _serialised = self
+            .scrape
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.active.set(i64::from(snapshot.is_some()));
+        let mut families = self.active.collect();
+        let Some(snapshot) = snapshot else {
+            return families;
+        };
+        for (counter, value) in [
+            (&self.wakes_seen, snapshot.wakes_seen),
+            (&self.delivered, snapshot.delivered),
+            (&self.written, snapshot.written),
+            (&self.coalesced, snapshot.coalesced),
+            (&self.meta_shed, snapshot.meta_shed),
+        ] {
+            counter.reset();
+            counter.inc_by(value);
+            families.extend(counter.collect());
+        }
+        // `reset` drops every child, so a cause is rendered from exactly the
+        // snapshot in hand (a zero IS rendered: once a sink is installed, a
+        // zero drop count is a measured fact a dashboard can draw).
+        self.dropped.reset();
+        for (cause, value) in wake_drop_causes(snapshot) {
+            self.dropped.with_label_values(&[cause]).inc_by(value);
+        }
+        families.extend(self.dropped.collect());
+        families
+    }
+}
+
+/// The CLOSED `cause` label set of [`WAKE_SINK_DROPPED_TOTAL`]: one label per
+/// drop field of [`crate::wake_sink::SinkMetricsSnapshot`], so the series
+/// cardinality is fixed at compile time and the labels sum to
+/// `SinkMetricsSnapshot::total_dropped` exactly.
+fn wake_drop_causes(snapshot: &crate::wake_sink::SinkMetricsSnapshot) -> [(&'static str, u64); 7] {
+    [
+        ("unknown", snapshot.dropped_unknown),
+        ("overflow", snapshot.dropped_overflow),
+        ("unaddressable", snapshot.dropped_unaddressable),
+        ("unencodable", snapshot.dropped_unencodable),
+        ("transport_full", snapshot.dropped_transport_full),
+        ("hub_down", snapshot.dropped_hub_down),
+        ("bus_lagged", snapshot.bus_lagged),
+    ]
+}
+
+impl Collector for WakeSinkCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        [
+            self.active.desc(),
+            self.wakes_seen.desc(),
+            self.delivered.desc(),
+            self.written.desc(),
+            self.coalesced.desc(),
+            self.meta_shed.desc(),
+            self.dropped.desc(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let snapshot = crate::wake_sink::installed_sink_metrics().map(|m| m.snapshot());
+        self.families_for(snapshot.as_ref())
+    }
+}
+
 /// Render the current registry state to the Prometheus text exposition
 /// format. Ignores errors from the encoder (unreachable in practice) and
 /// returns an empty string — the scrape returns 200 with a possibly-empty
@@ -2443,9 +2600,83 @@ mod tests {
             // #2502 — per-source auth-failure backoff surfaces.
             "ai_memory_auth_failures_total",
             "ai_memory_auth_backoff_episodes_total",
+            // #3657 — the wake sink gauge is rendered even with no sink
+            // installed (its counters are not: see the collector tests).
+            WAKE_SINK_ACTIVE,
         ] {
             assert!(text.contains(name), "/metrics missing {name}\n\n{text}");
         }
+    }
+
+    /// #3657 helper — the text a scrape would show for these families.
+    fn exposition_of(families: &[MetricFamily]) -> String {
+        let mut buf = Vec::new();
+        TextEncoder::new()
+            .encode(families, &mut buf)
+            .expect("text exposition");
+        String::from_utf8(buf).expect("utf-8 exposition")
+    }
+
+    /// #3657 — with no sink installed only the gauge is rendered, at 0: a
+    /// counter nothing measured is absent, never `0`.
+    #[test]
+    fn wake_sink_collector_renders_only_the_gauge_until_a_sink_is_installed_3657() {
+        let collector = WakeSinkCollector::new().expect("fresh names");
+        let families = collector.families_for(None);
+        assert_eq!(families.len(), 1, "{families:?}");
+        let text = exposition_of(&families);
+        assert!(text.contains("ai_memory_wake_sink_active 0"), "{text}");
+        assert!(
+            !text.contains("ai_memory_wake_sink_wakes_seen_total"),
+            "{text}"
+        );
+        assert!(!text.contains(WAKE_SINK_DROPPED_TOTAL), "{text}");
+    }
+
+    /// #3657 — every sink counter and every drop cause is rendered from the
+    /// snapshot, the causes sum to `total_dropped`, and a second scrape of the
+    /// same snapshot renders the same numbers (reset-then-set, no doubling).
+    #[test]
+    fn wake_sink_collector_renders_every_counter_and_drop_cause_3657() {
+        let sink = crate::wake_sink::SinkMetrics::default();
+        sink.wakes_seen();
+        sink.wakes_seen();
+        sink.delivered();
+        sink.written();
+        sink.coalesced();
+        sink.meta_shed();
+        sink.dropped_unknown();
+        sink.dropped_overflow();
+        sink.dropped_unaddressable();
+        sink.dropped_unencodable();
+        sink.dropped_transport_full();
+        sink.dropped_hub_down();
+        sink.bus_lagged(3);
+        let snapshot = sink.snapshot();
+
+        let collector = WakeSinkCollector::new().expect("fresh names");
+        let text = exposition_of(&collector.families_for(Some(&snapshot)));
+        for expected in [
+            "ai_memory_wake_sink_active 1",
+            "ai_memory_wake_sink_wakes_seen_total 2",
+            "ai_memory_wake_sink_delivered_total 1",
+            "ai_memory_wake_sink_written_total 1",
+            "ai_memory_wake_sink_coalesced_total 1",
+            "ai_memory_wake_sink_meta_shed_total 1",
+            "ai_memory_wake_sink_dropped_total{cause=\"unknown\"} 1",
+            "ai_memory_wake_sink_dropped_total{cause=\"overflow\"} 1",
+            "ai_memory_wake_sink_dropped_total{cause=\"unaddressable\"} 1",
+            "ai_memory_wake_sink_dropped_total{cause=\"unencodable\"} 1",
+            "ai_memory_wake_sink_dropped_total{cause=\"transport_full\"} 1",
+            "ai_memory_wake_sink_dropped_total{cause=\"hub_down\"} 1",
+            "ai_memory_wake_sink_dropped_total{cause=\"bus_lagged\"} 3",
+        ] {
+            assert!(text.contains(expected), "missing `{expected}`:\n{text}");
+        }
+        let summed: u64 = wake_drop_causes(&snapshot).iter().map(|(_, v)| v).sum();
+        assert_eq!(summed, snapshot.total_dropped());
+        let again = exposition_of(&collector.families_for(Some(&snapshot)));
+        assert_eq!(again, text, "a scrape must not accumulate across scrapes");
     }
 
     #[test]
