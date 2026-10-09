@@ -2765,7 +2765,15 @@ def _trusted_merge_ref_cells(t, fx, mirror, head8, good8, unrel8):
     saved = globals().get("_sleep")
     globals()["_sleep"] = fake_sleep
     try:
+        # #6163 precedent: no workflow step fetches the head; --pr-number makes this base copy fetch it.
+        fx.g("update-ref", "refs/pull/7/head", head8)
+        if run_git(mirror, "rev-parse", "--verify", "--quiet", "refs/remotes/pull/head").returncode == 0:
+            Fixture(mirror).g("update-ref", "-d", "refs/remotes/pull/head")
         cell("tr-m-current", "a current merge ref on the first fetch", good8, True)
+        fetched = run_git(mirror, "rev-parse", "--verify", "--quiet", "refs/remotes/pull/head^{commit}")
+        if fetched.stdout.decode().strip() != head8:
+            t.fail("(tr-m-head): --pr-number did not fetch refs/pull/7/head into refs/remotes/pull/head "
+                   f"(got {fetched.stdout.decode().strip()!r}, rc {fetched.returncode})")
         on_sleep.append(lambda: set_ref(good8))
         cell("tr-m-late", "a merge ref that becomes current on the second fetch", unrel8, True, sleeps=(5,))
         del on_sleep[:]
@@ -2774,9 +2782,25 @@ def _trusted_merge_ref_cells(t, fx, mirror, head8, good8, unrel8):
              needles=("::error title=cert-expiry trusted::", "stale", attempts), sleeps=PINNED_MERGE_REF_SLEEPS)
         cell("tr-m-missing", "no merge ref at all (a conflicted pull request)", "", False,
              needles=("::error title=cert-expiry trusted::", "conflict", attempts), sleeps=PINNED_MERGE_REF_SLEEPS)
-        for bad in ("0", "07", "7x", "-1", "1" * 11):
-            cell(f"tr-m-num-{bad[:4]}", f"--pr-number {bad!r}", good8, False, needles=("--pr-number",),
-                 args=(f"--pr-number={bad}", "--merge-ref=refs/remotes/pull/m7"))
+        # Hostile --pr-number values (#6163 precedent) are refused before any git fetch runs.
+        real_run_git, fetches = globals()["run_git"], []
+
+        def recording_run_git(repo, *args, **kw):
+            if "fetch" in args:
+                fetches.append(args)
+            return real_run_git(repo, *args, **kw)
+
+        globals()["run_git"] = recording_run_git
+        try:
+            for bad in ("0", "07", "-1", "--upload-pack=touch pwned", "../7", "7/../8", "7\n", "\u0667",
+                        "1" * 11, "7x", "", " 7"):
+                del fetches[:]
+                cell(f"tr-m-num-{bad[:6]!r}", f"--pr-number {bad!r}", good8, False, needles=("--pr-number",),
+                     args=(f"--pr-number={bad}", "--merge-ref=refs/remotes/pull/m7"))
+                if fetches:
+                    t.fail(f"(tr-m-num-{bad[:6]!r}): --pr-number {bad!r} reached git: {fetches!r}")
+        finally:
+            globals()["run_git"] = real_run_git
         cell("tr-m-sha", "--pr-number with a sha --merge-ref", good8, False, needles=("--merge-ref",),
              args=("--pr-number=7", f"--merge-ref={good8}"))
     finally:

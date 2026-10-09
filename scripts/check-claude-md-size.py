@@ -1866,10 +1866,6 @@ CERT_TRUSTED_WORKFLOW_LINES = (
     "ref: ${{ github.sha }}",
     "fetch-depth: 0",
     "persist-credentials: false",
-    "- name: Fetch the pull request head as git objects (data, never checked out)",
-    "env:",
-    "PR_NUMBER: ${{ github.event.pull_request.number }}",
-    'run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"',
     "- name: Cert-expiry gate self-test (base code)",
     "run: python3 -I scripts/check_cert_expiry.py --self-test",
     "- name: Judge the merge commit with the base copy of the gate",
@@ -1881,12 +1877,20 @@ CERT_TRUSTED_WORKFLOW_LINES = (
     'run: python3 -I scripts/check_cert_expiry.py --trusted --base-ref "$BASE_REF" --base-sha "$BASE_SHA" '
     '--head-sha "$HEAD_SHA" --pr-number "$PR_NUMBER" --merge-ref refs/remotes/pull/merge',
 )
-CERT_TRUSTED_WORKFLOW_INDENTS = (0, 0, 2, 4, 4, 0, 2, 0, 2, 2, 0, 2, 4, 4, 4, 4, 6, 8, 8, 10, 10, 10, 6, 8, 10, 8, 6, 8,
+CERT_TRUSTED_WORKFLOW_INDENTS = (0, 0, 2, 4, 4, 0, 2, 0, 2, 2, 0, 2, 4, 4, 4, 4, 6, 8, 8, 10, 10, 10, 6, 8,
                                  6, 8, 10, 10, 10, 10, 8)
+# #6163 (CodeQL actions/untrusted-checkout): the base copy of the gate fetches the head and the merge ref as git
+# objects itself (--pr-number); no workflow step fetches, pulls or checks out pull request content. Tokens the
+# comparison workflow's list already carries are not repeated.
+CERT_TRUSTED_FETCH_DANGER = (
+    ("git fetch", "the pull request head and merge ref are fetched by the base gate script, never by a workflow step"),
+    ("git pull", "the pull request head and merge ref are fetched by the base gate script, never by a workflow step"),
+    ("pr checkout", "a workflow step must never check out the pull request head"),
+)
 CERT_TRUSTED_DANGER = tuple(item for item in COMPARE_DANGER if item[0] != "/merge") + (
     ("self-hosted", "the job must run on a GitHub-hosted runner"),
     ("working-directory:", "the gate must run from the base checkout root"),
-)
+) + tuple(item for item in CERT_TRUSTED_FETCH_DANGER if item[0] not in {c[0] for c in COMPARE_DANGER})
 
 
 def cert_trusted_workflow_errors(path: Path, label: str = CERT_TRUSTED_WORKFLOW_PATH) -> list:
@@ -2241,6 +2245,14 @@ def run_cert_trusted_workflow_cases(repo_root: Path, base: Path) -> bool:
     ok &= case("#6140 paths filter", good.replace("    branches:", "    paths: [\"src/**\"]\n    branches:", 1), "`paths:`")
     ok &= case("#6140 swallowed failure", good.replace(
         "--self-test\n", "--self-test\n        continue-on-error: true\n", 1), "continue-on-error")
+    fetch_step = ("      - name: Fetch the pull request head as git objects (data, never checked out)\n"
+                  "        run: git fetch --no-tags origin \"+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head\"\n")
+    ok &= case("#6163 workflow fetch step re-added", good.replace(
+        "      - name: Cert-expiry gate self-test", fetch_step + "      - name: Cert-expiry gate self-test", 1),
+        "`git fetch`")
+    ok &= case("#6163 gh pr checkout step", good.replace(
+        "      - name: Cert-expiry gate self-test",
+        "      - run: gh pr checkout 7\n      - name: Cert-expiry gate self-test", 1), "`pr checkout`")
     ok &= case("#6140 unpinned action", good.replace(
         "@11d5960a326750d5838078e36cf38b85af677262", "@v4", 1), "action is not pinned")
     ok &= case("#6140 checkout impostor sha", good.replace(
