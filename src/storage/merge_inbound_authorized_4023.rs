@@ -154,7 +154,9 @@ pub fn merge_inbound_authorized(
                     inbound,
                     receiver_verified,
                 );
-                overwrite_full_row_by_id(conn, &merged)?;
+                // #4035 — `existing` decides whether the recovery snapshot
+                // is replaced (only when the merge changes the text).
+                overwrite_full_row_by_id(conn, &merged, &existing)?;
                 Ok(Some(merged.id))
             }
             // No row by this id — defer to the (title, namespace) dedup

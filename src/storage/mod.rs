@@ -18750,6 +18750,17 @@ pub fn archived_namespace_by_id(conn: &Connection, id: &str) -> Result<Option<St
 /// authorizer). Tests and the sqlite adapter delegation only; every
 /// production federation caller must use [`merge_inbound_authorized`], and
 /// `tests/merge_inbound_unchecked_ceiling_4023.rs` pins that mechanically.
+/// #4035 — does persisting `merged` over `existing` change the row's logical
+/// text (title or plaintext content)? Only then is the per-id
+/// `federation_merge` recovery snapshot worth replacing: a no-change replay
+/// or a losing inbound would otherwise overwrite the earlier pre-image with a
+/// copy of the live row. Both arguments are decoded `Memory` values, so the
+/// content compared is plaintext on an encrypted store too.
+#[must_use]
+pub(crate) fn merge_changes_text(existing: &Memory, merged: &Memory) -> bool {
+    existing.title != merged.title || existing.content != merged.content
+}
+
 pub fn merge_inbound(
     conn: &Connection,
     inbound: &Memory,
@@ -18784,18 +18795,35 @@ pub fn merge_inbound(
 /// `merge_inbound` parity). Do NOT add further callers without routing
 /// them through the same gates.
 ///
+/// `existing` is the live row the caller read under its write lock (the
+/// `merge_memory` LOCAL input) and decides whether the recovery snapshot is
+/// replaced — see [`merge_changes_text`].
+///
 /// # Errors
 ///
 /// Bubbles up serde encode errors for the JSON-shaped columns and any
 /// rusqlite error from the UPDATE.
-fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
+fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory, existing: &Memory) -> Result<()> {
     // #1773 (MEDIUM) — snapshot the pre-merge row before this peer-driven
     // LWW content overwrite, mirroring the #1725 in_place_edit snapshot, so a
     // federation merge where the remote wins the tiebreak leaves a recoverable
     // copy instead of permanently discarding prior local content. INSERT OR
-    // REPLACE so a repeated merge of the same id is idempotent; archives the
-    // CURRENT row (incl its encrypted_envelope) before the UPDATE below.
-    archive_memory_insert_only(conn, &mem.id, field_names::ARCHIVE_REASON_FEDERATION_MERGE)?;
+    // REPLACE keyed by id: the slot holds ONE snapshot. Archives the CURRENT
+    // row (incl its encrypted_envelope) before the UPDATE below.
+    //
+    // #4035 — ONLY when the merge changes the row's logical text. The slot
+    // used to be rewritten on EVERY same-id merge, so a redelivery of the
+    // row that already won (the product resends every committed row through
+    // `bulk_catchup_push`), or a LOSING older inbound that LWW discards,
+    // replaced the only recovery copy of the earlier text with a copy of the
+    // live row — the "idempotent" comment described exactly the overwrite it
+    // was supposed to prevent. Compared on the decrypted plaintext both
+    // `Memory` values carry (never the randomized ciphertext), so the check
+    // holds with at-rest encryption on. Other CRDT fields still converge
+    // below either way.
+    if merge_changes_text(existing, mem) {
+        archive_memory_insert_only(conn, &mem.id, field_names::ARCHIVE_REASON_FEDERATION_MERGE)?;
+    }
 
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
