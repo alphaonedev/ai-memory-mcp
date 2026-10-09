@@ -59,8 +59,12 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
-use ai_memory::federation::push_dlq::{FederationDlqSink, SqliteDlqSink, replay_once};
-use ai_memory::federation::{FederationConfig, PeerEndpoint, broadcast_store_quorum};
+use ai_memory::federation::push_dlq::{
+    FederationDlqSink, FederationPushDlqRow, SqliteDlqSink, replay_once,
+};
+use ai_memory::federation::{
+    FederationConfig, PeerEndpoint, SentinelExpansion, broadcast_store_quorum,
+};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::replication::QuorumPolicy;
 
@@ -68,6 +72,8 @@ use ai_memory::replication::QuorumPolicy;
 struct PeerState {
     /// Toggle peer behaviour: `true` = return 500, `false` = return 200.
     fail_mode: Arc<AtomicBool>,
+    /// #3658 — `true` = return 429 (a THROTTLE, the `note_dlq_throttled` arm).
+    throttle_mode: Arc<AtomicBool>,
     /// Number of POSTs the peer has received.
     hit_count: Arc<AtomicUsize>,
     /// Last body received (so the test can assert payload round-trips
@@ -85,6 +91,12 @@ async fn push_handler(
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(serde_json::json!({"error": "stub down"})),
+        );
+    }
+    if state.throttle_mode.load(Ordering::Relaxed) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            axum::Json(serde_json::json!({"error": "quota window"})),
         );
     }
     (
@@ -897,4 +909,402 @@ async fn pg_dlq_refresh_and_cas_guard_2360() {
             .expect("pg fresh mark"),
         "pg current-snapshot mark clears"
     );
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3658 — LOCAL bookkeeping failures at the `dyn FederationDlqSink`
+// boundary, exercised through the REAL sqlite sink: take / enqueue are
+// genuine, only the selected bookkeeping write is made to fail, the way a
+// broken DLQ store (disk full, lock, dropped table) fails it. The observable
+// is the exported Prometheus counter
+// `ai_memory_federation_push_dlq_bookkeeping_failed_total{op}`: a failed
+// local write must be COUNTED (pre-#3658 the `Result` was discarded at the
+// trait boundary and nothing distinguished a broken DLQ store from a
+// failing peer).
+// ---------------------------------------------------------------------------
+
+/// Serialises the #3658 cells: they read deltas of one process-global counter.
+static BOOKKEEPING_LOCK: Mutex<()> = Mutex::const_new(());
+
+const BOOKKEEPING_FAILED_METRIC: &str = "ai_memory_federation_push_dlq_bookkeeping_failed_total";
+
+/// The counter's current value for `op`, read from the exposition text the
+/// `/metrics` scrape serves (0 when the series has never been emitted).
+fn bookkeeping_failed(op: &str) -> u64 {
+    let series = format!("{BOOKKEEPING_FAILED_METRIC}{{op=\"{op}\"}} ");
+    ai_memory::metrics::render()
+        .lines()
+        .find_map(|line| line.strip_prefix(series.as_str()))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Which single sink write [`FailingBookkeepingSink`] makes fail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InjectedFault {
+    Bump,
+    Throttle,
+    Mark,
+    Reset,
+    Enqueue,
+}
+
+/// Delegates every call to a real sink and fails the selected write.
+#[derive(Clone)]
+struct FailingBookkeepingSink {
+    inner: Arc<dyn FederationDlqSink>,
+    fault: InjectedFault,
+}
+
+impl FailingBookkeepingSink {
+    fn failing(inner: Arc<dyn FederationDlqSink>, fault: InjectedFault) -> Self {
+        Self { inner, fault }
+    }
+
+    fn injected(&self, fault: InjectedFault, op: &str) -> Result<(), String> {
+        if self.fault == fault {
+            return Err(format!("injected: DLQ store cannot persist {op}"));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl FederationDlqSink for FailingBookkeepingSink {
+    async fn enqueue_push_failure(
+        &self,
+        memory_id: &str,
+        peer_id: &str,
+        payload_json: &serde_json::Value,
+        last_error: &str,
+    ) -> Result<(), String> {
+        self.injected(InjectedFault::Enqueue, "enqueue")?;
+        self.inner
+            .enqueue_push_failure(memory_id, peer_id, payload_json, last_error)
+            .await
+    }
+    async fn take_pending_dlq_rows(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<FederationPushDlqRow>, String> {
+        self.inner.take_pending_dlq_rows(limit).await
+    }
+    async fn mark_dlq_row_replayed(
+        &self,
+        id: i64,
+        expected_attempt_count: i32,
+    ) -> Result<bool, String> {
+        self.injected(InjectedFault::Mark, "mark_replayed")?;
+        self.inner
+            .mark_dlq_row_replayed(id, expected_attempt_count)
+            .await
+    }
+    async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String> {
+        self.injected(InjectedFault::Bump, "bump_attempt")?;
+        self.inner.bump_dlq_attempt(id, last_error).await
+    }
+    async fn pending_dlq_count(&self) -> Result<i64, String> {
+        self.inner.pending_dlq_count().await
+    }
+    async fn note_dlq_throttled(&self, id: i64, last_error: &str) -> Result<(), String> {
+        self.injected(InjectedFault::Throttle, "note_throttled")?;
+        self.inner.note_dlq_throttled(id, last_error).await
+    }
+    async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
+        self.injected(InjectedFault::Reset, "reset_throttled")?;
+        self.inner.reset_throttled_quarantine().await
+    }
+    async fn expand_erasure_sentinel(
+        &self,
+        row_id: i64,
+        expected_attempt_count: i32,
+        memory_id: &str,
+        peer_ids: &[String],
+        per_peer_payload: &serde_json::Value,
+        per_peer_last_error: &str,
+    ) -> Result<SentinelExpansion, String> {
+        self.inner
+            .expand_erasure_sentinel(
+                row_id,
+                expected_attempt_count,
+                memory_id,
+                peer_ids,
+                per_peer_payload,
+                per_peer_last_error,
+            )
+            .await
+    }
+    async fn erasure_delete_superseded_by_restore(
+        &self,
+        memory_id: &str,
+        erasure_failed_at: &str,
+    ) -> Result<bool, String> {
+        self.inner
+            .erasure_delete_superseded_by_restore(memory_id, erasure_failed_at)
+            .await
+    }
+}
+
+/// A real sqlite sink holding exactly one pending row for `peer-0`.
+async fn seeded_sqlite_sink(
+    peer_url: &str,
+) -> (
+    tempfile::TempDir,
+    ai_memory::handlers::Db,
+    Arc<dyn FederationDlqSink>,
+    FederationConfig,
+) {
+    let (tmp, db) = fresh_dlq_db();
+    let inner: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()).await.unwrap());
+    inner
+        .enqueue_push_failure(
+            "mem-3658",
+            "peer-0",
+            &serde_json::json!({"id": "mem-3658", "content": "bookkeeping probe"}),
+            "http 500 from the first push",
+        )
+        .await
+        .unwrap();
+    let cfg = build_cfg_with_sink(peer_url, inner.clone(), 500);
+    (tmp, db, inner, cfg)
+}
+
+async fn only_pending_row(sink: &dyn FederationDlqSink) -> FederationPushDlqRow {
+    let rows = sink.take_pending_dlq_rows(16).await.unwrap();
+    match rows.as_slice() {
+        [only] => only.clone(),
+        other => panic!("expected exactly one pending row: {other:?}"),
+    }
+}
+
+/// Peer answers 500 → `Fail` arm → `bump_dlq_attempt`. The bump fails: the
+/// failure must be COUNTED, and the real row is exactly as it was (budget
+/// frozen) — the audit's starvation hazard, made visible instead of silent.
+#[tokio::test]
+async fn replay_counts_failed_bump_after_peer_500_3658() {
+    let _serial = BOOKKEEPING_LOCK.lock().await;
+    let peer = PeerState {
+        fail_mode: Arc::new(AtomicBool::new(true)),
+        ..Default::default()
+    };
+    let peer_url = spawn_mock_peer(peer.clone()).await;
+    let (_tmp, _db, inner, cfg) = seeded_sqlite_sink(&peer_url).await;
+    let before_row = only_pending_row(inner.as_ref()).await;
+    let sink = FailingBookkeepingSink::failing(inner.clone(), InjectedFault::Bump);
+    let before = bookkeeping_failed("bump_attempt");
+    replay_once(&cfg, &sink).await;
+    assert_eq!(
+        bookkeeping_failed("bump_attempt") - before,
+        1,
+        "a failed local bump_dlq_attempt must be counted"
+    );
+    assert_eq!(peer.hit_count.load(Ordering::Relaxed), 1);
+    let after_row = only_pending_row(inner.as_ref()).await;
+    assert_eq!(
+        after_row.attempt_count, before_row.attempt_count,
+        "budget frozen"
+    );
+    assert_eq!(
+        after_row.last_error, before_row.last_error,
+        "last_error frozen"
+    );
+}
+
+/// Peer answers 429 → `Throttled` arm → `note_dlq_throttled` (#1544). The
+/// note fails: counted under its own op, and the attempt budget is still NOT
+/// burned (the #1544 contract survives the failure).
+#[tokio::test]
+async fn replay_counts_failed_throttle_note_after_peer_429_3658() {
+    let _serial = BOOKKEEPING_LOCK.lock().await;
+    let peer = PeerState {
+        throttle_mode: Arc::new(AtomicBool::new(true)),
+        ..Default::default()
+    };
+    let peer_url = spawn_mock_peer(peer.clone()).await;
+    let (_tmp, _db, inner, cfg) = seeded_sqlite_sink(&peer_url).await;
+    let sink = FailingBookkeepingSink::failing(inner.clone(), InjectedFault::Throttle);
+    let before = bookkeeping_failed("note_throttled");
+    replay_once(&cfg, &sink).await;
+    assert_eq!(
+        bookkeeping_failed("note_throttled") - before,
+        1,
+        "a failed local note_dlq_throttled must be counted"
+    );
+    let row = only_pending_row(inner.as_ref()).await;
+    assert_eq!(row.attempt_count, 1, "a throttle never burns an attempt");
+}
+
+/// Peer ACKS → `mark_dlq_row_replayed`. The clear fails: counted, the row
+/// stays pending, and the defined behaviour is a re-delivery next tick —
+/// proven by a second tick through the healthy sink, which clears the row
+/// and hits the peer a second time.
+#[tokio::test]
+async fn replay_counts_failed_mark_after_ack_and_redelivers_next_tick_3658() {
+    let _serial = BOOKKEEPING_LOCK.lock().await;
+    let peer = PeerState::default();
+    let peer_url = spawn_mock_peer(peer.clone()).await;
+    let (_tmp, _db, inner, cfg) = seeded_sqlite_sink(&peer_url).await;
+    let sink = FailingBookkeepingSink::failing(inner.clone(), InjectedFault::Mark);
+    let before = bookkeeping_failed("mark_replayed");
+    replay_once(&cfg, &sink).await;
+    assert_eq!(
+        bookkeeping_failed("mark_replayed") - before,
+        1,
+        "a failed local mark_dlq_row_replayed must be counted"
+    );
+    assert_eq!(peer.hit_count.load(Ordering::Relaxed), 1);
+    let _still_pending = only_pending_row(inner.as_ref()).await;
+
+    // Next tick, store healthy again: re-POSTed and cleared, nothing counted.
+    let before = bookkeeping_failed("mark_replayed");
+    replay_once(&cfg, inner.as_ref()).await;
+    assert_eq!(bookkeeping_failed("mark_replayed"), before);
+    assert_eq!(peer.hit_count.load(Ordering::Relaxed), 2, "re-delivered");
+    assert!(inner.take_pending_dlq_rows(16).await.unwrap().is_empty());
+}
+
+/// The #1544 un-quarantine sweep at the top of every tick is the same class
+/// of local bookkeeping write: its failure must be counted too.
+#[tokio::test]
+async fn replay_counts_failed_reset_throttled_sweep_3658() {
+    let _serial = BOOKKEEPING_LOCK.lock().await;
+    let peer = PeerState::default();
+    let peer_url = spawn_mock_peer(peer.clone()).await;
+    let (_tmp, _db, inner, cfg) = seeded_sqlite_sink(&peer_url).await;
+    let sink = FailingBookkeepingSink::failing(inner.clone(), InjectedFault::Reset);
+    let before = bookkeeping_failed("reset_throttled");
+    replay_once(&cfg, &sink).await;
+    assert_eq!(
+        bookkeeping_failed("reset_throttled") - before,
+        1,
+        "a failed reset_throttled_quarantine sweep must be counted"
+    );
+    // The tick still drained the independent row (it acked and cleared).
+    assert_eq!(peer.hit_count.load(Ordering::Relaxed), 1);
+    assert!(inner.take_pending_dlq_rows(16).await.unwrap().is_empty());
+}
+
+/// Landing a failed push into the DLQ is the data-loss form of this class:
+/// if the enqueue write fails the failed push is retried by nothing. It must
+/// be counted (op `enqueue`).
+#[tokio::test]
+async fn fanout_counts_failed_dlq_enqueue_3658() {
+    let _serial = BOOKKEEPING_LOCK.lock().await;
+    let peer = PeerState {
+        fail_mode: Arc::new(AtomicBool::new(true)),
+        ..Default::default()
+    };
+    let peer_url = spawn_mock_peer(peer.clone()).await;
+    let (_tmp, db) = fresh_dlq_db();
+    let inner: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()).await.unwrap());
+    let failing: Arc<dyn FederationDlqSink> = Arc::new(FailingBookkeepingSink::failing(
+        inner.clone(),
+        InjectedFault::Enqueue,
+    ));
+    let cfg = build_cfg_with_sink(&peer_url, failing, 500);
+    let before = bookkeeping_failed("enqueue");
+    let tracker = broadcast_store_quorum(&cfg, &sample_memory("dlq-mem-3658-enq"))
+        .await
+        .expect("broadcast returns its tracker");
+    assert!(!tracker.is_quorum_met(std::time::Instant::now()));
+    assert_eq!(
+        bookkeeping_failed("enqueue") - before,
+        1,
+        "a failed DLQ enqueue must be counted"
+    );
+    assert!(inner.take_pending_dlq_rows(16).await.unwrap().is_empty());
+}
+
+/// The REAL sqlite sink propagates its storage errors for every bookkeeping
+/// write (the sqlite half of the parity premise), and a replay tick over it
+/// counts the failure: with the table gone none of them may answer `Ok`.
+#[tokio::test]
+async fn sqlite_sink_bookkeeping_errors_propagate_and_are_counted_3658() {
+    let _serial = BOOKKEEPING_LOCK.lock().await;
+    let (_tmp, db) = fresh_dlq_db();
+    let sink = SqliteDlqSink::new(db.clone()).await.unwrap();
+    sink.enqueue_push_failure("mem-x", "peer-0", &serde_json::json!({"id": "mem-x"}), "e")
+        .await
+        .unwrap();
+    let id = only_pending_row(&sink).await.id;
+    db.lock()
+        .await
+        .0
+        .execute_batch("DROP TABLE federation_push_dlq;")
+        .unwrap();
+    assert!(sink.bump_dlq_attempt(id, "x").await.is_err());
+    assert!(sink.note_dlq_throttled(id, "x").await.is_err());
+    assert!(sink.mark_dlq_row_replayed(id, 1).await.is_err());
+    assert!(sink.reset_throttled_quarantine().await.is_err());
+
+    // A tick over the broken store: the reset sweep fails (counted), the take
+    // fails (the tick returns early — nothing else to count).
+    let cfg = build_cfg_with_sink("http://127.0.0.1:1", Arc::new(sink), 200);
+    let before = bookkeeping_failed("reset_throttled");
+    replay_once(&cfg, cfg.dlq_sink.as_deref().expect("sink")).await;
+    assert_eq!(bookkeeping_failed("reset_throttled") - before, 1);
+}
+
+/// Postgres half of parity: the counted trait-boundary handling through the
+/// REAL `PostgresDlqSink` (a failing bump injected over it). Ignored by
+/// default; run against a SCRATCH database with `AI_MEMORY_TEST_POSTGRES_URL`
+/// set: `cargo test --features sal-postgres --test federation_dlq_replay --
+/// --ignored pg_sink_bookkeeping_failure_is_counted_through_replay_3658`.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+#[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL pointing at a live scratch instance"]
+async fn pg_sink_bookkeeping_failure_is_counted_through_replay_3658() {
+    use ai_memory::federation::push_dlq::PostgresDlqSink;
+    use ai_memory::store::postgres::PostgresStore;
+
+    let _serial = BOOKKEEPING_LOCK.lock().await;
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!("test skipped: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let store = match PostgresStore::connect(&url).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("test skipped: PostgresStore::connect failed: {e}");
+            return;
+        }
+    };
+    let inner: Arc<dyn FederationDlqSink> = Arc::new(PostgresDlqSink::new(store));
+    let memory_id = format!("mem-3658-{}", uuid::Uuid::new_v4());
+    let peer_id = format!("peer-3658-{}", uuid::Uuid::new_v4());
+    inner
+        .enqueue_push_failure(
+            &memory_id,
+            &peer_id,
+            &serde_json::json!({"id": memory_id}),
+            "http 500 from the first push",
+        )
+        .await
+        .unwrap();
+    let peer = PeerState {
+        fail_mode: Arc::new(AtomicBool::new(true)),
+        ..Default::default()
+    };
+    let peer_url = spawn_mock_peer(peer).await;
+    let mut cfg = build_cfg_with_sink(&peer_url, inner.clone(), 500);
+    cfg.peers[0].id.clone_from(&peer_id);
+    let sink = FailingBookkeepingSink::failing(inner.clone(), InjectedFault::Bump);
+    let before = bookkeeping_failed("bump_attempt");
+    replay_once(&cfg, &sink).await;
+    assert!(
+        bookkeeping_failed("bump_attempt") - before >= 1,
+        "the pg row's failed bump must be counted"
+    );
+    let row = inner
+        .take_pending_dlq_rows(4096)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.memory_id == memory_id)
+        .expect("pg row still pending");
+    assert_eq!(row.attempt_count, 1, "pg budget frozen by the failed bump");
+    inner
+        .mark_dlq_row_replayed(row.id, row.attempt_count)
+        .await
+        .unwrap();
 }
