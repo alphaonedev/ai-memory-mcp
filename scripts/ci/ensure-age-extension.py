@@ -30,8 +30,15 @@ Behaviour:
 
 The tier URL is read from a file.  Its password is passed to psql through the
 ``PGPASSWORD`` environment variable and removed from the URL psql receives, so
-it never appears on a process argv.  A URL carrying ``sslpassword`` (libpq has
-no environment variable for it) is refused.  Neither form of the URL is printed.
+it never appears on a process argv.  Because urllib and libpq split a URL
+differently, the URL is refused (exit 2) when the two could disagree: it holds a
+``#`` (libpq has no fragment and reads keys after it), or an ``@`` after the
+point where urllib ended the host part.  Every query key other than
+``password`` must be on ``ALLOWED_QUERY_KEYS``, a case-sensitive allowlist of
+non-secret libpq parameters, so ``sslpassword``, ``oauth_client_secret``,
+``scram_client_key``, ``scram_server_key`` (no environment variable) and any
+other key are refused.  A refusal names the key, never its value, and neither
+form of the URL is printed.
 
 Exit codes: 0 healthy, 1 still unhealthy / probe or install failed,
 2 bad input (URL file, pg_config, source validation).
@@ -58,6 +65,18 @@ DEFAULT_PG_CONFIG = "/opt/homebrew/opt/postgresql@18/bin/pg_config"
 DEFAULT_PSQL = "/opt/homebrew/opt/postgresql@18/bin/psql"
 PROBE_SQL = "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'"
 URL_SCHEMES = ("postgres", "postgresql")
+# Non-secret libpq connection parameters accepted as tier URL query keys,
+# compared exactly as libpq does (case-sensitive).  Source: PostgreSQL 18 libpq
+# docs, "Connection Strings" > "Parameter Key Words" (LIBPQ-PARAMKEYWORDS).
+# ``password`` is handled separately (moved to PGPASSWORD); every other key,
+# including the secrets libpq cannot take from the environment, is refused.
+ALLOWED_QUERY_KEYS = frozenset((
+    "host", "hostaddr", "port", "dbname", "user", "application_name", "connect_timeout",
+    "sslmode", "sslrootcert", "sslcert", "sslkey", "sslcrl", "sslsni", "options",
+    "target_session_attrs", "client_encoding", "keepalives", "keepalives_idle",
+    "keepalives_interval", "keepalives_count", "tcp_user_timeout", "channel_binding",
+    "gssencmode", "krbsrvname", "service", "passfile", "requirepeer", "load_balance_hosts",
+))
 TEMP_SUFFIX = ".age-restore"
 
 # (source subdir, file name, sha256) for AGE 1.8.0 built against postgresql@18.
@@ -90,15 +109,22 @@ def psql_target(url):
     """Split the tier URL into (password-free URL for argv, password or None).
 
     Fails closed on anything that is not a postgres:// URL, because a keyword
-    DSN would carry its password on argv, and on an ``sslpassword`` query key,
-    because libpq has no environment variable for it.
+    DSN would carry its password on argv; on any URL urllib and libpq could
+    split differently (a ``#``, or an ``@`` past urllib's host part); and on any
+    query key that is not ``password`` or on ``ALLOWED_QUERY_KEYS``, because it
+    would stay on argv.  Messages name a key only, never a value.
     """
+    if "#" in url:
+        raise HelperError("tier URL file holds a '#'; libpq reads past it, so it is refused", EXIT_BAD_INPUT)
     try:
         parts = urlsplit(url)
     except ValueError:
         raise HelperError("tier URL file does not hold a valid postgres:// URL", EXIT_BAD_INPUT)
     if parts.scheme not in URL_SCHEMES or not parts.netloc:
         raise HelperError("tier URL file does not hold a postgres:// URL", EXIT_BAD_INPUT)
+    if "@" in parts.path or "@" in parts.query:
+        # libpq ends the userinfo at the first '@' before '/', urllib at '/', '?' or '#'.
+        raise HelperError("tier URL file has an '@' after the host part; percent-encode it", EXIT_BAD_INPUT)
     password = None
     netloc = parts.netloc
     if "@" in netloc:
@@ -108,6 +134,9 @@ def psql_target(url):
             password = unquote(raw_password)
             userinfo = user
         netloc = f"{userinfo}@{hostport}" if userinfo else hostport
+    if any(seg and "=" not in seg for seg in parts.query.split("&")):
+        # A bare segment is a value, not a key, so it is refused without being named.
+        raise HelperError("tier URL file has a query parameter without '='", EXIT_BAD_INPUT)
     query_pairs = parse_qsl(parts.query, keep_blank_values=True)
     kept = []
     for key, value in query_pairs:
@@ -115,10 +144,14 @@ def psql_target(url):
             raise HelperError("tier URL file carries sslpassword; use a key without a passphrase", EXIT_BAD_INPUT)
         if key == "password":
             password = value
-        else:
+        elif key in ALLOWED_QUERY_KEYS:
             kept.append((key, value))
+        else:
+            name = key if key.isidentifier() and key.isascii() and len(key) <= 64 else "<unprintable>"
+            raise HelperError(f"tier URL file carries query key {name}, which is not on the allowlist of "
+                              "non-secret libpq parameters", EXIT_BAD_INPUT)
     query = urlencode(kept) if len(kept) != len(query_pairs) else parts.query
-    return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment)), password
+    return urlunsplit((parts.scheme, netloc, parts.path, query, "")), password
 
 
 def probe_lists_age(psql, url):
