@@ -1601,6 +1601,23 @@ def _shape(old: str, new: Union[str, Transform]) -> Edit:
     return (SHAPE, old, new, False)
 
 
+JOB_RE_TMPL = r"(?m)^  %s:\n(?P<body>(?:^(?:    .*|)\n)*)"
+
+
+def _drop_job_permissions(job: str) -> Transform:
+    """Remove the `permissions:` block of release.yml job ``job`` when it has one
+    (#4937). A job with no block inherits the top-level `contents: write`; the
+    transform leaves a job that already inherits unchanged, so the case is red
+    while the guard still accepts inheritance for that job."""
+    def go(text: str) -> str:
+        m = re.search(JOB_RE_TMPL % re.escape(job), text)
+        if m is None:
+            raise RuntimeError(f"job `{job}:` not found in release.yml")
+        body = re.sub(r"(?m)^    permissions:\n(?:^      .*\n)+", "", m.group("body"), count=1)
+        return text[: m.start("body")] + body + text[m.end("body"):]
+    return go
+
+
 # name -> (want, edits). want: "pass" (guard accepts), "fail" (guard refuses),
 # "input-error" (guard exits 2). `--mutation-sweep` neutralises every refusal
 # site in turn and requires `--self-test` to go red, so each "fail" case must be
@@ -2019,6 +2036,11 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR8 crates-io declares permissions": ("fail", [_rel(CRATES_STEPS, CRATES_STEPS.replace(
         "    environment:", "    permissions:\n      packages: write\n    environment:"))]),
     "SR8 release job permissions changed": ("fail", [_rel(REL_PERMS, "      id-token: write\n    strategy:\n")]),
+    # --- #4937: supply-chain and crates-io hold `contents: read`, never the inherited write
+    "4937 supply-chain job inherits the top-level contents: write": ("fail", [_rel(
+        JOB_NAME, _drop_job_permissions("supply-chain"))]),
+    "4937 crates-io job inherits the top-level contents: write": ("fail", [_rel(
+        JOB_NAME, _drop_job_permissions("crates-io"))]),
     "SR8 copr job calls a reusable workflow": ("fail", [_rel(COPR_HDR, COPR_HDR + "    uses: ./.github/workflows/x.yml\n")]),
     "SR8 an extra job": ("fail", [_rel(COPR_HDR, _append_job("      - run: echo\n"))]),
     "SR8 unpinned secret": ("fail", _step_before_pkg("        env:\n          T: ${{ secrets.NPM_TOKEN }}\n        run: echo\n")),
