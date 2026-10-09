@@ -1051,8 +1051,11 @@ def path_max_fallback_violation(tmp):
 
     def raising(_path, _name):
         raise OSError(errno.EINVAL, "PC_PATH_MAX unavailable")
+    # the host's own platform first, so the last patch applied is never the host's and
+    # a leaked sys.platform patch is visible on every host (R6-F3)
+    plans = sorted(FALLBACK_PLATFORMS, key=lambda entry: entry[0] == real_platform)
     try:
-        for plat, want in FALLBACK_PLATFORMS:
+        for plat, want in plans:
             for label, patch in (("raises", raising), ("answers 0", lambda _p, _n: 0),
                                  ("answers None", lambda _p, _n: None)):
                 os.pathconf, sys.platform = patch, plat
@@ -1063,6 +1066,25 @@ def path_max_fallback_violation(tmp):
     finally:
         os.pathconf, sys.platform = real_pathconf, real_platform
     return None
+
+
+def path_max_restore_violation(tmp):
+    """None when path_max_fallback_violation hands os.pathconf and sys.platform back
+    exactly as it found them, else a description (#6145 R6-F3). The patch list ends on
+    a platform that is not the host's, so a dropped restore is visible on Linux too."""
+    saved_pathconf, saved_platform = os.pathconf, sys.platform
+    try:
+        res = path_max_fallback_violation(tmp)
+    finally:
+        leaked = []
+        if os.pathconf is not saved_pathconf:
+            leaked.append("os.pathconf")
+        if sys.platform != saved_platform:
+            leaked.append(f"sys.platform ({sys.platform!r}, not {saved_platform!r})")
+        os.pathconf, sys.platform = saved_pathconf, saved_platform
+    if leaked:
+        return f"path_max_fallback_violation leaked a patched {', '.join(leaked)}"
+    return res
 
 
 def guarded_violation():
@@ -1122,6 +1144,49 @@ def deep_scratch_relative_violation(tmp):
     finally:
         shutil.rmtree(base, ignore_errors=True)
     return res
+
+
+def deep_scratch_cap_violation(tmp):
+    """None when deep_scratch_violation keeps every target inside [scratch base,
+    PATH_MAX-1] on a scratch dir 400 bytes under PATH_MAX (where the +600 target hits
+    the cap) and reports a named 'needs room' violation one byte-pair from the limit
+    (R6-F1, R6-F2), else a description (#6145)."""
+    limit = path_max(tmp)
+    cap = limit - 1
+    seen = []
+    real = globals()["deep_scratch"]
+
+    def spy(spy_tmp, target):
+        seen.append(target)
+        return real(spy_tmp, target)
+    base, deepest = deep_scratch(tmp, limit - 400)
+    start = len(os.fsencode(str(deepest)))
+    globals()["deep_scratch"] = spy
+    try:
+        res = deep_scratch_violation(deepest)
+    finally:
+        globals()["deep_scratch"] = real
+        shutil.rmtree(base, ignore_errors=True)
+    if res is not None:
+        return f"deep_scratch_violation failed on a scratch {limit - 400} bytes long: {res}"
+    targets = [t for t in seen if t != 10][:2]
+    if len(targets) != 2 or cap not in targets:
+        return f"the deep_scratch targets {seen!r} never reached the cap {cap}"
+    if any(t > cap or t < start for t in targets):
+        return f"the deep_scratch targets {targets!r} leave [{start}, {cap}]"
+    for room, want_room in ((limit - 24, True), (limit - 25, False)):
+        base, deepest = deep_scratch(tmp, room)
+        try:
+            res = deep_scratch_violation(deepest)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+        if want_room:
+            need = f"the scratch path is {room} bytes; deep_scratch needs room"
+            if res is None or not res.startswith(need):
+                return f"a {room}-byte scratch gave {res!r}, not a violation starting {need!r}"
+        elif res is not None:
+            return f"a {room}-byte scratch gave {res!r}, not None"
+    return None
 
 
 def shim_isolation_violation(tmp, interpreter=None):
@@ -1232,6 +1297,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
         return 2
     for tag, cell, cell_args in (("path-max-fallback", path_max_fallback_violation, (tmp,)),
+                                 ("path-max-restore", path_max_restore_violation, (tmp,)),
+                                 ("shim-deep-cap", deep_scratch_cap_violation, (tmp,)),
                                  ("guarded", guarded_violation, ()),
                                  ("shim-scratch-limit", scratch_limit_message_violation, (tmp,)),
                                  ("shim-deep-relative", deep_scratch_relative_violation, (tmp,))):
@@ -1835,7 +1902,10 @@ SELF_TEST_OK = (
     "is reported as a violation; (path-max-fallback, #6145) PATH_MAX falls back to 1024 on macOS/BSD and "
     "4096 elsewhere when os.pathconf fails; (guarded, #6145) a crashing cell becomes a named failure and "
     "KeyboardInterrupt propagates; (shim-scratch-limit, #6145) a too-deep scratch path is reported with its "
-    "length and the limit; (shim-deep-relative, #6145) the deep-scratch targets stay valid on a deep checkout."
+    "length and the limit; (shim-deep-relative, #6145) the deep-scratch targets stay valid on a deep checkout; "
+    "(shim-deep-cap, #6145) they stay inside [scratch, PATH_MAX-1] and a scratch within a byte pair of "
+    "PATH_MAX gets the 'needs room' message; (path-max-restore, #6145) os.pathconf and sys.platform are "
+    "restored."
 )
 
 
