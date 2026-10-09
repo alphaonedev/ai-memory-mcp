@@ -89,7 +89,7 @@ The canonical CI matrix is in
 | Class | OS | Architecture | Target triple | Status |
 |---|---|---|---|---|
 | Desktop | macOS | aarch64 (Apple Silicon) | `aarch64-apple-darwin` | Prebuilt binary on every release |
-| Desktop | macOS | x86_64 (Intel) | `x86_64-apple-darwin` | Prebuilt binary on every release |
+| Desktop | macOS | x86_64 (Intel) | `x86_64-apple-darwin` | Source build only; no prebuilt binary from v1.0.0 (#6287: GitHub's last Intel macOS runner retires Aug 2027) |
 | Desktop | Linux | x86_64 | `x86_64-unknown-linux-gnu` | Prebuilt binary on every release |
 | Desktop | Linux | aarch64 (server / Pi / Graviton) | `aarch64-unknown-linux-gnu` | Prebuilt binary on every release |
 | Phone | iOS | aarch64 device | `aarch64-apple-ios` | Build pipeline GREEN; linkable staticlib in `.xcframework.tar.gz`. FFI surface: single `ai_memory_version()` symbol shipped; broader C-ABI deferred to v1.x (#1977). |
