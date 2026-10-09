@@ -236,7 +236,9 @@ mod tests {
 
     #[test]
     fn fault_decision_is_continue_when_unset() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::remove_var(ENV_ABORT_AFTER_COMMIT) };
         assert_eq!(fault_decision_for(0), FaultDecision::Continue);
         assert_eq!(fault_decision_for(5), FaultDecision::Continue);
@@ -244,7 +246,9 @@ mod tests {
 
     #[test]
     fn fault_decision_targets_only_the_configured_index() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var(ENV_ABORT_AFTER_COMMIT, "3") };
         assert_eq!(fault_decision_for(0), FaultDecision::Continue);
         assert_eq!(fault_decision_for(2), FaultDecision::Continue);
@@ -255,7 +259,9 @@ mod tests {
 
     #[test]
     fn fault_decision_ignores_garbage() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var(ENV_ABORT_AFTER_COMMIT, "not-a-number") };
         assert_eq!(fault_decision_for(0), FaultDecision::Continue);
         unsafe { std::env::remove_var(ENV_ABORT_AFTER_COMMIT) };
@@ -267,7 +273,9 @@ mod tests {
     /// case runs in a child process in `tests/power_loss_durability.rs`).
     #[test]
     fn write_batch_acks_and_survives_reopen() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::remove_var(ENV_ABORT_AFTER_COMMIT) };
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let ns = "durability-unit";
