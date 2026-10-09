@@ -41,12 +41,25 @@ REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}")
 # A login is 1-39 characters; a GitHub App account carries exactly one "[bot]" suffix (#6259).
 LOGIN_RE = re.compile(r"[A-Za-z0-9-]{1,39}(?:\[bot\])?")
 ASSOC_RE = re.compile(r"[A-Z_]{1,32}")
-TOKEN_RE = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")
+TOKEN_RE = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,})")
 QUEUE_REF_RE = re.compile(r"refs/heads/gh-readonly-queue/.+/pr-([0-9]{1,9})-([^/]*)")
 
 
 class GateError(Exception):
     """The verdict cannot be established; the gate fails closed."""
+
+
+def workflow_error(message):
+    """One ``::error::`` workflow command whose data cannot start another command (#6243).
+
+    Tokens are redacted, other control characters are replaced, and ``%``, CR and LF are
+    percent-encoded exactly as the runner decodes workflow-command data.
+    """
+    text = TOKEN_RE.sub("[redacted]", str(message))
+    text = re.sub("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x85\u2028\u2029]", "?", text)
+    text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return "::error::" + text
+
 
 
 def parse_pages(raw):
@@ -144,11 +157,11 @@ def pr_verdict(pr, repo, operator, api):
     if operator_approved(reviews, operator, sha):
         return True, f"PR #{number}: APPROVED review by @{operator} found for head {sha} (pass)"
     return False, (
-        f"::error::External-PR operator-approval gate FAILED for PR #{number}. Authored by "
+        workflow_error(f"External-PR operator-approval gate FAILED for PR #{number}. Authored by "
         f"'{author}' ({assoc}) from '{full_name}'. Contributions from outside the team can only "
         f"merge after @{operator} has reviewed the exact head commit ({sha}) and submitted an "
         f"APPROVED review on it (docs/AI_DEVELOPER_GOVERNANCE.md). After approving, re-run this "
-        f"job. Any new push voids the approval.")
+        f"job. Any new push voids the approval."))
 
 
 def merge_group_pr_number(event):
@@ -208,8 +221,8 @@ def run_gate(event_name, event, repo, sha, operator, api):
             failed = failed or not passed
         return (1 if failed else 0), lines
     except GateError as exc:
-        lines.append(f"::error::External-PR operator-approval gate cannot establish its verdict "
-                     f"(event={event_name}): {exc}. Failing closed.")
+        lines.append(workflow_error(f"External-PR operator-approval gate cannot establish its verdict "
+                                    f"(event={event_name}): {exc}. Failing closed."))
         return 1, lines
 
 
@@ -282,7 +295,7 @@ def main():
             with open(path, encoding="utf-8") as fh:
                 event = json.load(fh)
         except (OSError, ValueError) as exc:
-            print(f"::error::cannot read the {event_name} event payload ({exc}); failing closed")
+            print(workflow_error(f"cannot read the {event_name} event payload ({exc}); failing closed"))
             return 1
     rc, lines = run_gate(event_name, event, os.environ.get("GITHUB_REPOSITORY", ""),
                          os.environ.get("GITHUB_SHA", ""),
