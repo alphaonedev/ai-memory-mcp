@@ -141,6 +141,13 @@ LONG_DIGITS = re.compile(r"\d{4}")
 # masks the whole value. A prose word may start with a capital (a table cell `The budget for one call`) or be an
 # acronym of 2-5 capitals (`CLI`, `HTTP`).
 PROSE_WORD = re.compile(r"(?:[A-Za-z][a-z]{0,11}|[A-Z]{2,5})" + TRAIL, re.ASCII)
+# #6209 round 4 (code F3): after the first word of a `name: value`, only an all-lower-case prose word keeps the value
+# shown (`max_tokens: 20000 per request`); a capitalised word or an acronym (`token: on QZXC`) is masked. PROSE_WORD
+# still judges a table cell or the line after a bare name (prose_cell), where a sentence may start with a capital.
+LOWER_PROSE_WORD = re.compile(r"[a-z]{1,12}" + TRAIL, re.ASCII)
+# #6209 round 4 (security F3): a value is a count only when it holds at most MAX_COUNT_DIGITS ASCII digits in total,
+# in at most one word; digit groups joined by `_`, `.` or spaces (`4111 1111 1111 1111`) are one longer number.
+MAX_COUNT_DIGITS = 9
 ALWAYS_MASK_NAME = re.compile(r"(?i)passw(?:or)?d|passphrase")
 # #6163 round 3 (review G2): the user name is optional (`redis://:<password>@host`).
 URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]*:([^@\s/]+)@")
@@ -299,32 +306,45 @@ def head_fetch_args(pr_number: str) -> tuple:
     return ("fetch", "--no-tags", "origin", f"+refs/pull/{pr_number}/head:refs/remotes/pull/head")
 
 
+def digit_count(text: str) -> int:
+    """The number of ASCII digits in `text`."""
+    return sum(1 for char in text if "0" <= char <= "9")
+
+
+def count_shaped(words: list) -> bool:
+    """#6209 round 4 (security F3): True when `words` hold at most MAX_COUNT_DIGITS ASCII digits in total, all in at
+    most one word, so a number split into groups is judged as one number."""
+    return (digit_count("".join(words)) <= MAX_COUNT_DIGITS
+            and sum(1 for word in words if digit_count(word)) <= 1)
+
+
 def plain_word(name: str, word: str) -> bool:
-    """#6163: True when `word`, the value of credential name `name`, is configuration (a count, a switch word, or an
-    environment variable name per ENV_NAME_VALUE) rather than a credential. A password or passphrase is never plain."""
+    """#6163: True when `word`, the value of credential name `name`, is configuration (a count of at most
+    MAX_COUNT_DIGITS digits, a switch word, or an environment variable name per ENV_NAME_VALUE) rather than a
+    credential. A password or passphrase is never plain."""
     if ALWAYS_MASK_NAME.search(name):
         return False
     if PLAIN_VALUE.fullmatch(word):
-        return True
+        return digit_count(word) <= MAX_COUNT_DIGITS
     return bool(ENV_NAME_VALUE.fullmatch(word)) and not LONG_DIGITS.search(word) and bool(
         ENV_NAME_KEY.search(name) or ENV_NAME_TAIL.search(word))
 
 
 def plain_text(name: str, value: str) -> bool:
-    """#6209: True when the unquoted `value` of credential name `name` is empty, or its first word is plain and every
-    later word is plain or a short prose word (PROSE_WORD)."""
+    """#6209: True when the unquoted `value` of credential name `name` is empty, or its first word is plain, every
+    later word is plain or a lower-case prose word (LOWER_PROSE_WORD), and the words are count_shaped."""
     words = value.split()
-    return not words or (plain_word(name, words[0]) and all(
-        plain_word(name, word) or PROSE_WORD.fullmatch(word) for word in words[1:]))
+    return not words or (plain_word(name, words[0]) and count_shaped(words) and all(
+        plain_word(name, word) or LOWER_PROSE_WORD.fullmatch(word) for word in words[1:]))
 
 
 def prose_cell(name: str, value: str) -> bool:
     """#6210 / #6211: True when `value`, a table cell after credential name `name` or the line after a bare `name:`, is
-    plain_text, or a description of two or more words that are all plain or prose words (PROSE_WORD) under a name that
-    is not a password or passphrase."""
+    plain_text, or a description of two or more words that are all plain or prose words (PROSE_WORD), count_shaped,
+    under a name that is not a password or passphrase."""
     words = value.split()
-    return plain_text(name, value) or (len(words) > 1 and not ALWAYS_MASK_NAME.search(name) and all(
-        plain_word(name, word) or PROSE_WORD.fullmatch(word) for word in words))
+    return plain_text(name, value) or (len(words) > 1 and not ALWAYS_MASK_NAME.search(name) and count_shaped(words)
+                                       and all(plain_word(name, word) or PROSE_WORD.fullmatch(word) for word in words))
 
 
 def mask_table_cells(line: str) -> tuple:
