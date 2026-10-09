@@ -725,13 +725,7 @@ fn handle_update_inner(
 /// historic error text.
 fn conflict_or_string(e: anyhow::Error) -> String {
     if let Some(vc) = e.downcast_ref::<VersionConflict>() {
-        json!({
-            "status": "conflict",
-            "id": vc.id,
-            "expected_version": vc.expected,
-            "current_version": vc.current,
-        })
-        .to_string()
+        vc.envelope().to_string()
     } else {
         // #3713 — anything that is not the typed conflict goes through the
         // ONE funnel: a typed `StorageError` / governance refusal keeps its

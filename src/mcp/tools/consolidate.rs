@@ -216,7 +216,14 @@ pub(super) fn handle_consolidate(
     // under AI_MEMORY_REQUIRE_WHY_TRACE=1 the merged metadata must carry a
     // why_trace (caller-supplied on a source, or inherited) or the write is
     // refused at the consolidate gate.
-    let new_id = match db::consolidate(
+    // #4286 (CWE-367) — the LLM summary was built from `sources` as the gate
+    // read them. A second process on the same database (CLI, another daemon)
+    // can edit a source while the model runs, so pin each source's `version`
+    // from that read: on a mismatch nothing is consumed and the caller gets a
+    // conflict to retry. A caller-supplied summary stays unpinned.
+    let expected_versions: Option<Vec<i64>> =
+        auto_generated.then(|| sources.iter().map(|mem| mem.version).collect());
+    let new_id = match db::consolidate_with_expected_versions(
         conn,
         &ids,
         title,
@@ -226,6 +233,7 @@ pub(super) fn handle_consolidate(
         crate::db::CONSOLIDATION_SOURCE,
         &consolidator_agent_id,
         false,
+        expected_versions.as_deref(),
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -238,6 +246,10 @@ pub(super) fn handle_consolidate(
                 ) {
                     crate::quotas::log_refund_op_failed(&consolidator_agent_id, &re);
                 }
+            }
+            // #4286 — the typed conflict envelope `memory_update` emits (#884).
+            if let Some(vc) = e.downcast_ref::<crate::storage::VersionConflict>() {
+                return Err(vc.envelope().to_string());
             }
             return Err(crate::mcp::error_text::mcp_foreign_err(
                 "handle_consolidate",

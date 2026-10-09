@@ -40,6 +40,12 @@ pub const ACTION_TYPE: &str = "action_type";
 pub const AGENT_FILTER: &str = "agent_filter";
 /// `agent_pubkey` — wire/row field name.
 pub const AGENT_PUBKEY: &str = "agent_pubkey";
+/// `current_version` — the stored row version in a `VersionConflict`
+/// envelope (#884 / #4286).
+pub const CURRENT_VERSION: &str = "current_version";
+/// `expected_version` — the caller-pinned row version in a
+/// `VersionConflict` envelope and the `memory_update` parameter (#884).
+pub const EXPECTED_VERSION: &str = "expected_version";
 /// `pubkey_bound_at` — RFC3339 stamp written next to [`AGENT_PUBKEY`] on
 /// every bind/rotate so key provenance is auditable. The two keys are a
 /// PAIR: they are written together by `bind_agent_pubkey`, stripped
