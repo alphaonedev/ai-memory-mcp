@@ -155,7 +155,9 @@ mod tests {
 
     #[test]
     fn enabled_flag_default_off_and_truthy_grammar() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::remove_var(ENV_ERASURE_COLD_TIER) };
         assert!(!erasure_cold_tier_enabled(), "default is OFF (opt-in)");
         for truthy in ["1", "true", "YES", " on "] {
@@ -171,7 +173,9 @@ mod tests {
 
     #[test]
     fn shard_count_knobs_fall_through_on_garbage() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::remove_var(ENV_ERASURE_DATA_SHARDS) };
         unsafe { std::env::remove_var(ENV_ERASURE_PARITY_SHARDS) };
         let p = resolve_erasure_params().unwrap();
