@@ -574,10 +574,10 @@ def erratum_lines(lines):
         if not inside and not html:
             m = FENCE_RE.match(line)
             if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
-                fence, starts = m.group(1), False
+                fence = m.group(1)
                 continue
             if line.strip() == MATH_FENCE:
-                fence, starts = MATH_FENCE, False
+                fence = MATH_FENCE
                 continue
             block = HTML_BLOCK_RE.match(line)
             if block:
@@ -674,7 +674,8 @@ def check(root):
             for name in sorted({n for v in views for n in lookalikes(v)}):
                 problems.append(
                     "%s:%d: look-alike script name `%s` (a non-ASCII letter or mark where a script"
-                    " name has an ASCII letter)" % (rel, lineno, name)
+                    " name has an ASCII letter%s)"
+                    % (rel, lineno, name, "; %s is a letter with a combining mark" % MARKED if MARKED in name else "")
                 )
             found = []
             for view in views:
