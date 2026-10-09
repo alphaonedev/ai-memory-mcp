@@ -603,6 +603,16 @@ def _self_test_cases() -> int:
          message="head change Rule-Change-Approved-By: Justin")
     case("an empty trailer value does not count", reword, True, "RESULT: FAIL",
          message="head change\n\nRule-Change-Approved-By: ")
+    case("a body line starting with the trailer key above a separate trailer block does not count (#6179)", reword,
+         True, "RESULT: FAIL",
+         message="head change\n\nThe guard documents the\nRule-Change-Approved-By: <who>. Fails closed on a missing"
+                 " guard.\n\nCo-Authored-By: Placeholder <noreply@example.invalid>")
+    case("a body line starting with the trailer key in a non-final paragraph does not count (#6179)", reword, True,
+         "RESULT: FAIL", message="head change\n\nRule-Change-Approved-By: Justin\n\nprose closes the body")
+    case("a trailer inside the final trailer block beside other trailers passes (#6179)", reword, False,
+         "approval trailer(s): ` Justin `",
+         message="head change\n\nbody prose\n\nRule-Change-Approved-By: Justin\n"
+                 "Co-Authored-By: Placeholder <noreply@example.invalid>")
 
     def filler(root):
         edit("section body x", "section body y")(root)
