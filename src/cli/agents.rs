@@ -1547,6 +1547,8 @@ mod tests {
             "escalated for signed approval (cli test)",
         )
         .expect("route escalation")
+        .pending_id()
+        .to_string()
     }
 
     /// #2991/#2355 — the CLI approve funnel enforces the R40 gate: an

@@ -898,6 +898,46 @@ pub mod signed {
             .unwrap_or(false)
     }
 
+    /// #4378 — how [`route_escalation_to_approval_gate`] routed an escalation.
+    /// Typed (ERRORS-09) so a merely-deferred queue write can never be
+    /// mistaken for a written row: only [`Self::Queued`] names a pending row
+    /// that EXISTS.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum EscalationRouting {
+        /// The `pending_actions` row was written on the routing connection.
+        Queued(String),
+        /// #4116 — the write was handed to the write transaction the calling
+        /// thread holds on the same database; the row lands on that
+        /// transaction's own connection when it ends — or not at all, which
+        /// the funnel that owns the transaction reports
+        /// (`WriteTxn::rollback_resolving`). The id is reserved, not written.
+        Deferred(String),
+    }
+
+    impl EscalationRouting {
+        /// The pending id this routing reserved (written only for `Queued`).
+        #[must_use]
+        pub fn pending_id(&self) -> &str {
+            match self {
+                Self::Queued(id) | Self::Deferred(id) => id,
+            }
+        }
+
+        /// The refusal text the escalate producer returns to the blocked
+        /// writer: the queued text (the row exists) or the distinguishable
+        /// deferred text (#4116 vote item 3), decided by the variant rather
+        /// than by a lookup that could go stale.
+        #[must_use]
+        pub fn refusal_text(&self, reason: &str) -> String {
+            match self {
+                Self::Queued(id) => crate::storage::escalation_deferral::queued_refusal_text(id, reason),
+                Self::Deferred(id) => {
+                    crate::storage::escalation_deferral::deferred_refusal_text(id, reason)
+                }
+            }
+        }
+    }
+
     /// Route a typed governance
     /// [`Decision::Escalate`](crate::governance::agent_action::Decision::Escalate)
     /// to the approval gate: queue a `pending_actions` row whose payload is
@@ -906,7 +946,10 @@ pub mod signed {
     ///
     /// The escalation `rule_id` + `reason` are folded into the pending payload
     /// so an operator inspecting the queue sees WHY the op was escalated.
-    /// Returns the new pending action id.
+    /// Returns the typed [`EscalationRouting`]: `Queued(id)` when the row was
+    /// written here, `Deferred(id)` when the write was handed to the open
+    /// write transaction on this thread (#4116) and the row does not exist
+    /// yet.
     ///
     /// # Errors
     ///
@@ -920,7 +963,7 @@ pub mod signed {
         payload: &serde_json::Value,
         rule_id: &str,
         reason: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<EscalationRouting> {
         // Fold the escalation provenance + the signed-approval requirement into
         // the pending payload. A non-object payload is wrapped so the metadata
         // keys always have an object to live on.
@@ -960,7 +1003,7 @@ pub mod signed {
             payload: enriched,
         };
         match crate::storage::escalation_deferral::defer_to_open_txn(conn.path(), intent) {
-            Ok(()) => Ok(pending_id),
+            Ok(()) => Ok(EscalationRouting::Deferred(pending_id)),
             Err(intent) => {
                 crate::storage::escalation_deferral::insert_pending_action_row(
                     conn,
@@ -971,7 +1014,7 @@ pub mod signed {
                     requested_by,
                     &intent.payload,
                 )?;
-                Ok(pending_id)
+                Ok(EscalationRouting::Queued(pending_id))
             }
         }
     }

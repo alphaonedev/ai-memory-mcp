@@ -197,6 +197,8 @@ fn seed_escalated_store_pending(db_path: &std::path::Path, ns: &str, content: &s
         "escalated for signed approval (test)",
     )
     .expect("route escalation")
+    .pending_id()
+    .to_string()
 }
 
 fn signed_http_request(uri: &str, pending_id: &str, body: &Value) -> Request<Body> {
@@ -407,7 +409,9 @@ fn mcp_funnel_enforces_gate() {
         "r",
         "escalated",
     )
-    .unwrap();
+    .unwrap()
+    .pending_id()
+    .to_string();
     let err = ai_memory::mcp::handle_pending_approve(
         &conn,
         &json!({ "id": pid, "agent_id": "ai:operator" }),

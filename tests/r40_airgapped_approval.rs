@@ -215,7 +215,9 @@ fn airgapped_escalation_to_signed_approval_end_to_end() {
         "L1-8-escalate",
         "escalated for human approval (airgapped)",
     )
-    .expect("route escalation");
+    .expect("route escalation")
+    .pending_id()
+    .to_string();
 
     // The pending action carries the signed-approval requirement.
     let pa = ai_memory::db::get_pending_action(&conn, &pending_id)

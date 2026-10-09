@@ -5429,17 +5429,24 @@ pub(crate) fn route_or_block_escalated_write(
         rule_id,
         reason,
     ) {
-        Ok(pending_id) => {
+        Ok(routing) => {
             tracing::info!(
                 "L1-6 governance pre-write escalated namespace={:?} rule_id={} reason={} — \
-                 routed signed-approval pending_id={} (now, or when the write txn ends: #4116)",
+                 routed signed-approval pending_id={} ({})",
                 mem.namespace,
                 rule_id,
                 reason,
-                pending_id
+                routing.pending_id(),
+                match routing {
+                    crate::approvals::signed::EscalationRouting::Queued(_) => "queued now",
+                    crate::approvals::signed::EscalationRouting::Deferred(_) => {
+                        "deferred to the open write txn: #4116"
+                    }
+                }
             );
-            // #4116 — deferred vs queued text (never a phantom id).
-            Err(crate::storage::escalation_deferral::escalation_refusal_text(&pending_id, reason))
+            // #4116 / #4378 — deferred vs queued text, decided by the TYPED
+            // outcome (never a phantom id).
+            Err(routing.refusal_text(reason))
         }
         Err(e) => {
             // Fail CLOSED if the pending could not be queued — never let an
