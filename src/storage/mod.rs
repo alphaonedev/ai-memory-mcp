@@ -33154,6 +33154,98 @@ mod tests {
         );
     }
 
+    /// #4419 — an approved pending replays the requester's write WITHOUT
+    /// re-checking the requester's CURRENT admission: a standard tightened
+    /// after the request was queued (`write: any` -> `write: owner`) still
+    /// lands the write on approve, although a fresh request by the same
+    /// principal is refused. The replay must re-run the requester's admission
+    /// (deciding only, never queueing a second pending) and refuse.
+    #[test]
+    fn approved_replay_rechecks_the_requesters_current_admission_4419() {
+        use crate::config::{
+            PermissionsMode, lock_permissions_mode_for_test,
+            override_active_permissions_mode_for_test,
+        };
+        use crate::models::GovernedAction;
+        let _gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+
+        let conn = test_db();
+        let ns = "gov4419/replay";
+        let mut standard = make_memory("std-4419", "_standards-4419", Tier::Long, 9);
+        standard.metadata =
+            serde_json::json!({"agent_id": "ai:owner", "governance": {"write": "any"}});
+        let sid = insert(&conn, &standard).unwrap();
+        set_namespace_standard(&conn, ns, &sid, None).unwrap();
+
+        let queue_approved = |title: &str| {
+            let mut m = make_memory(title, ns, Tier::Mid, 5);
+            m.metadata = serde_json::json!({"agent_id": "ai:req"});
+            let payload = serde_json::to_value(&m).unwrap();
+            let pid = queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                ns,
+                None,
+                "ai:req",
+                &payload,
+            )
+            .unwrap();
+            assert!(decide_pending_action(&conn, &pid, true, "ai:owner").unwrap());
+            pid
+        };
+        let stale = queue_approved("stale-replay-4419");
+        let fresh = queue_approved("fresh-replay-4419");
+
+        // Control: still admitted while the standard says `write: any`.
+        execute_pending_action(&conn, &fresh).expect("admitted replay lands");
+        let count = |title: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND title = ?2",
+                params![ns, title],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("fresh-replay-4419"), 1);
+
+        // Tighten the standard AFTER the request was queued and approved.
+        let tightened =
+            serde_json::json!({"agent_id": "ai:owner", "governance": {"write": "owner"}});
+        update(
+            &conn,
+            &sid,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&tightened),
+        )
+        .unwrap();
+        let err = execute_pending_action(&conn, &stale)
+            .expect_err("a requester no longer admitted must be refused at replay");
+        assert!(
+            format!("{err:#}").contains("no longer admitted"),
+            "got: {err:#}"
+        );
+        assert_eq!(count("stale-replay-4419"), 0, "the stale replay must not land");
+        // Deciding only: the refused replay queued no second pending.
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_actions WHERE status = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0, "a refused replay never queues a second pending");
+
+        override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    }
+
     /// #3202 Fable HIGH — a STORE-class destination Approve on vertical
     /// promote must clone via `promote_to_namespace`, not
     /// `from_value::<Memory>` the `{id, to_namespace, mode:"vertical"}`
