@@ -106,6 +106,7 @@ Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
 
 import argparse
 import contextlib
+import datetime
 import io
 import os
 import re
@@ -157,18 +158,46 @@ EXPIRY_SENTENCE = (
 )
 
 
-# #6124 (5-agent vote 4d3ea1c5, T3): while the banner is EXPIRED/VOID at both
-# ends, a NEW dated amendment below STATUS that lists exactly the changed
-# watched paths / AI_MEMORY_FED_* identifiers and cites #6063 is a recorded,
-# non-discharging pass. Only a WP-B1 re-cert (#6063) returns the doc to LIVE.
+# #6124 (5-agent vote 4d3ea1c5, T3; decision memory 05c39563): while the
+# banner is EXPIRED/VOID at both ends, exactly ONE new dated amendment below
+# STATUS that lists exactly the changed watched paths / AI_MEMORY_FED_*
+# identifiers and cites only #6063 is a recorded, non-discharging pass, and
+# every amendment already present stays byte-identical (append-only ledger).
+# Only a WP-B1 re-cert (#6063) returns the doc to LIVE.
+#
+# Any `**Amendment` record opens a ledger entry, whatever its shape (13 of the
+# 17 historical ones carry body text on the header line).
+AMENDMENT_LEDGER_RE = re.compile(r"^>?[ \t]*\*\*Amendment\b")
+# The NEW entry's header stands alone on its line (nothing after the closing
+# `**`), inside a blockquote, at most 4 columns after `>` (more is an indented
+# code block in CommonMark). Group 1 is the ISO date.
 AMENDMENT_HEAD_RE = re.compile(
-    r"^>" + _S + r"*\*\*Amendment \(\d{4}-\d{2}-\d{2}\b.*\*\*" + _S + r"*$"
+    r"^>[ ]{0,4}\*\*Amendment \((\d{4}-\d{2}-\d{2})\b(?:(?!\*\*).)*\*\*[ \t\r]*$"
 )
-AMENDMENT_ITEM_RE = re.compile(r"^>" + _S + r"*[-*]" + _S + r"+`([^`\n]+)`" + _S + r"*$")
-AMENDMENT_BACK_RE = re.compile(r"^>" + _S + r"*Path back to LIVE:")
-FENCE_RE = re.compile(r"^>?" + _S + r"*(?:```|~~~)")
-ISSUE_REF_RE = re.compile(r"#\d+")
+AMENDMENT_ITEM_RE = re.compile(r"^>[ ]{0,4}[-*][ \t]+`([^`\n]+)`[ \t\r]*$")
+AMENDMENT_BACK_RE = re.compile(r"^>[ ]{0,4}Path back to LIVE:")
+# CommonMark fence opener: optional `>`, then a run of >= 3 backticks or
+# tildes; a backtick fence's info string carries no backtick. Indentation is
+# deliberately NOT capped here: reading an indented code line as a fence only
+# hides more text from the ledger, which can only make the gate stricter.
+FENCE_OPEN_RE = re.compile(r"^(>?)[ \t]*(`{3,}|~{3,})(.*)$")
+QUOTED_BLANK_RE = re.compile(r"^>[ \t\r]*$")
+BLANK_RE = re.compile(r"^[ \t\r]*$")
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->")
+# Every issue / pull number and every link target on a `Path back to LIVE:`
+# line: `#N`, `/issues/N`, `/pull/N`; inline link targets, autolinks, bare
+# URLs, `www.` autolinks. A reference-style link (`][`) is refused outright.
+BACK_ISSUE_RE = re.compile(r"#(\d+)|/(?:issues|pull)/(\d+)")
+BACK_TARGET_RE = re.compile(
+    r"\]\(\s*<?([^)\s>]*)|<([A-Za-z][A-Za-z0-9+.-]*:[^<>\s]*)>"
+    r"|((?:[A-Za-z][A-Za-z0-9+.-]*://|www\.)[^\s()<>\]]+)"
+)
 RE_CERT_ISSUE = "#6063"
+RE_CERT_URL = "https://github.com/alphaonedev/ai-memory-mcp/issues/6063"
+REGULAR_DOC_MODES = ("100644", "100755")
+# Cap on the cert doc the amendment ledger reads whole (#6124; #6140 applies
+# the same cap to the banner reader).
+CERT_DOC_MAX_BYTES = 2 * 1024 * 1024
 
 
 class GateError(Exception):
@@ -337,77 +366,280 @@ def fmt_banner(banner):
     return f"{banner[0]} {banner[1]}"
 
 
-def amendment_blocks(repo, tree):
-    """Amendment blocks of the cert doc at TREE that sit BELOW the STATUS line
-    and outside any code fence (#6124). A block starts at a single-line bold
-    `> **Amendment (YYYY-MM-DD, ...)**` header and runs over the following
-    `>` lines. Returns a list of dicts: header, items (exact backticked
-    bullet entries), back_ok (a `Path back to LIVE:` line that cites #6063
-    and no other issue)."""
-    proc = run_git(repo, "show", "--end-of-options", f"{tree}:{CERT_DOC}")
+def _doc_safe(text):
+    """TEXT as shown in gate output: as-is when every character is printable,
+    else its escaped `ascii()` form, so a name the change or the doc controls
+    cannot inject control characters into the log (#6124; the #6140 rebase
+    replaces this with the shared `log_safe`, #6175)."""
+    text = str(text)
+    return text if text.isprintable() else ascii(text)
+
+
+def read_cert_doc(repo, tree):
+    """Text of the cert doc at TREE for the amendment ledger (#6124). Read
+    from the object database only. Fail-closed (GateError) when the entry is
+    absent, is not a regular file (a symlink is never followed), exceeds
+    CERT_DOC_MAX_BYTES, or git cannot read it: an unreadable ledger is never
+    taken as an empty one."""
+    proc = run_git(repo, "ls-tree", "-z", "--full-tree", "--end-of-options", tree, CERT_DOC)
     if proc.returncode != 0:
-        return []
-    lines = proc.stdout.decode("utf-8", "replace").split("\n")
-    blocks = []
+        err = _doc_safe(proc.stderr.decode("utf-8", "replace").strip())
+        raise GateError(f"git ls-tree {tree} {CERT_DOC} exited {proc.returncode}: {err}")
+    entry = None
+    for rec in proc.stdout.split(b"\0"):
+        meta, sep, name = rec.partition(b"\t")
+        if sep and name.decode("utf-8", "replace") == CERT_DOC:
+            entry = meta.decode("ascii", "replace").split(" ")
+    if entry is None:
+        raise GateError(f"{CERT_DOC} is absent at {tree}; the amendment ledger cannot be read")
+    if len(entry) != 3 or entry[1] != "blob" or entry[0] not in REGULAR_DOC_MODES:
+        raise GateError(
+            f"{CERT_DOC} at {tree} is a symlink or other non-regular entry "
+            f"({_doc_safe(' '.join(entry))}); the amendment ledger is not read from it"
+        )
+    oid = entry[2]
+    size = git_text(repo, "cat-file", "-s", "--end-of-options", oid)
+    if not size.isdigit() or int(size) > CERT_DOC_MAX_BYTES:
+        raise GateError(
+            f"{CERT_DOC} at {tree} is {_doc_safe(size)} bytes, above the "
+            f"{CERT_DOC_MAX_BYTES}-byte cap of the amendment ledger reader"
+        )
+    proc = run_git(repo, "cat-file", "blob", "--end-of-options", oid)
+    if proc.returncode != 0:
+        err = _doc_safe(proc.stderr.decode("utf-8", "replace").strip())
+        raise GateError(f"git cat-file blob {oid} ({CERT_DOC}) exited {proc.returncode}: {err}")
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def _fence_opener(ln):
+    """(quoted, char, run length) when LN opens a CommonMark code fence."""
+    m = FENCE_OPEN_RE.match(ln)
+    if not m or (m.group(2)[0] == "`" and "`" in m.group(3)):
+        return None
+    return (m.group(1) == ">", m.group(2)[0], len(m.group(2)))
+
+
+def _fence_closes(ln, fence):
+    """True iff LN closes FENCE: same container, at most 3 columns of
+    indentation, the same character, a run at least as long, nothing after."""
+    quoted, char, run = fence
+    prefix = r"^> ?[ ]{0,3}" if quoted else r"^[ ]{0,3}"
+    return re.match(prefix + re.escape(char) + "{%d,}[ \\t\\r]*$" % run, ln) is not None
+
+
+def _ledger_plain(ln):
+    """True iff LN can continue a new amendment's paragraph: a non-blank quoted
+    line that opens no fence, no HTML comment and no other record."""
+    return (
+        ln.startswith(">")
+        and not QUOTED_BLANK_RE.match(ln)
+        and "<!--" not in ln
+        and "-->" not in ln
+        and _fence_opener(ln) is None
+        and not AMENDMENT_LEDGER_RE.match(ln)
+        and not STATUS_LINE_RE.match(ln)
+    )
+
+
+def parse_ledger(lines):
+    """The amendment ledger of the cert doc LINES (#6124): one entry per
+    `**Amendment` record outside code fences (CommonMark: a fence closes only
+    on the same character with a run at least as long) and outside HTML
+    comments. An entry runs from its header over the following lines of the
+    same container (quoted lines for a quoted header) until the next record,
+    the STATUS line, or the container ends; trailing blank lines are dropped.
+    Returns dicts: start (line index), header, quoted, below_status, raw."""
+    entries = []
     cur = None
-    in_fence = False
+    fence = None
+    in_comment = False
     seen_status = False
-    for ln in lines:
-        if FENCE_RE.match(ln):
-            in_fence = not in_fence
-            if not ln.startswith(">"):
-                cur = None
+    for idx, ln in enumerate(lines):
+        quoted = ln.startswith(">")
+        if cur is not None and (quoted != cur["quoted"] or (not quoted and BLANK_RE.match(ln))):
+            cur = None
+        if fence is not None:
+            if fence[0] and not quoted:
+                fence = None  # the blockquote ended, and its fence with it
+            else:
+                if _fence_closes(ln, fence):
+                    fence = None
+                if cur is not None:
+                    cur["raw"].append(ln)
+                continue
+        if in_comment:
+            if cur is not None:
+                cur["raw"].append(ln)
+            if "-->" in ln:
+                in_comment = False
             continue
-        if in_fence:
+        if "<!--" in ln:
+            in_comment = "<!--" in HTML_COMMENT_RE.sub("", ln)
+            if cur is not None:
+                cur["raw"].append(ln)
+            continue
+        opener = _fence_opener(ln)
+        if opener is not None:
+            fence = opener
+            if cur is not None:
+                cur["raw"].append(ln)
             continue
         if STATUS_LINE_RE.match(ln):
             seen_status = True
             cur = None
             continue
-        if not ln.startswith(">"):
-            cur = None
+        if AMENDMENT_LEDGER_RE.match(ln):
+            cur = {"start": idx, "header": ln, "quoted": quoted,
+                   "below_status": seen_status, "raw": [ln]}
+            entries.append(cur)
             continue
-        if AMENDMENT_HEAD_RE.match(ln):
-            cur = None
-            if seen_status:
-                cur = {"header": ln.strip(), "items": [], "back_ok": False}
-                blocks.append(cur)
-            continue
-        if cur is None:
-            continue
-        item = AMENDMENT_ITEM_RE.match(ln)
-        if item:
-            cur["items"].append(item.group(1))
-        elif AMENDMENT_BACK_RE.match(ln):
-            refs = ISSUE_REF_RE.findall(ln)
-            if refs and all(r == RE_CERT_ISSUE for r in refs):
-                cur["back_ok"] = True
-    return blocks
+        if cur is not None:
+            cur["raw"].append(ln)
+    for ent in entries:
+        while len(ent["raw"]) > 1 and (QUOTED_BLANK_RE.match(ent["raw"][-1])
+                                       or BLANK_RE.match(ent["raw"][-1])):
+            ent["raw"].pop()
+    return entries
+
+
+def amendment_blocks(repo, tree):
+    """The amendment ledger of the cert doc at TREE (fail-closed read)."""
+    return parse_ledger(read_cert_doc(repo, tree).split("\n"))
+
+
+def _ledger_key(entries):
+    return [(e["header"], tuple(e["raw"]), e["below_status"]) for e in entries]
+
+
+def _back_problems(back_lines):
+    """Why the `Path back to LIVE:` lines do not cite exactly #6063 by its
+    issue URL ([] when they do)."""
+    if not back_lines:
+        return [f"no 'Path back to LIVE:' line citing {RE_CERT_ISSUE}"]
+    nums = set()
+    targets = []
+    ref_link = False
+    for ln in back_lines:
+        nums.update(a or b for a, b in BACK_ISSUE_RE.findall(ln))
+        targets.extend((a or b or c).rstrip(".,;:") for a, b, c in BACK_TARGET_RE.findall(ln))
+        ref_link = ref_link or "][" in ln
+    why = []
+    others = sorted(n for n in nums if "#" + n != RE_CERT_ISSUE)
+    if others:
+        why.append("'Path back to LIVE:' cites another issue or pull request: "
+                   + ", ".join(_doc_safe(n) for n in others))
+    stray = sorted({t for t in targets if t != RE_CERT_URL})
+    if stray or ref_link:
+        why.append("'Path back to LIVE:' links somewhere other than " + RE_CERT_URL
+                   + (": " + ", ".join(_doc_safe(t) for t in stray) if stray else ""))
+    if RE_CERT_URL not in targets:
+        why.append(f"'Path back to LIVE:' does not link {RE_CERT_ISSUE} as "
+                   f"[{RE_CERT_ISSUE}]({RE_CERT_URL})")
+    return why
+
+
+def _commit_day(repo, sha):
+    text = git_text(repo, "show", "-s", "--format=%cs", "--end-of-options", sha)
+    try:
+        return datetime.date.fromisoformat(text)
+    except ValueError as exc:
+        raise GateError(f"committer date of {sha} is unreadable: {_doc_safe(text)}") from exc
 
 
 def amendment_verdict(repo, mb, judged, required):
-    """(ok, why) for the #6124 pass path: some amendment block at JUDGED whose
-    header is absent from MB lists exactly the REQUIRED set and cites #6063."""
-    old_headers = {b["header"] for b in amendment_blocks(repo, mb)}
-    fresh = [b for b in amendment_blocks(repo, judged) if b["header"] not in old_headers]
+    """(ok, why) for the #6124 pass path. The ledger at JUDGED must be the
+    ledger at MB plus exactly ONE new entry (every existing entry
+    byte-identical and in order), and that entry must be below STATUS, open
+    its own paragraph with its header alone on its line, carry a valid ISO
+    date not after the judged commit's date or today, list exactly REQUIRED,
+    and cite only #6063 by its issue URL. Doc read failures raise GateError."""
+    old_lines = read_cert_doc(repo, mb).split("\n")
+    new_lines = read_cert_doc(repo, judged).split("\n")
+    old = parse_ledger(old_lines)
+    new = parse_ledger(new_lines)
+    old_heads = {e["header"].rstrip("\r") for e in old}
+    fresh = [e for e in new if e["header"].rstrip("\r") not in old_heads]
     if not fresh:
-        return False, "no NEW dated amendment below STATUS was added in this change"
+        return False, ("no NEW amendment record was added below STATUS (a header that "
+                       "already exists in the document is not a new record)")
+    if len(fresh) > 1:
+        lines = ", ".join(str(e["start"] + 1) for e in fresh)
+        return False, (f"exactly one new amendment per change is accepted; this change adds "
+                       f"{len(fresh)} (lines {lines})")
+    ent = fresh[0]
+    at = f"the new amendment at line {ent['start'] + 1}"
+    start = ent["start"]
+    end = start + 1
+    while end < len(new_lines) and _ledger_plain(new_lines[end]):
+        end += 1
+    para = new_lines[start + 1:end]
+    prev = new_lines[start - 1] if start > 0 else ""
     why = []
-    for blk in fresh:
-        listed = set(blk["items"])
-        missing = sorted(required - listed)
-        extra = sorted(listed - required)
-        if len(listed) != len(blk["items"]):
-            why.append(f"{blk['header']}: an entry is listed more than once")
-        if missing:
-            why.append(f"{blk['header']}: not listed: {', '.join(missing)}")
-        if extra:
-            why.append(f"{blk['header']}: listed but not changed: {', '.join(extra)}")
-        if not blk["back_ok"]:
-            why.append(f"{blk['header']}: no 'Path back to LIVE:' line citing only {RE_CERT_ISSUE}")
-        if not missing and not extra and blk["back_ok"] and len(listed) == len(blk["items"]):
-            return True, blk["header"]
-    return False, "; ".join(why)
+    # Append-only: drop the new entry (and the one blank '>' line separating
+    # it) and the rest of the ledger must be the merge-base ledger, unchanged.
+    drop = set(range(start, end))
+    if start > 0 and QUOTED_BLANK_RE.match(prev):
+        drop.add(start - 1)
+    elif end < len(new_lines) and QUOTED_BLANK_RE.match(new_lines[end]):
+        drop.add(end)
+    rest = [ln for i, ln in enumerate(new_lines) if i not in drop]
+    if _ledger_key(parse_ledger(rest)) != _ledger_key(old):
+        why.append("an existing amendment record was removed, edited, re-dated, moved or "
+                   "reordered; the ledger is append-only, so every record present at the "
+                   "merge-base must stay byte-identical and in order, and the new one must "
+                   "be its own paragraph (a blank '>' line before and after it)")
+    if not ent["below_status"]:
+        why.append(f"{at} is above the STATUS line")
+    head = AMENDMENT_HEAD_RE.match(ent["header"])
+    if not head:
+        why.append(f"{at}: its header must stand alone on its line, inside the blockquote, "
+                   "shaped '> **Amendment (YYYY-MM-DD, ...).**' with nothing after the "
+                   "closing '**'")
+    else:
+        try:
+            day = datetime.date.fromisoformat(head.group(1))
+        except ValueError:
+            why.append(f"{at}: {head.group(1)} is not a valid ISO date")
+        else:
+            today = datetime.datetime.now(datetime.timezone.utc).date()
+            latest = min(_commit_day(repo, judged), today) + datetime.timedelta(days=1)
+            if day > latest:
+                why.append(f"{at}: {head.group(1)} is in the future (after {latest})")
+    if not (BLANK_RE.match(prev) or QUOTED_BLANK_RE.match(prev)):
+        why.append(f"{at}: its header must open its own paragraph (a blank line or a blank "
+                   "'>' line before it)")
+    items = [m.group(1) for m in (AMENDMENT_ITEM_RE.match(ln) for ln in para) if m]
+    listed = set(items)
+    missing = sorted(required - listed)
+    extra = sorted(listed - required)
+    if len(listed) != len(items):
+        why.append(f"{at}: an entry is listed more than once")
+    if missing:
+        why.append(f"{at}: not listed: {', '.join(_doc_safe(m) for m in missing)}")
+    if extra:
+        why.append(f"{at}: listed but not changed: {', '.join(_doc_safe(x) for x in extra)}")
+    why.extend(f"{at}: {w}" for w in _back_problems(
+        [ln for ln in para if AMENDMENT_BACK_RE.match(ln)]))
+    if why:
+        return False, "; ".join(why)
+    return True, f"line {ent['start'] + 1}"
+
+
+def amendment_remedy(status, required):
+    """The remedy for a watched change while the banner is EXPIRED/VOID: the
+    #6124 amendment record, spelled out, never a bare re-issue (#3899)."""
+    lines = [
+        f"Remedy: the certification is {status}, so its banner may move only through the "
+        f"WP-B1 re-measurement and re-issue ({RE_CERT_ISSUE}); re-binding without "
+        "re-measurement is forbidden (#3899). Record this change instead (#6124): add ONE "
+        f"new amendment below STATUS in {CERT_DOC}, as its own paragraph (a blank '>' line "
+        "before and after it), shaped exactly as below, and leave every existing amendment "
+        "byte-identical:",
+        "  > **Amendment (YYYY-MM-DD, #<issue> - section 7 record, non-discharging).**",
+    ]
+    lines.extend(f"  > - `{_doc_safe(r)}`" for r in sorted(required))
+    lines.append(f"  > Path back to LIVE: WP-B1 re-cert ([{RE_CERT_ISSUE}]({RE_CERT_URL})) only.")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -613,13 +845,9 @@ def _judge(repo, base, head, judged, mb, tip):
         return ok, "\n".join([head_line] + more)
 
     amend_why = ""
-    if (
-        incidental
-        and not deleted
-        and not malformed
-        and banner_mb[0] in ("EXPIRED", "VOID")
-        and banner_head[0] in ("EXPIRED", "VOID")
-    ):
+    # `incidental` means the banner is identical at both ends, so checking the
+    # merge-base STATUS alone also pins the judged one.
+    if incidental and not deleted and not malformed and banner_mb[0] in ("EXPIRED", "VOID"):
         amend_ok, amend_why = amendment_verdict(
             repo, mb, judged, set(watched) | set(added) | set(removed)
         )
@@ -646,9 +874,12 @@ def _judge(repo, base, head, judged, mb, tip):
     if amend_why:
         out.append(
             f"The certification is {banner_head[0]}; a non-discharging amendment is "
-            f"accepted only when it is new, below STATUS, outside code fences, lists "
-            f"exactly the changed watched paths and AI_MEMORY_FED_* identifiers, and "
-            f"cites {RE_CERT_ISSUE} (#6124). Not satisfied: {amend_why}."
+            "accepted only as exactly ONE new record below STATUS (header alone on its "
+            "line, opening its own paragraph, outside code fences and HTML comments, a "
+            "valid ISO date not in the future) that lists exactly the changed watched "
+            "paths and AI_MEMORY_FED_* identifiers and cites only "
+            f"{RE_CERT_ISSUE} by its issue URL, with every existing amendment left "
+            f"byte-identical (#6124). Not satisfied: {amend_why}."
         )
     if deleted:
         out.append(
@@ -679,10 +910,14 @@ def _judge(repo, base, head, judged, mb, tip):
         out.extend("  + " + a for a in added)
         out.extend("  - " + r for r in removed)
     out.append("")
-    out.append(
-        f"Remedy: modify {CERT_DOC} in this same change (re-issue against the "
-        "new SHA, or record the voiding)."
-    )
+    status_mb = banner_mb[0] if cert_touched else cert_banner(repo, mb)[0]
+    if status_mb in ("EXPIRED", "VOID") and not deleted and not malformed:
+        out.extend(amendment_remedy(status_mb, set(watched) | set(added) | set(removed)))
+    else:
+        out.append(
+            f"Remedy: modify {CERT_DOC} in this same change (re-issue against the "
+            "new SHA, or record the voiding)."
+        )
     return False, "\n".join(out)
 
 
@@ -1825,11 +2060,15 @@ SELF_TEST_OK = (
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
     "octopus merge RED; (ci1-ci7, #5970) the event payload range is authoritative under "
     "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
-    "outside CI; (6124-h1..h3, f8b, #6124) EXPIRED/VOID at both ends plus a NEW amendment "
-    "below STATUS listing exactly the changed watched paths and identifiers and citing "
-    "#6063 GREEN; (6124-f1..f11) missing, extra, substring, prose-only, pre-existing, LIVE "
-    "at either end, fenced, unlisted-identifier, above-STATUS, uncited, other-issue and "
-    "outside-the-block amendments RED."
+    "outside CI; (6124-h1..h4, #6124) EXPIRED/VOID at both ends plus exactly ONE new "
+    "amendment below STATUS listing exactly the changed watched paths and identifiers and "
+    "citing only #6063 by its issue URL GREEN; (6124-f1..f15b) missing, extra, substring, "
+    "prose-only, reused, re-dated, split, deleted or edited prior records, LIVE at the "
+    "merge-base, EXPIRED flipped to a stale LIVE (rule C), fenced (CommonMark), "
+    "HTML-commented, indented-code, unlisted-identifier, above-STATUS, mid-paragraph, "
+    "uncited, other-issue, bare-URL, foreign-link, URL-less, later-paragraph, two new "
+    "records and invalid or future dates RED; an unreadable, symlinked or oversized cert "
+    "doc fail-closed; the EXPIRED remedy names the amendment record and #3899."
 )
 
 
