@@ -5068,6 +5068,17 @@ pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
         Ok(changed) => {
             if let Some(txn) = write_txn {
                 txn.commit()?;
+                // #4365 — `tombstone_and_erase` erased the same-id archive
+                // snapshot (journaled) inside the tx; its cold-tier bundle goes
+                // AFTER our commit. When the CALLER owns the tx we cannot see
+                // its commit: the journaled survivor is hard-reaped by the
+                // gc-tick reconciler instead (never quarantined).
+                if changed {
+                    crate::erasure::archive_sync::remove_bundles_best_effort(
+                        conn,
+                        std::slice::from_ref(&id.to_string()),
+                    );
+                }
             }
             Ok(changed)
         }
@@ -6339,6 +6350,13 @@ fn forget_unstamped_victim_count(
 /// fingerprint would re-leak the erased row). The Ed25519 SIGNATURE column is
 /// populated by the federation EMIT path (slice 3c); the local resurrection
 /// guard is existence-based, so a locally-written tombstone needs no signature.
+///
+/// #4365 — when `archive` is `false` (a HARD forget) every victim's same-id
+/// `archived_memories` snapshot is erased too (see
+/// [`erase_same_id_archive_snapshot`]) and the victim ids are RETURNED so the
+/// caller can remove their cold-tier bundles after its commit. When `archive`
+/// is `true` the forget wrote its own recoverable archive row for each victim
+/// and must keep it, so nothing is erased and the vector is empty.
 fn purge_and_tombstone_forget(
     conn: &Connection,
     namespace: Option<&str>,
@@ -6347,7 +6365,8 @@ fn purge_and_tombstone_forget(
     caller: Option<&str>,
     now: &str,
     mode: crate::identity::owner_stamp::UnstampedMutationMode,
-) -> Result<()> {
+    archive: bool,
+) -> Result<Vec<String>> {
     let tier_str = tier.map(|t| t.as_str().to_string());
     let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     let victims = if let Some(pat) = pattern {
@@ -6455,12 +6474,22 @@ fn purge_and_tombstone_forget(
         // for the erased content. Runs on the live row BEFORE the forget
         // DELETE; if a future soft-forget keeps the row, the invariant
         // still holds on the surviving row. The production forget then
-        // hard-deletes the whole row (`memories` cascade), and the archive
-        // copy carries no cid columns — so no genesis pre-image survives a
-        // forget by ANY path.
+        // hard-deletes the whole row (`memories` cascade). NB (#4365): since
+        // #2385 the archive copy DOES carry the cid columns, so a same-id
+        // snapshot taken while the row was live would keep the pre-image —
+        // the hard forget erases that snapshot below; the soft forget's own
+        // archive row is the recoverable copy and keeps it by design.
         forget_scrub_cid_genesis(conn, id)?;
+        // #4365 — a HARD forget leaves no same-id snapshot of the earlier text.
+        if !archive {
+            erase_same_id_archive_snapshot(conn, id)?;
+        }
     }
-    Ok(())
+    Ok(if archive {
+        Vec::new()
+    } else {
+        victims_detail.into_iter().map(|(id, _, _)| id).collect()
+    })
 }
 
 /// v0.8.1 W2.3 (#1821 / gap G30) — the canonical signable bytes for a FORGET
@@ -7010,6 +7039,47 @@ fn tombstone_and_erase(
     // content-hash oracle intact AFTER the "crypto-erase".
     conn.execute(SQL_DELETE_DLQ_BY_MEMORY_ID, params![id])?;
     conn.execute(SQL_DELETE_DEDUP_BY_MEMORY_ID, params![id])?;
+    // #4365 — the same-id archive SNAPSHOT is remanence too (see the helper).
+    erase_same_id_archive_snapshot(conn, id)?;
+    Ok(())
+}
+
+/// #4365 (WP-ERASURE #6048) — erase the same-id `archived_memories` row of a
+/// memory that is being HARD-erased, inside the caller's transaction.
+///
+/// `archived_memories` is keyed by `id` alone and doubles as a per-id
+/// SNAPSHOT slot for a STILL-LIVE row: the #1725 `in_place_edit` pre-edit
+/// copy and the #1773 / #4206 `federation_merge` pre-merge copy are both
+/// written while the row keeps living. Every hard-erase funnel — [`delete`]
+/// (the `--hard` path and the trait `delete`), the `archive = false`
+/// [`forget`] / [`forget_for_caller`], and the non-archiving [`gc`] /
+/// [`size_gc`] eviction — removed only the live `memories` row, so a prior
+/// version of the text stayed at rest under the same id (with its
+/// `cid_genesis` pre-image, which #2385 carries into the archive) and
+/// `archive restore <id>` brought it back LIVE after a signed FORGET
+/// tombstone had been written. That is the #2313 class (pg hard forget
+/// leaked into `archived_memory_links`) on the archive table itself.
+///
+/// Routed through the erasure cold tier's write-ahead purge-intent journal
+/// FIRST (a no-op without a bundle directory), so a crash between this
+/// `DELETE` and the caller's post-commit `remove_bundles_best_effort` leaves
+/// a JOURNALED orphan the gc-tick reconciler hard-reaps — never an
+/// un-journaled one it would QUARANTINE (preserve). The caller removes the
+/// bundle AFTER its commit, the `purge_archive_matching` order.
+///
+/// Deliberately NOT called by any archiving (recoverable MOVE) path: a soft
+/// forget / archiving gc writes its OWN archive row and must keep it.
+///
+/// # Errors
+///
+/// Propagates the journal write (fail-closed before the row is touched) or
+/// the `DELETE`.
+fn erase_same_id_archive_snapshot(conn: &Connection, id: &str) -> Result<()> {
+    crate::erasure::archive_sync::journal_purge_intent(
+        conn,
+        std::slice::from_ref(&id.to_string()),
+    )?;
+    conn.execute(SQL_DELETE_ARCHIVED_BY_ID, params![id])?;
     Ok(())
 }
 
@@ -7041,7 +7111,7 @@ pub fn forget(
     // the whole transaction, so no concurrent writer can change the match set
     // between the archive and the delete.
     let write_txn = connection::WriteTxn::begin(conn)?;
-    let result = (|| -> Result<usize> {
+    let result = (|| -> Result<(usize, Vec<String>)> {
         if archive {
             // Archive matching memories before deletion.
             let now = Utc::now().to_rfc3339();
@@ -7187,8 +7257,10 @@ pub fn forget(
         //    (no FK / no cascade) → a confirm-by-hash oracle for forgotten
         //    content.
         // (5-agent vote 4d3ea1c5 — erasure-completeness finding.) Also records
-        // the W2.3 FORGET tombstone for each victim id in this same tx.
-        purge_and_tombstone_forget(
+        // the W2.3 FORGET tombstone for each victim id in this same tx, and
+        // (#4365) on a HARD forget erases each victim's same-id archive
+        // snapshot, returning the ids for the post-commit bundle removal.
+        let hard_erased = purge_and_tombstone_forget(
             conn,
             namespace,
             pattern,
@@ -7197,6 +7269,7 @@ pub fn forget(
             &Utc::now().to_rfc3339(),
             // No caller → no owner clause; the posture is irrelevant.
             crate::identity::owner_stamp::UnstampedMutationMode::Warn,
+            archive,
         )?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
@@ -7224,11 +7297,15 @@ pub fn forget(
             )
         }
         .map_err(anyhow::Error::from)
+        .map(|deleted| (deleted, hard_erased))
     })();
 
     match result {
-        Ok(deleted) => {
+        Ok((deleted, hard_erased)) => {
             write_txn.commit()?;
+            // #4365 — destruction intent flows through the cold tier: the
+            // erased snapshots' bundles go AFTER the commit (journaled in-tx).
+            crate::erasure::archive_sync::remove_bundles_best_effort(conn, &hard_erased);
             Ok(deleted)
         }
         Err(e) => {
@@ -7525,7 +7602,7 @@ pub fn forget_for_caller(
     // identical row set across the archive SELECT and the DELETE because the
     // `BEGIN IMMEDIATE` write lock is held for the whole transaction.
     let write_txn = connection::WriteTxn::begin(conn)?;
-    let result = (|| -> Result<usize> {
+    let result = (|| -> Result<(usize, Vec<String>)> {
         // #3124 — under `warn` report the unstamped rows this forget admits
         // (WARN + counter); under `refuse` the owner predicate excludes them.
         if !mode.refuses() {
@@ -7684,8 +7761,10 @@ pub fn forget_for_caller(
         // v0.8.1 W2.1 (#1821 / gap G30) — purge the non-cascaded derived-store
         // leaks for the SAME owner-scoped victim set (the `caller` arg adds
         // the #1772 owner clause so this never touches another caller's DLQ /
-        // dedup rows), in-tx, before the DELETE.
-        purge_and_tombstone_forget(
+        // dedup rows), in-tx, before the DELETE. #4365 — on a HARD forget the
+        // victims' same-id archive snapshots are erased too (ids returned for
+        // the post-commit bundle removal).
+        let hard_erased = purge_and_tombstone_forget(
             conn,
             namespace,
             pattern,
@@ -7693,6 +7772,7 @@ pub fn forget_for_caller(
             Some(caller),
             &Utc::now().to_rfc3339(),
             mode,
+            archive,
         )?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
@@ -7729,11 +7809,14 @@ pub fn forget_for_caller(
             )
         }
         .map_err(anyhow::Error::from)
+        .map(|deleted| (deleted, hard_erased))
     })();
 
     match result {
-        Ok(deleted) => {
+        Ok((deleted, hard_erased)) => {
             write_txn.commit()?;
+            // #4365 — erased snapshots' cold-tier bundles go AFTER the commit.
+            crate::erasure::archive_sync::remove_bundles_best_effort(conn, &hard_erased);
             Ok(deleted)
         }
         Err(e) => {
@@ -16515,6 +16598,10 @@ pub(crate) fn gc_for_caller(
     let mut total = 0usize;
     loop {
         let write_txn = connection::WriteTxn::begin(conn)?;
+        // #4365 — the ids this chunk HARD-evicted (non-archive path only), so
+        // their erased same-id archive snapshots' cold-tier bundles can be
+        // removed AFTER the chunk commits (journaled in-tx by the primitive).
+        let mut hard_evicted: Vec<String> = Vec::new();
         let result = (|| -> Result<usize> {
             if archive {
                 // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on GC archive.
@@ -16636,6 +16723,7 @@ pub(crate) fn gc_for_caller(
                 for (eid, ens, eagent) in &evicted {
                     evict_tombstone_and_erase(conn, eid, ens, eagent.as_deref(), &now)?;
                 }
+                hard_evicted.extend(evicted.into_iter().map(|(eid, _, _)| eid));
             }
             let mut delete_stmt = conn.prepare_cached(&format!(
                 "DELETE FROM memories WHERE id IN ({expired_chunk_ids})"
@@ -16646,6 +16734,8 @@ pub(crate) fn gc_for_caller(
         match result {
             Ok(n) => {
                 write_txn.commit()?;
+                // #4365 — post-commit bundle removal for the hard-evicted ids.
+                crate::erasure::archive_sync::remove_bundles_best_effort(conn, &hard_evicted);
                 total = total.checked_add(n).context("gc count overflow")?;
                 if n < GC_CHUNK_ROWS {
                     break;
@@ -16826,7 +16916,19 @@ pub fn size_gc(
             Ok(())
         })();
         match victim_result {
-            Ok(()) => write_txn.commit()?,
+            Ok(()) => {
+                write_txn.commit()?;
+                // #4365 — the hard eviction erased the victim's same-id archive
+                // snapshot (journaled) in-tx; its cold-tier bundle goes AFTER
+                // the commit. The archive branch is a recoverable MOVE and
+                // keeps everything.
+                if !archive {
+                    crate::erasure::archive_sync::remove_bundles_best_effort(
+                        conn,
+                        std::slice::from_ref(&id),
+                    );
+                }
+            }
             Err(e) => {
                 write_txn.rollback();
                 return Err(e);
