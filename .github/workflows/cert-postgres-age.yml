@@ -111,20 +111,21 @@ env:
   # Declaring it at workflow level also means no job depends on the runner
   # `.env` supplying it.
   CARGO_INCREMENTAL: "0"
-  # Lean debuginfo for the heavy sal-postgres test-compile. #6118: this was
-  # `"0"` while ci.yml's `Check (linux-fed,enterprise-fed)` leg builds the SAME
-  # `--features sal-postgres` targets at `line-tables-only`; the debuginfo level
-  # is part of cargo's artifact hash, so the two jobs kept TWO complete
-  # dependency + test-binary trees in the one persistent `target/` of each
-  # linux-fed runner. One level for every self-hosted cargo job = one tree
-  # (and this job's compile reuses the check leg's artifacts when it lands on
-  # the same runner). TEST is set alongside DEV per the #3461 pair rule (the
-  # `test` profile only inherits `dev` while nothing overrides it). Pinned by
+  # No dev debug info to keep the heavy sal-postgres test-compile lean. #6118:
+  # ci.yml's `Check (linux-fed,enterprise-fed)` leg builds the SAME
+  # `--features sal-postgres` targets and used to do so at `line-tables-only`;
+  # the debuginfo level is part of cargo's artifact hash, so the two jobs kept
+  # TWO complete dependency + test-binary trees in the one persistent `target/`
+  # of each linux-fed runner. Every self-hosted cargo job now declares this
+  # same `"0"` pair (one level = one tree, and this job's compile reuses the
+  # check leg's artifacts when it lands on the same runner). TEST is set
+  # alongside DEV per the #3461 pair rule (the `test` profile only inherits
+  # `dev` while nothing overrides it). Pinned by
   # scripts/test/test_ci_runner_target_hygiene_6118.py. No `-fuse-ld=mold`
   # RUSTFLAGS: mold was a GitHub-hosted-runner headroom hack; the self-hosted
   # node uses its provisioned system linker.
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
   # AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_AGE_URL are NO LONGER hardcoded
   # here — they are read at runtime from the node's $HOME/.ai-memory-ci-fed-url
   # (the always-up native cert tier: pg18.6 + AGE 1.8.0 + pgvector 0.8.6, TLS
