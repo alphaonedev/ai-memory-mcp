@@ -288,9 +288,12 @@ jobs:
           #   - push: no PR base exists, so both = $EVENT_BEFORE
           #     (=$PR_BEFORE here; `github.event.before` carries the
           #     previous branch tip). A push delta genuinely IS the
-          #     change being introduced to the branch, and push events
-          #     do not gate merges — required contexts are matched on
-          #     the PR head commit.
+          #     change being introduced to the branch. A push run is NOT
+          #     merge-neutral in general: a push to a Promotion carrier
+          #     (chain/**, #6117) lands on the promotion PR's head commit
+          #     and reports under the same required context names on
+          #     that sha, so it is handled by the carrier arm below
+          #     (full pipeline), never by this delta.
           ZERO=0000000000000000000000000000000000000000
           # Merge Queue (#3089) — a `merge_group` event has no PR diff to
           # classify, and a merge group MUST run the whole pipeline (never a
