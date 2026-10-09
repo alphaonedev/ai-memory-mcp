@@ -204,6 +204,13 @@ pub(super) struct RegisterResult {
     pub version: i64,
 }
 
+/// #2024 / #6148 - the ONE spelling of the retired-lineage refusal, shared by
+/// skill register and skill promote (both render it through
+/// [`RegisterCoreError::RetiredLineage`]).
+pub(crate) fn retired_lineage_refusal(namespace: &str, name: &str) -> String {
+    format!("skill lineage '{namespace}/{name}' is retired; unretire before re-registering")
+}
+
 /// #6146 - why [`register_core`] failed. The retired-lineage refusal is a
 /// typed variant so callers recognise it by type, never by its text: a
 /// reworded refusal still reaches the caller, and a foreign string that merely
@@ -220,10 +227,9 @@ pub(super) enum RegisterCoreError {
 impl std::fmt::Display for RegisterCoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::RetiredLineage { namespace, name } => write!(
-                f,
-                "skill lineage '{namespace}/{name}' is retired; unretire before re-registering"
-            ),
+            Self::RetiredLineage { namespace, name } => {
+                f.write_str(&retired_lineage_refusal(namespace, name))
+            }
             Self::Foreign(msg) => f.write_str(msg),
         }
     }
@@ -999,6 +1005,17 @@ mod tests {
     /// code across the skill register / promote modules, inside the named
     /// `retired_lineage_refusal` helper every site renders through (the
     /// pm-v3.1 hardcoded-literal class).
+    /// #6148: the typed variant renders exactly the shared helper's text.
+    #[test]
+    fn issue_6148_variant_renders_the_shared_refusal() {
+        let refused = RegisterCoreError::RetiredLineage {
+            namespace: "ns".into(),
+            name: "n".into(),
+        };
+        assert_eq!(refused.to_string(), retired_lineage_refusal("ns", "n"));
+        assert_eq!(String::from(refused), retired_lineage_refusal("ns", "n"));
+    }
+
     #[test]
     fn issue_6148_retired_lineage_refusal_text_has_one_named_home() {
         fn production(src: &str) -> &str {
