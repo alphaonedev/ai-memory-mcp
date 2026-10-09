@@ -226,7 +226,7 @@ fn resolve_store_binding(
             anyhow::bail!(
                 "--db and --store-url are mutually exclusive. \
                  Pass exactly one. Got --db={} and --store-url={}",
-                db_path.display(),
+                crate::url_display::db_path_display(&db_path),
                 crate::url_display::store_url_display(url),
             );
         }
@@ -3949,7 +3949,7 @@ pub(crate) fn load_boot_index_entries(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
-                db_path = %db_path.display(),
+                db_path = %crate::url_display::db_path_display(&db_path),
                 err = %e,
                 "HNSW boot warm-up: could not open DB; semantic index stays cold (#1579 B3)"
             );
@@ -6675,7 +6675,7 @@ pub async fn bootstrap_serve(
                     "v0.7.0 #1017: failed to open hook consultation connection at {}: {}; \
                      governance hooks will fail closed unless the explicit consultation-only \
                      fail-open override is enabled and durable audit admission succeeds",
-                    db_path.display(),
+                    crate::url_display::db_path_display(&db_path),
                     e,
                 );
                 None
@@ -7630,7 +7630,7 @@ pub async fn bootstrap_serve(
                 Err(e) => {
                     tracing::warn!(
                         target: "ai_memory::identity::replay",
-                        db_path = %db_path.display(),
+                        db_path = %crate::url_display::db_path_display(&db_path),
                         err = %e,
                         "#1255: FederationNonceCache persistence open failed; falling back to \
                          in-memory cache. Daemon restarts will reopen the replay window until \
@@ -8204,7 +8204,10 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     }
 
     let addr = format!("{}:{}", args.host, args.port);
-    tracing::info!("database: {}", db_path.display());
+    tracing::info!(
+        "database: {}",
+        crate::url_display::db_path_display(&db_path)
+    );
 
     // v1.0.0 #2166 — SIGHUP live `[llm]` reload. On unix, install a SIGHUP
     // handler that re-resolves + rebuilds the `[llm]` client and atomically
