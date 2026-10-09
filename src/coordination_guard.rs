@@ -175,6 +175,28 @@ mod tests {
         assert!(require_namespace("_act").is_ok());
     }
 
+    /// #4389 — the quota sentinel namespaces (`_notify`, the per-sender notify
+    /// aggregate row excluded from the namespace-omitted rollup; `_global`,
+    /// the v50 backfill sentinel) are not coordination namespaces: a charge
+    /// booked under them lands on the sentinel row and hides from the rollup.
+    #[test]
+    fn require_namespace_refuses_the_quota_sentinels_4389() {
+        for sentinel in [
+            crate::quotas::NOTIFY_AGGREGATE_NAMESPACE,
+            crate::quotas::GLOBAL_NAMESPACE,
+        ] {
+            let err = require_namespace(sentinel).expect_err(sentinel);
+            assert!(
+                err.contains("reserved") && err.contains(sentinel),
+                "{sentinel}: {err}"
+            );
+        }
+        // Other `_`-prefixed coordination namespaces stay admitted (the
+        // `_act` / `_sig` convention is load-bearing for the existing cells).
+        assert!(require_namespace("_act").is_ok());
+        assert!(require_namespace("_notify/sub").is_ok());
+    }
+
     #[test]
     fn require_text_rejects_empty_oversize_and_control() {
         assert!(require_text("title", "  ", MAX_TEXT_FIELD_BYTES).is_err());

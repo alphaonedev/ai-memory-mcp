@@ -937,6 +937,26 @@ mod handler_tests {
         assert_eq!(reacked["acknowledged"].as_bool(), Some(false));
     }
 
+    /// #4389 — a signal create into the `_notify` quota sentinel (or `_global`)
+    /// is refused at the shared coordination guard, so the storage charge can
+    /// never land on the sentinel row that the quota rollup excludes.
+    #[test]
+    fn send_refuses_the_quota_sentinel_namespace_4389() {
+        let conn = fresh();
+        for sentinel in [
+            crate::quotas::NOTIFY_AGGREGATE_NAMESPACE,
+            crate::quotas::GLOBAL_NAMESPACE,
+        ] {
+            let err = handle_signal_send(
+                &conn,
+                &json!({ "namespace": sentinel, "from_agent": "a", "subject": "s" }),
+                None,
+            )
+            .expect_err("a sentinel namespace must be refused");
+            assert!(err.contains("reserved"), "{sentinel}: {err}");
+        }
+    }
+
     /// Minor (A6-13) — an unknown `signal_type` is REJECTED, not coerced to
     /// `notify` (mirrors the #3007 `condition_type` fix).
     #[test]
