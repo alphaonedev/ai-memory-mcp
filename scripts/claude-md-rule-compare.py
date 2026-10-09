@@ -1646,6 +1646,108 @@ def _self_test_cases() -> int:
                     "AI_MEMORY_API_KEY_ENV: AI_MEMORY_API_KEY", "token_budget = 3500"):
         case(f"#6163 {visible!r} is not masked", head_line(visible), True, visible)
 
+    # #6163 round 3 (review G2, G3, G4, S1): further credential shapes in changed rule text are masked.
+    round3_shapes = (
+        ("URL userinfo with an empty user name (G2)", "redis://:6163-canary-redis@db.example.invalid:6379",
+         "6163-canary-redis"),
+        ("a JSON password with an escaped quote (G3)", '{"password": "ab\\"6163-canary-escaped"}',
+         "6163-canary-escaped"),
+        ("a password with an unterminated quote (G3)", 'password="6163-canary-unclosed', "6163-canary-unclosed"),
+        ("a long numeric secret (G4)", "secret=616312345678901234567890", "616312345678901234567890"),
+        ("an upper-case value with no env-name shape (G4)", "token=AB_CD_EF12", "AB_CD_EF12"),
+        ("a word after an exempted count (G4)", "api_key = 12345 realtailsecret", "realtailsecret"),
+        ("an upper-case PASSWORD name (S1, O4)", "PASSWORD=6163-canary-upper", "6163-canary-upper"),
+        ("a prefixed db_password name (S1, O5)", "db_password=6163-canary-prefixed", "6163-canary-prefixed"),
+        ("a numeric passphrase (S1, O12)", "passphrase=6163555", "6163555"),
+    )
+    for label, extra, hidden in round3_shapes:
+        case(f"#6163 {label} in changed rule text is masked", head_line(extra), True, "RULE TEXT CHANGED",
+             absent=hidden, needles=("credential-shaped value(s) masked",))
+    for visible in ("max_tokens: 20000 per request", "api_key: OPENAI_API_KEY", "token_count = 1,500"):
+        case(f"#6163 {visible!r} is not masked (round 3)", head_line(visible), True, visible)
+
+    # #6163 round 3 (review G1): a key line is masked by its position inside a BEGIN..END range of its own side, so a
+    # changed body line whose BEGIN line is outside the hunk (or on the other side only) never prints.
+    split_body = [f"6163-canary-split-b{index}" for index in range(1, 10)]
+    split_key = ["-----BEGIN PRIVATE KEY-----", *split_body, "-----END PRIVATE KEY-----"]
+    split_pad = [f"unchanged line {index}" for index in range(4)]
+
+    def base_key(root):
+        edit("tool limit is 103 tools", "tool limit is 103 tools\n" + "\n".join(split_pad + split_key))(root)
+        reseal(root)
+
+    def head_key_body_changed(root):
+        changed = [line.replace("-b5", "-b5-new") for line in split_key]
+        filler = [f"filler line {index}" for index in range(20)]
+        edit("tool limit is 103 tools", "tool limit is 103 tools\n" + "\n".join(filler + split_pad + changed))(root)
+        reseal(root)
+
+    case("#6163 a changed key body line whose BEGIN is outside the hunk is masked (G1)", head_key_body_changed,
+         True, "RULE TEXT CHANGED", base_mutate=base_key, absent="6163-canary-split",
+         needles=("+filler line 19", "credential-shaped value(s) masked"))
+
+    def head_key_begin_removed(root):
+        edit("tool limit is 103 tools", "tool limit is 103 tools\n" + "\n".join(split_pad + split_key[1:]))(root)
+        reseal(root)
+
+    case("#6163 key body context lines are masked when the head drops the BEGIN line (G1)", head_key_begin_removed,
+         True, "RULE TEXT CHANGED", base_mutate=base_key, absent="6163-canary-split",
+         needles=("credential-shaped value(s) masked",))
+
+    # #6163 round 3 (S1, O9 O10 O11): head text in a heading, an approval trailer and a base-guard refusal is masked.
+    def credential_heading(root):
+        target = root / "CLAUDE.md"
+        target.write_text(target.read_text(encoding="utf-8") + "\n## api_key=6163-canary-heading\n\nbody\n",
+                          encoding="utf-8")
+
+    case("#6163 a credential in an added heading is masked (S1, O9)", credential_heading, True,
+         "RULE TEXT CHANGED (added): ` ## api_key=[MASKED] `", absent="6163-canary-heading")
+
+    def credential_duplicate(root):
+        target = root / "CLAUDE.md"
+        target.write_text(target.read_text(encoding="utf-8") + "\n## api_key=6163-canary-dup\n\nbody\n\n"
+                          "## api_key=6163-canary-dup\n\nbody\n", encoding="utf-8")
+
+    case("#6163 a credential in a base-guard refusal is masked (S1, O11)", credential_duplicate, True,
+         "- BASE GUARD REFUSES THE HEAD: ` FAIL: CLAUDE.md has the heading '## api_key=[MASKED]'",
+         absent="6163-canary-dup", needles=("RULE TEXT CHANGED (duplicated heading)",))
+    case("#6163 a credential in an approval trailer is masked (S1, O10)", reword, False,
+         "approval trailer(s): ` password=[MASKED] `", trailer="password=6163-canary-trailer",
+         absent="6163-canary-trailer")
+
+    # #6163 round 3: unit cells on unified() itself (the diff shape, the line cap and CRLF lines).
+    def unit(label, ok, detail):
+        if ok:
+            print(f"PASS: self-test - #6163 {label}")
+        else:
+            failures.append(label)
+            print(f"FAIL: self-test - #6163 {label}\n{detail}", file=sys.stderr)
+
+    shape_pairs = (
+        ("a\nb\nc\nd\ne\nf\ng\nh\ni\nj", "a\nB\nc\nd\ne\nf\ng\nh\nI\nj"),
+        ("", "one\ntwo"),
+        ("one\ntwo", ""),
+        ("x1\nx2\nx3", "x0\nx1\nx2\nx3\nx4"),
+        ("k1\nk2\nk3\nk4\nk5\nk6\nk7", "k1\nk2\nk4\nk5\nk6\nk7"),
+    )
+    for number, (old_text, new_text) in enumerate(shape_pairs, 1):
+        want = "\n".join(difflib.unified_diff(old_text.split("\n"), new_text.split("\n"), "base", "head",
+                                              lineterm="", n=2))
+        got = unified(old_text, new_text, "## Sec", Redactor())
+        unit(f"unified() matches a unified diff with 2 context lines (shape {number})", got == want,
+             f"got:\n{got}\nwant:\n{want}")
+    cap_old = "\n".join(f"row{index}" for index in range(300))
+    cap_new = "\n".join(f"ROW{index}" for index in range(300))
+    cap_lines = unified(cap_old, cap_new, "## Sec", Redactor()).split("\n")
+    unit("a diff longer than the cap keeps exactly 200 lines, then the truncation note (S1, O1c)",
+         len(cap_lines) == 201 and cap_lines[199] == "-row196" and cap_lines[200] == "... diff truncated at 200 lines",
+         "\n".join(cap_lines[-3:]))
+    crlf_new = ("intro\r\n-----BEGIN PGP PRIVATE KEY BLOCK-----\r\n6163-canary-crlf\r\n"
+                "-----END PGP PRIVATE KEY BLOCK-----\r\nafter-crlf-6163\r")
+    crlf_report = unified("intro\r", crlf_new, "## Sec", Redactor())
+    unit("a CRLF private key block is masked and the line after its END stays visible (S1, O6)",
+         "6163-canary-crlf" not in crlf_report and "+after-crlf-6163\r" in crlf_report, crlf_report)
+
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
     fetch_root = base_dir / "pr-fetch"
