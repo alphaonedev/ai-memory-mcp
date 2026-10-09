@@ -620,6 +620,62 @@ class DocsMatchHitCases6384M4(unittest.TestCase):
         self.assertIn('never writes the manifest', ' '.join(sec.split()))
 
 
+class BuildScriptInputs6384L1(World):
+    """r1 L1: the build-script dep-info is found and the build-script run
+    output (cfgs, env, the ``output`` file) is part of the shared key."""
+
+    def add_build_script(self):
+        b = self.root / 'target' / 'debug' / 'build' / 'ai-memory-abc123'
+        b.mkdir(parents=True)
+        (self.root / 'build.rs').write_text('fn main() {}\n')
+        (b / 'build_script_build-abc123.d').write_text('%s: build.rs\n\nbuild.rs:\n' % (b / 'build_script_build-abc123'))
+        (b / 'build-script-build').write_text('x')
+        run = self.root / 'target' / 'debug' / 'build' / 'ai-memory-def456'
+        (run / 'out').mkdir(parents=True)
+        (run / 'output').write_text('cargo:rustc-cfg=has_x\\n')
+        self.run_dir = run
+        msg = {'reason': 'compiler-artifact', 'package_id': 'path+file:///repo#ai-memory@1.0.0',
+               'target': {'kind': ['custom-build'], 'name': 'build-script-build', 'src_path': '/repo/build.rs'},
+               'profile': {'test': False}, 'executable': None,
+               'filenames': [str(b / 'build-script-build'), str(b / 'build_script_build-abc123')]}
+        self.bs_msg = msg
+        self.exec_msg = {'reason': 'build-script-executed', 'package_id': 'path+file:///repo#ai-memory@1.0.0',
+                         'linked_libs': [], 'linked_paths': [], 'cfgs': ['has_x'], 'env': [['K', 'v']],
+                         'out_dir': str(run / 'out')}
+        self.bj.write_text(self.bj.read_text() + json.dumps(msg) + '\n' + json.dumps(self.exec_msg) + '\n')
+        return b
+
+    def test_build_script_depinfo_is_found(self):
+        b = self.add_build_script()
+        # The review probe's shape: only the build-script-build hard link.
+        msg = dict(self.bs_msg, filenames=[str(b / 'build-script-build')])
+        found = tbc.shared_depinfo_files([json.dumps(msg)])
+        self.assertEqual(found, [b / 'build_script_build-abc123.d'])
+
+    def test_build_script_cfg_change_changes_every_key(self):
+        self.add_build_script()
+        self.green_run('100')
+        lines = self.bj.read_text().splitlines()
+        self.exec_msg['cfgs'] = ['has_y']
+        lines[-1] = json.dumps(self.exec_msg)
+        self.bj.write_text('\n'.join(lines) + '\n')
+        out = self.plan(run_id='200', now=NOW + 60)
+        self.assertIn('skipped 0 of 3', out)
+
+    def test_build_script_output_file_change_changes_every_key(self):
+        self.add_build_script()
+        self.green_run('100')
+        (self.run_dir / 'output').write_text('cargo:rustc-cfg=has_z\\n')
+        out = self.plan(run_id='200', now=NOW + 60)
+        self.assertIn('skipped 0 of 3', out)
+
+    def test_unchanged_build_script_still_hits(self):
+        self.add_build_script()
+        self.green_run('100')
+        out = self.plan(run_id='200', now=NOW + 60)
+        self.assertIn('skipped 3 of 3', out)
+
+
 class Policy(unittest.TestCase):
     def test_allowed_matrix(self):
         on = {'CI_TEST_BINARY_CACHE': '1', 'CI_TEST_BINARY_CACHE_LOOKUP': '1'}
