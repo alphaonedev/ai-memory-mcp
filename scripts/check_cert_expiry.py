@@ -108,6 +108,7 @@ import argparse
 import contextlib
 import errno
 import io
+import json
 import os
 import re
 import shutil
@@ -789,7 +790,7 @@ class SelfTest:
 
 
 GIT_SHIM = """#!{python} -I
-import os, sys
+import json, os, sys
 real, argv = {real!r}, sys.argv[1:]
 if argv == ["--shim-isolation-probe"]:
     try:
@@ -799,6 +800,9 @@ if argv == ["--shim-isolation-probe"]:
         planted = False
     print(sys.flags.isolated, planted)
     sys.exit(0)
+if {trace!r}:
+    with open({trace!r}, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(argv) + chr(10))
 if "--version" in argv and {version!r}:
     print({version!r})
     sys.exit(0)
@@ -816,7 +820,7 @@ MKDTEMP_NAME_LEN = len("gitshim-long.") + 8  # tempfile.mkdtemp appends 8 random
 SCRATCH_PATH_LIMIT = 255 - len("#!") - len(" -I") - (1 + MKDTEMP_NAME_LEN) - 2
 
 
-def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
+def write_git_shim(shim_dir, real, version="", fail="", interpreter=None, trace=""):
     """Write the executable `git` PATH shim into shim_dir (#6145: its interpreter
     line is `python3 -I`, like the gate itself in c8-precheck.yml, so the shim's
     own directory is never on its sys.path). Fails closed with GateError when the
@@ -846,7 +850,7 @@ def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
                         f"{SHEBANG_MAX}; the kernel would truncate it and drop '-I'")
     shim = shim_dir / "git"
     shim.write_text(GIT_SHIM.format(python=python, real=real, version=version,
-                                    fail=fail), encoding="utf-8")
+                                    fail=fail, trace=str(trace)), encoding="utf-8")
     shim.chmod(0o755)
     return shim
 
@@ -1341,15 +1345,18 @@ def shim_isolation_violation(tmp, interpreter=None):
         shutil.rmtree(shim_dir, ignore_errors=True)
 
 
-def run_gate_shimmed(tmp, repo, env, version="", fail=""):
+def run_gate_shimmed(tmp, repo, env, version="", fail="", trace=""):
     """run_gate with a PATH shim `git` that reports `version` for --version
     and exits 128 on any call whose argv contains `fail`, and otherwise
-    delegates to the real git (R2-F2: pins the guarded branches)."""
+    delegates to the real git (R2-F2: pins the guarded branches). When `trace`
+    is a path, the shim appends every invocation's argv (one JSON list per
+    line) to it before doing anything else, so a caller can assert exactly
+    which git calls ran, independent of how a failure surfaces."""
     real = shutil.which("git")
     if real is None:
         raise GateError("git is not on PATH")
     shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
-    write_git_shim(shim_dir, real, version, fail)
+    write_git_shim(shim_dir, real, version, fail, trace=trace)
     saved = os.environ.get("PATH")
     os.environ["PATH"] = f"{shim_dir}{os.pathsep}{saved or ''}"
     try:
@@ -1974,16 +1981,30 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                      repo, dict(pr_base_env, **{key: "a" * 64}), "does not resolve to a commit")
         if hex_msg in out:
             t.fail(f"(pr4-sha256): a 64-hex {key} was refused by the sha validator:", out)
-    # 63 / 65 hex are refused by the validator, with no git call at all: a shim
-    # that refuses every rev-parse must never be reached.
+    # 63 / 65 hex are refused by the validator before any repository-touching git
+    # call. The only git call that legitimately precedes validation is the
+    # `git --version` probe in run_gate (require_git_version). The shim appends
+    # every invocation's argv to a trace file, and the cell asserts the trace
+    # holds exactly that one call (argv tail `--version`): a silent is_commit (`rev-parse`) or
+    # `fetch origin <value>` ahead of the validator is recorded even when the
+    # failure it causes is swallowed by run_git, so it turns this cell red.
     for n in (63, 65):
         for key in ("PR_HEAD_SHA", "GITHUB_SHA"):
+            trace = Path(tmp) / f"git-trace-{key}-{n}.jsonl"
+            trace.unlink(missing_ok=True)
             rc, out, err = run_gate_shimmed(tmp, repo, dict(pr_base_env, **{key: "b" * n}),
-                                            fail="rev-parse")
+                                            fail="rev-parse", trace=trace)
             text = out + err
+            calls = ([json.loads(ln) for ln in trace.read_text(encoding="utf-8").splitlines()]
+                     if trace.exists() else [])
             if rc != 1 or hex_msg not in text or "shim refuses" in text:
-                t.fail(f"(pr4-sha-len): a {n}-hex {key} was not refused by the validator "
-                       "before any git call:", text)
+                t.fail(f"(pr4-sha-len): a {n}-hex {key} was not refused by the validator:", text)
+            # run_git prefixes every call with `-c core.quotePath=false -C <repo>`, so
+            # the verb and its operands are the tail of argv: the probe ends in
+            # `--version`, a rev-parse / fetch does not.
+            if len(calls) != 1 or calls[0][-1:] != ["--version"]:
+                t.fail(f"(pr4-sha-len): a {n}-hex {key} ran git calls other than the "
+                       f"`--version` probe before the validator refused it: {calls!r}", text)
 
     # (k) fail-closed - pull_request with nothing set (missing PR head sha / base ref).
     t.gate("k", "pull_request with PR_HEAD_SHA and GITHUB_BASE_REF unset", repo,
@@ -2105,7 +2126,7 @@ SELF_TEST_OK = (
     "(checkout-depth, #6145) every #6145 shim and scratch cell (including shim-unexecutable) passes in a 226-byte scratch dir, the one a 184-byte checkout gets; "
     "the gate-run fixtures build one gitshim.* level under the scratch dir and fit within it; "
     "(pr4-sha256, #6144) a 64-hex PR_HEAD_SHA / GITHUB_SHA passes the validator and fails cleanly at the git lookup; "
-    "(pr4-sha-len) 63/65-hex refused before any git call."
+    "(pr4-sha-len) 63/65-hex refused with only the `git --version` probe traced before the validator."
 )
 
 
