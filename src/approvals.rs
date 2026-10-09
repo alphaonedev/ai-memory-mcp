@@ -1299,6 +1299,80 @@ pub mod signed {
             assert!(matches!(err, QuorumError::Forged(_)), "got {err:?}");
         }
 
+        /// #4378 — the router's result is TYPED, so a merely-DEFERRED queue
+        /// write (handed to the write transaction the calling thread holds on
+        /// the same database, #4116) can never be mistaken for a written row
+        /// by a caller that trusts the return value.
+        #[test]
+        fn routing_outcome_is_typed_queued_vs_deferred_4378() {
+            let dir = tempfile::Builder::new()
+                .prefix("issue-4378-")
+                .tempdir()
+                .expect("tempdir");
+            let path = dir.path().join("ai-memory.db");
+            let conn = crate::db::open(&path).expect("open");
+            let exists = |id: &str| -> bool {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pending_actions WHERE id = ?1",
+                    [id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .expect("count")
+                    > 0
+            };
+            let route = |on: &rusqlite::Connection| {
+                route_escalation_to_approval_gate(
+                    on,
+                    crate::models::GovernedAction::Store,
+                    "ns-4378",
+                    None,
+                    "ai:worker",
+                    &serde_json::json!({"title": "t", "metadata": {"agent_id": "ai:worker"}}),
+                    "R-4378",
+                    "escalated reason",
+                )
+                .expect("route")
+            };
+
+            // No transaction open on this thread: the row is WRITTEN.
+            let queued = route(&conn);
+            assert!(matches!(queued, EscalationRouting::Queued(_)), "{queued:?}");
+            assert!(exists(queued.pending_id()), "a Queued id names a row that exists");
+            assert!(
+                queued
+                    .refusal_text("escalated reason")
+                    .contains("escalated for signed approval (pending_id="),
+                "{}",
+                queued.refusal_text("escalated reason")
+            );
+
+            // A write transaction open on this thread for the same database
+            // (the funnel's), routed from a second connection (the hook's):
+            // DEFERRED, the row does NOT exist yet, and the text says so.
+            let hook_conn = crate::db::open(&path).expect("open hook connection");
+            let txn = crate::storage::connection::WriteTxn::begin(&conn).expect("begin");
+            let deferred = route(&hook_conn);
+            assert!(
+                matches!(deferred, EscalationRouting::Deferred(_)),
+                "{deferred:?}"
+            );
+            assert!(
+                !exists(deferred.pending_id()),
+                "a Deferred id names a row that is not written yet"
+            );
+            assert!(
+                deferred
+                    .refusal_text("escalated reason")
+                    .starts_with("escalation deferred: pending_id="),
+                "{}",
+                deferred.refusal_text("escalated reason")
+            );
+            assert_ne!(queued, deferred, "the two outcomes are distinct types");
+            // The transaction ending settles the deferred write.
+            txn.rollback();
+            assert!(exists(deferred.pending_id()), "settled on the funnel connection");
+        }
+
         #[test]
         fn unenrolled_signer_rejected() {
             let op = kp(1);
