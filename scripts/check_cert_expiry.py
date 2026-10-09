@@ -107,6 +107,7 @@ Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
 import argparse
 import contextlib
 import io
+import json
 import os
 import re
 import shutil
@@ -788,8 +789,11 @@ class SelfTest:
 
 
 GIT_SHIM = """#!{python}
-import os, sys
+import json, os, sys
 real, argv = {real!r}, sys.argv[1:]
+if {trace!r}:
+    with open({trace!r}, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(argv) + chr(10))
 if "--version" in argv and {version!r}:
     print({version!r})
     sys.exit(0)
@@ -800,17 +804,20 @@ os.execv(real, [real] + argv)
 """
 
 
-def run_gate_shimmed(tmp, repo, env, version="", fail=""):
+def run_gate_shimmed(tmp, repo, env, version="", fail="", trace=""):
     """run_gate with a PATH shim `git` that reports `version` for --version
     and exits 128 on any call whose argv contains `fail`, and otherwise
-    delegates to the real git (R2-F2: pins the guarded branches)."""
+    delegates to the real git (R2-F2: pins the guarded branches). When `trace`
+    is a path, the shim appends every invocation's argv (one JSON list per
+    line) to it before doing anything else, so a caller can assert exactly
+    which git calls ran, independent of how a failure surfaces."""
     real = shutil.which("git")
     if real is None:
         raise GateError("git is not on PATH")
     shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
     shim = shim_dir / "git"
     shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version=version,
-                                    fail=fail), encoding="utf-8")
+                                    fail=fail, trace=str(trace)), encoding="utf-8")
     shim.chmod(0o755)
     saved = os.environ.get("PATH")
     os.environ["PATH"] = f"{shim_dir}{os.pathsep}{saved or ''}"
@@ -1329,16 +1336,30 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                      repo, dict(pr_base_env, **{key: "a" * 64}), "does not resolve to a commit")
         if hex_msg in out:
             t.fail(f"(pr4-sha256): a 64-hex {key} was refused by the sha validator:", out)
-    # 63 / 65 hex are refused by the validator, with no git call at all: a shim
-    # that refuses every rev-parse must never be reached.
+    # 63 / 65 hex are refused by the validator before any repository-touching git
+    # call. The only git call that legitimately precedes validation is the
+    # `git --version` probe in run_gate (require_git_version). The shim appends
+    # every invocation's argv to a trace file, and the cell asserts the trace
+    # holds exactly that one call (argv tail `--version`): a silent is_commit (`rev-parse`) or
+    # `fetch origin <value>` ahead of the validator is recorded even when the
+    # failure it causes is swallowed by run_git, so it turns this cell red.
     for n in (63, 65):
         for key in ("PR_HEAD_SHA", "GITHUB_SHA"):
+            trace = Path(tmp) / f"git-trace-{key}-{n}.jsonl"
+            trace.unlink(missing_ok=True)
             rc, out, err = run_gate_shimmed(tmp, repo, dict(pr_base_env, **{key: "b" * n}),
-                                            fail="rev-parse")
+                                            fail="rev-parse", trace=trace)
             text = out + err
+            calls = ([json.loads(ln) for ln in trace.read_text(encoding="utf-8").splitlines()]
+                     if trace.exists() else [])
             if rc != 1 or hex_msg not in text or "shim refuses" in text:
-                t.fail(f"(pr4-sha-len): a {n}-hex {key} was not refused by the validator "
-                       "before any git call:", text)
+                t.fail(f"(pr4-sha-len): a {n}-hex {key} was not refused by the validator:", text)
+            # run_git prefixes every call with `-c core.quotePath=false -C <repo>`, so
+            # the verb and its operands are the tail of argv: the probe ends in
+            # `--version`, a rev-parse / fetch does not.
+            if len(calls) != 1 or calls[0][-1:] != ["--version"]:
+                t.fail(f"(pr4-sha-len): a {n}-hex {key} ran git calls other than the "
+                       f"`--version` probe before the validator refused it: {calls!r}", text)
 
     # (k) fail-closed - pull_request with nothing set (missing PR head sha / base ref).
     t.gate("k", "pull_request with PR_HEAD_SHA and GITHUB_BASE_REF unset", repo,
@@ -1443,7 +1464,8 @@ SELF_TEST_OK = (
     "octopus merge RED; (ci1-ci7, #5970) the event payload range is authoritative under "
     "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
     "outside CI; (pr4-sha256, #6144) a 64-hex PR_HEAD_SHA / GITHUB_SHA passes the validator "
-    "and fails cleanly at the git lookup; (pr4-sha-len) 63/65-hex refused before any git call."
+    "and fails cleanly at the git lookup; (pr4-sha-len) 63/65-hex refused with only the "
+    "`git --version` probe traced before the validator."
 )
 
 
