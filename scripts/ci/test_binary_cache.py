@@ -63,11 +63,17 @@ SCHEMA = 1
 MAX_AGE_SECONDS = 7 * 24 * 3600
 CLOCK_SKEW_SECONDS = 300
 SHARD_LISTS = ('serial', 'parallel_1', 'parallel_2')
-# Environment that changes what a test does. Values are hashed for these;
-# AI_MEMORY_TEST_POSTGRES_URL contributes PRESENCE only (the value is a per-job
-# ephemeral database URL and would make every key unique).
-ENV_VALUE_KEYS = ('AI_MEMORY_NO_CONFIG', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS')
-ENV_PRESENCE_KEYS = ('AI_MEMORY_TEST_POSTGRES_URL',)
+# Environment that changes what a test does (r1 H2). A self-hosted runner
+# inherits its service environment, so EVERY variable of these families is in
+# the key, not a hand-picked list: exact names, then name prefixes.
+ENV_EXACT_KEYS = ('CI', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTDOCFLAGS', 'RUST_MIN_STACK',
+                  'RUST_BACKTRACE', 'RUST_LOG', 'TZ')
+ENV_PREFIXES = ('AI_MEMORY_', 'RUST_TEST_', 'CARGO_PROFILE_', 'CARGO_BUILD_', 'PROPTEST_')
+# A name that looks like it carries a credential or a per-job address counts
+# by PRESENCE only (unset / empty / set). Its value is never hashed: a URL is a
+# per-job ephemeral database and would make every key unique, and a secret
+# must never reach a file, even hashed.
+ENV_SECRET_NAME_RE = re.compile(r'URL|PASSWORD|PASSPHRASE|SECRET|TOKEN|KEY|CRED|DSN')
 REGISTRY_MARKERS = ('/registry/src/', '/registry/cache/', '/git/checkouts/')
 
 
@@ -263,10 +269,25 @@ def tree_sensitive(depinfo_path, repo_root):
 
 # ------------------------------------------------------------------- key ----
 
+def env_name_in_key(name):
+    return name in ENV_EXACT_KEYS or name.startswith(ENV_PREFIXES)
+
+
 def env_fingerprint(env):
-    """Stable string of the behaviour-affecting environment."""
-    parts = ['%s=%s' % (k, env.get(k, '')) for k in ENV_VALUE_KEYS]
-    parts += ['%s=%s' % (k, '1' if env.get(k) else '0') for k in ENV_PRESENCE_KEYS]
+    """Stable string of the behaviour-affecting environment (r1 H2).
+
+    One line per present variable of the families above, sorted by name. A
+    plain setting contributes the sha256 of its value; a secret-like name
+    (``ENV_SECRET_NAME_RE``) contributes only ``<empty>`` or ``<set>``. No raw
+    value is ever part of the string.
+    """
+    parts = []
+    for name in sorted(k for k in env if env_name_in_key(k)):
+        val = env.get(name) or ''
+        if ENV_SECRET_NAME_RE.search(name):
+            parts.append('%s=%s' % (name, '<set>' if val else '<empty>'))
+        else:
+            parts.append('%s=sha256:%s' % (name, sha256_bytes(val.encode('utf-8', 'surrogateescape'))))
     return '\n'.join(parts)
 
 
