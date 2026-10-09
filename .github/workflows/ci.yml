@@ -773,12 +773,15 @@ jobs:
             tier: enterprise-fed
             # #3525/#3976/#6202/#6344: compile (~6-12 min) + the 7800 s
             # per-shard watchdog + the ephemeral-db setup/teardown must fit
-            # inside this outer bound. 150 = 130 min watchdog + 20 min (the
-            # #6202 rule is job limit >= watchdog + 15 min). Raised from
-            # 120/5400 s for the first measured sharded run (#6344 review r2
-            # F1): re-derive both from the per-shard timings after the first
-            # green run. Budget table: docs/ci/CARRIER-BRANCH-GATES.md.
-            timeout: 150
+            # inside this outer bound. 160 = 130 min watchdog + 28 min of
+            # pre-watchdog compile and database setup (measured in review r2)
+            # + 2 min teardown, so the named watchdog fires before the job
+            # cap (#6411; the #6202 rule job limit >= watchdog + 15 min is
+            # necessary but not sufficient). Raised from 120/5400 s for the
+            # first measured sharded run (#6344 review r2 F1): re-derive both
+            # from the per-shard timings after the first green run. Budget
+            # table: docs/ci/CARRIER-BRANCH-GATES.md.
+            timeout: 160
           - leg: macos-fed,sqlite
             runner: '["self-hosted","macos-fed"]'
             node: macos-fed
@@ -790,12 +793,15 @@ jobs:
             tier: enterprise-fed
             # #3525/#3976/#6202/#6344: compile (~6-12 min) + the 7800 s
             # per-shard watchdog + the ephemeral-db setup/teardown must fit
-            # inside this outer bound. 150 = 130 min watchdog + 20 min (the
-            # #6202 rule is job limit >= watchdog + 15 min). Raised from
-            # 120/5400 s for the first measured sharded run (#6344 review r2
-            # F1): re-derive both from the per-shard timings after the first
-            # green run. Budget table: docs/ci/CARRIER-BRANCH-GATES.md.
-            timeout: 150
+            # inside this outer bound. 160 = 130 min watchdog + 28 min of
+            # pre-watchdog compile and database setup (measured in review r2)
+            # + 2 min teardown, so the named watchdog fires before the job
+            # cap (#6411; the #6202 rule job limit >= watchdog + 15 min is
+            # necessary but not sufficient). Raised from 120/5400 s for the
+            # first measured sharded run (#6344 review r2 F1): re-derive both
+            # from the per-shard timings after the first green run. Budget
+            # table: docs/ci/CARRIER-BRANCH-GATES.md.
+            timeout: 160
     steps:
       # 2026-08-26 rigid-security-controls: a fork PR must NEVER have its code
       # checked out on a self-hosted node (f2 = the operator's home gateway,

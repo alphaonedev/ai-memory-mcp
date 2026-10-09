@@ -23,7 +23,12 @@ UPLOAD_PIN = 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'
 # 1,006-executable target list with the run-6160 contended weights).
 SHARD_ESTIMATE_SECS = 3913
 SHARD_WATCHDOG_SECS = 7800
-JOB_TIMEOUT_MIN = 150
+JOB_TIMEOUT_MIN = 160
+# #6411: compile + database setup measured at about 28 min in review r2; this
+# runs before the per-shard watchdog starts, so the job cap must cover it plus
+# a 2 min teardown/upload margin on top of the watchdog.
+PRE_WATCHDOG_MIN = 28
+TEARDOWN_MARGIN_MIN = 2
 
 
 def ci_text():
@@ -69,7 +74,7 @@ class ShardBudgetTests(unittest.TestCase):
         for needle in ('56 %', '2x', 'unmeasured', 'first green'):
             self.assertIn(needle, block, 'the F1 derivation must say: ' + needle)
 
-    def test_both_enterprise_fed_legs_cap_at_150_min_and_keep_the_ratio_rule(self):
+    def test_both_enterprise_fed_legs_cap_at_160_min_and_keep_the_ratio_rule(self):
         text = ci_text()
         secs, _ = enterprise_fed_watchdog(text)
         caps = enterprise_fed_timeouts(text)
@@ -77,6 +82,9 @@ class ShardBudgetTests(unittest.TestCase):
         for leg, cap in caps.items():
             self.assertEqual(cap, JOB_TIMEOUT_MIN, leg)
             self.assertGreaterEqual(cap, secs // 60 + 15, '%s: job limit >= watchdog + 15 min (#6202)' % leg)
+            self.assertGreaterEqual(
+                cap, secs // 60 + PRE_WATCHDOG_MIN + TEARDOWN_MARGIN_MIN,
+                '%s: job cap must outlast the pre-watchdog compile/DB phase so the named watchdog fires first (#6411)' % leg)
 
     def test_shards_share_one_budget_each(self):
         body = function_body(ci_text(), 'run_shard')
@@ -156,12 +164,12 @@ class ShardDocsTests(unittest.TestCase):
         row = [l for l in doc.splitlines() if l.startswith('| `linux-fed,enterprise-fed`')]
         self.assertEqual(len(row), 1)
         self.assertIn('7800 s (130 min)', row[0])
-        self.assertIn('| 150 |', row[0])
+        self.assertIn('| 160 |', row[0])
 
     def test_docs_and_workflow_agree_on_the_shard_budget(self):
         doc = DOC.read_text()
         shard = doc[doc.index('## Sharded enterprise-fed suite (#6344)'):]
-        for needle in ('7800 s', '150 min', '3,913 s', '56 %', '2x'):
+        for needle in ('7800 s', '160 min', '3,913 s', '56 %', '2x'):
             self.assertIn(needle, shard)
 
 

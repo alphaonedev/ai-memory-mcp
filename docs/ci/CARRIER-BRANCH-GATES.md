@@ -7,18 +7,22 @@ three concurrent shards and `$WATCHDOG_SECS` bounds each shard's whole chain
 (see [Sharded enterprise-fed suite (#6344)](#sharded-enterprise-fed-suite-6344)). The watchdog exists to catch a hung test and
 name it; it is NOT a cap on total suite duration. The job-level
 `timeout-minutes` (matrix `timeout`) is the outer backstop and must sit at
-least 15 minutes above the watchdog so that the named watchdog, not a nameless
-job-level cancel, is what fires. Compile runs outside the watchdog (`cargo test
+least 15 minutes above the watchdog, and on a sharded tier at least the watchdog
+plus the pre-watchdog compile and database phase (about 28 min) plus 2 min, so
+that the named watchdog, not a nameless job-level cancel, is what fires (#6411). Compile runs outside the watchdog (`cargo test
 --no-run`, #1989/#2657).
 
 | Tier / leg | Watchdog (`WATCHDOG_SECS`) | Job `timeout-minutes` | Measured uncontended | Measured contended |
 |---|---|---|---|---|
 | `ubuntu-latest,sqlite` | 2100 s (35 min) | 95 | see #3538 | see #3538 |
 | `macos-fed,sqlite` | 2400 s (40 min) | 80 | about 27 min (#3461) | n/a |
-| `linux-fed,enterprise-fed` | 7800 s (130 min) per shard | 150 | longest shard estimate 3,913 s (serial) | not yet measured (first green sharded run) |
-| `macos-fed,enterprise-fed` | 7800 s (130 min) per shard | 150 | n/a | n/a |
+| `linux-fed,enterprise-fed` | 7800 s (130 min) per shard | 160 | longest shard estimate 3,913 s (serial) | not yet measured (first green sharded run) |
+| `macos-fed,enterprise-fed` | 7800 s (130 min) per shard | 160 | n/a | n/a |
 
-Ratio rule: job `timeout-minutes` >= watchdog minutes + 15. All four rows meet it.
+Ratio rule: job `timeout-minutes` >= watchdog minutes + 15. On the sharded
+`enterprise-fed` legs the stricter rule applies: job `timeout-minutes` >=
+watchdog minutes + 28 (pre-watchdog compile and database setup) + 2 (teardown)
+= 160. All four rows meet both.
 
 ## Why enterprise-fed moved from 8100 s to 14400 s (#6202)
 
@@ -105,8 +109,8 @@ speedup, so the true figure lies between the two. The federation-name rule keeps
 47 binaries (about 437 s) in the serial shard on purpose.
 
 Budget: `WATCHDOG_SECS` = 7800 s (130 min) per shard and job `timeout-minutes` =
-150 min on both `enterprise-fed` legs (the watchdog plus 20 min, meeting the
-ratio rule). This is 2x the longest-shard estimate (3,913 s), set for the first
+160 min on both `enterprise-fed` legs (the watchdog plus 28 min of pre-watchdog
+compile and database setup plus 2 min, meeting the ratio rule, #6411). This is 2x the longest-shard estimate (3,913 s), set for the first
 measured run (#6344 review r2 F1; it was 5400 s / 120 min, 1.38x). The estimate
 is soft: 56 % of it is class averages (217 of the 388 serial binaries have no
 measured weight; the weights come from run 6160, which had 2 serial processes),
