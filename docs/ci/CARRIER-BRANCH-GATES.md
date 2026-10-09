@@ -1,8 +1,10 @@
-# CI hang-watchdog budgets by tier (#1492, #6202)
+# CI hang-watchdog budgets by tier (#1492, #6202, #6344)
 
 The full-suite step in `.github/workflows/ci.yml` ("full suite (cargo test)")
 runs `cargo test --no-fail-fast` under GNU `timeout --signal=TERM
---kill-after=60 $WATCHDOG_SECS`. The watchdog exists to catch a hung test and
+--kill-after=60 $WATCHDOG_SECS`. On tier `enterprise-fed` the suite runs as
+three concurrent shards and `$WATCHDOG_SECS` bounds each shard's whole chain
+(see [Sharded enterprise-fed suite (#6344)](#sharded-enterprise-fed-suite-6344)). The watchdog exists to catch a hung test and
 name it; it is NOT a cap on total suite duration. The job-level
 `timeout-minutes` (matrix `timeout`) is the outer backstop and must sit at
 least 15 minutes above the watchdog so that the named watchdog, not a nameless
@@ -13,12 +15,17 @@ job-level cancel, is what fires. Compile runs outside the watchdog (`cargo test
 |---|---|---|---|---|
 | `ubuntu-latest,sqlite` | 2100 s (35 min) | 95 | see #3538 | see #3538 |
 | `macos-fed,sqlite` | 2400 s (40 min) | 80 | about 27 min (#3461) | n/a |
-| `linux-fed,enterprise-fed` | 14400 s (240 min) | 270 | suite 4007-4750 s (67-79 min) | ~13,900-14,100 s extrapolated (232-235 min) |
-| `macos-fed,enterprise-fed` | 14400 s (240 min) | 270 | n/a | n/a |
+| `linux-fed,enterprise-fed` | 5400 s (90 min) per shard | 120 | longest shard estimate 3,913 s (serial) | not yet measured (first green sharded run) |
+| `macos-fed,enterprise-fed` | 5400 s (90 min) per shard | 120 | n/a | n/a |
 
 Ratio rule: job `timeout-minutes` >= watchdog minutes + 15. All four rows meet it.
 
 ## Why enterprise-fed moved from 8100 s to 14400 s (#6202)
+
+> Superseded by [Sharded enterprise-fed suite (#6344)](#sharded-enterprise-fed-suite-6344):
+> the serial 14400 s / 270 min budget below applied only while the suite ran
+> serially. It is kept as the measured record the shard budget was derived
+> from.
 
 The suite is 1,005 test executables run serially (`--test-threads=1`). From
 live job logs, the uncontended suite took 4007 s and 4750 s, and it reached the
@@ -53,8 +60,8 @@ invariant gates pin, so it is tracked separately.
 
 ## Sharded enterprise-fed suite (#6344)
 
-The serial full suite (about 13,100 s measured/extrapolated over 1,005 test
-executables) outgrew every watchdog raise, so tier `enterprise-fed` now builds
+The serial full suite (about 13,900-14,100 s contended, extrapolated over 1,005
+test executables; see the superseded #6202 section above) outgrew every watchdog raise, so tier `enterprise-fed` now builds
 once and runs three concurrent shards inside the same `Run tests
 (impact-aware)` step (job names, matrix legs and the step name are unchanged):
 
@@ -72,12 +79,36 @@ fails if the three sets are not disjoint and complete. A new `tests/*.rs` is
 picked up automatically; an unreadable or unclassifiable source goes to the
 serial shard. Only the serial shard touches the per-job Postgres database.
 
+Classification reads the union of every file a target compiles: `mod name;`
+(`name.rs`, `name/mod.rs`, inline-mod nesting), `#[path = "..."] mod name;` and
+`include!`, recursively; a `mod` that resolves to no file sends the target to
+the serial shard. A file two or more targets compile (`tests/common/`) counts
+per item: a binary inherits a helper's Postgres or `#[serial]` evidence only
+when its own code names that helper, and a test declared in a shared file
+moves every includer when its code uses Postgres. The lib gate fails the step
+when a lib code site that names `AI_MEMORY_TEST_POSTGRES_URL` (directly, in a
+string, or through a const/static) sits at a test path no prefix in
+`lib_pg_prefixes.txt` occurs in (the libtest substring rule).
+
 Each shard is a chain of `run_tests` calls, so the #1492 watchdog, `--no-fail-fast`
 (#2500) and the prebuild (#2657) invariants hold. The step waits on each shard
-PID separately and fails if any shard failed.
+PID separately and fails if any shard failed. Each shard's log, list file and
+the partition `manifest.json` are uploaded as the `shard-logs-<node>-<tier>`
+artifact on every outcome, including a cancel or the job cap.
 
-Estimated wall time (ideal, from the measured weights): serial 3,891 s,
-parallel 1,620 s and 1,516 s, so about 65 min against about 218 min before. The
-federation-name rule keeps 47 binaries (about 437 s) in the serial shard on
-purpose. Real wall time is not verified until a CI run completes; refresh the
-weights when it does.
+Estimated wall time (ideal, from the measured weights, 1,006 executables):
+serial 3,913 s (lib Postgres prefixes 84 s, doc tests 16 s, 388 class-(a)
+binaries), parallel 1,620 s and 1,515 s at `--test-threads=3`, so about 65 min
+against about 232-235 min contended before. The federation-name rule keeps 47
+binaries (about 437 s) in the serial shard on purpose.
+
+Budget: `WATCHDOG_SECS` = 5400 s (90 min) per shard, about 1.38x the longest
+shard estimate (3,913 s); job `timeout-minutes` = 120 min on both
+`enterprise-fed` legs, which is the watchdog (90 min) plus about 30 min for
+compile and ephemeral-database setup/teardown, meeting the ratio rule. The
+estimate uses weights from a contended serial run; contention between shards
+(two jobs of three shards on one 14-core host) is not yet measured. Real wall
+time is not verified until a CI run completes: refresh the weights from its
+per-shard `::notice::` lines and re-derive the budget when a shard comes within
+20 % of it. These numbers are pinned by
+`scripts/ci/tests/test_ci_shard_wiring_6344.py`.

@@ -151,7 +151,7 @@ class ShardDocsTests(unittest.TestCase):
         doc = DOC.read_text()
         self.assertIn('## Sharded enterprise-fed suite (#6344)', doc)
         self.assertIn('Superseded by [Sharded enterprise-fed suite (#6344)]', doc)
-        row = [l for l in doc.splitlines() if l.startswith('| linux-fed,enterprise-fed')]
+        row = [l for l in doc.splitlines() if l.startswith('| `linux-fed,enterprise-fed`')]
         self.assertEqual(len(row), 1)
         self.assertIn('5400 s (90 min)', row[0])
         self.assertIn('| 120 |', row[0])
