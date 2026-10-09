@@ -231,6 +231,9 @@ pub(crate) struct ConsolidationRunReport {
     /// #3170 — a rollback write-ahead failed this sweep. The curator folds it
     /// into the cycle's `rollback_log_degraded` flag (the #3116 contract).
     pub(crate) rollback_write_ahead_failed: bool,
+    /// #4821 — the sweep HALTED on that write-ahead failure: the remaining
+    /// clusters were neither summarised nor merged (deferred to a later cycle).
+    pub(crate) halted_on_rollback_degraded: bool,
     /// Per-cluster errors (summarise / persist / verify). Best-effort: one
     /// cluster failing does not abort the sweep.
     pub(crate) errors: Vec<String>,
@@ -587,8 +590,10 @@ impl<'a> ConsolidationPass<'a> {
     /// `cluster` → resolve members → `eligible` → `summarize` → `persist`
     /// → `verify`. Returns a [`ConsolidationRunReport`]; ordinary per-cluster
     /// failures (summarise / persist / a verify that rolls back cleanly) are
-    /// recorded in `report.errors` and never abort the sweep. The ONE
-    /// exception is a Stage-6 rollback that itself fails — see below.
+    /// recorded in `report.errors` and never abort the sweep. The two
+    /// exceptions are a rollback write-ahead that fails (#4821: the sweep
+    /// halts, `halted_on_rollback_degraded`) and a Stage-6 rollback that
+    /// itself fails — see below.
     ///
     /// **Dry-run (`self.dry_run`, a `--dry-run` curator cycle):** the sweep
     /// stops after `eligible` — it counts what it *would* consolidate
@@ -685,20 +690,31 @@ impl<'a> ConsolidationPass<'a> {
             };
             // #3692 — WRITE-AHEAD. The exact originals reach the rollback log
             // before `persist` deletes or tombstones a single one of them; a
-            // write-ahead that fails aborts the cluster with nothing touched.
+            // write-ahead that fails aborts the cluster with nothing touched
+            // and halts the sweep (#4821).
             let entry_id = match self.persist_rollback_write_ahead(&members).await {
                 Ok(id) => {
                     report.rollback_entries_written += 1;
                     id
                 }
                 Err(e) => {
+                    // #4821 — HALT the sweep (the #3116 fail-closed shape):
+                    // the rollback log just refused a write, so no later
+                    // cluster can be made reversible either. Stop here rather
+                    // than spend LLM calls and retry write-aheads against it.
                     report.rollback_write_ahead_failed = true;
+                    report.halted_on_rollback_degraded = true;
                     report.errors.push(format!(
                         "{}: {}: {e}",
                         self.name(),
                         crate::autonomy::ROLLBACK_WRITE_AHEAD_FAILED
                     ));
-                    continue;
+                    report.errors.push(format!(
+                        "{}: sweep halted — the rollback log is not writable, so the \
+                         remaining clusters are deferred untouched",
+                        self.name()
+                    ));
+                    break;
                 }
             };
             let versions: Vec<i64> = members.iter().map(|memory| memory.version).collect();
@@ -2070,6 +2086,7 @@ mod tests {
             );
             let summarised = llm.calls.lock().unwrap().iter().count();
             assert_eq!(summarised, 1, "cluster two must never be summarised");
+            assert!(report.halted_on_rollback_degraded, "{:?}", report.errors);
             assert!(report.rollback_write_ahead_failed);
             assert_eq!(report.memories_consolidated, 0);
             for source in &candidates {
