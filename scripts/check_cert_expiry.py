@@ -787,9 +787,12 @@ class SelfTest:
         return text
 
 
-GIT_SHIM = """#!{python}
+GIT_SHIM = """#!{python} -I
 import os, sys
 real, argv = {real!r}, sys.argv[1:]
+if argv == ["--shim-isolation-probe"]:
+    print(sys.flags.isolated, os.path.dirname(os.path.abspath(__file__)) in sys.path)
+    sys.exit(0)
 if "--version" in argv and {version!r}:
     print({version!r})
     sys.exit(0)
@@ -800,6 +803,41 @@ os.execv(real, [real] + argv)
 """
 
 
+def write_git_shim(shim_dir, real, version="", fail=""):
+    """Write the executable `git` PATH shim into shim_dir (#6145: its interpreter
+    line is `python3 -I`, like the gate itself in c8-precheck.yml, so the shim's
+    own directory is never on its sys.path)."""
+    shim = shim_dir / "git"
+    shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version=version,
+                                    fail=fail), encoding="utf-8")
+    shim.chmod(0o755)
+    return shim
+
+
+def shim_isolation_violation(tmp):
+    """None when the git shim is isolated, else a description (#6145). Runs the
+    shim's own probe: it reports `sys.flags.isolated` and whether its own
+    directory is on `sys.path` (without -I the script directory is sys.path[0],
+    so a module planted beside the shim would be importable)."""
+    real = shutil.which("git")
+    if real is None:
+        raise GateError("git is not on PATH")
+    shim_dir = Path(tempfile.mkdtemp(prefix="gitshim-iso.", dir=str(tmp)))
+    try:
+        shim = write_git_shim(shim_dir, real)
+        first = shim.read_text(encoding="utf-8").splitlines()[0]
+        if not first.startswith("#!") or first.split()[1:] != ["-I"]:
+            return f"shim interpreter line {first!r} is not '<python> -I'"
+        res = subprocess.run([str(shim), "--shim-isolation-probe"], capture_output=True,
+                             text=True, cwd=str(shim_dir), check=False)
+        if res.returncode != 0 or res.stdout.split() != ["1", "False"]:
+            return ("the shim is not isolated: probe printed "
+                    f"{res.stdout.strip()!r} (want '1 False'), rc {res.returncode}: {res.stderr}")
+        return None
+    finally:
+        shutil.rmtree(shim_dir, ignore_errors=True)
+
+
 def run_gate_shimmed(tmp, repo, env, version="", fail=""):
     """run_gate with a PATH shim `git` that reports `version` for --version
     and exits 128 on any call whose argv contains `fail`, and otherwise
@@ -808,10 +846,7 @@ def run_gate_shimmed(tmp, repo, env, version="", fail=""):
     if real is None:
         raise GateError("git is not on PATH")
     shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
-    shim = shim_dir / "git"
-    shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version=version,
-                                    fail=fail), encoding="utf-8")
-    shim.chmod(0o755)
+    write_git_shim(shim_dir, real, version, fail)
     saved = os.environ.get("PATH")
     os.environ["PATH"] = f"{shim_dir}{os.pathsep}{saved or ''}"
     try:
@@ -1253,6 +1288,9 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     rc, out, err = run_gate_shimmed(tmp, repo, env7, fail="--is-ancestor")
     if rc != 1 or "merge-base --is-ancestor exited 128" not in out + err:
         t.fail("(anc-error): an is-ancestor error did not fail closed:", out + err)
+    iso = shim_isolation_violation(tmp)
+    if iso is not None:
+        t.fail(f"(shim-isolation, #6145): {iso}")
     rc, out, err = run_gate_shimmed(tmp, repo, env7)
     if rc != 0:
         t.fail("(shim-control): the pass-through git shim was REJECTED:", out + err)
@@ -1423,7 +1461,8 @@ SELF_TEST_OK = (
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
     "octopus merge RED; (ci1-ci7, #5970) the event payload range is authoritative under "
     "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
-    "outside CI."
+    "outside CI; (shim-isolation, #6145) the git PATH shim runs under python3 -I: isolated flag set and "
+    "its own directory off sys.path."
 )
 
 
