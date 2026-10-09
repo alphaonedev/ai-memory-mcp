@@ -60,7 +60,16 @@ fn run_with_config_bounded(
     args: &[&str],
     deadline: Option<std::time::Duration>,
 ) -> String {
-    let root = scratch("run");
+    run_in(&scratch("run"), db_value, args, deadline)
+}
+
+/// [`run_with_config_bounded`] inside a caller-prepared scratch `root`.
+fn run_in(
+    root: &TempDir,
+    db_value: Option<&str>,
+    args: &[&str],
+    deadline: Option<std::time::Duration>,
+) -> String {
     let keys = root.path().join("keys");
     key_dir_sandbox::mkdir_0700(&keys);
     let xdg = root.path().join("home/.config");
@@ -159,4 +168,42 @@ fn doctor_never_echoes_a_scheme_less_db_flag_credential_6106() {
     assert_clean(&text, "--db <kv dsn> doctor", &value);
     let json = run_with_config(None, &["--db", &value, "doctor", "--json"]);
     assert_clean(&json, "--db <kv dsn> doctor --json", &value);
+}
+
+/// The deferred-audit journal and spool sit BESIDE the database file, so
+/// their paths carry the `db` value. When the spool's ancestor chain is
+/// refused (here: a world-writable, non-sticky parent, refused on any host)
+/// `serve` logs the journal path and the error chain, which names the
+/// refused ancestor; both must render through the allowlist (#6106).
+#[cfg(unix)]
+#[test]
+fn serve_deferred_audit_failure_never_echoes_a_config_db_credential_6106() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for (dir, value) in [
+        (
+            "open",
+            format!("open/host=db.example password={MARKER} dbname=mem"),
+        ),
+        (
+            "open/postgres:/svc:{MARKER}@db.example",
+            format!("open/postgres:/svc:{MARKER}@db.example/mem"),
+        ),
+    ] {
+        let root = scratch("audit");
+        let parent = root.path().join(dir.replace("{MARKER}", MARKER));
+        std::fs::create_dir_all(&parent).expect("mkdir db parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod 0777");
+        let text = run_in(
+            &root,
+            Some(&value),
+            &["serve", "--port", "0"],
+            Some(SERVE_DEADLINE),
+        );
+        assert!(
+            text.contains("deferred-audit"),
+            "the cell must reach the deferred-audit boot path for {value:?}:\n{text}"
+        );
+        assert_clean(&text, "serve deferred-audit boot failure", &value);
+    }
 }
