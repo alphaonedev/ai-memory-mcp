@@ -1376,12 +1376,28 @@ class Evasions6118(_GuardHelpers6118, unittest.TestCase):
     def test_6118_r6_6296_escaped_quoted_key_in_step(self) -> None:
         self._config_in_step(self.ESCAPED_KEY)
 
-    def test_6118_r6_6296_env_table_rustflags_in_config_file(self) -> None:
-        self._config_in_file(self.ENV_FLAGS)
-        self._config_in_file(self.ENV_ENCODED)
+    def test_6118_r6_6316_env_table_rustflags_is_inert_in_config_file(self) -> None:
+        # cargo 1.98 ignores [env] RUSTFLAGS / CARGO_ENCODED_RUSTFLAGS for rustc.
+        for body in (self.ENV_FLAGS, self.ENV_ENCODED, '[env]\nRUSTFLAGS = "-g"\n'):
+            self.assertEqual([], self._repo_mutated(".cargo/config.toml", body), body)
+            self.assertEqual([], self._repo_mutated("Cargo.toml", body), body)
 
-    def test_6118_r6_6296_env_table_rustflags_in_step(self) -> None:
-        self._config_in_step(self.ENV_FLAGS)
+    def test_6118_r6_6316_env_table_rustflags_is_inert_in_step(self) -> None:
+        for body in (self.ENV_FLAGS, '[env]\nRUSTFLAGS = "-g"\n'):
+            self._clean(self._step("Write config", "cat >> .cargo/config.toml <<'EOF'\n" + body + "EOF"))
+
+    def test_6118_r6_6316_commented_out_rustflags_in_step_is_clean(self) -> None:
+        body = '[build]\n# rustflags = ["-g"]\nrustflags = ["-Dwarnings"]\n'
+        self._clean(self._step("Write config", "cat >> .cargo/config.toml <<'EOF'\n" + body + "EOF"))
+        self._clean(self._step("Write config", "printf '[build]\\n# rustflags = [\"-g\"]\\n' >> .cargo/config.toml"))
+
+    def test_6118_r6_6316_commented_out_profile_override_in_step_is_clean(self) -> None:
+        body = '# [profile.dev.package."*"]\n# debug = 2\n[term]\nquiet = false\n'
+        self._clean(self._step("Write config", "cat >> .cargo/config.toml <<'EOF'\n" + body + "EOF"))
+
+    def test_6118_r6_6316_env_assignment_text_in_a_file_heredoc_is_clean(self) -> None:
+        # Data written to a FILE (not $GITHUB_ENV, not an interpreter) is read by the TOML rules only.
+        self._clean(self._step("a", "cat > notes.txt <<'EOF'\nRUSTFLAGS=-g\nEOF"))
 
     def test_6118_r6_6296_benign_multiline_string_is_clean(self) -> None:
         body = '[build]\nrustflags = """\n-Dwarnings\n"""\n[term]\nquiet = false\n'
@@ -1484,6 +1500,77 @@ class Evasions6118(_GuardHelpers6118, unittest.TestCase):
                      '[build]\nrustc = "scripts/ci/fake-rustc.sh"\n'):
             self._config_in_file(body)
             self._config_in_step(body)
+
+
+    # ---- #6311: profile overrides as inline tables one level above the package table ----
+
+    INLINE_PKG = '[profile]\ndev = { package = { "*" = { debug = 2 } } }\n'
+    INLINE_TOP = 'profile = { dev = { package = { "*" = { debug = 2 } } } }\n'
+    INLINE_BO = '[profile]\ndev = { build-override = { debug = 2 } }\n'
+    INLINE_TEST = '[profile]\ntest = { package = { serde = { debug = "limited" } } }\n'
+
+    def test_6118_r6_6311_inline_package_table_under_profile_in_config_file(self) -> None:
+        for body in (self.INLINE_PKG, self.INLINE_TOP, self.INLINE_BO, self.INLINE_TEST):
+            self._config_in_file(body)
+
+    def test_6118_r6_6311_inline_package_table_under_profile_in_cargo_toml(self) -> None:
+        for body in (self.INLINE_PKG, self.INLINE_TOP, self.INLINE_BO, self.INLINE_TEST):
+            found = self._repo_mutated("Cargo.toml", body)
+            self.assertTrue(self._debug_flagged(found), (body, found))
+
+    def test_6118_r6_6311_inline_package_table_under_profile_in_step(self) -> None:
+        for body in (self.INLINE_PKG, self.INLINE_TOP, self.INLINE_BO, self.INLINE_TEST):
+            self._config_in_step(body)
+
+    def test_6118_r6_6311_inline_overrides_that_do_not_raise_debuginfo_are_clean(self) -> None:
+        for body in ('[profile]\ndev = { opt-level = 1 }\n',
+                     '[profile]\ndev = { package = { "*" = { debug = 0 } } }\n',
+                     '[profile]\nrelease = { package = { "*" = { debug = 2 } } }\n',
+                     'profile = { release = { debug = 2 } }\n'):
+            self.assertEqual([], self._repo_mutated(".cargo/config.toml", body), body)
+
+    # ---- #6312: shell spellings of a rustc flags assignment (value semantics of bash) ----
+
+    SHELL_BAD = (
+        ("append", 'export RUSTFLAGS+=" -g"\ncargo test --no-run'),
+        ("append, no space", "RUSTFLAGS+=-g cargo test --no-run"),
+        ("locale string", 'RUSTFLAGS=$"-Copt-level=0 -g" cargo test --no-run'),
+        ("dq then bare concat", 'RUSTFLAGS="-Copt-level=0 "-g cargo test --no-run'),
+        ("bare then sq concat", "RUSTFLAGS=-Copt-level=0' -g' cargo test --no-run"),
+        ("dq continuation", 'RUSTFLAGS="-Copt-level=0 \\\n  -g" cargo test --no-run'),
+        ("dq multi-line value", 'export RUSTFLAGS="-Copt-level=0\n-g"\ncargo test --no-run'),
+        ("variable indirection", 'F=-g\nRUSTFLAGS="$F" cargo test --no-run'),
+        ("braced indirection", 'DBG="-C debuginfo=2"\nexport RUSTFLAGS="${DBG}"'),
+        ("command substitution", 'RUSTFLAGS="$(printf %s -g)" cargo test --no-run'),
+        ("backtick substitution", "RUSTFLAGS=`printf %s -g` cargo test --no-run"),
+        ("printf -v", "printf -v RUSTFLAGS '%s' -g\nexport RUSTFLAGS\ncargo test --no-run"),
+        ("read here-string", "read -r RUSTFLAGS <<< '-g'\nexport RUSTFLAGS\ncargo test --no-run"),
+        ("encoded separator in substitution", 'CARGO_ENCODED_RUSTFLAGS="$(printf \'-Copt-level=0\\x1f-g\')" cargo t'),
+        ("GITHUB_ENV echo heredoc", '{ echo "RUSTFLAGS<<EOF"; echo "-g"; echo "EOF"; } >> "$GITHUB_ENV"'),
+        ("GITHUB_ENV echo", 'echo "RUSTFLAGS=-g" >> "$GITHUB_ENV"'),
+        ("bash -c", "bash -c 'RUSTFLAGS=-g cargo test --no-run'"),
+        ("env prefix", "env RUSTFLAGS=-g cargo test --no-run"),
+        ("encoded dash escape", "RUSTFLAGS=$'\\x2dg' cargo test --no-run"),
+        ("debug env computed", 'L=2\nexport CARGO_PROFILE_DEV_DEBUG="$L"'),
+    )
+    SHELL_GOOD = (
+        ("npm -g", "npm install -g foo"),
+        ("RUSTFLAGS -D", 'RUSTFLAGS="-D warnings" cargo test --no-run'),
+        ("git log -g", "git log -g -1"),
+        ("debuginfo 0", 'echo "RUSTFLAGS=-C debuginfo=0" >> "$GITHUB_ENV"'),
+        ("prose mentions the flag", "echo 'build with RUSTFLAGS -g is slow' >&2"),
+        ("comment", "# RUSTFLAGS=-g would be slow\ncargo test --no-run"),
+    )
+
+    def test_6118_r6_6312_every_bad_shell_spelling_is_caught(self) -> None:
+        for label, run in self.SHELL_BAD:
+            with self.subTest(label):
+                self._caught(self._step("a", run))
+
+    def test_6118_r6_6312_benign_shell_lines_stay_clean(self) -> None:
+        for label, run in self.SHELL_GOOD:
+            with self.subTest(label):
+                self._clean(self._step("a", run))
 
 
 
@@ -2295,6 +2382,7 @@ class PruneScript6118(unittest.TestCase):
         dwarf.chmod(0o500)
         self.addCleanup(restore_mode, dwarf, 0o700)
         for attempt in range(3):
+            _write(self.target / "debug" / "deps" / "mcp_input_schema-7c7c", 120000, True)
             proc = self._run("--target-dir", str(self.target))
             self.assertEqual(0, proc.returncode, (attempt, proc.stdout, proc.stderr))
             self.assertRegex(proc.stdout, r"(?m)^::notice::prune-runner-target freed_bytes=\d+ deleted=\d+ "
@@ -2368,6 +2456,70 @@ class PruneScript6118(unittest.TestCase):
         self.assertEqual(1, len(kept), proc.stdout)
         self.assertIn("unreadable, not verified", kept[0])
         self.assertNotIn("same name, size and content", kept[0])
+
+    def test_6118_r6_6313_escape_is_injective_on_backslash(self) -> None:
+        # #6313: a literal backslash used to pass through, so the text "\\x0a" (backslash,
+        # x, 0, a) read exactly like an escaped newline.  Every output must decode one way.
+        mod = _load_prune()
+        self.assertEqual("\\\\", mod._escape("\\"))
+        self.assertNotEqual(mod._escape("a\nb"), mod._escape("a\\x0ab"))
+        self.assertNotEqual(mod._escape("a\u2028b"), mod._escape("a\\u{2028}b"))
+        samples = ["", "\\", "\\\\", "\n", "\\n", "\\x0a", "\x0a", "a\\", "\u2028", "\\u{2028}",
+                   "\u202e", "\\u{202e}", "plain", "é", "\\\n", "\x1b[31m", "\\x1b[31m"]
+        outs = [mod._escape(x) for x in samples]
+        self.assertEqual(len(set(samples)), len(set(outs)), list(zip(samples, outs)))
+
+    def test_6118_r6_6313_backslash_name_is_logged_escaped(self) -> None:
+        deps = self.target / "debug" / "deps"
+        _write(deps / "back\\x0aslash-0123456789abcdef", 130000, True)
+        proc = self._run("--target-dir", str(self.target), "--dry-run")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("back\\\\x0aslash-0123456789abcdef", proc.stdout)
+
+    def test_6118_r6_6314_unreadable_profile_side_partner_is_kept_and_not_called_a_match(self) -> None:
+        # #6314: the kept line must not claim "same content" when the bytes were never compared;
+        # the unreadable file here is the uplifted copy in the profile dir.
+        if UID0:
+            self.skipTest("root reads any file")
+        deps = self.target / "debug" / "deps"
+        up = self.target / "debug" / "unrp-bin"
+        _write(up, 4096, True)
+        cand = deps / "unrp_bin-bbbbbbbbbbbbbbbb"
+        _write(cand, 4096, True)
+        up.chmod(0o111)
+        self.addCleanup(restore_mode, up, 0o755)
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertTrue(cand.exists(), proc.stdout)
+        kept = [ln for ln in proc.stdout.splitlines() if "kept deps/unrp_bin-bbbbbbbbbbbbbbbb" in ln]
+        self.assertEqual(1, len(kept), proc.stdout)
+        self.assertIn("content unreadable, not verified", kept[0])
+        self.assertNotIn("same name, size and content", kept[0])
+
+    def test_6118_r6_6314_readable_identical_partner_still_says_same_content(self) -> None:
+        deps = self.target / "debug" / "deps"
+        _write(self.target / "debug" / "okrd-bin", 4096, True)
+        _write(deps / "okrd_bin-cccccccccccccccc", 4096, True)
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        kept = [ln for ln in proc.stdout.splitlines() if "kept deps/okrd_bin-cccccccccccccccc" in ln]
+        self.assertEqual(1, len(kept), proc.stdout)
+        self.assertIn("same name, size and content", kept[0])
+
+    def test_6118_r6_6315_missing_dir_fd_support_is_refused_for_every_function(self) -> None:
+        # #6315: each of os.open / os.stat / os.unlink / os.rmdir / os.readlink is a separate
+        # fail-closed refusal; dropping any one from the check must fail a test.
+        mod = _load_prune()
+        for fn in (os.open, os.stat, os.unlink, os.rmdir, os.readlink):
+            with self.subTest(fn.__name__):
+                out = io.StringIO()
+                supported = set(os.supports_dir_fd) - {fn}
+                with unittest.mock.patch.object(mod.os, "supports_dir_fd", supported), \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                    rc = mod.main(["--target-dir", str(self.target)])
+                self.assertEqual(2, rc, out.getvalue())
+                self.assertIn("dir_fd support for %s" % fn.__name__, out.getvalue())
+                self.assertTrue((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
 
     def test_6118_r6_6303_restore_mode_tolerates_a_removed_path(self) -> None:
         gone = Path(self.scratch.name) / "removed-by-the-prune"
