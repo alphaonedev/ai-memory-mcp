@@ -335,3 +335,89 @@ async fn dispatch_event_postgres_zero_subs_is_noop() {
     .await;
     // No assertion needed — the test passes iff the call returned.
 }
+
+/// #4076 — the postgres-daemon `agent_notified` webhook lane
+/// (`write_events::agent_notified_webhook_postgres`) must also put exactly
+/// one top-level `correlation_id` (the delivery UUID) on the wire, so a
+/// receiver that parses the body and echoes it is acked. The notification
+/// digest travels as `notification_correlation_id`.
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_agent_notified_body_echo_is_acked_4076() {
+    use ai_memory::write_events::{
+        AgentNotified, agent_notified_webhook_postgres, correlation_id_for,
+    };
+    use common::tls_receiver::Recorded;
+
+    ai_memory::config::set_allow_loopback_webhooks(true);
+    let tls = common::tls_receiver::dispatch_tls(&std::env::temp_dir());
+    let body_echo: common::tls_receiver::Responder = Arc::new(|req: &Recorded| {
+        let echoed = serde_json::from_slice::<serde_json::Value>(&req.body)
+            .ok()
+            .and_then(|v| {
+                v.get("correlation_id")
+                    .and_then(|c| c.as_str().map(str::to_string))
+            })
+            .unwrap_or_default();
+        Respond::ok().json(serde_json::json!({"status": "ack", "correlation_id": echoed}))
+    });
+    let server = TlsReceiver::start_with(tls, body_echo).await;
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let path_str = format!("/sink/{unique}");
+    let (state, audit_path) = make_test_state();
+    let url = format!("{}{}", server.uri(), path_str);
+    let ns = format!("_messages/ai:recipient-{unique}");
+    let sub_mem = make_subscription_memory(
+        &format!("sub-4076-{unique}"),
+        "probe",
+        &url,
+        &ns,
+        Some(&sha256_hex_local("test-secret-4076")),
+    );
+    state
+        .store
+        .store(&CallerContext::for_admin("test-setup"), &sub_mem)
+        .await
+        .expect("seed subscription memory");
+
+    let inbox_row_id = format!("inbox-row-{unique}");
+    agent_notified_webhook_postgres(
+        &state,
+        &AgentNotified {
+            recipient_agent_id: "ai:recipient-4076",
+            sender_agent_id: "ai:sender-4076",
+            inbox_row_id: &inbox_row_id,
+            namespace: &ns,
+            content: "body-placeholder-4076",
+        },
+    )
+    .await;
+    wait_dispatch_idle().await;
+
+    let received = server.received_requests().await.unwrap_or_default();
+    let req = received
+        .iter()
+        .find(|r| r.url.path() == path_str)
+        .expect("agent_notified reached the sink");
+    let raw = String::from_utf8_lossy(&req.body).into_owned();
+    assert_eq!(
+        raw.matches("\"correlation_id\":").count(),
+        1,
+        "#4076: one top-level correlation_id on the postgres lane; body = {raw}"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json body");
+    assert_eq!(
+        body.get("notification_correlation_id")
+            .and_then(|v| v.as_str()),
+        Some(correlation_id_for(&inbox_row_id).as_str()),
+        "{raw}"
+    );
+    let status: String = rusqlite::Connection::open(&audit_path)
+        .expect("open audit db")
+        .query_row(
+            "SELECT delivery_status FROM subscription_events WHERE subscription_id = ?1",
+            [format!("sub-4076-{unique}")],
+            |r| r.get(0),
+        )
+        .expect("audit row");
+    assert_eq!(status, "ack", "#4076: the body-echo receiver must be acked");
+}
