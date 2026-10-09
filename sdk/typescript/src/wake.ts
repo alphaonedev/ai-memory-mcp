@@ -520,8 +520,29 @@ function checkBundleStat(path: string, st: Stats): void {
  * the key directory this loader serves are POSIX-only surfaces today.
  */
 function readOwnerOnly(path: string): string {
-  const noFollow = fsConstants.O_NOFOLLOW;
-  const nonBlock = fsConstants.O_NONBLOCK;
+  return readOwnerOnlyWith(path, {
+    noFollow: fsConstants.O_NOFOLLOW,
+    nonBlock: fsConstants.O_NONBLOCK,
+  });
+}
+
+/**
+ * The flags a platform's `node:fs` offers for binding the check to the
+ * descriptor. Both are `undefined` on Windows (#3812).
+ */
+export interface OwnerOnlyOpenFlags {
+  noFollow?: number;
+  nonBlock?: number;
+}
+
+/**
+ * {@link readOwnerOnly} with the platform flags passed in, so a POSIX test can
+ * exercise the Windows leg (#3812). Not part of the SDK's public surface.
+ *
+ * @internal
+ */
+export function readOwnerOnlyWith(path: string, flags: OwnerOnlyOpenFlags): string {
+  const { noFollow, nonBlock } = flags;
   if (typeof noFollow !== "number" || typeof nonBlock !== "number") {
     // Windows. Documented above: the pre-#3780 shape, verbatim.
     const st = lstatSync(path);
