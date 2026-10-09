@@ -215,3 +215,8 @@ reads documentation through a path that names none of `docs` or `.md` (extend
 `DOC_READER_RE`), and to a test that reaches `changelog.d/` without naming
 it, spawning a tool or a repo script, or walking from the repository root
 (extend `CHANGELOG_READER_RE` or `TOOL_SPAWN_RE`).
+
+**Lineage correction.** The series is cut from `72ca19c23`. Its first two
+commits carry stale `Base:` trailers and are not rewritten: `35f2729b1` says
+`Base: 24ea76fb3` (its parent is `72ca19c23`) and `923248059` says
+`Base: fb8998028` (its parent is `35f2729b1`).
