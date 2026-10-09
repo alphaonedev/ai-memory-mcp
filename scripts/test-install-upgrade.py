@@ -90,6 +90,20 @@ class PackagingContract(unittest.TestCase):
                 missing = [line for line in reference if line not in lines]
                 self.assertEqual(missing, [], f'ai-memory-{name}.service lacks hardening lines')
 
+    def test_backup_unit_cannot_write_the_key_store(self):
+        # #4325 — under ProtectSystem=strict the service user's HOME is the
+        # state dir, so `ReadWritePaths=<state_dir>` (needed for the WAL/SHM
+        # sidecars, #3522) also exposed `<state_dir>/.config` — the operator
+        # signing key and the local TLS CA — to the hourly backup job. The
+        # backup only READS the signing key; the nested read-only grant wins
+        # over the enclosing read-write one (deeper paths are applied later).
+        main = self._unit_lines('ai-memory')
+        working = next(line for line in main if line.startswith('WorkingDirectory='))
+        state_dir = working.split('=', 1)[1]
+        backup = self._unit_lines('ai-memory-backup')
+        self.assertIn(f'ReadOnlyPaths=-{state_dir}/.config', backup,
+                      'the backup unit must grant the key store read-only')
+
     def test_read_only_paths_mark_optional_directories(self):
         # `ReadOnlyPaths=/etc/ai-memory` without `-` fails the unit on a host
         # where the directory does not exist; the `-` form starts without it.
