@@ -16,7 +16,8 @@ included), an Authorization Bearer/Basic value, a GitHub, AWS access key id, Sla
 personal access, Google API or npm token, a JSON Web Token, a PEM, PGP or PuTTY private key block, and the value on the
 line after a credential name that has none on its own line (#6211). A diff line inside a private key block is masked by
 its index on its own side, so it is masked even when the BEGIN line lies outside its hunk. Lines this script writes are
-never masked, and the verdict is computed on the unmasked text.
+never masked, and the verdict is computed on the unmasked text. Control and format characters of head text (ESC, CSI,
+BEL, a bidirectional override) are written as escapes before they reach the summary (#6212).
 
 The BASE guard (scripts/check-claude-md-size.py of the base checkout) and the BASE manifest
 (scripts/qc-allowlists/claude-md-rule-sections.sha256) then judge the head copies:
@@ -68,6 +69,7 @@ import shutil
 import stat
 import subprocess
 import tokenize
+import unicodedata
 from pathlib import Path
 from typing import NamedTuple
 
@@ -144,6 +146,8 @@ NAME_ONLY = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\
 # A next line that is a heading, a table row or a nested `key:` of its own is structure, not the value.
 STRUCTURE_LINE = re.compile(r"(?:#|\||[\w-]+:(?:\s|$))")
 MASK = "[MASKED]"
+# #6212: Unicode categories of head text that are escaped before they reach the summary (see printable).
+UNPRINTABLE_CATEGORIES = ("Cc", "Cf", "Cs", "Zl", "Zp")
 MAX_BLOB_BYTES = 2 * 1024 * 1024  # far above any legitimate file; refuses a memory-exhaustion blob
 # Messages of the base guard that the section comparison already reports in its own words.
 DRIFT_MARKERS = ("changed: sha256", "is not pinned in", "is missing from CLAUDE.md")
@@ -224,9 +228,24 @@ def section_texts(guard, text: str) -> dict:
     return {key: "\n".join(lines) for key, lines in bodies.items()}
 
 
+def printable(text: str) -> str:
+    """#6212: `text` with every control, format, surrogate or line/paragraph separator character except newline and
+    tab written as a `\\xHH` / `\\uHHHH` / `\\UHHHHHHHH` escape, so head text can never send a terminal escape
+    sequence (ESC, CSI, BEL) or a bidirectional override to whoever reads the summary or the job log."""
+    out = []
+    for char in text:
+        if char in "\n\t" or unicodedata.category(char) not in UNPRINTABLE_CATEGORIES:
+            out.append(char)
+            continue
+        code = ord(char)
+        out.append(f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}" if code < 0x10000 else f"\\U{code:08x}")
+    return "".join(out)
+
+
 def fenced(body: str, info: str = "diff") -> list:
     """R4 (#4507): a code fence one backtick longer than the longest backtick run in `body`, so head text can
-    never close the block early and render as Markdown in the job summary."""
+    never close the block early and render as Markdown in the job summary. #6212: `body` is made printable first."""
+    body = printable(body)
     longest = max((len(run) for run in re.findall(r"`+", body)), default=0)
     fence = "`" * max(3, longest + 1)
     return [fence + info, body, fence]
@@ -234,8 +253,9 @@ def fenced(body: str, info: str = "diff") -> list:
 
 def span(text: str) -> str:
     """R5 (#5166): head-controlled text outside a fence (a heading, a guard message, a trailer value) as one
-    inline code span, longer than any backtick run inside it, on one line, so it never renders as Markdown."""
-    flat = " ".join(text.splitlines())
+    inline code span, longer than any backtick run inside it, on one line, so it never renders as Markdown.
+    #6212: line breaks become spaces first (R5), then the rest is made printable."""
+    flat = printable(" ".join(text.splitlines()))
     ticks = "`" * (max((len(run) for run in re.findall(r"`+", flat)), default=0) + 1)
     return f"{ticks} {flat} {ticks}"
 
@@ -513,6 +533,13 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
     return "\n".join(lines + redactor.note()) + "\n", failed
 
 
+def closed_failure(exc: Exception) -> str:
+    """The report of a comparison that failed closed on `exc`. #6212: the message may quote head data, so it is
+    masked, put on one line and made printable like any other head text."""
+    message = printable(" ".join(Redactor().mask(str(exc)).splitlines()))
+    return f"## CLAUDE.md rule-change comparison\n\nRESULT: FAIL (closed) - {message}\n"
+
+
 def run(args) -> int:
     if not sys.flags.isolated:
         # R5 (#5163): second line of defence for a caller that imports this module; the refusal that
@@ -527,7 +554,7 @@ def run(args) -> int:
             git(Path(args.repo), *head_fetch_args(args.pr_number))
         report, failed = compare(Path(args.base_root), Path(args.repo), args.base_sha, args.head_sha, scratch)
     except (RuntimeError, OSError, UnicodeDecodeError, ValueError, SyntaxError) as exc:
-        report, failed = f"## CLAUDE.md rule-change comparison\n\nRESULT: FAIL (closed) - {exc}\n", True
+        report, failed = closed_failure(exc), True
     print(report)
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as handle:
@@ -687,7 +714,7 @@ def plant_coverage_gap(probed: list, names: list, rounds: int) -> bool:
 # truth that does not come from imported_modules() itself. Adding or removing an import without updating this tuple
 # makes the self-test red.
 EXPECTED_IMPORTS = ("argparse", "ast", "difflib", "importlib", "os", "pathlib", "py_compile", "re", "shutil", "stat",
-                    "subprocess", "tokenize", "typing")
+                    "subprocess", "tokenize", "typing", "unicodedata")
 
 
 def import_pin_gap(found: list, pinned) -> tuple:
@@ -1522,6 +1549,15 @@ def _self_test_cases() -> int:
         else:
             failures.append(f"span {raw!r}")
             print(f"FAIL: self-test - span({raw!r}) = {span(raw)!r}, wanted {want!r} (#5282)", file=sys.stderr)
+
+    # #6212: a fail-closed message is printed on one line, masked and with its control characters escaped.
+    closed = closed_failure(RuntimeError("bad head\x1b[2K\nsecond line password=6163-canary-closed"))
+    if ("\x1b" not in closed and "bad head\\x1b[2K second line password=[MASKED]" in closed
+            and "6163-canary-closed" not in closed):
+        print("PASS: self-test - #6212 a fail-closed message is masked, on one line and escaped")
+    else:
+        failures.append("closed_failure")
+        print(f"FAIL: self-test - #6212 closed_failure gave {closed!r}", file=sys.stderr)
 
     def tick_heading(root):
         target = root / "CLAUDE.md"
