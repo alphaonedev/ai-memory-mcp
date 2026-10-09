@@ -66,7 +66,7 @@ use crate::identity::keypair::AgentKeypair;
 use crate::models::{MemoryKind, MemoryLinkRelation};
 
 use super::skill_register::{
-    RegisterResult, register_core, resource_digest, validate_parameters_schema,
+    RegisterCoreError, RegisterResult, register_core, resource_digest, validate_parameters_schema,
 };
 
 /// Compiled default for `governance.skill_promotion_min_depth` when the
@@ -464,23 +464,21 @@ impl McpTool for SkillPromoteFromReflectionTool {
     }
 }
 
-/// Suffix of the one first-party refusal `register_core` raises as a bare
-/// `String` (`skill lineage '<ns>/<name>' is retired; ...`, #2024).
-const RETIRED_LINEAGE_REFUSAL_SUFFIX: &str = "is retired; unretire before re-registering";
-
-/// #6133 - lift a `register_core` string error onto the typed `anyhow` chain.
+/// #6133 / #6146 - lift a `register_core` error onto the typed `anyhow` chain.
 ///
-/// The retired-lineage refusal is our own actionable text, so it is planted
-/// as a typed `refusal` (copying the precedent at the minimum-depth refusal
-/// above) and reaches the caller verbatim on MCP and HTTP. Every other
-/// `register_core` string stays untyped: it is either already-sanitized
-/// `mcp_foreign_err` output or foreign serialization / compression text,
-/// and must keep classifying as foreign so it is withheld (ERRORS-15).
-fn register_core_error(msg: String) -> anyhow::Error {
-    if msg.starts_with("skill lineage '") && msg.ends_with(RETIRED_LINEAGE_REFUSAL_SUFFIX) {
-        crate::errors::refusal(msg)
-    } else {
-        anyhow::Error::msg(msg)
+/// The retired-lineage refusal is our own actionable text, so its typed
+/// variant is planted as a typed `refusal` (copying the precedent at the
+/// minimum-depth refusal above) and reaches the caller verbatim on MCP and
+/// HTTP. The match is on the VARIANT, never the text (#6146): every other
+/// `register_core` error stays untyped - it is either already-sanitized
+/// `mcp_foreign_err` output or foreign serialization / compression text, and
+/// must keep classifying as foreign so it is withheld (ERRORS-15).
+fn register_core_error(err: RegisterCoreError) -> anyhow::Error {
+    match err {
+        refused @ RegisterCoreError::RetiredLineage { .. } => {
+            crate::errors::refusal(refused.to_string())
+        }
+        RegisterCoreError::Foreign(msg) => anyhow::Error::msg(msg),
     }
 }
 
@@ -667,6 +665,25 @@ mod tests {
             crate::mcp::error_text::mcp_foreign_err("issue_6146", shaped),
             crate::mcp::error_text::DB_ERROR_TEXT
         );
+    }
+
+    /// #6146: the typed variant reaches the caller as a refusal whatever its
+    /// text says - the classification reads the variant, so a reworded
+    /// refusal still reaches the caller verbatim.
+    #[test]
+    fn issue_6146_retired_lineage_variant_is_a_refusal_by_type() {
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
+        let refused = RegisterCoreError::RetiredLineage {
+            namespace: "ns-6146".into(),
+            name: "lineage".into(),
+        };
+        let text = refused.to_string();
+        let mapped = crate::errors::MemoryError::from(register_core_error(refused));
+        assert!(
+            matches!(&mapped, crate::errors::MemoryError::Refused(m) if *m == text),
+            "{mapped:?}"
+        );
+        assert_eq!(crate::mcp::error_text::mcp_error_text(&mapped), text);
     }
 
     #[test]
