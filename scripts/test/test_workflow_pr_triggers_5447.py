@@ -3397,6 +3397,168 @@ class ExternalPrApprovalEntrypoint6226(_Scratch6117):
         self.assertEqual(0, out.returncode, "the mutant must pass vacuously, proving the cell is load-bearing")
 
 
+CARRIER_CONSUMERS = (
+    ("Run declaration hash gate", "DECLARATION_GATE_BASE",
+     "${{ github.event.pull_request.base.sha || steps.carrier.outputs.before || github.event.before }}"),
+    ("Run enterprise-federation cert-expiry gate", "GITHUB_EVENT_BEFORE",
+     "${{ steps.carrier.outputs.before || github.event.before }}"),
+    ("Run stale contract-assertion gate over the change range", "GITHUB_EVENT_BEFORE",
+     "${{ steps.carrier.outputs.before || github.event.before }}"),
+    ("Run count-assertion declaration gate over the change range", "GITHUB_EVENT_BEFORE",
+     "${{ steps.carrier.outputs.before || github.event.before }}"),
+)
+CARRIER_ARM_IF = 'if [ "$EVENT_NAME" = "push" ] && [ "${GITHUB_REF#refs/heads/chain/}" != "$GITHUB_REF" ]; then'
+CARRIER_ARM_IF_COVERAGE = ('if [ "${{ github.event_name }}" = "push" ] && '
+                           '[ "${GITHUB_REF#refs/heads/chain/}" != "$GITHUB_REF" ]; then')
+
+
+def _step_block(text: str, name: str) -> str:
+    """Raw lines of the step ``- name: <name>`` up to the next step or dedent."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)- name: \"?(.*?)\"?\s*$", line)
+        if m and m.group(2) == name:
+            indent = len(m.group(1))
+            end = len(lines)
+            for j in range(i + 1, len(lines)):
+                row = lines[j]
+                if row.strip() and len(row) - len(row.lstrip(" ")) <= indent:
+                    end = j
+                    break
+            return "\n".join(lines[i:end]) + "\n"
+    return ""
+
+
+def _carrier_arm(text: str, job: str, if_line: str) -> str:
+    """The body of the carrier-push arm inside the classify job (``""`` when absent)."""
+    body = _job_text(text, job)
+    start = body.find(if_line)
+    if start < 0:
+        return ""
+    end = body.find("\n          fi\n", start)
+    return body[start:end] if end > 0 else ""
+
+
+def _carrier_consumption_problems(ci: str, cov: str, c8: str) -> List[str]:
+    """What the carrier range is NOT doing (empty list = every consumer and arm is intact)."""
+    problems: List[str] = []
+    for step, key, rhs in CARRIER_CONSUMERS:
+        block = _step_block(c8, step)
+        if not block:
+            problems.append(f"c8-precheck step {step!r} is missing")
+        elif f"{key}: {rhs}\n" not in block:
+            problems.append(f"c8-precheck step {step!r} no longer reads {key}: {rhs}")
+    arm = _carrier_arm(ci, "classify", CARRIER_ARM_IF)
+    for want in ('echo "docs_only=false"', 'echo "test_impact=__ALL__"', "exit 0"):
+        if want not in arm:
+            problems.append(f"ci.yml classify carrier arm lacks {want}")
+    arm = _carrier_arm(cov, "classify", CARRIER_ARM_IF_COVERAGE)
+    for want in ('echo "docs_only=false"', "exit 0"):
+        if want not in arm:
+            problems.append(f"coverage.yml classify carrier arm lacks {want}")
+    return problems
+
+
+class CarrierRangeConsumed6117(unittest.TestCase):
+    """Cloud F1: the carrier range is CONSUMED and both classify steps keep the carrier arm.
+
+    The step that computes ``steps.carrier.outputs.before`` is pinned elsewhere; nothing
+    pinned that a gate reads it, nor that a docs-only lane merge onto a carrier still
+    classifies ``docs_only=false`` (a skipped job reports success and masks the verdict).
+    """
+
+    def setUp(self) -> None:
+        self.ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+        self.cov = (WORKFLOWS / "coverage.yml").read_text(encoding="utf-8")
+        self.c8 = C8_WORKFLOW.read_text(encoding="utf-8")
+
+    def mutate(self, which: str, old: str, new: str, count: int = 1) -> List[str]:
+        texts = {"ci": self.ci, "cov": self.cov, "c8": self.c8}
+        self.assertEqual(count, texts[which].count(old), f"mutation anchor {old!r}")
+        texts[which] = texts[which].replace(old, new)
+        return _carrier_consumption_problems(texts["ci"], texts["cov"], texts["c8"])
+
+    def test_6117_r3_f1_live_tree_is_intact(self) -> None:
+        self.assertEqual([], _carrier_consumption_problems(self.ci, self.cov, self.c8))
+
+    def test_6117_r3_f1_ci_classify_carrier_arm_removed_is_killed(self) -> None:
+        self.assertTrue(self.mutate("ci", CARRIER_ARM_IF, "if false; then"))
+
+    def test_6117_r3_f1_coverage_classify_carrier_arm_removed_is_killed(self) -> None:
+        self.assertTrue(self.mutate("cov", CARRIER_ARM_IF_COVERAGE, "if false; then"))
+
+    def test_6117_r3_f1_cert_expiry_range_start_reverted_is_killed(self) -> None:
+        step = _step_block(self.c8, "Run enterprise-federation cert-expiry gate")
+        mutant = step.replace("steps.carrier.outputs.before || ", "")
+        self.assertNotEqual(step, mutant)
+        self.assertTrue(self.mutate("c8", step, mutant))
+
+    def test_6117_r3_f1_declaration_gate_base_reverted_is_killed(self) -> None:
+        old = "github.event.pull_request.base.sha || steps.carrier.outputs.before || github.event.before"
+        self.assertTrue(self.mutate("c8", old, "github.event.pull_request.base.sha || github.event.before"))
+
+    def test_6117_r3_f1_all_four_before_consumers_reverted_is_killed(self) -> None:
+        mutant = self.c8.replace("steps.carrier.outputs.before || ", "")
+        self.assertEqual(4, self.c8.count("steps.carrier.outputs.before || "))
+        problems = _carrier_consumption_problems(self.ci, self.cov, mutant)
+        self.assertEqual(4, len(problems), problems)
+
+
+REQUIRED_SET_WORKFLOWS_6117 = ("ci.yml", "c8-precheck.yml", "coverage.yml", "cert-postgres-age.yml",
+                               "postgres-ignored.yml", "release-shape.yml")
+BEFORE_EXPR_OK = (
+    "${{ steps.carrier.outputs.before || github.event.before }}",
+    "${{ github.event.pull_request.base.sha || steps.carrier.outputs.before || github.event.before }}",
+)
+# The two classify steps read the bare push `before` only AFTER their carrier arm has
+# exited with docs_only=false (pinned by CarrierRangeConsumed6117), so they never see a
+# carrier push.  Any other bare consumer is a gate that narrows a carrier push.
+BEFORE_CLASSIFY_OK = {
+    "ci.yml": ("${{ github.event.before }}",),
+    "coverage.yml": ("${{ github.event.before }}",),
+}
+
+
+def _bare_before_consumers(texts: Dict[str, str]) -> List[str]:
+    """Every ``${{ ... github.event.before ... }}`` expression that has no carrier fallback."""
+    bad: List[str] = []
+    for name, text in texts.items():
+        for m in re.finditer(r"\$\{\{[^}]*github\.event\.before[^}]*\}\}", text):
+            expr = m.group(0)
+            if expr in BEFORE_EXPR_OK:
+                continue
+            if expr in BEFORE_CLASSIFY_OK.get(name, ()) and _job_text(text, "classify").find(expr) >= 0:
+                continue
+            line = text.count("\n", 0, m.start()) + 1
+            bad.append(f"{name}:{line}: {expr}")
+    return bad
+
+
+class CarrierBeforeClosedWorld6117(unittest.TestCase):
+    """Cloud F1 / vote 4d3ea1c5 testability lens: a fifth range consumer needs the carrier fallback."""
+
+    def texts(self) -> Dict[str, str]:
+        return {n: (WORKFLOWS / n).read_text(encoding="utf-8") for n in REQUIRED_SET_WORKFLOWS_6117}
+
+    def test_6117_r3_f1_every_github_event_before_has_the_carrier_fallback(self) -> None:
+        self.assertEqual([], _bare_before_consumers(self.texts()))
+
+    def test_6117_r3_f1_new_bare_consumer_is_killed(self) -> None:
+        texts = self.texts()
+        anchor = "          GITHUB_EVENT_BEFORE: ${{ steps.carrier.outputs.before || github.event.before }}\n"
+        self.assertIn(anchor, texts["c8-precheck.yml"])
+        texts["c8-precheck.yml"] = texts["c8-precheck.yml"].replace(
+            anchor, anchor + "          EXTRA_BASE: ${{ github.event.before }}\n", 1)
+        bad = _bare_before_consumers(texts)
+        self.assertEqual(1, len(bad), bad)
+        self.assertIn("c8-precheck.yml", bad[0])
+
+    def test_6117_r3_f1_bare_consumer_outside_classify_is_killed(self) -> None:
+        texts = self.texts()
+        texts["release-shape.yml"] += "      # x\n          B: ${{ github.event.before }}\n"
+        self.assertEqual(1, len(_bare_before_consumers(texts)))
+
+
 class GateScriptsRunIsolated6117(unittest.TestCase):
     """N-2 (#5163 class): the gate scripts the c8 workflow runs use ``python3 -I``.
 
