@@ -50,6 +50,15 @@ on:
       - "Cargo.lock"
       - "src/**"
       - "migrations/**"
+      # #6292: every other input the shipped binary is built from (the
+      # vendored path dependencies, the toolchain pin, cargo config, a build
+      # script, the image recipe). The guard refuses a Cargo.toml path
+      # dependency this filter does not cover.
+      - "vendor/**"
+      - "build.rs"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "Dockerfile"
   push:
     branches: ["release/**"]
   workflow_dispatch:
