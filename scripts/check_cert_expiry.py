@@ -112,7 +112,14 @@ after fetching the head and merge commit as objects. Trusted mode:
     header keys), differs between the merge commit's first parent and the merge
     commit, unless a `Rule-Change-Approved-By: <who>` trailer (the
     claude-md-rule-compare.py mechanism) is in first-parent..head. A trailer
-    never waives the section 7 verdict.
+    never waives the section 7 verdict; an approved guard change is also
+    printed as a `::warning title=GUARD CHANGED::` annotation;
+  * prints `GUARD SHADOW: <workflow> line <n>` and fails (not waivable) when
+    any workflow file at the merge commit, outside the guarded cert-expiry-gate
+    job, spells the required check name or a fragment of it (a second
+    producer of a required context; Refs #6177);
+  * fails closed on any git read error (a missing object is never "absent")
+    and on a blob above MAX_BLOB_BYTES.
 In every mode the cert doc is read through its tree entry: a symlink or any
 other non-regular entry at its path is refused (fail-closed), never followed.
 
@@ -771,12 +778,13 @@ JOB_KEY_RE = re.compile(r"  ([A-Za-z0-9_.-]+):[ \t]*(?:#.*)?")
 JOBS_KEY_RE = re.compile(r"jobs:[ \t]*(?:#.*)?")
 
 
-def guarded_workflow_text(text, job):
-    """The part of a workflow file the guard compares: every meaningful line
-    except those inside jobs other than JOB (blank and comment-only lines are
-    dropped). Header keys (on/permissions/env/defaults) stay guarded."""
+def workflow_regions(text, job):
+    """(line number, line, guarded) for every meaningful line of a workflow
+    file (blank and comment-only lines are dropped). A line is guarded unless
+    it is inside a job other than JOB: header keys (on/permissions/env/
+    defaults) stay guarded."""
     out, in_jobs, current = [], False, None
-    for line in text.split("\n"):
+    for number, line in enumerate(text.split("\n"), 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -787,8 +795,16 @@ def guarded_workflow_text(text, job):
             m = JOB_KEY_RE.fullmatch(line.rstrip("\r")) if indent == 2 else None
             current = m.group(1) if m else None
         if not in_jobs or current is None or current == job:
-            out.append(line)
-    return "\n".join(out)
+            out.append((number, line, True))
+        else:
+            out.append((number, line, False))
+    return out
+
+
+def guarded_workflow_text(text, job):
+    """The part of a workflow file the guard compares: the guarded lines of
+    workflow_regions (everything except the jobs other than JOB)."""
+    return "\n".join(line for _, line, guarded in workflow_regions(text, job) if guarded)
 
 
 def guarded_state(repo, tree, rel, job=None):
@@ -803,6 +819,91 @@ def guarded_state(repo, tree, rel, job=None):
     if job is None:
         return f"{mode} {oid}"
     return guarded_workflow_text(read_blob(repo, oid, rel).decode("utf-8", "replace"), job)
+
+
+def annotation(level, title, message):
+    """A GitHub Actions workflow-command line (`::warning title=..::msg`) with
+    the message data escaped per the runner's rules (%, CR, LF), so the text
+    stays on this one line. TITLE is a fixed literal of this script."""
+    data = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return f"::{level} title={title}::{data}"
+
+
+# The required context the shadow scan protects (c8-precheck.yml cert-expiry-gate).
+CERT_CONTEXT = "Enterprise-federation cert-expiry gate (cert §7 / F7)"
+WORKFLOW_DIR = ".github/workflows"
+# Canonical fragments of CERT_CONTEXT (lowercase, every character except a-z,
+# 0-9 and the section sign removed, YAML \x/\u/\U escapes decoded): a scanned
+# line run that spells one of them can produce the required check name.
+SHADOW_MARKERS = ("certexpiry", "§7f7")
+YAML_ESCAPE_RE = re.compile(r"\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8}))")
+
+
+def _shadow_canon(text):
+    def decode(m):
+        cp = int(next(g for g in m.groups() if g), 16)
+        return chr(cp) if cp <= 0x10FFFF and not 0xD800 <= cp <= 0xDFFF else ""
+    return re.sub(r"[^a-z0-9§]", "", YAML_ESCAPE_RE.sub(decode, text).lower())
+
+
+def shadow_check(repo, merge):
+    """(ok, lines): no job outside the guarded cert-expiry-gate job of
+    c8-precheck.yml can produce the required check name at MERGE (#6140
+    round 2, F3). Every workflow blob in .github/workflows is read from git
+    objects; the trusted workflow is skipped (it is guarded by blob id), and
+    in c8-precheck.yml only the lines outside the guarded text are scanned.
+    Consecutive scanned lines are joined, so a folded or escaped scalar is
+    still caught. Not waivable by a trailer: a legitimate change never needs a
+    second producer of a required context. A name built at run time from a
+    `${{ }}` expression is outside a text scan (Refs #6177)."""
+    entry = tree_entry(repo, merge, WORKFLOW_DIR)
+    if entry is None:
+        return True, [f"{PREFIX}: shadow scan — no {WORKFLOW_DIR} at {merge}"]
+    if entry[1] != "tree":
+        return False, [f"GUARD SHADOW: {WORKFLOW_DIR} at {merge} is not a directory "
+                       f"(mode {entry[0]} {entry[1]}); refused (fail-closed, #6140)"]
+    proc = run_git(repo, "ls-tree", "-z", "--full-tree", "--end-of-options", merge, WORKFLOW_DIR + "/")
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise GateError(f"git ls-tree {merge} {WORKFLOW_DIR}/ exited {proc.returncode}: {err}")
+    trusted_wf, (c8_rel, job) = TRUSTED_PATHS[1], TRUSTED_JOB
+    found, scanned = [], 0
+    for rec in proc.stdout.split(b"\0"):
+        meta, sep, name = rec.partition(b"\t")
+        rel = name.decode("utf-8", "replace")
+        if not sep or not rel.lower().endswith((".yml", ".yaml")) or rel == trusted_wf:
+            continue
+        fields = meta.decode("ascii", "replace").split(" ")
+        if len(fields) != 3:
+            raise GateError(f"git ls-tree {merge} {WORKFLOW_DIR}/: unparseable entry (fail-closed)")
+        mode, kind, oid = fields
+        if kind == "tree":
+            continue
+        if kind != "blob" or mode not in REGULAR_MODES:
+            found.append(f"GUARD SHADOW: {rel}: a symlink or other non-regular workflow entry "
+                         f"(mode {mode} {kind}); refused (fail-closed, #6140)")
+            continue
+        scanned += 1
+        text = read_blob(repo, oid, rel).decode("utf-8", "replace")
+        window = ""
+        for number, line, guarded in workflow_regions(text, job if rel == c8_rel else None):
+            if guarded and rel == c8_rel:
+                window = ""
+                continue
+            window += _shadow_canon(line)
+            if any(m in window for m in SHADOW_MARKERS):
+                found.append(
+                    f"GUARD SHADOW: {rel} line {number}: names the required check "
+                    f"'{CERT_CONTEXT}' (or a fragment of it) outside the {c8_rel} {job} job; a second "
+                    "producer of a required context can satisfy it with an always-green job "
+                    "(fail-closed, #6140; a trailer does not waive this; Refs #6177)"
+                )
+                break
+            window = window[-16:]
+    if found:
+        return False, found
+    return True, [f"{PREFIX}: shadow scan — {scanned} workflow file(s) at {merge}: no second producer "
+                  f"of '{CERT_CONTEXT}'"]
 
 
 def guard_check(repo, first, head, merge):
@@ -820,6 +921,12 @@ def guard_check(repo, first, head, merge):
     lines = [f"GUARD CHANGED: {c} (changes what the cert-expiry gate enforces)" for c in changed]
     if who:
         lines.append(f"{PREFIX}: approval trailer(s): {'; '.join(who)} (the §7 verdict is not waived)")
+        # Round 2 (F5 of the security review): the approval is self-asserted, so it
+        # is surfaced on the checks page, not only in the step log.
+        lines.extend(annotation(
+            "warning", "GUARD CHANGED",
+            f"{c} changed in {first}..{merge}; approved by trailer: {'; '.join(who)} (tamper-evidence: "
+            "review and the sole merger confirm; the §7 verdict is not waived)") for c in changed)
         return True, lines
     lines.append(
         f"RESULT: FAIL — a trusted cert-expiry gate path changed without a "
@@ -866,6 +973,8 @@ def run_trusted(repo, base_ref, head, merge_ref, base_sha=""):
         live = resolve_live_base(repo, base_ref)
         first = pr_base_tip(repo, live, head, merge, f"origin/{base_ref}")
         ok, lines = guard_check(repo, first, head, merge)
+        shadow_ok, shadow_lines = shadow_check(repo, merge)
+        ok, lines = ok and shadow_ok, lines + shadow_lines
     except GateError as exc:
         ok, lines = False, [f"{PREFIX}: ERROR — trusted guard: {exc} (fail-closed)"]
     (outs if ok else errs).append("\n".join(lines))
@@ -2620,7 +2729,12 @@ SELF_TEST_OK = (
     "CHANGED (the stub itself exits 0), a trailer never waives §7, environment overrides ignored, "
     "each trusted path and the cert-expiry-gate job block RED without the trailer and GREEN with it, "
     "other c8 jobs GREEN, a symlinked cert doc fail-closed, and the merge-parent cells (second "
-    "parent, octopus, reversed, not a merge, moved base GREEN, off-base) plus argument refusals."
+    "parent, octopus, reversed, not a merge, moved base GREEN, off-base) plus argument refusals; "
+    "(tr round 2) each c8-precheck.yml header key (env, on, permissions, defaults) RED without the "
+    "trailer and GREEN with it plus a ::warning annotation, a git ls-tree read error fail-closed "
+    "(entry, banner, guard, end to end), a cert doc above the blob cap refused, and a shadow job "
+    "producing the required check name (c8, new file, copied workflow, YAML escapes, folded scalar) "
+    "RED even with the trailer while an unrelated new workflow stays GREEN."
 )
 
 
