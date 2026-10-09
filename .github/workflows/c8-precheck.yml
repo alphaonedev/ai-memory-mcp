@@ -82,8 +82,8 @@ on:
     types: [checks_requested]
 
 # #3591 — explicit GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
-# Default contents: read. The one job that talks to the GitHub API
-# (`external-pr-operator-approval-gate`) widens below.
+# Default contents: read. The two jobs that talk to the GitHub API widen below:
+# `external-pr-operator-approval-gate` and `carrier-ruleset-live-gate` (#6143).
 permissions:
   contents: read
 
