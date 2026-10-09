@@ -109,7 +109,10 @@ ALLOW_REL = "scripts/qc-allowlists/compliance-script-names-allow.txt"
 # Rendering folds for stale-name detection (#6214): inline HTML tags and comments, Markdown
 # backslash escapes, dash variants, and letters that render like ASCII (a small explicit table:
 # the Cyrillic, Greek and Armenian look-alikes of the letters a script name can use).
-INLINE_TAG_RE = re.compile(r"<[^<>]*>")
+# A tag runs to its first ``>`` outside a quoted attribute value (#6214); any other ``<...>``
+# (a comment, a processing instruction) to its first ``>``.
+TAG = r"<[A-Za-z/](?:[^<>\"']|\"[^\"]*\"|'[^']*')*>"
+INLINE_TAG_RE = re.compile(TAG + r"|<[^<>]*>")
 ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
 DASHES = frozenset("\u02d7\u2043\u2212\u2796\ufe63\uff0d")
 LOOKALIKES = str.maketrans(
@@ -155,9 +158,16 @@ INDENTED_RE = re.compile(r"^(?: {4}| {0,3}\t)")
 TAG_NAME_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*")
 DETAILS_OPEN_RE = re.compile(r"<details(?![A-Za-z0-9-])", re.IGNORECASE)
 # The document skeleton (#6214): what a renderer drops between the letters of a name. A
-# comment (``<!-->``, ``<!--->`` included), a tag, a code-span backtick, a link or image
-# opener and a link closer with its inline destination.
-SKELETON_RE = re.compile(r"<!--(?:-?>|.*?-->)|<[A-Za-z/][^<>]*>|`|!?\[|\](?:\([^()]*\))?", re.DOTALL)
+# comment (``<!-->``, ``<!--->`` included; group 1, its closer found by ``skeleton_spans``), a
+# tag with quoted attribute values, a code-span backtick, a link or image opener, and a link
+# closer, with its inline destination and title when ``(`` follows (group 2, ``link_tail_end``).
+SKELETON_RE = re.compile(r"(<!--)|" + TAG + r"|`|!?\[|(\]\()|\]")
+# An inline link destination in angle brackets, and the characters that end or nest a bare one.
+ANGLE_DEST_RE = re.compile(r"<(?:\\.|[^<>\\\r\n])*>")
+DEST_STOP_RE = re.compile(r"[()\\\x00-\x20\x7f]")
+LINK_SPACE_RE = re.compile(r"[ \t]*(?:(?:\r\n|\r|\n)[ \t]*)?")
+# CommonMark nests at most 32 parentheses in a bare link destination.
+MAX_PAREN_DEPTH = 32
 # A script name in any letters (#6214): each letter of ``check``, ``sh`` and ``py`` is that ASCII
 # letter or any non-ASCII letter. A match that is not all ASCII is a look-alike.
 MARKED = "\u01c2"
@@ -167,9 +177,12 @@ def _loose(word):
     return "".join("(?:%s|[^\\W\\d_A-Za-z])" % c for c in word)
 
 
+# A separator is ``-``/``_`` (``.`` before the extension) or any non-ASCII, non-space character
+# (#6214): a CJK, Hangul, Lisu, Canadian syllabics or modifier-letter glyph that looks like one.
+NON_ASCII = r"[^\x00-\x7f\s]"
 LOOSE_RE = re.compile(
-    r"(?<![A-Za-z0-9_.-])" + _loose("check") + r"[-_][\w-]+\.(?:" + _loose("sh") + "|" + _loose("py")
-    + r")(?![A-Za-z0-9_])",
+    r"(?<![A-Za-z0-9_.-])" + _loose("check") + r"(?:[-_]|" + NON_ASCII + r")[\w-]+(?:\.|" + NON_ASCII
+    + r")(?:" + _loose("sh") + "|" + _loose("py") + r")(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 # Appended to a violation when a line names the stale name and a successor with the word
@@ -274,12 +287,16 @@ def rendered(line, fold_letters=True):
     invisible marks removed, look-alike letters mapped to ASCII, emphasis and strikethrough
     markers (``*``, ``~``) dropped. Its tokens are scanned in addition to the line's own, so
     this can only add findings; errata are still read from the unfolded visible text. With
-    ``fold_letters`` false, letters are kept and a letter carrying a combining mark becomes
-    ``MARKED``, a non-ASCII letter, for the look-alike scan (``LOOSE_RE``); a mark on any
-    other character is dropped.
+    ``fold_letters`` false, letters are kept (NFKC applies to other characters only) and a
+    letter carrying a combining mark becomes ``MARKED``, a non-ASCII letter, for the look-alike
+    scan (``LOOSE_RE``); a mark on any other character is dropped.
     """
     s = ESCAPE_RE.sub(r"\1", html.unescape(INLINE_TAG_RE.sub("", line)))
-    s = unicodedata.normalize("NFKC", s)
+    if fold_letters:
+        s = unicodedata.normalize("NFKC", s)
+    else:
+        # A fullwidth, mathematical or Kelvin-sign letter stays a non-ASCII letter (#6214).
+        s = "".join(c if c.isalpha() else unicodedata.normalize("NFKC", c) for c in s)
     s = "".join("-" if c in DASHES or unicodedata.category(c) == "Pd" else c for c in s)
     out = []
     for c in unicodedata.normalize("NFD", s) if fold_letters else s:
@@ -296,11 +313,128 @@ def rendered(line, fold_letters=True):
     return s.replace("*", "").replace("~", "")
 
 
+def link_space(text, i):
+    """Index after the spaces, tabs and at most one line ending at ``text[i]``."""
+    return LINK_SPACE_RE.match(text, i).end()
+
+
+def bare_dest_end(text, i, memo, depth=0):
+    """End of the bare link destination at ``text[i]``: the index of the space, control character,
+    unbalanced ``)`` or end of text that ends it, or -1 when a ``(`` in it is not closed.
+
+    The result depends on ``i`` only, so it is memoised for every position visited: a scan over a
+    run of destinations is linear in its length (#6352).
+    """
+    path, res = [], -1
+    while True:
+        if i in memo:
+            res = memo[i]
+            break
+        path.append(i)
+        m = DEST_STOP_RE.search(text, i)
+        if m is None:
+            res = len(text)
+            break
+        c = m.group()
+        if c == "\\":
+            i = m.end() + 1
+        elif c == "(":
+            close = -1 if depth >= MAX_PAREN_DEPTH else bare_dest_end(text, m.end(), memo, depth + 1)
+            if close < 0 or not text.startswith(")", close):
+                break
+            i = close + 1
+        else:
+            res = m.start()
+            break
+    for p in path:
+        memo[p] = res
+    return res
+
+
+def unescaped(text, ch, i, cache):
+    """Index of the first ``ch`` at or after ``i`` not escaped by a backslash, else -1.
+
+    ``cache`` holds the last (start, result) per character; the scan moves left to right, so a
+    later start at or before a found index (or after a failed search) reuses it (#6352).
+    """
+    last = cache.get(ch)
+    if last is not None and last[0] <= i and (last[1] < 0 or i <= last[1]):
+        return last[1]
+    j = i
+    while True:
+        j = text.find(ch, j)
+        if j < 0:
+            break
+        k = j
+        while k > i and text[k - 1] == "\\":
+            k -= 1
+        if (j - k) % 2 == 0:
+            break
+        j += 1
+    cache[ch] = (i, j)
+    return j
+
+
+def link_tail_end(text, i, memo, cache):
+    """Index after the inline link destination, title and ``)`` starting at ``text[i]`` (just
+    after ``](``), else -1 (#6214). A destination is ``<...>`` or a bare run with balanced (or
+    escaped) parentheses; a title is ``"..."``, ``'...'`` or ``(...)`` after white space.
+    """
+    i = link_space(text, i)
+    if text.startswith("<", i):
+        m = ANGLE_DEST_RE.match(text, i)
+        if m is None:
+            return -1
+        end = m.end()
+    else:
+        end = bare_dest_end(text, i, memo)
+        if end < 0:
+            return -1
+    k = link_space(text, end)
+    if k > end and k < len(text) and text[k] in "\"'(":
+        close = unescaped(text, ")" if text[k] == "(" else text[k], k + 1, cache)
+        if close < 0:
+            return -1
+        k = link_space(text, close + 1)
+    return k + 1 if text.startswith(")", k) else -1
+
+
+def skeleton_spans(text):
+    """Yield (start, end) of each ``SKELETON_RE`` span of ``text`` in one left-to-right scan.
+
+    A ``<!--`` runs to its closer; once a closer search fails, every later ``<!--`` is unclosed
+    too, so no search repeats and the scan is linear (#6352). An unclosed ``<!--`` is text.
+    """
+    pos, no_close, memo, cache = 0, len(text) + 1, {}, {}
+    while True:
+        m = SKELETON_RE.search(text, pos)
+        if m is None:
+            return
+        start, end = m.span()
+        if m.group(1):
+            if text.startswith(">", start + 4):
+                end = start + 5
+            elif text.startswith("->", start + 4):
+                end = start + 6
+            else:
+                close = -1 if start + 4 >= no_close else text.find("-->", start + 4)
+                if close < 0:
+                    no_close = min(no_close, start + 4)
+                    pos = start + 1
+                    continue
+                end = close + 3
+        elif m.group(2):
+            tail = link_tail_end(text, end, memo, cache)
+            end = start + 1 if tail < 0 else tail
+        yield start, end
+        pos = end
+
+
 def skeleton(lines):
     """Return {1-based line number: [text]}: the document as one text, split names joined (#6214).
 
-    Code-span backticks, link and image brackets and inline destinations, comments and tags
-    are removed from the joined lines (``SKELETON_RE``), line breaks inside them included, so
+    Code-span backticks, link and image brackets and inline destinations and titles, comments
+    and tags are removed from the joined lines (``skeleton_spans``), line breaks inside them included, so
     a name split across them reads as the reader sees it. Each skeleton line is filed under
     the line its first character comes from; a name found there is reported on that line.
     """
@@ -310,12 +444,12 @@ def skeleton(lines):
         starts.append(n)
         n += len(line) + 1
     out, origin, pos = [], [], 0
-    for m in list(SKELETON_RE.finditer(text)) + [None]:
-        end = len(text) if m is None else m.start()
+    for span in list(skeleton_spans(text)) + [None]:
+        end = len(text) if span is None else span[0]
         out.append(text[pos:end])
         origin.extend(range(pos, end))
-        if m is not None:
-            pos = m.end()
+        if span is not None:
+            pos = span[1]
     joined, found, i = "".join(out), {}, 0
     for part in joined.split("\n"):
         if part:
