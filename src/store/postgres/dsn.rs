@@ -403,7 +403,7 @@ mod tests {
             "the text floor pinned the host, so sqlx's parse is what failed: {err:?}"
         );
         for rendering in [format!("{err}"), format!("{err:?}")] {
-            for secret in [
+            for (i, secret) in [
                 "pasted-s3cr3t-4934",
                 "userinfo-s3cr3t",
                 "ssl-p4ss",
@@ -412,10 +412,14 @@ mod tests {
                 "password",
                 "svc-alice",
                 "?",
-            ] {
+            ]
+            .iter()
+            .enumerate()
+            {
+                // #6098: name the fixture by index, never by value.
                 assert!(
                     !rendering.contains(secret),
-                    "#4934: {secret} reached the parse error: {rendering}"
+                    "#4934: fixture {i} reached the parse error (rendering redacted)"
                 );
             }
             assert!(
@@ -428,8 +432,14 @@ mod tests {
         let err = evaluate(dsn).expect_err("a non-numeric port must not parse");
         let shown = format!("{err}");
         assert!(shown.contains("db.internal"), "{shown}");
-        for secret in ["SECRETQ4934", "pw4934", "sslpassword", "notaport"] {
-            assert!(!shown.contains(secret), "leaked {secret}: {shown}");
+        for (i, secret) in ["SECRETQ4934", "pw4934", "sslpassword", "notaport"]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                !shown.contains(secret),
+                "#4934: fixture {i} leaked in the non-numeric-port shape"
+            );
         }
     }
 
