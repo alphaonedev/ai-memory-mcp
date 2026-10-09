@@ -357,6 +357,69 @@ mod tests {
         );
     }
 
+    /// Render an ISOLATED registry the way `GET /metrics` renders the
+    /// process one, and return the sample lines of `family` (comment lines
+    /// excluded).
+    fn samples_of(m: &crate::metrics::Metrics, family: &str) -> Vec<String> {
+        use prometheus::Encoder as _;
+        let mut buf = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&m.registry.gather(), &mut buf)
+            .expect("encode isolated registry");
+        let text = String::from_utf8(buf).expect("utf-8 exposition");
+        text.lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter(|l| {
+                l.split([' ', '{'])
+                    .next()
+                    .is_some_and(|name| name == family)
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    const REFRESHED_AT: &str = "ai_memory_memories_refreshed_at_seconds";
+
+    /// #3683 — ABSENT IS NOT ZERO. Before the first successful refresh the
+    /// freshness gauge must emit NO sample: a `0` in a UNIX-time gauge reads
+    /// as 1970-01-01, so `time() - ai_memory_memories_refreshed_at_seconds`
+    /// would report ~56 years of staleness on a process whose refresher has
+    /// simply not run yet, and an operator mutes the alert.
+    #[test]
+    fn refreshed_at_is_absent_until_the_first_refresh_3683() {
+        let m = isolated();
+        assert_eq!(
+            samples_of(&m, REFRESHED_AT),
+            Vec::<String>::new(),
+            "no refresh has happened, so there is no refresh time to export"
+        );
+    }
+
+    /// #3683 — after a successful publish the series carries the refresh
+    /// time, and a FAILED read before that publishes nothing (still absent).
+    #[test]
+    fn refreshed_at_appears_with_the_refresh_time_after_publish_3683() {
+        let m = isolated();
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        assert_eq!(refresh_once_into(&m, &conn, 2_000), None);
+        assert_eq!(
+            samples_of(&m, REFRESHED_AT),
+            Vec::<String>::new(),
+            "a failed refresh is not a refresh"
+        );
+        publish_into(&m, 5, 1_700_000_000);
+        assert_eq!(
+            samples_of(&m, REFRESHED_AT),
+            vec![format!("{REFRESHED_AT} 1700000000")]
+        );
+        publish_into(&m, 6, 1_700_000_060);
+        assert_eq!(
+            samples_of(&m, REFRESHED_AT),
+            vec![format!("{REFRESHED_AT} 1700000060")],
+            "one series, advancing — never registered twice"
+        );
+    }
+
     // ---- v1.0.0 #2621 — SAL / postgres gauge refresher -------------
 
     /// The load-bearing #2621 regression: on a postgres-backed daemon the
