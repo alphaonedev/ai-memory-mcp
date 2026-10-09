@@ -190,8 +190,11 @@ def unified(old: str, new: str, key: str) -> str:
 
 
 def approvals(repo: Path, base_sha: str, head_sha: str) -> list:
-    """The `Rule-Change-Approved-By` trailer values in base..head (commit messages are data)."""
-    out = git(repo, "log", "--format=%B%x00", f"{base_sha}..{head_sha}").decode("utf-8", "replace")
+    """The `Rule-Change-Approved-By` trailer values in base..head (commit messages are data). #6179: only the
+    git trailer block (the final paragraph, git interpret-trailers semantics) is read; a body line that starts
+    with the key is prose, not an approval. The separator is pinned so a config cannot widen what is a trailer."""
+    out = git(repo, "-c", "trailer.separators=:", "log", "--format=%(trailers:only,unfold)%x00",
+              f"{base_sha}..{head_sha}").decode("utf-8", "replace")
     found = []
     for message in out.split("\0"):
         found += [match.group(1).strip() for match in TRAILER.finditer(message)]
