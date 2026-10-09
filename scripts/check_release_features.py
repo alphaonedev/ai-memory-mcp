@@ -93,7 +93,8 @@ each unit is and WHAT is substituted into it:
   * Permissions, secrets and the registry. The top-level ``permissions:`` is
     exactly ``contents: write`` and every job's ``permissions:`` is pinned
     (``RELEASE_JOB_PERMISSIONS``; ``packages: write`` exists in the docker job
-    only); the job set is pinned and no job may call a reusable workflow. Every
+    only, and every job declares its own block so none inherits the top-level
+    write, #4937); the job set is pinned and no job may call a reusable workflow. Every
     ``secrets`` reference must be ``secrets.<NAME>`` with NAME in
     ``RELEASE_SECRETS`` and no key may be named ``secrets``. The registry host
     (``ghcr.io``, any case) may appear only inside the docker job.
@@ -291,19 +292,22 @@ DOCKER_STEPS: List[Spec] = [
 # What each pinned docker step is, for the messages.
 DOCKER_STEP_ROLES = ("checkout", "Buildx setup", "registry login", "version", "image build", "provenance attestation")
 # release.yml permissions, pinned per job (#4719 SR-8): `packages: write` exists in
-# the docker job only; None = the job declares none and inherits the top level.
+# the docker job only. Every job declares its own block (#4937): a job that
+# declared none would inherit the top-level `contents: write`, so the guard
+# refuses a missing block as a pin mismatch.
 RELEASE_TOP_PERMISSIONS: Dict[str, Spec] = {"contents": "write"}
 _SIGN = {"contents": "write", "id-token": "write", "attestations": "write"}
 _READ_ATTEST = {"contents": "read", "attestations": "read"}
-RELEASE_JOB_PERMISSIONS: Dict[str, Optional[Dict[str, Spec]]] = {
-    "preflight": {"contents": "read"},
+_READ = {"contents": "read"}
+RELEASE_JOB_PERMISSIONS: Dict[str, Dict[str, Spec]] = {
+    "preflight": dict(_READ),
     "qualify": {"contents": "read", "checks": "read", "actions": "read"},
-    "supply-chain": None,
+    "supply-chain": dict(_READ),
     "release": dict(_SIGN),
     "sbom": dict(_SIGN),
     "mobile-ios": dict(_SIGN),
     "mobile-android": dict(_SIGN),
-    "crates-io": None,
+    "crates-io": dict(_READ),
     "homebrew": dict(_READ_ATTEST),
     "docker": dict(DOCKER_JOB["permissions"]),  # type: ignore[arg-type]
     "copr": dict(_READ_ATTEST),
@@ -1067,15 +1071,10 @@ def check_release_permissions(doc: Node, jobs: Node, rep: Report) -> None:
             continue
         if job.get("uses") is not None:
             rep.bad(f"release.yml: `jobs.{name}` calls a reusable workflow (`uses:`), which the guard cannot read")
-        perms = job.get("permissions")
-        if want is None:
-            if perms is not None:
-                rep.bad(pin_message("release.yml", f"`jobs.{name}.permissions` is declared; the pinned job inherits the "
-                                    "top-level `contents: write` and declares none", "RELEASE_JOB_PERMISSIONS"))
-            continue
-        why = pin_problem(perms, want, f"jobs.{name}.permissions")
+        why = pin_problem(job.get("permissions"), want, f"jobs.{name}.permissions")
         if why:
-            rep.bad(pin_message("release.yml", why, "RELEASE_JOB_PERMISSIONS"))
+            rep.bad(pin_message("release.yml", why + " (a job with no block inherits the top-level `contents: write`, "
+                                "#4937)", "RELEASE_JOB_PERMISSIONS"))
 
 
 def node_lines(node: Node) -> Iterator[Tuple[int, str]]:
@@ -1569,6 +1568,8 @@ DOCKER_HEAD = ("needs: [preflight, qualify, supply-chain]\n    if: needs.preflig
                "    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      packages: write\n")
 CRATES_STEPS = ("    # CARGO_REGISTRY_TOKEN is scoped to the `release` Environment (#3546 D4).\n"
                 "    environment: release\n    steps:\n")
+SUPPLY_PERMS = "    # it must not inherit the top-level `contents: write`.\n    permissions:\n      contents: read\n"
+CRATES_PERMS = "    # must not inherit the top-level `contents: write`.\n    permissions:\n      contents: read\n"
 COPR_HDR = "  copr:\n    name: Fedora COPR\n"
 LOGIN_PW = "          password: ${{ secrets.GITHUB_TOKEN }}\n"
 SHAPE_NAME = '    name: "Release-shaped build + PG TLS proof"\n'
@@ -2033,8 +2034,12 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         CRATES_STEPS, CRATES_STEPS + "      - name: extra\n        run: crane copy x GHCR.IO/o/ai-memory:latest\n")]),
     "SR8 top-level packages write": ("fail", [_rel("\npermissions:\n  contents: write\n",
                                                   "\npermissions:\n  contents: write\n  packages: write\n")]),
-    "SR8 crates-io declares permissions": ("fail", [_rel(CRATES_STEPS, CRATES_STEPS.replace(
+    "SR8 crates-io declares a second permissions block": ("fail", [_rel(CRATES_STEPS, CRATES_STEPS.replace(
         "    environment:", "    permissions:\n      packages: write\n    environment:"))]),
+    "4937 supply-chain widened to contents: write": ("fail", [_rel(
+        SUPPLY_PERMS, SUPPLY_PERMS.replace("contents: read", "contents: write"))]),
+    "4937 crates-io widened to packages: write": ("fail", [_rel(
+        CRATES_PERMS, CRATES_PERMS.replace("      contents: read\n", "      contents: read\n      packages: write\n"))]),
     "SR8 release job permissions changed": ("fail", [_rel(REL_PERMS, "      id-token: write\n    strategy:\n")]),
     # --- #4937: supply-chain and crates-io hold `contents: read`, never the inherited write
     "4937 supply-chain job inherits the top-level contents: write": ("fail", [_rel(

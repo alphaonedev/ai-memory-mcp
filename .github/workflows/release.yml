@@ -45,10 +45,11 @@ on:
         type: boolean
         default: true
 
-# #4719 - `packages: write` (GHCR push) is granted to the `docker` job only;
-# jobs without their own `permissions:` (supply-chain, crates-io) get
-# `contents: write` and nothing else. scripts/check_release_features.py pins
-# this block and every job's `permissions:`.
+# #4719 - `packages: write` (GHCR push) is granted to the `docker` job only.
+# #4937 - every job declares its own `permissions:` (no job inherits this
+# block), so the write scope below reaches only the jobs that attach release
+# assets. scripts/check_release_features.py pins this block and every job's
+# `permissions:`.
 permissions:
   contents: write
 
@@ -226,6 +227,10 @@ jobs:
     needs: [preflight, qualify]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # #4937 — least privilege: this job only reads the tree and runs gates, so
+    # it must not inherit the top-level `contents: write`.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -952,6 +957,11 @@ jobs:
     needs: [preflight, qualify, release]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
+    # #4937 — least privilege: `cargo publish` authenticates with
+    # CARGO_REGISTRY_TOKEN and writes nothing to this repository, so the job
+    # must not inherit the top-level `contents: write`.
+    permissions:
+      contents: read
     # CARGO_REGISTRY_TOKEN is scoped to the `release` Environment (#3546 D4).
     environment: release
     steps:
