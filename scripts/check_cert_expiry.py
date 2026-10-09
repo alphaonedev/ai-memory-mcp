@@ -823,6 +823,12 @@ JOBS_KEY_RE = re.compile(r"jobs:[ \t]*(?:#.*)?")
 YAML_BREAK_RE = re.compile("\r\n|[\r\n\x85\u2028\u2029]")
 
 
+# Round 5 (#6304): YAML s-white is a space or a tab and nothing else. Python's
+# str.strip() also removes NBSP, U+3000, FF and others that YAML keeps as
+# content, so blank and comment tests strip YAML_WHITE only.
+YAML_WHITE = " \t"
+
+
 def yaml_lines(text):
     """The lines of TEXT as a YAML parser sees them (YAML_BREAK_RE)."""
     return YAML_BREAK_RE.split(text)
@@ -834,7 +840,7 @@ def _workflow_lines(text):
     split on every YAML line break (#6228)."""
     in_jobs, current = False, None
     for number, line in enumerate(yaml_lines(text), 1):
-        stripped = line.strip()
+        stripped = line.strip(YAML_WHITE)
         if not stripped or stripped.startswith("#"):
             continue
         indent = len(line) - len(line.lstrip(" "))
@@ -1002,7 +1008,7 @@ def _yaml_hazards(text):
     out, block_col = [], None
     for number, raw in enumerate(yaml_lines(text), 1):
         body = raw.rstrip("\r")
-        stripped = body.strip()
+        stripped = body.strip(YAML_WHITE)
         indent = len(body) - len(body.lstrip(" "))
         if block_col is not None:
             if not stripped or indent > block_col:
@@ -1112,6 +1118,27 @@ def _line_break_findings(rel, text):
             f"CR, NEL, LS or PS; {len(numbers)} in this file) is refused in every workflow file {SHADOW_NOTE}"]
 
 
+def _whitespace_findings(rel, text):
+    """GUARD SHADOW for a whitespace character other than space or tab (NBSP,
+    U+3000, FF, VT, ...) anywhere in a workflow file (#6304): YAML keeps it as
+    content, Python treats it as blank, so a line led by one and then `#`
+    would be a comment to the scan and content to the parser. No legitimate
+    workflow needs one; it is refused, not interpreted. Line breaks are the
+    business of _line_break_findings."""
+    seen, first = [], None
+    for number, line in enumerate(yaml_lines(text), 1):
+        for ch in line:
+            if ch.isspace() and ch not in YAML_WHITE:
+                first = first or number
+                if ch not in seen:
+                    seen.append(ch)
+    if first is None:
+        return []
+    shown = ", ".join(f"U+{ord(c):04X}" for c in seen[:8])
+    return [f"GUARD SHADOW: {log_safe(rel)} line {first}: a whitespace character other than space or tab "
+            f"({shown}) is refused in every workflow file {SHADOW_NOTE}"]
+
+
 def _scan_workflow(rel, text, own):
     """GUARD SHADOW lines for REL: every meaningful line outside the own job
     region (and the own exact header lines) is scanned; consecutive scanned
@@ -1144,8 +1171,9 @@ def shadow_check(repo, merge):
     the trusted workflow) can produce the required check name at MERGE
     (#6140 rounds 2 to 4). Every workflow blob in .github/workflows is read
     from git objects and every line of it, split on every YAML line break, is
-    scanned, headers included; a line break other than LF or CRLF is refused
-    in every workflow file (#6228);
+    scanned, headers included; a line break other than LF or CRLF (#6228) and a
+    whitespace character other than space or tab (#6304) are refused in every
+    workflow file;
     both own files must keep a single pinned `name:` in their job and use no
     YAML construct (anchor, alias, tag, quoted or flow job key, ...) the scan
     cannot follow. Not waivable by a trailer: a legitimate change never needs
@@ -1181,6 +1209,7 @@ def shadow_check(repo, merge):
         scanned += 1
         text = read_blob(repo, oid, rel).decode("utf-8", "replace")
         found.extend(_line_break_findings(rel, text))
+        found.extend(_whitespace_findings(rel, text))
         own = owns.get(rel)
         if own:
             found.extend(_own_file_findings(rel, text, own[0], own[1]))
