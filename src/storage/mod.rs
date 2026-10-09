@@ -893,10 +893,18 @@ pub use merge_inbound_authorized_4023::{
 // by-id lanes (deletions / archives / restores / links). Own child module for
 // the same qual_10 reason as `merge_inbound_authorized_4023`.
 mod federation_by_id_4447;
+// #4206 — the title-slot pre-merge archive snapshot helpers (qual_10 split).
+mod title_slot_archive;
 pub use federation_by_id_4447::{
     ByIdNamespaceAuthorizer, InboundByIdNamespaceRefused, archive_memory_authorized,
     create_link_inbound_authorized, delete_authorized, inbound_by_id_namespace_refused,
     restore_archived_authorized,
+};
+#[cfg(feature = "sal-postgres")]
+pub(crate) use title_slot_archive::preimage_plaintext;
+use title_slot_archive::{
+    FederationMergePreimage, probe_federation_merge_preimage,
+    snapshot_title_slot_preimage_if_overwritten,
 };
 // `pub` (rather than `pub(crate)`) so the V-4 closeout
 // integration test suite (`tests/signed_events_chain_v34.rs`) can
@@ -1997,69 +2005,6 @@ fn emit_upsert_supersede_leaf_if_enabled(
     Ok(())
 }
 
-/// v1.0.0 #2954 — the pre-merge image of the `(title, namespace)` row a
-/// federation newer-wins upsert ([`insert_if_newer`]) is about to overwrite.
-/// Read under the SAME `BEGIN IMMEDIATE` write lock as the upsert (so the probe
-/// cannot race it), ONLY when the append-only spine is armed. Identity/version
-/// plus the two durable-content columns needed to decide whether the leaf fires
-/// — the plaintext/placeholder `content` and its at-rest `encrypted_envelope`.
-struct FederationMergePreimage {
-    /// The surviving local row's `updated_at` (the primary LWW key the
-    /// `CASE WHEN excluded.updated_at > memories.updated_at` arm compares).
-    updated_at: String,
-    /// The surviving local row's `id` (the `excluded.id > memories.id`
-    /// equal-timestamp tiebreak operand).
-    id: String,
-    /// The pre-supersede `version` recorded as the leaf's `prior_version`.
-    version: i64,
-    /// The stored `content` column (plaintext when encryption is off, the
-    /// placeholder when on) — compared against the value about to be stored to
-    /// decide whether the overwrite actually CHANGED durable content.
-    content: String,
-    /// The stored at-rest ciphertext envelope (NULL when encryption is off).
-    encrypted_envelope: Option<Vec<u8>>,
-}
-
-/// v1.0.0 #2954 — probe the `(title, namespace)` row [`insert_if_newer`]'s
-/// newer-wins upsert may overwrite, under the caller's open `BEGIN IMMEDIATE`
-/// write lock. Returns `None` when the append-only spine is OFF (default → no
-/// extra read → byte-identical) or when no row currently holds
-/// `(title, namespace)` (a fresh INSERT, which destroys nothing). The write
-/// lock is what makes the probe atomic with the upsert that follows.
-///
-/// # Errors
-///
-/// Propagates the lookup error; the caller rolls back its transaction.
-fn probe_federation_merge_preimage(
-    conn: &Connection,
-    title: &str,
-    namespace: &str,
-) -> Result<Option<FederationMergePreimage>> {
-    use rusqlite::OptionalExtension;
-    if !crate::config::append_only_enabled() {
-        return Ok(None);
-    }
-    conn.query_row(
-        &format!(
-            "SELECT updated_at, id, version, content, encrypted_envelope \
-             FROM memories WHERE title = ?1 AND namespace = ?2 AND {}",
-            crate::models::TITLE_SLOT_INDEX_PREDICATE
-        ),
-        params![title, namespace],
-        |r| {
-            Ok(FederationMergePreimage {
-                updated_at: r.get(0)?,
-                id: r.get(1)?,
-                version: r.get(2)?,
-                content: r.get(3)?,
-                encrypted_envelope: r.get(4)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
 /// v1.0.0 #2954 — append ONE identity-only SUPERSEDE leaf for a federation
 /// newer-wins ([`insert_if_newer`]) overwrite, in the caller's open
 /// transaction, mirroring the create-funnel #2948 helper
@@ -2070,8 +2015,9 @@ fn probe_federation_merge_preimage(
 /// evaluates — computed here in Rust against the write-lock-held pre-image so
 /// it cannot diverge from the live overwrite:
 ///
-///  * `pre` is `Some` ONLY when the spine is armed AND a prior `(title,
-///    namespace)` row existed (otherwise a fresh INSERT destroyed nothing);
+///  * `pre` is `Some` ONLY when a prior `(title, namespace)` row existed
+///    (otherwise a fresh INSERT destroyed nothing); the leaf itself is only
+///    appended when the spine is armed (`emit_revision_leaf_if_enabled`);
 ///  * the inbound row must WIN the tiebreak (`excluded.updated_at >
 ///    memories.updated_at` OR the equal-timestamp `excluded.id >
 ///    memories.id`), else the surviving content is the LOCAL row's and nothing
@@ -2105,9 +2051,7 @@ fn emit_federation_newer_wins_supersede_leaf_if_enabled(
     };
     // The inbound row wins the LWW tiebreak — byte-for-byte the same total
     // order the `ON CONFLICT … CASE` arm applies (updated_at, then id).
-    let inbound_won = mem.updated_at.as_str() > pre.updated_at.as_str()
-        || (mem.updated_at == pre.updated_at && mem.id.as_str() > pre.id.as_str());
-    if !inbound_won {
+    if !pre.inbound_wins(mem) {
         return Ok(());
     }
     // The overwrite actually changed durable content (content column or its
@@ -5625,12 +5569,17 @@ pub fn delete_archive_first(conn: &Connection, id: &str) -> Result<bool> {
 /// MOST-RECENT pre-edit snapshot (the "immediately-prior content"). A
 /// second edit replaces the first snapshot — by design (#1725 archives
 /// the immediately-prior content, not a per-edit history; full lineage
-/// is the #888 supersede fork). The only same-id archive row a live,
-/// in-place-editable row can collide with is a PRIOR `in_place_edit`
-/// snapshot: supersede forks a new id + deletes the old live row, GC
-/// deletes the live row, and restore removes the archive row on
-/// success — so this `REPLACE` never clobbers a different
-/// `archive_reason`'s record. Callers MUST already hold a transaction
+/// is the #888 supersede fork). The per-id archive slot holds ONE
+/// pre-image regardless of reason, so a live row's slot can collide
+/// with a prior `in_place_edit` snapshot AND with a prior
+/// `federation_merge` snapshot: the same-id federation merge (#1773,
+/// [`overwrite_full_row_by_id`]) and the title-slot federation merge
+/// (#4206, `snapshot_title_slot_preimage_if_overwritten`) write
+/// `federation_merge` into the same slot, so each of these writers can
+/// replace the other's record. The newest pre-image is the one kept;
+/// per-reason retention is the WP-ERASURE design (#6048). Supersede
+/// forks a new id + deletes the old live row, GC deletes the live row,
+/// and restore removes the archive row on success. Callers MUST already hold a transaction
 /// (the caller wraps archive + UPDATE in one `BEGIN IMMEDIATE` so a
 /// mid-failure rolls both back, leaving the OLD content live).
 ///
@@ -18566,22 +18515,33 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // newer-wins pre-image probe cannot race the upsert they bracket. Only taken
     // when this call owns the connection (autocommit) and at least one of the
     // two concerns is live (the federation receive loop wraps batches in its own
-    // tx, whose lock already covers both). Neither concern live ⇒ byte-identical
-    // legacy path.
-    let owns_tx = (crate::encryption::encryption_enabled(None)
-        || crate::config::append_only_enabled())
-        && conn.is_autocommit();
+    // tx, whose lock already covers both).
+    //
+    // #4206 — the pre-merge archive snapshot is a THIRD concern that is live on
+    // EVERY configuration: a newer inbound row that wins the title slot rewrites
+    // the local row's text, and the snapshot of the text it replaces must land
+    // in the same write transaction as that rewrite (probe → snapshot → upsert
+    // atomic, no window in which the text is neither archived nor live). So the
+    // write lock is now taken whenever this call owns the connection.
+    let owns_tx = conn.is_autocommit();
     let write_txn = if owns_tx {
         Some(connection::WriteTxn::begin(conn)?)
     } else {
         None
     };
     let sealed_merge = (|| -> Result<String> {
-        // #2954 — armed-only pre-image of the `(title, namespace)` row this
-        // upsert may overwrite. `None` when the spine is OFF (byte-identical) or
-        // no prior row exists. Read under the `BEGIN IMMEDIATE` write lock above
-        // so it cannot race the upsert whose newer-wins verdict it mirrors.
+        // #2954 / #4206 — pre-image of the `(title, namespace)` row this upsert
+        // may overwrite (`None` when no live row holds the slot). Read under the
+        // `BEGIN IMMEDIATE` write lock above so it cannot race the upsert whose
+        // newer-wins verdict it mirrors.
         let merge_preimage = probe_federation_merge_preimage(conn, &mem.title, &mem.namespace)?;
+        // #4206 — keep the text this upsert is about to overwrite recoverable:
+        // snapshot the pre-merge row into `archived_memories`
+        // (`federation_merge`) BEFORE the in-place rewrite, exactly as the
+        // same-id lane does (#1773 `overwrite_full_row_by_id`). Only when the
+        // inbound row wins AND its plaintext differs (a replay must not replace
+        // the last recoverable preimage).
+        snapshot_title_slot_preimage_if_overwritten(conn, merge_preimage.as_ref(), mem)?;
         let seal = seal_content_for_upsert(conn, mem)?;
         let content_to_store = seal.content_to_store.as_str();
         let encrypted_envelope: Option<&[u8]> = seal.envelope_bytes();
@@ -18660,8 +18620,9 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         // row won the LWW tiebreak. Append ONE identity-only SUPERSEDE leaf in
         // this same tx, gated on that same won-and-changed predicate (evaluated
         // against the write-lock-held pre-image so it cannot diverge from the
-        // live `CASE`). Mirrors the create-funnel #2948 wiring; the superseded
-        // pre-merge content lives only in the row it replaced, never in the leaf.
+        // live `CASE`). Mirrors the create-funnel #2948 wiring; the leaf is
+        // identity-only — the superseded pre-merge text is recoverable from the
+        // #4206 `federation_merge` archive snapshot taken above, never the leaf.
         // #3699 (5-agent vote 4d3ea1c5) — a CROSS-ID title merge (the inbound
         // id was folded into a local row of a different id, and will never
         // exist here) is counted and WARNed, never silent inside a 200: on a
