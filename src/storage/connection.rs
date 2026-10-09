@@ -246,7 +246,8 @@ impl<'c> WriteTxn<'c> {
     /// #4116 (vote D, item 2) — roll back a FUNNEL-OWNED transaction whose
     /// body failed with `err`, settle its deferred escalations FIRST, and
     /// return `err` rewritten to their REAL outcome: the queued text naming
-    /// `pending_id=<id>` (the row exists) or `escalation NOT queued: <err>`.
+    /// `pending_id=<id>` (the row exists) or the fixed
+    /// `escalation_deferral::ESCALATION_NOT_QUEUED_TEXT` phrase (#4379).
     /// A funnel that owns its `WriteTxn` ends it with this, so its caller is
     /// never handed a pending id that was not written.
     #[must_use]

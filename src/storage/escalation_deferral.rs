@@ -25,8 +25,9 @@
 //!   consolidate, merge_inbound): the funnel ends its transaction with
 //!   [`super::connection::WriteTxn::rollback_resolving`], which settles the
 //!   frame FIRST and then rewrites the refusal to the REAL outcome: the
-//!   queued text naming `pending_id=<id>` (the row exists), or
-//!   `escalation NOT queued: <err>`.
+//!   queued text naming `pending_id=<id>` (the row exists), or the fixed
+//!   [`ESCALATION_NOT_QUEUED_TEXT`] phrase (#4379: the storage error is
+//!   logged, never forwarded to the caller).
 //! - **Caller-owned transaction** (e.g. `SqliteStore::update` wrapping an
 //!   inner funnel): the refusal leaves the funnel before the enclosing
 //!   transaction ends, so it carries the distinguishable DEFERRED text
@@ -85,7 +86,8 @@ pub struct DeferredEscalation {
 /// Why one deferred queue write did NOT land (the row does not exist).
 ///
 /// Typed per ERRORS-10/13 (never a bare `String` error): `Display` is the
-/// lowercase phrase the funnel splices into `escalation NOT queued: <err>`.
+/// lowercase phrase [`settle_frame`] logs at ERROR; the caller only ever
+/// sees [`ESCALATION_NOT_QUEUED_TEXT`] (#4379).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum QueueWriteError {
@@ -345,9 +347,18 @@ pub fn escalation_refusal_text(pending_id: &str, reason: &str) -> String {
     }
 }
 
+/// #4379 — the FIXED caller-facing phrase for a deferred queue write that did
+/// not land. The storage failure itself (constraint names, lock / I/O states,
+/// the rendered `anyhow` chain) is logged at ERROR by [`settle_frame`] and
+/// never reaches the GovernanceRefusal reason, which lands in HTTP 403 bodies
+/// and MCP error data (the immediate, non-deferred path returns only the rule
+/// reason and logs the detail; this matches it).
+pub const ESCALATION_NOT_QUEUED_TEXT: &str = "escalation NOT queued (storage error; see server log)";
+
 /// Vote item 2 — rewrite a funnel's refusal to the REAL outcome of the queue
 /// writes its own transaction just settled: the deferred text becomes the
-/// queued text (row exists) or `escalation NOT queued: <err>`.
+/// queued text (row exists) or [`ESCALATION_NOT_QUEUED_TEXT`] + the rule
+/// reason (#4379: never the storage error chain).
 pub(super) fn resolve_refusal(err: &mut anyhow::Error, outcomes: &[SettledEscalation]) {
     if outcomes.is_empty() {
         return;
@@ -367,7 +378,8 @@ pub(super) fn resolve_refusal(err: &mut anyhow::Error, outcomes: &[SettledEscala
             .to_string();
         refusal.reason = match result {
             Ok(()) => queued_refusal_text(pending_id, &reason),
-            Err(e) => format!("escalation NOT queued: {e}: {reason}"),
+            // #4379 — a fixed phrase; `settle_frame` already logged `e` at ERROR.
+            Err(_) => format!("{ESCALATION_NOT_QUEUED_TEXT}: {reason}"),
         };
         return;
     }
