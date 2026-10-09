@@ -1912,6 +1912,9 @@ def _self_test_cases() -> int:
              absent=hidden, needles=("credential-shaped value(s) masked",))
     case("#6211 the line after a PuTTY key's Private-MAC stays visible", head_line(security_shapes[11][1]), True,
          "+after-putty-6163", absent="6163canaryputty")
+    # #6211 (final mutant O1b): the Private-MAC line ends a PuTTY key and carries a value; it is masked with the block.
+    case("#6211 a PuTTY key's Private-MAC value is masked", head_line(security_shapes[11][1]), True,
+         "+after-putty-6163", absent="6163abcdef")
     for visible in ("token_budget = 3500 tokens per call", "secret_scanning: enabled for every repository"):
         case(f"#6209 {visible!r} is not masked", head_line(visible), True, visible)
     # #6210: a `|` inside a code span (a regex alternation in rule prose) is not a Markdown table row.
