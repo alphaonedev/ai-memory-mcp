@@ -4078,8 +4078,24 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
         }
     }
 
-    let pending_count = db::count_pending_actions_by_status(conn, "pending").unwrap_or(0);
-    facts.push(("pending_actions_total".into(), pending_count.to_string()));
+    // #4980 — a read fault is a Critical finding, never a healthy-looking 0.
+    match db::count_pending_actions_by_status(conn, "pending") {
+        Ok(pending_count) => {
+            facts.push(("pending_actions_total".into(), pending_count.to_string()));
+        }
+        Err(e) => {
+            severity = Severity::Critical;
+            facts.push((
+                "pending_actions_total".into(),
+                over_depth_4715::UNREADABLE.into(),
+            ));
+            facts.push(("pending_actions_total_error".into(), format!("{e:#}")));
+            append_note(
+                &mut note,
+                "the pending-action queue depth could not be read (#4980)",
+            );
+        }
+    }
 
     // v1.0.0 #3430 — the REAL agent-action rule posture. `enabled = 1`
     // is NOT the enforcement state: once an operator pubkey is resolved

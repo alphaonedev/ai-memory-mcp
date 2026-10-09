@@ -103,14 +103,18 @@ pub fn count_subscriptions(conn: &Connection) -> Result<usize> {
 /// v0.6.3 (capabilities schema v2): count `pending_actions` rows whose
 /// `status` matches the predicate. Used by `handle_capabilities` to
 /// surface live approval queue depth.
+///
+/// # Errors
+///
+/// Returns `Err` on any SQLite failure, including a missing
+/// `pending_actions` table (#4980): a read fault is never reported as an
+/// empty queue.
 pub fn count_pending_actions_by_status(conn: &Connection, status: &str) -> Result<usize> {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pending_actions WHERE status = ?1",
-            params![status],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pending_actions WHERE status = ?1",
+        params![status],
+        |r| r.get(0),
+    )?;
     Ok(usize::try_from(count.max(0)).unwrap_or(0))
 }
 

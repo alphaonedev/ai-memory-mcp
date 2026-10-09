@@ -338,8 +338,8 @@ pub fn handle_capabilities_with_conn_v3(
 ///
 /// # Errors
 ///
-/// #4978 — a store read FAULT on a count the envelope advertises
-/// (`permissions.active_rules`) fails the call through the existing
+/// #4978 / #4980 — a store read FAULT on a count the envelope advertises
+/// (`permissions.active_rules`, `approval.pending_requests`) fails the call through the existing
 /// `Result<Value, String>` channel instead of advertising `0` over a store
 /// that could not be read (never fail open; no wire-shape change).
 fn build_capabilities_overlay(
@@ -426,9 +426,10 @@ fn build_capabilities_overlay(
         if let Ok(n) = db::count_subscriptions(c) {
             caps.hooks.registered_count = n;
         }
-        if let Ok(n) = db::count_pending_actions_by_status(c, "pending") {
-            caps.approval.pending_requests = n;
-        }
+        // #4980 — a fault reading the approval queue depth is an error,
+        // never `pending_requests = 0` (ERRORS-19).
+        caps.approval.pending_requests = db::count_pending_actions_by_status(c, "pending")
+            .map_err(|e| format!("pending approval requests could not be read: {e:#}"))?;
         // v0.7.0 Cluster-C SEC-3 (issue #767) — surface the deferred-
         // audit drainer's DLQ depth. Best-effort: a missing table
         // (pre-v40 DB) or transient lock falls through to 0 so the
