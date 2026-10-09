@@ -1971,6 +1971,27 @@ def self_test():
         doc.write_bytes(b"Runs [a][b] and [check_][x]new.py and check_new.py [c][] daily.\n\n[a]: https://x\n[b]: https://x\n[x]: https://x\n[c]: https://x\n")
         probs = check(root)
         expect(not probs, "R10-#6416-control: an existing name split by a reference label was rejected (%r)" % (probs,))
+        # #6418 (round 10): a compatibility character that NFKC turns into a name character (a Roman
+        # numeral c, a one-dot leader, a fullwidth or small full stop, a circled letter, a Unicode hyphen)
+        # is not that ASCII character: a reader who copies the name gets the wrong characters, so the
+        # look-alike report covers it even when its folded form is an existing script.
+        for label, text in (
+            ("U+217D Roman numeral c", "Run `ⅽheck_new.py`.\n"),
+            ("U+217D as a character reference", "Run &#x217D;heck_new.py.\n"),
+            ("U+2024 one-dot leader", "Run `check_new․py`.\n"),
+            ("U+FF0E fullwidth full stop", "Run `check_new．py`.\n"),
+            ("U+FE52 small full stop", "Run `check_new﹒py`.\n"),
+            ("U+24D2 circled c", "Run `ⓒheck_new.py`.\n"),
+            ("U+2010 hyphen", "Run `check‐new.py` and `check_new.py`.\n"),
+            ("U+2011 non-breaking hyphen", "Run `check‑new.py`.\n"),
+            ("U+FF3F fullwidth low line", "Run `check＿new.py`.\n"),
+        ):
+            doc.write_bytes(text.encode("utf-8"))
+            expect(any("look-alike script name" in p for p in check(root)),
+                   "R10-#6418-%s: a look-alike character folded into a valid script name was accepted" % label)
+        doc.write_bytes("Run `check_new.py`, check_new.py… and `check_new.py` – daily.\n".encode("utf-8"))
+        probs = check(root)
+        expect(not probs, "R10-#6418-control: punctuation after a valid name was reported (%r)" % (probs,))
         # #6353: an allowlist that exists but cannot be stat'ed is unreadable (exit 2), never absent.
         r = fresh("u-allow-loop")
         (r / ALLOW_REL).unlink()
