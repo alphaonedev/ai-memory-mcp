@@ -85,6 +85,57 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
   `brew install rust` — see §9. Host-specific paths and runner service names
   are operator-local, not published here.
 
+### 3.3 Runner disk hygiene (#6118)
+
+The fleet's workspace `target/` is persistent and IS the warm compile cache
+(#3128): never run `Swatinem/rust-cache` or a wholesale `cargo clean` on a
+fleet node. The test executables are the exception. One full `cargo test`
+build links ~1000 test binaries into `target/debug/deps`, and cargo relinks
+every one of them whenever the lib crate changes, i.e. on every commit, so they
+are dead weight the moment the job ends. On 2026-10-08 two linux-fed runners
+each held 164 GB of them (~170 MB per binary at `line-tables-only`) and took
+the f2 root filesystem from 224 GB to 78 GB free in two hours (#6118). Two
+controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
+(Section G of `scripts/test/test-ci-workflow-invariants.sh`, run by
+`c8-precheck.yml`):
+
+- **One debuginfo level, `0`, on every self-hosted cargo job** (`ci.yml`
+  `check`, `cert-postgres-age.yml`, `postgres-ignored.yml`,
+  `session-boot-lifetime.yml`): `CARGO_PROFILE_DEV_DEBUG` and
+  `CARGO_PROFILE_TEST_DEBUG` are both `"0"`. The level is part of cargo's
+  artifact hash, so jobs at different levels keep separate complete artifact
+  trees in one persistent `target/`; one level means one tree. Measured
+  2026-10-09 (sandbox, 4 cores, `cargo test --no-run -p ai-memory --lib --test
+  mcp_input_schema_no_false_strict_1052`, one `CARGO_TARGET_DIR` per level):
+
+  | debuginfo level            | integration test binary | lib unit-test binary | `debug/deps` |
+  |----------------------------|------------------------:|---------------------:|-------------:|
+  | cargo default (full, `2`)  | 484 MB                  | 889 MB               | 6.2 GB       |
+  | `line-tables-only`         | 130 MB                  | 411 MB               | 3.4 GB       |
+  | `0`                        | 11.6 MB                 | 258 MB               | 2.4 GB       |
+
+  The ~1000 integration binaries are what fill the disk: 11x smaller at `0`
+  than at `line-tables-only` (which the `check` job already ran at when it
+  wrote the 164 GB), so a full build's peak is ~12 GB instead of ~130-164 GB.
+  Nothing in CI reads line tables (no workflow, script or test sets
+  `RUST_BACKTRACE`; a panic's `file:line` is a compile-time string).
+- **`Prune runner target dir (#6118)` is the LAST step of each such job**,
+  under `if: always()`, running
+  `python3 scripts/ci/prune-runner-target.py --target-dir "${CARGO_TARGET_DIR:-target}"`.
+  The default `--scope test-bins` deletes the test/example executables (plus
+  their `.d` and `.dSYM` companions) and `incremental/`; the rlib / rmeta /
+  proc-macro outputs, `build/` and `.fingerprint/` stay, so the next compile is
+  still warm. `--dry-run` lists what would go and prints `freed_bytes=<n>`;
+  `--scope all` wipes `debug/{deps,build,incremental,examples,.fingerprint}`
+  wholesale (the disk-emergency prune, no toolchain needed). The script fails
+  closed (exit 2) on anything that is not a cargo target dir and never follows
+  a symlink. By hand on a node:
+
+  ```bash
+  python3 scripts/ci/prune-runner-target.py \
+    --target-dir ~/actions-runner/_work/ai-memory-mcp/ai-memory-mcp/target --dry-run
+  ```
+
 ---
 
 ## 4. CI topology
