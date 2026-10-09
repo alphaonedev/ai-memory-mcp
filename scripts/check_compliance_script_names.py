@@ -14,7 +14,8 @@ Rule: every ``check-*.sh`` / ``check_*.py`` script name in a
 bounded by non-name characters: in or out of backticks, in a fenced block, after
 a command (``bash scripts/...``) or a path (``./scripts/...``, a URL), after
 invisible characters (category Cf and every Default_Ignorable_Code_Point) are removed
-from document lines (#6195). Each line is also scanned as a reader sees it after
+from document lines (#6195); a bidirectional control character (an embedding, override,
+isolate or implicit mark) anywhere in a document is a violation. Each line is also scanned as a reader sees it after
 rendering (#6214): escapes, entities, inline tags and comments, emphasis markers, dash
 variants, combining marks and look-alike letters folded, so a backslash-escaped
 hyphen, ``check&#45;x.sh`` or a Cyrillic look-alike letter cannot hide a name. The
@@ -249,6 +250,12 @@ def invisible(c):
         return True
     cp = ord(c)
     return any(lo <= cp <= hi for lo, hi in DEFAULT_IGNORABLE)
+
+
+# Bidirectional controls (#6195): embeddings, overrides and isolates (U+202A-U+202E,
+# U+2066-U+2069) and the implicit marks (U+200E, U+200F, U+061C). Each is invisible, so the gate
+# strips it, yet it reorders what a reader sees: a reversed name looks like another name.
+BIDI_CONTROLS = frozenset("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
 
 
 def visible(text):
@@ -842,8 +849,14 @@ def check(root):
     allowed, ledger_problems = load_allowlist(root)
     problems.extend(ledger_problems)
     used = set()
-    for doc, _raw, lines in lines_by_doc:
+    for doc, raw, lines in lines_by_doc:
         rel = doc.relative_to(root).as_posix()
+        for lineno, line in enumerate(raw, 1):
+            for c in sorted({c for c in line if c in BIDI_CONTROLS}):
+                problems.append(
+                    "%s:%d: bidirectional control character U+%04X (it reorders what a reader sees)"
+                    % (rel, lineno, ord(c))
+                )
         joined = skeleton(lines)
         for lineno, line in enumerate(lines, 1):
             views = [line] + joined.get(lineno, [])
