@@ -96,6 +96,31 @@ sys.exit(mod.main(sys.argv[3:]))
 """
 
 
+# Delivers a signal to the helper's own pid right after the real Popen returns (the spawn window).
+# argv: script, signum, pid-file, then the helper's own arguments.
+WINDOW_HARNESS = """import importlib.util, os, subprocess, sys
+spec = importlib.util.spec_from_file_location("ensure_age_extension", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod.installed_ok = lambda dests: True
+mod.dest_dirs = lambda pg_config: {}
+signum, pid_file = int(sys.argv[2]), sys.argv[3]
+real_popen = subprocess.Popen
+
+
+class WindowPopen(real_popen):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        with open(pid_file, "w") as fh:
+            fh.write(str(self.pid))
+        os.kill(os.getpid(), signum)
+
+
+subprocess.Popen = WindowPopen
+sys.exit(mod.main(sys.argv[4:]))
+"""
+
+
 def write_exe(path, text):
     path.write_text(text)
     path.chmod(0o755)
@@ -722,6 +747,67 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertNotIn("Traceback", err)
         self.assertNotIn(PW_MARKER, out + err)
         self.assert_gone(child)
+
+    def test_sighup_mid_connect_is_one_line_and_terminates_the_psql_child(self):
+        # #6338: SIGHUP kept its default action, so the helper died and psql was reparented with PGPASSWORD.
+        proc, child = self.start_sleeping_helper()
+        proc.send_signal(signal.SIGHUP)
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 1, out + err)
+        self.assertEqual(err.strip(), PREFIX + "interrupted")
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn(PW_MARKER, out + err)
+        self.assert_gone(child)
+
+    def run_signal_in_spawn_window(self, signum):
+        """Deliver ``signum`` to the helper's own pid right after the real Popen returns (#6337).
+
+        This is the window a runner's signal can hit: the psql child exists, but the guard around
+        ``communicate`` has not been entered.  The wrapper records the child pid first, so the
+        assertion on the child's fate does not depend on timing.
+        """
+        write_exe(self.psql, SLEEPING_PSQL.format(py=sys.executable, base=str(self.base)))
+        self.install_good()
+        pid_file = self.base / "window.pid"
+        harness = self.base / "window_harness.py"
+        harness.write_text(WINDOW_HARNESS)
+        cmd = [sys.executable, "-I", str(harness), str(SCRIPT), str(int(signum)), str(pid_file),
+               "--url-file", str(self.url_file), "--age-dir", str(self.age),
+               "--pg-config", str(self.pg_config), "--psql", str(self.psql)]
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+        child = int(pid_file.read_text())
+
+        def reap():
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        self.addCleanup(reap)
+        return r, child
+
+    def test_signal_in_the_psql_spawn_window_terminates_the_psql_child(self):
+        # #6337: a handled signal between Popen() and the communicate() guard escaped the guard.
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signal=signum.name):
+                r, child = self.run_signal_in_spawn_window(signum)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertEqual(r.stderr.strip(), PREFIX + "interrupted")
+                self.assertNotIn(PW_MARKER, r.stdout + r.stderr)
+                self.assert_gone(child)
+
+    def test_connect_timeout_must_be_a_bounded_positive_integer(self):
+        # #6338: libpq reads connect_timeout=0 as "wait forever", which removes the orphan bound.
+        for value in ("0", "00", "61", "100", "-1", "+5", "5s", "", "1e1", "%30"):
+            with self.subTest(value=value):
+                self.assert_url_refused(
+                    f"postgres://ciuser:pw@127.0.0.1:5445/cidb?connect_timeout={value}", ("connect_timeout",))
+        self.assert_url_refused("postgres://ciuser@127.0.0.1:5445/cidb?%63onnect_timeout=0", ("connect_timeout",))
+        mod = load_module()
+        for value in ("1", "15", "60", "05"):
+            with self.subTest(accepted=value):
+                url = f"postgres://ciuser@127.0.0.1:5445/cidb?connect_timeout={value}"
+                self.assertEqual(mod.psql_target(url), (url, None))
 
     def test_psql_gets_a_bounded_connect_timeout(self):
         self.install_good()
