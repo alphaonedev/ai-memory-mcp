@@ -2124,6 +2124,20 @@ def _self_test_cases() -> int:
     masks("#6163 R4 a nested prose description under a bare api_key stays visible",
           "api_key:\n  description: The key used by the CLI", shown=("description: The key used by the CLI",),
           count=0)
+    # #6209 round 4 (security F3): the count exemption is judged over the whole value: at most 9 digits in total, in
+    # one count word. Digit groups joined by `_`, `.` or spaces are one longer number and are masked.
+    for label, text, hidden in (
+            ("an underscore-joined digit run", "secret=123456789_123_456_789", "123456789_123_456_789"),
+            ("a card-style grouped number", "secret: 4111 1111 1111 1111", "4111 1111 1111 1111"),
+            ("three six-digit groups", "token: 123456 654321 112233", "654321 112233"),
+            ("a decimal of 11 digits", "secret: 12345678.123", "12345678.123")):
+        masks(f"#6209 R4 {label} is masked", text, hidden=(hidden,))
+    # #6209 round 4 (code F3): after a count or switch word, only lower-case prose words keep the value visible.
+    masks("#6209 R4 a capitalised word after a count is masked", "secret: 1 Qzxcanary", hidden=("Qzxcanary",))
+    masks("#6209 R4 an acronym after a switch word is masked", "token: on QZXC", hidden=("QZXC",))
+    for visible in ("max_tokens: 20000 per request", "token_count = 1,500",
+                    "secret_scanning: enabled for every repository"):
+        masks(f"#6209 R4 {visible!r} stays visible", visible, shown=(visible,), count=0)
 
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
