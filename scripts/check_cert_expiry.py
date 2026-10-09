@@ -2206,6 +2206,7 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     shapes["log-who"] = pr("log-who", {wf_rel: "name: weakened (fixture)\n"},
                            f"\n\nRule-Change-Approved-By: Evil\r{forged}x")
     _round3_shapes(repo, shapes, pr, approve, wf_rel, c8_rel)
+    _round4_shapes(shapes, pr, approve, wf_rel, c8_rel)
     # Merge-structure shapes off one PR head (#6138 cells, here in --trusted mode).
     fx.g("checkout", "-q", "-b", "h8", base)
     fx.write("src/unrelated.rs", "// h8 PR work\n", append=True)
@@ -2332,6 +2333,7 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     _trusted_log_cells(t, judge, shapes)
     _trusted_merge_ref_cells(t, fx, mirror, head8, good8, unrel8)
     _trusted_round3_cells(tmp, t, judge, shapes)
+    _trusted_round4_cells(judge, shapes)
     _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8)
 
 
@@ -2619,6 +2621,98 @@ def _trusted_round3_cells(tmp, t, judge, shapes):
                 os.environ[k] = v
 
 
+C8_GATE_LAST = "      - run: python3 -I scripts/check_cert_expiry.py\n"
+TRUSTED_WF_LAST = "        run: python3 -I scripts/check_cert_expiry.py --self-test\n"
+
+
+def _hidden_job(text, last, brk):
+    """TEXT with SHADOW_JOB_FIXTURE joined onto its line LAST by the line break
+    BRK instead of LF, so a line scan that splits on LF only sees one line."""
+    return text.replace(last, last.rstrip("\n") + brk + brk.join(SHADOW_JOB_FIXTURE.rstrip("\n").split("\n")) + "\n", 1)
+
+
+def _round4_shapes(shapes, pr, approve, wf_rel, c8_rel):
+    """#6140 round 4 shapes (code review R3-1/R3-2, security review R3-1/R3-2,
+    #6228): a second producer hidden behind a YAML line break other than LF
+    inside each own job region, and one isolated shape per YAML-hazard rule."""
+    named = "    name: Enterprise-federation cert-expiry gate (cert §7 / F7)\n"
+    gate = "  cert-expiry-gate:\n" + named + "    runs-on: ubuntu-latest\n    steps:\n" + C8_GATE_LAST
+    trusted_pr = TRUSTED_WF_FIXTURE.replace("on:\n", "on:\n  pull_request:\n", 1)
+    ok_wf = "name: lb\non: [push]\njobs:\n  lb:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo lb\n"
+    r4 = {
+        "cr-c8": ({c8_rel: _hidden_job(C8_FIXTURE, C8_GATE_LAST, "\r")}, approve),
+        "sep-c8": ({c8_rel: _hidden_job(C8_FIXTURE, C8_GATE_LAST, " ")}, approve),
+        "nel-c8": ({c8_rel: _hidden_job(C8_FIXTURE, C8_GATE_LAST, "\x85")}, approve),
+        "ps-c8": ({c8_rel: _hidden_job(C8_FIXTURE, C8_GATE_LAST, " ")}, approve),
+        "cr-trusted": ({wf_rel: _hidden_job(trusted_pr, TRUSTED_WF_LAST, "\r")}, approve),
+        "nel-trusted": ({wf_rel: _hidden_job(trusted_pr, TRUSTED_WF_LAST, "\x85")}, approve),
+        "lb-other": ({".github/workflows/lb.yml": ok_wf.replace("on: [push]\n", "on: [push] ", 1)}, approve),
+        "crlf-c8": ({c8_rel: C8_FIXTURE.replace("\n", "\r\n")}, approve),
+        "merge": ({c8_rel: C8_FIXTURE.replace(named, named + "    <<: {timeout-minutes: 5}\n", 1)}, approve),
+        "tag": ({c8_rel: C8_FIXTURE.replace(named, named + "    timeout-minutes: !!int 5\n", 1)}, approve),
+        "blockind": ({c8_rel: C8_FIXTURE.replace(C8_GATE_LAST, C8_GATE_LAST + "      - run: |2\n          echo x\n", 1)},
+                     approve),
+        "docmark": ({c8_rel: "---\n" + C8_FIXTURE}, approve),
+        "dupjob": ({c8_rel: C8_FIXTURE + "  cert-expiry-gate:\n    runs-on: ubuntu-latest\n    steps:\n"
+                    "      - run: echo always-green\n"}, approve),
+        "tab": ({c8_rel: C8_FIXTURE.replace(named, named + "    \ttimeout-minutes: 5\n", 1)}, approve),
+        "qkey-hdr": ({c8_rel: C8_FIXTURE.replace("jobs:\n", '"env":\n  A: b\njobs:\n', 1)}, approve),
+        "qkey-step": ({c8_rel: C8_FIXTURE.replace(C8_GATE_LAST, C8_GATE_LAST + '        "name": x\n', 1)}, approve),
+        "qval": ({c8_rel: C8_FIXTURE.replace(named, named + '    env:\n      A: "x\n        y"\n', 1)}, approve),
+        "qspan": ({c8_rel: C8_FIXTURE.replace(C8_GATE_LAST, C8_GATE_LAST + '      - "x\n        y"\n', 1)}, approve),
+        "qmark": ({c8_rel: C8_FIXTURE.replace(named, named + "    ? shadow\n    : x\n", 1)}, approve),
+        "jobs2": ({c8_rel: C8_FIXTURE + "jobs:\n  shadow2:\n    runs-on: ubuntu-latest\n    steps:\n"
+                   "      - run: echo x\n"}, approve),
+        "indent6": ({c8_rel: C8_FIXTURE.replace(gate, "\n".join(("  " + ln if ln.startswith("    ") else ln)
+                                                                  for ln in gate.split("\n")), 1)}, approve),
+        "after-block": ({c8_rel: C8_FIXTURE.replace("      - run: echo other\n",
+                                                    "      - run: |\n          echo other\n", 1).replace(
+            "  later-job:\n", "  later-job:\n    <<: {timeout-minutes: 5}\n", 1)}, approve),
+        "window": ({".github/workflows/wide.yml": ok_wf.replace(
+            "  lb:\n", '  lb:\n    name: "Enterprise-federation cert-expir\\\n      y gate"\n', 1)}, ""),
+        "section": ({".github/workflows/sec.yml": ok_wf.replace(
+            "  lb:\n", "  lb:\n    name: Federation gate (cert §7 / F7)\n", 1)}, ""),
+    }
+    for key, (edits, trailer_msg) in r4.items():
+        shapes["r4-" + key] = pr("r4-" + key, edits, trailer_msg)
+
+
+def _trusted_round4_cells(judge, shapes):
+    """#6140 round 4 (code review R3-1/R3-2, security review R3-1/R3-2, #6228):
+    a second producer behind a YAML line break other than LF in an own job
+    region is RED WITH the trailer (the hidden job is named, and the line
+    break itself is refused in every workflow file), CRLF stays GREEN, and
+    each YAML-hazard rule of the own files has a cell that isolates it."""
+    shadow = "GUARD SHADOW: "
+    c8, wf = PINNED_TRUSTED_JOB[0], PINNED_TRUSTED_PATHS[1]
+    lb = "a YAML line break other than LF"
+    for key, where in (("cr-c8", c8), ("sep-c8", c8), ("nel-c8", c8), ("ps-c8", c8),
+                       ("cr-trusted", wf), ("nel-trusted", wf)):
+        # The trusted workflow is guarded whole, so its edit also prints the waived GUARD CHANGED.
+        judge(f"tr-s-{key}", f"a second producer behind a non-LF YAML line break ({key}) WITH the trailer",
+              *shapes["r4-" + key], needles=(shadow + where, lb, "(job 'shadow')")
+              + (("Selftest Approver",) if where == wf else ()))
+    judge("tr-s-lb-other", "a YAML line break other than LF in a workflow that is not an own file",
+          *shapes["r4-lb-other"], needles=(shadow + ".github/workflows/lb.yml", lb))
+    judge("tr-s-crlf", "c8-precheck.yml with CRLF line ends WITH the trailer", *shapes["r4-crlf-c8"], ok=True,
+          absent=(shadow,))
+    for key, says in (("merge", "merge key"), ("tag", "a YAML tag"), ("blockind", "indentation indicator"),
+                      ("docmark", "document marker"), ("dupjob", "is defined twice"),
+                      ("tab", "a tab in the indentation"), ("qkey-hdr", "a quoted mapping key"),
+                      ("qkey-step", "a quoted mapping key"), ("qval", "a quoted scalar spanning lines"),
+                      ("qspan", "a quoted scalar spanning lines"), ("qmark", "complex key"),
+                      ("jobs2", "a second jobs: key"), ("indent6", "is not indented by 4 spaces")):
+        judge(f"tr-s-{key}", f"an own-file YAML hazard ({key}) WITH the trailer", *shapes["r4-" + key],
+              needles=(shadow + c8, says, "Selftest Approver"))
+    # The hazard scan resumes after a block scalar: a merge key in a later (unguarded) job is refused.
+    judge("tr-s-after-block", "a merge key in a c8 job after a `run: |` block", *shapes["r4-after-block"],
+          needles=(shadow + c8, "merge key"))
+    judge("tr-s-window", "a name fragment split by a quoted continuation after 9 of its characters",
+          *shapes["r4-window"], needles=(shadow + ".github/workflows/wide.yml",))
+    judge("tr-s-section", "a name carrying only the section-sign fragment", *shapes["r4-section"],
+          needles=(shadow + ".github/workflows/sec.yml",))
+
+
 # The fetch timeout and the job budget it must fit (code F3, security R2-4).
 PINNED_FETCH_TIMEOUT = 45
 TRUSTED_JOB_SECONDS = 600
@@ -2627,6 +2721,15 @@ import os, sys, time
 real, argv = {real!r}, sys.argv[1:]
 if {hang!r} in argv:
     time.sleep(30)
+os.execv(real, [real] + argv)
+"""
+
+GIT_STDERR_SHIM = """#!{python}
+import os, sys
+real, argv = {real!r}, sys.argv[1:]
+if "fetch" in argv:
+    sys.stderr.buffer.write(b"fatal: remote says \\xe2\\x80\\xa8\\x1b[31m\\n::error title=forged::x\\n")
+    sys.exit(1)
 os.execv(real, [real] + argv)
 """
 
@@ -2726,6 +2829,19 @@ def _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8):
                     needles=("::error title=cert-expiry trusted::", "last fetch error", "could not complete"))
         finally:
             cut.clear()
+        # Round 4 (code R3-2 X12, security R3-2 Q10): a failed `update-ref -d` stops before any fetch.
+        with _git_shim(tmp, GIT_SHIM, version="", fail="update-ref"):
+            run("tr-f-delete", "every destination-ref delete failing", False,
+                needles=("git update-ref -d", "shim refuses"))
+        if fetches:
+            t.fail(f"(tr-f-delete): a fetch ran after a failed update-ref -d: {fetches!r}")
+        # Round 4 (code R3-2 X14): git's fetch stderr is escaped, never printed raw.
+        with _git_shim(tmp, GIT_STDERR_SHIM):
+            out = run("tr-f-stderr", "a fetch whose stderr carries U+2028, ESC, LF and a forged ::error", False,
+                      needles=("\\u2028", "\\x1b[31m", "\\x0a::error title=forged"))
+        if "\u2028" in out or "\x1b" in out:
+            t.fail("(tr-f-stderr): a raw U+2028 or ESC from git's stderr reached the log:", out)
+        _no_forged_lines(t, "tr-f-stderr", "git's fetch stderr", out)
     finally:
         globals()["run_git"] = real_run_git
         if real_sleep is None:
@@ -2812,7 +2928,14 @@ SELF_TEST_OK = (
     "continuations, a symlinked workflow and a non-directory .github/workflows RED; U+2028, C1, % and an "
     "oversized workflow's name escaped; inherited GIT_* ignored; every fetch bounded by FETCH_TIMEOUT within "
     "the job, a failed or hung fetch an ::error naming the last fetch error, a failed head fetch stopping "
-    "before any merge fetch, and a destination ref from an earlier run deleted, never judged."
+    "before any merge fetch, and a destination ref from an earlier run deleted, never judged; (tr round 4, "
+    "#6228) a second producer joined to an own job line by a CR, LS, PS or NEL RED even with the trailer (the "
+    "hidden job named, the line break refused in every workflow file) while CRLF stays GREEN; a merge key, tag, "
+    "explicit block indentation indicator, document marker, duplicate job, tab, quoted key (header or step), "
+    "quoted scalar spanning lines (value or node), complex key, second jobs: key, an own job body not indented "
+    "by 4 and a merge key after a block scalar each RED with the trailer; a name fragment split after 9 "
+    "characters and a section-sign-only fragment RED; a failed update-ref -d stopping before any fetch and "
+    "git's fetch stderr escaped."
 )
 
 
