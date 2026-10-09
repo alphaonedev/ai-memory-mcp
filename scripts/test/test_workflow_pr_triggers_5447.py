@@ -15,7 +15,31 @@ PR head, and ``rehearsal/audit-wip`` is the head of the promotion PR (the
 duplicate push + pull_request run share one concurrency key and cancel each
 other).  The shape follows the #2506 precedent in ``token-budget.yml``.
 
+THE CHAIN RULING (#6117).  A Promotion carrier (``chain/**``) is a long-lived
+integration branch that the conductor merges into with local signed merges; while
+no promotion PR is open against it, a push to it ran NO workflow, so carrier-only
+defects (#6115, #6116) surfaced only once a PR was opened against the carrier.
+The required-set workflows (``CHAIN_PUSH_WORKFLOWS``) therefore list ``chain/**``
+in ``push.branches``.  ``chain/promo6-ssh`` is also the HEAD of the promotion PR
+(#6160), the #2508 shape, so the ruling is only sound when the concurrency key of
+every such dual-trigger workflow is event-distinct (it names
+``github.event_name``): the push run and the pull_request run then never share a
+cancel-in-progress group.  Precedent for the key: ``release-shape.yml``,
+``cert-postgres-age.yml``, ``postgres-ignored.yml``; the sanctioned remedy named
+in ``scripts/qc-allowlists/dual-trigger-cancel-allow.txt`` and by rule (d) of
+``scripts/check-required-contexts.sh``.  ``rehearsal/**`` stays banned from
+``push.branches`` (R-PUSH): the ruling is for the chain carriers only.
+
 RULES ENFORCED (all closed-world: a trigger the reader cannot parse is a FAILURE):
+  R-CHAIN every workflow named in ``CHAIN_PUSH_WORKFLOWS`` lists the literal
+         entry ``chain/**`` in ``push.branches`` and its filter matches
+         ``chain/promo6-ssh`` (#6117).
+  R-CHAIN-KEY a workflow whose ``push`` filter can match any ref under ``chain/``
+         AND that also triggers on ``pull_request`` or ``pull_request_target``
+         AND that declares a top-level ``concurrency:`` block must name
+         ``github.event_name`` in that block's ``group`` (#2508, #6117).  A
+         ``concurrency:`` block without a ``group`` row counts as not
+         event-distinct.
   R-PR   every workflow whose ``pull_request`` filter can match main, develop or
          release/v1.0.0 lists the literal entry ``rehearsal/**`` and its filter
          matches ``rehearsal/audit-wip``.
@@ -137,6 +161,19 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 CARRIER = "rehearsal/audit-wip"
 CARRIER_PATTERN = "rehearsal/**"
 GATED_BASES = ("main", "develop", "release/v1.0.0")
+# #6117: the Promotion 6 carrier and the pattern the required-set workflows must
+# list in push.branches so every signed merge into a chain carrier has a verdict.
+CHAIN_CARRIER = "chain/promo6-ssh"
+CHAIN_PATTERN = "chain/**"
+CHAIN_PREFIX = "chain/"
+CHAIN_BRANCH = "chain"
+# The required-set carriers: the five COVERED_WORKFLOWS of
+# scripts/check-required-contexts.sh plus release-shape.yml, which #6117 names.
+CHAIN_PUSH_WORKFLOWS = ("ci.yml", "c8-precheck.yml", "coverage.yml", "release-shape.yml",
+                        "cert-postgres-age.yml", "postgres-ignored.yml")
+# The one discriminator rule (d) of scripts/check-required-contexts.sh accepts as
+# proof that a push run and a pull_request run resolve different group keys.
+EVENT_DISTINCT = "github.event_name"
 PR_TRIGGERS = ("pull_request", "pull_request_target")
 KNOWN_FILTER_KEYS = ("branches", "tags", "paths", "paths-ignore", "types")
 
@@ -777,7 +814,17 @@ def _push_item_problem(pat: str) -> str:
 
 def _push_can_match_rehearsal(pat: str) -> bool:
     """True when a decidable push glob can match the branch ``rehearsal`` or any ref under ``rehearsal/``."""
-    if "rehearsal" in pat:
+    return _push_can_match_under(pat, REHEARSAL_PREFIX, REHEARSAL_BRANCH)
+
+
+def _push_can_match_chain(pat: str) -> bool:
+    """True when a decidable push glob can match the branch ``chain`` or any ref under ``chain/`` (#6117)."""
+    return _push_can_match_under(pat, CHAIN_PREFIX, CHAIN_BRANCH)
+
+
+def _push_can_match_under(pat: str, prefix: str, branch: str) -> bool:
+    """True when a decidable push glob can match ``branch`` or any ref under ``prefix`` (closed-world, #5659)."""
+    if branch in pat:
         return True
     tokens: List[str] = []
     i = 0
@@ -800,7 +847,7 @@ def _push_can_match_rehearsal(pat: str) -> bool:
         return out
 
     states = close({0})
-    for ch in REHEARSAL_PREFIX:
+    for ch in prefix:
         nxt = set()
         for st in states:
             if st >= len(tokens):
@@ -812,20 +859,45 @@ def _push_can_match_rehearsal(pat: str) -> bool:
         if not states:
             break
     # Any live state after the whole prefix can still complete: literals extend the
-    # ref and stars match empty, so some ref under rehearsal/ matches.
-    return bool(states) or glob_match(pat, REHEARSAL_BRANCH)
+    # ref and stars match empty, so some ref under the prefix matches.
+    return bool(states) or glob_match(pat, branch)
+
+
+def concurrency_group(text: str) -> Optional[str]:
+    """The ``group`` value of the top-level ``concurrency:`` block, '' without a group row, None without the block.
+
+    Read from the same closed-world rows parse_triggers() uses (#6117), so a file
+    the reader refuses never yields a group here either.
+    """
+    if text.startswith("﻿"):
+        text = text[1:]
+    rows = _meaningful(text)
+    start = None
+    for idx, (ind, _body, key) in enumerate(rows):
+        if ind == 0 and key == "concurrency":
+            start = idx
+            break
+    if start is None:
+        return None
+    for ind, body, key in rows[start + 1:]:
+        if ind == 0:
+            break
+        if key == "group":
+            return body[len("group"):].lstrip(" ")[1:].strip(" ")
+    return ""
 
 
 def violations(name: str, text: str) -> List[str]:
     """Every rule violation for one workflow file's text (empty list = clean)."""
     try:
         triggers = parse_triggers(text)
+        group = concurrency_group(text)
     except Unparsed as exc:
         # Closed world (#5731): a file the reader cannot read is a failure, whatever
         # words its raw text holds; an escaped key spells a trigger with none of them.
         return [f"{name}: R-SHAPE cannot parse triggers ({exc})"]
     try:
-        return _rule_violations(name, triggers)
+        return _rule_violations(name, triggers, group)
     except Unparsed as exc:
         # A filter item the glob reader cannot read (a [ class, a ! negation, an
         # empty item, or any character or construct outside the modelled set) is
@@ -834,8 +906,13 @@ def violations(name: str, text: str) -> List[str]:
         return [f"{name}: R-SHAPE cannot match filters ({exc})"]
 
 
-def _rule_violations(name: str, triggers: Dict[str, Dict[str, List[str]]]) -> List[str]:
-    """R-PR and R-PUSH violations for one file's parsed triggers."""
+def _rule_violations(name: str, triggers: Dict[str, Dict[str, List[str]]],
+                     group: Optional[str] = None) -> List[str]:
+    """R-PR, R-PUSH, R-CHAIN and R-CHAIN-KEY violations for one file's parsed triggers.
+
+    ``group`` is the top-level concurrency group (see concurrency_group()); None
+    means the file declares no ``concurrency:`` block.
+    """
     found: List[str] = []
     for trig in PR_TRIGGERS:
         if trig not in triggers:
@@ -868,6 +945,22 @@ def _rule_violations(name: str, triggers: Dict[str, Dict[str, List[str]]]) -> Li
                     found.append(f"{name}: R-PUSH push.branches item {pat!r} can match a rehearsal ref")
         elif "tags" not in flt:
             found.append(f"{name}: R-PUSH push has no branches and no tags filter (matches every branch)")
+    # R-CHAIN (#6117): the required-set workflows run on every push to a chain carrier.
+    push_branches = (triggers.get("push") or {}).get("branches") or []
+    if name in CHAIN_PUSH_WORKFLOWS:
+        if CHAIN_PATTERN not in push_branches:
+            found.append(f"{name}: R-CHAIN push.branches lacks {CHAIN_PATTERN} (#6117)")
+        elif not filter_matches(push_branches, CHAIN_CARRIER):
+            found.append(f"{name}: R-CHAIN push.branches does not match {CHAIN_CARRIER} (#6117)")
+    # R-CHAIN-KEY (#2508, #6117): a chain carrier is a PR HEAD (the promotion PR), so a
+    # workflow that runs on both events for it must key its cancel group per event.
+    chain_push = [pat for pat in push_branches
+                  if not _push_item_problem(pat) and not pat.startswith("!") and _push_can_match_chain(pat)]
+    if chain_push and any(trig in triggers for trig in PR_TRIGGERS) and group is not None \
+            and EVENT_DISTINCT not in group:
+        found.append(f"{name}: R-CHAIN-KEY push.branches {chain_push[0]!r} can match a chain ref, the workflow "
+                     f"also triggers on pull_request, and concurrency.group does not name {EVENT_DISTINCT} "
+                     "(#2508 cancelled twin, #6117)")
     return found
 
 
@@ -1308,6 +1401,166 @@ class PushNeverRehearsal5659(unittest.TestCase):
         self._clean("[main, develop, 'release/**']")
         self._clean("[main, 'release/v0.6.3.1', feat/v0.7.0-grand-slam]")
         self._clean("[release/**]")
+
+
+HOUSE_KEY = ("x-${{ github.event.pull_request.head.repo.full_name == github.repository && "
+             "github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}")
+EVENT_KEY = "x-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name }}"
+
+
+def _with_conc(body: str, group: Optional[str]) -> str:
+    """A workflow text with the given on: body and a concurrency block (None = no block, '' = no group row)."""
+    text = "name: x\non:\n" + body
+    if group is None:
+        return text + "jobs: {}\n"
+    if group == "":
+        return text + "concurrency:\n  cancel-in-progress: true\njobs: {}\n"
+    return text + "concurrency:\n  group: " + group + "\n  cancel-in-progress: true\njobs: {}\n"
+
+
+class ChainPushCoverage6117(unittest.TestCase):
+    """#6117: the required-set workflows run on every push to a chain carrier, under an event-distinct key."""
+
+    CHAIN_PUSH = "  push:\n    branches: [main, develop, 'release/**', 'chain/**']\n"
+
+    def setUp(self) -> None:
+        self.live = load_all()
+
+    # ---- live sweep (red on the pre-#6117 tree, green once the trigger lands) ----
+
+    def test_6117_live_required_set_lists_chain_on_push(self) -> None:
+        for name in CHAIN_PUSH_WORKFLOWS:
+            self.assertIn(name, self.live, "required-set workflow missing from the census")
+            flt = parse_triggers(self.live[name]).get("push") or {}
+            branches = flt.get("branches", [])
+            self.assertIn(CHAIN_PATTERN, branches, (name, branches))
+            self.assertTrue(filter_matches(branches, CHAIN_CARRIER), (name, branches))
+            self.assertEqual([], [v for v in violations(name, self.live[name]) if "R-CHAIN" in v])
+
+    def test_6117_live_chain_push_workflows_key_per_event(self) -> None:
+        # Every live workflow that pushes on a chain ref AND gates PRs keys its cancel
+        # group per event; the six required-set carriers must be among them.
+        keyed = []
+        for name, text in self.live.items():
+            trig = parse_triggers(text)
+            pats = (trig.get("push") or {}).get("branches", [])
+            if not any(_push_can_match_chain(p) for p in pats if not _push_item_problem(p)):
+                continue
+            if not any(t in trig for t in PR_TRIGGERS):
+                continue
+            group = concurrency_group(text)
+            self.assertIsNotNone(group, name)
+            self.assertIn(EVENT_DISTINCT, group or "", (name, group))
+            keyed.append(name)
+        for name in CHAIN_PUSH_WORKFLOWS:
+            self.assertIn(name, keyed)
+
+    def test_6117_live_rehearsal_stays_off_push(self) -> None:
+        # The chain ruling does not loosen R-PUSH: no live push filter matches rehearsal/.
+        for name, text in self.live.items():
+            for pat in (parse_triggers(text).get("push") or {}).get("branches", []):
+                self.assertFalse(_push_can_match_rehearsal(pat), (name, pat))
+
+    # ---- mutants of the live files ----
+
+    def _assert_killed(self, name: str, mutant: str, needle: str) -> None:
+        got = violations(name, mutant)
+        self.assertTrue(any(needle in v for v in got), f"mutant survived: {name} {needle}: {got}")
+
+    def test_6117_m01_remove_chain_from_each_required_push(self) -> None:
+        for name in CHAIN_PUSH_WORKFLOWS:
+            t = self.live[name]
+            m = re.sub(r'(push:\s*\n\s*branches: \[[^\]]*?), "chain/\*\*"', r"\1", t, count=1)
+            self.assertNotEqual(t, m, name)
+            self._assert_killed(name, m, "R-CHAIN push.branches lacks")
+
+    def test_6117_m02_drop_event_name_from_each_dual_trigger_key(self) -> None:
+        for name in CHAIN_PUSH_WORKFLOWS:
+            t = self.live[name]
+            m = t.replace("${{ github.event_name }}-", "", 1)
+            self.assertNotEqual(t, m, name)
+            self._assert_killed(name, m, "R-CHAIN-KEY")
+
+    def test_6117_m03_narrow_chain_to_a_literal_that_is_not_the_carrier(self) -> None:
+        t = self.live["ci.yml"]
+        m = t.replace('"chain/**"]', '"chain/promo5"]', 1)
+        self.assertNotEqual(t, m)
+        self._assert_killed("ci.yml", m, "R-CHAIN push.branches lacks")
+
+    def test_6117_control_unmutated_required_set_is_clean(self) -> None:
+        for name in CHAIN_PUSH_WORKFLOWS:
+            self.assertEqual([], violations(name, self.live[name]), name)
+
+    # ---- synthetic shapes ----
+
+    def test_6117_rule_is_scoped_to_the_required_set(self) -> None:
+        # A workflow outside CHAIN_PUSH_WORKFLOWS owes no chain push entry.
+        self.assertEqual([], violations("token-budget.yml", _with_conc(GOOD_PUSH + GOOD_PR, HOUSE_KEY)))
+        got = violations("ci.yml", _with_conc(GOOD_PUSH + GOOD_PR, HOUSE_KEY))
+        self.assertTrue(any("R-CHAIN push.branches lacks chain/**" in v for v in got), got)
+
+    def test_6117_wildcard_without_the_literal_entry_is_red(self) -> None:
+        text = _with_conc("  push:\n    branches: [main, 'chain/*']\n" + GOOD_PR, EVENT_KEY)
+        got = violations("coverage.yml", text)
+        self.assertTrue(any("R-CHAIN push.branches lacks chain/**" in v for v in got), got)
+
+    def test_6117_house_key_with_chain_push_and_pr_is_red(self) -> None:
+        got = violations("x.yml", _with_conc(self.CHAIN_PUSH + GOOD_PR, HOUSE_KEY))
+        self.assertTrue(any("R-CHAIN-KEY" in v and "chain/**" in v for v in got), got)
+        self.assertFalse(any("R-CHAIN push" in v for v in got), got)
+
+    def test_6117_house_key_with_a_glob_that_reaches_chain_is_red(self) -> None:
+        for pat in ("ch*/**", "*/promo6-ssh", "**", "chain", "chainx"):
+            text = _with_conc("  push:\n    branches: [main, '" + pat + "']\n" + GOOD_PR, HOUSE_KEY)
+            got = violations("x.yml", text)
+            self.assertTrue(any("R-CHAIN-KEY" in v for v in got), (pat, got))
+
+    def test_6117_event_distinct_key_is_clean(self) -> None:
+        self.assertEqual([], violations("x.yml", _with_conc(self.CHAIN_PUSH + GOOD_PR, EVENT_KEY)))
+        self.assertEqual([], violations("ci.yml", _with_conc(self.CHAIN_PUSH + GOOD_PR, EVENT_KEY)))
+
+    def test_6117_push_only_workflow_needs_no_event_key(self) -> None:
+        # One trigger cannot produce the #2508 twin (rule (d) near-miss shape).
+        self.assertEqual([], violations("x.yml", _with_conc(self.CHAIN_PUSH, HOUSE_KEY)))
+
+    def test_6117_no_concurrency_block_is_clean_and_no_group_row_is_red(self) -> None:
+        self.assertEqual([], violations("x.yml", _with_conc(self.CHAIN_PUSH + GOOD_PR, None)))
+        got = violations("x.yml", _with_conc(self.CHAIN_PUSH + GOOD_PR, ""))
+        self.assertTrue(any("R-CHAIN-KEY" in v for v in got), got)
+
+    def test_6117_pull_request_target_counts_as_a_pr_trigger(self) -> None:
+        text = _with_conc(self.CHAIN_PUSH + "  pull_request_target:\n    branches: [main, 'rehearsal/**']\n",
+                          HOUSE_KEY)
+        self.assertTrue(any("R-CHAIN-KEY" in v for v in violations("x.yml", text)))
+
+    def test_6117_undecidable_push_item_is_r_push_not_r_chain_key(self) -> None:
+        got = violations("x.yml", _with_conc("  push:\n    branches: [main, 'ch?in/**']\n" + GOOD_PR, HOUSE_KEY))
+        self.assertTrue(any("R-PUSH" in v for v in got), got)
+        self.assertFalse(any("R-CHAIN-KEY" in v for v in got), got)
+
+    def test_6117_negated_chain_item_is_clean_for_the_key_rule(self) -> None:
+        text = _with_conc("  push:\n    branches: [main, '!chain/**']\n" + GOOD_PR, HOUSE_KEY)
+        self.assertFalse(any("R-CHAIN-KEY" in v for v in violations("x.yml", text)))
+
+    def test_6117_concurrency_group_reader(self) -> None:
+        self.assertIsNone(concurrency_group(_with_conc(GOOD_PR, None)))
+        self.assertEqual("", concurrency_group(_with_conc(GOOD_PR, "")))
+        self.assertEqual(EVENT_KEY, concurrency_group(_with_conc(GOOD_PR, EVENT_KEY)))
+        self.assertEqual('"q-${{ github.ref }}"', concurrency_group(_with_conc(GOOD_PR, '"q-${{ github.ref }}"')))
+        # A job-level concurrency block is not the top-level one.
+        text = "name: x\non:\n" + GOOD_PR + "jobs:\n  a:\n    concurrency:\n      group: j\n    runs-on: x\n"
+        self.assertIsNone(concurrency_group(text))
+        # The live required-set files all declare one.
+        for name in CHAIN_PUSH_WORKFLOWS:
+            self.assertTrue(concurrency_group(self.live[name]), name)
+
+    def test_6117_chain_prefix_matcher_mirrors_the_rehearsal_one(self) -> None:
+        for pat in ("chain/**", "chain/*", "chain", "ch*/x", "*/x", "**", "c*"):
+            self.assertTrue(_push_can_match_chain(pat), pat)
+        for pat in ("main", "release/**", "rehearsal/**", "chai*-x", "x/*", "cha*n-x"):
+            self.assertFalse(_push_can_match_chain(pat), pat)
+        self.assertTrue(_push_can_match_rehearsal("rehearsal/**"))
+        self.assertFalse(_push_can_match_rehearsal("chain/**"))
 
 
 class DuplicateKeys5666(unittest.TestCase):
