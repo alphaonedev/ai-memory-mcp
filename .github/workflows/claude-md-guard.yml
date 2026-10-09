@@ -22,7 +22,7 @@ on:
   push:
     branches: [main, develop, "release/**"]
   pull_request:
-    branches: [main, develop, "release/**", "rehearsal/**"]
+    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]
   # Merge Queue (#3089): report on the merge_group ref so the queue never wedges
   # on this context. See ci.yml for the full rationale.
   merge_group:
