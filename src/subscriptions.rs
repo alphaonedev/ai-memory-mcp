@@ -35,6 +35,8 @@ use crate::models::field_names;
 pub mod audit_status;
 // #3980 — the per-delivery audit row, persisted at admission.
 mod admission;
+// #4280 — namespace-only subscriptions: recorded, never delivered.
+pub mod namespace_only;
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
@@ -276,6 +278,10 @@ pub mod webhook_events {
 /// `WEBHOOK_EVENT_TYPES`.
 pub fn insert(conn: &Connection, req: &NewSubscription<'_>) -> Result<String> {
     validate_url(req.url)?;
+    insert_unvalidated(conn, req)
+}
+
+fn insert_unvalidated(conn: &Connection, req: &NewSubscription<'_>) -> Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
     let secret_hash = req.secret.map(sha256_hex);
     let now = chrono::Utc::now().to_rfc3339();
@@ -1136,6 +1142,10 @@ pub fn dispatch_event_to_subs(
         let db_path = db_path.to_path_buf();
         let secret_hash_owned = sub_secret_hash.clone();
         let server_wide_secret_owned = server_wide_secret.clone();
+        if namespace_only::is_namespace_only_url(&url) {
+            admission.record_namespace_only(&sub_id, &correlation_id, &event_owned, &body);
+            continue;
+        }
         if !admission.admit(&sub_id, &correlation_id, &event_owned, &body) {
             continue;
         }
@@ -2189,6 +2199,7 @@ pub fn validate_url(url: &str) -> Result<()> {
 /// (which would race with parallel tests). Production callers go
 /// through `validate_url`.
 fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
+    namespace_only::refuse_reserved(url)?;
     // #3684 — refusals name the target as its origin only (see
     // `validate_url_dns_with`); the subscriber who supplied the URL knows
     // the rest, and the operator log must not.
