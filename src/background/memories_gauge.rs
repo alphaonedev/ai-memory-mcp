@@ -34,8 +34,10 @@
 //! shape, so this module also publishes
 //! `ai_memory_memories_refreshed_at_seconds` and alert rules can assert
 //! freshness (`time() - ai_memory_memories_refreshed_at_seconds > N`).
-//! `0` means "never computed", which is distinguishable from a genuine
-//! empty corpus (where the count gauge is 0 but the timestamp is not).
+//! The timestamp series is ABSENT until the first successful refresh
+//! (#3683) — never `0`, which a UNIX-time alert would read as 1970 — so
+//! "never computed" is distinguishable from a genuine empty corpus (where
+//! the count gauge is 0 and the timestamp is present).
 //!
 //! An incrementally-maintained in-process counter was considered and
 //! REJECTED: other OS processes write the same SQLite file (the MCP stdio
@@ -92,7 +94,7 @@ pub fn resolve_interval() -> Duration {
 /// other test in the binary also mutates is a race, not a test.
 pub fn publish_into(metrics: &crate::metrics::Metrics, total: i64, now_unix: i64) {
     metrics.memories_gauge.set(total);
-    metrics.memories_gauge_refreshed_at.set(now_unix);
+    metrics.publish_memories_refreshed_at(now_unix);
 }
 
 /// Publish onto the process metrics registry — the production entry point.

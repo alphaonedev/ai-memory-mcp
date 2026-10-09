@@ -485,7 +485,7 @@ Series an operator should wire alerts to (canonical registration:
 | Series | Type | Meaning |
 |---|---|---|
 | `ai_memory_memories` | gauge | Corpus size. Refreshed on a paced loop (`AI_MEMORY_METRICS_GAUGE_REFRESH_SECS`, default `60`; `0` disables the loop), not per scrape. |
-| `ai_memory_memories_refreshed_at_seconds` | gauge | UNIX seconds at which the gauge above was last recomputed; `0` = never. **Not optional — alert on `time() - ai_memory_memories_refreshed_at_seconds`.** Without it a dead refresher would freeze a plausible-looking count forever, including through a mass deletion, while Prometheus `up` stayed `1`. |
+| `ai_memory_memories_refreshed_at_seconds` | gauge | UNIX seconds at which the gauge above was last recomputed; absent until the first successful refresh (never exported as `0`, which an age alert would read as 1970). **Not optional — alert on `time() - ai_memory_memories_refreshed_at_seconds`.** Without it a dead refresher would freeze a plausible-looking count forever, including through a mass deletion, while Prometheus `up` stayed `1`. |
 | `ai_memory_admission_shed_total` | counter | Requests shed by admission control with a typed `503`. |
 | `ai_memory_log_pipeline_active` | gauge | 1 when the configured operational log sink is installed and receiving events; 0 when logging is disabled (#3651). |
 | `ai_memory_log_records_delivered_total` | counter | Log records written to the configured sink without error. Present only while a log pipeline is active (#3651). |

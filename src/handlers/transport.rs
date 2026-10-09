@@ -1421,7 +1421,7 @@ pub(super) async fn sqlite_liveness(app: &AppState) -> (bool, &'static str) {
 /// sidecar that `State<Db>` always resolves to regardless of backend (which
 /// published `0` for a populated postgres corpus).
 pub async fn prometheus_metrics(State(app): State<AppState>) -> impl IntoResponse {
-    if crate::metrics::registry().memories_gauge_refreshed_at.get() == 0 {
+    if !crate::metrics::registry().memories_refreshed_at_published() {
         cold_prime_memories_gauge(&app).await;
     }
     let body = crate::metrics::render();

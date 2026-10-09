@@ -132,8 +132,15 @@ pub struct Metrics {
     pub webhook_audit_last_failure_at_seconds: IntGauge,
     pub memories_gauge: IntGauge,
     /// v1.0.0 #2583 — UNIX seconds at which `memories_gauge` was last
-    /// recomputed; `0` = never. Published in lockstep with the count by
+    /// recomputed. Published in lockstep with the count by
     /// [`crate::background::memories_gauge::publish`].
+    ///
+    /// #3683 — ABSENT until the first successful refresh: the gauge is NOT
+    /// registered at construction, only by
+    /// [`Metrics::publish_memories_refreshed_at`]. A `0` in a UNIX-time gauge
+    /// reads as 1970-01-01, so exporting one before any refresh made the
+    /// staleness alert below report ~56 years and get muted. Set it only
+    /// through that method; a direct `.set()` never reaches the scrape.
     ///
     /// This is NOT decoration. Once the corpus count is pre-computed rather
     /// than recomputed per scrape, a refresher that dies would otherwise
@@ -142,6 +149,9 @@ pub struct Metrics {
     /// stays 1. That is the #2444 "reports success while doing nothing"
     /// shape. Alert on `time() - ai_memory_memories_refreshed_at_seconds`.
     pub memories_gauge_refreshed_at: IntGauge,
+    /// #3683 — registers `memories_gauge_refreshed_at` exactly once, on the
+    /// first publish.
+    memories_refreshed_at_registration: std::sync::Once,
     pub hnsw_size_gauge: IntGauge,
     pub subscriptions_active_gauge: IntGauge,
     pub curator_cycles_total: IntCounter,
@@ -699,7 +709,40 @@ fn histogram_vec(
     }
 }
 
+/// #3683 — wire name of the corpus gauge's freshness series.
+pub const MEMORIES_REFRESHED_AT_SECONDS: &str = "ai_memory_memories_refreshed_at_seconds";
+
 impl Metrics {
+    /// #3683 — publish the corpus gauge's refresh time and, on the first
+    /// call, register the series so `/metrics` starts exporting it. Before
+    /// this has run once the family is absent from the scrape (never `0`).
+    ///
+    /// The value is set BEFORE registration, so the first scrape that sees
+    /// the series sees the real refresh time.
+    pub fn publish_memories_refreshed_at(&self, now_unix: i64) {
+        self.memories_gauge_refreshed_at.set(now_unix);
+        self.memories_refreshed_at_registration.call_once(|| {
+            if let Err(e) = self
+                .registry
+                .register(Box::new(self.memories_gauge_refreshed_at.clone()))
+            {
+                tracing::error!(
+                    target: crate::background::memories_gauge::TRACE_TARGET,
+                    error = %e,
+                    "{MEMORIES_REFRESHED_AT_SECONDS} could not be registered; the corpus \
+                     gauge's freshness is not exported"
+                );
+            }
+        });
+    }
+
+    /// #3683 — `true` once a refresh has been published (the freshness
+    /// series is then present in the scrape).
+    #[must_use]
+    pub fn memories_refreshed_at_published(&self) -> bool {
+        self.memories_refreshed_at_registration.is_completed()
+    }
+
     fn new_or_panic() -> Self {
         // Registration can only fail on duplicate-name conflict; with a
         // fresh registry that's unreachable. Panic is acceptable because
@@ -830,12 +873,17 @@ impl Metrics {
             &mut err,
         );
 
-        let memories_gauge_refreshed_at = int_gauge(
-            &registry,
-            "ai_memory_memories_refreshed_at_seconds",
-            "UNIX time at which ai_memory_memories was last recomputed (0 = never).",
-            &mut err,
-        );
+        // #3683 — constructed here, registered on the first publish
+        // (`publish_memories_refreshed_at`), so the series is absent until a
+        // refresh has actually happened.
+        let memories_gauge_refreshed_at = match IntGauge::new(
+            MEMORIES_REFRESHED_AT_SECONDS,
+            "UNIX time at which ai_memory_memories was last recomputed; absent until \
+             the first successful refresh.",
+        ) {
+            Ok(g) => g,
+            Err(e) => unreachable!("int_gauge metric {MEMORIES_REFRESHED_AT_SECONDS}: {e}"),
+        };
 
         let hnsw_size_gauge = int_gauge(
             &registry,
@@ -1554,6 +1602,7 @@ impl Metrics {
             webhook_audit_last_failure_at_seconds,
             memories_gauge,
             memories_gauge_refreshed_at,
+            memories_refreshed_at_registration: std::sync::Once::new(),
             hnsw_size_gauge,
             subscriptions_active_gauge,
             curator_cycles_total,
@@ -2404,7 +2453,7 @@ mod tests {
         registry().contradiction_detected_total.inc();
         registry().webhook_dispatched_total.inc();
         registry().memories_gauge.set(42);
-        registry().memories_gauge_refreshed_at.set(1);
+        registry().publish_memories_refreshed_at(1);
         registry().hnsw_size_gauge.set(42);
         registry().subscriptions_active_gauge.set(3);
         registry().federation_push_dlq_depth.set(0);
