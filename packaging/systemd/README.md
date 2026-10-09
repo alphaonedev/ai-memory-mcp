@@ -95,6 +95,30 @@ Do not weaken hardening directives without understanding the tradeoff —
 if an exploit lands in a crate deep in the dep tree, these are the walls
 that keep it from pivoting.
 
+## Upgrading the binary
+
+The deb / rpm / COPR packages and `install.sh` replace `/usr/bin/ai-memory`
+in place and restart nothing. The running daemon keeps executing the OLD
+binary. `ai-memory-curator.service` and `ai-memory-sync.service` open the
+live database through the migrating opener, so a companion that restarted
+before the primary (a crash, an OOM-kill, a `systemctl restart` of that unit
+alone) would run the NEW binary's migration ladder on the live database
+under the still-running OLDER daemon — the schema-ahead state the daemon
+refuses (#2445; this route is #4326). The backup job is immune: it opens the
+database through the unmigrated egress funnel and never migrates (#4207).
+
+Both companion units carry `PartOf=ai-memory.service`, so restarting the
+primary restarts them with it. After replacing the binary, restart the
+primary FIRST and nothing else:
+
+```sh
+sudo systemctl restart ai-memory.service      # PartOf= restarts curator + sync too
+systemctl status ai-memory ai-memory-curator ai-memory-sync
+```
+
+Do not restart `ai-memory-curator.service` or `ai-memory-sync.service` on
+their own while the primary still runs the previous binary.
+
 ## Troubleshooting
 
 ```sh
