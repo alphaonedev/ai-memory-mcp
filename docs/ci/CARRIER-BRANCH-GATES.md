@@ -15,8 +15,8 @@ job-level cancel, is what fires. Compile runs outside the watchdog (`cargo test
 |---|---|---|---|---|
 | `ubuntu-latest,sqlite` | 2100 s (35 min) | 95 | see #3538 | see #3538 |
 | `macos-fed,sqlite` | 2400 s (40 min) | 80 | about 27 min (#3461) | n/a |
-| `linux-fed,enterprise-fed` | 5400 s (90 min) per shard | 120 | longest shard estimate 3,913 s (serial) | not yet measured (first green sharded run) |
-| `macos-fed,enterprise-fed` | 5400 s (90 min) per shard | 120 | n/a | n/a |
+| `linux-fed,enterprise-fed` | 7800 s (130 min) per shard | 150 | longest shard estimate 3,913 s (serial) | not yet measured (first green sharded run) |
+| `macos-fed,enterprise-fed` | 7800 s (130 min) per shard | 150 | n/a | n/a |
 
 Ratio rule: job `timeout-minutes` >= watchdog minutes + 15. All four rows meet it.
 
@@ -96,19 +96,24 @@ PID separately and fails if any shard failed. Each shard's log, list file and
 the partition `manifest.json` are uploaded as the `shard-logs-<node>-<tier>`
 artifact on every outcome, including a cancel or the job cap.
 
-Estimated wall time (ideal, from the measured weights, 1,006 executables):
-serial 3,913 s (lib Postgres prefixes 84 s, doc tests 16 s, 388 class-(a)
-binaries), parallel 1,620 s and 1,515 s at `--test-threads=3`, so about 65 min
-against about 232-235 min contended before. The federation-name rule keeps 47
-binaries (about 437 s) in the serial shard on purpose.
+Estimated wall time (from the measured weights, 1,006 executables): serial
+3,913 s (lib Postgres prefixes 84 s, doc tests 16 s, 388 class-(a) binaries),
+parallel about 1,620 s and 1,812 s. The parallel figures divide each binary's
+seconds by min(its test count, 3) threads; the ideal at a flat
+`--test-threads=3` is 1,620 s and 1,515 s, and a single-test binary gets no
+speedup, so the true figure lies between the two. The federation-name rule keeps
+47 binaries (about 437 s) in the serial shard on purpose.
 
-Budget: `WATCHDOG_SECS` = 5400 s (90 min) per shard, about 1.38x the longest
-shard estimate (3,913 s); job `timeout-minutes` = 120 min on both
-`enterprise-fed` legs, which is the watchdog (90 min) plus about 30 min for
-compile and ephemeral-database setup/teardown, meeting the ratio rule. The
-estimate uses weights from a contended serial run; contention between shards
-(two jobs of three shards on one 14-core host) is not yet measured. Real wall
-time is not verified until a CI run completes: refresh the weights from its
-per-shard `::notice::` lines and re-derive the budget when a shard comes within
-20 % of it. These numbers are pinned by
+Budget: `WATCHDOG_SECS` = 7800 s (130 min) per shard and job `timeout-minutes` =
+150 min on both `enterprise-fed` legs (the watchdog plus 20 min, meeting the
+ratio rule). This is 2x the longest-shard estimate (3,913 s), set for the first
+measured run (#6344 review r2 F1; it was 5400 s / 120 min, 1.38x). The estimate
+is soft: 56 % of it is class averages (217 of the 388 serial binaries have no
+measured weight; the weights come from run 6160, which had 2 serial processes),
+and the contention between shards (two jobs of three shards on one 14-core host)
+is unmeasured. Real wall time is not verified until a CI run completes: after
+the first green sharded run, read the per-shard `::notice::` lines, refresh the
+weights, and re-derive the budget (the 20 % rule: raise it when a shard comes
+within 20 % of the watchdog; lower it toward 1.4x the measured longest shard
+once the figure is known). These numbers are pinned by
 `scripts/ci/tests/test_ci_shard_wiring_6344.py`.

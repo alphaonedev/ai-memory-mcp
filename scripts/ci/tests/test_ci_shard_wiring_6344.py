@@ -22,8 +22,8 @@ UPLOAD_PIN = 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'
 # Longest shard estimate (serial, scripts/ci/partition_test_binaries.py on the
 # 1,006-executable target list with the run-6160 contended weights).
 SHARD_ESTIMATE_SECS = 3913
-SHARD_WATCHDOG_SECS = 5400
-JOB_TIMEOUT_MIN = 120
+SHARD_WATCHDOG_SECS = 7800
+JOB_TIMEOUT_MIN = 150
 
 
 def ci_text():
@@ -61,13 +61,15 @@ def enterprise_fed_timeouts(text):
 class ShardBudgetTests(unittest.TestCase):
     """B3: watchdog and job cap re-derived for the shards."""
 
-    def test_shard_watchdog_is_5400_and_covers_the_longest_shard(self):
+    def test_shard_watchdog_is_7800_and_covers_the_longest_shard(self):
         secs, block = enterprise_fed_watchdog(ci_text())
         self.assertEqual(secs, SHARD_WATCHDOG_SECS)
-        self.assertGreaterEqual(secs, int(SHARD_ESTIMATE_SECS * 1.3))
+        self.assertGreaterEqual(secs, int(SHARD_ESTIMATE_SECS * 1.9))  # review r2 F1: budget = 2x the estimate
         self.assertIn('3,9', block, 'the derivation (longest shard ~3,900 s) must be in the comment')
+        for needle in ('56 %', '2x', 'unmeasured', 'first green'):
+            self.assertIn(needle, block, 'the F1 derivation must say: ' + needle)
 
-    def test_both_enterprise_fed_legs_cap_at_120_min_and_keep_the_ratio_rule(self):
+    def test_both_enterprise_fed_legs_cap_at_150_min_and_keep_the_ratio_rule(self):
         text = ci_text()
         secs, _ = enterprise_fed_watchdog(text)
         caps = enterprise_fed_timeouts(text)
@@ -153,13 +155,13 @@ class ShardDocsTests(unittest.TestCase):
         self.assertIn('Superseded by [Sharded enterprise-fed suite (#6344)]', doc)
         row = [l for l in doc.splitlines() if l.startswith('| `linux-fed,enterprise-fed`')]
         self.assertEqual(len(row), 1)
-        self.assertIn('5400 s (90 min)', row[0])
-        self.assertIn('| 120 |', row[0])
+        self.assertIn('7800 s (130 min)', row[0])
+        self.assertIn('| 150 |', row[0])
 
     def test_docs_and_workflow_agree_on_the_shard_budget(self):
         doc = DOC.read_text()
         shard = doc[doc.index('## Sharded enterprise-fed suite (#6344)'):]
-        for needle in ('5400 s', '120 min', '3,913 s'):
+        for needle in ('7800 s', '150 min', '3,913 s', '56 %', '2x'):
             self.assertIn(needle, shard)
 
 
