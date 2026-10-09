@@ -19,10 +19,12 @@ proof here is about the configuration the shipped binary is built with):
     ``/cargo`` (``--remap-path-prefix``), so a path that leaks into the binary
     leaks identically from both workspaces.
 
-Workspace B is a detached ``git worktree`` of workspace A's HEAD unless the
-directory already exists (then it is used as is: that is how ``--self-test``
-and a caller with its own second checkout drive it). No build cache is shared
-or restored: the point is two independent builds.
+Workspace B is a detached ``git worktree`` of workspace A's HEAD. An existing
+directory is accepted only when it is a clean checkout of exactly A's HEAD
+(#6291). No build cache is shared or restored: each build runs with an
+allowlisted environment (BUILD_ENV_ALLOWLIST), its own CARGO_TARGET_DIR and no
+compiler wrapper; a caller that sets RUSTC_WRAPPER / RUSTC_WORKSPACE_WRAPPER is
+refused. The point is two independent builds.
 
 On a mismatch the script prints both digests, both sizes, the number of
 differing bytes and the first differing offset, the ELF section table of each
@@ -55,6 +57,11 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 REMAP_SRC = "/src"
+# #6291: the only caller variables a build sees (plus the overrides build_once sets).
+BUILD_ENV_ALLOWLIST = ("PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "TMPDIR")
+# #6291: a compiler wrapper (a cache such as sccache) would let the second build reuse the first.
+WRAPPER_VARS = ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER",
+                "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
 REMAP_CARGO = "/cargo"
 CHUNK = 1 << 20
 
@@ -99,10 +106,22 @@ def rustflags_for(workspace: Path, remap: bool) -> str:
 
 
 def build_once(workspace: Path, target: str, features: str, epoch: str, cargo: str, remap: bool, bin_name: str) -> Path:
-    """One release build in ``workspace``; returns the built binary's path."""
-    env = dict(os.environ)
+    """One release build in ``workspace``; returns the built binary's path.
+
+    #6291: the build sees an allowlisted environment only, its own target
+    directory and no compiler wrapper (an empty RUSTC_WRAPPER also overrides a
+    ``build.rustc-wrapper`` from a cargo config file)."""
+    wrapped = [k for k in WRAPPER_VARS if os.environ.get(k)]
+    if wrapped:
+        raise ProofError(f"{', '.join(wrapped)} is set: a compiler wrapper can serve the second build from the first "
+                         "(unset it; the two builds must be independent)")
+    env = {k: os.environ[k] for k in BUILD_ENV_ALLOWLIST if k in os.environ}
     env["SOURCE_DATE_EPOCH"] = epoch
     env["RUSTFLAGS"] = rustflags_for(workspace, remap)
+    env["CARGO_TARGET_DIR"] = str(workspace / "target")
+    env["CARGO_INCREMENTAL"] = "0"
+    env["RUSTC_WRAPPER"] = ""
+    env["RUSTC_WORKSPACE_WRAPPER"] = ""
     cmd = [cargo, "build", "--locked", "--release", "--target", target, "--features", features]
     print(f"reproducible-build: {workspace}: SOURCE_DATE_EPOCH={epoch} RUSTFLAGS={env['RUSTFLAGS']!r}", flush=True)
     print("reproducible-build: + " + " ".join(cmd), flush=True)
@@ -119,8 +138,18 @@ def build_once(workspace: Path, target: str, features: str, epoch: str, cargo: s
 
 
 def ensure_workspace_b(workspace_a: Path, workspace_b: Path) -> None:
-    """Workspace B is a detached worktree of A's HEAD unless it already exists."""
+    """Workspace B is a fresh detached worktree of A's HEAD. #6291: an existing
+    directory is accepted only when it is a checkout of exactly A's HEAD with no
+    modified, untracked or ignored file (no earlier build output to reuse)."""
     if workspace_b.exists():
+        head_a = git(workspace_a, "rev-parse", "--verify", "HEAD")
+        head_b = git(workspace_b, "rev-parse", "--verify", "HEAD")
+        if head_a != head_b:
+            raise ProofError(f"workspace B {workspace_b} is at {head_b}, not workspace A's HEAD {head_a}")
+        dirty = git(workspace_b, "status", "--porcelain", "--ignored", "--untracked-files=all")
+        if dirty:
+            raise ProofError(f"workspace B {workspace_b} is not a clean checkout (modified, untracked or ignored files: "
+                             f"{dirty.splitlines()[0][:120]})")
         return
     workspace_b.parent.mkdir(parents=True, exist_ok=True)
     git(workspace_a, "worktree", "add", "--detach", str(workspace_b), "HEAD")
@@ -354,7 +383,8 @@ def _self_test(root: Path) -> int:
     if failures:
         return 1
     print("reproducible_build: self-test OK (identical builds pass; perturbed epoch, unremapped path, empty feature set "
-          "and missing build tool are refused)")
+          "and missing build tool are refused; a stale, dirty or prebuilt workspace B, a compiler wrapper and caller "
+          "environment leaks are refused, #6291)")
     return 0
 
 
