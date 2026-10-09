@@ -283,6 +283,54 @@ class OrphanSources6384H1(World):
         self.assertEqual(base['lib:ai_memory'], after['lib:ai_memory'])
 
 
+class EnvFingerprint6384H2(unittest.TestCase):
+    """r1 H2: runner-inherited env that changes test behaviour is part of the key."""
+
+    BASE = {'AI_MEMORY_NO_CONFIG': '1', 'AI_MEMORY_TEST_POSTGRES_URL': 'postgres://u@h/db1'}
+
+    def fp(self, **extra):
+        return tbc.env_fingerprint(dict(self.BASE, **extra))
+
+    def test_age_url_presence_and_bless_value_move_the_fingerprint(self):
+        base = self.fp()
+        self.assertNotEqual(base, self.fp(AI_MEMORY_TEST_AGE_URL='postgres://age'))
+        self.assertNotEqual(base, self.fp(AI_MEMORY_BLESS_SNAPSHOTS='1'))
+        self.assertNotEqual(self.fp(AI_MEMORY_BLESS_SNAPSHOTS='1'), self.fp(AI_MEMORY_BLESS_SNAPSHOTS='0'))
+
+    def test_every_ai_memory_and_runner_family_counts(self):
+        base = self.fp()
+        for name, val in (('AI_MEMORY_TEST_TIMING_BUDGET_MULT', '3'), ('AI_MEMORY_EMBED_OFFLINE', '1'),
+                          ('AI_MEMORY_TEST_ALLOW_DROP_EXTENSION', '1'), ('AI_MEMORY_TEST_PG_ISOLATE', '1'),
+                          ('CI', 'true'), ('RUST_TEST_THREADS', '1'), ('RUST_MIN_STACK', '8388608'),
+                          ('PROPTEST_CASES', '10'), ('CARGO_PROFILE_TEST_DEBUG', '0'),
+                          ('CARGO_BUILD_JOBS', '1'), ('RUSTFLAGS', '-C debuginfo=0')):
+            self.assertNotEqual(base, self.fp(**{name: val}), name)
+
+    def test_secret_like_names_count_by_presence_only_and_never_leak(self):
+        a = self.fp(AI_MEMORY_TEST_PG_URL='postgres://one', AI_MEMORY_API_KEY='k-sentinel-1',
+                    AI_MEMORY_DB_PASSPHRASE='pp-sentinel', AI_MEMORY_HUB_TOKEN='t1', AI_MEMORY_X_SECRET='s1',
+                    AI_MEMORY_PG_PASSWORD='pw1')
+        b = self.fp(AI_MEMORY_TEST_PG_URL='postgres://two', AI_MEMORY_API_KEY='k-sentinel-2',
+                    AI_MEMORY_DB_PASSPHRASE='other', AI_MEMORY_HUB_TOKEN='t2', AI_MEMORY_X_SECRET='s2',
+                    AI_MEMORY_PG_PASSWORD='pw2')
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, self.fp())
+        for raw in ('postgres://', 'sentinel', 'pw1', 'postgres://u@h/db1'):
+            self.assertNotIn(raw, a)
+
+    def test_empty_secret_differs_from_unset_and_from_set(self):
+        unset, empty = self.fp(), self.fp(AI_MEMORY_DB_PASSPHRASE='')
+        setv = self.fp(AI_MEMORY_DB_PASSPHRASE='x')
+        self.assertEqual(len({unset, empty, setv}), 3)
+
+    def test_plain_values_are_hashed_not_written(self):
+        fp = self.fp(AI_MEMORY_BLESS_SNAPSHOTS='bless-sentinel-value')
+        self.assertNotIn('bless-sentinel-value', fp)
+
+    def test_unrelated_runner_env_is_ignored(self):
+        self.assertEqual(self.fp(), self.fp(PATH='/x', HOME='/h', GITHUB_RUN_ID='9', RUNNER_TEMP='/r'))
+
+
 class Policy(unittest.TestCase):
     def test_allowed_matrix(self):
         on = {'CI_TEST_BINARY_CACHE': '1'}
