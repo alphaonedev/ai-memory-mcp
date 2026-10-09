@@ -315,6 +315,38 @@ def self_test():
             expect(check(root), "erratum naming an escaping symlink was accepted")
             link.unlink()
 
+        # #6141 round 5: pin the exact token, entry, erratum and allowlist semantics.
+        stale = "N30 enforcer is `%s`.\n"
+        # M7: an allowlist entry must match to end of line (no trailing garbage).
+        doc.write_text(stale % "check-old.sh" + erratum)
+        for tail in (":pinnedx", ":bogus", " trailing", "x"):
+            allow.write_text("docs/compliance/A.md:check-old.sh%s\n" % tail)
+            expect(
+                any("malformed allowlist entry" in p for p in check(root)),
+                "R5-M7: allowlist entry with trailing %r was accepted" % tail,
+            )
+        # M9/M10: both prefixes (check-, check_) and both suffixes (.sh, .py) are tokens.
+        for name in ("check-old.py", "check_old.sh", "check_old.py", "check-old.sh"):
+            allow.write_text("")
+            doc.write_text(stale % name)
+            expect(
+                any(name in p for p in check(root)),
+                "R5-M9/M10: stale `%s` without erratum was accepted" % name,
+            )
+            allow.write_text("docs/compliance/A.md:%s\n" % name)
+            doc.write_text(stale % name + "Erratum: `%s` is `scripts/check_new.py`.\n" % name)
+            expect(not check(root), "R5-M9/M10: allowlisted `%s` with erratum was rejected" % name)
+        # M11: a successor line that does not say "erratum" is not an erratum.
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+        doc.write_text(stale % "check-old.sh" + "N30 now uses `scripts/check_new.py` instead of `check-old.sh`.\n")
+        expect(check(root), "R5-M11: a successor line without the word erratum was accepted")
+        # M12: an erratum alone never clears a stale name; the allowlist entry is required.
+        allow.write_text("")
+        doc.write_text(stale % "check-old.sh" + erratum)
+        expect(check(root), "R5-M12: erratum without an allowlist entry was accepted")
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+        doc.write_text("N30 enforcer is `check-old.sh`.\n")
+
         allow.write_text("")
         doc.write_text("See `check_new.py` and `scripts/check_new.py`.\n")
         expect(not check(root), "resolving names were rejected")
