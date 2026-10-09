@@ -7170,21 +7170,44 @@ pub async fn bootstrap_serve(
     // present, so the marker is what BOUNDS the outbox: a deployment
     // nothing will drain accumulates ZERO rows, forever.
     //
-    // Stamped only when ALL THREE hold: federation is configured, the
+    // Stamped only when ALL FOUR hold: federation is configured, the
     // build carries `--features sal` (the whole push-DLQ surface is gated
-    // on it, so a default-features binary has no replay worker), and the
+    // on it, so a default-features binary has no replay worker), the
     // resolved sink is the SQLITE one — i.e. the worker drains the SAME
-    // file the MCP / CLI processes write to. A postgres-backed `serve`
-    // drains the POSTGRES table and never this sqlite file, so promising
-    // propagation there would be a lie (and MCP stdio is sqlite-only by
-    // construction anyway, CLAUDE.md #1675/n24). Every other boot CLEARS
-    // it, so turning federation off self-heals on the next start.
+    // file the MCP / CLI processes write to — and the replay worker will
+    // actually be SPAWNED below (`--catchup-interval-secs > 0`, the one
+    // condition that gates `spawn_catchup_loop`, which is the outbox's
+    // ONLY consumer). A postgres-backed `serve` drains the POSTGRES table
+    // and never this sqlite file, so promising propagation there would be
+    // a lie (and MCP stdio is sqlite-only by construction anyway,
+    // CLAUDE.md #1675/n24). Every other boot CLEARS it, so turning
+    // federation off — or the replay worker off — self-heals on the next
+    // start.
+    //
+    // #4067 — the interval was missing from this predicate: a federated
+    // sqlite `serve` with `--catchup-interval-secs=0` logged that erasures
+    // were ENABLED for fan-out, every CLI/MCP erasure queued an outbox row,
+    // and nothing ever drained it (an unbounded, never-propagating erasure
+    // queue behind a false capability claim).
     {
         #[cfg(feature = "sal")]
         let drainable_peers: Option<usize> = federation.as_ref().and_then(|fed| {
-            matches!(storage_backend, crate::handlers::StorageBackend::Sqlite)
+            (matches!(storage_backend, crate::handlers::StorageBackend::Sqlite)
+                && args.catchup_interval_secs > 0)
                 .then(|| fed.peer_count())
         });
+        #[cfg(feature = "sal")]
+        if federation.is_some()
+            && matches!(storage_backend, crate::handlers::StorageBackend::Sqlite)
+            && args.catchup_interval_secs == 0
+        {
+            tracing::warn!(
+                target: federation::erasure_outbox::ERASURE_OUTBOX_TRACE_TARGET,
+                "federation erasure outbox DISABLED: --catchup-interval-secs=0 spawns no \
+                 push-DLQ replay worker, so MCP/CLI erasures on this database do NOT \
+                 propagate to peers; set a positive interval to enable fan-out (#4067)"
+            );
+        }
         #[cfg(not(feature = "sal"))]
         let drainable_peers: Option<usize> = None;
         let guard = db_state.lock().await;
