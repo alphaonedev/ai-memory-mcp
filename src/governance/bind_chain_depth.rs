@@ -32,11 +32,14 @@
 //! such a walk would exceed the bound AND be longer than it is today, so an
 //! operator can always keep or shorten a pre-existing (pre-#4477) chain.
 //!
-//! Both backends load the same rows inside the bind's write transaction (under
-//! the sqlite writer lock / the postgres bind advisory lock) and call this one
+//! Both backends load the rows inside the bind's write transaction (under the
+//! sqlite writer lock / the postgres bind advisory lock) and call this one
 //! pure decision, so they cannot disagree and two binds cannot race past it.
-//! The read is the whole `namespace_meta` link column (bounded by the table;
-//! narrowing it to the affected subgraph is a follow-up).
+//! The sqlite read is the affected subgraph (#4718,
+//! `storage::bind_chain_depth::load_bind_link_subgraph`: the old and new
+//! upward chains plus every row whose chain reaches the bound namespace,
+//! through one recursive CTE); the postgres read is still the whole
+//! `namespace_meta` link column (its narrowing is the #4718 postgres half).
 //!
 //! The walk is conservative: it ignores ownership and the resolver's
 //! per-namespace "parent already in my own `/` hierarchy" stop, so it can only
