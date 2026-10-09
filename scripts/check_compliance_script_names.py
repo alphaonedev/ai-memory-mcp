@@ -78,6 +78,8 @@ TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_.-])(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(
 PATH_CHARS = frozenset(string.ascii_letters + string.digits + "_./-")
 SUCCESSOR_RE = re.compile(r"`scripts/([A-Za-z0-9_./-]+\.(?:sh|py))`")
 ALLOW_REL = "scripts/qc-allowlists/compliance-script-names-allow.txt"
+# A CommonMark fence line: up to three spaces, then three or more backticks or tildes (#6215).
+FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 ENTRY_RE = re.compile(
     r"^(docs/compliance/\S+\.md):(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(:pinned)?$"
 )
@@ -237,29 +239,79 @@ def compliance_docs(root):
     return sorted(docs), problems
 
 
+def backtick_run(line, i):
+    """Length of the run of backticks starting at ``line[i]``."""
+    n = i
+    while n < len(line) and line[n] == "`":
+        n += 1
+    return n - i
+
+
+def comment_open(line, pos):
+    """Index of the first ``<!--`` at or after ``pos`` that is not inside a code span, else -1.
+
+    A code span (a backtick run closed by the next run of the same length) shows ``<!--``
+    literally (#6215); an unmatched run is literal text and opens no span.
+    """
+    i = pos
+    while True:
+        start = line.find("<!--", i)
+        tick = line.find("`", i)
+        if start < 0 or tick < 0 or start < tick:
+            return start
+        n = backtick_run(line, tick)
+        j = tick + n
+        while True:
+            j = line.find("`", j)
+            if j < 0 or backtick_run(line, j) == n:
+                break
+            j += backtick_run(line, j)
+        i = tick + n if j < 0 else j + n
+
+
+def comment_text_removed(line, inside):
+    """Return (``line`` without HTML comment text, still inside a comment at the end)."""
+    shown, pos = [], 0
+    while True:
+        if inside:
+            end = line.find("-->", pos)
+            if end < 0:
+                break
+            inside, pos = False, end + len("-->")
+        else:
+            start = comment_open(line, pos)
+            if start < 0:
+                shown.append(line[pos:])
+                break
+            shown.append(line[pos:start])
+            inside, pos = True, start + len("<!--")
+    return "".join(shown), inside
+
+
 def visible_lines(lines):
-    """``lines`` with HTML comment text (``<!-- ... -->``) removed, line count kept (#6196).
+    """``lines`` reduced to the text a rendered document shows, line count kept (#6196, #6215).
 
     An erratum exists to tell a reader the text names a removed script, so only text a
-    rendered document shows can carry one. Stale names are still found in comments.
+    rendered document shows can carry one. Removed: HTML comment text (``<!-- ... -->``, also
+    across lines) and fence marker lines. Inside a fenced block or a code span ``<!--`` is
+    literal and opens nothing (#6215). Stale names are still found in all of this text.
     """
-    out, inside = [], False
+    out, inside, fence = [], False, None
     for line in lines:
-        shown, pos = [], 0
-        while True:
-            if inside:
-                end = line.find("-->", pos)
-                if end < 0:
-                    break
-                inside, pos = False, end + len("-->")
+        m = None if inside else FENCE_RE.match(line)
+        if fence is not None:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1] and not m.group(2).strip():
+                fence = None
+                out.append("")
             else:
-                start = line.find("<!--", pos)
-                if start < 0:
-                    shown.append(line[pos:])
-                    break
-                shown.append(line[pos:start])
-                inside, pos = True, start + len("<!--")
-        out.append("".join(shown))
+                out.append(line)
+            continue
+        if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+            fence = (m.group(1)[0], len(m.group(1)))
+            out.append("")
+            continue
+        shown, inside = comment_text_removed(line, inside)
+        out.append(shown)
     return out
 
 
