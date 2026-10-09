@@ -9,9 +9,9 @@ Stacked on scripts/ci/partition_test_binaries.py (#6344). Two sub-commands:
             equals the key of a prior GREEN run on the same base ref. Writes
             cache_plan.json and skip.txt next to the lists; the original lists
             are kept as ``<name>.txt.full``.
-``record``  After a FULLY green test step (exit code 0), merge the plan's keys
-            with result ``pass`` into the manifest. Skipped binaries are carried
-            forward with their original run_id / sha / recorded_at.
+``record``  After a FULLY green test step (exit code 0) of a run whose policy
+            allows recording (a push to ``release/**``, which never skips),
+            write the plan's keys with result ``pass`` into the manifest.
 
 The key (see ``build_key``) is sha256 over: the sorted (repo-relative path,
 sha256) of every file in the executable's own cargo dep-info ``<exe>.d``; the
@@ -19,22 +19,30 @@ same for the SHARED closure (dep-info of every local lib / bin / build-script
 unit, because an integration test links the lib and may run the bin, and a
 dep-info for a test target lists only that target's own sources); Cargo.lock;
 the ``rustc -Vv`` text; the feature/profile string; the behaviour-affecting
-environment; the Postgres server identity (``SELECT version()`` and the age /
-vector extension versions, or ``none`` without a test database URL); and a digest of every file in the repo a test could read at run
-time that rustc never saw (everything but build/VCS dirs and the ``.rs``
-files under src/ and tests/ that some dep-info of THIS build names; a ``.rs``
-file no dep-info names, such as a cfg-off module or an orphan, stays in). A binary whose own sources look like a tree
-scanner (read_dir, walkdir, glob, a "tests" path; integration test targets
-only, the lib and bin unit tests only read non-Rust fixtures) is keyed on the
-whole tree including those ``.rs`` files, so a source-scanning test is never skipped
+environment; the Postgres server identity (``SELECT version()`` and the
+age / vector extension versions, or ``none`` without a test database URL);
+and a digest of every file in the repo a test could read at run time that
+rustc never saw (everything but build/VCS dirs and the ``.rs`` files under
+src/ and tests/ that some dep-info of THIS build names; a ``.rs`` file no
+dep-info names, such as a cfg-off module or an orphan, stays in). A binary
+whose own sources look like a tree scanner (read_dir, walkdir, glob, a
+"tests" path; integration test targets only) is keyed on the whole tree
+including those ``.rs`` files, so a source-scanning test is never skipped
 because some OTHER file changed.
 
 Safety rules (enforced here, not only documented):
 
 1. Consulted only when CI_TEST_BINARY_CACHE=1.
-2. ``push`` to ``release/**`` is the seeding run: lookup OFF (every binary
-   runs), record ON. ``pull_request`` and ``push`` to ``chain/**``: lookup and
-   record. Any other event runs everything and records nothing.
+2. Who reads and who writes (decision of #6384 r2, review r1 M2; the
+   fail-closed direction, so it needed no vote):
+   * ``pull_request``: LOOK UP ONLY. A pull_request run
+     never writes the manifest: its test code is unmerged and runs as the
+     runner user, who can write the shared manifest directory.
+   * ``push`` to ``release/**``: the seeding run. Lookup OFF (every binary
+     runs), record ON after a fully green step.
+   * Anything else (``chain/**`` pushes included): no lookup, no record.
+   No policy both looks up and records, so a recorded ``pass`` always comes
+   from a run that executed that binary.
 3. A binary whose key cannot be computed (missing or unparsable .d, unreadable
    input) always runs. Any internal error leaves the full lists untouched.
 4. A manifest or entry older than 7 days, from a different tier or base ref, or
@@ -464,23 +472,16 @@ def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=T
 # --------------------------------------------------------------- policy -----
 
 def cache_policy(env, event, ref):
-    """(lookup, record, reason). Safety rules 1 and 2.
-
-    A push to release/** is the seeding run: lookup is OFF (every binary runs,
-    fail closed) but RECORD is ON, so a later PR into that branch can skip
-    binaries the authoritative full run already proved green.
-    """
+    """(lookup, record, reason). Safety rules 1 and 2 (see the module docstring)."""
     if env.get('CI_TEST_BINARY_CACHE') != '1':
         return False, False, 'CI_TEST_BINARY_CACHE is not 1'
     if event == 'pull_request':
-        return True, True, 'pull_request'
+        return True, False, 'pull_request: lookup only, never records'
     if event == 'push':
         if ref.startswith('refs/heads/release/') or ref.startswith('release/'):
             return False, True, 'push to release/**: full run, results recorded as the seed'
-        if ref.startswith('refs/heads/chain/') or ref.startswith('chain/'):
-            return True, True, 'push to chain/**'
-        return False, False, 'push to %s is not a chain or release branch' % (ref or '<unknown>')
-    return False, False, 'event %r is not pull_request or push' % event
+        return False, False, 'push to %s is not a release branch' % (ref or '<unknown>')
+    return False, False, 'event %r is not pull_request or push to release/**' % event
 
 
 def cache_allowed(env, event, ref):
@@ -572,14 +573,16 @@ def run_plan(args, env=None, now=None):
     env = dict(os.environ if env is None else env)
     now = time.time() if now is None else now
     sd = Path(args.shard_dir)
-    lookup, allowed, reason = cache_policy(env, args.event, args.ref)
-    plan = {'schema': SCHEMA, 'enabled': False, 'reason': reason, 'tier': args.tier,
-            'base': args.base_ref, 'node': args.node, 'keys': {}, 'skipped': {}}
-    if not allowed:
+    lookup, record, reason = cache_policy(env, args.event, args.ref)
+    plan = {'schema': SCHEMA, 'enabled': False, 'lookup': False, 'record': False, 'reason': reason,
+            'tier': args.tier, 'base': args.base_ref, 'node': args.node, 'keys': {}, 'skipped': {}}
+    if not (lookup or record):
         atomic_write(sd / 'cache_plan.json', json.dumps(plan, indent=1, sort_keys=True) + '\n')
         print('::notice::[%s] test-binary cache off (%s): running every binary' % (ISSUE, reason))
         return 0
     try:
+        if lookup and record:
+            raise CacheError('policy both looks up and records (refused)')
         build_lines = _read_lines(args.build_json)
         exes = ptb.parse_build_json(build_lines)
         rustc_vv = Path(args.rustc_vv).read_text()
@@ -616,7 +619,7 @@ def run_plan(args, env=None, now=None):
         atomic_write(src, ''.join(l + '\n' for l in new_lists[n]))
     atomic_write(sd / 'skip.txt', ''.join(sorted(n + '\n' for n in skip)))
     plan.update({
-        'enabled': True, 'reason': reason, 'prior_note': prior_note, 'run_id': args.run_id, 'sha': args.sha,
+        'enabled': True, 'lookup': lookup, 'record': record, 'reason': reason, 'prior_note': prior_note, 'run_id': args.run_id, 'sha': args.sha,
         'keys': keys, 'key_errors': why,
         'skipped': {n: {k: v for k, v in e.items()} for n, e in skip.items()},
     })
@@ -671,19 +674,22 @@ def run_record(args, now=None):
     if not plan.get('enabled'):
         print('::notice::[%s] test-binary cache not recorded: cache was off (%s)' % (ISSUE, plan.get('reason')))
         return 0
+    if plan.get('record') is not True or plan.get('lookup') is not False or plan.get('skipped'):
+        # Only a run that looked nothing up and skipped nothing may write
+        # (r1 M2): a pull_request plan has record=false.
+        print('::notice::[%s] test-binary cache not recorded: this run may not write the manifest (%s)'
+              % (ISSUE, plan.get('reason')))
+        return 0
     tier, base, node = plan['tier'], plan['base'], plan['node']
     mpath = manifest_path(args.manifest_dir, node, tier, base)
     with _Lock(str(mpath) + '.lock'):
         prior, _ = load_manifest(mpath, tier, base, now)
         entries = dict(prior)
-        recorded = carried = dropped = 0
+        recorded = dropped = 0
         for name, key in sorted(plan['keys'].items()):
             if key is None:
                 entries.pop(name, None)
                 dropped += 1
-            elif name in plan['skipped']:
-                entries[name] = plan['skipped'][name]
-                carried += 1
             else:
                 entries[name] = {'key': key, 'result': 'pass', 'run_id': args.run_id, 'sha': args.sha,
                                  'base': base, 'recorded_at': now}
@@ -691,8 +697,8 @@ def run_record(args, now=None):
         doc = {'schema': SCHEMA, 'tier': tier, 'base': base, 'node': node, 'updated_at': now,
                'updated_run_id': args.run_id, 'entries': entries}
         atomic_write(mpath, json.dumps(doc, indent=1, sort_keys=True) + '\n')
-    print('::notice::[%s] test-binary cache recorded: %d new pass, %d carried forward, %d without key (%d entries in %s)'
-          % (ISSUE, recorded, carried, dropped, len(entries), mpath.name))
+    print('::notice::[%s] test-binary cache recorded: %d pass, %d without key (%d entries in %s)'
+          % (ISSUE, recorded, dropped, len(entries), mpath.name))
     return 0
 
 

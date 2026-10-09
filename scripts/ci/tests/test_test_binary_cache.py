@@ -109,7 +109,8 @@ class World(unittest.TestCase):
         return (self.sd / (name + '.txt')).read_text()
 
     def green_run(self, run_id='100', now=NOW):
-        self.plan(now=now, run_id=run_id)
+        """A green release/** push: the only run that records (r1 M2)."""
+        self.plan(now=now, run_id=run_id, event='push', ref='refs/heads/release/v1.0.0')
         self.record(0, now=now, run_id=run_id)
         # restore the full lists for the next simulated run
         for n in tbc.SHARD_LISTS:
@@ -447,18 +448,19 @@ class PullRequestNeverRecords6384M2(World):
 
 class Policy(unittest.TestCase):
     def test_allowed_matrix(self):
-        on = {'CI_TEST_BINARY_CACHE': '1'}
+        on = {'CI_TEST_BINARY_CACHE': '1', 'CI_TEST_BINARY_CACHE_LOOKUP': '1'}
         self.assertTrue(tbc.cache_allowed(on, 'pull_request', 'refs/pull/9/merge')[0])
-        self.assertTrue(tbc.cache_allowed(on, 'push', 'refs/heads/chain/x')[0])
+        self.assertFalse(tbc.cache_allowed(on, 'push', 'refs/heads/chain/x')[0])
         self.assertFalse(tbc.cache_allowed(on, 'push', 'refs/heads/release/v1.0.0')[0])
         self.assertEqual(tbc.cache_policy(on, 'push', 'refs/heads/release/v1.0.0')[:2], (False, True))
-        self.assertEqual(tbc.cache_policy(on, 'pull_request', 'x')[:2], (True, True))
+        self.assertEqual(tbc.cache_policy(on, 'pull_request', 'x')[:2], (True, False))
         self.assertEqual(tbc.cache_policy(on, 'push', 'refs/heads/main')[:2], (False, False))
         self.assertFalse(tbc.cache_allowed(on, 'push', 'refs/heads/main')[0])
         self.assertFalse(tbc.cache_allowed(on, 'merge_group', 'refs/heads/gh-readonly-queue/x')[0])
         self.assertFalse(tbc.cache_allowed(on, 'workflow_dispatch', '')[0])
         for off in ({}, {'CI_TEST_BINARY_CACHE': '0'}, {'CI_TEST_BINARY_CACHE': 'true'}):
             self.assertFalse(tbc.cache_allowed(off, 'pull_request', 'x')[0])
+            self.assertEqual(tbc.cache_policy(off, 'push', 'refs/heads/release/v1.0.0')[:2], (False, False))
 
 
 class PlanAndRecord(World):
@@ -483,7 +485,7 @@ class PlanAndRecord(World):
         self.assertIn('skipped 3 of 3', out)
 
     def test_first_run_skips_nothing_and_records_all(self):
-        out = self.plan()
+        out = self.plan(event='push', ref='refs/heads/release/v1.0.0')
         self.assertIn('skipped 0 of 3 binaries (cache hits), running 3', out)
         self.assertEqual(self.list_text('serial'), '--lib\n--test a\n')
         self.record(0)
@@ -521,11 +523,11 @@ class PlanAndRecord(World):
             self.assertTrue(kept <= full)
         self.assertEqual(self.list_text('serial'), '--test a\n')
 
-    def test_carry_forward_keeps_original_provenance_and_age(self):
+    def test_reseed_records_fresh_provenance_because_it_ran_everything(self):
         self.green_run('100', now=NOW)
         self.green_run('200', now=NOW + 3600)
         for e in self.manifest()['entries'].values():
-            self.assertEqual((e['run_id'], e['recorded_at']), ('100', NOW))
+            self.assertEqual((e['run_id'], e['recorded_at']), ('200', NOW + 3600))
 
     def test_stale_entry_is_ignored_after_seven_days(self):
         self.green_run('100', now=NOW)
@@ -594,7 +596,7 @@ class PlanAndRecord(World):
         (self.deps / 'b-h4.d').unlink()
         self.plan(run_id='200', now=NOW + 60)
         self.assertEqual(self.list_text('parallel_2'), '--test b\n')
-        self.record(0, now=NOW + 60, run_id='200')
+        self.green_run('201', now=NOW + 60)
         self.assertNotIn('test:b', self.manifest()['entries'])
 
     def test_internal_error_runs_everything(self):
@@ -611,8 +613,7 @@ class PlanAndRecord(World):
         self.bj.write_text('\n'.join(lines) + '\n')
         self.lists()
         (self.sd / 'serial.txt').write_text('--lib\n')
-        self.plan(run_id='200', now=NOW + 60)
-        self.record(0, now=NOW + 60, run_id='200')
+        self.green_run('200', now=NOW + 60)
         self.assertIn('test:a', self.manifest()['entries'])
 
 

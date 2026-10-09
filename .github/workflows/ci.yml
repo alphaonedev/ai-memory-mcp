@@ -1185,11 +1185,14 @@ jobs:
           TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}
           TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}
           # #6384 — per-test-binary result cache (scripts/ci/test_binary_cache.py).
-          # ON only for pull_request and for push to chain/**; a push to
-          # release/** (the post-promotion run) and every other event stay a
-          # full run. The script re-checks the event and ref itself, so this
-          # expression is the second lock, not the only one.
-          CI_TEST_BINARY_CACHE: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/chain/') || startsWith(github.ref, 'refs/heads/release/')))) && '1' || '0' }}
+          # Who reads and who writes (r2 decision, review r1 M2):
+          #   pull_request      lookup only; it NEVER writes the manifest.
+          #   push release/**   lookup off (every binary runs); records the
+          #                     green results that later PRs into it look up.
+          #   anything else     no lookup, no record (chain/** included).
+          # The script re-checks the event and ref itself, so this expression is
+          # the second lock, not the only one.
+          CI_TEST_BINARY_CACHE: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))) && '1' || '0' }}
         shell: bash
         run: |
           set -euo pipefail
