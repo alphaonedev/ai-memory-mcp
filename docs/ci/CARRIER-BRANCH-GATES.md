@@ -117,7 +117,8 @@ and holds a repository-root expression (`env!("CARGO_MANIFEST_DIR")`,
 the tree at this change that is 36 of 1004 test targets (33 of the 535 tree
 scanners) and not the lib. An integration test whose own sources look like a
 tree scanner (`read_dir`, `walkdir`, `glob`, a `tests` path) is keyed on the
-whole tree, every `.rs` file included, so a source-scanning test is never
+whole tree, every `.rs` file and `docs/` included (`changelog.d/` only when
+the rule above says it can read it), so a source-scanning test is never
 skipped because some other file changed. The walk never opens a FIFO, socket
 or device, and the whole plan has a 120 s
 deadline; on expiry, or on any other failure, the full lists run.

@@ -40,8 +40,9 @@ changelog.d/ only of a binary that can read it (``source_traits``: names
 ``changelog``, spawns a tool or a repo script, or walks the repo root; r2
 M1). A binary whose own sources look like a tree scanner (read_dir, walkdir,
 glob, a "tests" path; integration test targets only) is keyed on the whole
-tree including those ``.rs`` files, so a source-scanning test is never
-skipped because some OTHER file changed. A docs-only pull request never
+tree including those ``.rs`` files and docs/ (changelog.d/ only when it can
+read it), so a source-scanning test is never skipped because some OTHER file
+changed. A docs-only pull request never
 reaches this script (``__SKIP__`` in ci.yml), and a src/ edit changes the
 shared closure, so the hits come from pull requests that touch only tests/
 and changelog.d/.
