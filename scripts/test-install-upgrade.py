@@ -59,6 +59,49 @@ class PackagingContract(unittest.TestCase):
         self.assertIn('ReadWritePaths=' + state_dir, backup.splitlines())
         self.assertNotIn('ReadOnlyPaths=' + database.split('=', 2)[2], backup.splitlines())
 
+    # #4401 — the primary unit's sandbox is the reference; every shipped
+    # companion unit carries the same hardening directives, line for line.
+    # systemd is not available where this runs (no `systemd-analyze verify`),
+    # so the parsed unit text is the evidence.
+    HARDENING_DIRECTIVES = (
+        'NoNewPrivileges', 'ProtectSystem', 'ProtectHome', 'PrivateTmp',
+        'PrivateDevices', 'ProtectKernelTunables', 'ProtectKernelModules',
+        'ProtectKernelLogs', 'ProtectControlGroups', 'ProtectHostname',
+        'ProtectClock', 'ProtectProc', 'RestrictAddressFamilies',
+        'RestrictNamespaces', 'RestrictRealtime', 'RestrictSUIDSGID',
+        'LockPersonality', 'MemoryDenyWriteExecute', 'SystemCallArchitectures',
+        'SystemCallFilter', 'CapabilityBoundingSet', 'AmbientCapabilities',
+    )
+    COMPANION_UNITS = ('backup', 'sync', 'curator')
+
+    @staticmethod
+    def _unit_lines(name):
+        return (ROOT / f'packaging/systemd/{name}.service').read_text().splitlines()
+
+    def test_companion_units_share_the_primary_hardening_set(self):
+        main = self._unit_lines('ai-memory')
+        reference = [line for line in main if line.split('=', 1)[0] in self.HARDENING_DIRECTIVES]
+        self.assertEqual(len({line.split('=', 1)[0] for line in reference}),
+                         len(self.HARDENING_DIRECTIVES),
+                         'the primary unit must set every directive this test mirrors')
+        for name in self.COMPANION_UNITS:
+            with self.subTest(unit=name):
+                lines = self._unit_lines(f'ai-memory-{name}')
+                missing = [line for line in reference if line not in lines]
+                self.assertEqual(missing, [], f'ai-memory-{name}.service lacks hardening lines')
+
+    def test_read_only_paths_mark_optional_directories(self):
+        # `ReadOnlyPaths=/etc/ai-memory` without `-` fails the unit on a host
+        # where the directory does not exist; the `-` form starts without it.
+        for name in ('ai-memory',) + tuple(f'ai-memory-{n}' for n in self.COMPANION_UNITS):
+            with self.subTest(unit=name):
+                for line in self._unit_lines(name):
+                    if not line.startswith('ReadOnlyPaths='):
+                        continue
+                    for token in line.split('=', 1)[1].split():
+                        self.assertTrue(token.startswith('-'),
+                                        f'{name}.service: ReadOnlyPaths entry {token!r} lacks the - prefix')
+
     def test_binary_only_package_documentation(self):
         payload = (ROOT / 'nfpm.yaml').read_text()
         readme = (ROOT / 'packaging/systemd/README.md').read_text()
