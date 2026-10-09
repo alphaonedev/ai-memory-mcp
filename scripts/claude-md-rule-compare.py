@@ -1877,6 +1877,18 @@ def _self_test_cases() -> int:
          "+after-putty-6163", absent="6163canaryputty")
     for visible in ("token_budget = 3500 tokens per call", "secret_scanning: enabled for every repository"):
         case(f"#6209 {visible!r} is not masked", head_line(visible), True, visible)
+    # #6210: a `|` inside a code span (a regex alternation in rule prose) is not a Markdown table row.
+    case("#6210 a regex alternation of credential words in a code span is not masked",
+         head_line("`password|secret|key|token|cred` patterns in the diff"), True,
+         "`password|secret|key|token|cred` patterns in the diff")
+    # #6210 / #6211: a prose table cell and a prose line after a bare name are descriptions, not values.
+    case("#6210 a prose table cell after a credential name is not masked",
+         head_line("\n| token_budget | The budget for one call |"), True, "| token_budget | The budget for one call |")
+    case("#6211 a prose line after a bare credential name is not masked",
+         head_line("\napi_key:\n  The key used by the CLI"), True, "+  The key used by the CLI")
+    case("#6210 a prose table cell after a password name is masked",
+         head_line("\n| password | correct horse battery |"), True, "RULE TEXT CHANGED",
+         absent="correct horse battery", needles=("credential-shaped value(s) masked",))
 
     def named_heading(root):
         target = root / "CLAUDE.md"
