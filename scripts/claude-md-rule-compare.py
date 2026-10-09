@@ -98,16 +98,21 @@ DIFF_LINE_CAP = 200
 PR_NUMBER = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
 # #6163: credential-shaped head text. The summary is a public job log; the masked value is still a rule change (the
 # verdict is computed before masking). The separator is an optional closing quote, backtick or emphasis, then `:` or
-# `=`; an unquoted value is the run of words up to a quote, a backtick or the end of the line, so `password = a b`
-# masks both words.
+# `=`; an unquoted value is the run of words (_WORD) up to a word that starts with a quote or a backtick, or the end
+# of the line, so `password = a b` masks both words.
 CREDENTIAL_NAME = (r"[\w-]*(?:passw(?:or)?d|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|"
                    r"credential)[\w-]*")
 # #6210: the name may be emphasised or code-quoted (`**password**: v`, `password:** v`, `` `token`: v ``) and the
 # value may be backtick-quoted; groups: 1 name, 2 separator, 3 "...", 4 '...', 5 `...`, 6 unquoted.
+# #6163 round 4 (security F6): a doubled quote (`""` in "...", `''` in '...', the YAML and SQL escape) is part of the
+# value, not its end. Round 4 (code F5): an unquoted value is a run of words; a word starts with no quote or backtick
+# and takes a quote or backtick that is followed by more of the word, so a quote inside a word (`password=abc"def`)
+# does not end the value and a closing quote of the surrounding text (`'name=value' text`) does.
+_WORD = r"[^\s\"'`](?:[^\s\"'`]|[\"'`](?=\S))*"
 CREDENTIAL_VALUE = re.compile(
     r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")((?:[*_]{1,2}|[\"'`])?\s*[:=]\s*(?:[*_]{1,2}\s*)?)"
-    r"(?:\"((?:[^\"\\\n]|\\.?)*)(?:\"|$)|'((?:[^'\\\n]|\\.?)*)(?:'|$)|`([^`\n]*)(?:`|$)|"
-    r"([^\s\"'`]+(?:[ \t]+[^\s\"'`]+)*))")
+    r"(?:\"((?:[^\"\\\n]|\\.?|\"\")*)(?:\"|$)|'((?:[^'\\\n]|\\.?|'')*)(?:'|$)|`([^`\n]*)(?:`|$)|"
+    r"(" + _WORD + r"(?:[ \t]+" + _WORD + r")*))")
 # #6210: a Markdown table row whose cell is a credential name (`| password | v |`); the cells after it are values.
 # A line that starts with `|` (after a diff prefix) is a table row; elsewhere a `|` inside a code span (a regex
 # alternation such as `password|secret|token` in rule prose) separates no cells.
@@ -119,20 +124,23 @@ TABLE_NAME_CELL = re.compile(r"(?i)\|\s*[*_`]{0,2}(" + CREDENTIAL_NAME + r")[*_`
 # #6163 round 2/3: a value that is a count or a switch word is configuration, not a credential (a ceiling change in rule
 # text must stay readable). A count is at most 9 digits with up to three 1-3 digit groups (review G4); a longer number
 # is masked. A password or passphrase is masked regardless.
+# #6163 round 4 (code F5): TRAIL is the punctuation a word may end with, a closing quote, backtick or emphasis
+# included, now that an unquoted word runs to whitespace (`` `max_tokens: 20000` ``).
+TRAIL = r"[.,;:)\]}\"'`*_]*"
 PLAIN_VALUE = re.compile(r"(?:\d{1,9}(?:[.,_]\d{1,3}){0,3}|true|false|yes|no|on|off|enabled|disabled|none|null)"
-                         r"[.,;:)\]}]*", re.ASCII)
+                         + TRAIL, re.ASCII)
 # #6163 round 3 (review G4): an UPPER_SNAKE value is shown only as the NAME of an environment variable: under a name
 # ending in env/var/name, or when the value itself ends in a credential word (`api_key: OPENAI_API_KEY`), and never
 # when it holds a run of 4 or more digits. Any other upper-case value (`token=AB_CD_EF12`) is masked.
-ENV_NAME_VALUE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+[.,;:)\]}]*", re.ASCII)
+ENV_NAME_VALUE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+" + TRAIL, re.ASCII)
 ENV_NAME_KEY = re.compile(r"(?i)[_-](?:env|var|name)$")
-ENV_NAME_TAIL = re.compile(r"_(?:KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIALS?)[.,;:)\]}]*$")
+ENV_NAME_TAIL = re.compile(r"_(?:KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIALS?)" + TRAIL + r"$")
 LONG_DIGITS = re.compile(r"\d{4}")
 # #6209: an unquoted multi-word value is shown only when its first word is plain and every later word is plain too or
 # a short prose word (`max_tokens: 20000 per request`); `token: on <secret>` or `secret: yes, it is <secret>`
 # masks the whole value. A prose word may start with a capital (a table cell `The budget for one call`) or be an
 # acronym of 2-5 capitals (`CLI`, `HTTP`).
-PROSE_WORD = re.compile(r"(?:[A-Za-z][a-z]{0,11}|[A-Z]{2,5})[.,;:)\]}]*", re.ASCII)
+PROSE_WORD = re.compile(r"(?:[A-Za-z][a-z]{0,11}|[A-Z]{2,5})" + TRAIL, re.ASCII)
 ALWAYS_MASK_NAME = re.compile(r"(?i)passw(?:or)?d|passphrase")
 # #6163 round 3 (review G2): the user name is optional (`redis://:<password>@host`).
 URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]*:([^@\s/]+)@")
@@ -155,8 +163,12 @@ NAME_ONLY = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\
 BLOCK_INDICATOR = re.compile(r"[|>][+-]?[1-9]?[+-]?")
 BLOCK_NAME = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\"'`])?\s*:\s*"
                         + BLOCK_INDICATOR.pattern + r"\s*$")
-# A next line that is a heading, a table row or a nested `key:` of its own is structure, not the value.
-STRUCTURE_LINE = re.compile(r"(?:#|\||[\w-]+:(?:\s|$))")
+# A next line that is a heading or a table row is structure, not the value; #6163 round 4 (code F6): a nested `key:`
+# with no value of its own is structure and passes the wait on to the line after it; a nested `key: value` is judged
+# by its value (prose_cell), so `api_key:` then `  value: <secret>` masks the secret.
+STRUCTURE_LINE = re.compile(r"[#|]")
+NESTED_NAME = re.compile(r"[\w-]+:")
+NESTED_VALUE = re.compile(r"[\w-]+:\s+(\S.*)")
 MASK = "[MASKED]"
 # #6212: Unicode categories of head text that are escaped before they reach the summary (see printable).
 UNPRINTABLE_CATEGORIES = ("Cc", "Cf", "Cs", "Zl", "Zp")
@@ -378,9 +390,10 @@ def indent_width(line: str) -> int:
 def value_line_indexes(lines: list, key_indexes=frozenset()) -> set:
     """#6211 round 4 (security F1, code F1): the indexes of `lines`, ONE side of a diff, that hold the value of a
     credential name with no value on its own line: the first non-blank line after a bare `name:` unless it is
-    structure (STRUCTURE_LINE) or a prose_cell, and every line of a YAML block scalar under
-    `name: |` / `name: >-` that is more indented than the name line (blank lines inside the block are skipped). A line
-    in `key_indexes` (a private key block, masked anyway) ends the wait. Computed per side, so a value changed under
+    structure (STRUCTURE_LINE, a nested `key:` that passes the wait on) or a prose_cell (a nested `key: value` is
+    judged by its value), and every line of a YAML block scalar under `name: |` / `name: >-` that is more indented
+    than the name line (blank lines inside the block are skipped). A line in `key_indexes` (a private key block,
+    masked anyway) ends the wait. Computed per side, so a value changed under
     an unchanged name line is found on the old side for its `-` row and on the head side for its `+` row."""
     inside, pending, block = set(), None, None
     for index, line in enumerate(lines):
@@ -397,7 +410,14 @@ def value_line_indexes(lines: list, key_indexes=frozenset()) -> set:
             block = None
         if pending is not None and content:
             name, pending = pending, None
-            if not (STRUCTURE_LINE.match(content) or prose_cell(name, content)):
+            nested = NESTED_VALUE.fullmatch(content)
+            if NESTED_NAME.fullmatch(content):
+                pending = name
+            elif nested is not None:
+                if not prose_cell(name, nested.group(1)):
+                    inside.add(index)
+                    continue
+            elif not (STRUCTURE_LINE.match(content) or prose_cell(name, content)):
                 inside.add(index)
                 continue
         if BLOCK_NAME.search(line):
