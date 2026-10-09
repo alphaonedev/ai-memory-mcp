@@ -406,33 +406,27 @@ pub async fn skill_promote_route(
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
             // #3707 / #6115 - the chain may carry a store or driver `Display`
-            // (SQL fragments, paths); the caller gets a fixed message per
-            // status, the detail goes to a tracing line for the operator.
+            // (SQL fragments, paths); the caller gets the class text below.
+            // #6131 F5 - `mcp_foreign_err` below owns the ONE operator log
+            // line for this failure (detail at error for a foreign root, warn
+            // for a typed refusal), so this arm does not log it again.
             let status = promote_error_status(&e);
-            tracing::warn!(
-                target: SKILLS_TRACE_TARGET,
-                error = %e,
-                status = status.as_u16(),
-                "skill_promote_route: refused (detail withheld from wire response, #3707)"
-            );
-            // The typed `ReflectionNotFound` root is OUR value, keyed only to
-            // the id the caller sent (#3551: hidden and missing share one
-            // envelope), so its text is safe to render; anything else is
-            // flattened.
-            (status, Json(json!({"error": promote_error_message(&e)}))).into_response()
+            // #6125 - the same classifier the MCP path of this operation
+            // uses: our own typed refusal / not-found text reaches the
+            // caller, a foreign (db / fs / codec) root becomes its class
+            // constant. `mcp_foreign_err` also owns the operator log line.
+            (status, Json(json!({"error": promote_error_message(e)}))).into_response()
         }
     }
 }
 
-/// #3707 / #6115 - fixed caller message for a failed skill-promote whose
-/// root is not our typed not-found verdict; store or driver text never
-/// crosses to the wire.
-const SKILL_PROMOTE_FAILED_MSG: &str = "skill promote failed";
-
-/// #3707 / #6115 - caller-facing message for a failed skill-promote.
-fn promote_error_message(e: &anyhow::Error) -> String {
-    e.downcast_ref::<crate::errors::ReflectionNotFound>()
-        .map_or_else(|| SKILL_PROMOTE_FAILED_MSG.to_owned(), ToString::to_string)
+/// #3707 / #6115 / #6125 - caller-facing message for a failed skill-promote,
+/// byte-identical to the text the MCP tool returns for the same chain
+/// (`crate::mcp::error_text::mcp_foreign_err`): first-party refusals keep
+/// their typed text, store / driver / io text is replaced by its class
+/// constant and never crosses to the wire.
+fn promote_error_message(e: anyhow::Error) -> String {
+    crate::mcp::error_text::mcp_foreign_err("skill_promote_route", e)
 }
 
 /// #4622 - HTTP status for a failed skill-promote: 404 only when the chain
@@ -698,9 +692,101 @@ mod promote_status_4622_tests {
     #[test]
     fn issue_6115_foreign_error_text_is_withheld_from_the_body() {
         let err = anyhow::anyhow!("no such table: skills (SQLITE_ERROR) at /var/db/x.sqlite");
-        assert_eq!(promote_error_message(&err), "skill promote failed");
+        assert_eq!(
+            promote_error_message(err),
+            crate::mcp::error_text::DB_ERROR_TEXT
+        );
         let rnf = anyhow::Error::new(ReflectionNotFound::new("abc"));
-        assert_eq!(promote_error_message(&rnf), "reflection not found: abc");
+        assert_eq!(promote_error_message(rnf), "reflection not found: abc");
+    }
+
+    /// #6126: table-driven body pins beyond the plain-string case - our own
+    /// typed refusals survive verbatim, wrapped db / io errors carrying a
+    /// path or DSN are replaced by their class constant.
+    #[test]
+    fn issue_6126_typed_refusal_survives_and_wrapped_foreign_error_is_withheld() {
+        use crate::mcp::error_text::DB_ERROR_TEXT;
+        let cases: Vec<(&str, anyhow::Error, String)> = vec![
+            (
+                "typed invalid-input refusal",
+                crate::errors::invalid_input("skill 'description' must be <= 1024 characters"),
+                "skill 'description' must be <= 1024 characters".to_owned(),
+            ),
+            (
+                "typed own-text refusal",
+                crate::errors::refusal("reflection depth 0 is below the promote minimum 1"),
+                "reflection depth 0 is below the promote minimum 1".to_owned(),
+            ),
+            (
+                "wrapped database error with DSN and path",
+                anyhow::Error::new(rusqlite::Error::InvalidPath("/var/db/x.sqlite".into()))
+                    .context("connect svc:hunter2@db.internal:5432 failed"),
+                DB_ERROR_TEXT.to_owned(),
+            ),
+            (
+                "wrapped io error with path",
+                anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "/srv/tenant/skills: EACCES",
+                ))
+                .context("write skill bundle"),
+                // The `anyhow` classifier has no io arm: a wrapped io root is the
+                // storage constant, identical to the MCP wire text.
+                DB_ERROR_TEXT.to_owned(),
+            ),
+        ];
+        for (label, err, expected) in cases {
+            let body = promote_error_message(err);
+            assert_eq!(body, expected, "{label}");
+            for leak in ["hunter2", "postgres://", "/var/db", "/srv/tenant", "EACCES"] {
+                assert!(!body.contains(leak), "{label}: {leak} leaked into {body}");
+            }
+        }
+    }
+
+    /// #6125 / #6131 F3: for every refusal shape the HTTP body text equals the
+    /// text the REAL MCP handler (`handle_skill_promote_from_reflection`) puts
+    /// on the wire for the same input, and the first-party refusals are present
+    /// in it. The last case is a foreign root (the namespace governance table is
+    /// gone): both transports must answer the storage constant and nothing from
+    /// the chain, so a `format!("{e:#}")` body goes red here.
+    #[test]
+    fn issue_6125_http_body_text_matches_mcp_wire_text() {
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
+        let (conn, _dir) = db();
+        let id = seed(&conn, "r", MemoryKind::Reflection);
+        let (broken, _broken_dir) = db();
+        let broken_id = seed(&broken, "r", MemoryKind::Reflection);
+        broken
+            .execute_batch("DROP TABLE namespace_meta;")
+            .expect("break the namespace governance table");
+        let long = "x".repeat(1025);
+        let db_text = crate::mcp::error_text::DB_ERROR_TEXT;
+        for (c, rid, name, desc, needle) in [
+            (&conn, id.as_str(), "BadName", "d", "spec \u{a7}3.1"),
+            (&conn, id.as_str(), "good-name", long.as_str(), "1024"),
+            (
+                &conn,
+                "absent-id",
+                "good-name",
+                "d",
+                "reflection not found: absent-id",
+            ),
+            (&broken, broken_id.as_str(), "good-name", "d", db_text),
+        ] {
+            let params = json!({
+                "reflection_id": rid, "skill_name": name, "skill_description": desc,
+                "agent_id": CALLER
+            });
+            let wire = crate::mcp::handle_skill_promote_from_reflection(c, &params, None)
+                .expect_err("MCP refused");
+            let http_err =
+                crate::mcp::handle_skill_promote_for_caller(c, &params, None, CALLER, Some(CALLER))
+                    .expect_err("HTTP refused");
+            let body = promote_error_message(http_err);
+            assert_eq!(body, wire, "HTTP and MCP text diverge for {name}");
+            assert!(body.contains(needle), "{needle} missing from {body}");
+        }
     }
 
     /// Pin 3: the 404 follows the type, not the Display text.

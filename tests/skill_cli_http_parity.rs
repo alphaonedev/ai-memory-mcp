@@ -348,6 +348,162 @@ async fn http_skill_promote_route_rejects_non_reflection_400() {
     );
 }
 
+/// POST a promote body for `id` as the enrolled admin and return `(status, body)`.
+async fn post_promote(router: axum::Router, id: &str, body: &Value) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/skill/{id}/promote"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", "ops:admin")
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    read_body_json(resp).await
+}
+
+/// #6125 - a first-party refusal (bad skill name) keeps its typed text in the
+/// 400 body, exactly as the MCP path of the same operation does.
+#[tokio::test]
+async fn issue_6125_http_promote_400_body_keeps_first_party_name_refusal() {
+    let (_dir, db_path) = fresh_db();
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let (status, v) = post_promote(
+        router,
+        "any-reflection",
+        &json!({"name": "BadName", "description": "d"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    let msg = v["error"].as_str().expect("error string");
+    assert!(msg.contains("spec §3.1"), "typed refusal text lost: {msg}");
+}
+
+/// #6125 - the over-long description refusal is first-party text too.
+#[tokio::test]
+async fn issue_6125_http_promote_400_body_keeps_first_party_description_refusal() {
+    let (_dir, db_path) = fresh_db();
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let (status, v) = post_promote(
+        router,
+        "any-reflection",
+        &json!({"name": "good-name", "description": "x".repeat(1025)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    let msg = v["error"].as_str().expect("error string");
+    assert!(msg.contains("1024"), "typed refusal text lost: {msg}");
+}
+
+/// #6125 - the 404 body for a missing reflection stays the typed text.
+#[tokio::test]
+async fn issue_6125_http_promote_404_body_is_unchanged() {
+    let (_dir, db_path) = fresh_db();
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let (status, v) = post_promote(
+        router,
+        "no-such-reflection",
+        &json!({"name": "good-name", "description": "d"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["error"], "reflection not found: no-such-reflection");
+}
+
+/// Seed one observation and a depth-1 reflection over it in `db_path`; returns
+/// the reflection id.
+fn seed_reflection(db_path: &std::path::Path) -> String {
+    let conn = ai_memory::db::open(db_path).unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let src = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: ai_memory::models::Tier::Mid,
+        namespace: "ns".into(),
+        title: "source".into(),
+        content: "body of source".into(),
+        tags: vec![],
+        priority: 5,
+        confidence: 1.0,
+        source: "cli".into(),
+        access_count: 0,
+        created_at: now.clone(),
+        updated_at: now,
+        last_accessed_at: None,
+        expires_at: None,
+        metadata: json!({}),
+        reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
+        ..Default::default()
+    };
+    let src_id = ai_memory::db::insert(&conn, &src).unwrap();
+    ai_memory::db::reflect(
+        &conn,
+        &ai_memory::db::ReflectInput {
+            source_ids: vec![src_id],
+            title: "reflection".into(),
+            content: "Synthesised insight: pattern X implies action Y.".into(),
+            namespace: Some("ns".into()),
+            tier: ai_memory::models::Tier::Mid,
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "cli".into(),
+            agent_id: "ops:admin".into(),
+            metadata: json!({}),
+        },
+    )
+    .unwrap()
+    .id
+}
+
+/// #6133 - the retired-lineage refusal is first-party text: after the lineage
+/// is retired, a second promote answers 400 with the refusal verbatim (the
+/// MCP wire text of the same chain), never `internal storage error`.
+#[tokio::test]
+async fn issue_6133_http_promote_400_body_keeps_retired_lineage_refusal() {
+    let (_dir, db_path) = fresh_db();
+    let reflection_id = seed_reflection(&db_path);
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let body = json!({"name": "retire-me", "description": "d"});
+    let (status, v) = post_promote(router.clone(), &reflection_id, &body).await;
+    assert_eq!(status, StatusCode::OK, "first promote: {v}");
+    ai_memory::db::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE skills SET retired_at = 1 WHERE namespace = 'ns' AND name = 'retire-me'",
+            [],
+        )
+        .unwrap();
+    let (status, v) = post_promote(router, &reflection_id, &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(
+        v["error"],
+        "skill lineage 'ns/retire-me' is retired; unretire before re-registering"
+    );
+}
+
+/// #6125 / S-F1 - a foreign (non-recognised) root at the route: the namespace
+/// governance table is gone, so the promote chain fails with a driver error.
+/// The 400 body is exactly the storage constant, with no chain text (table,
+/// SQL, path).
+#[tokio::test]
+async fn issue_6125_http_promote_400_body_for_foreign_error_is_exactly_the_storage_constant() {
+    let (_dir, db_path) = fresh_db();
+    let reflection_id = seed_reflection(&db_path);
+    ai_memory::db::open(&db_path)
+        .unwrap()
+        .execute_batch("DROP TABLE namespace_meta;")
+        .unwrap();
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let (status, v) = post_promote(
+        router,
+        &reflection_id,
+        &json!({"name": "good-name", "description": "d"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "internal storage error", "{v}");
+}
+
 // ---------------------------------------------------------------------------
 // #2024 — retire HTTP admin gate + CLI parity
 // ---------------------------------------------------------------------------
