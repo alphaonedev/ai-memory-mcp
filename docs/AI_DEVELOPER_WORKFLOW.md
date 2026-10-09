@@ -312,6 +312,10 @@ findings in the 10 areas (SQL injection, `validate_id()` coverage, command injec
 path traversal, `unwrap()`, error message leakage, race conditions, auth/authz, data in
 logs, CORS).
 
+Reviewers (and authors self-reviewing) also apply the settled-decisions rule in
+[§8.4.1](#841-decisions-table-and-review-log-settled-decisions): read the PR's
+Decisions table and Review log before writing findings.
+
 For documentation-only PRs the ten gates are still required (they should pass without
 changes), but the security checklist may be skipped if no source files changed.
 
@@ -349,6 +353,12 @@ PRs target `develop`. **Never** target `main`.
 - [ ] Manual security checklist (Engineering Standards §3.2) reviewed
 - [ ] Documentation sync (test counts, tool counts) where applicable
 
+## Decisions (settled)
+| Decision | Rationale | Where decided |
+
+## Review log
+| Round | Reviewer id | Verdict | Findings fixed (sha) |
+
 ## Linked issues
 Closes #<n>  (or "Refs #<n>")
 ```
@@ -366,6 +376,30 @@ Closes #<n>  (or "Refs #<n>")
 - Do not resolve review threads opened by reviewers — let the reviewer resolve them.
 - If a new push invalidates a prior approval (`main` is configured for stale-review
   dismissal — `develop` may not be), re-request review explicitly.
+
+### 8.4.1 Decisions table and Review log (settled decisions)
+
+Every PR description carries a **Decisions** table (Decision | Rationale | Where
+decided) and a **Review log** (one row per round: round, reviewer id, verdict,
+findings fixed with sha); both are in `.github/PULL_REQUEST_TEMPLATE.md`. They exist
+because reviewers start fresh each round: a decision that lives only in an A2A message
+does not exist for the next reviewer, and settled items get re-litigated (PR #6164
+needed seven code and seven security rounds; see
+[#6336](https://github.com/alphaonedev/ai-memory-mcp/issues/6336)). The conductor copies
+each A2A decision into the Decisions table at the moment it is made, with its message id
+(or the comment URL, or `5-agent vote (4d3ea1c5)` for a crossroads vote). The author
+appends a Review log row when a round's findings are fixed, citing the fix sha.
+
+**Settled-decisions rule for reviewers** (the repository has no in-repo reviewer agent
+definitions under `.claude/agents/`, so the rule is stated here and applies to every
+`code-reviewer` and `security-reviewer` run):
+
+- Before writing findings, read the PR's Decisions table and Review log.
+- A finding that contradicts a settled decision is reported only with a NEW fact
+  (`file:line` evidence not present in the earlier round) and is labelled
+  `RE-OPEN: <decision>`. Otherwise it is omitted.
+- The verdict lists which earlier-round findings it verified as fixed, by sha, instead
+  of restating them.
 
 ### 8.5 Merge path — single, by policy
 

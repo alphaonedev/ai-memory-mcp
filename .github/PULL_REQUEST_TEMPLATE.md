@@ -55,6 +55,28 @@ Closes #
 - [ ] Documentation sync where applicable (test counts, MCP tool counts — see Engineering Standards §2.6)
 - [ ] CLA on file for the accountable contributor
 
+## Decisions (settled — reviewers do not re-open without a new fact)
+
+<!--
+Every decision made about this PR (scope, design, accepted trade-off, routed-off
+follow-up) is one row, added by the conductor when it is made, with the A2A message id
+or comment URL. Reviewers read this table before writing findings; a finding that
+contradicts a row is reported only with a NEW fact and labelled "RE-OPEN: <decision>".
+See docs/AI_DEVELOPER_WORKFLOW.md section 8.5.
+-->
+
+| Decision | Rationale | Where decided |
+|---|---|---|
+| | | <!-- issue/comment URL, A2A message id, or "5-agent vote (4d3ea1c5)" --> |
+
+## Review log
+
+<!-- One row per review round. List earlier findings verified as fixed by sha. -->
+
+| Round | Reviewer id | Verdict | Findings fixed (sha) |
+|---|---|---|---|
+| 1 | | | |
+
 ## Notes for reviewers
 
 <!-- Anything reviewers should know: tradeoffs, follow-ups, things intentionally
