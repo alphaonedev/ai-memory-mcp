@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-test-binary result cache for the sharded enterprise-fed suite (#6384).
 
-Stacked on scripts/ci/partition_test_binaries.py (#6344). Two sub-commands:
+Stacked on scripts/ci/partition_test_binaries.py (#6344). Three sub-commands:
 
 ``plan``    After the partitioner has written serial.txt / parallel_1.txt /
             parallel_2.txt, compute a content key for every compiled test
@@ -9,6 +9,8 @@ Stacked on scripts/ci/partition_test_binaries.py (#6344). Two sub-commands:
             equals the key of a prior GREEN run on the same base ref. Writes
             cache_plan.json and skip.txt next to the lists; the original lists
             are kept as ``<name>.txt.full``.
+``restore`` Put the ``.txt.full`` lists back and disable the plan; the
+            workflow runs it when ``plan`` fails or overruns its deadline.
 ``record``  After a FULLY green test step (exit code 0) of a run whose policy
             allows recording (a push to ``release/**``, which never skips),
             write the plan's keys with result ``pass`` into the manifest.
@@ -46,7 +48,9 @@ Safety rules (enforced here, not only documented):
    * Anything else (``chain/**`` pushes included): no lookup, no record.
    No policy both looks up and records, so a recorded ``pass`` always comes
    from a run that executed that binary.
-3. A binary whose key cannot be computed (missing or unparsable .d, unreadable
+3. ``plan`` has a hard deadline (``--timeout-seconds``, 120 by default) and
+   never opens a FIFO, socket or device in the tree; on expiry nothing is
+   skipped (r1 M3). A binary whose key cannot be computed (missing or unparsable .d, unreadable
    input) always runs. Any internal error leaves the full lists untouched.
 4. A manifest or entry older than 7 days, from a different tier or base ref, or
    with a timestamp in the future is ignored.
@@ -63,6 +67,8 @@ import hashlib
 import json
 import os
 import re
+import signal
+import stat
 import subprocess
 import sys
 import time
@@ -257,10 +263,80 @@ def digest_runtime_tree(root, include_compiled_rs, compiled_labels=None):
             if (not include_compiled_rs and p.suffix == '.rs' and rel.parts[0] in COMPILED_RS_ROOTS
                     and str(rel) in compiled):
                 continue
-            if p.is_symlink() and not p.exists():
-                continue
-            out.append(('rt:' + str(rel), sha256_file(p)))
+            out.append(('rt:' + str(rel), runtime_entry_digest(p)))
     return out
+
+
+def _special_kind(mode):
+    for test, kind in ((stat.S_ISFIFO, 'fifo'), (stat.S_ISSOCK, 'socket'), (stat.S_ISCHR, 'chardev'),
+                       (stat.S_ISBLK, 'blockdev'), (stat.S_ISDIR, 'dir')):
+        if test(mode):
+            return kind
+    return 'other'
+
+
+def _hash_regular(path, follow):
+    """sha256 of a regular file, or None when the path is not one.
+
+    Opened with O_NONBLOCK (and O_NOFOLLOW unless ``follow``), then checked
+    with fstat, so a FIFO or device swapped in after the lstat is never read
+    (r1 M3).
+    """
+    flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0)
+    if not follow:
+        flags |= getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as exc:
+        raise CacheError('cannot open %s: %s' % (path, exc))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        h = hashlib.sha256()
+        with os.fdopen(fd, 'rb') as fh:
+            fd = None
+            for chunk in iter(lambda: fh.read(1 << 20), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError as exc:
+        raise CacheError('cannot read %s: %s' % (path, exc))
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def runtime_entry_digest(path):
+    """Digest string for one directory entry of the run-time tree (r1 M3).
+
+    A regular file contributes the sha256 of its content. A FIFO, socket or
+    device is never opened: it contributes ``special:<kind>``. A symlink to a
+    regular file contributes the target's content (a test reading through the
+    link sees that content); any other symlink contributes its target text.
+    """
+    try:
+        st = os.lstat(str(path))
+    except OSError as exc:
+        raise CacheError('cannot stat %s: %s' % (path, exc))
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            target = os.readlink(str(path))
+        except OSError as exc:
+            raise CacheError('cannot read link %s: %s' % (path, exc))
+        try:
+            tst = os.stat(str(path))
+        except OSError:
+            return 'link-dangling:' + sha256_bytes(target.encode())
+        if stat.S_ISREG(tst.st_mode):
+            h = _hash_regular(path, follow=True)
+            if h is not None:
+                return h
+        return 'link-special:%s:%s' % (_special_kind(tst.st_mode), sha256_bytes(target.encode()))
+    if stat.S_ISREG(st.st_mode):
+        h = _hash_regular(path, follow=False)
+        if h is not None:
+            return h
+        return 'special:changed-during-walk'
+    return 'special:' + _special_kind(st.st_mode)
 
 
 def tree_sensitive(depinfo_path, repo_root):
@@ -574,6 +650,43 @@ def atomic_write(path, text):
 
 # ------------------------------------------------------------------ plan ----
 
+PLAN_TIMEOUT_SECONDS = 120
+
+
+class PlanTimeout(CacheError):
+    """The plan overran its deadline (r1 M3): nothing is skipped."""
+
+
+class _Deadline:
+    """SIGALRM-based hard deadline for the compute phase of ``plan``.
+
+    Raises PlanTimeout inside the guarded block when it overruns. A deadline
+    that cannot be armed (not the main thread, no SIGALRM) raises CacheError
+    up front, so the cache is off rather than unbounded.
+    """
+
+    def __init__(self, seconds):
+        self.seconds = float(seconds)
+        self.prev = None
+
+    def _fire(self, _signum, _frame):
+        raise PlanTimeout('plan timed out after %gs' % self.seconds)
+
+    def __enter__(self):
+        if not self.seconds > 0:
+            raise CacheError('plan deadline must be positive, got %r' % self.seconds)
+        try:
+            self.prev = signal.signal(signal.SIGALRM, self._fire)
+            signal.setitimer(signal.ITIMER_REAL, self.seconds)
+        except (AttributeError, ValueError, OSError) as exc:
+            raise CacheError('cannot arm the plan deadline: %s' % exc)
+        return self
+
+    def __exit__(self, *exc):
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, self.prev if self.prev is not None else signal.SIG_DFL)
+        return False
+
 def run_plan(args, env=None, now=None):
     env = dict(os.environ if env is None else env)
     now = time.time() if now is None else now
@@ -588,27 +701,8 @@ def run_plan(args, env=None, now=None):
     try:
         if lookup and record:
             raise CacheError('policy both looks up and records (refused)')
-        build_lines = _read_lines(args.build_json)
-        exes = ptb.parse_build_json(build_lines)
-        rustc_vv = Path(args.rustc_vv).read_text()
-        if not rustc_vv.strip():
-            raise CacheError('rustc -Vv file is empty')
-        server_fp = pg_fingerprint(env, psql=args.psql)
-        keys, why = compute_keys(exes, build_lines, args.repo_root, rustc_vv, args.profile, env,
-                                 runtime=not args.no_runtime_tree, server_fp=server_fp)
-        mpath = manifest_path(args.manifest_dir, args.node, args.tier, args.base_ref)
-        if lookup:
-            prior, prior_note = load_manifest(mpath, args.tier, args.base_ref, now)
-            skip = decide(keys, prior)
-        else:
-            prior, prior_note, skip = {}, 'lookup off (record only)', {}
-        lib_name = next((e.key for e in exes if e.kind == 'lib'), 'lib:')
-        new_lists, removed = rewrite_lists(sd, set(skip), lib_name)
-        # Invariant: every skipped binary was removed from some list, and
-        # nothing else was.
-        gone = {selector_name(l, lib_name) for v in removed.values() for l in v}
-        if gone != set(skip):
-            raise CacheError('skip set and removed shard lines disagree')
+        with _Deadline(getattr(args, 'timeout_seconds', PLAN_TIMEOUT_SECONDS)):
+            keys, why, exes, skip, prior_note, new_lists = _plan_compute(args, env, now, sd, lookup)
     except (CacheError, ptb.PartitionError, OSError, ValueError) as exc:
         print('::warning::[%s] test-binary cache disabled for this run (%s): running every binary' % (ISSUE, exc))
         plan['reason'] = 'error: %s' % exc
@@ -617,7 +711,37 @@ def run_plan(args, env=None, now=None):
         except OSError:
             pass
         return 0
-    # Everything computed; now touch the files.
+    return _plan_apply(args, plan, sd, lookup, record, reason, keys, why, exes, skip, prior_note, new_lists)
+
+
+def _plan_compute(args, env, now, sd, lookup):
+    """Every read and hash of ``plan``; touches no file (runs under the deadline)."""
+    build_lines = _read_lines(args.build_json)
+    exes = ptb.parse_build_json(build_lines)
+    rustc_vv = Path(args.rustc_vv).read_text()
+    if not rustc_vv.strip():
+        raise CacheError('rustc -Vv file is empty')
+    server_fp = pg_fingerprint(env, psql=args.psql)
+    keys, why = compute_keys(exes, build_lines, args.repo_root, rustc_vv, args.profile, env,
+                             runtime=not args.no_runtime_tree, server_fp=server_fp)
+    mpath = manifest_path(args.manifest_dir, args.node, args.tier, args.base_ref)
+    if lookup:
+        prior, prior_note = load_manifest(mpath, args.tier, args.base_ref, now)
+        skip = decide(keys, prior)
+    else:
+        prior, prior_note, skip = {}, 'lookup off (record only)', {}
+    lib_name = next((e.key for e in exes if e.kind == 'lib'), 'lib:')
+    new_lists, removed = rewrite_lists(sd, set(skip), lib_name)
+    # Invariant: every skipped binary was removed from some list, and
+    # nothing else was.
+    gone = {selector_name(l, lib_name) for v in removed.values() for l in v}
+    if gone != set(skip):
+        raise CacheError('skip set and removed shard lines disagree')
+    return keys, why, exes, skip, prior_note, new_lists
+
+
+def _plan_apply(args, plan, sd, lookup, record, reason, keys, why, exes, skip, prior_note, new_lists):
+    """Write the plan outputs (deadline already disarmed)."""
     for n in SHARD_LISTS:
         src = sd / (n + '.txt')
         atomic_write(sd / (n + '.txt.full'), src.read_text())
@@ -642,6 +766,34 @@ def run_plan(args, env=None, now=None):
     print('::endgroup::')
     print('::notice::[%s] skipped %d of %d binaries (cache hits), running %d (%d without a computable key; prior manifest: %s)'
           % (ISSUE, n_skip, n_total, n_total - n_skip, n_nokey, prior_note))
+    return 0
+
+
+# --------------------------------------------------------------- restore ----
+
+def run_restore(args):
+    """Put every ``<list>.txt.full`` back and write a disabled plan (r1 M3).
+
+    The workflow calls this when ``plan`` exits non-zero or is killed by the
+    outer watchdog, so a half-finished plan can never leave a shortened list.
+    A list without a ``.txt.full`` was never rewritten (the full copy is
+    written before the list is replaced) and is left as it is. Raises on any
+    write failure: the workflow then fails the step instead of running a
+    list it cannot vouch for.
+    """
+    sd = Path(args.shard_dir)
+    restored = []
+    for n in SHARD_LISTS:
+        full = sd / (n + '.txt.full')
+        if full.is_file():
+            atomic_write(sd / (n + '.txt'), full.read_text())
+            restored.append(n)
+    atomic_write(sd / 'skip.txt', '')
+    plan = {'schema': SCHEMA, 'enabled': False, 'lookup': False, 'record': False, 'keys': {}, 'skipped': {},
+            'reason': 'restored after a failed or timed-out plan'}
+    atomic_write(sd / 'cache_plan.json', json.dumps(plan, indent=1, sort_keys=True) + '\n')
+    print('::warning::[%s] test-binary cache plan did not finish: full shard lists restored (%s); running every binary'
+          % (ISSUE, ', '.join(restored) or 'none were rewritten'))
     return 0
 
 
@@ -730,6 +882,10 @@ def build_parser():
     pl.add_argument('--psql', default='psql', help='psql used for the Postgres server fingerprint')
     pl.add_argument('--no-runtime-tree', action='store_true',
                     help='TESTS ONLY: skip the run-time file tree digest (never set by the workflow)')
+    pl.add_argument('--timeout-seconds', type=float, default=PLAN_TIMEOUT_SECONDS,
+                    help='hard deadline for computing the plan; on expiry nothing is skipped')
+    rs = sub.add_parser('restore', help='put the full shard lists back after a failed plan')
+    rs.add_argument('--shard-dir', required=True)
     rc = sub.add_parser('record', parents=[common])
     rc.add_argument('--rc', type=int, required=True, help='exit code of the test step; must be 0')
     return ap
@@ -739,6 +895,8 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.cmd == 'plan':
         return run_plan(args)
+    if args.cmd == 'restore':
+        return run_restore(args)
     return run_record(args)
 
 
