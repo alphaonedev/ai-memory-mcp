@@ -184,8 +184,10 @@ jobs:
         run: python -m pytest -q
       # #3840 — pyproject.toml declared ruff + mypy as dev tools and nothing
       # ran them (one unused import and 15 mypy errors sat on the tip). The
-      # declared toolchain is now the enforced one: the rule set is pinned in
-      # `[tool.ruff.lint]` so a newer ruff cannot move the gate.
+      # declared toolchain is now the enforced one: the ruff rule set is pinned
+      # in `[tool.ruff.lint]` so a newer ruff cannot move the gate. mypy floats
+      # inside `>=1.8,<3` (pyproject dev extra); the "15 errors" count was
+      # measured on the pre-fix tip and the tip is clean on mypy 2.4.0.
       - name: ruff
         working-directory: sdk/python
         run: python -m ruff check .
