@@ -23,6 +23,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -148,13 +149,25 @@ impl Session {
     }
 
     /// Wrap a spawned child: capture its stderr on a reader thread.
-    fn attach(mut child: Child) -> Self {
+    fn attach(child: Child) -> Self {
+        Self::attach_gated(child, Arc::new(AtomicBool::new(true)))
+    }
+
+    /// As [`Self::attach`], but the stderr reader thread captures nothing
+    /// until `gate` is set. A test holds the gate shut to make "the child has
+    /// exited but the reader has not yet appended its last line" a fixed state
+    /// instead of a scheduling race (#6142). The pipe buffers the child's
+    /// output meanwhile, so nothing is lost.
+    fn attach_gated(mut child: Child, gate: Arc<AtomicBool>) -> Self {
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         let stderr_buf = Arc::new(Mutex::new(String::new()));
         let mut child_stderr = child.stderr.take().expect("stderr");
         let sink = Arc::clone(&stderr_buf);
         let stderr_thread = std::thread::spawn(move || {
+            while !gate.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             let mut chunk = [0_u8; 1024];
             while let Ok(n) = child_stderr.read(&mut chunk) {
                 if n == 0 {
@@ -902,4 +915,44 @@ fn a_child_that_exits_at_start_up_fails_every_start_up_wait_fast_4347() {
             "{wait}: took {elapsed:?}; STARTUP_BOUND is {STARTUP_BOUND:?}"
         );
     }
+}
+
+/// #6142 (TEST-02) - a child that wrote the awaited line and then exited must
+/// not fail the wait just because the stderr reader thread had not yet
+/// appended that line when `try_wait` reported the exit. The reader is held
+/// shut (`attach_gated`) until the child is observed exited, so the
+/// "exited, buffer still empty" state is fixed rather than a race. The awaited
+/// line is one the refusing child DOES print; the wait must return, not panic.
+#[test]
+fn a_child_that_exits_after_writing_the_awaited_line_does_not_false_red_the_wait_6142() {
+    let home = sandbox();
+    let gate = Arc::new(AtomicBool::new(false));
+    let mut s = Session::attach_gated(
+        spawn_mcp(
+            home.path(),
+            &[(
+                "AI_MEMORY_TEST_FAIL_STOP_SIGNAL_INSTALL",
+                "SIGTERM".to_string(),
+            )],
+            &[],
+        ),
+        Arc::clone(&gate),
+    );
+    let deadline = Instant::now() + STARTUP_BOUND;
+    while s.child.try_wait().expect("try_wait").is_none() {
+        assert!(Instant::now() < deadline, "the refusing child never exited");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        s.stderr_buf.lock().is_ok_and(|b| b.is_empty()),
+        "precondition: the reader is gated, the buffer is still empty"
+    );
+    // Open the gate shortly after the wait starts, so the reader drains the
+    // pipe to EOF while the wait is already running.
+    let opener = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        gate.store(true, Ordering::Release);
+    });
+    s.wait_stderr_contains("refusing to start");
+    opener.join().expect("opener thread");
 }
