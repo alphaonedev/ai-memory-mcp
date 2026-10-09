@@ -789,6 +789,38 @@ mod promote_status_4622_tests {
         }
     }
 
+    /// #6147: the ONE operator log line for a foreign promote failure carries
+    /// the whole `anyhow` chain, so the driver root under a context wrapper
+    /// reaches the operator; the caller body stays the storage constant.
+    #[test]
+    fn issue_6147_operator_log_carries_the_inner_database_error() {
+        // #4090: tracing capture; run alone in a child (callsite-interest cache).
+        if crate::config::run_env_isolated_child_or_spawn(
+            "handlers::skills::promote_status_4622_tests::issue_6147_operator_log_carries_the_inner_database_error",
+        ) {
+            return;
+        }
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        let root = conn
+            .execute("DELETE FROM missing_table_6147", [])
+            .expect_err("missing table");
+        let err = anyhow::Error::new(root).context("skill promote register");
+        let (subscriber, sink) = crate::test_support::error_debug_capture();
+        let body = tracing::subscriber::with_default(subscriber, || promote_error_message(err));
+        let log = crate::test_support::captured_text(&sink);
+        let lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(crate::mcp::error_text::TRACE_TARGET))
+            .collect();
+        assert_eq!(lines.len(), 1, "one operator log line: {log}");
+        assert!(lines[0].contains("skill promote register"), "{log}");
+        assert!(
+            lines[0].contains("missing_table_6147"),
+            "inner cause lost: {log}"
+        );
+        assert_eq!(body, crate::mcp::error_text::DB_ERROR_TEXT);
+    }
+
     /// Pin 3: the 404 follows the type, not the Display text.
     #[test]
     fn issue_4622_reworded_display_keeps_404() {
