@@ -1423,6 +1423,8 @@ def self_test():
              stale_line + "\nText <!-- a --> b <!--\n" + erratum + "-->\n"),
             ("comment after an unmatched backtick run", stale_line + "\nText ``` <!--\n" + erratum + "-->\n"),
             ("erratum prefix inside a comment", stale_line + "\n<!--\n\nErratum (#1): x --> " + names),
+            ("erratum prefix inside a comment, erratum text after it",
+             stale_line + "\n<!--\n\nErratum (#1): x --> erratum: " + names),
             ("names only after rendering",
              stale_line + "\nErratum (#1): `check&#45;old.sh` is `scripts/check_new.py`.\n"),
         ):
@@ -1470,6 +1472,7 @@ def self_test():
             ("empty comment", "Run check-<!-->old.sh daily.\n"),
             ("processing instruction", "Run check-<?x?>old.sh daily.\n"),
             ("empty comment inside a link", "Run [check-<!-->](a)[old.sh](b) daily.\n"),
+            ("empty comment before a comment over lines", "Run <!-->check-<!--\n-->old.sh daily.\n"),
         ):
             doc.write_text(text, encoding="utf-8")
             expect(any("check-old.sh" in p for p in check(root)), "R8-#6214-%s: a split stale name was accepted" % label)
