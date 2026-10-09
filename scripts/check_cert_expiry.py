@@ -31,11 +31,17 @@ FAILS when that diff touches ANY of:
 
 UNLESS the same change also modifies
 `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` (a re-issue or voiding
-record in the same change satisfies the gate).
+record in the same change satisfies the gate), OR (#6124) the banner is EXPIRED
+or VOID at both ends and the change inserts exactly one non-discharging
+amendment record into the cert doc (see amendment_verdict).
 
 Failure message (required wording):
   federation-wire surface changed -> the enterprise-federation certification
   expires per its section 7 -> re-issue or void the cert doc in this same change.
+While the banner is already EXPIRED/VOID (#6369) the first clause is kept and
+the rest names the route that applies:
+  ... expires per its section 7 -> it is already EXPIRED: record a
+  non-discharging amendment (#6124); only the WP-B1 re-cert (#6063) re-issues it.
 
 RANGE RESOLUTION.
   pull_request     (#6137) The job checks out the pull_request MERGE commit
@@ -152,18 +158,26 @@ BINDS_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
-EXPIRY_SENTENCE = (
+EXPIRY_PREFIX = (
     "federation-wire surface changed → the enterprise-federation certification "
-    "expires per its §7 → re-issue or void the cert doc in this same change."
+    "expires per its §7"
+)
+EXPIRY_SENTENCE = EXPIRY_PREFIX + " → re-issue or void the cert doc in this same change."
+# #6369: an EXPIRED/VOID certification cannot be re-issued by an edit; the
+# headline names the route that applies (#6124) and the only way back (#6063).
+EXPIRY_AMEND_SENTENCE = (
+    EXPIRY_PREFIX + " → it is already {status}: record a non-discharging amendment "
+    "(#6124); only the WP-B1 re-cert (#6063) re-issues it."
 )
 
 
 # #6124 (5-agent vote 4d3ea1c5, T3; decision memory 05c39563): while the
-# banner is EXPIRED/VOID at both ends, exactly ONE new dated amendment below
-# STATUS that lists exactly the changed watched paths / AI_MEMORY_FED_*
-# identifiers and cites only #6063 is a recorded, non-discharging pass, and
-# every amendment already present stays byte-identical (append-only ledger).
-# Only a WP-B1 re-cert (#6063) returns the doc to LIVE.
+# banner is EXPIRED/VOID at both ends, a change that inserts into the cert
+# doc exactly ONE new dated amendment record below STATUS (and at most one
+# blank separator line, nothing else) that lists exactly the changed watched
+# paths / AI_MEMORY_FED_* identifiers and cites only #6063 is a recorded,
+# non-discharging pass (R3: #6354..#6359, #6365..#6369). Only a WP-B1
+# re-cert (#6063) returns the doc to LIVE.
 #
 # Any `**Amendment` record opens a ledger entry, whatever its shape (13 of the
 # 17 historical ones carry body text on the header line).
@@ -537,11 +551,6 @@ def parse_ledger(lines):
     return entries
 
 
-def amendment_blocks(repo, tree):
-    """The amendment ledger of the cert doc at TREE (fail-closed read)."""
-    return parse_ledger(read_cert_doc(repo, tree).split("\n"))
-
-
 def _record_problems(header, body):
     """Why the new record's HEADER and BODY lines are not in the record
     grammar, character set and citation rule ([] when they are; #6354,
@@ -692,10 +701,11 @@ def amendment_remedy(status, required):
     lines = [
         f"Remedy: the certification is {status}, so its banner may move only through the "
         f"WP-B1 re-measurement and re-issue ({RE_CERT_ISSUE}); re-binding without "
-        "re-measurement is forbidden (#3899). Record this change instead (#6124): add ONE "
-        f"new amendment below STATUS in {CERT_DOC}, as its own paragraph (a blank '>' line "
-        "before and after it), shaped exactly as below, and leave every existing amendment "
-        "byte-identical:",
+        "re-measurement is forbidden (#3899). Record this change instead (#6124): insert ONE "
+        f"new amendment record below STATUS in {CERT_DOC}, directly above an existing "
+        "amendment header (a blank '>' line between them) or as the last paragraph of its "
+        "blockquote, as its own paragraph, dated from the merge-base day to today, in plain "
+        "text shaped exactly as below, and change no other line of the doc:",
         "  > **Amendment (YYYY-MM-DD, #<issue> - section 7 record, non-discharging).**",
     ]
     lines.extend(f"  > - `{_doc_safe(r)}`" for r in sorted(required))
@@ -924,7 +934,9 @@ def _judge(repo, base, head, judged, mb, tip):
             )
             return ok, "\n".join([head_line] + more)
 
-    out = [EXPIRY_SENTENCE]
+    status_mb = banner_mb[0] if cert_touched else cert_banner(repo, mb)[0]
+    amendable = status_mb in ("EXPIRED", "VOID") and not deleted and not malformed
+    out = [EXPIRY_AMEND_SENTENCE.format(status=status_mb) if amendable else EXPIRY_SENTENCE]
     if incidental:
         out.append(
             "The cert doc WAS edited in this change, but neither its STATUS line "
@@ -935,12 +947,14 @@ def _judge(repo, base, head, judged, mb, tip):
     if amend_why:
         out.append(
             f"The certification is {banner_head[0]}; a non-discharging amendment is "
-            "accepted only as exactly ONE new record below STATUS (header alone on its "
-            "line, opening its own paragraph, outside code fences and HTML comments, a "
-            "valid ISO date not in the future) that lists exactly the changed watched "
-            "paths and AI_MEMORY_FED_* identifiers and cites only "
-            f"{RE_CERT_ISSUE} by its issue URL, with every existing amendment left "
-            f"byte-identical (#6124). Not satisfied: {amend_why}."
+            "accepted only as exactly ONE new record inserted below STATUS, with at most "
+            "one blank separator line and no other line of the doc changed (header alone "
+            "on its line, opening its own paragraph, directly above an existing amendment "
+            "header or closing its blockquote, outside code fences and HTML blocks, dated "
+            "from the merge-base commit day less one to today plus one, plain printable "
+            "text) that lists exactly the changed watched paths and AI_MEMORY_FED_* "
+            f"identifiers and cites only {RE_CERT_ISSUE} by its issue URL (#6124). "
+            f"Not satisfied: {amend_why}."
         )
     if deleted:
         out.append(
@@ -971,8 +985,7 @@ def _judge(repo, base, head, judged, mb, tip):
         out.extend("  + " + a for a in added)
         out.extend("  - " + r for r in removed)
     out.append("")
-    status_mb = banner_mb[0] if cert_touched else cert_banner(repo, mb)[0]
-    if status_mb in ("EXPIRED", "VOID") and not deleted and not malformed:
+    if amendable:
         out.extend(amendment_remedy(status_mb, set(watched) | set(added) | set(removed)))
     else:
         out.append(

@@ -349,9 +349,10 @@ certification and triggers re-cert** (see §7).
 > `check-cert-expiry.sh` so predicate (B) requires the banner itself to move
 > and predicate (C) fails a LIVE banner over watched drift. #6124 reopened it
 > only while the banner is EXPIRED or VOID, as a non-discharging record
-> (exactly ONE new amendment below STATUS listing exactly the changed watched
-> paths and `AI_MEMORY_FED_*` identifiers and citing only #6063, with every
-> earlier amendment left byte-identical); it never re-mints. **Discharged by
+> (the change inserts exactly ONE new amendment record below STATUS, plus at
+> most one blank separator line, and changes no other line of this document;
+> the record lists exactly the changed watched paths and `AI_MEMORY_FED_*`
+> identifiers and cites only #6063); it never re-mints. **Discharged by
 > full re-issue** (WP-B1, #6063), not by argument.
 >
 > §5.4(2)–(5) were **re-run at `92209ad91`**, not carried forward — the same
@@ -1516,12 +1517,18 @@ with §7-watched drift between that SHA and HEAD goes RED on every PR until
 the document is re-issued at HEAD or its STATUS is set to VOID/EXPIRED —
 the one-line remedy the failure names. While the banner is EXPIRED or VOID
 at both ends, [**#6124**](https://github.com/alphaonedev/ai-memory-mcp/issues/6124)
-also accepts exactly ONE new amendment below STATUS (its header alone on
-its line, outside code fences and HTML comments, with a valid date) that
-lists exactly the changed watched paths and identifiers and cites only
-#6063 by its issue URL, as a non-discharging record (never a re-mint);
-every earlier amendment must stay byte-identical (append-only), and the
-failure text names that record form. Its reported context is declared in
+also accepts a change that inserts exactly ONE new amendment record below
+STATUS, plus at most one blank separator line, and changes no other line of
+this document, as a non-discharging record (never a re-mint). The record's
+header stands alone on its line and opens its own paragraph; the record
+sits directly above an existing amendment header or closes its blockquote,
+outside code fences and every HTML block kind, with no lazy continuation
+line after it; it is dated from the merge-base commit day less one to today
+plus one; every line is plain printable text, a list entry or the
+`Path back to LIVE:` line; it lists exactly the changed watched paths and
+identifiers and cites only #6063, by its issue URL, with no other issue,
+commit, link or autolink anywhere in it. The failure text names that record
+form and where it may go. Its reported context is declared in
 `scripts/qc-allowlists/required-contexts-release.txt`; until the
 operator-gated branch-protection API call adds it to the live required
 set, the gate is a red check, not a merge block.)
