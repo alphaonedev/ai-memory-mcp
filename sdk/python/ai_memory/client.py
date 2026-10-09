@@ -73,8 +73,13 @@ class AiMemoryClient:
         verify: ``httpx`` ``verify`` — path to server CA bundle or bool. A
             zero-config daemon serves a certificate from the local CA it
             wrote to ``<key_dir>/tls/local-ca.pem`` on first boot; pass that
-            path to verify it (#3782). ``False`` is refused with
-            ``ValueError`` (#3840): there is no accept-any-certificate mode.
+            path to verify it (#3782). Accepted: ``None``, ``True``, a
+            non-blank CA path (``str`` / ``os.PathLike``, loaded into a
+            context the SDK builds, #6248) and an ``ssl.SSLContext`` that is
+            ``CERT_REQUIRED`` with ``check_hostname`` on (re-checked on every
+            request; a later weakening is refused, #6249). ``False`` and
+            every other value are refused with ``ValueError`` (#3840): there
+            is no accept-any-certificate mode.
         cert: ``httpx`` ``cert`` — client cert for mTLS (path or
             ``(cert, key)``).
         headers: Additional headers to send on every request.

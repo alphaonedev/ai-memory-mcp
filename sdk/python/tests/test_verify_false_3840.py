@@ -19,8 +19,8 @@ from __future__ import annotations
 import datetime
 import http.server
 import ipaddress
-import os
 import pathlib
+import socketserver
 import ssl
 import threading
 from collections.abc import Iterator
@@ -222,7 +222,14 @@ def tls_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[str, 
         def log_message(self, *args: object) -> None:
             return
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    class Server(http.server.ThreadingHTTPServer):
+        def server_bind(self) -> None:
+            # HTTPServer.server_bind resolves the FQDN, which stalls ~35s on hosts without DNS.
+            socketserver.TCPServer.server_bind(self)
+            self.server_name = "localhost"
+            self.server_port = self.server_address[1]
+
+    server = Server(("127.0.0.1", 0), Handler)
     server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     server_ctx.load_cert_chain(str(cert_path), str(key_path))
     # Handshake lazily in the per-connection handler thread, not in accept():
