@@ -130,6 +130,13 @@ permissions:
 # protected-branch CI. The chained key below restricts the coalescing
 # to head.repo==github.repository (internal-PR / maintainer paths) so
 # fork PRs cannot collide with branch keys.
+#
+# #6340: cancel-in-progress is true only for pull_request runs, so a push run
+# on release/**, main or develop is not cancelled by a later push while it is
+# in progress. A queued run is still replaced by a newer queued run (GitHub
+# semantics), and because this key coalesces push + same-branch internal PR
+# events, a pull_request run on that branch can still cancel an in-progress
+# push run. Pinned by scripts/test/test_workflow_concurrency_6340.py.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -220,6 +227,8 @@ jobs:
         with: { fetch-depth: 2 }
       - name: Test impact selector security fallbacks
         run: python3 scripts/test/test_ci_test_impact.py
+      - name: Workflow concurrency invariants (#6340)
+        run: python3 scripts/test/test_workflow_concurrency_6340.py
       - id: cls
         shell: bash
         env:
