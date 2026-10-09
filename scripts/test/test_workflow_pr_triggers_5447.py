@@ -3036,6 +3036,17 @@ class CarrierPushGeometry6117(_Scratch6117):
         self.assertEqual(1, rc, out)
         self.assertIn("behind=1", out)
 
+    def test_6117_r2_cf1_unfetchable_release_fails_even_with_a_stale_local_ref(self) -> None:
+        # The step fetches the release ref itself: a stale remote-tracking ref left on the
+        # runner must not stand in for an origin it cannot reach. Fetch failure = job failure.
+        h = self.history("ahead")
+        _g(h.work, "fetch", "--quiet", "origin",
+           "+refs/heads/release/v1.0.0:refs/remotes/origin/release/v1.0.0")
+        _g(h.work, "remote", "set-url", "origin", str(h.work / "no-such-origin.git"))
+        rc, out = h.run(self.geometry_body())
+        self.assertNotEqual(0, rc, out)
+        self.assertIn("::error::", out)
+
     def test_6117_r2_cf1_control_non_carrier_push_stays_inapplicable(self) -> None:
         h = self.history("behind")
         rc, out = h.run(self.geometry_body(), ref="refs/heads/main",
