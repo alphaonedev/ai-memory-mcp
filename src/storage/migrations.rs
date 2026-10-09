@@ -1968,6 +1968,8 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // mid-ladder `memories` table that has not grown that column
         // yet (v3). Idempotent. Recreated at the migration tail for ALL
         // starting versions, and only when `embedding` exists.
+        // #2554 — the bootstrap DDL, atomic with the ladder and the stamp.
+        conn.execute_batch(SCHEMA)?;
         crate::storage::embed_skip::drop_sqlite_clear_triggers(conn)?;
         if version < 2 {
             let mut has_confidence = false;
@@ -6708,45 +6710,30 @@ mod tests {
 
     #[test]
     fn migrate_rollback_path_on_failed_arm_propagates_error() {
-        // Force an arm to fail mid-transaction by pre-creating a
-        // conflicting table that one of the file-based migrations
-        // tries to redefine without IF NOT EXISTS. The v20
-        // (audit_log) migration's CREATE TABLE IF NOT EXISTS won't
-        // fail, but if we drop the schema_version table BEFORE
-        // migrate runs the initial probe survives (returns 0 via
-        // unwrap_or) but the final INSERT will fail because there is
-        // no table. This pins the err-arm of `result` -> ROLLBACK.
-        //
-        // We instead inject failure by stamping a pre-v1 version and
-        // dropping schema_version mid-stream. Cleaner approach: drop
-        // schema_version table before migrate so the final INSERT
-        // hits a "no such table" — the wrapped result captures it
-        // and the function ROLLBACKs the transaction.
+        // Force the terminal stamp INSERT to fail so the wrapped `result` is
+        // Err and the transaction ROLLs BACK. #2554: the bootstrap now runs
+        // inside the ladder's transaction and would recreate a DROPPED
+        // `schema_version`, so the failure is injected with an ABORT trigger
+        // the bootstrap cannot heal. Stamp 28 so the v29 arm fires first.
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch(SCHEMA).unwrap();
-        // Stamp at version=28 so the v29 arm fires.
         conn.execute("DELETE FROM schema_version", []).unwrap();
         conn.execute("INSERT INTO schema_version VALUES (28)", [])
             .unwrap();
-        // Drop a table the v29 path needs (memories itself). The
-        // v29 ALTER will then fail and the error path triggers
-        // ROLLBACK.
-        // Best alternative: drop schema_version. Then the final
-        // `DELETE FROM schema_version` errors. We must keep memories
-        // intact for v29's ALTER probe to run, so use the
-        // schema_version drop here.
-        conn.execute("DROP TABLE schema_version", []).unwrap();
-        // The initial probe also queries schema_version, so this
-        // produces an error before EXCLUSIVE begins. Without a
-        // schema_version table, `MAX(version)` query fails and
-        // unwrap_or returns 0 — migrate enters the loop, but the
-        // final INSERT to schema_version fails. The wrapped result
-        // is Err -> ROLLBACK runs. We pin that the function returns
-        // Err.
+        conn.execute_batch(
+            "CREATE TRIGGER block_stamp BEFORE INSERT ON schema_version \
+             BEGIN SELECT RAISE(ABORT, 'stamp blocked'); END;",
+        )
+        .unwrap();
         let res = super::migrate(&conn);
         assert!(
             res.is_err(),
             "migrate must propagate err when terminal INSERT fails"
+        );
+        assert_eq!(
+            current_version(&conn),
+            28,
+            "a rolled-back ladder keeps the stamp"
         );
     }
 

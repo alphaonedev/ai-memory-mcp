@@ -906,8 +906,12 @@ pub fn assert_schema_not_ahead(conn: &Connection, target: &str) -> Result<()> {
 /// difference between "permitted normally" and "permitted only by the hatch".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaPosture {
-    /// `observed <= supported` — the ordinary steady-state / upgrade case.
+    /// `observed == supported` — the ordinary steady state.
     Normal,
+    /// `observed < supported` — an upgrade. #2554: the bootstrap DDL runs
+    /// INSIDE the ladder's `BEGIN EXCLUSIVE` (in `migrate`), never before it,
+    /// so a failed ladder cannot leave newer objects behind an older stamp.
+    UpgradePending,
     /// `observed > supported`, admitted ONLY because the operator hatch names
     /// this exact version. The database must be handed back EXACTLY as found.
     AheadButAuthorised,
@@ -944,10 +948,10 @@ pub fn resolve_schema_posture(conn: &Connection, target: &str) -> Result<SchemaP
     // repair verb instead of "run a newer binary".
     super::schema_guard::assert_schema_not_poisoned(observed, BACKEND_SQLITE, target)?;
     super::schema_guard::evaluate(observed, supported, BACKEND_SQLITE, target)?;
-    Ok(if observed > supported {
-        SchemaPosture::AheadButAuthorised
-    } else {
-        SchemaPosture::Normal
+    Ok(match observed.cmp(&supported) {
+        std::cmp::Ordering::Greater => SchemaPosture::AheadButAuthorised,
+        std::cmp::Ordering::Less => SchemaPosture::UpgradePending,
+        std::cmp::Ordering::Equal => SchemaPosture::Normal,
     })
 }
 
@@ -1036,9 +1040,8 @@ pub fn open(path: &Path) -> Result<Connection> {
     // EXISTS` bootstrap set replaying over a NEWER database first, which can
     // resurrect a table or index the newer ladder deliberately removed. #2424
     // proved bootstrap-vs-ladder shape disagreement is a live class here.
-    if resolve_schema_posture(&conn, &path.display().to_string())?
-        == SchemaPosture::AheadButAuthorised
-    {
+    let posture = resolve_schema_posture(&conn, &path.display().to_string())?;
+    if posture == SchemaPosture::AheadButAuthorised {
         // The operator hatch authorised THIS database. Hand it back exactly as
         // found: no bootstrap replay, no ladder, no trigger install, and no
         // rollback-evidence check (that check APPENDS a signed evidence row,
@@ -1049,8 +1052,16 @@ pub fn open(path: &Path) -> Result<Connection> {
         // so a hatch that ran it would re-open the window the guard closes.
         return Ok(conn);
     }
-    conn.execute_batch(SCHEMA)
-        .context("failed to initialize schema")?;
+    // v1.0.0 #2554 — on an upgrade the bootstrap is NOT applied here: `migrate`
+    // runs it as the first statement inside the ladder's `BEGIN EXCLUSIVE`, so
+    // a ladder that dies (crash, ENOSPC, a refusing arm) rolls the newer
+    // bootstrap objects back with it instead of committing them behind the old
+    // stamp, where an older binary would pass the #2445 guard over them. At the
+    // tip the replay stays here (the #3172 steady-state contract below).
+    if posture == SchemaPosture::Normal {
+        conn.execute_batch(SCHEMA)
+            .context("failed to initialize schema")?;
+    }
     migrate(&conn)?;
     // v1.0.0 (#3172) — SCHEMA-masks-DATA-LOSS gate for APPEND-ONLY bootstrap
     // relations (`agent_lineage`), placed HERE in the open funnel rather than
