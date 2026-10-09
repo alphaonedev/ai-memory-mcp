@@ -695,6 +695,134 @@ def self_test():
             doc.write_text(text)
             expect(not check(root), "#6196-%s: a visible erratum was rejected" % label)
 
+        # R7 review: pins for round-6 survivors N3 N4 N5 N7 N10 N12 N13 N14 N15 N19.
+        allow.write_text("")
+        for cp in ("‍", "⁠", "﻿", "‎", "\U000e0041"):
+            doc.write_text("N30 enforcer is `check-o%sld.sh`.\n" % cp, encoding="utf-8")
+            expect(any("check-old.sh" in p for p in check(root)), "R7-N3/N4: Cf U+%04X hid a stale name" % ord(cp))
+        doc.write_text("<!-- N30 enforcer was `check-old.sh`. -->\n")
+        expect(any("check-old.sh" in p for p in check(root)), "R7-N7: a stale name inside an HTML comment was accepted")
+        doc.write_text("Runs `./scripts/fixtures/check_new.py`.\n")
+        expect(any("scripts/fixtures/check_new.py" in p for p in check(root)),
+               "R7-N12: a non-leading scripts/ path resolved by basename")
+        doc.write_text("See `precheck-old.sh`, `x.check-old.sh` and `check-old.shx`.\n")
+        expect(not check(root), "R7-N13/N14: a name embedded in a longer word was tokenised")
+        doc.write_text("N30 enforcer is `check_NEW.py`.\n")
+        expect(any("check_NEW.py" in p for p in check(root)), "R7-N5: a case variant of an existing script resolved")
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+        doc.write_text(stale_line + "<!-- a --> x <!-- " + erratum.strip() + " -->\n")
+        expect(check(root), "R7-N19: an erratum in a second comment on one line was accepted")
+        doc.write_text(stale_line + erratum)
+        allow.write_text("docs/compliance/A.md:check-old.sh​\n", encoding="utf-8")
+        expect(any("malformed allowlist entry" in p for p in check(root)),
+               "R7-N15: a Cf character in an allowlist entry was accepted")
+        r = fresh("u-allow-file")
+        denied_rc(r / ALLOW_REL, r, "R7-N10", ALLOW_REL + ": unreadable")
+
+        # #6195 (round 7): every Default_Ignorable_Code_Point is removed, not only category Cf.
+        allow.write_text("")
+        for cp in (0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D, 0x180F, 0x2065, 0x3164,
+                   0xFE00, 0xFE0F, 0xFFA0, 0xFFF0, 0xE0080, 0xE0100, 0xE01EF):
+            doc.write_text("N30 enforcer is `check-o%sld.sh`.\n" % chr(cp), encoding="utf-8")
+            expect(any("check-old.sh" in p for p in check(root)), "R7-#6195: U+%04X hid a stale name" % cp)
+
+        # #6215: '<!--' inside a fenced block or a code span is literal and hides nothing.
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+        for label, text in (
+            ("fence", stale_line + "```html\n<!-- example\n```\n" + erratum),
+            ("tilde fence", stale_line + "~~~~\n<!--\n~~~~\n" + erratum),
+            ("code span", stale_line + "Write `<!--` to open a comment.\n" + erratum),
+            ("double code span", stale_line + "Write ``a `<!--` b`` here.\n" + erratum),
+            ("code span on the erratum line", stale_line + "`<!--` " + erratum),
+        ):
+            doc.write_text(text)
+            expect(not check(root), "R7-#6215-%s: a literal '<!--' hid a visible erratum" % label)
+        doc.write_text(stale_line + "Text `code` then <!-- " + erratum.strip() + " -->\n")
+        expect(check(root), "R7-#6215-control: a comment after a closed code span was not hidden")
+
+        # #6196 (round 7): diagram fences (mermaid '%%' comments) are not reader-visible text.
+        for label, text in (
+            ("mermaid %%", stale_line + "```mermaid\ngraph TD\n%% " + erratum + "```\n"),
+            ("mermaid body", stale_line + "~~~ mermaid\n" + erratum + "~~~\n"),
+            ("math", stale_line + "```math\n" + erratum + "```\n"),
+            ("unclosed mermaid", stale_line + "```mermaid\n" + erratum),
+        ):
+            doc.write_text(text)
+            expect(check(root), "R7-#6196-%s: an erratum in a diagram fence was accepted" % label)
+        doc.write_text(stale_line + "```text\n" + erratum + "```\n")
+        expect(not check(root), "R7-#6196-control: an erratum in a plain code fence was rejected")
+        doc.write_text(stale_line + "```mermaid\ngraph TD\n```\n\n" + erratum)
+        expect(not check(root), "R7-#6196-control: an erratum after a closed mermaid fence was rejected")
+
+        # #6219: a link reference definition is never rendered, so it cannot carry an erratum.
+        for label, text in (
+            ("single line", stale_line + "\n[//]: # (" + erratum.strip() + ")\n"),
+            ("next-line title", stale_line + "\n[note]: /x\n(" + erratum.strip() + ")\n"),
+            ("continued title", stale_line + "\n[note]: /x 'Note\n" + erratum.strip() + "'\n"),
+            ("indented", stale_line + "\n   [//]: # \"" + erratum.strip() + "\"\n"),
+        ):
+            doc.write_text(text)
+            expect(check(root), "R7-#6219-%s: an erratum in a link reference definition was accepted" % label)
+        doc.write_text(stale_line + "\n[note]: /x\n\n" + erratum)
+        expect(not check(root), "R7-#6219-control: a visible erratum after a definition was rejected")
+
+        # #6214: the stale name a reader sees after Markdown/HTML rendering is checked.
+        allow.write_text("")
+        for label, text in (
+            ("backslash escape", "N30 enforcer is check\\-old.sh.\n"),
+            ("numeric entity", "N30 enforcer is check&#45;old.sh.\n"),
+            ("hex entity", "N30 enforcer is check&#x2d;old&#46;sh.\n"),
+            ("named entity", "N30 enforcer is check&hyphen;old.sh.\n"),
+            ("inline tag", "N30 enforcer is check-<span></span>old.sh.\n"),
+            ("inline comment", "N30 enforcer is check-<!-- x -->old.sh.\n"),
+            ("bold", "N30 enforcer is check-**old**.sh.\n"),
+            ("italic", "N30 enforcer is *check*-old.sh.\n"),
+            ("strikethrough", "N30 enforcer is check-~~old~~.sh.\n"),
+            ("U+2011", "N30 enforcer is check‑old.sh.\n"),
+            ("U+2010", "N30 enforcer is check‐old.sh.\n"),
+            ("U+2212", "N30 enforcer is check−old.sh.\n"),
+            ("Cyrillic", "N30 enforcer is сheck-old.sh.\n"),
+            ("Greek", "N30 enforcer is check-οld.sh.\n"),
+            ("combining mark", "N30 enforcer is chéck-old.sh.\n"),
+            ("fullwidth", "N30 enforcer is ｃheck-old.sh.\n"),
+        ):
+            doc.write_text(text, encoding="utf-8")
+            expect(any("check-old.sh" in p for p in check(root)), "R7-#6214-%s: a rendered stale name was accepted" % label)
+        doc.write_text("Runs check\\_new.py and check&#95;new.py and `check_new.py`.\n")
+        expect(not check(root), "R7-#6214-control: a rendered existing name was rejected")
+
+        # #6216: a written path outside scripts/ is checked at that path, never as a bare name.
+        (root / "infra").mkdir()
+        (root / "infra" / "check_infra.py").write_text("")
+        for cited in ("infra/check_new.py", "tools/scripts/check_new.py", "./check_new.py"):
+            doc.write_text("N30 enforcer is `%s`.\n" % cited)
+            expect(any(cited in p for p in check(root)), "R7-#6216: `%s` resolved as its bare name" % cited)
+        doc.write_text("N30 enforcer is `infra/check_infra.py` and `../../scripts/check_new.py`.\n")
+        expect(not check(root), "R7-#6216-control: an existing path outside scripts/ was rejected")
+
+        # #6217: a document symlink loop is reported as a loop.
+        r = fresh("s-loop")
+        if try_symlink(r / "docs" / "compliance" / "L1.md", r / "docs" / "compliance" / "L2.md", "#6217") and try_symlink(
+            r / "docs" / "compliance" / "L2.md", r / "docs" / "compliance" / "L1.md", "#6217"
+        ):
+            probs = check(r)
+            expect(
+                any("L1.md" in p and "loop" in p for p in probs) and not any("outside the repository" in p for p in probs),
+                "R7-#6217: a symlink loop was not reported as a loop (%r)" % (probs,),
+            )
+
+        # #6220: names match in any letter case; existence is exact-case on every host.
+        allow.write_text("")
+        for cited in ("CHECK-old.sh", "Check_Old.PY", "check_new.PY"):
+            doc.write_text("N30 enforcer is `%s`.\n" % cited)
+            expect(any(cited in p for p in check(root)), "R7-#6220: `%s` was not checked" % cited)
+        doc.write_text("Runs `scripts/SUB/check_sub.py`.\n")
+        expect(any("scripts/SUB/check_sub.py" in p for p in check(root)), "R7-#6220: a case variant of a directory resolved")
+        allow.write_text("docs/compliance/A.md:CHECK-old.sh\n")
+        doc.write_text("N30 enforcer is `CHECK-old.sh`.\nErratum: `CHECK-old.sh` is `scripts/check_new.py`.\n")
+        expect(not check(root), "R7-#6220: an allowlisted upper-case name with an erratum was rejected")
+        allow.write_text("")
+
         # #6199: a fixture setup failure exits 2 with 'SELF-TEST FAIL: fixture setup', never a traceback.
         gate_src = Path(__file__).read_text(encoding="utf-8")
 
