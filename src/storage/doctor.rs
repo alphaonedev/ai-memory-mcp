@@ -19,14 +19,18 @@ use std::collections::HashMap;
 use crate::models::GovernancePolicy;
 
 /// Check if a memory ID is a namespace standard (used by consolidate to warn).
-pub fn is_namespace_standard(conn: &Connection, id: &str) -> bool {
-    conn.query_row(
+///
+/// # Errors
+///
+/// Returns `Err` on any SQLite failure (e.g. an unreadable `namespace_meta`)
+/// — a read fault is never "not a standard" (#4977, ERRORS-19).
+pub fn is_namespace_standard(conn: &Connection, id: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM namespace_meta WHERE standard_id = ?1",
         params![id],
-        |r| r.get::<_, i64>(0),
-    )
-    .unwrap_or(0)
-        > 0
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// v0.6.3 (capabilities schema v2): count namespace standards whose

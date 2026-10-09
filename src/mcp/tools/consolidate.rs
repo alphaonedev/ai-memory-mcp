@@ -289,18 +289,10 @@ pub(super) fn handle_consolidate(
         result["auto_summary"] = json!(true);
         result["summary_preview"] = json!(summary.chars().take(200).collect::<String>());
     }
-    // Warn if any source memory was a namespace standard
-    let standard_ids: Vec<&str> = ids
-        .iter()
-        .filter(|id| db::is_namespace_standard(conn, id))
-        .map(std::string::String::as_str)
-        .collect();
-    if !standard_ids.is_empty() {
-        result["warning"] = json!(format!(
-            "consolidated memories included namespace standard(s): {}. Re-set the standard to the new memory ID: {}",
-            standard_ids.join(", "),
-            new_id
-        ));
+    // Warn if any source memory was a namespace standard — or if that
+    // check could not be completed (#4977).
+    if let Some(warning) = namespace_standard_warning(conn, &ids, &new_id) {
+        result["warning"] = json!(warning);
     }
 
     // P5 (G9): fire `memory_consolidated` webhook AFTER db::consolidate
@@ -320,6 +312,52 @@ pub(super) fn handle_consolidate(
     );
 
     Ok(result)
+}
+
+/// #4977 — the post-write namespace-standard warning for `memory_consolidate`.
+///
+/// `Some(text)` when a consolidated source WAS a namespace standard (the
+/// operator must re-bind it to `new_id`), or when the check itself could not
+/// be completed (a `namespace_meta` read fault). The second case is reported
+/// as a warning, never folded into "no standard was consumed" (fail closed to
+/// WARN, never to silence — ERRORS-19). `None` only for a completed, negative
+/// check.
+fn namespace_standard_warning(
+    conn: &rusqlite::Connection,
+    ids: &[String],
+    new_id: &str,
+) -> Option<String> {
+    let mut standard_ids: Vec<&str> = Vec::new();
+    let mut fault: Option<String> = None;
+    for id in ids {
+        match db::is_namespace_standard(conn, id) {
+            Ok(true) => standard_ids.push(id.as_str()),
+            Ok(false) => {}
+            Err(e) => {
+                fault = Some(format!("{e:#}"));
+                break;
+            }
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !standard_ids.is_empty() {
+        parts.push(format!(
+            "consolidated memories included namespace standard(s): {}. Re-set the standard to the new memory ID: {new_id}",
+            standard_ids.join(", ")
+        ));
+    }
+    if let Some(e) = fault {
+        parts.push(format!(
+            "the namespace standard check could not be completed ({e}); verify that none of the \
+             consolidated sources was a namespace standard, and re-set the standard to the new \
+             memory ID {new_id} if one was (#4977)"
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" | "))
+    }
 }
 
 // --- D1.5 (#986): per-tool McpTool impl for memory_consolidate ---
