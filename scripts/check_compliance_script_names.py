@@ -92,6 +92,7 @@ import string
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from pathlib import Path
 
@@ -1499,6 +1500,110 @@ def self_test():
                        encoding="utf-8")
         probs = check(root)
         expect(not probs, "R8-#6214-control: split or adjacent existing names were rejected (%r)" % (probs,))
+
+        # Round 9 (#6195 #6196 #6214 #6352 #6353). Line structure follows CommonMark: only CR, LF and
+        # CRLF end a line and only space and tab are blank or may follow a closing fence; structure
+        # is read before invisible characters are removed. A collapsed <details> hides an erratum.
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+        closed = "\n```\nx\n```%s\n" + line
+        for label, text in (
+            ("F1 VT after a closing fence", stale_line + closed % "\x0b"),
+            ("F1 FF after a closing fence", stale_line + closed % "\x0c"),
+            ("F1 FS after a closing mermaid fence", stale_line + "\n```mermaid\nA-->B\n```\x1c\n" + line),
+            ("F1 NBSP after a closing fence", stale_line + closed % " "),
+            ("F1 NBSP after a closing mermaid fence", stale_line + "\n```mermaid\nA-->B\n``` \n" + line),
+            ("F1 EM SPACE after a closing fence", stale_line + closed % " "),
+            ("F1 U+2028 after a closing fence", stale_line + closed % " "),
+            ("F1 NEL after a closing fence", stale_line + closed % "\x85"),
+            ("F1 zero-width space after a closing fence", stale_line + closed % "​"),
+            ("F1 soft hyphen after a closing fence", stale_line + closed % "­"),
+            ("F1 NBSP after a closing $$", stale_line + "\n$$\nx\n$$ \n" + line),
+            ("F1 NBSP line inside an HTML block", stale_line + "\n<div>\nx\n \n" + line),
+            ("F1 NBSP line inside a paragraph", stale_line + " \n" + line),
+            ("F6 collapsed <details>", stale_line + "\n<details>\n" + erratum + "\n</details>\n"),
+            ("F6 <details open>", stale_line + "\n<details open>\n" + erratum + "\n</details>\n"),
+            ("F6 '</details>' inside a comment",
+             stale_line + "\n<details>\n\n<!-- </details> -->\n" + erratum + "\n</details>\n"),
+            ("F6 '</details>' in an indented code block", stale_line + "\n<details>\n\n    </details>\n" + erratum),
+            ("F6 <details> on the erratum line",
+             stale_line + "\nErratum (#1): <details>`check-old.sh`</details> is `scripts/check_new.py`.\n"),
+            ("C4 CDATA section over lines", stale_line + "\n<![CDATA[\n" + erratum + "\n]]>\n"),
+            ("C4 declaration over lines", stale_line + "\n<!X\n" + erratum + "\n>\n"),
+            ("C4 name in a single-quoted attribute holding '>'",
+             stale_line + "\nErratum (#1): <a title='>`check-old.sh`'>x</a> is `scripts/check_new.py`.\n"),
+            ("C4 name in a double-quoted attribute holding '>'",
+             stale_line + '\nErratum (#1): <a title=">`check-old.sh`">x</a> is `scripts/check_new.py`.\n'),
+        ):
+            doc.write_bytes(text.encode("utf-8"))
+            expect(check(root), "R9-%s: a hidden or non-canonical erratum was accepted" % label)
+        for label, text in (
+            ("spaces and a tab after a closing fence", stale_line + closed % "  \t"),
+            ("CRLF line endings", (stale_line + erratum).replace("\n", "\r\n")),
+            ("CR line endings", (stale_line + erratum).replace("\n", "\r")),
+            ("byte order mark before a first-line erratum", "﻿" + line + stale_line),
+            ("after a closed <details>", stale_line + "\n<details>\n\nx\n\n</details>\n" + erratum),
+            ("invisible character inside the erratum's stale name",
+             stale_line + "\nErratum (#1): `check-o​ld.sh` is `scripts/check_new.py`.\n"),
+        ):
+            doc.write_bytes(text.encode("utf-8"))
+            probs = check(root)
+            expect(not probs, "R9-control %s: a canonical erratum was rejected (%r)" % (label, probs))
+        allow.write_text("")
+        for label, text in (
+            ("F2 '>' in a double-quoted attribute", 'Run check-<span title="a>b">old.sh daily.\n'),
+            ("F2 '<' in a double-quoted attribute", 'Run check-<span title="<">old.sh daily.\n'),
+            ("F2 '>' in a single-quoted attribute over lines", "Run check-<span title='a\n>b'>old.sh daily.\n"),
+            ("F3 nested parentheses in a destination", "Run [check-](a(b)c)old.sh daily.\n"),
+            ("F3 parentheses in a quoted title", 'Run [check-](a "(t)")old.sh daily.\n'),
+            ("F3 parenthesised title", "Run [check-](a (t))old.sh daily.\n"),
+            ("F3 angle-bracket destination", "Run [check-](<a(b>)old.sh daily.\n"),
+            ("F3 escaped parenthesis in a destination", "Run [check-](a\\)b)old.sh daily.\n"),
+            ("C4 entity and code span", "Run &#99;heck-`old.sh`.\n"),
+        ):
+            doc.write_bytes(text.encode("utf-8"))
+            expect(any("check-old.sh" in p for p in check(root)), "R9-%s: a split stale name was accepted" % label)
+        for label, text in (
+            ("F4 U+4E00 for '-'", "Run `check一old.sh`.\n"),
+            ("F4 U+3161 for '-'", "Run `checkㅡold.sh`.\n"),
+            ("F4 U+A4F8 for '.'", "Run `check-oldꓸsh`.\n"),
+            ("F4 U+02CD for '_'", "Run `checkˍnew.py`.\n"),
+            ("F4 U+1427 for '.'", "Run `check_newᐧpy`.\n"),
+            ("F4 entity U+4E00 for '-'", "Run check&#x4E00;old.sh daily.\n"),
+            ("C1 fullwidth c U+FF43", "Run `ｃheck_new.py`.\n"),
+            ("C1 mathematical bold c U+1D41C", "Run `\U0001d41check_new.py`.\n"),
+            ("C1 Kelvin sign U+212A", "Run `checK_new.py`.\n"),
+        ):
+            doc.write_bytes(text.encode("utf-8"))
+            expect(any("look-alike script name" in p for p in check(root)),
+                   "R9-%s: a look-alike script name was accepted" % label)
+        for label, text in (
+            ("F5 RLO reversing a name", "Run `check-‮hs.dlo‬` daily.\n"),
+            ("F5 isolate on a line without a name", "Text ⁧x⁩.\n"),
+            ("F5 right-to-left mark", "Run check-old‏.sh.\n"),
+            ("F5 Arabic letter mark", "Text ؜x.\n"),
+        ):
+            doc.write_bytes(text.encode("utf-8"))
+            expect(any(":1: bidirectional control character" in p for p in check(root)),
+                   "R9-%s: a bidirectional control character was accepted" % label)
+        # #6352: the skeleton scan is linear in the document length, whatever is left unclosed.
+        for label, text in (
+            ("unclosed '<!--'", "<!-- x\n" * 24000),
+            ("unclosed quoted attributes", "<a \"<b '\n" * 24000),
+            ("unclosed link destinations", "[x](\"a\"<b>'c'(" * 24000),
+            ("unclosed link titles", "[x](a \"(" * 24000),
+            ("quoted strings in one unclosed destination", "[x](" + "\"a\"'b'<c>" * 4000),
+        ):
+            started = time.monotonic()
+            skeleton(text.split("\n"))
+            took = time.monotonic() - started
+            expect(took < 3.0, "R9-#6352 %s: the skeleton scan took %.1fs" % (label, took))
+        # #6353: an allowlist that exists but cannot be stat'ed is unreadable (exit 2), never absent.
+        r = fresh("u-allow-loop")
+        (r / ALLOW_REL).unlink()
+        if try_symlink(r / ALLOW_REL, r / ALLOW_REL, "#6353-loop"):
+            rc, err = run_main(r)
+            expect(rc == 2 and ALLOW_REL + ": unreadable" in err,
+                   "#6353-loop: allowlist symlink loop: expected exit 2, got %r (stderr=%r)" % (rc, err))
 
         # #6199: a fixture setup failure exits 2 with 'SELF-TEST FAIL: fixture setup', never a traceback.
         gate_src = Path(__file__).read_text(encoding="utf-8")
