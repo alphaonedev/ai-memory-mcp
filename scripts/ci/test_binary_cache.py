@@ -32,7 +32,10 @@ because some OTHER file changed.
 
 Safety rules (enforced here, not only documented):
 
-1. Consulted only when CI_TEST_BINARY_CACHE=1.
+1. Consulted only when CI_TEST_BINARY_CACHE=1. Lookup additionally needs
+   CI_TEST_BINARY_CACHE_LOOKUP=1 (r1 M5), which ci.yml sets for pull_request
+   only, and this script grants on pull_request only: two independent locks,
+   so a push to ``release/**`` can never skip a binary.
 2. Who reads and who writes (decision of #6384 r2, review r1 M2; the
    fail-closed direction, so it needed no vote):
    * ``pull_request``: LOOK UP ONLY. A pull_request run
@@ -476,6 +479,8 @@ def cache_policy(env, event, ref):
     if env.get('CI_TEST_BINARY_CACHE') != '1':
         return False, False, 'CI_TEST_BINARY_CACHE is not 1'
     if event == 'pull_request':
+        if env.get('CI_TEST_BINARY_CACHE_LOOKUP') != '1':
+            return False, False, 'pull_request but CI_TEST_BINARY_CACHE_LOOKUP is not 1'
         return True, False, 'pull_request: lookup only, never records'
     if event == 'push':
         if ref.startswith('refs/heads/release/') or ref.startswith('release/'):

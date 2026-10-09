@@ -1190,9 +1190,12 @@ jobs:
           #   push release/**   lookup off (every binary runs); records the
           #                     green results that later PRs into it look up.
           #   anything else     no lookup, no record (chain/** included).
-          # The script re-checks the event and ref itself, so this expression is
-          # the second lock, not the only one.
+          # Lookup has its own flag (review r1 M5): CI_TEST_BINARY_CACHE_LOOKUP is
+          # '1' for pull_request only, so it is '0' on every release/** push, and
+          # the script also grants lookup on pull_request only (two locks). The
+          # script re-checks the event and ref for both flags itself.
           CI_TEST_BINARY_CACHE: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))) && '1' || '0' }}
+          CI_TEST_BINARY_CACHE_LOOKUP: ${{ github.event_name == 'pull_request' && '1' || '0' }}
         shell: bash
         run: |
           set -euo pipefail

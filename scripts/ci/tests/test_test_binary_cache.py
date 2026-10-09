@@ -22,7 +22,7 @@ import test_binary_cache as tbc  # noqa: E402
 REPO = HERE.parents[2]
 SCRATCH = REPO / '.local-runs' / 'cache-unittests'
 NOW = 1_800_000_000.0
-ENV_ON = {'CI_TEST_BINARY_CACHE': '1', 'AI_MEMORY_NO_CONFIG': '1'}
+ENV_ON = {'CI_TEST_BINARY_CACHE': '1', 'CI_TEST_BINARY_CACHE_LOOKUP': '1', 'AI_MEMORY_NO_CONFIG': '1'}
 
 
 def art(kind, name, exe, test, pid='path+file:///repo#ai-memory@1.0.0', filenames=None):
@@ -170,7 +170,7 @@ class KeyStability(World):
         base, _ = self.keys()
         for label, kw in (('rustc', {'rustc': 'rustc 1.99\n'}), ('profile', {'profile': 'test'}),
                           ('env', {'env': dict(ENV_ON, RUSTFLAGS='-C debuginfo=0')}),
-                          ('nocfg', {'env': {'CI_TEST_BINARY_CACHE': '1'}})):
+                          ('nocfg', {'env': {'CI_TEST_BINARY_CACHE': '1', 'CI_TEST_BINARY_CACHE_LOOKUP': '1'}})):
             other, _ = self.keys(**kw)
             for n in base:
                 self.assertNotEqual(base[n], other[n], '%s/%s' % (label, n))
