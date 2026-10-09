@@ -231,10 +231,16 @@ SBOM_CMD = 'cargo cyclonedx --format json --features "$FEATURES"'
 ASSERT_RECORD = ('asserted_sha256="$(shasum -a 256 "$bin" | cut -d\' \' -f1)"',
                  'echo "sha256=$asserted_sha256" >> "$GITHUB_OUTPUT"')
 ASSERT_ID = "assert"
-PACKAGE_ENV: Dict[str, "Spec"] = {"ASSERTED_SHA256": "${{ steps.assert.outputs.sha256 }}"}
+PACKAGE_ENV: Dict[str, "Spec"] = {"ASSERTED_SHA256": "${{ steps.assert.outputs.sha256 }}",
+                                  "REPRO_SHA256": "${{ needs.reproducible.outputs.sha256 }}"}
 PACKAGE_DIST = 'dist/${{ matrix.artifact }}'
 PACKAGE_CHECK = ('test "$packaged_sha256" = "$ASSERTED_SHA256" || { echo "::error::' + PACKAGE_DIST
                  + ' ($packaged_sha256) is not the binary the strict assert checked ($ASSERTED_SHA256)"; exit 1; }')
+# #6274: the x86_64 Linux leg ships only the bytes the reproducible job built
+# twice (its `sha256` output); the other legs are not covered by the proof yet.
+REPRO_CHECK = ('case "${{ matrix.target }}" in x86_64-unknown-linux-gnu) test -n "$REPRO_SHA256"; '
+               'test "$REPRO_SHA256" = "$ASSERTED_SHA256" || { echo "::error::the shipped x86_64-unknown-linux-gnu '
+               'binary ($ASSERTED_SHA256) is not the one the reproducible job built twice ($REPRO_SHA256)"; exit 1; } ;; esac')
 
 # #3613: the release build's deterministic inputs. The SBOM step already pinned
 # the epoch; the build step exports the same one plus path remapping, and the
@@ -255,6 +261,7 @@ WF_PACKAGE = (
     'packaged_sha256="$(shasum -a 256 "' + PACKAGE_DIST + '" | cut -d\' \' -f1)"',
     'test -n "$ASSERTED_SHA256"',
     PACKAGE_CHECK,
+    REPRO_CHECK,
     "cd dist",
     'tar czf "ai-memory-${{ matrix.target }}.tar.gz" "${{ matrix.artifact }}"',
 )
@@ -370,7 +377,6 @@ RELEASE_STEPS: List[Spec] = [
     {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
     {"name": "Install Rust 1.98.0 + target std", "uses": RUST_TOOLCHAIN_USES,
      "with": {"toolchain": "1.98.0", "targets": "${{ matrix.target }}"}},
-    {"uses": RUST_CACHE_USES},
     Unit("build"),
     Unit("assert"),
     Unit("package"),
@@ -454,11 +460,11 @@ RELEASE_STEPS: List[Spec] = [
               "prerelease": "${{ needs.preflight.outputs.is_prerelease == 'true' }}"},
      "env": {"GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"}},
 ]
-RELEASE_STEP_ROLES = ("checkout", "toolchain", "rust-cache", "build", "strict assert", "package", "deb/rpm", "checksum sweep",
+RELEASE_STEP_ROLES = ("checkout", "toolchain", "build", "strict assert", "package", "deb/rpm", "checksum sweep",
                       "artifact upload", "provenance attestation", "release body", "tag re-assert", "GitHub release")
 DOCKER_JOB: Dict[str, Spec] = {
     "name": "Docker (GHCR)",
-    "needs": Flow("preflight, qualify, supply-chain"),
+    "needs": Flow("preflight, qualify, supply-chain, reproducible"),
     "if": "needs.preflight.outputs.is_prerelease == 'false'",
     "runs-on": "ubuntu-latest",
     "permissions": {"contents": "read", "packages": "write", "id-token": "write", "attestations": "write"},
@@ -509,16 +515,19 @@ REPRO_JOB: Dict[str, Spec] = {
     "needs": Flow("preflight, qualify, supply-chain"),
     "runs-on": "ubuntu-latest",
     "timeout-minutes": "120",
+    # #6274: the proven digest, compared by the release job's x86_64 Linux leg.
+    "outputs": {"sha256": "${{ steps.proof.outputs.sha256 }}"},
     "permissions": dict(_READ),
 }
 REPRO_TARGET = "x86_64-unknown-linux-gnu"
 REPRO_BIND = "git diff --quiet HEAD -- scripts/release-features.sh scripts/release/reproducible_build.py"
 REPRO_PROOF = ('python3 scripts/release/reproducible_build.py --target ' + REPRO_TARGET
-               + ' --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b"')
+               + ' --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b"'
+               + ' --sha256-output "$GITHUB_OUTPUT"')
 REPRO_STEPS: List[Spec] = [
     {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
     {"name": "Install Rust 1.98.0", "uses": RUST_TOOLCHAIN_USES, "with": {"toolchain": "1.98.0"}},
-    {"name": "Build twice from two workspaces and compare (#3613)", "shell": "bash", "run": Block((
+    {"name": "Build twice from two workspaces and compare (#3613)", "id": "proof", "shell": "bash", "run": Block((
         "set -euo pipefail",
         "# #4768 — the declaration and the proof script are HEAD's.",
         REPRO_BIND,
@@ -631,7 +640,9 @@ RELEASE_JOBS = tuple(RELEASE_JOB_PERMISSIONS)
 # Every job's `needs:` edges, pinned (#6289): a publish job that dropped its
 # supply-chain / release / reproducible gate would run before (or without) it.
 # preflight is the root and carries no `needs:`.
-_PQS = Flow("preflight, qualify, supply-chain")
+# #6274: every job that builds or publishes an artifact needs the reproducible
+# proof (crates-io, homebrew and copr reach it through `release`).
+_PQS = Flow("preflight, qualify, supply-chain, reproducible")
 _PQR = Flow("preflight, qualify, release")
 RELEASE_JOB_NEEDS: Dict[str, Spec] = {
     "qualify": "preflight",
@@ -1878,7 +1889,7 @@ REPRO_SCRIPT = "scripts/release/reproducible_build.py"
 REPRO_HDR = "\n  reproducible:\n"
 PROOF_STEP_NAME = "      - name: Build twice from two workspaces and compare (#3613)\n"
 PROOF_CMD = ('python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" '
-             '--workspace-b "$RUNNER_TEMP/reproducible-b"')
+             '--workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT"')
 EPOCH_LINES = IND + 'SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"\n' + IND + "export SOURCE_DATE_EPOCH\n"
 REMAP_LINES = (IND + 'RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"\n'
                + IND + "export RUSTFLAGS\n")
@@ -1887,9 +1898,7 @@ REMAP_LINES = (IND + 'RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-pref
 REPRO_OUTPUTS = "    outputs:\n      sha256: ${{ steps.proof.outputs.sha256 }}\n"
 REPRO_OUT_ARG = ' --sha256-output "$GITHUB_OUTPUT"'
 REPRO_PKG_ENV = "REPRO_SHA256: ${{ needs.reproducible.outputs.sha256 }}"
-REPRO_CHECK_LINE = ('case "${{ matrix.target }}" in x86_64-unknown-linux-gnu) test -n "$REPRO_SHA256"; '
-                    'test "$REPRO_SHA256" = "$ASSERTED_SHA256" || { echo "::error::the shipped x86_64-unknown-linux-gnu '
-                    'binary ($ASSERTED_SHA256) is not the one the reproducible job built twice ($REPRO_SHA256)"; exit 1; } ;; esac')
+REPRO_CHECK_LINE = REPRO_CHECK
 
 
 def _rel(old: str, new: Union[str, Transform], every: bool = False) -> Edit:
@@ -2001,7 +2010,7 @@ def _drop_assert_step(text: str) -> str:
     return text[:a] + text[p:]
 
 
-NEEDS_REL = "    needs: [preflight, qualify, supply-chain]\n    runs-on: ${{ matrix.os }}\n"
+NEEDS_REL = "    needs: [preflight, qualify, supply-chain, reproducible]\n    runs-on: ${{ matrix.os }}\n"
 MATRIX_FF = "      fail-fast: false\n"
 ENTRY1 = "          - target: x86_64-unknown-linux-gnu\n            os: ubuntu-latest\n            artifact: ai-memory\n"
 SBOM_JOB = "  sbom:\n    name: SBOM (CycloneDX)\n"
@@ -2121,7 +2130,7 @@ def _d(old: str, new: str) -> Edit:
 
 
 DOCKER_HDR = "\n  docker:\n    name: Docker (GHCR)\n"
-DOCKER_HEAD = ("needs: [preflight, qualify, supply-chain]\n    if: needs.preflight.outputs.is_prerelease == 'false'\n"
+DOCKER_HEAD = ("needs: [preflight, qualify, supply-chain, reproducible]\n    if: needs.preflight.outputs.is_prerelease == 'false'\n"
                "    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      packages: write\n")
 CRATES_STEPS = ("    # CARGO_REGISTRY_TOKEN is scoped to the `release` Environment (#3546 D4).\n"
                 "    environment: release\n    steps:\n")
@@ -2683,7 +2692,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR9/D01 docker job env": ("fail", [_rel(DOCKER_HDR, DOCKER_HDR + "    env:\n      DOCKER_HOST: tcp://x:2375\n")]),
     "SR9/D03 docker job container": ("fail", [_rel(DOCKER_HDR, DOCKER_HDR + "    container: alpine\n")]),
     "SR9/D04 docker job runs-on self-hosted": ("fail", [_rel(DOCKER_HEAD, DOCKER_HEAD.replace("ubuntu-latest", "self-hosted"))]),
-    "SR9 docker job needs changed": ("fail", [_rel(DOCKER_HEAD, DOCKER_HEAD.replace(", supply-chain]", "]"))]),
+    "SR9 docker job needs changed": ("fail", [_rel(DOCKER_HEAD, DOCKER_HEAD.replace(", supply-chain, reproducible]", ", reproducible]"))]),
     "SR9 docker job if changed": ("fail", [_rel(DOCKER_HEAD, DOCKER_HEAD.replace("== 'false'", "== 'true'"))]),
     "SR9 docker job missing": ("fail", [_rel(DOCKER_HDR, _docker_job_scalar)]),
     "SR9 docker steps not a sequence": ("fail", [_rel(DOCKER_HDR, _docker_steps_scalar)]),
@@ -2807,7 +2816,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "4752 package hash check made non-fatal": ("fail", [_rel(IND + PACKAGE_CHECK, IND + PACKAGE_CHECK.replace("exit 1", "true"))]),
     "4752 package copies another binary": ("fail", [_rel(
         IND + WF_PACKAGE[2], IND + 'cp /opt/known-good/ai-memory "' + PACKAGE_DIST + '"')]),
-    "4752 package tars another file": ("fail", [_rel(IND + WF_PACKAGE[7], IND + WF_PACKAGE[7].replace('"${{ matrix.artifact }}"', "*"))]),
+    "4752 package tars another file": ("fail", [_rel(IND + WF_PACKAGE[-1], IND + WF_PACKAGE[-1].replace('"${{ matrix.artifact }}"', "*"))]),
     "4752 upload path widened": ("fail", [_rel("          path: dist/ai-memory*\n", "          path: dist/*\n")]),
     "4752 checksum step gains env": ("fail", [_rel(CHECKSUM_HDR, CHECKSUM_HDR + "        env:\n          X: y\n")]),
     "4752 checksum step shell changed": ("fail", [_rel(CHECKSUM_HDR, CHECKSUM_HDR.replace("shell: bash", "shell: sh"))]),

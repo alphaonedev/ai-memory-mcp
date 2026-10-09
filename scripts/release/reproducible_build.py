@@ -157,7 +157,8 @@ def describe_mismatch(bin_a: Path, bin_b: Path) -> None:
 
 
 def two_builds(workspace_a: Path, workspace_b: Path, target: str, features: str, bin_name: str, cargo: str,
-               epoch: Optional[str] = None, epoch_b: Optional[str] = None, remap: bool = True) -> int:
+               epoch: Optional[str] = None, epoch_b: Optional[str] = None, remap: bool = True,
+               sha256_output: Optional[Path] = None) -> int:
     """Build in both workspaces and compare. Returns the exit code (0 / 1).
     ``epoch_b`` and ``remap=False`` exist for the negative fixtures only."""
     if not features.strip():
@@ -175,6 +176,10 @@ def two_builds(workspace_a: Path, workspace_b: Path, target: str, features: str,
         describe_mismatch(bin_a, bin_b)
         return 1
     print(f"reproducible-build: OK (two builds of {bin_name} for {target} are byte-identical: {sha_a})", flush=True)
+    if sha256_output is not None:
+        # #6274: the proven digest, for the release job's shipped-binary compare.
+        with open(sha256_output, "a", encoding="utf-8") as fh:
+            fh.write(f"sha256={sha_a}\n")
     return 0
 
 
@@ -278,6 +283,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--bin", default="ai-memory", help="binary name under target/<target>/release/ (default ai-memory)")
     ap.add_argument("--epoch", help="SOURCE_DATE_EPOCH for both builds (default: A's HEAD committer timestamp)")
     ap.add_argument("--cargo", default="cargo", help="build tool to run (default cargo)")
+    ap.add_argument("--sha256-output", help="append `sha256=<digest>` here when the two builds match "
+                    "(the job's GITHUB_OUTPUT, #6274)")
     ap.add_argument("--self-test", action="store_true", help="prove the comparison with a stub build tool")
     args = ap.parse_args(argv)
     root = Path(__file__).resolve().parent.parent.parent
@@ -287,7 +294,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         ap.error("--target, --features and --workspace-b are required")
     try:
         return two_builds(Path(args.workspace_a).resolve(), Path(args.workspace_b).resolve(), args.target, args.features,
-                          args.bin, args.cargo, epoch=args.epoch)
+                          args.bin, args.cargo, epoch=args.epoch,
+                          sha256_output=Path(args.sha256_output) if args.sha256_output else None)
     except ProofError as exc:
         print(f"::error::reproducible-build: {exc}", file=sys.stderr)
         return 2

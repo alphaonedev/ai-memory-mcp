@@ -271,7 +271,7 @@ jobs:
   # --------------------------------------------------------------------
   release:
     name: Release (${{ matrix.target }})
-    needs: [preflight, qualify, supply-chain]
+    needs: [preflight, qualify, supply-chain, reproducible]
     runs-on: ${{ matrix.os }}
     # #2487 supply-chain: OIDC-bound Sigstore build provenance for the
     # release binaries + deb/rpm, mirroring the OIDC pattern the SDK
@@ -323,8 +323,10 @@ jobs:
           toolchain: 1.98.0
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-
+      # #6274 — no build cache is restored in this job: the x86_64 Linux binary
+      # must be the bytes the `reproducible` job builds twice from scratch, and
+      # the package step below refuses it otherwise.
+      #
       # #2676 packaging residual — release channel must not ship default-only
       # binaries that omit `sal` (federation/SAL surface). Assert via the same
       # pin Gate3 provision uses (`scripts/assert-compiled-features.sh`).
@@ -399,6 +401,7 @@ jobs:
         shell: bash
         env:
           ASSERTED_SHA256: ${{ steps.assert.outputs.sha256 }}
+          REPRO_SHA256: ${{ needs.reproducible.outputs.sha256 }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -406,6 +409,10 @@ jobs:
           packaged_sha256="$(shasum -a 256 "dist/${{ matrix.artifact }}" | cut -d' ' -f1)"
           test -n "$ASSERTED_SHA256"
           test "$packaged_sha256" = "$ASSERTED_SHA256" || { echo "::error::dist/${{ matrix.artifact }} ($packaged_sha256) is not the binary the strict assert checked ($ASSERTED_SHA256)"; exit 1; }
+          # #6274 — the x86_64 Linux binary that ships must be byte-identical to
+          # the one the `reproducible` job built twice; other legs are not yet
+          # covered by the proof (see the job's banner).
+          case "${{ matrix.target }}" in x86_64-unknown-linux-gnu) test -n "$REPRO_SHA256"; test "$REPRO_SHA256" = "$ASSERTED_SHA256" || { echo "::error::the shipped x86_64-unknown-linux-gnu binary ($ASSERTED_SHA256) is not the one the reproducible job built twice ($REPRO_SHA256)"; exit 1; } ;; esac
           cd dist
           tar czf "ai-memory-${{ matrix.target }}.tar.gz" "${{ matrix.artifact }}"
 
@@ -558,12 +565,18 @@ jobs:
   # inputs the release job's build step exports (`--locked`, the pinned
   # 1.98.0 toolchain, SOURCE_DATE_EPOCH = the tagged commit's timestamp,
   # workspace and CARGO_HOME paths remapped out of the binary), and the two
-  # SHA-256 digests must be equal. A mismatch fails the run and prints what
+  # SHA-256 digests must be equal. A mismatch fails the job and prints what
   # differed (sizes, first differing byte, each ELF section table,
   # diffoscope when installed). No build cache is restored here: a cache hit
   # would make the second build a copy of the first, not an independent
   # proof. scripts/release/reproducible_build.py --self-test carries the
   # negative fixtures (a perturbed SOURCE_DATE_EPOCH, an unremapped path).
+  #
+  # #6274 — the proof is a GATE, not a report: release, sbom, mobile-ios,
+  # mobile-android and docker all `needs:` this job (crates-io, homebrew and
+  # copr need `release`), so nothing publishes unless it passed. Its digest is
+  # the `sha256` output, and the release job's x86_64-unknown-linux-gnu leg
+  # refuses to package a binary whose asserted hash differs from it.
   #
   # Scope: this proves the x86_64-unknown-linux-gnu binary only. Not yet
   # proven (each a tracked #3613 item): aarch64-unknown-linux-gnu, the two
@@ -578,6 +591,8 @@ jobs:
     needs: [preflight, qualify, supply-chain]
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    outputs:
+      sha256: ${{ steps.proof.outputs.sha256 }}
     permissions:
       contents: read
     steps:
@@ -591,6 +606,7 @@ jobs:
           toolchain: 1.98.0
 
       - name: Build twice from two workspaces and compare (#3613)
+        id: proof
         shell: bash
         run: |
           set -euo pipefail
@@ -598,7 +614,7 @@ jobs:
           git diff --quiet HEAD -- scripts/release-features.sh scripts/release/reproducible_build.py
           FEATURES="$(bash scripts/release-features.sh)"
           test -n "$FEATURES"
-          python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b"
+          python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT"
 
   # --------------------------------------------------------------------
   # #1973 (v1.0 supply-chain, epic #1940) - CycloneDX SBOM per release.
@@ -628,7 +644,7 @@ jobs:
   # --------------------------------------------------------------------
   sbom:
     name: SBOM (CycloneDX)
-    needs: [preflight, qualify, supply-chain]
+    needs: [preflight, qualify, supply-chain, reproducible]
     runs-on: ubuntu-latest
     # #2487 — OIDC-bound Sigstore provenance for the CycloneDX SBOM
     # artifact (same mechanism as the release-binary job above).
@@ -744,7 +760,7 @@ jobs:
   # --------------------------------------------------------------------
   mobile-ios:
     name: Mobile artifact (iOS xcframework)
-    needs: [preflight, qualify, supply-chain]
+    needs: [preflight, qualify, supply-chain, reproducible]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: macos-latest
     # #2487 — OIDC-bound Sigstore provenance for the iOS xcframework
@@ -888,7 +904,7 @@ jobs:
   # --------------------------------------------------------------------
   mobile-android:
     name: Mobile artifact (Android AAR-compatible)
-    needs: [preflight, qualify, supply-chain]
+    needs: [preflight, qualify, supply-chain, reproducible]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     # #2487 — OIDC-bound Sigstore provenance for the Android JNI tarball
@@ -1254,7 +1270,7 @@ jobs:
   # --------------------------------------------------------------------
   docker:
     name: Docker (GHCR)
-    needs: [preflight, qualify, supply-chain]
+    needs: [preflight, qualify, supply-chain, reproducible]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     permissions:
