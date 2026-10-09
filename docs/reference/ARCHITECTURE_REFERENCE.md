@@ -742,3 +742,12 @@ something scrubbed (an opaque identifier, `alice`, etc.), or set
 `AI_MEMORY_ANONYMIZE=1` to use the `anonymous:pid-…` fallback instead.
 Tracking issue: #198.
 
+### Test-only environment seams: MCP stop-signal drain (#4347)
+
+These rows extend the Environment Variables table above (kept here so the line citations the `CLAUDE.md` index pins into this file stay stable).
+
+| # | Variable | Type | Default | Surface | Class | Notes |
+|--|---|---|---|---|---|---|
+| — | `AI_MEMORY_TEST_IN_FLIGHT_BUDGET_MS` | u64 ms | unset (= 10000, `IN_FLIGHT_BUDGET`) | `ai-memory mcp` stop path (debug/test builds only) | **test-only** | **[#4347, v1.0.0]** Shortens the budget a request in flight at a stop signal gets to finish before it is fenced (never acknowledged), so a test reaches the expiry path quickly (`tests/mcp_signal_drain_4347.rs`). Read only under `#[cfg(any(test, debug_assertions))]`; release builds ignore it. Production deployments MUST leave unset. Source: `src/mcp/shutdown.rs::TEST_IN_FLIGHT_BUDGET_ENV`. |
+| — | `AI_MEMORY_TEST_HOLD_IN_FLIGHT` | `<request id>:<directory>` | unset (no hold) | `ai-memory mcp` stdio loop (debug/test builds only) | **test-only** | **[#4347, v1.0.0]** Holds the finished request with that id before its acknowledgement: creates `<directory>/entered`, then waits (bounded 30 s) for `<directory>/release`, so a test can deliver a signal while a request is provably in flight (`tests/mcp_signal_drain_4347.rs`). Read only under `#[cfg(any(test, debug_assertions))]`; release builds ignore it. Production deployments MUST leave unset. Source: `src/mcp/shutdown.rs::TEST_HOLD_IN_FLIGHT_ENV`. |
+| — | `AI_MEMORY_TEST_FAIL_STOP_SIGNAL_INSTALL` | `SIGTERM` / `SIGINT` / `SIGHUP` / `any` | unset (no injected failure) | `ai-memory mcp` startup (debug/test builds only) | **test-only** | **[#4347, v1.0.0]** Makes the named stop-signal listener fail to install, so a test proves `mcp` refuses to start (fail closed) instead of serving without a graceful stop (`tests/mcp_signal_drain_4347.rs`). Read only under `#[cfg(any(test, debug_assertions))]`; release builds ignore it. Production deployments MUST leave unset. Source: `src/mcp/shutdown.rs::TEST_FAIL_STOP_INSTALL_ENV`. |

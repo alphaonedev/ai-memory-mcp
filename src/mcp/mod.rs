@@ -54,6 +54,8 @@ pub mod param_names;
 // the handler's fallback branch (empty-success / filter dropped /
 // negative-as-absent / stringy-bool). These helpers refuse instead.
 pub mod param_guard;
+/// #4347 — graceful stop on SIGTERM / SIGINT / SIGHUP.
+pub mod shutdown;
 pub mod stdio_drain;
 
 // #3378 unit 2 — inline JSON-Schema `enum` lists for closed MCP string
@@ -175,6 +177,21 @@ fn ok_response(id: Value, result: Value) -> RpcResponse {
         result: Some(result),
         error: None,
     }
+}
+
+/// #4347 (F-4) — write one reply, but only when the stop has not fenced the
+/// request: EVERY reply goes through [`shutdown::ShutdownGate::commit_ack`], so
+/// "no reply after a stop" is uniform (parse-error and oversize replies carry
+/// no write, but the invariant must not depend on that). `false`: the request
+/// was fenced, nothing was written and the caller stops serving.
+fn reply_unless_fenced(stdout: &mut io::Stdout, resp: &RpcResponse) -> anyhow::Result<bool> {
+    if !shutdown::gate().commit_ack() {
+        return Ok(false);
+    }
+    let out = serde_json::to_string(resp)?;
+    writeln!(stdout, "{out}")?;
+    stdout.flush()?;
+    Ok(true)
 }
 
 fn err_response(id: Value, code: i64, message: String) -> RpcResponse {
@@ -5201,8 +5218,8 @@ pub fn run_mcp_server(
     // hot-swap. Between JSON-RPC requests (the stdio loop is single-
     // threaded, so the swap point is race-free by construction) we stat
     // config.toml; when its mtime changes we validate-then-swap the
-    // `[llm]` client. NO SIGHUP on the stdio child — a HUP would collide
-    // with parent-exit orphan semantics. Disabled under
+    // `[llm]` client. SIGHUP is not a reload on the stdio child: since
+    // #4347 it is a graceful STOP (with SIGTERM / SIGINT). Disabled under
     // `AI_MEMORY_NO_CONFIG` so tests stay hermetic.
     let reload_config_path: Option<std::path::PathBuf> = if crate::config::skip_config() {
         None
@@ -5217,6 +5234,10 @@ pub fn run_mcp_server(
     let mut stdin_locked = stdin.lock();
     let mut line_buf: Vec<u8> = Vec::with_capacity(8192);
     loop {
+        // #4347 — a stop signal was claimed: return so the exit drain runs.
+        if shutdown::gate().is_stopping() {
+            break;
+        }
         line_buf.clear();
         // Take a per-line slice of stdin sized to MCP_MAX_LINE_BYTES + 1
         // so we can detect overrun (read_until returns the byte count
@@ -5230,6 +5251,12 @@ pub fn run_mcp_server(
             // Clean EOF.
             break;
         }
+        // #4347 — held until the end of this iteration (every `continue`
+        // included). A stop claimed while a request is in flight lets it
+        // finish; a line read after the claim is not processed.
+        let Some(_request_guard) = shutdown::gate().begin_request() else {
+            break;
+        };
         let overrun = line_buf.last() != Some(&b'\n') && n > MCP_MAX_LINE_BYTES;
         if overrun {
             // Drain the rest of this line so the next iteration starts on a
@@ -5251,9 +5278,9 @@ pub fn run_mcp_server(
                          and drain ceiling {MCP_MAX_DRAIN_BYTES} hit; closing stream"
                     ),
                 );
-                let out = serde_json::to_string(&resp)?;
-                writeln!(stdout, "{out}")?;
-                stdout.flush()?;
+                if !reply_unless_fenced(&mut stdout, &resp)? {
+                    break;
+                }
                 let _ = db::checkpoint(&conn);
                 eprintln!("ai-memory MCP server stopped (drain ceiling exceeded)");
                 return Ok(());
@@ -5263,9 +5290,9 @@ pub fn run_mcp_server(
                 jsonrpc::PARSE_ERROR,
                 format!("parse error: line exceeded {MCP_MAX_LINE_BYTES} bytes"),
             );
-            let out = serde_json::to_string(&resp)?;
-            writeln!(stdout, "{out}")?;
-            stdout.flush()?;
+            if !reply_unless_fenced(&mut stdout, &resp)? {
+                break;
+            }
             continue;
         }
         // Trim trailing newline (and optional \r) before decoding.
@@ -5283,9 +5310,9 @@ pub fn run_mcp_server(
                     jsonrpc::PARSE_ERROR,
                     format!("parse error: invalid UTF-8: {e}"),
                 );
-                let out = serde_json::to_string(&resp)?;
-                writeln!(stdout, "{out}")?;
-                stdout.flush()?;
+                if !reply_unless_fenced(&mut stdout, &resp)? {
+                    break;
+                }
                 continue;
             }
         };
@@ -5301,9 +5328,9 @@ pub fn run_mcp_server(
                     jsonrpc::PARSE_ERROR,
                     format!("parse error: {e}"),
                 );
-                let out = serde_json::to_string(&resp)?;
-                writeln!(stdout, "{out}")?;
-                stdout.flush()?;
+                if !reply_unless_fenced(&mut stdout, &resp)? {
+                    break;
+                }
                 continue;
             }
         };
@@ -5450,9 +5477,15 @@ pub fn run_mcp_server(
             Some(&nag_watcher),
             &nag_session_id,
         );
-        let out = serde_json::to_string(&resp)?;
-        writeln!(stdout, "{out}")?;
-        stdout.flush()?;
+        // #4347 — test seam: hold the finished request before its ack.
+        shutdown::hold_before_ack_for_test(req.id.as_ref());
+        // #4347 — the forensic row for this request is already queued. Commit
+        // to acknowledging it BEFORE the stop path can start its drain; once
+        // the stop fenced this request (its in-flight budget expired) it is
+        // never acknowledged, so no acknowledged request lacks its row.
+        if !reply_unless_fenced(&mut stdout, &resp)? {
+            break;
+        }
     }
 
     let _ = db::checkpoint(&conn);
