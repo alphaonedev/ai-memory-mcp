@@ -18,8 +18,9 @@ the cert kept being cited (the #2444 "reports success while doing nothing"
 shape applied to a certification expiry trigger).
 
 THE RULE (TASK C, verbatim, no extra escape hatches). The change under test is
-the standard PR diff (`merge-base(PR-base, HEAD)..HEAD`), NEVER a diff against
-the cert's pinned SHA (unrelated later PRs must not fail forever). The gate
+the standard PR diff (push / local: `merge-base(PR-base, HEAD)..HEAD`;
+pull_request: first parent..merge commit, see RANGE RESOLUTION), NEVER a diff
+against the cert's pinned SHA (unrelated later PRs must not fail forever). The gate
 FAILS when that diff touches ANY of:
 
   * src/federation/**  (the directory itself or any path under it)
@@ -41,34 +42,46 @@ RANGE RESOLUTION.
                    (GITHUB_SHA). The gate judges (B) and (C) at that merge
                    commit, never at the PR head in isolation, so a branch cut
                    before the carrier's banner fix is judged on the tree that
-                   would actually merge. The merge-base is computed against
-                   the LIVE base ref (`origin/$GITHUB_BASE_REF`, fetched
-                   explicitly when absent), NOT the event payload's
-                   PR_BASE_SHA, which can be stale. A PR's change is its
-                   effect on the merged result, so (A) drift and (B) the
-                   banner flip are measured from the merge commit's first
-                   parent (verified to be the live base tip) to the merge
-                   commit: base-side changes since the fork point were judged
-                   when they landed on the base. (Conductor decision, no vote:
-                   precedent = every other CI job tests the merge ref.)
-                   Fail-closed when GITHUB_BASE_REF / PR_HEAD_SHA are unset,
-                   the base ref cannot be fetched, a sha does not resolve, the
-                   merge commit does not descend from PR_HEAD_SHA, is not a
-                   two-parent merge, or its first parent is not the live base
-                   tip.
+                   would actually merge. NO merge-base is computed on a
+                   pull_request: the range starts at the merge commit's FIRST
+                   PARENT. A PR's change is its effect on the merged result, so
+                   (A) drift and (B) the banner flip are measured from the first
+                   parent to the merge commit; base-side changes since the fork
+                   point were judged when they landed on the base. (Conductor
+                   decision, no vote: precedent = every other CI job tests the
+                   merge ref.) The first parent must be ON the live base branch
+                   (`git merge-base --is-ancestor <first parent>
+                   origin/$GITHUB_BASE_REF`, the ref fetched explicitly when
+                   absent), not necessarily its tip: a landing on the base
+                   after the merge ref was built does not change what the PR
+                   contributes. The event payload's PR_BASE_SHA, which can be
+                   stale, is report-only. Fail-closed (the remedy is to push a
+                   new commit or sync the branch with the base; a re-run reuses
+                   the same GITHUB_SHA) when GITHUB_BASE_REF / PR_HEAD_SHA are
+                   unset, a sha taken from the environment is not 7-40 hex
+                   characters, the base ref cannot be fetched, a sha does not
+                   resolve, the merge commit does not have exactly two parents,
+                   its second parent is not PR_HEAD_SHA, its first parent is the
+                   PR head (reversed parents), or its first parent is not on the
+                   live base. (#6138: first parent on the base; strictly tighter
+                   than the landed gate; no vote.)
   push             github.event.before .. GITHUB_SHA. An all-zero `before`
                    (new branch / first push) is N/A-skip, never a false-fail.
   workflow_dispatch / other / empty
                    CERT_EXPIRY_BASE[/HEAD] override if set; else (local
                    convenience) merge-base with @{upstream} or
                    origin/release/v1.0.0; else N/A-skip.
+  GitHub Actions   (GITHUB_ACTIONS set, #5970) the event payload range is
+                   authoritative: CERT_EXPIRY_BASE / CERT_EXPIRY_HEAD set in
+                   the environment are refused (rc 1), as is an empty event
+                   name. Outside CI the overrides stay honoured for local use.
   Shallow checkout if merge-base fails and the repo is shallow, unshallow /
                    deepen + fetch the missing tip, then retry.
 
 THE TWO PREDICATES #3556 ADDS (2026-09-21).
   (B) a cert-doc edit satisfies the hatch ONLY if the STATUS line or the
       Binds-to line changed between the range start (merge-base; on a
-      pull_request the base tip) and the judged commit (a
+      pull_request the merge commit's first parent) and the judged commit (a
       re-issue rebinds; a voiding record flips STATUS; prose does neither).
   (C) at the judged commit, a banner that says LIVE bound to <sha> must have
       NO wire-surface drift between <sha> and that commit (paths and
@@ -108,6 +121,11 @@ FED_ID_PATTERN = "AI_MEMORY_FED_[A-Z0-9_]+"
 FED_ID_RE = re.compile(FED_ID_PATTERN)
 ZERO_SHA_RE = re.compile(r"^0+$")
 PREFIX = "check-cert-expiry"
+# Every sha taken from the environment is 7-40 hex chars (#6138 S-F2) before
+# any git call, so an option-shaped value can never reach a git argv.
+ENV_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+# `--end-of-options` (git >= 2.24) is passed ahead of positional refs.
+MIN_GIT_VERSION = (2, 24)
 
 # POSIX [[:space:]] spelled out so a Unicode space cannot widen the match.
 _S = r"[ \t\r\n\f\v]"
@@ -169,21 +187,40 @@ def git_text(repo, *args):
     return proc.stdout.decode("utf-8", "replace").strip()
 
 
+def require_git_version(repo):
+    """Fail closed unless git understands `--end-of-options` (>= 2.24)."""
+    text = git_text(repo, "--version")
+    m = re.match(r"git version (\d+)\.(\d+)", text)
+    if not m or (int(m.group(1)), int(m.group(2))) < MIN_GIT_VERSION:
+        need = ".".join(str(n) for n in MIN_GIT_VERSION)
+        raise GateError(f"git >= {need} is required for --end-of-options (got {text!r})")
+
+
+def env_sha(env, key):
+    """The sha in env[key], which must be 7-40 hex chars (S-F2, fail-closed)."""
+    val = env.get(key, "")
+    if not ENV_SHA_RE.match(val):
+        raise GateError(f"{key} {val!r} is not 7-40 hex characters (fail-closed)")
+    return val
+
+
 def is_commit(repo, ref):
-    return run_git(repo, "rev-parse", "--verify", "--quiet", ref + "^{commit}").returncode == 0
+    return run_git(
+        repo, "rev-parse", "--verify", "--quiet", "--end-of-options", ref + "^{commit}",
+    ).returncode == 0
 
 
 def ensure_commit(repo, sha):
     """Fetch SHA if it is not yet a local commit; True iff it resolves."""
     if is_commit(repo, sha):
         return True
-    run_git(repo, "fetch", "--no-tags", "--quiet", "origin", sha)
+    run_git(repo, "fetch", "--no-tags", "--quiet", "--end-of-options", "origin", sha)
     return is_commit(repo, sha)
 
 
 def resolve_merge_base(repo, a, b):
     """merge-base of a and b; deepen a shallow clone once. None if unresolvable."""
-    proc = run_git(repo, "merge-base", a, b)
+    proc = run_git(repo, "merge-base", "--end-of-options", a, b)
     if proc.returncode == 0:
         return proc.stdout.decode().strip()
     shallow = run_git(repo, "rev-parse", "--is-shallow-repository")
@@ -192,7 +229,7 @@ def resolve_merge_base(repo, a, b):
             run_git(repo, "fetch", "--deepen=2147483647", "--quiet")
         ensure_commit(repo, a)
         ensure_commit(repo, b)
-        proc = run_git(repo, "merge-base", a, b)
+        proc = run_git(repo, "merge-base", "--end-of-options", a, b)
         if proc.returncode == 0:
             return proc.stdout.decode().strip()
     return None
@@ -217,7 +254,7 @@ def changed_paths(repo, frm, to):
     """Raw NUL-delimited changed paths. --no-renames so a move of a watched
     file cannot hide as an unwatched destination-only name; -z so a non-ASCII
     or newline-bearing name cannot be C-quoted past the path globs."""
-    proc = run_git(repo, "diff", "--name-only", "-z", "--no-renames", frm, to)
+    proc = run_git(repo, "diff", "--name-only", "-z", "--no-renames", "--end-of-options", frm, to)
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", "replace").strip()
         raise GateError(f"git diff {frm} {to} exited {proc.returncode}: {err}")
@@ -255,7 +292,7 @@ def cert_banner(repo, tree):
     BINDS: the lowercase 40-hex bound SHA, "-" when no Binds-to line matches,
     "DUPLICATE" when two or more do.
     """
-    proc = run_git(repo, "show", f"{tree}:{CERT_DOC}")
+    proc = run_git(repo, "show", "--end-of-options", f"{tree}:{CERT_DOC}")
     if proc.returncode != 0:
         return ("ABSENT", "-")
     lines = proc.stdout.decode("utf-8", "replace").split("\n")
@@ -362,40 +399,68 @@ def check_banner_consistency(repo, judged):
     return False, lines
 
 
-def pr_base_tip(repo, base, tip):
-    """First parent of the pull_request merge commit, which must be the live
-    base tip; anything else is not the PR's merge result (fail-closed)."""
-    parents = git_text(repo, "rev-list", "--parents", "-n", "1", tip).split()
+def pr_base_tip(repo, base, head, tip):
+    """Validate the pull_request merge commit and return its first parent.
+
+    The merge commit must have exactly two parents; its second parent must be
+    PR_HEAD_SHA (#6138 S-F7); its first parent must be on the live base branch
+    (an ancestor of, or equal to, the live tip). The first parent need not be
+    the live tip: a landing on the base after the merge ref was built does not
+    change what the PR contributes, so the gate stays green and measures
+    first parent..merge commit (#6138 F1; strictly tighter than the landed
+    gate, no vote). Anything else is not the PR's merge result (fail-closed).
+    """
+    parents = git_text(repo, "rev-list", "--parents", "-n", "1", "--end-of-options", tip).split()
     if len(parents) != 3:
         raise GateError(
             f"merge commit {tip} does not have exactly two parents "
             "(not a pull_request merge result)"
         )
-    first = parents[1]
-    live = git_text(repo, "rev-parse", "--verify", f"{base}^{{commit}}")
-    if first != live:
+    first, second = parents[1], parents[2]
+    head_full = git_text(repo, "rev-parse", "--verify", "--end-of-options", f"{head}^{{commit}}")
+    if first == head_full:
         raise GateError(
-            f"merge commit {tip} first parent {first} is not the live base tip "
-            f"{live}; the base moved after the merge ref was built, re-run the job"
+            f"merge commit {tip} has the PR head {head_full} as its FIRST parent "
+            "(reversed parents: the base branch must be the first parent); "
+            "push a new commit or sync the branch with the base so GitHub rebuilds "
+            "the merge ref"
         )
+    if second != head_full:
+        raise GateError(
+            f"merge commit {tip} second parent {second} is not PR_HEAD_SHA "
+            f"{head_full} (not this PR's merge result)"
+        )
+    live = git_text(repo, "rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}")
+    anc = run_git(repo, "merge-base", "--is-ancestor", "--end-of-options", first, live)
+    if anc.returncode == 1:
+        raise GateError(
+            f"merge commit {tip} first parent {first} is not on the live base "
+            f"{base} (tip {live}); the merge ref was not built from this base: "
+            "push a new commit or sync the branch with the base so GitHub "
+            "rebuilds the merge ref (a re-run reuses the same GITHUB_SHA)"
+        )
+    if anc.returncode != 0:
+        err = anc.stderr.decode("utf-8", "replace").strip()
+        raise GateError(f"git merge-base --is-ancestor exited {anc.returncode}: {err}")
     return first
 
 
 def check_change(repo, base, head, tip=None):
     """Judge the change. Without `tip` it is merge-base(base, head)..head. With
     `tip` (the pull_request merge commit, #6137) it is tip^1..tip, tip^1 being
-    verified as the live base tip. Returns (ok, text)."""
+    verified to lie on the live base and tip^2 to be the PR head. Returns
+    (ok, text)."""
     judged = tip if tip else head
     refs = [base, head] + ([tip] if tip else [])
     if not all(is_commit(repo, r) for r in refs):
         return False, f"{PREFIX}: ERROR — cannot resolve range {base}..{judged} (fail-closed)"
     if tip:
         # #6137 (conductor decision): a pull_request's change is its effect on
-        # the merged result, so (A)/(B) compare the base tip (the merge
-        # commit's first parent) with the merge commit. Base-side changes
-        # since the fork point were judged when they landed on the base.
+        # the merged result, so (A)/(B) compare the merge commit's first parent
+        # (on the base branch) with the merge commit. Base-side changes since
+        # the fork point were judged when they landed on the base.
         try:
-            mb = pr_base_tip(repo, base, tip)
+            mb = pr_base_tip(repo, base, head, tip)
         except GateError as exc:
             return False, f"{PREFIX}: ERROR — {exc} (fail-closed)"
     else:
@@ -477,7 +542,7 @@ def _judge(repo, base, head, judged, mb, tip):
     out.append("")
     if tip:
         out.append(
-            f"Range: {mb}..{judged}  (base tip to the pull_request merge commit; "
+            f"Range: {mb}..{judged}  (first parent to the pull_request merge commit; "
             "judged at the pull_request merge commit)"
         )
     else:
@@ -520,42 +585,52 @@ def resolve_live_base(repo, base_ref):
     tracking = f"refs/remotes/origin/{base_ref}"
     if not is_commit(repo, tracking):
         run_git(
-            repo, "fetch", "--no-tags", "--quiet", "origin",
+            repo, "fetch", "--no-tags", "--quiet", "--end-of-options", "origin",
             f"+refs/heads/{base_ref}:{tracking}",
         )
     if not is_commit(repo, tracking):
         raise GateError(
             f"cannot resolve the live base ref origin/{base_ref} (fetch failed; fail-closed)"
         )
-    return git_text(repo, "rev-parse", "--verify", tracking + "^{commit}")
+    return git_text(repo, "rev-parse", "--verify", "--end-of-options", tracking + "^{commit}")
 
 
 def resolve_range(repo, env):
     """(base, head, tip) for the change under test. tip is the commit that
     (B)/(C) are judged at (None = judge at head). Raises Skip / GateError."""
     event = env.get("GITHUB_EVENT_NAME", "")
+    # #5970 (precedent: PR #5871 head 3be284991): inside GitHub Actions the
+    # event payload names the range, so a CERT_EXPIRY_BASE / CERT_EXPIRY_HEAD
+    # override is refused (even an empty one); outside CI it is honoured.
+    in_ci = "GITHUB_ACTIONS" in env
+    if in_ci:
+        refused = [k for k in ("CERT_EXPIRY_BASE", "CERT_EXPIRY_HEAD") if k in env]
+        if refused:
+            raise GateError(
+                f"refused (#5970, fail-closed): {', '.join(refused)} set in the gate's "
+                "environment under GitHub Actions; the range comes only from the "
+                "event payload"
+            )
     if env.get("CERT_EXPIRY_BASE"):
         return env["CERT_EXPIRY_BASE"], env.get("CERT_EXPIRY_HEAD") or "HEAD", None
 
     if event == "pull_request":
         # #6137: judge the merge commit the job checked out, against the LIVE
         # base ref, not the (possibly stale) payload PR_BASE_SHA.
-        head = _need(env, "PR_HEAD_SHA", "a pull_request event")
+        _need(env, "PR_HEAD_SHA", "a pull_request event")
+        head = env_sha(env, "PR_HEAD_SHA")
         base_ref = _need(env, "GITHUB_BASE_REF", "a pull_request event")
+        tip = env_sha(env, "GITHUB_SHA") if env.get("GITHUB_SHA") else "HEAD"
+        stale = env_sha(env, "PR_BASE_SHA") if env.get("PR_BASE_SHA") else ""
         base = resolve_live_base(repo, base_ref)
-        tip = env.get("GITHUB_SHA") or "HEAD"
         if not is_commit(repo, head):
             ensure_commit(repo, head)
         if not is_commit(repo, head):
             raise GateError(f"PR_HEAD_SHA {head} does not resolve to a commit (fail-closed)")
         if not is_commit(repo, tip):
             raise GateError(f"merge commit {tip} does not resolve to a commit (fail-closed)")
-        if run_git(repo, "merge-base", "--is-ancestor", head, tip).returncode != 0:
-            raise GateError(
-                f"merge commit {tip} does not descend from PR_HEAD_SHA {head}; "
-                "refusing to judge a tree that is not the PR's merge result (fail-closed)"
-            )
-        stale = env.get("PR_BASE_SHA", "")
+        # The merge commit's parent structure (two parents, second parent ==
+        # PR_HEAD_SHA, first parent on the live base) is verified in pr_base_tip.
         if stale and stale != base:
             print(
                 f"{PREFIX}: note — payload PR_BASE_SHA {stale} differs from the live "
@@ -566,20 +641,26 @@ def resolve_range(repo, env):
 
     if event == "push":
         before = env.get("GITHUB_EVENT_BEFORE", "")
-        after = env.get("GITHUB_SHA") or "HEAD"
         if not before or ZERO_SHA_RE.match(before):
             raise Skip("push has no previous tip (new branch / first push); skip")
+        before = env_sha(env, "GITHUB_EVENT_BEFORE")
+        after = env_sha(env, "GITHUB_SHA") if env.get("GITHUB_SHA") else "HEAD"
         return before, after, None
     if event == "workflow_dispatch":
         raise Skip(
             "workflow_dispatch has no PR/push range (set CERT_EXPIRY_BASE to force a check); skip"
         )
     if event == "":
+        if in_ci:
+            raise GateError(
+                "GITHUB_EVENT_NAME is empty in a CI run; the event payload is the "
+                "only range source under GitHub Actions (fail-closed)"
+            )
         # Local convenience: standard PR-shaped range vs the tracking branch or
         # origin/release/v1.0.0. Never invent a range against the pinned SHA.
         for ref in ("@{upstream}", "origin/release/v1.0.0"):
             if is_commit(repo, ref):
-                return git_text(repo, "rev-parse", "--verify", ref), "HEAD", None
+                return git_text(repo, "rev-parse", "--verify", "--end-of-options", ref), "HEAD", None
         raise Skip(
             "no CERT_EXPIRY_BASE, no @{upstream}, no origin/release/v1.0.0; skip"
         )
@@ -589,6 +670,7 @@ def resolve_range(repo, env):
 def run_gate(repo, env):
     """Returns (rc, stdout_text, stderr_text)."""
     try:
+        require_git_version(repo)
         base, head, tip = resolve_range(repo, env)
     except Skip as skip:
         return 0, "", f"{PREFIX}: N/A — {skip}"
@@ -680,11 +762,32 @@ class SelfTest:
         return out
 
 
+    def gate(self, label, why, repo, env, needle=None):
+        """Run the whole gate. needle None: it must pass. Else it must fail
+        closed (rc 1) AND say `needle` (a fail-closed for the wrong reason, or
+        a wrong remedy, is a defect too)."""
+        rc, out, err = run_gate(repo, env)
+        text = out + err
+        if needle is None:
+            if rc != 0:
+                self.fail(f"({label}): {why} was REJECTED:", text)
+        elif rc == 0:
+            self.fail(f"({label}): {why} did not fail closed", text)
+        elif needle not in text:
+            self.fail(f"({label}): {why} failed for the wrong reason (wanted {needle!r}):", text)
+        return text
+
+
 def _gate_env(**kw):
     return {k: v for k, v in kw.items() if v is not None}
 
 
 def self_test():
+    try:
+        require_git_version(REPO_ROOT)
+    except GateError as exc:
+        print(f"{PREFIX}: ERROR — {exc}", file=sys.stderr)
+        return 2
     scratch_root = REPO_ROOT / ".local-runs"
     scratch_root.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix="cert-expiry-selftest.", dir=str(scratch_root)))
@@ -1002,8 +1105,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # (pr3b) the stale payload base would have given a different range: prove
     #        the verdict text changes if the stale sha were honoured.
     stale_ok, stale_text = check_change(repo, genesis, feature, pr_merge)
-    if stale_ok or "not the live base tip" not in stale_text:
-        t.fail("(pr3b): a stale base that is not the merge commit's first parent did not fail closed", stale_text)
+    if stale_ok or "is not on the live base" not in stale_text:
+        t.fail("(pr3b): a base that does not contain the merge commit's first parent did not fail closed", stale_text)
 
     # (pr2) the head FLIPS the banner (voiding record + wire change) while the
     #       live base has moved on: detected over merge-base..merge-commit.
@@ -1076,31 +1179,110 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         (f"{base}..{merge6}", "did not measure base tip..merge-commit"),
     ], tip=merge6)
 
-    # (pr4) pull_request fail-closed cells.
+    # ---- #6138: merge-commit structure cells ------------------------------
+    # main is at `base`; h7 is the PR head, o7 an unrelated branch.
+    fx.reset(base)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+    fx.g("checkout", "-q", "-b", "h7", base)
+    fx.write("src/unrelated.rs", "// h7 PR work\n", append=True)
+    head7 = fx.commit(["src/unrelated.rs"], "h7: PR work")
+    fx.g("checkout", "-q", "-b", "o7", base)
+    fx.write("src/other7.rs", "fn other7() {}\n")
+    fx.commit(["src/other7.rs"], "o7: an unrelated branch")
+    fx.g("checkout", "-q", "main")
+    good7 = fx.merge("h7", "Merge h7 into main")
+    fx.reset(base)
+    unrel7 = fx.merge("o7", "Merge o7 into main (an unrelated branch, not the PR head)")
+    fx.reset(base)
+    fx.g("merge", "-q", "--no-ff", "-m", "octopus: h7 and o7 into main", "h7", "o7")
+    octo7 = fx.g("rev-parse", "HEAD")
+    fx.reset(base)
+    env7 = _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=head7,
+                     GITHUB_BASE_REF="main", GITHUB_SHA=good7, PATH=os.environ.get("PATH", ""))
+    t.gate("pr7-ok", "control: a two-parent merge of the live tip and the PR head", repo, env7)
+    # Each of the next two cells is rejected by exactly one predicate.
+    t.gate("pr7-second", "a two-parent merge whose second parent is an unrelated branch, not "
+           "PR_HEAD_SHA", repo, dict(env7, GITHUB_SHA=unrel7), "is not PR_HEAD_SHA")
+    t.gate("pr7-octopus", "a three-parent (octopus) merge containing the PR head", repo,
+           dict(env7, GITHUB_SHA=octo7), "does not have exactly two parents")
+    # The base moves by an unrelated commit after the merge ref was built.
+    fx.write("src/main7.rs", "fn main7() {}\n")
+    moved7 = fx.commit(["src/main7.rs"], "base moves on with an unrelated commit")
+    fx.g("update-ref", "refs/remotes/origin/main", moved7)
+    out = t.gate("pr4-moved", "base moved by an unrelated commit (first parent on the base)", repo, env7)
+    if f"unchanged in {base}..{good7}" not in out:
+        t.fail("(pr4-moved): the range did not start at the merge commit's first parent:", out)
+    # Reversed parents: the PR head is the first parent, the base the second.
+    fx.g("checkout", "-q", "h7")
+    rev7 = fx.merge("main", "Merge main into h7 (reversed parents)")
+    fx.g("checkout", "-q", "main")
+    t.gate("pr4-reversed", "reversed parents (PR head first)", repo,
+           dict(env7, GITHUB_SHA=rev7), "reversed parents")
+    # The first parent is not on the live base at all.
+    fx.g("update-ref", "refs/remotes/origin/main", side)
+    off = t.gate("pr4-offbase", "first parent not on the live base", repo, env7,
+                 "is not on the live base")
+    if "re-run the job" in off or "push a new commit or sync the branch" not in off:
+        t.fail("(pr4-offbase): the remedy must say to push or sync, never re-run:", off)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+
+    # (pr4) pull_request fail-closed cells; each asserts the reason.
     pr_base_env = _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=feature,
                             GITHUB_BASE_REF="main", GITHUB_SHA=pr_merge,
                             PATH=os.environ.get("PATH", ""))
-    closed = {
-        "no GITHUB_BASE_REF": {k: v for k, v in pr_base_env.items() if k != "GITHUB_BASE_REF"},
-        "no PR_HEAD_SHA": {k: v for k, v in pr_base_env.items() if k != "PR_HEAD_SHA"},
-        "unresolvable PR_HEAD_SHA": dict(pr_base_env, PR_HEAD_SHA="1" * 40),
-        "unresolvable merge commit": dict(pr_base_env, GITHUB_SHA="2" * 40),
-        "merge commit not descending from the head": dict(pr_base_env, GITHUB_SHA=base),
-        "base ref neither local nor fetchable": dict(pr_base_env, GITHUB_BASE_REF="no-such-branch"),
-        "option-shaped base ref": dict(pr_base_env, GITHUB_BASE_REF="--upload-pack=x"),
-    }
-    # The merge ref was built on an older base tip than the live base: fail closed.
-    fx.g("update-ref", "refs/remotes/origin/main", merge5)
-    closed["live base moved after the merge ref was built"] = dict(pr_base_env, GITHUB_SHA=pr_merge)
-    for why, env in closed.items():
-        rc, _out, _err = run_gate(repo, env)
-        if rc == 0:
-            t.fail(f"(pr4): pull_request with {why} did not fail closed")
+    hex_msg = "is not 7-40 hex characters"
+    closed = [
+        ("no GITHUB_BASE_REF", {k: v for k, v in pr_base_env.items() if k != "GITHUB_BASE_REF"},
+         "GITHUB_BASE_REF is unset"),
+        ("no PR_HEAD_SHA", {k: v for k, v in pr_base_env.items() if k != "PR_HEAD_SHA"},
+         "PR_HEAD_SHA is unset"),
+        ("unresolvable PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA="1" * 40),
+         "does not resolve to a commit"),
+        ("unresolvable merge commit", dict(pr_base_env, GITHUB_SHA="2" * 40),
+         "does not resolve to a commit"),
+        ("a GITHUB_SHA that is not a two-parent merge", dict(pr_base_env, GITHUB_SHA=base),
+         "does not have exactly two parents"),
+        ("base ref neither local nor fetchable", dict(pr_base_env, GITHUB_BASE_REF="no-such-branch"),
+         "cannot resolve the live base ref"),
+        ("option-shaped base ref", dict(pr_base_env, GITHUB_BASE_REF="--upload-pack=x"),
+         "is not a plain branch name"),
+        ("option-shaped PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA="--upload-pack=x"), hex_msg),
+        ("too-short PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA=feature[:6]), hex_msg),
+        ("non-hex GITHUB_SHA", dict(pr_base_env, GITHUB_SHA="zz" + pr_merge[2:]), hex_msg),
+        ("non-hex PR_BASE_SHA", dict(pr_base_env, PR_BASE_SHA="--oops"), hex_msg),
+        ("option-shaped push GITHUB_EVENT_BEFORE",
+         {"GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_BEFORE": "--upload-pack=x",
+          "GITHUB_SHA": base, "PATH": os.environ.get("PATH", "")}, hex_msg),
+    ]
+    for why, env, needle in closed:
+        t.gate("pr4", f"pull_request with {why}", repo, env, needle)
 
-    # (k) fail-closed - pull_request with nothing set (missing PR sha / base ref).
-    rc, _o, _e = run_gate(repo, {"GITHUB_EVENT_NAME": "pull_request"})
-    if rc == 0:
-        t.fail("(k): pull_request with unset PR_BASE_SHA did not fail closed")
+    # (k) fail-closed - pull_request with nothing set (missing PR head sha / base ref).
+    t.gate("k", "pull_request with PR_HEAD_SHA and GITHUB_BASE_REF unset", repo,
+           {"GITHUB_EVENT_NAME": "pull_request"}, "PR_HEAD_SHA is unset")
+
+    # ---- #5970 (ported from PR #5871): the event payload is authoritative in CI ----
+    push_env = {"GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_BEFORE": base, "GITHUB_SHA": docs,
+                "PATH": os.environ.get("PATH", "")}
+    refuse = "refused (#5970, fail-closed)"
+    t.gate("ci1", "control: a push range from the payload under GitHub Actions", repo,
+           dict(push_env, GITHUB_ACTIONS="true"))
+    t.gate("ci2", "CERT_EXPIRY_BASE/HEAD overrides under GitHub Actions", repo,
+           dict(push_env, GITHUB_ACTIONS="true", CERT_EXPIRY_BASE=base, CERT_EXPIRY_HEAD=docs),
+           refuse)
+    t.gate("ci3", "an empty CERT_EXPIRY_BASE under GitHub Actions", repo,
+           dict(push_env, GITHUB_ACTIONS="true", CERT_EXPIRY_BASE=""), refuse)
+    t.gate("ci4", "CERT_EXPIRY_HEAD alone under GitHub Actions", repo,
+           dict(push_env, GITHUB_ACTIONS="true", CERT_EXPIRY_HEAD=viol), refuse)
+    t.gate("ci5", "an empty event name under GitHub Actions", repo,
+           {"GITHUB_ACTIONS": "true", "PATH": os.environ.get("PATH", "")},
+           "GITHUB_EVENT_NAME is empty in a CI run")
+    t.gate("ci6", "the CERT_EXPIRY_BASE override outside CI (honoured, RED range)", repo,
+           {"CERT_EXPIRY_BASE": base, "CERT_EXPIRY_HEAD": viol,
+            "PATH": os.environ.get("PATH", "")}, sentence)
+    t.gate("ci7", "the CERT_EXPIRY_BASE override outside CI (honoured, docs range)", repo,
+           {"CERT_EXPIRY_BASE": base, "CERT_EXPIRY_HEAD": docs,
+            "PATH": os.environ.get("PATH", "")})
 
     # (l) N/A-skip - workflow_dispatch with no override (must not false-fail).
     rc, _o, _e = run_gate(repo, {"GITHUB_EVENT_NAME": "workflow_dispatch"})
@@ -1149,7 +1331,7 @@ SELF_TEST_OK = (
     "(f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs "
     "RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path "
     "still named); (j) identifier-rename RED (both names listed); (k) pull_request missing "
-    "PR_BASE_SHA fail-closed; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; "
+    "PR_HEAD_SHA / GITHUB_BASE_REF fail-closed with its reason; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; "
     "(n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; "
     "(p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + "
     "incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated "
@@ -1165,9 +1347,15 @@ SELF_TEST_OK = (
     "the base EXPIRED GREEN at the merge commit (and RED if judged at the head alone); (pr2) "
     "head that flips the banner detected over base-tip..merge-commit, and a wire change "
     "without the flip RED; (pr3) stale payload PR_BASE_SHA ignored, the live base ref used; "
-    "(pr4) pull_request fail-closed on missing/unresolvable base ref, head or merge commit, "
-    "or a first parent that is not the live base tip; (pr5) stale branch without a wire change "
-    "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED."
+    "(pr4) pull_request fail-closed, each with its reason, on missing/unresolvable base ref, "
+    "head or merge commit and on non-hex shas; (pr4-moved) base moved by an unrelated commit "
+    "GREEN; (pr4-offbase) first parent not on the base RED with the push-or-sync remedy; "
+    "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
+    "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
+    "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
+    "octopus merge RED; (ci1-ci7, #5970) the event payload range is authoritative under "
+    "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
+    "outside CI."
 )
 
 
