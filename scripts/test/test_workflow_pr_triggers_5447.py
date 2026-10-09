@@ -3774,5 +3774,74 @@ class ApprovalValidators6259(unittest.TestCase):
                 self.assertIn(hostile, missed)
 
 
+# ---- Round 4, item 2 (#6260, #6239): the closed-world scan is closed ----
+
+def _all_workflow_texts() -> Dict[str, str]:
+    return {p.name: p.read_text(encoding="utf-8") for p in sorted(WORKFLOWS.glob("*.yml"))}
+
+
+def _insert_after_job_header(text: str, job: str, line: str) -> str:
+    header = f"\n  {job}:\n"
+    assert text.count(header) == 1, (job, text.count(header))
+    return text.replace(header, header + line, 1)
+
+
+class BeforeClosedWorld6260(unittest.TestCase):
+    """#6260 / #6239: a bare ``github.event.before`` read outside the classify job is a defect.
+
+    The round-3 exemption asked whether the classify job contains the expression anywhere,
+    not whether THIS occurrence lies inside classify, so a new bare consumer in any other
+    ci.yml or coverage.yml job passed every test.
+    """
+
+    def texts(self) -> Dict[str, str]:
+        return _all_workflow_texts()
+
+    def test_6260_scan_set_is_every_workflow_file(self) -> None:
+        scanned = set(CarrierBeforeClosedWorld6117().texts())
+        self.assertEqual({p.name for p in WORKFLOWS.glob("*.yml")}, scanned)
+        self.assertIn("coverage.yml", scanned)
+
+    def test_6260_live_tree_has_no_uncovered_before_read(self) -> None:
+        self.assertEqual([], _bare_before_consumers(self.texts()))
+
+    def test_6260_m01_bare_read_in_another_ci_job_is_killed(self) -> None:
+        texts = self.texts()
+        texts["ci.yml"] = _insert_after_job_header(
+            texts["ci.yml"], "lint", "    env:\n      BARE: ${{ github.event.before }}\n")
+        bad = _bare_before_consumers(texts)
+        self.assertEqual(1, len(bad), bad)
+        self.assertTrue(bad[0].startswith("ci.yml:"), bad)
+
+    def test_6260_m02_bare_read_in_the_coverage_thresholds_job_is_killed(self) -> None:
+        texts = self.texts()
+        texts["coverage.yml"] = _insert_after_job_header(
+            texts["coverage.yml"], "per-module-thresholds",
+            "    env:\n      BARE: ${{ github.event.before }}\n")
+        bad = _bare_before_consumers(texts)
+        self.assertEqual(1, len(bad), bad)
+        self.assertTrue(bad[0].startswith("coverage.yml:"), bad)
+
+    def test_6260_m03_bracket_form_read_is_killed(self) -> None:
+        texts = self.texts()
+        texts["c8-precheck.yml"] = _insert_after_job_header(
+            texts["c8-precheck.yml"], REQUIRED_CONTEXTS_JOB,
+            "    env:\n      BARE: ${{ github.event['before'] }}\n")
+        self.assertEqual(1, len(_bare_before_consumers(texts)))
+
+    def test_6260_m04_shell_read_of_the_payload_is_killed(self) -> None:
+        texts = self.texts()
+        texts["c8-precheck.yml"] = _insert_after_job_header(
+            texts["c8-precheck.yml"], REQUIRED_CONTEXTS_JOB,
+            "    steps:\n      - run: base=$(jq -r .before \"$GITHUB_EVENT_PATH\")\n")
+        self.assertEqual(1, len(_bare_before_consumers(texts)))
+
+    def test_6260_m05_bare_read_in_a_new_workflow_file_is_killed(self) -> None:
+        texts = self.texts()
+        texts["brand-new.yml"] = "jobs:\n  x:\n    steps:\n      - run: echo ${{ github.event.before }}\n"
+        bad = _bare_before_consumers(texts)
+        self.assertEqual(["brand-new.yml:4: ${{ github.event.before }}"], bad)
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
