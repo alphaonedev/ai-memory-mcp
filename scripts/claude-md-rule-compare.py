@@ -2097,6 +2097,33 @@ def _self_test_cases() -> int:
     masks("#6211 R4 a JWT whose payload does not start with eyJ is masked",
           "jwt eyJhbGciOiJIUzI1NiJ9.eyAgInN1YiI6IjYxNjMifQ.c2lnbmF0dXJlNjE2M2NhbmFyeQ here",
           hidden=("eyAgInN1YiI6IjYxNjMifQ",), shown=("here",), count=1)
+    # #6163 round 4 (security F2, code F2; mutant O1a): a private key written on one line, as a JSON or environment
+    # string with `\n` escapes or with its body on the BEGIN line, is masked whole; the BEGIN line is key material.
+    one_line_pem = "-----BEGIN PRIVATE KEY-----\\nMIIEvQ6163canaryO1a\\n-----END PRIVATE KEY-----\\n"
+    masks("#6163 R4 a one-line PEM private key with escaped newlines is masked", f'key material "{one_line_pem}"',
+          hidden=("6163canaryO1a",), count=1)
+    masks("#6163 R4 a one-line PEM private key inside a service-account JSON is masked",
+          f'{{"type": "service_account", "private_key": "{one_line_pem}", "client_id": "6163"}}',
+          hidden=("6163canaryO1a",))
+    masks("#6163 R4 a PEM BEGIN line with its body and END on the same line is masked",
+          "-----BEGIN PRIVATE KEY----- MIIEvQ6163canarySameLine -----END PRIVATE KEY-----\nafter-same-line-6163",
+          hidden=("6163canarySameLine",), shown=("after-same-line-6163",))
+    # #6163 round 4 (code F5): an unquoted value runs to whitespace past a quote inside the word.
+    masks("#6163 R4 an unquoted password with a double quote inside is masked to the end of the word",
+          'password=abc"def6163CanaryInnerDq rest', hidden=("def6163CanaryInnerDq",))
+    masks("#6163 R4 an unquoted token with a single quote inside is masked to the end of the word",
+          "token: abc'def6163CanaryInnerSq", hidden=("def6163CanaryInnerSq",))
+    # #6163 round 4 (security F6): a doubled quote inside a quoted value is an escaped quote, not its end.
+    masks("#6163 R4 a single-quoted password with a doubled single quote is masked to its closing quote",
+          "password: 'ab''6163CanaryDoubledSq' tail", hidden=("6163CanaryDoubledSq",), shown=("tail",))
+    masks("#6163 R4 a double-quoted password with a doubled double quote is masked to its closing quote",
+          'password: "ab""6163CanaryDoubledDq" tail', hidden=("6163CanaryDoubledDq",), shown=("tail",))
+    # #6163 round 4 (code F6): a nested `key: value` line under a bare credential name is judged by its value.
+    masks("#6163 R4 a nested YAML value under a bare api_key is masked",
+          "api_key:\n  value: 6163CanaryNestedValue", hidden=("6163CanaryNestedValue",))
+    masks("#6163 R4 a nested prose description under a bare api_key stays visible",
+          "api_key:\n  description: The key used by the CLI", shown=("description: The key used by the CLI",),
+          count=0)
 
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
