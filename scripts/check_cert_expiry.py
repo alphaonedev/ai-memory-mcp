@@ -1308,6 +1308,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                      GITHUB_BASE_REF="main", GITHUB_SHA=good7, PATH=os.environ.get("PATH", ""))
     t.gate("pr7-ok", "control: a two-parent merge of the live tip and the PR head", repo, env7)
     # R2-F2: the version guard and the is-ancestor error branch are pinned.
+    path_before = os.environ.get("PATH")  # #6381: pinned by (shim-path-restore) below
     res = shimmed_cell(t, "gitver", tmp, repo, env7, version="git version 2.29.9")
     if res and (res[0] != 1 or "git >= 2.30 is required" not in res[1] + res[2]):
         t.fail("(gitver): git 2.29.9 did not fail closed with the version guard:", res[1] + res[2])
@@ -1356,6 +1357,12 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             else:
                 t.fail("(shim-unreach): a non-executable git shim (PATH lookup falls through "
                        "to the real git) was not refused")
+    # #6381: the shim PATH entry is process-global; every shim cell above, on its
+    # success path (shim-control), its gate-verdict paths (gitver, anc-error) and
+    # its refusal paths (shim-pathsep, shim-unreach), must leave PATH as found.
+    if os.environ.get("PATH") != path_before:
+        t.fail("(shim-path-restore): PATH was not restored after the git shim cells: "
+               f"{path_before!r} -> {os.environ.get('PATH')!r}")
     # Each of the next two cells is rejected by exactly one predicate.
     t.gate("pr7-second", "a two-parent merge whose second parent is an unrelated branch, not "
            "PR_HEAD_SHA", repo, dict(env7, GITHUB_SHA=unrel7), "is not PR_HEAD_SHA")
