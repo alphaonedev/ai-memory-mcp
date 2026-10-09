@@ -56,7 +56,9 @@ with open(base + "/psql.log", "a") as fh:
     fh.write(json.dumps({{"argv": sys.argv, "env_marker_ok": os.environ.get("PGPASSWORD") == {marker!r},
                          "pgpassword": os.environ.get("PGPASSWORD"),
                          "pgpassword_hex": os.environb.get(b"PGPASSWORD", b"").hex(),
-                         "connect_timeout_env": os.environ.get("PGCONNECT_TIMEOUT")}}) + "\\n")
+                         "connect_timeout_env": os.environ.get("PGCONNECT_TIMEOUT"),
+                         "pgservice": os.environ.get("PGSERVICE"),
+                         "pgservicefile": os.environ.get("PGSERVICEFILE")}}) + "\\n")
 print(1 if os.path.isfile(base + "/share/extension/age.control") else 0)
 """
 
@@ -158,8 +160,8 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             "--psql", str(self.psql),
         ]
 
-    def run_script(self, age_dir=None):
-        return subprocess.run(self.cmd(age_dir), capture_output=True, text=True, check=False)
+    def run_script(self, age_dir=None, env=None):
+        return subprocess.run(self.cmd(age_dir), capture_output=True, text=True, check=False, env=env)
 
     def install_good(self):
         for (sub, name), data in self.src.items():
@@ -646,6 +648,28 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertIn(key, mod.ALLOWED_QUERY_KEYS | mod.REFUSED_KNOWN_KEYS)
         self.assertEqual(mod.ALLOWED_QUERY_KEYS & mod.REFUSED_KNOWN_KEYS, set())
+
+    # ---- #6345: a pg_service.conf password must never beat the moved PGPASSWORD ----------
+    def test_service_key_in_url_is_refused_by_name(self):
+        # libpq fills unset options from the service file BEFORE it reads PGPASSWORD, so a service
+        # entry carrying a password beats the moved password (the URL password beat it originally).
+        for url in ("postgres://ciuser:pw@127.0.0.1:5445/cidb?service=svc",
+                    "postgres://ciuser@127.0.0.1:5445/cidb?service=svc",
+                    "postgres://ciuser:pw@127.0.0.1:5445/cidb?sslmode=disable&%73ervice=svc"):
+            with self.subTest(url=url.split("@", 1)[1]):
+                self.assert_url_refused(url, ("query key service",))
+
+    def test_pgservice_env_is_not_passed_to_psql(self):
+        self.install_good()
+        env = dict(os.environ, PGSERVICE="svc-6345", PGSERVICEFILE=str(self.base / "pg_service.conf"))
+        r = self.run_script(env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertIsNone(call["pgservice"], "PGSERVICE reached psql (service-file password would win)")
+            self.assertIsNone(call["pgservicefile"], "PGSERVICEFILE reached psql")
+            self.assertTrue(call["env_marker_ok"], "the moved password must still reach psql")
 
     # ---- #6252 / cloud F6: signals and the connect timeout --------------------
     def start_sleeping_helper(self):
