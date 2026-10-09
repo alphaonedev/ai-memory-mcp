@@ -844,11 +844,17 @@ def shim_interpreter_violation(tmp):
         too_long = long_dir / ("p" * 60)
         too_long.symlink_to(sys.executable)
         spaced = deep / "with space" / "python3"
-        pad = SHEBANG_MAX - fixed - len(str(deep)) - 1
+        pad = SHEBANG_MAX - fixed - len(os.fsencode(str(deep))) - 1
+        if pad < 1:
+            return f"the scratch path is too deep to build the boundary cases (pad {pad})"
         longest_ok = deep / ("q" * pad)
+        one_over = deep / ("q" * (pad + 1))
+        non_utf8 = deep / "py\udcff"
         cases = [("an over-long interpreter path", too_long, True),
                  ("an interpreter path with whitespace", spaced, True),
-                 ("the longest in-limit interpreter path", longest_ok, False)]
+                 ("the longest in-limit interpreter path", longest_ok, False),
+                 ("a 256-byte interpreter line", one_over, True),
+                 ("a non-UTF-8 (surrogate-escaped) interpreter path", non_utf8, True)]
         for label, interp, must_raise in cases:
             try:
                 write_git_shim(deep, "git", interpreter=interp)
