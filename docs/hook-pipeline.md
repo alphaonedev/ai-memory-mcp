@@ -373,7 +373,9 @@ Pinned by [`tests/hooks_executor_test.rs`](../tests/hooks_executor_test.rs),
    (`memory_capabilities` over MCP, e.g.
    `printf '<JSON-RPC tools/call>' | ai-memory mcp --profile full`)
    reports `hook_events_count` (26) and `registered_count` — it does
-   not enumerate per-event hook rows.
+   not enumerate per-event hook rows. `registered_count` is `null` with a
+   `registered_count_error` reason when the `subscriptions` table could
+   not be read (#4979); it is never a fabricated `0`.
 
 ## Tuning guidance
 

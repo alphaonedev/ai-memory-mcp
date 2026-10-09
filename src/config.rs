@@ -1104,7 +1104,15 @@ pub struct CapabilityPermissions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityHooks {
     /// Number of registered hook subscribers (proxy: webhook subscriptions).
-    pub registered_count: usize,
+    /// #4979 — `None` (wire `null`) when the `subscriptions` table could not
+    /// be read; the reason is in [`Self::registered_count_error`]. A read
+    /// fault is never a healthy-looking `0`. Precedent for a nullable count:
+    /// `capability_issuers`.
+    pub registered_count: Option<usize>,
+    /// #4979 — why `registered_count` is `null`; absent from the wire on a
+    /// healthy read (the `auto_export_spawn_failed_total` skip precedent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_count_error: Option<String>,
     // P1 honesty patch: `by_event` was always an empty map — no event
     // registry exists. Dropped from the v2 wire schema.
     /// v0.6.3.1 P5 (G9): canonical list of webhook event types the
@@ -1159,7 +1167,8 @@ fn default_hook_events_count() -> usize {
 impl Default for CapabilityHooks {
     fn default() -> Self {
         Self {
-            registered_count: 0,
+            registered_count: Some(0),
+            registered_count_error: None,
             webhook_events: default_webhook_events(),
             hook_events_count: HOOK_EVENTS_COUNT,
             auto_export_spawn_failed_total: 0,

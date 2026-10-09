@@ -4456,8 +4456,23 @@ fn section_webhook(conn: &rusqlite::Connection) -> ReportSection {
     let mut severity = Severity::Info;
     let mut note: Option<String> = None;
 
-    let sub_count = db::count_subscriptions(conn).unwrap_or(0);
-    facts.push(("subscription_count".into(), sub_count.to_string()));
+    // #4979 — a read fault is reported as `unreadable` at Critical, never a
+    // healthy-looking 0 (the #4715 / #4956 Governance shape, ERRORS-19).
+    match db::count_subscriptions(conn) {
+        Ok(n) => facts.push(("subscription_count".into(), n.to_string())),
+        Err(e) => {
+            severity = Severity::Critical;
+            facts.push((
+                "subscription_count".into(),
+                over_depth_4715::UNREADABLE.into(),
+            ));
+            facts.push(("subscription_count_error".into(), format!("{e:#}")));
+            append_note(
+                &mut note,
+                "the subscription count could not be read (#4979)",
+            );
+        }
+    }
 
     let (dispatched, failed) = db::doctor_webhook_delivery_totals(conn).unwrap_or((0, 0));
     facts.push(("dispatched_total".into(), dispatched.to_string()));

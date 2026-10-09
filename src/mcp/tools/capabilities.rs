@@ -220,8 +220,9 @@ impl CapabilitiesAccept {
 /// **Live DB counts.** When `conn` is `Some`, the dynamic blocks
 /// (`permissions.active_rules`, `hooks.registered_count`,
 /// `approval.pending_requests`) are populated from live counts. DB
-/// errors are non-fatal — the report falls back to zero-state so a
-/// transient blip cannot 500 the capabilities endpoint.
+/// errors are non-fatal — a blip cannot 500 the capabilities endpoint —
+/// but they are not hidden either: `hooks.registered_count` reports a
+/// read fault as `null` with `hooks.registered_count_error` (#4979).
 ///
 /// **Schema selection.** `accept` controls the wire shape. As of
 /// v0.7.0 A5 the default is `V3` (#1645); `V2` and `V1` remain
@@ -415,8 +416,14 @@ fn build_capabilities_overlay(
                 .map(|(ns, p)| format_rule_summary(&ns, &p))
                 .collect();
         }
-        if let Ok(n) = db::count_subscriptions(c) {
-            caps.hooks.registered_count = n;
+        // #4979 — a read fault is `null` + the reason on the wire, never a
+        // fabricated 0 (ERRORS-19); the rest of the report still answers.
+        match db::count_subscriptions(c) {
+            Ok(n) => caps.hooks.registered_count = Some(n),
+            Err(e) => {
+                caps.hooks.registered_count = None;
+                caps.hooks.registered_count_error = Some(format!("{e:#}"));
+            }
         }
         if let Ok(n) = db::count_pending_actions_by_status(c, "pending") {
             caps.approval.pending_requests = n;

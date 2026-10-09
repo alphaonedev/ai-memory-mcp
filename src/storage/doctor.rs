@@ -89,10 +89,13 @@ pub fn list_active_governance_policies(
 /// v0.6.3 (capabilities schema v2): count rows in the `subscriptions`
 /// table. Used by `handle_capabilities` as a proxy for "registered
 /// hooks" — the hook pipeline itself is v0.7 Bucket 0 work.
+///
+/// # Errors
+///
+/// Returns `Err` on any SQLite failure (e.g. an unreadable `subscriptions`
+/// table) — a read fault is never a healthy-looking `0` (#4979, ERRORS-19).
 pub fn count_subscriptions(conn: &Connection) -> Result<usize> {
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM subscriptions", [], |r| r.get(0))
-        .unwrap_or(0);
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM subscriptions", [], |r| r.get(0))?;
     Ok(usize::try_from(count.max(0)).unwrap_or(0))
 }
 
