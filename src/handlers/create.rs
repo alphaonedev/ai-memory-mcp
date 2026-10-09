@@ -1632,15 +1632,22 @@ pub async fn create_memory(
     headers: HeaderMap,
     JsonOrBadRequest(body): JsonOrBadRequest<CreateMemory>,
 ) -> impl IntoResponse {
+    // #3653 — `ai_memory_store_total` counts this route's FINAL outcome, on
+    // both backends: `ok` for a 2xx, `err` for anything else (validation,
+    // governance, quota, conflict, backend failure). The tier label is the
+    // requested one, a closed set, so the label space stays bounded.
+    let tier = body.tier.as_str();
     let response = create_memory_write(State(app.clone()), headers, JsonOrBadRequest(body))
         .await
         .into_response();
-    super::write_receipt::complete(
+    let response = super::write_receipt::complete(
         &app,
         response,
         super::write_receipt::WriterConnection::Legacy,
     )
-    .await
+    .await;
+    crate::metrics::record_store(tier, response.status().is_success());
+    response
 }
 
 #[allow(clippy::too_many_lines)]

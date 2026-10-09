@@ -7,7 +7,8 @@
 //! default `Registry`, a handful of global counters and a couple of
 //! histograms. Callers increment via the typed helpers (`record_store`,
 //! `record_recall`) rather than poking the registry directly so a future
-//! metrics-backend swap stays internal.
+//! metrics-backend swap stays internal. Both helpers are HTTP-scoped: the
+//! single-memory create route and the recall route (#3653, #1839).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -782,7 +783,9 @@ impl Metrics {
         let store_total = int_counter_vec(
             &registry,
             "ai_memory_store_total",
-            "Total memory_store calls, labeled by tier and result.",
+            "HTTP POST /api/v1/memories requests, labeled by requested tier and final \
+             result (ok = 2xx, err = any other status). MCP-stdio, CLI and bulk \
+             writes are not counted.",
             &["tier", "result"],
             &mut err,
         );
@@ -790,7 +793,8 @@ impl Metrics {
         let recall_total = int_counter_vec(
             &registry,
             "ai_memory_recall_total",
-            "Total memory_recall calls, labeled by mode.",
+            "Successful HTTP recalls, labeled by mode. Failed requests and MCP-stdio \
+             recalls are not counted.",
             &["mode"],
             &mut err,
         );
@@ -798,7 +802,8 @@ impl Metrics {
         let recall_latency_seconds = histogram_vec(
             &registry,
             "ai_memory_recall_latency_seconds",
-            "Recall latency in seconds, labeled by mode.",
+            "Latency of successful HTTP recalls in seconds, labeled by mode. Failed \
+             requests and MCP-stdio recalls are not observed.",
             vec![
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
             ],
@@ -2263,7 +2268,11 @@ pub fn render() -> String {
 }
 
 /// Convenience: record a store, labeled by tier.
-#[allow(dead_code)]
+///
+/// SCOPE (#3653): called once per `POST /api/v1/memories` request with its
+/// final outcome (both backends). MCP-stdio, CLI and bulk writes are not
+/// counted: a stdio or one-shot process exposes no `/metrics`, and bulk
+/// reports per-item outcomes. The HELP text states the same scope.
 pub fn record_store(tier: &str, ok: bool) {
     let result = if ok { "ok" } else { "err" };
     registry()

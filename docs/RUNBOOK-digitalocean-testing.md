@@ -209,7 +209,8 @@ done
 - `ai-memory stats --json` on each node shows identical
   `total` within 2% of each other after a 5-minute settle period.
 - Prometheus on each node:
-  `ai_memory_store_total{result="err"} / ai_memory_store_total` < 5%.
+  `ai_memory_store_total{result="err"} / ai_memory_store_total` < 5%
+  (HTTP `POST /api/v1/memories` outcomes only, #3653).
 
 ### Quorum-not-met probe
 

@@ -140,11 +140,11 @@ appear on `/api/v1/monitoring/metrics`.
 | `ai_memory_operator_dequarantined_total` | counter | — | Monotonic count of quarantined memories released by an OPERATOR through `ai-memory quarantine release` or `POST /api/v1/admin/quarantine/{id}/release` (#2402). The route-OUT twin of ai_memory_fed_quarantined_unattributed_total. Each increment also appends a `memory.dequarantined` signed-chain row naming the authenticated caller, in the same transaction as the state change. A no-op release (the id is not quarantined) does not increment. |
 | `ai_memory_query_embed_cache_hits_total` | counter | — | Monotonic counter of recall query embeddings served from the process-local bounded cache instead of a remote round trip (#2577). Zero under repeated traffic means the cache is disabled (AI_MEMORY_QUERY_EMBED_CACHE_ENTRIES=0) or every query is unique. |
 | `ai_memory_recall_embed_degraded_total` | counter | — | Monotonic counter of recalls that fell back to keyword/FTS because the query-embedding call failed or exceeded AI_MEMORY_RECALL_EMBED_BUDGET_MS (#2577). The results are honest (the response reports mode:keyword) but semantic ranking is OFF for those requests. Alert on a sustained increment rate: a few trips is a provider hiccup, a sustained rate means the budget is mis-sized for this deployment's embedding provider or the provider is unhealthy. Always zero on keyword-tier deployments. |
-| `ai_memory_recall_latency_seconds` | histogram | mode | Recall latency in seconds, labeled by mode. |
-| `ai_memory_recall_total` | counter | mode | Total memory_recall calls, labeled by mode. |
+| `ai_memory_recall_latency_seconds` | histogram | mode | Latency of successful HTTP recalls in seconds, labeled by mode. Failed requests and MCP-stdio recalls are not observed. |
+| `ai_memory_recall_total` | counter | mode | Successful HTTP recalls, labeled by mode. Failed requests and MCP-stdio recalls are not counted. |
 | `ai_memory_record_stop_gate_indeterminate_total` | counter | — | Monotonic counter of record-stop gate FAIL-CLOSED refusals: the audit chain could not be read, so the mutating write was refused rather than proceeding (#3877, vote 4d3ea1c5). Alert on a sustained rate: every gated write is being refused. |
 | `ai_memory_rerank_budget_degraded_total` | counter | — | Monotonic counter of autonomous-tier recalls whose cross-encoder rerank was SKIPPED because its estimated forward cost exceeded AI_MEMORY_RERANK_BUDGET_MS (#2608). The recall stays HYBRID (FTS/semantic-ranked, no neural re-ranking) and the configured score floor still applies — a DEGRADE, never a wrong result. Alert on a sustained increment rate: a few trips is a long-content tail, a sustained rate means the budget is mis-sized for this corpus. Always zero when the budget is disabled (=0) or on non-neural reranker deployments. |
-| `ai_memory_store_total` | counter | tier, result | Total memory_store calls, labeled by tier and result. |
+| `ai_memory_store_total` | counter | tier, result | HTTP POST /api/v1/memories requests, labeled by requested tier and final result (ok = 2xx, err = any other status). MCP-stdio, CLI and bulk writes are not counted. |
 | `ai_memory_subscription_dispatch_truncated_total` | counter | — | Monotonic counter of subscription-dispatch ticks whose subscriber scan hit SUBSCRIPTION_DISPATCH_LIMIT (1000) and was truncated. Non-zero means subscribers past the ceiling silently received NO event; the scan is ordered and cursor-less, so the same tail is cut on every write. Reduce the subscription population or split the deployment. |
 | `ai_memory_subscription_dlq_overflow_total` | counter | — | Monotonic counter of subscription_dlq inserts refused because the per-subscription DLQ depth had already hit MAX_SUBSCRIPTION_DLQ_ROWS (10_000). Non-zero indicates a hostile or persistently-broken webhook target that would otherwise fill the operator's disk with quarantined rows. Operators drain the queue via `ai-memory subscription dlq drain <subscription_id>` before resetting. |
 | `ai_memory_subscriptions_active` | gauge | — | Current count of active webhook subscriptions. |
@@ -221,8 +221,8 @@ A worked walk for "an agent says a memory it stored is gone":
 1. **Is the daemon alive and its store readable?** `curl` `/api/v1/health`.
    A 503 names the failed probe; stop and recover the store first.
 2. **Which process wrote it?** MCP stdio, CLI and HTTP writes all land in
-   the same store, but only HTTP writes move the daemon's
-   `ai_memory_store_total`. Check the agent's own logs for its write
+   the same store, but only HTTP single creates (`POST /api/v1/memories`)
+   move the daemon's `ai_memory_store_total` (#3653). Check the agent's own logs for its write
    receipt.
 3. **Was it refused?** Search the operational log for governance refusals
    and `signed_events` for `governance.check` rows naming the agent
