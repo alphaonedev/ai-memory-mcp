@@ -222,7 +222,7 @@ def approvals(repo: Path, base_sha: str, head_sha: str) -> list:
     git trailer block (the final paragraph, git interpret-trailers semantics) is read; a body line that starts
     with the key is prose, not an approval. #6396: each raw message is parsed by `trailer_block`, which loads no
     git configuration, so neither the host nor the repository can widen what counts as a trailer."""
-    out = git(repo, "log", "-z", "--format=%B", f"{base_sha}..{head_sha}")
+    out = git(repo, "log", "--format=%B", f"{base_sha}..{head_sha}")
     found = []
     for message in out.split(b"\0"):
         if message.strip():
@@ -1380,6 +1380,40 @@ def _self_test_cases() -> int:
         failures.append("approval range")
     else:
         print("PASS: self-test - a base-side commit after the fork carrying the trailer does not approve the head (#6403)")
+
+    def range_cell(name, work, base_root, repo, base_sha, head_sha, want_fail, needle):
+        """One base..head comparison on a fixture repo: the verdict and the report text must match."""
+        try:
+            report, failed = compare(base_root, repo, base_sha, head_sha, work / "scratch", guard.fixture_index_pins())
+        except RuntimeError as exc:
+            report, failed = f"RESULT: FAIL (closed) - {exc}", True
+        if failed != want_fail or needle not in report:
+            failures.append(name)
+            print(f"FAIL: self-test - {name}: failed={failed} (wanted {want_fail}), needle {needle!r}\n{report}",
+                  file=sys.stderr)
+        else:
+            print(f"PASS: self-test - {name}")
+
+    # #6434: every commit message is read on its own (git log -z). A subject line that is the approval key is never a
+    # trailer; read as one blob, the older commit's subject would become the last paragraph of the combined output
+    # and count as an approval for the newer commit that follows it.
+    work, fork_sha, base_root = fresh_pair("subjectkey")
+    repo = work / "repo"
+    reword(repo)
+    commit_all(repo, "Rule-Change-Approved-By: Justin")
+    (repo / "docs").mkdir(parents=True, exist_ok=True)
+    (repo / "docs" / "follow-up.md").write_text("x\n", encoding="utf-8")
+    head_sha = commit_all(repo, "plain follow-up")
+    range_cell("an older commit whose subject is the approval key does not approve the newer head (#6434)", work,
+               base_root, repo, fork_sha, head_sha, True, "no commit in the range carries")
+
+    work, fork_sha, base_root = fresh_pair("subjectkeynewest")
+    repo = work / "repo"
+    reword(repo)
+    commit_all(repo, "plain first commit")
+    head_sha = commit_all(repo, "Rule-Change-Approved-By: Justin")
+    range_cell("a newest commit whose subject is the approval key does not approve the head (#6434)", work, base_root,
+               repo, fork_sha, head_sha, True, "no commit in the range carries")
 
     # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
     # a backtick run, so a static fence there was never caught.
