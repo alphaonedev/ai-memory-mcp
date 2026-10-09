@@ -219,6 +219,36 @@ ALLOWED_REQUIRE = 'REQUIRE_FLAGS="$(bash scripts/release-features.sh --require-f
 # action or a restored cache could have rewritten either; `git diff --quiet`
 # exits 1 on any difference or deletion, which aborts the step under `set -e`).
 BIND_INPUTS = "git diff --quiet HEAD -- scripts/release-features.sh scripts/assert-compiled-features.sh"
+# #6275: the bound forms. Every interpreter is an absolute path and runs under
+# `env -i` with a fixed PATH, so neither a job-level environment value (a
+# startup file, a repository redirection, an exported function) nor a PATH
+# entry an earlier step added can change what runs. The bind compares the
+# CONTENT of each file (`git hash-object --no-filters`) with the blob the
+# verified preflight commit records, and HEAD with that commit: index flags
+# (assume-unchanged, skip-worktree) and an in-job commit cannot hide a rewrite.
+SANE_ENV = "/usr/bin/env -i PATH=/usr/bin:/bin"
+SANE_BASH = SANE_ENV + " /bin/bash --noprofile --norc"
+# The step shell: an absolute bash in POSIX mode, which reads no startup file.
+SANE_SHELL = "/bin/bash --posix --noprofile --norc -eo pipefail {0}"
+BIND_ENV: Dict[str, "Spec"] = {"PREFLIGHT_SHA": "${{ needs.preflight.outputs.sha }}"}
+
+
+def sane_bind(files: Tuple[str, ...]) -> str:
+    """The #6275 bind statement over ``files`` (fatal on any difference)."""
+    return (SANE_ENV + ' PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c \''
+            'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in ' + " ".join(files)
+            + '; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; '
+            'b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; '
+            'test -n "$a"; test "$a" = "$b"; done\'')
+
+
+SANE_BIND_INPUTS = sane_bind(("scripts/release-features.sh", "scripts/assert-compiled-features.sh"))
+SANE_REPRO_BIND = sane_bind(("scripts/release-features.sh", "scripts/release/reproducible_build.py"))
+SANE_FEATURES = 'FEATURES="$(' + SANE_BASH + ' scripts/release-features.sh)"'
+SANE_REQUIRE = 'REQUIRE_FLAGS="$(' + SANE_BASH + ' scripts/release-features.sh --require-flags)"'
+SANE_ASSERT = SANE_BASH + ' scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS'
+# The shell the bound units (build, assert, two-build proof) run under.
+BOUND_SHELL = "bash"
 ALLOWED_BIN = 'bin="target/${{ matrix.target }}/release/${{ matrix.artifact }}"'
 ASSERT_WORKFLOW = 'bash scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS'
 ASSERT_DOCKER = "bash scripts/assert-compiled-features.sh target/release/ai-memory --strict $REQUIRE_FLAGS"
@@ -1883,6 +1913,12 @@ DOCKER_RUN_HEAD = "RUN set -eu; \\\n"
 SHAPE_HDR = "      - name: Build release binary (exactly as release.yml)\n"
 SHAPE_LINE = IND + SHAPE_BUILD_CMD
 BIND_LINE = IND + BIND_INPUTS + "\n"
+# #6275 anchors (the cases above are no-ops until these land).
+SANE_BIND_LINE = IND + SANE_BIND_INPUTS + "\n"
+OLD_BIND_LINE = IND + "git diff --quiet HEAD -- scripts/release-features.sh scripts/assert-compiled-features.sh\n"
+OLD_ASSERT = 'bash scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS'
+SANE_SHELL_LINE = "        shell: " + SANE_SHELL + "\n"
+BIND_ENV_LINES = "        env:\n          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}\n"
 # #3613: the reproducible-build proof job and the deterministic inputs of the
 # release build (SOURCE_DATE_EPOCH, remapped paths).
 REPRO_SCRIPT = "scripts/release/reproducible_build.py"
@@ -1949,6 +1985,15 @@ def _job_key(job: str, line: str) -> Transform:
     """Add a job-level line right under ``job:`` when the job exists."""
     hdr = "\n  " + job + ":\n"
     return lambda text: text.replace(hdr, hdr + line, 1)
+
+
+def _in_assert_step(fn: Transform) -> Transform:
+    """Apply ``fn`` to the release job's strict-assert step only (#6275)."""
+    def go(text: str) -> str:
+        a = text.index(ASSERT_NAME)
+        b = text.index(PKG_HDR, a)
+        return text[:a] + fn(text[a:b]) + text[b:]
+    return go
 
 
 def _job_needs(job: str, new: str) -> Transform:
@@ -2312,6 +2357,42 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "4768 bind covers the declaration only": ("fail", [_rel(
         BUILD_HDR, _edit_all(BIND_LINE, IND + "git diff --quiet HEAD -- scripts/release-features.sh\n"))]),
     "4768 bind against another commit": ("fail", [_rel(BUILD_HDR, _edit_all(BIND_LINE, BIND_LINE.replace("HEAD", "HEAD~1")))]),
+    # --- #6275: the bind compares content with the verified commit, in a
+    # sanitized absolute-path shell; the declaration and the asserter are read
+    # and run the same way, and the units' own shell reads no startup file
+    "6275 bind compares the index (git diff HEAD)": ("fail", [_rel(BUILD_HDR, _edit_all(SANE_BIND_LINE, OLD_BIND_LINE))]),
+    "6275 bind runs git from PATH": ("fail", [_rel(BUILD_HDR, _edit_all(
+        SANE_BIND_LINE, SANE_BIND_LINE.replace("/usr/bin/git hash-object", "git hash-object")))]),
+    "6275 bind not under env -i": ("fail", [_rel(BUILD_HDR, _edit_all(
+        SANE_BIND_LINE, SANE_BIND_LINE.replace(SANE_ENV + " ", "")))]),
+    "6275 bind compares HEAD's blobs": ("fail", [_rel(BUILD_HDR, _edit_all(
+        SANE_BIND_LINE, SANE_BIND_LINE.replace('"$PREFLIGHT_SHA:$f"', '"HEAD:$f"')))]),
+    "6275 bind skips the HEAD check": ("fail", [_rel(BUILD_HDR, _edit_all(
+        SANE_BIND_LINE, SANE_BIND_LINE.replace('test "$h" = "$PREFLIGHT_SHA"; ', "")))]),
+    "6275 bind reads filtered content": ("fail", [_rel(BUILD_HDR, _edit_all(
+        SANE_BIND_LINE, SANE_BIND_LINE.replace(" --no-filters", "")))]),
+    "6275 bind honours replace refs": ("fail", [_rel(BUILD_HDR, _edit_all(
+        SANE_BIND_LINE, SANE_BIND_LINE.replace(" --no-replace-objects", "")))]),
+    "6275 bind made non-fatal": ("fail", [_rel(BUILD_HDR, _edit_all(SANE_BIND_LINE, SANE_BIND_LINE[:-1] + " || true\n"))]),
+    "6275 asserter run by PATH bash": ("fail", [_rel(BUILD_HDR, _edit_all(IND + SANE_ASSERT, IND + OLD_ASSERT))]),
+    "6275 declaration read by PATH bash in the build": ("fail", [_rel(BUILD_HDR, _in_build_step(
+        _edit_all(IND + SANE_FEATURES + "\n", IND + ALLOWED_FEATURES + "\n")))]),
+    "6275 require flags read by PATH bash": ("fail", [_rel(BUILD_HDR, _edit_all(IND + SANE_REQUIRE, IND + ALLOWED_REQUIRE))]),
+    "6275 build step without PREFLIGHT_SHA": ("fail", [_rel(BUILD_HDR, _in_build_step(_edit_all(BIND_ENV_LINES, "")))]),
+    "6275 assert step without PREFLIGHT_SHA": ("fail", [_rel(BUILD_HDR, _in_assert_step(_edit_all(BIND_ENV_LINES, "")))]),
+    "6275 PREFLIGHT_SHA from the triggering ref": ("fail", [_rel(BUILD_HDR, _in_build_step(_edit_all(
+        BIND_ENV_LINES, BIND_ENV_LINES.replace("needs.preflight.outputs.sha", "github.sha"))))]),
+    "6275 build step shell is PATH bash": ("fail", [_rel(BUILD_HDR, _in_build_step(_edit_all(SANE_SHELL_LINE, "        shell: bash\n")))]),
+    "6275 assert step shell is PATH bash": ("fail", [_rel(BUILD_HDR, _in_assert_step(_edit_all(SANE_SHELL_LINE, "        shell: bash\n")))]),
+    "6275 step shell reads startup files": ("fail", [_rel(BUILD_HDR, _in_build_step(_edit_all(
+        SANE_SHELL_LINE, SANE_SHELL_LINE.replace("--posix ", ""))))]),
+    "6275 proof bind compares the index": ("fail", [_rel(BUILD_HDR, _edit_all(
+        IND + SANE_REPRO_BIND + "\n", IND + "git diff --quiet HEAD -- scripts/release-features.sh scripts/release/reproducible_build.py\n"))]),
+    "6275 proof step shell is PATH bash": ("fail", [_rel(BUILD_HDR, _edit_all(
+        PROOF_STEP_NAME + "        id: proof\n" + SANE_SHELL_LINE, PROOF_STEP_NAME + "        id: proof\n        shell: bash\n"))]),
+    "6275 proof step without PREFLIGHT_SHA": ("fail", [_rel(BUILD_HDR, _edit_all(
+        SANE_SHELL_LINE + BIND_ENV_LINES + "        run: |\n          set -euo pipefail\n          # #4768 / #6275 — the declaration and the proof",
+        SANE_SHELL_LINE + "        run: |\n          set -euo pipefail\n          # #4768 / #6275 — the declaration and the proof"))]),
     "4768 Dockerfile a RUN between the asserter COPY and the declaration COPY": ("fail", [_docker(
         DOCKER_DECL_COPY + "\n", "RUN sed -i s/exit/true/ scripts/assert-compiled-features.sh\n" + DOCKER_DECL_COPY + "\n")]),
     "4768 Dockerfile asserter COPY missing": ("fail", [_docker(DOCKER_ASSERTER_COPY + "\n", "")]),
@@ -2971,6 +3052,9 @@ def unit_checks() -> int:
     if bk_instructions(list(DOCKER_RUN_LINES)) != [(1, len(DOCKER_RUN_LINES), DOCKER_RUN)]:
         print("self-test FAIL: DOCKER_RUN_LINES does not join to DOCKER_RUN", file=sys.stderr)
         failures += 1
+    if "OUT OF SCOPE" in (__doc__ or ""):
+        print("self-test FAIL: the module docstring still records an unbound gap (#6275)", file=sys.stderr)
+        failures += 1
     for doc, key, want in SCALARS:
         rep = Report()
         node = parse_yaml(doc, "scalar", rep)
@@ -2981,6 +3065,86 @@ def unit_checks() -> int:
         if got != want:
             print(f"self-test FAIL: scalar {doc!r} decoded {got!r}, wanted {want!r}", file=sys.stderr)
             failures += 1
+    return failures
+
+
+def shell_argv(spec: str) -> List[str]:
+    """argv GitHub runs a step body with: ``bash`` is its built-in
+    ``bash --noprofile --norc -eo pipefail {0}``; anything else is the
+    custom template with ``{0}`` dropped (the body is passed with ``-c``)."""
+    if spec == "bash":
+        return ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c"]
+    return [w for w in spec.split() if w != "{0}"] + ["-c"]
+
+
+TAMPER_FORMS = ("plain rewrite", "assume-unchanged", "skip-worktree", "in-job commit", "git shim on PATH",
+                "startup file in the job env", "exported git function", "repository redirection")
+
+
+def bound_runtime(root: Path, base: Path, payload: bytes, build: str, assert_body: str) -> int:
+    """#4768 / #6275: run the bound units against every tamper form."""
+    failures = 0
+    git = ["git", "-c", "user.name=self-test", "-c", "user.email=self-test@localhost", "-c", "commit.gpgsign=false"]
+
+    def fresh(name: str) -> Tuple[Path, str]:
+        repo = base / name
+        shutil.rmtree(repo, ignore_errors=True)
+        (repo / "scripts").mkdir(parents=True)
+        for rel in (DECL, ASSERTER):
+            shutil.copy2(root / rel, repo / rel)
+        for cmd in (["init", "-q"], ["add", DECL, ASSERTER], ["commit", "-q", "-m", "pin the inputs"]):
+            subprocess.run(git + cmd, cwd=repo, capture_output=True, check=True)
+        (repo / "target" / "x" / "release").mkdir(parents=True)
+        (repo / "target" / "x" / "release" / "ai-memory").write_bytes(payload)
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+        return repo, sha
+
+    def run(repo: Path, body: str, env: Dict[str, str]) -> int:
+        return subprocess.run(shell_argv(BOUND_SHELL) + [body], cwd=repo, env=env, capture_output=True).returncode
+
+    def tamper(form: str, repo: Path, rel: str, env: Dict[str, str]) -> Dict[str, str]:
+        with open(repo / rel, "a", encoding="utf-8") as fh:
+            fh.write("exit 0 # rewritten after checkout\n")
+        if form in ("assume-unchanged", "skip-worktree"):
+            subprocess.run(["git", "update-index", "--" + form, rel], cwd=repo, capture_output=True, check=True)
+        elif form == "in-job commit":
+            subprocess.run(git + ["commit", "-q", "-am", "narrow"], cwd=repo, capture_output=True, check=True)
+        elif form == "git shim on PATH":
+            shim = repo / "shim"
+            shim.mkdir()
+            (shim / "git").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (shim / "git").chmod(0o755)
+            return dict(env, PATH=f"{shim}:{env.get('PATH', '')}")
+        elif form == "startup file in the job env":
+            (repo / "startup.sh").write_text("git() { return 0; }\n", encoding="utf-8")
+            return dict(env, BASH_ENV=str(repo / "startup.sh"))
+        elif form == "exported git function":
+            return dict(env, **{"BASH_FUNC_git%%": "() { return 0; }"})
+        elif form == "repository redirection":
+            decoy = repo / "decoy"
+            (decoy / "scripts").mkdir(parents=True)
+            for r in (DECL, ASSERTER):
+                shutil.copy2(repo / r, decoy / r)
+            for cmd in (["init", "-q"], ["add", DECL, ASSERTER], ["commit", "-q", "-m", "decoy"]):
+                subprocess.run(git + cmd, cwd=decoy, capture_output=True, check=True)
+            return dict(env, GIT_DIR=str(decoy / ".git"), GIT_WORK_TREE=str(repo))
+        return env
+
+    for label, body in (("build unit", build), ("assert unit", assert_body)):
+        repo, sha = fresh("control")
+        env = dict(os.environ, GITHUB_OUTPUT=str(repo / "output.txt"), PREFLIGHT_SHA=sha)
+        if run(repo, body, env) != 0:
+            print(f"self-test FAIL: the {label} does not pass with the verified declaration and asserter", file=sys.stderr)
+            failures += 1
+        for form in TAMPER_FORMS:
+            for rel in (DECL, ASSERTER):
+                repo, sha = fresh("tamper")
+                env = dict(os.environ, GITHUB_OUTPUT=str(repo / "output.txt"), PREFLIGHT_SHA=sha)
+                env = tamper(form, repo, rel, env)
+                if run(repo, body, env) == 0:
+                    print(f"self-test FAIL: the {label} PASSED with {rel} rewritten after checkout ({form}, #4768/#6275): "
+                          "fail-open", file=sys.stderr)
+                    failures += 1
     return failures
 
 
@@ -3079,39 +3243,17 @@ def self_test(root: Path) -> int:
                       f"({repro!r:.14}): fail-open (#6274)", file=sys.stderr)
                 failures += 1
 
-        # --- #4768 runtime: in a checkout whose declaration and asserter are the
-        # committed ones the build and assert units pass; once either file is
-        # rewritten after checkout (an earlier step, an action, a restored cache)
-        # both units must refuse to read it.
-        bound = tmp / "bound"
-        shutil.rmtree(bound, ignore_errors=True)
-        (bound / "scripts").mkdir(parents=True)
-        for rel in (DECL, ASSERTER):
-            shutil.copy2(root / rel, bound / rel)
-        git = ["git", "-c", "user.name=self-test", "-c", "user.email=self-test@localhost", "-c", "commit.gpgsign=false"]
-        for cmd in (["init", "-q"], ["add", DECL, ASSERTER], ["commit", "-q", "-m", "pin the inputs"]):
-            subprocess.run(git + cmd, cwd=bound, capture_output=True, check=True)
-        (bound / "target" / "x" / "release").mkdir(parents=True)
-        (bound / "target" / "x" / "release" / "ai-memory").write_bytes(payload)
-        bound_env = dict(os.environ, GITHUB_OUTPUT=str(bound / "output.txt"))
+        # --- #4768 / #6275 runtime: in a checkout whose declaration and asserter
+        # are the verified commit's, the build and assert units pass under the
+        # pinned step shell; after any tamper form an earlier step could apply
+        # (a plain rewrite, an index flag that hides it, an in-job commit, a git
+        # shim on PATH, a startup file or an exported function in the job
+        # environment, a repository redirection) both units must refuse.
         bound_build = "\n".join(WF_BUILD).replace("${{ matrix.target }}", "x").replace("cargo build", "echo cargo-build")
         bound_assert = ("\n".join(WF_ASSERT).replace("${{ matrix.target }}", "x").replace("${{ matrix.artifact }}", "ai-memory")
+                        .replace(SANE_BASH + " scripts/assert-compiled-features.sh", "echo assert")
                         .replace("bash scripts/assert-compiled-features.sh", "echo assert"))
-
-        def run_bound(body: str) -> int:
-            return subprocess.run(["bash", "-c", "set -e; " + body], cwd=bound, env=bound_env, capture_output=True).returncode
-
-        for label, body in (("build unit", bound_build), ("assert unit", bound_assert)):
-            if run_bound(body) != 0:
-                print(f"self-test FAIL: the {label} does not pass with the committed declaration and asserter", file=sys.stderr)
-                failures += 1
-            for rel in (DECL, ASSERTER):
-                with open(bound / rel, "a", encoding="utf-8") as fh:
-                    fh.write("# rewritten after checkout\n")
-                if run_bound(body) == 0:
-                    print(f"self-test FAIL: the {label} PASSED with {rel} rewritten after checkout (#4768): fail-open", file=sys.stderr)
-                    failures += 1
-                subprocess.run(git + ["checkout", "--", rel], cwd=bound, capture_output=True, check=True)
+        failures += bound_runtime(root, tmp / "bound", payload, bound_build, bound_assert)
 
         # --- #3613: the two-build proof script proves itself (two identical
         # builds pass; a perturbed SOURCE_DATE_EPOCH and an unremapped workspace
