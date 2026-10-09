@@ -676,6 +676,9 @@ mod tests {
 
     #[test]
     fn namespace_no_header_no_bypass_denies() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // Make sure no test contamination from env vars.
         // SAFETY: the value cleared belongs to this test only;
         // serial-by-default cargo test isolation is sufficient.
@@ -702,6 +705,9 @@ mod tests {
 
     #[test]
     fn namespace_no_scope_row_denies_without_bypass() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         unsafe { std::env::remove_var(SYNC_TRUST_PEER_ENV) };
         let cfg = PeerAttestationConfig::default();
         assert!(!namespace_allowed(Some("peer-1"), "any", &cfg));
@@ -719,12 +725,10 @@ mod tests {
     // concurrent `from_env_parses_valid_json` and failed
     // `cfg.peers.is_empty()`. Same idiom as the rules-store guard.
 
-    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        // #6123: the crate's ONE process-env mutex, not a module-local one, so
+        // these writes also serialise against every other env-mutating lib test.
+        crate::config::test_env_lock()
     }
 
     #[test]

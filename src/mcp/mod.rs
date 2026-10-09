@@ -15033,6 +15033,10 @@ mod tests {
     /// The walk must register the matching parent.
     #[test]
     fn chunkc_auto_register_path_hierarchy_finds_ancestor_parent() {
+        // #6123: the function under test reads the process cwd; hold the
+        // crate's ONE process-env mutex so no concurrent test's
+        // `set_current_dir` moves it between this test's read and the call.
+        let _env_guard = crate::config::test_env_lock();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         // Confirm cwd is under /Users/fate/v07/... so "v07" is on the
         // walk path. The test reads `std::env::current_dir()` so

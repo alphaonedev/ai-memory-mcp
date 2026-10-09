@@ -148,8 +148,9 @@ mod tests {
 
     // Env-var tests are process-global; serialize them.
     fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        // #6123: the crate's ONE process-env mutex, not a module-local one, so
+        // these writes also serialise against every other env-mutating lib test.
+        crate::config::test_env_mutex()
     }
 
     #[test]

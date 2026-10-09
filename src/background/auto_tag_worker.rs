@@ -394,6 +394,9 @@ mod tests {
 
     #[test]
     fn resolve_queue_capacity_default_when_unset() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // SAFETY: test-local env mutation, no concurrent reader of this
         // specific var within the process (mirrors the house pattern used
         // throughout src/*.rs env-resolver tests).
@@ -403,6 +406,9 @@ mod tests {
 
     #[test]
     fn resolve_queue_capacity_honours_explicit_positive_value() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         unsafe { std::env::set_var(ENV_AUTOTAG_QUEUE_CAPACITY, "17") };
         assert_eq!(resolve_queue_capacity(), 17);
         unsafe { std::env::remove_var(ENV_AUTOTAG_QUEUE_CAPACITY) };
@@ -410,6 +416,9 @@ mod tests {
 
     #[test]
     fn resolve_queue_capacity_falls_through_on_zero() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         unsafe { std::env::set_var(ENV_AUTOTAG_QUEUE_CAPACITY, "0") };
         assert_eq!(resolve_queue_capacity(), AUTOTAG_QUEUE_CAPACITY_DEFAULT);
         unsafe { std::env::remove_var(ENV_AUTOTAG_QUEUE_CAPACITY) };
@@ -417,6 +426,9 @@ mod tests {
 
     #[test]
     fn resolve_queue_capacity_falls_through_on_garbage() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         unsafe { std::env::set_var(ENV_AUTOTAG_QUEUE_CAPACITY, "not-a-number") };
         assert_eq!(resolve_queue_capacity(), AUTOTAG_QUEUE_CAPACITY_DEFAULT);
         unsafe { std::env::remove_var(ENV_AUTOTAG_QUEUE_CAPACITY) };

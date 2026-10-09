@@ -363,8 +363,9 @@ mod tests {
 
     /// In-tree scratch root honoring the project no-`/tmp` HARD RULE.
     fn local_runs_dir() -> std::path::PathBuf {
-        let root = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
+        // #6123: the crate root, not the process cwd (another test may
+        // `set_current_dir` into a tempdir it then deletes).
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".local-runs")
             .join("transcript-paths-unit-test");
         std::fs::create_dir_all(&root).ok();

@@ -5675,13 +5675,21 @@ mod tests {
     /// clearing the vars while we hold it) makes the SQLite report
     /// independent of test ordering.
     fn run_local_collect(db_path: &Path) -> Report {
-        let _guard = crate::store_url::store_url_env_lock()
+        let guard = crate::store_url::store_url_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: `store_url_env_lock` is the process-global mutex EVERY
-        // reader/mutator of these two variables takes, and it is held for
-        // the whole of `run_local` below, so no concurrent thread observes
-        // or races the mutation.
+        run_local_collect_holding(db_path, &guard)
+    }
+
+    /// #6123 — [`run_local_collect`] for a caller that ALREADY holds the
+    /// crate's process-env mutex (`store_url_env_lock` now IS that mutex, so
+    /// re-taking it here would self-deadlock). The `_held` borrow is the
+    /// proof the caller holds it.
+    fn run_local_collect_holding(db_path: &Path, _held: &std::sync::MutexGuard<'_, ()>) -> Report {
+        // SAFETY: the caller holds the process-env mutex EVERY reader/mutator
+        // of these two variables takes (`_held`), for the whole of
+        // `run_local` below, so no concurrent thread observes or races the
+        // mutation.
         unsafe {
             std::env::remove_var(crate::store_url::STORE_URL_ENV);
             std::env::remove_var(crate::store_url::STORE_URL_FILE_ENV);
@@ -6049,12 +6057,12 @@ mod tests {
         ) {
             return;
         }
-        let _lock = crate::test_support::env_lock();
+        let lock = crate::test_support::env_lock();
         let guard = crate::test_support::EnvGuard::capture(crate::encryption::ENV_ENCRYPT_AT_REST);
         guard.set("1");
         crate::encryption::set_config_at_rest(false);
         let env = TestEnv::fresh();
-        let report = run_local_collect(&env.db_path);
+        let report = run_local_collect_holding(&env.db_path, &lock);
         let storage = find(&report, "Storage");
         assert_eq!(
             fact(storage, "at_rest"),
@@ -8311,8 +8319,9 @@ enabled = true
     /// reports the reembed-pending / unverified counts.
     #[test]
     fn embedding_space_census_warns_on_heterogeneous_corpus_2167() {
-        let dir = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        // #6123: the crate root, not the process cwd (another test may
+        // `set_current_dir` into a tempdir it then deletes).
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".local-runs")
             .join("doctor-census-2167");
         std::fs::create_dir_all(&dir).ok();
@@ -8764,8 +8773,9 @@ enabled = true
     // ---------------------------------------------------------------
 
     fn reach_env_lock() -> &'static std::sync::Mutex<()> {
-        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        L.get_or_init(|| std::sync::Mutex::new(()))
+        // #6123: the crate's ONE process-env mutex, not a module-local one, so
+        // these writes also serialise against every other env-mutating lib test.
+        crate::config::test_env_mutex()
     }
 
     /// RAII env setter scoped to a test; restores prior values on drop.
@@ -8865,10 +8875,12 @@ enabled = true
                 .mount(&server)
                 .await;
             let resolved = {
-                // Hold both existing test locks only while resolving, never
+                // Hold the process-env test lock only while resolving, never
                 // across await. Restore the fixture key before network I/O.
+                // #6123: `reach_env_lock()` is now this same process-env
+                // mutex, so the one guard covers both (re-taking it would
+                // self-deadlock).
                 let _config = crate::config::test_env_lock();
-                let _reach = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
                 let _scope = EnvScope::set(&[
                     ("AI_MEMORY_LLM_API_KEY", "fixture-key-3860"),
                     ("AI_MEMORY_LLM_BASE_URL", ""),

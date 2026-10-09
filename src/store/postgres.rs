@@ -38706,6 +38706,10 @@ mod tests {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
+        // #6123: this test toggles `AI_MEMORY_CONFIDENCE_DECAY`; serialise it
+        // on the crate's ONE process-env mutex (taken after the skip so a
+        // skipped run never contends for it).
+        let _env_guard = crate::config::test_env_lock();
         let store = PostgresStore::connect(&url).await.expect("connect");
         let ctx = CallerContext::for_agent("ai:sal-test");
         let unique = uuid::Uuid::new_v4();

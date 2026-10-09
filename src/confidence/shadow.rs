@@ -697,6 +697,9 @@ mod tests {
 
     #[test]
     fn shadow_config_from_env_reads_both_vars() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // Direct unit test of the env-reading helper. Independent of
         // the OnceLock cache.
         unsafe { std::env::remove_var(ENV_SHADOW) };

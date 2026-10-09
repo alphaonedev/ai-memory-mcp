@@ -1200,11 +1200,9 @@ mod tests {
     /// every test that calls [`run`] takes this guard. Cheap (one
     /// `Mutex` lock) and bullet-proof.
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        // #6123: the crate's ONE process-env mutex, not a module-local one, so
+        // these writes also serialise against every other env-mutating lib test.
+        crate::config::test_env_lock()
     }
 
     #[test]
@@ -1756,8 +1754,10 @@ mod tests {
     /// operator's "why won't my downgraded node start?" answer alive.
     #[test]
     fn boot_warns_on_schema_above_max() {
-        let _g = test_lock();
-        let _guard_env = crate::storage::schema_guard::test_env_lock();
+        // #6123: `test_lock()` IS the process-env mutex that
+        // `schema_guard::test_env_lock()` takes, so this one guard serialises
+        // the hatch env too (re-taking it would self-deadlock).
+        let _guard_env = test_lock();
         // SAFETY: process-wide env mutation, serialised by `_guard_env`.
         unsafe {
             std::env::remove_var(crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD);
@@ -1800,8 +1800,10 @@ mod tests {
     /// pass by matching `status=warn` alone (`WarnDbUnavailable` is also warn).
     #[test]
     fn boot_warns_on_schema_stamp_invalid() {
-        let _g = test_lock();
-        let _guard_env = crate::storage::schema_guard::test_env_lock();
+        // #6123: `test_lock()` IS the process-env mutex that
+        // `schema_guard::test_env_lock()` takes, so this one guard serialises
+        // the hatch env too (re-taking it would self-deadlock).
+        let _guard_env = test_lock();
         // SAFETY: process-wide env mutation, serialised by `_guard_env`.
         unsafe {
             std::env::remove_var(crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD);
@@ -1850,8 +1852,10 @@ mod tests {
     /// names the repair verb, never "consider upgrading" (no binary wrote it).
     #[test]
     fn boot_warns_on_schema_version_poisoned_2555() {
-        let _g = test_lock();
-        let _guard_env = crate::storage::schema_guard::test_env_lock();
+        // #6123: `test_lock()` IS the process-env mutex that
+        // `schema_guard::test_env_lock()` takes, so this one guard serialises
+        // the hatch env too (re-taking it would self-deadlock).
+        let _guard_env = test_lock();
         // SAFETY: process-wide env mutation, serialised by `_guard_env`.
         unsafe {
             std::env::remove_var(crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD);
@@ -1900,8 +1904,10 @@ mod tests {
 
     #[test]
     fn boot_json_schema_stamp_invalid_does_not_recommend_upgrade() {
-        let _g = test_lock();
-        let _guard_env = crate::storage::schema_guard::test_env_lock();
+        // #6123: `test_lock()` IS the process-env mutex that
+        // `schema_guard::test_env_lock()` takes, so this one guard serialises
+        // the hatch env too (re-taking it would self-deadlock).
+        let _guard_env = test_lock();
         // SAFETY: process-wide env mutation, serialised by `_guard_env`.
         unsafe {
             std::env::remove_var(crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD);
@@ -2058,8 +2064,10 @@ mod tests {
     #[test]
     fn boot_json_includes_schema_supported_flag() {
         // Happy path — schema in range → schema_supported = true.
-        let _g = test_lock();
-        let _guard_env = crate::storage::schema_guard::test_env_lock();
+        // #6123: `test_lock()` IS the process-env mutex that
+        // `schema_guard::test_env_lock()` takes, so this one guard serialises
+        // the hatch env too (re-taking it would self-deadlock).
+        let _guard_env = test_lock();
         // SAFETY: process-wide env mutation, serialised by `_guard_env`.
         unsafe {
             std::env::remove_var(crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD);

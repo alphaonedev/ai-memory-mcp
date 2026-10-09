@@ -1056,10 +1056,9 @@ mod handler_tests {
 
     /// Serialize the allowlist-env mutations across these tests.
     fn allowlist_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        // #6123: the crate's ONE process-env mutex, not a module-local one, so
+        // these writes also serialise against every other env-mutating lib test.
+        crate::config::test_env_lock()
     }
 
     struct AllowlistGuard {

@@ -2710,9 +2710,9 @@ mod tests {
 
     /// Serialise env-var mutation across snippet tests.
     fn snippet_env_lock() -> &'static std::sync::Mutex<()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        // #6123: the crate's ONE process-env mutex, not a module-local one, so
+        // these writes also serialise against every other env-mutating lib test.
+        crate::config::test_env_mutex()
     }
 
     /// Run the snippet emit path for `target` against an isolated
@@ -3343,9 +3343,9 @@ mod tests {
         // Drives the success branch of `which_ai_memory` (line 614).
         // We construct a tempdir, drop a synthetic "ai-memory" binary
         // inside, then temporarily set $PATH to point at it.
-        use std::sync::Mutex;
-        static PATH_LOCK: Mutex<()> = Mutex::new(());
-        let _g = PATH_LOCK.lock().unwrap();
+        // #6123: `PATH` is process-global; serialise on the crate's ONE
+        // process-env mutex, not a test-local one.
+        let _g = crate::config::test_env_lock();
 
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("ai-memory");

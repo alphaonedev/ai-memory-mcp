@@ -1114,16 +1114,28 @@ mod tests {
         assert!(dst_links.is_empty());
     }
 
-    #[tokio::test]
-    async fn open_store_sqlite_with_three_slashes() {
+    #[test]
+    fn open_store_sqlite_with_three_slashes() {
         // sqlite:///path → absolute path (already covered).
         // sqlite://./relative → relative; we cover the `else` branch in
         // open_store's path-strip closure (line 106).
         // Use a relative path under a CWD-private tempdir so it cleans up.
+        //
+        // #6123: the working directory is process-global. Unserialised, this
+        // `set_current_dir` let a concurrent lib test resolve its scratch
+        // root inside `tmp`, which is deleted when this test ends. Hold the
+        // crate's ONE process-env mutex across the cwd window, and drive the
+        // future with `block_on` so the std guard is never held across an
+        // `.await`.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = crate::config::test_env_lock();
         let cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
-        let result = open_store("sqlite://./relative.db").await;
+        let result = rt.block_on(open_store("sqlite://./relative.db"));
         let _ = std::env::set_current_dir(cwd);
         assert!(result.is_ok());
     }

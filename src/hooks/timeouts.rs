@@ -489,11 +489,9 @@ mod tests {
     // behind a Mutex so they don't race each other under parallel
     // cargo-test load.
     fn timing_mult_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        // #6123: the crate's ONE process-env mutex, not a module-local one, so
+        // these writes also serialise against every other env-mutating lib test.
+        crate::config::test_env_lock()
     }
 
     fn with_mult<R>(value: Option<&str>, body: impl FnOnce() -> R) -> R {

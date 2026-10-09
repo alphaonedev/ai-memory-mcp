@@ -2392,8 +2392,9 @@ mod tests {
     /// decorator tests, so toggling `AI_MEMORY_CONFIDENCE_DECAY` in one
     /// test never races another test in this binary reading the flag.
     fn decay_env_lock() -> &'static std::sync::Mutex<()> {
-        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        M.get_or_init(|| std::sync::Mutex::new(()))
+        // #6123: the crate's ONE process-env mutex, not a module-local one, so
+        // these writes also serialise against every other env-mutating lib test.
+        crate::config::test_env_mutex()
     }
 
     // PURE-function unit tests — no env, no DB, fully deterministic.

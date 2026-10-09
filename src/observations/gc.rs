@@ -126,6 +126,9 @@ mod tests {
 
     #[test]
     fn ttl_days_falls_back_when_env_unset() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // SAFETY: single-threaded test; no concurrent env access.
         unsafe {
             std::env::remove_var(TTL_ENV_VAR);

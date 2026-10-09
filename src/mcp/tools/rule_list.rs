@@ -360,16 +360,13 @@ mod tests {
 
         // Lock the process-wide env state for the duration of the
         // test so a sibling test can't race the env var.
-        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let _g = ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // #6123: the crate's ONE process-env mutex, not a test-local one.
+        let _g = crate::config::test_env_lock();
 
         let signing = SigningKey::from_bytes(&[42u8; 32]);
         let pubkey_b64 =
             base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes());
-        // SAFETY: serialised via ENV_LOCK above.
+        // SAFETY: serialised via test_env_lock above.
         unsafe { std::env::set_var("AI_MEMORY_OPERATOR_PUBKEY", &pubkey_b64) };
 
         let conn = fresh_conn();
@@ -377,7 +374,7 @@ mod tests {
         let r = handle_rule_list(&conn, &json!({"enabled_only": true})).unwrap();
         let count = r["count"].as_i64().unwrap();
 
-        // SAFETY: serialised via ENV_LOCK above.
+        // SAFETY: serialised via test_env_lock above.
         unsafe { std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY") };
 
         assert_eq!(

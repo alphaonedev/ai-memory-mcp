@@ -94,11 +94,9 @@ pub(crate) const UNSUPPORTED_ON_POSTGRES_FIELD: &str = "unsupported_on_postgres"
 /// a single serialisation point, not two independent locks.
 #[cfg(test)]
 pub(crate) fn fed_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    // #6123: the crate's ONE process-env mutex, not a module-local one, so
+    // these writes also serialise against every other env-mutating lib test.
+    crate::config::test_env_lock()
 }
 
 pub mod accept_provenance;

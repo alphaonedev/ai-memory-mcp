@@ -327,9 +327,9 @@ mod tests {
     /// can observe DEFAULT (256) when `default_when_unset` races it
     /// (ubuntu-latest sqlite, #3136).
     fn atomise_capacity_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        // #6123: the crate's ONE process-env mutex, not a module-local one, so
+        // these writes also serialise against every other env-mutating lib test.
+        crate::config::test_env_lock()
     }
 
     #[test]
