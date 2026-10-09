@@ -1365,6 +1365,22 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     if check_change(repo, "0" * 40, base)[0]:
         t.fail("(n): unresolvable base SHA did not fail closed")
 
+    # (utf8, #6163) a stream that refuses the UTF-8 reconfigure is reported, not
+    #     swallowed by an empty except; a stream without reconfigure() is skipped.
+    reconfigure = globals().get("reconfigure_utf8")
+    if reconfigure is None:
+        t.fail("(utf8): reconfigure_utf8 is not defined (a refused UTF-8 reconfigure is swallowed)")
+    else:
+        class Refuses:
+            name = "<planted>"
+
+            def reconfigure(self, **_kwargs):
+                raise ValueError("planted refusal")
+
+        notes = reconfigure((io.StringIO(), Refuses()))
+        if len(notes) != 1 or "planted refusal" not in notes[0] or "<planted>" not in notes[0]:
+            t.fail(f"(utf8): a refused reconfigure was not reported once: {notes!r}")
+
     # (o) GREEN - this PR itself (scripts / workflow / allowlist / CHANGELOG
     #     only; must not trip the gate). Runs against the REAL worktree so a
     #     future edit that accidentally touches the watched surface turns the
