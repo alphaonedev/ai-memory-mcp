@@ -8,6 +8,13 @@ Documentation=https://github.com/alphaonedev/ai-memory-mcp
 # AI_MEMORY_OLLAMA_URL if it lives elsewhere.
 After=ai-memory.service
 Wants=ai-memory.service
+# #4326 — the curator opens the live database through the migrating opener.
+# After an in-place binary replacement the primary keeps running the old
+# binary; a companion that restarted on its own would run the NEW migration
+# ladder under the OLDER daemon (the #2445 schema-ahead state). PartOf=
+# propagates a stop/restart of the primary here, so `systemctl restart
+# ai-memory.service` is the one upgrade step (see README "Upgrading").
+PartOf=ai-memory.service
 
 [Service]
 Type=simple
