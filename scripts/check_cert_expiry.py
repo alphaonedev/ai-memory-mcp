@@ -269,8 +269,13 @@ def changed_paths(repo, frm, to):
 
 
 def extract_fed_ids(repo, tree):
-    """Unique AI_MEMORY_FED_* identifiers in src/ at TREE (set of str)."""
-    proc = run_git(repo, "grep", "-h", "-I", "-E", FED_ID_PATTERN, tree, "--", "src")
+    """Unique AI_MEMORY_FED_* identifiers in src/ at TREE (set of str).
+
+    -a, never -I (#6174): for a tree argument git takes binary-ness from the
+    WORKING-TREE attributes, which on pull_request belong to the change under
+    test, so -I let that change hide src/ from the scan. A match in a real
+    binary blob can only widen the drift, which fails closed."""
+    proc = run_git(repo, "grep", "-h", "-a", "-E", FED_ID_PATTERN, tree, "--", "src")
     if proc.returncode == 1:  # no match
         return set()
     if proc.returncode != 0:
@@ -1650,6 +1655,8 @@ SELF_TEST_OK = (
     "(shim-probe-half, #6448) a git that exits 0 without the marker and a git that prints "
     "the marker but exits 1 are each refused; "
     "(shim-pathsep-clean, #6428) a refused separator path leaves no shim directory; "
+    "(attr, attr-gate, #6174) an identifier add hidden behind head-supplied attributes "
+    "marking src/** binary RED in check_change and end to end on pull_request; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
