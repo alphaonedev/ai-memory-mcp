@@ -513,13 +513,17 @@ def binary_traits(depinfo_path, repo_root, kind):
 
 def test_target_roots(repo_root):
     """Cargo's integration-test roots, independent of what a build compiled
-    (r2 M1): tests/*.rs, tests/*/main.rs and each ``[[test]] path`` of Cargo.toml."""
+    (r2 M1): tests/*.rs and tests/*/main.rs unless ``[package]`` sets
+    ``autotests = false``, plus each ``[[test]] path`` of Cargo.toml. Missing a
+    root keeps its files in every key, the safe direction."""
     root = Path(repo_root)
-    found = set(root.glob('tests/*.rs')) | set(root.glob('tests/*/main.rs'))
     try:
         manifest = (root / 'Cargo.toml').read_text(errors='replace')
     except OSError:
         manifest = ''
+    package = re.split(r'(?m)^\s*\[', '\n' + manifest)
+    auto = not any(b.startswith('package]') and re.search(r'(?m)^\s*autotests\s*=\s*false\b', b) for b in package)
+    found = (set(root.glob('tests/*.rs')) | set(root.glob('tests/*/main.rs'))) if auto else set()
     for block in re.split(r'(?m)^\s*\[', manifest):
         m = re.search(r'(?m)^\s*path\s*=\s*"([^"]+)"', block) if block.startswith('[test]]') else None
         if m:
