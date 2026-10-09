@@ -998,7 +998,7 @@ def deep_scratch_violation(tmp):
     PATH_MAX, so they stay valid on a deep checkout (R5-F3)."""
     cap = path_max(tmp) - 1
     base_len = len(os.fsencode(str(tmp))) + 1 + len("gitshim-deep.") + 8
-    if base_len + 1 > cap:
+    if base_len + 2 > cap:  # deep_scratch cannot extend a path by one byte (R6-F2)
         return (f"the scratch path is {len(os.fsencode(str(tmp)))} bytes; deep_scratch needs "
                 f"room below the {cap + 1}-byte PATH_MAX")
     for want in (min(base_len + 300, cap), min(base_len + 600, cap)):
@@ -1051,9 +1051,9 @@ def path_max_fallback_violation(tmp):
 
     def raising(_path, _name):
         raise OSError(errno.EINVAL, "PC_PATH_MAX unavailable")
-    # the host's own platform first, so the last patch applied is never the host's and
+    # the host's own platform first (False sorts first), so the last patch applied is never the host's and
     # a leaked sys.platform patch is visible on every host (R6-F3)
-    plans = sorted(FALLBACK_PLATFORMS, key=lambda entry: entry[0] == real_platform)
+    plans = sorted(FALLBACK_PLATFORMS, key=lambda entry: entry[0] != real_platform)
     try:
         for plat, want in plans:
             for label, patch in (("raises", raising), ("answers 0", lambda _p, _n: 0),
