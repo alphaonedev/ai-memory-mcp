@@ -1309,6 +1309,12 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
          "PR_HEAD_SHA is unset"),
         ("unresolvable PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA="1" * 40),
          "does not resolve to a commit"),
+        # An all-zero head or merge sha is not a skip: only the push-lane
+        # GITHUB_EVENT_BEFORE has that meaning (#6201); here it must reach the lookup.
+        ("all-zero PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA="0" * 40),
+         "does not resolve to a commit"),
+        ("all-zero GITHUB_SHA", dict(pr_base_env, GITHUB_SHA="0" * 40),
+         "does not resolve to a commit"),
         ("unresolvable merge commit", dict(pr_base_env, GITHUB_SHA="2" * 40),
          "does not resolve to a commit"),
         ("a GITHUB_SHA that is not a two-parent merge", dict(pr_base_env, GITHUB_SHA=base),
@@ -1455,7 +1461,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     if rc != 0:
         t.fail("(m2-zero64): push with a 64-zero before-SHA did not skip")
     for why, value in [(f"{n}-zero", "0" * n) for n in (1, 5, 6, 39, 41, 63, 65)] + [
-            ("40-zero plus newline", "0" * 40 + "\n"), ("64-zero plus newline", "0" * 64 + "\n")]:
+            ("40-zero plus newline", "0" * 40 + "\n"), ("64-zero plus newline", "0" * 64 + "\n"),
+            ("40 Arabic-Indic zeros", "\u0660" * 40), ("64 fullwidth zeros", "\uff10" * 64)]:
         rc, _o, err = run_gate(repo, dict(m2_base, GITHUB_EVENT_BEFORE=value))
         if rc != 1 or hex_msg not in err:
             t.fail(f"(m2-zero-len): a push {why} before-SHA was not refused by the "
@@ -1464,6 +1471,12 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     if rc != 1 or "cannot resolve range" not in err:
         t.fail("(m2-zero-prefix): a 40-hex before-SHA starting with 0 was skipped instead "
                "of judged:", err)
+
+    # (m2-zero-after, #6201) An all-zero GITHUB_SHA on a push is the tip, not a skip:
+    # the run is judged and stops at the range lookup.
+    rc, _o, err = run_gate(repo, dict(m2_base, GITHUB_EVENT_BEFORE=base, GITHUB_SHA="0" * 40))
+    if rc != 1 or "cannot resolve range" not in err:
+        t.fail("(m2-zero-after): a push with an all-zero GITHUB_SHA was not judged:", err)
 
     # (n) fail-closed - unresolvable range.
     if check_change(repo, "0" * 40, base)[0]:
@@ -1501,7 +1514,7 @@ SELF_TEST_OK = (
     "(f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs "
     "RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path "
     "still named); (j) identifier-rename RED (both names listed); (k) pull_request missing "
-    "PR_HEAD_SHA / GITHUB_BASE_REF fail-closed with its reason; (l) workflow_dispatch skip naming the outside-CI-only overrides; (m) push with zero before-SHA skip; (m2, #6201) only exactly 40 or 64 zeros skip, other zero lengths and newline-suffixed zeros are refused by the hex validator and a zero-prefixed 40-hex is judged; "
+    "PR_HEAD_SHA / GITHUB_BASE_REF fail-closed with its reason; (l) workflow_dispatch skip naming the outside-CI-only overrides; (m) push with zero before-SHA skip; (m2, #6201) only exactly 40 or 64 zeros skip, other zero lengths and newline-suffixed zeros are refused by the hex validator, a zero-prefixed 40-hex is judged, non-ASCII zeros (40 Arabic-Indic, 64 fullwidth) are refused, and an all-zero GITHUB_SHA / PR_HEAD_SHA is judged, never skipped (pr4 and m2-zero-after cells); "
     "(n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; "
     "(p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + "
     "incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated "
