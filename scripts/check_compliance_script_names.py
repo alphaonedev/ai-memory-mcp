@@ -570,7 +570,8 @@ def self_test():
         allow = root / ALLOW_REL
         doc = root / "docs" / "compliance" / "A.md"
         other = root / "docs" / "compliance" / "B.md"
-        erratum = "Erratum: `check-old.sh` is `scripts/check_new.py`.\n"
+        # The one erratum form (#6196, #6219, 5-agent vote 4d3ea1c5): column 0, after a blank line.
+        erratum = "\nErratum (#1): `check-old.sh` is `scripts/check_new.py`.\n"
 
         allow.write_text("")
         doc.write_text("N30 enforcer is `check-old.sh`.\n")
@@ -667,13 +668,13 @@ def self_test():
         doc.write_text("N30 enforcer is `check-old.sh`.\n")
         allow.write_text("docs/compliance/A.md:check-old.sh\n")
 
-        doc.write_text("Erratum: `check-old.sh` is `scripts/check_missing.py`.\n")
+        doc.write_text("Erratum (#1): `check-old.sh` is `scripts/check_missing.py`.\n")
         expect(check(root), "erratum naming a missing successor was accepted")
 
         # S-F1: the successor must resolve inside scripts/.
-        doc.write_text("N30 is `check-old.sh`.\nErratum: `check-old.sh` is `scripts/../outside.py`.\n")
+        doc.write_text("N30 is `check-old.sh`.\n\nErratum (#1): `check-old.sh` is `scripts/../outside.py`.\n")
         expect(check(root), "erratum naming scripts/../outside.py was accepted")
-        doc.write_text("N30 is `check-old.sh`.\nErratum: `check-old.sh` is `scripts/./check_new.py`.\n")
+        doc.write_text("N30 is `check-old.sh`.\n\nErratum (#1): `check-old.sh` is `scripts/./check_new.py`.\n")
         expect(check(root), "erratum naming a dot component was accepted")
         link = root / "scripts" / "check_link.py"
         try:
@@ -681,7 +682,7 @@ def self_test():
         except OSError:
             link = None
         if link is not None:
-            doc.write_text("N30 is `check-old.sh`.\nErratum: `check-old.sh` is `scripts/check_link.py`.\n")
+            doc.write_text("N30 is `check-old.sh`.\n\nErratum (#1): `check-old.sh` is `scripts/check_link.py`.\n")
             expect(check(root), "erratum naming an escaping symlink was accepted")
             link.unlink()
 
@@ -704,7 +705,7 @@ def self_test():
                 "R5-M9/M10: stale `%s` without erratum was accepted" % name,
             )
             allow.write_text("docs/compliance/A.md:%s\n" % name)
-            doc.write_text(stale % name + "Erratum: `%s` is `scripts/check_new.py`.\n" % name)
+            doc.write_text(stale % name + "\nErratum (#1): `%s` is `scripts/check_new.py`.\n" % name)
             expect(not check(root), "R5-M9/M10: allowlisted `%s` with erratum was rejected" % name)
         # M11: a successor line that does not say "erratum" is not an erratum.
         allow.write_text("docs/compliance/A.md:check-old.sh\n")
@@ -915,7 +916,7 @@ def self_test():
             expect(check(root), "#6196-%s: an erratum inside an HTML comment was accepted" % label)
         for label, text in (
             ("after a closed comment", stale_line + "<!-- header -->\n" + erratum),
-            ("after a close on the same line", stale_line + "<!-- a\nb --> " + erratum),
+            ("after a close on the line before", stale_line + "<!-- a\nb -->\n" + erratum),
         ):
             doc.write_text(text)
             expect(not check(root), "#6196-%s: a visible erratum was rejected" % label)
@@ -958,7 +959,8 @@ def self_test():
             ("tilde fence", stale_line + "~~~~\n<!--\n~~~~\n" + erratum),
             ("code span", stale_line + "Write `<!--` to open a comment.\n" + erratum),
             ("double code span", stale_line + "Write ``a `<!--` b`` here.\n" + erratum),
-            ("code span on the erratum line", stale_line + "`<!--` " + erratum),
+            ("code span on the erratum line",
+             stale_line + "\nErratum (#1): `<!--` `check-old.sh` is `scripts/check_new.py`.\n"),
         ):
             doc.write_text(text)
             expect(not check(root), "R7-#6215-%s: a literal '<!--' hid a visible erratum" % label)
@@ -975,7 +977,7 @@ def self_test():
             doc.write_text(text)
             expect(check(root), "R7-#6196-%s: an erratum in a diagram fence was accepted" % label)
         doc.write_text(stale_line + "```text\n" + erratum + "```\n")
-        expect(not check(root), "R7-#6196-control: an erratum in a plain code fence was rejected")
+        expect(check(root), "R8-#6196: an erratum in a plain code fence was accepted (not the erratum form)")
         doc.write_text(stale_line + "```mermaid\ngraph TD\n```\n\n" + erratum)
         expect(not check(root), "R7-#6196-control: an erratum after a closed mermaid fence was rejected")
 
@@ -1045,7 +1047,7 @@ def self_test():
         doc.write_text("Runs `scripts/SUB/check_sub.py`.\n")
         expect(any("scripts/SUB/check_sub.py" in p for p in check(root)), "R7-#6220: a case variant of a directory resolved")
         allow.write_text("docs/compliance/A.md:CHECK-old.sh\n")
-        doc.write_text("N30 enforcer is `CHECK-old.sh`.\nErratum: `CHECK-old.sh` is `scripts/check_new.py`.\n")
+        doc.write_text("N30 enforcer is `CHECK-old.sh`.\n\nErratum (#1): `CHECK-old.sh` is `scripts/check_new.py`.\n")
         expect(not check(root), "R7-#6220: an allowlisted upper-case name with an erratum was rejected")
         allow.write_text("")
 
@@ -1060,7 +1062,7 @@ def self_test():
             ("F7 unmatched backtick run", stale_line + "Text ``` <!-- " + erratum.strip() + " -->\n"),
             ("F8 backtick in a backtick info string", stale_line + "```x`y\n<!-- " + erratum.strip() + " -->\n"),
             ("G3 upper-case diagram info", stale_line + "```Mermaid\n" + erratum + "```\n"),
-            ("T13 look-alike erratum word", stale_line + "Errаtum: `check-old.sh` is `scripts/check_new.py`.\n"),
+            ("T13 look-alike erratum word", stale_line + "\nErrаtum (#1): `check-old.sh` is `scripts/check_new.py`.\n"),
         ):
             doc.write_text(text, encoding="utf-8")
             expect(check(root), "R7-%s: a hidden or invalid erratum was accepted" % label)
@@ -1068,7 +1070,7 @@ def self_test():
             ("F9 four-space indent is no fence", stale_line + "\n    ```mermaid\n\n" + erratum),
             ("L3 four-space indent is no definition", stale_line + "\n    [a]: /u\n" + erratum),
             ("F6 double span holding a single backtick",
-             stale_line + "Erratum: ``a ` <!-- b`` `check-old.sh` is `scripts/check_new.py`.\n"),
+             stale_line + "\nErratum (#1): ``a ` <!-- b`` `check-old.sh` is `scripts/check_new.py`.\n"),
         ):
             doc.write_text(text)
             expect(not check(root), "R7-%s: a visible erratum was rejected" % label)
@@ -1084,7 +1086,7 @@ def self_test():
         doc.write_text("Runs `./scripts/a/scripts/check_deep.py`.\n")
         expect(not check(root), "R7-O14: ./scripts/ with a nested scripts/ was not resolved from the first one")
         allow.write_text("docs/compliance/A.md:CHECK-old.SH\n")
-        doc.write_text("N30 enforcer is `CHECK-old.SH`.\nErratum: `CHECK-old.SH` is `scripts/check_new.py`.\n")
+        doc.write_text("N30 enforcer is `CHECK-old.SH`.\n\nErratum (#1): `CHECK-old.SH` is `scripts/check_new.py`.\n")
         expect(not check(root), "R7-C4: an allowlist entry with an upper-case suffix was rejected")
         allow.write_text("")
 
@@ -1140,7 +1142,7 @@ def self_test():
             doc.write_text(text)
             expect(check(root), "R8-%s: a hidden erratum was accepted" % label)
         for label, text in (
-            ("X6 empty label is no definition", stale_line + "[]: " + erratum),
+            ("X6 empty label is no definition", stale_line + "[]: x\n" + erratum),
             ("X9 a fence ends a definition paragraph", stale_line + "\n[a]: /u\n```\ncode\n```\n" + erratum),
         ):
             doc.write_text(text)
@@ -1192,15 +1194,119 @@ def self_test():
             doc.write_text(text)
             expect(check(root), "R8-F9-%s: an erratum GitHub does not render was accepted" % label)
         for label, text in (
-            ("after an inline tag", stale_line + "<br> " + erratum),
-            ("after a closed instruction", stale_line + "<? x ?> " + erratum),
+            ("after an inline tag", stale_line + "\nErratum (#1): <br> `check-old.sh` is `scripts/check_new.py`.\n"),
+            ("after a closed instruction",
+             stale_line + "\nErratum (#1): <? x ?> `check-old.sh` is `scripts/check_new.py`.\n"),
             ("code span", stale_line + "Write `<?` or `<a` here.\n" + erratum),
-            ("open tag ended by a blank line", stale_line + '<span title="x\n\n' + erratum),
-            ("open tag ended by a fence", stale_line + '<span title="x\n```\n' + erratum + "```\n"),
         ):
             doc.write_text(text)
             expect(not check(root), "R8-F9-control %s: a visible erratum was rejected" % label)
         allow.write_text("")
+
+        # #6196, #6219 (round 8, 5-agent vote 4d3ea1c5): the one erratum form is a line starting
+        # `Erratum (#<issue>): ` at column 0 that begins a paragraph (first line, after a blank line or
+        # a closing fence), outside any fence, $$ block, HTML comment, raw HTML block or open tag, with
+        # no link, image or footnote brackets outside code spans. Any other shape is not an erratum.
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+        names = "`check-old.sh` is `scripts/check_new.py`.\n"
+        line = erratum.lstrip("\n")
+        for label, text in (
+            ("no issue number", stale_line + "\nErratum: " + names),
+            ("lower case", stale_line + "\nerratum (#1): " + names),
+            ("indented", stale_line + "\n Erratum (#1): " + names),
+            ("continues a paragraph", stale_line + line),
+            ("after a heading line", stale_line + "\n# Notes\n" + line),
+            ("list item", stale_line + "\n- " + line),
+            ("block quote", stale_line + "\n> " + line),
+            ("fenced block", stale_line + "\n```\n" + erratum + "```\n"),
+            ("unclosed fence", stale_line + "\n~~~\n" + erratum),
+            ("footnote definition", stale_line + "\n[^e]: " + line),
+            ("link on the line", stale_line + "\nErratum (#1): [`check-old.sh`](x) is `scripts/check_new.py`.\n"),
+            ("image on the line", stale_line + "\nErratum (#1): ![`check-old.sh`](x) is `scripts/check_new.py`.\n"),
+            ("$$ block", stale_line + "\n$$\n" + erratum + "\n$$\n"),
+            ("unclosed $$ block", stale_line + "\n$$\n" + erratum),
+            ("open tag past a blank line", stale_line + '\n<span title="x\n' + erratum + '">\n'),
+            ("open tag past a fence", stale_line + '\n<span title="x\n```\n' + erratum + '```\n">\n'),
+            ("code span '<!--' in an HTML block", stale_line + "\n<div>\n`<!--`\n" + erratum + "\n-->\n"),
+            ("code span '<!--' in a pre block", stale_line + "\n<pre>\n`<!--`\n" + erratum + "\n</pre>\n-->\n"),
+            ("pre block", stale_line + "\n<PRE>\n" + erratum + "\n</pre>\n"),
+            ("fence line in an HTML block", stale_line + "\n<div>\n```\n<!--\n```\n" + erratum + "\n-->\n"),
+            ("escaped backtick", stale_line + "\nErratum (#1): \\`<!--` `check-old.sh` is `scripts/check_new.py`. -->\n"),
+            ("E1 escaped bracket label", stale_line + '\n[a\\]b]: # "' + erratum.strip() + '"\n'),
+            ("E2 label over lines", stale_line + '\n[\nx\n]: # "' + erratum.strip() + '"\n'),
+            ("E3 definition in a block quote", stale_line + '\n> [//]: # "' + erratum.strip() + '"\n'),
+            ("E4 definition in a list item", stale_line + '\n- [//]: # "' + erratum.strip() + '"\n'),
+            ("E5 mermaid in a block quote", stale_line + "\n> ```mermaid\n> %% " + erratum.strip() + "\n> ```\n"),
+            ("E6 mermaid in a list item",
+             stale_line + "\n- item\n\n    ```mermaid\n    %% " + erratum.strip() + "\n    ```\n"),
+            ("E10 escaped backtick before a comment", stale_line + "\n\\`<!--` " + erratum.strip() + " -->\n"),
+            ("#6238 '[ ]:' label", stale_line + "\n[ ]: " + line),
+            ("#6238 definition after a paragraph line", stale_line + "Text\n[//]: # (" + erratum.strip() + ")\n"),
+            ("#6246 '<!-->' on the erratum line", stale_line + "\n<!--> " + line),
+            ("#6215 M6 fence holding '<!--', then a mermaid erratum",
+             stale_line + "\n```\n<!--\n```\n```mermaid\n%% " + erratum.strip() + "\n```\n"),
+        ):
+            doc.write_text(text)
+            expect(check(root), "R8-canonical-%s: a non-canonical or hidden erratum was accepted" % label)
+        for label, text in (
+            ("canonical", stale_line + erratum),
+            ("first line", line + stale_line),
+            ("after a closing fence", stale_line + "\n```\n<!--\n```\n" + line),
+            ("after a closed comment block", stale_line + "\n<!--\nnote\n\n-->\n" + erratum),
+            ("#6246 after '<!-->'", stale_line + "\n<!-->\n" + erratum),
+            ("#6246 after '<!--->'", stale_line + "\n<!--->\n" + erratum),
+            ("#6246 after '<!-->' inline", stale_line + "\nText <!--> more.\n" + erratum),
+            ("after an HTML block", stale_line + "\n<div>\nx\n</div>\n" + erratum),
+            ("after a closed pre block", stale_line + "\n<pre>\nx\n</pre>\n" + erratum),
+            ("after a closed $$ block", stale_line + "\n$$\nx\n$$\n" + erratum),
+            ("brackets in a code span", stale_line + "\nErratum (#1): `[x]` `check-old.sh` is `scripts/check_new.py`.\n"),
+            ("#6238 after a '[ ]:' line", stale_line + "\n[ ]: x\n" + erratum),
+        ):
+            doc.write_text(text)
+            expect(not check(root), "R8-canonical-%s: a canonical erratum was rejected" % label)
+        # #6238: a line that names the stale name and a successor with the word erratum, but is not
+        # in the erratum form, is named in the violation together with the form to use.
+        doc.write_text(stale_line + "\n[ ]: " + line)
+        probs = check(root)
+        expect(any("line 3 is not an erratum" in p and "Erratum (#<issue>): " in p for p in probs),
+               "R8-#6238: a non-canonical erratum line was not named in the violation (%r)" % (probs,))
+        doc.write_text(stale_line + "\nN30 now uses `scripts/check_new.py`, not `check-old.sh`.\n")
+        expect(not any("is not an erratum" in p for p in check(root)),
+               "R8-#6238: a line without the word erratum was named as a non-canonical erratum")
+
+        # #6214 (round 8): a name a reader sees across code spans, links, comments and tags spanning
+        # lines is checked (document skeleton), and a name with any non-ASCII letter in a letter
+        # position is a look-alike, whatever its script.
+        allow.write_text("")
+        for label, text in (
+            ("D1 backtick split", "Run check-`old.sh` daily.\n"),
+            ("D2 adjacent code spans", "Run `check-`<!-- -->`old.sh` daily.\n"),
+            ("D3 adjacent links", "Run [check-](a)[old.sh](b) daily.\n"),
+            ("D4 comment over lines", "Run check-<!--\n-->old.sh daily.\n"),
+            ("tag over lines", "Run check-<span\nclass='x'>old.sh daily.\n"),
+            ("empty comment", "Run check-<!-->old.sh daily.\n"),
+        ):
+            doc.write_text(text, encoding="utf-8")
+            expect(any("check-old.sh" in p for p in check(root)), "R8-#6214-%s: a split stale name was accepted" % label)
+        doc.write_text("Before.\nRun check-<!--\n\n-->old.sh daily.\n")
+        expect(any(":2:" in p and "check-old.sh" in p for p in check(root)),
+               "R8-#6214: a skeleton finding was not reported on the line it starts on")
+        for label, text in (
+            ("D6 U+03F2", "Run `ϲheck-old.sh`.\n"),
+            ("D7 U+2CA5", "Run `ⲥheck-old.sh`.\n"),
+            ("D8 U+1D04", "Run `ᴄheck-old.sh`.\n"),
+            ("D9 U+13DF", "Run `ᏟHECK-OLD.SH`.\n"),
+            ("suffix letter", "Run `check-old.ѕh`.\n"),
+            ("of an existing script", "Run `сheck_new.py`.\n"),
+            ("split and non-ASCII", "Run `Ꮯheck-`old.sh.\n"),
+        ):
+            doc.write_text(text, encoding="utf-8")
+            expect(any("look-alike script name" in p for p in check(root)),
+                   "R8-#6214-%s: a look-alike script name was accepted" % label)
+        doc.write_text("Runs check_`new.py`, [check_](a)[new.py](b) and café-check_new.py, naïve check_new.py.\n",
+                       encoding="utf-8")
+        probs = check(root)
+        expect(not probs, "R8-#6214-control: split or adjacent existing names were rejected (%r)" % (probs,))
 
         # #6199: a fixture setup failure exits 2 with 'SELF-TEST FAIL: fixture setup', never a traceback.
         gate_src = Path(__file__).read_text(encoding="utf-8")
