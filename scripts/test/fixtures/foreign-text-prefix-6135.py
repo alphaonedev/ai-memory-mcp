@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# FROZEN VERBATIM pre-#6135 copy of scripts/check-foreign-text-to-caller.py (fa6b588e6), the R-203
+# control for the S4 own-vocabulary-constructor fix: its self-test leg must ACCEPT foreign text folded
+# into crate::errors::refusal(..) / crate::errors::invalid_input(..) / MemoryError::Refused(..), because
+# its S4 matcher named only the DatabaseError / ValidationFailed / Conflict / NotFound /
+# RefusedByGovernance / Internal variants. Never edit; replace only with a newer frozen prefix when the
+# next defect class lands.
 # check-foreign-text-to-caller.py — #3688 gate 7: FOREIGN TEXT CROSSING TO A CALLER.
 #
 # The rule keys on two properties of a VALUE, neither of which is a name:
@@ -1955,41 +1961,6 @@ pub fn build_router() -> axum::Router {
         ))
 }
 ''')
-    # #6135 — the own-vocabulary constructors the classifier passes through VERBATIM
-    # (crate::errors::refusal / invalid_input -> OwnText; MemoryError::Refused). Foreign text folded
-    # INTO one of them reaches the caller unchanged, so the construction is the sink (the
-    # src/mcp/error_text.rs property-3 contract). M2b / M2a are the PR #6131 review mutants.
-    _write(root, 'src/mcp/tools/skill_promote.rs', '''
-const GOVERNANCE_POLICY_UNREADABLE: &str = "GOVERNANCE_POLICY_UNREADABLE";
-fn min_depth_refusal(conn: &rusqlite::Connection, ns: &str) -> anyhow::Result<u32> {
-    // M2b — a store error folded into a refusal
-    let depth = db::get(conn, ns).map_err(|e| crate::errors::refusal(format!("{GOVERNANCE_POLICY_UNREADABLE}: {e:#}")))?;
-    Ok(depth)
-}
-fn description_path_refusal(path: &str) -> anyhow::Result<()> {
-    // M2a (provenance form) — a resolved filesystem path folded into an invalid_input
-    let resolved = std::fs::canonicalize(path).unwrap_or_default();
-    Err(crate::errors::invalid_input(format!("description file {resolved:?} rejected")))
-}
-fn refused_variant(conn: &rusqlite::Connection, id: &str) -> Result<(), MemoryError> {
-    match db::get(conn, id) {
-        Ok(_) => Ok(()),
-        Err(e) => Err(MemoryError::Refused(e.to_string())),
-    }
-}
-fn own_refusal(depth: u32) -> anyhow::Result<()> {
-    // CONTROL — our own composed refusal text (a numeric scalar beside a const) passes
-    Err(crate::errors::refusal(format!("{GOVERNANCE_POLICY_UNREADABLE}: depth {} below minimum", depth.saturating_add(1))))
-}
-fn own_invalid() -> anyhow::Result<()> {
-    // CONTROL — a literal invalid_input passes
-    Err(crate::errors::invalid_input("INVALID_INPUT: description is empty"))
-}
-fn refused_pattern(e: &MemoryError) -> &str {
-    // CONTROL — a match PATTERN on the variant is not a construction
-    match e { MemoryError::Refused(m) => m, _ => "" }
-}
-''')
     _write(root, 'src/mcp/mod.rs', '''
 macro_rules! register_mcp_tool { ($name:expr, $f:path) => { ($name, $f as DispatchFn) }; }
 pub static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = &[
@@ -2280,22 +2251,6 @@ def self_test(scratch):
         expect(any(':handle_get:mcp-error:db' in k for k in frozen_3767), 'R-203 sanity: the frozen gate still rejects a bare db call `.to_string()`d, so the declared-rusqlite/anyhow classes were never the gap')
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as ex:
         expect(False, f'R-203 (#3767): frozen prefix gate could not be run ({ex})')
-    # #6135 — S4 polices the own-vocabulary constructors the classifier passes through verbatim.
-    expect(has('src/mcp/tools/skill_promote.rs', ':min_depth_refusal:memory-error:db'), '#6135 M2b: a store error folded into crate::errors::refusal(format!(..{e:#})) is RED')
-    expect(has('src/mcp/tools/skill_promote.rs', ':description_path_refusal:memory-error:path'), '#6135 M2a: a resolved filesystem path folded into crate::errors::invalid_input(..) is RED')
-    expect(has('src/mcp/tools/skill_promote.rs', ':refused_variant:memory-error:db'), '#6135: a driver error folded into MemoryError::Refused(e.to_string()) is RED')
-    expect(not has('src/mcp/tools/skill_promote.rs', ':own_refusal:') and not has('src/mcp/tools/skill_promote.rs', ':own_invalid:'), '#6135 CONTROL: a refusal / invalid_input composed from our own text passes')
-    expect(not has('src/mcp/tools/skill_promote.rs', ':refused_pattern:'), '#6135 CONTROL: a `MemoryError::Refused(m) =>` match PATTERN is not a construction')
-    prefix_6135 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test', 'fixtures', 'foreign-text-prefix-6135.py')
-    try:
-        import subprocess
-        out = subprocess.run([sys.executable, prefix_6135, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
-        frozen_6135 = {x['key'] for x in json.loads(out)['findings'] if x['sev'] == 'FAIL'}
-        expect(not any(':min_depth_refusal:' in k for k in frozen_6135), 'R-203: the FROZEN pre-#6135 gate (test/fixtures/foreign-text-prefix-6135.py) ACCEPTS the M2b refusal — the defect reproduces')
-        expect(not any(':description_path_refusal:' in k or ':refused_variant:' in k for k in frozen_6135), 'R-203: the FROZEN gate ACCEPTS invalid_input / MemoryError::Refused built from foreign text')
-        expect(any(':from:memory-error:db' in k for k in frozen_6135), 'R-203 sanity: the frozen gate still flags MemoryError::DatabaseError(e.to_string()), so its silence above is the defect, not a broken run')
-    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as ex:
-        expect(False, f'R-203 (#6135): frozen prefix gate could not be run ({ex})')
     expect(has('src/hooks/chain.rs', ':fire:deny-reason:proc'), 'hook subprocess text in Deny.reason (#3704)')
     expect(has('src/errors.rs', ':from:memory-error:db'), 'From<rusqlite::Error> -> MemoryError::DatabaseError(e.to_string())')
     expect(has('src/subscriptions.rs', ':send:dlq-record:http'), "receiver's ack field persisted into subscription_dlq.last_error")
