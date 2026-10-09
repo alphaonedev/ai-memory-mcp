@@ -210,6 +210,33 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+/// #4306 — map the typed K9 link refusal (`StorageError::LinkPermissionDenied`,
+/// raised by `db::evaluate_link_permission` on a `Deny` / `Ask`) onto the ONE
+/// `PermissionDenied` envelope the postgres adapter returns from
+/// `link_internal` (error parity: same variant, same `action`, the link
+/// namespace as `target`, the typed Display as `reason`), so the HTTP mapper
+/// keyed on the variant renders 403 on both backends instead of a
+/// string-classified backend error on sqlite. Anything else stays a backend
+/// detail. The namespace probe runs on the refusal path only; a probe fault
+/// falls back to the default namespace (the postgres twin's absent-source
+/// fallback) rather than masking the refusal.
+fn link_refusal(conn: &rusqlite::Connection, e: anyhow::Error, link: &MemoryLink) -> StoreError {
+    match e.downcast_ref::<crate::storage::StorageError>() {
+        Some(se @ crate::storage::StorageError::LinkPermissionDenied { .. }) => {
+            let target = db::namespace_by_id(conn, &link.source_id)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
+            StoreError::PermissionDenied {
+                action: crate::mcp::registry::tool_names::MEMORY_LINK.to_string(),
+                target,
+                reason: se.to_string(),
+            }
+        }
+        _ => box_err(e),
+    }
+}
+
 /// #4447 — map the typed in-transaction by-id refusal onto the ONE
 /// `PermissionDenied` envelope the postgres adapter returns (error parity);
 /// anything else stays a backend detail.
@@ -1284,7 +1311,8 @@ impl MemoryStore for SqliteStore {
             crate::storage::LinkClaimWindow::from_link(link),
         )
         .map(|_| ())
-        .map_err(box_err)
+        // #4306 — a K9 Deny is `PermissionDenied` here as on postgres.
+        .map_err(|e| link_refusal(&conn, e, link))
     }
 
     async fn lineage_ancestors(
@@ -1440,7 +1468,8 @@ impl MemoryStore for SqliteStore {
             keypair,
             crate::storage::LinkClaimWindow::from_link(link),
         )
-        .map_err(box_err)
+        // #4306 — a K9 Deny is `PermissionDenied` here as on postgres.
+        .map_err(|e| link_refusal(&conn, e, link))
     }
 
     /// v0.7.0 ARCH-2 followup (FX-C2) — per-anchor edge probe. Thin
