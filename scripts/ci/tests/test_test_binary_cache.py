@@ -1057,5 +1057,180 @@ class PlanAndRecord(World):
         self.assertIn('test:a', self.manifest()['entries'])
 
 
+class ImpactSubsetBuild6384R2M1(World):
+    """r2 M1(a): a key never depends on which targets this build compiled. An
+    impact-mode PR (``--lib --test <impacted>``) on the seed's tree hits."""
+
+    def full_build(self):
+        top = self.root / 'target' / 'debug'
+        (self.root / 'src' / 'main.rs').write_text('fn main() {}\n')
+        (self.root / 'tests' / 'c.rs').write_text('fn c() {}\n')
+        (self.deps / 'c-h5.d').write_text('target/debug/deps/c-h5: tests/c.rs\n\ntests/c.rs:\n')
+        (top / 'ai-memory').write_text('bin')
+        (top / 'ai-memory.d').write_text('%s: src/main.rs\n\nsrc/main.rs:\n' % (top / 'ai-memory'))
+        (self.deps / 'ai_memory-h6').write_text('bin-test')
+        (self.deps / 'ai_memory-h6.d').write_text('target/debug/deps/ai_memory-h6: src/main.rs\n\nsrc/main.rs:\n')
+        d = str(self.deps)
+        self.extra = [art('bin', 'ai-memory', d + '/ai_memory-h6', True), art('test', 'c', d + '/c-h5', True)]
+        bin_line = art('bin', 'ai-memory', str(top / 'ai-memory'), False, filenames=[str(top / 'ai-memory')])
+        self.bj.write_text(self.bj.read_text() + '\n'.join([bin_line] + self.extra) + '\n')
+        (self.sd / 'serial.txt').write_text('--lib\n--test a\n--bin ai-memory\n')
+        (self.sd / 'parallel_2.txt').write_text('--test b\n--test c\n')
+
+    def impact_build(self):
+        """What ``cargo test --lib --test a --test b`` reports: no bin unittest, no c."""
+        lines = [l for l in self.bj.read_text().splitlines() if l and l not in self.extra]
+        self.bj.write_text('\n'.join(lines) + '\n')
+        self.lists()
+
+    def test_subset_build_on_identical_tree_hits_lib_and_plain_tests(self):
+        self.full_build()
+        self.green_run('100')
+        self.impact_build()
+        out = self.plan(run_id='200', now=NOW + 60)
+        self.assertIn('skipped 3 of 3', out)
+
+    def test_subset_build_reruns_only_the_edited_test(self):
+        self.full_build()
+        self.green_run('100')
+        (self.root / 'tests' / 'a.rs').write_text('fn a() { let _ = 2; }\n')
+        self.impact_build()
+        self.plan(run_id='200', now=NOW + 60)
+        self.assertEqual(self.list_text('serial'), '--test a\n')
+        self.assertEqual(self.list_text('parallel_2'), '')
+
+    def test_subset_build_still_keys_an_orphan_under_tests(self):
+        self.full_build()
+        self.green_run('100')
+        (self.root / 'tests' / 'common').mkdir()
+        (self.root / 'tests' / 'common' / 'orphan.rs').write_text('fn o() {}\n')
+        self.impact_build()
+        out = self.plan(run_id='200', now=NOW + 60)
+        self.assertIn('skipped 0 of 3', out)
+
+    def test_test_profile_units_are_not_in_the_shared_closure(self):
+        self.full_build()
+        found = {p.name for p in tbc.shared_depinfo_files(self.bj.read_text().splitlines())}
+        self.assertEqual(found, {'ai_memory-h2.d', 'ai-memory.d'})
+
+
+class ChangelogKeyedOnlyForReaders6384R2M1(World):
+    """r2 M1(b): changelog.d/ is in a binary's key only when the binary can
+    read it (names ``changelog``, runs a tool or repo script, or walks the
+    repo root); docs/ and *.md keep the r1 M4 rule."""
+
+    def changelog(self, text):
+        (self.root / 'changelog.d').mkdir(exist_ok=True)
+        (self.root / 'changelog.d' / '1.changed.md').write_text(text)
+
+    def seed_then_changelog_edit(self):
+        self.changelog('v1')
+        self.green_run('100')
+        self.changelog('v2')
+        return self.plan(run_id='200', now=NOW + 60)
+
+    def test_docs_reader_that_never_names_changelog_hits(self):
+        (self.root / 'src' / 'lib.rs').write_text('pub fn a() -> &\'static str { "docs/x.md" }\n')
+        (self.root / 'tests' / 'b.rs').write_text('fn b() { let _ = std::path::Path::new("docs"); }\n')
+        self.assertIn('skipped 3 of 3', self.seed_then_changelog_edit())
+
+    def test_docs_reader_still_reruns_on_a_docs_edit(self):
+        (self.root / 'tests' / 'b.rs').write_text('fn b() { let _ = std::path::Path::new("docs"); }\n')
+        (self.root / 'docs').mkdir()
+        (self.root / 'docs' / 'x.md').write_text('v1')
+        self.green_run('100')
+        (self.root / 'docs' / 'x.md').write_text('v2')
+        self.plan(run_id='200', now=NOW + 60)
+        self.assertEqual(self.list_text('parallel_2'), '--test b\n')
+
+    def test_scanner_of_one_subtree_hits_on_a_changelog_edit(self):
+        (self.root / 'tests' / 'b.rs').write_text(
+            'fn b() { let _ = std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")); }\n')
+        self.assertIn('skipped 3 of 3', self.seed_then_changelog_edit())
+
+    def test_scanner_of_one_subtree_still_reruns_on_any_rs_edit(self):
+        (self.root / 'tests' / 'b.rs').write_text(
+            'fn b() { let _ = std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")); }\n')
+        self.green_run('100')
+        (self.root / 'tests' / 'a.rs').write_text('fn a() { let _ = 3; }\n')
+        self.plan(run_id='200', now=NOW + 60)
+        self.assertEqual(self.list_text('parallel_2'), '--test b\n')
+
+    def test_scanner_of_the_repo_root_reruns_on_a_changelog_edit(self):
+        for body in ('let _ = std::fs::read_dir(env!("CARGO_MANIFEST_DIR"));',
+                     'let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")); let _ = std::fs::read_dir(&root);',
+                     'let _ = std::fs::read_dir(".");'):
+            with self.subTest(body=body):
+                self.setUp()
+                (self.root / 'tests' / 'b.rs').write_text('fn b() { %s }\n' % body)
+                self.seed_then_changelog_edit()
+                self.assertEqual(self.list_text('parallel_2'), '--test b\n')
+                self.assertEqual(self.list_text('serial'), '')
+
+    def test_binary_running_a_tool_or_repo_script_reruns_on_a_changelog_edit(self):
+        (self.root / 'scripts').mkdir()
+        (self.root / 'scripts' / 'x.sh').write_text('true\n')
+        for body in ('let _ = std::process::Command::new("git");',
+                     'let _ = std::path::Path::new("scripts/x.sh");'):
+            with self.subTest(body=body):
+                self.setUp()
+                (self.root / 'scripts').mkdir(exist_ok=True)
+                (self.root / 'scripts' / 'x.sh').write_text('true\n')
+                (self.root / 'tests' / 'b.rs').write_text('fn b() { %s }\n' % body)
+                self.seed_then_changelog_edit()
+                self.assertEqual(self.list_text('parallel_2'), '--test b\n')
+
+    def test_lib_naming_a_missing_script_path_is_not_a_reader(self):
+        # A skill resource path such as "scripts/run.sh" is data, not a spawn.
+        (self.root / 'src' / 'lib.rs').write_text('pub fn a() -> &\'static str { "scripts/run.sh" }\n')
+        self.assertIn('skipped 3 of 3', self.seed_then_changelog_edit())
+
+
+class RealTreeCensus6384R2M1(unittest.TestCase):
+    """r2 M1(b) on the real tree: the tree-scanning integration tests do not
+    all key on changelog.d/, and the lib does not."""
+
+    def census(self):
+        scanners = readers = 0
+        for root in tbc.test_target_roots(REPO):
+            texts = [p.read_text(errors='replace') for p in tbc.static_mod_closure(REPO, root)]
+            traits = tbc.source_traits(texts, 'test', REPO)
+            if traits['tree']:
+                scanners += 1
+                readers += traits['changelog']
+        return scanners, readers
+
+    def test_most_tree_scanners_do_not_key_on_changelog(self):
+        scanners, readers = self.census()
+        self.assertGreater(scanners, 100)
+        self.assertLess(readers * 2, scanners, 'scanners=%d changelog readers=%d' % (scanners, readers))
+
+    def test_lib_does_not_key_on_changelog(self):
+        texts = [p.read_text(errors='replace') for p in sorted((REPO / 'src').rglob('*.rs'))]
+        self.assertFalse(tbc.source_traits(texts, 'lib', REPO)['changelog'])
+
+
+class HitCaseDocs6384R2M1(unittest.TestCase):
+    """r2 M1(c)(d): the docs and the changelog state only hit cases CI can reach."""
+
+    def section(self):
+        text = (REPO / 'docs' / 'ci' / 'CARRIER-BRANCH-GATES.md').read_text()
+        sec = text[text.index('## Per-test-binary result cache (#6384)'):]
+        nxt = sec.find('\n## ', 5)
+        return ' '.join((sec[:nxt] if nxt > 0 else sec).split())
+
+    def test_carrier_doc_names_the_skip_path_and_drops_the_overclaims(self):
+        sec = self.section()
+        self.assertIn('__SKIP__', sec)
+        self.assertNotIn('skips every binary whose code does not name them', sec)
+        self.assertIn('changelog.d', sec)
+        self.assertIn('impact', sec)
+
+    def test_changelog_fragment_drops_the_documentation_only_claim(self):
+        text = ' '.join((REPO / 'changelog.d' / '6384.changed.md').read_text().split())
+        self.assertNotIn('are hits for every binary that does not read them', text)
+        self.assertIn('__SKIP__', text)
+
+
 if __name__ == '__main__':
     unittest.main()
