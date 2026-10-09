@@ -89,6 +89,7 @@ import html
 import io
 import os
 import re
+import stat
 import string
 import subprocess
 import sys
@@ -813,8 +814,12 @@ def collect_errata(root, lines_by_doc):
 def load_allowlist(root):
     """Return ({(doc, stale-name): pinned}, list of malformed/duplicate-line problems)."""
     path = root / ALLOW_REL
+    # Only a path that does not exist is absent (#6353); a symlink loop, a permission error or
+    # any other failure to stat it is an unreadable allowlist (exit 2), never "no allowlist".
     try:
-        present = path.is_file()
+        present = stat.S_ISREG(os.stat(str(path)).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        present = False
     except OSError:
         raise Unreadable(ALLOW_REL)
     if not present:
