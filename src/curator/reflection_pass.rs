@@ -1823,6 +1823,137 @@ mod tests {
             assert_eq!(report.reflections_persisted, 0);
         }
 
+        /// #4395 — seed three co-occurring Observations in `ns` and bind a
+        /// standard with `governance` to it. Returns the raw connection.
+        fn governed_namespace(
+            store: &SqliteStore,
+            ns: &str,
+            governance: serde_json::Value,
+        ) -> rusqlite::Connection {
+            let conn = conn_of(store);
+            insert_observation(&conn, ns, "G1", "shared keyword token strategy notes", 2);
+            insert_observation(&conn, ns, "G2", "shared keyword token strategy plan", 3);
+            insert_observation(&conn, ns, "G3", "shared keyword token strategy canary", 1);
+            let mut standard = make_obs(
+                &uuid::Uuid::new_v4().to_string(),
+                &format!("_standards-{ns}"),
+                "standard",
+                "policy",
+                0,
+            );
+            standard.metadata = serde_json::json!({"agent_id": "ai:owner", "governance": governance});
+            let sid = crate::db::insert(&conn, &standard).unwrap();
+            crate::db::set_namespace_standard(&conn, ns, &sid, None).unwrap();
+            conn
+        }
+
+        fn count_rows(conn: &rusqlite::Connection, sql: &str, ns: &str) -> i64 {
+            conn.query_row(sql, [ns], |r| r.get(0)).unwrap()
+        }
+
+        /// #4395 — a namespace whose standard requires approval above a
+        /// reflection depth must not receive an above-threshold reflection
+        /// from the curator without that approval: the pass queues a
+        /// `reflect` pending (the same row the MCP L1-8 gate queues) and
+        /// writes nothing.
+        #[tokio::test]
+        async fn curator_reflection_above_threshold_is_queued_not_written_4395() {
+            let (store, _dir) = open_db();
+            let conn = governed_namespace(
+                &store,
+                "governed-4395",
+                serde_json::json!({"write": "any", "require_approval_above_depth": 0}),
+            );
+            let llm = StubLlm::new("governed pattern");
+            let report = run_reflection_pass(
+                &store,
+                &llm,
+                None,
+                Some("governed-4395"),
+                None,
+                false,
+                |_| true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(report.clusters_eligible, 1, "{report:?}");
+            assert_eq!(report.reflections_persisted, 0, "{report:?}");
+            assert_eq!(
+                count_rows(
+                    &conn,
+                    "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND memory_kind = 'reflection'",
+                    "governed-4395",
+                ),
+                0,
+                "no ungoverned reflection may be written"
+            );
+            assert_eq!(
+                count_rows(
+                    &conn,
+                    "SELECT COUNT(*) FROM pending_actions WHERE namespace = ?1 \
+                     AND action_type = 'reflect' AND status = 'pending'",
+                    "governed-4395",
+                ),
+                1,
+                "the above-threshold reflection is parked for approval"
+            );
+        }
+
+        /// #4395 — the #3638 write admission applies to the curator too: a
+        /// `write: owner` namespace owned by another principal refuses the
+        /// curator's reflection (skipped with a logged reason, nothing
+        /// written, nothing queued).
+        #[tokio::test]
+        async fn curator_reflection_not_admitted_is_skipped_4395() {
+            let _gate = crate::config::lock_permissions_mode_for_test();
+            crate::config::override_active_permissions_mode_for_test(
+                crate::config::PermissionsMode::Enforce,
+            );
+            let (store, _dir) = open_db();
+            let conn = governed_namespace(
+                &store,
+                "owned-4395",
+                serde_json::json!({"write": "owner"}),
+            );
+            let llm = StubLlm::new("owned pattern");
+            let report = run_reflection_pass(
+                &store,
+                &llm,
+                None,
+                Some("owned-4395"),
+                None,
+                false,
+                |_| true,
+            )
+            .await
+            .unwrap();
+            crate::config::override_active_permissions_mode_for_test(
+                crate::config::PermissionsMode::Advisory,
+            );
+            assert_eq!(report.clusters_eligible, 1, "{report:?}");
+            assert_eq!(report.reflections_persisted, 0, "{report:?}");
+            assert!(
+                report.errors.iter().any(|e| e.contains("not admitted")),
+                "the skip is logged with its reason: {report:?}"
+            );
+            assert_eq!(
+                count_rows(
+                    &conn,
+                    "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND memory_kind = 'reflection'",
+                    "owned-4395",
+                ),
+                0
+            );
+            assert_eq!(
+                count_rows(
+                    &conn,
+                    "SELECT COUNT(*) FROM pending_actions WHERE namespace = ?1",
+                    "owned-4395",
+                ),
+                0
+            );
+        }
+
         #[test]
         fn dry_run_proposal_serialises() {
             let p = DryRunProposal {
