@@ -45,7 +45,7 @@ on:
   # together), #2523 and #2508 (push must not overlap a PR head such as
   # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: [main, develop, "release/**", "feat/v0.7.0-grand-slam", "rehearsal/**"]
+    branches: [main, develop, "release/**", "feat/v0.7.0-grand-slam", "rehearsal/**", "chain/**"]
   push:
     branches: [main, develop, "feat/v0.7.0-grand-slam", "release/**"]
   # Merge Queue (#3089) — `Per-Module Coverage Thresholds` (+ the sibling

@@ -39,7 +39,7 @@ name: CLAUDE.md rule-change comparison
 
 on:
   pull_request_target:
-    branches: [main, develop, "release/**", "rehearsal/**"]
+    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]
     types: [opened, synchronize, reopened, edited]
 
 permissions:
