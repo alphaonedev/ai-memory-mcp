@@ -345,6 +345,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ALLOWLISTED_FILES=(
     "tests/form_7_agent_external_wiring.rs"
     "tests/hf_cache_staged_3788.rs"
+    "tests/hf_hub_fetch_egress_posture_4123.rs"
 )
 
 is_allowlisted () {
