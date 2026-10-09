@@ -721,6 +721,118 @@ mod tests {
         assert!(err.contains("LLM summarization failed"), "got: {err}");
     }
 
+    /// #4286 — an LLM-generated summary is built from the sources' versions
+    /// at the gate read. A source edited by a second connection while the
+    /// model runs must not be consumed: the call returns a conflict, the v2
+    /// text stays live, and no summary row is written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn llm_summary_refuses_source_edited_mid_summary_4286() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+
+        const EDITED: &str = "v2 text committed while the summary was being generated";
+
+        struct EditOnce {
+            path: std::path::PathBuf,
+            target: String,
+            fired: AtomicBool,
+        }
+        impl Respond for EditOnce {
+            fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+                if !self.fired.swap(true, Ordering::SeqCst) {
+                    let conn = db::open(&self.path).expect("second connection");
+                    db::update(
+                        &conn,
+                        &self.target,
+                        None,
+                        Some(EDITED),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("concurrent edit commits");
+                }
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "message": {"content": "auto-summary text"},
+                    "done": true,
+                }))
+            }
+        }
+
+        let (conn, tmp) = fresh_db();
+        let a = seed_observation(&conn, "cn-4286", "a");
+        let b = seed_observation(&conn, "cn-4286", "b");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(EditOnce {
+                path: tmp.path().to_path_buf(),
+                target: b.clone(),
+                fired: AtomicBool::new(false),
+            })
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+        let (a2, b2) = (a.clone(), b.clone());
+        let (result, conn, _tmp) = tokio::task::spawn_blocking(move || {
+            let client = crate::llm::OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            let result = handle_consolidate(
+                &conn,
+                tmp.path(),
+                &json!({
+                    "ids": [a2, b2],
+                    "title": "consolidated-4286",
+                    "namespace": "cn-4286",
+                }),
+                Some(&client),
+                None,
+                None,
+                None,
+                None,
+            );
+            (result, conn, tmp)
+        })
+        .await
+        .unwrap();
+
+        let err = result.expect_err("a source edited mid-summary must not be consumed");
+        assert!(
+            err.contains("conflict"),
+            "conflict error expected, got: {err}"
+        );
+        let edited = db::get(&conn, &b).unwrap().expect("edited source live");
+        assert_eq!(edited.content, EDITED, "the v2 text is still live");
+        assert!(db::get(&conn, &a).unwrap().is_some(), "a not consumed");
+        let rows = db::list(
+            &conn,
+            Some("cn-4286"),
+            None,
+            16,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            rows.iter().all(|m| m.title != "consolidated-4286"),
+            "no summary row may be written on a conflict"
+        );
+    }
+
     // LLM provided but a source memory does not exist — error before LLM.
     #[tokio::test(flavor = "multi_thread")]
     async fn llm_path_missing_source_errors() {
