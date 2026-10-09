@@ -90,7 +90,10 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
 /// Propagates SQLite errors and rule-canonicalisation errors.
 pub fn compute_policy_digest(conn: &Connection) -> Result<[u8; 32]> {
     let mut hasher = Sha256::new();
-    if table_exists(conn, "governance_rules")? {
+    if table_exists(
+        conn,
+        crate::storage::schema_integrity::TABLE_GOVERNANCE_RULES,
+    )? {
         // `list` already returns rules ordered by `id ASC`.
         for rule in crate::governance::rules_store::list(conn)? {
             if !rule.enabled {
@@ -112,7 +115,10 @@ pub fn compute_policy_digest(conn: &Connection) -> Result<[u8; 32]> {
 type RulesFingerprint = (i64, i64, i64);
 
 fn rules_fingerprint(conn: &Connection) -> Result<RulesFingerprint> {
-    if !table_exists(conn, "governance_rules")? {
+    if !table_exists(
+        conn,
+        crate::storage::schema_integrity::TABLE_GOVERNANCE_RULES,
+    )? {
         return Ok((0, 0, 0));
     }
     conn.query_row(
