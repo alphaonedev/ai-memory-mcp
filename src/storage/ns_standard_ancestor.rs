@@ -106,6 +106,7 @@ pub fn set_admission_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ns_standard_ancestor::DescendantLevel;
 
     fn conn() -> Connection {
         crate::storage::open(std::path::Path::new(":memory:")).expect("open")
@@ -158,6 +159,80 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    /// #4713 — B binds `root/proj` (a governed standard B owns). X's FIRST
+    /// bind at the unbound root segment `root` is refused on sqlite; B may
+    /// bind `root`; the operator bypass may; a sibling that merely shares a
+    /// string prefix is not a descendant; a `_` in the target is matched
+    /// literally (LIKE escaping).
+    #[test]
+    fn first_bind_above_a_foreign_owned_descendant_is_refused_4713() {
+        let c = conn();
+        let b_std = standard(&c, "s", r#"{"agent_id":"b","governance":{"write":"owner"}}"#);
+        meta(&c, "root/proj", Some(&b_std), None);
+        assert_eq!(
+            governing_descendants_binding(&c, "root", "x").expect("read"),
+            DescendantLevel::ForeignOwned
+        );
+        assert_eq!(
+            governing_descendants_binding(&c, "root", "b").expect("read"),
+            DescendantLevel::Ungoverned
+        );
+        assert_eq!(
+            set_admission_conn(&c, "x", false, "root"),
+            Err(SetRefusal::NotOwner)
+        );
+        assert!(set_admission_conn(&c, "b", false, "root").is_ok());
+        assert!(set_admission_conn(&c, "x", true, "root").is_ok());
+        // Not descendants: a string-prefix sibling, and the row itself.
+        assert!(set_admission_conn(&c, "x", false, "roo").is_ok());
+        assert!(set_admission_conn(&c, "x", false, "root2").is_ok());
+        // LIKE escaping: `team_x/%` must not match `teamyx/p`.
+        meta(&c, "teamyx/p", Some(&b_std), None);
+        assert!(set_admission_conn(&c, "x", false, "team_x").is_ok());
+        assert_eq!(
+            set_admission_conn(&c, "x", false, "teamyx"),
+            Err(SetRefusal::NotOwner)
+        );
+    }
+
+    /// #4713 — descendants that do not GOVERN never block: an unowned
+    /// standard, a standard with no policy. A severed / dangling descendant
+    /// fails closed with its own reason.
+    #[test]
+    fn descendant_gate_unowned_passes_and_severed_fails_closed_4713() {
+        let c = conn();
+        let unowned = standard(&c, "s", r#"{"governance":{"write":"any"}}"#);
+        meta(&c, "open/a", Some(&unowned), None);
+        let no_policy = standard(&c, "s", r#"{"agent_id":"b"}"#);
+        meta(&c, "open/b", Some(&no_policy), None);
+        assert_eq!(
+            governing_descendants_binding(&c, "open", "x").expect("read"),
+            DescendantLevel::Ungoverned
+        );
+        assert!(set_admission_conn(&c, "x", false, "open").is_ok());
+
+        // Severed (NULL pointer) and dangling (reaped memory) descendants.
+        meta(&c, "sev/null", None, None);
+        assert_eq!(
+            set_admission_conn(&c, "x", false, "sev"),
+            Err(SetRefusal::DescendantUnresolvable)
+        );
+        let d = conn();
+        meta(&d, "dang/gone", Some("no-such-memory"), None);
+        assert_eq!(
+            set_admission_conn(&d, "x", false, "dang"),
+            Err(SetRefusal::DescendantUnresolvable)
+        );
+        // A corrupt descendant standard is severed too (#4356 CR1 parity).
+        let e = conn();
+        let corrupt = standard(&e, "s", "[]");
+        meta(&e, "bad/child", Some(&corrupt), None);
+        assert_eq!(
+            set_admission_conn(&e, "x", false, "bad"),
+            Err(SetRefusal::DescendantUnresolvable)
+        );
     }
 
     /// A read fault on the chain refuses (Unverifiable), never "ungoverned".

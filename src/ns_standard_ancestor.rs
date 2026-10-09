@@ -421,6 +421,82 @@ mod tests {
         assert!(set_admission("c", false, "gov/leaf", &owned, &gov(Some("a"))).is_ok());
     }
 
+    /// #4713 — the descendant-side twin of the #4356 ancestor gate: a FIRST
+    /// bind (or unowned rebind) at `root` is refused when another principal
+    /// already owns a bound `root/proj` below it; the owner of every
+    /// governing descendant, an unowned or policy-less descendant, and the
+    /// operator bypass pass; a severed descendant fails closed.
+    #[test]
+    fn foreign_owned_descendant_refuses_a_first_bind_above_it_4713() {
+        let governing = |o: Option<&str>| AncestorLevel::Governing {
+            owner: o.map(str::to_string),
+        };
+        let ok = |levels: Vec<AncestorLevel>| -> Vec<Result<AncestorLevel, ()>> {
+            levels.into_iter().map(Ok).collect()
+        };
+        // B owns root/proj; X first-binds root.
+        assert_eq!(
+            select_governing_descendant("x", ok(vec![governing(Some("b"))])),
+            Ok(DescendantLevel::ForeignOwned)
+        );
+        // B binds root above its own root/proj.
+        assert_eq!(
+            select_governing_descendant("b", ok(vec![governing(Some("b"))])),
+            Ok(DescendantLevel::Ungoverned)
+        );
+        // Unowned / policy-less / absent descendants do not govern.
+        assert_eq!(
+            select_governing_descendant(
+                "x",
+                ok(vec![
+                    governing(None),
+                    AncestorLevel::NoPolicy,
+                    AncestorLevel::Absent
+                ])
+            ),
+            Ok(DescendantLevel::Ungoverned)
+        );
+        assert_eq!(
+            select_governing_descendant("x", ok(vec![])),
+            Ok(DescendantLevel::Ungoverned)
+        );
+        // A severed descendant fails closed and outranks a foreign one.
+        assert_eq!(
+            select_governing_descendant(
+                "x",
+                ok(vec![governing(Some("b")), AncestorLevel::Severed])
+            ),
+            Ok(DescendantLevel::Severed)
+        );
+        // A read fault propagates (fail-closed at the caller).
+        let faulty: Vec<Result<AncestorLevel, &str>> = vec![Err("fault")];
+        assert_eq!(select_governing_descendant("x", faulty), Err("fault"));
+
+        // The admission applies to a first bind / unowned rebind only.
+        let nm = NamespaceStandardBinding::NoMetaRow;
+        assert_eq!(
+            descendant_admission(&nm, &DescendantLevel::ForeignOwned),
+            Err(SetRefusal::NotOwner)
+        );
+        assert_eq!(
+            descendant_admission(&nm, &DescendantLevel::Severed),
+            Err(SetRefusal::DescendantUnresolvable)
+        );
+        assert!(descendant_admission(&nm, &DescendantLevel::Ungoverned).is_ok());
+        let unowned = NamespaceStandardBinding::Resolved(None);
+        assert_eq!(
+            descendant_admission(&unowned, &DescendantLevel::ForeignOwned),
+            Err(SetRefusal::NotOwner)
+        );
+        // A rebind of an OWNED standard stays the current owner's call (#3758).
+        let owned = NamespaceStandardBinding::Resolved(Some("x".into()));
+        assert!(descendant_admission(&owned, &DescendantLevel::ForeignOwned).is_ok());
+        assert_eq!(
+            refusal_reason(SetRefusal::DescendantUnresolvable),
+            REASON_DESCENDANT_STANDARD_UNRESOLVABLE
+        );
+    }
+
     #[test]
     fn normalise_owner_treats_empty_and_system_as_unowned_4356() {
         assert_eq!(normalise_owner(Some(String::new())), None);
