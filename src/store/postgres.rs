@@ -88,6 +88,7 @@ mod tx_retry;
 // qual_10 budget reason as `parity_3064` above.
 mod bootstrap_ddl;
 mod governance_chain_4477; // #4477 one chain builder, #4492 bind depth (qual_10 budget)
+pub use governance_chain_4477::list_over_depth_chains_pg; // #4715 doctor census
 mod ns_standard_ancestor_4356; // #4356 bind gate (own module: qual_10 budget)
 mod ns_standard_bind; // #4478 SET body, caller + federated gate (qual_10 budget)
 // v1.0.0 #3614 — the lineage walk (recursive CTE + AGE Cypher + the backend
