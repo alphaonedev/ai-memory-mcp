@@ -411,7 +411,7 @@ API key comes from the `api_key` field in `config.toml`).
 |------|------|---------|-------|
 | `--host` | string | `127.0.0.1` | |
 | `--port` | u16 | `9077` | |
-| `--tls-cert`/`--tls-key` | path | — | Operator-supplied in-process HTTPS material (rustls, no OpenSSL): full chain PEM + PKCS#8 key, SANs covering every bind host. TLS itself is REQUIRED since v1.0.0 (#3705, "only encrypted data in transit"). On a SINGLETON the flags are optional — first boot generates a local CA + server certificate under `<key_dir>/tls/` and renews it (#3709 item 1). On a FLEET-shaped deployment (production / federated / hive, per #3700) they are REQUIRED: enterprise PKI is the first-class path and a fleet without operator material is refused (3x7 audit ruling — an unmanaged CA in an enterprise estate is an audit finding). A plaintext listener is refused everywhere, loopback included. |
+| `--tls-cert`/`--tls-key` | path | — | Operator-supplied in-process HTTPS material (rustls, no OpenSSL): full chain PEM + PKCS#8 key, SANs covering every bind host. TLS itself is REQUIRED since v1.0.0 (#3705, "only encrypted data in transit"). On a SINGLETON the flags are optional — first boot generates a local CA + server certificate under `<key_dir>/tls/` and renews it (#3709 item 1). On a FLEET-shaped deployment (production / federated / hive, per #3700) operator material is REQUIRED — supplied through these flags or installed with `ai-memory tls import`: enterprise PKI is the first-class path and a fleet without operator material is refused (3x7 audit ruling — an unmanaged CA in an enterprise estate is an audit finding). A plaintext listener is refused everywhere, loopback included. |
 | `--mtls-allowlist` | path | — | SHA-256 cert-fingerprint allowlist (requires `--tls-cert`). |
 | `--shutdown-grace-secs` | u64 | `30` | SIGINT grace period. |
 | `--quorum-writes` | usize | `0` | v0.7 federation: W, the acknowledgements required **including the local commit** (a write returns OK after the local commit plus `W-1` distinct peer acks within `--quorum-timeout-ms`; W=1 requires no remote acknowledgement). `0` = federation off. |
@@ -450,10 +450,14 @@ declared shape is not `singleton` gets no local CA at all**: `serve` refuses
 without operator material. The declaration decides — a node whose signals
 or agent registry look like a fleet is WARNED by the #3700 detector, never
 re-postured (promotion is an operator act) — see
-`docs/SECURITY.md` "Bring your own certificate". The `ai-memory tls
-init|import|renew` and `ai-memory db check-tls` verbs are v1.0.1 (#3709 items 2-4); until they ship the refusals name only what exists — `--tls-cert/--tls-key`, `sslmode=verify-full&sslrootcert=<ca.crt>`, the files under `<key_dir>/tls/` — and are
-#3709 items 2–4 (a separate branch); until they land, first-boot generation
-and `--tls-cert`/`--tls-key` are the two paths.
+`docs/SECURITY.md` "Bring your own certificate". v1.0.0 ships
+`ai-memory tls init`, `tls import` and `tls status` (`src/cli/tls.rs`; see
+the `tls` section below); `tls renew` for imported material (re-run
+`import`) and `ai-memory db check-tls` are NOT shipped in v1.0.0 (#3709), and
+a refusal names only what exists — `--tls-cert/--tls-key`, `ai-memory tls
+import`, `sslmode=verify-full&sslrootcert=<ca.crt>`, the files under
+`<key_dir>/tls/`. First-boot generation (singleton), `--tls-cert`/`--tls-key`,
+and `ai-memory tls import` are the three paths to listener material.
 
 ### `sync`, `sync-daemon`
 
