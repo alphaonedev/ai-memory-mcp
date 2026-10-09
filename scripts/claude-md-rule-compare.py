@@ -193,9 +193,11 @@ def config_free_env() -> dict:
     """The environment of the trailer parser (#6396): built from scratch, so nothing the host exports
     (GIT_CONFIG_COUNT/KEY_n/VALUE_n, GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, HOME, XDG_CONFIG_HOME) reaches it; the
     system config is switched off (git reads it from a compile-time path otherwise) and the global one is the null
-    device."""
+    device. GIT_DIR is the null device, so no repository is discovered whatever the working directory is
+    (GIT_CEILING_DIRECTORIES stops an upward walk but does not exclude the working directory itself, #6433)."""
     return {"PATH": os.environ.get("PATH", os.defpath), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-            "HOME": os.devnull, "XDG_CONFIG_HOME": os.devnull, "GIT_CEILING_DIRECTORIES": os.sep}
+            "HOME": os.devnull, "XDG_CONFIG_HOME": os.devnull, "GIT_CEILING_DIRECTORIES": os.sep,
+            "GIT_DIR": os.devnull}
 
 
 def trailer_block(message: bytes) -> str:
@@ -204,9 +206,10 @@ def trailer_block(message: bytes) -> str:
     `git interpret-trailers --parse` decides what is a trailer with git's own rules, but it also reads
     `trailer.<token>.key` and `trailer.separators` from the system, global and repository configuration; a
     configured token aliases another line to the approval key or turns a mostly-prose final paragraph into a trailer
-    block. So the parser runs from the filesystem root (outside any repository, so the repository config is never
-    found) with no system config, no global config and no HOME or XDG directory; its defaults (separator `:`) are
-    then the only rules. A parser failure raises RuntimeError (fail closed)."""
+    block. So the parser runs with GIT_DIR at the null device (#6433: no repository is discovered, so the repository
+    config is never found, whatever the working directory is; the filesystem root is only a second line of defence),
+    no system config, no global config and no HOME or XDG directory; its defaults (separator `:`) are then the only
+    rules. A parser failure raises RuntimeError (fail closed)."""
     try:
         result = subprocess.run(["git", "interpret-trailers", "--parse", "--no-divider"], input=message,
                                 capture_output=True, check=False, cwd=os.sep, env=config_free_env())
