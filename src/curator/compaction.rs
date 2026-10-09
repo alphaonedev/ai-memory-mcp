@@ -1752,6 +1752,9 @@ mod tests {
             fail_persist: bool,
             fail_verify: bool,
             fail_discard: bool,
+            /// #4821 — fail every write-ahead `store` (the pass's only
+            /// `store` call), as an unwritable rollback log would.
+            fail_write_ahead: bool,
             summary_id: Mutex<Option<String>>,
             stored: Mutex<Vec<String>>,
         }
@@ -1772,6 +1775,9 @@ mod tests {
                 ctx: &CallerContext,
                 memory: &Memory,
             ) -> crate::store::StoreResult<String> {
+                if self.fail_write_ahead {
+                    return Err(injected("write-ahead"));
+                }
                 let id = self.inner.store(ctx, memory).await?;
                 self.stored.lock().unwrap().push(id.clone());
                 Ok(id)
@@ -1951,6 +1957,7 @@ mod tests {
                 fail_persist,
                 fail_verify,
                 fail_discard,
+                fail_write_ahead: false,
                 summary_id: Mutex::new(None),
                 stored: Mutex::new(Vec::new()),
             };
@@ -1992,6 +1999,82 @@ mod tests {
                     usize::from(discard),
                     "{label}: a failed discard leaves the row"
                 );
+            }
+        }
+
+        /// #4821 — a rollback write-ahead failure HALTS the sweep (the #3116
+        /// fail-closed shape): the next cluster is never summarised, so no
+        /// further LLM spend or write-ahead retry lands against a log that
+        /// just failed. Two eligible clusters; the write-ahead fails on the
+        /// first; exactly one summarise call is allowed.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn write_ahead_failure_halts_the_sweep_4821() {
+            let _dag = crate::test_support::no_lineage_dag_guard();
+            let (store, _dir) = open_db();
+            let ctx = CallerContext::for_admin(CONSOLIDATOR_AGENT_ID);
+            let mut candidates = Vec::new();
+            for (ns, axis, content) in [
+                (
+                    "halt-a",
+                    0usize,
+                    "kubernetes rolling canary deploy strategy notes",
+                ),
+                (
+                    "halt-b",
+                    1usize,
+                    "postgres vacuum autovacuum tuning checklist notes",
+                ),
+            ] {
+                let mut vector = vec![0.0_f32; 384];
+                vector[axis] = 1.0;
+                for title in ["first", "second"] {
+                    let memory = make_memory_full(
+                        &uuid::Uuid::new_v4().to_string(),
+                        ns,
+                        title,
+                        content,
+                        Tier::Mid,
+                        5,
+                    );
+                    store.store(&ctx, &memory).await.unwrap();
+                    store
+                        .update_embedding(
+                            &ctx,
+                            &memory.id,
+                            Some(&vector),
+                            &crate::embeddings::embedding_space_fingerprint("test-space"),
+                        )
+                        .await
+                        .unwrap();
+                    candidates.push(store.get(&ctx, &memory.id).await.unwrap());
+                }
+            }
+            let fault = FaultStore {
+                inner: &store,
+                fail_persist: false,
+                fail_verify: false,
+                fail_discard: false,
+                fail_write_ahead: true,
+                summary_id: Mutex::new(None),
+                stored: Mutex::new(Vec::new()),
+            };
+            let llm = StubLlm::new("synthesized summary");
+            let report = ConsolidationPass::new(&fault, &llm, false)
+                .run(&candidates)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                report.eligible_clusters, 1,
+                "the sweep stops at cluster one"
+            );
+            let summarised = llm.calls.lock().unwrap().iter().count();
+            assert_eq!(summarised, 1, "cluster two must never be summarised");
+            assert!(report.rollback_write_ahead_failed);
+            assert_eq!(report.memories_consolidated, 0);
+            for source in &candidates {
+                let live = store.get(&ctx, &source.id).await.unwrap();
+                assert_eq!(live.content, source.content, "sources untouched");
             }
         }
 
