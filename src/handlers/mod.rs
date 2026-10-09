@@ -309,8 +309,9 @@ mod capability_from_headers_tests {
     /// 403, never collapse to "absent = bare ACL".
     #[test]
     fn presented_non_utf8_capability_header_is_403() {
-        // #6119: this test appends to the process-global forensic sink; hold the
-        // sink lock FIRST, then the capability-config lock (order: forensic -> cap).
+        // #6119: this test appends to the process-global forensic sink; it holds
+        // only the forensic sink lock. It never reads capability config, so no
+        // capability-config lock is taken.
         let _sink = crate::governance::audit::forensic_sink_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
