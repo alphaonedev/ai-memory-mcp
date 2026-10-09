@@ -4668,6 +4668,12 @@ pub fn run_mcp_server(
         }
     }
 
+    // #2426 — WARN for every configured hook whose event cannot fire here.
+    crate::hooks::warn_inert_subscriptions_at_boot(
+        app_config.resolve_hooks_enforce_mode(),
+        &app_config.resolve_required_events(),
+    );
+
     // #1885 (critical) — MCP PRE-event mandatory-hook-presence ENFORCEMENT gate.
     // Wire `dispatch_pre_event_enforced` into the real pre-event MCP handlers
     // (memory_store → PreStore, plus delete / promote / link / consolidate /

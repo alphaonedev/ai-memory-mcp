@@ -261,7 +261,10 @@ pub enum HookEvent {
     /// configure this hook in `mode = "daemon"` to amortize spawn
     /// cost. Classified as [`crate::hooks::EventClass::HotPath`].
     ///
-    /// Wires here at `crate::mcp::handle_recall` (top of fn).
+    /// NOT WIRED at v1.0.0 (#2426): the fire site,
+    /// `crate::mcp::handle_recall_with_pre_recall_hook`, has no production
+    /// caller; `memory_recall` dispatches to `handle_recall_caller`.
+    /// See [`crate::hooks::dispatch_status`].
     PreRecallExpand,
     /// v0.7.0 recursive-learning Task 6/8 — fires BEFORE the
     /// depth-cap check inside `db::reflect`. **Decision-class** hook:

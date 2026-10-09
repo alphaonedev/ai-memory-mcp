@@ -120,47 +120,59 @@ the `post_recall` / `post_search` notify events are retained):
 
 | Event | Phase | Class | Fires on | Wired at v1.0.0? |
 |---|---|---|---|---|
-| `pre_store` | write | Write | `memory_store`, `memory_update` (when content changes) | **yes** |
+| `pre_store` | write | Write | `memory_store`, `memory_update` (when content changes) | **only under the enforce gate** |
 | `post_store` | write | Write | intended: post-INSERT | **no — never fires** |
 | `post_recall` | read | Read | intended: `memory_recall`, family-loader recall | **no — never fires** |
 | `post_search` | read | Read | intended: `memory_search` | **no — never fires** |
-| `pre_delete` | write | Write | `memory_delete` | **yes** |
+| `pre_delete` | write | Write | `memory_delete` | **only under the enforce gate** |
 | `post_delete` | write | Write | intended: post-DELETE | **no — never fires** |
-| `pre_promote` | write | Write | tier promotion (manual + auto) | **yes** |
+| `pre_promote` | write | Write | tier promotion (manual + auto) | **only under the enforce gate** |
 | `post_promote` | write | Write | intended: post-UPDATE | **no — never fires** |
-| `pre_link` | write | Write | `memory_link` | **yes** |
+| `pre_link` | write | Write | `memory_link` | **only under the enforce gate** |
 | `post_link` | write | Write | intended: post-INSERT | **no — never fires** |
-| `pre_consolidate` | write | Write | `memory_consolidate` | **yes** |
+| `pre_consolidate` | write | Write | `memory_consolidate` | **only under the enforce gate** |
 | `post_consolidate` | write | Write | intended: post-return | **no — never fires** |
-| `pre_governance_decision` | gate | Write | governance pipeline | **yes** |
+| `pre_governance_decision` | gate | Write | governance pipeline | **only under the enforce gate** |
 | `post_governance_decision` | gate | Write | intended: post-return | **no — never fires** |
 | `on_index_eviction` | maintenance | Index | intended: HNSW eviction | **no — sink never installed** |
 
 > ### ⚠️ Firing status at v1.0.0 — read this before configuring a `post_*` hook
 >
-> **The decision-class `pre_*` events all fire. Most notify-class events do
-> not.** Verified against `release/v1.0.0`:
+> **No notify-class `post_*` event fires except `post_signal_ack`, and the
+> decision-class `pre_*` events fire only under the PE-1 enforcement gate.**
+> The authoritative registry is `crate::hooks::dispatch_status`
+> (`src/hooks/dispatch.rs`, #2426), kept honest by a source-scan test, and
+> `ai-memory doctor --hooks` (human and `--json`, field
+> `inert_subscriptions`) plus a boot WARN name every configured hook that
+> will not run:
 >
-> - **Wired (11 of 22)** — every one of the 10 decision-class `pre_*` events
->   (`pre_store`, `pre_delete`, `pre_promote`, `pre_link`, `pre_consolidate`,
->   `pre_governance_decision`, `pre_reflect`, `pre_compaction`,
->   `pre_recall_expand`, `pre_signal_send`) plus the one notify event
->   `post_signal_ack` (installed only when an operator has configured a
->   `post_signal_ack` hook). **Hook-based ENFORCEMENT is fully wired** — a
->   `Deny` from any `pre_*` hook really refuses the operation.
-> - **Advertised but NOT wired (11 of 22)** — `post_store`, `post_recall`,
+> - **Fires whenever configured (2 of 22)** — `pre_signal_send` and
+>   `post_signal_ack`, on the MCP stdio surface (`memory_signal_send` /
+>   `memory_signal_ack`).
+> - **Fires only under the enforcement gate (8 of 22)** — `pre_store`,
+>   `pre_delete`, `pre_promote`, `pre_link`, `pre_consolidate`,
+>   `pre_governance_decision`, `pre_reflect`, `pre_compaction`. These are
+>   consulted through `consult_pre_event_gate`, which is installed only when
+>   `[hooks].enforce_mode` is not `off` AND `[hooks].required_events` is
+>   non-empty. With the default `enforce_mode = off`, a hook configured on
+>   one of them never runs. Under the gate, a `Deny` really refuses the
+>   operation.
+> - **Never fires (12 of 22)** — `post_store`, `post_recall`,
 >   `post_search`, `post_delete`, `post_promote`, `post_link`,
 >   `post_consolidate`, `post_governance_decision`, `post_reflect`,
->   `on_index_eviction`, `on_compaction_rollback`. These variants parse from
->   `hooks.toml`, classify, and appear in `ai-memory doctor --hooks`, but no
->   production code path fires them, so a hook configured on one of them will
->   **never execute**. (`on_index_eviction` has a complete producer/observer
->   bridge in `src/hnsw.rs` + `src/hooks/chain.rs`, but nothing calls
->   `set_eviction_sink` outside tests, so the channel is never connected.)
+>   `on_index_eviction`, `on_compaction_rollback`, and `pre_recall_expand`.
+>   These variants parse from `hooks.toml`, but no production code path
+>   fires them, so a hook configured on one of them will **never execute**.
+>   (`on_index_eviction` has a complete producer/observer bridge in
+>   `src/hnsw.rs` + `src/hooks/chain.rs`, but nothing calls
+>   `set_eviction_sink` outside tests, so the channel is never connected.
+>   `pre_recall_expand`'s only fire site,
+>   `crate::mcp::handle_recall_with_pre_recall_hook`, has no production
+>   caller: `memory_recall` dispatches to `handle_recall_caller` directly.)
 >
 > This contradicts the standard this project states for itself under #2637 /
 > #2758 — "a hook the substrate advertises must actually fire, or it must not
-> be advertised". The disposition for these 11 (wire them, or remove them as
+> be advertised". The disposition for these 12 (wire them, or remove them as
 > `pre_archive` / `pre_recall` / `pre_search` were removed) is **open**, and
 > is a code change, not a docs change. This table records the measured
 > behaviour in the meantime. Do not build observability or audit pipelines on
@@ -189,7 +201,7 @@ The 5 grand-slam additions:
 
 | Event | Track | Class | Fires on |
 |---|---|---|---|
-| `pre_recall_expand` | G10 | **HotPath** | query-expansion synthesise step |
+| `pre_recall_expand` | G10 | **HotPath** | query-expansion synthesise step — **never fires** (no production caller of its fire site, #2426) |
 | `pre_reflect` / `post_reflect` | Recursive-learning Task 6/8 | Write | `memory_reflect` |
 | `pre_compaction` / `on_compaction_rollback` | L1-7 | Write | curator compaction pipeline |
 

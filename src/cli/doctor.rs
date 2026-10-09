@@ -657,6 +657,9 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
     let enforce_mode = app_config.resolve_hooks_enforce_mode();
     let required_events = app_config.resolve_required_events();
     let preflight = crate::hooks::preflight_report(&hooks, enforce_mode, &required_events);
+    // #2426 — subscriptions that cannot fire in this configuration.
+    let gate_installed = hooks_gate_installed(enforce_mode, &required_events);
+    let inert = crate::hooks::inert_subscriptions(&hooks, gate_installed);
 
     if args.json {
         let payload = serde_json::json!({
@@ -670,6 +673,8 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
                 .map(|e| crate::hooks::enforce::event_wire(*e))
                 .collect::<Vec<_>>(),
             "enforce_preflight": preflight,
+            // #2426 — enabled hooks whose event will not fire.
+            "inert_subscriptions": inert,
             "executors": hooks.iter().map(|h| serde_json::json!({
                 "event": h.event,
                 "command": h.command.display().to_string(),
@@ -698,6 +703,7 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
     }
 
     render_hooks_human_with(out, path_opt.as_deref(), &hooks)?;
+    render_inert_subscriptions(out, &inert)?;
     // #1734 PE-1 — enforcement pre-flight block.
     if preflight.is_empty() {
         writeln!(
@@ -727,7 +733,36 @@ fn render_hooks_human(out: &mut CliOutput<'_>) -> Result<()> {
         Some(p) if p.exists() => HookConfig::load_from_file(p).unwrap_or_default(),
         _ => Vec::new(),
     };
-    render_hooks_human_with(out, path_opt.as_deref(), &hooks)
+    render_hooks_human_with(out, path_opt.as_deref(), &hooks)?;
+    let app_config = crate::config::AppConfig::load();
+    let gate_installed = hooks_gate_installed(
+        app_config.resolve_hooks_enforce_mode(),
+        &app_config.resolve_required_events(),
+    );
+    render_inert_subscriptions(
+        out,
+        &crate::hooks::inert_subscriptions(&hooks, gate_installed),
+    )
+}
+
+/// #2426 — mirrors the install condition of the PE-1 pre-event gate in
+/// `serve` / `mcp` / `curator`: enforce not off AND a required event declared.
+fn hooks_gate_installed(
+    mode: crate::hooks::HookEnforceMode,
+    required: &[crate::hooks::HookEvent],
+) -> bool {
+    mode != crate::hooks::HookEnforceMode::Off && !required.is_empty()
+}
+
+/// #2426 — one WARN line per enabled hook subscription that will not run.
+fn render_inert_subscriptions(
+    out: &mut CliOutput<'_>,
+    inert: &[crate::hooks::InertSubscription],
+) -> Result<()> {
+    for i in inert {
+        writeln!(out.stdout, "  WARN: {}", i.message)?;
+    }
+    Ok(())
 }
 
 fn render_hooks_human_with(

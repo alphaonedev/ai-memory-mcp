@@ -8163,6 +8163,11 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         app_config.resolve_hooks_enforce_mode().as_str(),
         app_config.resolve_required_events().len()
     );
+    // #2426 — WARN for every configured hook whose event cannot fire here.
+    crate::hooks::warn_inert_subscriptions_at_boot(
+        app_config.resolve_hooks_enforce_mode(),
+        &app_config.resolve_required_events(),
+    );
 
     // #1924 (CWE-288) — INSTALL the process pre-event enforcement gate on the
     // HTTP daemon, mirroring `run_mcp_server`'s MCP install. Pre-#1924 ONLY the
