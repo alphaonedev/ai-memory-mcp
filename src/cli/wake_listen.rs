@@ -404,6 +404,10 @@ pub async fn run_exec_hook(
 /// coalesced wakes, or one flagged `lagged`, DOES return — there is mail
 /// waiting.
 ///
+/// The ignored empty welcome does NOT restart the backstop clock (#4058):
+/// only a read that really completed may, so a wait without `--timeout`
+/// keeps its documented `<= poll interval` bound across reconnects.
+///
 /// `None` means the caller's timeout expired, or every producer stopped —
 /// a bounded, honest "nothing arrived".
 async fn wait_on(stream: &mut WakeStream, timeout: Option<Duration>) -> Option<WakeSignal> {
@@ -418,8 +422,14 @@ async fn wait_on(stream: &mut WakeStream, timeout: Option<Duration>) -> Option<W
         };
         let signal = signal?;
         if signal.reason == WakeReason::Welcome && signal.pending_count == 0 {
-            // An empty welcome is "you are attached", not "you have mail".
-            stream.note_read();
+            // An empty welcome is "you are attached", not "you have mail" —
+            // and it is NOT a read, so the backstop clock is left alone
+            // (#4058). `note_read` means "a catch-up read just completed";
+            // acknowledging one that never ran let every reconnect that
+            // ended in an empty welcome postpone the backstop by up to a
+            // full interval, and the hub's welcome counts its in-memory
+            // hint set, not the durable inbox, so an empty welcome never
+            // proved an empty inbox.
             continue;
         }
         return Some(signal);
