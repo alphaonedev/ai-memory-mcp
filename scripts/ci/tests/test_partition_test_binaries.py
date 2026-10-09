@@ -469,6 +469,74 @@ class LibGateFollowUps6344R2(Base):
         self.assertEqual(totals['parallel_1_est'] + totals['parallel_2_est'], 10.0)
 
 
+class LibCallerResolution6412(Base):
+    """#6412: callers of a Postgres helper are followed by resolved path, not bare name."""
+
+    HELPER = 'pub(crate) fn live_pg_url() -> String { std::env::var("AI_MEMORY_TEST_POSTGRES_URL").unwrap() }\n'
+
+    @staticmethod
+    def in_tests(body):
+        return '#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() { %s }\n}\n' % body
+
+    def gate(self, a_rs, prefixes=('support',)):
+        fx('src/lib.rs', 'mod support;\nmod a;\n')
+        fx('src/support.rs', self.HELPER)
+        fx('src/a.rs', a_rs)
+        return pt.uncovered_lib_pg_modules(SCRATCH / 'src', list(prefixes))
+
+    def test_same_named_unrelated_fn_is_not_a_pg_site_6412(self):
+        a = 'fn live_pg_url() -> &\'static str { "x" }\n' + self.in_tests('let _ = live_pg_url();')
+        self.assertEqual(self.gate(a), [])
+
+    def test_same_named_method_is_not_a_pg_site_6412(self):
+        a = ('struct S;\nimpl S { fn live_pg_url(&self) -> u8 { 0 } }\n'
+             + self.in_tests('let _ = S.live_pg_url();'))
+        self.assertEqual(self.gate(a), [])
+
+    def test_name_in_string_literal_or_comment_is_not_a_pg_site_6412(self):
+        a = '// live_pg_url() in a comment\n' + self.in_tests('let _s = "live_pg_url()";')
+        self.assertEqual(self.gate(a), [])
+
+    def test_aliased_import_is_a_pg_site_6412(self):
+        a = 'use crate::support::live_pg_url as u;\n' + self.in_tests('let _ = super::u();')
+        self.assertEqual(self.gate(a), ['a::tests::t'])
+        self.assertEqual(self.gate(a, ['support', 'a::tests::t']), [])
+
+    def test_aliased_group_import_and_module_alias_are_pg_sites_6412(self):
+        group = 'use crate::support::{live_pg_url as u};\n' + self.in_tests('let _ = super::u();')
+        self.assertEqual(self.gate(group), ['a::tests::t'])
+        modal = 'use crate::support as s;\n' + self.in_tests('let _ = super::s::live_pg_url();')
+        self.assertEqual(self.gate(modal), ['a::tests::t'])
+
+    def test_glob_and_plain_imports_are_pg_sites_6412(self):
+        a = 'use crate::support::live_pg_url;\n' + self.in_tests('let _ = super::live_pg_url();')
+        self.assertEqual(self.gate(a), ['a::tests::t'])
+        b = 'use crate::support::*;\nfn wrap() -> String { live_pg_url() }\n'
+        self.assertEqual(self.gate(b), ['a'])
+
+    def test_function_passed_by_name_without_a_call_is_a_pg_site_6412(self):
+        a = self.in_tests('let f = crate::support::live_pg_url; let _ = f;')
+        self.assertEqual(self.gate(a), ['a::tests::t'])
+        b = self.in_tests('run(crate::support::live_pg_url);')
+        self.assertEqual(self.gate(b), ['a::tests::t'])
+
+    def test_qualified_and_spaced_calls_still_resolve_6412(self):
+        for call in ('crate::support::live_pg_url()', 'crate::support::live_pg_url ()',
+                     'crate :: support :: live_pg_url::<>()'):
+            self.assertEqual(self.gate(self.in_tests('let _ = %s;' % call)), ['a::tests::t'], call)
+
+    def test_qualifier_that_resolves_elsewhere_is_not_a_pg_site_6412(self):
+        a = self.in_tests('let _ = other::live_pg_url();')
+        self.assertEqual(self.gate(a), [])
+
+    def test_helper_defined_as_a_method_stays_fail_closed_6412(self):
+        fx('src/lib.rs', 'mod support;\nmod a;\n')
+        fx('src/support.rs', 'pub struct H;\nimpl H { pub fn url(&self) -> String '
+           '{ std::env::var("AI_MEMORY_TEST_POSTGRES_URL").unwrap() } }\n')
+        fx('src/a.rs', self.in_tests('let _ = crate::support::H.url();'))
+        self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['support']), ['a::tests::t'])
+
+
 class DocEstimateTests6344B6(Base):
     def test_doc_tests_are_in_the_serial_estimate_6344(self):
         exes = pt.parse_build_json([artifact(['lib'], 'ai_memory', SCRATCH / 'src' / 'lib.rs', '/x/lib'),

@@ -670,6 +670,181 @@ def lib_units(src_root):
     return units
 
 
+USE_RE = re.compile(r'\buse\s+([^;]*);')
+USE_TOKEN_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*|::|[{},*]')
+
+
+def expand_use_tree(text):
+    """Expand a use tree into (segments, alias, glob) triples.
+
+    ``a::{b, c as d, self}`` -> (a,b), (a,c,'d'), (a,) ; ``a::*`` -> (a,) with
+    glob set. A trailing ``self`` is dropped (it names the module itself).
+    """
+    toks = USE_TOKEN_RE.findall(text)
+    pos = [0]
+
+    def peek():
+        return toks[pos[0]] if pos[0] < len(toks) else None
+
+    def tree(prefix):
+        segs = list(prefix)
+        while True:
+            t = peek()
+            if t == '::':
+                pos[0] += 1
+            elif t == '{':
+                pos[0] += 1
+                out = []
+                while peek() not in (None, '}'):
+                    out += tree(segs)
+                    if peek() == ',':
+                        pos[0] += 1
+                pos[0] += 1
+                return out
+            elif t == '*':
+                pos[0] += 1
+                return [(tuple(segs), None, True)]
+            elif t is not None and t not in (',', '}', 'as'):
+                segs.append(t)
+                pos[0] += 1
+                if peek() == 'as':
+                    alias = toks[pos[0] + 1] if pos[0] + 1 < len(toks) else None
+                    pos[0] += 2
+                    return [(tuple(segs[:-1] if segs[-1] == 'self' and len(segs) > 1 else segs), alias, False)]
+                if peek() != '::':
+                    return [(tuple(segs[:-1] if segs[-1] == 'self' and len(segs) > 1 else segs), None, False)]
+            else:
+                return []
+
+    return tree(())
+
+
+class UseScope:
+    """What `use` items bind inside one module (a module path tuple)."""
+
+    def __init__(self):
+        self.items = []   # (segments, local name) for every non-glob import
+        self.globs = []   # segments of every `use path::*`
+
+
+def module_tuple(modp, ctx):
+    """Module path tuple for a position (file module + inline mods, stopping at a test fn)."""
+    parts = [x for x in modp.split('::') if x]
+    for kind, name, is_test in ctx:
+        if kind == 'fn' and is_test:
+            break
+        if kind == 'mod':
+            parts.append(name)
+    return tuple(parts)
+
+
+def resolve_modules(segs, here, scopes):
+    """Module tuples a path prefix can name from module ``here`` (crate/self/super and `use` aliases)."""
+    cur = None
+    for seg in segs:
+        if cur is None:
+            if seg == 'crate':
+                cur = {()}
+            elif seg == 'self':
+                cur = {here}
+            elif seg == 'super':
+                cur = {here[:-1]}
+            else:
+                cur = {here + (seg,), (seg,)}
+                for target in scopes.get(here, UseScope()).items:
+                    if target[1] == seg:
+                        cur |= resolve_modules(target[0], here, {})
+        elif seg == 'super':
+            cur = {q[:-1] for q in cur}
+        elif seg == 'self':
+            continue
+        else:
+            nxt = {q + (seg,) for q in cur}
+            for q in cur:
+                for target in scopes.get(q, UseScope()).items:
+                    if target[1] == seg:
+                        nxt |= resolve_modules(target[0], q, {})
+            cur = nxt
+    return cur or set()
+
+
+def collect_use_scopes(units):
+    """({module tuple: UseScope}, {file path: [(start, end)]}) for every `use` item in the lib."""
+    scopes, spans = {}, {}
+    for rf, modp in units:
+        found = list(USE_RE.finditer(rf.shape))
+        spans[rf.path] = [(m.start(), m.end()) for m in found]
+        for m, ctx in zip(found, rf.contexts([m.start() for m in found])):
+            scope = scopes.setdefault(module_tuple(modp, ctx), UseScope())
+            for segs, alias, glob in expand_use_tree(m.group(1)):
+                if glob:
+                    scope.globs.append(segs)
+                elif segs:
+                    scope.items.append((segs, alias or segs[-1]))
+    return scopes, spans
+
+
+def helper_hit(defmod, name, is_method, ref, here, qual, scopes):
+    """Whether the reference ``ref`` (qualifier ``qual``) in module ``here`` names the helper."""
+    if is_method:
+        return ref == name
+    if not qual:
+        if ref == name and here == defmod:
+            return True
+        scope = scopes.get(here, UseScope())
+        if any(local == ref and segs[-1] == name and defmod in resolve_modules(segs[:-1], here, scopes)
+               for segs, local in scope.items):
+            return True
+        return ref == name and any(defmod in resolve_modules(g, here, scopes) for g in scope.globs)
+    for q in resolve_modules(qual, here, scopes):
+        if ref == name and q == defmod:
+            return True
+        if any(local == ref and segs[-1] == name and defmod in resolve_modules(segs[:-1], q, scopes)
+               for segs, local in scopes.get(q, UseScope()).items):
+            return True
+    return False
+
+
+def helper_callers(units, helpers, site_path):
+    """Sites that call or pass by name a Postgres helper, resolved by module path and `use` aliases.
+
+    Strings and comments are blanked (``shape`` view). A free-fn helper matches a bare name only
+    in its own module or through a ``use`` (plain, aliased or glob) that resolves to it, and a
+    qualified name only when the qualifier resolves to its module; a same-named fn or method
+    elsewhere does not match (#6412). A helper that is itself an impl/trait method has no path to
+    resolve, so any non-definition mention of its name counts (fail closed).
+    """
+    scopes, spans = collect_use_scopes(units)
+    names = {n for (_m, n) in helpers}
+    out = []
+    for rf, modp in units:
+        locals_ = {local for sc in scopes.values() for segs, local in sc.items if segs[-1] in names}
+        pat = re.compile(r'\b(%s)\b' % '|'.join(map(re.escape, sorted(names | locals_))))
+        refs = []
+        for m in pat.finditer(rf.shape):
+            if any(a <= m.start() < b for a, b in spans[rf.path]):
+                continue  # an import, not a reference
+            before = rf.shape[max(0, m.start() - 256):m.start()]
+            after = rf.shape[m.end():m.end() + 4]
+            if FN_BEFORE_RE.search(before) or re.match(r'\s*(!|:(?!:)|::(?!\s*<))', after):
+                continue  # definition, macro, field/param/label or a module prefix
+            q = re.search(r'((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+)$', before)
+            qual = tuple(re.findall(r'[A-Za-z_][A-Za-z0-9_]*', q.group(1))) if q else ()
+            head = before[:q.start()] if q else before
+            refs.append((m, qual, head.rstrip().endswith('.')))
+        if not refs:
+            continue
+        for (m, qual, dotted), ctx in zip(refs, rf.contexts([r[0].start() for r in refs])):
+            here = module_tuple(modp, ctx)
+            path, _ = site_path(modp, ctx)
+            for (defmod, name), (is_method, def_paths) in helpers.items():
+                if dotted and not is_method:
+                    continue  # `x.name()` is a method call, never the free fn
+                if path not in def_paths and helper_hit(defmod, name, is_method, m.group(1), here, qual, scopes):
+                    out.append((path, '%s:%d (calls %s)' % (rf.path, rf.code.count('\n', 0, m.start()) + 1, name)))
+    return out
+
+
 def lib_pg_sites(src_root):
     """Every lib code site that names the Postgres test URL.
 
@@ -686,7 +861,7 @@ def lib_pg_sites(src_root):
         consts.update(m.group(1) for m in PG_CONST_RE.finditer(rf.code))
     const_re = re.compile(r'\b(%s)\b' % '|'.join(map(re.escape, sorted(consts)))) if consts else None
     out = []
-    helpers = {}  # fn name -> where a non-test fn names the URL (callers in other modules count too, r2 F2)
+    helpers = {}  # (module tuple, fn name) -> [is method, def paths]: a non-test fn that names the URL (r2 F2; resolved by path, #6412)
 
     def site_path(modp, ctx):
         parts = [modp] if modp else []
@@ -709,22 +884,16 @@ def lib_pg_sites(src_root):
         for at, ctx in zip(pos, rf.contexts(pos)):
             path, test_fn = site_path(modp, ctx)
             if test_fn is None:
-                fns = [name for kind, name, _ in ctx if kind == 'fn']
-                if fns:  # innermost enclosing fn: a helper any other test may call
-                    helpers.setdefault(fns[-1], set()).add(path)
+                fn_at = [i for i, (kind, _n, _t) in enumerate(ctx) if kind == 'fn']
+                if fn_at:  # innermost enclosing fn: a helper any other test may call
+                    i = fn_at[-1]
+                    entry = helpers.setdefault((module_tuple(modp, ctx), ctx[i][1]), [False, set()])
+                    entry[0] = entry[0] or (i > 0 and ctx[i - 1][0] == 'blk')  # impl/trait method: resolved by name only
+                    entry[1].add(path)
             line = rf.code.count('\n', 0, at) + 1
             out.append((path, '%s:%d' % (rf.path, line)))
     if helpers:
-        call_re = re.compile(r'\b(%s)\s*\(' % '|'.join(map(re.escape, sorted(helpers))))
-        for rf, modp in units:
-            calls = [m for m in call_re.finditer(rf.code) if not FN_BEFORE_RE.search(rf.code[max(0, m.start() - 16):m.start()])]
-            if not calls:
-                continue
-            for m, ctx in zip(calls, rf.contexts([m.start() for m in calls])):
-                path, _ = site_path(modp, ctx)
-                if path not in helpers[m.group(1)]:
-                    line = rf.code.count('\n', 0, m.start()) + 1
-                    out.append((path, '%s:%d (calls %s)' % (rf.path, line, m.group(1))))
+        out.extend(helper_callers(units, helpers, site_path))
     return out
 
 
