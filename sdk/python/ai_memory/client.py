@@ -69,7 +69,8 @@ class AiMemoryClient:
         verify: ``httpx`` ``verify`` — path to server CA bundle or bool. A
             zero-config daemon serves a certificate from the local CA it
             wrote to ``<key_dir>/tls/local-ca.pem`` on first boot; pass that
-            path to verify it (#3782). Never ``False``.
+            path to verify it (#3782). ``False`` is refused with
+            ``ValueError`` (#3840): there is no accept-any-certificate mode.
         cert: ``httpx`` ``cert`` — client cert for mTLS (path or
             ``(cert, key)``).
         headers: Additional headers to send on every request.
