@@ -562,11 +562,9 @@ mod tests {
     /// v0.7.0 #1042 lock — env-var manipulation in these tests races
     /// when run in parallel. Use a process-wide mutex to serialise.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        // #6123: the crate's ONE process-env mutex, not a module-local one, so
+        // these writes also serialise against every other env-mutating lib test.
+        crate::config::test_env_lock()
     }
 
     /// Generate a fresh Ed25519 keypair and stuff the verifying key

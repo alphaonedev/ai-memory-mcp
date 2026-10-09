@@ -12854,6 +12854,9 @@ legacy_scoring = false
 
     #[test]
     fn capabilities_enabled_resolution_ladder() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // v0.9.0 G10.1 (#1827); v1.0.0 R9 (#1960) — env
         // `AI_MEMORY_CAPABILITIES` > `[capabilities].enabled` > compiled
         // default TRUE (R9 default-on; was false through v0.9.0). The

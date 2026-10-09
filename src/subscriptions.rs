@@ -3433,6 +3433,9 @@ mod tests {
 
     #[test]
     fn test_validate_url_dns_fail_open_env_overrides_1053() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // v0.7.0 #1053 — operators with flaky DNS environments can
         // opt back into the legacy permissive posture via
         // `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1`. Pin the env-var

@@ -322,6 +322,9 @@ mod tests {
 
     #[test]
     fn auto_confidence_env_gating_default_off() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // Per the audit-honest contract: opt-in only. With no env var
         // set, the helper returns false and callers preserve the
         // caller-provided value.

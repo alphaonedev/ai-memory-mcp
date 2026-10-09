@@ -864,8 +864,9 @@ mod tests {
     /// Tempdirs land under the repo's gitignored `.local-runs/`, never
     /// on a tmpfs path.
     fn fresh_dir() -> tempfile::TempDir {
-        let root = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
+        // #6123: the crate root, not the process cwd (another test may
+        // `set_current_dir` into a tempdir it then deletes).
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".local-runs")
             .join("issue-1389-recover-unit-test");
         std::fs::create_dir_all(&root).ok();
@@ -1026,7 +1027,11 @@ mod tests {
         let mut opts = base_opts(transcript, "ai:test:limit");
         opts.limit = 2;
         let report = recover_from_transcript(&db, &opts).unwrap();
-        assert_eq!(report.lines_atomised, 2);
+        assert_eq!(
+            report.lines_atomised, 2,
+            "recover errors: {:?}",
+            report.errors
+        );
         assert_eq!(report.lines_skipped_limit, 1);
     }
 

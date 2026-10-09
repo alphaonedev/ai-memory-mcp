@@ -1710,6 +1710,9 @@ mod tests {
 
     #[test]
     fn require_signal_sig_default_strict_and_falsy_opts_out() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // #1801→#1954 item 5 — the signal lane flipped `false → true` at
         // v1.0.0: UNSET now resolves STRICT; an explicit FALSY token is the
         // `=0` escape-hatch opt-out; truthy opts in. Any other set value falls
@@ -1747,6 +1750,9 @@ mod tests {
 
     #[test]
     fn require_write_sig_default_strict_and_falsy_opts_out() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // #1801→#1954 item 5/6 — the write lane flipped `false → true` at
         // v1.0.0: UNSET now resolves STRICT; `AI_MEMORY_FED_REQUIRE_WRITE_SIG=0`
         // (or any falsy token) is the byte-identical pre-flip permissive
@@ -1780,6 +1786,9 @@ mod tests {
 
     #[test]
     fn require_push_namespace_scope_default_strict_and_falsy_opts_out() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // #2447 — the write-lane sibling of the two resolver tests above, and
         // the co-located precedence pin the env-table row 147 points at (this
         // is a direct-read knob, so it takes no `config_precedence` entry —
@@ -2196,6 +2205,9 @@ mod tests {
 
     #[test]
     fn quarantine_unattributed_default_permissive_and_truthy_opts_in() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // #1948 — mirrors the #1464 write-sig knob shape: default OFF
         // (permissive), truthy (`1`/`true`/`yes`/`on`) opts in. SAFETY:
         // single-threaded mutation of a var no other test reads.
@@ -2398,6 +2410,9 @@ mod tests {
 
     #[test]
     fn require_policy_current_default_on_and_falsy_opts_out() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // Mirrors the #1936 checkpoint knob: default ON (fail-closed for the
         // detected-stale case), falsy opts out. SAFETY: single-threaded
         // mutation of a var no other test reads.
@@ -2419,6 +2434,9 @@ mod tests {
 
     #[test]
     fn require_checkpoint_sig_default_fail_closed_and_falsy_opts_out() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // FED-RQ-01 — mirrors the #1718 transition knob: default ON
         // (fail-closed), falsy (`0`/`false`/`no`/`off`) opts out. SAFETY:
         // single-threaded mutation of a var no other test reads.

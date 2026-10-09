@@ -3064,6 +3064,9 @@ mod v1005_tests {
     /// uniform truthy set of the `AI_MEMORY_REQUIRE_*` gates.
     #[test]
     fn vector_ns_allowlist_env_flag_parse_1005() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // SAFETY: process-env mutation; the var is scoped to this
         // test and removed before returning (K2-gate test precedent).
         unsafe { std::env::remove_var(ENV_VECTOR_NS_ALLOWLIST) };

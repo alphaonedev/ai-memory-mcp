@@ -1999,8 +1999,9 @@ mod tests {
     }
 
     fn fresh_conn(tag: &str) -> Connection {
-        let root = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        // #6123: the crate root, not the process cwd (another test may
+        // `set_current_dir` into a tempdir it then deletes).
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".local-runs")
             .join("issue-2006-import");
         std::fs::create_dir_all(&root).ok();

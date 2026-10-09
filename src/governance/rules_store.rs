@@ -1778,6 +1778,9 @@ mod tests {
 
     #[test]
     fn resolve_operator_pubkey_returns_none_when_env_and_file_absent() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // The cert harness for resolve_operator_pubkey is platform-bound
         // (XDG paths differ on macOS / Linux). The trivial smoke is to
         // call it under a wiped env: in either platform, the env is
@@ -1803,6 +1806,9 @@ mod tests {
 
     #[test]
     fn resolve_operator_pubkey_accepts_url_safe_no_pad_base64() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         use base64::Engine;
         // Generate a real verifying key and encode it.
         let mut csprng = rand_core::OsRng;

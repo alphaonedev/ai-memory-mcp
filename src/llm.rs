@@ -5103,16 +5103,14 @@ mod wiremock_tests {
     // env-aware; #1142 fixed that one surface; #1143 closes the
     // remaining 4 (atomise, curator, MCP embed-fallback wire-shape,
     // daemon curator primitive entrypoint). The env-mutation tests
-    // serialise on a module-local mutex (matches the discipline in
-    // `src/federation/peer_attestation.rs::tests`).
+    // serialise on the crate's one process-env mutex (#6123; formerly a
+    // module-local one).
     // ==================================================================
 
-    pub(super) static ENV_GUARD_1143: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     pub(super) fn lock_env_1143() -> std::sync::MutexGuard<'static, ()> {
-        ENV_GUARD_1143
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        // #6123: the crate's ONE process-env mutex, not a module-local one, so
+        // these writes also serialise against every other env-mutating lib test.
+        crate::config::test_env_lock()
     }
 
     /// SAFETY: env-var mutation is unsynchronised across threads at the

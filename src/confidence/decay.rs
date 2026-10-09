@@ -285,6 +285,9 @@ mod tests {
 
     #[test]
     fn decay_env_gating_default_off() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         unsafe { std::env::remove_var(ENV_DECAY) };
         assert!(!decay_enabled());
         unsafe { std::env::set_var(ENV_DECAY, "1") };
