@@ -426,7 +426,10 @@ const KNOBS: &[KnobSpec] = &[
     KnobSpec {
         env: "AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED",
         hard_value: "1",
-        meets_floor: is_truthy,
+        // #3619 — delegate to the LIVE reader's value-level fn (#3033 NB1),
+        // never a re-derived grammar: the floor cannot accept a token the
+        // reader treats as off.
+        meets_floor: crate::federation::receive_auth::quarantine_unattributed_value_enabled,
     },
     KnobSpec {
         env: "AI_MEMORY_CID_ENFORCE",

@@ -642,7 +642,19 @@ pub const FED_QUARANTINE_UNATTRIBUTED_ENV: &str = "AI_MEMORY_FED_QUARANTINE_UNAT
 pub fn quarantine_unattributed_enabled() -> bool {
     std::env::var(FED_QUARANTINE_UNATTRIBUTED_ENV)
         .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .is_some_and(|v| quarantine_unattributed_value_enabled(&v))
+}
+
+/// Value-level core of [`quarantine_unattributed_enabled`]: the ONE grammar
+/// for `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`. The asi-hard `KNOBS` floor
+/// delegates to this same function (#3619, the #3033 NB1 house rule for
+/// pinned knobs), so the floor and the live reader cannot disagree. Uses the
+/// house truthy grammar (`1`/`true`/`yes`/`on`, trimmed, case-insensitive).
+/// Before #3619 the reader was case-sensitive, so `TRUE`/`Yes`/`ON` met the
+/// floor while quarantine stayed off.
+#[must_use]
+pub fn quarantine_unattributed_value_enabled(v: &str) -> bool {
+    crate::security_profile::is_truthy(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -2223,6 +2235,31 @@ mod tests {
             assert!(!quarantine_unattributed_enabled(), "{falsy:?} → permissive");
         }
         unsafe { std::env::remove_var(FED_QUARANTINE_UNATTRIBUTED_ENV) };
+    }
+
+    /// #3619 — the asi-hard floor for `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`
+    /// and the live reader agree on every token: floor-compliant ⇔ engaged.
+    /// Value-level (no env mutation), against the REAL `KNOBS` row.
+    #[test]
+    fn quarantine_floor_equals_live_reader_3619() {
+        let mut engaged = 0_usize;
+        for token in [
+            "1", "true", "TRUE", "True", "yes", "Yes", "YES", "on", "On", "ON", " TRUE ",
+            "\tyes\n", "0", "false", "FALSE", "no", "off", "", "banana", "2",
+        ] {
+            let floor =
+                crate::security_profile::knob_meets_floor(FED_QUARANTINE_UNATTRIBUTED_ENV, token)
+                    .expect("FED_QUARANTINE_UNATTRIBUTED is an asi-hard pinned knob");
+            let live = quarantine_unattributed_value_enabled(token);
+            assert_eq!(
+                floor, live,
+                "{token:?}: asi-hard floor and live reader disagree"
+            );
+            if live {
+                engaged += 1;
+            }
+        }
+        assert_eq!(engaged, 12, "every truthy spelling engages quarantine");
     }
 
     #[test]
