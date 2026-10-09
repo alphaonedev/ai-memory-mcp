@@ -1094,3 +1094,423 @@ fn verifier_pre_apply_requires_jobs_on_unfrozen_carriers_6143() -> TestResult {
         "no carrier branch",
     )
 }
+
+/// A fake `gh` (Python) on PATH. `routes` maps a substring of the LAST argv
+/// element to the body printed with exit 0; an unrouted call exits 1 (HTTP 404).
+#[cfg(unix)]
+fn fake_gh_path(dir: &Path, routes: &[(&str, &str)]) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).map_err(|e| format!("mkdir {}: {e}", bin.display()))?;
+    let table = serde_json::to_string(routes).map_err(|e| format!("encode routes: {e}"))?;
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/usr/bin/env python3\nimport json, sys\nfor needle, body in json.loads({table:?}):\n    if needle in sys.argv[-1]:\n        sys.stdout.write(body)\n        sys.exit(0)\nsys.stderr.write('HTTP 404')\nsys.exit(1)\n"
+        ),
+    )
+    .map_err(|e| format!("write fake gh: {e}"))?;
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod fake gh: {e}"))?;
+    Ok(format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    ))
+}
+
+/// Runs the live (non-fixture) verifier in the pending-apply state against a fake `gh`.
+#[cfg(unix)]
+fn run_with_fake_gh(name: &str, routes: &[(&str, &str)]) -> Result<(i32, String), String> {
+    let dir = scratch(name)?;
+    let path = fake_gh_path(&dir, routes)?;
+    let st_file = write_json(
+        &dir,
+        "state.json",
+        &serde_json::json!({"state": "pending-apply", "tracking_issue": TRACKING_ISSUE}),
+    )?;
+    let out = Command::new("python3")
+        .arg("-I")
+        .arg(root().join(VERIFIER))
+        .arg("--state-file")
+        .arg(&st_file)
+        .env("PATH", &path)
+        .current_dir(root())
+        .output()
+        .map_err(|e| format!("spawn python3: {e}"))?;
+    Ok(output_text(&out))
+}
+
+/// #6231 (security R3-F1): a ruleset detail or issue read that is not the requested
+/// object is unreadable, never "no ruleset" and never a traceback.
+#[cfg(unix)]
+#[test]
+fn verifier_rejects_malformed_ruleset_and_issue_reads_6231() -> TestResult {
+    let issue_open = r#"{"number": 6182, "state": "open"}"#;
+    expect(
+        "control: no rulesets, issue open",
+        &run_with_fake_gh(
+            "r6231-control",
+            &[("/rulesets?", "[]"), ("/issues/", issue_open)],
+        )?,
+        0,
+        "UNPROTECTED",
+    )?;
+    let detail_cases = [
+        ("detail empty object", "{}"),
+        (
+            "detail other id",
+            r#"{"id": 8, "target": "branch", "enforcement": "active"}"#,
+        ),
+        ("detail array", "[]"),
+        ("detail empty body", ""),
+        (
+            "detail without target",
+            r#"{"id": 7, "enforcement": "active"}"#,
+        ),
+    ];
+    for (label, detail) in detail_cases {
+        let got = run_with_fake_gh(
+            &format!("r6231-{}", label.replace(' ', "-")),
+            &[
+                ("/rulesets?", r#"[{"id": 7}]"#),
+                ("/rulesets/7", detail),
+                ("/issues/", issue_open),
+            ],
+        )?;
+        expect(label, &got, 1, "unreadable")?;
+        if got.1.contains("Traceback") {
+            return Err(format!(
+                "{label}: a traceback instead of a FAIL line:\n{}",
+                got.1
+            ));
+        }
+    }
+    for (label, issue) in [
+        ("issue other number", r#"{"number": 1, "state": "open"}"#),
+        ("issue array", "[]"),
+        ("issue empty body", ""),
+        (
+            "issue unknown state",
+            r#"{"number": 6182, "state": "weird"}"#,
+        ),
+    ] {
+        let got = run_with_fake_gh(
+            &format!("r6231-{}", label.replace(' ', "-")),
+            &[("/rulesets?", "[]"), ("/issues/", issue)],
+        )?;
+        expect(label, &got, 1, "unreadable")?;
+        if got.1.contains("Traceback") {
+            return Err(format!(
+                "{label}: a traceback instead of a FAIL line:\n{}",
+                got.1
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Runs `--pre-apply` against fixtures. `state` defaults to pending-apply.
+fn run_pre_apply(
+    name: &str,
+    tips: &serde_json::Value,
+    rulesets: &serde_json::Value,
+    state: &str,
+    release_workflow: Option<&str>,
+) -> Result<(i32, String), String> {
+    let dir = scratch(name)?;
+    let tips_file = write_json(&dir, "tips.json", tips)?;
+    let rs_file = write_json(&dir, "rulesets.json", rulesets)?;
+    let st_file = write_json(
+        &dir,
+        "state.json",
+        &serde_json::json!({"state": state, "tracking_issue": TRACKING_ISSUE}),
+    )?;
+    let mut cmd = Command::new("python3");
+    cmd.arg("-I")
+        .arg(root().join(VERIFIER))
+        .arg("--pre-apply")
+        .arg("--carrier-tips-file")
+        .arg(&tips_file)
+        .arg("--rulesets-file")
+        .arg(&rs_file)
+        .arg("--state-file")
+        .arg(&st_file);
+    if state == "applied" {
+        cmd.args(promoted_flags(&dir)?);
+    }
+    if let Some(text) = release_workflow {
+        let p = dir.join("release-workflow.yml");
+        std::fs::write(&p, text).map_err(|e| format!("write {}: {e}", p.display()))?;
+        cmd.arg("--release-workflow-file").arg(&p);
+    }
+    let out = cmd
+        .current_dir(root())
+        .output()
+        .map_err(|e| format!("spawn python3: {e}"))?;
+    Ok(output_text(&out))
+}
+
+/// #6232 (security R3-F2) + code R3-F1: a freeze that excludes the carrier is not
+/// trusted, an unfrozen tip must trigger on `pull_request` for its base, and once
+/// the state is `applied` the release tip must define the verifier job.
+#[test]
+fn verifier_pre_apply_checks_triggers_exclude_and_release_tip_6232() -> TestResult {
+    let wf = read(".github/workflows/c8-precheck.yml")?;
+    let flow = r#"branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]"#;
+    if !wf.contains(flow) {
+        return Err("c8-precheck.yml pull_request.branches line changed; update this test".into());
+    }
+    let no_chain = wf.replace(
+        flow,
+        r#"branches: [main, develop, "release/**", "rehearsal/**"]"#,
+    );
+    let no_verifier = wf.replace(
+        "\n  carrier-ruleset-live-gate:\n",
+        "\n  carrier-ruleset-live-gate-gone:\n",
+    );
+    if no_verifier == wf {
+        return Err("c8-precheck.yml has no carrier-ruleset-live-gate job".into());
+    }
+    let (sha_a, sha_b, sha_c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+    let two = |a: &str| {
+        serde_json::json!({
+            "refs/heads/chain/promo6-ssh": {"sha": sha_a, "workflow": a},
+            "refs/heads/rehearsal/audit-wip-ssh": {"sha": sha_b, "workflow": wf},
+        })
+    };
+    expect(
+        "trigger-less tip",
+        &run_pre_apply(
+            "r6232-notrigger",
+            &two(&no_chain),
+            &serde_json::json!([]),
+            "pending-apply",
+            None,
+        )?,
+        1,
+        "does not trigger on pull_request for chain/promo6-ssh",
+    )?;
+    let freeze_excluding = serde_json::json!([{
+        "id": 24_733_250, "name": "archive-refs-frozen (branches)", "target": "branch",
+        "enforcement": "active", "bypass_actors": [],
+        "conditions": {"ref_name": {
+            "include": ["refs/heads/chain/old"], "exclude": ["refs/heads/chain/old"]}},
+        "rules": [{"type": "update"}, {"type": "deletion"}]
+    }]);
+    let mut with_old = two(&wf);
+    with_old["refs/heads/chain/old"] = serde_json::json!({"sha": sha_c, "workflow": null});
+    expect(
+        "freeze that excludes the carrier is not trusted",
+        &run_pre_apply(
+            "r6232-exclude",
+            &with_old,
+            &freeze_excluding,
+            "pending-apply",
+            None,
+        )?,
+        1,
+        "refs/heads/chain/old",
+    )?;
+    expect(
+        "applied, release tip carries the verifier",
+        &run_pre_apply(
+            "r6232-rel-ok",
+            &two(&wf),
+            &serde_json::json!([]),
+            "applied",
+            Some(&wf),
+        )?,
+        0,
+        "release/v1.0.0",
+    )?;
+    expect(
+        "applied, release tip lacks the verifier",
+        &run_pre_apply(
+            "r6232-rel-missing",
+            &two(&wf),
+            &serde_json::json!([]),
+            "applied",
+            Some(&no_verifier),
+        )?,
+        1,
+        "release/v1.0.0 @ tip lacks",
+    )?;
+    expect(
+        "applied, release tip unreadable",
+        &run_pre_apply(
+            "r6232-rel-none",
+            &two(&wf),
+            &serde_json::json!([]),
+            "applied",
+            None,
+        )?,
+        1,
+        "release/v1.0.0",
+    )?;
+    expect(
+        "pending, release tip is not read",
+        &run_pre_apply(
+            "r6232-rel-pending",
+            &two(&wf),
+            &serde_json::json!([]),
+            "pending-apply",
+            Some(&no_verifier),
+        )?,
+        0,
+        "PRE-APPLY OK",
+    )
+}
+
+/// Code R3-F4: an empty `gh` body on the carrier-refs read is unreadable.
+#[cfg(unix)]
+#[test]
+fn verifier_pre_apply_fails_closed_on_empty_carrier_refs_6143() -> TestResult {
+    let dir = scratch("empty-refs")?;
+    let path = fake_gh_path(&dir, &[("matching-refs", "")])?;
+    let rs_file = write_json(&dir, "rulesets.json", &serde_json::json!([]))?;
+    let out = Command::new("python3")
+        .arg("-I")
+        .arg(root().join(VERIFIER))
+        .arg("--pre-apply")
+        .arg("--rulesets-file")
+        .arg(&rs_file)
+        .env("PATH", &path)
+        .current_dir(root())
+        .output()
+        .map_err(|e| format!("spawn python3: {e}"))?;
+    expect(
+        "empty carrier refs body",
+        &output_text(&out),
+        1,
+        "unparseable",
+    )
+}
+
+/// Code R3-F5: the tracking-issue pin is assigned once and never read from the
+/// environment, so a later rebinding cannot bypass the textual pin.
+#[test]
+fn verifier_tracking_issue_pin_is_env_free_6143() -> TestResult {
+    let src = read(VERIFIER)?;
+    let assigned = src
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.strip_prefix("TRACKING_ISSUE").is_some_and(|rest| {
+                rest.trim_start().starts_with('=') && !rest.trim_start().starts_with("==")
+            })
+        })
+        .count();
+    if assigned != 1 {
+        return Err(format!(
+            "{VERIFIER} must assign TRACKING_ISSUE exactly once, found {assigned}"
+        ));
+    }
+    for banned in ["environ", "getenv", "import os", "from os "] {
+        if src.contains(banned) {
+            return Err(format!(
+                "{VERIFIER} must not read the environment ({banned:?})"
+            ));
+        }
+    }
+    if src.contains("global TRACKING_ISSUE") {
+        return Err(format!(
+            "{VERIFIER} must not rebind TRACKING_ISSUE through global"
+        ));
+    }
+    let dir = scratch("env-pin")?;
+    let st_file = write_json(
+        &dir,
+        "state.json",
+        &serde_json::json!({"state": "pending-apply", "tracking_issue": 1234}),
+    )?;
+    let out = Command::new("python3")
+        .arg("-I")
+        .arg(root().join(VERIFIER))
+        .arg("--rulesets-file")
+        .arg(write_json(&dir, "rulesets.json", &serde_json::json!([]))?)
+        .arg("--state-file")
+        .arg(&st_file)
+        .args(["--tracking-issue-state", "open"])
+        .env("TRACKING_ISSUE", "1234")
+        .current_dir(root())
+        .output()
+        .map_err(|e| format!("spawn python3: {e}"))?;
+    expect(
+        "env cannot rebind the pin",
+        &output_text(&out),
+        1,
+        &format!("must be #{TRACKING_ISSUE}"),
+    )
+}
+
+/// Code R3-F2: the OK and flip lines name the ruleset id the `PUT` must target.
+#[test]
+fn verifier_names_the_ruleset_id_in_ok_and_flip_lines_6143() -> TestResult {
+    expect(
+        "flip line",
+        &run_verifier(
+            "id-flip",
+            &serde_json::json!([live_from_payload()?]),
+            "pending-apply",
+            "open",
+            &[],
+        )?,
+        1,
+        "carrier ruleset 424242 (",
+    )?;
+    expect(
+        "ok line",
+        &run_verifier(
+            "id-ok",
+            &serde_json::json!([live_promoted()?]),
+            "applied",
+            "open",
+            &[],
+        )?,
+        0,
+        "OK: carrier ruleset 424242 (",
+    )
+}
+
+/// Code R3-F3: the workflow permissions header names every job that calls the API.
+#[test]
+fn workflow_permissions_header_names_both_api_jobs_6143() -> TestResult {
+    let wf = read(".github/workflows/c8-precheck.yml")?;
+    let start = wf
+        .find("# #3591 — explicit GITHUB_TOKEN scope")
+        .ok_or("c8-precheck.yml lost its #3591 permissions header")?;
+    let rest = &wf[start..];
+    let end = rest
+        .find("\npermissions:\n")
+        .ok_or("c8-precheck.yml lost its top-level permissions block")?;
+    let header = &rest[..end];
+    for job in [
+        "external-pr-operator-approval-gate",
+        "carrier-ruleset-live-gate",
+    ] {
+        if !header.contains(job) {
+            return Err(format!("the permissions header must name {job}"));
+        }
+    }
+    Ok(())
+}
+
+/// Code R3-F1 + R3-F2: the runbook states the release precondition and where the
+/// ruleset id comes from.
+#[test]
+fn docs_state_release_precondition_and_ruleset_id_6143() -> TestResult {
+    let doc = read("docs/ci/CARRIER-BRANCH-GATES.md")?;
+    for needle in [
+        "`release/v1.0.0` defines `carrier-ruleset-live-gate`",
+        "`id` field of the POST response",
+    ] {
+        if !doc.contains(needle) {
+            return Err(format!(
+                "docs/ci/CARRIER-BRANCH-GATES.md must mention {needle:?}"
+            ));
+        }
+    }
+    Ok(())
+}
