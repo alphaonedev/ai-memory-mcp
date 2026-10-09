@@ -382,10 +382,12 @@ async fn exercise_resolver(store: Arc<dyn MemoryStore>) {
             json!({"write": "not-a-level", "require_approval_above_depth": 99}),
             Some(1),
         ),
-        // A non-integer knob is not honoured as a value; the ancestor governs.
+        // #4398 (composed #4285 x #4357 rule): an EXPLICIT non-integer knob
+        // decides at its level and fails CLOSED to 0; it no longer defers to
+        // the ancestor (pre-#4398 this cell expected the parent's 1).
         (
             json!({"write": "any", "require_approval_above_depth": "3"}),
-            Some(1),
+            Some(0),
         ),
         // 2^32 must not truncate to a disabled gate: fail closed to 0.
         (

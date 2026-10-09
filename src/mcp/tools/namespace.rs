@@ -541,6 +541,9 @@ fn handle_namespace_set_standard_inner(
         let policy: crate::models::GovernancePolicy = serde_json::from_value(merged.clone())
             .map_err(|e| crate::errors::msg::invalid(param_names::GOVERNANCE, e))?;
         validate::validate_governance_policy(&policy).map_err(|e| e.to_string())?;
+        // #4398 — the off-struct depth knobs are outside the typed struct, so
+        // validate their shape here or a non-integer lands silently.
+        validate::validate_governance_depth_knobs(&merged).map_err(|e| e.to_string())?;
 
         let mut metadata = if mem.metadata.is_object() {
             mem.metadata.clone()

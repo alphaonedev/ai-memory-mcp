@@ -99,12 +99,13 @@ pub enum ApprovalDepthLevelState {
     /// keep walking (the explicit opt-in to inherit).
     NullKey,
     /// The level states a threshold explicitly. It decides and ends the walk.
-    /// An out-of-range value is already saturated to 0 (fail closed).
+    /// An out-of-range or non-integer value is already saturated to 0 (fail
+    /// closed, #4398).
     Explicit(u32),
-    /// The level's governance blob is present but malformed (non-object, a
-    /// non-integer threshold, an unparseable policy). Severed: keep walking
-    /// (the Owner floor applies via the policy walk); if nothing explicit
-    /// follows, the walk resolves to `Some(0)` (gate on).
+    /// The level's governance blob is present but malformed (non-object, an
+    /// unparseable policy). Severed: keep walking (the Owner floor applies
+    /// via the policy walk); if nothing explicit follows, the walk resolves
+    /// to `Some(0)` (gate on).
     Corrupt,
 }
 
@@ -180,21 +181,34 @@ pub fn approval_depth_level_state(class: &StandardMetadata) -> ApprovalDepthLeve
     match class {
         StandardMetadata::Corrupt(_) => ApprovalDepthLevelState::Corrupt,
         StandardMetadata::NoGovernance => ApprovalDepthLevelState::Missing,
-        StandardMetadata::Policy(_, raw) => match raw.get("require_approval_above_depth") {
+        StandardMetadata::Policy(_, raw) => match raw.get(REQUIRE_APPROVAL_ABOVE_DEPTH_KEY) {
             None => ApprovalDepthLevelState::OmitsField,
             Some(serde_json::Value::Null) => ApprovalDepthLevelState::NullKey,
-            Some(v) => match v.as_u64() {
-                // QUAL-3 (FX-5): operator-controlled metadata. Reject the silent
-                // `n as u32` truncation that would let `2^32` land as 0 and
-                // DISABLE the gate. Fail-CLOSED on overflow: saturate to 0 so
-                // EVERY depth triggers approval (CLAUDE.md K3/K9). Pinned by
-                // `tests/governance_metadata_no_silent_truncation.rs`.
-                Some(n) => ApprovalDepthLevelState::Explicit(u32::try_from(n).unwrap_or(0)),
-                None => ApprovalDepthLevelState::Corrupt,
-            },
+            // #4398 (composed #4285 x #4357 rule): an EXPLICIT value DECIDES.
+            // One that is not a non-negative integer fitting u32 (a string, a
+            // negative, a float, a bool, an array, an overflow) fails CLOSED
+            // to threshold 0 at THIS level — EVERY depth triggers approval —
+            // rather than being severed so a permissive ancestor decides
+            // (CLAUDE.md K3/K9). The overflow arm is the pre-existing QUAL-3
+            // (FX-5) posture, pinned by
+            // `tests/governance_metadata_no_silent_truncation.rs`; the
+            // non-integer arm used to classify `Corrupt` (keep walking).
+            // `memory_namespace_set_standard` refuses these shapes at write
+            // time (`validate::validate_governance_depth_knobs`); this is the
+            // read-side floor for rows written before that or out of band.
+            Some(v) => ApprovalDepthLevelState::Explicit(
+                v.as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0),
+            ),
         },
     }
 }
+
+/// The off-struct governance knob the L1-8 reflect approval gate reads.
+pub const REQUIRE_APPROVAL_ABOVE_DEPTH_KEY: &str = "require_approval_above_depth";
+/// The off-struct governance knob `memory_skill_promote_from_reflection` reads.
+pub const SKILL_PROMOTION_MIN_DEPTH_KEY: &str = "skill_promotion_min_depth";
 
 /// #4357 — the shared per-level decision for
 /// [`resolve_require_approval_above_depth`] and its postgres twin.

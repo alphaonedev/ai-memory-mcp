@@ -924,8 +924,9 @@ mod approval_depth;
 /// `crate::db::*`, byte-identical to pre-split.
 mod doctor;
 pub use approval_depth::{
-    ApprovalDepthLevel, ApprovalDepthLevelState, ApprovalDepthWalk, approval_depth_level_decision,
-    approval_depth_level_state, resolve_require_approval_above_depth,
+    ApprovalDepthLevel, ApprovalDepthLevelState, ApprovalDepthWalk, REQUIRE_APPROVAL_ABOVE_DEPTH_KEY,
+    SKILL_PROMOTION_MIN_DEPTH_KEY, approval_depth_level_decision, approval_depth_level_state,
+    resolve_require_approval_above_depth,
 };
 pub mod embed_skip;
 /// v1.0.0 #3288 — sqlite half of the bounded, keyset-paged admin export.
@@ -23114,22 +23115,29 @@ pub fn resolve_skill_promotion_min_depth(
             }
             Some(StandardMetadata::NoGovernance) | None => continue,
         };
-        match gov.get("skill_promotion_min_depth") {
+        match gov.get(approval_depth::SKILL_PROMOTION_MIN_DEPTH_KEY) {
             // A well-formed policy that omits the knob: no override here and the
             // walk STOPS (leaf-first-wins, #2542; GOD final ruling), mirroring
             // the approval-depth walk. The result is the passed-corrupt rule.
             None => break,
             // An explicit null keeps walking (the explicit opt-in to inherit).
             Some(serde_json::Value::Null) => {}
-            Some(v) => match v.as_u64() {
-                // QUAL-3 (FX-5): operator-controlled metadata. Fail-CLOSED on
-                // overflow: saturate to `u32::MAX` so NO reflection can be
-                // promoted (pinned by
-                // `tests/governance_metadata_no_silent_truncation.rs`).
-                Some(n) => return Ok(Some(u32::try_from(n).unwrap_or(u32::MAX))),
-                // A non-integer value is corrupt: keep walking, fail closed.
-                None => passed_corrupt = true,
-            },
+            // #4398 (composed #4285 x #4357 rule): an EXPLICIT value DECIDES.
+            // QUAL-3 (FX-5): operator-controlled metadata. Fail-CLOSED on
+            // overflow AND on any non-integer shape (string, negative, float,
+            // bool, array): saturate to `u32::MAX` so NO reflection can be
+            // promoted at THIS level, rather than keep walking so a looser
+            // ancestor (or the compiled default) applies (pinned by
+            // `tests/governance_metadata_no_silent_truncation.rs` and the
+            // `_4398` cell). `memory_namespace_set_standard` refuses these
+            // shapes at write time (`validate::validate_governance_depth_knobs`).
+            Some(v) => {
+                return Ok(Some(
+                    v.as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .unwrap_or(u32::MAX),
+                ));
+            }
         }
     }
     // #4285 — a configured level that could not be read as a policy is not

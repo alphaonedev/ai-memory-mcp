@@ -648,6 +648,14 @@ async fn set_namespace_standard_inner(
                 )
                     .into_response();
             }
+            // #4398 — the off-struct depth knobs, same check as the MCP funnel.
+            if let Err(e) = validate::validate_governance_depth_knobs(&merged) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": crate::errors::msg::invalid(crate::META_KEY_GOVERNANCE, e)})),
+                )
+                    .into_response();
+            }
             let mut metadata = if standard_mem.metadata.is_object() {
                 standard_mem.metadata.clone()
             } else {

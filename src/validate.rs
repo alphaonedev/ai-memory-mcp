@@ -596,6 +596,37 @@ pub fn validate_metadata_scope(metadata: &serde_json::Value) -> Result<()> {
     );
 }
 
+/// #4398 — validate the OFF-STRUCT governance depth knobs
+/// (`require_approval_above_depth`, `skill_promotion_min_depth`) of a merged
+/// `metadata.governance` blob at WRITE time (`memory_namespace_set_standard`,
+/// MCP and HTTP). The typed [`GovernancePolicy`] deserialise ignores unknown
+/// keys, so a plausible non-integer form (`"3"`, `-1`, `2.5`, `true`, an
+/// array, an overflow) used to land unvalidated and resolve to NO gate.
+/// Each knob, when present, must be `null` (the explicit opt-in to inherit)
+/// or a non-negative integer that fits `u32`. A non-object blob is left to
+/// the typed deserialise, which already refuses it.
+///
+/// # Errors
+///
+/// Names the offending knob and the accepted shape.
+pub fn validate_governance_depth_knobs(governance: &serde_json::Value) -> Result<()> {
+    use crate::storage::{REQUIRE_APPROVAL_ABOVE_DEPTH_KEY, SKILL_PROMOTION_MIN_DEPTH_KEY};
+    let Some(obj) = governance.as_object() else {
+        return Ok(());
+    };
+    for knob in [REQUIRE_APPROVAL_ABOVE_DEPTH_KEY, SKILL_PROMOTION_MIN_DEPTH_KEY] {
+        match obj.get(knob) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(v) if v.as_u64().is_some_and(|n| u32::try_from(n).is_ok()) => {}
+            Some(_) => bail!(
+                "governance.{knob} must be a non-negative integer that fits u32 (or null to \
+                 inherit)"
+            ),
+        }
+    }
+    Ok(())
+}
+
 /// Validate a [`GovernancePolicy`] (Task 1.8). Closed-set tag checks are
 /// already handled by serde on deserialization; this adds semantic bounds:
 /// consensus quorum must be ≥ 1, Agent references must pass
