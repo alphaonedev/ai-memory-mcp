@@ -1371,6 +1371,50 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     fx.reset(base)
     fx.g("update-ref", "refs/remotes/origin/main", base)
 
+    # (mask, #6370) drift compares identifier OCCURRENCES, not just names: the
+    #       base defines an identifier in an unwatched file and also mentions it
+    #       in a comment elsewhere; the PR removes only the definition. The name
+    #       survives in the comment, yet the removal must stay RED.
+    fx.reset(base)
+    fx.g("checkout", "-q", "-b", "mk0", base)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "AI_MEMORY_FED_MASK_KNOB";\n')
+    fx.write("src/mask_note.rs", "// the knob AI_MEMORY_FED_MASK_KNOB is read at startup\n")
+    fx.banner("EXPIRED", base)  # no live claim, so the mk1 control is judged on drift alone
+    mk0 = fx.commit(["src/mask_def.rs", "src/mask_note.rs", CERT_DOC],
+                    "mk0: an identifier defined in one unwatched file and mentioned in another")
+    fx.g("checkout", "-q", "-b", "mk9", mk0)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "";\n')
+    mk9 = fx.commit(["src/mask_def.rs"], "mk9: remove the definition, the comment mention stays")
+    fx.g("checkout", "-q", "-b", "mk1", mk0)
+    fx.write("src/mask_note.rs", "// AI_MEMORY_FED_MASK_KNOB is also described here\n", append=True)
+    mk1 = fx.commit(["src/mask_note.rs"], "mk1: one more mention of the same identifier")
+    fx.g("checkout", "-q", "main")
+    fx.g("reset", "-q", "--hard", mk0)
+    fx.g("update-ref", "refs/remotes/origin/main", mk0)
+    merge_mk = fx.merge("mk9", "Merge mk9 into main")
+    t.expect_red("mask", "definition removed while a comment still names the identifier",
+                 repo, mk0, mk9, [
+                     ("- AI_MEMORY_FED_MASK_KNOB", "did not name the removed identifier"),
+                     (sentence, "did not carry the required section 7 expiry sentence"),
+                 ], tip=merge_mk)
+    t.gate("mask-gate", "pull_request that removes the definition of a still-mentioned identifier",
+           repo, _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=mk9,
+                           GITHUB_BASE_REF="main", GITHUB_SHA=merge_mk,
+                           PATH=os.environ.get("PATH", "")), "- AI_MEMORY_FED_MASK_KNOB")
+    mask_drift = wire_drift(repo, mk0, mk9)
+    if not any(d.startswith("-AI_MEMORY_FED_MASK_KNOB") for d in mask_drift):
+        t.fail("(mask-drift): wire_drift did not report the removed definition of a "
+               f"still-mentioned identifier: {mask_drift!r}")
+    # Control: an extra mention of an existing identifier is not drift (additions
+    # are unaffected; only a decrease in occurrences is a removal).
+    fx.g("reset", "-q", "--hard", mk0)
+    fx.g("update-ref", "refs/remotes/origin/main", mk0)
+    merge_mk1 = fx.merge("mk1", "Merge mk1 into main")
+    t.expect_green("mask-add", "one more mention of an identifier that already exists",
+                   repo, mk0, mk1, tip=merge_mk1)
+    fx.reset(base)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+
     # ---- #6138: merge-commit structure cells ------------------------------
     # main is at `base`; h7 is the PR head, o7 an unrelated branch.
     fx.reset(base)
@@ -1780,6 +1824,9 @@ SELF_TEST_OK = (
     "(attr, attr-gate, #6174) an identifier add hidden behind head-supplied attributes "
     "marking src/** binary RED in check_change and end to end on pull_request; "
     "(attr-rm, attr-rm-gate, #6174) the same for an identifier REMOVAL; "
+    "(mask, mask-gate, mask-drift, mask-add, #6370) removing the definition of an identifier "
+    "that a comment still names stays RED (occurrence counts, not name sets), while an extra "
+    "mention is GREEN; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
