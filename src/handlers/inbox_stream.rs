@@ -66,6 +66,64 @@ pub fn inbox_wake_visible_to(
     event.recipient_agent_id() == subscriber_agent
 }
 
+/// The tenant-safe SSE wire shape of one wake (v1.0.0 #4071).
+///
+/// [`crate::inbox_wake::InboxEvent`] carries a `seq` drawn from ONE
+/// process-wide counter shared by every recipient. Serialising the event
+/// as-is would let a subscriber read the gap between two of its own frames
+/// as the number of wakes published for OTHER agents in between — the
+/// cross-tenant notify-rate signal this stream already refuses to leak via a
+/// skipped-frame tick or a lag count (#628 P4). The wire frame therefore
+/// projects only the recipient's own facts. The one counter it carries is
+/// `recipient_seq` (#4125), which moves only when a wake is published to
+/// THIS recipient, so a gap in it counts the recipient's own missed wakes and
+/// nothing else — the same number the wake-hub forwards as
+/// `seq_high_watermark`.
+///
+/// Built by exhaustive destructuring (no `..`), so a field added to the
+/// event later fails to compile here until someone decides whether it is
+/// safe to show a tenant.
+#[derive(serde::Serialize)]
+struct InboxWakeWire<'a> {
+    event: &'static str,
+    recipient_agent_id: &'a str,
+    correlation_id: &'a str,
+    inbox_row_id: &'a str,
+    namespace: &'a str,
+    sender_agent_id: &'a str,
+    content_digest: &'a str,
+    notified_at: &'a str,
+    recipient_seq: u64,
+}
+
+impl<'a> From<&'a crate::inbox_wake::InboxEvent> for InboxWakeWire<'a> {
+    fn from(event: &'a crate::inbox_wake::InboxEvent) -> Self {
+        let crate::inbox_wake::InboxEvent::AgentNotified {
+            // Process-wide: NEVER on a tenant's wire (#4071).
+            seq: _,
+            recipient_agent_id,
+            correlation_id,
+            inbox_row_id,
+            namespace,
+            sender_agent_id,
+            content_digest,
+            notified_at,
+            recipient_seq,
+        } = event;
+        Self {
+            event: event.event_name(),
+            recipient_agent_id,
+            correlation_id,
+            inbox_row_id,
+            namespace,
+            sender_agent_id,
+            content_digest,
+            notified_at,
+            recipient_seq: *recipient_seq,
+        }
+    }
+}
+
 /// `GET /api/v1/inbox/stream` — SSE wake stream for the caller's own
 /// inbox.
 ///
@@ -153,7 +211,7 @@ pub async fn inbox_sse(
                             // leak the other tenant's notify rate.
                             continue;
                         }
-                        let data = match serde_json::to_string(&evt) {
+                        let data = match serde_json::to_string(&InboxWakeWire::from(&evt)) {
                             Ok(s) => s,
                             Err(e) => {
                                 // Degrading to an empty body would be
