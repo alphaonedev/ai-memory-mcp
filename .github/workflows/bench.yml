@@ -229,7 +229,7 @@ jobs:
           for i in 1 2 3; do
             target/release/ai-memory bench --json > "run-$i.json"
           done
-          python3 .github/scripts/median_baseline.py "$(git rev-parse --short HEAD)" \
+          python3 -I .github/scripts/median_baseline.py "$(git rev-parse --short HEAD)" \
             run-1.json run-2.json run-3.json > performance/baseline.json
           {
             echo '## Regenerated bench baseline (median-of-3, ubuntu-latest)'
