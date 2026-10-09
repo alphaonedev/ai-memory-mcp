@@ -64,7 +64,8 @@ pub const AUDIT_TRAIL_LATCHED_GAUGE: &str = "ai_memory_audit_trail_latched";
 /// sink, not an operator decision (contrast the signed, persisted record-stop).
 static LATCHED: AtomicBool = AtomicBool::new(false);
 
-/// Wall-clock milliseconds of the last retry; 0 = never.
+/// Wall-clock milliseconds of the last retry; 0 = never (retry due at once);
+/// `u64::MAX` = retry never due (test-only, set by `latch_for_test`, #6150).
 static LAST_PROBE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// #4464 — bumped by every counted failure while the mode is on, BEFORE the
@@ -233,12 +234,28 @@ fn probe_trail() -> bool {
 /// come due after [`PROBE_INTERVAL_MS`] of wall clock, and a sink-less child
 /// then cleared the latch. A test that needs an immediate retry calls
 /// [`reset_probe_clock_for_test`]. Callers hold `audit::sink_test_lock` and
-/// call [`force_on_for_test`]`(false)` afterwards.
+/// keep the returned guard alive for the span of the latch: its `Drop` calls
+/// [`force_on_for_test`]`(false)`, so a panic cannot leave a never-due latch
+/// behind for the rest of the process.
 #[cfg(test)]
-pub(crate) fn latch_for_test() {
+pub(crate) fn latch_for_test() -> LatchGuard {
     FORCE_ON_FOR_TEST.store(true, Ordering::SeqCst);
     LATCHED.store(true, Ordering::SeqCst);
     LAST_PROBE_MS.store(u64::MAX, Ordering::SeqCst);
+    LatchGuard(())
+}
+
+/// Test-only RAII guard from [`latch_for_test`]: dropping it restores the mode
+/// to the environment and clears the latch and retry clock (idempotent).
+#[cfg(test)]
+#[must_use = "dropping the guard immediately un-latches the audit trail"]
+pub(crate) struct LatchGuard(());
+
+#[cfg(test)]
+impl Drop for LatchGuard {
+    fn drop(&mut self) {
+        force_on_for_test(false);
+    }
 }
 
 /// Test-only: let the next latched gate retry at once.
@@ -321,12 +338,10 @@ mod tests {
     #[test]
     fn latch_for_test_stays_refusing_past_the_probe_interval_6150() {
         let _g = lock();
-        latch_for_test();
-        std::thread::sleep(std::time::Duration::from_millis(PROBE_INTERVAL_MS + 100));
-        let r = audit_trail_gate();
+        let _latch = latch_for_test();
+        let later = super::super::now_unix_ms().saturating_add(PROBE_INTERVAL_MS + 100);
+        let r = gate_with(true, later, || true);
         let still_latched = audit_trail_latched();
-        force_on_for_test(false);
-        reset_for_test();
         assert!(r.is_err(), "the gate must still refuse after the interval");
         assert!(still_latched, "no retry may have cleared the latch");
     }
