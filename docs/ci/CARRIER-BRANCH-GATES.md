@@ -124,8 +124,14 @@ deadline; on expiry, or on any other failure, the full lists run.
 
 **Who reads and who writes.**
 
-* `pull_request`: lookup only, under `github.base_ref`. A pull request
-  never writes the manifest: its test code is unmerged.
+* `pull_request`: lookup only, under `github.base_ref`. The script never
+  writes the manifest on a pull request. That does not keep the pull
+  request's own code out: a same-repository pull request runs its own test
+  code and its own `ci.yml` as the runner user, so that code can write the
+  manifest directory. Same-repository writers are trusted contributors. A
+  planted entry is bounded because the `release/**` push never skips a
+  binary, so the release branch's own run is never weakened, and a red
+  recording run removes the entries with its keys.
 * `push` to `release/**`: the seeding run. Lookup is off (every binary runs)
   and the results of a fully green step are recorded under the branch name.
 * Every other event, `chain/**` pushes included: no lookup, no record.

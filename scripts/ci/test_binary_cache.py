@@ -54,9 +54,14 @@ Safety rules (enforced here, not only documented):
    so a push to ``release/**`` can never skip a binary.
 2. Who reads and who writes (decision of #6384 r2, review r1 M2; the
    fail-closed direction, so it needed no vote):
-   * ``pull_request``: LOOK UP ONLY. A pull_request run
-     never writes the manifest: its test code is unmerged and runs as the
-     runner user, who can write the shared manifest directory.
+   * ``pull_request``: LOOK UP ONLY. This script never writes the manifest
+     on a pull_request run. That is no boundary against the pull request's
+     own code (r2 L2): a same-repository pull request runs its own test code
+     and its own ci.yml as the runner user, so that code can write the
+     manifest directory. Same-repository writers are trusted contributors;
+     what bounds a planted entry is that the ``release/**`` push never skips
+     a binary (it cannot weaken the release branch's own run) and that a red
+     recording run removes the entries with its keys (r2 L3).
    * ``push`` to ``release/**``: the seeding run. Lookup OFF (every binary
      runs), record ON after a fully green step.
    * Anything else (``chain/**`` pushes included): no lookup, no record.

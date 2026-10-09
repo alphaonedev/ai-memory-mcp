@@ -1187,6 +1187,9 @@ jobs:
           # #6384 — per-test-binary result cache (scripts/ci/test_binary_cache.py).
           # Who reads and who writes (r2 decision, review r1 M2):
           #   pull_request      lookup only; it NEVER writes the manifest.
+          #                     (The script does not; a same-repository PR's own
+          #                     test code runs as the runner user and can write the
+          #                     manifest dir. Bound: the release/** push never skips.)
           #   push release/**   lookup off (every binary runs); records the
           #                     green results that later PRs into it look up.
           #   anything else     no lookup, no record (chain/** included).
