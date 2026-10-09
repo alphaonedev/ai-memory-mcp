@@ -24336,6 +24336,163 @@ pub fn approve_with_approver_type(
 /// emits live in `decide_pending_action` and
 /// `sweep_pending_action_timeouts` respectively, so the three governance
 /// transitions are audit-complete together).
+/// #3202 / #4419 — decide `agent_id`'s CURRENT admission for `action` in
+/// `namespace` WITHOUT queueing. [`enforce_governance`] would insert a second
+/// pending on `Approve`; this consults the same policy / level / ungoverned
+/// path (and, for a store with a real memory payload, the same
+/// `required_scope` refusal) and returns the bare decision, so a replay
+/// executor can treat Deny or still-Pending as a refusal. `Off` and `Advisory`
+/// admit, exactly as the live gate does (Advisory logs rather than blocks by
+/// contract).
+fn decide_admission_without_queue(
+    conn: &Connection,
+    action: GovernedAction,
+    namespace: &str,
+    agent_id: &str,
+    memory_owner: Option<&str>,
+    payload: Option<&serde_json::Value>,
+) -> Result<GovernanceDecision> {
+    use crate::config::{PermissionsMode, active_permissions_mode};
+    let mode = active_permissions_mode();
+    if mode == PermissionsMode::Off || mode == PermissionsMode::Advisory {
+        return Ok(GovernanceDecision::Allow);
+    }
+    let Some(policy) = resolve_governance_policy(conn, namespace)? else {
+        return Ok(ungoverned_namespace_decision(
+            mode, action, namespace, agent_id,
+        ));
+    };
+    let level = match action {
+        GovernedAction::Store | GovernedAction::Reflect => &policy.core.write,
+        GovernedAction::Delete => &policy.core.delete,
+        GovernedAction::Promote => &policy.core.promote,
+    };
+    let ns_owner = namespace_owner(conn, namespace)?;
+    let mut decision = evaluate_level(
+        conn,
+        action,
+        namespace,
+        level,
+        agent_id,
+        memory_owner,
+        ns_owner.as_deref(),
+    )?;
+    if matches!(action, GovernedAction::Store)
+        && matches!(decision, GovernanceDecision::Allow)
+        && let Some(payload) = payload
+        && let Some(required) = policy.core.required_scope
+        && let Some(refusal) = crate::governance::required_scope_refusal(
+            required,
+            payload,
+            action,
+            policy.core.write.clone(),
+            agent_id,
+            namespace,
+        )
+    {
+        decision = GovernanceDecision::Deny(refusal);
+    }
+    Ok(decision)
+}
+
+/// #4419 — re-run the REQUESTER's current write admission for the action an
+/// approved pending replays (CWE-613 / CWE-863: a standard tightened after
+/// the request was queued — `write: any` to `write: owner` — must refuse the
+/// replay exactly as it refuses a fresh request by the same principal).
+/// Decides only, never queues a second pending; a Deny or a still-Pending
+/// verdict is a typed [`GovernanceRefusal`] and an audit row. The vertical
+/// promote store arm re-checks the DESTINATION namespace; the promote arm's
+/// own destination check (#3202) still runs in the arm.
+fn readmit_pending_requester(conn: &Connection, pa: &PendingAction) -> Result<()> {
+    let owner_of = |memory_id: Option<&str>| -> Result<Option<String>> {
+        let Some(id) = memory_id else {
+            return Ok(None);
+        };
+        Ok(get_any(conn, id)?.and_then(|m| {
+            m.metadata
+                .get(crate::META_KEY_AGENT_ID)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        }))
+    };
+    let payload_namespace = || {
+        pa.payload
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(|| pa.namespace.clone(), str::to_string)
+    };
+    let (action, namespace, memory_owner, payload) = match pa.action_type.as_str() {
+        "store" => {
+            let is_vertical_promote = pa.payload.get(field_names::MODE).and_then(|v| v.as_str())
+                == Some(field_names::MODE_VERTICAL);
+            if is_vertical_promote {
+                let to_ns = pa
+                    .payload
+                    .get(field_names::TO_NAMESPACE)
+                    .and_then(|v| v.as_str())
+                    .map_or_else(|| pa.namespace.clone(), str::to_string);
+                (GovernedAction::Store, to_ns, None, None)
+            } else {
+                (GovernedAction::Store, payload_namespace(), None, Some(&pa.payload))
+            }
+        }
+        "delete" => (
+            GovernedAction::Delete,
+            pa.namespace.clone(),
+            owner_of(pa.memory_id.as_deref())?,
+            None,
+        ),
+        "promote" => (
+            GovernedAction::Promote,
+            pa.namespace.clone(),
+            owner_of(pa.memory_id.as_deref())?,
+            None,
+        ),
+        "reflect" => (GovernedAction::Reflect, payload_namespace(), None, None),
+        // An unknown action_type is refused by the arm match below.
+        _ => return Ok(()),
+    };
+    let decision = decide_admission_without_queue(
+        conn,
+        action,
+        &namespace,
+        &pa.requested_by,
+        memory_owner.as_deref(),
+        payload,
+    )?;
+    let reason = match decision {
+        GovernanceDecision::Allow => return Ok(()),
+        GovernanceDecision::Deny(refusal) => {
+            emit_pending_action_event(conn, pa, "pending_action.refused_stale_admission_deny", None);
+            refusal.reason
+        }
+        GovernanceDecision::Pending(_) => {
+            emit_pending_action_event(
+                conn,
+                pa,
+                "pending_action.refused_stale_admission_pending",
+                None,
+            );
+            "the write now requires an approval that was not granted".to_string()
+        }
+    };
+    tracing::warn!(
+        target: crate::governance::GOVERNANCE_GATE_TRACE_TARGET,
+        pending_id = %pa.id,
+        requested_by = %pa.requested_by,
+        namespace = %namespace,
+        action = ?action,
+        "approved pending replay refused: the requester is no longer admitted (#4419)"
+    );
+    Err(anyhow::Error::new(GovernanceRefusal {
+        reason: format!(
+            "requester '{}' is no longer admitted to {} in '{namespace}': {reason}",
+            pa.requested_by,
+            action.as_str()
+        ),
+    }))
+}
+
 /// #3202 Fable HIGH (2) — evaluate destination `write` at execute time
 /// WITHOUT queueing. `enforce_governance` would insert a second pending
 /// on `Approve`; this consults the same policy/level/ungoverned path and
@@ -24345,29 +24502,14 @@ fn refuse_unapproved_destination_store(
     pa: &PendingAction,
     to_ns: &str,
 ) -> Result<()> {
-    use crate::config::{PermissionsMode, active_permissions_mode};
-    let mode = active_permissions_mode();
-    if mode == PermissionsMode::Off {
-        return Ok(());
-    }
-    let decision = match resolve_governance_policy(conn, to_ns)? {
-        Some(policy) => {
-            let ns_owner = namespace_owner(conn, to_ns)?;
-            evaluate_level(
-                conn,
-                GovernedAction::Store,
-                to_ns,
-                &policy.core.write,
-                &pa.requested_by,
-                None,
-                ns_owner.as_deref(),
-            )?
-        }
-        None => ungoverned_namespace_decision(mode, GovernedAction::Store, to_ns, &pa.requested_by),
-    };
-    if mode == PermissionsMode::Advisory {
-        return Ok(());
-    }
+    let decision = decide_admission_without_queue(
+        conn,
+        GovernedAction::Store,
+        to_ns,
+        &pa.requested_by,
+        None,
+        None,
+    )?;
     match decision {
         GovernanceDecision::Allow => Ok(()),
         GovernanceDecision::Deny(refusal) => {
@@ -24412,6 +24554,10 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
         emit_pending_action_event(conn, &pa, "pending_action.refused_agent_id_mismatch", None);
         return Err(e);
     }
+    // #4419 — stale authorization: the requester's admission is re-decided
+    // NOW (deciding only), so a standard tightened since the request was
+    // queued refuses the replay as it refuses a fresh request.
+    readmit_pending_requester(conn, &pa)?;
     let memory_id = match pa.action_type.as_str() {
         "store" => {
             // #3202 Fable HIGH — destination-namespace Approve on vertical
@@ -24564,8 +24710,17 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
 /// surface as a `Validation` error rather than a panic).
 fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result<Option<String>> {
     let input = reflect_input_from_pending(pa)?;
-    let outcome = crate::storage::reflect::reflect(conn, &input)
-        .map_err(|e| anyhow::anyhow!("reflect execute failed: {e}"))?;
+    // #4419 — replay under the REQUESTER's source visibility (the postgres
+    // twin replays as the requester's tenant, #4357): a source whose owner
+    // narrowed its scope to private after the request was queued folds to
+    // `SourceNotFound` here, exactly as it would on a fresh request.
+    let outcome = crate::storage::reflect::reflect_with_hooks_for_caller(
+        conn,
+        &input,
+        &crate::storage::reflect::ReflectHooks::empty(),
+        Some(pa.requested_by.as_str()),
+    )
+    .map_err(|e| anyhow::anyhow!("reflect execute failed: {e}"))?;
     Ok(Some(outcome.id))
 }
 
