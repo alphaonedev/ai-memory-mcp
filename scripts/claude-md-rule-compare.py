@@ -12,10 +12,11 @@ quote and to the end of the line when the quote is never closed; a count of at m
 and an UPPER_SNAKE value only as an environment variable name, unless the name is a password or passphrase; a later word
 that is neither plain nor short prose masks the whole value, #6209; an emphasised or code-quoted name, a backtick-quoted
 value and the cells after a credential-name cell of a Markdown table row, #6210), URL userinfo (an empty user name
-included), an Authorization Bearer/Basic value, a GitHub, AWS access key id, Slack or `sk-` provider token, and a PEM or
-PGP private key block. A diff line inside a private key block is masked by its index on its own side, so it is masked
-even when the BEGIN line lies outside its hunk. Lines this script writes are never masked, and the verdict is computed
-on the unmasked text.
+included), an Authorization Bearer/Basic value, a GitHub, AWS access key id, Slack or `sk-` provider token, a GitLab
+personal access, Google API or npm token, a JSON Web Token, a PEM, PGP or PuTTY private key block, and the value on the
+line after a credential name that has none on its own line (#6211). A diff line inside a private key block is masked by
+its index on its own side, so it is masked even when the BEGIN line lies outside its hunk. Lines this script writes are
+never masked, and the verdict is computed on the unmasked text.
 
 The BASE guard (scripts/check-claude-md-size.py of the base checkout) and the BASE manifest
 (scripts/qc-allowlists/claude-md-rule-sections.sha256) then judge the head copies:
@@ -130,9 +131,18 @@ ALWAYS_MASK_NAME = re.compile(r"(?i)passw(?:or)?d|passphrase")
 URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]*:([^@\s/]+)@")
 BEARER_VALUE = re.compile(r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/-]{8,}=*)")
 PROVIDER_KEY_SHAPE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|(?:AKIA|ASIA)[0-9A-Z]{16}|"
-                                r"xox[abposr]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{20,})\b")
-PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----")
-PRIVATE_KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----")
+                                r"xox[abposr]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{20,}|"
+                                # #6211: GitLab personal access, Google API and npm tokens carry no name either.
+                                r"glpat-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35,}|npm_[A-Za-z0-9]{36,})\b")
+# #6211: a JSON Web Token (header.payload.signature, both JSON parts base64url `{"` = `eyJ`).
+JWT_SHAPE = re.compile(r"\b(eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})")
+# A PEM or PGP private key block; #6211: a PuTTY private key file runs from its header to its Private-MAC line.
+PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|PuTTY-User-Key-File-\d+:")
+PRIVATE_KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|Private-MAC:")
+# #6211: a credential name with no value on its line (`api_key:`); the value is on the next line that is not blank.
+NAME_ONLY = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\"'`])?\s*[:=]\s*(?:[*_]{1,2})?\s*$")
+# A next line that is a heading, a table row or a nested `key:` of its own is structure, not the value.
+STRUCTURE_LINE = re.compile(r"(?:#|\||[\w-]+:(?:\s|$))")
 MASK = "[MASKED]"
 MAX_BLOB_BYTES = 2 * 1024 * 1024  # far above any legitimate file; refuses a memory-exhaustion blob
 # Messages of the base guard that the section comparison already reports in its own words.
@@ -330,23 +340,40 @@ class Redactor:
     def __init__(self) -> None:
         self.count = 0
 
-    def mask_rows(self, rows: list) -> list:
+    def mask_rows(self, rows: list, prefixed: bool = False) -> list:
         """Mask `rows` of (text, kind): kind "meta" is a diff header line the script writes (shown as is), "key" is a
-        line inside a private key block (masked whole, its diff prefix kept), "text" is masked shape by shape."""
-        out = []
+        line inside a private key block (masked whole, its diff prefix kept), "text" is masked shape by shape.
+        `prefixed`: every non-meta row starts with a one-character diff prefix. #6211: the first non-blank text row
+        after a credential name with no value (`api_key:`) is masked unless it is structure (STRUCTURE_LINE) or plain
+        prose of two or more words; a meta or key row ends the wait."""
+        out, pending = [], None
         for line, kind in rows:
             if kind == "meta":
                 out.append(line)
+                pending = None
                 continue
             if kind == "key":
                 self.count += 1
                 out.append(line[:1] + MASK if line[:1] in "+- " else MASK)
+                pending = None
                 continue
+            body = line[1:] if prefixed else line
+            content = body.strip()
+            if pending is not None and content:
+                if not (STRUCTURE_LINE.match(content) or (len(content.split()) > 1 and plain_text(pending, content))):
+                    self.count += 1
+                    out.append(line[:len(line) - len(body.lstrip())] + MASK)
+                    pending = None
+                    continue
+                pending = None
+            name_only = NAME_ONLY.search(line)
+            if name_only is not None:
+                pending = name_only.group(1)
             line, found = mask_named_values(line)
             self.count += found
             line, found = mask_table_cells(line)
             self.count += found
-            for pattern in (URL_USERINFO, BEARER_VALUE, PROVIDER_KEY_SHAPE):
+            for pattern in (URL_USERINFO, BEARER_VALUE, PROVIDER_KEY_SHAPE, JWT_SHAPE):
                 line, found = mask_group(pattern, line)
                 self.count += found
             out.append(line)
@@ -399,7 +426,7 @@ def unified(old: str, new: str, key: str, redactor=None) -> str:
                      for index in range(new_start, new_stop)]
     truncated = len(rows) > DIFF_LINE_CAP
     rows = rows[:DIFF_LINE_CAP]
-    lines = redactor.mask_rows(rows) if redactor is not None else [line for line, _kind in rows]
+    lines = redactor.mask_rows(rows, True) if redactor is not None else [line for line, _kind in rows]
     return "\n".join(lines) + (f"\n... diff truncated at {DIFF_LINE_CAP} lines" if truncated else "")
 
 
