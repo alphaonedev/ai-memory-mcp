@@ -1957,9 +1957,9 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         # An all-zero head or merge sha is not a skip: only the push-lane
         # GITHUB_EVENT_BEFORE has that meaning (#6201); here it must reach the lookup.
         ("all-zero PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA="0" * 40),
-         "does not resolve to a commit"),
+         f"PR_HEAD_SHA {'0' * 40} does not resolve to a commit"),
         ("all-zero GITHUB_SHA", dict(pr_base_env, GITHUB_SHA="0" * 40),
-         "does not resolve to a commit"),
+         f"merge commit {'0' * 40} does not resolve to a commit"),
         ("unresolvable merge commit", dict(pr_base_env, GITHUB_SHA="2" * 40),
          "does not resolve to a commit"),
         ("a GITHUB_SHA that is not a two-parent merge", dict(pr_base_env, GITHUB_SHA=base),
@@ -2120,7 +2120,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # (m2-zero-after, #6201) An all-zero GITHUB_SHA on a push is the tip, not a skip:
     # the run is judged and stops at the range lookup.
     rc, _o, err = run_gate(repo, dict(m2_base, GITHUB_EVENT_BEFORE=base, GITHUB_SHA="0" * 40))
-    if rc != 1 or "cannot resolve range" not in err:
+    if rc != 1 or f"cannot resolve range {base}..{'0' * 40}" not in err:
         t.fail("(m2-zero-after): a push with an all-zero GITHUB_SHA was not judged:", err)
 
     # (n) fail-closed - unresolvable range.
