@@ -1161,6 +1161,37 @@ jobs:
         # Actions CERT_EXPIRY_BASE/HEAD overrides are refused.
         run: python3 -I scripts/check_cert_expiry.py --self-test
 
+  carrier-base-fresh-gate:
+    # #6143. chain/** and rehearsal/** are pull_request BASES of this workflow but
+    # carry no ruleset requiring an up-to-date head, and GitHub does not re-run
+    # pull_request workflows when the base moves. A green run is therefore a
+    # verdict on the merge ref as it was built; on a moved base the gates judged a
+    # tree that is not the tree that lands. This job fails closed when the merge
+    # commit it checked out is not built on the LIVE tip of the carrier base (it
+    # re-fetches the tip every run, so a re-run turns a stale green RED). N/A on
+    # every other event and base (release/** and main are strict-protected).
+    # Closing "job finished -> merge click" needs the carrier ruleset documented
+    # in docs/ci/CARRIER-BRANCH-GATES.md (a repository-settings change).
+    # No `needs:`, no job-level `if:`, no `paths:` filter: always reports.
+    # Python runs with `-I` (precedent #5163). Deliberately unrequired at
+    # introduction (required-contexts-not-required.txt); promoted by the #3554
+    # lockstep once the carrier ruleset exists.
+    name: Carrier-base freshness gate (#6143)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Run carrier-base freshness gate
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 -I scripts/check_carrier_base_fresh.py
+      - name: Self-test the gate (regression evidence)
+        run: python3 -I scripts/check_carrier_base_fresh.py --self-test
+
   foreign-text-to-caller-gate:
     # #3688 gate 7 (Conductor ruling on the reviewer-f2r secret-to-sink sweep,
     # 2026-09-13). Keyed on SOURCE x SINK, never on a binding's name: a
