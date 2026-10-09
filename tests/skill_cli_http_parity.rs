@@ -410,6 +410,74 @@ async fn issue_6125_http_promote_404_body_is_unchanged() {
     assert_eq!(v["error"], "reflection not found: no-such-reflection");
 }
 
+/// #6133 - the retired-lineage refusal is first-party text: after the lineage
+/// is retired, a second promote answers 400 with the refusal verbatim (the
+/// MCP wire text of the same chain), never `internal storage error`.
+#[tokio::test]
+async fn issue_6133_http_promote_400_body_keeps_retired_lineage_refusal() {
+    let (_dir, db_path) = fresh_db();
+    let reflection_id = {
+        let conn = ai_memory::db::open(&db_path).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let src = ai_memory::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: ai_memory::models::Tier::Mid,
+            namespace: "ns".into(),
+            title: "source".into(),
+            content: "body of source".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "cli".into(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+            memory_kind: ai_memory::models::MemoryKind::Observation,
+            ..Default::default()
+        };
+        let src_id = ai_memory::db::insert(&conn, &src).unwrap();
+        ai_memory::db::reflect(
+            &conn,
+            &ai_memory::db::ReflectInput {
+                source_ids: vec![src_id],
+                title: "reflection".into(),
+                content: "Synthesised insight: pattern X implies action Y.".into(),
+                namespace: Some("ns".into()),
+                tier: ai_memory::models::Tier::Mid,
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "cli".into(),
+                agent_id: "ops:admin".into(),
+                metadata: json!({}),
+            },
+        )
+        .unwrap()
+        .id
+    };
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let body = json!({"name": "retire-me", "description": "d"});
+    let (status, v) = post_promote(router.clone(), &reflection_id, &body).await;
+    assert_eq!(status, StatusCode::OK, "first promote: {v}");
+    ai_memory::db::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE skills SET retired_at = 1 WHERE namespace = 'ns' AND name = 'retire-me'",
+            [],
+        )
+        .unwrap();
+    let (status, v) = post_promote(router, &reflection_id, &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(
+        v["error"],
+        "skill lineage 'ns/retire-me' is retired; unretire before re-registering"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #2024 — retire HTTP admin gate + CLI parity
 // ---------------------------------------------------------------------------
