@@ -12852,6 +12852,51 @@ legacy_scoring = false
         clear_permissions_mode_override_for_test();
     }
 
+    /// #4895 — a POISONED mode slot must still yield the INSTALLED mode,
+    /// never the pre-init `Advisory` fallback: a panic while holding the
+    /// write guard poisons the `RwLock`, and a reader that maps the poison
+    /// to "boot never installed a mode" silently runs every later governance
+    /// decision in `Advisory` (fail-open, ERRORS-19). The writers recover the
+    /// slot the same way, so a later install still lands.
+    #[test]
+    fn active_permissions_mode_survives_a_poisoned_slot_4895() {
+        let _serialise = lock_permissions_mode_for_test();
+        set_active_permissions_mode(PermissionsMode::Enforce);
+        // Poison the slot: a scoped thread panics while holding the write guard.
+        let joined = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _guard = ACTIVE_PERMISSIONS_MODE
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                panic!("poison the permissions-mode slot (#4895)");
+            })
+            .join()
+        });
+        assert!(joined.is_err(), "the scoped thread must have panicked");
+        assert!(
+            ACTIVE_PERMISSIONS_MODE.is_poisoned(),
+            "the slot must be poisoned for the cell to measure anything"
+        );
+        assert_eq!(
+            active_permissions_mode(),
+            PermissionsMode::Enforce,
+            "a poisoned slot must yield the installed mode, not the pre-init fallback"
+        );
+        // The writers recover the poisoned slot too: a later install still lands.
+        set_active_permissions_mode(PermissionsMode::Advisory);
+        assert_eq!(
+            active_permissions_mode(),
+            PermissionsMode::Advisory,
+            "a later install must still land on a poisoned slot"
+        );
+        clear_permissions_mode_override_for_test();
+        assert_eq!(
+            active_permissions_mode(),
+            UNINITIALIZED_PERMISSIONS_MODE_FALLBACK,
+            "clearing a poisoned slot must still reset it"
+        );
+    }
+
     #[test]
     fn capabilities_enabled_resolution_ladder() {
         // v0.9.0 G10.1 (#1827); v1.0.0 R9 (#1960) — env
