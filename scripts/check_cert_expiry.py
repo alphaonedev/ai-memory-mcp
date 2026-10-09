@@ -106,6 +106,7 @@ Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
 
 import argparse
 import contextlib
+import errno
 import io
 import os
 import re
@@ -888,31 +889,71 @@ def shim_interpreter_violation(tmp):
             shutil.rmtree(deep, ignore_errors=True)
 
 
-def deep_scratch(tmp, target_len):
-    """A scratch directory whose absolute path is about target_len bytes, built
-    with dir_fd so no single syscall sees a path over PATH_MAX (#6145 R3-F2)."""
-    base = Path(tempfile.mkdtemp(prefix="gitshim-deep.", dir=str(tmp)))
-    cur = base
-    fds = [os.open(str(base), os.O_RDONLY)]
+MKDTEMP_NAME_LEN = len("gitshim-long.") + 8  # tempfile.mkdtemp appends 8 random characters
+
+
+def path_max(path):
+    """The PATH_MAX of the filesystem holding path (Linux 4096, macOS 1024),
+    falling back to 4096 when the platform cannot say (#6145 R4-F1)."""
     try:
-        while len(os.fsencode(str(cur))) + 201 < target_len:
-            os.mkdir("d" * 200, dir_fd=fds[-1])
-            fds.append(os.open("d" * 200, os.O_RDONLY, dir_fd=fds[-1]))
-            cur = cur / ("d" * 200)
+        limit = os.pathconf(str(path), "PC_PATH_MAX")
+    except (OSError, ValueError, AttributeError):
+        return 4096
+    return limit if isinstance(limit, int) and limit > 0 else 4096
+
+
+def deep_scratch(tmp, target_len):
+    """A scratch directory whose absolute path is EXACTLY target_len bytes, built
+    with dir_fd so no single syscall sees a path over PATH_MAX (#6145 R3-F2, R4-F2).
+    Returns (base, deepest); on any failure removes base and raises OSError (R4-F3)."""
+    base = Path(tempfile.mkdtemp(prefix="gitshim-deep.", dir=str(tmp)))
+    fds = []
+    try:
+        cur, cur_len = base, len(os.fsencode(str(base)))
+        fds.append(os.open(str(base), os.O_RDONLY))
+        while cur_len < target_len:
+            room = target_len - cur_len
+            step = min(200, room - 1)
+            if room - step - 1 == 1:
+                step -= 1  # a final component needs 2 bytes ('/' + 1 char)
+            if step < 1:
+                raise OSError(errno.ENAMETOOLONG,
+                              f"cannot land on exactly {target_len} bytes from {cur_len}")
+            name = "d" * step
+            os.mkdir(name, dir_fd=fds[-1])
+            fds.append(os.open(name, os.O_RDONLY, dir_fd=fds[-1]))
+            cur, cur_len = cur / name, cur_len + 1 + step
+        if cur_len != target_len:
+            raise OSError(errno.ENAMETOOLONG,
+                          f"the scratch base is {cur_len} bytes, over the {target_len}-byte target")
+        return base, cur
+    except BaseException:
+        shutil.rmtree(base, ignore_errors=True)
+        raise
     finally:
         for fd in fds:
             os.close(fd)
-    return base, cur
 
 
 def shim_boundary_robustness_violation(tmp):
     """None when shim_interpreter_violation reports (never raises) on a scratch dir
-    that is missing or sits at PATH_MAX (#6145 R3-F2), else a description."""
+    that is missing or sits just under PATH_MAX (#6145 R3-F2), else a description.
+    The near-PATH_MAX path is sized from the platform's PATH_MAX (R4-F1) and the cell
+    asserts the 200-byte directory build would overflow it (R4-F2), so moving the
+    'too deep' check after the build turns this cell red."""
     missing = shim_interpreter_violation(tmp / "no-such-scratch-6145")
     if missing is None or not missing.startswith("could not build the boundary cases"):
         return f"a missing scratch dir gave {missing!r}, not a 'could not build' violation"
-    base, near_max = deep_scratch(tmp, 3900)
+    limit = path_max(tmp)
+    target = limit - 1 - (MKDTEMP_NAME_LEN + 1) - 1
     try:
+        base, near_max = deep_scratch(tmp, target)
+    except OSError as exc:
+        return f"could not build the near-PATH_MAX scratch: {exc}"
+    try:
+        if len(os.fsencode(str(near_max))) + MKDTEMP_NAME_LEN + 1 + 201 < limit:
+            return (f"the near-PATH_MAX scratch ({target} bytes) is too short for the 200-byte "
+                    f"build to overflow PATH_MAX {limit}")
         try:
             deep = shim_interpreter_violation(near_max)
         except OSError as exc:
@@ -1037,6 +1078,15 @@ def self_test():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def guarded(cell, *args, **kwargs):
+    """Run a self-test cell; a crash becomes a named violation string, not a traceback
+    (#6145 security O1)."""
+    try:
+        return cell(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - report any crash as a named failure
+        return f"{cell.__name__} raised {type(exc).__name__}: {exc}"
+
+
 def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     repo = tmp / "repo"
     repo.mkdir()
@@ -1051,22 +1101,22 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         t.fail(f"(shim-isolation, #6145): {iso}")
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
         return 2
-    iface = shim_interpreter_violation(tmp)
+    iface = guarded(shim_interpreter_violation, tmp)
     if iface is not None:
         t.fail(f"(shim-interpreter, #6145): {iface}")
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
         return 2
-    robust = shim_boundary_robustness_violation(tmp)
+    robust = guarded(shim_boundary_robustness_violation, tmp)
     if robust is not None:
         t.fail(f"(shim-interpreter-robust, #6145): {robust}")
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
         return 2
-    deepx = deep_scratch_violation(tmp)
+    deepx = guarded(deep_scratch_violation, tmp)
     if deepx is not None:
         t.fail(f"(shim-deep-scratch, #6145): {deepx}")
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
         return 2
-    unexec = shim_isolation_violation(tmp, interpreter=tmp / "no-such-python-6145")
+    unexec = guarded(shim_isolation_violation, tmp, interpreter=tmp / "no-such-python-6145")
     if unexec is None or not unexec.startswith("the shim could not be executed"):
         t.fail(f"(shim-unexecutable, #6145): an unexecutable shim gave {unexec!r}, "
                "not a 'the shim could not be executed' violation")
@@ -1652,7 +1702,9 @@ SELF_TEST_OK = (
     "a module planted beside it not importable, checked before any shimmed gate run; "
     "(shim-interpreter, #6145) a whitespace, NUL, over-long (>255 byte) or non-UTF-8 interpreter line is "
     "refused and a 255-byte line is accepted; (shim-interpreter-robust, #6145) a missing or near-PATH_MAX "
-    "scratch dir yields a named violation, not a traceback; (shim-unexecutable, #6145) an unexecutable shim "
+    "scratch dir, sized from the platform PATH_MAX, yields a named violation, not a traceback; "
+    "(shim-deep-scratch, #6145) the deep scratch builder lands on the exact length, removes itself on failure and "
+    "a build failure is a named violation; (shim-unexecutable, #6145) an unexecutable shim "
     "is reported as a violation."
 )
 
