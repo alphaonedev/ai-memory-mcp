@@ -907,9 +907,9 @@ def _read_word(text: str, i: int) -> Tuple[str, bool, bool, int]:
                 j += 2 if text[j] == "\\" else 1
             flush()
             inner = ANSI_C_ESCAPE_RE.sub(_ansi_c_one, text[i + 2:j])
-            # A decoded blank or newline is still one word of the value bash assigned, so it
-            # becomes the unit separator the flag matchers already split on.
-            out.append("".join("\x1f" if ch.isspace() else ch for ch in inner))
+            # A decoded blank, newline or \x1f stays inside the one word bash assigned; every flag
+            # matcher splits on whitespace and \x1f alike, so nothing is rewritten here.
+            out.append(inner)
             i = j + 1
             continue
         if c == '"' or (c == "$" and text[i + 1:i + 2] == '"'):
