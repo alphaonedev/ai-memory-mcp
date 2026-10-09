@@ -1164,6 +1164,7 @@ pub async fn dispatch_event_postgres(
     .await;
 }
 
+#[cfg(feature = "sal")]
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_event_postgres_gated(
     app: &AppState,
@@ -1363,6 +1364,7 @@ async fn dispatch_event_postgres_gated(
 /// [`crate::subscriptions::dispatch_event_for_deleted`]: the row is gone,
 /// so the read gate is evaluated against the caller's PRE-delete snapshot,
 /// which also supplies the envelope's id / namespace / owner.
+#[cfg(feature = "sal")]
 pub async fn dispatch_event_postgres_for_deleted(
     app: &AppState,
     event: &str,

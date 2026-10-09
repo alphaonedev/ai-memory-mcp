@@ -57,14 +57,9 @@ fn scratch() -> tempfile::TempDir {
         .expect("tempdir under .local-runs")
 }
 
-#[cfg_attr(
-    not(feature = "sal"),
-    expect(
-        clippy::needless_pass_by_value,
-        reason = "`SalStore` is a ZST without `sal`; under `sal` its inner Arc is \
-                  MOVED into the struct literal, so one signature keeps both legs."
-    )
-)]
+// `SalStore` is a ZST without `sal`; under `sal` its inner Arc is MOVED into
+// the struct literal, so one signature keeps both legs.
+#[cfg_attr(not(feature = "sal"), allow(clippy::needless_pass_by_value))]
 fn app_state(
     dir: &std::path::Path,
     llm: Option<OllamaClient>,

@@ -174,6 +174,7 @@ pub(crate) async fn fanout_or_pending(
 /// AFTER the SAL owner gate accepted the local delete, so an id the caller
 /// does not own is never fanned out. A network error is logged and
 /// swallowed (local commit landed; the sync daemon catches stragglers).
+#[cfg(feature = "sal")]
 pub(crate) async fn fanout_delete_or_pending(
     app: &AppState,
     id: &str,
@@ -196,6 +197,7 @@ pub(crate) async fn fanout_delete_or_pending(
 /// route's own success fields (`extra`, e.g. `{"id": .., "removed": true}`),
 /// so the caller can see both that the local row IS gone and that a peer
 /// still holds it.
+#[cfg(feature = "sal")]
 pub(crate) fn under_replicated_delete_response(
     payload: &QuorumNotMetPayload,
     extra: serde_json::Map<String, serde_json::Value>,
