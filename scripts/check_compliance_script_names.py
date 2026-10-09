@@ -13,7 +13,8 @@ Rule: every ``check-*.sh`` / ``check_*.py`` script name in a
 ``scripts/``, unless BOTH hold (below). A name is found anywhere on a line,
 bounded by non-name characters: in or out of backticks, in a fenced block, after
 a command (``bash scripts/...``) or a path (``./scripts/...``, a URL), after
-Unicode format characters (category Cf) are removed from document lines (#6195).
+invisible characters (category Cf and every Default_Ignorable_Code_Point) are removed
+from document lines (#6195).
 The path is the part after the first ``scripts`` component of the written path,
 else the bare name: ``scripts/sub/check-x.sh`` names that file, never a
 same-named file elsewhere, and a symlink counts only when it resolves inside
@@ -88,6 +89,29 @@ PINNABLE_DOCS = frozenset(
         "docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md",
     }
 )
+# Default_Ignorable_Code_Point (Unicode DerivedCoreProperties.txt) as inclusive ranges; the
+# standard library has no lookup for this property (#6195). It includes the members outside
+# category Cf: variation selectors, U+034F, Hangul fillers, Khmer inherent vowels, Mongolian free
+# variation selectors, and the reserved ranges a later Unicode version may assign as invisible.
+DEFAULT_IGNORABLE = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
 
 
 class Unreadable(Exception):
@@ -106,14 +130,23 @@ def read_text(root, path):
         raise Unreadable(path.relative_to(root))
 
 
-def doc_lines(root, path):
-    """A document's lines with Unicode format characters (category Cf) removed (#6195).
+def invisible(c):
+    """True for a character a reader does not see: category Cf or Default_Ignorable_Code_Point."""
+    if unicodedata.category(c) == "Cf":
+        return True
+    cp = ord(c)
+    return any(lo <= cp <= hi for lo, hi in DEFAULT_IGNORABLE)
 
-    A reader does not see a soft hyphen, a zero-width space or joiner, or a BOM, so the gate
+
+def doc_lines(root, path):
+    """A document's lines with invisible characters removed (#6195).
+
+    A reader does not see a soft hyphen, a zero-width space or joiner, a BOM, a variation
+    selector or a Hangul filler (category Cf plus Default_Ignorable_Code_Point), so the gate
     must not either. Only documents are normalised; the allowlist stays strict.
     """
     text = read_text(root, path)
-    return "".join(c for c in text if unicodedata.category(c) != "Cf").splitlines()
+    return "".join(c for c in text if not invisible(c)).splitlines()
 
 
 def tokens(line):
