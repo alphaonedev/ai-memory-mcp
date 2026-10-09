@@ -2289,6 +2289,47 @@ def _self_test_cases() -> int:
           '{\n  "kty": "RSA",\n  "n": "6163pubn",\n  "p": "6163CanaryJwkPrimePValue",\n'
           '  "qi": "6163CanaryJwkQiValue"\n}',
           hidden=("6163CanaryJwkPrime", "6163CanaryJwkQi"), shown=('"n": "6163pubn"',))
+    # #6163 round 4 (security F7): one cell per round-3 mutant survivor (T3-T19) and per round-4 rule, each failing
+    # under the mutant named in its label.
+    masks("#6211 R4 T3 a table row after a bare name is structure", "api_key:\n| a | b |", shown=("| a | b |",),
+          count=0)
+    masks("#6211 R4 T4 a nested key with no value after a bare name is structure", "api_key:\n  production:",
+          shown=("  production:",), count=0)
+    masks("#6211 R4 T5 a private key block ends the wait for a value",
+          "api_key:\n-----BEGIN PRIVATE KEY-----\nMIIT5\n-----END PRIVATE KEY-----\nafter-key-6163",
+          shown=("after-key-6163",), count=3)
+    masks("#6210 R4 T6 a cell that is already masked is not counted again", "| password | [MASKED] |", count=0)
+    masks("#6210 R4 T7 a two-word prose cell stays visible", "| token_budget | Per call |", shown=("Per call",),
+          count=0)
+    masks("#6163 R4 T9 an upper-snake value is an environment name only when it ends in a credential word",
+          "api_key: PROD_KEY_LIVEVALUE", hidden=("PROD_KEY_LIVEVALUE",), count=1)
+    masks("#6210 R4 T10 a long run of capitals in a table cell is not a prose acronym",
+          "| api_token | rotate QZXCANARYQ now |", hidden=("QZXCANARYQ",), count=1)
+    masks("#6210 R4 T12 an emphasised table name cell masks its value", "| **password** | canary6163T12 |",
+          hidden=("canary6163T12",), count=1)
+    masks("#6211 R4 T13 an emphasised bare name masks the next line", "**api_key**:\n  6163CanaryT13Value",
+          hidden=("6163CanaryT13Value",), count=1)
+    masks("#6211 R4 T14 a bare name with `=` masks the next line", "api_key =\n  6163CanaryT14Value",
+          hidden=("6163CanaryT14Value",), count=1)
+    masks("#6211 R4 T16 a blank line does not end the wait for a value", "api_key:\n\n  6163CanaryT16Value",
+          hidden=("6163CanaryT16Value",), count=1)
+    masks("#6211 R4 T17 a masked value line keeps its indentation", "api_key:\n    6163CanaryT17Value",
+          hidden=("6163CanaryT17Value",), shown=("\n    [MASKED]",), count=1)
+    masks("#6163 R4 T18 a backslash-escaped quote inside a single-quoted value is part of it",
+          "password: 'ab\\'6163CanaryT18' tail", hidden=("6163CanaryT18",), shown=("tail",), count=1)
+    diff_masks("#6163 R4 T19 a context line inside a key block of the head side only is masked",
+               "intro\nbody6163CanaryT19\n-----END PRIVATE KEY-----\nafter",
+               "intro\n-----BEGIN PRIVATE KEY-----\nbody6163CanaryT19\n-----END PRIVATE KEY-----\nafter",
+               hidden=("body6163CanaryT19",))
+    diff_masks("#6211 R4 T19 a context line that is a value on the head side only is masked",
+               "intro\n  6163CanaryT19Value\nend", "intro\napi_key:\n  6163CanaryT19Value\nend",
+               hidden=("6163CanaryT19Value",), shown=("+api_key:",))
+    masks("#6163 R4 a single-word nested value under a bare name is masked", "api_key:\n  value: hunterlike",
+          hidden=("hunterlike",), count=1)
+    masks("#6209 R4 a quoted grouped digit run is masked", 'secret: "123456789_123_456_789"',
+          hidden=("123456789_123_456_789",), count=1)
+    masks("#6211 R4 the line after a YAML block stays visible", "secret: |\n  6163CanaryBlockLine\nnext: shown-6163",
+          hidden=("6163CanaryBlockLine",), shown=("secret: |", "next: shown-6163"), count=1)
 
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
