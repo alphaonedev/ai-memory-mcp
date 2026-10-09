@@ -144,6 +144,16 @@ HTML_BLOCK_RE = re.compile(r"^ {0,3}<(/?)([A-Za-z][A-Za-z0-9-]*)")
 RAW_TEXT_TAGS = frozenset({"pre", "script", "style", "textarea"})
 # A line that is only ``$$`` opens or closes a display-math block, rendered as math (#6196).
 MATH_FENCE = "$$"
+# CommonMark lines and whitespace (#6196): only CR, LF and CRLF end a line, and only space and tab
+# make a line blank or may follow a closing fence. Python's splitlines() and strip() also take VT,
+# FF, FS, NEL, U+2028, NBSP and EM SPACE, which leave a GitHub fence or paragraph open.
+LINE_END_RE = re.compile(r"\r\n|\r|\n")
+BLANK = " \t"
+# A line that is an indented code block outside an HTML block: a ``</details>`` there is text (#6196).
+INDENTED_RE = re.compile(r"^(?: {4}| {0,3}\t)")
+# The name of a tag that ``comment_text_removed`` hides, ``/`` included for an end tag (#6196).
+TAG_NAME_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*")
+DETAILS_OPEN_RE = re.compile(r"<details(?![A-Za-z0-9-])", re.IGNORECASE)
 # The document skeleton (#6214): what a renderer drops between the letters of a name. A
 # comment (``<!-->``, ``<!--->`` included), a tag, a code-span backtick, a link or image
 # opener and a link closer with its inline destination.
@@ -228,15 +238,32 @@ def invisible(c):
     return any(lo <= cp <= hi for lo, hi in DEFAULT_IGNORABLE)
 
 
-def doc_lines(root, path):
-    """A document's lines with invisible characters removed (#6195).
+def visible(text):
+    """``text`` without invisible characters (category Cf and Default_Ignorable_Code_Point)."""
+    return "".join(c for c in text if not invisible(c))
 
-    A reader does not see a soft hyphen, a zero-width space or joiner, a BOM, a variation
-    selector or a Hangul filler (category Cf plus Default_Ignorable_Code_Point), so the gate
-    must not either. Only documents are normalised; the allowlist stays strict.
+
+def split_lines(text):
+    """``text`` split into CommonMark lines: only CR, LF and CRLF end a line (#6196)."""
+    lines = LINE_END_RE.split(text)
+    if lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def doc_lines(root, path):
+    """Return (raw, shown): a document's CommonMark lines as written, and without invisible characters.
+
+    A reader does not see a soft hyphen, a zero-width space or joiner, a variation selector or a
+    Hangul filler (category Cf plus Default_Ignorable_Code_Point), so names are matched in the
+    ``shown`` lines (#6195). Block structure (fences, blank lines, HTML blocks, errata) is read
+    from the ``raw`` lines, because an invisible character still makes a line non-blank and keeps
+    a closing fence from closing (#6196). Only a leading byte order mark is dropped from both, as
+    the renderer drops it. Only documents are normalised; the allowlist stays strict.
     """
     text = read_text(root, path)
-    return "".join(c for c in text if not invisible(c)).splitlines()
+    raw = split_lines(text[1:] if text.startswith("\ufeff") else text)
+    return raw, [visible(line) for line in raw]
 
 
 def rendered(line, fold_letters=True):
@@ -509,11 +536,13 @@ def tag_end(line, pos, quote):
     return -1, quote
 
 
-def comment_text_removed(line, inside, spans=True):
+def comment_text_removed(line, inside, spans=True, tags=None):
     """Return (``line`` without unrendered raw HTML, the open state at the end of ``line``).
 
     The state is "" (none), the closer of an open comment, CDATA section, processing
-    instruction or declaration, or ``"tag"`` plus an open attribute quote (#6196).
+    instruction or declaration, or ``"tag"`` plus an open attribute quote (#6196). The lower-case
+    name of each tag that starts on ``line`` (``/`` included for an end tag) is appended to
+    ``tags`` when given.
     """
     shown, pos = [], 0
     while True:
@@ -536,6 +565,9 @@ def comment_text_removed(line, inside, spans=True):
             shown.append(line[pos:start.start()])
             opener = start.group()
             inside = HIDDEN_HTML_CLOSERS.get(opener, ">" if opener.startswith("<!") else "tag")
+            name = TAG_NAME_RE.match(line, start.start())
+            if inside == "tag" and tags is not None and name:
+                tags.append(name.group()[1:].lower())
             # ``<!-->`` and ``<!--->`` are complete comments: the closer may share the
             # opener's dashes (#6246).
             pos = start.start() + 2 if opener == "<!--" else start.end()
@@ -545,9 +577,9 @@ def comment_text_removed(line, inside, spans=True):
 def fence_closes(fence, line):
     """True when ``line`` closes the fenced block opened by the marker ``fence`` (#6215)."""
     if fence == MATH_FENCE:
-        return line.strip() == MATH_FENCE
+        return line.strip(BLANK) == MATH_FENCE
     m = FENCE_RE.match(line)
-    return bool(m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip())
+    return bool(m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip(BLANK))
 
 
 def erratum_lines(lines):
@@ -561,11 +593,16 @@ def erratum_lines(lines):
     runs to its closer, across blank lines and fences), or inside a raw HTML block (where backticks
     protect nothing and a ``pre``/``script``/``style``/``textarea`` block runs to its closing tag),
     and not when its text holds ``[`` or ``]`` outside code spans (link, image and footnote syntax
-    can hide text). ``text`` is the line without its unrendered raw HTML. Any other shape (a list
-    item, a block quote, a definition, a table, after a paragraph line) is not an erratum: rejecting
-    a visible one only fails closed. Stale names are still found in all of this text.
+    can hide text). It is not an erratum inside a ``<details>`` element (collapsed by default) or on
+    a line that opens one (#6196): every ``<details`` outside a code span or fence opens one, and
+    only an end tag the renderer reads as a tag (not in a comment, a ``pre``/``script``/``style``/
+    ``textarea`` block or an indented code line) closes one. ``lines`` are the raw CommonMark
+    lines (``doc_lines``): only space and tab are blank (#6196). ``text`` is the line without its
+    unrendered raw HTML and invisible characters. Any other shape (a list item, a block quote, a
+    definition, a table, after a paragraph line) is not an erratum: rejecting a visible one only
+    fails closed. Stale names are still found in all of this text.
     """
-    found, inside, fence, html, starts = {}, "", None, "", True
+    found, inside, fence, html, starts, details = {}, "", None, "", True, 0
     for i, line in enumerate(lines):
         if fence is not None:
             starts = fence_closes(fence, line)
@@ -577,20 +614,24 @@ def erratum_lines(lines):
             if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
                 fence = m.group(1)
                 continue
-            if line.strip() == MATH_FENCE:
+            if line.strip(BLANK) == MATH_FENCE:
                 fence = MATH_FENCE
                 continue
             block = HTML_BLOCK_RE.match(line)
             if block:
                 tag = block.group(2).lower()
                 html = "</%s>" % tag if not block.group(1) and tag in RAW_TEXT_TAGS else "\n"
-        begins = starts and not inside and not html
-        shown, inside = comment_text_removed(line, inside, not html)
+        opens = len(DETAILS_OPEN_RE.findall(line if html else outside_code_spans(line)))
+        begins = starts and not inside and not html and not details and not opens
+        tags = []
+        shown, inside = comment_text_removed(line, inside, not html, tags)
         if begins and ERRATUM_RE.match(line) and not any(c in "[]" for c in outside_code_spans(shown)):
-            found[i] = shown
-        if html == "\n" and not line.strip() or html != "\n" and html and html in line.lower():
+            found[i] = visible(shown)
+        closes = 0 if html not in ("", "\n") or not html and INDENTED_RE.match(line) else tags.count("/details")
+        details = max(0, details + opens - closes)
+        if html == "\n" and not line.strip(BLANK) or html != "\n" and html and html in line.lower():
             html = ""
-        starts = not line.strip()
+        starts = not line.strip(BLANK)
     return found
 
 
@@ -614,9 +655,9 @@ def collect_errata(root, lines_by_doc):
     the violation can say which line to fix (#6238).
     """
     errata, per_doc, near = {}, {}, {}
-    for doc, lines in lines_by_doc:
+    for doc, raw, lines in lines_by_doc:
         rel = doc.relative_to(root).as_posix()
-        found = erratum_lines(lines)
+        found = erratum_lines(raw)
         for i, line in enumerate(lines):
             if i in found:
                 for name, succ in erratum_names(root, found[i]):
@@ -662,12 +703,12 @@ def load_allowlist(root):
 def check(root):
     """Return a list of violation strings for the tree at ``root``."""
     docs, problems = compliance_docs(root)
-    lines_by_doc = [(doc, doc_lines(root, doc)) for doc in docs]
+    lines_by_doc = [(doc,) + doc_lines(root, doc) for doc in docs]
     errata, per_doc, near = collect_errata(root, lines_by_doc)
     allowed, ledger_problems = load_allowlist(root)
     problems.extend(ledger_problems)
     used = set()
-    for doc, lines in lines_by_doc:
+    for doc, _raw, lines in lines_by_doc:
         rel = doc.relative_to(root).as_posix()
         joined = skeleton(lines)
         for lineno, line in enumerate(lines, 1):
