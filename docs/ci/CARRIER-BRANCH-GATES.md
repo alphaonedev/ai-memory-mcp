@@ -112,8 +112,10 @@ key loses its old entry. A failed or partial run records nothing.
 **Safety rules (enforced in the script).**
 
 1. The cache is consulted only when `CI_TEST_BINARY_CACHE=1`.
-2. Never on `push` to `release/**` (the post-promotion run stays a full run);
-   only on `pull_request` and `push` to `chain/**`.
+2. A `push` to `release/**` is the seeding run: lookup is OFF (every binary
+   runs, no skips, fail closed) but RECORD is ON under the branch name (for
+   example `release/v1.0.0`). Lookup plus record applies to `pull_request` (under
+   `github.base_ref`) and `push` to `chain/**`. Any other event runs everything.
 3. A binary whose key cannot be computed (missing or unparsable `.d`, unreadable
    input) always runs; if the shared inputs cannot be computed, everything runs.
    Any internal error leaves the full lists untouched.
@@ -136,7 +138,9 @@ the node is part of the file name).
 (same base ref manifest) skips nearly every binary and runs only the doc tests
 and binaries without a computable key. A PR that edits `src/` invalidates every
 key and runs the full suite. A PR that edits one `tests/*.rs` file reruns that
-binary plus any tree-scanning binary. The base ref is `github.base_ref` for a
+binary plus any tree-scanning binary. A carrier PR into `release/v1.0.0` reads
+the manifest written by the previous push to that branch, the authoritative full
+run of the tree it is stacked on. The base ref is `github.base_ref` for a
 pull request and the branch name for a push, so a chain push and a PR only
 share a manifest when they name the same base.
 

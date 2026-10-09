@@ -1172,7 +1172,7 @@ jobs:
           # release/** (the post-promotion run) and every other event stay a
           # full run. The script re-checks the event and ref itself, so this
           # expression is the second lock, not the only one.
-          CI_TEST_BINARY_CACHE: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/chain/'))) && '1' || '0' }}
+          CI_TEST_BINARY_CACHE: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/chain/') || startsWith(github.ref, 'refs/heads/release/')))) && '1' || '0' }}
         shell: bash
         run: |
           set -euo pipefail

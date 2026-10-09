@@ -30,8 +30,9 @@ because some OTHER file changed.
 Safety rules (enforced here, not only documented):
 
 1. Consulted only when CI_TEST_BINARY_CACHE=1.
-2. Never on ``push`` to ``release/**``; only on ``pull_request`` and on ``push``
-   to ``chain/**``. Any other event runs everything.
+2. ``push`` to ``release/**`` is the seeding run: lookup OFF (every binary
+   runs), record ON. ``pull_request`` and ``push`` to ``chain/**``: lookup and
+   record. Any other event runs everything and records nothing.
 3. A binary whose key cannot be computed (missing or unparsable .d, unreadable
    input) always runs. Any internal error leaves the full lists untouched.
 4. A manifest or entry older than 7 days, from a different tier or base ref, or
@@ -377,19 +378,30 @@ def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=T
 
 # --------------------------------------------------------------- policy -----
 
-def cache_allowed(env, event, ref):
-    """(allowed, reason). Safety rules 1 and 2."""
+def cache_policy(env, event, ref):
+    """(lookup, record, reason). Safety rules 1 and 2.
+
+    A push to release/** is the seeding run: lookup is OFF (every binary runs,
+    fail closed) but RECORD is ON, so a later PR into that branch can skip
+    binaries the authoritative full run already proved green.
+    """
     if env.get('CI_TEST_BINARY_CACHE') != '1':
-        return False, 'CI_TEST_BINARY_CACHE is not 1'
+        return False, False, 'CI_TEST_BINARY_CACHE is not 1'
     if event == 'pull_request':
-        return True, 'pull_request'
+        return True, True, 'pull_request'
     if event == 'push':
         if ref.startswith('refs/heads/release/') or ref.startswith('release/'):
-            return False, 'push to release/** always runs the full suite'
+            return False, True, 'push to release/**: full run, results recorded as the seed'
         if ref.startswith('refs/heads/chain/') or ref.startswith('chain/'):
-            return True, 'push to chain/**'
-        return False, 'push to %s is not a chain branch' % (ref or '<unknown>')
-    return False, 'event %r is not pull_request or push to chain/**' % event
+            return True, True, 'push to chain/**'
+        return False, False, 'push to %s is not a chain or release branch' % (ref or '<unknown>')
+    return False, False, 'event %r is not pull_request or push' % event
+
+
+def cache_allowed(env, event, ref):
+    """(lookup allowed, reason); kept for callers that only need the lookup bit."""
+    lookup, _record, reason = cache_policy(env, event, ref)
+    return lookup, reason
 
 
 def safe_name(text):
@@ -475,7 +487,7 @@ def run_plan(args, env=None, now=None):
     env = dict(os.environ if env is None else env)
     now = time.time() if now is None else now
     sd = Path(args.shard_dir)
-    allowed, reason = cache_allowed(env, args.event, args.ref)
+    lookup, allowed, reason = cache_policy(env, args.event, args.ref)
     plan = {'schema': SCHEMA, 'enabled': False, 'reason': reason, 'tier': args.tier,
             'base': args.base_ref, 'node': args.node, 'keys': {}, 'skipped': {}}
     if not allowed:
@@ -491,8 +503,11 @@ def run_plan(args, env=None, now=None):
         keys, why = compute_keys(exes, build_lines, args.repo_root, rustc_vv, args.profile, env,
                                  runtime=not args.no_runtime_tree)
         mpath = manifest_path(args.manifest_dir, args.node, args.tier, args.base_ref)
-        prior, prior_note = load_manifest(mpath, args.tier, args.base_ref, now)
-        skip = decide(keys, prior)
+        if lookup:
+            prior, prior_note = load_manifest(mpath, args.tier, args.base_ref, now)
+            skip = decide(keys, prior)
+        else:
+            prior, prior_note, skip = {}, 'lookup off (record only)', {}
         lib_name = next((e.key for e in exes if e.kind == 'lib'), 'lib:')
         new_lists, removed = rewrite_lists(sd, set(skip), lib_name)
         # Invariant: every skipped binary was removed from some list, and

@@ -256,6 +256,9 @@ class Policy(unittest.TestCase):
         self.assertTrue(tbc.cache_allowed(on, 'pull_request', 'refs/pull/9/merge')[0])
         self.assertTrue(tbc.cache_allowed(on, 'push', 'refs/heads/chain/x')[0])
         self.assertFalse(tbc.cache_allowed(on, 'push', 'refs/heads/release/v1.0.0')[0])
+        self.assertEqual(tbc.cache_policy(on, 'push', 'refs/heads/release/v1.0.0')[:2], (False, True))
+        self.assertEqual(tbc.cache_policy(on, 'pull_request', 'x')[:2], (True, True))
+        self.assertEqual(tbc.cache_policy(on, 'push', 'refs/heads/main')[:2], (False, False))
         self.assertFalse(tbc.cache_allowed(on, 'push', 'refs/heads/main')[0])
         self.assertFalse(tbc.cache_allowed(on, 'merge_group', 'refs/heads/gh-readonly-queue/x')[0])
         self.assertFalse(tbc.cache_allowed(on, 'workflow_dispatch', '')[0])
@@ -264,6 +267,26 @@ class Policy(unittest.TestCase):
 
 
 class PlanAndRecord(World):
+    def test_release_push_never_skips_but_records(self):
+        # Seed: a release push records every binary, skipping none.
+        self.plan(event='push', ref='refs/heads/release/v1.0.0')
+        self.assertEqual(self.list_text('serial'), '--lib\n--test a\n')
+        self.assertEqual(self.list_text('parallel_2'), '--test b\n')
+        self.assertFalse((self.sd / 'skip.txt').read_text())
+        self.record(0)
+        self.assertEqual(set(self.manifest()['entries']), {'lib:ai_memory', 'test:a', 'test:b'})
+        # A second release push on the identical tree still runs everything.
+        for n in tbc.SHARD_LISTS:
+            (self.sd / (n + '.txt')).write_text((self.sd / (n + '.txt.full')).read_text())
+        self.plan(event='push', ref='refs/heads/release/v1.0.0', run_id='101')
+        self.assertEqual(self.list_text('parallel_2'), '--test b\n')
+        self.assertFalse((self.sd / 'skip.txt').read_text())
+        # A PR into that base then hits the seed.
+        for n in tbc.SHARD_LISTS:
+            (self.sd / (n + '.txt')).write_text((self.sd / (n + '.txt.full')).read_text())
+        out = self.plan(run_id='102')
+        self.assertIn('skipped 3 of 3', out)
+
     def test_first_run_skips_nothing_and_records_all(self):
         out = self.plan()
         self.assertIn('skipped 0 of 3 binaries (cache hits), running 3', out)
@@ -348,7 +371,7 @@ class PlanAndRecord(World):
         self.green_run('100')
         before = {n: self.list_text(n) for n in tbc.SHARD_LISTS}
         out = self.plan(event='push', ref='refs/heads/release/v1.0.0', run_id='400', now=NOW + 5)
-        self.assertIn('cache off', out)
+        self.assertIn('skipped 0 of 3', out)
         out = self.plan(env={}, run_id='401', now=NOW + 5)
         self.assertIn('cache off', out)
         self.assertEqual(before, {n: self.list_text(n) for n in tbc.SHARD_LISTS})
