@@ -164,10 +164,7 @@ pub async fn open_store(url: &str) -> Result<Box<dyn MemoryStore>> {
 
     // #1579 A3 (SECURITY) — a mistyped scheme can still carry
     // credentials in the userinfo; redact before echoing.
-    anyhow::bail!(
-        "unrecognised store URL: {} (expected sqlite:///path or postgres://...)",
-        crate::url_display::store_url_display(url)
-    )
+    Err(unrecognised_store_url(url))
 }
 
 /// v1.0.0 #3435 — open the migration SOURCE, which is only ever READ.
@@ -210,7 +207,18 @@ pub async fn open_source_store(url: &str) -> Result<Box<dyn MemoryStore>> {
     // DSN whose password precedes a `://` option (#6096 r2 N1, #6100). Render
     // through the one url_display allowlist (ERRORS-09), never a local
     // "everything before ://" copy.
-    anyhow::bail!(
+    Err(unrecognised_store_url(url))
+}
+
+/// The one refusal for a store URL whose scheme is neither `sqlite://` nor
+/// `postgres://`. Every caller that rejects such a URL (`open_store`,
+/// `open_source_store`, `schema-init`) renders it here, so the wording and
+/// the redaction cannot drift between them (ERRORS-09). The URL is rendered
+/// through the one `url_display` allowlist because a mistyped scheme can
+/// still carry credentials in the userinfo (#1579 A3), a query-form password
+/// (#3667) or a libpq key/value DSN (#6096 r2 N1, #6100).
+pub(crate) fn unrecognised_store_url(url: &str) -> anyhow::Error {
+    anyhow::anyhow!(
         "unrecognised store URL: {} (expected sqlite:///path or postgres://...)",
         crate::url_display::store_url_display(url)
     )
