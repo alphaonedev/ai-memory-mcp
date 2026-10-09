@@ -1088,8 +1088,9 @@ jobs:
           # the node-local, brew-independent copy BEFORE CREATE EXTENSION
           # (five sha256-pinned files only; its one-line reason is on stderr).
           # macos-fed only: the linux-fed path is unchanged.
+          # python3 -I (#6339): the helper builds PGPASSWORD, so no sys.path[0] or PYTHONPATH.
           if [ "${CI_NODE:-}" = "macos-fed" ]; then
-            if ! python3 scripts/ci/ensure-age-extension.py --url-file "$url_file"; then
+            if ! python3 -I scripts/ci/ensure-age-extension.py --url-file "$url_file"; then
               echo "::error::enterprise-fed leg on $RUNNER_NAME: AGE self-heal failed (#6161), see the ensure-age-extension line above"
               exit 1
             fi
