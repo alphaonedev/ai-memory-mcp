@@ -771,3 +771,73 @@ fn public_surface_compiles() {
     let _report: reflection_pass::ReflectionPassReport =
         reflection_pass::ReflectionPassReport::default();
 }
+
+// ---------------------------------------------------------------------------
+// #4899 — the dry-run preview is idempotent with the live pass
+// ---------------------------------------------------------------------------
+
+/// **#4899**: a dry-run sweep must not propose a cluster whose exact source
+/// set already carries a Reflection. The preview otherwise reports phantom
+/// work on every run and disagrees with what a live run would do.
+#[tokio::test]
+async fn issue_4899_sqlite_dry_run_skips_already_reflected_cluster() {
+    let tmp = NamedTempFile::new().expect("tempfile");
+    let conn = db::open(tmp.path()).expect("db::open");
+    let store = sqlite_store(tmp.path());
+    let topic = "kubernetes rolling deploy canary strategy";
+    let mut source_ids: Vec<String> = Vec::new();
+    for i in 0..3 {
+        let mem = make_observation("ns-4899", topic, i);
+        source_ids.push(mem.id.clone());
+        db::insert(&conn, &mem).expect("db::insert observation");
+    }
+    source_ids.sort();
+
+    // Live sweep: exactly one Reflection over the three sources.
+    let live = StubLlm::new("live pattern");
+    let report = run_reflection_pass(
+        &store,
+        &live,
+        None,
+        Some("ns-4899"),
+        None,
+        false,
+        always_enabled,
+    )
+    .await
+    .expect("live pass");
+    assert_eq!(
+        report.reflections_persisted, 1,
+        "errors={:?}",
+        report.errors
+    );
+
+    // Dry-run sweep afterwards: the same cluster is NOT proposed again.
+    let preview = StubLlm::new("preview pattern");
+    let report = run_reflection_pass(
+        &store,
+        &preview,
+        None,
+        Some("ns-4899"),
+        None,
+        true,
+        always_enabled,
+    )
+    .await
+    .expect("dry-run pass");
+    assert!(report.dry_run);
+    assert!(report.errors.is_empty(), "errors={:?}", report.errors);
+    let phantom: Vec<&reflection_pass::DryRunProposal> = report
+        .dry_run_proposals
+        .iter()
+        .filter(|p| {
+            let mut ids = p.source_ids.clone();
+            ids.sort();
+            ids == source_ids
+        })
+        .collect();
+    assert!(
+        phantom.is_empty(),
+        "a cluster that already has a Reflection must not be proposed (#4899): {phantom:?}"
+    );
+}
