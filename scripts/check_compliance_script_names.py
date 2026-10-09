@@ -2007,6 +2007,40 @@ def self_test():
         doc.write_bytes("Run `check_new.py`, check_new.py… and `check_new.py` – daily.\n".encode("utf-8"))
         probs = check(root)
         expect(not probs, "R10-#6418-control: punctuation after a valid name was reported (%r)" % (probs,))
+        # #6419 (round 10): the code-span scan reads each character a bounded number of times, so
+        # backtick runs of distinct lengths (none ever matching) cost O(n), not O(n^1.5). The work is
+        # counted (characters inside the runs the scan measures), so the bound holds at any host speed.
+        runs, k, size = [], 1, 0
+        while size < 20000:
+            runs.append("`" * k + " ")
+            size += k + 1
+            k += 1
+        unique_runs = "".join(runs)
+        tick_run = globals()["backtick_run"]
+        measured = [0]
+
+        def counted_run(line, i):
+            n = tick_run(line, i)
+            measured[0] += n + 1
+            return n
+
+        globals()["backtick_run"] = counted_run
+        try:
+            for label, scan in (
+                ("outside_code_spans", lambda: outside_code_spans(unique_runs)),
+                ("comment_open", lambda: comment_open(unique_runs, 0)),
+                ("erratum_lines", lambda: erratum_lines([unique_runs])),
+            ):
+                measured[0] = 0
+                scan()
+                expect(measured[0] <= 8 * len(unique_runs),
+                       "R10-#6419-%s: %d characters measured for %d characters of distinct backtick runs"
+                       % (label, measured[0], len(unique_runs)))
+        finally:
+            globals()["backtick_run"] = tick_run
+        doc.write_bytes(("Run `check_new.py` and ``a`b`` and `` `c` `` and ```` ``` ```` daily.\n" + unique_runs).encode())
+        probs = check(root)
+        expect(not probs, "R10-#6419-control: backtick runs of many lengths changed a verdict (%r)" % (probs,))
         # #6353: an allowlist that exists but cannot be stat'ed is unreadable (exit 2), never absent.
         r = fresh("u-allow-loop")
         (r / ALLOW_REL).unlink()
