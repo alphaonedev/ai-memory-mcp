@@ -23,6 +23,7 @@ import {
   chmodSync,
   symlinkSync,
   unlinkSync,
+  mkdirSync,
 } from "node:fs";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -50,6 +51,7 @@ import {
   helloTranscript,
   isHubDriven,
   lengthPrefixed,
+  readOwnerOnlyWith,
   topicsHash,
   type BundleFile,
   type WakeSignal,
@@ -493,6 +495,85 @@ describe("delegation bundle", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 15_000);
+
+  // -------------------------------------------------------------------------
+  // #3812 — the Windows leg must read the bytes it CHECKED, too
+  //
+  // Where `node:fs` offers no `O_NOFOLLOW` / `O_NONBLOCK` (Windows), the
+  // loader cannot refuse a symlink at the open. That is a documented residual.
+  // What is NOT acceptable is checking mode/owner on the path and then reading
+  // the path again (CodeQL js/file-system-race, alert 355): open first, fstat
+  // the descriptor, read from that descriptor. These cells run the Windows
+  // leg on POSIX by handing it no flags.
+  // -------------------------------------------------------------------------
+
+  posixOnly("the Windows leg never reads a file swapped in after the check (#3812)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wake-3812-"));
+    try {
+      const mine = makeBundle().file;
+      const path = join(dir, "b.json");
+      writeFileSync(path, JSON.stringify(mine));
+      chmodSync(path, 0o600);
+
+      // World-readable and not this agent: refused on its own merits.
+      const theirs = makeBundle({ principal: "ai:attacker-3812" }).file;
+      const theirsPath = join(dir, "theirs.json");
+      writeFileSync(theirsPath, JSON.stringify(theirs));
+      chmodSync(theirsPath, 0o644);
+
+      let loaded: string | null = null;
+      // The hook fires AFTER the leg's `lstatSync` (its first touch), so the
+      // path is swapped between the check and whatever the leg reads from.
+      const fired = withSwapOnFirstTouch(
+        path,
+        () => {
+          unlinkSync(path);
+          symlinkSync(theirsPath, path);
+        },
+        "after",
+        () => {
+          try {
+            loaded = (JSON.parse(readOwnerOnlyWith(path, {})) as BundleFile).agent_id;
+          } catch {
+            loaded = null;
+          }
+        },
+      );
+
+      expect(fired).toBe(1);
+      // Either a refusal or the file that was actually CHECKED — never the swap.
+      expect(loaded).not.toBe("ai:attacker-3812");
+      expect([null, AGENT_ID]).toContain(loaded);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  posixOnly("the Windows leg keeps every refusal and the allowed path (#3812)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wake-3812-"));
+    try {
+      const { file } = makeBundle();
+      const path = join(dir, "b.json");
+      writeFileSync(path, JSON.stringify(file));
+      chmodSync(path, 0o600);
+      expect((JSON.parse(readOwnerOnlyWith(path, {})) as BundleFile).agent_id).toBe(AGENT_ID);
+
+      chmodSync(path, 0o644);
+      expect(() => readOwnerOnlyWith(path, {})).toThrow(/must be 0600/);
+      chmodSync(path, 0o600);
+
+      // No O_NOFOLLOW on this leg: the link refusal is the lstat pre-check.
+      const link = join(dir, "link.json");
+      symlinkSync(path, link);
+      expect(() => readOwnerOnlyWith(link, {})).toThrow(/symlink/);
+
+      const dirPath = join(dir, "sub");
+      mkdirSync(dirPath, 0o700);
+      expect(() => readOwnerOnlyWith(dirPath, {})).toThrow(/not a regular file/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it("keeps every refusal and the allowed path on the descriptor-bound read", () => {
     const dir = mkdtempSync(join(tmpdir(), "wake-3780-"));
