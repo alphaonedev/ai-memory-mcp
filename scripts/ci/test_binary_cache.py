@@ -752,8 +752,15 @@ def atomic_write(path, text):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name('.%s.%d.tmp' % (path.name, os.getpid()))
-    tmp.write_text(text)
-    os.replace(str(tmp), str(path))
+    try:
+        tmp.write_text(text)
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 # ------------------------------------------------------------------ plan ----
@@ -849,18 +856,19 @@ def _plan_compute(args, env, now, sd, lookup):
 
 
 def _plan_apply(args, plan, sd, lookup, record, reason, keys, why, exes, skip, prior_note, new_lists):
-    """Write the plan outputs (deadline already disarmed)."""
-    for n in SHARD_LISTS:
-        src = sd / (n + '.txt')
-        atomic_write(sd / (n + '.txt.full'), src.read_text())
-        atomic_write(src, ''.join(l + '\n' for l in new_lists[n]))
-    atomic_write(sd / 'skip.txt', ''.join(sorted(n + '\n' for n in skip)))
+    """Write the plan outputs (deadline already disarmed).
+
+    Order (r1 L3): the audit trail is printed and an enabled cache_plan.json
+    and skip.txt are written BEFORE any list is shortened, then every
+    ``.txt.full`` copy, then the lists. Any OSError on the way restores the
+    full lists and disables the plan; if even that fails the exception
+    propagates (non-zero exit), and the workflow runs ``restore`` or fails.
+    """
     plan.update({
-        'enabled': True, 'lookup': lookup, 'record': record, 'reason': reason, 'prior_note': prior_note, 'run_id': args.run_id, 'sha': args.sha,
-        'keys': keys, 'key_errors': why,
-        'skipped': {n: {k: v for k, v in e.items()} for n, e in skip.items()},
+        'enabled': True, 'lookup': lookup, 'record': record, 'reason': reason, 'prior_note': prior_note,
+        'run_id': args.run_id, 'sha': args.sha, 'keys': keys, 'key_errors': why,
+        'skipped': {n: dict(e) for n, e in skip.items()},
     })
-    atomic_write(sd / 'cache_plan.json', json.dumps(plan, indent=1, sort_keys=True) + '\n')
     n_total = len(exes)
     n_skip = len(skip)
     n_nokey = sum(1 for k in keys.values() if k is None)
@@ -872,12 +880,44 @@ def _plan_apply(args, plan, sd, lookup, record, reason, keys, why, exes, skip, p
     for n, r in sorted(why.items()):
         print('nokey %s: %s' % (n, r))
     print('::endgroup::')
+    sys.stdout.flush()
+    try:
+        atomic_write(sd / 'cache_plan.json', json.dumps(plan, indent=1, sort_keys=True) + '\n')
+        atomic_write(sd / 'skip.txt', ''.join(sorted(n + '\n' for n in skip)))
+        for n in SHARD_LISTS:
+            atomic_write(sd / (n + '.txt.full'), (sd / (n + '.txt')).read_text())
+        for n in SHARD_LISTS:
+            atomic_write(sd / (n + '.txt'), ''.join(l + '\n' for l in new_lists[n]))
+    except OSError as exc:
+        print('::warning::[%s] test-binary cache disabled for this run (writing the shard lists failed: %s)'
+              % (ISSUE, exc))
+        _restore(sd, 'writing the shard lists failed: %s' % exc)
+        return 0
     print('::notice::[%s] skipped %d of %d binaries (cache hits), running %d (%d without a computable key; prior manifest: %s)'
           % (ISSUE, n_skip, n_total, n_total - n_skip, n_nokey, prior_note))
     return 0
 
 
 # --------------------------------------------------------------- restore ----
+
+def _restore(sd, reason):
+    """Write a disabled plan, then copy every ``<list>.txt.full`` back.
+
+    The disabled plan goes first, so ``record`` refuses even when a list copy
+    then fails.
+    """
+    plan = {'schema': SCHEMA, 'enabled': False, 'lookup': False, 'record': False, 'keys': {}, 'skipped': {},
+            'reason': reason}
+    atomic_write(sd / 'cache_plan.json', json.dumps(plan, indent=1, sort_keys=True) + '\n')
+    atomic_write(sd / 'skip.txt', '')
+    restored = []
+    for n in SHARD_LISTS:
+        full = sd / (n + '.txt.full')
+        if full.is_file():
+            atomic_write(sd / (n + '.txt'), full.read_text())
+            restored.append(n)
+    return restored
+
 
 def run_restore(args):
     """Put every ``<list>.txt.full`` back and write a disabled plan (r1 M3).
@@ -889,17 +929,7 @@ def run_restore(args):
     write failure: the workflow then fails the step instead of running a
     list it cannot vouch for.
     """
-    sd = Path(args.shard_dir)
-    restored = []
-    for n in SHARD_LISTS:
-        full = sd / (n + '.txt.full')
-        if full.is_file():
-            atomic_write(sd / (n + '.txt'), full.read_text())
-            restored.append(n)
-    atomic_write(sd / 'skip.txt', '')
-    plan = {'schema': SCHEMA, 'enabled': False, 'lookup': False, 'record': False, 'keys': {}, 'skipped': {},
-            'reason': 'restored after a failed or timed-out plan'}
-    atomic_write(sd / 'cache_plan.json', json.dumps(plan, indent=1, sort_keys=True) + '\n')
+    restored = _restore(Path(args.shard_dir), 'restored after a failed or timed-out plan')
     print('::warning::[%s] test-binary cache plan did not finish: full shard lists restored (%s); running every binary'
           % (ISSUE, ', '.join(restored) or 'none were rewritten'))
     return 0

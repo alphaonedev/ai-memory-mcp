@@ -731,8 +731,11 @@ class AuditBeforeRewrite6384L3(World):
         self.green_run('100')
         real_replace = os.replace
 
+        failed = []
+
         def boom(src, dst):
-            if Path(dst).name == 'parallel_2.txt':
+            if Path(dst).name == 'parallel_2.txt' and not failed:
+                failed.append(dst)
                 raise OSError(28, 'No space left on device')
             return real_replace(src, dst)
         tbc.os.replace = boom
@@ -749,6 +752,24 @@ class AuditBeforeRewrite6384L3(World):
         self.assertEqual(self.list_text('parallel_2'), '--test b\n')
         self.assertFalse(json.loads((self.sd / 'cache_plan.json').read_text())['enabled'])
         self.assertEqual([p.name for p in self.sd.iterdir() if p.name.endswith('.tmp')], [])
+
+
+    def test_persistent_write_failure_exits_non_zero_so_the_workflow_restores_or_fails(self):
+        self.green_run('100')
+        real_replace = os.replace
+
+        def boom(src, dst):
+            if Path(dst).name == 'parallel_2.txt':
+                raise OSError(28, 'No space left on device')
+            return real_replace(src, dst)
+        tbc.os.replace = boom
+        try:
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(OSError):
+                    tbc.run_plan(self.args(run_id='200'), env=ENV_ON, now=NOW + 60)
+        finally:
+            tbc.os.replace = real_replace
+        self.assertFalse(json.loads((self.sd / 'cache_plan.json').read_text())['enabled'])
 
 
 class Policy(unittest.TestCase):
