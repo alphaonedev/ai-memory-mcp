@@ -1384,5 +1384,32 @@ class LineageCorrection6384R2L4(unittest.TestCase):
             self.assertIn(sha, note)
 
 
+class AutotestsOff6384R2M1(unittest.TestCase):
+    """r2 M1 follow-up: with ``autotests = false`` a tests/*.rs file is not a
+    cargo target unless a ``[[test]]`` names it, so it must not be treated as
+    compiled (it stays in every key)."""
+
+    def setUp(self):
+        self.root = SCRATCH / 'autotests'
+        shutil.rmtree(self.root, ignore_errors=True)
+        (self.root / 'tests' / 'd').mkdir(parents=True)
+        for rel in ('tests/a.rs', 'tests/dead.rs', 'tests/d/main.rs'):
+            (self.root / rel).write_text('fn x() {}\n')
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def roots(self, manifest):
+        (self.root / 'Cargo.toml').write_text(manifest)
+        return {q.relative_to(self.root).as_posix() for q in tbc.test_target_roots(self.root)}
+
+    def test_default_discovers_every_root(self):
+        self.assertEqual(self.roots('[package]\nname = "x"\n'), {'tests/a.rs', 'tests/dead.rs', 'tests/d/main.rs'})
+
+    def test_autotests_false_keeps_only_declared_tests(self):
+        got = self.roots('[package]\nname = "x"\nautotests = false\n\n[[test]]\nname = "a"\npath = "tests/a.rs"\n')
+        self.assertEqual(got, {'tests/a.rs'})
+
+
 if __name__ == '__main__':
     unittest.main()
