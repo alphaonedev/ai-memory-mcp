@@ -85,6 +85,7 @@ class Exe:
         self.cls = None
         self.reasons = []
         self.shared = []
+        self.test_count = None  # test fns in the sources it compiles; None = unknown
 
     @property
     def key(self):
@@ -152,6 +153,7 @@ ITEM_RE = re.compile(
     r'\b(?:(fn|struct|enum|union|trait|type|const|static|mod)\s+(?:mut\s+)?(?:r#)?([A-Za-z_][A-Za-z0-9_]*)'
     r'|(macro_rules!)\s*([A-Za-z_][A-Za-z0-9_]*)|(impl)\b)')
 FN_BEFORE_RE = re.compile(r'\bfn\s+$')  # the name is being defined here, not called
+SHARD_THREADS = 3  # --test-threads of each parallel shard
 PG_TOKEN = 'AI_MEMORY_TEST_POSTGRES_URL'
 PG_TOKEN_RE = re.compile(r'\bAI_MEMORY_TEST_POSTGRES_URL\b')
 PG_CONST_RE = re.compile(
@@ -803,6 +805,8 @@ def partition(exes, weights, prefixes, with_doc=False):
     index = SourceIndex(others)
     for e in others:
         classify(e, index)
+        units = index.walks.get(e.key, ([], []))[0]
+        e.test_count = sum(len(TEST_ATTR_RE.findall(rf.shape)) for rf, _ in units) or None
     means = class_means(others, weights)
     serial = [e for e in others if e.cls == 'a']
     b_exes = [e for e in others if e.cls == 'b']
@@ -816,7 +820,15 @@ def partition(exes, weights, prefixes, with_doc=False):
     h1, h2, t1, t2 = balance(items, lib_nonpg, 0.0)
     doc = weights.get('doc:tests', 0.0) if with_doc else 0.0
     ts = lib_pg + doc + sum(weight_of(e, weights, means) for e in serial)
-    return serial, h1, h2, bool(lib), {'serial': ts, 'parallel_1': t1, 'parallel_2': t2}, means
+
+    def est(exes_, base):
+        # a binary's tests use at most min(test count, threads) threads (r2 F4); unknown count = full threads
+        return base / SHARD_THREADS + sum(
+            weight_of(e, weights, means) / min(e.test_count or SHARD_THREADS, SHARD_THREADS) for e in exes_)
+
+    totals = {'serial': ts, 'parallel_1': t1, 'parallel_2': t2,
+              'parallel_1_est': est(h1, lib_nonpg), 'parallel_2_est': est(h2, 0.0)}
+    return serial, h1, h2, bool(lib), totals, means
 
 
 def write_lists(out_dir, serial, h1, h2, has_lib):
@@ -883,15 +895,18 @@ def run(args):
             'parallel_2_serial_work': round(totals['parallel_2'], 1),
             'parallel_1_ideal_threads_3': round(totals['parallel_1'] / 3, 1),
             'parallel_2_ideal_threads_3': round(totals['parallel_2'] / 3, 1),
+            'parallel_1_est_min_tests_threads': round(totals['parallel_1_est'], 1),
+            'parallel_2_est_min_tests_threads': round(totals['parallel_2_est'], 1),
         },
         'targets': {e.key: {'class': e.cls, 'reasons': e.reasons, 'shared': e.shared}
                     for e in exes if e.kind != 'lib'},
     }
     (out_dir / 'manifest.json').write_text(json.dumps(manifest, indent=1, sort_keys=True) + '\n')
     print('[#6344] shards: serial=%d parallel_1=%d parallel_2=%d of %d executables; '
-          'estimate serial=%.0fs parallel=%.0fs/%.0fs (ideal, threads 3)'
+          'estimate serial=%.0fs parallel=%.0fs/%.0fs (per-binary min(tests, 3) threads; ideal %.0fs/%.0fs)'
           % (manifest['counts']['serial'], manifest['counts']['parallel_1'], manifest['counts']['parallel_2'],
-             len(exes), totals['serial'], totals['parallel_1'] / 3, totals['parallel_2'] / 3))
+             len(exes), totals['serial'], totals['parallel_1_est'], totals['parallel_2_est'],
+             totals['parallel_1'] / 3, totals['parallel_2'] / 3))
     return 0
 
 

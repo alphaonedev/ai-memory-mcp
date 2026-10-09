@@ -447,6 +447,27 @@ class LibGateFollowUps6344R2(Base):
         self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['support', 'a::tests::talks_to_pg']), [])
         self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['support', 'a']), [])
 
+    def test_parallel_estimate_divides_by_min_tests_and_threads_6344_f4(self):
+        specs = {'single': '#[test]\nfn one() {}\n',
+                 'many': ''.join('#[test]\nfn t%d() {}\n' % i for i in range(6)),
+                 'pair': '#[test]\nfn p1() {}\n#[test]\nfn p2() {}\n'}
+        lines = [artifact(['lib'], 'ai_memory', SCRATCH / 'src' / 'lib.rs', '/x/lib')]
+        for name, text in specs.items():
+            lines.append(artifact(['test'], name, fx('tests/%s.rs' % name, text), '/x/' + name))
+        w = {'lib:pg': 0.0, 'lib:nonpg': 300.0, 'test:single': 30.0, 'test:many': 30.0, 'test:pair': 30.0}
+        exes = pt.parse_build_json(lines)
+        totals = pt.partition(exes, w, [])[4]
+        # all three binaries land in the half with the lib-free base (parallel_2)
+        self.assertEqual(totals['parallel_2'], 90.0)
+        self.assertEqual(totals['parallel_1'], 300.0)
+        self.assertEqual(totals['parallel_2_est'], 30.0 + 10.0 + 15.0)
+        self.assertEqual(totals['parallel_1_est'], 100.0)
+
+    def test_unknown_test_count_falls_back_to_the_thread_count_6344_f4(self):
+        exes = pt.parse_build_json([artifact(['test'], 'macro_gen', fx('tests/macro_gen.rs', 'gen_tests!();\n'))])
+        totals = pt.partition(exes, {'test:macro_gen': 30.0}, [])[4]
+        self.assertEqual(totals['parallel_1_est'] + totals['parallel_2_est'], 10.0)
+
 
 class DocEstimateTests6344B6(Base):
     def test_doc_tests_are_in_the_serial_estimate_6344(self):
