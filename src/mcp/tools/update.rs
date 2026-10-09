@@ -325,8 +325,6 @@ fn handle_update_inner(
         ) {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
-        #[cfg(test)]
-        crate::recover::in_tx_fault::owner_gate_passed(&resolved_id);
     }
     // v0.7.0 Provenance Gap 5 (#888) — typed `edit_source`
     // discriminator. `Llm` and `Hook` route through the
@@ -523,23 +521,37 @@ fn handle_update_inner(
     // carrying the patched content + a `supersedes` link new→old.
     // Caller's `expected_version` is still honored as the gate.
     if edit_source.appends_and_archives() {
-        let result = db::update_with_archive_on_supersede(
-            conn,
-            &resolved_id,
-            title,
-            content,
-            tier.as_ref(),
-            namespace,
-            tags.as_ref(),
-            priority,
-            confidence,
-            expires_at,
-            metadata.as_ref(),
-            source_uri,
-            expected_version,
-            edit_source,
-        )
+        // #4147 — the authoritative owner gate and the archive+insert run
+        // under ONE `BEGIN IMMEDIATE` (the storage primitive joins it).
+        let (refused, result) = db::in_write_txn(conn, || {
+            if let Some(refusal) = owner_gate_under_write_lock(conn, &resolved_id)? {
+                return Ok((Some(refusal), None));
+            }
+            let result = db::update_with_archive_on_supersede(
+                conn,
+                &resolved_id,
+                title,
+                content,
+                tier.as_ref(),
+                namespace,
+                tags.as_ref(),
+                priority,
+                confidence,
+                expires_at,
+                metadata.as_ref(),
+                source_uri,
+                expected_version,
+                edit_source,
+            )?;
+            Ok((None, Some(result)))
+        })
         .map_err(conflict_or_string)?;
+        if let Some(refusal) = refused {
+            return Err(refusal.into());
+        }
+        let Some(result) = result else {
+            return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
+        };
         // Re-embed the NEW row when content changed.
         if let Some(emb) = embedder {
             let new_id = &result.new_id;
@@ -619,6 +631,11 @@ fn handle_update_inner(
     // persist the patch alone (and a refused unit refunds a growth charge
     // for bytes that genuinely never landed).
     let unit = db::in_write_txn(conn, || {
+        // #4147 — the authoritative owner gate, under the write lock the
+        // patch below is written under.
+        if let Some(refusal) = owner_gate_under_write_lock(conn, &resolved_id)? {
+            return Ok(Err(refusal));
+        }
         let (found, content_changed) = db::update_with_expected_version(
             conn,
             &resolved_id,
@@ -670,10 +687,18 @@ fn handle_update_inner(
                 db::set_lifecycle_state(conn, &resolved_id, requested)?;
             }
         }
-        Ok((found, content_changed))
+        Ok(Ok((found, content_changed)))
     });
     let (found, content_changed) = match unit {
-        Ok(v) => v,
+        Ok(Ok(v)) => v,
+        Ok(Err(refusal)) => {
+            // #4147 — the row changed hands between the fast gate and the
+            // write lock: nothing was written, so the growth charge is refunded.
+            if let Some((ref owner, ref ns, delta)) = quota_charge {
+                let _ = crate::quotas::refund_storage_only(conn, owner, ns, delta);
+            }
+            return Err(refusal.into());
+        }
         Err(e) => {
             // FBL-12 — refund the growth charge when the write itself
             // fails (e.g. a VersionConflict, or #3152 an illegal lifecycle
@@ -725,6 +750,37 @@ fn handle_update_inner(
 /// returns a typed [`VersionConflict`]. Other errors stringify
 /// verbatim so existing callers and tests continue to see the
 /// historic error text.
+/// #4147 — the AUTHORITATIVE owner gate of the MCP update funnel, run under
+/// the `BEGIN IMMEDIATE` the write is made under (the #1786 gate above it
+/// fails fast but reads in its own autocommit statement, so a second OS
+/// process could commit a re-own between that read and the write). Keyed
+/// on the same env-only enforced-read caller: a no-op in the
+/// single-operator default. Returns the refusal text when the write must
+/// not proceed; the caller rolls the unit back by returning early.
+fn owner_gate_under_write_lock(
+    conn: &rusqlite::Connection,
+    resolved_id: &str,
+) -> anyhow::Result<Option<&'static str>> {
+    if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
+        let Some(target) = db::get(conn, resolved_id)? else {
+            return Ok(Some(crate::errors::msg::MEMORY_NOT_FOUND));
+        };
+        if !crate::visibility::caller_owns_for_mutation(
+            &target,
+            &caller,
+            false,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::UPDATE,
+            ),
+        ) {
+            return Ok(Some(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY));
+        }
+        #[cfg(test)]
+        crate::recover::in_tx_fault::owner_gate_passed(resolved_id);
+    }
+    Ok(None)
+}
+
 fn conflict_or_string(e: anyhow::Error) -> String {
     if let Some(vc) = e.downcast_ref::<VersionConflict>() {
         json!({

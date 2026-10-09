@@ -710,8 +710,6 @@ async fn update_memory_write(
             return resp;
         }
     }
-    #[cfg(test)]
-    crate::recover::in_tx_fault::owner_gate_passed(&resolved_id);
     // Preserve existing agent_id when caller provides new metadata — provenance
     // is immutable after first write (see NHI design in crate::identity).
     let preserved_metadata = body.metadata.as_ref().map(|new_meta| {
@@ -784,7 +782,32 @@ async fn update_memory_write(
     // #3152 — the patch and the optional lifecycle transition are ONE write
     // transaction (both storage primitives join it), so an illegal edge or a
     // crash between them leaves the row exactly as it was.
+    //
+    // #4147 — the AUTHORITATIVE owner gate runs INSIDE that transaction: the
+    // gate above fails fast, but its read and the write below were separate
+    // autocommit statements, so a second OS process on the same file could
+    // commit a re-own in between and the write landed on the new owner's row.
+    // Under `BEGIN IMMEDIATE` the row is re-read and re-gated with the write
+    // lock held, and no other writer can commit until this unit ends.
+    enum WriteUnit {
+        Done((bool, bool)),
+        Refused(axum::response::Response),
+    }
     let unit = db::in_write_txn(&lock.0, || {
+        if let Some(current) = db::get(&lock.0, &resolved_id)?
+            && let Some(resp) = crate::handlers::parity::require_caller_owns_memory(
+                &current,
+                &caller,
+                false,
+                crate::identity::owner_stamp::MutationSite::sqlite(
+                    crate::identity::owner_stamp::funnel::UPDATE,
+                ),
+            )
+        {
+            return Ok(WriteUnit::Refused(resp));
+        }
+        #[cfg(test)]
+        crate::recover::in_tx_fault::owner_gate_passed(&resolved_id);
         let res = db::update_with_expected_version(
             &lock.0,
             &resolved_id,
@@ -816,10 +839,18 @@ async fn update_memory_write(
         {
             db::set_lifecycle_state(&lock.0, &resolved_id, target)?;
         }
-        Ok(res)
+        Ok(WriteUnit::Done(res))
     });
     match unit {
-        Ok((true, _)) => {
+        Ok(WriteUnit::Refused(resp)) => {
+            // #4147 — the row changed hands between the fast gate and the
+            // write lock: nothing was written, so the growth charge is refunded.
+            if let Some((ref owner, ref ns, delta)) = quota_charge {
+                let _ = crate::quotas::refund_storage_only(&lock.0, owner, ns, delta);
+            }
+            resp
+        }
+        Ok(WriteUnit::Done((true, _))) => {
             let mem = db::get(&lock.0, &resolved_id).ok().flatten();
             // Issue #219: regenerate the embedding when the searchable text
             // (title/content) changed. Without this, the semantic index keeps
@@ -866,7 +897,7 @@ async fn update_memory_write(
             }
             Json(receipt).into_response()
         }
-        Ok((false, _)) => {
+        Ok(WriteUnit::Done((false, _))) => {
             // FBL-12 — refund the growth charge when the row vanished
             // between the charge and the write (the growth never landed).
             if let Some((ref owner, ref ns, delta)) = quota_charge {
@@ -1249,22 +1280,22 @@ pub async fn delete_memory(
         }
     };
 
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
+    let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
+            )
+                .into_response();
+        }
+    };
     // Task 1.9: governance enforcement (delete-side).
     {
         use crate::models::{GovernanceDecision, GovernedAction};
-        let header_agent_id = headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok());
-        let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-            Ok(a) => a,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-                )
-                    .into_response();
-            }
-        };
         let mem_owner = target
             .metadata
             .get("agent_id")
@@ -1299,8 +1330,6 @@ pub async fn delete_memory(
         ) {
             return resp;
         }
-        #[cfg(test)]
-        crate::recover::in_tx_fault::owner_gate_passed(&target.id);
         let payload = json!({"id": target.id, "title": target.title});
         // v0.9.0 G10.1 (#1827) — edge-parse the optional
         // `X-AI-Memory-Capability` header ONCE; inert unless
@@ -1385,10 +1414,46 @@ pub async fn delete_memory(
     // inbox message is archived, everything else erased; `archived` is on
     // the wire so the caller can tell which happened.
     let archived = crate::visibility::inbox_delete_retains(&target.namespace);
-    let delete_outcome = if archived {
-        db::delete_archive_first(&lock.0, &target.id)
-    } else {
-        db::delete(&lock.0, &target.id)
+    // #4147 — the AUTHORITATIVE owner gate and the erase run under ONE
+    // `BEGIN IMMEDIATE`: the gate above fails fast, but its read and the
+    // delete were separate autocommit statements, so a second OS process on
+    // the same file could commit a re-own in between and the erase landed on
+    // the new owner's row — irreversibly. The row is re-read (unfiltered, the
+    // same row `resolve_id` found) and re-gated with the write lock held.
+    enum DeleteUnit {
+        Deleted(bool),
+        Refused(axum::response::Response),
+    }
+    let delete_outcome = db::in_write_txn(&lock.0, || {
+        let Some(current) = db::get_any(&lock.0, &target.id)? else {
+            return Ok(DeleteUnit::Deleted(false));
+        };
+        if let Some(resp) = crate::handlers::parity::require_caller_owns_memory(
+            &current,
+            &agent_id,
+            archived,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::DELETE,
+            ),
+        ) {
+            return Ok(DeleteUnit::Refused(resp));
+        }
+        #[cfg(test)]
+        crate::recover::in_tx_fault::owner_gate_passed(&target.id);
+        let deleted = if archived {
+            db::delete_archive_first(&lock.0, &target.id)?
+        } else {
+            db::delete(&lock.0, &target.id)?
+        };
+        Ok(DeleteUnit::Deleted(deleted))
+    });
+    let delete_outcome = match delete_outcome {
+        Ok(DeleteUnit::Deleted(deleted)) => Ok(deleted),
+        Ok(DeleteUnit::Refused(resp)) => {
+            drop(lock);
+            return resp;
+        }
+        Err(e) => Err(e),
     };
     // v0.6.4-017 — G9 HTTP webhook parity. Fire `memory_delete` after
     // the row is gone (mirrors the MCP pattern at mcp.rs:2227). Snapshot

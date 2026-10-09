@@ -287,8 +287,6 @@ pub(super) fn handle_delete(
         ) {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
-        #[cfg(test)]
-        crate::recover::in_tx_fault::owner_gate_passed(&target.id);
     }
 
     // #3730 — retention policy by namespace (`inbox_delete_retains`): a
@@ -297,13 +295,39 @@ pub(super) fn handle_delete(
     // disposition is reported on the wire (`archived`) so a caller never has
     // to consult documentation to know whether its data still exists.
     let archived = crate::visibility::inbox_delete_retains(&target.namespace);
-    let deleted = if archived {
-        db::delete_archive_first(conn, &target.id)
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("delete_archive_first", e))?
-    } else {
-        db::delete(conn, &target.id)
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("delete_archive_first", e))?
-    };
+    // #4147 — the AUTHORITATIVE owner gate and the erase run under ONE
+    // `BEGIN IMMEDIATE` (both delete primitives join it): the gate above
+    // fails fast, but its read and the delete were separate autocommit
+    // statements, so a second OS process on the same file could commit a
+    // re-own in between and the erase landed on the new owner's row —
+    // irreversibly. The row is re-read and re-gated with the write lock held.
+    let deleted = db::in_write_txn(conn, || {
+        if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
+            let Some(current) = db::get(conn, &target.id)? else {
+                return Ok(Ok(false));
+            };
+            if !crate::visibility::caller_owns_for_mutation(
+                &current,
+                &caller,
+                archived,
+                crate::identity::owner_stamp::MutationSite::sqlite(
+                    crate::identity::owner_stamp::funnel::DELETE,
+                ),
+            ) {
+                return Ok(Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY));
+            }
+            #[cfg(test)]
+            crate::recover::in_tx_fault::owner_gate_passed(&target.id);
+        }
+        let deleted = if archived {
+            db::delete_archive_first(conn, &target.id)?
+        } else {
+            db::delete(conn, &target.id)?
+        };
+        Ok(Ok(deleted))
+    })
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("delete_archive_first", e))?
+    .map_err(String::from)?;
     if deleted {
         // v1.0.0 #2446 — queue the erasure for federated fan-out. The MCP
         // surface never constructs a `FederationConfig` (it is HTTP-`serve`

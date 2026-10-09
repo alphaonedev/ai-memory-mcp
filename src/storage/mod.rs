@@ -4881,9 +4881,11 @@ pub fn update_with_archive_on_supersede(
     // returns cleanly with no state change.
     consult_governance_pre_write(&new_mem)?;
 
-    // Steps 1+2 (#1638): one transaction around archive + insert.
-    let write_txn = connection::WriteTxn::begin(conn)?;
-    let tx_result = (|| -> Result<()> {
+    // Steps 1+2 (#1638): one transaction around archive + insert. #4147 —
+    // `in_write_txn`, so the MCP update funnel can run its owner gate and
+    // this write under ONE caller-owned `BEGIN IMMEDIATE` (joined, never
+    // nested); standalone it still opens and commits its own.
+    connection::in_write_txn(conn, || -> Result<()> {
         // Step 1: archive the OLD row with reason='superseded'.
         let moved = archive_memory_no_tx(conn, &archived_id, Some("superseded"))?;
         if !moved {
@@ -4897,14 +4899,7 @@ pub fn update_with_archive_on_supersede(
         // Step 2: insert the NEW row carrying the patched content.
         insert(conn, &new_mem)?;
         Ok(())
-    })();
-    match tx_result {
-        Ok(()) => write_txn.commit()?,
-        Err(e) => {
-            write_txn.rollback();
-            return Err(e);
-        }
-    }
+    })?;
 
     // Step 3: the supersede edge from new→archived id is preserved
     // in the new row's `metadata.superseded_id` (see above). A
