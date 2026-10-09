@@ -1035,6 +1035,7 @@ pub use reflect::{
     ReflectError, ReflectHookDecision, ReflectHooks, ReflectInput, ReflectOutcome,
     canonical_cbor_reflection_decorrelation_refused, canonical_cbor_reflection_depth_exceeded,
     reflect, reflect_with_hooks, reflect_with_hooks_for_caller,
+    reflect_with_hooks_for_caller_versions,
 };
 // `emit_reflection_depth_exceeded_audit` is `pub(crate)` — preserve
 // the same visibility on the re-export so it remains reachable from

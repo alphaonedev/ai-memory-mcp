@@ -65,6 +65,13 @@ pub(crate) fn map_reflect_error_to_wire_string(err: db::ReflectError) -> String 
         db::ReflectError::DecorrelationRefused { .. } => {
             "REFLECTION_DECORRELATION_REFUSED: reflection decorrelation requirement not met".into()
         }
+        // #4289 — only reachable through the version-checked funnel (the
+        // curator reflection pass today); the direct MCP / HTTP reflect
+        // surfaces pass no expected versions.
+        db::ReflectError::SourceVersionConflict { .. } => {
+            "REFLECTION_SOURCE_CONFLICT: a source memory changed while the reflection was generated"
+                .into()
+        }
         db::ReflectError::Database(_) => {
             "REFLECTION_FAILED: reflection could not be completed".into()
         }

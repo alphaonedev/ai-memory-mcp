@@ -2512,6 +2512,21 @@ impl MemoryStore for SqliteStore {
         signing_key: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError>
     {
+        self.reflect_with_expected_versions(ctx, input, signing_key, None)
+            .await
+    }
+
+    /// #4289 — the version-checked twin of [`Self::reflect`]: identical
+    /// gates, with `expected_versions` compared inside the write transaction
+    /// by `db::reflect_with_hooks_for_caller_versions`.
+    async fn reflect_with_expected_versions(
+        &self,
+        ctx: &CallerContext,
+        input: &crate::storage::reflect::ReflectInput,
+        signing_key: Option<&crate::identity::keypair::AgentKeypair>,
+        expected_versions: Option<&[i64]>,
+    ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError>
+    {
         let conn = self.state.lock().await;
         let mut hooks = db::ReflectHooks::empty();
         hooks.active_keypair = signing_key;
@@ -2524,7 +2539,13 @@ impl MemoryStore for SqliteStore {
             let mut stamped = input.clone();
             crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
             // Admin/substrate context: unscoped source read, as before (#3176).
-            db::reflect_with_hooks_for_caller(&conn, &stamped, &hooks, None)
+            db::reflect_with_hooks_for_caller_versions(
+                &conn,
+                &stamped,
+                &hooks,
+                None,
+                expected_versions,
+            )
         } else {
             // #3014 — a TENANT reflect crosses the attestation posture. The
             // production tenant reflect surfaces (MCP + HTTP-sqlite) route
@@ -2543,11 +2564,12 @@ impl MemoryStore for SqliteStore {
             // unscoped `db::get`, so a tenant could confirm the existence of —
             // and pull the content of — another agent's `scope=private`
             // memory into its own reflection.
-            db::reflect_with_hooks_for_caller(
+            db::reflect_with_hooks_for_caller_versions(
                 &conn,
                 &stamped,
                 &hooks,
                 Some(ctx.effective_principal()),
+                expected_versions,
             )
         }
     }

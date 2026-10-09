@@ -3787,6 +3787,33 @@ pub trait MemoryStore: Send + Sync {
         ))
     }
 
+    /// #4289 — [`Self::reflect`] with the source versions the caller
+    /// summarised, aligned one-for-one with `input.source_ids` (the #4045
+    /// [`Self::consolidate_with_expected_versions`] shape). Adapters compare
+    /// them INSIDE the write transaction and refuse with
+    /// [`crate::storage::reflect::ReflectError::SourceVersionConflict`] when a
+    /// source changed after it was summarised, so a reflection never lands
+    /// with provenance over text its sources no longer hold. `None` retains
+    /// the ordinary reflect contract.
+    ///
+    /// Default: `Some` versions are refused as unsupported on this backend;
+    /// `None` delegates to [`Self::reflect`].
+    async fn reflect_with_expected_versions(
+        &self,
+        ctx: &CallerContext,
+        input: &crate::storage::reflect::ReflectInput,
+        signing_key: Option<&crate::identity::keypair::AgentKeypair>,
+        expected_versions: Option<&[i64]>,
+    ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError>
+    {
+        if expected_versions.is_some() {
+            return Err(crate::storage::reflect::ReflectError::Database(
+                "version-checked reflection is not supported on this storage backend".to_string(),
+            ));
+        }
+        self.reflect(ctx, input, signing_key).await
+    }
+
     /// Recursive-learning provenance (L2-2): walk a reflection memory's
     /// origin metadata, returning the `ReflectionOrigin` record
     /// (peer-origin, signing agent, original depth, local cap at

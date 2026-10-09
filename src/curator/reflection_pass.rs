@@ -511,7 +511,17 @@ impl<'a> ReflectionPass<'a> {
     /// [`ReflectInput`] contract (issue #1548).
     ///
     /// No-op when `self.dry_run = true`.
-    async fn persist(&self, summary: &Memory, sources: &[MemoryId]) -> Result<()> {
+    ///
+    /// #4289 — `expected_versions`, when supplied, carries the `version` of
+    /// each source AS SNAPSHOTTED (aligned with `sources`); the substrate
+    /// compares them inside the reflect write transaction and refuses the
+    /// reflection when a source changed while the summary was generated.
+    async fn persist(
+        &self,
+        summary: &Memory,
+        sources: &[MemoryId],
+        expected_versions: Option<&[i64]>,
+    ) -> Result<()> {
         if self.dry_run || sources.is_empty() {
             return Ok(());
         }
@@ -561,7 +571,11 @@ impl<'a> ReflectionPass<'a> {
         // SQLite adapter sets `ReflectHooks::active_keypair`; Postgres
         // signs natively), so the wire shape is byte-identical across
         // backends.
-        match self.store.reflect(&self.ctx, &input, self.keypair).await {
+        match self
+            .store
+            .reflect_with_expected_versions(&self.ctx, &input, self.keypair, expected_versions)
+            .await
+        {
             Ok(_outcome) => Ok(()),
             Err(ReflectError::DepthExceeded {
                 attempted,
@@ -571,6 +585,20 @@ impl<'a> ReflectionPass<'a> {
                 anyhow::bail!(
                     "ReflectionPass::persist: substrate refused — proposed depth \
                      {attempted} exceeds namespace cap {cap} in '{namespace}'"
+                )
+            }
+            // #4289 — a source changed between the snapshot and the write:
+            // the substrate landed nothing; the cluster is retried on the
+            // next sweep from a fresh snapshot.
+            Err(ReflectError::SourceVersionConflict {
+                id,
+                expected,
+                current,
+            }) => {
+                anyhow::bail!(
+                    "ReflectionPass::persist: source '{id}' changed while the reflection \
+                     was generated (snapshot version {expected}, stored version {current}); \
+                     cluster skipped"
                 )
             }
             Err(other) => Err(anyhow::anyhow!(other.to_string())),
@@ -842,7 +870,13 @@ pub async fn run_reflection_pass(
                 continue;
             }
 
-            match pass.persist(&summary, &source_ids).await {
+            // #4289 — carry the snapshotted source versions so the substrate
+            // refuses a reflection whose sources changed while it was generated.
+            let source_versions: Vec<i64> = cluster.iter().map(|m| m.version).collect();
+            match pass
+                .persist(&summary, &source_ids, Some(&source_versions))
+                .await
+            {
                 Ok(()) => {
                     report.reflections_persisted += 1;
                     // Best-effort verify on the most recent reflection
@@ -1580,7 +1614,9 @@ mod tests {
             let llm = StubLlm::new("S");
             let pass = ReflectionPass::new(&store, &llm, None, None, true);
             let summary = make_obs("s", "ns", "[reflection]", "c", 1);
-            pass.persist(&summary, &["x".to_string()]).await.unwrap();
+            pass.persist(&summary, &["x".to_string()], None)
+                .await
+                .unwrap();
         }
 
         #[tokio::test]
@@ -1589,7 +1625,7 @@ mod tests {
             let llm = StubLlm::new("S");
             let pass = ReflectionPass::new(&store, &llm, None, None, false);
             let summary = make_obs("s", "ns", "[reflection]", "c", 1);
-            pass.persist(&summary, &[]).await.unwrap();
+            pass.persist(&summary, &[], None).await.unwrap();
         }
 
         #[tokio::test]
@@ -1603,7 +1639,7 @@ mod tests {
             let src_id = crate::db::insert(&conn_of(&store), &source).unwrap();
             let summary = make_obs("s", "ns", "[reflection]", "c", 0);
             let err = pass
-                .persist(&summary, &[src_id])
+                .persist(&summary, &[src_id], None)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -1630,7 +1666,7 @@ mod tests {
                     crate::db::get(&conn, &s3).unwrap().unwrap(),
                 ])
                 .unwrap();
-            pass.persist(&summary, &[s1.clone(), s2.clone(), s3.clone()])
+            pass.persist(&summary, &[s1.clone(), s2.clone(), s3.clone()], None)
                 .await
                 .unwrap();
 
@@ -2237,7 +2273,7 @@ mod tests {
                     crate::db::get(&conn, &s3).unwrap().unwrap(),
                 ])
                 .unwrap();
-            pass.persist(&summary, &[s1.clone(), s2.clone(), s3.clone()])
+            pass.persist(&summary, &[s1.clone(), s2.clone(), s3.clone()], None)
                 .await
                 .unwrap();
             let listed = crate::db::list(

@@ -73,6 +73,15 @@ pub enum ReflectError {
         quorum_n: usize,
         namespace: String,
     },
+    /// #4289 — a source memory's `version` no longer matches the version
+    /// the caller summarised (the #4045 `consolidate_with_expected_versions`
+    /// shape). Checked INSIDE the write transaction, so a reflection is
+    /// never written over text its sources no longer hold.
+    SourceVersionConflict {
+        id: String,
+        expected: i64,
+        current: i64,
+    },
     /// Database error during the atomic write. Carries the underlying
     /// rusqlite / anyhow string.
     Database(String),
@@ -107,6 +116,15 @@ impl std::fmt::Display for ReflectError {
                 "reflection refused: attested model-family decorrelation quorum not met \
                  ({distinct_attested_families} distinct attested families across \
                  {attested_rows} attested rows < required {quorum_n}, namespace='{namespace}')"
+            ),
+            Self::SourceVersionConflict {
+                id,
+                expected,
+                current,
+            } => write!(
+                f,
+                "reflection refused: source '{id}' changed after it was summarised \
+                 (expected version {expected}, stored version {current})"
             ),
         }
     }
@@ -360,14 +378,42 @@ pub fn reflect_with_hooks(
 ///
 /// Same variants as [`reflect_with_hooks`]; a source the caller cannot see
 /// surfaces as [`ReflectError::SourceNotFound`].
-#[allow(clippy::too_many_lines)]
 pub fn reflect_with_hooks_for_caller(
     conn: &Connection,
     input: &ReflectInput,
     hooks: &ReflectHooks<'_>,
     caller: Option<&str>,
 ) -> std::result::Result<ReflectOutcome, ReflectError> {
+    reflect_with_hooks_for_caller_versions(conn, input, hooks, caller, None)
+}
+
+/// #4289 — [`reflect_with_hooks_for_caller`] with the source versions the
+/// caller summarised, aligned one-for-one with `input.source_ids` (the #4045
+/// `consolidate_with_expected_versions` shape). The versions are compared
+/// at the source load AND re-read inside the write transaction, so a source
+/// edited between the caller's snapshot and the write refuses the whole
+/// reflection with [`ReflectError::SourceVersionConflict`] and nothing lands.
+/// `None` retains the ordinary reflect contract.
+///
+/// # Errors
+///
+/// Same variants as [`reflect_with_hooks_for_caller`] plus
+/// [`ReflectError::SourceVersionConflict`]; a version slice whose length
+/// differs from `source_ids` is a [`ReflectError::Validation`].
+#[allow(clippy::too_many_lines)]
+pub fn reflect_with_hooks_for_caller_versions(
+    conn: &Connection,
+    input: &ReflectInput,
+    hooks: &ReflectHooks<'_>,
+    caller: Option<&str>,
+    expected_versions: Option<&[i64]>,
+) -> std::result::Result<ReflectOutcome, ReflectError> {
     use crate::validate;
+    if expected_versions.is_some_and(|v| v.len() != input.source_ids.len()) {
+        return Err(ReflectError::Validation(
+            "source version count must match source ids".into(),
+        ));
+    }
     // ─── 1. Validate inputs ──────────────────────────────────────────
     validate::validate_title(&input.title).map_err(|e| ReflectError::Validation(e.to_string()))?;
     validate::validate_content(&input.content)
@@ -407,7 +453,7 @@ pub fn reflect_with_hooks_for_caller(
 
     // ─── 2. Load each source memory; bail on any missing id ─────────
     let mut sources = Vec::with_capacity(input.source_ids.len());
-    for id in &input.source_ids {
+    for (index, id) in input.source_ids.iter().enumerate() {
         match get(conn, id).map_err(|e| ReflectError::Database(e.to_string()))? {
             // #3176 — a TENANT caller only sees what it may read; an invisible
             // source folds to the SAME `SourceNotFound` a missing id produces
@@ -417,6 +463,17 @@ pub fn reflect_with_hooks_for_caller(
                     crate::visibility::is_readable_on_query(&m, Some(c), Some(m.namespace.as_str()))
                 }) =>
             {
+                // #4289 — early refusal (cheap; the authoritative re-check
+                // runs inside the write transaction below).
+                if let Some(versions) = expected_versions
+                    && versions[index] != m.version
+                {
+                    return Err(ReflectError::SourceVersionConflict {
+                        id: id.clone(),
+                        expected: versions[index],
+                        current: m.version,
+                    });
+                }
                 sources.push(m);
             }
             Some(_) | None => return Err(ReflectError::SourceNotFound(id.clone())),
@@ -644,6 +701,30 @@ pub fn reflect_with_hooks_for_caller(
         .map_err(|e| ReflectError::Database(e.to_string()))?;
 
     let txn_result = (|| -> std::result::Result<String, ReflectError> {
+        // #4289 — authoritative version check INSIDE the write lock: a
+        // source edited between the snapshot above and this BEGIN IMMEDIATE
+        // refuses the reflection, and the rollback below lands nothing.
+        if let Some(versions) = expected_versions {
+            for (index, id) in input.source_ids.iter().enumerate() {
+                let current: i64 = conn
+                    .query_row("SELECT version FROM memories WHERE id = ?1", [id], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => {
+                            ReflectError::SourceNotFound(id.clone())
+                        }
+                        other => ReflectError::Database(other.to_string()),
+                    })?;
+                if versions[index] != current {
+                    return Err(ReflectError::SourceVersionConflict {
+                        id: id.clone(),
+                        expected: versions[index],
+                        current,
+                    });
+                }
+            }
+        }
         // v0.7.0 fix campaign R1-M3 (#690) — substrate-side reflections
         // must NOT silently merge into an existing (title, namespace).
         // If a row with the same title is already present in the

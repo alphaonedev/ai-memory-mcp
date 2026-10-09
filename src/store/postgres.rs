@@ -14303,19 +14303,67 @@ impl PostgresStore {
     ///
     /// Same variants as [`PostgresStore::reflect`] plus
     /// [`crate::db::ReflectError::HookVeto`] on `pre_reflect` veto.
-    #[allow(clippy::too_many_lines)]
     pub async fn reflect_with_hooks(
         &self,
         ctx: &super::CallerContext,
         input: &crate::db::ReflectInput,
         hooks: &crate::db::ReflectHooks<'_>,
     ) -> std::result::Result<crate::db::ReflectOutcome, crate::db::ReflectError> {
+        // #1955 R45 — record-stop fence at this public entry point (pinned by
+        // `tests/record_stop_r45_1955.rs`), then the shared body.
+        self.gate_record_stop()
+            .await
+            .map_err(|e| crate::db::ReflectError::Database(e.to_string()))?;
+        self.reflect_with_hooks_gated(ctx, input, hooks, None).await
+    }
+
+    /// #4289 — [`Self::reflect_with_hooks`] with the source versions the
+    /// caller summarised, aligned one-for-one with `input.source_ids` (the
+    /// #4045 `consolidate_with_expected_versions` shape). The versions are
+    /// re-read INSIDE the write transaction, after the sources are
+    /// key-share locked in id order, so a source edited between the
+    /// caller's snapshot and this write refuses the reflection with
+    /// [`crate::db::ReflectError::SourceVersionConflict`] and nothing lands.
+    ///
+    /// # Errors
+    ///
+    /// Same variants as [`Self::reflect_with_hooks`] plus
+    /// `SourceVersionConflict`; a version slice whose length differs from
+    /// `source_ids` is a `Validation` error.
+    pub async fn reflect_with_hooks_versions(
+        &self,
+        ctx: &super::CallerContext,
+        input: &crate::db::ReflectInput,
+        hooks: &crate::db::ReflectHooks<'_>,
+        expected_versions: Option<&[i64]>,
+    ) -> std::result::Result<crate::db::ReflectOutcome, crate::db::ReflectError> {
+        // #1955 R45 — record-stop fence at this public entry point too.
+        self.gate_record_stop()
+            .await
+            .map_err(|e| crate::db::ReflectError::Database(e.to_string()))?;
+        self.reflect_with_hooks_gated(ctx, input, hooks, expected_versions)
+            .await
+    }
+
+    /// The shared reflect body behind [`Self::reflect_with_hooks`] and
+    /// [`Self::reflect_with_hooks_versions`]; both public entry points have
+    /// already crossed the record-stop fence.
+    #[allow(clippy::too_many_lines)]
+    async fn reflect_with_hooks_gated(
+        &self,
+        ctx: &super::CallerContext,
+        input: &crate::db::ReflectInput,
+        hooks: &crate::db::ReflectHooks<'_>,
+        expected_versions: Option<&[i64]>,
+    ) -> std::result::Result<crate::db::ReflectOutcome, crate::db::ReflectError> {
         use crate::db::ReflectError;
         use crate::validate;
 
-        self.gate_record_stop()
-            .await
-            .map_err(|e| ReflectError::Database(e.to_string()))?;
+        if expected_versions.is_some_and(|v| v.len() != input.source_ids.len()) {
+            return Err(ReflectError::Validation(
+                "source version count must match source ids".into(),
+            ));
+        }
         // ─── 1. Validate inputs ─────────────────────────────────────
         validate::validate_title(&input.title)
             .map_err(|e| ReflectError::Validation(e.to_string()))?;
@@ -14600,6 +14648,35 @@ impl PostgresStore {
         lock_order_4209::lock_memories_in_id_order(&mut tx, &src_locks)
             .await
             .map_err(|e| ReflectError::Database(format!("lock reflect sources: {e}")))?;
+
+        // #4289 — authoritative version check under the source locks: the
+        // rows are held KEY SHARE until commit, so a concurrent edit either
+        // committed before this read (refused here) or waits behind it.
+        if let Some(versions) = expected_versions {
+            use sqlx::Row;
+            for (index, id) in input.source_ids.iter().enumerate() {
+                let row = sqlx::query("SELECT version FROM memories WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        ReflectError::Database(format!("read reflect source version: {e}"))
+                    })?;
+                let Some(row) = row else {
+                    return Err(ReflectError::SourceNotFound(id.clone()));
+                };
+                let current: i64 = row.try_get("version").map_err(|e| {
+                    ReflectError::Database(format!("read reflect source version: {e}"))
+                })?;
+                if versions[index] != current {
+                    return Err(ReflectError::SourceVersionConflict {
+                        id: id.clone(),
+                        expected: versions[index],
+                        current,
+                    });
+                }
+            }
+        }
 
         // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948) — COW SUPERSEDE: probe the
         // existing (title, namespace) row's version BEFORE the reflection upsert
@@ -28671,6 +28748,21 @@ impl MemoryStore for PostgresStore {
         signing_key: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError>
     {
+        self.reflect_with_expected_versions(ctx, input, signing_key, None)
+            .await
+    }
+
+    /// #4289 — the version-checked twin of [`MemoryStore::reflect`]: the
+    /// same gates, with `expected_versions` re-read under the source locks
+    /// by [`PostgresStore::reflect_with_hooks_versions`].
+    async fn reflect_with_expected_versions(
+        &self,
+        ctx: &CallerContext,
+        input: &crate::storage::reflect::ReflectInput,
+        signing_key: Option<&crate::identity::keypair::AgentKeypair>,
+        expected_versions: Option<&[i64]>,
+    ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError>
+    {
         // Delegate to the fully-implemented inherent native-sqlx port
         // (validation → source load → depth → governance cap →
         // depth-exceeded signed_events audit → atomic memory + signed
@@ -28687,9 +28779,12 @@ impl MemoryStore for PostgresStore {
             let mut stamped = input.clone();
             crate::identity::attest::gate_unsigned_surface_attestation(&mut stamped.metadata)
                 .map_err(|e| crate::storage::reflect::ReflectError::Validation(e.to_string()))?;
-            return self.reflect_with_hooks(ctx, &stamped, &hooks).await;
+            return self
+                .reflect_with_hooks_versions(ctx, &stamped, &hooks, expected_versions)
+                .await;
         }
-        self.reflect_with_hooks(ctx, input, &hooks).await
+        self.reflect_with_hooks_versions(ctx, input, &hooks, expected_versions)
+            .await
     }
 
     async fn get_reflection_origin(
