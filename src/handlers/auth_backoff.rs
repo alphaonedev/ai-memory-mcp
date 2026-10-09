@@ -14,7 +14,10 @@
 //! the middleware consults it at every auth-failure site (missing key and
 //! unknown key alike, shared-key and per-agent-key paths) and at the success
 //! site (a success resets the source). No second copy of the decision
-//! exists anywhere.
+//! exists anywhere. #4068 — the outer monitoring gate
+//! (`super::monitoring::access`), which authenticates the monitoring routes
+//! itself, consults the SAME policy instance (pre-check before any key is
+//! looked at, a failure recorded at each of its `401` sites, a success reset).
 //!
 //! * Source identity is the TCP peer IP (`ConnectInfo<SocketAddr>`,
 //!   `transport.rs`), NEVER a client header: a header-derived source lets an

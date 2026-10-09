@@ -66,8 +66,52 @@ fn refusal(code: StatusCode, reason: &'static str) -> Response {
     (code, Json(json!({"error": reason}))).into_response()
 }
 
+/// #4068 — a credential failure at THIS gate is an auth failure like any
+/// other: record it in the shared #2502 `AuthFailurePolicy` (the same table
+/// `api_key_auth` uses) and answer `429` once the source is past its budget.
+fn auth_failure(
+    state: &AccessState,
+    source: Option<std::net::IpAddr>,
+    now: std::time::Instant,
+    reason: &'static str,
+) -> Response {
+    if let Some(ip) = source
+        && let super::auth_backoff::AuthDecision::Refuse { retry_after_secs } =
+            state.auth.auth_backoff.on_failure(ip, now)
+    {
+        return super::transport::backoff_refusal(retry_after_secs);
+    }
+    refusal(StatusCode::UNAUTHORIZED, reason)
+}
+
 /// The outermost HTTP gate; checks both credentials before any bypass branch.
 pub(crate) async fn access(State(state): State<AccessState>, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    let health = is_health_path(path);
+    let scoped = !state.scopes.agent_ids.is_empty() || !state.scopes.peer_ids.is_empty();
+    // #4068 — the requests THIS gate authenticates: the monitoring routes
+    // (TLS listener only; the plaintext refusal below is not a credential
+    // check) and, once health-only scopes exist, every ordinary route except
+    // the public `/health` liveness probe and the mTLS federation lane the
+    // transport gate also leaves out of backoff. The shared #2502 backoff is
+    // consulted BEFORE any key is looked at, so a correct key presented
+    // during backoff is refused too (no key oracle).
+    let gated = if health {
+        state.tls_enabled
+    } else {
+        scoped
+            && path != super::routes::HEALTH
+            && !(state.auth.mtls_enforced && path.starts_with(super::authority::SYNC_PREFIX))
+    };
+    let source = super::transport::auth_backoff_source(&req);
+    let now = std::time::Instant::now();
+    if gated
+        && let Some(ip) = source
+        && let super::auth_backoff::AuthDecision::Refuse { .. } =
+            state.auth.auth_backoff.pre_check(ip, now)
+    {
+        return auth_failure(&state, source, now, "monitoring_requires_authentication");
+    }
     let token = req
         .headers()
         .get(crate::HEADER_API_KEY)
@@ -85,7 +129,6 @@ pub(crate) async fn access(State(state): State<AccessState>, req: Request, next:
     // elevate a health-only principal. Restriction wins over other authority.
     let restricted = agent.is_some_and(|id| state.scopes.agent_ids.contains(id))
         || peer.is_some_and(|id| state.scopes.peer_ids.contains(id));
-    let health = is_health_path(req.uri().path());
     let read = matches!(*req.method(), Method::GET | Method::HEAD);
     if restricted && (!health || !read) {
         return refusal(StatusCode::FORBIDDEN, "monitoring_scope_refused");
@@ -96,25 +139,26 @@ pub(crate) async fn access(State(state): State<AccessState>, req: Request, next:
     // Revoked/unresolved keys cannot fall through an auth-off deployment.
     // Once health-only scopes exist, all non-probe requests need a resolved
     // transport principal, even when the legacy shared key is unconfigured.
-    if (!state.scopes.agent_ids.is_empty() || !state.scopes.peer_ids.is_empty())
-        && !health
-        && req.uri().path() != super::routes::HEALTH
-        && agent.is_none()
-        && peer.is_none()
-        && !global
-    {
-        return refusal(StatusCode::UNAUTHORIZED, "unresolved_transport_principal");
+    let resolved = agent.is_some() || peer.is_some() || global;
+    if scoped && !health && path != super::routes::HEALTH && !resolved {
+        return auth_failure(&state, source, now, "unresolved_transport_principal");
     }
     if health {
         if !state.tls_enabled {
             return refusal(StatusCode::FORBIDDEN, "monitoring_requires_tls");
         }
-        if agent.is_none() && peer.is_none() && !global {
-            return refusal(
-                StatusCode::UNAUTHORIZED,
-                "monitoring_requires_authentication",
-            );
+        if !resolved {
+            return auth_failure(&state, source, now, "monitoring_requires_authentication");
         }
+    }
+    // #4068 — a success at a site this gate is the authenticator for resets
+    // the source (the monitoring routes, and ordinary routes when no shared
+    // key is configured, so `api_key_auth` is a pass-through).
+    if gated
+        && (health || state.auth.key.is_none())
+        && let Some(ip) = source
+    {
+        state.auth.auth_backoff.on_success(ip);
     }
     next.run(req).await
 }

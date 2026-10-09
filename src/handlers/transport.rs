@@ -979,7 +979,7 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// forged header. `None` (a router driven without a TCP listener, as in
 /// tests) passes through to normal auth with no backoff.
 /// See `handlers::auth_backoff` for the policy.
-fn auth_backoff_source(req: &Request) -> Option<IpAddr> {
+pub(super) fn auth_backoff_source(req: &Request) -> Option<IpAddr> {
     req.extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|peer| peer.0.ip())
@@ -989,7 +989,7 @@ fn auth_backoff_source(req: &Request) -> Option<IpAddr> {
 /// body. Rendered only here, so the shared-key and per-agent-key paths are
 /// byte-identical and the body never says whether the key exists or which
 /// path failed (uniform refusal).
-fn backoff_refusal(retry_after_secs: u64) -> Response {
+pub(super) fn backoff_refusal(retry_after_secs: u64) -> Response {
     let retry = axum::http::HeaderValue::from_str(&retry_after_secs.to_string())
         .unwrap_or_else(|_| axum::http::HeaderValue::from_static("1"));
     (
