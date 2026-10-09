@@ -1412,6 +1412,18 @@ def self_test():
             ("#6246 '<!-->' on the erratum line", stale_line + "\n<!--> " + line),
             ("#6215 M6 fence holding '<!--', then a mermaid erratum",
              stale_line + "\n```\n<!--\n```\n```mermaid\n%% " + erratum.strip() + "\n```\n"),
+            # round-8 mutant kills: each shape pins one clause of the erratum form.
+            ("issue number empty", stale_line + "\nErratum (#): " + names),
+            ("issue number zero", stale_line + "\nErratum (#0): " + names),
+            ("closing bracket only", stale_line + "\nErratum (#1): " + names.rstrip("\n") + " x]\n"),
+            ("opening bracket only", stale_line + "\nErratum (#1): " + names.rstrip("\n") + " [x\n"),
+            ("link after the code spans", stale_line + "\nErratum (#1): `check-old.sh` is `scripts/check_new.py` [x](y).\n"),
+            ("comment reopened after a close on the line",
+             stale_line + "\nText <!-- a --> b <!--\n" + erratum + "-->\n"),
+            ("comment after an unmatched backtick run", stale_line + "\nText ``` <!--\n" + erratum + "-->\n"),
+            ("erratum prefix inside a comment", stale_line + "\n<!--\n\nErratum (#1): x --> " + names),
+            ("names only after rendering",
+             stale_line + "\nErratum (#1): `check&#45;old.sh` is `scripts/check_new.py`.\n"),
         ):
             doc.write_text(text)
             expect(check(root), "R8-canonical-%s: a non-canonical or hidden erratum was accepted" % label)
@@ -1428,6 +1440,9 @@ def self_test():
             ("after a closed $$ block", stale_line + "\n$$\nx\n$$\n" + erratum),
             ("brackets in a code span", stale_line + "\nErratum (#1): `[x]` `check-old.sh` is `scripts/check_new.py`.\n"),
             ("#6238 after a '[ ]:' line", stale_line + "\n[ ]: x\n" + erratum),
+            ("after a backtick line with a backtick info string", stale_line + "\n```x`y\n" + erratum),
+            ("after a comment holding a fence line", stale_line + "\n<!--\n```\n-->\n" + erratum + "```\n"),
+            ("after an indented code line with a code-span '<!--'", stale_line + "\n    <div> `<!--`\n" + erratum),
         ):
             doc.write_text(text)
             expect(not check(root), "R8-canonical-%s: a canonical erratum was rejected" % label)
@@ -1452,6 +1467,8 @@ def self_test():
             ("D4 comment over lines", "Run check-<!--\n-->old.sh daily.\n"),
             ("tag over lines", "Run check-<span\nclass='x'>old.sh daily.\n"),
             ("empty comment", "Run check-<!-->old.sh daily.\n"),
+            ("processing instruction", "Run check-<?x?>old.sh daily.\n"),
+            ("empty comment inside a link", "Run [check-<!-->](a)[old.sh](b) daily.\n"),
         ):
             doc.write_text(text, encoding="utf-8")
             expect(any("check-old.sh" in p for p in check(root)), "R8-#6214-%s: a split stale name was accepted" % label)
@@ -1466,10 +1483,14 @@ def self_test():
             ("suffix letter", "Run `check-old.ѕh`.\n"),
             ("of an existing script", "Run `сheck_new.py`.\n"),
             ("split and non-ASCII", "Run `Ꮯheck-`old.sh.\n"),
+            ("combining mark on an existing script", "Run `c\u0336heck_new.py`.\n"),
         ):
             doc.write_text(text, encoding="utf-8")
             expect(any("look-alike script name" in p for p in check(root)),
                    "R8-#6214-%s: a look-alike script name was accepted" % label)
+        doc.write_text("Run `c\u0336heck_new.py`.\n", encoding="utf-8")
+        expect(any("is a letter with a combining mark" in p for p in check(root)),
+               "R8-#6214: the look-alike message does not explain the combining-mark placeholder")
         doc.write_text("Runs check_`new.py`, [check_](a)[new.py](b) and café-check_new.py, naïve check_new.py.\n",
                        encoding="utf-8")
         probs = check(root)
