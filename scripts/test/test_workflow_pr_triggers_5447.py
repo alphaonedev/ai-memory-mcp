@@ -3620,6 +3620,12 @@ class ApprovalDocTruth6213(unittest.TestCase):
                 self.assertIn("#6213", text)
                 self.assertIn("named by the queue ref", text)
 
+    def test_6117_r3_f6_claude_md_size_comment_states_the_current_rule(self) -> None:
+        raw = (ROOT / "scripts" / "check-claude-md-size.py").read_text(encoding="utf-8")
+        text = " ".join(raw.replace("\n#", "\n").split())
+        self.assertNotIn("must NOT name rehearsal/** or chain/**", text)
+        self.assertIn("chain/** is admitted on push ONLY in the required-set workflows", text)
+
 
 class GateScriptsRunIsolated6117(unittest.TestCase):
     """N-2 (#5163 class): the gate scripts the c8 workflow runs use ``python3 -I``.
