@@ -1829,7 +1829,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     fx.write(mod_rs, "// f4\n", append=True)
     fx.banner("EXPIRED", genesis, "\n" + old6100 + "\nUnrelated prose edit.\n")
     f4 = fx.commit([mod_rs, CERT_DOC], "6124 cell f4")
-    t.expect_red("6124-f4", "pre-existing amendment reused", repo, pre, f4, red6124)
+    t.expect_red("6124-f4", "pre-existing amendment reused", repo, pre, f4, red6124 + [
+        ("no NEW amendment record", "did not say no new record was added")])
     # (6124-f4b) RED (R2, sec F1 / code F1) - an existing amendment re-dated
     # (header edited) is a rewrite of the ledger, not a new record.
     f4b = edit_range("\n" + old6100.replace("2026-10-09", "2026-10-08"), label="f4b", frm=pre)
@@ -1879,24 +1880,28 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     t.expect_red("6124-f7", "list inside a code fence", repo, exp6124, f7, red6124)
     f7b = edit_range("\n```\n" + amend("#6162", [mod_rs]) + "```\n", label="f7b")
     t.expect_red("6124-f7b", "whole amendment inside a code fence", repo, exp6124, f7b, red6124)
-    # (6124-f7c) RED (R2, sec F3 / code F2) - a ``` fence is not closed by ~~~.
-    f7c = edit_range("\n```\n~~~\n" + amend("#6162", [mod_rs]) + "```\n", label="f7c")
+    # (6124-f7c) RED (R2, sec F3 / code F2) - a ``` fence is not closed by ~~~
+    # (the amendment is its own paragraph inside the fence, so only the fence
+    # rule hides it).
+    f7c = edit_range("\n```\n~~~\n\n" + amend("#6162", [mod_rs]) + "\n```\n", label="f7c")
     t.expect_red("6124-f7c", "amendment inside a ``` fence 'closed' by ~~~", repo, exp6124,
                  f7c, red6124)
     # (6124-f7d) RED (R2, sec F3) - a ```` fence is not closed by a shorter ```.
-    f7d = edit_range("\n````\n```\n" + amend("#6162", [mod_rs]) + "````\n", label="f7d")
+    f7d = edit_range("\n````\n```\n\n" + amend("#6162", [mod_rs]) + "\n````\n", label="f7d")
     t.expect_red("6124-f7d", "amendment inside a 4-backtick fence", repo, exp6124, f7d, red6124)
     # (6124-f7e) RED (R2, sec F2 / code F2) - an amendment in an HTML comment
     # never renders.
-    f7e = edit_range("\n<!--\n" + amend("#6162", [mod_rs]) + "-->\n", label="f7e")
+    f7e = edit_range("\n<!--\n\n" + amend("#6162", [mod_rs]) + "\n-->\n", label="f7e")
     t.expect_red("6124-f7e", "amendment inside an HTML comment", repo, exp6124, f7e, red6124)
     # (6124-f7f) RED (R2, sec F2) - a comment opened on a quoted line.
-    f7f = edit_range("\n> <!-- hidden\n" + amend("#6162", [mod_rs]) + "> -->\n", label="f7f")
+    f7f = edit_range("\n> <!-- hidden\n>\n" + amend("#6162", [mod_rs]) + ">\n> -->\n",
+                     label="f7f")
     t.expect_red("6124-f7f", "amendment inside a quoted HTML comment", repo, exp6124, f7f,
                  red6124)
-    # (6124-f7g) RED (R2) - an indented code block (>4 columns after '>').
-    indented = "".join(">     " + ln[2:] + "\n" for ln in amend("#6162", [mod_rs]).splitlines())
-    f7g = edit_range("\n> Note.\n>\n" + indented, label="f7g")
+    # (6124-f7g) RED (R2) - a header indented more than 4 columns after '>'
+    # is an indented code block, not a header (the list below it is plain).
+    head7g, rest7g = amend("#6162", [mod_rs]).split("\n", 1)
+    f7g = edit_range("\n> Note.\n>\n>     " + head7g[2:] + "\n" + rest7g, label="f7g")
     t.expect_red("6124-f7g", "amendment inside an indented code block", repo, exp6124, f7g,
                  red6124)
     # (6124-f8) RED - an identifier changed but is not listed.
@@ -1916,6 +1921,12 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     f9b = edit_range("\n> Preceding prose line.\n" + amend("#6162", [mod_rs]), label="f9b")
     t.expect_red("6124-f9b", "header not opening its own paragraph", repo, exp6124, f9b,
                  red6124)
+    # (6124-f9c) RED (R2, code F10) - the header stands alone on its line:
+    # body text after the closing ** (even text ending in bold) is refused.
+    f9c = edit_range("\n" + amend("#6162", [mod_rs]).replace(
+        "non-discharging).**", "non-discharging).** Changed in **this range**", 1),
+        label="f9c")
+    t.expect_red("6124-f9c", "header line carrying body text", repo, exp6124, f9c, red6124)
     # (6124-f10) RED - no #6063 citation, or another issue cited as the way back.
     f10 = edit_range("\n" + amend("#6162", [mod_rs], cite=False), label="f10")
     t.expect_red("6124-f10", "amendment without the #6063 citation", repo, exp6124, f10, red6124)
@@ -1936,7 +1947,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # (6124-f10e) RED (R2) - "#6063" linked to another repository's issue.
     f10e = edit_range("\n" + amend("#6162", [mod_rs], back=(
         "> Path back to LIVE: WP-B1 re-cert "
-        "([#6063](https://github.com/example-fork/ai-memory-mcp/issues/6063)) only.")),
+        f"([#6063]({url6063}); mirror "
+        "[#6063](https://github.com/example-fork/ai-memory-mcp/issues/6063)) only.")),
         label="f10e")
     t.expect_red("6124-f10e", "#6063 linked to another repository", repo, exp6124, f10e,
                  red6124)
@@ -2011,7 +2023,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # (6124-f14) RED (R2, sec F5 / code F8) - exactly ONE new amendment.
     f14 = edit_range("\n" + amend("#6162", [mod_rs]) + "\n"
                      + amend("#6199", ["src/unrelated.rs"], cite=False), label="f14")
-    t.expect_red("6124-f14", "a second, unrelated new amendment", repo, exp6124, f14, red6124)
+    t.expect_red("6124-f14", "a second, unrelated new amendment", repo, exp6124, f14,
+                 red6124 + [("exactly one new amendment", "did not name the one-record rule")])
     # (6124-f15a/b) RED (R2, sec F4 / code F9) - the header date is a real ISO
     # date and not in the future.
     f15a = edit_range("\n" + amend("#6162", [mod_rs], date="2026-13-45"), label="f15a")
@@ -2066,6 +2079,7 @@ SELF_TEST_OK = (
     "prose-only, reused, re-dated, split, deleted or edited prior records, LIVE at the "
     "merge-base, EXPIRED flipped to a stale LIVE (rule C), fenced (CommonMark), "
     "HTML-commented, indented-code, unlisted-identifier, above-STATUS, mid-paragraph, "
+    "header-with-body-text, "
     "uncited, other-issue, bare-URL, foreign-link, URL-less, later-paragraph, two new "
     "records and invalid or future dates RED; an unreadable, symlinked or oversized cert "
     "doc fail-closed; the EXPIRED remedy names the amendment record and #3899."
