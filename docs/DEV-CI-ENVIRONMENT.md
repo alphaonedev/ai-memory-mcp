@@ -135,29 +135,63 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   workflow can never disagree for a job that is added later without the pair.
   The hygiene test fails any self-hosted job that sets another level in a
   workflow, job or step `env:`, in a `run:` body (`export`, or a write to
-  `$GITHUB_ENV`) or through a rustc `debuginfo=` flag, and it censuses every
-  job whose `runs-on` can resolve to a self-hosted runner.
+  `$GITHUB_ENV`), through a rustc `debuginfo=` or `-g` flag (`RUSTFLAGS`,
+  `RUSTDOCFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`,
+  `CARGO_TARGET_<triple>_RUSTFLAGS`) or through `cargo --config
+  profile.<p>.debug=...` (which beats the `CARGO_PROFILE_*` env), and it
+  censuses every job whose `runs-on` can resolve to a self-hosted runner
+  (`ubuntu-slim` and the `ubuntu-`/`macos-`/`windows-` images count as
+  GitHub-hosted).
 - **`Prune runner target dir (#6118)` is the LAST step of each such job**,
   under `if: always() && ... && steps.checkout.outcome == 'success'` (it never
   runs a script the job's own checkout did not produce), running
   `python3 scripts/ci/prune-runner-target.py --target-dir "${CARGO_TARGET_DIR:-target}"`.
-  The default `--scope test-bins` deletes the test/example executables (plus
-  their `.d` and `.dSYM` companions) and `incremental/`; the rlib / rmeta /
+  The default `--scope test-bins` deletes the test executables in `deps/`
+  (plus their `.d` and `.dSYM` companions) and `incremental/`. Each example is
+  two hard links to one file, `examples/<name>-<hash>` and its uplift
+  `examples/<name>`; the pair is deleted together, with both names'
+  companions, and its bytes count once. Any other hard-linked executable (the
+  `deps/<bin>-<hash>` behind an uplifted `debug/<bin>`) is kept, since deleting
+  one link frees nothing. The rlib / rmeta /
   proc-macro outputs, `build/` and `.fingerprint/` stay, so the next compile is
   still warm. `--dry-run` lists what would go and prints `freed_bytes=<n>`;
   `--scope all` wipes `debug/{deps,build,incremental,examples,.fingerprint}`
   wholesale (the disk-emergency prune, no toolchain needed). The script fails
   closed (exit 2, nothing touched) on a `--profile` that is not one path
-  component, a symlinked target dir or profile dir, a dir outside
-  `GITHUB_WORKSPACE` that is not the exported `CARGO_TARGET_DIR`, and a dir
-  without cargo's marker (a `CACHEDIR.TAG` carrying the cachedir signature, or
+  component, an empty `--target-dir`, a symlinked target dir or profile dir,
+  a dir outside `GITHUB_WORKSPACE` (accepted only with
+  `--allow-outside-workspace` when it is the exported `CARGO_TARGET_DIR`), and
+  a dir without cargo's marker (a `CACHEDIR.TAG` carrying the cachedir signature, or
   `<profile>/.cargo-lock`). A target dir that does not exist yet is "nothing to
   prune" (exit 0). It deletes through directory fds opened with `O_NOFOLLOW`,
   so it never follows a symlink, even one swapped in mid-run. An entry it
-  cannot remove prints a `::warning::` line; the rest is still pruned and the
-  exit code is 1. `freed_bytes` is exact: a hard-linked file counts once, and
-  only when all of its links go. Loose `deps/*.o` files are kept. By hand on a
-  node:
+  cannot read or remove prints a `::warning::` line; the rest is still pruned,
+  the totals are printed and the exit code is 1. Names in those lines are
+  escaped (`%` `%25`, CR `%0D`, LF `%0A`), so a file name cannot start a
+  workflow command of its own. `freed_bytes` is exact: a hard-linked file
+  counts once, and only when all of its links go. The run ends with
+  `::notice::prune-runner-target freed_bytes=<n> deleted=<k> mode=<pruned|dry-run>`,
+  which shows on the job summary. Loose `deps/*.o` files are kept.
+
+  Runner layout rules that follow from the refusals:
+
+  - **Never make a runner's `target` a symlink** (for example to a larger
+    disk). The script refuses it with exit 2 and the required job goes red.
+    For more disk, move the runner's whole `_work` directory (the runner's
+    work folder setting) to the larger volume, so `target` stays a real
+    directory inside `GITHUB_WORKSPACE`.
+  - **Do not export a `CARGO_TARGET_DIR` outside the workspace on a runner.**
+    The workflows never pass `--allow-outside-workspace`, so such a dir is
+    refused with exit 2 and the job goes red. A dir shared by several runners
+    would let one job's prune delete test binaries another job is running; the
+    flag exists only for a by-hand prune of a dir you know is private.
+  - **One-time per fleet runner after #6118 lands:** run
+    `python3 scripts/ci/prune-runner-target.py --target-dir <runner>/_work/ai-memory-mcp/ai-memory-mcp/target --scope all`
+    while the runner is idle, to drop the second debuginfo tree and the test
+    binaries written before the prune step existed. The first build after it
+    is cold; later builds stay warm.
+
+  By hand on a node:
 
   ```bash
   python3 scripts/ci/prune-runner-target.py \
