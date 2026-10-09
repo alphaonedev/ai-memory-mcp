@@ -189,13 +189,35 @@ pg_ctl -D <pg-age-stack>/pgdata start|stop
 **AGE self-heal (#6161).** The hand-built AGE 1.8.0 files originally lived inside
 Homebrew's `postgresql@18` share/lib trees, which `brew upgrade` relinks, dropping
 them (CI then fails with `extension "age" is not available`). A brew-independent
-copy now lives in `<pg-age-stack>/age-1.8.0/{share,lib}` (the four `age*.control/sql`
-files and `age.dylib`). On the macos-fed node the "Configure enterprise-fed tier"
-step runs `scripts/ci/ensure-age-extension.py` before `CREATE EXTENSION`: if
-`pg_available_extensions` lacks `age` it copies `share/*` into
-`pg_config --sharedir`/extension and `lib/*` into `pg_config --pkglibdir`, re-checks,
-and fails with one clear message if the restore did not help. It is a no-op when AGE
-is present. The directory is overridable with `--age-dir` or `AI_MEMORY_CI_AGE_DIR`.
+copy now lives in `<pg-age-stack>/age-1.8.0/{share,lib}`. On the macos-fed node the
+"Configure enterprise-fed tier" step runs `scripts/ci/ensure-age-extension.py`
+before `CREATE EXTENSION`:
+
+- **Manifest.** It installs exactly five files, each pinned to a sha256 in the
+  script's `MANIFEST`: `age.dylib` (into `pg_config --pkglibdir`) and
+  `age.control`, `age--1.8.0.sql`, `age--1.7.0--1.8.0.sql`, `age--1.6.0--1.7.0.sql`
+  (into `pg_config --sharedir`/extension). Nothing else in the source directory
+  is read or copied. Rebuilding AGE means updating those pins in the same change.
+- **Health check.** AGE counts as present only when `pg_available_extensions`
+  lists `age` (that view reflects `age.control` alone) AND all five files are at
+  their destinations as regular files with the pinned hashes. A lost or stale
+  `age.dylib` or SQL file is therefore restored, not reported as healthy.
+- **Source validation.** Before any write, the source dir, `share/`, `lib/` and
+  each file must be real (no symlinks), owned by the runner's uid and not group-
+  or world-writable, and each file's bytes (read through an `O_NOFOLLOW` fd) must
+  match its pin. Any failure exits 2 with one `ensure-age-extension: ...` line and
+  writes nothing.
+- **Install.** `lib` is installed before `share`, so the control file never
+  appears ahead of its module. Each file goes through a per-process `mkstemp`
+  temp file, `fsync` and an atomic `os.replace`, so the three macos-fed runner
+  instances can restore concurrently. On a write error the temp file is removed;
+  if another runner has meanwhile made AGE healthy the run passes, otherwise the
+  files this run created are removed and it exits 1.
+- **Secrets.** The tier password goes to psql through `PGPASSWORD`; the URL on
+  psql's argv carries no password, and neither form is printed.
+
+It is a no-op when AGE is healthy. `--age-dir` exists for the unit tests only;
+CI always uses the default node path, and there is no environment override.
 Keep `postgresql@18` and `pgvector` brew-pinned on the node regardless.
 
 ### Self-hosted runners
