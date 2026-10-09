@@ -537,6 +537,128 @@ class LibCallerResolution6412(Base):
         self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['support']), ['a::tests::t'])
 
 
+class LibCallerTransitive6412(Base):
+    """#6412 r2 (review HIGH-1): resolution follows `use`, globs and re-exports transitively and fails closed."""
+
+    HELPER = LibCallerResolution6412.HELPER
+
+    @staticmethod
+    def with_tests(body, pre=''):
+        return '#[cfg(test)]\nmod tests {\n    %s\n    #[test]\n    fn t() { %s }\n}\n' % (pre, body)
+
+    def gate(self, files, prefixes=('support',)):
+        mods = ['support'] + sorted({k.split('/')[0].split('.')[0] for k in files})
+        fx('src/lib.rs', ''.join('mod %s;\n' % m for m in mods))
+        fx('src/support.rs', self.HELPER
+           + 'pub mod tests_support { pub fn pgurl() -> String { std::env::var("AI_MEMORY_TEST_POSTGRES_URL").unwrap() } }\n')
+        for k, v in files.items():
+            fx('src/' + k, v)
+        return pt.uncovered_lib_pg_modules(SCRATCH / 'src', list(prefixes))
+
+    def test_c1_super_glob_reaches_parents_plain_import_6412(self):
+        a = 'use crate::support::live_pg_url;\n' + self.with_tests('let _ = live_pg_url();', 'use super::*;')
+        self.assertEqual(self.gate({'a.rs': a}), ['a::tests::t'])
+
+    def test_c2_super_glob_reaches_parents_glob_import_6412(self):
+        a = 'use crate::support::*;\n' + self.with_tests('let _ = live_pg_url();', 'use super::*;')
+        self.assertEqual(self.gate({'a.rs': a}), ['a::tests::t'])
+
+    def test_c3_super_glob_reaches_parents_alias_6412(self):
+        a = 'use crate::support::live_pg_url as u;\n' + self.with_tests('let _ = u();', 'use super::*;')
+        self.assertEqual(self.gate({'a.rs': a}), ['a::tests::t'])
+
+    def test_r1_plain_use_of_a_reexport_6412(self):
+        files = {'a.rs': self.with_tests('let _ = live_pg_url();', 'use crate::re::live_pg_url;'),
+                 're.rs': 'pub(crate) use crate::support::live_pg_url;\n'}
+        self.assertEqual(self.gate(files), ['a::tests::t'])
+
+    def test_r2_glob_use_of_a_reexport_6412(self):
+        files = {'a.rs': self.with_tests('let _ = live_pg_url();', 'use crate::re::*;'),
+                 're.rs': 'pub use crate::support::live_pg_url;\n'}
+        self.assertEqual(self.gate(files), ['a::tests::t'])
+
+    def test_r3_plain_use_of_a_glob_reexport_6412(self):
+        files = {'a.rs': self.with_tests('let _ = live_pg_url();', 'use crate::re::live_pg_url;'),
+                 're.rs': 'pub use crate::support::*;\n'}
+        self.assertEqual(self.gate(files), ['a::tests::t'])
+
+    def test_k1_use_super_super_helper_from_a_child_file_module_6412(self):
+        files = {'a.rs': 'use crate::support::live_pg_url;\nmod b;\n',
+                 'a/b.rs': self.with_tests('let _ = live_pg_url();', 'use super::super::live_pg_url;')}
+        self.assertEqual(self.gate(files), ['a::b::tests::t'])
+
+    def test_reexport_cycle_terminates_and_stays_clean_6412(self):
+        files = {'a.rs': self.with_tests('let _ = live_pg_url();', 'use crate::re::*;'),
+                 're.rs': 'pub use crate::a::*;\n'}
+        self.assertEqual(self.gate(files), [])
+
+    def test_reexport_cycle_still_finds_the_helper_6412(self):
+        files = {'a.rs': 'pub use crate::re::*;\n' + self.with_tests('let _ = live_pg_url();', 'use crate::re::*;'),
+                 're.rs': 'pub use crate::a::*;\npub use crate::support::live_pg_url;\n'}
+        self.assertEqual(self.gate(files), ['a::tests::t'])
+
+    def test_unresolvable_in_crate_glob_is_fail_closed_6412(self):
+        files = {'a.rs': self.with_tests('let _ = live_pg_url();', 'use crate::Kind::*;')}
+        self.assertEqual(self.gate(files), ['a::tests::t'])
+
+    def test_external_glob_is_not_a_caller_6412(self):
+        files = {'a.rs': self.with_tests('let _ = live_pg_url();', 'use some_extern_crate::*;')}
+        self.assertEqual(self.gate(files), [])
+
+    # probe cases from the review that must stay green
+    def test_local_fn_shadows_a_glob_6412(self):
+        a = 'use crate::support::*;\nfn live_pg_url() -> u8 { 0 }\n' + self.with_tests('let _ = super::live_pg_url();')
+        self.assertEqual(self.gate({'a.rs': a}), [])
+
+    def test_local_fn_shadows_through_super_glob_6412(self):
+        a = ('use crate::support::*;\nfn live_pg_url() -> u8 { 0 }\n'
+             + self.with_tests('let _ = live_pg_url();', 'use super::*;'))
+        self.assertEqual(self.gate({'a.rs': a}), [])
+
+    def test_path_expression_without_use_6412(self):
+        a = self.with_tests('let _ = crate::support::live_pg_url();')
+        self.assertEqual(self.gate({'a.rs': a}), ['a::tests::t'])
+
+    def test_alias_inside_a_test_fn_6412(self):
+        a = self.with_tests('use crate::support::live_pg_url as u; let _ = u();')
+        self.assertEqual(self.gate({'a.rs': a}), ['a::tests::t'])
+
+    def test_nested_group_with_self_6412(self):
+        a = ('use crate::{support::{self, live_pg_url}};\n'
+             + self.with_tests('let _ = super::support::live_pg_url(); let _ = super::live_pg_url();'))
+        self.assertEqual(self.gate({'a.rs': a}), ['a::tests::t'])
+
+    def test_renamed_reexport_through_a_qualified_path_6412(self):
+        files = {'a.rs': self.with_tests('let _ = crate::re::pg();'),
+                 're.rs': 'pub use crate::support::live_pg_url as pg;\n'}
+        self.assertEqual(self.gate(files), ['a::tests::t'])
+
+    def test_renamed_reexport_then_plain_use_6412(self):
+        files = {'a.rs': self.with_tests('let _ = pg();', 'use crate::re::pg;'),
+                 're.rs': 'pub use crate::support::live_pg_url as pg;\n'}
+        self.assertEqual(self.gate(files), ['a::tests::t'])
+
+    def test_two_globs_one_offering_the_name_is_flagged_6412(self):
+        files = {'a.rs': self.with_tests('let _ = live_pg_url();', 'use crate::support::*; use crate::other::*;'),
+                 'other.rs': 'pub fn x() {}\n'}
+        self.assertEqual(self.gate(files), ['a::tests::t'])
+
+    def test_struct_literal_pass_by_name_6412(self):
+        a = ('use crate::support::live_pg_url;\nstruct C { f: fn() -> String }\n'
+             + self.with_tests('let _ = C { f: super::live_pg_url };'))
+        self.assertEqual(self.gate({'a.rs': a}), ['a::tests::t'])
+
+    def test_same_module_macro_flags_the_module_6412(self):
+        a = ('macro_rules! m { () => { crate::support::live_pg_url() } }\n'
+             + self.with_tests('let _ = m!();'))
+        self.assertIn('a', self.gate({'a.rs': a}))
+
+    def test_helper_defined_in_parent_module_is_flagged_6412(self):
+        a = ('fn h() -> String { crate::support::live_pg_url() }\n'
+             + self.with_tests('let _ = h();', 'use super::*;'))
+        self.assertEqual(self.gate({'a.rs': a}), ['a'])
+
+
 class DocEstimateTests6344B6(Base):
     def test_doc_tests_are_in_the_serial_estimate_6344(self):
         exes = pt.parse_build_json([artifact(['lib'], 'ai_memory', SCRATCH / 'src' / 'lib.rs', '/x/lib'),

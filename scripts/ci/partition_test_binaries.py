@@ -784,45 +784,118 @@ def collect_use_scopes(units):
     return scopes, spans
 
 
-def helper_hit(defmod, name, is_method, ref, here, qual, scopes):
+CRATE_ROOTS = ('crate', 'self', 'super')
+DEF_KINDS = ('fn', 'struct', 'enum', 'union', 'trait', 'type', 'const', 'static', 'mod')
+
+
+class ModuleFacts:
+    """Per-module `use` scopes, item definitions and the set of known module tuples of the lib."""
+
+    def __init__(self, units):
+        self.scopes, self.spans = collect_use_scopes(units)
+        self.defs = {}    # module tuple -> names of items defined directly in it
+        self.known = {()}  # module tuples that exist (file modules, inline mods and their prefixes)
+        for rf, modp in units:
+            parts = tuple(x for x in modp.split('::') if x)
+            self.known.update(parts[:i] for i in range(1, len(parts) + 1))
+            found = list(ITEM_RE.finditer(rf.shape))
+            for m, ctx in zip(found, rf.contexts([m.start() for m in found])):
+                if m.group(1) not in DEF_KINDS or any(kind != 'mod' for kind, _n, _t in ctx):
+                    continue  # impl items, fn-local items, macros: not module-level names
+                here = module_tuple(modp, ctx)
+                self.defs.setdefault(here, set()).add(m.group(2))
+                if m.group(1) == 'mod':
+                    self.known.add(here + (m.group(2),))
+
+    def modules(self, segs, here):
+        """(known module tuples ``segs`` can name from ``here``, whether the path is unresolvable in-crate).
+
+        Unresolvable means the path starts at the crate (or at a name this module imports) yet
+        reaches no known module (an enum, a type, a macro-made module): the caller then fails
+        closed instead of treating the name as a different item.
+        """
+        found = resolve_modules(segs, here, self.scopes) & self.known
+        if found:
+            return found, False
+        imported = {local for _s, local in self.scopes.get(here, UseScope()).items}
+        return set(), bool(segs) and (segs[0] in CRATE_ROOTS or segs[0] in imported)
+
+
+class HelperResolver:
+    """Whether a name, seen from a module, may denote one free-fn Postgres helper (fail closed)."""
+
+    def __init__(self, defmod, name, facts):
+        self.defmod, self.name, self.facts = defmod, name, facts
+
+    def offers(self, mod, ident, seen):
+        """Whether ``ident`` bound in module ``mod`` (defined, imported, glob-imported or re-exported) may be the helper."""
+        if (mod, ident) in seen:
+            return False  # cycle guard: the other branches of the search decide
+        seen.add((mod, ident))
+        if ident == self.name and mod == self.defmod:
+            return True
+        if ident in self.facts.defs.get(mod, ()):
+            return False  # a different item defined here shadows any glob
+        scope = self.facts.scopes.get(mod, UseScope())
+        explicit = [segs for segs, local in scope.items if local == ident]
+        if explicit:
+            return any(self.item_offers(segs, mod, seen) for segs in explicit)
+        return any(self.glob_offers(g, mod, ident, seen) for g in scope.globs)
+
+    def item_offers(self, segs, mod, seen):
+        if len(segs) < 2:
+            return False
+        mods, unresolved = self.facts.modules(segs[:-1], mod)
+        return unresolved or any(self.offers(q, segs[-1], seen) for q in sorted(mods))
+
+    def glob_offers(self, glob, mod, ident, seen):
+        mods, unresolved = self.facts.modules(glob, mod)
+        return unresolved or any(self.offers(q, ident, seen) for q in sorted(mods))
+
+    def hit(self, ref, here, qual):
+        """Whether ``ref`` (qualifier ``qual``) in module ``here`` names the helper."""
+        if not qual:
+            return self.offers(here, ref, set())
+        mods, unresolved = self.facts.modules(qual, here)
+        return unresolved or any(self.offers(q, ref, set()) for q in sorted(mods))
+
+
+def helper_hit(resolver, is_method, ref, here, qual):
     """Whether the reference ``ref`` (qualifier ``qual``) in module ``here`` names the helper."""
     if is_method:
-        return ref == name
-    if not qual:
-        if ref == name and here == defmod:
-            return True
-        scope = scopes.get(here, UseScope())
-        if any(local == ref and segs[-1] == name and defmod in resolve_modules(segs[:-1], here, scopes)
-               for segs, local in scope.items):
-            return True
-        return ref == name and any(defmod in resolve_modules(g, here, scopes) for g in scope.globs)
-    for q in resolve_modules(qual, here, scopes):
-        if ref == name and q == defmod:
-            return True
-        if any(local == ref and segs[-1] == name and defmod in resolve_modules(segs[:-1], q, scopes)
-               for segs, local in scopes.get(q, UseScope()).items):
-            return True
-    return False
+        return ref == resolver.name
+    return resolver.hit(ref, here, qual)
 
 
 def helper_callers(units, helpers, site_path):
-    """Sites that call or pass by name a Postgres helper, resolved by module path and `use` aliases.
+    """Sites that call of a Postgres helper, resolved by module path, `use` and globs.
 
-    Strings and comments are blanked (``shape`` view). A free-fn helper matches a bare name only
-    in its own module or through a ``use`` (plain, aliased or glob) that resolves to it, and a
-    qualified name only when the qualifier resolves to its module; a same-named fn or method
-    elsewhere does not match (#6412). A helper that is itself an impl/trait method has no path to
-    resolve, so any non-definition mention of its name counts (fail closed).
+    Strings and comments are blanked (``shape`` view). A free-fn helper matches a name only when
+    the name is defined, imported (plain, aliased, group), glob-imported or re-exported (``pub
+    use``) along a chain that reaches it, followed transitively with a cycle guard, so
+    ``mod tests { use super::*; }`` sees what its parent imports. A name the resolver cannot prove
+    is a different item counts as the helper (fail closed, the posture of the bare-name matcher
+    this replaced); only a same-module different definition, a method call, or a path that
+    provably leaves the crate is excluded (#6412). A helper that is itself an impl/trait method
+    has no path to resolve, so any non-definition mention of its name counts.
     """
-    scopes, spans = collect_use_scopes(units)
+    facts = ModuleFacts(units)
     names = {n for (_m, n) in helpers}
+    grew = True
+    while grew:  # every local name a chain of imports can give a helper (alias of an alias)
+        grew = False
+        for sc in facts.scopes.values():
+            for segs, local in sc.items:
+                if segs[-1] in names and local not in names:
+                    names.add(local)
+                    grew = True
+    resolvers = {key: HelperResolver(key[0], key[1], facts) for key in helpers}
+    pat = re.compile(r'\b(%s)\b' % '|'.join(map(re.escape, sorted(names))))
     out = []
     for rf, modp in units:
-        locals_ = {local for sc in scopes.values() for segs, local in sc.items if segs[-1] in names}
-        pat = re.compile(r'\b(%s)\b' % '|'.join(map(re.escape, sorted(names | locals_))))
         refs = []
         for m in pat.finditer(rf.shape):
-            if any(a <= m.start() < b for a, b in spans[rf.path]):
+            if any(a <= m.start() < b for a, b in facts.spans[rf.path]):
                 continue  # an import, not a reference
             before = rf.shape[max(0, m.start() - 256):m.start()]
             after = rf.shape[m.end():m.end() + 4]
@@ -837,11 +910,11 @@ def helper_callers(units, helpers, site_path):
         for (m, qual, dotted), ctx in zip(refs, rf.contexts([r[0].start() for r in refs])):
             here = module_tuple(modp, ctx)
             path, _ = site_path(modp, ctx)
-            for (defmod, name), (is_method, def_paths) in helpers.items():
+            for key, (is_method, def_paths) in helpers.items():
                 if dotted and not is_method:
                     continue  # `x.name()` is a method call, never the free fn
-                if path not in def_paths and helper_hit(defmod, name, is_method, m.group(1), here, qual, scopes):
-                    out.append((path, '%s:%d (calls %s)' % (rf.path, rf.code.count('\n', 0, m.start()) + 1, name)))
+                if path not in def_paths and helper_hit(resolvers[key], is_method, m.group(1), here, qual):
+                    out.append((path, '%s:%d (calls %s)' % (rf.path, rf.code.count('\n', 0, m.start()) + 1, key[1])))
     return out
 
 
