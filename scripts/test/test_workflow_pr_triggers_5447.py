@@ -3935,5 +3935,56 @@ class ApprovalJobPinned6261(unittest.TestCase):
                                      "      - name: Something else\n"))
 
 
+# ---- Round 4, item 4 (#6240 = sec S2, #6241): every workflow python step runs isolated ----
+
+GEOMETRY_WRAPPER = ROOT / "scripts" / "check-promotion-geometry.sh"
+# `python3 path/to/script.py ...` without -I puts the script's directory first on sys.path (#5163).
+BARE_PYTHON_SCRIPT_RE = re.compile(r"python3\s+(?!-)[^\s\"'$|;&]*\.py\b")
+
+
+def _bare_python_script_runs(texts: Dict[str, str]) -> List[str]:
+    found: List[str] = []
+    for name, text in texts.items():
+        for lineno, row in enumerate(text.splitlines(), 1):
+            if row.lstrip().startswith("#"):
+                continue
+            for m in BARE_PYTHON_SCRIPT_RE.finditer(row):
+                found.append(f"{name}:{lineno}: {m.group(0)}")
+    return found
+
+
+class WrapperAndWorkflowPythonIsolated6240(unittest.TestCase):
+    """#6240 (the geometry wrapper) and #6241 (every other workflow python script step)."""
+
+    def test_6240_geometry_wrapper_runs_python_isolated(self) -> None:
+        text = GEOMETRY_WRAPPER.read_text(encoding="utf-8")
+        self.assertRegex(text, r'(?m)^exec python3 -I "\$SCRIPT_DIR/check_promotion_geometry\.py" "\$@"$')
+
+    def test_6240_m01_wrapper_without_isolation_is_killed(self) -> None:
+        text = GEOMETRY_WRAPPER.read_text(encoding="utf-8")
+        mutant = text.replace("python3 -I ", "python3 ")
+        self.assertNotEqual(text, mutant)
+        self.assertNotRegex(mutant, r'(?m)^exec python3 -I "\$SCRIPT_DIR/check_promotion_geometry\.py" "\$@"$')
+
+    def test_6240_wrapper_still_runs_the_geometry_script(self) -> None:
+        out = subprocess.run(["bash", str(GEOMETRY_WRAPPER), "--print-release"], capture_output=True,
+                             text=True, timeout=60, check=False)
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        self.assertEqual("release/v1.0.0", out.stdout.strip())
+
+    def test_6241_no_workflow_runs_a_python_script_without_isolation(self) -> None:
+        self.assertEqual([], _bare_python_script_runs(_all_workflow_texts()))
+
+    def test_6241_m01_a_bare_script_run_in_any_workflow_is_killed(self) -> None:
+        texts = _all_workflow_texts()
+        texts["new.yml"] = "jobs:\n  x:\n    steps:\n      - run: python3 scripts/check-x.py --self-test\n"
+        mine = [f for f in _bare_python_script_runs(texts) if f.startswith("new.yml:")]
+        self.assertEqual(["new.yml:4: python3 scripts/check-x.py"], mine)
+        texts = _all_workflow_texts()
+        self.assertIn("python3 -I scripts/", texts["ci.yml"])
+        texts["ci.yml"] = texts["ci.yml"].replace("python3 -I scripts/", "python3 scripts/", 1)
+        self.assertTrue(any(f.startswith("ci.yml:") for f in _bare_python_script_runs(texts)))
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
