@@ -66,10 +66,18 @@ python3 -I scripts/check_carrier_ruleset_live.py --require-full-view
   rule names that carrier exactly, does not exclude it, and shows
   `bypass_actors: []`. For every other carrier it reads
   `.github/workflows/c8-precheck.yml` at the tip and fails unless both #6143
-  jobs are defined there. Any carrier it cannot read is RED.
-- Expected after the `POST`: rc 1, `carrier ruleset is live and matches; flip
-  carrier-ruleset-state.json to "applied"`. The promotion (step 3 below)
-  flips the state and promotes the verifier job.
+  jobs are defined there and the workflow triggers on `pull_request` for that
+  carrier's base (`on.pull_request.branches` covers `chain/**` or
+  `rehearsal/**`); a tip that defines the jobs but does not trigger would never
+  report the required context. Any carrier it cannot read is RED. It checks the
+  jobs, the trigger and, in the `applied` state, the release tip (step 3
+  precondition); it does not compare the tip's payload or declaration files.
+- Expected after the `POST`: rc 1, `carrier ruleset <id> ('<name>') is live and
+  matches; flip carrier-ruleset-state.json to "applied"`. The promotion (step 3
+  below) flips the state and promotes the verifier job.
+- The ruleset `<id>` for the later `PUT` is the `id` field of the POST
+  response, and the same id is printed in the verifier's flip line (and in its
+  `OK: carrier ruleset <id> ...` line once the state is `applied`).
 
 Effects to expect once the ruleset is live:
 
@@ -136,19 +144,37 @@ The state is coupled to the promotion of the verifier's own context,
 2. ai:god-f2 runs `--pre-apply` (rc 0 required), applies the payload (`POST`,
    command above) and runs the verifier with `--require-full-view`. The
    expected result is rc 1 with "flip".
-3. Promotion. Update the ruleset first, then merge:
+3. Promotion. Update the ruleset first, then merge.
+
+   Precondition: `release/v1.0.0` defines `carrier-ruleset-live-gate` (and its
+   workflow triggers on `pull_request` for that base). The #3554 lockstep below
+   makes the verifier a required context on `release/v1.0.0` classic
+   protection. Until the release tip carries the job, every open pull request
+   into `release/v1.0.0` whose head is not a carrier (for example #5391, #5053
+   and #5044) would never report it and could not merge. The job reaches
+   `release/v1.0.0` when the carrier carrying this change merges into it
+   (today #6160). Do not touch the release protection before that.
+   `--pre-apply` enforces this: in the `applied` state it also reads
+   `.github/workflows/c8-precheck.yml` at the `release/v1.0.0` tip and is RED
+   unless the verifier job is defined there and the workflow triggers on it.
+
    1. Prepare the promotion pull request on top of step 1, in one commit:
       - set the state in `carrier-ruleset-state.json` to `applied`;
-      - take the verifier context through the #3554 lockstep: release/v1.0.0
-        protection, `bash scripts/check-required-contexts-live.sh --pin-from-live`,
-        then `required-contexts-release.txt`;
+      - take the verifier context through the #3554 lockstep, after the
+        precondition above and a `--pre-apply` rc 0 with the promoted state:
+        add it to the release/v1.0.0 protection, then
+        `bash scripts/check-required-contexts-live.sh --pin-from-live`, then
+        `required-contexts-release.txt`;
       - add the context to `required-contexts-carrier.txt` and to the payload;
       - remove the `carrier-ruleset-live-gate` ledger line.
 
       The verifier refuses any partial version of this commit.
-   2. ai:god-f2 runs `--pre-apply` again, then updates the live ruleset from
-      the promotion pull request's payload:
-      `gh api -X PUT repos/alphaonedev/ai-memory-mcp/rulesets/<id> --input docs/ci/carrier-ruleset.json`.
+   2. ai:god-f2 runs `--pre-apply` again (with the promoted state, so the
+      release tip is read), then updates the live ruleset from the promotion
+      pull request's payload:
+      `gh api -X PUT repos/alphaonedev/ai-memory-mcp/rulesets/<id> --input docs/ci/carrier-ruleset.json`,
+      where `<id>` is the `id` field of the POST response or the id in the
+      verifier's flip line.
    3. Re-run the promotion pull request's checks. Its verifier is now green
       (`OK`), and it merges.
 
