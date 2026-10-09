@@ -103,6 +103,15 @@ class PackagingContract(unittest.TestCase):
         backup = self._unit_lines('ai-memory-backup')
         self.assertIn(f'ReadOnlyPaths=-{state_dir}/.config', backup,
                       'the backup unit must grant the key store read-only')
+        # #6230 — the `-` lets hosts without the directory still run, so the
+        # manual install recipe must create `.config` as the unit's own User=
+        # (never root) before the backup timer is enabled.
+        owner = next(line for line in backup if line.startswith('User=')).split('=', 1)[1]
+        readme = (ROOT / 'packaging/systemd/README.md').read_text()
+        recipe = f'sudo install -d -o {owner} -g {owner} -m 0700 {state_dir}/.config'
+        self.assertIn(recipe, readme, 'README must create the key-store parent as the service user')
+        self.assertLess(readme.index(recipe), readme.index('systemctl enable --now ai-memory-backup.timer'),
+                        'the key-store parent must exist before the backup timer is enabled')
 
     def test_companions_restart_with_the_primary(self):
         # #4326 — curator and sync open the live database through the
