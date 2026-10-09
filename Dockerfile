@@ -78,6 +78,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 COPY --from=builder /build/target/release/ai-memory /usr/local/bin/ai-memory
 
+# #4752 — the strict exact-set assert runs AGAIN in the runtime stage on the
+# SHIPPED path, with the same declaration and asserter the builder used (copied
+# from the builder stage, never from the build context), so the file this image
+# executes is proven to be a binary that passed the assert and that runs on this
+# base image (the glibc-mismatch class of PR #465). The guard
+# (scripts/check_release_features.py) pins this COPY + RUN right after the
+# binary COPY and refuses any COPY / ADD / RUN after it.
+COPY --from=builder /build/scripts/release-features.sh /build/scripts/assert-compiled-features.sh /opt/ai-memory/release-check/
+RUN set -eu; REQUIRE_FLAGS="$(bash /opt/ai-memory/release-check/release-features.sh --require-flags)"; test -n "$REQUIRE_FLAGS"; bash /opt/ai-memory/release-check/assert-compiled-features.sh /usr/local/bin/ai-memory --strict $REQUIRE_FLAGS
+
 ENV AI_MEMORY_DB=/data/ai-memory.db
 
 VOLUME /data
