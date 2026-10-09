@@ -1722,6 +1722,10 @@ mod tests {
         summary_response: String,
         /// If `true`, every `POST /api/chat` returns HTTP 500.
         chat_returns_error: bool,
+        /// #4287 — called with `(path, body)` on every LLM POST before the
+        /// response is written, so a test can commit a concurrent edit
+        /// inside the curator's LLM window.
+        on_llm_call: Option<StdArc<dyn Fn(&str, &str) + Send + Sync>>,
     }
 
     impl Default for FakeOllamaCfg {
@@ -1731,6 +1735,7 @@ mod tests {
                 contradiction_answer: "no".to_string(),
                 summary_response: "consolidated summary".to_string(),
                 chat_returns_error: false,
+                on_llm_call: None,
             }
         }
     }
@@ -1834,6 +1839,11 @@ mod tests {
             let _ = reader.read_exact(&mut body);
         }
         let body_str = String::from_utf8_lossy(&body).to_string();
+        if method == "POST"
+            && let Some(hook) = &cfg.on_llm_call
+        {
+            hook(path, &body_str);
+        }
 
         let (status, body): (&str, String) = if method == "GET" && path == "/api/tags" {
             // is_available + ensure_model probe — return a non-empty model list.
@@ -2180,6 +2190,152 @@ mod tests {
         };
         let report = run_once(&conn, Some(&llm), &cfg, None).unwrap();
         assert!(report.contradictions_found >= 1, "report: {report:?}");
+    }
+
+    /// #4287 — commit an operator metadata edit (`operator_note`) to every
+    /// row in `ns` from a second connection, re-reading each row first.
+    fn concurrent_metadata_edit(db_path: &std::path::Path, ns: &str) {
+        let conn = db::open(db_path).expect("second connection");
+        let rows = db::list(
+            &conn,
+            Some(ns),
+            None,
+            16,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("list");
+        for row in rows {
+            let mut meta = row.metadata.clone();
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("operator_note".to_string(), serde_json::json!("kept"));
+            }
+            db::update(
+                &conn,
+                &row.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&meta),
+            )
+            .expect("concurrent metadata edit commits");
+        }
+    }
+
+    fn assert_operator_note_kept(conn: &Connection, ids: &[&str]) {
+        for id in ids {
+            let row = db::get(conn, id).unwrap().unwrap();
+            assert_eq!(
+                row.metadata.get("operator_note"),
+                Some(&serde_json::json!("kept")),
+                "a metadata edit committed during the curator's LLM call was lost on {id}: {}",
+                row.metadata
+            );
+        }
+    }
+
+    /// #4287 — `persist_auto_tags` wrote back the sweep-start metadata
+    /// snapshot without a version check, so an edit committed while
+    /// `auto_tag` ran was silently replaced. The edit must survive alongside
+    /// `auto_tags`.
+    #[test]
+    fn run_once_auto_tag_keeps_concurrent_metadata_edit_4287() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let edits = StdArc::new(AtomicUsize::new(0));
+        let edits_in_hook = StdArc::clone(&edits);
+        let cfg_server = FakeOllamaCfg {
+            // `auto_tag` is a `/api/chat` call whose prompt asks for tags (the
+            // same routing the fake server's responder uses).
+            on_llm_call: Some(StdArc::new(move |_route: &str, body: &str| {
+                if body.contains("tags") && !body.contains("contradict") {
+                    concurrent_metadata_edit(&path, "cas-4287-tag");
+                    edits_in_hook.fetch_add(1, StdOrdering::SeqCst);
+                }
+            })),
+            ..FakeOllamaCfg::default()
+        };
+        let server = FakeOllama::start(cfg_server);
+        let llm = ollama_for(&server);
+        let conn = db::open(tmp.path()).unwrap();
+        let mem = make_eligible_memory("cas-4287-tag", "anchor");
+        db::insert(&conn, &mem).unwrap();
+        let cfg = CuratorConfig {
+            include_namespaces: vec!["cas-4287-tag".to_string()],
+            ..CuratorConfig::default()
+        };
+        let report = run_once(&conn, Some(&llm), &cfg, None).unwrap();
+
+        assert!(report.auto_tagged >= 1, "report: {report:?}");
+        assert!(
+            edits.load(StdOrdering::SeqCst) >= 1,
+            "the concurrent edit must run inside the auto_tag call"
+        );
+        assert_operator_note_kept(&conn, &[&mem.id]);
+        let row = db::get(&conn, &mem.id).unwrap().unwrap();
+        assert!(
+            row.metadata.get("auto_tags").is_some(),
+            "the curator's own key still lands: {}",
+            row.metadata
+        );
+    }
+
+    /// #4287 — the contradiction arm: an edit committed while
+    /// `detect_contradiction` ran must survive `persist_contradiction`.
+    #[test]
+    fn run_once_contradiction_keeps_concurrent_metadata_edit_4287() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let edits = StdArc::new(AtomicUsize::new(0));
+        let edits_in_hook = StdArc::clone(&edits);
+        let cfg_server = FakeOllamaCfg {
+            contradiction_answer: "yes".to_string(),
+            on_llm_call: Some(StdArc::new(move |_route: &str, body: &str| {
+                if body.contains("contradict") {
+                    concurrent_metadata_edit(&path, "cas-4287-con");
+                    edits_in_hook.fetch_add(1, StdOrdering::SeqCst);
+                }
+            })),
+            ..FakeOllamaCfg::default()
+        };
+        let server = FakeOllama::start(cfg_server);
+        let llm = ollama_for(&server);
+        let conn = db::open(tmp.path()).unwrap();
+        let m1 = make_eligible_memory("cas-4287-con", "first");
+        let m2 = make_eligible_memory("cas-4287-con", "second");
+        db::insert(&conn, &m1).unwrap();
+        db::insert(&conn, &m2).unwrap();
+        let cfg = CuratorConfig {
+            include_namespaces: vec!["cas-4287-con".to_string()],
+            ..CuratorConfig::default()
+        };
+        let report = run_once(&conn, Some(&llm), &cfg, None).unwrap();
+
+        assert!(report.contradictions_found >= 1, "report: {report:?}");
+        assert!(
+            edits.load(StdOrdering::SeqCst) >= 1,
+            "the concurrent edit must run inside the contradiction call"
+        );
+        assert_operator_note_kept(&conn, &[&m1.id, &m2.id]);
+        let flagged = [&m1.id, &m2.id].iter().any(|id| {
+            db::get(&conn, id)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .get(crate::models::field_names::CONFIRMED_CONTRADICTIONS)
+                .is_some()
+        });
+        assert!(flagged, "the curator's own key still lands");
     }
 
     /// When the LLM returns HTTP 500 errors, `run_once` records the
