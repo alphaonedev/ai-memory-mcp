@@ -14,7 +14,10 @@ Rule: every ``check-*.sh`` / ``check_*.py`` script name in a
 bounded by non-name characters: in or out of backticks, in a fenced block, after
 a command (``bash scripts/...``) or a path (``./scripts/...``, a URL), after
 invisible characters (category Cf and every Default_Ignorable_Code_Point) are removed
-from document lines (#6195).
+from document lines (#6195). Each line is also scanned as a reader sees it after
+rendering (#6214): escapes, entities, inline tags and comments, emphasis markers, dash
+variants, combining marks and look-alike letters folded, so a backslash-escaped
+hyphen, ``check&#45;x.sh`` or a Cyrillic look-alike letter cannot hide a name.
 The path is the part after the first ``scripts`` component of the written path,
 else the bare name: ``scripts/sub/check-x.sh`` names that file, never a
 same-named file elsewhere, and a symlink counts only when it resolves inside
@@ -62,6 +65,7 @@ allowlist.
 
 import argparse
 import contextlib
+import html
 import io
 import os
 import re
@@ -78,6 +82,27 @@ TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_.-])(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(
 PATH_CHARS = frozenset(string.ascii_letters + string.digits + "_./-")
 SUCCESSOR_RE = re.compile(r"`scripts/([A-Za-z0-9_./-]+\.(?:sh|py))`")
 ALLOW_REL = "scripts/qc-allowlists/compliance-script-names-allow.txt"
+# Rendering folds for stale-name detection (#6214): inline HTML tags and comments, Markdown
+# backslash escapes, dash variants, and letters that render like ASCII (a small explicit table:
+# the Cyrillic, Greek and Armenian look-alikes of the letters a script name can use).
+INLINE_TAG_RE = re.compile(r"<[^<>]*>")
+ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
+DASHES = frozenset("\u02d7\u2043\u2212\u2796\ufe63\uff0d")
+LOOKALIKES = str.maketrans(
+    {
+        "\u0430": "a", "\u0410": "A", "\u0412": "B", "\u0441": "c", "\u0421": "C", "\u0501": "d",
+        "\u0435": "e", "\u0415": "E", "\u04bb": "h", "\u041d": "H", "\u0456": "i", "\u0406": "I",
+        "\u0458": "j", "\u0408": "J", "\u043a": "k", "\u041a": "K", "\u04cf": "l", "\u041c": "M",
+        "\u043e": "o", "\u041e": "O", "\u0440": "p", "\u0420": "P", "\u051b": "q", "\u051a": "Q",
+        "\u0455": "s", "\u0405": "S", "\u0422": "T", "\u051d": "w", "\u051c": "W", "\u0445": "x",
+        "\u0425": "X", "\u0443": "y", "\u0423": "Y",
+        "\u03b1": "a", "\u0391": "A", "\u0392": "B", "\u0395": "E", "\u0397": "H", "\u03b9": "i",
+        "\u0399": "I", "\u03ba": "k", "\u039a": "K", "\u039c": "M", "\u039d": "N", "\u03bd": "v",
+        "\u03bf": "o", "\u039f": "O", "\u03c1": "p", "\u03a1": "P", "\u03a4": "T", "\u03c5": "u",
+        "\u03a5": "Y", "\u03c7": "x", "\u03a7": "X", "\u0396": "Z",
+        "\u0131": "i", "\u0237": "j", "\u0251": "a", "\u0261": "g", "\u0585": "o", "\u057d": "u",
+    }
+)
 # A CommonMark fence line: up to three spaces, then three or more backticks or tildes (#6215).
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 # Fence info strings GitHub renders as a diagram or figure, never as text: the body (mermaid
@@ -154,6 +179,23 @@ def doc_lines(root, path):
     """
     text = read_text(root, path)
     return "".join(c for c in text if not invisible(c)).splitlines()
+
+
+def rendered(line):
+    """``line`` as a reader sees it, folded for stale-name detection only (#6214).
+
+    Inline tags and comments removed, entities decoded, backslash escapes dropped, NFKC
+    (fullwidth and other compatibility forms), every dash folded to ``-``, combining and
+    invisible marks removed, look-alike letters mapped to ASCII, emphasis and strikethrough
+    markers (``*``, ``~``) dropped. Its tokens are scanned in addition to the line's own, so
+    this can only add findings; errata are still read from the unfolded visible text.
+    """
+    s = ESCAPE_RE.sub(r"\1", html.unescape(INLINE_TAG_RE.sub("", line)))
+    s = unicodedata.normalize("NFKC", s)
+    s = "".join("-" if c in DASHES or unicodedata.category(c) == "Pd" else c for c in s)
+    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) not in ("Mn", "Me"))
+    s = "".join(c for c in s if not invisible(c)).translate(LOOKALIKES)
+    return s.replace("*", "").replace("~", "")
 
 
 def tokens(line):
@@ -392,7 +434,9 @@ def check(root):
     for doc, lines in lines_by_doc:
         rel = doc.relative_to(root).as_posix()
         for lineno, line in enumerate(lines, 1):
-            for cited, base, path in tokens(line):
+            found = list(tokens(line))
+            found += [t for t in tokens(rendered(line)) if t not in found]
+            for cited, base, path in found:
                 if successor_ok(root, path):
                     continue
                 pinned = allowed.get((rel, base))
