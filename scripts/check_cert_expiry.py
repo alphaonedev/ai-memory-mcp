@@ -787,6 +787,18 @@ class SelfTest:
         return text
 
 
+class FailureRecorder:
+    """Stand-in for SelfTest that records failures instead of printing them,
+    so a cell can assert that a helper reports exactly one named failure
+    without polluting the real self-test output (#6380)."""
+
+    def __init__(self):
+        self.messages = []
+
+    def fail(self, msg, out=None):
+        self.messages.append(msg)
+
+
 GIT_SHIM = """#!{python}
 import os, sys
 real, argv = {real!r}, sys.argv[1:]
@@ -1281,6 +1293,23 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             t.fail(f"(shim-pathsep): refused for the wrong reason: {exc}")
     else:
         t.fail("(shim-pathsep): a scratch path containing the PATH separator was not refused")
+    # #6380: the call-site wrapper turns a refused shim into exactly one named
+    # self-test failure (it must neither swallow the error nor fabricate a verdict).
+    wrapper = globals().get("shimmed_cell")
+    if wrapper is None:
+        t.fail("(shim-pathsep): there is no module-level shimmed_cell wrapper, so the "
+               "call-site conversion of a refused shim into a named failure is unpinned (#6380)")
+    else:
+        rec = FailureRecorder()
+        res = wrapper(rec, "shim-pathsep", sep_dir, repo, env7, version="git version 2.29.9")
+        if res is not None:
+            t.fail(f"(shim-pathsep): shimmed_cell returned a gate verdict for a refused shim: {res!r}")
+        if len(rec.messages) != 1:
+            t.fail(f"(shim-pathsep): shimmed_cell recorded {len(rec.messages)} failures for a "
+                   f"refused shim, wanted exactly one: {rec.messages!r}")
+        elif ("(shim-pathsep): the git shim could not be installed" not in rec.messages[0]
+              or "PATH separator" not in rec.messages[0]):
+            t.fail(f"(shim-pathsep): the named failure is wrong: {rec.messages[0]!r}")
     # Each of the next two cells is rejected by exactly one predicate.
     t.gate("pr7-second", "a two-parent merge whose second parent is an unrelated branch, not "
            "PR_HEAD_SHA", repo, dict(env7, GITHUB_SHA=unrel7), "is not PR_HEAD_SHA")
