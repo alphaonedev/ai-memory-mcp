@@ -430,11 +430,22 @@ class LibGateFollowUps6344R2(Base):
                    '#[derive(Debug)]', '#[serial]', '#[ignore]'):
             self.assertFalse(pt.TEST_ATTR_RE.search(no), no)
         fx('src/m.rs',
-           '#[cfg(test)]\nfn pg_url() -> String { std::env::var("AI_MEMORY_TEST_POSTGRES_URL").unwrap() }\n'
-           '#[cfg(test)]\nmod t {\n    #[test]\n    fn uses() { let _ = super::pg_url(); }\n}\n')
+           '#[cfg(test)]\nfn pg_url() -> String { std::env::var("AI_MEMORY_TEST_POSTGRES_URL").unwrap() }\n')
         # the helper is not a test fn: a prefix naming it must not "cover" it
         self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['m::pg_url']), ['m'])
         self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['m']), [])
+
+    def test_caller_of_a_cross_module_pg_helper_counts_as_postgres_6344_f2(self):
+        fx('src/lib.rs', 'mod support;\nmod a;\n')
+        fx('src/support.rs',
+           'pub(crate) fn live_pg_url() -> String { std::env::var("AI_MEMORY_TEST_POSTGRES_URL").unwrap() }\n')
+        fx('src/a.rs',
+           '#[cfg(test)]\nmod tests {\n    #[test]\n    fn talks_to_pg() { let _ = crate::support::live_pg_url(); }\n'
+           '    #[test]\n    fn pure() { assert_eq!(1, 1); }\n}\n')
+        got = pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['support'])
+        self.assertEqual(got, ['a::tests::talks_to_pg'])
+        self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['support', 'a::tests::talks_to_pg']), [])
+        self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['support', 'a']), [])
 
 
 class DocEstimateTests6344B6(Base):

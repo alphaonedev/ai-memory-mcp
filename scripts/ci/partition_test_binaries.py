@@ -151,6 +151,7 @@ TEST_ATTR_RE = re.compile(r'#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*(?:test|
 ITEM_RE = re.compile(
     r'\b(?:(fn|struct|enum|union|trait|type|const|static|mod)\s+(?:mut\s+)?(?:r#)?([A-Za-z_][A-Za-z0-9_]*)'
     r'|(macro_rules!)\s*([A-Za-z_][A-Za-z0-9_]*)|(impl)\b)')
+FN_BEFORE_RE = re.compile(r'\bfn\s+$')  # the name is being defined here, not called
 PG_TOKEN = 'AI_MEMORY_TEST_POSTGRES_URL'
 PG_TOKEN_RE = re.compile(r'\bAI_MEMORY_TEST_POSTGRES_URL\b')
 PG_CONST_RE = re.compile(
@@ -683,6 +684,20 @@ def lib_pg_sites(src_root):
         consts.update(m.group(1) for m in PG_CONST_RE.finditer(rf.code))
     const_re = re.compile(r'\b(%s)\b' % '|'.join(map(re.escape, sorted(consts)))) if consts else None
     out = []
+    helpers = {}  # fn name -> where a non-test fn names the URL (callers in other modules count too, r2 F2)
+
+    def site_path(modp, ctx):
+        parts = [modp] if modp else []
+        test_fn = None
+        for kind, name, is_test in ctx:
+            if kind == 'mod' and test_fn is None:
+                parts.append(name)
+            elif kind == 'fn' and is_test and test_fn is None:
+                test_fn = name
+        if test_fn:
+            parts.append(test_fn)
+        return '::'.join(parts), test_fn
+
     for rf, modp in units:
         pos = [m.start() for m in PG_TOKEN_RE.finditer(rf.code)]
         if const_re is not None:
@@ -690,17 +705,24 @@ def lib_pg_sites(src_root):
         if not pos:
             continue
         for at, ctx in zip(pos, rf.contexts(pos)):
-            parts = [modp] if modp else []
-            test_fn = None
-            for kind, name, is_test in ctx:
-                if kind == 'mod' and test_fn is None:
-                    parts.append(name)
-                elif kind == 'fn' and is_test and test_fn is None:
-                    test_fn = name
-            if test_fn:
-                parts.append(test_fn)
+            path, test_fn = site_path(modp, ctx)
+            if test_fn is None:
+                fns = [name for kind, name, _ in ctx if kind == 'fn']
+                if fns:  # innermost enclosing fn: a helper any other test may call
+                    helpers.setdefault(fns[-1], set()).add(path)
             line = rf.code.count('\n', 0, at) + 1
-            out.append(('::'.join(parts), '%s:%d' % (rf.path, line)))
+            out.append((path, '%s:%d' % (rf.path, line)))
+    if helpers:
+        call_re = re.compile(r'\b(%s)\s*\(' % '|'.join(map(re.escape, sorted(helpers))))
+        for rf, modp in units:
+            calls = [m for m in call_re.finditer(rf.code) if not FN_BEFORE_RE.search(rf.code[max(0, m.start() - 16):m.start()])]
+            if not calls:
+                continue
+            for m, ctx in zip(calls, rf.contexts([m.start() for m in calls])):
+                path, _ = site_path(modp, ctx)
+                if path not in helpers[m.group(1)]:
+                    line = rf.code.count('\n', 0, m.start()) + 1
+                    out.append((path, '%s:%d (calls %s)' % (rf.path, line, m.group(1))))
     return out
 
 
