@@ -102,8 +102,10 @@ the pull request's own copy of this script and of its workflow job. The
 out only the BASE commit and runs this (base) copy with
   --trusted --base-ref NAME --head-sha SHA --merge-ref REF [--base-sha SHA]
           [--pr-number N]
-after fetching the head as objects. Trusted mode:
-  * with --pr-number, fetches refs/pull/N/merge into --merge-ref (a
+and no workflow step fetches pull request content (#6163 precedent). Trusted mode:
+  * with --pr-number (strictly `[1-9][0-9]{0,9}`, checked before any git
+    call), fetches refs/pull/N/head into refs/remotes/pull/head and
+    refs/pull/N/merge into --merge-ref (a
     refs/remotes/ ref) itself and, while that merge ref is missing or its
     second parent is not the head, fetches it again after each of the fixed
     MERGE_REF_SLEEPS; after the last attempt it fails closed with an
@@ -986,7 +988,10 @@ def resolve_merge_ref(repo, ref):
 # then fails closed with an ::error annotation. A stale merge commit is never
 # judged: it could only produce a false RED, never a false GREEN.
 MERGE_REF_SLEEPS = (5, 10, 20, 30)
-PR_NUMBER_RE = re.compile(r"[1-9][0-9]{0,9}")
+PR_NUMBER_RE = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
+# #6163 precedent: no workflow step fetches pull request content; with
+# --pr-number this base copy fetches the head as git objects into this ref.
+HEAD_FETCH_REF = "refs/remotes/pull/head"
 _sleep = time.sleep  # self-test seam: the cells record the backoff instead of sleeping
 
 
@@ -1007,14 +1012,22 @@ def _merge_ref_state(repo, merge_ref, head):
 
 
 def fetch_merge_ref(repo, pr_number, merge_ref, head):
-    """Fetch refs/pull/<PR>/merge into MERGE_REF until it is current for HEAD,
-    with the fixed MERGE_REF_SLEEPS backoff. Raises GateError after the last
-    attempt (fail-closed)."""
+    """Fetch refs/pull/<PR>/head into HEAD_FETCH_REF once and refs/pull/<PR>/merge
+    into MERGE_REF until it is current for HEAD, with the fixed
+    MERGE_REF_SLEEPS backoff (objects only, nothing checked out; a fixed
+    argument list, never a shell). PR_NUMBER is validated before any git call.
+    Raises GateError on a failed head fetch and after the last merge attempt
+    (fail-closed)."""
     if not PR_NUMBER_RE.fullmatch(pr_number):
         raise GateError(f"--pr-number {pr_number!r} is not a decimal pull request number (fail-closed)")
     if not (MERGE_REF_RE.fullmatch(merge_ref) and ".." not in merge_ref):
         raise GateError(f"--merge-ref {merge_ref!r} must be a refs/remotes/ ref when --pr-number is given "
                         "(the gate fetches into it; fail-closed)")
+    proc = run_git(repo, "fetch", "--no-tags", "--no-recurse-submodules", "--quiet", "--end-of-options",
+                   "origin", f"+refs/pull/{pr_number}/head:{HEAD_FETCH_REF}")
+    if proc.returncode != 0:
+        err = log_safe(proc.stderr.decode("utf-8", "replace").strip())
+        raise GateError(f"git fetch of refs/pull/{pr_number}/head exited {proc.returncode}: {err} (fail-closed)")
     attempts = len(MERGE_REF_SLEEPS) + 1
     reason = "missing"
     for attempt in range(attempts):

@@ -12,11 +12,14 @@
 # WHAT IT DOES. pull_request_target runs the workflow FILE OF THE BASE BRANCH
 # with the BASE checkout (the shape of claude-md-rule-compare.yml, #4507, #5163).
 # The pull request head and its merge commit are fetched as git objects only:
-# they are never checked out, imported or executed. The gate fetches the merge
-# ref itself (--pr-number, #6176): pull_request_target does not wait for GitHub
-# to build the test merge, so a stale or missing refs/pull/N/merge is fetched
-# again a fixed number of times with fixed sleeps (5, 10, 20, 30 s) and then
-# fails closed with an ::error (a conflicted pull request has no merge ref). The BASE copy of
+# they are never checked out, imported or executed. No workflow step fetches
+# them: the base copy of the gate does, from a strictly validated decimal
+# --pr-number passed through env (the #6163 shape that closes the CodeQL
+# untrusted-checkout alert class). It also re-fetches the merge ref (#6176):
+# pull_request_target does not wait for GitHub to build the test merge, so a
+# stale or missing refs/pull/N/merge is fetched again a fixed number of times
+# with fixed sleeps (5, 10, 20, 30 s) and then fails closed with an ::error (a
+# conflicted pull request has no merge ref). The BASE copy of
 # scripts/check_cert_expiry.py runs with `python3 -I` in --trusted mode and
 # judges the merge commit purely through git object reads (diff, cat-file,
 # grep over trees): the same section 7 rules and the same merge-parent checks as
@@ -87,10 +90,6 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Fetch the pull request head as git objects (data, never checked out)
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"
       - name: Cert-expiry gate self-test (base code)
         run: python3 -I scripts/check_cert_expiry.py --self-test
       - name: Judge the merge commit with the base copy of the gate
