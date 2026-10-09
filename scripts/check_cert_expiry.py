@@ -1394,22 +1394,26 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
          for k in ("PR_HEAD_SHA", "GITHUB_SHA", "PR_BASE_SHA")]
         + [("push", k, push_sha_env) for k in ("GITHUB_EVENT_BEFORE", "GITHUB_SHA")]
     )
-    for n in (63, 65):
+    # The third value is a 40-character run of ASCII-lookalike Unicode decimal digits (Arabic-Indic one):
+    # loosening any of the five validation sites to accept any Unicode digit lets it through.
+    sha_len_values = (("63-hex", "b" * 63), ("65-hex", "b" * 65),
+                      ("40 Arabic-Indic digit", "\u0661" * 40))
+    for label, sha_val in sha_len_values:
         for lane, key, lane_env in sha_len_cells:
-            trace = Path(tmp) / f"git-trace-{lane}-{key}-{n}.jsonl"
+            trace = Path(tmp) / f"git-trace-{lane}-{key}-{len(sha_val)}-{ord(sha_val[0])}.jsonl"
             trace.unlink(missing_ok=True)
-            rc, out, err = run_gate_shimmed(tmp, repo, dict(lane_env, **{key: "b" * n}),
+            rc, out, err = run_gate_shimmed(tmp, repo, dict(lane_env, **{key: sha_val}),
                                             fail="rev-parse", trace=trace)
             text = out + err
             calls = ([json.loads(ln) for ln in trace.read_text(encoding="utf-8").splitlines()]
                      if trace.exists() else [])
-            if rc != 1 or hex_msg not in text or "shim refuses" in text:
-                t.fail(f"(pr4-sha-len): a {lane} {n}-hex {key} was not refused by the validator:", text)
+            if rc != 1 or f"{key} {sha_val!r} {hex_msg}" not in text or "shim refuses" in text:
+                t.fail(f"(pr4-sha-len): a {lane} {label} {key} was not refused by the validator naming the rejected sha:", text)
             # run_git prefixes every call with `-c core.quotePath=false -C <repo>`, so
             # the verb and its operands are the tail of argv: the probe ends in
             # `--version`, a rev-parse / fetch does not.
             if calls != [["-c", "core.quotePath=false", "-C", str(repo), "--version"]]:
-                t.fail(f"(pr4-sha-len): a {lane} {n}-hex {key} ran git calls other than the "
+                t.fail(f"(pr4-sha-len): a {lane} {label} {key} ran git calls other than the "
                        f"`--version` probe before the validator refused it: {calls!r}", text)
 
     # (k) fail-closed - pull_request with nothing set (missing PR head sha / base ref).
@@ -1543,7 +1547,7 @@ SELF_TEST_OK = (
     "outside CI; (pr4-sha256, #6144) a 64-hex PR_HEAD_SHA / GITHUB_SHA (pull_request) and "
     "GITHUB_EVENT_BEFORE / GITHUB_SHA (push) pass the validator and fail cleanly at the later "
     "lookup; (pr4-sha-case, #6144) upper-case 40/64-hex shas pass the validator on every "
-    "validated key; (pr4-sha-len) 63/65-hex refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; GITHUB_EVENT_BEFORE and GITHUB_SHA on push) with only the "
+    "validated key; (pr4-sha-len) 63/65-hex and 40 non-ASCII-digit values refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; GITHUB_EVENT_BEFORE and GITHUB_SHA on push) with only the "
     "`git --version` probe traced before the validator."
 )
 
