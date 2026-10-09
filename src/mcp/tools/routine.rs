@@ -1099,6 +1099,161 @@ mod handler_tests {
         let all = handle_routine_list(&conn, &json!({ "namespace": "_rt" })).expect("all");
         assert_eq!(all["routines"].as_array().expect("array").len(), 1);
     }
+
+    /// #3369 helper — create + freeze a routine whose single action title is
+    /// `{{t}}` under the supplied frozen `parameters` declaration.
+    fn frozen_routine_with_parameters(conn: &rusqlite::Connection, parameters: Value) -> String {
+        let created = handle_routine_create(
+            conn,
+            &json!({
+                "namespace": "_rt3369",
+                "name": format!("r-{}", uuid::Uuid::new_v4()),
+                "template": {"actions": [{"kind": "task.do", "title": "{{t}}"}]},
+                "parameters": parameters,
+                "created_by": "agent-a",
+            }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID].as_str().expect("id").to_string();
+        handle_routine_freeze(conn, &json!({ "id": id }), None).expect("freeze ok");
+        id
+    }
+
+    /// #3369 helper — the run's failure text, whether the handler answered
+    /// `Err` or recorded a `failed` run carrying `error`.
+    fn run_failure_text(outcome: Result<Value, String>) -> String {
+        match outcome {
+            Err(e) => e,
+            Ok(ran) => {
+                assert_eq!(
+                    ran["run"]["state"].as_str(),
+                    Some("failed"),
+                    "#3369: the run must not complete: {ran}"
+                );
+                ran["error"]
+                    .as_str()
+                    .expect("failure arm carries error")
+                    .to_string()
+            }
+        }
+    }
+
+    fn action_count(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM actions", [], |r| r.get(0))
+            .expect("count actions")
+    }
+
+    /// #3369 — `parameters` is signed into the freeze attestation, so a run
+    /// MUST honour it: a declared `required` parameter missing from
+    /// `arguments` refuses the run (no action carrying the literal `{{t}}`
+    /// text is materialised). Control: supplying it completes the run with
+    /// the substituted title.
+    #[test]
+    fn routine_run_refuses_a_missing_required_parameter_3369() {
+        let _id = unset_caller();
+        let conn = fresh();
+        let id = frozen_routine_with_parameters(&conn, json!({"t": {"required": true}}));
+
+        let message = run_failure_text(handle_routine_run(
+            &conn,
+            &json!({ "routine_id": id, "arguments": {} }),
+        ));
+        assert!(
+            message.contains("'t'") && message.contains("required"),
+            "#3369: refusal names the missing required parameter: {message}"
+        );
+        assert_eq!(action_count(&conn), 0, "#3369: nothing materialised");
+
+        let ran = handle_routine_run(
+            &conn,
+            &json!({ "routine_id": id, "arguments": {"t": "ship it"} }),
+        )
+        .expect("run ok");
+        assert_eq!(
+            ran["run"]["state"].as_str(),
+            Some("completed"),
+            "daemon error: {}",
+            ran["error"].as_str().unwrap_or("<none>")
+        );
+        let action_id = ran["created_action_ids"][0].as_str().expect("action id");
+        let action = crate::actions::get(&conn, action_id)
+            .expect("get action")
+            .expect("action present");
+        assert_eq!(action.title, "ship it");
+    }
+
+    /// #3369 — a declared `type` is enforced: a string where the frozen
+    /// schema says `integer` refuses the run; an integer completes it.
+    #[test]
+    fn routine_run_refuses_a_wrongly_typed_argument_3369() {
+        let _id = unset_caller();
+        let conn = fresh();
+        let id = frozen_routine_with_parameters(
+            &conn,
+            json!({"t": {"required": true, "type": "integer"}}),
+        );
+
+        let message = run_failure_text(handle_routine_run(
+            &conn,
+            &json!({ "routine_id": id, "arguments": {"t": "seven"} }),
+        ));
+        assert!(
+            message.contains("'t'") && message.contains("integer"),
+            "#3369: refusal names the parameter and the declared type: {message}"
+        );
+        assert_eq!(action_count(&conn), 0);
+
+        let ran = handle_routine_run(&conn, &json!({ "routine_id": id, "arguments": {"t": 7} }))
+            .expect("run ok");
+        assert_eq!(ran["run"]["state"].as_str(), Some("completed"), "{ran}");
+        let action_id = ran["created_action_ids"][0].as_str().expect("action id");
+        let action = crate::actions::get(&conn, action_id)
+            .expect("get action")
+            .expect("action present");
+        assert_eq!(action.title, "7");
+    }
+
+    /// #3369 — a placeholder the arguments do not bind never materialises as
+    /// literal `{{...}}` text, even when the parameter was not declared
+    /// (the pre-fix default `parameters: []` + `{{t}}` template shape).
+    #[test]
+    fn routine_run_refuses_an_unresolved_placeholder_3369() {
+        let _id = unset_caller();
+        let conn = fresh();
+        let id = frozen_routine_with_parameters(&conn, json!([]));
+
+        let message = run_failure_text(handle_routine_run(
+            &conn,
+            &json!({ "routine_id": id, "arguments": {"other": "x"} }),
+        ));
+        assert!(
+            message.contains("{{t}}") && message.contains("unresolved"),
+            "#3369: refusal names the unresolved placeholder: {message}"
+        );
+        assert_eq!(action_count(&conn), 0);
+
+        let ran = handle_routine_run(
+            &conn,
+            &json!({ "routine_id": id, "arguments": {"t": "bound"} }),
+        )
+        .expect("run ok");
+        assert_eq!(ran["run"]["state"].as_str(), Some("completed"), "{ran}");
+    }
+
+    /// #3369 — the array-of-names form (`["t"]`, the shape every existing
+    /// routine test freezes) declares REQUIRED names; a missing one refuses.
+    #[test]
+    fn routine_run_treats_declared_names_as_required_3369() {
+        let _id = unset_caller();
+        let conn = fresh();
+        let id = frozen_routine_with_parameters(&conn, json!(["t"]));
+        let message = run_failure_text(handle_routine_run(
+            &conn,
+            &json!({ "routine_id": id, "arguments": {} }),
+        ));
+        assert!(message.contains("'t'"), "{message}");
+        assert_eq!(action_count(&conn), 0);
+    }
 }
 
 #[cfg(test)]
