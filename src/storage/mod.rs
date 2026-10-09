@@ -32506,6 +32506,33 @@ mod tests {
         assert_eq!((dispatched, failed), (0, 0));
     }
 
+    /// #4981 — an unreadable `memories` table is a FAILED probe: `Err`, never
+    /// `Ok(None)` ("pre-P2 schema") or `Ok(Some(0))` (ERRORS-19). Only a
+    /// missing `embedding_dim` column means pre-P2.
+    #[test]
+    fn doctor_dim_violations_unreadable_memories_is_err_4981() {
+        let conn = test_db();
+        conn.execute_batch("ALTER TABLE memories RENAME TO memories_gone")
+            .unwrap();
+        assert!(
+            doctor_dim_violations(&conn).is_err(),
+            "an unreadable memories table must be an error, not pre-P2 / 0 violations"
+        );
+    }
+
+    /// #4981 — the pre-P2 arm is preserved: a `memories` table WITHOUT the
+    /// `embedding_dim` column is `Ok(None)`, not an error.
+    #[test]
+    fn doctor_dim_violations_missing_column_is_pre_p2_4981() {
+        let conn = test_db();
+        conn.execute_batch(
+            "ALTER TABLE memories RENAME TO memories_gone;
+             CREATE TABLE memories (id TEXT PRIMARY KEY, namespace TEXT, embedding BLOB);",
+        )
+        .unwrap();
+        assert_eq!(doctor_dim_violations(&conn).unwrap(), None);
+    }
+
     /// #4979 — an unreadable `subscriptions` table is a FAILED probe, never a
     /// healthy-looking `Ok(0)` (ERRORS-19).
     #[test]

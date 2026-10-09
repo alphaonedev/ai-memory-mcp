@@ -6390,6 +6390,35 @@ mod tests {
         assert_eq!(fact(wh, "audit_rows_pending_stale"), "0");
     }
 
+    /// #4981 — an unreadable `memories` table is Critical with the
+    /// `dim_violations` fact `unreadable` and a `dim_violations_error` fact,
+    /// never `not_observed (pre-P2 schema)` at Info (ERRORS-19).
+    #[test]
+    fn storage_section_critical_when_dim_violations_unreadable_4981() {
+        let env = TestEnv::fresh();
+        let conn = crate::db::open(&env.db_path).expect("open + migrate");
+        conn.execute_batch("ALTER TABLE memories RENAME TO memories_gone")
+            .expect("rename away");
+        let section = section_storage(&conn, &env.db_path);
+        assert_eq!(
+            fact(&section, FACT_DIM_VIOLATIONS),
+            over_depth_4715::UNREADABLE,
+            "{:?}",
+            section.facts
+        );
+        assert!(
+            fact(&section, "dim_violations_error").contains("memories"),
+            "{:?}",
+            section.facts
+        );
+        assert_eq!(section.severity, Severity::Critical, "{:?}", section.facts);
+        assert!(
+            section.note.as_deref().is_some_and(|n| n.contains("#4981")),
+            "note must name the read fault: {:?}",
+            section.note
+        );
+    }
+
     /// Renames `subscriptions` away so every read of it is a fault (the
     /// #4956 fixture shape), then runs the local doctor.
     fn webhook_report_with_unreadable_subscriptions() -> Report {
