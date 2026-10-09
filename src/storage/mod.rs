@@ -995,6 +995,8 @@ pub use doctor::{
 // via the lib.rs shim) so callsites keep resolving without churn.
 pub use connection::open;
 // #1580 — read-only connection opener for the HTTP WAL read-pool.
+/// #5882 — the typed read-only refusal `touch_many` returns.
+pub use connection::TouchRefusedReadOnly;
 pub use connection::open_read_only;
 // #3411 / #3434 — missing-path refusal for advertised-read-only verbs.
 pub use connection::{MISSING_DATABASE_REFUSAL, open_existing_read_only};
@@ -3660,8 +3662,17 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
 /// matches the existing behaviour where any failed touch surfaces
 /// to the recall log path.
 ///
-/// Returns the number of rows successfully touched (always equal to
-/// `ids.len()` on success).
+/// Returns the number of rows touched — always `ids.len()` on success
+/// (an empty batch is `Ok(0)`).
+///
+/// # Errors
+///
+/// [`TouchRefusedReadOnly`] (downcastable) when the connection has
+/// `PRAGMA query_only = ON` — the #1580 read-pool posture, or a scope that
+/// made the handle read-only: NOTHING is written and the dropped access
+/// signal is the caller's to log (#5882; pre-fix this was a silent
+/// `Ok(0)`). A failure to READ the pragma is an error too, never "assume
+/// writable". Otherwise the underlying SQLite error, after rollback.
 pub fn touch_many(
     conn: &Connection,
     ids: &[&str],
@@ -3672,20 +3683,21 @@ pub fn touch_many(
         return Ok(0);
     }
     // #1580 — the WAL read-pool opens its connections with
-    // `PRAGMA query_only = ON`. `touch_many` is best-effort access
-    // bookkeeping (access_count bump / TTL extend / promotion), so on a
-    // read-only pool connection it no-ops. v1.0.0 (#1953) note: recall
-    // paths never reach this function at all now (the sync-touch
-    // opt-back-in was removed) — this guard remains for the EXPLICIT
-    // touch verb's own callers, which may legitimately run against a
-    // read-pool connection. The pragma read is one cheap round-trip;
-    // on the writer connection `query_only` is `0` and the touch
-    // proceeds normally.
+    // `PRAGMA query_only = ON`; a write there would fail with
+    // `SQLITE_READONLY` mid-transaction. v1.0.0 (#1953): recall paths
+    // never reach this function (the sync-touch opt-back-in was removed),
+    // so this guard serves the EXPLICIT verb's own callers. #5882 — the
+    // guard REFUSES with a typed error instead of reporting a touch that
+    // never happened, and the pragma read itself fails closed. One cheap
+    // round-trip; on the writer connection `query_only` is `0`.
     let query_only: i64 = conn
         .query_row("PRAGMA query_only", [], |r| r.get(0))
-        .unwrap_or(0);
+        .context("touch_many: PRAGMA query_only could not be read (#5882)")?;
     if query_only != 0 {
-        return Ok(0);
+        return Err(TouchRefusedReadOnly {
+            requested: ids.len(),
+        }
+        .into());
     }
     let now = Utc::now();
     let now_str = now.to_rfc3339();

@@ -58,6 +58,13 @@ fn touch_many_refuses_a_read_only_pool_connection_5882() {
         format!("{err:#}").contains("query_only"),
         "the refusal must name the read-only posture: {err:#}"
     );
+    let refused = err
+        .downcast_ref::<ai_memory::storage::TouchRefusedReadOnly>()
+        .unwrap_or_else(|| panic!("the refusal must be the typed error, got: {err:#}"));
+    assert_eq!(
+        refused.requested, 1,
+        "the batch size is carried: {refused:?}"
+    );
     assert_eq!(
         access_count(&writer, "m1"),
         4,

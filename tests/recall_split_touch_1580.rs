@@ -9,16 +9,17 @@
 //! v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5) removed the mid→long
 //! promotion + priority ladder) runs on the writer connection (PHASE 2).
 //! The
-//! enabler is that `touch_many` no-ops on a connection with
+//! enabler is that `touch_many` REFUSES a connection with
 //! `PRAGMA query_only = ON` (the read-pool posture) so the read phase
-//! performs no writes.
+//! performs no writes — since #5882 with the typed
+//! `TouchRefusedReadOnly` error rather than a silent `Ok(0)`.
 //!
 //! This test pins both halves deterministically against a shared file DB
 //! (the read-pool is per-connection-correct only on a file DB; `:memory:`
 //! is per-connection):
 //!
-//!  1. `touch_many` on a read-only connection is a NO-OP — `access_count`
-//!     is unchanged (the PHASE 1 skip).
+//!  1. `touch_many` on a read-only connection is REFUSED — `access_count`
+//!     is unchanged (the PHASE 1 guard).
 //!  2. `touch_many` on the writer connection bumps `access_count` 4→5 and
 //!     floor-extends `expires_at`, but (post-R2) does NOT promote the mid
 //!     row or bump priority (the PHASE 2 authoritative touch).
@@ -66,18 +67,20 @@ fn read_tier(conn: &rusqlite::Connection, id: &str) -> String {
 }
 
 #[test]
-fn touch_many_noop_on_readonly_then_full_ladder_on_writer() {
+fn touch_many_refuses_readonly_then_full_ladder_on_writer() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     let writer = ai_memory::storage::open(tmp.path()).expect("open writer");
     seed_mid_at_4(&writer, "m1");
 
-    // PHASE 1 — read-only (read-pool) connection: touch_many must no-op.
+    // PHASE 1 — read-only (read-pool) connection: touch_many must REFUSE
+    // (#5882 — a typed error, no longer a silent `Ok(0)`) and write nothing.
     let ro = ai_memory::storage::open_read_only(tmp.path()).expect("open read-only");
-    let n = ai_memory::storage::touch_many(&ro, &["m1"], SHORT_EXTEND, MID_EXTEND)
-        .expect("touch_many on read-only conn must succeed (as a no-op)");
-    assert_eq!(
-        n, 0,
-        "touch_many must report zero touched rows on a read-only connection"
+    let err = ai_memory::storage::touch_many(&ro, &["m1"], SHORT_EXTEND, MID_EXTEND)
+        .expect_err("touch_many on a read-only conn must be refused (#5882)");
+    assert!(
+        err.downcast_ref::<ai_memory::storage::TouchRefusedReadOnly>()
+            .is_some(),
+        "the refusal is the typed read-only error: {err:#}"
     );
     assert_eq!(
         read_access_count(&writer, "m1"),

@@ -1144,6 +1144,35 @@ pub fn open_read_only(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// #5882 — typed refusal: a maintenance WRITE verb (`touch_many`) was
+/// called on a connection whose `PRAGMA query_only` is ON — the read-pool
+/// posture [`open_read_only`] sets, or a scope that made the handle
+/// read-only. Nothing is written; the caller decides whether a dropped
+/// access signal is a WARN (the explicit verb) or an error. Pre-fix the
+/// verb answered `Ok(0)` and the signal was lost without a trace, while
+/// every other write on such a connection fails with `SQLITE_READONLY`.
+///
+/// Shape precedent: [`SchemaBehindReadOnly`] (a typed, downcastable
+/// read-only refusal with a rendered operator message).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TouchRefusedReadOnly {
+    /// How many ids the refused batch carried (none were touched).
+    pub requested: usize,
+}
+
+impl std::fmt::Display for TouchRefusedReadOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "touch refused: the connection is read-only (PRAGMA query_only = ON); \
+             {} access signal(s) were NOT recorded (#5882)",
+            self.requested
+        )
+    }
+}
+
+impl std::error::Error for TouchRefusedReadOnly {}
+
 /// #3411 / #3434 — slug for a missing database on a read-only verb
 /// (`boot`, `doctor`). `Connection::open` would CREATE the file and
 /// [`open`] would then migrate it; these verbs are advertised
