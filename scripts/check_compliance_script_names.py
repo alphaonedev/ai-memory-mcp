@@ -165,9 +165,11 @@ DETAILS_OPEN_RE = re.compile(r"<details(?![A-Za-z0-9-])", re.IGNORECASE)
 # closer, with its inline destination and title when ``(`` follows (group 2, ``link_tail_end``).
 SKELETON_RE = re.compile(r"(<!--)|" + TAG + r"|`|!?\[|(\]\()|\]")
 # An inline link destination in angle brackets, and the characters that end or nest a bare one.
-ANGLE_DEST_RE = re.compile(r"<(?:\\.|[^<>\\\r\n])*>")
-DEST_STOP_RE = re.compile(r"[()\\\x00-\x20\x7f]")
+ANGLE_DEST_RE = re.compile(r"<(?:\\(?:\r\n|[\s\S])|[^<>\\\r\n])*>")
+DEST_STOP_RE = re.compile(r"[()\\ \t\r\n]")
 LINK_SPACE_RE = re.compile(r"[ \t]*(?:(?:\r\n|\r|\n)[ \t]*)?")
+# Only ASCII punctuation can be backslash-escaped (CommonMark 2.4).
+ASCII_PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 # CommonMark nests at most 32 parentheses in a bare link destination.
 MAX_PAREN_DEPTH = 32
 # A script name in any letters (#6214): each letter of ``check``, ``sh`` and ``py`` is that ASCII
@@ -345,7 +347,7 @@ def bare_dest_end(text, i, memo, depth=0):
             break
         c = m.group()
         if c == "\\":
-            i = m.end() + 1
+            i = m.end() + 1 if text[m.end() : m.end() + 1] in ASCII_PUNCT else m.end()
         elif c == "(":
             close = -1 if depth >= MAX_PAREN_DEPTH else bare_dest_end(text, m.end(), memo, depth + 1)
             if close < 0 or not text.startswith(")", close):
