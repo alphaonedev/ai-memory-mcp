@@ -528,6 +528,19 @@ def load_all() -> Dict[str, str]:
     return {p.name: p.read_text(encoding="utf-8") for p in files}
 
 
+REPO_CONFIG_FILES = ("Cargo.toml", ".cargo/config.toml", ".cargo/config")
+
+
+def load_repo_files() -> Dict[str, str]:
+    """The cargo manifest and config files a self-hosted build reads (#6255)."""
+    return {name: (ROOT / name).read_text(encoding="utf-8") for name in REPO_CONFIG_FILES if (ROOT / name).is_file()}
+
+
+def repo_file_violations(repo_files: Dict[str, str]) -> List[str]:
+    """R-DEBUG findings in Cargo.toml and .cargo/config.toml."""
+    return []
+
+
 def self_hosted_jobs(workflows: Dict[str, str]) -> Dict[Tuple[str, str], Tuple[Workflow, Job]]:
     found: Dict[Tuple[str, str], Tuple[Workflow, Job]] = {}
     for name, text in workflows.items():
@@ -687,8 +700,9 @@ def violations(name: str, wf: Workflow, job: Job) -> List[str]:
     return found
 
 
-def all_violations(workflows: Dict[str, str]) -> List[str]:
+def all_violations(workflows: Dict[str, str], repo_files: Optional[Dict[str, str]] = None) -> List[str]:
     found: List[str] = []
+    found.extend(repo_file_violations(load_repo_files() if repo_files is None else repo_files))
     try:
         jobs = self_hosted_jobs(workflows)
     except Unparsed as exc:
@@ -711,7 +725,7 @@ def _replace_once(text: str, old: str, new: str) -> str:
 
 class LiveWorkflows6118(unittest.TestCase):
     def test_6118_live_workflows_clean(self) -> None:
-        found = all_violations(load_all())
+        found = all_violations(load_all(), load_repo_files())
         self.assertEqual([], found, "\n".join(found))
 
     def test_6118_census_matches_live_runs_on(self) -> None:
@@ -1055,6 +1069,79 @@ class Mutants6118(unittest.TestCase):
             "          CARGO_ENCODED_RUSTFLAGS=$'-Copt-level=0\\x1f-Dwarnings' cargo test --no-run\n"
             "          echo $'tab\\there'\n")
         self.assertEqual([], found)
+
+    # ---- round 5 (#6255): section-aware cargo TOML, multi-line arrays ----
+
+    def _repo_mutated(self, name: str, text: str) -> List[str]:
+        repo = load_repo_files()
+        repo[name] = text
+        return all_violations(self.live, repo)
+
+    PKG_OVERRIDES = (
+        '[profile.dev.package."*"]\ndebug = 2\n',
+        '[profile.test.package."*"]\ndebug = "line-tables-only"\n',
+        '[profile.dev]\npackage."*".debug = 2\n',
+        '[profile.dev]\npackage = { "*" = { debug = 2 } }\n',
+        '[profile.dev.package]\n"*" = { debug = 1 }\n',
+        '[profile]\ndev.package."*".debug = 2\n',
+        '[profile.dev.build-override]\ndebug = 2\n',
+        '[profile.dev.package.\'*\']\ndebug = true\n',
+    )
+    MULTILINE_FLAGS = (
+        '[build]\nrustflags = [\n  "-C",\n  "opt-level=0",\n  "-g",\n]\n',
+        '[build]\nrustflags = [\n  "-Copt-level=0",\n  "-g"\n]\n',
+        '[target.x86_64-unknown-linux-gnu]\nrustflags = [ # why\n  "-g",\n]\n',
+    )
+    BENIGN_TOML = (
+        '[profile.dev]\ndebug = 2\nopt-level = 1\n',
+        '[profile.dev.package."*"]\ndebug = 0\nopt-level = 3\n',
+        '[profile.dev.package.foo]\ndebug = false\ndebug-assertions = true\n',
+        '[profile.coverage]\ninherits = "dev"\ndebug = 1\n',
+        '[profile.release.package."*"]\ndebug = 2\n',
+        '[build]\nrustflags = [\n  "-D",\n  "warnings",\n]\n',
+    )
+
+    def test_6118_r5_6255_step_written_config_package_override(self) -> None:
+        for body in self.PKG_OVERRIDES:
+            lines = "".join("          " + ln + "\n" for ln in body.splitlines())
+            found = self._before_prune(
+                "      - name: Write config\n        run: |\n          cat >> .cargo/config.toml <<'EOF'\n"
+                + lines + "          EOF\n")
+            self.assertTrue(self._debug_flagged(found), (body, found))
+        found = self._before_prune(
+            "      - name: Printf config\n        run: |\n"
+            "          printf '[profile.dev.package.\"*\"]\\ndebug = 2\\n' >> .cargo/config.toml\n")
+        self.assertTrue(self._debug_flagged(found), found)
+
+    def test_6118_r5_6255_cargo_manifest_package_override(self) -> None:
+        live = load_repo_files()["Cargo.toml"]
+        for body in self.PKG_OVERRIDES:
+            found = self._repo_mutated("Cargo.toml", live.rstrip("\n") + "\n\n" + body)
+            self.assertTrue(self._debug_flagged(found), (body, found))
+
+    def test_6118_r5_6255_cargo_config_file_package_override(self) -> None:
+        for body in self.PKG_OVERRIDES + self.MULTILINE_FLAGS:
+            found = self._repo_mutated(".cargo/config.toml", body)
+            self.assertTrue(self._debug_flagged(found), (body, found))
+
+    def test_6118_r5_6255_multiline_rustflags_array(self) -> None:
+        for body in self.MULTILINE_FLAGS:
+            lines = "".join("          " + ln + "\n" for ln in body.splitlines())
+            found = self._before_prune(
+                "      - name: Write flags\n        run: |\n          cat > .cargo/config.toml <<'EOF'\n"
+                + lines + "          EOF\n")
+            self.assertTrue(self._debug_flagged(found), (body, found))
+            found = self._repo_mutated("Cargo.toml", load_repo_files()["Cargo.toml"].rstrip("\n") + "\n\n" + body)
+            self.assertTrue(self._debug_flagged(found), (body, found))
+
+    def test_6118_r5_6255_benign_toml_is_clean(self) -> None:
+        for body in self.BENIGN_TOML:
+            self.assertEqual([], self._repo_mutated(".cargo/config.toml", body), body)
+            lines = "".join("          " + ln + "\n" for ln in body.splitlines())
+            found = self._before_prune(
+                "      - name: Write config\n        run: |\n          cat >> .cargo/config.toml <<'EOF'\n"
+                + lines + "          EOF\n")
+            self.assertEqual([], found, body)
 
 
 def _write(path: Path, size: int, executable: bool = False) -> None:
