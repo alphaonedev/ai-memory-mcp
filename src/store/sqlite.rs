@@ -5555,6 +5555,86 @@ mod tests {
         assert_eq!(attest, "unsigned");
     }
 
+    /// #4306 — a K9 link `Deny` is `StoreError::PermissionDenied` on the
+    /// postgres adapter (`PostgresStore::link_internal`), so the SAL caller
+    /// (and the HTTP mapper keyed on the variant) sees 403 there. The sqlite
+    /// adapter boxed the typed `StorageError::LinkPermissionDenied` into
+    /// `StoreError::Backend("link denied by permission rule: …")` — the same
+    /// refusal, a string-classified backend error, a different status. Pin:
+    /// the same Deny gives the same variant, `action` and `reason` on both
+    /// `link` and `link_signed`.
+    #[tokio::test]
+    async fn k9_link_deny_is_permission_denied_on_sqlite_4306() {
+        use crate::config::{
+            PermissionsMode, lock_permissions_mode_for_test,
+            override_active_permissions_mode_for_test,
+        };
+        use crate::permissions::{
+            PermissionRule, RuleDecision, clear_active_permission_rules_for_test,
+            set_active_permission_rules,
+        };
+        let _gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+        clear_active_permission_rules_for_test();
+        set_active_permission_rules(vec![PermissionRule {
+            namespace_pattern: "parity-4306".to_string(),
+            op: crate::mcp::registry::tool_names::MEMORY_LINK.to_string(),
+            agent_pattern: "*".to_string(),
+            decision: RuleDecision::Deny,
+            reason: Some("test: link denied by 4306 rule".to_string()),
+        }]);
+
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mut a = test_memory("k9-4306-a", "content for 4306 a");
+        a.namespace = "parity-4306".to_string();
+        let mut b = test_memory("k9-4306-b", "content for 4306 b");
+        b.namespace = "parity-4306".to_string();
+        let a_id = store.store(&ctx, &a).await.expect("a");
+        let b_id = store.store(&ctx, &b).await.expect("b");
+        let link = MemoryLink {
+            source_id: a_id,
+            target_id: b_id,
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+
+        let unsigned = store.link(&ctx, &link).await.expect_err("K9 Deny refuses");
+        let signed = store
+            .link_signed(&ctx, &link, None)
+            .await
+            .expect_err("K9 Deny refuses");
+
+        clear_active_permission_rules_for_test();
+        override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+
+        for err in [unsigned, signed] {
+            match err {
+                StoreError::PermissionDenied {
+                    action,
+                    target,
+                    reason,
+                } => {
+                    assert_eq!(action, crate::mcp::registry::tool_names::MEMORY_LINK);
+                    // Postgres names the link namespace as the target.
+                    assert_eq!(target, "parity-4306");
+                    assert!(
+                        reason.starts_with(crate::storage::LINK_PERMISSION_DENIED_ERR_PREFIX),
+                        "reason keeps the typed prefix: {reason}"
+                    );
+                }
+                other => panic!("expected PermissionDenied (postgres parity), got: {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn register_agent_then_is_registered() {
         let store = fresh_store();
