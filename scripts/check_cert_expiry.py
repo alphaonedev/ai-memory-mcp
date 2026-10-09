@@ -1433,18 +1433,22 @@ def shim_isolation_result(tmp, check=shim_isolation_violation):
 
 
 def shim_isolation_crash_violation():
-    """None when shim_isolation_result turns an OSError and a ValueError raised by the
-    check into `shim_isolation_violation raised <Type>: ...`, else a description. The
-    ValueError plant pins the handler at Exception, not OSError: decoding the probe
-    output of non-UTF-8 bytes raises UnicodeDecodeError, a ValueError (#6145 R10-F2,
-    R11-F1)."""
-    for exc_type in (OSError, ValueError):
+    """None when shim_isolation_result turns an OSError, a ValueError and a class defined
+    here raised by the check into `shim_isolation_violation raised <Type>: ...`, else a
+    description. The private class derives from Exception only, so no narrower tuple of
+    builtin types catches it: the three plants pin the handler at Exception. Decoding the
+    probe output of non-UTF-8 bytes raises UnicodeDecodeError, a ValueError (#6145 R10-F2,
+    R11-F1, R12-F1)."""
+    class _Planted6145(Exception):
+        pass
+
+    for exc_type in (OSError, ValueError, _Planted6145):
         def crashing(_tmp, exc_type=exc_type):
             raise exc_type("planted 6145")
         got = shim_isolation_result(None, crashing)
         want = f"shim_isolation_violation raised {exc_type.__name__}: planted 6145"
         if got != want:
-            return f"a {exc_type.__name__} in the isolation cell gave {got!r}, not {want!r}"
+            return f"a {exc_type.__name__} raised in the isolation cell gave {got!r}, not {want!r}"
     return None
 
 
