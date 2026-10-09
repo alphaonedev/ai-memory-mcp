@@ -1344,6 +1344,175 @@ class PruneScript6118(unittest.TestCase):
         self.assertEqual(2, cli.returncode, cli.stdout + cli.stderr)
         self.assertTrue((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
 
+    # ---- round 4 (SR3-1, SR3-2, R3-F1, R3-F3, R3-F4, R3-F5) ----
+
+    def _hash_name_lines(self, out: str) -> List[str]:
+        return [x for x in out.splitlines() if "##[" in x]
+
+    def test_6118_r4_sr3_1_legacy_v1_command_prefix_cannot_forge_a_command(self) -> None:
+        # SR3-1: the runner also parses the legacy `##[cmd]` form ANYWHERE in a
+        # line, so a printed file name must not carry `##[` either: the kept
+        # (nlink 2) line and the dry-run `would delete` line both echo names.
+        deps = self.target / "debug" / "deps"
+        kept = deps / "kv1##[error]forged-v1"
+        _write(kept, 9, True)
+        os.link(kept, Path(self.scratch.name) / "kv1-outside")
+        _write(deps / "dr##[add-mask]x-0123456789abcdef", 7, True)
+        for args in (("--dry-run",), ()):
+            proc = self._run("--target-dir", str(self.target), *args)
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            self.assertEqual([], self._hash_name_lines(proc.stdout + proc.stderr), (args, proc.stdout))
+            self.assertIn("kv1%23%23[error]forged-v1", proc.stdout, args)
+        mod = _load_prune()
+        self.assertEqual("a%2523%0Ab%23%23[x]", mod._escape("a%23\nb##[x]"))
+
+    def test_6118_r4_sr3_2a_scandir_failure_inside_remove_warns_and_continues(self) -> None:
+        # SR3-2(a): os.scandir dups the fd, so EMFILE (EIO, ENOMEM) escapes
+        # _remove; it must warn, leave the directory and report False.
+        import errno
+        from unittest import mock
+        mod = _load_prune()
+        sub = self.target / "debug" / "incremental" / "s1"
+        _write(sub / "f", 3)
+        parent_fd = os.open(str(sub.parent), os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, parent_fd)
+        tally = mod.Tally()
+        with mock.patch.object(mod.os, "scandir", side_effect=OSError(errno.EMFILE, "Too many open files")):
+            ok = mod._remove(parent_fd, "s1", "debug/incremental/s1", tally, False)
+        self.assertFalse(ok)
+        self.assertEqual(1, len(tally.errors), tally.errors)
+        self.assertIn("Too many open files", tally.errors[0])
+        self.assertTrue((sub / "f").exists())
+
+    def test_6118_r4_sr3_2b_a_very_deep_tree_warns_instead_of_crashing(self) -> None:
+        # SR3-2(b): _remove recursed without a bound (RecursionError, or EMFILE
+        # on the fd it holds per level).  A tree deeper than any cargo output
+        # is warned about and left in place; the other candidates still go and
+        # the totals still print.  Built with chdir (a path this long exceeds
+        # PATH_MAX), removed the same way.
+        inc = self.target / "debug" / "incremental" / "deep"
+        inc.mkdir(parents=True)
+        here = os.getcwd()
+
+        def _drop_deep() -> None:
+            os.chdir(str(inc))
+            level = 0
+            while os.path.isdir("d"):
+                os.chdir("d")
+                level += 1
+            for _ in range(level):
+                os.chdir("..")
+                os.rmdir("d")
+            os.chdir(here)
+        self.addCleanup(_drop_deep)
+        os.chdir(str(inc))
+        try:
+            for _ in range(1100):
+                os.mkdir("d")
+                os.chdir("d")
+        finally:
+            os.chdir(here)
+        proc = self._run("--target-dir", str(self.target))
+        self.assertNotIn("Traceback", proc.stderr, proc.stdout + proc.stderr)
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"::warning::prune-runner-target: debug/incremental/deep/d/d")
+        self.assertIn("::notice::prune-runner-target freed_bytes=", proc.stdout)
+        self.assertFalse((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
+
+    def test_6118_r4_r3_f3_non_utf8_name_is_escaped_not_a_traceback(self) -> None:
+        # R3-F3: a file name that is not UTF-8 decodes with surrogateescape; a
+        # strict UTF-8 stdout (the f2 runners run LANG=en_US.UTF-8) raised
+        # UnicodeEncodeError before the totals.  _escape now backslash-escapes
+        # the undecodable bytes, and main() makes stdout/stderr lossless.
+        mod = _load_prune()
+        raw = os.fsdecode(b"deps/tst\xfe-0123456789abcdef")
+        self.assertEqual("deps/tst\\xfe-0123456789abcdef", mod._escape(raw))
+        mod._escape(raw).encode("utf-8")  # must not raise
+        import contextlib
+        import io
+        deps = os.fsencode(str(self.target / "debug" / "deps"))
+        try:
+            with open(os.path.join(deps, b"tst\xfe-0123456789abcdef"), "wb") as fh:
+                fh.write(b"x" * 11)
+            os.chmod(os.path.join(deps, b"tst\xfe-0123456789abcdef"), 0o755)
+        except OSError:
+            self.skipTest("this filesystem rejects non-UTF-8 names (APFS)")
+        out = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+        err = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = mod.main(["--target-dir", str(self.target), "--dry-run"])
+        out.flush()
+        self.assertEqual(0, rc)
+        text = out.buffer.getvalue().decode("utf-8")  # type: ignore[attr-defined]
+        self.assertIn("deps/tst\\xfe-0123456789abcdef", text)
+        self.assertIn("::notice::prune-runner-target freed_bytes=", text)
+
+    def test_6118_r4_r3_f1_clone_shaped_bin_source_is_kept_by_name_and_size(self) -> None:
+        # R3-F1: on macOS cargo copies (APFS clonefile) instead of hard-linking,
+        # so deps/<bin>-<hash> and <profile>/<bin> are two inodes with nlink 1.
+        # Pruning the deps side forces a relink of the bin ("Dirty ... couldn't
+        # read metadata").  The partner is found by name and size.
+        deps = self.target / "debug" / "deps"
+        _write(deps / "probe_bin-cff58677ac0f78dc", 4096, True)
+        _write(self.target / "debug" / "probe-bin", 4096, True)
+        _write(deps / "probe_bin-1111222233334444", 5000, True)  # same crate, other size: a test exe
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertTrue((deps / "probe_bin-cff58677ac0f78dc").exists())
+        self.assertTrue((self.target / "debug" / "probe-bin").exists())
+        self.assertFalse((deps / "probe_bin-1111222233334444").exists())
+        self.assertEqual(self._expected_freed() + 5000, self._freed(proc.stdout))
+        self.assertIn("kept deps/probe_bin-cff58677ac0f78dc", proc.stdout)
+        self.assertIn("debug/probe-bin", proc.stdout)
+
+    def test_6118_r4_r3_f1_clone_shaped_example_pair_is_pruned_together(self) -> None:
+        # R3-F1 (macOS): the example uplift is a clone too (two inodes, nlink 1,
+        # equal size and name): the pair goes together.  freed_bytes counts each
+        # clone at full size, an upper bound on APFS (clones share blocks).
+        ex = self.target / "debug" / "examples"
+        _write(ex / "clone-0123456789abcdef", 900, True)
+        _write(ex / "clone", 900, True)
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertFalse((ex / "clone").exists())
+        self.assertFalse((ex / "clone-0123456789abcdef").exists())
+        self.assertEqual(self._expected_freed() + 1800, self._freed(proc.stdout))
+
+    def test_6118_r4_r3_f4_dashed_example_pair_is_pruned_together(self) -> None:
+        # R3-F4: cargo names the hashed artifact with the crate-style stem
+        # (my_demo-<hash>) and uplifts it under the declared name (my-demo):
+        # one inode, nlink 2.  The dash and underscore spellings are one name.
+        ex = self.target / "debug" / "examples"
+        _write(ex / "my_demo-228f4a433534936b", 4000, True)
+        os.link(ex / "my_demo-228f4a433534936b", ex / "my-demo")
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertFalse((ex / "my-demo").exists())
+        self.assertFalse((ex / "my_demo-228f4a433534936b").exists())
+        self.assertEqual(self._expected_freed() + 4000, self._freed(proc.stdout))
+
+    def test_6118_r4_r3_f5_kept_line_names_the_real_reason(self) -> None:
+        # R3-F5: the kept line used to say "<profile>/<bin>" for every kept file,
+        # even a hard-linked example.  It now names what was actually found.
+        ex = self.target / "debug" / "examples"
+        _write(ex / "keep3-0123456789abcdef", 800, True)
+        os.link(ex / "keep3-0123456789abcdef", ex / "keep3")
+        os.link(ex / "keep3-0123456789abcdef", ex / "keep3-third")
+        deps = self.target / "debug" / "deps"
+        _write(deps / "probe_bin-cff58677ac0f78dc", 4096, True)
+        _write(self.target / "debug" / "probe-bin", 4096, True)
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        kept = [x for x in proc.stdout.splitlines() if x.lstrip().startswith("kept ")]
+        ex_lines = [x for x in kept if "examples/keep3" in x]
+        self.assertTrue(ex_lines, proc.stdout)
+        for line in ex_lines:
+            self.assertNotIn("<profile>/<bin>", line)
+            self.assertIn("examples", line)
+        bin_lines = [x for x in kept if "deps/probe_bin-" in x]
+        self.assertEqual(1, len(bin_lines), kept)
+        self.assertIn("debug/probe-bin", bin_lines[0])
+
 
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
 EXAMPLE_UPLIFT = "debug/examples/demo"
