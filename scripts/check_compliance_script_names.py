@@ -30,10 +30,13 @@ elsewhere, and a symlink counts only when it resolves inside ``scripts/`` (or,
 for a path outside ``scripts/``, inside the repository) (#6198). The allowlist is read strictly (no Cf removal).
 
 1. an erratum line somewhere in ``docs/compliance/`` names it together with an
-   existing successor (``scripts/<name>``). An erratum line is a single line
-   whose reader-visible text (outside HTML comments, processing instructions, CDATA,
-   declarations and tag markup, #6196) contains the word
-   "erratum", the stale name, and the successor in backticks. The successor must resolve inside ``scripts/``: a
+   existing successor (``scripts/<name>``). An erratum line has one form, the one a
+   rendered document always shows (#6196, #6219; 5-agent vote 4d3ea1c5): it starts
+   ``Erratum (#<issue>): `` at column 0 and begins a paragraph, outside any fenced or
+   ``$$`` block, raw HTML block, HTML comment, processing instruction, CDATA section,
+   declaration or tag, with no ``[`` or ``]`` outside code spans (``erratum_lines``).
+   Its text, without unrendered raw HTML, names the stale name and the successor in
+   backticks. The successor must resolve inside ``scripts/``: a
    ``..`` or ``.`` component, or a symlink escaping ``scripts/``, is rejected.
 2. the ``<relative-doc-path>:<stale-name>`` pair is listed in
    ``scripts/qc-allowlists/compliance-script-names-allow.txt``. The allowlist
@@ -118,17 +121,21 @@ LOOKALIKES = str.maketrans(
 )
 # A CommonMark fence line: up to three spaces, then three or more backticks or tildes (#6215).
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-# Fence info strings GitHub renders as a diagram or figure, never as text: the body (mermaid
-# '%%' comments included) is not reader-visible (#6196).
-DIAGRAM_FENCES = frozenset({"mermaid", "math", "geojson", "topojson", "stl"})
 # Raw HTML that GitHub renders as nothing (#6196): a comment, a CDATA section, a processing
 # instruction and a declaration (``<!`` and a letter) end at their closer; a tag (``<`` and a
 # letter or ``/``) hides its own markup, attribute values included, to its first ``>`` outside
 # quotes. Hiding more than GitHub does only fails closed.
 HIDDEN_HTML_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|<![A-Za-z]|<[A-Za-z/]")
 HIDDEN_HTML_CLOSERS = {"<!--": "-->", "<![CDATA[": "]]>", "<?": "?>"}
-# A CommonMark link reference definition ([label]: destination "title"), never rendered (#6219).
-LINKDEF_RE = re.compile(r"^ {0,3}\[[^\]]+\]:")
+# The one erratum form (#6196, #6219; 5-agent vote 4d3ea1c5): a line starting with this at column 0.
+ERRATUM_RE = re.compile(r"Erratum \(#[1-9][0-9]*\): ")
+# A line opening a raw HTML block (CommonMark types 1, 6, 7; over-approximated: any tag at the start
+# of a line). Inside one, backticks are raw text and protect nothing (#6196). A RAW_TEXT_TAGS block
+# runs to its closing tag, any other to the next blank line.
+HTML_BLOCK_RE = re.compile(r"^ {0,3}<(/?)([A-Za-z][A-Za-z0-9-]*)")
+RAW_TEXT_TAGS = frozenset({"pre", "script", "style", "textarea"})
+# A line that is only ``$$`` opens or closes a display-math block, rendered as math (#6196).
+MATH_FENCE = "$$"
 ENTRY_RE = re.compile(
     r"^(docs/compliance/\S+\.md):((?i:check)[-_][A-Za-z0-9_-]+\.(?i:sh|py))(:pinned)?$", re.ASCII
 )
@@ -343,26 +350,68 @@ def backtick_run(line, i):
     return n - i
 
 
-def comment_open(line, pos):
+def next_tick(line, i):
+    """Index of the first backtick at or after ``i`` not escaped by a backslash, else -1 (#6196).
+
+    A backtick after an odd number of backslashes is literal text and opens no code span.
+    """
+    while True:
+        tick = line.find("`", i)
+        if tick < 0:
+            return tick
+        k = tick
+        while k > i and line[k - 1] == "\\":
+            k -= 1
+        if (tick - k) % 2 == 0:
+            return tick
+        i = tick + 1
+
+
+def code_span_end(line, tick):
+    """Index after the code span opened by the backtick run at ``tick``, or -1 when it is unclosed."""
+    n = backtick_run(line, tick)
+    j = tick + n
+    while True:
+        j = line.find("`", j)
+        if j < 0:
+            return j
+        if backtick_run(line, j) == n:
+            return j + n
+        j += backtick_run(line, j)
+
+
+def comment_open(line, pos, spans=True):
     """The first ``HIDDEN_HTML_RE`` match at or after ``pos`` not inside a code span, else None.
 
-    A code span (a backtick run closed by the next run of the same length) shows ``<!--``,
-    ``<?`` or ``<a`` literally (#6215, #6196); an unmatched run is literal text and opens no span.
+    A code span (an unescaped backtick run closed by the next run of the same length) shows
+    ``<!--``, ``<?`` or ``<a`` literally (#6215, #6196); an unmatched run is literal text and opens
+    no span. With ``spans`` false (inside a raw HTML block) backticks protect nothing.
     """
     i = pos
     while True:
         start = HIDDEN_HTML_RE.search(line, i)
-        tick = line.find("`", i)
+        tick = next_tick(line, i) if spans else -1
         if start is None or tick < 0 or start.start() < tick:
             return start
-        n = backtick_run(line, tick)
-        j = tick + n
-        while True:
-            j = line.find("`", j)
-            if j < 0 or backtick_run(line, j) == n:
-                break
-            j += backtick_run(line, j)
-        i = tick + n if j < 0 else j + n
+        end = code_span_end(line, tick)
+        i = tick + backtick_run(line, tick) if end < 0 else end
+
+
+def outside_code_spans(line):
+    """``line`` with every code span, its backticks included, removed (#6196)."""
+    out, i = [], 0
+    while True:
+        tick = next_tick(line, i)
+        if tick < 0:
+            out.append(line[i:])
+            return "".join(out)
+        end = code_span_end(line, tick)
+        if end < 0:
+            out.append(line[i : tick + backtick_run(line, tick)])
+            i = tick + backtick_run(line, tick)
+        else:
+            out.append(line[i:tick])
+            i = end
 
 
 def tag_end(line, pos, quote):
@@ -379,7 +428,7 @@ def tag_end(line, pos, quote):
     return -1, quote
 
 
-def comment_text_removed(line, inside):
+def comment_text_removed(line, inside, spans=True):
     """Return (``line`` without unrendered raw HTML, the open state at the end of ``line``).
 
     The state is "" (none), the closer of an open comment, CDATA section, processing
@@ -399,7 +448,7 @@ def comment_text_removed(line, inside):
                 break
             inside, pos = "", end + len(inside)
         else:
-            start = comment_open(line, pos)
+            start = comment_open(line, pos, spans)
             if start is None:
                 shown.append(line[pos:])
                 break
@@ -410,47 +459,68 @@ def comment_text_removed(line, inside):
     return "".join(shown), inside
 
 
-def visible_lines(lines):
-    """``lines`` reduced to the text a rendered document shows, line count kept (#6196, #6215).
+def fence_closes(fence, line):
+    """True when ``line`` closes the fenced block opened by the marker ``fence`` (#6215)."""
+    if fence == MATH_FENCE:
+        return line.strip() == MATH_FENCE
+    m = FENCE_RE.match(line)
+    return bool(m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip())
 
-    An erratum exists to tell a reader the text names a removed script, so only text a
-    rendered document shows can carry one. Removed: HTML comment text (``<!-- ... -->``, also
-    across lines), processing instructions, CDATA sections, declarations and tag markup with
-    its attributes (#6196; an open tag ends at a blank line or a fence, where GitHub shows it
-    as text), fence marker lines, and the body of a diagram fence (``mermaid`` with its
-    ``%%`` comments, ``math``, ``geojson``, ``topojson``, ``stl``). Inside a fenced block or a
-    code span ``<!--`` is literal and opens nothing (#6215). A blank-line-delimited paragraph
-    from a link reference definition line (``[//]: # (...)``, a title on the next line or
-    continued over lines) is removed to its end (#6219); a visible line directly after a
-    definition can only be over-hidden, which fails closed. Stale names are still found in all
-    of this text.
+
+def erratum_lines(lines):
+    """Return {index: text} for the erratum lines of a document (#6196, #6219).
+
+    An erratum exists to tell a reader the text names a removed script, so it has one form that a
+    rendered document always shows (5-agent vote 4d3ea1c5): a line starting ``Erratum (#<issue>): ``
+    at column 0 that begins a paragraph (the first line, or after a blank line or a closing fence).
+    It is not an erratum inside a fenced block or a ``$$`` block (an unclosed one runs to the end),
+    inside an open HTML comment, processing instruction, CDATA section, declaration or tag (each
+    runs to its closer, across blank lines and fences), or inside a raw HTML block (where backticks
+    protect nothing and a ``pre``/``script``/``style``/``textarea`` block runs to its closing tag),
+    and not when its text holds ``[`` or ``]`` outside code spans (link, image and footnote syntax
+    can hide text). ``text`` is the line without its unrendered raw HTML. Any other shape (a list
+    item, a block quote, a definition, a table, after a paragraph line) is not an erratum: rejecting
+    a visible one only fails closed. Stale names are still found in all of this text.
     """
-    out, inside, fence, linkdef = [], "", None, False
-    for line in lines:
-        if inside.startswith("tag") and (not line.strip() or FENCE_RE.match(line)):
-            inside = ""
-        m = None if inside else FENCE_RE.match(line)
+    found, inside, fence, html, starts = {}, "", None, "", True
+    for i, line in enumerate(lines):
         if fence is not None:
-            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1] and not m.group(2).strip():
+            starts = fence_closes(fence, line)
+            if starts:
                 fence = None
-                out.append("")
-            else:
-                out.append("" if fence[2] else line)
             continue
-        if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
-            info = (m.group(2).split() or [""])[0].lower()
-            fence = (m.group(1)[0], len(m.group(1)), info in DIAGRAM_FENCES)
-            linkdef = False
-            out.append("")
-            continue
-        if not inside:
-            if not line.strip():
-                linkdef = False
-            elif LINKDEF_RE.match(line):
-                linkdef = True
-        shown, inside = comment_text_removed(line, inside)
-        out.append("" if linkdef else shown)
-    return out
+        if not inside and not html:
+            m = FENCE_RE.match(line)
+            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                fence, starts = m.group(1), False
+                continue
+            if line.strip() == MATH_FENCE:
+                fence, starts = MATH_FENCE, False
+                continue
+            block = HTML_BLOCK_RE.match(line)
+            if block:
+                tag = block.group(2).lower()
+                html = "</%s>" % tag if not block.group(1) and tag in RAW_TEXT_TAGS else "\n"
+        begins = starts and not inside and not html
+        shown, inside = comment_text_removed(line, inside, not html)
+        if begins and ERRATUM_RE.match(line) and not any(c in "[]" for c in outside_code_spans(shown)):
+            found[i] = shown
+        if html == "\n" and not line.strip() or html != "\n" and html and html in line.lower():
+            html = ""
+        starts = not line.strip()
+    return found
+
+
+def erratum_names(root, line):
+    """Yield (stale name, successor) for each name ``line`` gives an existing successor (#6198)."""
+    if "erratum" not in line.lower():
+        return
+    succ = [s for s in SUCCESSOR_RE.findall(line) if successor_ok(root, s)]
+    if not succ:
+        return
+    for _cited, name, path in tokens(line):
+        if path not in ["scripts/" + s for s in succ]:
+            yield name, succ[0]
 
 
 def collect_errata(root, lines_by_doc):
@@ -458,16 +528,10 @@ def collect_errata(root, lines_by_doc):
     errata, per_doc = {}, {}
     for doc, lines in lines_by_doc:
         rel = doc.relative_to(root).as_posix()
-        for line in visible_lines(lines):
-            if "erratum" not in line.lower():
-                continue
-            succ = [s for s in SUCCESSOR_RE.findall(line) if successor_ok(root, s)]
-            if not succ:
-                continue
-            for _cited, name, path in tokens(line):
-                if path not in ["scripts/" + s for s in succ]:
-                    errata[name] = succ[0]
-                    per_doc.setdefault(rel, {})[name] = succ[0]
+        for text in erratum_lines(lines).values():
+            for name, succ in erratum_names(root, text):
+                errata[name] = succ
+                per_doc.setdefault(rel, {})[name] = succ
     return errata, per_doc
 
 
