@@ -874,14 +874,17 @@ server; raising `max_connections` costs server memory (§10.1).
 | Daemon `sqlx` pool | `AI_MEMORY_PG_POOL_MAX` (→ `postgres_pool_max_connections` → `DEFAULT_MAX_CONNECTIONS`) | Per-daemon ceiling and the term in the sizing rule above. Keep the compiled default while the sum fits; lower it on every daemon when it does not. |
 | Daemon `sqlx` pool | `AI_MEMORY_PG_POOL_MIN` (→ `postgres_pool_min_connections` → `DEFAULT_MIN_CONNECTIONS`) | Warm-connection floor per daemon (default 2). |
 | Daemon `sqlx` pool | `AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS` (→ `postgres_acquire_timeout_secs` → `DEFAULT_ACQUIRE_TIMEOUT_SECS`) | How long a daemon waits for a free pool slot before erroring (default 30 s). Keep ≥ PgBouncer's `query_wait_timeout` so the daemon does not give up before PgBouncer can hand it a server connection. |
-| PgBouncer | `default_pool_size` | Server conns per `(user, db)`. The sum across pools must stay below Postgres `max_connections` (§10.2) minus the superuser reserve. |
+| PgBouncer | `default_pool_size` | Server conns per `(user, db)`; in `session` mode at least the sum of the daemons' `AI_MEMORY_PG_POOL_MAX` using that pair. The server-side bound counts the reserve too: Σ over pools of (`default_pool_size` + `reserve_pool_size`) ≤ Postgres `max_connections` (§10.2) − `superuser_reserved_connections`, because PgBouncer opens up to `reserve_pool_size` server connections above `default_pool_size` when clients queue past `reserve_pool_timeout` (the §5.6.6 run at `default_pool_size = 1` with the template's `reserve_pool_size = 4` shows the second client being given a reserve backend). Either budget the reserve in that sum or set `reserve_pool_size = 0` where `default_pool_size` already equals the clients' sum. |
 | PgBouncer | `max_client_conn` | Total client admission. Set ≥ Σ(per-daemon `AI_MEMORY_PG_POOL_MAX`) across the fleet so no daemon is refused at the door. |
 
 **Invariant:** `Σ(daemon AI_MEMORY_PG_POOL_MAX) ≤ max_client_conn`, and
-`default_pool_size + reserve_pool_size ≤ Postgres max_connections −
-superuser_reserved_connections`. Violating the first starves daemons at
-connect time; violating the second makes Postgres itself refuse
-PgBouncer.
+`Σ over pools of (default_pool_size + reserve_pool_size) ≤ Postgres
+max_connections − superuser_reserved_connections`. Violating the first
+starves daemons at connect time; violating the second makes Postgres itself
+refuse PgBouncer once the reserve is in use (at 15 daemons with
+`AI_MEMORY_PG_POOL_MAX = 13` against `max_connections = 200`, 195 alone looks
+like it fits the 197 available, but 195 + 4 = 199 does not; 12 per daemon
+gives 180 + 4 = 184, the T4 row above).
 
 #### 5.6.6 Why `session` mode — the executed evidence
 
