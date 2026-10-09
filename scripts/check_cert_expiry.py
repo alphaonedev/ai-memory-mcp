@@ -27,7 +27,8 @@ FAILS when that diff touches ANY of:
   * src/handlers/federation_receive.rs
   * src/handlers/federation_signing_check.rs
   * added / removed / renamed `AI_MEMORY_FED_[A-Z0-9_]+` identifiers anywhere
-    in src/  (set-diff of identifiers at merge-base vs the judged commit)
+    in src/  (names new to the judged commit, and names gone from it or
+    whose occurrence count in src/ fell, at merge-base vs the judged commit)
 
 UNLESS the same change also modifies
 `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` (a re-issue or voiding
@@ -105,6 +106,7 @@ Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
 """
 
 import argparse
+import collections
 import contextlib
 import io
 import os
@@ -268,30 +270,56 @@ def changed_paths(repo, frm, to):
     return [p.decode("utf-8", "replace") for p in proc.stdout.split(b"\0") if p]
 
 
-def extract_fed_ids(repo, tree):
-    """Unique AI_MEMORY_FED_* identifiers in src/ at TREE (set of str).
+def extract_fed_id_counts(repo, tree):
+    """Occurrences of each AI_MEMORY_FED_* identifier in src/ at TREE
+    (Counter: identifier -> number of occurrences).
 
     -a, never -I (#6174): for a tree argument git takes binary-ness from the
     WORKING-TREE attributes, which on pull_request belong to the change under
-    test, so -I let that change hide src/ from the scan. A match in a real
-    binary blob can only widen the drift, which fails closed."""
+    test, so -I let that change hide src/ from the scan. Reading binaries adds
+    their matches to BOTH trees' counts; it does not by itself widen or narrow
+    the drift. Occurrences, not just names (#6370): a name that merely survives
+    in a comment elsewhere must not hide the removal of its definition."""
     proc = run_git(repo, "grep", "-h", "-a", "-E", FED_ID_PATTERN, tree, "--", "src")
     if proc.returncode == 1:  # no match
-        return set()
+        return collections.Counter()
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", "replace").strip()
         raise GateError(f"git grep at {tree} exited {proc.returncode}: {err}")
-    return set(FED_ID_RE.findall(proc.stdout.decode("utf-8", "replace")))
+    return collections.Counter(FED_ID_RE.findall(proc.stdout.decode("utf-8", "replace")))
+
+
+def extract_fed_ids(repo, tree):
+    """Unique AI_MEMORY_FED_* identifiers in src/ at TREE (set of str)."""
+    return set(extract_fed_id_counts(repo, tree))
+
+
+def fed_id_delta(base_counts, head_counts):
+    """(added, removed) identifier drift between two occurrence Counters.
+
+    added: names new to the head. removed: names gone from the head, and names
+    whose occurrence count FELL (the definition may have been removed while a
+    comment or test literal still names it, #6370); the latter carry the count
+    change. An extra mention of an existing name is not drift."""
+    added = sorted(set(head_counts) - set(base_counts))
+    removed = []
+    for name in sorted(base_counts):
+        before, after = base_counts[name], head_counts.get(name, 0)
+        if after == 0:
+            removed.append(name)
+        elif after < before:
+            removed.append(f"{name} (occurrences in src/ fell {before} -> {after})")
+    return added, removed
 
 
 def wire_drift(repo, frm, to):
     """Section 7 surface that differs between two trees: watched paths, then
     +added / -removed AI_MEMORY_FED_* identifiers. Empty list = no drift."""
     out = [p for p in changed_paths(repo, frm, to) if is_watched_path(p)]
-    from_ids = extract_fed_ids(repo, frm)
-    to_ids = extract_fed_ids(repo, to)
-    out.extend("+" + i for i in sorted(to_ids - from_ids))
-    out.extend("-" + i for i in sorted(from_ids - to_ids))
+    added, removed = fed_id_delta(extract_fed_id_counts(repo, frm),
+                                  extract_fed_id_counts(repo, to))
+    out.extend("+" + i for i in added)
+    out.extend("-" + i for i in removed)
     return out
 
 
@@ -497,10 +525,8 @@ def _judge(repo, base, head, judged, mb, tip):
             cert_touched = True
         if is_watched_path(p):
             watched.append(p)
-    base_ids = extract_fed_ids(repo, mb)
-    head_ids = extract_fed_ids(repo, judged)
-    added = sorted(head_ids - base_ids)
-    removed = sorted(base_ids - head_ids)
+    added, removed = fed_id_delta(extract_fed_id_counts(repo, mb),
+                                  extract_fed_id_counts(repo, judged))
     id_changed = bool(added or removed)
 
     if not watched and not id_changed:
