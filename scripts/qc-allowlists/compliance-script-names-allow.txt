@@ -1,0 +1,13 @@
+# compliance-script-names-allow.txt - allowlist for
+# `scripts/check_compliance_script_names.py` (#6141). One entry per line:
+# `<relative-doc-path>:<stale-script-name>`. Each entry is a document that
+# legitimately carries a historical mention of a script that no longer exists
+# in scripts/, covered by an erratum line in docs/compliance/ that names the
+# successor. A stale entry (suppresses nothing) or a malformed entry FAILS the
+# gate. Format follows the other scripts/qc-allowlists/*.txt ledgers.
+#
+# v1.0.0-DECLARATION.md is SHA-256 pinned and cannot carry an erratum itself.
+docs/compliance/MISSION-CRITICAL-CERTIFICATION-STANDARD-v1.md:check-cert-expiry.sh
+docs/compliance/BALLOT-PROCEDURE.md:check-cert-expiry.sh
+docs/compliance/v1.0.0-DECLARATION.md:check-cert-expiry.sh
+docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md:check-cert-expiry.sh
