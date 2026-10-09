@@ -927,6 +927,47 @@ def shim_boundary_robustness_violation(tmp):
     return None
 
 
+def deep_scratch_violation(tmp):
+    """None when deep_scratch lands on the exact length, cleans up after itself on
+    failure and the robustness cell turns a build failure into a named violation
+    (#6145 R4-F1/F2/F3), else a description."""
+    for want in (2500, 3000):
+        base = None
+        try:
+            base, cur = deep_scratch(tmp, want)
+            got = len(os.fsencode(str(cur)))
+            if got != want:
+                return f"deep_scratch({want}) built a {got}-byte path, not the exact length"
+        except OSError as exc:
+            return f"deep_scratch({want}) raised {type(exc).__name__}: {exc}"
+        finally:
+            if base is not None:
+                shutil.rmtree(base, ignore_errors=True)
+    try:
+        deep_scratch(tmp, 10)
+    except OSError:
+        pass
+    else:
+        return "deep_scratch with a target shorter than its base did not fail"
+    left = sorted(p.name for p in tmp.glob("gitshim-deep.*"))
+    if left:
+        return f"a failed deep_scratch left {left!r} behind"
+    real, boom = globals()["deep_scratch"], OSError(28, "No space left on device")
+
+    def failing(_tmp, _target):
+        raise boom
+    globals()["deep_scratch"] = failing
+    try:
+        res = shim_boundary_robustness_violation(tmp)
+    except Exception as exc:  # noqa: BLE001 - the cell must report, never raise
+        return f"a deep_scratch build failure raised {type(exc).__name__}: {exc}"
+    finally:
+        globals()["deep_scratch"] = real
+    if res is None or not res.startswith("could not build the near-PATH_MAX scratch"):
+        return f"a deep_scratch build failure gave {res!r}, not a named violation"
+    return None
+
+
 def shim_isolation_violation(tmp, interpreter=None):
     """None when the git shim is isolated, else a description (#6145). Plants an
     empty `gitshim_canary_6145.py` beside the shim and runs the shim's own probe,
@@ -1018,6 +1059,11 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     robust = shim_boundary_robustness_violation(tmp)
     if robust is not None:
         t.fail(f"(shim-interpreter-robust, #6145): {robust}")
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
+    deepx = deep_scratch_violation(tmp)
+    if deepx is not None:
+        t.fail(f"(shim-deep-scratch, #6145): {deepx}")
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
         return 2
     unexec = shim_isolation_violation(tmp, interpreter=tmp / "no-such-python-6145")
