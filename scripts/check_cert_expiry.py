@@ -28,7 +28,8 @@ FAILS when that diff touches ANY of:
   * src/handlers/federation_signing_check.rs
   * added / removed / renamed `AI_MEMORY_FED_[A-Z0-9_]+` identifiers anywhere
     in src/  (names new to the judged commit, and names gone from it or
-    whose occurrence count in src/ fell, at merge-base vs the judged commit)
+    that lost an occurrence line, keyed on (identifier, trimmed line text), at
+    merge-base vs the judged commit)
 
 UNLESS the same change also modifies
 `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` (a re-issue or voiding
@@ -122,7 +123,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 CERT_DOC = "docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
 FED_ID_PATTERN = "AI_MEMORY_FED_[A-Z0-9_]+"
-FED_ID_RE = re.compile(FED_ID_PATTERN)
+# Left word boundary (#6427): a longer token that merely ends in an identifier
+# (NOTAI_MEMORY_FED_X) is not a mention of it. git grep still selects lines with
+# the unanchored FED_ID_PATTERN; the match itself is taken here.
+FED_ID_RE = re.compile(r"(?<![A-Za-z0-9_])" + FED_ID_PATTERN)
 ZERO_SHA_RE = re.compile(r"^0+$")
 PREFIX = "check-cert-expiry"
 # Every sha taken from the environment is exactly 40 (SHA-1) or 64 (SHA-256)
@@ -272,43 +276,69 @@ def changed_paths(repo, frm, to):
 
 def extract_fed_id_counts(repo, tree):
     """Occurrences of each AI_MEMORY_FED_* identifier in src/ at TREE
-    (Counter: identifier -> number of occurrences).
+    (Counter: (identifier, trimmed line text) -> number of occurrences).
 
     -a, never -I (#6174): for a tree argument git takes binary-ness from the
     WORKING-TREE attributes, which on pull_request belong to the change under
     test, so -I let that change hide src/ from the scan. Reading binaries adds
     their matches to BOTH trees' counts; it does not by itself widen or narrow
     the drift. Occurrences, not just names (#6370): a name that merely survives
-    in a comment elsewhere must not hide the removal of its definition."""
+    in a comment elsewhere must not hide the removal of its definition. Keyed on
+    the trimmed line as well as the name (#6427): a single global count per name
+    could be offset by a mention added anywhere else, so a line that carried a
+    name and is gone from the head is a loss whatever else mentions the name.
+    Lines are compared without their path, so moving a line between files and
+    re-indenting it is not drift."""
     proc = run_git(repo, "grep", "-h", "-a", "-E", FED_ID_PATTERN, tree, "--", "src")
     if proc.returncode == 1:  # no match
         return collections.Counter()
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", "replace").strip()
         raise GateError(f"git grep at {tree} exited {proc.returncode}: {err}")
-    return collections.Counter(FED_ID_RE.findall(proc.stdout.decode("utf-8", "replace")))
+    counts = collections.Counter()
+    for line in proc.stdout.decode("utf-8", "replace").split("\n"):
+        text = line.strip()
+        for name in FED_ID_RE.findall(text):
+            counts[(name, text)] += 1
+    return counts
 
 
 def extract_fed_ids(repo, tree):
     """Unique AI_MEMORY_FED_* identifiers in src/ at TREE (set of str)."""
-    return set(extract_fed_id_counts(repo, tree))
+    return {name for name, _ in extract_fed_id_counts(repo, tree)}
 
 
 def fed_id_delta(base_counts, head_counts):
-    """(added, removed) identifier drift between two occurrence Counters.
+    """(added, removed) identifier drift between two keyed occurrence Counters.
 
     added: names new to the head. removed: names gone from the head, and names
-    whose occurrence count FELL (the definition may have been removed while a
-    comment or test literal still names it, #6370); the latter carry the count
-    change. An extra mention of an existing name is not drift."""
-    added = sorted(set(head_counts) - set(base_counts))
+    that lost an occurrence line: some (name, trimmed line) pair has fewer
+    matches at the head than at the base (the definition may have been removed,
+    replaced by a comment or wrapped in one while a mention elsewhere still
+    names it, #6370, #6427). Such a name carries the count change. An extra
+    mention of an existing name, or a line moved between files, is not drift."""
+    base_names = collections.Counter()
+    head_names = collections.Counter()
+    for (name, _), n in base_counts.items():
+        base_names[name] += n
+    for (name, _), n in head_counts.items():
+        head_names[name] += n
+    added = sorted(set(head_names) - set(base_names))
+    lost = collections.Counter()
+    for (name, text), before in base_counts.items():
+        if head_counts.get((name, text), 0) < before:
+            lost[name] += before - head_counts.get((name, text), 0)
     removed = []
-    for name in sorted(base_counts):
-        before, after = base_counts[name], head_counts.get(name, 0)
+    for name in sorted(base_names):
+        before, after = base_names[name], head_names.get(name, 0)
         if after == 0:
             removed.append(name)
-        elif after < before:
-            removed.append(f"{name} (occurrences in src/ fell {before} -> {after})")
+        elif lost[name]:
+            if after < before:
+                removed.append(f"{name} (occurrences in src/ fell {before} -> {after})")
+            else:
+                removed.append(f"{name} ({lost[name]} occurrence(s) on lines that no longer "
+                               f"exist in src/, offset by mentions elsewhere: {before} -> {after})")
     return added, removed
 
 
@@ -1817,6 +1847,11 @@ SELF_TEST_OK = (
     "(mask, mask-gate, mask-drift, mask-add, #6370) removing the definition of an identifier "
     "that a comment still names stays RED (occurrence counts, not name sets), while an extra "
     "mention is GREEN; "
+    "(mask-xfile, mask-incomment, mask-longer, mask-blockcomment, mask-annot, #6427) a removed "
+    "definition offset by a mention in another file, a comment in its place, a longer token, a "
+    "block comment around it or the drift annotation text stays RED, as do look-alike spellings "
+    "(mask-confusable, mask-confusable-note, mask-zwsp, mask-crsplit) and a removed mention "
+    "(mask-note-removed), while a defining line moved to another file is GREEN (mask-moved); "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
