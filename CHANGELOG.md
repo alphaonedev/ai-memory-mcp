@@ -3080,7 +3080,7 @@ backend and missing or divergently implemented on its twin). Pinned by
   `store/sqlite.rs` (the SAL store's separate shared writer), `quotas.rs` (2),
   `atomisation/mod.rs`, `federation/push_dlq.rs`,
   `mcp/tools/store/synthesis.rs`, and `cli/io.rs` (2 — the `mine` importer's
-  chunked `BEGIN`/`COMMIT` loop, via `WriteTxn::begin_deferred`).
+  chunked `BEGIN`/`COMMIT` loop, opened IMMEDIATE via `WriteTxn::begin` since #5084).
   `mcp/tools/skill_register.rs` and `mcp/tools/skill_retire.rs` already used
   RAII `rusqlite::Transaction` and are unchanged.
 - **A failed `COMMIT` no longer strands the connection either.** The house
