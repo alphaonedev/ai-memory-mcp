@@ -151,8 +151,12 @@ LOWER_PROSE_WORD = re.compile(r"[a-z]{1,12}" + TRAIL, re.ASCII)
 # in at most one word; digit groups joined by `_`, `.` or spaces (`4111 1111 1111 1111`) are one longer number.
 MAX_COUNT_DIGITS = 9
 ALWAYS_MASK_NAME = re.compile(r"(?i)passw(?:or)?d|passphrase")
-# #6163 round 3 (review G2): the user name is optional (`redis://:<password>@host`).
-URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]*:([^@\s/]+)@")
+# #6163 round 3 (review G2): the user name is optional (`redis://:<password>@host`). Round 4 (security F4): the
+# password runs to the LAST `@` of the authority, so a password holding `@` is masked whole; a user-only userinfo
+# of URL_USER_MIN or more characters (a token sent as the user name) is masked too, a short one (`git@`) is shown.
+URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]*:([^/?#\s]+)@")
+URL_USER_MIN = 20
+URL_USER_ONLY = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://([^/?#\s:@]{" + str(URL_USER_MIN) + r",})@")
 BEARER_VALUE = re.compile(r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/-]{8,}=*)")
 PROVIDER_KEY_SHAPE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|(?:AKIA|ASIA)[0-9A-Z]{16}|"
                                 r"xox[abposr]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{20,}|"
@@ -493,7 +497,7 @@ class Redactor:
             self.count += found
             line, found = mask_table_cells(line)
             self.count += found
-            for pattern in (URL_USERINFO, BEARER_VALUE, PROVIDER_KEY_SHAPE, JWT_SHAPE):
+            for pattern in (URL_USERINFO, URL_USER_ONLY, BEARER_VALUE, PROVIDER_KEY_SHAPE, JWT_SHAPE):
                 line, found = mask_group(pattern, line)
                 self.count += found
             out.append(line)
