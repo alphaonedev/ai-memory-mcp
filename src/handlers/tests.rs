@@ -17505,3 +17505,7 @@ fn a_latched_audit_trail_refuses_sync_push_on_both_backends_4400() {
         },
     );
 }
+
+// #3653 — the store counter is moved by real HTTP writes.
+#[path = "tests/store_metrics_3653.rs"]
+mod store_metrics_3653;
