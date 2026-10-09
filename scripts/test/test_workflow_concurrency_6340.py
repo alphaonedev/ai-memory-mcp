@@ -12,12 +12,12 @@ cancelled by a later push while it is IN PROGRESS.
 WHAT IT DOES NOT DO (GitHub semantics, pinned so the docs cannot overclaim):
   * A PENDING (queued) run is still replaced when a newer run queues in the same
     group, whatever ``cancel-in-progress`` says.
-  * ci.yml and coverage.yml key the group by ref WITHOUT ``github.event_name``
-    (deliberate: an internal PR's pull_request run and its head-branch push run
-    coalesce, so one sha is not tested twice). A pull_request run on the same
-    branch can therefore still cancel an in-progress push run there.
-    postgres-ignored.yml and cert-postgres-age.yml include ``github.event_name``
-    and cannot.
+  * All four files key the group with ``github.event_name`` (#6117: ci.yml and
+    coverage.yml run on push to chain/**, and a chain carrier is the head of its
+    promotion PR, so a shared key would let the pull_request run cancel the
+    carrier's push run). A pull_request run therefore cannot cancel an
+    in-progress push run in any of the four; a push and a pull_request run of
+    one sha both complete.
 
 Stdlib only; the top-level ``concurrency:`` block is read by line, closed-world:
 a block this reader cannot parse is a failure.
@@ -38,8 +38,8 @@ FORK_SAFE_TAIL = (
 )
 # file -> whether its group key is event-distinct (contains github.event_name)
 EXPECTED = {
-    "ci.yml": False,
-    "coverage.yml": False,
+    "ci.yml": True,
+    "coverage.yml": True,
     "postgres-ignored.yml": True,
     "cert-postgres-age.yml": True,
 }

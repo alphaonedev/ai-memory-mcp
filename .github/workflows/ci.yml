@@ -78,13 +78,26 @@ name: CI
 # record the answer as a `# RUNNER PLACEMENT` comment on the job.
 
 on:
+  # #6117: chain/** (the Promotion carriers) IS in push.branches: the conductor
+  # lands lane PRs, release syncs and bootstrap merges on the carrier with local
+  # signed merges, and before this entry a push to chain/promo6-ssh ran no
+  # workflow at all (carrier-only defects #6115 / #6116 surfaced only once a PR
+  # was opened against the carrier). The carrier is ALSO the head of its
+  # promotion PR (#6160), i.e. the #2508 push+pull_request twin, which is why the
+  # concurrency group below is keyed per event: both runs complete, neither is
+  # cancelled. The classify arm below runs the FULL pipeline on a carrier push
+  # so the push verdict is never narrower than the promotion PR's on the same
+  # SHA. Pinned by R-CHAIN / R-CHAIN-KEY in
+  # scripts/test/test_workflow_pr_triggers_5447.py and by C4 of
+  # scripts/test/test-ci-workflow-invariants.sh.
   push:
-    branches: [main, develop, "release/**"]
+    branches: [main, develop, "release/**", "chain/**"]
     tags: ["v*"]
   # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
   # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
   # together), #2523 and #2508 (push must not overlap a PR head such as
-  # rehearsal/audit-wip, the head of the promotion PR).
+  # rehearsal/audit-wip, the head of the promotion PR). The #6117 chain/** push
+  # entry above does not loosen this: R-PUSH still refuses rehearsal/** on push.
   pull_request:
     branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]
   # Merge Queue (#3089) — GitHub runs a queued PR's REQUIRED checks against the
@@ -131,14 +144,25 @@ permissions:
 # to head.repo==github.repository (internal-PR / maintainer paths) so
 # fork PRs cannot collide with branch keys.
 #
+# #6117 — the key is EVENT-DISTINCT (`github.event_name` is folded in).
+# `push.branches` lists chain/**, and a chain carrier is the HEAD of its
+# promotion PR (#6160), so a push to it fires a push run AND a pull_request
+# synchronize run for one sha. Under a shared key the pull_request run would
+# cancel the in-progress push run (or replace it while queued) and leave a
+# permanent CANCELLED check-run on the carrier — the #2508 class rule (d) of
+# scripts/check-required-contexts.sh exists for. Folding in the event name
+# is the remedy that rule and scripts/qc-allowlists/dual-trigger-cancel-allow.txt
+# sanction (precedent: release-shape.yml, cert-postgres-age.yml,
+# postgres-ignored.yml). Cost: a push to a branch that is a PR head (a chain
+# carrier; a release/** -> main merge-up) keeps BOTH runs; #6117 accepts that
+# second run because the carrier needs a verdict on every push.
 # #6340: cancel-in-progress is true only for pull_request runs, so a push run
-# on release/**, main or develop is not cancelled by a later push while it is
-# in progress. A queued run is still replaced by a newer queued run (GitHub
-# semantics), and because this key coalesces push + same-branch internal PR
-# events, a pull_request run on that branch can still cancel an in-progress
-# push run. Pinned by scripts/test/test_workflow_concurrency_6340.py.
+# on release/**, main, develop or chain/** is not cancelled by a later push
+# while it is in progress. A queued run is still replaced by a newer queued
+# run in the same group (GitHub semantics). Pinned by
+# scripts/test/test_workflow_concurrency_6340.py.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -285,6 +309,23 @@ jobs:
             echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
             echo "test_impact_reason=merge_group-full-pipeline" >> "$GITHUB_OUTPUT"
             echo "::notice::merge_group event — running the full pipeline (not docs-only)"
+            exit 0
+          fi
+          # Carrier push (#6117) — a push to a Promotion carrier (chain/**) is
+          # a signed merge landing on a branch that is ALSO the head of its
+          # promotion PR (#6160). That PR's synchronize run classifies the
+          # WHOLE carrier against the release base; this push run reports
+          # under the SAME context names on the SAME sha, so it must never be
+          # narrower (a docs-only lane merge would otherwise leave `skipped`
+          # Check rows beside the PR run's real verdicts). Full pipeline,
+          # like merge_group. $GITHUB_REF is the runner's default env var.
+          if [ "$EVENT_NAME" = "push" ] && [ "${GITHUB_REF#refs/heads/chain/}" != "$GITHUB_REF" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
+            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_reason=carrier-push-full-pipeline" >> "$GITHUB_OUTPUT"
+            echo "::notice::push to a chain carrier (#6117) — running the full pipeline (not docs-only)"
             exit 0
           fi
           if [ "$EVENT_NAME" = "pull_request" ]; then

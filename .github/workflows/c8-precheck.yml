@@ -64,8 +64,19 @@ on:
   # tool-count-drift.yml; same shape ci.yml and coverage.yml already use.
   # Statically enforced from here on by rule (d) of
   # scripts/check-required-contexts.sh, which runs in this very workflow.
+  #
+  # #6117 — chain/** (the Promotion carriers) is the one PR-HEAD pattern that
+  # IS listed here, on purpose: a carrier receives the conductor's local signed
+  # merges, and without a push lane a merge into chain/promo6-ssh had zero
+  # check-runs (#6115 / #6116 were invisible until a PR opened against it).
+  # The twin that rule (d) guards against is defused differently from the
+  # narrowing above: the concurrency group below is keyed per event, so the
+  # push run and the promotion PR's synchronize run (#6160 has the carrier as
+  # its head) never share a cancel group. The range-scoped gates below widen a
+  # carrier push to the whole carrier (merge-base(release/v1.0.0, HEAD)..HEAD),
+  # so the push verdict is never narrower than the PR verdict it sits beside.
   push:
-    branches: [main, develop, "release/**"]
+    branches: [main, develop, "release/**", "chain/**"]
   # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
   # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
   # together), #2523 and #2508 (push must not overlap a PR head such as
@@ -87,11 +98,13 @@ on:
 permissions:
   contents: read
 
-# Fork-PR-safe concurrency key: coalesces push + same-branch internal
-# PR events; isolates fork PRs by PR number. See ci.yml for full
-# rationale.
+# Fork-PR-safe concurrency key; isolates fork PRs by PR number. See ci.yml
+# for full rationale. #6117: keyed per event (`github.event_name`) because
+# push.branches lists chain/** and a chain carrier is the head of its
+# promotion PR — a shared key would cancel one of the two runs per sha
+# (#2508, rule (d) of scripts/check-required-contexts.sh).
 concurrency:
-  group: c8-precheck-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
+  group: c8-precheck-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -560,12 +573,37 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      - name: Resolve the range start for a carrier push (#6117)
+        id: carrier
+        # A push to a Promotion carrier (chain/**) is judged over the WHOLE
+        # carrier, merge-base(release/v1.0.0, HEAD)..HEAD — the range the
+        # carrier's promotion PR is judged over — never over just the merge
+        # the push delivered: both runs report under this context name on one
+        # sha, and a narrower push verdict must not stand in for the PR one.
+        # Off a carrier push `before` is empty and github.event.before applies
+        # as before. The release ref is the one
+        # scripts/check_promotion_geometry.py pins (RELEASE). Fails closed.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          CARRIER_RELEASE_REF: release/v1.0.0
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "push" ] || [ "${REF#refs/heads/chain/}" = "$REF" ]; then
+            echo "before=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF"
+          before="$(git merge-base "origin/$CARRIER_RELEASE_REF" HEAD)"
+          echo "carrier push: range start = merge-base(origin/$CARRIER_RELEASE_REF, HEAD) = $before"
+          echo "before=$before" >> "$GITHUB_OUTPUT"
       - name: Run declaration hash gate
         env:
           # D1b compares the pin against its content at the PR base (a push
-          # compares against the previous head); an absent ref is tolerated
-          # only by SKIPPING D1b, never the hash check itself.
-          DECLARATION_GATE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # compares against the previous head; a carrier push against the
+          # release merge-base, #6117); an absent ref is tolerated only by
+          # SKIPPING D1b, never the hash check itself.
+          DECLARATION_GATE_BASE: ${{ github.event.pull_request.base.sha || steps.carrier.outputs.before || github.event.before }}
         run: bash scripts/check-declaration-hash.sh
       - name: Self-test the gate (regression evidence)
         # Plants a softened target without a re-pin (D1), a re-pin without a
@@ -1125,13 +1163,39 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      - name: Resolve the range start for a carrier push (#6117)
+        id: carrier
+        # A push to a Promotion carrier (chain/**) is judged over the WHOLE
+        # carrier, merge-base(release/v1.0.0, HEAD)..HEAD — the range the
+        # carrier's promotion PR is judged over (#6137: first parent on the
+        # live base .. merge commit) — never over just the merge the push
+        # delivered: both runs report under this REQUIRED context name on one
+        # sha, and a narrower push verdict must not stand in for the PR one.
+        # Off a carrier push `before` is empty and github.event.before applies
+        # as before (the gate's own push arm: merge-base(before, sha)..sha). The
+        # release ref is the one scripts/check_promotion_geometry.py pins
+        # (RELEASE). Fails closed: an unresolvable merge-base fails the job.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          CARRIER_RELEASE_REF: release/v1.0.0
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "push" ] || [ "${REF#refs/heads/chain/}" = "$REF" ]; then
+            echo "before=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF"
+          before="$(git merge-base "origin/$CARRIER_RELEASE_REF" HEAD)"
+          echo "carrier push: range start = merge-base(origin/$CARRIER_RELEASE_REF, HEAD) = $before"
+          echo "before=$before" >> "$GITHUB_OUTPUT"
       - name: Run enterprise-federation cert-expiry gate
         env:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GITHUB_BASE_REF: ${{ github.base_ref }}
-          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_EVENT_BEFORE: ${{ steps.carrier.outputs.before || github.event.before }}
         run: python3 -I scripts/check_cert_expiry.py
       - name: Self-test the gate (regression evidence)
         # --self-test builds a throwaway repo under .local-runs/ (never a
@@ -1325,12 +1389,36 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      - name: Resolve the range start for a carrier push (#6117)
+        id: carrier
+        # A push to a Promotion carrier (chain/**) is judged over the WHOLE
+        # carrier, merge-base(release/v1.0.0, HEAD)..HEAD — the range the
+        # carrier's promotion PR is judged over — never over just the merge
+        # the push delivered: both runs report under this context name on one
+        # sha, and a narrower push verdict must not stand in for the PR one.
+        # Off a carrier push `before` is empty and github.event.before applies
+        # as before. The release ref is the one
+        # scripts/check_promotion_geometry.py pins (RELEASE). Fails closed.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          CARRIER_RELEASE_REF: release/v1.0.0
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "push" ] || [ "${REF#refs/heads/chain/}" = "$REF" ]; then
+            echo "before=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF"
+          before="$(git merge-base "origin/$CARRIER_RELEASE_REF" HEAD)"
+          echo "carrier push: range start = merge-base(origin/$CARRIER_RELEASE_REF, HEAD) = $before"
+          echo "before=$before" >> "$GITHUB_OUTPUT"
       - name: Run stale contract-assertion gate over the change range
         env:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_EVENT_BEFORE: ${{ steps.carrier.outputs.before || github.event.before }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
@@ -1359,12 +1447,36 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      - name: Resolve the range start for a carrier push (#6117)
+        id: carrier
+        # A push to a Promotion carrier (chain/**) is judged over the WHOLE
+        # carrier, merge-base(release/v1.0.0, HEAD)..HEAD — the range the
+        # carrier's promotion PR is judged over — never over just the merge
+        # the push delivered: both runs report under this context name on one
+        # sha, and a narrower push verdict must not stand in for the PR one.
+        # Off a carrier push `before` is empty and github.event.before applies
+        # as before. The release ref is the one
+        # scripts/check_promotion_geometry.py pins (RELEASE). Fails closed.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          CARRIER_RELEASE_REF: release/v1.0.0
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "push" ] || [ "${REF#refs/heads/chain/}" = "$REF" ]; then
+            echo "before=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF"
+          before="$(git merge-base "origin/$CARRIER_RELEASE_REF" HEAD)"
+          echo "carrier push: range start = merge-base(origin/$CARRIER_RELEASE_REF, HEAD) = $before"
+          echo "before=$before" >> "$GITHUB_OUTPUT"
       - name: Run count-assertion declaration gate over the change range
         env:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_EVENT_BEFORE: ${{ steps.carrier.outputs.before || github.event.before }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
