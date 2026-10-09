@@ -8,10 +8,12 @@ objects with `git ls-tree` and `git cat-file` into a scratch directory. Nothing 
 or checked out, and a symlink blob (mode 120000) at any of the three paths is refused. Credential-shaped head text is
 masked in the summary where it enters the report (#6163): a `name=value` / `name: value` whose name holds a password,
 passphrase, secret, token, API key, access key, private key or credential word (quoted, multi-word and JSON-quoted
-forms included; a count, a switch word or an UPPER_SNAKE environment variable name is shown unless the name is a
-password or passphrase), URL userinfo, an Authorization Bearer/Basic value, a GitHub, AWS access key id, Slack or
-`sk-` provider token, and a PEM or PGP private key block. Lines this script writes are never masked, and the verdict
-is computed on the unmasked text.
+forms included, past an escaped quote and to the end of the line when the quote is never closed; a count of at most
+9 digits or a switch word is shown, and an UPPER_SNAKE value only as an environment variable name, unless the name is a
+password or passphrase), URL userinfo (an empty user name included), an Authorization Bearer/Basic value, a GitHub,
+AWS access key id, Slack or `sk-` provider token, and a PEM or PGP private key block. A diff line inside a private key
+block is masked by its index on its own side, so it is masked even when the BEGIN line lies outside its hunk. Lines
+this script writes are never masked, and the verdict is computed on the unmasked text.
 
 The BASE guard (scripts/check-claude-md-size.py of the base checkout) and the BASE manifest
 (scripts/qc-allowlists/claude-md-rule-sections.sha256) then judge the head copies:
@@ -82,7 +84,7 @@ CENSUS_DIGITS = re.compile(
 # R4 (#4507): the code and configuration that judge a rule change. A change to any of them is reported and needs
 # the trailer, so a guard weakened in one PR cannot silently judge the next one. The manifest is not listed: the
 # section comparison above already judges it against the base.
-TRUSTED_PATHS = ("scripts/check-claude-md-size.py", "scripts/claude-md-rule-compare.py",
+GUARD_PATHS = ("scripts/check-claude-md-size.py", "scripts/claude-md-rule-compare.py",
                  ".github/workflows/claude-md-guard.yml", ".github/workflows/claude-md-rule-compare.yml",
                  ".github/CODEOWNERS")
 DIFF_LINE_CAP = 200
@@ -95,13 +97,25 @@ PR_NUMBER = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
 # the line, so `password = a b` masks both words.
 CREDENTIAL_VALUE = re.compile(
     r"(?i)(?<![\w-])([\w-]*(?:passw(?:or)?d|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|"
-    r"credential)[\w-]*)([\"'`]?\s*[:=]\s*)(?:\"([^\"\n]*)\"|'([^'\n]*)'|([^\s\"'`]+(?:[ \t]+[^\s\"'`]+)*))")
-# #6163 round 2: a value that is a count, a switch word or an UPPER_SNAKE environment variable name is configuration,
-# not a credential (a ceiling change in rule text must stay readable). A password or passphrase is masked regardless.
-PLAIN_VALUE = re.compile(r"(?:\d+(?:[.,_]\d+)*|true|false|yes|no|on|off|enabled|disabled|none|null|"
-                         r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)[.,;:)\]}]*", re.ASCII)
+    r"credential)[\w-]*)([\"'`]?\s*[:=]\s*)(?:\"((?:[^\"\\\n]|\\.?)*)(?:\"|$)|'((?:[^'\\\n]|\\.?)*)(?:'|$)|"
+    r"([^\s\"'`]+(?:[ \t]+[^\s\"'`]+)*))")
+# #6163 round 3 (review G3): a quoted value runs to its closing quote past `\"` escapes, or to the end of the line when
+# the quote is never closed, so neither an escaped quote nor a missing one leaves the rest of the value visible.
+# #6163 round 2/3: a value that is a count or a switch word is configuration, not a credential (a ceiling change in rule
+# text must stay readable). A count is at most 9 digits with up to three 1-3 digit groups (review G4); a longer number
+# is masked. A password or passphrase is masked regardless.
+PLAIN_VALUE = re.compile(r"(?:\d{1,9}(?:[.,_]\d{1,3}){0,3}|true|false|yes|no|on|off|enabled|disabled|none|null)"
+                         r"[.,;:)\]}]*", re.ASCII)
+# #6163 round 3 (review G4): an UPPER_SNAKE value is shown only as the NAME of an environment variable: under a name
+# ending in env/var/name, or when the value itself ends in a credential word (`api_key: OPENAI_API_KEY`), and never
+# when it holds a run of 4 or more digits. Any other upper-case value (`token=AB_CD_EF12`) is masked.
+ENV_NAME_VALUE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+[.,;:)\]}]*", re.ASCII)
+ENV_NAME_KEY = re.compile(r"(?i)[_-](?:env|var|name)$")
+ENV_NAME_TAIL = re.compile(r"_(?:KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIALS?)[.,;:)\]}]*$")
+LONG_DIGITS = re.compile(r"\d{4}")
 ALWAYS_MASK_NAME = re.compile(r"(?i)passw(?:or)?d|passphrase")
-URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]+:([^@\s/]+)@")
+# #6163 round 3 (review G2): the user name is optional (`redis://:<password>@host`).
+URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]*:([^@\s/]+)@")
 BEARER_VALUE = re.compile(r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/-]{8,}=*)")
 PROVIDER_KEY_SHAPE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|(?:AKIA|ASIA)[0-9A-Z]{16}|"
                                 r"xox[abposr]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{20,})\b")
@@ -205,9 +219,9 @@ def span(text: str) -> str:
 
 
 def guard_path_changes(repo: Path, base_sha: str, head_sha: str) -> list:
-    """The TRUSTED_PATHS the head changes relative to its merge base with the base (fail closed on git error)."""
+    """The GUARD_PATHS the head changes relative to its merge base with the base (fail closed on git error)."""
     merge_base = git(repo, "merge-base", base_sha, head_sha).decode("ascii").strip()
-    out = git(repo, "diff", "--name-only", "-z", "--no-renames", merge_base, head_sha, "--", *TRUSTED_PATHS)
+    out = git(repo, "diff", "--name-only", "-z", "--no-renames", merge_base, head_sha, "--", *GUARD_PATHS)
     return sorted(name.decode("utf-8", "replace") for name in out.split(b"\0") if name)
 
 
@@ -219,9 +233,20 @@ def head_fetch_args(pr_number: str) -> tuple:
     return ("fetch", "--no-tags", "origin", f"+refs/pull/{pr_number}/head:refs/remotes/pull/head")
 
 
+def plain_word(name: str, word: str) -> bool:
+    """#6163: True when `word`, the value of credential name `name`, is configuration (a count, a switch word, or an
+    environment variable name per ENV_NAME_VALUE) rather than a credential. A password or passphrase is never plain."""
+    if ALWAYS_MASK_NAME.search(name):
+        return False
+    if PLAIN_VALUE.fullmatch(word):
+        return True
+    return bool(ENV_NAME_VALUE.fullmatch(word)) and not LONG_DIGITS.search(word) and bool(
+        ENV_NAME_KEY.search(name) or ENV_NAME_TAIL.search(word))
+
+
 def mask_named_values(line: str) -> tuple:
     """#6163: mask the value of every credential-named `name=value` / `name: value` in one line; returns (line, count).
-    A plain value (PLAIN_VALUE) is left visible unless the name is a password or passphrase."""
+    A plain value (plain_word) is left visible unless the name is a password or passphrase."""
     out, pos, count = [], 0, 0
     while True:
         match = CREDENTIAL_VALUE.search(line, pos)
@@ -231,7 +256,7 @@ def mask_named_values(line: str) -> tuple:
         value = match.group(group)
         first = value.split()[0] if value.split() else ""
         plain = (group == 5 and first or value.strip())
-        if not value.strip() or (not ALWAYS_MASK_NAME.search(match.group(1)) and PLAIN_VALUE.fullmatch(plain)):
+        if not value.strip() or plain_word(match.group(1), plain):
             stop = match.start(group) + (len(first) if group == 5 else len(value) + 1)
             out.append(line[pos:stop])
             pos = stop
@@ -251,6 +276,17 @@ def mask_group(pattern, line: str) -> tuple:
     return pattern.subn(replace, line)
 
 
+def key_line_indexes(lines: list, in_key: bool = False) -> set:
+    """#6163 round 3 (review G1): the indexes of `lines` inside a private key block, BEGIN and END lines included; an
+    unterminated BEGIN runs to the end. `in_key` starts inside a block (a section whose heading is a BEGIN line)."""
+    inside = set()
+    for index, line in enumerate(lines):
+        if in_key or PRIVATE_KEY_BEGIN.search(line):
+            inside.add(index)
+            in_key = not PRIVATE_KEY_END.search(line)
+    return inside
+
+
 class Redactor:
     """#6163: masks credential-shaped HEAD text at the point it enters the report (one diff block or one inline span
     per call) and counts what it masked. The private key state never outlives one call, so an unterminated BEGIN line
@@ -259,12 +295,15 @@ class Redactor:
     def __init__(self) -> None:
         self.count = 0
 
-    def mask(self, text: str, in_key: bool = False) -> str:
-        """Mask `text`; `in_key` starts the block inside a private key (a section whose heading is a BEGIN line)."""
+    def mask_rows(self, rows: list) -> list:
+        """Mask `rows` of (text, kind): kind "meta" is a diff header line the script writes (shown as is), "key" is a
+        line inside a private key block (masked whole, its diff prefix kept), "text" is masked shape by shape."""
         out = []
-        for line in text.split("\n"):
-            if in_key or PRIVATE_KEY_BEGIN.search(line):
-                in_key = not PRIVATE_KEY_END.search(line)
+        for line, kind in rows:
+            if kind == "meta":
+                out.append(line)
+                continue
+            if kind == "key":
                 self.count += 1
                 out.append(line[:1] + MASK if line[:1] in "+- " else MASK)
                 continue
@@ -274,7 +313,14 @@ class Redactor:
                 line, found = mask_group(pattern, line)
                 self.count += found
             out.append(line)
-        return "\n".join(out)
+        return out
+
+    def mask(self, text: str, in_key: bool = False) -> str:
+        """Mask `text`; `in_key` starts the block inside a private key (a section whose heading is a BEGIN line)."""
+        lines = text.split("\n")
+        inside = key_line_indexes(lines, in_key)
+        return "\n".join(self.mask_rows([(line, "key" if index in inside else "text")
+                                         for index, line in enumerate(lines)]))
 
     def note(self) -> list:
         if not self.count:
@@ -283,13 +329,41 @@ class Redactor:
                 "diff shows the raw text and the verdict was computed on it."]
 
 
+def unified_range(start: int, stop: int) -> str:
+    """The `start,length` of a unified diff hunk header for the 0-based range [start, stop) (difflib's format)."""
+    length = stop - start
+    if length == 1:
+        return str(start + 1)
+    return f"{start + 1 if length else start},{length}"
+
+
 def unified(old: str, new: str, key: str, redactor=None) -> str:
-    diff = list(difflib.unified_diff(old.split("\n"), new.split("\n"), "base", "head", lineterm="", n=2))
-    truncated = len(diff) > DIFF_LINE_CAP
-    body = "\n".join(diff[:DIFF_LINE_CAP])
-    if redactor is not None:
-        body = redactor.mask(body, bool(PRIVATE_KEY_BEGIN.search(key)) and not PRIVATE_KEY_END.search(key))
-    return body + (f"\n... diff truncated at {DIFF_LINE_CAP} lines" if truncated else "")
+    """A unified diff (2 context lines, the same text difflib.unified_diff gives) of one section, capped at
+    DIFF_LINE_CAP lines. #6163 round 3 (review G1): every `-`, `+` or context line whose index on its own side lies in a
+    private key block of that side is masked, so a key line prints masked even when its BEGIN line is outside the
+    hunk; a context line is masked when it lies in a block on either side."""
+    old_lines, new_lines = old.split("\n"), new.split("\n")
+    heading_key = bool(PRIVATE_KEY_BEGIN.search(key)) and not PRIVATE_KEY_END.search(key)
+    old_key, new_key = key_line_indexes(old_lines, heading_key), key_line_indexes(new_lines, heading_key)
+    rows = []
+    for group in difflib.SequenceMatcher(None, old_lines, new_lines).get_grouped_opcodes(2):
+        if not rows:
+            rows += [("--- base", "meta"), ("+++ head", "meta")]
+        rows.append((f"@@ -{unified_range(group[0][1], group[-1][2])} "
+                     f"+{unified_range(group[0][3], group[-1][4])} @@", "meta"))
+        for tag, old_start, old_stop, new_start, new_stop in group:
+            if tag == "equal":
+                rows += [(" " + old_lines[index], "key" if index in old_key or new_index in new_key else "text")
+                         for index, new_index in zip(range(old_start, old_stop), range(new_start, new_stop))]
+                continue
+            rows += [("-" + old_lines[index], "key" if index in old_key else "text")
+                     for index in range(old_start, old_stop)]
+            rows += [("+" + new_lines[index], "key" if index in new_key else "text")
+                     for index in range(new_start, new_stop)]
+    truncated = len(rows) > DIFF_LINE_CAP
+    rows = rows[:DIFF_LINE_CAP]
+    lines = redactor.mask_rows(rows) if redactor is not None else [line for line, _kind in rows]
+    return "\n".join(lines) + (f"\n... diff truncated at {DIFF_LINE_CAP} lines" if truncated else "")
 
 
 def approvals(repo: Path, base_sha: str, head_sha: str) -> list:
@@ -417,7 +491,7 @@ def make_repo(guard, root: Path):
         census + "\n", census + "\nThe surface has 103 MCP tools and 99 CLI subcommands (97 in the default build). A vote needs 5 agents.\n",
         1), encoding="utf-8")
     guard.update_manifest_quiet(root)
-    for rel in TRUSTED_PATHS:
+    for rel in GUARD_PATHS:
         stub = root / rel
         stub.parent.mkdir(parents=True, exist_ok=True)
         stub.write_text("# stub\n", encoding="utf-8")
@@ -764,16 +838,16 @@ def _self_test_cases() -> int:
     case("a change to the guard code is reported and needs the trailer (R4)", guard_edit, True, "GUARD CHANGED")
     case("a guard change with the trailer passes (R4)", guard_edit, False, "approval trailer(s)", trailer="Justin")
     # R5 (#5164): the trusted set is pinned to a literal, and the per-path cases loop over that literal, so
-    # dropping an entry from TRUSTED_PATHS fails here instead of silently dropping its own case.
+    # dropping an entry from GUARD_PATHS fails here instead of silently dropping its own case.
     pinned_guard_paths = ("scripts/check-claude-md-size.py", "scripts/claude-md-rule-compare.py",
                       ".github/workflows/claude-md-guard.yml", ".github/workflows/claude-md-rule-compare.yml",
                       ".github/CODEOWNERS")
-    if TRUSTED_PATHS != pinned_guard_paths:
-        failures.append("TRUSTED_PATHS pin")
-        print(f"FAIL: self-test - TRUSTED_PATHS {TRUSTED_PATHS} differs from the pinned set (R5, #5164)",
+    if GUARD_PATHS != pinned_guard_paths:
+        failures.append("GUARD_PATHS pin")
+        print(f"FAIL: self-test - GUARD_PATHS {GUARD_PATHS} differs from the pinned set (R5, #5164)",
               file=sys.stderr)
     else:
-        print("PASS: self-test - TRUSTED_PATHS equals the pinned set (R5, #5164)")
+        print("PASS: self-test - GUARD_PATHS equals the pinned set (R5, #5164)")
     for rel in pinned_guard_paths:
         case(f"a change to {rel} is reported and needs the trailer (R4)", guard_file_write(rel), True,
              f"GUARD CHANGED: {rel}")
