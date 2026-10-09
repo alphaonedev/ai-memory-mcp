@@ -127,7 +127,9 @@ and no workflow step fetches pull request content (#6163 precedent). Trusted mod
     printed as a `::warning title=GUARD CHANGED::` annotation;
   * prints `GUARD SHADOW: <workflow> line <n>` and fails (not waivable) when
     any line of any workflow file at the merge commit, headers and the trusted
-    workflow included, spells the required check name or a fragment of it
+    workflow included (lines split on every YAML line break; a line break
+    other than LF or CRLF is itself refused, #6228), spells the required
+    check name or a fragment of it
     outside the two pinned job regions (cert-expiry-gate in c8-precheck.yml,
     cert-expiry-trusted in the trusted workflow, each with one pinned
     `name:`), or when either of those two files uses a YAML construct the
@@ -814,13 +816,23 @@ TRAILER = re.compile(r"^Rule-Change-Approved-By: (\S.*)$", re.MULTILINE)
 MERGE_REF_RE = re.compile(r"refs/remotes/[A-Za-z0-9._/-]+")
 JOB_KEY_RE = re.compile(r"  ([A-Za-z0-9_.-]+):[ \t]*(?:#.*)?")
 JOBS_KEY_RE = re.compile(r"jobs:[ \t]*(?:#.*)?")
+# Round 4 (#6228): every line break a YAML parser honours (YAML 1.2 b-break:
+# CRLF, CR, LF; YAML 1.1 parsers such as PyYAML also NEL, LS and PS). Workflow
+# text is split on all of them, so no line break hides a line from the scan.
+YAML_BREAK_RE = re.compile("\r\n|[\r\n\x85\u2028\u2029]")
+
+
+def yaml_lines(text):
+    """The lines of TEXT as a YAML parser sees them (YAML_BREAK_RE)."""
+    return YAML_BREAK_RE.split(text)
 
 
 def _workflow_lines(text):
     """(line number, line, indent, in_jobs, current job key or None) for every
-    meaningful line of a workflow file (blank and comment-only lines dropped)."""
+    meaningful line of a workflow file (blank and comment-only lines dropped),
+    split on every YAML line break (#6228)."""
     in_jobs, current = False, None
-    for number, line in enumerate(text.split("\n"), 1):
+    for number, line in enumerate(yaml_lines(text), 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -987,7 +999,7 @@ def _yaml_hazards(text):
     indentation indicators, document markers and tabs in indentation. Block
     scalar bodies are skipped, so `&&` or `*)` in a `run: |` script is text."""
     out, block_col = [], None
-    for number, raw in enumerate(text.split("\n"), 1):
+    for number, raw in enumerate(yaml_lines(text), 1):
         body = raw.rstrip("\r")
         stripped = body.strip()
         indent = len(body) - len(body.lstrip(" "))
@@ -1087,6 +1099,18 @@ def _own_file_findings(rel, text, job, pinned):
     return found
 
 
+def _line_break_findings(rel, text):
+    """GUARD SHADOW for a YAML line break other than LF or CRLF (a lone CR,
+    NEL, LS or PS) anywhere in a workflow file (#6228): a parser starts a new
+    line there, so such a break could hide a job from a reader or a scan.
+    No legitimate workflow needs one; it is refused, not interpreted."""
+    numbers = [n for n, m in enumerate(YAML_BREAK_RE.finditer(text), 1) if m.group() not in ("\n", "\r\n")]
+    if not numbers:
+        return []
+    return [f"GUARD SHADOW: {log_safe(rel)} line {numbers[0]}: a YAML line break other than LF or CRLF (a lone "
+            f"CR, NEL, LS or PS; {len(numbers)} in this file) is refused in every workflow file {SHADOW_NOTE}"]
+
+
 def _scan_workflow(rel, text, own):
     """GUARD SHADOW lines for REL: every meaningful line outside the own job
     region (and the own exact header lines) is scanned; consecutive scanned
@@ -1117,8 +1141,10 @@ def shadow_check(repo, merge):
     """(ok, lines): no job outside the pinned own job regions (the
     cert-expiry-gate job of c8-precheck.yml, the cert-expiry-trusted job of
     the trusted workflow) can produce the required check name at MERGE
-    (#6140 rounds 2 and 3). Every workflow blob in .github/workflows is read
-    from git objects and every line of it is scanned, headers included;
+    (#6140 rounds 2 to 4). Every workflow blob in .github/workflows is read
+    from git objects and every line of it, split on every YAML line break, is
+    scanned, headers included; a line break other than LF or CRLF is refused
+    in every workflow file (#6228);
     both own files must keep a single pinned `name:` in their job and use no
     YAML construct (anchor, alias, tag, quoted or flow job key, ...) the scan
     cannot follow. Not waivable by a trailer: a legitimate change never needs
@@ -1153,6 +1179,7 @@ def shadow_check(repo, merge):
             continue
         scanned += 1
         text = read_blob(repo, oid, rel).decode("utf-8", "replace")
+        found.extend(_line_break_findings(rel, text))
         own = owns.get(rel)
         if own:
             found.extend(_own_file_findings(rel, text, own[0], own[1]))
