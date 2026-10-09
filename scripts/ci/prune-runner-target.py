@@ -77,7 +77,9 @@ dirs named above under the chosen profile are ever touched.  An entry that
 vanished meanwhile is not an error.  Any other error reading a directory or an
 entry during the scan, or removing an entry, prints a ``::warning::`` line and
 the run continues with the rest; the totals are still printed and the exit code
-is 1.  Every name printed is escaped as GitHub escapes a workflow-command value
+is 0 (#6300: the step is ``if: always()``, so a nonzero exit after a partial failure
+would red every later job; the warnings and ``warnings=<n>`` on the notice carry it).
+Only a refusal exits 2.  Every name printed is escaped as GitHub escapes a workflow-command value
 (``%`` -> ``%25``, CR -> ``%0D``, LF -> ``%0A``) and ``#`` -> ``%23`` (the
 runner also parses the legacy ``##[command]`` form anywhere in a line), and a
 byte that is not UTF-8, and every other control character (C0, DEL, C1), is
@@ -89,7 +91,7 @@ the file descriptors.
 
 OUTPUT.  One line per category, then ``freed_bytes=<n>``, a human-readable
 total and ``::notice::prune-runner-target freed_bytes=<n> deleted=<k>
-mode=<pruned|dry-run>`` (a job-summary annotation; ``k`` counts the candidates
+mode=<pruned|dry-run> warnings=<n>`` (a job-summary annotation; ``k`` counts the candidates
 fully removed).  A category row counts only the candidates fully removed (so the
 rows sum to ``k``); a candidate that could not be removed is counted on its own
 ``failed <category> <n>`` line and in the warnings.  On Linux the count is exact, also under ``--dry-run``: a
@@ -115,6 +117,7 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Set, Tuple
 
@@ -132,30 +135,39 @@ EXAMPLE_HASH_RE = re.compile(r"[0-9a-f]{16}")
 MAX_REMOVE_DEPTH = 100
 EXEC_BITS = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
 EXIT_REFUSED = 2
-EXIT_WARNED = 1
 # The first line of every CACHEDIR.TAG (https://bford.info/cachedir/); cargo
 # writes it at the root of each target dir it creates.
 CACHEDIR_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 # C0 controls (CR and LF are already %-escaped), DEL and C1: never printed raw (#6254).
 CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f]")
+# Unicode categories that print as nothing or move text around (#6299): Zl / Zp
+# (U+2028 / U+2029 line and paragraph separators), Cf (bidi, zero-width and
+# other format characters), Co (private use), Cn (unassigned / noncharacter).
+# Cs only reaches here from a lone surrogate.  Written as \\u{hex}.
+INVISIBLE_CATEGORIES = frozenset({"Zl", "Zp", "Cf", "Cs", "Co", "Cn"})
 WARNING_PREFIX = "::warning::prune-runner-target: "
 
 
 def _escape(text: str) -> str:
     """Make a file name safe to print on a log line.
 
+    A literal backslash is doubled first, so every escape below is unambiguous and
+    the mapping is injective: two different names never print the same (#6313).
     Undecodable bytes (a surrogateescape-decoded name on Linux) become ``\\xNN``
     so a strict UTF-8 stdout never raises (R3-F3).  Then GitHub's
     workflow-command escaping (``%``, CR, LF) so one name can never become two
     log lines, and ``#`` -> ``%23`` because the runner's legacy parser accepts
     ``##[command]`` anywhere in a line (SR3-1).  Every other control character
     (C0, DEL, C1: ESC starts an ANSI sequence a log viewer or terminal acts on)
-    becomes ``\\xNN`` (#6254).
+    becomes ``\\xNN`` (#6254), and so does every code point that prints as
+    nothing or reorders text (U+2028 / U+2029, bidi and zero-width format
+    characters, private-use and unassigned code points), as ``\\u{hex}`` (#6299).
     """
-    text = os.fsencode(text).decode("utf-8", "backslashreplace")
+    text = os.fsencode(text).replace(b"\\", b"\\\\").decode("utf-8", "backslashreplace")
     text = text.replace("%", "%25").replace("#", "%23").replace("\r", "%0D").replace("\n", "%0A")
-    return CONTROL_RE.sub(lambda m: "\\x%02x" % ord(m.group()), text)
+    text = CONTROL_RE.sub(lambda m: "\\x%02x" % ord(m.group()), text)
+    return "".join("\\u{%x}" % ord(ch) if unicodedata.category(ch) in INVISIBLE_CATEGORIES else ch for ch in text)
 
 
 def _warn(errors: List[str], rel: str, exc: OSError) -> None:
@@ -414,10 +426,11 @@ def _add_dsym_links(plan: Plan, fd: int, sub: str, names: List[str]) -> None:
             plan.candidates.append(Candidate(fd, name, prefix + name, sub + " dSYM"))
 
 
-def _same_bytes(dir_a: int, a: str, dir_b: int, b: str) -> bool:
+def _same_bytes(dir_a: int, a: str, dir_b: int, b: str) -> Optional[bool]:
     """Identical content: the bin's uplift is a hard link or a clone of its source.
 
-    A file that cannot be read counts as identical, so it is kept (fail closed).
+    ``None`` when either file cannot be read: the caller keeps the candidate
+    (fail closed) and says it was not verified, instead of claiming a match.
     """
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
@@ -427,7 +440,7 @@ def _same_bytes(dir_a: int, a: str, dir_b: int, b: str) -> bool:
                 if chunk_a != chunk_b or not chunk_a:
                     return chunk_a == chunk_b
     except OSError:
-        return True
+        return None
 
 
 def _norm(name: str) -> str:
@@ -488,13 +501,16 @@ def _scan_test_bins(plan: Plan, profile_fd: int) -> None:
             if sub == "deps":
                 stem = _hashed_stem(name)
                 partner = bins.get(_norm(stem), {}).get(st.st_size) if stem is not None else None
-                if partner is not None and not _same_bytes(fd, name, profile_fd, partner):
+                same = None if partner is None else _same_bytes(fd, name, profile_fd, partner)
+                if same is False:
                     partner = None  # same name and size, other content: an ordinary test executable
                 if partner is not None:
                     # cargo's bin uplift source (hard link on Linux, clone on
                     # macOS): pruning it makes cargo relink the bin.
-                    plan.kept.append((sub + "/" + name, "uplift source of %s/%s (same name, size and content); "
-                                      "pruning it forces a relink" % (plan.profile, partner)))
+                    why = ("same name, size and content" if same else
+                           "same name and size, content unreadable, not verified")
+                    plan.kept.append((sub + "/" + name, "uplift source of %s/%s (%s); pruning it forces a relink"
+                                      % (plan.profile, partner, why)))
                     continue
             if st.st_nlink > 1:
                 if sub == "examples" and st.st_nlink == 2:
@@ -646,7 +662,7 @@ def plan_target(target_dir: str, profile: str, scope: str, env: Mapping[str, str
 def execute(plan: Plan, dry_run: bool) -> Tally:
     """Remove (or, dry-run, only total) every candidate through the plan's fds."""
     tally = Tally()
-    tally.errors.extend(plan.errors)  # scan-phase warnings (already printed) count toward exit 1
+    tally.errors.extend(plan.errors)  # scan-phase warnings (already printed) count toward warnings=<n>
     verb = "would delete" if dry_run else "deleted"
     for cand in plan.candidates:
         before = tally.freed
@@ -708,7 +724,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except NothingToPrune as exc:
         print("nothing to prune: %s" % _escape(str(exc)))
         print("freed_bytes=0")
-        print("::notice::prune-runner-target freed_bytes=0 deleted=0 mode=%s"
+        print("::notice::prune-runner-target freed_bytes=0 deleted=0 mode=%s warnings=0"
               % ("dry-run" if args.dry_run else "pruned"))
         return 0
     except OSError as exc:
@@ -735,11 +751,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("  " + _escape(note))
     print("freed_bytes=%d" % tally.freed)
     print("freed %s (%s)" % (_human(tally.freed), mode))
-    print("::notice::prune-runner-target freed_bytes=%d deleted=%d mode=%s" % (tally.freed, tally.deleted, mode))
+    print("::notice::prune-runner-target freed_bytes=%d deleted=%d mode=%s warnings=%d"
+          % (tally.freed, tally.deleted, mode, len(tally.errors)))
     if tally.errors:
-        print("%d entr%s could not be read or removed (warnings above); exit %d"
-              % (len(tally.errors), "y" if len(tally.errors) == 1 else "ies", EXIT_WARNED))
-        return EXIT_WARNED
+        # The prune ran to the end; what it could not remove is a disk-hygiene
+        # warning, not a reason to red a job (#6300).  The step is `if: always()`,
+        # so a nonzero exit here would fail every later job on the runner.
+        print("%d entr%s could not be read or removed (warnings above); exit 0"
+              % (len(tally.errors), "y" if len(tally.errors) == 1 else "ies"))
     return 0
 
 
