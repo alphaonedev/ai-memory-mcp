@@ -743,7 +743,7 @@ MCP tools (5): `memory_routine_create`, `memory_routine_freeze`, `memory_routine
 
 > **Shipped state (v0.8.0 — reconciled at [#1488](https://github.com/alphaonedev/ai-memory-mcp/issues/1488) close).** All four sub-tasks landed on `release/v0.8.0`:
 > - **4.A** ([#1733](https://github.com/alphaonedev/ai-memory-mcp/issues/1733)) — HTTP admission control: `compose_admission_control` (semaphore + `axum::middleware::from_fn`), typed `503 server_overloaded` + `ai_memory_admission_shed_total`, config-driven ceiling `AI_MEMORY_MAX_INFLIGHT_REQUESTS` (`[limits].max_inflight_requests`, default `0` = opt-in).
-> - **4.B** ([#1736](https://github.com/alphaonedev/ai-memory-mcp/issues/1736)) — PgBouncer per-module pooler: copy-deployable templates in [`infra/pgbouncer/`](infra/pgbouncer/) (transaction-mode `pgbouncer.ini` with `max_prepared_statements = 256`, `role-defaults.sql`, `docker-compose.yml`, `smoke-test.sh`) + the rationale in `docs/enterprise-deployment.md §5.6` (the config-only guidance the directory materializes; the design's "§10.4" placeholder landed as §5.6). The `smoke-test.sh` proves AGE transaction-mode pinning + role-default timeouts survive the pooler's `DISCARD ALL`; it is a Docker-rig test, deliberately outside the 8-workflow CI gate (like `infra/lan-parity-test/`).
+> - **4.B** ([#1736](https://github.com/alphaonedev/ai-memory-mcp/issues/1736)) — PgBouncer per-module pooler: copy-deployable templates in [`infra/pgbouncer/`](infra/pgbouncer/) (`pgbouncer.ini` with `max_prepared_statements = 256`, `role-defaults.sql`, `docker-compose.yml`, `smoke-test.sh`) + the rationale in `docs/enterprise-deployment.md §5.6` (the config-only guidance the directory materializes; the design's "§10.4" placeholder landed as §5.6). Shipped as transaction mode at v0.8.0; **corrected to session mode at v1.0.0 (#4667)** — the Postgres adapter keeps migration-lock, `search_path` and timeout state on the server session, so `transaction` and `statement` pooling are not supported until [#4679](https://github.com/alphaonedev/ai-memory-mcp/issues/4679) lands. The `smoke-test.sh` runs an AGE cypher transaction + the role-default timeouts through the pooler; it is a Docker-rig test, deliberately outside the 8-workflow CI gate (like `infra/lan-parity-test/`).
 > - **4.C** ([#1735](https://github.com/alphaonedev/ai-memory-mcp/issues/1735)) — staggered AGE cold-path: schema-v69 `kg_projection_outbox` + `AI_MEMORY_AGE_PROJECTION_MODE` (`sync`/`deferred`) + the `PostgresStore` cold drainer (`drain_kg_projection_outbox`/`spawn_drainer`).
 > - **4.D** ([#1737](https://github.com/alphaonedev/ai-memory-mcp/issues/1737)) — empirical envelope measurement: the harness ships in [`infra/pillar4-envelope/`](infra/pillar4-envelope/) (`measure-envelope.sh` + README). Publishing the measured **X** + confirming the 1000-agents/module default at ~⅓ X is an operator-run on a postgres/pgvector/AGE rig (the campaign is a hardware measurement, not application code).
 
@@ -762,12 +762,18 @@ queue-collapse.
 ##### §11.4.Pillar4.B PgBouncer per-module pooler (+1.5 sessions)
 
 PgBouncer (≥1.21, for `max_prepared_statements`) as the per-module connection pooler
-in front of each module's Postgres+AGE backbone. Transaction-mode multiplexing with
-`max_prepared_statements` set so the Fix #4 sqlx prepared-statement / generic-plan
-pinning (shipped v0.7.0) survives the pooler (pre-1.21 transaction-mode broke named
-prepared statements). Deliverables: deploy templates (compose + k8s), expansion of
+in front of each module's Postgres+AGE backbone. As planned, this was transaction-mode
+multiplexing with `max_prepared_statements` set; **as shipped (#4667) it is `session`
+mode**, because the Postgres adapter keeps migration-lock, `search_path` and timeout
+state on the server session and the executed probe recorded on PR #4710 fails on
+`transaction` and `statement` modes (see `docs/enterprise-deployment.md §5.6`).
+Transaction mode returns when [#4679](https://github.com/alphaonedev/ai-memory-mcp/issues/4679)
+lands. `max_prepared_statements` stays set (PgBouncer ≥1.21); in `session` mode each
+client keeps its own server connection, and PgBouncer's default
+`server_reset_query = DISCARD ALL` clears it before the next client reuses it.
+Deliverables: deploy templates (compose + k8s), expansion of
 `docs/enterprise-deployment.md §10.4`, and an `infra/lan-parity-test/` integration
-test proving plan-caching holds through PgBouncer. **Supavisor is explicitly NOT
+test that runs the suite through PgBouncer. **Supavisor is explicitly NOT
 adopted** — the documented hive (Topology 8/9, `docs/reference-architectures.md`)
 absorbs millions-agent fan-in via hierarchical tiering (1:10–1:100 per tier) + the
 HMAC-batching edge sync gateway *before* Postgres, so the millions-of-concurrent-PG-

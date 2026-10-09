@@ -46,8 +46,8 @@ What it does:
    (`postgres://…@127.0.0.1:6432/ai_memory`).
 4. Ramps concurrency over `CONCURRENCY_STEPS`. Each worker = one simulated
    agent looping **store → link → recall** (the `link` op drives the **AGE
-   graph write path** — the real per-module throughput bound; PgBouncer fixes
-   connection fan-in, *not* AGE write concurrency).
+   graph write path** — the real per-module throughput bound; the session-mode
+   pooler (#4667) adds neither connection fan-in nor AGE write concurrency).
 5. Per step, records p50/p95/p99 latency + the **503 shed-rate**, and stops at
    the first step that crosses `P95_BUDGET_MS` or `SHED_RATE_KNEE`. That step's
    concurrency is **X**.
