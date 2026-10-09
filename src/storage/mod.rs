@@ -17014,6 +17014,50 @@ fn archive_owner_mutation_clause(
     )
 }
 
+/// #4366 (WP-ERASURE #6048) — the lifecycle allow-list as a bare `WHERE`
+/// predicate (no leading `AND`) for the `archived_memories` read lanes:
+/// [`list_archived_impl`], [`archive_stats_scoped`], [`archive_stats`]. It is
+/// the SAME placeholder-free fragment every live read / egress lane uses
+/// ([`crate::models::lifecycle_visible_clause`], #1948), so the vocabulary
+/// lives in exactly one place; `NULL` stays visible-legacy. A `quarantined`
+/// (or `contaminated` / unknown) row that a merge snapshot, a gc / forget
+/// archive or an operator archive copied into the archive is hidden here
+/// exactly as its live twin is hidden by `export_all` / `list` / `recall`.
+fn archive_lifecycle_visible_predicate() -> String {
+    let clause = crate::models::lifecycle_visible_clause("");
+    clause
+        .strip_prefix("AND ")
+        .map_or_else(|| clause.clone(), str::to_string)
+}
+
+/// #4366 — is the archived row `id` lifecycle-VISIBLE (the Rust twin of
+/// [`archive_lifecycle_visible_predicate`], for the by-id restore funnels)?
+/// Absent row or `NULL` state ⇒ visible-legacy (the caller's own existence
+/// probe decides absence); a state outside
+/// [`crate::models::RECALL_VISIBLE_LIFECYCLE_STATES`] — `quarantined`,
+/// `contaminated`, a consolidation tombstone, or a value this binary cannot
+/// parse — is hidden, so a restore cannot launder a black-holed row back
+/// into the live set (fail-closed, the allow-list contract).
+///
+/// # Errors
+///
+/// Propagates the rusqlite failure of the probe.
+fn archived_row_lifecycle_visible(conn: &Connection, id: &str) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    let state: Option<Option<String>> = conn
+        .query_row(
+            "SELECT lifecycle_state FROM archived_memories WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match state.flatten() {
+        None => true,
+        Some(raw) => crate::models::LifecycleState::from_str(&raw)
+            .is_some_and(crate::models::LifecycleState::is_recall_visible),
+    })
+}
+
 /// #3382 archive ownership SQL prefilter; the final read decision also
 /// applies canonical query visibility before pagination or aggregation.
 fn archive_owner_scope_clause(idx: usize) -> String {
@@ -17072,6 +17116,10 @@ fn list_archived_impl(
         params_vec.push(Box::new(c.to_string()));
         wheres.push(archive_owner_scope_clause(params_vec.len()));
     }
+    // #4366 — the #1948 fail-CLOSED lifecycle allow-list, on the archive
+    // read lane too (BOTH the scoped and the unscoped listing): a quarantined
+    // row copied into `archived_memories` stays as invisible as the live row.
+    wheres.push(archive_lifecycle_visible_predicate());
     let mut where_sql = if wheres.is_empty() {
         String::new()
     } else {
@@ -17322,6 +17370,19 @@ fn restore_archived_impl(
         // resurrection: the federation /sync/push `restores[]` chokepoint
         // (src/handlers/federation_receive.rs) and the LWW re-push gate on
         // `insert_if_newer` / `merge_inbound`.
+        // #4366 — the lifecycle allow-list IS a gate here: a quarantined /
+        // contaminated / unparseable archived row is hidden from every read
+        // lane, and a restore that put it back live would launder the
+        // black-hole (#1948) into the live set. Refused as the unnamed
+        // not-found shape (`Ok(false)`); the archive row is left in place.
+        if !archived_row_lifecycle_visible(conn, id)? {
+            tracing::warn!(
+                target: "lifecycle",
+                memory_id = %id,
+                "archive restore refused: archived row is lifecycle-hidden (#4366)"
+            );
+            return Ok(false);
+        }
         // Check if ID already exists in active memories to prevent silent overwrite
         let active_exists: bool = conn
             .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
@@ -17570,6 +17631,15 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // owner-initiated restore is an AUTHORIZED un-forget — no tombstone gate
         // here (the G30 tombstone gates only automatic resurrection: the
         // federation restores[] chokepoint + the LWW re-push gate).
+        // #4366 — the lifecycle allow-list IS a gate (see `restore_archived_impl`).
+        if !archived_row_lifecycle_visible(conn, id)? {
+            tracing::warn!(
+                target: "lifecycle",
+                memory_id = %id,
+                "archive restore refused: archived row is lifecycle-hidden (#4366)"
+            );
+            return Ok(false);
+        }
         // Check if ID already exists in active memories to prevent silent overwrite.
         let active_exists: bool = conn
             .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
@@ -18056,10 +18126,18 @@ pub fn purge_archive_for_caller(
 }
 
 pub fn archive_stats(conn: &Connection) -> Result<serde_json::Value> {
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM archived_memories", [], |r| r.get(0))?;
-    let mut stmt = conn.prepare(
-        "SELECT namespace, COUNT(*) FROM archived_memories GROUP BY namespace ORDER BY COUNT(*) DESC",
+    // #4366 — the unscoped admin aggregate applies the lifecycle allow-list
+    // too (the `export_all` posture: even the admin egress hides quarantine).
+    let visible = archive_lifecycle_visible_predicate();
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM archived_memories WHERE {visible}"),
+        [],
+        |r| r.get(0),
     )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT namespace, COUNT(*) FROM archived_memories WHERE {visible} \
+         GROUP BY namespace ORDER BY COUNT(*) DESC"
+    ))?;
     let by_ns: Vec<serde_json::Value> = stmt
         .query_map([], |row| {
             Ok(serde_json::json!({
@@ -18108,9 +18186,11 @@ fn archive_row_readable(
 /// # Errors
 /// Propagates query and row decoding failures.
 pub fn archive_stats_scoped(conn: &Connection, caller: Option<&str>) -> Result<serde_json::Value> {
+    // #4366 — lifecycle allow-list on the aggregate too.
     let mut sql = format!(
-        "SELECT id, namespace, metadata FROM archived_memories WHERE 1=1 {}",
+        "SELECT id, namespace, metadata FROM archived_memories WHERE 1=1 {} AND {}",
         *crate::visibility::SQL_AND_NOT_SUBSTRATE,
+        archive_lifecycle_visible_predicate(),
     );
     if caller.is_some() {
         sql.push_str(" AND ");
