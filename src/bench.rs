@@ -1274,17 +1274,16 @@ pub fn append_history(
     Ok(())
 }
 
+#[cfg(test)]
 #[allow(clippy::wildcard_imports)]
 mod tests {
     use super::*;
     use crate::db;
 
-    #[allow(dead_code)]
     fn fresh_conn() -> Connection {
         db::open(Path::new(":memory:")).unwrap()
     }
 
-    #[allow(dead_code)]
     fn small_config() -> BenchConfig {
         BenchConfig {
             iterations: 30,
@@ -1583,7 +1582,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     fn synthetic_result(op: Operation, p95: f64) -> OperationResult {
         OperationResult {
             operation: op,
@@ -1597,7 +1595,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     fn synthetic_baseline(op: Operation, p95: f64) -> BaselineRecord {
         BaselineRecord {
             operation: op,
@@ -1803,7 +1800,6 @@ mod tests {
     }
 
     /// One synthetic over-budget row, reused by the `verdict` tests below.
-    #[allow(dead_code)]
     fn failing_result() -> OperationResult {
         OperationResult {
             operation: Operation::StoreNoEmbedding,
