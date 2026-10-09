@@ -943,14 +943,37 @@ pub mod signed {
                 serde_json::Value::String(reason.to_string()),
             );
         }
-        crate::storage::queue_pending_action(
-            conn,
+        // #4116 — when THIS thread holds a write transaction on the same
+        // database (the L1-6 hook fires from inside a write funnel and queues on
+        // its OWN connection), an INSERT here would wait out `busy_timeout`
+        // behind that lock and fail SQLITE_BUSY: refused and never queued.
+        // Defer it to that transaction instead; it lands on the funnel's own
+        // connection the moment the transaction ends.
+        let pending_id = uuid::Uuid::new_v4().to_string();
+        let intent = crate::storage::escalation_deferral::DeferredEscalation {
+            pending_id: pending_id.clone(),
             action,
-            namespace,
-            memory_id,
-            requested_by,
-            &enriched,
-        )
+            namespace: namespace.to_string(),
+            memory_id: memory_id.map(str::to_string),
+            requested_by: requested_by.to_string(),
+            rule_id: rule_id.to_string(),
+            payload: enriched,
+        };
+        match crate::storage::escalation_deferral::defer_to_open_txn(conn.path(), intent) {
+            Ok(()) => Ok(pending_id),
+            Err(intent) => {
+                crate::storage::escalation_deferral::insert_pending_action_row(
+                    conn,
+                    &pending_id,
+                    action,
+                    namespace,
+                    memory_id,
+                    requested_by,
+                    &intent.payload,
+                )?;
+                Ok(pending_id)
+            }
+        }
     }
 
     /// Emit a signed, chained `approval_quorum_met` event into the audit chain
