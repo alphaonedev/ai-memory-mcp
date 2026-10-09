@@ -804,6 +804,20 @@ pub async fn run_reflection_pass(
             let source_ids: Vec<String> = cluster.iter().map(|m| m.id.clone()).collect();
 
             if dry_run {
+                // #4899 — the preview is idempotent with the live pass: a
+                // cluster whose exact source set already carries a Reflection
+                // is not proposed again. Fail closed: a lookup fault is an
+                // error in the report and the cluster is NOT proposed.
+                match find_reflection_for_sources(store, &pass.ctx, &source_ids).await {
+                    Ok(Some(_existing)) => continue,
+                    Ok(None) => {}
+                    Err(e) => {
+                        report.errors.push(format!(
+                            "namespace '{ns}': existing-reflection lookup failed: {e}"
+                        ));
+                        continue;
+                    }
+                }
                 report.dry_run_proposals.push(DryRunProposal {
                     namespace: ns.clone(),
                     proposed_title: summary.title.clone(),
@@ -887,6 +901,64 @@ async fn verify_recent(
         "verify_recent: no Reflection in namespace '{namespace}' carries the \
          expected reflects_on edge set"
     )
+}
+
+/// #4899 — the id of a Reflection whose outbound `reflects_on` edge set is
+/// EXACTLY `source_ids`, if one exists. Walks the inbound `reflects_on` edges
+/// of the first source (every candidate reflection links every source, so one
+/// anchor is enough) and confirms each candidate's full outbound set and its
+/// kind through the store, never a bounded namespace listing.
+///
+/// # Errors
+///
+/// Any store fault (link walk or `get`): the caller fails closed.
+#[cfg(feature = "sal")]
+async fn find_reflection_for_sources(
+    store: &dyn MemoryStore,
+    ctx: &CallerContext,
+    source_ids: &[String],
+) -> Result<Option<String>> {
+    let Some(first) = source_ids.first() else {
+        return Ok(None);
+    };
+    let target_set: HashSet<&str> = source_ids.iter().map(String::as_str).collect();
+    let inbound = store
+        .get_links_for_anchor(first)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut candidates: Vec<String> = inbound
+        .iter()
+        .filter(|l| {
+            l.target_id == *first && l.relation == crate::models::MemoryLinkRelation::ReflectsOn
+        })
+        .map(|l| l.source_id.clone())
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    for cand in candidates {
+        let links = store
+            .get_links_for_anchor(&cand)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let outbound: HashSet<&str> = links
+            .iter()
+            .filter(|l| {
+                l.source_id == cand && l.relation == crate::models::MemoryLinkRelation::ReflectsOn
+            })
+            .map(|l| l.target_id.as_str())
+            .collect();
+        if outbound != target_set {
+            continue;
+        }
+        let memory = store
+            .get(ctx, &cand)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        if memory.memory_kind == MemoryKind::Reflection {
+            return Ok(Some(cand));
+        }
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
