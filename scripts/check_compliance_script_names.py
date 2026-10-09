@@ -136,6 +136,12 @@ HTML_BLOCK_RE = re.compile(r"^ {0,3}<(/?)([A-Za-z][A-Za-z0-9-]*)")
 RAW_TEXT_TAGS = frozenset({"pre", "script", "style", "textarea"})
 # A line that is only ``$$`` opens or closes a display-math block, rendered as math (#6196).
 MATH_FENCE = "$$"
+# Appended to a violation when a line names the stale name and a successor with the word
+# "erratum" but is not in the erratum form (#6238).
+NEAR_HINT = (
+    "; line %d is not an erratum (an erratum line starts `Erratum (#<issue>): ` at column 0,"
+    " begins a paragraph and is shown as text with no [ or ] outside code spans)"
+)
 ENTRY_RE = re.compile(
     r"^(docs/compliance/\S+\.md):((?i:check)[-_][A-Za-z0-9_-]+\.(?i:sh|py))(:pinned)?$", re.ASCII
 )
@@ -526,15 +532,25 @@ def erratum_names(root, line):
 
 
 def collect_errata(root, lines_by_doc):
-    """Return (all, per_doc): stale name -> successor, globally and by doc path."""
-    errata, per_doc = {}, {}
+    """Return (all, per_doc, near): stale name -> successor, globally and by doc path.
+
+    ``near`` maps doc path -> stale name -> the 1-based number of the first line that names the
+    name and an existing successor with the word "erratum" but is not in the erratum form, so
+    the violation can say which line to fix (#6238).
+    """
+    errata, per_doc, near = {}, {}, {}
     for doc, lines in lines_by_doc:
         rel = doc.relative_to(root).as_posix()
-        for text in erratum_lines(lines).values():
-            for name, succ in erratum_names(root, text):
-                errata[name] = succ
-                per_doc.setdefault(rel, {})[name] = succ
-    return errata, per_doc
+        found = erratum_lines(lines)
+        for i, line in enumerate(lines):
+            if i in found:
+                for name, succ in erratum_names(root, found[i]):
+                    errata[name] = succ
+                    per_doc.setdefault(rel, {})[name] = succ
+            else:
+                for name, _succ in erratum_names(root, line):
+                    near.setdefault(rel, {}).setdefault(name, i + 1)
+    return errata, per_doc, near
 
 
 def load_allowlist(root):
@@ -572,7 +588,7 @@ def check(root):
     """Return a list of violation strings for the tree at ``root``."""
     docs, problems = compliance_docs(root)
     lines_by_doc = [(doc, doc_lines(root, doc)) for doc in docs]
-    errata, per_doc = collect_errata(root, lines_by_doc)
+    errata, per_doc, near = collect_errata(root, lines_by_doc)
     allowed, ledger_problems = load_allowlist(root)
     problems.extend(ledger_problems)
     used = set()
@@ -589,9 +605,11 @@ def check(root):
                 if pinned is not None and covered:
                     used.add((rel, base))
                     continue
+                hint = near.get(rel, {}).get(base)
                 problems.append(
                     "%s:%d: `%s` does not exist (checked at %s) and no erratum-covered allowlist"
-                    " entry (%s) names it" % (rel, lineno, cited, path, ALLOW_REL)
+                    " entry (%s) names it%s"
+                    % (rel, lineno, cited, path, ALLOW_REL, "" if hint is None else NEAR_HINT % hint)
                 )
     for (rel, base), pinned in sorted(allowed.items()):
         if pinned and base in per_doc.get(rel, {}):
