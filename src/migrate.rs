@@ -721,7 +721,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_store_sqlite_url() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let path = tmp.path().to_string_lossy().to_string();
         let url = format!("sqlite://{path}");
         let store = open_store(&url).await.expect("open sqlite store");
@@ -742,8 +742,8 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_sqlite_to_sqlite_roundtrip() {
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let ctx = CallerContext::for_agent("ai:seed");
@@ -773,8 +773,8 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_dry_run_does_not_write() {
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let ctx = CallerContext::for_agent("ai:seed");
@@ -793,8 +793,8 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_is_idempotent_on_rerun() {
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let ctx = CallerContext::for_agent("ai:seed");
@@ -811,8 +811,8 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_with_namespace_filter() {
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let ctx = CallerContext::for_agent("ai:seed");
@@ -867,8 +867,8 @@ mod tests {
             N > crate::storage::LIST_MAX_LIMIT,
             "test must exceed the per-page clamp to be meaningful"
         );
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_MIGRATE);
@@ -905,8 +905,8 @@ mod tests {
     /// sampled row's vector bytes + space match exactly.
     #[tokio::test]
     async fn migrate_copies_embeddings_and_preserves_space() {
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_MIGRATE);
@@ -1007,8 +1007,8 @@ mod tests {
         // of the destination, then per-link `link()` writes — every key
         // is absent from the empty destination snapshot so each row
         // lands in `links_written`.
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let ctx = CallerContext::for_agent("ai:seed");
@@ -1049,8 +1049,8 @@ mod tests {
         // Second pass through the same store -> every source link key is
         // already present in the destination pre-snapshot, so each row
         // lands in `links_skipped` (line 284).
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let ctx = CallerContext::for_agent("ai:seed");
@@ -1083,8 +1083,8 @@ mod tests {
         // Dry-run skips the destination pre-snapshot (line 248 branch)
         // and never invokes `link()` on the destination. `links_read`
         // is still tallied (line 269).
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let ctx = CallerContext::for_agent("ai:seed");
@@ -1135,8 +1135,8 @@ mod tests {
         // the namespace-filter case where source has no memories — every
         // path through migrate stays clean and the error vec is empty.
         // This is a 3-run flake guard rather than an error-path test.
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         for _ in 0..3 {
@@ -1181,8 +1181,8 @@ mod tests {
         // a source store with a memory and a link, but the destination
         // has neither the source nor the target memory — the
         // foreign-key on `memory_links` rejects the insert.
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let ctx = CallerContext::for_agent("ai:seed");
@@ -1324,8 +1324,8 @@ mod tests {
     #[tokio::test]
     async fn migrate_reports_source_list_failure() {
         // Drives lines 172-174 — source `list()` returns Err.
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let inner = SqliteStore::open(src_tmp.path()).unwrap();
         let src = FailingListStore {
             inner,
@@ -1343,8 +1343,8 @@ mod tests {
     async fn migrate_reports_source_list_links_failure() {
         // Drives lines 238-240 — source `list_links()` returns Err
         // after a successful memory phase.
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let inner = SqliteStore::open(src_tmp.path()).unwrap();
         let ctx = CallerContext::for_agent("ai:seed");
         inner
@@ -1375,8 +1375,8 @@ mod tests {
     async fn migrate_reports_destination_pre_snapshot_failure() {
         // Drives lines 259-263 — destination `list_links()` snapshot
         // fails. We inject the failure on the dst side.
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src_inner = SqliteStore::open(src_tmp.path()).unwrap();
         let ctx = CallerContext::for_agent("ai:seed");
         src_inner
@@ -1411,8 +1411,8 @@ mod tests {
         // that excludes the target. The link still appears in
         // list_links (it's filed by source namespace), but the
         // destination's FK rejects the insert.
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let ctx = CallerContext::for_agent("ai:seed");
@@ -1441,8 +1441,8 @@ mod tests {
         // Pass `namespace_filter = Some(..)` so `list_links` receives
         // the filter (lines 235-236). Destination snapshot via the
         // non-dry-run path also uses the filter.
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let ctx = CallerContext::for_agent("ai:seed");
@@ -1496,7 +1496,7 @@ mod tests {
     /// under `PRAGMA query_only`, so a clean plan proves the phase is pure.
     #[tokio::test]
     async fn plan_reads_a_read_only_source_and_needs_no_destination_3435() {
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         {
             let writer = SqliteStore::open(src_tmp.path()).unwrap();
             let ctx = CallerContext::for_agent("ai:seed");
@@ -1530,7 +1530,7 @@ mod tests {
         assert_eq!(r.links_written, 0);
         // `migrate(.., dry_run = true)` is the same plan — its `to` is
         // never consulted.
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let via_migrate = migrate(src.as_ref(), &dst, 10, None, true).await;
         assert_eq!(via_migrate.memories_read, r.memories_read);
@@ -1542,8 +1542,8 @@ mod tests {
     /// WHOLE migration with the named error, before a single row lands.
     #[tokio::test]
     async fn migrate_refuses_source_lineage_cycle_before_writing_3435() {
-        let src_tmp = tempfile::NamedTempFile::new().unwrap();
-        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src_tmp = crate::test_support::SqliteTempFile::new().unwrap();
+        let dst_tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let src = SqliteStore::open(src_tmp.path()).unwrap();
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let ctx = CallerContext::for_agent("ai:seed");

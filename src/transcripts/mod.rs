@@ -72,7 +72,7 @@ mod tests {
     fn migration_is_idempotent() {
         // Open the DB twice in succession; the CREATE TABLE IF NOT
         // EXISTS path for memory_transcripts must not error.
-        let p = tempfile::NamedTempFile::new().unwrap();
+        let p = crate::test_support::SqliteTempFile::new().unwrap();
         let path = p.path().to_path_buf();
         let _ = db::open(&path).unwrap();
         let conn = db::open(&path).unwrap();
@@ -264,7 +264,7 @@ mod tests {
     /// CREATE TABLE / CREATE INDEX statements.
     #[test]
     fn i2_migration_is_idempotent() {
-        let p = tempfile::NamedTempFile::new().unwrap();
+        let p = crate::test_support::SqliteTempFile::new().unwrap();
         let path = p.path().to_path_buf();
         let _ = db::open(&path).unwrap();
         let conn = db::open(&path).unwrap();

@@ -580,11 +580,11 @@ fn run_from_pretool_stdin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::SqliteTempFile;
     use rusqlite::params;
-    use tempfile::NamedTempFile;
 
-    fn seed_rules_db() -> NamedTempFile {
-        let tmp = NamedTempFile::new().unwrap();
+    fn seed_rules_db() -> SqliteTempFile {
+        let tmp = SqliteTempFile::new().unwrap();
         let conn = rusqlite::Connection::open(tmp.path()).unwrap();
         conn.execute_batch(
             "CREATE TABLE governance_rules (
@@ -784,7 +784,7 @@ mod tests {
     // owns the mapping; a re-introduction of a missing-field / wrong-kind
     // mapping, or a Refuse that fails to translate into a `deny`, trips here.
 
-    fn open_seeded_conn(tmp: &NamedTempFile) -> rusqlite::Connection {
+    fn open_seeded_conn(tmp: &SqliteTempFile) -> rusqlite::Connection {
         rusqlite::Connection::open(tmp.path()).unwrap()
     }
 

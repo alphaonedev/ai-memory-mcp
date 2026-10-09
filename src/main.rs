@@ -1217,7 +1217,7 @@ mod tests {
              sha256:{fp_b}\t# node-2 with tab\n\
              {fp_c}\n"
         );
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(tmp.path(), body).unwrap();
         let set = tls::load_fingerprint_allowlist(tmp.path()).await.unwrap();
         assert_eq!(set.len(), 3, "expected 3 fingerprints, got {}", set.len());
@@ -1271,7 +1271,7 @@ mod tests {
         // `#` is fine (gets trimmed), but whitespace inside the hex run
         // still errors so soft-wrap copy-paste artefacts are caught.
         let body = format!("{} {}\n", "a".repeat(32), "a".repeat(32));
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(tmp.path(), body).unwrap();
         let err = tls::load_fingerprint_allowlist(tmp.path())
             .await

@@ -574,8 +574,11 @@ mod cov897_tests {
     use tokio::sync::{Mutex, RwLock};
     use uuid::Uuid;
 
-    fn build_app(tier: FeatureTier, autonomous: bool) -> (AppState, tempfile::NamedTempFile) {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    fn build_app(
+        tier: FeatureTier,
+        autonomous: bool,
+    ) -> (AppState, crate::test_support::SqliteTempFile) {
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
         let _ = crate::db::open(&path).expect("db::open");
         let conn = crate::db::open(&path).expect("reopen");

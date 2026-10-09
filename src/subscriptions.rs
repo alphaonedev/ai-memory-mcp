@@ -3514,13 +3514,13 @@ mod tests {
     //     `llm.rs::wiremock_tests`.
     // ----------------------------------------------------------------
 
-    use tempfile::NamedTempFile;
+    use crate::test_support::SqliteTempFile;
 
     /// Stand up a fresh on-disk SQLite at a tempfile path with the
     /// production schema applied. Returns the path and keeps the file
     /// alive via the returned `NamedTempFile` (drop deletes it).
-    fn fresh_db() -> (NamedTempFile, std::path::PathBuf) {
-        let f = NamedTempFile::new().expect("tempfile");
+    fn fresh_db() -> (SqliteTempFile, std::path::PathBuf) {
+        let f = SqliteTempFile::new().expect("tempfile");
         let p = f.path().to_path_buf();
         // Apply schema via the production opener so migrations run.
         let _ = crate::db::open(&p).expect("db::open");

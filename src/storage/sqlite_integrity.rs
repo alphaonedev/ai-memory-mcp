@@ -460,7 +460,7 @@ mod tests {
     /// positive control: the gate may never refuse a sound corpus.
     #[test]
     fn a_fresh_corpus_is_sound_and_page_accounted_3510() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let conn = crate::db::open(tmp.path()).expect("open");
         match check(&conn).expect("the check must complete") {
             Soundness::Sound(Coverage::WholeFileByPageAccounting(census)) => {
@@ -489,7 +489,7 @@ mod tests {
     /// is refused either way, which is the invariant.
     #[test]
     fn unaccounted_pages_are_refused_however_sqlite_answers_3510() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         {
             let conn = crate::db::open(tmp.path()).expect("open");
             assert!(matches!(check(&conn).expect("check"), Soundness::Sound(_)));

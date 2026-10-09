@@ -268,7 +268,7 @@ mod tests {
     fn write_batch_acks_and_survives_reopen() {
         let _g = env_lock().lock().unwrap();
         unsafe { std::env::remove_var(ENV_ABORT_AFTER_COMMIT) };
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let ns = "durability-unit";
         let acked = {
             let conn = crate::db::open(tmp.path()).unwrap();

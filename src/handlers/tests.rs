@@ -477,7 +477,7 @@ fn test_app_state_with_admin(db: Db, agent_id: &str) -> AppState {
 /// to satisfy the `AppState` field shape.
 #[cfg(feature = "sal")]
 fn test_sqlite_store_handle() -> Arc<dyn crate::store::MemoryStore> {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for test SqliteStore");
+    let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile for test SqliteStore");
     // Keep the tempfile alive for the lifetime of the process by
     // leaking the path — the OS reclaims it on exit. Tests that
     // touch the trait-routed path open their own dedicated stores.
@@ -16910,7 +16910,7 @@ async fn postgres_delete_pre_get_fault_is_503_and_does_not_delete_3228() {
 async fn http_capture_turn_namespace_governance_pending_returns_202() {
     let _gate = pin_governance_enforce_for_test();
     crate::governance::clear_active_permission_rules_for_test();
-    let f = tempfile::NamedTempFile::new().unwrap();
+    let f = crate::test_support::SqliteTempFile::new().unwrap();
     let path = f.path().to_path_buf();
     let conn = crate::db::open(&path).unwrap();
     let ns = "gov-capture-3225";

@@ -9653,9 +9653,9 @@ mod tests {
     // because they set the process-global posture / header-trust env.
 
     /// Write a temp mTLS allowlist file with `n` distinct 64-hex fingerprints.
-    fn fp_allowlist(n: usize) -> tempfile::NamedTempFile {
+    fn fp_allowlist(n: usize) -> crate::test_support::SqliteTempFile {
         use std::io::Write as _;
-        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        let mut f = crate::test_support::SqliteTempFile::new().expect("tempfile");
         for i in 0..n {
             // Distinct 64-hex lines: (i as hex) left-padded into 64 chars.
             writeln!(f, "{:064x}", i + 1).expect("write fp");

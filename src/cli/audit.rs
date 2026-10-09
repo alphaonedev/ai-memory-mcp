@@ -2128,7 +2128,7 @@ mod tests {
 
     #[test]
     fn audit_show_emits_no_rows_message_on_empty_table() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
@@ -2140,7 +2140,7 @@ mod tests {
 
     #[test]
     fn audit_show_renders_grant_and_deny_rows_in_text_format() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = crate::db::open(tmp.path()).unwrap();
         crate::db::record_capability_expansion(&conn, Some("alice"), "graph", true, None);
         crate::db::record_capability_expansion(&conn, Some("bob"), "power", false, None);
@@ -2162,7 +2162,7 @@ mod tests {
 
     #[test]
     fn audit_show_emits_valid_json_when_flag_set() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = crate::db::open(tmp.path()).unwrap();
         crate::db::record_capability_expansion(&conn, Some("alice"), "graph", true, None);
         drop(conn);
@@ -2184,7 +2184,7 @@ mod tests {
 
     #[test]
     fn audit_show_filters_by_agent_id() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = crate::db::open(tmp.path()).unwrap();
         crate::db::record_capability_expansion(&conn, Some("alice"), "graph", true, None);
         crate::db::record_capability_expansion(&conn, Some("bob"), "power", false, None);

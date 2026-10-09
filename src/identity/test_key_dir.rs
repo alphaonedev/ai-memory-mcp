@@ -126,6 +126,9 @@ pub fn install() -> &'static Path {
             }
             assert_isolated(dir.path());
             bind_key_dir_env(dir.path());
+            // #6266 — a static `TempDir` never drops; remove it at process exit.
+            #[cfg(test)]
+            crate::test_support::exit_cleanup::remove_dir_at_exit(dir.path());
             dir
         })
         .path();

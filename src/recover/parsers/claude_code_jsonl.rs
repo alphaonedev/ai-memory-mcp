@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn since_filter_excludes_earlier_lines() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let mut f = crate::test_support::SqliteTempFile::new().unwrap();
         writeln!(
             f,
             r#"{{"timestamp":"2026-05-28T10:00:00Z","type":"user","message":{{"content":"a"}}}}"#
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn parse_skips_blank_and_malformed_lines_but_keeps_good_ones() {
         use std::io::Write;
-        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let mut f = crate::test_support::SqliteTempFile::new().unwrap();
         writeln!(f).unwrap();
         writeln!(f, "not json at all").unwrap();
         writeln!(f, r#"{{"type":"last-prompt"}}"#).unwrap();

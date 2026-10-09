@@ -1842,8 +1842,8 @@ mod tests {
         }
     }
 
-    fn setup_conn() -> (tempfile::NamedTempFile, Connection) {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+    fn setup_conn() -> (crate::test_support::SqliteTempFile, Connection) {
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         (tmp, conn)
     }
@@ -2343,7 +2343,7 @@ mod tests {
     #[tokio::test]
     async fn reverse_rollback_entry_store_restores_originals_sqlite() {
         use crate::store::MemoryStore;
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let store = crate::store::sqlite::SqliteStore::open(tmp.path()).expect("open store");
         let ctx = crate::store::CallerContext::for_admin("ai:test");
 
@@ -2406,7 +2406,7 @@ mod tests {
     #[tokio::test]
     async fn reverse_rollback_entry_store_collision_aborts_sqlite() {
         use crate::store::MemoryStore;
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let store = crate::store::sqlite::SqliteStore::open(tmp.path()).expect("open store");
         let ctx = crate::store::CallerContext::for_admin("ai:test");
 

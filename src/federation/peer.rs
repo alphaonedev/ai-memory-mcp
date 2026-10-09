@@ -702,7 +702,7 @@ mod build_pinning_tests {
     #[test]
     fn build_takes_pinning_branch_when_env_set() {
         let _g = crate::tls::fed_pin_env_lock();
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(tmp.path(), format!("peer.example {}\n", "a".repeat(64))).unwrap();
         // SAFETY: serialised via fed_pin_env_lock(); removed before asserts so
         // a failed assertion never leaks the var to a later test.

@@ -4598,7 +4598,7 @@ mod tests {
     // `db::delete_link` against an unrelated local sqlite file.
     #[tokio::test]
     async fn fbl08_delete_link_removes_edge_and_reports_removal() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let ctx = CallerContext::for_agent("alice");
         let a = test_memory("fbl08-src", "source body");
@@ -4643,7 +4643,7 @@ mod tests {
         // by `tests/sal_parity_batch_atomicity_3181.rs`. `list_unembedded`
         // is implemented (#2639) but admin-gated (#1586): a tenant context
         // still gets empty.
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let ctx = CallerContext::for_agent("alice");
 
@@ -4713,7 +4713,7 @@ mod tests {
     /// permanently invisible to semantic + hybrid recall.
     #[tokio::test]
     async fn list_unembedded_scans_null_embedding_rows_for_admin_2639() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let tenant = CallerContext::for_agent("alice");
         let admin = CallerContext::for_admin("test-backfill");
@@ -4768,7 +4768,7 @@ mod tests {
     /// stored fingerprint goes stale (healing path).
     #[tokio::test]
     async fn list_unembedded_persists_skip_for_undecryptable_3344() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
         let store = SqliteStore::open(&path).expect("open");
         let admin = CallerContext::for_admin("test-3344");
@@ -4864,7 +4864,7 @@ mod tests {
         // rows were invisible. Seed 260 high-priority non-matching
         // rows (crossing the 256-row page) + 2 LOW-priority matching
         // rows that sort last; the paged adapter impl must find both.
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let ctx = CallerContext::for_agent("alice");
         for i in 0..260 {
@@ -4896,7 +4896,7 @@ mod tests {
         // #1634 — the sqlite adapter passed a literal None into the
         // expires_at slot (the pg twin honored it per #1423), so any
         // trait caller setting it had the field silently dropped.
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let ctx = CallerContext::for_agent("alice");
         let m = test_memory("exp-1634", "expiry-thread fixture body");
@@ -4972,7 +4972,7 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_store_get() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let ctx = CallerContext::for_agent("alice");
         let mem = test_memory("hello", "world one two three four five six seven");
@@ -4983,7 +4983,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_missing_returns_not_found() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let ctx = CallerContext::for_agent("alice");
         let err = store
@@ -4995,7 +4995,7 @@ mod tests {
 
     #[tokio::test]
     async fn capabilities_declare_sqlite_reality() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let caps = store.capabilities();
         assert!(caps.contains(Capabilities::DURABLE));
@@ -5090,7 +5090,7 @@ mod tests {
     /// (b) exercises the real `verify` detection via a raw metadata wipe.
     #[tokio::test]
     async fn verify_flags_missing_agent_id_update_preserves_2106() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let ctx = CallerContext::for_agent("alice");
         let mut mem = test_memory("hello", "x content long enough to pass validate");
@@ -5155,7 +5155,7 @@ mod tests {
     // ---------------------------------------------------------------------
 
     fn fresh_store() -> SqliteStore {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
         // Drop the NamedTempFile guard so close() doesn't race the DB
         // open; the path leaks but it's under the OS tmp dir which
@@ -6430,7 +6430,7 @@ mod tests {
         // pin that begin_transaction fails LOUDLY (Unsupported) until
         // a real implementation lands, so no caller can ever hold a
         // transaction handle that doesn't transact.
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let ctx = CallerContext::for_agent("alice");
         let err = match store.begin_transaction(&ctx).await {
@@ -6445,7 +6445,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_path_accessor_returns_open_path() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
         let store = SqliteStore::open(&path).expect("open");
         assert_eq!(store.path(), path.as_path());

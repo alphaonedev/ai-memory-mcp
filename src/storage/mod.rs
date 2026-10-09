@@ -32672,7 +32672,7 @@ mod tests {
     fn audit_log_migration_idempotent_on_re_open() {
         // Open the DB twice in succession; the audit_log CREATE TABLE
         // IF NOT EXISTS path must not error.
-        let p = tempfile::NamedTempFile::new().unwrap();
+        let p = crate::test_support::SqliteTempFile::new().unwrap();
         let p = p.path().to_path_buf();
         let _ = open(&p).unwrap();
         let conn = open(&p).unwrap();

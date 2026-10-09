@@ -266,8 +266,8 @@ impl DispatchDrainReport {
 mod tests {
     use super::*;
 
-    fn fresh_db() -> (tempfile::NamedTempFile, PathBuf) {
-        let f = tempfile::NamedTempFile::new().expect("tempfile");
+    fn fresh_db() -> (crate::test_support::SqliteTempFile, PathBuf) {
+        let f = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let p = f.path().to_path_buf();
         let _ = crate::db::open(&p).expect("db::open");
         (f, p)

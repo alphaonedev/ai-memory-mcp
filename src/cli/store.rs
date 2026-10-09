@@ -1514,7 +1514,7 @@ mod tests {
     /// cannot pass by rejecting everything.
     #[test]
     fn read_back_persisted_errors_when_row_is_missing_3025() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
 
         let err = read_back_persisted(&conn, "no-such-id-3025")
@@ -1537,7 +1537,7 @@ mod tests {
     /// write-already-happened wording and the id.
     #[test]
     fn read_back_persisted_errors_when_read_fails_3025() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         conn.execute_batch("DROP TABLE memories;")
             .expect("drop table to force a read failure");

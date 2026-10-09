@@ -495,11 +495,11 @@ fn truncate(s: &str, max_chars: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::SqliteTempFile;
     use std::io::Write;
-    use tempfile::NamedTempFile;
 
-    fn make_temp_file(content: &str) -> NamedTempFile {
-        let mut f = NamedTempFile::new().unwrap();
+    fn make_temp_file(content: &str) -> SqliteTempFile {
+        let mut f = SqliteTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
     }
@@ -668,12 +668,12 @@ fn mine_with_zero_limit_returns_empty() {
 #[cfg(test)]
 mod tests_w12d {
     use super::*;
+    use crate::test_support::SqliteTempFile;
     use std::fs;
     use std::io::Write as _;
-    use tempfile::NamedTempFile;
 
-    fn temp_file(content: &str) -> NamedTempFile {
-        let mut f = NamedTempFile::new().unwrap();
+    fn temp_file(content: &str) -> SqliteTempFile {
+        let mut f = SqliteTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
     }

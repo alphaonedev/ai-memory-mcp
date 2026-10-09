@@ -839,7 +839,7 @@ namespace = "*"
 
     #[test]
     fn load_from_file_round_trip() {
-        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let mut tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         tmp.write_all(VALID_CANONICAL.as_bytes()).expect("write");
         let hooks = HookConfig::load_from_file(tmp.path()).expect("loads");
         assert_eq!(hooks.len(), 1);
@@ -859,7 +859,7 @@ namespace = "*"
     /// the executor is wired in.
     #[tokio::test]
     async fn sighup_reload_swaps_snapshot() {
-        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let mut tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         tmp.write_all(VALID_CANONICAL.as_bytes()).expect("write A");
 
         let snapshot: Arc<HookConfigSnapshot> = Arc::new(RwLock::new(

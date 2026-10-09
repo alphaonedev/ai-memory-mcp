@@ -979,7 +979,7 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
     }
 
-    pub(super) fn set_fully_hardened_env() -> tempfile::NamedTempFile {
+    pub(super) fn set_fully_hardened_env() -> crate::test_support::SqliteTempFile {
         unsafe {
             std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "asi-hard");
         }
@@ -987,7 +987,7 @@ mod tests {
         // single source of truth for what "compliant" means for that set.
         crate::security_profile::enforce_at_boot().expect("asi-hard pins cleanly from a clean env");
 
-        let fp_file = tempfile::NamedTempFile::new().expect("tempfile");
+        let fp_file = crate::test_support::SqliteTempFile::new().expect("tempfile");
         std::fs::write(fp_file.path(), "example.org abc123\n").expect("write fp file");
 
         unsafe {
@@ -1038,6 +1038,8 @@ mod tests {
             let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
             crate::governance::audit::init(dir.path(), Some(signing))
                 .expect("install daemon audit key");
+            // #6266 — a static `TempDir` never drops; remove it at process exit.
+            crate::test_support::exit_cleanup::remove_dir_at_exit(dir.path());
             dir
         });
         // AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT / _SIG / _NONCE /
@@ -2066,7 +2068,7 @@ mod tests {
     /// at a postgres:// DSN, so check #15 evaluates the COMPENSATING pg
     /// at-rest control instead of the sqlcipher predicate. Returns the
     /// fingerprints tempfile (kept alive by the caller).
-    fn set_postgres_backend(dsn: &str) -> tempfile::NamedTempFile {
+    fn set_postgres_backend(dsn: &str) -> crate::test_support::SqliteTempFile {
         let fp = set_fully_hardened_env();
         unsafe {
             std::env::set_var(crate::store_url::STORE_URL_ENV, dsn);

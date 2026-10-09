@@ -12327,7 +12327,7 @@ legacy_scoring = false
     #[test]
     fn load_from_returns_default_for_unparseable_toml() {
         // Garbage TOML → load_from prints a warning and returns default.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(tmp.path(), "this is not [valid toml]]]").unwrap();
         let cfg = AppConfig::load_from(tmp.path());
         assert!(cfg.tier.is_none());
@@ -12335,7 +12335,7 @@ legacy_scoring = false
 
     #[test]
     fn load_from_parses_valid_toml() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
             r#"
@@ -12370,7 +12370,7 @@ legacy_scoring = false
 
     #[test]
     fn try_load_from_optional_propagates_parse_error_3166() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
             "db = \"/var/lib/ai-memory/prod.db\"\nnot toml]]]",
@@ -12391,7 +12391,7 @@ legacy_scoring = false
 
     #[test]
     fn try_load_from_optional_does_not_echo_api_key_on_toml_error_3277() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(tmp.path(), "api_key = \"sekrit-must-not-leak\"unclosed\n").unwrap();
         let err = AppConfig::try_load_from_optional(tmp.path())
             .expect_err("malformed api_key TOML must refuse, not default");
@@ -12424,7 +12424,7 @@ legacy_scoring = false
 
     #[test]
     fn try_load_from_optional_preserves_the_configured_db_3166() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(tmp.path(), "db = \"/var/lib/ai-memory/prod.db\"\n").unwrap();
         let cfg = AppConfig::try_load_from_optional(tmp.path()).expect("valid config");
         assert_eq!(cfg.db.as_deref(), Some("/var/lib/ai-memory/prod.db"));
@@ -12537,7 +12537,7 @@ legacy_scoring = false
     #[test]
     fn unknown_keys_refuse_the_boot_loader_at_every_level() {
         let toml_src = "tier = \"autonomous\"\n\n[memory]\ntier = \"ignored\"\n\n[storage]\ndb_mmap_size_byte = 1\n";
-        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("create temp file");
         std::fs::write(tmp.path(), toml_src).expect("write temp config");
 
         let err = AppConfig::try_load_from_optional(tmp.path())
@@ -12572,7 +12572,7 @@ legacy_scoring = false
     fn egress_loader_applies_known_keys_and_warns_on_unknown_ones() {
         let toml_src =
             "tier = \"keyword\"\ndb = \"/srv/ai-memory/live.db\"\n\n[memory]\ntier = \"x\"\n";
-        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("create temp file");
         std::fs::write(tmp.path(), toml_src).expect("write temp config");
         assert!(
             AppConfig::try_load_from_optional(tmp.path()).is_err(),
@@ -12612,7 +12612,7 @@ legacy_scoring = false
     #[test]
     fn clean_config_loads_unchanged_under_unknown_key_refusal() {
         let toml_src = "schema_version = 2\ntier = \"autonomous\"\napi_key = \"k\"\n\n[deployment]\nshape = \"team\"\n\n[storage]\ndb_mmap_size_bytes = 1\n";
-        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("create temp file");
         std::fs::write(tmp.path(), toml_src).expect("write temp config");
         let cfg = AppConfig::try_load_from_optional(tmp.path()).expect("clean config loads");
         assert_eq!(cfg.tier.as_deref(), Some("autonomous"));

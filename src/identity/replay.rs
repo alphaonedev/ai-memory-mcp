@@ -1179,7 +1179,7 @@ mod federation_nonce_cache_tests {
     /// nonce)` MUST surface as `Replay` on the second cache.
     #[test]
     fn issue_1255_nonce_persists_across_recreated_cache() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let db_path = tmp.path().to_path_buf();
 
         // First cache — accept the nonce as Fresh, persisting it.
@@ -1242,7 +1242,7 @@ mod federation_nonce_cache_tests {
             .expect("count rows")
         }
 
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let db_path = tmp.path().to_path_buf();
         let cache = FederationNonceCache::new_with_db_persistence(&db_path)
             .expect("open + migrate nonce db");
@@ -1284,7 +1284,7 @@ mod federation_nonce_cache_tests {
         // #1690 — the hydration-time legacy-bloat repair keeps the newest
         // `cap` rows per peer and deletes the rest. Tested with a small
         // cap so we don't seed 10k rows.
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let conn = crate::db::open(tmp.path()).expect("open + migrate");
         // peer-a: 4 rows (last_touch 1..4); peer-b: 2 rows (5..6).
         for (peer, touch) in [

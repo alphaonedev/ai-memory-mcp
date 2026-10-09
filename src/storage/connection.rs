@@ -1428,7 +1428,7 @@ mod tests {
 
     #[test]
     fn open_round_trip_creates_db_and_runs_migrations() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let conn = open(tmp.path()).expect("open initial");
         // schema_version table must exist and be populated.
         let v: i64 = conn
@@ -1448,7 +1448,7 @@ mod tests {
         // CREATE TRIGGER batch. This test exercises both branches: first
         // open installs triggers; second open hits the already-installed
         // probe and returns early without running CREATE TRIGGER.
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         // First open.
         let _conn1 = open(tmp.path()).expect("first open");
         // Second open against the same path.
@@ -1467,7 +1467,7 @@ mod tests {
 
     #[test]
     fn open_applies_wal_journal_mode() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let conn = open(tmp.path()).expect("open");
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
@@ -1483,7 +1483,7 @@ mod tests {
         // process-global, but nothing in the test binary seeds it —
         // `daemon_runtime::run` is the only production writer — so the
         // fallback branch is the one under test.
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let conn = open(tmp.path()).expect("open");
         let mmap: i64 = conn
             .query_row("PRAGMA mmap_size", [], |r| r.get(0))
@@ -1586,7 +1586,7 @@ mod tests {
     fn open_applies_resolved_synchronous_pragma() {
         // `open` must apply the resolved `PRAGMA synchronous`. Unseeded /
         // no-env → NORMAL (which SQLite reports as the integer 1).
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let conn = open(tmp.path()).expect("open");
         let sync: i64 = conn
             .query_row("PRAGMA synchronous", [], |r| r.get(0))
@@ -1597,7 +1597,7 @@ mod tests {
 
     #[test]
     fn open_enables_foreign_keys() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let conn = open(tmp.path()).expect("open");
         let fk: i32 = conn
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
@@ -1648,7 +1648,7 @@ mod tests {
     /// bootstrap used to crash on.
     #[test]
     fn open_succeeds_on_legacy_pre_v36_memories_shape() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         {
             let conn = open(tmp.path()).expect("seed: fresh open");
             for ix in [
@@ -1742,7 +1742,7 @@ mod tests {
     /// against the missing column.
     #[test]
     fn open_succeeds_on_legacy_pre_v41_shadow_shape() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         {
             let conn = open(tmp.path()).expect("seed: fresh open");
             conn.execute(
@@ -2033,7 +2033,7 @@ mod tests {
         // install. We bypass the validator by writing directly with
         // rusqlite::execute so the trigger is the only thing standing
         // between the bad row and persistence.
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let conn = open(tmp.path()).expect("open");
         let now = chrono::Utc::now().to_rfc3339();
         let res = conn.execute(
@@ -2063,7 +2063,7 @@ mod tests {
         let _lock = crate::test_support::env_lock();
         let guard = crate::test_support::EnvGuard::capture(ENV_DB_PASSPHRASE);
         guard.set("s1-test-passphrase");
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let err = open(tmp.path()).expect_err("passphrase + non-sqlcipher must refuse");
         let msg = err.to_string();
         assert!(
@@ -2089,7 +2089,7 @@ mod tests {
         let _lock = crate::test_support::env_lock();
         let guard = crate::test_support::EnvGuard::capture(crate::encryption::ENV_ENCRYPT_AT_REST);
         guard.set("1");
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         open(tmp.path())
             .expect("ENCRYPT_AT_REST + non-sqlcipher must open (ChaCha, not SQLCipher)");
         refuse_at_rest_requested_without_sqlcipher()
@@ -2142,7 +2142,7 @@ mod tests {
         );
         refuse_at_rest_requested_without_sqlcipher()
             .expect("cleared passphrase must not trip the S1 gate");
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         open(tmp.path()).expect("store-open after reset must succeed on non-sqlcipher");
     }
 }

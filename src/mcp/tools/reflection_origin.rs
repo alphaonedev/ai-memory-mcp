@@ -138,7 +138,7 @@ mod tests {
     use crate::storage as db;
 
     fn fresh_db() -> rusqlite::Connection {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         db::open(tmp.path()).expect("db::open")
     }
 
@@ -248,7 +248,7 @@ mod authority_gate_3600_tests {
 
     #[test]
     fn foreign_owner_private_reflection_is_not_found_for_another_caller_3600() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let conn = db::open(tmp.path()).expect("db::open");
         let id = seed_private_reflection(&conn, "ai:alice");
         let err =
@@ -262,7 +262,7 @@ mod authority_gate_3600_tests {
 
     #[test]
     fn owner_reads_their_reflection_provenance_3600() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let conn = db::open(tmp.path()).expect("db::open");
         let id = seed_private_reflection(&conn, "ai:alice");
         let out = handle_reflection_origin(&conn, &json!({"memory_id": id}), Some("ai:alice"))

@@ -895,7 +895,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_sqlite_emits_json_with_expected_fields() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let path = tmp.path().to_string_lossy().to_string();
         let url = format!("sqlite://{path}");
 
@@ -956,7 +956,7 @@ mod tests {
     async fn run_sqlite_carries_explicit_embedding_dim() {
         // v0.7.0 L3 — operator-provided dim is echoed into the report
         // even on SQLite where the column has no dim of its own.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let path = tmp.path().to_string_lossy().to_string();
         let url = format!("sqlite://{path}");
 
@@ -985,7 +985,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_sqlite_human_output_renders_report() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let path = tmp.path().to_string_lossy().to_string();
         let url = format!("sqlite://{path}");
         let mut stdout = Vec::<u8>::new();
@@ -1498,7 +1498,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_sqlite_human_output_is_six_lines_minimum() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let path = tmp.path().to_string_lossy().to_string();
         let url = format!("sqlite://{path}");
 
@@ -1725,7 +1725,7 @@ mod tests {
         // master walk / schema_version read. Already exercised end-to-
         // end via run_sqlite_emits_json_with_expected_fields, but here
         // we pin the helper's return shape on its own.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let path = tmp.path().to_string_lossy().to_string();
         let url = format!("sqlite://{path}");
         // Trigger init by opening through migrate first.
@@ -1752,7 +1752,7 @@ mod tests {
     #[tokio::test]
     async fn read_schema_version_falls_back_to_zero_on_missing_table() {
         // Drives the `.unwrap_or(0)` branch at line 282.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = rusqlite::Connection::open(tmp.path()).unwrap();
         // No `schema_version` table — the helper's query errors and
         // the caller substitutes 0.

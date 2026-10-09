@@ -1326,8 +1326,8 @@ mod tests {
 
     /// Convenience: write `body` to a temp file and return the temp file
     /// (kept so the caller can `tmp.path()`).
-    fn write_tmp(body: &str) -> tempfile::NamedTempFile {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+    fn write_tmp(body: &str) -> crate::test_support::SqliteTempFile {
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(tmp.path(), body).unwrap();
         tmp
     }
@@ -2159,7 +2159,7 @@ mod tests {
             .without_time()
             .finish();
 
-        let key = tempfile::NamedTempFile::new().unwrap();
+        let key = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(key.path(), b"dummy keymat").unwrap();
         std::fs::set_permissions(key.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
 
@@ -2200,7 +2200,7 @@ mod tests {
             .without_time()
             .finish();
 
-        let key = tempfile::NamedTempFile::new().unwrap();
+        let key = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(key.path(), b"dummy keymat").unwrap();
         std::fs::set_permissions(key.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
 
@@ -2267,7 +2267,7 @@ mod tests {
         // into a [u8; 32] which goes into the verifier. Hex content is
         // irrelevant to the builder — it just needs to be non-empty so
         // the empty-allowlist refusal does not trip.
-        let allowlist = tempfile::NamedTempFile::new().unwrap();
+        let allowlist = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(allowlist.path(), format!("{}\n", "a".repeat(64))).unwrap();
 
         let config = load_mtls_rustls_config(&cert, &key, allowlist.path())
@@ -2287,7 +2287,7 @@ mod tests {
             .join("tests/fixtures/tls/valid_cert.pem");
         let key = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tls/valid_key_pkcs8.pem");
-        let allowlist = tempfile::NamedTempFile::new().unwrap();
+        let allowlist = crate::test_support::SqliteTempFile::new().unwrap();
         // Comment-only allowlist — parses successfully, but the set is empty.
         std::fs::write(allowlist.path(), "# nothing here\n").unwrap();
 
@@ -2307,7 +2307,7 @@ mod tests {
         let cert = std::path::PathBuf::from("/does/not/exist/mtls-cert.pem");
         let key = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tls/valid_key_pkcs8.pem");
-        let allowlist = tempfile::NamedTempFile::new().unwrap();
+        let allowlist = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(allowlist.path(), format!("{}\n", "b".repeat(64))).unwrap();
 
         let err = load_mtls_rustls_config(&cert, &key, allowlist.path())
@@ -2325,7 +2325,7 @@ mod tests {
         let cert = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tls/valid_cert.pem");
         let key = std::path::PathBuf::from("/does/not/exist/mtls-key.pem");
-        let allowlist = tempfile::NamedTempFile::new().unwrap();
+        let allowlist = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(allowlist.path(), format!("{}\n", "c".repeat(64))).unwrap();
 
         let err = load_mtls_rustls_config(&cert, &key, allowlist.path())

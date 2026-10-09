@@ -458,8 +458,8 @@ mod tests {
     use crate::atomisation::AtomiserConfig;
     use crate::atomisation::curator::{Atom, Curator, CuratorError};
     use crate::storage as db;
+    use crate::test_support::SqliteTempFile;
     use std::sync::Mutex;
-    use tempfile::NamedTempFile;
 
     /// Deterministic mock — pops a canned response queue. Mirrors the
     /// shape used by `tests/atomisation/core.rs` so the engine sees a
@@ -493,8 +493,8 @@ mod tests {
         }
     }
 
-    fn fresh_db() -> (NamedTempFile, rusqlite::Connection) {
-        let tmp = NamedTempFile::new().expect("tempfile");
+    fn fresh_db() -> (SqliteTempFile, rusqlite::Connection) {
+        let tmp = SqliteTempFile::new().expect("tempfile");
         let conn = db::open(tmp.path()).expect("db::open");
         (tmp, conn)
     }

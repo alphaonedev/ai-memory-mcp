@@ -9274,7 +9274,7 @@ enabled = true
         }
         crate::security_profile::enforce_at_boot().expect("asi-hard pins cleanly");
 
-        let fp_file = tempfile::NamedTempFile::new().unwrap();
+        let fp_file = crate::test_support::SqliteTempFile::new().unwrap();
         std::fs::write(fp_file.path(), "example.org abc123\n").unwrap();
         // #2991 check #20 — a deterministic, valid base64 Ed25519 approver pubkey.
         let approver_pubkey_b64 = {

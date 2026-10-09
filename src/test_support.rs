@@ -28,7 +28,10 @@
 //! writes — a fourth instance of the $HOME per-module-mutex defect
 //! (#1998 -> #2115 -> #2127).
 
+pub(crate) mod exit_cleanup;
 mod leak_guard_6266;
+pub(crate) mod sqlite_tempfile;
+pub(crate) use sqlite_tempfile::SqliteTempFile;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

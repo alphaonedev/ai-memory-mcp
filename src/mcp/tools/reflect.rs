@@ -1229,8 +1229,8 @@ mod tests {
         assert_eq!(caller_depth, Some(3));
     }
 
-    fn fresh_db() -> (rusqlite::Connection, tempfile::NamedTempFile) {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    fn fresh_db() -> (rusqlite::Connection, crate::test_support::SqliteTempFile) {
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let conn = db::open(tmp.path()).expect("db::open");
         (conn, tmp)
     }

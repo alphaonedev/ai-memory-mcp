@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn read_peer_cred_refuses_a_descriptor_that_is_not_a_socket() {
-        let tmp = tempfile::NamedTempFile::new().expect("tmp file");
+        let tmp = crate::test_support::SqliteTempFile::new().expect("tmp file");
         assert!(
             read_peer_cred(tmp.as_file().as_raw_fd()).is_err(),
             "a non-socket descriptor must be an error, never a fabricated credential"

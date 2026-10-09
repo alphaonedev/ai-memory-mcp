@@ -1363,7 +1363,7 @@ mod tests {
 
     #[test]
     fn run_once_without_llm_emits_error_but_succeeds() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let cfg = CuratorConfig::default();
         let report = run_once(&conn, None, &cfg, None).unwrap();
@@ -1424,7 +1424,7 @@ mod tests {
     fn persist_auto_tags_writes_metadata() {
         // After persist_auto_tags, the row's metadata.auto_tags reflects the
         // input list and metadata.curated_at is a non-empty string.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let mem = make_test_memory("curate-test", "anchor", &"a".repeat(120));
         db::insert(&conn, &mem).unwrap();
@@ -1453,7 +1453,7 @@ mod tests {
     fn persist_auto_tags_with_empty_tag_list_still_writes_marker() {
         // Even an empty tag list must persist `auto_tags: []` and
         // `curated_at` so the curator skips the row on the next cycle.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let mem = make_test_memory("curate-test", "anchor", &"a".repeat(120));
         db::insert(&conn, &mem).unwrap();
@@ -1474,7 +1474,7 @@ mod tests {
     fn persist_contradiction_appends_unique_ids() {
         // Two persist_contradiction calls with different ids → both ids
         // present in the array. A duplicate id is a no-op.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let mem = make_test_memory("curate-test", "anchor", &"a".repeat(120));
         db::insert(&conn, &mem).unwrap();
@@ -1506,7 +1506,7 @@ mod tests {
     #[test]
     fn adjacent_memory_returns_none_when_only_self_exists() {
         // Solo namespace → no sibling → Ok(None).
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let mem = make_test_memory("solo-ns", "only", &"a".repeat(120));
         db::insert(&conn, &mem).unwrap();
@@ -1519,7 +1519,7 @@ mod tests {
     fn adjacent_memory_returns_some_when_sibling_present() {
         // Two memories in the same namespace → adjacent_memory returns the
         // other one (whichever the underlying `db::list` orders first).
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let m1 = make_test_memory("dual-ns", "first", &"a".repeat(120));
         let m2 = make_test_memory("dual-ns", "second", &"b".repeat(120));
@@ -1534,7 +1534,7 @@ mod tests {
     #[test]
     fn adjacent_memory_skips_short_sibling() {
         // Sibling exists but content too short → adjacent_memory returns None.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let m1 = make_test_memory("ns-short", "anchor", &"a".repeat(120));
         let mut m2 = make_test_memory("ns-short", "tiny-sibling", "x");
@@ -1567,7 +1567,7 @@ mod tests {
     fn collect_candidates_returns_eligible_memories() {
         // Long-tier rows with sufficient content are picked up; short-tier
         // rows are excluded by collect_candidates' per-tier sweep.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         for i in 0..3 {
             let mem = make_test_memory("cand-ns", &format!("row-{i}"), &"a".repeat(120));
@@ -1584,7 +1584,7 @@ mod tests {
     fn run_once_with_dry_run_does_not_persist() {
         // dry_run=true with no LLM still runs to completion; the report
         // captures duration and the "no LLM" error path.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let mem = make_test_memory("dry-ns", "anchor", &"a".repeat(120));
         db::insert(&conn, &mem).unwrap();
@@ -1606,7 +1606,7 @@ mod tests {
         use std::thread;
         use std::time::Duration;
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let db_path = tmp.path().to_path_buf();
         let conn = db::open(&db_path).unwrap();
 
@@ -1989,7 +1989,7 @@ mod tests {
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let mem = make_eligible_memory("autotag-ns", "anchor");
         db::insert(&conn, &mem).unwrap();
@@ -2024,7 +2024,7 @@ mod tests {
             let server = FakeOllama::start(FakeOllamaCfg::default());
             let llm = ollama_for(&server);
 
-            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let tmp = crate::test_support::SqliteTempFile::new().unwrap();
             let conn = db::open(tmp.path()).unwrap();
             let mem = make_eligible_memory("dry-llm-ns", "anchor");
             db::insert(&conn, &mem).unwrap();
@@ -2066,7 +2066,7 @@ mod tests {
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         for i in 0..3 {
             let m = make_eligible_memory("capns", &format!("anchor-{i}"));
@@ -2090,7 +2090,7 @@ mod tests {
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let inside = make_eligible_memory("included", "in");
         let outside = make_eligible_memory("not-included", "out");
@@ -2116,7 +2116,7 @@ mod tests {
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let kept = make_eligible_memory("kept", "k");
         let dropped = make_eligible_memory("dropped", "d");
@@ -2143,7 +2143,7 @@ mod tests {
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let cfg = CuratorConfig::default();
 
@@ -2167,7 +2167,7 @@ mod tests {
         let server = FakeOllama::start(cfg_server);
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let m1 = make_eligible_memory("dual", "first");
         let m2 = make_eligible_memory("dual", "second");
@@ -2194,7 +2194,7 @@ mod tests {
         let server = FakeOllama::start(cfg_server);
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let mem = make_eligible_memory("fail-ns", "anchor");
         db::insert(&conn, &mem).unwrap();
@@ -2228,7 +2228,7 @@ mod tests {
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let mem = make_eligible_memory("report-ns", "anchor");
         db::insert(&conn, &mem).unwrap();
@@ -2293,7 +2293,7 @@ mod tests {
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let mem = make_eligible_memory("idem-ns", "anchor");
         db::insert(&conn, &mem).unwrap();
@@ -2333,7 +2333,7 @@ mod tests {
 
     #[test]
     fn run_once_size_gc_evicts_and_increments_counter() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         // Two ~1KB long-tier rows; lower-priority is the eviction victim.
         let low = make_sized_curator_memory("sgc-ns", "low", 1, 1000);
@@ -2369,7 +2369,7 @@ mod tests {
 
     #[test]
     fn run_once_size_gc_none_cap_does_not_evict() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let m = make_sized_curator_memory("sgc-ns", "a", 1, 5000);
         db::insert(&conn, &m).unwrap();
@@ -2387,7 +2387,7 @@ mod tests {
 
     #[test]
     fn run_once_size_gc_dry_run_does_not_evict() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let low = make_sized_curator_memory("sgc-ns", "low", 1, 1000);
         let high = make_sized_curator_memory("sgc-ns", "high", 9, 1000);
@@ -2424,7 +2424,7 @@ mod tests {
     /// operator's compaction opt-in.
     #[test]
     fn run_once_size_gc_cap_without_enabled_does_not_evict() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let low = make_sized_curator_memory("sgc-ns", "low", 1, 1000);
         let high = make_sized_curator_memory("sgc-ns", "high", 9, 1000);
@@ -2460,7 +2460,7 @@ mod tests {
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         for i in 0..3 {
             let m = make_eligible_memory("multi-ns", &format!("anchor-{i}"));
@@ -2487,7 +2487,7 @@ mod tests {
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         // Two near-duplicates (≥0.55 jaccard threshold) in one namespace.
         let now = chrono::Utc::now().to_rfc3339();
@@ -2581,7 +2581,7 @@ mod tests {
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
 
         // One mergeable near-duplicate pair: `make_eligible_memory` gives both
@@ -2695,7 +2695,7 @@ mod tests {
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
 
         // Seed an observation in the test namespace; this is what the
@@ -2829,7 +2829,7 @@ mod tests {
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
 
         let obs = make_eligible_memory("dry-persona-ns", "observation");
@@ -2914,7 +2914,7 @@ mod tests {
         let _lineage = crate::test_support::no_lineage_dag_guard();
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
 
         seed_reflection_with_entity(&conn, "persona-kept", "entity-kept");
@@ -2955,7 +2955,7 @@ mod tests {
         let _lineage = crate::test_support::no_lineage_dag_guard();
         let server = FakeOllama::start(FakeOllamaCfg::default());
         let llm = ollama_for(&server);
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
 
         seed_reflection_with_entity(&conn, "persona-in", "entity-in");
@@ -3015,7 +3015,7 @@ mod tests {
     /// write must be refused loudly, not self-reported as a success.
     #[test]
     fn persist_helpers_refuse_non_object_metadata() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
 
         let mut mem = make_eligible_memory("meta-ns", "non-object-metadata");
@@ -3048,7 +3048,7 @@ mod tests {
 fn apply_rollback_handles_storage_error() {
     // Test that when persist_auto_tags fails (e.g., DB error),
     // the curator still records the error but continues.
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = crate::test_support::SqliteTempFile::new().unwrap();
     let conn = db::open(tmp.path()).unwrap();
 
     // created_at is `now` so the #1466 tier-default expiry backfill on
@@ -3117,7 +3117,7 @@ fn consolidate_pair_skips_when_namespaces_disagree() {
     // This is a future test once autonomy::consolidate_pair is available.
     // For now, verify that the adjacent_memory function skips
     // memories in different namespaces.
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = crate::test_support::SqliteTempFile::new().unwrap();
     let conn = db::open(tmp.path()).unwrap();
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -3230,7 +3230,7 @@ fn priority_feedback_floors_at_priority_1() {
 fn cycle_aborts_on_database_error() {
     // Test that run_once gracefully handles edge cases.
     // We use a valid connection but verify the error path exists.
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = crate::test_support::SqliteTempFile::new().unwrap();
     let conn = db::open(tmp.path()).unwrap();
     let cfg = CuratorConfig::default();
 
@@ -3340,7 +3340,7 @@ mod consolidation_pass_tests_1746 {
         // cycle, the SAL pass is the LIVE consolidator — it summarises, writes
         // the [consolidated] row, hard-deletes the sources, and FOLDS its counts
         // into report.autonomy so the self-report is accurate.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let candidates = seed(&conn);
         let cfg = CuratorConfig {
@@ -3404,7 +3404,7 @@ mod consolidation_pass_tests_1746 {
     fn consolidation_pass_dry_run_does_not_write_when_enabled() {
         // compaction.enabled but a --dry-run cycle: simulate-only, no LLM, no
         // write — the pass respects cfg.dry_run.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let candidates = seed(&conn);
         let cfg = CuratorConfig {
@@ -3453,7 +3453,7 @@ mod consolidation_pass_tests_1746 {
 
     #[test]
     fn consolidation_pass_noop_when_compaction_disabled() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let candidates = seed(&conn);
         // Default config → compaction.enabled = false.
@@ -3486,7 +3486,7 @@ mod consolidation_pass_tests_1746 {
     /// unwind, and the corpus is untouched either way.
     #[tokio::test]
     async fn consolidation_pass_degrades_instead_of_panicking_inside_a_runtime() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let candidates = seed(&conn);
         let cfg = CuratorConfig {
@@ -3533,7 +3533,7 @@ mod consolidation_pass_tests_1746 {
     /// positive control asserts the SAL pass RAN rather than skipped.
     #[tokio::test(flavor = "multi_thread")]
     async fn consolidation_pass_runs_under_spawn_blocking() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let candidates = seed(&conn);
         let cfg = CuratorConfig {
@@ -3610,7 +3610,7 @@ mod consolidation_pass_tests_1746 {
             }
         }
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = crate::test_support::SqliteTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let candidates = seed(&conn);
         let cfg = CuratorConfig {
