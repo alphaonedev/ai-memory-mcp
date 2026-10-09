@@ -16,12 +16,35 @@ stay admitted.
 
 from __future__ import annotations
 
+import pathlib
+import ssl
+
 import certifi
 import httpx
 import pytest
 
 from ai_memory import AiMemoryClient, AsyncAiMemoryClient
 from ai_memory._common import build_httpx_kwargs
+
+
+class _EmptyStr(str):
+    """A str subclass whose ``strip`` lies; the guard must not trust it."""
+
+    def strip(self, chars: str | None = None) -> str:  # noqa: ARG002
+        return "x"
+
+
+def _unverified_context() -> ssl.SSLContext:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def _no_hostname_check_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    return context
 
 BASE_URL = "https://localhost:9077"
 
@@ -81,3 +104,36 @@ def test_sync_constructor_admits_ca_path() -> None:
 async def test_async_constructor_admits_ca_path() -> None:
     async with AsyncAiMemoryClient(base_url=BASE_URL, verify=certifi.where()) as client:
         assert isinstance(client._client, httpx.AsyncClient)  # noqa: SLF001 - construction probe
+
+
+@pytest.mark.parametrize(
+    "verify",
+    ["", " ", "\t\n", _EmptyStr(""), b"", [], {}, 1, object()],
+    ids=["empty", "space", "whitespace", "str-subclass-empty", "bytes", "list", "dict", "int", "object"],
+)
+def test_funnel_refuses_blank_or_undocumented_verify_values(verify: object) -> None:
+    # httpx 0.27.x reads ``verify=""`` as "do not verify"; any value the SDK
+    # does not document is refused rather than forwarded (fail closed, #3840).
+    with pytest.raises(ValueError):
+        _kwargs(verify)
+
+
+@pytest.mark.parametrize("make", [_unverified_context, _no_hostname_check_context])
+def test_funnel_refuses_non_verifying_ssl_context(make: object) -> None:
+    with pytest.raises(ValueError):
+        _kwargs(make())  # type: ignore[operator]
+
+
+def test_funnel_admits_verifying_ssl_context_and_pathlike() -> None:
+    context = ssl.create_default_context()
+    assert _kwargs(context)["verify"] is context
+    ca = pathlib.Path(certifi.where())
+    assert _kwargs(ca)["verify"] == ca
+
+
+@pytest.mark.parametrize("verify", ["", _unverified_context()], ids=["empty", "context"])
+def test_both_constructors_refuse_bypass_forms(verify: object) -> None:
+    with pytest.raises(ValueError):
+        AiMemoryClient(base_url=BASE_URL, verify=verify)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        AsyncAiMemoryClient(base_url=BASE_URL, verify=verify)  # type: ignore[arg-type]
