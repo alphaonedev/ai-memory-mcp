@@ -1886,6 +1886,39 @@ def self_test():
             doc.write_bytes(text.encode("utf-8"))
             probs = check(root)
             expect(not probs, "R10-#6426-%s: hidden attribute text was reported (%r)" % (label, probs))
+        # #6415 (round 10): the erratum-visibility check reads the same constructs the renderer does. A
+        # '</details>' the renderer does not read as a closing tag (escaped, in a link destination or title,
+        # in a reference definition, in a code span over lines) closes nothing; a '<details>' it does read as
+        # an opening tag (after a code span that ends on the next line) opens one; and a fence inside a list
+        # item ends with the item. In each, the erratum is hidden from the reader.
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+        for label, text in (
+            ("B1 escaped '</details>'", stale_line + "\n<details>\n\n\\</details>\n" + erratum),
+            ("B2 '</details>' in an angle destination", stale_line + "\n<details>\n\n[a](</details>)\n" + erratum),
+            ("B3 '</details>' in a link title", stale_line + '\n<details>\n\n[a](x "</details>")\n' + erratum),
+            ("B4 '</details>' in a reference definition", stale_line + "\n<details>\n\n[r]: </details>\n" + erratum),
+            ("B5 '</details>' in a code span over lines",
+             stale_line + "\n<details>\n\nx `\ny </details> `\n" + erratum),
+            ("B6 '<details>' after a code span closing on its line",
+             stale_line + "\nP `\n` <details> `\n" + erratum),
+            ("B7 '<details>' after a list-item fence", stale_line + "\n- a\n  ```\n<details>\n```\n" + erratum),
+            ("B8 '<!--' after a list-item fence", stale_line + "\n- a\n  ```\n<!--\n```\n" + erratum + "-->\n"),
+            ("B18 '<details>' after a numbered-item fence",
+             stale_line + "\n1. a\n   ```\n<details>\n```\n" + erratum),
+        ):
+            doc.write_bytes(text.encode("utf-8"))
+            expect(check(root), "R10-#6415-%s: a hidden erratum was accepted" % label)
+        for label, text in (
+            ("closed block", stale_line + "\n<details>\n\nx\n\n</details>\n" + erratum),
+            ("closed block, end tag with spaces", stale_line + "\n<details>\n\nx\n\n  </details>\n" + erratum),
+            ("list-item fence closed in the item", stale_line + "\n- a\n  ```\n  <details>\n  ```\n" + erratum),
+            ("code span over lines without a tag", stale_line + "\nP `\nq`\n" + erratum),
+            ("'<details>' alone in a code span", stale_line + "\nText `<details>` here.\n" + erratum),
+        ):
+            doc.write_bytes(text.encode("utf-8"))
+            probs = check(root)
+            expect(not probs, "R10-#6415-control %s: a visible erratum was rejected (%r)" % (label, probs))
+        allow.write_text("")
         # #6353: an allowlist that exists but cannot be stat'ed is unreadable (exit 2), never absent.
         r = fresh("u-allow-loop")
         (r / ALLOW_REL).unlink()
