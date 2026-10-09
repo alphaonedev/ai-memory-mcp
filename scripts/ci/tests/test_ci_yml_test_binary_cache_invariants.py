@@ -91,5 +91,25 @@ class PlanDeadline6384M3(unittest.TestCase):
         self.assertIn('"$TIMEOUT_BIN"', self.text[i:i + 200])
 
 
+class ManifestDir6384L5(unittest.TestCase):
+    """r1 L5: with HOME unset the manifest goes to RUNNER_TEMP or .local-runs,
+    never into the tracked tree."""
+
+    def setUp(self):
+        self.text = CI_YML.read_text()
+
+    def test_no_pwd_fallback_and_explicit_chain(self):
+        self.assertFalse('${HOME:-$PWD}' in self.text, 'HOME-or-PWD fallback still present')
+        i = self.text.index('cache_dir="${CI_TEST_MANIFEST_DIR:-}"')
+        block = self.text[i:i + 600]
+        self.assertIn('$HOME/.cache/ai-memory-ci/test-manifest', block)
+        self.assertIn('$RUNNER_TEMP/ai-memory-ci/test-manifest', block)
+        self.assertIn('$PWD/.local-runs/ai-memory-ci/test-manifest', block)
+
+    def test_record_passes_the_repo_root(self):
+        i = self.text.index('test_binary_cache.py record')
+        self.assertIn('--repo-root .', self.text[i:i + 300])
+
+
 if __name__ == '__main__':
     unittest.main()

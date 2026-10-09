@@ -837,6 +837,55 @@ class LockAndSweep6384L4(World):
         self.assertTrue(other.exists())
 
 
+class ManifestNameAndDir6384L5(World):
+    """r1 L5: the manifest file name is a hash of node, tier and base ref, and
+    the manifest directory never lands inside the checkout."""
+
+    def test_distinct_bases_never_share_a_file(self):
+        a = tbc.manifest_path('/m', 'n', 't', 'release/v1')
+        b = tbc.manifest_path('/m', 'n', 't', 'release_v1')
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(tbc.manifest_path('/m', 'a-b', 'c', 'x'), tbc.manifest_path('/m', 'a', 'b-c', 'x'))
+        self.assertRegex(a.name, r'^test-manifest-[0-9a-f]{32}\.json$')
+        self.assertEqual(a, tbc.manifest_path('/m', 'n', 't', 'release/v1'))
+
+    def test_dir_resolution_order(self):
+        r = Path('/repo')
+        self.assertEqual(tbc.resolve_manifest_dir('/x', {'HOME': '/h'}, r), Path('/x'))
+        self.assertEqual(tbc.resolve_manifest_dir('', {'CI_TEST_MANIFEST_DIR': '/e', 'HOME': '/h'}, r), Path('/e'))
+        self.assertEqual(tbc.resolve_manifest_dir('', {'HOME': '/h'}, r), Path('/h/.cache/ai-memory-ci/test-manifest'))
+        self.assertEqual(tbc.resolve_manifest_dir('', {'HOME': '', 'RUNNER_TEMP': '/rt'}, r),
+                         Path('/rt/ai-memory-ci/test-manifest'))
+        self.assertEqual(tbc.resolve_manifest_dir('', {}, r), r / '.local-runs' / 'ai-memory-ci' / 'test-manifest')
+
+    def test_plan_refuses_a_manifest_dir_inside_the_checkout(self):
+        self.green_run('100')
+        out = self.plan(run_id='200', now=NOW + 60, manifest_dir=str(self.root / '.cache' / 'm'))
+        self.assertIn('::warning::', out)
+        self.assertIn('inside the checkout', out)
+        self.assertEqual(self.list_text('parallel_2'), '--test b\n')
+        self.assertFalse((self.root / '.cache').exists())
+
+    def test_record_refuses_a_manifest_dir_inside_the_checkout(self):
+        self.plan(event='push', ref='refs/heads/release/v1.0.0')
+        out = io.StringIO()
+        with redirect_stdout(out):
+            tbc.run_record(argparse.Namespace(shard_dir=str(self.sd), manifest_dir=str(self.root / '.cache' / 'm'),
+                                              rc=0, run_id='100', sha='abc', repo_root=str(self.root)), now=NOW)
+        self.assertIn('not recorded', out.getvalue())
+        self.assertFalse((self.root / '.cache').exists())
+
+    def test_local_runs_inside_the_checkout_is_allowed(self):
+        mdir = self.root / '.local-runs' / 'm'
+        self.plan(event='push', ref='refs/heads/release/v1.0.0', manifest_dir=str(mdir))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            tbc.run_record(argparse.Namespace(shard_dir=str(self.sd), manifest_dir=str(mdir), rc=0, run_id='100',
+                                              sha='abc', repo_root=str(self.root)), now=NOW)
+        self.assertIn('recorded', out.getvalue())
+        self.assertTrue(tbc.manifest_path(mdir, 'linux-fed', 'enterprise-fed', 'release/v1.0.0').exists())
+
+
 class Policy(unittest.TestCase):
     def test_allowed_matrix(self):
         on = {'CI_TEST_BINARY_CACHE': '1', 'CI_TEST_BINARY_CACHE_LOOKUP': '1'}
