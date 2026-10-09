@@ -79,6 +79,11 @@ DEBUG_LEVEL = "0"
 DEBUG_KEYS = ("CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG")
 HOSTED_GUARD = "runner.environment != 'github-hosted'"
 DOCS_ONLY_GUARD = "docs_only"
+# S-F4 (round 2): the prune step runs the CHECKED-OUT script, so it must not run
+# when this job's checkout was skipped (fork-PR refusal) or failed: the
+# persistent workspace would otherwise hand it the previous job's copy.
+CHECKOUT_STEP_ID = "checkout"
+CHECKOUT_GUARD = "steps.checkout.outcome == 'success'"
 CARGO_RE = re.compile(r"(^|[\s;&|(])cargo\s+(test|build|llvm-cov|bench|nextest)\b")
 
 # Every (workflow, job) that runs cargo on a self-hosted label, pinned.  A new
@@ -100,6 +105,7 @@ class Step:
         self.name = ""
         self.cond = ""
         self.uses = ""
+        self.step_id = ""
         self.run: List[str] = []
 
     def run_text(self) -> str:
@@ -287,6 +293,8 @@ def _read_steps(job: Job, rows: List[Tuple[int, str, int]], raw: List[str], star
             step.cond = _strip_comment(value)
         elif key == "uses":
             step.uses = _strip_comment(value)
+        elif key == "id":
+            step.step_id = _unquote(_strip_comment(value))
         elif key == "run":
             header = _strip_comment(value)
             if header in ("|", "|-", "|+", ">", ">-", ">+"):
@@ -347,6 +355,10 @@ def violations(name: str, wf: Workflow, job: Job) -> List[str]:
     siblings_guarded = any(DOCS_ONLY_GUARD in s.cond for s in job.steps[:-1])
     if siblings_guarded and DOCS_ONLY_GUARD not in last.cond:
         found.append("%s: R-PRUNE prune step `if:` lacks the docs_only guard its siblings carry (rule (b3))" % where)
+    if not any(s.uses.startswith("actions/checkout@") and s.step_id == CHECKOUT_STEP_ID for s in job.steps[:-1]):
+        found.append("%s: R-PRUNE no `actions/checkout` step with `id: %s` before the prune step" % (where, CHECKOUT_STEP_ID))
+    if CHECKOUT_GUARD not in last.cond:
+        found.append("%s: R-PRUNE prune step `if:` lacks %s (S-F4)" % (where, CHECKOUT_GUARD))
     run = last.run_text()
     if PRUNE_INVOCATION not in run or "--target-dir" not in run:
         found.append("%s: R-PRUNE prune step does not run `%s --target-dir ...`: %r" % (where, PRUNE_INVOCATION, run))
@@ -463,6 +475,80 @@ class Mutants6118(unittest.TestCase):
         found = self._mutated("name: x\n\ton: push\n")
         self.assertTrue(found and found[0].startswith("R-SHAPE"), found)
 
+    # ---- round 2 (C-F1): workflow shapes the round-1 reader let through ----
+
+    def _appended(self, job_yaml: str) -> List[str]:
+        return self._mutated(self.ci.rstrip("\n") + "\n" + job_yaml)
+
+    def _before_prune(self, step_yaml: str) -> List[str]:
+        anchor = "      - name: " + PRUNE_STEP_NAME + "\n"
+        self.assertEqual(1, self.ci.count(anchor), anchor)
+        return self._mutated(_replace_once(self.ci, anchor, step_yaml + anchor))
+
+    def _assert_unpinned(self, found: List[str], job_id: str) -> None:
+        self.assertTrue(any(v.startswith("R-CENSUS unpinned self-hosted") and ("ci.yml/" + job_id) in v
+                            for v in found), found)
+
+    def test_6118_m08_block_sequence_runs_on(self) -> None:
+        found = self._appended(
+            "  extra_block_seq_job:\n    runs-on:\n      - self-hosted\n      - linux-fed\n"
+            "    steps:\n      - run: cargo test --all-targets\n")
+        self._assert_unpinned(found, "extra_block_seq_job")
+
+    def test_6118_m09_self_hosted_label_under_matrix_os_via_fromjson(self) -> None:
+        found = self._appended(
+            "  extra_matrix_os_job:\n    strategy:\n      matrix:\n        include:\n"
+            "          - os: '[\"ubuntu-latest\"]'\n          - os: '[\"self-hosted\",\"linux-fed\"]'\n"
+            "    runs-on: ${{ fromJSON(matrix.os) }}\n    steps:\n      - run: cargo test --lib\n")
+        self._assert_unpinned(found, "extra_matrix_os_job")
+
+    def test_6118_m09b_fleet_label_without_self_hosted_literal(self) -> None:
+        # A fleet label alone routes to the fleet; it is not a GitHub-hosted image.
+        found = self._appended(
+            "  extra_matrix_label_job:\n    strategy:\n      matrix:\n        os: [ubuntu-latest, macos-fed]\n"
+            "    runs-on: ${{ matrix.os }}\n    steps:\n      - run: cargo build\n")
+        self._assert_unpinned(found, "extra_matrix_label_job")
+
+    def test_6118_m10_cargo_through_a_script(self) -> None:
+        found = self._appended(
+            "  extra_script_job:\n    runs-on: [self-hosted, linux-fed]\n"
+            "    steps:\n      - run: scripts/coverage.sh\n")
+        self._assert_unpinned(found, "extra_script_job")
+
+    def test_6118_m11_debug_override_written_to_github_env(self) -> None:
+        found = self._before_prune(
+            "      - name: Raise debuginfo\n"
+            "        run: echo \"CARGO_PROFILE_DEV_DEBUG=line-tables-only\" >> \"$GITHUB_ENV\"\n")
+        self.assertTrue(any("R-DEBUG" in v and "line-tables-only" in v for v in found), found)
+
+    def test_6118_m11b_debug_override_in_a_block_run_group(self) -> None:
+        found = self._before_prune(
+            "      - name: Raise test debuginfo\n        run: |\n          {\n"
+            "            echo \"CARGO_PROFILE_TEST_DEBUG=1\"\n          } >> \"$GITHUB_ENV\"\n")
+        self.assertTrue(any("R-DEBUG" in v and "CARGO_PROFILE_TEST_DEBUG" in v and "'1'" in v for v in found), found)
+
+    def test_6118_m12_runs_on_mapping_form_is_unparsed(self) -> None:
+        found = self._appended(
+            "  extra_group_job:\n    runs-on:\n      group: fleet\n    steps:\n      - run: echo hi\n")
+        self.assertTrue(found and found[0].startswith("R-SHAPE"), found)
+
+    def test_6118_m13_prune_without_checkout_guard(self) -> None:
+        anchor = "&& " + HOSTED_GUARD + " && " + CHECKOUT_GUARD
+        self.assertEqual(1, self.ci.count(anchor), anchor)
+        found = self._mutated(_replace_once(self.ci, anchor, "&& " + HOSTED_GUARD))
+        self.assertTrue(any("lacks " + CHECKOUT_GUARD in v for v in found), found)
+
+    def test_6118_m14_step_level_env_debug_override(self) -> None:
+        found = self._before_prune(
+            "      - name: Step env override\n        env:\n          CARGO_PROFILE_TEST_DEBUG: line-tables-only\n"
+            "        run: cargo test --no-run\n")
+        self.assertTrue(any("R-DEBUG" in v and "line-tables-only" in v for v in found), found)
+
+    def test_6118_m15_unknown_runs_on_expression_is_unparsed(self) -> None:
+        found = self._appended(
+            "  extra_expr_job:\n    runs-on: ${{ inputs.runner }}\n    steps:\n      - run: echo hi\n")
+        self.assertTrue(found and found[0].startswith("R-SHAPE"), found)
+
 
 def _write(path: Path, size: int, executable: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -520,10 +606,12 @@ class PruneScript6118(unittest.TestCase):
         _write(self.outside, 777, True)
         (self.target / "debug" / "deps" / "evil-link").symlink_to(self.outside)
 
-    def _run(self, *args: str) -> subprocess.CompletedProcess:
+    def _run(self, *args: str, env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+        base = {k: v for k, v in os.environ.items() if k not in ("GITHUB_WORKSPACE", "CARGO_TARGET_DIR")}
+        base.update(env or {})
         return subprocess.run(
             [sys.executable, "-I", str(PRUNE_SCRIPT), *args],
-            cwd=str(ROOT), capture_output=True, text=True, check=False,
+            cwd=str(ROOT), capture_output=True, text=True, check=False, env=base,
         )
 
     def _expected_freed(self) -> int:
@@ -550,8 +638,18 @@ class PruneScript6118(unittest.TestCase):
         self.assertIn("refusing", proc.stderr)
         self.assertTrue((plain / "debug" / "deps" / "x-1111").exists())
 
-    def test_6118_refuses_missing_dir(self) -> None:
+    def test_6118_missing_dir_is_nothing_to_prune(self) -> None:
+        # C-F4: a job that fails before its first compile on a fresh runner has no
+        # target dir; the always() prune must not add a second, misleading red step.
         proc = self._run("--target-dir", str(Path(self.scratch.name) / "absent"))
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("nothing to prune", proc.stdout)
+        self.assertEqual(0, self._freed(proc.stdout))
+
+    def test_6118_refuses_a_file_as_target_dir(self) -> None:
+        f = Path(self.scratch.name) / "a-file"
+        _write(f, 10)
+        proc = self._run("--target-dir", str(f))
         self.assertEqual(2, proc.returncode, proc.stdout + proc.stderr)
         self.assertIn("refusing", proc.stderr)
 
@@ -625,6 +723,148 @@ class PruneScript6118(unittest.TestCase):
         proc = self._run("--target-dir", rel, "--dry-run")
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
         self.assertEqual(self._expected_freed(), self._freed(proc.stdout))
+
+    # ---- round 2 (C-F5, S-F1..S-F3, S-F5) ----
+
+    def test_6118_scope_all_counts_only_bytes_it_frees(self) -> None:
+        # C-F5: a hard-linked file whose other link SURVIVES (the uplifted bin
+        # outside the five dirs) frees nothing; a pair whose links are BOTH
+        # inside the wiped dirs frees its bytes once.
+        src = self.target / "debug" / "deps" / "ai_memory-bin-1111"
+        _write(src, 4096, True)
+        os.link(src, self.target / "debug" / "ai-memory-bin")
+        pair = self.target / "debug" / "deps" / "pair-a"
+        _write(pair, 3000)
+        os.link(pair, self.target / "debug" / "deps" / "pair-b")
+        proc = self._run("--target-dir", str(self.target), "--scope", "all")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        in_five = sum(size for rel, size, _e, _d in self.LAYOUT
+                      if any(rel.startswith("debug/" + d + "/") for d in self.FIVE_DIRS))
+        self.assertEqual(in_five + 3000, self._freed(proc.stdout))
+        self.assertTrue((self.target / "debug" / "ai-memory-bin").exists())
+
+    def test_6118_refuses_symlinked_target_root(self) -> None:
+        # S-F2: a committed `target` symlink must not redirect the prune.
+        link = Path(self.scratch.name) / "link-target"
+        link.symlink_to(self.target)
+        proc = self._run("--target-dir", str(link))
+        self.assertEqual(2, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("symlink", proc.stderr)
+        self.assertTrue((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
+
+    def test_6118_refuses_root_outside_github_workspace(self) -> None:
+        # S-F2: with GITHUB_WORKSPACE set, the root must lie inside it unless it IS
+        # the runner's explicit CARGO_TARGET_DIR.
+        ws = Path(self.scratch.name) / "workspace"
+        ws.mkdir()
+        proc = self._run("--target-dir", str(self.target), env={"GITHUB_WORKSPACE": str(ws)})
+        self.assertEqual(2, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("GITHUB_WORKSPACE", proc.stderr)
+        self.assertTrue((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
+        ok_ws = self._run("--target-dir", str(self.target), "--dry-run",
+                          env={"GITHUB_WORKSPACE": str(Path(self.scratch.name))})
+        self.assertEqual(0, ok_ws.returncode, ok_ws.stdout + ok_ws.stderr)
+        ok_ctd = self._run("--target-dir", str(self.target), "--dry-run",
+                           env={"GITHUB_WORKSPACE": str(ws), "CARGO_TARGET_DIR": str(self.target)})
+        self.assertEqual(0, ok_ctd.returncode, ok_ctd.stdout + ok_ctd.stderr)
+
+    def test_6118_cachedir_tag_signature_is_checked(self) -> None:
+        # S-F2: a CACHEDIR.TAG without cargo's signature is not a marker.
+        (self.target / "debug" / ".cargo-lock").unlink()
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(2, proc.returncode, proc.stdout + proc.stderr)
+        self.assertTrue((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
+        (self.target / "CACHEDIR.TAG").write_bytes(CARGO_CACHEDIR_TAG)
+        ok = self._run("--target-dir", str(self.target), "--dry-run")
+        self.assertEqual(0, ok.returncode, ok.stdout + ok.stderr)
+
+    def test_6118_profile_is_validated_before_any_filesystem_work(self) -> None:
+        # S-F5: the --profile check fires first, whatever the target dir is.
+        for target in (str(Path(self.scratch.name) / "absent"), str(self.target)):
+            for bad in ("..", "../x", "a/b", ""):
+                proc = self._run("--target-dir", target, "--profile", bad)
+                self.assertEqual(2, proc.returncode, (target, bad, proc.stdout + proc.stderr))
+                self.assertIn("--profile must be one path component", proc.stderr, (target, bad))
+
+    def test_6118_symlink_swap_of_deps_between_scan_and_delete_cannot_escape(self) -> None:
+        # S-F1: deletion goes through directory fds opened O_NOFOLLOW at scan time,
+        # so swapping `deps` for a symlink afterwards cannot redirect it.
+        mod = _load_prune()
+        plan = mod.plan_target(str(self.target), "debug", "test-bins", env={})
+        victim = Path(self.scratch.name) / "victim-deps"
+        for name in ("ai_memory-0a1b", "ai_memory-0a1b.d", "mcp_input_schema-7c7c", "mcp_input_schema-7c7c.d"):
+            _write(victim / name, 11, True)
+        deps = self.target / "debug" / "deps"
+        deps.rename(self.target / "debug" / "deps-orig")
+        deps.symlink_to(victim)
+        try:
+            tally = mod.execute(plan, dry_run=False)
+        finally:
+            plan.close()
+        for name in ("ai_memory-0a1b", "ai_memory-0a1b.d", "mcp_input_schema-7c7c", "mcp_input_schema-7c7c.d"):
+            self.assertTrue((victim / name).exists(), name)
+            self.assertFalse((self.target / "debug" / "deps-orig" / name).exists(), name)
+        self.assertEqual([], tally.errors)
+
+    def test_6118_symlink_swap_of_profile_under_scope_all_cannot_escape(self) -> None:
+        mod = _load_prune()
+        plan = mod.plan_target(str(self.target), "debug", "all", env={})
+        victim = Path(self.scratch.name) / "victim-profile"
+        for d in self.FIVE_DIRS:
+            _write(victim / d / "precious", 13)
+        debug = self.target / "debug"
+        debug.rename(self.target / "debug-orig")
+        debug.symlink_to(victim)
+        try:
+            mod.execute(plan, dry_run=False)
+        finally:
+            plan.close()
+        for d in self.FIVE_DIRS:
+            self.assertTrue((victim / d / "precious").exists(), d)
+            self.assertFalse((self.target / "debug-orig" / d).exists(), d)
+
+    def test_6118_file_vanishing_mid_run_is_tolerated(self) -> None:
+        # S-F3: a candidate removed by someone else between scan and delete is
+        # already gone: no traceback, no error, and its bytes are not claimed.
+        mod = _load_prune()
+        plan = mod.plan_target(str(self.target), "debug", "test-bins", env={})
+        (self.target / "debug" / "deps" / "mcp_input_schema-7c7c").unlink()
+        try:
+            tally = mod.execute(plan, dry_run=False)
+        finally:
+            plan.close()
+        self.assertEqual([], tally.errors)
+        self.assertEqual(self._expected_freed() - 120000, tally.freed)
+
+    def test_6118_unremovable_entry_warns_continues_and_exits_1(self) -> None:
+        # S-F3: any other OSError is a warning; the rest is still pruned, the
+        # totals are still printed, and the exit code is 1 at the end.
+        dwarf = self.target / "debug" / "deps" / "mcp_input_schema-7c7c.dSYM" / "Contents" / "Resources" / "DWARF"
+        dwarf.chmod(0o500)
+        self.addCleanup(dwarf.chmod, 0o700)
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("::warning::prune-runner-target:", proc.stdout)
+        self.assertEqual(self._expected_freed() - 2000, self._freed(proc.stdout))
+        self.assertFalse((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
+        self.assertFalse((self.target / "debug" / "examples" / "demo-1e1e").exists())
+
+
+# cargo's own CACHEDIR.TAG (https://bford.info/cachedir/): the signature line is
+# what makes it a marker, not the file name.
+CARGO_CACHEDIR_TAG = (b"Signature: 8a477f597d28d172789f06886806bc55\n"
+                      b"# This file is a cache directory tag created by cargo.\n")
+
+
+def _load_prune():
+    """Import scripts/ci/prune-runner-target.py in-process (its name has dashes)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("prune_runner_target_6118", str(PRUNE_SCRIPT))
+    if spec is None or spec.loader is None:
+        raise AssertionError("cannot load " + str(PRUNE_SCRIPT))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 if __name__ == "__main__":
