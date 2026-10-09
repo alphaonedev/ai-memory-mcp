@@ -201,13 +201,30 @@ for flag in os.environ.get("RUSTFLAGS", "").split():
         src, dst = flag[len("--remap-path-prefix="):].split("=", 1)
         if cwd.startswith(src):
             cwd = dst + cwd[len(src):]
-out = pathlib.Path("target") / target / "release" / "ai-memory"
+# Like cargo: CARGO_TARGET_DIR (when set) decides where the output lands, and a
+# caller variable that reaches the build is visible in what it produces.
+out = pathlib.Path(os.environ.get("CARGO_TARGET_DIR") or "target") / target / "release" / "ai-memory"
 out.parent.mkdir(parents=True, exist_ok=True)
-out.write_text("epoch=%s features=%s target=%s cwd=%s\\n" % (os.environ.get("SOURCE_DATE_EPOCH"), features, target, cwd))
+out.write_text("epoch=%s features=%s target=%s cwd=%s leak=%s\\n" % (
+    os.environ.get("SOURCE_DATE_EPOCH"), features, target, cwd, os.environ.get("REPRO_SELFTEST_LEAK")))
 '''
 
 
+SELF_TEST_CLEARED = ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
+                     "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "REPRO_SELFTEST_LEAK")
+
+
 def self_test(root: Path) -> int:
+    """Run the cases with the cargo variables a developer shell may carry cleared
+    (each case that needs one sets it), and restore them afterwards."""
+    saved = {k: os.environ.pop(k) for k in SELF_TEST_CLEARED if k in os.environ}
+    try:
+        return _self_test(root)
+    finally:
+        os.environ.update(saved)
+
+
+def _self_test(root: Path) -> int:
     base = os.environ.get("TMPDIR") or str(root / ".local-runs")
     Path(base).mkdir(parents=True, exist_ok=True)
     failures: List[str] = []
@@ -219,10 +236,21 @@ def self_test(root: Path) -> int:
         stub.chmod(0o755)
         ws_a, ws_b = tmp / "workspace-a", tmp / "workspace-b"
 
+        def g(ws: Path, *args: str) -> None:
+            subprocess.run(["git", "-C", str(ws), "-c", "user.name=selftest", "-c", "user.email=selftest@invalid",
+                            "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"] + list(args),
+                           check=True, capture_output=True)
+
         def fresh() -> None:
+            # A is a one-commit repository; B does not exist (the proof creates it
+            # as a detached worktree of A's HEAD).
             for ws in (ws_a, ws_b):
                 shutil.rmtree(ws, ignore_errors=True)
-                ws.mkdir()
+            ws_a.mkdir()
+            g(ws_a, "init", "-q")
+            (ws_a / "src.txt").write_text("one\n", encoding="utf-8")
+            g(ws_a, "add", "src.txt")
+            g(ws_a, "commit", "-q", "-m", "one")
 
         def run(name: str, want: int, **kwargs: object) -> None:
             fresh()
@@ -236,6 +264,62 @@ def self_test(root: Path) -> int:
                 failures.append(f"{name}: exit {got}, wanted {want}")
 
         run("two identical builds pass", 0)
+
+        # --- #6291: the two builds are independent.
+        def run_prepared(name: str, want: int, prepare, env: Optional[dict] = None, check=None) -> None:
+            fresh()
+            prepare()
+            saved = {k: os.environ.get(k) for k in (env or {})}
+            os.environ.update(env or {})
+            try:
+                got = two_builds(ws_a, ws_b, "x86_64-unknown-linux-gnu", "sal,sal-postgres", "ai-memory", str(stub),
+                                 epoch="1700000000")
+            except ProofError as exc:
+                got = 2
+                print(f"self-test: {name}: {exc}", file=sys.stderr)
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+            if got != want:
+                failures.append(f"{name}: exit {got}, wanted {want}")
+            elif check is not None and not check():
+                failures.append(f"{name}: the build output shows the caller environment reached it")
+
+        def b_at_older_commit() -> None:
+            g(ws_a, "worktree", "add", "-q", "--detach", str(ws_b), "HEAD")
+            (ws_a / "src.txt").write_text("two\n", encoding="utf-8")
+            g(ws_a, "commit", "-q", "-am", "two")
+
+        def b_dirty() -> None:
+            g(ws_a, "worktree", "add", "-q", "--detach", str(ws_b), "HEAD")
+            (ws_b / "src.txt").write_text("seeded\n", encoding="utf-8")
+
+        def b_prebuilt() -> None:
+            g(ws_a, "worktree", "add", "-q", "--detach", str(ws_b), "HEAD")
+            (ws_b / "target").mkdir()
+            (ws_b / "target" / "seed").write_text("cached\n", encoding="utf-8")
+
+        def nothing() -> None:
+            pass
+
+        def a_output_clean() -> bool:
+            built = ws_a / "target" / "x86_64-unknown-linux-gnu" / "release" / "ai-memory"
+            return built.is_file() and "leak=None" in built.read_text(encoding="utf-8")
+
+        run_prepared("6291 an existing workspace B at another commit is refused", 2, b_at_older_commit)
+        run_prepared("6291 an existing workspace B with a modified file is refused", 2, b_dirty)
+        run_prepared("6291 an existing workspace B holding build output is refused", 2, b_prebuilt)
+        run_prepared("6291 RUSTC_WRAPPER in the caller environment is refused", 2, nothing,
+                     {"RUSTC_WRAPPER": "/usr/bin/true"})
+        run_prepared("6291 RUSTC_WORKSPACE_WRAPPER in the caller environment is refused", 2, nothing,
+                     {"RUSTC_WORKSPACE_WRAPPER": "/usr/bin/true"})
+        run_prepared("6291 a caller CARGO_TARGET_DIR does not redirect the builds", 0, nothing,
+                     {"CARGO_TARGET_DIR": str(tmp / "shared-target")})
+        run_prepared("6291 a caller variable outside the allowlist does not reach the build", 0, nothing,
+                     {"REPRO_SELFTEST_LEAK": "1"}, a_output_clean)
         run("a perturbed SOURCE_DATE_EPOCH on the second build is a mismatch", 1, epoch_b="1700000001")
         run("an unremapped workspace path is a mismatch", 1, remap=False)
         fresh()
