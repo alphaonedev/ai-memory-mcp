@@ -155,7 +155,7 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   hard link (one inode, nlink 2) and the pair's bytes count once; on macOS
   cargo copies it (an APFS clone: two inodes, nlink 1) and each is counted at
   full size. The bin's uplift source `deps/<bin>-<hash>` is kept: it is found
-  by name and size against `debug/<bin>`, not by link count (a clone has
+  by name, size and content against `debug/<bin>`, not by link count (a clone has
   nlink 1), because pruning it makes cargo report the bin "Dirty" and relink
   it on the next job. Any other hard-linked executable is kept too, since
   deleting one link frees nothing; each `kept` line names the reason. The rlib / rmeta /
