@@ -871,7 +871,7 @@ pub fn run_posture(
                 writeln!(
                     out.stderr,
                     "ai-memory doctor --posture: live PRAGMA synchronous not observed on {}: {e:#}",
-                    path.display()
+                    crate::url_display::db_path_display(path)
                 )?;
                 None
             }
@@ -1743,7 +1743,7 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
                         "database at {} is on a schema NEWER than this binary — refusing \
                          to operate it. Every other section is N/A. `ai-memory backup` \
                          still works against this database.",
-                        db_path.display()
+                        crate::url_display::db_path_display(db_path)
                     )
                 } else if zeroed.is_some() {
                     format!(
@@ -1754,7 +1754,7 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
                          snapshot suppressed. Every other section is N/A. `ai-memory \
                          backup` still works against this database: snapshot it BEFORE \
                          repairing the `schema_version` row.",
-                        db_path.display()
+                        crate::url_display::db_path_display(db_path)
                     )
                 } else if poisoned.is_some() {
                     format!(
@@ -1764,14 +1764,14 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
                          cannot fix it. Every other section is N/A. `ai-memory backup` \
                          still works against this database: snapshot it, then restamp \
                          with `ai-memory doctor --repair-schema-version <N>`.",
-                        db_path.display()
+                        crate::url_display::db_path_display(db_path)
                     )
                 } else if let Some(b) = behind {
                     format!(
                         "database at {} is on schema v{}, behind this binary (v{}) — \
                          refusing to operate it (read-only; {}). Repair: `{}` or {}. \
                          Every other section is N/A.",
-                        db_path.display(),
+                        crate::url_display::db_path_display(db_path),
                         b.observed,
                         b.supported,
                         crate::storage::schema_guard::SCHEMA_BEHIND_READ_ONLY_REFUSAL,
@@ -1782,18 +1782,18 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
                     format!(
                         "database at {} does not exist — refusing to create it \
                          (doctor is read-only). Every other section is N/A.",
-                        db_path.display()
+                        crate::url_display::db_path_display(db_path)
                     )
                 } else {
                     format!(
                         "could not open database at {} — every other section is N/A",
-                        db_path.display()
+                        crate::url_display::db_path_display(db_path)
                     )
                 }),
             });
             return Report {
                 mode: "local".into(),
-                source: db_path.display().to_string(),
+                source: crate::url_display::db_path_display(db_path),
                 generated_at: chrono::Utc::now().to_rfc3339(),
                 sections,
                 overall: Severity::Critical,
@@ -1856,7 +1856,7 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
 
     Report {
         mode: "local".into(),
-        source: db_path.display().to_string(),
+        source: crate::url_display::db_path_display(db_path),
         generated_at: chrono::Utc::now().to_rfc3339(),
         sections,
         overall: Severity::Info,
@@ -5264,7 +5264,10 @@ fn run_remote(url: &str, db_path: &Path, auth: &RemoteAuth) -> Report {
 
     Report {
         mode: "remote".into(),
-        source: format!("{base} (local db reference: {})", db_path.display()),
+        source: format!(
+            "{base} (local db reference: {})",
+            crate::url_display::db_path_display(db_path)
+        ),
         generated_at: chrono::Utc::now().to_rfc3339(),
         sections,
         overall: Severity::Info,
