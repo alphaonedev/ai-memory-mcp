@@ -31,7 +31,8 @@ for a path outside ``scripts/``, inside the repository) (#6198). The allowlist i
 
 1. an erratum line somewhere in ``docs/compliance/`` names it together with an
    existing successor (``scripts/<name>``). An erratum line is a single line
-   whose reader-visible text (outside HTML comments, #6196) contains the word
+   whose reader-visible text (outside HTML comments, processing instructions, CDATA,
+   declarations and tag markup, #6196) contains the word
    "erratum", the stale name, and the successor in backticks. The successor must resolve inside ``scripts/``: a
    ``..`` or ``.`` component, or a symlink escaping ``scripts/``, is rejected.
 2. the ``<relative-doc-path>:<stale-name>`` pair is listed in
@@ -120,6 +121,12 @@ FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 # Fence info strings GitHub renders as a diagram or figure, never as text: the body (mermaid
 # '%%' comments included) is not reader-visible (#6196).
 DIAGRAM_FENCES = frozenset({"mermaid", "math", "geojson", "topojson", "stl"})
+# Raw HTML that GitHub renders as nothing (#6196): a comment, a CDATA section, a processing
+# instruction and a declaration (``<!`` and a letter) end at their closer; a tag (``<`` and a
+# letter or ``/``) hides its own markup, attribute values included, to its first ``>`` outside
+# quotes. Hiding more than GitHub does only fails closed.
+HIDDEN_HTML_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|<![A-Za-z]|<[A-Za-z/]")
+HIDDEN_HTML_CLOSERS = {"<!--": "-->", "<![CDATA[": "]]>", "<?": "?>"}
 # A CommonMark link reference definition ([label]: destination "title"), never rendered (#6219).
 LINKDEF_RE = re.compile(r"^ {0,3}\[[^\]]+\]:")
 ENTRY_RE = re.compile(
@@ -337,16 +344,16 @@ def backtick_run(line, i):
 
 
 def comment_open(line, pos):
-    """Index of the first ``<!--`` at or after ``pos`` that is not inside a code span, else -1.
+    """The first ``HIDDEN_HTML_RE`` match at or after ``pos`` not inside a code span, else None.
 
-    A code span (a backtick run closed by the next run of the same length) shows ``<!--``
-    literally (#6215); an unmatched run is literal text and opens no span.
+    A code span (a backtick run closed by the next run of the same length) shows ``<!--``,
+    ``<?`` or ``<a`` literally (#6215, #6196); an unmatched run is literal text and opens no span.
     """
     i = pos
     while True:
-        start = line.find("<!--", i)
+        start = HIDDEN_HTML_RE.search(line, i)
         tick = line.find("`", i)
-        if start < 0 or tick < 0 or start < tick:
+        if start is None or tick < 0 or start.start() < tick:
             return start
         n = backtick_run(line, tick)
         j = tick + n
@@ -358,22 +365,48 @@ def comment_open(line, pos):
         i = tick + n if j < 0 else j + n
 
 
+def tag_end(line, pos, quote):
+    """Return (index after the tag's closing ``>`` or -1, open quote at the end of ``line``)."""
+    for i in range(pos, len(line)):
+        c = line[i]
+        if quote:
+            if c == quote:
+                quote = ""
+        elif c in "\"'":
+            quote = c
+        elif c == ">":
+            return i + 1, ""
+    return -1, quote
+
+
 def comment_text_removed(line, inside):
-    """Return (``line`` without HTML comment text, still inside a comment at the end)."""
+    """Return (``line`` without unrendered raw HTML, the open state at the end of ``line``).
+
+    The state is "" (none), the closer of an open comment, CDATA section, processing
+    instruction or declaration, or ``"tag"`` plus an open attribute quote (#6196).
+    """
     shown, pos = [], 0
     while True:
-        if inside:
-            end = line.find("-->", pos)
+        if inside.startswith("tag"):
+            end, quote = tag_end(line, pos, inside[len("tag"):])
+            if end < 0:
+                inside = "tag" + quote
+                break
+            inside, pos = "", end
+        elif inside:
+            end = line.find(inside, pos)
             if end < 0:
                 break
-            inside, pos = False, end + len("-->")
+            inside, pos = "", end + len(inside)
         else:
             start = comment_open(line, pos)
-            if start < 0:
+            if start is None:
                 shown.append(line[pos:])
                 break
-            shown.append(line[pos:start])
-            inside, pos = True, start + len("<!--")
+            shown.append(line[pos:start.start()])
+            opener = start.group()
+            inside = HIDDEN_HTML_CLOSERS.get(opener, ">" if opener.startswith("<!") else "tag")
+            pos = start.end()
     return "".join(shown), inside
 
 
@@ -382,7 +415,9 @@ def visible_lines(lines):
 
     An erratum exists to tell a reader the text names a removed script, so only text a
     rendered document shows can carry one. Removed: HTML comment text (``<!-- ... -->``, also
-    across lines), fence marker lines, and the body of a diagram fence (``mermaid`` with its
+    across lines), processing instructions, CDATA sections, declarations and tag markup with
+    its attributes (#6196; an open tag ends at a blank line or a fence, where GitHub shows it
+    as text), fence marker lines, and the body of a diagram fence (``mermaid`` with its
     ``%%`` comments, ``math``, ``geojson``, ``topojson``, ``stl``). Inside a fenced block or a
     code span ``<!--`` is literal and opens nothing (#6215). A blank-line-delimited paragraph
     from a link reference definition line (``[//]: # (...)``, a title on the next line or
@@ -390,8 +425,10 @@ def visible_lines(lines):
     definition can only be over-hidden, which fails closed. Stale names are still found in all
     of this text.
     """
-    out, inside, fence, linkdef = [], False, None, False
+    out, inside, fence, linkdef = [], "", None, False
     for line in lines:
+        if inside.startswith("tag") and (not line.strip() or FENCE_RE.match(line)):
+            inside = ""
         m = None if inside else FENCE_RE.match(line)
         if fence is not None:
             if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1] and not m.group(2).strip():
