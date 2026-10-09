@@ -229,15 +229,20 @@ fn sqlite_store_display(rest: &str) -> String {
 ///
 /// `migrate --from sqlite://svc:<pw>@x/db` hands the path `svc:<pw>@x/db` to
 /// the missing-database refusal, which printed it raw. A path holding `://`
-/// renders through [`store_url_display`]; a path holding `@` renders
-/// [`UNPARSEABLE_STORE_URL`] (fail closed, the same `@` rule as
-/// [`sqlite_store_display`]); any other path renders as itself.
+/// renders through [`store_url_display`]; a path holding `@` or `=` renders
+/// [`UNPARSEABLE_STORE_URL`] (fail closed: `@` is the userinfo shape of a
+/// mistyped store URL such as `postgres:/svc:<pw>@host/db`, the same rule as
+/// [`sqlite_store_display`], and `=` is a libpq key/value DSN
+/// `host=db password=<pw>`, #6102); any other path renders as itself.
+///
+/// It is also the renderer of the config `db` value (#6102), which is a
+/// SQLite path by contract but is where a store DSN lands by mistake.
 #[must_use]
 pub fn db_path_display(path: &std::path::Path) -> String {
     let text = path.to_string_lossy();
     if text.contains("://") {
         store_url_display(&text)
-    } else if text.contains('@') {
+    } else if text.contains(['@', '=']) {
         UNPARSEABLE_STORE_URL.to_string()
     } else {
         text.into_owned()
