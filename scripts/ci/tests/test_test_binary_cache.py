@@ -772,6 +772,71 @@ class AuditBeforeRewrite6384L3(World):
         self.assertFalse(json.loads((self.sd / 'cache_plan.json').read_text())['enabled'])
 
 
+class LockAndSweep6384L4(World):
+    """r1 L4: no lock means no record (lookup unaffected), and manifests,
+    locks and temp files older than 7 days are swept."""
+
+    OLD = 8 * 24 * 3600
+
+    def _flock_fails(self):
+        import fcntl
+        real = fcntl.flock
+
+        def fail(*_a, **_k):
+            raise OSError(37, 'No locks available')
+        fcntl.flock = fail
+        self.addCleanup(setattr, fcntl, 'flock', real)
+
+    def _age(self, path, seconds):
+        old = time.time() - seconds
+        os.utime(str(path), (old, old))
+
+    def test_lock_failure_records_nothing(self):
+        self.plan(event='push', ref='refs/heads/release/v1.0.0')
+        self._flock_fails()
+        out = self.record(0)
+        self.assertIn('not recorded', out)
+        self.assertFalse(tbc.manifest_path(self.mdir, 'linux-fed', 'enterprise-fed', 'release/v1.0.0').exists())
+
+    def test_lock_failure_still_allows_lookup(self):
+        self.green_run('100')
+        self._flock_fails()
+        self.assertIn('skipped 3 of 3', self.plan(run_id='200', now=NOW + 60))
+
+    def test_record_sweeps_old_manifests_locks_and_tmp_files(self):
+        old_m = self.mdir / 'test-manifest-stale.json'
+        old_l = self.mdir / 'test-manifest-stale.json.lock'
+        old_t = self.mdir / '.test-manifest-stale.json.123.tmp'
+        fresh_t = self.mdir / '.test-manifest-other.json.456.tmp'
+        for f in (old_m, old_l, old_t, fresh_t):
+            f.write_text('{}')
+        for f in (old_m, old_l, old_t):
+            self._age(f, self.OLD)
+        self.green_run('100')
+        self.assertFalse(old_m.exists())
+        self.assertFalse(old_l.exists())
+        self.assertFalse(old_t.exists())
+        self.assertTrue(fresh_t.exists())
+        self.assertTrue(tbc.manifest_path(self.mdir, 'linux-fed', 'enterprise-fed', 'release/v1.0.0').exists())
+
+    def test_sweep_keeps_the_lock_of_a_live_manifest(self):
+        live = self.mdir / 'test-manifest-live.json'
+        lock = self.mdir / 'test-manifest-live.json.lock'
+        live.write_text('{}')
+        lock.write_text('')
+        self._age(lock, self.OLD)
+        self.green_run('100')
+        self.assertTrue(live.exists())
+        self.assertTrue(lock.exists())
+
+    def test_sweep_leaves_unrelated_files_alone(self):
+        other = self.mdir / 'notes.txt'
+        other.write_text('x')
+        self._age(other, self.OLD)
+        self.green_run('100')
+        self.assertTrue(other.exists())
+
+
 class Policy(unittest.TestCase):
     def test_allowed_matrix(self):
         on = {'CI_TEST_BINARY_CACHE': '1', 'CI_TEST_BINARY_CACHE_LOOKUP': '1'}
