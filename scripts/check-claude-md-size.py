@@ -1840,8 +1840,9 @@ CERT_TRUSTED_WORKFLOW_PATH = ".github/workflows/cert-expiry-trusted.yml"
 # scripts/check_cert_expiry.py over the pull request's merge commit as git objects. It is pinned to this canonical
 # form (comments and blank lines dropped), twin of COMPARE_WORKFLOW_LINES: a changed trigger, a wider permission,
 # a head or merge-commit checkout, an extra step, a secret, a self-hosted runner or a `run:` that is not the base
-# gate fails the guard. The merge ref is FETCHED as objects (never checked out), so `/merge` is allowed on the fetch
-# line only, which the exact-line comparison enforces.
+# gate fails the guard. The merge ref is FETCHED as objects by the gate itself (never checked out; #6176 re-fetches
+# a stale or missing merge ref with bounded backoff), so `/merge` is allowed only in the gate line's
+# `--merge-ref refs/remotes/pull/merge`, which the exact-line comparison enforces.
 CERT_TRUSTED_WORKFLOW_LINES = (
     "name: Enterprise-federation cert-expiry gate (trusted base copy)",
     "on:",
@@ -1865,23 +1866,23 @@ CERT_TRUSTED_WORKFLOW_LINES = (
     "ref: ${{ github.sha }}",
     "fetch-depth: 0",
     "persist-credentials: false",
-    "- name: Fetch the pull request head and merge commit as git objects (data, never checked out)",
+    "- name: Fetch the pull request head as git objects (data, never checked out)",
     "env:",
     "PR_NUMBER: ${{ github.event.pull_request.number }}",
-    'run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head" '
-    '"+refs/pull/${PR_NUMBER}/merge:refs/remotes/pull/merge"',
+    'run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"',
     "- name: Cert-expiry gate self-test (base code)",
     "run: python3 -I scripts/check_cert_expiry.py --self-test",
     "- name: Judge the merge commit with the base copy of the gate",
     "env:",
+    "PR_NUMBER: ${{ github.event.pull_request.number }}",
     "BASE_REF: ${{ github.event.pull_request.base.ref }}",
     "BASE_SHA: ${{ github.event.pull_request.base.sha }}",
     "HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
     'run: python3 -I scripts/check_cert_expiry.py --trusted --base-ref "$BASE_REF" --base-sha "$BASE_SHA" '
-    '--head-sha "$HEAD_SHA" --merge-ref refs/remotes/pull/merge',
+    '--head-sha "$HEAD_SHA" --pr-number "$PR_NUMBER" --merge-ref refs/remotes/pull/merge',
 )
 CERT_TRUSTED_WORKFLOW_INDENTS = (0, 0, 2, 4, 4, 0, 2, 0, 2, 2, 0, 2, 4, 4, 4, 4, 6, 8, 8, 10, 10, 10, 6, 8, 10, 8, 6, 8,
-                                 6, 8, 10, 10, 10, 8)
+                                 6, 8, 10, 10, 10, 10, 8)
 CERT_TRUSTED_DANGER = tuple(item for item in COMPARE_DANGER if item[0] != "/merge") + (
     ("self-hosted", "the job must run on a GitHub-hosted runner"),
     ("working-directory:", "the gate must run from the base checkout root"),
