@@ -680,6 +680,15 @@ jobs:
       # CARGO_PROFILE_DEV_DEBUG (the hosted low-mem step below) would otherwise
       # leave the test profile at this value. Both are stated at every point
       # they are set, so the pair can never drift apart.
+      #
+      # #6118 — the SAME pair is declared by every other self-hosted cargo job
+      # (cert-postgres-age.yml, postgres-ignored.yml, session-boot-lifetime.yml).
+      # The debuginfo level is part of cargo's artifact hash, so two jobs at two
+      # levels keep TWO complete dependency + test-binary trees in the one
+      # persistent `target/` of a fleet runner; one level = one tree. The test
+      # executables themselves are pruned at job end by the
+      # `Prune runner target dir (#6118)` step at the bottom of this job. Both
+      # halves are pinned by scripts/test/test_ci_runner_target_hygiene_6118.py.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     strategy:
@@ -1506,6 +1515,27 @@ jobs:
           else
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
           fi
+
+      # #6118 — the fleet's persistent `target/` is the warm cache (#3128), but
+      # the ~1000 test executables `cargo test` links into `target/debug/deps`
+      # are NOT cache: cargo relinks every one of them whenever the lib crate
+      # changes, i.e. on every commit, so keeping them past the job buys nothing
+      # and cost ~164 GB per runner (#6118: the f2 root filesystem went from
+      # 224 GB to 78 GB free in two hours with two runners each holding 164 GB;
+      # a parallel pair of fresh builds would have ENOSPC'd mid-job, and nothing
+      # cleaned up). Prune them here; the rlib / rmeta / proc-macro outputs,
+      # `build/` and `.fingerprint/` that make the next compile warm are kept
+      # (the script's default `--scope test-bins`). always(): a red or cancelled
+      # test run leaves the same binaries behind. Self-hosted only: a hosted VM
+      # is discarded with the job. docs_only-guarded for rule (b3) of
+      # scripts/check-required-contexts.sh (a docs-only run compiled nothing).
+      # The step honours a runner-side CARGO_TARGET_DIR, else the workspace
+      # default. MUST stay the LAST step of this job — pinned by
+      # scripts/test/test_ci_runner_target_hygiene_6118.py.
+      - name: Prune runner target dir (#6118)
+        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment != 'github-hosted'
+        shell: bash
+        run: python3 scripts/ci/prune-runner-target.py --target-dir "${CARGO_TARGET_DIR:-target}"
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #

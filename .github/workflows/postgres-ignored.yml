@@ -42,8 +42,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0"
+  # #6118 — `line-tables-only`, the SAME level as ci.yml's enterprise-fed leg
+  # and cert-postgres-age.yml, not `"0"`: the debuginfo level is part of
+  # cargo's artifact hash, so a different level here kept a second complete
+  # dependency + test-binary tree in each linux-fed runner's persistent
+  # `target/`. One level for every self-hosted cargo job = one tree. Pinned by
+  # scripts/test/test_ci_runner_target_hygiene_6118.py.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   postgres-ignored:
@@ -145,3 +151,13 @@ jobs:
           else
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
           fi
+
+      # #6118 — prune the ~1000 test executables the `--list` + `--ignored`
+      # runs above linked into the runner's persistent `target/` (the warm
+      # rlib / build-script / fingerprint cache is kept). Full rationale on the
+      # step of the same name in ci.yml. always(): a red or cancelled run leaves
+      # the same binaries behind. MUST stay the LAST step — pinned by
+      # scripts/test/test_ci_runner_target_hygiene_6118.py.
+      - name: Prune runner target dir (#6118)
+        if: always()
+        run: python3 scripts/ci/prune-runner-target.py --target-dir "${CARGO_TARGET_DIR:-target}"
