@@ -71,7 +71,7 @@ on:
   # together), #2523 and #2508 (push must not overlap a PR head such as
   # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: [main, develop, "release/**", "rehearsal/**"]
+    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]
   # Merge Queue (#3089) — this workflow carries several REQUIRED gate contexts,
   # so it MUST report on the `merge_group` ref or the queue wedges. Its jobs
   # have no docs-only/event `if:` gating (the two event-scoped gates —

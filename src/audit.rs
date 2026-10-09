@@ -2211,6 +2211,9 @@ mod verify_snapshot_4332_tests;
 mod fail_closed_4400_tests;
 
 #[cfg(test)]
+mod append_only_scratch_5752_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::Tier;
@@ -3418,6 +3421,9 @@ mod tests {
         let path = tmp.path().join("audit.log");
         // Pre-create so chflags has a real inode to flag.
         std::fs::write(&path, b"").unwrap();
+        // #5752: clears the flag on every exit path, a panic included, so the
+        // tempdir (and a runner workspace) never keeps an undeletable log.
+        let _scratch = super::append_only_scratch_5752_tests::AppendOnlyScratch::new(path.clone());
         // append_only_hint=true reaches mark_append_only. On darwin the
         // call may or may not succeed depending on user privileges and
         // chflags's response to UF_APPEND on a tmpfile — either way
@@ -3425,17 +3431,6 @@ mod tests {
         super::init(&path, true, true).expect("init must tolerate flag outcome");
         assert!(super::is_enabled());
         super::shutdown_for_test();
-        // Best-effort: clear UF_APPEND if it was set so tmpdir cleanup
-        // can remove the file. We ignore errors — the file lives under
-        // the OS tmpdir cleaner anyway.
-        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-        unsafe {
-            use std::ffi::CString;
-            use std::os::unix::ffi::OsStrExt;
-            if let Ok(c) = CString::new(path.as_os_str().as_bytes()) {
-                let _ = libc::chflags(c.as_ptr(), 0);
-            }
-        }
     }
 
     #[test]

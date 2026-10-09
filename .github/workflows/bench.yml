@@ -18,7 +18,7 @@ on:
   # together), #2523 and #2508 (push must not overlap a PR head such as
   # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: [main, develop, "release/**", "rehearsal/**"]
+    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]
     # Bench is advisory (not in required-status-checks). Trigger-level
     # paths-ignore is safe here and saves a full release build (~6-8 min)
     # on every docs-only PR.
