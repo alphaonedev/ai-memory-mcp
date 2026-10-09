@@ -1603,8 +1603,9 @@ WORKFLOW_PATH = ".github/workflows/claude-md-guard.yml"
 
 
 WORKFLOW_BASE_BRANCHES = ("main", "develop", "release/**", "rehearsal/**", "chain/**")
-# `push` must NOT name rehearsal/** or chain/** (#5447 R-PUSH, #5659, #6105): the carrier and the chain
-# branches get the guard on their pull_request runs.
+# `push` must NOT name rehearsal/** (#5447 R-PUSH, #5659, #6105); chain/** is admitted on push ONLY in the
+# required-set workflows under an event-distinct concurrency key (#6117). This guard is not in that set and stays
+# off chain pushes: the carrier and the chain branches get it on their pull_request runs.
 WORKFLOW_PUSH_BRANCHES = ("main", "develop", "release/**")
 WORKFLOW_FORBIDDEN_KEYS = ("pull_request_target", "continue-on-error", "paths", "paths-ignore",
                            "branches-ignore", "tags", "tags-ignore", "if", "shell", "working-directory",
