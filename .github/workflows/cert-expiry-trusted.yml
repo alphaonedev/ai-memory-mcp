@@ -24,9 +24,20 @@
 # scripts/check-claude-md-size.py)
 # it prints GUARD CHANGED and fails unless a commit in the pull request carries
 # a `Rule-Change-Approved-By: <who>` trailer. Like the rule-change comparison,
-# the trailer is tamper-EVIDENCE: review and the sole merger enforce. A trailer
-# never waives the section 7 verdict itself. Permissions are contents: read; no
-# secret is used.
+# the trailer is tamper-EVIDENCE: review and the sole merger enforce; an
+# approved guard change is also raised as a `::warning` annotation on the
+# checks page. A trailer never waives the section 7 verdict itself. A second
+# job anywhere in .github/workflows that can produce the required check name
+# (GUARD SHADOW) fails closed and is not waivable. Permissions are
+# contents: read; no secret is used.
+#
+# WHICH BASE COMMIT. The checkout is `github.sha`, not the payload
+# `pull_request.base.sha`: for pull_request_target this workflow FILE is read
+# from github.sha (the base branch tip when the event fired), so the gate
+# script is taken from the same commit as the workflow that runs it. The
+# payload base.sha is where the pull request was last synced and can be older,
+# so an unsynced pull request would otherwise be judged by an older, weaker
+# copy of the gate (security review F6 of #6140).
 #
 # REQUIRED-CONTEXT STATUS. This job is a companion and is NOT yet a required
 # context: the required context stays `Enterprise-federation cert-expiry gate
@@ -69,7 +80,7 @@ jobs:
       - name: Check out the BASE commit only
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Fetch the pull request head and merge commit as git objects (data, never checked out)
