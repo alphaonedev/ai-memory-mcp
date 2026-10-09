@@ -859,7 +859,8 @@ def check(root):
     for doc, raw, lines in lines_by_doc:
         rel = doc.relative_to(root).as_posix()
         for lineno, line in enumerate(raw, 1):
-            for c in sorted({c for c in line if c in BIDI_CONTROLS}):
+            # A character reference is decoded once by the renderer (#6417): ``&amp;#x202E;`` stays literal.
+            for c in sorted({c for c in line + html.unescape(line) if c in BIDI_CONTROLS}):
                 problems.append(
                     "%s:%d: bidirectional control character U+%04X (it reorders what a reader sees)"
                     % (rel, lineno, ord(c))
