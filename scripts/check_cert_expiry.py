@@ -109,8 +109,10 @@ and no workflow step fetches pull request content (#6163 precedent). Trusted mod
     refs/remotes/ ref) itself and, while that merge ref is missing or its
     second parent is not the head, fetches it again after each of the fixed
     MERGE_REF_SLEEPS; after the last attempt it fails closed with an
-    `::error` annotation (GitHub builds the test merge asynchronously and
-    never for a conflicted pull request, #6176);
+    `::error` annotation naming the last fetch error (GitHub builds the test
+    merge asynchronously and never for a conflicted pull request, #6176).
+    Both destination refs are deleted before the first fetch, and each fetch
+    is cut after FETCH_TIMEOUT seconds;
   * reads git objects only (ls-tree / cat-file / diff / grep / log between
     shas); nothing from the head is checked out or executed;
   * takes the range only from its arguments (the process environment,
@@ -124,9 +126,13 @@ and no workflow step fetches pull request content (#6163 precedent). Trusted mod
     never waives the section 7 verdict; an approved guard change is also
     printed as a `::warning title=GUARD CHANGED::` annotation;
   * prints `GUARD SHADOW: <workflow> line <n>` and fails (not waivable) when
-    any workflow file at the merge commit, outside the guarded cert-expiry-gate
-    job, spells the required check name or a fragment of it (a second
-    producer of a required context; Refs #6177);
+    any line of any workflow file at the merge commit, headers and the trusted
+    workflow included, spells the required check name or a fragment of it
+    outside the two pinned job regions (cert-expiry-gate in c8-precheck.yml,
+    cert-expiry-trusted in the trusted workflow, each with one pinned
+    `name:`), or when either of those two files uses a YAML construct the
+    line scan cannot follow (a second producer of a required context;
+    Refs #6177);
   * fails closed on any git read error (a missing object is never "absent")
     and on a blob above MAX_BLOB_BYTES.
 In every mode a name the change controls (a path, a workflow file name, a
@@ -377,11 +383,11 @@ def read_blob(repo, oid, rel):
     """Bytes of blob OID (named REL in messages), refused above MAX_BLOB_BYTES."""
     size = git_text(repo, "cat-file", "-s", "--end-of-options", oid)
     if not size.isdigit() or int(size) > MAX_BLOB_BYTES:
-        raise GateError(f"{rel} blob {oid} size {size!r} exceeds {MAX_BLOB_BYTES} bytes (fail-closed)")
+        raise GateError(f"{log_safe(rel)} blob {oid} size {size!r} exceeds {MAX_BLOB_BYTES} bytes (fail-closed)")
     proc = run_git(repo, "cat-file", "blob", "--end-of-options", oid)
     if proc.returncode != 0:
         err = log_safe(proc.stderr.decode("utf-8", "replace").strip())
-        raise GateError(f"git cat-file blob {oid} ({rel}) exited {proc.returncode}: {err}")
+        raise GateError(f"git cat-file blob {oid} ({log_safe(rel)}) exited {proc.returncode}: {err}")
     return proc.stdout
 
 
@@ -811,12 +817,10 @@ JOB_KEY_RE = re.compile(r"  ([A-Za-z0-9_.-]+):[ \t]*(?:#.*)?")
 JOBS_KEY_RE = re.compile(r"jobs:[ \t]*(?:#.*)?")
 
 
-def workflow_regions(text, job):
-    """(line number, line, guarded) for every meaningful line of a workflow
-    file (blank and comment-only lines are dropped). A line is guarded unless
-    it is inside a job other than JOB: header keys (on/permissions/env/
-    defaults) stay guarded."""
-    out, in_jobs, current = [], False, None
+def _workflow_lines(text):
+    """(line number, line, indent, in_jobs, current job key or None) for every
+    meaningful line of a workflow file (blank and comment-only lines dropped)."""
+    in_jobs, current = False, None
     for number, line in enumerate(text.split("\n"), 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -827,6 +831,16 @@ def workflow_regions(text, job):
         elif in_jobs and indent <= 2:
             m = JOB_KEY_RE.fullmatch(line.rstrip("\r")) if indent == 2 else None
             current = m.group(1) if m else None
+        yield number, line, indent, in_jobs, current
+
+
+def workflow_regions(text, job):
+    """(line number, line, guarded) for every meaningful line of a workflow
+    file (blank and comment-only lines are dropped). A line is guarded unless
+    it is inside a job other than JOB: header keys (on/permissions/env/
+    defaults) stay guarded."""
+    out = []
+    for number, line, _, in_jobs, current in _workflow_lines(text):
         if not in_jobs or current is None or current == job:
             out.append((number, line, True))
         else:
@@ -879,15 +893,237 @@ def _shadow_canon(text):
     return re.sub(r"[^a-z0-9§]", "", YAML_ESCAPE_RE.sub(decode, text).lower())
 
 
+# Round 3 (code F1, security R2-1): the only regions allowed to spell the
+# required check name are the job of each file below whose `name:` is pinned
+# (and, in the trusted workflow, two exact header lines). Every other line of
+# every workflow file, headers included, is scanned, and both files are
+# refused when they use a YAML construct the line scan cannot follow.
+TRUSTED_WF_JOB = "cert-expiry-trusted"
+TRUSTED_WF_JOB_NAME = "Enterprise-federation cert-expiry gate, trusted base copy (cert §7 / F7)"
+TRUSTED_WF_HEADER_LINES = (
+    "name: Enterprise-federation cert-expiry gate (trusted base copy)",
+    "  group: cert-expiry-trusted-${{ github.event.pull_request.number }}",
+)
+JOB_NAME_RE = re.compile(r"    name:(?:[ \t]+(.*?))?[ \t]*")
+BLOCK_INDICATOR_RE = re.compile(r"[|>]([0-9]?)[+-]?([0-9]?)[ \t]*(?:#.*)?")
+SHADOW_NOTE = "(fail-closed, #6140; a trailer does not waive this; Refs #6177)"
+
+
+def _own_regions():
+    """{workflow path: (own job, pinned job name, exempt header lines)}."""
+    return {TRUSTED_JOB[0]: (TRUSTED_JOB[1], CERT_CONTEXT, ()),
+            TRUSTED_PATHS[1]: (TRUSTED_WF_JOB, TRUSTED_WF_JOB_NAME, TRUSTED_WF_HEADER_LINES)}
+
+
+def _quoted_end(body, pos):
+    """Index just past the quoted scalar starting at POS, or -1 when it does
+    not close on this line."""
+    quote, i = body[pos], pos + 1
+    while i < len(body):
+        if quote == '"' and body[i] == "\\":
+            i += 2
+            continue
+        if body[i] == quote:
+            if quote == "'" and body[i + 1:i + 2] == "'":
+                i += 2
+                continue
+            return i + 1
+        i += 1
+    return -1
+
+
+def _flow_hazard(body, pos):
+    """A hazard in the flow collection starting at POS, or None. Node starts
+    (after `[`, `{`, `,`, `: ` and `? `) are checked for anchors, aliases,
+    tags and quoted keys; the collection must close on this line."""
+    depth, i, start = 0, pos, True
+    while i < len(body):
+        ch = body[i]
+        if ch in " \t":
+            i += 1
+            continue
+        if start and ch in "&*!":
+            return f"a YAML {'anchor' if ch == '&' else 'alias' if ch == '*' else 'tag'} in a flow collection"
+        if ch in "\"'":
+            end = _quoted_end(body, i)
+            if end < 0:
+                return "a quoted scalar spanning lines"
+            i, start = end, False
+            continue
+        if ch == "#" and body[i - 1:i] in (" ", "\t"):
+            break
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+            if depth == 0:
+                return None
+        start = ch in "[{," or (ch in ":?" and body[i + 1:i + 2] in (" ", ""))
+        i += 1
+    return "a flow collection spanning lines"
+
+
+def _node_hazard(body, pos):
+    """(hazard or None, block-scalar indicator seen) for the node at POS."""
+    rest = body[pos:]
+    if not rest or rest.startswith("#"):
+        return None, False
+    ch = rest[0]
+    if ch in "&*!":
+        return f"a YAML {'anchor' if ch == '&' else 'alias' if ch == '*' else 'tag'} ({rest.split()[0]})", False
+    if ch in "[{":
+        return _flow_hazard(body, pos), False
+    if ch in "|>":
+        m = BLOCK_INDICATOR_RE.fullmatch(rest)
+        if m is None or m.group(1) or m.group(2):
+            return "a block scalar with an explicit indentation indicator", True
+        return None, True
+    return None, False
+
+
+def _yaml_hazards(text):
+    """(line number, hazard) for every YAML construct in TEXT that a line scan
+    cannot follow: anchors, aliases, tags, merge keys, complex (`?`) or quoted
+    keys, quoted scalars or flow collections spanning lines, explicit block
+    indentation indicators, document markers and tabs in indentation. Block
+    scalar bodies are skipped, so `&&` or `*)` in a `run: |` script is text."""
+    out, block_col = [], None
+    for number, raw in enumerate(text.split("\n"), 1):
+        body = raw.rstrip("\r")
+        stripped = body.strip()
+        indent = len(body) - len(body.lstrip(" "))
+        if block_col is not None:
+            if not stripped or indent > block_col:
+                continue
+            block_col = None
+        if not stripped or stripped.startswith("#"):
+            continue
+        if body[indent] == "\t":
+            out.append((number, "a tab in the indentation"))
+            continue
+        if indent == 0 and (body.startswith("---") or body.startswith("...")):
+            out.append((number, "a YAML document marker"))
+            continue
+        pos = indent
+        while body[pos:pos + 1] == "-" and body[pos + 1:pos + 2] in (" ", ""):
+            pos += 1
+            while body[pos:pos + 1] == " ":
+                pos += 1
+        key_col = pos
+        if body[pos:pos + 1] == "?" and body[pos + 1:pos + 2] in (" ", ""):
+            out.append((number, "a YAML complex key (?)"))
+            continue
+        hazard, block = _node_hazard(body, pos)
+        if hazard is None and not block and body[pos:pos + 1] in ("\"", "'"):
+            end = _quoted_end(body, pos)
+            if end < 0:
+                hazard = "a quoted scalar spanning lines"
+            elif body[end:end + 1] == ":":
+                hazard = "a quoted mapping key"
+        elif hazard is None and not block:
+            m = re.match(r"([^\s#\"'][^#]*?):(?:[ \t]+|$)", body[pos:])
+            if m:
+                if m.group(1).strip() == "<<":
+                    hazard = "a YAML merge key (<<)"
+                else:
+                    value = pos + m.end()
+                    hazard, block = _node_hazard(body, value)
+                    if hazard is None and not block and body[value:value + 1] in ("\"", "'"):
+                        if _quoted_end(body, value) < 0:
+                            hazard = "a quoted scalar spanning lines"
+        if hazard:
+            out.append((number, hazard))
+        if block:
+            block_col = key_col
+    return out
+
+
+def _own_file_findings(rel, text, job, pinned):
+    """GUARD SHADOW lines for the structure of an own file (c8-precheck.yml or
+    the trusted workflow): YAML hazards, `jobs:` children that are not plain
+    job keys, duplicate jobs, and the own job's single pinned `name:`."""
+    found, seen, jobs_lines = [], set(), 0
+    name_lines, first_child = [], None
+    where = f"{log_safe(rel)}"
+    for number, hazard in _yaml_hazards(text):
+        found.append(f"GUARD SHADOW: {where} line {number}: {hazard}; a YAML construct the shadow scan "
+                     f"cannot follow is refused in this file {SHADOW_NOTE}")
+    for number, line, indent, in_jobs, current in _workflow_lines(text):
+        body = line.rstrip("\r")
+        if indent == 0 and JOBS_KEY_RE.fullmatch(body):
+            jobs_lines += 1
+            if jobs_lines > 1:
+                found.append(f"GUARD SHADOW: {where} line {number}: a second jobs: key {SHADOW_NOTE}")
+            continue
+        if not in_jobs:
+            continue
+        if indent <= 2:
+            if current is None:
+                found.append(f"GUARD SHADOW: {where} line {number}: {log_safe(body.strip())!r} under jobs: is "
+                             f"not a plain job key; it may define a job the scan cannot name {SHADOW_NOTE}")
+            elif current in seen:
+                found.append(f"GUARD SHADOW: {where} line {number}: job '{log_safe(current)}' is defined twice "
+                             f"{SHADOW_NOTE}")
+            else:
+                seen.add(current)
+            continue
+        if current != job:
+            continue
+        if first_child is None:
+            first_child = (number, indent)
+        m = JOB_NAME_RE.fullmatch(body)
+        if indent == 4 and m:
+            name_lines.append((number, m.group(1) or ""))
+    if job not in seen:
+        # No own job: nothing in this file is exempt from the line scan, and a
+        # missing required job leaves the check unreported (a block, not a pass).
+        return found
+    if first_child is None or first_child[1] != 4:
+        found.append(f"GUARD SHADOW: {where} line {first_child[0] if first_child else '?'}: the {job} job body "
+                     f"is not indented by 4 spaces, so its name: line cannot be pinned {SHADOW_NOTE}")
+    elif len(name_lines) != 1 or name_lines[0][1] != pinned:
+        shown = "; ".join(f"line {n}: {log_safe(v)!r}" for n, v in name_lines) or "none"
+        found.append(f"GUARD SHADOW: {where}: job '{job}' must have exactly one name: line, the pinned "
+                     f"name '{pinned}' (found {shown}) {SHADOW_NOTE}")
+    return found
+
+
+def _scan_workflow(rel, text, own):
+    """GUARD SHADOW lines for REL: every meaningful line outside the own job
+    region (and the own exact header lines) is scanned; consecutive scanned
+    lines are joined, so a folded or escaped scalar is still caught. One line
+    per job region (or the header) that spells the required check name."""
+    job, _, header = own if own else (None, None, ())
+    found, reported, window = [], set(), ""
+    for number, line, _, in_jobs, current in _workflow_lines(text):
+        if own and ((in_jobs and current == job) or (not in_jobs and line.rstrip("\r") in header)):
+            window = ""
+            continue
+        region = f"job '{log_safe(current)}'" if current else ("jobs: block" if in_jobs else "workflow header")
+        window += _shadow_canon(line)
+        if any(m in window for m in SHADOW_MARKERS):
+            window = ""
+            if region not in reported:
+                reported.add(region)
+                found.append(
+                    f"GUARD SHADOW: {log_safe(rel)} line {number} ({region}): names the required check "
+                    f"'{CERT_CONTEXT}' (or a fragment of it) outside the pinned job regions; a second producer "
+                    f"of a required context can satisfy it with an always-green job {SHADOW_NOTE}")
+            continue
+        window = window[-16:]
+    return found
+
+
 def shadow_check(repo, merge):
-    """(ok, lines): no job outside the guarded cert-expiry-gate job of
-    c8-precheck.yml can produce the required check name at MERGE (#6140
-    round 2, F3). Every workflow blob in .github/workflows is read from git
-    objects; the trusted workflow is skipped (it is guarded by blob id), and
-    in c8-precheck.yml only the lines outside the guarded text are scanned.
-    Consecutive scanned lines are joined, so a folded or escaped scalar is
-    still caught. Not waivable by a trailer: a legitimate change never needs a
-    second producer of a required context. A name built at run time from a
+    """(ok, lines): no job outside the pinned own job regions (the
+    cert-expiry-gate job of c8-precheck.yml, the cert-expiry-trusted job of
+    the trusted workflow) can produce the required check name at MERGE
+    (#6140 rounds 2 and 3). Every workflow blob in .github/workflows is read
+    from git objects and every line of it is scanned, headers included;
+    both own files must keep a single pinned `name:` in their job and use no
+    YAML construct (anchor, alias, tag, quoted or flow job key, ...) the scan
+    cannot follow. Not waivable by a trailer: a legitimate change never needs
+    a second producer of a required context. A name built at run time from a
     `${{ }}` expression is outside a text scan (Refs #6177)."""
     entry = tree_entry(repo, merge, WORKFLOW_DIR)
     if entry is None:
@@ -899,12 +1135,12 @@ def shadow_check(repo, merge):
     if proc.returncode != 0:
         err = log_safe(proc.stderr.decode("utf-8", "replace").strip())
         raise GateError(f"git ls-tree {merge} {WORKFLOW_DIR}/ exited {proc.returncode}: {err}")
-    trusted_wf, (c8_rel, job) = TRUSTED_PATHS[1], TRUSTED_JOB
+    owns = _own_regions()
     found, scanned = [], 0
     for rec in proc.stdout.split(b"\0"):
         meta, sep, name = rec.partition(b"\t")
         rel = name.decode("utf-8", "replace")
-        if not sep or not rel.lower().endswith((".yml", ".yaml")) or rel == trusted_wf:
+        if not sep or not rel.lower().endswith((".yml", ".yaml")):
             continue
         fields = meta.decode("ascii", "replace").split(" ")
         if len(fields) != 3:
@@ -918,21 +1154,10 @@ def shadow_check(repo, merge):
             continue
         scanned += 1
         text = read_blob(repo, oid, rel).decode("utf-8", "replace")
-        window = ""
-        for number, line, guarded in workflow_regions(text, job if rel == c8_rel else None):
-            if guarded and rel == c8_rel:
-                window = ""
-                continue
-            window += _shadow_canon(line)
-            if any(m in window for m in SHADOW_MARKERS):
-                found.append(
-                    f"GUARD SHADOW: {log_safe(rel)} line {number}: names the required check "
-                    f"'{CERT_CONTEXT}' (or a fragment of it) outside the {c8_rel} {job} job; a second "
-                    "producer of a required context can satisfy it with an always-green job "
-                    "(fail-closed, #6140; a trailer does not waive this; Refs #6177)"
-                )
-                break
-            window = window[-16:]
+        own = owns.get(rel)
+        if own:
+            found.extend(_own_file_findings(rel, text, own[0], own[1]))
+        found.extend(_scan_workflow(rel, text, own))
     if found:
         return False, found
     return True, [f"{PREFIX}: shadow scan — {scanned} workflow file(s) at {merge}: no second producer "
@@ -993,6 +1218,11 @@ PR_NUMBER_RE = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
 # --pr-number this base copy fetches the head as git objects into this ref.
 HEAD_FETCH_REF = "refs/remotes/pull/head"
 _sleep = time.sleep  # self-test seam: the cells record the backoff instead of sleeping
+# Round 3 (code F3, security R2-4): every fetch is cut after FETCH_TIMEOUT
+# seconds. Worst case: (1 head + 5 merge fetches) x 45 s + 65 s of sleeps =
+# 335 s, inside the 600 s (timeout-minutes: 10) trusted job with room for the
+# checkout and the self-test step. The other git calls read local objects.
+FETCH_TIMEOUT = 45
 
 
 class MergeRefError(GateError):
@@ -1015,35 +1245,56 @@ def fetch_merge_ref(repo, pr_number, merge_ref, head):
     """Fetch refs/pull/<PR>/head into HEAD_FETCH_REF once and refs/pull/<PR>/merge
     into MERGE_REF until it is current for HEAD, with the fixed
     MERGE_REF_SLEEPS backoff (objects only, nothing checked out; a fixed
-    argument list, never a shell). PR_NUMBER is validated before any git call.
-    Raises GateError on a failed head fetch and after the last merge attempt
-    (fail-closed)."""
+    argument list, never a shell). PR_NUMBER is validated before any git call;
+    both destination refs are deleted before the first fetch, and each fetch
+    is cut after FETCH_TIMEOUT seconds. Raises MergeRefError (an ::error
+    annotation) on a failed head fetch and after the last merge attempt,
+    naming the last fetch error (fail-closed)."""
     if not PR_NUMBER_RE.fullmatch(pr_number):
         raise GateError(f"--pr-number {pr_number!r} is not a decimal pull request number (fail-closed)")
     if not (MERGE_REF_RE.fullmatch(merge_ref) and ".." not in merge_ref):
         raise GateError(f"--merge-ref {merge_ref!r} must be a refs/remotes/ ref when --pr-number is given "
                         "(the gate fetches into it; fail-closed)")
-    proc = run_git(repo, "fetch", "--no-tags", "--no-recurse-submodules", "--quiet", "--end-of-options",
-                   "origin", f"+refs/pull/{pr_number}/head:{HEAD_FETCH_REF}")
-    if proc.returncode != 0:
-        err = log_safe(proc.stderr.decode("utf-8", "replace").strip())
-        raise GateError(f"git fetch of refs/pull/{pr_number}/head exited {proc.returncode}: {err} (fail-closed)")
+    # Round 3 (security R2-5): a destination ref an earlier run left behind is
+    # deleted first, so only what this run fetched is ever judged.
+    for ref in (HEAD_FETCH_REF, merge_ref):
+        proc = run_git(repo, "update-ref", "-d", ref)
+        if proc.returncode != 0:
+            err = log_safe(proc.stderr.decode("utf-8", "replace").strip())
+            raise GateError(f"git update-ref -d {ref} exited {proc.returncode}: {err} (fail-closed)")
+    err = _fetch(repo, f"+refs/pull/{pr_number}/head:{HEAD_FETCH_REF}")
+    if err:
+        raise MergeRefError(f"git fetch of refs/pull/{pr_number}/head failed: {err} (fail-closed)")
     attempts = len(MERGE_REF_SLEEPS) + 1
-    reason = "missing"
+    reason, last_error = "missing", ""
     for attempt in range(attempts):
-        run_git(repo, "fetch", "--no-tags", "--no-recurse-submodules", "--quiet", "--end-of-options",
-                "origin", f"+refs/pull/{pr_number}/merge:{merge_ref}")
+        err = _fetch(repo, f"+refs/pull/{pr_number}/merge:{merge_ref}")
+        last_error = err or last_error
         reason = _merge_ref_state(repo, merge_ref, head)
         if reason is None:
             return
         if attempt < len(MERGE_REF_SLEEPS):
             _sleep(MERGE_REF_SLEEPS[attempt])
+    detail = f"; last fetch error: {last_error}" if last_error else ""
     raise MergeRefError(
         f"refs/pull/{pr_number}/merge is {reason} after {attempts} fetch attempts "
-        f"(sleeps {', '.join(str(n) for n in MERGE_REF_SLEEPS)} s). GitHub had not built a current test merge "
-        "for this head; a pull request with a merge conflict has none. Resolve any conflict, or push or sync "
-        "the branch, then re-run this job (fail-closed)"
+        f"(sleeps {', '.join(str(n) for n in MERGE_REF_SLEEPS)} s){detail}. GitHub had not built a current test "
+        "merge for this head; a pull request with a merge conflict has none. Resolve any conflict, or push or "
+        "sync the branch, then re-run this job (fail-closed)"
     )
+
+
+def _fetch(repo, refspec):
+    """Fetch REFSPEC from origin (objects only, a fixed argument list, cut
+    after FETCH_TIMEOUT seconds); "" on success, else the log-safe error."""
+    try:
+        proc = run_git(repo, "fetch", "--no-tags", "--no-recurse-submodules", "--quiet", "--end-of-options",
+                       "origin", refspec, timeout=FETCH_TIMEOUT)
+    except GateError as exc:
+        return log_safe(str(exc))
+    if proc.returncode != 0:
+        return f"exited {proc.returncode}: {log_safe(proc.stderr.decode('utf-8', 'replace').strip())}"
+    return ""
 
 
 def run_trusted(repo, base_ref, head, merge_ref, base_sha="", pr_number=None):
@@ -1078,7 +1329,8 @@ def run_trusted(repo, base_ref, head, merge_ref, base_sha="", pr_number=None):
         shadow_ok, shadow_lines = shadow_check(repo, merge)
         ok, lines = ok and shadow_ok, lines + shadow_lines
     except GateError as exc:
-        ok, lines = False, [f"{PREFIX}: ERROR — trusted guard: {exc} (fail-closed)"]
+        suffix = "" if str(exc).endswith("(fail-closed)") else " (fail-closed)"
+        ok, lines = False, [f"{PREFIX}: ERROR — trusted guard: {exc}{suffix}"]
     (outs if ok else errs).append("\n".join(lines))
     rc = 0 if rc == 0 and ok else 1
     return rc, "\n".join(outs), "\n".join(errs)
@@ -3208,7 +3460,14 @@ SELF_TEST_OK = (
     "second fetch GREEN after one fixed sleep, stale or missing (conflicted) RED with an ::error after "
     "the fixed backoff, malformed numbers and a sha --merge-ref refused; (tr #6175) a watched path, a "
     "workflow file name and an approval trailer carrying LF / CR and a forged ::error printed escaped, "
-    "with no log line read as a workflow command."
+    "with no log line read as a workflow command; (tr round 3) a second producer in the trusted "
+    "workflow, behind a quoted or flow job key, through a YAML anchor / alias (job, header, env), as the "
+    "trusted job's name or in the trusted header RED even with the trailer, while the real trusted shape "
+    "edited with the trailer and c8 jobs using &&, *) and ** stay GREEN; a name split across quoted "
+    "continuations, a symlinked workflow and a non-directory .github/workflows RED; U+2028, C1, % and an "
+    "oversized workflow's name escaped; inherited GIT_* ignored; every fetch bounded by FETCH_TIMEOUT within "
+    "the job, a failed or hung fetch an ::error naming the last fetch error, a failed head fetch stopping "
+    "before any merge fetch, and a destination ref from an earlier run deleted, never judged."
 )
 
 
