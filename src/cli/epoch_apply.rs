@@ -260,16 +260,13 @@ pub fn run(
     Ok(())
 }
 
-/// Decode a lowercase-hex string to bytes. Small local helper so the
-/// consumer has no hex-crate dependency in this path.
+/// Decode a hex string (either case) to bytes.
+///
+/// #4074 — decodes over BYTES (the `hex` crate): the signature is read from
+/// a file, and the old `&str` pair slicer panicked on a multi-byte code
+/// point and accepted a `+` sign as a hex digit.
 fn hex_decode(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        bail!("odd-length hex string");
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).context("invalid hex byte"))
-        .collect()
+    hex::decode(s).context("invalid hex string")
 }
 
 #[cfg(test)]

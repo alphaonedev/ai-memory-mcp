@@ -1888,14 +1888,11 @@ pub(crate) fn hmac_sha256_hex(key_hex: &str, body: &str) -> String {
     format!("{:x}", outer.finalize())
 }
 
+/// #4074 — decode over BYTES via the `hex` crate: an even-byte-length
+/// value carrying a multi-byte code point used to panic the `&str` pair
+/// slicer, and `from_str_radix` accepted a `+` sign as hex.
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
+    ::hex::decode(s).ok()
 }
 
 /// v0.7.0 #1048 (Agent-5 #8) — boot-time hex validator for the
