@@ -3089,7 +3089,9 @@ class CarrierRangeStep6117(_Scratch6117):
         # S-F4: no workflow pins the carrier release ref by hand; every carrier step and
         # the geometry step derive it from check_promotion_geometry.RELEASE.
         for name, text in load_all().items():
-            self.assertNotRegex(text, r"CARRIER_RELEASE_REF:\s*\S", name)
+            # An env key (`CARRIER_RELEASE_REF: <value>` at line start), not the
+            # `$CARRIER_RELEASE_REF:refs/...` refspec inside a fetch line.
+            self.assertNotRegex(text, r"(?m)^\s*CARRIER_RELEASE_REF:\s*\S", name)
         derive = "python3 scripts/check_promotion_geometry.py --print-release"
         for body in self.bodies() + [self.geometry_body()]:
             self.assertIn(derive, body)

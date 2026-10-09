@@ -87,7 +87,11 @@ on:
   # concurrency group below is keyed per event: both runs complete, neither is
   # cancelled. The classify arm below runs the FULL pipeline on a carrier push
   # so the push verdict is never narrower than the promotion PR's on the same
-  # SHA. Pinned by R-CHAIN / R-CHAIN-KEY in
+  # SHA. The two runs test the same tree, not only the same range: the push
+  # run tests HEAD, the PR run the merge tree, and the REQUIRED #3872 geometry
+  # step in c8-precheck.yml measures the carrier push as well (behind=0 means
+  # the merge tree IS the HEAD tree; a carrier behind release is red on both
+  # runs). Pinned by R-CHAIN / R-CHAIN-KEY in
   # scripts/test/test_workflow_pr_triggers_5447.py and by C4 of
   # scripts/test/test-ci-workflow-invariants.sh.
   push:
