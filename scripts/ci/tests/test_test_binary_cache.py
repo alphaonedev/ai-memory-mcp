@@ -250,6 +250,39 @@ class KeyStability(World):
         self.assertEqual(base['test:b'], after['test:b'])
 
 
+class OrphanSources6384H1(World):
+    """r1 H1: a .rs file no dep-info names (cfg-off module, orphan) is a run-time input."""
+
+    def keys(self):
+        exes = tbc.ptb.parse_build_json(self.bj.read_text().splitlines())
+        return tbc.compute_keys(exes, self.bj.read_text().splitlines(), self.root, self.rustc.read_text(),
+                                'test sal-postgres', ENV_ON)
+
+    def test_uncompiled_src_file_edit_moves_the_lib_key(self):
+        (self.root / 'src' / 'vectorlite.rs').write_text('// cfg(feature = "vectorlite") only\n')
+        k1, _ = self.keys()
+        (self.root / 'src' / 'vectorlite.rs').write_text('// cfg(feature = "vectorlite") only\nfn m() {}\n')
+        k2, _ = self.keys()
+        self.assertNotEqual(k1['lib:ai_memory'], k2['lib:ai_memory'])
+        self.assertNotEqual(k1['test:a'], k2['test:a'])
+
+    def test_orphan_tests_file_edit_moves_every_key(self):
+        (self.root / 'tests' / 'common').mkdir()
+        (self.root / 'tests' / 'common' / 'orphan.rs').write_text('fn o() {}\n')
+        k1, _ = self.keys()
+        (self.root / 'tests' / 'common' / 'orphan.rs').write_text('fn o() { 1 }\n')
+        k2, _ = self.keys()
+        for n in k1:
+            self.assertNotEqual(k1[n], k2[n], n)
+
+    def test_compiled_file_of_another_binary_still_leaves_non_scanner_alone(self):
+        base, _ = self.keys()
+        (self.root / 'tests' / 'a.rs').write_text('fn a() { 2 }\n')
+        after, _ = self.keys()
+        self.assertEqual(base['test:b'], after['test:b'])
+        self.assertEqual(base['lib:ai_memory'], after['lib:ai_memory'])
+
+
 class Policy(unittest.TestCase):
     def test_allowed_matrix(self):
         on = {'CI_TEST_BINARY_CACHE': '1'}
