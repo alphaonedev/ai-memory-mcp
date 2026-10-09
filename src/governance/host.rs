@@ -28,9 +28,14 @@
 //!   delimiters `/ \ ? # @ %` and `<>^|`.
 //! * IPv4 literals are the WHATWG dotted quad (so `127.1` and `127.000.000.001`
 //!   canonicalise to `127.0.0.1`, exactly the address a client would dial);
-//!   IPv6 literals are bracketed and compressed (`[::1]`). An IPv4-mapped
-//!   IPv6 literal (`::ffff:a.b.c.d` or its hex form) canonicalises to the IPv4
-//!   dotted quad on BOTH sides, so each spelling matches the other (#4415).
+//!   IPv6 literals are bracketed and compressed (`[::1]`). An IPv6 literal
+//!   whose embedded IPv4 is the DESTINATION — IPv4-mapped `::ffff:a.b.c.d`
+//!   (#4415), the NAT64 well-known prefix `64:ff9b::a.b.c.d` (RFC 6052) and
+//!   the IPv4-translated `::ffff:0:a.b.c.d` (RFC 2765) — canonicalises to the
+//!   IPv4 dotted quad on BOTH sides, so each spelling matches the other
+//!   (#4426). 6to4 `2002::/16`, the local-use NAT64 prefix `64:ff9b:1::/48`
+//!   and the deprecated IPv4-compatible `::a.b.c.d` stay distinct IPv6 hosts
+//!   (see `embedded_ipv4_destination` for why each is excluded).
 //! * An optional `:port` suffix is parsed (digits, `u16`, leading zeros
 //!   stripped) into [`CanonHost::port`]; see "Ports" below.
 //!
@@ -302,9 +307,10 @@ fn canonical_host_part(host: &str, allow_star: bool) -> Result<String, HostCanon
             .and_then(|h| h.strip_suffix(']'))
             .unwrap_or(host);
         let addr: Ipv6Addr = inner.parse().map_err(|_| HostCanonError::BadIp)?;
-        // #4415 — an IPv4-mapped IPv6 literal reaches the same endpoint as
-        // the IPv4 address: unify both spellings on the dotted quad.
-        if let Some(v4) = addr.to_ipv4_mapped() {
+        // #4415 / #4426 — an IPv6 literal that carries an embedded IPv4
+        // DESTINATION reaches the same endpoint as the IPv4 address: unify
+        // both spellings on the dotted quad.
+        if let Some(v4) = embedded_ipv4_destination(addr) {
             return Ok(v4.to_string());
         }
         return Ok(format!("[{addr}]"));
@@ -320,6 +326,46 @@ fn canonical_host_part(host: &str, allow_star: bool) -> Result<String, HostCanon
     let canon = parse_domain_or_ipv4(host)?;
     check_lengths(&canon)?;
     Ok(canon)
+}
+
+/// The RFC 6052 well-known NAT64 prefix `64:ff9b::/96`, as its leading
+/// six 16-bit groups.
+const NAT64_WELL_KNOWN_PREFIX: [u16; 6] = [0x64, 0xff9b, 0, 0, 0, 0];
+/// The RFC 2765 (SIIT) IPv4-translated prefix `::ffff:0:0/96`.
+const IPV4_TRANSLATED_PREFIX: [u16; 6] = [0, 0, 0, 0, 0xffff, 0];
+
+/// #4415 / #4426 — the IPv4 address an IPv6 literal DELIVERS TO, when the
+/// literal is one of the forms whose embedded IPv4 is the destination:
+///
+/// * IPv4-mapped `::ffff:a.b.c.d` (#4415);
+/// * the NAT64 well-known prefix `64:ff9b::a.b.c.d` (RFC 6052 §2.1): on a
+///   network with a NAT64 gateway the packet is translated to the embedded
+///   public IPv4 address;
+/// * the IPv4-translated `::ffff:0:a.b.c.d` (RFC 2765 §2.1, SIIT), reserved
+///   and never a routable IPv6 host of its own.
+///
+/// Deliberately NOT unified (treated as distinct IPv6 hosts), so a rule
+/// author can still name them as such:
+///
+/// * 6to4 `2002::/16` — the embedded IPv4 is the 6to4 relay / site address,
+///   not the destination host;
+/// * the local-use NAT64 prefix `64:ff9b:1::/48` (RFC 8215) and any
+///   operator-chosen NAT64 prefix — the embedding layout is deployment
+///   specific and cannot be decoded here;
+/// * the deprecated IPv4-compatible `::a.b.c.d` (RFC 4291 §2.5.5.1) — its
+///   space contains `::` and `::1`, so decoding it would rewrite loopback.
+fn embedded_ipv4_destination(addr: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = addr.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let seg = addr.segments();
+    let prefix = [seg[0], seg[1], seg[2], seg[3], seg[4], seg[5]];
+    if prefix == NAT64_WELL_KNOWN_PREFIX || prefix == IPV4_TRANSLATED_PREFIX {
+        let [a, b] = seg[6].to_be_bytes();
+        let [c, d] = seg[7].to_be_bytes();
+        return Some(Ipv4Addr::new(a, b, c, d));
+    }
+    None
 }
 
 /// Run the host through the WHATWG URL host parser (the parser every outbound
