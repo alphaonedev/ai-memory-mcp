@@ -392,7 +392,7 @@ pub(crate) fn default_base_url_for_alias(alias: &str) -> Option<&'static str> {
 /// health probe, the model-pull listings, and the `ai-memory doctor`
 /// reachability probes (#1598 literal-dedup).
 pub(crate) fn ollama_tags_url(base_url: &str) -> String {
-    format!("{base_url}/api/tags")
+    join_api_path(base_url, "/api/tags")
 }
 
 /// Per-alias environment-variable fallback for the API key. Lets
@@ -700,9 +700,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// v0.7.0 F6 — health-probe timeout. Quick check at /api/tags.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// #3742 — the one way a request URL is joined onto a configured base URL
+/// (query string preserved).
+mod api_url;
 /// #4193 — the one posture-aware reqwest builder every inference client
 /// starts from (proxies refused + redirects disabled outside `allow`).
 mod egress_policy;
+pub use api_url::join_api_path;
+
+/// OpenAI-compatible model listing path (the health probe), joined onto the
+/// base URL by [`join_api_path`] here and in the `doctor` reachability probe.
+pub const OPENAI_COMPAT_MODELS_PATH: &str = "/models";
+/// Ollama model-pull path, joined onto the base URL by [`join_api_path`].
+const OLLAMA_PULL_PATH: &str = "/api/pull";
 
 /// v1.0.0 #3140 — multiplier applied to the largest *inner* reqwest
 /// timeout of a call to derive that call's **bridge budget**, the outer
@@ -1882,9 +1892,10 @@ impl OllamaClient {
     pub async fn is_available_async(&self) -> bool {
         let (url, bearer) = match &self.provider {
             LlmProvider::Ollama => (ollama_tags_url(&self.base_url), None),
-            LlmProvider::OpenAiCompatible { api_key } => {
-                (format!("{}/models", self.base_url), Some(api_key.as_str()))
-            }
+            LlmProvider::OpenAiCompatible { api_key } => (
+                join_api_path(&self.base_url, OPENAI_COMPAT_MODELS_PATH),
+                Some(api_key.as_str()),
+            ),
         };
         let mut req = self.client.get(&url).timeout(HEALTH_TIMEOUT);
         if let Some(key) = bearer {
@@ -1957,7 +1968,7 @@ impl OllamaClient {
             self.model
         );
 
-        let pull_url = format!("{}/api/pull", self.base_url);
+        let pull_url = join_api_path(&self.base_url, OLLAMA_PULL_PATH);
         let pull_client = reqwest::Client::builder()
             .timeout(PULL_TIMEOUT)
             .build()
@@ -2037,7 +2048,7 @@ impl OllamaClient {
                 }
                 messages.push(json!({"role": "user", "content": prompt}));
                 (
-                    self.base_url.clone() + OLLAMA_CHAT_PATH,
+                    join_api_path(&self.base_url, OLLAMA_CHAT_PATH),
                     json!({
                         "model": self.model,
                         "messages": messages,
@@ -2053,7 +2064,7 @@ impl OllamaClient {
                 }
                 messages.push(json!({"role": "user", "content": prompt}));
                 (
-                    self.base_url.clone() + OPENAI_CHAT_PATH,
+                    join_api_path(&self.base_url, OPENAI_CHAT_PATH),
                     json!({
                         "model": self.model,
                         "messages": messages,
@@ -2196,7 +2207,7 @@ impl OllamaClient {
                 if !tools.is_empty() {
                     body["tools"] = Value::Array(tools.iter().map(ToolDef::to_wire).collect());
                 }
-                (self.base_url.clone() + OLLAMA_CHAT_PATH, body, None)
+                (join_api_path(&self.base_url, OLLAMA_CHAT_PATH), body, None)
             }
             LlmProvider::OpenAiCompatible { api_key } => {
                 let mut messages = Vec::new();
@@ -2213,7 +2224,7 @@ impl OllamaClient {
                     body["tools"] = Value::Array(tools.iter().map(ToolDef::to_wire).collect());
                 }
                 (
-                    self.base_url.clone() + OPENAI_CHAT_PATH,
+                    join_api_path(&self.base_url, OPENAI_CHAT_PATH),
                     body,
                     Some(api_key.as_str()),
                 )
@@ -2466,7 +2477,7 @@ impl OllamaClient {
                 }
                 messages.push(json!({"role": "user", "content": prompt}));
                 (
-                    self.base_url.clone() + OLLAMA_CHAT_PATH,
+                    join_api_path(&self.base_url, OLLAMA_CHAT_PATH),
                     json!({"model": model, "messages": messages, "stream": false}),
                     None,
                 )
@@ -2478,7 +2489,7 @@ impl OllamaClient {
                 }
                 messages.push(json!({"role": "user", "content": prompt}));
                 (
-                    self.base_url.clone() + OPENAI_CHAT_PATH,
+                    join_api_path(&self.base_url, OPENAI_CHAT_PATH),
                     json!({"model": model, "messages": messages, "stream": false}),
                     Some(api_key.as_str()),
                 )
@@ -2624,7 +2635,7 @@ impl OllamaClient {
             ));
         }
         self.check_outbound()?;
-        let url = format!("{}/api/generate", self.base_url);
+        let url = join_api_path(&self.base_url, "/api/generate");
         let resp = match self
             .client
             .post(&url)
@@ -2788,7 +2799,7 @@ impl OllamaClient {
             // all; the client-side `EMBED_MAX_BYTES` guard still caps
             // pathological inputs before they are sent.
             LlmProvider::Ollama => (
-                format!("{}/api/embed", self.base_url),
+                join_api_path(&self.base_url, "/api/embed"),
                 json!({"model": embed_model, "input": text, "truncate": true}),
                 None,
             ),
@@ -2799,7 +2810,7 @@ impl OllamaClient {
             // pgvector `vector(768)` fleet schemas + ANN indexes
             // (<=2000-dim limit) usable with high-dim API models.
             LlmProvider::OpenAiCompatible { api_key } => (
-                format!("{}{}", self.base_url, OPENAI_COMPAT_EMBEDDINGS_PATH),
+                join_api_path(&self.base_url, OPENAI_COMPAT_EMBEDDINGS_PATH),
                 match self.embed_dimensions {
                     Some(dims) => {
                         json!({"model": embed_model, "input": text, "dimensions": dims})
@@ -3118,7 +3129,7 @@ impl OllamaClient {
         }
 
         tracing::info!("Pulling Ollama embedding model '{}'...", model);
-        let pull_url = format!("{}/api/pull", self.base_url);
+        let pull_url = join_api_path(&self.base_url, OLLAMA_PULL_PATH);
         let pull_client = reqwest::Client::builder()
             .timeout(PULL_TIMEOUT)
             .build()

@@ -143,12 +143,13 @@ fn doctor_llm_facts_render_the_base_url_from_the_allowlist_3667() {
             let parsed: serde_json::Value =
                 serde_json::from_str(&out).expect("doctor --json is one JSON document");
             let facts = parsed.to_string();
-            // The probe is `<base_url>/models` (the client's own join); a
-            // base URL carrying a query puts `/models` after it, so the
-            // allowlist rendering is the origin + the base path.
+            // The probe is `<base path>/models` (the client's own join). #3742
+            // — the base URL's query string stays AFTER the joined path, so
+            // the allowlist rendering (origin + path, never the query) shows
+            // the full probe path, not the base path cut at the query.
             assert!(
-                facts.contains("\"probe_url\"") && facts.contains("https://127.0.0.1:9/v1"),
-                "#3667: probe_url renders origin + path only:\n{facts}"
+                facts.contains("\"probe_url\"") && facts.contains("https://127.0.0.1:9/v1/models"),
+                "#3667/#3742: probe_url renders origin + the joined path only:\n{facts}"
             );
             assert!(
                 facts.contains("\"error\"") && facts.contains("network"),
@@ -157,8 +158,8 @@ fn doctor_llm_facts_render_the_base_url_from_the_allowlist_3667() {
             assert_clean(&facts, "doctor --json document");
         } else {
             assert!(
-                out.contains("error contacting https://127.0.0.1:9/v1"),
-                "the note names the probe from the allowlist:\n{out}"
+                out.contains("error contacting https://127.0.0.1:9/v1/models"),
+                "the note names the joined probe from the allowlist (#3742):\n{out}"
             );
         }
     }
