@@ -411,6 +411,39 @@ impl WakeStream {
         })
     }
 
+    /// A stream whose ONLY producer besides the test is the production
+    /// backstop, so a test can inject hub-shaped signals (an empty welcome, a
+    /// wake) against the real backstop clock (#4058). Test-only: nothing in
+    /// the product can hand-craft a hub signal.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start`].
+    #[cfg(test)]
+    pub(crate) fn start_injectable(
+        cfg: WakeClientConfig,
+    ) -> Result<(Self, mpsc::Sender<WakeSignal>)> {
+        cfg.validate()?;
+        let (tx, rx) = mpsc::channel::<WakeSignal>(SIGNAL_QUEUE_DEPTH);
+        let read_done = Arc::new(Notify::new());
+        let metrics = Arc::new(ClientMetrics::default());
+        let backstop = {
+            let tx = tx.clone();
+            let read_done = Arc::clone(&read_done);
+            let metrics = Arc::clone(&metrics);
+            tokio::spawn(backstop_loop(cfg.poll_interval, tx, read_done, metrics))
+        };
+        Ok((
+            Self {
+                rx,
+                read_done,
+                metrics,
+                tasks: vec![backstop],
+            },
+            tx,
+        ))
+    }
+
     /// This listener's live counters.
     #[must_use]
     pub fn metrics(&self) -> Arc<ClientMetrics> {
