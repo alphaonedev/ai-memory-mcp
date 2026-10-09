@@ -4,7 +4,7 @@
 (docs/compliance/MISSION-CRITICAL-CERTIFICATION-STANDARD-v1.md, §4 and §5) written as
 the step-by-step procedure a wave follows. The rules are reproduced verbatim below; the
 procedure adds only the order of operations and the record shapes.
-Erratum (#6141): N30's enforcer `check-cert-expiry.sh` is `scripts/check_cert_expiry.py` since #6137; behaviour on push events is byte-identical. The same erratum covers every historical mention in docs/compliance/. -->
+Erratum (#6141): N30's enforcer `check-cert-expiry.sh` is `scripts/check_cert_expiry.py` since #6137; its verdict and output are identical on every push payload GitHub Actions delivers, and it fails closed on malformed SHAs, CERT_EXPIRY_* overrides (#5970) or git < 2.30. The same erratum covers the historical mentions in docs/compliance/ listed in scripts/qc-allowlists/compliance-script-names-allow.txt. -->
 
 ## The rules (verbatim from the standard)
 
