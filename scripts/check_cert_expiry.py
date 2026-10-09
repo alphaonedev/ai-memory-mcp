@@ -824,7 +824,8 @@ def run_gate_shimmed(tmp, repo, env, version="", fail=""):
         # #6178: the PATH entry would be split and the real git would run.
         shutil.rmtree(shim_dir, ignore_errors=True)
         raise GateError(f"the scratch path {str(shim_dir)!r} contains the PATH separator "
-                        f"{os.pathsep!r}; the git shim would be unreachable")
+                        f"{os.pathsep!r}; the git shim would be unreachable (run the self-test "
+                        f"from a checkout whose path has no {os.pathsep!r})")
     shim = shim_dir / "git"
     shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version=version,
                                     fail=fail), encoding="utf-8")
