@@ -148,6 +148,197 @@ fn substitute_placeholders(
     }
 }
 
+/// #3369 — the closed `type` vocabulary a frozen parameter may declare.
+const PARAMETER_TYPES: [&str; 7] = [
+    "string", "number", "integer", "boolean", "object", "array", "any",
+];
+
+/// #3369 — one declared parameter, normalised from either `parameters`
+/// shape (see [`validate_arguments_against_parameters`]).
+struct DeclaredParameter {
+    name: String,
+    required: bool,
+    ty: Option<String>,
+}
+
+/// #3369 — read one parameter SPEC (`true` / `false` / `null` / an object
+/// with optional `required` + `type`) for `name`.
+fn declared_parameter_from_spec(name: &str, spec: &Value) -> Result<DeclaredParameter, String> {
+    let (required, ty) = match spec {
+        Value::Bool(required) => (*required, None),
+        Value::Null => (false, None),
+        Value::Object(map) => {
+            let required = match map.get("required") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    return Err(format!(
+                        "routine parameter '{name}' has a non-boolean `required` flag"
+                    ));
+                }
+            };
+            let ty = match map.get("type") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(t)) if PARAMETER_TYPES.contains(&t.as_str()) => Some(t.clone()),
+                Some(Value::String(t)) => {
+                    return Err(format!(
+                        "routine parameter '{name}' declares unsupported type '{t}' \
+                         (supported: {})",
+                        PARAMETER_TYPES.join(", ")
+                    ));
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "routine parameter '{name}' has a non-string `type`"
+                    ));
+                }
+            };
+            (required, ty)
+        }
+        _ => {
+            return Err(format!(
+                "routine parameter '{name}' must be declared as a boolean, null or an object"
+            ));
+        }
+    };
+    Ok(DeclaredParameter {
+        name: name.to_string(),
+        required,
+        ty,
+    })
+}
+
+/// #3369 — normalise the frozen `parameters` declaration. Two shapes are
+/// accepted, both already in the wild: a JSON ARRAY of names (`["t"]`, every
+/// name REQUIRED — the array form has no way to say otherwise) or of
+/// `{name, required?, type?}` objects; or a JSON OBJECT keyed by name whose
+/// value is a spec (`{"t": {"required": true, "type": "integer"}}`,
+/// `{"t": true}`). `null` / an empty value declares nothing. Any other
+/// shape is refused (fail-closed: the declaration was attested at freeze,
+/// so an unreadable one must not silently enforce nothing).
+fn declared_parameters(parameters: &Value) -> Result<Vec<DeclaredParameter>, String> {
+    match parameters {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| match item {
+                Value::String(name) if !name.trim().is_empty() => Ok(DeclaredParameter {
+                    name: name.clone(),
+                    required: true,
+                    ty: None,
+                }),
+                Value::Object(map) => {
+                    let name = map
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|n| !n.trim().is_empty())
+                        .ok_or_else(|| {
+                            format!("routine parameters[{i}] must carry a non-empty string `name`")
+                        })?;
+                    declared_parameter_from_spec(name, item)
+                }
+                _ => Err(format!(
+                    "routine parameters[{i}] must be a parameter name or a {{name, required, type}} object"
+                )),
+            })
+            .collect(),
+        Value::Object(map) => map
+            .iter()
+            .map(|(name, spec)| declared_parameter_from_spec(name, spec))
+            .collect(),
+        _ => Err("routine parameters must be a JSON array or object".to_string()),
+    }
+}
+
+/// #3369 — does `value` satisfy the declared `type` token?
+fn argument_matches_type(value: &Value, ty: &str) -> bool {
+    match ty {
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "boolean" => value.is_boolean(),
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        _ => true,
+    }
+}
+
+/// #3369 — enforce the frozen `parameters` declaration against the run's
+/// `arguments`: every `required` parameter must be present (JSON `null`
+/// does not count as supplied) and every supplied declared parameter must
+/// match its declared `type`. Undeclared arguments are admitted (the
+/// pre-#3369 default declaration is `[]`); an unbound placeholder is caught
+/// separately by [`find_unresolved_placeholder`].
+///
+/// # Errors
+/// A refusal string naming the offending parameter.
+pub(crate) fn validate_arguments_against_parameters(
+    parameters: &Value,
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    for param in declared_parameters(parameters)? {
+        match arguments.get(&param.name) {
+            None | Some(Value::Null) if param.required => {
+                return Err(format!(
+                    "routine run is missing required parameter '{}' (declared in the \
+                     frozen parameters)",
+                    param.name
+                ));
+            }
+            Some(value) => {
+                if let Some(ty) = &param.ty
+                    && !value.is_null()
+                    && !argument_matches_type(value, ty)
+                {
+                    return Err(format!(
+                        "routine argument '{}' must be of type {ty} (declared in the frozen \
+                         parameters)",
+                        param.name
+                    ));
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// #3369 — the first `{{name}}` placeholder still present anywhere in
+/// `value` after substitution (strings, recursively through arrays and
+/// objects, including object keys). A placeholder name is a non-empty run
+/// of `[A-Za-z0-9_.-]` between `{{` and `}}`, optionally padded with
+/// whitespace; braces around anything else are plain text.
+fn find_unresolved_placeholder(value: &Value) -> Option<String> {
+    fn in_str(s: &str) -> Option<String> {
+        let mut rest = s;
+        while let Some(start) = rest.find("{{") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find("}}") else {
+                return None;
+            };
+            let name = after[..end].trim();
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+            {
+                return Some(name.to_string());
+            }
+            rest = &after[end + 2..];
+        }
+        None
+    }
+    match value {
+        Value::String(s) => in_str(s),
+        Value::Array(items) => items.iter().find_map(find_unresolved_placeholder),
+        Value::Object(map) => map
+            .iter()
+            .find_map(|(k, v)| in_str(k).or_else(|| find_unresolved_placeholder(v))),
+        _ => None,
+    }
+}
+
 pub(crate) fn plan(
     routine: &Routine,
     arguments: &Value,
@@ -173,6 +364,11 @@ pub(crate) fn plan(
     let arguments = arguments
         .as_object()
         .ok_or_else(|| "arguments must be a JSON object".to_string())?;
+    // #3369 — the frozen `parameters` declaration is signed into the freeze
+    // attestation; honour it before any substitution so a missing required
+    // parameter or a wrongly-typed argument refuses the run instead of
+    // silently materialising literal `{{placeholder}}` text.
+    validate_arguments_against_parameters(&routine.parameters, arguments)?;
     let template = routine
         .template
         .as_object()
@@ -236,6 +432,29 @@ pub(crate) fn plan(
                 .map_err(|e| e.to_string())?
                 .unwrap_or_else(|| json!({}));
             let priority = crate::mcp::param_guard::optional_i64(spec, "priority")?.unwrap_or(0);
+            let metadata = spec_obj
+                .get("metadata")
+                .map(|v| substitute_field(v, arguments, "metadata"))
+                .transpose()
+                .map_err(|e| e.to_string())?
+                .unwrap_or_else(|| json!({}));
+
+            // #3369 — a placeholder the arguments did not bind must never
+            // land as literal `{{name}}` text: refuse the whole run (atomic;
+            // nothing is inserted yet) naming the placeholder and the field.
+            for (field, value) in [
+                ("kind", &Value::String(kind.clone())),
+                ("title", &Value::String(title.clone())),
+                ("payload", &payload),
+                ("metadata", &metadata),
+            ] {
+                if let Some(name) = find_unresolved_placeholder(value) {
+                    return Err(format!(
+                        "unresolved placeholder '{{{{{name}}}}}' in template action [{i}] \
+                         field `{field}`: pass `{name}` in arguments"
+                    ));
+                }
+            }
 
             let action = Action {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -248,12 +467,7 @@ pub(crate) fn plan(
                 agent_id: Some(actor.clone()),
                 claimed_by: None,
                 vector_clock: json!({}),
-                metadata: spec_obj
-                    .get("metadata")
-                    .map(|v| substitute_field(v, arguments, "metadata"))
-                    .transpose()
-                    .map_err(|e| e.to_string())?
-                    .unwrap_or_else(|| json!({})),
+                metadata,
                 created_at: now,
                 updated_at: now,
             };
