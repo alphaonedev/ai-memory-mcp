@@ -46,7 +46,9 @@ or an unreadable (non-UTF-8 / I/O error) compliance document or allowlist.
 import argparse
 import contextlib
 import io
+import os
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -206,6 +208,9 @@ def self_test():
         if not cond:
             fails.append(msg)
 
+    skipped = []
+    euid = getattr(os, "geteuid", lambda: "n/a")()
+
     with tempfile.TemporaryDirectory(dir=str(scratch)) as d:
         root = Path(d)
         (root / "scripts" / "qc-allowlists").mkdir(parents=True)
@@ -275,6 +280,21 @@ def self_test():
             any(":pinned" in p and "A.md" in p for p in check(root)),
             "#6173: ':pinned' on a document outside PINNABLE_DOCS was accepted",
         )
+        # S1 (security R5): PINNABLE_DOCS compares full paths, never basenames.
+        (root / "docs" / "compliance" / "sub").mkdir()
+        sub = root / "docs" / "compliance" / "sub" / "v1.0.0-DECLARATION.md"
+        sub.write_text(stale)
+        doc.write_text(stale + erratum)
+        allow.write_text(
+            "docs/compliance/A.md:check-old.sh\n"
+            "docs/compliance/sub/v1.0.0-DECLARATION.md:check-old.sh:pinned\n"
+        )
+        expect(
+            any(":pinned not permitted" in p for p in check(root)),
+            "R6-S1: :pinned on a subfolder look-alike of a PINNABLE_DOCS basename was accepted",
+        )
+        sub.unlink()
+        (root / "docs" / "compliance" / "sub").rmdir()
         doc.write_text(stale + erratum)
         decl.write_text(stale + erratum)
         allow.write_text("docs/compliance/v1.0.0-DECLARATION.md:check-old.sh:pinned\n")
@@ -340,6 +360,14 @@ def self_test():
         allow.write_text("docs/compliance/A.md:check-old.sh\n")
         doc.write_text(stale % "check-old.sh" + "N30 now uses `scripts/check_new.py` instead of `check-old.sh`.\n")
         expect(check(root), "R5-M11: a successor line without the word erratum was accepted")
+        # S2 (security R5): a backticked scripts/-prefixed stale name is flagged.
+        allow.write_text("")
+        doc.write_text("N30 enforcer is `scripts/check-old.sh`.\n")
+        expect(check(root), "R6-S2: stale scripts/-prefixed name was accepted")
+        # S6 (security R5): the word "erratum" must be on the line naming the stale name and successor.
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+        doc.write_text("Erratum (see below).\n" + stale % "check-old.sh" + "`check-old.sh` is `scripts/check_new.py`.\n")
+        expect(check(root), "R6-S6: erratum word on a different line from the successor was accepted")
         # M12: an erratum alone never clears a stale name; the allowlist entry is required.
         allow.write_text("")
         doc.write_text(stale % "check-old.sh" + erratum)
@@ -347,6 +375,31 @@ def self_test():
         allow.write_text("docs/compliance/A.md:check-old.sh\n")
         doc.write_text("N30 enforcer is `check-old.sh`.\n")
 
+        # R6 review: exit code, scripts/-prefixed tokens, scripts/-only resolution, ledger hygiene.
+        allow.write_text("")
+        doc.write_text("N30 enforcer is `check-old.sh`.\n")
+        rc, err = run_main(root)
+        expect(rc == 1 and "FAIL " in err, "R6-R1: violation tree: expected exit 1 with FAIL lines, got %r" % (rc,))
+        doc.write_text("See `check_new.py`.\n")
+        rc, _ = run_main(root)
+        expect(rc == 0, "R6-R1: clean tree: expected exit 0, got %r" % (rc,))
+        doc.write_text("N30 enforcer is `scripts/check-gone.sh`.\n")
+        expect(any("scripts/check-gone.sh" in p for p in check(root)),
+               "R6-R2: stale scripts/-prefixed name was accepted")
+        (root / "check-gone.sh").write_text("")
+        (root / "scripts" / "check-dir.sh").mkdir()
+        doc.write_text("N30 is `check-gone.sh` and `check-dir.sh`.\n")
+        probs = check(root)
+        expect(any("check-gone.sh" in p for p in probs), "R6-R14: name resolving only outside scripts/ was accepted")
+        expect(any("check-dir.sh" in p for p in probs), "R6-R14: name resolving to a directory was accepted")
+        (root / "check-gone.sh").unlink()
+        (root / "scripts" / "check-dir.sh").rmdir()
+        doc.write_text("N30 enforcer is `check-old.sh`.\n" + erratum)
+        allow.write_text("docs/compliance/A.md:check-old.sh\njunk # note\n")
+        expect(any("malformed allowlist entry" in p for p in check(root)),
+               "R6-R18: malformed line containing '#' was accepted")
+        allow.write_text("  docs/compliance/A.md:check-old.sh  \n")
+        expect(not check(root), "R6-R9: whitespace-padded allowlist entry was rejected")
         allow.write_text("")
         doc.write_text("See `check_new.py` and `scripts/check_new.py`.\n")
         expect(not check(root), "resolving names were rejected")
@@ -356,6 +409,197 @@ def self_test():
         rc, err = run_main(root)
         expect(rc == 2, "non-UTF-8 doc: expected exit 2, got %r" % (rc,))
         expect("A.md: unreadable" in err, "non-UTF-8 doc: missing 'unreadable' line (stderr=%r)" % err)
+
+        # Round 6 (#6169 #6195 #6196 #6197 #6198 #6199): each cell builds its own tree under ``root``.
+        def fresh(name):
+            r = root / name
+            (r / "scripts" / "qc-allowlists").mkdir(parents=True)
+            (r / "docs" / "compliance").mkdir(parents=True)
+            (r / "scripts" / "check_new.py").write_text("")
+            (r / ALLOW_REL).write_text("")
+            return r
+
+        def try_symlink(link, target, label):
+            try:
+                link.symlink_to(target)
+            except OSError as exc:
+                skipped.append("%s (symlink unsupported: %s)" % (label, exc))
+                return False
+            return True
+
+        def denied_rc(target, sroot, label, needle):
+            mode = target.stat().st_mode & 0o7777
+            target.chmod(0)
+            try:
+                if os.access(str(target), os.R_OK):
+                    skipped.append("%s (chmod 000 does not deny access to euid %s)" % (label, euid))
+                    return
+                rc, err = run_main(sroot)
+            finally:
+                target.chmod(mode)
+            expect(
+                rc == 2 and needle in err,
+                "%s: expected exit 2 with %r, got %r (stderr=%r)" % (label, needle, rc, err),
+            )
+
+        stale_line = "N30 enforcer is `check-old.sh`.\n"
+        # #6169: an unreadable directory, document or allowlist in the scan set exits 2, never 'ok'.
+        r = fresh("u-dir")
+        (r / "docs" / "compliance" / "locked").mkdir()
+        (r / "docs" / "compliance" / "locked" / "X.md").write_text(stale_line)
+        denied_rc(r / "docs" / "compliance" / "locked", r, "#6169-dir", "docs/compliance/locked: unreadable")
+        r = fresh("u-file")
+        (r / "docs" / "compliance" / "C.md").write_text(stale_line)
+        denied_rc(r / "docs" / "compliance" / "C.md", r, "#6169-file", "docs/compliance/C.md: unreadable")
+        r = fresh("u-allow")
+        denied_rc(r / "scripts" / "qc-allowlists", r, "#6169-allowlist", ALLOW_REL + ": unreadable")
+        r = fresh("u-missing")
+        (r / "docs" / "compliance").rmdir()
+        rc, err = run_main(r)
+        expect(
+            rc == 2 and "docs/compliance: unreadable" in err,
+            "#6169-missing: missing docs/compliance: expected exit 2, got %r (stderr=%r)" % (rc, err),
+        )
+
+        # #6197: '.MD' documents are scanned; symlinked directories and escaping document symlinks are refused.
+        r = fresh("s-md")
+        (r / "docs" / "compliance" / "N.MD").write_text(stale_line)
+        (r / "docs" / "compliance" / "M.Md").write_text(stale_line)
+        probs = check(r)
+        expect(any("N.MD" in p and "check-old.sh" in p for p in probs), "#6197-MD: stale name in a .MD document was accepted")
+        expect(any("M.Md" in p and "check-old.sh" in p for p in probs), "#6197-Md: stale name in a .Md document was accepted")
+        r = fresh("s-link")
+        (r / "elsewhere").mkdir()
+        (r / "elsewhere" / "X.md").write_text(stale_line)
+        if try_symlink(r / "docs" / "compliance" / "linked", r / "elsewhere", "#6197-dir"):
+            expect(
+                any("docs/compliance/linked" in p and "symlinked directory" in p for p in check(r)),
+                "#6197-dir: a symlinked subdirectory was not refused",
+            )
+        r = fresh("s-top")
+        (r / "docs" / "compliance").rmdir()
+        (r / "real").mkdir()
+        (r / "real" / "X.md").write_text(stale_line)
+        if try_symlink(r / "docs" / "compliance", r / "real", "#6197-top"):
+            expect(
+                any("docs/compliance" in p and "symlinked directory" in p for p in check(r)),
+                "#6197-top: a symlinked docs/compliance was not refused",
+            )
+        r = fresh("s-escape")
+        (root / "ext.md").write_text("Nothing stale here.\n")
+        if try_symlink(r / "docs" / "compliance" / "E.md", root / "ext.md", "#6197-escape"):
+            expect(
+                any("E.md" in p and "outside the repository" in p for p in check(r)),
+                "#6197-escape: a document symlink leaving the repository was not refused",
+            )
+        r = fresh("s-inside")
+        (r / "notes.md").write_text(stale_line)
+        if try_symlink(r / "docs" / "compliance" / "I.md", r / "notes.md", "#6197-inside"):
+            expect(
+                any("I.md" in p and "check-old.sh" in p for p in check(r)),
+                "#6197-inside: a document symlink inside the repository was not scanned",
+            )
+
+        # #6198: a cited name resolves only to that exact path under scripts/, contained in scripts/.
+        allow.write_text("")
+        (root / "scripts" / "fixtures").mkdir()
+        (root / "scripts" / "fixtures" / "check-nest.sh").write_text("")
+        doc.write_text("N30 enforcer is `check-nest.sh`.\n")
+        expect(any("check-nest.sh" in p for p in check(root)), "#6198-nested: a nested look-alike cleared a stale name")
+        if try_symlink(root / "scripts" / "check-esc.sh", root / "outside.py", "#6198-escape"):
+            doc.write_text("N30 enforcer is `check-esc.sh`.\n")
+            expect(any("check-esc.sh" in p for p in check(root)), "#6198-escape: a symlink escaping scripts/ cleared a stale name")
+            (root / "scripts" / "check-esc.sh").unlink()
+        (root / "scripts" / "sub").mkdir()
+        (root / "scripts" / "sub" / "check_sub.py").write_text("")
+        doc.write_text("Runs `scripts/sub/check_sub.py` and `scripts/fixtures/check-nest.sh`.\n")
+        expect(not check(root), "#6198-exact: an exact scripts/<subdir>/ path was rejected")
+        if try_symlink(root / "scripts" / "check-alias.sh", root / "scripts" / "check_new.py", "#6198-alias"):
+            doc.write_text("N30 enforcer is `check-alias.sh`.\n")
+            expect(not check(root), "#6198-alias: a symlink inside scripts/ was rejected")
+            (root / "scripts" / "check-alias.sh").unlink()
+
+        # #6195: the stale name is found anywhere on a line, after removing invisible format characters.
+        hidden = {
+            "soft hyphen": "N30 enforcer is `check-ol­d.sh`.\n",
+            "ZWSP": "N30 enforcer is `check-​old.sh`.\n",
+            "ZWNJ": "N30 enforcer is `check-old‌.sh`.\n",
+            "fenced block": "Run:\n\n```\nbash check-old.sh --verify\n```\n",
+            "bash scripts/": "Run `bash scripts/check-old.sh`.\n",
+            "./scripts/": "Run `./scripts/check-old.sh`.\n",
+            "scripts/<subdir>/": "Run `scripts/sub/check-old.sh`.\n",
+            "bare prose": "The enforcer check-old.sh runs on every push.\n",
+            "URL": "See https://github.com/o/r/blob/main/scripts/check-old.sh for N30.\n",
+        }
+        for label, text in sorted(hidden.items()):
+            doc.write_text(text)
+            expect(any("check-old.sh" in p for p in check(root)), "#6195-%s: stale name was accepted" % label)
+        doc.write_text(
+            "Run `bash scripts/check_new.py`, `./scripts/check_new.py` and check_new.py;\n"
+            "see https://github.com/o/r/blob/main/scripts/check_new.py and `check_​new.py`.\n"
+        )
+        expect(not check(root), "#6195-resolving: resolving names in prefixed forms were rejected")
+
+        # #6196: an erratum hidden in an HTML comment never clears a stale name.
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+        for label, text in (
+            ("one-line comment", stale_line + "<!-- " + erratum.strip() + " -->\n"),
+            ("multi-line comment", stale_line + "<!-- header\n" + erratum + "-->\n"),
+            ("comment opened earlier on the line", stale_line + "<!-- x " + erratum),
+        ):
+            doc.write_text(text)
+            expect(check(root), "#6196-%s: an erratum inside an HTML comment was accepted" % label)
+        for label, text in (
+            ("after a closed comment", stale_line + "<!-- header -->\n" + erratum),
+            ("after a close on the same line", stale_line + "<!-- a\nb --> " + erratum),
+        ):
+            doc.write_text(text)
+            expect(not check(root), "#6196-%s: a visible erratum was rejected" % label)
+
+        # #6199: a fixture setup failure exits 2 with 'SELF-TEST FAIL: fixture setup', never a traceback.
+        gate_src = Path(__file__).read_text(encoding="utf-8")
+
+        def child_self_test(name, prepare):
+            c = root / name
+            (c / "scripts").mkdir(parents=True)
+            (c / "scripts" / "check_compliance_script_names.py").write_text(gate_src, encoding="utf-8")
+            undo = prepare(c / ".local-runs")
+            if undo is None:
+                return None
+            try:
+                return subprocess.run(
+                    [sys.executable, "-I", str(c / "scripts" / "check_compliance_script_names.py"), "--self-test"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+            finally:
+                undo()
+
+        def as_file(path):
+            path.write_text("not a directory\n")
+            return lambda: None
+
+        def read_only(path):
+            path.mkdir()
+            path.chmod(0o555)
+            if os.access(str(path), os.W_OK):
+                path.chmod(0o755)
+                skipped.append("#6199-readonly (chmod 555 does not deny writes to euid %s)" % euid)
+                return None
+            return lambda: path.chmod(0o755)
+
+        for label, prepare in (("file", as_file), ("readonly", read_only)):
+            res = child_self_test("c-" + label, prepare)
+            if res is None:
+                continue
+            expect(
+                res.returncode == 2 and "SELF-TEST FAIL: fixture setup" in res.stderr and "Traceback" not in res.stderr,
+                "#6199-%s: .local-runs unusable: expected exit 2 with 'fixture setup', got %r (stderr=%r)"
+                % (label, res.returncode, res.stderr[-300:]),
+            )
+    for note in skipped:
+        print("self-test: skipped %s" % note)
     return "; ".join(fails) if fails else None
 
 
