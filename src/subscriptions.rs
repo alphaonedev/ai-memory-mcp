@@ -33,6 +33,7 @@ use crate::models::field_names;
 
 // #3659 — delivery-audit bookkeeping evidence (counters, /metrics, /health).
 pub mod audit_status;
+mod dns_guard;
 #[cfg(test)]
 mod dns_guard_4165_tests;
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
@@ -616,8 +617,13 @@ pub mod dlq_reason {
     pub const HTTP_PREFIX: &str = "http-";
     /// The subscription URL failed the SSRF guard.
     pub const SSRF_REJECTED: &str = "ssrf_rejected";
-    /// The subscription URL failed the DNS-resolved SSRF guard.
-    pub const DNS_SSRF_REJECTED: &str = "dns_ssrf_rejected";
+    /// #4165 — the DNS-resolved SSRF guard refused the subscription URL for
+    /// its ADDRESS CLASS (or a host that can never name an address): a pure
+    /// function of the stored URL, so the retry ladder stops at one attempt.
+    pub const DNS_SSRF_FORBIDDEN_ADDRESS: &str = "dns_ssrf_forbidden_address";
+    /// #4165 — the resolver did not answer for the subscription URL's host
+    /// (transient under the fail-closed posture): retried through the ladder.
+    pub const DNS_RESOLUTION_FAILED: &str = "dns_resolution_failed";
     /// #3979 — admitted, but its worker had not started at the shutdown
     /// drain deadline; recorded instead of dropped. Nothing was sent.
     pub const SHUTDOWN_UNSTARTED: &str = "shutdown_unstarted";
@@ -1622,16 +1628,16 @@ fn deliver_with_retry(
 /// pure function of the stored subscription URL and the process posture
 /// that no later attempt can change?
 ///
-/// Only [`dlq_reason::SSRF_REJECTED`] qualifies today: the syntactic guard
+/// [`dlq_reason::SSRF_REJECTED`] qualifies: the syntactic guard
 /// (`validate_url`) reads the URL bytes and the loopback knob, nothing
-/// else. [`dlq_reason::DNS_SSRF_REJECTED`] is NOT terminal — it carries
-/// both the address-class violation (deterministic) and a resolver
-/// FAILURE under the fail-closed posture (transient), and the two share
-/// one reason token; splitting them is a guard change, not a ladder
-/// change. Every ACK / HTTP / client-build reason stays retryable.
+/// else. #4165 — so does [`dlq_reason::DNS_SSRF_FORBIDDEN_ADDRESS`]: the
+/// DNS guard now types its refusal ([`dns_guard::DnsGuardRefusal`]), and the
+/// address-class verdict is as deterministic as the syntactic one.
+/// [`dlq_reason::DNS_RESOLUTION_FAILED`] (the resolver did not answer) stays
+/// retryable, as does every ACK / HTTP / client-build reason.
 #[must_use]
 fn refusal_is_terminal(reason: &str) -> bool {
-    reason == dlq_reason::SSRF_REJECTED
+    reason == dlq_reason::SSRF_REJECTED || reason == dlq_reason::DNS_SSRF_FORBIDDEN_ADDRESS
 }
 
 /// Perform one HTTP POST with SSRF-hardened URL check + signature
@@ -1675,7 +1681,10 @@ fn send(
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("DNS SSRF guard rejected webhook URL {target}: {e}");
-                return Err(dlq_reason::DNS_SSRF_REJECTED.to_string());
+                // #4165 — the typed refusal picks its own DLQ reason, so the
+                // ladder can tell a permanent address-class verdict from a
+                // transient resolver failure.
+                return Err(e.dlq_reason().to_string());
             }
         };
     // v0.7.0 SR-W3 (HIGH) — redirect SSRF-pin bypass. The
@@ -1937,11 +1946,15 @@ pub fn validate_hmac_secret_hex(secret: Option<&str>) -> Result<(), String> {
 /// against DNS-rebind attacks where an attacker-controlled hostname
 /// resolves to an internal IP at connect time.
 ///
-/// Runs in the dispatch thread (blocking). Best-effort: if DNS fails
-/// we let reqwest surface the error rather than fail closed, because
-/// transient DNS outages should not silently drop webhook delivery.
+/// Runs in the dispatch thread (blocking). Fails CLOSED on a resolver
+/// failure since #1053 (`AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1` restores the
+/// legacy permissive posture); the typed refusal
+/// ([`dns_guard::DnsGuardRefusal`], #4165) is flattened to `anyhow` here for
+/// the registration-time callers that only need pass / refuse.
 pub fn validate_url_dns(url: &str) -> Result<()> {
-    validate_url_dns_with(url, crate::config::allow_loopback_webhooks()).map(|_| ())
+    validate_url_dns_with(url, crate::config::allow_loopback_webhooks())
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
 }
 
 /// v0.7.0 #1082 (SR-1 #2, HIGH) — DNS-rebind TOCTOU fix. Returns
@@ -1993,7 +2006,7 @@ pub(crate) fn host_port_with_default_http_port(host_port: &str) -> String {
 pub(crate) fn validate_url_dns_resolved(
     url: &str,
     allow_loopback: bool,
-) -> Result<(String, Vec<std::net::SocketAddr>)> {
+) -> Result<(String, Vec<std::net::SocketAddr>), dns_guard::DnsGuardRefusal> {
     validate_url_dns_with(url, allow_loopback)
 }
 
@@ -2041,7 +2054,8 @@ fn hostname_shape_invalid(host: &str) -> bool {
 fn validate_url_dns_with(
     url: &str,
     allow_loopback: bool,
-) -> Result<(String, Vec<std::net::SocketAddr>)> {
+) -> Result<(String, Vec<std::net::SocketAddr>), dns_guard::DnsGuardRefusal> {
+    use dns_guard::DnsGuardRefusal::{ForbiddenAddress, ResolutionFailed};
     // #3684 — every message below renders the target as its origin only;
     // a chat-webhook URL carries its credential in the path.
     let shown = crate::url_display::url_origin(url);
@@ -2049,7 +2063,7 @@ fn validate_url_dns_with(
     let lower = url.to_ascii_lowercase();
     let (_scheme, rest) = lower
         .split_once("://")
-        .ok_or_else(|| anyhow!("webhook URL missing scheme: {url_display}"))?;
+        .ok_or_else(|| ForbiddenAddress(format!("webhook URL missing scheme: {url_display}")))?;
     // #3744 — userinfo is stripped BEFORE any host extraction, the same
     // way `validate_url_with` does it; this guard is the SECOND line of
     // defence for the same class and must read the same host.
@@ -2132,11 +2146,12 @@ fn validate_url_dns_with(
             );
             return Ok((resolved_host, Vec::new()));
         }
-        return Err(anyhow!(
+        // #4165 — TERMINAL: the shape verdict is a pure function of the URL.
+        return Err(ForbiddenAddress(format!(
             "SSRF guard: DNS resolution failed for {url_display}: hostname violates RFC 1035 \
              label/length limits; failing CLOSED (post-#1053 secure default — set \
              AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
-        ));
+        )));
     }
     let addrs: Vec<std::net::SocketAddr> = match resolv_target.to_socket_addrs() {
         Ok(iter) => iter.collect(),
@@ -2155,29 +2170,30 @@ fn validate_url_dns_with(
                 // own DNS query (the explicit UNSAFE legacy posture).
                 return Ok((resolved_host, Vec::new()));
             }
-            return Err(anyhow!(
+            // #4165 — RETRYABLE: the resolver did not answer this time.
+            return Err(ResolutionFailed(format!(
                 "SSRF guard: DNS resolution failed for {url_display}: {e}; failing CLOSED \
                  (post-#1053 secure default — set AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
-            ));
+            )));
         }
     };
     for addr in &addrs {
         let ip = addr.ip();
         if is_private(ip) && !is_loopback_normalized(ip) {
-            return Err(anyhow!(
+            return Err(ForbiddenAddress(format!(
                 "host resolves to private/link-local IP {ip}: {url_display}"
-            ));
+            )));
         }
         // H11 (#628 blocker) — DNS-rebind protection for loopback.
         // Default-OFF; operators with `[subscriptions]
         // allow_loopback_webhooks = true` accept loopback-resolving
         // hostnames.
         if is_loopback_normalized(ip) && !allow_loopback {
-            return Err(anyhow!(
+            return Err(ForbiddenAddress(format!(
                 "host resolves to loopback IP {ip}: {url_display} — rejected by default \
                  (SSRF guard); set `[subscriptions] allow_loopback_webhooks = true` \
                  to opt in"
-            ));
+            )));
         }
     }
     // v0.7.0 #1082 — return the resolved host + addr list so the

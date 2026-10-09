@@ -450,7 +450,8 @@ pub async fn subscribe(
         // and `dispatch_event_postgres` matches and enqueues it like any
         // other. Delivery to `https://localhost/...` is then refused by
         // the dispatch-time SSRF guard and recorded as a failed delivery
-        // (DLQ reason `DNS_SSRF_REJECTED`), unless the operator enabled
+        // (DLQ reason `DNS_SSRF_FORBIDDEN_ADDRESS`, terminal — one attempt,
+        // #4165), unless the operator enabled
         // `allow_loopback_webhooks`, in which case a localhost POST is
         // attempted. We mark it so the REGISTRATION-time SSRF guard can
         // skip the loopback rejection — H11's allow_loopback_webhooks knob
