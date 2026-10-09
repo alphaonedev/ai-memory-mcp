@@ -1393,8 +1393,7 @@ def check_workflow_sweep(root: Path, rep: Report) -> None:
     `permissions: write-all`, no release image name (#4935)."""
     wf_dir = root / WORKFLOWS
     if not wf_dir.is_dir():
-        rep.bad(f"{WORKFLOWS} is missing")
-        return
+        return  # release.yml and release-shape.yml are already reported missing by load()
     for path in sorted(wf_dir.glob("*.y*ml")):
         if path.name == CI_IMAGE_WF:
             check_ci_image_workflow(path, rep)
