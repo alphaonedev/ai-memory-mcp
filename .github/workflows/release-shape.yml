@@ -84,11 +84,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
+      # #6284: the same statements as release.yml's build step (SHAPE_BUILD is
+      # derived from WF_BUILD in scripts/check_release_features.py): the
+      # content-hash bind of the declaration and asserter (#4768 / #6275), the
+      # deterministic inputs (#3613) and the sanitized declaration read. Only
+      # the cross `--target` is dropped (the proof reads target/release).
       - name: Build release binary (exactly as release.yml)
-        shell: bash
+        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}
+        env:
+          PREFLIGHT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          FEATURES="$(bash scripts/release-features.sh)"
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release-features.sh scripts/assert-compiled-features.sh; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+          export RUSTFLAGS
+          FEATURES="$(/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/release-features.sh)"
           test -n "$FEATURES"
           cargo build --locked --release --features "$FEATURES"
 
