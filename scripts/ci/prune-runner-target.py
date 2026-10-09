@@ -25,13 +25,18 @@ every self-hosted cargo job, after a successful checkout):
   * deletes the contents of ``<target>/<profile>/incremental`` (CI runs with
     CARGO_INCREMENTAL=0, so anything there is stale state from elsewhere);
   * deletes an example together with its uplift: cargo builds
-    ``examples/<name>-<hash>`` and hard-links it as ``examples/<name>`` (one
-    inode, nlink 2, both links in ``examples/``), so the pair goes in one run,
-    with each name's ``.d`` and ``.dSYM`` twin, and its bytes count once;
-  * keeps any other hard-linked executable (cargo's uplift source
-    ``deps/<bin>-<hash>``, the other link being ``<profile>/<bin>``, or a link
-    whose partner is not the matching examples name): deleting one side frees
-    nothing while the other exists, and it is one bin, not one of the ~1000 tests;
+    ``examples/<name>-<hash>`` and uplifts it as ``examples/<name>`` (on Linux
+    one inode, nlink 2, both links in ``examples/``; on macOS/APFS a clone: two
+    inodes, nlink 1), so the pair goes in one run, with each name's ``.d`` and
+    ``.dSYM`` twin.  ``-`` and ``_`` are one name (cargo builds
+    ``my_demo-<hash>`` for the example ``my-demo``);
+  * keeps cargo's bin uplift source ``deps/<bin>-<hash>``: the file that has a
+    regular executable ``<profile>/<bin>`` of the same size and the same name
+    (``-`` = ``_``), found by NAME AND SIZE because cargo hard-links on Linux
+    but copies (an APFS clone, nlink 1) on macOS, and pruning the source makes
+    cargo report the bin "Dirty" and relink it; also keeps any other
+    hard-linked executable (a link whose partner is not the matching examples
+    name): deleting one side frees nothing while the other exists;
   * keeps everything else, so the next compile stays warm.
 ``--scope all`` instead removes the five artifact dirs ``deps``, ``build``,
 ``incremental``, ``examples`` and ``.fingerprint`` under the profile wholesale:
@@ -72,14 +77,22 @@ vanished meanwhile is not an error.  Any other error reading a directory or an
 entry during the scan, or removing an entry, prints a ``::warning::`` line and
 the run continues with the rest; the totals are still printed and the exit code
 is 1.  Every name printed is escaped as GitHub escapes a workflow-command value
-(``%`` -> ``%25``, CR -> ``%0D``, LF -> ``%0A``), so a hostile file name can
-never start a log line of its own.
+(``%`` -> ``%25``, CR -> ``%0D``, LF -> ``%0A``) and ``#`` -> ``%23`` (the
+runner also parses the legacy ``##[command]`` form anywhere in a line), and a
+byte that is not UTF-8 is written as ``\\xNN``, so a hostile file name can never
+start a log line or a command of its own and printing never raises.  A
+directory tree nested deeper than MAX_REMOVE_DEPTH (far beyond anything cargo
+writes) is warned about and left in place instead of exhausting the stack or
+the file descriptors.
 
 OUTPUT.  One line per category, then ``freed_bytes=<n>``, a human-readable
 total and ``::notice::prune-runner-target freed_bytes=<n> deleted=<k>
 mode=<pruned|dry-run>`` (a job-summary annotation; ``k`` counts the candidates
-fully removed).  The count is exact, also under ``--dry-run``: a hard-linked file counts
-once, and only when every one of its links is removed in this run.
+fully removed).  On Linux the count is exact, also under ``--dry-run``: a
+hard-linked file counts once, and only when every one of its links is removed in
+this run.  On macOS/APFS cargo's uplift copies are clones that share blocks, so
+each clone is counted at full size and ``freed_bytes`` is an UPPER BOUND there
+(a clone's blocks are released only when its twin goes too).
 
 Python 3.9+, standard library only (the fleet nodes ship python3 on PATH; the
 ``Ensure python3 + node present`` step of ci.yml asserts it).
@@ -110,6 +123,9 @@ KEEP_SUFFIXES = (".rlib", ".rmeta", ".so", ".dylib", ".dll", ".a", ".d", ".o", "
 ARTIFACT_DIRS = ("deps", "build", "incremental", "examples", ".fingerprint")
 # cargo's metadata hash on an example: examples/<name>-<16 lowercase hex>.
 EXAMPLE_HASH_RE = re.compile(r"[0-9a-f]{16}")
+# A tree deeper than this is far beyond any cargo output; it is warned about and
+# left in place (each level holds a directory fd and a Python frame).
+MAX_REMOVE_DEPTH = 100
 EXEC_BITS = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
 EXIT_REFUSED = 2
 EXIT_WARNED = 1
@@ -121,8 +137,16 @@ WARNING_PREFIX = "::warning::prune-runner-target: "
 
 
 def _escape(text: str) -> str:
-    """GitHub's workflow-command value escaping: one name can never become two log lines."""
-    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    """Make a file name safe to print on a log line.
+
+    Undecodable bytes (a surrogateescape-decoded name on Linux) become ``\\xNN``
+    so a strict UTF-8 stdout never raises (R3-F3).  Then GitHub's
+    workflow-command escaping (``%``, CR, LF) so one name can never become two
+    log lines, and ``#`` -> ``%23`` because the runner's legacy parser accepts
+    ``##[command]`` anywhere in a line (SR3-1).
+    """
+    text = os.fsencode(text).decode("utf-8", "backslashreplace")
+    return text.replace("%", "%25").replace("#", "%23").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def _warn(errors: List[str], rel: str, exc: OSError) -> None:
@@ -177,7 +201,7 @@ class Plan:
         self.scope = scope
         self.fds: List[int] = []
         self.candidates: List[Candidate] = []
-        self.kept: List[str] = []
+        self.kept: List[Tuple[str, str]] = []  # (name under the profile, why it stays)
         self.notes: List[str] = []
         self.errors: List[str] = []  # scan-phase warnings, carried into the exit code
 
@@ -194,7 +218,11 @@ class Plan:
 
 
 class Tally:
-    """Exact bytes freed (each inode counted once, only when its LAST link goes)."""
+    """Bytes freed: each inode counted once, only when its LAST link goes.
+
+    Exact on Linux.  On APFS a clone is its own inode, so it is counted at full
+    size and the total is an upper bound (clones share blocks).
+    """
 
     def __init__(self) -> None:
         self.freed = 0
@@ -225,7 +253,7 @@ class Tally:
         _warn(self.errors, rel, exc)
 
 
-def _remove(dir_fd: int, name: str, rel: str, tally: Tally, dry_run: bool) -> bool:
+def _remove(dir_fd: int, name: str, rel: str, tally: Tally, dry_run: bool, depth: int = 0) -> bool:
     """Remove ``name`` under ``dir_fd`` (a tree depth-first), never following a symlink.
 
     Returns False when something under it could not be removed (already warned).
@@ -239,6 +267,9 @@ def _remove(dir_fd: int, name: str, rel: str, tally: Tally, dry_run: bool) -> bo
         tally.warn(rel, exc)
         return False
     if stat.S_ISDIR(st.st_mode):
+        if depth >= MAX_REMOVE_DEPTH:
+            tally.warn(rel, OSError(errno.ELOOP, "nested more than %d levels deep; left in place" % MAX_REMOVE_DEPTH))
+            return False
         try:
             fd = _open_dir(name, dir_fd)
         except FileNotFoundError:
@@ -252,10 +283,14 @@ def _remove(dir_fd: int, name: str, rel: str, tally: Tally, dry_run: bool) -> bo
             if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
                 tally.warn(rel, OSError(errno.EAGAIN, "replaced while pruning; left in place"))
                 return False
-            with os.scandir(fd) as it:
-                children = sorted(entry.name for entry in it)
+            try:
+                with os.scandir(fd) as it:
+                    children = sorted(entry.name for entry in it)
+            except OSError as exc:
+                tally.warn(rel, exc)
+                return False
             for child in children:
-                ok = _remove(fd, child, rel + "/" + child, tally, dry_run) and ok
+                ok = _remove(fd, child, rel + "/" + child, tally, dry_run, depth + 1) and ok
         finally:
             os.close(fd)
         if not ok or dry_run:
@@ -343,15 +378,47 @@ def _add_with_twins(plan: Plan, fd: int, name: str, sub: str, present: Set[str],
             plan.candidates.append(Candidate(fd, twin, prefix + twin, sub + category))
 
 
+def _norm(name: str) -> str:
+    """cargo spells a target ``my-demo`` and its crate-style artifact ``my_demo-<hash>``."""
+    return name.replace("-", "_")
+
+
+def _hashed_stem(name: str) -> Optional[str]:
+    """``stem`` of ``<stem>-<16 lowercase hex>``, else None."""
+    stem, sep, digest = name.rpartition("-")
+    if sep and stem and EXAMPLE_HASH_RE.fullmatch(digest):
+        return stem
+    return None
+
+
 def _uplift_pair(names: List[str]) -> bool:
-    """Exactly ``<name>`` and ``<name>-<16 hex>``: cargo's example + its uplift."""
+    """Exactly ``<name>`` and ``<name>-<16 hex>`` (``-`` = ``_``): cargo's example + its uplift."""
     if len(names) != 2:
         return False
-    short, long_ = sorted(names, key=len)
-    return long_.startswith(short + "-") and EXAMPLE_HASH_RE.fullmatch(long_[len(short) + 1:]) is not None
+    for plain, hashed in (names, names[::-1]):
+        stem = _hashed_stem(hashed)
+        if stem is not None and _norm(stem) == _norm(plain):
+            return True
+    return False
+
+
+def _profile_bins(plan: Plan, profile_fd: int) -> Dict[str, Dict[int, str]]:
+    """``{normalised name: {size: name}}`` of the regular executables directly under the profile dir.
+
+    These are cargo's bin uplifts (``<profile>/<bin>``).  Found by name, because
+    on macOS the uplift is a copy (an APFS clone, nlink 1), not a hard link.
+    """
+    found: Dict[str, Dict[int, str]] = {}
+    prefix = plan.profile + "/"
+    for name in _list_dir(plan, profile_fd, plan.profile) or []:
+        st = _scan_lstat(plan, name, profile_fd, prefix + name)
+        if st is not None and _is_test_executable(name, st):
+            found.setdefault(_norm(name), {})[st.st_size] = name
+    return found
 
 
 def _scan_test_bins(plan: Plan, profile_fd: int) -> None:
+    bins = _profile_bins(plan, profile_fd)
     for sub in ("deps", "examples"):
         fd = _open_sub(plan, profile_fd, sub)
         if fd is None:
@@ -366,13 +433,21 @@ def _scan_test_bins(plan: Plan, profile_fd: int) -> None:
             st = _scan_lstat(plan, name, fd, prefix + name)
             if st is None or not _is_test_executable(name, st):
                 continue
+            if sub == "deps":
+                stem = _hashed_stem(name)
+                partner = bins.get(_norm(stem), {}).get(st.st_size) if stem is not None else None
+                if partner is not None:
+                    # cargo's bin uplift source (hard link on Linux, clone on
+                    # macOS): pruning it makes cargo relink the bin.
+                    plan.kept.append((sub + "/" + name, "uplift source of %s/%s (same name and size); "
+                                      "pruning it forces a relink" % (plan.profile, partner)))
+                    continue
             if st.st_nlink > 1:
                 if sub == "examples" and st.st_nlink == 2:
                     linked.setdefault((st.st_dev, st.st_ino), []).append(name)
                     continue
-                # cargo's uplift source deps/<bin>-<hash>, hard-linked to
-                # <profile>/<bin>: deleting this side frees nothing.
-                plan.kept.append(sub + "/" + name)
+                plan.kept.append((sub + "/" + name, "hard-linked (nlink=%d); frees nothing while its other "
+                                  "link exists" % st.st_nlink))
                 continue
             _add_with_twins(plan, fd, name, sub, present, False)
         for key in sorted(linked):
@@ -383,7 +458,8 @@ def _scan_test_bins(plan: Plan, profile_fd: int) -> None:
                 for name in pair:
                     _add_with_twins(plan, fd, name, sub, present, True)
             else:
-                plan.kept.extend(sub + "/" + name for name in pair)
+                plan.kept.extend((sub + "/" + name, "hard-linked example without its matching <name> / "
+                                  "<name>-<hash> twin in examples/") for name in pair)
     fd = _open_sub(plan, profile_fd, "incremental")
     if fd is None:
         return
@@ -558,6 +634,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="accept a target dir outside GITHUB_WORKSPACE when it is the exported "
                              "CARGO_TARGET_DIR (manual use; the workflows never pass it)")
     args = parser.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="backslashreplace")
 
     try:
         _validate_profile(args.profile)
@@ -587,8 +667,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for category in sorted(tally.per_category):
         count, size = tally.per_category[category]
         print("  %-24s %6d  %s" % (category, count, _human(size)))
-    for name in plan.kept:
-        print("  kept hard-linked uplift source %s (frees nothing while <profile>/<bin> exists)" % _escape(name))
+    for name, why in plan.kept:
+        print("  kept %s: %s" % (_escape(name), _escape(why)))
     for note in plan.notes:
         print("  " + _escape(note))
     print("freed_bytes=%d" % tally.freed)

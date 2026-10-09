@@ -1447,6 +1447,24 @@ class PruneScript6118(unittest.TestCase):
         self.assertIn("deps/tst\\xfe-0123456789abcdef", text)
         self.assertIn("::notice::prune-runner-target freed_bytes=", text)
 
+    def test_6118_r4_r3_f3_main_survives_a_stdout_that_cannot_encode_a_name(self) -> None:
+        # R3-F3/SR3-2(c): the same crash for a VALID name the stream cannot
+        # encode (a strict ASCII stdout); portable to APFS.  main() reconfigures
+        # stdout/stderr to backslashreplace, so the run reaches its totals.
+        import contextlib
+        import io
+        _write(self.target / "debug" / "deps" / "caf\u00e9-0123456789abcdef", 11, True)
+        mod = _load_prune()
+        out = io.TextIOWrapper(io.BytesIO(), encoding="ascii", errors="strict")
+        err = io.TextIOWrapper(io.BytesIO(), encoding="ascii", errors="strict")
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = mod.main(["--target-dir", str(self.target), "--dry-run"])
+        out.flush()
+        self.assertEqual(0, rc)
+        text = out.buffer.getvalue().decode("ascii")  # type: ignore[attr-defined]
+        self.assertIn("caf\\xe9-0123456789abcdef", text)
+        self.assertIn("::notice::prune-runner-target freed_bytes=", text)
+
     def test_6118_r4_r3_f1_clone_shaped_bin_source_is_kept_by_name_and_size(self) -> None:
         # R3-F1: on macOS cargo copies (APFS clonefile) instead of hard-linking,
         # so deps/<bin>-<hash> and <profile>/<bin> are two inodes with nlink 1.
