@@ -173,8 +173,10 @@ pub enum RulesAction {
     /// memory the agent emits. Only the fingerprint
     /// `sha256(public_key)[:16]` is logged.
     Keygen {
-        /// Output path for the 32-byte private seed. The base64
-        /// public key sibling is written to `<out>.pub`.
+        /// Output path for the 32-byte private seed; the base64 public key
+        /// sibling is written to `<out>.pub`. The basename must be
+        /// `operator.key` (the name the loaders read): `--out` relocates the
+        /// directory, any other name is refused (#3437).
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
         /// Overwrite an existing private/public key pair. Emits a
@@ -572,6 +574,23 @@ fn resolve_keygen_out_path(
     key_dir_overridden: bool,
 ) -> Result<PathBuf> {
     if let Some(p) = explicit_out {
+        // #3437 (5-agent vote 4d3ea1c5, 5/5 option C) — `--out` may relocate
+        // the key's DIRECTORY, never rename it. The signer
+        // (`load_operator_signing_key_from_dir`) and the verifier
+        // (`rules_store::resolve_operator_pubkey`) read only fixed names, so
+        // any other basename produced a key nothing could load. Refuse before
+        // anything is written; the loaders stay unchanged, so sign and verify
+        // cannot diverge.
+        if p.file_name() != Some(std::ffi::OsStr::new(OPERATOR_KEY_FILENAME)) {
+            bail!(
+                "rules.keygen: refusing --out {}: the operator-key loaders read only \
+                 `{OPERATOR_KEY_FILENAME}` + `{OPERATOR_KEY_FILENAME}.pub`, so a key written \
+                 under another name could never be loaded by `rules enable --sign` or \
+                 verified. Pass `--out <dir>/{OPERATOR_KEY_FILENAME}`, or `--key-dir <dir>` \
+                 with no --out (#3437).",
+                p.display()
+            );
+        }
         return Ok(p.to_path_buf());
     }
     if key_dir_overridden {
@@ -2205,7 +2224,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("ai-memory.db");
         drop(crate::db::open(&db_path).expect("db::open"));
-        let key_path = dir.path().join("op.key");
+        // #3437 — `--out` relocates the directory; the basename must be the
+        // loadable `operator.key` (a custom name is refused).
+        let key_path = dir.path().join("explicit-out").join(OPERATOR_KEY_FILENAME);
         let args = RulesArgs {
             key_dir: None,
             action: RulesAction::Keygen {
