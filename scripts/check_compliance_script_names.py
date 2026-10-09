@@ -83,6 +83,8 @@ FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 # Fence info strings GitHub renders as a diagram or figure, never as text: the body (mermaid
 # '%%' comments included) is not reader-visible (#6196).
 DIAGRAM_FENCES = frozenset({"mermaid", "math", "geojson", "topojson", "stl"})
+# A CommonMark link reference definition ([label]: destination "title"), never rendered (#6219).
+LINKDEF_RE = re.compile(r"^ {0,3}\[[^\]]+\]:")
 ENTRY_RE = re.compile(
     r"^(docs/compliance/\S+\.md):(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(:pinned)?$"
 )
@@ -298,10 +300,13 @@ def visible_lines(lines):
     rendered document shows can carry one. Removed: HTML comment text (``<!-- ... -->``, also
     across lines), fence marker lines, and the body of a diagram fence (``mermaid`` with its
     ``%%`` comments, ``math``, ``geojson``, ``topojson``, ``stl``). Inside a fenced block or a
-    code span ``<!--`` is literal and opens nothing (#6215). Stale names are still found in all
+    code span ``<!--`` is literal and opens nothing (#6215). A blank-line-delimited paragraph
+    from a link reference definition line (``[//]: # (...)``, a title on the next line or
+    continued over lines) is removed to its end (#6219); a visible line directly after a
+    definition can only be over-hidden, which fails closed. Stale names are still found in all
     of this text.
     """
-    out, inside, fence = [], False, None
+    out, inside, fence, linkdef = [], False, None, False
     for line in lines:
         m = None if inside else FENCE_RE.match(line)
         if fence is not None:
@@ -314,10 +319,16 @@ def visible_lines(lines):
         if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
             info = (m.group(2).split() or [""])[0].lower()
             fence = (m.group(1)[0], len(m.group(1)), info in DIAGRAM_FENCES)
+            linkdef = False
             out.append("")
             continue
+        if not inside:
+            if not line.strip():
+                linkdef = False
+            elif LINKDEF_RE.match(line):
+                linkdef = True
         shown, inside = comment_text_removed(line, inside)
-        out.append(shown)
+        out.append("" if linkdef else shown)
     return out
 
 
