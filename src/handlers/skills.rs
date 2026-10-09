@@ -406,15 +406,11 @@ pub async fn skill_promote_route(
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
             // #3707 / #6115 - the chain may carry a store or driver `Display`
-            // (SQL fragments, paths); the caller gets the class text below,
-            // the detail goes to a tracing line for the operator.
+            // (SQL fragments, paths); the caller gets the class text below.
+            // #6131 F5 - `mcp_foreign_err` below owns the ONE operator log
+            // line for this failure (detail at error for a foreign root, warn
+            // for a typed refusal), so this arm does not log it again.
             let status = promote_error_status(&e);
-            tracing::warn!(
-                target: SKILLS_TRACE_TARGET,
-                error = %e,
-                status = status.as_u16(),
-                "skill_promote_route: refused (detail withheld from wire response, #3707)"
-            );
             // #6125 - the same classifier the MCP path of this operation
             // uses: our own typed refusal / not-found text reaches the
             // caller, a foreign (db / fs / codec) root becomes its class
