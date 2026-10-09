@@ -237,6 +237,39 @@ def self_test():
         expect(check(root), "pinned entry with no erratum anywhere was accepted")
         allow.write_text("docs/compliance/A.md:check-old.sh\n")
 
+        # #6173: ':pinned' is a closed set; the cells use the real pinnable document paths.
+        decl = root / "docs" / "compliance" / "v1.0.0-DECLARATION.md"
+        cert = root / "docs" / "compliance" / "ENTERPRISE-FEDERATION-CERTIFICATION.md"
+        stale = "N30 enforcer is `check-old.sh`.\n"
+        other.write_text(erratum)
+        doc.write_text(stale)
+        allow.write_text("docs/compliance/A.md:check-old.sh:pinned\n")
+        expect(
+            any(":pinned" in p and "A.md" in p for p in check(root)),
+            "#6173: ':pinned' on a document outside PINNABLE_DOCS was accepted",
+        )
+        doc.write_text(stale + erratum)
+        decl.write_text(stale + erratum)
+        allow.write_text("docs/compliance/v1.0.0-DECLARATION.md:check-old.sh:pinned\n")
+        expect(
+            any("unnecessary :pinned" in p for p in check(root)),
+            "#6173: ':pinned' on a document carrying its own erratum was accepted",
+        )
+        decl.write_text(stale)
+        cert.write_text(stale)
+        allow.write_text(
+            "docs/compliance/A.md:check-old.sh\n"
+            "docs/compliance/v1.0.0-DECLARATION.md:check-old.sh:pinned\n"
+            "docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md:check-old.sh:pinned\n"
+        )
+        other.unlink()
+        doc.write_text(stale + erratum)
+        expect(not check(root), "#6173: the two real pinned documents were rejected")
+        decl.unlink()
+        cert.unlink()
+        doc.write_text("N30 enforcer is `check-old.sh`.\n")
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+
         doc.write_text("Erratum: `check-old.sh` is `scripts/check_missing.py`.\n")
         expect(check(root), "erratum naming a missing successor was accepted")
 
