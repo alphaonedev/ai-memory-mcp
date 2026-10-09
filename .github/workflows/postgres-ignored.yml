@@ -145,3 +145,24 @@ jobs:
           else
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
           fi
+
+      # #6118 — the self-hosted workspace `target/` is PERSISTENT (it is the
+      # warm cache, #3128), so the ~1000 test executables one debug
+      # `cargo test` build links into `target/debug/deps` (~164 GB per runner)
+      # used to stay there for good and filled the shared root filesystem.
+      # Delete ONLY those executables (extension-less, executable files in
+      # `target/debug/deps`); every `.rlib`/`.rmeta`/`.d`, `build/`,
+      # `incremental/` and `.fingerprint/` stays, so the cache stays warm and
+      # cargo rebuilds just the test crates next run. always() so a failed or
+      # cancelled run still reclaims the disk; hosted runners are discarded
+      # anyway. LAST step, after every cargo invocation in this job.
+      - name: Prune test executables from target/debug/deps (self-hosted, issue 6118)
+        if: always() && runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/ci/prune_test_binaries.py ]; then
+            echo "::notice::no checkout in this workspace; nothing to prune"
+            exit 0
+          fi
+          python3 -I scripts/ci/prune_test_binaries.py --target-dir target

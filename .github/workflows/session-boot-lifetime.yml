@@ -57,6 +57,13 @@ jobs:
           - os: macos-fed
             runner: '["self-hosted","macos-fed"]'
     runs-on: ${{ fromJSON(matrix.runner) }}
+    env:
+      # #6118 — debuginfo budget, same pair and level as the ci.yml `check`
+      # job (#3453/#3461): line tables keep file:line in backtraces at about a
+      # third of the size. TEST is stated with DEV because the `test` profile
+      # only inherits `dev` while nothing overrides it.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -80,3 +87,24 @@ jobs:
           AI_MEMORY_NO_CONFIG: '1'
         run: |
           cargo test --test boot_primitive_contract --test recipe_contract --test boot_lifecycle
+
+      # #6118 — the self-hosted workspace `target/` is PERSISTENT (it is the
+      # warm cache, #3128), so the ~1000 test executables one debug
+      # `cargo test` build links into `target/debug/deps` (~164 GB per runner)
+      # used to stay there for good and filled the shared root filesystem.
+      # Delete ONLY those executables (extension-less, executable files in
+      # `target/debug/deps`); every `.rlib`/`.rmeta`/`.d`, `build/`,
+      # `incremental/` and `.fingerprint/` stays, so the cache stays warm and
+      # cargo rebuilds just the test crates next run. always() so a failed or
+      # cancelled run still reclaims the disk; hosted runners are discarded
+      # anyway. LAST step, after every cargo invocation in this job.
+      - name: Prune test executables from target/debug/deps (self-hosted, issue 6118)
+        if: always() && runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/ci/prune_test_binaries.py ]; then
+            echo "::notice::no checkout in this workspace; nothing to prune"
+            exit 0
+          fi
+          python3 -I scripts/ci/prune_test_binaries.py --target-dir target
