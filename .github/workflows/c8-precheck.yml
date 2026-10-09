@@ -1096,11 +1096,22 @@ jobs:
     # change could merge through green CI while the cert kept being cited
     # (the #2444 "reports success while doing nothing" shape).
     #
-    # Diff range is the standard PR diff (merge-base-with-PR-base .. HEAD),
-    # NEVER a diff against the cert's pinned SHA, so unrelated later PRs
-    # do not fail forever. `fetch-depth: 0` is required (default
-    # actions/checkout@v4 is a shallow single-commit checkout of the PR
-    # merge ref, which cannot walk merge-base(base, head)).
+    # Diff range is the standard PR diff, NEVER a diff against the cert's
+    # pinned SHA, so unrelated later PRs do not fail forever. On
+    # pull_request (#6137, #6138) the gate judges the MERGE commit this job
+    # checked out (GITHUB_SHA), not the PR head in isolation and not the
+    # payload's PR_BASE_SHA (report-only; it can be stale). It computes NO
+    # merge-base: the range starts at the merge commit's first parent, which
+    # must be on the live base ref (GITHUB_BASE_REF, fetched explicitly if
+    # absent), and the second parent must be PR_HEAD_SHA, else it fails
+    # closed (push a new commit or sync the branch with the base; a re-run
+    # reuses the same GITHUB_SHA). A branch cut before the carrier's banner
+    # fix is judged on the tree that would actually merge. `fetch-depth: 0`
+    # is required (default actions/checkout@v4 is a shallow single-commit
+    # checkout of the PR merge ref, which cannot walk the history to the base
+    # branch; push and override ranges still need merge-base(base, head)).
+    # The Python runs with `-I` (isolated mode, precedent #5163) so a module in
+    # scripts/ can never shadow the standard library.
     #
     # No `needs:`, no job-level `if:`, no `paths:` filter — always runs.
     # Declared REQUIRED in required-contexts-release.txt and live-required
@@ -1119,8 +1130,9 @@ jobs:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-        run: bash scripts/check-cert-expiry.sh
+        run: python3 -I scripts/check_cert_expiry.py
       - name: Self-test the gate (regression evidence)
         # --self-test builds a throwaway repo under .local-runs/ (never a
         # real branch, never /tmp) and asserts: a watched-path violation
@@ -1136,7 +1148,18 @@ jobs:
         # diff (a non-ancestor bind is measured, not waved), a decoy or
         # duplicated banner line fail-closes, deleting the doc alongside a
         # wire change fail-closes, and a pure banner reformat is GREEN.
-        run: bash scripts/check-cert-expiry.sh --self-test
+        # (#6137, #6138) A stale-LIVE head banner is GREEN at the
+        # pull_request merge commit when the live base records EXPIRED, a
+        # head that flips the banner is detected over first-parent..merge-
+        # commit, a stale payload base sha is ignored, a stale branch is not
+        # charged for base-side wire changes (pr5), a base that moved by an
+        # unrelated commit stays GREEN (pr4-moved), a PR wire change without
+        # a banner flip is RED (pr6), and a missing or unresolvable base ref /
+        # head / merge commit, a non-hex sha, reversed parents, a second
+        # parent that is not the PR head, an octopus merge, or a first parent
+        # not on the base fail-close with their reason. (#5970) under GitHub
+        # Actions CERT_EXPIRY_BASE/HEAD overrides are refused.
+        run: python3 -I scripts/check_cert_expiry.py --self-test
 
   foreign-text-to-caller-gate:
     # #3688 gate 7 (Conductor ruling on the reviewer-f2r secret-to-sink sweep,

@@ -35,7 +35,7 @@ None of it is certified today.
 ## How to read a certificate against this appendix
 
 1. Confirm the artifact's certificate is not expired (§5: any change to the watched
-   surface set expires it; `scripts/check-cert-expiry.sh`) and carries a bundle whose
+   surface set expires it; `scripts/check_cert_expiry.py`) and carries a bundle whose
    `envelope_ref` equals the pinned declaration hash.
 2. Confirm your backend, transport model, host range, topology, posture and external
    processors are INSIDE the §0.1 envelope, and your own SLO/RPO/RTO are inside the
