@@ -1139,6 +1139,32 @@ def self_test():
         expect(any("check_NEW.py" in p for p in probs) and any("scripts/SUB/check_sub.py" in p for p in probs),
                "R8-N5: on an emulated case-insensitive filesystem a case variant resolved (%r)" % (probs,))
 
+        # #6196 (round 8): raw HTML GitHub renders as nothing cannot carry an erratum: a processing
+        # instruction, a CDATA section, a declaration, and a tag's attributes (also across lines).
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+        for label, text in (
+            ("processing instruction", stale_line + "<? " + erratum.strip() + " ?>\n"),
+            ("multi-line processing instruction", stale_line + "<?\n" + erratum + "?>\n"),
+            ("processing instruction in a paragraph", stale_line + "Text <? " + erratum.strip() + " ?> end\n"),
+            ("CDATA", stale_line + "<![CDATA[ " + erratum.strip() + " ]]>\n"),
+            ("declaration", stale_line + "<!DOCTYPE " + erratum.strip() + ">\n"),
+            ("attribute", stale_line + '<span title="' + erratum.strip() + '"></span>\n'),
+            ("attribute with '>'", stale_line + '<span title="a > ' + erratum.strip() + '"></span>\n'),
+            ("multi-line tag", stale_line + "<span\ntitle='" + erratum.strip() + "'></span>\n"),
+        ):
+            doc.write_text(text)
+            expect(check(root), "R8-F9-%s: an erratum GitHub does not render was accepted" % label)
+        for label, text in (
+            ("after an inline tag", stale_line + "<br> " + erratum),
+            ("after a closed instruction", stale_line + "<? x ?> " + erratum),
+            ("code span", stale_line + "Write `<?` or `<a` here.\n" + erratum),
+            ("open tag ended by a blank line", stale_line + '<span title="x\n\n' + erratum),
+            ("open tag ended by a fence", stale_line + '<span title="x\n```\n' + erratum + "```\n"),
+        ):
+            doc.write_text(text)
+            expect(not check(root), "R8-F9-control %s: a visible erratum was rejected" % label)
+        allow.write_text("")
+
         # #6199: a fixture setup failure exits 2 with 'SELF-TEST FAIL: fixture setup', never a traceback.
         gate_src = Path(__file__).read_text(encoding="utf-8")
 
