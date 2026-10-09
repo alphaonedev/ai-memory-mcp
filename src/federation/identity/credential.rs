@@ -776,6 +776,9 @@ mod tests {
 
     #[test]
     fn load_from_env_unset_is_none() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // SAFETY: single-threaded within this test; we only remove the var.
         unsafe {
             std::env::remove_var(FED_CREDENTIAL_PATH_ENV);

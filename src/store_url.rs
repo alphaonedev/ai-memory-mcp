@@ -246,8 +246,9 @@ fn url_carries_credentials(url: &str) -> bool {
 /// failed `fx_f2_build_store_handle_no_url` under parallel ordering).
 #[cfg(test)]
 pub(crate) fn store_url_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    &LOCK
+    // #6123: the crate's ONE process-env mutex, not a module-local one, so
+    // these writes also serialise against every other env-mutating lib test.
+    crate::config::test_env_mutex()
 }
 
 #[cfg(test)]

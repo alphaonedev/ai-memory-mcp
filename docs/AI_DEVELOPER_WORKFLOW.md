@@ -306,6 +306,11 @@ All ten must be clean. If clippy pedantic requires `#[allow(clippy::...)]`, just
 in the PR description. All six script gates are wired into
 `.github/workflows/c8-precheck.yml` and will block any PR that fails them.
 
+**Keep the failing log.** When a lib test run fails — including a failure that
+passes on rerun — save the full output to `.local-runs/<lane>/lib-fail.log` before
+rerunning, and quote the failing test names and panic lines in the report. A flake
+with no saved log cannot be traced ([#6123](https://github.com/alphaonedev/ai-memory-mcp/issues/6123)).
+
 In addition, walk the **manual security checklist** in
 [`ENGINEERING_STANDARDS.md` §3.2](ENGINEERING_STANDARDS.html) and confirm zero new
 findings in the 10 areas (SQL injection, `validate_id()` coverage, command injection,

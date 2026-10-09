@@ -10002,6 +10002,9 @@ mod tests {
     /// defaults to `false` (fail-closed) when unset.
     #[test]
     fn governance_fail_open_on_error_env_parse_1455() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // Unset → secure default.
         unsafe { std::env::remove_var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR") };
         assert!(!governance_fail_open_on_error());
@@ -13103,13 +13106,18 @@ decision = "allow"
         // the handler and masks the bypass. Opt back to permissive via the
         // wired escape hatch, serialised on the SAME shared lock the strict
         // enrollment tests hold so a parallel run can't leak the env.
+        //
+        // #6123: build the store BEFORE taking the lock. `keyword_app_state`
+        // opens under `no_passphrase_guard()`, which takes the crate's
+        // process-env mutex — the same mutex `fed_env_test_lock()` now is —
+        // so opening while holding it would self-deadlock.
+        let env = TestEnv::fresh();
+        let app_state = keyword_app_state(&env.db_path);
         let _fed_guard = crate::handlers::fed_env_test_lock();
         let _fed_prev = std::env::var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS").ok();
         // SAFETY: env mutation under the shared test-scoped lock; restored
         // below before the lock is released.
         unsafe { std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", "1") };
-        let env = TestEnv::fresh();
-        let app_state = keyword_app_state(&env.db_path);
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: true,

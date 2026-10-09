@@ -738,6 +738,9 @@ quorum:
 
     #[test]
     fn load_from_env_unset_is_none() {
+        // #6123: serialise this env mutation on the crate's ONE process-env
+        // mutex so it cannot race another lib test reading the same variable.
+        let _env_guard = crate::config::test_env_lock();
         // SAFETY: single-threaded test; no other thread reads this var.
         unsafe { std::env::remove_var(FED_INVENTORY_PATH_ENV) };
         assert_eq!(FederationInventory::load_from_env().expect("ok"), None);

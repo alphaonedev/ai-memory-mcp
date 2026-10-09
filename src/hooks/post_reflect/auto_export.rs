@@ -506,10 +506,9 @@ mod tests {
     /// tests (which never set the env-var) are not held up.
     #[test]
     fn auto_export_worker_panic_increments_spawn_failed_counter() {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        // PoisonError is fine — we only care about exclusive access.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // #6123: the crate's ONE process-env mutex (poison-tolerant), not a
+        // test-local one.
+        let _guard = crate::config::test_env_lock();
 
         let (conn, dir, db_path) = fresh_db();
         enable_auto_export_on_namespace(&conn, "panic-ns");
@@ -536,7 +535,7 @@ mod tests {
         };
 
         let before = crate::metrics::auto_export_spawn_failed_count();
-        // SAFETY: env-var mutation is process-global; the ENV_LOCK
+        // SAFETY: env-var mutation is process-global; the test_env_lock
         // mutex above serialises against any other test in this
         // module that touches the same key. No other module sets it.
         // SAFETY justification documented above; unsafe is required
@@ -558,7 +557,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        // SAFETY: same as set_var above — protected by ENV_LOCK.
+        // SAFETY: same as set_var above — protected by test_env_lock.
         unsafe {
             std::env::remove_var(AUTO_EXPORT_INJECT_PANIC_ENV);
         }

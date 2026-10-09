@@ -104,8 +104,9 @@ mod tests {
     /// tests in this module (mirrors the lock discipline used by
     /// `federation::signing` and `governance::audit` tests).
     fn fed_identity_env_lock() -> &'static std::sync::Mutex<()> {
-        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        M.get_or_init(|| std::sync::Mutex::new(()))
+        // #6123: the crate's ONE process-env mutex, not a module-local one, so
+        // these writes also serialise against every other env-mutating lib test.
+        crate::config::test_env_mutex()
     }
 
     struct EnvGuard {
