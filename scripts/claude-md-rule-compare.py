@@ -2,9 +2,11 @@
 """claude-md-rule-compare.py - issue #4507 (PR #4508 review R3-F3): make a CLAUDE.md rule change loud.
 
 Run by .github/workflows/claude-md-rule-compare.yml from the BASE branch (pull_request_target). The pull
-request head is DATA: its CLAUDE.md and the two docs/reference files are read out of git objects with
-`git ls-tree` and `git cat-file` into a scratch directory. Nothing from the head is executed, imported or
-checked out, and a symlink blob (mode 120000) at any of the three paths is refused.
+request head is DATA: with --pr-number this base script fetches `refs/pull/<N>/head` as git objects (no workflow
+step fetches or checks out the head, #6163), and its CLAUDE.md and the two docs/reference files are read out of git
+objects with `git ls-tree` and `git cat-file` into a scratch directory. Nothing from the head is executed, imported
+or checked out, and a symlink blob (mode 120000) at any of the three paths is refused. A credential-shaped value in
+the head text is masked in the summary (#6163); the verdict is computed on the unmasked text.
 
 The BASE guard (scripts/check-claude-md-size.py of the base checkout) and the BASE manifest
 (scripts/qc-allowlists/claude-md-rule-sections.sha256) then judge the head copies:
@@ -32,7 +34,7 @@ Python 3.9 standard library only.
 
 Usage (the comparison refuses to run without -I):
   python3 -I scripts/claude-md-rule-compare.py --base-root DIR --repo DIR --base-sha SHA --head-sha SHA
-      --scratch DIR [--summary FILE]
+      --scratch DIR [--pr-number N] [--summary FILE]
   python3 -I scripts/claude-md-rule-compare.py --self-test
 """
 import sys
@@ -79,6 +81,17 @@ TRUSTED_PATHS = ("scripts/check-claude-md-size.py", "scripts/claude-md-rule-comp
                  ".github/workflows/claude-md-guard.yml", ".github/workflows/claude-md-rule-compare.yml",
                  ".github/CODEOWNERS")
 DIFF_LINE_CAP = 200
+# #6163: the pull request number that names the head refspec; a decimal with no leading zero, ASCII only, at most ten
+# digits, so nothing but `refs/pull/<N>/head` can reach the fetch.
+PR_NUMBER = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
+# #6163: a credential-shaped `name=value` / `name: value` in head text, and a PEM private key block. The summary is a
+# public job log; the masked value is still a rule change (the verdict is computed before masking).
+CREDENTIAL_VALUE = re.compile(
+    r"(?i)(?<![\w-])([\w-]*(?:passw(?:or)?d|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|"
+    r"credential)[\w-]*\s*[:=]\s*[\"']?)([^\s\"'`]+)")
+PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+PRIVATE_KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
+MASK = "[MASKED]"
 MAX_BLOB_BYTES = 2 * 1024 * 1024  # far above any legitimate file; refuses a memory-exhaustion blob
 # Messages of the base guard that the section comparison already reports in its own words.
 DRIFT_MARKERS = ("changed: sha256", "is not pinned in", "is missing from CLAUDE.md")
@@ -175,11 +188,41 @@ def span(text: str) -> str:
     return f"{ticks} {flat} {ticks}"
 
 
-def trusted_changes(repo: Path, base_sha: str, head_sha: str) -> list:
+def guard_path_changes(repo: Path, base_sha: str, head_sha: str) -> list:
     """The TRUSTED_PATHS the head changes relative to its merge base with the base (fail closed on git error)."""
     merge_base = git(repo, "merge-base", base_sha, head_sha).decode("ascii").strip()
     out = git(repo, "diff", "--name-only", "-z", "--no-renames", merge_base, head_sha, "--", *TRUSTED_PATHS)
     return sorted(name.decode("utf-8", "replace") for name in out.split(b"\0") if name)
+
+
+def head_fetch_args(pr_number: str) -> tuple:
+    """#6163: the git arguments that fetch the pull request head as objects into the base clone (never checked out).
+    Anything but a plain decimal pull request number raises ValueError (fail closed)."""
+    if not PR_NUMBER.fullmatch(pr_number):
+        raise ValueError(f"--pr-number must be a decimal pull request number, got {pr_number!r}")
+    return ("fetch", "--no-tags", "origin", f"+refs/pull/{pr_number}/head:refs/remotes/pull/head")
+
+
+def redact_credentials(report: str) -> str:
+    """#6163: mask credential-shaped values and private key blocks in the summary text. When anything is masked the
+    report says so, so a masked rule change stays loud; the pull request diff shows the raw text."""
+    out = []
+    masked = 0
+    in_key = False
+    for line in report.split("\n"):
+        if in_key or PRIVATE_KEY_BEGIN.search(line):
+            in_key = not PRIVATE_KEY_END.search(line)
+            masked += 1
+            out.append(line[:1] + MASK if line[:1] in "+- " else MASK)
+            continue
+        line, count = CREDENTIAL_VALUE.subn(lambda match: match.group(1) + MASK, line)
+        masked += count
+        out.append(line)
+    if masked:
+        out.insert(-1 if out and out[-1] == "" else len(out),
+                   f"NOTE: {masked} credential-shaped value(s) masked in this summary (#6163); the pull request "
+                   "diff shows the raw text and the verdict was computed on it.")
+    return "\n".join(out)
 
 
 def unified(old: str, new: str, key: str) -> str:
@@ -251,7 +294,7 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
         lines.append(f"- BASE GUARD REFUSES THE HEAD: {span(error)}")
     if residual:
         lines.append("")
-    for rel in trusted_changes(repo, base_sha, head_sha):
+    for rel in guard_path_changes(repo, base_sha, head_sha):
         rule_changed = True
         lines.append(f"- GUARD CHANGED: {rel} (the code that judges rule changes; needs the trailer)")
     approved = approvals(repo, base_sha, head_sha)
@@ -268,7 +311,7 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
         lines.append("RESULT: PASS - only counts changed (printed above for review).")
     else:
         lines.append("RESULT: PASS - no rule section differs from the base manifest.")
-    return "\n".join(lines) + "\n", failed
+    return redact_credentials("\n".join(lines) + "\n"), failed
 
 
 def run(args) -> int:
@@ -281,6 +324,8 @@ def run(args) -> int:
     scratch = Path(args.scratch)
     try:
         scratch.mkdir(parents=True, exist_ok=True)
+        if args.pr_number is not None:
+            git(Path(args.repo), *head_fetch_args(args.pr_number))
         report, failed = compare(Path(args.base_root), Path(args.repo), args.base_sha, args.head_sha, scratch)
     except (RuntimeError, OSError, UnicodeDecodeError, ValueError, SyntaxError) as exc:
         report, failed = f"## CLAUDE.md rule-change comparison\n\nRESULT: FAIL (closed) - {exc}\n", True
@@ -610,8 +655,6 @@ def _self_test_cases() -> int:
 
     case("same-size filler swap is a rule change", filler, True, "RULE TEXT CHANGED")
 
-    census_heading = next(h for h in guard.CLAUDE_MD_REQUIRED_HEADINGS if h.startswith(CENSUS_SECTION))
-
     def census_edit(old, new):
         def apply(root):
             edit(old, new)(root)
@@ -648,29 +691,29 @@ def _self_test_cases() -> int:
     case("a head heading is a code span in the summary (R5, #5166)", link_heading, True,
          "RULE TEXT CHANGED (added): ` ## [ok](https://e.invalid/x) `")
 
-    def trusted_write(rel, data=b"# weakened\n"):
+    def guard_file_write(rel, data=b"# weakened\n"):
         def apply(root):
             target = root / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
         return apply
 
-    guard_edit = trusted_write(GUARD_REL)
+    guard_edit = guard_file_write(GUARD_REL)
     case("a change to the guard code is reported and needs the trailer (R4)", guard_edit, True, "GUARD CHANGED")
     case("a guard change with the trailer passes (R4)", guard_edit, False, "approval trailer(s)", trailer="Justin")
     # R5 (#5164): the trusted set is pinned to a literal, and the per-path cases loop over that literal, so
     # dropping an entry from TRUSTED_PATHS fails here instead of silently dropping its own case.
-    pinned_trusted = ("scripts/check-claude-md-size.py", "scripts/claude-md-rule-compare.py",
+    pinned_guard_paths = ("scripts/check-claude-md-size.py", "scripts/claude-md-rule-compare.py",
                       ".github/workflows/claude-md-guard.yml", ".github/workflows/claude-md-rule-compare.yml",
                       ".github/CODEOWNERS")
-    if TRUSTED_PATHS != pinned_trusted:
+    if TRUSTED_PATHS != pinned_guard_paths:
         failures.append("TRUSTED_PATHS pin")
         print(f"FAIL: self-test - TRUSTED_PATHS {TRUSTED_PATHS} differs from the pinned set (R5, #5164)",
               file=sys.stderr)
     else:
         print("PASS: self-test - TRUSTED_PATHS equals the pinned set (R5, #5164)")
-    for rel in pinned_trusted:
-        case(f"a change to {rel} is reported and needs the trailer (R4)", trusted_write(rel), True,
+    for rel in pinned_guard_paths:
+        case(f"a change to {rel} is reported and needs the trailer (R4)", guard_file_write(rel), True,
              f"GUARD CHANGED: {rel}")
 
     def weakened_pyc(root):
@@ -1067,10 +1110,10 @@ def _self_test_cases() -> int:
 
     case("a deleted trusted workflow is reported (R4)", delete_compare_workflow, True,
          "GUARD CHANGED: .github/workflows/claude-md-rule-compare.yml")
-    case("a workflow trigger block removed is reported (R4)", trusted_write(
+    case("a workflow trigger block removed is reported (R4)", guard_file_write(
         ".github/workflows/claude-md-guard.yml", b"name: stub\n"), True,
         "GUARD CHANGED: .github/workflows/claude-md-guard.yml")
-    case("a trusted workflow that is not UTF-8 is reported, not a crash (R4)", trusted_write(
+    case("a trusted workflow that is not UTF-8 is reported, not a crash (R4)", guard_file_write(
         ".github/workflows/claude-md-guard.yml", b"\xff\xfe\x00"), True,
         "GUARD CHANGED: .github/workflows/claude-md-guard.yml")
 
@@ -1085,7 +1128,7 @@ def _self_test_cases() -> int:
         target.symlink_to("claude-md-rule-compare.py")
 
     case("a trusted file replaced by a symlink is reported (R4)", symlink_guard, True, f"GUARD CHANGED: {GUARD_REL}")
-    case("a change to an untrusted file is not a guard change (R4)", trusted_write("README.md", b"hi\n"), False,
+    case("a change to an untrusted file is not a guard change (R4)", guard_file_write("README.md", b"hi\n"), False,
          "no rule section differs")
 
     def fence_check(root):
@@ -1540,6 +1583,7 @@ def main() -> int:
     parser.add_argument("--base-sha")
     parser.add_argument("--head-sha")
     parser.add_argument("--scratch")
+    parser.add_argument("--pr-number", help="fetch refs/pull/<N>/head as git objects before comparing (#6163)")
     parser.add_argument("--summary")
     args = parser.parse_args()
     if args.self_test:
