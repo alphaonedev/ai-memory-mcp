@@ -87,7 +87,7 @@
     "path": "src/wake_hub/startup.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "b0671b409822027fd665c757b7b289b0d9f33480ae3ef9d30f912a4a38efa592"
+    "sha256": "f12102376634db8f19dfd0e7fd9a38a3763be6b7cf1ed0f0fc74d0da1f32794c"
   },
   {
     "path": "src/wake_client/bundle.rs",
@@ -99,7 +99,7 @@
     "path": "src/wake_client/mod.rs",
     "role": "Client bundle/session/signal boundary; decode hints and request a read, never write memory.",
     "mode": "rust-production-tokens",
-    "sha256": "7cad4fc0e315b4f7f326fcfda799dce8d131f707138bf38e63bb8e72017d0e38"
+    "sha256": "6044e3880be01ddf7348430e7ad18f51fea9406641579f2e57bfc76a1b3422ca"
   },
   {
     "path": "src/wake_client/session.rs",
@@ -141,7 +141,7 @@
     "path": "src/cli/wake_listen.rs",
     "role": "Operator-resolved caller catch_up_read -> handle_inbox; refuses a Postgres store before opening the local sidecar (#3730, control-plane guard ahead of the content path); metadata rendering; operator --exec via audited_tokio_command.",
     "mode": "rust-production-tokens",
-    "sha256": "aa0ed659de0325d126e704b21390831f851bd338eaa6641a38b9591102ea51b2"
+    "sha256": "cffd2e342d1de14c190520b2c5784a3ff1463a50d87fb1ee8d6c5166ec7f5bcf"
   },
   {
     "path": "src/inbox_wake.rs",
@@ -159,7 +159,7 @@
     "path": "sdk/python/ai_memory/wake.py",
     "role": "Python decoder -> metadata WakeSignal -> operator-provided on_signal callback; external trust boundary.",
     "mode": "sdk-source-bytes",
-    "sha256": "3f4a521bbf4aa0bb3e090708dcbe1c134b9b2214296870f803d19997157e93fb"
+    "sha256": "74e416fe96f9ae69256ecd7f61c47475b4766c2fb4aba048681a85c545f7157d"
   },
   {
     "path": "sdk/python/swarm/wake.py",
@@ -171,6 +171,6 @@
     "path": "sdk/typescript/src/wake.ts",
     "role": "TypeScript decoder/state machine -> metadata WakeSignal -> operator-provided onSignal callback; external trust boundary.",
     "mode": "sdk-source-bytes",
-    "sha256": "de28c5a4f2315a1b150437d8714db79a01c41c654beebb9c52753db693630a3d"
+    "sha256": "eb190b501757892e23e53db83c6217fa2a56396d6662425b9ad9c1559d6af0b2"
   }
 ]
