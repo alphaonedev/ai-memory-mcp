@@ -284,19 +284,36 @@ def live_issue_state(repo):
 
 
 def self_test():
+    """Offline regression cases. Every case is isolated: an exception is a failed case."""
+    # Independent oracle values (deliberately not the module constants).
+    v_ctx, v_job, pinned = "Carrier-ruleset live verifier (#6143)", "carrier-ruleset-live-gate", 6182
+    qc = REPO_ROOT / "scripts" / "qc-allowlists"
     payload = read_json(PAYLOAD)
     carrier = read_decl(CARRIER_DECL)
     release = read_decl(RELEASE_DECL)
-    good = json.loads(json.dumps(payload))
-    good["id"] = 1
+    ledger = read_decl(qc / "required-contexts-not-required.txt")
+    wf_text = (REPO_ROOT / ".github" / "workflows" / "c8-precheck.yml").read_text(encoding="utf-8")
 
-    def mut(fn):
-        rs = json.loads(json.dumps(good))
-        fn(rs)
-        return rs
+    def copy(v):
+        return json.loads(json.dumps(v))
 
     def params(rs):
         return rs["rules"][0]["parameters"]
+
+    promoted_payload = copy(payload)
+    params(promoted_payload)["required_status_checks"].append({"context": v_ctx, "integration_id": ACTIONS_APP_ID})
+    ledger_p = [line for line in ledger if line.split()[:2] != ["c8-precheck.yml", v_job]]
+    committed = (payload, carrier, release, ledger)
+    promoted = (promoted_payload, carrier + [v_ctx], release + [v_ctx], ledger_p)
+    good_c = copy(payload)
+    good_c["id"] = 1
+    good = copy(promoted_payload)
+    good["id"] = 1
+
+    def mut(fn, base=None):
+        rs = copy(good if base is None else base)
+        fn(rs)
+        return rs
 
     def is_open(_):
         return "open"
@@ -307,77 +324,175 @@ def self_test():
     def unreadable(_):
         raise VerifyError("HTTP 404")
 
-    applied = {"state": "applied", "tracking_issue": 6182}
-    pending = {"state": "pending-apply", "tracking_issue": 6182}
+    applied = {"state": "applied", "tracking_issue": pinned}
+    pending = {"state": "pending-apply", "tracking_issue": pinned}
     hidden = mut(lambda rs: rs.pop("bypass_actors"))
     cases = [
-        # label, rulesets, state, issue_state, require_full_view, want_rc, needle
-        ("applied good", [good], applied, is_open, False, 0, "OK"),
-        ("applied absent", [], applied, is_open, False, 1, "no carrier ruleset"),
-        ("exclude", [mut(lambda rs: rs["conditions"]["ref_name"].update(exclude=["refs/heads/chain/x"]))],
+        # label, bundle, rulesets, state, issue_state, require_full_view, want_rc, needle
+        ("applied good", promoted, [good], applied, is_open, False, 0, "OK"),
+        ("applied absent", promoted, [], applied, is_open, False, 1, "no carrier ruleset"),
+        ("exclude", promoted, [mut(lambda rs: rs["conditions"]["ref_name"].update(exclude=["refs/heads/chain/x"]))],
          applied, is_open, False, 1, "exclude"),
-        ("bypass", [mut(lambda rs: rs.update(bypass_actors=[{"actor_id": 5, "actor_type": "RepositoryRole",
-                                                              "bypass_mode": "always"}]))],
-         applied, is_open, False, 1, "bypass_actors must be empty"),
-        ("integration_id", [mut(lambda rs: params(rs)["required_status_checks"][0].update(integration_id=999))],
+        ("bypass", promoted, [mut(lambda rs: rs.update(bypass_actors=[{"actor_id": 5, "actor_type": "RepositoryRole",
+                                                                        "bypass_mode": "always"}]))],
+         applied, is_open, False, 1, "bypass_actors must be"),
+        ("integration_id", promoted,
+         [mut(lambda rs: params(rs)["required_status_checks"][0].update(integration_id=999))],
          applied, is_open, False, 1, "integration_id"),
-        ("no integration_id", [mut(lambda rs: params(rs)["required_status_checks"][0].pop("integration_id"))],
+        ("no integration_id", promoted,
+         [mut(lambda rs: params(rs)["required_status_checks"][0].pop("integration_id"))],
          applied, is_open, False, 1, "integration_id"),
-        ("create", [mut(lambda rs: params(rs).pop("do_not_enforce_on_create"))],
+        ("create", promoted, [mut(lambda rs: params(rs).pop("do_not_enforce_on_create"))],
          applied, is_open, False, 1, "do_not_enforce_on_create"),
-        ("not strict", [mut(lambda rs: params(rs).update(strict_required_status_checks_policy=False))],
+        ("not strict", promoted, [mut(lambda rs: params(rs).update(strict_required_status_checks_policy=False))],
          applied, is_open, False, 1, "strict_required_status_checks_policy"),
-        ("missing ctx", [mut(lambda rs: params(rs)["required_status_checks"].pop())],
+        ("missing ctx", promoted, [mut(lambda rs: params(rs)["required_status_checks"].pop())],
          applied, is_open, False, 1, "contexts drift"),
-        ("extra ctx", [mut(lambda rs: params(rs)["required_status_checks"].append(
+        ("extra ctx", promoted, [mut(lambda rs: params(rs)["required_status_checks"].append(
             {"context": "x", "integration_id": ACTIONS_APP_ID}))], applied, is_open, False, 1, "extra"),
-        ("one pattern", [mut(lambda rs: rs["conditions"]["ref_name"].update(include=[REQUIRED_PATTERNS[0]]))],
+        ("one pattern", promoted,
+         [mut(lambda rs: rs["conditions"]["ref_name"].update(include=[REQUIRED_PATTERNS[0]]))],
          applied, is_open, False, 1, "include lacks"),
-        ("disabled", [mut(lambda rs: rs.update(enforcement="disabled"))], applied, is_open, False, 1,
+        ("disabled", promoted, [mut(lambda rs: rs.update(enforcement="disabled"))], applied, is_open, False, 1,
          "no carrier ruleset"),
-        ("hidden bypass warn", [hidden], applied, is_open, False, 0, "UNVERIFIED"),
-        ("hidden bypass strict", [hidden], applied, is_open, True, 1, "UNVERIFIED"),
-        ("pending absent open", [], pending, is_open, False, 0, "UNPROTECTED"),
-        ("pending absent closed", [], pending, is_closed, False, 1, "#6182 is closed"),
-        ("pending absent unreadable", [], pending, unreadable, False, 1, "unreadable"),
-        ("pending live match", [good], pending, is_open, False, 1, "flip"),
-        ("pending renamed weak", [mut(lambda rs: (rs.update(name="other"),
-                                                  params(rs).update(strict_required_status_checks_policy=False)))],
+        ("hidden bypass warn", promoted, [hidden], applied, is_open, False, 0, "UNVERIFIED"),
+        ("hidden bypass strict", promoted, [hidden], applied, is_open, True, 1, "UNVERIFIED"),
+        # R2-F1 (security): only an actual empty list is verified empty.
+        ("bypass null strict", promoted, [mut(lambda rs: rs.update(bypass_actors=None))], applied, is_open, True, 1,
+         "bypass_actors must be an empty list"),
+        ("bypass null", promoted, [mut(lambda rs: rs.update(bypass_actors=None))], applied, is_open, False, 1,
+         "bypass_actors must be an empty list"),
+        ("bypass not a list", promoted, [mut(lambda rs: rs.update(bypass_actors="[]"))], applied, is_open, True, 1,
+         "bypass_actors must be an empty list"),
+        ("pending absent open", committed, [], pending, is_open, False, 0, "UNPROTECTED"),
+        ("pending absent closed", committed, [], pending, is_closed, False, 1, "#6182 is closed"),
+        ("pending absent unreadable", committed, [], pending, unreadable, False, 1, "unreadable"),
+        ("pending live match", committed, [good_c], pending, is_open, False, 1, "flip"),
+        ("pending renamed weak", committed,
+         [mut(lambda rs: (rs.update(name="other"), params(rs).update(strict_required_status_checks_policy=False)),
+              base=good_c)],
          pending, is_open, False, 1, "strict_required_status_checks_policy"),
-        ("archive-freeze ignored", [{"id": 2, "name": "archive", "target": "branch", "enforcement": "active",
-                                     "conditions": {"ref_name": {"include": ["refs/heads/chain/promo6"],
-                                                                 "exclude": []}},
-                                     "rules": [{"type": "update"}]}], pending, is_open, False, 0, "UNPROTECTED"),
-        ("bogus state", [], {"state": "later", "tracking_issue": 6182}, is_open, False, 1, "state must be"),
-        ("bad issue", [], {"state": "pending-apply", "tracking_issue": "6182"}, is_open, False, 1,
+        ("archive-freeze ignored", committed,
+         [{"id": 2, "name": "archive", "target": "branch", "enforcement": "active",
+           "conditions": {"ref_name": {"include": ["refs/heads/chain/promo6"], "exclude": []}},
+           "rules": [{"type": "update"}]}], pending, is_open, False, 0, "UNPROTECTED"),
+        ("bogus state", committed, [], {"state": "later", "tracking_issue": pinned}, is_open, False, 1,
+         "state must be"),
+        ("bad issue", committed, [], {"state": "pending-apply", "tracking_issue": str(pinned)}, is_open, False, 1,
          "tracking_issue"),
+        # R2-F2 (security): the pending state names #6182 and no other issue.
+        ("other tracking issue", committed, [], {"state": "pending-apply", "tracking_issue": 1234}, is_open, False,
+         1, f"must be #{pinned}"),
+        # R2-F1 (code): the state moves only together with the verifier's promotion.
+        ("applied but not promoted", committed, [good_c], applied, is_open, False, 1, "is not promoted"),
+        ("pending but promoted", promoted, [], pending, is_open, False, 1, "already promoted"),
+        ("applied payload lacks verifier", (payload, carrier + [v_ctx], release + [v_ctx], ledger_p), [good_c],
+         applied, is_open, False, 1, "missing from ['payload']"),
+        ("applied release lacks verifier", (promoted_payload, carrier + [v_ctx], release, ledger_p), [good],
+         applied, is_open, False, 1, "missing from ['release declaration']"),
+        ("applied ledger kept", (promoted_payload, carrier + [v_ctx], release + [v_ctx], ledger), [good],
+         applied, is_open, False, 1, "still lists " + v_job),
+        ("pending ledger dropped", (payload, carrier, release, ledger_p), [], pending, is_open, False, 1,
+         "lacks the " + v_job),
     ]
     failures = []
-    for label, rulesets, state, issue_state, full, want_rc, needle in cases:
-        rc, lines = verify(payload, carrier, release, state, rulesets, issue_state, full)
+    total = 0
+
+    def check(label, fn):
+        nonlocal total
+        total += 1
+        try:
+            problem = fn()
+        except Exception as exc:  # noqa: BLE001 - the harness reports every crash as a failed case
+            problem = f"raised {type(exc).__name__}: {exc}"
+        if problem:
+            failures.append(f"{label}: {problem}")
+
+    def verify_case(bundle, rulesets, state, issue_state, full, want_rc, needle):
+        rc, lines = verify(*bundle, state, rulesets, issue_state, full)
         text = "\n".join(lines)
         if rc != want_rc or needle not in text:
-            failures.append(f"{label}: rc={rc} (want {want_rc}) needle {needle!r} in {text!r}")
+            return f"rc={rc} (want {want_rc}) needle {needle!r} in {text!r}"
+        return None
+
+    for label, bundle, rulesets, state, issue_state, full, want_rc, needle in cases:
+        check(label, lambda b=bundle, r=rulesets, s=state, i=issue_state, f=full, w=want_rc, n=needle:
+              verify_case(b, r, s, i, f, w, n))
     # offline payload drift
     offline = [
-        ("payload bypass", mut(lambda rs: rs.update(bypass_actors=[{"actor_id": 1}])), carrier, "bypass_actors"),
-        ("payload decl drift", good, carrier[:-1], "drift"),
-        ("release gap", good, carrier, "lacks release-required"),
+        ("payload bypass", mut(lambda rs: rs.update(bypass_actors=[{"actor_id": 1}]), base=good_c), carrier,
+         release, "bypass_actors"),
+        ("payload decl drift", good_c, carrier[:-1], release, "drift"),
+        ("release gap", good_c, carrier, release + ["only-release"], "lacks release-required"),
     ]
-    for label, p, decl, needle in offline:
-        rel = release + ["only-release"] if label == "release gap" else release
-        text = "\n".join(check_payload(p, decl, rel))
-        if needle not in text:
-            failures.append(f"{label}: offline check missed {needle!r}: {text!r}")
-    if check_payload(payload, carrier, release):
-        failures.append(f"committed payload fails the offline check: {check_payload(payload, carrier, release)}")
-    if parse_pages('[{"id":1}]\n[{"id":2},{"id":3}]') != [{"id": 1}, {"id": 2}, {"id": 3}]:
-        failures.append("parse_pages does not concatenate paginated arrays")
+    for label, p, decl, rel, needle in offline:
+        check(label, lambda p=p, d=decl, r=rel, n=needle:
+              None if n in "\n".join(check_payload(p, d, r)) else f"offline check missed {n!r}")
+    check("committed payload", lambda: check_payload(payload, carrier, release) or None)
+    check("paginate", lambda: None if parse_pages('[{"id":1}]\n[{"id":2},{"id":3}]') == [
+        {"id": 1}, {"id": 2}, {"id": 3}] else "parse_pages does not concatenate paginated arrays")
+    check("zero rulesets", lambda: None if parse_pages("[]\n") == [] else "parse_pages('[]') is not []")
+
+    # R2-F3 (security): an empty gh body is unreadable, never "zero rulesets".
+    def empty_body(text):
+        try:
+            parse_pages(text)
+        except ValueError:
+            return None
+        return f"parse_pages({text!r}) accepted an empty body"
+    check("empty body", lambda: empty_body(""))
+    check("whitespace body", lambda: empty_body(" \n"))
+
+    # R2-F4 (security): the pre-apply check refuses while an unfrozen carrier lacks a #6143 job.
+    no_fresh = wf_text.replace("\n  carrier-base-fresh-gate:\n", "\n  carrier-base-fresh-gate-gone:\n")
+    no_verifier = wf_text.replace("\n  carrier-ruleset-live-gate:\n", "\n  carrier-ruleset-live-gate-gone:\n")
+    sha_a, sha_b, sha_c = "a" * 40, "b" * 40, "c" * 40
+    live_two = [("refs/heads/chain/promo6-ssh", sha_a), ("refs/heads/rehearsal/audit-wip-ssh", sha_b)]
+    freeze = {"id": 24733250, "target": "branch", "enforcement": "active", "bypass_actors": [],
+              "conditions": {"ref_name": {"include": ["refs/heads/chain/old"], "exclude": []}},
+              "rules": [{"type": "update"}, {"type": "deletion"}]}
+    freeze_hidden = copy(freeze)
+    freeze_hidden.pop("bypass_actors")
+
+    def fetcher(texts):
+        def fetch(sha):
+            if sha not in texts:
+                raise VerifyError("HTTP 404")
+            return texts[sha]
+        return fetch
+
+    pre_cases = [
+        # label, payload, rulesets, carriers, texts, want_rc, needle
+        ("pre-apply ok", payload, [], live_two, {sha_a: wf_text, sha_b: wf_text}, 0, "PRE-APPLY OK"),
+        ("pre-apply stale carrier", payload, [], live_two, {sha_a: wf_text, sha_b: no_fresh}, 1,
+         "refs/heads/rehearsal/audit-wip-ssh"),
+        ("pre-apply verifier job missing", payload, [], live_two, {sha_a: no_verifier, sha_b: wf_text}, 1,
+         v_ctx),
+        ("pre-apply frozen skipped", payload, [freeze], live_two + [("refs/heads/chain/old", sha_c)],
+         {sha_a: wf_text, sha_b: wf_text}, 0, "frozen by ruleset 24733250"),
+        ("pre-apply hidden-bypass freeze not trusted", payload, [freeze_hidden],
+         live_two + [("refs/heads/chain/old", sha_c)], {sha_a: wf_text, sha_b: wf_text}, 1, "refs/heads/chain/old"),
+        ("pre-apply unreadable tip", payload, [], live_two, {sha_a: wf_text}, 1, "unreadable"),
+        ("pre-apply no carriers", payload, [], [], {}, 1, "no carrier branch"),
+        ("pre-apply payload drift", mut(lambda rs: rs.update(bypass_actors=[{"actor_id": 1}]), base=good_c), [],
+         live_two, {sha_a: wf_text, sha_b: wf_text}, 1, "bypass_actors"),
+    ]
+
+    def pre_case(p, rulesets, carriers, texts, want_rc, needle):
+        rc, lines = pre_apply(p, carrier, release, rulesets, carriers, fetcher(texts))
+        text = "\n".join(lines)
+        if rc != want_rc or needle not in text:
+            return f"rc={rc} (want {want_rc}) needle {needle!r} in {text!r}"
+        return None
+
+    for label, p, rulesets, carriers, texts, want_rc, needle in pre_cases:
+        check(label, lambda p=p, r=rulesets, c=carriers, t=texts, w=want_rc, n=needle: pre_case(p, r, c, t, w, n))
     if failures:
         for f in failures:
             print(f"SELF-TEST FAIL: {f}", file=sys.stderr)
+        print(f"check_carrier_ruleset_live self-test: {len(failures)} of {total} cases FAILED", file=sys.stderr)
         return 1
-    print(f"check_carrier_ruleset_live self-test: {len(cases) + len(offline) + 2} cases OK")
+    print(f"check_carrier_ruleset_live self-test: {total} cases OK")
     return 0
 
 

@@ -240,6 +240,83 @@ fn live_from_payload() -> Result<serde_json::Value, String> {
     Ok(rs)
 }
 
+/// Which declaration files the verifier reads in a fixture run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bundle {
+    /// The committed files (the verifier context is still unpromoted).
+    Committed,
+    /// The committed files after the #6182 promotion: the verifier context is
+    /// in the payload and both declarations, and its ledger line is gone.
+    Promoted,
+}
+
+const LEDGER: &str = "scripts/qc-allowlists/required-contexts-not-required.txt";
+const VERIFIER_JOB_ID: &str = "carrier-ruleset-live-gate";
+
+fn promoted_payload() -> Result<serde_json::Value, String> {
+    let mut p = payload()?;
+    rsc_params(&mut p)?["required_status_checks"]
+        .as_array_mut()
+        .ok_or("payload checks not an array")?
+        .push(serde_json::json!({"context": VERIFIER_JOB, "integration_id": ACTIONS_APP_ID}));
+    Ok(p)
+}
+
+/// The promoted payload as GitHub would return it for an admin reader.
+fn live_promoted() -> Result<serde_json::Value, String> {
+    let mut rs = promoted_payload()?;
+    let obj = rs.as_object_mut().ok_or("payload is not an object")?;
+    obj.insert("id".into(), serde_json::json!(424_242));
+    Ok(rs)
+}
+
+fn is_verifier_ledger_line(line: &str) -> bool {
+    line.split_whitespace()
+        .take(2)
+        .eq(["c8-precheck.yml", VERIFIER_JOB_ID])
+}
+
+/// Writes the promoted declaration bundle and returns the fixture flags.
+fn promoted_flags(dir: &Path) -> Result<Vec<String>, String> {
+    let payload_file = write_json(dir, "payload.json", &promoted_payload()?)?;
+    let write_lines = |file: &str, lines: Vec<String>| -> Result<PathBuf, String> {
+        let p = dir.join(file);
+        std::fs::write(&p, lines.join("\n") + "\n")
+            .map_err(|e| format!("write {}: {e}", p.display()))?;
+        Ok(p)
+    };
+    let mut carrier = decl_lines(CARRIER_DECL)?;
+    carrier.push(VERIFIER_JOB.to_owned());
+    let mut release = decl_lines(RELEASE_DECL)?;
+    release.push(VERIFIER_JOB.to_owned());
+    let ledger: Vec<String> = decl_lines(LEDGER)?
+        .into_iter()
+        .filter(|l| !is_verifier_ledger_line(l))
+        .collect();
+    let mut flags = Vec::new();
+    for (flag, path) in [
+        ("--payload-file", payload_file),
+        ("--carrier-decl-file", write_lines("carrier.txt", carrier)?),
+        ("--release-decl-file", write_lines("release.txt", release)?),
+        ("--ledger-file", write_lines("ledger.txt", ledger)?),
+    ] {
+        flags.push(flag.to_owned());
+        flags.push(path.display().to_string());
+    }
+    Ok(flags)
+}
+
+fn output_text(out: &std::process::Output) -> (i32, String) {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.code().unwrap_or(-1), text)
+}
+
+/// Fixture run. The `applied` state is judged against the promoted bundle
+/// (the only bundle `applied` is valid with, #6143 code R2-F1).
 fn run_verifier(
     name: &str,
     rulesets: &serde_json::Value,
@@ -247,13 +324,35 @@ fn run_verifier(
     issue: &str,
     extra: &[&str],
 ) -> Result<(i32, String), String> {
+    let bundle = if state == "applied" {
+        Bundle::Promoted
+    } else {
+        Bundle::Committed
+    };
+    run_verifier_with(name, rulesets, state, TRACKING_ISSUE, issue, bundle, extra)
+}
+
+fn run_verifier_with(
+    name: &str,
+    rulesets: &serde_json::Value,
+    state: &str,
+    tracking: u64,
+    issue: &str,
+    bundle: Bundle,
+    extra: &[&str],
+) -> Result<(i32, String), String> {
     let dir = scratch(name)?;
     let rs_file = write_json(&dir, "rulesets.json", rulesets)?;
     let st_file = write_json(
         &dir,
         "state.json",
-        &serde_json::json!({"state": state, "tracking_issue": TRACKING_ISSUE}),
+        &serde_json::json!({"state": state, "tracking_issue": tracking}),
     )?;
+    let flags = if bundle == Bundle::Promoted {
+        promoted_flags(&dir)?
+    } else {
+        Vec::new()
+    };
     let out = Command::new("python3")
         .arg("-I")
         .arg(root().join(VERIFIER))
@@ -262,16 +361,12 @@ fn run_verifier(
         .arg("--state-file")
         .arg(&st_file)
         .args(["--tracking-issue-state", issue])
+        .args(&flags)
         .args(extra)
         .current_dir(root())
         .output()
         .map_err(|e| format!("spawn python3: {e}"))?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Ok((out.status.code().unwrap_or(-1), text))
+    Ok(output_text(&out))
 }
 
 fn expect(name: &str, got: &(i32, String), rc: i32, needle: &str) -> TestResult {
@@ -436,6 +531,20 @@ fn workflow_runs_carrier_ruleset_verifier_6143() -> TestResult {
     if job.get("if").is_some() || job.get("needs").is_some() {
         return Err("verifier job must have no job-level if:/needs:".into());
     }
+    // Security R2-F5: the tracking-issue read is granted, not inherited from
+    // the repository being public (#3591 job-level pattern).
+    let perms = job
+        .get("permissions")
+        .and_then(serde_yaml_ng::Value::as_mapping)
+        .ok_or("verifier job must declare job-level permissions")?;
+    for (key, want) in [("contents", "read"), ("issues", "read")] {
+        if perms.get(key).and_then(|v| v.as_str()) != Some(want) {
+            return Err(format!("verifier job permissions must grant {key}: {want}"));
+        }
+    }
+    if perms.len() != 2 {
+        return Err("verifier job permissions must be exactly contents: read, issues: read".into());
+    }
     let steps = job
         .get("steps")
         .and_then(serde_yaml_ng::Value::as_sequence)
@@ -464,7 +573,7 @@ fn workflow_runs_carrier_ruleset_verifier_6143() -> TestResult {
 /// F3 + security F4: a ruleset that does not really protect the carriers fails.
 #[test]
 fn verifier_rejects_weakened_carrier_rulesets_6143() -> TestResult {
-    let good = live_from_payload()?;
+    let good = live_promoted()?;
     expect(
         "applied+good",
         &run_verifier("good", &serde_json::json!([good]), "applied", "open", &[])?,
@@ -675,6 +784,12 @@ fn docs_and_changelog_do_not_overclaim_6143() -> TestResult {
         "do_not_enforce_on_create",
         "24733250",
         CARRIER_DECL,
+        // Code R2-F2/R2-F3 + security R2-F4: precondition, pre-apply check,
+        // update-first promotion order and the expected red.
+        "python3 -I scripts/check_carrier_ruleset_live.py --pre-apply",
+        "`chain/promo6-ssh` and `rehearsal/audit-wip-ssh`",
+        "Update the ruleset first, then merge",
+        "If the promotion merges before the `PUT`, its own",
     ] {
         if !doc.contains(needle) {
             return Err(format!(
@@ -696,4 +811,286 @@ fn docs_and_changelog_do_not_overclaim_6143() -> TestResult {
         return Err("#6143 ledger lines must not claim the job hard-fails merges".into());
     }
     Ok(())
+}
+
+/// Code R2-F1: the state marker is mechanically coupled to the promotion of the
+/// verifier's own context (release + carrier declaration + payload, ledger line
+/// gone), so a state-only flip cannot leave the removed-rule detector advisory.
+#[test]
+fn verifier_state_is_coupled_to_verifier_promotion_6143() -> TestResult {
+    // (a) The committed files agree with the committed state.
+    let st: serde_json::Value =
+        serde_json::from_str(&read(STATE_FILE)?).map_err(|e| format!("parse {STATE_FILE}: {e}"))?;
+    let applied = match st.get("state").and_then(|s| s.as_str()) {
+        Some("applied") => true,
+        Some("pending-apply") => false,
+        other => return Err(format!("{STATE_FILE}: bad state {other:?}")),
+    };
+    let p = payload()?;
+    let in_payload = p["rules"][0]["parameters"]["required_status_checks"]
+        .as_array()
+        .ok_or("payload checks not an array")?
+        .iter()
+        .any(|c| c["context"] == VERIFIER_JOB);
+    let places = [
+        (
+            "release declaration",
+            decl_lines(RELEASE_DECL)?.iter().any(|l| l == VERIFIER_JOB),
+        ),
+        (
+            "carrier declaration",
+            decl_lines(CARRIER_DECL)?.iter().any(|l| l == VERIFIER_JOB),
+        ),
+        ("payload", in_payload),
+    ];
+    for (place, present) in places {
+        if present != applied {
+            return Err(format!(
+                "state applied={applied} but {VERIFIER_JOB:?} in {place} = {present}"
+            ));
+        }
+    }
+    let ledgered = decl_lines(LEDGER)?
+        .iter()
+        .any(|l| is_verifier_ledger_line(l));
+    if ledgered == applied {
+        return Err(format!(
+            "state applied={applied} but ledger line {VERIFIER_JOB_ID} present = {ledgered}"
+        ));
+    }
+    // (b) A state-only flip is RED even against a matching live ruleset.
+    expect(
+        "applied but not promoted",
+        &run_verifier_with(
+            "c-applied-unpromoted",
+            &serde_json::json!([live_from_payload()?]),
+            "applied",
+            TRACKING_ISSUE,
+            "open",
+            Bundle::Committed,
+            &[],
+        )?,
+        1,
+        "is not promoted",
+    )?;
+    // (c) A promotion without the state flip is RED.
+    expect(
+        "pending but promoted",
+        &run_verifier_with(
+            "c-pending-promoted",
+            &serde_json::json!([]),
+            "pending-apply",
+            TRACKING_ISSUE,
+            "open",
+            Bundle::Promoted,
+            &[],
+        )?,
+        1,
+        "already promoted",
+    )?;
+    // (d) The full promotion against the matching live ruleset is OK.
+    expect(
+        "applied and promoted",
+        &run_verifier_with(
+            "c-applied-promoted",
+            &serde_json::json!([live_promoted()?]),
+            "applied",
+            TRACKING_ISSUE,
+            "open",
+            Bundle::Promoted,
+            &[],
+        )?,
+        0,
+        "carrier-ruleset-live: OK",
+    )
+}
+
+/// Security R2-F1: `bypass_actors: null` (or any non-list) is never a
+/// verified-empty list, with or without `--require-full-view`.
+#[test]
+fn verifier_rejects_null_bypass_actors_6143() -> TestResult {
+    for (label, value) in [
+        ("null", serde_json::Value::Null),
+        ("string", serde_json::json!("[]")),
+    ] {
+        let mut rs = live_promoted()?;
+        rs["bypass_actors"] = value;
+        for extra in [&[][..], &["--require-full-view"][..]] {
+            expect(
+                &format!("bypass {label} {extra:?}"),
+                &run_verifier(
+                    &format!("bypass-{label}-{}", extra.len()),
+                    &serde_json::json!([rs.clone()]),
+                    "applied",
+                    "open",
+                    extra,
+                )?,
+                1,
+                "bypass_actors must be an empty list",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Security R2-F2: the pending state names tracking issue #6182 and no other.
+#[test]
+fn verifier_pins_tracking_issue_6143() -> TestResult {
+    expect(
+        "other open issue",
+        &run_verifier_with(
+            "pin-other",
+            &serde_json::json!([]),
+            "pending-apply",
+            1234,
+            "open",
+            Bundle::Committed,
+            &[],
+        )?,
+        1,
+        &format!("must be #{TRACKING_ISSUE}"),
+    )?;
+    if !read(VERIFIER)?.contains(&format!("TRACKING_ISSUE = {TRACKING_ISSUE}")) {
+        return Err(format!(
+            "{VERIFIER} must pin TRACKING_ISSUE = {TRACKING_ISSUE}"
+        ));
+    }
+    Ok(())
+}
+
+/// Security R2-F3: `gh` exiting 0 with an empty body is unreadable in both
+/// states (zero rulesets is the body `[]`). A fake `gh` (Python) on PATH
+/// answers the issue read with an open issue and the rulesets list with "".
+#[cfg(unix)]
+#[test]
+fn verifier_fails_closed_on_empty_gh_output_6143() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("empty-gh")?;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).map_err(|e| format!("mkdir {}: {e}", bin.display()))?;
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/usr/bin/env python3\nimport sys\nif any('/issues/' in a for a in sys.argv):\n    print('{\"state\": \"open\"}')\nsys.exit(0)\n",
+    )
+    .map_err(|e| format!("write fake gh: {e}"))?;
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod fake gh: {e}"))?;
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    for state in ["pending-apply", "applied"] {
+        let st_file = write_json(
+            &dir,
+            &format!("state-{state}.json"),
+            &serde_json::json!({"state": state, "tracking_issue": TRACKING_ISSUE}),
+        )?;
+        let mut cmd = Command::new("python3");
+        cmd.arg("-I")
+            .arg(root().join(VERIFIER))
+            .arg("--state-file")
+            .arg(&st_file)
+            .env("PATH", &path)
+            .current_dir(root());
+        if state == "applied" {
+            cmd.args(promoted_flags(&dir)?);
+        }
+        let out = cmd.output().map_err(|e| format!("spawn python3: {e}"))?;
+        expect(
+            &format!("empty gh body, {state}"),
+            &output_text(&out),
+            1,
+            "unparseable",
+        )?;
+    }
+    Ok(())
+}
+
+/// Security R2-F4: `--pre-apply` refuses the POST/PUT while an unfrozen carrier
+/// tip lacks a #6143 job; a carrier is skipped only when frozen by a visible
+/// no-bypass `update` rule.
+#[test]
+fn verifier_pre_apply_requires_jobs_on_unfrozen_carriers_6143() -> TestResult {
+    let wf = read(".github/workflows/c8-precheck.yml")?;
+    let stale = wf.replace(
+        "\n  carrier-base-fresh-gate:\n",
+        "\n  carrier-base-fresh-gate-gone:\n",
+    );
+    if stale == wf {
+        return Err("c8-precheck.yml has no carrier-base-fresh-gate job".into());
+    }
+    let (sha_a, sha_b, sha_c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+    let freeze = |bypass: Option<serde_json::Value>| {
+        let mut rs = serde_json::json!({
+            "id": 24_733_250, "name": "archive-refs-frozen (branches)", "target": "branch",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["refs/heads/chain/old"], "exclude": []}},
+            "rules": [{"type": "update"}, {"type": "deletion"}]
+        });
+        if let Some(b) = bypass {
+            rs["bypass_actors"] = b;
+        }
+        rs
+    };
+    let run = |name: &str, tips: serde_json::Value, rulesets: serde_json::Value| {
+        let dir = scratch(name)?;
+        let tips_file = write_json(&dir, "tips.json", &tips)?;
+        let rs_file = write_json(&dir, "rulesets.json", &rulesets)?;
+        let out = Command::new("python3")
+            .arg("-I")
+            .arg(root().join(VERIFIER))
+            .arg("--pre-apply")
+            .arg("--carrier-tips-file")
+            .arg(&tips_file)
+            .arg("--rulesets-file")
+            .arg(&rs_file)
+            .current_dir(root())
+            .output()
+            .map_err(|e| format!("spawn python3: {e}"))?;
+        Ok::<_, String>(output_text(&out))
+    };
+    let two = |b: &str| {
+        serde_json::json!({
+            "refs/heads/chain/promo6-ssh": {"sha": sha_a, "workflow": wf},
+            "refs/heads/rehearsal/audit-wip-ssh": {"sha": sha_b, "workflow": b},
+        })
+    };
+    expect(
+        "both carry",
+        &run("pre-ok", two(&wf), serde_json::json!([]))?,
+        0,
+        "PRE-APPLY OK",
+    )?;
+    expect(
+        "stale carrier",
+        &run("pre-stale", two(&stale), serde_json::json!([]))?,
+        1,
+        "refs/heads/rehearsal/audit-wip-ssh",
+    )?;
+    let mut with_old = two(&wf);
+    with_old["refs/heads/chain/old"] = serde_json::json!({"sha": sha_c, "workflow": null});
+    expect(
+        "frozen skipped",
+        &run(
+            "pre-frozen",
+            with_old.clone(),
+            serde_json::json!([freeze(Some(serde_json::json!([])))]),
+        )?,
+        0,
+        "frozen by ruleset 24733250",
+    )?;
+    expect(
+        "hidden-bypass freeze is not trusted",
+        &run("pre-hidden", with_old, serde_json::json!([freeze(None)]))?,
+        1,
+        "refs/heads/chain/old",
+    )?;
+    expect(
+        "no carriers",
+        &run("pre-none", serde_json::json!({}), serde_json::json!([]))?,
+        1,
+        "no carrier branch",
+    )
 }
