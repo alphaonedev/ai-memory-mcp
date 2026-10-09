@@ -197,6 +197,28 @@ def self_test():
         expect(check(root), "malformed allowlist entry was accepted")
         allow.write_text("docs/compliance/A.md:check-old.sh\n")
 
+        # R2-F2: a repeated <doc>:<name> line is a violation naming the duplicate.
+        allow.write_text("docs/compliance/A.md:check-old.sh\ndocs/compliance/A.md:check-old.sh\n")
+        expect(
+            any("duplicate allowlist entry" in p for p in check(root)),
+            "duplicate allowlist entry was accepted",
+        )
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+
+        # #6170: an allowlisted doc must carry its own erratum even when another doc still does.
+        both = "docs/compliance/A.md:check-old.sh%s\ndocs/compliance/B.md:check-old.sh\n"
+        other.write_text(erratum)
+        doc.write_text("N30 enforcer is `check-old.sh`.\n")
+        allow.write_text(both % "")
+        expect(check(root), "allowlisted doc whose own erratum was removed was accepted")
+        # #6170: only an entry marked ':pinned' may rely on an erratum in another doc.
+        allow.write_text(both % ":pinned")
+        expect(not check(root), "pinned entry backed by a repository erratum was rejected")
+        other.unlink()
+        allow.write_text("docs/compliance/A.md:check-old.sh:pinned\n")
+        expect(check(root), "pinned entry with no erratum anywhere was accepted")
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+
         doc.write_text("Erratum: `check-old.sh` is `scripts/check_missing.py`.\n")
         expect(check(root), "erratum naming a missing successor was accepted")
 
