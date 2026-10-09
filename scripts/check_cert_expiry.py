@@ -810,6 +810,10 @@ os.execv(real, [real] + argv)
 
 
 SHEBANG_MAX = 255  # Linux truncates the interpreter line at 256 bytes (newline included)
+MKDTEMP_NAME_LEN = len("gitshim-long.") + 8  # tempfile.mkdtemp appends 8 random characters
+# Longest absolute scratch path under which the 255-byte boundary cell still fits:
+# 255 - '#!' - ' -I' - '/gitshim-long.XXXXXXXX' - the pad's 1 byte - a 1-byte file name.
+SCRATCH_PATH_LIMIT = 255 - len("#!") - len(" -I") - (1 + MKDTEMP_NAME_LEN) - 2
 
 
 def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
@@ -819,7 +823,13 @@ def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
     interpreter line cannot carry `-I` intact: whitespace or a NUL byte in the
     interpreter path splits it, a path that is not valid UTF-8 cannot be written, and
     a line over SHEBANG_MAX (255) bytes is truncated by the kernel, which silently
-    drops `-I` (a 255-byte line is accepted, a 256-byte line refused)."""
+    drops `-I` (a 255-byte line is accepted, a 256-byte line refused).
+
+    Self-test limit (#6145 R5-F3): the `shim-interpreter` cell builds 255/256-byte
+    interpreter lines under its scratch dir, so that dir's absolute path must be at
+    most SCRATCH_PATH_LIMIT (226) bytes, i.e. the checkout path at most 184 bytes
+    (CI uses 44). A deeper checkout fails the cell with a message naming both
+    lengths; it is a property of the environment, not a defect in the gate."""
     python = sys.executable if interpreter is None else str(interpreter)
     line = f"#!{python} -I"
     if not python or "\x00" in python or any(ch.isspace() for ch in python):
@@ -844,14 +854,21 @@ def shim_interpreter_violation(tmp):
     """None when write_git_shim refuses every unsafe interpreter path and accepts
     the longest safe one (#6145 S-F1), else a description. The boundary is sized to
     the LITERAL 255/256 byte lines the kernel allows/truncates, never to SHEBANG_MAX,
-    so changing that constant to 256 fails here (#6145 R3-F1)."""
+    so changing that constant to 256 fails here (#6145 R3-F1). Needs the scratch dir's
+    absolute path to be at most SCRATCH_PATH_LIMIT (226) bytes, i.e. a checkout path
+    of at most 184 bytes; deeper, it reports the lengths instead of building (R5-F3)."""
     fixed = len("#!") + len(" -I")
     deep = None
     try:
         deep = Path(tempfile.mkdtemp(prefix="gitshim-long.", dir=str(tmp)))
         pad = 255 - fixed - len(os.fsencode(str(deep))) - 1
         if pad < 1:
-            return f"the scratch path is too deep to build the boundary cases (pad {pad})"
+            have = len(os.fsencode(str(tmp)))
+            return (f"the scratch path is too deep to build the boundary cases (pad {pad}): "
+                    f"the scratch path is {have} bytes but the 255-byte shebang boundary cell "
+                    f"needs it at most {SCRATCH_PATH_LIMIT} bytes (checkout path at most "
+                    f"{SCRATCH_PATH_LIMIT - have + len(os.fsencode(str(REPO_ROOT)))} bytes); "
+                    "run the self-test from a shallower checkout")
         long_dir = deep / ("d" * 200)
         long_dir.mkdir()
         too_long = long_dir / ("p" * 60)
@@ -889,17 +906,22 @@ def shim_interpreter_violation(tmp):
             shutil.rmtree(deep, ignore_errors=True)
 
 
-MKDTEMP_NAME_LEN = len("gitshim-long.") + 8  # tempfile.mkdtemp appends 8 random characters
+
+def platform_path_max():
+    """The platform's PATH_MAX: 1024 on macOS and the BSDs, 4096 elsewhere (R5-F1)."""
+    bsd = ("darwin", "freebsd", "openbsd", "netbsd")
+    return 1024 if sys.platform.startswith(bsd) else 4096
 
 
 def path_max(path):
     """The PATH_MAX of the filesystem holding path (Linux 4096, macOS 1024),
-    falling back to 4096 when the platform cannot say (#6145 R4-F1)."""
+    falling back to the platform's value when os.pathconf cannot say (#6145 R4-F1,
+    R5-F1), so the fallback never exceeds the real limit."""
     try:
         limit = os.pathconf(str(path), "PC_PATH_MAX")
     except (OSError, ValueError, AttributeError):
-        return 4096
-    return limit if isinstance(limit, int) and limit > 0 else 4096
+        return platform_path_max()
+    return limit if isinstance(limit, int) and limit > 0 else platform_path_max()
 
 
 def deep_scratch(tmp, target_len):
@@ -971,8 +993,15 @@ def shim_boundary_robustness_violation(tmp):
 def deep_scratch_violation(tmp):
     """None when deep_scratch lands on the exact length, cleans up after itself on
     failure and the robustness cell turns a build failure into a named violation
-    (#6145 R4-F1/F2/F3), else a description."""
-    for want in (2500, 3000):
+    (#6145 R4-F1/F2/F3), else a description. The two targets are relative to the scratch
+    path length (+300 and +600 bytes past the deep_scratch base) and capped below
+    PATH_MAX, so they stay valid on a deep checkout (R5-F3)."""
+    cap = path_max(tmp) - 1
+    base_len = len(os.fsencode(str(tmp))) + 1 + len("gitshim-deep.") + 8
+    if base_len + 1 > cap:
+        return (f"the scratch path is {len(os.fsencode(str(tmp)))} bytes; deep_scratch needs "
+                f"room below the {cap + 1}-byte PATH_MAX")
+    for want in (min(base_len + 300, cap), min(base_len + 600, cap)):
         base = None
         try:
             base, cur = deep_scratch(tmp, want)
@@ -1803,7 +1832,10 @@ SELF_TEST_OK = (
     "scratch dir, sized from the platform PATH_MAX, yields a named violation, not a traceback; "
     "(shim-deep-scratch, #6145) the deep scratch builder lands on the exact length, removes itself on failure and "
     "a build failure is a named violation; (shim-unexecutable, #6145) an unexecutable shim "
-    "is reported as a violation."
+    "is reported as a violation; (path-max-fallback, #6145) PATH_MAX falls back to 1024 on macOS/BSD and "
+    "4096 elsewhere when os.pathconf fails; (guarded, #6145) a crashing cell becomes a named failure and "
+    "KeyboardInterrupt propagates; (shim-scratch-limit, #6145) a too-deep scratch path is reported with its "
+    "length and the limit; (shim-deep-relative, #6145) the deep-scratch targets stay valid on a deep checkout."
 )
 
 
