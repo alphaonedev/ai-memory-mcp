@@ -1302,6 +1302,15 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None, DUMP_DERIVED=False):
             e = find_matching(text, m.end()-1, '(', ')')
             if e < 0: continue
             yield ('memory-error', text[m.end():e], m.start())
+        # S4b (#6135): the own-vocabulary constructors the MemoryError classifier passes through
+        # VERBATIM — crate::errors::refusal / invalid_input (OwnText roots) and MemoryError::Refused.
+        # Foreign text folded into one of them is the construction-site sink src/mcp/error_text.rs
+        # (property 3) says this gate polices. Qualified paths only: other modules declare local fns
+        # named `refusal` that are not the classifier's roots. A `=>` after the call is a PATTERN.
+        for m in re.finditer(r'(?<![A-Za-z0-9_.])(?:(?:crate::)?errors::(?:refusal|invalid_input)|MemoryError::Refused)\s*\(', text):
+            e = find_matching(text, m.end()-1, '(', ')')
+            if e < 0 or text[e+1:e+4].lstrip().startswith('=>'): continue
+            yield ('memory-error', text[m.end():e], m.start())
         # S5: MCP tool errors — Err(...) / map_err(|e| ...) inside a derived MCP fn (the wire error is String)
         for m in re.finditer(r'\bErr\s*\(', text):
             if not in_mcp(m.start()): continue
