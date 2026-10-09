@@ -3294,6 +3294,31 @@ class ExternalPrApprovalOnPush6117(unittest.TestCase):
         self.assertIn("persist-credentials: false", job)
         self.assertIn("pull-requests: read", job)
 
+    APPROVAL_STEPS = ("Self-test the external-PR approval evaluator (#6193)",
+                      "Evaluate external-PR approval requirement")
+    STEP_NEUTRALISER = r"(?m)^\s+(?:- )?(?:if|continue-on-error):|^\s+timeout-minutes:\s*0\s*$"
+
+    def test_6117_r3_f2_approval_steps_cannot_be_neutralised(self) -> None:
+        # Cloud F2: a step-level `if:` or `continue-on-error` turns the required context green.
+        job = _job_text(C8_WORKFLOW.read_text(encoding="utf-8"), APPROVAL_JOB)
+        for name in self.APPROVAL_STEPS:
+            with self.subTest(step=name):
+                block = _step_block(job, name)
+                self.assertTrue(block, f"step {name!r} is missing")
+                self.assertNotRegex(block, self.STEP_NEUTRALISER)
+
+    def test_6117_r3_f2_mutants_are_killed(self) -> None:
+        job = _job_text(C8_WORKFLOW.read_text(encoding="utf-8"), APPROVAL_JOB)
+        for label, extra in (("approval-step-continue-on-error", "        continue-on-error: true\n"),
+                             ("approval-step-if-pull_request-only",
+                              "        if: github.event_name == 'pull_request'\n"),
+                             ("approval-step-timeout-zero", "        timeout-minutes: 0\n")):
+            for name in self.APPROVAL_STEPS:
+                with self.subTest(mutant=label, step=name):
+                    block = _step_block(job, name)
+                    head, _, rest = block.partition("\n")
+                    self.assertRegex(head + "\n" + extra + rest, self.STEP_NEUTRALISER)
+
     def test_6117_r2_sf1_self_test_passes(self) -> None:
         out = subprocess.run([sys.executable, str(APPROVAL_PY), "--self-test"],
                              capture_output=True, text=True, timeout=60, check=False)
