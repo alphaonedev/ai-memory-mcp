@@ -58,7 +58,8 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
         if: runner.environment != 'github-hosted'
@@ -159,5 +160,5 @@ jobs:
       # the same binaries behind. MUST stay the LAST step — pinned by
       # scripts/test/test_ci_runner_target_hygiene_6118.py.
       - name: Prune runner target dir (#6118)
-        if: always()
+        if: always() && steps.checkout.outcome == 'success'
         run: python3 scripts/ci/prune-runner-target.py --target-dir "${CARGO_TARGET_DIR:-target}"

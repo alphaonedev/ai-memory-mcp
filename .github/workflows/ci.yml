@@ -819,7 +819,8 @@ jobs:
         run: |
           echo "::error::Refusing to run fork PR code on a self-hosted runner (leg ${{ matrix.leg }})."
           exit 1
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: docs-only short-circuit
         if: needs.classify.outputs.docs_only == 'true'
@@ -1546,7 +1547,7 @@ jobs:
       # default. MUST stay the LAST step of this job — pinned by
       # scripts/test/test_ci_runner_target_hygiene_6118.py.
       - name: Prune runner target dir (#6118)
-        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment != 'github-hosted'
+        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment != 'github-hosted' && steps.checkout.outcome == 'success'
         shell: bash
         run: python3 scripts/ci/prune-runner-target.py --target-dir "${CARGO_TARGET_DIR:-target}"
 
