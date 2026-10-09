@@ -149,9 +149,14 @@ partial run records nothing.
 5. Every hit is printed with its recorded run and sha.
 6. `record` refuses unless the step exit code is exactly 0.
 
-**Storage.** A per-runner directory (`$CI_TEST_MANIFEST_DIR`, default
-`$HOME/.cache/ai-memory-ci/test-manifest`), one JSON file per node, tier and
-base ref, written atomically under an advisory lock. A run that cannot take
+**Storage.** A per-runner directory: `$CI_TEST_MANIFEST_DIR`, else
+`$HOME/.cache/ai-memory-ci/test-manifest`, else
+`$RUNNER_TEMP/ai-memory-ci/test-manifest`, else
+`<checkout>/.local-runs/ai-memory-ci/test-manifest`. A directory inside the
+checkout but outside `.local-runs/` is refused (the cache is disabled for that
+run). One JSON file per node, tier and base ref, named
+`test-manifest-<first 32 hex of sha256(node, tier, base)>.json`, written
+atomically under an advisory lock. A run that cannot take
 the lock records nothing (lookup is unaffected). Each record removes this
 script's manifests, locks and temp files older than 7 days. `ci.yml` has no
 `actions/cache` precedent (only `Swatinem/rust-cache`, hosted legs only), the

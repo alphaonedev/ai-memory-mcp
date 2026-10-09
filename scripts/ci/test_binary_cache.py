@@ -681,12 +681,49 @@ def cache_allowed(env, event, ref):
     return lookup, reason
 
 
-def safe_name(text):
-    return re.sub(r'[^A-Za-z0-9_.-]', '_', text) or '_'
-
-
 def manifest_path(manifest_dir, node, tier, base):
-    return Path(manifest_dir) / ('test-manifest-%s-%s-%s.json' % (safe_name(node), safe_name(tier), safe_name(base)))
+    """``test-manifest-<sha256(node NUL tier NUL base)[:32]>.json`` (r1 L5).
+
+    A hash, not a character substitution, so ``release/v1`` and
+    ``release_v1`` never share a file. The node, tier and base are stored in
+    the manifest and re-checked on load.
+    """
+    digest = sha256_bytes(('%s\0%s\0%s' % (node, tier, base)).encode())[:32]
+    return Path(manifest_dir) / ('test-manifest-%s.json' % digest)
+
+
+MANIFEST_SUBDIR = Path('ai-memory-ci') / 'test-manifest'
+
+
+def resolve_manifest_dir(arg, env, repo_root):
+    """The manifest directory (r1 L5): ``--manifest-dir``, else
+    $CI_TEST_MANIFEST_DIR, else $HOME/.cache/ai-memory-ci/test-manifest, else
+    $RUNNER_TEMP/ai-memory-ci/test-manifest, else
+    <repo>/.local-runs/ai-memory-ci/test-manifest."""
+    for cand in (arg, env.get('CI_TEST_MANIFEST_DIR')):
+        if cand:
+            return Path(cand)
+    if env.get('HOME'):
+        return Path(env['HOME']) / '.cache' / MANIFEST_SUBDIR
+    if env.get('RUNNER_TEMP'):
+        return Path(env['RUNNER_TEMP']) / MANIFEST_SUBDIR
+    return Path(repo_root) / '.local-runs' / MANIFEST_SUBDIR
+
+
+def check_manifest_dir(manifest_dir, repo_root):
+    """Refuse a manifest dir inside the checkout outside ``.local-runs/``: there
+    it would change the run-time tree key and be wiped by a clean (r1 L5)."""
+    mdir = Path(manifest_dir).resolve()
+    root = Path(repo_root).resolve()
+    try:
+        mdir.relative_to(root)
+    except ValueError:
+        return mdir
+    try:
+        mdir.relative_to(root / '.local-runs')
+    except ValueError:
+        raise CacheError('manifest dir %s is inside the checkout (outside .local-runs/)' % mdir)
+    return mdir
 
 
 def load_manifest(path, tier, base, now):
@@ -841,7 +878,8 @@ def _plan_compute(args, env, now, sd, lookup):
     server_fp = pg_fingerprint(env, psql=args.psql)
     keys, why = compute_keys(exes, build_lines, args.repo_root, rustc_vv, args.profile, env,
                              runtime=not args.no_runtime_tree, server_fp=server_fp)
-    mpath = manifest_path(args.manifest_dir, args.node, args.tier, args.base_ref)
+    mdir = check_manifest_dir(resolve_manifest_dir(args.manifest_dir, env, args.repo_root), args.repo_root)
+    mpath = manifest_path(mdir, args.node, args.tier, args.base_ref)
     if lookup:
         prior, prior_note = load_manifest(mpath, args.tier, args.base_ref, now)
         skip = decide(keys, prior)
@@ -1046,7 +1084,13 @@ def run_record(args, now=None):
               % (ISSUE, plan.get('reason')))
         return 0
     tier, base, node = plan['tier'], plan['base'], plan['node']
-    mpath = manifest_path(args.manifest_dir, node, tier, base)
+    repo_root = getattr(args, 'repo_root', '.') or '.'
+    try:
+        mdir = check_manifest_dir(resolve_manifest_dir(args.manifest_dir, dict(os.environ), repo_root), repo_root)
+    except CacheError as exc:
+        print('::warning::[%s] test-binary cache not recorded: %s' % (ISSUE, exc))
+        return 0
+    mpath = manifest_path(mdir, node, tier, base)
     try:
         lock = _Lock(str(mpath) + '.lock').__enter__()
     except CacheError as exc:
@@ -1082,7 +1126,8 @@ def build_parser():
     sub = ap.add_subparsers(dest='cmd', required=True)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument('--shard-dir', required=True)
-    common.add_argument('--manifest-dir', required=True)
+    common.add_argument('--manifest-dir', default='',
+                        help='manifest directory (default: see resolve_manifest_dir)')
     common.add_argument('--run-id', default='')
     common.add_argument('--sha', default='')
     pl = sub.add_parser('plan', parents=[common])
@@ -1104,6 +1149,7 @@ def build_parser():
     rs.add_argument('--shard-dir', required=True)
     rc = sub.add_parser('record', parents=[common])
     rc.add_argument('--rc', type=int, required=True, help='exit code of the test step; must be 0')
+    rc.add_argument('--repo-root', default='.')
     return ap
 
 

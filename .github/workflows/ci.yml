@@ -1571,7 +1571,13 @@ jobs:
             # actions/cache: its scope rules hide a chain-branch entry from a PR
             # on another base, and archive restores onto self-hosted trees are
             # unsafe, #3128). Any failure here leaves the full lists untouched.
-            cache_dir="${CI_TEST_MANIFEST_DIR:-${HOME:-$PWD}/.cache/ai-memory-ci/test-manifest}"
+            # Manifest dir (review r1 L5): never inside the tracked tree.
+            cache_dir="${CI_TEST_MANIFEST_DIR:-}"
+            if [ -z "$cache_dir" ]; then
+              if [ -n "${HOME:-}" ]; then cache_dir="$HOME/.cache/ai-memory-ci/test-manifest"
+              elif [ -n "${RUNNER_TEMP:-}" ]; then cache_dir="$RUNNER_TEMP/ai-memory-ci/test-manifest"
+              else cache_dir="$PWD/.local-runs/ai-memory-ci/test-manifest"; fi
+            fi
             cache_base="${GITHUB_BASE_REF:-${GITHUB_REF_NAME:-unknown}}"
             rustc -Vv > "$sd/rustc-vv.txt" 2>&1 || : > "$sd/rustc-vv.txt"
             # The plan has its own 120 s deadline (review r1 M3) and runs under
@@ -1621,7 +1627,7 @@ jobs:
               echo "::error::[#6344] sharded '${label}' FAILED (serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}); see the shard output groups above"
             else
               # #6384 — record ONLY after a fully green step (all three shards 0).
-              python3 scripts/ci/test_binary_cache.py record --shard-dir "$sd" --manifest-dir "$cache_dir" \
+              python3 scripts/ci/test_binary_cache.py record --shard-dir "$sd" --manifest-dir "$cache_dir" --repo-root . \
                 --rc 0 --run-id "${GITHUB_RUN_ID:-}" --sha "${GITHUB_SHA:-}" \
                 || echo "::warning::[#6384] test-binary cache record failed (cache unchanged)"
             fi
