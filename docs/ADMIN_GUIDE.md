@@ -1418,14 +1418,17 @@ path, unchanged, and the one to reach for when the daemon is not going to be
 reconfigured:
 
 ```bash
-# sqlite data tier (run on the host holding the database file)
-ai-memory agents bind-api-key --agent-id svc-indexer --token "$TOKEN"
+# sqlite data tier (run on the host holding the database file).
+# The token is read from a 0600 file (--token-file, or the
+# AI_MEMORY_AGENT_API_KEY_FILE env var); a token on --token argv is REFUSED
+# since #3781 because argv is world-readable via /proc/<pid>/cmdline.
+ai-memory agents bind-api-key --agent-id svc-indexer --token-file /etc/ai-memory/svc-indexer.token
 ai-memory agents revoke-api-key --agent-id svc-indexer
 
 # postgres data tier — prefer the AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE
 # channel over --store-url: a URL on argv is world-readable via /proc/<pid>/cmdline
 AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory agents bind-api-key \
-  --agent-id svc-indexer --token "$TOKEN"
+  --agent-id svc-indexer --token-file /etc/ai-memory/svc-indexer.token
 ```
 
 You generate the token; the CLI stores only its SHA-256 digest and never the

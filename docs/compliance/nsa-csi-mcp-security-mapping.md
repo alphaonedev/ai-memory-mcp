@@ -102,7 +102,9 @@ shared-key deployment (the #1985 trap) — but a procurement reviewer must be
 told which posture the coverage claim describes. **A multi-principal deployment
 that leaves the default in place is running the posture this project rates
 finding H1 (High, OWASP A01/A07).** Closing it is two steps:
-`ai-memory agents bind-api-key --agent-id <a> --token <t>` per principal, then
+`ai-memory agents bind-api-key --agent-id <a> --token-file <0600 path>` per
+principal (a token on `--token` argv is refused since #3781; the file channel is
+`--token-file` or `AI_MEMORY_AGENT_API_KEY_FILE`), then
 `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce`. As of v1.0.0 #3418 the
 enrolled key map is a LIVE registry, not a boot snapshot: a running `serve`
 re-reads it from the configured backend (sqlite or postgres) every

@@ -260,7 +260,7 @@ footer a{color:var(--text-muted)}
       <tbody>
         <tr>
           <td class="col-name">a · Access control</td>
-          <td>Namespace isolation + Form 7 agent-EXTERNAL governance + admin-role gate + per-tenant authorisation + HTTP per-agent-key principal binding (#2044/#2129/#2154). <strong>Structurally addressed under <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce</code> with per-agent keys enrolled.</strong> The shipped default (<code>advisory</code>, zero keys enrolled) is finding <strong>H1 (High)</strong> of the <a href="v1.0.0-security-assessment.html">v1.0.0 assessment</a> — cross-tenant IDOR/BOLA via a spoofable <code>X-Agent-Id</code>. Close it with <code>ai-memory agents bind-api-key --agent-id &lt;a&gt; --token &lt;t&gt;</code> per principal, then <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce</code> and restart <code>serve</code>. See <a href="#concern-a">concern (a)</a>.</td>
+          <td>Namespace isolation + Form 7 agent-EXTERNAL governance + admin-role gate + per-tenant authorisation + HTTP per-agent-key principal binding (#2044/#2129/#2154). <strong>Structurally addressed under <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce</code> with per-agent keys enrolled.</strong> The shipped default (<code>advisory</code>, zero keys enrolled) is finding <strong>H1 (High)</strong> of the <a href="v1.0.0-security-assessment.html">v1.0.0 assessment</a> — cross-tenant IDOR/BOLA via a spoofable <code>X-Agent-Id</code>. Close it with <code>ai-memory agents bind-api-key --agent-id &lt;a&gt; --token-file &lt;0600 path&gt;</code> per principal (a token on <code>--token</code> argv is refused since #3781), then <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce</code> and restart <code>serve</code>. See <a href="#concern-a">concern (a)</a>.</td>
           <td><code>namespace_isolation</code>, <code>form_7_agent_external_governance</code></td>
           <td><code>governance::agent_action::check_agent_action</code> · <code>handlers::admin_role::{is_admin_caller, require_admin}</code> · <code>handlers::identity_binding</code></td>
           <td><span class="status partial"><code>enforce</code> posture</span></td>
@@ -431,8 +431,10 @@ footer a{color:var(--text-muted)}
       <p><strong>The shipped default is <code>advisory</code> with zero keys enrolled</strong>, and in that posture the project's own CHANGELOG records the consequence verbatim: <em>"Out of the box (<code>advisory</code> default + zero per-agent keys enrolled) H1/M1 behave EXACTLY as pre-#2044 — the gate is fully inert until an operator enrolls per-agent keys AND sets <code>enforce</code>."</em> That default was chosen deliberately — <code>enforce</code>-by-default with zero keys enrolled would refuse every existing shared-key deployment (the #1985 trap) — but a procurement reviewer must be told which posture the coverage claim describes. <strong>A multi-principal deployment that leaves the default in place is running the posture this project rates finding H1 (High, OWASP A01/A07)</strong> in its own <a href="v1.0.0-security-assessment.html">v1.0.0 adversarial security assessment</a>: cross-tenant IDOR/BOLA on read+mutate via a spoofable <code>X-Agent-Id</code>. Single-operator deployments that enrol no per-agent keys are unaffected either way.</p>
       <p><strong>Closing it is two steps:</strong></p>
 <pre class="codeblock"><span class="com"># 1. Enrol a per-agent API key for every named principal</span>
-<span class="com">#    (add --store-url &lt;url&gt; to enrol against a postgres data tier)</span>
-ai-memory agents bind-api-key --agent-id &lt;agent&gt; --token &lt;token&gt;
+<span class="com">#    (add --store-url &lt;url&gt; to enrol against a postgres data tier).</span>
+<span class="com">#    The token is read from a 0600 file; a token on --token argv is</span>
+<span class="com">#    REFUSED since #3781 (argv is world-readable via /proc/&lt;pid&gt;/cmdline).</span>
+ai-memory agents bind-api-key --agent-id &lt;agent&gt; --token-file &lt;0600 path&gt;
 
 <span class="com">#    Or, since v1.0.0 #3474, over the network with no shell on the data</span>
 <span class="com">#    tier — admin-gated, rate-limited, audited by key FINGERPRINT (never</span>
