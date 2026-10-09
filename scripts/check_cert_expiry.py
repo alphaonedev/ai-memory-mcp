@@ -1321,6 +1321,25 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     for why, env, needle in closed:
         t.gate("pr4", f"pull_request with {why}", repo, env, needle)
 
+    # (#6144) The 64-hex (SHA-256 object format) form is ACCEPTED by the sha
+    # validator: the run then fails cleanly at the later git lookup, never at the
+    # validator. Narrowing ENV_SHA_RE to 40 hex turns these cells red.
+    for key in ("PR_HEAD_SHA", "GITHUB_SHA"):
+        out = t.gate("pr4-sha256", f"pull_request with a 64-hex {key} (accepted by the validator)",
+                     repo, dict(pr_base_env, **{key: "a" * 64}), "does not resolve to a commit")
+        if hex_msg in out:
+            t.fail(f"(pr4-sha256): a 64-hex {key} was refused by the sha validator:", out)
+    # 63 / 65 hex are refused by the validator, with no git call at all: a shim
+    # that refuses every rev-parse must never be reached.
+    for n in (63, 65):
+        for key in ("PR_HEAD_SHA", "GITHUB_SHA"):
+            rc, out, err = run_gate_shimmed(tmp, repo, dict(pr_base_env, **{key: "b" * n}),
+                                            fail="rev-parse")
+            text = out + err
+            if rc != 1 or hex_msg not in text or "shim refuses" in text:
+                t.fail(f"(pr4-sha-len): a {n}-hex {key} was not refused by the validator "
+                       "before any git call:", text)
+
     # (k) fail-closed - pull_request with nothing set (missing PR head sha / base ref).
     t.gate("k", "pull_request with PR_HEAD_SHA and GITHUB_BASE_REF unset", repo,
            {"GITHUB_EVENT_NAME": "pull_request"}, "PR_HEAD_SHA is unset")
@@ -1423,7 +1442,8 @@ SELF_TEST_OK = (
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
     "octopus merge RED; (ci1-ci7, #5970) the event payload range is authoritative under "
     "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
-    "outside CI."
+    "outside CI; (pr4-sha256, #6144) a 64-hex PR_HEAD_SHA / GITHUB_SHA passes the validator "
+    "and fails cleanly at the git lookup; (pr4-sha-len) 63/65-hex refused before any git call."
 )
 
 
