@@ -1501,17 +1501,25 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
               "and no @{upstream})", file=sys.stderr)
 
     # ---- #6124: non-discharging amendment while EXPIRED/VOID ---------------
-    # 5-agent vote (4d3ea1c5), T3. Rule B gets a pass path only when STATUS is
-    # EXPIRED/VOID at both ends AND the diff adds a NEW amendment listing
-    # exactly the changed watched paths / identifiers and citing #6063.
-    def amend(ref, items, cite=True, tag="Amendment", fence=False):
-        lines = [f"> **{tag} (2026-10-09, {ref} - section 7 record, non-discharging).**",
+    # 5-agent vote (4d3ea1c5), T3; decision memory 05c39563. Rule B gets a
+    # pass path only when STATUS is EXPIRED/VOID at both ends AND the diff adds
+    # exactly ONE new amendment (header alone on its line, opening its own
+    # paragraph, outside code fences and HTML comments, valid ISO date not in
+    # the future) listing exactly the changed watched paths / identifiers and
+    # citing only #6063 by its issue URL, while every amendment already present
+    # at the merge-base stays byte-identical and in order (append-only ledger).
+    url6063 = "https://github.com/alphaonedev/ai-memory-mcp/issues/6063"
+
+    def amend(ref, items, cite=True, tag="Amendment", fence=False, date="2026-10-09",
+              back=None):
+        lines = [f"> **{tag} ({date}, {ref} - section 7 record, non-discharging).**",
                  "> Changed in this range:"]
         body = [f"> - `{i}`" for i in items]
         lines.extend(["> ```"] + body + ["> ```"] if fence else body)
-        if cite:
-            lines.append("> Path back to LIVE: WP-B1 re-cert "
-                         "([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)) only.")
+        if back is not None:
+            lines.append(back)
+        elif cite:
+            lines.append(f"> Path back to LIVE: WP-B1 re-cert ([#6063]({url6063})) only.")
         return "\n".join(lines) + "\n"
 
     recv_rs = "src/handlers/federation_receive.rs"
@@ -1523,10 +1531,10 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     fx.banner("EXPIRED", genesis)
     exp6124 = fx.commit([CERT_DOC], "base: banner EXPIRED (#6124)")
 
-    def edit_range(extra, touch=(mod_rs,), ids=False, label="x"):
-        """From exp6124: edit `touch`, optionally add an identifier, rewrite the
-        cert doc (banner unchanged) with `extra` below STATUS, commit."""
-        fx.reset(exp6124)
+    def edit_range(extra, touch=(mod_rs,), ids=False, label="x", frm=None):
+        """From exp6124 (or FRM): edit `touch`, optionally add an identifier,
+        rewrite the cert doc (banner unchanged) with `extra` below STATUS, commit."""
+        fx.reset(frm or exp6124)
         paths = []
         for tp in touch:
             fx.write(tp, f"// {label}\n", append=True)
@@ -1554,6 +1562,13 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     h3 = fx.commit([mod_rs, CERT_DOC], "6124 cell h3")
     t.expect_green("6124-h3", "VOID both ends + valid new amendment", repo, void6124, h3,
                    green6124)
+    # (6124-h4) GREEN - identifier-only change listed exactly.
+    fx.reset(exp6124)
+    fx.write("src/config.rs", f'pub const N: &str = "{new_id}";\n', append=True)
+    fx.banner("EXPIRED", genesis, "\n" + amend("#6162", [new_id]))
+    h4 = fx.commit(["src/config.rs", CERT_DOC], "6124 cell h4")
+    t.expect_green("6124-h4", "identifier-only change listed exactly", repo, exp6124, h4,
+                   green6124)
 
     red6124 = [(sentence, "did not carry the required section 7 expiry sentence")]
     # (6124-f1) RED - a changed watched file is missing from the list.
@@ -1568,16 +1583,45 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     t.expect_red("6124-f3", "list entry that merely contains the path", repo, exp6124, f3, red6124)
     f3b = edit_range("\n> **Amendment (2026-10-09, #6162 - section 7 record).**\n"
                      f"> This touched {mod_rs} in passing.\n"
-                     "> Path back to LIVE: WP-B1 re-cert (#6063) only.\n", label="f3b")
+                     f"> Path back to LIVE: WP-B1 re-cert ([#6063]({url6063})) only.\n",
+                     label="f3b")
     t.expect_red("6124-f3b", "prose mention instead of a list entry", repo, exp6124, f3b, red6124)
     # (6124-f4) RED - a pre-existing amendment is never reused.
     fx.reset(exp6124)
-    fx.banner("EXPIRED", genesis, "\n" + amend("#6100", [mod_rs]))
+    old6100 = amend("#6100", [mod_rs])
+    fx.banner("EXPIRED", genesis, "\n" + old6100)
     pre = fx.commit([CERT_DOC], "base: pre-existing amendment (#6124)")
     fx.write(mod_rs, "// f4\n", append=True)
-    fx.banner("EXPIRED", genesis, "\n" + amend("#6100", [mod_rs]) + "\nUnrelated prose edit.\n")
+    fx.banner("EXPIRED", genesis, "\n" + old6100 + "\nUnrelated prose edit.\n")
     f4 = fx.commit([mod_rs, CERT_DOC], "6124 cell f4")
     t.expect_red("6124-f4", "pre-existing amendment reused", repo, pre, f4, red6124)
+    # (6124-f4b) RED (R2, sec F1 / code F1) - an existing amendment re-dated
+    # (header edited) is a rewrite of the ledger, not a new record.
+    f4b = edit_range("\n" + old6100.replace("2026-10-09", "2026-10-08"), label="f4b", frm=pre)
+    t.expect_red("6124-f4b", "pre-existing amendment header re-dated", repo, pre, f4b, red6124)
+    # (6124-f4c) RED (R2, code F1 P8) - an old one-line amendment split so its
+    # header stands alone is the old record rewritten, not a new one.
+    oneline = ("> **Amendment (2026-10-01, #6100 - record).** Body text on the header line.\n"
+               "> More of the old record.\n")
+    fx.reset(exp6124)
+    fx.banner("EXPIRED", genesis, "\n" + oneline)
+    pre1 = fx.commit([CERT_DOC], "base: one-line-header amendment (#6124)")
+    f4c = edit_range("\n> **Amendment (2026-10-01, #6100 - record).**\n"
+                     "> Body text on the header line.\n> More of the old record.\n"
+                     f"> - `{mod_rs}`\n"
+                     f"> Path back to LIVE: WP-B1 re-cert ([#6063]({url6063})) only.\n",
+                     label="f4c", frm=pre1)
+    t.expect_red("6124-f4c", "old one-line amendment split into a new-looking one", repo, pre1,
+                 f4c, red6124)
+    # (6124-f4d) RED (R2, sec F1) - an old amendment deleted, a valid new one added.
+    f4d = edit_range("\n" + amend("#6162", [mod_rs]), label="f4d", frm=pre)
+    t.expect_red("6124-f4d", "old amendment deleted beside a new one", repo, pre, f4d, red6124)
+    # (6124-f4e) RED (R2, append-only) - an old amendment's body edited beside
+    # a valid new one.
+    f4e = edit_range("\n" + old6100.replace("Changed in this range:", "Changed (edited):")
+                     + "\n" + amend("#6162", [mod_rs]), label="f4e", frm=pre)
+    t.expect_red("6124-f4e", "old amendment body edited beside a new one", repo, pre, f4e,
+                 red6124)
     # (6124-f5) RED - LIVE at both ends keeps rule B whatever the doc says.
     fx.reset(base)
     fx.write(mod_rs, "// f5\n", append=True)
@@ -1585,26 +1629,44 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     f5 = fx.commit([mod_rs, CERT_DOC], "6124 cell f5")
     t.expect_red("6124-f5", "LIVE at merge-base and judged commit + amendment", repo, base, f5,
                  red6124)
-    # (6124-f6) RED - EXPIRED at the merge-base, LIVE (stale bind) at the judged commit.
+    # (6124-f6) RED - EXPIRED at the merge-base flipped to LIVE (stale bind)
+    # beside an amendment. A banner change never enters the amendment route;
+    # it is the #3556 re-issue hatch, and rule C must still hold the new LIVE
+    # claim to its bind (pins that the hatch out of EXPIRED keeps rule C).
     fx.reset(exp6124)
     fx.write(mod_rs, "// f6\n", append=True)
     fx.banner("LIVE", genesis, "\n" + amend("#6162", [mod_rs]))
     f6 = fx.commit([mod_rs, CERT_DOC], "6124 cell f6")
-    t.expect_red("6124-f6", "LIVE at the judged commit + amendment", repo, exp6124, f6, [])
+    t.expect_red("6124-f6", "EXPIRED flipped to a stale LIVE + amendment", repo, exp6124, f6,
+                 [("claims LIVE bound to", "did not hold the new LIVE claim to its bind")])
     # (6124-f7) RED - decoy: header and list inside a code fence.
     f7 = edit_range("\n" + amend("#6162", [mod_rs], fence=True), label="f7")
     t.expect_red("6124-f7", "list inside a code fence", repo, exp6124, f7, red6124)
     f7b = edit_range("\n```\n" + amend("#6162", [mod_rs]) + "```\n", label="f7b")
     t.expect_red("6124-f7b", "whole amendment inside a code fence", repo, exp6124, f7b, red6124)
+    # (6124-f7c) RED (R2, sec F3 / code F2) - a ``` fence is not closed by ~~~.
+    f7c = edit_range("\n```\n~~~\n" + amend("#6162", [mod_rs]) + "```\n", label="f7c")
+    t.expect_red("6124-f7c", "amendment inside a ``` fence 'closed' by ~~~", repo, exp6124,
+                 f7c, red6124)
+    # (6124-f7d) RED (R2, sec F3) - a ```` fence is not closed by a shorter ```.
+    f7d = edit_range("\n````\n```\n" + amend("#6162", [mod_rs]) + "````\n", label="f7d")
+    t.expect_red("6124-f7d", "amendment inside a 4-backtick fence", repo, exp6124, f7d, red6124)
+    # (6124-f7e) RED (R2, sec F2 / code F2) - an amendment in an HTML comment
+    # never renders.
+    f7e = edit_range("\n<!--\n" + amend("#6162", [mod_rs]) + "-->\n", label="f7e")
+    t.expect_red("6124-f7e", "amendment inside an HTML comment", repo, exp6124, f7e, red6124)
+    # (6124-f7f) RED (R2, sec F2) - a comment opened on a quoted line.
+    f7f = edit_range("\n> <!-- hidden\n" + amend("#6162", [mod_rs]) + "> -->\n", label="f7f")
+    t.expect_red("6124-f7f", "amendment inside a quoted HTML comment", repo, exp6124, f7f,
+                 red6124)
+    # (6124-f7g) RED (R2) - an indented code block (>4 columns after '>').
+    indented = "".join(">     " + ln[2:] + "\n" for ln in amend("#6162", [mod_rs]).splitlines())
+    f7g = edit_range("\n> Note.\n>\n" + indented, label="f7g")
+    t.expect_red("6124-f7g", "amendment inside an indented code block", repo, exp6124, f7g,
+                 red6124)
     # (6124-f8) RED - an identifier changed but is not listed.
     f8 = edit_range("\n" + amend("#6162", [mod_rs]), ids=True, label="f8")
     t.expect_red("6124-f8", "identifier changed but not listed", repo, exp6124, f8, red6124)
-    fx.reset(exp6124)
-    fx.write("src/config.rs", f'pub const N: &str = "{new_id}";\n', append=True)
-    fx.banner("EXPIRED", genesis, "\n" + amend("#6162", [new_id]))
-    f8b = fx.commit(["src/config.rs", CERT_DOC], "6124 cell f8b")
-    t.expect_green("6124-f8b", "identifier-only change listed exactly", repo, exp6124, f8b,
-                   green6124)
     # (6124-f9) RED - the amendment sits above the STATUS line.
     fx.reset(exp6124)
     fx.write(mod_rs, "// f9\n", append=True)
@@ -1614,15 +1676,113 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
              "> ## STATUS — **EXPIRED as of 2026-01-01** (fixture)\n\nBody prose.\n")
     f9 = fx.commit([mod_rs, CERT_DOC], "6124 cell f9")
     t.expect_red("6124-f9", "amendment above STATUS", repo, exp6124, f9, red6124)
+    # (6124-f9b) RED (R2, code F10) - the header must open its own paragraph;
+    # glued under a prose line it renders inside that paragraph.
+    f9b = edit_range("\n> Preceding prose line.\n" + amend("#6162", [mod_rs]), label="f9b")
+    t.expect_red("6124-f9b", "header not opening its own paragraph", repo, exp6124, f9b,
+                 red6124)
     # (6124-f10) RED - no #6063 citation, or another issue cited as the way back.
     f10 = edit_range("\n" + amend("#6162", [mod_rs], cite=False), label="f10")
     t.expect_red("6124-f10", "amendment without the #6063 citation", repo, exp6124, f10, red6124)
     f10b = edit_range("\n" + amend("#6162", [mod_rs]).replace("#6063", "#6064")
                       .replace("issues/6063", "issues/6064"), label="f10b")
     t.expect_red("6124-f10b", "amendment citing a different issue", repo, exp6124, f10b, red6124)
-    # (6124-f11) RED - list lines after the block ended do not count.
-    f11 = edit_range("\n" + amend("#6162", []) + "\n- `" + mod_rs + "`\n", label="f11")
+    # (6124-f10c) RED (R2, code F3 P3) - a second back line citing another issue.
+    f10c = edit_range("\n" + amend("#6162", [mod_rs]) + "> Path back to LIVE: #6064.\n",
+                      label="f10c")
+    t.expect_red("6124-f10c", "second back line citing another issue", repo, exp6124, f10c,
+                 red6124)
+    # (6124-f10d) RED (R2, sec F6 / code F3 P5) - another issue as a bare URL.
+    f10d = edit_range("\n" + amend("#6162", [mod_rs], back=(
+        f"> Path back to LIVE: WP-B1 re-cert ([#6063]({url6063})) or "
+        "https://github.com/alphaonedev/ai-memory-mcp/issues/6064.")), label="f10d")
+    t.expect_red("6124-f10d", "back line naming another issue by bare URL", repo, exp6124, f10d,
+                 red6124)
+    # (6124-f10e) RED (R2) - "#6063" linked to another repository's issue.
+    f10e = edit_range("\n" + amend("#6162", [mod_rs], back=(
+        "> Path back to LIVE: WP-B1 re-cert "
+        "([#6063](https://github.com/example-fork/ai-memory-mcp/issues/6063)) only.")),
+        label="f10e")
+    t.expect_red("6124-f10e", "#6063 linked to another repository", repo, exp6124, f10e,
+                 red6124)
+    # (6124-f10f) RED (R2) - a bare "#6063" without the issue URL the doc uses.
+    f10f = edit_range("\n" + amend("#6162", [mod_rs], back=(
+        "> Path back to LIVE: WP-B1 re-cert (#6063) only.")), label="f10f")
+    t.expect_red("6124-f10f", "#6063 cited without its issue URL", repo, exp6124, f10f, red6124)
+    # (6124-f11) RED - list lines after the block ended (a new blockquote
+    # after a blank line) do not count.
+    f11 = edit_range("\n" + amend("#6162", []) + "\n> - `" + mod_rs + "`\n", label="f11")
     t.expect_red("6124-f11", "list outside the amendment block", repo, exp6124, f11, red6124)
+    # (6124-f11b) RED (R2) - list lines after a '>' blank line are a separate
+    # paragraph, not the amendment's list.
+    f11b = edit_range("\n" + amend("#6162", []) + ">\n> - `" + mod_rs + "`\n", label="f11b")
+    t.expect_red("6124-f11b", "list in a later paragraph", repo, exp6124, f11b, red6124)
+    # (6124-f12a) RED (R2, code F6) - the cert doc cannot be read at the
+    # merge-base for the ledger: fail closed, never "no prior amendments".
+    real_run_git = globals()["run_git"]
+    reads = {"n": 0}
+
+    def flaky_run_git(repo_, *args, **kw):
+        joined = " ".join(str(a) for a in args)
+        if CERT_DOC in joined and pre in joined:
+            reads["n"] += 1
+            if reads["n"] > 1:
+                return subprocess.CompletedProcess(list(args), 128, b"",
+                                                   b"injected read failure (self-test)")
+        return real_run_git(repo_, *args, **kw)
+
+    globals()["run_git"] = flaky_run_git
+    try:
+        t.expect_red("6124-f12a", "cert doc unreadable at the merge-base", repo, pre, f4,
+                     [("fail-closed", "did not fail closed on the unreadable cert doc")])
+    finally:
+        globals()["run_git"] = real_run_git
+    # (6124-f12b) RED (R2, code F6 / #6140 shape) - a symlink at the cert-doc
+    # path is never read as the ledger.
+    fx.reset(exp6124)
+    (repo / CERT_DOC).unlink()
+    os.symlink("../../README.md", str(repo / CERT_DOC))
+    link6124 = fx.commit([CERT_DOC], "6124 cell f12b: symlinked cert doc")
+    try:
+        amendment_blocks(repo, link6124)
+        t.fail("(6124-f12b): a symlinked cert doc was read as the amendment ledger")
+    except GateError:
+        pass
+    # (6124-f12c) RED (R2) - an oversized cert doc is refused, not read whole.
+    saved_cap = globals().get("CERT_DOC_MAX_BYTES")
+    globals()["CERT_DOC_MAX_BYTES"] = 16
+    try:
+        amendment_blocks(repo, exp6124)
+        t.fail("(6124-f12c): a cert doc above the size cap was read")
+    except GateError:
+        pass
+    finally:
+        if saved_cap is None:
+            globals().pop("CERT_DOC_MAX_BYTES", None)
+        else:
+            globals()["CERT_DOC_MAX_BYTES"] = saved_cap
+    # (6124-f13) RED (R2, code F7) - the #6162 shape (EXPIRED, cert doc not
+    # touched): the remedy names the amendment route, not a bare re-issue.
+    fx.reset(exp6124)
+    fx.write(mod_rs, "// f13\n", append=True)
+    f13 = fx.commit([mod_rs], "6124 cell f13")
+    t.expect_red("6124-f13", "EXPIRED + watched change without the cert doc", repo, exp6124,
+                 f13, red6124 + [
+                     ("> **Amendment (YYYY-MM-DD", "did not name the amendment header form"),
+                     (f"> - `{mod_rs}`", "did not name the exact list entry"),
+                     ("Path back to LIVE:", "did not name the #6063 back line"),
+                     ("#3899", "did not warn that a re-bind without re-measurement is forbidden"),
+                 ])
+    # (6124-f14) RED (R2, sec F5 / code F8) - exactly ONE new amendment.
+    f14 = edit_range("\n" + amend("#6162", [mod_rs]) + "\n"
+                     + amend("#6199", ["src/unrelated.rs"], cite=False), label="f14")
+    t.expect_red("6124-f14", "a second, unrelated new amendment", repo, exp6124, f14, red6124)
+    # (6124-f15a/b) RED (R2, sec F4 / code F9) - the header date is a real ISO
+    # date and not in the future.
+    f15a = edit_range("\n" + amend("#6162", [mod_rs], date="2026-13-45"), label="f15a")
+    t.expect_red("6124-f15a", "impossible header date", repo, exp6124, f15a, red6124)
+    f15b = edit_range("\n" + amend("#6162", [mod_rs], date="9999-12-31"), label="f15b")
+    t.expect_red("6124-f15b", "future header date", repo, exp6124, f15b, red6124)
     fx.reset(base)
 
     if t.failed:
