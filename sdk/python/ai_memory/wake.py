@@ -643,7 +643,7 @@ def _ed25519_key(seed: bytes) -> Any:
 
 
 def _check_window(cert: _Certificate, source: str, now: float | None) -> None:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     def parse(value: str) -> float:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
@@ -974,11 +974,11 @@ class WakeListener:
                     acked = decode_topics(frame.payload)
                 except WakeError:
                     continue
-                self.subscribed = (
-                    acked
-                    if frame.kind is Kind.SUBSCRIBE
-                    else tuple(t for t in self.subscribed if t not in acked)
-                )
+                if frame.kind is Kind.SUBSCRIBE:
+                    self.subscribed = acked
+                else:
+                    current: tuple[str, ...] = self.subscribed
+                    self.subscribed = tuple(topic for topic in current if topic not in acked)
                 self._emit(WakeSignal(WakeReason.SUBSCRIBED, topics=acked))
             elif frame.kind is Kind.ERROR:
                 raise WakeError(f"the hub refused this session: {_error_text(frame.payload)}")

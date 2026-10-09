@@ -13,6 +13,10 @@ See :class:`AsyncAiMemoryClient` for the asyncio counterpart.
 
 from __future__ import annotations
 
+# #3840 — this class defines a `list` METHOD, so inside the class body a bare
+# `builtins.list[...]` annotation resolves to that method (mypy: "not valid as a type").
+# Annotations below spell the builtin explicitly.
+import builtins
 from types import TracebackType
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
@@ -153,7 +157,7 @@ class AiMemoryClient:
         content: str,
         tier: str | None = None,
         namespace: str | None = None,
-        tags: list[str] | None = None,
+        tags: builtins.list[str] | None = None,
         priority: int | None = None,
         confidence: float | None = None,
         source: str | None = None,
@@ -221,7 +225,7 @@ class AiMemoryClient:
         )
         return self._request("POST", "/api/v1/memories", json_body=body)
 
-    def bulk_store(self, memories: list[CreateMemory | dict[str, Any]]) -> BulkCreateResponse:
+    def bulk_store(self, memories: builtins.list[CreateMemory | dict[str, Any]]) -> BulkCreateResponse:
         """``POST /api/v1/memories/bulk`` — insert up to 1000 at once."""
         payload = [prep_json(m) for m in memories]
         raw = self._request("POST", "/api/v1/memories/bulk", json_body=payload)
@@ -279,7 +283,7 @@ class AiMemoryClient:
         until: str | None = None,
         tags: str | None = None,
         agent_id: str | None = None,
-    ) -> list[Memory]:
+    ) -> builtins.list[Memory]:
         """``GET /api/v1/memories`` — browse with filters."""
         raw = self._request(
             "GET",
@@ -312,7 +316,7 @@ class AiMemoryClient:
         tags: str | None = None,
         agent_id: str | None = None,
         as_agent: str | None = None,
-    ) -> list[Memory]:
+    ) -> builtins.list[Memory]:
         """``GET /api/v1/search`` — FTS keyword OR search (matches any token)."""
         raw = self._request(
             "GET",
@@ -393,7 +397,7 @@ class AiMemoryClient:
             json_body={"source_id": source_id, "target_id": target_id, "relation": relation},
         )
 
-    def get_links(self, memory_id: str) -> list[dict[str, Any]]:
+    def get_links(self, memory_id: str) -> builtins.list[dict[str, Any]]:
         """``GET /api/v1/links/{id}``."""
         raw = self._request("GET", f"/api/v1/links/{memory_id}")
         return raw.get("links", raw) if isinstance(raw, dict) else raw
@@ -425,7 +429,7 @@ class AiMemoryClient:
         """``GET /api/v1/stats``."""
         return Stats.model_validate(self._request("GET", "/api/v1/stats"))
 
-    def namespaces(self) -> list[dict[str, Any]]:
+    def namespaces(self) -> builtins.list[dict[str, Any]]:
         """``GET /api/v1/namespaces``."""
         raw = self._request("GET", "/api/v1/namespaces")
         return raw.get("namespaces", raw) if isinstance(raw, dict) else raw
@@ -506,7 +510,7 @@ class AiMemoryClient:
             "DELETE", "/api/v1/subscriptions", params={"id": subscription_id}
         )
 
-    def subscriptions(self) -> list[Subscription]:
+    def subscriptions(self) -> builtins.list[Subscription]:
         """``GET /api/v1/subscriptions``."""
         raw = self._request("GET", "/api/v1/subscriptions")
         items = raw.get("subscriptions", raw) if isinstance(raw, dict) else raw
@@ -523,7 +527,7 @@ class AiMemoryClient:
         agent_id: str | None = None,
         unread_only: bool | None = None,
         limit: int | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """``GET /api/v1/inbox`` — fetch received messages."""
         raw = self._request(
             "GET",
@@ -543,14 +547,14 @@ class AiMemoryClient:
     # (``docs/federation.md``).
 
     # -- agents -------------------------------------------------------------
-    def agents(self) -> list[AgentRegistration]:
+    def agents(self) -> builtins.list[AgentRegistration]:
         """``GET /api/v1/agents``."""
         raw = self._request("GET", "/api/v1/agents")
         items = raw.get("agents", raw) if isinstance(raw, dict) else raw
         return [AgentRegistration.model_validate(a) for a in items]
 
     def register_agent(
-        self, agent_id: str, agent_type: str, capabilities: list[str] | None = None
+        self, agent_id: str, agent_type: str, capabilities: builtins.list[str] | None = None
     ) -> dict[str, Any]:
         """``POST /api/v1/agents``."""
         return self._request(
