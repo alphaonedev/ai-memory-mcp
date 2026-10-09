@@ -2709,8 +2709,9 @@ impl PostgresStore {
             refused @ dsn::FlooredConnectError::Refused(_) => StoreError::InvalidInput {
                 detail: refused.to_string(),
             },
-            // #1579 A3 (SECURITY) — the parse text is URL-redacted
-            // before it leaves the adapter.
+            // #1579 A3 (SECURITY) — the detail carries the allowlist
+            // rendering of the DSN and none of the driver's text
+            // (#3711 / #4934); it is safe to surface verbatim.
             dsn::FlooredConnectError::Parse(detail) => StoreError::BackendUnavailable {
                 backend: "postgres".to_string(),
                 sqlstate: None,
