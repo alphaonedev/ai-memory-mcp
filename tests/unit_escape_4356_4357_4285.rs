@@ -10,6 +10,10 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use ai_memory::models::{Memory, Tier};
@@ -18,7 +22,6 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tempfile::NamedTempFile;
 use tower::ServiceExt as _;
 
 /// Cells mutate process env (attestation / `why_trace` postures); one at a time.
@@ -32,9 +35,9 @@ fn build_router(
     backend: StorageBackend,
     store: Arc<dyn MemoryStore>,
     sqlite_path: Option<&std::path::Path>,
-) -> (axum::Router, NamedTempFile) {
+) -> (axum::Router, SqliteTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = sqlite_path.unwrap_or(f.path()).to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -162,7 +165,7 @@ fn enforce_mode() {
     );
 }
 
-fn sqlite_store(file: &NamedTempFile) -> Arc<dyn MemoryStore> {
+fn sqlite_store(file: &SqliteTempFile) -> Arc<dyn MemoryStore> {
     Arc::new(ai_memory::store::sqlite::SqliteStore::open(file.path()).expect("sqlite"))
 }
 
@@ -232,7 +235,7 @@ async fn exercise_stranger_cannot_open_subtree_and_reflect_is_pending(
 #[tokio::test]
 async fn unit_stranger_escape_sqlite() {
     let _serial = SERIAL.lock().await;
-    let file = NamedTempFile::new().expect("sqlite file");
+    let file = SqliteTempFile::new().expect("sqlite file");
     exercise_stranger_cannot_open_subtree_and_reflect_is_pending(
         sqlite_store(&file),
         StorageBackend::Sqlite,

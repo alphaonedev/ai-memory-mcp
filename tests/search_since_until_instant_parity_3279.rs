@@ -35,6 +35,9 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::models::{Memory, Tier};
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, Filter, MemoryStore};
@@ -118,7 +121,7 @@ async fn sqlite_search_since_until_are_instant_compared_3279() {
     let ctx = CallerContext::for_agent(OWNER);
     let ns = format!("since-until-3279-{}", uuid::Uuid::new_v4());
 
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let store = SqliteStore::open(f.path()).expect("open SqliteStore");
     seed_sqlite(&store, &ctx, &ns).await;
 
@@ -175,7 +178,7 @@ async fn sqlite_and_postgres_search_since_until_agree_3279() {
     let ctx = CallerContext::for_agent(OWNER);
     let ns = format!("since-until-3279-pg-{}", uuid::Uuid::new_v4());
 
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let sqlite = SqliteStore::open(f.path()).expect("open SqliteStore");
     seed_sqlite(&sqlite, &ctx, &ns).await;
     for m in corpus(&ns) {

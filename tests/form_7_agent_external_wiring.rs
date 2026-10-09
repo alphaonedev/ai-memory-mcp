@@ -23,6 +23,9 @@
 //! (b) the Allow path proceeds, and (c) the install-defaults CLI flips
 //! the seeded rule rows.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::governance::agent_action::AgentAction;
 use ai_memory::governance::wire_check::{self, GOVERNANCE_PRE_ACTION};
 use rusqlite::params;
@@ -282,7 +285,7 @@ fn governance_install_defaults_activates_seed_rules() {
     // Build a fresh DB with the four seeded rows at enabled = 0 — no
     // need to drag in the migration runner; the install-defaults verb
     // only needs the table + the four ids.
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = crate::sqlite_tempfile::SqliteTempFile::new().unwrap();
     {
         let conn = rusqlite::Connection::open(tmp.path()).unwrap();
         conn.execute_batch(

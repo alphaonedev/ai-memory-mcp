@@ -14,12 +14,15 @@
 //! `fail_mode = Closed` pointing at a NONEXISTENT command, so `503` == "the
 //! scoped hook FIRED" and "not 503" == "it was scoped out".
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -71,9 +74,9 @@ fn install_gate_once() {
     });
 }
 
-fn build_test_router() -> (axum::Router, NamedTempFile) {
+fn build_test_router() -> (axum::Router, SqliteTempFile) {
     permissive_attestation_for_tests();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

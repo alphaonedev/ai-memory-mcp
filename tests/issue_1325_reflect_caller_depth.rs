@@ -22,13 +22,13 @@
 //! 3. Mismatch — caller asserts a value the substrate would refute,
 //!    returns `CALLER_DEPTH_MISMATCH` BEFORE the write lands.
 
+use crate::common::sqlite_tempfile::SqliteTempFile;
 use ai_memory::mcp::handle_reflect;
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::storage as db;
 use chrono::Utc;
 use rusqlite::Connection;
 use serde_json::json;
-use tempfile::NamedTempFile;
 
 mod common;
 use common::fresh_conn;
@@ -75,7 +75,7 @@ fn insert_depth0_observation(conn: &Connection, namespace: &str, title: &str) ->
 /// document that the new field is OPTIONAL (no breaking change).
 #[test]
 fn issue_1325_depth_omitted_preserves_substrate_default() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let conn = db::open(tmp.path()).expect("db::open");
     let src_a = insert_depth0_observation(&conn, "ns-1325-omit", "src-a");
     let src_b = insert_depth0_observation(&conn, "ns-1325-omit", "src-b");
@@ -105,7 +105,7 @@ fn issue_1325_depth_omitted_preserves_substrate_default() {
 /// depth-0 sources).
 #[test]
 fn issue_1325_depth_matching_substrate_value_accepted() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let conn = db::open(tmp.path()).expect("db::open");
     let src_a = insert_depth0_observation(&conn, "ns-1325-match", "src-a");
     let src_b = insert_depth0_observation(&conn, "ns-1325-match", "src-b");
@@ -135,7 +135,7 @@ fn issue_1325_depth_matching_substrate_value_accepted() {
 /// caller's `depth=5` silently dropped.
 #[test]
 fn issue_1325_depth_mismatch_refused_with_stable_slug() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let conn = db::open(tmp.path()).expect("db::open");
     let src_a = insert_depth0_observation(&conn, "ns-1325-bad", "src-a");
 
@@ -174,7 +174,7 @@ fn issue_1325_depth_mismatch_refused_with_stable_slug() {
 fn issue_1325_negative_depth_rejected_at_parse() {
     let conn = fresh_conn();
     let src_a = insert_depth0_observation(&conn, "ns-1325-neg", "src-a");
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
 
     let err = handle_reflect(
         &conn,
@@ -207,7 +207,7 @@ fn issue_1325_negative_depth_rejected_at_parse() {
 /// 92.47% < threshold 95%).
 #[test]
 fn issue_1325_negative_depth_refused() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let conn = db::open(tmp.path()).expect("db::open");
     let src_a = insert_depth0_observation(&conn, "ns-1325-neg-refused", "src-a");
 

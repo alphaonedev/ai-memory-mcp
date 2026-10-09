@@ -29,10 +29,10 @@
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
+use crate::common::sqlite_tempfile::SqliteTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt as _;
 
@@ -50,7 +50,7 @@ static HMAC_LOCK: StdMutex<()> = StdMutex::new(());
 
 const TEST_SECRET: &str = "cov-gov-1660-secret";
 
-fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, Db) {
+fn build_router(backend: StorageBackend) -> (axum::Router, SqliteTempFile, Db) {
     // The admin-gate (#1570) treats a self-asserted `X-Agent-Id` naming
     // an admin id as trusted ONLY when the daemon has request
     // authentication configured (or the header-trust escape hatch is
@@ -59,7 +59,7 @@ fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, Db) {
     // `test_app_state` scaffold establishes via
     // `install_security_bypass_for_legacy_tests`.
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let db: Db = Arc::new(Mutex::new((

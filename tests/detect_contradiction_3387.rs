@@ -86,6 +86,9 @@
 //! Nothing here mutates the environment, so this binary needs no lock of its
 //! own: the whole point is that it shares its process with nothing.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::llm::OllamaClient;
 use ai_memory::mcp::tools::handle_detect_contradiction_for_tests;
 use ai_memory::storage as db;
@@ -93,8 +96,8 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn fresh_db() -> (rusqlite::Connection, tempfile::NamedTempFile) {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+fn fresh_db() -> (rusqlite::Connection, crate::sqlite_tempfile::SqliteTempFile) {
+    let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn = db::open(tmp.path()).expect("db::open");
     (conn, tmp)
 }

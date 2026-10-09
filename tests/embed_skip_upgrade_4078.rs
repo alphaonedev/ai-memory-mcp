@@ -4,6 +4,9 @@
 //! Regression for #4078: real opener upgrades a v96-shaped store, and repairs
 //! a previously upgraded store whose derived-cache triggers were lost.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::db;
 use rusqlite::Connection;
 
@@ -77,7 +80,7 @@ fn assert_heals(conn: &Connection) {
 }
 
 fn sqlite_upgrade_preserves_embed_skip_healing(version: i64) {
-    let temp = tempfile::NamedTempFile::new().unwrap();
+    let temp = crate::sqlite_tempfile::SqliteTempFile::new().unwrap();
     let conn = db::open(temp.path()).unwrap();
     conn.execute_batch(SQLITE_V96_SHAPE)
         .expect("restore v96 schema shape");
@@ -138,7 +141,7 @@ fn sqlite_v99_upgrade_preserves_embed_skip_healing_4078() {
 
 #[test]
 fn sqlite_current_schema_repairs_missing_embed_skip_triggers_4078() {
-    let temp = tempfile::NamedTempFile::new().unwrap();
+    let temp = crate::sqlite_tempfile::SqliteTempFile::new().unwrap();
     let conn = db::open(temp.path()).unwrap();
     seed(&conn);
     conn.execute_batch(
@@ -155,7 +158,7 @@ fn sqlite_current_schema_repairs_missing_embed_skip_triggers_4078() {
 /// triggers, shorten the row with a RAW update (no trigger fires), reopen.
 #[test]
 fn sqlite_repair_clears_markers_stranded_in_the_trigger_gap_4078() {
-    let temp = tempfile::NamedTempFile::new().unwrap();
+    let temp = crate::sqlite_tempfile::SqliteTempFile::new().unwrap();
     let conn = db::open(temp.path()).unwrap();
     seed(&conn);
     conn.execute_batch(
@@ -181,7 +184,7 @@ fn sqlite_repair_clears_markers_stranded_in_the_trigger_gap_4078() {
 /// whose oversize row was edited before this binary upgraded it.
 #[test]
 fn sqlite_ladder_upgrade_clears_markers_stranded_in_the_trigger_gap_4078() {
-    let temp = tempfile::NamedTempFile::new().unwrap();
+    let temp = crate::sqlite_tempfile::SqliteTempFile::new().unwrap();
     let conn = db::open(temp.path()).unwrap();
     seed(&conn);
     conn.execute_batch(

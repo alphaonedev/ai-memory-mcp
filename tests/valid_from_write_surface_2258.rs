@@ -33,14 +33,17 @@
     clippy::similar_names
 )]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::{Arc, Once};
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use rusqlite::params;
-use tempfile::NamedTempFile;
 use tower::ServiceExt as _;
 
 // Interval endpoints shared across scenarios.
@@ -102,7 +105,7 @@ fn assert_same_instant(got: &str, want: &str) {
 
 #[test]
 fn mcp_store_valid_from_round_trips_and_filters_valid_at() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let ttl = ResolvedTtl::default();
@@ -167,7 +170,7 @@ fn mcp_store_valid_from_round_trips_and_filters_valid_at() {
 
 #[test]
 fn mcp_store_valid_from_immutable_on_merge_upsert() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let ttl = ResolvedTtl::default();
@@ -229,7 +232,7 @@ fn mcp_store_valid_from_immutable_on_merge_upsert() {
 
 #[test]
 fn mcp_store_rejects_malformed_valid_from() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let ttl = ResolvedTtl::default();
@@ -295,7 +298,7 @@ fn cli_store_args(title: &str, ns: &str) -> ai_memory::cli::store::StoreArgs {
 
 #[test]
 fn cli_store_valid_from_round_trips() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let cfg = ai_memory::config::AppConfig::default();
     let ns = "vf-cli";
@@ -321,7 +324,7 @@ fn cli_store_valid_from_round_trips() {
 
 #[test]
 fn cli_store_rejects_malformed_valid_until() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let cfg = ai_memory::config::AppConfig::default();
     let ns = "vf-cli-bad";
@@ -344,9 +347,9 @@ fn cli_store_rejects_malformed_valid_until() {
 // HTTP `POST /api/v1/memories`
 // ---------------------------------------------------------------------------
 
-fn build_router_fixture() -> (axum::Router, NamedTempFile) {
+fn build_router_fixture() -> (axum::Router, SqliteTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -606,7 +609,7 @@ async fn http_bulk_store_rejects_malformed_valid_from() {
 
 #[test]
 fn store_accepts_inverted_interval_as_empty_never_valid() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let ttl = ResolvedTtl::default();

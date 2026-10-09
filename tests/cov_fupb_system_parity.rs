@@ -20,6 +20,9 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::redundant_closure_for_method_calls)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -29,7 +32,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
 fn build_sqlite_router() -> axum::Router {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     std::mem::forget(f);

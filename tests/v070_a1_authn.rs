@@ -102,7 +102,8 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
     )));
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new()
+            .expect("tempfile for SqliteStore");
         let p = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         std::sync::Arc::new(
@@ -444,7 +445,7 @@ async fn r3_s1_subscribe_succeeds_with_server_wide_secret() {
 async fn s5c1_pattern_a_non_loopback_bind_without_api_key_refuses() {
     // The daemon's bootstrap must fail-fast when the operator tries
     // to bind to a routable address with no API key configured.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for db");
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for db");
     let path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
     let tls = common::tls::TestTls::generate(&path.with_extension("tls3705"));
@@ -492,7 +493,7 @@ async fn s5c1_pattern_a_non_loopback_bind_without_api_key_refuses() {
 async fn s5c1_pattern_a_loopback_bind_without_api_key_succeeds_with_warn() {
     // Loopback bind with no api_key must still boot (single-tenant
     // dev convention). The startup just logs a WARN.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for db");
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for db");
     let path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
     let tls = common::tls::TestTls::generate(&path.with_extension("tls3705"));

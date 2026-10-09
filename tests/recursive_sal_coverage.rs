@@ -14,6 +14,9 @@
 // an empty test target.
 #![cfg(feature = "sal")]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::models::{
     Checkpoint, CheckpointState, ConditionType, ConfidenceSource, Memory, MemoryKind, Routine,
     RoutineRun, RoutineRunState, RoutineState, Signal, SignalType, Tier,
@@ -1038,7 +1041,7 @@ fn uuid_like() -> String {
 
 #[tokio::test]
 async fn sqlite_sal_recursive_surface_roundtrips() {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let store: Arc<dyn MemoryStore> =
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(f.path()).expect("open SqliteStore"));
     exercise_sal_surface(store.as_ref()).await;

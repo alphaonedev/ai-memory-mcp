@@ -58,7 +58,8 @@ fn build_disjoint_fake_pg_router() -> (axum::Router, std::path::PathBuf) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+    let tmp =
+        crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for SqliteStore");
     let store_path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
     let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
@@ -532,7 +533,7 @@ async fn pending_approve_missing_id_returns_404_on_sqlite_1620() {
         // Reuse the harness builder but point the gate at a SQLITE
         // backend: build a plain sqlite router the same way the
         // attestation integration tests do.
-        let f = tempfile::NamedTempFile::new().expect("tempfile");
+        let f = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
         let db_path = f.path().to_path_buf();
         let _ = ai_memory::db::open(&db_path).expect("db::open");
         // Leak the tempfile guard so the DB outlives this block.

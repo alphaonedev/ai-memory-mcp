@@ -24,12 +24,15 @@
 #![allow(clippy::doc_markdown)]
 #![cfg(feature = "sal")]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt as _;
 use wiremock::matchers::{method, path};
@@ -86,11 +89,11 @@ fn permissive_attestation_for_tests() {
     ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
 }
 /// Build a sqlite-backed router whose `app.llm` points at `llm_url`
-/// (a wiremock `/api/chat` endpoint). Keeps the `NamedTempFile` alive
+/// (a wiremock `/api/chat` endpoint). Keeps the `SqliteTempFile` alive
 /// via the returned guard.
-fn build_llm_router(llm_url: Option<&str>) -> (axum::Router, NamedTempFile, Db) {
+fn build_llm_router(llm_url: Option<&str>) -> (axum::Router, SqliteTempFile, Db) {
     permissive_attestation_for_tests();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let db: Db = Arc::new(Mutex::new((

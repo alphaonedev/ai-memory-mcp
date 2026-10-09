@@ -46,42 +46,28 @@ pub struct SqliteTempFile {
 }
 
 impl SqliteTempFile {
-    /// Create the scratch file in the process temp dir.
+    /// Create the scratch file in the process temp dir (drop-in for
+    /// `NamedTempFile::new`).
     ///
     /// # Errors
     ///
     /// Any I/O error from `NamedTempFile::new`.
-    pub fn try_new() -> std::io::Result<Self> {
+    pub fn new() -> std::io::Result<Self> {
         Ok(Self {
             inner: NamedTempFile::new()?,
         })
     }
 
-    /// Create the scratch file inside `dir`.
+    /// Create the scratch file inside `dir` (drop-in for
+    /// `NamedTempFile::new_in`).
     ///
     /// # Errors
     ///
-    /// Any I/O error from `Builder::tempfile_in`.
-    pub fn try_new_in(dir: &Path) -> std::io::Result<Self> {
+    /// Any I/O error from `NamedTempFile::new_in`.
+    pub fn new_in<P: AsRef<Path>>(dir: P) -> std::io::Result<Self> {
         Ok(Self {
-            inner: tempfile::Builder::new().tempfile_in(dir)?,
+            inner: NamedTempFile::new_in(dir)?,
         })
-    }
-
-    /// Create the scratch file inside `dir`; panics on I/O failure (test code).
-    pub fn new_in(dir: &Path) -> Self {
-        Self::try_new_in(dir).expect("tempfile_in")
-    }
-
-    /// Create the scratch file; panics on I/O failure (test code).
-    pub fn new() -> Self {
-        Self::try_new().expect("tempfile")
-    }
-}
-
-impl Default for SqliteTempFile {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -89,5 +75,15 @@ impl Deref for SqliteTempFile {
     type Target = NamedTempFile;
     fn deref(&self) -> &NamedTempFile {
         &self.inner
+    }
+}
+
+impl Drop for SqliteTempFile {
+    fn drop(&mut self) {
+        // Best-effort teardown (OWNERSHIP-25: never panic in Drop). A missing
+        // side file is the normal case when the connection closed cleanly.
+        for side in side_files(self.inner.path()) {
+            let _ = std::fs::remove_file(side);
+        }
     }
 }

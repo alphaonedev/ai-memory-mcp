@@ -35,6 +35,9 @@
 //!   --test attested_created_at_roundtrip_3422                         # + live pg
 //! ```
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::identity::attest;
 use ai_memory::identity::keypair;
 use ai_memory::identity::verify::AttestLevel;
@@ -81,7 +84,7 @@ fn reverify_from_row(
 /// verifies, byte-for-byte.
 #[test]
 fn sqlite_canonical_created_at_reverifies_from_the_persisted_row_3422() {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("db::open");
     let kp = keypair::generate(AGENT).expect("keypair");
 

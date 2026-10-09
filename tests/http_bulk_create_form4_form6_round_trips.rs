@@ -17,18 +17,21 @@
 //! posting a batch with full Form-4+Form-6 fields silently lost
 //! everything.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
-fn build_test_router() -> (axum::Router, NamedTempFile) {
+fn build_test_router() -> (axum::Router, SqliteTempFile) {
     // #1919 — this suite pins Form-4/Form-6 field round-tripping, not
     // attestation; opt out of the v0.9 required-agent-attestation default
     // so the unsigned bulk rows persist instead of 403 ATTESTATION_FAILED.
@@ -36,7 +39,7 @@ fn build_test_router() -> (axum::Router, NamedTempFile) {
     ATTEST.call_once(|| unsafe {
         std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0");
     });
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

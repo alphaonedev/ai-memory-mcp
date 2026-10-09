@@ -51,7 +51,8 @@ fn build_router_in_memory() -> (axum::Router, ai_memory::handlers::Db) {
     // OWN tempfile so there is no second writer on the receive db.
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new()
+            .expect("tempfile for SqliteStore");
         let sp = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         std::sync::Arc::new(

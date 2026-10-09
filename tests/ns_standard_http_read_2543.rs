@@ -22,15 +22,18 @@
 //! - CONTROL: shared-scope standard remains fetchable
 //! - CONTROL: owner can still read their own private standard
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -198,7 +201,7 @@ async fn get_standard_path(router: &axum::Router, ns: &str, agent: &str) -> (Sta
 
 #[tokio::test]
 async fn http_qs_withholds_private_cross_namespace_standard_2543() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     {
         let conn = ai_memory::db::open(tmp.path()).expect("open");
         seed_cross_namespace_bind(&conn, None);
@@ -227,7 +230,7 @@ async fn http_qs_withholds_private_cross_namespace_standard_2543() {
 
 #[tokio::test]
 async fn http_path_withholds_private_cross_namespace_standard_2543() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     {
         let conn = ai_memory::db::open(tmp.path()).expect("open");
         seed_cross_namespace_bind(&conn, None);
@@ -246,7 +249,7 @@ async fn http_path_withholds_private_cross_namespace_standard_2543() {
 
 #[tokio::test]
 async fn http_qs_shared_standard_still_readable_2543() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     {
         let conn = ai_memory::db::open(tmp.path()).expect("open");
         seed_cross_namespace_bind(&conn, Some("shared"));
@@ -273,7 +276,7 @@ async fn http_qs_shared_standard_still_readable_2543() {
 
 #[tokio::test]
 async fn http_qs_owner_can_read_own_private_standard_2543() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     {
         let conn = ai_memory::db::open(tmp.path()).expect("open");
         seed_cross_namespace_bind(&conn, None);

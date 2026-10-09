@@ -24,16 +24,20 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::identity_binding::api_key_sha256_hex;
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 use tower::ServiceExt as _;
 
 const SHARED_KEY: &str = "shared-transport-key";
@@ -49,7 +53,7 @@ fn fresh_dir() -> TempDir {
 /// Build a router in `mode` with `alice` enrolled as the owner of the
 /// `ALICE_KEY` per-agent api-key. The shared transport key (`SHARED_KEY`)
 /// authenticates transport but resolves to NO per-agent principal.
-fn build_router(mode: HttpIdentityMode) -> (axum::Router, NamedTempFile) {
+fn build_router(mode: HttpIdentityMode) -> (axum::Router, SqliteTempFile) {
     let mut enrolled = HashMap::new();
     enrolled.insert(api_key_sha256_hex(ALICE_KEY), "alice".to_string());
     build_router_with(mode, enrolled)
@@ -59,7 +63,7 @@ fn build_router(mode: HttpIdentityMode) -> (axum::Router, NamedTempFile) {
 /// gate is fully inert in this posture (the zero-config single-operator
 /// deployment) regardless of `mode` — this is the path the third pass must
 /// preserve for the newly-gated #2135/#2137/#2138/#2140 routes.
-fn build_router_zero_enroll(mode: HttpIdentityMode) -> (axum::Router, NamedTempFile) {
+fn build_router_zero_enroll(mode: HttpIdentityMode) -> (axum::Router, SqliteTempFile) {
     build_router_with(mode, HashMap::new())
 }
 
@@ -68,9 +72,9 @@ fn build_router_zero_enroll(mode: HttpIdentityMode) -> (axum::Router, NamedTempF
 fn build_router_with(
     mode: HttpIdentityMode,
     enrolled: HashMap<String, String>,
-) -> (axum::Router, NamedTempFile) {
+) -> (axum::Router, SqliteTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

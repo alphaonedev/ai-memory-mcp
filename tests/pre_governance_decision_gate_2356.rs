@@ -24,13 +24,16 @@
 //! is a process-global `OnceLock` (first-writer-wins, non-resettable), and
 //! a single sequential test avoids intra-file races on the set-once gate.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -45,9 +48,9 @@ fn permissive_attestation_for_tests() {
     ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
 }
 
-fn build_test_router() -> (axum::Router, NamedTempFile) {
+fn build_test_router() -> (axum::Router, SqliteTempFile) {
     permissive_attestation_for_tests();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

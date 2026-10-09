@@ -27,12 +27,15 @@
 
 #![cfg(feature = "sal")]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -132,8 +135,8 @@ fn sqlite_ledger_prunes_past_the_retention_window_3419() {
 // The HTTP surface — `POST /api/v1/memories`, both backend lanes.
 // ===========================================================================
 
-fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, std::path::PathBuf) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn build_router(backend: StorageBackend) -> (axum::Router, SqliteTempFile, std::path::PathBuf) {
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

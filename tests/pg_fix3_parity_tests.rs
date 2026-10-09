@@ -20,6 +20,9 @@
 
 #![cfg(feature = "sal-postgres")]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::models::{Memory, Tier};
 use ai_memory::store::postgres::PostgresStore;
 use ai_memory::store::{CallerContext, MemoryStore, UpdatePatch};
@@ -395,16 +398,16 @@ async fn live_delete_cleans_namespace_meta_pg_1642() {
 
 fn build_pg_router(
     store: std::sync::Arc<dyn MemoryStore>,
-) -> (axum::Router, tempfile::NamedTempFile) {
+) -> (axum::Router, crate::sqlite_tempfile::SqliteTempFile) {
     use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
     use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
     // The sqlite Db tuple is transport plumbing the pg branch never
-    // reads; the NamedTempFile guard is returned so the caller keeps
+    // reads; the SqliteTempFile guard is returned so the caller keeps
     // the backing file alive for the router's lifetime.
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let db: Db = Arc::new(Mutex::new((conn, db_path, ResolvedTtl::default(), true)));

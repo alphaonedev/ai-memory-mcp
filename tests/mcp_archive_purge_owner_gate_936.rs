@@ -23,12 +23,15 @@
 //!    envelope includes `owner_scope: "admin"|"caller"` so the
 //!    operator can audit which branch fired.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use serde_json::json;
-use tempfile::NamedTempFile;
 
-fn open_db_with_seed(owner: &str, namespace: &str) -> NamedTempFile {
-    let f = NamedTempFile::new().expect("tempfile");
+fn open_db_with_seed(owner: &str, namespace: &str) -> SqliteTempFile {
+    let f = SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("db::open");
     let now = chrono::Utc::now().to_rfc3339();
     let id = uuid::Uuid::new_v4().to_string();
@@ -67,7 +70,7 @@ fn open_db_with_seed(owner: &str, namespace: &str) -> NamedTempFile {
     f
 }
 
-fn add_seed(f: &NamedTempFile, owner: &str, namespace: &str) {
+fn add_seed(f: &SqliteTempFile, owner: &str, namespace: &str) {
     let conn = ai_memory::db::open(f.path()).expect("reopen db");
     let now = chrono::Utc::now().to_rfc3339();
     let id = uuid::Uuid::new_v4().to_string();
@@ -105,7 +108,7 @@ fn add_seed(f: &NamedTempFile, owner: &str, namespace: &str) {
         .expect("archive_memory must move row");
 }
 
-fn archive_count(f: &NamedTempFile) -> i64 {
+fn archive_count(f: &SqliteTempFile) -> i64 {
     let conn = ai_memory::db::open(f.path()).expect("reopen db");
     conn.query_row("SELECT COUNT(*) FROM archived_memories", [], |r| r.get(0))
         .expect("count")
@@ -170,7 +173,7 @@ fn mcp_response_carries_owner_scope_936() {
     // #3383: both admin fixtures seed the same immutable process allowlist.
     ai_memory::identity::set_admin_agent_ids(vec!["ops:admin".to_string()]);
     // Empty DB still returns the envelope with `owner_scope`.
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let _ = ai_memory::db::open(f.path()).expect("db::open");
     let conn = ai_memory::db::open(f.path()).expect("reopen db");
 

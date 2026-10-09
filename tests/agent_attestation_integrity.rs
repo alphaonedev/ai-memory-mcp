@@ -22,13 +22,16 @@
 //! Env-mutating cases serialise on [`ENV_LOCK`]; edition-2024 requires the
 //! `unsafe` env mutators.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -39,8 +42,8 @@ use ai_memory::handlers::{ApiKeyState, AppState, Db};
 /// test in this binary that reads `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn build_test_router() -> (axum::Router, NamedTempFile, std::path::PathBuf) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn build_test_router() -> (axum::Router, SqliteTempFile, std::path::PathBuf) {
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -433,7 +436,7 @@ fn mcp_require_attestation_rejects_unsigned_store() {
     // SAFETY: edition-2024 env mutation; serialised by ENV_LOCK above.
     unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "1") };
 
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let ttl = ResolvedTtl::default();
@@ -588,7 +591,7 @@ fn mcp_default_permissive_lands_unsigned_store_claimed_1985() {
     // surface-scoped default lives in the ABSENCE of the var.
     unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION") };
 
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let ttl = ResolvedTtl::default();
@@ -683,7 +686,7 @@ fn mcp_forged_signature_rejected_under_permissive_default_1985() {
     // SAFETY: edition-2024 env mutation; serialised by ENV_LOCK.
     unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION") };
 
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
 
@@ -799,7 +802,7 @@ fn cli_opt_out_zero_lands_unsigned_store_claimed_1751() {
 /// unsigned/require tests never reach. No env mutation, so no `ENV_LOCK`.
 #[test]
 fn mcp_signed_store_upgrades_to_agent_attested() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
 

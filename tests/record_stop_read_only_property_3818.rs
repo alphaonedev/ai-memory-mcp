@@ -75,8 +75,11 @@ fn call(tool: &str, args: &Value) -> Value {
     json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}})
 }
 
-fn open_db() -> (tempfile::NamedTempFile, rusqlite::Connection) {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+fn open_db() -> (
+    crate::common::sqlite_tempfile::SqliteTempFile,
+    rusqlite::Connection,
+) {
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(tmp.path()).expect("open db");
     (tmp, conn)
 }

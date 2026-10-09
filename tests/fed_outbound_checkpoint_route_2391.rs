@@ -24,6 +24,9 @@
 //! to unwired, this returns `503 under-replicated` instead — the assertion is
 //! load-bearing on the fanout, not merely on the handler existing.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -95,7 +98,7 @@ fn federation_config(push_url: &str) -> ai_memory::federation::FederationConfig 
 fn build_router_with_pending_checkpoint(
     federation: Option<ai_memory::federation::FederationConfig>,
 ) -> axum::Router {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     std::mem::forget(f);

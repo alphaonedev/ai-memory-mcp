@@ -11,12 +11,15 @@
 
 #![cfg(feature = "sal")]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, MemoryStore};
 
 #[tokio::test]
 async fn list_unembedded_denied_non_admin_sqlite_3344() {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let store = SqliteStore::open(tmp.path()).expect("open");
     let tenant = CallerContext::for_agent("ai:tenant-3344");
     let scanned = store

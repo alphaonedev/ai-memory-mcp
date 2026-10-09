@@ -38,6 +38,9 @@
 #![allow(clippy::await_holding_lock)]
 #![allow(clippy::too_many_lines)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -153,8 +156,8 @@ async fn spawn_enrolled_receiver(peer_pubkey: VerifyingKey) -> (String, Enrolled
 /// Seed one memory into a fresh sqlite DB so `sync_cycle_once`'s
 /// `memories_updated_since` returns a non-empty `outgoing` batch and the
 /// push actually fires.
-fn seed_db_with_one_memory() -> tempfile::NamedTempFile {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+fn seed_db_with_one_memory() -> crate::sqlite_tempfile::SqliteTempFile {
+    let db_tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("db tempfile");
     let conn = db::open(db_tmp.path()).expect("db::open");
     let now = chrono::Utc::now().to_rfc3339();
     let mem = Memory {

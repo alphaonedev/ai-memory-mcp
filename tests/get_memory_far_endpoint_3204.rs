@@ -25,15 +25,18 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use ai_memory::models::{Memory, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -44,7 +47,7 @@ const OTHER_INBOX: &str = "_messages/ai:other-3204";
 
 struct Fixture {
     router: axum::Router,
-    file: NamedTempFile,
+    file: SqliteTempFile,
     anchor: String,
     own: String,
     collective: String,
@@ -78,7 +81,7 @@ fn fixture_with_store(
     live_store: Option<Arc<dyn ai_memory::store::MemoryStore>>,
 ) -> Fixture {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let file = NamedTempFile::new().expect("tempfile");
+    let file = SqliteTempFile::new().expect("tempfile");
     let path = file.path().to_path_buf();
     let conn = ai_memory::db::open(&path).expect("open DB");
     let anchor = insert(&conn, NS, json!({"agent_id": CALLER, "scope": "private"}));

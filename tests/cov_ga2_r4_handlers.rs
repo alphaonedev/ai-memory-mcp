@@ -72,6 +72,9 @@
 #![allow(clippy::uninlined_format_args)]
 #![allow(clippy::let_underscore_untyped)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -148,8 +151,8 @@ fn enable_admin_header_trust() {
 // the legacy db path and the trait).
 // ---------------------------------------------------------------------------
 
-fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile, Db) {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+fn sqlite_router() -> (axum::Router, crate::sqlite_tempfile::SqliteTempFile, Db) {
+    let db_tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -217,8 +220,8 @@ fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile, Db) {
 
 /// SQLite router with `verify_require_nonce = true` so the strict-mode
 /// missing-nonce 400 arm in `verify_link_handler` is reachable.
-fn sqlite_router_strict_nonce() -> (axum::Router, tempfile::NamedTempFile) {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+fn sqlite_router_strict_nonce() -> (axum::Router, crate::sqlite_tempfile::SqliteTempFile) {
+    let db_tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen");

@@ -31,12 +31,15 @@
 
 #![cfg(feature = "sal")]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -63,7 +66,7 @@ fn permissive_attestation_for_tests() {
 /// tempfile that owns the sqlite database (kept alive by the caller) and its
 /// path, so a test can read the DURABLE row back and assert on what actually
 /// landed — not merely on the wire envelope.
-fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, std::path::PathBuf) {
+fn build_router(backend: StorageBackend) -> (axum::Router, SqliteTempFile, std::path::PathBuf) {
     permissive_attestation_for_tests();
     // #1570 — model an AUTHENTICATED deployment (api_key configured at boot).
     // `require_admin` honours an `X-Agent-Id` role claim only when the daemon
@@ -74,7 +77,7 @@ fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, std::p
     // about attestation, not the admin gate. Same fixture line as
     // `tests/import_memories_admin_gate_956.rs`.
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

@@ -34,6 +34,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::await_holding_lock)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -60,7 +63,7 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn setup_router() -> (axum::Router, Db) {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     std::mem::forget(db_tmp);
     let _ = ai_memory::db::open(&db_path).expect("db::open");

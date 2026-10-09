@@ -362,7 +362,7 @@ async fn k8_http_link_at_links_per_day_limit_returns_429_1621() {
 
     const AID: &str = "ai:k8-http-1621";
 
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

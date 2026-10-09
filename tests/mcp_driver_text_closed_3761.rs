@@ -20,6 +20,12 @@
 
 #![allow(clippy::missing_panics_doc)]
 
+// The cfg-gated `mod common` also compiles this file; the own declaration keeps
+// non-`sal` builds working.
+#[allow(clippy::duplicate_mod)]
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::mcp::error_text::DB_ERROR_TEXT;
 use serde_json::json;
 
@@ -141,7 +147,7 @@ fn namespace_bind_read_fault_refuses_closed_3761() {
 fn namespace_ownership_refusal_passes_through_3761() {
     unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") };
     unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
-    let dir = tempfile::NamedTempFile::new().expect("tempfile");
+    let dir = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(dir.path()).expect("open");
     let ttl = ai_memory::config::ResolvedTtl::default();
     let owner = "ai:owner-3761";

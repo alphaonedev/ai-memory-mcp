@@ -58,7 +58,7 @@ use common::free_port;
 /// Build an `AppState` with a SAL-routed `SqliteStore` opened against
 /// a tempfile so the freshly-applied migrations populate the
 /// `schema_version` table.
-fn build_sqlite_app_state() -> (AppState, tempfile::NamedTempFile) {
+fn build_sqlite_app_state() -> (AppState, crate::common::sqlite_tempfile::SqliteTempFile) {
     // The `Db` legacy field stays a `:memory:` connection because the
     // legacy direct-rusqlite handlers reach for it at GC / WAL
     // checkpoint time; the test never exercises those paths so a
@@ -70,7 +70,8 @@ fn build_sqlite_app_state() -> (AppState, tempfile::NamedTempFile) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
     let path = std::path::PathBuf::from(":memory:");
     let db: Db = Arc::new(Mutex::new((conn, path, ResolvedTtl::default(), true)));
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+    let tmp =
+        crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for SqliteStore");
     let store: Arc<dyn MemoryStore> =
         Arc::new(SqliteStore::open(tmp.path()).expect("open SqliteStore"));
     let state = AppState {

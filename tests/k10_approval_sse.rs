@@ -22,6 +22,9 @@
 //!      (broadcast channels do not replay history, so the subscribe
 //!      ordering matters).
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::approvals::{ApprovalEvent, publish, subscribe};
 use serde_json::json;
 use std::time::Duration;
@@ -116,7 +119,7 @@ async fn http_sse_endpoint_emits_event_to_attached_client() {
     )));
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for SqliteStore");
         let p = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         std::sync::Arc::new(

@@ -39,6 +39,9 @@
 
 #![allow(clippy::doc_markdown, clippy::missing_panics_doc)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::SECS_PER_DAY;
 use ai_memory::db;
 use ai_memory::models::{Memory, MemoryKind, Tier};
@@ -189,7 +192,7 @@ fn seed_v064_corpus(conn: &Connection) -> Vec<String> {
 
 #[test]
 fn v064_baseline_data_survives_full_v070_upgrade_lossless_and_idempotent() {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
 
     // 1. Seed a realistic v0.6.4 corpus under the full schema, then
@@ -291,7 +294,7 @@ fn v064_legacy_rows_physically_lacking_v070_columns_upgrade_losslessly() {
     // is intentionally retained: it carries a self-referential FOREIGN
     // KEY, which SQLite forbids dropping — its add-arm is already pinned
     // by `wt_1_a_schema_migration`.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
 
     let before_fp;

@@ -37,6 +37,9 @@
     clippy::missing_panics_doc
 )]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::models::ConfidenceSource;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -50,9 +53,9 @@ use ai_memory::profile::Profile;
 use ai_memory::storage;
 use ai_memory::storage::GovernanceRefusal;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 
 // ---------------------------------------------------------------------------
 // Mock curator — deterministic, programmable, no network.
@@ -155,8 +158,8 @@ fn set_mode(mode: HookMode) {
 // Fixtures
 // ---------------------------------------------------------------------------
 
-fn fresh_db() -> (NamedTempFile, Connection) {
-    let tmp = NamedTempFile::new().expect("tempfile");
+fn fresh_db() -> (SqliteTempFile, Connection) {
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let conn = storage::open(tmp.path()).expect("db::open");
     (tmp, conn)
 }

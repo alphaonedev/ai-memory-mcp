@@ -17,12 +17,15 @@
 #![allow(clippy::doc_markdown)]
 #![cfg(feature = "sal")]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt as _;
 
@@ -40,13 +43,13 @@ fn permissive_attestation_for_tests() {
     // the process lifetime, set before the caller issues any gated store.
     ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
 }
-fn build_router() -> (axum::Router, NamedTempFile) {
+fn build_router() -> (axum::Router, SqliteTempFile) {
     permissive_attestation_for_tests();
     // Mark request-authn configured so the explicit admin allowlist
     // below admits the admin caller (the `cfg(test)` "*" wildcard arm
     // is compiled out for integration-test linkage; #980/#1570).
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let db: Db = Arc::new(Mutex::new((

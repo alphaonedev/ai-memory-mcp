@@ -33,6 +33,9 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc, clippy::field_reassign_with_default)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::models::Memory;
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, Filter, MemoryStore, MetadataEq};
@@ -137,7 +140,7 @@ fn shape_matrix() -> Vec<(&'static str, serde_json::Value, bool)> {
 
 #[tokio::test]
 async fn metadata_eq_pushdown_matches_rust_predicate_on_every_json_shape_2580() {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("db::open");
 
     let matrix = shape_matrix();
@@ -197,7 +200,7 @@ async fn metadata_eq_pushdown_matches_rust_predicate_on_every_json_shape_2580() 
 
 #[tokio::test]
 async fn metadata_eq_key_is_bound_never_json_path_interpolated_2580() {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("db::open");
 
     // A row whose metadata carries a benign key, plus a row with a key
@@ -258,7 +261,7 @@ async fn metadata_eq_key_is_bound_never_json_path_interpolated_2580() {
 
 #[tokio::test]
 async fn unset_metadata_eq_is_byte_identical_legacy_list_2580() {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("db::open");
     for (label, metadata, _) in shape_matrix() {
         let mut m = Memory::default();

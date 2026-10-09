@@ -22,15 +22,18 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::doc_markdown)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -164,7 +167,7 @@ async fn delete_as(router: &axum::Router, caller: &str, id: &str) -> (StatusCode
 
 #[tokio::test]
 async fn bob_cannot_delete_alice_memory_937() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let alice_id = seed_memory(tmp.path(), "ai:alice", "delete-gate/test", &json!({}));
     let router = build_router_fixture(tmp.path());
     let (status, body) = delete_as(&router, "ai:bob", &alice_id).await;
@@ -196,7 +199,7 @@ async fn bob_cannot_delete_alice_memory_937() {
 
 #[tokio::test]
 async fn owner_can_delete_own_memory_937() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let alice_id = seed_memory(tmp.path(), "ai:alice", "delete-gate/own", &json!({}));
     let router = build_router_fixture(tmp.path());
     let (status, body) = delete_as(&router, "ai:alice", &alice_id).await;
@@ -205,7 +208,7 @@ async fn owner_can_delete_own_memory_937() {
 
 #[tokio::test]
 async fn inbox_target_can_delete_inbox_message_937() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let inbox_id = seed_memory(
         tmp.path(),
         "ai:alice",

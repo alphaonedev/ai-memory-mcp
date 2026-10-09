@@ -33,12 +33,15 @@
 #![allow(clippy::await_holding_lock)]
 #![allow(clippy::doc_markdown)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::{Arc, Mutex as StdMutex};
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -106,7 +109,7 @@ fn permissive_attestation_for_tests() {
     // the process lifetime, set before the caller issues any gated store.
     ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
 }
-fn build_router_fixture() -> (axum::Router, NamedTempFile) {
+fn build_router_fixture() -> (axum::Router, SqliteTempFile) {
     permissive_attestation_for_tests();
     // #1570 — these tests model an AUTHENTICATED deployment (api_key
     // configured at boot), the pre-#1570 implicit posture, so the admin
@@ -123,7 +126,7 @@ fn build_router_fixture() -> (axum::Router, NamedTempFile) {
 /// [`build_router_fixture`] delegates here with `Arc::new(None)`.
 fn build_router_fixture_with_llm(
     llm: Arc<ai_memory::reload::SwappableLlm>,
-) -> (axum::Router, NamedTempFile) {
+) -> (axum::Router, SqliteTempFile) {
     permissive_attestation_for_tests();
     // #1570 — these tests model an AUTHENTICATED deployment (api_key
     // configured at boot), the pre-#1570 implicit posture, so the admin
@@ -132,7 +135,7 @@ fn build_router_fixture_with_llm(
     // is pinned by tests/admin_header_trust_1570.rs in its own process.
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     install_federation_legacy_bypass();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -221,7 +224,7 @@ fn build_router_fixture_with_llm(
 /// tests build their own router with this helper so the rejection
 /// contract on `/export` and `/import` stays exercised at the same
 /// fixture grain (no separate test binary needed).
-fn build_router_fixture_no_admin() -> (axum::Router, NamedTempFile) {
+fn build_router_fixture_no_admin() -> (axum::Router, SqliteTempFile) {
     permissive_attestation_for_tests();
     // #1570 — these tests model an AUTHENTICATED deployment (api_key
     // configured at boot), the pre-#1570 implicit posture, so the admin
@@ -230,7 +233,7 @@ fn build_router_fixture_no_admin() -> (axum::Router, NamedTempFile) {
     // is pinned by tests/admin_header_trust_1570.rs in its own process.
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     install_federation_legacy_bypass();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

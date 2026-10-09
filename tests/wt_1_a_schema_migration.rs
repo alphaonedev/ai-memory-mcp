@@ -67,9 +67,9 @@ fn index_exists(conn: &Connection, index_name: &str) -> bool {
 
 /// Open a fresh sqlite DB through `db::open` (which applies the full
 /// migration ladder). Returns the `Connection` plus the holding
-/// `NamedTempFile` so the file outlives the connection.
-fn fresh_db_via_open() -> (Connection, tempfile::NamedTempFile) {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+/// `SqliteTempFile` so the file outlives the connection.
+fn fresh_db_via_open() -> (Connection, crate::common::sqlite_tempfile::SqliteTempFile) {
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(tmp.path()).expect("db::open applies migrations");
     (conn, tmp)
 }
@@ -168,7 +168,7 @@ fn test_migration_v36_idempotent() {
     // Re-opening the same DB file runs migrate() a second time. The
     // fast-path early-return at the top of migrate() should short-
     // circuit because version >= CURRENT_SCHEMA_VERSION.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn1 = ai_memory::db::open(tmp.path()).expect("first open");
     let v1: i64 = conn1
         .query_row(
@@ -219,7 +219,7 @@ fn test_migration_v36_preserves_existing_data() {
     // WITHOUT touching the new columns reproduces that exact
     // scenario on a fresh DB; the columns default to NULL and the
     // row count stays stable across replay.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(tmp.path()).expect("first open");
 
     for i in 0..100 {
@@ -375,11 +375,12 @@ fn test_relation_derives_from_check_constraint() {
 // Capabilities endpoint — extends s75 pattern.
 // -------------------------------------------------------------------
 
-fn build_sqlite_app_state() -> (AppState, tempfile::NamedTempFile) {
+fn build_sqlite_app_state() -> (AppState, crate::common::sqlite_tempfile::SqliteTempFile) {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
     let path = std::path::PathBuf::from(":memory:");
     let db: Db = Arc::new(Mutex::new((conn, path, ResolvedTtl::default(), true)));
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+    let tmp =
+        crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for SqliteStore");
     let store: Arc<dyn MemoryStore> =
         Arc::new(SqliteStore::open(tmp.path()).expect("open SqliteStore"));
     let state = AppState {
@@ -525,7 +526,7 @@ async fn test_capabilities_db_schema_version_reports_36() {
 /// unconditionally would fail this pin.
 #[test]
 fn v49_migration_idempotent_on_replay_1112() {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn1 = ai_memory::db::open(tmp.path()).expect("first open");
     let v1: i64 = conn1
         .query_row(

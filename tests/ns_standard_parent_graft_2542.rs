@@ -29,6 +29,9 @@
 //! Driven at the resolver (`db::resolve_governance_policy` /
 //! `db::resolve_require_approval_above_depth`).
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::config::ResolvedTtl;
 use ai_memory::db;
 use ai_memory::models::{
@@ -48,8 +51,8 @@ fn permissive_attestation() {
     ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
 }
 
-fn open_db() -> (Connection, tempfile::NamedTempFile) {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+fn open_db() -> (Connection, crate::sqlite_tempfile::SqliteTempFile) {
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn = db::open(f.path()).expect("db::open");
     (conn, f)
 }

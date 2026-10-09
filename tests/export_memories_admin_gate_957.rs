@@ -52,15 +52,18 @@
 //!    leak the allowlist configuration nor the caller's
 //!    resolved identity.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -188,7 +191,7 @@ async fn export_as(router: &axum::Router, caller: Option<&str>) -> (StatusCode, 
 
 #[tokio::test]
 async fn non_admin_caller_gets_403_957() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_memory(db_path, "alice", "secrets-957/a");
     seed_memory(db_path, "carol", "secrets-957/c");
@@ -216,7 +219,7 @@ async fn non_admin_caller_gets_403_957() {
 
 #[tokio::test]
 async fn admin_caller_gets_full_corpus_957() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_memory(db_path, "alice", "secrets-957/a");
     seed_memory(db_path, "carol", "secrets-957/c");
@@ -241,7 +244,7 @@ async fn admin_caller_gets_full_corpus_957() {
 
 #[tokio::test]
 async fn missing_agent_id_header_gets_403_957() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_memory(db_path, "alice", "secrets-957/a");
 
@@ -263,7 +266,7 @@ async fn missing_agent_id_header_gets_403_957() {
 
 #[tokio::test]
 async fn empty_allowlist_rejects_every_caller_957() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_memory(db_path, "alice", "secrets-957/a");
 
@@ -288,7 +291,7 @@ async fn empty_allowlist_rejects_every_caller_957() {
 
 #[tokio::test]
 async fn error_body_is_sanitised_957() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_memory(db_path, "alice", "secrets-957/a");
 

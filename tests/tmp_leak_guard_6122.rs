@@ -37,7 +37,7 @@ fn scratch_dir(tag: &str) -> tempfile::TempDir {
 fn file_dropped_before_connection_leaves_no_side_files_6122() {
     let dir = scratch_dir("order");
     {
-        let f = SqliteTempFile::new_in(dir.path());
+        let f = SqliteTempFile::new_in(dir.path()).expect("tempfile");
         let conn = ai_memory::db::open(f.path()).expect("db::open");
         // Mirrors the suites: the connection outlives the file handle.
         drop(f);
@@ -55,7 +55,7 @@ fn file_dropped_before_connection_leaves_no_side_files_6122() {
 fn many_scopes_leave_no_side_files_6122() {
     let dir = scratch_dir("many");
     for _ in 0..20 {
-        let f = SqliteTempFile::new_in(dir.path());
+        let f = SqliteTempFile::new_in(dir.path()).expect("tempfile");
         let _conn = ai_memory::db::open(f.path()).expect("db::open");
         let _reader = ai_memory::db::open(f.path()).expect("reopen");
         // `f` declared first, so it drops LAST here; the leak needs the
@@ -79,5 +79,39 @@ fn side_files_names_cover_wal_shm_journal_6122() {
     assert_eq!(
         names,
         ["/x/.tmpAb-wal", "/x/.tmpAb-shm", "/x/.tmpAb-journal"]
+    );
+}
+
+/// Ceiling: ZERO integration suites may bind a sqlite database to a raw
+/// `tempfile::NamedTempFile` (the ceiling only falls). Use
+/// `common/sqlite_tempfile.rs::SqliteTempFile`, which owns the `-wal` / `-shm`.
+#[test]
+fn no_suite_binds_sqlite_to_raw_named_tempfile_6122() {
+    let opens_sqlite = |s: &str| {
+        [
+            "db::open",
+            "SqliteStore::open",
+            "open_db",
+            "Connection::open",
+        ]
+        .iter()
+        .any(|needle| s.contains(needle))
+    };
+    let mut offenders = Vec::new();
+    for entry in std::fs::read_dir("tests").expect("read tests/") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().is_none_or(|e| e != "rs") || path.ends_with("tmp_leak_guard_6122.rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("read suite");
+        if src.contains("NamedTempFile") && opens_sqlite(&src) {
+            offenders.push(path.display().to_string());
+        }
+    }
+    offenders.sort();
+    assert!(
+        offenders.is_empty(),
+        "#6122: {} suite(s) bind sqlite to a raw NamedTempFile (orphans -wal/-shm): {offenders:?}",
+        offenders.len()
     );
 }

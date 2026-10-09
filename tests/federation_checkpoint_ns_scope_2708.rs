@@ -47,6 +47,9 @@
 //! (resolver enrollment), `AI_MEMORY_FED_PEER_ATTESTATION` (the peer scope), and
 //! the sig/enrollment knobs from the process-global environment.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -156,7 +159,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         true,
     )));
     let store: Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for SqliteStore");
         let p = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"))

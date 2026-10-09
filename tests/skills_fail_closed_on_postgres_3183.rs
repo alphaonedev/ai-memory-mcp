@@ -58,6 +58,9 @@
 #![allow(clippy::doc_markdown, clippy::too_many_lines)]
 #![cfg(feature = "sal")]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -97,7 +100,7 @@ fn app_state(backend: StorageBackend) -> AppState {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+    let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for SqliteStore");
     let store_path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
     let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(

@@ -38,6 +38,9 @@
 #![allow(clippy::needless_update)]
 #![allow(clippy::cast_precision_loss)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -94,11 +97,11 @@ async fn embed_calls(server: &MockServer) -> usize {
 struct Receiver {
     router: axum::Router,
     db: Db,
-    _db_tmp: tempfile::NamedTempFile,
+    _db_tmp: crate::sqlite_tempfile::SqliteTempFile,
 }
 
 fn build_receiver(embedder: Option<Embedder>) -> Receiver {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

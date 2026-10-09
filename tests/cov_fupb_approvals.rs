@@ -40,7 +40,7 @@ static APPROVALS_GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 const TEST_SECRET: &str = "cov-fupb-approvals-secret";
 
 fn build_sqlite_router() -> (axum::Router, std::path::PathBuf) {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     std::mem::forget(f);

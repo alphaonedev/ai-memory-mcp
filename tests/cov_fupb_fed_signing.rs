@@ -23,6 +23,9 @@
 #![allow(clippy::redundant_closure_for_method_calls)]
 #![allow(clippy::await_holding_lock)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::{Arc, Mutex};
 
 use ai_memory::federation::signing as fed_signing;
@@ -39,7 +42,7 @@ static FED_SIGNING_ENV_LOCK: Mutex<()> = Mutex::new(());
 const PEER_ID: &str = "peer-fupb-signing";
 
 fn build_sqlite_router() -> axum::Router {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     std::mem::forget(f);

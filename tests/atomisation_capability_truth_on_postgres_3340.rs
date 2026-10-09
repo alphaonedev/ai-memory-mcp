@@ -16,10 +16,13 @@
 //!
 //! Fixture mirrors `tests/skills_fail_closed_on_postgres_3183.rs`; the
 //! SqliteStore file lives in a `tempdir` that the test keeps alive (no
-//! `NamedTempFile` for a database path, nothing forgotten).
+//! `SqliteTempFile` for a database path, nothing forgotten).
 
 #![allow(clippy::doc_markdown, clippy::too_many_lines)]
 #![cfg(feature = "sal")]
+
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
 
 use std::sync::Arc;
 

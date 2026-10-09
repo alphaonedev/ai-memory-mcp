@@ -47,6 +47,9 @@
 //! constructs the exact damage the partial check skips — unreferenced pages —
 //! against a REAL migrated corpus and asserts the verdict is a refusal.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::path::{Path, PathBuf};
 
 /// The literal this gate polices: the PRAGMA text at the START of a Rust
@@ -250,7 +253,7 @@ fn the_two_converted_surfaces_cite_the_shared_helper_3510() {
 fn a_freshly_migrated_database_is_page_accounted_not_partially_checked_3510() {
     use ai_memory::storage::sqlite_integrity::{Coverage, Soundness, check};
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
 
     // A real migrated corpus at the current ladder tip.
