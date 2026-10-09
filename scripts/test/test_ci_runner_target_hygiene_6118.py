@@ -812,6 +812,41 @@ class Mutants6118(unittest.TestCase):
         self.assertEqual([], found)
         self.assertFalse(_leg_is_hosted(["ubuntu-slim", "self-hosted"]))
 
+    # ---- round 3, cloud review CF1: the six census shapes, each pinned ----
+    # (shape 2 `group:` block = m12, shape 3 non-`runner` matrix key = m09/m09b,
+    # shape 5 cargo through a script = m10; the rest are pinned here)
+
+    def test_6118_m20_bare_fleet_label_inline(self) -> None:
+        for spec in ("macos-fed", "[linux-fed]"):
+            found = self._appended("  extra_bare_job:\n    runs-on: %s\n    steps:\n      - run: cargo test\n" % spec)
+            self._assert_unpinned(found, "extra_bare_job")
+
+    def test_6118_m21_runs_on_flow_mapping_is_unparsed(self) -> None:
+        found = self._appended(
+            "  extra_flow_map_job:\n    runs-on: {labels: [self-hosted, linux-fed]}\n"
+            "    steps:\n      - run: cargo test\n")
+        self.assertTrue(found and found[0].startswith("R-SHAPE"), found)
+
+    def test_6118_m22_cargo_spellings_are_censused(self) -> None:
+        for run in ("cargo +nightly test", "\"\\\"$CARGO\\\" test\"", "cargo run --bin ai-memory",
+                    "bash scripts/x.sh"):
+            found = self._appended(
+                "  extra_cargo_job:\n    runs-on: [self-hosted, linux-fed]\n    steps:\n      - run: %s\n" % run)
+            self._assert_unpinned(found, "extra_cargo_job")
+
+    def test_6118_m23_composite_action_is_censused(self) -> None:
+        found = self._appended(
+            "  extra_action_job:\n    runs-on: [self-hosted, linux-fed]\n    steps:\n"
+            "      - uses: ./.github/actions/cargo\n        with:\n          args: test\n")
+        self._assert_unpinned(found, "extra_action_job")
+
+    def test_6118_m24_prune_step_must_not_allow_outside_workspace(self) -> None:
+        # CF4: the workflows never opt in to an out-of-workspace target dir.
+        anchor = PRUNE_RUN_LINE
+        self.assertEqual(1, self.ci.count(anchor), anchor)
+        found = self._mutated(_replace_once(self.ci, anchor, anchor + " --allow-outside-workspace"))
+        self.assertTrue(any("R-PRUNE" in v and "--allow-outside-workspace" in v for v in found), found)
+
 
 def _write(path: Path, size: int, executable: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -849,8 +884,12 @@ class PruneScript6118(unittest.TestCase):
         ("debug/build/libsqlite3-sys-3d3d/output", 20, False, False),
         ("debug/.fingerprint/ai-memory-0a1b/lib-ai_memory", 8, False, False),
         ("debug/incremental/ai_memory-xyz/s-abc-def-working/dep-graph.bin", 6000, False, True),
-        ("debug/examples/demo-1e1e", 50000, True, True),
-        ("debug/examples/demo-1e1e.d", 10, False, True),
+        # cargo builds examples/<name>-<hash> and uplifts it by hard-linking
+        # examples/<name> (setUp adds the link): a real tree never holds an
+        # example with nlink 1 (CF2).
+        ("debug/examples/demo-0123456789abcdef", 50000, True, True),
+        ("debug/examples/demo-0123456789abcdef.d", 10, False, True),
+        ("debug/examples/demo.d", 10, False, True),
         ("release/deps/ai_memory-ffff", 900, True, False),  # other profile, untouched
     )
     FIVE_DIRS = ("deps", "build", "incremental", "examples", ".fingerprint")
@@ -862,6 +901,7 @@ class PruneScript6118(unittest.TestCase):
         self.target = Path(self.scratch.name) / "target"
         for rel, size, exe, _deleted in self.LAYOUT:
             _write(self.target / rel, size, exe)
+        os.link(self.target / EXAMPLE_HASHED, self.target / EXAMPLE_UPLIFT)
         # A symlink inside deps that points OUTSIDE the target dir; it looks
         # like an executable (the link target is executable) and must be
         # skipped, never followed.
@@ -1028,7 +1068,13 @@ class PruneScript6118(unittest.TestCase):
         ok_ws = self._run("--target-dir", str(self.target), "--dry-run",
                           env={"GITHUB_WORKSPACE": str(Path(self.scratch.name))})
         self.assertEqual(0, ok_ws.returncode, ok_ws.stdout + ok_ws.stderr)
-        ok_ctd = self._run("--target-dir", str(self.target), "--dry-run",
+        # CF4: an exported CARGO_TARGET_DIR outside the workspace is honoured only
+        # with the explicit --allow-outside-workspace (the workflows never pass it).
+        no_flag = self._run("--target-dir", str(self.target), "--dry-run",
+                            env={"GITHUB_WORKSPACE": str(ws), "CARGO_TARGET_DIR": str(self.target)})
+        self.assertEqual(2, no_flag.returncode, no_flag.stdout + no_flag.stderr)
+        self.assertIn("--allow-outside-workspace", no_flag.stderr)
+        ok_ctd = self._run("--target-dir", str(self.target), "--dry-run", "--allow-outside-workspace",
                            env={"GITHUB_WORKSPACE": str(ws), "CARGO_TARGET_DIR": str(self.target)})
         self.assertEqual(0, ok_ctd.returncode, ok_ctd.stdout + ok_ctd.stderr)
 
@@ -1111,7 +1157,54 @@ class PruneScript6118(unittest.TestCase):
         self.assertIn("::warning::prune-runner-target:", proc.stdout)
         self.assertEqual(self._expected_freed() - 2000, self._freed(proc.stdout))
         self.assertFalse((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
-        self.assertFalse((self.target / "debug" / "examples" / "demo-1e1e").exists())
+        self.assertFalse((self.target / EXAMPLE_HASHED).exists())
+
+    # ---- round 3, cloud review (CF2, CF4, CF6) ----
+
+    def test_6118_example_uplift_pair_is_pruned_together(self) -> None:
+        # CF2: examples/<name> and examples/<name>-<hash> are one inode (nlink 2,
+        # both in examples/); cargo re-uplifts, so the pair goes together and its
+        # bytes count once.  A pair that does not match <name> + <name>-<hash>,
+        # and an example linked from outside examples/, stay.
+        ex = self.target / "debug" / "examples"
+        _write(ex / "tool-fedcba9876543210", 700, True)
+        os.link(ex / "tool-fedcba9876543210", ex / "unrelated")
+        _write(ex / "keep-1111222233334444", 800, True)
+        os.link(ex / "keep-1111222233334444", self.target / "debug" / "keep")
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertEqual(self._expected_freed(), self._freed(proc.stdout))
+        for rel in (EXAMPLE_HASHED, EXAMPLE_UPLIFT, EXAMPLE_HASHED + ".d", "debug/examples/demo.d"):
+            self.assertFalse((self.target / rel).exists(), rel)
+        for name in ("tool-fedcba9876543210", "unrelated", "keep-1111222233334444"):
+            self.assertTrue((ex / name).exists(), name)
+        self.assertTrue((self.target / "debug" / "keep").exists())
+        # The deps <-> <profile>/<bin> uplift rule is unchanged.
+        self.assertTrue((self.target / "debug" / "ai-memory").exists())
+
+    def test_6118_notice_line_carries_the_totals(self) -> None:
+        # CF6: the totals are also a ::notice:: annotation, so the first fleet
+        # run's evidence is on the job summary, not deep in the step log.
+        dry = self._run("--target-dir", str(self.target), "--dry-run")
+        self.assertRegex(dry.stdout, r"(?m)^::notice::prune-runner-target freed_bytes=%d deleted=10 mode=dry-run$"
+                         % self._expected_freed())
+        real = self._run("--target-dir", str(self.target))
+        self.assertEqual(0, real.returncode, real.stdout + real.stderr)
+        self.assertRegex(real.stdout, r"(?m)^::notice::prune-runner-target freed_bytes=%d deleted=10 mode=pruned$"
+                         % self._expected_freed())
+
+    def test_6118_outside_workspace_real_run_needs_the_flag(self) -> None:
+        # CF4: two runners sharing one out-of-workspace CARGO_TARGET_DIR would let
+        # runner A's prune delete runner B's in-flight test binaries.
+        ws = Path(self.scratch.name) / "workspace"
+        ws.mkdir()
+        env = {"GITHUB_WORKSPACE": str(ws), "CARGO_TARGET_DIR": str(self.target)}
+        proc = self._run("--target-dir", str(self.target), env=env)
+        self.assertEqual(2, proc.returncode, proc.stdout + proc.stderr)
+        self.assertTrue((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
+        ok = self._run("--target-dir", str(self.target), "--allow-outside-workspace", env=env)
+        self.assertEqual(0, ok.returncode, ok.stdout + ok.stderr)
+        self.assertFalse((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
 
     # ---- round 3 (F2 = SR2-1, SR2-2, SR2-3, SR2-4) ----
 
@@ -1134,8 +1227,8 @@ class PruneScript6118(unittest.TestCase):
         self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
         self.assertIn("::warning::prune-runner-target: debug/deps:", proc.stdout)
-        self.assertEqual(50000 + 10 + 6000, self._freed(proc.stdout))
-        self.assertFalse((self.target / "debug" / "examples" / "demo-1e1e").exists())
+        self.assertEqual(EXAMPLES_AND_INCREMENTAL, self._freed(proc.stdout))
+        self.assertFalse((self.target / EXAMPLE_HASHED).exists())
         self.assertEqual([], os.listdir(str(self.target / "debug" / "incremental")))
         self.assertIn("1 entry could not be read or removed (warnings above); exit 1", proc.stdout)
 
@@ -1157,7 +1250,7 @@ class PruneScript6118(unittest.TestCase):
         self.assertEqual(1, rc, out)
         self.assertIn("::warning::prune-runner-target: debug/deps/mcp_input_schema-7c7c: Input/output error", out)
         self.assertNotIn("ai_memory-0a1b", out.split("freed_bytes=")[0].replace("libai_memory-0a1b", ""))
-        self.assertEqual(50000 + 10 + 6000, self._freed(out))
+        self.assertEqual(EXAMPLES_AND_INCREMENTAL, self._freed(out))
 
     def test_6118_newline_in_entry_name_cannot_inject_a_workflow_command(self) -> None:
         # SR2-2: a name printed on a `::warning::` (or any) line is escaped the way
@@ -1236,6 +1329,13 @@ class PruneScript6118(unittest.TestCase):
             self.fail("the prune CLI blocked on a FIFO CACHEDIR.TAG (SR2-4)")
         self.assertEqual(2, cli.returncode, cli.stdout + cli.stderr)
         self.assertTrue((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
+
+
+EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
+EXAMPLE_UPLIFT = "debug/examples/demo"
+# Bytes the default scope frees from examples/ (the uplift pair once, two .d)
+# plus incremental/.
+EXAMPLES_AND_INCREMENTAL = 50000 + 10 + 10 + 6000
 
 
 # cargo's own CACHEDIR.TAG (https://bford.info/cachedir/): the signature line is
