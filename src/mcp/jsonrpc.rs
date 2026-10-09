@@ -59,6 +59,10 @@ pub const SUPPORTED_PROTOCOL_REVISIONS: &[&str] = &[NEWEST_PROTOCOL_REVISION];
 /// first element of the list.
 pub const NEWEST_PROTOCOL_REVISION: &str = "2024-11-05";
 
+/// Wire name of the `initialize` request param and result field that carries
+/// the MCP revision.
+pub const PROTOCOL_VERSION_FIELD: &str = "protocolVersion";
+
 /// Longest slice of a client-supplied `protocolVersion` echoed into the
 /// stderr diagnostic (the value is untrusted and rendered `{:?}`-escaped).
 const DIAGNOSTIC_ECHO_MAX_CHARS: usize = 64;
@@ -74,7 +78,7 @@ const DIAGNOSTIC_ECHO_MAX_CHARS: usize = 64;
 #[must_use]
 pub fn negotiate_protocol_revision(params: &serde_json::Value) -> (&'static str, bool) {
     match params
-        .get("protocolVersion")
+        .get(PROTOCOL_VERSION_FIELD)
         .and_then(serde_json::Value::as_str)
         .and_then(|asked| {
             SUPPORTED_PROTOCOL_REVISIONS
@@ -92,7 +96,7 @@ pub fn negotiate_protocol_revision(params: &serde_json::Value) -> (&'static str,
 /// untrusted request value, `{:?}`-escaped.
 #[must_use]
 pub fn protocol_downgrade_diagnostic(params: &serde_json::Value, answered: &str) -> String {
-    let asked = match params.get("protocolVersion") {
+    let asked = match params.get(PROTOCOL_VERSION_FIELD) {
         None => "<missing>".to_string(),
         Some(serde_json::Value::String(s)) => {
             let clipped: String = s.chars().take(DIAGNOSTIC_ECHO_MAX_CHARS).collect();
