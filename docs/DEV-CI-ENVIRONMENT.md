@@ -216,8 +216,10 @@ before `CREATE EXTENSION`:
   and removing one could undo a restore another runner has already verified.
 - **Secrets.** The tier password goes to psql through `PGPASSWORD`; the URL on
   psql's argv carries no password, and neither form is printed. Because urllib
-  and libpq split a URL differently, a URL holding a `#` (libpq has no fragment)
-  or an `@` after the host part is refused with exit 2 before psql runs. Every
+  and libpq split a URL differently, a URL holding a TAB, line break or NUL, a
+  `#` (libpq has no fragment), more than one `@` in the host part or an `@`
+  after it, a query segment without exactly one `=`, or no host part (the
+  socket-directory form) is refused with exit 2 before psql runs. Every
   query key other than `password` must be on `ALLOWED_QUERY_KEYS`, a
   case-sensitive allowlist of non-secret libpq parameters (`sslmode`,
   `application_name`, `connect_timeout`, ...); any other key, including
