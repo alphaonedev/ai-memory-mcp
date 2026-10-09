@@ -222,7 +222,7 @@ def approvals(repo: Path, base_sha: str, head_sha: str) -> list:
     git trailer block (the final paragraph, git interpret-trailers semantics) is read; a body line that starts
     with the key is prose, not an approval. #6396: each raw message is parsed by `trailer_block`, which loads no
     git configuration, so neither the host nor the repository can widen what counts as a trailer."""
-    out = git(repo, "log", "--format=%B", f"{base_sha}..{head_sha}")
+    out = git(repo, "log", "-z", "--format=%B", f"{base_sha}..{head_sha}")
     found = []
     for message in out.split(b"\0"):
         if message.strip():
