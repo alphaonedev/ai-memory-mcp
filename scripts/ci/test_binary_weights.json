@@ -2,9 +2,10 @@
  "schema": 1,
  "unit": "seconds",
  "source": "scout report CI-SHARD-SCOUT-2026-10-09 (run 6160 linux-fed, serial threads=1, contended)",
- "note": "keys are kind:name; lib:pg and lib:nonpg are the lib unittests split on scripts/ci/lib_pg_prefixes.txt; unmeasured binaries use the class mean",
+ "note": "keys are kind:name; lib:pg and lib:nonpg are the lib unittests split on scripts/ci/lib_pg_prefixes.txt; unmeasured binaries use the class mean; doc:tests is the cargo test --doc run the serial shard appends (~16 s, #6344 review r1 B6)",
  "weights": {
   "bin:ai-memory": 0.26,
+  "doc:tests": 16.0,
   "lib:nonpg": 4859.45,
   "lib:pg": 84.16,
   "test:a2a_campaign_round1": 2.65,

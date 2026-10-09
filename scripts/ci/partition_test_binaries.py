@@ -765,12 +765,14 @@ def balance(items, base1, base2):
     return h1, h2, t1, t2
 
 
-def partition(exes, weights, prefixes):
+def partition(exes, weights, prefixes, with_doc=False):
     """Return (serial, half1, half2, lib_in_half1, totals). Lists hold Exe objects.
 
     Each target is classified on the union of the sources it compiles (its
     ``mod``/``#[path]``/``include!`` tree), with shared helper files folded in
-    per referenced item (see ``SourceIndex``).
+    per referenced item (see ``SourceIndex``). With ``with_doc`` the doc tests,
+    which the serial shard runs after its binaries, add ``weights['doc:tests']``
+    to the serial estimate.
     """
     lib = [e for e in exes if e.kind == 'lib']
     others = [e for e in exes if e.kind != 'lib']
@@ -788,7 +790,8 @@ def partition(exes, weights, prefixes):
     lib_nonpg = weights.get('lib:nonpg', 0.0) if lib else 0.0
     lib_pg = weights.get('lib:pg', 0.0) if lib else 0.0
     h1, h2, t1, t2 = balance(items, lib_nonpg, 0.0)
-    ts = lib_pg + sum(weight_of(e, weights, means) for e in serial)
+    doc = weights.get('doc:tests', 0.0) if with_doc else 0.0
+    ts = lib_pg + doc + sum(weight_of(e, weights, means) for e in serial)
     return serial, h1, h2, bool(lib), {'serial': ts, 'parallel_1': t1, 'parallel_2': t2}, means
 
 
@@ -839,7 +842,7 @@ def run(args):
             raise PartitionError('lib modules read AI_MEMORY_TEST_POSTGRES_URL but no prefix in %s covers them: %s'
                                  % (args.lib_pg_prefixes, ', '.join(missing)))
     weights = load_weights(args.weights)
-    serial, h1, h2, has_lib, totals, means = partition(exes, weights, prefixes)
+    serial, h1, h2, has_lib, totals, means = partition(exes, weights, prefixes, args.with_doc == '1')
     out_dir = Path(args.out_dir)
     write_lists(out_dir, serial, h1, h2, has_lib)
     (out_dir / 'lib_pg_filters.txt').write_text(''.join(p + '\n' for p in prefixes))
@@ -849,6 +852,7 @@ def run(args):
         'counts': {'serial': len(serial) + (1 if has_lib else 0),
                    'parallel_1': len(h1) + (1 if has_lib else 0), 'parallel_2': len(h2)},
         'class_mean_seconds': means,
+        'doc_tests_in_serial': args.with_doc == '1',
         'estimate_seconds': {
             'serial_threads_1': round(totals['serial'], 1),
             'parallel_1_serial_work': round(totals['parallel_1'], 1),
@@ -875,6 +879,8 @@ def build_parser():
     ap.add_argument('--out-dir', required=True, help='directory for the list files and manifest')
     ap.add_argument('--weights', default=str(here / 'test_binary_weights.json'))
     ap.add_argument('--lib-pg-prefixes', default=str(here / 'lib_pg_prefixes.txt'))
+    ap.add_argument('--with-doc', choices=('0', '1'), default='0',
+                    help='1 when the serial shard also runs the doc tests (adds doc:tests to its estimate)')
     return ap
 
 

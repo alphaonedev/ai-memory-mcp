@@ -229,6 +229,8 @@ jobs:
         run: python3 scripts/test/test_ci_test_impact.py
       - name: Workflow concurrency invariants (#6340)
         run: python3 scripts/test/test_workflow_concurrency_6340.py
+      - name: Shard partition and wiring unit tests (#6344)
+        run: python3 -m unittest discover -s scripts/ci/tests
       - id: cls
         shell: bash
         env:
@@ -1461,7 +1463,7 @@ jobs:
           # run_shard <name> <shard-dir> <threads> <lib-mode: pg|skip> <with-doc: 0|1>
           run_shard() {
             local name="$1" sd="$2" threads="$3" libmode="$4" with_doc="$5"
-            local list="$sd/$1.txt" t0 remaining rc=0 l has_lib=0 n_it=0 n_lib=0
+            local list="$sd/$1.txt" t0 remaining rc=0 l tflag tname has_lib=0 n_it=0 n_lib=0
             local -a itargs libargs
             itargs=(); libargs=()
             t0=$(date +%s)
@@ -1470,7 +1472,10 @@ jobs:
               if [ "$l" = "--lib" ]; then
                 has_lib=1
               else
-                itargs+=($l); n_it=$((n_it + 1))
+                # One "<--flag> <name>" selector per line; split into two
+                # quoted words (no unquoted word-split, SC2206).
+                read -r tflag tname <<< "$l"
+                itargs+=("$tflag" "$tname"); n_it=$((n_it + 1))
               fi
             done < "$list"
             if [ "$has_lib" -eq 1 ]; then
@@ -1519,7 +1524,7 @@ jobs:
             rm -rf "$sd"; mkdir -p "$sd"
             echo "::notice::[#6344] '${label}': compile once, partition, then run serial + 2 parallel shards"
             cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || return "$?"
-            python3 scripts/ci/partition_test_binaries.py --build-json "$sd/build.jsonl" --repo-root . --out-dir "$sd" || return "$?"
+            python3 scripts/ci/partition_test_binaries.py --build-json "$sd/build.jsonl" --repo-root . --out-dir "$sd" --with-doc "$with_doc" || return "$?"
             ( run_shard serial "$sd" 1 pg "$with_doc" ) > "$sd/serial.log" 2>&1 &
             pid_s=$!
             ( run_shard parallel_1 "$sd" 3 skip 0 ) > "$sd/parallel_1.log" 2>&1 &
