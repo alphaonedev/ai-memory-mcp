@@ -32,8 +32,9 @@ every self-hosted cargo job, after a successful checkout):
     ``my_demo-<hash>`` for the example ``my-demo``);
   * keeps cargo's bin uplift source ``deps/<bin>-<hash>``: the file that has a
     regular executable ``<profile>/<bin>`` of the same size and the same name
-    (``-`` = ``_``), found by NAME AND SIZE because cargo hard-links on Linux
-    but copies (an APFS clone, nlink 1) on macOS, and pruning the source makes
+    (``-`` = ``_``) and the same bytes, found by NAME, SIZE AND CONTENT because
+    cargo hard-links on Linux but copies (an APFS clone, nlink 1) on macOS; a
+    same-size file with other bytes is an ordinary test executable.  Pruning the source makes
     cargo report the bin "Dirty" and relink it; also keeps any other
     hard-linked executable (a link whose partner is not the matching examples
     name): deleting one side frees nothing while the other exists;
@@ -413,6 +414,22 @@ def _add_dsym_links(plan: Plan, fd: int, sub: str, names: List[str]) -> None:
             plan.candidates.append(Candidate(fd, name, prefix + name, sub + " dSYM"))
 
 
+def _same_bytes(dir_a: int, a: str, dir_b: int, b: str) -> bool:
+    """Identical content: the bin's uplift is a hard link or a clone of its source.
+
+    A file that cannot be read counts as identical, so it is kept (fail closed).
+    """
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        with open(os.open(a, flags, dir_fd=dir_a), "rb") as fa, open(os.open(b, flags, dir_fd=dir_b), "rb") as fb:
+            while True:
+                chunk_a, chunk_b = fa.read(1 << 20), fb.read(1 << 20)
+                if chunk_a != chunk_b or not chunk_a:
+                    return chunk_a == chunk_b
+    except OSError:
+        return True
+
+
 def _norm(name: str) -> str:
     """cargo spells a target ``my-demo`` and its crate-style artifact ``my_demo-<hash>``."""
     return name.replace("-", "_")
@@ -471,10 +488,12 @@ def _scan_test_bins(plan: Plan, profile_fd: int) -> None:
             if sub == "deps":
                 stem = _hashed_stem(name)
                 partner = bins.get(_norm(stem), {}).get(st.st_size) if stem is not None else None
+                if partner is not None and not _same_bytes(fd, name, profile_fd, partner):
+                    partner = None  # same name and size, other content: an ordinary test executable
                 if partner is not None:
                     # cargo's bin uplift source (hard link on Linux, clone on
                     # macOS): pruning it makes cargo relink the bin.
-                    plan.kept.append((sub + "/" + name, "uplift source of %s/%s (same name and size); "
+                    plan.kept.append((sub + "/" + name, "uplift source of %s/%s (same name, size and content); "
                                       "pruning it forces a relink" % (plan.profile, partner)))
                     continue
             if st.st_nlink > 1:
