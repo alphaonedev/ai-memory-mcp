@@ -3146,6 +3146,36 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         "        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}\n", "        shell: bash\n", 1)))]),
     "6284 shape build bind sha taken from the PR head": ("fail", [_shape(SHAPE_HDR, _in_shape_build(lambda s: s.replace(
         "PREFLIGHT_SHA: ${{ github.sha }}", "PREFLIGHT_SHA: ${{ github.event.pull_request.head.sha }}", 1)))]),
+    # --- #6280 / cloud F6: no ARG, no builder ENV, builder COPY/ADD only from the allowlist
+    "6280 ARG before the first FROM": ("fail", [_docker(D_BUILDER, "ARG RUST_TAG=1.98\n" + D_BUILDER)]),
+    "6280 ARG in the builder stage": ("fail", [_docker(D_LOCK, "ARG CARGO_FEATURES=sal\n" + D_LOCK)]),
+    "6280 ENV in the builder stage": ("fail", [_docker(D_LOCK, "ENV RUSTFLAGS=-Cpanic=abort\n" + D_LOCK)]),
+    "6280 builder COPY outside the allowlist": ("fail", [_docker(D_LOCK, D_LOCK + "COPY build.rs build.rs\n")]),
+    "6280 builder ADD of a remote file": ("fail", [_docker(D_LOCK, D_LOCK + "ADD https://example.invalid/x.tar /build/\n")]),
+    # --- #6281: both base images pinned by digest
+    "6281 builder FROM without a digest": ("fail", [_docker(" AS builder", lambda s: re.sub(
+        r"@sha256:[0-9a-f]{64} AS builder", " AS builder", s))]),
+    "6281 builder FROM digest changed": ("fail", [_docker(" AS builder", lambda s: re.sub(
+        r"(FROM rust:\S+?)@sha256:[0-9a-f]{64}", r"\1@sha256:" + "0" * 64, s))]),
+    "6281 runtime FROM without a digest": ("fail", [_docker("FROM debian:", lambda s: re.sub(
+        r"(FROM debian:\S+?)@sha256:[0-9a-f]{64}", r"\1", s))]),
+    "6281 runtime FROM image changed": ("fail", [_docker("FROM debian:", lambda s: s.replace(
+        "FROM debian:bookworm-slim", "FROM debian:trixie-slim", 1))]),
+    # --- cloud F5: the final stage takes only the two --from COPYs, a fixed ENV, the pinned ENTRYPOINT/CMD
+    "CF5 final COPY of another builder file": ("fail", [_final("COPY --from=builder /build/Cargo.toml /etc/ai-memory.toml\n")]),
+    "CF5 final ADD of a remote file": ("fail", [_final("ADD https://example.invalid/x /usr/local/bin/x\n")]),
+    "CF5 final COPY from the build context": ("fail", [_final("COPY scripts/ /opt/scripts/\n")]),
+    "CF5 ENV PATH in the final stage": ("fail", [_final("ENV PATH=/opt/x:$PATH\n")]),
+    "CF5 ENV LD_PRELOAD in the final stage": ("fail", [_final("ENV LD_PRELOAD=/opt/x.so\n")]),
+    "CF5 extra RUN before the binary COPY": ("fail", [_final("RUN ln -sf /bin/true /usr/local/bin/x\n")]),
+    "CF5 ENTRYPOINT not the shipped absolute path": ("fail", [_docker("ENTRYPOINT [", lambda s: re.sub(
+        r"ENTRYPOINT \[[^\]\n]*\]", 'ENTRYPOINT ["ai-memory"]', s))]),
+    "CF5 ENTRYPOINT through a shell": ("fail", [_docker("ENTRYPOINT [", lambda s: re.sub(
+        r"ENTRYPOINT \[[^\]\n]*\]", 'ENTRYPOINT ["/bin/sh", "-c", "ai-memory serve"]', s))]),
+    "CF5 ENTRYPOINT removed": ("fail", [_docker("ENTRYPOINT [", _drop_lines_with("ENTRYPOINT ["))]),
+    "CF5 CMD changed": ("fail", [_docker("CMD [", lambda s: re.sub(r"CMD \[[^\]\n]*\]", 'CMD ["mcp"]', s))]),
+    "CF5 CMD removed": ("fail", [_docker("CMD [", _drop_lines_with("CMD ["))]),
+    "valid: CF5 LABEL before the binary COPY": ("pass", [_final("LABEL org.example.y=2\n")]),
     # --- #6279: the release matrix pins each (target, os) pair; no self-hosted leg
     "6279 matrix os self-hosted": ("fail", [_rel(LINUX_X86_LEG, LINUX_X86_LEG.replace("ubuntu-latest", "self-hosted"))]),
     "6279 matrix os changed for one target": ("fail", [_rel(LINUX_ARM_LEG, LINUX_ARM_LEG.replace("ubuntu-24.04-arm",
