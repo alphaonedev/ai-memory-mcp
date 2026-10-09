@@ -21,7 +21,7 @@
 //! refuses everything.
 
 use ai_memory::egress::{
-    EgressClass, EgressDecision, InferenceEgressMode, admit_inference_target,
+    EgressClass, EgressDecision, InferenceEgressMode, admit_inference_target, admitted_host,
     evaluate_inference_egress, target_is_loopback,
 };
 
@@ -112,6 +112,31 @@ fn internal_only_admitted_host_is_the_client_host_or_refused_4018() {
         client_host("https://127.0.0.1:9/v1").as_deref(),
         Some("127.0.0.1")
     );
+}
+
+#[test]
+fn admitted_host_is_the_client_host_for_every_shape_4018() {
+    // The exported predicate the gate reads its host through equals the
+    // client's host (bracket-stripped for IPv6, the `resolve_to_addrs` key)
+    // on the adversarial table AND on ordinary shapes.
+    for (url, contacted) in DISAGREEING {
+        assert_eq!(admitted_host(url).as_deref(), Some(*contacted), "{url}");
+    }
+    for (url, host) in [
+        ("https://api.openai.com/v1", "api.openai.com"),
+        ("https://svc:pw@API.Example:8443/v1?k=v#f", "api.example"),
+        ("http://[::1]:11434", "::1"),
+        ("http://127.0.0.1:11434/", "127.0.0.1"),
+    ] {
+        assert_eq!(admitted_host(url).as_deref(), Some(host), "{url}");
+    }
+    for url in ["localhost:11434", "ftp://127.0.0.1/v1", "", "https://"] {
+        assert_eq!(
+            admitted_host(url),
+            None,
+            "{url}: no http(s) host to agree on"
+        );
+    }
 }
 
 #[test]
