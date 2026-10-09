@@ -59,6 +59,13 @@ pub const SUPPORTED_PROTOCOL_REVISIONS: &[&str] = &[NEWEST_PROTOCOL_REVISION];
 /// first element of the list.
 pub const NEWEST_PROTOCOL_REVISION: &str = "2024-11-05";
 
+/// Pre-#6157 name of [`NEWEST_PROTOCOL_REVISION`], public at v0.9.0. Kept
+/// as a deprecated alias (the #1558 crate-root alias precedent) so
+/// downstream callers keep compiling; it is the revision `initialize`
+/// answers when the client asks for an unsupported or no revision.
+#[deprecated(note = "use NEWEST_PROTOCOL_REVISION (#6157)")]
+pub const PROTOCOL_REVISION: &str = NEWEST_PROTOCOL_REVISION;
+
 /// Wire name of the `initialize` request param and result field that carries
 /// the MCP revision.
 pub const PROTOCOL_VERSION_FIELD: &str = "protocolVersion";
