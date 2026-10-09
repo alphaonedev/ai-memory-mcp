@@ -1448,7 +1448,7 @@ def shim_isolation_crash_violation():
         got = shim_isolation_result(None, crashing)
         want = f"shim_isolation_violation raised {exc_type.__name__}: planted 6145"
         if got != want:
-            return f"a {exc_type.__name__} raised in the isolation cell gave {got!r}, not {want!r}"
+            return f"{exc_type.__name__} raised in the isolation cell gave {got!r}, not {want!r}"
     return None
 
 
