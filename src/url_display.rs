@@ -86,19 +86,87 @@ fn unparseable(url: &str) -> String {
 /// Use it for a federation peer, a webhook target, an LLM / embedder base
 /// URL, an MCP forward URL — any URL that reaches a log line, a refusal,
 /// a doctor fact or a stored record.
+///
+/// A URL whose parsed path, query or fragment holds an `@`
+/// ([`store_url_is_ambiguous`]) renders `scheme://<redacted-authority>`
+/// (#6101): its parsed host and port may be credential bytes (a
+/// numeric-prefixed password parses as the port). The rendering shows no
+/// path, so failing closed on every such URL costs only display detail.
 #[must_use]
 pub fn url_origin(url: &str) -> String {
     let trimmed = url.trim();
     match reqwest::Url::parse(trimmed) {
-        Ok(parsed) => {
-            let host = parsed.host_str().unwrap_or(NO_HOST);
-            match parsed.port() {
-                Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
-                None => format!("{}://{host}", parsed.scheme()),
-            }
-        }
+        Ok(parsed) if store_url_is_ambiguous(trimmed) => redacted_authority(&parsed),
+        Ok(parsed) => origin_of(&parsed),
         Err(_) => unparseable(trimmed),
     }
+}
+
+/// `scheme://host[:port]` of an already-parsed URL.
+fn origin_of(parsed: &reqwest::Url) -> String {
+    let host = parsed.host_str().unwrap_or(NO_HOST);
+    match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    }
+}
+
+/// `scheme://<redacted-authority>` of an already-parsed URL.
+fn redacted_authority(parsed: &reqwest::Url) -> String {
+    format!("{}://{REDACTED_AUTHORITY}", parsed.scheme())
+}
+
+/// Schemes the WHATWG parser treats as special: on these `\` ends the
+/// authority exactly like `/`.
+const SPECIAL_SCHEMES: [&str; 6] = ["http", "https", "ws", "wss", "ftp", "file"];
+
+/// `true` when a URL with an `@` after its parsed authority shows the
+/// credential shape (#6101), so [`url_origin_and_path`] must not render it.
+///
+/// [`url_origin_and_path`] is a DURABLE peer key (`sync_state.peer_id`), so
+/// unlike [`url_origin`] it cannot redact every `@` in a path: a legitimate
+/// `https://host/a@b` must keep its key. The URL is ambiguous when
+/// [`store_url_is_ambiguous`] holds AND one of:
+/// - the parsed userinfo is non-empty (the delimiter came after the
+///   credential, so the parsed host is credential bytes);
+/// - the raw text has no `scheme://` (the parser invented the authority);
+/// - the RAW authority span (after the parser's own tab / LF / CR deletion,
+///   up to the first `/`, `?`, `#`, or `\` on a special scheme) has a `:`
+///   whose port is empty or not all digits (`svc:` + delimiter);
+/// - the text between that span and the first `@` holds a `:` (a
+///   `user:password@` remainder).
+///
+/// Not distinguishable from a legitimate path, and so still rendered: a
+/// numeric-prefixed password (`svc:123/<pw>@host`, parsed as port `123`) and
+/// a delimiter in a password-less username token.
+fn origin_and_path_is_ambiguous(raw: &str, parsed: &reqwest::Url) -> bool {
+    if !store_url_is_ambiguous(raw) {
+        return false;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return true;
+    }
+    let normalised: String = raw
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let Some((_, rest)) = normalised.split_once("://") else {
+        return true;
+    };
+    let special = SPECIAL_SCHEMES.contains(&parsed.scheme());
+    let end = rest
+        .find(|c: char| matches!(c, '/' | '?' | '#') || (special && c == '\\'))
+        .unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let bad_port = !authority.ends_with(']')
+        && authority
+            .rsplit_once(':')
+            .is_some_and(|(_, port)| port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()));
+    bad_port
+        || tail
+            .split('@')
+            .next()
+            .is_some_and(|before| before.contains(':'))
 }
 
 /// `scheme://host[:port]/path` — the origin plus the PATH of `url`, still
@@ -113,8 +181,9 @@ pub fn url_origin(url: &str) -> String {
 pub fn url_origin_and_path(url: &str) -> String {
     let trimmed = url.trim();
     match reqwest::Url::parse(trimmed) {
+        Ok(parsed) if origin_and_path_is_ambiguous(trimmed, &parsed) => redacted_authority(&parsed),
         Ok(parsed) => {
-            let mut out = url_origin(trimmed);
+            let mut out = origin_of(&parsed);
             let path = parsed.path();
             if path != "/" {
                 out.push_str(path);
@@ -176,9 +245,9 @@ pub fn store_url_display(url: &str) -> String {
     match reqwest::Url::parse(trimmed) {
         Ok(parsed) => {
             if store_url_is_ambiguous(trimmed) {
-                return format!("{}://{REDACTED_AUTHORITY}", parsed.scheme());
+                return redacted_authority(&parsed);
             }
-            let mut out = url_origin(trimmed);
+            let mut out = origin_of(&parsed);
             // The database is the FIRST path segment; libpq allows nothing
             // deeper, so a longer path is simply not rendered.
             if let Some(db) = parsed
