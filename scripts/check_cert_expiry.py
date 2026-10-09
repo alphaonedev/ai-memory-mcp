@@ -841,6 +841,17 @@ def run_gate_shimmed(tmp, repo, env, version="", fail=""):
         shutil.rmtree(shim_dir, ignore_errors=True)
 
 
+def shimmed_cell(t, label, tmp, repo, env, **kw):
+    """run_gate_shimmed for a self-test cell; a shim that cannot be installed
+    is a named self-test failure recorded on `t` and returns None, never a
+    verdict on the gate (#6178, #6380)."""
+    try:
+        return run_gate_shimmed(tmp, repo, env, **kw)
+    except GateError as exc:
+        t.fail(f"({label}): the git shim could not be installed: {exc}")
+        return None
+
+
 def _gate_env(**kw):
     return {k: v for k, v in kw.items() if v is not None}
 
@@ -1264,22 +1275,13 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                      GITHUB_BASE_REF="main", GITHUB_SHA=good7, PATH=os.environ.get("PATH", ""))
     t.gate("pr7-ok", "control: a two-parent merge of the live tip and the PR head", repo, env7)
     # R2-F2: the version guard and the is-ancestor error branch are pinned.
-    def shimmed(label, **kw):
-        """run_gate_shimmed; a shim that cannot be installed is a named
-        self-test failure, never a verdict on the gate (#6178)."""
-        try:
-            return run_gate_shimmed(tmp, repo, env7, **kw)
-        except GateError as exc:
-            t.fail(f"({label}): the git shim could not be installed: {exc}")
-            return None
-
-    res = shimmed("gitver", version="git version 2.29.9")
+    res = shimmed_cell(t, "gitver", tmp, repo, env7, version="git version 2.29.9")
     if res and (res[0] != 1 or "git >= 2.30 is required" not in res[1] + res[2]):
         t.fail("(gitver): git 2.29.9 did not fail closed with the version guard:", res[1] + res[2])
-    res = shimmed("anc-error", fail="--is-ancestor")
+    res = shimmed_cell(t, "anc-error", tmp, repo, env7, fail="--is-ancestor")
     if res and (res[0] != 1 or "merge-base --is-ancestor exited 128" not in res[1] + res[2]):
         t.fail("(anc-error): an is-ancestor error did not fail closed:", res[1] + res[2])
-    res = shimmed("shim-control")
+    res = shimmed_cell(t, "shim-control", tmp, repo, env7)
     if res and res[0] != 0:
         t.fail("(shim-control): the pass-through git shim was REJECTED:", res[1] + res[2])
     # #6178: a scratch path that contains the PATH separator splits the shim
@@ -1295,21 +1297,16 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         t.fail("(shim-pathsep): a scratch path containing the PATH separator was not refused")
     # #6380: the call-site wrapper turns a refused shim into exactly one named
     # self-test failure (it must neither swallow the error nor fabricate a verdict).
-    wrapper = globals().get("shimmed_cell")
-    if wrapper is None:
-        t.fail("(shim-pathsep): there is no module-level shimmed_cell wrapper, so the "
-               "call-site conversion of a refused shim into a named failure is unpinned (#6380)")
-    else:
-        rec = FailureRecorder()
-        res = wrapper(rec, "shim-pathsep", sep_dir, repo, env7, version="git version 2.29.9")
-        if res is not None:
-            t.fail(f"(shim-pathsep): shimmed_cell returned a gate verdict for a refused shim: {res!r}")
-        if len(rec.messages) != 1:
-            t.fail(f"(shim-pathsep): shimmed_cell recorded {len(rec.messages)} failures for a "
-                   f"refused shim, wanted exactly one: {rec.messages!r}")
-        elif ("(shim-pathsep): the git shim could not be installed" not in rec.messages[0]
-              or "PATH separator" not in rec.messages[0]):
-            t.fail(f"(shim-pathsep): the named failure is wrong: {rec.messages[0]!r}")
+    rec = FailureRecorder()
+    res = shimmed_cell(rec, "shim-pathsep", sep_dir, repo, env7, version="git version 2.29.9")
+    if res is not None:
+        t.fail(f"(shim-pathsep): shimmed_cell returned a gate verdict for a refused shim: {res!r}")
+    if len(rec.messages) != 1:
+        t.fail(f"(shim-pathsep): shimmed_cell recorded {len(rec.messages)} failures for a "
+               f"refused shim, wanted exactly one: {rec.messages!r}")
+    elif ("(shim-pathsep): the git shim could not be installed" not in rec.messages[0]
+          or "PATH separator" not in rec.messages[0]):
+        t.fail(f"(shim-pathsep): the named failure is wrong: {rec.messages[0]!r}")
     # Each of the next two cells is rejected by exactly one predicate.
     t.gate("pr7-second", "a two-parent merge whose second parent is an unrelated branch, not "
            "PR_HEAD_SHA", repo, dict(env7, GITHUB_SHA=unrel7), "is not PR_HEAD_SHA")
