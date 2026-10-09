@@ -2659,11 +2659,15 @@ def _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8):
     worst = (len(PINNED_MERGE_REF_SLEEPS) + 2) * PINNED_FETCH_TIMEOUT + sum(PINNED_MERGE_REF_SLEEPS)
     if worst > TRUSTED_JOB_SECONDS - 180:
         t.fail(f"(tr-f-pin): worst-case fetch time {worst} s leaves under 180 s of the {TRUSTED_JOB_SECONDS} s job")
-    real_run_git, real_sleep, fetches = globals()["run_git"], globals().get("_sleep"), []
+    real_run_git, real_sleep, fetches, cut = globals()["run_git"], globals().get("_sleep"), [], {}
 
     def recording_run_git(repo, *args, **kw):
         if "fetch" in args:
             fetches.append((args, kw.get("timeout")))
+            # tr-f-hang: the hung refspec is cut sooner, only once the gate passed FETCH_TIMEOUT
+            # (the other fetches keep the real bound, so a slow host never fails them).
+            if fetch_timeout is not None and kw.get("timeout") == fetch_timeout and any(s in args for s in cut):
+                kw["timeout"] = cut[next(spec for spec in cut if spec in args)]
         return real_run_git(repo, *args, **kw)
 
     def run(label, why, ok, needles=(), absent=(), pr_number="7", merge_ref="refs/remotes/pull/m7"):
@@ -2708,14 +2712,15 @@ def _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8):
         with _git_shim(tmp, GIT_SHIM, version="", fail="+refs/pull/7/merge:refs/remotes/pull/m7"):
             run("tr-f-error", "every merge fetch failing", False,
                 needles=("::error title=cert-expiry trusted::", "last fetch error", "shim refuses"))
-        # R2-4: a hung fetch is cut at FETCH_TIMEOUT and retried, then reported as an ::error.
-        globals()["FETCH_TIMEOUT"] = 0.5
+        # R2-4: a hung fetch is cut at its timeout and retried, then reported as an ::error.
+        hang = "+refs/pull/7/merge:refs/remotes/pull/m7"
+        cut[hang] = 1
         try:
-            with _git_shim(tmp, GIT_HANG_SHIM, hang="+refs/pull/7/merge:refs/remotes/pull/m7"):
+            with _git_shim(tmp, GIT_HANG_SHIM, hang=hang):
                 run("tr-f-hang", "every merge fetch hanging", False,
                     needles=("::error title=cert-expiry trusted::", "last fetch error", "could not complete"))
         finally:
-            globals()["FETCH_TIMEOUT"] = fetch_timeout
+            cut.clear()
     finally:
         globals()["run_git"] = real_run_git
         if real_sleep is None:
