@@ -2205,6 +2205,20 @@ def _image_build_copy_in_sbom_job(text: str) -> str:
     return text.replace(SBOM_HDR, _image_step(text) + SBOM_HDR, 1)
 
 
+def _image_cache(line: str) -> Transform:
+    """Give the release image build ``line`` (a cache-from / cache-to key) back;
+    unchanged while the step still has that key (#6276: red until it is dropped)."""
+    key = line.strip().split(":", 1)[0] + ":"
+
+    def go(text: str) -> str:
+        step = _image_step(text)
+        if key in step:
+            return text
+        body = step.rstrip("\n")
+        return text.replace(step, body + "\n" + line + "\n" + step[len(body):], 1)
+    return go
+
+
 def _swap_cache_order(text: str) -> str:
     return text.replace(PUSH_CACHE, "          cache-to: type=gha,mode=max\n          cache-from: type=gha\n", 1)
 
@@ -2769,6 +2783,13 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "IB buildx setup in another case": ("fail", [_rel(BUILDX_STEP, BUILDX_STEP.replace("docker/setup", "Docker/setup"))]),
     "IB login carries another key": ("fail", [_rel(LOGIN_NAME, LOGIN_NAME + "        env:\n          X: y\n")]),
     "valid: image build with: keys reordered": ("pass", [_rel(PUSH_CACHE, _swap_cache_order)]),
+    # --- #6276: the release image build neither reads nor writes a shared build cache
+    "6276 docker build reads the shared gha cache": ("fail", [_rel(BUILD_IMG_NAME, _image_cache(
+        "          cache-from: type=gha"))]),
+    "6276 docker build writes the shared gha cache": ("fail", [_rel(BUILD_IMG_NAME, _image_cache(
+        "          cache-to: type=gha,mode=max"))]),
+    "6276 docker build reads a registry cache": ("fail", [_rel(BUILD_IMG_NAME, _image_cache(
+        "          cache-from: type=registry,ref=ghcr.io/x/cache"))]),
     # --- #4719 review round 2 (SR-5/F1): double-quoted escapes are never decoded
     "SR5/S10 double-quoted run spells cargo with an escape": ("fail", _step_before_pkg(
         '        run: "\\x63argo build --release --target ${{ matrix.target }}"\n')),
