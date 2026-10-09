@@ -89,7 +89,9 @@ the file descriptors.
 OUTPUT.  One line per category, then ``freed_bytes=<n>``, a human-readable
 total and ``::notice::prune-runner-target freed_bytes=<n> deleted=<k>
 mode=<pruned|dry-run>`` (a job-summary annotation; ``k`` counts the candidates
-fully removed).  On Linux the count is exact, also under ``--dry-run``: a
+fully removed).  A category row counts only the candidates fully removed (so the
+rows sum to ``k``); a candidate that could not be removed is counted on its own
+``failed <category> <n>`` line and in the warnings.  On Linux the count is exact, also under ``--dry-run``: a
 hard-linked file counts once, and only when every one of its links is removed in
 this run.  On macOS/APFS cargo's uplift copies are clones that share blocks, so
 each clone is counted at full size and ``freed_bytes`` is an UPPER BOUND there
@@ -235,7 +237,8 @@ class Tally:
         self.deleted = 0  # candidates fully removed (or, dry-run, removable)
         self.errors: List[str] = []
         self.lines: List[str] = []
-        self.per_category: Dict[str, Tuple[int, int]] = {}
+        self.per_category: Dict[str, Tuple[int, int]] = {}  # category -> (removed, bytes freed)
+        self.failed: Dict[str, int] = {}  # category -> candidates that could not be fully removed (#6258)
         self._links: Dict[Tuple[int, int], List[int]] = {}
 
     def account(self, st: os.stat_result) -> None:
@@ -601,11 +604,16 @@ def execute(plan: Plan, dry_run: bool) -> Tally:
     verb = "would delete" if dry_run else "deleted"
     for cand in plan.candidates:
         before = tally.freed
-        if _remove(cand.dir_fd, cand.name, cand.rel, tally, dry_run):
-            tally.deleted += 1
-        size = tally.freed - before
+        removed = _remove(cand.dir_fd, cand.name, cand.rel, tally, dry_run)
+        size = tally.freed - before  # a partly removed tree still freed what went
         count, total = tally.per_category.get(cand.category, (0, 0))
-        tally.per_category[cand.category] = (count + 1, total + size)
+        if removed:
+            tally.deleted += 1
+            tally.per_category[cand.category] = (count + 1, total + size)
+        else:
+            tally.failed[cand.category] = tally.failed.get(cand.category, 0) + 1
+            if size:
+                tally.per_category[cand.category] = (count, total + size)
         if dry_run:
             tally.lines.append("  %s %s (%s)" % (verb, _escape(cand.rel), _human(size)))
     return tally
@@ -673,6 +681,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for category in sorted(tally.per_category):
         count, size = tally.per_category[category]
         print("  %-24s %6d  %s" % (category, count, _human(size)))
+    for category in sorted(tally.failed):
+        print("  failed %-24s %6d" % (category, tally.failed[category]))
     for name, why in plan.kept:
         print("  kept %s: %s" % (_escape(name), _escape(why)))
     for note in plan.notes:
