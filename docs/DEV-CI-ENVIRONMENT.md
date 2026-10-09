@@ -241,7 +241,7 @@ before `CREATE EXTENSION`:
   (`gsslib`, `gssdelegation`, `replication`, `oauth_issuer`, `oauth_client_id`,
   `oauth_scope`) are refused by name, as is `service` (#6345: libpq reads a
   `pg_service.conf` entry before `PGPASSWORD`, so its password would beat the
-  moved one; psql also runs without `PGSERVICE`/`PGSERVICEFILE`); `ssl=true` is a JDBC alias, use `sslmode`.
+  moved one; psql also runs without `PGSERVICE`/`PGSERVICEFILE`); `ssl=true` (a JDBC alias that libpq maps to `sslmode=require`) is refused so the TLS mode is always spelled `sslmode`; `sslkeylogfile` (writes TLS session secrets to a file) and `require_auth` (changes the accepted authentication methods) are refused by name as well.
   A refusal names a key only when it is a known libpq keyword (an unlisted key
   can be the tail of a password that held a raw `&`), never a value. psql runs
   with `PGCONNECT_TIMEOUT=15` and a 60 s limit; a URL `connect_timeout` must be an
