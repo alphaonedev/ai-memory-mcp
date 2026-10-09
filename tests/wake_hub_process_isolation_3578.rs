@@ -167,13 +167,102 @@ fn refresher_stays_the_store_opener_and_installs_as_the_hub_uid_3578() {
         trimmed_lines(&unit).any(|l| l == "User=ai-memory"),
         "refresher must keep User=ai-memory — it opens the store"
     );
+    // #3637 (M4) — the root hand-off is `wake-hub --publish-snapshot`
+    // (symlink-free, validated, atomic rename to the hub dir's owner), never
+    // install(1), which dereferences the ai-memory-writable source and
+    // unlinks-then-recreates the destination. Checked on LOGICAL lines, so a
+    // `\` continuation cannot hide either half (#3637 F4).
+    let violations = refresher_handoff_violations(&unit);
     assert!(
-        unit.contains("ExecStartPost=+/usr/bin/install -o ai-memory-hub"),
-        "refresher must install(1) the snapshot as the hub uid (0600 owner check)"
+        violations.is_empty(),
+        "refresher breaks the #3637 hand-off contract: {violations:?}"
     );
     assert!(
         unit.contains("/run/ai-memory-hub/hub-allow.json"),
         "refresher must land the snapshot where the hub unit reads it"
+    );
+}
+
+/// systemd logical lines: `\`-continued physical lines joined into one, with
+/// comment lines dropped (systemd ignores them, including inside a
+/// continuation). Pins that match a single physical line can be evaded by
+/// moving the offending token onto a continuation line (#3637 F4).
+fn logical_lines(unit: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut acc = String::new();
+    for line in trimmed_lines(unit) {
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(head) = line.strip_suffix('\\') {
+            acc.push_str(head);
+            acc.push(' ');
+        } else {
+            acc.push_str(line);
+            out.push(std::mem::take(&mut acc));
+        }
+    }
+    if !acc.is_empty() {
+        out.push(acc);
+    }
+    out
+}
+
+/// The #3637 M4 hand-off contract over logical lines: exactly one root
+/// `ExecStartPost=+` runs `ai-memory wake-hub --publish-snapshot` with the
+/// staging source AND the hub's allowlist path on that same command, and no
+/// `Exec*` command anywhere runs install(1).
+fn refresher_handoff_violations(unit: &str) -> Vec<&'static str> {
+    let lines = logical_lines(unit);
+    let mut v = Vec::new();
+    let handoffs = lines
+        .iter()
+        .filter(|l| {
+            l.starts_with("ExecStartPost=+")
+                && l.contains("/usr/bin/ai-memory wake-hub")
+                && l.contains("--publish-snapshot /var/lib/ai-memory/hub-allow.json")
+                && l.contains("--allowlist /run/ai-memory-hub/hub-allow.json")
+        })
+        .count();
+    if handoffs != 1 {
+        v.push("exactly one root ExecStartPost=+ must run wake-hub --publish-snapshot SRC --allowlist /run/ai-memory-hub/hub-allow.json");
+    }
+    if lines
+        .iter()
+        .any(|l| l.starts_with("Exec") && l.contains("install"))
+    {
+        v.push("no Exec* command may run install(1) (#3637 CWE-59)");
+    }
+    v
+}
+
+#[test]
+fn denied_an_install_step_hidden_on_a_continuation_line_is_refused_3637() {
+    // The reviewer's evasion (#3637 F4): the positive pin is satisfied and
+    // install(1) sits on a continuation line of a second ExecStartPost.
+    let evasion = "\
+[Service]
+User=ai-memory
+ExecStartPost=+/usr/bin/env AI_MEMORY_NO_CONFIG=1 /usr/bin/ai-memory wake-hub \\
+    --publish-snapshot /var/lib/ai-memory/hub-allow.json \\
+    --allowlist /run/ai-memory-hub/hub-allow.json
+ExecStartPost=+/usr/bin/env \\
+    /usr/bin/install -o ai-memory-hub -g ai-memory-hub -m 0600 \\
+    /var/lib/ai-memory/hub-allow.json /run/ai-memory-hub/hub-allow.json
+";
+    let v = refresher_handoff_violations(evasion);
+    assert!(
+        v.iter().any(|s| s.contains("install")),
+        "a continuation-line install(1) must be caught, got {v:?}"
+    );
+    // And the allowlist path must be on the SAME command as --publish-snapshot.
+    let split = "\
+ExecStartPost=+/usr/bin/ai-memory wake-hub --publish-snapshot /var/lib/ai-memory/hub-allow.json
+ExecStartPre=/bin/true /run/ai-memory-hub/hub-allow.json --allowlist
+";
+    assert!(
+        !refresher_handoff_violations(split).is_empty(),
+        "an --allowlist path detached from the hand-off command must be refused"
     );
 }
 
