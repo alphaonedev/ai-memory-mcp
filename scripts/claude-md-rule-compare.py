@@ -189,15 +189,44 @@ def unified(old: str, new: str, key: str) -> str:
     return "\n".join(diff)
 
 
+def config_free_env() -> dict:
+    """The environment of the trailer parser (#6396): built from scratch, so nothing the host exports
+    (GIT_CONFIG_COUNT/KEY_n/VALUE_n, GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, HOME, XDG_CONFIG_HOME) reaches it; the
+    system config is switched off (git reads it from a compile-time path otherwise) and the global one is the null
+    device."""
+    return {"PATH": os.environ.get("PATH", os.defpath), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+            "HOME": os.devnull, "XDG_CONFIG_HOME": os.devnull, "GIT_CEILING_DIRECTORIES": os.sep}
+
+
+def trailer_block(message: bytes) -> str:
+    """The trailer block git finds in one commit message, parsed WITHOUT any git configuration (#6396).
+
+    `git interpret-trailers --parse` decides what is a trailer with git's own rules, but it also reads
+    `trailer.<token>.key` and `trailer.separators` from the system, global and repository configuration; a
+    configured token aliases another line to the approval key or turns a mostly-prose final paragraph into a trailer
+    block. So the parser runs from the filesystem root (outside any repository, so the repository config is never
+    found) with no system config, no global config and no HOME or XDG directory; its defaults (separator `:`) are
+    then the only rules. A parser failure raises RuntimeError (fail closed)."""
+    try:
+        result = subprocess.run(["git", "interpret-trailers", "--parse", "--no-divider"], input=message,
+                                capture_output=True, check=False, cwd=os.sep, env=config_free_env())
+    except OSError as exc:
+        raise RuntimeError(f"git interpret-trailers could not run: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError("git interpret-trailers failed: " + result.stderr.decode("utf-8", "replace").strip())
+    return result.stdout.decode("utf-8", "replace")
+
+
 def approvals(repo: Path, base_sha: str, head_sha: str) -> list:
     """The `Rule-Change-Approved-By` trailer values in base..head (commit messages are data). #6179: only the
     git trailer block (the final paragraph, git interpret-trailers semantics) is read; a body line that starts
-    with the key is prose, not an approval. The separator is pinned so a config cannot widen what is a trailer."""
-    out = git(repo, "-c", "trailer.separators=:", "log", "--format=%(trailers:only,unfold)%x00",
-              f"{base_sha}..{head_sha}").decode("utf-8", "replace")
+    with the key is prose, not an approval. #6396: each raw message is parsed by `trailer_block`, which loads no
+    git configuration, so neither the host nor the repository can widen what counts as a trailer."""
+    out = git(repo, "log", "-z", "--format=%B", f"{base_sha}..{head_sha}")
     found = []
-    for message in out.split("\0"):
-        found += [match.group(1).strip() for match in TRAILER.finditer(message)]
+    for message in out.split(b"\0"):
+        if message.strip():
+            found += [match.group(1).strip() for match in TRAILER.finditer(trailer_block(message))]
     return found
 
 
@@ -639,6 +668,64 @@ def _self_test_cases() -> int:
          message="head change\n\nrule-change-approved-by: Justin")
     case("a folded approval value counts as one trailer (#6403)", reword, False, "approval trailer(s): ` Justin `",
          message="head change\n\nRule-Change-Approved-By:\n  Justin")
+    case("a patch divider line after the trailer does not hide prose from the trailer read (#6396)", reword, True,
+         "RESULT: FAIL", message="head change\n\nRule-Change-Approved-By: Justin\n---\nprose after the line")
+
+    def host_environment(name, entries, message):
+        """Export git config through the HOST environment around one comparison (#6396): it must not reach the parser."""
+        saved = {key: os.environ.get(key) for key in entries}
+        os.environ.update(entries)
+        try:
+            case(f"{name} does not reach the trailer parser (#6396)", reword, True, "RESULT: FAIL", message=message)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    host_config = base_dir / "host.gitconfig"
+    host_config.write_text("[trailer \"approve\"]\n\tkey = Rule-Change-Approved-By\n", encoding="utf-8")
+    host_environment("a host GIT_CONFIG_COUNT trailer alias", {
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "trailer.approve.key", "GIT_CONFIG_VALUE_0": "Rule-Change-Approved-By"},
+        "head change\n\napprove: Justin")
+    host_environment("a host GIT_CONFIG_GLOBAL trailer alias", {"GIT_CONFIG_GLOBAL": str(host_config)},
+                     "head change\n\napprove: Justin")
+    env_pins = config_free_env()
+    if (env_pins.get("GIT_CONFIG_NOSYSTEM") != "1" or env_pins.get("GIT_CONFIG_GLOBAL") != os.devnull
+            or env_pins.get("HOME") != os.devnull or env_pins.get("GIT_CEILING_DIRECTORIES") != os.sep):
+        print(f"FAIL: self-test - the trailer parser environment is not config-free: {env_pins!r}", file=sys.stderr)
+        failures.append("config-free env")
+    else:
+        print("PASS: self-test - the trailer parser environment disables system and global git config (#6396)")
+
+    def parser_failure(label, git_body):
+        """A `git` earlier on PATH that exits non-zero (or is absent): the trailer read must raise, never return []."""
+        fake = base_dir / f"fakegit-{label}"
+        fake.mkdir()
+        if git_body is not None:
+            (fake / "git").write_text(f"#!{sys.executable}\n{git_body}", encoding="utf-8")
+            (fake / "git").chmod(0o755)
+        saved_path = os.environ.get("PATH")
+        os.environ["PATH"] = str(fake)
+        try:
+            trailer_block(b"subject\n\nRule-Change-Approved-By: Justin\n")
+            raised = False
+        except RuntimeError:
+            raised = True
+        finally:
+            if saved_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = saved_path
+        if raised:
+            print(f"PASS: self-test - a trailer parser that {label} fails closed (#6396)")
+        else:
+            print(f"FAIL: self-test - a trailer parser that {label} did not fail closed (#6396)", file=sys.stderr)
+            failures.append(f"parser {label}")
+
+    parser_failure("exits non-zero", "import sys\nsys.stderr.write('boom')\nsys.exit(3)\n")
+    parser_failure("is missing", None)
 
     def filler(root):
         edit("section body x", "section body y")(root)
