@@ -1565,22 +1565,26 @@ shutdown too). If that drain hits its 30 s budget the write is still
 durable, and what happens to each delivery depends on whether its worker
 had started (#3979):
 
-- **Started** (holding a dispatch slot): it has a `subscription_events`
-  audit row, written before the first send, so
-  `memory_subscription_replay` re-delivers it.
+- **Every admitted delivery** gets its `subscription_events` audit row
+  (`delivery_status = "pending"`, full payload) at ADMISSION, before any
+  worker is spawned (#3980). If that row cannot be written the delivery is
+  not sent: it goes to `subscription_dlq` instead.
+- **Started** (holding a dispatch slot): its audit row is settled to `ack`
+  or `failed` by its worker, so `memory_subscription_replay` re-delivers it.
 - **Not started** (queued behind `AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY`,
-  default 32, or behind the blocking pool): it has no audit row. The drain
-  records it to `subscription_dlq` with `last_error = "shutdown_unstarted"`
-  (visible in `memory_subscription_dlq_list`) and it is never sent late.
-  If that DLQ write fails (for example the per-subscription DLQ cap), the
-  delivery is logged at ERROR and lost.
+  default 32, or behind the blocking pool): the drain moves it to
+  `subscription_dlq` with `last_error = "shutdown_unstarted"` (visible in
+  `memory_subscription_dlq_list`), deleting its `pending` audit row in the
+  same transaction, and it is never sent late. If that DLQ write fails (for
+  example the per-subscription DLQ cap), the delivery is logged at ERROR
+  and keeps its `pending` audit row.
 
-The shutdown WARN reports all three counts. **A crash is not covered.**
-SIGKILL, an OOM kill or an abort before the drain loses every delivery
-that had not started, because until its worker runs a delivery exists only
-in memory (admission-time persistence is tracked in #3980). The event
-stream therefore records every write that
-*dispatched*, not every delivery a subscriber will receive.
+The shutdown WARN reports all three counts. **A crash** (SIGKILL, an OOM
+kill or an abort before the drain) skips the sweep: every delivery that had
+not started keeps its `pending` audit row, so `memory_subscription_replay`
+returns it with its payload, and `ai-memory doctor` counts it as a stale
+pending row. Nothing re-sends it automatically: a restart cannot tell
+"never sent" from "sent, then killed before its status was recorded".
 
 ### `POST /api/v1/subscriptions` — register webhook
 
