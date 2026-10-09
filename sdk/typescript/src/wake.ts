@@ -513,11 +513,14 @@ function checkBundleStat(path: string, st: Stats): void {
  * `src/wake_client/bundle.rs` (`open_owner_only`), modelled in turn on
  * `AllowlistCache::open_checked` (#3504).
  *
- * **Platform caveat:** Windows has no `O_NOFOLLOW` and no `O_NONBLOCK`, so
- * there is no way to bind the check to the descriptor with `node:fs` there.
- * That leg keeps the historical path-based check-then-read, unchanged and
- * still racy, and says so rather than pretending otherwise. The hub socket and
- * the key directory this loader serves are POSIX-only surfaces today.
+ * **Platform caveat:** Windows has no `O_NOFOLLOW` and no `O_NONBLOCK`, so a
+ * symlink cannot be refused AT the open there; that leg refuses a link with a
+ * best-effort `lstatSync` pre-check on the path instead (#3812). Everything
+ * else is the same on every platform: ONE open, `fstat` on that descriptor,
+ * read from that descriptor. The residual on Windows is therefore a link
+ * swapped in between the pre-check and the open — never the mode/owner check,
+ * which is always bound to the bytes that are read. The hub socket and the key
+ * directory this loader serves are POSIX-only surfaces today.
  */
 function readOwnerOnly(path: string): string {
   return readOwnerOnlyWith(path, {
@@ -543,22 +546,24 @@ export interface OwnerOnlyOpenFlags {
  */
 export function readOwnerOnlyWith(path: string, flags: OwnerOnlyOpenFlags): string {
   const { noFollow, nonBlock } = flags;
-  if (typeof noFollow !== "number" || typeof nonBlock !== "number") {
-    // Windows. Documented above: the pre-#3780 shape, verbatim.
-    const st = lstatSync(path);
-    if (st.isSymbolicLink()) {
-      throw new WakeError(
-        `${path} is a symlink: a credential reached through a link is one whose ` +
-          "permissions were checked on the wrong file",
-      );
-    }
-    checkBundleStat(path, st);
-    return readFileSync(path, "utf8");
+  let openFlags = fsConstants.O_RDONLY;
+  if (typeof noFollow === "number" && typeof nonBlock === "number") {
+    openFlags |= noFollow | nonBlock;
+  } else if (lstatSync(path).isSymbolicLink()) {
+    // Windows (#3812): with no O_NOFOLLOW the link refusal is this pre-check
+    // on the path, and nothing else is: the mode/owner check and the read
+    // below run on ONE descriptor exactly as on POSIX. The residual on this
+    // leg is a link swapped in between here and the open, never a
+    // check-then-read on the path.
+    throw new WakeError(
+      `${path} is a symlink: a credential reached through a link is one whose ` +
+        "permissions were checked on the wrong file",
+    );
   }
 
   let fd: number;
   try {
-    fd = openSync(path, fsConstants.O_RDONLY | noFollow | nonBlock);
+    fd = openSync(path, openFlags);
   } catch (err) {
     // ELOOP is what O_NOFOLLOW reports for a symlink on Linux and macOS
     // (EMLINK on the BSDs). Kept as its own refusal so the operator is told
