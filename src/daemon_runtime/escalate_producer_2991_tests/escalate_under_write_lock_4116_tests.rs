@@ -180,6 +180,186 @@ fn assert_escalation_queued<T: std::fmt::Debug>(
     );
 }
 
+/// #4376 — with the deferred queue write FORCED to fail, a funnel that OWNS
+/// its transaction must say so (`escalation NOT queued`), name no id, queue
+/// nothing, and leave the write refused.
+fn assert_escalation_not_queued<T: std::fmt::Debug>(
+    conn: &rusqlite::Connection,
+    funnel: &str,
+    run: impl FnOnce() -> anyhow::Result<T>,
+) {
+    let before = pending_counts(conn).0;
+    let err = run().expect_err(&format!("{funnel}: the escalated write stays refused"));
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("escalation NOT queued") && !msg.contains("pending_id="),
+        "{funnel}: a failed queue write must say NOT queued and name no id: {msg}"
+    );
+    assert_eq!(pending_counts(conn).0, before, "{funnel}: nothing was queued");
+    assert!(conn.is_autocommit(), "{funnel}: back in autocommit");
+}
+
+/// #4376 — the `ReflectInput` the reflect cells submit.
+fn reflect_input(ns: &str, title: &str, sources: &[String]) -> crate::storage::ReflectInput {
+    crate::storage::ReflectInput {
+        source_ids: sources.to_vec(),
+        title: title.to_string(),
+        content: format!("{title}: a reflection over the sources"),
+        namespace: Some(ns.to_string()),
+        tier: Tier::Mid,
+        tags: Vec::new(),
+        priority: 5,
+        confidence: 1.0,
+        source: "system".to_string(),
+        agent_id: "ai:worker-4116".to_string(),
+        metadata: serde_json::json!({}),
+    }
+}
+
+/// #4376 — the owning `WriteTxn` sites OUTSIDE the four named funnels
+/// (`reflect_with_hooks_for_caller`; under `sal` also `SqliteStore::
+/// {store_batch, store_with_embedding_no_overwrite, update}`) must report the
+/// SETTLED outcome: the queued text naming a pending id that EXISTS on the
+/// normal path, and `escalation NOT queued` under the forced-failure seam —
+/// never the caller-owned DEFERRED wording, which is stale by the time the
+/// caller reads it (the transaction has already ended).
+#[test]
+fn owning_sites_outside_the_named_funnels_report_the_settled_outcome_4376() {
+    if crate::config::run_env_isolated_child_or_spawn(
+        "daemon_runtime::escalate_producer_2991_tests::escalate_under_write_lock_4116_tests::owning_sites_outside_the_named_funnels_report_the_settled_outcome_4376",
+    ) {
+        return;
+    }
+    let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
+    let (_dir, path) = setup("owners-4376");
+    let conn = crate::db::open(&path).expect("open main");
+    let ns = "gov4116/owners";
+
+    let s1 = memory("reflect-src-1", ns);
+    let s2 = memory("reflect-src-2", ns);
+    crate::storage::insert(&conn, &s1).expect("insert s1");
+    crate::storage::insert(&conn, &s2).expect("insert s2");
+    let sources = vec![s1.id.clone(), s2.id.clone()];
+    #[cfg(feature = "sal")]
+    let update_target = {
+        let m = memory("sal-update-target", ns);
+        crate::storage::insert(&conn, &m).expect("insert update target");
+        m
+    };
+
+    seed_rule(&path, "escalate");
+    let _rx = install_hook(&path);
+
+    // ── normal path: the pending exists and the refusal names it ──
+    assert_escalation_queued(&conn, "reflect_with_hooks_for_caller", false, || {
+        crate::storage::reflect_with_hooks_for_caller(
+            &conn,
+            &reflect_input(ns, "reflection-queued", &sources),
+            &crate::storage::ReflectHooks::empty(),
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+    });
+    #[cfg(feature = "sal")]
+    let (rt, store, ctx) = {
+        use crate::store::{CallerContext, sqlite::SqliteStore};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store = SqliteStore::open(&path).expect("open SAL store");
+        (rt, store, CallerContext::for_agent("ai:worker-4116"))
+    };
+    #[cfg(feature = "sal")]
+    {
+        use crate::store::MemoryStore;
+        assert_escalation_queued(&conn, "SqliteStore::store_batch", false, || {
+            rt.block_on(store.store_batch(&ctx, &[memory("batch-queued", ns)]))
+                .map_err(|e| anyhow::anyhow!(e.to_string()))
+        });
+        assert_escalation_queued(
+            &conn,
+            "SqliteStore::store_with_embedding_no_overwrite",
+            false,
+            || {
+                rt.block_on(store.store_with_embedding_no_overwrite(
+                    &ctx,
+                    &memory("no-overwrite-queued", ns),
+                    None,
+                    None,
+                ))
+                .map_err(|e| anyhow::anyhow!(e.to_string()))
+            },
+        );
+        assert_escalation_queued(&conn, "SqliteStore::update", false, || {
+            rt.block_on(store.update(
+                &ctx,
+                &update_target.id,
+                crate::store::UpdatePatch {
+                    title: Some("sal-update-target retitled".to_string()),
+                    ..Default::default()
+                },
+            ))
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+        });
+    }
+
+    // ── forced failure: NOT queued, no id named ──
+    crate::storage::escalation_deferral::force_deferred_queue_failure_for_test(true);
+    assert_escalation_not_queued(&conn, "reflect_with_hooks_for_caller", || {
+        crate::storage::reflect_with_hooks_for_caller(
+            &conn,
+            &reflect_input(ns, "reflection-not-queued", &sources),
+            &crate::storage::ReflectHooks::empty(),
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+    });
+    #[cfg(feature = "sal")]
+    {
+        use crate::store::MemoryStore;
+        assert_escalation_not_queued(&conn, "SqliteStore::store_batch", || {
+            rt.block_on(store.store_batch(&ctx, &[memory("batch-not-queued", ns)]))
+                .map_err(|e| anyhow::anyhow!(e.to_string()))
+        });
+        assert_escalation_not_queued(
+            &conn,
+            "SqliteStore::store_with_embedding_no_overwrite",
+            || {
+                rt.block_on(store.store_with_embedding_no_overwrite(
+                    &ctx,
+                    &memory("no-overwrite-not-queued", ns),
+                    None,
+                    None,
+                ))
+                .map_err(|e| anyhow::anyhow!(e.to_string()))
+            },
+        );
+        assert_escalation_not_queued(&conn, "SqliteStore::update", || {
+            rt.block_on(store.update(
+                &ctx,
+                &update_target.id,
+                crate::store::UpdatePatch {
+                    title: Some("sal-update-target retitled again".to_string()),
+                    ..Default::default()
+                },
+            ))
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+        });
+    }
+    crate::storage::escalation_deferral::force_deferred_queue_failure_for_test(false);
+
+    // Nothing the gate escalated was written.
+    let reflections: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND title LIKE 'reflection-%'",
+            [ns],
+            |r| r.get(0),
+        )
+        .expect("count reflections");
+    assert_eq!(reflections, 0, "escalated reflections must not land");
+}
+
 #[test]
 fn escalate_under_held_write_lock_queues_on_every_funnel() {
     if crate::config::run_env_isolated_child_or_spawn(
