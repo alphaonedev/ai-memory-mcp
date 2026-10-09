@@ -251,7 +251,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 2 }
       - name: Test impact selector security fallbacks
-        run: python3 scripts/test/test_ci_test_impact.py
+        run: python3 -I scripts/test/test_ci_test_impact.py
       - id: cls
         shell: bash
         env:
@@ -559,14 +559,14 @@ jobs:
         # verifier then runs offline and content-pinned.
         run: cargo fetch --locked
       - name: Verify every custom-build package is ledgered
-        run: python3 scripts/check-build-script-vetting.py
+        run: python3 -I scripts/check-build-script-vetting.py
       - name: Self-test (prove the gate is load-bearing)
         # Runs AFTER the gate, mirroring the vendor-literal gate's convention:
         # if the detection logic regresses, this trips even when the ledger
         # happens to be clean. Includes the R-203 leg that runs the FROZEN
         # pre-#2635 ledger-only algorithm over a planted unvetted package and
         # requires it to MISS — so the leg cannot pass tautologically.
-        run: python3 scripts/check-build-script-vetting.py --self-test
+        run: python3 -I scripts/check-build-script-vetting.py --self-test
 
   # actionlint — workflow-injection guard (#1851, audit follow-up #1855).
   # actionlint's NATIVE expression-injection check flags the #1851 class: an

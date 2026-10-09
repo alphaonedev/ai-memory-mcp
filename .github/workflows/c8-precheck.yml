@@ -277,9 +277,9 @@ jobs:
         # = tmpdir; the gate must catch the drift.
         run: bash scripts/check-docs-vs-ssot.sh --self-test
       - name: CLAUDE.md size ceiling (#4507)
-        run: python3 scripts/check-claude-md-size.py
+        run: python3 -I scripts/check-claude-md-size.py
       - name: Self-test the CLAUDE.md size guard
-        run: python3 scripts/check-claude-md-size.py --self-test
+        run: python3 -I scripts/check-claude-md-size.py --self-test
 
   doc-symbol-anchor-gate:
     # Issue #2629 / 3x7 claims register. `check-docs-vs-ssot.sh` pins
@@ -391,13 +391,13 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run MCP transport-isolation gate
-        run: python3 scripts/check-mcp-transport-isolation.py
+        run: python3 -I scripts/check-mcp-transport-isolation.py
       - name: Self-test the gate (regression evidence)
         # Plants a TcpListener::bind, an axum::serve, and an
         # out-of-allowlist reqwest client in mcp files (each must RED);
         # near-miss controls that must PASS: the allowlisted transport.rs
         # reqwest client, and a rusqlite `.bind(` SQL parameter.
-        run: python3 scripts/check-mcp-transport-isolation.py --self-test
+        run: python3 -I scripts/check-mcp-transport-isolation.py --self-test
 
   ci-job-claims-gate:
     # 3x7 claims register 3.3.3 — C-21 / C-23 / C-24 / C-31, all one
@@ -429,9 +429,9 @@ jobs:
         # The release build, the assert pin, the release-shaped proof job and
         # the INSTALL "pre-built binaries" claim all follow the one declaration
         # in scripts/release-features.sh (sal-postgres ships).
-        run: python3 scripts/check_release_features.py
+        run: python3 -I scripts/check_release_features.py
       - name: Release feature-set guard self-test (a broken declaration must fail the build, #4480)
-        run: python3 scripts/check_release_features.py --self-test
+        run: python3 -I scripts/check_release_features.py --self-test
       - name: Self-test the gate (regression evidence)
         # Plants all four historical claims. The C-31 leg is the
         # load-bearing one: the workflow EXISTS and its job EXISTS, so
@@ -1555,12 +1555,12 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run no-credentials-on-argv gate
-        run: python3 scripts/check-docs-no-argv-secrets.py
+        run: python3 -I scripts/check-docs-no-argv-secrets.py
       - name: Self-test the gate (regression evidence)
         # Red probes: inline, =, quoted, continuation and curator forms.
         # Green near-misses: file form, no password, redaction tokens,
         # shell expansion, the schema-init allowlist.
-        run: python3 scripts/check-docs-no-argv-secrets.py --self-test
+        run: python3 -I scripts/check-docs-no-argv-secrets.py --self-test
 
   sqlite-write-txn-immediate-gate:
     # #5084 / #5241: a rusqlite DEFERRED transaction that reads then writes
@@ -1573,6 +1573,6 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run SQLite write-transaction IMMEDIATE gate
-        run: python3 scripts/check-sqlite-write-txn-immediate.py
+        run: python3 -I scripts/check-sqlite-write-txn-immediate.py
       - name: Self-test the gate (regression evidence)
-        run: python3 scripts/check-sqlite-write-txn-immediate.py --self-test
+        run: python3 -I scripts/check-sqlite-write-txn-immediate.py --self-test
