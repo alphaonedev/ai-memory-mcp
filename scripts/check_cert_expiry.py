@@ -808,6 +808,11 @@ def run_gate_shimmed(tmp, repo, env, version="", fail=""):
     if real is None:
         raise GateError("git is not on PATH")
     shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
+    if os.pathsep in str(shim_dir):
+        # #6178: the PATH entry would be split and the real git would run.
+        shutil.rmtree(shim_dir, ignore_errors=True)
+        raise GateError(f"the scratch path {str(shim_dir)!r} contains the PATH separator "
+                        f"{os.pathsep!r}; the git shim would be unreachable")
     shim = shim_dir / "git"
     shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version=version,
                                     fail=fail), encoding="utf-8")
@@ -1247,15 +1252,24 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                      GITHUB_BASE_REF="main", GITHUB_SHA=good7, PATH=os.environ.get("PATH", ""))
     t.gate("pr7-ok", "control: a two-parent merge of the live tip and the PR head", repo, env7)
     # R2-F2: the version guard and the is-ancestor error branch are pinned.
-    rc, out, err = run_gate_shimmed(tmp, repo, env7, version="git version 2.29.9")
-    if rc != 1 or "git >= 2.30 is required" not in out + err:
-        t.fail("(gitver): git 2.29.9 did not fail closed with the version guard:", out + err)
-    rc, out, err = run_gate_shimmed(tmp, repo, env7, fail="--is-ancestor")
-    if rc != 1 or "merge-base --is-ancestor exited 128" not in out + err:
-        t.fail("(anc-error): an is-ancestor error did not fail closed:", out + err)
-    rc, out, err = run_gate_shimmed(tmp, repo, env7)
-    if rc != 0:
-        t.fail("(shim-control): the pass-through git shim was REJECTED:", out + err)
+    def shimmed(label, **kw):
+        """run_gate_shimmed; a shim that cannot be installed is a named
+        self-test failure, never a verdict on the gate (#6178)."""
+        try:
+            return run_gate_shimmed(tmp, repo, env7, **kw)
+        except GateError as exc:
+            t.fail(f"({label}): the git shim could not be installed: {exc}")
+            return None
+
+    res = shimmed("gitver", version="git version 2.29.9")
+    if res and (res[0] != 1 or "git >= 2.30 is required" not in res[1] + res[2]):
+        t.fail("(gitver): git 2.29.9 did not fail closed with the version guard:", res[1] + res[2])
+    res = shimmed("anc-error", fail="--is-ancestor")
+    if res and (res[0] != 1 or "merge-base --is-ancestor exited 128" not in res[1] + res[2]):
+        t.fail("(anc-error): an is-ancestor error did not fail closed:", res[1] + res[2])
+    res = shimmed("shim-control")
+    if res and res[0] != 0:
+        t.fail("(shim-control): the pass-through git shim was REJECTED:", res[1] + res[2])
     # #6178: a scratch path that contains the PATH separator splits the shim
     # entry, so the shim is unreachable and the real git runs; refuse that.
     sep_dir = tmp / f"sep{os.pathsep}dir"
@@ -1428,7 +1442,8 @@ SELF_TEST_OK = (
     "head or merge commit and on non-hex, abbreviated or newline-suffixed shas; (pr4-moved) base moved by an unrelated commit "
     "GREEN; (pr4-offbase) first parent not on the base RED naming origin/<base ref>, each sha once, "
     "with the push-or-sync remedy; (gitver) git below 2.30 fail-closed; (anc-error) an is-ancestor "
-    "error fail-closed; "
+    "error fail-closed; (shim-pathsep, #6178) a shim scratch path containing the PATH "
+    "separator refused, so the shim cells never run against the real git; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
