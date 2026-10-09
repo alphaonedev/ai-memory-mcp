@@ -2012,7 +2012,9 @@ DOCKER = "Dockerfile"
 INSTALL = "docs/INSTALL.md"
 DECL = "scripts/release-features.sh"
 ASSERTER = "scripts/assert-compiled-features.sh"
-INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL, ASSERTER, SHAPE_PROOF_SCRIPT)
+CARGO = "Cargo.toml"
+PASTE_DEP = 'paste = { path = "vendor/paste" }'
+INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL, ASSERTER, SHAPE_PROOF_SCRIPT, CARGO)
 
 
 def mutate_file(path: Path, old: str, new: Union[str, None, Transform], every: bool = False) -> None:
@@ -3050,6 +3052,19 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         "        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}\n", "        shell: bash\n", 1)))]),
     "6284 shape build bind sha taken from the PR head": ("fail", [_shape(SHAPE_HDR, _in_shape_build(lambda s: s.replace(
         "PREFLIGHT_SHA: ${{ github.sha }}", "PREFLIGHT_SHA: ${{ github.event.pull_request.head.sha }}", 1)))]),
+    # --- #6292: the release-shape `paths:` filter covers every build input
+    "6292 path dependency outside the release-shape paths filter": ("fail", [(CARGO, PASTE_DEP,
+        PASTE_DEP.replace("vendor/paste", "third_party/paste"), False)]),
+    "6292 dependency-table path dependency outside the filter": ("fail", [(CARGO, PASTE_DEP,
+        lambda s: s + '\n[dependencies.extra]\nversion = "1"\npath = "third_party/extra"\n', False)]),
+    "6292 patch-table path dependency outside the filter": ("fail", [(CARGO, PASTE_DEP,
+        lambda s: s + '\n[patch.crates-io]\nserde = { path = "third_party/serde" }\n', False)]),
+    "valid: 6292 commented path dependency is not a dependency": ("pass", [(CARGO, PASTE_DEP,
+        PASTE_DEP + '\n# old = { path = "third_party/old" }', False)]),
+    "valid: 6292 path in a trailing comment is not a dependency": ("pass", [(CARGO, PASTE_DEP,
+        PASTE_DEP + '  # was path = "third_party/old"', False)]),
+    "valid: 6292 test target path is not a dependency": ("pass", [(CARGO, PASTE_DEP,
+        lambda s: s + '\n[[test]]\nname = "x"\npath = "elsewhere/x.rs"\n', False)]),
     # --- #4719 round 5 SR-8: the docker job is pinned whole; no other job may reach the registry
     "SR8/I01 absolute-path docker push in a docker-job step": ("fail", _docker_extra_step("        run: /usr/bin/docker push x\n")),
     "SR8/I02 docker -H push in a docker-job step": ("fail", _docker_extra_step("        run: docker -H tcp://x:2375 push x\n")),
@@ -3381,6 +3396,13 @@ def unit_checks() -> int:
             or SHAPE_BUILD[-1] != WF_BUILD[-1].replace(" --target ${{ matrix.target }}", "")):
         print("self-test FAIL: the release-shape build statements differ from the release build's (#6284): "
               f"{[s for s in WF_BUILD if s not in SHAPE_BUILD]} missing", file=sys.stderr)
+        failures += 1
+    # #6292: the release-shape trigger filter covers every build input the
+    # binary is made from, not only the source tree.
+    missing = [p for p in ("vendor/**", "build.rs", "rust-toolchain.toml", "Dockerfile", ".cargo/**")
+               if p not in SHAPE_PATHS]
+    if missing:
+        print(f"self-test FAIL: the release-shape paths filter omits build inputs (#6292): {missing}", file=sys.stderr)
         failures += 1
     if "OUT OF SCOPE" in (__doc__ or ""):
         print("self-test FAIL: the module docstring still records an unbound gap (#6275)", file=sys.stderr)
