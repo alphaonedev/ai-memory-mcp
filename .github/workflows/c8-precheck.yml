@@ -1426,3 +1426,17 @@ jobs:
         run: python3 scripts/check-sqlite-write-txn-immediate.py
       - name: Self-test the gate (regression evidence)
         run: python3 scripts/check-sqlite-write-txn-immediate.py --self-test
+
+  inline-mod-tests-cfg-gate:
+    # #4755: an inline `mod tests` under src/ without #[cfg(test)] compiles
+    # its helpers into the production library and the #3623 boundary
+    # (scripts/lib/production-lines.awk) classes its #[test] fns as
+    # production, so test-only gates skip them and production-only gates
+    # scan them. The pin carries scanner self-tests on synthetic sources.
+    name: Inline mod tests cfg(test) gate (#4755)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run inline mod tests cfg(test) gate (+ scanner self-tests)
+        run: python3 scripts/test/test_inline_mod_tests_cfg_4755.py
