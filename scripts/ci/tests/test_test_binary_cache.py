@@ -1343,5 +1343,34 @@ class RedRecordingRunInvalidates6384R2L3(World):
         self.assertEqual(self.manifest(), before)
 
 
+class ManifestWriterWording6384R2L2(unittest.TestCase):
+    """r2 L2: ``record`` never writes on a pull request, but a same-repository
+    pull request's own test code runs as the runner user and CAN write the
+    manifest directory. The docs must say so and name what bounds it,
+    instead of claiming the manifest is out of reach."""
+
+    def sections(self):
+        carrier = (REPO / 'docs' / 'ci' / 'CARRIER-BRANCH-GATES.md').read_text()
+        i = carrier.index('## Per-test-binary result cache (#6384)')
+        sec = carrier[i:]
+        nxt = sec.find('\n## ', 5)
+        sec = sec[:nxt] if nxt > 0 else sec
+        ci = (REPO / '.github' / 'workflows' / 'ci.yml').read_text()
+        j = ci.index('# #6384 — per-test-binary result cache')
+        return {'docstring': tbc.__doc__, 'carrier': sec, 'ci.yml': ci[j:j + 1600]}
+
+    def test_no_unmerged_code_claim(self):
+        for name, text in self.sections().items():
+            flat = ' '.join(text.split())
+            self.assertNotIn('its test code is unmerged', flat, name)
+
+    def test_residual_exposure_is_stated(self):
+        for name, text in self.sections().items():
+            flat = ' '.join(text.replace('#', ' ').split())
+            self.assertIn('same-repository', flat, name)
+            self.assertIn('can write the manifest', flat, name)
+            self.assertIn('never skips', flat, name)
+
+
 if __name__ == '__main__':
     unittest.main()
