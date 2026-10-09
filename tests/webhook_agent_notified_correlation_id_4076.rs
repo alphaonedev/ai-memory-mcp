@@ -126,7 +126,10 @@ async fn agent_notified_body_echo_receiver_acks_with_one_correlation_id_4076() {
         Some(header.as_str()),
         "#4076: the body's correlation_id must be the delivery id the header carries"
     );
-    assert_eq!(audit_corr, header, "audit row and header name the same delivery");
+    assert_eq!(
+        audit_corr, header,
+        "audit row and header name the same delivery"
+    );
     assert_eq!(
         body.get("notification_correlation_id")
             .and_then(|v| v.as_str()),
