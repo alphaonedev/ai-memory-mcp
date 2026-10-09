@@ -507,4 +507,81 @@ mod tests {
         .join()
         .expect("leaking thread must not abort or panic");
     }
+
+    /// #6132 — one leaked intent is reported ONCE. The child leaks a frame
+    /// holding one deferred escalation, opens another `WriteTxn` on the same
+    /// database on the same thread (`open_frame` reports the stale frame),
+    /// then lets the thread exit (`Frames::drop`). Across both detection
+    /// points the child's stderr must carry exactly one `#4116` ERROR report,
+    /// not one from each.
+    #[test]
+    fn issue_4116_stale_frame_reported_once() {
+        const ROLE: &str = "AI_MEMORY_TEST_6132_STALE_FRAME_REPORTED_ONCE";
+        const PATH: &str =
+            "storage::escalation_deferral::tests::issue_4116_stale_frame_reported_once";
+        if std::env::var(ROLE).as_deref() != Ok("child") {
+            let out = crate::spawn_audit::audited_command(
+                std::env::current_exe().expect("current_exe"),
+                "escalation_deferral::issue_4116_stale_frame_reported_once",
+            )
+            .args(["--exact", PATH, "--nocapture", "--test-threads=1"])
+            .env(ROLE, "child")
+            .output()
+            .expect("spawn child");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "child must exit 0, got {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                out.status
+            );
+            assert!(
+                stdout.contains("1 passed") && !stdout.contains("0 passed"),
+                "child did not run:\n{stdout}"
+            );
+            let reports = stderr
+                .lines()
+                .filter(|l| l.contains("ERROR") && l.contains("#4116"))
+                .count();
+            assert_eq!(
+                reports, 1,
+                "one leaked intent must be reported exactly once across open_frame + \
+                 thread exit:\n{stderr}"
+            );
+            return;
+        }
+        crate::logging::init_console_tracing(&[]);
+        std::thread::spawn(|| {
+            let dir = tempfile::Builder::new()
+                .prefix("issue-6132-once-")
+                .tempdir()
+                .expect("tempdir");
+            let path = dir.path().join("ai-memory.db");
+            let a = crate::db::open(&path).expect("open a");
+            let b = crate::db::open(&path).expect("open b");
+            let leaked = super::super::connection::WriteTxn::begin(&a).expect("begin a");
+            let intent = super::DeferredEscalation {
+                pending_id: "once-6132".to_string(),
+                action: crate::models::GovernedAction::Store,
+                namespace: "gov6132/once".to_string(),
+                memory_id: None,
+                requested_by: "ai:worker".to_string(),
+                rule_id: "R-once".to_string(),
+                payload: serde_json::json!({}),
+            };
+            assert!(super::defer_to_open_txn(a.path(), intent).is_ok());
+            std::mem::forget(leaked);
+            // Release `a`'s write lock so `b` can BEGIN IMMEDIATE; the leaked
+            // frame stays on this thread's stack (matched by db path).
+            drop(a);
+            // Debug builds trip the stale-frame `debug_assert!` inside
+            // `open_frame` (after its report); release builds return a guard.
+            let next = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::super::connection::WriteTxn::begin(&b)
+            }));
+            drop(next);
+        })
+        .join()
+        .expect("leaking thread must not abort or panic");
+    }
 }
