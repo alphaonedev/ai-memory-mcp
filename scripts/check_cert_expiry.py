@@ -1255,6 +1255,31 @@ def deep_scratch_cap_violation(tmp):
 CHECKOUT_DEPTH_PREFIX = "cert-expiry-depth."
 
 
+def checkout_depth_cells():
+    """The cells checkout_depth_violation runs in its 226-byte scratch dir (#6145 R10-F1)."""
+    return (shim_isolation_violation, shim_interpreter_violation,
+            shim_boundary_robustness_violation, deep_scratch_violation,
+            path_max_restore_diagnostic_violation, deep_scratch_cap_violation,
+            scratch_limit_message_violation, deep_scratch_relative_violation)
+
+
+# Cells whose scratch path or shim interpreter line grows with the scratch depth; each
+# must run in checkout_depth_violation's 226-byte scratch dir (#6145 R10-F1).
+CHECKOUT_DEPTH_REQUIRED = ("shim_unexecutable_violation",)
+
+
+def checkout_depth_coverage_violation():
+    """None when checkout_depth_cells() names every cell in CHECKOUT_DEPTH_REQUIRED, else
+    a description (#6145 R10-F1): the shim-unexecutable cell's interpreter line is 251
+    bytes at a 226-byte scratch dir, so a cell left out of checkout-depth lets a deeper
+    one pass from a shallow checkout."""
+    have = {cell.__name__ for cell in checkout_depth_cells()}
+    missing = [name for name in CHECKOUT_DEPTH_REQUIRED if name not in have]
+    if missing:
+        return f"checkout-depth does not run {', '.join(missing)}"
+    return None
+
+
 def checkout_depth_violation(tmp):
     """None when every #6145 shim and scratch cell passes in a scratch dir exactly
     SCRATCH_PATH_LIMIT (226) bytes long, the scratch a 184-byte checkout gets, else a
@@ -1275,10 +1300,7 @@ def checkout_depth_violation(tmp):
         got = len(os.fsencode(str(deep)))
         if got != SCRATCH_PATH_LIMIT:
             return f"the depth scratch dir is {got} bytes, not {SCRATCH_PATH_LIMIT}"
-        for cell in (shim_isolation_violation, shim_interpreter_violation,
-                     shim_boundary_robustness_violation, deep_scratch_violation,
-                     path_max_restore_diagnostic_violation, deep_scratch_cap_violation,
-                     scratch_limit_message_violation, deep_scratch_relative_violation):
+        for cell in checkout_depth_cells():
             res = guarded(cell, deep)
             if res is not None:
                 return f"{cell.__name__} failed in a {got}-byte scratch dir: {res}"
@@ -1384,16 +1406,35 @@ def run_cells(t, cells):
     return None
 
 
+def shim_isolation_result(tmp, check=shim_isolation_violation):
+    """The shim-isolation verdict for _self_test: None when `check(tmp)` passes, else a
+    description. A GateError is the description itself; any other crash becomes the
+    `guarded` form, so a crash is a named failure and not a traceback (#6145 R10-F2)."""
+    try:
+        return check(tmp)
+    except GateError as exc:
+        return str(exc)
+
+
+def shim_isolation_crash_violation():
+    """None when shim_isolation_result turns an OSError raised by the check into
+    `shim_isolation_violation raised OSError: ...`, else a description (#6145 R10-F2)."""
+    def crashing(_tmp):
+        raise OSError("planted 6145")
+    got = shim_isolation_result(None, crashing)
+    want = "shim_isolation_violation raised OSError: planted 6145"
+    if got != want:
+        return f"an OSError in the isolation cell gave {got!r}, not {want!r}"
+    return None
+
+
 def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     repo = tmp / "repo"
     repo.mkdir()
     t = SelfTest()
     # #6145: prove the git PATH shim is isolated before any gate run uses it; an
     # unisolated shim aborts the self-test here.
-    try:
-        iso = shim_isolation_violation(tmp)
-    except GateError as exc:
-        iso = str(exc)
+    iso = shim_isolation_result(tmp)
     if iso is not None:
         t.fail(f"(shim-isolation, #6145): {iso}")
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
@@ -1417,6 +1458,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                        ("path-max-diagnostic", path_max_restore_diagnostic_violation, (tmp,)),
                        ("shim-deep-cap", deep_scratch_cap_violation, (tmp,)),
                        ("guarded", guarded_violation, ()),
+                       ("shim-isolation-crash", shim_isolation_crash_violation, ()),
+                       ("checkout-depth-coverage", checkout_depth_coverage_violation, ()),
                        ("shim-scratch-limit", scratch_limit_message_violation, (tmp,)),
                        ("shim-deep-relative", deep_scratch_relative_violation, (tmp,)),
                        ("checkout-depth", checkout_depth_violation, (tmp,))))
