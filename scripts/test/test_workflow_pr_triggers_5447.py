@@ -147,9 +147,13 @@ Run:  python3 scripts/test/test_workflow_pr_triggers_5447.py
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import string
+import subprocess
 import sys
+import tempfile
 import unicodedata
 import unittest
 from pathlib import Path
@@ -2814,6 +2818,456 @@ class GlobSemantics5447(unittest.TestCase):
         self.assertFalse(filter_matches(["release/**"], CARRIER))
         with self.assertRaises(Unparsed):
             filter_matches(["rehearsal/**", "!rehearsal/audit-wip"], CARRIER)
+
+
+# ---------------------------------------------------------------------------
+# #6117 round 2: the carrier push must judge what the promotion PR judges.
+# These cells run the workflow STEP TEXT itself (extracted from c8-precheck.yml)
+# against throwaway Git histories under .local-runs/, so a pass here is a
+# behavioural fact about the step, not a grep of its words.
+# ---------------------------------------------------------------------------
+
+C8_WORKFLOW = WORKFLOWS / "c8-precheck.yml"
+GEOMETRY_PY = ROOT / "scripts" / "check_promotion_geometry.py"
+GEOMETRY_SH = ROOT / "scripts" / "check-promotion-geometry.sh"
+APPROVAL_PY = ROOT / "scripts" / "check_external_pr_approval.py"
+GEOMETRY_STEP = "Promotion ancestry soundness (#3872"
+CARRIER_RANGE_STEP = "Resolve the range start for a carrier push (#6117)"
+APPROVAL_JOB = "external-pr-operator-approval-gate"
+REQUIRED_CONTEXTS_JOB = "required-contexts-gate"
+RELEASE_6117 = "release/v1.0.0"
+REPO_6117 = "alphaonedev/ai-memory-mcp"
+OPERATOR_6117 = "alphaonedev"
+
+
+def _job_text(text: str, job_id: str) -> str:
+    """The lines of one top-level job (``  <job_id>:`` up to the next job key)."""
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line == f"  {job_id}:":
+            start = i
+            break
+    if start is None:
+        raise AssertionError(f"job {job_id} not found")
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[j]) or re.match(r"^[A-Za-z]", lines[j]):
+            end = j
+            break
+    return "\n".join(lines[start:end]) + "\n"
+
+
+def _step_runs(text: str, step_prefix: str) -> List[str]:
+    """The ``run:`` body of every step whose name starts with ``step_prefix`` (dedented)."""
+    lines = text.splitlines()
+    bodies: List[str] = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)- name: \"?(.*?)\"?\s*$", line)
+        if not m or not m.group(2).startswith(step_prefix):
+            continue
+        item_indent = len(m.group(1))
+        for j in range(i + 1, len(lines)):
+            row = lines[j]
+            if row.strip() and len(row) - len(row.lstrip(" ")) <= item_indent:
+                raise AssertionError(f"step {step_prefix!r} has no run: key")
+            rm = re.match(r"^(\s*)run:\s*(.*)$", row)
+            if not rm:
+                continue
+            key_indent = len(rm.group(1))
+            if rm.group(2) not in ("|", "|-"):
+                bodies.append(rm.group(2) + "\n")
+                break
+            body: List[str] = []
+            for k in range(j + 1, len(lines)):
+                b = lines[k]
+                if b.strip() and len(b) - len(b.lstrip(" ")) <= key_indent:
+                    break
+                body.append(b[key_indent + 2:] if b.strip() else "")
+            bodies.append("\n".join(body).rstrip("\n") + "\n")
+            break
+    return bodies
+
+
+def _clean_git_env() -> Dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def _g(repo: Path, *args: str) -> str:
+    out = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
+                         env=_clean_git_env(), timeout=60, check=False)
+    if out.returncode:
+        raise AssertionError(f"git {' '.join(args)}: {out.stderr}")
+    return out.stdout.strip()
+
+
+class _History6117:
+    """origin.git + a work clone on chain/promo6-ssh; ``shape`` picks the release geometry.
+
+    ahead     release/v1.0.0 = root, carrier = root + one commit (behind=0)
+    behind    release/v1.0.0 = root + a release-only commit the carrier lacks
+    unrelated release/v1.0.0 is an orphan history (no merge-base)
+    absent    origin has no release/v1.0.0 at all
+    The work clone holds NO refs/remotes/origin/release/* until a step fetches it.
+    """
+
+    def __init__(self, td: Path, shape: str, scripts: Optional[Dict[str, str]] = None) -> None:
+        self.origin = td / "origin.git"
+        self.work = td / "work"
+        _g(td, "init", "--quiet", "--bare", str(self.origin))
+        _g(td, "init", "--quiet", "--initial-branch=chain/promo6-ssh", str(self.work))
+        w = self.work
+        _g(w, "config", "user.name", "fixture")
+        _g(w, "config", "user.email", "fixture@example.invalid")
+        _g(w, "config", "commit.gpgsign", "false")
+        _g(w, "remote", "add", "origin", str(self.origin))
+        self.root = self._commit("root.txt")
+        if shape == "unrelated":
+            _g(w, "checkout", "--quiet", "--orphan", "rel")
+            _g(w, "rm", "--quiet", "-rf", "--cached", ".")
+            self._commit("orphan.txt")
+            _g(w, "push", "--quiet", "origin", "rel:refs/heads/" + RELEASE_6117)
+            _g(w, "checkout", "--quiet", "-f", "chain/promo6-ssh")
+            _g(w, "branch", "--quiet", "-D", "rel")
+        elif shape == "behind":
+            _g(w, "checkout", "--quiet", "-b", "rel")
+            self._commit("release-only.txt")
+            _g(w, "push", "--quiet", "origin", "rel:refs/heads/" + RELEASE_6117)
+            _g(w, "checkout", "--quiet", "chain/promo6-ssh")
+            _g(w, "branch", "--quiet", "-D", "rel")
+        elif shape == "ahead":
+            _g(w, "push", "--quiet", "origin", "HEAD:refs/heads/" + RELEASE_6117)
+        elif shape != "absent":
+            raise AssertionError(shape)
+        self.head = self._commit("carrier.txt")
+        _g(w, "push", "--quiet", "origin", "chain/promo6-ssh")
+        for ref in _g(w, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/release").splitlines():
+            _g(w, "update-ref", "-d", ref)
+        (w / "scripts").mkdir()
+        sources = scripts or {}
+        for path in (GEOMETRY_PY, GEOMETRY_SH):
+            text = sources.get(path.name, path.read_text(encoding="utf-8"))
+            (w / "scripts" / path.name).write_text(text, encoding="utf-8")
+        self.output = td / "github_output"
+        self.output.write_text("")
+        self.event = td / "event.json"
+
+    def _commit(self, name: str) -> str:
+        (self.work / name).write_text(name + "\n")
+        _g(self.work, "add", "--", name)
+        _g(self.work, "commit", "--quiet", "--no-gpg-sign", "-m", name)
+        return _g(self.work, "rev-parse", "HEAD")
+
+    def run(self, body: str, ref: str = "refs/heads/chain/promo6-ssh", event: str = "push",
+            payload: Optional[dict] = None) -> Tuple[int, str]:
+        if payload is None:
+            payload = {"ref": ref, "before": self.root, "after": self.head}
+        self.event.write_text(json.dumps(payload))
+        env = _clean_git_env()
+        env.update({"GITHUB_OUTPUT": str(self.output), "GITHUB_EVENT_PATH": str(self.event),
+                    "GITHUB_EVENT_NAME": event, "EVENT_NAME": event, "GITHUB_REF": ref, "REF": ref,
+                    "GITHUB_SHA": self.head, "CARRIER_RELEASE_REF": RELEASE_6117})
+        out = subprocess.run(["bash", "-c", body], cwd=str(self.work), capture_output=True,
+                             text=True, env=env, timeout=120, check=False)
+        return out.returncode, out.stdout + out.stderr
+
+
+class _Scratch6117(unittest.TestCase):
+    def setUp(self) -> None:
+        scratch = ROOT / ".local-runs"
+        scratch.mkdir(exist_ok=True)
+        self._td = tempfile.TemporaryDirectory(prefix="r2-6117-", dir=str(scratch))
+        self.td = Path(self._td.name)
+        self.c8 = C8_WORKFLOW.read_text(encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._td.cleanup()
+
+    def history(self, shape: str, scripts: Optional[Dict[str, str]] = None) -> _History6117:
+        sub = Path(tempfile.mkdtemp(dir=str(self.td)))
+        return _History6117(sub, shape, scripts)
+
+    def geometry_body(self) -> str:
+        bodies = _step_runs(_job_text(self.c8, REQUIRED_CONTEXTS_JOB), GEOMETRY_STEP)
+        self.assertEqual(1, len(bodies), "exactly one #3872 geometry step in the required-context job")
+        return bodies[0]
+
+
+class CarrierPushGeometry6117(_Scratch6117):
+    """C-F1: on a carrier push the REQUIRED geometry context measures the carrier, never INAPPLICABLE."""
+
+    def test_6117_r2_cf1_carrier_push_behind_release_fails(self) -> None:
+        h = self.history("behind")
+        rc, out = h.run(self.geometry_body())
+        self.assertEqual(1, rc, out)
+        self.assertIn("behind=1", out)
+
+    def test_6117_r2_cf1_carrier_push_ahead_of_release_measures_and_passes(self) -> None:
+        h = self.history("ahead")
+        rc, out = h.run(self.geometry_body())
+        self.assertEqual(0, rc, out)
+        self.assertIn("ahead=1 behind=0", out)
+        self.assertNotIn("INAPPLICABLE", out)
+
+    def test_6117_r2_cf1_carrier_push_without_release_ref_fails_closed(self) -> None:
+        h = self.history("absent")
+        rc, out = h.run(self.geometry_body())
+        self.assertNotEqual(0, rc, out)
+
+    def test_6117_r2_cf1_carrier_push_with_malformed_after_sha_fails_closed(self) -> None:
+        h = self.history("ahead")
+        rc, out = h.run(self.geometry_body(),
+                        payload={"ref": "refs/heads/chain/promo6-ssh", "after": "HEAD"})
+        self.assertNotEqual(0, rc, out)
+
+    def test_6117_r2_cf1_carrier_push_judges_the_pushed_sha_not_the_checkout(self) -> None:
+        # The event's `after` is the judged commit: a BEHIND sha stays BEHIND even when
+        # the checkout HEAD has been moved onto a commit that contains the release.
+        h = self.history("behind")
+        behind_sha = h.head
+        _g(h.work, "fetch", "--quiet", "origin", "+refs/heads/release/v1.0.0:refs/heads/rel")
+        _g(h.work, "merge", "--quiet", "--no-edit", "--no-gpg-sign", "rel")
+        rc, out = h.run(self.geometry_body(),
+                        payload={"ref": "refs/heads/chain/promo6-ssh", "after": behind_sha})
+        self.assertEqual(1, rc, out)
+        self.assertIn("behind=1", out)
+
+    def test_6117_r2_cf1_control_non_carrier_push_stays_inapplicable(self) -> None:
+        h = self.history("behind")
+        rc, out = h.run(self.geometry_body(), ref="refs/heads/main",
+                        payload={"ref": "refs/heads/main", "after": "0" * 40})
+        self.assertEqual(0, rc, out)
+        self.assertIn("INAPPLICABLE", out)
+
+    def test_6117_r2_cf1_m01_script_without_the_carrier_arm_is_killed(self) -> None:
+        # Mutant: the geometry script answers every push INAPPLICABLE again (the d1dd551
+        # behaviour). The behind cell must turn red against it.
+        src = GEOMETRY_PY.read_text(encoding="utf-8")
+        anchor = 'CARRIER_PREFIX = "refs/heads/chain/"\n'
+        self.assertIn(anchor, src, "mutation anchor (the carrier ref prefix)")
+        mutant = src.replace(anchor, 'CARRIER_PREFIX = "refs/heads/never-a-carrier/"\n', 1)
+        h = self.history("behind", scripts={GEOMETRY_PY.name: mutant})
+        rc, out = h.run(self.geometry_body())
+        self.assertEqual(0, rc, "mutant should be INAPPLICABLE (exit 0); the live cell above expects 1")
+        self.assertIn("INAPPLICABLE", out)
+
+
+class CarrierRangeStep6117(_Scratch6117):
+    """S-F3 / S-F4: the four carrier range-start steps fail loudly and read the release ref from one source."""
+
+    def bodies(self) -> List[str]:
+        bodies = _step_runs(self.c8, CARRIER_RANGE_STEP)
+        self.assertEqual(4, len(bodies), "four carrier range-start steps (#6187 tracks the dedup)")
+        return bodies
+
+    def test_6117_r2_sf3_unrelated_history_fails_with_an_error_annotation(self) -> None:
+        for body in self.bodies():
+            h = self.history("unrelated")
+            rc, out = h.run(body)
+            self.assertNotEqual(0, rc, out)
+            self.assertIn("::error::", out, "a refused carrier range must say why (S-F3)")
+
+    def test_6117_r2_sf3_control_related_history_resolves_the_merge_base(self) -> None:
+        for body in self.bodies():
+            h = self.history("ahead")
+            rc, out = h.run(body)
+            self.assertEqual(0, rc, out)
+            self.assertIn(f"before={h.root}", h.output.read_text())
+
+    def test_6117_r2_sf3_control_non_carrier_push_yields_an_empty_range_start(self) -> None:
+        for body in self.bodies():
+            h = self.history("unrelated")
+            rc, out = h.run(body, ref="refs/heads/main")
+            self.assertEqual(0, rc, out)
+            self.assertEqual("before=\n", h.output.read_text())
+
+    def test_6117_r2_sf4_release_ref_has_one_source(self) -> None:
+        # S-F4: no workflow pins the carrier release ref by hand; every carrier step and
+        # the geometry step derive it from check_promotion_geometry.RELEASE.
+        for name, text in load_all().items():
+            self.assertNotRegex(text, r"CARRIER_RELEASE_REF:\s*\S", name)
+        derive = "python3 scripts/check_promotion_geometry.py --print-release"
+        for body in self.bodies() + [self.geometry_body()]:
+            self.assertIn(derive, body)
+        out = subprocess.run([sys.executable, str(GEOMETRY_PY), "--print-release"],
+                             capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(0, out.returncode, out.stderr)
+        src = GEOMETRY_PY.read_text(encoding="utf-8")
+        pinned = re.search(r'^RELEASE = "([^"]+)"$', src, re.M)
+        self.assertIsNotNone(pinned)
+        self.assertEqual(pinned.group(1) + "\n", out.stdout)
+
+    def test_6117_r2_sf4_hardcoded_release_in_a_range_step_is_killed(self) -> None:
+        # Mutant: one carrier step goes back to a hand-pinned env value.
+        derive = 'CARRIER_RELEASE_REF="$(python3 scripts/check_promotion_geometry.py --print-release)"'
+        self.assertIn(derive, self.c8)
+        mutant = self.c8.replace(derive, "CARRIER_RELEASE_REF=release/v1.0.0", 1)
+        bodies = _step_runs(mutant, CARRIER_RANGE_STEP) + [
+            _step_runs(_job_text(mutant, REQUIRED_CONTEXTS_JOB), GEOMETRY_STEP)[0]]
+        self.assertTrue(any("--print-release" not in b for b in bodies))
+
+
+# ---- S-F1: the External-PR operator-approval gate on non-PR events (#6193) ----
+
+def _load_approval():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("check_external_pr_approval_6117", str(APPROVAL_PY))
+    if spec is None or spec.loader is None:
+        raise AssertionError("cannot load " + str(APPROVAL_PY))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+SHA_A = "a" * 40
+SHA_B = "b" * 40
+
+
+def _pr(number: int, sha: str, assoc: str = "NONE", head_repo: Optional[str] = "fork/ai-memory-mcp") -> dict:
+    head: dict = {"sha": sha, "repo": None if head_repo is None else {"full_name": head_repo}}
+    return {"number": number, "author_association": assoc, "user": {"login": "someone"}, "head": head}
+
+
+def _review(sha: str, login: str = OPERATOR_6117, state: str = "APPROVED") -> dict:
+    return {"user": {"login": login}, "state": state, "commit_id": sha}
+
+
+def _fake_api(pulls: List[dict], reviews: Optional[Dict[int, List[dict]]] = None, fail: bool = False):
+    calls: List[str] = []
+
+    def api(path: str):
+        calls.append(path)
+        if fail:
+            raise _APPROVAL.GateError("HTTP 502 from the API")
+        m = re.search(r"/pulls/(\d+)/reviews", path)
+        if m:
+            return (reviews or {}).get(int(m.group(1)), [])
+        if re.search(r"/pulls\?", path) and "state=open" in path:
+            return pulls
+        raise AssertionError("unexpected API path " + path)
+
+    api.calls = calls  # type: ignore[attr-defined]
+    return api
+
+
+_APPROVAL = None  # loaded per test class
+
+
+def _approval_cases(mod) -> List[str]:
+    """Names of the decision cells ``mod.run_gate`` gets WRONG (empty list = all right)."""
+    wrong: List[str] = []
+
+    def cell(name: str, want: int, event: str, sha: str, api, payload: Optional[dict] = None) -> None:
+        try:
+            rc, _lines = mod.run_gate(event, payload or {}, REPO_6117, sha, OPERATOR_6117, api)
+        except Exception as exc:  # a crash is a wrong answer, never a pass
+            wrong.append(f"{name} (raised {exc!r})")
+            return
+        if rc != want:
+            wrong.append(f"{name} (rc={rc}, want {want})")
+
+    ext = _pr(7, SHA_A)
+    cell("push-unapproved-external-PR-head-fails", 1, "push", SHA_A, _fake_api([ext]))
+    cell("push-approved-external-PR-head-passes", 0, "push", SHA_A,
+         _fake_api([ext], {7: [_review(SHA_A)]}))
+    cell("push-approval-on-another-commit-fails", 1, "push", SHA_A,
+         _fake_api([ext], {7: [_review(SHA_B)]}))
+    cell("push-approval-by-another-login-fails", 1, "push", SHA_A,
+         _fake_api([ext], {7: [_review(SHA_A, login="mallory")]}))
+    cell("push-commented-not-approved-fails", 1, "push", SHA_A,
+         _fake_api([ext], {7: [_review(SHA_A, state="COMMENTED")]}))
+    cell("push-team-same-repo-PR-passes", 0, "push", SHA_A,
+         _fake_api([_pr(8, SHA_A, "MEMBER", REPO_6117)]))
+    cell("push-team-author-fork-head-needs-approval", 1, "push", SHA_A,
+         _fake_api([_pr(9, SHA_A, "COLLABORATOR", "fork/ai-memory-mcp")]))
+    cell("push-deleted-head-repo-is-external", 1, "push", SHA_A,
+         _fake_api([_pr(10, SHA_A, "OWNER", None)]))
+    cell("push-no-PR-heads-the-sha-passes", 0, "push", SHA_A, _fake_api([_pr(7, SHA_B)]))
+    cell("push-one-of-two-PRs-unapproved-fails", 1, "push", SHA_A,
+         _fake_api([_pr(7, SHA_A), _pr(11, SHA_A)], {7: [_review(SHA_A)]}))
+    cell("merge-group-is-judged-like-push", 1, "merge_group", SHA_A, _fake_api([ext]))
+    cell("api-error-fails-closed", 1, "push", SHA_A, _fake_api([ext], fail=True))
+    cell("malformed-pull-entry-fails-closed", 1, "push", SHA_A, _fake_api([{"number": 7}]))
+    cell("non-sha-commit-fails-closed", 1, "push", "HEAD", _fake_api([]))
+    pr_event = {"pull_request": ext}
+    cell("pull-request-external-unapproved-fails", 1, "pull_request", "", _fake_api([]), pr_event)
+    cell("pull-request-external-approved-passes", 0, "pull_request", "",
+         _fake_api([], {7: [_review(SHA_A)]}), pr_event)
+    cell("pull-request-team-same-repo-passes", 0, "pull_request", "", _fake_api([]),
+         {"pull_request": _pr(8, SHA_A, "MEMBER", REPO_6117)})
+    cell("pull-request-missing-payload-fails-closed", 1, "pull_request", "", _fake_api([]), {})
+    return wrong
+
+
+class ExternalPrApprovalOnPush6117(unittest.TestCase):
+    """S-F1 / #6193: a push run evaluates the same approval condition for every open PR headed by its sha."""
+
+    def setUp(self) -> None:
+        global _APPROVAL
+        if not APPROVAL_PY.is_file():
+            self.fail(f"{APPROVAL_PY.relative_to(ROOT)} is missing: the approval gate has no evaluator (#6193)")
+        _APPROVAL = _load_approval()
+        self.mod = _APPROVAL
+
+    def test_6117_r2_sf1_decision_table(self) -> None:
+        self.assertEqual([], _approval_cases(self.mod))
+
+    def test_6117_r2_sf1_m01_unconditional_non_pr_pass_is_killed(self) -> None:
+        # Mutant: the d1dd551 behaviour, every non-pull_request event passes.
+        src = APPROVAL_PY.read_text(encoding="utf-8")
+        anchor = "def run_gate(event_name, event, repo, sha, operator, api):\n"
+        self.assertIn(anchor, src)
+        mutant_src = src.replace(
+            anchor, anchor + '    if event_name != "pull_request":\n        return 0, ["mutant"]\n', 1)
+        ns: dict = {"__name__": "approval_mutant_6117"}
+        exec(compile(mutant_src, "approval_mutant_6117", "exec"), ns)
+
+        class _M:  # attribute view over the mutant namespace
+            pass
+
+        m = _M()
+        for k, v in ns.items():
+            setattr(m, k, v)
+        wrong = _approval_cases(m)
+        self.assertIn("push-unapproved-external-PR-head-fails (rc=0, want 1)", wrong)
+
+    def test_6117_r2_sf1_paginated_output_is_concatenated_arrays(self) -> None:
+        self.assertEqual([{"a": 1}, {"b": 2}], self.mod.parse_pages('[{"a": 1}]\n[{"b": 2}]\n'))
+        self.assertEqual([], self.mod.parse_pages("[]"))
+        for bad in ("", "not json", '{"message": "Bad credentials"}', "[1] trailing"):
+            with self.assertRaises(self.mod.GateError, msg=bad):
+                self.mod.parse_pages(bad)
+
+    def test_6117_r2_sf1_workflow_runs_the_evaluator_on_every_event(self) -> None:
+        job = _job_text(C8_WORKFLOW.read_text(encoding="utf-8"), APPROVAL_JOB)
+        runs = "\n".join(_step_runs(job, "Evaluate external-PR approval requirement"))
+        self.assertIn("python3 scripts/check_external_pr_approval.py", runs)
+        self.assertNotIn("gate not applicable (pass)", job)
+        self.assertNotRegex(job, r'"\$EVENT" != "pull_request"')
+        # rule (f): the job always runs and always reports.
+        self.assertNotRegex(job, r"(?m)^    (needs|if):")
+        # The evaluator is read from a checkout that does not keep the token on disk.
+        self.assertIn("persist-credentials: false", job)
+        self.assertIn("pull-requests: read", job)
+
+    def test_6117_r2_sf1_self_test_passes(self) -> None:
+        out = subprocess.run([sys.executable, str(APPROVAL_PY), "--self-test"],
+                             capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        job = _job_text(C8_WORKFLOW.read_text(encoding="utf-8"), APPROVAL_JOB)
+        self.assertIn("python3 scripts/check_external_pr_approval.py --self-test", job)
+
+
+class RoundTwoDocTruth6117(unittest.TestCase):
+    """C-F3: the classify comment no longer says push events never gate merges."""
+
+    def test_6117_r2_cf3_ci_classify_comment_names_the_carrier_exception(self) -> None:
+        ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+        self.assertNotIn("push events do not gate merges", " ".join(ci.replace("#", " ").split()))
 
 
 if __name__ == "__main__":
