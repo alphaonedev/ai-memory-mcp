@@ -690,8 +690,11 @@ local namespace cap, even if the sending peer's local cap is higher.
    proved "TLS + mTLS + API key all aligned"; an operator following that
    got a green light for an auth stack that was never exercised.
    To verify the **full** stack, call a gated endpoint instead:
-   `curl --cert peer.crt --key peer.key -H "X-API-Key: $KEY" \
+   `printf 'header = "X-API-Key: %s"\n' "$KEY" | curl --config - \
+   --cert peer.crt --key peer.key \
    -H "x-peer-id: peer-node-1" https://memory.prod/api/v1/sync/since?since=...`
+   (the key is piped to curl as a config line from the `printf` builtin, never
+   a curl argument)
    — note that under an enforced mTLS posture `/api/v1/sync/*` **also**
    bypasses the api-key layer by design
    ([#702](https://github.com/alphaonedev/ai-memory-mcp/issues/702)), so

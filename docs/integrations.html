@@ -448,9 +448,10 @@ memory:
           </div>
         </div>
         <p class="client-desc">Direct xAI API integration via the HTTP daemon. Authorization header passes through; per-agent_id quotas enforced server-side (v0.7.0).</p>
-        <pre class="client-config"><span class="cmt"># Reach the HTTP daemon directly</span>
-curl https://memory.local:9077/api/v1/recall \
-  -H <span class="str">"x-api-key: $MEMORY_KEY"</span> \
+        <pre class="client-config"><span class="cmt"># Reach the HTTP daemon directly (the key is piped to curl as a</span>
+<span class="cmt"># config line from the printf builtin, never a curl argument)</span>
+printf <span class="str">'header = "x-api-key: %s"\n'</span> <span class="str">"$MEMORY_KEY"</span> |
+  curl https://memory.local:9077/api/v1/recall --config - \
   -H <span class="str">"x-agent-id: ai:grok@host:pid-1"</span></pre>
       </div>
 

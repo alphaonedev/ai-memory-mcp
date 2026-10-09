@@ -441,8 +441,11 @@ ai-memory agents bind-api-key --agent-id &lt;agent&gt; --token-file &lt;0600 pat
 <span class="com">#    by token), Cache-Control: no-store, and refused unless the listener</span>
 <span class="com">#    is loopback or in-process TLS. Revoking another principal's key, or</span>
 <span class="com">#    the last enrolled key, needs a second registered approver.</span>
-curl -sS -X POST https://&lt;host&gt;/api/v1/agents/&lt;agent&gt;/api-key \
-  -H "x-api-key: $ADMIN_KEY" -H "x-agent-id: &lt;admin&gt;" -d '{}'
+<span class="com">#    The admin key is piped to curl as a config line (printf is a shell</span>
+<span class="com">#    builtin), so it is never a curl argument and never appears in ps.</span>
+printf 'header = "x-api-key: %s"\n' "$ADMIN_KEY" |
+  curl -sS -X POST https://&lt;host&gt;/api/v1/agents/&lt;agent&gt;/api-key --config - \
+  -H "x-agent-id: &lt;admin&gt;" -d '{}'
 
 <span class="com"># 2. Require the binding. Since v1.0.0 #3418 the enrolled key map is a LIVE</span>
 <span class="com">#    registry, not a boot snapshot: a running `serve` re-reads it from the</span>

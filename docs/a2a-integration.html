@@ -527,9 +527,11 @@ configured wake sink and federation fanout. The same durable row remains
 readable when a local CLI write is discovered by the timed fallback.</p>
 <p>For immediate daemon-driven hints, set <code>API_BASE</code> to your daemon's HTTPS base
 URL and supply your approved API key and TLS files through these placeholders:</p>
-<pre><code class="language-bash">curl --fail-with-body --silent --show-error \
+<pre><code class="language-bash"># The key is piped to curl as a config line (printf is a shell builtin), never an argument.
+printf 'header = &quot;X-API-Key: %s&quot;\n' &quot;$API_KEY&quot; |
+  curl --fail-with-body --silent --show-error --config - \
   --cacert &quot;$CA_CERT&quot; --cert &quot;$CLIENT_CERT&quot; --key &quot;$CLIENT_KEY&quot; \
-  -H &quot;X-API-Key: $API_KEY&quot; -H &quot;X-Agent-Id: $COORDINATOR&quot; \
+  -H &quot;X-Agent-Id: $COORDINATOR&quot; \
   -H 'Content-Type: application/json' \
   &quot;$API_BASE/api/v1/notify&quot; \
   --data '{&quot;target_agent_id&quot;:&quot;ai:worker&quot;,&quot;title&quot;:&quot;Next batch&quot;,&quot;content&quot;:&quot;Please process the queued work.&quot;}'

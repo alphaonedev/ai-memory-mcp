@@ -318,14 +318,15 @@ HTTP:
 # Daemon
 ai-memory serve --port 9077 --db /var/lib/ai-memory/ai-memory.db
 
-# Agent 1
-curl -H "X-Agent-Id: alice@team-finance" \
-     -H "X-API-Key: $(cat /etc/ai-memory/api.key)" \
+# Agent 1 — the key is piped to curl as a config line (printf is a shell
+# builtin), so it is never a curl argument and never appears in `ps`.
+printf 'header = "X-API-Key: %s"\n' "$(cat /etc/ai-memory/api.key)" |
+  curl --config - -H "X-Agent-Id: alice@team-finance" \
      https://127.0.0.1:9077/api/v1/recall?q=quarterly+forecast
 
 # Agent 2 — same shape, a different caller identity
-curl -H "X-Agent-Id: bob@team-finance" \
-     -H "X-API-Key: $(cat /etc/ai-memory/api.key)" \
+printf 'header = "X-API-Key: %s"\n' "$(cat /etc/ai-memory/api.key)" |
+  curl --config - -H "X-Agent-Id: bob@team-finance" \
      https://127.0.0.1:9077/api/v1/recall?q=quarterly+forecast
 ```
 

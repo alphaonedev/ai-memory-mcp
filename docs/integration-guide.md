@@ -344,7 +344,10 @@ curl -X POST https://127.0.0.1:9077/api/v1/memory_check_agent_action \
 **Production hardening:**
 
 - Set an API key via the `api_key` field in `config.toml` (`serve` has
-  no `--api-key` flag). All callers then pass `-H "X-API-Key: <key>"`.
+  no `--api-key` flag). All callers then send the key in the `X-API-Key`
+  request header; with curl, feed it as a config line from the `printf`
+  builtin (`printf 'header = "X-API-Key: %s"\n' "$KEY" | curl --config - …`)
+  rather than as an `-H` argument, so it never appears in `ps`.
 - Add TLS: `--tls-cert /etc/ai-memory/cert.pem --tls-key /etc/ai-memory/key.pem`.
 - Pin who can connect: `--mtls-allowlist /etc/ai-memory/peer-fingerprints.txt`.
 
