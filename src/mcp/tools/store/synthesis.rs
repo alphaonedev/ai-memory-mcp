@@ -424,11 +424,14 @@ pub(super) fn apply_synthesis_updates_and_deletes(
     // the entire merge back instead of leaving a half-synthesised store.
     // Vector-index mutations are in-memory and DEFERRED until after COMMIT so a
     // rollback can never leave the index out of sync with the DB.
-    // #3163 — RAII guard. The early `return Ok(None)` arms below keep their
-    // explicit ROLLBACK so the write lock is released at the exact bail-out
-    // point; the guard is what covers a PANIC unwind out of any of the
-    // update/link/delete calls, and it no-ops once the connection is back in
-    // autocommit, so the two are idempotent with each other.
+    // #3163 — RAII guard. The early `return Ok(None)` arms below end it with
+    // `rollback_resolving` (#4376) so the write lock is released at the exact
+    // bail-out point AND the logged refusal carries the settled outcome of
+    // any deferred escalation; the guard is what covers a PANIC unwind out
+    // of any of the update/link/delete calls. The provenance-row insert arm
+    // is NOT a bail-out: its refusal is logged while the transaction is still
+    // open, so the deferred wording it carries is accurate there, and the
+    // escalation settles (and is logged) at COMMIT.
     let Ok(write_txn) = crate::storage::connection::WriteTxn::begin(conn) else {
         return Ok(None);
     };
@@ -465,11 +468,15 @@ pub(super) fn apply_synthesis_updates_and_deletes(
         let (_found, content_changed) = match upd {
             Ok(v) => v,
             Err(e) => {
+                // #4376 — this merge OWNS its transaction: roll back through
+                // the guard so the deferred escalations settle FIRST and the
+                // logged refusal names the REAL outcome (a pending id that
+                // exists, or NOT queued), never the stale deferred wording.
+                let e = write_txn.rollback_resolving(e);
                 tracing::warn!(
                     target: "synthesis",
-                    "synthesis update failed for {cand_id}: {e}; rolling back merge",
+                    "synthesis update failed for {cand_id}: {e}; merge rolled back",
                 );
-                let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
                 return Ok(None);
             }
         };
@@ -569,11 +576,12 @@ pub(super) fn apply_synthesis_updates_and_deletes(
             continue;
         }
         if let Err(e) = db::delete(conn, del_id) {
+            // #4376 — see the update arm above: settle, then log the real outcome.
+            let e = write_txn.rollback_resolving(e);
             tracing::warn!(
                 target: "synthesis",
-                "synthesis delete failed for {del_id}: {e}; rolling back merge",
+                "synthesis delete failed for {del_id}: {e}; merge rolled back",
             );
-            let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
             return Ok(None);
         }
     }

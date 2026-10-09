@@ -643,7 +643,11 @@ pub fn reflect_with_hooks_for_caller(
     let write_txn = super::connection::WriteTxn::begin(conn)
         .map_err(|e| ReflectError::Database(e.to_string()))?;
 
-    let txn_result = (|| -> std::result::Result<String, ReflectError> {
+    // #4376 — the body keeps the RAW `anyhow` error (a typed `ReflectError`
+    // rides inside it) so the owned transaction below can settle its deferred
+    // escalations and rewrite a governance refusal to the REAL outcome BEFORE
+    // it is stringified into `ReflectError::Database`.
+    let txn_result = (|| -> anyhow::Result<String> {
         // v0.7.0 fix campaign R1-M3 (#690) — substrate-side reflections
         // must NOT silently merge into an existing (title, namespace).
         // If a row with the same title is already present in the
@@ -653,12 +657,12 @@ pub fn reflect_with_hooks_for_caller(
         let actual_id = insert_with_conflict(conn, &new_mem, ConflictMode::Error).map_err(|e| {
             if e.downcast_ref::<crate::storage::ConflictError>().is_some() {
                 tracing::warn!(target: REFLECT_TRACE_TARGET, error = %e, "reflection title conflict");
-                ReflectError::Validation(
+                anyhow::Error::new(ReflectError::Validation(
                     "reflection title collides with an existing memory in the same namespace"
                         .into(),
-                )
+                ))
             } else {
-                ReflectError::Database(e.to_string())
+                e
             }
         })?;
         // Self-link rejection lives in `validate_link`; a self-link
@@ -672,7 +676,7 @@ pub fn reflect_with_hooks_for_caller(
                 src_id,
                 crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
             )
-            .map_err(|e| ReflectError::Validation(e.to_string()))?;
+            .map_err(|e| anyhow::Error::new(ReflectError::Validation(e.to_string())))?;
             // Issue #815 — the pre-#815 path called `create_link` here,
             // which always produced `attest_level='unsigned'` rows for
             // every reflects_on edge regardless of whether the caller
@@ -694,8 +698,7 @@ pub fn reflect_with_hooks_for_caller(
                 src_id,
                 crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
                 hooks.active_keypair,
-            )
-            .map_err(|e| ReflectError::Database(e.to_string()))?;
+            )?;
         }
         Ok(actual_id)
     })();
@@ -725,8 +728,17 @@ pub fn reflect_with_hooks_for_caller(
             Ok(outcome)
         }
         Err(e) => {
-            write_txn.rollback();
-            Err(e)
+            // #4376 — this funnel OWNS its transaction: settle the deferred
+            // escalations first and hand the caller the REAL outcome (the
+            // queued text naming a pending id that exists, or NOT queued),
+            // never the caller-owned deferred wording. A typed `ReflectError`
+            // raised in the body surfaces unchanged; everything else keeps the
+            // historical `Database(e.to_string())` shape.
+            let e = write_txn.rollback_resolving(e);
+            Err(match e.downcast::<ReflectError>() {
+                Ok(typed) => typed,
+                Err(e) => ReflectError::Database(e.to_string()),
+            })
         }
     }
 }

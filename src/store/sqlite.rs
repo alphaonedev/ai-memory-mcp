@@ -657,12 +657,13 @@ impl MemoryStore for SqliteStore {
                 }
                 Ok(ids)
             }
-            Err(e) => {
-                if let Some(txn) = write_txn {
-                    txn.rollback();
-                }
-                Err(box_err(e))
-            }
+            // #4376 — an OWNED transaction settles its deferred escalations
+            // first and reports the REAL outcome (vote 4116 item 2): the
+            // queued text naming a pending id that exists, or NOT queued.
+            Err(e) => Err(box_err(match write_txn {
+                Some(txn) => txn.rollback_resolving(e),
+                None => e,
+            })),
         }
     }
 
@@ -726,16 +727,19 @@ impl MemoryStore for SqliteStore {
         } else {
             None
         };
-        let written = (|| -> StoreResult<String> {
+        // The body keeps the raw `anyhow` error: #4376 — the owned
+        // transaction below must settle its deferred escalations and rewrite
+        // the refusal BEFORE the error is classified into the SAL envelope.
+        let written = (|| -> anyhow::Result<String> {
             let id = if ctx.bypass_visibility {
                 let mut stamped = memory.clone();
                 crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
-                db::insert_no_overwrite(&conn, &stamped).map_err(map_err)?
+                db::insert_no_overwrite(&conn, &stamped)?
             } else {
-                db::insert_no_overwrite(&conn, memory).map_err(map_err)?
+                db::insert_no_overwrite(&conn, memory)?
             };
             if let (Some(vec), Some(stamp)) = (embedding_vec, space_stamp) {
-                db::set_embedding(&conn, &id, vec, stamp).map_err(map_err)?;
+                db::set_embedding(&conn, &id, vec, stamp)?;
             }
             Ok(id)
         })();
@@ -746,12 +750,12 @@ impl MemoryStore for SqliteStore {
                 }
                 Ok(id)
             }
-            Err(e) => {
-                if let Some(txn) = write_txn {
-                    txn.rollback();
-                }
-                Err(e)
-            }
+            // #4376 — an OWNED transaction reports the REAL outcome of its
+            // deferred escalations (vote 4116 item 2), never the deferred text.
+            Err(e) => Err(map_err(match write_txn {
+                Some(txn) => txn.rollback_resolving(e),
+                None => e,
+            })),
         }
     }
 
@@ -965,16 +969,24 @@ impl MemoryStore for SqliteStore {
                 db::set_lifecycle_state(&conn, id, target)?;
             }
             Ok(found)
-        })
-        .map_err(|e| {
-            e.downcast_ref::<crate::storage::InvalidTransition>()
-                .map_or_else(
+        });
+        // #4376 — the inner `in_write_txn` JOINS this method's own #3957
+        // transaction, so the refusal it propagates still carries the
+        // caller-owned DEFERRED wording. This method OWNS that transaction:
+        // end it with `rollback_resolving` so the caller is told the REAL
+        // outcome (vote 4116 item 2) before the error is classified.
+        let found = match found {
+            Ok(found) => found,
+            Err(e) => {
+                let e = txn.rollback_resolving(e);
+                return Err(e.downcast_ref::<crate::storage::InvalidTransition>().map_or_else(
                     || box_err(&e),
                     |it| StoreError::InvalidTransition {
                         detail: it.to_string(),
                     },
-                )
-        })?;
+                ));
+            }
+        };
         if !found {
             return Err(StoreError::NotFound { id: id.to_string() });
         }
