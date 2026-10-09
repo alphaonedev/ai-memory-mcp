@@ -1348,6 +1348,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # real git) must be refused by name, never leave the gate blamed. Under a
     # checkout path holding the separator the cells above already fail by name.
     if os.pathsep not in str(tmp):
+        shims_before = sorted(p.name for p in tmp.glob("gitshim.*"))
         with unittest.mock.patch.object(Path, "chmod", lambda self, mode, *a, **k: None):
             try:
                 run_gate_shimmed(tmp, repo, env7, version="git version 2.29.9")
@@ -1357,6 +1358,17 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             else:
                 t.fail("(shim-unreach): a non-executable git shim (PATH lookup falls through "
                        "to the real git) was not refused")
+        if sorted(p.name for p in tmp.glob("gitshim.*")) != shims_before:
+            t.fail("(shim-unreach-clean): a refused git shim left its scratch directory behind")
+    # #6379: a probe that cannot even start (no git on the probed PATH) is a
+    # refusal by name, not a silent pass.
+    try:
+        _require_shim_reachable(str(tmp / "no-such-dir"))
+    except GateError as exc:
+        if "probe failed" not in str(exc):
+            t.fail(f"(shim-probe-oserror): refused for the wrong reason: {exc}")
+    else:
+        t.fail("(shim-probe-oserror): a probe that could not start was treated as reachable")
     # #6381: the shim PATH entry is process-global; every shim cell above, on its
     # success path (shim-control), its gate-verdict paths (gitver, anc-error) and
     # its refusal paths (shim-pathsep, shim-unreach), must leave PATH as found.
@@ -1527,7 +1539,9 @@ SELF_TEST_OK = (
     "error fail-closed; (shim-pathsep, #6178) a shim scratch path containing the PATH "
     "separator refused with its remedy and reported as exactly one named failure by "
     "shimmed_cell (#6380), so the shim cells never run against the real git; "
-    "(shim-unreach, #6379) a non-executable git shim refused; (shim-path-restore, #6381) "
+    "(shim-unreach, #6379) a non-executable git shim refused and its scratch directory removed "
+    "((shim-unreach-clean)); (shim-probe-oserror) a probe that cannot start refused; "
+    "(shim-path-restore, #6381) "
     "PATH restored after every shim cell; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
