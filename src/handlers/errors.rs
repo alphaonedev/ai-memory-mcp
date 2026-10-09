@@ -295,6 +295,32 @@ pub(crate) fn record_stopped_response(
         .into_response()
 }
 
+/// #4091 — ONE spelling for the consolidate refusal when no summary could be
+/// produced: `503` + the `SUMMARY_UNAVAILABLE` code + a fixed caller message
+/// + a closed-set `reason` token. Rendered BEFORE any storage call, so the
+/// sources are never touched. `detail` goes to a `tracing` line for the
+/// operator, never on the wire (an LLM transport error is foreign text).
+pub(crate) fn summary_unavailable_response(
+    reason: &'static str,
+    detail: &str,
+) -> axum::response::Response {
+    tracing::warn!(
+        code = crate::errors::error_codes::SUMMARY_UNAVAILABLE,
+        reason,
+        detail,
+        "consolidate refused: no summary could be produced (#4091)"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "code": crate::errors::error_codes::SUMMARY_UNAVAILABLE,
+            "error": crate::errors::msg::SUMMARY_UNAVAILABLE,
+            "reason": reason,
+        })),
+    )
+        .into_response()
+}
+
 pub(crate) fn handler_error_500(e: &dyn std::fmt::Display) -> axum::response::Response {
     tracing::error!("handler error: {e}");
     (

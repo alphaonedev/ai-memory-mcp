@@ -46,7 +46,7 @@ pub(crate) const META_CONSOLIDATOR_TENANT: &str = "consolidator_tenant";
 
 /// `metadata.summary_source` — `"caller"` when the consolidation's `content` is
 /// the VERBATIM tenant-supplied summary (genuinely tenant-authored bytes) or
-/// `"substrate"` when the daemon derived it (LLM / deterministic concat). Keeps
+/// `"substrate"` when the daemon derived it (LLM; #4091 — never a placeholder). Keeps
 /// the row's authorship record truthful even though `agent_id` names the
 /// substrate that assembled + signs the row (#2860 truthfulness lens).
 pub(crate) const META_SUMMARY_SOURCE: &str = "summary_source";
@@ -58,7 +58,7 @@ pub(crate) const SUMMARY_SOURCE_SUBSTRATE: &str = "substrate";
 /// Classify the consolidation's content authorship from the request's raw
 /// `summary` field: a non-empty caller-supplied summary is genuinely
 /// tenant-authored CONTENT ([`SUMMARY_SOURCE_CALLER`]); an absent / empty one
-/// means the daemon derived it (LLM or deterministic concat,
+/// means the daemon derived it (LLM — #4091 refuses when it cannot,
 /// [`SUMMARY_SOURCE_SUBSTRATE`]). Keeps the row's authorship record truthful
 /// even though `agent_id` names the substrate that assembled + signs the row.
 #[must_use]

@@ -197,6 +197,14 @@ pub mod error_codes {
     /// v1.0.0 #3288 — an export `limit` outside `1..=max_page_size`. Refused
     /// rather than clamped so the caller learns the real ceiling.
     pub const EXPORT_LIMIT_OUT_OF_RANGE: &str = "EXPORT_LIMIT_OUT_OF_RANGE";
+
+    /// v1.0.0 #4091 — `POST /api/v1/consolidate` without a caller-supplied
+    /// `summary` could not obtain one from the model (no LLM wired, the call
+    /// exceeded `llm_call_timeout`, the LLM errored, or it answered an empty
+    /// / refused body). The consolidation is REFUSED with no write, so the
+    /// sources are never replaced by a content-free placeholder (the
+    /// pre-#4091 'deterministic fallback'). Retryable (503).
+    pub const SUMMARY_UNAVAILABLE: &str = "SUMMARY_UNAVAILABLE";
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +228,17 @@ pub mod error_codes {
 pub mod msg {
     // ---- sanitized 500 body (issue #851 canonical envelope) -----------------
     pub const INTERNAL_SERVER_ERROR: &str = "internal server error";
+
+    // ---- consolidate (#4091) --------------------------------------------------
+    /// The fixed caller message of the 503 `SUMMARY_UNAVAILABLE` refusal.
+    pub const SUMMARY_UNAVAILABLE: &str =
+        "consolidation refused: no summary could be produced, so the sources were left untouched \
+         (supply `summary`, or retry when the LLM is reachable)";
+    /// `reason` tokens the refusal carries (closed set).
+    pub const SUMMARY_REASON_NO_LLM: &str = "no_llm_configured";
+    pub const SUMMARY_REASON_TIMEOUT: &str = "llm_timeout";
+    pub const SUMMARY_REASON_EMPTY: &str = "llm_empty_or_refused";
+    pub const SUMMARY_REASON_ERROR: &str = "llm_error";
 
     // ---- not-found family ----------------------------------------------------
     pub const MEMORY_NOT_FOUND: &str = "memory not found";

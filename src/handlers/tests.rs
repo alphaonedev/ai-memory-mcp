@@ -76,7 +76,7 @@ fn install_security_bypass_for_legacy_tests() {
     });
 }
 
-fn test_state() -> Db {
+pub(super) fn test_state() -> Db {
     install_security_bypass_for_legacy_tests();
     // #3498 battery: isolated handler slices must install the network gate
     // before fanout, just as the federation test fixtures do (#3515).
@@ -385,7 +385,7 @@ async fn create_and_update_with_metadata() {
 use axum::{Router, body::Body, routing::get as axum_get, routing::post as axum_post};
 use tower::ServiceExt as _;
 
-fn test_app_state(db: Db) -> AppState {
+pub(super) fn test_app_state(db: Db) -> AppState {
     // #1751 — pin the lib-test binary to the explicit permissive
     // attestation opt-out so the unsigned HTTP create fixtures below
     // keep exercising their actual subject matter (required-default
@@ -15857,25 +15857,28 @@ async fn http_consolidate_accepts_use_llm_without_summary_l7() {
         )
         .await
         .unwrap();
-    // The regression manifests as 422; the fix produces 201.
+    // The L7 regression manifests as 422 (a wire-shape rejection of the
+    // absent `summary`); the request shape is accepted.
     assert_ne!(
         resp.status(),
         StatusCode::UNPROCESSABLE_ENTITY,
         "L7 regression: consolidate 422'd on absent summary"
     );
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    // #4091 — with NO LLM wired the daemon can produce no summary, so the
+    // consolidation is REFUSED (503 SUMMARY_UNAVAILABLE) and the sources
+    // are left untouched — never consolidated under a placeholder.
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    // S51 reads `summary_len >= 20`; assert the body carries a
-    // summary string (the LLM-absent fallback is well above 20
-    // chars for any 2-id input).
-    let summary = v["summary"].as_str().expect("summary in response");
-    assert!(
-        summary.len() >= 20,
-        "L7 fallback summary too short: {summary:?}"
-    );
+    assert_eq!(v["code"], crate::errors::error_codes::SUMMARY_UNAVAILABLE);
+    assert_eq!(v["reason"], crate::errors::msg::SUMMARY_REASON_NO_LLM);
+    let lock = state.lock().await;
+    for id in [&id_a, &id_b] {
+        let row = db::get(&lock.0, id).unwrap().expect("source still live");
+        assert_eq!(row.lifecycle_state, crate::models::LifecycleState::Open);
+    }
 }
 
 // ------------------------------------------------------------------
@@ -15965,16 +15968,15 @@ async fn http_consolidate_response_carries_summary_on_every_key_s51_reads() {
         .route("/api/v1/consolidate", axum_post(consolidate_memories))
         .with_state(test_app_state(state.clone()));
 
-    // S51's exact request shape — `use_llm: true` and no `summary`
-    // field. test_state() does not wire an LLM, so the resolver
-    // falls through to the deterministic concat-of-titles
-    // fallback, exactly as the postgres branch will on a daemon
-    // whose Ollama endpoint is down.
+    // The response-shape contract under test is the same whichever way
+    // the summary was obtained. test_state() wires no LLM — and #4091
+    // made the LLM-absent path a 503 refusal instead of a placeholder —
+    // so the caller supplies the summary explicitly here.
     let body = serde_json::json!({
         "ids": [id_a, id_b],
         "title": "AOM-101 lifecycle",
         "namespace": "l7-followup",
-        "use_llm": true,
+        "summary": "AOM-101 hardened the sync_push retry path with exponential backoff and jitter.",
     });
     let resp = app
         .oneshot(
