@@ -341,6 +341,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # #4768 — the declaration this step reads and the asserter the next
+          # step runs must be the checked-out commit's: an earlier step, an
+          # action or a restored cache that rewrote either would narrow the
+          # feature set consistently for the build AND the assert, so the
+          # strict assert would pass on a binary missing the advertised tier.
+          # `git diff --quiet` exits 1 on any change or deletion (fatal under
+          # -e). The static guard cannot see runtime rewrites; this can.
+          git diff --quiet HEAD -- scripts/release-features.sh scripts/assert-compiled-features.sh
           # Own statement: a failing declaration aborts here under -e (a
           # substitution inside the cargo arguments would be swallowed and the
           # build would silently use default features).
@@ -353,6 +361,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # #4768 — same bind as the build step, re-checked here because a step
+          # ran in between: the asserter and the declaration are HEAD's.
+          git diff --quiet HEAD -- scripts/release-features.sh scripts/assert-compiled-features.sh
           bin="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
           REQUIRE_FLAGS="$(bash scripts/release-features.sh --require-flags)"
           test -n "$REQUIRE_FLAGS"
