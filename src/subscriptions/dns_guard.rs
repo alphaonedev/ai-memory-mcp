@@ -24,6 +24,36 @@
 
 use std::fmt;
 
+/// The port an `https://` URL without an explicit port connects to.
+const HTTPS_DEFAULT_PORT: u16 = 443;
+/// The port an `http://` (or scheme-less) URL without an explicit port
+/// connects to.
+const HTTP_DEFAULT_PORT: u16 = 80;
+
+/// #4075 — append the SCHEME's default port to a bracket/colon-normalized
+/// `host_port` that omits one, so `ToSocketAddrs` resolves it on the port
+/// the connector will actually open. Single home of the default-port rule,
+/// shared by the webhook SSRF lane (`validate_url_dns_with`) and the egress
+/// inference lane (`egress::resolve_inference_authority`) via the #3744
+/// one-helper rule.
+///
+/// Before #4075 this appended `:80` for every scheme. reqwest's per-host
+/// override (`Client::builder().resolve(host, addr)`) is installed with that
+/// port, and the locked connector (reqwest 0.12.28 / hyper-util 0.1.20)
+/// replaces an override's port only when the URI port is explicit or the
+/// override port is 0 — so an implicit-port `https://` target had its TLS
+/// connection opened to TCP 80 and every delivery to a normal :443 receiver
+/// failed into the DLQ.
+#[must_use]
+pub(crate) fn host_port_with_default_port(host_port: &str, scheme: &str) -> String {
+    let port = if scheme.eq_ignore_ascii_case("https") {
+        HTTPS_DEFAULT_PORT
+    } else {
+        HTTP_DEFAULT_PORT
+    };
+    format!("{host_port}:{port}")
+}
+
 /// Why the DNS-resolved SSRF guard refused a webhook target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DnsGuardRefusal {
