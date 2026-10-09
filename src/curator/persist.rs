@@ -48,30 +48,79 @@ fn metadata_object_mut<'a>(
     })
 }
 
+/// #4287 — bound on the re-read / re-apply cycle when a concurrent writer
+/// keeps moving the row's version. Same shape as the auto-tag worker's
+/// version-conflict retry (`background/auto_tag_worker.rs`); past the bound
+/// the write is refused and reported, never forced over the newer row.
+const MAX_PERSIST_ATTEMPTS: usize = 3;
+
+/// #4287 — version-checked metadata write-back for the curator sweep.
+///
+/// The sweep holds a snapshot of each memory taken before its LLM call. The
+/// pre-fix helpers cloned that snapshot's whole `metadata`, added one key and
+/// wrote it back through the version-less `db::update`, so a metadata edit
+/// committed while the model ran (another agent, the HTTP/MCP API, the CLI)
+/// was silently replaced. Now the write is pinned to the version the
+/// metadata was read at (`update_with_expected_version`); on a
+/// `VersionConflict` the row is re-read and ONLY the curator's own key is
+/// re-applied to the fresh metadata, up to [`MAX_PERSIST_ATTEMPTS`] times.
+fn persist_metadata_key(
+    conn: &Connection,
+    mem: &Memory,
+    what: &str,
+    apply: impl Fn(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<()> {
+    let mut metadata = mem.metadata.clone();
+    let mut version = mem.version;
+    for _ in 0..MAX_PERSIST_ATTEMPTS {
+        let mut updated = metadata.clone();
+        apply(metadata_object_mut(&mut updated, &mem.id, what)?);
+        match db::update_with_expected_version(
+            conn,
+            &mem.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&updated),
+            None,
+            Some(version),
+            None,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.downcast_ref::<db::VersionConflict>().is_some() => {
+                let fresh = db::get(conn, &mem.id)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "refusing to write {what} for memory {}: the row vanished while the \
+                         curator was writing it",
+                        mem.id
+                    )
+                })?;
+                metadata = fresh.metadata;
+                version = fresh.version;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    anyhow::bail!(
+        "refusing to write {what} for memory {}: its metadata changed under the curator \
+         {MAX_PERSIST_ATTEMPTS} times in a row; skipped this cycle so the newer edit is kept",
+        mem.id
+    )
+}
+
 pub(super) fn persist_auto_tags(conn: &Connection, mem: &Memory, tags: &[String]) -> Result<()> {
-    let mut updated = mem.metadata.clone();
-    {
-        let obj = metadata_object_mut(&mut updated, &mem.id, "auto_tags")?;
+    persist_metadata_key(conn, mem, "auto_tags", |obj| {
         obj.insert("auto_tags".to_string(), serde_json::json!(tags));
         obj.insert(
             "curated_at".to_string(),
             serde_json::json!(chrono::Utc::now().to_rfc3339()),
         );
-    }
-    db::update(
-        conn,
-        &mem.id,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(&updated),
-    )?;
-    Ok(())
+    })
 }
 
 pub(super) fn persist_contradiction(
@@ -79,19 +128,17 @@ pub(super) fn persist_contradiction(
     mem: &Memory,
     against_id: &str,
 ) -> Result<()> {
-    let mut updated = mem.metadata.clone();
-    {
-        let obj =
-            metadata_object_mut(&mut updated, &mem.id, field_names::CONFIRMED_CONTRADICTIONS)?;
-        let existing = obj
+    persist_metadata_key(conn, mem, field_names::CONFIRMED_CONTRADICTIONS, |obj| {
+        let mut ids: Vec<String> = obj
             .get(field_names::CONFIRMED_CONTRADICTIONS)
             .and_then(|v| v.as_array())
-            .cloned()
+            .map(|existing| {
+                existing
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
-        let mut ids: Vec<String> = existing
-            .into_iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
         if !ids.iter().any(|id| id == against_id) {
             ids.push(against_id.to_string());
         }
@@ -99,19 +146,5 @@ pub(super) fn persist_contradiction(
             field_names::CONFIRMED_CONTRADICTIONS.to_string(),
             serde_json::json!(ids),
         );
-    }
-    db::update(
-        conn,
-        &mem.id,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(&updated),
-    )?;
-    Ok(())
+    })
 }
