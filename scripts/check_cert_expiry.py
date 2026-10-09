@@ -1009,6 +1009,92 @@ def deep_scratch_violation(tmp):
     return None
 
 
+FALLBACK_PLATFORMS = (("darwin", 1024), ("freebsd14", 1024), ("openbsd7", 1024),
+                      ("netbsd10", 1024), ("linux", 4096))
+
+
+def path_max_fallback_violation(tmp):
+    """None when path_max falls back to the platform's PATH_MAX (1024 on darwin and the
+    BSDs, 4096 elsewhere) when os.pathconf raises or answers nonsense, else a
+    description (#6145 R5-F1). os.pathconf and sys.platform are patched in place and
+    restored."""
+    real_pathconf, real_platform = os.pathconf, sys.platform
+
+    def raising(_path, _name):
+        raise OSError(errno.EINVAL, "PC_PATH_MAX unavailable")
+    try:
+        for plat, want in FALLBACK_PLATFORMS:
+            for label, patch in (("raises", raising), ("answers 0", lambda _p, _n: 0),
+                                 ("answers None", lambda _p, _n: None)):
+                os.pathconf, sys.platform = patch, plat
+                got = path_max(tmp)
+                if got != want:
+                    return (f"path_max fell back to {got} on {plat} when os.pathconf {label}, "
+                            f"not the platform limit {want}")
+    finally:
+        os.pathconf, sys.platform = real_pathconf, real_platform
+    return None
+
+
+def guarded_violation():
+    """None when guarded() turns an Exception into '<cell> raised <Type>: <msg>',
+    returns None for a passing cell and lets KeyboardInterrupt propagate, else a
+    description (#6145 R5-F2)."""
+    def boom():
+        raise RuntimeError("x")
+
+    def fine():
+        return None
+
+    def interrupted():
+        raise KeyboardInterrupt
+    try:
+        got = guarded(boom)
+    except Exception as exc:  # noqa: BLE001 - an unguarded crash is the defect under test
+        return f"guarded let a RuntimeError escape: {exc}"
+    if got != "boom raised RuntimeError: x":
+        return f"guarded gave {got!r} for a raising cell, not 'boom raised RuntimeError: x'"
+    if guarded(fine) is not None:
+        return "guarded changed the result of a passing cell"
+    try:
+        guarded(interrupted)
+    except KeyboardInterrupt:
+        return None
+    return "guarded swallowed a KeyboardInterrupt"
+
+
+def scratch_limit_message_violation(tmp):
+    """None when the 'scratch path is too deep' violation names the actual scratch path
+    length and the limit, else a description (#6145 R5-F3). The limit is derived here
+    independently of the code under test: 255 - '#!' - ' -I' - '/gitshim-long.XXXXXXXX'
+    - the pad's 1 byte and the 1-byte file name."""
+    limit = 255 - len("#!") - len(" -I") - (1 + MKDTEMP_NAME_LEN) - 2
+    base, deepest = deep_scratch(tmp, limit + 40)
+    try:
+        msg = shim_interpreter_violation(deepest)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    if msg is None or not msg.startswith("the scratch path is too deep"):
+        return f"a {limit + 40}-byte scratch gave {msg!r}, not a 'too deep' violation"
+    for need in (f"{limit + 40} bytes", f"{limit} bytes"):
+        if need not in msg:
+            return f"the 'too deep' message {msg!r} does not state {need!r}"
+    return None
+
+
+def deep_scratch_relative_violation(tmp):
+    """None when deep_scratch_violation stays valid on a deep scratch dir (its targets
+    are relative to the scratch path length and capped below PATH_MAX), else a
+    description (#6145 R5-F3)."""
+    limit = path_max(tmp)
+    base, deepest = deep_scratch(tmp, max(limit - 700, len(os.fsencode(str(tmp))) + 100))
+    try:
+        res = deep_scratch_violation(deepest)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    return res
+
+
 def shim_isolation_violation(tmp, interpreter=None):
     """None when the git shim is isolated, else a description (#6145). Plants an
     empty `gitshim_canary_6145.py` beside the shim and runs the shim's own probe,
@@ -1116,6 +1202,18 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         t.fail(f"(shim-deep-scratch, #6145): {deepx}")
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
         return 2
+    for tag, cell, cell_args in (("path-max-fallback", path_max_fallback_violation, (tmp,)),
+                                 ("guarded", guarded_violation, ()),
+                                 ("shim-scratch-limit", scratch_limit_message_violation, (tmp,)),
+                                 ("shim-deep-relative", deep_scratch_relative_violation, (tmp,))):
+        try:
+            res = guarded(cell, *cell_args)
+        except Exception as exc:  # noqa: BLE001 - guarded itself must never leak a crash
+            res = f"{cell.__name__} escaped guarded: {type(exc).__name__}: {exc}"
+        if res is not None:
+            t.fail(f"({tag}, #6145): {res}")
+            print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+            return 2
     unexec = guarded(shim_isolation_violation, tmp, interpreter=tmp / "no-such-python-6145")
     if unexec is None or not unexec.startswith("the shim could not be executed"):
         t.fail(f"(shim-unexecutable, #6145): an unexecutable shim gave {unexec!r}, "
