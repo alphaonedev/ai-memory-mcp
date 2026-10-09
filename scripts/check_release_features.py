@@ -826,12 +826,23 @@ SBOM_JOB_KEYS = ("name", "needs", "runs-on", "permissions", "steps")
 RELEASE_RUNS_ON = "${{ matrix.os }}"
 # The release matrix. Every value is substituted textually into the pinned
 # build / assert units before bash runs, so each one is a strict literal.
-RELEASE_TARGETS = (
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
+# #6279: each target is pinned to its runner (a target moved to another
+# runner, or to a self-hosted one, is refused: release jobs hold contents,
+# id-token and attestations write). #6287: no x86_64-apple-darwin leg
+# (5-agent vote 4d3ea1c5, D1 3-2).
+RELEASE_MATRIX = (
+    ("x86_64-unknown-linux-gnu", "ubuntu-latest"),
+    ("aarch64-unknown-linux-gnu", "ubuntu-24.04-arm"),
+    ("aarch64-apple-darwin", "macos-latest"),
 )
+RELEASE_TARGETS = tuple(target for target, _ in RELEASE_MATRIX)
+# #6287: the Homebrew formula's macOS block: Apple Silicon only.
+BREW_MACOS = """            on_macos do
+              depends_on arch: :arm64
+              url "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v#{version}/ai-memory-aarch64-apple-darwin.tar.gz"
+              sha256 "SHA_AARCH64_APPLE_DARWIN"
+            end
+"""
 MATRIX_REQUIRED = ("target", "os", "artifact")
 MATRIX_VALUE_RE = {
     "target": re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+){2,3}"),
@@ -1373,7 +1384,7 @@ def check_matrix(job: Node, rep: Report) -> None:
                 "`include:` entries (no other axis, no `exclude:`, no expression; the shape is fixed in check_matrix in "
                 f"{GUARD_PATH})")
         return
-    targets: List[str] = []
+    pairs: List[Tuple[str, str]] = []
     for n, entry in enumerate(include.value if isinstance(include.value, list) else []):
         keys = set(entry.keys())
         if entry.kind != "map" or not set(MATRIX_REQUIRED) <= keys <= set(MATRIX_VALUE_RE):
@@ -1386,11 +1397,33 @@ def check_matrix(job: Node, rep: Report) -> None:
                 rep.bad(f"release.yml release matrix entry {n + 1}: `{key}:` must be an unquoted literal matching "
                         f"`{rx.pattern}` (it is substituted into the pinned build and assert text before bash runs: "
                         "no expression, quote, space or shell metacharacter)" + pin_hint("MATRIX_VALUE_RE"))
-        tv = entry.get("target")
-        targets.append(tv.text() if tv is not None else "")
-    if sorted(targets) != sorted(RELEASE_TARGETS):
-        rep.bad(f"release.yml release matrix targets {sorted(targets)} differ from the pinned set "
-                f"{sorted(RELEASE_TARGETS)}" + pin_hint("RELEASE_TARGETS"))
+        tv, ov = entry.get("target"), entry.get("os")
+        pairs.append((tv.text() if tv is not None else "", ov.text() if ov is not None else ""))
+    if sorted(pairs) != sorted(RELEASE_MATRIX):
+        rep.bad(f"release.yml release matrix (target, os) pairs {sorted(pairs)} differ from the pinned set "
+                f"{sorted(RELEASE_MATRIX)} (each target builds and runs its strict assert on its own GitHub-hosted "
+                "runner; a self-hosted or moved leg is refused, #6279)" + pin_hint("RELEASE_MATRIX"))
+
+
+def check_homebrew(text: str, rep: Report) -> None:
+    """#6287: the Homebrew job ships exactly the matrix targets: its SHA loop
+    names RELEASE_TARGETS in order, its tarballs and SHA placeholders are those
+    targets, and its macOS block is Apple Silicon only (BREW_MACOS)."""
+    m = re.search(r"^  homebrew:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", text, re.M | re.S)
+    job = m.group(1) if m else ""
+    loops = re.findall(r"^ *for TARGET in ([^;\n]*); do$", job, re.M)
+    if [loop.split() for loop in loops] != [list(RELEASE_TARGETS)]:
+        rep.bad(f"release.yml homebrew job: the asset SHA loop must be exactly one `for TARGET in "
+                f"{' '.join(RELEASE_TARGETS)}; do` (found {loops})" + pin_hint("RELEASE_TARGETS"))
+    want = sorted(RELEASE_TARGETS)
+    tarballs = sorted(set(re.findall(r"ai-memory-([A-Za-z0-9_.-]+?)\.tar\.gz", job)))
+    placeholders = sorted(set(re.findall(r"\bSHA_([A-Z0-9_]+)\b", job)))
+    if tarballs != want or placeholders != sorted(t.upper().replace("-", "_") for t in want):
+        rep.bad(f"release.yml homebrew job: formula tarballs {tarballs} / SHA placeholders {placeholders} must be "
+                f"exactly the release targets {want} (#6287)" + pin_hint("RELEASE_TARGETS"))
+    if job.count(BREW_MACOS) != 1:
+        rep.bad("release.yml homebrew job: the formula's `on_macos` block must be exactly BREW_MACOS (Apple Silicon "
+                "only, `depends_on arch: :arm64`; no Intel branch, #6287)" + pin_hint("BREW_MACOS"))
 
 
 def check_release_job(job: Node, rep: Report) -> None:
@@ -1737,6 +1770,7 @@ def check_release_yml(text: str, rep: Report) -> None:
         check_sbom_job(sbom, rep)
     check_docker_job(jobs, rep)
     check_repro_job(jobs, rep)
+    check_homebrew(text, rep)
 
 
 def docker_nearest(builder: List[str], run: str = DOCKER_RUN) -> str:
@@ -3126,6 +3160,11 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         "depends_on arch: :arm64"))]),
     "6287 formula carries an Intel macOS tarball": ("fail", [_rel("            on_macos do\n", "            on_macos do\n"
         '              url "https://example.invalid/ai-memory-x86_64-apple-darwin.tar.gz"\n')]),
+    "6287 formula linux url points at an Intel macOS tarball": ("fail", [_rel(
+        "ai-memory-x86_64-unknown-linux-gnu.tar.gz\"", "ai-memory-x86_64-apple-darwin.tar.gz\"")]),
+    "6287 formula substitutes an Intel macOS SHA placeholder": ("fail", [_rel(
+        '          sed -i "s/SHA_AARCH64_APPLE_DARWIN/', '          sed -i "s/SHA_X86_64_APPLE_DARWIN/x/" f.rb\n'
+        '          sed -i "s/SHA_AARCH64_APPLE_DARWIN/')]),
     # --- #6292: the release-shape `paths:` filter covers every build input
     "6292 path dependency outside the release-shape paths filter": ("fail", [(CARGO, PASTE_DEP,
         PASTE_DEP.replace("vendor/paste", "third_party/paste"), False)]),

@@ -293,16 +293,15 @@ jobs:
             os: ubuntu-latest
             artifact: ai-memory
             nfpm_arch: amd64
+          # #6287 / #4770: no x86_64-apple-darwin leg (5-agent vote 4d3ea1c5,
+          # D1 3-2): GitHub's last Intel macOS image retires Aug 2027 and a
+          # cross build on arm64 could only assert under Rosetta 2, which is not
+          # guaranteed. Intel Macs build from source. The guard pins these three
+          # (target, os) pairs (RELEASE_MATRIX) and refuses a self-hosted leg.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             artifact: ai-memory
             nfpm_arch: arm64
-          - target: x86_64-apple-darwin
-            # macos-15-intel is GitHub's last x86_64 macOS image; it retires
-            # in Aug 2027. Replace this leg before then.
-            # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
-            os: macos-15-intel
-            artifact: ai-memory
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: ai-memory
@@ -386,9 +385,9 @@ jobs:
           test -n "$REQUIRE_FLAGS"
           # #2728 / #4719 — EVERY release target runs the strict exact-set
           # `ai-memory features` self-report, on a runner that executes the
-          # artifact natively (x86_64-apple-darwin builds on the Intel
-          # `macos-15-intel` runner, not cross-built on arm64 where Rosetta 2
-          # is not guaranteed). There is no skip branch: a binary that cannot
+          # artifact natively (each of the three targets builds on a runner of
+          # its own architecture; nothing is cross-built and run under an
+          # emulator, #6287). There is no skip branch: a binary that cannot
           # run on its runner fails this step (fail closed), and
           # scripts/check_release_features.py refuses a conditional assert.
           # shellcheck disable=SC2086 # word-splitting the --require flags is intended
@@ -1166,7 +1165,7 @@ jobs:
           VERSION=${{ steps.version.outputs.version }}
           BASE="https://github.com/alphaonedev/ai-memory-mcp/releases/download/v${VERSION}"
 
-          for TARGET in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+          for TARGET in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
             ASSET="ai-memory-${TARGET}.tar.gz"
             # -f so an HTTP error page can never be mistaken for the tarball.
             curl -fsSL -o "$ASSET" "${BASE}/${ASSET}"
@@ -1212,13 +1211,9 @@ jobs:
             license "Apache-2.0"
 
             on_macos do
-              if Hardware::CPU.arm?
-                url "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v#{version}/ai-memory-aarch64-apple-darwin.tar.gz"
-                sha256 "SHA_AARCH64_APPLE_DARWIN"
-              else
-                url "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v#{version}/ai-memory-x86_64-apple-darwin.tar.gz"
-                sha256 "SHA_X86_64_APPLE_DARWIN"
-              end
+              depends_on arch: :arm64
+              url "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v#{version}/ai-memory-aarch64-apple-darwin.tar.gz"
+              sha256 "SHA_AARCH64_APPLE_DARWIN"
             end
 
             on_linux do
@@ -1262,7 +1257,6 @@ jobs:
           sed -i "s/VERSION_PLACEHOLDER/${VERSION}/" homebrew-tap/Formula/ai-memory.rb
           sed -i "s/SHA_X86_64_UNKNOWN_LINUX_GNU/${{ steps.sha.outputs.sha_x86_64_unknown_linux_gnu }}/" homebrew-tap/Formula/ai-memory.rb
           sed -i "s/SHA_AARCH64_UNKNOWN_LINUX_GNU/${{ steps.sha.outputs.sha_aarch64_unknown_linux_gnu }}/" homebrew-tap/Formula/ai-memory.rb
-          sed -i "s/SHA_X86_64_APPLE_DARWIN/${{ steps.sha.outputs.sha_x86_64_apple_darwin }}/" homebrew-tap/Formula/ai-memory.rb
           sed -i "s/SHA_AARCH64_APPLE_DARWIN/${{ steps.sha.outputs.sha_aarch64_apple_darwin }}/" homebrew-tap/Formula/ai-memory.rb
 
       - name: Push updated formula
