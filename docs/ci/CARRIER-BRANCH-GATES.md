@@ -40,24 +40,43 @@ The exact POST body is committed at `docs/ci/carrier-ruleset.json`:
   15368 (GitHub Actions), so a commit status posted under the same name by any
   other app or token does not satisfy the rule.
 
-Apply it (one command, from a checkout of the carrier tip that contains this
-change; repository-settings write, held by ai:god-f2):
+Precondition: apply the ruleset only after this change is on every carrier
+that is not frozen and still takes pull requests. On 2026-10-09
+(`git ls-remote origin 'refs/heads/chain/*' 'refs/heads/rehearsal/*'`) these
+are `chain/promo6-ssh` and `rehearsal/audit-wip-ssh`. `chain/promo6` and
+`rehearsal/audit-wip` are frozen by ruleset 24733250. The ruleset requires
+`Carrier-base freshness gate (#6143)` on every `chain/**` and `rehearsal/**`
+base. On a carrier whose tip lacks that job, the context never reports, so no
+pull request into that carrier can merge. The pre-apply check below enforces
+this precondition; it does not rely on this list.
+
+Apply it from a checkout of a carrier tip that contains this change. These are
+repository-settings writes, held by ai:god-f2. Use an admin-scoped token, which
+can see `bypass_actors`:
 
 ```
+python3 -I scripts/check_carrier_ruleset_live.py --pre-apply
 gh api -X POST repos/alphaonedev/ai-memory-mcp/rulesets --input docs/ci/carrier-ruleset.json
-```
-
-Then verify with an admin-scoped token, which can see `bypass_actors`:
-
-```
 python3 -I scripts/check_carrier_ruleset_live.py --require-full-view
 ```
 
-Expected right after applying: rc 1, `carrier ruleset is live and matches;
-flip carrier-ruleset-state.json to "applied"`. The promotion commit (#6182)
-flips the state and promotes the verifier job.
+- `--pre-apply` must return rc 0 (`PRE-APPLY OK`) before the `POST`. It reads
+  every live `refs/heads/chain/**` and `refs/heads/rehearsal/**` branch
+  (GET only). It skips a carrier only when an active ruleset with an `update`
+  rule names that carrier exactly, does not exclude it, and shows
+  `bypass_actors: []`. For every other carrier it reads
+  `.github/workflows/c8-precheck.yml` at the tip and fails unless both #6143
+  jobs are defined there. Any carrier it cannot read is RED.
+- Expected after the `POST`: rc 1, `carrier ruleset is live and matches; flip
+  carrier-ruleset-state.json to "applied"`. The promotion (step 3 below)
+  flips the state and promotes the verifier job.
 
 Effects to expect once the ruleset is live:
+
+- A new carrier (`chain/**` or `rehearsal/**`) must be cut from a tip that
+  already contains both #6143 jobs; otherwise its pull requests cannot merge.
+  Run `--pre-apply` after cutting one. It is RED for a carrier that lacks the
+  jobs.
 
 - A direct push that moves an existing carrier is refused unless its commits
   have already passed every required check on another ref. Carriers move by
@@ -74,7 +93,18 @@ Effects to expect once the ruleset is live:
 
 `scripts/qc-allowlists/carrier-ruleset-state.json` holds
 `{"state": "pending-apply" | "applied", "tracking_issue": 6182}`. Any other
-value is RED.
+value is RED, including any tracking issue other than #6182 (the number is
+pinned in the verifier).
+
+The state is coupled to the promotion of the verifier's own context,
+`Carrier-ruleset live verifier (#6143)`:
+
+- `applied` requires that context in `required-contexts-release.txt`, in
+  `required-contexts-carrier.txt` and in the payload, and requires no
+  `carrier-ruleset-live-gate` line in `required-contexts-not-required.txt`.
+- `pending-apply` requires the reverse in every place.
+- A half promotion is RED. For example, a commit that only flips the state
+  cannot leave the removed-rule detector advisory.
 
 - Always, offline: the payload must match the description above and
   `required-contexts-carrier.txt`, and the carrier declaration must contain
@@ -89,22 +119,47 @@ value is RED.
   `UNPROTECTED ...` with the apply command, rc 0. #6182 closed or unreadable is
   RED. A drifting candidate is RED. A matching candidate is RED until the state
   is flipped to `applied`.
-- The rulesets API unreadable: RED in every state.
+- The rulesets API unreadable: RED in every state. An empty response body
+  also counts as unreadable; zero rulesets is the body `[]`.
 - `bypass_actors` is hidden from the Actions `GITHUB_TOKEN`. A hidden field is
-  reported as `UNVERIFIED` (WARN); `--require-full-view` makes it RED. A visible
+  reported as `UNVERIFIED` (WARN), and `--require-full-view` makes it RED. Only
+  an actual empty JSON list counts as verified empty. `null`, a non-list or a
   non-empty list is always RED.
+- The job is granted `contents: read` and `issues: read` at job level. The
+  issue read therefore does not depend on the repository being public.
 
 ## Landing order (#6182)
 
-1. This change lands. Both jobs are in `required-contexts-not-required.txt`.
-2. ai:god-f2 applies the payload (command above) and runs the verifier with
-   `--require-full-view`.
-3. One promotion commit: `carrier-ruleset-state.json` state `applied`; the
-   verifier context goes through the #3554 lockstep (release/v1.0.0
-   protection, `bash scripts/check-required-contexts-live.sh --pin-from-live`,
-   `required-contexts-release.txt`), and into `required-contexts-carrier.txt`
-   and the payload, after which ai:god-f2 updates the live ruleset with
-   `gh api -X PUT repos/alphaonedev/ai-memory-mcp/rulesets/<id> --input docs/ci/carrier-ruleset.json`.
+1. This change lands on every unfrozen carrier that still takes pull
+   requests: `chain/promo6-ssh` and `rehearsal/audit-wip-ssh` (2026-10-09).
+   Both jobs are in `required-contexts-not-required.txt`.
+2. ai:god-f2 runs `--pre-apply` (rc 0 required), applies the payload (`POST`,
+   command above) and runs the verifier with `--require-full-view`. The
+   expected result is rc 1 with "flip".
+3. Promotion. Update the ruleset first, then merge:
+   1. Prepare the promotion pull request on top of step 1, in one commit:
+      - set the state in `carrier-ruleset-state.json` to `applied`;
+      - take the verifier context through the #3554 lockstep: release/v1.0.0
+        protection, `bash scripts/check-required-contexts-live.sh --pin-from-live`,
+        then `required-contexts-release.txt`;
+      - add the context to `required-contexts-carrier.txt` and to the payload;
+      - remove the `carrier-ruleset-live-gate` ledger line.
+
+      The verifier refuses any partial version of this commit.
+   2. ai:god-f2 runs `--pre-apply` again, then updates the live ruleset from
+      the promotion pull request's payload:
+      `gh api -X PUT repos/alphaonedev/ai-memory-mcp/rulesets/<id> --input docs/ci/carrier-ruleset.json`.
+   3. Re-run the promotion pull request's checks. Its verifier is now green
+      (`OK`), and it merges.
+
+   The order matters. If the promotion merges before the `PUT`, its own
+   verifier run is RED (`required contexts drift: missing ['Carrier-ruleset
+   live verifier (#6143)']`). Every carrier pull request stays RED the same
+   way until the `PUT`. After the `PUT`, a pull request that does not yet
+   contain the promotion fails its verifier (the live ruleset has one more
+   context than its payload) until it updates its branch. The strict
+   up-to-date rule forces that update anyway. Land the promotion on
+   `rehearsal/audit-wip-ssh` too.
 4. #6182 and #6143 close with the verifier output as evidence.
 
 The freshness job is never moved into `required-contexts-release.txt`:
