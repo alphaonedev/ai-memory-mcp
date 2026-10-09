@@ -20,8 +20,9 @@ unit, because an integration test links the lib and may run the bin, and a
 dep-info for a test target lists only that target's own sources); Cargo.lock;
 the ``rustc -Vv`` text; the feature/profile string; the behaviour-affecting
 environment; and a digest of every file in the repo a test could read at run
-time that rustc never saw (everything but build/VCS dirs and the compiled
-``.rs`` under src/ and tests/). A binary whose own sources look like a tree
+time that rustc never saw (everything but build/VCS dirs and the ``.rs``
+files under src/ and tests/ that some dep-info of THIS build names; a ``.rs``
+file no dep-info names, such as a cfg-off module or an orphan, stays in). A binary whose own sources look like a tree
 scanner (read_dir, walkdir, glob, a "tests" path; integration test targets
 only, the lib and bin unit tests only read non-Rust fixtures) is keyed on the
 whole tree including those ``.rs`` files, so a source-scanning test is never skipped
@@ -211,14 +212,19 @@ COMPILED_RS_ROOTS = ('src', 'tests')
 TREE_SENSITIVE_RE = re.compile(r'read_dir|walkdir|WalkDir|\bglob\b|"tests"|tests/|include_dir')
 
 
-def digest_runtime_tree(root, include_compiled_rs):
+def digest_runtime_tree(root, include_compiled_rs, compiled_labels=None):
     """sha256 pairs of every file a test could read at run time.
 
-    Everything under the repo except build/VCS dirs. ``.rs`` files under src/
-    and tests/ are skipped unless ``include_compiled_rs`` (they are covered per
-    binary by dep-info).
+    Everything under the repo except build/VCS dirs. A ``.rs`` file under src/
+    or tests/ is skipped only when ``include_compiled_rs`` is false AND its
+    repo-relative path is in ``compiled_labels`` (the union of every dep-info
+    of this build, so a per-binary key already covers it). A ``.rs`` file no
+    dep-info names (a cfg-off module, an orphan file) stays in: the lib's own
+    tests scan src/ at run time (r1 H1). ``compiled_labels=None`` means "no
+    dep-info known", so every ``.rs`` file stays in.
     """
     root = Path(root)
+    compiled = frozenset(compiled_labels or ())
     out = []
     for dirpath, dirnames, filenames in os.walk(str(root)):
         rel_dir = Path(dirpath).relative_to(root)
@@ -229,7 +235,8 @@ def digest_runtime_tree(root, include_compiled_rs):
         for name in sorted(filenames):
             p = Path(dirpath) / name
             rel = p.relative_to(root)
-            if not include_compiled_rs and p.suffix == '.rs' and rel.parts[0] in COMPILED_RS_ROOTS:
+            if (not include_compiled_rs and p.suffix == '.rs' and rel.parts[0] in COMPILED_RS_ROOTS
+                    and str(rel) in compiled):
                 continue
             if p.is_symlink() and not p.exists():
                 continue
@@ -354,13 +361,13 @@ def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=T
             raise CacheError('no dep-info found for the local lib/bin/build-script units')
         for sf in sfiles:
             shared.extend(digest_depinfo(sf, repo_root))
-        rt_base = digest_runtime_tree(repo_root, False) if runtime else []
-        rt_full = digest_runtime_tree(repo_root, True) if runtime else []
     except CacheError as exc:
         for e in exes:
             keys[e.key], why[e.key] = None, 'shared inputs unavailable: %s' % exc
         return keys, why
-    env_fp = env_fingerprint(env)
+    # Own dep-info per binary first: the union of every dep-info label decides
+    # which .rs files the run-time tree may leave out (r1 H1).
+    own_by_exe = {}
     for e in exes:
         try:
             dep = exe_depinfo_path(e.executable)
@@ -369,6 +376,25 @@ def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=T
             own = digest_depinfo(dep, repo_root)
             if not own:
                 raise CacheError('empty dep-info for %s' % e.key)
+            own_by_exe[e.key] = (dep, own)
+        except CacheError as exc:
+            keys[e.key], why[e.key] = None, str(exc)
+    compiled = {label for label, _ in shared}
+    for _dep, own in own_by_exe.values():
+        compiled.update(label for label, _ in own)
+    try:
+        rt_base = digest_runtime_tree(repo_root, False, compiled) if runtime else []
+        rt_full = digest_runtime_tree(repo_root, True) if runtime else []
+    except CacheError as exc:
+        for e in exes:
+            keys[e.key], why[e.key] = None, 'shared inputs unavailable: %s' % exc
+        return keys, why
+    env_fp = env_fingerprint(env)
+    for e in exes:
+        if e.key not in own_by_exe:
+            continue
+        dep, own = own_by_exe[e.key]
+        try:
             rt = rt_full if (runtime and e.kind not in ('lib', 'bin') and tree_sensitive(dep, repo_root)) else rt_base
             keys[e.key] = build_key(own, shared, lock_sha, rustc_vv, profile, env_fp, rt)
         except CacheError as exc:
