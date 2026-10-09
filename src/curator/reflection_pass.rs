@@ -1757,6 +1757,128 @@ mod tests {
             assert!(report.reflections_persisted >= 1);
         }
 
+        /// #3154 — count the Reflections in `ns` whose OUTBOUND `reflects_on`
+        /// edge set is exactly `sources` (the duplicate-provenance shape the
+        /// issue describes: two rows, identical fan-out).
+        fn count_reflections_over(conn: &rusqlite::Connection, ns: &str, sources: &[String]) -> usize {
+            let want: HashSet<&str> = sources.iter().map(String::as_str).collect();
+            crate::db::list(conn, Some(ns), None, 1_000, 0, None, None, None, None, None, None)
+                .unwrap()
+                .iter()
+                .filter(|m| m.memory_kind == MemoryKind::Reflection)
+                .filter(|m| {
+                    let links = crate::db::get_links(conn, &m.id).unwrap();
+                    let outbound: HashSet<&str> = links
+                        .iter()
+                        .filter(|l| {
+                            l.source_id == m.id
+                                && l.relation == crate::models::MemoryLinkRelation::ReflectsOn
+                        })
+                        .map(|l| l.target_id.as_str())
+                        .collect();
+                    outbound == want
+                })
+                .count()
+        }
+
+        /// #3154 — the pass is IDEMPOTENT over an unchanged cluster: a second
+        /// sweep over the same three Observations must neither mint a second
+        /// Reflection with the identical `reflects_on` fan-out nor pay a second
+        /// LLM round-trip for it. Pre-fix `persist` reflected unconditionally
+        /// and `eligible()` re-checked only kind / namespace / access_count,
+        /// so every `--reflect` sweep re-minted the hot cluster.
+        #[tokio::test]
+        async fn reflection_pass_does_not_remint_an_unchanged_cluster_3154() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let llm = StubLlm::new("idempotent pattern");
+            let s1 = insert_observation(&conn, "idem", "T1", "shared keyword token strategy notes", 2);
+            let s2 = insert_observation(&conn, "idem", "T2", "shared keyword token strategy plan", 3);
+            let s3 = insert_observation(
+                &conn,
+                "idem",
+                "T3",
+                "shared keyword token strategy canary",
+                1,
+            );
+            let sources = vec![s1, s2, s3];
+
+            let first =
+                run_reflection_pass(&store, &llm, None, Some("idem"), None, false, |_| true)
+                    .await
+                    .unwrap();
+            assert_eq!(first.reflections_persisted, 1, "first sweep mints: {first:?}");
+            assert_eq!(count_reflections_over(&conn, "idem", &sources), 1);
+
+            let second =
+                run_reflection_pass(&store, &llm, None, Some("idem"), None, false, |_| true)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                second.reflections_persisted, 0,
+                "#3154: the second sweep over an unchanged cluster must not mint again: {second:?}"
+            );
+            assert!(second.errors.is_empty(), "no verify/persist errors: {second:?}");
+            assert_eq!(
+                count_reflections_over(&conn, "idem", &sources),
+                1,
+                "#3154: exactly one Reflection carries this reflects_on fan-out"
+            );
+            assert_eq!(
+                llm.calls.lock().unwrap().len(),
+                1,
+                "#3154: an already-reflected cluster must not pay a second LLM round-trip"
+            );
+        }
+
+        /// #3154 — `verify_recent` must find the freshly-written Reflection
+        /// even when the namespace's first page is full of OTHER rows. Pre-fix
+        /// it scanned only the first 16 rows of the namespace, so a busy
+        /// namespace produced a spurious `verify failed` after a successful
+        /// persist. Twenty higher-priority decoy Reflections sort ahead of
+        /// ours in the stable `priority DESC, updated_at DESC, id ASC` order.
+        #[tokio::test]
+        async fn verify_recent_finds_the_reflection_past_the_first_sixteen_rows_3154() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let llm = StubLlm::new("buried pattern");
+            let s1 = insert_observation(&conn, "wide", "T1", "shared keyword token strategy notes", 2);
+            let s2 = insert_observation(&conn, "wide", "T2", "shared keyword token strategy plan", 3);
+            let s3 = insert_observation(
+                &conn,
+                "wide",
+                "T3",
+                "shared keyword token strategy canary",
+                1,
+            );
+            let sources = vec![s1, s2, s3];
+            let first =
+                run_reflection_pass(&store, &llm, None, Some("wide"), None, false, |_| true)
+                    .await
+                    .unwrap();
+            assert_eq!(first.reflections_persisted, 1, "{first:?}");
+            assert!(first.errors.is_empty(), "{first:?}");
+
+            for i in 0..20 {
+                let mut decoy = make_obs(
+                    &uuid::Uuid::new_v4().to_string(),
+                    "wide",
+                    &format!("[reflection] decoy {i}"),
+                    "decoy reflection body",
+                    0,
+                );
+                decoy.memory_kind = MemoryKind::Reflection;
+                decoy.priority = 9;
+                decoy.metadata = serde_json::json!({"agent_id": "test-agent"});
+                crate::db::insert(&conn, &decoy).unwrap();
+            }
+
+            let ctx = curator_caller_context("ai:curator-3154");
+            verify_recent(&store, &ctx, "wide", &sources)
+                .await
+                .expect("#3154: verify_recent must page past the first 16 rows");
+        }
+
         #[tokio::test]
         async fn run_reflection_pass_depth_refusal_increments_counter() {
             let (store, _dir) = open_db();
