@@ -1422,7 +1422,7 @@ def run_manifest_cases(fresh) -> bool:
         try:
             ok &= raw(root, "F1 an unreadable manifest", True, "cannot read")
         finally:
-            os.chmod(root / manifest, 0o644)
+            os.chmod(root / manifest, 0o600)  # #6163: owner-only
         ok &= owner_only(root / manifest, "F1 the manifest restored after the unreadable case")
     # --update: rewrites the manifest, reports the changed section, refuses a symlinked manifest.
     root = fresh()
@@ -1509,7 +1509,7 @@ def run_ref_cases(fresh, arch: str, style: str) -> bool:
             try:
                 ok &= refs_expect(root, f"R3-F8 {name} unreadable (mode 000)", True, "cannot read")
             finally:
-                os.chmod(root / rel, 0o644)
+                os.chmod(root / rel, 0o600)  # #6163: owner-only
             ok &= owner_only(root / rel, f"R3-F8 {name} restored after the unreadable case")
     return ok
 
@@ -1780,22 +1780,20 @@ COMPARE_WORKFLOW_LINES = (
     "ref: ${{ github.event.pull_request.base.sha }}",
     "fetch-depth: 0",
     "persist-credentials: false",
-    "- name: Fetch the pull request head as git objects (data, never checked out)",
-    "env:",
-    "PR_NUMBER: ${{ github.event.pull_request.number }}",
-    'run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"',
     "- name: Comparison self-test (base code)",
     "run: python3 -I scripts/claude-md-rule-compare.py --self-test",
     "- name: Compare the head rule sections with the base manifest",
     "env:",
     "BASE_SHA: ${{ github.event.pull_request.base.sha }}",
     "HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+    "PR_NUMBER: ${{ github.event.pull_request.number }}",
     'run: python3 -I scripts/claude-md-rule-compare.py --base-root . --repo . --base-sha "$BASE_SHA" '
-    '--head-sha "$HEAD_SHA" --scratch "$RUNNER_TEMP/rule-compare" --summary "$GITHUB_STEP_SUMMARY"',
+    '--head-sha "$HEAD_SHA" --pr-number "$PR_NUMBER" --scratch "$RUNNER_TEMP/rule-compare" '
+    '--summary "$GITHUB_STEP_SUMMARY"',
 )
 # R4 (#4507): the indentation of each meaningful line, so a key moved out of its block (for example
 # `persist-credentials` lifted out of `with:`) is refused although its stripped text is unchanged.
-COMPARE_WORKFLOW_INDENTS = (0, 0, 2, 4, 4, 0, 2, 0, 2, 2, 0, 2, 4, 4, 4, 4, 6, 8, 8, 10, 10, 10, 6, 8, 10, 8, 6, 8, 6, 8, 10, 10, 8)
+COMPARE_WORKFLOW_INDENTS = (0, 0, 2, 4, 4, 0, 2, 0, 2, 2, 0, 2, 4, 4, 4, 4, 6, 8, 8, 10, 10, 10, 6, 8, 6, 8, 10, 10, 10, 8)
 COMPARE_DANGER = (
     ("if:", "a condition can skip the comparison"),
     ("paths:", "a paths filter can skip the comparison"),
@@ -1807,6 +1805,11 @@ COMPARE_DANGER = (
     ("head_ref", "the head branch name must never reach the job"),
     ("/merge", "the merge ref contains head content"),
     ("secrets.", "no secret may be exposed to a pull_request_target job"),
+    # #6163 (CodeQL actions/untrusted-checkout): the base comparison script fetches the head as git objects
+    # (--pr-number); no workflow step fetches, pulls or checks out the pull request head.
+    ("git fetch", "the pull request head is fetched by the base comparison script, never by a workflow step"),
+    ("git pull", "the pull request head is fetched by the base comparison script, never by a workflow step"),
+    ("pr checkout", "a workflow step must never check out the pull request head"),
 )
 
 
@@ -2049,7 +2052,19 @@ def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
         "differs from the pinned form")
     ok &= case("R3-F3 head repo checked out", good.replace(
         checkout, checkout + "          repository: ${{ github.event.pull_request.head.repo.full_name }}\n", 1), "head.repo")
-    ok &= case("R3-F3 merge ref", good.replace("refs/pull/${PR_NUMBER}/head", "refs/pull/${PR_NUMBER}/merge", 1), "/merge")
+    ok &= case("R3-F3 merge ref", good.replace(
+        "PR_NUMBER: ${{ github.event.pull_request.number }}", "PR_NUMBER: ${{ github.event.pull_request.number }}/merge", 1),
+        "/merge")
+    fetch_step = ("      - name: Fetch the pull request head\n        env:\n"
+                  "          PR_NUMBER: ${{ github.event.pull_request.number }}\n"
+                  '        run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"\n')
+    ok &= case("#6163 a workflow step that fetches the head", good.replace(
+        "      - name: Comparison self-test (base code)", fetch_step + "      - name: Comparison self-test (base code)", 1),
+        "`git fetch`")
+    ok &= case("#6163 a workflow step that pulls the head", good.replace(
+        "--self-test\n", "--self-test\n      - run: git pull origin pull/1/head\n", 1), "`git pull`")
+    ok &= case("#6163 a workflow step that checks the head out with gh", good.replace(
+        "--self-test\n", "--self-test\n      - run: gh pr checkout 1\n", 1), "`pr checkout`")
     ok &= case("R3-F3 write permission", good.replace("  contents: read", "  contents: write", 1), "differs from the pinned form")
     ok &= case("R3-F3 extra permission", good.replace("  contents: read", "  contents: read\n  pull-requests: write", 1),
                "meaningful lines")

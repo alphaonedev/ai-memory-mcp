@@ -18,9 +18,11 @@
 # WHY pull_request_target. The pull_request run of claude-md-guard.yml executes
 # the head's own guard and manifest, so a head that rewrites both passes. This
 # trigger runs the workflow FILE OF THE BASE BRANCH with the base checkout, and
-# the head is DATA: scripts/claude-md-rule-compare.py reads CLAUDE.md and the two
-# docs/reference files out of git objects (ls-tree, cat-file), refuses a symlink
-# blob, and never executes, imports or checks out anything from the head.
+# the head is DATA: scripts/claude-md-rule-compare.py (base code) fetches
+# refs/pull/<N>/head as git objects itself (--pr-number, a validated decimal;
+# no workflow step fetches or checks out the head, #6163), reads CLAUDE.md and
+# the two docs/reference files out of git objects (ls-tree, cat-file), refuses
+# a symlink blob, and never executes, imports or checks out anything from the head.
 # Permissions are contents: read. No secret is used.
 #
 # BOOTSTRAP. pull_request_target only runs a workflow that already exists on the
@@ -61,14 +63,11 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Fetch the pull request head as git objects (data, never checked out)
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"
       - name: Comparison self-test (base code)
         run: python3 -I scripts/claude-md-rule-compare.py --self-test
       - name: Compare the head rule sections with the base manifest
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 -I scripts/claude-md-rule-compare.py --base-root . --repo . --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --scratch "$RUNNER_TEMP/rule-compare" --summary "$GITHUB_STEP_SUMMARY"
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 -I scripts/claude-md-rule-compare.py --base-root . --repo . --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --pr-number "$PR_NUMBER" --scratch "$RUNNER_TEMP/rule-compare" --summary "$GITHUB_STEP_SUMMARY"

@@ -393,8 +393,8 @@ def check_banner_consistency(repo, judged):
         f"re-issue it at HEAD or record VOID/EXPIRED in {CERT_DOC}.",
         "",
         f"Bound: {binds}  HEAD: {judged}",
-        "Federation-wire drift since the bind (paths; +added / -removed "
-        "AI_MEMORY_FED_* identifiers):",
+        ("Federation-wire drift since the bind (paths; +added / -removed "
+         "AI_MEMORY_FED_* identifiers):"),
     ]
     lines.extend("  " + d for d in drift)
     lines.append("")
@@ -1439,8 +1439,27 @@ SELF_TEST_OK = (
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
     "octopus merge RED; (ci1-ci7, #5970) the event payload range is authoritative under "
     "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
-    "outside CI."
+    "outside CI; (utf8, #6163) a refused UTF-8 reconfigure of an output stream is "
+    "reported once, not swallowed."
 )
+
+
+def reconfigure_utf8(streams):
+    """Reconfigure each text stream to UTF-8 with replacement; return one note per
+    stream that refused (#6163: a refusal is reported, never swallowed). A stream
+    without reconfigure() (not a TextIOWrapper, e.g. a captured StringIO) keeps its
+    encoding by design."""
+    notes = []
+    for stream in streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except ValueError as exc:
+            notes.append(f"{PREFIX}: NOTE — {getattr(stream, 'name', '?')} keeps its "
+                         f"encoding; UTF-8 reconfigure refused: {exc}")
+    return notes
 
 
 def main(argv=None):
@@ -1449,11 +1468,8 @@ def main(argv=None):
     parser.add_argument("--self-test", action="store_true",
                         help="plant-a-violation corpus in a scratch repository")
     args = parser.parse_args(argv)
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
+    for note in reconfigure_utf8((sys.stdout, sys.stderr)):
+        print(note, file=sys.stderr)
     if args.self_test:
         return self_test()
     rc, out, err = run_gate(REPO_ROOT, dict(os.environ))
