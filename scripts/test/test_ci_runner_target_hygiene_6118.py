@@ -1137,7 +1137,7 @@ class PruneScript6118(unittest.TestCase):
         self.assertEqual(50000 + 10 + 6000, self._freed(proc.stdout))
         self.assertFalse((self.target / "debug" / "examples" / "demo-1e1e").exists())
         self.assertEqual([], os.listdir(str(self.target / "debug" / "incremental")))
-        self.assertIn("could not be removed", proc.stdout)
+        self.assertIn("1 entry could not be read or removed (warnings above); exit 1", proc.stdout)
 
     def test_6118_scan_entry_vanishing_or_failing_lstat_is_handled(self) -> None:
         # F2 / SR2-1: an entry that vanishes between scandir and lstat is skipped
@@ -1225,7 +1225,9 @@ class PruneScript6118(unittest.TestCase):
         except subprocess.TimeoutExpired:
             self.fail("opening a FIFO CACHEDIR.TAG blocked (SR2-4)")
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
-        self.assertIn("RESULT False False", proc.stdout)
+        # The first call reads the real tag unless an lstat-before-open let the
+        # swap in; the second always meets a FIFO.  Neither may block.
+        self.assertRegex(proc.stdout, r"RESULT (True|False) False")
         # End to end: a FIFO tag and no .cargo-lock is "not a cargo target dir".
         (self.target / "debug" / ".cargo-lock").unlink()
         try:
