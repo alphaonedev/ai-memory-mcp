@@ -1241,11 +1241,17 @@ pub async fn delete_memory(
                 let archived = target
                     .as_ref()
                     .is_some_and(|m| crate::visibility::inbox_delete_retains(&m.namespace));
-                (
-                    StatusCode::OK,
-                    Json(json!({"deleted": true, "id": id, "archived": archived})),
-                )
-                    .into_response()
+                let receipt = json!({"deleted": true, "id": id, "archived": archived});
+                // #4153 — fan the deletion out on the federation delete lane,
+                // as the sqlite arm below has always done; a quorum miss is
+                // the W3/G12 `202` carrying the local success fields. The
+                // SAL owner gate accepted this id, so a refused delete never
+                // reaches a peer.
+                if let Some(payload) = super::fanout_delete_or_pending(&app, &id).await {
+                    let extra = receipt.as_object().cloned().unwrap_or_default();
+                    return super::under_replicated_delete_response(&payload, extra);
+                }
+                (StatusCode::OK, Json(receipt)).into_response()
             }
             Err(e) => store_err_to_response(e),
         };
