@@ -796,7 +796,7 @@ impl DeferredAuditJournal {
             }
         }
         if overflow_markers > 0 {
-            tracing::error!(overflow_markers, path = %spool_dir.display(), "deferred-audit spool contains durable overflow evidence; prior refusals were blocked because audit admission was unavailable");
+            tracing::error!(overflow_markers, path = %shown(&spool_dir), "deferred-audit spool contains durable overflow evidence; prior refusals were blocked because audit admission was unavailable");
         }
         sync_directory(&spool_dir).context("fsync reconciled deferred-audit spool")?;
         validate_atomic_publication(&spool_dir)?;
@@ -846,7 +846,7 @@ impl DeferredAuditJournal {
                 }
                 anyhow::bail!(
                     "journal spool occurrence-id collision at {}",
-                    spool_path.display()
+                    shown(&spool_path)
                 );
             }
             let frame_len = u64::try_from(frame.len()).context("journal spool frame length")?;
@@ -883,7 +883,7 @@ impl DeferredAuditJournal {
                     Err(error) => {
                         usage.entries += 1;
                         usage.bytes += frame_len;
-                        tracing::error!(%error, path = %staging_path.display(), "deferred-audit staging cleanup failed; artifact remains quota-accounted");
+                        tracing::error!(%error, path = %shown(&staging_path), "deferred-audit staging cleanup failed; artifact remains quota-accounted");
                         Ok(())
                     }
                 }
@@ -934,7 +934,7 @@ impl DeferredAuditJournal {
         let mut sequences = std::collections::HashSet::new();
         let mut occurrence_hashes = std::collections::HashSet::new();
         for entry in std::fs::read_dir(&self.spool_dir)
-            .with_context(|| format!("journal replay: read spool {}", self.spool_dir.display()))?
+            .with_context(|| format!("journal replay: read spool {}", shown(&self.spool_dir)))?
         {
             let path = entry.context("journal replay: read spool entry")?.path();
             if path.extension().is_some_and(|ext| ext == "event") {
@@ -962,10 +962,9 @@ impl DeferredAuditJournal {
         });
         for (path, _, occurrence_hash) in spool_entries {
             let frame = read_journal_frame_bounded(&path)
-                .with_context(|| format!("journal replay: read {}", path.display()))?;
-            let event = parse_complete_journal_frame(&frame).with_context(|| {
-                format!("journal replay: corrupt spool frame {}", path.display())
-            })?;
+                .with_context(|| format!("journal replay: read {}", shown(&path)))?;
+            let event = parse_complete_journal_frame(&frame)
+                .with_context(|| format!("journal replay: corrupt spool frame {}", shown(&path)))?;
             let occurrence_id = event
                 .occurrence_id
                 .as_deref()
@@ -1027,7 +1026,7 @@ impl DeferredAuditJournal {
         if existing != expected {
             anyhow::bail!(
                 "journal acknowledge occurrence-id/payload collision at {}",
-                spool_path.display()
+                shown(&spool_path)
             );
         }
         std::fs::remove_file(&spool_path).context("journal acknowledge: remove occurrence")?;
@@ -1049,7 +1048,7 @@ impl DeferredAuditJournal {
         let hash = hex::encode(payload_hash(occurrence_id.as_bytes()));
         let mut found = None;
         for entry in std::fs::read_dir(&self.spool_dir)
-            .with_context(|| format!("scan deferred-audit spool {}", self.spool_dir.display()))?
+            .with_context(|| format!("scan deferred-audit spool {}", shown(&self.spool_dir)))?
         {
             let path = entry.context("scan deferred-audit spool entry")?.path();
             if !path
@@ -1071,7 +1070,7 @@ impl DeferredAuditJournal {
         let mut sequences = std::collections::HashSet::new();
         let mut occurrence_hashes = std::collections::HashSet::new();
         for entry in std::fs::read_dir(&self.spool_dir)
-            .with_context(|| format!("scan deferred-audit spool {}", self.spool_dir.display()))?
+            .with_context(|| format!("scan deferred-audit spool {}", shown(&self.spool_dir)))?
         {
             let path = entry.context("scan deferred-audit spool entry")?.path();
             if path
@@ -1187,7 +1186,7 @@ fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<(bool, File, Vec<Fil
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
                 Err(error) => {
                     return Err(error).with_context(|| {
-                        format!("create deferred-audit spool {}", spool_dir.display())
+                        format!("create deferred-audit spool {}", shown(&spool_dir))
                     });
                 }
             }
@@ -1199,7 +1198,7 @@ fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<(bool, File, Vec<Fil
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
                 Err(error) => {
                     return Err(error).with_context(|| {
-                        format!("create deferred-audit spool {}", spool_dir.display())
+                        format!("create deferred-audit spool {}", shown(&spool_dir))
                     });
                 }
             }
@@ -1275,26 +1274,23 @@ fn validate_spool_ancestors_at(path: &Path) -> Result<()> {
         let link_metadata = std::fs::symlink_metadata(ancestor).with_context(|| {
             format!(
                 "inspect deferred-audit spool ancestor link {}",
-                ancestor.display()
+                shown(&ancestor)
             )
         })?;
         if link_metadata.file_type().is_symlink() {
             anyhow::bail!(
                 "deferred-audit spool ancestor is a symlink: {}",
-                ancestor.display()
+                shown(&ancestor)
             );
         }
         let directory = open_directory_handle(ancestor).with_context(|| {
             format!(
                 "open deferred-audit spool ancestor safely {}",
-                ancestor.display()
+                shown(&ancestor)
             )
         })?;
         let metadata = directory.metadata().with_context(|| {
-            format!(
-                "inspect deferred-audit spool ancestor {}",
-                ancestor.display()
-            )
+            format!("inspect deferred-audit spool ancestor {}", shown(&ancestor))
         })?;
         let mode = metadata.permissions().mode();
         // SAFETY: geteuid has no preconditions and only reads credentials.
@@ -1302,13 +1298,13 @@ fn validate_spool_ancestors_at(path: &Path) -> Result<()> {
         if !spool_ancestor_permissions_trusted(metadata.uid(), mode, effective_uid) {
             anyhow::bail!(
                 "deferred-audit spool ancestor permits untrusted rename: {}",
-                ancestor.display()
+                shown(&ancestor)
             );
         }
         if !metadata.is_dir() {
             anyhow::bail!(
                 "deferred-audit spool ancestor is not a directory: {}",
-                ancestor.display()
+                shown(&ancestor)
             );
         }
         #[cfg(target_os = "macos")]
@@ -1627,10 +1623,10 @@ fn open_or_create_private_file(path: &Path, label: &str) -> Result<File> {
     let file = match open(true) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            open(false).with_context(|| format!("open existing {label} {}", path.display()))?
+            open(false).with_context(|| format!("open existing {label} {}", shown(&path)))?
         }
         Err(error) => {
-            return Err(error).with_context(|| format!("create {label} {}", path.display()));
+            return Err(error).with_context(|| format!("create {label} {}", shown(&path)));
         }
     };
     ensure_regular_file(&file, label)?;
@@ -1650,7 +1646,7 @@ fn create_new_private_file(path: &Path, label: &str) -> Result<File> {
     apply_no_follow(&mut options);
     let file = options
         .open(path)
-        .with_context(|| format!("create private {label} {}", path.display()))?;
+        .with_context(|| format!("create private {label} {}", shown(&path)))?;
     ensure_regular_file(&file, label)?;
     #[cfg(unix)]
     validate_unix_private_file(&file, label)?;
@@ -2065,7 +2061,7 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
     }
     if unresolved {
         tracing::warn!(
-            path = %journal_path.display(),
+            path = %shown(&journal_path),
             "recover_deferred_audit: one or more records remain unresolved; journal retained"
         );
     } else {
@@ -2408,7 +2404,7 @@ impl SqliteSignedEventsSink {
             let conn = crate::db::open(&self.db_path).with_context(|| {
                 format!(
                     "SqliteSignedEventsSink: open {} for deferred-audit drainer",
-                    self.db_path.display()
+                    shown(&self.db_path)
                 )
             })?;
             self.conn = Some(conn);
@@ -2546,7 +2542,7 @@ impl SqliteSignedEventsSink {
                         self.bump_race_retry();
                         tracing::warn!(
                             attempt = attempt + 1,
-                            db = %conn_path.display(),
+                            db = %shown(&conn_path),
                             "deferred_audit sink: SQLITE_CONSTRAINT_UNIQUE on signed_events.sequence — \
                              chain-head race; retrying (budget {APPEND_UNIQUE_RACE_MAX_RETRIES})"
                         );
@@ -3036,6 +3032,15 @@ pub fn install_deferred_audit_drainer(
     (queue, supervisor)
 }
 
+/// #6106 — every path this module renders (the journal, the spool and its
+/// ancestors, the database) is derived from the `db` value, which may be a
+/// mistyped store DSN carrying a credential (`host=db password=<pw>`,
+/// `postgres:/svc:<pw>@host/db`), so it renders through the ONE
+/// database-path allowlist (ERRORS-09), never raw.
+fn shown(path: &Path) -> String {
+    crate::url_display::db_path_display(path)
+}
+
 /// v0.8.0 PE-4 (#1732) — filename suffix for the crash-durable journal,
 /// appended to the resolved db path (e.g. `ai-memory.db` →
 /// `ai-memory.db.deferred-audit.journal`).
@@ -3074,7 +3079,7 @@ pub fn install_deferred_audit_drainer_with_journal(
     if let Err(e) = recover_deferred_audit(&journal_path, db_path) {
         tracing::error!(
             "deferred-audit boot recovery failed for {}; audit delivery is FAIL-CLOSED: {e:#}",
-            journal_path.display()
+            shown(&journal_path)
         );
         let (queue, receiver) = DeferredAuditQueue::new();
         drop(receiver);
@@ -3085,7 +3090,7 @@ pub fn install_deferred_audit_drainer_with_journal(
         Err(e) => {
             tracing::error!(
                 "deferred-audit journal open failed for {}; audit delivery is FAIL-CLOSED: {e:#}",
-                journal_path.display()
+                shown(&journal_path)
             );
             let (queue, receiver) = DeferredAuditQueue::new();
             drop(receiver);
@@ -3123,7 +3128,7 @@ pub(crate) fn install_deferred_audit_drainer_with_shutdown(
     if let Err(e) = recover_deferred_audit(&journal_path, db_path) {
         tracing::error!(
             "deferred-audit boot recovery failed for {}; audit delivery is FAIL-CLOSED: {e:#}",
-            journal_path.display()
+            shown(&journal_path)
         );
         let (queue, receiver) = DeferredAuditQueue::new();
         drop(receiver);
@@ -3140,7 +3145,7 @@ pub(crate) fn install_deferred_audit_drainer_with_shutdown(
         Err(e) => {
             tracing::error!(
                 "deferred-audit journal open failed for {}; audit delivery is FAIL-CLOSED: {e:#}",
-                journal_path.display()
+                shown(&journal_path)
             );
             let (queue, receiver) = DeferredAuditQueue::new();
             drop(receiver);
