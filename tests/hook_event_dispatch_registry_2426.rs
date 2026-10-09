@@ -16,6 +16,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
@@ -36,10 +37,12 @@ fn hooks_config(tmp: &Path, events: &[&str]) -> PathBuf {
     }
     let mut toml = String::new();
     for event in events {
-        toml.push_str(&format!(
-            "[[hook]]\nevent = {event:?}\ncommand = {:?}\npriority = 0\ntimeout_ms = 1000\nmode = \"exec\"\nenabled = true\nnamespace = \"*\"\n\n",
+        writeln!(
+            toml,
+            "[[hook]]\nevent = {event:?}\ncommand = {:?}\npriority = 0\ntimeout_ms = 1000\nmode = \"exec\"\nenabled = true\nnamespace = \"*\"\n",
             cmd_path.display().to_string(),
-        ));
+        )
+        .expect("write to String");
     }
     std::fs::write(hooks_dir.join("hooks.toml"), toml).expect("hooks.toml");
     xdg
@@ -47,7 +50,12 @@ fn hooks_config(tmp: &Path, events: &[&str]) -> PathBuf {
 
 fn doctor_hooks(tmp: &Path, xdg: &Path, json: bool) -> String {
     let db = tmp.join("doctor-2426.db");
-    let mut args = vec!["--db", db.to_str().expect("utf8 db path"), "doctor", "--hooks"];
+    let mut args = vec![
+        "--db",
+        db.to_str().expect("utf8 db path"),
+        "doctor",
+        "--hooks",
+    ];
     if json {
         args.push("--json");
     }
@@ -74,7 +82,12 @@ fn doctor_hooks_names_a_subscription_that_will_never_fire_2426() {
     let tmp = TempDir::new().expect("tempdir");
     let xdg = hooks_config(
         tmp.path(),
-        &["post_store", "pre_delete", "pre_recall_expand", "pre_signal_send"],
+        &[
+            "post_store",
+            "pre_delete",
+            "pre_recall_expand",
+            "pre_signal_send",
+        ],
     );
     let text = doctor_hooks(tmp.path(), &xdg, false);
     let line_for = |event: &str| {

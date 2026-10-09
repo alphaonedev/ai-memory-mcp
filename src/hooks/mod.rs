@@ -23,6 +23,8 @@
 pub mod chain;
 pub mod config;
 pub mod decision;
+/// #2426 — which `HookEvent`s actually dispatch in a production build.
+pub mod dispatch;
 /// PE-1 (#1734) — mandatory-hook presence enforcement.
 pub mod enforce;
 pub mod events;
@@ -65,6 +67,10 @@ pub use events::{EvictionEvent, HookEvent};
 // `use crate::hooks::executor::HookDecision`) resolving via the
 // canonical `crate::hooks::decision::HookDecision` path.
 pub use decision::{DecisionParseError, HookDecision, ModifyPayload, is_pre_event};
+pub use dispatch::{
+    DispatchStatus, InertSubscription, dispatch_status, inert_subscriptions,
+    warn_inert_subscriptions, warn_inert_subscriptions_at_boot,
+};
 pub use enforce::{
     HookEnforceMode, effective_fail_mode, enforce_required_event_presence,
     is_eligible_required_event, preflight_report,
