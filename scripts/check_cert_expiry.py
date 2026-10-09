@@ -2084,6 +2084,25 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                                   "GITHUB_EVENT_BEFORE": "0" * 40})
     if rc != 0:
         t.fail("(m): push with zero before-SHA did not skip")
+    # (m2, #6201) The skip is for the two well-formed all-zero shas only (40 hex for
+    # SHA-1, 64 for SHA-256). A zero value of any other length, or one with a trailing
+    # newline, is malformed input and the hex validator refuses it; a before-sha that
+    # merely starts with zeros is a real range (here unresolvable) and is judged,
+    # never skipped.
+    m2_base = {"GITHUB_EVENT_NAME": "push", "GITHUB_SHA": base}
+    rc, _o, _e = run_gate(repo, dict(m2_base, GITHUB_EVENT_BEFORE="0" * 64))
+    if rc != 0:
+        t.fail("(m2-zero64): push with a 64-zero before-SHA did not skip")
+    for why, value in [(f"{n}-zero", "0" * n) for n in (1, 5, 6, 39, 41, 63, 65)] + [
+            ("40-zero plus newline", "0" * 40 + "\n"), ("64-zero plus newline", "0" * 64 + "\n")]:
+        rc, _o, err = run_gate(repo, dict(m2_base, GITHUB_EVENT_BEFORE=value))
+        if rc != 1 or hex_msg not in err:
+            t.fail(f"(m2-zero-len): a push {why} before-SHA was not refused by the "
+                   "sha validator:", err)
+    rc, _o, err = run_gate(repo, dict(m2_base, GITHUB_EVENT_BEFORE="0" + "a" * 39))
+    if rc != 1 or "cannot resolve range" not in err:
+        t.fail("(m2-zero-prefix): a 40-hex before-SHA starting with 0 was skipped instead "
+               "of judged:", err)
 
     # (n) fail-closed - unresolvable range.
     if check_change(repo, "0" * 40, base)[0]:
