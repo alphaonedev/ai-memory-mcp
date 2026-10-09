@@ -6,6 +6,11 @@ Wants=network-online.target
 # Sync opens the same local database directly and contacts peers over HTTP.
 # Start after the parent service has initialized that database.
 Requires=ai-memory.service
+# #4326 — Requires= alone does not propagate a RESTART of the primary. The
+# sync daemon opens the live database through the migrating opener, so after
+# an in-place binary replacement it must restart WITH the primary, never
+# before it (see README "Upgrading the binary").
+PartOf=ai-memory.service
 
 [Service]
 Type=simple
