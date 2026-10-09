@@ -1948,4 +1948,89 @@ mod tests {
         assert_eq!(lt, rt);
         assert_eq!(lt, vec!["a", "b", "c"]);
     }
+
+    /// #4208 F1 — a verified, attested inbound and a persisted row that
+    /// differs from it in exactly ONE compared field. Each cell fails if that
+    /// field's comparison is dropped from `persisted_is_verified_unit`.
+    fn attested_unit() -> Memory {
+        let mut m = base("u", "2026-06-16T00:00:00+00:00");
+        m.metadata = json!({"agent_id": "ai:a", "attest_level": "agent_attested"});
+        m
+    }
+
+    #[test]
+    fn verified_unit_matches_identical_row_4208() {
+        let v = attested_unit();
+        assert!(persisted_is_verified_unit(&v.clone(), &v));
+    }
+
+    #[test]
+    fn verified_unit_rejects_content_mismatch_4208() {
+        let v = attested_unit();
+        let mut p = v.clone();
+        p.content = "other".into();
+        assert!(!persisted_is_verified_unit(&p, &v));
+    }
+
+    #[test]
+    fn verified_unit_rejects_title_mismatch_4208() {
+        let v = attested_unit();
+        let mut p = v.clone();
+        p.title = "other".into();
+        assert!(!persisted_is_verified_unit(&p, &v));
+    }
+
+    #[test]
+    fn verified_unit_rejects_namespace_mismatch_4208() {
+        let v = attested_unit();
+        let mut p = v.clone();
+        p.namespace = "other".into();
+        assert!(!persisted_is_verified_unit(&p, &v));
+    }
+
+    #[test]
+    fn verified_unit_rejects_memory_kind_mismatch_4208() {
+        let v = attested_unit();
+        let mut p = v.clone();
+        p.memory_kind = MemoryKind::Reflection;
+        assert!(!persisted_is_verified_unit(&p, &v));
+    }
+
+    #[test]
+    fn verified_unit_rejects_author_mismatch_4208() {
+        let v = attested_unit();
+        let mut p = v.clone();
+        p.metadata = json!({"agent_id": "ai:b", "attest_level": "agent_attested"});
+        assert!(!persisted_is_verified_unit(&p, &v));
+    }
+
+    #[test]
+    fn verified_unit_rejects_missing_or_empty_author_4208() {
+        let mut v = attested_unit();
+        v.metadata = json!({"attest_level": "agent_attested"});
+        assert!(!persisted_is_verified_unit(&v.clone(), &v));
+        v.metadata = json!({"agent_id": "", "attest_level": "agent_attested"});
+        assert!(!persisted_is_verified_unit(&v.clone(), &v));
+    }
+
+    /// #4208 F3 — an inbound that is not `agent_attested` never matches, even
+    /// when the stored row is byte-identical (defence in depth).
+    #[test]
+    fn verified_unit_requires_inbound_attested_4208() {
+        let mut v = attested_unit();
+        v.metadata = json!({"agent_id": "ai:a", "attest_level": "claimed"});
+        assert!(!persisted_is_verified_unit(&v.clone(), &v));
+        v.metadata = json!({"agent_id": "ai:a"});
+        assert!(!persisted_is_verified_unit(&v.clone(), &v));
+    }
+
+    /// #4208 — created_at and the signature key are deliberately NOT compared.
+    #[test]
+    fn verified_unit_ignores_created_at_and_signature_4208() {
+        let v = attested_unit();
+        let mut p = v.clone();
+        p.created_at = "2020-01-01T00:00:00+00:00".into();
+        p.metadata = json!({"agent_id": "ai:a", "write_signature": "zzz"});
+        assert!(persisted_is_verified_unit(&p, &v));
+    }
 }
