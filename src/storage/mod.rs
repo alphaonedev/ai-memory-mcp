@@ -32518,6 +32518,19 @@ mod tests {
         assert_eq!((dispatched, failed), (0, 0));
     }
 
+    /// #4977 — an unreadable `namespace_meta` is an error from the standard
+    /// check, never "not a standard" (ERRORS-19).
+    #[test]
+    fn is_namespace_standard_unreadable_table_is_err_4977() {
+        let conn = test_db();
+        conn.execute_batch("ALTER TABLE namespace_meta RENAME TO namespace_meta_gone")
+            .unwrap();
+        assert!(
+            is_namespace_standard(&conn, "any-id").is_err(),
+            "an unreadable namespace_meta must be an error, not false"
+        );
+    }
+
     /// #4981 — an unreadable `memories` table is a FAILED probe: `Err`, never
     /// `Ok(None)` ("pre-P2 schema") or `Ok(Some(0))` (ERRORS-19). Only a
     /// missing `embedding_dim` column means pre-P2.

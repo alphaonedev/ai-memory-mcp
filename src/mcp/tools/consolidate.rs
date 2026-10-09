@@ -776,6 +776,39 @@ mod tests {
     // branch is well-exercised by other test surfaces (see
     // `tests/storage_*` integration tests). This negative-case test
     // pins the happy-path branch of the post-write check.
+    /// #4977 — the post-write standard check reports a `namespace_meta`
+    /// read fault as a WARNING (fail closed to WARN, never to silence).
+    /// Pre-fix `is_namespace_standard` folded the fault into `false` and the
+    /// operator got a clean result while a standard may have been consumed.
+    /// The check is exercised on its own helper because `db::consolidate`
+    /// itself touches `namespace_meta` (the source-delete sever) and refuses
+    /// before the post-write check when the table is unreadable.
+    #[test]
+    fn standard_check_warns_when_lookup_faults_4977() {
+        let (conn, _tmp) = fresh_db();
+        conn.execute_batch("ALTER TABLE namespace_meta RENAME TO namespace_meta_gone")
+            .expect("rename away");
+        let warning = namespace_standard_warning(&conn, &["src-a".to_string()], "new-id")
+            .expect("a failed standard check must WARN, never read as 'no standard'");
+        assert!(
+            warning.contains("could not be completed") && warning.contains("namespace_meta"),
+            "the warning must say the check was not completed and why: {warning}"
+        );
+        assert!(
+            warning.contains("new-id"),
+            "the warning must name the id to re-bind: {warning}"
+        );
+    }
+
+    /// #4977 — the healthy negative stays silent: readable table, no
+    /// standard among the sources, no warning.
+    #[test]
+    fn standard_check_silent_when_no_standard_4977() {
+        let (conn, _tmp) = fresh_db();
+        let a = seed_observation(&conn, "cn-std-ok", "a");
+        assert_eq!(namespace_standard_warning(&conn, &[a], "new-id"), None);
+    }
+
     #[test]
     fn no_warning_when_no_standard() {
         let (conn, tmp) = fresh_db();
