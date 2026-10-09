@@ -1383,6 +1383,131 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         print("self-test NOTE (o): skipped own-PR check (no origin/release/v1.0.0 "
               "and no @{upstream})", file=sys.stderr)
 
+    # ---- #6124: non-discharging amendment while EXPIRED/VOID ---------------
+    # 5-agent vote (4d3ea1c5), T3. Rule B gets a pass path only when STATUS is
+    # EXPIRED/VOID at both ends AND the diff adds a NEW amendment listing
+    # exactly the changed watched paths / identifiers and citing #6063.
+    def amend(ref, items, cite=True, tag="Amendment", fence=False):
+        lines = [f"> **{tag} (2026-10-09, {ref} - section 7 record, non-discharging).**",
+                 "> Changed in this range:"]
+        body = [f"> - `{i}`" for i in items]
+        lines.extend(["> ```"] + body + ["> ```"] if fence else body)
+        if cite:
+            lines.append("> Path back to LIVE: WP-B1 re-cert "
+                         "([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)) only.")
+        return "\n".join(lines) + "\n"
+
+    recv_rs = "src/handlers/federation_receive.rs"
+    new_id = "AI_MEMORY_FED_6124_KNOB"
+    green6124 = [("non-discharging", "did not say the amendment is non-discharging"),
+                 ("#6063", "did not name #6063 as the way back to LIVE")]
+
+    fx.reset(base)
+    fx.banner("EXPIRED", genesis)
+    exp6124 = fx.commit([CERT_DOC], "base: banner EXPIRED (#6124)")
+
+    def edit_range(extra, touch=(mod_rs,), ids=False, label="x"):
+        """From exp6124: edit `touch`, optionally add an identifier, rewrite the
+        cert doc (banner unchanged) with `extra` below STATUS, commit."""
+        fx.reset(exp6124)
+        paths = []
+        for tp in touch:
+            fx.write(tp, f"// {label}\n", append=True)
+            paths.append(tp)
+        if ids:
+            fx.write("src/config.rs", f'pub const N: &str = "{new_id}";\n', append=True)
+            paths.append("src/config.rs")
+        fx.banner("EXPIRED", genesis, extra)
+        return fx.commit(paths + [CERT_DOC], f"6124 cell {label}")
+
+    # (6124-h1) GREEN - EXPIRED both ends + new amendment listing the one path.
+    h1 = edit_range("\n" + amend("#6162", [mod_rs]), label="h1")
+    t.expect_green("6124-h1", "EXPIRED both ends + valid new amendment", repo, exp6124, h1,
+                   green6124)
+    # (6124-h2) GREEN - two watched paths + a new identifier, all listed.
+    h2 = edit_range("\n" + amend("#6162", [mod_rs, recv_rs, new_id]), touch=(mod_rs, recv_rs),
+                    ids=True, label="h2")
+    t.expect_green("6124-h2", "paths and identifier all listed", repo, exp6124, h2, green6124)
+    # (6124-h3) GREEN - VOID both ends works the same way.
+    fx.reset(base)
+    fx.banner("VOID", genesis)
+    void6124 = fx.commit([CERT_DOC], "base: banner VOID (#6124)")
+    fx.write(mod_rs, "// h3\n", append=True)
+    fx.banner("VOID", genesis, "\n" + amend("#6162", [mod_rs]))
+    h3 = fx.commit([mod_rs, CERT_DOC], "6124 cell h3")
+    t.expect_green("6124-h3", "VOID both ends + valid new amendment", repo, void6124, h3,
+                   green6124)
+
+    red6124 = [(sentence, "did not carry the required section 7 expiry sentence")]
+    # (6124-f1) RED - a changed watched file is missing from the list.
+    f1 = edit_range("\n" + amend("#6162", [mod_rs]), touch=(mod_rs, recv_rs), label="f1")
+    t.expect_red("6124-f1", "watched file missing from the amendment list", repo, exp6124, f1,
+                 red6124)
+    # (6124-f2) RED - the list names a path that did not change.
+    f2 = edit_range("\n" + amend("#6162", [mod_rs, recv_rs]), label="f2")
+    t.expect_red("6124-f2", "extra path listed", repo, exp6124, f2, red6124)
+    # (6124-f3) RED - substring / prose mention is not an exact list entry.
+    f3 = edit_range("\n" + amend("#6162", [mod_rs + ".bak"]), label="f3")
+    t.expect_red("6124-f3", "list entry that merely contains the path", repo, exp6124, f3, red6124)
+    f3b = edit_range("\n> **Amendment (2026-10-09, #6162 - section 7 record).**\n"
+                     f"> This touched {mod_rs} in passing.\n"
+                     "> Path back to LIVE: WP-B1 re-cert (#6063) only.\n", label="f3b")
+    t.expect_red("6124-f3b", "prose mention instead of a list entry", repo, exp6124, f3b, red6124)
+    # (6124-f4) RED - a pre-existing amendment is never reused.
+    fx.reset(exp6124)
+    fx.banner("EXPIRED", genesis, "\n" + amend("#6100", [mod_rs]))
+    pre = fx.commit([CERT_DOC], "base: pre-existing amendment (#6124)")
+    fx.write(mod_rs, "// f4\n", append=True)
+    fx.banner("EXPIRED", genesis, "\n" + amend("#6100", [mod_rs]) + "\nUnrelated prose edit.\n")
+    f4 = fx.commit([mod_rs, CERT_DOC], "6124 cell f4")
+    t.expect_red("6124-f4", "pre-existing amendment reused", repo, pre, f4, red6124)
+    # (6124-f5) RED - LIVE at both ends keeps rule B whatever the doc says.
+    fx.reset(base)
+    fx.write(mod_rs, "// f5\n", append=True)
+    fx.banner("LIVE", genesis, "\n" + amend("#6162", [mod_rs]))
+    f5 = fx.commit([mod_rs, CERT_DOC], "6124 cell f5")
+    t.expect_red("6124-f5", "LIVE at merge-base and judged commit + amendment", repo, base, f5,
+                 red6124)
+    # (6124-f6) RED - EXPIRED at the merge-base, LIVE (stale bind) at the judged commit.
+    fx.reset(exp6124)
+    fx.write(mod_rs, "// f6\n", append=True)
+    fx.banner("LIVE", genesis, "\n" + amend("#6162", [mod_rs]))
+    f6 = fx.commit([mod_rs, CERT_DOC], "6124 cell f6")
+    t.expect_red("6124-f6", "LIVE at the judged commit + amendment", repo, exp6124, f6, [])
+    # (6124-f7) RED - decoy: header and list inside a code fence.
+    f7 = edit_range("\n" + amend("#6162", [mod_rs], fence=True), label="f7")
+    t.expect_red("6124-f7", "list inside a code fence", repo, exp6124, f7, red6124)
+    f7b = edit_range("\n```\n" + amend("#6162", [mod_rs]) + "```\n", label="f7b")
+    t.expect_red("6124-f7b", "whole amendment inside a code fence", repo, exp6124, f7b, red6124)
+    # (6124-f8) RED - an identifier changed but is not listed.
+    f8 = edit_range("\n" + amend("#6162", [mod_rs]), ids=True, label="f8")
+    t.expect_red("6124-f8", "identifier changed but not listed", repo, exp6124, f8, red6124)
+    fx.reset(exp6124)
+    fx.write("src/config.rs", f'pub const N: &str = "{new_id}";\n', append=True)
+    fx.banner("EXPIRED", genesis, "\n" + amend("#6162", [new_id]))
+    f8b = fx.commit(["src/config.rs", CERT_DOC], "6124 cell f8b")
+    t.expect_green("6124-f8b", "identifier-only change listed exactly", repo, exp6124, f8b,
+                   green6124)
+    # (6124-f9) RED - the amendment sits above the STATUS line.
+    fx.reset(exp6124)
+    fx.write(mod_rs, "// f9\n", append=True)
+    fx.write(CERT_DOC,
+             "# Enterprise federation certification (fixture)\n\n"
+             f"**Binds to:** `{genesis}` (fixture bind)\n\n" + amend("#6162", [mod_rs]) + "\n"
+             "> ## STATUS — **EXPIRED as of 2026-01-01** (fixture)\n\nBody prose.\n")
+    f9 = fx.commit([mod_rs, CERT_DOC], "6124 cell f9")
+    t.expect_red("6124-f9", "amendment above STATUS", repo, exp6124, f9, red6124)
+    # (6124-f10) RED - no #6063 citation, or another issue cited as the way back.
+    f10 = edit_range("\n" + amend("#6162", [mod_rs], cite=False), label="f10")
+    t.expect_red("6124-f10", "amendment without the #6063 citation", repo, exp6124, f10, red6124)
+    f10b = edit_range("\n" + amend("#6162", [mod_rs]).replace("#6063", "#6064")
+                      .replace("issues/6063", "issues/6064"), label="f10b")
+    t.expect_red("6124-f10b", "amendment citing a different issue", repo, exp6124, f10b, red6124)
+    # (6124-f11) RED - list lines after the block ended do not count.
+    f11 = edit_range("\n" + amend("#6162", []) + "\n- `" + mod_rs + "`\n", label="f11")
+    t.expect_red("6124-f11", "list outside the amendment block", repo, exp6124, f11, red6124)
+    fx.reset(base)
+
     if t.failed:
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
         return 2
