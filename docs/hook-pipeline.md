@@ -59,7 +59,9 @@ Fields ([`HookConfig`](../src/hooks/config.rs)):
 - **`namespace`** — namespace pattern (`*`, exact, or `prefix/*`); chain is filtered before invocation.
   `*` matches every namespace (the field is required: [`validate_hook`](../src/hooks/config.rs) rejects an empty value); otherwise the
   pattern matches EXACTLY, or as a `prefix/*` glob covering the prefix itself
-  and any child under it. Validation is shape-only; the runtime matcher is
+  and any child under it. Any other wildcard form (a mid-path or suffix `*`,
+  `**`, a bare `/*`) is REJECTED at load (#4526: the matcher would compare it
+  as a literal and the hook would silently never fire); the runtime matcher is
   [`HookConfig::matches_namespace`](../src/hooks/config.rs). See
   §"Namespace scoping on pre-* events" below for how the in-flight namespace is
   resolved.

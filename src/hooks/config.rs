@@ -385,17 +385,39 @@ fn validate_hook(idx: usize, h: &HookConfig) -> Result<(), HooksConfigError> {
             reason: "must be a non-empty path".into(),
         });
     }
-    // Shape-only validation: any non-empty string is accepted here. The runtime
-    // matcher, `HookConfig::matches_namespace` (`*`, exact match, or `prefix/*`
-    // glob), decides at fire time whether a hook covers a namespace; load does
-    // not parse the pattern.
-    if h.namespace.trim().is_empty() {
+    let pattern = h.namespace.trim();
+    if pattern.is_empty() {
         return Err(HooksConfigError::Validation {
             field: format!("hook[{idx}].namespace"),
             reason: "must be a non-empty pattern (use \"*\" to match all)".into(),
         });
     }
+    // #4526 — the runtime matcher, `HookConfig::matches_namespace`, understands
+    // exactly three shapes: `*`, an exact namespace, and one trailing `prefix/*`.
+    // Any other wildcard form (a mid-path or suffix `*`, `**`, a bare `/*`)
+    // used to load cleanly and was then compared as a LITERAL, so a scoped
+    // guard hook silently never fired: a fail-open configuration outcome no
+    // log line revealed. Refuse it at load, so a boot load fails loudly and a
+    // SIGHUP reload keeps the previous config.
+    if !namespace_pattern_is_supported(pattern) {
+        return Err(HooksConfigError::Validation {
+            field: format!("hook[{idx}].namespace"),
+            reason: "unsupported wildcard; use '*', an exact namespace, or 'prefix/*'".into(),
+        });
+    }
     Ok(())
+}
+
+/// #4526 — the wildcard grammar `HookConfig::matches_namespace` implements:
+/// the whole pattern `*`, a pattern with no `*` at all, or a non-empty
+/// `*`-free prefix followed by exactly one trailing `/*`.
+fn namespace_pattern_is_supported(pattern: &str) -> bool {
+    if pattern == "*" || !pattern.contains('*') {
+        return true;
+    }
+    pattern
+        .strip_suffix("/*")
+        .is_some_and(|prefix| !prefix.is_empty() && !prefix.contains('*'))
 }
 
 /// Convert a byte offset into a 1-indexed (line, column) pair
