@@ -431,9 +431,6 @@ pub async fn subscribe(
 
     // Rewrite S33's `{agent_id, namespace}` body into the webhook shape.
     let mut url_was_synthesized = false;
-    // Suppress dead-code lint when sal feature is off (the variable is
-    // only consulted inside the postgres-dispatch branch below).
-    let _ = &url_was_synthesized;
     let (url, namespace_filter, agent_filter) = if let Some(u) = body.url {
         (u, body.namespace_filter, body.agent_filter)
     } else {
@@ -444,25 +441,16 @@ pub async fn subscribe(
             )
                 .into_response();
         };
-        // Synthetic loopback URL — round-trips the (agent_id, namespace)
-        // pair through the wire shape. It is NOT excluded from dispatch:
-        // the row is stored as an ordinary subscription with no marker,
-        // and `dispatch_event_postgres` matches and enqueues it like any
-        // other. Delivery to `https://localhost/...` is then refused by
-        // the dispatch-time SSRF guard and recorded as a failed delivery
-        // (DLQ reason `DNS_SSRF_REJECTED`), unless the operator enabled
-        // `allow_loopback_webhooks`, in which case a localhost POST is
-        // attempted. We mark it so the REGISTRATION-time SSRF guard can
-        // skip the loopback rejection — H11's allow_loopback_webhooks knob
-        // gates real callers, not internally-synthesized stubs.
-        // The assignment is unused under default features (the reader
-        // is `#[cfg(feature = "sal")]`-gated); allow the unused-assignment
-        // warning specifically.
-        #[allow(unused_assignments)]
-        {
-            url_was_synthesized = true;
-        }
-        let synthetic = format!("https://localhost/_ns/{caller}/{ns}");
+        // Synthetic URL — round-trips the (agent_id, namespace) pair through
+        // the wire shape. #4280: the prefix is RESERVED (refused for every
+        // caller-supplied URL by `subscriptions::validate_url`), so the
+        // dispatcher reads it as "namespace-only": each matching event gets
+        // its audit row (status `recorded`, read by
+        // `memory_subscription_replay`) and NO delivery attempt, so no DLQ
+        // row and no loopback request. Registration skips the URL validator
+        // for this one synthesized form only.
+        url_was_synthesized = true;
+        let synthetic = crate::subscriptions::namespace_only::url_for(&caller, &ns);
         (
             synthetic,
             Some(ns),
@@ -486,11 +474,10 @@ pub async fn subscribe(
     // peer originated the subscription.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // Skip registration-time SSRF validation for synthetic loopback
-        // stubs (see the note where they are built: they ARE matched by
-        // the dispatcher, and the dispatch-time guard refuses their
-        // delivery by default). Real caller-supplied URLs still go
-        // through the H11 SSRF guard here.
+        // Skip registration-time URL validation for the synthesized
+        // namespace-only URL only (see where it is built; #4280). Real
+        // caller-supplied URLs still go through the H11 SSRF guard here,
+        // which also refuses the reserved namespace-only prefix.
         if !url_was_synthesized && let Err(e) = crate::subscriptions::validate_url(&url) {
             return (
                 StatusCode::BAD_REQUEST,
@@ -610,19 +597,22 @@ pub async fn subscribe(
     // `caller` verbatim. An HTTP caller registered under "ai:bob" must be
     // able to subscribe as "ai:bob", not as "ai:ai:bob@host:pid-N".
     let sub_result: Result<serde_json::Value, String> = (|| {
-        crate::subscriptions::validate_url(&url).map_err(|e| e.to_string())?;
-        let id = crate::subscriptions::insert(
-            &lock.0,
-            &crate::subscriptions::NewSubscription {
-                url: &url,
-                events: &events,
-                secret: body.secret.as_deref(),
-                namespace_filter: namespace_filter.as_deref(),
-                agent_filter: agent_filter.as_deref(),
-                created_by: Some(&caller),
-                event_types: None,
-            },
-        )
+        let req = crate::subscriptions::NewSubscription {
+            url: &url,
+            events: &events,
+            secret: body.secret.as_deref(),
+            namespace_filter: namespace_filter.as_deref(),
+            agent_filter: agent_filter.as_deref(),
+            created_by: Some(&caller),
+            event_types: None,
+        };
+        // #4280 — the synthesized namespace-only URL is reserved, so it has
+        // its own insert; every caller-supplied URL is validated by `insert`.
+        let id = if url_was_synthesized {
+            crate::subscriptions::namespace_only::insert(&lock.0, &req)
+        } else {
+            crate::subscriptions::insert(&lock.0, &req)
+        }
         .map_err(|e| e.to_string())?;
         Ok(json!({
             "id": id,

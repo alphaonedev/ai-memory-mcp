@@ -8170,10 +8170,11 @@ async fn h8b_unsubscribe_nonexistent_id_returns_removed_false() {
 #[tokio::test]
 async fn h8b_unsubscribe_by_agent_and_namespace() {
     let state = test_state();
-    // Seed a subscription owned by alice for namespace "demo".
+    // Seed a subscription owned by alice for namespace "demo", the way the
+    // S33 synthesizer stores it (#4280: the prefix is reserved for it).
     {
         let lock = state.lock().await;
-        crate::subscriptions::insert(
+        crate::subscriptions::namespace_only::insert(
             &lock.0,
             &crate::subscriptions::NewSubscription {
                 url: "https://localhost/_ns/alice/demo",

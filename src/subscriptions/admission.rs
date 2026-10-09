@@ -155,6 +155,29 @@ impl<'c> Admission<'c> {
         false
     }
 
+    /// #4280 — a namespace-only row's event: its audit row, already settled
+    /// as never-sent. Nothing is spawned for it; a failed write is logged.
+    pub(super) fn record_namespace_only(
+        &self,
+        sub_id: &str,
+        correlation_id: &str,
+        event: &str,
+        body: &str,
+    ) {
+        let res = self.conn().and_then(|c| {
+            super::namespace_only::record_with_conn(c, sub_id, correlation_id, event, body)
+        });
+        if let Err(e) = res {
+            tracing::error!(
+                target: TRACE_TARGET,
+                subscription_id = %sub_id,
+                correlation_id = %correlation_id,
+                "namespace-only subscription event could not be recorded; replay will \
+                 not return it: {e}"
+            );
+        }
+    }
+
     /// Commit the batch. On `Err` every admission row of the batch is gone
     /// and the caller must refuse every delivery it admitted.
     pub(super) fn commit(self) -> Result<()> {

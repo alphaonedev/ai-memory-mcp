@@ -1602,6 +1602,16 @@ SHA-256 hash; dispatched events carry an
 subscription `id`. Equivalent MCP tool: `memory_subscribe`
 (`src/mcp/tools/subscribe.rs`).
 
+**Namespace-only shape** (`{ "agent_id": "…", "namespace": "…" }`, no
+`url`): the handler stores the subscription with the synthetic url
+`https://localhost/_ns/<agent_id>/<namespace>`. Each matching event writes
+its `subscription_events` audit row with `delivery_status = "recorded"`
+(terminal: recorded for `memory_subscription_replay`, never sent), and no
+delivery is attempted, so it leaves no `subscription_dlq` row and makes no
+loopback request (#4280). The `https://localhost/_ns/` prefix is reserved:
+a caller-supplied `url` that starts with it, in any letter case, is
+refused on every registration surface.
+
 ### `DELETE /api/v1/subscriptions?id=<id>` — unregister webhook
 
 Returns `{"deleted": true}`. Equivalent MCP tool: `memory_unsubscribe`
