@@ -2855,6 +2855,75 @@ mod tests {
         );
     }
 
+    /// #4426 — on the real `check_agent_action` funnel: an IPv4 `refuse` rule
+    /// reaches the NAT64 (`64:ff9b::/96`) spelling of the same destination
+    /// (dotted and hex tail), the reverse (a NAT64 rule, an IPv4 request)
+    /// holds, and a different embedded address is still allowed.
+    #[test]
+    fn network_request_nat64_matches_the_ipv4_rule_4426() {
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "R-v4-4426",
+            "network_request",
+            r#"{"host":"203.0.113.9"}"#,
+            "refuse",
+            true,
+        );
+        let check = |host: &str| {
+            check_agent_action(
+                &conn,
+                "agent:t",
+                &AgentAction::NetworkRequest {
+                    host: host.into(),
+                    scheme: "https".into(),
+                },
+            )
+            .unwrap()
+        };
+        for spelled in [
+            "[64:ff9b::203.0.113.9]",
+            "[64:ff9b::cb00:7109]",
+            "64:ff9b::cb00:7109",
+            "[::ffff:0:203.0.113.9]",
+            "203.0.113.9",
+        ] {
+            assert!(
+                check(spelled).is_refusal(),
+                "the IPv4 rule must refuse {spelled}"
+            );
+        }
+        // A different embedded address is a different host.
+        assert_eq!(check("[64:ff9b::203.0.113.10]"), Decision::Allow);
+        assert_eq!(check("203.0.113.10"), Decision::Allow);
+
+        // The reverse: a NAT64-spelled rule refuses the IPv4 request.
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "R-nat64-4426",
+            "network_request",
+            r#"{"host":"[64:ff9b::203.0.113.9]"}"#,
+            "refuse",
+            true,
+        );
+        let action = AgentAction::NetworkRequest {
+            host: "203.0.113.9".into(),
+            scheme: "https".into(),
+        };
+        assert!(check_agent_action(&conn, "agent:t", &action).unwrap().is_refusal());
+        let other = AgentAction::NetworkRequest {
+            host: "203.0.113.10".into(),
+            scheme: "https".into(),
+        };
+        assert_eq!(
+            check_agent_action(&conn, "agent:t", &other).unwrap(),
+            Decision::Allow
+        );
+    }
+
     #[test]
     fn custom_action_matches_on_kind() {
         let _forensic = forensic_lock();

@@ -589,6 +589,40 @@ mod tests {
         assert!(canonicalize_host("a:b:c").is_err());
     }
 
+    /// #4426 — IPv6 forms that carry an embedded IPv4 DESTINATION canonicalise
+    /// to the dotted quad (NAT64 well-known prefix `64:ff9b::/96`, RFC 6052;
+    /// the IPv4-translated `::ffff:0:a.b.c.d`, RFC 2765), on both sides, so
+    /// an IPv4 rule reaches them. Forms whose embedded IPv4 is NOT the
+    /// destination (6to4 `2002::/16`), whose layout is operator-chosen
+    /// (local-use NAT64 `64:ff9b:1::/48`, RFC 8215), or which collide with
+    /// `::`/`::1` (the deprecated IPv4-compatible `::a.b.c.d`) stay distinct
+    /// IPv6 hosts.
+    #[test]
+    fn ipv4_embedding_ipv6_forms_4426() {
+        // Unified on the embedded IPv4.
+        assert_eq!(h("[64:ff9b::203.0.113.9]"), "203.0.113.9");
+        assert_eq!(h("[64:ff9b::cb00:7109]"), "203.0.113.9");
+        assert_eq!(h("64:ff9b::cb00:7109"), "203.0.113.9");
+        assert_eq!(h("[64:FF9B::CB00:7109]"), "203.0.113.9");
+        assert_eq!(h("[::ffff:0:203.0.113.9]"), "203.0.113.9");
+        assert_eq!(h("[::ffff:0:cb00:7109]"), "203.0.113.9");
+        assert_eq!(
+            canonicalize_host_pattern("[64:ff9b::203.0.113.9]")
+                .unwrap()
+                .host(),
+            "203.0.113.9"
+        );
+        assert_eq!(canonicalize_host("[64:ff9b::203.0.113.9]:8443").unwrap().port(), Some(8443));
+        // Distinct hosts, by decision.
+        let v6 = |s: &str| format!("[{}]", s.parse::<Ipv6Addr>().unwrap());
+        assert_eq!(h("[::203.0.113.9]"), v6("::203.0.113.9"));
+        assert_eq!(h("[2002:cb00:7109::1]"), v6("2002:cb00:7109::1"));
+        assert_eq!(h("[64:ff9b:1::cb00:7109]"), v6("64:ff9b:1::cb00:7109"));
+        assert_eq!(h("[64:ff9b:0:1::cb00:7109]"), v6("64:ff9b:0:1::cb00:7109"));
+        assert_eq!(h("[::1]"), "[::1]");
+        assert_eq!(h("[::]"), "[::]");
+    }
+
     #[test]
     fn ports_parsed_and_matched() {
         let c = canonicalize_host("Evil.com.:0443").unwrap();
