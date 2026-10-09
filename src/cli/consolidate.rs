@@ -656,6 +656,117 @@ mod tests {
         assert!(env.stdout_str().contains("consolidated 2 memories"));
     }
 
+    /// #4277 — `auto-consolidate` built the merged content from a raw
+    /// 200-byte slice of each source. A multi-byte character spanning byte
+    /// 200 panicked the verb; otherwise every byte past 200 was dropped
+    /// from the merged row before the sources were consumed (hard-deleted
+    /// under the legacy disposition), so the tail was lost for good.
+    #[test]
+    fn test_auto_consolidate_4277_preserves_full_multibyte_source_text() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // 199 ASCII bytes, then a 2-byte char occupying bytes 199..201, so
+        // byte 200 is NOT a char boundary; then a distinctive tail.
+        let long_body = format!("{}é tail-past-byte-200 ünïcödé", "a".repeat(199));
+        assert!(!long_body.is_char_boundary(200));
+        let mut sources = vec![long_body];
+        for i in 0..2 {
+            sources.push(format!("short-body-{i}"));
+        }
+        for (i, body) in sources.iter().enumerate() {
+            seed_memory(&db, "auto-4277", &format!("src-{i}"), body);
+        }
+        let args = AutoConsolidateArgs {
+            namespace: Some("auto-4277".to_string()),
+            short_only: false,
+            min_count: 3,
+            dry_run: false,
+        };
+        {
+            let mut out = env.output();
+            run_auto(&db, &args, false, Some("test-agent"), &mut out)
+                .expect("auto-consolidate must not fail on a multi-byte source");
+        }
+        assert!(
+            env.stdout_str().contains("auto-consolidated 3 memories"),
+            "got: {}",
+            env.stdout_str()
+        );
+        let conn = db::open(&db).expect("db::open");
+        let rows = db::list(
+            &conn,
+            Some("auto-4277"),
+            None,
+            50,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("db::list");
+        let merged = rows
+            .iter()
+            .find(|m| m.title.starts_with("Consolidated:"))
+            .expect("merged row present");
+        for body in &sources {
+            assert!(
+                merged.content.contains(body.as_str()),
+                "source text not recoverable from the merged row: {body:?}"
+            );
+        }
+    }
+
+    /// #4277 — the non-panicking half: an ASCII source longer than 200 bytes
+    /// had its tail dropped from the merged row before the source was
+    /// consumed.
+    #[test]
+    fn test_auto_consolidate_4277_does_not_truncate_long_ascii_source() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let long_body = format!("{}-TAIL-PAST-BYTE-200", "b".repeat(300));
+        let sources = [long_body, "short-x".to_string(), "short-y".to_string()];
+        for (i, body) in sources.iter().enumerate() {
+            seed_memory(&db, "auto-4277-ascii", &format!("src-{i}"), body);
+        }
+        let args = AutoConsolidateArgs {
+            namespace: Some("auto-4277-ascii".to_string()),
+            short_only: false,
+            min_count: 3,
+            dry_run: false,
+        };
+        {
+            let mut out = env.output();
+            run_auto(&db, &args, false, Some("test-agent"), &mut out).expect("auto-consolidate");
+        }
+        let conn = db::open(&db).expect("db::open");
+        let rows = db::list(
+            &conn,
+            Some("auto-4277-ascii"),
+            None,
+            50,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("db::list");
+        let merged = rows
+            .iter()
+            .find(|m| m.title.starts_with("Consolidated:"))
+            .expect("merged row present");
+        assert!(
+            merged.content.contains("-TAIL-PAST-BYTE-200"),
+            "the tail of a >200-byte source was lost: {:?}",
+            merged.content
+        );
+    }
+
     #[test]
     fn test_auto_consolidate_multi_tag_membership_dedupes() {
         // A memory tagged with both `alpha` and `beta` appears in both
