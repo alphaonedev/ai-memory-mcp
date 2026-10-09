@@ -1260,7 +1260,8 @@ def checkout_depth_cells():
     return (shim_isolation_violation, shim_interpreter_violation,
             shim_boundary_robustness_violation, deep_scratch_violation,
             path_max_restore_diagnostic_violation, deep_scratch_cap_violation,
-            scratch_limit_message_violation, deep_scratch_relative_violation)
+            scratch_limit_message_violation, deep_scratch_relative_violation,
+            shim_unexecutable_violation)
 
 
 # Cells whose scratch path or shim interpreter line grows with the scratch depth; each
@@ -1285,8 +1286,10 @@ def checkout_depth_violation(tmp):
     SCRATCH_PATH_LIMIT (226) bytes long, the scratch a 184-byte checkout gets, else a
     description (#6145 R8-F1, R9-F2). No cell may need more depth than shim-interpreter
     itself, so a cell that nests the self-test (or any of its cells) deeper than its
-    own scratch dir fails here. path_max_restore_violation builds no path and is not
-    re-run, so the fallback check runs once per self-test (R9-F1); the gate-run
+    own scratch dir fails here (checkout_depth_cells lists them; the checkout-depth-coverage
+    cell pins shim_unexecutable_violation in it). path_max_restore_violation builds no
+    path and is not in the list; the diagnostic still runs it, but only with planted
+    fallbacks, so the real fallback check runs once per self-test (R9-F1); the gate-run
     fixtures build one `gitshim.*` level under the scratch dir and fit within it. The
     dir is a sibling of tmp (tmp itself is 226 bytes at a 184-byte checkout) and is
     removed afterwards."""
@@ -1406,6 +1409,17 @@ def run_cells(t, cells):
     return None
 
 
+def shim_unexecutable_violation(tmp):
+    """None when a shim whose interpreter does not exist is reported as 'the shim could
+    not be executed', else a description (#6145 R10-F1). The interpreter line is 251
+    bytes at a 226-byte scratch dir, so checkout-depth runs this cell too."""
+    unexec = guarded(shim_isolation_violation, tmp, interpreter=tmp / "no-such-python-6145")
+    if unexec is None or not unexec.startswith("the shim could not be executed"):
+        return (f"an unexecutable shim gave {unexec!r}, "
+                "not a 'the shim could not be executed' violation")
+    return None
+
+
 def shim_isolation_result(tmp, check=shim_isolation_violation):
     """The shim-isolation verdict for _self_test: None when `check(tmp)` passes, else a
     description. A GateError is the description itself; any other crash becomes the
@@ -1414,6 +1428,8 @@ def shim_isolation_result(tmp, check=shim_isolation_violation):
         return check(tmp)
     except GateError as exc:
         return str(exc)
+    except Exception as exc:  # noqa: BLE001 - report any crash as a named failure
+        return f"shim_isolation_violation raised {type(exc).__name__}: {exc}"
 
 
 def shim_isolation_crash_violation():
@@ -1465,12 +1481,9 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                        ("checkout-depth", checkout_depth_violation, (tmp,))))
     if rc is not None:
         return rc
-    unexec = guarded(shim_isolation_violation, tmp, interpreter=tmp / "no-such-python-6145")
-    if unexec is None or not unexec.startswith("the shim could not be executed"):
-        t.fail(f"(shim-unexecutable, #6145): an unexecutable shim gave {unexec!r}, "
-               "not a 'the shim could not be executed' violation")
-        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
-        return 2
+    rc = run_cells(t, (("shim-unexecutable", shim_unexecutable_violation, (tmp,)),))
+    if rc is not None:
+        return rc
     fx = Fixture(repo)
     fx.g("init", "-q", "-b", "main")
     fx.g("config", "user.name", "Cert Expiry Selftest")
@@ -2063,8 +2076,10 @@ SELF_TEST_OK = (
     "restored and the fallback check runs once, first; (path-max-diagnostic, #6145) a dropped restore "
     "names the real host platform and is put back, and a failing (not leaking) fallback check is "
     "reported as path-max-fallback, running only that cell in the same scratch dir; "
-    "(checkout-depth, #6145) every #6145 shim and scratch cell passes in a 226-byte scratch dir, the "
-    "one a 184-byte checkout gets; the gate-run fixtures build one gitshim.* level under the scratch "
+    "(shim-isolation-crash, #6145) a crash in the isolation cell is a named failure; "
+    "(checkout-depth-coverage, #6145) checkout-depth runs the shim-unexecutable cell; "
+    "(checkout-depth, #6145) every #6145 shim and scratch cell (including shim-unexecutable) passes in a "
+    "226-byte scratch dir, the one a 184-byte checkout gets; the gate-run fixtures build one gitshim.* level under the scratch "
     "dir and fit within it."
 )
 
