@@ -254,9 +254,12 @@ export interface WakeMeta {
    */
   digestHex: string;
   /**
-   * The producer's host-wide wake counter when the hint was minted. Read it as
-   * "wakes happened that you did not see"; the correct response to a gap is
-   * ONE catch-up read.
+   * This RECIPIENT's own wake number when the hint was minted (#4125): it
+   * moves only when a wake is published to this recipient, so a gap counts
+   * wakes YOU did not see and never another tenant's notify volume (#4118).
+   * The correct response to a gap is ONE catch-up read. Across a producer
+   * restart the number rebases forward, so a difference is a count only
+   * between two values with no rebase in between.
    */
   seqHighWatermark: number;
 }
