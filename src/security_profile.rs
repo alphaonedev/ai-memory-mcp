@@ -792,6 +792,72 @@ pub fn runtime_boot_report() -> Result<(SecurityPosture, Vec<PinReport>)> {
 mod tests {
     use super::*;
 
+    /// #3620 — `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS` guards two secret
+    /// files: the DB passphrase file (`daemon_runtime::passphrase_from_file`)
+    /// and the `[llm]`/`[embeddings]` `api_key_file`
+    /// (`config::enforce_api_key_file_perms`). They used to read it with two
+    /// grammars (`1|true` vs `1|true|yes|on`), so `=yes` opened the hatch for
+    /// one file and not the other. Pin: for every token, both gates open or
+    /// stay shut TOGETHER, and the token set is exactly the house grammar.
+    #[cfg(unix)]
+    #[test]
+    fn passphrase_lax_perms_hatch_has_one_grammar_for_both_files_3620() {
+        use std::os::unix::fs::PermissionsExt as _;
+        const HATCH: &str = "AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS";
+        let _env = crate::config::test_env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lax-3620.secret");
+        std::fs::write(&path, "pw-placeholder-3620\n").expect("write secret");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 0644");
+        let prior = std::env::var_os(HATCH);
+        let tokens: &[(Option<&str>, bool)] = &[
+            (None, false),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("TRUE"), true),
+            (Some("yes"), true),
+            (Some("on"), true),
+            (Some(" 1"), true),
+            (Some("YES\n"), true),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("no"), false),
+            (Some("off"), false),
+            (Some(""), false),
+            (Some("2"), false),
+            (Some("enable"), false),
+        ];
+        for &(token, open) in tokens {
+            // SAFETY: serialised by `config::test_env_lock`.
+            match token {
+                Some(v) => unsafe { std::env::set_var(HATCH, v) },
+                None => unsafe { std::env::remove_var(HATCH) },
+            }
+            let passphrase = crate::daemon_runtime::passphrase_from_file(&path).is_ok();
+            let file = std::fs::File::open(&path).expect("open secret");
+            let api_key =
+                crate::config::enforce_api_key_file_perms(&file, &path, "[llm].api_key_file")
+                    .is_ok();
+            assert_eq!(
+                passphrase, api_key,
+                "#3620: {HATCH}={token:?} opened the passphrase-file hatch={passphrase} but \
+                 the api_key_file hatch={api_key}: one knob, two grammars"
+            );
+            assert_eq!(
+                passphrase,
+                open,
+                "#3620: {HATCH}={token:?} must {} the lax-permissions hatch",
+                if open { "open" } else { "keep shut" }
+            );
+        }
+        // SAFETY: serialised by `config::test_env_lock`.
+        match prior {
+            Some(v) => unsafe { std::env::set_var(HATCH, v) },
+            None => unsafe { std::env::remove_var(HATCH) },
+        }
+    }
+
     #[test]
     fn is_truthy_and_is_falsy_are_the_one_house_grammar_3200() {
         // #3200 — the ONE house truthy/falsy grammar: `1`/`true`/`yes`/`on`

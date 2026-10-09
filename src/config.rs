@@ -8167,7 +8167,7 @@ fn resolve_api_key_ladder(
 /// Takes the ALREADY-OPEN handle (not the path) so the gate is an `fstat` on
 /// the same descriptor the key bytes are read from — #1790 finding 2, no
 /// stat-then-reopen window. `path` is used for error text only.
-fn enforce_api_key_file_perms(
+pub(crate) fn enforce_api_key_file_perms(
     file: &std::fs::File,
     path: &Path,
     field: &str,
