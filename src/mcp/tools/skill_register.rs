@@ -995,6 +995,33 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// #6148: the retired-lineage refusal text is spelled ONCE in production
+    /// code across the skill register / promote modules, inside the named
+    /// `retired_lineage_refusal` helper every site renders through (the
+    /// pm-v3.1 hardcoded-literal class).
+    #[test]
+    fn issue_6148_retired_lineage_refusal_text_has_one_named_home() {
+        fn production(src: &str) -> &str {
+            src.split("\n#[cfg(test)]").next().unwrap_or(src)
+        }
+        let needle = concat!("is retired; ", "unretire before re-registering");
+        let register = production(include_str!("skill_register.rs"));
+        let promote = production(include_str!("skill_promote.rs"));
+        let copies = register.matches(needle).count() + promote.matches(needle).count();
+        assert_eq!(copies, 1, "#6148: the refusal text must have one home");
+        let at = register
+            .find(needle)
+            .expect("refusal text in skill_register.rs");
+        let helper = register
+            .find("fn retired_lineage_refusal(")
+            .expect("#6148: the refusal text lives in a named helper");
+        let helper_end = helper + register[helper..].find("\n}").expect("helper body ends");
+        assert!(
+            (helper..helper_end).contains(&at),
+            "#6148: the one copy of the refusal text is inside retired_lineage_refusal"
+        );
+    }
+
     fn open_db() -> (rusqlite::Connection, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.db");
