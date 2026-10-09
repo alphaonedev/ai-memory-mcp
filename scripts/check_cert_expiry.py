@@ -2025,7 +2025,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             if hex_msg in out:
                 t.fail(f"(pr4-sha-case): a push upper-case {n}-hex {key} was refused by the sha "
                        "validator:", out)
-    # 63 / 65 hex are refused by the validator before any repository-touching git
+    # Every `sha_len_values` entry is refused by the validator before any repository-touching git
     # call. The only git call that legitimately precedes validation is the
     # `git --version` probe in run_gate (require_git_version). The shim appends
     # every invocation's argv to a trace file, and the cell asserts the trace
@@ -2039,12 +2039,23 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
          for k in ("PR_HEAD_SHA", "GITHUB_SHA", "PR_BASE_SHA")]
         + [("push", k, push_sha_env) for k in ("GITHUB_EVENT_BEFORE", "GITHUB_SHA")]
     )
-    # The third value is a 40-character run of ASCII-lookalike Unicode decimal digits (Arabic-Indic one):
-    # loosening any of the five validation sites to accept any Unicode digit lets it through.
+    # Each non-length value is the only cell that catches its own loosening of a validation site:
+    #   Arabic-Indic digit  : a `\d` / `str.isdigit` / any-Unicode-digit class.
+    #   fullwidth digit     : a class widened with the fullwidth digit range U+FF10-U+FF19.
+    #   40-hex plus newline : a `$`-anchored match, or a `.strip()` before the match.
+    #   40-hex plus CR      : a `.rstrip('\r')` before the match.
+    #   space plus 40-hex   : a `.strip(' ')` or `.lstrip()` before the match.
+    #   superscript digit   : a translate of superscript digits to ASCII before the match.
+    #   40 non-hex letter   : a `len in (40, 64)` plus `isascii() and isalnum()` check instead of hex.
+    # (#6414, #6404)
     sha_len_values = (("63-hex", "b" * 63), ("65-hex", "b" * 65),
                       ("40 Arabic-Indic digit", "\u0661" * 40),
                       ("40 fullwidth digit", "\uff11" * 40),
-                      ("40-hex plus newline", "b" * 40 + "\n"))
+                      ("40-hex plus newline", "b" * 40 + "\n"),
+                      ("40-hex plus CR", "b" * 40 + "\r"),
+                      ("space plus 40-hex", " " + "b" * 40),
+                      ("40 superscript digit", "\u00b9" * 40),
+                      ("40 non-hex ASCII letter", "g" * 40))
     for label, sha_val in sha_len_values:
         for lane, key, lane_env in sha_len_cells:
             trace = Path(tmp) / f"git-trace-{lane}-{key}-{len(sha_val)}-{ord(sha_val[0])}.jsonl"
@@ -2210,7 +2221,7 @@ SELF_TEST_OK = (
     "the gate-run fixtures build one gitshim.* level under the scratch dir and fit within it; "
     "(pr4-sha256, #6144) a 64-hex PR_HEAD_SHA / GITHUB_SHA (pull_request) and GITHUB_EVENT_BEFORE / GITHUB_SHA (push) pass the validator and fail cleanly at the later lookup; "
     "(pr4-sha-case, #6144) upper-case 40/64-hex shas pass the validator on every validated key; "
-    "(pr4-sha-len) 63/65-hex, 40 non-ASCII-digit (Arabic-Indic, fullwidth) and newline-suffixed 40-hex values refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; "
+    "(pr4-sha-len) 63/65-hex, 40 non-ASCII-digit (Arabic-Indic, fullwidth, superscript), 40 non-hex ASCII, newline- or CR-suffixed and space-prefixed 40-hex values refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; "
     "GITHUB_EVENT_BEFORE and GITHUB_SHA on push) with only the `git --version` probe traced before the validator."
 )
 
