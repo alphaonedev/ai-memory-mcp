@@ -34,6 +34,11 @@ sudo systemd-sysusers packaging/systemd/ai-memory.sysusers.conf
 # sudo useradd --system --home /run/ai-memory-hub --shell /usr/sbin/nologin ai-memory-hub
 sudo install -d -o ai-memory -g ai-memory -m 0750 /var/lib/ai-memory
 sudo install -d -o ai-memory -g ai-memory -m 0750 /var/lib/ai-memory/backups
+# Key store parent (#6230): create it as the service user BEFORE enabling the
+# backup timer. The backup unit mounts it read-only (`ReadOnlyPaths=-...`, the
+# `-` skips a missing path), so a hand-created root-owned `.config` would lock
+# the daemon out of its own signing key and local CA.
+sudo install -d -o ai-memory -g ai-memory -m 0700 /var/lib/ai-memory/.config
 
 # 2. Units into /etc/systemd/system. The .deb and .rpm packages ship no units.
 sudo install -m 0644 packaging/systemd/*.service /etc/systemd/system/
