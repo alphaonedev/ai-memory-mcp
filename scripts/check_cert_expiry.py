@@ -840,7 +840,9 @@ def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
 
 def shim_interpreter_violation(tmp):
     """None when write_git_shim refuses every unsafe interpreter path and accepts
-    the longest safe one (#6145 S-F1), else a description."""
+    the longest safe one (#6145 S-F1), else a description. The boundary is sized to
+    the LITERAL 255/256 byte lines the kernel allows/truncates, never to SHEBANG_MAX,
+    so changing that constant to 256 fails here (#6145 R3-F1)."""
     fixed = len("#!") + len(" -I")
     deep = Path(tempfile.mkdtemp(prefix="gitshim-long.", dir=str(tmp)))
     try:
@@ -849,17 +851,22 @@ def shim_interpreter_violation(tmp):
         too_long = long_dir / ("p" * 60)
         too_long.symlink_to(sys.executable)
         spaced = deep / "with space" / "python3"
-        pad = SHEBANG_MAX - fixed - len(os.fsencode(str(deep))) - 1
+        pad = 255 - fixed - len(os.fsencode(str(deep))) - 1
         if pad < 1:
             return f"the scratch path is too deep to build the boundary cases (pad {pad})"
         longest_ok = deep / ("q" * pad)
         one_over = deep / ("q" * (pad + 1))
+        for want, interp in ((255, longest_ok), (256, one_over)):
+            got = len(os.fsencode(f"#!{interp} -I"))
+            if got != want:
+                return f"the {want}-byte boundary case is {got} bytes"
         non_utf8 = deep / "py\udcff"
         cases = [("an over-long interpreter path", too_long, True),
                  ("an interpreter path with whitespace", spaced, True),
                  ("the longest in-limit interpreter path", longest_ok, False),
                  ("a 256-byte interpreter line", one_over, True),
-                 ("a non-UTF-8 (surrogate-escaped) interpreter path", non_utf8, True)]
+                 ("a non-UTF-8 (surrogate-escaped) interpreter path", non_utf8, True),
+                 ("an interpreter path with a NUL byte", deep / "py\x00x", True)]
         for label, interp, must_raise in cases:
             try:
                 write_git_shim(deep, "git", interpreter=interp)
@@ -874,6 +881,45 @@ def shim_interpreter_violation(tmp):
         return None
     finally:
         shutil.rmtree(deep, ignore_errors=True)
+
+
+def deep_scratch(tmp, target_len):
+    """A scratch directory whose absolute path is about target_len bytes, built
+    with dir_fd so no single syscall sees a path over PATH_MAX (#6145 R3-F2)."""
+    base = Path(tempfile.mkdtemp(prefix="gitshim-deep.", dir=str(tmp)))
+    cur = base
+    fds = [os.open(str(base), os.O_RDONLY)]
+    try:
+        while len(os.fsencode(str(cur))) + 201 < target_len:
+            os.mkdir("d" * 200, dir_fd=fds[-1])
+            fds.append(os.open("d" * 200, os.O_RDONLY, dir_fd=fds[-1]))
+            cur = cur / ("d" * 200)
+    finally:
+        for fd in fds:
+            os.close(fd)
+    return base, cur
+
+
+def shim_boundary_robustness_violation(tmp):
+    """None when shim_interpreter_violation reports (never raises) on a scratch dir
+    that is missing or sits at PATH_MAX (#6145 R3-F2), else a description."""
+    missing = shim_interpreter_violation(tmp / "no-such-scratch-6145")
+    if missing is None or not missing.startswith("could not build the boundary cases"):
+        return f"a missing scratch dir gave {missing!r}, not a 'could not build' violation"
+    base, near_max = deep_scratch(tmp, 3900)
+    try:
+        try:
+            deep = shim_interpreter_violation(near_max)
+        except OSError as exc:
+            return f"a near-PATH_MAX scratch dir raised {type(exc).__name__}: {exc}"
+        if deep is None or not deep.startswith("the scratch path is too deep"):
+            return f"a near-PATH_MAX scratch dir gave {deep!r}, not a 'too deep' violation"
+        left = [p.name for p in near_max.iterdir()] if near_max.is_dir() else []
+        if left:
+            return f"a near-PATH_MAX scratch dir was left with {left!r}"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    return None
 
 
 def shim_isolation_violation(tmp):
@@ -962,6 +1008,17 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     iface = shim_interpreter_violation(tmp)
     if iface is not None:
         t.fail(f"(shim-interpreter, #6145): {iface}")
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
+    robust = shim_boundary_robustness_violation(tmp)
+    if robust is not None:
+        t.fail(f"(shim-interpreter-robust, #6145): {robust}")
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
+    unexec = shim_isolation_violation(tmp, interpreter=tmp / "no-such-python-6145")
+    if unexec is None or not unexec.startswith("the shim could not be executed"):
+        t.fail(f"(shim-unexecutable, #6145): an unexecutable shim gave {unexec!r}, "
+               "not a 'the shim could not be executed' violation")
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
         return 2
     fx = Fixture(repo)
