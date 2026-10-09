@@ -599,7 +599,7 @@ jobs:
             echo "before=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          CARRIER_RELEASE_REF="$(python3 scripts/check_promotion_geometry.py --print-release)"
+          CARRIER_RELEASE_REF="$(python3 -I scripts/check_promotion_geometry.py --print-release)"
           git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF" || {
             echo "::error::carrier push: cannot fetch origin/$CARRIER_RELEASE_REF; refusing to judge the carrier over an unknown range"
             exit 1
@@ -892,7 +892,7 @@ jobs:
       - name: Promotion ancestry soundness (#3872, #6117 carrier push)
         run: |
           set -euo pipefail
-          release="$(python3 scripts/check_promotion_geometry.py --print-release)"
+          release="$(python3 -I scripts/check_promotion_geometry.py --print-release)"
           git fetch --no-tags origin "+refs/heads/$release:refs/remotes/origin/$release" || {
             echo "::error::cannot fetch origin/$release; the #3872 geometry cannot be proven, refusing"
             exit 1
@@ -1211,7 +1211,7 @@ jobs:
             echo "before=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          CARRIER_RELEASE_REF="$(python3 scripts/check_promotion_geometry.py --print-release)"
+          CARRIER_RELEASE_REF="$(python3 -I scripts/check_promotion_geometry.py --print-release)"
           git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF" || {
             echo "::error::carrier push: cannot fetch origin/$CARRIER_RELEASE_REF; refusing to judge the carrier over an unknown range"
             exit 1
@@ -1367,12 +1367,12 @@ jobs:
         with:
           persist-credentials: false
       - name: Self-test the external-PR approval evaluator (#6193)
-        run: python3 scripts/check_external_pr_approval.py --self-test
+        run: python3 -I scripts/check_external_pr_approval.py --self-test
       - name: Evaluate external-PR approval requirement
         env:
           GH_TOKEN: ${{ github.token }}
           OPERATOR_LOGIN: alphaonedev
-        run: python3 scripts/check_external_pr_approval.py
+        run: python3 -I scripts/check_external_pr_approval.py
 
   # ---------------------------------------------------------------------------
   # #3967 — three gates that existed and ran NOWHERE. Rule (g) of
@@ -1431,7 +1431,7 @@ jobs:
             echo "before=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          CARRIER_RELEASE_REF="$(python3 scripts/check_promotion_geometry.py --print-release)"
+          CARRIER_RELEASE_REF="$(python3 -I scripts/check_promotion_geometry.py --print-release)"
           git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF" || {
             echo "::error::carrier push: cannot fetch origin/$CARRIER_RELEASE_REF; refusing to judge the carrier over an unknown range"
             exit 1
@@ -1497,7 +1497,7 @@ jobs:
             echo "before=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          CARRIER_RELEASE_REF="$(python3 scripts/check_promotion_geometry.py --print-release)"
+          CARRIER_RELEASE_REF="$(python3 -I scripts/check_promotion_geometry.py --print-release)"
           git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF" || {
             echo "::error::carrier push: cannot fetch origin/$CARRIER_RELEASE_REF; refusing to judge the carrier over an unknown range"
             exit 1
