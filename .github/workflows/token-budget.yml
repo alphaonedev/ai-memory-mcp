@@ -58,7 +58,7 @@ on:
   # together), #2523 and #2508 (push must not overlap a PR head such as
   # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: [main, develop, "release/**", "rehearsal/**"]
+    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]
 
 # #3591 — explicit GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
 # Checkout + cargo/scripts only; no PR comments, SARIF, or checks writes.

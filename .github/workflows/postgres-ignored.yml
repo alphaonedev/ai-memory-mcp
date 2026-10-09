@@ -27,7 +27,7 @@ on:
   # together), #2523 and #2508 (push must not overlap a PR head such as
   # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: ["release/**", "rehearsal/**"]
+    branches: ["release/**", "rehearsal/**", "chain/**"]
   push:
     branches: ["release/**"]
   workflow_dispatch:
