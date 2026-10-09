@@ -35,7 +35,7 @@ use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use hf_hub::{Repo, RepoType, api::sync::Api};
+use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use tokenizers::Tokenizer;
 
 use crate::models::Memory;
@@ -1058,8 +1058,10 @@ impl CrossEncoder {
 
     /// #2086 (unlock condition (i) named by #1867/#1969) — resolve the
     /// cross-encoder's config/tokenizer/weights, honoring the substrate-wide
-    /// offline guard ([`crate::embeddings::Embedder::remote_fetch_disabled`],
-    /// `AI_MEMORY_EMBED_OFFLINE`/`HF_HUB_OFFLINE`).
+    /// offline guard ([`crate::embeddings::Embedder::remote_fetch_disabled_reason`]:
+    /// `AI_MEMORY_EMBED_OFFLINE`/`HF_HUB_OFFLINE`, or — #4123 — a restricted
+    /// `AI_MEMORY_INFERENCE_EGRESS` posture, which refuses the Hub fetch and
+    /// runs the cross-encoder cache-only).
     ///
     /// **Offline mode:** resolve from the hf-hub repo cache dir via a plain
     /// filesystem existence check — no hf-hub API, no network — mirroring
@@ -1072,14 +1074,37 @@ impl CrossEncoder {
     /// silent network attempt); `new_neural` then surfaces
     /// `reranker_used = "degraded_lexical"`.
     ///
-    /// **Online mode:** unconditional hf-hub network fetch, byte-identical
-    /// to the pre-#2086 behavior.
+    /// **Online mode:** hf-hub network fetch with the cache rooted where the
+    /// offline resolver reads (#4123; `HF_ENDPOINT` honoured for a mirror);
+    /// otherwise byte-identical to the pre-#2086 behavior.
     fn resolve_cross_encoder_files()
     -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
-        if crate::embeddings::Embedder::remote_fetch_disabled() {
-            return Self::load_cross_encoder_from_fallback();
+        if let Some(reason) = crate::embeddings::Embedder::remote_fetch_disabled_reason() {
+            return Self::load_cross_encoder_from_fallback().map_err(|e| {
+                tracing::warn!(
+                    reason = %reason,
+                    "cross-encoder weights are not pre-staged and the Hugging Face Hub fetch \
+                     is disabled — neural reranking degrades to lexical. Pre-stage \
+                     {CROSS_ENCODER_MODEL_ID} under ~/.cache/huggingface/hub for this \
+                     posture, or run once under AI_MEMORY_INFERENCE_EGRESS=allow on a \
+                     connected host"
+                );
+                e
+            });
         }
-        let api = Api::new().context("failed to init HuggingFace Hub API")?;
+        // #4123 — the ONLINE cache is rooted where the OFFLINE resolver reads
+        // (`load_cross_encoder_from_fallback`: `$HOME/.cache/huggingface/hub`),
+        // so a cache this fetch populates is the one a later offline run
+        // resolves; `HF_ENDPOINT` names a mirror / recorder. (`from_env` would
+        // root the cache at `HF_HOME`, which that resolver does not read.)
+        let mut builder =
+            ApiBuilder::from_cache(hf_hub::Cache::new(Self::cross_encoder_hub_root()));
+        if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
+            builder = builder.with_endpoint(endpoint);
+        }
+        let api = builder
+            .build()
+            .context("failed to init HuggingFace Hub API")?;
         let repo = api.repo(Repo::new(
             CROSS_ENCODER_MODEL_ID.to_string(),
             RepoType::Model,
@@ -1106,31 +1131,50 @@ impl CrossEncoder {
     /// (`snapshots/<commit-hash>`) by scanning every `snapshots/*` leaf under
     /// the repo dir, so the documented "ran online once, now offline" path no
     /// longer silently degrades to lexical.
-    fn load_cross_encoder_from_fallback()
-    -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    /// The hf-hub repo cache dir the offline resolver scans.
+    /// [`CROSS_ENCODER_FALLBACK_MODEL_SUBDIR`] is the `<repo>/snapshots/main`
+    /// hand-staged leaf; its grandparent is the hf-hub repo cache dir
+    /// `<repo>`, under which an online fetch instead writes
+    /// `snapshots/<commit-hash>/`. Derived from the one SSOT const so both
+    /// layouts resolve without duplicating the path literal.
+    fn cross_encoder_repo_dir() -> std::path::PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        // [`CROSS_ENCODER_FALLBACK_MODEL_SUBDIR`] is the `<repo>/snapshots/main`
-        // hand-staged leaf; its grandparent is the hf-hub repo cache dir
-        // `<repo>`, under which an online fetch instead writes
-        // `snapshots/<commit-hash>/`. Derive the repo dir from the one SSOT
-        // const so both layouts resolve without duplicating the path literal.
         let staged = std::path::PathBuf::from(&home).join(CROSS_ENCODER_FALLBACK_MODEL_SUBDIR);
-        let repo_dir = staged
+        staged
             .parent()
             .and_then(std::path::Path::parent)
             .map_or_else(
                 || std::path::PathBuf::from(&home),
                 std::path::Path::to_path_buf,
-            );
+            )
+    }
+
+    /// #4123 — the hf-hub cache ROOT (`…/huggingface/hub`) the online fetch
+    /// writes into: the parent of [`Self::cross_encoder_repo_dir`], so online
+    /// and offline agree on one location.
+    fn cross_encoder_hub_root() -> std::path::PathBuf {
+        let repo_dir = Self::cross_encoder_repo_dir();
+        repo_dir
+            .parent()
+            .map_or_else(|| repo_dir.clone(), std::path::Path::to_path_buf)
+    }
+
+    fn load_cross_encoder_from_fallback()
+    -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+        let repo_dir = Self::cross_encoder_repo_dir();
         if let Some(files) = Self::first_complete_snapshot(&repo_dir) {
             return Ok(files);
         }
+        // #4123 — name the ACTUAL reason the fetch is disabled (the offline
+        // knob, or the restricted inference-egress posture), not just the knob.
+        let reason = crate::embeddings::Embedder::remote_fetch_disabled_reason()
+            .unwrap_or_else(|| "AI_MEMORY_EMBED_OFFLINE/HF_HUB_OFFLINE".to_string());
         anyhow::bail!(
-            "offline (AI_MEMORY_EMBED_OFFLINE/HF_HUB_OFFLINE): cross-encoder model \
-             files not found in pre-stage dir: {}. Pre-stage {CROSS_ENCODER_MODEL_ID}'s \
-             config.json/tokenizer.json/model.safetensors under a snapshots/ leaf there \
-             for air-gapped neural reranking, or unset the offline knob to allow a network \
-             fetch (falls back to lexical reranking in the meantime).",
+            "offline ({reason}): cross-encoder model files not found in pre-stage dir: {}. \
+             Pre-stage {CROSS_ENCODER_MODEL_ID}'s config.json/tokenizer.json/model.safetensors \
+             under a snapshots/ leaf there for air-gapped neural reranking, or lift the \
+             offline knob / posture to allow a network fetch (falls back to lexical \
+             reranking in the meantime).",
             repo_dir.display()
         )
     }
@@ -3316,7 +3360,7 @@ mod tests {
             std::env::set_var("AI_MEMORY_EMBED_OFFLINE", "1");
         }
         assert!(
-            crate::embeddings::Embedder::remote_fetch_disabled(),
+            crate::embeddings::Embedder::remote_fetch_disabled_reason().is_some(),
             "offline knob must be honored"
         );
         let result = CrossEncoder::resolve_cross_encoder_files();
