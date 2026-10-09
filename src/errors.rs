@@ -385,6 +385,14 @@ pub mod msg {
     pub const SUBSCRIBE_REQUIRES_IDENTITY: &str =
         "subscribe requires an asserted caller identity: set the X-Agent-Id header";
 
+    /// #4274 (WP-ERASURE #6048) — the per-row reason `POST /api/v1/import`
+    /// records when a bundle row's id carries a signed FORGET tombstone
+    /// (#1821 / G30): the forget covenant forbids re-admitting it live, so
+    /// the row is SKIPPED (never a whole-import failure). Same wording as
+    /// the v1 CLI import funnel (`src/cli/io.rs`).
+    pub const IMPORT_SKIPPED_FORGET_TOMBSTONE: &str =
+        "skipped — a destination forget tombstone forbids re-admission";
+
     // ---- validation -------------------------------------------------------------
     pub const FORGET_FILTER_REQUIRED: &str =
         "at least one of namespace, pattern, or tier is required";

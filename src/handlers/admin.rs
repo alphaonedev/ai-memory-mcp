@@ -1770,9 +1770,68 @@ pub async fn import_memories(
             }
         }
 
-        match db::insert(&lock.0, &mem) {
-            Ok(_) => imported += 1,
+        // #4274 (WP-ERASURE #6048) — the forget covenant on the HTTP import
+        // lane. The bundle keeps `mem.id`, and `db::insert` performs no
+        // `forget_tombstones` probe, so an admin re-import of an older export
+        // RESURRECTED a forgotten id beside its own signed tombstone (the
+        // #2208 class on a third surface; the v2 portability import at
+        // `src/portability/import.rs` and the v1 CLI import at
+        // `src/cli/io.rs` both gate). Probe + insert run under ONE
+        // `BEGIN IMMEDIATE` so a forget committed by another process between
+        // the probe and the write cannot slip through: `insert_inner` is
+        // transaction-aware and joins the open tx (the `delete` precedent).
+        // A tombstoned id is a per-row skip with a reason, never a
+        // whole-import failure.
+        let write_txn = match crate::storage::connection::WriteTxn::begin(&lock.0) {
+            Ok(txn) => txn,
             Err(e) => {
+                tracing::warn!("import_memories: begin tx failed for {}: {e}", mem.id);
+                errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
+                continue;
+            }
+        };
+        match db::memory_is_tombstoned(&lock.0, &mem.id) {
+            Ok(true) => {
+                write_txn.rollback();
+                tracing::warn!(
+                    memory_id = %mem.id,
+                    "import_memories: row skipped — forget tombstone present (#4274)"
+                );
+                errors.push(format!(
+                    "{}: {}",
+                    mem.id,
+                    crate::errors::msg::IMPORT_SKIPPED_FORGET_TOMBSTONE
+                ));
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // A probe that could not run is not evidence the id is
+                // admissible: refuse the row (fail-closed), keep the import.
+                write_txn.rollback();
+                tracing::error!(
+                    memory_id = %mem.id,
+                    "import_memories: forget-tombstone probe failed; row refused (#4274): {e}"
+                );
+                errors.push(format!(
+                    "{}: import refused: forget-tombstone probe unavailable",
+                    mem.id
+                ));
+                continue;
+            }
+        }
+        match db::insert(&lock.0, &mem) {
+            Ok(_) => match write_txn.commit() {
+                Ok(()) => imported += 1,
+                Err(e) => {
+                    tracing::warn!("import_memories: commit failed for {}: {e}", mem.id);
+                    errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
+                }
+            },
+            Err(e) => {
+                // #4116 — settle deferred escalations, then report the REAL
+                // outcome (never a phantom pending id).
+                let e = write_txn.rollback_resolving(e);
                 // Issue #851: db::insert errors include raw rusqlite
                 // text (SQL fragments, constraint names). Sanitize.
                 tracing::warn!("import_memories: db::insert failed for {}: {e}", mem.id);
