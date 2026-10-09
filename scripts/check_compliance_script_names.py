@@ -525,6 +525,20 @@ def self_test():
                "R6-R18: malformed line containing '#' was accepted")
         allow.write_text("  docs/compliance/A.md:check-old.sh  \n")
         expect(not check(root), "R6-R9: whitespace-padded allowlist entry was rejected")
+        # R5: an allowlist entry must name a document under docs/compliance/.
+        allow.write_text("notes/A.md:check-old.sh\n")
+        expect(any("malformed allowlist entry" in p for p in check(root)),
+               "R6-R5: allowlist entry outside docs/compliance/ was not reported as malformed")
+        # R19: the successor an erratum names is not itself excused at another path.
+        allow.write_text("docs/compliance/A.md:check-old.sh\ndocs/compliance/A.md:check_new.py\n")
+        doc.write_text(erratum + "Old copy: `scripts/legacy/check_new.py`.\n")
+        expect(any("scripts/legacy/check_new.py" in p for p in check(root)),
+               "R6-R19: an erratum excused its own successor at a missing path")
+        # O14: the path after the FIRST scripts component is the one checked.
+        allow.write_text("")
+        doc.write_text("N30 enforcer is `scripts/scripts/check_new.py`.\n")
+        expect(any("scripts/scripts/check_new.py" in p for p in check(root)),
+               "R6-O14: scripts/scripts/<name> resolved to scripts/<name>")
         allow.write_text("")
         doc.write_text("See `check_new.py` and `scripts/check_new.py`.\n")
         expect(not check(root), "resolving names were rejected")
