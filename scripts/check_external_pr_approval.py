@@ -36,8 +36,10 @@ import sys
 
 TEAM_ASSOCIATIONS = frozenset(("OWNER", "MEMBER", "COLLABORATOR"))
 SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
-REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
-LOGIN_RE = re.compile(r"[A-Za-z0-9-]{1,39}")
+# GitHub limits: owner <= 39, repository name <= 100 characters (#6259).
+REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}")
+# A login is 1-39 characters; a GitHub App account carries exactly one "[bot]" suffix (#6259).
+LOGIN_RE = re.compile(r"[A-Za-z0-9-]{1,39}(?:\[bot\])?")
 ASSOC_RE = re.compile(r"[A-Z_]{1,32}")
 TOKEN_RE = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")
 QUEUE_REF_RE = re.compile(r"refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]{40,64}")
