@@ -1540,10 +1540,14 @@ def check_dockerfile(text: str, rep: Report) -> None:
         if m is not None and m.group("src").lower() != src:
             rep.bad(f"Dockerfile: final-stage `{ins[:60]}` takes `--from={m.group('src')}`; only the stage that "
                     "builds the binary may feed the image")
+    bidx = names.get(src)
+    if bidx is None or bidx == len(stages) - 1:
+        rep.bad(f"Dockerfile: the final image copies the binary from `{src}`, which is not an earlier named stage")
+        return
     # #4752: right after the binary COPY the final stage copies the declaration and
     # the asserter from the SAME stage and re-asserts the shipped path; after that
     # RUN no COPY, ADD or RUN may follow (it could replace the asserted file).
-    at = next((k for k, ins in enumerate(final) if BINARY_COPY_RE.fullmatch(ins)), -1)
+    at = max((k for k, ins in enumerate(final) if BINARY_COPY_RE.fullmatch(ins)), default=-1)
     check_copy = DOCKER_CHECK_COPY_RE.fullmatch(final[at + 1]) if 0 <= at < len(final) - 1 else None
     if (at < 0 or check_copy is None or check_copy.group("stage").lower() != src
             or at + 2 >= len(final) or final[at + 2] != DOCKER_RUNTIME_ASSERT):
@@ -1555,10 +1559,6 @@ def check_dockerfile(text: str, rep: Report) -> None:
         if ins.split(" ", 1)[0].upper() in ("COPY", "ADD", "RUN"):
             rep.bad(f"Dockerfile: `{ins[:60]}` after the runtime assert can replace the asserted file; only metadata "
                     "instructions (ENV, VOLUME, EXPOSE, USER, ENTRYPOINT, CMD...) may follow it (#4752)")
-    bidx = names.get(src)
-    if bidx is None or bidx == len(stages) - 1:
-        rep.bad(f"Dockerfile: the final image copies the binary from `{src}`, which is not an earlier named stage")
-        return
     for k, (_, body) in enumerate(stages):
         for pos, ins in enumerate(body):
             canon = k == bidx and pos == len(body) - 1 and ins == DOCKER_RUN
@@ -1823,6 +1823,12 @@ def _docker(old: str, new: Union[str, Transform], every: bool = False) -> Edit:
 def _final(ins: str) -> Edit:
     """An instruction in the final stage, before the binary COPY (#4752 pins what follows it)."""
     return _docker(D_BIN, ins + D_BIN)
+
+
+def _step_in_sbom(body: str) -> List[Edit]:
+    """A new sbom-job step (the release job is pinned whole, so a step there is
+    refused by RELEASE_STEPS before anything else can be the sole refusal)."""
+    return [_rel(SBOM_HDR, "      - name: extra\n" + body + SBOM_HDR)]
 
 
 def _step_before_pkg(body: str) -> List[Edit]:
@@ -2259,7 +2265,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR1 release job runs-on changed": ("fail", [_rel(NEEDS_REL, NEEDS_REL.replace("${{ matrix.os }}", "self-hosted"))]),
     "SR1 release job if: (skips the job)": ("fail", [_rel(JOB_NAME, JOB_NAME + "    if: false\n")]),
     "SR1 release job container:": ("fail", [_rel(JOB_NAME, JOB_NAME + "    container: decoy:latest\n")]),
-    "SR1 a step is a plain scalar, not a mapping": ("fail", [_rel(PKG_HDR, "      - echo hi\n" + PKG_HDR)]),
+    "SR1 a step is a plain scalar, not a mapping": ("fail", [_rel(SBOM_HDR, "      - echo hi\n" + SBOM_HDR)]),
     "SR1 build step name carries an expression": ("fail", [_rel(BUILD_HDR, BUILD_HDR.replace("binary", "binary ${{ matrix.os }}"))]),
     "SR1 run: |- on the assert step": ("fail", [_rel(ASSERT_RUN, ASSERT_RUN.replace("run: |", "run: |-"))]),
     "SR1 jobs: is not a mapping": ("fail", [_rel("\njobs:\n", "\njobs: []\nx-jobs:\n")]),
@@ -2439,9 +2445,9 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         JOB_NAME, _drop_job_permissions("crates-io"))]),
     "SR8 copr job calls a reusable workflow": ("fail", [_rel(COPR_HDR, COPR_HDR + "    uses: ./.github/workflows/x.yml\n")]),
     "SR8 an extra job": ("fail", [_rel(COPR_HDR, _append_job("      - run: echo\n"))]),
-    "SR8 unpinned secret": ("fail", _step_before_pkg("        env:\n          T: ${{ secrets.NPM_TOKEN }}\n        run: echo\n")),
-    "SR8 secrets dotted with spaces": ("fail", _step_before_pkg("        env:\n          T: ${{ secrets . GITHUB_TOKEN }}\n        run: echo\n")),
-    "SR8 all secrets as JSON": ("fail", _step_before_pkg("        env:\n          T: ${{ toJSON(secrets) }}\n        run: echo\n")),
+    "SR8 unpinned secret": ("fail", _step_in_sbom("        env:\n          T: ${{ secrets.NPM_TOKEN }}\n        run: echo\n")),
+    "SR8 secrets dotted with spaces": ("fail", _step_in_sbom("        env:\n          T: ${{ secrets . GITHUB_TOKEN }}\n        run: echo\n")),
+    "SR8 all secrets as JSON": ("fail", _step_in_sbom("        env:\n          T: ${{ toJSON(secrets) }}\n        run: echo\n")),
     "SR8 secrets: inherit": ("fail", [_rel(COPR_HDR, COPR_HDR + "    secrets: inherit\n")]),
     "valid: pinned secret in a sbom-job step": ("pass", [_rel(
         SBOM_HDR, "      - name: extra\n        env:\n          T: ${{ secrets.GITHUB_TOKEN }}\n        run: echo\n" + SBOM_HDR)]),
@@ -2945,7 +2951,7 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("proof URL sslmode not pinned", r"\?sslmode=verify-full", r"\?sslmode=[a-z-]+"),
     ("proof URL sslrootcert not pinned", r"&sslrootcert=\$\{PGTLS_DIR\}/ca\.crt", r"&sslrootcert=[^\"]*"),
     ("pinned step name expression allowed", 'if name is not None and "${{" in name.text():\n        why.bad("the step', 'if False:\n        why.bad("the step'),
-    ("quoted build tool spelling not unquoted (release job)", "BUILD_TOOL_RE.search(unquoted(t))", "BUILD_TOOL_RE.search(t)"),
+    ("quoted build tool spelling not unquoted (whole file)", "BUILD_TOOL_RE.search(unquoted(ln))", "BUILD_TOOL_RE.search(ln)"),
     ("quoted build tool spelling not unquoted (Dockerfile)", "BUILD_TOOL_RE.search(unquoted(ins))", "BUILD_TOOL_RE.search(ins)"),
     ("KEY_RE accepts a space before the colon", 'KEY_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_-]*):', 'KEY_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_-]*) ?:'),
     ("SHAPE_ADVISORY flipped", "SHAPE_ADVISORY = False", "SHAPE_ADVISORY = True"),
