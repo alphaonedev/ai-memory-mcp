@@ -2208,6 +2208,16 @@ mod tests {
             unsafe { std::env::set_var(FED_QUARANTINE_UNATTRIBUTED_ENV, truthy) };
             assert!(quarantine_unattributed_enabled(), "{truthy:?} → opt-in");
         }
+        // #3619 — case variants meet the asi-hard floor (case-insensitive
+        // `is_truthy`), so the live reader must engage quarantine for them
+        // too; otherwise the certified posture reports compliant-but-off.
+        for truthy in ["TRUE", "True", "Yes", "YES", "ON", "On", " TRUE "] {
+            unsafe { std::env::set_var(FED_QUARANTINE_UNATTRIBUTED_ENV, truthy) };
+            assert!(
+                quarantine_unattributed_enabled(),
+                "{truthy:?} meets the asi-hard floor, so it must engage quarantine (#3619)"
+            );
+        }
         for falsy in ["0", "false", "no", "off", ""] {
             unsafe { std::env::set_var(FED_QUARANTINE_UNATTRIBUTED_ENV, falsy) };
             assert!(!quarantine_unattributed_enabled(), "{falsy:?} → permissive");
