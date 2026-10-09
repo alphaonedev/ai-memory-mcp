@@ -47,7 +47,9 @@
 //! A frame that still holds deferred intents when a later `WriteTxn` opens on
 //! the same thread and database, a settle of an unknown frame, and frames
 //! still holding intents when the thread exits (a `mem::forget`-ed
-//! `WriteTxn`) are all reported at ERROR. The first two go through `tracing`
+//! `WriteTxn`) are all reported at ERROR. Each lost intent is reported once
+//! (#6132): intents the stale-frame check reported are not reported again at
+//! thread exit. The first two go through `tracing`
 //! and also trip a `debug_assert!`; the thread-exit case is written directly
 //! to stderr (an `ERROR #4116: ...` line), because the `tracing` fmt layer's
 //! own thread-local buffer may already be destroyed at thread exit and
@@ -123,6 +125,18 @@ struct TxnFrame {
     /// in-memory / temp database, which no other connection can share).
     db_path: Option<String>,
     deferred: Vec<DeferredEscalation>,
+    /// #6132 — how many of `deferred` were already reported as lost by
+    /// [`open_frame`]'s stale-frame check, so thread exit does not report the
+    /// same intents again. Only ever raised to `deferred.len()`; the frame
+    /// and its intents are never dropped by that report.
+    reported: usize,
+}
+
+impl TxnFrame {
+    /// Deferred intents not yet reported as lost.
+    fn unreported(&self) -> usize {
+        self.deferred.len().saturating_sub(self.reported)
+    }
 }
 
 /// The per-thread frame stack. Its destructor (thread exit) reports frames
@@ -131,7 +145,8 @@ struct Frames(Vec<TxnFrame>);
 
 impl Drop for Frames {
     fn drop(&mut self) {
-        let lost: usize = self.0.iter().map(|f| f.deferred.len()).sum();
+        // #6132 — intents `open_frame` already reported are not reported again.
+        let lost: usize = self.0.iter().map(TxnFrame::unreported).sum();
         if lost > 0 {
             // No debug_assert here: a panic in a TLS destructor aborts. This
             // runs at thread exit, in thread-local destructor order (reverse
@@ -190,12 +205,20 @@ pub(super) fn open_frame(conn: &Connection) -> u64 {
     let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
     TXN_FRAMES.with(|frames| {
         let mut frames = frames.borrow_mut();
-        let stale = frames
+        // #6132 — report each stale intent once: mark it reported here (before
+        // the debug_assert can unwind) so `Frames::drop` does not repeat it.
+        let mut stale = 0usize;
+        for frame in frames
             .0
-            .iter()
-            .any(|f| f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty());
-        if stale {
+            .iter_mut()
+            .filter(|f| db_path.is_some() && f.db_path == db_path)
+        {
+            stale = stale.saturating_add(frame.unreported());
+            frame.reported = frame.deferred.len();
+        }
+        if stale > 0 {
             tracing::error!(
+                stale,
                 "#4116: a WriteTxn opened while an older frame on the same database still \
                  holds deferred escalations (leaked or unsettled transaction)"
             );
@@ -205,6 +228,7 @@ pub(super) fn open_frame(conn: &Connection) -> u64 {
             id,
             db_path,
             deferred: Vec::new(),
+            reported: 0,
         });
     });
     id
