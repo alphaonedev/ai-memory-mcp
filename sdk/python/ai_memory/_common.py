@@ -15,6 +15,8 @@ an ``await`` lives here. In particular:
 from __future__ import annotations
 
 import json
+import os
+import ssl
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -74,6 +76,41 @@ def encode_path_segment(value: str) -> str:
     return quote(value, safe="")
 
 
+_UNVERIFIED_MESSAGE = (
+    "verify=False is refused: it would turn the daemon's TLS listener "
+    "into an unauthenticated one (an encrypted pipe to whoever answers). "
+    "This covers any falsy or blank verify value and an SSL context that "
+    "does not verify certificates. "
+    "Pass the CA bundle path instead — verify=<key_dir>/tls/local-ca.pem "
+    "for a zero-config daemon — or omit verify= to use the platform "
+    "trust store (#3840)."
+)
+
+
+def _refuse_unverified_tls(verify: object) -> None:
+    """Raise ``ValueError`` unless ``verify`` keeps TLS verification on (#3840).
+
+    Admitted: ``None`` (platform trust store), ``True``, a non-blank CA-bundle
+    path (``str`` or ``os.PathLike``) and an ``ssl.SSLContext`` that requires a
+    certificate and checks the hostname. Everything else is refused, fail
+    closed: ``False``, any other falsy value (``0``, ``0.0``, ``""``), a
+    blank or whitespace-only path, an ``SSLContext`` with ``CERT_NONE`` or
+    ``check_hostname=False``, and any type this SDK does not document.
+    """
+    if verify is None or verify is True:
+        return
+    if isinstance(verify, ssl.SSLContext):
+        if verify.verify_mode == ssl.CERT_NONE or not verify.check_hostname:
+            raise ValueError(_UNVERIFIED_MESSAGE)
+        return
+    if isinstance(verify, os.PathLike):
+        verify = os.fspath(verify)
+    # `str.strip(verify)` bypasses a str subclass that overrides `strip`.
+    if isinstance(verify, str) and str.strip(verify):
+        return
+    raise ValueError(_UNVERIFIED_MESSAGE)
+
+
 def build_httpx_kwargs(
     *,
     base_url: str,
@@ -102,9 +139,11 @@ def build_httpx_kwargs(
         ValueError: on ``verify=False`` (#3840). Under the transit-encryption
             standard (#3824) an unverified TLS channel is an encrypted pipe to
             whoever answers — the man-in-the-middle exposure the #3828
-            ``http://`` refusal closes, one layer up. Both clients construct
-            through this one funnel, so the refusal lives here once and there
-            is no escape hatch.
+            ``http://`` refusal closes, one layer up. The refusal also covers
+            every other way to switch verification off: a falsy or blank
+            ``verify`` and an ``ssl.SSLContext`` whose ``verify_mode`` is
+            ``CERT_NONE`` or whose ``check_hostname`` is False. Both clients
+            construct through this one funnel, so the refusal lives here once.
     """
     headers: dict[str, str] = {
         "User-Agent": f"ai-memory-python/{SDK_VERSION}",
@@ -123,17 +162,10 @@ def build_httpx_kwargs(
         "timeout": timeout,
     }
     # #3840 — `False` was documented as "never pass" and forwarded untouched.
-    # httpx reads ANY falsy `verify` as "do not verify", so the refusal covers
-    # `0` / `0.0` too, not only the literal `False`; `None` means "platform
-    # trust store" and a path (even a wrong one) is still a verifying client.
-    if verify is not None and not isinstance(verify, str) and not verify:
-        raise ValueError(
-            "verify=False is refused: it would turn the daemon's TLS listener "
-            "into an unauthenticated one (an encrypted pipe to whoever answers). "
-            "Pass the CA bundle path instead — verify=<key_dir>/tls/local-ca.pem "
-            "for a zero-config daemon — or omit verify= to use the platform "
-            "trust store (#3840)."
-        )
+    # httpx reads ANY falsy `verify` as "do not verify" (httpx 0.27.x does so
+    # for `""` too), and a caller-supplied `ssl.SSLContext` is used as given,
+    # so the refusal is decided by `_refuse_unverified_tls`, not by `is False`.
+    _refuse_unverified_tls(verify)
     if verify is not None:
         kwargs["verify"] = verify
     if cert is not None:

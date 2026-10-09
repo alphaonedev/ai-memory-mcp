@@ -14,7 +14,7 @@ See :class:`AsyncAiMemoryClient` for the asyncio counterpart.
 from __future__ import annotations
 
 # #3840 — this class defines a `list` METHOD, so inside the class body a bare
-# `builtins.list[...]` annotation resolves to that method (mypy: "not valid as a type").
+# `list[...]` annotation resolves to that method (mypy: "not valid as a type").
 # Annotations below spell the builtin explicitly.
 import builtins
 from types import TracebackType
