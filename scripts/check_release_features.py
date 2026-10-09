@@ -112,10 +112,10 @@ each unit is and WHAT is substituted into it:
     ``release-shape:``, whose keys are exactly ``name``/``runs-on``/
     ``timeout-minutes``/``steps`` with pinned values (``SHAPE_JOB``), so no job
     ``needs:``, ``if:``, ``env:``, ``defaults:``, ``container:`` or
-    ``services:``. ``continue-on-error`` follows ``SHAPE_ADVISORY``: while it is
-    True (the #4480 ruling: advisory until the first green run on main) the job
-    must carry exactly the plain ``continue-on-error: true``; when #4720 flips it
-    to False the key is refused. The Postgres proof is located structurally:
+    ``services:``. ``continue-on-error`` follows ``SHAPE_ADVISORY``: while it was
+    True (the #4480 ruling: advisory until the first green run) the job had to
+    carry exactly the plain ``continue-on-error: true``; #4720 flipped it to
+    False and the key is refused. The Postgres proof is located structurally:
     exactly one ``run`` step whose statements equal the pinned
     ``bash scripts/release-shape-pg-proof.sh target/release/ai-memory "$url"``
     (the URL assignment may change its port only), with the step key set pinned
@@ -337,11 +337,11 @@ SHAPE_JOB: Dict[str, Spec] = {
     "runs-on": "ubuntu-latest",
     "timeout-minutes": "60",
 }
-# #4480 ruled the release-shape job ADVISORY until its first green run on main; #4720
-# tracks the flip to required. While True the job must carry exactly the plain
-# `continue-on-error: true`; the #4720 fix sets this to False in the same commit
-# that drops the key from release-shape.yml, after which the key is refused.
-SHAPE_ADVISORY = True
+# #4480 ruled the release-shape job ADVISORY until its first green run; #4720
+# flipped it to required once it had run green (87 runs by 2026-10-09). While
+# True the job must carry exactly the plain `continue-on-error: true`; False
+# (the live state) refuses the key. Both states stay testable (ADVISORY_CASES).
+SHAPE_ADVISORY = False
 DOCKER_SYNTAX = "# syntax=docker/dockerfile:1"
 DOCKER_DECL_COPY = "COPY scripts/release-features.sh scripts/release-features.sh"
 DOCKER_LOCK_COPY = "COPY Cargo.toml Cargo.lock ./"
@@ -1609,7 +1609,7 @@ def _add_shape_continue_on_error(text: str) -> str:
     """Give the release-shape job `continue-on-error: true` when it has none
     (#4720). While the job is advisory the key is already there and the text is
     unchanged, so the case is red exactly until the flip lands."""
-    if "continue-on-error" in text:
+    if re.search(r"(?m)^    continue-on-error:", text):
         return text
     return text.replace(SHAPE_RUNS_ON, SHAPE_RUNS_ON + "    continue-on-error: true\n", 1)
 
@@ -2021,7 +2021,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "P4 the only proof invocation replaced by true": ("fail", [(SHAPE, SHAPE_PROOF_CMD, "true", False)]),
     "P6 continue-on-error on the proof step": ("fail", [(SHAPE, PROOF_NAME, PROOF_NAME + "        continue-on-error: true\n", False)]),
     "P5 if: false on the proof step": ("fail", [(SHAPE, PROOF_NAME, PROOF_NAME + "        if: false\n", False)]),
-    "P5b if on the release-shape job": ("fail", [(SHAPE, "    runs-on: ubuntu-latest\n    # Advisory", "    runs-on: ubuntu-latest\n    if: false\n    # Advisory", False)]),
+    "P5b if on the release-shape job": ("fail", [_shape(SHAPE_RUNS_ON, SHAPE_RUNS_ON + "    if: false\n")]),
     "P7 proof step deleted": ("fail", [(SHAPE, PROOF_NAME, _drop_proof_step, False)]),
     "P8 proof runs before the build": ("fail", [(SHAPE, PROOF_NAME, _proof_before_build, False)]),
     "P9 proof invocation made non-fatal": ("fail", [(SHAPE, SHAPE_PROOF_CMD, SHAPE_PROOF_CMD + " || true", False)]),
@@ -2088,7 +2088,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR10/P22c top-level defaults": ("fail", [_shape("\nenv:\n", "\ndefaults:\n  run:\n    working-directory: x\n\nenv:\n")]),
     "SR10/P23 job container": ("fail", [_shape(SHAPE_NAME, SHAPE_NAME + "    container: alpine\n")]),
     "SR10 job name changed": ("fail", [_shape(SHAPE_NAME, '    name: "Release shape"\n')]),
-    "SR10 job runs-on changed": ("fail", [_shape("    runs-on: ubuntu-latest\n    # Advisory", "    runs-on: self-hosted\n    # Advisory")]),
+    "SR10 job runs-on changed": ("fail", [_shape(SHAPE_RUNS_ON, "    runs-on: self-hosted\n")]),
     "SR10 job timeout changed": ("fail", [_shape("    timeout-minutes: 60\n", "    timeout-minutes: 600\n")]),
     # --- #4720: the release-shape proof is required; a continue-on-error on the job is refused
     "4720 release-shape job carries continue-on-error": ("fail", [_shape(SHAPE_RUNS_ON, _add_shape_continue_on_error)]),
@@ -2114,12 +2114,12 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
 
 # SHAPE_ADVISORY states (C-5): (advisory, want, edits).
 ADVISORY_CASES: Dict[str, Tuple[bool, str, List[Edit]]] = {
-    "advisory: the plain continue-on-error true passes": (True, "pass", []),
-    "advisory: continue-on-error removed": (True, "fail", [(SHAPE, "    continue-on-error: true\n", "", False)]),
-    "advisory: continue-on-error quoted": (True, "fail", [(SHAPE, "continue-on-error: true", "continue-on-error: 'true'", False)]),
-    "advisory: continue-on-error false": (True, "fail", [(SHAPE, "continue-on-error: true", "continue-on-error: false", False)]),
-    "required: continue-on-error still set": (False, "fail", []),
-    "required: continue-on-error removed passes": (False, "pass", [(SHAPE, "    continue-on-error: true\n", "", False)]),
+    "advisory: the plain continue-on-error true passes": (True, "pass", [_shape(SHAPE_RUNS_ON, _add_shape_continue_on_error)]),
+    "advisory: continue-on-error missing": (True, "fail", []),
+    "advisory: continue-on-error quoted": (True, "fail", [_shape(SHAPE_RUNS_ON, SHAPE_RUNS_ON + "    continue-on-error: 'true'\n")]),
+    "advisory: continue-on-error false": (True, "fail", [_shape(SHAPE_RUNS_ON, SHAPE_RUNS_ON + "    continue-on-error: false\n")]),
+    "required: continue-on-error set": (False, "fail", [_shape(SHAPE_RUNS_ON, _add_shape_continue_on_error)]),
+    "required: no continue-on-error passes": (False, "pass", []),
 }
 # C-6: (edits, exact error count, substring of the first message).
 MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
@@ -2451,8 +2451,8 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("quoted build tool spelling not unquoted (release job)", "BUILD_TOOL_RE.search(unquoted(t))", "BUILD_TOOL_RE.search(t)"),
     ("quoted build tool spelling not unquoted (Dockerfile)", "BUILD_TOOL_RE.search(unquoted(ins))", "BUILD_TOOL_RE.search(ins)"),
     ("KEY_RE accepts a space before the colon", 'KEY_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_-]*):', 'KEY_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_-]*) ?:'),
-    ("SHAPE_ADVISORY flipped", "SHAPE_ADVISORY = True", "SHAPE_ADVISORY = False"),
-    ("advisory default ignored", "        advisory = SHAPE_ADVISORY\n", "        advisory = False\n"),
+    ("SHAPE_ADVISORY flipped", "SHAPE_ADVISORY = False", "SHAPE_ADVISORY = True"),
+    ("advisory default ignored", "        advisory = SHAPE_ADVISORY\n", "        advisory = True\n"),
     ("advisory branch always taken", "    if advisory:\n", "    if True:\n"),
     ("required state never refuses the key", "    elif coe is not None:\n", "    elif False:\n"),
     ("pinned scalar style not compared", 'node.kind == "scalar" and node.style == style and', 'node.kind == "scalar" and'),

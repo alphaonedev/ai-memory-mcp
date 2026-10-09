@@ -17,14 +17,22 @@
 # is no skip path. What only the release matrix itself proves: the macOS and
 # aarch64-linux cross builds (this job builds the host target, x86_64 linux).
 #
-# ADVISORY (continue-on-error) by GOD's ruling on #4480: this workflow lands
-# untried, so its failure must not block a merge or a release until it has run
-# green once. It flips to REQUIRED (drop `continue-on-error`, declare the
-# context) after the first green run on main. It is not in COVERED_WORKFLOWS of
-# scripts/check-required-contexts.sh and is named by no doc as an enforcing
-# gate (scripts/check-ci-job-claims.sh). The feature declaration itself is
-# enforced separately and BLOCKING by scripts/check_release_features.py
-# (c8-precheck), and gates release.yml and the Dockerfile.
+# NOT ADVISORY (#4720). The workflow landed `continue-on-error: true` by GOD's
+# ruling on #4480 (untried, so a failure must not block until it had run green
+# once). It has since run green on every pull_request event it fired for
+# (87 runs by 2026-10-09; the latest 25 all `success`, e.g. run 37944916557 on
+# chain/promo6-ssh), so the key is gone: a failing proof fails the run, and
+# scripts/check_release_features.py (SHAPE_ADVISORY = False) refuses the key.
+# The workflow is in COVERED_WORKFLOWS of scripts/check-required-contexts.sh;
+# its job is declared in the dated not-required ledger
+# (scripts/qc-allowlists/required-contexts-not-required.txt) until the #3554
+# lockstep promotes the context "Release-shaped build + PG TLS proof" into
+# live branch protection. NOTE for that promotion: rule (c) of the
+# required-contexts gate refuses a path-filtered carrier, so the `paths:`
+# filter below must go in the same change that requires the context. The
+# feature declaration itself is enforced separately and BLOCKING by
+# scripts/check_release_features.py (c8-precheck), and gates release.yml and
+# the Dockerfile.
 
 name: Release-shaped build + PostgreSQL TLS proof (#4480)
 
@@ -61,8 +69,7 @@ jobs:
   release-shape:
     name: "Release-shaped build + PG TLS proof"
     runs-on: ubuntu-latest
-    # Advisory until the first green run on main (#4480, GOD ruling).
-    continue-on-error: true
+    # No `continue-on-error`: a failing proof fails the run (#4720).
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
