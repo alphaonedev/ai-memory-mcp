@@ -104,6 +104,25 @@ class PackagingContract(unittest.TestCase):
         self.assertIn(f'ReadOnlyPaths=-{state_dir}/.config', backup,
                       'the backup unit must grant the key store read-only')
 
+    def test_companions_restart_with_the_primary(self):
+        # #4326 — curator and sync open the live database through the
+        # migrating `db::open`. After an in-place binary replacement the
+        # daemon keeps running the old binary; a companion that restarts
+        # first (crash, OOM, `systemctl restart` of only that unit) would run
+        # the NEW migration ladder on the live primary under the OLDER
+        # daemon — the schema-ahead state #2445 refuses. PartOf= makes a
+        # restart of the primary propagate, and the README tells the operator
+        # that replacing the binary means restarting the primary first.
+        for name in ('curator', 'sync'):
+            with self.subTest(unit=name):
+                lines = self._unit_lines(f'ai-memory-{name}')
+                self.assertIn('PartOf=ai-memory.service', lines)
+                self.assertLess(lines.index('PartOf=ai-memory.service'), lines.index('[Service]'),
+                                'PartOf= belongs to the [Unit] section')
+        readme = (ROOT / 'packaging/systemd/README.md').read_text()
+        self.assertIn('## Upgrading the binary', readme)
+        self.assertIn('systemctl restart ai-memory.service', readme)
+
     def test_read_only_paths_mark_optional_directories(self):
         # `ReadOnlyPaths=/etc/ai-memory` without `-` fails the unit on a host
         # where the directory does not exist; the `-` form starts without it.
