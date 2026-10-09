@@ -167,9 +167,12 @@ pub fn sweep_pending_action_timeouts(
     // so a concurrent decide_pending_action wins (its decision is
     // not overwritten).
     let now = Utc::now().to_rfc3339();
-    let tx_savepoint = conn.unchecked_transaction()?;
+    // BEGIN IMMEDIATE (#5084): the candidate read above is outside the
+    // transaction and the transaction is UPDATE-only, but one rule holds for
+    // every write path (a DEFERRED upgrade can fail with SQLITE_BUSY_SNAPSHOT).
+    let tx_savepoint = crate::storage::connection::WriteTxn::begin(conn)?;
     {
-        let mut update = tx_savepoint.prepare(
+        let mut update = conn.prepare(
             "UPDATE pending_actions
              SET status = 'expired', expired_at = ?1
              WHERE id = ?2 AND status = 'pending'",

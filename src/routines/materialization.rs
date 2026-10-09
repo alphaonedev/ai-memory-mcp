@@ -329,7 +329,10 @@ pub(crate) fn materialize_template_for_caller(
     caller: Option<&str>,
 ) -> Result<Vec<String>, String> {
     let plan = plan(routine, arguments, now, caller)?;
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    // BEGIN IMMEDIATE (#5084, the #2250 class): create_guarded_in_transaction
+    // reads (record-stop gate, quota row) before it writes.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
     let mut ids = Vec::with_capacity(plan.actions.len());
     for action in plan.actions {
         ids.push(

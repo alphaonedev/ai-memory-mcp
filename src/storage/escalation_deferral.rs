@@ -423,7 +423,7 @@ mod tests {
         let path = dir.path().join("ai-memory.db");
         let a = crate::db::open(&path).expect("open a");
         let b = crate::db::open(&path).expect("open b");
-        let leaked = super::super::connection::WriteTxn::begin_deferred(&a).expect("begin a");
+        let leaked = super::super::connection::WriteTxn::begin(&a).expect("begin a");
         let intent = super::DeferredEscalation {
             pending_id: "leak-4116".to_string(),
             action: crate::models::GovernedAction::Store,
@@ -435,7 +435,11 @@ mod tests {
         };
         assert!(super::defer_to_open_txn(a.path(), intent).is_ok());
         std::mem::forget(leaked);
-        let _next = super::super::connection::WriteTxn::begin_deferred(&b).expect("begin b");
+        // BEGIN IMMEDIATE holds the write lock; release connection `a` so `b` can
+        // open. The leaked frame stays in the thread-local frame stack (matched
+        // by db path), so the expected panic still fires.
+        drop(a);
+        let _next = super::super::connection::WriteTxn::begin(&b).expect("begin b");
     }
 
     /// #4116 F1 — the thread-exit leak report is an ERROR line on stderr and
@@ -485,7 +489,7 @@ mod tests {
                 .tempdir()
                 .expect("tempdir");
             let conn = crate::db::open(&dir.path().join("ai-memory.db")).expect("open");
-            let leaked = super::super::connection::WriteTxn::begin_deferred(&conn).expect("begin");
+            let leaked = super::super::connection::WriteTxn::begin(&conn).expect("begin");
             let intent = super::DeferredEscalation {
                 pending_id: "exit-4116".to_string(),
                 action: crate::models::GovernedAction::Store,

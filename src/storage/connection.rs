@@ -117,14 +117,6 @@ pub const SQL_BEGIN_IMMEDIATE: &str = "BEGIN IMMEDIATE";
 pub const SQL_COMMIT: &str = "COMMIT";
 pub const SQL_ROLLBACK: &str = "ROLLBACK";
 
-/// v1.0.0 #3163 — the plain (DEFERRED) BEGIN, used by the CLI `mine` import's
-/// chunked transaction. Hoisted out of `cli/io.rs` as an inline literal so
-/// every transaction verb in the substrate is spelled once, here
-/// (pm-v3.1 no-hardcoded-literals). DEFERRED is correct there because the
-/// importer owns its own process-private connection and takes no lock until
-/// its first write.
-pub const SQL_BEGIN_DEFERRED: &str = "BEGIN";
-
 /// v1.0.0 #3163 — the migration ladder's exclusive-lock BEGIN, hoisted out
 /// of `migrations.rs` as an inline literal so every transaction verb in the
 /// substrate is spelled once, here (pm-v3.1 no-hardcoded-literals).
@@ -202,18 +194,6 @@ impl<'c> WriteTxn<'c> {
     /// is left to roll back.
     pub fn begin(conn: &'c Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(SQL_BEGIN_IMMEDIATE)?;
-        Ok(Self::opened(conn))
-    }
-
-    /// Open a DEFERRED transaction on `conn` — the chunked-import boundary,
-    /// which takes no write lock until its first write.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the `rusqlite` error from `BEGIN`. As with
-    /// [`WriteTxn::begin`], no guard is constructed on failure.
-    pub fn begin_deferred(conn: &'c Connection) -> rusqlite::Result<Self> {
-        conn.execute_batch(SQL_BEGIN_DEFERRED)?;
         Ok(Self::opened(conn))
     }
 
@@ -1017,7 +997,30 @@ pub fn open_unmigrated(path: &Path) -> Result<Connection> {
     apply_sqlcipher_key(&conn)?;
     register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
     apply_writer_pragmas(&conn)?;
-    Ok(conn)
+    Ok(test_trace_on_open(conn))
+}
+
+// Test seam (#5243): lets a race test trace a connection that a function under
+// test opens for itself (`mine`, `doctor --repair-schema-version`), where the
+// test has no handle to arm it. A no-op unless a test armed it on this thread.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OPEN_TRACE_5084: std::cell::Cell<Option<fn(&str)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn test_trace_on_open(mut conn: Connection) -> Connection {
+    if let Some(cb) = OPEN_TRACE_5084.with(std::cell::Cell::get) {
+        conn.trace(Some(cb));
+    }
+    conn
+}
+
+#[cfg(not(test))]
+#[inline]
+fn test_trace_on_open(conn: Connection) -> Connection {
+    conn
 }
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -1084,7 +1087,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     // check withholds (Unknown) and this is a silent no-op.
     crate::governance::audit::enforce_rollback_check_at_open(&conn)
         .context("open-time rollback-evidence check")?;
-    Ok(conn)
+    Ok(test_trace_on_open(conn))
 }
 
 /// #1580 — open a **read-only** connection to an already-initialized
@@ -1995,7 +1998,6 @@ mod tests {
                 for (i, line) in text.lines().enumerate() {
                     if line.contains("execute_batch")
                         && (line.contains("SQL_BEGIN_IMMEDIATE")
-                            || line.contains("SQL_BEGIN_DEFERRED")
                             || line.contains("SQL_BEGIN_EXCLUSIVE"))
                     {
                         hits.push(format!("{rel}:{}:{line}", i + 1));
@@ -2008,6 +2010,18 @@ mod tests {
             hits.is_empty(),
             "raw execute_batch(SQL_BEGIN_*) outside allow-listed sites (#3163):\n{}",
             hits.join("\n")
+        );
+        // #5461: the DEFERRED verb constant was removed by #5084, so the walk
+        // above can no longer match it. The primitive file is allow-listed, so
+        // pin its absence directly; the needle is split so this test does not
+        // match itself.
+        let own = std::fs::read_to_string(root.join("storage/connection.rs"))
+            .expect("read storage/connection.rs");
+        let needle = ["SQL_BEGIN_", "DEFERRED"].concat();
+        assert!(
+            !own.contains(&needle),
+            "{needle} was removed by #5084; re-introducing a DEFERRED transaction \
+             verb needs a fresh allowlist decision (#3163, #5084, #5461)"
         );
     }
 

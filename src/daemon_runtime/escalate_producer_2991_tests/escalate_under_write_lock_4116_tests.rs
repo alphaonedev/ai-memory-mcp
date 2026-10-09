@@ -365,7 +365,7 @@ fn deferred_queue_failure_never_reports_a_phantom_pending_id() {
     // Caller-owned transaction: the deferred wording, which never claims the
     // row exists, and the named id is indeed absent.
     let err = {
-        let txn = crate::storage::connection::WriteTxn::begin(&conn).expect("begin");
+        let txn = crate::storage::connection::WriteTxn::begin(&conn).expect("open write txn");
         let out = crate::storage::update_with_expected_version(
             &conn,
             &target.id,
