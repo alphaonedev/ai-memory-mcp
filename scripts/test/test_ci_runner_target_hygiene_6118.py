@@ -747,6 +747,48 @@ class Mutants6118(unittest.TestCase):
             "  extra_expr_job:\n    runs-on: ${{ inputs.runner }}\n    steps:\n      - run: echo hi\n")
         self.assertTrue(found and found[0].startswith("R-SHAPE"), found)
 
+    # ---- round 3 (F1, F3): two more debuginfo spellings, one hosted label ----
+
+    def test_6118_m16_cargo_config_profile_debug_override(self) -> None:
+        # F1: cargo's --config on the command line beats CARGO_PROFILE_* env.
+        found = self._before_prune(
+            "      - name: Config debug override\n"
+            "        run: cargo test --no-run --config 'profile.dev.debug=\"line-tables-only\"'\n")
+        self.assertTrue(any("R-DEBUG" in v and "profile.dev.debug" in v and "line-tables-only" in v
+                            for v in found), found)
+
+    def test_6118_m17_rustflags_dash_g(self) -> None:
+        # F1: `-g` is rustc's spelling of `-C debuginfo=2`.
+        found = self._before_prune(
+            "      - name: RUSTFLAGS -g\n        env:\n          RUSTFLAGS: \"-g\"\n"
+            "        run: cargo test --no-run\n")
+        self.assertTrue(any("R-DEBUG" in v and "RUSTFLAGS" in v and "-g" in v for v in found), found)
+
+    def test_6118_m17b_rustflags_dash_g_in_a_run_body(self) -> None:
+        found = self._before_prune(
+            "      - name: RUSTFLAGS -g inline\n"
+            "        run: RUSTFLAGS=\"-C opt-level=0 -g\" cargo test --no-run\n")
+        self.assertTrue(any("R-DEBUG" in v and "-g" in v for v in found), found)
+
+    def test_6118_m18_level_0_spellings_and_unrelated_dash_g_are_clean(self) -> None:
+        # The F1 detectors must not flag a level-0 spelling or a `-g` that is not
+        # a rustc flag (npm's global install), nor `profile.*.debug-assertions`.
+        found = self._before_prune(
+            "      - name: Level 0 spellings\n        env:\n          RUSTFLAGS: \"-C debuginfo=0\"\n"
+            "        run: |\n"
+            "          cargo test --no-run --config profile.dev.debug=0 --config 'profile.test.debug=\"0\"'\n"
+            "          cargo test --no-run --config profile.dev.debug-assertions=true\n"
+            "          npm install -g some-tool\n")
+        self.assertEqual([], found)
+
+    def test_6118_m19_ubuntu_slim_is_github_hosted(self) -> None:
+        # F3: `ubuntu-slim` is a GitHub-hosted label; a job on it is not censused.
+        self.assertTrue(_leg_is_hosted(["ubuntu-slim"]))
+        found = self._appended(
+            "  extra_slim_job:\n    runs-on: ubuntu-slim\n    steps:\n      - run: cargo test --lib\n")
+        self.assertEqual([], found)
+        self.assertFalse(_leg_is_hosted(["ubuntu-slim", "self-hosted"]))
+
 
 def _write(path: Path, size: int, executable: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -804,12 +846,13 @@ class PruneScript6118(unittest.TestCase):
         _write(self.outside, 777, True)
         (self.target / "debug" / "deps" / "evil-link").symlink_to(self.outside)
 
-    def _run(self, *args: str, env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+    def _run(self, *args: str, env: Optional[Dict[str, str]] = None,
+             cwd: Optional[Path] = None, timeout: Optional[float] = None) -> subprocess.CompletedProcess:
         base = {k: v for k, v in os.environ.items() if k not in ("GITHUB_WORKSPACE", "CARGO_TARGET_DIR")}
         base.update(env or {})
         return subprocess.run(
             [sys.executable, "-I", str(PRUNE_SCRIPT), *args],
-            cwd=str(ROOT), capture_output=True, text=True, check=False, env=base,
+            cwd=str(cwd or ROOT), capture_output=True, text=True, check=False, env=base, timeout=timeout,
         )
 
     def _expected_freed(self) -> int:
@@ -1046,6 +1089,128 @@ class PruneScript6118(unittest.TestCase):
         self.assertEqual(self._expected_freed() - 2000, self._freed(proc.stdout))
         self.assertFalse((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
         self.assertFalse((self.target / "debug" / "examples" / "demo-1e1e").exists())
+
+    # ---- round 3 (F2 = SR2-1, SR2-2, SR2-3, SR2-4) ----
+
+    def _main_in_process(self, mod, *args: str) -> Tuple[int, str]:
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = mod.main(list(args))
+        return rc, buf.getvalue()
+
+    def test_6118_scan_unreadable_subdir_warns_and_prunes_the_rest(self) -> None:
+        # F2 / SR2-1: EACCES on deps/ during the SCAN is a warning, not a
+        # traceback; examples/ and incremental/ are still pruned, the totals are
+        # printed, and the exit code is 1.
+        deps = self.target / "debug" / "deps"
+        deps.chmod(0)
+        self.addCleanup(deps.chmod, 0o755)
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertIn("::warning::prune-runner-target: debug/deps:", proc.stdout)
+        self.assertEqual(50000 + 10 + 6000, self._freed(proc.stdout))
+        self.assertFalse((self.target / "debug" / "examples" / "demo-1e1e").exists())
+        self.assertEqual([], os.listdir(str(self.target / "debug" / "incremental")))
+        self.assertIn("could not be removed", proc.stdout)
+
+    def test_6118_scan_entry_vanishing_or_failing_lstat_is_handled(self) -> None:
+        # F2 / SR2-1: an entry that vanishes between scandir and lstat is skipped
+        # silently; any other lstat error is a warning and the scan continues.
+        mod = _load_prune()
+        real = mod._lstat
+
+        def flaky(name, dir_fd):
+            if name == "ai_memory-0a1b":
+                raise FileNotFoundError(2, "No such file or directory", name)
+            if name == "mcp_input_schema-7c7c":
+                raise OSError(5, "Input/output error", name)
+            return real(name, dir_fd)
+
+        mod._lstat = flaky
+        rc, out = self._main_in_process(mod, "--target-dir", str(self.target), "--dry-run")
+        self.assertEqual(1, rc, out)
+        self.assertIn("::warning::prune-runner-target: debug/deps/mcp_input_schema-7c7c: Input/output error", out)
+        self.assertNotIn("ai_memory-0a1b", out.split("freed_bytes=")[0].replace("libai_memory-0a1b", ""))
+        self.assertEqual(50000 + 10 + 6000, self._freed(out))
+
+    def test_6118_newline_in_entry_name_cannot_inject_a_workflow_command(self) -> None:
+        # SR2-2: a name printed on a `::warning::` (or any) line is escaped the way
+        # GitHub decodes command values (% -> %25, CR -> %0D, LF -> %0A), so the
+        # rest of a hostile name never starts its own log line.
+        name = "pwn\n::error::forged-6118"
+        deps = self.target / "debug" / "deps"
+        _write(deps / name, 5, True)
+        inner = deps / (name + ".dSYM") / "inner"
+        _write(inner / "f", 3)
+        inner.chmod(0o500)
+        self.addCleanup(inner.chmod, 0o700)
+        for args in (("--dry-run",), ()):
+            proc = self._run("--target-dir", str(self.target), *args)
+            lines = (proc.stdout + proc.stderr).splitlines()
+            self.assertFalse([x for x in lines if x.lstrip().startswith("::error::")], proc.stdout + proc.stderr)
+            self.assertIn("pwn%0A::error::forged-6118", proc.stdout, args)
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("::warning::prune-runner-target: debug/deps/pwn%0A::error::forged-6118.dSYM/inner/f:",
+                      proc.stdout)
+        mod = _load_prune()
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod.Tally().warn("a%b\rc\nd", OSError(13, "Permission denied"))
+        self.assertEqual("::warning::prune-runner-target: a%25b%0Dc%0Ad: Permission denied\n", buf.getvalue())
+
+    def test_6118_refuses_empty_target_dir(self) -> None:
+        # SR2-3: `--target-dir ""` must not silently mean the current directory.
+        before = _tree_size(self.target)
+        for bad in ("", "  "):
+            proc = self._run("--target-dir", bad, cwd=self.target)
+            self.assertEqual(2, proc.returncode, (bad, proc.stdout + proc.stderr))
+            self.assertIn("refusing", proc.stderr)
+            self.assertIn("--target-dir", proc.stderr)
+        self.assertEqual(before, _tree_size(self.target))
+
+    def test_6118_cachedir_tag_fifo_cannot_stall_the_marker_check(self) -> None:
+        # SR2-4: a CACHEDIR.TAG that is (or is swapped, after any lstat, for) a
+        # FIFO must not block the open until a writer appears.
+        driver = (
+            "import importlib.util, os, stat, sys\n"
+            "spec = importlib.util.spec_from_file_location('p', sys.argv[1])\n"
+            "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
+            "root = sys.argv[2]; tag = os.path.join(root, 'CACHEDIR.TAG')\n"
+            "real = mod._lstat\n"
+            "def swapping(name, dir_fd):\n"
+            "    st = real(name, dir_fd)\n"
+            "    if name == 'CACHEDIR.TAG' and stat.S_ISREG(st.st_mode):\n"
+            "        os.unlink(tag); os.mkfifo(tag)\n"
+            "    return st\n"
+            "mod._lstat = swapping\n"
+            "fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)\n"
+            "first = mod._has_cachedir_tag(fd)\n"
+            "if not stat.S_ISFIFO(os.lstat(tag).st_mode):\n"
+            "    os.unlink(tag); os.mkfifo(tag)\n"
+            "second = mod._has_cachedir_tag(fd)\n"
+            "print('RESULT', first, second)\n"
+        )
+        (self.target / "CACHEDIR.TAG").write_bytes(CARGO_CACHEDIR_TAG)
+        try:
+            proc = subprocess.run([sys.executable, "-I", "-c", driver, str(PRUNE_SCRIPT), str(self.target)],
+                                  capture_output=True, text=True, check=False, timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("opening a FIFO CACHEDIR.TAG blocked (SR2-4)")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("RESULT False False", proc.stdout)
+        # End to end: a FIFO tag and no .cargo-lock is "not a cargo target dir".
+        (self.target / "debug" / ".cargo-lock").unlink()
+        try:
+            cli = self._run("--target-dir", str(self.target), timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("the prune CLI blocked on a FIFO CACHEDIR.TAG (SR2-4)")
+        self.assertEqual(2, cli.returncode, cli.stdout + cli.stderr)
+        self.assertTrue((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
 
 
 # cargo's own CACHEDIR.TAG (https://bford.info/cachedir/): the signature line is
