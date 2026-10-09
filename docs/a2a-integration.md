@@ -429,12 +429,21 @@ attestation. The receiving host's local plane completes the intended hop.
 The hub itself cannot bridge hosts; mounting a socket remotely does not create
 a supported cross-host transport.
 
-**Current limitation:** federation receive/apply does not currently publish a
-receiving-host inbox wake. The remaining federation-to-local-wake integration is
-tracked in [#3631](https://github.com/alphaonedev/ai-memory-mcp/issues/3631).
-Until that path is complete, the receiving agent's bounded inbox poll discovers
-the replicated row. Cross-host delivery is not a measured millisecond promise.
-See the [federation guide](federation.md) for peer configuration.
+**Cross-host wake ([#3631](https://github.com/alphaonedev/ai-memory-mcp/issues/3631),
+shipped in v1.0.0):** when the receiving daemon applies a replicated inbox row,
+through `/sync/push` or its catch-up pull, it publishes the same `agent_notified`
+wake a local `memory_notify` publishes (`src/federation/applied_wake.rs`, called
+from `src/federation/receive.rs` and `src/handlers/federation_receive.rs`). The
+wake fires only when the apply moved the row forward: a replayed row this node
+already holds, an older inbound that lost the newer-wins merge, and a row that is
+not readable after the apply (tombstoned or quarantined) wake nobody. The wake
+carries the recipient, row id, namespace, sender and a digest of the body, never
+the body itself. `ai-memory sync-daemon` and the one-shot `ai-memory sync` CLI
+apply rows in their own process, which installs no wake sink, so rows they apply
+are found by the poll. On every path the bounded inbox poll (at most 60 seconds)
+remains the delivery guarantee; cross-host delivery is not a measured
+millisecond promise. See the [federation guide](federation.md) for peer
+configuration.
 
 Enrol both the transport certificate pin and the peer's Ed25519 signing key.
 A public-only import uses the peer ID configured by the receiving daemon:
@@ -515,7 +524,7 @@ placeholders; never copy an operator's keys or deployment coordinates.
 | Local hub returns `404 no such agent` for a remote recipient | Notify fires the local sink even when the agent lives elsewhere. The sink logs a connection failure and reconnects. Durable delivery is unaffected; tracked in [#3635](https://github.com/alphaonedev/ai-memory-mcp/issues/3635). Do not chase it as data loss. |
 | Transient federation push failure immediately after daemon restart | Observed delivery recovers through DLQ replay on its next sweep: degrade-never-lose for queued committed delivery. Check replay success and receipt IDs instead of resending blindly. |
 | Hub reachable, listener unauthorized | Check matching hub ID, enrolled key, bundle ownership/mode/expiry and fresh allowlist; renew as in section 3. Never disable verification. |
-| Inbox rows arrive but no hints | Check `sink_socket`, producer enrolment, snapshot refresh, use of the daemon send surface, and the cross-host limitation in #3631. Polling remains required. |
+| Inbox rows arrive but no hints | Check `sink_socket`, producer enrolment, snapshot refresh and use of the daemon send surface. A row applied by `ai-memory sync-daemon` or `ai-memory sync` produces no wake (those processes install no wake sink), and a replayed or superseded federated row wakes nobody by design (#3631, section 6). Polling remains required. |
 | Shell agent reruns the same task | Inbox listings are not acknowledgements; persist row-ID deduplication and commit it only after successful processing. |
 
 For example, generate a fresh named-curve key with the OpenSSL 3 executable

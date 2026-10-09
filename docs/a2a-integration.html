@@ -647,12 +647,21 @@ mutual TLS, signed pushes, peer signing-key enrolment and namespace-scoped
 attestation. The receiving host's local plane completes the intended hop.
 The hub itself cannot bridge hosts; mounting a socket remotely does not create
 a supported cross-host transport.</p>
-<p><strong>Current limitation:</strong> federation receive/apply does not currently publish a
-receiving-host inbox wake. The remaining federation-to-local-wake integration is
-tracked in <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/3631">#3631</a>.
-Until that path is complete, the receiving agent's bounded inbox poll discovers
-the replicated row. Cross-host delivery is not a measured millisecond promise.
-See the <a href="federation.md">federation guide</a> for peer configuration.</p>
+<p><strong>Cross-host wake (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/3631">#3631</a>,
+shipped in v1.0.0):</strong> when the receiving daemon applies a replicated inbox row,
+through <code>/sync/push</code> or its catch-up pull, it publishes the same <code>agent_notified</code>
+wake a local <code>memory_notify</code> publishes (<code>src/federation/applied_wake.rs</code>, called
+from <code>src/federation/receive.rs</code> and <code>src/handlers/federation_receive.rs</code>). The
+wake fires only when the apply moved the row forward: a replayed row this node
+already holds, an older inbound that lost the newer-wins merge, and a row that is
+not readable after the apply (tombstoned or quarantined) wake nobody. The wake
+carries the recipient, row id, namespace, sender and a digest of the body, never
+the body itself. <code>ai-memory sync-daemon</code> and the one-shot <code>ai-memory sync</code> CLI
+apply rows in their own process, which installs no wake sink, so rows they apply
+are found by the poll. On every path the bounded inbox poll (at most 60 seconds)
+remains the delivery guarantee; cross-host delivery is not a measured
+millisecond promise. See the <a href="federation.md">federation guide</a> for peer
+configuration.</p>
 <p>Enrol both the transport certificate pin and the peer's Ed25519 signing key.
 A public-only import uses the peer ID configured by the receiving daemon:</p>
 <pre><code class="language-bash">ai-memory identity import --agent-id &quot;$PEER_ID&quot; --pub &quot;$PEER_PUBLIC_KEY_FILE&quot;
@@ -779,7 +788,7 @@ placeholders; never copy an operator's keys or deployment coordinates.</p>
 </tr>
 <tr>
 <td>Inbox rows arrive but no hints</td>
-<td>Check <code>sink_socket</code>, producer enrolment, snapshot refresh, use of the daemon send surface, and the cross-host limitation in #3631. Polling remains required.</td>
+<td>Check <code>sink_socket</code>, producer enrolment, snapshot refresh and use of the daemon send surface. A row applied by <code>ai-memory sync-daemon</code> or <code>ai-memory sync</code> produces no wake (those processes install no wake sink), and a replayed or superseded federated row wakes nobody by design (#3631, section 6). Polling remains required.</td>
 </tr>
 <tr>
 <td>Shell agent reruns the same task</td>
