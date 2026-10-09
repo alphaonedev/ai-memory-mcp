@@ -1602,6 +1602,18 @@ def _shape(old: str, new: Union[str, Transform]) -> Edit:
     return (SHAPE, old, new, False)
 
 
+SHAPE_RUNS_ON = "    runs-on: ubuntu-latest\n"
+
+
+def _add_shape_continue_on_error(text: str) -> str:
+    """Give the release-shape job `continue-on-error: true` when it has none
+    (#4720). While the job is advisory the key is already there and the text is
+    unchanged, so the case is red exactly until the flip lands."""
+    if "continue-on-error" in text:
+        return text
+    return text.replace(SHAPE_RUNS_ON, SHAPE_RUNS_ON + "    continue-on-error: true\n", 1)
+
+
 JOB_RE_TMPL = r"(?m)^  %s:\n(?P<body>(?:^(?:    .*|)\n)*)"
 
 
@@ -2078,6 +2090,8 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR10 job name changed": ("fail", [_shape(SHAPE_NAME, '    name: "Release shape"\n')]),
     "SR10 job runs-on changed": ("fail", [_shape("    runs-on: ubuntu-latest\n    # Advisory", "    runs-on: self-hosted\n    # Advisory")]),
     "SR10 job timeout changed": ("fail", [_shape("    timeout-minutes: 60\n", "    timeout-minutes: 600\n")]),
+    # --- #4720: the release-shape proof is required; a continue-on-error on the job is refused
+    "4720 release-shape job carries continue-on-error": ("fail", [_shape(SHAPE_RUNS_ON, _add_shape_continue_on_error)]),
     "SR10 an extra job": ("fail", [_shape(SHAPE_NAME, lambda t: t.rstrip("\n") + "\n\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n")]),
     "SR10 permissions changed": ("fail", [_shape("permissions:\n  contents: read\n", "permissions:\n  contents: write\n")]),
     "SR10/P25 last path filter dropped": ("fail", [_shape('      - "migrations/**"\n', "")]),
