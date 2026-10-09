@@ -8911,6 +8911,87 @@ enabled = true
         }
     }
 
+    /// #4121 — the LLM and embeddings reachability probes are an inference
+    /// egress like any other: under a refusing `AI_MEMORY_INFERENCE_EGRESS`
+    /// posture they must send NOTHING (no request, so no Bearer credential)
+    /// to the configured endpoint and report the refusal as a fact. Control:
+    /// `allow` still probes both endpoints.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reachability_probes_honour_inference_egress_4121() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (mode, allowed) in [("deny", false), ("allow", true)] {
+            let server = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            // The env lock and the scope live INSIDE the blocking task, so
+            // no std lock is held across an `.await`.
+            let (llm, embed) = tokio::task::spawn_blocking(move || {
+                let _config = crate::config::test_env_lock();
+                let _reach = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+                clear_llm_embed_env();
+                let _scope = EnvScope::set(&[
+                    (crate::egress::ENV_INFERENCE_EGRESS, mode),
+                    (
+                        "AI_MEMORY_LLM_BACKEND",
+                        crate::llm::BACKEND_OPENAI_COMPATIBLE,
+                    ),
+                    ("AI_MEMORY_LLM_BASE_URL", &uri),
+                    ("AI_MEMORY_LLM_API_KEY", "pw-placeholder-4121"),
+                    ("AI_MEMORY_LLM_MODEL", "fixture-model-4121"),
+                    (
+                        "AI_MEMORY_EMBED_BACKEND",
+                        crate::llm::BACKEND_OPENAI_COMPATIBLE,
+                    ),
+                    ("AI_MEMORY_EMBED_BASE_URL", &uri),
+                    ("AI_MEMORY_EMBED_API_KEY", "pw-placeholder-4121"),
+                    ("AI_MEMORY_EMBED_MODEL", "fixture-embed-4121"),
+                ]);
+                (
+                    section_llm_reachability_1146(),
+                    section_embeddings_reachability_1598(),
+                )
+            })
+            .await
+            .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            if allowed {
+                assert_eq!(
+                    requests.len(),
+                    2,
+                    "control: `allow` probes the LLM and the embedding endpoint"
+                );
+                continue;
+            }
+            assert!(
+                requests.is_empty(),
+                "#4121: under {mode} the doctor probes contacted the refused endpoint \
+                 {} time(s) (Authorization header present: {})",
+                requests.len(),
+                requests
+                    .iter()
+                    .any(|r| r.headers.contains_key("authorization"))
+            );
+            for section in [&llm, &embed] {
+                assert!(
+                    section.facts.iter().any(|(k, _)| k == "inference_egress"),
+                    "#4121: {} must name the egress refusal as a fact; facts={:?}",
+                    section.name,
+                    section.facts
+                );
+                assert!(
+                    !section.facts.iter().any(|(k, _)| k == "http_status"),
+                    "#4121: {} must not report a probe status under a refusal",
+                    section.name
+                );
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn llm_reachability_probe_arms_1146() {
         use wiremock::matchers::{method, path};
