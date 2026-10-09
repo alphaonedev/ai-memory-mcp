@@ -195,7 +195,11 @@ fn assert_escalation_not_queued<T: std::fmt::Debug>(
         msg.contains("escalation NOT queued") && !msg.contains("pending_id="),
         "{funnel}: a failed queue write must say NOT queued and name no id: {msg}"
     );
-    assert_eq!(pending_counts(conn).0, before, "{funnel}: nothing was queued");
+    assert_eq!(
+        pending_counts(conn).0,
+        before,
+        "{funnel}: nothing was queued"
+    );
     assert!(conn.is_autocommit(), "{funnel}: back in autocommit");
 }
 

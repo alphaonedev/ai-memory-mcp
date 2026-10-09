@@ -353,7 +353,8 @@ pub fn escalation_refusal_text(pending_id: &str, reason: &str) -> String {
 /// never reaches the GovernanceRefusal reason, which lands in HTTP 403 bodies
 /// and MCP error data (the immediate, non-deferred path returns only the rule
 /// reason and logs the detail; this matches it).
-pub const ESCALATION_NOT_QUEUED_TEXT: &str = "escalation NOT queued (storage error; see server log)";
+pub const ESCALATION_NOT_QUEUED_TEXT: &str =
+    "escalation NOT queued (storage error; see server log)";
 
 /// Vote item 2 — rewrite a funnel's refusal to the REAL outcome of the queue
 /// writes its own transaction just settled: the deferred text becomes the

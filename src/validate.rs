@@ -614,7 +614,10 @@ pub fn validate_governance_depth_knobs(governance: &serde_json::Value) -> Result
     let Some(obj) = governance.as_object() else {
         return Ok(());
     };
-    for knob in [REQUIRE_APPROVAL_ABOVE_DEPTH_KEY, SKILL_PROMOTION_MIN_DEPTH_KEY] {
+    for knob in [
+        REQUIRE_APPROVAL_ABOVE_DEPTH_KEY,
+        SKILL_PROMOTION_MIN_DEPTH_KEY,
+    ] {
         match obj.get(knob) {
             None | Some(serde_json::Value::Null) => {}
             Some(v) if v.as_u64().is_some_and(|n| u32::try_from(n).is_ok()) => {}

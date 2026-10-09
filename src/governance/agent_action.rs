@@ -2913,7 +2913,11 @@ mod tests {
             host: "203.0.113.9".into(),
             scheme: "https".into(),
         };
-        assert!(check_agent_action(&conn, "agent:t", &action).unwrap().is_refusal());
+        assert!(
+            check_agent_action(&conn, "agent:t", &action)
+                .unwrap()
+                .is_refusal()
+        );
         let other = AgentAction::NetworkRequest {
             host: "203.0.113.10".into(),
             scheme: "https".into(),

@@ -1013,10 +1013,7 @@ namespace = "{pat}"
             match err {
                 HooksConfigError::Validation { field, reason } => {
                     assert_eq!(field, "hook[0].namespace", "{bad:?}");
-                    assert!(
-                        reason.contains("unsupported wildcard"),
-                        "{bad:?}: {reason}"
-                    );
+                    assert!(reason.contains("unsupported wildcard"), "{bad:?}: {reason}");
                 }
                 other => panic!("{bad:?}: expected a Validation error, got {other:?}"),
             }

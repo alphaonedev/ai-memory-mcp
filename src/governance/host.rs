@@ -658,7 +658,12 @@ mod tests {
                 .host(),
             "203.0.113.9"
         );
-        assert_eq!(canonicalize_host("[64:ff9b::203.0.113.9]:8443").unwrap().port(), Some(8443));
+        assert_eq!(
+            canonicalize_host("[64:ff9b::203.0.113.9]:8443")
+                .unwrap()
+                .port(),
+            Some(8443)
+        );
         // Distinct hosts, by decision.
         let v6 = |s: &str| format!("[{}]", s.parse::<Ipv6Addr>().unwrap());
         assert_eq!(h("[::203.0.113.9]"), v6("::203.0.113.9"));

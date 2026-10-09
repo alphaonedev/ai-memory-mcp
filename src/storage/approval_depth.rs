@@ -197,9 +197,7 @@ pub fn approval_depth_level_state(class: &StandardMetadata) -> ApprovalDepthLeve
             // time (`validate::validate_governance_depth_knobs`); this is the
             // read-side floor for rows written before that or out of band.
             Some(v) => ApprovalDepthLevelState::Explicit(
-                v.as_u64()
-                    .and_then(|n| u32::try_from(n).ok())
-                    .unwrap_or(0),
+                v.as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0),
             ),
         },
     }

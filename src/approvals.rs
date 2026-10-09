@@ -930,7 +930,9 @@ pub mod signed {
         #[must_use]
         pub fn refusal_text(&self, reason: &str) -> String {
             match self {
-                Self::Queued(id) => crate::storage::escalation_deferral::queued_refusal_text(id, reason),
+                Self::Queued(id) => {
+                    crate::storage::escalation_deferral::queued_refusal_text(id, reason)
+                }
                 Self::Deferred(id) => {
                     crate::storage::escalation_deferral::deferred_refusal_text(id, reason)
                 }
@@ -1380,7 +1382,10 @@ pub mod signed {
             // No transaction open on this thread: the row is WRITTEN.
             let queued = route(&conn);
             assert!(matches!(queued, EscalationRouting::Queued(_)), "{queued:?}");
-            assert!(exists(queued.pending_id()), "a Queued id names a row that exists");
+            assert!(
+                exists(queued.pending_id()),
+                "a Queued id names a row that exists"
+            );
             assert!(
                 queued
                     .refusal_text("escalated reason")
@@ -1413,7 +1418,10 @@ pub mod signed {
             assert_ne!(queued, deferred, "the two outcomes are distinct types");
             // The transaction ending settles the deferred write.
             txn.rollback();
-            assert!(exists(deferred.pending_id()), "settled on the funnel connection");
+            assert!(
+                exists(deferred.pending_id()),
+                "settled on the funnel connection"
+            );
         }
 
         #[test]

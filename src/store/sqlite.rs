@@ -979,12 +979,14 @@ impl MemoryStore for SqliteStore {
             Ok(found) => found,
             Err(e) => {
                 let e = txn.rollback_resolving(e);
-                return Err(e.downcast_ref::<crate::storage::InvalidTransition>().map_or_else(
-                    || box_err(&e),
-                    |it| StoreError::InvalidTransition {
-                        detail: it.to_string(),
-                    },
-                ));
+                return Err(e
+                    .downcast_ref::<crate::storage::InvalidTransition>()
+                    .map_or_else(
+                        || box_err(&e),
+                        |it| StoreError::InvalidTransition {
+                            detail: it.to_string(),
+                        },
+                    ));
             }
         };
         if !found {

@@ -16,9 +16,8 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::ns_standard_ancestor::{
-    AncestorLevel, DescendantLevel, GoverningAncestor, SetRefusal,
-    classify_standard_metadata_text, descendant_admission, select_governing_ancestor,
-    select_governing_descendant, set_admission,
+    AncestorLevel, DescendantLevel, GoverningAncestor, SetRefusal, classify_standard_metadata_text,
+    descendant_admission, select_governing_ancestor, select_governing_descendant, set_admission,
 };
 
 /// The RAW level row: `namespace_meta.standard_id` and the bound memory's RAW
@@ -120,10 +119,13 @@ pub fn governing_descendants_binding(
         })
         .context("#4713 descendant levels read")?;
     let levels = rows.map(|row| {
-        row.context("#4713 descendant level row").map(|row| match row {
-            (None, _, _) | (Some(_), false, _) => AncestorLevel::Severed,
-            (Some(_), true, raw) => classify_standard_metadata_text(raw.as_deref().unwrap_or("null")),
-        })
+        row.context("#4713 descendant level row")
+            .map(|row| match row {
+                (None, _, _) | (Some(_), false, _) => AncestorLevel::Severed,
+                (Some(_), true, raw) => {
+                    classify_standard_metadata_text(raw.as_deref().unwrap_or("null"))
+                }
+            })
     });
     select_governing_descendant(caller, levels)
 }
@@ -245,7 +247,11 @@ mod tests {
     #[test]
     fn first_bind_above_a_foreign_owned_descendant_is_refused_4713() {
         let c = conn();
-        let b_std = standard(&c, "s", r#"{"agent_id":"b","governance":{"write":"owner"}}"#);
+        let b_std = standard(
+            &c,
+            "s",
+            r#"{"agent_id":"b","governance":{"write":"owner"}}"#,
+        );
         meta(&c, "root/proj", Some(&b_std), None);
         assert_eq!(
             governing_descendants_binding(&c, "root", "x").expect("read"),

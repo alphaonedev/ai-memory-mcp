@@ -1246,7 +1246,10 @@ mod tests {
             ("require_approval_above_depth", json!(-1)),
             ("require_approval_above_depth", json!(2.5)),
             ("require_approval_above_depth", json!(true)),
-            ("require_approval_above_depth", json!(u64::from(u32::MAX) + 1)),
+            (
+                "require_approval_above_depth",
+                json!(u64::from(u32::MAX) + 1),
+            ),
             ("skill_promotion_min_depth", json!("2")),
             ("skill_promotion_min_depth", json!(-2)),
             ("skill_promotion_min_depth", json!(1.5)),

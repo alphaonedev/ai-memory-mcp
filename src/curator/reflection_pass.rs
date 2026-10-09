@@ -631,7 +631,8 @@ impl<'a> ReflectionPass<'a> {
                 max_src_depth = max_src_depth.max(m.reflection_depth);
             }
         }
-        let proposed_depth = u32::try_from(max_src_depth.max(0).saturating_add(1)).unwrap_or(u32::MAX);
+        let proposed_depth =
+            u32::try_from(max_src_depth.max(0).saturating_add(1)).unwrap_or(u32::MAX);
         // The SAME pending payload shape the MCP L1-8 gate queues, so an
         // approve replays it through `execute_reflect_from_payload`.
         let payload = serde_json::json!({
@@ -1978,7 +1979,8 @@ mod tests {
                 "policy",
                 0,
             );
-            standard.metadata = serde_json::json!({"agent_id": "ai:owner", "governance": governance});
+            standard.metadata =
+                serde_json::json!({"agent_id": "ai:owner", "governance": governance});
             let sid = crate::db::insert(&conn, &standard).unwrap();
             crate::db::set_namespace_standard(&conn, ns, &sid, None).unwrap();
             conn
@@ -2047,23 +2049,15 @@ mod tests {
                 crate::config::PermissionsMode::Enforce,
             );
             let (store, _dir) = open_db();
-            let conn = governed_namespace(
-                &store,
-                "owned-4395",
-                serde_json::json!({"write": "owner"}),
-            );
+            let conn =
+                governed_namespace(&store, "owned-4395", serde_json::json!({"write": "owner"}));
             let llm = StubLlm::new("owned pattern");
-            let report = run_reflection_pass(
-                &store,
-                &llm,
-                None,
-                Some("owned-4395"),
-                None,
-                false,
-                |_| true,
-            )
-            .await
-            .unwrap();
+            let report =
+                run_reflection_pass(&store, &llm, None, Some("owned-4395"), None, false, |_| {
+                    true
+                })
+                .await
+                .unwrap();
             crate::config::override_active_permissions_mode_for_test(
                 crate::config::PermissionsMode::Advisory,
             );
