@@ -3297,7 +3297,7 @@ class ExternalPrApprovalOnPush6117(unittest.TestCase):
 
     APPROVAL_STEPS = ("Self-test the external-PR approval evaluator (#6193)",
                       "Evaluate external-PR approval requirement")
-    STEP_NEUTRALISER = r"(?m)^\s+(?:- )?(?:if|continue-on-error):|^\s+timeout-minutes:\s*0\s*$"
+    STEP_NEUTRALISER = r"""(?m)^\s+(?:- )?["']?(?:if|continue-on-error)["']?\s*:|^\s+timeout-minutes\s*:\s*0\s*$"""
 
     def test_6117_r3_f2_approval_steps_cannot_be_neutralised(self) -> None:
         # Cloud F2: a step-level `if:` or `continue-on-error` turns the required context green.
@@ -3498,6 +3498,9 @@ def _carrier_consumption_problems(ci: str, cov: str, c8: str) -> List[str]:
             problems.append(f"c8-precheck step {step!r} is missing")
         elif f"{key}: {rhs}\n" not in block:
             problems.append(f"c8-precheck step {step!r} no longer reads {key}: {rhs}")
+    bound = c8.count(f"      - name: {CARRIER_RANGE_STEP}\n        id: carrier\n")
+    if bound != c8.count(f"- name: {CARRIER_RANGE_STEP}"):
+        problems.append("a carrier range step lost its `id: carrier` binding (steps.carrier.outputs would be empty)")
     arm = _carrier_arm(ci, "classify", CARRIER_ARM_IF)
     for want in ('echo "docs_only=false"', 'echo "test_impact=__ALL__"', "exit 0"):
         if want not in arm:
@@ -3869,10 +3872,12 @@ class BeforeClosedWorld6260(unittest.TestCase):
 
 APPROVAL_EVALUATE_STEP = "Evaluate external-PR approval requirement"
 APPROVAL_SELFTEST_STEP = "Self-test the external-PR approval evaluator (#6193)"
-APPROVAL_STEP_NEUTRALISER = r"(?m)^\s+(?:- )?(?:if|continue-on-error):|^\s+timeout-minutes:\s*0\s*$"
+APPROVAL_STEP_NEUTRALISER = r"""(?m)^\s+(?:- )?["']?(?:if|continue-on-error)["']?\s*:|^\s+timeout-minutes\s*:\s*0\s*$"""
 # The exact commands (no `|| true`, no swapped flag): the Evaluate step must run the real check.
 APPROVAL_SELFTEST_RUN = "python3 -I scripts/check_external_pr_approval.py --self-test"
 APPROVAL_EVALUATE_RUN = "python3 -I scripts/check_external_pr_approval.py"
+# The approving authority the context name, the governance doc and contributing-external.md promise.
+APPROVAL_OPERATOR = "alphaonedev"
 
 
 def _approval_job_problems(c8: str) -> List[str]:
@@ -3894,6 +3899,9 @@ def _approval_job_problems(c8: str) -> List[str]:
         runs = [r.strip() for r in _step_runs(block, name)]
         if runs != [command]:
             problems.append(f"step {name!r} runs {runs!r}, not exactly {command!r}")
+    evaluate = _step_block(job, APPROVAL_EVALUATE_STEP)
+    if f"          OPERATOR_LOGIN: {APPROVAL_OPERATOR}\n" not in evaluate:
+        problems.append(f"the Evaluate step no longer sets OPERATOR_LOGIN: {APPROVAL_OPERATOR}")
     return problems
 
 
@@ -4178,9 +4186,8 @@ class CloudR2ApprovalPins(unittest.TestCase):
                 self.assertTrue(self.mutated_job(anchor, anchor + extra), extra)
 
     def test_cloud_r2_f8_header_comment_matches_the_per_event_behaviour(self) -> None:
-        job_start = self.c8.index(f"\n  {APPROVAL_JOB}:\n")
-        header = self.c8[self.c8.rindex("\n\n", 0, job_start):job_start]
-        self.assertNotIn("A push or merge_group run", header)
+        header = _job_text(self.c8, APPROVAL_JOB)
+        self.assertNotIn("applies the rule above to each", header)
         self.assertIn("named by the queue ref", header)
         self.assertIn("head_sha", header)
 

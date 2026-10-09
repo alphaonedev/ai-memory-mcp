@@ -1330,11 +1330,12 @@ jobs:
     # re-reviews what will actually merge. Team-authored same-repo PRs pass
     # unconditionally: the single-authority merge train is untouched.
     #
-    # EVERY EVENT (#6117 / #6193). A push or merge_group run reports this
-    # REQUIRED context on the same sha as the PR run, so it is judged too:
-    # scripts/check_external_pr_approval.py lists the open PRs whose head is
-    # GITHUB_SHA and applies the rule above to each (none: pass); any API
-    # error fails closed. Residual (#6213): a PR opened LATER on a sha a push
+    # EVERY EVENT (#6117 / #6193 / #6227). A push or merge_group run reports
+    # this REQUIRED context on the same sha as the PR run, so it is judged
+    # too: scripts/check_external_pr_approval.py judges the event's own pull
+    # request on pull_request; on merge_group the PR named by the queue ref
+    # (whose sha must equal merge_group.head_sha); on push the open PRs
+    # whose head is GITHUB_SHA (none: pass). Any API error fails closed. Residual (#6213): a PR opened LATER on a sha a push
     # run already judged still sits beside that earlier run's result.
     #
     # Commit signing is enforced separately (live `required_signatures`
