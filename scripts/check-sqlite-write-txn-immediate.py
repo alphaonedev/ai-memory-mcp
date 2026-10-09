@@ -674,6 +674,165 @@ def self_test():
     ):
         got = sorted({h[0] for h in scan(files)})
         expect("red:#6152 nested mod in cfg(test): " + label, got == flagged)
+    # --- #6154 review R2 (F1): every literal is read; only message sinks skip ---
+    # Decision (single correct answer, fail closed; no vote): the base gate read
+    # every string literal, and the #6152 narrowing to SQL argument positions let
+    # DEFERRED statements escape.  Keep the base behaviour and exempt only
+    # literals that are arguments of message sinks.
+    f_open = "fn f(c: &Connection) -> Result<()> {\n%s\n    Ok(())\n}\n"
+    for label, text in (
+        ("let String::from", f_open % '    let sql = String::from("BEGIN");\n    c.execute_batch(&sql)?;'),
+        ("let to_string", f_open % '    let sql = "BEGIN".to_string();\n    c.execute_batch(&sql)?;'),
+        ("as_str chain", f_open % '    let sql = String::from("BEGIN");\n    c.execute_batch(sql.as_str())?;'),
+        ("helper fn returns literal", "fn open_sql() -> &'static str {\n    \"BEGIN\"\n}\n"),
+        ("helper fn one-line return", "fn open_sql() -> &'static str { \"BEGIN\" }\n"),
+        ("pub(crate) const", 'pub(crate) const OPEN: &str = "BEGIN";\n'),
+        ("pub(in path) const", 'pub(in crate::storage) const OPEN: &str = "BEGIN";\n'),
+        ("const wrapped by rustfmt", 'const OPEN_AND_LOG: &str =\n    "BEGIN";\n'),
+        ("let wrapped by rustfmt", f_open % '    let sql =\n        "BEGIN";\n    c.execute_batch(sql)?;'),
+        ("UFCS execute_batch", f_open % '    rusqlite::Connection::execute_batch(c, "BEGIN")?;'),
+        ("UFCS split", f_open % '    rusqlite::Connection::execute_batch(\n        c,\n        "BEGIN",\n    )?;'),
+        ("query_row_and_then", f_open % '    c.query_row_and_then("BEGIN", [], |_| Ok::<(), rusqlite::Error>(()))?;'),
+        ("prepare_with_flags", f_open % '    c.prepare_with_flags("BEGIN", PrepFlags::empty())?;'),
+        ("Batch::new", f_open % '    let mut b = rusqlite::Batch::new(c, "BEGIN");'),
+        ("helper wrapper arg", f_open % '    exec(c, "BEGIN")?;'),
+        ("if expr let", f_open % '    let sql = if ro { "BEGIN" } else { "BEGIN IMMEDIATE" };\n    c.execute_batch(sql)?;'),
+        (
+            "match arm",
+            f_open % '    let sql = match m {\n        Mode::Read => "BEGIN",\n        Mode::Write => "BEGIN IMMEDIATE",\n    };\n    c.execute_batch(sql)?;',
+        ),
+        ("reassign mut", f_open % '    let mut sql = "SELECT 1";\n    sql = "BEGIN";\n    c.execute_batch(sql)?;'),
+        ("struct field", f_open % '    let s = Stmt { sql: "BEGIN" };\n    c.execute_batch(s.sql)?;'),
+        ("array of statements", f_open % '    for s in ["BEGIN", "INSERT INTO t VALUES (1)"] {\n        c.execute(s, [])?;\n    }'),
+        ("format! in let", f_open % '    let sql = format!("BEGIN {}", mode);\n    c.execute_batch(&sql)?;'),
+        ("format! arg literal in execute_batch", f_open % '    c.execute_batch(&format!("{}", "BEGIN"))?;'),
+        ("closure return", f_open % '    let open = || "BEGIN";\n    c.execute_batch(open())?;'),
+        ("Some(literal)", f_open % '    let sql = Some("BEGIN");\n    c.execute_batch(sql.unwrap_or_default())?;'),
+        ("String::from SAVEPOINT", f_open % '    let s = String::from("SAVEPOINT a");\n    c.execute_batch(&s)?;'),
+        ("plain fn named info (not a macro)", f_open % '    info(c, "BEGIN")?;'),
+        ("free fn named expect (not a method)", f_open % '    expect("BEGIN");'),
+        ("block inside assert!", f_open % '    assert!({ let s = "BEGIN"; c.execute_batch(s).is_ok() });'),
+        ("unknown call inside a sink", f_open % '    panic!("{}", exec(c, "BEGIN"));'),
+        ("let inside a closure passed to context", f_open % '    r.with_context(|| { let s = "BEGIN"; s })?;'),
+    ):
+        rule = "R6" if "SAVEPOINT" in text else "R3"
+        bad, _, _ = run(text)
+        expect("red:#6154 F1 literal escapes the SQL-position rule: " + label, [b[3] for b in bad] == [rule])
+    for label, text in (
+        ("expect", 'let t = WriteTxn::begin(c).expect("begin");'),
+        ("expect_err", 'let e = WriteTxn::begin(c).expect_err("BEGIN");'),
+        ("context", 'let t = WriteTxn::begin(c).context("BEGIN")?;'),
+        ("with_context", 'let t = WriteTxn::begin(c).with_context(|| format!("begin {}", n))?;'),
+        ("expect(&format!)", 'let t = WriteTxn::begin(c).expect(&format!("BEGIN {}", n));'),
+        ("panic!", 'panic!("BEGIN");'),
+        ("assert!", 'assert!(ok, "begin");'),
+        ("assert_eq!", 'assert_eq!(a, 1, "BEGIN");'),
+        ("assert_ne!", 'assert_ne!(a, 1, "begin;");'),
+        ("debug_assert!", 'debug_assert!(ok, "begin");'),
+        ("debug_assert_eq!", 'debug_assert_eq!(a, 1, "BEGIN");'),
+        ("unreachable!", 'unreachable!("begin");'),
+        ("todo!", 'todo!("BEGIN");'),
+        ("unimplemented!", 'unimplemented!("begin");'),
+        ("trace!", 'trace!("BEGIN");'),
+        ("debug!", 'debug!("begin");'),
+        ("info!", 'info!("BEGIN");'),
+        ("warn!", 'warn!("begin");'),
+        ("error!", 'error!("BEGIN");'),
+        ("tracing::info!", 'tracing::info!("BEGIN");'),
+        ("print!", 'print!("BEGIN");'),
+        ("println!", 'println!("begin");'),
+        ("eprint!", 'eprint!("BEGIN");'),
+        ("eprintln!", 'eprintln!("begin");'),
+        ("write!", 'write!(f, "BEGIN")?;'),
+        ("writeln!", 'writeln!(f, "begin")?;'),
+        ("anyhow!", 'return Err(anyhow!("BEGIN"));'),
+        ("bail!", 'bail!("begin");'),
+        ("ensure!", 'ensure!(ok, "BEGIN");'),
+        ("params!", 'c.execute("INSERT INTO t(a) VALUES (?1)", params!["BEGIN"])?;'),
+        ("named_params!", 'c.execute("INSERT INTO t(a) VALUES (:a)", named_params! {":a": "begin"})?;'),
+        ("format! inside panic!", 'panic!("{}", format!("BEGIN {}", n));'),
+        ("rustfmt-wrapped expect", 'let t = WriteTxn::begin(c)\n        .expect(\n            "BEGIN",\n        );'),
+    ):
+        bad, _, _ = run("fn f(c: &Connection) {\n    %s\n}\n" % text)
+        expect("green:#6154 F1 message sink literal is not SQL: " + label, not bad)
+    # --- #6154 review R2 (F2): one whole-file literal pass, no 3-line window ---
+    for label, text in (
+        (
+            "multi-line SQL execute closing within 3 lines, then BEGIN",
+            'fn f(c: &Connection) -> Result<()> {\n    c.execute(\n        "UPDATE t SET a = 1\n'
+            '         WHERE b = 2\n         AND c = 3\n         AND d = 4",\n        [],\n    )?;\n'
+            '    c.execute_batch("BEGIN")?;\n    Ok(())\n}\n',
+        ),
+        ("char literal quote on the line above", "fn f(c: &Connection) {\n    let q = '\"';\n    c.execute_batch(\"BEGIN\")?;\n}\n"),
+        (
+            "open multi-line string above",
+            'fn f(c: &Connection) {\n    let note = "line one\n        line two";\n    c.execute_batch("BEGIN")?;\n}\n',
+        ),
+        (
+            "raw string with a quote above",
+            'fn f(c: &Connection) {\n    let s = r#"a"b"#;\n    c.execute_batch("BEGIN")?;\n}\n',
+        ),
+        ("escaped quote above", 'fn f(c: &Connection) {\n    let s = "a\\"";\n    c.execute_batch("BEGIN")?;\n}\n'),
+        ("byte string with a quote above", 'fn f(c: &Connection) {\n    let s = b"\\"";\n    c.execute_batch("BEGIN")?;\n}\n'),
+        (
+            "block comment with a quote above",
+            'fn f(c: &Connection) {\n    /* it"s */\n    c.execute_batch("BEGIN")?;\n}\n',
+        ),
+    ):
+        bad, _, _ = run(text)
+        expect("red:#6154 F2 unbalanced quote outside the window: " + label, [b[3] for b in bad] == ["R3"])
+    bad, _, _ = run("fn f() {\n    let s = \"c.unchecked_transaction()\";\n}\n")
+    expect("green:#6154 F2 code-looking text inside a string literal is not code", not bad)
+    # --- #6155 (closed by the whole-literal read): a multi-line literal is read whole ---
+    for label, text in (
+        ("raw const, BEGIN on the 2nd line", 'const S: &str = r#"\nBEGIN;\nINSERT INTO t VALUES (1);\n"#;\n'),
+        ("plain string batch", 'fn f(c: &Connection) {\n    c.execute_batch("\n        BEGIN;\n        COMMIT;")?;\n}\n'),
+        ("statement after a semicolon on line 2", 'fn f(c: &Connection) {\n    c.execute_batch("PRAGMA x = 1;\n BEGIN")?;\n}\n'),
+    ):
+        bad, _, _ = run(text)
+        expect("red:#6155 multi-line literal read whole: " + label, [b[3] for b in bad] == ["R3"])
+    bad, _, _ = run('const S: &str = r#"\nBEGIN IMMEDIATE;\nINSERT INTO t VALUES (1);\n"#;\n')
+    expect("green:#6155 multi-line BEGIN IMMEDIATE batch", not bad)
+    # --- #6154 review R2 (F3): ambiguous mod layout in a cfg(test) block fails closed ---
+    deferred = "fn t(c: &Connection) { c.unchecked_transaction(); }\n"
+    for label, files in (
+        (
+            "mod x; at the block indent, non-rustfmt",
+            {
+                "src/a.rs": "#[cfg(test)]\nmod tests {\nmod helpers;\n}\n",
+                "src/a/tests/helpers.rs": deferred,
+                "src/a/helpers.rs": deferred,
+            },
+        ),
+        (
+            "mod x; left of the block indent",
+            {
+                "src/a.rs": "    #[cfg(test)]\n    mod tests {\n  mod helpers;\n    }\n",
+                "src/a/tests/helpers.rs": deferred,
+                "src/a/helpers.rs": deferred,
+            },
+        ),
+        (
+            "mod x; closing brace missing before the next item",
+            {
+                "src/a.rs": "#[cfg(test)]\nmod tests {\n    mod u {\n        fn h() {}\n}\n",
+                "src/a/tests/u.rs": deferred,
+            },
+        ),
+    ):
+        got = {(h[0], h[3]) for h in scan(files)}
+        expect("red:#6154 F3 ambiguous cfg(test) layout is a violation: " + label, ("src/a.rs", "R0") in got)
+    got = sorted({h[0] for h in scan({
+        "src/a.rs": "#[cfg(test)]\nmod tests {\n        mod helpers;\n}\n",
+        "src/a/tests/helpers.rs": deferred,
+    })})
+    expect("green:#6154 F3 mod x; indented deeper than the block is test code", got == [])
+    got = sorted({h[0] for h in scan({
+        "src/lib.rs": "mod prod;\n#[cfg(test)]\n#[path = \"unit_tests.rs\"]\nmod unit;\n",
+        "src/prod.rs": deferred,
+        "src/unit_tests.rs": deferred,
+    })})
+    expect("red:#6154 F3 mod x; outside a cfg(test) block is scanned, #[path] honoured", got == ["src/prod.rs"])
     # stale allowlist entry must fail
     _, stale, _ = evaluate({"src/x.rs": "fn f() {}\n"}, allow)
     expect("red:stale allowlist", stale == [("src/ok.rs", "ro")])
