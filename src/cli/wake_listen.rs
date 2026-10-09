@@ -867,3 +867,9 @@ mod tests_3642 {
         );
     }
 }
+
+// #4058 — the one-shot wait's backstop bound, pinned against the PRODUCTION
+// backstop clock in its own file.
+#[cfg(test)]
+#[path = "wake_listen_wait_tests.rs"]
+mod wait_tests;
