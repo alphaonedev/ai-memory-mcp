@@ -1785,6 +1785,25 @@ class PruneScript6118(unittest.TestCase):
         self.assertEqual(5, (outside_dsym / "keep").stat().st_size)
         self.assertFalse((ex / "clonex").exists())
 
+    def test_6118_r5_info_same_size_impostor_is_not_named_as_the_bin_source(self) -> None:
+        # Round-4 code review, INFO: name and size alone matched an unrelated
+        # deps/<bin>-<hash> of the same size and then kept it as the bin's
+        # "uplift source".  The bytes decide: only a file with the content of
+        # <profile>/<bin> (a hard link or a clone of it) is the source.
+        deps = self.target / "debug" / "deps"
+        _write(self.target / "debug" / "imp-bin", 4096, True)
+        _write(deps / "imp_bin-aaaaaaaaaaaaaaaa", 4096, True)  # the real source: same bytes
+        impostor = deps / "imp_bin-bbbbbbbbbbbbbbbb"  # a test executable that happens to be as large
+        impostor.write_bytes(b"y" * 4096)
+        impostor.chmod(0o755)
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertTrue((deps / "imp_bin-aaaaaaaaaaaaaaaa").exists())
+        self.assertFalse(impostor.exists(), proc.stdout)
+        self.assertNotIn("imp_bin-bbbbbbbbbbbbbbbb", proc.stdout)
+        self.assertIn("kept deps/imp_bin-aaaaaaaaaaaaaaaa", proc.stdout)
+        self.assertEqual(self._expected_freed() + 4096, self._freed(proc.stdout))
+
 
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
 EXAMPLE_UPLIFT = "debug/examples/demo"
