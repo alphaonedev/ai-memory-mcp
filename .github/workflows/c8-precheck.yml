@@ -1358,8 +1358,9 @@ jobs:
       pull-requests: read
     steps:
       # #6117 / #6193: the evaluator runs on EVERY event. On pull_request it
-      # judges the event's PR; on push / merge_group it judges every OPEN PR
-      # whose head is GITHUB_SHA by the same rule (a push run reports this
+      # judges the event's PR; on merge_group it judges the PR named by
+      # merge_group.head_ref (#6227); on push it judges every OPEN PR whose
+      # head is GITHUB_SHA by the same rule (a push run reports this
       # REQUIRED context on the same sha as the PR run, so it may never pass
       # where the PR run fails). Any API error fails closed. The checkout only
       # supplies the evaluator; it does not keep the token on disk.
