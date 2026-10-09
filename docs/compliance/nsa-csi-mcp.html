@@ -446,8 +446,10 @@ curl -sS -X POST https://&lt;host&gt;/api/v1/agents/&lt;agent&gt;/api-key \
 <span class="com">#    registry, not a boot snapshot: a running `serve` re-reads it from the</span>
 <span class="com">#    configured backend every AI_MEMORY_AGENT_KEY_REFRESH_SECS seconds</span>
 <span class="com">#    (default 15; 0 restores the old restart-required behaviour), so both</span>
-<span class="com">#    enrollment and REVOCATION take effect without a restart. That window is</span>
-<span class="com">#    the upper bound on how long a leaked per-agent key stays live.</span>
+<span class="com">#    enrollment and REVOCATION take effect after the next SUCCESSFUL refresh,</span>
+<span class="com">#    with no restart. The interval is a polling cadence, not an upper bound on</span>
+<span class="com">#    a revoked key's lifetime: a failed refresh keeps the last known key map</span>
+<span class="com">#    with no deadline, so the key authenticates until a refresh succeeds.</span>
 export AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce
 ai-memory serve</pre>
       <div class="anchor-list">

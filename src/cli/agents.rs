@@ -180,9 +180,10 @@ pub enum AgentsAction {
     /// v1.0.0 #2095 — revoke (invalidate) EVERY enrolled per-agent HTTP api-key
     /// bound to `agent_id`. The PK is the token digest, so a leaked key can only
     /// be invalidated by revoking the agent's binding(s). v1.0.0 #3418 — the
-    /// revocation stops the key authenticating within the daemon's refresh
-    /// window with NO restart; that window is the upper bound on how long a
-    /// leaked key stays live, so keep it short on a fleet.
+    /// revocation stops the key authenticating on the daemon's next SUCCESSFUL
+    /// refresh with NO restart; a failed refresh keeps the last known key map,
+    /// so the refresh interval is a cadence, not an upper bound on how long a
+    /// leaked key stays live (#4001) — keep it short on a fleet.
     RevokeApiKey {
         /// Agent identifier whose api-key binding(s) to remove.
         #[arg(long)]

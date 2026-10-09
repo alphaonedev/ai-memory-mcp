@@ -108,9 +108,13 @@ enrolled key map is a LIVE registry, not a boot snapshot: a running `serve`
 re-reads it from the configured backend (sqlite or postgres) every
 `AI_MEMORY_AGENT_KEY_REFRESH_SECS` seconds (default 15; `0` restores the
 previous restart-required behaviour and says so at boot), so enrollment — and,
-materially for this section, **REVOCATION** — takes effect within that window
-with no restart. That window is therefore the upper bound on how long a leaked
-per-agent key stays live, and `ai-memory doctor` reports it. Enrolling against
+materially for this section, **REVOCATION** — takes effect after the next
+SUCCESSFUL refresh, with no restart. The interval is a polling cadence, not an
+upper bound on how long a leaked per-agent key stays live: a refresh that fails
+(backend unreachable, read error) keeps the last known enrolled set with no
+deadline (`AgentKeyRefresh::KeptLastKnown` in
+`src/handlers/identity_binding.rs`), so a revoked key keeps authenticating
+until a refresh succeeds. `ai-memory doctor` reports the cadence. Enrolling against
 a postgres data tier uses
 `ai-memory agents bind-api-key --store-url <url> …`. As of v1.0.0 #3474 the
 same enrolment is reachable over the network without shell access to the data

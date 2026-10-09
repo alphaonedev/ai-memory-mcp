@@ -218,13 +218,19 @@ impl EnrolledAgentKeys {
 /// Env var resolving how often the daemon re-reads `agent_api_keys`.
 ///
 /// Named here rather than in `config.rs` because the VALUE is identity-binding
-/// policy: it is the upper bound on how long a REVOKED key keeps working.
+/// policy: it is the polling cadence after which a REVOKED key stops working
+/// on the next SUCCESSFUL refresh. It is NOT an upper bound on the key's
+/// lifetime: a failed refresh keeps the last known enrolled set with no
+/// deadline (`AgentKeyRefresh::KeptLastKnown`), so the key authenticates
+/// until a refresh succeeds (#4001).
 pub const ENV_AGENT_KEY_REFRESH_SECS: &str = "AI_MEMORY_AGENT_KEY_REFRESH_SECS";
 
 /// Compiled default refresh cadence, in seconds.
 ///
-/// 15s is chosen as the revocation window an operator can reason about: short
-/// enough that "I revoked that key" is true within a quarter-minute, long
+/// 15s is chosen as the revocation cadence an operator can reason about: short
+/// enough that "I revoked that key" lands within a quarter-minute once a
+/// refresh succeeds (a failed refresh keeps the last known set, so this is a
+/// cadence, not a bound — #4001), long
 /// enough that a 1000-daemon fleet polling one postgres tier costs one trivial
 /// indexed read per daemon per 15s. The read is `SELECT token_sha256, agent_id`
 /// over a table sized by ENROLLED AGENTS, not by memories.

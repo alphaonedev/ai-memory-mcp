@@ -2439,10 +2439,11 @@ pub trait MemoryStore: Send + Sync {
     /// #2095 (v1.0.0) — revoke EVERY enrolled per-agent api-key bound to
     /// `agent_id` (invalidate a leaked key). Returns the number of bindings
     /// removed; revoking an unbound agent is `Ok(0)` (idempotent). v1.0.0 #3418
-    /// — takes effect within the daemon's live-refresh window
+    /// — takes effect on the daemon's next SUCCESSFUL live refresh
     /// (`AI_MEMORY_AGENT_KEY_REFRESH_SECS`, default 15s), NOT at the next
-    /// restart; that window is the upper bound on how long a leaked key stays
-    /// live.
+    /// restart; a failed refresh keeps the last known key map, so that
+    /// interval is a polling cadence, not an upper bound on how long a leaked
+    /// key stays live (#4001).
     ///
     /// Default returns `UnsupportedCapability` so an adapter without key
     /// provisioning fails loudly rather than silently leaving a leaked key live.
