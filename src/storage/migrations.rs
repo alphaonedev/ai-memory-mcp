@@ -4673,7 +4673,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 /// legacy immortal rows (NULL `expires_at` on mid/short), which GC can never
 /// reap. Stamps `created_at + Tier::default_ttl_secs()` (the SAME SSOT the
 /// write path uses, bound as a parameter); `long` rows have no TTL and stay
-/// NULL. Idempotent: only NULL-expiry rows are touched.
+/// NULL. Idempotent: only NULL-expiry rows are touched. #2462: writes the
+/// canonical `…SS.ffffffZ` rendering itself (`%f` = `SS.SSS`, padded to
+/// micros) rather than relying on the later v87 heal.
 ///
 /// # Errors
 /// Propagates any sqlite error from the per-tier `UPDATE`.
@@ -4682,7 +4684,7 @@ pub fn backfill_v54_tier_default_expiry(conn: &Connection) -> Result<()> {
         if let Some(ttl_secs) = tier.default_ttl_secs() {
             conn.execute(
                 "UPDATE memories \
-                    SET expires_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', created_at, ?1) \
+                    SET expires_at = strftime('%Y-%m-%dT%H:%M:%f000Z', created_at, ?1) \
                   WHERE expires_at IS NULL AND tier = ?2",
                 params![format!("+{ttl_secs} seconds"), tier.as_str()],
             )?;
