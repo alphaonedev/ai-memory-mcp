@@ -1690,6 +1690,36 @@ class PruneScript6118(unittest.TestCase):
         self.assertEqual(1, len(bin_lines), kept)
         self.assertIn("debug/probe-bin", bin_lines[0])
 
+    # ---- round 5 (#6254..#6258) ----
+
+    def _control_bytes(self, out: str) -> List[str]:
+        """Every character of ``out`` that a terminal or a log viewer would act on (LF ends a line, so it stays)."""
+        return sorted({repr(c) for c in out if (ord(c) < 0x20 and c != "\n") or 0x7F <= ord(c) <= 0x9F})
+
+    def test_6118_r5_6254_control_characters_in_names_never_reach_the_log_raw(self) -> None:
+        # #6254 (SR4-1): a file name with ESC, BEL, BS, VT, FF, DEL or a C1
+        # character reaches a LATER job's log through the kept, `would delete`
+        # and warning lines; the web viewer recolours or hides text on an ANSI
+        # SGR sequence.  Every C0 control other than CR/LF, DEL and C1 is
+        # written as \xNN.
+        mod = _load_prune()
+        self.assertEqual("a\\x1b[31mb\\x07c\\x7fd\\x85e\\x09f", mod._escape("a\x1b[31mb\x07c\x7fd\u0085e\tf"))
+        self.assertEqual("a%0Db%0Ac%25", mod._escape("a\rb\nc%"))  # the existing escapes still win for CR / LF / %
+        deps = self.target / "debug" / "deps"
+        for name in ("esc\x1b[31m-0123456789abcdef", "bel\x07x-0123456789abcdef", "del\x7fx-0123456789abcdef",
+                     "ctl\x08\x0b\x0c-0123456789abcdef", "c1\u0085x-0123456789abcdef"):
+            _write(deps / name, 9, True)
+        kept = deps / "kept\x1b]0;title\x07name"
+        _write(kept, 9, True)
+        os.link(kept, Path(self.scratch.name) / "kept-outside")
+        for args in (("--dry-run",), ()):
+            proc = self._run("--target-dir", str(self.target), *args)
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            self.assertEqual([], self._control_bytes(proc.stdout + proc.stderr), (args, proc.stdout))
+            self.assertIn("kept\\x1b]0;title\\x07name", proc.stdout, args)
+            if args:  # only the dry run lists the names it would delete
+                self.assertIn("esc\\x1b[31m-0123456789abcdef", proc.stdout, args)
+
 
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
 EXAMPLE_UPLIFT = "debug/examples/demo"
