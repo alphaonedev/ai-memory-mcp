@@ -38,6 +38,16 @@ env:
   # Declaring it at workflow level also means no job depends on the runner
   # `.env` supplying it.
   CARGO_INCREMENTAL: "0"
+  # #6118 — the SAME debuginfo pair as ci.yml's `check` job. The macos-fed leg
+  # shares that job's persistent `target/` on the f1 node, and the debuginfo
+  # level is part of cargo's artifact hash: left at cargo's default (full
+  # debuginfo) this suite kept a THIRD complete dependency tree there, at the
+  # largest size. One level for every self-hosted cargo job = one tree. TEST is
+  # set alongside DEV per the #3461 pair rule. Harmless on the hosted ubuntu
+  # leg (smaller binaries, shorter link; the ephemeral VM keeps nothing).
+  # Pinned by scripts/test/test_ci_runner_target_hygiene_6118.py.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   lifetime-tests:
@@ -80,3 +90,14 @@ jobs:
           AI_MEMORY_NO_CONFIG: '1'
         run: |
           cargo test --test boot_primitive_contract --test recipe_contract --test boot_lifecycle
+
+      # #6118 — prune the test executables this job linked into the f1 runner's
+      # persistent `target/` (the warm rlib / build-script / fingerprint cache
+      # is kept). Full rationale on the step of the same name in ci.yml.
+      # always(): a red or cancelled run leaves the same binaries behind.
+      # Self-hosted only: the hosted ubuntu VM is discarded with the job. MUST
+      # stay the LAST step — pinned by
+      # scripts/test/test_ci_runner_target_hygiene_6118.py.
+      - name: Prune runner target dir (#6118)
+        if: always() && runner.environment != 'github-hosted'
+        run: python3 scripts/ci/prune-runner-target.py --target-dir "${CARGO_TARGET_DIR:-target}"

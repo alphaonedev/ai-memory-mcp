@@ -801,6 +801,20 @@ else
         "$(grep -E 'R-(PR|PUSH|SHAPE)|^FAIL|^ERROR' "$SCRATCH/f-5447.out" | head -12)"
 fi
 
+# SECTION G (#6118): self-hosted runner target-dir hygiene. Every job that runs
+# cargo on a self-hosted label declares CARGO_PROFILE_DEV_DEBUG and
+# CARGO_PROFILE_TEST_DEBUG = line-tables-only (one artifact tree per persistent
+# target/) and ends with the always() `Prune runner target dir (#6118)` step
+# that runs scripts/ci/prune-runner-target.py; the script itself is exercised
+# against a fake target tree under .local-runs. Closed-world, stdlib-only reader
+# plus mutation legs over the live ci.yml.
+if python3 "$ROOT/scripts/test/test_ci_runner_target_hygiene_6118.py" >"$SCRATCH/g-6118.out" 2>&1; then
+    ok "G: every self-hosted cargo job pins lean debuginfo and prunes its test executables at job end (#6118)"
+else
+    bad "G: runner target-dir hygiene failed (#6118)" \
+        "$(grep -E 'R-(DEBUG|PRUNE|CENSUS|SHAPE)|^FAIL|^ERROR|AssertionError' "$SCRATCH/g-6118.out" | head -12)"
+fi
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "ci.yml invariants: $PASS/$PASS PASS"
