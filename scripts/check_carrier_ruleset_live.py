@@ -25,7 +25,14 @@ judged in full against the payload (include, exclude == [], bypass_actors == [],
 strict, do_not_enforce_on_create, the exact context set, integration_id). The
 carriers are protected only when a candidate matches.
 
-State machine (5-agent vote (4d3ea1c5), memory a03dd15d):
+State machine (5-agent vote (4d3ea1c5), memory a03dd15d). The state file must
+name tracking issue TRACKING_ISSUE (#6182) and no other, and the state is
+coupled to the promotion of this verifier's own context (VERIFIER_CONTEXT):
+  applied        the verifier context must be in required-contexts-release.txt,
+                 required-contexts-carrier.txt and the payload, and its job
+                 (VERIFIER_JOB_ID) must be gone from
+                 required-contexts-not-required.txt; pending-apply requires
+                 the reverse in every place. A half promotion is FAIL.
   applied        match -> OK; no candidate or drift -> FAIL.
   pending-apply  no candidate and the tracking issue is OPEN -> WARN
                  "UNPROTECTED" and exit 0; the issue closed, missing or
@@ -33,12 +40,23 @@ State machine (5-agent vote (4d3ea1c5), memory a03dd15d):
                  matching candidate -> FAIL "flip the state to applied" (a
                  stale marker fails in both directions).
   anything else  FAIL.
-Unreadable rulesets API -> FAIL in every state (no degrade).
+Unreadable rulesets API (including an empty body) -> FAIL in every state
+(no degrade).
+
+--pre-apply (run by ai:god-f2 BEFORE the POST/PUT): lists every live
+refs/heads/chain/** and refs/heads/rehearsal/** branch and, for each carrier
+that is not frozen, reads .github/workflows/c8-precheck.yml at its tip and
+FAILS unless both #6143 jobs (CARRIER_JOBS) are defined there. A carrier is
+frozen only when an active branch ruleset with an `update` rule names it
+exactly, does not exclude it, and shows bypass_actors == [] (so run it with an
+admin token). The ruleset requires the freshness context on every carrier
+base; a carrier whose tip lacks the job could never merge a pull request.
 
 bypass_actors is omitted by GitHub for low-privilege readers (the Actions
 GITHUB_TOKEN). An omitted field is UNVERIFIED, never treated as []: a WARN by
 default, a FAIL under --require-full-view (run that with an admin token after
-applying the ruleset). A visible non-empty list always fails.
+applying the ruleset). Only an actual empty JSON list is verified empty; null,
+a non-list or a non-empty list always fails.
 
 LIMIT: a pull_request run executes the PR's own copy of this script and of the
 declaration (the #6140 self-judged-gate class). The job is advisory until it
@@ -65,6 +83,17 @@ STATES = ("pending-apply", "applied")
 GH_TIMEOUT_SECONDS = 60
 POST_CMD = ("gh api -X POST repos/alphaonedev/ai-memory-mcp/rulesets "
             "--input docs/ci/carrier-ruleset.json")
+LEDGER = REPO_ROOT / "scripts" / "qc-allowlists" / "required-contexts-not-required.txt"
+LEDGER_WORKFLOW = "c8-precheck.yml"
+WORKFLOW_PATH = ".github/workflows/" + LEDGER_WORKFLOW
+# R2-F2 (security): the only issue the pending-apply state may name.
+TRACKING_ISSUE = 6182
+VERIFIER_JOB_ID = "carrier-ruleset-live-gate"
+VERIFIER_CONTEXT = "Carrier-ruleset live verifier (#6143)"
+FRESHNESS_JOB_ID = "carrier-base-fresh-gate"
+FRESHNESS_CONTEXT = "Carrier-base freshness gate (#6143)"
+CARRIER_JOBS = ((FRESHNESS_JOB_ID, FRESHNESS_CONTEXT), (VERIFIER_JOB_ID, VERIFIER_CONTEXT))
+SHA_HEX_LEN = 40
 
 
 class VerifyError(Exception):
@@ -126,6 +155,42 @@ def check_payload(payload, carrier_decl, release_decl):
     return reasons
 
 
+def payload_contexts(payload):
+    rules = rsc_rules(payload)
+    if len(rules) != 1:
+        return []
+    return [c.get("context") for c in (rules[0].get("parameters") or {}).get("required_status_checks") or []]
+
+
+def ledger_has_job(ledger, job_id):
+    """A ledger line is `<workflow> <job-id> <date> <issue> <reason>`."""
+    return any(line.split()[:2] == [LEDGER_WORKFLOW, job_id] for line in ledger)
+
+
+def check_promotion(state_name, payload, carrier_decl, release_decl, ledger):
+    """R2-F1: the state marker moves only together with the verifier's promotion."""
+    places = (("release declaration", VERIFIER_CONTEXT in release_decl),
+              ("carrier declaration", VERIFIER_CONTEXT in carrier_decl),
+              ("payload", VERIFIER_CONTEXT in payload_contexts(payload)))
+    ledgered = ledger_has_job(ledger, VERIFIER_JOB_ID)
+    reasons = []
+    if state_name == "applied":
+        missing = [name for name, present in places if not present]
+        if missing:
+            reasons.append(f"state applied but the verifier context {VERIFIER_CONTEXT!r} is not promoted: "
+                           f"missing from {missing}")
+        if ledgered:
+            reasons.append(f"state applied but {LEDGER.name} still lists {VERIFIER_JOB_ID} as unrequired")
+    elif state_name == "pending-apply":
+        present = [name for name, here in places if here]
+        if present:
+            reasons.append(f"state pending-apply but the verifier context {VERIFIER_CONTEXT!r} is already "
+                           f"promoted into {present}")
+        if not ledgered:
+            reasons.append(f"state pending-apply but {LEDGER.name} lacks the {VERIFIER_JOB_ID} line")
+    return reasons
+
+
 def covers_carrier(ruleset):
     ref = (ruleset.get("conditions") or {}).get("ref_name") or {}
     for pat in ref.get("include") or []:
@@ -158,8 +223,8 @@ def judge_one(rs, payload, require_full_view):
     if "bypass_actors" not in rs:
         msg = f"{rid}: bypass_actors UNVERIFIED (field hidden from this token; rerun with an admin token)"
         (reasons if require_full_view else warnings).append(msg)
-    elif rs.get("bypass_actors"):
-        reasons.append(f"{rid}: bypass_actors must be empty, has {rs.get('bypass_actors')}")
+    elif not (isinstance(rs["bypass_actors"], list) and rs["bypass_actors"] == []):
+        reasons.append(f"{rid}: bypass_actors must be an empty list, has {rs['bypass_actors']!r}")
     rules = rsc_rules(rs)
     if not rules:
         reasons.append(f"{rid}: no required_status_checks rule")
@@ -187,7 +252,7 @@ def judge_one(rs, payload, require_full_view):
     return reasons, warnings
 
 
-def verify(payload, carrier_decl, release_decl, state, rulesets, issue_state, require_full_view):
+def verify(payload, carrier_decl, release_decl, ledger, state, rulesets, issue_state, require_full_view):
     """Return (rc, lines). issue_state is a callable returning 'open'/'closed' or raising."""
     lines = []
     reasons = check_payload(payload, carrier_decl, release_decl)
@@ -197,6 +262,9 @@ def verify(payload, carrier_decl, release_decl, state, rulesets, issue_state, re
         reasons.append(f"carrier-ruleset state must be one of {list(STATES)}, got {st!r}")
     if not isinstance(issue, int) or isinstance(issue, bool) or issue <= 0:
         reasons.append(f"carrier-ruleset state tracking_issue must be a positive issue number, got {issue!r}")
+    elif issue != TRACKING_ISSUE:
+        reasons.append(f"carrier-ruleset state tracking_issue must be #{TRACKING_ISSUE}, got #{issue}")
+    reasons.extend(check_promotion(st, payload, carrier_decl, release_decl, ledger))
     if reasons:
         return 1, [f"FAIL: {r}" for r in reasons]
     cands = candidates(rulesets, payload)
@@ -251,15 +319,19 @@ def gh_run(args):
 def parse_pages(text):
     """`gh api --paginate` prints one JSON array per page; concatenate them."""
     dec = json.JSONDecoder()
-    out, i = [], 0
+    out, i, pages = [], 0, 0
     while True:
         while i < len(text) and text[i].isspace():
             i += 1
         if i >= len(text):
+            if not pages:
+                # R2-F3: zero items is `[]` (one page); an empty body is unreadable.
+                raise ValueError("empty response body (no JSON page)")
             return out
         page, i = dec.raw_decode(text, i)
         if not isinstance(page, list):
             raise ValueError("rulesets page is not a JSON array")
+        pages += 1
         out.extend(page)
 
 
@@ -280,6 +352,92 @@ def live_issue_state(repo):
         if "pull_request" in data:
             raise VerifyError(f"#{number} is a pull request, not an issue")
         return data.get("state") or "missing"
+    return fetch
+
+
+def frozen_by(ref, rulesets):
+    """Id of an active ruleset that freezes `ref` outright, else None (fail closed)."""
+    for rs in rulesets:
+        if rs.get("target") != "branch" or rs.get("enforcement") != "active":
+            continue
+        if not any(r.get("type") == "update" for r in rs.get("rules") or []):
+            continue
+        cond = (rs.get("conditions") or {}).get("ref_name") or {}
+        if ref not in (cond.get("include") or []) or ref in (cond.get("exclude") or []):
+            continue
+        if isinstance(rs.get("bypass_actors"), list) and rs["bypass_actors"] == []:
+            return rs.get("id")
+    return None
+
+
+def job_defined(workflow_text, job_id, name):
+    """True when `jobs.<job_id>` in the workflow text carries `name: <name>`."""
+    lines = workflow_text.splitlines()
+    for i, line in enumerate(lines):
+        if line.rstrip() != f"  {job_id}:":
+            continue
+        for body in lines[i + 1:]:
+            if body.strip() and not body.startswith("   "):
+                break
+            if body.startswith("    name:"):
+                value = body[len("    name:"):].strip()
+                return value in (name, f'"{name}"', f"'{name}'")
+        return False
+    return False
+
+
+def pre_apply(payload, carrier_decl, release_decl, rulesets, carriers, fetch_workflow):
+    """R2-F4: refuse the POST/PUT while an unfrozen carrier tip lacks a #6143 job.
+
+    carriers: list of (ref, sha); fetch_workflow(sha) returns the c8-precheck.yml
+    text at that commit or raises VerifyError."""
+    reasons = check_payload(payload, carrier_decl, release_decl)
+    lines = []
+    unfrozen = 0
+    if not carriers:
+        reasons.append("no carrier branch found under refs/heads/chain/ or refs/heads/rehearsal/")
+    for ref, sha in carriers:
+        rid = frozen_by(ref, rulesets)
+        if rid is not None:
+            lines.append(f"PRE-APPLY: {ref} frozen by ruleset {rid} (update rule, no bypass); skipped")
+            continue
+        unfrozen += 1
+        try:
+            text = fetch_workflow(sha)
+        except VerifyError as exc:
+            reasons.append(f"{ref} @ {sha}: {WORKFLOW_PATH} unreadable ({exc})")
+            continue
+        lacking = [name for job_id, name in CARRIER_JOBS if not job_defined(text, job_id, name)]
+        if lacking:
+            reasons.append(f"{ref} @ {sha} lacks {lacking}: land this change on it before applying the ruleset")
+        else:
+            lines.append(f"PRE-APPLY: {ref} @ {sha} carries both #6143 jobs")
+    if carriers and not unfrozen:
+        reasons.append("every carrier is frozen; nothing to protect, refusing to apply blind")
+    if reasons:
+        return 1, lines + [f"FAIL: {r}" for r in reasons]
+    return 0, lines + [f"PRE-APPLY OK: {unfrozen} unfrozen carrier(s) carry the #6143 jobs; apply with: {POST_CMD}"]
+
+
+def live_carriers(repo):
+    out = []
+    try:
+        for prefix in CARRIER_PREFIXES:
+            heads = prefix[len("refs/"):]
+            for ref in parse_pages(gh_run(["--paginate", f"repos/{repo}/git/matching-refs/{heads}?per_page=100"])):
+                name, sha = ref["ref"], ref["object"]["sha"]
+                if not (isinstance(name, str) and name.startswith(prefix) and isinstance(sha, str)
+                        and len(sha) == SHA_HEX_LEN and all(ch in "0123456789abcdef" for ch in sha)):
+                    raise ValueError(f"unexpected ref entry {ref!r}")
+                out.append((name, sha))
+    except (ValueError, KeyError, TypeError) as exc:
+        raise VerifyError(f"carrier refs response unparseable: {exc}") from exc
+    return out
+
+
+def live_workflow(repo):
+    def fetch(sha):
+        return gh_run(["-H", "Accept: application/vnd.github.raw", f"repos/{repo}/contents/{WORKFLOW_PATH}?ref={sha}"])
     return fetch
 
 
@@ -496,9 +654,29 @@ def self_test():
     return 0
 
 
+def fixture_carriers(path):
+    """--carrier-tips-file: {ref: {"sha": sha, "workflow": text | null}}."""
+    tips = read_json(path)
+    if not isinstance(tips, dict):
+        raise VerifyError("carrier tips fixture must be a JSON object")
+    try:
+        carriers = [(ref, tip["sha"]) for ref, tip in tips.items()]
+        texts = {tip["sha"]: tip["workflow"] for tip in tips.values()}
+    except (KeyError, TypeError) as exc:
+        raise VerifyError(f"carrier tips fixture malformed: {exc}") from exc
+
+    def fetch(sha):
+        if not isinstance(texts.get(sha), str):
+            raise VerifyError(f"{WORKFLOW_PATH} absent at {sha}")
+        return texts[sha]
+    return carriers, fetch
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--pre-apply", action="store_true",
+                    help="before the POST/PUT: fail unless every unfrozen carrier tip defines both #6143 jobs")
     ap.add_argument("--repo", default="alphaonedev/ai-memory-mcp")
     ap.add_argument("--require-full-view", action="store_true",
                     help="fail when bypass_actors is hidden from the token (admin verification)")
@@ -506,24 +684,39 @@ def main(argv=None):
     ap.add_argument("--state-file", default=str(STATE_FILE))
     ap.add_argument("--tracking-issue-state", choices=("open", "closed"),
                     help="fixture: tracking issue state (skips the API)")
+    ap.add_argument("--payload-file", default=str(PAYLOAD), help="fixture: ruleset payload")
+    ap.add_argument("--carrier-decl-file", default=str(CARRIER_DECL), help="fixture: carrier declaration")
+    ap.add_argument("--release-decl-file", default=str(RELEASE_DECL), help="fixture: release declaration")
+    ap.add_argument("--ledger-file", default=str(LEDGER), help="fixture: not-required ledger")
+    ap.add_argument("--carrier-tips-file",
+                    help='fixture for --pre-apply: {ref: {"sha": sha, "workflow": text|null}} (skips the API)')
     args = ap.parse_args(argv)
     try:
         if args.self_test:
             return self_test()
-        payload = read_json(PAYLOAD)
-        state = read_json(args.state_file)
+        payload = read_json(args.payload_file)
+        carrier_decl = read_decl(args.carrier_decl_file)
+        release_decl = read_decl(args.release_decl_file)
         rulesets = read_json(args.rulesets_file) if args.rulesets_file else live_rulesets(args.repo)
         if not isinstance(rulesets, list):
             raise VerifyError("rulesets must be a JSON array")
-        if args.tracking_issue_state:
-            fixed = args.tracking_issue_state
-
-            def issue_state(_):
-                return fixed
+        if args.pre_apply:
+            if args.carrier_tips_file:
+                carriers, fetch = fixture_carriers(args.carrier_tips_file)
+            else:
+                carriers, fetch = live_carriers(args.repo), live_workflow(args.repo)
+            rc, lines = pre_apply(payload, carrier_decl, release_decl, rulesets, carriers, fetch)
         else:
-            issue_state = live_issue_state(args.repo)
-        rc, lines = verify(payload, read_decl(CARRIER_DECL), read_decl(RELEASE_DECL), state,
-                           rulesets, issue_state, args.require_full_view)
+            state = read_json(args.state_file)
+            if args.tracking_issue_state:
+                fixed = args.tracking_issue_state
+
+                def issue_state(_):
+                    return fixed
+            else:
+                issue_state = live_issue_state(args.repo)
+            rc, lines = verify(payload, carrier_decl, release_decl, read_decl(args.ledger_file), state,
+                               rulesets, issue_state, args.require_full_view)
     except VerifyError as exc:
         print(f"carrier-ruleset-live: FAIL: {exc}", file=sys.stderr)
         return 1

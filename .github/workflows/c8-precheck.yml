@@ -1209,6 +1209,14 @@ jobs:
     name: Carrier-ruleset live verifier (#6143)
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # #3591 pattern (see the external-PR gate): the verifier reads the
+    # tracking issue (GET issues/6182) besides the rulesets. Grant the read
+    # explicitly so it never depends on the repository being public.
+    # Job-level permissions replace the workflow default, so contents: read
+    # stays listed.
+    permissions:
+      contents: read
+      issues: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Verify the live carrier ruleset (read-only)
