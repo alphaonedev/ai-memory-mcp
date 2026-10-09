@@ -2154,6 +2154,21 @@ def _self_test_cases() -> int:
           shown=("@git.example.invalid/x.git",))
     masks("#6163 R4 a short URL user name stays visible", "ssh://git@git.example.invalid/x.git",
           shown=("ssh://git@git.example.invalid/x.git",), count=0)
+    # #6343: private key formats with no credential name: RFC 4716 (SSH2) armour, an age identity, and the private
+    # members of a JSON Web Key.
+    ssh2 = "---- BEGIN SSH2 ENCRYPTED " + "PRIVATE KEY ----"
+    masks("#6343 an SSH2 (RFC 4716) private key block is masked and the line after its END stays visible",
+          f'{ssh2}\nComment: "6163"\nP2/56wAAA6163CanarySsh2Body\n{ssh2.replace("BEGIN", "END")}\nafter-ssh2-6163',
+          hidden=("6163CanarySsh2Body",), shown=("after-ssh2-6163",))
+    age_key = "AGE-SECRET-" + "KEY-1" + "6163CANARY" + "QPZRY9X8GF" * 5
+    masks("#6343 an age secret key is masked", f"identity {age_key} here", hidden=(age_key[16:],), shown=("here",))
+    masks("#6343 a JWK private member on a line with kty is masked",
+          '{"kty":"EC","crv":"P-256","x":"6163pubx","d":"6163CanaryJwkD"}', hidden=("6163CanaryJwkD",),
+          shown=('"x":"6163pubx"',))
+    masks("#6343 a pretty-printed JWK private member is masked",
+          '{\n  "kty": "RSA",\n  "n": "6163pubn",\n  "p": "6163CanaryJwkPrimePValue",\n'
+          '  "qi": "6163CanaryJwkQiValue"\n}',
+          hidden=("6163CanaryJwkPrime", "6163CanaryJwkQi"), shown=('"n": "6163pubn"',))
 
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
