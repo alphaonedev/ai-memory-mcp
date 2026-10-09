@@ -118,7 +118,9 @@ CREDENTIAL_VALUE = re.compile(
 # alternation such as `password|secret|token` in rule prose) separates no cells.
 TABLE_ROW_START = re.compile(r"[+ -]?\s*\|")
 CODE_SPAN = re.compile(r"(`+).*?\1")
-TABLE_NAME_CELL = re.compile(r"(?i)\|\s*[*_`]{0,2}(" + CREDENTIAL_NAME + r")[*_`]{0,2}\s*(?=\|)")
+# #6210 round 4 (security F5): a GitHub Flavored Markdown row may omit its leading pipe (`password | v |`), so a name
+# cell may also start the line (after an optional diff prefix).
+TABLE_NAME_CELL = re.compile(r"(?i)(?:^[+ -]?\s*|\|\s*)[*_`]{0,2}(" + CREDENTIAL_NAME + r")[*_`]{0,2}\s*(?=\|)")
 # #6163 round 3 (review G3): a quoted value runs to its closing quote past `\"` escapes, or to the end of the line when
 # the quote is never closed, so neither an escaped quote nor a missing one leaves the rest of the value visible.
 # #6163 round 2/3: a value that is a count or a switch word is configuration, not a credential (a ceiling change in rule
