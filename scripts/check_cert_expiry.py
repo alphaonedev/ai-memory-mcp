@@ -1395,6 +1395,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     t.expect_red("mask", "definition removed while a comment still names the identifier",
                  repo, mk0, mk9, [
                      ("- AI_MEMORY_FED_MASK_KNOB", "did not name the removed identifier"),
+                     ("occurrences in src/ fell 2 -> 1", "did not carry the occurrence-count change"),
                      (sentence, "did not carry the required section 7 expiry sentence"),
                  ], tip=merge_mk)
     t.gate("mask-gate", "pull_request that removes the definition of a still-mentioned identifier",
