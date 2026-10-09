@@ -72,5 +72,24 @@ class LookupFlag6384M5(unittest.TestCase):
             self.assertEqual(tbc.cache_policy(env, 'push', ref)[:2], (False, True))
 
 
+class PlanDeadline6384M3(unittest.TestCase):
+    """r1 M3: ci.yml bounds the plan and restores the full lists if it fails."""
+
+    def setUp(self):
+        self.text = CI_YML.read_text()
+
+    def test_plan_has_a_timeout_and_a_restore_fallback(self):
+        i = self.text.index('test_binary_cache.py plan')
+        j = self.text.index('pg_isolate_split.py', i)
+        block = self.text[i:j]
+        self.assertIn('--timeout-seconds 120', block)
+        self.assertIn('test_binary_cache.py restore --shard-dir "$sd"', block)
+        self.assertIn('|| return', block[block.index('test_binary_cache.py restore'):])
+
+    def test_plan_runs_under_the_outer_watchdog_when_available(self):
+        i = self.text.index('cache_plan_to=(')
+        self.assertIn('"$TIMEOUT_BIN"', self.text[i:i + 200])
+
+
 if __name__ == '__main__':
     unittest.main()

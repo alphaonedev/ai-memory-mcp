@@ -8,8 +8,12 @@ No test runs cargo or rustc.
 import argparse
 import io
 import json
+import os
 import shutil
+import socket
+import subprocess
 import sys
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -84,7 +88,7 @@ class World(unittest.TestCase):
         base = dict(shard_dir=str(self.sd), manifest_dir=str(self.mdir), run_id='100', sha='abc', build_json=str(self.bj),
                     repo_root=str(self.root), rustc_vv=str(self.rustc), profile='test sal-postgres', tier='enterprise-fed',
                     node='linux-fed', base_ref='release/v1.0.0', event='pull_request', ref='refs/pull/1/merge',
-                    no_runtime_tree=False, psql='psql')
+                    no_runtime_tree=False, psql='psql', timeout_seconds=120)
         base.update(kw)
         return argparse.Namespace(**base)
 
@@ -444,6 +448,93 @@ class PullRequestNeverRecords6384M2(World):
         doc = tbc.__doc__
         self.assertIn('pull_request', doc)
         self.assertIn('never writes the manifest', doc)
+
+
+class SpecialFilesAndTimeout6384M3(World):
+    """r1 M3: the tree walk never opens a FIFO, socket or device, and the plan
+    has a hard deadline; on timeout nothing is skipped and the lists stay full."""
+
+    def _digest_in_child(self):
+        code = ('import sys; sys.path.insert(0, %r); import test_binary_cache as t; '
+                'd = t.digest_runtime_tree(%r, False); print(len(d))' % (str(HERE.parent), str(self.root)))
+        try:
+            out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail('digest_runtime_tree blocked on a special file')
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out
+
+    def test_fifo_in_tree_is_not_opened(self):
+        os.mkfifo(str(self.root / 'stale.fifo'))
+        self._digest_in_child()
+        labels = dict(tbc.digest_runtime_tree(self.root, False))
+        self.assertTrue(labels['rt:stale.fifo'].startswith('special:'), labels.get('rt:stale.fifo'))
+
+    def test_socket_in_tree_is_not_opened(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.bind(str(self.root / 'x.sock'))
+            self._digest_in_child()
+            labels = dict(tbc.digest_runtime_tree(self.root, False))
+            self.assertTrue(labels['rt:x.sock'].startswith('special:'))
+        finally:
+            s.close()
+
+    def test_symlink_to_fifo_is_not_followed_into_a_read(self):
+        os.mkfifo(str(self.root / 'pipe'))
+        os.symlink('pipe', str(self.root / 'link-to-pipe'))
+        self._digest_in_child()
+
+    def test_symlink_to_regular_file_hashes_the_target_content(self):
+        (self.root / 'data.txt').write_text('v1\n')
+        os.symlink('data.txt', str(self.root / 'alias.txt'))
+        d0 = dict(tbc.digest_runtime_tree(self.root, False))
+        (self.root / 'data.txt').write_text('v2\n')
+        d1 = dict(tbc.digest_runtime_tree(self.root, False))
+        self.assertNotEqual(d0['rt:alias.txt'], d1['rt:alias.txt'])
+
+    def test_plan_timeout_runs_every_binary(self):
+        self.green_run('100')
+        real = tbc.compute_keys
+
+        def slow(*a, **kw):
+            time.sleep(3)
+            return real(*a, **kw)
+        tbc.compute_keys = slow
+        try:
+            t0 = time.monotonic()
+            out = self.plan(run_id='200', now=NOW + 60, timeout_seconds=0.5)
+            elapsed = time.monotonic() - t0
+        finally:
+            tbc.compute_keys = real
+        self.assertLess(elapsed, 2.5)
+        self.assertIn('timed out', out)
+        self.assertIn('::warning::', out)
+        self.assertEqual(self.list_text('serial'), '--lib\n--test a\n')
+        self.assertEqual(self.list_text('parallel_2'), '--test b\n')
+        self.assertFalse(json.loads((self.sd / 'cache_plan.json').read_text())['enabled'])
+        self.assertIn('not recorded', self.record(rc=0, run_id='200'))
+
+    def test_cli_default_timeout_is_120_seconds(self):
+        a = tbc.build_parser().parse_args(['plan', '--shard-dir', 's', '--manifest-dir', 'm', '--build-json', 'b',
+                                           '--rustc-vv', 'r', '--tier', 't', '--node', 'n', '--base-ref', 'x',
+                                           '--event', 'pull_request'])
+        self.assertEqual(a.timeout_seconds, 120)
+
+    def test_restore_puts_full_lists_back_and_disables_the_plan(self):
+        self.green_run('100')
+        self.plan(run_id='200', now=NOW + 60)
+        self.assertEqual(self.list_text('parallel_2'), '')
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = tbc.main(['restore', '--shard-dir', str(self.sd)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.list_text('serial'), '--lib\n--test a\n')
+        self.assertEqual(self.list_text('parallel_1'), '--lib\n')
+        self.assertEqual(self.list_text('parallel_2'), '--test b\n')
+        self.assertFalse(json.loads((self.sd / 'cache_plan.json').read_text())['enabled'])
+        self.assertEqual((self.sd / 'skip.txt').read_text() if (self.sd / 'skip.txt').exists() else '', '')
+        self.assertIn('not recorded', self.record(rc=0, run_id='200'))
 
 
 class Policy(unittest.TestCase):
