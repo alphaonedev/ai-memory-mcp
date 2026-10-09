@@ -96,8 +96,29 @@ identifier in a file outside the three path watches does not trip the
 identifier check. This gate does not re-run 5.4(2)-(5); it only forces the
 cert-doc to be touched so a human/re-issue cannot be skipped.
 
+TRUSTED MODE (#6140). The required job runs on `pull_request`, so it executes
+the pull request's own copy of this script and of its workflow job. The
+`pull_request_target` workflow .github/workflows/cert-expiry-trusted.yml checks
+out only the BASE commit and runs this (base) copy with
+  --trusted --base-ref NAME --head-sha SHA --merge-ref REF [--base-sha SHA]
+after fetching the head and merge commit as objects. Trusted mode:
+  * reads git objects only (ls-tree / cat-file / diff / grep / log between
+    shas); nothing from the head is checked out or executed;
+  * takes the range only from its arguments (the process environment,
+    CERT_EXPIRY_* and GITHUB_*, is not consulted) and applies the
+    pull_request rules above to the merge commit (same fail-closed parentage);
+  * prints `GUARD CHANGED: <path>` and fails when a TRUSTED_PATHS entry, or
+    the cert-expiry-gate job block of c8-precheck.yml (with that workflow's
+    header keys), differs between the merge commit's first parent and the merge
+    commit, unless a `Rule-Change-Approved-By: <who>` trailer (the
+    claude-md-rule-compare.py mechanism) is in first-parent..head. A trailer
+    never waives the section 7 verdict.
+In every mode the cert doc is read through its tree entry: a symlink or any
+other non-regular entry at its path is refused (fail-closed), never followed.
+
 Usage:
   scripts/check_cert_expiry.py              # against the resolved range
+  scripts/check_cert_expiry.py --trusted --base-ref B --head-sha H --merge-ref M
   scripts/check_cert_expiry.py --self-test  # plant-a-violation in a scratch
                                             # repository (never a real branch)
 
@@ -289,19 +310,61 @@ def wire_drift(repo, frm, to):
     return out
 
 
+REGULAR_MODES = ("100644", "100755")
+# Cap on a blob the gate reads whole (the cert doc, the guarded workflow).
+MAX_BLOB_BYTES = 2 * 1024 * 1024
+
+
+def tree_entry(repo, tree, rel):
+    """(mode, type, object id) of REL at TREE, or None when absent. Read from
+    the object database only (no working tree); a git failure is fail-closed."""
+    proc = run_git(repo, "ls-tree", "-z", "--full-tree", "--end-of-options", tree, rel)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise GateError(f"git ls-tree {tree} {rel} exited {proc.returncode}: {err}")
+    for rec in proc.stdout.split(b"\0"):
+        meta, sep, name = rec.partition(b"\t")
+        if sep and name.decode("utf-8", "replace") == rel:
+            fields = meta.decode("ascii", "replace").split(" ")
+            if len(fields) != 3:
+                raise GateError(f"git ls-tree {tree} {rel}: unparseable entry (fail-closed)")
+            return fields[0], fields[1], fields[2]
+    return None
+
+
+def read_blob(repo, oid, rel):
+    """Bytes of blob OID (named REL in messages), refused above MAX_BLOB_BYTES."""
+    size = git_text(repo, "cat-file", "-s", "--end-of-options", oid)
+    if not size.isdigit() or int(size) > MAX_BLOB_BYTES:
+        raise GateError(f"{rel} blob {oid} size {size!r} exceeds {MAX_BLOB_BYTES} bytes (fail-closed)")
+    proc = run_git(repo, "cat-file", "blob", "--end-of-options", oid)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise GateError(f"git cat-file blob {oid} ({rel}) exited {proc.returncode}: {err}")
+    return proc.stdout
+
+
 def cert_banner(repo, tree):
     """(STATUS, BINDS) of the cert doc at TREE.
 
     STATUS: LIVE | VOID | EXPIRED | UNPARSEABLE (doc present, no STATUS line)
     | DUPLICATE (two or more STATUS lines: a decoy above the real banner must
-    not be read as the banner) | ABSENT (no doc at TREE).
+    not be read as the banner) | ABSENT (no doc at TREE). A symlink or any
+    other non-regular entry at the cert-doc path raises GateError (#6140).
     BINDS: the lowercase 40-hex bound SHA, "-" when no Binds-to line matches,
     "DUPLICATE" when two or more do.
     """
-    proc = run_git(repo, "show", "--end-of-options", f"{tree}:{CERT_DOC}")
-    if proc.returncode != 0:
+    entry = tree_entry(repo, tree, CERT_DOC)
+    if entry is None:
         return ("ABSENT", "-")
-    lines = proc.stdout.decode("utf-8", "replace").split("\n")
+    mode, kind, oid = entry
+    if kind != "blob" or mode not in REGULAR_MODES:
+        # #6140: a symlink is never followed or read as the banner text.
+        raise GateError(
+            f"{CERT_DOC} at {tree} is a symlink or other non-regular entry "
+            f"(mode {mode} {kind}); refused (fail-closed, #6140)"
+        )
+    lines = read_blob(repo, oid, CERT_DOC).decode("utf-8", "replace").split("\n")
     statuses = [m for m in (STATUS_LINE_RE.match(ln) for ln in lines) if m]
     binds = [m for m in (BINDS_LINE_RE.match(ln) for ln in lines) if m]
     if not statuses:
@@ -687,6 +750,126 @@ def run_gate(repo, env):
     base_name = f"origin/{env['GITHUB_BASE_REF']}" if tip is not None else None
     ok, text = check_change(repo, base, head, tip, base_name)
     return (0, text, "") if ok else (1, "", text)
+
+
+# ---------------------------------------------------------------------------
+# --trusted mode (#6140): the pull_request_target companion job
+# ---------------------------------------------------------------------------
+
+# Paths whose edit changes what the gate enforces. Editing one needs a
+# `Rule-Change-Approved-By:` trailer in the PR's commits (the mechanism and the
+# trailer text of scripts/claude-md-rule-compare.py, pinned by the self-test).
+TRUSTED_PATHS = ("scripts/check_cert_expiry.py", ".github/workflows/cert-expiry-trusted.yml",
+                 "scripts/check-claude-md-size.py")
+# The required cert-expiry-gate job block of c8-precheck.yml is guarded too,
+# with everything in that workflow outside its other jobs.
+TRUSTED_JOB = (".github/workflows/c8-precheck.yml", "cert-expiry-gate")
+TRAILER = re.compile(r"^Rule-Change-Approved-By: (\S.*)$", re.MULTILINE)
+MERGE_REF_RE = re.compile(r"refs/remotes/[A-Za-z0-9._/-]+")
+JOB_KEY_RE = re.compile(r"  ([A-Za-z0-9_.-]+):[ \t]*(?:#.*)?")
+JOBS_KEY_RE = re.compile(r"jobs:[ \t]*(?:#.*)?")
+
+
+def guarded_workflow_text(text, job):
+    """The part of a workflow file the guard compares: every meaningful line
+    except those inside jobs other than JOB (blank and comment-only lines are
+    dropped). Header keys (on/permissions/env/defaults) stay guarded."""
+    out, in_jobs, current = [], False, None
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            in_jobs, current = bool(JOBS_KEY_RE.fullmatch(line.rstrip("\r"))), None
+        elif in_jobs and indent <= 2:
+            m = JOB_KEY_RE.fullmatch(line.rstrip("\r")) if indent == 2 else None
+            current = m.group(1) if m else None
+        if not in_jobs or current is None or current == job:
+            out.append(line)
+    return "\n".join(out)
+
+
+def guarded_state(repo, tree, rel, job=None):
+    """A comparable fingerprint of REL at TREE: absence, a non-regular entry
+    (symlink, submodule, tree), the blob id, or for JOB the guarded text."""
+    entry = tree_entry(repo, tree, rel)
+    if entry is None:
+        return "<absent>"
+    mode, kind, oid = entry
+    if kind != "blob" or mode not in REGULAR_MODES:
+        return f"<non-regular {mode} {kind} {oid}>"
+    if job is None:
+        return f"{mode} {oid}"
+    return guarded_workflow_text(read_blob(repo, oid, rel).decode("utf-8", "replace"), job)
+
+
+def guard_check(repo, first, head, merge):
+    """(ok, lines): trusted paths changed between the merge commit's first
+    parent and the merge commit, and the approval trailers in first..head."""
+    changed = [rel for rel in TRUSTED_PATHS
+               if guarded_state(repo, first, rel) != guarded_state(repo, merge, rel)]
+    rel, job = TRUSTED_JOB
+    if guarded_state(repo, first, rel, job) != guarded_state(repo, merge, rel, job):
+        changed.append(f"{rel} ({job} job)")
+    if not changed:
+        return True, [f"{PREFIX}: trusted guard — no trusted gate path changed in {first}..{merge}"]
+    log = git_text(repo, "log", "--format=%B%x00", "--end-of-options", f"{first}..{head}")
+    who = [m.group(1).strip() for m in TRAILER.finditer(log)]
+    lines = [f"GUARD CHANGED: {c} (changes what the cert-expiry gate enforces)" for c in changed]
+    if who:
+        lines.append(f"{PREFIX}: approval trailer(s): {'; '.join(who)} (the §7 verdict is not waived)")
+        return True, lines
+    lines.append(
+        f"RESULT: FAIL — a trusted cert-expiry gate path changed without a "
+        f"'Rule-Change-Approved-By: <who>' trailer in {first}..{head} (fail-closed, #6140)"
+    )
+    return False, lines
+
+
+def resolve_merge_ref(repo, ref):
+    """Full sha of the pull_request merge commit named by REF (a 40/64-hex sha
+    or a refs/remotes/... ref the workflow fetched); fail-closed otherwise."""
+    if not (ENV_SHA_RE.fullmatch(ref) or (MERGE_REF_RE.fullmatch(ref) and ".." not in ref)):
+        raise GateError(
+            f"--merge-ref {ref!r} is not a 40/64-hex sha or a refs/remotes/ ref (fail-closed)"
+        )
+    proc = run_git(repo, "rev-parse", "--verify", "--quiet", "--end-of-options", ref + "^{commit}")
+    if proc.returncode != 0:
+        raise GateError(f"--merge-ref {ref} does not resolve to a commit (fail-closed)")
+    return proc.stdout.decode().strip()
+
+
+def run_trusted(repo, base_ref, head, merge_ref, base_sha=""):
+    """--trusted: judge the pull_request merge commit with THIS (base) copy of
+    the gate, reading git objects only, and require the approval trailer when
+    a trusted path changed. The range comes only from the arguments: the
+    process environment (CERT_EXPIRY_*, GITHUB_*) is not consulted.
+    Returns (rc, stdout_text, stderr_text)."""
+    try:
+        require_git_version(repo)
+        if not ENV_SHA_RE.fullmatch(head):
+            raise GateError(f"--head-sha {head!r} is not exactly 40 or 64 hex characters (fail-closed)")
+        if base_sha and not ENV_SHA_RE.fullmatch(base_sha):
+            raise GateError(f"--base-sha {base_sha!r} is not exactly 40 or 64 hex characters (fail-closed)")
+        merge = resolve_merge_ref(repo, merge_ref)
+    except GateError as exc:
+        return 1, "", f"{PREFIX}: ERROR — {exc}"
+    env = {"GITHUB_EVENT_NAME": "pull_request", "PR_HEAD_SHA": head,
+           "GITHUB_BASE_REF": base_ref, "GITHUB_SHA": merge}
+    if base_sha:
+        env["PR_BASE_SHA"] = base_sha
+    rc, out, err = run_gate(repo, env)
+    outs, errs = [out] if out else [], [err] if err else []
+    try:
+        live = resolve_live_base(repo, base_ref)
+        first = pr_base_tip(repo, live, head, merge, f"origin/{base_ref}")
+        ok, lines = guard_check(repo, first, head, merge)
+    except GateError as exc:
+        ok, lines = False, [f"{PREFIX}: ERROR — trusted guard: {exc} (fail-closed)"]
+    (outs if ok else errs).append("\n".join(lines))
+    rc = 0 if rc == 0 and ok else 1
+    return rc, "\n".join(outs), "\n".join(errs)
 
 
 # ---------------------------------------------------------------------------
@@ -1521,14 +1704,16 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     fx.g("merge", "-q", "--no-ff", "-m", "octopus: h8 and o8", "h8", "o8")
     octo8 = fx.g("rev-parse", "HEAD")
     fx.reset(base)
+    # The base moves on first, so merging main INTO the head is a real
+    # two-parent merge with the head as its first parent (reversed).
+    fx.write("src/main8.rs", "fn main8() {}\n")
+    moved8 = fx.commit(["src/main8.rs"], "base moves on with an unrelated commit")
     fx.g("checkout", "-q", "h8")
     rev8 = fx.merge("main", "Merge main into h8 (reversed parents)")
     fx.g("checkout", "-q", "-b", "side8", genesis)
     fx.write("src/side8.rs", "fn side8() {}\n")
     side8 = fx.commit(["src/side8.rs"], "a side branch the merge was not built from")
     fx.g("checkout", "-q", "main")
-    fx.write("src/main8.rs", "fn main8() {}\n")
-    moved8 = fx.commit(["src/main8.rs"], "base moves on with an unrelated commit")
     fx.g("update-ref", "refs/remotes/pull/merge", shapes["clean"][1])
 
     # The judged repository is a BARE mirror: there is no working tree, so the
@@ -1539,8 +1724,8 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     mg.g("update-ref", "refs/remotes/origin/main", base)
 
     def judge(label, why, head, merge, needles=(), absent=(), ok=False, extra=()):
-        rc, out = trusted_cli(mirror, "--base-ref", "main", "--base-sha", base,
-                              "--head-sha", head, "--merge-ref", merge, *extra)
+        rc, out = trusted_cli(mirror, "--base-ref=main", f"--base-sha={base}",
+                              f"--head-sha={head}", f"--merge-ref={merge}", *extra)
         if ok and rc != 0:
             t.fail(f"({label}): {why} was REJECTED (rc {rc}):", out)
         elif not ok and rc != 1:
@@ -1619,8 +1804,8 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     judge("tr-e-optref", "an option-shaped merge ref", head8, "--upload-pack=x", needles=("--merge-ref",))
     judge("tr-e-missing", "a merge ref that does not resolve", head8, "refs/remotes/pull/no-such",
           needles=("does not resolve",))
-    rc, out = trusted_cli(mirror, "--base-ref", "--upload-pack=x", "--base-sha", base,
-                          "--head-sha", head8, "--merge-ref", good8)
+    rc, out = trusted_cli(mirror, "--base-ref=--upload-pack=x", f"--base-sha={base}",
+                          f"--head-sha={head8}", f"--merge-ref={good8}")
     if rc != 1 or "is not a plain branch name" not in out:
         t.fail(f"(tr-e-baseref): an option-shaped base ref did not fail closed (rc {rc}):", out)
     rc, out = trusted_cli(mirror, "--base-ref", "main", "--merge-ref", good8)
@@ -1675,7 +1860,24 @@ def main(argv=None):
         description="Enterprise-federation certification section 7 expiry gate.")
     parser.add_argument("--self-test", action="store_true",
                         help="plant-a-violation corpus in a scratch repository")
+    parser.add_argument("--trusted", action="store_true",
+                        help="judge a pull_request merge commit from git objects only "
+                             "(the pull_request_target base-copy job, #6140)")
+    parser.add_argument("--repo", default=str(REPO_ROOT), help="--trusted: repository to read")
+    parser.add_argument("--base-ref", help="--trusted: the pull request base branch name")
+    parser.add_argument("--base-sha", default="", help="--trusted: payload base sha (report-only)")
+    parser.add_argument("--head-sha", help="--trusted: the pull request head sha")
+    parser.add_argument("--merge-ref", help="--trusted: the merge commit (sha or refs/remotes/ ref)")
     args = parser.parse_args(argv)
+    if args.trusted and args.self_test:
+        parser.error("--trusted and --self-test are exclusive")
+    if args.trusted:
+        missing = [f"--{n.replace('_', '-')}" for n in ("base_ref", "head_sha", "merge_ref")
+                   if getattr(args, n) is None]
+        if missing:
+            parser.error(f"--trusted requires {', '.join(missing)}")
+    elif any(v is not None for v in (args.base_ref, args.head_sha, args.merge_ref)) or args.base_sha:
+        parser.error("--base-ref/--base-sha/--head-sha/--merge-ref are only valid with --trusted")
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -1683,7 +1885,11 @@ def main(argv=None):
             pass
     if args.self_test:
         return self_test()
-    rc, out, err = run_gate(REPO_ROOT, dict(os.environ))
+    if args.trusted:
+        rc, out, err = run_trusted(Path(args.repo), args.base_ref, args.head_sha,
+                                   args.merge_ref, args.base_sha)
+    else:
+        rc, out, err = run_gate(REPO_ROOT, dict(os.environ))
     if out:
         print(out)
     if err:

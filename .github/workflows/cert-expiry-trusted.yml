@@ -1,0 +1,86 @@
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Enterprise-federation cert-expiry gate, trusted base copy (issue #6140).
+#
+# WHAT IT CLOSES. The required `cert-expiry-gate` job in c8-precheck.yml runs on
+# pull_request, so the workflow file and scripts/check_cert_expiry.py come from
+# the pull request's own merge ref: a pull request that edits the gate is judged
+# by its own edited copy, and a change that weakens the cert section 7 expiry
+# control can pass together with a change that relies on the weakening.
+#
+# WHAT IT DOES. pull_request_target runs the workflow FILE OF THE BASE BRANCH
+# with the BASE checkout (the shape of claude-md-rule-compare.yml, #4507, #5163).
+# The pull request head and its merge commit are fetched as git objects only:
+# they are never checked out, imported or executed. The BASE copy of
+# scripts/check_cert_expiry.py runs with `python3 -I` in --trusted mode and
+# judges the merge commit purely through git object reads (diff, cat-file,
+# grep over trees): the same section 7 rules and the same merge-parent checks as
+# the pull_request job (exactly two parents, second parent the PR head, first
+# parent on the live base; anything else fails closed), a symlinked
+# certification document fails closed, and when the pull request edits a
+# trusted path (the gate script, this file, the cert-expiry-gate job block and
+# the header keys of c8-precheck.yml, or the canonical-form pin in
+# scripts/check-claude-md-size.py)
+# it prints GUARD CHANGED and fails unless a commit in the pull request carries
+# a `Rule-Change-Approved-By: <who>` trailer. Like the rule-change comparison,
+# the trailer is tamper-EVIDENCE: review and the sole merger enforce. A trailer
+# never waives the section 7 verdict itself. Permissions are contents: read; no
+# secret is used.
+#
+# REQUIRED-CONTEXT STATUS. This job is a companion and is NOT yet a required
+# context: the required context stays `Enterprise-federation cert-expiry gate
+# (cert §7 / F7)` on the pull_request job. Moving the requirement to this job
+# is a branch-protection edit, outside the AI lanes, and waits for a recorded
+# proof run on a scratch pull request (this repository has recorded no
+# pull_request_target run of this file yet). Decision: 5-agent vote
+# (4d3ea1c5), posture B (additive companion job).
+#
+# BOOTSTRAP. pull_request_target only runs a workflow that already exists on the
+# base branch, so the pull request that introduces this file is judged by
+# review. From the first landing on, it is judged by this job.
+#
+# DELIBERATE CHOICES. No paths filter and no job-level `if` (a skipped context
+# reads as pending; scripts/check-required-contexts.sh rule f). No merge_group
+# trigger (no merge queue rule is configured). The guard pins THIS file
+# (cert_trusted_workflow_errors in scripts/check-claude-md-size.py) to a
+# canonical form, so widening permissions, checking out the head or the merge
+# commit, adding a step, using a secret or a self-hosted runner fails the guard.
+name: Enterprise-federation cert-expiry gate (trusted base copy)
+
+on:
+  pull_request_target:
+    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cert-expiry-trusted-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  cert-expiry-trusted:
+    name: Enterprise-federation cert-expiry gate, trusted base copy (cert §7 / F7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the BASE commit only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the pull request head and merge commit as git objects (data, never checked out)
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head" "+refs/pull/${PR_NUMBER}/merge:refs/remotes/pull/merge"
+      - name: Cert-expiry gate self-test (base code)
+        run: python3 -I scripts/check_cert_expiry.py --self-test
+      - name: Judge the merge commit with the base copy of the gate
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 -I scripts/check_cert_expiry.py --trusted --base-ref "$BASE_REF" --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --merge-ref refs/remotes/pull/merge
