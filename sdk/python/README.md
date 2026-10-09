@@ -61,9 +61,10 @@ with AiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client
 
 `verify=` **replaces** the trust store with that bundle; verification stays
 full (chain + hostname — the daemon's leaf carries `localhost`, `127.0.0.1`,
-`::1` and the machine hostname as SANs). Never pass `verify=False`: that
-turns a TLS listener into an unauthenticated one. Two ways to avoid passing
-`verify=` per client:
+`::1` and the machine hostname as SANs). `verify=False` is **refused** by both
+constructors with `ValueError` (#3840): it would turn a TLS listener into an
+unauthenticated one, and there is no accept-any-certificate option. Two ways
+to avoid passing `verify=` per client:
 
 - install `local-ca.pem` into the OS trust store
   (`update-ca-certificates`, `security add-trusted-cert`), or point

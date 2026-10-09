@@ -88,14 +88,23 @@ def build_httpx_kwargs(
 
     mTLS is wired through the stock httpx params:
 
-    * ``verify`` — path to the server CA bundle or ``True`` / ``False``. For a
+    * ``verify`` — path to the server CA bundle or ``True``. For a
       zero-config daemon this is ``<key_dir>/tls/local-ca.pem`` (#3782).
+      ``False`` (or any other falsy non-path value) is REFUSED — see Raises.
     * ``cert`` — client certificate; accepts a single path or ``(cert, key)``.
 
     ``api_key`` is sent as ``X-API-Key`` (the server also accepts
     ``?api_key=`` query params, but a header keeps it out of access logs).
     ``agent_id`` is sent as ``X-Agent-Id`` — the HTTP daemon's default
     agent resolution precedence is body → header → per-request anonymous.
+
+    Raises:
+        ValueError: on ``verify=False`` (#3840). Under the transit-encryption
+            standard (#3824) an unverified TLS channel is an encrypted pipe to
+            whoever answers — the man-in-the-middle exposure the #3828
+            ``http://`` refusal closes, one layer up. Both clients construct
+            through this one funnel, so the refusal lives here once and there
+            is no escape hatch.
     """
     headers: dict[str, str] = {
         "User-Agent": f"ai-memory-python/{SDK_VERSION}",
@@ -113,6 +122,18 @@ def build_httpx_kwargs(
         "headers": headers,
         "timeout": timeout,
     }
+    # #3840 — `False` was documented as "never pass" and forwarded untouched.
+    # httpx reads ANY falsy `verify` as "do not verify", so the refusal covers
+    # `0` / `0.0` too, not only the literal `False`; `None` means "platform
+    # trust store" and a path (even a wrong one) is still a verifying client.
+    if verify is not None and not isinstance(verify, str) and not verify:
+        raise ValueError(
+            "verify=False is refused: it would turn the daemon's TLS listener "
+            "into an unauthenticated one (an encrypted pipe to whoever answers). "
+            "Pass the CA bundle path instead — verify=<key_dir>/tls/local-ca.pem "
+            "for a zero-config daemon — or omit verify= to use the platform "
+            "trust store (#3840)."
+        )
     if verify is not None:
         kwargs["verify"] = verify
     if cert is not None:
