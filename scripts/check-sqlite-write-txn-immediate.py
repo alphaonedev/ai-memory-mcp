@@ -850,6 +850,11 @@ def _probes():
         ("format! arg literal in execute_batch", f_open % '    c.execute_batch(&format!("{}", "BEGIN"))?;'),
         ("closure return", f_open % '    let open = || "BEGIN";\n    c.execute_batch(open())?;'),
         ("Some(literal)", f_open % '    let sql = Some("BEGIN");\n    c.execute_batch(sql.unwrap_or_default())?;'),
+        ("write! builds SQL", f_open % '    let mut sql = String::new();\n    write!(sql, "BEGIN")?;\n    c.execute_batch(&sql)?;'),
+        ("writeln! builds SQL", f_open % '    let mut sql = String::new();\n    writeln!(sql, "BEGIN;")?;\n    c.execute_batch(&sql)?;'),
+        ("write! to a writer", f_open % '    write!(f, "BEGIN")?;'),
+        ("writeln! to a writer", f_open % '    writeln!(f, "begin")?;'),
+        ("write! literal argument", f_open % '    let mut sql = String::new();\n    write!(sql, "{}", "BEGIN")?;\n    c.execute_batch(&sql)?;'),
         ("String::from SAVEPOINT", f_open % '    let s = String::from("SAVEPOINT a");\n    c.execute_batch(&s)?;'),
         ("plain fn named info (not a macro)", f_open % '    info(c, "BEGIN")?;'),
         ("free fn named expect (not a method)", f_open % '    expect("BEGIN");'),
@@ -885,8 +890,6 @@ def _probes():
         ("println!", 'println!("begin");'),
         ("eprint!", 'eprint!("BEGIN");'),
         ("eprintln!", 'eprintln!("begin");'),
-        ("write!", 'write!(f, "BEGIN")?;'),
-        ("writeln!", 'writeln!(f, "begin")?;'),
         ("anyhow!", 'return Err(anyhow!("BEGIN"));'),
         ("bail!", 'bail!("begin");'),
         ("ensure!", 'ensure!(ok, "BEGIN");'),
@@ -923,6 +926,18 @@ def _probes():
     ):
         bad, _, _ = run(text)
         expect("red:#6154 F2 unbalanced quote outside the window: " + label, [b[3] for b in bad] == ["R3"])
+    for label, text in (
+        ("escaped newline before BEGIN", f_open % '    c.execute_batch("PRAGMA x = 1;\\nBEGIN")?;'),
+        ("tab escape after BEGIN", f_open % '    c.execute_batch("BEGIN\\t;")?;'),
+    ):
+        bad, _, _ = run(text)
+        expect("red:#6154 r3 F2 escapes are decoded: " + label, [b[3] for b in bad] == ["R3"])
+    for label, text in (
+        ("block comment holding code", f_open % "    /* c.unchecked_transaction() */"),
+        ("block comment holding a BEGIN call", f_open % '    /* c.execute_batch("BEGIN")?; */'),
+    ):
+        bad, _, _ = run(text)
+        expect("green:#6154 r3 F2 " + label + " is not code", not bad)
     bad, _, _ = run("fn f() {\n    let s = \"c.unchecked_transaction()\";\n}\n")
     expect("green:#6154 F2 code-looking text inside a string literal is not code", not bad)
     # --- #6155 (closed by the whole-literal read): a multi-line literal is read whole ---
