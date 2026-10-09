@@ -600,7 +600,7 @@ def _self_test_cases() -> int:
 
     counter = [0]
 
-    def case(name, mutate, want_fail, needle, trailer=None, base_mutate=None, message=None, absent=None):
+    def case(name, mutate, want_fail, needle, trailer=None, base_mutate=None, message=None, absent=None, needles=()):
         counter[0] += 1
         work = base_dir / f"c{counter[0]}"
         base_sha = make_repo(guard, work / "repo")
@@ -617,9 +617,10 @@ def _self_test_cases() -> int:
             report, failed = compare(base_root, work / "repo", base_sha, head_sha, work / "scratch", guard.fixture_index_pins())
         except RuntimeError as exc:
             report, failed = f"RESULT: FAIL (closed) - {exc}", True
-        if failed != want_fail or needle not in report or (absent is not None and absent in report):
+        missing = [want for want in (needle, *needles) if want not in report]
+        if failed != want_fail or missing or (absent is not None and absent in report):
             failures.append(name)
-            print(f"FAIL: self-test - {name}: failed={failed} (wanted {want_fail}), needle {needle!r}, "
+            print(f"FAIL: self-test - {name}: failed={failed} (wanted {want_fail}), missing {missing!r}, "
                   f"absent {absent!r}\n{report}", file=sys.stderr)
         else:
             print(f"PASS: self-test - {name}")
@@ -1517,15 +1518,157 @@ def _self_test_cases() -> int:
     case("#6163 a private key block in changed rule text is masked in the report", pem_reword, True,
          "RULE TEXT CHANGED", absent=canary)
 
-    # #6163 (CodeQL py/clear-text-*-sensitive-data, SensitiveDataHeuristics.qll): an identifier that holds
-    # "trusted", "secret" or a password word marks every value derived from it as a credential. The values this
-    # script names are repository paths and report lines, so no identifier may carry such a word.
-    sensitive_name = re.compile(r"(?i)((?<!is)(?<!is_)secret|(?<!un)(?<!un_)(?<!is)(?<!is_)trusted(?!_iter)|"
-                                r"confidential|pass(wd|word|code|.?phrase)|api.?(key|tok))")
-    not_sensitive = re.compile(r"(?i)(redact|censor|obfuscate|hash|md5|sha|random|crypt|encode|(?<!pro)file|path|"
-                               r"url)")
+    # #6163 round 2 (review F1): masking applies to head text where it enters the report, one diff block or one span
+    # at a time. A private key BEGIN line with no END line masks the rest of ITS block only; the lines this script
+    # writes (GUARD CHANGED, the approval list, RESULT) always stay visible.
+    guard_line = f"- GUARD CHANGED: {GUARD_REL} (the code"
+    open_canary = "6163-canary-unterminated"
+
+    def unterminated_begin(root):
+        edit("tool limit is 103 tools", f"tool limit is 103 tools\n-----BEGIN PRIVATE KEY-----\n{open_canary}")(root)
+        reseal(root)
+        guard_file_write(GUARD_REL)(root)
+
+    case("#6163 an unterminated private key BEGIN masks only its block; GUARD CHANGED and RESULT survive",
+         unterminated_begin, False, guard_line, trailer="Justin", absent=open_canary,
+         needles=("RESULT: PASS - rule text changed; approval trailer(s): ` Justin `",))
+    case("#6163 an unterminated private key BEGIN without the trailer still shows GUARD CHANGED and RESULT: FAIL",
+         unterminated_begin, True, guard_line, absent=open_canary,
+         needles=("RESULT: FAIL - the rule text changed and no commit",))
+    heading_canary = "6163-canary-heading-key"
+
+    def begin_heading(root):
+        target = root / "CLAUDE.md"
+        target.write_text(target.read_text(encoding="utf-8") + "\n## -----BEGIN RSA PRIVATE KEY-----\n\n"
+                          f"{heading_canary}\n", encoding="utf-8")
+        guard_file_write(GUARD_REL)(root)
+
+    case("#6163 a private key BEGIN in an added heading masks only its block; GUARD CHANGED and RESULT survive",
+         begin_heading, False, guard_line, trailer="Justin", absent=heading_canary,
+         needles=("RESULT: PASS - rule text changed; approval trailer(s): ` Justin `", "RULE TEXT CHANGED (added)"))
+
+    # #6163 round 2 (review F2): each credential shape the docstring names is masked.
+    def head_line(extra):
+        def apply(root):
+            edit("tool limit is 103 tools", f"tool limit is 103 tools; {extra}")(root)
+            reseal(root)
+        return apply
+
+    provider_canaries = ("gh" + "p_" + "6163canary" + "Q" * 26, "AK" + "IA" + "6163CANARYQQQQQQ")
+    shapes = (
+        ("a quoted multi-word password", 'password="hunter2 6163-canary-qb 6163-canary-qc"', "6163-canary-qc"),
+        ("an unquoted multi-word password", "password = s1x 6163-canary-s2", "6163-canary-s2"),
+        ("a JSON-quoted password key", '{"password": "6163-canary-json"}', "6163-canary-json"),
+        ("URL userinfo", "postgres://dbuser:6163-canary-url@db.example.invalid/x", "6163-canary-url"),
+        ("an Authorization Bearer value", "Authorization: Bearer 6163-canary-bearer-token", "6163-canary-bearer"),
+        ("a bare provider token", f"use {provider_canaries[0]} here", provider_canaries[0]),
+        ("a bare access key id", f"use {provider_canaries[1]} here", provider_canaries[1]),
+        ("a numeric password", "password=8675309", "8675309"),
+    )
+    for label, extra, hidden in shapes:
+        case(f"#6163 {label} in changed rule text is masked", head_line(extra), True, "RULE TEXT CHANGED",
+             absent=hidden, needles=("credential-shaped value(s) masked",))
+
+    pgp_canary = "6163-canary-pgp"
+
+    def pgp_block(root):
+        edit("tool limit is 103 tools", "tool limit is 103 tools\n-----BEGIN PGP PRIVATE KEY BLOCK-----\n"
+             f"{pgp_canary}\n-----END PGP PRIVATE KEY BLOCK-----\nafter-the-key-6163")(root)
+        reseal(root)
+
+    case("#6163 a PGP private key block is masked and the text after its END stays visible", pgp_block, True,
+         "+after-the-key-6163", absent=pgp_canary)
+
+    # #6163 round 2 (review F4): a count, a switch word or an environment variable name is not a credential, so a
+    # ceiling change in rule text stays readable in the summary.
+    for visible in ("X_TOKENS=20000", "max_tokens: 20000", "secret_scanning: enabled",
+                    "AI_MEMORY_API_KEY_ENV: AI_MEMORY_API_KEY", "token_budget = 3500"):
+        case(f"#6163 {visible!r} is not masked", head_line(visible), True, visible)
+
+    # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
+    # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
+    fetch_root = base_dir / "pr-fetch"
+    origin = fetch_root / "origin"
+    fetch_base = make_repo(guard, origin)
+    git(origin, "branch", "basebr", fetch_base)
+    reword(origin)
+    fetch_head = commit_all(origin, "head change\n\nRule-Change-Approved-By: Justin")
+    git(origin, "update-ref", "refs/pull/7/head", fetch_head)
+    git(origin, "reset", "-q", "--hard", fetch_base)
+    clone = fetch_root / "clone"
+    subprocess.run(["git", "clone", "-q", "--no-local", "--single-branch", "--branch", "basebr", "--no-tags",
+                    origin.resolve().as_uri(), str(clone)], check=True, capture_output=True)
+    fetch_base_root = fetch_root / "baseroot"
+    shutil.copytree(clone, fetch_base_root, ignore=shutil.ignore_patterns(".git"))
+    shutil.copyfile(guard_path, fetch_base_root / GUARD_REL)
+
+    def head_ref() -> str:
+        probe = subprocess.run(["git", "-C", str(clone), "rev-parse", "-q", "--verify", "refs/remotes/pull/head"],
+                               capture_output=True, text=True, check=False)
+        return probe.stdout.strip()
+
+    def run_cli(pr_number):
+        summary = fetch_root / f"summary-{counter[0]}.md"
+        counter[0] += 1
+        argv = [sys.executable, "-I", str(Path(__file__).resolve()), "--base-root", str(fetch_base_root),
+                "--repo", str(clone), "--base-sha", fetch_base, "--head-sha", fetch_head,
+                "--scratch", str(fetch_root / "scratch"), "--summary", str(summary)]
+        if pr_number is not None:
+            argv += ["--pr-number", pr_number]
+        result = subprocess.run(argv, capture_output=True, text=True, check=False, env=child_env(),
+                                stdin=subprocess.DEVNULL)
+        written = summary.read_text(encoding="utf-8") if summary.is_file() else ""
+        return result.returncode, result.stdout, written
+
+    head_missing = subprocess.run(["git", "-C", str(clone), "cat-file", "-e", fetch_head], capture_output=True,
+                                  check=False).returncode != 0
+    fetch_checks = [("the base clone starts without the head objects", head_missing)]
+    rc, out, written = run_cli("07")
+    fetch_checks.append(("--pr-number 07 fails closed and creates no ref",
+                         rc == 1 and "RESULT: FAIL (closed) - --pr-number must be" in out and head_ref() == ""))
+    rc, out, written = run_cli("7")
+    fetch_checks.append(("--pr-number 7 fetches refs/pull/7/head and the comparison passes with the trailer",
+                         rc == 0 and head_ref() == fetch_head and "RESULT: PASS - rule text changed" in out
+                         and "RESULT: PASS - rule text changed" in written))
+    for label, ok in fetch_checks:
+        if ok:
+            print(f"PASS: self-test - #6163 run(): {label}")
+        else:
+            failures.append(f"run() fetch: {label}")
+            print(f"FAIL: self-test - #6163 run(): {label} (rc={rc})\n{out}", file=sys.stderr)
+
+    # #6163 (CodeQL py/clear-text-*-sensitive-data, SensitiveDataHeuristics.qll): an identifier whose name falls in
+    # the heuristic's secret, password or private-data class marks every value derived from it as sensitive (the
+    # Python clear-text queries ignore its id and certificate classes). The values this script names are repository
+    # paths and report lines, so no identifier may fall in those classes. Round 2 (review F3): the three classes are
+    # written out in full here, plus "trusted", the name CodeQL traced in alerts 403-409. A name is exempt when it
+    # matches the heuristic's not-sensitive list, ends in a path/file/url word (a repository path), or is a module this
+    # script imports (a module object is not a datum).
+    class_one = r"(?<!is)(?<!is_)secret|(?<!un)(?<!un_)(?<!is)(?<!is_)token|(?<!un)(?<!un_)(?<!is)(?<!is_)trusted"
+    class_two = (r"pass(wd|word|code|.?phrase)(?!.*question)|(auth(entication|ori[sz]ation)?).?key|oauth|"
+                      r"api.?(key|tok)|([_-]|\b)mfa([_-]|\b)")
+    class_three = (r"social.?security|employer.?identification|national.?insurance|resident.?id|"
+                     r"passport.?(num|no)|([_-]|\b)ssn([_-]|\b)|post.?code|zip.?code|home.?addr|"
+                     r"(mob(ile)?|home).?(num|no|tel|phone)|(tel|fax|phone).?(num|no)|telephone|"
+                     r"emergency.?contact|latitude|longitude|nationality|(credit|debit|bank|visa).?(card|num|no|"
+                     r"acc(ou)?nt)|acc(ou)?nt.?(no|num|credit)|salary|billing|credit.?(rating|score)|"
+                     r"([_-]|\b)ccn([_-]|\b)|birth.?da(te|y)|da(te|y).?(of.?)?birth|medical|(health|care).?plan|"
+                     r"healthkit|appointment|prescription|blood.?(type|alcohol|glucose|pressure)|"
+                     r"heart.?(rate|rhythm)|body.?(mass|fat)|menstrua|pregnan|insulin|inhaler|insurance|private.?data")
+    sensitive_name = re.compile(f"(?is)({class_one}|{class_two}|{class_three})")
+    not_sensitive = re.compile(r"(?is)([^\w$.-]|redact|censor|obfuscate|hash|md5|sha|random|((?<!un)(en))?(crypt|"
+                               r"(?<!pass)code)|certain|concert|secretar|accountant|accountab|(path|paths|file|url)$)")
+    heuristic_samples = ("auth_key", "authorization_key", "oauth_state", "mfa_code", "salary_line", "api_token",
+                         "session_secret", "trusted_write", "zip_code", "passphrase")
+    missed = [name for name in heuristic_samples if not sensitive_name.search(name)]
+    if missed:
+        failures.append("sensitive-name classes")
+        print(f"FAIL: self-test - #6163 the sensitive-name classes miss {missed}", file=sys.stderr)
+    else:
+        print("PASS: self-test - #6163 the sensitive-name classes cover the secret, password and private-data names")
     own_tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
     own_names = set()
+    imported = set()
     for node in ast.walk(own_tree):
         if isinstance(node, ast.Name):
             own_names.add(node.id)
@@ -1535,12 +1678,25 @@ def _self_test_cases() -> int:
             own_names.add(node.arg)
         elif isinstance(node, ast.Attribute):
             own_names.add(node.attr)
-    flagged = sorted(name for name in own_names if sensitive_name.search(name) and not not_sensitive.search(name))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            imported.update((alias.asname or alias.name).split(".")[0] for alias in node.names)
+    flagged = sorted(name for name in own_names - imported
+                     if sensitive_name.search(name) and not not_sensitive.search(name))
     if flagged:
         failures.append("sensitive identifier names")
         print(f"FAIL: self-test - #6163 identifiers CodeQL reads as credentials: {flagged}", file=sys.stderr)
     else:
         print("PASS: self-test - #6163 no identifier reads as a credential to the sensitive-data heuristic")
+    # Round 2 (review F3): the changelog states exactly what the identifier cell checks.
+    fragment = repo_root / "changelog.d" / "6163.fixed.md"
+    fragment_words = " ".join(fragment.read_text(encoding="utf-8").split()) if fragment.is_file() else ""
+    if "refuses any identifier that matches the heuristic" in fragment_words or (
+            "secret, password and private-data name classes" not in fragment_words):
+        failures.append("6163 changelog wording")
+        print("FAIL: self-test - #6163 changelog.d/6163.fixed.md does not name the checked sensitive-name classes",
+              file=sys.stderr)
+    else:
+        print("PASS: self-test - #6163 the changelog names the sensitive-name classes the self-test checks")
 
     # #6163 (CodeQL actions/untrusted-checkout): the pull request head is fetched by this base script, never by a
     # workflow step; the refspec is built from a validated decimal number only.
