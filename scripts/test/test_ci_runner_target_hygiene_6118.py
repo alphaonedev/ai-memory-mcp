@@ -19,10 +19,18 @@ world: a workflow file the reader cannot read is a FAILURE, never a skip):
            a new self-hosted cargo job cannot appear without being pinned here.
   R-DEBUG  the effective env (workflow ``env:`` overlaid by job ``env:``) sets
            BOTH ``CARGO_PROFILE_DEV_DEBUG`` and ``CARGO_PROFILE_TEST_DEBUG`` to
-           ``line-tables-only`` (the pair rule of #3461: ``test`` only inherits
-           ``dev`` while nothing overrides it; one value for every self-hosted
-           job so the shared persistent ``target/`` holds ONE artifact tree, not
-           one per debuginfo level).
+           ``0`` (the pair rule of #3461: ``test`` only inherits ``dev`` while
+           nothing overrides it; one value for every self-hosted job so the
+           shared persistent ``target/`` holds ONE artifact tree, not one per
+           debuginfo level).  ``0``, not ``line-tables-only``: the check job
+           ALREADY ran at ``line-tables-only`` when it wrote the 164 GB, and a
+           sandbox measurement (2026-10-09, lib unit-test binary + one
+           integration test binary) put the integration test binary at 130 MB
+           at ``line-tables-only`` and 11.6 MB at ``0`` (11x); the ~1000
+           integration binaries are what fill the disk.  Nothing in CI reads
+           line tables: no workflow, script or test sets RUST_BACKTRACE, panic
+           locations are compile-time strings, and the hosted sqlite leg and
+           both pg jobs have run the full suites at ``0`` since #3461 / #3274.
   R-PRUNE  the job's LAST step is named PRUNE_STEP_NAME, runs under
            ``if: always()`` (a red or cancelled test run leaves the same
            binaries behind), is skipped on GitHub-hosted runners when the job
@@ -67,7 +75,7 @@ PRUNE_INVOCATION = "python3 scripts/ci/prune-runner-target.py"
 # The exact step body every self-hosted job runs (honours a runner-side
 # CARGO_TARGET_DIR override, else the workspace default `target`).
 PRUNE_RUN_LINE = '        run: python3 scripts/ci/prune-runner-target.py --target-dir "${CARGO_TARGET_DIR:-target}"'
-DEBUG_LEVEL = "line-tables-only"
+DEBUG_LEVEL = "0"
 DEBUG_KEYS = ("CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG")
 HOSTED_GUARD = "runner.environment != 'github-hosted'"
 DOCS_ONLY_GUARD = "docs_only"
@@ -402,10 +410,23 @@ class Mutants6118(unittest.TestCase):
         found = self._mutated(mutant)
         self.assertTrue(any("R-PRUNE last step is" in v for v in found), found)
 
-    def test_6118_m02_debug_level_zero(self) -> None:
-        mutant = _replace_once(self.ci, "CARGO_PROFILE_DEV_DEBUG: line-tables-only", 'CARGO_PROFILE_DEV_DEBUG: "0"')
+    def test_6118_m02_debug_level_line_tables(self) -> None:
+        # The check job's env rows are the quoted form `"0"`; the reader unquotes.
+        anchor = 'CARGO_PROFILE_DEV_DEBUG: "0"'
+        self.assertEqual(1, self.ci.count(anchor), anchor)
+        mutant = _replace_once(self.ci, anchor, "CARGO_PROFILE_DEV_DEBUG: line-tables-only")
         found = self._mutated(mutant)
-        self.assertTrue(any("R-DEBUG CARGO_PROFILE_DEV_DEBUG is '0'" in v for v in found), found)
+        self.assertTrue(any("R-DEBUG CARGO_PROFILE_DEV_DEBUG is 'line-tables-only'" in v for v in found), found)
+
+    def test_6118_m02b_debug_pair_half_set(self) -> None:
+        # Only DEV set: the `test` profile would still inherit it today, but the
+        # #3461 pair rule says both are stated wherever either is, so the pair
+        # can never drift apart.
+        anchor = 'CARGO_PROFILE_TEST_DEBUG: "0"'
+        self.assertEqual(1, self.ci.count(anchor), anchor)
+        mutant = _replace_once(self.ci, anchor, "CARGO_PROFILE_TEST_DEBUG_UNSET: x")
+        found = self._mutated(mutant)
+        self.assertTrue(any("R-DEBUG CARGO_PROFILE_TEST_DEBUG is None" in v for v in found), found)
 
     def test_6118_m03_drop_always(self) -> None:
         anchor = "if: always() && needs.classify.outputs.docs_only != 'true' && " + HOSTED_GUARD
