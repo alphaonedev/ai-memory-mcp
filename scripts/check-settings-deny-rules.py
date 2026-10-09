@@ -15,7 +15,8 @@ What this gate enforces:
   2. `permissions` is an object; `deny`, `ask` and `allow`, when present, are lists of strings.
   3. `permissions.deny` contains each of REQUIRED_DENY: Edit(//tmp/**), Edit(//var/tmp/**),
      Edit(//private/tmp/**).
-  4. No entry (leading whitespace stripped) in deny, ask or allow starts with `Write(`,
+  4. No entry in deny, ask or allow differs from its whitespace-trimmed form (Claude Code does
+     not trim rules, so a padded rule matches nothing), and none starts with `Write(`,
      `NotebookEdit(` or `MultiEdit(`: those forms are never matched.
   5. No deny entry uses the single-slash absolute form Edit(/tmp...), Edit(/var/tmp...) or
      Edit(/private/tmp...), which is repo-relative and does not protect the absolute path.
@@ -57,9 +58,13 @@ def check(path):
         if not isinstance(value, list) or not all(isinstance(e, str) for e in value):
             errors.append(f"FAIL: {path} `permissions.{key}` is not a list of strings")
             value = []
-        entries[key] = [e.strip() for e in value]
+        entries[key] = list(value)
     for key in LISTS:
         for entry in entries[key]:
+            if entry != entry.strip():
+                errors.append(
+                    f"FAIL: {path} permissions.{key} entry {entry!r} has leading or trailing whitespace; "
+                    f"Claude Code does not trim rules, so it matches no tool and denies nothing (#6165)")
             if entry.startswith(DEAD_PREFIXES):
                 errors.append(
                     f"FAIL: {path} permissions.{key} entry {entry!r} uses a form Claude Code never "
