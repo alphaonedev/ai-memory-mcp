@@ -4645,7 +4645,9 @@ fn section_llm_reachability_from_resolved(resolved: &crate::config::ResolvedLlm)
         (crate::llm::ollama_tags_url(&resolved.base_url), None)
     } else {
         (
-            format!("{}/models", resolved.base_url),
+            // #3742 — the client's own join: a base URL with a query string
+            // keeps it AFTER the path.
+            crate::llm::join_api_path(&resolved.base_url, crate::llm::OPENAI_COMPAT_MODELS_PATH),
             resolved.api_key().map(str::to_string),
         )
     };
@@ -4870,11 +4872,9 @@ fn section_embeddings_reachability_1598() -> ReportSection {
     // Build the probe request: a no-auth model listing for the
     // Ollama wire shape, a minimal 1-char embed for API backends.
     let (probe_url, req) = if is_api {
-        let url = format!(
-            "{}{}",
-            resolved.url,
-            crate::llm::OPENAI_COMPAT_EMBEDDINGS_PATH
-        );
+        // #3742 — the client's own join (query string preserved).
+        let url =
+            crate::llm::join_api_path(&resolved.url, crate::llm::OPENAI_COMPAT_EMBEDDINGS_PATH);
         let mut req = client
             .post(&url)
             .json(&serde_json::json!({ "model": resolved.model, "input": "a" }));
