@@ -145,7 +145,9 @@ MOD_DECL_RE = re.compile(r'\bmod\s+(r#)?([A-Za-z_][A-Za-z0-9_]*)\s*([;{])')
 FN_RE = re.compile(r'\bfn\s+(r#)?([A-Za-z_][A-Za-z0-9_]*)')
 INCLUDE_RE = re.compile(r'\binclude!\s*\(\s*"')
 PATH_ATTR_RE = re.compile(r'#\s*\[\s*path\s*=\s*"')
-TEST_ATTR_RE = re.compile(r'#\s*\[[^\]]*\btest\b')
+# A test-fn attribute: #[test], #[tokio::test(..)], #[sqlx::test], #[rstest], #[test_case(..)],
+# #[test_log::test]. Not #[cfg(test)] / #[cfg_attr(test, ..)]: those mark helpers (r2 F3).
+TEST_ATTR_RE = re.compile(r'#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*(?:test|rstest|test_case)\b')
 ITEM_RE = re.compile(
     r'\b(?:(fn|struct|enum|union|trait|type|const|static|mod)\s+(?:mut\s+)?(?:r#)?([A-Za-z_][A-Za-z0-9_]*)'
     r'|(macro_rules!)\s*([A-Za-z_][A-Za-z0-9_]*)|(impl)\b)')

@@ -419,6 +419,24 @@ class LibGateBypassTests6344B2(Base):
         self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['mcp::store_tool::tests::live_']), [])
 
 
+class LibGateFollowUps6344R2(Base):
+    """review r2 F2/F3/F4."""
+
+    def test_cfg_test_helper_is_not_a_test_fn_6344_f3(self):
+        for yes in ('#[test]', '#[tokio::test]', '#[tokio::test(flavor = "multi_thread")]', '#[sqlx::test]',
+                    '#[rstest]', '#[test_log::test]', '#[test_case(1)]'):
+            self.assertTrue(pt.TEST_ATTR_RE.search(yes), yes)
+        for no in ('#[cfg(test)]', '#[cfg(all(test, unix))]', '#[cfg_attr(test, derive(Debug))]',
+                   '#[derive(Debug)]', '#[serial]', '#[ignore]'):
+            self.assertFalse(pt.TEST_ATTR_RE.search(no), no)
+        fx('src/m.rs',
+           '#[cfg(test)]\nfn pg_url() -> String { std::env::var("AI_MEMORY_TEST_POSTGRES_URL").unwrap() }\n'
+           '#[cfg(test)]\nmod t {\n    #[test]\n    fn uses() { let _ = super::pg_url(); }\n}\n')
+        # the helper is not a test fn: a prefix naming it must not "cover" it
+        self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['m::pg_url']), ['m'])
+        self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['m']), [])
+
+
 class DocEstimateTests6344B6(Base):
     def test_doc_tests_are_in_the_serial_estimate_6344(self):
         exes = pt.parse_build_json([artifact(['lib'], 'ai_memory', SCRATCH / 'src' / 'lib.rs', '/x/lib'),
