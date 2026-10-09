@@ -110,10 +110,13 @@ fn every_pinned_constructor_routes_through_the_pin_helper_3822() {
 
 #[test]
 fn non_pinned_constructors_do_not_carry_the_pin_3822() {
-    // Specificity control: the pin (no_proxy + Policy::none) is UNIQUE to the
-    // InternalOnly path. The byte-identical-legacy non-pinned constructors
-    // must NOT have gained it (a global no_proxy/none would change every
-    // client, which #3822 does not do).
+    // Specificity control: the ADDRESS pin (resolve_to_addrs) is UNIQUE to
+    // the InternalOnly path, and the non-pinned constructors must not carry
+    // an UNCONDITIONAL no_proxy/none of their own. #4193 later gave every
+    // constructor a POSTURE-CONDITIONED policy through
+    // `egress_policy::inference_client_builder` (no_proxy + Policy::none
+    // outside `allow`; `allow` byte-identical legacy) — that lives in the
+    // policy module, keyed on the posture, never inline in a constructor.
     let src = llm_src();
     for base in [
         "fn new_openai_compatible(",
@@ -121,8 +124,13 @@ fn non_pinned_constructors_do_not_carry_the_pin_3822() {
     ] {
         let body = fn_body(&src, base);
         assert!(
-            !body.contains(".no_proxy()"),
-            "{base} (non-pinned) must NOT carry .no_proxy() — the pin is InternalOnly-only"
+            !body.contains(".no_proxy()") && !body.contains(".resolve_to_addrs("),
+            "{base} (non-pinned) must NOT carry an inline pin — the address pin is \
+             InternalOnly-only and the posture policy lives in egress_policy"
+        );
+        assert!(
+            body.contains("inference_client_builder("),
+            "{base} (non-pinned) builds through the #4193 posture policy"
         );
     }
 }
