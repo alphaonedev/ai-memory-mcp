@@ -2692,6 +2692,33 @@ def _ci_image_top_level_packages_write(text: str) -> str:
 JOB_RE_TMPL = r"(?m)^  %s:\n(?P<body>(?:^(?:    .*|)\n)*)"
 
 
+def _in_job(job: str, fn: Transform) -> Transform:
+    """Apply ``fn`` to release.yml job ``job`` only (unchanged when absent)."""
+    def go(text: str) -> str:
+        m = re.search(JOB_RE_TMPL % re.escape(job), text)
+        return text if m is None else text[: m.start()] + fn(m.group(0)) + text[m.end():]
+    return go
+
+
+def _once(old: str, new: str) -> Transform:
+    return lambda s: s.replace(old, new, 1)
+
+
+# #6282 / #3613 anchors: one epoch per artifact job (a pinned step output), the
+# deterministic packer, the docker build-arg (red until they land).
+EPOCH_YAML = ("      - name: Source date epoch (#3613)\n        id: epoch\n        shell: bash\n        run: |\n"
+              + IND + "set -euo pipefail\n" + IND + 'epoch="$(/usr/bin/git log -1 --format=%ct)"\n'
+              + IND + 'test -n "$epoch"\n' + IND + 'echo "epoch=$epoch" >> "$GITHUB_OUTPUT"\n')
+EPOCH_ENV_LINE = "          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}\n"
+PACK_BIND_LINE = IND + sane_bind(("scripts/release/reproducible_build.py",)) + "\n"
+PACKER = SANE_ENV + " /usr/bin/python3 -I ../scripts/release/reproducible_build.py --pack "
+REL_PACK = PACKER + '"ai-memory-${{ matrix.target }}.tar.gz" --epoch "$SOURCE_DATE_EPOCH" "${{ matrix.artifact }}"'
+IOS_PACK = PACKER + 'ai-memory-ios.xcframework.tar.gz --epoch "$SOURCE_DATE_EPOCH" AiMemory.xcframework'
+ANDROID_PACK = PACKER + 'ai-memory-android.tar.gz --epoch "$SOURCE_DATE_EPOCH" aar'
+DOCKER_EPOCH_ARG = "          build-args: SOURCE_DATE_EPOCH=${{ steps.epoch.outputs.epoch }}\n"
+PROOF_NFPM = ' --nfpm "$RUNNER_TEMP/nfpm/nfpm" --nfpm-arch amd64 --version "${TAG#v}"'
+
+
 def _drop_job_permissions(job: str) -> Transform:
     """Remove the `permissions:` block of release.yml job ``job`` when it has one
     (#4937). A job with no block inherits the top-level `contents: write`; the
@@ -3247,6 +3274,46 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "CF5 CMD changed": ("fail", [_docker("CMD [", lambda s: re.sub(r"CMD \[[^\]\n]*\]", 'CMD ["mcp"]', s))]),
     "CF5 CMD removed": ("fail", [_docker("CMD [", _drop_lines_with("CMD ["))]),
     "valid: CF5 LABEL before the binary COPY": ("pass", [_final("LABEL org.example.y=2\n")]),
+    # --- #6282 / #3613: every artifact job reads one epoch (a pinned step output) and packs deterministically
+    "6282 release job epoch step removed": ("fail", [_rel(REL_PACK, _in_job("release", _once(EPOCH_YAML, "")))]),
+    "6282 package step tars with tar czf": ("fail", [_rel(REL_PACK, 'tar czf "ai-memory-${{ matrix.target }}.tar.gz" '
+                                                     '"${{ matrix.artifact }}"')]),
+    "6282 package step packs another file": ("fail", [_rel(REL_PACK, REL_PACK.replace('"${{ matrix.artifact }}"', "."))]),
+    "6282 package step epoch env removed": ("fail", [_rel(REL_PACK, _in_job("release", lambda s: s.replace(
+        "          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}\n" + EPOCH_ENV_LINE,
+        "          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}\n", 1)))]),
+    "6282 package step epoch is a literal": ("fail", [_rel(REL_PACK, _in_job("release", lambda s: s.replace(
+        "          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}\n" + EPOCH_ENV_LINE,
+        "          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}\n          SOURCE_DATE_EPOCH: \"1\"\n", 1)))]),
+    "6282 package step packer not bound to the verified commit": ("fail", [_rel(REL_PACK, _in_job("release", _once(
+        PACK_BIND_LINE, "")))]),
+    "6282 deb/rpm step without the epoch": ("fail", [_rel(
+        "          TAG: ${{ needs.preflight.outputs.tag }}\n" + EPOCH_ENV_LINE,
+        "          TAG: ${{ needs.preflight.outputs.tag }}\n")]),
+    "6282 mobile-ios epoch step removed": ("fail", [_rel(IOS_PACK, _in_job("mobile-ios", _once(EPOCH_YAML, "")))]),
+    "6282 mobile-android epoch step removed": ("fail", [_rel(ANDROID_PACK, _in_job("mobile-android", _once(EPOCH_YAML, "")))]),
+    "6282 mobile-ios tars with tar czf": ("fail", [_rel(IOS_PACK, "tar czf ai-memory-ios.xcframework.tar.gz AiMemory.xcframework")]),
+    "6282 mobile-android tars with tar czf": ("fail", [_rel(ANDROID_PACK, "tar czf ai-memory-android.tar.gz aar/")]),
+    "6282 mobile-android a second archive by tar -cf": ("fail", [_rel(ANDROID_PACK, ANDROID_PACK + "\n" + IND
+                                                                    + "tar -cf extra.tar aar")]),
+    "6282 mobile-ios an archive by tar --create": ("fail", [_rel(IOS_PACK, IOS_PACK + "\n" + IND
+                                                               + "tar --create -f extra.tar AiMemory.xcframework")]),
+    "6282 mobile-ios build without the epoch": ("fail", [_rel(IOS_PACK, _in_job("mobile-ios", _once(EPOCH_ENV_LINE, "")))]),
+    "6282 mobile-android build without remapped paths": ("fail", [_rel(ANDROID_PACK, _in_job("mobile-android", _once(
+        REMAP_LINES, "")))]),
+    "6282 mobile-ios packer not bound to the verified commit": ("fail", [_rel(IOS_PACK, _in_job("mobile-ios", _once(
+        PACK_BIND_LINE, "")))]),
+    "6282 docker job epoch step removed": ("fail", [_rel(DOCKER_EPOCH_ARG, _in_job("docker", _once(EPOCH_YAML, "")))]),
+    "6282 docker build-arg removed": ("fail", [_rel(DOCKER_EPOCH_ARG, "")]),
+    "6282 Dockerfile ARG SOURCE_DATE_EPOCH removed": ("fail", [_docker("ARG SOURCE_DATE_EPOCH\n", "")]),
+    "6282 Dockerfile ARG SOURCE_DATE_EPOCH with a default": ("fail", [_docker("ARG SOURCE_DATE_EPOCH\n",
+                                                                             "ARG SOURCE_DATE_EPOCH=0\n")]),
+    "valid: 6282 a tar listing in the android job": ("pass", [_rel(ANDROID_PACK, ANDROID_PACK + "\n" + IND
+                                                                 + "tar -tzf ai-memory-android.tar.gz")]),
+    # --- #6283: the proof also compares the tarball and the deb/rpm built in each workspace
+    "6283 proof without --nfpm": ("fail", [_rel(PROOF_NFPM, "")]),
+    "6283 proof nfpm install step removed": ("fail", [_rel(PROOF_NFPM, _in_job("reproducible", lambda s: re.sub(
+        r"      - name: Install nfpm 2\.41\.1 \(pinned digest\)\n(?:        .*\n|\n)*?(?=      - )", "", s, count=1)))]),
     # --- #6279: the release matrix pins each (target, os) pair; no self-hosted leg
     "6279 matrix os self-hosted": ("fail", [_rel(LINUX_X86_LEG, LINUX_X86_LEG.replace("ubuntu-latest", "self-hosted"))]),
     "6279 matrix os changed for one target": ("fail", [_rel(LINUX_ARM_LEG, LINUX_ARM_LEG.replace("ubuntu-24.04-arm",
