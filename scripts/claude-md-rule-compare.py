@@ -161,13 +161,22 @@ BEARER_VALUE = re.compile(r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/-]{8,}=*)")
 PROVIDER_KEY_SHAPE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|(?:AKIA|ASIA)[0-9A-Z]{16}|"
                                 r"xox[abposr]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{20,}|"
                                 # #6211: GitLab personal access, Google API and npm tokens carry no name either.
-                                r"glpat-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35,}|npm_[A-Za-z0-9]{36,})\b")
+                                r"glpat-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35,}|npm_[A-Za-z0-9]{36,}|"
+                                # #6343: an age identity (X25519 secret key, Bech32 upper case).
+                                r"AGE-SECRET-KEY-1[0-9A-Z]{50,})\b")
 # #6211: a JSON Web Token (header.payload.signature); round 4 (code F4): only the header is known to be base64url JSON
 # (`{"` = `eyJ`), so the payload and signature are any base64url runs of 8 or more characters.
 JWT_SHAPE = re.compile(r"\b(eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b")
-# A PEM or PGP private key block; #6211: a PuTTY private key file runs from its header to its Private-MAC line.
-PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|PuTTY-User-Key-File-\d+:")
-PRIVATE_KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|Private-MAC:")
+# A PEM or PGP private key block; #6211: a PuTTY private key file runs from its header to its Private-MAC line;
+# #6343: an RFC 4716 (SSH2) armour has four dashes and spaces (`---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----`).
+PRIVATE_KEY_BEGIN = re.compile(r"-{4,5} ?BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)? ?-{4,5}|PuTTY-User-Key-File-\d+:")
+PRIVATE_KEY_END = re.compile(r"-{4,5} ?END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)? ?-{4,5}|Private-MAC:")
+# #6343: a private member of a JSON Web Key (RFC 7517/7518: EC/OKP `d`, RSA `p` `q` `dp` `dq` `qi` and `d`, oct
+# `k`). It is masked on a line that names the key type (`"kty"`), and anywhere when its value is JWK_MEMBER_MIN or
+# more base64url characters (a pretty-printed key puts each member on its own line).
+JWK_PRIVATE_MEMBER = re.compile(r"\"(?:d|p|q|dp|dq|qi|k)\"\s*:\s*\"([A-Za-z0-9_-]+)\"")
+JWK_TYPE = re.compile(r"\"kty\"\s*:")
+JWK_MEMBER_MIN = 16
 # #6211: a credential name with no value on its line (`api_key:`); the value is on the next line that is not blank.
 NAME_ONLY = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\"'`])?\s*[:=]\s*(?:[*_]{1,2})?\s*$")
 # #6211 round 4 (security F1): a YAML block scalar under a credential name (`private_key: |`, `secret: >-`); every
@@ -400,6 +409,22 @@ def mask_named_values(line: str) -> tuple:
     return "".join(out), count
 
 
+def mask_jwk_members(line: str) -> tuple:
+    """#6343: mask the value of every JWK_PRIVATE_MEMBER in `line` that is on a line naming the key type or is
+    JWK_MEMBER_MIN or more characters long; returns (line, count)."""
+    typed = JWK_TYPE.search(line) is not None
+    count = 0
+
+    def replace(match):
+        nonlocal count
+        if not typed and len(match.group(1)) < JWK_MEMBER_MIN:
+            return match.group(0)
+        count += 1
+        start, stop = match.span(1)
+        return match.group(0)[:start - match.start()] + MASK + match.group(0)[stop - match.start():]
+    return JWK_PRIVATE_MEMBER.sub(replace, line), count
+
+
 def mask_group(pattern, line: str) -> tuple:
     """Replace group 1 of every `pattern` match in `line` with MASK; returns (line, count)."""
     def replace(match):
@@ -496,6 +521,8 @@ class Redactor:
             line, found = mask_named_values(line)
             self.count += found
             line, found = mask_table_cells(line)
+            self.count += found
+            line, found = mask_jwk_members(line)
             self.count += found
             for pattern in (URL_USERINFO, URL_USER_ONLY, BEARER_VALUE, PROVIDER_KEY_SHAPE, JWT_SHAPE):
                 line, found = mask_group(pattern, line)
