@@ -113,6 +113,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1310,6 +1311,20 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     elif ("(shim-pathsep): the git shim could not be installed" not in rec.messages[0]
           or "PATH separator" not in rec.messages[0]):
         t.fail(f"(shim-pathsep): the named failure is wrong: {rec.messages[0]!r}")
+    # #6379: a shim that is installed but unreachable for a reason other than the
+    # PATH separator (here: not executable, so PATH lookup falls through to the
+    # real git) must be refused by name, never leave the gate blamed. Under a
+    # checkout path holding the separator the cells above already fail by name.
+    if os.pathsep not in str(tmp):
+        with unittest.mock.patch.object(Path, "chmod", lambda self, mode, *a, **k: None):
+            try:
+                run_gate_shimmed(tmp, repo, env7, version="git version 2.29.9")
+            except GateError as exc:
+                if "is not the git on PATH" not in str(exc):
+                    t.fail(f"(shim-unreach): refused for the wrong reason: {exc}")
+            else:
+                t.fail("(shim-unreach): a non-executable git shim (PATH lookup falls through "
+                       "to the real git) was not refused")
     # Each of the next two cells is rejected by exactly one predicate.
     t.gate("pr7-second", "a two-parent merge whose second parent is an unrelated branch, not "
            "PR_HEAD_SHA", repo, dict(env7, GITHUB_SHA=unrel7), "is not PR_HEAD_SHA")
