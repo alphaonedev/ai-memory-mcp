@@ -80,7 +80,9 @@ each unit is and WHAT is substituted into it:
     runtime base image); after that RUN no COPY, ADD or RUN may follow. That
     stage (the builder) must not start
     FROM another stage nor COPY ``--from``, must COPY Cargo.lock, and must end
-    with exactly the declaration COPY followed by the canonical RUN. ``cargo``
+    with exactly the declaration COPY followed by the canonical RUN, whose first
+    statements (#6277) are ``sha256sum -c`` checks of the copied declaration and
+    asserter against digests run_guard computes from the tree. ``cargo``
     (and the other build tools) anywhere else in the Dockerfile is refused, read
     with quote and backslash characters removed. Every line ending in ``\\``
     outside the canonical RUN is refused, and the canonical RUN's lines must be
@@ -313,28 +315,64 @@ WF_SBOM = ("set -euo pipefail",) + EPOCH_STATEMENTS + (
     "ls -la ai-memory.cdx.json*",
 )
 SHAPE_BUILD = ("set -euo pipefail", ALLOWED_FEATURES, 'test -n "$FEATURES"', SHAPE_BUILD_CMD)
-DOCKER_RUN = (
-    "RUN set -eu; "
-    + ALLOWED_FEATURES + "; "
-    + ALLOWED_REQUIRE + "; "
-    + 'test -n "$FEATURES"; test -n "$REQUIRE_FLAGS"; '
-    + SHAPE_BUILD_CMD + "; "
-    + "strip target/release/ai-memory; "
-    + ASSERT_DOCKER
-)
+# #6277: the build RUN first checks the copied declaration and asserter against
+# sha256 digests the guard computes from the tree it checks (run_guard), so an
+# image build whose context differs from the reviewed files fails at its first
+# statement. The digests are not hand-copied pins: they are recomputed on every
+# guard run, and the Dockerfile must carry exactly those values.
+DOCKER_SUMMED = ("scripts/release-features.sh", "scripts/assert-compiled-features.sh")
+NO_DIGEST = "0" * 64
+
+
+def tree_digests(root: Path) -> Tuple[str, ...]:
+    """sha256 of each DOCKER_SUMMED file under ``root``; NO_DIGEST when unreadable
+    (run_guard refuses that, so a missing file never yields a passing pin)."""
+    out = []
+    for rel in DOCKER_SUMMED:
+        try:
+            out.append(hashlib.sha256((root / rel).read_bytes()).hexdigest())
+        except OSError:
+            out.append(NO_DIGEST)
+    return tuple(out)
+
+
+def docker_sums(digests: Tuple[str, ...]) -> Tuple[str, ...]:
+    return tuple(f'echo "{d} *{rel}" | sha256sum -c -' for d, rel in zip(digests, DOCKER_SUMMED))
+
+
+def docker_run(digests: Tuple[str, ...]) -> str:
+    return (
+        "RUN set -eu; "
+        + "".join(s + "; " for s in docker_sums(digests))
+        + ALLOWED_FEATURES + "; "
+        + ALLOWED_REQUIRE + "; "
+        + 'test -n "$FEATURES"; test -n "$REQUIRE_FLAGS"; '
+        + SHAPE_BUILD_CMD + "; "
+        + "strip target/release/ai-memory; "
+        + ASSERT_DOCKER
+    )
+
+
 # The ONLY `\` continuation the guard accepts anywhere: the canonical build RUN,
 # compared physical line by physical line (#4719 C-1/C-2). Any other line that
 # ends in `\` (Dockerfile, or release.yml / release-shape.yml run text) is refused.
-DOCKER_RUN_LINES = (
-    "RUN set -eu; \\",
-    "    " + ALLOWED_FEATURES + "; \\",
-    "    " + ALLOWED_REQUIRE + "; \\",
-    '    test -n "$FEATURES"; \\',
-    '    test -n "$REQUIRE_FLAGS"; \\',
-    "    " + SHAPE_BUILD_CMD + "; \\",
-    "    strip target/release/ai-memory; \\",
-    "    " + ASSERT_DOCKER,
-)
+def docker_run_lines(digests: Tuple[str, ...]) -> Tuple[str, ...]:
+    return (("RUN set -eu; \\",)
+            + tuple("    " + s + "; \\" for s in docker_sums(digests))
+            + ("    " + ALLOWED_FEATURES + "; \\",
+               "    " + ALLOWED_REQUIRE + "; \\",
+               '    test -n "$FEATURES"; \\',
+               '    test -n "$REQUIRE_FLAGS"; \\',
+               "    " + SHAPE_BUILD_CMD + "; \\",
+               "    strip target/release/ai-memory; \\",
+               "    " + ASSERT_DOCKER))
+
+
+# The pins of this checkout (the self-test and messages); run_guard recomputes
+# them from the tree it is given.
+DOCKER_DIGESTS = tree_digests(Path(__file__).resolve().parent.parent)
+DOCKER_RUN = docker_run(DOCKER_DIGESTS)
+DOCKER_RUN_LINES = docker_run_lines(DOCKER_DIGESTS)
 # #4752: the runtime stage re-asserts the SHIPPED path with the declaration and
 # asserter copied from the builder stage (never from the build context).
 DOCKER_CHECK_DIR = "/opt/ai-memory/release-check"
@@ -1614,8 +1652,8 @@ def check_release_yml(text: str, rep: Report) -> None:
     check_repro_job(jobs, rep)
 
 
-def docker_nearest(builder: List[str]) -> str:
-    want = tuple(DOCKER_RUN.split("; "))
+def docker_nearest(builder: List[str], run: str = DOCKER_RUN) -> str:
+    want = tuple(run.split("; "))
     runs = [ins for ins in builder if ins.upper().startswith("RUN ")]
     if not runs:
         return "the builder stage has no RUN"
@@ -1623,8 +1661,9 @@ def docker_nearest(builder: List[str]) -> str:
     return "nearest builder RUN: " + first_diff(tuple(got.split("; ")), want)
 
 
-def check_dockerfile(text: str, rep: Report) -> None:
+def check_dockerfile(text: str, rep: Report, digests: Tuple[str, ...] = DOCKER_DIGESTS) -> None:
     check_no_bash_env("Dockerfile", text, rep)
+    run, run_lines = docker_run(digests), docker_run_lines(digests)
     raw = text.split("\n")
     if raw[0] != DOCKER_SYNTAX:
         rep.bad(f"Dockerfile: line 1 must be exactly `{DOCKER_SYNTAX}` (the syntax directive picks the frontend that "
@@ -1638,8 +1677,8 @@ def check_dockerfile(text: str, rep: Report) -> None:
     spans = bk_instructions(raw)
     canon_lines: set = set()
     for first, last, ins in spans:
-        if ins == DOCKER_RUN:
-            if tuple(raw[first - 1:last]) == DOCKER_RUN_LINES:
+        if ins == run:
+            if tuple(raw[first - 1:last]) == run_lines:
                 canon_lines.update(range(first, last + 1))
             else:
                 rep.bad(pin_message("Dockerfile", f"line {first}: the build RUN is not written exactly as the pinned "
@@ -1715,7 +1754,7 @@ def check_dockerfile(text: str, rep: Report) -> None:
                     "instructions (ENV, VOLUME, EXPOSE, USER, ENTRYPOINT, CMD...) may follow it (#4752)")
     for k, (_, body) in enumerate(stages):
         for pos, ins in enumerate(body):
-            canon = k == bidx and pos == len(body) - 1 and ins == DOCKER_RUN
+            canon = k == bidx and pos == len(body) - 1 and ins == run
             if BUILD_TOOL_RE.search(unquoted(ins)) and not canon:
                 rep.bad(f"Dockerfile: a build tool outside the canonical build RUN (the last instruction of the stage the "
                         f"image copies the binary from): {ins[:80]}")
@@ -1732,9 +1771,10 @@ def check_dockerfile(text: str, rep: Report) -> None:
         rep.bad(f"Dockerfile: the builder stage must `{DOCKER_ASSERTER_COPY}` immediately before the declaration COPY "
                 "(#4768: an instruction between the asserter COPY and the build RUN could rewrite the asserter)"
                 + pin_hint("DOCKER_ASSERTER_COPY"))
-    if builder[-1:] != [DOCKER_RUN]:
-        rep.bad("Dockerfile: the builder stage must END with exactly the allowed build+assert RUN (nothing after it); "
-                + docker_nearest(builder) + pin_hint("DOCKER_RUN"))
+    if builder[-1:] != [run]:
+        rep.bad("Dockerfile: the builder stage must END with exactly the allowed build+assert RUN (nothing after it; "
+                "#6277: its checksum statements carry the sha256 of the tree's declaration and asserter); "
+                + docker_nearest(builder, run) + pin_hint("DOCKER_RUN"))
 
 
 def check_inline_use(name: str, text: str, rep: Report) -> None:
@@ -1848,7 +1888,11 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
     if rel is not None:
         check_release_yml(rel, rep)
     if docker is not None:
-        check_dockerfile(docker, rep)
+        digests = tree_digests(root)
+        for rel, digest in zip(DOCKER_SUMMED, digests):
+            if digest == NO_DIGEST:
+                rep.bad(f"{rel}: unreadable, so the Dockerfile checksum pin cannot be computed (#6277)")
+        check_dockerfile(docker, rep, digests)
     if shape is not None:
         check_shape(shape, rep, advisory)
     if install is not None:
@@ -2183,7 +2227,7 @@ def _drop_proof_step(text: str) -> str:
 # #6277: the Dockerfile build RUN checks the copied declaration and asserter
 # against digests the guard computes from the tree. These transforms are no-ops
 # until the checksum lines land (red first).
-SUM_LINE_RE = r'^    echo "[0-9a-f]{64}  %s" \| sha256sum -c -; \\\n'
+SUM_LINE_RE = r'^    echo "[0-9a-f]{64} \*%s" \| sha256sum -c -; \\\n'
 
 
 def _drop_sum(path: str) -> Transform:
@@ -2191,12 +2235,12 @@ def _drop_sum(path: str) -> Transform:
 
 
 def _zero_sum(path: str) -> Transform:
-    pat = r'(?m)^(    echo ")[0-9a-f]{64}(  %s" \| sha256sum -c -)' % re.escape(path)
+    pat = r'(?m)^(    echo ")[0-9a-f]{64}( \*%s" \| sha256sum -c -)' % re.escape(path)
     return lambda text: re.sub(pat, lambda m: m.group(1) + "0" * 64 + m.group(2), text)
 
 
 def _swap_sum_paths(text: str) -> str:
-    a, b = "  " + DECL + '" | sha256sum', "  " + ASSERTER + '" | sha256sum'
+    a, b = " *" + DECL + '" | sha256sum', " *" + ASSERTER + '" | sha256sum'
     return text.replace(a, "\0").replace(b, a).replace("\0", b)
 
 
@@ -3221,6 +3265,8 @@ def self_test(root: Path) -> int:
             .replace("strip target", "echo strip target")
             .replace("bash scripts/assert-compiled-features.sh", "echo assert")
         )
+        for s in docker_sums(DOCKER_DIGESTS):  # proven on their own below (#6277)
+            docker_body = docker_body.replace(s, "true")
         (tmp / "scripts").mkdir()
         for label, body, shell in (("build step", build_body, "bash"), ("Dockerfile RUN", docker_body, "sh")):
             shutil.copy2(root / DECL, tmp / DECL)
@@ -3528,7 +3574,7 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("pinned no-value key not compared", 'return "" if node.kind == "null" else', 'return "" if True else'),
     ("whole-pinned job step count not compared", "if len(items) != len(steps_spec):", "if False:"),
     ("action SHA bump not recognised", 'uses.text().split("@")[0] == want.split("@")[0]', "False"),
-    ("canonical RUN physical lines not compared", "if tuple(raw[first - 1:last]) == DOCKER_RUN_LINES:", "if True:"),
+    ("canonical RUN physical lines not compared", "if tuple(raw[first - 1:last]) == run_lines:", "if True:"),
     ("continuations outside the canonical RUN allowed", "        if n not in canon_lines:\n", "        if False:\n"),
     ("run continuation check never fires", 'if text.rstrip(" \\t").endswith("\\\\"):', "if False:"),
     ("registry allowed outside the docker job", "if not in_docker and REGISTRY in text.lower():", "if False:"),

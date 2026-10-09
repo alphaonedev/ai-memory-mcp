@@ -52,9 +52,14 @@ COPY vendor/ vendor/
 # sqlx on rustls, no libpq / system OpenSSL at runtime) and asserts the same set.
 # --locked (#2895): build against the COMMITTED Cargo.lock (copied above), never
 # a silently re-resolved dependency.
+# #4768 / #6277 — the build RUN first checks both copied files against the
+# sha256 the guard (scripts/check_release_features.py) computes from the tree,
+# so a build context that differs from the reviewed files fails here.
 COPY scripts/assert-compiled-features.sh scripts/assert-compiled-features.sh
 COPY scripts/release-features.sh scripts/release-features.sh
 RUN set -eu; \
+    echo "4dcd53494e52381437e6fe13f21d06a5393a4e2ef83d02369d02278b00f5d9d6 *scripts/release-features.sh" | sha256sum -c -; \
+    echo "ea836345a37906f6cf7f867533915f3b52b39a6ac273e22a590050a1d68e9a13 *scripts/assert-compiled-features.sh" | sha256sum -c -; \
     FEATURES="$(bash scripts/release-features.sh)"; \
     REQUIRE_FLAGS="$(bash scripts/release-features.sh --require-flags)"; \
     test -n "$FEATURES"; \
