@@ -4535,6 +4535,62 @@ fn section_capabilities_local() -> ReportSection {
     }
 }
 
+/// #4121 — the reachability probes are inference egress like any other: admit
+/// the target through the #1963 gate (`crate::egress::admit_inference_target`,
+/// the same call the curator section and every client builder make) BEFORE
+/// any client is built or credential attached. `Ok(pin)` carries the
+/// internal-only resolve-then-pin target (#3822) the probe client must use, so
+/// the probed host is the admitted host; `Err` is the finished section that
+/// reports the refusal as a fact and sends nothing.
+fn admit_probe_target(
+    name: &str,
+    class: crate::egress::EgressClass,
+    base_url: &str,
+    facts: &mut Vec<(String, String)>,
+) -> Result<Option<crate::egress::PinnedTarget>, ReportSection> {
+    match crate::egress::admit_inference_target(
+        crate::egress::resolve_inference_egress_mode(),
+        class,
+        base_url,
+    ) {
+        Ok(pin) => Ok(pin),
+        Err(decision) => {
+            if let crate::egress::EgressDecision::Refuse { reason, .. } = decision {
+                facts.push(("inference_egress".into(), reason));
+            }
+            Err(ReportSection {
+                name: name.into(),
+                severity: Severity::Info,
+                facts: std::mem::take(facts),
+                note: Some(
+                    "probe skipped: the inference-egress posture (AI_MEMORY_INFERENCE_EGRESS) \
+                     refuses this target, so the daemon builds no client for it and doctor \
+                     sends it no request and no credential (#4121)"
+                        .into(),
+                ),
+            })
+        }
+    }
+}
+
+/// #4121 — the probe client: 5 s timeouts, plus the #3822 internal-only pin
+/// (`resolve_to_addrs`, no redirects, no proxy) when the admission returned
+/// one, mirroring `OllamaClient::apply_internal_egress_pin`.
+fn probe_client(
+    pin: Option<&crate::egress::PinnedTarget>,
+) -> reqwest::Result<reqwest::blocking::Client> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(5));
+    if let Some(pin) = pin {
+        builder = builder
+            .resolve_to_addrs(&pin.host, &pin.addrs)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
+    }
+    builder.build()
+}
+
 /// v0.7.x (#1146) — LLM reachability probe.
 ///
 /// Resolves the canonical LLM configuration via
@@ -4640,6 +4696,16 @@ fn section_llm_reachability_from_resolved(resolved: &crate::config::ResolvedLlm)
         };
     }
 
+    let pin = match admit_probe_target(
+        SECTION_LLM_REACHABILITY,
+        crate::egress::EgressClass::InferenceLlm,
+        &resolved.base_url,
+        &mut facts,
+    ) {
+        Ok(pin) => pin,
+        Err(section) => return section,
+    };
+
     // Build the probe URL.
     let (probe_url, bearer) = if resolved.is_ollama_native() {
         (crate::llm::ollama_tags_url(&resolved.base_url), None)
@@ -4655,11 +4721,7 @@ fn section_llm_reachability_from_resolved(resolved: &crate::config::ResolvedLlm)
     ));
 
     let started = std::time::Instant::now();
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
+    let client = match probe_client(pin.as_ref()) {
         Ok(c) => c,
         Err(e) => {
             facts.push((
@@ -4845,13 +4907,18 @@ fn section_embeddings_reachability_1598() -> ReportSection {
     }
 
     let is_api = crate::config::is_api_embed_backend(&resolved.backend);
+    let pin = match admit_probe_target(
+        SECTION_EMBEDDINGS_REACHABILITY,
+        crate::egress::EgressClass::InferenceEmbedding,
+        &resolved.url,
+        &mut facts,
+    ) {
+        Ok(pin) => pin,
+        Err(section) => return section,
+    };
 
     let started = std::time::Instant::now();
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
+    let client = match probe_client(pin.as_ref()) {
         Ok(c) => c,
         Err(e) => {
             facts.push((
