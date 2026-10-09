@@ -1013,6 +1013,22 @@ class Mutants6118(unittest.TestCase):
             "          cargo build --profile=release\n")
         self.assertEqual([], found)
 
+    def test_6118_m33_bash_ansi_c_quoting_hides_the_separator(self) -> None:
+        # #6256: bash $'..' decodes \x1f, \037 and \n before cargo sees the value.
+        for spelling in (
+                "CARGO_ENCODED_RUSTFLAGS=$'-Copt-level=0\\x1f-g' cargo test --no-run",
+                "CARGO_ENCODED_RUSTFLAGS=$'-g\\x1f-Copt-level=0' cargo test --no-run",
+                "export CARGO_ENCODED_RUSTFLAGS=$'-Copt-level=0\\037-g'",
+                "RUSTFLAGS=$'-Copt-level=0\\n-g' cargo test --no-run",
+                "RUSTFLAGS=$'-Copt-level=0\\x20-g' cargo test --no-run"):
+            found = self._before_prune("      - name: Ansi-C\n        run: " + spelling + "\n")
+            self.assertTrue(self._debug_flagged(found), (spelling, found))
+        found = self._before_prune(
+            "      - name: Ansi-C benign\n        run: |\n"
+            "          CARGO_ENCODED_RUSTFLAGS=$'-Copt-level=0\\x1f-Dwarnings' cargo test --no-run\n"
+            "          echo $'tab\\there'\n")
+        self.assertEqual([], found)
+
 
 def _write(path: Path, size: int, executable: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
