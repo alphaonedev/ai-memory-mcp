@@ -21,8 +21,8 @@ same-named file elsewhere, and a symlink counts only when it resolves inside
 
 1. an erratum line somewhere in ``docs/compliance/`` names it together with an
    existing successor (``scripts/<name>``). An erratum line is a single line
-   containing the word "erratum", the stale name in backticks, and the
-   successor in backticks. The successor must resolve inside ``scripts/``: a
+   whose reader-visible text (outside HTML comments, #6196) contains the word
+   "erratum", the stale name, and the successor in backticks. The successor must resolve inside ``scripts/``: a
    ``..`` or ``.`` component, or a symlink escaping ``scripts/``, is rejected.
 2. the ``<relative-doc-path>:<stale-name>`` pair is listed in
    ``scripts/qc-allowlists/compliance-script-names-allow.txt``. The allowlist
@@ -203,12 +203,38 @@ def compliance_docs(root):
     return sorted(docs), problems
 
 
+def visible_lines(lines):
+    """``lines`` with HTML comment text (``<!-- ... -->``) removed, line count kept (#6196).
+
+    An erratum exists to tell a reader the text names a removed script, so only text a
+    rendered document shows can carry one. Stale names are still found in comments.
+    """
+    out, inside = [], False
+    for line in lines:
+        shown, pos = [], 0
+        while True:
+            if inside:
+                end = line.find("-->", pos)
+                if end < 0:
+                    break
+                inside, pos = False, end + len("-->")
+            else:
+                start = line.find("<!--", pos)
+                if start < 0:
+                    shown.append(line[pos:])
+                    break
+                shown.append(line[pos:start])
+                inside, pos = True, start + len("<!--")
+        out.append("".join(shown))
+    return out
+
+
 def collect_errata(root, lines_by_doc):
     """Return (all, per_doc): stale name -> successor, globally and by doc path."""
     errata, per_doc = {}, {}
     for doc, lines in lines_by_doc:
         rel = doc.relative_to(root).as_posix()
-        for line in lines:
+        for line in visible_lines(lines):
             if "erratum" not in line.lower():
                 continue
             succ = [s for s in SUCCESSOR_RE.findall(line) if successor_ok(root, s)]
