@@ -421,3 +421,56 @@ async fn postgres_agent_notified_body_echo_is_acked_4076() {
         .expect("audit row");
     assert_eq!(status, "ack", "#4076: the body-echo receiver must be acked");
 }
+
+/// #4280 — on the postgres daemon a namespace-only subscription memory (the
+/// synthetic `https://localhost/_ns/<agent>/<ns>` url the HTTP postgres branch
+/// stores) is recorded for replay and never delivered: one audit row with the
+/// terminal status `recorded`, zero DLQ rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_namespace_only_subscription_is_recorded_not_delivered_4280() {
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let (state, audit_path) = make_test_state();
+    let ns = format!("ns-4280-{unique}");
+    let sub_id = format!("sub-4280-{unique}");
+    let sub_mem = make_subscription_memory(
+        &sub_id,
+        "probe",
+        &format!("https://localhost/_ns/probe/{ns}"),
+        &ns,
+        Some(&sha256_hex_local("test-secret-4280")),
+    );
+    state
+        .store
+        .store(&CallerContext::for_admin("test-setup"), &sub_mem)
+        .await
+        .expect("seed namespace-only subscription memory");
+
+    dispatch_event_postgres(
+        &state,
+        "memory_store",
+        "mem-4280",
+        &ns,
+        Some("ai:probe"),
+        None,
+    )
+    .await;
+    wait_dispatch_idle().await;
+
+    let conn = rusqlite::Connection::open(&audit_path).expect("open audit db");
+    let status: String = conn
+        .query_row(
+            "SELECT delivery_status FROM subscription_events WHERE subscription_id = ?1",
+            [&sub_id],
+            |r| r.get(0),
+        )
+        .expect("one audit row");
+    assert_eq!(status, "recorded", "#4280: recorded for replay, never sent");
+    let dlq: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM subscription_dlq WHERE subscription_id = ?1",
+            [&sub_id],
+            |r| r.get(0),
+        )
+        .expect("count dlq");
+    assert_eq!(dlq, 0, "#4280: no DLQ row for a namespace-only event");
+}
