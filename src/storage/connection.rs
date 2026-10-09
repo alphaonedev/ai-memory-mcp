@@ -968,6 +968,30 @@ fn apply_writer_pragmas(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// #6107 — rusqlite's open failure appends the raw path to its message
+/// (`unable to open database file: <path>`), and that path can be a mistyped
+/// store URL carrying a credential (`serve --store-url sqlite://svc:<pw>@x/db`).
+/// Drop the message (the extended code still says what failed) and render the
+/// path through the allowlist in the context instead. The error keeps its
+/// `rusqlite::Error` type, so a caller downcasting the code is unaffected.
+fn scrub_open_error(e: rusqlite::Error) -> rusqlite::Error {
+    match e {
+        rusqlite::Error::SqliteFailure(code, Some(_)) => rusqlite::Error::SqliteFailure(code, None),
+        rusqlite::Error::InvalidPath(path) => {
+            rusqlite::Error::InvalidPath(crate::url_display::db_path_display(&path).into())
+        }
+        other => other,
+    }
+}
+
+/// The context line of a failed writer open: the slug plus the rendered path.
+fn open_failure_context(path: &Path) -> String {
+    format!(
+        "failed to open database {}",
+        crate::url_display::db_path_display(path)
+    )
+}
+
 /// v1.0.0 #2445 — open an EXISTING database WITHOUT applying the bootstrap
 /// schema, the migration ladder, the CHECK triggers, or the downgrade guard.
 ///
@@ -993,7 +1017,9 @@ fn apply_writer_pragmas(conn: &Connection) -> Result<()> {
 /// Propagates connection-open failures, the SQLCipher unlock failure, or any
 /// PRAGMA failure.
 pub fn open_unmigrated(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path).context("failed to open database")?;
+    let conn = Connection::open(path)
+        .map_err(scrub_open_error)
+        .with_context(|| open_failure_context(path))?;
     apply_sqlcipher_key(&conn)?;
     register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
     apply_writer_pragmas(&conn)?;
@@ -1024,7 +1050,9 @@ fn test_trace_on_open(conn: Connection) -> Connection {
 }
 
 pub fn open(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path).context("failed to open database")?;
+    let conn = Connection::open(path)
+        .map_err(scrub_open_error)
+        .with_context(|| open_failure_context(path))?;
     apply_sqlcipher_key(&conn)?;
     register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
     apply_writer_pragmas(&conn)?;
@@ -1121,6 +1149,7 @@ pub fn open_read_only(path: &Path) -> Result<Connection> {
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)
+        .map_err(scrub_open_error)
         .context("failed to open read-only database connection")?;
     apply_sqlcipher_key(&conn)?;
     register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
@@ -1163,13 +1192,16 @@ pub const MISSING_DATABASE_REFUSAL: &str =
 /// must not), plus every error [`open_read_only`] / the #2445/#2555/#2564
 /// guards can produce.
 pub fn open_existing_read_only(path: &Path) -> Result<Connection> {
+    // #6107 — the path may come from a mistyped store URL
+    // (`migrate --from sqlite://svc:<pw>@x/db`), so it renders through the
+    // allowlist, never raw.
+    let target = crate::url_display::db_path_display(path);
     match path.try_exists() {
-        Ok(false) => anyhow::bail!("{}: {}", MISSING_DATABASE_REFUSAL, path.display()),
+        Ok(false) => anyhow::bail!("{MISSING_DATABASE_REFUSAL}: {target}"),
         Ok(true) => {}
-        Err(e) => anyhow::bail!("cannot stat {}: {e}", path.display()),
+        Err(e) => anyhow::bail!("cannot stat {target}: {e}"),
     }
     let conn = open_read_only(path)?;
-    let target = path.display().to_string();
     // Diagnose schema-ahead / poisoned / zeroed WITHOUT migrating so
     // boot/doctor keep the #2445/#2555/#2564 typed refusals.
     assert_schema_not_ahead(&conn, &target)?;
