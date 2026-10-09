@@ -1758,6 +1758,33 @@ class PruneScript6118(unittest.TestCase):
         self.assertRegex(out.getvalue(), r"(?m)^  failed\s+deps executable\s+1$")
         self.assertNotRegex(out.getvalue(), r"(?m)^  deps executable\s+2\b")
 
+    def test_6118_r5_6257_example_dsym_uplift_symlink_does_not_dangle(self) -> None:
+        # #6257: with packed split debuginfo on macOS cargo writes
+        # examples/<name>.dSYM -> <name>-<hash>.dSYM next to the nlink-1 clone
+        # pair.  The pair and the hashed dSYM go; the link into it must go too
+        # (as a link, never followed) instead of dangling.  A link that points
+        # anywhere else is none of the prune's business and stays.
+        ex = self.target / "debug" / "examples"
+        _write(ex / "clonex-0123456789abcdef", 900, True)
+        _write(ex / "clonex", 900, True)
+        _write(ex / "clonex-0123456789abcdef.dSYM" / "Contents" / "Info.plist", 40)
+        (ex / "clonex.dSYM").symlink_to("clonex-0123456789abcdef.dSYM")
+        _write(ex / "stray", 300, True)
+        outside_dsym = Path(self.scratch.name) / "outside-dsym"
+        _write(outside_dsym / "keep", 5)
+        (ex / "stray.dSYM").symlink_to(outside_dsym)
+        for args in (("--dry-run",), ()):
+            proc = self._run("--target-dir", str(self.target), *args)
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            if args:
+                self.assertTrue(os.path.lexists(ex / "clonex.dSYM"))
+                self.assertIn("debug/examples/clonex.dSYM", proc.stdout)
+        self.assertFalse(os.path.lexists(ex / "clonex.dSYM"), os.listdir(ex))
+        self.assertFalse((ex / "clonex-0123456789abcdef.dSYM").exists())
+        self.assertTrue(os.path.islink(ex / "stray.dSYM"))
+        self.assertEqual(5, (outside_dsym / "keep").stat().st_size)
+        self.assertFalse((ex / "clonex").exists())
+
 
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
 EXAMPLE_UPLIFT = "debug/examples/demo"
