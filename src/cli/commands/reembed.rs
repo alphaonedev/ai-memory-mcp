@@ -15,12 +15,16 @@
 //! ## Resolution contract
 //!
 //! The embedder is resolved through the SAME path as daemon/MCP boot:
-//! [`crate::config::AppConfig::resolve_embeddings`] +
-//! [`crate::embeddings::Embedder::from_resolved`], with the tier model
-//! gated exactly like [`crate::daemon_runtime::build_embedder`] (API
+//! [`crate::config::AppConfig::resolve_embeddings`] + the inference-egress
+//! admission funnel ([`crate::egress::admit_inference_target`], #4122) +
+//! [`crate::embeddings::Embedder::from_resolved_pinned`], with the tier
+//! model gated exactly like [`crate::daemon_runtime::build_embedder`] (API
 //! backends bypass the local model picker; the tier preset only gates
 //! whether embeddings are enabled at all). A keyword-only tier errors
-//! out with a clear message ([`EXIT_NO_EMBEDDER`]).
+//! out with a clear message ([`EXIT_NO_EMBEDDER`]); an embed endpoint the
+//! `AI_MEMORY_INFERENCE_EGRESS` posture refuses exits with
+//! [`EXIT_EMBEDDER_INIT_FAILED`] after an audited refusal and BEFORE any
+//! client exists, so no memory content leaves the host.
 //!
 //! ## Failure isolation
 //!
@@ -51,7 +55,9 @@ use crate::embeddings::Embed;
 pub const EXIT_NO_EMBEDDER: i32 = 2;
 
 /// Exit code when an embedder is configured but its construction
-/// failed (502-equivalent — dead endpoint, bad key, unknown dim).
+/// failed (502-equivalent — dead endpoint, bad key, unknown dim), or was
+/// REFUSED by the inference-egress posture before construction (#4122:
+/// no client, no egress — the same "no embedder could be built" outcome).
 pub const EXIT_EMBEDDER_INIT_FAILED: i32 = 3;
 
 /// #2167 §7 — exit code when `reembed --stamp-only` REFUSES because the
@@ -430,11 +436,59 @@ pub async fn cmd_reembed(
         return Ok(EXIT_NO_EMBEDDER);
     };
 
+    // #4122 — the SAME inference-egress admission funnel as the MCP stdio
+    // init (`src/mcp/mod.rs`) and `daemon_runtime::build_embedder`
+    // (#1963 / #3822 / #3933): an EGRESSING embed lane (every API backend,
+    // plus the ollama+Nomic lane) is admitted under
+    // AI_MEMORY_INFERENCE_EGRESS BEFORE any client exists. `reembed` is the
+    // most content-heavy egress the product performs (every memory in
+    // scope), so a refusal must send NOTHING: audit it (#1991, against the
+    // operator-resolved db_path), name the posture, exit non-zero. On
+    // admission the embedder is built PINNED (`internal-only`
+    // resolve-then-pin). The local in-process candle embedder never
+    // egresses and is not gated.
+    let egress_pin = if crate::config::embed_lane_egresses(&resolved.backend, Some(tier_model)) {
+        use crate::egress::{
+            EgressClass, EgressDecision, InferenceEgressMode, admit_inference_target,
+        };
+        let mode = InferenceEgressMode::resolve();
+        match admit_inference_target(mode, EgressClass::InferenceEmbedding, &resolved.url) {
+            Ok(pin) => pin,
+            Err(EgressDecision::Refuse {
+                class,
+                target,
+                reason,
+            }) => {
+                crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
+                writeln!(
+                    out.stderr,
+                    "reembed: REFUSED — inference-plane egress refused for the embed endpoint \
+                     (backend={}, target={}, {}={}); {reason}. No memory content was sent \
+                     and no vector was written (#4122). Point [embeddings] at an endpoint \
+                     the posture admits, or set {} to a posture that admits this one.",
+                    resolved.backend,
+                    crate::url_display::url_origin(&target),
+                    crate::egress::ENV_INFERENCE_EGRESS,
+                    mode.as_str(),
+                    crate::egress::ENV_INFERENCE_EGRESS,
+                )?;
+                return Ok(EXIT_EMBEDDER_INIT_FAILED);
+            }
+            Err(EgressDecision::Allow) => None,
+        }
+    } else {
+        None
+    };
+
     // Same spawn_blocking discipline as `build_embedder`: HF-Hub +
     // candle construction spin their own runtime internally.
     let resolved_for_build = resolved.clone();
     let built = tokio::task::spawn_blocking(move || {
-        crate::embeddings::Embedder::from_resolved(&resolved_for_build, Some(tier_model))
+        crate::embeddings::Embedder::from_resolved_pinned(
+            &resolved_for_build,
+            Some(tier_model),
+            egress_pin.as_ref(),
+        )
     })
     .await?;
     let embedder = match built {
