@@ -19558,13 +19558,20 @@ pub fn get_unembedded_ids_batch_after_amortised(
 /// #1779 — `query_map` row mapper for the embedding-fetch SELECTs that now
 /// also pull `encrypted_envelope` + `metadata`:
 /// `(id, title, content, envelope, metadata_json)`.
-type EmbeddableRawRow = (String, String, String, Option<Vec<u8>>, String);
+///
+/// #4214 — the envelope cell is read through the #4133 [`read_envelope_column`]
+/// decoder, never a typed `Option<Vec<u8>>` get: that get turned ONE non-BLOB
+/// cell (TEXT / INTEGER / REAL, corruption or tampering) into a column TYPE
+/// error that failed the whole `query_map` batch, so the backfill never got
+/// past the poisoned row. The malformed cell is carried as
+/// [`EnvelopeColumn::Malformed`] and [`resolve_embeddable_scan`] skips it.
+type EmbeddableRawRow = (String, String, String, EnvelopeColumn, String);
 fn embeddable_row_mapper(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddableRawRow> {
     Ok((
         row.get::<_, String>(0)?,
         row.get::<_, String>(1)?,
         row.get::<_, String>(2)?,
-        row.get::<_, Option<Vec<u8>>>(3)?,
+        read_envelope_column(row, 3)?,
         row.get::<_, String>(4)?,
     ))
 }
@@ -19611,6 +19618,34 @@ fn resolve_embeddable_scan(conn: &Connection, raw: Vec<EmbeddableRawRow>) -> Emb
     let mut decrypt_skipped = 0usize;
     for (id, title, content, envelope, metadata_json) in raw {
         let agent_id = crate::storage::embed_skip::agent_id_from_metadata_json(&metadata_json);
+        // #4214 — a non-BLOB envelope cell takes the SAME disposition as an
+        // undecryptable envelope (the #4133 scan-read rule): WARN, bump the
+        // corrupt-provenance metric, remember the row as unembeddable, and
+        // count it as a decrypt-skip. The raw cursor (`raw_last_id`) already
+        // advanced past it, so the rest of the batch is still embedded and
+        // the plaintext `content` column is never handed to the embedder.
+        let envelope = match envelope {
+            EnvelopeColumn::Absent => None,
+            EnvelopeColumn::Blob(bytes) => Some(bytes),
+            EnvelopeColumn::Malformed(kind) => {
+                tracing::warn!(
+                    target: UNDECRYPTABLE_ROW_TRACE_TARGET,
+                    memory_id = %id,
+                    agent_id = %agent_id,
+                    error = %malformed_envelope_detail(kind),
+                    "embed: skipping row with a non-BLOB encrypted_envelope cell (#4214)"
+                );
+                crate::metrics::record_corrupt_provenance(field_names::ENCRYPTED_ENVELOPE);
+                crate::storage::embed_skip::record_sqlite_best_effort(
+                    conn,
+                    &id,
+                    &agent_id,
+                    crate::storage::embed_skip::EmbedSkipReason::Undecryptable,
+                );
+                decrypt_skipped += 1;
+                continue;
+            }
+        };
         match resolve_embeddable_content(&id, content, envelope, &metadata_json) {
             Some(resolved) => {
                 let doc = crate::embeddings::embedding_document(&title, &resolved);
