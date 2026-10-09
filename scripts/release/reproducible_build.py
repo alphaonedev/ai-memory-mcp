@@ -378,6 +378,7 @@ def _self_test(root: Path) -> int:
             failures.append("a missing build tool was not an error")
         except ProofError:
             pass
+        failures.extend(_self_test_6282(tmp, ws_a, ws_b, stub, g, fresh))
     for f in failures:
         print(f"reproducible_build: self-test FAIL: {f}", file=sys.stderr)
     if failures:
@@ -386,6 +387,123 @@ def _self_test(root: Path) -> int:
           "and missing build tool are refused; a stale, dirty or prebuilt workspace B, a compiler wrapper and caller "
           "environment leaks are refused, #6291)")
     return 0
+
+
+STUB_NFPM = '''#!/usr/bin/env python3
+"""Stub nfpm for reproducible_build.py --self-test: writes a 'package' that is a
+function of the packaged binary, SOURCE_DATE_EPOCH, ARCH, VERSION and the format."""
+import hashlib
+import os
+import pathlib
+import sys
+
+args = sys.argv[1:]
+fmt = args[args.index("-p") + 1]
+outdir = pathlib.Path(args[args.index("-t") + 1])
+binary = hashlib.sha256(pathlib.Path("dist/ai-memory").read_bytes()).hexdigest()
+outdir.mkdir(parents=True, exist_ok=True)
+name = "ai-memory_%s_%s.%s" % (os.environ["VERSION"], os.environ["ARCH"], fmt)
+(outdir / name).write_text("bin=%s epoch=%s fmt=%s\\n" % (binary, os.environ.get("SOURCE_DATE_EPOCH"), fmt))
+'''
+
+
+def _self_test_6282(tmp: Path, ws_a: Path, ws_b: Path, stub: Path, g, fresh) -> List[str]:
+    """#6282 / #6283 cases: the deterministic packer, and the tarball and deb/rpm
+    comparisons of the two-build proof."""
+    import tarfile
+    out: List[str] = []
+    pack = globals().get("pack_tarball")
+    if pack is None:
+        return ["6282 pack_tarball (the deterministic packer) is missing"]
+    src = tmp / "pack-src"
+
+    def tree(stamp: int, reverse: bool) -> None:
+        shutil.rmtree(src, ignore_errors=True)
+        files = [("d/b.txt", b"b\n", 0o644), ("d/a.bin", b"a\n", 0o755), ("top", b"t\n", 0o600)]
+        for rel, data, mode in (reversed(files) if reverse else files):
+            p = src / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+            p.chmod(mode)
+            os.utime(p, (stamp, stamp))
+        os.utime(src / "d", (stamp, stamp))
+
+    def packed(name: str, epoch: str) -> bytes:
+        dst = tmp / name
+        pack(dst, src, ["d", "top"], epoch)
+        return dst.read_bytes()
+
+    tree(1111111111, False)
+    one = packed("one.tar.gz", "1700000000")
+    tree(1222222222, True)
+    two = packed("two.tar.gz", "1700000000")
+    if one != two:
+        out.append("6282 pack: file mtimes or creation order changed the archive bytes")
+    if packed("three.tar.gz", "1700000001") == one:
+        out.append("6282 pack: a different epoch gave the same archive (the epoch is not recorded)")
+    with tarfile.open(tmp / "one.tar.gz", "r:gz") as tf:
+        members = tf.getmembers()
+        names = [m.name for m in members]
+        if names != sorted(names) or names[:1] != ["d"]:
+            out.append(f"6282 pack: members are not in sorted order: {names}")
+        for m in members:
+            if (m.mtime, m.uid, m.gid, m.uname, m.gname) != (1700000000, 0, 0, "", ""):
+                out.append(f"6282 pack: {m.name} carries a build-host mtime or owner")
+            want = 0o755 if m.isdir() or m.name == "d/a.bin" else 0o644
+            if m.mode != want:
+                out.append(f"6282 pack: {m.name} mode {oct(m.mode)}, wanted {oct(want)}")
+    if one[4:8] != b"\0\0\0\0" or one[3] & 0x08:
+        out.append("6282 pack: the gzip header carries a timestamp or a file name")
+    for bad_names, bad_epoch, why in ((["/etc"], "1", "an absolute name"), (["../x"], "1", "a name outside the root"),
+                                      (["d"], "", "an empty epoch"), (["d"], "x1", "a non-numeric epoch"),
+                                      (["missing"], "1", "a missing name"), ([], "1", "no name")):
+        try:
+            pack(tmp / "bad.tar.gz", src, bad_names, bad_epoch)
+            out.append(f"6282 pack: {why} was accepted")
+        except ProofError:
+            pass
+    (src / "link").symlink_to("top")
+    try:
+        pack(tmp / "bad.tar.gz", src, ["link"], "1")
+        out.append("6282 pack: a symbolic link was packed")
+    except ProofError:
+        pass
+    cwd = os.getcwd()
+    try:
+        os.chdir(src)
+        rc = main(["--pack", str(tmp / "cli.tar.gz"), "--epoch", "1700000000", "d", "top"])
+    finally:
+        os.chdir(cwd)
+    if rc != 0 or (tmp / "cli.tar.gz").read_bytes() != one:
+        out.append(f"6282 pack CLI did not write the same archive (exit {rc})")
+
+    # #6283: the proof compares the tarball of each build and, with --nfpm, the deb/rpm.
+    nfpm = tmp / "bin" / "nfpm"
+    nfpm.write_text(STUB_NFPM, encoding="utf-8")
+    nfpm.chmod(0o755)
+
+    def proof(name: str, want: int, **kwargs: object) -> None:
+        fresh()
+        try:
+            got = two_builds(ws_a, ws_b, "x86_64-unknown-linux-gnu", "sal", "ai-memory", str(stub), epoch="1700000000",
+                             **kwargs)  # type: ignore[arg-type]
+        except ProofError as exc:
+            got = 2
+            print(f"self-test: {name}: {exc}", file=sys.stderr)
+        except TypeError as exc:
+            got = -1
+            print(f"self-test: {name}: {exc}", file=sys.stderr)
+        if got != want:
+            out.append(f"{name}: exit {got}, wanted {want}")
+
+    proof("6283 identical builds give identical tarballs", 0)
+    proof("6283 a tarball packed with another epoch is a mismatch", 1, pack_epoch_b="1700000001")
+    nf = {"nfpm": str(nfpm), "nfpm_arch": "amd64", "version": "1.0.0"}
+    proof("6283 identical builds give identical deb and rpm", 0, **nf)
+    proof("6283 a deb/rpm built with another epoch is a mismatch", 1, nfpm_epoch_b="1700000001", **nf)
+    proof("6283 a missing nfpm is an error", 2, nfpm=str(tmp / "no-such-nfpm"), nfpm_arch="amd64", version="1.0.0")
+    proof("6283 --nfpm without a version is an error", 2, nfpm=str(nfpm), nfpm_arch="amd64", version="")
+    return out
 
 
 def main(argv: Optional[List[str]] = None) -> int:
