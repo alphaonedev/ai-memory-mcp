@@ -37,8 +37,8 @@ any call.  Only a literal that is an argument of a MESSAGE SINK is skipped
 (#6152, #6154): ``expect`` / ``expect_err`` / ``context`` / ``with_context``;
 the macros ``panic!`` ``assert*!`` ``debug_assert*!`` ``unreachable!``
 ``todo!`` ``unimplemented!`` ``trace!/debug!/info!/warn!/error!``
-``print!/println!/eprint!/eprintln!`` ``write!/writeln!`` ``anyhow!/bail!/ensure!``
-``params!/named_params!``; and ``format!`` / ``concat!`` when it is itself an
+``print!/println!/eprint!/eprintln!`` ``anyhow!/bail!/ensure!``
+``params!/named_params!`` (``write!/writeln!`` are NOT sinks: they build SQL text); and ``format!`` / ``concat!`` when it is itself an
 argument of one of those.  A literal that reaches a block ``{..}``, an array
 or any other call before a sink is NOT a message and stays scanned.  Source
 text is lexed once per file (strings, raw strings, byte strings, char
@@ -135,7 +135,7 @@ SINK_MACROS = frozenset(
         "panic", "assert", "assert_eq", "assert_ne", "debug_assert",
         "debug_assert_eq", "debug_assert_ne", "unreachable", "todo",
         "unimplemented", "trace", "debug", "info", "warn", "error", "print",
-        "println", "eprint", "eprintln", "write", "writeln", "anyhow", "bail",
+        "println", "eprint", "eprintln", "anyhow", "bail",
         "ensure", "params", "named_params",
     }
 )
@@ -218,6 +218,10 @@ def _blank(s):
     return re.sub(r"[^\n]", " ", s)
 
 
+def _blank_block(s):
+    return re.sub(r"[^\n]", " ", s)
+
+
 def _blank_lit(s):
     return re.sub(r"[^\n]", " ", s)
 
@@ -264,7 +268,7 @@ def lex(text):
                     break
                 depth += 1 if b.group(0) == "/*" else -1
                 e = b.end()
-            out += [text[last:s], _blank(text[s:e])]
+            out += [text[last:s], _blank_block(text[s:e])]
             pos = last = e
         elif t == "'":
             c = CHAR_LIT.match(text, s)
@@ -1033,6 +1037,8 @@ def self_test():
         ("R5 SQL-by-name check removed", lambda: g.update(NONLITERAL_EXEC=re.compile(r"(?!)"))),
         ("sink-skip removed (every literal scanned)", lambda: g.update(message_sink=_never)),
         ("sink-skip widened (every literal skipped)", lambda: g.update(message_sink=_always)),
+        ("escape decoding removed", lambda: g.update(unescape=_identity)),
+        ("block-comment blanking removed", lambda: g.update(_blank_block=_identity)),
         ("literal blanking removed", lambda: g.update(_blank_lit=_identity)),
         ("raw-string handling removed", lambda: g.update(TOKEN=_build_token(raw=False))),
         ("char-literal handling removed", lambda: g.update(CHAR_LIT=re.compile(r"(?!)"))),
@@ -1041,7 +1047,7 @@ def self_test():
     ]
     saved = {k: g[k] for k in (
         "RULES", "LIT_RULES", "WRITE_SQL", "NONLITERAL_EXEC", "message_sink",
-        "_blank_lit", "TOKEN", "CHAR_LIT", "mod_inside", "block_balanced",
+        "_blank_lit", "_blank_block", "unescape", "TOKEN", "CHAR_LIT", "mod_inside", "block_balanced",
     )}
     killed = 0
     try:
