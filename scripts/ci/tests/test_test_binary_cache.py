@@ -1307,5 +1307,41 @@ class CargoAndPgSettingsInKey6384R2L1(World):
         self.assertIn("'vector'", sql)
 
 
+class RedRecordingRunInvalidates6384R2L3(World):
+    """r2 L3: a red release/** push (the recording run) removes every manifest
+    entry whose key equals a key of its own plan, because one of those
+    binaries may be the one that failed; entries with other keys stay."""
+
+    def red_push(self, run_id='200', now=NOW + 60):
+        self.plan(now=now, run_id=run_id, event='push', ref='refs/heads/release/v1.0.0')
+        return self.record(rc=101, now=now, run_id=run_id)
+
+    def test_same_keys_are_removed(self):
+        self.green_run('100')
+        self.assertEqual(set(self.manifest()['entries']), {'lib:ai_memory', 'test:a', 'test:b'})
+        out = self.red_push()
+        self.assertIn('invalidated', out)
+        self.assertEqual(self.manifest()['entries'], {})
+        for n in tbc.SHARD_LISTS:
+            (self.sd / (n + '.txt')).write_text((self.sd / (n + '.txt.full')).read_text())
+        self.assertIn('skipped 0 of 3', self.plan(run_id='300', now=NOW + 120))
+
+    def test_entries_with_other_keys_stay(self):
+        self.green_run('100')
+        old_a = self.manifest()['entries']['test:a']['key']
+        (self.root / 'tests' / 'a.rs').write_text('fn a() { changed }\n')
+        self.red_push()
+        entries = self.manifest()['entries']
+        self.assertEqual(set(entries), {'test:a'})
+        self.assertEqual(entries['test:a']['key'], old_a)
+
+    def test_red_pull_request_changes_nothing(self):
+        self.green_run('100')
+        before = self.manifest()
+        self.plan(run_id='200', now=NOW + 60)
+        self.record(rc=101, now=NOW + 60, run_id='200')
+        self.assertEqual(self.manifest(), before)
+
+
 if __name__ == '__main__':
     unittest.main()

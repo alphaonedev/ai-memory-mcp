@@ -124,5 +124,20 @@ class CargoVersion6384R2L1(unittest.TestCase):
         self.assertTrue('--cargo-v "$sd/cargo-v.txt"' in self.text[i:i + 700], 'plan lacks --cargo-v')
 
 
+class RedRunInvalidates6384R2L3(unittest.TestCase):
+    """r2 L3: the red branch of the sharded step calls ``record --rc "$rc"``
+    so a red recording run drops the entries carrying its keys."""
+
+    def setUp(self):
+        self.text = CI_YML.read_text()
+
+    def test_red_branch_calls_record_with_the_exit_code(self):
+        i = self.text.index('if [ "$rc" -ne 0 ]; then\n              echo "::error::[#6344] sharded')
+        j = self.text.index('            else\n', i)
+        red = self.text[i:j]
+        self.assertTrue('test_binary_cache.py record' in red, 'red branch does not call record')
+        self.assertTrue('--rc "$rc"' in red, 'red branch does not pass the exit code')
+
+
 if __name__ == '__main__':
     unittest.main()
