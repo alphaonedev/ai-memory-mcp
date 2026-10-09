@@ -387,6 +387,32 @@ def _add_with_twins(plan: Plan, fd: int, name: str, sub: str, present: Set[str],
             plan.candidates.append(Candidate(fd, twin, prefix + twin, sub + category))
 
 
+def _add_dsym_links(plan: Plan, fd: int, sub: str, names: List[str]) -> None:
+    """Queue ``<x>.dSYM`` symlinks whose target is a ``.dSYM`` directory queued in this directory (#6257).
+
+    On macOS cargo uplifts an example's packed debuginfo as the symlink
+    ``examples/<name>.dSYM`` -> ``<name>-<hash>.dSYM``.  Once the target goes
+    the link would dangle.  Only a link whose target is a bare name of a
+    candidate of this scan is queued; it is read with readlink and unlinked as a
+    link, never followed.  A link to anything else stays.
+    """
+    prefix = "%s/%s/" % (plan.profile, sub)
+    queued = {c.name for c in plan.candidates if c.dir_fd == fd}
+    for name in names:
+        if not name.endswith(".dSYM") or name in queued:
+            continue
+        st = _scan_lstat(plan, name, fd, prefix + name)
+        if st is None or not stat.S_ISLNK(st.st_mode):
+            continue
+        try:
+            target = os.readlink(name, dir_fd=fd)
+        except OSError as exc:
+            plan.warn(prefix + name, exc)
+            continue
+        if target in queued and target.endswith(".dSYM"):
+            plan.candidates.append(Candidate(fd, name, prefix + name, sub + " dSYM"))
+
+
 def _norm(name: str) -> str:
     """cargo spells a target ``my-demo`` and its crate-style artifact ``my_demo-<hash>``."""
     return name.replace("-", "_")
@@ -469,6 +495,7 @@ def _scan_test_bins(plan: Plan, profile_fd: int) -> None:
             else:
                 plan.kept.extend((sub + "/" + name, "hard-linked example without its matching <name> / "
                                   "<name>-<hash> twin in examples/") for name in pair)
+        _add_dsym_links(plan, fd, sub, names)
     fd = _open_sub(plan, profile_fd, "incremental")
     if fd is None:
         return
@@ -538,7 +565,7 @@ def plan_target(target_dir: str, profile: str, scope: str, env: Mapping[str, str
         raise Refused("unknown scope %r" % scope)
     if not target_dir.strip():
         raise Refused("--target-dir is empty; an empty path would mean the current directory")
-    for fn in (os.open, os.stat, os.unlink, os.rmdir):
+    for fn in (os.open, os.stat, os.unlink, os.rmdir, os.readlink):
         if fn not in os.supports_dir_fd:
             raise Refused("this Python lacks dir_fd support for %s; refusing a path-based delete" % fn.__name__)
     raw = Path(target_dir)
