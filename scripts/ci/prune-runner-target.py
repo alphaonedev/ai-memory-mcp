@@ -24,6 +24,9 @@ cargo job's last step under ``if: always()``):
     ``<name>.dSYM`` bundle;
   * deletes the contents of ``<target>/<profile>/incremental`` (CI runs with
     CARGO_INCREMENTAL=0, so anything there is stale state from elsewhere);
+  * keeps a hard-linked executable (cargo's uplift source ``deps/<bin>-<hash>``,
+    the other link being ``<profile>/<bin>``): deleting one side frees nothing
+    while the other exists, and it is one bin, not one of the ~1000 tests;
   * keeps everything else, so the next compile stays warm.
 ``--scope all`` instead removes the five artifact dirs ``deps``, ``build``,
 ``incremental``, ``examples`` and ``.fingerprint`` under the profile wholesale:
@@ -108,6 +111,15 @@ def _is_test_executable(entry: os.DirEntry) -> bool:
     return bool(entry.stat(follow_symlinks=False).st_mode & EXEC_BITS)
 
 
+def _is_hard_linked(entry: os.DirEntry) -> bool:
+    """True for cargo's uplift source: ``deps/<bin>-<hash>`` hard-linked to ``<profile>/<bin>``.
+
+    Deleting one side frees nothing while the other exists, so the file is kept
+    and not counted (it is one bin, not one of the ~1000 test executables).
+    """
+    return entry.stat(follow_symlinks=False).st_nlink > 1
+
+
 def _inside(root: Path, path: Path) -> bool:
     """True when ``path`` (not followed) lies under the resolved ``root``."""
     try:
@@ -117,7 +129,8 @@ def _inside(root: Path, path: Path) -> bool:
     return parent == root or root in parent.parents
 
 
-def _candidates_test_bins(profile_dir: Path, root: Path) -> List[Candidate]:
+def _candidates_test_bins(profile_dir: Path, root: Path, kept: List[str]) -> List[Candidate]:
+    """Candidates for the default scope; ``kept`` collects hard-linked files left in place."""
     found: List[Candidate] = []
     for sub in ("deps", "examples"):
         d = profile_dir / sub
@@ -128,6 +141,9 @@ def _candidates_test_bins(profile_dir: Path, root: Path) -> List[Candidate]:
         names = {e.name for e in entries}
         for entry in entries:
             if not _is_test_executable(entry):
+                continue
+            if _is_hard_linked(entry):
+                kept.append(sub + "/" + entry.name)
                 continue
             path = Path(entry.path)
             if not _inside(root, path):
@@ -215,10 +231,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("freed_bytes=0")
         return 0
 
+    kept: List[str] = []
     if args.scope == "all":
         cands = _candidates_all(profile_dir, root)
     else:
-        cands = _candidates_test_bins(profile_dir, root)
+        cands = _candidates_test_bins(profile_dir, root, kept)
 
     per_category: Dict[str, Tuple[int, int]] = {}
     freed = 0
@@ -236,6 +253,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for category in sorted(per_category):
         count, size = per_category[category]
         print("  %-24s %6d  %s" % (category, count, _human(size)))
+    for name in kept:
+        print("  kept hard-linked uplift source %s (frees nothing while <profile>/<bin> exists)" % name)
     print("freed_bytes=%d" % freed)
     print("freed %s (%s)" % (_human(freed), mode))
     return 0
