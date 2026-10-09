@@ -1411,5 +1411,36 @@ class AutotestsOff6384R2M1(unittest.TestCase):
         self.assertEqual(got, {'tests/a.rs'})
 
 
+class EmbeddedDataIsNotReadingCode6384R2M1(World):
+    """r2 M1 follow-up: a file the binary embeds with include_str! (dep-info
+    lists it) is compile-time data, not run-time reading code, so its text
+    must not make the binary a changelog or docs reader. The real lib embeds
+    PERFORMANCE.md, which mentions CHANGELOG."""
+
+    def test_embedded_markdown_does_not_set_traits(self):
+        (self.root / 'PERF.md').write_text('See CHANGELOG and docs/ for details.\n')
+        dep = self.deps / 'ai_memory-h1.d'
+        dep.write_text('target/debug/deps/ai_memory-h1: src/lib.rs PERF.md\n\nsrc/lib.rs:\nPERF.md:\n')
+        self.assertEqual(tbc.binary_traits(dep, self.root, 'lib'), {'tree': False, 'docs': False, 'changelog': False})
+
+    def test_real_lib_closure_is_not_a_changelog_reader(self):
+        cl = tbc.static_mod_closure(REPO, REPO / 'src' / 'lib.rs')
+        self.assertTrue(any(q.suffix != '.rs' for q in cl), 'expected embedded data in the lib closure')
+        dep = SCRATCH / 'real-lib.d'
+        dep.write_text('lib: %s\n' % ' '.join(str(q) for q in sorted(cl)))
+        self.assertFalse(tbc.binary_traits(dep, REPO, 'lib')['changelog'])
+
+    def test_changelog_fragment_keeps_the_lib_hit_when_it_embeds_markdown(self):
+        (self.root / 'PERF.md').write_text('See CHANGELOG.\n')
+        for name in ('ai_memory-h1.d', 'ai_memory-h2.d'):
+            d = self.deps / name
+            d.write_text(d.read_text().replace('src/lib.rs\n\n', 'src/lib.rs PERF.md\n\n', 1) + 'PERF.md:\n')
+        self.green_run('100')
+        (self.root / 'changelog.d').mkdir(exist_ok=True)
+        (self.root / 'changelog.d' / '1.fixed.md').write_text('x\n')
+        self.plan(run_id='200', now=NOW + 60)
+        self.assertEqual(self.list_text('parallel_1'), '')
+
+
 if __name__ == '__main__':
     unittest.main()
