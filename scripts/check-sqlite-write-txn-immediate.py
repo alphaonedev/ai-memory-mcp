@@ -493,6 +493,77 @@ def self_test():
     for name in ("src/identity/attest.rs", "src/storage/model_attest.rs", "src/peer_attestation.rs"):
         bad, _, _ = run("fn f(c: &Connection) {\n c.unchecked_transaction();\n}\n", name)
         expect("red:" + name + " is scanned", len(bad) == 1)
+    # --- #6152: the BEGIN literal rule reads SQL argument positions only ---
+    for label, text in (
+        ("expect(\"begin\")", 'fn f(c: &Connection) {\n let t = WriteTxn::begin(c).expect("begin");\n}\n'),
+        ("expect(\"BEGIN\")", 'fn f(c: &Connection) {\n let t = WriteTxn::begin(c).expect("BEGIN");\n}\n'),
+        ("expect(\"begin a ..\")", 'fn f(c: &Connection) {\n let t = WriteTxn::begin(c).expect("begin a write txn");\n}\n'),
+        ("panic message", 'fn f() {\n panic!("begin");\n}\n'),
+        ("assert message", 'fn f(a: u8) {\n assert_eq!(a, 1, "begin");\n}\n'),
+        ("split expect", 'fn f(c: &Connection) {\n let t = WriteTxn::begin(c)\n .expect(\n "begin",\n );\n}\n'),
+        ("param value", 'fn f(c: &Connection) {\n c.execute("INSERT INTO t(a) VALUES (?1)", params!["begin"])?;\n}\n'),
+    ):
+        bad, _, _ = run(text)
+        expect("green:#6152 message literal is not SQL: " + label, not bad)
+    for label, text in (
+        ("prepare", 'fn f(c: &Connection) {\n let s = c.prepare("BEGIN")?;\n}\n'),
+        ("prepare_cached", 'fn f(c: &Connection) {\n let s = c.prepare_cached("BEGIN")?;\n}\n'),
+        ("query_row", 'fn f(c: &Connection) {\n c.query_row("BEGIN", [], |_| Ok(()))?;\n}\n'),
+        ("execute split line", 'fn f(c: &Connection) {\n c.execute(\n "BEGIN",\n [],\n )?;\n}\n'),
+        ("const item", 'const OPEN: &str = "BEGIN";\nfn f() {}\n'),
+        ("static item", 'static OPEN: &str = "BEGIN DEFERRED";\nfn f() {}\n'),
+        ("let binding", 'fn f(c: &Connection) {\n let sql = "BEGIN";\n c.execute_batch(sql)?;\n}\n'),
+    ):
+        bad, _, _ = run(text)
+        expect("red:#6152 SQL position still fires: " + label, len(bad) == 1 and bad[0][3] == "R3")
+    # --- #6152: `mod x;` declared inside a cfg(test) block is test code ---
+    # (src/daemon_runtime.rs declares escalate_under_write_lock_4116_tests so)
+    deferred = "fn t(c: &Connection) { c.unchecked_transaction(); }\n"
+    for label, files, flagged in (
+        (
+            "inline block in a non-mod.rs file",
+            {
+                "src/foo.rs": "#[cfg(test)]\nmod t {\n    mod inner;\n    fn h() {}\n}\nfn prod() {}\n",
+                "src/foo/t/inner.rs": deferred,
+            },
+            [],
+        ),
+        (
+            "inline block in a mod.rs file, <name>/mod.rs layout",
+            {
+                "src/m/mod.rs": "#[cfg(test)]\nmod t {\n    mod inner;\n}\n",
+                "src/m/t/inner/mod.rs": deferred,
+            },
+            [],
+        ),
+        (
+            "two levels of nesting",
+            {
+                "src/foo.rs": "#[cfg(test)]\nmod t {\n    mod u {\n        mod inner;\n    }\n}\n",
+                "src/foo/t/u/inner.rs": deferred,
+            },
+            [],
+        ),
+        (
+            "a sibling outside the test mod directory is still scanned",
+            {
+                "src/foo.rs": "#[cfg(test)]\nmod t {\n    mod inner;\n}\n",
+                "src/foo/t/inner.rs": deferred,
+                "src/foo/inner.rs": deferred,
+            },
+            ["src/foo/inner.rs"],
+        ),
+        (
+            "mod x; after the test block closes is not test code",
+            {
+                "src/foo.rs": "#[cfg(test)]\nmod t {\n    fn h() {}\n}\nmod inner;\n",
+                "src/foo/inner.rs": deferred,
+            },
+            ["src/foo/inner.rs"],
+        ),
+    ):
+        got = sorted({h[0] for h in scan(files)})
+        expect("red:#6152 nested mod in cfg(test): " + label, got == flagged)
     # stale allowlist entry must fail
     _, stale, _ = evaluate({"src/x.rs": "fn f() {}\n"}, allow)
     expect("red:stale allowlist", stale == [("src/ok.rs", "ro")])
