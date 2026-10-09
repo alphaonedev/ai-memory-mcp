@@ -349,7 +349,9 @@ the AGE projection prime, and the cutover dance.
    idempotently, preserving data.
 5. **Verify schema parity:**
    ```bash
-   psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' \
+   # libpq reads the password from ~/.pgpass (mode 0600, one line:
+   # HOST:5432:aimemory:aimemory:PASSWORD), so it never reaches psql's argv.
+   psql 'postgres://aimemory@HOST:5432/aimemory' \
      -tAc "SELECT MAX(version) FROM schema_version;"
    # → 55
    ```
