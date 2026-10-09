@@ -1440,3 +1440,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run inline mod tests cfg(test) gate (+ scanner self-tests)
         run: python3 scripts/test/test_inline_mod_tests_cfg_4755.py
+
+  packaging-contract-gate:
+    # #4401 / #4325 / #4326 (umbrella #6060): the shipped systemd units are
+    # pinned by scripts/test-install-upgrade.py (PackagingContract: same
+    # hardening set on every unit, `-` on optional ReadOnlyPaths, the backup
+    # unit's read-only key store, PartOf= on the companions; InstallerUpgrade:
+    # real installer fault injection against stub binaries, #4077-#4084).
+    # No workflow ran that file. The suite is offline and runs in under a
+    # second; systemd itself is not needed (the unit TEXT is parsed).
+    name: Packaging contract gate (#6060)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run packaging contract + installer upgrade tests
+        run: python3 scripts/test-install-upgrade.py
