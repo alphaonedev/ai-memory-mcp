@@ -258,7 +258,7 @@ def write_atomic(data, mode, dest):
         try:
             os.unlink(tmp)
         except OSError:
-            pass
+            pass  # temp already removed; the original error is re-raised below
         raise
 
 
