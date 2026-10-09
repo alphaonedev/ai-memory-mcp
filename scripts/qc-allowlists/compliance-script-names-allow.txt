@@ -9,8 +9,11 @@
 # An entry is honoured only while that document itself carries an erratum line
 # for the name (#6170). An entry suffixed `:pinned` is for a document that cannot
 # carry one and is honoured while an erratum for the name exists in any
-# docs/compliance/ document: v1.0.0-DECLARATION.md is SHA-256 pinned, and
-# ENTERPRISE-FEDERATION-CERTIFICATION.md is guarded by the cert section 7 gate.
+# docs/compliance/ document. `:pinned` is a closed set enforced by the gate
+# (#6173): exactly v1.0.0-DECLARATION.md (SHA-256 pinned) and
+# ENTERPRISE-FEDERATION-CERTIFICATION.md (guarded by the cert section 7 gate).
+# `:pinned` on any other document, or on a document that carries its own
+# erratum for the name, FAILS the gate.
 docs/compliance/MISSION-CRITICAL-CERTIFICATION-STANDARD-v1.md:check-cert-expiry.sh
 docs/compliance/BALLOT-PROCEDURE.md:check-cert-expiry.sh
 docs/compliance/v1.0.0-DECLARATION.md:check-cert-expiry.sh:pinned
