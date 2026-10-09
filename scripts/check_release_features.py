@@ -3175,7 +3175,7 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("pinned mapping key set not compared", "if set(node.keys()) != set(spec):", "if False:"),
     ("pinned sequence length not compared", "if items is None or len(items) != len(spec):", "if items is None:"),
     ("pinned no-value key not compared", 'return "" if node.kind == "null" else', 'return "" if True else'),
-    ("docker step count not compared", "if len(items) != len(DOCKER_STEPS):", "if False:"),
+    ("whole-pinned job step count not compared", "if len(items) != len(steps_spec):", "if False:"),
     ("action SHA bump not recognised", 'uses.text().split("@")[0] == want.split("@")[0]', "False"),
     ("canonical RUN physical lines not compared", "if tuple(raw[first - 1:last]) == DOCKER_RUN_LINES:", "if True:"),
     ("continuations outside the canonical RUN allowed", "        if n not in canon_lines:\n", "        if False:\n"),
