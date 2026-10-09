@@ -336,23 +336,44 @@ def parse_pages(text):
         out.extend(page)
 
 
-def live_rulesets(repo):
+def is_int_id(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def live_rulesets(repo, run=gh_run):
+    """List then read each ruleset. A detail that is not the listed ruleset is unreadable (#6231)."""
     try:
-        listing = parse_pages(gh_run(["--paginate", f"repos/{repo}/rulesets?per_page=100"]))
-        return [json.loads(gh_run([f"repos/{repo}/rulesets/{int(r['id'])}"])) for r in listing]
-    except (ValueError, KeyError, TypeError) as exc:
+        listing = parse_pages(run(["--paginate", f"repos/{repo}/rulesets?per_page=100"]))
+        out = []
+        for item in listing:
+            if not (isinstance(item, dict) and is_int_id(item.get("id"))):
+                raise VerifyError(f"ruleset listing entry has no integer id: {item!r}")
+            rid = item["id"]
+            try:
+                detail = json.loads(run([f"repos/{repo}/rulesets/{rid}"]))
+            except ValueError as exc:
+                raise VerifyError(f"ruleset {rid} detail unreadable: {exc}") from exc
+            if not (isinstance(detail, dict) and detail.get("id") == rid
+                    and isinstance(detail.get("target"), str) and isinstance(detail.get("enforcement"), str)):
+                raise VerifyError(f"ruleset {rid} detail unreadable: not the requested ruleset")
+            out.append(detail)
+        return out
+    except (ValueError, TypeError) as exc:
         raise VerifyError(f"rulesets response unparseable: {exc}") from exc
 
 
-def live_issue_state(repo):
+def live_issue_state(repo, run=gh_run):
     def fetch(number):
         try:
-            data = json.loads(gh_run([f"repos/{repo}/issues/{int(number)}"]))
+            data = json.loads(run([f"repos/{repo}/issues/{int(number)}"]))
         except ValueError as exc:
             raise VerifyError(f"issue response unparseable: {exc}") from exc
+        if not (isinstance(data, dict) and data.get("number") == number
+                and data.get("state") in ("open", "closed")):
+            raise VerifyError(f"issue #{number} response is not that issue")
         if "pull_request" in data:
             raise VerifyError(f"#{number} is a pull request, not an issue")
-        return data.get("state") or "missing"
+        return data["state"]
     return fetch
 
 
