@@ -109,6 +109,10 @@ CREDENTIAL_VALUE = re.compile(
     r"(?:\"((?:[^\"\\\n]|\\.?)*)(?:\"|$)|'((?:[^'\\\n]|\\.?)*)(?:'|$)|`([^`\n]*)(?:`|$)|"
     r"([^\s\"'`]+(?:[ \t]+[^\s\"'`]+)*))")
 # #6210: a Markdown table row whose cell is a credential name (`| password | v |`); the cells after it are values.
+# A line that starts with `|` (after a diff prefix) is a table row; elsewhere a `|` inside a code span (a regex
+# alternation such as `password|secret|token` in rule prose) separates no cells.
+TABLE_ROW_START = re.compile(r"[+ -]?\s*\|")
+CODE_SPAN = re.compile(r"(`+).*?\1")
 TABLE_NAME_CELL = re.compile(r"(?i)\|\s*[*_`]{0,2}(" + CREDENTIAL_NAME + r")[*_`]{0,2}\s*(?=\|)")
 # #6163 round 3 (review G3): a quoted value runs to its closing quote past `\"` escapes, or to the end of the line when
 # the quote is never closed, so neither an escaped quote nor a missing one leaves the rest of the value visible.
@@ -126,8 +130,9 @@ ENV_NAME_TAIL = re.compile(r"_(?:KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIAL
 LONG_DIGITS = re.compile(r"\d{4}")
 # #6209: an unquoted multi-word value is shown only when its first word is plain and every later word is plain too or
 # a short lower-case prose word (`max_tokens: 20000 per request`); `token: on <secret>` or `secret: yes, it is <secret>`
-# masks the whole value. A prose word may start with a capital (a table cell `The budget for one call`).
-PROSE_WORD = re.compile(r"[A-Za-z][a-z]{0,11}[.,;:)\]}]*", re.ASCII)
+# masks the whole value. A prose word may start with a capital (a table cell `The budget for one call`) or be an
+# acronym of 2-5 capitals (`CLI`, `HTTP`).
+PROSE_WORD = re.compile(r"(?:[A-Za-z][a-z]{0,11}|[A-Z]{2,5})[.,;:)\]}]*", re.ASCII)
 ALWAYS_MASK_NAME = re.compile(r"(?i)passw(?:or)?d|passphrase")
 # #6163 round 3 (review G2): the user name is optional (`redis://:<password>@host`).
 URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]*:([^@\s/]+)@")
@@ -294,18 +299,32 @@ def plain_text(name: str, value: str) -> bool:
         plain_word(name, word) or PROSE_WORD.fullmatch(word) for word in words[1:]))
 
 
+def prose_cell(name: str, value: str) -> bool:
+    """#6210 / #6211: True when `value`, a table cell after credential name `name` or the line after a bare `name:`, is
+    plain_text, or a description of two or more words that are all plain or prose words (PROSE_WORD) under a name that
+    is not a password or passphrase."""
+    words = value.split()
+    return plain_text(name, value) or (len(words) > 1 and not ALWAYS_MASK_NAME.search(name) and all(
+        plain_word(name, word) or PROSE_WORD.fullmatch(word) for word in words))
+
+
 def mask_table_cells(line: str) -> tuple:
-    """#6210: in a Markdown table row with a credential-name cell, mask every later cell that is not plain_text
-    (Markdown emphasis and code quotes around the cell ignored); returns (line, count)."""
-    match = TABLE_NAME_CELL.search(line)
+    """#6210: in a Markdown table row with a credential-name cell, mask every later cell that is not prose_cell
+    (Markdown emphasis and code quotes around the cell ignored); returns (line, count). A `|` inside a code span of a
+    line that does not start with `|` is not a cell separator (TABLE_ROW_START, CODE_SPAN)."""
+    scan = line if TABLE_ROW_START.match(line) else CODE_SPAN.sub(lambda span_match: span_match.group(0).replace(
+        "|", " "), line)
+    match = TABLE_NAME_CELL.search(scan)
     if match is None:
         return line, 0
-    cells, count = line[match.end():].split("|"), 0
-    for index in range(1, len(cells)):
-        value = cells[index].strip().strip("*_`")
-        if value != MASK and not plain_text(match.group(1), value):
-            cells[index], count = f" {MASK} ", count + 1
-    return line[:match.end()] + "|".join(cells), count
+    texts, count, start = [], 0, match.end()
+    for index, cell in enumerate(scan[match.end():].split("|")):
+        text, start = line[start:start + len(cell)], start + len(cell) + 1
+        value = text.strip().strip("*_`")
+        if index and value != MASK and not prose_cell(match.group(1), value):
+            text, count = f" {MASK} ", count + 1
+        texts.append(text)
+    return line[:match.end()] + "|".join(texts), count
 
 
 def mask_named_values(line: str) -> tuple:
@@ -364,8 +383,8 @@ class Redactor:
         """Mask `rows` of (text, kind): kind "meta" is a diff header line the script writes (shown as is), "key" is a
         line inside a private key block (masked whole, its diff prefix kept), "text" is masked shape by shape.
         `prefixed`: every non-meta row starts with a one-character diff prefix. #6211: the first non-blank text row
-        after a credential name with no value (`api_key:`) is masked unless it is structure (STRUCTURE_LINE) or plain
-        prose of two or more words; a meta or key row ends the wait."""
+        after a credential name with no value (`api_key:`) is masked unless it is structure (STRUCTURE_LINE) or a
+        prose_cell; a meta or key row ends the wait."""
         out, pending = [], None
         for line, kind in rows:
             if kind == "meta":
@@ -380,7 +399,7 @@ class Redactor:
             body = line[1:] if prefixed else line
             content = body.strip()
             if pending is not None and content:
-                if not (STRUCTURE_LINE.match(content) or (len(content.split()) > 1 and plain_text(pending, content))):
+                if not (STRUCTURE_LINE.match(content) or prose_cell(pending, content)):
                     self.count += 1
                     out.append(line[:len(line) - len(body.lstrip())] + MASK)
                     pending = None
