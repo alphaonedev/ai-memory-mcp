@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
-use hf_hub::{Repo, RepoType, api::sync::Api};
+use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
@@ -1033,31 +1033,47 @@ impl Embedder {
     pub fn new_local() -> Result<Self> {
         let device = Device::Cpu;
 
-        let (config_path, tokenizer_path, weights_path) = if Self::remote_fetch_disabled() {
-            // Offline mode (#1501): skip the network HF-Hub fetch entirely and
-            // rely solely on a pre-staged cache. This eliminates the cold-cache
-            // concurrent-download race — many parallel `ai-memory recall`
-            // subprocesses (the integration suite spawns one per test, all
-            // first-touch-downloading the same MiniLM weights) serialise on the
-            // hf-hub cache lock at up to HF_DOWNLOAD_TIMEOUT each, stacking to a
-            // multi-minute stall. When the cache is absent this `?` errors fast
-            // and the caller degrades to the keyword path (same contract as a
-            // timed-out download), but without any network wait.
-            Self::load_from_fallback()?
-        } else {
-            match Self::download_within(HF_DOWNLOAD_TIMEOUT, Self::download_via_hf_hub) {
-                Ok(paths) => paths,
-                Err(e) => {
-                    // #4284 — `tracing`, never `eprintln!`: this loader runs on a
-                    // worker thread while CLI verbs (`recall`) hold the
-                    // process-wide stderr lock for their whole run, so a stderr
-                    // write here blocks forever and the verb hangs instead of
-                    // degrading to keyword recall.
-                    tracing::warn!(error = %e, "hf-hub download failed, trying fallback dir");
-                    Self::load_from_fallback()?
+        let (config_path, tokenizer_path, weights_path) =
+            if let Some(reason) = Self::remote_fetch_disabled_reason() {
+                // Offline / cache-only mode (#1501 knob; #4123 a restricted
+                // inference-egress posture): skip the network HF-Hub fetch entirely
+                // and rely solely on a pre-staged cache. This eliminates the
+                // cold-cache concurrent-download race — many parallel `ai-memory
+                // recall` subprocesses (the integration suite spawns one per test,
+                // all first-touch-downloading the same MiniLM weights) serialise on
+                // the hf-hub cache lock at up to HF_DOWNLOAD_TIMEOUT each, stacking
+                // to a multi-minute stall. When the cache is absent this errors fast
+                // and the caller degrades to the keyword path (same contract as a
+                // timed-out download), but without any network wait — naming WHY
+                // the fetch was refused and where to stage the weights (#4123).
+                Self::load_from_fallback().map_err(|e| {
+                    tracing::warn!(
+                        reason = %reason,
+                        "MiniLM weights are not pre-staged and the Hugging Face Hub fetch is \
+                         disabled — semantic recall degrades to keyword. Stage config.json / \
+                         tokenizer.json / model.safetensors under HF_HOME/hub (else \
+                         ~/.cache/huggingface/hub) for this posture, or run once under \
+                         AI_MEMORY_INFERENCE_EGRESS=allow on a connected host"
+                    );
+                    e.context(format!(
+                        "Hugging Face Hub fetch disabled ({reason}); the pre-staged cache \
+                     (fallback dir) is the only source"
+                    ))
+                })?
+            } else {
+                match Self::download_within(HF_DOWNLOAD_TIMEOUT, Self::download_via_hf_hub) {
+                    Ok(paths) => paths,
+                    Err(e) => {
+                        // #4284 — `tracing`, never `eprintln!`: this loader runs on a
+                        // worker thread while CLI verbs (`recall`) hold the
+                        // process-wide stderr lock for their whole run, so a stderr
+                        // write here blocks forever and the verb hangs instead of
+                        // degrading to keyword recall.
+                        tracing::warn!(error = %e, "hf-hub download failed, trying fallback dir");
+                        Self::load_from_fallback()?
+                    }
                 }
-            }
-        };
+            };
 
         let config_data =
             std::fs::read_to_string(&config_path).context("failed to read config.json")?;
@@ -1953,9 +1969,16 @@ impl Embedder {
         }
     }
 
+    /// Online fetch. #4123 — built through `ApiBuilder::from_env()` (the
+    /// hf-hub documented way) so the ONLINE cache honours `HF_HOME` exactly as
+    /// the OFFLINE resolver does (#3788) and a mirror / recorder can be named
+    /// with `HF_ENDPOINT`; `Api::new()` read neither. Only reached when
+    /// [`Self::remote_fetch_disabled_reason`] is `None`.
     fn download_via_hf_hub() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>
     {
-        let api = Api::new().context("failed to initialise HuggingFace Hub API")?;
+        let api = ApiBuilder::from_env()
+            .build()
+            .context("failed to initialise HuggingFace Hub API")?;
         let repo = api.repo(Repo::new(MINILM_MODEL_ID.to_string(), RepoType::Model));
         let config_path = repo
             .get(HF_CONFIG_FILE)
@@ -1969,26 +1992,58 @@ impl Embedder {
         Ok((config_path, tokenizer_path, weights_path))
     }
 
-    /// Whether the local MiniLM embedder must avoid the network and use only
-    /// a pre-staged cache. Honors the de-facto-standard `HF_HUB_OFFLINE` plus
-    /// the dedicated `AI_MEMORY_EMBED_OFFLINE` knob. Used by hermetic CI (the
-    /// integration suite sets it to dodge the #1501 cold-download race) and by
-    /// air-gapped operators who pre-stage the weights in the standard HuggingFace
-    /// cache (`HF_HOME`/hub, else `$HOME/.cache/huggingface/hub`; see
-    /// [`Self::staged_model_snapshot_dir`]).
+    /// Whether — and WHY — the local MiniLM embedder must avoid the network
+    /// and use only a pre-staged cache: `None` = online; `Some(reason)` names
+    /// the offline knob that is set (the de-facto-standard `HF_HUB_OFFLINE`
+    /// or the dedicated `AI_MEMORY_EMBED_OFFLINE`), else the restricted
+    /// `AI_MEMORY_INFERENCE_EGRESS` posture that refuses the fetch (#4123, see
+    /// [`Self::hub_fetch_refused_by_posture`]). The knob is consulted first so
+    /// a hermetic-CI run reads the same reason it always did. Used by hermetic
+    /// CI (the integration suite sets the knob to dodge the #1501
+    /// cold-download race) and by air-gapped operators who pre-stage the
+    /// weights in the standard HuggingFace cache (`HF_HOME`/hub, else
+    /// `$HOME/.cache/huggingface/hub`; see [`Self::staged_model_snapshot_dir`]).
     ///
-    /// `pub(crate)` (#2086) — the reranker's cross-encoder loader
-    /// (`crate::reranker::CrossEncoder::resolve_cross_encoder_files`) shares
-    /// this same offline knob so `AI_MEMORY_EMBED_OFFLINE`/`HF_HUB_OFFLINE`
-    /// gates network fetches for BOTH the embedder and the reranker
-    /// consistently, one substrate-wide offline posture rather than two.
-    pub(crate) fn remote_fetch_disabled() -> bool {
+    /// Shared (#2086) with the reranker's cross-encoder loader
+    /// (`crate::reranker::CrossEncoder::resolve_cross_encoder_files`) so the
+    /// knob AND the posture gate network fetches for BOTH the embedder and the
+    /// reranker consistently, one substrate-wide offline posture rather than
+    /// two. `pub` so the own-binary test
+    /// (`tests/hf_hub_fetch_egress_posture_4123.rs`) and `ai-memory doctor`
+    /// can report the same reason the loaders act on.
+    #[must_use]
+    pub fn remote_fetch_disabled_reason() -> Option<String> {
         let truthy = |name: &str| {
             std::env::var(name)
                 .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
                 .unwrap_or(false)
         };
-        truthy("AI_MEMORY_EMBED_OFFLINE") || truthy(HF_HUB_OFFLINE_ENV)
+        if truthy("AI_MEMORY_EMBED_OFFLINE") || truthy(HF_HUB_OFFLINE_ENV) {
+            return Some(format!(
+                "offline knob set (AI_MEMORY_EMBED_OFFLINE / {HF_HUB_OFFLINE_ENV})"
+            ));
+        }
+        let mode = crate::egress::resolve_inference_egress_mode();
+        Self::hub_fetch_refused_by_posture(mode).then(|| {
+            format!(
+                "{}={} refuses Hugging Face Hub weight downloads; the model runs cache-only (#4123)",
+                crate::egress::ENV_INFERENCE_EGRESS,
+                mode.as_str()
+            )
+        })
+    }
+
+    /// #4123 (GOD ruling, 5-agent vote 4d3ea1c5, 5/5 option A) — whether the
+    /// inference-egress posture refuses a Hugging Face Hub weight download.
+    /// Copies the #4193 rule (`llm::egress_policy::apply_inference_egress_policy`):
+    /// `allow` is byte-identical legacy; EVERY other posture refuses, because a
+    /// restricted posture is the operator's statement that no inference-plane
+    /// egress leaves the host (`deny` is documented as "no inference egress at
+    /// all"; `internal-only` admits no public address, and the Hub is one).
+    /// Pure — the mode is injected so the matrix is pinned env-free.
+    #[must_use]
+    pub fn hub_fetch_refused_by_posture(mode: crate::egress::InferenceEgressMode) -> bool {
+        !matches!(mode, crate::egress::InferenceEgressMode::Allow)
     }
 
     /// Resolve the pre-staged MiniLM model files from the offline HuggingFace
@@ -3452,6 +3507,28 @@ fn load_from_fallback_succeeds_when_files_present() {
 }
 
 #[test]
+fn hub_fetch_refused_by_every_restricted_posture_allow_untouched_4123() {
+    // #4123 — env-free matrix (the mode is INJECTED, per the #3822 pin
+    // contract): `allow` is byte-identical legacy; every other posture refuses
+    // the Hugging Face Hub weight download (the #4193 rule, copied).
+    use crate::egress::InferenceEgressMode;
+    assert!(
+        !Embedder::hub_fetch_refused_by_posture(InferenceEgressMode::Allow),
+        "allow must stay byte-identical (online fetch permitted)"
+    );
+    for mode in [
+        InferenceEgressMode::LoopbackOnly,
+        InferenceEgressMode::Deny,
+        InferenceEgressMode::InternalOnly,
+    ] {
+        assert!(
+            Embedder::hub_fetch_refused_by_posture(mode),
+            "{mode:?} must refuse the Hub weight download (cache-only)"
+        );
+    }
+}
+
+#[test]
 fn offline_env_skips_network_and_errors_fast_on_empty_cache() {
     // #1501 — with the offline knob set and no pre-staged cache, `new_local`
     // must take the no-network branch and surface the fallback error fast
@@ -3503,7 +3580,7 @@ fn offline_env_skips_network_and_errors_fast_on_empty_cache() {
         std::env::remove_var(HF_HUB_OFFLINE_ENV);
     }
     assert!(
-        Embedder::remote_fetch_disabled(),
+        Embedder::remote_fetch_disabled_reason().is_some(),
         "offline knob must be honored"
     );
     let result = Embedder::new_local();

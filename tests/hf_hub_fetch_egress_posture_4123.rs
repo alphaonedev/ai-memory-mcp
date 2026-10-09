@@ -3,7 +3,7 @@
 
 //! #4123 (WP-EGRESS #6053; GOD ruling, 5-agent vote 4d3ea1c5, 5/5 option A)
 //! — a restricted `AI_MEMORY_INFERENCE_EGRESS` posture REFUSES the Hugging
-//! Face Hub weight downloads of the in-process embedder (MiniLM) and the
+//! Face Hub weight downloads of the in-process embedder (`MiniLM`) and the
 //! cross-encoder reranker. Those models run cache-only under `loopback-only`
 //! / `deny` / `internal-only`, exactly as under `AI_MEMORY_EMBED_OFFLINE`:
 //! with no pre-staged cache the embedder fails closed (keyword recall,
@@ -13,11 +13,13 @@
 //! Before this fix both loaders called `hf_hub::api::sync::Api::new()` with
 //! no admission at all: under `deny` — documented as "no inference egress at
 //! all" — a cache miss still reached huggingface.co. `Api::new()` also read
-//! neither `HF_ENDPOINT` nor `HF_HOME` (only the OFFLINE loader honoured
-//! `HF_HOME`, #3788), so an online fetch wrote its cache under `$HOME` while
-//! the offline resolver read `HF_HOME`; both loaders now build through
-//! `ApiBuilder::from_env()`, the hf-hub documented way, which is also what
-//! lets this test point the Hub at a local recorder.
+//! neither `HF_ENDPOINT` nor `HF_HOME` (only the OFFLINE `MiniLM` loader
+//! honoured `HF_HOME`, #3788), so the embedder's online fetch wrote its cache
+//! under `$HOME` while its offline resolver read `HF_HOME`. The embedder now
+//! builds through `ApiBuilder::from_env()` (the hf-hub documented way); the
+//! reranker roots its online cache where ITS offline resolver reads (`$HOME`)
+//! and honours `HF_ENDPOINT`. Honouring `HF_ENDPOINT` is also what lets this
+//! test point the Hub at a local recorder.
 //!
 //! Cells (each posture × a recording local "hub" that answers 404, an EMPTY
 //! `HF_HOME`, a scratch `HOME`, the offline knobs REMOVED so only the posture
@@ -31,7 +33,8 @@
 //! 3. A pre-staged cache under `deny` still loads: resolution reaches the
 //!    staged files with zero requests (the load then fails on the fake
 //!    `config.json`, which proves the cache-only path was taken).
-//! 4. Structural: both loaders build through `ApiBuilder::from_env()`.
+//! 4. Structural: neither loader builds through `Api::new()`; each uses the
+//!    `ApiBuilder` rooted at the cache its own offline resolver reads.
 //!
 //! OWN-BINARY on purpose: it mutates `HOME`, `HF_HOME`, `HF_ENDPOINT`, the
 //! offline knobs, the posture and the proxy vars — never inside the shared
@@ -249,7 +252,7 @@ async fn allow_control_reaches_the_hub_endpoint_4123() {
 // ─── 3. a pre-staged cache still loads under deny ────────────────────────
 
 /// Stage the hf-hub cache layout (`refs/main` -> `snapshots/<commit>/`,
-/// the #3788 shape) with placeholder files for the MiniLM repo.
+/// the #3788 shape) with placeholder files for the `MiniLM` repo.
 fn stage_minilm(hf_home: &Path) {
     let repo = hf_home.join("hub/models--sentence-transformers--all-MiniLM-L6-v2");
     let commit = "1110a243bcb1f321a9cf06d6e63c9bbd2f1b3a4c";
@@ -301,19 +304,31 @@ fn read_src(rel: &str) -> String {
 
 #[test]
 fn both_hub_loaders_build_from_env_and_consult_the_posture_4123() {
-    for (file, loader) in [
-        ("src/embeddings.rs", "fn download_via_hf_hub("),
-        ("src/reranker.rs", "fn resolve_cross_encoder_files("),
+    // (file, loader, the builder it must use, what that builder honours)
+    for (file, loader, builder, why) in [
+        (
+            "src/embeddings.rs",
+            "fn download_via_hf_hub(",
+            "ApiBuilder::from_env()",
+            "HF_ENDPOINT + HF_HOME, the root the offline resolver reads (#3788)",
+        ),
+        (
+            "src/reranker.rs",
+            "fn resolve_cross_encoder_files(",
+            "ApiBuilder::from_cache(",
+            "the $HOME-rooted cache its offline resolver reads, plus HF_ENDPOINT",
+        ),
     ] {
         let src = read_src(file);
         let start = src
             .find(loader)
             .unwrap_or_else(|| panic!("{file}: {loader} not found"));
-        let body = &src[start..start + 1500];
+        // Char-safe window over the loader body (the comments carry non-ASCII).
+        let body: String = src[start..].chars().take(3000).collect();
         assert!(
-            body.contains("ApiBuilder::from_env()"),
-            "#4123: {file} {loader} must build the Hub client through \
-             `ApiBuilder::from_env()` (HF_ENDPOINT + HF_HOME honoured); got:\n{body}"
+            body.contains(builder),
+            "#4123: {file} {loader} must build the Hub client through `{builder}` ({why}); \
+             got:\n{body}"
         );
         assert!(
             !body.contains("Api::new()"),
@@ -321,6 +336,11 @@ fn both_hub_loaders_build_from_env_and_consult_the_posture_4123() {
              HF_ENDPOINT / HF_HOME); got:\n{body}"
         );
     }
+    let rr = read_src("src/reranker.rs");
+    assert!(
+        rr.contains("\"HF_ENDPOINT\""),
+        "#4123: the reranker's online fetch must honour HF_ENDPOINT"
+    );
     let emb = read_src("src/embeddings.rs");
     assert!(
         emb.contains("fn hub_fetch_refused_by_posture("),
