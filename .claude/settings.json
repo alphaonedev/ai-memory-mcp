@@ -40,9 +40,9 @@
       "These permissions are enforced by convention + the SessionStart hook; the .deny list below makes them version-controlled."
     ],
     "deny": [
-      "Write(/tmp/**)",
-      "Write(/var/tmp/**)",
-      "Write(/private/tmp/**)"
+      "Edit(/tmp/**)",
+      "Edit(/var/tmp/**)",
+      "Edit(/private/tmp/**)"
     ]
   }
 }
