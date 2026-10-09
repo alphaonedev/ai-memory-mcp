@@ -271,3 +271,28 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).context("invalid hex byte"))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::hex_decode;
+
+    /// #4074 — the manifest signature is read from a file; a non-hex value
+    /// must be an `Err`, never a panic, and a `+` sign is not a hex digit.
+    #[test]
+    fn hex_decode_rejects_non_hex_without_panic_4074() {
+        for bad in [
+            "\u{1F600}",
+            "a\u{20AC}",
+            "\u{E9}\u{E9}",
+            "+f+f",
+            "abc",
+            "zz",
+        ] {
+            let owned = bad.to_owned();
+            let outcome = std::panic::catch_unwind(move || hex_decode(&owned));
+            let verdict = outcome.unwrap_or_else(|_| panic!("hex_decode PANICKED on {bad:?}"));
+            assert!(verdict.is_err(), "non-hex {bad:?} must be refused");
+        }
+        assert_eq!(hex_decode("00fF").ok(), Some(vec![0x00, 0xff]));
+    }
+}
