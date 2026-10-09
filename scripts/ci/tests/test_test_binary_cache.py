@@ -84,7 +84,7 @@ class World(unittest.TestCase):
         base = dict(shard_dir=str(self.sd), manifest_dir=str(self.mdir), run_id='100', sha='abc', build_json=str(self.bj),
                     repo_root=str(self.root), rustc_vv=str(self.rustc), profile='test sal-postgres', tier='enterprise-fed',
                     node='linux-fed', base_ref='release/v1.0.0', event='pull_request', ref='refs/pull/1/merge',
-                    no_runtime_tree=False)
+                    no_runtime_tree=False, psql='psql')
         base.update(kw)
         return argparse.Namespace(**base)
 
@@ -329,6 +329,69 @@ class EnvFingerprint6384H2(unittest.TestCase):
 
     def test_unrelated_runner_env_is_ignored(self):
         self.assertEqual(self.fp(), self.fp(PATH='/x', HOME='/h', GITHUB_RUN_ID='9', RUNNER_TEMP='/r'))
+
+
+FAKE_PSQL = """#!/usr/bin/env python3
+import os, sys
+sys.stdout.write(os.environ.get('FAKE_PSQL_OUT', ''))
+sys.exit(int(os.environ.get('FAKE_PSQL_RC', '0')))
+"""
+PG_OUT_1 = 'PostgreSQL 18.6 on x86_64-pc-linux-gnu\nage 1.8.0 1.8.0\nvector 0.8.1 0.8.1\n'
+PG_OUT_2 = 'PostgreSQL 18.6 on x86_64-pc-linux-gnu\nage 1.9.0 1.9.0\nvector 0.8.1 0.8.1\n'
+
+
+class PostgresServerFingerprint6384M1(World):
+    """r1 M1: the Postgres server and its age / vector versions are in the key."""
+
+    def setUp(self):
+        super().setUp()
+        self.psql = SCRATCH / 'fake-psql'
+        self.psql.write_text(FAKE_PSQL)
+        self.psql.chmod(0o755)
+
+    def pg_env(self, out=PG_OUT_1, rc='0'):
+        return dict(ENV_ON, AI_MEMORY_TEST_POSTGRES_URL='postgres://u@h:5445/db', FAKE_PSQL_OUT=out, FAKE_PSQL_RC=rc)
+
+    def test_no_url_is_none(self):
+        self.assertEqual(tbc.pg_fingerprint(ENV_ON, psql=str(self.psql)), 'none')
+
+    def test_version_or_extension_change_moves_the_fingerprint(self):
+        a = tbc.pg_fingerprint(self.pg_env(PG_OUT_1), psql=str(self.psql))
+        b = tbc.pg_fingerprint(self.pg_env(PG_OUT_2), psql=str(self.psql))
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a, 'none')
+        self.assertNotIn('postgres://', a)
+
+    def test_failure_empty_or_missing_psql_raises(self):
+        for env, psql in ((self.pg_env(rc='2'), str(self.psql)), (self.pg_env(out=''), str(self.psql)),
+                          (self.pg_env(), str(SCRATCH / 'no-such-psql'))):
+            with self.assertRaises(tbc.CacheError):
+                tbc.pg_fingerprint(env, psql=psql)
+
+    def test_server_fingerprint_moves_every_key(self):
+        exes = tbc.ptb.parse_build_json(self.bj.read_text().splitlines())
+        lines = self.bj.read_text().splitlines()
+        k1, _ = tbc.compute_keys(exes, lines, self.root, self.rustc.read_text(), 'p', ENV_ON, server_fp='A')
+        k2, _ = tbc.compute_keys(exes, lines, self.root, self.rustc.read_text(), 'p', ENV_ON, server_fp='B')
+        for n in k1:
+            self.assertNotEqual(k1[n], k2[n], n)
+
+    def test_server_upgrade_between_runs_means_no_hits(self):
+        seed = self.pg_env(PG_OUT_1)
+        self.plan(env=seed, event='push', ref='refs/heads/release/v1.0.0', psql=str(self.psql))
+        self.record(0)
+        for n in tbc.SHARD_LISTS:
+            (self.sd / (n + '.txt')).write_text((self.sd / (n + '.txt.full')).read_text())
+        self.assertIn('skipped 0 of 3', self.plan(env=self.pg_env(PG_OUT_2), run_id='2', psql=str(self.psql)))
+
+    def test_unreadable_server_fingerprint_means_no_skips(self):
+        self.plan(env=self.pg_env(), event='push', ref='refs/heads/release/v1.0.0', psql=str(self.psql))
+        self.record(0)
+        for n in tbc.SHARD_LISTS:
+            (self.sd / (n + '.txt')).write_text((self.sd / (n + '.txt.full')).read_text())
+        out = self.plan(env=self.pg_env(rc='2'), run_id='2', psql=str(self.psql))
+        self.assertIn('::warning::', out)
+        self.assertEqual(self.list_text('serial'), '--lib\n--test a\n')
 
 
 class Policy(unittest.TestCase):
