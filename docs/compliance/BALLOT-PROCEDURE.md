@@ -3,7 +3,8 @@
 <!-- #3557 (N22, item 18): the review-wave and issuance rules of the adopted standard
 (docs/compliance/MISSION-CRITICAL-CERTIFICATION-STANDARD-v1.md, §4 and §5) written as
 the step-by-step procedure a wave follows. The rules are reproduced verbatim below; the
-procedure adds only the order of operations and the record shapes. -->
+procedure adds only the order of operations and the record shapes.
+Erratum (#6141): N30's enforcer `check-cert-expiry.sh` is `scripts/check_cert_expiry.py` since #6137; behaviour on push events is byte-identical. The same erratum covers every historical mention in docs/compliance/. -->
 
 ## The rules (verbatim from the standard)
 
