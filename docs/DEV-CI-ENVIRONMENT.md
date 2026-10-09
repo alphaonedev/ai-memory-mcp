@@ -157,7 +157,7 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   full size. The bin's uplift source `deps/<bin>-<hash>` is kept: it is found
   by name, size and content against `debug/<bin>`, not by link count (a clone has
   nlink 1), because pruning it makes cargo report the bin "Dirty" and relink
-  it on the next job. Any other hard-linked executable is kept too, since
+  it on the next job. On macOS an example's `.dSYM` symlink (`examples/<name>.dSYM -> <name>-<hash>.dSYM`) goes with it, so no dangling link stays behind. The category rows of the summary count only files actually deleted; a deletion that failed is listed on `failed <category>` rows. Any other hard-linked executable is kept too, since
   deleting one link frees nothing; each `kept` line names the reason. The rlib / rmeta /
   proc-macro outputs, `build/` and `.fingerprint/` stay, so the next compile is
   still warm. `--dry-run` lists what would go and prints `freed_bytes=<n>`;
@@ -173,7 +173,7 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   so it never follows a symlink, even one swapped in mid-run. An entry it
   cannot read or remove prints a `::warning::` line; the rest is still pruned,
   the totals are printed and the exit code is 1. Names in those lines are
-  escaped (`%` `%25`, `#` `%23`, CR `%0D`, LF `%0A`, a non-UTF-8 byte `\xNN`),
+  escaped (`%` `%25`, `#` `%23`, CR `%0D`, LF `%0A`, any other control character, DEL or C1 byte `\xNN`, a non-UTF-8 byte `\xNN`),
   so a file name cannot start a workflow command of its own (the runner also
   parses the legacy `##[command]` form anywhere in a line). A directory nested
   more than 100 levels deep is warned about and left in place. `freed_bytes`
