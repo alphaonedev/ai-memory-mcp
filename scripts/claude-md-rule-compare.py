@@ -1578,6 +1578,16 @@ def _self_test_cases() -> int:
         failures.append("closed_failure")
         print(f"FAIL: self-test - #6212 closed_failure gave {closed!r}", file=sys.stderr)
 
+    # #6211 (final mutants N27, N36): a diff header row is shown as is and ends the wait after a bare credential name,
+    # so the first line of the next hunk is not taken for that name's value.
+    header_rows = Redactor().mask_rows([("+api_key:", "text"), ("@@ -9 +9 @@", "meta"), (" visible-6163", "text")],
+                                       True)
+    if header_rows == ["+api_key:", "@@ -9 +9 @@", " visible-6163"]:
+        print("PASS: self-test - #6211 a hunk header is shown as is and ends the wait for a value")
+    else:
+        failures.append("mask_rows meta")
+        print(f"FAIL: self-test - #6211 mask_rows over a hunk header gave {header_rows!r}", file=sys.stderr)
+
     def tick_heading(root):
         target = root / "CLAUDE.md"
         target.write_text(target.read_text(encoding="utf-8") + "\n## added `x` heading\n\nbody\n", encoding="utf-8")
@@ -1858,6 +1868,14 @@ def _self_test_cases() -> int:
              absent=hidden, needles=("credential-shaped value(s) masked",))
     for visible in ("max_tokens: 20000 per request", "api_key: OPENAI_API_KEY", "token_count = 1,500"):
         case(f"#6163 {visible!r} is not masked (round 3)", head_line(visible), True, visible)
+    # #6163 round 3 (final mutants SR3, N9): the env-name exemption is upper case only and refuses a run of 4 digits,
+    # so under an `_env` name a lower-case snake value or a value with a digit run is still masked.
+    for label, extra, hidden in (("a lower-case snake value under an _env name", "token_env: canary_lower_snake",
+                                  "canary_lower_snake"),
+                                 ("an env-name value with a 4-digit run", "API_TOKEN_ENV: SK_6163_9999_LIVE",
+                                  "SK_6163_9999_LIVE")):
+        case(f"#6163 {label} in changed rule text is masked", head_line(extra), True, "RULE TEXT CHANGED",
+             absent=hidden, needles=("credential-shaped value(s) masked",))
 
     # #6209 #6210 #6211 (security review round 2): a leading count or switch word does not exempt the words after
     # it; Markdown forms (a backtick-quoted value, an emphasised name, a table row) and unlabelled token shapes (a
@@ -1905,6 +1923,14 @@ def _self_test_cases() -> int:
          head_line("\n| token_budget | The budget for one call |"), True, "| token_budget | The budget for one call |")
     case("#6211 a prose line after a bare credential name is not masked",
          head_line("\napi_key:\n  The key used by the CLI"), True, "+  The key used by the CLI")
+    # #6210 (final mutants N18, N33): a one-word cell is a value, not a description, and a table row is split at every
+    # `|` (Markdown splits the cells before it reads code spans), so a code span across cells does not hide the value.
+    for label, extra, hidden in (("a one-word table cell after a token name", "\n| api_token | swordfish |",
+                                  "swordfish"),
+                                 ("a table value inside a code span that crosses cells",
+                                  "\n| `x | api_token | 6163-canary-span | y` |", "6163-canary-span")):
+        case(f"#6210 {label} is masked", head_line(extra), True, "RULE TEXT CHANGED", absent=hidden,
+             needles=("credential-shaped value(s) masked",))
     case("#6210 a prose table cell after a password name is masked",
          head_line("\n| password | correct horse battery |"), True, "RULE TEXT CHANGED",
          absent="correct horse battery", needles=("credential-shaped value(s) masked",))
@@ -1932,6 +1958,13 @@ def _self_test_cases() -> int:
          "\\x1b[31mred6212", needles=("\\x9b2J", "\\x07bell"), absent="\x1b")
     case("#6212 no C1 or BEL control character reaches the summary", control_text, True, "RULE TEXT CHANGED",
          absent="\x9b")
+
+    def bidi_text(root):
+        edit("tool limit is 103 tools", "tool limit is 103 tools \u202ebidi6212\u202c")(root)
+        reseal(root)
+
+    case("#6212 a bidirectional override in changed rule text is shown escaped (final mutant N30)", bidi_text, True,
+         "\\u202ebidi6212\\u202c", absent="\u202e")
 
     # #6163 round 3 (review G1): a key line is masked by its position inside a BEGIN..END range of its own side, so a
     # changed body line whose BEGIN line is outside the hunk (or on the other side only) never prints.
