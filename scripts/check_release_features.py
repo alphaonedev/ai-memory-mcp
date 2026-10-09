@@ -2309,6 +2309,61 @@ def _docker_job_scalar(text: str) -> str:
     return text[:a] + "\n  docker: none\n" + text[c:]
 
 
+GUARD_STEP_NAME = "      - name: Release feature declaration guard\n"
+OPENSSL_NAME = "      - name: No OpenSSL / libpq / native-tls in the shipped dependency graph\n"
+TLS_PG_NAME = "      - name: Start a TLS PostgreSQL service (throwaway CA, hostssl-only)\n"
+STOP_PG_NAME = "      - name: Stop the PostgreSQL service\n"
+SHAPE_CHECKOUT = "      - uses: actions/checkout@"
+
+
+def _shape_step_after_build(run: str) -> Transform:
+    """An extra step right after the release-shaped build (#6278)."""
+    def go(text: str) -> str:
+        return text.replace(OPENSSL_NAME, "      - name: x\n        shell: bash\n        run: " + run + "\n\n"
+                            + OPENSSL_NAME, 1)
+    return go
+
+
+def _shape_modifier(name: str, line: str) -> Transform:
+    """Give the release-shape step whose header is ``name`` the key ``line`` (#6290)."""
+    def go(text: str) -> str:
+        a = text.index(name)
+        b = text.index("\n", a) + 1
+        return text[:b] + line + text[b:]
+    return go
+
+
+def _proof_step(text: str) -> str:
+    a = text.index(PROOF_NAME)
+    return text[a:text.index(STOP_PG_NAME, a)]
+
+
+def _in_proof_step(fn: Transform) -> Transform:
+    def go(text: str) -> str:
+        step = _proof_step(text)
+        return text.replace(step, fn(step), 1)
+    return go
+
+
+def _drop_proof_bind(step: str) -> str:
+    """The proof step without its content-hash bind line (#6278: unchanged
+    until the bind lands, so the case is red exactly until then)."""
+    return "".join(ln for ln in step.splitlines(True) if "git hash-object" not in ln)
+
+
+def _proof_via_path_bash(step: str) -> str:
+    return step.replace("/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/release-shape-pg-proof.sh",
+                        "bash scripts/release-shape-pg-proof.sh", 1)
+
+
+def _proof_shell_bash(step: str) -> str:
+    return step.replace("        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}\n", "        shell: bash\n", 1)
+
+
+def _proof_bind_sha(step: str) -> str:
+    return step.replace("PREFLIGHT_SHA: ${{ github.sha }}", "PREFLIGHT_SHA: ${{ github.event.pull_request.head.sha }}", 1)
+
+
 def _docker_steps_scalar(text: str) -> str:
     a, c = text.index("\n  docker:\n"), text.index("\n  copr:\n")
     s = text.index("    steps:\n", a)
@@ -2837,6 +2892,35 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "P15 proof URL points at another host": ("fail", [(SHAPE, "127.0.0.1:55432/proof", "198.51.100.7:55432/proof", False)]),
     "D16d uppercase RUN --MOUNT": ("fail", [_final("RUN --MOUNT=type=cache,target=/m true\n")]),
     "valid: proof URL port changed": ("pass", [(SHAPE, "127.0.0.1:55432/proof", "127.0.0.1:55433/proof", False)]),
+    # --- #6278 / #6290: the release-shape job is pinned WHOLE (SHAPE_STEPS)
+    "6278 release-shape step between build and proof writes the binary": ("fail", [_shape(PROOF_NAME, _shape_step_after_build(
+        "cp /bin/true target/release/ai-memory"))]),
+    "6278 release-shape step between build and proof writes the proof script": ("fail", [_shape(
+        PROOF_NAME, _shape_step_after_build("printf 'exit 0' > scripts/release-shape-pg-proof.sh"))]),
+    "6278 release-shape step appended after the cleanup": ("fail", [_shape(STOP_PG_NAME, lambda t: t.rstrip("\n")
+                                                                          + "\n\n      - name: x\n        run: echo\n")]),
+    "6278 release-shape TLS service step body changed": ("fail", [_shape(
+        "          docker exec release-shape-pg psql", "          true\n          docker exec release-shape-pg psql")]),
+    "6278 release-shape openssl check step dropped": ("fail", [_shape(OPENSSL_NAME, lambda t: t.replace(
+        t[t.index(OPENSSL_NAME):t.index(TLS_PG_NAME)], "", 1))]),
+    "6278 proof step loses the content-hash bind of the proof script": ("fail", [_shape(PROOF_NAME, _in_proof_step(
+        _drop_proof_bind))]),
+    "6278 proof script run through PATH bash": ("fail", [_shape(PROOF_NAME, _in_proof_step(_proof_via_path_bash))]),
+    "6278 proof step shell is plain bash": ("fail", [_shape(PROOF_NAME, _in_proof_step(_proof_shell_bash))]),
+    "6278 proof bind sha taken from the PR head": ("fail", [_shape(PROOF_NAME, _in_proof_step(_proof_bind_sha))]),
+    "6290 if: false on the guard step": ("fail", [_shape(GUARD_STEP_NAME, _shape_modifier(GUARD_STEP_NAME,
+                                                                                          "        if: false\n"))]),
+    "6290 continue-on-error on the guard step": ("fail", [_shape(GUARD_STEP_NAME, _shape_modifier(
+        GUARD_STEP_NAME, "        continue-on-error: true\n"))]),
+    "6290 continue-on-error on checkout": ("fail", [_shape(SHAPE_CHECKOUT, _shape_modifier(
+        SHAPE_CHECKOUT, "        continue-on-error: true\n"))]),
+    "6290 if: false on the openssl check": ("fail", [_shape(OPENSSL_NAME, _shape_modifier(OPENSSL_NAME,
+                                                                                         "        if: false\n"))]),
+    "6290 continue-on-error on the TLS service step": ("fail", [_shape(TLS_PG_NAME, _shape_modifier(
+        TLS_PG_NAME, "        continue-on-error: true\n"))]),
+    "6290 timeout-minutes on the guard step": ("fail", [_shape(GUARD_STEP_NAME, _shape_modifier(
+        GUARD_STEP_NAME, "        timeout-minutes: 1\n"))]),
+    "6290 cleanup step if: always() narrowed": ("fail", [_shape("        if: always()\n", "        if: success()\n")]),
     # --- #4719 round 5 SR-8: the docker job is pinned whole; no other job may reach the registry
     "SR8/I01 absolute-path docker push in a docker-job step": ("fail", _docker_extra_step("        run: /usr/bin/docker push x\n")),
     "SR8/I02 docker -H push in a docker-job step": ("fail", _docker_extra_step("        run: docker -H tcp://x:2375 push x\n")),
