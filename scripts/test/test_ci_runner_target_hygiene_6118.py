@@ -852,6 +852,96 @@ class Mutants6118(unittest.TestCase):
         found = self._mutated(_replace_once(self.ci, anchor, anchor + " --allow-outside-workspace"))
         self.assertTrue(any("R-PRUNE" in v and "--allow-outside-workspace" in v for v in found), found)
 
+    # ---- round 4 (R3-F2, SR3-3): more debuginfo spellings, fewer false alarms ----
+
+    def _debug_flagged(self, found: List[str]) -> bool:
+        return any("R-DEBUG" in v for v in found)
+
+    def test_6118_m25_inline_table_profile_debug(self) -> None:
+        found = self._before_prune(
+            "      - name: Inline table\n"
+            "        run: cargo test --no-run --config 'profile.dev={debug=1}'\n")
+        self.assertTrue(self._debug_flagged(found), found)
+        found = self._before_prune(
+            "      - name: Inline table spaced\n"
+            "        run: cargo test --no-run --config 'profile.test = { debug = \"line-tables-only\" }'\n")
+        self.assertTrue(self._debug_flagged(found), found)
+
+    def test_6118_m26_lowercase_build_rustflags_dash_g(self) -> None:
+        found = self._before_prune(
+            "      - name: Lowercase key\n"
+            "        run: cargo test --no-run --config 'build.rustflags=[\"-g\"]'\n")
+        self.assertTrue(self._debug_flagged(found), found)
+
+    def test_6118_m27_yaml_escaped_separator_in_encoded_rustflags(self) -> None:
+        # The YAML double-quoted escape \x1f is the unit separator cargo splits on.
+        for value in ('"-Copt-level=0\\x1f-g"', '"-g\\x1f-Copt-level=0"', '"-Copt-level=0\\u001f-g"'):
+            found = self._before_prune(
+                "      - name: Encoded flags\n        env:\n          CARGO_ENCODED_RUSTFLAGS: " + value + "\n"
+                "        run: cargo test --no-run\n")
+            self.assertTrue(self._debug_flagged(found), (value, found))
+
+    def test_6118_m28_benign_lines_are_clean(self) -> None:
+        # R3-F2 false positives: `git log -g` on a RUSTFLAGS line, prose that
+        # mentions -g, and the valid level-0 spellings false / "none".
+        found = self._before_prune(
+            "      - name: Benign\n        run: |\n"
+            "          RUSTFLAGS=\"-D warnings\" cargo clippy && git log -g\n"
+            "          echo \"RUSTFLAGS: never pass -g here\"\n"
+            "          cargo test --no-run --config profile.dev.debug=false\n"
+            "          cargo test --no-run --config 'profile.test.debug=\"none\"'\n"
+            "          cargo test --no-run --config 'profile.dev={debug=0}'\n"
+            "          cargo test --no-run --config 'build.rustflags=[\"-D\", \"warnings\"]'\n")
+        self.assertEqual([], found)
+
+    def test_6118_m29_step_appends_build_rustflags_to_cargo_config(self) -> None:
+        found = self._before_prune(
+            "      - name: Write config\n        run: |\n"
+            "          mkdir -p .cargo\n"
+            "          printf '[build]\\nrustflags = [\"-g\"]\\n' >> .cargo/config.toml\n")
+        self.assertTrue(self._debug_flagged(found), found)
+        found = self._before_prune(
+            "      - name: Write config heredoc\n        run: |\n"
+            "          cat >> .cargo/config.toml <<'EOF'\n"
+            "          [build]\n"
+            "          rustflags = [\"-g\"]\n"
+            "          EOF\n")
+        self.assertTrue(self._debug_flagged(found), found)
+
+    def test_6118_m30_cargo_config_file_can_set_anything(self) -> None:
+        found = self._before_prune(
+            "      - name: Config file\n        run: cargo test --no-run --config ci/debug.toml\n")
+        self.assertTrue(self._debug_flagged(found), found)
+
+    def test_6118_m31_github_env_heredoc_rustflags(self) -> None:
+        found = self._before_prune(
+            "      - name: Env heredoc\n        run: |\n"
+            "          {\n"
+            "            echo 'RUSTFLAGS<<EOF'\n"
+            "            echo '-g'\n"
+            "            echo 'EOF'\n"
+            "          } >> \"$GITHUB_ENV\"\n")
+        self.assertTrue(self._debug_flagged(found), found)
+        found = self._before_prune(
+            "      - name: Env heredoc plain\n        run: |\n"
+            "          cat >> \"$GITHUB_ENV\" <<EOF\n"
+            "          RUSTFLAGS<<FLAGS\n"
+            "          -Copt-level=0 -g\n"
+            "          FLAGS\n"
+            "          EOF\n")
+        self.assertTrue(self._debug_flagged(found), found)
+
+    def test_6118_m32_custom_cargo_profile_on_a_self_hosted_job(self) -> None:
+        # The prune only ever touches target/<profile> for the default profile.
+        found = self._before_prune(
+            "      - name: Custom profile\n        run: cargo test --no-run --profile ci\n")
+        self.assertTrue(self._debug_flagged(found), found)
+        found = self._before_prune(
+            "      - name: Known profiles\n        run: |\n"
+            "          cargo test --no-run --profile dev\n"
+            "          cargo build --profile=release\n")
+        self.assertEqual([], found)
+
 
 def _write(path: Path, size: int, executable: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
