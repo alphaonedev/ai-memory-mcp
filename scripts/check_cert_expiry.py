@@ -121,7 +121,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CERT_DOC = "docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
 FED_ID_PATTERN = "AI_MEMORY_FED_[A-Z0-9_]+"
 FED_ID_RE = re.compile(FED_ID_PATTERN)
-ZERO_SHA_RE = re.compile(r"^0+$")
+# The only skip-worthy before-sha: exactly 40 (SHA-1) or 64 (SHA-256) zeros, matched
+# with `fullmatch`; a zero value of any other length is malformed and reaches the
+# hex validator (#6201).
+ZERO_SHA_RE = re.compile(r"0{40}(?:0{24})?")
 PREFIX = "check-cert-expiry"
 # Every sha taken from the environment is exactly 40 (SHA-1) or 64 (SHA-256)
 # hex chars (#6138 S-F2, R2-1), matched with `fullmatch` so a trailing newline
@@ -649,7 +652,7 @@ def resolve_range(repo, env):
 
     if event == "push":
         before = env.get("GITHUB_EVENT_BEFORE", "")
-        if not before or ZERO_SHA_RE.match(before):
+        if not before or ZERO_SHA_RE.fullmatch(before):
             raise Skip("push has no previous tip (new branch / first push); skip")
         before = env_sha(env, "GITHUB_EVENT_BEFORE")
         after = env_sha(env, "GITHUB_SHA") if env.get("GITHUB_SHA") else "HEAD"
@@ -1495,7 +1498,7 @@ SELF_TEST_OK = (
     "(f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs "
     "RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path "
     "still named); (j) identifier-rename RED (both names listed); (k) pull_request missing "
-    "PR_HEAD_SHA / GITHUB_BASE_REF fail-closed with its reason; (l) workflow_dispatch skip naming the outside-CI-only overrides; (m) push with zero before-SHA skip; "
+    "PR_HEAD_SHA / GITHUB_BASE_REF fail-closed with its reason; (l) workflow_dispatch skip naming the outside-CI-only overrides; (m) push with zero before-SHA skip; (m2, #6201) only exactly 40 or 64 zeros skip, other zero lengths and newline-suffixed zeros are refused by the hex validator and a zero-prefixed 40-hex is judged; "
     "(n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; "
     "(p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + "
     "incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated "
