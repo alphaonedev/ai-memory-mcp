@@ -435,16 +435,20 @@ fn promote_error_message(e: anyhow::Error) -> String {
 /// single sanitized OPERATOR log line for it (the conversion owns the log
 /// line, as in `crate::mcp::error_text::log_foreign`). The line carries the
 /// alternate (`{e:#}`) render of the whole `anyhow` chain, so a driver root
-/// under a context wrapper reaches the operator; the caller body is rendered
-/// from the returned class only.
+/// under a context wrapper reaches the operator, and (#6149) the HTTP status
+/// the route returns; the caller body is rendered from the returned class only.
 fn log_foreign(e: anyhow::Error) -> crate::errors::MemoryError {
     const CONTEXT: &str = "skill_promote_route";
+    // #6149 - the status the route returns for this chain, so the operator
+    // can correlate the log line with the response.
+    let status = promote_error_status(&e).as_u16();
     let chain = format!("{e:#}");
     let mapped = crate::errors::MemoryError::from(e);
     if mapped.is_foreign_class() {
         tracing::error!(
             target: crate::mcp::error_text::TRACE_TARGET,
             context = CONTEXT,
+            status,
             code = mapped.code(),
             detail = %chain,
             "#6147: foreign error kept on the operator log; the caller receives the class"
@@ -453,6 +457,7 @@ fn log_foreign(e: anyhow::Error) -> crate::errors::MemoryError {
         tracing::warn!(
             target: crate::mcp::error_text::TRACE_TARGET,
             context = CONTEXT,
+            status,
             code = mapped.code(),
             detail = %chain,
             "#6147: typed refusal passed through to the caller"
