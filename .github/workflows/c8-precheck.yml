@@ -1426,3 +1426,19 @@ jobs:
         run: python3 scripts/check-sqlite-write-txn-immediate.py
       - name: Self-test the gate (regression evidence)
         run: python3 scripts/check-sqlite-write-txn-immediate.py --self-test
+
+  env-mutation-lock-gate:
+    # #6123: every lib-test write to an environment variable or the working
+    # directory must run under the crate's one process-env lock. Lexical,
+    # script-only gate; fails closed on an unparseable or symlinked source tree.
+    name: Lib-test env/cwd mutation lock gate (#6123)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run env-mutation lock gate
+        run: python3 scripts/check-env-mutation-lock.py
+      - name: Self-test the gate (regression evidence)
+        # Planted bypass shapes (aliases, turbofish, released or spawned
+        # guards, foreign lock, poison unwrap, symlink) must each be caught.
+        run: python3 scripts/check-env-mutation-lock.py --self-test
