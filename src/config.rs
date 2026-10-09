@@ -8185,12 +8185,9 @@ pub(crate) fn enforce_api_key_file_perms(
         if mode & 0o077 != 0 {
             // Allow lax perms only when the operator explicitly opts in
             // (mirroring #1055 for AI_MEMORY_DB_PASSPHRASE_FILE).
+            // #3620 — the ONE house grammar, shared with `passphrase_from_file`.
             let opt_in = std::env::var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS")
-                .ok()
-                .is_some_and(|s| {
-                    let t = s.trim().to_ascii_lowercase();
-                    matches!(t.as_str(), "1" | "true" | "yes" | "on")
-                });
+                .is_ok_and(|v| crate::security_profile::is_truthy(&v));
             if !opt_in {
                 return Err(format!(
                     "{field} = {:?} has lax permissions \
