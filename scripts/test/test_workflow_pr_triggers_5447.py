@@ -3103,7 +3103,7 @@ class CarrierRangeStep6117(_Scratch6117):
             # An env key (`CARRIER_RELEASE_REF: <value>` at line start), not the
             # `$CARRIER_RELEASE_REF:refs/...` refspec inside a fetch line.
             self.assertNotRegex(text, r"(?m)^\s*CARRIER_RELEASE_REF:\s*\S", name)
-        derive = "python3 scripts/check_promotion_geometry.py --print-release"
+        derive = "python3 -I scripts/check_promotion_geometry.py --print-release"
         for body in self.bodies() + [self.geometry_body()]:
             self.assertIn(derive, body)
         out = subprocess.run([sys.executable, str(GEOMETRY_PY), "--print-release"],
@@ -3116,7 +3116,7 @@ class CarrierRangeStep6117(_Scratch6117):
 
     def test_6117_r2_sf4_hardcoded_release_in_a_range_step_is_killed(self) -> None:
         # Mutant: one carrier step goes back to a hand-pinned env value.
-        derive = 'CARRIER_RELEASE_REF="$(python3 scripts/check_promotion_geometry.py --print-release)"'
+        derive = 'CARRIER_RELEASE_REF="$(python3 -I scripts/check_promotion_geometry.py --print-release)"'
         self.assertIn(derive, self.c8)
         mutant = self.c8.replace(derive, "CARRIER_RELEASE_REF=release/v1.0.0", 1)
         bodies = _step_runs(mutant, CARRIER_RANGE_STEP) + [
@@ -3258,7 +3258,7 @@ class ExternalPrApprovalOnPush6117(unittest.TestCase):
     def test_6117_r2_sf1_workflow_runs_the_evaluator_on_every_event(self) -> None:
         job = _job_text(C8_WORKFLOW.read_text(encoding="utf-8"), APPROVAL_JOB)
         runs = "\n".join(_step_runs(job, "Evaluate external-PR approval requirement"))
-        self.assertIn("python3 scripts/check_external_pr_approval.py", runs)
+        self.assertIn("python3 -I scripts/check_external_pr_approval.py", runs)
         self.assertNotIn("gate not applicable (pass)", job)
         self.assertNotRegex(job, r'"\$EVENT" != "pull_request"')
         # rule (f): the job always runs and always reports.
@@ -3272,7 +3272,7 @@ class ExternalPrApprovalOnPush6117(unittest.TestCase):
                              capture_output=True, text=True, timeout=60, check=False)
         self.assertEqual(0, out.returncode, out.stdout + out.stderr)
         job = _job_text(C8_WORKFLOW.read_text(encoding="utf-8"), APPROVAL_JOB)
-        self.assertIn("python3 scripts/check_external_pr_approval.py --self-test", job)
+        self.assertIn("python3 -I scripts/check_external_pr_approval.py --self-test", job)
 
 
 class ExternalPrApprovalEntrypoint6226(_Scratch6117):
@@ -3356,6 +3356,28 @@ class ExternalPrApprovalEntrypoint6226(_Scratch6117):
         out = subprocess.run([sys.executable, "-I", str(mutant)], capture_output=True, text=True,
                              env=env, timeout=60, check=False)
         self.assertEqual(0, out.returncode, "the mutant must pass vacuously, proving the cell is load-bearing")
+
+
+class GateScriptsRunIsolated6117(unittest.TestCase):
+    """N-2 (#5163 class): the gate scripts the c8 workflow runs use ``python3 -I``.
+
+    ``python3 scripts/x.py`` puts ``scripts/`` first on ``sys.path``, so a sibling
+    ``scripts/json.py`` or ``scripts/re.py`` would run inside the gate.  ``-I`` removes
+    the script directory and the user site from the import path.  Precedent:
+    ``claude-md-rule-compare.yml`` and the cert-expiry steps of this workflow.
+    """
+
+    GATE_SCRIPTS = {"check_promotion_geometry.py": 5, "check_external_pr_approval.py": 2}
+
+    def test_6117_r3_n2_gate_scripts_run_with_isolated_python(self) -> None:
+        text = C8_WORKFLOW.read_text(encoding="utf-8")
+        for script, expected in self.GATE_SCRIPTS.items():
+            with self.subTest(script=script):
+                bare = re.findall(r"python3 (?!-I )\S*scripts/" + re.escape(script), text)
+                self.assertEqual([], bare, f"{script} must run as `python3 -I` (#5163)")
+                isolated = re.findall(r"python3 -I scripts/" + re.escape(script), text)
+                self.assertEqual(expected, len(isolated),
+                                 f"{script}: expected {expected} isolated invocations")
 
 
 class RoundTwoDocTruth6117(unittest.TestCase):
