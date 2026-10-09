@@ -18,6 +18,8 @@ from document lines (#6195). Each line is also scanned as a reader sees it after
 rendering (#6214): escapes, entities, inline tags and comments, emphasis markers, dash
 variants, combining marks and look-alike letters folded, so a backslash-escaped
 hyphen, ``check&#45;x.sh`` or a Cyrillic look-alike letter cannot hide a name.
+Names match in any ASCII letter case, and existence is decided by exact names from
+directory listings, the same on case-insensitive filesystems (#6220).
 A bare name means ``scripts/<name>``. A written path is checked at that path
 from the repository root (#6216): leading ``/``, ``.`` and ``..`` components and a
 URL's host part are dropped only when ``scripts`` follows, so ``./scripts/x``,
@@ -84,7 +86,11 @@ from pathlib import Path
 
 # A script name anywhere on a line, bounded by non-name characters (#6195): inside or outside
 # backticks, in a fenced block, after a command or a path prefix.
-TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_.-])(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(?![A-Za-z0-9_])")
+# Matched in any ASCII letter case (#6220): CHECK-x.sh and check_x.PY name scripts too. re.ASCII
+# keeps IGNORECASE from folding the Kelvin sign or long s into ASCII letters.
+TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(?![A-Za-z0-9_])", re.IGNORECASE | re.ASCII
+)
 PATH_CHARS = frozenset(string.ascii_letters + string.digits + "_./-")
 SUCCESSOR_RE = re.compile(r"`scripts/([A-Za-z0-9_./-]+\.(?:sh|py))`")
 ALLOW_REL = "scripts/qc-allowlists/compliance-script-names-allow.txt"
@@ -117,7 +123,7 @@ DIAGRAM_FENCES = frozenset({"mermaid", "math", "geojson", "topojson", "stl"})
 # A CommonMark link reference definition ([label]: destination "title"), never rendered (#6219).
 LINKDEF_RE = re.compile(r"^ {0,3}\[[^\]]+\]:")
 ENTRY_RE = re.compile(
-    r"^(docs/compliance/\S+\.md):(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(:pinned)?$"
+    r"^(docs/compliance/\S+\.md):((?i:check)[-_][A-Za-z0-9_-]+\.(?i:sh|py))(:pinned)?$", re.ASCII
 )
 # The two documents that cannot carry an erratum, each already guarded by another
 # gate: the SHA-256 declaration pin and the cert section 7 gate (#6173).
@@ -232,9 +238,11 @@ def tokens(line):
 def path_ok(root, target):
     """True when the root-relative ``target`` is exactly a file contained where it claims (#6216).
 
-    No ``.``/``..``/empty component, a regular file at that exact path (no basename search), and a
-    symlink only when it resolves inside scripts/ for a ``scripts/...`` target, else inside the
-    repository.
+    No ``.``/``..``/empty component, every component present under that exact name in its parent's
+    directory listing (#6220: a case-insensitive filesystem cannot turn ``CHECK-x.sh`` or
+    ``scripts/SUB/`` into an existing file), a regular file at that exact path (no basename
+    search), and a symlink only when it resolves inside scripts/ for a ``scripts/...`` target,
+    else inside the repository.
     """
     parts = target.split("/")
     if any(part in ("", ".", "..") for part in parts):
@@ -242,6 +250,11 @@ def path_ok(root, target):
     path = root.joinpath(*parts)
     base = root / "scripts" if parts[0] == "scripts" else root
     try:
+        parent = root
+        for part in parts:
+            if part not in os.listdir(str(parent)):
+                return False
+            parent = parent / part
         if not path.is_file():
             return False
         path.resolve().relative_to(base.resolve())
