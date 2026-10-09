@@ -156,6 +156,7 @@ import sys
 import tempfile
 import unicodedata
 import unittest
+import unittest.mock
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -4078,6 +4079,75 @@ class QueueRefDigitCap6244(unittest.TestCase):
         event = {"merge_group": {"head_sha": SHA_C, "head_ref": ref}}
         with self.assertRaises(ValueError):  # the mutant dies in int(); the live gate returns 1
             mod.run_gate("merge_group", event, REPO_6117, SHA_C, OPERATOR_6117, _fake_api([_pr(7, SHA_A)]))
+
+
+# ---- Round 4, item 6 (#6243): workflow-command data is escaped; fine-grained tokens are redacted ----
+
+PAT_6243 = "github_pat_" + "A1b2C3d4E5f6G7h8I9j0K1" + "_" + "x" * 40
+
+
+class WorkflowCommandEscaping6243(unittest.TestCase):
+    """Text the gate relays into ``::error::`` lines can never start another workflow command."""
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def failing_gate(self, message: str) -> List[str]:
+        def api(path: str):
+            raise self.mod.GateError(message)
+        _rc, lines = self.mod.run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, api)
+        return lines
+
+    def test_6243_forged_workflow_commands_in_relayed_text_are_neutralised(self) -> None:
+        for hostile in ("boom\n::error::forged", "boom\r::set-output name=x::y", "100% sure\n::add-mask::z",
+                        "boom\u2028::error::forged", "boom\x1b[31m red"):
+            with self.subTest(hostile=hostile):
+                lines = self.failing_gate(hostile)
+                self.assertEqual(1, len(lines), lines)
+                text = "".join(lines)
+                self.assertEqual(1, text.count("::error::"), text)
+                for bad in ("\n", "\r", "\x1b", "\u2028"):
+                    self.assertNotIn(bad, text)
+
+    def test_6243_percent_and_newlines_are_escaped_not_dropped(self) -> None:
+        text = self.failing_gate("a%b\nc\rd")[0]
+        self.assertIn("a%25b%0Ac%0Dd", text)
+
+    def test_6243_fine_grained_token_is_redacted(self) -> None:
+        text = self.failing_gate("HTTP 401 for " + PAT_6243)[0]
+        self.assertNotIn("github_pat_", text)
+        self.assertIn("[redacted]", text)
+
+    def test_6243_classic_tokens_are_still_redacted(self) -> None:
+        text = self.failing_gate("HTTP 401 for ghp_" + "a" * 36)[0]
+        self.assertNotIn("ghp_", text)
+
+    def test_6243_gh_stderr_is_escaped_and_redacted_end_to_end(self) -> None:
+        import types
+        hostile = "bad credentials " + PAT_6243 + "\x1b[0m\r::error::forged\nsecond line"
+
+        def fake_run(*_a, **_k):
+            return types.SimpleNamespace(returncode=1, stdout="", stderr=hostile)
+        with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+            _rc, lines = self.mod.run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, self.mod.gh_api)
+        text = "\n".join(lines)
+        self.assertEqual(1, len(lines), lines)
+        self.assertEqual(1, text.count("::error::"), text)
+        self.assertNotIn("github_pat_", text)
+        self.assertNotIn("\x1b", text)
+
+    def test_6243_m01_every_error_emission_uses_the_escaper(self) -> None:
+        src = APPROVAL_PY.read_text(encoding="utf-8")
+        self.assertNotRegex(src, r'f?"::error::')
+        self.assertGreaterEqual(src.count("workflow_error("), 3)
+        mutant = src.replace("def workflow_error(message):", "def workflow_error(message):\n    return '::error::' + message")
+        self.assertNotEqual(src, mutant)
+        mod = _exec_approval_src(mutant)
+
+        def api(path: str):
+            raise mod.GateError("x\n::error::forged")
+        _rc, lines = mod.run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, api)
+        self.assertIn("\n", "".join(lines))  # the mutant leaks the raw newline; the live module does not
 
 
 if __name__ == "__main__":
