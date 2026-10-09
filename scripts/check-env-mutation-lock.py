@@ -499,7 +499,7 @@ SELF_TEST_FIXTURE = {
 pub(crate) fn test_env_mutex() -> &'static std::sync::Mutex<()> { todo!() }
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    test_env_mutex().lock().unwrap()
+    test_env_mutex().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 pub fn production() { unsafe { std::env::set_var("PROD_OK", "1") }; }
 """,
@@ -522,7 +522,10 @@ mod tests {
     #[test]
     fn wrapper_guard() { let _g = lock(); unsafe { std::env::set_var("A", "1") }; }
     #[test]
-    fn raw_mutex() { let _g = raw().lock().unwrap(); let _s = Scope::set("B"); }
+    fn raw_mutex() {
+        let _g = raw().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _s = Scope::set("B");
+    }
     #[test]
     fn locked_chdir() { let _g = lock(); std::env::set_current_dir("/").unwrap(); }
     #[test]
@@ -539,6 +542,32 @@ mod tests {
     impl Drop for Held {
         fn drop(&mut self) { unsafe { std::env::remove_var("G") }; }
     }
+    #[test]
+    fn agent_id_under_lock_b() {
+        let _g = crate::identity::agent_id_env_test_lock();
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "x") };
+    }
+    #[test]
+    fn spawn_locks_inside() {
+        std::thread::spawn(|| {
+            let _g = lock();
+            unsafe { std::env::set_var("S", "1") };
+        });
+    }
+    #[test]
+    fn write_then_drop() { let g = lock(); unsafe { std::env::set_var("W", "1") }; drop(g); }
+    #[test]
+    fn nested_block_still_held() {
+        let _g = lock();
+        { if true { unsafe { std::env::set_var("N", "1") }; } }
+    }
+    struct Ctor { _g: std::sync::MutexGuard<'static, ()> }
+    impl Ctor {
+        fn new() -> Self { Ctor { _g: crate::config::test_env_lock() } }
+        fn poke(&self) { unsafe { std::env::set_var("CT", "1") }; }
+    }
+    #[test]
+    fn guard_type_acquires_in_ctor() { Ctor::new().poke(); }
     // a comment mentioning std::env::set_var("E", "1") is not a site
     #[test]
     fn string_is_not_a_site() { let _s = "std::env::set_var(\\"F\\", \\"1\\")"; }
@@ -571,6 +600,135 @@ mod tests {
     }
     #[test]
     fn unlocked_instance() { Leaky::new().poke(); }
+    #[test]
+    fn turbofish_site() { unsafe { std::env::set_var::<&str, &str>("BAD6", "1") }; }
+    #[test]
+    fn fn_pointer() {
+        let f = std::env::set_var::<&str, &str>;
+        let _ = f;
+    }
+    #[test]
+    fn block_released() {
+        { let _g = crate::config::test_env_lock(); }
+        unsafe { std::env::set_var("BAD7", "1") };
+    }
+    #[test]
+    fn drop_released() {
+        let g = crate::config::test_env_lock();
+        drop(g);
+        unsafe { std::env::set_var("BAD8", "1") };
+    }
+    #[test]
+    fn multiline_dropped() {
+        let _ =
+            crate::config::test_env_lock();
+        unsafe { std::env::set_var("BAD9", "1") };
+    }
+    #[test]
+    fn conditional_lock() {
+        if false { let _g = crate::config::test_env_lock(); }
+        unsafe { std::env::set_var("BAD10", "1") };
+    }
+    #[test]
+    fn lock_b_wrong_var() {
+        let _g = crate::identity::agent_id_env_test_lock();
+        unsafe { std::env::set_var("AI_MEMORY_DB", "1") };
+    }
+    #[test]
+    fn spawned_write() {
+        let _g = crate::config::test_env_lock();
+        std::thread::spawn(|| {
+            unsafe { std::env::set_var("BAD11", "1") };
+        });
+    }
+    fn mixed_helper() { unsafe { std::env::set_var("BAD12", "1") }; }
+    #[test]
+    fn mixed_locked_caller() { let _g = crate::config::test_env_lock(); mixed_helper(); }
+    #[test]
+    fn mixed_unlocked_caller() { mixed_helper(); }
+    #[test]
+    fn run_prefix_not_isolated() {
+        crate::config::run_x("x");
+        unsafe { std::env::set_var("BAD13", "1") };
+    }
+}
+""",
+    "src/alias.rs": """
+#[cfg(test)]
+mod tests {
+    use std::env::set_var as sv;
+    #[test]
+    fn via_alias() { unsafe { sv("X", "1") }; }
+}
+""",
+    "src/macro_site.rs": """
+#[cfg(test)]
+mod tests {
+    macro_rules! setx { () => { unsafe { std::env::set_var("X", "1") } }; }
+    #[test]
+    fn via_macro() { setx!(); }
+}
+""",
+    "src/guardty.rs": """
+#[cfg(test)]
+mod tests {
+    fn local() -> &'static std::sync::Mutex<()> {
+        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(()))
+    }
+    struct G { _g: std::sync::MutexGuard<'static, ()> }
+    impl G {
+        fn new() -> Self { G { _g: local().lock().unwrap_or_else(std::sync::PoisonError::into_inner) } }
+        fn poke(&self) { unsafe { std::env::set_var("X", "1") }; }
+    }
+    #[test]
+    fn via_foreign_guard() { G::new().poke(); }
+}
+""",
+    "src/pm.rs": """
+#[cfg(test)]
+#[path = "pm_extra_tests.rs"]
+mod extra;
+""",
+    "src/pm_extra_tests.rs": """
+fn path_helper() { unsafe { std::env::set_var("X", "1") }; }
+#[test]
+fn via_path_mount() { path_helper(); }
+""",
+    "src/m.rs": """
+#[cfg(test)]
+mod t;
+""",
+    "src/m/t.rs": """
+fn mounted_helper() { unsafe { std::env::set_var("X", "1") }; }
+#[test]
+fn mounted_test() { mounted_helper(); }
+""",
+    "src/bare.rs": """
+#[test]
+fn bare_test() { unsafe { std::env::set_var("X", "1") }; }
+""",
+    "src/poison.rs": """
+#[cfg(test)]
+mod tests {
+    fn w() -> &'static std::sync::Mutex<()> { crate::config::test_env_mutex() }
+    #[test]
+    fn poison_unwrap() {
+        let _g = w().lock().unwrap();
+        unsafe { std::env::set_var("X", "1") };
+    }
+    #[test]
+    fn poison_expect() {
+        let _g = crate::config::test_env_mutex().lock().expect("env");
+        unsafe { std::env::set_var("Y", "1") };
+    }
+}
+""",
+    "src/zbad.rs": """
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn zbad_test() { unsafe { std::env::set_var("X", "1") }; }
 }
 """,
 }
@@ -579,6 +737,16 @@ SELF_TEST_EXPECTED = {
     ("src/bad.rs", "module_local_lock"), ("src/bad.rs", "dropped_guard"),
     ("src/bad.rs", "lock_after"), ("src/bad.rs", "poke"),
     ("src/bad.rs", "unlocked_chdir"),
+    ("src/bad.rs", "turbofish_site"), ("src/bad.rs", "fn_pointer"),
+    ("src/bad.rs", "block_released"), ("src/bad.rs", "drop_released"),
+    ("src/bad.rs", "multiline_dropped"), ("src/bad.rs", "conditional_lock"),
+    ("src/bad.rs", "lock_b_wrong_var"), ("src/bad.rs", "spawned_write"),
+    ("src/bad.rs", "mixed_helper"), ("src/bad.rs", "run_prefix_not_isolated"),
+    ("src/alias.rs", "item_scope"), ("src/macro_site.rs", "item_scope"),
+    ("src/guardty.rs", "poke"), ("src/pm_extra_tests.rs", "path_helper"),
+    ("src/m/t.rs", "mounted_helper"), ("src/bare.rs", "bare_test"),
+    ("src/poison.rs", "poison_unwrap"), ("src/poison.rs", "poison_expect"),
+    ("src/zbad.rs", "zbad_test"), ("src/linked", "linked"),
 }
 
 
