@@ -1144,7 +1144,7 @@ pub struct ServeArgs {
     #[arg(long, requires = "tls_cert")]
     pub mtls_allowlist: Option<PathBuf>,
     /// Seconds to wait for in-flight requests to complete on graceful
-    /// shutdown (SIGINT). Default 30. Bumped from 10 in v0.6.0 because
+    /// shutdown (SIGINT, or SIGTERM on unix). Default 30. Bumped from 10 in v0.6.0 because
     /// large `/sync/push` batches can take longer than 10s under load
     /// (red-team #233).
     #[arg(long, default_value_t = 30)]
@@ -8109,6 +8109,16 @@ fn classify_server_failure(error: anyhow::Error) -> anyhow::Error {
 pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) -> Result<()> {
     init_tracing();
 
+    // #4072 — install the SIGTERM handler BEFORE bootstrap, so a stop that
+    // lands while the daemon is still coming up is queued for the graceful
+    // path below instead of taking the default action (death by signal, no
+    // drain, no final witness, no WAL checkpoint). A daemon that cannot
+    // install the handler it advertises refuses to start rather than run
+    // with a weaker shutdown contract than it documents.
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("serve: could not install the SIGTERM handler")?;
+
     let mut bootstrap = match bootstrap_serve(&db_path, &args, app_config).await {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
@@ -8248,8 +8258,8 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         }));
     }
 
-    // Graceful shutdown. The signal future only waits for ctrl_c and
-    // then resolves, which tells axum to begin graceful shutdown of
+    // Graceful shutdown. The signal future only waits for SIGINT or SIGTERM
+    // and then resolves, which tells axum to begin graceful shutdown of
     // in-flight requests. The deferred-audit drain + WAL checkpoint run
     // AFTER the server has fully quiesced (below `serve`), so:
     //   1. no refusal submitted by an in-flight request is lost, and
@@ -8263,6 +8273,16 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     let checkpoint_state = bootstrap.db_state.clone();
     let drain_metrics = bootstrap.deferred_audit_metrics.clone();
     let shutdown = async move {
+        // #4072 — SIGINT and (on unix) SIGTERM resolve the SAME future, so
+        // `docker stop`, Kubernetes and a plain `kill` take the graceful
+        // path, not the default action. Same shape as
+        // `cli::wake_hub::shutdown_signal`.
+        #[cfg(unix)]
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+        #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("shutting down — draining deferred-audit queue then checkpointing WAL");
     };
@@ -8308,7 +8328,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             let socket_addr: std::net::SocketAddr = addr.parse()?;
             // axum-server doesn't have a direct graceful-shutdown on the
             // TLS builder yet; spawn the signal listener on the Handle
-            // instead so ctrl_c triggers a graceful shutdown. Window is
+            // instead so either shutdown signal triggers a graceful shutdown. Window is
             // operator-configurable via --shutdown-grace-secs (default 30,
             // bumped from 10 in v0.6.0 — red-team #233).
             let grace = std::time::Duration::from_secs(args.shutdown_grace_secs);

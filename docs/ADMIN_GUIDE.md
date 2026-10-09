@@ -891,7 +891,8 @@ See [Database Management → Backup](#backup) and [Database Management → Resto
 
 ## Graceful Shutdown
 
-The HTTP daemon handles SIGINT (Ctrl+C) gracefully:
+The HTTP daemon handles SIGINT (Ctrl+C) and Unix SIGTERM gracefully; both
+signals enter the same drain path (#4072):
 
 1. Stops accepting new connections
 2. Waits for in-flight requests to complete
@@ -912,7 +913,7 @@ crash or `SIGKILL` skips this step: webhook deliveries that had not started
 are lost, and neither replay nor the DLQ shows them. Use the graceful stop
 path above.
 
-> **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
+> **Note:** The HTTP daemon handles SIGINT (Ctrl+C) and Unix SIGTERM gracefully, with the final witness and WAL checkpoint on either. Systemd sends SIGTERM by default -- the service file still sets `KillSignal=SIGINT`, and either signal now enters the same drain path. Containers and supervisors that send SIGTERM (`docker stop`, Kubernetes) must allow the same stop budget: at least 90 seconds with the default daemon settings (`docker stop --timeout 90`, `terminationGracePeriodSeconds: 90`); raise it if `--shutdown-grace-secs` is raised. The image declares `STOPSIGNAL SIGTERM` (#4072).
 
 The daemon exits with status **75 (`EX_TEMPFAIL`)** when it cannot certify a
 safe shutdown or safely drop its Tokio runtime. Before final certification,
@@ -1679,7 +1680,7 @@ SQLite WAL mode creates two additional files alongside the database:
 - `ai-memory.db-wal` -- write-ahead log
 - `ai-memory.db-shm` -- shared memory file
 
-Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint(TRUNCATE)` on SIGINT). If the daemon crashes, these files persist but are automatically recovered on next open.
+Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint(TRUNCATE)` on SIGINT or Unix SIGTERM). If the daemon crashes, these files persist but are automatically recovered on next open.
 
 ## HTTP API Endpoints
 
