@@ -537,6 +537,88 @@ class SpecialFilesAndTimeout6384M3(World):
         self.assertIn('not recorded', self.record(rc=0, run_id='200'))
 
 
+class DocsNotInRuntimeKey6384M4(World):
+    """r1 M4: changelog.d/**, docs/** and *.md leave the run-time key of a
+    binary whose sources never name them, so a docs-only change is a hit."""
+
+    def add_docs(self, tag):
+        (self.root / 'changelog.d').mkdir(exist_ok=True)
+        (self.root / 'docs' / 'ci').mkdir(parents=True, exist_ok=True)
+        (self.root / 'changelog.d' / '9999.changed.md').write_text(tag)
+        (self.root / 'docs' / 'ci' / 'notes.txt').write_text(tag)
+        (self.root / 'README.md').write_text(tag)
+
+    def test_base_digest_ignores_docs_changelog_and_markdown(self):
+        d0 = tbc.digest_runtime_tree(self.root, False)
+        self.add_docs('x')
+        self.assertEqual(d0, tbc.digest_runtime_tree(self.root, False))
+
+    def test_full_digest_still_sees_docs(self):
+        d0 = tbc.digest_runtime_tree(self.root, True)
+        self.add_docs('x')
+        self.assertNotEqual(d0, tbc.digest_runtime_tree(self.root, True))
+
+    def test_non_doc_file_still_changes_the_base_digest(self):
+        d0 = tbc.digest_runtime_tree(self.root, False)
+        (self.root / 'config.toml').write_text('x = 1\n')
+        self.assertNotEqual(d0, tbc.digest_runtime_tree(self.root, False))
+
+    def test_docs_only_change_is_a_hit_for_binaries_that_never_read_docs(self):
+        self.add_docs('v1')
+        self.green_run('100')
+        self.add_docs('v2')
+        out = self.plan(run_id='200', now=NOW + 60)
+        self.assertIn('skipped 3 of 3', out)
+
+    def test_binary_naming_changelog_reruns_on_a_changelog_change(self):
+        (self.root / 'tests' / 'b.rs').write_text('fn b() { let _ = std::fs::read_dir("changelog.d"); }\n')
+        self.add_docs('v1')
+        self.green_run('100')
+        self.add_docs('v2')
+        self.plan(run_id='200', now=NOW + 60)
+        self.assertEqual(self.list_text('parallel_2'), '--test b\n')
+        self.assertEqual(self.list_text('serial'), '')
+
+    def test_binary_naming_docs_in_a_string_reruns(self):
+        (self.root / 'tests' / 'b.rs').write_text('fn b() { let _ = std::path::Path::new("docs").join("x"); }\n')
+        self.add_docs('v1')
+        self.green_run('100')
+        self.add_docs('v2')
+        self.plan(run_id='200', now=NOW + 60)
+        self.assertEqual(self.list_text('parallel_2'), '--test b\n')
+
+    def test_mention_only_in_a_line_comment_does_not_count(self):
+        (self.root / 'tests' / 'b.rs').write_text('// see docs/ci/CARRIER-BRANCH-GATES.md\nfn b() {}\n')
+        self.add_docs('v1')
+        self.green_run('100')
+        self.add_docs('v2')
+        self.plan(run_id='200', now=NOW + 60)
+        self.assertEqual(self.list_text('parallel_2'), '')
+
+
+class DocsMatchHitCases6384M4(unittest.TestCase):
+    """r1 M4: the docs and the changelog describe the real hit cases."""
+
+    def test_changelog_names_pull_requests_into_release_only(self):
+        text = (REPO / 'changelog.d' / '6384.changed.md').read_text()
+        self.assertNotIn('chain push', text)
+        self.assertIn('pull request', text)
+        self.assertIn('release/**', text)
+        self.assertIn('never on release pushes', text.replace('\n', ' '))
+
+    def test_carrier_doc_has_no_chain_lookup_claim(self):
+        text = (REPO / 'docs' / 'ci' / 'CARRIER-BRANCH-GATES.md').read_text()
+        i = text.index('## Per-test-binary result cache (#6384)')
+        sec = text[i:]
+        nxt = sec.find('\n## ', 5)
+        sec = sec[:nxt] if nxt > 0 else sec
+        self.assertNotIn('`push` to `chain/**`', sec)
+        self.assertNotIn('green chain tip', sec)
+        self.assertNotIn('carried forward', sec)
+        self.assertIn('CI_TEST_BINARY_CACHE_LOOKUP', sec)
+        self.assertIn('never writes the manifest', sec.replace('\n', ' '))
+
+
 class Policy(unittest.TestCase):
     def test_allowed_matrix(self):
         on = {'CI_TEST_BINARY_CACHE': '1', 'CI_TEST_BINARY_CACHE_LOOKUP': '1'}
