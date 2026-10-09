@@ -162,6 +162,53 @@ pub(crate) async fn fanout_or_pending(
     }
 }
 
+/// #4079 / #4153 — fan a locally-committed DELETE out to peers on the
+/// federation delete lane (`sync_push.deletions`), the twin of
+/// [`fanout_or_pending`] for the SAL-store arms whose SQLite siblings have
+/// always called `broadcast_delete_quorum`. Returns `None` on full quorum
+/// (or when no federation is configured); on a quorum MISS returns the
+/// payload so the caller renders the W3/G12 `202` carrying its own
+/// `removed` / `deleted` fields through [`under_replicated_delete_response`]
+/// — the local erase already landed, and every peer that missed it has a
+/// push-DLQ row the replay worker re-delivers. Callers MUST invoke this only
+/// AFTER the SAL owner gate accepted the local delete, so an id the caller
+/// does not own is never fanned out. A network error is logged and
+/// swallowed (local commit landed; the sync daemon catches stragglers).
+pub(crate) async fn fanout_delete_or_pending(
+    app: &AppState,
+    id: &str,
+) -> Option<QuorumNotMetPayload> {
+    let fed = app.federation.as_ref().as_ref()?;
+    match crate::federation::broadcast_delete_quorum(fed, id).await {
+        Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
+            Ok(_) => None,
+            Err(err) => Some(QuorumNotMetPayload::from_err(&err)),
+        },
+        Err(e) => {
+            tracing::warn!("delete fanout error (local erase committed): {e:?}");
+            None
+        }
+    }
+}
+
+/// #4079 / #4153 — the `202` for a delete that committed locally but missed
+/// quorum: the [`under_replicated_response`] replication fields PLUS the
+/// route's own success fields (`extra`, e.g. `{"id": .., "removed": true}`),
+/// so the caller can see both that the local row IS gone and that a peer
+/// still holds it.
+pub(crate) fn under_replicated_delete_response(
+    payload: &QuorumNotMetPayload,
+    extra: serde_json::Map<String, serde_json::Value>,
+) -> axum::response::Response {
+    let mut body = extra;
+    body.insert("quorum_met".to_string(), json!(false));
+    body.insert("acks".to_string(), json!(payload.got));
+    body.insert("needed".to_string(), json!(payload.needed));
+    body.insert("reason".to_string(), json!(payload.reason));
+    body.insert("durability".to_string(), json!("local"));
+    (StatusCode::ACCEPTED, Json(serde_json::Value::Object(body))).into_response()
+}
+
 /// Helper — resolve the caller's `agent_id` using the HTTP precedence chain.
 ///
 /// # SECURITY (v0.7.0 — header-first; body and query must match)

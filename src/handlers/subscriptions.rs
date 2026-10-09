@@ -782,11 +782,27 @@ pub async fn unsubscribe(
         };
         return match target_id {
             Some(id) => match app.store.delete(&ctx, &id).await {
-                Ok(()) => (
-                    StatusCode::OK,
-                    Json(json!({"id": id, "removed": true, (field_names::STORAGE_BACKEND): "postgres"})),
-                )
-                    .into_response(),
+                Ok(()) => {
+                    // #4079 — the subscribe arm replicated this row to every
+                    // peer through the quorum store lane; withdraw it on the
+                    // delete lane the same way, AFTER the SAL owner gate
+                    // accepted the local delete. A quorum miss is the W3/G12
+                    // 202 (local row gone, peer still holds it, push-DLQ row
+                    // queued), never a bare success.
+                    let removed = json!({
+                        "id": id,
+                        "removed": true,
+                        (field_names::STORAGE_BACKEND): "postgres",
+                    });
+                    if let Some(payload) = super::fanout_delete_or_pending(&app, &id).await {
+                        let extra = removed
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default();
+                        return super::under_replicated_delete_response(&payload, extra);
+                    }
+                    (StatusCode::OK, Json(removed)).into_response()
+                }
                 Err(crate::store::StoreError::NotFound { .. }) => (
                     StatusCode::OK,
                     Json(json!({"id": id, "removed": false, (field_names::STORAGE_BACKEND): "postgres"})),
