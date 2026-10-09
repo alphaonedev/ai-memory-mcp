@@ -419,6 +419,13 @@ wf_fact() {
         }'
 }
 
+# conc_group <workflow-basename> — the top-level concurrency group expression,
+# from the gate's audited CONC record (raw, as rule (d) reads it).
+conc_group() {
+    RQC_WORKFLOW_DIR="$WF_DIR" bash "$GATE" --dump 2>/dev/null | awk -F'\t' -v w="$1" '
+        $1 == "CONC" && $2 == w { print $5 }'
+}
+
 # push_branches <workflow-path> — the gate's parser records only the
 # pull_request branch list, so read the push list directly.
 push_branches() {
@@ -494,20 +501,30 @@ for entry in "${DECIDERS[@]}"; do
     # Ratchet-shaped: the list must stay within the protected-branch patterns
     # below. `feat/v0.7.0-grand-slam` is a grandfathered LITERAL (a legacy pin
     # in coverage.yml), not a wildcard, so it cannot match a class of heads.
+    # `chain/**` (#6117) is the one PR-HEAD pattern admitted on push — the
+    # Promotion carrier is the head of its promotion PR (#6160) — and it is
+    # admitted ONLY while the workflow's cancel group is event-distinct (names
+    # `github.event_name`), so the push run and the PR run never share a group.
     pushb="$(push_branches "$WF_DIR/$dwf")"
+    group="$(conc_group "$dwf")"
     unexpected=""
     for tok in $(printf '%s' "$pushb" | tr -d '[]"' | tr ',' ' '); do
         case "$tok" in
             main | develop | 'release/**' | feat/v0.7.0-grand-slam) ;;
+            'chain/**')
+                case "$group" in
+                    *github.event_name*) ;;
+                    *) unexpected="$unexpected $tok(cancel-group-not-event-distinct)" ;;
+                esac ;;
             "") ;;
             *) unexpected="$unexpected $tok" ;;
         esac
     done
     if [ -z "$unexpected" ]; then
-        ok "C4 $dwf push branches are protected-branch-only ($pushb) — one run per SHA, no #2508 cancelled twin"
+        ok "C4 $dwf push branches are protected-branch-only plus chain/** under an event-distinct key ($pushb) — one run per SHA per event, no #2508 cancelled twin"
     else
         bad "C4 $dwf push: trigger gained branch pattern(s):$unexpected" \
-            "if any of those can match a PR HEAD branch, this context gets a duplicate CANCELLED check-run on every SHA (#2508) and must not stay a required context in that shape"
+            "if any of those can match a PR HEAD branch under a shared cancel group, this context gets a duplicate CANCELLED check-run on every SHA (#2508) and must not stay a required context in that shape"
     fi
 done
 
