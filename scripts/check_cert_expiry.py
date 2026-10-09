@@ -1895,6 +1895,12 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     shapes["newwf"] = pr("newwf", {".github/workflows/lint.yml": "name: lint\non: [pull_request]\njobs:\n"
                                    "  lint:\n    name: Lint\n    runs-on: ubuntu-latest\n"
                                    "    steps:\n      - run: echo lint\n"})
+    # #6175: names the change controls, carrying a newline / CR and a forged workflow command.
+    forged = "::error title=forged::"
+    shapes["log-watched"] = pr("log-watched", {f"src/federation/x\n{forged}y.rs": "fn x() {}\n"})
+    shapes["log-shadow"] = pr("log-shadow", {f".github/workflows/x\n{forged}.yml": f"name: {CERT_CONTEXT_FIXTURE}\n"})
+    shapes["log-who"] = pr("log-who", {wf_rel: "name: weakened (fixture)\n"},
+                           f"\n\nRule-Change-Approved-By: Evil\r{forged}x")
     # Merge-structure shapes off one PR head (#6138 cells, here in --trusted mode).
     fx.g("checkout", "-q", "-b", "h8", base)
     fx.write("src/unrelated.rs", "// h8 PR work\n", append=True)
@@ -2018,7 +2024,36 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     if rc == 0 or "--head-sha" not in out:
         t.fail(f"(tr-e-args): --trusted without --head-sha did not refuse (rc {rc}):", out)
     _trusted_round2_cells(tmp, t, judge, shapes, mirror, job)
+    _trusted_log_cells(t, judge, shapes)
     _trusted_merge_ref_cells(t, fx, mirror, head8, good8, unrel8)
+
+
+CERT_CONTEXT_FIXTURE = "Enterprise-federation cert-expiry gate (cert §7 / F7)"
+# Workflow commands this gate emits on purpose (annotation()); every other line
+# must not read as a command after the runner's leading-whitespace trim.
+OWN_COMMANDS = ("::warning title=GUARD CHANGED::", "::error title=cert-expiry trusted::")
+
+
+def _trusted_log_cells(t, judge, shapes):
+    """#6175: a name the change controls (a watched path, a workflow file name,
+    an approval trailer) is printed with its control characters escaped, so it
+    can never start a new step-log line that the runner reads as a workflow
+    command (`::error`, `::add-mask`, ...)."""
+    cells = (
+        ("tr-log-watched", "a watched path carrying a newline and a forged ::error", "log-watched", False,
+         "src/federation/x\\x0a::error title=forged::y.rs"),
+        ("tr-log-shadow", "a workflow file name carrying a newline and a forged ::error", "log-shadow", False,
+         ".github/workflows/x\\x0a::error title=forged::.yml"),
+        ("tr-log-who", "an approval trailer carrying a CR and a forged ::error", "log-who", True,
+         "Evil\\x0d::error title=forged::x"),
+    )
+    for label, why, key, ok, shown in cells:
+        out = judge(label, why, *shapes[key], ok=ok, needles=(shown,))
+        if "\r" in out:
+            t.fail(f"({label}): {why}: a raw carriage return reached the log:", out)
+        for line in out.splitlines():
+            if line.lstrip().startswith("::") and not line.lstrip().startswith(OWN_COMMANDS):
+                t.fail(f"({label}): {why}: the log line {line!r} reads as a workflow command", out)
 
 
 # #6176: the merge ref is re-fetched a fixed number of times with fixed sleeps.
