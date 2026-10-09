@@ -411,6 +411,62 @@ pub fn insert_pending_action_row(
 
 #[cfg(test)]
 mod tests {
+    /// #4379 — when a settled queue write FAILED, the rewritten refusal must
+    /// not forward the storage error chain to the remote caller (it reaches
+    /// HTTP 403 bodies and MCP error data): a FIXED phrase, the rule reason
+    /// kept, no pending id named. The chain is logged at ERROR by
+    /// `settle_frame`, the immediate path's posture.
+    #[test]
+    fn not_queued_refusal_hides_the_storage_chain_4379() {
+        let reason = "R-4379 escalate rule reason";
+        let deferred = super::deferred_refusal_text("pid-4379", reason);
+        let mut err = anyhow::Error::new(crate::storage::GovernanceRefusal { reason: deferred });
+        let internal = "UNIQUE constraint failed: pending_actions.id (database is locked)";
+        let outcomes = vec![(
+            "pid-4379".to_string(),
+            Err(super::QueueWriteError::Insert(internal.to_string())),
+        )];
+        super::resolve_refusal(&mut err, &outcomes);
+        let refusal = err
+            .downcast_ref::<crate::storage::GovernanceRefusal>()
+            .expect("still a governance refusal");
+        // The fixed caller phrase (the production const duplicates it; test
+        // code is outside the literal gate and must compile on the pre-fix
+        // tree for the red run).
+        let fixed = "escalation NOT queued (storage error; see server log)";
+        assert!(
+            refusal.reason.starts_with(fixed),
+            "fixed phrase expected, got: {}",
+            refusal.reason
+        );
+        assert!(
+            !refusal.reason.contains("UNIQUE constraint") && !refusal.reason.contains("locked"),
+            "the storage chain must not reach the caller: {}",
+            refusal.reason
+        );
+        assert!(
+            refusal.reason.ends_with(reason) && !refusal.reason.contains("pending_id="),
+            "rule reason kept, no phantom id: {}",
+            refusal.reason
+        );
+        // Every failure class renders the same caller text (no variant leaks
+        // its internals either).
+        for failure in [
+            super::QueueWriteError::TxnNotEnded,
+            super::QueueWriteError::Forced,
+        ] {
+            let mut err = anyhow::Error::new(crate::storage::GovernanceRefusal {
+                reason: super::deferred_refusal_text("pid-4379", reason),
+            });
+            super::resolve_refusal(&mut err, &[("pid-4379".to_string(), Err(failure))]);
+            let text = err
+                .downcast_ref::<crate::storage::GovernanceRefusal>()
+                .map(|r| r.reason.clone())
+                .expect("refusal");
+            assert_eq!(text, format!("{fixed}: {reason}"));
+        }
+    }
+
     /// Vote item 5(a) — a leaked `WriteTxn` whose frame still holds a deferred
     /// escalation is detected when the next transaction opens on the database.
     #[test]
