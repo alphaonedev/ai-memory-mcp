@@ -162,8 +162,12 @@ DETAILS_OPEN_RE = re.compile(r"<details(?![A-Za-z0-9-])", re.IGNORECASE)
 # The document skeleton (#6214): what a renderer drops between the letters of a name. A
 # comment (``<!-->``, ``<!--->`` included; group 1, its closer found by ``skeleton_spans``), a
 # tag with quoted attribute values, a code-span backtick, a link or image opener, and a link
-# closer, with its inline destination and title when ``(`` follows (group 2, ``link_tail_end``).
-SKELETON_RE = re.compile(r"(<!--)|" + TAG + r"|`|!?\[|(\]\()|\]")
+# closer, with its inline destination and title when ``(`` follows (group 2, ``link_tail_end``) or its
+# reference label when ``[`` follows (group 3, #6416).
+SKELETON_RE = re.compile(r"(<!--)|" + TAG + r"|`|!?\[|(\]\()|(\]\[)|\]")
+# The rest of a full or collapsed reference link after ``][`` (#6416): a label of up to 999 characters,
+# line breaks included, holding no unescaped bracket, and its closing bracket.
+LABEL_TAIL_RE = re.compile(r"(?:\\[\s\S]|[^\[\]\\]){0,999}\]")
 # An inline link destination in angle brackets, and the characters that end or nest a bare one.
 ANGLE_DEST_RE = re.compile(r"<(?:\\(?:\r\n|[\s\S])|[^<>\\\r\n])*>")
 DEST_STOP_RE = re.compile(r"[()\\ \t\r\n]")
@@ -436,6 +440,9 @@ def skeleton_spans(text):
         elif m.group(2):
             tail = link_tail_end(text, end, memo, cache)
             end = start + 1 if tail < 0 else tail
+        elif m.group(3):
+            label = LABEL_TAIL_RE.match(text, end)
+            end = start + 1 if label is None else label.end()
         yield start, end
         pos = end
 
