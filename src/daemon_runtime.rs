@@ -11739,6 +11739,109 @@ mod tests {
         }
     }
 
+    /// #4067 — the erasure-outbox drainability marker must track the ONLY
+    /// consumer of the outbox, the federation push-DLQ replay worker, which
+    /// `bootstrap_serve` spawns ONLY when `--catchup-interval-secs > 0`.
+    /// Pre-fix the marker was derived from "federation configured + sqlite"
+    /// alone, so a federated sqlite `serve` with interval `0` logged that
+    /// MCP/CLI erasures were ENABLED for fan-out, every CLI/MCP erasure on
+    /// that file queued an outbox row, and nothing ever drained it: a false
+    /// capability claim and an unbounded, never-propagating erasure queue.
+    ///
+    /// Runs in a clean child of the test binary (the #3152 shape) so the
+    /// `standard` posture a federated library boot needs is set on the
+    /// child's `Command`, never on this process's shared environment.
+    #[cfg(all(feature = "sal", unix))]
+    #[tokio::test]
+    async fn erasure_outbox_marker_tracks_the_replay_worker_4067() {
+        use crate::recover::in_tx_fault::{
+            CHILD_MARKER_ENV, CHILD_ROLE_ENV, child_role_is, child_var,
+        };
+        const ROLE: &str = "erasure-outbox-marker-4067";
+        const TEST_PATH: &str =
+            "daemon_runtime::tests::erasure_outbox_marker_tracks_the_replay_worker_4067";
+        if !child_role_is(ROLE) {
+            let dir = tempfile::Builder::new()
+                .prefix("erasure-outbox-4067-")
+                .tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/.local-runs"))
+                .expect("tempdir under .local-runs");
+            let marker = dir.path().join("done-4067");
+            let out = crate::test_support::spawn_test_child(
+                TEST_PATH,
+                &[
+                    (CHILD_ROLE_ENV, ROLE),
+                    (CHILD_MARKER_ENV, &marker.to_string_lossy()),
+                    (crate::security_profile::ENV_SECURITY_PROFILE, "standard"),
+                ],
+            );
+            let detail = format!(
+                "status={:?}\nstdout={}\nstderr={}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "the #4067 child failed: {detail}");
+            assert_eq!(
+                std::fs::read_to_string(&marker).ok().as_deref(),
+                Some(ROLE),
+                "the #4067 child never ran its body: {detail}"
+            );
+            return;
+        }
+        // #3539 — plain-sqlite boot: hold the passphrase window.
+        let _no_pass = crate::test_support::no_passphrase_guard();
+        let env = TestEnv::fresh();
+        let mut cfg = AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        let mut args = args_with_db(&env.db_path);
+        args.quorum_writes = 1;
+        args.quorum_peers = vec!["https://127.0.0.1:65531".to_string()];
+        args.quorum_timeout_ms = 100;
+
+        // CONTROL — a positive interval spawns the replay worker, so the
+        // marker is stamped: MCP/CLI erasures on this file WILL drain.
+        args.catchup_interval_secs = crate::SECS_PER_HOUR as u64;
+        let bs = bootstrap_serve(&env.db_path, &args, &cfg).await.unwrap();
+        assert!(bs.app_state.federation.is_some());
+        {
+            let guard = bs.app_state.db.lock().await;
+            assert!(
+                crate::federation::erasure_outbox::is_drainable(&guard.0),
+                "control: a federated sqlite serve with a replay worker stamps the marker"
+            );
+        }
+        for h in bs.task_handles {
+            h.abort();
+        }
+
+        // RESTART positive -> zero: no replay worker is spawned, so the
+        // marker must be REMOVED (not merely left from the previous boot)
+        // and an erasure queued on this file must be refused.
+        args.catchup_interval_secs = 0;
+        let bs = bootstrap_serve(&env.db_path, &args, &cfg).await.unwrap();
+        assert!(bs.app_state.federation.is_some());
+        {
+            let guard = bs.app_state.db.lock().await;
+            assert!(
+                !crate::federation::erasure_outbox::is_drainable(&guard.0),
+                "#4067: --catchup-interval-secs=0 spawns no replay worker, so the \
+                 drainability marker must not claim erasures propagate"
+            );
+            assert!(
+                !crate::federation::erasure_outbox::enqueue_erasure(
+                    &guard.0,
+                    "erasure-4067-nobody-drains-this",
+                    crate::federation::erasure_outbox::surfaces::MCP_DELETE,
+                ),
+                "#4067: with no drainer an erasure must not be queued forever"
+            );
+        }
+        for h in bs.task_handles {
+            h.abort();
+        }
+        std::fs::write(child_var(CHILD_MARKER_ENV), ROLE).expect("write the #4067 done marker");
+    }
+
     #[tokio::test]
     async fn test_bootstrap_serve_federation_invalid_peer_errors() {
         // #3700 — a library boot with explicit peers / mTLS is FLEET-shaped;
