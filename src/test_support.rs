@@ -29,6 +29,7 @@
 //! (#1998 -> #2115 -> #2127).
 
 pub(crate) mod exit_cleanup;
+#[cfg(unix)]
 mod leak_guard_6266;
 pub(crate) mod sqlite_tempfile;
 pub(crate) use sqlite_tempfile::SqliteTempFile;

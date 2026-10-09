@@ -41,16 +41,10 @@ fn leftovers(dir: &Path) -> Vec<String> {
 
 #[test]
 fn issue_6266_lib_tests_leave_no_scratch_in_tmpdir() {
-    let exe = std::env::current_exe().expect("current_exe for #6266 leak guard");
     let scratch = tempfile::tempdir().expect("#6266 private TMPDIR");
+    let scratch_str = scratch.path().to_str().expect("utf-8 scratch path");
     for exact in LEAKING_TESTS {
-        let output =
-            crate::spawn_audit::audited_command(exe.clone(), "test_support::leak_guard_6266")
-                .args(["--exact", exact, "--test-threads=1"])
-                .env("TMPDIR", scratch.path())
-                .env("AI_MEMORY_NO_CONFIG", "1")
-                .output()
-                .expect("spawn #6266 leak-guard child");
+        let output = super::spawn_test_child(exact, &[("TMPDIR", scratch_str)]);
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success() && stdout.contains("1 passed"),
