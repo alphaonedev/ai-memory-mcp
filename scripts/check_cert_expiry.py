@@ -4,7 +4,7 @@
 """CI gate for the enterprise-federation certification section 7 expiry trigger.
 
 Ported from scripts/check-cert-expiry.sh (#6137, per the operator's standing
-Python-not-shell rule). F7 / 2026-08-12 ratification caveat, #3556.
+Python-not-shell rule). F7 / 2026-08-12 ratification caveat, #3556, #6137.
 
 THE DEFECT CLASS THIS CLOSES. docs/compliance/ENTERPRISE-FEDERATION-
 CERTIFICATION.md section 7 states that the certification "expires on any
@@ -37,8 +37,19 @@ Failure message (required wording):
   expires per its section 7 -> re-issue or void the cert doc in this same change.
 
 RANGE RESOLUTION.
-  pull_request     PR_BASE_SHA + PR_HEAD_SHA (fail-closed if base is missing or
-                   merge-base is unresolvable after a shallow deepen).
+  pull_request     (#6137) The job checks out the pull_request MERGE commit
+                   (GITHUB_SHA). The gate judges (B) and (C) at that merge
+                   commit, never at the PR head in isolation, so a branch cut
+                   before the carrier's banner fix is judged on the tree that
+                   would actually merge. The merge-base is computed against
+                   the LIVE base ref (`git merge-base origin/$GITHUB_BASE_REF
+                   $PR_HEAD_SHA`, fetching that ref explicitly when absent),
+                   NOT the event payload's PR_BASE_SHA, which can be stale.
+                   Drift detection (A) runs over merge-base..merge-commit.
+                   Fail-closed when GITHUB_BASE_REF / PR_HEAD_SHA are unset,
+                   the base ref cannot be fetched, a sha does not resolve, the
+                   merge commit does not descend from PR_HEAD_SHA, or the
+                   merge-base is unresolvable after a shallow deepen.
   push             github.event.before .. GITHUB_SHA. An all-zero `before`
                    (new branch / first push) is N/A-skip, never a false-fail.
   workflow_dispatch / other / empty
@@ -491,8 +502,31 @@ def resolve_range(repo, env):
         return env["CERT_EXPIRY_BASE"], env.get("CERT_EXPIRY_HEAD") or "HEAD", None
 
     if event == "pull_request":
-        base = _need(env, "PR_BASE_SHA", "a pull_request event")
-        return base, env.get("PR_HEAD_SHA") or "HEAD", None
+        # #6137: judge the merge commit the job checked out, against the LIVE
+        # base ref, not the (possibly stale) payload PR_BASE_SHA.
+        head = _need(env, "PR_HEAD_SHA", "a pull_request event")
+        base_ref = _need(env, "GITHUB_BASE_REF", "a pull_request event")
+        base = resolve_live_base(repo, base_ref)
+        tip = env.get("GITHUB_SHA") or "HEAD"
+        if not is_commit(repo, head):
+            ensure_commit(repo, head)
+        if not is_commit(repo, head):
+            raise GateError(f"PR_HEAD_SHA {head} does not resolve to a commit (fail-closed)")
+        if not is_commit(repo, tip):
+            raise GateError(f"merge commit {tip} does not resolve to a commit (fail-closed)")
+        if run_git(repo, "merge-base", "--is-ancestor", head, tip).returncode != 0:
+            raise GateError(
+                f"merge commit {tip} does not descend from PR_HEAD_SHA {head}; "
+                "refusing to judge a tree that is not the PR's merge result (fail-closed)"
+            )
+        stale = env.get("PR_BASE_SHA", "")
+        if stale and stale != base:
+            print(
+                f"{PREFIX}: note — payload PR_BASE_SHA {stale} differs from the live "
+                f"base origin/{base_ref} {base}; using the live base (#6137)",
+                file=sys.stderr,
+            )
+        return base, head, tip
 
     if event == "push":
         before = env.get("GITHUB_EVENT_BEFORE", "")
@@ -885,6 +919,105 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     ])
     fx.reset(base)
 
+    # ---- #6137: pull_request judged at the merge commit ----------------------
+    # History: base (LIVE bound genesis) -> stale_tip (wire change W landed with
+    # no re-issue: banner LIVE with drift, the pre-#6121 carrier state). The
+    # feature branch is cut at stale_tip. The live base then heals to EXPIRED.
+    fx.write(mod_rs, "// W: wire change, banner not re-issued\n", append=True)
+    stale_tip = fx.commit([mod_rs], "carrier before the banner fix: wire change, banner still LIVE")
+    fx.g("checkout", "-q", "-b", "feature", stale_tip)
+    fx.write("src/unrelated.rs", "// feature work\n", append=True)
+    feature = fx.commit(["src/unrelated.rs"], "feature: unrelated change on a stale branch")
+    fx.g("checkout", "-q", "main")
+    fx.banner("EXPIRED", genesis)
+    healed_base = fx.commit([CERT_DOC], "carrier banner fix: record EXPIRED (#6121 shape)")
+    fx.g("update-ref", "refs/remotes/origin/main", healed_base)
+    pr_merge = fx.merge("feature", "Merge feature into main (pull_request merge commit)")
+
+    # (pr1) GREEN at the merge commit; RED if judged at the head in isolation
+    #       (the old semantics), proving the two differ on this very history.
+    t.expect_green("pr1", "stale-LIVE head banner with base banner EXPIRED, judged at the merge commit",
+                   repo, healed_base, feature, [
+        ("federation-wire surface unchanged", "did not pass at the merge commit"),
+        ("banner STATUS=EXPIRED", "did not read the EXPIRED banner at the merge commit"),
+    ], tip=pr_merge)
+    t.expect_red("pr1-head", "head-only judgment of the same stale branch (old semantics)", repo,
+                 healed_base, feature, [
+        ("while its banner still says LIVE", "did not show the stale-LIVE head failure"),
+    ])
+    pr_env = _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=feature,
+                       GITHUB_BASE_REF="main", GITHUB_SHA=pr_merge, PATH=os.environ.get("PATH", ""))
+    rc, out, err = run_gate(repo, pr_env)
+    if rc != 0:
+        t.fail("(pr1-gate): pull_request event on the stale branch did not pass end to end:", out + err)
+
+    # (pr3) the payload PR_BASE_SHA is stale (genesis); the LIVE base ref wins.
+    captured = io.StringIO()
+    with contextlib.redirect_stderr(captured):
+        rc, out, err = run_gate(repo, dict(pr_env, PR_BASE_SHA=genesis))
+    err = err + captured.getvalue()
+    if rc != 0:
+        t.fail("(pr3): a stale payload PR_BASE_SHA broke the pull_request verdict:", out + err)
+    elif f"unchanged in {stale_tip}..{pr_merge}" not in out:
+        t.fail("(pr3): the live base was NOT used (merge-base should be the stale branch point):", out)
+    elif "using the live base" not in err:
+        t.fail("(pr3): the stale payload base was not reported:", err)
+
+    # (pr3b) the stale payload base would have given a different range: prove
+    #        the verdict text changes if the stale sha were honoured.
+    stale_text = check_change(repo, genesis, feature, pr_merge)[1]
+    if f"unchanged in {genesis}.." in stale_text:
+        t.fail("(pr3b): control: stale-base range unexpectedly reads as unchanged", stale_text)
+
+    # (pr2) the head FLIPS the banner (voiding record + wire change) while the
+    #       live base has moved on: detected over merge-base..merge-commit.
+    fx.reset(base)
+    fx.g("checkout", "-q", "-b", "flip", base)
+    fx.write(mod_rs, "// flip branch wire change\n", append=True)
+    fx.banner("VOID", genesis)
+    flip = fx.commit([mod_rs, CERT_DOC], "flip: wire change + VOID record")
+    fx.g("checkout", "-q", "main")
+    fx.write("src/unrelated.rs", "// base moved\n", append=True)
+    moved_base = fx.commit(["src/unrelated.rs"], "base moves on with an unrelated change")
+    fx.g("update-ref", "refs/remotes/origin/main", moved_base)
+    flip_merge = fx.merge("flip", "Merge flip into main")
+    t.expect_green("pr2", "head that flips the banner (VOID) with the base moved on", repo,
+                   moved_base, flip, [
+        ("cert doc re-issued/voided", "did not detect the banner flip over merge-base..merge-commit"),
+        (f"{base}..{flip_merge}", "did not measure merge-base..merge-commit"),
+    ], tip=flip_merge)
+    # (pr2b) the same wire change WITHOUT the banner flip is still RED there.
+    fx.reset(moved_base)
+    fx.g("checkout", "-q", "-b", "noflip", base)
+    fx.write(mod_rs, "// noflip branch wire change\n", append=True)
+    noflip = fx.commit([mod_rs], "noflip: wire change, no cert-doc change")
+    fx.g("checkout", "-q", "main")
+    noflip_merge = fx.merge("noflip", "Merge noflip into main")
+    t.expect_red("pr2b", "wire change without a banner flip over a moved base", repo, moved_base,
+                 noflip, [
+        (sentence, "did not carry the required §7 expiry sentence"),
+        (mod_rs, "did not name the watched path"),
+        ("judged at the pull_request merge commit", "did not say it judged the merge commit"),
+    ], tip=noflip_merge)
+
+    # (pr4) pull_request fail-closed cells.
+    pr_base_env = _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=feature,
+                            GITHUB_BASE_REF="main", GITHUB_SHA=pr_merge,
+                            PATH=os.environ.get("PATH", ""))
+    closed = {
+        "no GITHUB_BASE_REF": {k: v for k, v in pr_base_env.items() if k != "GITHUB_BASE_REF"},
+        "no PR_HEAD_SHA": {k: v for k, v in pr_base_env.items() if k != "PR_HEAD_SHA"},
+        "unresolvable PR_HEAD_SHA": dict(pr_base_env, PR_HEAD_SHA="1" * 40),
+        "unresolvable merge commit": dict(pr_base_env, GITHUB_SHA="2" * 40),
+        "merge commit not descending from the head": dict(pr_base_env, GITHUB_SHA=base),
+        "base ref neither local nor fetchable": dict(pr_base_env, GITHUB_BASE_REF="no-such-branch"),
+        "option-shaped base ref": dict(pr_base_env, GITHUB_BASE_REF="--upload-pack=x"),
+    }
+    for why, env in closed.items():
+        rc, _out, _err = run_gate(repo, env)
+        if rc == 0:
+            t.fail(f"(pr4): pull_request with {why} did not fail closed")
+
     # (k) fail-closed - pull_request with nothing set (missing PR sha / base ref).
     rc, _o, _e = run_gate(repo, {"GITHUB_EVENT_NAME": "pull_request"})
     if rc == 0:
@@ -949,7 +1082,11 @@ SELF_TEST_OK = (
     "fail-closed; (x1) decoy STATUS line above the banner RED (exactly-one rule); (x2) decoy "
     "Binds-to line RED; (y) cert doc deleted alongside a wire change RED (ABSENT fails closed); "
     "(z) pure banner reformat on a docs-only change GREEN (tolerant parse); (z2) reformat + "
-    "wire change RED as incidental, not unparseable"
+    "wire change RED as incidental, not unparseable; (pr1) #6137 stale-LIVE head banner with "
+    "the base EXPIRED GREEN at the merge commit (and RED if judged at the head alone); (pr2) "
+    "head that flips the banner detected over merge-base..merge-commit, and a wire change "
+    "without the flip RED; (pr3) stale payload PR_BASE_SHA ignored, the live base ref used; "
+    "(pr4) pull_request fail-closed on missing/unresolvable base ref, head or merge commit."
 )
 
 
