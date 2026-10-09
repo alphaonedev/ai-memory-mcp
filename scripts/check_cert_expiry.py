@@ -2874,11 +2874,12 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     # #6175: names the change controls, carrying a newline / CR and a forged workflow command.
     forged = "::error title=forged::"
     shapes["log-watched"] = pr("log-watched", {f"src/federation/x\n{forged}y.rs": "fn x() {}\n"})
-    shapes["log-shadow"] = pr("log-shadow", {f".github/workflows/x\n{forged}.yml": f"name: {CERT_CONTEXT_FIXTURE}\n"})
+    shapes["log-shadow"] = pr("log-shadow", {f".github/workflows/x\n{forged}.yml": f"name: {CERT_CONTEXT_FIXTURE}\r# cr\u00a0\n"})
     shapes["log-who"] = pr("log-who", {wf_rel: "name: weakened (fixture)\n"},
                            f"\n\nRule-Change-Approved-By: Evil\r{forged}x")
     _round3_shapes(repo, shapes, pr, approve, wf_rel, c8_rel)
     _round4_shapes(shapes, pr, approve, wf_rel, c8_rel)
+    _round5_shapes(shapes, pr, approve, wf_rel, c8_rel)
     # Merge-structure shapes off one PR head (#6138 cells, here in --trusted mode).
     fx.g("checkout", "-q", "-b", "h8", base)
     fx.write("src/unrelated.rs", "// h8 PR work\n", append=True)
@@ -3006,6 +3007,7 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     _trusted_merge_ref_cells(t, fx, mirror, head8, good8, unrel8)
     _trusted_round3_cells(tmp, t, judge, shapes)
     _trusted_round4_cells(judge, shapes)
+    _trusted_round5_cells(judge, shapes)
     _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8)
 
 
@@ -3318,6 +3320,8 @@ def _round4_shapes(shapes, pr, approve, wf_rel, c8_rel):
         "ps-c8": ({c8_rel: _hidden_job(C8_FIXTURE, C8_GATE_LAST, " ")}, approve),
         "cr-trusted": ({wf_rel: _hidden_job(trusted_pr, TRUSTED_WF_LAST, "\r")}, approve),
         "nel-trusted": ({wf_rel: _hidden_job(trusted_pr, TRUSTED_WF_LAST, "\x85")}, approve),
+        "sep-trusted": ({wf_rel: _hidden_job(trusted_pr, TRUSTED_WF_LAST, "\u2028")}, approve),
+        "ps-trusted": ({wf_rel: _hidden_job(trusted_pr, TRUSTED_WF_LAST, "\u2029")}, approve),
         "lb-other": ({".github/workflows/lb.yml": ok_wf.replace("on: [push]\n", "on: [push] ", 1)}, approve),
         "crlf-c8": ({c8_rel: C8_FIXTURE.replace("\n", "\r\n")}, approve),
         "merge": ({c8_rel: C8_FIXTURE.replace(named, named + "    <<: {timeout-minutes: 5}\n", 1)}, approve),
@@ -3349,6 +3353,54 @@ def _round4_shapes(shapes, pr, approve, wf_rel, c8_rel):
         shapes["r4-" + key] = pr("r4-" + key, edits, trailer_msg)
 
 
+NBSP_FLOW = ("name: ws\non: [push]\njobs:\n  shadow: {{runs-on: ubuntu-latest, steps: [{{run: 'echo\n"
+             "{ch}#x'}}], name: Enterprise-federation cert-expiry gate (cert \xa77 / F7)}}\n")
+
+
+def _round5_shapes(shapes, pr, approve, wf_rel, c8_rel):
+    """#6140 round 5 shapes (security review R4 SR4-1, #6304): Unicode
+    whitespace that YAML keeps as content, leading a `#` line the scan used to
+    drop as a comment, in a workflow that is not an own file and inside the
+    own file c8-precheck.yml."""
+    ok_wf = ("name: ws\non: [push]\njobs:\n  ws:\n    runs-on: ubuntu-latest\n"
+             "    steps:\n      - run: echo ws\n")
+    r5 = {
+        "nbsp": ({".github/workflows/ws-nbsp.yml": NBSP_FLOW.format(ch="\u00a0")}, ""),
+        "ideo": ({".github/workflows/ws-ideo.yml": NBSP_FLOW.format(ch="\u3000")}, ""),
+        "ff": ({".github/workflows/ws-ff.yml": NBSP_FLOW.format(ch="\x0c")}, ""),
+        "vt": ({".github/workflows/ws-vt.yml": NBSP_FLOW.format(ch="\x0b")}, ""),
+        "nbsp-quoted": ({".github/workflows/ws-q.yml": ok_wf.replace(
+            "echo ws", 'echo "a\u00a0b"', 1)}, ""),
+        "tabcomment": ({".github/workflows/ws-tab.yml": ok_wf.replace("name: ws\n", "name: ws   \n", 1).replace(
+            "jobs:\n", "\t# a tab-indented comment   \njobs:\n", 1).replace(
+            "ubuntu-latest\n", "ubuntu-latest   \n", 1)}, ""),
+        "nbsp-block-c8": ({c8_rel: C8_FIXTURE.replace(
+            C8_GATE_LAST, C8_GATE_LAST + "      - run: |\n          echo x\n\u00a0\n          ? k\n", 1)}, approve),
+    }
+    for key, (edits, trailer_msg) in r5.items():
+        shapes["r5-" + key] = pr("r5-" + key, edits, trailer_msg)
+
+
+def _trusted_round5_cells(judge, shapes):
+    """#6140 round 5 (security review R4 SR4-1, #6304): the blank and comment
+    tests use YAML whitespace only (space, tab), so a line led by NBSP, U+3000
+    or FF is scanned, and any other whitespace character in a workflow file is
+    refused as GUARD SHADOW (RED even WITH the trailer, no waiver)."""
+    shadow = "GUARD SHADOW: "
+    ws = "a whitespace character other than space or tab"
+    for key, code, scanned in (("nbsp", "U+00A0", True), ("ideo", "U+3000", True), ("ff", "U+000C", True), ("vt", "U+000B", True)):
+        judge(f"tr-s-{key}", f"a second producer on a {code}-led line of a new workflow, NO trailer",
+              *shapes["r5-" + key], needles=(shadow + f".github/workflows/ws-{key}.yml", ws, code,
+                                              "(workflow header): names the required check"))
+    judge("tr-s-nbsp-quoted", "U+00A0 only inside a quoted value of a workflow that is not an own file",
+          *shapes["r5-nbsp-quoted"], needles=(shadow + ".github/workflows/ws-q.yml", ws, "U+00A0"))
+    judge("tr-s-tabcomment", "control: a tab-indented comment and trailing spaces", *shapes["r5-tabcomment"],
+          ok=True, absent=(shadow,))
+    judge("tr-s-nbsp-block-c8", "a U+00A0-only line ends a block scalar of c8-precheck.yml, WITH the trailer",
+          *shapes["r5-nbsp-block-c8"],
+          needles=(shadow + PINNED_TRUSTED_JOB[0], ws, "complex key", "Selftest Approver"))
+
+
 def _trusted_round4_cells(judge, shapes):
     """#6140 round 4 (code review R3-1/R3-2, security review R3-1/R3-2, #6228):
     a second producer behind a YAML line break other than LF in an own job
@@ -3359,7 +3411,7 @@ def _trusted_round4_cells(judge, shapes):
     c8, wf = PINNED_TRUSTED_JOB[0], PINNED_TRUSTED_PATHS[1]
     lb = "a YAML line break other than LF"
     for key, where in (("cr-c8", c8), ("sep-c8", c8), ("nel-c8", c8), ("ps-c8", c8),
-                       ("cr-trusted", wf), ("nel-trusted", wf)):
+                       ("cr-trusted", wf), ("nel-trusted", wf), ("sep-trusted", wf), ("ps-trusted", wf)):
         # The trusted workflow is guarded whole, so its edit also prints the waived GUARD CHANGED.
         judge(f"tr-s-{key}", f"a second producer behind a non-LF YAML line break ({key}) WITH the trailer",
               *shapes["r4-" + key], needles=(shadow + where, lb, "(job 'shadow')")
@@ -3628,7 +3680,12 @@ SELF_TEST_OK = (
     "quoted scalar spanning lines (value or node), complex key, second jobs: key, an own job body not indented "
     "by 4 and a merge key after a block scalar each RED with the trailer; a name fragment split after 9 "
     "characters and a section-sign-only fragment RED; a failed update-ref -d stopping before any fetch and "
-    "git's fetch stderr escaped."
+    "git's fetch stderr escaped; (tr round 5, #6304) a second producer on a NBSP, U+3000, FF or VT "
+    "led line of a new workflow, a Unicode whitespace character only inside a quoted value, and a "
+    "NBSP-only line ending a block scalar of c8-precheck.yml RED (no trailer needed; not waivable) "
+    "while a tab-indented comment and trailing spaces stay GREEN; (tr round 5, #6228) a second producer "
+    "joined by LS or PS in the trusted workflow RED with the trailer, and a hostile workflow file "
+    "name printed escaped by both the line-break and the shadow messages."
 )
 
 
