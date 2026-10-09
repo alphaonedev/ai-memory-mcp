@@ -102,6 +102,16 @@ each unit is and WHAT is substituted into it:
     registry login, version, image build, provenance attestation), each with its
     exact keys, its ``uses`` pinned to a SHA constant, its ``with:`` inputs and
     its run text. No step can be added, removed, reordered or changed.
+  * The ``reproducible:`` job (#3613) is pinned WHOLE the same way (``REPRO_JOB``
+    / ``REPRO_STEPS``: checkout, toolchain, the two-build proof step, no cache
+    step, no ``if:``, no job ``env:``): it builds the x86_64-unknown-linux-gnu
+    binary twice from the verified SHA in two workspaces through
+    ``scripts/release/reproducible_build.py`` and fails on any byte
+    difference. The release build unit exports the same deterministic inputs
+    (``EPOCH_STATEMENTS``: SOURCE_DATE_EPOCH = the tagged commit's timestamp;
+    ``REMAP_STATEMENTS``: the workspace and CARGO_HOME remapped out of the
+    binary), so the proof is about the configuration the shipped binary is
+    built with.
   * Permissions, secrets and the registry. The top-level ``permissions:`` is
     exactly ``contents: write`` and every job's ``permissions:`` is pinned
     (``RELEASE_JOB_PERMISSIONS``; ``packages: write`` exists in the docker job
@@ -226,8 +236,16 @@ PACKAGE_DIST = 'dist/${{ matrix.artifact }}'
 PACKAGE_CHECK = ('test "$packaged_sha256" = "$ASSERTED_SHA256" || { echo "::error::' + PACKAGE_DIST
                  + ' ($packaged_sha256) is not the binary the strict assert checked ($ASSERTED_SHA256)"; exit 1; }')
 
+# #3613: the release build's deterministic inputs. The SBOM step already pinned
+# the epoch; the build step exports the same one plus path remapping, and the
+# `reproducible` job (REPRO_STEPS) builds twice with exactly these inputs.
+EPOCH_STATEMENTS = ('SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"', "export SOURCE_DATE_EPOCH")
+REMAP_STATEMENTS = ('RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"',
+                    "export RUSTFLAGS")
+
 # The exact statements (after normalisation) of each unit that decides what ships.
-WF_BUILD = ("set -euo pipefail", BIND_INPUTS, ALLOWED_FEATURES, 'test -n "$FEATURES"', BUILD_CMD)
+WF_BUILD = (("set -euo pipefail", BIND_INPUTS) + EPOCH_STATEMENTS + REMAP_STATEMENTS
+            + (ALLOWED_FEATURES, 'test -n "$FEATURES"', BUILD_CMD))
 WF_ASSERT = ("set -euo pipefail", BIND_INPUTS, ALLOWED_BIN, ALLOWED_REQUIRE, 'test -n "$REQUIRE_FLAGS"',
              ASSERT_WORKFLOW) + ASSERT_RECORD
 WF_PACKAGE = (
@@ -240,10 +258,7 @@ WF_PACKAGE = (
     "cd dist",
     'tar czf "ai-memory-${{ matrix.target }}.tar.gz" "${{ matrix.artifact }}"',
 )
-WF_SBOM = (
-    "set -euo pipefail",
-    'SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"',
-    "export SOURCE_DATE_EPOCH",
+WF_SBOM = ("set -euo pipefail",) + EPOCH_STATEMENTS + (
     ALLOWED_FEATURES,
     'test -n "$FEATURES"',
     SBOM_CMD,
@@ -486,10 +501,38 @@ RELEASE_TOP_PERMISSIONS: Dict[str, Spec] = {"contents": "write"}
 _SIGN = {"contents": "write", "id-token": "write", "attestations": "write"}
 _READ_ATTEST = {"contents": "read", "attestations": "read"}
 _READ = {"contents": "read"}
+# The reproducible job is pinned WHOLE (#3613): the proof is worth exactly as
+# much as the independence of its two builds, so no cache step, no job `env:`,
+# no `if:` and no step the guard did not read can reach it.
+REPRO_JOB: Dict[str, Spec] = {
+    "name": "Reproducible build proof (x86_64-unknown-linux-gnu, two builds)",
+    "needs": Flow("preflight, qualify, supply-chain"),
+    "runs-on": "ubuntu-latest",
+    "timeout-minutes": "120",
+    "permissions": dict(_READ),
+}
+REPRO_TARGET = "x86_64-unknown-linux-gnu"
+REPRO_BIND = "git diff --quiet HEAD -- scripts/release-features.sh scripts/release/reproducible_build.py"
+REPRO_PROOF = ('python3 scripts/release/reproducible_build.py --target ' + REPRO_TARGET
+               + ' --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b"')
+REPRO_STEPS: List[Spec] = [
+    {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
+    {"name": "Install Rust 1.98.0", "uses": RUST_TOOLCHAIN_USES, "with": {"toolchain": "1.98.0"}},
+    {"name": "Build twice from two workspaces and compare (#3613)", "shell": "bash", "run": Block((
+        "set -euo pipefail",
+        "# #4768 — the declaration and the proof script are HEAD's.",
+        REPRO_BIND,
+        ALLOWED_FEATURES,
+        'test -n "$FEATURES"',
+        REPRO_PROOF,
+    ))},
+]
+REPRO_STEP_ROLES = ("checkout", "toolchain", "two-build proof")
 RELEASE_JOB_PERMISSIONS: Dict[str, Dict[str, Spec]] = {
     "preflight": dict(_READ),
     "qualify": {"contents": "read", "checks": "read", "actions": "read"},
     "supply-chain": dict(_READ),
+    "reproducible": dict(_READ),
     "release": dict(_SIGN),
     "sbom": dict(_SIGN),
     "mobile-ios": dict(_SIGN),
@@ -1252,10 +1295,9 @@ def pin_message(label: str, why: str, const: str) -> str:
     return f"{label}: {why}{pin_hint(const)}"
 
 
-def docker_step_message(step: Node, spec: Spec, n: int) -> str:
-    """The one message for docker job step ``n`` ("" when it is the pinned step)."""
-    return pinned_step_message(step, spec, f"jobs.docker.steps.{n + 1}", f"release.yml ({DOCKER_STEP_ROLES[n]} step)",
-                               "DOCKER_STEPS")
+def whole_step_message(step: Node, spec: Spec, n: int, job: str, roles: Tuple[str, ...], const: str) -> str:
+    """The one message for step ``n`` of whole-pinned job ``job`` ("" when it is the pinned step)."""
+    return pinned_step_message(step, spec, f"jobs.{job}.steps.{n + 1}", f"release.yml ({roles[n]} step)", const)
 
 
 def pinned_step_message(step: Node, spec: Spec, at: str, role: str, const: str) -> str:
@@ -1277,43 +1319,60 @@ def pinned_step_message(step: Node, spec: Spec, at: str, role: str, const: str) 
     return pin_message(role, why, const) if why else ""
 
 
-def check_docker_job(jobs: Node, rep: Report) -> None:
-    """The docker job holds `packages: write`, so it is pinned WHOLE: its keys and
-    values (DOCKER_JOB) and its exact ordered steps (DOCKER_STEPS: keys, SHA-pinned
-    `uses`, `with:` inputs, run text). No `env:`, `container:`, `defaults:`,
-    `services:`, `strategy:` or extra step can be added."""
-    job = jobs.get("docker")
-    if job is None or job.kind != "map":
-        rep.bad("release.yml: the `docker:` job is missing or not a mapping (the GHCR image is built and pushed only by "
-                "the pinned `docker:` job)")
+def check_whole_job(jobs: Node, job: str, job_spec: Dict[str, Spec], job_const: str, steps_spec: List[Spec],
+                    steps_const: str, roles: Tuple[str, ...], why: Tuple[str, str, str], rep: Report) -> None:
+    """A job pinned WHOLE: its keys and values (``job_spec``) and its exact
+    ordered steps (``steps_spec``: keys, SHA-pinned `uses`, `with:` inputs, run
+    text). No `env:`, `container:`, `defaults:`, `services:`, `strategy:` or
+    extra step can be added. ``why`` = the (missing job, extra key, extra step)
+    message tails."""
+    node = jobs.get(job)
+    if node is None or node.kind != "map":
+        rep.bad(f"release.yml: the `{job}:` job is missing or not a mapping ({why[0]})")
         return
-    want_keys = set(DOCKER_JOB) | {"steps"}
-    if set(job.keys()) != want_keys:
-        extra, lost = sorted(set(job.keys()) - want_keys), sorted(want_keys - set(job.keys()))
-        rep.bad(pin_message("release.yml", f"`jobs.docker` keys differ from the pinned set (extra {extra}, missing "
-                            f"{lost}; a job `env:`, `container:`, `defaults:`, `services:` or `strategy:` changes what is "
-                            "built or pushed)", "DOCKER_JOB"))
-    for key, spec in DOCKER_JOB.items():
-        why = pin_problem(job.get(key), spec, f"jobs.docker.{key}")
-        if why:
-            rep.bad(pin_message("release.yml", why, "DOCKER_JOB"))
-    steps = job.get("steps")
+    want_keys = set(job_spec) | {"steps"}
+    if set(node.keys()) != want_keys:
+        extra, lost = sorted(set(node.keys()) - want_keys), sorted(want_keys - set(node.keys()))
+        rep.bad(pin_message("release.yml", f"`jobs.{job}` keys differ from the pinned set (extra {extra}, missing "
+                            f"{lost}; {why[1]})", job_const))
+    for key, spec in job_spec.items():
+        problem = pin_problem(node.get(key), spec, f"jobs.{job}.{key}")
+        if problem:
+            rep.bad(pin_message("release.yml", problem, job_const))
+    steps = node.get("steps")
     items = steps.value if steps is not None and steps.kind == "seq" and isinstance(steps.value, list) else None
     if items is None:
-        rep.bad(pin_message("release.yml", "`jobs.docker.steps` must be a sequence", "DOCKER_STEPS"))
+        rep.bad(pin_message("release.yml", f"`jobs.{job}.steps` must be a sequence", steps_const))
         return
-    if len(items) != len(DOCKER_STEPS):
-        first = next((n for n in range(max(len(items), len(DOCKER_STEPS)))
-                      if n >= len(items) or n >= len(DOCKER_STEPS) or docker_step_message(items[n], DOCKER_STEPS[n], n)),
-                     0)
-        rep.bad(pin_message("release.yml", f"the docker job has {len(items)} steps, the pinned list has "
-                            f"{len(DOCKER_STEPS)} (an extra step can build or push an image the guard never read); the "
-                            f"first difference is step {first + 1}", "DOCKER_STEPS"))
+    if len(items) != len(steps_spec):
+        first = next((n for n in range(max(len(items), len(steps_spec)))
+                      if n >= len(items) or n >= len(steps_spec)
+                      or whole_step_message(items[n], steps_spec[n], n, job, roles, steps_const)), 0)
+        rep.bad(pin_message("release.yml", f"the {job} job has {len(items)} steps, the pinned list has "
+                            f"{len(steps_spec)} ({why[2]}); the first difference is step {first + 1}", steps_const))
         return
-    for n, (step, spec) in enumerate(zip(items, DOCKER_STEPS)):
-        msg = docker_step_message(step, spec, n)
+    for n, (step, spec) in enumerate(zip(items, steps_spec)):
+        msg = whole_step_message(step, spec, n, job, roles, steps_const)
         if msg:
             rep.bad(msg)
+
+
+def check_docker_job(jobs: Node, rep: Report) -> None:
+    """The docker job holds `packages: write`, so it is pinned WHOLE (DOCKER_JOB /
+    DOCKER_STEPS)."""
+    check_whole_job(jobs, "docker", DOCKER_JOB, "DOCKER_JOB", DOCKER_STEPS, "DOCKER_STEPS", DOCKER_STEP_ROLES, (
+        "the GHCR image is built and pushed only by the pinned `docker:` job",
+        "a job `env:`, `container:`, `defaults:`, `services:` or `strategy:` changes what is built or pushed",
+        "an extra step can build or push an image the guard never read"), rep)
+
+
+def check_repro_job(jobs: Node, rep: Report) -> None:
+    """The reproducible job is pinned WHOLE (#3613, REPRO_JOB / REPRO_STEPS): the
+    two builds it compares must be independent and unconditional."""
+    check_whole_job(jobs, "reproducible", REPRO_JOB, "REPRO_JOB", REPRO_STEPS, "REPRO_STEPS", REPRO_STEP_ROLES, (
+        "the two-build byte-identity proof runs only in the pinned `reproducible:` job, #3613",
+        "a job `env:`, `if:`, `continue-on-error:`, `container:` or `strategy:` can skip or alter the proof",
+        "an extra step can restore a cache into, or replace, a build the proof compares"), rep)
 
 
 def check_release_permissions(doc: Node, jobs: Node, rep: Report) -> None:
@@ -1473,6 +1532,7 @@ def check_release_yml(text: str, rep: Report) -> None:
     if want_kind(sbom, "map", "release.yml `jobs.sbom`", rep) and sbom is not None:
         check_sbom_job(sbom, rep)
     check_docker_job(jobs, rep)
+    check_repro_job(jobs, rep)
 
 
 def docker_nearest(builder: List[str]) -> str:
@@ -2840,7 +2900,7 @@ def self_test(root: Path) -> int:
         # checkout); here it is replaced so the declaration abort stays what is
         # measured.
         build_body = ("\n".join(WF_BUILD).replace("${{ matrix.target }}", "x").replace("cargo build", "echo cargo-build")
-                      .replace(BIND_INPUTS, "true"))
+                      .replace(BIND_INPUTS, "true").replace(EPOCH_STATEMENTS[0], "SOURCE_DATE_EPOCH=1"))
         docker_body = (
             DOCKER_RUN[len("RUN ") :]
             .replace("cargo build", "echo cargo-build")
