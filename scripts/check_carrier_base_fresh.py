@@ -28,7 +28,14 @@ started" and makes a stale green detectable by a re-run (a re-run of a
 pull_request job reuses the same GITHUB_SHA, so it re-fetches the live tip and
 turns RED if the base has moved). It cannot close "job finished -> merge click"
 on its own; that needs the carrier ruleset in docs/ci/CARRIER-BRANCH-GATES.md
-(strict required status checks), which is a repository-settings change.
+(strict required status checks), which is a repository-settings change
+applied by ai:god-f2 (#6182).
+
+ADVISORY until required. This job blocks nothing until (a) the carrier
+ruleset requires this context (#6182) AND (b) the #6140 trusted base-copy
+posture covers this job: a pull_request run executes the PR's own copy of
+this script and of the job, so a PR that edits the gate is judged by its
+own edit.
 
 Exit: 0 pass / N/A, 1 gate failure, 2 usage.
 """
@@ -147,7 +154,8 @@ def _commit(repo, name):
 
 
 def self_test():
-    scratch_root = os.environ.get("TMPDIR") or str(REPO_ROOT / ".local-runs")
+    # F7 (#6143 r2): never an inherited TMPDIR (it may be /tmp or a tmpfs).
+    scratch_root = str(REPO_ROOT / ".local-runs")
     Path(scratch_root).mkdir(parents=True, exist_ok=True)
     failures = []
 

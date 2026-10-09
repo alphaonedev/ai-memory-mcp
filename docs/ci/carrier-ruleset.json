@@ -1,0 +1,202 @@
+{
+  "name": "carrier-branches-strict-checks",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/heads/chain/**",
+        "refs/heads/rehearsal/**"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "do_not_enforce_on_create": true,
+        "required_status_checks": [
+          {
+            "context": "Classify changes",
+            "integration_id": 15368
+          },
+          {
+            "context": "Lint (fmt + clippy)",
+            "integration_id": 15368
+          },
+          {
+            "context": "actionlint (workflow-injection guard)",
+            "integration_id": 15368
+          },
+          {
+            "context": "MSRV (Rust 1.98)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Postgres feature gate",
+            "integration_id": 15368
+          },
+          {
+            "context": "SAL-only feature gate",
+            "integration_id": 15368
+          },
+          {
+            "context": "vectorlite feature gate",
+            "integration_id": 15368
+          },
+          {
+            "context": "Dockerfile build (no push)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Check (ubuntu-latest,sqlite)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Check (linux-fed,enterprise-fed)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Check (macos-fed,sqlite)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Check (macos-fed,enterprise-fed)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Cross-compile (aarch64-apple-ios)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Cross-compile (aarch64-linux-android)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Build-script custom-build ledger gate (#2635)",
+            "integration_id": 15368
+          },
+          {
+            "context": "C8 caller-context allowlist check",
+            "integration_id": 15368
+          },
+          {
+            "context": "Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)",
+            "integration_id": 15368
+          },
+          {
+            "context": "L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Hardcoded-literal duplication ratchet (pm-v3.1)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Docs vs SSOT drift gate",
+            "integration_id": 15368
+          },
+          {
+            "context": "Cloud-init ASCII gate",
+            "integration_id": 15368
+          },
+          {
+            "context": "Test-reachable stdin-read gate (#1989)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Migration-ladder-uniqueness gate (guardrail-D)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Test-env $HOME-lock gate (#2146)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Installer checksum fail-closed gate (#2449)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Non-Rust conformance-reader proof gate (#2452)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Required-context + classify-base soundness gate (#2494/#2496/#2508)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Git-dependency-source supply-chain gate (#2050/#2512)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Coverage classify (docs-only short-circuit)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Per-Module Coverage Thresholds",
+            "integration_id": 15368
+          },
+          {
+            "context": "Doc symbol/path anchor gate (#2629)",
+            "integration_id": 15368
+          },
+          {
+            "context": "SDK-path vs routes.rs membership gate (#2629)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Named-CI-job existence + enforcement-truthfulness gate (#2629)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Doc surface completeness gate (#2839)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Capacity-claim ceiling gate (#2869)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Benchmark-claim canon gate (#2879)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Enterprise-federation cert-expiry gate (cert §7 / F7)",
+            "integration_id": 15368
+          },
+          {
+            "context": "External-PR operator-approval gate (author outside team => @alphaonedev review)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Postgres ignored tests (sal-postgres --ignored)",
+            "integration_id": 15368
+          },
+          {
+            "context": "URL-sink redaction gate (#3688 / #3967)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Stale contract-assertion gate (#3688 / #3967)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Claude plugin manifest gate (#3967)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Carrier-base freshness gate (#6143)",
+            "integration_id": 15368
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1173,9 +1173,11 @@ jobs:
     # Closing "job finished -> merge click" needs the carrier ruleset documented
     # in docs/ci/CARRIER-BRANCH-GATES.md (a repository-settings change).
     # No `needs:`, no job-level `if:`, no `paths:` filter: always reports.
-    # Python runs with `-I` (precedent #5163). Deliberately unrequired at
-    # introduction (required-contexts-not-required.txt); promoted by the #3554
-    # lockstep once the carrier ruleset exists.
+    # Python runs with `-I` (precedent #5163). Advisory: never a release/v1.0.0
+    # context (required-contexts-not-required.txt, permanently); declared in
+    # scripts/qc-allowlists/required-contexts-carrier.txt and enforced only by
+    # the carrier ruleset once ai:god-f2 applies it (#6182). Runs the PR's own
+    # copy under pull_request (#6140 class).
     name: Carrier-base freshness gate (#6143)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1191,6 +1193,30 @@ jobs:
         run: python3 -I scripts/check_carrier_base_fresh.py
       - name: Self-test the gate (regression evidence)
         run: python3 -I scripts/check_carrier_base_fresh.py --self-test
+
+  carrier-ruleset-live-gate:
+    # #6143 item 3 / #6182. Read-only (GET) comparison of the LIVE repository
+    # rulesets with the committed carrier ruleset payload
+    # (docs/ci/carrier-ruleset.json) and the carrier context declaration
+    # (scripts/qc-allowlists/required-contexts-carrier.txt), so a removed or
+    # weakened carrier rule is RED once the state file says `applied`. While
+    # the state is `pending-apply` and tracking issue #6182 is OPEN, an absent
+    # ruleset is a WARN (UNPROTECTED) and rc 0; every other case fails closed.
+    # Decision: 5-agent vote (4d3ea1c5), memory a03dd15d. The Actions token
+    # cannot see bypass_actors: reported UNVERIFIED here; ai:god-f2 verifies
+    # with --require-full-view. Advisory (not-required ledger) until #6182.
+    # No `needs:`, no job-level `if:`, no `paths:` filter: always reports.
+    name: Carrier-ruleset live verifier (#6143)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify the live carrier ruleset (read-only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I scripts/check_carrier_ruleset_live.py
+      - name: Self-test the verifier (regression evidence)
+        run: python3 -I scripts/check_carrier_ruleset_live.py --self-test
 
   foreign-text-to-caller-gate:
     # #3688 gate 7 (Conductor ruling on the reviewer-f2r secret-to-sink sweep,

@@ -274,11 +274,11 @@ fn run_verifier(
     Ok((out.status.code().unwrap_or(-1), text))
 }
 
-fn expect(name: &str, got: (i32, String), rc: i32, needle: &str) -> TestResult {
-    if got.0 != rc || !got.1.contains(needle) {
+fn expect(name: &str, got: &(i32, String), rc: i32, needle: &str) -> TestResult {
+    let (got_rc, got_text) = got;
+    if *got_rc != rc || !got_text.contains(needle) {
         return Err(format!(
-            "{name}: rc={} (want {rc}), output must contain {needle:?}; got:\n{}",
-            got.0, got.1
+            "{name}: rc={got_rc} (want {rc}), output must contain {needle:?}; got:\n{got_text}"
         ));
     }
     Ok(())
@@ -419,7 +419,7 @@ fn carrier_state_marker_names_tracking_issue_6143() -> TestResult {
     Ok(())
 }
 
-/// F2: a c8 job runs the verifier on every PR (ledgered, GH_TOKEN plumbed).
+/// F2: a c8 job runs the verifier on every PR (ledgered, `GH_TOKEN` plumbed).
 #[test]
 fn workflow_runs_carrier_ruleset_verifier_6143() -> TestResult {
     let wf = workflow()?;
@@ -467,7 +467,7 @@ fn verifier_rejects_weakened_carrier_rulesets_6143() -> TestResult {
     let good = live_from_payload()?;
     expect(
         "applied+good",
-        run_verifier("good", &serde_json::json!([good]), "applied", "open", &[])?,
+        &run_verifier("good", &serde_json::json!([good]), "applied", "open", &[])?,
         0,
         "carrier-ruleset-live: OK",
     )?;
@@ -476,7 +476,7 @@ fn verifier_rejects_weakened_carrier_rulesets_6143() -> TestResult {
     v["conditions"]["ref_name"]["exclude"] = serde_json::json!(["refs/heads/chain/promo6-ssh"]);
     expect(
         "exclude",
-        run_verifier("exclude", &serde_json::json!([v]), "applied", "open", &[])?,
+        &run_verifier("exclude", &serde_json::json!([v]), "applied", "open", &[])?,
         1,
         "exclude",
     )?;
@@ -485,7 +485,7 @@ fn verifier_rejects_weakened_carrier_rulesets_6143() -> TestResult {
     v["bypass_actors"] = serde_json::json!([{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]);
     expect(
         "bypass",
-        run_verifier("bypass", &serde_json::json!([v]), "applied", "open", &[])?,
+        &run_verifier("bypass", &serde_json::json!([v]), "applied", "open", &[])?,
         1,
         "bypass_actors",
     )?;
@@ -494,7 +494,7 @@ fn verifier_rejects_weakened_carrier_rulesets_6143() -> TestResult {
     rsc_params(&mut v)?["required_status_checks"][0]["integration_id"] = serde_json::json!(999);
     expect(
         "integration",
-        run_verifier(
+        &run_verifier(
             "integration",
             &serde_json::json!([v]),
             "applied",
@@ -512,7 +512,7 @@ fn verifier_rejects_weakened_carrier_rulesets_6143() -> TestResult {
         .remove("do_not_enforce_on_create");
     expect(
         "create",
-        run_verifier("create", &serde_json::json!([v]), "applied", "open", &[])?,
+        &run_verifier("create", &serde_json::json!([v]), "applied", "open", &[])?,
         1,
         "do_not_enforce_on_create",
     )?;
@@ -521,7 +521,7 @@ fn verifier_rejects_weakened_carrier_rulesets_6143() -> TestResult {
     rsc_params(&mut v)?["strict_required_status_checks_policy"] = serde_json::json!(false);
     expect(
         "strict",
-        run_verifier("strict", &serde_json::json!([v]), "applied", "open", &[])?,
+        &run_verifier("strict", &serde_json::json!([v]), "applied", "open", &[])?,
         1,
         "strict_required_status_checks_policy",
     )?;
@@ -533,7 +533,7 @@ fn verifier_rejects_weakened_carrier_rulesets_6143() -> TestResult {
         .pop();
     expect(
         "missing ctx",
-        run_verifier("missing", &serde_json::json!([v]), "applied", "open", &[])?,
+        &run_verifier("missing", &serde_json::json!([v]), "applied", "open", &[])?,
         1,
         "contexts",
     )?;
@@ -544,7 +544,7 @@ fn verifier_rejects_weakened_carrier_rulesets_6143() -> TestResult {
         .remove("bypass_actors");
     expect(
         "hidden bypass",
-        run_verifier(
+        &run_verifier(
             "hidden",
             &serde_json::json!([v.clone()]),
             "applied",
@@ -556,7 +556,7 @@ fn verifier_rejects_weakened_carrier_rulesets_6143() -> TestResult {
     )?;
     expect(
         "hidden bypass strict",
-        run_verifier(
+        &run_verifier(
             "hidden-strict",
             &serde_json::json!([v]),
             "applied",
@@ -576,19 +576,19 @@ fn verifier_pending_state_machine_6143() -> TestResult {
     let none = serde_json::json!([]);
     expect(
         "pending+absent+open",
-        run_verifier("p-open", &none, "pending-apply", "open", &[])?,
+        &run_verifier("p-open", &none, "pending-apply", "open", &[])?,
         0,
         "UNPROTECTED",
     )?;
     expect(
         "pending+absent+closed",
-        run_verifier("p-closed", &none, "pending-apply", "closed", &[])?,
+        &run_verifier("p-closed", &none, "pending-apply", "closed", &[])?,
         1,
         &format!("#{TRACKING_ISSUE}"),
     )?;
     expect(
         "pending+live",
-        run_verifier(
+        &run_verifier(
             "p-live",
             &serde_json::json!([good.clone()]),
             "pending-apply",
@@ -603,7 +603,7 @@ fn verifier_pending_state_machine_6143() -> TestResult {
     rsc_params(&mut renamed)?["strict_required_status_checks_policy"] = serde_json::json!(false);
     expect(
         "pending+weak renamed",
-        run_verifier(
+        &run_verifier(
             "p-weak",
             &serde_json::json!([renamed]),
             "pending-apply",
@@ -615,13 +615,13 @@ fn verifier_pending_state_machine_6143() -> TestResult {
     )?;
     expect(
         "applied+absent",
-        run_verifier("a-absent", &none, "applied", "open", &[])?,
+        &run_verifier("a-absent", &none, "applied", "open", &[])?,
         1,
         "no carrier ruleset",
     )?;
     expect(
         "bogus state",
-        run_verifier("bogus", &none, "later", "open", &[])?,
+        &run_verifier("bogus", &none, "later", "open", &[])?,
         1,
         "state",
     )
