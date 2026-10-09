@@ -1925,8 +1925,8 @@ impl OllamaClient {
     /// # Errors
     ///
     /// Returns an error if the `/api/tags` listing fails, the response
-    /// JSON cannot be parsed, the pull-client cannot be built, or the
-    /// pull request fails.
+    /// JSON cannot be parsed, or the pull request fails (both go through
+    /// the client's admission policy, #4048).
     pub async fn ensure_model_async(&self) -> Result<()> {
         if matches!(self.provider, LlmProvider::OpenAiCompatible { .. }) {
             return Ok(());
@@ -1969,13 +1969,14 @@ impl OllamaClient {
         );
 
         let pull_url = join_api_path(&self.base_url, OLLAMA_PULL_PATH);
-        let pull_client = reqwest::Client::builder()
-            .timeout(PULL_TIMEOUT)
-            .build()
-            .context("Failed to build pull client")?;
-
-        let resp = pull_client
+        // #4048 — the pull goes through the SAME admitted client as every
+        // other request (the #3822 pin, the #4193 proxy / redirect refusal);
+        // a fresh client here carried no admission policy at all. The
+        // per-request timeout overrides the client's for this request only.
+        let resp = self
+            .client
             .post(&pull_url)
+            .timeout(PULL_TIMEOUT)
             .json(&json!({ "name": self.model }))
             .send()
             .await
@@ -3093,8 +3094,8 @@ impl OllamaClient {
     /// # Errors
     ///
     /// Returns an error if the `/api/tags` listing fails, the JSON
-    /// parse fails, the pull client cannot be built, or the
-    /// `/api/pull` request fails (network or non-2xx response).
+    /// parse fails, or the `/api/pull` request fails (network or non-2xx
+    /// response; both go through the client's admission policy, #4048).
     pub async fn ensure_embed_model_async(&self, model: &str) -> Result<()> {
         if matches!(self.provider, LlmProvider::OpenAiCompatible { .. }) {
             return Ok(());
@@ -3130,12 +3131,12 @@ impl OllamaClient {
 
         tracing::info!("Pulling Ollama embedding model '{}'...", model);
         let pull_url = join_api_path(&self.base_url, OLLAMA_PULL_PATH);
-        let pull_client = reqwest::Client::builder()
-            .timeout(PULL_TIMEOUT)
-            .build()
-            .context("Failed to build pull client")?;
-        let resp = pull_client
+        // #4048 — same admitted client as the listing above (see
+        // `ensure_model_async`); the per-request timeout bounds the pull.
+        let resp = self
+            .client
             .post(&pull_url)
+            .timeout(PULL_TIMEOUT)
             .json(&json!({ "name": model }))
             .send()
             .await
