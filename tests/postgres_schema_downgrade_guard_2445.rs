@@ -345,3 +345,52 @@ async fn pg_exact_version_hatch_admits_and_skips_the_bootstrap_replay_2445() {
 
     scratch.destroy().await;
 }
+
+/// #2554 (postgres twin, host-run) — the sqlite fix makes the bootstrap atomic
+/// with the ladder; postgres needs no change because every rung commits its own
+/// transaction together with its OWN `schema_version` row, so `MAX(version)`
+/// only ever names the last COMPLETED rung. Pin that ledger shape: an upgrade
+/// from `tip - 1` appends exactly the tip row and keeps the prior one.
+#[tokio::test]
+async fn pg_upgrade_appends_one_stamp_row_per_completed_rung_2554() {
+    let Some(admin_url) = postgres_url() else {
+        eprintln!(
+            "skip: AI_MEMORY_TEST_POSTGRES_URL unset (role needs CREATEDB — each test \
+             builds and drops its own throwaway database)"
+        );
+        return;
+    };
+    let _g = env_lock().await;
+    // SAFETY: process-wide env mutation, serialised by `_g`.
+    unsafe { std::env::remove_var(ENV_ALLOW_SCHEMA_AHEAD) };
+
+    let scratch = ScratchDb::create(&admin_url, "rungs").await;
+    drop(
+        PostgresStore::connect(&scratch.url)
+            .await
+            .expect("greenfield connect must succeed"),
+    );
+    stamp(&scratch.url, tip() - 1).await;
+    drop(
+        PostgresStore::connect(&scratch.url)
+            .await
+            .expect("an upgrade from tip - 1 must succeed"),
+    );
+
+    let pool = admin_pool(&scratch.url).await;
+    let rows: Vec<i32> = sqlx::query_scalar("SELECT version FROM schema_version ORDER BY version")
+        .fetch_all(&pool)
+        .await
+        .expect("read schema_version ledger");
+    pool.close().await;
+    scratch.destroy().await;
+
+    let want: Vec<i32> = [tip() - 1, tip()]
+        .into_iter()
+        .map(|v| i32::try_from(v).expect("version fits in the int4 column"))
+        .collect();
+    assert_eq!(
+        rows, want,
+        "each completed rung must append its own stamp row (honest MAX(version))"
+    );
+}
