@@ -42,14 +42,17 @@ from those crates, the kept bins included, not only of the test executables;
 deleting them would break symbolication of what the cache keeps.
 
 SAFETY.  Fail closed, checks in this order, nothing touched on a refusal (exit 2):
-  1. ``--profile`` is one path component (not empty, ``.``, ``..`` or a path).
+  1. ``--profile`` is one path component (not empty, ``.``, ``..`` or a path),
+     and ``--target-dir`` is not empty (an empty path would mean the cwd).
   2. ``--target-dir`` is not itself a symlink.  A target dir that does not
      exist yet (a job that failed before its first compile) is "nothing to
      prune", exit 0.  One that is not a directory is refused.
   3. When GITHUB_WORKSPACE is set, the resolved dir lies inside it, or it IS
      the resolved CARGO_TARGET_DIR the runner exported.
   4. It carries cargo's own marker: a regular ``CACHEDIR.TAG`` whose first line
-     is the cachedir signature, or a regular ``<profile>/.cargo-lock``.
+     is the cachedir signature (opened non-blocking and checked with fstat, so a
+     FIFO or device swapped in cannot stall the step), or a regular
+     ``<profile>/.cargo-lock``.
   5. The profile dir is a real directory, not a symlink.
 Every directory is opened with O_NOFOLLOW and held open from the scan to the
 delete; every stat, unlink and rmdir is relative to those fds, so swapping a
@@ -57,9 +60,12 @@ directory for a symlink between the scan and the delete cannot redirect the
 removal outside the tree.  A symlink entry is skipped in ``test-bins`` scope
 and removed as a link, never dereferenced, in ``all`` scope.  Only the five
 dirs named above under the chosen profile are ever touched.  An entry that
-vanished meanwhile is not an error.  Any other error removing an entry prints a
-``::warning::`` line and the run continues; the totals are still printed and
-the exit code is 1.
+vanished meanwhile is not an error.  Any other error reading a directory or an
+entry during the scan, or removing an entry, prints a ``::warning::`` line and
+the run continues with the rest; the totals are still printed and the exit code
+is 1.  Every name printed is escaped as GitHub escapes a workflow-command value
+(``%`` -> ``%25``, CR -> ``%0D``, LF -> ``%0A``), so a hostile file name can
+never start a log line of its own.
 
 OUTPUT.  One line per category, then ``freed_bytes=<n>`` and a human-readable
 total.  The count is exact, also under ``--dry-run``: a hard-linked file counts
@@ -98,6 +104,17 @@ EXIT_WARNED = 1
 CACHEDIR_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 WARNING_PREFIX = "::warning::prune-runner-target: "
+
+
+def _escape(text: str) -> str:
+    """GitHub's workflow-command value escaping: one name can never become two log lines."""
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _warn(errors: List[str], rel: str, exc: OSError) -> None:
+    msg = "%s: %s" % (rel, exc.strerror or exc)
+    errors.append(msg)
+    print(WARNING_PREFIX + _escape(msg))
 
 
 class Refused(Exception):
@@ -148,6 +165,10 @@ class Plan:
         self.candidates: List[Candidate] = []
         self.kept: List[str] = []
         self.notes: List[str] = []
+        self.errors: List[str] = []  # scan-phase warnings, carried into the exit code
+
+    def warn(self, rel: str, exc: OSError) -> None:
+        _warn(self.errors, rel, exc)
 
     def hold(self, fd: int) -> int:
         self.fds.append(fd)
@@ -186,9 +207,7 @@ class Tally:
             self._links[key] = [st.st_nlink, 1]
 
     def warn(self, rel: str, exc: OSError) -> None:
-        msg = "%s: %s" % (rel, exc.strerror or exc)
-        self.errors.append(msg)
-        print(WARNING_PREFIX + msg)
+        _warn(self.errors, rel, exc)
 
 
 def _remove(dir_fd: int, name: str, rel: str, tally: Tally, dry_run: bool) -> bool:
@@ -252,7 +271,7 @@ def _is_test_executable(name: str, st: os.stat_result) -> bool:
 
 
 def _open_sub(plan: Plan, profile_fd: int, sub: str) -> Optional[int]:
-    """Open ``<profile>/<sub>`` O_NOFOLLOW; None when absent or not a real directory."""
+    """Open ``<profile>/<sub>`` O_NOFOLLOW; None when absent, not a real directory or unreadable (warned)."""
     try:
         return plan.hold(_open_dir(sub, profile_fd))
     except FileNotFoundError:
@@ -260,8 +279,30 @@ def _open_sub(plan: Plan, profile_fd: int, sub: str) -> Optional[int]:
     except OSError as exc:
         if _not_a_real_dir(exc):
             plan.notes.append("skipped %s/%s: a symlink or not a directory (never followed)" % (plan.profile, sub))
-            return None
-        raise
+        else:
+            plan.warn("%s/%s" % (plan.profile, sub), exc)
+        return None
+
+
+def _list_dir(plan: Plan, fd: int, rel: str) -> Optional[List[str]]:
+    """Sorted entry names of the directory held as ``fd``; None (warned) when it cannot be read."""
+    try:
+        with os.scandir(fd) as it:
+            return sorted(entry.name for entry in it)
+    except OSError as exc:
+        plan.warn(rel, exc)
+        return None
+
+
+def _scan_lstat(plan: Plan, name: str, fd: int, rel: str) -> Optional[os.stat_result]:
+    """lstat during the scan: None when the entry vanished (silent) or cannot be read (warned)."""
+    try:
+        return _lstat(name, fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        plan.warn(rel, exc)
+        return None
 
 
 def _scan_test_bins(plan: Plan, profile_fd: int) -> None:
@@ -269,13 +310,14 @@ def _scan_test_bins(plan: Plan, profile_fd: int) -> None:
         fd = _open_sub(plan, profile_fd, sub)
         if fd is None:
             continue
-        with os.scandir(fd) as it:
-            names = sorted(entry.name for entry in it)
+        names = _list_dir(plan, fd, "%s/%s" % (plan.profile, sub))
+        if names is None:
+            continue
         present = set(names)
         prefix = "%s/%s/" % (plan.profile, sub)
         for name in names:
-            st = _lstat(name, fd)
-            if not _is_test_executable(name, st):
+            st = _scan_lstat(plan, name, fd, prefix + name)
+            if st is None or not _is_test_executable(name, st):
                 continue
             if st.st_nlink > 1:
                 # cargo's uplift source deps/<bin>-<hash>, hard-linked to
@@ -286,24 +328,24 @@ def _scan_test_bins(plan: Plan, profile_fd: int) -> None:
             for twin, category, want_dir in ((name + ".d", " dep-info", False), (name + ".dSYM", " dSYM", True)):
                 if twin not in present:
                     continue
-                tst = _lstat(twin, fd)
-                if (stat.S_ISDIR(tst.st_mode) if want_dir else stat.S_ISREG(tst.st_mode)):
+                tst = _scan_lstat(plan, twin, fd, prefix + twin)
+                if tst is not None and (stat.S_ISDIR(tst.st_mode) if want_dir else stat.S_ISREG(tst.st_mode)):
                     plan.candidates.append(Candidate(fd, twin, prefix + twin, sub + category))
     fd = _open_sub(plan, profile_fd, "incremental")
-    if fd is not None:
-        with os.scandir(fd) as it:
-            names = sorted(entry.name for entry in it)
-        for name in names:
-            if stat.S_ISLNK(_lstat(name, fd).st_mode):
-                continue
-            plan.candidates.append(Candidate(fd, name, "%s/incremental/%s" % (plan.profile, name), "incremental"))
+    if fd is None:
+        return
+    prefix = "%s/incremental/" % plan.profile
+    for name in _list_dir(plan, fd, prefix.rstrip("/")) or []:
+        st = _scan_lstat(plan, name, fd, prefix + name)
+        if st is None or stat.S_ISLNK(st.st_mode):
+            continue
+        plan.candidates.append(Candidate(fd, name, prefix + name, "incremental"))
 
 
 def _scan_all(plan: Plan, profile_fd: int) -> None:
     for sub in ARTIFACT_DIRS:
-        try:
-            st = _lstat(sub, profile_fd)
-        except FileNotFoundError:
+        st = _scan_lstat(plan, sub, profile_fd, "%s/%s" % (plan.profile, sub))
+        if st is None:
             continue
         if not stat.S_ISDIR(st.st_mode):
             plan.notes.append("skipped %s/%s: a symlink or not a directory (never followed)" % (plan.profile, sub))
@@ -312,14 +354,22 @@ def _scan_all(plan: Plan, profile_fd: int) -> None:
 
 
 def _has_cachedir_tag(root_fd: int) -> bool:
+    """A regular CACHEDIR.TAG carrying the signature.
+
+    Opened O_NONBLOCK|O_NOFOLLOW and checked with fstat on the open fd: a FIFO
+    or device in its place (even one swapped in after a stat) is rejected
+    instead of blocking the step until the job times out.
+    """
     try:
-        if not stat.S_ISREG(_lstat("CACHEDIR.TAG", root_fd).st_mode):
-            return False
-        fd = os.open("CACHEDIR.TAG", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+        fd = os.open("CACHEDIR.TAG", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root_fd)
     except OSError:
         return False
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
         head = os.read(fd, len(CACHEDIR_SIGNATURE))
+    except OSError:
+        return False
     finally:
         os.close(fd)
     return head == CACHEDIR_SIGNATURE
@@ -345,6 +395,8 @@ def plan_target(target_dir: str, profile: str, scope: str, env: Mapping[str, str
     _validate_profile(profile)
     if scope not in ("test-bins", "all"):
         raise Refused("unknown scope %r" % scope)
+    if not target_dir.strip():
+        raise Refused("--target-dir is empty; an empty path would mean the current directory")
     for fn in (os.open, os.stat, os.unlink, os.rmdir):
         if fn not in os.supports_dir_fd:
             raise Refused("this Python lacks dir_fd support for %s; refusing a path-based delete" % fn.__name__)
@@ -384,7 +436,7 @@ def plan_target(target_dir: str, profile: str, scope: str, env: Mapping[str, str
         if profile_fd is not None:
             try:
                 has_lock = stat.S_ISREG(_lstat(".cargo-lock", profile_fd).st_mode)
-            except FileNotFoundError:
+            except OSError:
                 has_lock = False
         if not (_has_cachedir_tag(root_fd) or has_lock):
             raise Refused("%s has neither a cargo CACHEDIR.TAG (signature checked) nor %s/.cargo-lock; "
@@ -406,6 +458,7 @@ def plan_target(target_dir: str, profile: str, scope: str, env: Mapping[str, str
 def execute(plan: Plan, dry_run: bool) -> Tally:
     """Remove (or, dry-run, only total) every candidate through the plan's fds."""
     tally = Tally()
+    tally.errors.extend(plan.errors)  # scan-phase warnings (already printed) count toward exit 1
     verb = "would delete" if dry_run else "deleted"
     for cand in plan.candidates:
         before = tally.freed
@@ -414,12 +467,12 @@ def execute(plan: Plan, dry_run: bool) -> Tally:
         count, total = tally.per_category.get(cand.category, (0, 0))
         tally.per_category[cand.category] = (count + 1, total + size)
         if dry_run:
-            tally.lines.append("  %s %s (%s)" % (verb, cand.rel, _human(size)))
+            tally.lines.append("  %s %s (%s)" % (verb, _escape(cand.rel), _human(size)))
     return tally
 
 
 def _refuse(msg: str) -> int:
-    print("prune-runner-target: refusing: " + msg, file=sys.stderr)
+    print("prune-runner-target: refusing: " + _escape(msg), file=sys.stderr)
     return EXIT_REFUSED
 
 
@@ -451,9 +504,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Refused as exc:
         return _refuse(str(exc))
     except NothingToPrune as exc:
-        print("nothing to prune: %s" % exc)
+        print("nothing to prune: %s" % _escape(str(exc)))
         print("freed_bytes=0")
         return 0
+    except OSError as exc:
+        # The root checks raced with a change or hit an unreadable path before
+        # anything was opened for deletion: nothing was touched.
+        return _refuse("cannot check %s: %s" % (args.target_dir, exc))
     try:
         tally = execute(plan, args.dry_run)
     finally:
@@ -462,18 +519,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     mode = "dry-run" if args.dry_run else "pruned"
     for line in tally.lines:
         print(line)
-    print("%s %s scope=%s" % (mode, plan.root / plan.profile, plan.scope))
+    print("%s %s scope=%s" % (mode, _escape(str(plan.root / plan.profile)), plan.scope))
     for category in sorted(tally.per_category):
         count, size = tally.per_category[category]
         print("  %-24s %6d  %s" % (category, count, _human(size)))
     for name in plan.kept:
-        print("  kept hard-linked uplift source %s (frees nothing while <profile>/<bin> exists)" % name)
+        print("  kept hard-linked uplift source %s (frees nothing while <profile>/<bin> exists)" % _escape(name))
     for note in plan.notes:
-        print("  " + note)
+        print("  " + _escape(note))
     print("freed_bytes=%d" % tally.freed)
     print("freed %s (%s)" % (_human(tally.freed), mode))
     if tally.errors:
-        print("%d entr%s could not be removed (warnings above); exit %d"
+        print("%d entr%s could not be read or removed (warnings above); exit %d"
               % (len(tally.errors), "y" if len(tally.errors) == 1 else "ies", EXIT_WARNED))
         return EXIT_WARNED
     return 0
