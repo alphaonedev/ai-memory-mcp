@@ -3869,20 +3869,30 @@ class BeforeClosedWorld6260(unittest.TestCase):
 APPROVAL_EVALUATE_STEP = "Evaluate external-PR approval requirement"
 APPROVAL_SELFTEST_STEP = "Self-test the external-PR approval evaluator (#6193)"
 APPROVAL_STEP_NEUTRALISER = r"(?m)^\s+(?:- )?(?:if|continue-on-error):|^\s+timeout-minutes:\s*0\s*$"
+# The exact commands (no `|| true`, no swapped flag): the Evaluate step must run the real check.
+APPROVAL_SELFTEST_RUN = "python3 -I scripts/check_external_pr_approval.py --self-test"
+APPROVAL_EVALUATE_RUN = "python3 -I scripts/check_external_pr_approval.py"
 
 
 def _approval_job_problems(c8: str) -> List[str]:
     """Ways the approval job could pass while the evaluator does not decide (empty = intact)."""
     job = _job_text(c8, APPROVAL_JOB)
     problems: List[str] = []
-    if re.search(r"(?m)^    (needs|if):", job):
-        problems.append("job-level needs/if")
-    for name in (APPROVAL_SELFTEST_STEP, APPROVAL_EVALUATE_STEP):
+    if re.search(r"(?m)^    (needs|if|continue-on-error):", job):
+        problems.append("job-level needs/if/continue-on-error")
+    if not re.search(r"(?m)^    timeout-minutes:\s*[1-9][0-9]*\s*$", job):
+        problems.append("job timeout-minutes is not a positive integer")
+    for name, command in ((APPROVAL_SELFTEST_STEP, APPROVAL_SELFTEST_RUN),
+                          (APPROVAL_EVALUATE_STEP, APPROVAL_EVALUATE_RUN)):
         block = _step_block(job, name)
         if not block:
             problems.append(f"step {name!r} is missing")
-        elif re.search(APPROVAL_STEP_NEUTRALISER, block):
+            continue
+        if re.search(APPROVAL_STEP_NEUTRALISER, block):
             problems.append(f"step {name!r} is neutralised")
+        runs = [r.strip() for r in _step_runs(block, name)]
+        if runs != [command]:
+            problems.append(f"step {name!r} runs {runs!r}, not exactly {command!r}")
     return problems
 
 
