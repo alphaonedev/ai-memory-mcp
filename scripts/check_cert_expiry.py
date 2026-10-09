@@ -2451,6 +2451,22 @@ C8_FIXTURE = (
     "  # a comment at job indent belongs to the next job\n"
     "  later-job:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo later\n"
 )
+# Round 3: the trusted workflow in its real shape (every line of it that spells
+# a fragment of the required check name), so the shadow scan is exercised on it.
+TRUSTED_WF_FIXTURE = (
+    "name: Enterprise-federation cert-expiry gate (trusted base copy)\n"
+    "on:\n  pull_request_target:\n    branches: [main, develop, \"release/**\"]\n"
+    "permissions:\n  contents: read\n"
+    "concurrency:\n  group: cert-expiry-trusted-${{ github.event.pull_request.number }}\n"
+    "  cancel-in-progress: true\n"
+    "jobs:\n  cert-expiry-trusted:\n"
+    "    name: Enterprise-federation cert-expiry gate, trusted base copy (cert §7 / F7)\n"
+    "    runs-on: ubuntu-latest\n    timeout-minutes: 10\n    steps:\n"
+    "      - name: Cert-expiry gate self-test (base code)\n"
+    "        run: python3 -I scripts/check_cert_expiry.py --self-test\n"
+)
+SHADOW_JOB_FIXTURE = ("  shadow:\n    name: Enterprise-federation cert-expiry gate (cert §7 / F7)\n"
+                      "    runs-on: ubuntu-latest\n    steps:\n      - run: echo always-green\n")
 
 
 def trusted_cli(repo, *args):
@@ -2499,7 +2515,7 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     fx.write(mod_rs, "fn federation_mod() {}\n")
     fx.write("src/unrelated.rs", "fn other() {}\n")
     fx.write(gate_rel, "# the base copy of the gate (fixture)\n")
-    fx.write(wf_rel, "name: trusted (fixture)\n")
+    fx.write(wf_rel, TRUSTED_WF_FIXTURE)
     fx.write(pin_rel, "# the canonical-form pin (fixture)\n")
     fx.write(c8_rel, C8_FIXTURE)
     genesis = fx.commit(["src", "scripts", ".github"], "genesis")
@@ -2582,6 +2598,7 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     shapes["log-shadow"] = pr("log-shadow", {f".github/workflows/x\n{forged}.yml": f"name: {CERT_CONTEXT_FIXTURE}\n"})
     shapes["log-who"] = pr("log-who", {wf_rel: "name: weakened (fixture)\n"},
                            f"\n\nRule-Change-Approved-By: Evil\r{forged}x")
+    _round3_shapes(repo, shapes, pr, approve, wf_rel, c8_rel)
     # Merge-structure shapes off one PR head (#6138 cells, here in --trusted mode).
     fx.g("checkout", "-q", "-b", "h8", base)
     fx.write("src/unrelated.rs", "// h8 PR work\n", append=True)
@@ -2707,6 +2724,8 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     _trusted_round2_cells(tmp, t, judge, shapes, mirror, job)
     _trusted_log_cells(t, judge, shapes)
     _trusted_merge_ref_cells(t, fx, mirror, head8, good8, unrel8)
+    _trusted_round3_cells(tmp, t, judge, shapes)
+    _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8)
 
 
 CERT_CONTEXT_FIXTURE = "Enterprise-federation cert-expiry gate (cert §7 / F7)"
@@ -2870,6 +2889,232 @@ def _trusted_round2_cells(tmp, t, judge, shapes, mirror, job):
           needles=(shadow + ".github/workflows/shadow.yml",))
     judge("tr-s-control", "a new unrelated workflow file", *shapes["newwf"], ok=True, absent=(shadow, guard))
     judge("tr-s-other", "other c8 jobs edited", *shapes["otherjob"], ok=True, absent=(shadow, guard))
+
+
+def _round3_shapes(repo, shapes, pr, approve, wf_rel, c8_rel):
+    """#6140 round 3 shapes: shadow producers inside the trailer-waivable
+    regions (each WITH the trailer), the R2-3 test-gap shapes and controls."""
+    ctx = "Enterprise-federation cert-expiry gate (cert §7 / F7)"
+    named = f"    name: {ctx}\n"
+    alias_job = "  shadow:\n    name: *ctx\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo always-green\n"
+    gate_env = named + f"    env:\n      CTX: &ctx {ctx}\n"
+
+    def symlink_wf(rel):
+        (repo / rel).symlink_to("c8-precheck.yml")
+
+    def wf_blob(rel):
+        shutil.rmtree(repo / rel)
+        (repo / rel).write_text("not a directory\n", encoding="utf-8")
+
+    amp = C8_FIXTURE.replace(
+        "  later-job:\n    runs-on: ubuntu-latest\n",
+        "  later-job:\n    if: github.event_name == 'pull_request' && true\n    runs-on: ubuntu-latest\n"
+        "    env:\n      GLOB: \"release/**\"\n", 1).replace(
+        "      - run: echo later\n",
+        "      - run: echo later\n      - run: |\n          case \"$x\" in\n"
+        "            *) [ -n \"$x\" ] && echo *.txt ;;\n          esac\n", 1)
+    split = ("name: split\non: [pull_request]\njobs:\n  split:\n"
+             "    name: \"Enterprise-federation cert-ex\\\n      piry gate (cert §\\\n      7 / F7)\"\n"
+             "    runs-on: ubuntu-latest\n    steps:\n      - run: echo always-green\n")
+    r3 = {
+        "trusted": ({wf_rel: TRUSTED_WF_FIXTURE.replace("on:\n", "on:\n  pull_request:\n", 1)
+                     + SHADOW_JOB_FIXTURE}, approve),
+        "quoted": ({c8_rel: C8_FIXTURE + SHADOW_JOB_FIXTURE.replace("  shadow:", '  "shadow":', 1)}, approve),
+        "flow": ({c8_rel: C8_FIXTURE + f'  shadow: {{name: "{ctx}", runs-on: ubuntu-latest, '
+                  "steps: [{run: echo always-green}]}\n"}, approve),
+        "anchor": ({c8_rel: C8_FIXTURE.replace(named, named.replace("name: ", "name: &ctx "), 1) + alias_job},
+                   approve),
+        "anchor-hdr": ({c8_rel: C8_FIXTURE.replace("jobs:\n", f"env:\n  CTX: &ctx {ctx}\njobs:\n", 1) + alias_job},
+                       approve),
+        "anchor-env": ({c8_rel: C8_FIXTURE.replace(named, gate_env, 1) + alias_job}, approve),
+        "trusted-name": ({wf_rel: TRUSTED_WF_FIXTURE.replace("gate, trusted base copy (cert", "gate (cert", 1)},
+                         approve),
+        "trusted-hdr": ({wf_rel: TRUSTED_WF_FIXTURE.replace("jobs:\n", f"env:\n  CTX: {ctx}\njobs:\n", 1)}, approve),
+        "trusted-ok": ({wf_rel: TRUSTED_WF_FIXTURE.replace("timeout-minutes: 10", "timeout-minutes: 9", 1)}, approve),
+        "amp": ({c8_rel: amp}, ""),
+        "split": ({".github/workflows/split.yml": split}, ""),
+        "log-sep": ({"src/federation/a b.rs": "fn a() {}\n", "src/federation/c\x85d.rs": "fn c() {}\n"}, ""),
+        "pct": ({wf_rel: TRUSTED_WF_FIXTURE.replace("timeout-minutes: 10", "timeout-minutes: 8", 1)},
+                "\n\nRule-Change-Approved-By: Pct%0A::error title=forged::x"),
+        "symwf": ({".github/workflows/s.yml": symlink_wf}, approve),
+        "wfblob": ({".github/workflows": wf_blob}, approve),
+        "bigname": ({".github/workflows/x\n::error title=forged::big.yml": "# " + "x" * 8192 + "\n"}, ""),
+    }
+    for key, (edits, trailer_msg) in r3.items():
+        shapes["r3-" + key] = pr("r3-" + key, edits, trailer_msg)
+
+
+def _no_forged_lines(t, label, why, out):
+    """No step-log line of OUT reads as a workflow command this gate did not emit."""
+    for line in out.splitlines():
+        if line.lstrip().startswith("::") and not line.lstrip().startswith(OWN_COMMANDS):
+            t.fail(f"({label}): {why}: the log line {line!r} reads as a workflow command", out)
+
+
+def _trusted_round3_cells(tmp, t, judge, shapes):
+    """#6140 round 3 (code review F1/F2, security review R2-1..R2-3): no
+    region a trailer can waive hides a second producer of the required check
+    name, and the R2-3 properties each have a cell of their own."""
+    shadow, guard = "GUARD SHADOW: ", "GUARD CHANGED: "
+    c8, wf = PINNED_TRUSTED_JOB[0], PINNED_TRUSTED_PATHS[1]
+    for key, where, says in (("trusted", wf, "job 'shadow'"), ("quoted", c8, '"shadow"'),
+                             ("flow", c8, "shadow: {name"), ("anchor", c8, "anchor"),
+                             ("anchor-hdr", c8, "anchor"), ("anchor-env", c8, "anchor"),
+                             ("trusted-name", wf, "pinned"), ("trusted-hdr", wf, "workflow header")):
+        judge(f"tr-s-{key}", f"a second producer in a trailer-waivable region ({key}) WITH the trailer",
+              *shapes["r3-" + key], needles=(shadow + where, says, "Selftest Approver"))
+    judge("tr-s-trusted-ok", "the trusted workflow in its real shape, edited WITH the trailer",
+          *shapes["r3-trusted-ok"], ok=True, needles=(guard + wf,), absent=(shadow,))
+    judge("tr-s-amp", "other c8 jobs using &&, *) and a quoted ** (no YAML anchor or alias)", *shapes["r3-amp"],
+          ok=True, absent=(shadow, guard))
+    judge("tr-s-split", "a shadow name split across double-quoted line continuations", *shapes["r3-split"],
+          needles=(shadow + ".github/workflows/split.yml",))
+    judge("tr-s-symlink", "a symlinked workflow file WITH the trailer", *shapes["r3-symwf"],
+          needles=(shadow + ".github/workflows/s.yml", "symlink"))
+    judge("tr-s-notdir", ".github/workflows replaced by a file WITH the trailer", *shapes["r3-wfblob"],
+          needles=(shadow + ".github/workflows", "is not a directory"))
+    # #6175 (R2-3 N3/N4): U+2028 and C1 (NEL) are escaped, never printed raw.
+    out = judge("tr-log-sep", "watched paths carrying U+2028 and U+0085", *shapes["r3-log-sep"],
+                needles=("a\\u2028b.rs", "c\\x85d.rs"))
+    if " " in out or "\x85" in out:
+        t.fail("(tr-log-sep): a raw U+2028 or U+0085 reached the log:", out)
+    # #6175 (R2-3 N5): `%` in a trailer is escaped inside the ::warning annotation.
+    out = judge("tr-log-pct", "an approval trailer carrying %0A and a forged ::error", *shapes["r3-pct"], ok=True)
+    warnings = [line for line in out.splitlines() if line.startswith("::warning title=GUARD CHANGED::")]
+    if not warnings or any("%250A::error" not in w or "%0A::" in w.replace("%250A", "") for w in warnings):
+        t.fail("(tr-log-pct): the ::warning line does not carry the trailer's % escaped as %25:", out)
+    # #6175 (code F2 / security R2-2): an oversized workflow's file name is escaped too.
+    saved_cap = globals()["MAX_BLOB_BYTES"]
+    globals()["MAX_BLOB_BYTES"] = 4096
+    try:
+        out = judge("tr-log-big", "an oversized workflow whose name carries LF and a forged ::error",
+                    *shapes["r3-bigname"], needles=("x\\x0a::error title=forged::big.yml", "exceeds 4096 bytes"),
+                    absent=("(fail-closed) (fail-closed)",))
+    finally:
+        globals()["MAX_BLOB_BYTES"] = saved_cap
+    _no_forged_lines(t, "tr-log-big", "an oversized workflow name", out)
+    # R2-3 N9: inherited GIT_* variables never redirect the gate's git calls.
+    planted = {"GIT_DIR": "/nonexistent", "GIT_WORK_TREE": "/nonexistent", "GIT_INDEX_FILE": "/nonexistent/index"}
+    saved = {k: os.environ.get(k) for k in planted}
+    os.environ.update(planted)
+    try:
+        judge("tr-git-env", "GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE in the environment", *shapes["clean"], ok=True)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# The fetch timeout and the job budget it must fit (code F3, security R2-4).
+PINNED_FETCH_TIMEOUT = 45
+TRUSTED_JOB_SECONDS = 600
+GIT_HANG_SHIM = """#!{python}
+import os, sys, time
+real, argv = {real!r}, sys.argv[1:]
+if {hang!r} in argv:
+    time.sleep(30)
+os.execv(real, [real] + argv)
+"""
+
+
+@contextlib.contextmanager
+def _git_shim(tmp, template, **fields):
+    """PATH-shim `git` from TEMPLATE (GIT_SHIM or GIT_HANG_SHIM) for the block."""
+    real = shutil.which("git")
+    if real is None:
+        raise GateError("git is not on PATH")
+    shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
+    shim = shim_dir / "git"
+    shim.write_text(template.format(python=sys.executable, real=real, **fields), encoding="utf-8")
+    shim.chmod(0o755)
+    saved = os.environ.get("PATH")
+    os.environ["PATH"] = f"{shim_dir}{os.pathsep}{saved or ''}"
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved
+        shutil.rmtree(shim_dir, ignore_errors=True)
+
+
+def _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8):
+    """#6140 round 3 (code F3, security R2-3 N7, R2-4, R2-5): every fetch is
+    time-bounded within the job timeout, a failed fetch is reported with its
+    error text, a failed head fetch stops before any merge fetch, and a
+    destination ref left by an earlier run is never judged."""
+    fetch_timeout = globals().get("FETCH_TIMEOUT")
+    if fetch_timeout != PINNED_FETCH_TIMEOUT:
+        t.fail(f"(tr-f-pin): FETCH_TIMEOUT {fetch_timeout!r} differs from {PINNED_FETCH_TIMEOUT!r}")
+    worst = (len(PINNED_MERGE_REF_SLEEPS) + 2) * PINNED_FETCH_TIMEOUT + sum(PINNED_MERGE_REF_SLEEPS)
+    if worst > TRUSTED_JOB_SECONDS - 180:
+        t.fail(f"(tr-f-pin): worst-case fetch time {worst} s leaves under 180 s of the {TRUSTED_JOB_SECONDS} s job")
+    real_run_git, real_sleep, fetches = globals()["run_git"], globals().get("_sleep"), []
+
+    def recording_run_git(repo, *args, **kw):
+        if "fetch" in args:
+            fetches.append((args, kw.get("timeout")))
+        return real_run_git(repo, *args, **kw)
+
+    def run(label, why, ok, needles=(), absent=(), pr_number="7", merge_ref="refs/remotes/pull/m7"):
+        del fetches[:]
+        rc, out = trusted_cli(mirror, "--base-ref=main", f"--head-sha={head8}", f"--pr-number={pr_number}",
+                              f"--merge-ref={merge_ref}")
+        if (rc == 0) != ok or rc not in (0, 1):
+            t.fail(f"({label}): {why}: rc {rc}, expected {0 if ok else 1}:", out)
+        for needle in needles:
+            if needle not in out:
+                t.fail(f"({label}): {why}: output does not say {needle!r}:", out)
+        for needle in absent:
+            if needle in out:
+                t.fail(f"({label}): {why}: output must not say {needle!r}:", out)
+        return out
+
+    def ref_of(ref):
+        proc = run_git(mirror, "rev-parse", "--verify", "--quiet", ref)
+        return proc.stdout.decode().strip() if proc.returncode == 0 else ""
+
+    globals()["run_git"], globals()["_sleep"] = recording_run_git, lambda seconds: None
+    try:
+        fx.g("update-ref", "refs/pull/7/head", head8)
+        fx.g("update-ref", "refs/pull/7/merge", good8)
+        run("tr-f-timeout", "a current merge ref", True)
+        if not fetches or any(timeout != fetch_timeout for _, timeout in fetches):
+            t.fail(f"(tr-f-timeout): a git fetch ran without the FETCH_TIMEOUT bound: {fetches!r}")
+        # R2-5: a merge ref an earlier run left behind is deleted before the fetch, never judged.
+        fx.g("update-ref", "-d", "refs/pull/7/merge")
+        Fixture(mirror).g("update-ref", "refs/remotes/pull/m7", good8)
+        run("tr-f-stale-local", "a current local merge ref with none on the origin", False,
+            needles=("::error title=cert-expiry trusted::", "missing", "last fetch error"))
+        # R2-3 N7: no refs/pull/9/head on the origin: fail closed before any merge fetch.
+        run("tr-f-head", "a pull request head the origin does not have", False, pr_number="9",
+            needles=("::error title=cert-expiry trusted::", "git fetch of refs/pull/9/head"))
+        if any("+refs/pull/9/merge:refs/remotes/pull/m7" in args for args, _ in fetches):
+            t.fail(f"(tr-f-head): a merge fetch ran after the head fetch failed: {fetches!r}")
+        if ref_of(HEAD_FETCH_REF) or ref_of("refs/remotes/pull/m7"):
+            t.fail("(tr-f-head): a destination ref from an earlier fetch survived a failed fetch")
+        # Code F3: the last fetch error is part of the ::error.
+        fx.g("update-ref", "refs/pull/7/merge", good8)
+        with _git_shim(tmp, GIT_SHIM, version="", fail="+refs/pull/7/merge:refs/remotes/pull/m7"):
+            run("tr-f-error", "every merge fetch failing", False,
+                needles=("::error title=cert-expiry trusted::", "last fetch error", "shim refuses"))
+        # R2-4: a hung fetch is cut at FETCH_TIMEOUT and retried, then reported as an ::error.
+        globals()["FETCH_TIMEOUT"] = 0.5
+        try:
+            with _git_shim(tmp, GIT_HANG_SHIM, hang="+refs/pull/7/merge:refs/remotes/pull/m7"):
+                run("tr-f-hang", "every merge fetch hanging", False,
+                    needles=("::error title=cert-expiry trusted::", "last fetch error", "could not complete"))
+        finally:
+            globals()["FETCH_TIMEOUT"] = fetch_timeout
+    finally:
+        globals()["run_git"] = real_run_git
+        if real_sleep is None:
+            globals().pop("_sleep", None)
+        else:
+            globals()["_sleep"] = real_sleep
 
 
 def trusted_cli_shimmed(tmp, repo, fail, shape):
