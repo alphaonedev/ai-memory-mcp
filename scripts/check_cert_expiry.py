@@ -58,8 +58,8 @@ RANGE RESOLUTION.
                    stale, is report-only. Fail-closed (the remedy is to push a
                    new commit or sync the branch with the base; a re-run reuses
                    the same GITHUB_SHA) when GITHUB_BASE_REF / PR_HEAD_SHA are
-                   unset, a sha taken from the environment is not 7-40 hex
-                   characters, the base ref cannot be fetched, a sha does not
+                   unset, a sha taken from the environment is not exactly
+                   40 (or 64) hex characters, the base ref cannot be fetched, a sha does not
                    resolve, the merge commit does not have exactly two parents,
                    its second parent is not PR_HEAD_SHA, its first parent is the
                    PR head (reversed parents), or its first parent is not on the
@@ -68,7 +68,8 @@ RANGE RESOLUTION.
   push             github.event.before .. GITHUB_SHA. An all-zero `before`
                    (new branch / first push) is N/A-skip, never a false-fail.
   workflow_dispatch / other / empty
-                   CERT_EXPIRY_BASE[/HEAD] override if set; else (local
+                   CERT_EXPIRY_BASE[/HEAD] override if set (outside CI only;
+                   refused under GitHub Actions, #5970); else (local
                    convenience) merge-base with @{upstream} or
                    origin/release/v1.0.0; else N/A-skip.
   GitHub Actions   (GITHUB_ACTIONS set, #5970) the event payload range is
@@ -121,11 +122,16 @@ FED_ID_PATTERN = "AI_MEMORY_FED_[A-Z0-9_]+"
 FED_ID_RE = re.compile(FED_ID_PATTERN)
 ZERO_SHA_RE = re.compile(r"^0+$")
 PREFIX = "check-cert-expiry"
-# Every sha taken from the environment is 7-40 hex chars (#6138 S-F2) before
-# any git call, so an option-shaped value can never reach a git argv.
-ENV_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
-# `--end-of-options` (git >= 2.24) is passed ahead of positional refs.
-MIN_GIT_VERSION = (2, 24)
+# Every sha taken from the environment is exactly 40 (SHA-1) or 64 (SHA-256)
+# hex chars (#6138 S-F2, R2-1), matched with `fullmatch` so a trailing newline
+# or an abbreviation (which git would resolve as a ref name) is refused before
+# any git call, and an option-shaped value can never reach a git argv.
+ENV_SHA_RE = re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?")
+# `--end-of-options` is passed ahead of positional refs. `git rev-parse`
+# learned it only in git 2.30 (git RelNotes/2.30.0.txt:74-76); fetch,
+# merge-base, diff, show and rev-list had it since 2.24. The floor is the
+# newest of those, because the gate calls `rev-parse --verify` throughout.
+MIN_GIT_VERSION = (2, 30)
 
 # POSIX [[:space:]] spelled out so a Unicode space cannot widen the match.
 _S = r"[ \t\r\n\f\v]"
@@ -188,7 +194,7 @@ def git_text(repo, *args):
 
 
 def require_git_version(repo):
-    """Fail closed unless git understands `--end-of-options` (>= 2.24)."""
+    """Fail closed unless `git rev-parse` understands `--end-of-options` (>= 2.30)."""
     text = git_text(repo, "--version")
     m = re.match(r"git version (\d+)\.(\d+)", text)
     if not m or (int(m.group(1)), int(m.group(2))) < MIN_GIT_VERSION:
@@ -197,10 +203,10 @@ def require_git_version(repo):
 
 
 def env_sha(env, key):
-    """The sha in env[key], which must be 7-40 hex chars (S-F2, fail-closed)."""
+    """The sha in env[key], exactly 40 or 64 hex chars (S-F2, R2-1, fail-closed)."""
     val = env.get(key, "")
-    if not ENV_SHA_RE.match(val):
-        raise GateError(f"{key} {val!r} is not 7-40 hex characters (fail-closed)")
+    if not ENV_SHA_RE.fullmatch(val):
+        raise GateError(f"{key} {val!r} is not exactly 40 or 64 hex characters (fail-closed)")
     return val
 
 
@@ -399,7 +405,7 @@ def check_banner_consistency(repo, judged):
     return False, lines
 
 
-def pr_base_tip(repo, base, head, tip):
+def pr_base_tip(repo, base, head, tip, base_name=None):
     """Validate the pull_request merge commit and return its first parent.
 
     The merge commit must have exactly two parents; its second parent must be
@@ -409,6 +415,7 @@ def pr_base_tip(repo, base, head, tip):
     change what the PR contributes, so the gate stays green and measures
     first parent..merge commit (#6138 F1; strictly tighter than the landed
     gate, no vote). Anything else is not the PR's merge result (fail-closed).
+    `base_name` (origin/<GITHUB_BASE_REF>) only labels the messages.
     """
     parents = git_text(repo, "rev-list", "--parents", "-n", "1", "--end-of-options", tip).split()
     if len(parents) != 3:
@@ -435,7 +442,7 @@ def pr_base_tip(repo, base, head, tip):
     if anc.returncode == 1:
         raise GateError(
             f"merge commit {tip} first parent {first} is not on the live base "
-            f"{base} (tip {live}); the merge ref was not built from this base: "
+            f"{base_name or 'branch'} (tip {live}); the merge ref was not built from this base: "
             "push a new commit or sync the branch with the base so GitHub "
             "rebuilds the merge ref (a re-run reuses the same GITHUB_SHA)"
         )
@@ -445,7 +452,7 @@ def pr_base_tip(repo, base, head, tip):
     return first
 
 
-def check_change(repo, base, head, tip=None):
+def check_change(repo, base, head, tip=None, base_name=None):
     """Judge the change. Without `tip` it is merge-base(base, head)..head. With
     `tip` (the pull_request merge commit, #6137) it is tip^1..tip, tip^1 being
     verified to lie on the live base and tip^2 to be the PR head. Returns
@@ -460,7 +467,7 @@ def check_change(repo, base, head, tip=None):
         # (on the base branch) with the merge commit. Base-side changes since
         # the fork point were judged when they landed on the base.
         try:
-            mb = pr_base_tip(repo, base, head, tip)
+            mb = pr_base_tip(repo, base, head, tip, base_name)
         except GateError as exc:
             return False, f"{PREFIX}: ERROR — {exc} (fail-closed)"
     else:
@@ -648,7 +655,8 @@ def resolve_range(repo, env):
         return before, after, None
     if event == "workflow_dispatch":
         raise Skip(
-            "workflow_dispatch has no PR/push range (set CERT_EXPIRY_BASE to force a check); skip"
+            "workflow_dispatch has no PR/push range (outside CI, CERT_EXPIRY_BASE/HEAD "
+            "check a range by hand; they are refused under GitHub Actions); skip"
         )
     if event == "":
         if in_ci:
@@ -676,7 +684,8 @@ def run_gate(repo, env):
         return 0, "", f"{PREFIX}: N/A — {skip}"
     except GateError as exc:
         return 1, "", f"{PREFIX}: ERROR — {exc}"
-    ok, text = check_change(repo, base, head, tip)
+    base_name = f"origin/{env['GITHUB_BASE_REF']}" if tip is not None else None
+    ok, text = check_change(repo, base, head, tip, base_name)
     return (0, text, "") if ok else (1, "", text)
 
 
@@ -776,6 +785,43 @@ class SelfTest:
         elif needle not in text:
             self.fail(f"({label}): {why} failed for the wrong reason (wanted {needle!r}):", text)
         return text
+
+
+GIT_SHIM = """#!{python}
+import os, sys
+real, argv = {real!r}, sys.argv[1:]
+if "--version" in argv and {version!r}:
+    print({version!r})
+    sys.exit(0)
+if {fail!r} and {fail!r} in argv:
+    sys.stderr.write("fatal: shim refuses " + {fail!r} + chr(10))
+    sys.exit(128)
+os.execv(real, [real] + argv)
+"""
+
+
+def run_gate_shimmed(tmp, repo, env, version="", fail=""):
+    """run_gate with a PATH shim `git` that reports `version` for --version
+    and exits 128 on any call whose argv contains `fail`, and otherwise
+    delegates to the real git (R2-F2: pins the guarded branches)."""
+    real = shutil.which("git")
+    if real is None:
+        raise GateError("git is not on PATH")
+    shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
+    shim = shim_dir / "git"
+    shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version=version,
+                                    fail=fail), encoding="utf-8")
+    shim.chmod(0o755)
+    saved = os.environ.get("PATH")
+    os.environ["PATH"] = f"{shim_dir}{os.pathsep}{saved or ''}"
+    try:
+        return run_gate(repo, dict(env, PATH=os.environ["PATH"]))
+    finally:
+        if saved is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved
+        shutil.rmtree(shim_dir, ignore_errors=True)
 
 
 def _gate_env(**kw):
@@ -1200,6 +1246,16 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     env7 = _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=head7,
                      GITHUB_BASE_REF="main", GITHUB_SHA=good7, PATH=os.environ.get("PATH", ""))
     t.gate("pr7-ok", "control: a two-parent merge of the live tip and the PR head", repo, env7)
+    # R2-F2: the version guard and the is-ancestor error branch are pinned.
+    rc, out, err = run_gate_shimmed(tmp, repo, env7, version="git version 2.29.9")
+    if rc != 1 or "git >= 2.30 is required" not in out + err:
+        t.fail("(gitver): git 2.29.9 did not fail closed with the version guard:", out + err)
+    rc, out, err = run_gate_shimmed(tmp, repo, env7, fail="--is-ancestor")
+    if rc != 1 or "merge-base --is-ancestor exited 128" not in out + err:
+        t.fail("(anc-error): an is-ancestor error did not fail closed:", out + err)
+    rc, out, err = run_gate_shimmed(tmp, repo, env7)
+    if rc != 0:
+        t.fail("(shim-control): the pass-through git shim was REJECTED:", out + err)
     # Each of the next two cells is rejected by exactly one predicate.
     t.gate("pr7-second", "a two-parent merge whose second parent is an unrelated branch, not "
            "PR_HEAD_SHA", repo, dict(env7, GITHUB_SHA=unrel7), "is not PR_HEAD_SHA")
@@ -1224,13 +1280,18 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                  "is not on the live base")
     if "re-run the job" in off or "push a new commit or sync the branch" not in off:
         t.fail("(pr4-offbase): the remedy must say to push or sync, never re-run:", off)
+    if "is not on the live base origin/main (tip " not in off:
+        t.fail("(pr4-offbase): the message must name origin/<GITHUB_BASE_REF>:", off)
+    for what, sha in (("first parent", fx.g("rev-parse", f"{good7}^1")), ("live tip", side)):
+        if off.count(sha) != 1:
+            t.fail(f"(pr4-offbase): the {what} sha must be printed exactly once:", off)
     fx.g("update-ref", "refs/remotes/origin/main", base)
 
     # (pr4) pull_request fail-closed cells; each asserts the reason.
     pr_base_env = _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=feature,
                             GITHUB_BASE_REF="main", GITHUB_SHA=pr_merge,
                             PATH=os.environ.get("PATH", ""))
-    hex_msg = "is not 7-40 hex characters"
+    hex_msg = "is not exactly 40 or 64 hex characters"
     closed = [
         ("no GITHUB_BASE_REF", {k: v for k, v in pr_base_env.items() if k != "GITHUB_BASE_REF"},
          "GITHUB_BASE_REF is unset"),
@@ -1248,6 +1309,9 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
          "is not a plain branch name"),
         ("option-shaped PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA="--upload-pack=x"), hex_msg),
         ("too-short PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA=feature[:6]), hex_msg),
+        ("12-char abbreviated PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA=feature[:12]), hex_msg),
+        ("40-hex GITHUB_SHA with a trailing newline",
+         dict(pr_base_env, GITHUB_SHA=pr_merge + "\n"), hex_msg),
         ("non-hex GITHUB_SHA", dict(pr_base_env, GITHUB_SHA="zz" + pr_merge[2:]), hex_msg),
         ("non-hex PR_BASE_SHA", dict(pr_base_env, PR_BASE_SHA="--oops"), hex_msg),
         ("option-shaped push GITHUB_EVENT_BEFORE",
@@ -1285,9 +1349,11 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             "PATH": os.environ.get("PATH", "")})
 
     # (l) N/A-skip - workflow_dispatch with no override (must not false-fail).
-    rc, _o, _e = run_gate(repo, {"GITHUB_EVENT_NAME": "workflow_dispatch"})
+    rc, _o, skip_msg = run_gate(repo, {"GITHUB_EVENT_NAME": "workflow_dispatch"})
     if rc != 0:
         t.fail("(l): workflow_dispatch without CERT_EXPIRY_BASE did not skip")
+    if "outside CI" not in skip_msg or "refused under GitHub Actions" not in skip_msg:
+        t.fail("(l): the skip message must say the overrides work only outside CI:", skip_msg)
 
     # (m) N/A-skip - push with all-zero before (new branch / first push).
     rc, _o, _e = run_gate(repo, {"GITHUB_EVENT_NAME": "push", "GITHUB_SHA": base,
@@ -1331,7 +1397,7 @@ SELF_TEST_OK = (
     "(f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs "
     "RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path "
     "still named); (j) identifier-rename RED (both names listed); (k) pull_request missing "
-    "PR_HEAD_SHA / GITHUB_BASE_REF fail-closed with its reason; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; "
+    "PR_HEAD_SHA / GITHUB_BASE_REF fail-closed with its reason; (l) workflow_dispatch skip naming the outside-CI-only overrides; (m) push with zero before-SHA skip; "
     "(n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; "
     "(p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + "
     "incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated "
@@ -1348,8 +1414,10 @@ SELF_TEST_OK = (
     "head that flips the banner detected over base-tip..merge-commit, and a wire change "
     "without the flip RED; (pr3) stale payload PR_BASE_SHA ignored, the live base ref used; "
     "(pr4) pull_request fail-closed, each with its reason, on missing/unresolvable base ref, "
-    "head or merge commit and on non-hex shas; (pr4-moved) base moved by an unrelated commit "
-    "GREEN; (pr4-offbase) first parent not on the base RED with the push-or-sync remedy; "
+    "head or merge commit and on non-hex, abbreviated or newline-suffixed shas; (pr4-moved) base moved by an unrelated commit "
+    "GREEN; (pr4-offbase) first parent not on the base RED naming origin/<base ref>, each sha once, "
+    "with the push-or-sync remedy; (gitver) git below 2.30 fail-closed; (anc-error) an is-ancestor "
+    "error fail-closed; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
