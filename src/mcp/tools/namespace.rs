@@ -1228,6 +1228,60 @@ mod tests {
         );
     }
 
+    /// #4398 — the off-struct depth knobs (`require_approval_above_depth`,
+    /// `skill_promotion_min_depth`) are refused at write time unless they are
+    /// a non-negative integer that fits `u32` (or `null`, the explicit opt-in
+    /// to inherit). Pre-fix the typed deserialise dropped them unvalidated and
+    /// a plausible non-integer form silently resolved to NO gate.
+    #[test]
+    fn set_standard_refuses_malformed_depth_knobs_4398() {
+        let _g = crate::identity::agent_id_env_unset_guard();
+        let conn = fresh_conn();
+        let id = insert_owned(&conn, "ns-4398", "standard", "ai:alice");
+        for (knob, bad) in [
+            ("require_approval_above_depth", json!("3")),
+            ("require_approval_above_depth", json!(-1)),
+            ("require_approval_above_depth", json!(2.5)),
+            ("require_approval_above_depth", json!(true)),
+            ("require_approval_above_depth", json!(u64::from(u32::MAX) + 1)),
+            ("skill_promotion_min_depth", json!("2")),
+            ("skill_promotion_min_depth", json!(-2)),
+            ("skill_promotion_min_depth", json!(1.5)),
+            ("skill_promotion_min_depth", json!([1])),
+        ] {
+            let err = handle_namespace_set_standard(
+                &conn,
+                &json!({
+                    "namespace": "ns-4398",
+                    "id": id,
+                    "agent_id": "ai:alice",
+                    "governance": {"write": "any", knob: bad},
+                }),
+            )
+            .expect_err(&format!("{knob}={bad} must be refused"));
+            assert!(err.contains(knob), "{knob}={bad}: {err}");
+        }
+        // Well-formed values and the explicit null still land.
+        for (knob, good) in [
+            ("require_approval_above_depth", json!(3)),
+            ("require_approval_above_depth", json!(0)),
+            ("require_approval_above_depth", json!(null)),
+            ("skill_promotion_min_depth", json!(2)),
+            ("skill_promotion_min_depth", json!(null)),
+        ] {
+            handle_namespace_set_standard(
+                &conn,
+                &json!({
+                    "namespace": "ns-4398",
+                    "id": id,
+                    "agent_id": "ai:alice",
+                    "governance": {"write": "any", knob: good},
+                }),
+            )
+            .unwrap_or_else(|e| panic!("{knob}={good} must land: {e}"));
+        }
+    }
+
     /// #2545 — claimed non-owner must not clear a SEVERED/dangling binding.
     #[test]
     fn clear_standard_refuses_unresolvable_binding_2545() {

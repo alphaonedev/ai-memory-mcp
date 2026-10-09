@@ -33091,6 +33091,69 @@ mod tests {
         assert_eq!(mem.metadata["agent_id"], "alice");
     }
 
+    /// #4398 — under the composed #4285 x #4357 rule an EXPLICIT value decides,
+    /// and an explicit value that is not a non-negative integer fitting `u32`
+    /// fails CLOSED at that level (approval threshold 0 / promotion floor
+    /// `u32::MAX`) instead of being severed and letting a permissive ancestor
+    /// decide. `null` stays the explicit opt-in to inherit.
+    #[test]
+    fn non_integer_depth_knobs_fail_closed_at_their_level_4398() {
+        let conn = test_db();
+        let mut top = make_memory("std-top-4398", "_standards-4398", Tier::Long, 9);
+        top.metadata = serde_json::json!({"governance": {
+            "write": "any",
+            "require_approval_above_depth": 5,
+            "skill_promotion_min_depth": 0,
+        }});
+        let top_id = insert(&conn, &top).unwrap();
+        set_namespace_standard(&conn, "gov4398", &top_id, None).unwrap();
+        let bad_values = [
+            serde_json::json!("3"),
+            serde_json::json!(-1),
+            serde_json::json!(2.5),
+            serde_json::json!(true),
+            serde_json::json!([3]),
+            serde_json::json!({"n": 3}),
+        ];
+        for (i, bad) in bad_values.iter().enumerate() {
+            let mut leaf = make_memory(&format!("std-leaf-4398-{i}"), "_standards-4398", Tier::Long, 9);
+            leaf.metadata = serde_json::json!({"governance": {
+                "write": "any",
+                "require_approval_above_depth": bad,
+                "skill_promotion_min_depth": bad,
+            }});
+            let leaf_id = insert(&conn, &leaf).unwrap();
+            set_namespace_standard(&conn, "gov4398/leaf", &leaf_id, Some("gov4398")).unwrap();
+            assert_eq!(
+                resolve_require_approval_above_depth(&conn, "gov4398/leaf").unwrap(),
+                Some(0),
+                "approval: {bad} must fail closed, not inherit the ancestor's 5"
+            );
+            assert_eq!(
+                resolve_skill_promotion_min_depth(&conn, "gov4398/leaf").unwrap(),
+                Some(u32::MAX),
+                "promotion: {bad} must fail closed, not inherit the ancestor's 0"
+            );
+        }
+        // Control: `null` inherits; an integer decides.
+        let mut null_leaf = make_memory("std-leaf-4398-null", "_standards-4398", Tier::Long, 9);
+        null_leaf.metadata = serde_json::json!({"governance": {
+            "write": "any",
+            "require_approval_above_depth": null,
+            "skill_promotion_min_depth": null,
+        }});
+        let null_id = insert(&conn, &null_leaf).unwrap();
+        set_namespace_standard(&conn, "gov4398/leaf", &null_id, Some("gov4398")).unwrap();
+        assert_eq!(
+            resolve_require_approval_above_depth(&conn, "gov4398/leaf").unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            resolve_skill_promotion_min_depth(&conn, "gov4398/leaf").unwrap(),
+            Some(0)
+        );
+    }
+
     /// #3202 Fable HIGH — a STORE-class destination Approve on vertical
     /// promote must clone via `promote_to_namespace`, not
     /// `from_value::<Memory>` the `{id, to_namespace, mode:"vertical"}`
