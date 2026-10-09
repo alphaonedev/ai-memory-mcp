@@ -283,7 +283,9 @@ certification and triggers re-cert** (see §7).
 > wrong to fire** — and the measured substance is nil. A record stating only the
 > second reads as an excuse; only the first hides what changed. Discharged by
 > full re-issue, not by argument (the amendment-without-re-mint route was closed
-> by #3556).
+> for a LIVE banner by #3556; #6124 reopened it only as a non-discharging record
+> while the banner is EXPIRED or VOID, and full re-issue under WP-B1 remains the
+> only discharge).
 >
 > §5.4(2)–(5) were **re-run at `eae99be43`**, not carried forward: between the
 > two binds rehearsal also took #3877 (record-stop gate fail-CLOSED + fixture
@@ -344,10 +346,13 @@ certification and triggers re-cert** (see §7).
 > §7 states the certification expires on **any** change to the federation wire
 > path and carries no comment-only carve-out, so tree-equivalence does not
 > discharge it. Nor does an amendment-without-re-mint: that route (used by the
-> 2026-08-28 and 2026-09-02 amendments) was closed by #3556, which hardened
-> `check-cert-expiry.sh` so predicate (B) requires the banner itself to move
-> and predicate (C) fails a LIVE banner over watched drift. **Discharged by
-> full re-issue**, not by argument.
+> 2026-08-28 and 2026-09-02 amendments) was closed for a LIVE banner by #3556,
+> which hardened `check-cert-expiry.sh` so predicate (B) requires the banner
+> itself to move and predicate (C) fails a LIVE banner over watched drift.
+> #6124 reopened it only as a non-discharging record while the banner is
+> EXPIRED or VOID (a NEW amendment below STATUS listing exactly the changed
+> watched paths and `AI_MEMORY_FED_*` identifiers and citing #6063); it never
+> re-mints. **Discharged by full re-issue** (WP-B1, #6063), not by argument.
 >
 > §5.4(2)–(5) were **re-run at `92209ad91`**, not carried forward — the same
 > batch moved `doctor --posture` check #15 (#3866) and the pg connect funnel,
@@ -1509,7 +1514,7 @@ it only if the STATUS line or the Binds-to line changed (an incidental
 prose edit is not a re-issue), and a banner that says LIVE bound to a SHA
 with §7-watched drift between that SHA and HEAD goes RED on every PR until
 the document is re-issued at HEAD or its STATUS is set to VOID/EXPIRED —
-the one-line remedy the failure names. Its reported context is declared in
+the one-line remedy the failure names. While the banner is EXPIRED or VOID at both ends, [**#6124**](https://github.com/alphaonedev/ai-memory-mcp/issues/6124) also accepts a NEW amendment below STATUS that lists exactly the changed watched paths and identifiers and cites #6063, as a non-discharging record (never a re-mint). Its reported context is declared in
 `scripts/qc-allowlists/required-contexts-release.txt`; until the
 operator-gated branch-protection API call adds it to the live required
 set, the gate is a red check, not a merge block.)
