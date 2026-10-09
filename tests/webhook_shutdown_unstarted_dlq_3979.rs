@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use ai_memory::config::set_allow_loopback_webhooks;
 use ai_memory::subscriptions::{self, NewSubscription, override_dispatch_concurrency_for_tests};
 use common::tls_receiver::{TlsReceiver, ack_echo_slow};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
 mod common;
 use common::fresh_db_tempfile_path as fresh_db;
@@ -94,15 +94,6 @@ fn rows_by_subscription(db_path: &std::path::Path) -> BTreeMap<String, Rows> {
         out.entry(sub).or_default().dlq.push((corr, err, retries));
     }
     out
-}
-
-fn audit_row_count(db_path: &std::path::Path) -> i64 {
-    Connection::open(db_path)
-        .expect("open audit db")
-        .query_row("SELECT COUNT(*) FROM subscription_events", params![], |r| {
-            r.get(0)
-        })
-        .expect("count events")
 }
 
 /// Each dispatched delivery has its audit row (it had started) or exactly
@@ -194,10 +185,11 @@ fn a_delivery_queued_at_the_drain_deadline_gets_a_dlq_row_not_silence_3979() {
         subscriptions::dispatch_event(&conn, "memory_store", "mem-3979", "ns-3979", None, &db_path);
 
         // Wait for the delivery that won the single permit to start: its
-        // worker writes the audit row before the first send. The other one
-        // is now queued behind the permit.
+        // worker's first send reaches the receiver. The other one is now
+        // queued behind the permit. (#3980 writes BOTH audit rows at
+        // admission, so an audit row no longer signals a started worker.)
         let started_by = Instant::now() + START_DEADLINE;
-        while audit_row_count(&db_path) < 1 {
+        while receiver.received_count().await < 1 {
             assert!(
                 Instant::now() < started_by,
                 "no delivery worker started within {START_DEADLINE:?}; the test \

@@ -1301,7 +1301,9 @@ pub async fn dispatch_event_postgres(
         lock.1.clone()
     };
 
+    // #3980 — `None`: the admission audit rows go to the sqlite sidecar at
+    // `db_path`, opened once for the whole batch.
     crate::subscriptions::dispatch_event_to_subs(
-        matching, event, memory_id, namespace, agent_id, &db_path, details,
+        None, matching, event, memory_id, namespace, agent_id, &db_path, details,
     );
 }

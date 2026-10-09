@@ -33,6 +33,8 @@ use crate::models::field_names;
 
 // #3659 — delivery-audit bookkeeping evidence (counters, /metrics, /health).
 pub mod audit_status;
+// #3980 — the per-delivery audit row, persisted at admission.
+mod admission;
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
@@ -119,8 +121,8 @@ pub async fn wait_dispatch_idle() {
 /// a fatal shutdown (a late worker could write after the final audit
 /// checkpoint), while a one-shot CLI treats it as a loud WARN — its write
 /// is already durable.
-/// A crash never reaches this drain: deliveries not yet started are lost
-/// on a crash (#3979).
+/// A crash never reaches this drain: a delivery not yet started keeps its
+/// `pending` admission audit row (#3980), readable through replay.
 ///
 /// v1.0.0 #3403 — extracted so the daemon-shutdown drain and the
 /// one-shot-CLI drain are the SAME wait, not two similar loops. Delivery
@@ -1016,7 +1018,14 @@ pub fn dispatch_event_with_details(
         })
         .collect();
     dispatch_event_to_subs(
-        matching, event, memory_id, namespace, agent_id, db_path, details,
+        Some(conn),
+        matching,
+        event,
+        memory_id,
+        namespace,
+        agent_id,
+        db_path,
+        details,
     );
 }
 
@@ -1035,6 +1044,7 @@ pub fn dispatch_event_with_details(
 /// SAL store handle. A future SAL audit-log surface (#-tracking)
 /// will route this through the trait too.
 pub fn dispatch_event_to_subs(
+    admission_conn: Option<&Connection>,
     matching: Vec<(Subscription, Option<String>)>,
     event: &str,
     memory_id: &str,
@@ -1090,6 +1100,11 @@ pub fn dispatch_event_to_subs(
     // secret. In production the setter runs once at boot, so this only
     // removes a test-visible race; the value is behaviour-identical.
     let server_wide_secret = crate::config::active_hooks_hmac_secret();
+    // #3980 — every delivery's `pending` audit row is written HERE, before
+    // anything is spawned, so a crash cannot lose an admitted delivery; the
+    // spawns wait until the batch has committed (`admission.rs`).
+    let admission = admission::Admission::begin(admission_conn, db_path);
+    let mut staged = Vec::new();
     for (sub, sub_secret_hash) in matching {
         // v0.7.0 K6 — UUIDv7 correlation id is generated per
         // (subscription, event) pair so receivers can correlate ACKs
@@ -1121,6 +1136,9 @@ pub fn dispatch_event_to_subs(
         let db_path = db_path.to_path_buf();
         let secret_hash_owned = sub_secret_hash.clone();
         let server_wide_secret_owned = server_wide_secret.clone();
+        if !admission.admit(&sub_id, &correlation_id, &event_owned, &body) {
+            continue;
+        }
         // #3979 — registered BEFORE the worker is spawned; the worker's
         // first act is to claim it. Until then the shutdown drain can
         // record it to the DLQ instead of dropping it with the runtime.
@@ -1165,69 +1183,8 @@ pub fn dispatch_event_to_subs(
                     None
                 }
             };
-            // Persist the per-delivery audit row BEFORE the network
-            // send so replay-from-cursor (K7) sees a stable record
-            // even if the dispatcher process crashes mid-retry. Only
-            // from HERE on: before this INSERT the delivery exists only
-            // in memory (#3979 — lost on a crash, DLQ'd at a drain miss).
-            let event_audit_result = if let Some(c) = worker_conn.as_ref() {
-                record_subscription_event_with_conn(
-                    c,
-                    &sub_id,
-                    &correlation_id,
-                    &event_owned,
-                    &body,
-                )
-            } else {
-                record_subscription_event(&db_path, &sub_id, &correlation_id, &event_owned, &body)
-            };
-            if let Err(e) = event_audit_result {
-                // #3191 F-5 (fail-closed) — the per-delivery `subscription_events`
-                // row is the DURABLE record that this webhook fired. Pre-fix a
-                // failed audit write only logged a WARN and then dispatched the
-                // payload ANYWAY, so a webhook could reach the subscriber with NO
-                // audit row — an unattributable, unreplayable side effect. Refuse
-                // to dispatch: route the delivery to the DLQ (durable + replayable
-                // via `memory_subscription_replay`) and return, so the event is
-                // never lost — only deferred. An event that cannot be audited is
-                // not sent.
-                tracing::warn!(
-                    "subscription {sub_id} dispatch refused: event audit write failed: {e}; \
-                     routing to DLQ instead of dispatching unaudited (#3191 F-5)"
-                );
-                let failed_at = chrono::Utc::now().to_rfc3339();
-                let last_error =
-                    format!("event audit write failed; dispatch refused fail-closed: {e}");
-                let dlq_result = if let Some(c) = worker_conn.as_ref() {
-                    record_dlq_with_conn(
-                        c,
-                        &sub_id,
-                        &correlation_id,
-                        &event_owned,
-                        &body,
-                        0,
-                        &last_error,
-                        &failed_at,
-                        &failed_at,
-                    )
-                } else {
-                    record_dlq(
-                        &db_path,
-                        &sub_id,
-                        &correlation_id,
-                        &event_owned,
-                        &body,
-                        0,
-                        &last_error,
-                        &failed_at,
-                        &failed_at,
-                    )
-                };
-                if let Err(de) = dlq_result {
-                    tracing::warn!("subscription DLQ write failed after audit failure: {de}");
-                }
-                return;
-            }
+            // #3980 — the `pending` audit row was written at admission;
+            // from here on the worker only settles it.
             let secret_hash = secret_hash_owned;
             let server_wide_secret = server_wide_secret_owned;
             // Canonical string: "<timestamp>.<body>". Keyed HMAC over
@@ -1353,6 +1310,16 @@ pub fn dispatch_event_to_subs(
             }
         };
 
+        staged.push((ticket, work));
+    }
+    if let Err(e) = admission.commit() {
+        tracing::warn!("subscription dispatch: admission commit failed: {e}; refusing the batch");
+        for (ticket, _work) in staged {
+            unstarted::refuse(ticket, &e);
+        }
+        return;
+    }
+    for (_ticket, work) in staged {
         // PERF-3 (FX-10) — production path: bounded semaphore + Tokio
         // blocking pool. The semaphore caps concurrent in-flight
         // deliveries at the operator-tunable bound; permits are

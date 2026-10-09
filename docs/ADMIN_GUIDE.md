@@ -911,8 +911,9 @@ deliveries that had not started yet are recorded to the subscription DLQ
 `memory_subscription_dlq_list`) rather than dropped. The shutdown log line
 counts the started, DLQ-recorded and unrecordable deliveries (#3979). A
 crash or `SIGKILL` skips this step: webhook deliveries that had not started
-are lost, and neither replay nor the DLQ shows them. Use the graceful stop
-path above.
+keep the `pending` audit row written when they were admitted (#3980), so
+`memory_subscription_replay` returns them, but nothing re-sends them
+automatically. Use the graceful stop path above.
 
 > **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
 

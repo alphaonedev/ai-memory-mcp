@@ -4,13 +4,11 @@
 //! #3979 — webhook deliveries that were admitted but whose worker has not
 //! started yet.
 //!
-//! A delivery's `subscription_events` audit row is written by its worker,
-//! and the worker runs only once the delivery holds a `DISPATCH_SEMAPHORE`
-//! permit AND the tokio blocking pool has started it. Admission itself
-//! persists nothing. Before #3979, a delivery still waiting at the shutdown
-//! drain deadline was dropped with the runtime: no audit row, no
-//! `subscription_dlq` row, invisible to `memory_subscription_replay` and to
-//! `memory_subscription_dlq_list`.
+//! A delivery's worker runs only once the delivery holds a
+//! `DISPATCH_SEMAPHORE` permit AND the tokio blocking pool has started it.
+//! Before #3979, a delivery still waiting at the shutdown drain deadline was
+//! dropped with the runtime: no `subscription_dlq` row, and (before #3980,
+//! which moved the audit INSERT to admission) no audit row either.
 //!
 //! Every admitted delivery is now registered in [`REGISTRY`] until one of
 //! two parties takes it:
@@ -27,11 +25,13 @@
 //! the deadline (a one-shot CLI still finishing), the worker can still claim
 //! and deliver it.
 //!
-//! **Not covered: a crash.** The table lives in process memory. A SIGKILL,
-//! an OOM kill or a panic-abort before the drain loses every delivery that
-//! had not started, exactly as before. Closing that needs the audit row
-//! persisted at admission, on the dispatching caller's connection (#3979
-//! follow-up, #3980).
+//! **A crash.** The table lives in process memory, so a SIGKILL, an OOM
+//! kill or a panic-abort before the drain skips this sweep. Since #3980 such
+//! a delivery still has its `pending` admission audit row (written on the
+//! dispatching caller's connection before any spawn, see `admission.rs`), so
+//! `memory_subscription_replay` returns it; it is not re-sent automatically.
+//! On a drain miss the sweep replaces that `pending` row with the DLQ row in
+//! one transaction, so a delivery still has exactly one durable record.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -122,6 +122,38 @@ pub struct UnstartedSweep {
     pub unrecorded: usize,
 }
 
+/// #3980 — the admission batch that carried this delivery could not be
+/// committed, so it has no audit row: take it back before any worker runs and
+/// route it to the DLQ instead of sending it unaudited (#3191 F-5 shape).
+pub(super) fn refuse(ticket: Ticket, cause: &anyhow::Error) {
+    let Some(d) = REGISTRY.table().remove(&ticket.0) else {
+        return;
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let last_error = format!("event audit write failed; dispatch refused fail-closed: {cause}");
+    if let Err(e) = super::record_dlq(
+        &d.db_path,
+        &d.sub_id,
+        &d.correlation_id,
+        &d.event,
+        &d.body,
+        0,
+        &last_error,
+        &now,
+        &now,
+    ) {
+        tracing::error!(
+            target: TRACE_TARGET,
+            subscription_id = %d.sub_id,
+            correlation_id = %d.correlation_id,
+            event_type = %d.event,
+            error = %e,
+            "admission refusal: could not record an unaudited webhook delivery to the \
+             DLQ; it is not sent and has no durable record (#3980)"
+        );
+    }
+}
+
 /// Record every delivery whose worker has not started to the DLQ, at the
 /// shutdown drain deadline.
 ///
@@ -144,18 +176,17 @@ impl Registry {
         let now = chrono::Utc::now().to_rfc3339();
         let mut sweep = UnstartedSweep::default();
         table.retain(|_, d| {
-            // `record_dlq` opens its own connection per row: one open per
-            // stranded delivery, once, at shutdown. It is the same capped,
-            // atomic insert every other DLQ row goes through (#1253, #3191 F-4).
-            let result = super::record_dlq(
+            // One connection per stranded delivery, once, at shutdown; the same
+            // capped, atomic insert every other DLQ row goes through (#1253,
+            // #3191 F-4). #3980 — in the same transaction it deletes the
+            // delivery's `pending` admission row: one durable record, never two.
+            let result = super::admission::transfer_unstarted_to_dlq(
                 &d.db_path,
                 &d.sub_id,
                 &d.correlation_id,
                 &d.event,
                 &d.body,
-                0,
                 super::dlq_reason::SHUTDOWN_UNSTARTED,
-                &now,
                 &now,
             );
             match result {
