@@ -693,7 +693,8 @@ def _self_test_cases() -> int:
                      "head change\n\napprove: Justin")
     env_pins = config_free_env()
     if (env_pins.get("GIT_CONFIG_NOSYSTEM") != "1" or env_pins.get("GIT_CONFIG_GLOBAL") != os.devnull
-            or env_pins.get("HOME") != os.devnull or env_pins.get("GIT_CEILING_DIRECTORIES") != os.sep):
+            or env_pins.get("HOME") != os.devnull or env_pins.get("GIT_CEILING_DIRECTORIES") != os.sep
+            or env_pins.get("GIT_DIR") != os.devnull):
         print(f"FAIL: self-test - the trailer parser environment is not config-free: {env_pins!r}", file=sys.stderr)
         failures.append("config-free env")
     else:
@@ -723,6 +724,53 @@ def _self_test_cases() -> int:
         else:
             print(f"FAIL: self-test - a trailer parser that {label} did not fail closed (#6396)", file=sys.stderr)
             failures.append(f"parser {label}")
+
+    # #6433: the parser must not discover a repository from ANY working directory. GIT_CEILING_DIRECTORIES stops an
+    # upward walk but does not exclude the working directory itself, so a parser started inside a repository (a
+    # repository at the filesystem root, or a dropped cwd) would read that repository's trailer config.
+    alias_repo = base_dir / "alias-repo"
+    subprocess.run(["git", "init", "-q", str(alias_repo)], check=True)
+    subprocess.run(["git", "-C", str(alias_repo), "config", "trailer.approve.key", "Rule-Change-Approved-By"], check=True)
+    inside = subprocess.run(["git", "interpret-trailers", "--parse", "--no-divider"], input=b"s\n\napprove: Justin\n",
+                            capture_output=True, check=False, cwd=str(alias_repo), env=config_free_env())
+    if b"Rule-Change-Approved-By" in inside.stdout:
+        print("FAIL: self-test - the trailer parser environment still finds a repository from its working directory"
+              " (#6433)", file=sys.stderr)
+        failures.append("parser environment repository")
+    else:
+        print("PASS: self-test - the trailer parser environment does not find a repository from its working directory"
+              " (#6433)")
+
+    def recorded_parser_call():
+        """Run trailer_block with a recording `git` first on PATH: the working directory and GIT_DIR it was given."""
+        fake = base_dir / "fakegit-record"
+        fake.mkdir()
+        record = base_dir / "fakegit-record.txt"
+        (fake / "git").write_text(f"#!{sys.executable}\nimport os\n"
+                                  f"open({str(record)!r}, 'w').write(os.getcwd() + '\\n' + os.environ.get('GIT_DIR', '<unset>'))\n",
+                                  encoding="utf-8")
+        (fake / "git").chmod(0o755)
+        saved_path = os.environ.get("PATH")
+        os.environ["PATH"] = str(fake)
+        try:
+            trailer_block(b"subject\n")
+            return record.read_text(encoding="utf-8").split("\n")
+        finally:
+            if saved_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = saved_path
+
+    try:
+        seen_cwd, seen_git_dir = recorded_parser_call()
+    except (RuntimeError, OSError, ValueError) as exc:
+        seen_cwd, seen_git_dir = repr(exc), None
+    if seen_cwd != os.path.realpath(os.sep) or seen_git_dir != os.devnull:
+        print(f"FAIL: self-test - the trailer parser runs from the filesystem root with GIT_DIR at the null device"
+              f" (#6433): cwd={seen_cwd!r} GIT_DIR={seen_git_dir!r}", file=sys.stderr)
+        failures.append("parser cwd and GIT_DIR")
+    else:
+        print("PASS: self-test - the trailer parser runs from the filesystem root with GIT_DIR at the null device (#6433)")
 
     parser_failure("exits non-zero", "import sys\nsys.stderr.write('boom')\nsys.exit(3)\n")
     parser_failure("is missing", None)
