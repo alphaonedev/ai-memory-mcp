@@ -1144,9 +1144,12 @@ jobs:
         # wire change fail-closes, and a pure banner reformat is GREEN.
         # (#6137) A stale-LIVE head banner is GREEN at the pull_request
         # merge commit when the live base records EXPIRED, a head that
-        # flips the banner is detected over merge-base..merge-commit, a
-        # stale payload base sha is ignored for the live base ref, and a
-        # missing or unresolvable base ref / head / merge commit fail-closes.
+        # flips the banner is detected over base-tip..merge-commit, a
+        # stale payload base sha is ignored for the live base ref, a stale
+        # branch is not charged for base-side wire changes (pr5), a PR wire
+        # change without a banner flip is RED (pr6), and a missing or
+        # unresolvable base ref / head / merge commit or a first parent that
+        # is not the live base tip fail-closes.
         run: python3 scripts/check_cert_expiry.py --self-test
 
   foreign-text-to-caller-gate:

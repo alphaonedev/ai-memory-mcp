@@ -42,14 +42,20 @@ RANGE RESOLUTION.
                    commit, never at the PR head in isolation, so a branch cut
                    before the carrier's banner fix is judged on the tree that
                    would actually merge. The merge-base is computed against
-                   the LIVE base ref (`git merge-base origin/$GITHUB_BASE_REF
-                   $PR_HEAD_SHA`, fetching that ref explicitly when absent),
-                   NOT the event payload's PR_BASE_SHA, which can be stale.
-                   Drift detection (A) runs over merge-base..merge-commit.
+                   the LIVE base ref (`origin/$GITHUB_BASE_REF`, fetched
+                   explicitly when absent), NOT the event payload's
+                   PR_BASE_SHA, which can be stale. A PR's change is its
+                   effect on the merged result, so (A) drift and (B) the
+                   banner flip are measured from the merge commit's first
+                   parent (verified to be the live base tip) to the merge
+                   commit: base-side changes since the fork point were judged
+                   when they landed on the base. (Conductor decision, no vote:
+                   precedent = every other CI job tests the merge ref.)
                    Fail-closed when GITHUB_BASE_REF / PR_HEAD_SHA are unset,
                    the base ref cannot be fetched, a sha does not resolve, the
-                   merge commit does not descend from PR_HEAD_SHA, or the
-                   merge-base is unresolvable after a shallow deepen.
+                   merge commit does not descend from PR_HEAD_SHA, is not a
+                   two-parent merge, or its first parent is not the live base
+                   tip.
   push             github.event.before .. GITHUB_SHA. An all-zero `before`
                    (new branch / first push) is N/A-skip, never a false-fail.
   workflow_dispatch / other / empty
@@ -61,7 +67,8 @@ RANGE RESOLUTION.
 
 THE TWO PREDICATES #3556 ADDS (2026-09-21).
   (B) a cert-doc edit satisfies the hatch ONLY if the STATUS line or the
-      Binds-to line changed between merge-base and the judged commit (a
+      Binds-to line changed between the range start (merge-base; on a
+      pull_request the base tip) and the judged commit (a
       re-issue rebinds; a voiding record flips STATUS; prose does neither).
   (C) at the judged commit, a banner that says LIVE bound to <sha> must have
       NO wire-surface drift between <sha> and that commit (paths and
@@ -355,15 +362,44 @@ def check_banner_consistency(repo, judged):
     return False, lines
 
 
+def pr_base_tip(repo, base, tip):
+    """First parent of the pull_request merge commit, which must be the live
+    base tip; anything else is not the PR's merge result (fail-closed)."""
+    parents = git_text(repo, "rev-list", "--parents", "-n", "1", tip).split()
+    if len(parents) != 3:
+        raise GateError(
+            f"merge commit {tip} does not have exactly two parents "
+            "(not a pull_request merge result)"
+        )
+    first = parents[1]
+    live = git_text(repo, "rev-parse", "--verify", f"{base}^{{commit}}")
+    if first != live:
+        raise GateError(
+            f"merge commit {tip} first parent {first} is not the live base tip "
+            f"{live}; the base moved after the merge ref was built, re-run the job"
+        )
+    return first
+
+
 def check_change(repo, base, head, tip=None):
-    """Judge the change. `base`/`head` define the merge-base; the change under
-    test is merge-base..judged where judged is `tip` (the pull_request merge
-    commit, #6137) or, when no tip is given, `head`. Returns (ok, text)."""
+    """Judge the change. Without `tip` it is merge-base(base, head)..head. With
+    `tip` (the pull_request merge commit, #6137) it is tip^1..tip, tip^1 being
+    verified as the live base tip. Returns (ok, text)."""
     judged = tip if tip else head
     refs = [base, head] + ([tip] if tip else [])
     if not all(is_commit(repo, r) for r in refs):
         return False, f"{PREFIX}: ERROR — cannot resolve range {base}..{judged} (fail-closed)"
-    mb = resolve_merge_base(repo, base, head)
+    if tip:
+        # #6137 (conductor decision): a pull_request's change is its effect on
+        # the merged result, so (A)/(B) compare the base tip (the merge
+        # commit's first parent) with the merge commit. Base-side changes
+        # since the fork point were judged when they landed on the base.
+        try:
+            mb = pr_base_tip(repo, base, tip)
+        except GateError as exc:
+            return False, f"{PREFIX}: ERROR — {exc} (fail-closed)"
+    else:
+        mb = resolve_merge_base(repo, base, head)
     if mb is None:
         return False, (
             f"{PREFIX}: ERROR — no merge-base for {base}..{head} "
@@ -441,8 +477,8 @@ def _judge(repo, base, head, judged, mb, tip):
     out.append("")
     if tip:
         out.append(
-            f"Range: {mb}..{judged}  (merge-base of {base} and {head}; judged at "
-            "the pull_request merge commit)"
+            f"Range: {mb}..{judged}  (base tip to the pull_request merge commit; "
+            "judged at the pull_request merge commit)"
         )
     else:
         out.append(f"Range: {mb}..{judged}  (merge-base of {base} and {head})")
@@ -958,16 +994,16 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     err = err + captured.getvalue()
     if rc != 0:
         t.fail("(pr3): a stale payload PR_BASE_SHA broke the pull_request verdict:", out + err)
-    elif f"unchanged in {stale_tip}..{pr_merge}" not in out:
-        t.fail("(pr3): the live base was NOT used (merge-base should be the stale branch point):", out)
+    elif f"unchanged in {healed_base}..{pr_merge}" not in out:
+        t.fail("(pr3): the live base was NOT used (range should be base tip..merge commit):", out)
     elif "using the live base" not in err:
         t.fail("(pr3): the stale payload base was not reported:", err)
 
     # (pr3b) the stale payload base would have given a different range: prove
     #        the verdict text changes if the stale sha were honoured.
-    stale_text = check_change(repo, genesis, feature, pr_merge)[1]
-    if f"unchanged in {genesis}.." in stale_text:
-        t.fail("(pr3b): control: stale-base range unexpectedly reads as unchanged", stale_text)
+    stale_ok, stale_text = check_change(repo, genesis, feature, pr_merge)
+    if stale_ok or "not the live base tip" not in stale_text:
+        t.fail("(pr3b): a stale base that is not the merge commit's first parent did not fail closed", stale_text)
 
     # (pr2) the head FLIPS the banner (voiding record + wire change) while the
     #       live base has moved on: detected over merge-base..merge-commit.
@@ -984,7 +1020,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     t.expect_green("pr2", "head that flips the banner (VOID) with the base moved on", repo,
                    moved_base, flip, [
         ("cert doc re-issued/voided", "did not detect the banner flip over merge-base..merge-commit"),
-        (f"{base}..{flip_merge}", "did not measure merge-base..merge-commit"),
+        (f"{moved_base}..{flip_merge}", "did not measure base tip..merge-commit"),
     ], tip=flip_merge)
     # (pr2b) the same wire change WITHOUT the banner flip is still RED there.
     fx.reset(moved_base)
@@ -1000,6 +1036,46 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         ("judged at the pull_request merge commit", "did not say it judged the merge commit"),
     ], tip=noflip_merge)
 
+    # (pr5) conductor decision (#6137): the banner is already EXPIRED at the
+    #       fork point, the base then gained a wire change, and a stale branch
+    #       with no wire change of its own must PASS (the base-side change was
+    #       judged when it landed; the PR's own effect is nil).
+    fx.reset(base)
+    fx.banner("EXPIRED", genesis)
+    fork5 = fx.commit([CERT_DOC], "base: banner EXPIRED at the fork point")
+    fx.g("checkout", "-q", "-b", "stale5", fork5)
+    fx.write("src/unrelated.rs", "// stale5 branch work\n", append=True)
+    stale5 = fx.commit(["src/unrelated.rs"], "stale5: unrelated change, no wire change")
+    fx.g("checkout", "-q", "main")
+    fx.write(mod_rs, "// base-side wire change after the fork\n", append=True)
+    base5 = fx.commit([mod_rs], "base gains a wire change after the fork (banner already EXPIRED)")
+    fx.g("update-ref", "refs/remotes/origin/main", base5)
+    merge5 = fx.merge("stale5", "Merge stale5 into main")
+    if mod_rs not in changed_paths(repo, fork5, merge5):
+        t.fail("(pr5): control: merge-base..merge-commit no longer sees the base-side wire change")
+    t.expect_green("pr5", "stale branch with no wire change over a base that gained one", repo,
+                   base5, stale5, [
+        (f"unchanged in {base5}..{merge5}", "did not measure base tip..merge-commit"),
+    ], tip=merge5)
+    rc, out, err = run_gate(repo, dict(pr_env, PR_HEAD_SHA=stale5, GITHUB_SHA=merge5))
+    if rc != 0:
+        t.fail("(pr5-gate): pull_request event on the stale branch did not pass end to end:", out + err)
+
+    # (pr6) the PR itself adds a wire change, does not flip the banner, base
+    #       unchanged: still RED under (A)/(B).
+    fx.reset(base)
+    fx.g("checkout", "-q", "-b", "wire6", base)
+    fx.write(mod_rs, "// wire6 branch wire change\n", append=True)
+    wire6 = fx.commit([mod_rs], "wire6: wire change, banner untouched")
+    fx.g("checkout", "-q", "main")
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+    merge6 = fx.merge("wire6", "Merge wire6 into main")
+    t.expect_red("pr6", "PR wire change without a banner flip, base unchanged", repo, base, wire6, [
+        (sentence, "did not carry the required section 7 expiry sentence"),
+        (mod_rs, "did not name the watched path"),
+        (f"{base}..{merge6}", "did not measure base tip..merge-commit"),
+    ], tip=merge6)
+
     # (pr4) pull_request fail-closed cells.
     pr_base_env = _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=feature,
                             GITHUB_BASE_REF="main", GITHUB_SHA=pr_merge,
@@ -1013,6 +1089,9 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         "base ref neither local nor fetchable": dict(pr_base_env, GITHUB_BASE_REF="no-such-branch"),
         "option-shaped base ref": dict(pr_base_env, GITHUB_BASE_REF="--upload-pack=x"),
     }
+    # The merge ref was built on an older base tip than the live base: fail closed.
+    fx.g("update-ref", "refs/remotes/origin/main", merge5)
+    closed["live base moved after the merge ref was built"] = dict(pr_base_env, GITHUB_SHA=pr_merge)
     for why, env in closed.items():
         rc, _out, _err = run_gate(repo, env)
         if rc == 0:
@@ -1084,9 +1163,11 @@ SELF_TEST_OK = (
     "(z) pure banner reformat on a docs-only change GREEN (tolerant parse); (z2) reformat + "
     "wire change RED as incidental, not unparseable; (pr1) #6137 stale-LIVE head banner with "
     "the base EXPIRED GREEN at the merge commit (and RED if judged at the head alone); (pr2) "
-    "head that flips the banner detected over merge-base..merge-commit, and a wire change "
+    "head that flips the banner detected over base-tip..merge-commit, and a wire change "
     "without the flip RED; (pr3) stale payload PR_BASE_SHA ignored, the live base ref used; "
-    "(pr4) pull_request fail-closed on missing/unresolvable base ref, head or merge commit."
+    "(pr4) pull_request fail-closed on missing/unresolvable base ref, head or merge commit, "
+    "or a first parent that is not the live base tip; (pr5) stale branch without a wire change "
+    "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED."
 )
 
 
