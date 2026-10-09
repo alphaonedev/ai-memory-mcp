@@ -410,55 +410,59 @@ async fn issue_6125_http_promote_404_body_is_unchanged() {
     assert_eq!(v["error"], "reflection not found: no-such-reflection");
 }
 
+/// Seed one observation and a depth-1 reflection over it in `db_path`; returns
+/// the reflection id.
+fn seed_reflection(db_path: &std::path::Path) -> String {
+    let conn = ai_memory::db::open(&db_path).unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let src = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: ai_memory::models::Tier::Mid,
+        namespace: "ns".into(),
+        title: "source".into(),
+        content: "body of source".into(),
+        tags: vec![],
+        priority: 5,
+        confidence: 1.0,
+        source: "cli".into(),
+        access_count: 0,
+        created_at: now.clone(),
+        updated_at: now,
+        last_accessed_at: None,
+        expires_at: None,
+        metadata: json!({}),
+        reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
+        ..Default::default()
+    };
+    let src_id = ai_memory::db::insert(&conn, &src).unwrap();
+    ai_memory::db::reflect(
+        &conn,
+        &ai_memory::db::ReflectInput {
+            source_ids: vec![src_id],
+            title: "reflection".into(),
+            content: "Synthesised insight: pattern X implies action Y.".into(),
+            namespace: Some("ns".into()),
+            tier: ai_memory::models::Tier::Mid,
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "cli".into(),
+            agent_id: "ops:admin".into(),
+            metadata: json!({}),
+        },
+    )
+    .unwrap()
+    .id
+}
+
 /// #6133 - the retired-lineage refusal is first-party text: after the lineage
 /// is retired, a second promote answers 400 with the refusal verbatim (the
 /// MCP wire text of the same chain), never `internal storage error`.
 #[tokio::test]
 async fn issue_6133_http_promote_400_body_keeps_retired_lineage_refusal() {
     let (_dir, db_path) = fresh_db();
-    let reflection_id = {
-        let conn = ai_memory::db::open(&db_path).unwrap();
-        let now = chrono::Utc::now().to_rfc3339();
-        let src = ai_memory::models::Memory {
-            id: uuid::Uuid::new_v4().to_string(),
-            tier: ai_memory::models::Tier::Mid,
-            namespace: "ns".into(),
-            title: "source".into(),
-            content: "body of source".into(),
-            tags: vec![],
-            priority: 5,
-            confidence: 1.0,
-            source: "cli".into(),
-            access_count: 0,
-            created_at: now.clone(),
-            updated_at: now,
-            last_accessed_at: None,
-            expires_at: None,
-            metadata: json!({}),
-            reflection_depth: 0,
-            memory_kind: ai_memory::models::MemoryKind::Observation,
-            ..Default::default()
-        };
-        let src_id = ai_memory::db::insert(&conn, &src).unwrap();
-        ai_memory::db::reflect(
-            &conn,
-            &ai_memory::db::ReflectInput {
-                source_ids: vec![src_id],
-                title: "reflection".into(),
-                content: "Synthesised insight: pattern X implies action Y.".into(),
-                namespace: Some("ns".into()),
-                tier: ai_memory::models::Tier::Mid,
-                tags: vec![],
-                priority: 5,
-                confidence: 1.0,
-                source: "cli".into(),
-                agent_id: "ops:admin".into(),
-                metadata: json!({}),
-            },
-        )
-        .unwrap()
-        .id
-    };
+    let reflection_id = seed_reflection(&db_path);
     let (router, _db) = build_router_with_db_path(&db_path);
     let body = json!({"name": "retire-me", "description": "d"});
     let (status, v) = post_promote(router.clone(), &reflection_id, &body).await;
@@ -476,6 +480,29 @@ async fn issue_6133_http_promote_400_body_keeps_retired_lineage_refusal() {
         v["error"],
         "skill lineage 'ns/retire-me' is retired; unretire before re-registering"
     );
+}
+
+/// #6125 / S-F1 - a foreign (non-recognised) root at the route: the namespace
+/// governance table is gone, so the promote chain fails with a driver error.
+/// The 400 body is exactly the storage constant, with no chain text (table,
+/// SQL, path).
+#[tokio::test]
+async fn issue_6125_http_promote_400_body_for_foreign_error_is_exactly_the_storage_constant() {
+    let (_dir, db_path) = fresh_db();
+    let reflection_id = seed_reflection(&db_path);
+    ai_memory::db::open(&db_path)
+        .unwrap()
+        .execute_batch("DROP TABLE namespace_meta;")
+        .unwrap();
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let (status, v) = post_promote(
+        router,
+        &reflection_id,
+        &json!({"name": "good-name", "description": "d"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "internal storage error", "{v}");
 }
 
 // ---------------------------------------------------------------------------

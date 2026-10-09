@@ -745,39 +745,45 @@ mod promote_status_4622_tests {
         }
     }
 
-    /// #6125: for every refusal shape the HTTP body text equals the MCP wire
-    /// text of the same chain (both go through `mcp_foreign_err`), and the
-    /// first-party refusals are present in it.
+    /// #6125 / #6131 F3: for every refusal shape the HTTP body text equals the
+    /// text the REAL MCP handler (`handle_skill_promote_from_reflection`) puts
+    /// on the wire for the same input, and the first-party refusals are present
+    /// in it. The last case is a foreign root (the namespace governance table is
+    /// gone): both transports must answer the storage constant and nothing from
+    /// the chain, so a `format!("{e:#}")` body goes red here.
     #[test]
     fn issue_6125_http_body_text_matches_mcp_wire_text() {
         let (conn, _dir) = db();
         let id = seed(&conn, "r", MemoryKind::Reflection);
+        let (broken, _broken_dir) = db();
+        let broken_id = seed(&broken, "r", MemoryKind::Reflection);
+        broken
+            .execute_batch("DROP TABLE namespace_meta;")
+            .expect("break the namespace governance table");
         let long = "x".repeat(1025);
-        for (rid, name, desc, needle) in [
-            (id.as_str(), "BadName", "d", "spec \u{a7}3.1"),
-            (id.as_str(), "good-name", long.as_str(), "1024"),
+        let db_text = crate::mcp::error_text::DB_ERROR_TEXT;
+        for (c, rid, name, desc, needle) in [
+            (&conn, id.as_str(), "BadName", "d", "spec \u{a7}3.1"),
+            (&conn, id.as_str(), "good-name", long.as_str(), "1024"),
             (
+                &conn,
                 "absent-id",
                 "good-name",
                 "d",
                 "reflection not found: absent-id",
             ),
+            (&broken, broken_id.as_str(), "good-name", "d", db_text),
         ] {
             let params = json!({
-                "reflection_id": rid, "skill_name": name, "skill_description": desc
+                "reflection_id": rid, "skill_name": name, "skill_description": desc,
+                "agent_id": CALLER
             });
-            let run = || {
-                crate::mcp::handle_skill_promote_for_caller(
-                    &conn,
-                    &params,
-                    None,
-                    CALLER,
-                    Some(CALLER),
-                )
-                .expect_err("refused")
-            };
-            let wire = crate::mcp::error_text::mcp_foreign_err("parity", run());
-            let body = promote_error_message(run());
+            let wire = crate::mcp::handle_skill_promote_from_reflection(c, &params, None)
+                .expect_err("MCP refused");
+            let http_err =
+                crate::mcp::handle_skill_promote_for_caller(c, &params, None, CALLER, Some(CALLER))
+                    .expect_err("HTTP refused");
+            let body = promote_error_message(http_err);
             assert_eq!(body, wire, "HTTP and MCP text diverge for {name}");
             assert!(body.contains(needle), "{needle} missing from {body}");
         }
