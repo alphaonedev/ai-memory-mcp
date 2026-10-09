@@ -105,9 +105,17 @@ each unit is and WHAT is substituted into it:
     backslash characters removed (``c''argo`` reads as ``cargo``). That is a
     best-effort spelling view for REFUSALS only; it cannot see a name built by
     expansion (#4752, #4768).
-  * release-shape.yml is pinned as a skeleton: its top-level keys in order
+  * release.yml's own identity is pinned (#4936): the workflow ``name:``
+    (``RELEASE_WORKFLOW_NAME``), the whole ``on:`` value (``RELEASE_ON``: the
+    one ``workflow_dispatch`` trigger with its two inputs, ``dry_run``
+    defaulting to true) and the whole ``concurrency:`` value
+    (``RELEASE_CONCURRENCY``: one run per tag, ``cancel-in-progress: false`` so
+    a second dispatch can never cancel a release between its publish steps).
+  * release-shape.yml is pinned as a skeleton: its ``name:``
+    (``SHAPE_WORKFLOW_NAME``) and top-level keys in order
     (``SHAPE_TOP_KEYS``), the ``on:`` triggers (``SHAPE_ON``, branch and path
-    filters included), ``permissions:`` (``SHAPE_PERMISSIONS``) and ``env:``
+    filters included), ``permissions:`` (``SHAPE_PERMISSIONS``),
+    ``concurrency:`` (``SHAPE_CONCURRENCY``) and ``env:``
     (exactly the two ``CARGO_*`` values, ``SHAPE_ENV``); exactly one job,
     ``release-shape:``, whose keys are exactly ``name``/``runs-on``/
     ``timeout-minutes``/``steps`` with pinned values (``SHAPE_JOB``), so no job
@@ -229,14 +237,18 @@ class Double(str):
     """A pinned double-quoted scalar (no backslash: the parser refuses one)."""
 
 
+class Single(str):
+    """A pinned single-quoted scalar, compared by its decoded text."""
+
+
 class Block(tuple):
     """A pinned ``|`` literal block, compared line by line."""
 
 
-# Pinned YAML: str = plain scalar, Flow / Double = that style, Block = `|` lines,
-# dict = a mapping with exactly these keys, list = a sequence of exactly these
-# items, None = a key with no value.
-Spec = Union[str, Flow, Double, Block, Dict[str, object], List[object], None]
+# Pinned YAML: str = plain scalar, Flow / Double / Single = that style, Block =
+# `|` lines, dict = a mapping with exactly these keys, list = a sequence of
+# exactly these items, None = a key with no value.
+Spec = Union[str, Flow, Double, Single, Block, Dict[str, object], List[object], None]
 
 # The docker job is pinned WHOLE (#4719 SR-8/SR-9): it holds `packages: write`,
 # so anything it runs can put an image on the release tag. Every action is pinned
@@ -312,13 +324,35 @@ RELEASE_JOB_PERMISSIONS: Dict[str, Dict[str, Spec]] = {
     "docker": dict(DOCKER_JOB["permissions"]),  # type: ignore[arg-type]
     "copr": dict(_READ_ATTEST),
 }
+# release.yml identity, trigger and concurrency values, pinned whole (#4936): a
+# release run starts only from an operator `workflow_dispatch` whose `dry_run`
+# defaults to true, and an in-flight release is never cancelled by a second
+# dispatch for the same tag (a partial publish: GHCR pushed, attestations not).
+RELEASE_WORKFLOW_NAME = "Release (workflow_dispatch — operator-gated publish)"
+RELEASE_ON: Dict[str, Spec] = {
+    "workflow_dispatch": {"inputs": {
+        "tag": {"description": Single("Release tag to publish (must already exist on remote, e.g. v0.7.0)."),
+                "required": "true"},
+        "dry_run": {"description": Single("Build and verify everything but publish nothing. Set to false to publish."),
+                    "type": "boolean", "default": "true"},
+    }},
+}
+RELEASE_CONCURRENCY: Dict[str, Spec] = {"group": "release-${{ github.event.inputs.tag }}", "cancel-in-progress": "false"}
 # The only secrets release.yml may read: a new credential (a registry token in
 # another job) is refused until it is added here on purpose.
 RELEASE_SECRETS = ("GITHUB_TOKEN", "CARGO_REGISTRY_TOKEN", "HOMEBREW_TAP_TOKEN", "COPR_CONFIG")
 SECRET_REF_RE = re.compile(r"(?<![\w.-])secrets(?![\w-])(?P<ref>\s*\.\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*))?", re.I)
 # The image registry is named only inside the pinned docker job.
 REGISTRY = "ghcr.io"
-# release-shape.yml skeleton (#4719 SR-10).
+# release-shape.yml skeleton (#4719 SR-10). The workflow name and concurrency
+# values are pinned too (#4936, #4720): once the job's context is required its
+# check name is load-bearing, and `cancel-in-progress` decides whether a
+# duplicate event can cancel the proof run.
+SHAPE_WORKFLOW_NAME = "Release-shaped build + PostgreSQL TLS proof (#4480)"
+SHAPE_CONCURRENCY: Dict[str, Spec] = {
+    "group": "release-shape-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name }}",
+    "cancel-in-progress": "true",
+}
 SHAPE_TOP_KEYS = ("name", "on", "permissions", "concurrency", "env", "jobs")
 SHAPE_PERMISSIONS: Dict[str, Spec] = {"contents": "read"}
 SHAPE_ENV: Dict[str, Spec] = {"CARGO_TERM_COLOR": "always", "CARGO_INCREMENTAL": Double("0")}
@@ -978,7 +1012,8 @@ def pin_problem(node: Optional[Node], spec: Spec, path: str) -> str:
         if node.kind == "block" and node.style == "|" and tuple(node.value) == tuple(spec):  # type: ignore[arg-type]
             return ""
         return f"`{path}` must be exactly the `|` block {list(spec)}"
-    style = "flow" if isinstance(spec, Flow) else "double" if isinstance(spec, Double) else "plain"
+    style = ("flow" if isinstance(spec, Flow) else "double" if isinstance(spec, Double)
+             else "single" if isinstance(spec, Single) else "plain")
     if node.kind == "scalar" and node.style == style and node.text() == spec:
         return ""
     got = node.text() if node.kind == "scalar" else ""
@@ -1129,6 +1164,12 @@ def check_release_yml(text: str, rep: Report) -> None:
     for key in doc.keys():
         if key not in TOP_KEYS:
             rep.bad(f"release.yml top level: `{key}:` is not allowed (allowed: {', '.join(TOP_KEYS)})" + pin_hint("TOP_KEYS"))
+    for key, spec, const in (("name", RELEASE_WORKFLOW_NAME, "RELEASE_WORKFLOW_NAME"), ("on", RELEASE_ON, "RELEASE_ON"),
+                             ("concurrency", RELEASE_CONCURRENCY, "RELEASE_CONCURRENCY")):
+        why = pin_problem(doc.get(key), spec, key)
+        if why:
+            rep.bad(pin_message("release.yml", why + " (#4936: a release starts only from the pinned operator dispatch "
+                                "and is never cancelled mid-publish)", const))
     jobs = doc.get("jobs")
     if not want_kind(jobs, "map", "release.yml `jobs:`", rep) or jobs is None:
         return
@@ -1277,8 +1318,9 @@ def check_shape(text: str, rep: Report, advisory: Optional[bool] = None) -> None
         rep.bad(pin_message("release-shape.yml", f"top-level keys {doc.keys()} differ from the pinned "
                             f"{list(SHAPE_TOP_KEYS)} (a top-level `defaults:` or `env:` change redirects every step)",
                             "SHAPE_TOP_KEYS"))
-    for key, spec, const in (("on", SHAPE_ON, "SHAPE_ON"), ("permissions", SHAPE_PERMISSIONS, "SHAPE_PERMISSIONS"),
-                             ("env", SHAPE_ENV, "SHAPE_ENV")):
+    for key, spec, const in (("name", SHAPE_WORKFLOW_NAME, "SHAPE_WORKFLOW_NAME"), ("on", SHAPE_ON, "SHAPE_ON"),
+                             ("permissions", SHAPE_PERMISSIONS, "SHAPE_PERMISSIONS"),
+                             ("concurrency", SHAPE_CONCURRENCY, "SHAPE_CONCURRENCY"), ("env", SHAPE_ENV, "SHAPE_ENV")):
         why = pin_problem(doc.get(key), spec, key)
         if why:
             rep.bad(pin_message("release-shape.yml", why, const))
