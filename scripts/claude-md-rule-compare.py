@@ -2051,6 +2051,53 @@ def _self_test_cases() -> int:
     unit("a CRLF private key block is masked and the line after its END stays visible (S1, O6)",
          "6163-canary-crlf" not in crlf_report and "+after-crlf-6163\r" in crlf_report, crlf_report)
 
+    # #6163 round 4: unit cells on Redactor().mask() and unified() for the round-3 review findings. Each names the
+    # finding it pins; `hidden` must not appear in the output, `shown` must.
+    def masks(label, text, hidden=(), shown=(), count=None):
+        redactor = Redactor()
+        got = redactor.mask(text)
+        unit(label, all(item not in got for item in hidden) and all(item in got for item in shown)
+             and (count is None or redactor.count == count), f"count={redactor.count}\n{got}")
+
+    def diff_masks(label, old_text, new_text, hidden=(), shown=(), count=None):
+        redactor = Redactor()
+        got = unified(old_text, new_text, "## Sec", redactor)
+        unit(label, all(item not in got for item in hidden) and all(item in got for item in shown)
+             and (count is None or redactor.count == count), f"count={redactor.count}\n{got}")
+
+    # #6211 round 4 (security F1, code F1): the value on the line after a bare credential name is found on each side
+    # of the diff, so a rotated value under an unchanged name line is masked on both its `-` and its `+` row, at the
+    # end of a hunk too, and when blank lines put the name line outside the hunk.
+    diff_masks("#6211 R4 a rotated api_key value under a context name is masked on both sides",
+               "intro\napi_key:\n  6163OldCanaryValueAAAA\nafter\nend",
+               "intro\napi_key:\n  6163NewCanaryValueBBBB\nafter\nend",
+               hidden=("6163OldCanary", "6163NewCanary"), shown=(" api_key:", "-  [MASKED]", "+  [MASKED]"), count=2)
+    diff_masks("#6211 R4 a rotated password value under a context name is masked on both sides",
+               "intro\npassword:\n  6163OldCanaryPw\nend", "intro\npassword:\n  6163NewCanaryPw\nend",
+               hidden=("6163OldCanaryPw", "6163NewCanaryPw"), count=2)
+    diff_masks("#6211 R4 a rotated value at the end of a hunk is masked on both sides",
+               "intro\napi_key:\n  6163OldCanaryEnd", "intro\napi_key:\n  6163NewCanaryEnd",
+               hidden=("6163OldCanaryEnd", "6163NewCanaryEnd"), count=2)
+    diff_masks("#6211 R4 a rotated value whose name line is outside the hunk is masked",
+               "intro\napi_key:\n\n\n\n  6163OldCanaryFar\nend",
+               "intro\napi_key:\n\n\n\n  6163NewCanaryFar\nend",
+               hidden=("6163OldCanaryFar", "6163NewCanaryFar"), count=2)
+    # #6211 round 4 (security F1): a YAML block scalar under a credential name masks every line more indented than
+    # the name; the first line back at the name's indentation is shown.
+    masks("#6211 R4 a YAML literal block under private_key is masked",
+          "private_key: |\n  6163CanaryBlockLineOne\n\n  6163CanaryBlockLineTwo\nafter-block-6163",
+          hidden=("6163CanaryBlock",), shown=("private_key: |", "after-block-6163"), count=2)
+    masks("#6211 R4 a YAML folded block with chomping under secret is masked",
+          "  secret: >-\n      6163CanaryFoldedOne\n      6163CanaryFoldedTwo\n  next: shown-6163",
+          hidden=("6163CanaryFolded",), shown=("  secret: >-", "  next: shown-6163"), count=2)
+    diff_masks("#6211 R4 a changed line inside a YAML block whose name line is unchanged is masked",
+               "x\nsecret: |\n  6163OldCanaryInBlock\n  keep\ny", "x\nsecret: |\n  6163NewCanaryInBlock\n  keep\ny",
+               hidden=("6163OldCanaryInBlock", "6163NewCanaryInBlock", "  keep"), count=3)
+    # #6211 round 4 (code F4): a JSON Web Token is matched on its header alone; the payload need not start with `eyJ`.
+    masks("#6211 R4 a JWT whose payload does not start with eyJ is masked",
+          "jwt eyJhbGciOiJIUzI1NiJ9.eyAgInN1YiI6IjYxNjMifQ.c2lnbmF0dXJlNjE2M2NhbmFyeQ here",
+          hidden=("eyAgInN1YiI6IjYxNjMifQ",), shown=("here",), count=1)
+
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
     fetch_root = base_dir / "pr-fetch"
