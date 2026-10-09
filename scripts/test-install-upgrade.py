@@ -123,17 +123,30 @@ class PackagingContract(unittest.TestCase):
         self.assertIn('## Upgrading the binary', readme)
         self.assertIn('systemctl restart ai-memory.service', readme)
 
+    # Optional directories: absent on a fresh host, so the `-` form must be used
+    # or the unit fails to start. Mandatory paths (the database file, #4325
+    # step 2 / #6203) must NOT carry `-`: a missing database has to fail the
+    # unit, not be skipped silently.
+    OPTIONAL_READ_ONLY_DIRECTORIES = ('/etc/ai-memory', '/var/lib/ai-memory/.config')
+    MANDATORY_READ_ONLY_PATHS = ('/var/lib/ai-memory/ai-memory.db',)
+
     def test_read_only_paths_mark_optional_directories(self):
-        # `ReadOnlyPaths=/etc/ai-memory` without `-` fails the unit on a host
-        # where the directory does not exist; the `-` form starts without it.
         for name in ('ai-memory',) + tuple(f'ai-memory-{n}' for n in self.COMPANION_UNITS):
             with self.subTest(unit=name):
                 for line in self._unit_lines(name):
                     if not line.startswith('ReadOnlyPaths='):
                         continue
                     for token in line.split('=', 1)[1].split():
-                        self.assertTrue(token.startswith('-'),
-                                        f'{name}.service: ReadOnlyPaths entry {token!r} lacks the - prefix')
+                        bare = token.lstrip('-')
+                        if bare in self.OPTIONAL_READ_ONLY_DIRECTORIES:
+                            self.assertTrue(token.startswith('-'),
+                                            f'{name}.service: optional {token!r} lacks the - prefix')
+                        elif bare in self.MANDATORY_READ_ONLY_PATHS:
+                            self.assertFalse(token.startswith('-'),
+                                             f'{name}.service: mandatory {token!r} must not carry -')
+                        else:
+                            self.fail(f'{name}.service: ReadOnlyPaths entry {token!r} is not classified '
+                                      'as optional or mandatory in this test')
 
     def test_binary_only_package_documentation(self):
         payload = (ROOT / 'nfpm.yaml').read_text()
