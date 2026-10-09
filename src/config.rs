@@ -6920,7 +6920,13 @@ pub fn active_permissions_mode() -> PermissionsMode {
 /// the `_for_test` suffix at every callsite documents the intent —
 /// "this is a test poking the global gate" — better than an
 /// unsuffixed setter would.
+///
+/// #4756 — compiled only into test builds and `test-support` consumers
+/// (integration tests reach it through the dev-dependency self-feature in
+/// `Cargo.toml`), so a release library or an embedding crate cannot write
+/// the global gate mode through this path.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn override_active_permissions_mode_for_test(mode: PermissionsMode) {
     set_active_permissions_mode(mode);
 }
@@ -6934,7 +6940,12 @@ pub fn override_active_permissions_mode_for_test(mode: PermissionsMode) {
 /// the next test. With the single-source-of-truth collapse, clearing
 /// resets the lone slot — subsequent reads see `Advisory` until the
 /// next setter call, which is the documented contract.
+///
+/// #4756 — gated like [`override_active_permissions_mode_for_test`]: this
+/// downgrades `Enforce` to the `Advisory` pre-init fallback, so it must not
+/// exist in a non-test build at all.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn clear_permissions_mode_override_for_test() {
     // #4895 — same poison recovery as the production setter.
     *ACTIVE_PERMISSIONS_MODE
@@ -6953,8 +6964,11 @@ pub fn clear_permissions_mode_override_for_test() {
 /// for its duration so two scenarios cannot race the atomic. The
 /// returned guard poisons-OK so one panicking scenario does not
 /// chain-fail the rest.
+///
+/// #4756 — gated like [`override_active_permissions_mode_for_test`].
 #[doc(hidden)]
 #[must_use]
+#[cfg(any(test, feature = "test-support"))]
 pub fn lock_permissions_mode_for_test() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::Mutex;
     static GATE_LOCK: Mutex<()> = Mutex::new(());
