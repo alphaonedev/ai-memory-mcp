@@ -394,6 +394,57 @@ class PostgresServerFingerprint6384M1(World):
         self.assertEqual(self.list_text('serial'), '--lib\n--test a\n')
 
 
+ENV_LOOKUP = dict(ENV_ON, CI_TEST_BINARY_CACHE_LOOKUP='1')
+
+
+class PullRequestNeverRecords6384M2(World):
+    """r1 M2 decision: pull_request looks up only; only a release/** push records."""
+
+    def test_policy_matrix(self):
+        pol = tbc.cache_policy
+        self.assertEqual(pol(ENV_LOOKUP, 'pull_request', 'refs/pull/9/merge')[:2], (True, False))
+        self.assertEqual(pol(ENV_LOOKUP, 'push', 'refs/heads/release/v1.0.0')[:2], (False, True))
+        self.assertEqual(pol(ENV_LOOKUP, 'push', 'refs/heads/chain/promo6')[:2], (False, False))
+        for ev in ('merge_group', 'workflow_dispatch', 'schedule', 'pull_request_target'):
+            self.assertEqual(pol(ENV_LOOKUP, ev, 'refs/heads/release/v1.0.0')[:2], (False, False), ev)
+
+    def test_no_event_both_looks_up_and_records(self):
+        for ev, ref in (('pull_request', 'refs/pull/1/merge'), ('push', 'refs/heads/release/v1.0.0'),
+                        ('push', 'refs/heads/chain/x'), ('push', 'release/v1.0.0')):
+            lookup, record, _ = tbc.cache_policy(ENV_LOOKUP, ev, ref)
+            self.assertFalse(lookup and record, (ev, ref))
+
+    def test_pr_plan_then_green_record_never_writes_the_manifest(self):
+        self.plan(env=ENV_LOOKUP)
+        out = self.record(0)
+        self.assertIn('not recorded', out)
+        self.assertEqual([p.name for p in self.mdir.iterdir() if p.name.endswith('.json')], [])
+
+    def test_pr_cannot_overwrite_the_release_seed(self):
+        self.plan(env=ENV_LOOKUP, event='push', ref='refs/heads/release/v1.0.0')
+        self.record(0)
+        seed = self.manifest()
+        for n in tbc.SHARD_LISTS:
+            (self.sd / (n + '.txt')).write_text((self.sd / (n + '.txt.full')).read_text())
+        (self.root / 'tests' / 'a.rs').write_text('fn a() { pr }\n')
+        self.plan(env=ENV_LOOKUP, run_id='200', now=NOW + 60)
+        self.record(0, now=NOW + 60, run_id='200')
+        self.assertEqual(self.manifest(), seed)
+
+    def test_tampered_plan_claiming_record_with_skips_is_refused(self):
+        self.plan(env=ENV_LOOKUP, event='push', ref='refs/heads/release/v1.0.0')
+        plan = json.loads((self.sd / 'cache_plan.json').read_text())
+        plan['skipped'] = {'test:a': {'key': 'x', 'result': 'pass', 'base': 'release/v1.0.0', 'recorded_at': NOW}}
+        (self.sd / 'cache_plan.json').write_text(json.dumps(plan))
+        self.assertIn('not recorded', self.record(0))
+        self.assertEqual([p.name for p in self.mdir.iterdir() if p.name.endswith('.json')], [])
+
+    def test_docstring_states_the_decision(self):
+        doc = tbc.__doc__
+        self.assertIn('pull_request', doc)
+        self.assertIn('never writes the manifest', doc)
+
+
 class Policy(unittest.TestCase):
     def test_allowed_matrix(self):
         on = {'CI_TEST_BINARY_CACHE': '1'}
