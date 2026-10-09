@@ -3138,6 +3138,7 @@ def _load_approval():
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
+SHA_C = "c" * 40
 
 
 def _pr(number: int, sha: str, assoc: str = "NONE", head_repo: Optional[str] = "fork/ai-memory-mcp") -> dict:
@@ -3147,6 +3148,11 @@ def _pr(number: int, sha: str, assoc: str = "NONE", head_repo: Optional[str] = "
 
 def _review(sha: str, login: str = OPERATOR_6117, state: str = "APPROVED") -> dict:
     return {"user": {"login": login}, "state": state, "commit_id": sha}
+
+
+def _merge_group_event(number: int, base: str = "main", sha: str = SHA_C) -> dict:
+    ref = f"refs/heads/gh-readonly-queue/{base}/pr-{number}-{sha}"
+    return {"action": "checks_requested", "merge_group": {"head_sha": SHA_C, "head_ref": ref}}
 
 
 def _fake_api(pulls: List[dict], reviews: Optional[Dict[int, List[dict]]] = None, fail: bool = False):
@@ -3202,7 +3208,28 @@ def _approval_cases(mod) -> List[str]:
     cell("push-no-PR-heads-the-sha-passes", 0, "push", SHA_A, _fake_api([_pr(7, SHA_B)]))
     cell("push-one-of-two-PRs-unapproved-fails", 1, "push", SHA_A,
          _fake_api([_pr(7, SHA_A), _pr(11, SHA_A)], {7: [_review(SHA_A)]}))
-    cell("merge-group-is-judged-like-push", 1, "merge_group", SHA_A, _fake_api([ext]))
+    # #6227: a merge_group run's GITHUB_SHA is the queue commit, never a PR head.  The PR
+    # under test is named by merge_group.head_ref (gh-readonly-queue/<base>/pr-<N>-<sha>).
+    cell("merge-group-queue-sha-external-unapproved-fails", 1, "merge_group", SHA_C,
+         _fake_api([ext]), _merge_group_event(7))
+    cell("merge-group-queue-sha-external-approved-passes", 0, "merge_group", SHA_C,
+         _fake_api([ext], {7: [_review(SHA_A)]}), _merge_group_event(7))
+    cell("merge-group-approval-on-another-commit-fails", 1, "merge_group", SHA_C,
+         _fake_api([ext], {7: [_review(SHA_B)]}), _merge_group_event(7))
+    cell("merge-group-team-same-repo-passes", 0, "merge_group", SHA_C,
+         _fake_api([_pr(8, SHA_A, "MEMBER", REPO_6117)]), _merge_group_event(8))
+    cell("merge-group-nested-base-branch-parses", 1, "merge_group", SHA_C,
+         _fake_api([ext]), _merge_group_event(7, base="release/v1.0.0"))
+    cell("merge-group-named-pr-not-open-fails-closed", 1, "merge_group", SHA_C,
+         _fake_api([_pr(9, SHA_B)]), _merge_group_event(7))
+    cell("merge-group-missing-payload-fails-closed", 1, "merge_group", SHA_C, _fake_api([ext]), {})
+    cell("merge-group-unparsable-head-ref-fails-closed", 1, "merge_group", SHA_C,
+         _fake_api([_pr(8, SHA_A, "MEMBER", REPO_6117)]),
+         {"merge_group": {"head_ref": "refs/heads/gh-readonly-queue/main/not-a-pr"}})
+    cell("merge-group-zero-pr-number-fails-closed", 1, "merge_group", SHA_C,
+         _fake_api([_pr(8, SHA_A, "MEMBER", REPO_6117)]), _merge_group_event(0))
+    cell("merge-group-non-string-head-ref-fails-closed", 1, "merge_group", SHA_C,
+         _fake_api([ext]), {"merge_group": {"head_ref": 7}})
     cell("api-error-fails-closed", 1, "push", SHA_A, _fake_api([ext], fail=True))
     cell("malformed-pull-entry-fails-closed", 1, "push", SHA_A, _fake_api([{"number": 7}]))
     cell("non-sha-commit-fails-closed", 1, "push", "HEAD", _fake_api([]))
@@ -3342,6 +3369,18 @@ class ExternalPrApprovalEntrypoint6226(_Scratch6117):
             self.assertEqual(1, rc, out)
             self.assertIn("::error::cannot read the pull_request event payload", out)
 
+    def test_6227_merge_group_payload_unreadable_fails_closed(self) -> None:
+        rc, out = self.run_script("merge_group", str(self.td / "no-such-event.json"), sha=SHA_C)
+        self.assertEqual(1, rc, out)
+        self.assertIn("::error::cannot read the merge_group event payload", out)
+
+    def test_6227_merge_group_judges_the_pr_named_by_the_queue_ref(self) -> None:
+        event = self.td / "merge_group.json"
+        event.write_text(json.dumps(_merge_group_event(2)), encoding="utf-8")
+        rc, out = self.run_script("merge_group", str(event), sha=SHA_C)
+        self.assertEqual(1, rc, out)  # PR #2 is the external PR of the fake gh
+        self.assertIn("PR #2", out)
+
     def test_6226_m01_dropping_paginate_is_killed(self) -> None:
         src = APPROVAL_PY.read_text(encoding="utf-8")
         needle = '["gh", "api", "--paginate", path]'
@@ -3378,6 +3417,19 @@ class GateScriptsRunIsolated6117(unittest.TestCase):
                 isolated = re.findall(r"python3 -I scripts/" + re.escape(script), text)
                 self.assertEqual(expected, len(isolated),
                                  f"{script}: expected {expected} isolated invocations")
+
+
+class MergeGroupDocTruth6227(unittest.TestCase):
+    """#6227: no doc says the merge_group arm judges a PR head it cannot see."""
+
+    def test_6227_changelog_names_the_queue_ref_not_the_sha(self) -> None:
+        text = " ".join((ROOT / "changelog.d" / "6117.security.md").read_text(encoding="utf-8").split())
+        self.assertIn("head_ref", text)
+        self.assertNotIn("judges push and merge-queue runs", text)
+
+    def test_6227_evaluator_docstring_names_the_queue_ref(self) -> None:
+        src = APPROVAL_PY.read_text(encoding="utf-8")
+        self.assertIn("gh-readonly-queue", src)
 
 
 class RoundTwoDocTruth6117(unittest.TestCase):
