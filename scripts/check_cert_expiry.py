@@ -2537,6 +2537,9 @@ def _round3_shapes(repo, shapes, pr, approve, wf_rel, c8_rel):
         "trusted-name": ({wf_rel: TRUSTED_WF_FIXTURE.replace("gate, trusted base copy (cert", "gate (cert", 1)},
                          approve),
         "trusted-hdr": ({wf_rel: TRUSTED_WF_FIXTURE.replace("jobs:\n", f"env:\n  CTX: {ctx}\njobs:\n", 1)}, approve),
+        "c8-hdr": ({c8_rel: C8_FIXTURE.replace("jobs:\n", f"env:\n  CTX: {ctx}\njobs:\n", 1)}, approve),
+        "flow-anchor": ({c8_rel: C8_FIXTURE.replace(named, named + f"    env: {{CTX: &ctx {ctx}}}\n", 1)}, approve),
+        "flow-span": ({c8_rel: C8_FIXTURE.replace("jobs:\n", "env: {A: x,\n  B: y}\njobs:\n", 1)}, approve),
         "trusted-ok": ({wf_rel: TRUSTED_WF_FIXTURE.replace("timeout-minutes: 10", "timeout-minutes: 9", 1)}, approve),
         "amp": ({c8_rel: amp}, ""),
         "split": ({".github/workflows/split.yml": split}, ""),
@@ -2567,7 +2570,9 @@ def _trusted_round3_cells(tmp, t, judge, shapes):
     for key, where, says in (("trusted", wf, "job 'shadow'"), ("quoted", c8, '"shadow"'),
                              ("flow", c8, "shadow: {name"), ("anchor", c8, "anchor"),
                              ("anchor-hdr", c8, "anchor"), ("anchor-env", c8, "anchor"),
-                             ("trusted-name", wf, "pinned"), ("trusted-hdr", wf, "workflow header")):
+                             ("trusted-name", wf, "pinned"), ("trusted-hdr", wf, "workflow header"),
+                             ("c8-hdr", c8, "workflow header"), ("flow-anchor", c8, "anchor in a flow collection"),
+                             ("flow-span", c8, "a flow collection spanning lines")):
         judge(f"tr-s-{key}", f"a second producer in a trailer-waivable region ({key}) WITH the trailer",
               *shapes["r3-" + key], needles=(shadow + where, says, "Selftest Approver"))
     judge("tr-s-trusted-ok", "the trusted workflow in its real shape, edited WITH the trailer",
@@ -2801,7 +2806,8 @@ SELF_TEST_OK = (
     "workflow file name and an approval trailer carrying LF / CR and a forged ::error printed escaped, "
     "with no log line read as a workflow command; (tr round 3) a second producer in the trusted "
     "workflow, behind a quoted or flow job key, through a YAML anchor / alias (job, header, env), as the "
-    "trusted job's name or in the trusted header RED even with the trailer, while the real trusted shape "
+    "trusted job's name, in the trusted or the c8-precheck.yml header, or as an anchor inside a flow "
+    "collection RED even with the trailer, a flow collection spanning lines refused, while the real trusted shape "
     "edited with the trailer and c8 jobs using &&, *) and ** stay GREEN; a name split across quoted "
     "continuations, a symlinked workflow and a non-directory .github/workflows RED; U+2028, C1, % and an "
     "oversized workflow's name escaped; inherited GIT_* ignored; every fetch bounded by FETCH_TIMEOUT within "
