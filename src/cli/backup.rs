@@ -2196,6 +2196,24 @@ pub fn run_restore(
     run_restore_with(db_path, args, json_out, out, policy, &mut RealPublishIo)
 }
 
+/// #2444 — cross-backend refusal. The manifest field is `Option` so a
+/// pre-#2444 manifest (no `backend` key) still restores; a snapshot that
+/// POSITIVELY declares a non-sqlite origin is refused rather than copied onto
+/// a SQLite path. #2565 — applied on the verified path AND under
+/// `--skip-verify`, which waives the sha256, not compatibility.
+fn refuse_cross_backend(snapshot_path: &Path, backend: Option<&str>) -> Result<()> {
+    if let Some(backend) = backend {
+        if backend != BACKEND_SQLITE {
+            anyhow::bail!(
+                "snapshot {} declares backend `{backend}`, but `restore` writes a \
+                 local SQLite database. Refusing a cross-backend restore (#2444).",
+                snapshot_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// SHA-256 of an open file, read from its start, lowercase hex.
 fn sha256_hex(mut f: &std::fs::File) -> Result<String> {
     use sha2::Digest;
@@ -2268,12 +2286,29 @@ fn run_restore_with(
     // Manifest pre-checks that need no bytes: cross-backend and
     // forward-schema. The sha256 itself is checked on the STAGED copy below.
     let (manifest, verification) = if args.skip_verify {
+        // v1.0.0 #2565 — `--skip-verify` waives the sha256, never the
+        // compatibility refusals: a manifest beside the snapshot is still read
+        // (unverified) for its backend, and one that cannot be read refuses.
+        let detail = if manifest_path.exists() {
+            let text = std::fs::read_to_string(&manifest_path)?;
+            let plain: BackupManifest = serde_json::from_str(&text).with_context(|| {
+                format!(
+                    "manifest {} is unreadable; --skip-verify still applies its \
+                     compatibility refusals. Remove it to restore without one (#2565)",
+                    manifest_path.display()
+                )
+            })?;
+            refuse_cross_backend(&snapshot_path, plain.backend.as_deref())?;
+            "--skip-verify: manifest read for compatibility only; sha256 not checked"
+        } else {
+            "--skip-verify: no manifest was read"
+        };
         note_unverified_restore(
             out,
             &snapshot_path,
             &target_db,
             ManifestVerification::Skipped,
-            "--skip-verify: no manifest was read",
+            detail,
         )?;
         (None, ManifestVerification::Skipped)
     } else {
@@ -2349,19 +2384,7 @@ fn run_restore_with(
                 )
             }
         };
-        // #2444 — cross-backend refusal. The manifest field is `Option` so a
-        // pre-#2444 manifest (no `backend` key) still restores; a snapshot that
-        // POSITIVELY declares a non-sqlite origin is refused rather than copied
-        // onto a SQLite path.
-        if let Some(backend) = manifest.backend.as_deref() {
-            if backend != BACKEND_SQLITE {
-                anyhow::bail!(
-                    "snapshot {} declares backend `{backend}`, but `restore` writes a \
-                     local SQLite database. Refusing a cross-backend restore (#2444).",
-                    snapshot_path.display()
-                );
-            }
-        }
+        refuse_cross_backend(&snapshot_path, manifest.backend.as_deref())?;
         // #2444 — forward-schema refusal. Restoring a snapshot taken by a NEWER
         // binary onto this one opens cleanly (the ladder only ever migrates
         // FORWARD) and then writes rows that silently drop the newer columns.

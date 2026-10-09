@@ -584,7 +584,7 @@ signature, then the sha256 it covers, before replacing the DB. See
 | `--snapshot <name>` | `restore` | The snapshot to restore from a `--from` directory: its file name (`ai-memory-<ts>.db`), its id (`ai-memory-<ts>`), or its manifest's file name. A plain name, never a path; must be a regular file (v1.0.0 #3550). |
 | `--latest` | `restore` | With a `--from` directory, restore the backup whose **signed** manifest records the newest creation time. Only manifests that verify are considered, and one whose signature fails makes the command refuse, naming it. Modification times are never consulted (v1.0.0 #3199). Conflicts with `--snapshot`. |
 | `--allow-unsigned-manifest` | `restore` | Accept a manifest the operator key did not sign (a pre-v1.0.0 backup, or one taken without the key). The sha256, backend, schema and integrity checks still run. WARNs, records an audit event, and is refused under `asi-hard`. A signature that is present but does not verify is refused even with this flag (v1.0.0 #3199). |
-| `--skip-verify` | `restore` | Read no manifest at all: the only way to restore a manifest-less `.bak` / `.pre-restore` / `.pre-repair` file. WARNs, records an audit event, and is refused under `asi-hard`. Not routine. |
+| `--skip-verify` | `restore` | Skip the sha256 check: the only way to restore a manifest-less `.pre-restore` / `.pre-repair` file. A manifest that IS beside the snapshot is still read for its backend, and a cross-backend one is refused (#2565). WARNs, records an audit event, and is refused under `asi-hard`. Not routine. A pre-migration `.bak` carries an unsigned manifest; restore it with `--allow-unsigned-manifest`. |
 | `--yes` | `restore` | Skip the `Proceed? [y/N]` confirmation. REQUIRED with `--json` and whenever stdin is not a terminal (v1.0.0 #3131). |
 | `--store-url <url>` | both | The store this deployment serves, same grammar as `serve` / `curator`. Also read from `AI_MEMORY_STORE_URL_FILE` / `AI_MEMORY_STORE_URL`. |
 
@@ -791,7 +791,8 @@ restored the attacker's bytes. Now:
 | Signed, does NOT verify (altered, other key, half a signature) | **refused**, no flag accepts it | **refused** |
 | Signed, but no operator public key on this host | refused unless `--allow-unsigned-manifest` | refused |
 | Unsigned (pre-v1.0.0, or taken without the key) | refused unless `--allow-unsigned-manifest` | refused |
-| No manifest (`.bak`, `.pre-restore`, `.pre-repair`) | refused unless `--skip-verify` | refused |
+| Pre-migration snapshot (`.pre-migration-…bak`, unsigned manifest beside it since #2565) | refused unless `--allow-unsigned-manifest` | refused |
+| No manifest (`.pre-restore`, `.pre-repair`, an older `.bak`) | refused unless `--skip-verify` | refused |
 
 Every accepted unverified restore prints a `WARNING` on stderr, records
 a `backup_restore_unverified` decision in the forensic audit log when

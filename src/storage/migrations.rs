@@ -1172,6 +1172,9 @@ fn snapshot_before_migration(
                  refusing to mutate schema without a recoverable backup"
             )
         })?;
+    // #2565 — the sibling manifest makes the snapshot restorable through the
+    // VERIFIED `restore` path (sha256 + compatibility refusals).
+    super::pre_migration_manifest::write(&snapshot_path, &db_path, from_version)?;
 
     Ok(Some(snapshot_path))
 }

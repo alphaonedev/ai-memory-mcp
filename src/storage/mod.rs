@@ -943,7 +943,9 @@ pub mod lineage_import;
 pub mod lockout;
 pub mod migration_meta;
 pub mod migrations;
+// v1.0.0 #2565 — sibling manifest for the pre-migration snapshot.
 pub mod model_attest;
+mod pre_migration_manifest;
 /// #1955 [P1][R45] — substrate record-stop actuator (storage layer): the
 /// non-feature-gated flag registry + attestation logic + the
 /// `StorageError::RecordStopped` `db::`-funnel gate. Lives here (not under
