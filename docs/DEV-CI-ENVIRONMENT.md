@@ -138,7 +138,8 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   `$GITHUB_ENV`), through a rustc `debuginfo=` or `-g` flag (`RUSTFLAGS`,
   `RUSTDOCFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`,
   `CARGO_TARGET_<triple>_RUSTFLAGS`) or through `cargo --config
-  profile.<p>.debug=...` (which beats the `CARGO_PROFILE_*` env), and it
+  profile.<p>.debug=...` (inline tables, `--config <file>` and `build.rustflags`
+  included; it beats the `CARGO_PROFILE_*` env) or a custom `cargo --profile`, and it
   censuses every job whose `runs-on` can resolve to a self-hosted runner
   (`ubuntu-slim` and the `ubuntu-`/`macos-`/`windows-` images count as
   GitHub-hosted).
@@ -148,11 +149,16 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   `python3 scripts/ci/prune-runner-target.py --target-dir "${CARGO_TARGET_DIR:-target}"`.
   The default `--scope test-bins` deletes the test executables in `deps/`
   (plus their `.d` and `.dSYM` companions) and `incremental/`. Each example is
-  two hard links to one file, `examples/<name>-<hash>` and its uplift
-  `examples/<name>`; the pair is deleted together, with both names'
-  companions, and its bytes count once. Any other hard-linked executable (the
-  `deps/<bin>-<hash>` behind an uplifted `debug/<bin>`) is kept, since deleting
-  one link frees nothing. The rlib / rmeta /
+  `examples/<name>-<hash>` plus its uplift `examples/<name>` (`-` and `_` are
+  one name: cargo builds `my_demo-<hash>` for the example `my-demo`); the pair
+  is deleted together, with both names' companions. On Linux the uplift is a
+  hard link (one inode, nlink 2) and the pair's bytes count once; on macOS
+  cargo copies it (an APFS clone: two inodes, nlink 1) and each is counted at
+  full size. The bin's uplift source `deps/<bin>-<hash>` is kept: it is found
+  by name and size against `debug/<bin>`, not by link count (a clone has
+  nlink 1), because pruning it makes cargo report the bin "Dirty" and relink
+  it on the next job. Any other hard-linked executable is kept too, since
+  deleting one link frees nothing; each `kept` line names the reason. The rlib / rmeta /
   proc-macro outputs, `build/` and `.fingerprint/` stay, so the next compile is
   still warm. `--dry-run` lists what would go and prints `freed_bytes=<n>`;
   `--scope all` wipes `debug/{deps,build,incremental,examples,.fingerprint}`
@@ -167,9 +173,13 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   so it never follows a symlink, even one swapped in mid-run. An entry it
   cannot read or remove prints a `::warning::` line; the rest is still pruned,
   the totals are printed and the exit code is 1. Names in those lines are
-  escaped (`%` `%25`, CR `%0D`, LF `%0A`), so a file name cannot start a
-  workflow command of its own. `freed_bytes` is exact: a hard-linked file
-  counts once, and only when all of its links go. The run ends with
+  escaped (`%` `%25`, `#` `%23`, CR `%0D`, LF `%0A`, a non-UTF-8 byte `\xNN`),
+  so a file name cannot start a workflow command of its own (the runner also
+  parses the legacy `##[command]` form anywhere in a line). A directory nested
+  more than 100 levels deep is warned about and left in place. `freed_bytes`
+  is exact on Linux: a hard-linked file counts once, and only when all of its
+  links go. On macOS/APFS it is an upper bound: each clone counts at full
+  size, but a clone's blocks are released only when its twin goes too. The run ends with
   `::notice::prune-runner-target freed_bytes=<n> deleted=<k> mode=<pruned|dry-run>`,
   which shows on the job summary. Loose `deps/*.o` files are kept.
 
