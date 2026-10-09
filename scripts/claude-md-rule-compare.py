@@ -555,7 +555,7 @@ def _self_test_cases() -> int:
 
     counter = [0]
 
-    def case(name, mutate, want_fail, needle, trailer=None, base_mutate=None, message=None):
+    def case(name, mutate, want_fail, needle, trailer=None, base_mutate=None, message=None, absent=None):
         counter[0] += 1
         work = base_dir / f"c{counter[0]}"
         base_sha = make_repo(guard, work / "repo")
@@ -572,10 +572,10 @@ def _self_test_cases() -> int:
             report, failed = compare(base_root, work / "repo", base_sha, head_sha, work / "scratch", guard.fixture_index_pins())
         except RuntimeError as exc:
             report, failed = f"RESULT: FAIL (closed) - {exc}", True
-        if failed != want_fail or needle not in report:
+        if failed != want_fail or needle not in report or (absent is not None and absent in report):
             failures.append(name)
-            print(f"FAIL: self-test - {name}: failed={failed} (wanted {want_fail}), needle {needle!r}\n{report}",
-                  file=sys.stderr)
+            print(f"FAIL: self-test - {name}: failed={failed} (wanted {want_fail}), needle {needle!r}, "
+                  f"absent {absent!r}\n{report}", file=sys.stderr)
         else:
             print(f"PASS: self-test - {name}")
 
@@ -1452,6 +1452,76 @@ def _self_test_cases() -> int:
          trailer="Justin", base_mutate=base_manifest_garbage)
     case("R5 a malformed base manifest fails closed without the trailer", reword, True, "unusable",
          base_mutate=base_manifest_garbage)
+
+    # #6163 (CodeQL py/clear-text-logging-sensitive-data): a credential-shaped value in head rule text never reaches
+    # the summary, stdout or the step-summary file; the verdict is still computed on the unmasked text, and the
+    # report says that it masked something, so a masked rule change stays loud.
+    canary = "hunter2-6163-canary"
+
+    def credential_reword(root):
+        edit("tool limit is 103 tools", f"tool limit is 103 tools; password={canary}")(root)
+        reseal(root)
+
+    case("#6163 a password= value in changed rule text is masked in the report", credential_reword, True,
+         "RULE TEXT CHANGED", absent=canary)
+    case("#6163 the report says a value was masked", credential_reword, True, "masked", absent=canary)
+
+    def pem_reword(root):
+        edit("tool limit is 103 tools", "tool limit is 103 tools\n-----BEGIN PRIVATE KEY-----\n"
+             f"{canary}\n-----END PRIVATE KEY-----")(root)
+        reseal(root)
+
+    case("#6163 a private key block in changed rule text is masked in the report", pem_reword, True,
+         "RULE TEXT CHANGED", absent=canary)
+
+    # #6163 (CodeQL py/clear-text-*-sensitive-data, SensitiveDataHeuristics.qll): an identifier that holds
+    # "trusted", "secret" or a password word marks every value derived from it as a credential. The values this
+    # script names are repository paths and report lines, so no identifier may carry such a word.
+    sensitive_name = re.compile(r"(?i)((?<!is)(?<!is_)secret|(?<!un)(?<!un_)(?<!is)(?<!is_)trusted(?!_iter)|"
+                                r"confidential|pass(wd|word|code|.?phrase)|api.?(key|tok))")
+    not_sensitive = re.compile(r"(?i)(redact|censor|obfuscate|hash|md5|sha|random|crypt|encode|(?<!pro)file|path|"
+                               r"url)")
+    own_tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    own_names = set()
+    for node in ast.walk(own_tree):
+        if isinstance(node, ast.Name):
+            own_names.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            own_names.add(node.name)
+        elif isinstance(node, ast.arg):
+            own_names.add(node.arg)
+        elif isinstance(node, ast.Attribute):
+            own_names.add(node.attr)
+    flagged = sorted(name for name in own_names if sensitive_name.search(name) and not not_sensitive.search(name))
+    if flagged:
+        failures.append("sensitive identifier names")
+        print(f"FAIL: self-test - #6163 identifiers CodeQL reads as credentials: {flagged}", file=sys.stderr)
+    else:
+        print("PASS: self-test - #6163 no identifier reads as a credential to the sensitive-data heuristic")
+
+    # #6163 (CodeQL actions/untrusted-checkout): the pull request head is fetched by this base script, never by a
+    # workflow step; the refspec is built from a validated decimal number only.
+    fetch_args = globals().get("head_fetch_args")
+    if fetch_args is None:
+        failures.append("head_fetch_args")
+        print("FAIL: self-test - #6163 head_fetch_args is not defined (the workflow fetches the head itself)",
+              file=sys.stderr)
+    else:
+        want_args = ("fetch", "--no-tags", "origin", "+refs/pull/6163/head:refs/remotes/pull/head")
+        if tuple(fetch_args("6163")) != want_args:
+            failures.append("head_fetch_args shape")
+            print(f"FAIL: self-test - #6163 head_fetch_args('6163') = {fetch_args('6163')!r}", file=sys.stderr)
+        else:
+            print("PASS: self-test - #6163 head_fetch_args builds the one pull request head refspec")
+        for bad in ("", "0", "06163", "-1", "1 2", "12/../x", "+refs/heads/main", "\uff11\uff12", "1\n",
+                    "9" * 11):
+            try:
+                fetch_args(bad)
+            except ValueError:
+                print(f"PASS: self-test - #6163 head_fetch_args refuses {bad!r}")
+            else:
+                failures.append(f"head_fetch_args {bad!r}")
+                print(f"FAIL: self-test - #6163 head_fetch_args accepted {bad!r}", file=sys.stderr)
 
     shutil.rmtree(base_dir, ignore_errors=True)
     if failures:

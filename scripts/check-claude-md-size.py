@@ -1423,6 +1423,7 @@ def run_manifest_cases(fresh) -> bool:
             ok &= raw(root, "F1 an unreadable manifest", True, "cannot read")
         finally:
             os.chmod(root / manifest, 0o644)
+        ok &= owner_only(root / manifest, "F1 the manifest restored after the unreadable case")
     # --update: rewrites the manifest, reports the changed section, refuses a symlinked manifest.
     root = fresh()
     edit(root, "section body x", "section body y")
@@ -1509,7 +1510,18 @@ def run_ref_cases(fresh, arch: str, style: str) -> bool:
                 ok &= refs_expect(root, f"R3-F8 {name} unreadable (mode 000)", True, "cannot read")
             finally:
                 os.chmod(root / rel, 0o644)
+            ok &= owner_only(root / rel, f"R3-F8 {name} restored after the unreadable case")
     return ok
+
+
+def owner_only(path: Path, label: str) -> bool:
+    """#6163 (CodeQL py/overly-permissive-file): a fixture whose mode the self-test sets is readable by its owner
+    only, never by group or world."""
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    if mode & 0o077:
+        print(f"FAIL: self-test - #6163 {label}: mode {mode:o} is readable beyond its owner", file=sys.stderr)
+        return False
+    return True
 
 
 # R2-4: the limits above, restated as literals that do NOT derive from the constants. The cases in
@@ -2011,6 +2023,14 @@ def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
               file=sys.stderr)
         return False
     good = real.read_text(encoding="utf-8")
+    # #6163 (CodeQL actions/untrusted-checkout): no step of the pull_request_target workflow fetches, pulls or
+    # checks out the pull request head; the base comparison script fetches it as git objects (--pr-number).
+    head_fetch = re.compile(r"\bgit\s+(fetch|pull)\b|\b(gh|hub)\s+pr\s+checkout\b")
+    fetching = [raw for raw in split_lines(good) if head_fetch.search(re.sub(r"(^|\s)#.*$", "", raw))]
+    if fetching:
+        print(f"FAIL: self-test - #6163 a comparison workflow step fetches the pull request head: {fetching[0].strip()}",
+              file=sys.stderr)
+        ok = False
     wf = base / "cwf"
     wf.mkdir()
 
