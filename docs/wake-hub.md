@@ -53,9 +53,10 @@ Every wake carries `seq_high_watermark`: the RECIPIENT's own wake number,
 assigned by the producer at publish time (#4125). It moves only when a wake is
 published to that recipient, so a gap between two of your values counts wakes
 YOU missed and never measures another tenant's notify volume (the host-wide
-wake sequence did). That same host-wide sequence is the cross-tenant channel
-tracked by #4071, which is OPEN and NOT fixed by this change: the inbox SSE
-stream still emits the host-wide `seq` until #4071 lands. It is a count of wakes, not an inbox depth — a
+wake sequence did). The inbox SSE stream carries the same per-recipient number
+as `recipient_seq` and never the host-wide `seq` (#4071); the host-wide
+sequence stays on the in-process bus for internal consumers only. It is a
+count of wakes, not an inbox depth — a
 truthful depth would put a database read on the very latency path this plane
 exists to remove.
 
@@ -129,8 +130,8 @@ jump is a residual signal and it is NOT nothing. Stated exactly:
   admission control and request latency. An observer holding k hub identities
   can lay k canaries at the least-recently-woken end and read a count (or k time
   slices) from one flood instead of one threshold bit. This is a residual, not a
-  closed channel, and it is strictly weaker than the host-wide sequence still
-  emitted on the inbox SSE stream (#4071, open).
+  closed channel, and it is strictly weaker than the host-wide sequence the
+  inbox SSE stream used to emit (closed by #4071).
 
 Read it as *"wakes happened that you did not see"*. The correct response to a
 gap is ONE catch-up inbox read. That is fail-safe by construction: a client may

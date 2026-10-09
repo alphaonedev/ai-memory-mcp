@@ -239,6 +239,13 @@ pub enum InboxEvent {
         /// [`seq_high_watermark`]) to size the gap exactly, then does one
         /// catch-up inbox read. Sequences are per-process and reset on
         /// restart; they order wakes, they do not identify them.
+        ///
+        /// INTERNAL ONLY (#4071): the counter is shared by every recipient,
+        /// so the gap between two of one tenant's values measures OTHER
+        /// tenants' notify volume. The inbox SSE stream projects the event
+        /// through a wire DTO that omits it (`handlers::inbox_stream`), the
+        /// wake-hub forwards [`Self::AgentNotified::recipient_seq`] instead
+        /// (#4125); any new tenant-facing surface must do the same.
         seq: u64,
         /// Inbox owner. The ONLY agent this frame may ever be shown to.
         recipient_agent_id: String,
