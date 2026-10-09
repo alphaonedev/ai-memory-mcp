@@ -328,4 +328,76 @@ mod tests {
 
         override_active_permissions_mode_for_test(PermissionsMode::Advisory);
     }
+
+    /// #4419 — an approved `reflect` replay reads its sources under the
+    /// read-visibility posture exactly like the direct funnel: under the
+    /// enforced multi-tenant opt-in (`AI_MEMORY_AGENT_ID` set) the REQUESTER
+    /// is the visibility caller, so a private source owned by another
+    /// principal is refused at execute (no reflection lands) while the
+    /// requester's own source replays. The approver's process identity never
+    /// widens the read.
+    #[test]
+    fn approved_reflect_replay_reads_sources_as_the_requester_4419() {
+        use crate::models::GovernedAction;
+        let _envg = crate::identity::agent_id_env_test_lock();
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:approver-process") };
+
+        let conn = test_db();
+        let ns = "gov4419/reflect";
+        let seed = |title: &str, owner: &str| -> String {
+            let mut m = make_memory(title, ns, Tier::Mid, 5);
+            m.metadata = serde_json::json!({"agent_id": owner, "scope": "private"});
+            insert(&conn, &m).unwrap()
+        };
+        let foreign = seed("foreign-src-4419", "ai:other");
+        let own = seed("own-src-4419", "ai:req");
+
+        let queue_approved = |title: &str, source_id: &str| -> String {
+            let payload = serde_json::json!({
+                field_names::SOURCE_IDS: [source_id],
+                "title": title,
+                "content": "synthesis over one source",
+                "namespace": ns,
+                "agent_id": "ai:req",
+                "proposed_depth": 1,
+            });
+            let pid =
+                queue_pending_action(&conn, GovernedAction::Reflect, ns, None, "ai:req", &payload)
+                    .unwrap();
+            assert!(decide_pending_action(&conn, &pid, true, "ai:approver-process").unwrap());
+            pid
+        };
+        let over_foreign = queue_approved("reflect-foreign-4419", &foreign);
+        let over_own = queue_approved("reflect-own-4419", &own);
+
+        let err = execute_pending_action(&conn, &over_foreign)
+            .expect_err("a source the requester cannot read must refuse the replay");
+        assert!(
+            format!("{err:#}").contains("reflect execute failed"),
+            "got: {err:#}"
+        );
+        let count = |title: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND title = ?2",
+                params![ns, title],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("reflect-foreign-4419"), 0, "no reflection may land");
+
+        let landed = execute_pending_action(&conn, &over_own)
+            .expect("the requester's own source replays")
+            .expect("reflect returns the new id");
+        assert_eq!(count("reflect-own-4419"), 1);
+        assert_eq!(
+            get(&conn, &landed)
+                .unwrap()
+                .expect("reflection row")
+                .metadata["agent_id"],
+            "ai:req"
+        );
+
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+    }
 }

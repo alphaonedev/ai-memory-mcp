@@ -24521,15 +24521,26 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
 /// surface as a `Validation` error rather than a panic).
 fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result<Option<String>> {
     let input = reflect_input_from_pending(pa)?;
-    // #4419 — replay under the REQUESTER's source visibility (the postgres
-    // twin replays as the requester's tenant, #4357): a source whose owner
-    // narrowed its scope to private after the request was queued folds to
-    // `SourceNotFound` here, exactly as it would on a fresh request.
+    // #4419 — the replay scopes its SOURCE READ exactly as the direct
+    // `memory_reflect` funnel does (`src/mcp/tools/reflect.rs`, #3282): the
+    // read-visibility posture (`resolve_read_visibility_caller`) decides
+    // WHETHER sources are filtered, and under the enforced multi-tenant
+    // opt-in the REQUESTER — never the approver's process identity — is the
+    // visibility caller, so a source whose owner narrowed its scope to
+    // private after the request was queued folds to `SourceNotFound` exactly
+    // as it would on a fresh request (the postgres twin replays as the
+    // requester's tenant, #4357). In the single-operator trust-all posture
+    // (`AI_MEMORY_AGENT_ID` unset) no filter applies, byte-identical to the
+    // direct funnel: an unconditional requester filter would hide every
+    // unowned source (CLI / HTTP / curator writes) from an approved replay
+    // that a fresh request reads without filtering.
+    let read_caller =
+        crate::identity::resolve_read_visibility_caller().map(|_| pa.requested_by.clone());
     let outcome = crate::storage::reflect::reflect_with_hooks_for_caller(
         conn,
         &input,
         &crate::storage::reflect::ReflectHooks::empty(),
-        Some(pa.requested_by.as_str()),
+        read_caller.as_deref(),
     )
     .map_err(|e| anyhow::anyhow!("reflect execute failed: {e}"))?;
     Ok(Some(outcome.id))
@@ -33021,6 +33032,12 @@ mod tests {
     /// "unknown action_type: reflect" and the queued row would never land.
     #[test]
     fn test_execute_reflect_arm_succeeds_round_trip() {
+        // #4419 — the replay reads its sources under the read-visibility
+        // posture; this cell pins the single-operator trust-all posture
+        // (unowned sources stay readable), so hold the env lock and clear the
+        // opt-in rather than inherit whatever a sibling test left set.
+        let _envg = crate::identity::agent_id_env_test_lock();
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
         let conn = test_db();
         // Seed two source memories the reflection will reflect on.
         let src1 = make_memory("src-1", "ns/reflect", Tier::Mid, 5);
