@@ -1087,6 +1087,45 @@ def path_max_restore_violation(tmp):
     return res
 
 
+_IN_RESTORE_DIAGNOSTIC = []
+
+
+def path_max_restore_diagnostic_violation(tmp):
+    """None when a dropped os.pathconf/sys.platform restore is reported against the
+    REAL host platform, else a description (#6145 R7-F1). Runs _self_test in a nested
+    scratch with path_max_fallback_violation replaced by a copy that leaks its patches
+    (what a dropped `finally` does); the nested run's FAIL message must say
+    `not '<host platform>'`, i.e. the restore cell took its snapshot before anything
+    could leak. os.pathconf, sys.platform and the replaced cell are put back."""
+    if _IN_RESTORE_DIAGNOSTIC:
+        return None
+    host, real_pathconf = sys.platform, os.pathconf
+    real_cell = globals()["path_max_fallback_violation"]
+
+    def leaking(_tmp):
+        for plat, _want in sorted(FALLBACK_PLATFORMS, key=lambda entry: entry[0] != sys.platform):
+            os.pathconf, sys.platform = (lambda _p, _n: 0), plat
+        return None
+    nested = tmp / "nested-restore-diagnostic"
+    nested.mkdir()
+    globals()["path_max_fallback_violation"] = leaking
+    _IN_RESTORE_DIAGNOSTIC.append(True)
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            rc = _self_test(nested)
+    finally:
+        _IN_RESTORE_DIAGNOSTIC.clear()
+        globals()["path_max_fallback_violation"] = real_cell
+        os.pathconf, sys.platform = real_pathconf, host
+    if rc != 2 or "leaked a patched" not in err.getvalue():
+        return f"a leaked patch was not reported (rc {rc}): {err.getvalue()[-300:]!r}"
+    if f"not {host!r}" not in err.getvalue():
+        return (f"the leak message does not name the real host platform {host!r}: "
+                f"{err.getvalue()[-300:]!r}")
+    return None
+
+
 def guarded_violation():
     """None when guarded() turns an Exception into '<cell> raised <Type>: <msg>',
     returns None for a passing cell and lets KeyboardInterrupt propagate, else a
@@ -1298,6 +1337,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         return 2
     for tag, cell, cell_args in (("path-max-fallback", path_max_fallback_violation, (tmp,)),
                                  ("path-max-restore", path_max_restore_violation, (tmp,)),
+                                 ("path-max-diagnostic", path_max_restore_diagnostic_violation, (tmp,)),
                                  ("shim-deep-cap", deep_scratch_cap_violation, (tmp,)),
                                  ("guarded", guarded_violation, ()),
                                  ("shim-scratch-limit", scratch_limit_message_violation, (tmp,)),
