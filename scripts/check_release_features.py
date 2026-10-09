@@ -1569,6 +1569,11 @@ DOCKER_HEAD = ("needs: [preflight, qualify, supply-chain]\n    if: needs.preflig
 CRATES_STEPS = ("    # CARGO_REGISTRY_TOKEN is scoped to the `release` Environment (#3546 D4).\n"
                 "    environment: release\n    steps:\n")
 SUPPLY_PERMS = "    # it must not inherit the top-level `contents: write`.\n    permissions:\n      contents: read\n"
+REL_ON = "on:\n  workflow_dispatch:\n"
+REL_GROUP = "  group: release-${{ github.event.inputs.tag }}\n"
+REL_WF_NAME = "name: Release (workflow_dispatch — operator-gated publish)\n"
+SHAPE_GROUP = "  group: release-shape-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name }}\n"
+SHAPE_WF_NAME = "name: Release-shaped build + PostgreSQL TLS proof (#4480)\n"
 CRATES_PERMS = "    # must not inherit the top-level `contents: write`.\n    permissions:\n      contents: read\n"
 COPR_HDR = "  copr:\n    name: Fedora COPR\n"
 LOGIN_PW = "          password: ${{ secrets.GITHUB_TOKEN }}\n"
@@ -2092,6 +2097,20 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR10 job timeout changed": ("fail", [_shape("    timeout-minutes: 60\n", "    timeout-minutes: 600\n")]),
     # --- #4720: the release-shape proof is required; a continue-on-error on the job is refused
     "4720 release-shape job carries continue-on-error": ("fail", [_shape(SHAPE_RUNS_ON, _add_shape_continue_on_error)]),
+    # --- #4936: the `on:` and `concurrency:` values (and the workflow names) are pinned whole
+    "4936 release.yml on: gains workflow_call": ("fail", [_rel(REL_ON, "on:\n  workflow_call:\n  workflow_dispatch:\n")]),
+    "4936 release.yml on: gains push tags": ("fail", [_rel(REL_ON, "on:\n  push:\n    tags: ['v*']\n  workflow_dispatch:\n")]),
+    "4936 release.yml on: gains workflow_run": ("fail", [_rel(
+        REL_ON, "on:\n  workflow_run:\n    workflows: [CI]\n    types: [completed]\n  workflow_dispatch:\n")]),
+    "4936 release.yml dry_run input defaults to false": ("fail", [_rel("        default: true\n", "        default: false\n")]),
+    "4936 release.yml concurrency cancel-in-progress: true": ("fail", [_rel(
+        "  cancel-in-progress: false\n", "  cancel-in-progress: true\n")]),
+    "4936 release.yml concurrency group changed": ("fail", [_rel(REL_GROUP, "  group: release\n")]),
+    "4936 release.yml workflow name changed": ("fail", [_rel(REL_WF_NAME, "name: Release\n")]),
+    "4936 release-shape.yml concurrency group changed": ("fail", [_shape(SHAPE_GROUP, "  group: release-shape\n")]),
+    "4936 release-shape.yml concurrency cancel-in-progress: false": ("fail", [_shape(
+        "  cancel-in-progress: true\n", "  cancel-in-progress: false\n")]),
+    "4936 release-shape.yml workflow name changed": ("fail", [_shape(SHAPE_WF_NAME, "name: Release shape\n")]),
     "SR10 an extra job": ("fail", [_shape(SHAPE_NAME, lambda t: t.rstrip("\n") + "\n\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n")]),
     "SR10 permissions changed": ("fail", [_shape("permissions:\n  contents: read\n", "permissions:\n  contents: write\n")]),
     "SR10/P25 last path filter dropped": ("fail", [_shape('      - "migrations/**"\n', "")]),
