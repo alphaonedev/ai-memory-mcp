@@ -50,8 +50,9 @@ pub const INTERNAL_ERROR: i64 = -32603;
 /// request object per line and answers a JSON array with `-32700`, so
 /// claiming it would advertise semantics the server does not implement.
 /// `2025-06-18` and `2026-07-28` are likewise unaudited. The pin
-/// `tests/mcp_protocol_revision_ssot_6157.rs` keeps every fixture and doc
-/// that names a `protocolVersion` inside this list.
+/// `tests/mcp_protocol_revision_ssot_6157.rs` walks the whole repository
+/// (clients, cookbooks, benches, docs, tests, scripts) and keeps every
+/// `protocolVersion` it names inside this list.
 pub const SUPPORTED_PROTOCOL_REVISIONS: &[&str] = &[NEWEST_PROTOCOL_REVISION];
 
 /// The newest entry of [`SUPPORTED_PROTOCOL_REVISIONS`]: what a client that
