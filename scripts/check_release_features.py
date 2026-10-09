@@ -2310,7 +2310,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR3 duplicate stage name": ("fail", [_docker(D_FINAL, "FROM busybox AS builder\n" + D_FINAL)]),
     "SR3 binary copied twice": ("fail", [_docker(D_FINAL, D_FINAL + D_BIN)]),
     "SR3 final stage takes another --from": ("fail", [_final("COPY --from=busybox /bin/sh /bin/sh2\n")]),
-    "SR3 binary copied from an image, not a stage": ("fail", [_docker(D_BIN, D_BIN.replace("=builder", "=rust:1.98"))]),
+    "SR3 binary copied from an image, not a stage": ("fail", [(DOCKER, "--from=builder", "--from=rust:1.98", True)]),
     "SR3 builder takes a --from": ("fail", [_docker(D_WORKDIR, D_WORKDIR + "COPY --from=busybox /bin/sh /bin/sh\n")]),
     "SR3/D1 dead stage holds the canonical RUN, shipped builder altered": ("fail", [_docker(D_BUILDER, _dead_stage_then_alter)]),
     "SR3 cargo fetch in the builder before the canonical RUN": ("fail", [_docker(D_LOCK, D_LOCK + "RUN cargo fetch\n")]),
