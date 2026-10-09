@@ -1875,6 +1875,17 @@ def self_test():
         doc.write_bytes(b"Run check_new.py&amp;#x202E; and check_new.py&amp;rlm; daily.\n")
         probs = check(root)
         expect(not probs, "R10-#6417-control: a literal, escaped reference was reported (%r)" % (probs,))
+        # #6426 (round 10): a quoted attribute value may hold a '>' (INLINE_TAG_RE is quote-aware), so the
+        # text inside it is hidden by the renderer and is not a script name the reader sees. These two cells
+        # pin that the quote-aware tag pattern is load-bearing: a pattern that stops at the first '>' exposes
+        # the attribute text as reader text and reports a name nobody reads.
+        for label, text in (
+            ("name inside a double-quoted attribute value", 'Run check-cert-<span title="a>expiry.sh"> daily.\n'),
+            ("look-alike inside an attribute value", 'Run <span title="x>сheck_cert_expiry.py">y</span>.\n'),
+        ):
+            doc.write_bytes(text.encode("utf-8"))
+            probs = check(root)
+            expect(not probs, "R10-#6426-%s: hidden attribute text was reported (%r)" % (label, probs))
         # #6353: an allowlist that exists but cannot be stat'ed is unreadable (exit 2), never absent.
         r = fresh("u-allow-loop")
         (r / ALLOW_REL).unlink()
