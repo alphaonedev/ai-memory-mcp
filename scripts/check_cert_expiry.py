@@ -1966,6 +1966,25 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     for why, env, needle in closed:
         t.gate("pr4", f"pull_request with {why}", repo, env, needle)
 
+    # (#6144) The 64-hex (SHA-256 object format) form is ACCEPTED by the sha
+    # validator: the run then fails cleanly at the later git lookup, never at the
+    # validator. Narrowing ENV_SHA_RE to 40 hex turns these cells red.
+    for key in ("PR_HEAD_SHA", "GITHUB_SHA"):
+        out = t.gate("pr4-sha256", f"pull_request with a 64-hex {key} (accepted by the validator)",
+                     repo, dict(pr_base_env, **{key: "a" * 64}), "does not resolve to a commit")
+        if hex_msg in out:
+            t.fail(f"(pr4-sha256): a 64-hex {key} was refused by the sha validator:", out)
+    # 63 / 65 hex are refused by the validator, with no git call at all: a shim
+    # that refuses every rev-parse must never be reached.
+    for n in (63, 65):
+        for key in ("PR_HEAD_SHA", "GITHUB_SHA"):
+            rc, out, err = run_gate_shimmed(tmp, repo, dict(pr_base_env, **{key: "b" * n}),
+                                            fail="rev-parse")
+            text = out + err
+            if rc != 1 or hex_msg not in text or "shim refuses" in text:
+                t.fail(f"(pr4-sha-len): a {n}-hex {key} was not refused by the validator "
+                       "before any git call:", text)
+
     # (k) fail-closed - pull_request with nothing set (missing PR head sha / base ref).
     t.gate("k", "pull_request with PR_HEAD_SHA and GITHUB_BASE_REF unset", repo,
            {"GITHUB_EVENT_NAME": "pull_request"}, "PR_HEAD_SHA is unset")
@@ -2068,27 +2087,25 @@ SELF_TEST_OK = (
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
     "octopus merge RED; (ci1-ci7, #5970) the event payload range is authoritative under "
     "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
-    "outside CI; (shim-isolation, #6145) the git PATH shim runs under python3 -I: isolated flag set and "
-    "a module planted beside it not importable, checked before any shimmed gate run; "
-    "(shim-interpreter, #6145) a whitespace, NUL, over-long (>255 byte) or non-UTF-8 interpreter line is "
-    "refused and a 255-byte line is accepted; (shim-interpreter-robust, #6145) a missing or near-PATH_MAX "
-    "scratch dir, sized from the platform PATH_MAX, yields a named violation, not a traceback; "
-    "(shim-deep-scratch, #6145) the deep scratch builder lands on the exact length, removes itself on failure and "
-    "a build failure is a named violation; (shim-unexecutable, #6145) an unexecutable shim "
-    "is reported as a violation; (path-max-fallback, #6145) PATH_MAX falls back to 1024 on macOS/BSD and "
-    "4096 elsewhere when os.pathconf fails; (guarded, #6145) a crashing cell becomes a named failure and "
-    "KeyboardInterrupt propagates; (shim-scratch-limit, #6145) a too-deep scratch path is reported with its "
-    "length and the limit; (shim-deep-relative, #6145) the deep-scratch targets stay valid on a deep checkout; "
-    "(shim-deep-cap, #6145) they stay inside [deep_scratch base, PATH_MAX-1] and a scratch 24 bytes under "
-    "PATH_MAX gets the 'needs room' message; (path-max-restore, #6145) os.pathconf and sys.platform are "
-    "restored and the fallback check runs once, first; (path-max-diagnostic, #6145) a dropped restore "
-    "names the real host platform and is put back, and a failing (not leaking) fallback check is "
-    "reported as path-max-fallback, running only that cell in the same scratch dir; "
+    "outside CI; "
+    "(shim-isolation, #6145) the git PATH shim runs under python3 -I: isolated flag set and a module planted beside it not importable, checked before any shimmed gate run; "
+    "(shim-interpreter, #6145) a whitespace, NUL, over-long (>255 byte) or non-UTF-8 interpreter line is refused and a 255-byte line is accepted; "
+    "(shim-interpreter-robust, #6145) a missing or near-PATH_MAX scratch dir, sized from the platform PATH_MAX, yields a named violation, not a traceback; "
+    "(shim-deep-scratch, #6145) the deep scratch builder lands on the exact length, removes itself on failure and a build failure is a named violation; "
+    "(shim-unexecutable, #6145) an unexecutable shim is reported as a violation; "
+    "(path-max-fallback, #6145) PATH_MAX falls back to 1024 on macOS/BSD and 4096 elsewhere when os.pathconf fails; "
+    "(guarded, #6145) a crashing cell becomes a named failure and KeyboardInterrupt propagates; "
+    "(shim-scratch-limit, #6145) a too-deep scratch path is reported with its length and the limit; "
+    "(shim-deep-relative, #6145) the deep-scratch targets stay valid on a deep checkout; "
+    "(shim-deep-cap, #6145) they stay inside [deep_scratch base, PATH_MAX-1] and a scratch 24 bytes under PATH_MAX gets the 'needs room' message; "
+    "(path-max-restore, #6145) os.pathconf and sys.platform are restored and the fallback check runs once, first; "
+    "(path-max-diagnostic, #6145) a dropped restore names the real host platform and is put back, and a failing (not leaking) fallback check is reported as path-max-fallback, running only that cell in the same scratch dir; "
     "(shim-isolation-crash, #6145) a crash in the isolation cell is a named failure; "
     "(checkout-depth-coverage, #6145) checkout-depth runs the shim-unexecutable cell; "
-    "(checkout-depth, #6145) every #6145 shim and scratch cell (including shim-unexecutable) passes in a "
-    "226-byte scratch dir, the one a 184-byte checkout gets; the gate-run fixtures build one gitshim.* level under the scratch "
-    "dir and fit within it."
+    "(checkout-depth, #6145) every #6145 shim and scratch cell (including shim-unexecutable) passes in a 226-byte scratch dir, the one a 184-byte checkout gets; "
+    "the gate-run fixtures build one gitshim.* level under the scratch dir and fit within it; "
+    "(pr4-sha256, #6144) a 64-hex PR_HEAD_SHA / GITHUB_SHA passes the validator and fails cleanly at the git lookup; "
+    "(pr4-sha-len) 63/65-hex refused before any git call."
 )
 
 
