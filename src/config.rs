@@ -6838,9 +6838,12 @@ static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<PermissionsMode>> =
 /// restart (#1174 PR7); the previous `OnceLock` shape made repeat
 /// callers silently no-op.
 pub fn set_active_permissions_mode(mode: PermissionsMode) {
-    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() {
-        *w = Some(mode);
-    }
+    // #4895 — recover a poisoned slot instead of silently dropping the
+    // install: the only write under the guard is a `Copy` assignment, so the
+    // slot's value is never torn and the poison carries no information.
+    *ACTIVE_PERMISSIONS_MODE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mode);
 }
 
 /// The pre-initialization fallback mode for [`active_permissions_mode`].
@@ -6879,7 +6882,15 @@ const UNINITIALIZED_PERMISSIONS_MODE_FALLBACK: PermissionsMode = PermissionsMode
 /// scenario.
 #[must_use]
 pub fn active_permissions_mode() -> PermissionsMode {
-    match ACTIVE_PERMISSIONS_MODE.read().ok().and_then(|g| *g) {
+    // #4895 — a POISONED slot still yields the INSTALLED mode. Mapping the
+    // poison to "boot never installed a mode" would run every later
+    // governance decision in the pre-init `Advisory` fallback (fail-open)
+    // after a panic under the write guard; the writers recover the poison
+    // the same way, so reader and writers agree.
+    let installed: Option<PermissionsMode> = *ACTIVE_PERMISSIONS_MODE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match installed {
         Some(mode) => mode,
         None => {
             static UNINIT_GATE_WARN_ONCE: std::sync::Once = std::sync::Once::new();
@@ -6925,9 +6936,10 @@ pub fn override_active_permissions_mode_for_test(mode: PermissionsMode) {
 /// next setter call, which is the documented contract.
 #[doc(hidden)]
 pub fn clear_permissions_mode_override_for_test() {
-    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() {
-        *w = None;
-    }
+    // #4895 — same poison recovery as the production setter.
+    *ACTIVE_PERMISSIONS_MODE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 /// Test-only: acquire the global gate-mode serialization lock.
