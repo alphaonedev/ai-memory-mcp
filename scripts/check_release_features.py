@@ -2070,6 +2070,9 @@ INSTALL = "docs/INSTALL.md"
 DECL = "scripts/release-features.sh"
 ASSERTER = "scripts/assert-compiled-features.sh"
 CARGO = "Cargo.toml"
+LINUX_X86_LEG = "          - target: x86_64-unknown-linux-gnu\n            os: ubuntu-latest\n"
+LINUX_ARM_LEG = "          - target: aarch64-unknown-linux-gnu\n            os: ubuntu-24.04-arm\n"
+BREW_LOOP = "          for TARGET in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu "
 PASTE_DEP = 'paste = { path = "vendor/paste" }'
 INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL, ASSERTER, SHAPE_PROOF_SCRIPT, CARGO)
 
@@ -3109,6 +3112,20 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         "        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}\n", "        shell: bash\n", 1)))]),
     "6284 shape build bind sha taken from the PR head": ("fail", [_shape(SHAPE_HDR, _in_shape_build(lambda s: s.replace(
         "PREFLIGHT_SHA: ${{ github.sha }}", "PREFLIGHT_SHA: ${{ github.event.pull_request.head.sha }}", 1)))]),
+    # --- #6279: the release matrix pins each (target, os) pair; no self-hosted leg
+    "6279 matrix os self-hosted": ("fail", [_rel(LINUX_X86_LEG, LINUX_X86_LEG.replace("ubuntu-latest", "self-hosted"))]),
+    "6279 matrix os changed for one target": ("fail", [_rel(LINUX_ARM_LEG, LINUX_ARM_LEG.replace("ubuntu-24.04-arm",
+                                                                                                    "ubuntu-22.04-arm"))]),
+    "6279 matrix os swapped between two targets": ("fail", [_rel(LINUX_X86_LEG, LINUX_X86_LEG.replace(
+        "ubuntu-latest", "ubuntu-24.04-arm")), _rel(LINUX_ARM_LEG, LINUX_ARM_LEG.replace("ubuntu-24.04-arm", "ubuntu-latest"))]),
+    # --- #6287 (5-agent vote 4d3ea1c5, D1): Homebrew ships exactly the matrix targets
+    "6287 homebrew sha loop drops a target": ("fail", [_rel(BREW_LOOP, BREW_LOOP.replace("aarch64-unknown-linux-gnu ", ""))]),
+    "6287 homebrew sha loop adds a target": ("fail", [_rel(BREW_LOOP, BREW_LOOP.replace(
+        "for TARGET in ", "for TARGET in riscv64gc-unknown-linux-gnu "))]),
+    "6287 formula without the arm64 macOS requirement": ("fail", [_rel("on_macos do", _drop_lines_with(
+        "depends_on arch: :arm64"))]),
+    "6287 formula carries an Intel macOS tarball": ("fail", [_rel("            on_macos do\n", "            on_macos do\n"
+        '              url "https://example.invalid/ai-memory-x86_64-apple-darwin.tar.gz"\n')]),
     # --- #6292: the release-shape `paths:` filter covers every build input
     "6292 path dependency outside the release-shape paths filter": ("fail", [(CARGO, PASTE_DEP,
         PASTE_DEP.replace("vendor/paste", "third_party/paste"), False)]),
@@ -3456,6 +3473,14 @@ def unit_checks() -> int:
             or SHAPE_BUILD[-1] != WF_BUILD[-1].replace(" --target ${{ matrix.target }}", "")):
         print("self-test FAIL: the release-shape build statements differ from the release build's (#6284): "
               f"{[s for s in WF_BUILD if s not in SHAPE_BUILD]} missing", file=sys.stderr)
+        failures += 1
+    # #6279 / #6287: exactly three (target, os) pairs, no Intel macOS leg
+    # (5-agent vote 4d3ea1c5, D1 3-2), no self-hosted runner.
+    want_matrix = (("x86_64-unknown-linux-gnu", "ubuntu-latest"), ("aarch64-unknown-linux-gnu", "ubuntu-24.04-arm"),
+                   ("aarch64-apple-darwin", "macos-latest"))
+    if globals().get("RELEASE_MATRIX") != want_matrix or tuple(RELEASE_TARGETS) != tuple(t for t, _ in want_matrix):
+        print(f"self-test FAIL: the release matrix pin is not the three voted (target, os) pairs (#6279, #6287): "
+              f"{globals().get('RELEASE_MATRIX')}", file=sys.stderr)
         failures += 1
     # #6292: the release-shape trigger filter covers every build input the
     # binary is made from, not only the source tree.
