@@ -815,14 +815,15 @@ def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
     """Write the executable `git` PATH shim into shim_dir (#6145: its interpreter
     line is `python3 -I`, like the gate itself in c8-precheck.yml, so the shim's
     own directory is never on its sys.path). Fails closed with GateError when the
-    interpreter line cannot carry `-I` intact: whitespace in the interpreter path
-    splits it, and a line over SHEBANG_MAX bytes is truncated by the kernel, which
-    silently drops `-I`."""
+    interpreter line cannot carry `-I` intact: whitespace or a NUL byte in the
+    interpreter path splits it, a path that is not valid UTF-8 cannot be written, and
+    a line over SHEBANG_MAX (255) bytes is truncated by the kernel, which silently
+    drops `-I` (a 255-byte line is accepted, a 256-byte line refused)."""
     python = sys.executable if interpreter is None else str(interpreter)
     line = f"#!{python} -I"
-    if not python or any(ch.isspace() for ch in python):
+    if not python or "\x00" in python or any(ch.isspace() for ch in python):
         raise GateError(f"the shim interpreter path {python!r} is empty or contains "
-                        "whitespace; its '-I' flag would not survive the shebang")
+                        "whitespace or a NUL byte; its '-I' flag would not survive the shebang")
     try:
         line_bytes = len(line.encode("utf-8"))
     except UnicodeEncodeError as exc:
@@ -844,16 +845,17 @@ def shim_interpreter_violation(tmp):
     the LITERAL 255/256 byte lines the kernel allows/truncates, never to SHEBANG_MAX,
     so changing that constant to 256 fails here (#6145 R3-F1)."""
     fixed = len("#!") + len(" -I")
-    deep = Path(tempfile.mkdtemp(prefix="gitshim-long.", dir=str(tmp)))
+    deep = None
     try:
+        deep = Path(tempfile.mkdtemp(prefix="gitshim-long.", dir=str(tmp)))
+        pad = 255 - fixed - len(os.fsencode(str(deep))) - 1
+        if pad < 1:
+            return f"the scratch path is too deep to build the boundary cases (pad {pad})"
         long_dir = deep / ("d" * 200)
         long_dir.mkdir()
         too_long = long_dir / ("p" * 60)
         too_long.symlink_to(sys.executable)
         spaced = deep / "with space" / "python3"
-        pad = 255 - fixed - len(os.fsencode(str(deep))) - 1
-        if pad < 1:
-            return f"the scratch path is too deep to build the boundary cases (pad {pad})"
         longest_ok = deep / ("q" * pad)
         one_over = deep / ("q" * (pad + 1))
         for want, interp in ((255, longest_ok), (256, one_over)):
@@ -879,8 +881,11 @@ def shim_interpreter_violation(tmp):
             if must_raise:
                 return f"{label} was accepted (the kernel would drop '-I')"
         return None
+    except OSError as exc:
+        return f"could not build the boundary cases: {exc}"
     finally:
-        shutil.rmtree(deep, ignore_errors=True)
+        if deep is not None:
+            shutil.rmtree(deep, ignore_errors=True)
 
 
 def deep_scratch(tmp, target_len):
@@ -922,7 +927,7 @@ def shim_boundary_robustness_violation(tmp):
     return None
 
 
-def shim_isolation_violation(tmp):
+def shim_isolation_violation(tmp, interpreter=None):
     """None when the git shim is isolated, else a description (#6145). Plants an
     empty `gitshim_canary_6145.py` beside the shim and runs the shim's own probe,
     which reports `sys.flags.isolated` and whether the canary imported (without
@@ -933,7 +938,7 @@ def shim_isolation_violation(tmp):
         raise GateError("git is not on PATH")
     shim_dir = Path(tempfile.mkdtemp(prefix="gitshim-iso.", dir=str(tmp)))
     try:
-        shim = write_git_shim(shim_dir, real)
+        shim = write_git_shim(shim_dir, real, interpreter=interpreter)
         (shim_dir / "gitshim_canary_6145.py").write_text("", encoding="utf-8")
         first = shim.read_text(encoding="utf-8").splitlines()[0]
         if not first.startswith("#!") or first.split()[1:] != ["-I"]:
@@ -1599,7 +1604,10 @@ SELF_TEST_OK = (
     "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
     "outside CI; (shim-isolation, #6145) the git PATH shim runs under python3 -I: isolated flag set and "
     "a module planted beside it not importable, checked before any shimmed gate run; "
-    "(shim-interpreter, #6145) a whitespace or over-long (>255 byte) interpreter line is refused."
+    "(shim-interpreter, #6145) a whitespace, NUL, over-long (>255 byte) or non-UTF-8 interpreter line is "
+    "refused and a 255-byte line is accepted; (shim-interpreter-robust, #6145) a missing or near-PATH_MAX "
+    "scratch dir yields a named violation, not a traceback; (shim-unexecutable, #6145) an unexecutable shim "
+    "is reported as a violation."
 )
 
 
