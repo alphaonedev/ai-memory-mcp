@@ -86,8 +86,8 @@ static WAKE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// A recipient's [`InboxEvent::AgentNotified::recipient_seq`] moves ONLY when
 /// a wake is published to that recipient, so the gap between two of its values
 /// counts the recipient's own missed wakes and never measures another tenant's
-/// notify volume (the host-wide [`WAKE_SEQ`] does, which is why #4071 — open —
-/// tracks keeping it off tenant-facing surfaces). Because the number is assigned HERE, before
+/// notify volume (the host-wide [`WAKE_SEQ`] does, which is why #4071 keeps
+/// it off every tenant-facing surface). Because the number is assigned HERE, before
 /// the broadcast send, a consumer whose receiver lags still sees the dropped
 /// numbers as a gap; a counter kept in the consumer would renumber across it.
 ///
