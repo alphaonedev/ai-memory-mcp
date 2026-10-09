@@ -130,6 +130,9 @@ mod lifecycle_tx_3152;
 mod forensic_outage_4199;
 // v1.0.0 #4209/#4210 — one ascending-id lock order for multi-row `memories` locks.
 mod lock_order_4209;
+// v1.0.0 #4208 — the evidence-bound route-OUT dequarantine. Own module for the
+// same qual_10 budget reason as `parity_3064` above.
+mod dequarantine_verified_4208;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -20962,6 +20965,17 @@ impl MemoryStore for PostgresStore {
         // Wave-2 B8 — sqlite twin gates at the trait method (ERRORS-09).
         self.gate_record_stop().await?;
         self.dequarantine_raw(id).await
+    }
+
+    /// #4208 — evidence-bound route-OUT (see the trait doc).
+    async fn dequarantine_verified(
+        &self,
+        id: &str,
+        verified_inbound: &crate::models::Memory,
+    ) -> StoreResult<bool> {
+        // Record-plane mutation: gated here too (#3175 parity scan).
+        self.gate_record_stop().await?;
+        self.dequarantine_verified_in_tx(id, verified_inbound).await
     }
 
     /// v1.0.0 #2402 — the AUDITED operator release (postgres twin). ONE

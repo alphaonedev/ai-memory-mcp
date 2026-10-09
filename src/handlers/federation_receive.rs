@@ -3105,8 +3105,11 @@ async fn sync_push_write(
                 // #3901 — only when the row written IS the inbound row: a
                 // cross-id title-slot merge returns a DIFFERENT local row's id,
                 // whose quarantine the attestation never covered.
+                // #4208 — and only when the row PERSISTED is the verified signed
+                // unit: a verified inbound that lost the newer-wins merge leaves
+                // never-attested local content on the row, so it releases nothing.
                 if let Some(target) = attest_dequarantine_target(&to_insert, &actual_id)
-                    && let Err(e) = db::dequarantine(&lock.0, target)
+                    && let Err(e) = db::dequarantine_if_verified_unit(&lock.0, target, &to_insert)
                 {
                     // The merge is committed; the row simply stays
                     // quarantined (fail closed) — surface it, never swallow.
