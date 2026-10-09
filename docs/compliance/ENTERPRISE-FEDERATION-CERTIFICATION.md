@@ -1501,8 +1501,8 @@ outside the watched paths does not trip the mechanized gate and is
 covered by review plus the posture/removal proofs, not by CI. (Mechanized
 as Task C / [**#2915**](https://github.com/alphaonedev/ai-memory-mcp/pull/2915),
 merged 2026-08-13: the `cert-expiry-gate` job in
-`.github/workflows/c8-precheck.yml` runs `scripts/check-cert-expiry.sh`
-on every PR diff — a watched-surface change without a same-change edit
+`.github/workflows/c8-precheck.yml` runs `scripts/check_cert_expiry.py`
+(ported from `check-cert-expiry.sh` by #6137) on every PR diff — a watched-surface change without a same-change edit
 to this document goes RED. Since [**#3556**](https://github.com/alphaonedev/ai-memory-mcp/issues/3556)
 (2026-09-21) the gate also READS this banner: a same-change edit satisfies
 it only if the STATUS line or the Binds-to line changed (an incidental

@@ -1096,11 +1096,16 @@ jobs:
     # change could merge through green CI while the cert kept being cited
     # (the #2444 "reports success while doing nothing" shape).
     #
-    # Diff range is the standard PR diff (merge-base-with-PR-base .. HEAD),
-    # NEVER a diff against the cert's pinned SHA, so unrelated later PRs
-    # do not fail forever. `fetch-depth: 0` is required (default
-    # actions/checkout@v4 is a shallow single-commit checkout of the PR
-    # merge ref, which cannot walk merge-base(base, head)).
+    # Diff range is the standard PR diff, NEVER a diff against the cert's
+    # pinned SHA, so unrelated later PRs do not fail forever. On
+    # pull_request (#6137) the gate judges the MERGE commit this job checked
+    # out (GITHUB_SHA) against the LIVE base ref (GITHUB_BASE_REF, fetched
+    # explicitly if absent), not the PR head in isolation and not the
+    # payload's PR_BASE_SHA (which can be stale); a branch cut before the
+    # carrier's banner fix is judged on the tree that would actually merge.
+    # `fetch-depth: 0` is required (default actions/checkout@v4 is a shallow
+    # single-commit checkout of the PR merge ref, which cannot walk
+    # merge-base(base, head)).
     #
     # No `needs:`, no job-level `if:`, no `paths:` filter — always runs.
     # Declared REQUIRED in required-contexts-release.txt and live-required
@@ -1119,8 +1124,9 @@ jobs:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-        run: bash scripts/check-cert-expiry.sh
+        run: python3 scripts/check_cert_expiry.py
       - name: Self-test the gate (regression evidence)
         # --self-test builds a throwaway repo under .local-runs/ (never a
         # real branch, never /tmp) and asserts: a watched-path violation
@@ -1136,7 +1142,12 @@ jobs:
         # diff (a non-ancestor bind is measured, not waved), a decoy or
         # duplicated banner line fail-closes, deleting the doc alongside a
         # wire change fail-closes, and a pure banner reformat is GREEN.
-        run: bash scripts/check-cert-expiry.sh --self-test
+        # (#6137) A stale-LIVE head banner is GREEN at the pull_request
+        # merge commit when the live base records EXPIRED, a head that
+        # flips the banner is detected over merge-base..merge-commit, a
+        # stale payload base sha is ignored for the live base ref, and a
+        # missing or unresolvable base ref / head / merge commit fail-closes.
+        run: python3 scripts/check_cert_expiry.py --self-test
 
   foreign-text-to-caller-gate:
     # #3688 gate 7 (Conductor ruling on the reviewer-f2r secret-to-sink sweep,
