@@ -810,14 +810,29 @@ PgBouncer.
   pgbouncer`) that `pool_mode` reads `transaction` after any config
   reload.
 
-> **Caveat — server-side prepared statements.** `transaction` mode
-> shares server connections across clients, so session-scoped
-> server-side prepared statements are not guaranteed to survive across
-> transactions. ai-memory's sqlx layer pins query plans via the
-> generic-plan path (#1472 follow-on, see CLAUDE.md) rather than
-> relying on long-lived named prepared statements, so it is compatible;
-> if you add a custom query path, do not assume a named prepared
-> statement persists beyond its transaction under PgBouncer.
+> **Caveat — server-side prepared statements.** ai-memory's `sqlx`
+> layer DOES use named server-side prepared statements on its hot path.
+> `sqlx-postgres` 0.8.6 names every persistent statement `sqlx_s_<n>`
+> from a counter that starts at the same value on every client
+> connection (`io/mod.rs` `NAMED_START` / `NAME_PREFIX`;
+> `connection/establish.rs` `next_statement_id: StatementId::NAMED_START`;
+> `connection/executor.rs` `next_statement_id = id.next()`), so the
+> names are unique per **client** connection, not per **server**
+> connection. Wherever a pooler shares one server connection between
+> clients, three outcomes are possible, not one: the statement a client
+> prepared is missing on the next server connection it is handed
+> (`prepared statement "sqlx_s_1" does not exist`); a name another
+> client already prepared on that server connection collides
+> (`prepared statement "sqlx_s_1" already exists`); or the request
+> executes the same-named statement another client prepared — a
+> **wrong query runs** instead of the request failing.
+> `max_prepared_statements` > 0 (PgBouncer ≥ 1.21 prepared-statement
+> tracking; the shipped `infra/pgbouncer/pgbouncer.ini` sets 256) makes
+> PgBouncer track and re-prepare the named statements per server
+> connection and is therefore **mandatory, not tuning, wherever server
+> connections are shared between clients**. If you add a custom query
+> path, do not assume a named prepared statement persists beyond its
+> transaction under PgBouncer.
 
 > **Caveat — `statement_timeout` / `lock_timeout` under transaction
 > mode (REQUIRED ops step).** The daemon installs its query-safety
