@@ -332,10 +332,13 @@ the AGE projection prime, and the cutover dance.
 ### 5.1 Executive summary (do not skip the full doc)
 
 1. **Snapshot the postgres database first.** `pg_dump` of the database
-   schema + data:
+   schema + data. Give `pg_dump` and `psql` the password through
+   `~/.pgpass` (mode `0600`, one line: `HOST:5432:aimemory:aimemory:PASSWORD`),
+   never in the URL on the argv — `/proc/<pid>/cmdline` and `ps` expose an
+   argv to every local UID:
    ```bash
    pg_dump --format=custom --file=ai-memory.pre-v07.dump \
-     postgres://aimemory:PASSWORD@HOST:5432/aimemory
+     postgres://aimemory@HOST:5432/aimemory
    ```
 2. **Stop the daemon.** `systemctl stop ai-memory` or your service manager.
 3. **Install the v0.7.0 binary** (per §4.3 above).
@@ -347,9 +350,9 @@ the AGE projection prime, and the cutover dance.
    `schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
    Opening the store walks the postgres ladder up to schema v57
    idempotently, preserving data.
-5. **Verify schema parity:**
+5. **Verify schema parity** (password from `~/.pgpass`, as in step 1):
    ```bash
-   psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' \
+   psql 'postgres://aimemory@HOST:5432/aimemory' \
      -tAc "SELECT MAX(version) FROM schema_version;"
    # → 55
    ```

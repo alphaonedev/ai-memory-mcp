@@ -194,7 +194,10 @@ sqlite3 ~/.local/share/ai-memory/memory.db \
    UNION ALL SELECT 'signed_events', COUNT(*) FROM signed_events
    UNION ALL SELECT 'memory_transcripts', COUNT(*) FROM memory_transcripts;"
 
-psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' -c "
+# psql / pg_dump take the password from ~/.pgpass (mode 0600, one line:
+# HOST:5432:aimemory:aimemory:PASSWORD) — never put it in the URL on the
+# argv, which every local UID can read via /proc/<pid>/cmdline and ps.
+psql 'postgres://aimemory@HOST:5432/aimemory' -c "
   SELECT 'memories' AS tbl, COUNT(*) FROM memories
   UNION ALL SELECT 'memory_links', COUNT(*) FROM memory_links
   UNION ALL SELECT 'namespaces', COUNT(*) FROM namespaces
@@ -210,8 +213,8 @@ pre-Wave-1 binary — re-run with the v0.7.0 binary that has Stream A's
 `migrate.rs` link-walk.
 
 ```bash
-# Schema parity.
-psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' \
+# Schema parity (password from ~/.pgpass, as above).
+psql 'postgres://aimemory@HOST:5432/aimemory' \
   -tAc "SELECT MAX(version) FROM schema_version;"
 # → 55
 ```
