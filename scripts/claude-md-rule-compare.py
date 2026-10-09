@@ -10,7 +10,8 @@ enters the report (#6163): a `name=value` / `name: value` whose name holds a pas
 key, access key, private key or credential word (quoted, multi-word and JSON-quoted forms included, past an escaped
 quote and to the end of the line when the quote is never closed; a count of at most 9 digits or a switch word is shown,
 and an UPPER_SNAKE value only as an environment variable name, unless the name is a password or passphrase; a later word
-that is neither plain nor short lower-case prose masks the whole value, #6209), URL userinfo (an empty user name
+that is neither plain nor short prose masks the whole value, #6209; an emphasised or code-quoted name, a backtick-quoted
+value and the cells after a credential-name cell of a Markdown table row, #6210), URL userinfo (an empty user name
 included), an Authorization Bearer/Basic value, a GitHub, AWS access key id, Slack or `sk-` provider token, and a PEM or
 PGP private key block. A diff line inside a private key block is masked by its index on its own side, so it is masked
 even when the BEGIN line lies outside its hunk. Lines this script writes are never masked, and the verdict is computed
@@ -96,10 +97,16 @@ PR_NUMBER = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
 # verdict is computed before masking). Groups: 1 the name, 2 its separator (an optional closing quote or backtick,
 # then `:` or `=`), 3/4 a double/single-quoted value, 5 an unquoted run of words up to a quote, a backtick or the end of
 # the line, so `password = a b` masks both words.
+CREDENTIAL_NAME = (r"[\w-]*(?:passw(?:or)?d|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|"
+                   r"credential)[\w-]*")
+# #6210: the name may be emphasised or code-quoted (`**password**: v`, `password:** v`, `` `token`: v ``) and the
+# value may be backtick-quoted; groups: 1 name, 2 separator, 3 "...", 4 '...', 5 `...`, 6 unquoted.
 CREDENTIAL_VALUE = re.compile(
-    r"(?i)(?<![\w-])([\w-]*(?:passw(?:or)?d|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|"
-    r"credential)[\w-]*)([\"'`]?\s*[:=]\s*)(?:\"((?:[^\"\\\n]|\\.?)*)(?:\"|$)|'((?:[^'\\\n]|\\.?)*)(?:'|$)|"
+    r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")((?:[*_]{1,2}|[\"'`])?\s*[:=]\s*(?:[*_]{1,2}\s*)?)"
+    r"(?:\"((?:[^\"\\\n]|\\.?)*)(?:\"|$)|'((?:[^'\\\n]|\\.?)*)(?:'|$)|`([^`\n]*)(?:`|$)|"
     r"([^\s\"'`]+(?:[ \t]+[^\s\"'`]+)*))")
+# #6210: a Markdown table row whose cell is a credential name (`| password | v |`); the cells after it are values.
+TABLE_NAME_CELL = re.compile(r"(?i)\|\s*[*_`]{0,2}(" + CREDENTIAL_NAME + r")[*_`]{0,2}\s*(?=\|)")
 # #6163 round 3 (review G3): a quoted value runs to its closing quote past `\"` escapes, or to the end of the line when
 # the quote is never closed, so neither an escaped quote nor a missing one leaves the rest of the value visible.
 # #6163 round 2/3: a value that is a count or a switch word is configuration, not a credential (a ceiling change in rule
@@ -116,8 +123,8 @@ ENV_NAME_TAIL = re.compile(r"_(?:KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIAL
 LONG_DIGITS = re.compile(r"\d{4}")
 # #6209: an unquoted multi-word value is shown only when its first word is plain and every later word is plain too or
 # a short lower-case prose word (`max_tokens: 20000 per request`); `token: on <secret>` or `secret: yes, it is <secret>`
-# masks the whole value.
-PROSE_WORD = re.compile(r"[a-z]{1,12}[.,;:)\]}]*", re.ASCII)
+# masks the whole value. A prose word may start with a capital (a table cell `The budget for one call`).
+PROSE_WORD = re.compile(r"[A-Za-z][a-z]{0,11}[.,;:)\]}]*", re.ASCII)
 ALWAYS_MASK_NAME = re.compile(r"(?i)passw(?:or)?d|passphrase")
 # #6163 round 3 (review G2): the user name is optional (`redis://:<password>@host`).
 URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]*:([^@\s/]+)@")
@@ -249,6 +256,28 @@ def plain_word(name: str, word: str) -> bool:
         ENV_NAME_KEY.search(name) or ENV_NAME_TAIL.search(word))
 
 
+def plain_text(name: str, value: str) -> bool:
+    """#6209: True when the unquoted `value` of credential name `name` is empty, or its first word is plain and every
+    later word is plain or a short prose word (PROSE_WORD)."""
+    words = value.split()
+    return not words or (plain_word(name, words[0]) and all(
+        plain_word(name, word) or PROSE_WORD.fullmatch(word) for word in words[1:]))
+
+
+def mask_table_cells(line: str) -> tuple:
+    """#6210: in a Markdown table row with a credential-name cell, mask every later cell that is not plain_text
+    (Markdown emphasis and code quotes around the cell ignored); returns (line, count)."""
+    match = TABLE_NAME_CELL.search(line)
+    if match is None:
+        return line, 0
+    cells, count = line[match.end():].split("|"), 0
+    for index in range(1, len(cells)):
+        value = cells[index].strip().strip("*_`")
+        if value != MASK and not plain_text(match.group(1), value):
+            cells[index], count = f" {MASK} ", count + 1
+    return line[:match.end()] + "|".join(cells), count
+
+
 def mask_named_values(line: str) -> tuple:
     """#6163: mask the value of every credential-named `name=value` / `name: value` in one line; returns (line, count).
     A plain value (plain_word) is left visible unless the name is a password or passphrase; an unquoted value of several
@@ -258,14 +287,12 @@ def mask_named_values(line: str) -> tuple:
         match = CREDENTIAL_VALUE.search(line, pos)
         if match is None:
             break
-        group = next(index for index in (3, 4, 5) if match.group(index) is not None)
+        group = next(index for index in (3, 4, 5, 6) if match.group(index) is not None)
         value = match.group(group)
-        words = value.split()
-        first = words[0] if words else ""
-        plain = (group == 5 and first or value.strip())
-        if not value.strip() or (plain_word(match.group(1), plain) and (group != 5 or all(
-                plain_word(match.group(1), word) or PROSE_WORD.fullmatch(word) for word in words[1:]))):
-            stop = match.start(group) + (len(first) if group == 5 else len(value) + 1)
+        first = value.split()[0] if value.split() else ""
+        if plain_text(match.group(1), value) if group == 6 else not value.strip() or plain_word(match.group(1),
+                                                                                              value.strip()):
+            stop = match.start(group) + (len(first) if group == 6 else len(value) + 1)
             out.append(line[pos:stop])
             pos = stop
             continue
@@ -316,6 +343,8 @@ class Redactor:
                 out.append(line[:1] + MASK if line[:1] in "+- " else MASK)
                 continue
             line, found = mask_named_values(line)
+            self.count += found
+            line, found = mask_table_cells(line)
             self.count += found
             for pattern in (URL_USERINFO, BEARER_VALUE, PROVIDER_KEY_SHAPE):
                 line, found = mask_group(pattern, line)
