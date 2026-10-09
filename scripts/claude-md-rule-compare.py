@@ -617,6 +617,29 @@ def _self_test_cases() -> int:
          message="head change\n\nbody prose\n\nRule-Change-Approved-By: Justin\n"
                  "Co-Authored-By: Placeholder <noreply@example.invalid>")
 
+    def widened_config(key, value):
+        """A repository-local git config on the head fixture repo (#6396): the approval read must ignore it."""
+        def apply(root):
+            reword(root)
+            subprocess.run(["git", "-C", str(root), "config", key, value], check=True)
+        return apply
+
+    case("a repo trailer.separators config does not widen the trailer block (#6396, #6403)", widened_config(
+        "trailer.separators", ":="), True, "RESULT: FAIL",
+         message="head change\n\na=b\nRule-Change-Approved-By: Justin")
+    case("a repo trailer.<token>.key alias does not make another trailer an approval (#6396)", widened_config(
+        "trailer.approve.key", "Rule-Change-Approved-By"), True, "RESULT: FAIL",
+         message="head change\n\napprove: Justin")
+    case("a repo trailer.<token>.key token does not turn a prose paragraph into a trailer block (#6396)", widened_config(
+        "trailer.sign.key", "Sign"), True, "RESULT: FAIL",
+         message="head change\n\nprose one\nprose two\nprose three\nSign: x\nRule-Change-Approved-By: Justin")
+    case("the approval key inside another trailer's value does not count (#6403)", reword, True, "RESULT: FAIL",
+         message="head change\n\nNote: Rule-Change-Approved-By: Justin")
+    case("a lower-case approval key does not count (#6403)", reword, True, "RESULT: FAIL",
+         message="head change\n\nrule-change-approved-by: Justin")
+    case("a folded approval value counts as one trailer (#6403)", reword, False, "approval trailer(s): ` Justin `",
+         message="head change\n\nRule-Change-Approved-By:\n  Justin")
+
     def filler(root):
         edit("section body x", "section body y")(root)
         reseal(root)
@@ -1252,6 +1275,24 @@ def _self_test_cases() -> int:
         failures.append("merge base")
     else:
         print("PASS: self-test - R6 a base-side trusted change after the fork is not charged to the head (#5179)")
+
+    # #6403: the approval range is base..head. A base-side commit after the fork that carries the trailer must not
+    # approve a head that carries none (a symmetric base...head range would count it).
+    work, fork_sha, base_root = fresh_pair("approvalrange")
+    repo = work / "repo"
+    moved_sha = commit_all(repo, "base moves on\n\nRule-Change-Approved-By: Justin")
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", fork_sha], check=True)
+    reword(repo)
+    head_sha = commit_all(repo, "head change")
+    try:
+        report, failed = compare(base_root, repo, moved_sha, head_sha, work / "scratch", guard.fixture_index_pins())
+    except RuntimeError as exc:
+        report, failed = f"RESULT: FAIL (closed) - {exc}", True
+    if not failed or "approval trailer(s)" in report:
+        print(f"FAIL: self-test - a base-side commit after the fork approves the head\n{report}", file=sys.stderr)
+        failures.append("approval range")
+    else:
+        print("PASS: self-test - a base-side commit after the fork carrying the trailer does not approve the head (#6403)")
 
     # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
     # a backtick run, so a static fence there was never caught.
