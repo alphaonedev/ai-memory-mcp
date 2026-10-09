@@ -293,6 +293,19 @@ def doc_lines(root, path):
     return raw, [visible(line) for line in raw]
 
 
+def unfolded(c):
+    """``c`` for the look-alike scan: ``MARKED`` when NFKC turns the non-ASCII ``c`` into name characters."""
+    if c.isascii():
+        return c
+    n = unicodedata.normalize("NFKC", c)
+    return MARKED if n and n.isascii() and all(x.isalnum() or x in "_.-" for x in n) else n
+
+
+def dash(c, fold_letters):
+    """A dash as ``-`` for stale-name detection; for the look-alike scan only ``-`` itself stays one (#6418)."""
+    return "-" if fold_letters or c == "-" else MARKED
+
+
 def rendered(line, fold_letters=True):
     """``line`` as a reader sees it, folded for stale-name detection only (#6214).
 
@@ -309,9 +322,11 @@ def rendered(line, fold_letters=True):
     if fold_letters:
         s = unicodedata.normalize("NFKC", s)
     else:
-        # A fullwidth, mathematical or Kelvin-sign letter stays a non-ASCII letter (#6214).
-        s = "".join(c if c.isalpha() else unicodedata.normalize("NFKC", c) for c in s)
-    s = "".join("-" if c in DASHES or unicodedata.category(c) == "Pd" else c for c in s)
+        # A fullwidth, mathematical or Kelvin-sign letter stays a non-ASCII letter (#6214), and so does
+        # any other character that NFKC turns into name characters (a Roman numeral c, a one-dot
+        # leader, a fullwidth full stop, a circled letter): the reader copies the original (#6418).
+        s = "".join(c if c.isalpha() else unfolded(c) for c in s)
+    s = "".join(dash(c, fold_letters) if c in DASHES or unicodedata.category(c) == "Pd" else c for c in s)
     out = []
     for c in unicodedata.normalize("NFD", s) if fold_letters else s:
         if invisible(c):
