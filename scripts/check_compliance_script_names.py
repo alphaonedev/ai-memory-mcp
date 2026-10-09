@@ -995,7 +995,8 @@ def self_test():
         ):
             probs = check(r)
             expect(
-                any("L1.md" in p and "loop" in p for p in probs) and not any("outside the repository" in p for p in probs),
+                any("L1.md: document symlink loop (refused)" in p for p in probs)
+                and not any("outside the repository" in p for p in probs),
                 "R7-#6217: a symlink loop was not reported as a loop (%r)" % (probs,),
             )
 
@@ -1010,6 +1011,77 @@ def self_test():
         doc.write_text("N30 enforcer is `CHECK-old.sh`.\nErratum: `CHECK-old.sh` is `scripts/check_new.py`.\n")
         expect(not check(root), "R7-#6220: an allowlisted upper-case name with an erratum was rejected")
         allow.write_text("")
+
+        # Round-7 mutant cells (evidence round7/r7_mutants.py): each pins one branch of the round-7 code.
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+        doc.write_text(stale_line + erratum.replace("check-old", "check-️old"), encoding="utf-8")
+        expect(not check(root), "R7-D4: a variation selector inside an erratum's stale name voided the erratum")
+        for label, text in (
+            ("F3/F5 tilde line inside a backtick fence", stale_line + "```mermaid\n~~~\n" + erratum + "```\n"),
+            ("F4 shorter closing run", stale_line + "````mermaid\n```\n" + erratum + "````\n"),
+            ("F3 closing run with an info string", stale_line + "```mermaid\n``` x\n" + erratum + "```\n"),
+            ("F7 unmatched backtick run", stale_line + "Text ``` <!-- " + erratum.strip() + " -->\n"),
+            ("F8 backtick in a backtick info string", stale_line + "```x`y\n<!-- " + erratum.strip() + " -->\n"),
+            ("G3 upper-case diagram info", stale_line + "```Mermaid\n" + erratum + "```\n"),
+            ("T13 look-alike erratum word", stale_line + "Errаtum: `check-old.sh` is `scripts/check_new.py`.\n"),
+        ):
+            doc.write_text(text, encoding="utf-8")
+            expect(check(root), "R7-%s: a hidden or invalid erratum was accepted" % label)
+        for label, text in (
+            ("F9 four-space indent is no fence", stale_line + "\n    ```mermaid\n\n" + erratum),
+            ("L3 four-space indent is no definition", stale_line + "\n    [a]: /u\n" + erratum),
+            ("F6 double span holding a single backtick",
+             stale_line + "Erratum: ``a ` <!-- b`` `check-old.sh` is `scripts/check_new.py`.\n"),
+        ):
+            doc.write_text(text)
+            expect(not check(root), "R7-%s: a visible erratum was rejected" % label)
+        allow.write_text("")
+        for label, text in (
+            ("T11 entity-encoded invisible character", "N30 enforcer is check&#8203;-old.sh.\n"),
+            ("C2 name after a long s", "N30 enforcer is ſcheck-old.sh.\n"),
+        ):
+            doc.write_text(text, encoding="utf-8")
+            expect(any("check-old.sh" in p for p in check(root)), "R7-%s: a stale name was not checked" % label)
+        (root / "scripts" / "a" / "scripts").mkdir(parents=True)
+        (root / "scripts" / "a" / "scripts" / "check_deep.py").write_text("")
+        doc.write_text("Runs `./scripts/a/scripts/check_deep.py`.\n")
+        expect(not check(root), "R7-O14: ./scripts/ with a nested scripts/ was not resolved from the first one")
+        allow.write_text("docs/compliance/A.md:CHECK-old.SH\n")
+        doc.write_text("N30 enforcer is `CHECK-old.SH`.\nErratum: `CHECK-old.SH` is `scripts/check_new.py`.\n")
+        expect(not check(root), "R7-C4: an allowlist entry with an upper-case suffix was rejected")
+        allow.write_text("")
+
+        # P7, Y3, Y4: a resolve() error other than a loop fails closed under its own message.
+        real_resolve = Path.resolve
+
+        def check_with_resolve(r, name, exc):
+            def resolve(self, *args, **kwargs):
+                if self.name == name:
+                    raise exc
+                return real_resolve(self, *args, **kwargs)
+
+            Path.resolve = resolve
+            try:
+                return check(r)
+            except Exception as err:  # an escaped exception is the failure being probed
+                return ["raised %s" % type(err).__name__]
+            finally:
+                Path.resolve = real_resolve
+
+        r = fresh("r-runtime")
+        (r / "docs" / "compliance" / "A.md").write_text("Runs `scripts/check_new.py`.\n")
+        probs = check_with_resolve(r, "check_new.py", RuntimeError("Symlink loop"))
+        expect(any("check_new.py" in p and "does not exist" in p for p in probs),
+               "R7-P7: a RuntimeError from resolve() in path_ok did not fail closed (%r)" % (probs,))
+        r = fresh("r-unresolvable")
+        (r / "docs" / "compliance" / "real.md").write_text("No script names.\n")
+        if try_symlink(r / "docs" / "compliance" / "U.md", r / "docs" / "compliance" / "real.md", "R7-Y3"):
+            probs = check_with_resolve(r, "U.md", OSError(errno.EIO, "I/O error"))
+            expect(
+                any("U.md: document symlink cannot be resolved" in p for p in probs)
+                and not any("outside the repository" in p for p in probs),
+                "R7-Y3/Y4: an unresolvable document symlink was not refused as such (%r)" % (probs,),
+            )
 
         # #6199: a fixture setup failure exits 2 with 'SELF-TEST FAIL: fixture setup', never a traceback.
         gate_src = Path(__file__).read_text(encoding="utf-8")
