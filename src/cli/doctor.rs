@@ -4074,7 +4074,20 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
             facts.push(("oldest_pending_age_secs".into(), "queue_empty".into()));
         }
         Err(e) => {
-            facts.push(("pending_query_error".into(), e.to_string()));
+            // #4982 — a read fault (or an unparseable pending row) is a
+            // Critical finding, never `queue_empty`: the 24h-backlog check
+            // could not run.
+            severity = Severity::Critical;
+            facts.push((
+                "oldest_pending_age_secs".into(),
+                over_depth_4715::UNREADABLE.into(),
+            ));
+            facts.push(("pending_query_error".into(), format!("{e:#}")));
+            append_note(
+                &mut note,
+                "the oldest pending action could not be read, so the 24h backlog check \
+                 could not run (#4982)",
+            );
         }
     }
 

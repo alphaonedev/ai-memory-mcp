@@ -275,13 +275,16 @@ pub fn doctor_dim_violations(conn: &Connection) -> Result<Option<usize>> {
 }
 
 /// Age in seconds of the oldest `pending` row in `pending_actions`, or
-/// `None` if the queue is empty (or the column is unparseable). The
-/// doctor uses this to flag a backlog older than 24h as critical.
+/// `None` if the queue is empty. The doctor uses this to flag a backlog
+/// older than 24h as critical.
 ///
 /// # Errors
 ///
-/// Returns `Err` only on hard SQLite failures (e.g. missing table).
+/// Returns `Err` on any SQLite failure (e.g. a missing table) AND on a
+/// pending row whose `requested_at` does not parse as RFC 3339 (#4982): a
+/// queue the probe could not read is never reported as empty.
 pub fn doctor_oldest_pending_age_secs(conn: &Connection) -> Result<Option<i64>> {
+    use rusqlite::OptionalExtension as _;
     let row: Option<String> = conn
         .query_row(
             "SELECT requested_at FROM pending_actions WHERE status = 'pending'
@@ -289,13 +292,13 @@ pub fn doctor_oldest_pending_age_secs(conn: &Connection) -> Result<Option<i64>> 
             [],
             |r| r.get(0),
         )
-        .ok();
+        .optional()?;
     let Some(ts) = row else {
         return Ok(None);
     };
-    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&ts) else {
-        return Ok(None);
-    };
+    let parsed = chrono::DateTime::parse_from_rfc3339(&ts).map_err(|e| {
+        anyhow::anyhow!("oldest pending row has an unparseable requested_at {ts:?}: {e}")
+    })?;
     // M11 (v0.7.0 round-2) — clamp negative ages to 0. `requested_at`
     // is stamped by the writer's clock; on a host with skewed time
     // (NTP slewing back, intentional misconfiguration, or VM time
