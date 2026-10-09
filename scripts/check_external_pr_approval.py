@@ -42,7 +42,7 @@ REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}")
 LOGIN_RE = re.compile(r"[A-Za-z0-9-]{1,39}(?:\[bot\])?")
 ASSOC_RE = re.compile(r"[A-Z_]{1,32}")
 TOKEN_RE = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")
-QUEUE_REF_RE = re.compile(r"refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]{40,64}")
+QUEUE_REF_RE = re.compile(r"refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-([^/]*)")
 
 
 class GateError(Exception):
@@ -160,6 +160,13 @@ def merge_group_pr_number(event):
     if number <= 0:
         raise GateError(f"merge_group head_ref {ref!r} does not name a pull request "
                         "(expected refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>)")
+    # The ref is attacker-influenced text; the queued head is GitHub's own field. The sha in the
+    # ref must be a full commit sha and equal that head, or the verdict is not about the queue (#6242).
+    ref_sha = match.group(2)
+    head_sha = group.get("head_sha")
+    if (not SHA_RE.fullmatch(ref_sha) or not isinstance(head_sha, str)
+            or not SHA_RE.fullmatch(head_sha) or ref_sha != head_sha):
+        raise GateError(f"merge_group head_ref sha {ref_sha!r} is not the queued head commit")
     return number
 
 
@@ -232,11 +239,18 @@ def self_test():
         ("merge-group-unapproved", 1, "merge_group", "c" * 40, api_for([pr(1, a)])),
         ("merge-group-approved", 0, "merge_group", "c" * 40, api_for([pr(1, a)], {1: [approved]})),
         ("merge-group-no-pr-in-ref", 1, "merge_group", "c" * 40, api_for([pr(1, a)])),
+        ("merge-group-ref-sha-not-queued-head", 1, "merge_group", "c" * 40,
+         api_for([pr(1, a)], {1: [approved]})),
     ]
     failures = 0
-    queue = {"merge_group": {"head_ref": "refs/heads/gh-readonly-queue/main/pr-1-" + "c" * 40}}
+    queue = {"merge_group": {"head_sha": "c" * 40,
+                             "head_ref": "refs/heads/gh-readonly-queue/main/pr-1-" + "c" * 40}}
+    forged = {"merge_group": {"head_sha": "c" * 40,
+                              "head_ref": "refs/heads/gh-readonly-queue/main/pr-1-" + "d" * 40}}
     for name, want, event_name, sha, api in cases:
         event = {} if name == "merge-group-no-pr-in-ref" else (queue if event_name == "merge_group" else {})
+        if name == "merge-group-ref-sha-not-queued-head":
+            event = forged
         rc, _lines = run_gate(event_name, event, repo, sha, op, api)
         ok = rc == want
         failures += 0 if ok else 1
