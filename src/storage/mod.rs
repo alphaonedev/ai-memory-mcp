@@ -879,6 +879,9 @@ pub mod escalation_deferral;
 pub(crate) use contamination_marker::StampAuthority;
 pub(crate) mod decontaminate;
 mod lifecycle_write;
+// #4208 — the evidence-bound route-OUT dequarantine (child module: QUAL-10).
+mod dequarantine_verified;
+pub use dequarantine_verified::dequarantine_if_verified_unit;
 // #4023 — the in-transaction peer-scope re-check on the sqlite federation merge
 // (`merge_inbound_authorized` + its typed refusal + the shared refusal
 // builder). Its own child module so this file's qual_10 ceiling is not

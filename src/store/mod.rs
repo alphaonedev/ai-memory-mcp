@@ -1816,6 +1816,26 @@ pub trait MemoryStore: Send + Sync {
         Ok(false)
     }
 
+    /// #4208 — the evidence-bound SYSTEM route-OUT used by the federation
+    /// receive funnels: clear `id`'s quarantine ONLY when the row the adapter
+    /// PERSISTED shows the signed content this node verified
+    /// ([`crate::models::persisted_is_verified_unit`]), read and released
+    /// under one row lock. A verified unit that lost the newer-wins merge
+    /// leaves never-attested content on the row, so it releases nothing.
+    ///
+    /// # Errors
+    ///
+    /// Adapter-specific backend error. The default is a FAIL-CLOSED no-op
+    /// `Ok(false)`: an adapter that cannot prove the stored surface never
+    /// releases a quarantine.
+    async fn dequarantine_verified(
+        &self,
+        _id: &str,
+        _verified_inbound: &crate::models::Memory,
+    ) -> StoreResult<bool> {
+        Ok(false)
+    }
+
     /// v1.0.0 [#2402] — the OPERATOR release: clear a quarantined row AND
     /// append a `memory.dequarantined` signed event in the SAME transaction.
     ///
