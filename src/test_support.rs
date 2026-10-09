@@ -28,6 +28,8 @@
 //! writes — a fourth instance of the $HOME per-module-mutex defect
 //! (#1998 -> #2115 -> #2127).
 
+mod leak_guard_6266;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
