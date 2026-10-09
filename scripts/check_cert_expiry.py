@@ -404,8 +404,8 @@ def read_cert_doc(repo, tree):
     """Text of the cert doc at TREE for the amendment ledger (#6124). Read
     from the object database only. Fail-closed (GateError) when the entry is
     absent, is not a regular file (a symlink is never followed), exceeds
-    CERT_DOC_MAX_BYTES, or git cannot read it: an unreadable ledger is never
-    taken as an empty one."""
+    CERT_DOC_MAX_BYTES, is not valid UTF-8 (#6368), or git cannot read it: an
+    unreadable ledger is never taken as an empty one."""
     proc = run_git(repo, "ls-tree", "-z", "--full-tree", "--end-of-options", tree, CERT_DOC)
     if proc.returncode != 0:
         err = _doc_safe(proc.stderr.decode("utf-8", "replace").strip())
@@ -433,7 +433,15 @@ def read_cert_doc(repo, tree):
     if proc.returncode != 0:
         err = _doc_safe(proc.stderr.decode("utf-8", "replace").strip())
         raise GateError(f"git cat-file blob {oid} ({CERT_DOC}) exited {proc.returncode}: {err}")
-    return proc.stdout.decode("utf-8", "replace")
+    try:
+        return proc.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # #6368: a lossy decode would turn an invalid byte into U+FFFD and let
+        # two different documents compare byte-identical; fail closed.
+        raise GateError(
+            f"{CERT_DOC} at {tree} is not valid UTF-8 (byte offset {exc.start}); the "
+            "amendment ledger is not read from it"
+        ) from exc
 
 
 def _fence_opener(ln):
@@ -475,12 +483,9 @@ def parse_ledger(lines):
     on the same character with a run at least as long), outside HTML
     comments and outside every other CommonMark HTML block kind (#6365: a
     quoted block ends with its blockquote; types 1/3/4/5 end at their closing
-    text, types 6/7 at a blank line; an unquoted block swallows '>' lines). An entry runs from its header over the following lines of the
-    same container (quoted lines for a quoted header) until the next record,
-    the STATUS line, or the container ends; trailing blank lines are dropped.
-    Returns dicts: start (line index), header, quoted, below_status, raw."""
+    text, types 6/7 at a blank line; an unquoted block swallows '>' lines).
+    Returns dicts: start (line index), header, quoted, below_status."""
     entries = []
-    cur = None
     fence = None
     in_comment = False
     html = None  # (quoted, end regex or None) of the open HTML block
@@ -488,8 +493,6 @@ def parse_ledger(lines):
     for idx, ln in enumerate(lines):
         quoted = ln.startswith(">")
         content = QUOTE_MARKERS_RE.sub("", ln, count=1) if quoted else ln
-        if cur is not None and (quoted != cur["quoted"] or (not quoted and BLANK_RE.match(ln))):
-            cur = None
         if html is not None:
             if html[0] and not quoted:
                 html = None  # the blockquote ended, and its HTML block with it
@@ -501,8 +504,6 @@ def parse_ledger(lines):
                         html = None
                 elif html[1].search(text):
                     html = None
-                if cur is not None:
-                    cur["raw"].append(ln)
                 continue
         if fence is not None:
             if fence[0] and not quoted:
@@ -510,58 +511,35 @@ def parse_ledger(lines):
             else:
                 if _fence_closes(ln, fence):
                     fence = None
-                if cur is not None:
-                    cur["raw"].append(ln)
                 continue
         if in_comment:
-            if cur is not None:
-                cur["raw"].append(ln)
             if "-->" in ln:
                 in_comment = False
             continue
         if "<!--" in ln:
             in_comment = "<!--" in HTML_COMMENT_RE.sub("", ln)
-            if cur is not None:
-                cur["raw"].append(ln)
             continue
         opener = _fence_opener(ln)
         if opener is not None:
             fence = opener
-            if cur is not None:
-                cur["raw"].append(ln)
             continue
         block = _html_opener(content)
         if block is not None:
             if not block[1]:
                 html = (quoted, block[0])
-            if cur is not None:
-                cur["raw"].append(ln)
             continue
         if STATUS_LINE_RE.match(ln):
             seen_status = True
-            cur = None
             continue
         if AMENDMENT_LEDGER_RE.match(ln):
-            cur = {"start": idx, "header": ln, "quoted": quoted,
-                   "below_status": seen_status, "raw": [ln]}
-            entries.append(cur)
-            continue
-        if cur is not None:
-            cur["raw"].append(ln)
-    for ent in entries:
-        while len(ent["raw"]) > 1 and (QUOTED_BLANK_RE.match(ent["raw"][-1])
-                                       or BLANK_RE.match(ent["raw"][-1])):
-            ent["raw"].pop()
+            entries.append({"start": idx, "header": ln, "quoted": quoted,
+                            "below_status": seen_status})
     return entries
 
 
 def amendment_blocks(repo, tree):
     """The amendment ledger of the cert doc at TREE (fail-closed read)."""
     return parse_ledger(read_cert_doc(repo, tree).split("\n"))
-
-
-def _ledger_key(entries):
-    return [(e["header"], tuple(e["raw"]), e["below_status"]) for e in entries]
 
 
 def _record_problems(header, body):
@@ -607,19 +585,26 @@ def _commit_day(repo, sha):
         raise GateError(f"committer date of {sha} is unreadable: {_doc_safe(text)}") from exc
 
 
+def _is_sep(lines, i):
+    return 0 <= i < len(lines) and (BLANK_RE.match(lines[i]) or QUOTED_BLANK_RE.match(lines[i]))
+
+
 def amendment_verdict(repo, mb, judged, required):
-    """(ok, why) for the #6124 pass path. The ledger at JUDGED must be the
-    ledger at MB plus exactly ONE new entry (every existing entry
-    byte-identical and in order), and that entry must be below STATUS, open
-    its own paragraph with its header alone on its line, carry a valid ISO
-    date not after the judged commit's date or today, list exactly REQUIRED,
-    and cite only #6063 by its issue URL. Doc read failures raise GateError."""
+    """(ok, why) for the #6124 pass path. The cert doc at JUDGED must be the
+    doc at MB with exactly ONE new amendment record inserted (plus at most one
+    blank separator line) and no other line changed (#6366), and that record
+    must be below STATUS, open its own paragraph with its header alone on its
+    line, sit directly above an existing amendment header or close its
+    blockquote, be followed by no lazy line (#6354), carry a valid ISO date
+    from the merge-base commit day - 1 (#6358) to the judged commit's day (or
+    today) + 1, list exactly REQUIRED, keep to the record grammar and cite
+    only #6063 by its issue URL (#6367). Doc read failures raise GateError."""
     old_lines = read_cert_doc(repo, mb).split("\n")
     new_lines = read_cert_doc(repo, judged).split("\n")
-    old = parse_ledger(old_lines)
-    new = parse_ledger(new_lines)
-    old_heads = {e["header"].rstrip("\r") for e in old}
-    fresh = [e for e in new if e["header"].rstrip("\r") not in old_heads]
+    # Every header line already in the merge-base doc, wherever it sits (a
+    # fenced or hidden copy included), is not a new record.
+    old_heads = {ln.rstrip("\r") for ln in old_lines if AMENDMENT_LEDGER_RE.match(ln)}
+    fresh = [e for e in parse_ledger(new_lines) if e["header"].rstrip("\r") not in old_heads]
     if not fresh:
         return False, ("no NEW amendment record was added below STATUS (a header that "
                        "already exists in the document is not a new record)")
@@ -636,24 +621,31 @@ def amendment_verdict(repo, mb, judged, required):
     para = new_lines[start + 1:end]
     prev = new_lines[start - 1] if start > 0 else ""
     why = []
-    if end < len(new_lines) and not (BLANK_RE.match(new_lines[end])
-                                     or QUOTED_BLANK_RE.match(new_lines[end])):
+    # #6366: the change is a pure insertion of the record and at most one
+    # blank separator line; every other line of the doc stays byte-identical,
+    # so no existing record (or prose, or HTML opener) is edited around it.
+    spans = [(start, end)]
+    if _is_sep(new_lines, start - 1):
+        spans.append((start - 1, end))
+    if _is_sep(new_lines, end):
+        spans.append((start, end + 1))
+    if not any(new_lines[:a] + new_lines[b:] == old_lines for a, b in spans):
+        why.append("the cert doc may only gain the new amendment record and one blank "
+                   "separator line; every other line must stay byte-identical (existing "
+                   "records are append-only: never removed, edited, re-dated, moved or "
+                   "reordered, and nothing may be inserted around them)")
+    if end < len(new_lines) and not _is_sep(new_lines, end):
         why.append(f"{at}: line {end + 1} continues its last paragraph without a '>' (a lazy "
                    "continuation line renders inside the record); end the record with a "
                    "blank line or a blank '>' line")
-    # Append-only: drop the new entry (and the one blank '>' line separating
-    # it) and the rest of the ledger must be the merge-base ledger, unchanged.
-    drop = set(range(start, end))
-    if start > 0 and QUOTED_BLANK_RE.match(prev):
-        drop.add(start - 1)
-    elif end < len(new_lines) and QUOTED_BLANK_RE.match(new_lines[end]):
-        drop.add(end)
-    rest = [ln for i, ln in enumerate(new_lines) if i not in drop]
-    if _ledger_key(parse_ledger(rest)) != _ledger_key(old):
-        why.append("an existing amendment record was removed, edited, re-dated, moved or "
-                   "reordered; the ledger is append-only, so every record present at the "
-                   "merge-base must stay byte-identical and in order, and the new one must "
-                   "be its own paragraph (a blank '>' line before and after it)")
+    nxt = end
+    while nxt < len(new_lines) and QUOTED_BLANK_RE.match(new_lines[nxt]):
+        nxt += 1
+    if (nxt > end and nxt < len(new_lines) and new_lines[nxt].startswith(">")
+            and not AMENDMENT_LEDGER_RE.match(new_lines[nxt])):
+        why.append(f"{at}: it would take over the paragraph at line {nxt + 1}, which is not "
+                   "an amendment record; place the record directly above an existing "
+                   "amendment header or as the last paragraph of its blockquote")
     if not ent["below_status"]:
         why.append(f"{at} is above the STATUS line")
     head = AMENDMENT_HEAD_RE.match(ent["header"])
@@ -669,9 +661,13 @@ def amendment_verdict(repo, mb, judged, required):
         else:
             today = datetime.datetime.now(datetime.timezone.utc).date()
             latest = min(_commit_day(repo, judged), today) + datetime.timedelta(days=1)
+            earliest = _commit_day(repo, mb) - datetime.timedelta(days=1)
             if day > latest:
                 why.append(f"{at}: {head.group(1)} is in the future (after {latest})")
-    if not (BLANK_RE.match(prev) or QUOTED_BLANK_RE.match(prev)):
+            if day < earliest:
+                why.append(f"{at}: {head.group(1)} is before the merge-base commit day less "
+                           f"one ({earliest}); a record is dated when it is written")
+    if not _is_sep([prev], 0):
         why.append(f"{at}: its header must open its own paragraph (a blank line or a blank "
                    "'>' line before it)")
     items = [m.group(1) for m in (AMENDMENT_ITEM_RE.match(ln) for ln in para) if m]
