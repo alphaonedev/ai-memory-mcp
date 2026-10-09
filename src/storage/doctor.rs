@@ -904,27 +904,22 @@ pub fn doctor_reflection_depth_distribution(conn: &Connection) -> Result<Vec<Ref
 /// `timestamp >= since_rfc3339` are counted. Pass the epoch
 /// (`"1970-01-01T00:00:00Z"`) to count all-time.
 ///
-/// Returns `0` when the `signed_events` table does not exist (pre-H5
-/// schemas) rather than propagating the error, matching the pattern
-/// in other doctor helpers.
-///
 /// # Errors
 ///
-/// Returns `Err` only on hard query failures (table exists but query
-/// is malformed — should not happen in practice).
+/// Returns `Err` on any SQLite failure, including a missing `signed_events`
+/// table (#4780): on every current schema that table exists, so its absence
+/// is a fault and is never reported as `0` refusals.
 pub fn doctor_reflection_depth_exceeded_count(
     conn: &Connection,
     since_rfc3339: &str,
 ) -> Result<i64> {
-    let n: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM signed_events
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM signed_events
              WHERE event_type = 'reflection.depth_exceeded'
                AND timestamp >= ?1",
-            params![since_rfc3339],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+        params![since_rfc3339],
+        |r| r.get(0),
+    )?;
     Ok(n)
 }
 

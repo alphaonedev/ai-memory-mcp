@@ -5066,14 +5066,33 @@ fn section_reflection_health(conn: &rusqlite::Connection) -> ReportSection {
     let mut severity = Severity::Info;
     let mut notes: Vec<String> = Vec::new();
 
-    // ── depth-distribution per namespace ─────────────────────────────
-    let dist_rows = db::doctor_reflection_depth_distribution(conn).unwrap_or_default();
+    // #4780 — every store read below reports a FAULT as a Critical finding
+    // with the error text and the value fact set to `unreadable`, never as
+    // an empty histogram / zero refusals (ERRORS-19; the #4715 Governance
+    // shape). See `reflection_read_fault`.
 
-    if dist_rows.is_empty() {
+    // ── depth-distribution per namespace ─────────────────────────────
+    let dist_rows = match db::doctor_reflection_depth_distribution(conn) {
+        Ok(rows) => Some(rows),
+        Err(e) => {
+            reflection_read_fault(
+                (&mut facts, &mut severity, &mut notes),
+                "the reflection depth distribution",
+                (
+                    "reflections_observed",
+                    "reflection_depth_distribution_error",
+                ),
+                &e,
+            );
+            None
+        }
+    };
+
+    if dist_rows.as_ref().is_some_and(Vec::is_empty) {
         facts.push(("reflections_observed".into(), "none".into()));
-    } else {
+    } else if let Some(dist_rows) = &dist_rows {
         // Per-namespace breakdown.
-        for row in &dist_rows {
+        for row in dist_rows {
             facts.push((
                 format!("ns::{}::dist", row.namespace),
                 format!(
@@ -5102,35 +5121,60 @@ fn section_reflection_health(conn: &rusqlite::Connection) -> ReportSection {
     }
 
     // ── per-namespace totals (24h / 7d / all-time) ───────────────────
-    let totals = db::doctor_reflection_totals_by_namespace(conn).unwrap_or_default();
-    for (ns, last_24h, last_7d, all_time) in &totals {
-        facts.push((
-            format!("ns::{}::totals", ns),
-            format!("24h={last_24h} 7d={last_7d} all_time={all_time}"),
-        ));
+    match db::doctor_reflection_totals_by_namespace(conn) {
+        Ok(totals) => {
+            for (ns, last_24h, last_7d, all_time) in &totals {
+                facts.push((
+                    format!("ns::{}::totals", ns),
+                    format!("24h={last_24h} 7d={last_7d} all_time={all_time}"),
+                ));
+            }
+        }
+        Err(e) => reflection_read_fault(
+            (&mut facts, &mut severity, &mut notes),
+            "the per-namespace reflection totals",
+            ("reflection_totals", "reflection_totals_error"),
+            &e,
+        ),
     }
 
     // ── depth-limit refusals last 24h ────────────────────────────────
     let last_day_cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
-    let refusals_24h =
-        db::doctor_reflection_depth_exceeded_count(conn, &last_day_cutoff).unwrap_or(0);
-    facts.push(("depth_limit_refusals_24h".into(), refusals_24h.to_string()));
-
-    if refusals_24h > 0 {
-        severity = severity_max(severity, Severity::Warning);
-        notes.push(format!(
-            "{refusals_24h} depth-limit refusal(s) in the last 24h \
-             (event_type='reflection.depth_exceeded' in signed_events)"
-        ));
+    match db::doctor_reflection_depth_exceeded_count(conn, &last_day_cutoff) {
+        Ok(refusals_24h) => {
+            facts.push(("depth_limit_refusals_24h".into(), refusals_24h.to_string()));
+            if refusals_24h > 0 {
+                severity = severity_max(severity, Severity::Warning);
+                notes.push(format!(
+                    "{refusals_24h} depth-limit refusal(s) in the last 24h \
+                     (event_type='reflection.depth_exceeded' in signed_events)"
+                ));
+            }
+        }
+        Err(e) => reflection_read_fault(
+            (&mut facts, &mut severity, &mut notes),
+            "the depth-limit refusal count for the last 24h",
+            ("depth_limit_refusals_24h", "depth_limit_refusals_24h_error"),
+            &e,
+        ),
     }
 
     // All-time refusals as an informational counter.
-    let refusals_all =
-        db::doctor_reflection_depth_exceeded_count(conn, "1970-01-01T00:00:00Z").unwrap_or(0);
-    facts.push((
-        "depth_limit_refusals_all_time".into(),
-        refusals_all.to_string(),
-    ));
+    match db::doctor_reflection_depth_exceeded_count(conn, "1970-01-01T00:00:00Z") {
+        Ok(refusals_all) => facts.push((
+            "depth_limit_refusals_all_time".into(),
+            refusals_all.to_string(),
+        )),
+        Err(e) => reflection_read_fault(
+            (&mut facts, &mut severity, &mut notes),
+            "the all-time depth-limit refusal count",
+            (
+                "depth_limit_refusals_all_time",
+                "depth_limit_refusals_all_time_error",
+            ),
+            &e,
+        ),
+    }
 
     let note = if notes.is_empty() {
         None
@@ -5144,6 +5188,22 @@ fn section_reflection_health(conn: &rusqlite::Connection) -> ReportSection {
         facts,
         note,
     }
+}
+
+/// #4780 — fold one Reflection Health read FAULT into the section: the value
+/// fact prints `unreadable` (never `0` / `none` / an empty histogram), the
+/// error fact carries the error text, the section is Critical and the note
+/// says what could not be read.
+fn reflection_read_fault(
+    (facts, severity, notes): (&mut Vec<(String, String)>, &mut Severity, &mut Vec<String>),
+    what: &str,
+    (value_key, error_key): (&str, &str),
+    e: &anyhow::Error,
+) {
+    *severity = Severity::Critical;
+    facts.push((value_key.into(), over_depth_4715::UNREADABLE.into()));
+    facts.push((error_key.into(), format!("{e:#}")));
+    notes.push(format!("{what} could not be read (#4780)"));
 }
 
 /// v1.0.0 #2985 — the Batman auto-atomisation curator readiness section.
