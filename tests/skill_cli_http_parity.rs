@@ -376,7 +376,6 @@ async fn issue_6125_http_promote_400_body_keeps_first_party_name_refusal() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
     let msg = v["error"].as_str().expect("error string");
     assert!(msg.contains("spec §3.1"), "typed refusal text lost: {msg}");
-    assert_ne!(msg, "skill promote failed");
 }
 
 /// #6125 - the over-long description refusal is first-party text too.

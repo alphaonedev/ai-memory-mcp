@@ -706,7 +706,6 @@ mod promote_status_4622_tests {
     #[test]
     fn issue_6126_typed_refusal_survives_and_wrapped_foreign_error_is_withheld() {
         use crate::mcp::error_text::DB_ERROR_TEXT;
-        let dsn = "postgres://svc:hunter2@db.internal:5432/ai_memory";
         let cases: Vec<(&str, anyhow::Error, String)> = vec![
             (
                 "typed invalid-input refusal",
@@ -721,7 +720,7 @@ mod promote_status_4622_tests {
             (
                 "wrapped database error with DSN and path",
                 anyhow::Error::new(rusqlite::Error::InvalidPath("/var/db/x.sqlite".into()))
-                    .context(format!("connect {dsn} failed")),
+                    .context("connect svc:hunter2@db.internal:5432 failed"),
                 DB_ERROR_TEXT.to_owned(),
             ),
             (
@@ -753,6 +752,7 @@ mod promote_status_4622_tests {
     /// the chain, so a `format!("{e:#}")` body goes red here.
     #[test]
     fn issue_6125_http_body_text_matches_mcp_wire_text() {
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         let (conn, _dir) = db();
         let id = seed(&conn, "r", MemoryKind::Reflection);
         let (broken, _broken_dir) = db();

@@ -619,6 +619,7 @@ mod tests {
     /// error`.
     #[test]
     fn issue_6133_retired_lineage_refusal_reaches_the_caller_verbatim() {
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         let (conn, _dir) = open_db();
         let obs_id = insert_observation(&conn, "source", "ns");
         let refl_id = make_reflection(&conn, &[obs_id], "ns");
@@ -645,6 +646,7 @@ mod tests {
     /// other `register_core` string (foreign serialization text) stays foreign.
     #[test]
     fn issue_6133_other_register_core_strings_stay_foreign() {
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         let foreign = register_core_error("zstd compress error: /srv/tenant/x EACCES".into());
         assert_eq!(
             crate::mcp::error_text::mcp_foreign_err("issue_6133", foreign),
