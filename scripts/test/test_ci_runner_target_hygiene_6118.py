@@ -49,7 +49,8 @@ FAILURE, never a skip):
            locations are compile-time strings, and the hosted sqlite leg and
            both pg jobs have run the full suites at ``0`` since #3461 / #3274.
            No step may set any ``CARGO_PROFILE_*_DEBUG`` (or a rustc
-           ``debuginfo=`` flag) to anything but ``0``: a step-level ``env:``
+           ``debuginfo=`` / ``-g`` flag, or a ``cargo --config
+           profile.<p>.debug=``) to anything but ``0``: a step-level ``env:``
            row, or an assignment in a ``run:`` body (``export``, or an
            ``echo ... >> "$GITHUB_ENV"`` that overrides the job env for every
            later step) is flagged.
@@ -107,10 +108,11 @@ DOCS_ONLY_GUARD = "docs_only"
 # persistent workspace would otherwise hand it the previous job's copy.
 CHECKOUT_STEP_ID = "checkout"
 CHECKOUT_GUARD = "steps.checkout.outcome == 'success'"
-# GitHub-hosted image labels (ubuntu-latest, ubuntu-24.04-arm, macos-15-intel,
-# windows-2022, ...).  Anything else (``self-hosted``, ``linux-fed``,
-# ``macos-fed``, a typo) is treated as a fleet label: fail closed.
-HOSTED_LABEL_RE = re.compile(r"(ubuntu|macos|windows)-(latest|[0-9]+(\.[0-9]+)?)(-(arm|arm64|intel|large|xlarge))?")
+# GitHub-hosted image labels (ubuntu-latest, ubuntu-24.04-arm, ubuntu-slim,
+# macos-15-intel, windows-2022, ...).  Anything else (``self-hosted``,
+# ``linux-fed``, ``macos-fed``, a typo) is treated as a fleet label: fail closed.
+HOSTED_LABEL_RE = re.compile(
+    r"ubuntu-slim|(ubuntu|macos|windows)-(latest|[0-9]+(\.[0-9]+)?)(-(arm|arm64|intel|large|xlarge))?")
 RUNS_ON_EXPR_RE = re.compile(
     r"\$\{\{\s*(?:fromJSON\(\s*matrix\.([A-Za-z0-9_-]+)\s*\)|matrix\.([A-Za-z0-9_-]+))\s*\}\}")
 DEBUG_ENV_KEY_RE = re.compile(r"CARGO_PROFILE_[A-Z0-9_]+_DEBUG")
@@ -118,6 +120,16 @@ DEBUG_ENV_KEY_RE = re.compile(r"CARGO_PROFILE_[A-Z0-9_]+_DEBUG")
 # `echo ... >> "$GITHUB_ENV"`), with the value bare or quoted.
 RUN_DEBUG_ASSIGN_RE = re.compile(r"(CARGO_PROFILE_[A-Z0-9_]+_DEBUG)\s*=\s*[\"']?([^\s\"';|&)}]*)")
 DEBUGINFO_FLAG_RE = re.compile(r"debuginfo\s*=\s*[\"']?([A-Za-z0-9_-]*)")
+# `cargo --config profile.<p>.debug=<v>` (also `profile.<p>.package.<pkg>.debug`):
+# command-line config takes precedence over the CARGO_PROFILE_* env.  Not
+# `debug-assertions`.  The value may be TOML-quoted inside shell quotes.
+CONFIG_DEBUG_RE = re.compile(r"(profile\.[A-Za-z0-9_.*\"'-]*?\.debug)\s*=\s*\\?[\"']?([A-Za-z0-9_-]*)")
+# rustc's `-g` is `-C debuginfo=2`.  Matched as a standalone token in a rustc
+# flags env value, or in a run line that sets RUSTFLAGS / calls rustc (a bare
+# `-g` elsewhere, e.g. `npm install -g`, is not a rustc flag).
+RUSTC_FLAGS_KEY_RE = re.compile(r"(CARGO_ENCODED_)?RUST(DOC)?FLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_[A-Z0-9_]+_RUSTFLAGS")
+RUSTC_CONTEXT_RE = re.compile(r"RUST(DOC)?FLAGS|\brustc\b")
+DASH_G_RE = re.compile(r"(?:^|[\s\"'=\x1f])-g(?=$|[\s\"'\x1f])")
 
 # Every (workflow, job) that can land on a self-hosted runner, pinned.  A new
 # self-hosted job must be added here AND given the rules above.
@@ -498,31 +510,42 @@ def self_hosted_jobs(workflows: Dict[str, str]) -> Dict[Tuple[str, str], Tuple[W
     return found
 
 
+def _level_spellings(text: str, rustc_context: bool) -> List[str]:
+    """Every debuginfo level other than ``0`` spelled in ``text`` as a rustc flag or cargo --config."""
+    found: List[str] = []
+    for m in DEBUGINFO_FLAG_RE.finditer(text):
+        if m.group(1) != DEBUG_LEVEL:
+            found.append("debuginfo=%r" % m.group(1))
+    for m in CONFIG_DEBUG_RE.finditer(text):
+        if m.group(2) != DEBUG_LEVEL:
+            found.append("%s=%r (cargo --config beats CARGO_PROFILE_* env)" % (m.group(1).strip("\"'"), m.group(2)))
+    if rustc_context and DASH_G_RE.search(text):
+        found.append("rustc -g (= -C debuginfo=2)")
+    return found
+
+
 def _debug_overrides(where: str, effective: Dict[str, str], job: Job) -> List[str]:
     """Every place a self-hosted job sets a debuginfo level other than ``0``."""
     found: List[str] = []
     for key, value in sorted(effective.items()):
         if DEBUG_ENV_KEY_RE.fullmatch(key) and key not in DEBUG_KEYS and value != DEBUG_LEVEL:
             found.append("%s: R-DEBUG env %s is %r, want %r" % (where, key, value, DEBUG_LEVEL))
-        for m in DEBUGINFO_FLAG_RE.finditer(value):
-            if m.group(1) != DEBUG_LEVEL:
-                found.append("%s: R-DEBUG env %s carries debuginfo=%r, want %r" % (where, key, m.group(1), DEBUG_LEVEL))
+        for spelled in _level_spellings(value, bool(RUSTC_FLAGS_KEY_RE.fullmatch(key))):
+            found.append("%s: R-DEBUG env %s carries %s, want %r" % (where, key, spelled, DEBUG_LEVEL))
     for step in job.steps:
         label = step.name or step.uses or "<unnamed step>"
         for key, value in sorted(step.env.items()):
             if DEBUG_ENV_KEY_RE.fullmatch(key) and value != DEBUG_LEVEL:
                 found.append("%s: R-DEBUG step %r env %s is %r, want %r" % (where, label, key, value, DEBUG_LEVEL))
-            for m in DEBUGINFO_FLAG_RE.finditer(value):
-                if m.group(1) != DEBUG_LEVEL:
-                    found.append("%s: R-DEBUG step %r env %s carries debuginfo=%r" % (where, label, key, m.group(1)))
+            for spelled in _level_spellings(value, bool(RUSTC_FLAGS_KEY_RE.fullmatch(key))):
+                found.append("%s: R-DEBUG step %r env %s carries %s, want %r" % (where, label, key, spelled, DEBUG_LEVEL))
         for line in step.run:
             for m in RUN_DEBUG_ASSIGN_RE.finditer(line):
                 if m.group(2) != DEBUG_LEVEL:
                     found.append("%s: R-DEBUG step %r run sets %s to %r (a $GITHUB_ENV write overrides every later "
                                  "step), want %r" % (where, label, m.group(1), m.group(2), DEBUG_LEVEL))
-            for m in DEBUGINFO_FLAG_RE.finditer(line):
-                if m.group(1) != DEBUG_LEVEL:
-                    found.append("%s: R-DEBUG step %r run sets debuginfo=%r, want %r" % (where, label, m.group(1), DEBUG_LEVEL))
+            for spelled in _level_spellings(line, bool(RUSTC_CONTEXT_RE.search(line))):
+                found.append("%s: R-DEBUG step %r run sets %s, want %r" % (where, label, spelled, DEBUG_LEVEL))
     return found
 
 
