@@ -7,17 +7,21 @@ out the head, #6163), and its CLAUDE.md and the two docs/reference files are rea
 and `git cat-file` into a scratch directory. Nothing from the head is executed, imported or checked out, and a symlink
 blob (mode 120000) at any of the three paths is refused. Credential-shaped head text is masked in the summary where it
 enters the report (#6163): a `name=value` / `name: value` whose name holds a password, passphrase, secret, token, API
-key, access key, private key or credential word (quoted, multi-word and JSON-quoted forms included, past an escaped
-quote and to the end of the line when the quote is never closed; a count of at most 9 digits or a switch word is shown,
-and an UPPER_SNAKE value only as an environment variable name, unless the name is a password or passphrase; a later word
-that is neither plain nor short prose masks the whole value, #6209; an emphasised or code-quoted name, a backtick-quoted
-value and the cells after a credential-name cell of a Markdown table row, #6210), URL userinfo (an empty user name
-included), an Authorization Bearer/Basic value, a GitHub, AWS access key id, Slack or `sk-` provider token, a GitLab
-personal access, Google API or npm token, a JSON Web Token, a PEM, PGP or PuTTY private key block, and the value on the
-line after a credential name that has none on its own line (#6211). A diff line inside a private key block is masked by
-its index on its own side, so it is masked even when the BEGIN line lies outside its hunk. Lines this script writes are
-never masked, and the verdict is computed on the unmasked text. Control and format characters of head text (ESC, CSI,
-BEL, a bidirectional override) are written as escapes before they reach the summary (#6212).
+key, access key, private key or credential word (quoted, multi-word and JSON-quoted forms included, past an escaped or
+doubled quote and to the end of the line when the quote is never closed, and past a quote inside an unquoted word; a
+count of at most 9 ASCII digits in total, in one word, or a switch word is shown, and an UPPER_SNAKE value only as an
+environment variable name, unless the name is a password or passphrase; a later word that is neither plain nor
+lower-case prose masks the whole value, #6209; an emphasised or code-quoted name, a backtick-quoted value and the cells
+after a credential-name cell of a Markdown table row, with or without a leading pipe, #6210), URL userinfo (the password
+up to the last `@`, an empty user name included, and a user-only userinfo of 20 or more characters), an Authorization
+Bearer/Basic value, a GitHub, AWS access key id, Slack or `sk-` provider token, a GitLab personal access, Google API or
+npm token, a JSON Web Token (by its `eyJ` header), an age identity and the private members of a JSON Web Key (#6343), a
+PEM, PGP, SSH2 (RFC 4716) or PuTTY private key block, and the value on the line after a credential name that has none on
+its own line or every line of a YAML block scalar under one (#6211). A diff line inside a private key block, or holding
+the value of such a name, is masked by its index on its own side of the diff, so it is masked even when its BEGIN or
+name line lies outside its hunk or is unchanged. Lines this script writes are never masked, and the verdict is computed
+on the unmasked text. Control and format characters of head text (ESC, CSI, BEL, a bidirectional override) are written
+as escapes before they reach the summary (#6212).
 
 The BASE guard (scripts/check-claude-md-size.py of the base checkout) and the BASE manifest
 (scripts/qc-allowlists/claude-md-rule-sections.sha256) then judge the head copies:
@@ -90,8 +94,8 @@ CENSUS_DIGITS = re.compile(
 # the trailer, so a guard weakened in one PR cannot silently judge the next one. The manifest is not listed: the
 # section comparison above already judges it against the base.
 GUARD_PATHS = ("scripts/check-claude-md-size.py", "scripts/claude-md-rule-compare.py",
-                 ".github/workflows/claude-md-guard.yml", ".github/workflows/claude-md-rule-compare.yml",
-                 ".github/CODEOWNERS")
+               ".github/workflows/claude-md-guard.yml", ".github/workflows/claude-md-rule-compare.yml",
+               ".github/CODEOWNERS")
 DIFF_LINE_CAP = 200
 # #6163: the pull request number that names the head refspec; a decimal with no leading zero, ASCII only, at most ten
 # digits, so nothing but `refs/pull/<N>/head` can reach the fetch.
