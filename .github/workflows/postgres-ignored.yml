@@ -28,8 +28,13 @@ on:
   # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
     branches: ["release/**", "rehearsal/**", "chain/**"]
+  # #6117: chain/** (the Promotion carriers) gets the push lane so every signed
+  # merge the conductor lands on a carrier runs the ignored pg cells, not only
+  # the PRs opened against it. The key below is already event-distinct, so the
+  # carrier's promotion PR run and this push run never cancel each other
+  # (#2508). rehearsal/** stays off push (#5447 R-PUSH).
   push:
-    branches: ["release/**"]
+    branches: ["release/**", "chain/**"]
   workflow_dispatch:
 
 permissions:

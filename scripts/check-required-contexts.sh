@@ -353,12 +353,23 @@ COVERED_WORKFLOWS="${RQC_COVERED_WORKFLOWS:-ci.yml c8-precheck.yml coverage.yml 
 # in coverage.yml) matches no probe and is therefore NOT flagged: it names one
 # historical branch, it cannot match a CLASS of future heads, and a pattern
 # that cannot match a class cannot carry the recurring defect.
+#
+# 2026-10-09 (#6117): the two PROMOTION-CARRIER prefixes are heads too — the
+# carrier is the head of its promotion PR into release/** (rehearsal/audit-wip
+# was the head of #6045; chain/promo6-ssh is the head of #6160). `chain/**` IS
+# listed in `push.branches` of the required-set workflows since #6117 (so a
+# signed merge into the carrier gets a verdict), which is sound ONLY under an
+# event-distinct cancel group; the probes below make rule (d) HARD-FAIL the
+# moment a carrier pattern appears on push under the house key. `rehearsal/**`
+# is kept off push altogether by R-PUSH of
+# scripts/test/test_workflow_pr_triggers_5447.py.
 PR_HEAD_PROBES=(
     fix/2508-probe feat/2508-probe docs/2508-probe chore/2508-probe
     ci/2508-probe test/2508-probe refactor/2508-probe perf/2508-probe
     infra/2508-probe build/2508-probe style/2508-probe coverage/2508-probe
     qc/2508-probe campaign/2508-probe sec/2508-probe security/2508-probe
     hotfix/2508-probe local/2508-probe
+    chain/2508-probe rehearsal/2508-probe
     topic-probe-2508
     fix/nested/2508-probe
 )
@@ -1667,6 +1678,29 @@ YAML
         return 2
     fi
     echo "  [d] the four near-miss shapes (#2509-narrowed triggers / cancel-in-progress:false / push-only / event_name-keyed group) all PASS: the rule fires on the defect, not the neighbourhood"
+
+    # #6117: a Promotion carrier (chain/**, rehearsal/**) is the HEAD of its
+    # promotion PR, so a carrier pattern on push under the house key is the
+    # #2508 class — and under the event-distinct key it is the sanctioned #6117
+    # shape the required-set workflows now carry. Both directions, both prefixes.
+    local carrier_pat
+    for carrier_pat in 'chain/**' 'rehearsal/**'; do
+        write_clean
+        write_dup "[main, develop, \"release/**\", \"$carrier_pat\"]" 'true' "$house_key"
+        rc="$(run_fixture)"
+        if [ "$rc" = "0" ]; then
+            echo "  [d] #6117: '$carrier_pat' on push under the house key (a promotion-carrier head): NOT CAUGHT — FAIL" >&2
+            return 2
+        fi
+        write_clean
+        write_dup "[main, develop, \"release/**\", \"$carrier_pat\"]" 'true' "$event_key"
+        rc="$(run_fixture)"
+        if [ "$rc" != "0" ]; then
+            echo "  [d] #6117: '$carrier_pat' on push under the event-distinct key was REJECTED (exit $rc) — the rule forbids the #6117 shape" >&2
+            return 2
+        fi
+    done
+    echo "  [d] #6117: a promotion-carrier pattern (chain/**, rehearsal/**) on push is CAUGHT under the house key and PASSES under the event-distinct key"
 
     # The pending-fix ledger: scoped to ONE (workflow, pattern) pair, and an
     # entry that does not name a tracking issue is itself a failure.
