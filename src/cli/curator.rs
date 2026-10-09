@@ -612,11 +612,13 @@ async fn run_store_backed_sweep(
         .await;
         tracing::info!(
             "curator SAL cycle: namespaces={} observations={} clusters_eligible={} \
-             reflections_persisted={} depth_refusals={} errors={} (dry_run={})",
+             reflections_persisted={} reflections_parked={} depth_refusals={} errors={} \
+             (dry_run={})",
             report.namespaces_visited,
             report.observations_scanned,
             report.clusters_eligible,
             report.reflections_persisted,
+            report.reflections_parked,
             report.depth_refusals,
             report.errors.len(),
             report.dry_run,
@@ -1233,6 +1235,11 @@ fn print_reflection_report(
         r.reflections_persisted
     )?;
     writeln!(out.stdout, "  depth_refusals:        {}", r.depth_refusals)?;
+    writeln!(
+        out.stdout,
+        "  reflections_parked:    {}",
+        r.reflections_parked
+    )?;
     writeln!(out.stdout, "  errors:                {}", r.errors.len())?;
     writeln!(out.stdout, "  dry_run:               {}", r.dry_run)?;
     for e in &r.errors {
@@ -2853,6 +2860,7 @@ mod tests {
             clusters_eligible: 1,
             reflections_persisted: 0,
             depth_refusals: 0,
+            reflections_parked: 0,
             errors: vec!["a problem".to_string()],
             dry_run_proposals: vec![crate::curator::reflection_pass::DryRunProposal {
                 namespace: "app".to_string(),

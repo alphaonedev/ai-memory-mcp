@@ -270,6 +270,18 @@ pub(crate) struct ReflectionPass<'a> {
     pub(crate) dry_run: bool,
 }
 
+/// #4395 — what [`ReflectionPass::persist`] did with a proposed reflection.
+#[cfg(feature = "sal")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PersistOutcome {
+    /// The reflection row + its `reflects_on` edges landed (or the call was
+    /// a dry-run / empty-source no-op).
+    Written,
+    /// The governed decision parked the reflection as a `reflect` pending
+    /// action for approval; nothing was written. Carries the pending id.
+    Parked(String),
+}
+
 #[cfg(feature = "sal")]
 impl<'a> ReflectionPass<'a> {
     /// Construct a `ReflectionPass`. `keypair` is the curator's
@@ -511,9 +523,12 @@ impl<'a> ReflectionPass<'a> {
     /// [`ReflectInput`] contract (issue #1548).
     ///
     /// No-op when `self.dry_run = true`.
-    async fn persist(&self, summary: &Memory, sources: &[MemoryId]) -> Result<()> {
+    ///
+    /// #4395 — returns [`PersistOutcome::Parked`] when the governed decision
+    /// queued the reflection for approval instead of writing it.
+    async fn persist(&self, summary: &Memory, sources: &[MemoryId]) -> Result<PersistOutcome> {
         if self.dry_run || sources.is_empty() {
-            return Ok(());
+            return Ok(PersistOutcome::Written);
         }
 
         // Curator-side max-depth guard. The substrate enforces the
@@ -553,6 +568,26 @@ impl<'a> ReflectionPass<'a> {
             metadata: summary.metadata.clone(),
         };
 
+        // #4395 — internal actors are not above namespace governance (GOD
+        // ruling, 2026-10-01). Route this write through the SAME governed
+        // decision the external reflect funnels run BEFORE the substrate
+        // write: the #3638 write admission (as the CURATOR principal, never
+        // the admin bypass) and the L1-8 `require_approval_above_depth`
+        // gate (the #4357 shared decision via the trait resolver, backend-
+        // blind). An above-threshold or still-pending reflection is PARKED
+        // as the same `reflect` pending the MCP gate queues (so an approve
+        // replays it through `execute_reflect_from_payload`); a denied one is
+        // skipped with its reason; nothing is ever written ungoverned.
+        if let Some(pending_id) = self.governed_decision(&input, sources).await? {
+            tracing::info!(
+                target: crate::storage::reflect::REFLECT_TRACE_TARGET,
+                namespace = %summary.namespace,
+                pending_id = %pending_id,
+                "curator reflection parked for approval (#4395)"
+            );
+            return Ok(PersistOutcome::Parked(pending_id));
+        }
+
         // Issue #815 — thread the curator's signing keypair into the
         // reflect call so the substrate's signed-link path produces
         // `attest_level='self_signed'` rows for every `reflects_on` edge
@@ -562,7 +597,7 @@ impl<'a> ReflectionPass<'a> {
         // signs natively), so the wire shape is byte-identical across
         // backends.
         match self.store.reflect(&self.ctx, &input, self.keypair).await {
-            Ok(_outcome) => Ok(()),
+            Ok(_outcome) => Ok(PersistOutcome::Written),
             Err(ReflectError::DepthExceeded {
                 attempted,
                 cap,
@@ -575,6 +610,96 @@ impl<'a> ReflectionPass<'a> {
             }
             Err(other) => Err(anyhow::anyhow!(other.to_string())),
         }
+    }
+
+    /// #4395 — the governed decision for one curator reflection, mirroring
+    /// `mcp::tools::reflect` (#3638 admission, then the L1-8 threshold).
+    /// Returns `Ok(Some(pending_id))` when the reflection was parked for
+    /// approval, `Ok(None)` when it may be written, and `Err` when it is
+    /// refused (the caller records the reason and writes nothing).
+    async fn governed_decision(
+        &self,
+        input: &ReflectInput,
+        sources: &[MemoryId],
+    ) -> Result<Option<String>> {
+        use crate::models::GovernanceDecision;
+        let ns = input.namespace.clone().unwrap_or_default();
+        let agent_id = self.agent_id();
+        let mut max_src_depth: i32 = 0;
+        for id in sources {
+            if let Some(m) = store_get_opt(self.store, &self.ctx, id).await? {
+                max_src_depth = max_src_depth.max(m.reflection_depth);
+            }
+        }
+        let proposed_depth = u32::try_from(max_src_depth.max(0).saturating_add(1)).unwrap_or(u32::MAX);
+        // The SAME pending payload shape the MCP L1-8 gate queues, so an
+        // approve replays it through `execute_reflect_from_payload`.
+        let payload = serde_json::json!({
+            (crate::models::field_names::SOURCE_IDS): input.source_ids,
+            "title": input.title,
+            "content": input.content,
+            "namespace": ns,
+            "tier": input.tier.as_str(),
+            "tags": input.tags,
+            "priority": input.priority,
+            (crate::models::field_names::CONFIDENCE): input.confidence,
+            "agent_id": agent_id,
+            "metadata": input.metadata,
+            (crate::models::field_names::PROPOSED_DEPTH): proposed_depth,
+        });
+        // #3638 — write admission as the curator principal (the store-level
+        // gate queues its own pending on `Pending` under Enforce).
+        match self
+            .store
+            .enforce_governance_action(
+                crate::store::GovernedAction::Reflect,
+                &ns,
+                &agent_id,
+                None,
+                None,
+                &payload,
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("ReflectionPass::persist: write-admission consult failed")?
+        {
+            GovernanceDecision::Allow => {}
+            GovernanceDecision::Deny(refusal) => {
+                anyhow::bail!(
+                    "ReflectionPass::persist: curator not admitted to write a reflection into \
+                     '{ns}': {}",
+                    refusal.reason
+                );
+            }
+            GovernanceDecision::Pending(pending_id) => return Ok(Some(pending_id)),
+        }
+        // L1-8 — the approval-depth threshold (#4357 shared decision).
+        let threshold = self
+            .store
+            .resolve_require_approval_above_depth(&ns)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("ReflectionPass::persist: approval threshold unreadable; refusing")?;
+        if let Some(threshold) = threshold
+            && proposed_depth > threshold
+        {
+            let pending_id = self
+                .store
+                .queue_pending_action(
+                    &self.ctx,
+                    crate::store::GovernedAction::Reflect,
+                    &ns,
+                    None,
+                    &agent_id,
+                    &payload,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
+                .context("ReflectionPass::persist: could not park the reflection for approval")?;
+            return Ok(Some(pending_id));
+        }
+        Ok(None)
     }
 
     /// Verify that the persisted reflection identified by `summary_id`
@@ -672,6 +797,12 @@ pub struct ReflectionPassReport {
     /// Number of refused-by-depth-cap clusters (substrate refusal or
     /// curator `--max-depth` guard).
     pub depth_refusals: usize,
+    /// #4395 — number of reflections PARKED as a `reflect` pending action
+    /// for approval by the namespace's governed decision (write admission
+    /// `Pending`, or proposed depth above `require_approval_above_depth`).
+    /// Nothing was written for these; `memory_pending_approve` replays them.
+    #[serde(default)]
+    pub reflections_parked: usize,
     /// LLM call failures, persist errors, and verify errors that
     /// did NOT abort the pass.
     pub errors: Vec<String>,
@@ -813,7 +944,12 @@ pub async fn run_reflection_pass(
             }
 
             match pass.persist(&summary, &source_ids).await {
-                Ok(()) => {
+                // #4395 — parked for approval: counted, never verified (no
+                // row exists yet), never an error.
+                Ok(PersistOutcome::Parked(_)) => {
+                    report.reflections_parked += 1;
+                }
+                Ok(PersistOutcome::Written) => {
                     report.reflections_persisted += 1;
                     // Best-effort verify on the most recent reflection
                     // in this namespace. We re-derive the id by listing
@@ -1244,6 +1380,7 @@ mod tests {
             clusters_eligible: 3,
             reflections_persisted: 3,
             depth_refusals: 0,
+            reflections_parked: 0,
             errors: vec![],
             dry_run_proposals: vec![],
             dry_run: false,
