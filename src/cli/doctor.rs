@@ -6456,6 +6456,29 @@ mod tests {
         assert_eq!(report.overall, Severity::Critical);
     }
 
+    /// #4781 — an unreadable delivery-totals read is Critical with
+    /// `dispatched_total` / `failed_total` / `success_rate_pct` all
+    /// `unreadable` and a `webhook_delivery_totals_error` fact, never
+    /// `0 dispatched / 0 failed` that looks like a healthy idle store.
+    #[test]
+    fn webhook_section_critical_when_delivery_totals_unreadable_4781() {
+        let report = webhook_report_with_unreadable_subscriptions();
+        let wh = find(&report, "Webhook");
+        for key in ["dispatched_total", "failed_total", "success_rate_pct"] {
+            assert_eq!(fact(wh, key), over_depth_4715::UNREADABLE, "{key}: {wh:?}");
+        }
+        assert!(
+            fact(wh, "webhook_delivery_totals_error").contains("subscriptions"),
+            "{wh:?}"
+        );
+        assert_eq!(wh.severity, Severity::Critical, "{wh:?}");
+        assert!(
+            wh.note.as_deref().is_some_and(|n| n.contains("#4781")),
+            "note must name the read fault: {:?}",
+            wh.note
+        );
+    }
+
     #[test]
     fn local_run_webhook_section_warns_on_stale_pending_audit_rows_3659() {
         let env = TestEnv::fresh();

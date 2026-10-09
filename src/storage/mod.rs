@@ -32533,6 +32533,19 @@ mod tests {
         assert_eq!(doctor_dim_violations(&conn).unwrap(), None);
     }
 
+    /// #4781 — an unreadable `subscriptions` table is a FAILED totals probe,
+    /// never a healthy-looking `Ok((0, 0))` (ERRORS-19).
+    #[test]
+    fn doctor_webhook_delivery_totals_unreadable_table_is_err_4781() {
+        let conn = test_db();
+        conn.execute_batch("ALTER TABLE subscriptions RENAME TO subscriptions_gone")
+            .unwrap();
+        assert!(
+            doctor_webhook_delivery_totals(&conn).is_err(),
+            "unreadable delivery totals must be an error, not 0 dispatched / 0 failed"
+        );
+    }
+
     /// #4979 — an unreadable `subscriptions` table is a FAILED probe, never a
     /// healthy-looking `Ok(0)` (ERRORS-19).
     #[test]
