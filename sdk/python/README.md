@@ -42,8 +42,7 @@ so a client must be handed the CA explicitly:
 So on Linux, with no `AI_MEMORY_KEY_DIR` override, the file is
 `~/.config/ai-memory/keys/tls/local-ca.pem`.
 
-Pin it with the client's `verify=` option (the stock `httpx` parameter — it
-takes the PATH of a CA bundle). Both `AiMemoryClient` and
+Pin it with the client's `verify=` option. Both `AiMemoryClient` and
 `AsyncAiMemoryClient` accept it:
 
 ```python
@@ -61,14 +60,49 @@ with AiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client
 
 `verify=` **replaces** the trust store with that bundle; verification stays
 full (chain + hostname — the daemon's leaf carries `localhost`, `127.0.0.1`,
-`::1` and the machine hostname as SANs). `verify=False` is **refused** by both
-constructors with `ValueError` (#3840): it would turn a TLS listener into an
-unauthenticated one, and there is no accept-any-certificate option. Two ways
-to avoid passing `verify=` per client:
+`::1` and the machine hostname as SANs). There is no accept-any-certificate
+option (#3840).
 
-- install `local-ca.pem` into the OS trust store
-  (`update-ca-certificates`, `security add-trusted-cert`), or point
-  `SSL_CERT_FILE` at it;
+#### Accepted and refused `verify=` forms
+
+Accepted (anything else raises `ValueError` from the constructor):
+
+- `None` (the default): httpx's own default trust, which is the `certifi`
+  bundle, or the file or directory named by `SSL_CERT_FILE` / `SSL_CERT_DIR`
+  when those are set. It is NOT the operating-system store, and
+  `REQUESTS_CA_BUNDLE` is ignored.
+- `True`: the same, explicit.
+- A `str` or `os.PathLike` naming an existing CA bundle file or hashed CA
+  directory. The path is resolved with `os.path.realpath` when the client is
+  built (symlinks followed, a relative path fixed against the working
+  directory at that moment) and the SDK loads it into a context it builds with
+  `ssl.create_default_context`. A later `chdir` cannot change what is trusted.
+- Exactly `ssl.SSLContext` (not a subclass): the object returned by
+  `ssl.create_default_context(cafile=...)`, with `verify_mode` left at
+  `CERT_REQUIRED`, `check_hostname` on, and `wrap_socket`/`wrap_bio` unpatched.
+  The check runs again before every request, so weakening the context after
+  construction is refused, not honoured.
+
+Refused with `ValueError` (#3840, #6267, #6268, #6269):
+
+- `False`, and every other falsy or blank value (`""`, `0`, a falsy
+  `str`/path subclass).
+- A path that does not exist, or is neither a file nor a directory.
+- A context with `verify_mode` of `CERT_NONE` or `CERT_OPTIONAL`, or with
+  `check_hostname` off.
+- Any `ssl.SSLContext` subclass, including `truststore.SSLContext`: such an
+  object keeps its real verification state elsewhere, so the SDK cannot prove
+  it verifies. Use `ssl.create_default_context(cafile=...)` or pass the CA path.
+- A context whose `wrap_socket` or `wrap_bio` was replaced (on the instance or
+  on the class), or that shadows any other `ssl.SSLContext` attribute on the
+  instance.
+- Any other type.
+
+Two ways to avoid passing `verify=` per client:
+
+- point `SSL_CERT_FILE` (or `SSL_CERT_DIR`) at `local-ca.pem` and leave
+  `verify=` unset: httpx reads those variables for its default trust, whereas
+  installing the CA into the operating-system store does not affect it;
 - run the daemon with an operator-supplied `--tls-cert`/`--tls-key` pair from
   a CA your hosts already trust, in which case no pinning is needed at all.
 

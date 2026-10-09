@@ -14,10 +14,12 @@ an ``await`` lives here. In particular:
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import ssl
-from typing import TYPE_CHECKING, Any
+import stat
+from typing import TYPE_CHECKING, Any, Union
 from urllib.parse import quote
 
 import httpx
@@ -80,37 +82,97 @@ _UNVERIFIED_MESSAGE = (
     "verify=False is refused: it would turn the daemon's TLS listener "
     "into an unauthenticated one (an encrypted pipe to whoever answers). "
     "This covers any falsy or blank verify value and an SSL context that "
-    "does not verify certificates. "
-    "Pass the CA bundle path instead — verify=<key_dir>/tls/local-ca.pem "
-    "for a zero-config daemon — or omit verify= to use the platform "
-    "trust store (#3840)."
+    "does not verify certificates or is not provably the stock one. "
+    "Accepted verify= forms: None (httpx default trust: certifi, or SSL_CERT_FILE / SSL_CERT_DIR), True, the path of a "
+    "CA bundle file or CA directory (str or os.PathLike), or exactly an "
+    "ssl.SSLContext (not a subclass, such as truststore.SSLContext) that is "
+    "CERT_REQUIRED with check_hostname on and has no patched wrap_socket or "
+    "wrap_bio. Build one with ssl.create_default_context(cafile=<CA path>) "
+    "or pass verify=<CA path>, e.g. <key_dir>/tls/local-ca.pem for a "
+    "zero-config daemon (#3840, #6267, #6268)."
 )
 
+#: ``ssl.SSLContext`` attributes that decide what a handshake verifies,
+#: captured at import. A context is admitted only while every one of them is
+#: still the stock object, so a later class-level patch is caught too (#6268).
+_HANDSHAKE_ATTRIBUTES = (
+    "wrap_socket",
+    "wrap_bio",
+    "verify_mode",
+    "check_hostname",
+    "sslsocket_class",
+    "sslobject_class",
+)
+_STOCK_HANDSHAKE = {name: ssl.SSLContext.__dict__.get(name) for name in _HANDSHAKE_ATTRIBUTES}
 
-def _context_verifies(context: ssl.SSLContext) -> bool:
-    """Whether ``context`` requires a certificate AND checks the hostname.
 
-    Read through the ``ssl.SSLContext`` base-class descriptors: a subclass can
-    override ``verify_mode``/``check_hostname`` as Python properties and report
-    a secure state over a context OpenSSL runs unverified (#6248).
+def _context_verifies(context: object) -> bool:
+    """Whether ``context`` is the stock ``ssl.SSLContext`` and verifies.
+
+    Admitted only when ALL hold (5-agent vote 4d3ea1c5, form B):
+
+    * ``type(context) is ssl.SSLContext``: a subclass, including
+      ``truststore.SSLContext``, keeps its real state on an inner object, so
+      the outer object reporting ``CERT_REQUIRED`` proves nothing (#6267);
+    * ``verify_mode``/``check_hostname`` read through the base-class
+      descriptors are ``CERT_REQUIRED`` and on (#6248);
+    * the instance dict shadows no ``ssl.SSLContext`` attribute, so no
+      ``context.wrap_socket = ...`` style patch reroutes the handshake (#6268);
+    * the handshake-deciding class attributes are still the objects captured
+      at import (#6268).
     """
+    if type(context) is not ssl.SSLContext:
+        return False
+    if any(hasattr(ssl.SSLContext, key) for key in vars(context)):
+        return False
+    if any(ssl.SSLContext.__dict__.get(name) is not stock for name, stock in _STOCK_HANDSHAKE.items()):
+        return False
     return bool(
         ssl.SSLContext.verify_mode.__get__(context) == ssl.CERT_REQUIRED  # type: ignore[attr-defined]
         and ssl.SSLContext.check_hostname.__get__(context)  # type: ignore[attr-defined]
     )
 
 
+def _context_from_path(path: str) -> ssl.SSLContext:
+    """A verifying context for the CA file or directory ``path`` (#6269).
+
+    The path is resolved with ``os.path.realpath`` NOW and the context is
+    built from the absolute result: OpenSSL resolves a relative CA directory
+    lazily, at handshake time, against whatever the working directory is then.
+    A path that is neither an existing regular file nor an existing directory
+    (missing, FIFO, socket, device) is a ``ValueError`` rather than a late
+    ``FileNotFoundError`` or a hang.
+    """
+    resolved = os.path.realpath(path)
+    try:
+        mode = os.stat(resolved).st_mode
+    except OSError:
+        mode = 0
+    # `S_ISREG`/`S_ISDIR` only: a FIFO, socket or device would block or misbehave
+    # when opened (#6307), so it is refused before anything opens it.
+    if stat.S_ISDIR(mode):
+        return ssl.create_default_context(capath=resolved)
+    if stat.S_ISREG(mode):
+        return ssl.create_default_context(cafile=resolved)
+    raise ValueError(
+        "verify= names a CA path that is not an existing regular file or "
+        f"directory: {path!r}. Pass the CA bundle file or hashed CA directory "
+        "(#6269, #6307)."
+    )
+
+
 def _checked_verify(verify: object) -> bool | ssl.SSLContext | None:
     """Return the ONLY value ``build_httpx_kwargs`` may forward, or raise (#3840).
 
-    Forwarded to httpx: ``None`` (platform trust store, kwarg omitted), ``True``,
-    a caller ``ssl.SSLContext`` that is ``CERT_REQUIRED`` with ``check_hostname``
-    on (read via the base-class descriptors), or a context this SDK builds
-    itself from the exact ``str`` of a non-blank CA path (``str`` or
-    ``os.PathLike``). Never the caller's own str/path object: httpx 0.27 decides
-    on its truthiness and 0.28 mishandles ``os.PathLike`` (#6248, #6245).
-    Refused, fail closed: ``False`` and every other falsy or blank value, a
-    non-verifying context, and any type this SDK does not document.
+    Forwarded to httpx: ``None`` (httpx default trust, kwarg omitted), ``True``,
+    a caller context that passes :func:`_context_verifies` (exactly
+    ``ssl.SSLContext``), or a context this SDK builds itself from the resolved
+    absolute path of an existing CA file or directory (``str`` or
+    ``os.PathLike``). Never the caller's own str/path object: httpx 0.27
+    decides on its truthiness and 0.28 mishandles ``os.PathLike`` (#6248,
+    #6245). Refused, fail closed: ``False`` and every other falsy or blank
+    value, a non-stock or non-verifying context, a CA path that does not
+    exist, and any type this SDK does not document.
     """
     if verify is None or verify is True:
         return verify
@@ -123,34 +185,133 @@ def _checked_verify(verify: object) -> bool | ssl.SSLContext | None:
         # `str.__str__` yields an exact `str`: no overridden `strip`/`__bool__`.
         path = str.__str__(raw) if isinstance(raw, str) else ""
         if path.strip():
-            if os.path.isdir(path):
-                return ssl.create_default_context(capath=path)
-            return ssl.create_default_context(cafile=path)
+            return _context_from_path(path)
     raise ValueError(_UNVERIFIED_MESSAGE)
 
 
-def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> list[Any]:
-    """An httpx ``request`` hook that re-checks a caller-held context (#6249).
+_SESSION_MESSAGE = (
+    "verify=False equivalent refused: the TLS session negotiated for this "
+    "connection is not a verified session of the context passed as verify= "
+    "(no validated server certificate, or the handshake ran on another "
+    "context). Use ssl.create_default_context(cafile=<CA path>) or "
+    "verify=<CA path> (#6305, #6306, #6268)."
+)
 
-    The caller keeps a reference to the context they passed in and may weaken it
-    after construction; the check therefore runs on every request.
+
+def _assert_negotiated_session(session: object, context: ssl.SSLContext) -> None:
+    """Raise ``ValueError`` unless ``session`` is a verified session of ``context``.
+
+    ``session`` is the connection's ``ssl_object`` after the handshake. It must
+    exist, belong to the caller's own context object (a handshake handed to
+    another context is refused) and carry a VALIDATED peer certificate:
+    ``getpeercert()`` is empty when the chain was not verified (``CERT_NONE``,
+    ``CERT_OPTIONAL`` without a certificate, anonymous suites). Unlike the
+    pre-handshake predicate this inspects what actually happened on the wire,
+    so it also closes the check/use race (#6306) and auth-null suites (#6305).
+    """
+    if session is None or getattr(session, "context", None) is not context:
+        raise ValueError(_SESSION_MESSAGE)
+    getpeercert = getattr(session, "getpeercert", None)
+    if getpeercert is None or not getpeercert():
+        raise ValueError(_SESSION_MESSAGE)
+
+
+def _with_trace(request: httpx.Request, trace: Any) -> None:
+    """Install ``trace`` on ``request``, chaining any trace the caller set."""
+    inherited = request.extensions.get("trace")
+
+    if inherited is None:
+        request.extensions["trace"] = trace
+        return
+
+    if inspect.iscoroutinefunction(trace):
+
+        async def chained_async(event: str, info: dict[str, Any]) -> None:
+            await trace(event, info)
+            result = inherited(event, info)
+            if inspect.isawaitable(result):
+                await result
+
+        request.extensions["trace"] = chained_async
+        return
+
+    def chained(event: str, info: dict[str, Any]) -> None:
+        trace(event, info)
+        inherited(event, info)
+
+    request.extensions["trace"] = chained
+
+
+_START_TLS_DONE = "connection.start_tls.complete"
+
+
+def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list[Any]]:
+    """httpx event hooks that enforce a caller-held context (#6249, #6305, #6306).
+
+    * ``request``: re-check the context before every request (early, clear
+      error) and install an httpcore ``trace`` that inspects each NEW TLS
+      session right after its handshake and before any request byte is sent;
+      an unverified session is closed and refused.
+    * ``response``: a backstop that inspects the connection the response came
+      over, which also covers a pooled connection and a trace event that never
+      fired, so a missing check fails closed.
+
+    The caller keeps a reference to the context and may weaken it after
+    construction or between the check and the handshake; the session check
+    does not depend on the context's state at any earlier moment.
     """
 
     def _recheck() -> None:
         if not _context_verifies(context):
             raise ValueError(_UNVERIFIED_MESSAGE)
 
+    def _session_of(stream: object) -> object:
+        extra = getattr(stream, "get_extra_info", None)
+        return None if extra is None else extra("ssl_object")
+
     if is_async:
 
-        async def _arequest(_request: httpx.Request) -> None:
+        async def _atrace(event: str, info: dict[str, Any]) -> None:
+            if event != _START_TLS_DONE:
+                return
+            stream = info.get("return_value")
+            try:
+                _assert_negotiated_session(_session_of(stream), context)
+            except ValueError:
+                aclose = getattr(stream, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                raise
+
+        async def _arequest(request: httpx.Request) -> None:
             _recheck()
+            _with_trace(request, _atrace)
 
-        return [_arequest]
+        async def _aresponse(response: httpx.Response) -> None:
+            _assert_negotiated_session(_session_of(response.extensions.get("network_stream")), context)
 
-    def _request(_request: httpx.Request) -> None:
+        return {"request": [_arequest], "response": [_aresponse]}
+
+    def _trace(event: str, info: dict[str, Any]) -> None:
+        if event != _START_TLS_DONE:
+            return
+        stream = info.get("return_value")
+        try:
+            _assert_negotiated_session(_session_of(stream), context)
+        except ValueError:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+            raise
+
+    def _request(request: httpx.Request) -> None:
         _recheck()
+        _with_trace(request, _trace)
 
-    return [_request]
+    def _response(response: httpx.Response) -> None:
+        _assert_negotiated_session(_session_of(response.extensions.get("network_stream")), context)
+
+    return {"request": [_request], "response": [_response]}
 
 
 def build_httpx_kwargs(
@@ -159,7 +320,7 @@ def build_httpx_kwargs(
     api_key: str | None,
     agent_id: str | None,
     timeout: float,
-    verify: bool | str | None,
+    verify: Union[bool, str, os.PathLike[str], ssl.SSLContext, None],
     cert: str | tuple[str, str] | None,
     extra_headers: dict[str, str] | None,
     is_async: bool = False,
@@ -183,9 +344,11 @@ def build_httpx_kwargs(
             standard (#3824) an unverified TLS channel is an encrypted pipe to
             whoever answers — the man-in-the-middle exposure the #3828
             ``http://`` refusal closes, one layer up. Accepted forms are exactly
-            ``None``, ``True``, a non-blank CA path (``str`` or ``os.PathLike``)
-            and an ``ssl.SSLContext`` that is ``CERT_REQUIRED`` with
-            ``check_hostname`` on. Every other value is refused. Only a checked
+            ``None``, ``True``, the path of an existing CA file or directory (``str``
+            or ``os.PathLike``, resolved with ``os.path.realpath`` at
+            construction) and exactly ``ssl.SSLContext`` (never a subclass) that
+            is ``CERT_REQUIRED`` with ``check_hostname`` on and no patched
+            ``wrap_socket``/``wrap_bio``. Every other value is refused. Only a checked
             value reaches httpx: a CA path becomes a context this SDK builds
             from the exact path string (#6248, #6245), and a caller-supplied
             context is re-checked before every request (#6249; the client does
@@ -218,7 +381,7 @@ def build_httpx_kwargs(
     if checked is not None:
         kwargs["verify"] = checked
     if isinstance(checked, ssl.SSLContext) and checked is verify:
-        kwargs["event_hooks"] = {"request": _request_hooks(checked, is_async=is_async)}
+        kwargs["event_hooks"] = _request_hooks(checked, is_async=is_async)
     if cert is not None:
         kwargs["cert"] = cert
     return kwargs

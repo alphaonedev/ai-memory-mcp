@@ -17,9 +17,11 @@ from __future__ import annotations
 # `list[...]` annotation resolves to that method (mypy: "not valid as a type").
 # Annotations below spell the builtin explicitly.
 import builtins
+import os
+import ssl
 from types import TracebackType
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Union
 
 import httpx
 
@@ -70,16 +72,17 @@ class AiMemoryClient:
         agent_id: If provided, sent as ``X-Agent-Id`` so the server stamps
             this identity on stored memories (see docs/reference/ARCHITECTURE_REFERENCE.md §Agent Identity).
         timeout: Seconds before a request is aborted.
-        verify: ``httpx`` ``verify`` — path to server CA bundle or bool. A
-            zero-config daemon serves a certificate from the local CA it
-            wrote to ``<key_dir>/tls/local-ca.pem`` on first boot; pass that
-            path to verify it (#3782). Accepted: ``None``, ``True``, a
-            non-blank CA path (``str`` / ``os.PathLike``, loaded into a
-            context the SDK builds, #6248) and an ``ssl.SSLContext`` that is
-            ``CERT_REQUIRED`` with ``check_hostname`` on (re-checked on every
-            request; a later weakening is refused, #6249). ``False`` and
-            every other value are refused with ``ValueError`` (#3840): there
-            is no accept-any-certificate mode.
+        verify: TLS server verification. Accepted: ``None`` (httpx default trust:
+            certifi, or ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` when set), ``True``, the path of an existing CA bundle file or hashed
+            CA directory (``str`` / ``os.PathLike``, resolved with
+            ``os.path.realpath`` now and loaded into a context the SDK builds,
+            #6248, #6269) and exactly ``ssl.SSLContext`` (not a subclass such
+            as ``truststore.SSLContext``) that is ``CERT_REQUIRED`` with
+            ``check_hostname`` on and no patched ``wrap_socket``/``wrap_bio``
+            (re-checked on every request; a later weakening is refused, #6249,
+            #6267, #6268). ``False`` and every other value raise
+            ``ValueError`` (#3840): there is no accept-any-certificate mode. A
+            zero-config daemon's CA is ``<key_dir>/tls/local-ca.pem`` (#3782).
         cert: ``httpx`` ``cert`` — client cert for mTLS (path or
             ``(cert, key)``).
         headers: Additional headers to send on every request.
@@ -92,7 +95,7 @@ class AiMemoryClient:
         api_key: str | None = None,
         agent_id: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
-        verify: bool | str | None = None,
+        verify: Union[bool, str, os.PathLike[str], ssl.SSLContext, None] = None,
         cert: str | tuple[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
