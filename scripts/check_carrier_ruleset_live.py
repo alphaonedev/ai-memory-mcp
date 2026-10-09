@@ -67,6 +67,7 @@ Exit: 0 pass (or pending WARN), 1 drift/unreadable, 2 usage.
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -487,7 +488,7 @@ def self_test():
     hidden = mut(lambda rs: rs.pop("bypass_actors"))
     cases = [
         # label, bundle, rulesets, state, issue_state, require_full_view, want_rc, needle
-        ("applied good", promoted, [good], applied, is_open, False, 0, "OK"),
+        ("applied good", promoted, [good], applied, is_open, False, 0, "OK: carrier ruleset 1 ("),
         ("applied absent", promoted, [], applied, is_open, False, 1, "no carrier ruleset"),
         ("exclude", promoted, [mut(lambda rs: rs["conditions"]["ref_name"].update(exclude=["refs/heads/chain/x"]))],
          applied, is_open, False, 1, "exclude"),
@@ -526,6 +527,8 @@ def self_test():
         ("pending absent closed", committed, [], pending, is_closed, False, 1, "#6182 is closed"),
         ("pending absent unreadable", committed, [], pending, unreadable, False, 1, "unreadable"),
         ("pending live match", committed, [good_c], pending, is_open, False, 1, "flip"),
+        # R3-F2 (code): the flip line names the ruleset (and its id) the PUT must target.
+        ("pending live match names id", committed, [good_c], pending, is_open, False, 1, "carrier ruleset 1 ("),
         ("pending renamed weak", committed,
          [mut(lambda rs: (rs.update(name="other"), params(rs).update(strict_required_status_checks_policy=False)),
               base=good_c)],
@@ -645,6 +648,120 @@ def self_test():
 
     for label, p, rulesets, carriers, texts, want_rc, needle in pre_cases:
         check(label, lambda p=p, r=rulesets, c=carriers, t=texts, w=want_rc, n=needle: pre_case(p, r, c, t, w, n))
+    # R3-F1 (security) / #6231: the per-ruleset detail and the tracking-issue reads
+    # are validated; a body that is not the requested object is unreadable.
+    def fake_run(routes):
+        def run(args):
+            for needle, body in routes:
+                if needle in args[-1]:
+                    return body
+            raise VerifyError("HTTP 404")
+        return run
+
+    def read_raises(fn):
+        try:
+            fn()
+        except VerifyError:
+            return None
+        return "accepted a malformed response"
+
+    listing = '[{"id": 7}]'
+    detail_ok = '{"id": 7, "target": "branch", "enforcement": "active"}'
+    for label, routes in (
+            ("detail empty object", (("/rulesets/7", "{}"), ("/rulesets?", listing))),
+            ("detail other id", (("/rulesets/7", '{"id": 8, "target": "branch", "enforcement": "active"}'),
+                                 ("/rulesets?", listing))),
+            ("detail array", (("/rulesets/7", "[]"), ("/rulesets?", listing))),
+            ("detail empty body", (("/rulesets/7", ""), ("/rulesets?", listing))),
+            ("detail target missing", (("/rulesets/7", '{"id": 7, "enforcement": "active"}'),
+                                       ("/rulesets?", listing))),
+            ("detail enforcement not a string", (("/rulesets/7", '{"id": 7, "target": "branch", "enforcement": 1}'),
+                                                 ("/rulesets?", listing))),
+            ("listing item bool id", (("/rulesets?", '[{"id": true}]'),)),
+            ("listing item not an object", (("/rulesets?", "[7]"),)),
+            ("listing item without id", (("/rulesets?", "[{}]"),))):
+        check(label, lambda r=routes: read_raises(lambda: live_rulesets("o/r", run=fake_run(r))))
+    check("detail valid", lambda: None if live_rulesets(
+        "o/r", run=fake_run((("/rulesets/7", detail_ok), ("/rulesets?", listing)))) == [json.loads(detail_ok)]
+        else "valid detail not returned")
+    for label, body in (
+            ("issue other number", '{"number": 1, "state": "open"}'),
+            ("issue array", "[]"),
+            ("issue empty body", ""),
+            ("issue state unknown", '{"number": 6182, "state": "weird"}'),
+            ("issue state missing", '{"number": 6182}'),
+            ("issue is a pull request", '{"number": 6182, "state": "open", "pull_request": {}}')):
+        check(label, lambda b=body: read_raises(lambda: live_issue_state("o/r", run=fake_run((("/issues/", b),)))(
+            pinned)))
+    check("issue valid", lambda: None if live_issue_state("o/r", run=fake_run((
+        ("/issues/", '{"number": 6182, "state": "closed"}'),)))(pinned) == "closed" else "valid issue not read")
+
+    # R3-F2 (security) / #6232: a freeze that EXCLUDES the carrier is not trusted, and an
+    # unfrozen tip must trigger on pull_request for its base.
+    freeze_excl = copy(freeze)
+    freeze_excl["conditions"]["ref_name"]["exclude"] = ["refs/heads/chain/old"]
+    flow = 'branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]'
+    no_chain = wf_text.replace(flow, 'branches: [main, develop, "release/**", "rehearsal/**"]')
+    no_pr = wf_text.replace("\n  pull_request:\n", "\n  pull_request_target_gone:\n")
+    pre_cases2 = [
+        ("pre-apply freeze that excludes the carrier is not trusted", [freeze_excl],
+         live_two + [("refs/heads/chain/old", sha_c)], {sha_a: wf_text, sha_b: wf_text}, 1, "refs/heads/chain/old"),
+        ("pre-apply tip without the chain trigger", [], live_two, {sha_a: no_chain, sha_b: wf_text}, 1,
+         "does not trigger on pull_request for chain/promo6-ssh"),
+        ("pre-apply tip without pull_request", [], live_two, {sha_a: wf_text, sha_b: no_pr}, 1,
+         "does not trigger on pull_request for rehearsal/audit-wip-ssh"),
+    ]
+    for label, rulesets, carriers, texts, want_rc, needle in pre_cases2:
+        check(label, lambda r=rulesets, c=carriers, t=texts, w=want_rc, n=needle: pre_case(payload, r, c, t, w, n))
+    for label, text, branch, want in (
+            ("trigger flow list", wf_text, "chain/x", True),
+            ("trigger flow list nested", wf_text, "rehearsal/a/b", True),
+            ("trigger release", wf_text, "release/v1.0.0", True),
+            ("trigger not listed", wf_text, "feature/x", False),
+            ("trigger single star stops at slash", "on:\n  pull_request:\n    branches: ['chain/*']\n",
+             "chain/a/b", False),
+            ("trigger block list", "on:\n  pull_request:\n    branches:\n      - 'chain/**'\n", "chain/a", True),
+            ("trigger no branch filter", "on:\n  pull_request:\n    types: [opened]\n", "chain/a", True),
+            ("trigger branches-ignore", "on:\n  pull_request:\n    branches-ignore: ['chain/**']\n", "chain/a",
+             False),
+            ("trigger negated pattern", "on:\n  pull_request:\n    branches: ['chain/**', '!chain/a']\n",
+             "chain/a", False),
+            ("trigger push only", "on:\n  push:\n    branches: ['chain/**']\n", "chain/a", False),
+            ("trigger no on block", "name: x\n", "chain/a", False)):
+        check(label, lambda t=text, b=branch, w=want: None if trigger_covers(t, b) is w
+              else f"trigger_covers({b!r}) is not {w}")
+
+    # R3-F1 (code): once the state is `applied`, release/v1.0.0 must define the verifier job
+    # (the same availability class as the carriers) before the PUT makes it required there.
+    def pre_release(state_name, release_text, want_rc, needle):
+        rel = None if release_text is None else (lambda: release_text)
+        rc, lines = pre_apply(payload, carrier, release, [], live_two, fetcher({sha_a: wf_text, sha_b: wf_text}),
+                              state={"state": state_name, "tracking_issue": pinned}, release_workflow=rel)
+        text = "\n".join(lines)
+        if rc != want_rc or needle not in text:
+            return f"rc={rc} (want {want_rc}) needle {needle!r} in {text!r}"
+        return None
+    for label, state_name, release_text, want_rc, needle in (
+            ("pre-apply applied release carries the job", "applied", wf_text, 0, "release/v1.0.0"),
+            ("pre-apply applied release lacks the job", "applied", no_verifier, 1,
+             "release/v1.0.0 @ tip lacks " + repr([v_ctx])),
+            ("pre-apply applied release does not trigger", "applied", no_pr, 1,
+             "does not trigger on pull_request for release/v1.0.0"),
+            ("pre-apply applied release unreadable", "applied", None, 1, "release/v1.0.0"),
+            ("pre-apply pending does not read release", "pending-apply", no_verifier, 0, "PRE-APPLY OK")):
+        check(label, lambda s=state_name, t=release_text, w=want_rc, n=needle: pre_release(s, t, w, n))
+    check("pre-apply bogus state", lambda: pre_release("later", wf_text, 1, "state must be"))
+
+    # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
+    own = Path(__file__).read_text(encoding="utf-8")
+    pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
+    check("pin assigned once", lambda: None if len(re.findall(pin_assign, own)) == 1
+          else "TRACKING_ISSUE must be assigned exactly once")
+    check("pin never rebound by global", lambda: None if not re.search(r"\bglob" + r"al\s+TRACKING_ISSUE", own)
+          else "TRACKING_ISSUE must not be rebound through a global statement")
+    check("verifier reads no env vars", lambda: None if not re.search(
+        r"\benv" + r"iron\b|\bget" + r"env\b|^\s*(?:import|from)\s+os\b", own, re.M)
+          else "the verifier must not read env vars")
     if failures:
         for f in failures:
             print(f"SELF-TEST FAIL: {f}", file=sys.stderr)
