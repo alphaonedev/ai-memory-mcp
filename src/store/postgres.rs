@@ -14144,13 +14144,16 @@ impl PostgresStore {
                 .try_get::<i64, _>("version")
                 .unwrap_or_else(|_| crate::models::default_memory_version()),
             // v0.8.0 Pillar 2 (#1709) — read the v64 column. Pre-v64 rows /
-            // backups missing the column fall back to `Open` (SQL DEFAULT)
-            // and any unrecognised future value reads as `Open`.
-            lifecycle_state: row
-                .try_get::<String, _>(field_names::LIFECYCLE_STATE)
-                .ok()
-                .and_then(|s| crate::models::LifecycleState::from_str(&s))
-                .unwrap_or_default(),
+            // backups missing the column fall back to `Open` (SQL DEFAULT);
+            // #4134 — an unrecognised value decodes FAIL-CLOSED as `Unknown`
+            // (hidden, verbatim), never as `Open`.
+            lifecycle_state: crate::models::LifecycleState::decode_stored(
+                &row_id,
+                row.try_get::<Option<String>, _>(field_names::LIFECYCLE_STATE)
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            ),
             // v0.9.0 G8 (#1825) — read the v74 additive content-id. `None`
             // on pre-v74 rows (column absent) and rows the backfill left
             // NULL. `cid_genesis` is read on demand by the verify path only.

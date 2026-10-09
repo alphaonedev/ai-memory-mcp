@@ -728,8 +728,8 @@ pub const NODE_LOCAL_LIFECYCLE_STATES: [LifecycleState; 2] =
 /// Whether `state` is a node-local containment overlay
 /// ([`NODE_LOCAL_LIFECYCLE_STATES`]).
 #[must_use]
-pub fn is_node_local_lifecycle(state: LifecycleState) -> bool {
-    NODE_LOCAL_LIFECYCLE_STATES.contains(&state)
+pub fn is_node_local_lifecycle(state: &LifecycleState) -> bool {
+    NODE_LOCAL_LIFECYCLE_STATES.contains(state)
 }
 
 /// Boids item 3 R2.1 (#3266; fixes #3750) — the ONE lifecycle merge
@@ -754,10 +754,15 @@ pub fn is_node_local_lifecycle(state: LifecycleState) -> bool {
 /// Deliberately NOT commutative when a side is a node-local overlay.
 #[must_use]
 pub fn merge_lifecycle_local_taint_wins(local: &Memory, remote: &Memory) -> LifecycleState {
-    if is_node_local_lifecycle(local.lifecycle_state)
+    // #4134 — a LOCAL value this binary cannot read is kept VERBATIM (a merge
+    // must never launder it into a known state), and a REMOTE one is never
+    // adopted over a readable local state.
+    if is_node_local_lifecycle(&local.lifecycle_state)
         || remote.lifecycle_state == LifecycleState::Contaminated
+        || matches!(local.lifecycle_state, LifecycleState::Unknown(_))
+        || matches!(remote.lifecycle_state, LifecycleState::Unknown(_))
     {
-        return local.lifecycle_state;
+        return local.lifecycle_state.clone();
     }
     lww(
         local,
@@ -777,6 +782,10 @@ pub fn lifecycle_local_taint_wins_case(new: &str, old: &str) -> String {
         .map(|s| format!("'{}'", s.as_str()))
         .join(", ");
     let contaminated = LifecycleState::Contaminated.as_str();
+    // #4134 — no `Unknown` arm here: every DO UPDATE this CASE rides carries
+    // the `title_slot_merge_backstop` (the recall allow-list), so a stored
+    // value outside the vocabulary already makes the statement update
+    // nothing; the Rust twin keeps a local `Unknown` verbatim.
     format!(
         "CASE WHEN {old}.lifecycle_state IN ({local_wins}) \
               OR {new}.lifecycle_state = '{contaminated}' \
@@ -864,7 +873,7 @@ pub fn pg_node_local_overlay(incoming: &str) -> String {
 /// the row was changed.
 pub fn normalise_inbound_node_local_overlay(mem: &mut Memory) -> bool {
     let mut changed = false;
-    if is_node_local_lifecycle(mem.lifecycle_state) {
+    if is_node_local_lifecycle(&mem.lifecycle_state) {
         mem.lifecycle_state = LifecycleState::Open;
         changed = true;
     }
@@ -1234,7 +1243,7 @@ mod tests {
             LifecycleState::Open,
         ] {
             let mut m = base("a", "2026-06-16T00:00:00+00:00");
-            m.lifecycle_state = st;
+            m.lifecycle_state = st.clone();
             assert!(!normalise_inbound_node_local_overlay(&mut m));
             assert_eq!(m.lifecycle_state, st);
         }

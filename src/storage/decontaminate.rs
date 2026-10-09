@@ -124,6 +124,10 @@ pub(crate) enum Observed {
     /// The row was contaminated and is now released to this state (written +
     /// `swarm.decontaminate` appended; the caller commits, THEN warns).
     Decontaminated(LifecycleState),
+    /// #4134 — the row holds a value this binary does not recognise (raw
+    /// column value, text or not): the caller releases it to `open` with the
+    /// raw value as its compare-and-set.
+    Unrecognised(rusqlite::types::Value),
     /// Absent, or neither contaminated nor quarantined: nothing was written.
     NotContained,
 }
@@ -142,7 +146,7 @@ pub(crate) fn observe_and_release_sqlite(
 ) -> Result<Observed> {
     use rusqlite::OptionalExtension;
     super::record_stop::gate_storage_conn(tx)?;
-    let row: Option<(String, Option<String>)> = tx
+    let row: Option<(rusqlite::types::Value, Option<String>)> = tx
         .query_row(
             "SELECT lifecycle_state, metadata FROM memories WHERE id = ?1",
             rusqlite::params![id],
@@ -152,10 +156,18 @@ pub(crate) fn observe_and_release_sqlite(
     let Some((state, meta)) = row else {
         return Ok(Observed::NotContained);
     };
-    match LifecycleState::from_str(&state) {
+    // #4134 — decoded fail-closed: a value outside the vocabulary (or a
+    // non-text value) is `Unrecognised`, released by the operator path only.
+    let known = match &state {
+        rusqlite::types::Value::Text(s) => LifecycleState::from_str(s),
+        rusqlite::types::Value::Null => Some(LifecycleState::Open),
+        _ => None,
+    };
+    match known {
         Some(LifecycleState::Quarantined) => return Ok(Observed::Quarantined),
         Some(LifecycleState::Contaminated) => {}
-        _ => return Ok(Observed::NotContained),
+        Some(_) => return Ok(Observed::NotContained),
+        None => return Ok(Observed::Unrecognised(state)),
     }
     let plan = plan_release(parse_metadata(meta.as_deref()).as_ref());
     let now = release_now().to_rfc3339();
@@ -196,7 +208,7 @@ pub(crate) const QUARANTINE_TRACE_TARGET: &str = "ai_memory::quarantine";
 
 /// The fleet-watchable signal of a decontaminate, shared by both backends
 /// (identifying fields only, never content).
-pub(crate) fn warn_released(id: &str, agent_id: &str, target: LifecycleState) {
+pub(crate) fn warn_released(id: &str, agent_id: &str, target: &LifecycleState) {
     tracing::warn!(
         target: QUARANTINE_TRACE_TARGET,
         memory_id = %id,

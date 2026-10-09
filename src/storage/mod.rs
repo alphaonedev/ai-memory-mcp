@@ -1292,7 +1292,7 @@ fn row_to_memory_with_policy(
             },
         );
     let mut memory = Memory {
-        id: row_id,
+        id: row_id.clone(),
         tier,
         namespace: row.get("namespace")?,
         title: row.get("title")?,
@@ -1358,15 +1358,15 @@ fn row_to_memory_with_policy(
         // value a pre-v45 row would land at the moment the ALTER
         // fires in the migrate ladder).
         version: row.get::<_, i64>("version").unwrap_or(1),
-        // v0.8.0 Pillar 2 (#1709) — schema v64 column. Falls back to
-        // `Open` on pre-v64 rows (column absent) and on any unrecognised
-        // value from a future schema (forward-compat), matching the SQL
-        // `DEFAULT 'open'`.
-        lifecycle_state: row
-            .get::<_, String>(field_names::LIFECYCLE_STATE)
-            .ok()
-            .and_then(|s| crate::models::LifecycleState::from_str(&s))
-            .unwrap_or_default(),
+        // v0.8.0 Pillar 2 (#1709) — schema v64 column. `Open` on pre-v64
+        // rows (column absent, matching the SQL `DEFAULT 'open'`); #4134 —
+        // any value this binary does not recognise (text or not) decodes
+        // FAIL-CLOSED as `Unknown`, never `Open`.
+        lifecycle_state: lifecycle_write::decode_stored_value(
+            &row_id,
+            row.get::<_, rusqlite::types::Value>(field_names::LIFECYCLE_STATE)
+                .ok(),
+        ),
         // v0.9.0 G8 (#1825) — schema v74 additive content-id. `None` on
         // pre-v74 rows (column absent) and on rows the backfill left NULL
         // (undecryptable / `version >= 2` re-stored). `cid_genesis` is
@@ -4116,15 +4116,35 @@ pub fn operator_dequarantine(conn: &mut Connection, id: &str, agent_id: &str) ->
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     // Boids item 3 R2.5 (#3266) — the path is chosen by the state observed
     // under the write lock, never by the caller (`decontaminate`).
-    match decontaminate::observe_and_release_sqlite(&tx, id, agent_id)? {
-        decontaminate::Observed::Quarantined => {}
-        decontaminate::Observed::Decontaminated(target) => {
-            tx.commit()?;
-            decontaminate::warn_released(id, agent_id, target);
-            return Ok(true);
-        }
-        decontaminate::Observed::NotContained => return Ok(false),
-    }
+    // #4134 — the CAS value is the state OBSERVED under the lock: the literal
+    // `quarantined`, or the raw unrecognised value (text or not) the operator
+    // is repairing, bound verbatim so the release matches exactly that row
+    // state and nothing else.
+    let observed: rusqlite::types::Value =
+        match decontaminate::observe_and_release_sqlite(&tx, id, agent_id)? {
+            decontaminate::Observed::Quarantined => rusqlite::types::Value::Text(
+                crate::models::LifecycleState::Quarantined
+                    .as_str()
+                    .to_string(),
+            ),
+            decontaminate::Observed::Unrecognised(raw) => {
+                tracing::warn!(
+                    target: decontaminate::QUARANTINE_TRACE_TARGET,
+                    memory_id = %id,
+                    operator = %agent_id,
+                    "quarantine.operator_release: releasing a memory whose lifecycle_state \
+                     holds a value this binary does not recognise (#4134) — the row was \
+                     hidden fail-closed and is restored to open"
+                );
+                raw
+            }
+            decontaminate::Observed::Decontaminated(target) => {
+                tx.commit()?;
+                decontaminate::warn_released(id, agent_id, &target);
+                return Ok(true);
+            }
+            decontaminate::Observed::NotContained => return Ok(false),
+        };
     let changed = tx.execute(
         "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
          WHERE id = ?3 AND lifecycle_state = ?4",
@@ -4132,7 +4152,7 @@ pub fn operator_dequarantine(conn: &mut Connection, id: &str, agent_id: &str) ->
             crate::models::LifecycleState::Open.as_str(),
             Utc::now().to_rfc3339(),
             id,
-            crate::models::LifecycleState::Quarantined.as_str(),
+            observed,
         ],
     )?;
     if changed == 0 {
@@ -13547,7 +13567,7 @@ fn contaminate_row(
     let Some((cur_str, meta_str)) = row else {
         return Ok(ContaminateOutcome::Vanished);
     };
-    let cur = crate::models::LifecycleState::from_str(&cur_str).unwrap_or_default();
+    let cur = crate::models::LifecycleState::from_stored_text(&cur_str);
     if cur == crate::models::LifecycleState::Contaminated {
         return Ok(ContaminateOutcome::AlreadyContaminated);
     }
@@ -13895,7 +13915,7 @@ pub fn swarm_rewind(
             reason: contamination_marker::rewind_root_not_found(root_id),
         }));
     };
-    let root_state = crate::models::LifecycleState::from_str(&root_state_str).unwrap_or_default();
+    let root_state = crate::models::LifecycleState::from_stored_text(&root_state_str);
     let root_meta: serde_json::Value = root_meta_str
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
@@ -13956,7 +13976,7 @@ pub fn swarm_rewind(
                 .optional()?;
             match st
                 .as_deref()
-                .and_then(crate::models::LifecycleState::from_str)
+                .map(crate::models::LifecycleState::from_stored_text)
             {
                 Some(crate::models::LifecycleState::Contaminated) => {
                     report.descendants_already_contaminated += 1;
@@ -13998,7 +14018,7 @@ pub fn swarm_rewind(
                 reason: contamination_marker::rewind_root_not_found(root_id),
             }));
         };
-        let root_state = crate::models::LifecycleState::from_str(&locked_state).unwrap_or_default();
+        let root_state = crate::models::LifecycleState::from_stored_text(&locked_state);
         let root_meta: serde_json::Value = locked_meta
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())

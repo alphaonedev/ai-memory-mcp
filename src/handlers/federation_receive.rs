@@ -1344,7 +1344,7 @@ pub(crate) fn sanitize_inbound_pull_memory(mem: &mut Memory) {
 /// send lanes never ship a hidden row, so a wire overlay is abnormal: WARN with
 /// identifying fields only (never content).
 pub(crate) fn normalise_inbound_node_local_overlay_or_warn(mem: &mut Memory) {
-    let wire_state = mem.lifecycle_state;
+    let wire_state = mem.lifecycle_state.clone();
     if crate::models::crdt_merge::normalise_inbound_node_local_overlay(mem) {
         tracing::warn!(
             target: ATTESTATION_TRACE_TARGET,
@@ -6104,7 +6104,7 @@ mod tests {
         use crate::models::LifecycleState;
         for st in [LifecycleState::Contaminated, LifecycleState::Quarantined] {
             let mut m = wsig_mem("ai:curator");
-            m.lifecycle_state = st;
+            m.lifecycle_state = st.clone();
             m.metadata.as_object_mut().unwrap().insert(
                 crate::storage::CONTAMINATION_METADATA_KEY.to_string(),
                 serde_json::json!({"prior_lifecycle_state": "done"}),

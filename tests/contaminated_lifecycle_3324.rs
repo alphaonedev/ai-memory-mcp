@@ -146,14 +146,14 @@ fn contaminated_is_system_only_terminal_and_unreachable_by_caller() {
     // No caller transition may REACH Contaminated (absent from the graph).
     for from in LifecycleState::all() {
         assert!(
-            !from.can_transition_to(LifecycleState::Contaminated),
+            !from.can_transition_to(&LifecycleState::Contaminated),
             "{} must not transition to Contaminated",
             from.as_str()
         );
     }
     // ...and Contaminated is a dead end.
     for to in LifecycleState::all() {
-        assert!(!LifecycleState::Contaminated.can_transition_to(*to));
+        assert!(!LifecycleState::Contaminated.can_transition_to(to));
     }
 
     // The write-boundary validator rejects it as caller input (system-only).

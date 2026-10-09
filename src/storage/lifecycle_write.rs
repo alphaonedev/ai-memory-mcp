@@ -8,6 +8,28 @@ use chrono::Utc;
 use rusqlite::{Connection, params};
 
 use super::{InvalidTransition, Result};
+use crate::models::LifecycleState;
+
+/// #4134 — decode a raw sqlite `lifecycle_state` column value FAIL-CLOSED
+/// (the sqlite half of [`LifecycleState::decode_stored`]): `None` (column
+/// absent on a pre-v64 read) and SQL NULL are the visible-legacy `Open`;
+/// TEXT goes through the shared decoder; an INTEGER / REAL / BLOB value —
+/// which no typed writer ever produces — is rendered to text and lands as
+/// `Unknown`, so a damaged column hides its row rather than re-opening it.
+pub(crate) fn decode_stored_value(
+    memory_id: &str,
+    raw: Option<rusqlite::types::Value>,
+) -> LifecycleState {
+    use rusqlite::types::Value;
+    let rendered = match raw {
+        None | Some(Value::Null) => None,
+        Some(Value::Text(s)) => Some(s),
+        Some(Value::Integer(i)) => Some(i.to_string()),
+        Some(Value::Real(f)) => Some(f.to_string()),
+        Some(Value::Blob(b)) => Some(format!("<blob {} bytes>", b.len())),
+    };
+    LifecycleState::decode_stored(memory_id, rendered.as_deref())
+}
 
 /// The read-under-the-write-lock of [`set_lifecycle_state`] (also used to name
 /// the state a lost CAS moved to).
@@ -50,7 +72,6 @@ pub fn set_lifecycle_state(
     id: &str,
     state: crate::models::LifecycleState,
 ) -> Result<bool> {
-    use crate::models::LifecycleState;
     use rusqlite::OptionalExtension;
     super::record_stop::gate_storage_conn(conn)?;
     // #3957 / #3152 — transaction-aware: the SAL `update` funnel runs its
@@ -60,19 +81,22 @@ pub fn set_lifecycle_state(
     // opens (and commits or rolls back) its own otherwise.
     super::in_write_txn(conn, || -> Result<bool> {
         // #1726 — read the current state (under the write lock) and validate.
-        let current: Option<String> = conn
+        // #4134 — read the RAW column value: an unrecognised (or non-text)
+        // current state decodes fail-closed as `Unknown`, which has no legal
+        // outbound edge, so the row is left exactly as found.
+        let current: Option<rusqlite::types::Value> = conn
             .query_row(SQL_SELECT_LIFECYCLE_STATE_BY_ID, params![id], |r| r.get(0))
             .optional()?;
-        let Some(current_str) = current else {
+        let Some(current_raw) = current else {
             return Ok(false);
         };
-        let from = LifecycleState::from_str(&current_str).unwrap_or_default();
+        let from = decode_stored_value(id, Some(current_raw.clone()));
         // A no-op (requested == current) is idempotent success, not a
         // self-loop error — mirrors the `memory_update` handler contract.
         if from == state {
             return Ok(true);
         }
-        if !from.can_transition_to(state) {
+        if !from.can_transition_to(&state) {
             return Err(InvalidTransition {
                 id: id.to_string(),
                 from,
@@ -83,18 +107,15 @@ pub fn set_lifecycle_state(
         let n = conn.execute(
             "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
              WHERE id = ?3 AND lifecycle_state = ?4",
-            params![state.as_str(), Utc::now().to_rfc3339(), id, current_str],
+            params![state.as_str(), Utc::now().to_rfc3339(), id, current_raw],
         )?;
         if n == 0 {
-            let moved_to: Option<String> = conn
+            let moved_to: Option<rusqlite::types::Value> = conn
                 .query_row(SQL_SELECT_LIFECYCLE_STATE_BY_ID, params![id], |r| r.get(0))
                 .optional()?;
             return Err(InvalidTransition {
                 id: id.to_string(),
-                from: moved_to
-                    .as_deref()
-                    .and_then(LifecycleState::from_str)
-                    .unwrap_or(from),
+                from: moved_to.map_or(from, |v| decode_stored_value(id, Some(v))),
                 to: state,
             }
             .into());

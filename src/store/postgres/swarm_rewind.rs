@@ -147,7 +147,7 @@ impl PostgresStore {
         tx.commit()
             .await
             .map_err(|e| to_store_err("decontaminate commit", e))?;
-        crate::storage::decontaminate::warn_released(id, &ctx.agent_id, plan.target);
+        crate::storage::decontaminate::warn_released(id, &ctx.agent_id, &plan.target);
         Ok(true)
     }
 
@@ -184,7 +184,7 @@ impl PostgresStore {
         if !authority.admits(&object_or_empty(meta), id, STAMP_SITE) {
             return Ok(Stamp::Unauthorized);
         }
-        let cur = LifecycleState::from_str(&cur_str).unwrap_or_default();
+        let cur = LifecycleState::from_stored_text(&cur_str);
         if cur == LifecycleState::Contaminated {
             return Ok(Stamp::AlreadyContaminated);
         }
@@ -390,7 +390,7 @@ impl PostgresStore {
                 detail: crate::storage::contamination_marker::rewind_root_not_found(root_id),
             });
         };
-        let root_state = LifecycleState::from_str(&root_state_str).unwrap_or_default();
+        let root_state = LifecycleState::from_stored_text(&root_state_str);
         let already_rewound = is_rewound(root_state, &object_or_empty(root_meta));
 
         // #3946: a safety decision reads the relational source of truth;
@@ -438,7 +438,7 @@ impl PostgresStore {
                         .fetch_optional(&self.pool)
                         .await
                         .map_err(|e| to_store_err("swarm_rewind preview", e))?;
-                match st.and_then(|(s,)| LifecycleState::from_str(&s)) {
+                match st.map(|(s,)| LifecycleState::from_stored_text(&s)) {
                     Some(LifecycleState::Contaminated) => {
                         report.descendants_already_contaminated += 1;
                     }
@@ -490,7 +490,7 @@ impl PostgresStore {
                 detail: crate::storage::contamination_marker::rewind_root_not_found(root_id),
             });
         };
-        let root_state = LifecycleState::from_str(&locked_state_str).unwrap_or_default();
+        let root_state = LifecycleState::from_stored_text(&locked_state_str);
         if is_rewound(root_state, &object_or_empty(locked_meta)) {
             report.already_rewound = true;
             return Ok(report);

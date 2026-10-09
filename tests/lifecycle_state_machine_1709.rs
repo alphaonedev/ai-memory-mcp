@@ -231,14 +231,14 @@ fn set_lifecycle_state_noop_is_idempotent_ok() {
 fn transition_machine_legal_and_illegal_pairs() {
     use LifecycleState::{Abandoned, Active, Blocked, Done, Open};
     // Legal.
-    assert!(Open.can_transition_to(Active));
-    assert!(Active.can_transition_to(Done));
-    assert!(Active.can_transition_to(Blocked));
-    assert!(Blocked.can_transition_to(Active));
+    assert!(Open.can_transition_to(&Active));
+    assert!(Active.can_transition_to(&Done));
+    assert!(Active.can_transition_to(&Blocked));
+    assert!(Blocked.can_transition_to(&Active));
     // Illegal: skipping / terminal / self-loop.
-    assert!(!Open.can_transition_to(Done));
-    assert!(!Done.can_transition_to(Active));
-    assert!(!Abandoned.can_transition_to(Active));
-    assert!(!Active.can_transition_to(Active));
+    assert!(!Open.can_transition_to(&Done));
+    assert!(!Done.can_transition_to(&Active));
+    assert!(!Abandoned.can_transition_to(&Active));
+    assert!(!Active.can_transition_to(&Active));
     assert!(Done.is_terminal() && Abandoned.is_terminal());
 }

@@ -65,14 +65,16 @@ pub(super) async fn apply_lifecycle_patch_in_tx(
     let Some((current_str,)) = current else {
         return Err(StoreError::NotFound { id: id.to_string() });
     };
-    let from = LifecycleState::from_str(&current_str).unwrap_or_default();
+    // #4134 — an unrecognised current state decodes fail-closed (`Unknown`
+    // has no legal outbound edge), so the row is left exactly as found.
+    let from = LifecycleState::from_stored_text(&current_str);
     // No-op (requested == current) is idempotent success, not a
     // self-loop error — mirrors the sqlite primitive + the memory_update
     // contract.
     if from == target {
         return Ok(false);
     }
-    if !from.can_transition_to(target) {
+    if !from.can_transition_to(&target) {
         return Err(StoreError::InvalidTransition {
             detail: format!(
                 "CONFLICT: illegal lifecycle transition for memory {id}: {from} -> {target} is not permitted"

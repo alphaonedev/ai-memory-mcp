@@ -332,11 +332,22 @@ pub struct QuarantinedMemory {
 /// `Open` is the initial state for every memory (the SQL
 /// `DEFAULT 'open'` on the column handles the backfill contract for rows
 /// that pre-date the v64 migration; new inserts that omit the field also
-/// land at `Open`). An unrecognised value from a future schema read by an
-/// older binary falls back to `Open` via the `unwrap_or_default()` chain
-/// in `row_to_memory` (forward-compat).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+/// land at `Open`).
+///
+/// #4134 — a stored value NO variant recognises (a state a newer binary
+/// wrote, a corrupted or tampered column, a non-text value) decodes
+/// FAIL-CLOSED as [`Self::Unknown`] carrying the raw text: hidden on every
+/// read lane, no legal outbound transition, written back VERBATIM by the
+/// full-row funnels, and repairable only through the audited operator
+/// release. It is never `Open`: the pre-#4134 `unwrap_or_default()` mapper
+/// read a quarantined row whose column was damaged as an ordinary open row,
+/// and showing a quarantined row is a wrong result where hiding one is a
+/// reversible degrade. The wire form is a plain string, so this enum carries
+/// hand-written `Serialize` / `Deserialize` impls: the raw text of an
+/// `Unknown` serialises verbatim (a relay forwards what it cannot read), and
+/// an unrecognised wire value is REFUSED on decode exactly as the derived
+/// impl refused it (a caller can never request an unknown state).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum LifecycleState {
     /// Initial / default — created, not yet being worked.
     #[default]
@@ -386,12 +397,53 @@ pub enum LifecycleState {
     /// `lifecycle_state` in `metadata.contamination.prior_lifecycle_state` so a
     /// future `swarm_rewind` can restore the exact prior state.
     Contaminated,
+    /// #4134 — a stored value this binary does not recognise, carried
+    /// VERBATIM (the rendered column text). Produced ONLY by
+    /// [`Self::decode_stored`] / [`Self::from_stored_text`] on the read
+    /// path — never by caller input ([`Self::from_str`] and the wire
+    /// deserializer refuse it) and never by [`Self::all`]. Fail-closed on
+    /// every predicate: not recall-visible, system-only, terminal, no
+    /// legal transition in or out, a refused title-slot occupant.
+    Unknown(String),
+}
+
+impl Serialize for LifecycleState {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for LifecycleState {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::from_str(&raw)
+            .ok_or_else(|| serde::de::Error::unknown_variant(&raw, Self::WIRE_VARIANTS))
+    }
 }
 
 impl LifecycleState {
-    /// Column-wire string (matches the SQL `DEFAULT 'open'` value).
+    /// The wire vocabulary a caller may present, in declaration order (the
+    /// `expected` list of the deserializer's `unknown_variant` error).
+    const WIRE_VARIANTS: &'static [&'static str] = &[
+        "open",
+        "active",
+        "blocked",
+        "done",
+        "abandoned",
+        "tombstoned",
+        "quarantined",
+        "contaminated",
+    ];
+
+    /// Column-wire string (matches the SQL `DEFAULT 'open'` value). For
+    /// [`Self::Unknown`] this is the raw stored text, verbatim.
     #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Open => "open",
             Self::Active => "active",
@@ -401,7 +453,45 @@ impl LifecycleState {
             Self::Tombstoned => "tombstoned",
             Self::Quarantined => "quarantined",
             Self::Contaminated => "contaminated",
+            Self::Unknown(raw) => raw,
         }
+    }
+
+    /// #4134 — decode the RAW column text FAIL-CLOSED: a recognised value
+    /// is its variant, anything else is [`Self::Unknown`] carrying the text
+    /// verbatim. Pure (no logging); the row mappers go through
+    /// [`Self::decode_stored`], which adds the corruption observability.
+    #[must_use]
+    pub fn from_stored_text(raw: &str) -> Self {
+        Self::from_str(raw).unwrap_or_else(|| Self::Unknown(raw.to_string()))
+    }
+
+    /// #4134 — the ONE row-mapper decode on both adapters. `None` (a SQL
+    /// NULL / a column the ladder has not added yet) is the visible-legacy
+    /// [`Self::Open`], the same reading the SQL [`lifecycle_visible_clause`]
+    /// gives a NULL; any other unrecognised value is [`Self::Unknown`] with a
+    /// WARN naming the row (never its content) and one
+    /// `corrupt_provenance_rows_total{column="lifecycle_state"}` tick, so a
+    /// damaged or tampered column is an operator-visible event rather than a
+    /// silently re-opened row.
+    #[must_use]
+    pub fn decode_stored(memory_id: &str, raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return Self::Open;
+        };
+        let state = Self::from_stored_text(raw);
+        if let Self::Unknown(text) = &state {
+            tracing::warn!(
+                target: "lifecycle.unknown_state",
+                memory_id = %memory_id,
+                raw_len = text.len(),
+                "memories.lifecycle_state holds a value this binary does not recognise; the row is \
+                 hidden fail-closed and left verbatim (#4134) — release it with the operator \
+                 dequarantine once the cause is known"
+            );
+            crate::metrics::record_corrupt_provenance(super::field_names::LIFECYCLE_STATE);
+        }
+        state
     }
 
     /// Parse the column-wire string. Returns `None` on unrecognised values
@@ -444,7 +534,7 @@ impl LifecycleState {
     /// auto-propagated invalidation taint) are terminal like `Done` /
     /// `Abandoned`.
     #[must_use]
-    pub fn is_terminal(self) -> bool {
+    pub fn is_terminal(&self) -> bool {
         matches!(
             self,
             Self::Done
@@ -452,6 +542,7 @@ impl LifecycleState {
                 | Self::Tombstoned
                 | Self::Quarantined
                 | Self::Contaminated
+                | Self::Unknown(_)
         )
     }
 
@@ -462,10 +553,10 @@ impl LifecycleState {
     /// only by the system tombstone / quarantine / contamination
     /// raw-UPDATE paths.
     #[must_use]
-    pub fn is_system_only(self) -> bool {
+    pub fn is_system_only(&self) -> bool {
         matches!(
             self,
-            Self::Tombstoned | Self::Quarantined | Self::Contaminated
+            Self::Tombstoned | Self::Quarantined | Self::Contaminated | Self::Unknown(_)
         )
     }
 
@@ -478,8 +569,8 @@ impl LifecycleState {
     /// HNSW/linear-scan recall branches that filter loaded [`Memory`] rows
     /// in Rust rather than in SQL.
     #[must_use]
-    pub fn is_recall_visible(self) -> bool {
-        RECALL_VISIBLE_LIFECYCLE_STATES.contains(&self)
+    pub fn is_recall_visible(&self) -> bool {
+        RECALL_VISIBLE_LIFECYCLE_STATES.contains(self)
     }
 
     /// v1.0.0 R19/A3 (#1948) route-OUT — the state a quarantined row returns
@@ -493,14 +584,14 @@ impl LifecycleState {
     /// (`Quarantined` is absent from [`Self::can_transition_to`], so this is
     /// deliberately NOT a caller transition).
     #[must_use]
-    pub fn dequarantine_target(self) -> Option<Self> {
+    pub fn dequarantine_target(&self) -> Option<Self> {
         matches!(self, Self::Quarantined).then_some(Self::Open)
     }
 
     /// Whether `self → to` is a legal lifecycle transition. No self-loops;
     /// terminals (`Done` / `Abandoned`) go nowhere.
     #[must_use]
-    pub fn can_transition_to(self, to: Self) -> bool {
+    pub fn can_transition_to(&self, to: &Self) -> bool {
         matches!(
             (self, to),
             (Self::Open, Self::Active)
@@ -651,8 +742,8 @@ impl LifecycleState {
     /// #3690 — the ONE admission predicate for a `(title, namespace)`
     /// occupant, see [`TitleSlotAdmission`].
     #[must_use]
-    pub fn title_slot_admission(self) -> TitleSlotAdmission {
-        if self == Self::Tombstoned {
+    pub fn title_slot_admission(&self) -> TitleSlotAdmission {
+        if *self == Self::Tombstoned {
             TitleSlotAdmission::Free
         } else if self.is_recall_visible() {
             TitleSlotAdmission::Occupied
@@ -669,7 +760,7 @@ impl LifecycleState {
     /// row whose hiding reason it cannot read.
     #[must_use]
     pub fn title_slot_admission_for(raw: &str) -> TitleSlotAdmission {
-        Self::from_str(raw).map_or(TitleSlotAdmission::Refused, Self::title_slot_admission)
+        Self::from_str(raw).map_or(TitleSlotAdmission::Refused, |s| s.title_slot_admission())
     }
     /// v1.0.0 #2894 - the ONE re-open predicate for a rollback restore: a
     /// `restore_or_conflict` write that merges into a stored row re-opens it
@@ -685,8 +776,8 @@ impl LifecycleState {
     /// arm so it holds atomically; this bool form is what unit tests pin
     /// directly.
     #[must_use]
-    pub fn restore_reopens_row(stored: Self, incoming: Self) -> bool {
-        stored == Self::Tombstoned && incoming.is_recall_visible()
+    pub fn restore_reopens_row(stored: &Self, incoming: &Self) -> bool {
+        *stored == Self::Tombstoned && incoming.is_recall_visible()
     }
 }
 
@@ -2733,14 +2824,14 @@ mod tests {
     fn restore_reopens_row_only_for_tombstone_to_visible_2894() {
         for incoming in RECALL_VISIBLE_LIFECYCLE_STATES {
             assert!(
-                LifecycleState::restore_reopens_row(LifecycleState::Tombstoned, incoming),
+                LifecycleState::restore_reopens_row(&LifecycleState::Tombstoned, &incoming),
                 "stored tombstone + visible {incoming:?} re-opens"
             );
         }
         for stored in RECALL_VISIBLE_LIFECYCLE_STATES {
             for incoming in LifecycleState::all() {
                 assert!(
-                    !LifecycleState::restore_reopens_row(stored, *incoming),
+                    !LifecycleState::restore_reopens_row(&stored, incoming),
                     "stored visible {stored:?} never re-opens (stored wins)"
                 );
             }
@@ -2748,7 +2839,7 @@ mod tests {
         for stored in [LifecycleState::Quarantined, LifecycleState::Contaminated] {
             for incoming in LifecycleState::all() {
                 assert!(
-                    !LifecycleState::restore_reopens_row(stored, *incoming),
+                    !LifecycleState::restore_reopens_row(&stored, incoming),
                     "stored hidden {stored:?} is never re-opened"
                 );
             }
@@ -2759,7 +2850,7 @@ mod tests {
             LifecycleState::Contaminated,
         ] {
             assert!(
-                !LifecycleState::restore_reopens_row(LifecycleState::Tombstoned, incoming),
+                !LifecycleState::restore_reopens_row(&LifecycleState::Tombstoned, &incoming),
                 "hidden incoming {incoming:?} never re-opens, even onto a tombstone"
             );
         }
@@ -3371,7 +3462,7 @@ mod tests {
         // (no caller path reaches it), and flagged system-only.
         for from in LifecycleState::all() {
             assert!(
-                !from.can_transition_to(LifecycleState::Quarantined),
+                !from.can_transition_to(&LifecycleState::Quarantined),
                 "{from} -> Quarantined must be an illegal caller transition"
             );
         }
@@ -3437,30 +3528,30 @@ mod tests {
     fn lifecycle_state_transition_matrix_is_enforced() {
         use LifecycleState::{Abandoned, Active, Blocked, Done, Open};
         // Legal edges.
-        assert!(Open.can_transition_to(Active));
-        assert!(Open.can_transition_to(Abandoned));
-        assert!(Active.can_transition_to(Blocked));
-        assert!(Active.can_transition_to(Done));
-        assert!(Active.can_transition_to(Abandoned));
-        assert!(Blocked.can_transition_to(Active));
-        assert!(Blocked.can_transition_to(Abandoned));
+        assert!(Open.can_transition_to(&Active));
+        assert!(Open.can_transition_to(&Abandoned));
+        assert!(Active.can_transition_to(&Blocked));
+        assert!(Active.can_transition_to(&Done));
+        assert!(Active.can_transition_to(&Abandoned));
+        assert!(Blocked.can_transition_to(&Active));
+        assert!(Blocked.can_transition_to(&Abandoned));
         // Illegal: skipping active.
-        assert!(!Open.can_transition_to(Done));
-        assert!(!Open.can_transition_to(Blocked));
+        assert!(!Open.can_transition_to(&Done));
+        assert!(!Open.can_transition_to(&Blocked));
         // Illegal: no self-loops.
-        assert!(!Open.can_transition_to(Open));
-        assert!(!Active.can_transition_to(Active));
-        assert!(!Blocked.can_transition_to(Blocked));
+        assert!(!Open.can_transition_to(&Open));
+        assert!(!Active.can_transition_to(&Active));
+        assert!(!Blocked.can_transition_to(&Blocked));
         // Illegal: terminals go nowhere.
         for to in LifecycleState::all() {
-            assert!(!Done.can_transition_to(*to), "done -> {to} must be illegal");
+            assert!(!Done.can_transition_to(to), "done -> {to} must be illegal");
             assert!(
-                !Abandoned.can_transition_to(*to),
+                !Abandoned.can_transition_to(to),
                 "abandoned -> {to} must be illegal"
             );
         }
         // Illegal: blocked cannot jump straight to done (must re-activate).
-        assert!(!Blocked.can_transition_to(Done));
+        assert!(!Blocked.can_transition_to(&Done));
     }
 
     #[test]

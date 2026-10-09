@@ -649,7 +649,7 @@ fn handle_update_inner(
                 .ok_or_else(|| anyhow::anyhow!(crate::errors::msg::MEMORY_NOT_FOUND))?
                 .lifecycle_state;
             if requested != current {
-                if !current.can_transition_to(requested) {
+                if !current.can_transition_to(&requested) {
                     // #3713: a typed root (the caller's own bad input), so the
                     // MCP funnel passes the text through verbatim instead of
                     // flattening it to the storage-error class.
@@ -659,7 +659,7 @@ fn handle_update_inner(
                         requested.as_str(),
                         LifecycleState::all()
                             .iter()
-                            .filter(|s| current.can_transition_to(**s))
+                            .filter(|s| current.can_transition_to(s))
                             .map(|s| s.as_str())
                             .collect::<Vec<_>>()
                             .join("|"),
