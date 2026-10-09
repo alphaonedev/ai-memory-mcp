@@ -59,7 +59,8 @@ FAILURE, never a skip):
            binaries behind), is skipped on GitHub-hosted runners when the job
            can land on one, carries the ``docs_only`` guard when its siblings do
            (rule (b3) of scripts/check-required-contexts.sh), and runs
-           ``python3 scripts/ci/prune-runner-target.py --target-dir ...``.
+           ``python3 scripts/ci/prune-runner-target.py --target-dir ...``
+           without ``--allow-outside-workspace``.
 
 The prune script itself is exercised below against a fake target tree built
 under ``<repo>/.local-runs`` (never /tmp, project hard rule): it must refuse a
@@ -98,6 +99,7 @@ PRUNE_STEP_NAME = "Prune runner target dir (#6118)"
 PRUNE_INVOCATION = "python3 scripts/ci/prune-runner-target.py"
 # The exact step body every self-hosted job runs (honours a runner-side
 # CARGO_TARGET_DIR override, else the workspace default `target`).
+ALLOW_OUTSIDE_FLAG = "--allow-outside-workspace"
 PRUNE_RUN_LINE = '        run: python3 scripts/ci/prune-runner-target.py --target-dir "${CARGO_TARGET_DIR:-target}"'
 DEBUG_LEVEL = "0"
 DEBUG_KEYS = ("CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG")
@@ -581,6 +583,9 @@ def violations(name: str, wf: Workflow, job: Job) -> List[str]:
     run = last.run_text()
     if PRUNE_INVOCATION not in run or "--target-dir" not in run:
         found.append("%s: R-PRUNE prune step does not run `%s --target-dir ...`: %r" % (where, PRUNE_INVOCATION, run))
+    if ALLOW_OUTSIDE_FLAG in run:
+        found.append("%s: R-PRUNE prune step passes %s; a workflow never prunes a target dir outside "
+                     "its workspace (CF4)" % (where, ALLOW_OUTSIDE_FLAG))
     return found
 
 
@@ -1171,9 +1176,18 @@ class PruneScript6118(unittest.TestCase):
         os.link(ex / "tool-fedcba9876543210", ex / "unrelated")
         _write(ex / "keep-1111222233334444", 800, True)
         os.link(ex / "keep-1111222233334444", self.target / "debug" / "keep")
+        # macOS: cargo uplifts the dSYM bundle as a symlink <name>.dSYM; it is
+        # unlinked as a link and never followed (here it points outside).
+        _write(self.target / (EXAMPLE_HASHED + ".dSYM") / "Contents" / "dwarf", 300, False)
+        outside = Path(self.scratch.name) / "outside-dsym"
+        _write(outside / "keep-me", 5, False)
+        os.symlink(str(outside), str(self.target / (EXAMPLE_UPLIFT + ".dSYM")))
         proc = self._run("--target-dir", str(self.target))
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
-        self.assertEqual(self._expected_freed(), self._freed(proc.stdout))
+        self.assertEqual(self._expected_freed() + 300, self._freed(proc.stdout))
+        self.assertTrue((outside / "keep-me").exists())
+        self.assertFalse(os.path.lexists(str(self.target / (EXAMPLE_UPLIFT + ".dSYM"))))
+        self.assertFalse((self.target / (EXAMPLE_HASHED + ".dSYM")).exists())
         for rel in (EXAMPLE_HASHED, EXAMPLE_UPLIFT, EXAMPLE_HASHED + ".d", "debug/examples/demo.d"):
             self.assertFalse((self.target / rel).exists(), rel)
         for name in ("tool-fedcba9876543210", "unrelated", "keep-1111222233334444"):

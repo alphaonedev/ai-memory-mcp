@@ -24,9 +24,14 @@ every self-hosted cargo job, after a successful checkout):
     macOS ``<name>.dSYM`` bundle;
   * deletes the contents of ``<target>/<profile>/incremental`` (CI runs with
     CARGO_INCREMENTAL=0, so anything there is stale state from elsewhere);
-  * keeps a hard-linked executable (cargo's uplift source ``deps/<bin>-<hash>``,
-    the other link being ``<profile>/<bin>``): deleting one side frees nothing
-    while the other exists, and it is one bin, not one of the ~1000 tests;
+  * deletes an example together with its uplift: cargo builds
+    ``examples/<name>-<hash>`` and hard-links it as ``examples/<name>`` (one
+    inode, nlink 2, both links in ``examples/``), so the pair goes in one run,
+    with each name's ``.d`` and ``.dSYM`` twin, and its bytes count once;
+  * keeps any other hard-linked executable (cargo's uplift source
+    ``deps/<bin>-<hash>``, the other link being ``<profile>/<bin>``, or a link
+    whose partner is not the matching examples name): deleting one side frees
+    nothing while the other exists, and it is one bin, not one of the ~1000 tests;
   * keeps everything else, so the next compile stays warm.
 ``--scope all`` instead removes the five artifact dirs ``deps``, ``build``,
 ``incremental``, ``examples`` and ``.fingerprint`` under the profile wholesale:
@@ -47,8 +52,11 @@ SAFETY.  Fail closed, checks in this order, nothing touched on a refusal (exit 2
   2. ``--target-dir`` is not itself a symlink.  A target dir that does not
      exist yet (a job that failed before its first compile) is "nothing to
      prune", exit 0.  One that is not a directory is refused.
-  3. When GITHUB_WORKSPACE is set, the resolved dir lies inside it, or it IS
-     the resolved CARGO_TARGET_DIR the runner exported.
+  3. When GITHUB_WORKSPACE is set, the resolved dir lies inside it.  A dir
+     outside it is accepted only with ``--allow-outside-workspace`` AND when it
+     IS the resolved CARGO_TARGET_DIR the runner exported.  The workflows never
+     pass the flag: a target dir shared by several runners would let one job's
+     prune delete another job's test binaries while that job runs them.
   4. It carries cargo's own marker: a regular ``CACHEDIR.TAG`` whose first line
      is the cachedir signature (opened non-blocking and checked with fstat, so a
      FIFO or device swapped in cannot stall the step), or a regular
@@ -67,8 +75,10 @@ is 1.  Every name printed is escaped as GitHub escapes a workflow-command value
 (``%`` -> ``%25``, CR -> ``%0D``, LF -> ``%0A``), so a hostile file name can
 never start a log line of its own.
 
-OUTPUT.  One line per category, then ``freed_bytes=<n>`` and a human-readable
-total.  The count is exact, also under ``--dry-run``: a hard-linked file counts
+OUTPUT.  One line per category, then ``freed_bytes=<n>``, a human-readable
+total and ``::notice::prune-runner-target freed_bytes=<n> deleted=<k>
+mode=<pruned|dry-run>`` (a job-summary annotation; ``k`` counts the candidates
+fully removed).  The count is exact, also under ``--dry-run``: a hard-linked file counts
 once, and only when every one of its links is removed in this run.
 
 Python 3.9+, standard library only (the fleet nodes ship python3 on PATH; the
@@ -78,16 +88,18 @@ Usage:
   python3 scripts/ci/prune-runner-target.py --target-dir "${CARGO_TARGET_DIR:-target}"
   python3 scripts/ci/prune-runner-target.py --target-dir target --dry-run
   python3 scripts/ci/prune-runner-target.py --target-dir target --scope all
+  python3 scripts/ci/prune-runner-target.py --target-dir "$CARGO_TARGET_DIR" --allow-outside-workspace
 """
 from __future__ import annotations
 
 import argparse
 import errno
 import os
+import re
 import stat
 import sys
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Set, Tuple
 
 # Outputs under <profile>/deps and <profile>/examples that ARE the warm cache
 # (or its dep-info / debuginfo) and are never pruned in test-bins scope, even
@@ -96,6 +108,8 @@ from typing import Dict, List, Mapping, Optional, Tuple
 KEEP_SUFFIXES = (".rlib", ".rmeta", ".so", ".dylib", ".dll", ".a", ".d", ".o", ".dwo", ".dwp", ".pdb")
 # The only subdirectories of a profile this script ever deletes from.
 ARTIFACT_DIRS = ("deps", "build", "incremental", "examples", ".fingerprint")
+# cargo's metadata hash on an example: examples/<name>-<16 lowercase hex>.
+EXAMPLE_HASH_RE = re.compile(r"[0-9a-f]{16}")
 EXEC_BITS = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
 EXIT_REFUSED = 2
 EXIT_WARNED = 1
@@ -184,6 +198,7 @@ class Tally:
 
     def __init__(self) -> None:
         self.freed = 0
+        self.deleted = 0  # candidates fully removed (or, dry-run, removable)
         self.errors: List[str] = []
         self.lines: List[str] = []
         self.per_category: Dict[str, Tuple[int, int]] = {}
@@ -305,6 +320,37 @@ def _scan_lstat(plan: Plan, name: str, fd: int, rel: str) -> Optional[os.stat_re
         return None
 
 
+def _add_with_twins(plan: Plan, fd: int, name: str, sub: str, present: Set[str], link_dsym: bool) -> None:
+    """Queue ``name`` with its ``.d`` (regular) and ``.dSYM`` (dir) twins.
+
+    ``link_dsym``: cargo also uplifts the dSYM of an example as a symlink
+    ``examples/<name>.dSYM`` -> ``<name>-<hash>.dSYM``; that link is unlinked as
+    a link, never followed.
+    """
+    prefix = "%s/%s/" % (plan.profile, sub)
+    plan.candidates.append(Candidate(fd, name, prefix + name, sub + " executable"))
+    for twin, category, want_dir in ((name + ".d", " dep-info", False), (name + ".dSYM", " dSYM", True)):
+        if twin not in present:
+            continue
+        tst = _scan_lstat(plan, twin, fd, prefix + twin)
+        if tst is None:
+            continue
+        if want_dir:
+            ok = stat.S_ISDIR(tst.st_mode) or (link_dsym and stat.S_ISLNK(tst.st_mode))
+        else:
+            ok = stat.S_ISREG(tst.st_mode)
+        if ok:
+            plan.candidates.append(Candidate(fd, twin, prefix + twin, sub + category))
+
+
+def _uplift_pair(names: List[str]) -> bool:
+    """Exactly ``<name>`` and ``<name>-<16 hex>``: cargo's example + its uplift."""
+    if len(names) != 2:
+        return False
+    short, long_ = sorted(names, key=len)
+    return long_.startswith(short + "-") and EXAMPLE_HASH_RE.fullmatch(long_[len(short) + 1:]) is not None
+
+
 def _scan_test_bins(plan: Plan, profile_fd: int) -> None:
     for sub in ("deps", "examples"):
         fd = _open_sub(plan, profile_fd, sub)
@@ -315,22 +361,29 @@ def _scan_test_bins(plan: Plan, profile_fd: int) -> None:
             continue
         present = set(names)
         prefix = "%s/%s/" % (plan.profile, sub)
+        linked: Dict[Tuple[int, int], List[str]] = {}
         for name in names:
             st = _scan_lstat(plan, name, fd, prefix + name)
             if st is None or not _is_test_executable(name, st):
                 continue
             if st.st_nlink > 1:
+                if sub == "examples" and st.st_nlink == 2:
+                    linked.setdefault((st.st_dev, st.st_ino), []).append(name)
+                    continue
                 # cargo's uplift source deps/<bin>-<hash>, hard-linked to
                 # <profile>/<bin>: deleting this side frees nothing.
                 plan.kept.append(sub + "/" + name)
                 continue
-            plan.candidates.append(Candidate(fd, name, prefix + name, sub + " executable"))
-            for twin, category, want_dir in ((name + ".d", " dep-info", False), (name + ".dSYM", " dSYM", True)):
-                if twin not in present:
-                    continue
-                tst = _scan_lstat(plan, twin, fd, prefix + twin)
-                if tst is not None and (stat.S_ISDIR(tst.st_mode) if want_dir else stat.S_ISREG(tst.st_mode)):
-                    plan.candidates.append(Candidate(fd, twin, prefix + twin, sub + category))
+            _add_with_twins(plan, fd, name, sub, present, False)
+        for key in sorted(linked):
+            pair = sorted(linked[key])
+            if _uplift_pair(pair):
+                # Both links of the inode are here: the pair goes together and
+                # frees the bytes once (the Tally counts the last link).
+                for name in pair:
+                    _add_with_twins(plan, fd, name, sub, present, True)
+            else:
+                plan.kept.extend(sub + "/" + name for name in pair)
     fd = _open_sub(plan, profile_fd, "incremental")
     if fd is None:
         return
@@ -375,18 +428,21 @@ def _has_cachedir_tag(root_fd: int) -> bool:
     return head == CACHEDIR_SIGNATURE
 
 
-def _inside_workspace(root: Path, env: Mapping[str, str]) -> bool:
+def _inside_workspace(root: Path, env: Mapping[str, str], allow_outside: bool) -> bool:
     workspace = env.get("GITHUB_WORKSPACE", "")
     if not workspace:
         return True
     ws = Path(workspace).resolve()
     if ws in root.parents:
         return True
+    if not allow_outside:
+        return False
     explicit = env.get("CARGO_TARGET_DIR", "")
     return bool(explicit) and Path(explicit).resolve() == root
 
 
-def plan_target(target_dir: str, profile: str, scope: str, env: Mapping[str, str]) -> Plan:
+def plan_target(target_dir: str, profile: str, scope: str, env: Mapping[str, str],
+                allow_outside: bool = False) -> Plan:
     """Run every safety check, open the directories O_NOFOLLOW and list what to remove.
 
     Raises Refused (nothing touched) or NothingToPrune.  The caller must
@@ -410,8 +466,9 @@ def plan_target(target_dir: str, profile: str, scope: str, env: Mapping[str, str
     if not stat.S_ISDIR(raw_st.st_mode):
         raise Refused("%s is not a directory" % raw)
     root = raw.resolve(strict=True)
-    if not _inside_workspace(root, env):
-        raise Refused("%s is outside GITHUB_WORKSPACE (%s) and is not CARGO_TARGET_DIR"
+    if not _inside_workspace(root, env, allow_outside):
+        raise Refused("%s is outside GITHUB_WORKSPACE (%s); it is pruned only with --allow-outside-workspace "
+                      "and only when it is the exported CARGO_TARGET_DIR"
                       % (root, env.get("GITHUB_WORKSPACE", "")))
     plan = Plan(root, profile, scope)
     try:
@@ -462,7 +519,8 @@ def execute(plan: Plan, dry_run: bool) -> Tally:
     verb = "would delete" if dry_run else "deleted"
     for cand in plan.candidates:
         before = tally.freed
-        _remove(cand.dir_fd, cand.name, cand.rel, tally, dry_run)
+        if _remove(cand.dir_fd, cand.name, cand.rel, tally, dry_run):
+            tally.deleted += 1
         size = tally.freed - before
         count, total = tally.per_category.get(cand.category, (0, 0))
         tally.per_category[cand.category] = (count + 1, total + size)
@@ -496,16 +554,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="test-bins (default): test/example executables + incremental; "
                              "all: the five artifact dirs wholesale")
     parser.add_argument("--dry-run", action="store_true", help="list and total, delete nothing")
+    parser.add_argument("--allow-outside-workspace", action="store_true",
+                        help="accept a target dir outside GITHUB_WORKSPACE when it is the exported "
+                             "CARGO_TARGET_DIR (manual use; the workflows never pass it)")
     args = parser.parse_args(argv)
 
     try:
         _validate_profile(args.profile)
-        plan = plan_target(args.target_dir, args.profile, args.scope, os.environ)
+        plan = plan_target(args.target_dir, args.profile, args.scope, os.environ,
+                           args.allow_outside_workspace)
     except Refused as exc:
         return _refuse(str(exc))
     except NothingToPrune as exc:
         print("nothing to prune: %s" % _escape(str(exc)))
         print("freed_bytes=0")
+        print("::notice::prune-runner-target freed_bytes=0 deleted=0 mode=%s"
+              % ("dry-run" if args.dry_run else "pruned"))
         return 0
     except OSError as exc:
         # The root checks raced with a change or hit an unreadable path before
@@ -529,6 +593,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("  " + _escape(note))
     print("freed_bytes=%d" % tally.freed)
     print("freed %s (%s)" % (_human(tally.freed), mode))
+    print("::notice::prune-runner-target freed_bytes=%d deleted=%d mode=%s" % (tally.freed, tally.deleted, mode))
     if tally.errors:
         print("%d entr%s could not be read or removed (warnings above); exit %d"
               % (len(tally.errors), "y" if len(tally.errors) == 1 else "ies", EXIT_WARNED))
