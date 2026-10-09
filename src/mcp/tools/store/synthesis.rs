@@ -164,7 +164,22 @@ pub(super) struct SynthesisOutcome {
     /// handler surfaces this on the response envelope as
     /// `synthesis_failed: true` + `synthesis_failed_reason`.
     pub failed_reason: Option<String>,
+    /// #4173 — Delete verdicts the store path WITHHELD (collapsed to
+    /// NoOp), as `(candidate_id, reason_code)`. Surfaced on the store
+    /// response as `synthesis_deletes_withheld` so a caller can tell
+    /// "applied" from "skipped". The durable write itself still succeeds
+    /// (the same additive honest-envelope shape as `synthesis_failed`).
+    /// On this base the withholding arm is the K9 recheck
+    /// ([`k9_allows_synthesis_delete`]); the #3806 decision seam adds
+    /// its own reason codes to the same vector when it lands.
+    pub withheld_deletes: Vec<(String, &'static str)>,
 }
+
+/// #4173 — reason code for a Delete the K9 pipeline DENIED.
+pub(super) const WITHHELD_K9_DENIED: &str = "k9_denied";
+/// #4173 — reason code for a Delete the K9 pipeline held for approval
+/// (`Ask`), which the synthesis path has no operator UI to surface.
+pub(super) const WITHHELD_K9_ASK: &str = "k9_ask";
 
 impl SynthesisOutcome {
     pub(super) fn empty() -> Self {
@@ -173,6 +188,7 @@ impl SynthesisOutcome {
             updates: Vec::new(),
             deletes: Vec::new(),
             failed_reason: None,
+            withheld_deletes: Vec::new(),
         }
     }
 }
@@ -262,6 +278,7 @@ pub(super) fn run_synthesis_pass(
             }
             let mut updates: Vec<(String, String)> = Vec::new();
             let mut deletes: Vec<String> = Vec::new();
+            let mut withheld_deletes: Vec<(String, &'static str)> = Vec::new();
             for v in &resp.verdicts {
                 match v.verb {
                     crate::synthesis::SynthesisVerb::Update => {
@@ -275,8 +292,12 @@ pub(super) fn run_synthesis_pass(
                         // SEC-1 — re-check K9 per delete verdict. The
                         // curator's verdict is advice; the K9 pipeline
                         // remains authoritative.
-                        if k9_allows_synthesis_delete(&mem.namespace, agent_id, &v.candidate_id) {
-                            deletes.push(v.candidate_id.clone());
+                        // #4173 — a withheld delete is NOT a silent skip:
+                        // record the candidate + reason for the envelope.
+                        match k9_allows_synthesis_delete(&mem.namespace, agent_id, &v.candidate_id)
+                        {
+                            Ok(()) => deletes.push(v.candidate_id.clone()),
+                            Err(reason) => withheld_deletes.push((v.candidate_id.clone(), reason)),
                         }
                     }
                     crate::synthesis::SynthesisVerb::Add
@@ -288,6 +309,7 @@ pub(super) fn run_synthesis_pass(
                 updates,
                 deletes,
                 failed_reason: None,
+                withheld_deletes,
             })
         }
         Err(e) => {
@@ -311,6 +333,7 @@ pub(super) fn run_synthesis_pass(
                     updates: Vec::new(),
                     deletes: Vec::new(),
                     failed_reason: Some(reason),
+                    withheld_deletes: Vec::new(),
                 }),
             }
         }
@@ -318,13 +341,19 @@ pub(super) fn run_synthesis_pass(
 }
 
 /// SEC-1 helper — consult the K9 permission pipeline on a synthesis
-/// delete verdict. Returns `true` when K9 allows (Allow / Modify);
-/// `false` when K9 denies or asks for approval (the synthesis path
-/// has no operator UI to surface a prompt). The store handler's
+/// delete verdict. Returns `Ok(())` when K9 allows (Allow / Modify);
+/// `Err(reason_code)` when K9 denies or asks for approval (the synthesis
+/// path has no operator UI to surface a prompt). The store handler's
 /// audit-honest WARN logs the deny/ask reason verbatim — preserved
 /// here so the call sites stay aligned with the pre-#881 trace
-/// output.
-fn k9_allows_synthesis_delete(namespace: &str, agent_id: &str, candidate_id: &str) -> bool {
+/// output. #4173 — the reason code ([`WITHHELD_K9_DENIED`] /
+/// [`WITHHELD_K9_ASK`]) rides the response envelope so the caller sees
+/// the withheld delete instead of inferring it from a count.
+fn k9_allows_synthesis_delete(
+    namespace: &str,
+    agent_id: &str,
+    candidate_id: &str,
+) -> Result<(), &'static str> {
     use crate::permissions::{Decision, Op, PermissionContext, Permissions};
     let payload = json!({
         "id": candidate_id,
@@ -337,7 +366,7 @@ fn k9_allows_synthesis_delete(namespace: &str, agent_id: &str, candidate_id: &st
         payload,
     };
     match Permissions::evaluate(&ctx, &[]) {
-        Decision::Allow | Decision::Modify(_) => true,
+        Decision::Allow | Decision::Modify(_) => Ok(()),
         Decision::Deny(reason) => {
             tracing::warn!(
                 target: "synthesis",
@@ -345,7 +374,7 @@ fn k9_allows_synthesis_delete(namespace: &str, agent_id: &str, candidate_id: &st
                 candidate_id = %candidate_id,
                 "synthesis delete verdict denied by K9: {reason}",
             );
-            false
+            Err(WITHHELD_K9_DENIED)
         }
         Decision::Ask(reason) => {
             // Ask outside K10 flow → treat as deny on the synthesis
@@ -359,7 +388,7 @@ fn k9_allows_synthesis_delete(namespace: &str, agent_id: &str, candidate_id: &st
                 "synthesis delete verdict held for approval (ask): {reason}; \
                  skipping in this batch",
             );
-            false
+            Err(WITHHELD_K9_ASK)
         }
     }
 }

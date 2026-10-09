@@ -1330,6 +1330,18 @@ fn handle_store_inner(
         response["synthesis_failed"] = json!(true);
         response["synthesis_failed_reason"] = json!(reason);
     }
+    if !synthesis_outcome.withheld_deletes.is_empty() {
+        // #4173 — a Delete verdict the K9 recheck withheld is NOT a
+        // silent skip: name each withheld candidate and why. Absent when
+        // nothing was withheld (additive, the `synthesis_failed` shape).
+        response["synthesis_deletes_withheld"] = json!(
+            synthesis_outcome
+                .withheld_deletes
+                .iter()
+                .map(|(id, reason)| json!({ "id": id, "reason": reason }))
+                .collect::<Vec<_>>()
+        );
+    }
     // #2987 — `atomise_mode` is the mode that ACTUALLY RAN, emitted on
     // EVERY branch; `atomise_mode_configured` + a reason token appear
     // only when the two differ. The pre-v1.0.0 form hardcoded
