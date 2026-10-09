@@ -85,5 +85,9 @@ EXPOSE 9077
 
 USER aimem
 
+# #4072 — the default stop signal, stated so it is a contract: `serve` drains
+# gracefully on SIGTERM exactly as on SIGINT. Give `docker stop` / Kubernetes
+# at least 90 s with the default --shutdown-grace-secs (see ADMIN_GUIDE).
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["ai-memory"]
 CMD ["serve", "--host", "0.0.0.0"]
