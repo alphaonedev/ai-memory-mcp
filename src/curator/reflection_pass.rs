@@ -785,11 +785,43 @@ pub async fn run_reflection_pass(
             if !pass.eligible(&cluster) {
                 continue;
             }
-            report.clusters_eligible += 1;
 
             // Deterministic ordering so the produced reflection ids are
             // stable across re-runs on the same input (helps debugging).
             cluster.sort_by(|a, b| a.id.cmp(&b.id));
+            let source_ids: Vec<String> = cluster.iter().map(|m| m.id.clone()).collect();
+
+            // #3154 — source-set fingerprint guard. A cluster that an earlier
+            // sweep already reflected (a Reflection in this namespace whose
+            // outbound `reflects_on` set is EXACTLY this source set) is not
+            // eligible again: pre-fix every `--reflect` / upkeep sweep
+            // re-summarised the hot cluster (one LLM round-trip per sweep) and
+            // then either minted a duplicate with identical provenance or
+            // tripped the R1-M3 title-collision refusal, reported as a
+            // spurious `persist failed`. The guard runs BEFORE `summarize` so
+            // the LLM is never paid for a cluster that is already reflected.
+            // A lookup error is conservative: the cluster is skipped (never
+            // minted blind) and the error is reported.
+            match find_reflection_over_sources(store, &pass.ctx, ns, &source_ids).await {
+                Ok(Some(existing)) => {
+                    tracing::debug!(
+                        target: crate::storage::reflect::REFLECT_TRACE_TARGET,
+                        namespace = %ns,
+                        reflection_id = %existing,
+                        sources = source_ids.len(),
+                        "#3154: cluster already reflected; skipping"
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("namespace '{ns}': reflection lookup failed: {e}"));
+                    continue;
+                }
+            }
+            report.clusters_eligible += 1;
 
             let summary = match pass.summarize(&cluster) {
                 Ok(s) => s,
@@ -800,8 +832,6 @@ pub async fn run_reflection_pass(
                     continue;
                 }
             };
-
-            let source_ids: Vec<String> = cluster.iter().map(|m| m.id.clone()).collect();
 
             if dry_run {
                 report.dry_run_proposals.push(DryRunProposal {
@@ -843,9 +873,84 @@ pub async fn run_reflection_pass(
     Ok(report)
 }
 
-/// Best-effort verify helper used by [`run_reflection_pass`]. Looks up
-/// the most-recent Reflection in `namespace` and confirms its outbound
-/// `reflects_on` edges cover exactly the supplied `source_ids`.
+/// #3154 — page size of the Reflection scan in
+/// [`find_reflection_over_sources`].
+#[cfg(feature = "sal")]
+const REFLECTION_SCAN_PAGE: usize = 64;
+
+/// #3154 — hard ceiling on the rows one lookup walks, so a pathological
+/// namespace bounds the cost of the fingerprint guard (a cluster whose
+/// Reflection sits beyond the ceiling is re-minted, never lost).
+#[cfg(feature = "sal")]
+const REFLECTION_SCAN_LIMIT: usize = 4_096;
+
+/// #3154 — find a Reflection in `namespace` whose OUTBOUND `reflects_on`
+/// edge set is exactly `source_ids`. Pages through the namespace in the
+/// adapters' STABLE list order (`priority DESC, updated_at DESC, id ASC`,
+/// #1876) so a busy namespace cannot hide the row behind the first page
+/// (pre-fix `verify_recent` scanned only the first 16 rows). Returns the
+/// reflection id when found, `None` when no Reflection carries that fan-out
+/// within [`REFLECTION_SCAN_LIMIT`] rows.
+#[cfg(feature = "sal")]
+async fn find_reflection_over_sources(
+    store: &dyn MemoryStore,
+    ctx: &CallerContext,
+    namespace: &str,
+    source_ids: &[String],
+) -> Result<Option<String>> {
+    let target_set: HashSet<&str> = source_ids.iter().map(String::as_str).collect();
+    let mut offset = 0usize;
+    while offset < REFLECTION_SCAN_LIMIT {
+        let filter = Filter {
+            namespace: Some(namespace.to_string()),
+            limit: REFLECTION_SCAN_PAGE,
+            offset,
+            ..Default::default()
+        };
+        let page = store
+            .list(ctx, &filter)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("find_reflection_over_sources: store.list failed")?;
+        if page.is_empty() {
+            return Ok(None);
+        }
+        for cand in page
+            .iter()
+            .filter(|m| m.memory_kind == MemoryKind::Reflection)
+        {
+            let links = store
+                .get_links_for_anchor(&cand.id)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
+                .context("find_reflection_over_sources: get_links_for_anchor failed")?;
+            let outbound: HashSet<&str> = links
+                .iter()
+                .filter(|l| {
+                    l.source_id == cand.id
+                        && l.relation == crate::models::MemoryLinkRelation::ReflectsOn
+                })
+                .map(|l| l.target_id.as_str())
+                .collect();
+            if outbound == target_set {
+                return Ok(Some(cand.id.clone()));
+            }
+        }
+        if page.len() < REFLECTION_SCAN_PAGE {
+            return Ok(None);
+        }
+        offset += page.len();
+    }
+    Ok(None)
+}
+
+/// Best-effort verify helper used by [`run_reflection_pass`]. Confirms a
+/// Reflection in `namespace` carries outbound `reflects_on` edges covering
+/// exactly the supplied `source_ids`.
+///
+/// #3154 — walks the namespace through [`find_reflection_over_sources`]
+/// (paged, stable order) instead of the first 16 rows, so a busy namespace
+/// no longer produces a spurious `verify failed` after a successful persist.
 #[cfg(feature = "sal")]
 async fn verify_recent(
     store: &dyn MemoryStore,
@@ -853,35 +958,12 @@ async fn verify_recent(
     namespace: &str,
     source_ids: &[String],
 ) -> Result<()> {
-    let candidates = store_list_namespace(store, ctx, namespace, 16)
+    if find_reflection_over_sources(store, ctx, namespace, source_ids)
         .await
-        .context("verify_recent: store.list failed")?;
-    let target_set: HashSet<&str> = source_ids.iter().map(String::as_str).collect();
-    for cand in candidates
-        .iter()
-        .filter(|m| m.memory_kind == MemoryKind::Reflection)
+        .context("verify_recent")?
+        .is_some()
     {
-        let links = store
-            .get_links_for_anchor(&cand.id)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let outbound: HashSet<&str> = links
-            .iter()
-            .filter(|l| {
-                l.source_id == cand.id
-                    && l.relation == crate::models::MemoryLinkRelation::ReflectsOn
-            })
-            .map(|l| l.target_id.as_str())
-            .collect();
-        if outbound == target_set {
-            // Round-trip the verify step against this reflection.
-            // Reuse the trait method so the verification path is
-            // identical to what the pass would do on the standalone
-            // run.
-            // We don't have a `ReflectionPass` here so we inline the
-            // same checks via the link walk we already did.
-            return Ok(());
-        }
+        return Ok(());
     }
     anyhow::bail!(
         "verify_recent: no Reflection in namespace '{namespace}' carries the \
@@ -1760,25 +1842,41 @@ mod tests {
         /// #3154 — count the Reflections in `ns` whose OUTBOUND `reflects_on`
         /// edge set is exactly `sources` (the duplicate-provenance shape the
         /// issue describes: two rows, identical fan-out).
-        fn count_reflections_over(conn: &rusqlite::Connection, ns: &str, sources: &[String]) -> usize {
+        fn count_reflections_over(
+            conn: &rusqlite::Connection,
+            ns: &str,
+            sources: &[String],
+        ) -> usize {
             let want: HashSet<&str> = sources.iter().map(String::as_str).collect();
-            crate::db::list(conn, Some(ns), None, 1_000, 0, None, None, None, None, None, None)
-                .unwrap()
-                .iter()
-                .filter(|m| m.memory_kind == MemoryKind::Reflection)
-                .filter(|m| {
-                    let links = crate::db::get_links(conn, &m.id).unwrap();
-                    let outbound: HashSet<&str> = links
-                        .iter()
-                        .filter(|l| {
-                            l.source_id == m.id
-                                && l.relation == crate::models::MemoryLinkRelation::ReflectsOn
-                        })
-                        .map(|l| l.target_id.as_str())
-                        .collect();
-                    outbound == want
-                })
-                .count()
+            crate::db::list(
+                conn,
+                Some(ns),
+                None,
+                1_000,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .iter()
+            .filter(|m| m.memory_kind == MemoryKind::Reflection)
+            .filter(|m| {
+                let links = crate::db::get_links(conn, &m.id).unwrap();
+                let outbound: HashSet<&str> = links
+                    .iter()
+                    .filter(|l| {
+                        l.source_id == m.id
+                            && l.relation == crate::models::MemoryLinkRelation::ReflectsOn
+                    })
+                    .map(|l| l.target_id.as_str())
+                    .collect();
+                outbound == want
+            })
+            .count()
         }
 
         /// #3154 — the pass is IDEMPOTENT over an unchanged cluster: a second
@@ -1792,8 +1890,15 @@ mod tests {
             let (store, _dir) = open_db();
             let conn = conn_of(&store);
             let llm = StubLlm::new("idempotent pattern");
-            let s1 = insert_observation(&conn, "idem", "T1", "shared keyword token strategy notes", 2);
-            let s2 = insert_observation(&conn, "idem", "T2", "shared keyword token strategy plan", 3);
+            let s1 = insert_observation(
+                &conn,
+                "idem",
+                "T1",
+                "shared keyword token strategy notes",
+                2,
+            );
+            let s2 =
+                insert_observation(&conn, "idem", "T2", "shared keyword token strategy plan", 3);
             let s3 = insert_observation(
                 &conn,
                 "idem",
@@ -1807,7 +1912,10 @@ mod tests {
                 run_reflection_pass(&store, &llm, None, Some("idem"), None, false, |_| true)
                     .await
                     .unwrap();
-            assert_eq!(first.reflections_persisted, 1, "first sweep mints: {first:?}");
+            assert_eq!(
+                first.reflections_persisted, 1,
+                "first sweep mints: {first:?}"
+            );
             assert_eq!(count_reflections_over(&conn, "idem", &sources), 1);
 
             let second =
@@ -1818,7 +1926,10 @@ mod tests {
                 second.reflections_persisted, 0,
                 "#3154: the second sweep over an unchanged cluster must not mint again: {second:?}"
             );
-            assert!(second.errors.is_empty(), "no verify/persist errors: {second:?}");
+            assert!(
+                second.errors.is_empty(),
+                "no verify/persist errors: {second:?}"
+            );
             assert_eq!(
                 count_reflections_over(&conn, "idem", &sources),
                 1,
@@ -1842,8 +1953,15 @@ mod tests {
             let (store, _dir) = open_db();
             let conn = conn_of(&store);
             let llm = StubLlm::new("buried pattern");
-            let s1 = insert_observation(&conn, "wide", "T1", "shared keyword token strategy notes", 2);
-            let s2 = insert_observation(&conn, "wide", "T2", "shared keyword token strategy plan", 3);
+            let s1 = insert_observation(
+                &conn,
+                "wide",
+                "T1",
+                "shared keyword token strategy notes",
+                2,
+            );
+            let s2 =
+                insert_observation(&conn, "wide", "T2", "shared keyword token strategy plan", 3);
             let s3 = insert_observation(
                 &conn,
                 "wide",
