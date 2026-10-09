@@ -823,8 +823,13 @@ def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
     if not python or any(ch.isspace() for ch in python):
         raise GateError(f"the shim interpreter path {python!r} is empty or contains "
                         "whitespace; its '-I' flag would not survive the shebang")
-    if len(line.encode("utf-8")) > SHEBANG_MAX:
-        raise GateError(f"the shim interpreter line is {len(line.encode('utf-8'))} bytes, over "
+    try:
+        line_bytes = len(line.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise GateError(f"the shim interpreter path {python!r} is not valid UTF-8 ({exc.reason}); "
+                        "the shim is written as UTF-8, so its '-I' flag cannot be guaranteed") from exc
+    if line_bytes > SHEBANG_MAX:
+        raise GateError(f"the shim interpreter line is {line_bytes} bytes, over "
                         f"{SHEBANG_MAX}; the kernel would truncate it and drop '-I'")
     shim = shim_dir / "git"
     shim.write_text(GIT_SHIM.format(python=python, real=real, version=version,
