@@ -2462,6 +2462,23 @@ def _proof_bind_sha(step: str) -> str:
     return step.replace("PREFLIGHT_SHA: ${{ github.sha }}", "PREFLIGHT_SHA: ${{ github.event.pull_request.head.sha }}", 1)
 
 
+def _in_shape_build(fn: Transform) -> Transform:
+    """Apply ``fn`` to the release-shape build step only (#6284)."""
+    def go(text: str) -> str:
+        a = text.index(SHAPE_HDR)
+        step = text[a:text.index(OPENSSL_NAME, a)]
+        return text.replace(step, fn(step), 1)
+    return go
+
+
+def _drop_lines_with(*needles: str) -> Transform:
+    """Drop every line holding one of ``needles`` (unchanged while none is there,
+    so a case is red exactly until the statement lands)."""
+    def go(text: str) -> str:
+        return "".join(ln for ln in text.splitlines(True) if not any(n in ln for n in needles))
+    return go
+
+
 def _docker_steps_scalar(text: str) -> str:
     a, c = text.index("\n  docker:\n"), text.index("\n  copr:\n")
     s = text.index("    steps:\n", a)
@@ -3019,6 +3036,17 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "6290 timeout-minutes on the guard step": ("fail", [_shape(GUARD_STEP_NAME, _shape_modifier(
         GUARD_STEP_NAME, "        timeout-minutes: 1\n"))]),
     "6290 cleanup step if: always() narrowed": ("fail", [_shape("        if: always()\n", "        if: success()\n")]),
+    # --- #6284: the release-shape build is the release build (one constant, SHAPE_BUILD from WF_BUILD)
+    "6284 shape build without the input bind": ("fail", [_shape(SHAPE_HDR, _in_shape_build(_drop_lines_with(
+        "git hash-object")))]),
+    "6284 shape build without SOURCE_DATE_EPOCH": ("fail", [_shape(SHAPE_HDR, _in_shape_build(_drop_lines_with(
+        "SOURCE_DATE_EPOCH")))]),
+    "6284 shape build without the path remap": ("fail", [_shape(SHAPE_HDR, _in_shape_build(_drop_lines_with(
+        "RUSTFLAGS")))]),
+    "6284 shape build step shell is plain bash": ("fail", [_shape(SHAPE_HDR, _in_shape_build(lambda s: s.replace(
+        "        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}\n", "        shell: bash\n", 1)))]),
+    "6284 shape build bind sha taken from the PR head": ("fail", [_shape(SHAPE_HDR, _in_shape_build(lambda s: s.replace(
+        "PREFLIGHT_SHA: ${{ github.sha }}", "PREFLIGHT_SHA: ${{ github.event.pull_request.head.sha }}", 1)))]),
     # --- #4719 round 5 SR-8: the docker job is pinned whole; no other job may reach the registry
     "SR8/I01 absolute-path docker push in a docker-job step": ("fail", _docker_extra_step("        run: /usr/bin/docker push x\n")),
     "SR8/I02 docker -H push in a docker-job step": ("fail", _docker_extra_step("        run: docker -H tcp://x:2375 push x\n")),
@@ -3343,6 +3371,13 @@ def unit_checks() -> int:
         failures += 1
     if bk_instructions(list(DOCKER_RUN_LINES)) != [(1, len(DOCKER_RUN_LINES), DOCKER_RUN)]:
         print("self-test FAIL: DOCKER_RUN_LINES does not join to DOCKER_RUN", file=sys.stderr)
+        failures += 1
+    # #6284: the release-shape build is the release build; only the cargo
+    # command drops the cross target (the proof reads target/release/ai-memory).
+    if (SHAPE_BUILD[:-1] != WF_BUILD[:-1]
+            or SHAPE_BUILD[-1] != WF_BUILD[-1].replace(" --target ${{ matrix.target }}", "")):
+        print("self-test FAIL: the release-shape build statements differ from the release build's (#6284): "
+              f"{[s for s in WF_BUILD if s not in SHAPE_BUILD]} missing", file=sys.stderr)
         failures += 1
     if "OUT OF SCOPE" in (__doc__ or ""):
         print("self-test FAIL: the module docstring still records an unbound gap (#6275)", file=sys.stderr)
