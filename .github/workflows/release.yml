@@ -348,7 +348,8 @@ jobs:
           test -n "$FEATURES"
           cargo build --locked --release --target ${{ matrix.target }} --features "$FEATURES"
 
-      - name: Assert compiled features (#2676, #2728)
+      - name: "Assert compiled features (#2676, #2728)"
+        id: assert
         shell: bash
         run: |
           set -euo pipefail
@@ -364,13 +365,30 @@ jobs:
           # scripts/check_release_features.py refuses a conditional assert.
           # shellcheck disable=SC2086 # word-splitting the --require flags is intended
           bash scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS
+          # #4752 — record WHICH bytes passed the assert; the package step
+          # refuses any other file (shasum: present on the Linux and macOS
+          # runners alike).
+          asserted_sha256="$(shasum -a 256 "$bin" | cut -d' ' -f1)"
+          echo "sha256=$asserted_sha256" >> "$GITHUB_OUTPUT"
 
       - name: Package binary
+        # #4752 — the file that is packaged, checksummed, attested and uploaded
+        # is bound to the file the strict assert checked: its SHA-256 must equal
+        # the hash the assert step recorded, or nothing is packaged. Every step
+        # of this job is pinned whole by scripts/check_release_features.py
+        # (RELEASE_STEPS), so no later step can write dist/ unseen.
+        shell: bash
+        env:
+          ASSERTED_SHA256: ${{ steps.assert.outputs.sha256 }}
         run: |
+          set -euo pipefail
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} dist/
+          cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "dist/${{ matrix.artifact }}"
+          packaged_sha256="$(shasum -a 256 "dist/${{ matrix.artifact }}" | cut -d' ' -f1)"
+          test -n "$ASSERTED_SHA256"
+          test "$packaged_sha256" = "$ASSERTED_SHA256" || { echo "::error::dist/${{ matrix.artifact }} ($packaged_sha256) is not the binary the strict assert checked ($ASSERTED_SHA256)"; exit 1; }
           cd dist
-          tar czf ai-memory-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          tar czf "ai-memory-${{ matrix.target }}.tar.gz" "${{ matrix.artifact }}"
 
       - name: Build deb and rpm packages
         if: matrix.nfpm_arch
