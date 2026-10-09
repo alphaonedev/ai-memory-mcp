@@ -971,3 +971,45 @@ fn a_child_that_exits_after_writing_the_awaited_line_does_not_false_red_the_wait
     s.wait_stderr_contains("refusing to start");
     opener.join().expect("opener thread");
 }
+
+/// #6142 (TEST-02) - pins the `wait_entered` re-check. The child has exited and
+/// the `entered` marker is absent when the wait starts; a helper thread then
+/// writes the marker and opens the gate. The wait's loop check sees no marker,
+/// `try_wait` sees the exit, `stderr_text()` blocks on the gated reader, and the
+/// re-check runs only after the marker exists, so the wait must return. A
+/// re-check mutated to `|_| false` panics here ("the child exited ... while
+/// waiting for the held request").
+#[test]
+fn a_child_that_exits_after_writing_the_entered_marker_does_not_false_red_the_wait_6142() {
+    let home = sandbox();
+    let dir = barrier_dir(home.path());
+    let gate = Arc::new(AtomicBool::new(false));
+    let mut s = Session::attach_gated(
+        spawn_mcp(
+            home.path(),
+            &[(
+                "AI_MEMORY_TEST_FAIL_STOP_SIGNAL_INSTALL",
+                "SIGTERM".to_string(),
+            )],
+            &[],
+        ),
+        Arc::clone(&gate),
+    );
+    let deadline = Instant::now() + STARTUP_BOUND;
+    while s.child.try_wait().expect("try_wait").is_none() {
+        assert!(Instant::now() < deadline, "the refusing child never exited");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let marker = dir.join("entered");
+    assert!(
+        !marker.exists(),
+        "precondition: the marker is not written yet"
+    );
+    let opener = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(&marker, b"x").expect("write the entered marker");
+        gate.store(true, Ordering::Release);
+    });
+    s.wait_entered(&dir);
+    opener.join().expect("opener thread");
+}
