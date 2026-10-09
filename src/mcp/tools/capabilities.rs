@@ -241,7 +241,7 @@ pub fn handle_capabilities_with_conn(
         reranker,
         embedder_loaded,
         conn,
-    );
+    )?;
 
     // --- Schema selection ---
     match accept {
@@ -290,7 +290,7 @@ pub fn handle_capabilities_with_conn_v3(
         reranker,
         embedder_loaded,
         conn,
-    );
+    )?;
     let summary = build_capabilities_summary(profile);
     let describe = build_capabilities_describe_to_user(profile);
     let tools = build_capabilities_tools(profile, mcp_config, agent_id);
@@ -335,13 +335,20 @@ pub fn handle_capabilities_with_conn_v3(
 /// the v1/v2 entry point [`handle_capabilities_with_conn`] and the v3
 /// entry point [`handle_capabilities_with_conn_v3`] so the overlay
 /// logic stays single-sourced.
+///
+/// # Errors
+///
+/// #4978 — a store read FAULT on a count the envelope advertises
+/// (`permissions.active_rules`) fails the call through the existing
+/// `Result<Value, String>` channel instead of advertising `0` over a store
+/// that could not be read (never fail open; no wire-shape change).
 fn build_capabilities_overlay(
     tier_config: &TierConfig,
     resolved_models: &ResolvedModels,
     reranker: Option<&BatchedReranker>,
     embedder_loaded: bool,
     conn: Option<&rusqlite::Connection>,
-) -> crate::config::Capabilities {
+) -> Result<crate::config::Capabilities, String> {
     // v0.7.x (#1168) — build the report from the operator-resolved
     // models triple. The boot banner already routes the same triple
     // through `app_config.resolve_models()`; the capabilities surface
@@ -396,9 +403,10 @@ fn build_capabilities_overlay(
 
     // --- Live DB-count overlays ---
     if let Some(c) = conn {
-        if let Ok(n) = db::count_active_governance_rules(c) {
-            caps.permissions.active_rules = n;
-        }
+        // #4978 — a fault reading the active governance rules is an error,
+        // never `active_rules = 0` (ERRORS-19).
+        caps.permissions.active_rules = db::count_active_governance_rules(c)
+            .map_err(|e| format!("active governance rules could not be read: {e:#}"))?;
         // v0.7.0 K5 — populate `permissions.rule_summary` with a
         // one-line summary per active governance policy, sorted lex by
         // namespace. The DB layer returns the rows already sorted, so
@@ -466,7 +474,7 @@ fn build_capabilities_overlay(
         }
     }
 
-    caps
+    Ok(caps)
 }
 
 /// v0.7.0 K5 — format a single [`GovernancePolicy`] as a one-line
@@ -1520,7 +1528,8 @@ mod d1_2_983_tests {
             None,
             false,
             None,
-        );
+        )
+        .expect("#4978: no connection, so no store read can fault");
         assert!(
             !caps.features.cross_encoder_reranking,
             "#1647: no handle ⇒ flag false"

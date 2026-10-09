@@ -34,16 +34,20 @@ pub fn is_namespace_standard(conn: &Connection, id: &str) -> bool {
 /// has an explicit governance policy attached to its standard memory.
 /// The count is a transparent passthrough — the full permission system
 /// arrives in v0.7 (arch-enhancement-spec §3).
+///
+/// # Errors
+///
+/// Returns `Err` on any SQLite failure, including a bound standard whose
+/// metadata is not valid JSON or a missing `namespace_meta` table (#4978):
+/// a read fault is never reported as `0` active rules.
 pub fn count_active_governance_rules(conn: &Connection) -> Result<usize> {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM memories m
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memories m
              INNER JOIN namespace_meta nm ON nm.standard_id = m.id
              WHERE json_extract(m.metadata, '$.governance') IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+        [],
+        |r| r.get(0),
+    )?;
     Ok(usize::try_from(count.max(0)).unwrap_or(0))
 }
 
