@@ -9,7 +9,9 @@
 # CI job (PR #465 retrospective; v0.6.5 bake).
 # 1.98-slim-bookworm matches the rust-toolchain.toml dev/CI pin (1.98.0)
 # so the shipped binary is built with the same compiler as CI.
-FROM rust:1.98-slim-bookworm AS builder
+# #6281: both FROM lines are pinned by OCI index digest; refresh a digest together
+# with DOCKER_BUILDER_IMAGE / DOCKER_RUNTIME_IMAGE in scripts/check_release_features.py.
+FROM rust:1.98-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential && rm -rf /var/lib/apt/lists/*
 
@@ -69,7 +71,7 @@ RUN set -eu; \
     bash scripts/assert-compiled-features.sh target/release/ai-memory --strict $REQUIRE_FLAGS
 
 # ---- Runtime stage ----
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 LABEL org.opencontainers.image.title="ai-memory"
 LABEL org.opencontainers.image.description="AI-agnostic persistent memory system — MCP server, HTTP API, and CLI"
@@ -100,5 +102,5 @@ EXPOSE 9077
 
 USER aimem
 
-ENTRYPOINT ["ai-memory"]
+ENTRYPOINT ["/usr/local/bin/ai-memory"]
 CMD ["serve", "--host", "0.0.0.0"]

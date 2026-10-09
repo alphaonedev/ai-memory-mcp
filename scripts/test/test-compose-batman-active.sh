@@ -39,7 +39,7 @@
 #   and reports no rotation.
 #
 # Every service must declare its entrypoint EXPLICITLY (#3838, Codex review):
-# the root Dockerfile sets ENTRYPOINT ["ai-memory"] and Dockerfile.batman-active
+# the root Dockerfile sets ENTRYPOINT ["/usr/local/bin/ai-memory"] and Dockerfile.batman-active
 # sets none, so a command that relied on the image entrypoint ran
 # `ai-memory ai-memory ...` under the image the compose usage line names.
 #
