@@ -1,49 +1,84 @@
 # Per-binary Postgres isolation (#6383 / #6386)
 
-Status: opt-in. `AI_MEMORY_TEST_PG_ISOLATE=1` is exported only by the
-`Configure enterprise-fed tier` step of `.github/workflows/ci.yml`; the sqlite
-legs never see it. Making it the repo-wide default is a T3/T6 decision that
-needs the 5-agent vote (`4d3ea1c5`), as does raising in-binary
-`--test-threads` above 1.
+Status: **opt-in, off on every CI leg.** The lane runs only when
+`AI_MEMORY_TEST_PG_ISOLATE` is `1` in the job environment, and
+`.github/workflows/ci.yml` sets it on no leg (the invariant
+`G1-opt-in` in `scripts/ci/check_pg_isolate_invariants.py` fails the build if
+it ever does). This was decided by GOD in review r1 (M4): the first sharded
+carrier run goes with isolation off. Making it the default, and raising
+in-binary `--test-threads` above 1, wait for two green sharded carrier runs and
+a 5-agent vote (`4d3ea1c5`). The repository variable `CI_PG_ISOLATE_OFF=1` is
+an extra hard kill switch that wins over the flag.
 
-## What changes
+## What changes when it is on
 
 Before, every test binary on an enterprise-fed leg shared one ephemeral
 database, so the class (a) binaries (Postgres, `#[serial]`, `federat*`) ran one
-after another. With the flag on:
+after another. With the lane on (flag `1`, kill switch not `1`, tier
+`enterprise-fed`):
 
-1. **Configure** sweeps orphans, asserts `SHOW max_connections >= jobs*18+20`
-   (164 for width 8; fails closed), and builds `<CI_FED_DB>_tpl` with the `age`
-   and `vector` extensions, then marks it `IS_TEMPLATE true ALLOW_CONNECTIONS
-   false`. Nothing ever connects to it, so `CREATE DATABASE ... TEMPLATE` never
-   hits SQLSTATE 55006 except under a stray session, which the mint retries
-   three times.
-2. **Run** (`run_isolated_lane`, a sibling of `run_tests`) calls
-   `scripts/test/pg_isolated_binary.py run`, which for each `--test`/`--bin`
-   in the serial shard mints `ai_memory_t_<unix seconds>_<8 hex>`, points
-   `AI_MEMORY_TEST_POSTGRES_URL` (and `AI_MEMORY_TEST_AGE_URL` when set) at it,
-   runs `cargo test --no-fail-fast --test <bin> -- --test-threads=1`, and drops
-   the clone. Width is 8. Binaries named in
-   `scripts/ci/pg_isolate_serial_residual.txt`, or that bind a fixed loopback
-   port, use a shared path, or have no readable source
-   (`scripts/ci/pg_isolate_split.py`), run last, serially, on the shared
-   database.
-3. **Cleanup** un-marks and drops the template and any idle leftover clones.
+1. **Configure** runs `pg_isolated_binary.py setup --emit-env`. It checks the
+   live connection budget: `max_connections` minus the reserved slots minus the
+   sessions open right now (`pg_stat_activity`) must cover
+   `jobs * (18 + 1) + 20` (172 for width 8), or the step fails. It builds
+   `<CI_FED_DB>_tpl` with the `age` and `vector` extensions and marks it
+   `IS_TEMPLATE true ALLOW_CONNECTIONS false`, so `CREATE DATABASE ... TEMPLATE`
+   only hits SQLSTATE 55006 under a stray session, which the mint retries. It
+   exports `AI_MEMORY_TEST_PG_TEMPLATE` and `AI_MEMORY_TEST_PG_RUN_ID` to
+   `$GITHUB_ENV`.
+2. **Run.** The test step fails with `::error::` when the lane is on but the
+   template or run id is missing; it never skips. `run_isolated_lane` prebuilds
+   only the targets in `iso_targets.txt`, then calls
+   `pg_isolated_binary.py run` under the #1492 watchdog. For each
+   `--test`/`--bin` it mints `ai_memory_t_<run id>_<unix seconds>_<8 hex>`,
+   holds a keepalive session on it, points `AI_MEMORY_TEST_POSTGRES_URL` (and
+   `AI_MEMORY_TEST_AGE_URL` when set) at it, runs
+   `cargo test --no-fail-fast --test <bin> -- --test-threads=1`, then releases
+   the hold and drops the clone. The width is 8, reduced to what the live
+   budget allows. Each binary writes its own log under
+   `$RUNNER_TEMP/ci-shard/iso-logs/<bin>.log`. A failing binary's last 200
+   lines are echoed in a `::group::`, and the step
+   `Upload isolated-lane per-binary logs (#6383)` uploads the directory with
+   `if: always()`.
+   Binaries named in `scripts/ci/pg_isolate_serial_residual.txt`, binaries
+   that bind a fixed loopback port or use a shared path, and binaries with no
+   readable source (`scripts/ci/pg_isolate_split.py`) run last, one at a time,
+   on the shared database. The flag is stripped from their environment, so the
+   Rust helper does not mint for them.
+3. **Cleanup** runs `pg_isolated_binary.py teardown --run-id <this run>`, which
+   drops this run's leftover clones and the template.
+
+On SIGTERM (the watchdog) or SIGINT, the wrapper stops dispatching, sends TERM
+to every running `cargo` process group and KILL 5 s later, drops the clones in
+flight, and exits 143. All of this finishes inside the 60 s `--kill-after`
+window.
 
 The Rust helper `tests/common/pg_isolate.rs` gives the same isolation to a
-local run (`postgres_url()`/`age_url()` mint once per process when the flag is
-on). It does nothing when the URL already names an `ai_memory_t_*` database,
-which is what the CI wrapper hands out.
+local run: `postgres_url()`/`age_url()` mint once per process when the flag is
+on. It does nothing when the URL already names an `ai_memory_t_*` database,
+which is what the CI wrapper hands out. It requires `AI_MEMORY_TEST_PG_TEMPLATE`
+and never falls back to cloning the shared database. It uses
+`AI_MEMORY_TEST_PG_RUN_ID`, or generates a run id per process when that is
+unset.
 
 ## Safety properties
 
-* Flag off is today's behaviour, byte for byte.
-* Fail closed: flag on and the clone cannot be made is a failure, never a
-  silent fall back to the shared database.
-* The sweep drops only databases whose whole name matches the exact shape, are
-  older than 600 s (clones) or one day (`ai_memory_test_ci_*`), and have no live
-  session, so a concurrent run's long binary is never dropped.
-* Kill switch: set the repository variable `CI_PG_ISOLATE_OFF=1`.
+* Flag off (or the kill switch on) is today's behaviour, byte for byte.
+* Fail closed: with the flag on, a clone that cannot be made, held or named is
+  a failure. Nothing silently falls back to the shared database.
+* **Run-scoped.** Every clone name carries its run id (`[a-z0-9]{1,20}`).
+  Teardown, and the Rust helper's sweep of its own stale clones, only ever
+  touch clones of their own run.
+* **No FORCE drops.** A database with a live session cannot be dropped, so a
+  race with another binary fails the drop instead of terminating that binary.
+* **Admin-only cross-run sweep.**
+  `pg_isolated_binary.py sweep --older-than N` (N at least 600 s) drops idle
+  clones of any run. CI never calls it (invariant `G2-no-ci-sweep`).
+* **No secrets in argv.** `psql` gets the connection through libpq environment
+  variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`,
+  `PGSSLMODE`, ...). ci.yml passes the URL through the environment, never with
+  `--url` (invariant `G3-no-url-argv`). A URL query key the wrapper does not
+  know fails closed.
 
 ## Budgets left unchanged
 
