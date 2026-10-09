@@ -676,6 +676,29 @@ class BuildScriptInputs6384L1(World):
         self.assertIn('skipped 3 of 3', out)
 
 
+class StaleDepInfo6384L2(World):
+    """r1 L2: only the dep-info this build wrote counts; old deps/<name>-*.d
+    files left in a persistent target dir are ignored."""
+
+    def test_uplifted_bin_does_not_glob_historical_depinfo(self):
+        top = self.root / 'target' / 'debug'
+        for h in ('old1', 'old2'):
+            (self.deps / ('ai_memory-%s.d' % h)).write_text('x: gone-%s.rs\n' % h)
+        (top / 'ai-memory.d').write_text('%s: src/lib.rs\n' % (top / 'ai-memory'))
+        msg = art('bin', 'ai-memory', str(top / 'ai-memory'), False, filenames=[str(top / 'ai-memory')])
+        self.assertEqual(tbc.shared_depinfo_files([msg]), [top / 'ai-memory.d'])
+
+    def test_stale_depinfo_naming_a_deleted_file_does_not_disable_the_cache(self):
+        top = self.root / 'target' / 'debug'
+        (self.deps / 'ai_memory-old1.d').write_text('x: src/deleted.rs\n\nsrc/deleted.rs:\n')
+        (top / 'ai-memory.d').write_text('%s: src/lib.rs\n' % (top / 'ai-memory'))
+        self.bj.write_text(self.bj.read_text() + art('bin', 'ai-memory', str(top / 'ai-memory'), False,
+                                                     filenames=[str(top / 'ai-memory')]) + '\n')
+        self.green_run('100')
+        out = self.plan(run_id='200', now=NOW + 60)
+        self.assertIn('skipped 3 of 3', out)
+
+
 class Policy(unittest.TestCase):
     def test_allowed_matrix(self):
         on = {'CI_TEST_BINARY_CACHE': '1', 'CI_TEST_BINARY_CACHE_LOOKUP': '1'}
