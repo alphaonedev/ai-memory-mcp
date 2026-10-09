@@ -280,8 +280,18 @@ error: invalid tier: Long (use short, mid, long)
 and a non-zero exit, on every surface that takes one (`forget`,
 `search`, `list`, `update`, `store`, `mine`, and the MCP
 `memory_forget` / `memory_search` / `memory_list` / `memory_update`
-tools). The refusal happens before the database is opened, so nothing
-is deleted and nothing is returned.
+tools). An invalid tier is refused outright rather than treated as an
+unconstrained filter, and nothing is returned — but validation does not
+universally precede database access. `forget`, `search`, `list` and
+`mine` parse the tier before opening the database. `store` and `update`
+open it first: `store` (`src/cli/store.rs`) runs `db::open` and then
+`db::gc_if_needed` — which archives, or with `archive_on_gc=false` erases,
+rows that have ALREADY EXPIRED — before `Tier::parse_strict`, and
+`update` (`src/cli/update.rs`) opens the database and resolves the id
+before parsing. So on those two verbs a refused tier can be preceded by
+routine expired-row GC under the configured archive policy; no live row
+is deleted or changed. On the MCP tools the database is already open and
+the refusal comes before any delete, change or return.
 
 Before v1.0.0 an unrecognised value parsed to "no tier filter", which
 WIDENED the request instead of narrowing it: `forget --tier Long`
