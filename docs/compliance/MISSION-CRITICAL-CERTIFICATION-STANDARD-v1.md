@@ -4,7 +4,8 @@ docs/reviews/AI-MEMORY-V1.0.0-MISSION-CRITICAL-CERTIFICATION-STANDARD-2026-09-09
 v1.0.0 certification decision. The §0.2 declaration this standard requires is
 docs/compliance/v1.0.0-DECLARATION.md; its SHA-256 is pinned in
 scripts/qc-allowlists/declaration.sha256 and enforced by scripts/check-declaration-hash.sh.
-Edits to the standard's text go through a new revision of the reviews/ source, never here. -->
+Edits to the standard's text go through a new revision of the reviews/ source, never here.
+Erratum (#6141): N30's enforcer `check-cert-expiry.sh` is `scripts/check_cert_expiry.py` since #6137; behaviour on push events is byte-identical. The same erratum covers every historical mention in docs/compliance/. -->
 
 > **Label: VENDOR SELF-CERTIFIED (3×3).** This standard and its companion audit were
 > reviewed 3×3 by one principal (§4); every certificate issued under it carries the same
