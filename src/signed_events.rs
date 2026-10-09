@@ -404,6 +404,15 @@ pub mod event_types {
     /// that hash. Monotonicity is the append-only event count.
     pub const GOVERNANCE_POLICY_ADVANCED: &str = "governance.policy_version_advanced";
 
+    /// #3207 — `signed_events.event_type` for the requester-less
+    /// pending-action TIMEOUT transition the sweep emits (the 4th
+    /// governance transition next to `pending_action.approved` /
+    /// `.denied` / `.refused_agent_id_mismatch`). Its audit row's
+    /// `agent_id` is the REQUESTER (no decider exists) on BOTH backends:
+    /// sqlite `storage::emit_pending_action_event`, postgres
+    /// `postgres_parity::emit_pending_action_event_in_tx`.
+    pub const PENDING_ACTION_TIMED_OUT: &str = "pending_action.timed_out";
+
     /// v0.9.0 §25.3 S2 (D3-021, #1767) — `signed_events.event_type` for a
     /// write-time DECORRELATION REFUSAL: an `enforce`-mode reflection
     /// write refused because the target namespace corpus + incoming write

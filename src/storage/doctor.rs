@@ -189,7 +189,12 @@ pub fn sweep_pending_action_timeouts(
     // itself has already committed.
     for (id, _) in &rows {
         if let Ok(Some(pa)) = super::get_pending_action(conn, id) {
-            super::emit_pending_action_event(conn, &pa, "pending_action.timed_out", None);
+            super::emit_pending_action_event(
+                conn,
+                &pa,
+                crate::signed_events::event_types::PENDING_ACTION_TIMED_OUT,
+                None,
+            );
         }
     }
     Ok(rows)

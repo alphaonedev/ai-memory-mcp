@@ -451,12 +451,20 @@ pub(crate) async fn emit_pending_action_event_in_tx(
         }
     })?;
 
-    // The audit row's `agent_id` is the decision ACTOR. (The sqlite twin
-    // additionally maps the requester-less `pending_action.timed_out` path to
-    // the requester; that emit has no postgres caller yet.)
+    // The audit row's `agent_id` is the decision ACTOR for approve / deny.
+    // #3207 — the requester-less `pending_action.timed_out` transition has
+    // no decider (the sweeper moved the row), so its actor is the
+    // originating REQUESTER — the sqlite `emit_pending_action_event` rule,
+    // mirrored here so the pg sweep's audit row attributes identically
+    // (the CBOR `decided_by` stays empty on both backends).
+    let actor = if event_type == crate::signed_events::event_types::PENDING_ACTION_TIMED_OUT {
+        pa.requested_by.clone()
+    } else {
+        decided_by
+    };
     let event = crate::signed_events::SignedEvent::with_daemon_signature(
         crate::signed_events::payload_hash(&cbor),
-        decided_by,
+        actor,
         event_type.to_string(),
         timestamp,
         None,

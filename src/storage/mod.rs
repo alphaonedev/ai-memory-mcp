@@ -23837,7 +23837,7 @@ fn emit_pending_action_event(
     // approve / deny, the requester for the requester-less timeout
     // path (no human/agent decided — the sweeper transitioned the
     // row, so the "actor" is the originating requester).
-    let agent_id = if event_type == "pending_action.timed_out" {
+    let agent_id = if event_type == crate::signed_events::event_types::PENDING_ACTION_TIMED_OUT {
         pa.requested_by.clone()
     } else {
         decided_by
