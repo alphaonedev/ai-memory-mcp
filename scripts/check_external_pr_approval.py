@@ -37,6 +37,9 @@ import sys
 TEAM_ASSOCIATIONS = frozenset(("OWNER", "MEMBER", "COLLABORATOR"))
 SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+LOGIN_RE = re.compile(r"[A-Za-z0-9-]{1,39}")
+ASSOC_RE = re.compile(r"[A-Z_]{1,32}")
+TOKEN_RE = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")
 QUEUE_REF_RE = re.compile(r"refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]{40,64}")
 
 
@@ -77,7 +80,9 @@ def gh_api(path):
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise GateError(f"gh api {path}: {exc}") from exc
     if proc.returncode != 0:
-        raise GateError(f"gh api {path} exited {proc.returncode}: {proc.stderr.strip()[:300]}")
+        first = (proc.stderr.strip().splitlines() or [""])[0]
+        first = TOKEN_RE.sub("[redacted]", first)[:300]
+        raise GateError(f"gh api {path} exited {proc.returncode}: {first}")
     return parse_pages(proc.stdout)
 
 
@@ -121,10 +126,16 @@ def pr_verdict(pr, repo, operator, api):
     """(passed, line) for one pull request."""
     number, sha, head = _head(pr)
     user = pr.get("user")
-    author = user.get("login") if isinstance(user, dict) else "?"
+    author = user.get("login") if isinstance(user, dict) else None
+    if not isinstance(author, str) or not LOGIN_RE.fullmatch(author):
+        raise GateError(f"PR #{number} has an invalid author login")
     assoc = pr.get("author_association")
+    if assoc is not None and (not isinstance(assoc, str) or not ASSOC_RE.fullmatch(assoc)):
+        raise GateError(f"PR #{number} has an invalid author_association")
     head_repo = head.get("repo")
     full_name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+    if full_name is not None and (not isinstance(full_name, str) or not REPO_RE.fullmatch(full_name)):
+        raise GateError(f"PR #{number} has an invalid head repository name")
     if not is_external(pr, repo):
         return True, f"PR #{number}: author={author} ({assoc}), same-repo head - team PR (pass)"
     reviews = api(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
