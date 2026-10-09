@@ -174,17 +174,26 @@ characters (CR, form feed, NUL...), NBSP and every other Unicode space or zero-w
 workflows or Dockerfile are refused, never folded: Python, YAML and bash
 disagree on what a line and a blank are.
 
-RUNTIME BIND (#4768). The whole-job pin sees every ``run:`` line but not what
-an action (``uses:``) or a restored cache does at runtime, so the build and
-assert units themselves open with ``BIND_INPUTS``: ``git diff --quiet HEAD --
-scripts/release-features.sh scripts/assert-compiled-features.sh``, fatal
-under ``set -e`` on any change or deletion of the declaration or the
-asserter after checkout. In the Dockerfile the asserter COPY is pinned
-immediately before the declaration COPY (``DOCKER_ASSERTER_COPY``), which is
-pinned immediately before the build RUN, so no instruction can rewrite either
-file between its COPY and the RUN that reads it. Still OUT OF SCOPE: an
-action that replaces ``git`` or ``bash`` on PATH, or the shell's own
-environment (``BASH_ENV`` is refused textually only).
+RUNTIME BIND (#4768, #6275). The whole-job pin sees every ``run:`` line but
+not what an action (``uses:``) does at runtime, so the build and assert units
+(and the two-build proof) open with ``BIND_INPUTS`` (``sane_bind``): under
+``/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc`` it checks
+that HEAD is the verified preflight commit (``PREFLIGHT_SHA``, step env) and
+that each bound file's content (``/usr/bin/git hash-object --no-filters``) is
+the blob that commit records (``--no-replace-objects``). Index flags
+(assume-unchanged, skip-worktree), an in-job commit and a repository
+redirection in the job environment cannot hide a rewrite from it. The
+declaration is read and the asserter run by the same absolute, sanitized
+interpreter (``SANE_FEATURES``, ``SANE_REQUIRE``, ``SANE_ASSERT``), and the
+units' own shell is ``SANE_SHELL``: an absolute ``/bin/bash`` in POSIX mode,
+which reads no startup file, so neither a PATH entry nor an environment value
+an earlier step added runs before or instead of them (an exported function
+cannot shadow an absolute path). What remains trusted is the runner image and
+the pinned toolchain action that provides ``cargo``. In the Dockerfile the
+asserter COPY is pinned immediately before the declaration COPY
+(``DOCKER_ASSERTER_COPY``), which is pinned immediately before the build RUN,
+so no instruction can rewrite either file between its COPY and the RUN that
+reads it. The runtime self-test applies every tamper form (``TAMPER_FORMS``).
 
 Exit codes: 0 = guard passes, 1 = guard failure (or self-test / sweep failure),
 2 = usage error or unreadable input (non-UTF-8, a directory or a symlink loop
@@ -214,11 +223,6 @@ HERE = Path(__file__).resolve().parent
 
 ALLOWED_FEATURES = 'FEATURES="$(bash scripts/release-features.sh)"'
 ALLOWED_REQUIRE = 'REQUIRE_FLAGS="$(bash scripts/release-features.sh --require-flags)"'
-# #4768: before the build reads the declaration and before the assert runs the
-# asserter, both files must be the checked-out commit's (an earlier step, an
-# action or a restored cache could have rewritten either; `git diff --quiet`
-# exits 1 on any difference or deletion, which aborts the step under `set -e`).
-BIND_INPUTS = "git diff --quiet HEAD -- scripts/release-features.sh scripts/assert-compiled-features.sh"
 # #6275: the bound forms. Every interpreter is an absolute path and runs under
 # `env -i` with a fixed PATH, so neither a job-level environment value (a
 # startup file, a repository redirection, an exported function) nor a PATH
@@ -248,9 +252,12 @@ SANE_FEATURES = 'FEATURES="$(' + SANE_BASH + ' scripts/release-features.sh)"'
 SANE_REQUIRE = 'REQUIRE_FLAGS="$(' + SANE_BASH + ' scripts/release-features.sh --require-flags)"'
 SANE_ASSERT = SANE_BASH + ' scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS'
 # The shell the bound units (build, assert, two-build proof) run under.
-BOUND_SHELL = "bash"
+BOUND_SHELL = SANE_SHELL
 ALLOWED_BIN = 'bin="target/${{ matrix.target }}/release/${{ matrix.artifact }}"'
-ASSERT_WORKFLOW = 'bash scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS'
+# #4768 / #6275: before the build reads the declaration and before the assert
+# runs the asserter, both files must be the verified commit's (fatal under -e).
+BIND_INPUTS = SANE_BIND_INPUTS
+ASSERT_WORKFLOW = SANE_ASSERT
 ASSERT_DOCKER = "bash scripts/assert-compiled-features.sh target/release/ai-memory --strict $REQUIRE_FLAGS"
 BUILD_CMD = 'cargo build --locked --release --target ${{ matrix.target }} --features "$FEATURES"'
 SHAPE_BUILD_CMD = 'cargo build --locked --release --features "$FEATURES"'
@@ -281,8 +288,8 @@ REMAP_STATEMENTS = ('RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefi
 
 # The exact statements (after normalisation) of each unit that decides what ships.
 WF_BUILD = (("set -euo pipefail", BIND_INPUTS) + EPOCH_STATEMENTS + REMAP_STATEMENTS
-            + (ALLOWED_FEATURES, 'test -n "$FEATURES"', BUILD_CMD))
-WF_ASSERT = ("set -euo pipefail", BIND_INPUTS, ALLOWED_BIN, ALLOWED_REQUIRE, 'test -n "$REQUIRE_FLAGS"',
+            + (SANE_FEATURES, 'test -n "$FEATURES"', BUILD_CMD))
+WF_ASSERT = ("set -euo pipefail", BIND_INPUTS, ALLOWED_BIN, SANE_REQUIRE, 'test -n "$REQUIRE_FLAGS"',
              ASSERT_WORKFLOW) + ASSERT_RECORD
 WF_PACKAGE = (
     "set -euo pipefail",
@@ -550,18 +557,19 @@ REPRO_JOB: Dict[str, Spec] = {
     "permissions": dict(_READ),
 }
 REPRO_TARGET = "x86_64-unknown-linux-gnu"
-REPRO_BIND = "git diff --quiet HEAD -- scripts/release-features.sh scripts/release/reproducible_build.py"
-REPRO_PROOF = ('python3 scripts/release/reproducible_build.py --target ' + REPRO_TARGET
+REPRO_BIND = SANE_REPRO_BIND
+REPRO_PROOF = ('/usr/bin/python3 scripts/release/reproducible_build.py --target ' + REPRO_TARGET
                + ' --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b"'
                + ' --sha256-output "$GITHUB_OUTPUT"')
 REPRO_STEPS: List[Spec] = [
     {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
     {"name": "Install Rust 1.98.0", "uses": RUST_TOOLCHAIN_USES, "with": {"toolchain": "1.98.0"}},
-    {"name": "Build twice from two workspaces and compare (#3613)", "id": "proof", "shell": "bash", "run": Block((
+    {"name": "Build twice from two workspaces and compare (#3613)", "id": "proof", "shell": SANE_SHELL, "env": dict(BIND_ENV),
+     "run": Block((
         "set -euo pipefail",
-        "# #4768 — the declaration and the proof script are HEAD's.",
+        "# #4768 / #6275 — the declaration and the proof script are the verified commit's.",
         REPRO_BIND,
-        ALLOWED_FEATURES,
+        SANE_FEATURES,
         'test -n "$FEATURES"',
         REPRO_PROOF,
     ))},
@@ -662,7 +670,8 @@ DOCKER_INSTRUCTIONS = frozenset((
 ))
 
 KEYS_SHELL = ("name", "shell", "run")
-KEYS_ASSERT = ("name", "id", "shell", "run")
+KEYS_BOUND = ("name", "shell", "env", "run")
+KEYS_ASSERT = ("name", "id", "shell", "env", "run")
 KEYS_PACKAGE = ("name", "shell", "env", "run")
 KEYS_PLAIN = ("name", "run")
 TOP_KEYS = ("name", "on", "permissions", "concurrency", "jobs")
@@ -712,7 +721,7 @@ BUILD_TOOL_RE = re.compile(r"(?<![\w.-])(?:cargo-zigbuild|cargo|rustc|cross)(?![
 SBOM_TOOL_RE = re.compile(r"(?<![\w-])cargo(?![\w-]).*?\scyclonedx(?![\w-])", re.I)
 # Quote and backslash characters bash removes inside a word (`c''argo`, `ca\rgo`).
 QUOTE_RE = re.compile(r"['\"\\]")
-INLINE_USE_RE = re.compile(r"\$\(\s*bash [^)]*release-features\.sh|`\s*bash [^`]*release-features\.sh")
+INLINE_USE_RE = re.compile(r"\$\([^)]*release-features\.sh|`[^`]*release-features\.sh")
 # C0/C1 controls (tab excepted: the YAML parser refuses it itself), every Unicode
 # space other than U+0020 (NBSP, ogham, en/em..., narrow NBSP, math space,
 # ideographic), zero-width characters and the BOM, line/paragraph separators.
@@ -1158,7 +1167,7 @@ def step_problem(step: Node, want_keys: Tuple[str, ...], expected: Tuple[str, ..
     if run is None or run.kind != "block" or run.style != "|":
         why.bad("`run:` must be a literal block (`run: |`); a folded, quoted or inline run is refused")
     shell = step.get("shell")
-    if "shell" in want_keys and (shell is None or shell.style != "plain" or shell.text() != "bash"):
+    if "shell" in want_keys and "shell" not in (pins or {}) and (shell is None or shell.style != "plain" or shell.text() != "bash"):
         why.bad(f"`shell: {shell.text() if shell is not None else ''}` (only an unquoted `shell: bash` is allowed)")
     got = norm(run_lines(step))
     if got != expected:
@@ -1270,9 +1279,10 @@ def check_release_job(job: Node, rep: Report) -> None:
     check_matrix(job, rep)
     steps = job_steps(job, "release.yml release job", rep)
     units = {
-        "build": one_unit(steps, KEYS_SHELL, WF_BUILD, "release.yml: the release job build", rep, "WF_BUILD"),
+        "build": one_unit(steps, KEYS_BOUND, WF_BUILD, "release.yml: the release job build", rep, "WF_BUILD",
+                          pins={"shell": SANE_SHELL, "env": BIND_ENV}),
         "assert": one_unit(steps, KEYS_ASSERT, WF_ASSERT, "release.yml: the release job strict assert", rep, "WF_ASSERT",
-                           pins={"id": ASSERT_ID}),
+                           pins={"id": ASSERT_ID, "shell": SANE_SHELL, "env": BIND_ENV}),
         "package": one_unit(steps, KEYS_PACKAGE, WF_PACKAGE, "release.yml: the release job hash-bound package", rep,
                             "WF_PACKAGE", pins={"env": PACKAGE_ENV}),
     }
@@ -1731,7 +1741,8 @@ def check_inline_use(name: str, text: str, rep: Report) -> None:
     """Every use of the declaration is its own assignment (a failing declaration
     inside a substitution in another command would be swallowed)."""
     for ln in logical_lines(text.split("\n")):
-        stripped = ln.replace(ALLOWED_FEATURES, "").replace(ALLOWED_REQUIRE, "").replace(ALLOWED_REQUIRE_IMAGE, "")
+        stripped = (ln.replace(SANE_FEATURES, "").replace(SANE_REQUIRE, "").replace(ALLOWED_FEATURES, "")
+                    .replace(ALLOWED_REQUIRE, "").replace(ALLOWED_REQUIRE_IMAGE, ""))
         if INLINE_USE_RE.search(stripped):
             rep.bad(f"{name}: inline use of the declaration (a failure would be swallowed; assign it in its own statement): {ln[:80]}")
 
@@ -1893,16 +1904,16 @@ def mk_root(src: Path, dst: Path) -> None:
 
 
 IND = "          "
-ASSIGN = IND + ALLOWED_FEATURES + "\n"
+ASSIGN = IND + SANE_FEATURES + "\n"
 REL_BUILD = ASSIGN + IND + 'test -n "$FEATURES"\n' + IND + BUILD_CMD
 REL_BUILD_CMD = IND + BUILD_CMD
 REL_ASSERT = IND + ASSERT_WORKFLOW
 BIN_LINE = IND + ALLOWED_BIN
 ASSERT_NAME = '      - name: "Assert compiled features (#2676, #2728)"\n'
-ASSERT_HDR = ASSERT_NAME + "        id: assert\n        shell: bash\n"
-ASSERT_RUN = ASSERT_HDR + "        run: |\n"
+ASSERT_HDR = ASSERT_NAME + "        id: assert\n        shell: " + SANE_SHELL + "\n"
+BIND_ENV_LINES = "        env:\n          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}\n"
+ASSERT_RUN = ASSERT_HDR + BIND_ENV_LINES + "        run: |\n"
 BUILD_HDR = "      - name: Build release binary\n"
-BUILD_SHELL = "        shell: bash\n        run: |\n          set -euo pipefail\n"
 SBOM_HDR = "      - name: Generate CycloneDX SBOM (JSON)\n"
 SBOM_LINE = IND + SBOM_CMD
 PKG_HDR = "      - name: Package binary\n"
@@ -1918,13 +1929,12 @@ SANE_BIND_LINE = IND + SANE_BIND_INPUTS + "\n"
 OLD_BIND_LINE = IND + "git diff --quiet HEAD -- scripts/release-features.sh scripts/assert-compiled-features.sh\n"
 OLD_ASSERT = 'bash scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS'
 SANE_SHELL_LINE = "        shell: " + SANE_SHELL + "\n"
-BIND_ENV_LINES = "        env:\n          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}\n"
 # #3613: the reproducible-build proof job and the deterministic inputs of the
 # release build (SOURCE_DATE_EPOCH, remapped paths).
 REPRO_SCRIPT = "scripts/release/reproducible_build.py"
 REPRO_HDR = "\n  reproducible:\n"
 PROOF_STEP_NAME = "      - name: Build twice from two workspaces and compare (#3613)\n"
-PROOF_CMD = ('python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" '
+PROOF_CMD = ('/usr/bin/python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" '
              '--workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT"')
 EPOCH_LINES = IND + 'SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"\n' + IND + "export SOURCE_DATE_EPOCH\n"
 REMAP_LINES = (IND + 'RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"\n'
@@ -2408,7 +2418,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "3613 proof job restores a build cache": ("fail", [_rel(
         BUILD_HDR, _edit_all(PROOF_STEP_NAME, "      - uses: " + RUST_CACHE_USES + " # v2\n\n" + PROOF_STEP_NAME))]),
     "3613 proof step does not bind the proof script to HEAD": ("fail", [_rel(
-        BUILD_HDR, _edit_all(IND + "git diff --quiet HEAD -- scripts/release-features.sh scripts/release/reproducible_build.py\n", ""))]),
+        BUILD_HDR, _edit_all(IND + SANE_REPRO_BIND + "\n", ""))]),
     "3613 release build without SOURCE_DATE_EPOCH": ("fail", [_rel(BUILD_HDR, _in_build_step(_edit_all(EPOCH_LINES, "")))]),
     "3613 release build without remapped paths": ("fail", [_rel(BUILD_HDR, _in_build_step(_edit_all(REMAP_LINES, "")))]),
     "3613 release build remaps the workspace only": ("fail", [_rel(BUILD_HDR, _in_build_step(_edit_all(
@@ -2457,17 +2467,17 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "N14 hash -p shadows bash": ("fail", _before_assert(IND + "hash -p /usr/bin/true bash")),
     "N14b exec before the assert": ("fail", _before_assert(IND + "exec true")),
     "N15 assert step rewrites the declaration": ("fail", [_rel(
-        IND + ALLOWED_REQUIRE, IND + "sed -i.bak s/,sal-postgres// scripts/release-features.sh\n" + IND + ALLOWED_REQUIRE)]),
+        IND + SANE_REQUIRE, IND + "sed -i.bak s/,sal-postgres// scripts/release-features.sh\n" + IND + SANE_REQUIRE)]),
     "N16 extra statement after the assert": ("fail", [_rel(REL_ASSERT, REL_ASSERT + "\n" + IND + "true")]),
     "N16b statements reordered": ("fail", [_rel(
-        BIN_LINE + "\n" + IND + ALLOWED_REQUIRE, IND + ALLOWED_REQUIRE + "\n" + BIN_LINE)]),
+        BIN_LINE + "\n" + IND + SANE_REQUIRE, IND + SANE_REQUIRE + "\n" + BIN_LINE)]),
     "N17 comment line inside a continuation hides the assert": ("fail", [_rel(
         REL_ASSERT, IND + "echo hi \\\n" + IND + "# x \\\n" + REL_ASSERT)]),
     "N18 step key written as a flow mapping": ("fail", [_rel(ASSERT_HDR, ASSERT_NAME + "        {shell: bash}\n")]),
     "N19 run block with inconsistent indentation": ("fail", [_rel(BIND_LINE + BIN_LINE, BIND_LINE + "         " + ALLOWED_BIN)]),
     "N20 duplicate step key": ("fail", _hdr_key(ASSERT_HDR, "shell: bash")),
     "N21 extra step key": ("fail", _hdr_key(ASSERT_HDR, "timeout-minutes: 5")),
-    "N22 inline run value": ("fail", [_rel(ASSERT_RUN, ASSERT_HDR + "        run: " + ASSERT_WORKFLOW + "\n" + "          true\n")]),
+    "N22 inline run value": ("fail", [_rel(ASSERT_RUN, ASSERT_HDR + BIND_ENV_LINES + "        run: " + ASSERT_WORKFLOW + "\n" + "          true\n")]),
     "N23 step carries only the first key as a dash line with extra spaces": ("fail", [_rel(
         ASSERT_NAME, "      -   name: Assert compiled features\n")]),
     # --- R1 / F2: the assert is pinned to the release binary
@@ -2490,8 +2500,8 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "R4 continue-on-error on the assert step": ("fail", _hdr_key(ASSERT_NAME, "continue-on-error: true")),
     "R4 step-level if: on the build step": ("fail", _hdr_key(BUILD_HDR, "if: matrix.os != 'macos-latest'")),
     "R4 continue-on-error on the SBOM step": ("fail", _hdr_key(SBOM_HDR, "continue-on-error: true")),
-    "R4 non-bash shell on the assert step": ("fail", [_rel(ASSERT_HDR, ASSERT_HDR.replace("shell: bash", "shell: sh"))]),
-    "R4 non-bash shell on the build step": ("fail", [_rel(BUILD_SHELL, BUILD_SHELL.replace("shell: bash", "shell: sh"))]),
+    "R4 non-bash shell on the assert step": ("fail", [_rel(BUILD_HDR, _in_assert_step(_edit_all(SANE_SHELL_LINE, "        shell: sh\n")))]),
+    "R4 non-bash shell on the build step": ("fail", [_rel(BUILD_HDR, _in_build_step(_edit_all(SANE_SHELL_LINE, "        shell: sh\n")))]),
     "R4 assert || true": ("fail", [_rel(REL_ASSERT, REL_ASSERT + " || true")]),
     "R4 assert followed by || on the next line": ("fail", [_rel(REL_ASSERT, REL_ASSERT + " ||\n" + IND + "true")]),
     "R4 build || true": ("fail", [_rel(REL_BUILD_CMD, REL_BUILD_CMD + " || true")]),

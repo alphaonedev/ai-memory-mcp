@@ -340,17 +340,21 @@ jobs:
         # --locked (#2895): build against the COMMITTED Cargo.lock exactly.
         # A release must never silently resolve a newer transitive dependency
         # than the one that was reviewed/audited on the branch.
-        shell: bash
+        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}
+        env:
+          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}
         run: |
           set -euo pipefail
-          # #4768 — the declaration this step reads and the asserter the next
-          # step runs must be the checked-out commit's: an earlier step, an
-          # action or a restored cache that rewrote either would narrow the
-          # feature set consistently for the build AND the assert, so the
-          # strict assert would pass on a binary missing the advertised tier.
-          # `git diff --quiet` exits 1 on any change or deletion (fatal under
-          # -e). The static guard cannot see runtime rewrites; this can.
-          git diff --quiet HEAD -- scripts/release-features.sh scripts/assert-compiled-features.sh
+          # #4768 / #6275 — the declaration this step reads and the asserter
+          # the next step runs must be the verified preflight commit's: an
+          # earlier step or action that rewrote either would narrow the
+          # feature set consistently for the build AND the assert. The check
+          # compares each file's content with the blob PREFLIGHT_SHA records
+          # (index flags and an in-job commit cannot hide a rewrite) and HEAD
+          # with PREFLIGHT_SHA, in an `env -i` shell with absolute paths (no
+          # job-level environment value or PATH entry reaches it). The step
+          # shell is an absolute bash in POSIX mode (no startup file).
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release-features.sh scripts/assert-compiled-features.sh; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
           # #3613 — deterministic inputs, the same ones the `reproducible` job
           # below builds with twice: the tagged commit's own timestamp (the SBOM
           # job's lever) and runner paths remapped out of the binary, so the
@@ -362,20 +366,23 @@ jobs:
           # Own statement: a failing declaration aborts here under -e (a
           # substitution inside the cargo arguments would be swallowed and the
           # build would silently use default features).
-          FEATURES="$(bash scripts/release-features.sh)"
+          FEATURES="$(/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/release-features.sh)"
           test -n "$FEATURES"
           cargo build --locked --release --target ${{ matrix.target }} --features "$FEATURES"
 
       - name: "Assert compiled features (#2676, #2728)"
         id: assert
-        shell: bash
+        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}
+        env:
+          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}
         run: |
           set -euo pipefail
-          # #4768 — same bind as the build step, re-checked here because a step
-          # ran in between: the asserter and the declaration are HEAD's.
-          git diff --quiet HEAD -- scripts/release-features.sh scripts/assert-compiled-features.sh
+          # #4768 / #6275 — same bind as the build step, re-checked here because
+          # a step ran in between: the asserter and the declaration are the
+          # verified commit's, read and run by an absolute, sanitized bash.
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release-features.sh scripts/assert-compiled-features.sh; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
           bin="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
-          REQUIRE_FLAGS="$(bash scripts/release-features.sh --require-flags)"
+          REQUIRE_FLAGS="$(/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/release-features.sh --require-flags)"
           test -n "$REQUIRE_FLAGS"
           # #2728 / #4719 — EVERY release target runs the strict exact-set
           # `ai-memory features` self-report, on a runner that executes the
@@ -385,7 +392,7 @@ jobs:
           # run on its runner fails this step (fail closed), and
           # scripts/check_release_features.py refuses a conditional assert.
           # shellcheck disable=SC2086 # word-splitting the --require flags is intended
-          bash scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS
+          /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS
           # #4752 — record WHICH bytes passed the assert; the package step
           # refuses any other file (shasum: present on the Linux and macOS
           # runners alike).
@@ -607,14 +614,16 @@ jobs:
 
       - name: Build twice from two workspaces and compare (#3613)
         id: proof
-        shell: bash
+        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}
+        env:
+          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}
         run: |
           set -euo pipefail
-          # #4768 — the declaration and the proof script are HEAD's.
-          git diff --quiet HEAD -- scripts/release-features.sh scripts/release/reproducible_build.py
-          FEATURES="$(bash scripts/release-features.sh)"
+          # #4768 / #6275 — the declaration and the proof script are the verified commit's.
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release-features.sh scripts/release/reproducible_build.py; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
+          FEATURES="$(/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/release-features.sh)"
           test -n "$FEATURES"
-          python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT"
+          /usr/bin/python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT"
 
   # --------------------------------------------------------------------
   # #1973 (v1.0 supply-chain, epic #1940) - CycloneDX SBOM per release.
