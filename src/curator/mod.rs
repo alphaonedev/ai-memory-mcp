@@ -670,6 +670,16 @@ fn run_consolidation_pass(
     if !cfg.compaction.enabled {
         return;
     }
+    // #3170 — the #3116 halt applies to the LIVE consolidator too. When the
+    // autonomy passes already lost a rollback-log write this cycle, the log
+    // is not trusted to make another destructive merge reversible, so the
+    // SAL pass does not start: no LLM spend, no merge, sources untouched.
+    if report.autonomy.rollback_log_degraded {
+        report
+            .errors
+            .push(CONSOLIDATION_PASS_SKIPPED_ROLLBACK_DEGRADED.to_string());
+        return;
+    }
     // ERRORS-08 / CONCURRENCY-22 / #3244 — nested `Runtime::block_on`
     // panics on a *current-thread* worker (`#[tokio::test]` default).
     // `Handle::try_current()` is the wrong probe: a `spawn_blocking`
@@ -704,7 +714,13 @@ fn run_consolidation_pass(
         /* dry_run = */ cfg.dry_run,
     )
     // #1750 — thread the operator-resolved cosine gate into the clusterer.
-    .with_cosine_threshold(cfg.compaction.cosine_threshold);
+    .with_cosine_threshold(cfg.compaction.cosine_threshold)
+    // #3170 — `max_ops_per_cycle` is a hard cap on LLM-invoking ops per
+    // cycle; hand the pass only what is left after the passes before it.
+    .with_llm_op_budget(
+        cfg.max_ops_per_cycle
+            .saturating_sub(report.operations_attempted),
+    );
     let drive_pass = || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -765,11 +781,30 @@ fn run_consolidation_pass(
             // SAL-specific counters (no AutonomyPassReport home).
             report.compaction_pass_clusters_eligible += out.eligible_clusters;
             report.compaction_pass_rolled_back += out.rolled_back;
+            // #3170 — charge the pass's LLM ops to the cycle and fold its own
+            // write-ahead failures into the cycle's degraded flag.
+            report.operations_attempted = report
+                .operations_attempted
+                .saturating_add(out.operations_attempted);
+            report.operations_skipped_cap = report
+                .operations_skipped_cap
+                .saturating_add(out.operations_skipped_cap);
+            if out.rollback_write_ahead_failed {
+                report.autonomy.rollback_log_degraded = true;
+            }
             report.errors.extend(out.errors);
         }
         Err(e) => report.errors.push(e),
     }
 }
+
+/// #3170 — operator-visible skip when the cycle's rollback log is already
+/// degraded: the SAL consolidator does not start. One named const so the
+/// production skip and the assertion share a single spelling.
+#[cfg(feature = "sal")]
+const CONSOLIDATION_PASS_SKIPPED_ROLLBACK_DEGRADED: &str = "consolidation pass: skipped — the \
+     rollback log is degraded this cycle (a rollback write failed), so no further destructive \
+     merge can be made reversible; deferred to the next cycle";
 
 /// Operator-visible skip when `run_once` is on a thread that is *driving*
 /// a tokio runtime (`enter_runtime`). `spawn_blocking` is NOT this case

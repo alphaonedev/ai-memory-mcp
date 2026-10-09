@@ -751,7 +751,10 @@ async fn store_backed_consolidation_sweep(
 
     // #1750 — thread the operator-resolved cosine gate into the clusterer.
     let pass = curator::compaction::ConsolidationPass::new(store, llm, cfg.dry_run)
-        .with_cosine_threshold(cfg.compaction.cosine_threshold);
+        .with_cosine_threshold(cfg.compaction.cosine_threshold)
+        // #3170 — the sweep's LLM calls are capped by `max_ops_per_cycle`
+        // (no autonomy passes run before this one on the store-backed path).
+        .with_llm_op_budget(cfg.max_ops_per_cycle);
     match pass.run(&candidates).await {
         Ok(out) => {
             // Preserve any list/namespace errors gathered above.
