@@ -8968,6 +8968,15 @@ pub async fn sync_cycle_once(
     // `sync_state.peer_id`, every backup or every `VACUUM INTO` snapshot.
     let peer_key = crate::url_display::url_origin_and_path(peer_url);
     let peer_key = peer_key.as_str();
+    // #6101 — an ambiguous or unparseable peer URL renders a CONSTANT, so
+    // two such peers would share one cursor row (and the #3675 heal below
+    // would fold both raw rows into it). Refuse before sync_state is read.
+    if !crate::url_display::origin_and_path_is_durable_key(peer_url) {
+        anyhow::bail!(
+            "peer {peer_key} refused: its URL has no unique sync_state key \
+             (ambiguous or unparseable authority; percent-encode the userinfo) (#6101)"
+        );
+    }
 
     // --- PULL --------------------------------------------------------
     let since = {

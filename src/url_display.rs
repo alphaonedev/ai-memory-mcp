@@ -194,6 +194,19 @@ pub fn url_origin_and_path(url: &str) -> String {
     }
 }
 
+/// `true` when [`url_origin_and_path`] renders `url` as a key that names
+/// this URL alone, so it can be a DURABLE key (`sync_state.peer_id`, #3675).
+///
+/// `false` for an ambiguous authority (rendered as the constant
+/// `scheme://<redacted-authority>`, #6101) and for an unparseable URL
+/// (rendered as the constant `scheme://<unparseable>`): every such URL
+/// renders the same text, so two of them would share one cursor row.
+#[must_use]
+pub fn origin_and_path_is_durable_key(url: &str) -> bool {
+    let trimmed = url.trim();
+    reqwest::Url::parse(trimmed).is_ok_and(|parsed| !origin_and_path_is_ambiguous(trimmed, &parsed))
+}
+
 /// `true` when `url` PARSES to a URL whose path, query or fragment holds an
 /// `@` - the ambiguous-authority shape (#6096).
 ///
@@ -642,6 +655,21 @@ mod tests {
             let url = format!("https://svc:123{d}SECRETX6101pw@peer.example/mesh");
             assert_eq!(url_origin(&url), "https://<redacted-authority>", "{url:?}");
         }
+    }
+
+    #[test]
+    fn durable_key_only_for_a_unique_rendering_6101() {
+        for url in [
+            "https://peer.example:9077/mesh",
+            "https://alice:s3cr3t@peer.example/mesh",
+            "https://host/a@b",
+        ] {
+            assert!(origin_and_path_is_durable_key(url), "{url:?}");
+        }
+        for url in ambiguous_peer_urls_6101() {
+            assert!(!origin_and_path_is_durable_key(&url), "{url:?}");
+        }
+        assert!(!origin_and_path_is_durable_key("https://h:99999/a"));
     }
 
     #[test]
