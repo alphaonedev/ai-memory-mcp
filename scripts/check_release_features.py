@@ -164,10 +164,17 @@ characters (CR, form feed, NUL...), NBSP and every other Unicode space or zero-w
 workflows or Dockerfile are refused, never folded: Python, YAML and bash
 disagree on what a line and a blank are.
 
-OUT OF SCOPE (tracked): an action step (``uses:``) or a shared cache poisoning
-the environment or rewriting the declaration before the allowed units run
-(#4768); the whole-job pin sees every ``run:`` line but not what an action
-does at runtime.
+RUNTIME BIND (#4768). The whole-job pin sees every ``run:`` line but not what
+an action (``uses:``) or a restored cache does at runtime, so the build and
+assert units themselves open with ``BIND_INPUTS``: ``git diff --quiet HEAD --
+scripts/release-features.sh scripts/assert-compiled-features.sh``, fatal
+under ``set -e`` on any change or deletion of the declaration or the
+asserter after checkout. In the Dockerfile the asserter COPY is pinned
+immediately before the declaration COPY (``DOCKER_ASSERTER_COPY``), which is
+pinned immediately before the build RUN, so no instruction can rewrite either
+file between its COPY and the RUN that reads it. Still OUT OF SCOPE: an
+action that replaces ``git`` or ``bash`` on PATH, or the shell's own
+environment (``BASH_ENV`` is refused textually only).
 
 Exit codes: 0 = guard passes, 1 = guard failure (or self-test / sweep failure),
 2 = usage error or unreadable input (non-UTF-8, a directory or a symlink loop
@@ -220,8 +227,9 @@ PACKAGE_CHECK = ('test "$packaged_sha256" = "$ASSERTED_SHA256" || { echo "::erro
                  + ' ($packaged_sha256) is not the binary the strict assert checked ($ASSERTED_SHA256)"; exit 1; }')
 
 # The exact statements (after normalisation) of each unit that decides what ships.
-WF_BUILD = ("set -euo pipefail", ALLOWED_FEATURES, 'test -n "$FEATURES"', BUILD_CMD)
-WF_ASSERT = ("set -euo pipefail", ALLOWED_BIN, ALLOWED_REQUIRE, 'test -n "$REQUIRE_FLAGS"', ASSERT_WORKFLOW) + ASSERT_RECORD
+WF_BUILD = ("set -euo pipefail", BIND_INPUTS, ALLOWED_FEATURES, 'test -n "$FEATURES"', BUILD_CMD)
+WF_ASSERT = ("set -euo pipefail", BIND_INPUTS, ALLOWED_BIN, ALLOWED_REQUIRE, 'test -n "$REQUIRE_FLAGS"',
+             ASSERT_WORKFLOW) + ASSERT_RECORD
 WF_PACKAGE = (
     "set -euo pipefail",
     "mkdir -p dist",
@@ -1581,6 +1589,10 @@ def check_dockerfile(text: str, rep: Report) -> None:
     if builder[-2:-1] != [DOCKER_DECL_COPY]:
         rep.bad(f"Dockerfile: the builder stage must `{DOCKER_DECL_COPY}` immediately before the build RUN"
                 + pin_hint("DOCKER_DECL_COPY"))
+    if builder[-3:-2] != [DOCKER_ASSERTER_COPY]:
+        rep.bad(f"Dockerfile: the builder stage must `{DOCKER_ASSERTER_COPY}` immediately before the declaration COPY "
+                "(#4768: an instruction between the asserter COPY and the build RUN could rewrite the asserter)"
+                + pin_hint("DOCKER_ASSERTER_COPY"))
     if builder[-1:] != [DOCKER_RUN]:
         rep.bad("Dockerfile: the builder stage must END with exactly the allowed build+assert RUN (nothing after it); "
                 + docker_nearest(builder) + pin_hint("DOCKER_RUN"))
@@ -2187,8 +2199,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "N17 comment line inside a continuation hides the assert": ("fail", [_rel(
         REL_ASSERT, IND + "echo hi \\\n" + IND + "# x \\\n" + REL_ASSERT)]),
     "N18 step key written as a flow mapping": ("fail", [_rel(ASSERT_HDR, ASSERT_NAME + "        {shell: bash}\n")]),
-    "N19 run block with inconsistent indentation": ("fail", [_rel(
-        IND + "set -euo pipefail\n" + BIN_LINE, IND + "set -euo pipefail\n" + "         " + ALLOWED_BIN)]),
+    "N19 run block with inconsistent indentation": ("fail", [_rel(BIND_LINE + BIN_LINE, BIND_LINE + "         " + ALLOWED_BIN)]),
     "N20 duplicate step key": ("fail", _hdr_key(ASSERT_HDR, "shell: bash")),
     "N21 extra step key": ("fail", _hdr_key(ASSERT_HDR, "timeout-minutes: 5")),
     "N22 inline run value": ("fail", [_rel(ASSERT_RUN, ASSERT_HDR + "        run: " + ASSERT_WORKFLOW + "\n" + "          true\n")]),
@@ -2773,7 +2784,11 @@ def self_test(root: Path) -> int:
         # --- runtime fail-closed: a failing/empty declaration must abort the
         # allowed build step and the Dockerfile RUN under `set -e`. (The guard
         # pins the real files to these exact statements, see the unmutated case.)
-        build_body = "\n".join(WF_BUILD).replace("${{ matrix.target }}", "x").replace("cargo build", "echo cargo-build")
+        # The #4768 bind is proven on its own below (this scratch dir is not a
+        # checkout); here it is replaced so the declaration abort stays what is
+        # measured.
+        build_body = ("\n".join(WF_BUILD).replace("${{ matrix.target }}", "x").replace("cargo build", "echo cargo-build")
+                      .replace(BIND_INPUTS, "true"))
         docker_body = (
             DOCKER_RUN[len("RUN ") :]
             .replace("cargo build", "echo cargo-build")
