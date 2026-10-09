@@ -526,6 +526,72 @@ mod tests {
         }
     }
 
+    /// #6101 - federation peer / webhook URLs whose userinfo holds an
+    /// unencoded `/`, `?` or `#`: leading delimiter in the password, the
+    /// delimiter in a `user:password` username, and a secret before the
+    /// delimiter (the parsed host is then credential bytes).
+    fn ambiguous_peer_urls_6101() -> Vec<String> {
+        let mk = "SECRETX6101";
+        let mut out = Vec::new();
+        for d in ['/', '?', '#'] {
+            out.push(format!("https://svc:{d}{mk}pw@peer.example:9077/mesh/a"));
+            out.push(format!(
+                "https://svc{d}{mk}user:pw@peer.example:9077/mesh/a"
+            ));
+            out.push(format!("https://svc:a@{mk}{d}x@peer.example:9077/mesh/a"));
+        }
+        out.push(format!("https://svc:a@{mk}\\x@peer.example/mesh"));
+        out.push(format!("HTTPS://svc:/{mk}pw@peer.example/mesh"));
+        out.push(format!("https:\t//svc:/{mk}pw@peer.example/mesh"));
+        out.push(format!("https:/svc:/{mk}pw@peer.example/mesh"));
+        out
+    }
+
+    #[test]
+    fn origin_and_path_redact_an_ambiguous_authority_6101() {
+        for url in ambiguous_peer_urls_6101() {
+            for (name, f) in [
+                ("url_origin", url_origin as fn(&str) -> String),
+                ("url_origin_and_path", url_origin_and_path),
+            ] {
+                let r = f(&url);
+                assert!(
+                    !r.to_ascii_lowercase().contains("secretx6101"),
+                    "#6101: {name} rendered credential bytes of {url:?}: {r:?}"
+                );
+                assert_eq!(r, "https://<redacted-authority>", "{name} {url:?}");
+            }
+        }
+    }
+
+    /// `url_origin` shows no path, so it fails closed on ANY `@` after the
+    /// authority: a numeric-prefixed password (`svc:123/<pw>@host`) parses
+    /// as port `123`.
+    #[test]
+    fn origin_fails_closed_on_a_numeric_prefixed_password_6101() {
+        for d in ['/', '?', '#'] {
+            let url = format!("https://svc:123{d}SECRETX6101pw@peer.example/mesh");
+            assert_eq!(url_origin(&url), "https://<redacted-authority>", "{url:?}");
+        }
+    }
+
+    #[test]
+    fn origin_and_path_keeps_a_legitimate_at_sign_in_the_path_6101() {
+        assert_eq!(url_origin_and_path("https://host/a@b"), "https://host/a@b");
+        assert_eq!(
+            url_origin_and_path("https://peer.example:9077/mesh/a@b?token=qpw"),
+            "https://peer.example:9077/mesh/a@b"
+        );
+        assert_eq!(
+            url_origin_and_path("https://[::1]:9077/mesh/a@b"),
+            "https://[::1]:9077/mesh/a@b"
+        );
+        assert_eq!(
+            url_origin_and_path("https://alice:s3cr3t@peer.example/mesh"),
+            "https://peer.example/mesh"
+        );
+    }
+
     #[test]
     fn transport_failure_tokens_are_closed_vocabulary_3710() {
         assert_eq!(TransportFailure::Status(503).token(), "http_503");
