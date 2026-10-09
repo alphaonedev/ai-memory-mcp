@@ -318,7 +318,10 @@ WF_SBOM = ("set -euo pipefail",) + EPOCH_STATEMENTS + (
     "sha256sum ai-memory.cdx.json > ai-memory.cdx.json.sha256",
     "ls -la ai-memory.cdx.json*",
 )
-SHAPE_BUILD = ("set -euo pipefail", ALLOWED_FEATURES, 'test -n "$FEATURES"', SHAPE_BUILD_CMD)
+# #6284: the release-shape build IS the release build (one constant): the same
+# bind, deterministic inputs and sanitized declaration read; only the cargo
+# command drops the cross `--target` (the proof reads target/release).
+SHAPE_BUILD = WF_BUILD[:-1] + (SHAPE_BUILD_CMD,)
 # #6277: the build RUN first checks the copied declaration and asserter against
 # sha256 digests the guard computes from the tree it checks (run_guard), so an
 # image build whose context differs from the reviewed files fails at its first
@@ -1920,8 +1923,8 @@ def check_shape(text: str, rep: Report, advisory: Optional[bool] = None) -> None
                 f"{GUARD_PATH} (#4720: the job is required, a failing proof must fail the run)")
     steps = job_steps(job, "release-shape.yml release-shape job", rep)
     units = {
-        "build": one_unit(steps, KEYS_SHELL, SHAPE_BUILD, "release-shape.yml: the `release-shape:` job build", rep,
-                          "SHAPE_BUILD"),
+        "build": one_unit(steps, KEYS_BOUND, SHAPE_BUILD, "release-shape.yml: the `release-shape:` job build", rep,
+                          "SHAPE_BUILD", pins={"shell": SANE_SHELL, "env": SHAPE_BIND_ENV}),
         "proof": one_unit(steps, KEYS_BOUND, SHAPE_PROOF, "release-shape.yml: the `release-shape:` job pg proof "
                           "(an executing, bound `scripts/release-shape-pg-proof.sh` run step; the `paths:` filter "
                           "does not count)", rep, "SHAPE_PROOF", _shape_norm,
