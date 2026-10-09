@@ -2138,6 +2138,12 @@ def _self_test_cases() -> int:
     for visible in ("max_tokens: 20000 per request", "token_count = 1,500",
                     "secret_scanning: enabled for every repository"):
         masks(f"#6209 R4 {visible!r} stays visible", visible, shown=(visible,), count=0)
+    # #6210 round 4 (security F5): a GitHub Flavored Markdown table row may omit its leading pipe.
+    masks("#6210 R4 a table row without a leading pipe masks the value cell",
+          "password | 6163CanaryNoLeadingPipe |", hidden=("6163CanaryNoLeadingPipe",), count=1)
+    diff_masks("#6210 R4 a changed table row without a leading pipe masks the value cell in the diff",
+               "x\napi_token | old6163CanaryRow\ny", "x\napi_token | new6163CanaryRow\ny",
+               hidden=("old6163CanaryRow", "new6163CanaryRow"), shown=("-api_token |", "+api_token |"))
 
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
