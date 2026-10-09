@@ -86,6 +86,8 @@ Run:  python3 scripts/test/test_ci_runner_target_hygiene_6118.py
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -1719,6 +1721,42 @@ class PruneScript6118(unittest.TestCase):
             self.assertIn("kept\\x1b]0;title\\x07name", proc.stdout, args)
             if args:  # only the dry run lists the names it would delete
                 self.assertIn("esc\\x1b[31m-0123456789abcdef", proc.stdout, args)
+
+    def test_6118_r5_6258_category_rows_count_only_successful_deletions(self) -> None:
+        # #6258: execute() counted every candidate in its category row, whether
+        # `_remove` succeeded or not, so a row read "incremental 3" beside
+        # `deleted=2`.  An injected EACCES on one executable: the row counts the
+        # removals only, the failure is reported on its own, and the row counts
+        # sum to the `deleted` figure.
+        import unittest.mock
+        mod = _load_prune()
+        real_unlink = os.unlink
+
+        def flaky(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if path == "mcp_input_schema-7c7c":
+                raise PermissionError(13, "Permission denied")
+            return real_unlink(path, *args, **kwargs)
+
+        plan = mod.plan_target(str(self.target), "debug", "test-bins", env={})
+        try:
+            with unittest.mock.patch.object(mod.os, "unlink", flaky):
+                tally = mod.execute(plan, dry_run=False)
+        finally:
+            plan.close()
+        self.assertEqual(1, len(tally.errors), tally.errors)
+        counted = sum(count for count, _size in tally.per_category.values())
+        self.assertEqual(tally.deleted, counted, tally.per_category)
+        self.assertEqual(1, tally.per_category["deps executable"][0], tally.per_category)
+        self.assertEqual({"deps executable": 1}, tally.failed)
+        out = io.StringIO()
+        dir_fd_ok = set(os.supports_dir_fd) | {flaky}  # main() refuses an os.unlink without dir_fd support
+        with unittest.mock.patch.object(mod.os, "unlink", flaky), \
+                unittest.mock.patch.object(mod.os, "supports_dir_fd", dir_fd_ok), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = mod.main(["--target-dir", str(self.target)])
+        self.assertEqual(1, rc, out.getvalue())
+        self.assertRegex(out.getvalue(), r"(?m)^  failed\s+deps executable\s+1$")
+        self.assertNotRegex(out.getvalue(), r"(?m)^  deps executable\s+2\b")
 
 
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
