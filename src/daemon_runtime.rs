@@ -12634,7 +12634,8 @@ mod tests {
     fn test_apply_startup_env_seeds_encryption_at_rest_from_config_b3() {
         // Wave-2 B3 — `[encryption].at_rest = true` must opt in without
         // exporting `AI_MEMORY_ENCRYPT_AT_REST` (#2905 env-leak class).
-        let _enc = crate::test_support::env_lock();
+        // #6123 — `env_var_lock()` is the one process-env mutex; taking
+        // `test_support::env_lock()` as well would self-deadlock.
         let _g = env_var_lock();
         crate::encryption::set_config_at_rest(false);
         // SAFETY: serialized via env_var_lock.
