@@ -52,8 +52,13 @@ exactly, does not exclude it, and shows bypass_actors == [] (so run it with an
 admin token). The ruleset requires the freshness context on every carrier
 base; a carrier whose tip lacks the job could never merge a pull request.
 
-Every unfrozen carrier tip must also trigger on pull_request for its own base
-(trigger_covers), or its required contexts would never report.
+With state `applied` it also reads .github/workflows/c8-precheck.yml at the tip of
+release/v1.0.0 (RELEASE_REF) and FAILS unless the verifier job (VERIFIER_JOB_ID) is
+defined there and the workflow triggers on pull_request for that base, because the PUT
+makes the verifier required on release/v1.0.0 too (open non-carrier PRs would never
+report it). Every unfrozen carrier tip must also trigger on pull_request for its own
+base (trigger_covers), or its required contexts would never report. The OK and flip
+lines print the matched ruleset id, which the promotion PUT needs.
 
 bypass_actors is omitted by GitHub for low-privilege readers (the Actions
 GITHUB_TOKEN). An omitted field is UNVERIFIED, never treated as []: a WARN by
@@ -69,6 +74,7 @@ Exit: 0 pass (or pending WARN), 1 drift/unreadable, 2 usage.
 """
 
 import argparse
+import functools
 import json
 import re
 import subprocess
@@ -215,7 +221,7 @@ def candidates(rulesets, payload):
 
 def ruleset_label(rs):
     """`carrier ruleset <id> ('<name>')`: the id the promotion PUT targets (code R3-F2)."""
-    return "carrier ruleset"
+    return f"carrier ruleset {rs.get('id')} ({rs.get('name')!r})"
 
 
 def judge_one(rs, payload, require_full_view):
@@ -288,7 +294,7 @@ def verify(payload, carrier_decl, release_decl, ledger, state, rulesets, issue_s
             matched.append(rs)
     if st == "applied":
         if matched:
-            lines.append("OK")
+            lines.append(f"OK: {ruleset_label(matched[0])} is live and matches")
             return 0, lines
         if not cands:
             drift.append("no carrier ruleset is live (state applied): the carriers are unprotected")
@@ -297,7 +303,8 @@ def verify(payload, carrier_decl, release_decl, ledger, state, rulesets, issue_s
     if cands:
         if matched and not drift:
             return 1, lines + [f"FAIL: {ruleset_label(matched[0])} is live and matches; flip "
-                               f"{STATE_FILE.name} to \"applied\" and promote the verifier (#{issue})"]
+                               f"{STATE_FILE.name} to \"applied\" and promote the verifier (#{issue}); "
+                               f"the PUT targets ruleset id {matched[0].get('id')}"]
         if matched:
             return 1, lines + [f"FAIL: {r}" for r in drift] + [
                 f"FAIL: {ruleset_label(matched[0])} is live and matches, but other candidates drift; "
@@ -532,13 +539,19 @@ def check_tip(label, text, branch, jobs):
     return reasons
 
 
-def pre_apply(payload, carrier_decl, release_decl, rulesets, carriers, fetch_workflow):
+def pre_apply(payload, carrier_decl, release_decl, rulesets, carriers, fetch_workflow,
+              state=None, release_workflow=None):
     """R2-F4: refuse the POST/PUT while an unfrozen carrier tip lacks a #6143 job.
 
     carriers: list of (ref, sha); fetch_workflow(sha) returns the c8-precheck.yml
     text at that commit or raises VerifyError. Each unfrozen tip must define the jobs
-    AND trigger on pull_request for its own base (#6232)."""
+    AND trigger on pull_request for its own base (#6232). Once `state` is applied the
+    PUT also makes the verifier required on release/v1.0.0, so release_workflow()
+    (the c8-precheck.yml text at the release tip) must define it there too (code R3-F1)."""
     reasons = check_payload(payload, carrier_decl, release_decl)
+    st = state.get("state") if isinstance(state, dict) else None
+    if state is not None and st not in STATES:
+        reasons.append(f"carrier-ruleset state must be one of {list(STATES)}, got {st!r}")
     lines = []
     unfrozen = 0
     if not carriers:
@@ -559,11 +572,27 @@ def pre_apply(payload, carrier_decl, release_decl, rulesets, carriers, fetch_wor
             reasons.extend(problems)
         else:
             lines.append(f"PRE-APPLY: {ref} @ {sha} carries both #6143 jobs and triggers on its base")
+    if st == "applied":
+        reasons.extend(check_release_tip(release_workflow, lines))
     if carriers and not unfrozen:
         reasons.append("every carrier is frozen; nothing to protect, refusing to apply blind")
     if reasons:
         return 1, lines + [f"FAIL: {r}" for r in reasons]
     return 0, lines + [f"PRE-APPLY OK: {unfrozen} unfrozen carrier(s) carry the #6143 jobs; apply with: {POST_CMD}"]
+
+
+def check_release_tip(release_workflow, lines):
+    """Reasons the release tip cannot report the verifier context the PUT makes required there."""
+    if release_workflow is None:
+        return [f"{RELEASE_REF} @ tip unreadable (no reader): the PUT makes the verifier required there"]
+    try:
+        text = release_workflow()
+    except VerifyError as exc:
+        return [f"{RELEASE_REF} @ tip: {WORKFLOW_PATH} unreadable ({exc})"]
+    problems = check_tip(f"{RELEASE_REF} @ tip", text, RELEASE_REF, ((VERIFIER_JOB_ID, VERIFIER_CONTEXT),))
+    if not problems:
+        lines.append(f"PRE-APPLY: {RELEASE_REF} tip defines {VERIFIER_JOB_ID} and triggers on pull_request")
+    return problems
 
 
 def live_carriers(repo):
@@ -951,6 +980,8 @@ def main(argv=None):
     ap.add_argument("--carrier-decl-file", default=str(CARRIER_DECL), help="fixture: carrier declaration")
     ap.add_argument("--release-decl-file", default=str(RELEASE_DECL), help="fixture: release declaration")
     ap.add_argument("--ledger-file", default=str(LEDGER), help="fixture: not-required ledger")
+    ap.add_argument("--release-workflow-file",
+                    help="fixture for --pre-apply: c8-precheck.yml text at the release/v1.0.0 tip (skips the API)")
     ap.add_argument("--carrier-tips-file",
                     help='fixture for --pre-apply: {ref: {"sha": sha, "workflow": text|null}} (skips the API)')
     args = ap.parse_args(argv)
@@ -968,7 +999,19 @@ def main(argv=None):
                 carriers, fetch = fixture_carriers(args.carrier_tips_file)
             else:
                 carriers, fetch = live_carriers(args.repo), live_workflow(args.repo)
-            rc, lines = pre_apply(payload, carrier_decl, release_decl, rulesets, carriers, fetch)
+            state = read_json(args.state_file)
+            if args.release_workflow_file:
+                def release_workflow():
+                    try:
+                        return Path(args.release_workflow_file).read_text(encoding="utf-8")
+                    except OSError as exc:
+                        raise VerifyError(f"cannot read {args.release_workflow_file}: {exc}") from exc
+            elif args.carrier_tips_file:
+                release_workflow = None
+            else:
+                release_workflow = functools.partial(live_workflow(args.repo), RELEASE_REF)
+            rc, lines = pre_apply(payload, carrier_decl, release_decl, rulesets, carriers, fetch,
+                                  state=state, release_workflow=release_workflow)
         else:
             state = read_json(args.state_file)
             if args.tracking_issue_state:
