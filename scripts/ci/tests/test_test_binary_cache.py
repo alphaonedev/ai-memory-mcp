@@ -699,6 +699,58 @@ class StaleDepInfo6384L2(World):
         self.assertIn('skipped 3 of 3', out)
 
 
+class AuditBeforeRewrite6384L3(World):
+    """r1 L3: the audit trail and cache_plan.json exist before any shard list
+    is shortened, and a failure while replacing the lists restores them."""
+
+    def test_audit_and_plan_precede_every_list_replacement(self):
+        self.green_run('100')
+        out = io.StringIO()
+        events = []
+        real_replace = os.replace
+
+        def spy(src, dst):
+            name = Path(dst).name
+            if name in ('serial.txt', 'parallel_1.txt', 'parallel_2.txt'):
+                events.append(('list', name, '::group::' in out.getvalue() and 'hit test:a' in out.getvalue(),
+                               (self.sd / 'cache_plan.json').exists()
+                               and json.loads((self.sd / 'cache_plan.json').read_text()).get('enabled')))
+            return real_replace(src, dst)
+        tbc.os.replace = spy
+        try:
+            with redirect_stdout(out):
+                tbc.run_plan(self.args(run_id='200'), env=ENV_ON, now=NOW + 60)
+        finally:
+            tbc.os.replace = real_replace
+        self.assertTrue(events)
+        for ev in events:
+            self.assertTrue(ev[2], 'audit not printed before %s was replaced' % ev[1])
+            self.assertTrue(ev[3], 'enabled plan not written before %s was replaced' % ev[1])
+
+    def test_failure_while_replacing_lists_restores_the_full_lists(self):
+        self.green_run('100')
+        real_replace = os.replace
+
+        def boom(src, dst):
+            if Path(dst).name == 'parallel_2.txt':
+                raise OSError(28, 'No space left on device')
+            return real_replace(src, dst)
+        tbc.os.replace = boom
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                rc = tbc.run_plan(self.args(run_id='200'), env=ENV_ON, now=NOW + 60)
+        finally:
+            tbc.os.replace = real_replace
+        self.assertEqual(rc, 0)
+        self.assertIn('::warning::', out.getvalue())
+        self.assertEqual(self.list_text('serial'), '--lib\n--test a\n')
+        self.assertEqual(self.list_text('parallel_1'), '--lib\n')
+        self.assertEqual(self.list_text('parallel_2'), '--test b\n')
+        self.assertFalse(json.loads((self.sd / 'cache_plan.json').read_text())['enabled'])
+        self.assertEqual([p.name for p in self.sd.iterdir() if p.name.endswith('.tmp')], [])
+
+
 class Policy(unittest.TestCase):
     def test_allowed_matrix(self):
         on = {'CI_TEST_BINARY_CACHE': '1', 'CI_TEST_BINARY_CACHE_LOOKUP': '1'}
