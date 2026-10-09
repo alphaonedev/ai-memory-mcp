@@ -1196,7 +1196,7 @@ class RealTreeCensus6384R2M1(unittest.TestCase):
     def census(self):
         scanners = readers = 0
         for root in tbc.test_target_roots(REPO):
-            texts = [p.read_text(errors='replace') for p in tbc.static_mod_closure(REPO, root)]
+            texts = [p.read_text(errors='replace') for p in tbc.static_mod_closure(REPO, root) if p.suffix == '.rs']
             traits = tbc.source_traits(texts, 'test', REPO)
             if traits['tree']:
                 scanners += 1

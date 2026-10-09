@@ -495,15 +495,19 @@ def source_traits(texts, kind, repo_root):
 
 
 def binary_traits(depinfo_path, repo_root, kind):
-    """source_traits over the binary's own (non-registry) dep-info sources. An
-    unreadable source makes every trait true (the conservative direction)."""
+    """source_traits over the binary's own (non-registry) ``.rs`` dep-info
+    sources. Other dep-info files are data embedded at compile time
+    (``include_str!``, ``include_bytes!``; already keyed through dep-info), not
+    run-time reading code, so their text sets no trait (r2 M1: the lib embeds
+    PERFORMANCE.md, which mentions CHANGELOG). An unreadable source makes
+    every trait true (the conservative direction)."""
     deps, _ = parse_depinfo(Path(depinfo_path).read_text(errors='replace'))
     root = Path(repo_root).resolve()
     texts = []
     for d in deps:
         q = Path(d)
         q = q if q.is_absolute() else root / q
-        if _is_registry(q) or not q.is_file():
+        if q.suffix != '.rs' or _is_registry(q) or not q.is_file():
             continue
         try:
             texts.append(q.read_text(errors='replace'))
