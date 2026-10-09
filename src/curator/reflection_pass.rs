@@ -1879,6 +1879,85 @@ mod tests {
             .count()
         }
 
+        /// #4289 — an LLM stub that EDITS one source (in-place content update
+        /// + version bump, the #4045 shape) while it is "generating" the
+        /// summary, i.e. between the curator's snapshot and the reflect write.
+        struct EditingLlm {
+            db_path: std::path::PathBuf,
+            target: String,
+        }
+
+        impl AutonomyLlm for EditingLlm {
+            fn auto_tag(&self, _title: &str, _content: &str) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn detect_contradiction(&self, _a: &str, _b: &str) -> Result<bool> {
+                Ok(false)
+            }
+            fn summarize_memories(&self, _memories: &[(String, String)]) -> Result<String> {
+                let conn = crate::db::open(&self.db_path)?;
+                conn.execute(
+                    "UPDATE memories SET content = 'edited while the reflection was generated', \
+                     version = version + 1 WHERE id = ?1",
+                    [&self.target],
+                )?;
+                Ok("summary of the text the source no longer holds".to_string())
+            }
+        }
+
+        /// #4289 — a reflection generated from a stale snapshot must NOT land:
+        /// when a source changes between the cluster snapshot and the reflect
+        /// write, the cluster is skipped (no Reflection row, no `reflects_on`
+        /// provenance claiming to summarise text the source no longer holds)
+        /// and the report names the conflict. Pre-fix `persist` passed only the
+        /// source ids, so the stale reflection landed with current-looking
+        /// provenance. The no-race control is
+        /// `run_reflection_pass_persists_reflections`.
+        #[tokio::test]
+        async fn reflection_pass_skips_a_cluster_whose_source_changed_mid_generation_4289() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let s1 = insert_observation(
+                &conn,
+                "race",
+                "T1",
+                "shared keyword token strategy notes",
+                2,
+            );
+            let s2 =
+                insert_observation(&conn, "race", "T2", "shared keyword token strategy plan", 3);
+            let s3 = insert_observation(
+                &conn,
+                "race",
+                "T3",
+                "shared keyword token strategy canary",
+                1,
+            );
+            let sources = vec![s1.clone(), s2, s3];
+            let llm = EditingLlm {
+                db_path: store.path().to_path_buf(),
+                target: s1,
+            };
+
+            let report =
+                run_reflection_pass(&store, &llm, None, Some("race"), None, false, |_| true)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                report.reflections_persisted, 0,
+                "#4289: a reflection over a source that changed mid-generation must not land: {report:?}"
+            );
+            assert!(
+                report.errors.iter().any(|e| e.contains("changed")),
+                "#4289: the report names the stale-source conflict: {report:?}"
+            );
+            assert_eq!(
+                count_reflections_over(&conn, "race", &sources),
+                0,
+                "#4289: no Reflection row carries provenance over the stale snapshot"
+            );
+        }
+
         /// #3154 — the pass is IDEMPOTENT over an unchanged cluster: a second
         /// sweep over the same three Observations must neither mint a second
         /// Reflection with the identical `reflects_on` fan-out nor pay a second
