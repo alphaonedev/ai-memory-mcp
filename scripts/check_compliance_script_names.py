@@ -27,10 +27,13 @@ unless BOTH hold:
 An allowlisted pair is honoured only while the document ITSELF carries an
 erratum line for that name (#6170), so deleting the erratum from one document
 fails the gate even when another document still carries one. The only
-exception is an entry marked ``<doc>:<name>:pinned``: a document that cannot
-carry an erratum (the SHA-256 pinned declaration, or a text guarded by a
-separate gate) is honoured while an erratum for the name exists in any
-``docs/compliance/`` document.
+exception is an entry marked ``<doc>:<name>:pinned``, honoured while an erratum
+for the name exists in any ``docs/compliance/`` document. ``:pinned`` is a
+closed set (#6173): ``PINNABLE_DOCS`` holds exactly the two documents that
+cannot carry an erratum, ``v1.0.0-DECLARATION.md`` (SHA-256 pinned) and
+``ENTERPRISE-FEDERATION-CERTIFICATION.md`` (cert section 7 gate). A ``:pinned``
+entry for any other document is a violation, and so is a ``:pinned`` entry for
+a document that carries its own erratum for that name ("unnecessary :pinned").
 
 Usage:
     python3 -I scripts/check_compliance_script_names.py [--root DIR]
@@ -53,6 +56,14 @@ SUCCESSOR_RE = re.compile(r"`scripts/([A-Za-z0-9_./-]+\.(?:sh|py))`")
 ALLOW_REL = "scripts/qc-allowlists/compliance-script-names-allow.txt"
 ENTRY_RE = re.compile(
     r"^(docs/compliance/\S+\.md):(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(:pinned)?$"
+)
+# The two documents that cannot carry an erratum, each already guarded by another
+# gate: the SHA-256 declaration pin and the cert section 7 gate (#6173).
+PINNABLE_DOCS = frozenset(
+    {
+        "docs/compliance/v1.0.0-DECLARATION.md",
+        "docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md",
+    }
 )
 
 
@@ -134,6 +145,11 @@ def load_allowlist(root):
             problems.append("%s:%d: duplicate allowlist entry %s:%s" % (ALLOW_REL, lineno, key[0], key[1]))
             continue
         pairs[key] = m.group(3) is not None
+        if pairs[key] and key[0] not in PINNABLE_DOCS:
+            problems.append(
+                "%s:%d: :pinned not permitted for %s:%s (only %s)"
+                % (ALLOW_REL, lineno, key[0], key[1], ", ".join(sorted(PINNABLE_DOCS)))
+            )
     return pairs, problems
 
 
@@ -159,6 +175,12 @@ def check(root):
                     "%s:%d: `%s` does not exist under scripts/ and no erratum-covered allowlist"
                     " entry (%s) names it" % (rel, lineno, tok, ALLOW_REL)
                 )
+    for (rel, base), pinned in sorted(allowed.items()):
+        if pinned and base in per_doc.get(rel, {}):
+            problems.append(
+                "%s: unnecessary :pinned on %s:%s (the document carries its own erratum)"
+                % (ALLOW_REL, rel, base)
+            )
     for rel, base in sorted(set(allowed) - used):
         problems.append("%s: stale allowlist entry %s:%s suppresses nothing" % (ALLOW_REL, rel, base))
     return problems
@@ -224,17 +246,22 @@ def self_test():
         allow.write_text("docs/compliance/A.md:check-old.sh\n")
 
         # #6170: an allowlisted doc must carry its own erratum even when another doc still does.
-        both = "docs/compliance/A.md:check-old.sh%s\ndocs/compliance/B.md:check-old.sh\n"
+        pin = root / "docs" / "compliance" / "v1.0.0-DECLARATION.md"
+        both = "docs/compliance/%s:check-old.sh%s\ndocs/compliance/B.md:check-old.sh\n"
         other.write_text(erratum)
         doc.write_text("N30 enforcer is `check-old.sh`.\n")
-        allow.write_text(both % "")
+        allow.write_text(both % ("A.md", ""))
         expect(check(root), "allowlisted doc whose own erratum was removed was accepted")
-        # #6170: only an entry marked ':pinned' may rely on an erratum in another doc.
-        allow.write_text(both % ":pinned")
+        # #6170: only a ':pinned' entry (on a PINNABLE_DOCS document) may rely on another doc's erratum.
+        doc.unlink()
+        pin.write_text("N30 enforcer is `check-old.sh`.\n")
+        allow.write_text(both % ("v1.0.0-DECLARATION.md", ":pinned"))
         expect(not check(root), "pinned entry backed by a repository erratum was rejected")
         other.unlink()
-        allow.write_text("docs/compliance/A.md:check-old.sh:pinned\n")
+        allow.write_text("docs/compliance/v1.0.0-DECLARATION.md:check-old.sh:pinned\n")
         expect(check(root), "pinned entry with no erratum anywhere was accepted")
+        pin.unlink()
+        doc.write_text("N30 enforcer is `check-old.sh`.\n")
         allow.write_text("docs/compliance/A.md:check-old.sh\n")
 
         # #6173: ':pinned' is a closed set; the cells use the real pinnable document paths.
