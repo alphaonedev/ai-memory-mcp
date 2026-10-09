@@ -5,7 +5,7 @@
 //! and no up-to-date-head rule, so a green gate on a stale head can be merged.
 //!
 //! Repo-side fix pinned here: (1) `scripts/check_carrier_base_fresh.py` fails
-//! closed when the merge ref a pull_request job judged is not built on the LIVE
+//! closed when the merge ref a `pull_request` job judged is not built on the LIVE
 //! tip of a carrier base; (2) `c8-precheck.yml` runs it on every PR into a carrier
 //! base; (3) the carrier ruleset the repository settings must carry is declared
 //! in `docs/ci/CARRIER-BRANCH-GATES.md` so a removed rule is a reviewable diff.
@@ -170,6 +170,22 @@ fn carrier_ruleset_is_documented_for_relay_6143() -> TestResult {
                 "docs/ci/CARRIER-BRANCH-GATES.md must mention {needle:?}"
             ));
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn carrier_ruleset_live_checker_self_test_passes_6143() -> TestResult {
+    let out = Command::new("python3")
+        .args(["-I", "scripts/check_carrier_ruleset_live.py", "--self-test"])
+        .current_dir(root())
+        .output()
+        .map_err(|e| format!("spawn python3: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ruleset checker self-test failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     Ok(())
 }
