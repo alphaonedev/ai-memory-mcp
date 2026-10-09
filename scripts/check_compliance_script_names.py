@@ -1856,6 +1856,24 @@ def self_test():
             doc.write_bytes(text.encode("utf-8"))
             expect(any("check-old.sh" in p for p in check(root)),
                    "R10-#6424-%s: a stale name split across a link was accepted" % label)
+        # #6417 (round 10): a character reference for a directional control is decoded by the renderer into
+        # the real control, so the bidirectional-control report covers the decoded text as well as the raw line.
+        for label, text in (
+            ("hex override", "Run check_new.py&#x202E; daily.\n"),
+            ("decimal override", "Run check_new.py&#8238; daily.\n"),
+            ("named mark", "Run check_new.py&rlm; daily.\n"),
+            ("named left mark", "Run check_new.py&lrm; daily.\n"),
+            ("isolate", "Run check_new.py&#x2067;x&#x2069; daily.\n"),
+            ("inside an HTML block", "<div>\ncheck_new.py&#x202E;\n</div>\n"),
+            ("inside a code span", "Run `check_new.py&#x202E;` daily.\n"),
+            ("uppercase hex digits with a leading zero", "Run check_new.py&#X0202E; daily.\n"),
+        ):
+            doc.write_bytes(text.encode("utf-8"))
+            expect(any("bidirectional control character" in p for p in check(root)),
+                   "R10-#6417-%s: a character reference for a bidirectional control was accepted" % label)
+        doc.write_bytes(b"Run check_new.py&amp;#x202E; and check_new.py&amp;rlm; daily.\n")
+        probs = check(root)
+        expect(not probs, "R10-#6417-control: a literal, escaped reference was reported (%r)" % (probs,))
         # #6353: an allowlist that exists but cannot be stat'ed is unreadable (exit 2), never absent.
         r = fresh("u-allow-loop")
         (r / ALLOW_REL).unlink()
