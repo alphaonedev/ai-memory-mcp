@@ -165,7 +165,10 @@ each unit is and WHAT is substituted into it:
     and the two scripts it runs to ``${{ github.sha }}`` (``SHAPE_PROOF_BIND``),
     the URL assignment (which may change its port only), and the script run
     under ``env -i`` with an absolute bash, in the sanitized step shell. The
-    ``paths:`` trigger filter is NOT evidence.
+    ``paths:`` trigger filter is NOT evidence, but it must fire for every build
+    input (#6292): ``SHAPE_PATHS`` lists vendor/**, build.rs,
+    rust-toolchain.toml, .cargo/** and the Dockerfile, and every ``path =``
+    dependency or patch in Cargo.toml must be covered by one of its globs.
 
 PIN MAINTENANCE. Every pin-mismatch message names the constant to update and
 this file. A Dependabot SHA bump of a docker-job action fails with ONE message
@@ -214,6 +217,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fnmatch
 import hashlib
 import os
 import re
@@ -694,7 +698,10 @@ SHAPE_PATHS = (
     ".github/workflows/release.yml", ".github/workflows/release-shape.yml", "scripts/release-features.sh",
     "scripts/check_release_features.py", "scripts/release-shape-pg-proof.sh", "scripts/assert-compiled-features.sh",
     "Cargo.toml", "Cargo.lock", "src/**", "migrations/**",
+    "vendor/**", "build.rs", "rust-toolchain.toml", ".cargo/**", "Dockerfile",
 )
+# Cargo.toml tables whose `path` key names a build target, not a dependency.
+CARGO_TARGET_TABLES = ("package", "lib", "bin", "test", "bench", "example")
 SHAPE_ON: Dict[str, Spec] = {
     "pull_request": {"branches": Flow('"release/**", "rehearsal/**", "chain/**", "main"'), "paths": [Double(p) for p in SHAPE_PATHS]},
     "push": {"branches": Flow('"release/**"')},
@@ -1959,6 +1966,53 @@ def check_install(text: str, rep: Report) -> None:
         rep.bad("docs/INSTALL.md still says the postgres path needs a source build")
 
 
+def _toml_code(line: str) -> str:
+    """The part of one TOML line before a comment (a `#` outside a string)."""
+    quote = ""
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#":
+            return line[:i]
+    return line
+
+
+def cargo_path_deps(text: str) -> List[str]:
+    """Every `path = "..."` in a Cargo.toml dependency or patch table (inline
+    or dotted), excluding build-target tables and the package itself."""
+    deps: List[str] = []
+    table = ""
+    for raw in text.splitlines():
+        code = _toml_code(raw).strip()
+        head = re.fullmatch(r"\[\[?\s*([^\]]+?)\s*\]\]?", code)
+        if head:
+            table = head.group(1).split(".")[0].strip()
+            continue
+        if table in CARGO_TARGET_TABLES:
+            continue
+        for found in re.finditer(r"(?<![\w-])path\s*=\s*\"([^\"]*)\"", code):
+            dep = found.group(1).strip().rstrip("/")
+            while dep.startswith("./"):
+                dep = dep[2:]
+            if dep not in ("", "."):
+                deps.append(dep)
+    return deps
+
+
+def check_shape_paths(cargo: str, rep: Report) -> None:
+    """#6292: a change to any path dependency must trigger the release-shape
+    proof, so the pinned `paths:` filter must cover each one."""
+    for dep in cargo_path_deps(cargo):
+        if dep.startswith("/") or ".." in dep.split("/"):
+            rep.bad(f"Cargo.toml: path dependency {dep!r} lies outside the repository (#6292)")
+        elif not any(fnmatch.fnmatchcase(dep + "/Cargo.toml", pat) for pat in SHAPE_PATHS):
+            rep.bad(f"Cargo.toml: path dependency {dep!r} is not covered by the release-shape.yml `paths:` filter "
+                    "(SHAPE_PATHS); a change to it would not run the release-shaped proof (#6292)")
+
+
 def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], str]:
     rep = Report()
     feat = load(root / "scripts" / "release-features.sh", "scripts/release-features.sh", rep, False)
@@ -1966,6 +2020,7 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
     shape = load(root / ".github" / "workflows" / "release-shape.yml", ".github/workflows/release-shape.yml (no release-shaped proof)", rep, True)
     docker = load(root / "Dockerfile", "Dockerfile", rep, True)
     install = load(root / "docs" / "INSTALL.md", "docs/INSTALL.md", rep, False)
+    cargo = load(root / "Cargo.toml", "Cargo.toml", rep, True)
 
     declared = ""
     if feat is not None:
@@ -1994,6 +2049,8 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
         check_dockerfile(docker, rep, digests)
     if shape is not None:
         check_shape(shape, rep, advisory)
+    if cargo is not None:
+        check_shape_paths(cargo, rep)
     if install is not None:
         check_install(install, rep)
     check_workflow_sweep(root, rep)
@@ -3059,6 +3116,9 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         lambda s: s + '\n[dependencies.extra]\nversion = "1"\npath = "third_party/extra"\n', False)]),
     "6292 patch-table path dependency outside the filter": ("fail", [(CARGO, PASTE_DEP,
         lambda s: s + '\n[patch.crates-io]\nserde = { path = "third_party/serde" }\n', False)]),
+    "6292 path dependency above the repository": ("fail", [(CARGO, PASTE_DEP,
+        PASTE_DEP.replace("vendor/paste", "vendor/../../paste"), False)]),
+    "6292 absolute path dependency": ("fail", [(CARGO, PASTE_DEP, PASTE_DEP.replace("vendor/paste", "/opt/paste"), False)]),
     "valid: 6292 commented path dependency is not a dependency": ("pass", [(CARGO, PASTE_DEP,
         PASTE_DEP + '\n# old = { path = "third_party/old" }', False)]),
     "valid: 6292 path in a trailing comment is not a dependency": ("pass", [(CARGO, PASTE_DEP,
