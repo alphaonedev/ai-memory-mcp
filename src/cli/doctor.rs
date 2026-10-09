@@ -75,6 +75,11 @@ const FACT_DB_SCHEMA: &str = "db_schema";
 const FACT_BINARY_SUPPORTS_SCHEMA: &str = "binary_supports_schema";
 const FACT_SCHEMA_STAMP: &str = "schema_stamp";
 const FACT_DIM_VIOLATIONS: &str = "dim_violations";
+/// #4781 — the Webhook section's delivery-totals fact keys, named once so
+/// the healthy and the `unreadable` arms cannot drift (pm-v3.1 literals).
+const FACT_DISPATCHED_TOTAL: &str = "dispatched_total";
+const FACT_FAILED_TOTAL: &str = "failed_total";
+const FACT_SUCCESS_RATE_PCT: &str = "success_rate_pct";
 
 /// v1.0.0 (#3113) — `doctor` fact naming the core-relation integrity state
 /// (see [`crate::storage::schema_integrity`]).
@@ -4488,25 +4493,47 @@ fn section_webhook(conn: &rusqlite::Connection) -> ReportSection {
         }
     }
 
-    let (dispatched, failed) = db::doctor_webhook_delivery_totals(conn).unwrap_or((0, 0));
-    facts.push(("dispatched_total".into(), dispatched.to_string()));
-    facts.push(("failed_total".into(), failed.to_string()));
+    // #4781 — a totals read fault is `unreadable` at Critical, never
+    // `0 dispatched / 0 failed` that looks like a healthy idle store.
+    match db::doctor_webhook_delivery_totals(conn) {
+        Ok((dispatched, failed)) => {
+            facts.push((FACT_DISPATCHED_TOTAL.into(), dispatched.to_string()));
+            facts.push((FACT_FAILED_TOTAL.into(), failed.to_string()));
 
-    if dispatched > 0 {
-        let success_rate = ((dispatched.saturating_sub(failed)) as f64 / dispatched as f64) * 100.0;
-        facts.push(("success_rate_pct".into(), format!("{success_rate:.2}")));
-        // 95% lifetime success threshold. P5 will refine this to a
-        // rolling-1h window when the dispatch table grows a timestamp
-        // log; for now we use the lifetime totals already present in
-        // `subscriptions.dispatch_count` / `failure_count`.
-        if success_rate < 95.0 {
-            severity = Severity::Warning;
-            note = Some(format!(
-                "lifetime delivery success {success_rate:.2}% < 95% threshold"
-            ));
+            if dispatched > 0 {
+                let success_rate =
+                    ((dispatched.saturating_sub(failed)) as f64 / dispatched as f64) * 100.0;
+                facts.push((FACT_SUCCESS_RATE_PCT.into(), format!("{success_rate:.2}")));
+                // 95% lifetime success threshold. P5 will refine this to a
+                // rolling-1h window when the dispatch table grows a timestamp
+                // log; for now we use the lifetime totals already present in
+                // `subscriptions.dispatch_count` / `failure_count`.
+                if success_rate < 95.0 {
+                    severity = Severity::Warning;
+                    append_note(
+                        &mut note,
+                        &format!("lifetime delivery success {success_rate:.2}% < 95% threshold"),
+                    );
+                }
+            } else {
+                facts.push((FACT_SUCCESS_RATE_PCT.into(), "no_deliveries_yet".into()));
+            }
         }
-    } else {
-        facts.push(("success_rate_pct".into(), "no_deliveries_yet".into()));
+        Err(e) => {
+            severity = Severity::Critical;
+            for key in [
+                FACT_DISPATCHED_TOTAL,
+                FACT_FAILED_TOTAL,
+                FACT_SUCCESS_RATE_PCT,
+            ] {
+                facts.push((key.into(), over_depth_4715::UNREADABLE.into()));
+            }
+            facts.push(("webhook_delivery_totals_error".into(), format!("{e:#}")));
+            append_note(
+                &mut note,
+                "the webhook delivery totals could not be read (#4781)",
+            );
+        }
     }
 
     // #3659 — the persisted delivery history is only as good as the status
@@ -6493,7 +6520,11 @@ mod tests {
     fn webhook_section_critical_when_delivery_totals_unreadable_4781() {
         let report = webhook_report_with_unreadable_subscriptions();
         let wh = find(&report, "Webhook");
-        for key in ["dispatched_total", "failed_total", "success_rate_pct"] {
+        for key in [
+            FACT_DISPATCHED_TOTAL,
+            FACT_FAILED_TOTAL,
+            FACT_SUCCESS_RATE_PCT,
+        ] {
             assert_eq!(fact(wh, key), over_depth_4715::UNREADABLE, "{key}: {wh:?}");
         }
         assert!(

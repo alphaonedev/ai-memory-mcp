@@ -430,22 +430,19 @@ pub fn doctor_over_depth_chains(
 ///
 /// # Errors
 ///
-/// Returns `Err` only on hard SQLite failures.
+/// Returns `Err` on any SQLite failure (e.g. an unreadable `subscriptions`
+/// table) — a read fault is never `(0, 0)` (#4781, ERRORS-19).
 pub fn doctor_webhook_delivery_totals(conn: &Connection) -> Result<(u64, u64)> {
-    let dispatched: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(dispatch_count), 0) FROM subscriptions",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let failed: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(failure_count), 0) FROM subscriptions",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    let dispatched: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(dispatch_count), 0) FROM subscriptions",
+        [],
+        |r| r.get(0),
+    )?;
+    let failed: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(failure_count), 0) FROM subscriptions",
+        [],
+        |r| r.get(0),
+    )?;
     Ok((
         u64::try_from(dispatched.max(0)).unwrap_or(0),
         u64::try_from(failed.max(0)).unwrap_or(0),
