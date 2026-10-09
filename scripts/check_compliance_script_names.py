@@ -1837,6 +1837,23 @@ def self_test():
         probs = check(root)
         expect(any("line 3 is not an erratum" in p for p in probs),
                "R9-#6238: a non-canonical erratum with a soft hyphen was not named (%r)" % (probs,))
+        # #6424 (round 10): the inline-link destination parser follows the GitHub grammar. A backslash escapes
+        # only ASCII punctuation, a bare destination ends only at space, tab, CR or LF, and an angle
+        # destination may hold a backslash before a line ending, so each of these is a link whose visible text
+        # joins the following text into the stale name.
+        for label, text in (
+            ("backslash before a space and a title", 'Run [check-](\\ "a b")old.sh daily.\n'),
+            ("backslash before a tab and a title", 'Run [check-](\\\t"a b")old.sh daily.\n'),
+            ("NUL inside a destination", "Run [check-](a\x00b)old.sh daily.\n"),
+            ("DEL inside a destination", "Run [check-](a\x7fb)old.sh daily.\n"),
+            ("backslash and LF in an angle destination", "Run [check-](<a\\\nb>)old.sh daily.\n"),
+            ("backslash and CRLF in an angle destination", "Run [check-](<a\\\r\nb>)old.sh daily.\n"),
+            ("backslash and CRLF in an angle destination, CRLF lines", "Run [check-](<a\\\r\nb>)old.sh daily.\r\n"),
+            ("backslash before a space, CRLF lines", 'Run [check-](\\ "a b")old.sh daily.\r\n'),
+        ):
+            doc.write_bytes(text.encode("utf-8"))
+            expect(any("check-old.sh" in p for p in check(root)),
+                   "R10-#6424-%s: a stale name split across a link was accepted" % label)
         # #6353: an allowlist that exists but cannot be stat'ed is unreadable (exit 2), never absent.
         r = fresh("u-allow-loop")
         (r / ALLOW_REL).unlink()
