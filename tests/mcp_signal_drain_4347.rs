@@ -275,13 +275,22 @@ impl Session {
     /// child has already exited while a start-up wait is still polling: a
     /// child that crashed at start-up must not cost the full `STARTUP_BOUND`
     /// (#4347 L-2, TEST-02).
-    fn fail_if_exited(&mut self, waiting_for: &str) {
-        if let Some(status) = self.child.try_wait().expect("try_wait") {
-            let stderr = self.stderr_text();
-            panic!(
-                "the child exited ({status:?}) while waiting for {waiting_for}; stderr:\n{stderr}"
-            );
+    ///
+    /// The child may have written the awaited line and exited before the
+    /// stderr reader thread appended it, so on exit the reader is joined (it
+    /// reads to EOF) and `done` is evaluated on the complete stderr. Returns
+    /// `true` when the child exited but the awaited condition now holds (the
+    /// caller then returns instead of waiting); panics only when it does not
+    /// (#6142, TEST-02). Returns `false` while the child is still running.
+    fn fail_if_exited(&mut self, waiting_for: &str, done: impl Fn(&str) -> bool) -> bool {
+        let Some(status) = self.child.try_wait().expect("try_wait") else {
+            return false;
+        };
+        let stderr = self.stderr_text();
+        if done(&stderr) {
+            return true;
         }
+        panic!("the child exited ({status:?}) while waiting for {waiting_for}; stderr:\n{stderr}");
     }
 
     /// Wait (bounded) until the child has written `needle` to stderr; fails
@@ -292,7 +301,9 @@ impl Session {
             if self.stderr_buf.lock().is_ok_and(|b| b.contains(needle)) {
                 return;
             }
-            self.fail_if_exited(&format!("{needle:?} on stderr"));
+            if self.fail_if_exited(&format!("{needle:?} on stderr"), |e| e.contains(needle)) {
+                return;
+            }
             assert!(
                 Instant::now() < deadline,
                 "the child never wrote {needle:?} to stderr"
@@ -306,7 +317,11 @@ impl Session {
     fn wait_entered(&mut self, dir: &Path) {
         let deadline = Instant::now() + STARTUP_BOUND;
         while !dir.join("entered").exists() {
-            self.fail_if_exited("the held request");
+            // The `entered` marker is a file written before the child blocks,
+            // so after the child exits its final state is already on disk.
+            if self.fail_if_exited("the held request", |_| dir.join("entered").exists()) {
+                return;
+            }
             assert!(
                 Instant::now() < deadline,
                 "the child never reached the held request"
