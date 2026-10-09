@@ -42,7 +42,7 @@ REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}")
 LOGIN_RE = re.compile(r"[A-Za-z0-9-]{1,39}(?:\[bot\])?")
 ASSOC_RE = re.compile(r"[A-Z_]{1,32}")
 TOKEN_RE = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")
-QUEUE_REF_RE = re.compile(r"refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-([^/]*)")
+QUEUE_REF_RE = re.compile(r"refs/heads/gh-readonly-queue/.+/pr-([0-9]{1,9})-([^/]*)")
 
 
 class GateError(Exception):
@@ -158,8 +158,9 @@ def merge_group_pr_number(event):
     match = QUEUE_REF_RE.fullmatch(ref) if isinstance(ref, str) else None
     number = int(match.group(1)) if match else 0
     if number <= 0:
-        raise GateError(f"merge_group head_ref {ref!r} does not name a pull request "
-                        "(expected refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>)")
+        shown = ref if isinstance(ref, str) and len(ref) <= 120 else f"<{type(ref).__name__} of unusable shape>"
+        raise GateError(f"merge_group head_ref {shown!r} does not name a pull request "
+                        "(expected refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>, N at most 9 digits)")
     # The ref is attacker-influenced text; the queued head is GitHub's own field. The sha in the
     # ref must be a full commit sha and equal that head, or the verdict is not about the queue (#6242).
     ref_sha = match.group(2)
