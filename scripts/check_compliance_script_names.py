@@ -1083,6 +1083,62 @@ def self_test():
                 "R7-Y3/Y4: an unresolvable document symlink was not refused as such (%r)" % (probs,),
             )
 
+        # Reviewer round 7: pins for survivors N5 N5b X2 X3 X4 X5 X6 X7 X9 X10.
+        allow.write_text("")
+        for cp in (0xFFF9, 0xFFFB, 0x13430):
+            doc.write_text("N30 enforcer is `check-o%sld.sh`.\n" % chr(cp), encoding="utf-8")
+            expect(any("check-old.sh" in p for p in check(root)),
+                   "R8-X2: Cf U+%04X outside Default_Ignorable hid a stale name" % cp)
+        doc.write_text("Runs `tools//scripts/check_new.py`.\n")
+        expect(any("tools//scripts/check_new.py" in p for p in check(root)),
+               "R8-X3: a '//' inside a written path was read as a URL")
+        doc.write_text("Runs `infra/check_infra.py` and check&#95;infra.py.\n")
+        expect(any("scripts/check_infra.py" in p for p in check(root)),
+               "R8-X10: a rendered citation sharing a raw citation's name was dropped")
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+        for label, text in (
+            ("X4 fence inside a comment", stale_line + "<!--\n```\n" + erratum + "```\n-->\n"),
+            ("X5 diagram info with a second word", stale_line + "```mermaid theme\n" + erratum + "```\n"),
+        ):
+            doc.write_text(text)
+            expect(check(root), "R8-%s: a hidden erratum was accepted" % label)
+        for label, text in (
+            ("X6 empty label is no definition", stale_line + "[]: " + erratum),
+            ("X9 a fence ends a definition paragraph", stale_line + "\n[a]: /u\n```\ncode\n```\n" + erratum),
+        ):
+            doc.write_text(text)
+            expect(not check(root), "R8-%s: a visible erratum was rejected" % label)
+        allow.write_text("")
+        r = fresh("s-dangling")
+        if try_symlink(r / "docs" / "compliance" / "D.md", r / "docs" / "compliance" / "missing.md", "R8-X7"):
+            rc, err = run_main(r)
+            expect(rc == 2 and "D.md: unreadable" in err and "loop" not in err,
+                   "R8-X7: a dangling document symlink gave %r %r" % (rc, err))
+        # #6220 on a case-sensitive CI runner: emulate a case-insensitive filesystem, so only the
+        # exact-name listing walk can reject a case variant of a file or directory.
+        real_is_file = Path.is_file
+
+        def ci_is_file(self, *args, **kwargs):
+            cur = Path(Path(os.path.abspath(str(self))).anchor)
+            for part in Path(os.path.abspath(str(self))).parts[1:]:
+                try:
+                    hit = [n for n in os.listdir(str(cur)) if n.lower() == part.lower()]
+                except OSError:
+                    return False
+                if not hit:
+                    return False
+                cur = cur / hit[0]
+            return real_is_file(cur)
+
+        Path.is_file = ci_is_file
+        try:
+            doc.write_text("Runs `check_NEW.py` and `scripts/SUB/check_sub.py`.\n")
+            probs = check(root)
+        finally:
+            Path.is_file = real_is_file
+        expect(any("check_NEW.py" in p for p in probs) and any("scripts/SUB/check_sub.py" in p for p in probs),
+               "R8-N5: on an emulated case-insensitive filesystem a case variant resolved (%r)" % (probs,))
+
         # #6199: a fixture setup failure exits 2 with 'SELF-TEST FAIL: fixture setup', never a traceback.
         gate_src = Path(__file__).read_text(encoding="utf-8")
 
