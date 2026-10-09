@@ -283,9 +283,8 @@ certification and triggers re-cert** (see §7).
 > wrong to fire** — and the measured substance is nil. A record stating only the
 > second reads as an excuse; only the first hides what changed. Discharged by
 > full re-issue, not by argument (the amendment-without-re-mint route was closed
-> for a LIVE banner by #3556; #6124 reopened it only as a non-discharging record
-> while the banner is EXPIRED or VOID, and full re-issue under WP-B1 remains the
-> only discharge).
+> by #3556; #6124 reopened it only while the banner is EXPIRED or VOID, as a
+> non-discharging record, and WP-B1 (#6063) remains the only discharge).
 >
 > §5.4(2)–(5) were **re-run at `eae99be43`**, not carried forward: between the
 > two binds rehearsal also took #3877 (record-stop gate fail-CLOSED + fixture
@@ -346,13 +345,14 @@ certification and triggers re-cert** (see §7).
 > §7 states the certification expires on **any** change to the federation wire
 > path and carries no comment-only carve-out, so tree-equivalence does not
 > discharge it. Nor does an amendment-without-re-mint: that route (used by the
-> 2026-08-28 and 2026-09-02 amendments) was closed for a LIVE banner by #3556,
-> which hardened `check-cert-expiry.sh` so predicate (B) requires the banner
-> itself to move and predicate (C) fails a LIVE banner over watched drift.
-> #6124 reopened it only as a non-discharging record while the banner is
-> EXPIRED or VOID (a NEW amendment below STATUS listing exactly the changed
-> watched paths and `AI_MEMORY_FED_*` identifiers and citing #6063); it never
-> re-mints. **Discharged by full re-issue** (WP-B1, #6063), not by argument.
+> 2026-08-28 and 2026-09-02 amendments) was closed by #3556, which hardened
+> `check-cert-expiry.sh` so predicate (B) requires the banner itself to move
+> and predicate (C) fails a LIVE banner over watched drift. #6124 reopened it
+> only while the banner is EXPIRED or VOID, as a non-discharging record
+> (exactly ONE new amendment below STATUS listing exactly the changed watched
+> paths and `AI_MEMORY_FED_*` identifiers and citing only #6063, with every
+> earlier amendment left byte-identical); it never re-mints. **Discharged by
+> full re-issue** (WP-B1, #6063), not by argument.
 >
 > §5.4(2)–(5) were **re-run at `92209ad91`**, not carried forward — the same
 > batch moved `doctor --posture` check #15 (#3866) and the pg connect funnel,
@@ -1514,7 +1514,14 @@ it only if the STATUS line or the Binds-to line changed (an incidental
 prose edit is not a re-issue), and a banner that says LIVE bound to a SHA
 with §7-watched drift between that SHA and HEAD goes RED on every PR until
 the document is re-issued at HEAD or its STATUS is set to VOID/EXPIRED —
-the one-line remedy the failure names. While the banner is EXPIRED or VOID at both ends, [**#6124**](https://github.com/alphaonedev/ai-memory-mcp/issues/6124) also accepts a NEW amendment below STATUS that lists exactly the changed watched paths and identifiers and cites #6063, as a non-discharging record (never a re-mint). Its reported context is declared in
+the one-line remedy the failure names. While the banner is EXPIRED or VOID
+at both ends, [**#6124**](https://github.com/alphaonedev/ai-memory-mcp/issues/6124)
+also accepts exactly ONE new amendment below STATUS (its header alone on
+its line, outside code fences and HTML comments, with a valid date) that
+lists exactly the changed watched paths and identifiers and cites only
+#6063 by its issue URL, as a non-discharging record (never a re-mint);
+every earlier amendment must stay byte-identical (append-only), and the
+failure text names that record form. Its reported context is declared in
 `scripts/qc-allowlists/required-contexts-release.txt`; until the
 operator-gated branch-protection API call adds it to the live required
 set, the gate is a red check, not a merge block.)
@@ -1945,6 +1952,13 @@ reproducible with `scripts/recapture-cert-3607-posture.sh`.
 ---
 
 ## 8. Current determination
+
+**Current state: EXPIRED since 2026-10-07** (see the STATUS banner at the top;
+§7 fired after the `385da3a05` bind and re-measurement and re-issue are pending
+under WP-B1, [#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)).
+The determinations below are historical records of earlier binds. Amendments
+recorded under #6124 while the banner is EXPIRED are non-discharging records:
+they list what changed and never return the document to LIVE.
 
 **Status at `f32c18dadf8a659567960747cc2802186bac9de9` (2026-09-21
 re-issue; the v1.0.0 promotion candidate; supersedes the 2026-09-12 #3607
