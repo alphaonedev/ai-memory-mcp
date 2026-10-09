@@ -889,8 +889,10 @@ ai-memory curator --prune-reports --json
 # Idempotent and resumable; safe to re-run.
 ai-memory curator --prune-reports --apply
 
-# Postgres-backed store: the same collapse through the SAL trait.
-ai-memory curator --prune-reports --apply --store-url postgres://…
+# Postgres-backed store: the same collapse through the SAL trait. The DSN
+# comes from the 0600 file (or AI_MEMORY_STORE_URL), never from --store-url
+# on the argv, which any local UID can read via /proc/<pid>/cmdline.
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory curator --prune-reports --apply
 ```
 
 **Curator self-reports (#3345).** Each sweep writes one `Tier::Short` row to
@@ -1939,7 +1941,11 @@ ai-memory quarantine list                          # what is currently held (ide
 ai-memory quarantine list --namespace team/eng     # narrow to one namespace
 ai-memory quarantine list --limit 500 --json       # bounded page, machine-readable
 ai-memory quarantine release <id>                  # release ONE quarantined row to open, or decontaminate ONE contaminated row (#3266 R2.5)
-ai-memory quarantine list --store-url postgres://… # same two verbs on the enterprise tier
+# Enterprise tier: a `--store-url` beginning with `postgres` selects the SAL
+# path (src/daemon_runtime.rs:2230); the DSN that is actually opened comes from
+# AI_MEMORY_STORE_URL_FILE / AI_MEMORY_STORE_URL when either is set
+# (build_curator_store -> resolve_store_url), so keep the credential there.
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory quarantine list --store-url postgres://
 ```
 
 [#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948) writes an

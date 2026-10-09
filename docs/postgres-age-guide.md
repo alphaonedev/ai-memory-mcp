@@ -329,10 +329,12 @@ a backend that *does* come up; use `doctor` to diagnose one that does not.
 way to bootstrap a fresh postgres backend:
 
 ```bash
-ai-memory schema-init --store-url 'postgres://aimemory:changeme-please@localhost:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
+# Password from ~/.pgpass (mode 0600, one line: localhost:5432:aimemory:aimemory:<password>),
+# not in the URL: schema-init reads its URL only from the argv.
+ai-memory schema-init --store-url 'postgres://aimemory@localhost:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
 ```
 
-`schema-init` is one of two verbs with no non-argv channel: it reads its URL only from the required `--store-url` argument (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host, and start the long-running `serve` through `AI_MEMORY_STORE_URL_FILE` (see [Daemon configuration](#daemon-configuration)).
+`schema-init` is one of two verbs with no non-argv channel: it reads its URL only from the required `--store-url` argument (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), and an argv is visible in `ps` to every local UID for the seconds this one-shot command runs. Keep the password out of the URL: when the DSN carries no password the `sqlx` driver resolves it from `PGPASSFILE` or `~/.pgpass` (`sqlx-postgres` 0.8.6 `options/parse.rs` → `apply_pgpass`), so only the user, host and database ride on the argv. Start the long-running `serve` through `AI_MEMORY_STORE_URL_FILE` (see [Daemon configuration](#daemon-configuration)).
 
 Since v1.0.0 (#3705, "only encrypted data in transit") every DSN the
 daemon or CLI opens MUST pin `sslmode=verify-full&sslrootcert=<ca>`; a DSN
