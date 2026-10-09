@@ -1952,6 +1952,69 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     if rc == 0 or "--head-sha" not in out:
         t.fail(f"(tr-e-args): --trusted without --head-sha did not refuse (rc {rc}):", out)
     _trusted_round2_cells(tmp, t, judge, shapes, mirror, job)
+    _trusted_merge_ref_cells(t, fx, mirror, head8, good8, unrel8)
+
+
+# #6176: the merge ref is re-fetched a fixed number of times with fixed sleeps.
+PINNED_MERGE_REF_SLEEPS = (5, 10, 20, 30)
+
+
+def _trusted_merge_ref_cells(t, fx, mirror, head8, good8, unrel8):
+    """#6176: with --pr-number the gate fetches refs/pull/<N>/merge itself and
+    re-fetches a stale or missing merge ref with bounded backoff before it
+    fails closed with an ::error annotation. Sleeps are recorded, not slept."""
+    if globals().get("MERGE_REF_SLEEPS") != PINNED_MERGE_REF_SLEEPS:
+        t.fail(f"(tr-m-pin): MERGE_REF_SLEEPS {globals().get('MERGE_REF_SLEEPS')!r} differs from "
+               f"{PINNED_MERGE_REF_SLEEPS!r}")
+    slept, on_sleep = [], []
+
+    def fake_sleep(seconds):
+        slept.append(seconds)
+        if on_sleep:
+            on_sleep.pop(0)()
+
+    def set_ref(sha):
+        if sha:
+            fx.g("update-ref", "refs/pull/7/merge", sha)
+        elif run_git(fx.repo, "rev-parse", "--verify", "--quiet", "refs/pull/7/merge").returncode == 0:
+            fx.g("update-ref", "-d", "refs/pull/7/merge")
+
+    def cell(label, why, sha, ok, needles=(), sleeps=(), args=("--pr-number=7", "--merge-ref=refs/remotes/pull/m7")):
+        set_ref(sha)
+        del slept[:]
+        rc, out = trusted_cli(mirror, "--base-ref=main", f"--head-sha={head8}", *args)
+        if ok and rc != 0:
+            t.fail(f"({label}): {why} was REJECTED (rc {rc}):", out)
+        elif not ok and rc != 1:
+            t.fail(f"({label}): {why} did not fail closed with rc 1 (rc {rc}):", out)
+        for needle in needles:
+            if needle not in out:
+                t.fail(f"({label}): {why}: output does not say {needle!r}:", out)
+        if list(slept) != list(sleeps):
+            t.fail(f"({label}): {why}: slept {slept!r}, expected the fixed backoff {list(sleeps)!r}", out)
+
+    saved = globals().get("_sleep")
+    globals()["_sleep"] = fake_sleep
+    try:
+        cell("tr-m-current", "a current merge ref on the first fetch", good8, True)
+        on_sleep.append(lambda: set_ref(good8))
+        cell("tr-m-late", "a merge ref that becomes current on the second fetch", unrel8, True, sleeps=(5,))
+        del on_sleep[:]
+        attempts = f"{len(PINNED_MERGE_REF_SLEEPS) + 1} fetch attempts"
+        cell("tr-m-stale", "a merge ref that never becomes current", unrel8, False,
+             needles=("::error title=cert-expiry trusted::", "stale", attempts), sleeps=PINNED_MERGE_REF_SLEEPS)
+        cell("tr-m-missing", "no merge ref at all (a conflicted pull request)", "", False,
+             needles=("::error title=cert-expiry trusted::", "conflict", attempts), sleeps=PINNED_MERGE_REF_SLEEPS)
+        for bad in ("0", "07", "7x", "-1", "1" * 11):
+            cell(f"tr-m-num-{bad[:4]}", f"--pr-number {bad!r}", good8, False, needles=("--pr-number",),
+                 args=(f"--pr-number={bad}", "--merge-ref=refs/remotes/pull/m7"))
+        cell("tr-m-sha", "--pr-number with a sha --merge-ref", good8, False, needles=("--merge-ref",),
+             args=("--pr-number=7", f"--merge-ref={good8}"))
+    finally:
+        if saved is None:
+            globals().pop("_sleep", None)
+        else:
+            globals()["_sleep"] = saved
 
 
 def _trusted_round2_cells(tmp, t, judge, shapes, mirror, job):
