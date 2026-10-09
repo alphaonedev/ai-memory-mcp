@@ -1256,6 +1256,17 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     rc, out, err = run_gate_shimmed(tmp, repo, env7)
     if rc != 0:
         t.fail("(shim-control): the pass-through git shim was REJECTED:", out + err)
+    # #6178: a scratch path that contains the PATH separator splits the shim
+    # entry, so the shim is unreachable and the real git runs; refuse that.
+    sep_dir = tmp / f"sep{os.pathsep}dir"
+    sep_dir.mkdir()
+    try:
+        run_gate_shimmed(sep_dir, repo, env7, version="git version 2.29.9")
+    except GateError as exc:
+        if "PATH separator" not in str(exc):
+            t.fail(f"(shim-pathsep): refused for the wrong reason: {exc}")
+    else:
+        t.fail("(shim-pathsep): a scratch path containing the PATH separator was not refused")
     # Each of the next two cells is rejected by exactly one predicate.
     t.gate("pr7-second", "a two-parent merge whose second parent is an unrelated branch, not "
            "PR_HEAD_SHA", repo, dict(env7, GITHUB_SHA=unrel7), "is not PR_HEAD_SHA")
