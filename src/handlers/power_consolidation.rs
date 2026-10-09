@@ -476,6 +476,17 @@ pub async fn consolidate_memories(
     }
     let tier = body.tier.unwrap_or(Tier::Long);
     let source_ids = body.ids.clone();
+    // #4286 (CWE-367, the #4045 class on the tenant surface) — an LLM summary
+    // is built from the sources as the gate read them, and the model runs
+    // with no store lock held. Pin each source's `version` from that read so
+    // the consolidation refuses (409, nothing consumed) when a source changed
+    // in the window instead of consuming text the summary never saw. A
+    // caller-supplied summary is the caller's own statement and stays
+    // unpinned.
+    let expected_versions: Option<Vec<i64>> = match body.summary.as_deref() {
+        Some(s) if !s.is_empty() => None,
+        _ => Some(consolidate_sources.iter().map(|m| m.version).collect()),
+    };
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 14) — postgres-backed daemons
     // route through the SAL trait. Returns a structured 201/error envelope
@@ -510,7 +521,7 @@ pub async fn consolidate_memories(
         };
         let new_id = match app
             .store
-            .consolidate(
+            .consolidate_with_expected_versions(
                 &ctx,
                 &body.ids,
                 &body.title,
@@ -519,6 +530,7 @@ pub async fn consolidate_memories(
                 &tier,
                 crate::db::CONSOLIDATION_SOURCE,
                 &pg_author_id,
+                expected_versions.as_deref(),
             )
             .await
         {
@@ -686,7 +698,7 @@ pub async fn consolidate_memories(
         Some(f) => f.sender_agent_id.clone(),
         None => consolidator_agent_id.clone(),
     };
-    let consolidate_result = db::consolidate(
+    let consolidate_result = db::consolidate_with_expected_versions(
         &lock.0,
         &body.ids,
         &body.title,
@@ -696,6 +708,7 @@ pub async fn consolidate_memories(
         crate::db::CONSOLIDATION_SOURCE,
         &author_id,
         false,
+        expected_versions.as_deref(),
     );
     // #1788 — refund the quota charge if the consolidate write failed (mirrors
     // the single-write refund_op path). Best-effort; done inside the lock.
@@ -818,10 +831,22 @@ pub async fn consolidate_memories(
             )
                 .into_response()
         }
-        // #3014 — 403 ATTESTATION_FAILED under global-strict (parity with the
-        // store path); otherwise the sanitized 500.
-        Err(e) => crate::handlers::errors::attestation_refused_response(&e.to_string())
-            .unwrap_or_else(|| crate::handlers::errors::handler_error_500(&e)),
+        Err(e) => {
+            // #4286 — a source changed after the LLM summary was built from
+            // it: 409 with the typed version pair, nothing consumed, safe to
+            // retry (the envelope `PUT /memories/{id}` uses for #884).
+            if let Some(vc) = e.downcast_ref::<crate::storage::VersionConflict>() {
+                let mut body = vc.envelope();
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("error".to_string(), json!(e.to_string()));
+                }
+                return (StatusCode::CONFLICT, Json(body)).into_response();
+            }
+            // #3014 — 403 ATTESTATION_FAILED under global-strict (parity with
+            // the store path); otherwise the sanitized 500.
+            crate::handlers::errors::attestation_refused_response(&e.to_string())
+                .unwrap_or_else(|| crate::handlers::errors::handler_error_500(&e))
+        }
     }
 }
 

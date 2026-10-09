@@ -3944,6 +3944,22 @@ impl std::fmt::Display for VersionConflict {
 
 impl std::error::Error for VersionConflict {}
 
+impl VersionConflict {
+    /// The one JSON conflict envelope every surface returns for a typed
+    /// version mismatch (`PUT /memories/{id}`, `memory_update`, and the
+    /// #4286 consolidate refusal), so a caller re-reads and retries the
+    /// same way everywhere.
+    #[must_use]
+    pub fn envelope(&self) -> serde_json::Value {
+        serde_json::json!({
+            "status": "conflict",
+            "id": self.id,
+            (crate::models::field_names::EXPECTED_VERSION): self.expected,
+            (crate::models::field_names::CURRENT_VERSION): self.current,
+        })
+    }
+}
+
 /// v0.8.0 Pillar 2 (#1726) — typed error returned when a lifecycle-state
 /// transition is illegal per
 /// [`crate::models::LifecycleState::can_transition_to`] (e.g. `open → done`
