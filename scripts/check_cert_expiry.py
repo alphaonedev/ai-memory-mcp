@@ -1981,6 +1981,39 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                      repo, dict(pr_base_env, **{key: "a" * 64}), "does not resolve to a commit")
         if hex_msg in out:
             t.fail(f"(pr4-sha256): a 64-hex {key} was refused by the sha validator:", out)
+    # The push lane validates GITHUB_EVENT_BEFORE and GITHUB_SHA at their own sites
+    # in resolve_range: a 64-hex value passes the validator and the run then stops
+    # at the later range lookup, never at the validator.
+    push_sha_env = _gate_env(GITHUB_EVENT_NAME="push", GITHUB_EVENT_BEFORE=base, GITHUB_SHA=base,
+                             PATH=os.environ.get("PATH", ""))
+    for key in ("GITHUB_EVENT_BEFORE", "GITHUB_SHA"):
+        out = t.gate("pr4-sha256", f"push with a 64-hex {key} (accepted by the validator)",
+                     repo, dict(push_sha_env, **{key: "a" * 64}), "cannot resolve range")
+        if hex_msg in out:
+            t.fail(f"(pr4-sha256): a push 64-hex {key} was refused by the sha validator:", out)
+    # (#6144) The validator is case-insensitive: git accepts upper-case hex, so an
+    # upper-case 40- or 64-hex value on every validated key reaches the later
+    # lookup. Narrowing ENV_SHA_RE to lower-case hex turns these cells red.
+    for n in (40, 64):
+        for key in ("PR_HEAD_SHA", "GITHUB_SHA"):
+            out = t.gate("pr4-sha-case", f"pull_request with an upper-case {n}-hex {key}",
+                         repo, dict(pr_base_env, **{key: "A" * n}), "does not resolve to a commit")
+            if hex_msg in out:
+                t.fail(f"(pr4-sha-case): an upper-case {n}-hex {key} was refused by the sha "
+                       "validator:", out)
+        # The payload PR_BASE_SHA is validated before the merge-commit parent checks,
+        # which refuse this fixture ("is not on the live base"), never the validator.
+        out = t.gate("pr4-sha-case", f"pull_request with an upper-case {n}-hex PR_BASE_SHA",
+                     repo, dict(pr_base_env, PR_BASE_SHA="A" * n), "is not on the live base")
+        if hex_msg in out:
+            t.fail(f"(pr4-sha-case): an upper-case {n}-hex PR_BASE_SHA was refused by the sha "
+                   "validator:", out)
+        for key in ("GITHUB_EVENT_BEFORE", "GITHUB_SHA"):
+            out = t.gate("pr4-sha-case", f"push with an upper-case {n}-hex {key}",
+                         repo, dict(push_sha_env, **{key: "A" * n}), "cannot resolve range")
+            if hex_msg in out:
+                t.fail(f"(pr4-sha-case): a push upper-case {n}-hex {key} was refused by the sha "
+                       "validator:", out)
     # 63 / 65 hex are refused by the validator before any repository-touching git
     # call. The only git call that legitimately precedes validation is the
     # `git --version` probe in run_gate (require_git_version). The shim appends
@@ -1988,22 +2021,28 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # holds exactly that one call (argv tail `--version`): a silent is_commit (`rev-parse`) or
     # `fetch origin <value>` ahead of the validator is recorded even when the
     # failure it causes is swallowed by run_git, so it turns this cell red.
+    # The loop covers the pull_request lane (PR_HEAD_SHA, GITHUB_SHA) and the push
+    # lane (GITHUB_EVENT_BEFORE, GITHUB_SHA), each validated at its own site.
+    sha_len_cells = (
+        [("pull_request", k, pr_base_env) for k in ("PR_HEAD_SHA", "GITHUB_SHA")]
+        + [("push", k, push_sha_env) for k in ("GITHUB_EVENT_BEFORE", "GITHUB_SHA")]
+    )
     for n in (63, 65):
-        for key in ("PR_HEAD_SHA", "GITHUB_SHA"):
-            trace = Path(tmp) / f"git-trace-{key}-{n}.jsonl"
+        for lane, key, lane_env in sha_len_cells:
+            trace = Path(tmp) / f"git-trace-{lane}-{key}-{n}.jsonl"
             trace.unlink(missing_ok=True)
-            rc, out, err = run_gate_shimmed(tmp, repo, dict(pr_base_env, **{key: "b" * n}),
+            rc, out, err = run_gate_shimmed(tmp, repo, dict(lane_env, **{key: "b" * n}),
                                             fail="rev-parse", trace=trace)
             text = out + err
             calls = ([json.loads(ln) for ln in trace.read_text(encoding="utf-8").splitlines()]
                      if trace.exists() else [])
             if rc != 1 or hex_msg not in text or "shim refuses" in text:
-                t.fail(f"(pr4-sha-len): a {n}-hex {key} was not refused by the validator:", text)
+                t.fail(f"(pr4-sha-len): a {lane} {n}-hex {key} was not refused by the validator:", text)
             # run_git prefixes every call with `-c core.quotePath=false -C <repo>`, so
             # the verb and its operands are the tail of argv: the probe ends in
             # `--version`, a rev-parse / fetch does not.
             if len(calls) != 1 or calls[0][-1:] != ["--version"]:
-                t.fail(f"(pr4-sha-len): a {n}-hex {key} ran git calls other than the "
+                t.fail(f"(pr4-sha-len): a {lane} {n}-hex {key} ran git calls other than the "
                        f"`--version` probe before the validator refused it: {calls!r}", text)
 
     # (k) fail-closed - pull_request with nothing set (missing PR head sha / base ref).
@@ -2125,8 +2164,9 @@ SELF_TEST_OK = (
     "(checkout-depth-coverage, #6145) checkout-depth runs the shim-unexecutable cell; "
     "(checkout-depth, #6145) every #6145 shim and scratch cell (including shim-unexecutable) passes in a 226-byte scratch dir, the one a 184-byte checkout gets; "
     "the gate-run fixtures build one gitshim.* level under the scratch dir and fit within it; "
-    "(pr4-sha256, #6144) a 64-hex PR_HEAD_SHA / GITHUB_SHA passes the validator and fails cleanly at the git lookup; "
-    "(pr4-sha-len) 63/65-hex refused with only the `git --version` probe traced before the validator."
+    "(pr4-sha256, #6144) a 64-hex PR_HEAD_SHA / GITHUB_SHA (pull_request) and GITHUB_EVENT_BEFORE / GITHUB_SHA (push) pass the validator and fail cleanly at the later lookup; "
+    "(pr4-sha-case, #6144) upper-case 40/64-hex shas pass the validator on every validated key; "
+    "(pr4-sha-len) 63/65-hex refused on both lanes with only the `git --version` probe traced before the validator."
 )
 
 
