@@ -79,6 +79,7 @@ class AsyncAiMemoryClient:
                 verify=verify,
                 cert=cert,
                 extra_headers=headers,
+                is_async=True,
             )
         )
 
