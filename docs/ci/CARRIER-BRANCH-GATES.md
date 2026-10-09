@@ -151,7 +151,9 @@ partial run records nothing.
 
 **Storage.** A per-runner directory (`$CI_TEST_MANIFEST_DIR`, default
 `$HOME/.cache/ai-memory-ci/test-manifest`), one JSON file per node, tier and
-base ref, written atomically under an advisory lock. `ci.yml` has no
+base ref, written atomically under an advisory lock. A run that cannot take
+the lock records nothing (lookup is unaffected). Each record removes this
+script's manifests, locks and temp files older than 7 days. `ci.yml` has no
 `actions/cache` precedent (only `Swatinem/rust-cache`, hosted legs only), the
 enterprise-fed legs are self-hosted, and GitHub's cache scoping rules differ
 per base. The repository already documents why archive restores onto

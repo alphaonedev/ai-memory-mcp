@@ -64,7 +64,9 @@ Safety rules (enforced here, not only documented):
 6. ``record`` refuses unless the step exit code is exactly 0.
 
 Fail direction: every doubt means "run the binary". Storage is a per-runner
-directory; writes are atomic (temp file + rename) under an advisory lock.
+directory; writes are atomic (temp file + rename) under an advisory lock
+that fails closed (no lock, no record), and each record sweeps files older
+than 7 days (r1 L4).
 
 Python 3.9+, standard library only.
 """
@@ -938,22 +940,90 @@ def run_restore(args):
 # ---------------------------------------------------------------- record ----
 
 class _Lock:
+    """Exclusive advisory lock on ``path``. Fails closed (r1 L4): when the
+    lock cannot be taken, CacheError is raised and nothing is recorded."""
+
     def __init__(self, path):
         self.path = path
         self.fh = None
 
     def __enter__(self):
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self.fh = open(self.path, 'a')
         try:
             import fcntl
+        except ImportError as exc:
+            raise CacheError('no advisory locks on this platform: %s' % exc)
+        try:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            self.fh = open(self.path, 'a')
             fcntl.flock(self.fh, fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            pass
+        except OSError as exc:
+            if self.fh is not None:
+                self.fh.close()
+                self.fh = None
+            raise CacheError('cannot lock %s: %s' % (self.path, exc))
         return self
 
     def __exit__(self, *exc):
-        self.fh.close()
+        if self.fh is not None:
+            self.fh.close()
+        return False
+
+
+SWEEP_MANIFEST_RE = re.compile(r'^test-manifest-.*\.json$')
+SWEEP_TMP_RE = re.compile(r'^\.test-manifest-.*\.json\.\d+\.tmp$')
+
+
+def sweep_manifest_dir(manifest_dir, keep, wall_now=None):
+    """Remove manifests, locks and temp files older than 7 days (r1 L4).
+
+    Ages come from file mtimes against the wall clock. ``keep`` (the manifest
+    just written) and its lock are never removed. A lock goes only when its
+    manifest is gone and a non-blocking flock on it succeeds (nobody holds
+    it). Only files named like this script's own files are touched; every
+    error is ignored (a sweep never affects the record). Returns the count.
+    """
+    wall_now = time.time() if wall_now is None else wall_now
+    mdir = Path(manifest_dir)
+    keep = Path(keep)
+    removed = 0
+    try:
+        entries = sorted(mdir.iterdir())
+    except OSError:
+        return 0
+
+    def old(path):
+        try:
+            st = os.lstat(str(path))
+        except OSError:
+            return False
+        return stat.S_ISREG(st.st_mode) and wall_now - st.st_mtime > MAX_AGE_SECONDS
+
+    for path in entries:
+        name = path.name
+        if path == keep or not (SWEEP_MANIFEST_RE.match(name) or SWEEP_TMP_RE.match(name)):
+            continue
+        if old(path):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    for path in entries:
+        name = path.name
+        if not name.endswith('.json.lock') or not SWEEP_MANIFEST_RE.match(name[:-len('.lock')]):
+            continue
+        manifest = path.with_name(name[:-len('.lock')])
+        if manifest == keep or manifest.exists() or not old(path):
+            continue
+        try:
+            import fcntl
+            with open(str(path), 'a') as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                path.unlink()
+                removed += 1
+        except (ImportError, OSError):
+            pass
+    return removed
 
 
 def run_record(args, now=None):
@@ -977,7 +1047,12 @@ def run_record(args, now=None):
         return 0
     tier, base, node = plan['tier'], plan['base'], plan['node']
     mpath = manifest_path(args.manifest_dir, node, tier, base)
-    with _Lock(str(mpath) + '.lock'):
+    try:
+        lock = _Lock(str(mpath) + '.lock').__enter__()
+    except CacheError as exc:
+        print('::warning::[%s] test-binary cache not recorded: %s (lookup is unaffected)' % (ISSUE, exc))
+        return 0
+    try:
         prior, _ = load_manifest(mpath, tier, base, now)
         entries = dict(prior)
         recorded = dropped = 0
@@ -992,8 +1067,11 @@ def run_record(args, now=None):
         doc = {'schema': SCHEMA, 'tier': tier, 'base': base, 'node': node, 'updated_at': now,
                'updated_run_id': args.run_id, 'entries': entries}
         atomic_write(mpath, json.dumps(doc, indent=1, sort_keys=True) + '\n')
-    print('::notice::[%s] test-binary cache recorded: %d pass, %d without key (%d entries in %s)'
-          % (ISSUE, recorded, dropped, len(entries), mpath.name))
+        swept = sweep_manifest_dir(mpath.parent, mpath)
+    finally:
+        lock.__exit__(None, None, None)
+    print('::notice::[%s] test-binary cache recorded: %d pass, %d without key (%d entries in %s; swept %d old files)'
+          % (ISSUE, recorded, dropped, len(entries), mpath.name, swept))
     return 0
 
 
