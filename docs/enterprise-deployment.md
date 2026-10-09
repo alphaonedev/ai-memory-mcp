@@ -906,8 +906,11 @@ Same-DC cross-rack adds ~0.5 ms RTT. Effective p95s:
   5–30 ms within a region. Sync replication remains feasible but
   the trade-off shifts.
 - **Quorum considerations.** A two-DC deployment with W=2 of N=2
-  cannot tolerate a single DC failure. The minimum partition-tolerant
-  deployment is three DCs (or two DCs + a witness in a third location).
+  cannot meet its quorum during a single DC failure: writes keep landing
+  locally and are answered `202` with `quorum_met:false` until the other
+  DC is reachable again (§6.4). The minimum deployment that keeps meeting
+  quorum through a single-DC failure is three DCs (or two DCs + a witness
+  in a third location).
 
 ### 6.2 Cross-DC federation
 
@@ -947,20 +950,68 @@ Recommended pattern for T5:
 
 ### 6.4 Quorum considerations for partition tolerance
 
-A two-DC deployment has a fundamental dilemma: any reasonable W (=2)
-requires both DCs to be reachable, so a single-DC partition halts
-writes. Three options:
+**A partition does not halt writes.** A write that cannot reach its
+W-of-N quorum is neither refused nor rolled back: the local commit lands
+first (ADR-0001) and the peer fanout runs after it. A quorum miss is
+answered **`202 Accepted`** with the replication state in the body,
+`{"quorum_met": false, "acks": <acks received, local included>,
+"needed": <W>, "reason": "...", "durability": "local"}`
+(`under_replicated_response` in `src/handlers/parity.rs`; the v0.8.1 W3 /
+gap G12 decision that a locally-durable write is never a 5xx). There is no
+`Retry-After` header, because the client is not the retry path. The row
+stays on the local node, every peer that did not ack gets a
+`federation_push_dlq` row (the #2667 landing pass in
+`src/federation/sync.rs`, on every fanout lane), and the replay worker
+(`spawn_replay_federation_push_dlq` in `src/federation/push_dlq.rs`)
+re-posts it on the catch-up cadence until the peer acks. The peer's own
+catch-up pull (`spawn_catchup_loop` in `src/federation/receive.rs`, every
+`--catchup-interval-secs`, default 30) fetches from `/sync/since` whatever
+it missed. Pinned by
+`src/handlers/tests.rs::http_set_qs_fanout_202_payload_shape_includes_quorum_fields`
+and `src/handlers/tests.rs::http_set_qs_fanout_202_no_retry_after_header_w3`,
+and on the Postgres backend by
+`tests/federation_postgres_fanout.rs::consolidate_fanout_postgres_under_replicated_is_202_2861`.
 
-1. **Accept the write-halt on partition.** Simplest. Operator alarms
-   when one DC is unreachable; manual failover.
+So during a single-DC partition a two-DC deployment at W=2 keeps
+accepting writes on both sides, each answered `202 quorum_met:false`. What
+the partition costs is cross-DC durability and coordination, not
+availability: a `202` proves only a local commit, the two sides diverge
+until the partition heals, and the DLQ replay plus the catch-up pull then
+converge them under the newer-wins merge. A caller that needs
+quorum-confirmed durability must read the body, not the status class, and
+an authority-granting write (an action claim, a lease) must never be taken
+as cluster-confirmed from a `2xx` alone.
+
+What the operator sees during the partition (§12.2 metrics):
+`ai_memory_federation_push_dlq_depth` rises and stays non-zero, and the
+#1544 edge-triggered WARN fires once when it crosses
+`AI_MEMORY_FED_DLQ_DEPTH_WARN_THRESHOLD` (default 1000);
+`ai_memory_federation_fanout_retry_total` climbs; and
+`ai_memory_federation_peer_last_success_timestamp_seconds{peer,direction}`
+stops advancing for the unreachable peer while its `last_attempt` keeps
+moving. When the peer is reachable again the DLQ replay and the catch-up
+pull resume on their own; no operator action is needed for convergence. A
+DLQ row is retried up to `MAX_REPLAY_ATTEMPTS` (`src/federation/push_dlq.rs`)
+and then quarantined (`ai_memory_federation_push_dlq_quarantined_total`,
+§6.6), which is the one outcome that does need an operator.
+
+Three ways to shape this:
+
+1. **Accept local-only writes during the partition.** Simplest. Alarm on
+   the DLQ depth gauge and the per-peer freshness gauge; review what
+   diverged after the heal if the workload is order-sensitive.
 2. **Add a witness in a third location** — a small ai-memory peer
-   that exists only to break ties. Lowers cost vs a full third DC.
+   that exists only to break ties, so W=2 stays reachable from the
+   majority side. Lowers cost vs a full third DC.
 3. **Move to three DCs.** Three-of-three or three-of-five quorum;
-   single-DC failure becomes tolerable.
+   a single-DC failure no longer drops writes to local-only durability.
 
 The [`FederationConfig`](../src/federation/mod.rs) `policy` field
 ([`QuorumPolicy`](../src/replication.rs), its `w` member) carries the
-quorum width; the operator chooses it explicitly.
+quorum width; the operator chooses it explicitly. The ack deadline is
+`--quorum-timeout-ms` (`ServeArgs` in `src/daemon_runtime.rs`, default
+2000): cross-DC meshes need 5000–10000, and the do-1461 reference
+deployment uses 8000.
 
 ### 6.5 sync/push and sync/since across DCs
 
