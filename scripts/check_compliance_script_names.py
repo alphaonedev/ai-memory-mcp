@@ -53,7 +53,8 @@ Usage:
     python3 -I scripts/check_compliance_script_names.py [--root DIR]
     python3 -I scripts/check_compliance_script_names.py --self-test
 
-Exit codes: 0 green, 1 violation(s) found, 2 usage error, self-test failure,
+Exit codes: 0 green, 1 violation(s) found, 2 usage error, self-test failure
+(including ``SELF-TEST FAIL: fixture setup: ...`` when ``.local-runs`` is unusable),
 or an unreadable (non-UTF-8 / I/O error) compliance document, directory or
 allowlist.
 """
@@ -733,7 +734,11 @@ def main(argv):
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
     if args.self_test:
-        err = self_test()
+        try:
+            err = self_test()
+        except (OSError, Unreadable) as exc:
+            # A scratch or fixture I/O failure is a self-test failure (exit 2), not a violation (#6199).
+            err = "fixture setup: %s: %s" % (type(exc).__name__, exc)
         if err:
             print("SELF-TEST FAIL: " + err, file=sys.stderr)
             return 2
