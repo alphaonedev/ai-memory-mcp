@@ -178,6 +178,8 @@ pub struct WriteTxn<'c> {
     /// `true` once the transaction has been terminated (committed or
     /// rolled back), which makes [`Drop`] a no-op.
     finished: bool,
+    /// #4116 — this transaction's frame (see `storage::escalation_deferral`).
+    frame_id: u64,
 }
 
 impl<'c> WriteTxn<'c> {
@@ -192,10 +194,7 @@ impl<'c> WriteTxn<'c> {
     /// is left to roll back.
     pub fn begin(conn: &'c Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(SQL_BEGIN_IMMEDIATE)?;
-        Ok(Self {
-            conn,
-            finished: false,
-        })
+        Ok(Self::opened(conn))
     }
 
     /// Open an EXCLUSIVE write transaction on `conn` — the schema-migration
@@ -207,10 +206,7 @@ impl<'c> WriteTxn<'c> {
     /// [`WriteTxn::begin`], no guard is constructed on failure.
     pub fn begin_exclusive(conn: &'c Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(SQL_BEGIN_EXCLUSIVE)?;
-        Ok(Self {
-            conn,
-            finished: false,
-        })
+        Ok(Self::opened(conn))
     }
 
     /// Commit the transaction, consuming the guard.
@@ -225,7 +221,17 @@ impl<'c> WriteTxn<'c> {
         // Only a SUCCESSFUL commit disarms the guard. On the error path we
         // fall through with `finished == false` so `Drop` rolls back.
         self.finished = true;
+        let _settled = super::escalation_deferral::settle_frame(self.conn, self.frame_id);
         Ok(())
+    }
+
+    /// Register a freshly-opened transaction's #4116 escalation frame.
+    fn opened(conn: &'c Connection) -> Self {
+        Self {
+            conn,
+            finished: false,
+            frame_id: super::escalation_deferral::open_frame(conn),
+        }
     }
 
     /// Roll the transaction back explicitly, consuming the guard.
@@ -234,15 +240,28 @@ impl<'c> WriteTxn<'c> {
     /// to write `let _ = conn.execute_batch(SQL_ROLLBACK);` keep saying
     /// what they mean instead of relying on an invisible drop.
     pub fn rollback(mut self) {
-        self.finish();
+        let _settled = self.finish();
+    }
+
+    /// #4116 (vote D, item 2) — roll back a FUNNEL-OWNED transaction whose
+    /// body failed with `err`, settle its deferred escalations FIRST, and
+    /// return `err` rewritten to their REAL outcome: the queued text naming
+    /// `pending_id=<id>` (the row exists) or `escalation NOT queued: <err>`.
+    /// A funnel that owns its `WriteTxn` ends it with this, so its caller is
+    /// never handed a pending id that was not written.
+    #[must_use]
+    pub fn rollback_resolving(mut self, mut err: anyhow::Error) -> anyhow::Error {
+        let outcomes = self.finish();
+        super::escalation_deferral::resolve_refusal(&mut err, &outcomes);
+        err
     }
 
     /// Terminate the transaction with a ROLLBACK unless it is already
     /// terminated. Infallible by construction — see the type-level
     /// "Panics in `Drop`" note.
-    fn finish(&mut self) {
+    fn finish(&mut self) -> Vec<super::escalation_deferral::SettledEscalation> {
         if self.finished {
-            return;
+            return Vec::new();
         }
         self.finished = true;
         // A connection already back in autocommit has nothing open: the
@@ -250,9 +269,12 @@ impl<'c> WriteTxn<'c> {
         // a fatal statement error. Issuing ROLLBACK there would only log a
         // spurious "cannot rollback - no transaction is active".
         if self.conn.is_autocommit() {
-            return;
+            return super::escalation_deferral::settle_frame(self.conn, self.frame_id);
         }
-        if let Err(e) = self.conn.execute_batch(SQL_ROLLBACK) {
+        let rolled_back = self.conn.execute_batch(SQL_ROLLBACK);
+        // #4116 — queue deferred escalations (refused unless the lock is released).
+        let outcomes = super::escalation_deferral::settle_frame(self.conn, self.frame_id);
+        if let Err(e) = rolled_back {
             tracing::error!(
                 target: TXN_GUARD_TRACE_TARGET,
                 error = %e,
@@ -262,12 +284,13 @@ impl<'c> WriteTxn<'c> {
                  the request closed rather than write into it"
             );
         }
+        outcomes
     }
 }
 
 impl Drop for WriteTxn<'_> {
     fn drop(&mut self) {
-        self.finish();
+        let _settled = self.finish();
     }
 }
 
@@ -294,8 +317,17 @@ pub fn in_write_txn<T>(conn: &Connection, unit: impl FnOnce() -> Result<T>) -> R
     } else {
         None
     };
-    // An `Err` here drops `owned`, which rolls the owned transaction back.
-    let out = unit()?;
+    // An `Err` rolls the owned transaction back; #4116: an OWNED transaction
+    // settles its deferred escalations first and reports the real outcome.
+    let out = match unit() {
+        Ok(out) => out,
+        Err(e) => {
+            return Err(match owned {
+                Some(txn) => txn.rollback_resolving(e),
+                None => e,
+            });
+        }
+    };
     if let Some(txn) = owned {
         txn.commit()?;
     }
