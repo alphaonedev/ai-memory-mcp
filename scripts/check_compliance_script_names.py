@@ -455,7 +455,9 @@ def comment_text_removed(line, inside, spans=True):
             shown.append(line[pos:start.start()])
             opener = start.group()
             inside = HIDDEN_HTML_CLOSERS.get(opener, ">" if opener.startswith("<!") else "tag")
-            pos = start.end()
+            # ``<!-->`` and ``<!--->`` are complete comments: the closer may share the
+            # opener's dashes (#6246).
+            pos = start.start() + 2 if opener == "<!--" else start.end()
     return "".join(shown), inside
 
 
