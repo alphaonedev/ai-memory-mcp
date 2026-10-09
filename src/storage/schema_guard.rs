@@ -445,11 +445,21 @@ pub const SCHEMA_BEHIND_READ_ONLY_REFUSAL: &str =
 
 /// Repair verb named in the schema-behind refusal (and in `boot` / `doctor`
 /// copy). One spelling so the hardcoded-literals ratchet does not re-grow.
-pub const SCHEMA_BEHIND_REPAIR: &str = "ai-memory migrate --in-place";
+///
+/// v1.0.0 #4377 — it must be a command THIS build's CLI accepts (pinned by
+/// `tests/schema_behind_repair_hint_4377.rs`, which parses it with the real
+/// clap tree). It named `ai-memory migrate --in-place`, a flag `migrate` never
+/// had. `schema-init` runs the forward ladder on the resolved store and exits
+/// (`--features sal`); the default build has no in-place migrate verb, so it
+/// names `serve`, whose [`crate::db::open`] migrates.
+#[cfg(feature = "sal")]
+pub const SCHEMA_BEHIND_REPAIR: &str = "ai-memory schema-init --store-url <store-url>";
+/// See the `sal` variant above (#4377).
+#[cfg(not(feature = "sal"))]
+pub const SCHEMA_BEHIND_REPAIR: &str = "ai-memory serve";
 
 /// Companion repair: starting the daemon runs [`crate::db::open`], which
-/// migrates. Named next to [`SCHEMA_BEHIND_REPAIR`] because the default
-/// build has no `migrate` subcommand (`Migrate` is `--features sal`).
+/// migrates.
 pub const SCHEMA_BEHIND_REPAIR_DAEMON: &str = "start the daemon";
 
 /// v1.0.0 #3411 / #3434 — the typed refusal: this database's schema is

@@ -337,7 +337,7 @@ enum BootStatus {
     /// v1.0.0 #3411 / #3434 — `open_existing_read_only` refused because the
     /// recorded schema stamp is strictly BEHIND this binary. Distinct from
     /// [`Self::WarnSchemaUnsupported`] (ahead → "install a newer binary"):
-    /// this one names `ai-memory migrate --in-place` / start the daemon,
+    /// this one names `schema_guard::SCHEMA_BEHIND_REPAIR` / start the daemon,
     /// because the binary is already the right one and the database needs
     /// the writer funnel.
     WarnSchemaBehind { observed: i64, supported: i64 },

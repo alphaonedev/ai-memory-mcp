@@ -177,7 +177,7 @@ pub mod error_codes {
 
     /// v1.0.0 #3411 / #3434 — a read-only verb (`boot`, `doctor`) opened a
     /// database whose schema stamp is STRICTLY BEHIND this binary. A writer
-    /// (`db::open`, the daemon, `ai-memory migrate --in-place`) would migrate;
+    /// (`db::open`, the daemon, `ai-memory schema-init`) would migrate;
     /// these verbs must not. Un-prefixed for the same reason as
     /// [`SCHEMA_AHEAD_OF_BINARY`]: a deliberate refusal STATE shared across
     /// surfaces, not a backend fault. A SEPARATE slug because the operator

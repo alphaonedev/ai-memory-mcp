@@ -11,7 +11,7 @@
 //! 1. **Schema-behind on first boot after upgrade.** A user upgrading
 //!    from an older schema has a stamp below this binary; `boot` is
 //!    read-only and must WARN with the typed behind refusal (repair:
-//!    `ai-memory migrate --in-place` / start the daemon) rather than
+//!    `schema_guard::SCHEMA_BEHIND_REPAIR` / start the daemon) rather than
 //!    silently migrating. The writer funnel (`db::open`) still migrates.
 //! 2. **Corrupted DB.** Disk error, partial write, malware quarantine —
 //!    boot must exit 0 with a `warn` status rather than crashing the
@@ -116,7 +116,8 @@ fn boot_after_v18_to_v19_migration() {
     assert_eq!(parsed["status"], "warn");
     let note = parsed["note"].as_str().unwrap_or_default();
     assert!(
-        note.contains("behind") || note.contains("migrate --in-place"),
+        note.contains("behind")
+            || note.contains(ai_memory::storage::schema_guard::SCHEMA_BEHIND_REPAIR),
         "boot must name the behind repair, got note: {note}"
     );
     let still: i64 = rusqlite::Connection::open(&db_path)
