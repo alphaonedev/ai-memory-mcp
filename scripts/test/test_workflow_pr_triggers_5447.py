@@ -3986,5 +3986,58 @@ class WrapperAndWorkflowPythonIsolated6240(unittest.TestCase):
         self.assertTrue(any(f.startswith("ci.yml:") for f in _bare_python_script_runs(texts)))
 
 
+# ---- Round 4, item 5 (#6242): the queue ref sha is bound to the queued head ----
+
+SHA_D = "d" * 40
+
+
+class QueueRefShaBinding6242(unittest.TestCase):
+    """The ``<sha>`` in ``gh-readonly-queue/<base>/pr-<N>-<sha>`` must be a full sha equal to the queued head."""
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+        self.ext = _pr(7, SHA_A)
+
+    def run_group(self, event: dict, pulls: Optional[List[dict]] = None) -> Tuple[int, str]:
+        api = _fake_api(pulls if pulls is not None else [self.ext], {7: [_review(SHA_A)]})
+        rc, lines = self.mod.run_gate("merge_group", event, REPO_6117, SHA_C, OPERATOR_6117, api)
+        return rc, "\n".join(lines)
+
+    def test_6242_matching_sha_is_judged(self) -> None:
+        rc, out = self.run_group(_merge_group_event(7))
+        self.assertEqual(0, rc, out)
+
+    def test_6242_ref_sha_differing_from_the_queued_head_fails_closed(self) -> None:
+        rc, out = self.run_group(_merge_group_event(7, sha=SHA_D))
+        self.assertEqual(1, rc, out)
+        self.assertIn("cannot establish its verdict", out)
+        self.assertIn("queued head", out)
+
+    def test_6242_short_or_non_hex_ref_sha_fails_closed(self) -> None:
+        for sha in ("abc", "c" * 39, "C" * 40, "g" * 40, "c" * 41, "c" * 65):
+            with self.subTest(sha=sha):
+                rc, out = self.run_group(_merge_group_event(7, sha=sha))
+                self.assertEqual(1, rc, out)
+                self.assertIn("cannot establish its verdict", out)
+
+    def test_6242_missing_queued_head_sha_fails_closed(self) -> None:
+        event = _merge_group_event(7)
+        del event["merge_group"]["head_sha"]
+        rc, out = self.run_group(event)
+        self.assertEqual(1, rc, out)
+        self.assertIn("queued head", out)
+
+    def test_6242_m01_dropping_the_equality_is_killed(self) -> None:
+        src = APPROVAL_PY.read_text(encoding="utf-8")
+        needle = " or ref_sha != head_sha"
+        self.assertIn(needle, src)
+        mod = _exec_approval_src(src.replace(needle, ""))
+        api = _fake_api([self.ext], {7: [_review(SHA_A)]})
+        rc, lines = mod.run_gate("merge_group", _merge_group_event(7, sha=SHA_D), REPO_6117, SHA_C,
+                                 OPERATOR_6117, api)
+        self.assertEqual(0, rc, lines)  # the mutant accepts a forged ref sha ...
+        self.assertEqual(1, self.run_group(_merge_group_event(7, sha=SHA_D))[0])  # ... the live gate does not
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
