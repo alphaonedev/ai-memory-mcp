@@ -23,7 +23,7 @@
 
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::subscriptions::{
-    DeleteEventDetails, NewSubscription, dispatch_event, dispatch_event_with_details, insert,
+    DeleteEventDetails, NewSubscription, dispatch_event, dispatch_event_for_deleted, insert,
     wait_dispatch_idle,
 };
 use serde_json::json;
@@ -175,15 +175,9 @@ async fn private_delete_title_does_not_reach_a_non_reader_4069() {
         tier: row.tier.to_string(),
     })
     .ok();
-    dispatch_event_with_details(
-        &conn,
-        MEMORY_DELETE,
-        &id,
-        NS,
-        Some(ALICE),
-        &db_path,
-        details,
-    );
+    // Every delete funnel hands the fan-out its PRE-delete snapshot (the
+    // row is gone, so that is what the read gate is evaluated against).
+    dispatch_event_for_deleted(&conn, MEMORY_DELETE, &row, &db_path, details);
     wait_dispatch_idle().await;
 
     let alice_bodies = bodies_on(&receiver, &alice_path).await;

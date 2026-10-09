@@ -959,11 +959,139 @@ pub fn dispatch_event_with_details(
     db_path: &std::path::Path,
     details: Option<serde_json::Value>,
 ) {
+    // #4069 — resolve the SOURCE row the event is about so each
+    // subscriber's read permission can be checked. A row that cannot be
+    // resolved (already gone, or a read fault) is `Unavailable`, which
+    // fails CLOSED to the owner's own subscriptions; the delete funnels
+    // pass their pre-delete snapshot through `dispatch_event_for_deleted`.
+    let source = if event_names_a_memory(event) {
+        crate::storage::get_any(conn, memory_id).ok().flatten()
+    } else {
+        None
+    };
+    let gate = match (&source, event_names_a_memory(event)) {
+        (_, false) => SourceGate::Ungated,
+        (Some(mem), true) => SourceGate::Row(mem),
+        (None, true) => SourceGate::Unavailable,
+    };
+    dispatch_event_gated(conn, event, memory_id, namespace, agent_id, db_path, details, gate);
+}
+
+/// #4069 — `memory_delete` (and any other post-erase event): the row is
+/// gone, so the caller hands over its PRE-delete snapshot and the read gate
+/// is evaluated against that, exactly as it would have been against the
+/// live row. The envelope's `memory_id` / `namespace` / `agent_id` come
+/// from the same snapshot.
+pub fn dispatch_event_for_deleted(
+    conn: &Connection,
+    event: &str,
+    snapshot: &crate::models::Memory,
+    db_path: &std::path::Path,
+    details: Option<serde_json::Value>,
+) {
+    let owner = crate::write_events::owner_of(snapshot);
+    dispatch_event_gated(
+        conn,
+        event,
+        &snapshot.id,
+        &snapshot.namespace,
+        owner.as_deref(),
+        db_path,
+        details,
+        SourceGate::Row(snapshot),
+    );
+}
+
+/// Fired by the daemon's pending-action expiry sweep for every
+/// `pending_actions` row it expires. The envelope's `memory_id` slot carries
+/// the PENDING-ACTION id, not a memory row (see [`SourceGate::Ungated`]).
+/// Deliberately NOT in [`webhook_events`] / [`WEBHOOK_EVENT_TYPES`]: it is
+/// a dispatch-lane event that was never part of the advertised subscriber
+/// vocabulary, and this const only names its existing wire string.
+pub const PENDING_ACTION_EXPIRED_EVENT: &str = "pending_action_expired";
+
+/// #4069 — what the fan-out knows about the memory an event is about, for
+/// the per-subscriber read gate ([`subscriber_may_receive`]).
+#[derive(Clone, Copy)]
+pub enum SourceGate<'a> {
+    /// The event names no memory row (`approval_requested`,
+    /// `pending_action_expired`): the string filters alone decide, as
+    /// before #4069. Nothing in such an envelope is memory content.
+    Ungated,
+    /// The row (live, or the delete funnel's pre-delete snapshot).
+    Row(&'a crate::models::Memory),
+    /// The event names a memory row that is not in the store (or could not
+    /// be read). There is no content to protect beyond the envelope's own
+    /// id / namespace / owner — a read-back by id answers not-found to
+    /// everyone — so the string filters alone decide. Every delete funnel
+    /// passes its pre-delete snapshot ([`SourceGate::Row`]) precisely so a
+    /// just-erased private row never lands here.
+    Unavailable,
+}
+
+/// #4069 — events whose `memory_id` names a memory row (everything but the
+/// governance / pending-action events). Default-INCLUDED: a new event type
+/// is gated unless it is listed here as naming no memory.
+#[must_use]
+pub fn event_names_a_memory(event: &str) -> bool {
+    !matches!(
+        event,
+        webhook_events::APPROVAL_REQUESTED | PENDING_ACTION_EXPIRED_EVENT
+    )
+}
+
+/// #4069 — may the subscription owned by `created_by` receive an event
+/// about `source`, whose owner is `event_owner`?
+///
+/// Pre-#4069 the fan-out selected recipients by event / namespace / agent
+/// STRING filters alone and never consulted the read predicate, so a
+/// non-admin subscriber with no filters was sent events about another
+/// principal's PRIVATE memories (on SQLite the delete event carries the
+/// pre-delete title). The dispatcher's comment relied on "the wire-surface
+/// gate", which only establishes subscription OWNERSHIP.
+///
+/// * `created_by == None` — an operator-created registration with no
+///   owner (the CLI posture; the HTTP route refuses an anonymous
+///   subscribe, #3775, and the MCP tool stamps the caller): the documented
+///   single-tenant trust-all contract, unchanged.
+/// * `SourceGate::Row` — the SAME predicate every read lane applies
+///   ([`crate::visibility::is_readable_on_query`]), with the row's own
+///   namespace as the requested one so a substrate-namespace row (an inbox
+///   message) is judged by the per-row owner / recipient gate rather than
+///   hidden wholesale.
+/// * `SourceGate::Unavailable` — no row, so nothing beyond the envelope to
+///   protect; the string filters alone decide (see the variant doc).
+#[must_use]
+pub fn subscriber_may_receive(created_by: Option<&str>, source: SourceGate<'_>) -> bool {
+    let Some(subscriber) = created_by else {
+        return true;
+    };
+    match source {
+        SourceGate::Ungated | SourceGate::Unavailable => true,
+        SourceGate::Row(mem) => {
+            crate::visibility::is_readable_on_query(mem, Some(subscriber), Some(&mem.namespace))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_event_gated(
+    conn: &Connection,
+    event: &str,
+    memory_id: &str,
+    namespace: &str,
+    agent_id: Option<&str>,
+    db_path: &std::path::Path,
+    details: Option<serde_json::Value>,
+    gate: SourceGate<'_>,
+) {
     // Dispatch path needs the global view (every tenant's subscriptions
     // for this event), so `None` here is correct — ownership scoping
     // would silently drop matching subscribers belonging to OTHER
     // tenants. The cross-tenant authorization gate lives at the wire
-    // surface (MCP/HTTP handlers), not here. See #870/#872/#874.
+    // surface (MCP/HTTP handlers) for subscription OWNERSHIP, and
+    // (#4069) in `subscriber_may_receive` below for per-event READ
+    // permission. See #870/#872/#874.
     //
     // v0.7.0 #1097 — pre-filter by event type at the SQL level using
     // `list_by_event` instead of the legacy `list(conn, None)` full
@@ -1007,6 +1135,9 @@ pub fn dispatch_event_with_details(
                 agent_id,
             )
         })
+        // #4069 — the subscription owner must be able to READ the source
+        // memory; a string filter match is not a read authorization.
+        .filter(|s| subscriber_may_receive(s.created_by.as_deref(), gate))
         .map(|s| {
             let secret_hash = load_secret_hash_with_conn(conn, &s.id).unwrap_or(None);
             (s, secret_hash)

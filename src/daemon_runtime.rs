@@ -4413,7 +4413,7 @@ fn spawn_postgres_maintenance_loop_if_enabled(
                     for (id, namespace) in expired {
                         crate::handlers::dispatch_event_postgres(
                             &app,
-                            "pending_action_expired",
+                            crate::subscriptions::PENDING_ACTION_EXPIRED_EVENT,
                             &id,
                             &namespace,
                             None,
@@ -4734,7 +4734,7 @@ pub fn spawn_pending_timeout_sweep_loop(
                 let lock = state.lock().await;
                 crate::subscriptions::dispatch_event(
                     &lock.0,
-                    "pending_action_expired",
+                    crate::subscriptions::PENDING_ACTION_EXPIRED_EVENT,
                     &id,
                     &namespace,
                     None,

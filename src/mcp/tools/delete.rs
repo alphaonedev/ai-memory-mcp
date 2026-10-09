@@ -344,9 +344,7 @@ pub(super) fn handle_delete(
         crate::write_events::delete(
             conn,
             db_path,
-            &target.id,
-            &snapshot_namespace,
-            snapshot_owner.as_deref(),
+            &target,
             &crate::subscriptions::DeleteEventDetails {
                 title: snapshot_title,
                 tier: snapshot_tier,

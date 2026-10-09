@@ -1194,17 +1194,11 @@ pub async fn delete_memory(
                 // K7-style cross-namespace event subscribers get the
                 // delete notification on postgres-backed daemons.
                 if let Some(ref mem) = target {
-                    let mem_owner = mem
-                        .metadata
-                        .get("agent_id")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-                    super::dispatch_event_postgres(
+                    // #4069 — the pre-delete snapshot carries the read gate.
+                    super::dispatch_event_postgres_for_deleted(
                         &app,
                         crate::mcp::registry::tool_names::MEMORY_DELETE,
-                        &id,
-                        &mem.namespace,
-                        mem_owner.as_deref(),
+                        mem,
                         None,
                     )
                     .await;
@@ -1405,17 +1399,13 @@ pub async fn delete_memory(
             tier: target.tier.to_string(),
         })
         .ok();
-        let owner_aid = target
-            .metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        crate::subscriptions::dispatch_event_with_details(
+        // #4069 — the pre-delete snapshot carries the read gate: a private
+        // row's delete event (and its title) never reaches a subscriber the
+        // read path denies.
+        crate::subscriptions::dispatch_event_for_deleted(
             &lock.0,
             crate::mcp::registry::tool_names::MEMORY_DELETE,
-            &target.id,
-            &target.namespace,
-            owner_aid.as_deref(),
+            &target,
             &lock.1,
             details,
         );

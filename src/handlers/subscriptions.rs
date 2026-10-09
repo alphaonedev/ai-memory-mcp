@@ -1123,9 +1123,40 @@ pub async fn dispatch_event_postgres(
     // scope=private filter so a tenant's collective-scope event can fire
     // every matching subscriber's hook regardless of which tenant
     // registered it. The cross-tenant authorization gate lives at the
-    // wire surface (subscribe/list/unsubscribe handlers).
+    // wire surface (subscribe/list/unsubscribe handlers) for subscription
+    // OWNERSHIP, and (#4069) in `subscriber_may_receive` for per-event READ
+    // permission.
     let ctx =
         crate::store::CallerContext::for_admin(crate::identity::sentinels::SUBSCRIPTION_DISPATCH);
+    // #4069 — resolve the SOURCE row through the same admin view; a row
+    // that cannot be resolved fails CLOSED to the owner's own
+    // subscriptions (the delete funnel hands over its pre-delete snapshot
+    // through `dispatch_event_postgres_for_deleted` instead).
+    let source = if crate::subscriptions::event_names_a_memory(event) {
+        app.store.get(&ctx, memory_id).await.ok()
+    } else {
+        None
+    };
+    let gate = match (&source, crate::subscriptions::event_names_a_memory(event)) {
+        (_, false) => crate::subscriptions::SourceGate::Ungated,
+        (Some(mem), true) => crate::subscriptions::SourceGate::Row(mem),
+        (None, true) => crate::subscriptions::SourceGate::Unavailable,
+    };
+    dispatch_event_postgres_gated(app, &ctx, event, memory_id, namespace, agent_id, details, gate)
+        .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_event_postgres_gated(
+    app: &AppState,
+    ctx: &crate::store::CallerContext,
+    event: &str,
+    memory_id: &str,
+    namespace: &str,
+    agent_id: Option<&str>,
+    details: Option<serde_json::Value>,
+    gate: crate::subscriptions::SourceGate<'_>,
+) {
 
     // Pull only the subscription mirror rows (`_subscriptions/<agent>`)
     // via the sargable namespace-prefix scan. `Filter::namespace` is
@@ -1140,7 +1171,7 @@ pub async fn dispatch_event_postgres(
     let fetch_limit = SUBSCRIPTION_DISPATCH_LIMIT.saturating_add(1);
     let memories = match app
         .store
-        .list_by_namespace_prefix(&ctx, SUBSCRIPTION_NS_PREFIX, fetch_limit)
+        .list_by_namespace_prefix(ctx, SUBSCRIPTION_NS_PREFIX, fetch_limit)
         .await
     {
         Ok(rows) => rows,
@@ -1264,6 +1295,11 @@ pub async fn dispatch_event_postgres(
         ) {
             continue;
         }
+        // #4069 — the subscription owner must be able to READ the source
+        // memory; a string filter match is not a read authorization.
+        if !crate::subscriptions::subscriber_may_receive(created_by.as_deref(), gate) {
+            continue;
+        }
 
         let sub = crate::subscriptions::Subscription {
             id: sub_id,
@@ -1304,4 +1340,30 @@ pub async fn dispatch_event_postgres(
     crate::subscriptions::dispatch_event_to_subs(
         matching, event, memory_id, namespace, agent_id, &db_path, details,
     );
+}
+
+/// #4069 — the postgres-arm twin of
+/// [`crate::subscriptions::dispatch_event_for_deleted`]: the row is gone,
+/// so the read gate is evaluated against the caller's PRE-delete snapshot,
+/// which also supplies the envelope's id / namespace / owner.
+pub async fn dispatch_event_postgres_for_deleted(
+    app: &AppState,
+    event: &str,
+    snapshot: &Memory,
+    details: Option<serde_json::Value>,
+) {
+    let ctx =
+        crate::store::CallerContext::for_admin(crate::identity::sentinels::SUBSCRIPTION_DISPATCH);
+    let owner = crate::write_events::owner_of(snapshot);
+    dispatch_event_postgres_gated(
+        app,
+        &ctx,
+        event,
+        &snapshot.id,
+        &snapshot.namespace,
+        owner.as_deref(),
+        details,
+        crate::subscriptions::SourceGate::Row(snapshot),
+    )
+    .await;
 }

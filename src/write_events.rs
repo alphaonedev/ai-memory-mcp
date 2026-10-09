@@ -115,21 +115,21 @@ pub fn store(
 ///
 /// `details` comes from the caller's PRE-delete snapshot; there is no row
 /// left to read it from, which is exactly why the pairing belongs here
-/// and not at each call site.
+/// and not at each call site. #4069 — the whole `snapshot` travels with
+/// it: the fan-out evaluates each subscriber's READ permission against the
+/// row as it was (the envelope's id / namespace / owner are taken from it),
+/// so a private row's delete event never reaches a subscriber the read
+/// path denies.
 pub fn delete(
     conn: &Connection,
     db_path: &Path,
-    memory_id: &str,
-    namespace: &str,
-    agent_id: Option<&str>,
+    snapshot: &crate::models::Memory,
     details: &DeleteEventDetails,
 ) {
-    subscriptions::dispatch_event_with_details(
+    subscriptions::dispatch_event_for_deleted(
         conn,
         tool_names::MEMORY_DELETE,
-        memory_id,
-        namespace,
-        agent_id,
+        snapshot,
         db_path,
         details_of(details, tool_names::MEMORY_DELETE),
     );

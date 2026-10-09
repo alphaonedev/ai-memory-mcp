@@ -343,9 +343,7 @@ pub fn cmd_delete(
         crate::write_events::delete(
             &conn,
             db_path,
-            &target.id,
-            &target.namespace,
-            crate::write_events::owner_of(&target).as_deref(),
+            &target,
             &crate::subscriptions::DeleteEventDetails {
                 title: target.title.clone(),
                 tier: target.tier.to_string(),

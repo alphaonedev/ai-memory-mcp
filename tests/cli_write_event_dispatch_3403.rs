@@ -93,7 +93,10 @@ fn subscribe(db_path: &Path, url: &str, event_types: Option<&[String]>) {
             secret: Some("cli-3403-secret"),
             namespace_filter: None,
             agent_filter: None,
-            created_by: Some("cli-3403"),
+            // #4069 — the subscription is owned by the SAME principal the CLI
+            // runs as: fan-out now checks that a subscriber can read the
+            // source row, and these rows are private to `ai:cli-3403`.
+            created_by: Some("ai:cli-3403"),
             event_types,
         },
     )
