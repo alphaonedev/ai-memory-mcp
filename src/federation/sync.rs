@@ -597,13 +597,18 @@ pub(super) async fn land_push_failures(
             .enqueue_push_failure(dlq_key, peer_id, body, &reason)
             .await
         {
-            tracing::warn!(
-                target: super::push_dlq::PUSH_DLQ_TRACE_TARGET,
-                dlq_key = %dlq_key,
-                peer_id = %peer_id,
-                lane = %lane,
-                "federation: failed to enqueue {lane} push-failure DLQ row for peer \
-                 {peer_id} on {dlq_key}: {e}",
+            // #3658 — the data-loss form of the bookkeeping class: the failed
+            // push is now retried by nothing, so it is counted, not just logged.
+            super::push_dlq::note_bookkeeping_failure(
+                super::push_dlq::DlqBookkeepingOp::Enqueue,
+                None,
+                peer_id,
+                dlq_key,
+                &e,
+                &format!(
+                    "the failed {lane} push was NOT queued for retry; only the peer's own \
+                     /sync/since catch-up can deliver it"
+                ),
             );
         } else {
             tracing::info!(

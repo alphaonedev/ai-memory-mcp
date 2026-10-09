@@ -284,6 +284,20 @@ pub struct Metrics {
     /// §federation-push-DLQ. It should fall to zero and stay there.
     pub federation_push_dlq_legacy_positional: IntCounter,
 
+    /// #3658 — LOCAL federation push-DLQ bookkeeping writes that FAILED,
+    /// labeled by the write (`op`, closed set =
+    /// [`crate::federation::push_dlq::DlqBookkeepingOp::as_label`]:
+    /// `bump_attempt` | `note_throttled` | `mark_replayed` |
+    /// `reset_throttled` | `enqueue`).
+    ///
+    /// Pre-#3658 the replay worker discarded these `Result`s at the
+    /// `dyn FederationDlqSink` boundary, so a broken local DLQ store (disk,
+    /// lock, schema) looked exactly like a failing PEER: `attempt_count` and
+    /// `last_error` froze, quarantine never arrived, and the log described
+    /// the peer outcome only. Increments once per failed write (a rate);
+    /// sustained non-zero means the DLQ store is not persisting.
+    pub federation_push_dlq_bookkeeping_failed: IntCounterVec,
+
     /// #2716 (CB-12) — cumulative count of pending federated ERASURES /
     /// DELETES that the replay worker SUPERSEDED instead of propagating,
     /// because the target id is LIVE again locally with an `updated_at`
@@ -1104,6 +1118,20 @@ impl Metrics {
             &mut err,
         );
 
+        // #3658 — LOCAL DLQ bookkeeping failures, by op (closed set).
+        let federation_push_dlq_bookkeeping_failed = int_counter_vec(
+            &registry,
+            "ai_memory_federation_push_dlq_bookkeeping_failed_total",
+            "Federation push-DLQ bookkeeping writes that FAILED, labeled by the write \
+             (op=bump_attempt|note_throttled|mark_replayed|reset_throttled|enqueue). This is \
+             the LOCAL DLQ store failing to persist, not the peer: the row's attempt budget \
+             and last_error stay frozen and it is retried next tick; a failed enqueue means \
+             the failed push was not queued for retry. Sustained non-zero means the DLQ \
+             store is broken (disk, lock, schema). #3658.",
+            &["op"],
+            &mut err,
+        );
+
         // #2716 (CB-12) — federated erasure/delete supersede observability.
         let federation_erasure_superseded = int_counter(
             &registry,
@@ -1579,6 +1607,7 @@ impl Metrics {
             federation_push_dlq_quarantined_by_cause,
             unstamped_mutation_allowed_total,
             federation_push_dlq_legacy_positional,
+            federation_push_dlq_bookkeeping_failed,
             federation_erasure_superseded,
             federation_quarantined_unattributed,
             forensic_sink_unavailable,

@@ -817,7 +817,17 @@ It has its own counter instead:
 per affected row per replay pass. Non-zero after an upgrade means rows
 written by a pre-#2442 binary are still present — see
 `docs/TROUBLESHOOTING.md` §federation-push-DLQ. It should fall to zero and
-stay there. The label set is
+stay there. **#3658** adds
+`ai_memory_federation_push_dlq_bookkeeping_failed_total{op}` (closed label
+set `bump_attempt`|`note_throttled`|`mark_replayed`|`reset_throttled`|`enqueue`,
+SSOT `push_dlq::DlqBookkeepingOp`): a LOCAL DLQ bookkeeping write that
+failed. Before #3658 the replay worker discarded those results, so a broken
+local DLQ store (disk, lock, schema) looked exactly like a failing peer. A
+failed write is logged at `error` naming row, peer, op and error, counted,
+and the tick continues; the affected row keeps its pre-tick attempt budget
+and `last_error` and is retried next tick (idempotent on the peer by memory
+id). A failed `enqueue` means a failed push was not queued for retry at all.
+Sustained non-zero means the DLQ store is not persisting. The cause label set is
 enumerated in exactly one place in code
 (`push_dlq::classify_quarantine_cause`); treat that as the SSOT and this
 list as a mirror. #1544 also narrows the federation RECEIVE quota: the

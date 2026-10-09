@@ -611,10 +611,132 @@ fn classify_quarantine_cause_legacy(last_error: &str) -> &'static str {
     }
 }
 
+/// #3658 — which LOCAL DLQ bookkeeping write failed. Closed set: it is the
+/// `op` label of `ai_memory_federation_push_dlq_bookkeeping_failed_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DlqBookkeepingOp {
+    /// [`FederationDlqSink::bump_dlq_attempt`] — burn one attempt and
+    /// refresh `last_error`.
+    BumpAttempt,
+    /// [`FederationDlqSink::note_dlq_throttled`] — refresh `last_error`
+    /// without burning an attempt (#1544).
+    NoteThrottled,
+    /// [`FederationDlqSink::mark_dlq_row_replayed`] — clear a row the peer
+    /// acked (or that a restore superseded).
+    MarkReplayed,
+    /// [`FederationDlqSink::reset_throttled_quarantine`] — the #1544
+    /// un-quarantine sweep at the top of every tick.
+    ResetThrottled,
+    /// [`FederationDlqSink::enqueue_push_failure`] — landing a failed push
+    /// into the DLQ. A failure here LOSES the retry: nothing re-sends it.
+    Enqueue,
+}
+
+impl DlqBookkeepingOp {
+    /// Every op, in label order (the closed label set).
+    pub const ALL: [Self; 5] = [
+        Self::BumpAttempt,
+        Self::NoteThrottled,
+        Self::MarkReplayed,
+        Self::ResetThrottled,
+        Self::Enqueue,
+    ];
+
+    /// Stable metric label / log field.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::BumpAttempt => "bump_attempt",
+            Self::NoteThrottled => "note_throttled",
+            Self::MarkReplayed => "mark_replayed",
+            Self::ResetThrottled => "reset_throttled",
+            Self::Enqueue => "enqueue",
+        }
+    }
+}
+
+/// #3658 — what one [`replay_once`] tick did.
+///
+/// **Behaviour on failed persistence, defined here.** A failed bookkeeping
+/// write does NOT abort the tick: every other row's outcome is independent,
+/// and stopping would starve the peers that ARE working. The affected row
+/// keeps its pre-tick `attempt_count` / `last_error` and is re-POSTed next
+/// tick (the peer-side write is idempotent by memory id, so a re-delivery
+/// after a lost `mark_replayed` is safe). The failure is recorded three ways
+/// so it can never be mistaken for a peer outcome: an `error!` line naming
+/// row / peer / op / error, the
+/// `ai_memory_federation_push_dlq_bookkeeping_failed_total{op}` counter, and
+/// this summary. Sustained failures mean the LOCAL DLQ store is broken: a row
+/// that can never burn its budget can never reach quarantine.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayTick {
+    /// Rows the tick took from the sink (0 when the take itself failed).
+    pub rows_taken: usize,
+    /// LOCAL bookkeeping writes that failed during the tick.
+    pub bookkeeping_failures: usize,
+}
+
+/// #3658 — count and log ONE failed LOCAL DLQ bookkeeping write as a LOCAL
+/// store failure (never a peer outcome). `row_id` is `None` for writes that
+/// are not about an existing row (the reset sweep, an enqueue).
+pub(crate) fn note_bookkeeping_failure(
+    op: DlqBookkeepingOp,
+    row_id: Option<i64>,
+    peer_id: &str,
+    memory_id: &str,
+    error: &str,
+    consequence: &str,
+) {
+    crate::metrics::registry()
+        .federation_push_dlq_bookkeeping_failed
+        .with_label_values(&[op.as_label()])
+        .inc();
+    tracing::error!(
+        target: PUSH_DLQ_TRACE_TARGET,
+        row_id = ?row_id,
+        peer_id = %peer_id,
+        memory_id = %memory_id,
+        op = op.as_label(),
+        error = %error,
+        "federation DLQ: LOCAL bookkeeping write {} FAILED (row {row_id:?}, peer {peer_id}) — \
+         this is the local DLQ store not persisting, not the peer: {consequence} (#3658)",
+        op.as_label(),
+    );
+}
+
+/// #3658 — handle the `Result` of a LOCAL bookkeeping write about `row` at
+/// the `dyn FederationDlqSink` boundary: on `Err` count + log it
+/// ([`note_bookkeeping_failure`]) and record it on the tick. Every
+/// row-scoped bookkeeping call in [`replay_once`] goes through here; a bare
+/// `let _ =` on a sink write is the defect this closes.
+fn record_bookkeeping(
+    result: Result<(), String>,
+    op: DlqBookkeepingOp,
+    row: &FederationPushDlqRow,
+    consequence: &str,
+    tick: &mut ReplayTick,
+) {
+    if let Err(e) = result {
+        tick.bookkeeping_failures = tick.bookkeeping_failures.saturating_add(1);
+        note_bookkeeping_failure(
+            op,
+            Some(row.id),
+            &row.peer_id,
+            &row.memory_id,
+            &e,
+            consequence,
+        );
+    }
+}
+
 /// Drive one replay pass. Public so the integration test in
 /// `tests/federation_dlq_replay.rs` can advance the worker manually
 /// without waiting on the `tokio::time::sleep` cadence.
-pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink) {
+///
+/// #3658 — returns the tick summary; see [`ReplayTick`] for the defined
+/// behaviour when a local bookkeeping write fails.
+pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink) -> ReplayTick {
+    let mut tick = ReplayTick::default();
     // #1544 — before draining, un-quarantine rows that were quarantined
     // SOLELY because a 429 throttle (per-agent / federation quota window)
     // burned their attempt budget past MAX_REPLAY_ATTEMPTS before the
@@ -628,10 +750,18 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
             target: PUSH_DLQ_TRACE_TARGET,
             "replay: un-quarantined {n} throttle-stalled (429) DLQ row(s) for retry"
         ),
-        Err(e) => tracing::warn!(
-            target: PUSH_DLQ_TRACE_TARGET,
-            "replay: reset_throttled_quarantine failed (non-fatal): {e}"
-        ),
+        Err(e) => {
+            tick.bookkeeping_failures = tick.bookkeeping_failures.saturating_add(1);
+            note_bookkeeping_failure(
+                DlqBookkeepingOp::ResetThrottled,
+                None,
+                "-",
+                "-",
+                &e,
+                "throttle-quarantined rows were not released this tick; the drain below \
+                 still runs and the sweep is retried next tick",
+            );
+        }
     }
     // #1579 B5 — adaptive drain batch. Scale the per-tick take with
     // the live backlog (`min(backlog, configurable cap)`, floored at
@@ -660,16 +790,17 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                 target: PUSH_DLQ_TRACE_TARGET,
                 "replay_federation_push_dlq: failed to load pending rows: {e}"
             );
-            return;
+            return tick;
         }
     };
+    tick.rows_taken = rows.len();
 
     if rows.is_empty() {
         // Still refresh the gauge — operators alert on it sitting at
         // 0 long-term; an unreachable sink would otherwise leave the
         // gauge stale.
         refresh_depth_gauge(sink).await;
-        return;
+        return tick;
     }
 
     tracing::info!(
@@ -741,7 +872,7 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
         // then a backend error, which classifies as the honest catch-all
         // `other`, never a fabricated cause).
         if row.peer_id == super::erasure_outbox::ALL_PEERS_SENTINEL_PEER_ID {
-            expand_erasure_sentinel_row(config, sink, &row).await;
+            expand_erasure_sentinel_row(config, sink, &row, &mut tick).await;
             continue;
         }
 
@@ -798,7 +929,14 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                         super::dlq_class::detail_of(&row.last_error)
                     ))
                 };
-                let _ = sink.bump_dlq_attempt(row.id, &reason).await;
+                record_bookkeeping(
+                    sink.bump_dlq_attempt(row.id, &reason).await,
+                    DlqBookkeepingOp::BumpAttempt,
+                    &row,
+                    "the legacy-keyed row cannot converge to take-exclusion and keeps \
+                     starving live rows",
+                    &mut tick,
+                );
                 if !LEGACY_PEER_ID_WARNED.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
                         target: PUSH_DLQ_TRACE_TARGET,
@@ -837,8 +975,8 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                     );
                 }
             } else {
-                let _ = sink
-                    .bump_dlq_attempt(
+                record_bookkeeping(
+                    sink.bump_dlq_attempt(
                         row.id,
                         // #2672 — typed class (the peer set is LOCAL config,
                         // so this classification was never steerable, but the
@@ -846,7 +984,12 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                         &super::dlq_class::DlqErrorClass::PeerRemoved
                             .stamp("peer no longer in FederationConfig"),
                     )
-                    .await;
+                    .await,
+                    DlqBookkeepingOp::BumpAttempt,
+                    &row,
+                    "the removed-peer row never reaches quarantine",
+                    &mut tick,
+                );
                 tracing::warn!(
                     target: PUSH_DLQ_TRACE_TARGET,
                     row_id = row.id,
@@ -880,15 +1023,16 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                     // 0-row no-op (a concurrent bump) just leaves it
                     // pending — the next tick re-checks and still will not
                     // POST while the restore stands.
-                    if let Err(e) = sink.mark_dlq_row_replayed(row.id, row.attempt_count).await {
-                        tracing::warn!(
-                            target: PUSH_DLQ_TRACE_TARGET,
-                            row_id = row.id,
-                            "replay: superseded erasure row {} could not be cleared \
-                             (non-fatal; stays pending, re-checked next tick): {e}",
-                            row.id,
-                        );
-                    }
+                    record_bookkeeping(
+                        sink.mark_dlq_row_replayed(row.id, row.attempt_count)
+                            .await
+                            .map(|_matched| ()),
+                        DlqBookkeepingOp::MarkReplayed,
+                        &row,
+                        "the superseded erasure row could not be cleared; it stays pending \
+                         and is re-checked next tick",
+                        &mut tick,
+                    );
                     tracing::warn!(
                         target: PUSH_DLQ_TRACE_TARGET,
                         row_id = row.id,
@@ -975,11 +1119,13 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            target: PUSH_DLQ_TRACE_TARGET,
-                            row_id = row.id,
-                            "replay: peer {} acked but mark_dlq_row_replayed failed: {e}",
-                            row.peer_id,
+                        record_bookkeeping(
+                            Err(e),
+                            DlqBookkeepingOp::MarkReplayed,
+                            &row,
+                            "the peer ACKED but the clear was not persisted, so the row will \
+                             be re-POSTed next tick (idempotent on the peer by memory id)",
+                            &mut tick,
                         );
                     }
                 }
@@ -988,15 +1134,20 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                 // Peer received the row but rewrote the id —
                 // operator-visible divergence. Bump and keep row so
                 // the audit trail captures the drift.
-                let _ = sink
-                    .bump_dlq_attempt(
+                record_bookkeeping(
+                    sink.bump_dlq_attempt(
                         row.id,
                         // #2672 — typed class, not a token the classifier
                         // greps out of the sentence.
                         &super::dlq_class::DlqErrorClass::IdDrift
                             .stamp("replay observed id_drift on peer ack"),
                     )
-                    .await;
+                    .await,
+                    DlqBookkeepingOp::BumpAttempt,
+                    &row,
+                    "the id-drift audit trail was not recorded on the row",
+                    &mut tick,
+                );
                 tracing::warn!(
                     target: PUSH_DLQ_TRACE_TARGET,
                     row_id = row.id,
@@ -1006,7 +1157,14 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                 );
             }
             AckOutcome::Fail(reason) => {
-                let _ = sink.bump_dlq_attempt(row.id, &reason).await;
+                record_bookkeeping(
+                    sink.bump_dlq_attempt(row.id, &reason).await,
+                    DlqBookkeepingOp::BumpAttempt,
+                    &row,
+                    "the attempt budget did not burn, so this row can never reach \
+                     quarantine while the store stays broken",
+                    &mut tick,
+                );
                 tracing::debug!(
                     target: PUSH_DLQ_TRACE_TARGET,
                     row_id = row.id,
@@ -1025,7 +1183,14 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
             // attempt budget intact so the row keeps retrying until it
             // lands.
             AckOutcome::Throttled(reason) => {
-                let _ = sink.note_dlq_throttled(row.id, &reason).await;
+                record_bookkeeping(
+                    sink.note_dlq_throttled(row.id, &reason).await,
+                    DlqBookkeepingOp::NoteThrottled,
+                    &row,
+                    "the throttle reason was not recorded, so the un-quarantine sweep \
+                     cannot recognise this row",
+                    &mut tick,
+                );
                 tracing::debug!(
                     target: PUSH_DLQ_TRACE_TARGET,
                     row_id = row.id,
@@ -1039,6 +1204,20 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
     }
 
     refresh_depth_gauge(sink).await;
+    if tick.bookkeeping_failures > 0 {
+        tracing::error!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            rows_taken = tick.rows_taken,
+            bookkeeping_failures = tick.bookkeeping_failures,
+            "replay tick: {} LOCAL DLQ bookkeeping write(s) failed over {} row(s) — the DLQ \
+             store is not persisting; attempt budgets and last_error are frozen for the \
+             affected rows and they are retried next tick. Alert on \
+             ai_memory_federation_push_dlq_bookkeeping_failed_total (#3658)",
+            tick.bookkeeping_failures,
+            tick.rows_taken,
+        );
+    }
+    tick
 }
 
 /// #2446 — `last_error` stamped on a per-peer row minted by expanding an
@@ -1058,6 +1237,7 @@ async fn expand_erasure_sentinel_row(
     config: &FederationConfig,
     sink: &dyn FederationDlqSink,
     row: &FederationPushDlqRow,
+    tick: &mut ReplayTick,
 ) {
     let sentinel = super::erasure_outbox::ALL_PEERS_SENTINEL_PEER_ID;
     // Fail-closed collision guard. The sentinel token is not a producible
@@ -1066,12 +1246,17 @@ async fn expand_erasure_sentinel_row(
     // unrecoverable, so verify against the LIVE peer set rather than
     // trusting the derivation to stay that way.
     if config.peers.iter().any(|p| p.id == sentinel) {
-        let _ = sink
-            .bump_dlq_attempt(
+        record_bookkeeping(
+            sink.bump_dlq_attempt(
                 row.id,
                 "erasure sentinel collides with a configured peer id; refusing to fan out",
             )
-            .await;
+            .await,
+            DlqBookkeepingOp::BumpAttempt,
+            row,
+            "the colliding sentinel row never reaches quarantine",
+            tick,
+        );
         tracing::error!(
             target: PUSH_DLQ_TRACE_TARGET,
             row_id = row.id,
@@ -1146,8 +1331,8 @@ async fn expand_erasure_sentinel_row(
             row.id,
         ),
         Err(e) => {
-            let _ = sink
-                .bump_dlq_attempt(
+            record_bookkeeping(
+                sink.bump_dlq_attempt(
                     row.id,
                     // #2672 — a LOCAL store error, but its text is not ours to
                     // predict. Class it structurally so no digit sequence
@@ -1156,7 +1341,12 @@ async fn expand_erasure_sentinel_row(
                     &super::dlq_class::DlqErrorClass::Other
                         .stamp(&format!("erasure sentinel expansion failed: {e}")),
                 )
-                .await;
+                .await,
+                DlqBookkeepingOp::BumpAttempt,
+                row,
+                "the failed expansion was not recorded on the sentinel row",
+                tick,
+            );
             tracing::warn!(
                 target: PUSH_DLQ_TRACE_TARGET,
                 row_id = row.id,
@@ -1964,6 +2154,17 @@ mod replay_arm_tests {
         live_rows: Mutex<Vec<(String, String)>>,
         // #2446 — records `expand_erasure_sentinel` calls: (row_id, peers).
         expanded: Mutex<Vec<(i64, Vec<String>)>>,
+        // #3658 — the one bookkeeping write this mock makes fail.
+        fail_op: Option<super::DlqBookkeepingOp>,
+    }
+
+    impl MockSink {
+        fn fault(&self, op: super::DlqBookkeepingOp) -> Result<(), String> {
+            if self.fail_op == Some(op) {
+                return Err(format!("mock {} error", op.as_label()));
+            }
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait]
@@ -1975,6 +2176,7 @@ mod replay_arm_tests {
             payload_json: &serde_json::Value,
             last_error: &str,
         ) -> Result<(), String> {
+            self.fault(super::DlqBookkeepingOp::Enqueue)?;
             self.rows.lock().unwrap().push(FederationPushDlqRow {
                 id: (self.rows.lock().unwrap().len() + 1) as i64,
                 memory_id: memory_id.to_string(),
@@ -2003,6 +2205,7 @@ mod replay_arm_tests {
             id: i64,
             expected_attempt_count: i32,
         ) -> Result<bool, String> {
+            self.fault(super::DlqBookkeepingOp::MarkReplayed)?;
             // Model the guarded UPDATE: only clear when the live row still
             // carries the observed attempt_count (a concurrent bump makes
             // this a 0-row no-op → Ok(false)).
@@ -2019,6 +2222,7 @@ mod replay_arm_tests {
         }
 
         async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String> {
+            self.fault(super::DlqBookkeepingOp::BumpAttempt)?;
             self.bumped
                 .lock()
                 .unwrap()
@@ -2034,6 +2238,7 @@ mod replay_arm_tests {
         }
 
         async fn note_dlq_throttled(&self, id: i64, last_error: &str) -> Result<(), String> {
+            self.fault(super::DlqBookkeepingOp::NoteThrottled)?;
             // Record the throttle WITHOUT bumping attempt_count, then
             // refresh last_error on the matching row.
             self.throttled
@@ -2049,6 +2254,7 @@ mod replay_arm_tests {
         }
 
         async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
+            self.fault(super::DlqBookkeepingOp::ResetThrottled)?;
             let mut n = 0u64;
             for row in self.rows.lock().unwrap().iter_mut() {
                 if row.attempt_count >= MAX_REPLAY_ATTEMPTS && row.last_error.contains("429") {
@@ -2263,6 +2469,136 @@ mod replay_arm_tests {
             "a failed POST must bump attempt_count"
         );
         assert!(sink.marked_replayed.lock().unwrap().is_empty());
+    }
+
+    // ----- #3658 LOCAL bookkeeping failures --------------------------------
+
+    /// A refused-port peer URL (TCP to port 1 fails fast). Spelled with `\x2F`
+    /// escapes so the source carries no literal double slash: the
+    /// count-assertion gate strips `//` line comments before it blanks string
+    /// literals, so every extra `"https://…"` line would shift its quote
+    /// parity and mis-pair unrelated assertions in this file.
+    const DEAD_PEER_URL_3658: &str = "https:\x2F\x2F127.0.0.1:1/api/v1/sync/push";
+
+    /// #3658 — the closed `op` label set is exactly these five, distinct.
+    #[test]
+    fn bookkeeping_op_labels_are_a_closed_distinct_set_3658() {
+        let labels: Vec<&str> = super::DlqBookkeepingOp::ALL
+            .iter()
+            .map(|op| op.as_label())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "bump_attempt",
+                "note_throttled",
+                "mark_replayed",
+                "reset_throttled",
+                "enqueue"
+            ]
+        );
+    }
+
+    /// #3658 — a healthy tick reports the rows it took and zero failures.
+    #[tokio::test]
+    async fn healthy_tick_reports_zero_bookkeeping_failures_3658() {
+        let sink = MockSink::default();
+        sink.rows.lock().unwrap().push(row(7, "peer-gone", 1));
+        let cfg = cfg_with_peer("peer-0", DEAD_PEER_URL_3658);
+        let tick = replay_once(&cfg, &sink).await;
+        assert_eq!(
+            tick,
+            super::ReplayTick {
+                rows_taken: 1,
+                bookkeeping_failures: 0
+            }
+        );
+        let bumped_ids: Vec<i64> = sink.bumped.lock().unwrap().iter().map(|b| b.0).collect();
+        assert_eq!(bumped_ids, vec![7], "the healthy bump persisted");
+    }
+
+    /// #3658 — the peer-removed arm's bump fails: the tick records it and
+    /// keeps going (the second, independent row is still processed).
+    #[tokio::test]
+    async fn failed_bump_is_recorded_on_the_tick_and_tick_continues_3658() {
+        let sink = MockSink {
+            fail_op: Some(super::DlqBookkeepingOp::BumpAttempt),
+            ..MockSink::default()
+        };
+        {
+            let mut rows = sink.rows.lock().unwrap();
+            rows.push(row(7, "peer-gone", 1));
+            rows.push(row(8, "peer-also-gone", 1));
+        }
+        let cfg = cfg_with_peer("peer-0", DEAD_PEER_URL_3658);
+        let tick = replay_once(&cfg, &sink).await;
+        assert_eq!(
+            tick,
+            super::ReplayTick {
+                rows_taken: 2,
+                bookkeeping_failures: 2
+            },
+            "both rows' failed bumps are recorded; the first failure does not stop the tick"
+        );
+        assert!(sink.bumped.lock().unwrap().is_empty(), "nothing persisted");
+    }
+
+    /// #3658 — the #1544 reset sweep failing is recorded on the tick, and
+    /// the drain still runs.
+    #[tokio::test]
+    async fn failed_reset_sweep_is_recorded_and_drain_still_runs_3658() {
+        let sink = MockSink {
+            fail_op: Some(super::DlqBookkeepingOp::ResetThrottled),
+            ..MockSink::default()
+        };
+        sink.rows.lock().unwrap().push(row(7, "peer-gone", 1));
+        let cfg = cfg_with_peer("peer-0", DEAD_PEER_URL_3658);
+        let tick = replay_once(&cfg, &sink).await;
+        assert_eq!(
+            tick,
+            super::ReplayTick {
+                rows_taken: 1,
+                bookkeeping_failures: 1
+            }
+        );
+        let bumped_ids: Vec<i64> = sink.bumped.lock().unwrap().iter().map(|b| b.0).collect();
+        assert_eq!(bumped_ids, vec![7], "the drain still ran");
+    }
+
+    /// #3658 — the erasure-sentinel collision arm's bump goes through the
+    /// same handler.
+    #[tokio::test]
+    async fn failed_sentinel_collision_bump_is_recorded_3658() {
+        let sentinel = crate::federation::erasure_outbox::ALL_PEERS_SENTINEL_PEER_ID;
+        let sink = MockSink {
+            fail_op: Some(super::DlqBookkeepingOp::BumpAttempt),
+            ..MockSink::default()
+        };
+        sink.rows
+            .lock()
+            .unwrap()
+            .push(sentinel_row(5, "mem-s", TS_OLD));
+        let cfg = cfg_with_peer(sentinel, DEAD_PEER_URL_3658);
+        let tick = replay_once(&cfg, &sink).await;
+        assert_eq!(
+            tick,
+            super::ReplayTick {
+                rows_taken: 1,
+                bookkeeping_failures: 1
+            }
+        );
+        assert!(sink.expanded.lock().unwrap().is_empty(), "never fanned out");
+    }
+
+    /// #3658 — a take error is not a bookkeeping write: zero rows, zero failures.
+    #[tokio::test]
+    async fn take_error_tick_reports_nothing_taken_3658() {
+        let sink = MockSink {
+            take_should_err: true,
+            ..MockSink::default()
+        };
+        let cfg = cfg_with_peer("peer-0", DEAD_PEER_URL_3658);
+        assert_eq!(replay_once(&cfg, &sink).await, super::ReplayTick::default());
     }
 
     #[tokio::test]
