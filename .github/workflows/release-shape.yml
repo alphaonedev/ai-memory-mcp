@@ -30,7 +30,7 @@ name: Release-shaped build + PostgreSQL TLS proof (#4480)
 
 on:
   pull_request:
-    branches: ["release/**", "rehearsal/**", "main"]
+    branches: ["release/**", "rehearsal/**", "chain/**", "main"]
     paths:
       - ".github/workflows/release.yml"
       - ".github/workflows/release-shape.yml"

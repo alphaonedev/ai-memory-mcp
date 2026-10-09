@@ -12,7 +12,7 @@
 > (`docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) is the standard this
 > certification answers to; this document is the evidence-bound answer.
 
-**Binds to:** `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5` (the re-assembled batch-6 tip;
+Last LIVE bind (historical, no live bind while EXPIRED): `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5` (the re-assembled batch-6 tip;
 re-issued 2026-10-02 after **3 §7-watched federation-wire files changed** since the prior bind
 `eba96b307` — 74 changed lines, **49 of them code**, from five commits — §5.4(2)–(5) re-run at the
 new SHA per §7). The 2026-09-26 re-issue at `eba96b307`, the 2026-09-23 re-issue at `eae99be43`, the 2026-09-22 re-issue at `92209ad91`, the 2026-09-21 re-issue at `f32c18dad`, the 2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11
@@ -20,7 +20,35 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-10-02** (re-issued at the re-assembled batch-6 tip `385da3a05` at 22 checks after 3 §7-watched federation-wire files changed by REAL CODE — #4023, #4408, #4400/#4464 and #4300; supersedes the 2026-09-26 bind at `eba96b307`)
+> ## STATUS — **EXPIRED as of 2026-10-07** (§7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
+>
+> **Amendment (2026-10-07, #6063 WP-B1 — §7 EXPIRY RECORD, certification EXPIRED).**
+> The federation certification **expired** per §7 when four §7-watched
+> federation-wire files changed after the bind `385da3a05`
+> (`src/federation/mod.rs`, `src/federation/ns_meta_ancestor_gate.rs`,
+> `src/handlers/federation_receive.rs`, `src/handlers/federation_signing_check.rs`;
+> +620/−35 lines, 484 code lines, from #4447, #4478, #4495, #4499, #4356 et al.).
+> The `AI_MEMORY_FED_*` identifier NAME set is unchanged. **No live claim is made
+> for the post-`385da3a05` wire path.** The `385da3a05` evidence under
+> `docs/compliance/evidence/cert-385da3a05/` remains a historical record of that
+> bind only. This amendment does **not** re-measure anything and does **not**
+> re-bind: the §5.4(2)–(5) re-measurement (posture legs, acceptance battery,
+> removal proof) at the post-freeze SHA, and the re-issue to `LIVE`, are work
+> package WP-B1 ([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)),
+> run after code freeze. Re-binding to a newer SHA without that re-measurement is
+> forbidden (#3899).
+>
+> **Amendment (2026-10-08, #6116 - second §7 record for the #4507 doc-comment retargets).**
+> Two §7-watched federation-wire files changed again after the 2026-10-07
+> expiry record above, through the #4507 citation-retarget chain
+> (`6c6634d66`, `015b44777`, `2a18bffe2`, merged at `cd3cb6140`):
+> `src/federation/mod.rs` and `src/handlers/federation_receive.rs`, +1/-1
+> lines each. Both edits are Rust doc-comment path retargets only; no code,
+> no `AI_MEMORY_FED_*` identifier and no wire behaviour changed. This record
+> does **not** re-measure anything and does **not** re-bind. The certification
+> stays EXPIRED, and the re-measurement and re-issue stay under WP-B1
+> ([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)); re-binding
+> without that re-measurement is forbidden (#3899).
 >
 > Re-validated and re-bound against `f32c18dadf8a659567960747cc2802186bac9de9`
 > at the v1.0.0 promotion tip on 2026-09-21: §5.4(2) posture legs re-measured at 22 checks
