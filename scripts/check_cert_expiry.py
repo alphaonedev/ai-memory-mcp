@@ -791,7 +791,12 @@ GIT_SHIM = """#!{python} -I
 import os, sys
 real, argv = {real!r}, sys.argv[1:]
 if argv == ["--shim-isolation-probe"]:
-    print(sys.flags.isolated, os.path.dirname(os.path.abspath(__file__)) in sys.path)
+    try:
+        import gitshim_canary_6145
+        planted = True
+    except ImportError:
+        planted = False
+    print(sys.flags.isolated, planted)
     sys.exit(0)
 if "--version" in argv and {version!r}:
     print({version!r})
@@ -801,6 +806,9 @@ if {fail!r} and {fail!r} in argv:
     sys.exit(128)
 os.execv(real, [real] + argv)
 """
+
+
+SHEBANG_MAX = 255  # Linux truncates the interpreter line at 256 bytes (newline included)
 
 
 def write_git_shim(shim_dir, real, version="", fail=""):
@@ -814,17 +822,51 @@ def write_git_shim(shim_dir, real, version="", fail=""):
     return shim
 
 
+def shim_interpreter_violation(tmp):
+    """None when write_git_shim refuses every unsafe interpreter path and accepts
+    the longest safe one (#6145 S-F1), else a description."""
+    fixed = len("#!") + len(" -I")
+    deep = Path(tempfile.mkdtemp(prefix="gitshim-long.", dir=str(tmp)))
+    try:
+        long_dir = deep / ("d" * 200)
+        long_dir.mkdir()
+        too_long = long_dir / ("p" * 60)
+        too_long.symlink_to(sys.executable)
+        spaced = deep / "with space" / "python3"
+        pad = SHEBANG_MAX - fixed - len(str(deep)) - 1
+        longest_ok = deep / ("q" * pad)
+        cases = [("an over-long interpreter path", too_long, True),
+                 ("an interpreter path with whitespace", spaced, True),
+                 ("the longest in-limit interpreter path", longest_ok, False)]
+        for label, interp, must_raise in cases:
+            try:
+                write_git_shim(deep, "git", interpreter=interp)
+            except GateError:
+                if not must_raise:
+                    return f"{label} was refused"
+                continue
+            except Exception as exc:  # noqa: BLE001 - report any non-GateError as a violation
+                return f"{label} raised {type(exc).__name__}, not GateError: {exc}"
+            if must_raise:
+                return f"{label} was accepted (the kernel would drop '-I')"
+        return None
+    finally:
+        shutil.rmtree(deep, ignore_errors=True)
+
+
 def shim_isolation_violation(tmp):
-    """None when the git shim is isolated, else a description (#6145). Runs the
-    shim's own probe: it reports `sys.flags.isolated` and whether its own
-    directory is on `sys.path` (without -I the script directory is sys.path[0],
-    so a module planted beside the shim would be importable)."""
+    """None when the git shim is isolated, else a description (#6145). Plants an
+    empty `gitshim_canary_6145.py` beside the shim and runs the shim's own probe,
+    which reports `sys.flags.isolated` and whether the canary imported (without
+    -I the script directory is sys.path[0], so a planted module imports). The
+    real import system decides, so a symlinked scratch path cannot fool it."""
     real = shutil.which("git")
     if real is None:
         raise GateError("git is not on PATH")
     shim_dir = Path(tempfile.mkdtemp(prefix="gitshim-iso.", dir=str(tmp)))
     try:
         shim = write_git_shim(shim_dir, real)
+        (shim_dir / "gitshim_canary_6145.py").write_text("", encoding="utf-8")
         first = shim.read_text(encoding="utf-8").splitlines()[0]
         if not first.startswith("#!") or first.split()[1:] != ["-I"]:
             return f"shim interpreter line {first!r} is not '<python> -I'"
@@ -882,6 +924,21 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     repo = tmp / "repo"
     repo.mkdir()
     t = SelfTest()
+    # #6145: prove the git PATH shim is isolated before any gate run uses it; an
+    # unisolated shim aborts the self-test here.
+    try:
+        iso = shim_isolation_violation(tmp)
+    except GateError as exc:
+        iso = str(exc)
+    if iso is not None:
+        t.fail(f"(shim-isolation, #6145): {iso}")
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
+    iface = shim_interpreter_violation(tmp)
+    if iface is not None:
+        t.fail(f"(shim-interpreter, #6145): {iface}")
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
     fx = Fixture(repo)
     fx.g("init", "-q", "-b", "main")
     fx.g("config", "user.name", "Cert Expiry Selftest")
@@ -1288,9 +1345,6 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     rc, out, err = run_gate_shimmed(tmp, repo, env7, fail="--is-ancestor")
     if rc != 1 or "merge-base --is-ancestor exited 128" not in out + err:
         t.fail("(anc-error): an is-ancestor error did not fail closed:", out + err)
-    iso = shim_isolation_violation(tmp)
-    if iso is not None:
-        t.fail(f"(shim-isolation, #6145): {iso}")
     rc, out, err = run_gate_shimmed(tmp, repo, env7)
     if rc != 0:
         t.fail("(shim-control): the pass-through git shim was REJECTED:", out + err)
@@ -1462,7 +1516,8 @@ SELF_TEST_OK = (
     "octopus merge RED; (ci1-ci7, #5970) the event payload range is authoritative under "
     "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
     "outside CI; (shim-isolation, #6145) the git PATH shim runs under python3 -I: isolated flag set and "
-    "its own directory off sys.path."
+    "a module planted beside it not importable, checked before any shimmed gate run; "
+    "(shim-interpreter, #6145) a whitespace or over-long (>255 byte) interpreter line is refused."
 )
 
 
