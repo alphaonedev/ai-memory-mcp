@@ -15,6 +15,15 @@ repository sources. Output is written to ``--out-dir``:
 * ``lib_pg_filters.txt``  the lib Postgres test-name prefixes (one per line).
 * ``manifest.json``   per-executable class, reason and weight; set sizes; estimates.
 
+Classification reads the union of every source file a target compiles: the
+crate root, every ``mod name;`` (``name.rs`` / ``name/mod.rs``), every
+``#[path = "..."] mod name;`` and every ``include!("...")``, recursively. A file
+that two or more targets compile (``tests/common/``) is a shared helper: its
+Postgres / ``#[serial]`` / fixed-port evidence counts only for the targets that
+reference the helper item carrying it, unless the file itself declares tests,
+in which case it is unioned like any other. A ``mod`` that resolves to no file
+is class (a) (fail closed).
+
 Every list line is one cargo target selector: ``--lib``, ``--bin NAME``,
 ``--test NAME`` or ``--example NAME``.
 
@@ -33,7 +42,9 @@ Fail closed (exit 2, ``::error::`` on stderr) when:
 Python 3.9+, standard library only.
 """
 import argparse
+import bisect
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -52,7 +63,6 @@ FEDERAT_RE = re.compile(r'federat', re.IGNORECASE)
 PORT_RE = re.compile(r'(?:127\.0\.0\.1|localhost|0\.0\.0\.0):(?!0\b)\d{2,5}\b')
 SHARED_PATH_RE = re.compile(r'"/(?:tmp|var/tmp|dev/shm)/')
 ENV_RE = re.compile(r'env::set_var|env::remove_var|set_current_dir')
-PG_ENV_READ_RE = re.compile(r'var(?:_os)?\(\s*"AI_MEMORY_TEST_POSTGRES_URL"')
 SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9_.-]+$')
 
 KIND_FLAG = {'test': '--test', 'bin': '--bin', 'example': '--example', 'bench': '--bench'}
@@ -122,37 +132,476 @@ def parse_build_json(lines):
     return ordered
 
 
-def read_sources(src_path):
-    """Source text of a target: its file plus the sibling module directory.
+# ---------------------------------------------------------------------------
+# Rust source graph (#6344 review r1 B1/B2). A small lexer and module walker:
+# enough of the Rust module rules to follow `mod name;`, `#[path = "..."] mod
+# name;` and `include!("...")` from a crate root, and to tell, for any byte
+# offset, which inline `mod` blocks and which `fn` enclose it. It never needs
+# to be a parser: every ambiguity resolves towards "more evidence".
+# ---------------------------------------------------------------------------
+IDENT_CH = re.compile(r'[A-Za-z0-9_]')
+MOD_DECL_RE = re.compile(r'\bmod\s+(r#)?([A-Za-z_][A-Za-z0-9_]*)\s*([;{])')
+FN_RE = re.compile(r'\bfn\s+(r#)?([A-Za-z_][A-Za-z0-9_]*)')
+INCLUDE_RE = re.compile(r'\binclude!\s*\(\s*"')
+PATH_ATTR_RE = re.compile(r'#\s*\[\s*path\s*=\s*"')
+TEST_ATTR_RE = re.compile(r'#\s*\[[^\]]*\btest\b')
+ITEM_RE = re.compile(
+    r'\b(?:(fn|struct|enum|union|trait|type|const|static|mod)\s+(?:mut\s+)?(?:r#)?([A-Za-z_][A-Za-z0-9_]*)'
+    r'|(macro_rules!)\s*([A-Za-z_][A-Za-z0-9_]*)|(impl)\b)')
+PG_TOKEN = 'AI_MEMORY_TEST_POSTGRES_URL'
+PG_TOKEN_RE = re.compile(r'\bAI_MEMORY_TEST_POSTGRES_URL\b')
+PG_CONST_RE = re.compile(
+    r'\b(?:const|static)\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:[^=;]*=\s*"[^"]*AI_MEMORY_TEST_POSTGRES_URL')
+RUST_KEYWORDS = frozenset(
+    'as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod '
+    'move mut pub ref return self Self static struct super trait true type union unsafe use where while'.split())
 
-    Returns None when nothing readable exists (unknown source: class a).
+
+def mask(src):
+    """Return (code, shape): two views of ``src`` with the same length.
+
+    ``code`` blanks comments and keeps literals; ``shape`` also blanks the
+    contents of string and char literals (so braces and keywords inside them
+    are not structure). Newlines are kept in both, so offsets line up.
     """
-    if not src_path:
-        return None
-    p = Path(src_path)
-    files = []
-    if p.is_file():
-        files.append(p)
-    base = p.parent if p.name == 'main.rs' else p.with_suffix('')
-    if base.is_dir():
-        files.extend(sorted(base.rglob('*.rs')))
-    if not files:
-        return None
-    seen, chunks = set(), []
-    for f in files:
-        if f in seen:
+    n = len(src)
+    code, shape = list(src), list(src)
+
+    def blank(view, a, b):
+        for k in range(a, b):
+            if view[k] != '\n':
+                view[k] = ' '
+
+    i = 0
+    while i < n:
+        c = src[i]
+        nxt = src[i + 1] if i + 1 < n else ''
+        if c == '/' and nxt == '/':
+            j = src.find('\n', i)
+            j = n if j < 0 else j
+            blank(code, i, j)
+            blank(shape, i, j)
+            i = j
             continue
-        seen.add(f)
+        if c == '/' and nxt == '*':
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if src.startswith('/*', j):
+                    depth, j = depth + 1, j + 2
+                elif src.startswith('*/', j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            blank(code, i, j)
+            blank(shape, i, j)
+            i = j
+            continue
+        prev_ident = i > 0 and IDENT_CH.match(src[i - 1])
+        if c in 'rb' and not prev_ident:
+            j = i + 1 if c == 'r' else (i + 2 if nxt == 'r' else -1)
+            if j > 0:
+                k = j
+                while k < n and src[k] == '#':
+                    k += 1
+                if k < n and src[k] == '"':
+                    close = '"' + '#' * (k - j)
+                    end = src.find(close, k + 1)
+                    end = n if end < 0 else end + len(close)
+                    blank(shape, k + 1, max(k + 1, end - len(close)))
+                    i = end
+                    continue
+        if c == '"':
+            j = i + 1
+            while j < n and src[j] != '"':
+                j += 2 if src[j] == '\\' else 1
+            blank(shape, i + 1, min(j, n))
+            i = j + 1
+            continue
+        if c == "'":
+            if nxt == '\\':
+                j = src.find("'", i + 2)
+                j = n if j < 0 else j
+                if src[i + 2:i + 3] == "'":
+                    j = src.find("'", i + 3)
+                    j = n if j < 0 else j
+                blank(shape, i + 1, j)
+                i = j + 1
+                continue
+            if i + 2 < n and src[i + 2] == "'":
+                blank(shape, i + 1, i + 2)
+                i += 3
+                continue
+        i += 1
+    return ''.join(code), ''.join(shape)
+
+
+class RustFile:
+    """One source file: both views plus brace structure, computed once."""
+
+    def __init__(self, path, text):
+        self.path = path
+        self.text = text
+        self.code, self.shape = mask(text)
+        openers = {}
+        for m in MOD_DECL_RE.finditer(self.shape):
+            if m.group(3) == '{':
+                openers[m.end() - 1] = ('mod', m.group(2), False)
+        for m in FN_RE.finditer(self.shape):
+            j = m.end()
+            while j < len(self.shape) and self.shape[j] not in '{;':
+                j += 1
+            if j < len(self.shape) and self.shape[j] == '{':
+                lead = self.shape[self._item_start(m.start()):m.start()]
+                openers[j] = ('fn', m.group(2), bool(TEST_ATTR_RE.search(lead)))
+        self.braces = [(m.start(), m.group(0)) for m in re.finditer(r'[{}]', self.shape)]
+        self.openers = openers
+
+    def _item_start(self, pos):
+        """Offset just after the previous `;`, `{` or `}` (start of this item's attributes)."""
+        k = max(self.shape.rfind(ch, 0, pos) for ch in ';{}')
+        return k + 1
+
+    def contexts(self, positions):
+        """For each offset, the stack of enclosing ('mod'|'fn'|'blk', name, is_test)."""
+        order = sorted(range(len(positions)), key=lambda x: positions[x])
+        out = [None] * len(positions)
+        stack, bi = [], 0
+        for idx in order:
+            pos = positions[idx]
+            while bi < len(self.braces) and self.braces[bi][0] < pos:
+                at, ch = self.braces[bi]
+                if ch == '{':
+                    stack.append(self.openers.get(at, ('blk', '', False)))
+                elif stack:
+                    stack.pop()
+                bi += 1
+            out[idx] = list(stack)
+        return out
+
+    def literal_at(self, quote_pos):
+        """The string literal whose opening quote is at quote_pos (from the code view)."""
+        end = self.code.find('"', quote_pos + 1)
+        return self.code[quote_pos + 1:end] if end > 0 else None
+
+    def preceding_path_attr(self, pos):
+        lead_start = self._item_start(pos)
+        m = None
+        for m in PATH_ATTR_RE.finditer(self.shape, lead_start, pos):
+            pass
+        return self.literal_at(m.end() - 1) if m else None
+
+
+def _read(path, cache):
+    key = str(path)
+    if key not in cache:
         try:
-            chunks.append(f.read_text(errors='replace'))
+            cache[key] = RustFile(path, Path(path).read_text(errors='replace'))
         except OSError:
+            cache[key] = None
+    return cache[key]
+
+
+def walk_crate(root, root_mod='', root_like=True, cache=None):
+    """Follow the module tree from ``root``.
+
+    Returns (units, unresolved): units is a list of (RustFile, module_path)
+    for every reachable file (each once); unresolved lists `mod` declarations
+    whose file does not exist (a cfg'd-out module, or a missing file).
+    """
+    cache = {} if cache is None else cache
+    units, unresolved, seen = [], [], set()
+    root = Path(os.path.normpath(str(root)))
+    child_dir = root.parent if root_like or root.name == 'mod.rs' else root.with_suffix('')
+    todo = [(root, root_mod, child_dir, root.parent)]
+    while todo:
+        path, modp, cdir, pdir = todo.pop()
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        rf = _read(path, cache)
+        if rf is None:
+            unresolved.append(key)
+            continue
+        units.append((rf, modp))
+        decls = [m for m in MOD_DECL_RE.finditer(rf.shape) if m.group(3) == ';']
+        incs = list(INCLUDE_RE.finditer(rf.shape))
+        ctxs = rf.contexts([m.start() for m in decls] + [m.start() for m in incs])
+        for m, ctx in zip(decls + incs, ctxs):
+            inline = [s[1] for s in ctx if s[0] == 'mod']
+            if any(s[0] != 'mod' for s in ctx):
+                continue  # a `mod x;` inside a fn body is not a file module
+            base_dir = cdir.joinpath(*inline) if inline else cdir
+            sub = '::'.join(p for p in [modp] + inline if p)
+            if m.re is INCLUDE_RE:
+                lit = rf.literal_at(m.end() - 1)
+                if lit:
+                    target = Path(os.path.normpath(str(path.parent / lit)))
+                    todo.append((target, sub, base_dir, base_dir if inline else pdir))
+                continue
+            name = m.group(2)
+            child_mod = '::'.join(p for p in [sub, name] if p)
+            lit = rf.preceding_path_attr(m.start())
+            if lit is not None:
+                target = Path(os.path.normpath(str((base_dir if inline else pdir) / lit)))
+                todo.append((target, child_mod, target.parent, target.parent))
+                continue
+            flat, nested = base_dir / (name + '.rs'), base_dir / name / 'mod.rs'
+            if flat.is_file():
+                todo.append((flat, child_mod, base_dir / name, base_dir))
+            elif nested.is_file():
+                todo.append((nested, child_mod, nested.parent, nested.parent))
+            else:
+                unresolved.append('%s (mod %s)' % (key, name))
+    return units, unresolved
+
+
+def top_level_items(rf):
+    """(name, start, end) of items whose enclosing stack holds only `mod` blocks.
+
+    An `impl ... Type {` block is reported under the last identifier before its
+    brace (the implemented type), so evidence inside methods attaches to Type.
+    """
+    found = []
+    ms = list(ITEM_RE.finditer(rf.shape))
+    ctxs = rf.contexts([m.start() for m in ms])
+    for m, ctx in zip(ms, ctxs):
+        if any(s[0] != 'mod' for s in ctx):
+            continue
+        kind = m.group(1) or m.group(3) or m.group(5)
+        if kind == 'mod':
+            continue
+        j = m.end()
+        while j < len(rf.shape) and rf.shape[j] not in '{;':
+            j += 1
+        if kind == 'impl':
+            head = rf.shape[m.end():j]
+            prev = None
+            while prev != head:
+                prev, head = head, re.sub(r'<[^<>{]*>', ' ', head)
+            idents = re.findall(r'[A-Za-z_][A-Za-z0-9_]*', re.split(r'\bwhere\b', head)[0])
+            idents = [x for x in idents if x not in RUST_KEYWORDS]
+            if not idents:
+                continue
+            name = idents[-1]
+        else:
+            name = m.group(2) or m.group(4)
+        if name in RUST_KEYWORDS:
+            continue
+        end = j + 1
+        if j < len(rf.shape) and rf.shape[j] == '{':
+            depth = 0
+            for at, ch in rf.braces[bisect.bisect_left(rf.braces, (j, '')):]:
+                depth += 1 if ch == '{' else -1
+                if depth == 0:
+                    end = at + 1
+                    break
+            else:
+                end = len(rf.shape)
+        found.append((name, m.start(), end))
+    return found
+
+
+EVIDENCE = (('pg', PG_RE), ('serial', SERIAL_RE), ('port', PORT_RE), ('shared-path', SHARED_PATH_RE))
+# A test declared in a SHARED file runs in every binary that compiles the file,
+# so it would move every one of them into the serial shard. It counts only when
+# its CODE uses Postgres: a Postgres type, module or helper call in the shape
+# view (comments and string contents blanked), or a direct env read of the test
+# URL, in the test fn or in any helper it calls (transitively). Naming Postgres
+# in a string (a ``postgres://`` URL fixture, an error message quoting
+# ``AI_MEMORY_TEST_POSTGRES_URL``) is not use: the URL-predicate unit tests in
+# tests/common/{postgres_env,lane_db}.rs are pure and stay with their binaries.
+PG_CODE_RE = re.compile(
+    r'postgres_url\(|postgres_env|PostgresEnv|PgPool|sqlx::|PostgresStore|pg_test_client'
+    r'|pg_barrier|lane_db|pg_sources|pg_blocking_pids'
+)
+PG_ENV_READ_RE = re.compile(r'\bvar(?:_os)?\s*\(\s*"AI_MEMORY_TEST_POSTGRES_URL"')
+
+
+def full_evidence(rf, a, b):
+    """Every marker on the raw slice (comments and strings included): fail closed."""
+    return {t for t, rx in EVIDENCE if rx.search(rf.text, a, b)}
+
+
+def code_evidence(rf, a, b, pg_consts=None):
+    """Markers that show the slice's code does it (see PG_CODE_RE)."""
+    tags = set()
+    if PG_CODE_RE.search(rf.shape, a, b) or PG_ENV_READ_RE.search(rf.code, a, b):
+        tags.add('pg')
+    elif pg_consts is not None and pg_consts.search(rf.shape, a, b):
+        tags.add('pg')
+    if SERIAL_RE.search(rf.shape, a, b):
+        tags.add('serial')
+    return tags
+
+
+class SourceIndex:
+    """Cross-target view of the test sources (#6344 r1 B1).
+
+    A file reached by exactly one target is part of that binary. A file reached
+    by two or more targets (``tests/common/*``) is a shared helper: its evidence
+    attaches to its top-level item names (fn, struct, impl'd type, const,
+    macro), transitively, and a binary inherits the evidence of every such name
+    its own sources reference. A test fn declared in a shared file runs in
+    every binary that compiles the file, so each of them also inherits that
+    test's ``code_evidence``, including that of every helper it calls.
+    """
+
+    def __init__(self, exes):
+        self.cache = {}
+        self.walks = {}
+        reach = {}
+        for e in exes:
+            units, unresolved = self._walk(e)
+            self.walks[e.key] = (units, unresolved)
+            for rf, _ in units:
+                reach[str(rf.path)] = reach.get(str(rf.path), 0) + 1
+        self.reach = reach
+        helpers = {}
+        for units, _ in self.walks.values():
+            for rf, _ in units:
+                if reach[str(rf.path)] >= 2:
+                    helpers[str(rf.path)] = rf
+        self.helper_files = set(helpers)
+        files = list(helpers.values())
+        self.evidence = self._helper_evidence(files, full_evidence)
+        self.name_re = self._names_re(self.evidence)
+        consts = sorted({m.group(1) for rf in files for m in PG_CONST_RE.finditer(rf.code)})
+        pg_consts = re.compile(r'\b(%s)\b' % '|'.join(consts)) if consts else None
+        self.code_ev = self._helper_evidence(files, lambda rf, a, b: code_evidence(rf, a, b, pg_consts))
+        self.code_name_re = self._names_re(self.code_ev)
+        self.shared_test_tags = {path: self._shared_test_tags(rf, pg_consts) for path, rf in helpers.items()}
+
+    @staticmethod
+    def _names_re(ev):
+        names = sorted(ev, key=lambda x: (-len(x), x))
+        return re.compile(r'\b(%s)\b' % '|'.join(map(re.escape, names))) if names else None
+
+    def _shared_test_tags(self, rf, pg_consts):
+        """{tag: reason} carried by the test fns a shared file declares."""
+        tags = {}
+        if not TEST_ATTR_RE.search(rf.shape):
+            return tags
+        label = '%s#tests' % Path(rf.path).name
+        for name, a, b in top_level_items(rf):
+            if not TEST_ATTR_RE.search(rf.shape, rf._item_start(a), a):
+                continue
+            for tag in sorted(code_evidence(rf, a, b, pg_consts)):
+                tags.setdefault(tag, '%s:%s' % (label, name))
+            if self.code_name_re is not None:
+                for m in self.code_name_re.finditer(rf.shape, a, b):
+                    if m.group(1) != name:
+                        for tag in sorted(self.code_ev[m.group(1)]):
+                            tags.setdefault(tag, '%s:%s' % (label, m.group(1)))
+        return tags
+
+    def _walk(self, exe):
+        if not exe.src_path or not Path(exe.src_path).is_file():
+            return [], ['<root>']
+        return walk_crate(exe.src_path, cache=self.cache)
+
+    @staticmethod
+    def _helper_evidence(files, evidence_of):
+        items = []
+        for rf in files:
+            for name, a, b in top_level_items(rf):
+                items.append((name, rf, a, b, evidence_of(rf, a, b)))
+            for m in re.finditer(r'\b([A-Za-z_][A-Za-z0-9_]*)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)', rf.code):
+                items.append((m.group(2), rf, m.start(), m.end(), set()))
+        ev = {}
+        for name, _, _, _, tags in items:
+            if tags:
+                ev.setdefault(name, set()).update(tags)
+        changed = True
+        while changed and ev:
+            changed = False
+            rx = re.compile(r'\b(%s)\b' % '|'.join(map(re.escape, sorted(ev))))
+            for name, rf, a, b, _ in items:
+                got = set()
+                for m in rx.finditer(rf.code, a, b):
+                    if m.group(1) != name:
+                        got |= ev[m.group(1)]
+                if got - ev.get(name, set()):
+                    ev.setdefault(name, set()).update(got)
+                    changed = True
+        return ev
+
+    def own_text(self, exe):
+        """(raw text, unresolved mods, inherited evidence) for one target, or None if unreadable."""
+        units, unresolved = self.walks.get(exe.key) or self._walk(exe)
+        if not units:
             return None
-    return '\n'.join(chunks)
+        own = [rf for rf, _ in units if str(rf.path) not in self.helper_files]
+        extras = stem_dir_extras(exe.src_path, {os.path.normpath(str(rf.path)) for rf, _ in units})
+        if extras is None:
+            return None
+        inherited = {}
+        for rf, _ in units:
+            for tag, why in sorted(self.shared_test_tags.get(str(rf.path), {}).items()):
+                inherited.setdefault(tag, why)
+        if self.name_re is not None:
+            for code in [rf.code for rf in own] + [mask(t)[0] for t in extras]:
+                for m in self.name_re.finditer(code):
+                    for tag in sorted(self.evidence[m.group(1)]):
+                        inherited.setdefault(tag, m.group(1))
+        return '\n'.join([rf.text for rf in own] + extras), unresolved, inherited
 
 
-def classify(exe):
-    """Set exe.cls ('a' or 'b'), exe.reasons and exe.shared. Not for the lib."""
-    text = read_sources(exe.src_path)
+def stem_dir_extras(src_path, seen):
+    """Texts of files under the sibling ``<stem>/`` directory not already in ``seen``.
+
+    Kept from r0: not a Rust module rule, but more evidence never hurts. None
+    when one of them is unreadable.
+    """
+    p = Path(src_path)
+    base = p.parent if p.name == 'main.rs' else p.with_suffix('')
+    texts = []
+    if base.is_dir():
+        for f in sorted(base.rglob('*.rs')):
+            if os.path.normpath(str(f)) in seen:
+                continue
+            try:
+                texts.append(f.read_text(errors='replace'))
+            except OSError:
+                return None
+    return texts
+
+
+def read_sources(src_path):
+    """Source text of one target on its own: every file its module tree reaches
+    (``mod name;``, ``#[path = "..."] mod name;``, ``include!``; the
+    ``name.rs``, ``name/mod.rs`` and path-attribute forms), plus any file under
+    the sibling ``<stem>/`` directory.
+
+    Returns None when the root is unreadable (unknown source: class a).
+    """
+    if not src_path or not Path(src_path).is_file():
+        return None
+    units, _ = walk_crate(src_path)
+    if not units:
+        return None
+    seen = {os.path.normpath(str(rf.path)) for rf, _ in units}
+    extras = stem_dir_extras(src_path, seen)
+    if extras is None:
+        return None
+    return '\n'.join([rf.text for rf, _ in units] + extras)
+
+
+def classify(exe, index=None):
+    """Set exe.cls ('a' or 'b'), exe.reasons and exe.shared. Not for the lib.
+
+    Without an index every reachable file counts (most evidence); with one,
+    shared helper files count through the names the target references.
+    """
+    inherited, unresolved, text = {}, [], None
+    if index is None:
+        text = read_sources(exe.src_path)
+        if text is not None:
+            unresolved = walk_crate(exe.src_path)[1]
+    else:
+        got = index.own_text(exe)
+        if got is not None:
+            text, unresolved, inherited = got
     if text is None:
         exe.cls, exe.reasons = 'a', ['unknown-source']
         return
@@ -160,19 +609,25 @@ def classify(exe):
     m = PG_RE.search(text)
     if m:
         reasons.append('pg:' + m.group(0)[:32])
+    elif 'pg' in inherited:
+        reasons.append('pg-helper:' + inherited['pg'])
     if SERIAL_RE.search(text):
         reasons.append('serial')
+    elif 'serial' in inherited:
+        reasons.append('serial-helper:' + inherited['serial'])
     if FEDERAT_RE.search(exe.name):
         reasons.append('name:federat')
+    if unresolved:
+        reasons.append('unresolved-mod')
     if reasons:
         exe.cls, exe.reasons = 'a', reasons
         return
     exe.cls = 'b'
     if ENV_RE.search(text):
         exe.reasons.append('env')
-    if PORT_RE.search(text):
+    if PORT_RE.search(text) or 'port' in inherited:
         exe.shared.append('port')
-    if SHARED_PATH_RE.search(text):
+    if SHARED_PATH_RE.search(text) or 'shared-path' in inherited:
         exe.shared.append('shared-path')
 
 
@@ -251,11 +706,17 @@ def balance(items, base1, base2):
 
 
 def partition(exes, weights, prefixes):
-    """Return (serial, half1, half2, lib_in_half1, totals). Lists hold Exe objects."""
+    """Return (serial, half1, half2, lib_in_half1, totals). Lists hold Exe objects.
+
+    Each target is classified on the union of the sources it compiles (its
+    ``mod``/``#[path]``/``include!`` tree), with shared helper files folded in
+    per referenced item (see ``SourceIndex``).
+    """
     lib = [e for e in exes if e.kind == 'lib']
     others = [e for e in exes if e.kind != 'lib']
+    index = SourceIndex(others)
     for e in others:
-        classify(e)
+        classify(e, index)
     means = class_means(others, weights)
     serial = [e for e in others if e.cls == 'a']
     b_exes = [e for e in others if e.cls == 'b']
