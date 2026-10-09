@@ -3247,38 +3247,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         }
 
         if version < 54 {
-            // v0.7.0 #1466 — one-shot backfill of tier-default expiry on
-            // legacy immortal rows. Before the write-path chokepoint fix,
-            // every internally-minted mid/short memory built with
-            // `expires_at: None` landed with a NULL expiry, which GC
-            // (`expires_at IS NOT NULL AND expires_at < now`) can never
-            // reap. Stamp those rows with `created_at + tier-default TTL`
-            // so they age out on the next sweep.
-            //
-            // The interval is derived from `Tier::default_ttl_secs()` — the
-            // SAME SSOT the write path uses — and bound as a parameter, so
-            // the backfill can never drift from the canonical per-tier TTL
-            // and carries no hardcoded interval literal. `long` rows have no
-            // TTL (`default_ttl_secs() == None`) and are left NULL.
-            //
-            // `strftime` emits `YYYY-MM-DDTHH:MM:SS+00:00` — the same
-            // RFC3339 shape `Utc::now().to_rfc3339()` produces — so the
-            // lexical comparison in `gc()` stays monotonic. Idempotent:
-            // only NULL-expiry rows are touched, so a re-run finds none.
-            for tier in [
-                crate::models::Tier::Mid,
-                crate::models::Tier::Short,
-                crate::models::Tier::Long,
-            ] {
-                if let Some(ttl_secs) = tier.default_ttl_secs() {
-                    conn.execute(
-                        "UPDATE memories \
-                            SET expires_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', created_at, ?1) \
-                          WHERE expires_at IS NULL AND tier = ?2",
-                        params![format!("+{ttl_secs} seconds"), tier.as_str()],
-                    )?;
-                }
-            }
+            backfill_v54_tier_default_expiry(conn)?;
         }
         if version < 55 {
             // v0.7.0 #1476 — federation-catchup `updated_at` index.
@@ -4700,6 +4669,28 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 /// idempotent (canonical values are skipped), fail-safe (unparseable
 /// values keep their exact bytes — never destroy), and probe-tolerant
 /// (a missing column/table makes the SELECT prepare fail → no-op).
+/// v0.7.0 #1466 (schema v54) — one-shot backfill of tier-default expiry on
+/// legacy immortal rows (NULL `expires_at` on mid/short), which GC can never
+/// reap. Stamps `created_at + Tier::default_ttl_secs()` (the SAME SSOT the
+/// write path uses, bound as a parameter); `long` rows have no TTL and stay
+/// NULL. Idempotent: only NULL-expiry rows are touched.
+///
+/// # Errors
+/// Propagates any sqlite error from the per-tier `UPDATE`.
+pub fn backfill_v54_tier_default_expiry(conn: &Connection) -> Result<()> {
+    for tier in [crate::models::Tier::Mid, crate::models::Tier::Short] {
+        if let Some(ttl_secs) = tier.default_ttl_secs() {
+            conn.execute(
+                "UPDATE memories \
+                    SET expires_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', created_at, ?1) \
+                  WHERE expires_at IS NULL AND tier = ?2",
+                params![format!("+{ttl_secs} seconds"), tier.as_str()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn normalize_expiry_rows(conn: &Connection, select_sql: &str, update_sql: &str) -> Result<()> {
     let Ok(mut stmt) = conn.prepare(select_sql) else {
         return Ok(());
