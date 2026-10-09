@@ -432,4 +432,44 @@ mod tests {
             assert!(!shown.contains(secret), "leaked {secret}: {shown}");
         }
     }
+
+    /// #6098 — the #4934 secret-ABSENCE assertions must not put the fixture
+    /// value they check for into their own panic text. A failing run would
+    /// print exactly the cleartext #4934 forbids, and static analysis flags
+    /// the shape whether or not the fixture is a real credential. Pins the
+    /// message SHAPE: every `!<x>.contains(secret)` assertion in the #4934
+    /// test names the fixture by index and interpolates neither the value
+    /// nor the rendering that would carry it.
+    #[test]
+    fn secret_absence_messages_never_interpolate_the_fixture_6098() {
+        const SOURCE: &str = include_str!("dsn.rs");
+        let start = SOURCE
+            .find("fn parse_error_never_renders_query_secrets_4934")
+            .unwrap_or(SOURCE.len());
+        let body = &SOURCE[start..];
+        let body = &body[..body.find("\n    }\n").unwrap_or(body.len())];
+        // Built at run time so this test's own text is not a match.
+        let needles = ["secret", "rendering", "shown"].map(|name| format!("{{{name}}}"));
+        let mut absence_asserts = 0_usize;
+        for chunk in body.split("assert!(").skip(1) {
+            let head = chunk.trim_start();
+            if !(head.starts_with("!rendering.contains(secret)")
+                || head.starts_with("!shown.contains(secret)"))
+            {
+                continue;
+            }
+            absence_asserts += 1;
+            let stmt = &chunk[..chunk.find(");").unwrap_or(chunk.len())];
+            for needle in &needles {
+                assert!(
+                    !stmt.contains(needle.as_str()),
+                    "#6098: a secret-absence assertion interpolates {needle} into its message"
+                );
+            }
+        }
+        assert_eq!(
+            absence_asserts, 2,
+            "#6098: both #4934 secret-absence assertions are pinned"
+        );
+    }
 }
