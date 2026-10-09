@@ -811,12 +811,23 @@ os.execv(real, [real] + argv)
 SHEBANG_MAX = 255  # Linux truncates the interpreter line at 256 bytes (newline included)
 
 
-def write_git_shim(shim_dir, real, version="", fail=""):
+def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
     """Write the executable `git` PATH shim into shim_dir (#6145: its interpreter
     line is `python3 -I`, like the gate itself in c8-precheck.yml, so the shim's
-    own directory is never on its sys.path)."""
+    own directory is never on its sys.path). Fails closed with GateError when the
+    interpreter line cannot carry `-I` intact: whitespace in the interpreter path
+    splits it, and a line over SHEBANG_MAX bytes is truncated by the kernel, which
+    silently drops `-I`."""
+    python = sys.executable if interpreter is None else str(interpreter)
+    line = f"#!{python} -I"
+    if not python or any(ch.isspace() for ch in python):
+        raise GateError(f"the shim interpreter path {python!r} is empty or contains "
+                        "whitespace; its '-I' flag would not survive the shebang")
+    if len(line.encode("utf-8")) > SHEBANG_MAX:
+        raise GateError(f"the shim interpreter line is {len(line.encode('utf-8'))} bytes, over "
+                        f"{SHEBANG_MAX}; the kernel would truncate it and drop '-I'")
     shim = shim_dir / "git"
-    shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version=version,
+    shim.write_text(GIT_SHIM.format(python=python, real=real, version=version,
                                     fail=fail), encoding="utf-8")
     shim.chmod(0o755)
     return shim
@@ -870,8 +881,11 @@ def shim_isolation_violation(tmp):
         first = shim.read_text(encoding="utf-8").splitlines()[0]
         if not first.startswith("#!") or first.split()[1:] != ["-I"]:
             return f"shim interpreter line {first!r} is not '<python> -I'"
-        res = subprocess.run([str(shim), "--shim-isolation-probe"], capture_output=True,
-                             text=True, cwd=str(shim_dir), check=False)
+        try:
+            res = subprocess.run([str(shim), "--shim-isolation-probe"], capture_output=True,
+                                 text=True, cwd=str(shim_dir), check=False)
+        except OSError as exc:
+            return f"the shim could not be executed: {exc}"
         if res.returncode != 0 or res.stdout.split() != ["1", "False"]:
             return ("the shim is not isolated: probe printed "
                     f"{res.stdout.strip()!r} (want '1 False'), rc {res.returncode}: {res.stderr}")
