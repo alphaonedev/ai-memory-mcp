@@ -184,6 +184,22 @@ FENCE_OPEN_RE = re.compile(r"^(>?)[ \t]*(`{3,}|~{3,})(.*)$")
 QUOTED_BLANK_RE = re.compile(r"^>[ \t\r]*$")
 BLANK_RE = re.compile(r"^[ \t\r]*$")
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->")
+# #6365: the CommonMark HTML block kinds other than the comment (type 2, kept
+# by the anywhere-in-line `<!--` rule). START is matched against the line's
+# content (blockquote markers removed) at most 3 columns in; END is the text
+# that closes the block (searched after the opener on its own line too), or
+# None for types 6/7, which end at a blank line. Types 6 and 7 are matched by
+# any tag at line start: reading more lines as HTML only hides more text from
+# the ledger, which can only make the gate stricter.
+HTML_BLOCK_KINDS = (
+    (re.compile(r"^[ ]{0,3}<(?:script|pre|style|textarea)(?:[ \t>]|$)", re.IGNORECASE),
+     re.compile(r"</(?:script|pre|style|textarea)>", re.IGNORECASE)),
+    (re.compile(r"^[ ]{0,3}<\?"), re.compile(r"\?>")),
+    (re.compile(r"^[ ]{0,3}<!\[CDATA\["), re.compile(r"\]\]>")),
+    (re.compile(r"^[ ]{0,3}<![A-Za-z]"), re.compile(r">")),
+    (re.compile(r"^[ ]{0,3}</?[A-Za-z]"), None),
+)
+QUOTE_MARKERS_RE = re.compile(r"^(?:[ ]{0,3}>[ ]?)+")
 # Every issue / pull number and every link target on a `Path back to LIVE:`
 # line: `#N`, `/issues/N`, `/pull/N`; inline link targets, autolinks, bare
 # URLs, `www.` autolinks. A reference-style link (`][`) is refused outright.
@@ -441,11 +457,23 @@ def _ledger_plain(ln):
     )
 
 
+def _html_opener(content):
+    """(end regex or None, closed on this line) when CONTENT (a line with its
+    blockquote markers removed) opens a CommonMark HTML block (#6365)."""
+    for start, end in HTML_BLOCK_KINDS:
+        m = start.match(content)
+        if m:
+            return end, end is not None and end.search(content, m.end()) is not None
+    return None
+
+
 def parse_ledger(lines):
     """The amendment ledger of the cert doc LINES (#6124): one entry per
     `**Amendment` record outside code fences (CommonMark: a fence closes only
-    on the same character with a run at least as long) and outside HTML
-    comments. An entry runs from its header over the following lines of the
+    on the same character with a run at least as long), outside HTML
+    comments and outside every other CommonMark HTML block kind (#6365: a
+    quoted block ends with its blockquote; types 1/3/4/5 end at their closing
+    text, types 6/7 at a blank line; an unquoted block swallows '>' lines). An entry runs from its header over the following lines of the
     same container (quoted lines for a quoted header) until the next record,
     the STATUS line, or the container ends; trailing blank lines are dropped.
     Returns dicts: start (line index), header, quoted, below_status, raw."""
@@ -453,11 +481,27 @@ def parse_ledger(lines):
     cur = None
     fence = None
     in_comment = False
+    html = None  # (quoted, end regex or None) of the open HTML block
     seen_status = False
     for idx, ln in enumerate(lines):
         quoted = ln.startswith(">")
+        content = QUOTE_MARKERS_RE.sub("", ln, count=1) if quoted else ln
         if cur is not None and (quoted != cur["quoted"] or (not quoted and BLANK_RE.match(ln))):
             cur = None
+        if html is not None:
+            if html[0] and not quoted:
+                html = None  # the blockquote ended, and its HTML block with it
+            else:
+                # In an unquoted block a '>' is raw text, so the raw line is read.
+                text = content if html[0] else ln
+                if html[1] is None:
+                    if BLANK_RE.match(text):
+                        html = None
+                elif html[1].search(text):
+                    html = None
+                if cur is not None:
+                    cur["raw"].append(ln)
+                continue
         if fence is not None:
             if fence[0] and not quoted:
                 fence = None  # the blockquote ended, and its fence with it
@@ -481,6 +525,13 @@ def parse_ledger(lines):
         opener = _fence_opener(ln)
         if opener is not None:
             fence = opener
+            if cur is not None:
+                cur["raw"].append(ln)
+            continue
+        block = _html_opener(content)
+        if block is not None:
+            if not block[1]:
+                html = (quoted, block[0])
             if cur is not None:
                 cur["raw"].append(ln)
             continue
