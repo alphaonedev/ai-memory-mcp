@@ -224,8 +224,10 @@ def approvals(repo: Path, base_sha: str, head_sha: str) -> list:
     """The `Rule-Change-Approved-By` trailer values in base..head (commit messages are data). #6179: only the
     git trailer block (the final paragraph, git interpret-trailers semantics) is read; a body line that starts
     with the key is prose, not an approval. #6396: each raw message is parsed by `trailer_block`, which loads no
-    git configuration, so neither the host nor the repository can widen what counts as a trailer."""
-    out = git(repo, "log", "-z", "--format=%B", f"{base_sha}..{head_sha}")
+    git configuration, so neither the host nor the repository can widen what counts as a trailer. #6431: the log
+    read pins `--no-show-signature` and `--encoding=UTF-8`, so a host `log.showSignature` cannot inject verifier text
+    and a host `i18n.logOutputEncoding` cannot turn a real approval into unreadable bytes."""
+    out = git(repo, "log", "-z", "--no-show-signature", "--encoding=UTF-8", "--format=%B", f"{base_sha}..{head_sha}")
     found = []
     for message in out.split(b"\0"):
         if message.strip():
