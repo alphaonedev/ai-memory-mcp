@@ -74,13 +74,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      # #6290: the guard runs right after checkout, before any third-party action
+      # can change the job's PATH or environment.
+      - name: Release feature declaration guard
+        run: python3 scripts/check_release_features.py
+
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-
-      - name: Release feature declaration guard
-        run: python3 scripts/check_release_features.py
 
       - name: Build release binary (exactly as release.yml)
         shell: bash
@@ -139,12 +141,18 @@ jobs:
           fi
           docker exec release-shape-pg psql -U postgres -d proof -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS vector;'
 
+      # #6278: the proof script and the two scripts it runs must be this commit's
+      # (content-hash bind, 5-agent vote (4d3ea1c5) D3=C), and the script runs
+      # under an empty environment with absolute interpreters.
       - name: Prove the shipped binary reports sal-postgres and uses the tier over verify-full
-        shell: bash
+        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}
+        env:
+          PREFLIGHT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release-shape-pg-proof.sh scripts/release-features.sh scripts/assert-compiled-features.sh; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
           url="postgres://postgres:${PGTLS_PW}@127.0.0.1:55432/proof?sslmode=verify-full&sslrootcert=${PGTLS_DIR}/ca.crt"
-          bash scripts/release-shape-pg-proof.sh target/release/ai-memory "$url"
+          /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/release-shape-pg-proof.sh target/release/ai-memory "$url"
 
       - name: Stop the PostgreSQL service
         if: always()

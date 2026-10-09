@@ -156,12 +156,16 @@ each unit is and WHAT is substituted into it:
     ``services:``. ``continue-on-error`` follows ``SHAPE_ADVISORY``: while it was
     True (the #4480 ruling: advisory until the first green run) the job had to
     carry exactly the plain ``continue-on-error: true``; #4720 flipped it to
-    False and the key is refused. The Postgres proof is located structurally:
-    exactly one ``run`` step whose statements equal the pinned
-    ``bash scripts/release-shape-pg-proof.sh target/release/ai-memory "$url"``
-    (the URL assignment may change its port only), with the step key set pinned
-    (so no step ``if:`` or ``continue-on-error:``), ordered after the
-    release-shaped build. The ``paths:`` trigger filter is NOT evidence.
+    False and the key is refused. The job's ordered step list is pinned WHOLE
+    (``SHAPE_STEPS``, #6278 / #6290): checkout, the guard (before any
+    third-party action), toolchain, cache, the build unit, the native-TLS
+    check, the TLS service, the proof unit, the cleanup (the only step with
+    ``if:``, exactly ``always()``). The Postgres proof is the unit whose
+    statements equal ``SHAPE_PROOF``: the content-hash bind of the proof script
+    and the two scripts it runs to ``${{ github.sha }}`` (``SHAPE_PROOF_BIND``),
+    the URL assignment (which may change its port only), and the script run
+    under ``env -i`` with an absolute bash, in the sanitized step shell. The
+    ``paths:`` trigger filter is NOT evidence.
 
 PIN MAINTENANCE. Every pin-mismatch message names the constant to update and
 this file. A Dependabot SHA bump of a docker-job action fails with ONE message
@@ -381,9 +385,15 @@ DOCKER_CHECK_COPY_RE = re.compile(r"COPY --from=(?P<stage>\S+) /build/scripts/re
                                   r"/build/scripts/assert-compiled-features\.sh " + re.escape(DOCKER_CHECK_DIR) + "/")
 DOCKER_RUNTIME_ASSERT = ("RUN set -eu; " + ALLOWED_REQUIRE_IMAGE + '; test -n "$REQUIRE_FLAGS"; bash ' + DOCKER_CHECK_DIR
                          + "/assert-compiled-features.sh /usr/local/bin/ai-memory --strict $REQUIRE_FLAGS")
-SHAPE_PROOF_CMD = 'bash scripts/release-shape-pg-proof.sh target/release/ai-memory "$url"'
+# #6278: the proof step binds the proof script and the two scripts it runs to
+# the commit under test (the #6275 content-hash bind, 5-agent vote (4d3ea1c5)
+# D3=C) and runs it under an empty environment with absolute interpreters.
+SHAPE_PROOF_SCRIPT = "scripts/release-shape-pg-proof.sh"
+SHAPE_BIND_ENV: Dict[str, "Spec"] = {"PREFLIGHT_SHA": "${{ github.sha }}"}
+SHAPE_PROOF_BIND = sane_bind((SHAPE_PROOF_SCRIPT, "scripts/release-features.sh", "scripts/assert-compiled-features.sh"))
+SHAPE_PROOF_CMD = SANE_BASH + " " + SHAPE_PROOF_SCRIPT + ' target/release/ai-memory "$url"'
 SHAPE_PROOF_URL = "url=<the TLS verify-full proof URL>"
-SHAPE_PROOF = ("set -euo pipefail", SHAPE_PROOF_URL, SHAPE_PROOF_CMD)
+SHAPE_PROOF = ("set -euo pipefail", SHAPE_PROOF_BIND, SHAPE_PROOF_URL, SHAPE_PROOF_CMD)
 SHAPE_URL_RE = re.compile(
     r'url="postgres://postgres:\$\{PGTLS_PW\}@127\.0\.0\.1:[0-9]+/proof\?sslmode=verify-full'
     r'&sslrootcert=\$\{PGTLS_DIR\}/ca\.crt"')
@@ -427,6 +437,8 @@ IMAGE_BUILD_USES = "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f
 ATTEST_USES = "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be"
 RUST_TOOLCHAIN_USES = "dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c"
 RUST_CACHE_USES = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
+# release-shape.yml pins the 1.98.0 branch commit of the same action (no `with:`).
+SHAPE_TOOLCHAIN_USES = "dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0"
 UPLOAD_ARTIFACT_USES = "actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4"
 GH_RELEASE_USES = "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65"
 USES_CONSTANTS = {
@@ -437,6 +449,7 @@ USES_CONSTANTS = {
     ATTEST_USES: "ATTEST_USES",
     RUST_TOOLCHAIN_USES: "RUST_TOOLCHAIN_USES",
     RUST_CACHE_USES: "RUST_CACHE_USES",
+    SHAPE_TOOLCHAIN_USES: "SHAPE_TOOLCHAIN_USES",
     UPLOAD_ARTIFACT_USES: "UPLOAD_ARTIFACT_USES",
     GH_RELEASE_USES: "GH_RELEASE_USES",
 }
@@ -689,6 +702,72 @@ SHAPE_JOB: Dict[str, Spec] = {
     "runs-on": "ubuntu-latest",
     "timeout-minutes": "60",
 }
+# #6278 / #6290: the release-shape job is pinned WHOLE, like the release job. Two
+# slots are the statement-list units (the release-shaped build, the PG proof);
+# every other step is compared whole, so no step can be added between the build
+# and the proof (to replace the binary or the proof script), and no step carries
+# an `if:`, `continue-on-error:` or `timeout-minutes:` the list does not pin
+# (only the cleanup step runs `if: always()`). The guard step runs right after
+# checkout, before any third-party action.
+SHAPE_STEPS: List[Spec] = [
+    {"uses": CHECKOUT_USES},
+    {"name": "Release feature declaration guard", "run": "python3 scripts/check_release_features.py"},
+    {"name": "Install Rust 1.98.0 (matches rust-toolchain.toml pin)", "uses": SHAPE_TOOLCHAIN_USES},
+    {"uses": RUST_CACHE_USES},
+    Unit("build"),
+    {"name": "No OpenSSL / libpq / native-tls in the shipped dependency graph", "shell": "bash",
+     "run": Block((
+         'set -euo pipefail',
+         'FEATURES="$(bash scripts/release-features.sh)"',
+         'test -n "$FEATURES"',
+         'tree="$(cargo tree --locked -e normal --target all --features "$FEATURES")"',
+         'if printf \'%s\\n\' "$tree" | grep -E \'(^|[^a-z-])(openssl-sys|native-tls|openssl |libpq)\'; then',
+         '  echo "::error::the release feature set pulls a native TLS / libpq dependency (#4480 requires pure-Rust rustls)"',
+         '  exit 1',
+         'fi',
+         'echo "no openssl-sys / native-tls / libpq in the release dependency graph"',
+     ))},
+    {"name": "Start a TLS PostgreSQL service (throwaway CA, hostssl-only)", "shell": "bash",
+     "run": Block((
+         'set -euo pipefail',
+         'd="$RUNNER_TEMP/pgtls"',
+         'mkdir -p "$d"',
+         'cd "$d"',
+         'openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=release-shape-ca" -keyout ca.key -out ca.crt',
+         'openssl req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.1" -keyout server.key -out server.csr',
+         "printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\\n' > san.ext",
+         'openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 -extfile san.ext -out server.crt',
+         '# hostssl ONLY on TCP: a plaintext login cannot succeed, so a green',
+         '# round trip proves the session was TLS.',
+         "printf 'local all all trust\\nhostssl all all all scram-sha-256\\n' > pg_hba.conf",
+         'sudo chown 999:999 server.key server.crt pg_hba.conf',
+         'sudo chmod 600 server.key',
+         'pw="$(openssl rand -hex 16)"',
+         'echo "::add-mask::$pw"',
+         'echo "PGTLS_DIR=$d" >> "$GITHUB_ENV"',
+         'echo "PGTLS_PW=$pw" >> "$GITHUB_ENV"',
+         '# Image: pgvector/pgvector 0.8.6-pg18 (canonical PostgreSQL 18.6 + pgvector 0.8.6',
+         '# stack of the repo SSOT), pinned by digest; no Apache AGE in this image.',
+         'docker run -d --name release-shape-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=proof -v "$d:/certs:ro" pgvector/pgvector@sha256:2ba9ca5f2e7daa0f0e7723cba1ee9167bab54efd3640516a44ac1a928dd67e7a -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key -c hba_file=/certs/pg_hba.conf',
+         'for _ in $(seq 1 60); do',
+         '  if docker exec release-shape-pg pg_isready -U postgres -d proof >/dev/null 2>&1; then',
+         '    ready=1; break',
+         '  fi',
+         '  sleep 2',
+         'done',
+         'if [ "${ready:-0}" != 1 ]; then',
+         '  docker logs release-shape-pg || true',
+         '  echo "::error::the TLS PostgreSQL service did not become ready (the proof must not pass vacuously)"',
+         '  exit 1',
+         'fi',
+         "docker exec release-shape-pg psql -U postgres -d proof -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS vector;'",
+     ))},
+    Unit("proof"),
+    {"name": "Stop the PostgreSQL service", "if": "always()", "shell": "bash",
+     "run": "docker rm -f release-shape-pg >/dev/null 2>&1 || true"},
+]
+SHAPE_STEP_ROLES = ("checkout", "feature declaration guard", "toolchain", "build cache", "release-shaped build",
+                    "native TLS check", "TLS PostgreSQL service", "PG proof", "PostgreSQL cleanup")
 # #4480 ruled the release-shape job ADVISORY until its first green run; #4720
 # flipped it to required once it had run green (87 runs by 2026-10-09). While
 # True the job must carry exactly the plain `continue-on-error: true`; False
@@ -1787,8 +1866,8 @@ def check_inline_use(name: str, text: str, rep: Report) -> None:
 
 def _shape_norm(lines: Tuple[str, ...]) -> Tuple[str, ...]:
     """The proof statements with the TLS URL assignment (any port) replaced by its placeholder."""
-    if len(lines) == len(SHAPE_PROOF) and SHAPE_URL_RE.fullmatch(lines[1]):
-        return (lines[0], SHAPE_PROOF_URL, lines[2])
+    if len(lines) == len(SHAPE_PROOF) and SHAPE_URL_RE.fullmatch(lines[2]):
+        return lines[:2] + (SHAPE_PROOF_URL,) + lines[3:]
     return lines
 
 
@@ -1840,13 +1919,32 @@ def check_shape(text: str, rep: Report, advisory: Optional[bool] = None) -> None
         rep.bad(f"release-shape.yml: `jobs.release-shape.continue-on-error` is set but SHAPE_ADVISORY is False in "
                 f"{GUARD_PATH} (#4720: the job is required, a failing proof must fail the run)")
     steps = job_steps(job, "release-shape.yml release-shape job", rep)
-    builds = one_unit(steps, KEYS_SHELL, SHAPE_BUILD, "release-shape.yml: the `release-shape:` job build", rep,
-                      "SHAPE_BUILD")
-    proofs = one_unit(steps, KEYS_SHELL, SHAPE_PROOF, "release-shape.yml: the `release-shape:` job pg proof "
-                      "(an executing `bash scripts/release-shape-pg-proof.sh` run step; the `paths:` filter does not count)",
-                      rep, "SHAPE_PROOF", _shape_norm)
-    if builds and proofs and proofs[0] < builds[0]:
-        rep.bad("release-shape.yml: the pg proof must run after the release-shaped build, in the same job")
+    units = {
+        "build": one_unit(steps, KEYS_SHELL, SHAPE_BUILD, "release-shape.yml: the `release-shape:` job build", rep,
+                          "SHAPE_BUILD"),
+        "proof": one_unit(steps, KEYS_BOUND, SHAPE_PROOF, "release-shape.yml: the `release-shape:` job pg proof "
+                          "(an executing, bound `scripts/release-shape-pg-proof.sh` run step; the `paths:` filter "
+                          "does not count)", rep, "SHAPE_PROOF", _shape_norm,
+                          pins={"shell": SANE_SHELL, "env": SHAPE_BIND_ENV}),
+    }
+    # #6278 / #6290: the whole ordered step list is pinned (SHAPE_STEPS).
+    items = [st for _, st in steps]
+    if len(items) != len(SHAPE_STEPS):
+        rep.bad(pin_message("release-shape.yml", f"the release-shape job has {len(items)} steps, the pinned list has "
+                            f"{len(SHAPE_STEPS)} (an extra step can replace the proven binary or the proof script; a "
+                            "missing one skips a control)", "SHAPE_STEPS"))
+        return
+    for n, (step, spec) in enumerate(zip(items, SHAPE_STEPS)):
+        if isinstance(spec, Unit):
+            if units[str(spec)] != [n]:
+                rep.bad(pin_message("release-shape.yml", f"`jobs.release-shape.steps.{n + 1}` must be the {spec} unit "
+                                    f"({SHAPE_STEP_ROLES[n]}); the proof runs after the build, in the same job",
+                                    "SHAPE_STEPS"))
+            continue
+        msg = pinned_step_message(step, spec, f"jobs.release-shape.steps.{n + 1}",
+                                  f"release-shape.yml ({SHAPE_STEP_ROLES[n]} step)", "SHAPE_STEPS")
+        if msg:
+            rep.bad(msg)
 
 
 def check_install(text: str, rep: Report) -> None:
@@ -1911,7 +2009,7 @@ DOCKER = "Dockerfile"
 INSTALL = "docs/INSTALL.md"
 DECL = "scripts/release-features.sh"
 ASSERTER = "scripts/assert-compiled-features.sh"
-INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL, ASSERTER)
+INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL, ASSERTER, SHAPE_PROOF_SCRIPT)
 
 
 def mutate_file(path: Path, old: str, new: Union[str, None, Transform], every: bool = False) -> None:
@@ -3271,6 +3369,7 @@ def shell_argv(spec: str) -> List[str]:
     return [w for w in spec.split() if w != "{0}"] + ["-c"]
 
 
+BOUND_FILES = (DECL, ASSERTER, SHAPE_PROOF_SCRIPT)
 TAMPER_FORMS = ("plain rewrite", "assume-unchanged", "skip-worktree", "in-job commit", "git shim on PATH",
                 "startup file in the job env", "exported git function", "repository redirection")
 
@@ -3284,9 +3383,9 @@ def bound_runtime(root: Path, base: Path, payload: bytes, build: str, assert_bod
         repo = base / name
         shutil.rmtree(repo, ignore_errors=True)
         (repo / "scripts").mkdir(parents=True)
-        for rel in (DECL, ASSERTER):
+        for rel in BOUND_FILES:
             shutil.copy2(root / rel, repo / rel)
-        for cmd in (["init", "-q"], ["add", DECL, ASSERTER], ["commit", "-q", "-m", "pin the inputs"]):
+        for cmd in (["init", "-q"], ["add", *BOUND_FILES], ["commit", "-q", "-m", "pin the inputs"]):
             subprocess.run(git + cmd, cwd=repo, capture_output=True, check=True)
         (repo / "target" / "x" / "release").mkdir(parents=True)
         (repo / "target" / "x" / "release" / "ai-memory").write_bytes(payload)
@@ -3317,21 +3416,23 @@ def bound_runtime(root: Path, base: Path, payload: bytes, build: str, assert_bod
         elif form == "repository redirection":
             decoy = repo / "decoy"
             (decoy / "scripts").mkdir(parents=True)
-            for r in (DECL, ASSERTER):
+            for r in BOUND_FILES:
                 shutil.copy2(repo / r, decoy / r)
-            for cmd in (["init", "-q"], ["add", DECL, ASSERTER], ["commit", "-q", "-m", "decoy"]):
+            for cmd in (["init", "-q"], ["add", *BOUND_FILES], ["commit", "-q", "-m", "decoy"]):
                 subprocess.run(git + cmd, cwd=decoy, capture_output=True, check=True)
             return dict(env, GIT_DIR=str(decoy / ".git"), GIT_WORK_TREE=str(repo))
         return env
 
-    for label, body in (("build unit", build), ("assert unit", assert_body)):
+    shape_bind = "set -euo pipefail\n" + SHAPE_PROOF_BIND  # #6278
+    for label, body, rels in (("build unit", build, (DECL, ASSERTER)), ("assert unit", assert_body, (DECL, ASSERTER)),
+                              ("release-shape proof bind", shape_bind, BOUND_FILES)):
         repo, sha = fresh("control")
         env = dict(os.environ, GITHUB_OUTPUT=str(repo / "output.txt"), PREFLIGHT_SHA=sha)
         if run(repo, body, env) != 0:
             print(f"self-test FAIL: the {label} does not pass with the verified declaration and asserter", file=sys.stderr)
             failures += 1
         for form in TAMPER_FORMS:
-            for rel in (DECL, ASSERTER):
+            for rel in rels:
                 repo, sha = fresh("tamper")
                 env = dict(os.environ, GITHUB_OUTPUT=str(repo / "output.txt"), PREFLIGHT_SHA=sha)
                 env = tamper(form, repo, rel, env)
@@ -3657,8 +3758,10 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("empty instruction at end of file inside a continuation dropped", "    if buf is not None:\n        out.append((start, len(lines), _collapse(buf)))", "    if buf is not None and buf.strip(\" \\t\"):\n        out.append((start, len(lines), _collapse(buf)))"),
     ("instruction word is not case-folded", 'word = ins.split(" ", 1)[0].upper()', 'word = ins.split(" ", 1)[0]'),
     ("final-stage binary COPY count not compared", "if len(copies) != 1:", "if False:"),
-    ("proof order against the build not compared", "if builds and proofs and proofs[0] < builds[0]:", "if False:"),
-    ("proof URL placeholder accepts any URL", "SHAPE_URL_RE.fullmatch(lines[1])", "True"),
+    ("shape step count not compared", "if len(items) != len(SHAPE_STEPS):", "if False:"),
+    ("shape unit slot not compared", "            if units[str(spec)] != [n]:\n                rep.bad(pin_message(\"release-shape.yml\"",
+     "            if False:\n                rep.bad(pin_message(\"release-shape.yml\""),
+    ("proof URL placeholder accepts any URL", "SHAPE_URL_RE.fullmatch(lines[2])", "True"),
     ("proof norm drops statements after the URL", "if len(lines) == len(SHAPE_PROOF) and SHAPE_URL_RE", "if len(lines) >= 3 and SHAPE_URL_RE"),
     ("proof URL sslmode not pinned", r"\?sslmode=verify-full", r"\?sslmode=[a-z-]+"),
     ("proof URL sslrootcert not pinned", r"&sslrootcert=\$\{PGTLS_DIR\}/ca\.crt", r"&sslrootcert=[^\"]*"),
