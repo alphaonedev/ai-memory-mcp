@@ -654,6 +654,21 @@ mod tests {
         );
     }
 
+    /// #6146: the refusal is recognised by its TYPE, never by its text. A bare
+    /// `register_core` string that merely has the refusal's shape (here with a
+    /// path planted where the lineage goes) stays foreign and is withheld.
+    #[test]
+    fn issue_6146_refusal_shaped_string_is_not_a_typed_refusal() {
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
+        let shaped = register_core_error(
+            "skill lineage '/srv/tenant/x' is retired; unretire before re-registering".into(),
+        );
+        assert_eq!(
+            crate::mcp::error_text::mcp_foreign_err("issue_6146", shaped),
+            crate::mcp::error_text::DB_ERROR_TEXT
+        );
+    }
+
     #[test]
     fn refuses_unknown_reflection_id() {
         let (conn, _dir) = open_db();
