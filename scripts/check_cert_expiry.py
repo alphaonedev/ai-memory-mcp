@@ -1369,6 +1369,58 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             t.fail(f"(shim-probe-oserror): refused for the wrong reason: {exc}")
     else:
         t.fail("(shim-probe-oserror): a probe that could not start was treated as reachable")
+    # #6428: the shim directory is owned by one try/finally, so ANY exception
+    # (not only GateError) raised after it is created must remove it.
+    if os.pathsep not in str(tmp):
+        shims_before = sorted(p.name for p in tmp.glob("gitshim.*"))
+        with unittest.mock.patch.object(sys.modules[__name__], "_require_shim_reachable",
+                                        side_effect=RuntimeError("probe blew up")):
+            try:
+                run_gate_shimmed(tmp, repo, env7, version="git version 2.29.9")
+            except RuntimeError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - a different exception is itself the failure
+                t.fail(f"(shim-clean-any-exc): wrong exception type escaped: {exc!r}")
+            else:
+                t.fail("(shim-clean-any-exc): a probe exception was swallowed")
+        if sorted(p.name for p in tmp.glob("gitshim.*")) != shims_before:
+            t.fail("(shim-clean-any-exc): a non-GateError exception left the shim scratch "
+                   "directory behind")
+    # #6428: the probe decodes with errors="replace", so a git that writes bytes
+    # that are not UTF-8 is a named refusal, never a UnicodeDecodeError crash.
+    if os.pathsep not in str(tmp):
+        fake_dir = Path(tempfile.mkdtemp(prefix="fakegit.", dir=str(tmp)))
+        try:
+            fake = fake_dir / "git"
+            fake.write_text(f"#!{sys.executable}\nimport sys\n"
+                            "sys.stdout.buffer.write(bytes([0xff, 0xfe, 10]))\n", encoding="utf-8")
+            fake.chmod(0o755)
+            try:
+                _require_shim_reachable(str(fake_dir))
+            except GateError as exc:
+                if "is not the git on PATH" not in str(exc):
+                    t.fail(f"(shim-probe-decode): refused for the wrong reason: {exc}")
+            except Exception as exc:  # noqa: BLE001 - the crash is the failure being pinned
+                t.fail(f"(shim-probe-decode): non-UTF-8 probe output crashed the probe: {exc!r}")
+            else:
+                t.fail("(shim-probe-decode): non-UTF-8 probe output was treated as the marker")
+            # #6428: a probe that runs past its timeout is a named refusal; the
+            # branch is reached through a real sleeping git and a 1 second budget.
+            sleeper = fake_dir / "git"
+            sleeper.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n",
+                               encoding="utf-8")
+            sleeper.chmod(0o755)
+            try:
+                _require_shim_reachable(str(fake_dir), timeout=1)
+            except GateError as exc:
+                if "probe failed" not in str(exc):
+                    t.fail(f"(shim-probe-timeout): refused for the wrong reason: {exc}")
+            except Exception as exc:  # noqa: BLE001 - an escaped timeout is the failure
+                t.fail(f"(shim-probe-timeout): the probe timeout escaped as {exc!r}")
+            else:
+                t.fail("(shim-probe-timeout): a probe that timed out was treated as reachable")
+        finally:
+            shutil.rmtree(fake_dir, ignore_errors=True)
     # #6381: the shim PATH entry is process-global; every shim cell above, on its
     # success path (shim-control), its gate-verdict paths (gitver, anc-error) and
     # its refusal paths (shim-pathsep, shim-unreach), must leave PATH as found.
