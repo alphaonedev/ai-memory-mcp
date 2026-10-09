@@ -56,17 +56,29 @@ each unit is and WHAT is substituted into it:
     open-ended list of job keys that can skip, redirect or neutralise the
     assert (``if:``, ``env:``, ``defaults:``, ``container:``,
     ``continue-on-error:``...). A pinned step ``name:`` must not carry ``${{``.
-  * In the release job no step other than the canonical build may mention
-    ``cargo``, ``rustc``, ``cross`` or ``cargo-zigbuild`` (any case, any option
-    order, any ``+toolchain``), and in the whole of release.yml at most one
-    line runs one of them against ``matrix.target``. This is a REFUSAL, not
-    tracking: it does not prove the uploaded file is the asserted one (#4752).
+  * The release job is pinned WHOLE (#4752, the way the docker job is): its
+    ordered step list is exactly ``RELEASE_STEPS``. Three slots are the
+    statement-list units (build; strict assert, which has ``id: assert`` and
+    records the SHA-256 of the bytes it checked in ``GITHUB_OUTPUT``; the
+    hash-bound package step, whose ``env`` reads that output and which refuses
+    to package a file with any other hash, ``WF_PACKAGE``). Every other step is
+    compared whole: keys, SHA-pinned ``uses``, ``with:`` / ``env:`` / ``if:``
+    values and the exact ``run:`` lines. So no step can be added, removed,
+    reordered or changed, and the file that is packaged, checksummed, attested
+    and uploaded is the file the assert executed. In the whole of release.yml
+    at most one line runs a build tool (``cargo``, ``rustc``, ``cross``,
+    ``cargo-zigbuild``, any case) against ``matrix.target``.
   * Dockerfile: line 1 must be exactly ``# syntax=docker/dockerfile:1`` and no
     other parser directive (``escape``, ``check``, a second ``syntax``) may
     appear anywhere; heredocs (``<<``), ``SHELL``, ``ONBUILD`` and unknown
     instructions are refused. Stages are parsed: the final stage must COPY the
     binary exactly once, from a NAMED earlier stage, and take nothing else
-    ``--from`` another stage or image; that stage (the builder) must not start
+    ``--from`` another stage or image except, immediately after the binary
+    COPY, the declaration and the asserter from that same stage, followed by
+    exactly the runtime assert RUN on ``/usr/local/bin/ai-memory``
+    (``DOCKER_RUNTIME_ASSERT``, #4752: the shipped path is re-asserted on the
+    runtime base image); after that RUN no COPY, ADD or RUN may follow. That
+    stage (the builder) must not start
     FROM another stage nor COPY ``--from``, must COPY Cargo.lock, and must end
     with exactly the declaration COPY followed by the canonical RUN. ``cargo``
     (and the other build tools) anywhere else in the Dockerfile is refused, read
@@ -152,9 +164,10 @@ characters (CR, form feed, NUL...), NBSP and every other Unicode space or zero-w
 workflows or Dockerfile are refused, never folded: Python, YAML and bash
 disagree on what a line and a blank are.
 
-OUT OF SCOPE (tracked): the shipped file differing from the asserted one
-(#4752), another step or Dockerfile instruction poisoning the environment or
-rewriting the declaration before the allowed units run (#4768).
+OUT OF SCOPE (tracked): an action step (``uses:``) or a shared cache poisoning
+the environment or rewriting the declaration before the allowed units run
+(#4768); the whole-job pin sees every ``run:`` line but not what an action
+does at runtime.
 
 Exit codes: 0 = guard passes, 1 = guard failure (or self-test / sweep failure),
 2 = usage error or unreadable input (non-UTF-8, a directory or a symlink loop
@@ -169,6 +182,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import os
 import re
 import shutil
@@ -189,10 +203,30 @@ ASSERT_DOCKER = "bash scripts/assert-compiled-features.sh target/release/ai-memo
 BUILD_CMD = 'cargo build --locked --release --target ${{ matrix.target }} --features "$FEATURES"'
 SHAPE_BUILD_CMD = 'cargo build --locked --release --features "$FEATURES"'
 SBOM_CMD = 'cargo cyclonedx --format json --features "$FEATURES"'
+# #4752: the assert step records the SHA-256 of the bytes it checked; the package
+# step refuses any other file. `shasum -a 256` exists on every matrix runner
+# (perl on the Linux images, the system tool on macOS).
+ASSERT_RECORD = ('asserted_sha256="$(shasum -a 256 "$bin" | cut -d\' \' -f1)"',
+                 'echo "sha256=$asserted_sha256" >> "$GITHUB_OUTPUT"')
+ASSERT_ID = "assert"
+PACKAGE_ENV: Dict[str, "Spec"] = {"ASSERTED_SHA256": "${{ steps.assert.outputs.sha256 }}"}
+PACKAGE_DIST = 'dist/${{ matrix.artifact }}'
+PACKAGE_CHECK = ('test "$packaged_sha256" = "$ASSERTED_SHA256" || { echo "::error::' + PACKAGE_DIST
+                 + ' ($packaged_sha256) is not the binary the strict assert checked ($ASSERTED_SHA256)"; exit 1; }')
 
 # The exact statements (after normalisation) of each unit that decides what ships.
 WF_BUILD = ("set -euo pipefail", ALLOWED_FEATURES, 'test -n "$FEATURES"', BUILD_CMD)
-WF_ASSERT = ("set -euo pipefail", ALLOWED_BIN, ALLOWED_REQUIRE, 'test -n "$REQUIRE_FLAGS"', ASSERT_WORKFLOW)
+WF_ASSERT = ("set -euo pipefail", ALLOWED_BIN, ALLOWED_REQUIRE, 'test -n "$REQUIRE_FLAGS"', ASSERT_WORKFLOW) + ASSERT_RECORD
+WF_PACKAGE = (
+    "set -euo pipefail",
+    "mkdir -p dist",
+    'cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "' + PACKAGE_DIST + '"',
+    'packaged_sha256="$(shasum -a 256 "' + PACKAGE_DIST + '" | cut -d\' \' -f1)"',
+    'test -n "$ASSERTED_SHA256"',
+    PACKAGE_CHECK,
+    "cd dist",
+    'tar czf "ai-memory-${{ matrix.target }}.tar.gz" "${{ matrix.artifact }}"',
+)
 WF_SBOM = (
     "set -euo pipefail",
     'SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"',
@@ -229,6 +263,14 @@ DOCKER_RUN_LINES = (
     "    strip target/release/ai-memory; \\",
     "    " + ASSERT_DOCKER,
 )
+# #4752: the runtime stage re-asserts the SHIPPED path with the declaration and
+# asserter copied from the builder stage (never from the build context).
+DOCKER_CHECK_DIR = "/opt/ai-memory/release-check"
+ALLOWED_REQUIRE_IMAGE = 'REQUIRE_FLAGS="$(bash ' + DOCKER_CHECK_DIR + '/release-features.sh --require-flags)"'
+DOCKER_CHECK_COPY_RE = re.compile(r"COPY --from=(?P<stage>\S+) /build/scripts/release-features\.sh "
+                                  r"/build/scripts/assert-compiled-features\.sh " + re.escape(DOCKER_CHECK_DIR) + "/")
+DOCKER_RUNTIME_ASSERT = ("RUN set -eu; " + ALLOWED_REQUIRE_IMAGE + '; test -n "$REQUIRE_FLAGS"; bash ' + DOCKER_CHECK_DIR
+                         + "/assert-compiled-features.sh /usr/local/bin/ai-memory --strict $REQUIRE_FLAGS")
 SHAPE_PROOF_CMD = 'bash scripts/release-shape-pg-proof.sh target/release/ai-memory "$url"'
 SHAPE_PROOF_URL = "url=<the TLS verify-full proof URL>"
 SHAPE_PROOF = ("set -euo pipefail", SHAPE_PROOF_URL, SHAPE_PROOF_CMD)
@@ -254,6 +296,11 @@ class Block(tuple):
     """A pinned ``|`` literal block, compared line by line."""
 
 
+class Unit(str):
+    """A RELEASE_STEPS slot held by one of the three statement-list units
+    (``build`` / ``assert`` / ``package``), located by ``one_unit``."""
+
+
 # Pinned YAML: str = plain scalar, Flow / Double / Single = that style, Block =
 # `|` lines, dict = a mapping with exactly these keys, list = a sequence of
 # exactly these items, None = a key with no value.
@@ -268,13 +315,119 @@ BUILDX_USES = "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd
 LOGIN_USES = "docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9"
 IMAGE_BUILD_USES = "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8"
 ATTEST_USES = "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be"
+RUST_TOOLCHAIN_USES = "dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c"
+RUST_CACHE_USES = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
+UPLOAD_ARTIFACT_USES = "actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4"
+GH_RELEASE_USES = "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65"
 USES_CONSTANTS = {
     CHECKOUT_USES: "CHECKOUT_USES",
     BUILDX_USES: "BUILDX_USES",
     LOGIN_USES: "LOGIN_USES",
     IMAGE_BUILD_USES: "IMAGE_BUILD_USES",
     ATTEST_USES: "ATTEST_USES",
+    RUST_TOOLCHAIN_USES: "RUST_TOOLCHAIN_USES",
+    RUST_CACHE_USES: "RUST_CACHE_USES",
+    UPLOAD_ARTIFACT_USES: "UPLOAD_ARTIFACT_USES",
+    GH_RELEASE_USES: "GH_RELEASE_USES",
 }
+# The release job is pinned WHOLE (#4752), the way the docker job is: it holds
+# `contents: write` + `attestations: write`, so any step it runs can change,
+# checksum, attest and upload the shipped file. Three slots are the statement-list
+# units located by `one_unit` (build, strict assert, hash-bound package); every
+# other step is compared whole: keys, SHA-pinned `uses`, `with:` / `env:` / `if:`
+# values and the exact `run:` block lines. Nothing can be added, removed,
+# reordered or changed without updating RELEASE_STEPS in the same commit.
+_TAG_ENV = {"TAG": "${{ needs.preflight.outputs.tag }}"}
+RELEASE_STEPS: List[Spec] = [
+    {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
+    {"name": "Install Rust 1.98.0 + target std", "uses": RUST_TOOLCHAIN_USES,
+     "with": {"toolchain": "1.98.0", "targets": "${{ matrix.target }}"}},
+    {"uses": RUST_CACHE_USES},
+    Unit("build"),
+    Unit("assert"),
+    Unit("package"),
+    {"name": "Build deb and rpm packages", "if": "matrix.nfpm_arch", "env": dict(_TAG_ENV), "run": Block((
+        "set -euo pipefail",
+        "# #3546 — download to a file and check a PINNED digest before",
+        "# extracting; never `curl | tar`. Digests from goreleaser's",
+        "# v2.41.1 checksums.txt, cross-checked on 2026-09-11 by hashing",
+        "# both downloaded tarballs.",
+        "NFPM_ARCH=$(uname -m | sed 's/aarch64/arm64/')",
+        'case "$NFPM_ARCH" in',
+        "  x86_64) NFPM_SHA256=b3cf95aa6dabed836d09ad7f0c190a13c74c5b1304db60846f0f702ee407f430 ;;",
+        "  arm64)  NFPM_SHA256=17350a838c8e2c422c6e573ed379b18424565d2de8a2b1cb1b20211976124eb5 ;;",
+        '  *) echo "::error::no pinned nfpm digest for $NFPM_ARCH"; exit 1 ;;',
+        "esac",
+        'NFPM_TGZ="$RUNNER_TEMP/nfpm_2.41.1_Linux_${NFPM_ARCH}.tar.gz"',
+        'curl -fsSL -o "$NFPM_TGZ" "https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_Linux_${NFPM_ARCH}.tar.gz"',
+        'echo "${NFPM_SHA256}  ${NFPM_TGZ}" | sha256sum -c -',
+        'tar xzf "$NFPM_TGZ" -C /usr/local/bin nfpm',
+        "",
+        'VERSION="${TAG#v}"',
+        "",
+        "ARCH=${{ matrix.nfpm_arch }} VERSION=$VERSION nfpm package -p deb -f nfpm.yaml -t dist/",
+        "ARCH=${{ matrix.nfpm_arch }} VERSION=$VERSION nfpm package -p rpm -f nfpm.yaml -t dist/",
+        "",
+        "ls -la dist/*.deb dist/*.rpm",
+    ))},
+    {"name": "Checksum every release artifact", "shell": "bash", "run": Block((
+        "set -euo pipefail",
+        "cd dist",
+        "emitted=0",
+        "for f in *; do",
+        '  [ -f "$f" ] || continue',
+        '  case "$f" in',
+        "    *.sha256)          continue ;;",
+        '    ai-memory)         echo "::notice::skipping checksum for non-arch-qualified \'$f\' (collides across matrix legs)"; continue ;;',
+        "  esac",
+        "  if command -v sha256sum >/dev/null 2>&1; then",
+        '    sha256sum "$f" > "$f.sha256"',
+        "  else",
+        '    shasum -a 256 "$f" > "$f.sha256"',
+        "  fi",
+        "  emitted=$((emitted + 1))",
+        "done",
+        "# Fail loudly rather than publishing a release with no checksums:",
+        "# a sweep that silently emitted nothing would be the exact",
+        '# "reports success when it did nothing" defect #2449 is about.',
+        'if [ "$emitted" -eq 0 ]; then',
+        '  echo "::error::checksum sweep produced nothing - refusing to publish unverifiable artifacts"',
+        "  exit 1",
+        "fi",
+        'echo "checksummed ${emitted} artifact(s)"',
+        "ls -la",
+    ))},
+    {"name": "Upload release artifact", "uses": UPLOAD_ARTIFACT_USES,
+     "with": {"name": "ai-memory-${{ matrix.target }}", "path": "dist/ai-memory*"}},
+    {"name": "Attest build provenance (release binaries + packages)", "if": "github.event.inputs.dry_run == 'false'",
+     "uses": ATTEST_USES, "with": {"subject-path": Single("dist/ai-memory*")}},
+    {"name": "Resolve release-body file (per-tag override, optional)", "id": "release_body", "shell": "bash",
+     "env": dict(_TAG_ENV), "run": Block((
+         "# v0.6.4 introduced the per-tag release-body convention. The",
+         "# file lives at .github/release-body-<tag>.md and carries the",
+         "# polished GitHub release page copy.",
+         'path=".github/release-body-${TAG}.md"',
+         'if [[ -f "$path" ]]; then',
+         '  echo "body_path=$path" >> "$GITHUB_OUTPUT"',
+         '  echo "::notice::release body sourced from $path"',
+         "else",
+         '  echo "body_path=" >> "$GITHUB_OUTPUT"',
+         '  echo "::notice::no release-body file at $path — falling back to auto-generated notes"',
+         "fi",
+     ))},
+    {"name": "Re-assert the release tag has not moved (#3546)", "shell": "bash",
+     "env": {"REMOTE": "https://github.com/${{ github.repository }}", "TAG": "${{ needs.preflight.outputs.tag }}",
+             "TAG_OBJECT": "${{ needs.preflight.outputs.tag_object }}", "SHA": "${{ needs.preflight.outputs.sha }}"},
+     "run": Block(('bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" --tag-object "$TAG_OBJECT" --sha "$SHA"',))},
+    {"name": "Create GitHub Release", "if": "github.event.inputs.dry_run == 'false'", "uses": GH_RELEASE_USES,
+     "with": {"tag_name": "${{ needs.preflight.outputs.tag }}", "files": "dist/ai-memory*",
+              "body_path": "${{ steps.release_body.outputs.body_path }}",
+              "generate_release_notes": "${{ steps.release_body.outputs.body_path == '' }}",
+              "prerelease": "${{ needs.preflight.outputs.is_prerelease == 'true' }}"},
+     "env": {"GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"}},
+]
+RELEASE_STEP_ROLES = ("checkout", "toolchain", "rust-cache", "build", "strict assert", "package", "deb/rpm", "checksum sweep",
+                      "artifact upload", "provenance attestation", "release body", "tag re-assert", "GitHub release")
 DOCKER_JOB: Dict[str, Spec] = {
     "name": "Docker (GHCR)",
     "needs": Flow("preflight, qualify, supply-chain"),
@@ -411,6 +564,8 @@ DOCKER_INSTRUCTIONS = frozenset((
 ))
 
 KEYS_SHELL = ("name", "shell", "run")
+KEYS_ASSERT = ("name", "id", "shell", "run")
+KEYS_PACKAGE = ("name", "shell", "env", "run")
 KEYS_PLAIN = ("name", "run")
 TOP_KEYS = ("name", "on", "permissions", "concurrency", "jobs")
 RELEASE_JOBS = tuple(RELEASE_JOB_PERMISSIONS)
@@ -863,11 +1018,21 @@ def _same(lines: Tuple[str, ...]) -> Tuple[str, ...]:
     return lines
 
 
-def step_problem(step: Node, want_keys: Tuple[str, ...], expected: Tuple[str, ...], norm: Norm = _same) -> str:
-    """Why ``step`` is not the allowed unit ("" when it is exactly that unit)."""
+Pins = Optional[Dict[str, Spec]]
+
+
+def step_problem(step: Node, want_keys: Tuple[str, ...], expected: Tuple[str, ...], norm: Norm = _same,
+                 pins: Pins = None) -> str:
+    """Why ``step`` is not the allowed unit ("" when it is exactly that unit).
+    ``pins`` are step keys other than name/shell/run compared whole (the assert
+    step's ``id``, the package step's ``env``, #4752)."""
     why = Report()
     if set(step.keys()) != set(want_keys):
         why.bad(f"step keys {sorted(step.keys())} differ from the only allowed set {sorted(want_keys)}")
+    for key, spec in (pins or {}).items():
+        pinned = pin_problem(step.get(key), spec, key)
+        if pinned:
+            why.bad(pinned)
     name = step.get("name")
     if name is not None and "${{" in name.text():
         why.bad("the step `name:` carries a `${{ }}` expression (refused in a pinned unit)")
@@ -891,12 +1056,12 @@ def job_steps(job: Node, where: str, rep: Report) -> List[Tuple[int, Node]]:
 
 
 def canonical(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], expected: Tuple[str, ...],
-              norm: Norm = _same) -> List[int]:
-    return [i for i, st in steps if not step_problem(st, want_keys, expected, norm)]
+              norm: Norm = _same, pins: Pins = None) -> List[int]:
+    return [i for i, st in steps if not step_problem(st, want_keys, expected, norm, pins)]
 
 
 def nearest_problem(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], expected: Tuple[str, ...],
-                    norm: Norm = _same) -> str:
+                    norm: Norm = _same, pins: Pins = None) -> str:
     """The step that shares the most statements with the unit, and why it is not it."""
     best: Optional[Tuple[int, Node]] = None
     score = 0
@@ -906,15 +1071,15 @@ def nearest_problem(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], e
             best, score = (i, st), s
     if best is None:
         return "no step shares a statement with it"
-    return f"nearest is {step_label(*best)}: {step_problem(best[1], want_keys, expected, norm)}"
+    return f"nearest is {step_label(*best)}: {step_problem(best[1], want_keys, expected, norm, pins)}"
 
 
 def one_unit(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], expected: Tuple[str, ...], what: str,
-             rep: Report, const: str, norm: Norm = _same) -> List[int]:
-    found = canonical(steps, want_keys, expected, norm)
+             rep: Report, const: str, norm: Norm = _same, pins: Pins = None) -> List[int]:
+    found = canonical(steps, want_keys, expected, norm, pins)
     if len(found) != 1:
         rep.bad(f"{what} must have exactly one step with exactly the allowed body (found {len(found)})"
-                + (": " + nearest_problem(steps, want_keys, expected, norm) if not found else "") + pin_hint(const))
+                + (": " + nearest_problem(steps, want_keys, expected, norm, pins) if not found else "") + pin_hint(const))
     return found
 
 
@@ -986,17 +1151,33 @@ def check_release_job(job: Node, rep: Report) -> None:
         rep.bad(f"release.yml release job `runs-on:` must be exactly `{RELEASE_RUNS_ON}`" + pin_hint("RELEASE_RUNS_ON"))
     check_matrix(job, rep)
     steps = job_steps(job, "release.yml release job", rep)
-    builds = one_unit(steps, KEYS_SHELL, WF_BUILD, "release.yml: the release job build", rep, "WF_BUILD")
-    asserts = one_unit(steps, KEYS_SHELL, WF_ASSERT, "release.yml: the release job strict assert", rep, "WF_ASSERT")
-    if builds and asserts and min(asserts) < max(builds):
-        rep.bad("release.yml: the strict assert must run after the build, in the same job")
-    for i, st in steps:
-        if i in builds:
+    units = {
+        "build": one_unit(steps, KEYS_SHELL, WF_BUILD, "release.yml: the release job build", rep, "WF_BUILD"),
+        "assert": one_unit(steps, KEYS_ASSERT, WF_ASSERT, "release.yml: the release job strict assert", rep, "WF_ASSERT",
+                           pins={"id": ASSERT_ID}),
+        "package": one_unit(steps, KEYS_PACKAGE, WF_PACKAGE, "release.yml: the release job hash-bound package", rep,
+                            "WF_PACKAGE", pins={"env": PACKAGE_ENV}),
+    }
+    # #4752: the whole ordered step list is pinned, like the docker job's. The
+    # three units must sit in their slots (build, then assert, then package);
+    # every other step is compared whole.
+    items = [st for _, st in steps]
+    if len(items) != len(RELEASE_STEPS):
+        rep.bad(pin_message("release.yml", f"the release job has {len(items)} steps, the pinned list has "
+                            f"{len(RELEASE_STEPS)} (an extra step can rebuild, replace, re-checksum or re-upload the "
+                            "shipped file; a missing one skips a control)", "RELEASE_STEPS"))
+        return
+    for n, (step, spec) in enumerate(zip(items, RELEASE_STEPS)):
+        if isinstance(spec, Unit):
+            if units[str(spec)] != [n]:
+                rep.bad(pin_message("release.yml", f"`jobs.release.steps.{n + 1}` must be the {spec} unit "
+                                    f"({RELEASE_STEP_ROLES[n]}); the units run in the order build, assert, package",
+                                    "RELEASE_STEPS"))
             continue
-        hit = next((m for m in (BUILD_TOOL_RE.search(unquoted(t)) for t in node_texts(st)) if m), None)
-        if hit is not None:
-            rep.bad(f"release.yml: release job {step_label(i, st)} runs `{hit.group(0)}`; only the canonical build "
-                    "step may run a build tool in the release job (any option order or +toolchain)")
+        msg = pinned_step_message(step, spec, f"jobs.release.steps.{n + 1}", f"release.yml ({RELEASE_STEP_ROLES[n]} step)",
+                                  "RELEASE_STEPS")
+        if msg:
+            rep.bad(msg)
 
 
 def check_sbom_job(job: Node, rep: Report) -> None:
@@ -1056,11 +1237,15 @@ def pin_message(label: str, why: str, const: str) -> str:
 
 
 def docker_step_message(step: Node, spec: Spec, n: int) -> str:
-    """The one message for docker job step ``n`` ("" when it is the pinned step).
+    """The one message for docker job step ``n`` ("" when it is the pinned step)."""
+    return pinned_step_message(step, spec, f"jobs.docker.steps.{n + 1}", f"release.yml ({DOCKER_STEP_ROLES[n]} step)",
+                               "DOCKER_STEPS")
+
+
+def pinned_step_message(step: Node, spec: Spec, at: str, role: str, const: str) -> str:
+    """The one message for a whole-pinned step ("" when it is the pinned step).
     A changed SHA of a pinned action (a Dependabot bump) names its constant; the
     rest of the step is then compared as if the new SHA were pinned."""
-    at = f"jobs.docker.steps.{n + 1}"
-    role = f"release.yml ({DOCKER_STEP_ROLES[n]} step)"
     uses = step.get("uses") if step.kind == "map" else None
     want = spec.get("uses") if isinstance(spec, dict) else None
     if (isinstance(want, str) and uses is not None and uses.kind == "scalar" and uses.style == "plain"
@@ -1073,7 +1258,7 @@ def docker_step_message(step: Node, spec: Spec, n: int) -> str:
                 f"Dependabot): update {const} in {GUARD_PATH} to the new SHA in the same commit"
                 + (f"; also {why}" if why else ""))
     why = pin_problem(step, spec, at)
-    return pin_message(role, why, "DOCKER_STEPS") if why else ""
+    return pin_message(role, why, const) if why else ""
 
 
 def check_docker_job(jobs: Node, rep: Report) -> None:
@@ -1355,6 +1540,21 @@ def check_dockerfile(text: str, rep: Report) -> None:
         if m is not None and m.group("src").lower() != src:
             rep.bad(f"Dockerfile: final-stage `{ins[:60]}` takes `--from={m.group('src')}`; only the stage that "
                     "builds the binary may feed the image")
+    # #4752: right after the binary COPY the final stage copies the declaration and
+    # the asserter from the SAME stage and re-asserts the shipped path; after that
+    # RUN no COPY, ADD or RUN may follow (it could replace the asserted file).
+    at = next((k for k, ins in enumerate(final) if BINARY_COPY_RE.fullmatch(ins)), -1)
+    check_copy = DOCKER_CHECK_COPY_RE.fullmatch(final[at + 1]) if 0 <= at < len(final) - 1 else None
+    if (at < 0 or check_copy is None or check_copy.group("stage").lower() != src
+            or at + 2 >= len(final) or final[at + 2] != DOCKER_RUNTIME_ASSERT):
+        rep.bad("Dockerfile: the binary COPY must be followed immediately by the release-check COPY from the same stage "
+                f"(`COPY --from=<stage> /build/scripts/release-features.sh /build/scripts/assert-compiled-features.sh "
+                f"{DOCKER_CHECK_DIR}/`) and then by exactly the runtime assert RUN on /usr/local/bin/ai-memory (#4752)"
+                + pin_hint("DOCKER_RUNTIME_ASSERT"))
+    for ins in final[at + 3:] if at >= 0 else []:
+        if ins.split(" ", 1)[0].upper() in ("COPY", "ADD", "RUN"):
+            rep.bad(f"Dockerfile: `{ins[:60]}` after the runtime assert can replace the asserted file; only metadata "
+                    "instructions (ENV, VOLUME, EXPOSE, USER, ENTRYPOINT, CMD...) may follow it (#4752)")
     bidx = names.get(src)
     if bidx is None or bidx == len(stages) - 1:
         rep.bad(f"Dockerfile: the final image copies the binary from `{src}`, which is not an earlier named stage")
@@ -1383,7 +1583,7 @@ def check_inline_use(name: str, text: str, rep: Report) -> None:
     """Every use of the declaration is its own assignment (a failing declaration
     inside a substitution in another command would be swallowed)."""
     for ln in logical_lines(text.split("\n")):
-        stripped = ln.replace(ALLOWED_FEATURES, "").replace(ALLOWED_REQUIRE, "")
+        stripped = ln.replace(ALLOWED_FEATURES, "").replace(ALLOWED_REQUIRE, "").replace(ALLOWED_REQUIRE_IMAGE, "")
         if INLINE_USE_RE.search(stripped):
             rep.bad(f"{name}: inline use of the declaration (a failure would be swallowed; assign it in its own statement): {ln[:80]}")
 
@@ -1549,8 +1749,8 @@ REL_BUILD = ASSIGN + IND + 'test -n "$FEATURES"\n' + IND + BUILD_CMD
 REL_BUILD_CMD = IND + BUILD_CMD
 REL_ASSERT = IND + ASSERT_WORKFLOW
 BIN_LINE = IND + ALLOWED_BIN
-ASSERT_NAME = "      - name: Assert compiled features (#2676, #2728)\n"
-ASSERT_HDR = ASSERT_NAME + "        shell: bash\n"
+ASSERT_NAME = '      - name: "Assert compiled features (#2676, #2728)"\n'
+ASSERT_HDR = ASSERT_NAME + "        id: assert\n        shell: bash\n"
 ASSERT_RUN = ASSERT_HDR + "        run: |\n"
 BUILD_HDR = "      - name: Build release binary\n"
 BUILD_SHELL = "        shell: bash\n        run: |\n          set -euo pipefail\n"
@@ -1611,11 +1811,18 @@ D_FINAL = "FROM debian:bookworm-slim\n"
 D_WORKDIR = "WORKDIR /build\n"
 D_LOCK = DOCKER_LOCK_COPY + "\n"
 D_BIN = "COPY --from=builder /build/target/release/ai-memory /usr/local/bin/ai-memory\n"
+D_ENV = "ENV AI_MEMORY_DB=/data/ai-memory.db\n"
+D_CHECK = DOCKER_RUNTIME_ASSERT + "\n"
 SHAPE_JOB_HDR = "\n  release-shape:\n"
 
 
 def _docker(old: str, new: Union[str, Transform], every: bool = False) -> Edit:
     return (DOCKER, old, new, every)
+
+
+def _final(ins: str) -> Edit:
+    """An instruction in the final stage, before the binary COPY (#4752 pins what follows it)."""
+    return _docker(D_BIN, ins + D_BIN)
 
 
 def _step_before_pkg(body: str) -> List[Edit]:
@@ -1714,6 +1921,9 @@ CRATES_STEPS = ("    # CARGO_REGISTRY_TOKEN is scoped to the `release` Environme
                 "    environment: release\n    steps:\n")
 SUPPLY_PERMS = "    # it must not inherit the top-level `contents: write`.\n    permissions:\n      contents: read\n"
 NFPM_LS = "          ls -la dist/*.deb dist/*.rpm\n"
+PKG_ENV = "        env:\n          ASSERTED_SHA256: ${{ steps.assert.outputs.sha256 }}\n"
+CHECKSUM_HDR = "      - name: Checksum every release artifact  # checksum-sweep (#2449)\n        shell: bash\n"
+GH_TOKEN_ENV = "          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
 CHECKSUM_DONE = '          echo "checksummed ${emitted} artifact(s)"\n'
 REL_ON = "on:\n  workflow_dispatch:\n"
 REL_GROUP = "  group: release-${{ github.event.inputs.tag }}\n"
@@ -2086,15 +2296,15 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     # --- #4719 SR-3/M2: Dockerfile directives, heredocs, stage chain
     "SR3 syntax directive changed": ("fail", [_docker(DOCKER_SYNTAX + "\n", "# syntax=docker/dockerfile:1.7\n")]),
     "SR3 escape directive": ("fail", [_docker(DOCKER_SYNTAX + "\n", DOCKER_SYNTAX + "\n# escape=`\n")]),
-    "SR3 heredoc RUN in the final stage": ("fail", [_docker(D_BIN, D_BIN + "RUN cat <<<x\n")]),
-    "SR3 ONBUILD instruction": ("fail", [_docker(D_BIN, D_BIN + "ONBUILD RUN true\n")]),
-    "SR3 unknown instruction": ("fail", [_docker(D_BIN, D_BIN + "BOGUS x\n")]),
+    "SR3 heredoc RUN in the final stage": ("fail", [_final("RUN cat <<<x\n")]),
+    "SR3 ONBUILD instruction": ("fail", [_final("ONBUILD RUN true\n")]),
+    "SR3 unknown instruction": ("fail", [_final("BOGUS x\n")]),
     "SR3 instruction before the first FROM": ("fail", [_docker(D_BUILDER, "ENV X=1\n" + D_BUILDER)]),
     "SR3 FROM outside the subset": ("fail", [_docker(D_FINAL, "FROM busybox junk AS dead\n" + D_FINAL)]),
     "SR3 stage FROM an earlier stage": ("fail", [_docker(D_FINAL, "FROM builder AS other\n" + D_FINAL)]),
     "SR3 duplicate stage name": ("fail", [_docker(D_FINAL, "FROM busybox AS builder\n" + D_FINAL)]),
-    "SR3 binary copied twice": ("fail", [_docker(D_BIN, D_BIN + D_BIN)]),
-    "SR3 final stage takes another --from": ("fail", [_docker(D_BIN, D_BIN + "COPY --from=busybox /bin/sh /bin/sh2\n")]),
+    "SR3 binary copied twice": ("fail", [_docker(D_FINAL, D_FINAL + D_BIN)]),
+    "SR3 final stage takes another --from": ("fail", [_final("COPY --from=busybox /bin/sh /bin/sh2\n")]),
     "SR3 binary copied from an image, not a stage": ("fail", [_docker(D_BIN, D_BIN.replace("=builder", "=rust:1.98"))]),
     "SR3 builder takes a --from": ("fail", [_docker(D_WORKDIR, D_WORKDIR + "COPY --from=busybox /bin/sh /bin/sh\n")]),
     "SR3/D1 dead stage holds the canonical RUN, shipped builder altered": ("fail", [_docker(D_BUILDER, _dead_stage_then_alter)]),
@@ -2178,14 +2388,14 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "D11 blank line inside a continuation swallows the binary COPY": ("fail", [_docker(D_BIN, "VOLUME /data \\\n\n" + D_BIN)]),
     "D12 comment line inside the build RUN continuation": ("fail", [_docker(
         '    strip target/release/ai-memory; \\', '    # note\n    strip target/release/ai-memory; \\')]),
-    "D12b comment line inside another instruction's continuation": ("fail", [_docker(D_BIN, "LABEL a=1 \\\n# c\n b=2\n" + D_BIN)]),
+    "D12b comment line inside another instruction's continuation": ("fail", [_final("LABEL a=1 \\\n# c\n b=2\n")]),
     "D13 final stage FROM a variable": ("fail", [_docker(D_FINAL, "FROM ${BASE}\n")]),
     "D13b builder stage FROM a variable": ("fail", [_docker(D_BUILDER, "FROM ${BASE} AS builder\n")]),
-    "D15 lowercase instruction in the final stage": ("pass", [_docker(D_BIN, D_BIN + "label org.example.x=1\n")]),
+    "D15 lowercase instruction in the final stage": ("pass", [_final("label org.example.x=1\n")]),
     "D15b mixed-case binary COPY is not the binary COPY": ("fail", [_docker(D_BIN, D_BIN.replace("COPY", "Copy"))]),
     "D16 RUN --mount from= in the builder": ("fail", [_docker(D_LOCK, D_LOCK + "RUN --mount=type=bind,from=busybox,target=/m true\n")]),
-    "D16b RUN --mount in the final stage": ("fail", [_docker(D_BIN, D_BIN + "RUN --mount=type=bind,from=busybox,target=/m true\n")]),
-    "D16c lowercase run --mount": ("fail", [_docker(D_BIN, D_BIN + "run --mount=type=cache,target=/m true\n")]),
+    "D16b RUN --mount in the final stage": ("fail", [_final("RUN --mount=type=bind,from=busybox,target=/m true\n")]),
+    "D16c lowercase run --mount": ("fail", [_final("run --mount=type=cache,target=/m true\n")]),
     # --- #4719 SR-6/P4/P5/P6: the pg proof is a real, executing, fatal run step
     "P4 the only proof invocation replaced by true": ("fail", [(SHAPE, SHAPE_PROOF_CMD, "true", False)]),
     "P6 continue-on-error on the proof step": ("fail", [(SHAPE, PROOF_NAME, PROOF_NAME + "        continue-on-error: true\n", False)]),
@@ -2200,7 +2410,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "P13 proof invoked with a different binary": ("fail", [(SHAPE, SHAPE_PROOF_CMD, SHAPE_PROOF_CMD.replace("target/release/ai-memory", "/bin/true"), False)]),
     "P14 proof step name carries an expression": ("fail", [(SHAPE, PROOF_NAME, PROOF_NAME.replace("tier", "tier ${{ github.actor }}"), False)]),
     "P15 proof URL points at another host": ("fail", [(SHAPE, "127.0.0.1:55432/proof", "198.51.100.7:55432/proof", False)]),
-    "D16d uppercase RUN --MOUNT": ("fail", [_docker(D_BIN, D_BIN + "RUN --MOUNT=type=cache,target=/m true\n")]),
+    "D16d uppercase RUN --MOUNT": ("fail", [_final("RUN --MOUNT=type=cache,target=/m true\n")]),
     "valid: proof URL port changed": ("pass", [(SHAPE, "127.0.0.1:55432/proof", "127.0.0.1:55433/proof", False)]),
     # --- #4719 round 5 SR-8: the docker job is pinned whole; no other job may reach the registry
     "SR8/I01 absolute-path docker push in a docker-job step": ("fail", _docker_extra_step("        run: /usr/bin/docker push x\n")),
@@ -2233,8 +2443,8 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR8 secrets dotted with spaces": ("fail", _step_before_pkg("        env:\n          T: ${{ secrets . GITHUB_TOKEN }}\n        run: echo\n")),
     "SR8 all secrets as JSON": ("fail", _step_before_pkg("        env:\n          T: ${{ toJSON(secrets) }}\n        run: echo\n")),
     "SR8 secrets: inherit": ("fail", [_rel(COPR_HDR, COPR_HDR + "    secrets: inherit\n")]),
-    "valid: pinned secret in a release step": ("pass", _step_before_pkg(
-        "        env:\n          T: ${{ secrets.GITHUB_TOKEN }}\n        run: echo\n")),
+    "valid: pinned secret in a sbom-job step": ("pass", [_rel(
+        SBOM_HDR, "      - name: extra\n        env:\n          T: ${{ secrets.GITHUB_TOKEN }}\n        run: echo\n" + SBOM_HDR)]),
     # --- SR-9: docker job keys and values
     "SR9/D01 docker job env": ("fail", [_rel(DOCKER_HDR, DOCKER_HDR + "    env:\n      DOCKER_HOST: tcp://x:2375\n")]),
     "SR9/D03 docker job container": ("fail", [_rel(DOCKER_HDR, DOCKER_HDR + "    container: alpine\n")]),
@@ -2306,6 +2516,45 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         CHECKSUM_DONE, '          cp /opt/known-good/ai-memory.tar.gz "ai-memory-${{ matrix.target }}.tar.gz"\n' + CHECKSUM_DONE)]),
     "4752 Dockerfile final stage copies over the shipped binary": ("fail", [_docker(
         D_BIN, D_BIN + "COPY decoy/ai-memory /usr/local/bin/ai-memory\n")]),
+    "4752 Dockerfile a RUN after the runtime assert": ("fail", [_docker(D_ENV, "RUN true\n" + D_ENV)]),
+    "4752 Dockerfile a COPY after the runtime assert": ("fail", [_docker(D_ENV, "COPY decoy/ai-memory /usr/local/bin/ai-memory\n" + D_ENV)]),
+    "4752 Dockerfile an ADD after the runtime assert": ("fail", [_docker(D_ENV, "ADD decoy.tar /usr/local/bin/\n" + D_ENV)]),
+    "4752 Dockerfile runtime assert missing": ("fail", [_docker(D_CHECK, "")]),
+    "4752 Dockerfile runtime assert not strict": ("fail", [_docker(D_CHECK, D_CHECK.replace("--strict ", ""))]),
+    "4752 Dockerfile runtime assert on another path": ("fail", [_docker(D_CHECK, D_CHECK.replace("/usr/local/bin/ai-memory", "/bin/ls"))]),
+    "4752 Dockerfile release-check scripts copied from the build context": ("fail", [_docker(
+        "COPY --from=builder /build/scripts/release-features.sh /build/scripts/assert-compiled-features.sh",
+        "COPY scripts/release-features.sh scripts/assert-compiled-features.sh")]),
+    "4752 Dockerfile release-check scripts copied from an image": ("fail", [_docker(
+        "COPY --from=builder /build/scripts/release-features.sh", "COPY --from=busybox /build/scripts/release-features.sh")]),
+    "4752 Dockerfile runtime assert reads the declaration inline": ("fail", [_docker(
+        D_CHECK, 'RUN bash ' + DOCKER_CHECK_DIR + '/assert-compiled-features.sh /usr/local/bin/ai-memory --strict '
+        '$(bash ' + DOCKER_CHECK_DIR + '/release-features.sh --require-flags)\n')]),
+    "valid: a LABEL after the runtime assert": ("pass", [_docker(D_ENV, "LABEL org.example.x=1\n" + D_ENV)]),
+    "4752 assert step has no id": ("fail", [_rel("        id: assert\n", "")]),
+    "4752 assert step id changed": ("fail", [_rel("        id: assert\n", "        id: check\n")]),
+    "4752 assert output not recorded": ("fail", [_rel(IND + ASSERT_RECORD[1] + "\n", "")]),
+    "4752 assert records the hash of another file": ("fail", [_rel(
+        IND + ASSERT_RECORD[0], IND + ASSERT_RECORD[0].replace('"$bin"', "/opt/known-good/ai-memory"))]),
+    "4752 package step env dropped": ("fail", [_rel(PKG_ENV, "")]),
+    "4752 package step env points at another step": ("fail", [_rel(PKG_ENV, PKG_ENV.replace("steps.assert.", "steps.build."))]),
+    "4752 package hash check removed": ("fail", [_rel(IND + PACKAGE_CHECK + "\n", "")]),
+    "4752 package hash check made non-fatal": ("fail", [_rel(IND + PACKAGE_CHECK, IND + PACKAGE_CHECK.replace("exit 1", "true"))]),
+    "4752 package copies another binary": ("fail", [_rel(
+        IND + WF_PACKAGE[2], IND + 'cp /opt/known-good/ai-memory "' + PACKAGE_DIST + '"')]),
+    "4752 package tars another file": ("fail", [_rel(IND + WF_PACKAGE[7], IND + WF_PACKAGE[7].replace('"${{ matrix.artifact }}"', "*"))]),
+    "4752 upload path widened": ("fail", [_rel("          path: dist/ai-memory*\n", "          path: dist/*\n")]),
+    "4752 checksum step gains env": ("fail", [_rel(CHECKSUM_HDR, CHECKSUM_HDR + "        env:\n          X: y\n")]),
+    "4752 checksum step shell changed": ("fail", [_rel(CHECKSUM_HDR, CHECKSUM_HDR.replace("shell: bash", "shell: sh"))]),
+    "4752 nfpm step if dropped": ("fail", [_rel("        if: matrix.nfpm_arch\n", "")]),
+    "4752 release-body step id changed": ("fail", [_rel("        id: release_body\n", "        id: body\n")]),
+    "4752 tag re-assert env dropped": ("fail", [_rel(
+        "          TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}\n          SHA: ${{ needs.preflight.outputs.sha }}\n        run: |\n          bash scripts/release/assert-tag-unmoved.sh",
+        "          SHA: ${{ needs.preflight.outputs.sha }}\n        run: |\n          bash scripts/release/assert-tag-unmoved.sh")]),
+    "4752 GitHub release files widened": ("fail", [_rel("          files: dist/ai-memory*\n", "          files: dist/*\n")]),
+    "4752 a step appended after Create GitHub Release": ("fail", [_rel(
+        GH_TOKEN_ENV, GH_TOKEN_ENV + "      - name: extra\n        run: echo\n")]),
+    "4752 toolchain step targets changed": ("fail", [_rel("          targets: ${{ matrix.target }}\n", "          targets: x86_64-unknown-linux-gnu\n")]),
     "valid: the CI image name in another workflow": ("pass", [_decoy_wf(
         run="docker pull ghcr.io/${{ github.repository_owner }}/ai-memory-ci:latest")]),
     "valid: packages: read in another workflow": ("pass", [_decoy_wf(job="    permissions:\n      packages: read\n")]),
@@ -2324,9 +2573,9 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "C1 canonical build RUN re-indented": ("fail", [_d("    strip target/release/ai-memory; \\", "  strip target/release/ai-memory; \\")]),
     "C1 canonical build RUN joined onto one line": ("fail", [_d("\n".join(DOCKER_RUN_LINES), DOCKER_RUN)]),
     "builder ends with another single-line RUN": ("fail", [_d("\n".join(DOCKER_RUN_LINES), "RUN true")]),
-    "C1 continuation in another instruction": ("fail", [_d(D_BIN, D_BIN + "LABEL a=1 \\\n b=2\n")]),
-    "SR11/B05 quoted cargo in the final stage": ("fail", [_d(D_BIN, D_BIN + "RUN c''argo --version\n")]),
-    "X11 --mount after another flag": ("fail", [_d(D_BIN, D_BIN + "RUN --network=none --mount=type=cache,target=/m true\n")]),
+    "C1 continuation in another instruction": ("fail", [_final("LABEL a=1 \\\n b=2\n")]),
+    "SR11/B05 quoted cargo in the final stage": ("fail", [_final("RUN c''argo --version\n")]),
+    "X11 --mount after another flag": ("fail", [_final("RUN --network=none --mount=type=cache,target=/m true\n")]),
     "X00 FROM image with an embedded $VAR": ("fail", [_d(D_FINAL, "FROM debian:bookworm-slim$SUFFIX\n")]),
 }
 
@@ -2351,6 +2600,10 @@ MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
                                                 "update DOCKER_STEPS in scripts/check_release_features.py"),
     "message: build unit drift names WF_BUILD": ([_rel(REL_BUILD_CMD, REL_BUILD_CMD + " --verbose")], 2,
                                                  "update WF_BUILD in scripts/check_release_features.py"),
+    "message: GH_RELEASE_USES SHA bump": ([_rel(GH_RELEASE_USES, GH_RELEASE_USES[:-1] + "0")], 1,
+                                          "update GH_RELEASE_USES in scripts/check_release_features.py"),
+    "message: upload path drift names RELEASE_STEPS": ([_rel("          path: dist/ai-memory*\n", "          path: dist/*\n")], 1,
+                                                       "update RELEASE_STEPS in scripts/check_release_features.py"),
 }
 
 
@@ -2492,6 +2745,32 @@ def self_test(root: Path) -> int:
                 if rc == 0:
                     print(f"self-test FAIL: {label} PASSED with a broken declaration ({mutant}): fail-open", file=sys.stderr)
                     failures += 1
+
+        # --- #4752 runtime: the package unit packages the asserted bytes and
+        # refuses any other hash (empty, wrong, or the right digest in another
+        # case: `shasum` prints lower-case hex and the comparison is exact).
+        pkg_body = "\n".join(WF_PACKAGE).replace("${{ matrix.target }}", "x").replace("${{ matrix.artifact }}", "ai-memory")
+        payload = b"the asserted bytes\n"
+        good = hashlib.sha256(payload).hexdigest()
+
+        def package(asserted: str) -> Tuple[int, bool]:
+            pkg = tmp / "pkg"
+            shutil.rmtree(pkg, ignore_errors=True)
+            (pkg / "target" / "x" / "release").mkdir(parents=True)
+            (pkg / "target" / "x" / "release" / "ai-memory").write_bytes(payload)
+            env = dict(os.environ, ASSERTED_SHA256=asserted)
+            rc = subprocess.run(["bash", "-c", pkg_body], cwd=pkg, env=env, capture_output=True).returncode
+            return rc, (pkg / "dist" / "ai-memory-x.tar.gz").is_file()
+
+        if package(good) != (0, True):
+            print("self-test FAIL: the package unit does not package the asserted binary", file=sys.stderr)
+            failures += 1
+        for wrong in ("", "0" * 64, good.upper(), hashlib.sha256(b"other").hexdigest()):
+            rc, packaged = package(wrong)
+            if rc == 0 or packaged:
+                print(f"self-test FAIL: the package unit packaged a file whose hash is not the asserted one ({wrong[:12]!r}): "
+                      "fail-open", file=sys.stderr)
+                failures += 1
 
         # --- the guard itself: positive controls and every bypass form.
         for name, (want, edits) in CASES.items():
