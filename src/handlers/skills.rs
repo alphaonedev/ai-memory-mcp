@@ -407,14 +407,14 @@ pub async fn skill_promote_route(
         Err(e) => {
             // #3707 / #6115 - the chain may carry a store or driver `Display`
             // (SQL fragments, paths); the caller gets the class text below.
-            // #6131 F5 - `mcp_foreign_err` below owns the ONE operator log
-            // line for this failure (detail at error for a foreign root, warn
-            // for a typed refusal), so this arm does not log it again.
+            // #6131 F5 / #6147 - `promote_error_message` below owns the ONE
+            // operator log line for this failure (the whole chain at error for
+            // a foreign root, warn for a typed refusal).
             let status = promote_error_status(&e);
             // #6125 - the same classifier the MCP path of this operation
             // uses: our own typed refusal / not-found text reaches the
             // caller, a foreign (db / fs / codec) root becomes its class
-            // constant. `mcp_foreign_err` also owns the operator log line.
+            // constant.
             (status, Json(json!({"error": promote_error_message(e)}))).into_response()
         }
     }
@@ -422,11 +422,43 @@ pub async fn skill_promote_route(
 
 /// #3707 / #6115 / #6125 - caller-facing message for a failed skill-promote,
 /// byte-identical to the text the MCP tool returns for the same chain
-/// (`crate::mcp::error_text::mcp_foreign_err`): first-party refusals keep
-/// their typed text, store / driver / io text is replaced by its class
-/// constant and never crosses to the wire.
+/// (`crate::mcp::error_text::mcp_error_text` over the same typed class):
+/// first-party refusals keep their typed text, store / driver / io text is
+/// replaced by its class constant and never crosses to the wire. #6147 - the
+/// ONE operator log line is written here by [`log_foreign`] with the whole
+/// chain, so the conversion below renders without logging a second time.
 fn promote_error_message(e: anyhow::Error) -> String {
-    crate::mcp::error_text::mcp_foreign_err("skill_promote_route", e)
+    crate::mcp::error_text::mcp_error_text(&log_foreign(e))
+}
+
+/// #6147 - convert a failed promote's chain to its typed class AND write the
+/// single sanitized OPERATOR log line for it (the conversion owns the log
+/// line, as in `crate::mcp::error_text::log_foreign`). The line carries the
+/// alternate (`{e:#}`) render of the whole `anyhow` chain, so a driver root
+/// under a context wrapper reaches the operator; the caller body is rendered
+/// from the returned class only.
+fn log_foreign(e: anyhow::Error) -> crate::errors::MemoryError {
+    const CONTEXT: &str = "skill_promote_route";
+    let chain = format!("{e:#}");
+    let mapped = crate::errors::MemoryError::from(e);
+    if mapped.is_foreign_class() {
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            context = CONTEXT,
+            code = mapped.code(),
+            detail = %chain,
+            "#6147: foreign error kept on the operator log; the caller receives the class"
+        );
+    } else {
+        tracing::warn!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            context = CONTEXT,
+            code = mapped.code(),
+            detail = %chain,
+            "#6147: typed refusal passed through to the caller"
+        );
+    }
+    mapped
 }
 
 /// #4622 - HTTP status for a failed skill-promote: 404 only when the chain
