@@ -46,8 +46,15 @@ on:
   # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
     branches: [main, develop, "release/**", "feat/v0.7.0-grand-slam", "rehearsal/**", "chain/**"]
+  # #6117: chain/** (the Promotion carriers) is in push.branches so every signed
+  # merge the conductor lands on a carrier gets this required context's verdict,
+  # not only the PRs opened against the carrier. The carrier is also the head
+  # of its promotion PR (#6160), so the concurrency group below is keyed per
+  # event (no #2508 cancelled twin) and the classify arm below runs the full
+  # sweep on a carrier push (never narrower than the promotion PR's run on the
+  # same sha). See ci.yml for the full rationale.
   push:
-    branches: [main, develop, "feat/v0.7.0-grand-slam", "release/**"]
+    branches: [main, develop, "feat/v0.7.0-grand-slam", "release/**", "chain/**"]
   # Merge Queue (#3089) — `Per-Module Coverage Thresholds` (+ the sibling
   # doc/claims gates) are REQUIRED contexts, so this workflow MUST report on
   # the `merge_group` ref or the queue wedges. The `Coverage classify` decider
@@ -71,11 +78,13 @@ permissions:
   contents: read
 
 # v0.7.x (#1148) — cancel stale runs on a PR when a new push lands.
-# Fork-PR-safe concurrency key: coalesces push + same-branch internal
-# PR events; isolates fork PRs by PR number. See ci.yml for full
-# rationale + the prior unsafe-key incident that motivated this shape.
+# Fork-PR-safe concurrency key; isolates fork PRs by PR number. See ci.yml
+# for full rationale + the prior unsafe-key incident that motivated this
+# shape. #6117: keyed per event (`github.event_name`) because push.branches
+# now lists chain/** and a chain carrier is the head of its promotion PR —
+# a shared key would cancel one of the two runs per sha (#2508, rule (d)).
 concurrency:
-  group: cov-${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
+  group: cov-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
 
 env:
@@ -129,6 +138,15 @@ jobs:
           if [ "${{ github.event_name }}" = "merge_group" ]; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             echo "::notice::merge_group event — running the full coverage sweep (not docs-only)"
+            exit 0
+          fi
+          # Carrier push (#6117): a push to a chain/** carrier reports under
+          # the same context name, on the same sha, as the carrier's promotion
+          # PR run, which sweeps the whole carrier; this run must never be the
+          # narrower (docs-only, `skipped`) twin of that verdict. Full sweep.
+          if [ "${{ github.event_name }}" = "push" ] && [ "${GITHUB_REF#refs/heads/chain/}" != "$GITHUB_REF" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::push to a chain carrier (#6117) — running the full coverage sweep (not docs-only)"
             exit 0
           fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then

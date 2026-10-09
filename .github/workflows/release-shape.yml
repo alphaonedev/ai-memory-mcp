@@ -42,8 +42,13 @@ on:
       - "Cargo.lock"
       - "src/**"
       - "migrations/**"
+  # #6117: chain/** (the Promotion carriers) gets the push lane so every signed
+  # merge the conductor lands on a carrier is release-shape-proven, not only
+  # the PRs opened against it. The key below is already event-distinct, so the
+  # carrier's promotion PR run and this push run never cancel each other
+  # (#2508). Pinned by SHAPE_ON in scripts/check_release_features.py.
   push:
-    branches: ["release/**"]
+    branches: ["release/**", "chain/**"]
   workflow_dispatch:
 
 permissions:

@@ -325,7 +325,8 @@ SHAPE_PATHS = (
 )
 SHAPE_ON: Dict[str, Spec] = {
     "pull_request": {"branches": Flow('"release/**", "rehearsal/**", "chain/**", "main"'), "paths": [Double(p) for p in SHAPE_PATHS]},
-    "push": {"branches": Flow('"release/**"')},
+    # #6117: the Promotion carriers (chain/**) get the push lane too.
+    "push": {"branches": Flow('"release/**", "chain/**"')},
     "workflow_dispatch": None,
 }
 SHAPE_JOB: Dict[str, Spec] = {
@@ -2054,7 +2055,10 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR10 an extra job": ("fail", [_shape(SHAPE_NAME, lambda t: t.rstrip("\n") + "\n\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n")]),
     "SR10 permissions changed": ("fail", [_shape("permissions:\n  contents: read\n", "permissions:\n  contents: write\n")]),
     "SR10/P25 last path filter dropped": ("fail", [_shape('      - "migrations/**"\n', "")]),
-    "SR10 push branches widened": ("fail", [_shape('branches: ["release/**"]\n', 'branches: ["release/**", "x"]\n')]),
+    "SR10 push branches widened": ("fail", [_shape('branches: ["release/**", "chain/**"]\n',
+                                                   'branches: ["release/**", "chain/**", "x"]\n')]),
+    "SR10/#6117 push branches lose chain/**": ("fail", [_shape('branches: ["release/**", "chain/**"]\n',
+                                                               'branches: ["release/**"]\n')]),
     "SR10 workflow_dispatch given a value": ("fail", [_shape("  workflow_dispatch:\n", "  workflow_dispatch: x\n")]),
     "SR10 run continuation in the proof": ("fail", [_shape(SHAPE_PROOF_CMD, SHAPE_PROOF_CMD.replace(
         " target/release", " \\\n            target/release"))]),
