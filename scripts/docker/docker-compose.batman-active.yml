@@ -136,7 +136,7 @@ services:
     # mapping only reaches a listener on the container's 0.0.0.0; the published
     # port stays host-loopback (127.0.0.1:9077).
     # #3838 (Codex review): the entrypoint is EXPLICIT on every service. The root
-    # Dockerfile sets ENTRYPOINT ["ai-memory"] and Dockerfile.batman-active sets
+    # Dockerfile sets ENTRYPOINT ["/usr/local/bin/ai-memory"] and Dockerfile.batman-active sets
     # none, so a command that also starts with `ai-memory` ran
     # `ai-memory ai-memory ...` (exit 2) under the image the usage line names.
     # With the entrypoint pinned here the stack boots the same under either.

@@ -789,6 +789,42 @@ DOCKER_DECL_COPY = "COPY scripts/release-features.sh scripts/release-features.sh
 # instruction can rewrite the asserter between its COPY and the build RUN.
 DOCKER_ASSERTER_COPY = "COPY scripts/assert-compiled-features.sh scripts/assert-compiled-features.sh"
 DOCKER_LOCK_COPY = "COPY Cargo.toml Cargo.lock ./"
+# #6281: both base images are pinned by their OCI index digest (a tag can be re-pointed).
+# Refresh: resolve the tag's index digest, then update the two FROM lines and these two
+# constants in ONE commit (the guard compares the whole `image:tag@sha256:...` literal).
+DOCKER_BUILDER_IMAGE = "rust:1.98-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730"
+DOCKER_RUNTIME_IMAGE = "debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587"
+# cloud F5: the image runs the asserted file by its absolute path (a PATH lookup could pick
+# another file named ai-memory) with the pinned default arguments.
+DOCKER_ENTRYPOINT = 'ENTRYPOINT ["/usr/local/bin/ai-memory"]'
+DOCKER_CMD = 'CMD ["serve", "--host", "0.0.0.0"]'
+# #6280 / cloud F6: everything the builder stage may do before the asserter COPY, the
+# declaration COPY and the build RUN (pinned separately). No ARG, no ENV, no other COPY or ADD.
+DOCKER_BUILDER_ALLOWED = frozenset((
+    "RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential "
+    "&& rm -rf /var/lib/apt/lists/*",
+    "WORKDIR /build",
+    DOCKER_LOCK_COPY,
+    "COPY src/ src/",
+    "COPY benches/ benches/",
+    "COPY tests/ tests/",
+    "COPY examples/ examples/",
+    "COPY migrations/ migrations/",
+    "COPY vendor/ vendor/",
+))
+# cloud F5: what the final stage may hold besides LABELs and the pinned binary COPY,
+# release-check COPY and runtime assert RUN.
+DOCKER_FINAL_ALLOWED = frozenset((
+    "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* "
+    "&& groupadd --system aimem && useradd --system --gid aimem --create-home aimem && mkdir -p /data "
+    "&& chown aimem:aimem /data",
+    "ENV AI_MEMORY_DB=/data/ai-memory.db",
+    "VOLUME /data",
+    "EXPOSE 9077",
+    "USER aimem",
+    DOCKER_ENTRYPOINT,
+    DOCKER_CMD,
+))
 DOCKER_INSTRUCTIONS = frozenset((
     "FROM", "RUN", "CMD", "LABEL", "EXPOSE", "ENV", "ADD", "COPY", "ENTRYPOINT",
     "VOLUME", "USER", "WORKDIR", "ARG", "STOPSIGNAL", "HEALTHCHECK",
@@ -1782,6 +1818,16 @@ def docker_nearest(builder: List[str], run: str = DOCKER_RUN) -> str:
     return "nearest builder RUN: " + first_diff(tuple(got.split("; ")), want)
 
 
+def _docker_owned(ins: str, src: Optional[str]) -> bool:
+    """An instruction an older Dockerfile rule already refuses or pins (the allowlists below
+    leave it to that rule so each refusal stays the only one a case reaches)."""
+    word = ins.split(" ", 1)[0].upper()
+    m = FROM_FLAG_RE.search(ins)
+    return (word not in DOCKER_INSTRUCTIONS or "--mount" in ins.lower() or "<<" in ins or "BASH_ENV" in ins
+            or (m is not None and (src is None or m.group("src").lower() != src))
+            or BUILD_TOOL_RE.search(unquoted(ins)) is not None)
+
+
 def check_dockerfile(text: str, rep: Report, digests: Tuple[str, ...] = DOCKER_DIGESTS) -> None:
     check_no_bash_env("Dockerfile", text, rep)
     run, run_lines = docker_run(digests), docker_run_lines(digests)
@@ -1795,6 +1841,7 @@ def check_dockerfile(text: str, rep: Report, digests: Tuple[str, ...] = DOCKER_D
                     f"directive changes what a line continuation is): {ln.strip()[:60]}")
     stages: List[Tuple[Optional[str], List[str]]] = []
     names: Dict[str, int] = {}
+    images: List[str] = []
     spans = bk_instructions(raw)
     canon_lines: set = set()
     for first, last, ins in spans:
@@ -1837,10 +1884,11 @@ def check_dockerfile(text: str, rep: Report, digests: Tuple[str, ...] = DOCKER_D
                     rep.bad(f"Dockerfile: duplicate stage name `{name}`")
                 names.setdefault(name.lower(), len(stages))
             stages.append((name, []))
+            images.append(image)
             continue
         if not stages:
-            if word != "ARG":
-                rep.bad(f"Dockerfile: `{word}` before the first FROM: {ins[:60]}")
+            rep.bad(f"Dockerfile: `{word}` before the first FROM (#6280: an ARG there parameterises the base image "
+                    f"and the build; nothing precedes the first FROM): {ins[:60]}")
             continue
         stages[-1][1].append(ins)
     final = stages[-1][1] if stages else []
@@ -1879,10 +1927,33 @@ def check_dockerfile(text: str, rep: Report, digests: Tuple[str, ...] = DOCKER_D
             if BUILD_TOOL_RE.search(unquoted(ins)) and not canon:
                 rep.bad(f"Dockerfile: a build tool outside the canonical build RUN (the last instruction of the stage the "
                         f"image copies the binary from): {ins[:80]}")
+    # #6281: both base images by digest.
+    for k, want in ((bidx, DOCKER_BUILDER_IMAGE), (len(stages) - 1, DOCKER_RUNTIME_IMAGE)):
+        image = images[k]
+        if "$" not in image and image.lower() not in names and image != want:
+            rep.bad(f"Dockerfile: stage {k + 1} starts FROM `{image[:90]}`; it must be exactly `{want}` (#6281: a base "
+                    "image by tag alone can be re-pointed)" + pin_hint("DOCKER_BUILDER_IMAGE / DOCKER_RUNTIME_IMAGE"))
+    # cloud F5: the final stage holds LABELs, the pinned COPY/COPY/RUN and DOCKER_FINAL_ALLOWED only.
+    for pos, ins in enumerate(final):
+        if at <= pos <= at + 2 or ins.split(" ", 1)[0].upper() == "LABEL" or _docker_owned(ins, src):
+            continue
+        if pos > at + 2 and ins.split(" ", 1)[0].upper() in ("COPY", "ADD", "RUN"):
+            continue
+        if ins not in DOCKER_FINAL_ALLOWED:
+            rep.bad(f"Dockerfile: final-stage `{ins[:70]}` is not in the final-stage allowlist (cloud F5: no other COPY, "
+                    "ADD, RUN or ENV may shape the shipped image)" + pin_hint("DOCKER_FINAL_ALLOWED"))
+    if final.count(DOCKER_ENTRYPOINT) != 1 or final.count(DOCKER_CMD) != 1:
+        rep.bad(f"Dockerfile: the final stage must hold exactly one `{DOCKER_ENTRYPOINT}` and one `{DOCKER_CMD}` "
+                "(cloud F5)" + pin_hint("DOCKER_ENTRYPOINT / DOCKER_CMD"))
     builder = stages[bidx][1]
     for ins in builder:
         if FROM_FLAG_RE.search(ins):
             rep.bad(f"Dockerfile: the builder stage takes `--from` another stage or image: {ins[:60]}")
+    # #6280 / cloud F6: before the pinned last three, the builder holds DOCKER_BUILDER_ALLOWED only.
+    for ins in builder[:-3]:
+        if not _docker_owned(ins, None) and ins not in DOCKER_BUILDER_ALLOWED:
+            rep.bad(f"Dockerfile: builder `{ins[:70]}` is not in the builder allowlist (#6280: no ARG, no ENV, no other "
+                    "COPY or ADD may feed the build)" + pin_hint("DOCKER_BUILDER_ALLOWED"))
     if DOCKER_LOCK_COPY not in builder[:-2]:
         rep.bad(f"Dockerfile: the builder stage does not `{DOCKER_LOCK_COPY}` before the build" + pin_hint("DOCKER_LOCK_COPY"))
     if builder[-2:-1] != [DOCKER_DECL_COPY]:
@@ -2309,8 +2380,8 @@ MATRIX_FF = "      fail-fast: false\n"
 ENTRY1 = "          - target: x86_64-unknown-linux-gnu\n            os: ubuntu-latest\n            artifact: ai-memory\n"
 SBOM_JOB = "  sbom:\n    name: SBOM (CycloneDX)\n"
 PUSH_WITH = "        with:\n          context: .\n"
-D_BUILDER = "FROM rust:1.98-slim-bookworm AS builder\n"
-D_FINAL = "FROM debian:bookworm-slim\n"
+D_BUILDER = "FROM " + DOCKER_BUILDER_IMAGE + " AS builder\n"
+D_FINAL = "FROM " + DOCKER_RUNTIME_IMAGE + "\n"
 D_WORKDIR = "WORKDIR /build\n"
 D_LOCK = DOCKER_LOCK_COPY + "\n"
 D_BIN = "COPY --from=builder /build/target/release/ai-memory /usr/local/bin/ai-memory\n"
