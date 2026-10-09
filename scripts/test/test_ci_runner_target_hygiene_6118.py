@@ -53,7 +53,14 @@ FAILURE, never a skip):
            profile.<p>.debug=``) to anything but ``0``: a step-level ``env:``
            row, or an assignment in a ``run:`` body (``export``, or an
            ``echo ... >> "$GITHUB_ENV"`` that overrides the job env for every
-           later step) is flagged.
+           later step) is flagged.  Also flagged: an inline ``profile.<p>={debug=..}``
+           table, a ``rustflags`` value (any case, env row, run body, a config
+           file a step writes, a ``RUSTFLAGS<<EOF`` heredoc, YAML ``\\x1f``
+           escapes decoded), ``cargo --config <file>`` (a file can set any
+           level) and ``cargo --profile <p>`` for a ``p`` outside dev / test /
+           release / bench.  ``0``, ``false`` and ``"none"`` are the level-0
+           spellings of a flag; ``git log -g`` or prose that mentions ``-g`` is
+           not a rustc flag.
   R-PRUNE  the job's LAST step is named PRUNE_STEP_NAME, runs under
            ``if: always()`` (a red or cancelled test run leaves the same
            binaries behind), is skipped on GitHub-hosted runners when the job
@@ -103,6 +110,11 @@ ALLOW_OUTSIDE_FLAG = "--allow-outside-workspace"
 PRUNE_RUN_LINE = '        run: python3 scripts/ci/prune-runner-target.py --target-dir "${CARGO_TARGET_DIR:-target}"'
 DEBUG_LEVEL = "0"
 DEBUG_KEYS = ("CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG")
+# Every spelling of debuginfo level 0 that cargo / rustc accept in a flag or a
+# `--config` value.  The pinned CARGO_PROFILE_*_DEBUG env rows stay the literal
+# ``0`` (DEBUG_LEVEL): one value, one artifact tree.
+LEVEL_OFF = frozenset({DEBUG_LEVEL, "false", "none"})
+CARGO_PROFILES_OK = frozenset({"dev", "test", "release", "bench"})
 HOSTED_GUARD = "runner.environment != 'github-hosted'"
 DOCS_ONLY_GUARD = "docs_only"
 # S-F4 (round 2): the prune step runs the CHECKED-OUT script, so it must not run
@@ -126,12 +138,27 @@ DEBUGINFO_FLAG_RE = re.compile(r"debuginfo\s*=\s*[\"']?([A-Za-z0-9_-]*)")
 # command-line config takes precedence over the CARGO_PROFILE_* env.  Not
 # `debug-assertions`.  The value may be TOML-quoted inside shell quotes.
 CONFIG_DEBUG_RE = re.compile(r"(profile\.[A-Za-z0-9_.*\"'-]*?\.debug)\s*=\s*\\?[\"']?([A-Za-z0-9_-]*)")
+# The same key in an inline table: `--config 'profile.dev={debug=1}'`.
+INLINE_DEBUG_RE = re.compile(
+    r"(profile\.[A-Za-z0-9_.*\"'-]+)\s*=\s*\{[^}]*?\bdebug\s*=\s*\\?[\"']?([A-Za-z0-9_-]*)")
+# `cargo --config <value>`: a value without `=` is a config FILE, which can set
+# anything (and beats the CARGO_PROFILE_* env).
+CARGO_CONFIG_ARG_RE = re.compile(r"\bcargo\b[^|;&\n]*?--config(?:=|\s+)(?:\"([^\"]*)\"|'([^']*)'|(\S+))")
+CARGO_PROFILE_ARG_RE = re.compile(r"\bcargo\b[^|;&\n]*?--profile(?:=|\s+)([A-Za-z0-9_.-]+)")
 # rustc's `-g` is `-C debuginfo=2`.  Matched as a standalone token in a rustc
 # flags env value, or in a run line that sets RUSTFLAGS / calls rustc (a bare
 # `-g` elsewhere, e.g. `npm install -g`, is not a rustc flag).
 RUSTC_FLAGS_KEY_RE = re.compile(r"(CARGO_ENCODED_)?RUST(DOC)?FLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_[A-Z0-9_]+_RUSTFLAGS")
-RUSTC_CONTEXT_RE = re.compile(r"RUST(DOC)?FLAGS|\brustc\b")
-DASH_G_RE = re.compile(r"(?:^|[\s\"'=\x1f])-g(?=$|[\s\"'\x1f])")
+# In a run body only the VALUE of a flags assignment (`RUSTFLAGS=...`,
+# `rustflags = [...]` in a config.toml written by a step; any case) or the
+# simple command that calls `rustc` is searched for `-g`, so `git log -g` on the
+# same line, or prose that mentions -g, is not a rustc flag.
+RUSTFLAGS_ASSIGN_RE = re.compile(
+    r"(?i)RUST(?:DOC)?FLAGS\s*=\s*(\"[^\"]*\"|'[^']*'|\[[^\]]*\]|[^\s;|&]*)")
+RUSTFLAGS_HEREDOC_RE = re.compile(r"(?i)RUST(?:DOC)?FLAGS\s*<<-?\s*['\"]?(\w+)['\"]?")
+RUSTC_SEGMENT_RE = re.compile(r"\brustc\b([^|;&]*)")
+YAML_HEX_ESCAPE_RE = re.compile(r"\\x([0-9A-Fa-f]{2})|\\u([0-9A-Fa-f]{4})")
+DASH_G_RE = re.compile(r"(?:^|[\s\"'=\x1f\[,])-g(?=$|[\s\"'\x1f\],])")
 
 # Every (workflow, job) that can land on a self-hosted runner, pinned.  A new
 # self-hosted job must be added here AND given the rules above.
@@ -512,17 +539,48 @@ def self_hosted_jobs(workflows: Dict[str, str]) -> Dict[Tuple[str, str], Tuple[W
     return found
 
 
-def _level_spellings(text: str, rustc_context: bool) -> List[str]:
-    """Every debuginfo level other than ``0`` spelled in ``text`` as a rustc flag or cargo --config."""
+def _yaml_unescape(value: str) -> str:
+    """Decode the ``\\xNN`` / ``\\uNNNN`` escapes of a YAML double-quoted scalar (``\\x1f`` is cargo's flag separator)."""
+    return YAML_HEX_ESCAPE_RE.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), value)
+
+
+def _heredoc_ends(line: str, delimiter: str) -> bool:
+    return re.search(r"(?:^|[\s'\"])" + re.escape(delimiter) + r"(?:$|[\s'\"])", line) is not None
+
+
+def _level_spellings(text: str, flags_value: bool) -> List[str]:
+    """Every debuginfo level other than off spelled in ``text`` as a rustc flag or cargo --config.
+
+    ``flags_value``: ``text`` IS a rustc flags value (an env row of a RUSTFLAGS
+    key), so a standalone ``-g`` anywhere in it counts; otherwise ``text`` is a
+    run line and ``-g`` counts only in a flags assignment's value or after ``rustc``.
+    """
     found: List[str] = []
     for m in DEBUGINFO_FLAG_RE.finditer(text):
-        if m.group(1) != DEBUG_LEVEL:
+        if m.group(1) not in LEVEL_OFF:
             found.append("debuginfo=%r" % m.group(1))
     for m in CONFIG_DEBUG_RE.finditer(text):
-        if m.group(2) != DEBUG_LEVEL:
+        if m.group(2) not in LEVEL_OFF:
             found.append("%s=%r (cargo --config beats CARGO_PROFILE_* env)" % (m.group(1).strip("\"'"), m.group(2)))
-    if rustc_context and DASH_G_RE.search(text):
+    for m in INLINE_DEBUG_RE.finditer(text):
+        if m.group(2) not in LEVEL_OFF:
+            found.append("%s={debug=%r} (cargo --config beats CARGO_PROFILE_* env)" % (m.group(1).strip("\"'"), m.group(2)))
+    if flags_value:
+        scanned = [text]
+    else:
+        scanned = [m.group(1) for m in RUSTFLAGS_ASSIGN_RE.finditer(text)]
+        scanned.extend(m.group(1) for m in RUSTC_SEGMENT_RE.finditer(text))
+    if any(DASH_G_RE.search(piece) for piece in scanned):
         found.append("rustc -g (= -C debuginfo=2)")
+    if not flags_value:
+        for m in CARGO_CONFIG_ARG_RE.finditer(text):
+            value = next(g for g in m.groups() if g is not None)
+            if "=" not in value:
+                found.append("cargo --config %s (a config file can set any debuginfo level)" % value)
+        for m in CARGO_PROFILE_ARG_RE.finditer(text):
+            if m.group(1) not in CARGO_PROFILES_OK:
+                found.append("cargo --profile %s (a custom profile has its own debuginfo and a target/%s the prune "
+                             "never touches)" % (m.group(1), m.group(1)))
     return found
 
 
@@ -532,21 +590,32 @@ def _debug_overrides(where: str, effective: Dict[str, str], job: Job) -> List[st
     for key, value in sorted(effective.items()):
         if DEBUG_ENV_KEY_RE.fullmatch(key) and key not in DEBUG_KEYS and value != DEBUG_LEVEL:
             found.append("%s: R-DEBUG env %s is %r, want %r" % (where, key, value, DEBUG_LEVEL))
-        for spelled in _level_spellings(value, bool(RUSTC_FLAGS_KEY_RE.fullmatch(key))):
+        for spelled in _level_spellings(_yaml_unescape(value), bool(RUSTC_FLAGS_KEY_RE.fullmatch(key))):
             found.append("%s: R-DEBUG env %s carries %s, want %r" % (where, key, spelled, DEBUG_LEVEL))
     for step in job.steps:
         label = step.name or step.uses or "<unnamed step>"
         for key, value in sorted(step.env.items()):
             if DEBUG_ENV_KEY_RE.fullmatch(key) and value != DEBUG_LEVEL:
                 found.append("%s: R-DEBUG step %r env %s is %r, want %r" % (where, label, key, value, DEBUG_LEVEL))
-            for spelled in _level_spellings(value, bool(RUSTC_FLAGS_KEY_RE.fullmatch(key))):
+            for spelled in _level_spellings(_yaml_unescape(value), bool(RUSTC_FLAGS_KEY_RE.fullmatch(key))):
                 found.append("%s: R-DEBUG step %r env %s carries %s, want %r" % (where, label, key, spelled, DEBUG_LEVEL))
+        heredoc = ""  # delimiter of an open `RUSTFLAGS<<DELIM` ($GITHUB_ENV multi-line value)
         for line in step.run:
+            if heredoc:
+                if _heredoc_ends(line, heredoc):
+                    heredoc = ""
+                elif DASH_G_RE.search(line):
+                    found.append("%s: R-DEBUG step %r run sets rustc -g in a RUSTFLAGS heredoc, want %r"
+                                 % (where, label, DEBUG_LEVEL))
+            else:
+                opened = RUSTFLAGS_HEREDOC_RE.search(line)
+                if opened:
+                    heredoc = opened.group(1)
             for m in RUN_DEBUG_ASSIGN_RE.finditer(line):
                 if m.group(2) != DEBUG_LEVEL:
                     found.append("%s: R-DEBUG step %r run sets %s to %r (a $GITHUB_ENV write overrides every later "
                                  "step), want %r" % (where, label, m.group(1), m.group(2), DEBUG_LEVEL))
-            for spelled in _level_spellings(line, bool(RUSTC_CONTEXT_RE.search(line))):
+            for spelled in _level_spellings(line, False):
                 found.append("%s: R-DEBUG step %r run sets %s, want %r" % (where, label, spelled, DEBUG_LEVEL))
     return found
 
