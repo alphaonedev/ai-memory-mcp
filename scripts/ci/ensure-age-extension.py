@@ -70,16 +70,22 @@ not know; use ``sslmode``.  A refusal names a key only when it is a known libpq
 keyword (an unlisted key can be the tail of a password that held a raw ``&``),
 never a value, and neither form of the URL is printed.
 
-psql runs with ``PGCONNECT_TIMEOUT=15`` (a ``connect_timeout`` in the URL
-overrides it) and a 60 second overall limit.  SIGTERM and SIGINT stop the psql
-child, print ``ensure-age-extension: interrupted`` and exit 1, so no orphan
-keeps PGPASSWORD in its environment.
+psql runs with ``PGCONNECT_TIMEOUT=15`` and a 60 second overall limit.  A
+``connect_timeout`` in the URL overrides the default but must be an integer in
+1..60 (#6338): libpq reads 0 as "wait forever", which would leave a psql that
+outlives a SIGKILLed helper (SIGKILL cannot be caught) holding PGPASSWORD without
+bound.  SIGTERM, SIGINT and SIGHUP stop the psql child, print
+``ensure-age-extension: interrupted`` and exit 1.  While the child is being
+spawned or awaited the handler only records the signal and the probe polls that
+flag every 0.2 s (#6337); raising from the handler instead could land between the
+fork and the guard around ``communicate`` and orphan psql with PGPASSWORD.
 
 Exit codes: 0 healthy, 1 still unhealthy / probe or install failed,
 2 bad input (URL file, pg_config, source validation).
 """
 
 import argparse
+import contextlib
 import errno
 import hashlib
 import os
@@ -90,6 +96,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from urllib.parse import unquote, urlsplit
 
 EXIT_OK = 0
@@ -101,6 +108,9 @@ DEFAULT_AGE_DIR = Path.home() / "pg-age-stack" / "age-1.8.0"
 DEFAULT_PG_CONFIG = "/opt/homebrew/opt/postgresql@18/bin/pg_config"
 DEFAULT_PSQL = "/opt/homebrew/opt/postgresql@18/bin/psql"
 PROBE_TIMEOUT_SECONDS = 60
+PROBE_POLL_SECONDS = 0.2  # how often the probe looks at the interrupt flag (#6337)
+MAX_CONNECT_TIMEOUT_SECONDS = PROBE_TIMEOUT_SECONDS  # URL connect_timeout range 1..60 (#6338)
+INTERRUPT_SIGNALS = ("SIGTERM", "SIGINT", "SIGHUP")
 CONNECT_TIMEOUT_SECONDS = "15"  # PGCONNECT_TIMEOUT for psql; a connect_timeout in the URL overrides it
 PROBE_SQL = "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'"
 URL_SCHEMES = ("postgres", "postgresql")
@@ -156,6 +166,11 @@ class HelperError(Exception):
 def running_uid():
     """The uid every source dir and file must belong to."""
     return os.geteuid()
+
+
+def valid_connect_timeout(value):
+    """True for 1..MAX_CONNECT_TIMEOUT_SECONDS written as one or two ASCII digits."""
+    return re.fullmatch(r"[0-9]{1,2}", value) is not None and 1 <= int(value) <= MAX_CONNECT_TIMEOUT_SECONDS
 
 
 def psql_target(url):
@@ -230,6 +245,10 @@ def psql_target(url):
             password = unquote(raw_value, errors="surrogateescape")
             removed = True
         elif key in ALLOWED_QUERY_KEYS:
+            if key == "connect_timeout" and not valid_connect_timeout(unquote(raw_value, errors="surrogateescape")):
+                # libpq reads 0 as "wait forever": an orphaned psql would then never exit (#6338).
+                raise HelperError(f"tier URL file has a connect_timeout outside 1..{MAX_CONNECT_TIMEOUT_SECONDS} "
+                                  "seconds; libpq reads 0 as no limit", EXIT_BAD_INPUT)
             kept.append(seg)
         else:
             # An unlisted key can be the tail of a password that held a raw '&': name known keywords only.
@@ -247,6 +266,51 @@ def psql_target(url):
     query = "&".join(kept) if removed else parts.query
     # Concatenate: urlunsplit drops '//' when the netloc is empty (':pw@' with a host in the query).
     return f"{parts.scheme}://{netloc}{parts.path}" + (f"?{query}" if query else ""), password
+
+
+_interrupt = {"defer": False, "pending": False}
+
+
+def note_interrupt(signum, frame):
+    """Signal handler: raise, except while a psql child is live, then only record it (#6337).
+
+    Raising between the fork and the guard around ``communicate`` would escape the guard and
+    leave psql running with PGPASSWORD; the probe polls ``pending`` and stops the child itself.
+    """
+    if _interrupt["defer"]:
+        _interrupt["pending"] = True
+        return
+    raise KeyboardInterrupt
+
+
+@contextlib.contextmanager
+def deferred_interrupts():
+    """Hold signals as a flag while the psql child is spawned and awaited; re-raise on exit."""
+    _interrupt["pending"] = False
+    _interrupt["defer"] = True
+    try:
+        yield
+    finally:
+        _interrupt["defer"] = False
+        if _interrupt["pending"]:
+            _interrupt["pending"] = False
+            raise KeyboardInterrupt
+
+
+def wait_for_probe(proc):
+    """communicate() in short slices so a recorded signal is noticed within PROBE_POLL_SECONDS."""
+    deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
+    while True:
+        if _interrupt["pending"]:
+            raise KeyboardInterrupt
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(proc.args, PROBE_TIMEOUT_SECONDS)
+        try:
+            stdout, _ = proc.communicate(timeout=min(PROBE_POLL_SECONDS, remaining))
+            return stdout
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def stop_child(proc):
@@ -267,24 +331,25 @@ def probe_lists_age(psql, url):
     env["PGCONNECT_TIMEOUT"] = CONNECT_TIMEOUT_SECONDS  # a connect_timeout in the URL overrides it
     for name in SERVICE_ENV:
         env.pop(name, None)  # #6345: a service-file password would beat the moved PGPASSWORD
-    try:
-        proc = subprocess.Popen(
-            [psql, target, "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", PROBE_SQL],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=env,
-        )
-    except ValueError as exc:
-        # subprocess refuses a NUL in argv or env before spawning anything.
-        raise HelperError(f"age probe refused its psql arguments ({type(exc).__name__})", EXIT_BAD_INPUT)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise HelperError(f"age probe could not run psql ({type(exc).__name__})", EXIT_UNAVAILABLE)
-    try:
-        stdout, _ = proc.communicate(timeout=PROBE_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        stop_child(proc)
-        raise HelperError("age probe could not run psql (TimeoutExpired)", EXIT_UNAVAILABLE)
-    except BaseException:
-        stop_child(proc)  # SIGTERM/SIGINT: never leave psql (and its PGPASSWORD) behind
-        raise
+    with deferred_interrupts():
+        try:
+            proc = subprocess.Popen(
+                [psql, target, "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", PROBE_SQL],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=env,
+            )
+        except ValueError as exc:
+            # subprocess refuses a NUL in argv or env before spawning anything.
+            raise HelperError(f"age probe refused its psql arguments ({type(exc).__name__})", EXIT_BAD_INPUT)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise HelperError(f"age probe could not run psql ({type(exc).__name__})", EXIT_UNAVAILABLE)
+        try:
+            stdout = wait_for_probe(proc)
+        except subprocess.TimeoutExpired:
+            stop_child(proc)
+            raise HelperError("age probe could not run psql (TimeoutExpired)", EXIT_UNAVAILABLE)
+        except BaseException:
+            stop_child(proc)  # a recorded signal or error: never leave psql (and its PGPASSWORD) behind
+            raise
     if proc.returncode != 0:
         # psql stderr is deliberately not echoed (it can carry connection detail).
         raise HelperError(f"age probe failed: psql exited {proc.returncode}", EXIT_UNAVAILABLE)
@@ -466,15 +531,11 @@ def run(args):
     print(f"age extension restored from {args.age_dir} and available")
 
 
-def raise_interrupt(signum, frame):
-    raise KeyboardInterrupt
-
-
 def main(argv=None):
     try:
-        # SIGTERM ends like SIGINT: unwinds to the probe, which kills the psql child first.
-        signal.signal(signal.SIGTERM, raise_interrupt)
-        signal.signal(signal.SIGINT, raise_interrupt)
+        # SIGTERM and SIGHUP end like SIGINT: the probe stops the psql child first.
+        for name in INTERRUPT_SIGNALS:
+            signal.signal(getattr(signal, name), note_interrupt)
     except ValueError:
         pass  # not the main thread (in-process callers); the default handlers stay
     try:
