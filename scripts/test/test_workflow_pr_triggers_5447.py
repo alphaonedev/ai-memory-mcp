@@ -4105,7 +4105,7 @@ class WorkflowCommandEscaping6243(unittest.TestCase):
                 lines = self.failing_gate(hostile)
                 self.assertEqual(1, len(lines), lines)
                 text = "".join(lines)
-                self.assertEqual(1, text.count("::error::"), text)
+                self.assertEqual(1, len(text.splitlines()), text)  # one physical line, one command
                 for bad in ("\n", "\r", "\x1b", "\u2028"):
                     self.assertNotIn(bad, text)
 
@@ -4132,13 +4132,14 @@ class WorkflowCommandEscaping6243(unittest.TestCase):
             _rc, lines = self.mod.run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, self.mod.gh_api)
         text = "\n".join(lines)
         self.assertEqual(1, len(lines), lines)
-        self.assertEqual(1, text.count("::error::"), text)
+        self.assertEqual(1, len(text.splitlines()), text)
         self.assertNotIn("github_pat_", text)
         self.assertNotIn("\x1b", text)
 
     def test_6243_m01_every_error_emission_uses_the_escaper(self) -> None:
         src = APPROVAL_PY.read_text(encoding="utf-8")
-        self.assertNotRegex(src, r'f?"::error::')
+        self.assertEqual(1, src.count('"::error::"'))  # only the escaper builds the prefix
+        self.assertNotRegex(src, r'f"::error::')
         self.assertGreaterEqual(src.count("workflow_error("), 3)
         mutant = src.replace("def workflow_error(message):", "def workflow_error(message):\n    return '::error::' + message")
         self.assertNotEqual(src, mutant)
