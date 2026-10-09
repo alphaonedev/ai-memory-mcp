@@ -1407,8 +1407,11 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
 # --------------------------------------------------------------- self-test --
 Transform = Callable[[str], str]
 Edit = Tuple[str, str, Union[str, None, Transform], bool]  # (file, old, new | None=delete | fn, every)
-REL = ".github/workflows/release.yml"
-SHAPE = ".github/workflows/release-shape.yml"
+WORKFLOWS = ".github/workflows"
+REL = WORKFLOWS + "/release.yml"
+SHAPE = WORKFLOWS + "/release-shape.yml"
+CI_IMAGE = WORKFLOWS + "/publish-ci-image.yml"
+DECOY_WF = WORKFLOWS + "/decoy.yml"
 DOCKER = "Dockerfile"
 INSTALL = "docs/INSTALL.md"
 DECL = "scripts/release-features.sh"
@@ -1434,11 +1437,16 @@ def mutate_file(path: Path, old: str, new: Union[str, None, Transform], every: b
 
 
 def mk_root(src: Path, dst: Path) -> None:
+    """A scratch repo root holding the guard's inputs: INPUT_FILES plus every
+    workflow file (the #4935 sweep reads the whole directory)."""
     if dst.exists():
         shutil.rmtree(dst)
     for rel in INPUT_FILES:
         (dst / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src / rel, dst / rel)
+    for wf in sorted((src / WORKFLOWS).glob("*.y*ml")):
+        if wf.is_file() and not (dst / WORKFLOWS / wf.name).exists():
+            shutil.copy2(wf, dst / WORKFLOWS / wf.name)
 
 
 IND = "          "
@@ -1659,6 +1667,24 @@ def _add_shape_continue_on_error(text: str) -> str:
     if re.search(r"(?m)^    continue-on-error:", text):
         return text
     return text.replace(SHAPE_RUNS_ON, SHAPE_RUNS_ON + "    continue-on-error: true\n", 1)
+
+
+DECOY_BODY = "name: decoy\non:\n  push:\n%sjobs:\n  decoy:\n    runs-on: ubuntu-latest\n%s    steps:\n      - run: %s\n"
+
+
+def _decoy_wf(top: str = "", job: str = "", run: str = "echo") -> Edit:
+    """A new workflow file (#4935): ``top`` is inserted at the top level, ``job``
+    under the one job, ``run`` is the step command."""
+    return (DECOY_WF, "", DECOY_BODY % (top, job, run), False)
+
+
+def _ci_image_top_level_packages_write(text: str) -> str:
+    """Give publish-ci-image.yml a top-level `packages: write` when it has none
+    (#4935). Before the fix the grant IS top-level, so the text is unchanged and
+    the case is red; after it, the grant is job-level and this adds a second."""
+    if re.search(r"(?m)^  packages: write\n", text):
+        return text
+    return text.replace("permissions:\n  contents: read\n", "permissions:\n  contents: read\n  packages: write\n", 1)
 
 
 JOB_RE_TMPL = r"(?m)^  %s:\n(?P<body>(?:^(?:    .*|)\n)*)"
@@ -2153,6 +2179,25 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "4936 release-shape.yml concurrency cancel-in-progress: false": ("fail", [_shape(
         "  cancel-in-progress: true\n", "  cancel-in-progress: false\n")]),
     "4936 release-shape.yml workflow name changed": ("fail", [_shape(SHAPE_WF_NAME, "name: Release shape\n")]),
+    # --- #4935: GHCR publication authority is bounded across EVERY workflow
+    "4935 packages: write at the top level of another workflow": ("fail", [_decoy_wf(top="permissions:\n  packages: write\n")]),
+    "4935 packages: write on a job of another workflow": ("fail", [_decoy_wf(job="    permissions:\n      packages: write\n")]),
+    "4935 packages: write as a flow mapping": ("fail", [_decoy_wf(job="    permissions: {contents: read, packages: write}\n")]),
+    "4935 packages: write quoted": ("fail", [_decoy_wf(job="    permissions:\n      packages: 'write'\n")]),
+    "4935 permissions: write-all in another workflow": ("fail", [_decoy_wf(top="permissions: write-all\n")]),
+    "4935 permissions: write-all on a job": ("fail", [_decoy_wf(job="    permissions: write-all\n")]),
+    "4935 release image name in another workflow": ("fail", [_decoy_wf(
+        run="docker push ghcr.io/${{ github.repository_owner }}/ai-memory:latest")]),
+    "4935 release image name in another case": ("fail", [_decoy_wf(run="crane copy x GHCR.IO/alphaonedev/AI-MEMORY:1.0.0")]),
+    "4935 publish-ci-image.yml holds packages: write at the top level": ("fail", [(
+        CI_IMAGE, "", _ci_image_top_level_packages_write, False)]),
+    "4935 publish-ci-image.yml packages: write on a second job": ("fail", [(
+        CI_IMAGE, "", lambda t: t.rstrip("\n") + "\n\n  other:\n    runs-on: ubuntu-latest\n    permissions:\n"
+        "      packages: write\n    steps:\n      - run: echo\n", False)]),
+    "valid: the CI image name in another workflow": ("pass", [_decoy_wf(
+        run="docker pull ghcr.io/${{ github.repository_owner }}/ai-memory-ci:latest")]),
+    "valid: packages: read in another workflow": ("pass", [_decoy_wf(job="    permissions:\n      packages: read\n")]),
+    "valid: a comment naming packages: write": ("pass", [_decoy_wf(job="    # packages: write is refused here (#4935)\n")]),
     "SR10 an extra job": ("fail", [_shape(SHAPE_NAME, lambda t: t.rstrip("\n") + "\n\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n")]),
     "SR10 permissions changed": ("fail", [_shape("permissions:\n  contents: read\n", "permissions:\n  contents: write\n")]),
     "SR10/P25 last path filter dropped": ("fail", [_shape('      - "migrations/**"\n', "")]),
