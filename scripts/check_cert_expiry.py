@@ -820,15 +820,21 @@ GIT_SHIM_PROBE_ARG = "--gitshim-probe"
 GIT_SHIM_PROBE_MARKER = "gitshim-probe-ok"
 
 
-def _require_shim_reachable(path):
+GIT_SHIM_PROBE_TIMEOUT = 60
+
+
+def _require_shim_reachable(path, timeout=GIT_SHIM_PROBE_TIMEOUT):
     """Positive probe (#6379): `git` looked up on `path` must be the shim,
     which answers GIT_SHIM_PROBE_ARG with GIT_SHIM_PROBE_MARKER. Any cause that
     makes the shim unreachable (not executable, an exec-refusing mount, a split
     PATH entry) lets lookup fall through to the real git; refuse by name so the
-    cells never blame the gate for it."""
+    cells never blame the gate for it. Output is decoded with errors="replace"
+    so a git that writes non-UTF-8 bytes is a named refusal, never a crash
+    (#6428)."""
     try:
         proc = subprocess.run(["git", GIT_SHIM_PROBE_ARG], capture_output=True, text=True,
-                              env=dict(os.environ, PATH=path), timeout=60, check=False)
+                              errors="replace", env=dict(os.environ, PATH=path),
+                              timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         raise GateError(f"the git shim is not the git on PATH (probe failed: {exc})") from exc
     if proc.returncode != 0 or proc.stdout.strip() != GIT_SHIM_PROBE_MARKER:
@@ -840,31 +846,28 @@ def _require_shim_reachable(path):
 def run_gate_shimmed(tmp, repo, env, version="", fail=""):
     """run_gate with a PATH shim `git` that reports `version` for --version
     and exits 128 on any call whose argv contains `fail`, and otherwise
-    delegates to the real git (R2-F2: pins the guarded branches)."""
+    delegates to the real git (R2-F2: pins the guarded branches). One
+    try/finally owns the shim directory from creation, so any exception
+    removes it, not only GateError (#6428)."""
     real = shutil.which("git")
     if real is None:
         raise GateError("git is not on PATH")
     shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
-    if os.pathsep in str(shim_dir):
-        # #6178: the PATH entry would be split and the real git would run.
-        shutil.rmtree(shim_dir, ignore_errors=True)
-        raise GateError(f"the scratch path {str(shim_dir)!r} contains the PATH separator "
-                        f"{os.pathsep!r}; the git shim would be unreachable (run the self-test "
-                        f"from a checkout whose path has no {os.pathsep!r})")
-    shim = shim_dir / "git"
-    shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version=version,
-                                    fail=fail, probe=GIT_SHIM_PROBE_ARG,
-                                    marker=GIT_SHIM_PROBE_MARKER), encoding="utf-8")
-    shim.chmod(0o755)
     saved = os.environ.get("PATH")
-    shim_path = f"{shim_dir}{os.pathsep}{saved or ''}"
     try:
+        if os.pathsep in str(shim_dir):
+            # #6178: the PATH entry would be split and the real git would run.
+            raise GateError(f"the scratch path {str(shim_dir)!r} contains the PATH separator "
+                            f"{os.pathsep!r}; the git shim would be unreachable (run the "
+                            f"self-test from a checkout whose path has no {os.pathsep!r})")
+        shim = shim_dir / "git"
+        shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version=version,
+                                        fail=fail, probe=GIT_SHIM_PROBE_ARG,
+                                        marker=GIT_SHIM_PROBE_MARKER), encoding="utf-8")
+        shim.chmod(0o755)
+        shim_path = f"{shim_dir}{os.pathsep}{saved or ''}"
         _require_shim_reachable(shim_path)
-    except GateError:
-        shutil.rmtree(shim_dir, ignore_errors=True)
-        raise
-    os.environ["PATH"] = shim_path
-    try:
+        os.environ["PATH"] = shim_path
         return run_gate(repo, dict(env, PATH=os.environ["PATH"]))
     finally:
         if saved is None:
@@ -1595,6 +1598,9 @@ SELF_TEST_OK = (
     "((shim-unreach-clean)); (shim-probe-oserror) a probe that cannot start refused; "
     "(shim-path-restore, #6381) "
     "PATH restored after every shim cell; "
+    "(shim-clean-any-exc, #6428) any exception, not only GateError, removes the shim "
+    "directory; (shim-probe-decode) non-UTF-8 probe output refused by name; "
+    "(shim-probe-timeout) a probe past its timeout refused by name; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
