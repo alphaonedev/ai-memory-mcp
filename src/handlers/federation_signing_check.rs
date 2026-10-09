@@ -793,7 +793,11 @@ pub(super) async fn sync_push_via_store(
                         &to_insert,
                         &applied_id,
                     )
-                    && let Err(e) = app.store.dequarantine(target).await
+                    // #4208 — released only when the stored row IS the verified
+                    // signed unit (a verified inbound that lost the merge leaves
+                    // never-attested content behind); read + release under one
+                    // row lock.
+                    && let Err(e) = app.store.dequarantine_verified(target, &to_insert).await
                 {
                     // The merge is committed; the row simply stays
                     // quarantined (fail closed) — surface it, never swallow.
