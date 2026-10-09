@@ -32,7 +32,9 @@
 //!
 //! - **dim_violations** (P2): pre-P2 schemas have no `embedding_dim` column.
 //!   `db::doctor_dim_violations` returns `Ok(None)` and the doctor renders
-//!   "not yet observed (pre-P2 schema)".
+//!   "not yet observed (pre-P2 schema)". Any OTHER read failure (an
+//!   unreadable `memories` table, a failing census) is `Err`, rendered as
+//!   `unreadable` at Critical (#4981) — never a healthy 0 or "pre-P2".
 //! - **HNSW evictions** (P3): the eviction counter has no SQL surface today.
 //!   The doctor reports the value as 0 from a NOT_AVAILABLE-tagged section
 //!   until P3 lands the in-memory counter.
@@ -3385,7 +3387,8 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
         }
     }
 
-    // dim_violations (P2 surface). Pre-P2: Ok(None) -> render N/A line, no severity bump.
+    // dim_violations (P2 surface). Pre-P2: Ok(None) -> render N/A line, no
+    // severity bump. #4981: a read fault is `unreadable` at Critical.
     match db::doctor_dim_violations(conn) {
         Ok(Some(0)) => {
             facts.push((FACT_DIM_VIOLATIONS.into(), "0".into()));
@@ -3404,7 +3407,18 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
             ));
         }
         Err(e) => {
-            facts.push(("dim_violations_error".into(), e.to_string()));
+            // #4981 — never a healthy-looking 0 or "pre-P2" (ERRORS-19); the
+            // #4715 / #4956 Governance shape.
+            severity = Severity::Critical;
+            facts.push((
+                FACT_DIM_VIOLATIONS.into(),
+                over_depth_4715::UNREADABLE.into(),
+            ));
+            facts.push(("dim_violations_error".into(), format!("{e:#}")));
+            append_note(
+                &mut note,
+                "the embedding-dim census could not be read (#4981)",
+            );
         }
     }
 
@@ -8323,12 +8337,13 @@ enabled = true
         );
     }
 
-    /// A connection with no schema at all: `db::stats` fails, the
-    /// Storage section must downgrade to WARN with a `stats_error`
-    /// fact, and `dim_violations` renders the pre-P2 `not_observed`
-    /// line (prepare on the missing table fails → `Ok(None)`).
+    /// A connection with no schema at all: `db::stats` fails with a
+    /// `stats_error` fact, and (#4981) the `dim_violations` census is a
+    /// READ FAULT — `unreadable` at Critical with its error fact — not the
+    /// pre-P2 `not_observed` line (a missing `memories` table is not a
+    /// missing `embedding_dim` column).
     #[test]
-    fn storage_section_warns_with_stats_error_on_missing_schema() {
+    fn storage_section_critical_with_stats_error_on_missing_schema_4981() {
         let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
         // #3553 — the fixture models "a FUNNELLED connection whose schema is
         // missing", so it applies the resolved `PRAGMA synchronous` exactly
@@ -8344,17 +8359,20 @@ enabled = true
         )
         .expect("mirror the funnel's synchronous level");
         let section = section_storage(&conn, Path::new("/nonexistent/doctor.db"));
-        assert_eq!(section.severity, Severity::Warning, "{:?}", section.facts);
+        assert_eq!(section.severity, Severity::Critical, "{:?}", section.facts);
         assert!(
             section.facts.iter().any(|(k, _)| k == "stats_error"),
             "facts: {:?}",
             section.facts
         );
+        assert_eq!(
+            fact(&section, FACT_DIM_VIOLATIONS),
+            over_depth_4715::UNREADABLE,
+            "facts: {:?}",
+            section.facts
+        );
         assert!(
-            section
-                .facts
-                .iter()
-                .any(|(k, v)| k == "dim_violations" && v.contains("not_observed")),
+            fact(&section, "dim_violations_error").contains("memories"),
             "facts: {:?}",
             section.facts
         );

@@ -227,21 +227,25 @@ pub fn sweep_pending_action_timeouts(
 ///
 /// # Errors
 ///
-/// Returns `Err` only on hard SQLite failures — a missing column is
-/// reported as `Ok(None)`, not an error.
+/// Returns `Err` on any SQLite failure other than a MISSING `embedding_dim`
+/// column, which is reported as `Ok(None)`. An unreadable `memories` table
+/// or a failing census is an error, never `None` / `Some(0)` (#4981,
+/// ERRORS-19).
 pub fn doctor_dim_violations(conn: &Connection) -> Result<Option<usize>> {
-    let has_dim = conn
-        .prepare("SELECT embedding_dim FROM memories LIMIT 0")
-        .is_ok();
-    if !has_dim {
-        return Ok(None);
+    // #4981 — only the absent column means pre-P2; every other prepare
+    // failure (no such table, corrupt schema) is a read fault.
+    match conn.prepare("SELECT embedding_dim FROM memories LIMIT 0") {
+        Ok(_) => {}
+        Err(e) if is_missing_column(&e, crate::models::field_names::EMBEDDING_DIM) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
     }
     // For each namespace, find the modal dim (most-frequent non-null value)
     // and count rows whose dim differs from it. Rows with NULL dim but a
     // non-empty embedding count as violations too — they are mid-migration.
-    let n: i64 = conn
-        .query_row(
-            "WITH per_ns_modes AS (
+    let n: i64 = conn.query_row(
+        "WITH per_ns_modes AS (
                  SELECT namespace, embedding_dim, COUNT(*) AS c
                  FROM memories
                  WHERE embedding IS NOT NULL AND embedding_dim IS NOT NULL
@@ -262,11 +266,24 @@ pub fn doctor_dim_violations(conn: &Connection) -> Result<Option<usize>> {
              WHERE m.embedding IS NOT NULL
                AND (m.embedding_dim IS NULL
                     OR (mo.modal_dim IS NOT NULL AND m.embedding_dim != mo.modal_dim))",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+        [],
+        |r| r.get(0),
+    )?;
     Ok(Some(usize::try_from(n.max(0)).unwrap_or(0)))
+}
+
+/// #4981 — `true` only for SQLite's "no such column: `<column>`" prepare
+/// failure, the one error that means a pre-P2 schema rather than a fault.
+/// rusqlite reports a prepare failure as `SqlInputError` (message + SQL +
+/// offset) and an execute-time failure as `SqliteFailure`; the message is
+/// prefix-matched because the SQL text follows it.
+fn is_missing_column(e: &rusqlite::Error, column: &str) -> bool {
+    let wanted = format!("no such column: {column}");
+    match e {
+        rusqlite::Error::SqlInputError { msg, .. } => msg.starts_with(&wanted),
+        rusqlite::Error::SqliteFailure(_, Some(msg)) => msg.starts_with(&wanted),
+        _ => false,
+    }
 }
 
 /// Age in seconds of the oldest `pending` row in `pending_actions`, or
