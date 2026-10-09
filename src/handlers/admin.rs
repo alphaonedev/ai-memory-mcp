@@ -1031,16 +1031,7 @@ pub async fn run_gc(
         // extended row is not counted) and delete nothing: the same
         // `SQL_GC_EXPIRED_WHERE` predicate `db::gc` sweeps, unscoped
         // (the admin gate above already admitted the caller).
-        let now = chrono::Utc::now().to_rfc3339();
-        let counted: Result<usize, rusqlite::Error> = lock.0.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM memories WHERE {}",
-                db::SQL_GC_EXPIRED_WHERE
-            ),
-            rusqlite::params![now, Option::<&str>::None],
-            |r| r.get(0),
-        );
-        return match counted {
+        return match db::count_gc_expired(&lock.0, None) {
             Ok(count) => Json(json!({
                 "collected": count,
                 "dry_run": true,

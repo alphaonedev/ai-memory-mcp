@@ -16438,6 +16438,25 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     gc_for_caller(conn, archive, None)
 }
 
+/// #3415 — the rows a sweep would reap RIGHT NOW (the same
+/// [`SQL_GC_EXPIRED_WHERE`] predicate [`gc_for_caller`] deletes), without
+/// deleting anything. `owner` scopes the count like the sweep; `None` is
+/// the operator/admin view. The ONE dry-run counter behind the MCP
+/// `memory_gc` and HTTP `POST /api/v1/gc` `dry_run` flags.
+///
+/// # Errors
+///
+/// Propagates the SQLite error.
+pub fn count_gc_expired(conn: &Connection, owner: Option<&str>) -> Result<usize> {
+    let now = Utc::now().to_rfc3339();
+    let count: usize = conn.query_row(
+        &format!("SELECT COUNT(*) FROM memories WHERE {SQL_GC_EXPIRED_WHERE}"),
+        params![now, owner],
+        |r| r.get(0),
+    )?;
+    Ok(count)
+}
+
 /// #3383 — caller-scoped MCP collection. `None` is the operator/admin sweep.
 /// Every archive, link snapshot, revision, erasure and delete uses the same
 /// owner-filtered chunk under the write transaction. Like archive purge, a

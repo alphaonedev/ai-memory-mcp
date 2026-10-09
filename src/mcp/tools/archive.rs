@@ -392,18 +392,9 @@ pub(super) fn handle_gc(
         tracing::warn!("recall-access fold failed (pre-gc, memory_gc): {e}");
     }
     if dry_run {
-        // Just count expired without deleting
-        let now = chrono::Utc::now().to_rfc3339();
-        let count: usize = conn
-            .query_row(
-                &format!(
-                    "SELECT COUNT(*) FROM memories WHERE {}",
-                    db::SQL_GC_EXPIRED_WHERE
-                ),
-                rusqlite::params![now, owner],
-                |r| r.get(0),
-            )
-            .map_err(|error| crate::mcp::error_text::mcp_foreign_err("get", error))?;
+        // Just count expired without deleting (#3415: the shared counter).
+        let count = db::count_gc_expired(conn, owner)
+            .map_err(|error| crate::mcp::error_text::mcp_foreign_err("count_gc_expired", error))?;
         // #3171 — surface `archived` on BOTH shapes. The tool advertises
         // "archives first", but that is conditional on the daemon's
         // `archive_on_gc` setting: with it OFF the sweep is a permanent
