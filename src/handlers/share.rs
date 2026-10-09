@@ -22,6 +22,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::ApiJson;
 use super::AppState;
 
 /// HTTP wire shape for `POST /api/v1/share`.
@@ -53,7 +54,7 @@ pub struct ShareBody {
 pub async fn share_memory(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<ShareBody>,
+    ApiJson(body): ApiJson<ShareBody>,
 ) -> impl IntoResponse {
     // v1.0.0 #3379 — per-agent-key identity gate BEFORE the caller is resolved
     // from `X-Agent-Id` for the caller-owns-source check below. Without it a

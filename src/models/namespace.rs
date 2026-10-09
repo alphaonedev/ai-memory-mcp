@@ -312,6 +312,13 @@ pub struct Approval {
     pub approved_at: String,
 }
 
+/// #3415 — the closed set of `pending_actions.status` values a pending row
+/// can carry (`pending` on queue, `approved` / `rejected` on decide,
+/// `expired` from the timeout sweep). The `?status=` filter on
+/// `GET /api/v1/pending` is validated against this set so an unknown value
+/// is a `400`, never a `200` that silently matches nothing.
+pub const PENDING_ACTION_STATUSES: [&str; 4] = ["pending", "approved", "rejected", "expired"];
+
 /// Row returned by `db::list_pending_actions`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingAction {

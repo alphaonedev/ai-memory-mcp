@@ -30,6 +30,7 @@ use crate::db;
 use crate::identity::sentinels;
 use crate::validate;
 
+use super::ApiJson;
 use super::AppState;
 use super::MAX_BULK_SIZE;
 #[cfg(feature = "sal")]
@@ -468,7 +469,7 @@ pub struct ArchiveByIdsBody {
 pub async fn archive_by_ids(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<ArchiveByIdsBody>,
+    ApiJson(body): ApiJson<ArchiveByIdsBody>,
 ) -> impl IntoResponse {
     // Bound the batch the same way bulk_create / sync_push do.
     if body.ids.len() > MAX_BULK_SIZE {

@@ -316,7 +316,7 @@ async fn skill_register_handler_refuses_without_the_route_gate() {
     let resp = ai_memory::handlers::skill_register_route(
         axum::extract::State(app),
         headers,
-        axum::Json(valid_register_body()),
+        ai_memory::handlers::ApiJson(valid_register_body()),
     )
     .await
     .into_response();

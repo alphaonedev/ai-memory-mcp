@@ -297,7 +297,7 @@ async fn http_register_escape_matches_mcp_byte_for_byte_3762() {
     let resp = ai_memory::handlers::skill_register_route(
         axum::extract::State(app),
         admin_headers(),
-        axum::Json(params),
+        ai_memory::handlers::ApiJson(params),
     )
     .await
     .into_response();
@@ -332,7 +332,7 @@ async fn http_register_inline_succeeds_control_3762() {
     let resp = ai_memory::handlers::skill_register_route(
         axum::extract::State(app),
         admin_headers(),
-        axum::Json(inline_skill("http-inline-ok-3762")),
+        ai_memory::handlers::ApiJson(inline_skill("http-inline-ok-3762")),
     )
     .await
     .into_response();
@@ -375,7 +375,7 @@ async fn http_export_escape_matches_mcp_byte_for_byte_3762() {
         axum::extract::State(app),
         admin_headers(),
         axum::extract::Path(skill_id),
-        axum::Json(ai_memory::handlers::SkillExportBody {
+        ai_memory::handlers::ApiJson(ai_memory::handlers::SkillExportBody {
             target_folder: outside_s.clone(),
         }),
     )
@@ -424,7 +424,7 @@ async fn http_export_relative_succeeds_control_3762() {
         axum::extract::State(app),
         admin_headers(),
         axum::extract::Path(skill_id),
-        axum::Json(ai_memory::handlers::SkillExportBody {
+        ai_memory::handlers::ApiJson(ai_memory::handlers::SkillExportBody {
             target_folder: "nested/3762-ok".to_string(),
         }),
     )
@@ -535,7 +535,7 @@ mod pg_3762 {
             axum::extract::State(app),
             admin_headers(),
             axum::extract::Path("no-such-skill".to_string()),
-            axum::Json(ai_memory::handlers::SkillExportBody {
+            ai_memory::handlers::ApiJson(ai_memory::handlers::SkillExportBody {
                 target_folder: probe_s,
             }),
         )
@@ -563,7 +563,7 @@ mod pg_3762 {
         let resp = ai_memory::handlers::skill_register_route(
             axum::extract::State(app),
             admin_headers(),
-            axum::Json(inline_skill("pg-probe-3762")),
+            ai_memory::handlers::ApiJson(inline_skill("pg-probe-3762")),
         )
         .await
         .into_response();

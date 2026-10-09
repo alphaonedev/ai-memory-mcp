@@ -26,6 +26,7 @@ use crate::models::{Memory, Tier};
 use crate::profile::Family;
 use crate::validate;
 
+use super::ApiJson;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::MAX_BULK_SIZE;
@@ -320,7 +321,7 @@ async fn consolidate_fanout(
 pub async fn consolidate_memories(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<ConsolidateBody>,
+    ApiJson(body): ApiJson<ConsolidateBody>,
 ) -> impl IntoResponse {
     // #1924 (CWE-288) — consult the PRE-CONSOLIDATE enforcement gate before the
     // consolidation write (HTTP parity with the MCP gate).
@@ -866,7 +867,7 @@ pub struct AutoTagBody {
 pub async fn auto_tag_handler(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<AutoTagBody>,
+    ApiJson(body): ApiJson<AutoTagBody>,
 ) -> impl IntoResponse {
     if app.llm.is_none() {
         return (
@@ -1009,7 +1010,7 @@ pub struct ExpandQueryBody {
 /// - response 400: empty / missing query
 pub async fn expand_query_handler(
     State(app): State<AppState>,
-    Json(body): Json<ExpandQueryBody>,
+    ApiJson(body): ApiJson<ExpandQueryBody>,
 ) -> impl IntoResponse {
     if app.llm.is_none() {
         return (
@@ -1165,7 +1166,7 @@ pub struct LoadFamilyBody {
 pub async fn load_family_handler(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<LoadFamilyBody>,
+    ApiJson(body): ApiJson<LoadFamilyBody>,
 ) -> impl IntoResponse {
     use std::str::FromStr;
 

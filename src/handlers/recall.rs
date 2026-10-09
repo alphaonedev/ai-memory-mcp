@@ -24,6 +24,7 @@ use crate::db;
 use crate::models::{RecallBody, RecallQuery, RecallRequest};
 use crate::validate;
 
+use super::ApiJson;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
@@ -237,7 +238,7 @@ pub async fn recall_memories_get(
 pub async fn recall_memories_post(
     State(app): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(body): Json<RecallBody>,
+    ApiJson(body): ApiJson<RecallBody>,
 ) -> impl IntoResponse {
     // #967 — same DTO marshal-once shape as the GET path; the body
     // `resolved_query` precedence (`context > query > q`) is

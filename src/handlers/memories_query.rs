@@ -24,6 +24,7 @@ use crate::db;
 use crate::models::{ForgetQuery, ListQuery, Memory, SearchQuery};
 use crate::validate;
 
+use super::ApiJson;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
@@ -620,7 +621,7 @@ pub async fn search_memories(
 pub async fn forget_memories(
     State(app): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(body): Json<ForgetQuery>,
+    ApiJson(body): ApiJson<ForgetQuery>,
 ) -> impl IntoResponse {
     // #942 SECURITY-high (Track A QC sweep, 2026-05-20) — admin-only
     // gate on bulk-forget. `db::forget` is a destructive operation

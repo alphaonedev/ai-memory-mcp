@@ -34,6 +34,7 @@ use axum::{Json, http::StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 
+use super::ApiJson;
 use crate::handlers::AppState;
 
 /// Response field carrying the W-of-N acknowledgement count on a successful
@@ -121,7 +122,7 @@ pub async fn transition_action(
     State(app): State<AppState>,
     headers: HeaderMap,
     Path(action_id): Path<String>,
-    Json(body): Json<ActionTransitionRequest>,
+    ApiJson(body): ApiJson<ActionTransitionRequest>,
 ) -> impl IntoResponse {
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
@@ -242,7 +243,7 @@ pub async fn transition_action(
 pub async fn send_signal(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<SendSignalRequest>,
+    ApiJson(body): ApiJson<SendSignalRequest>,
 ) -> impl IntoResponse {
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
@@ -755,7 +756,7 @@ pub async fn resolve_checkpoint(
     State(app): State<AppState>,
     headers: HeaderMap,
     Path(checkpoint_id): Path<String>,
-    Json(body): Json<CheckpointResolveHttpRequest>,
+    ApiJson(body): ApiJson<CheckpointResolveHttpRequest>,
 ) -> impl IntoResponse {
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)

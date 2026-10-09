@@ -26,6 +26,7 @@ use crate::models::{ConfidenceSource, Memory, Tier};
 #[cfg(feature = "sal")]
 use chrono::Utc;
 
+use super::ApiJson;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
@@ -97,7 +98,7 @@ pub struct NotifyBody {
 pub async fn notify(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<NotifyBody>,
+    ApiJson(body): ApiJson<NotifyBody>,
 ) -> impl IntoResponse {
     let Some(payload) = body.payload.or(body.content) else {
         return (
@@ -356,7 +357,7 @@ pub struct SubscribeBody {
 pub async fn subscribe(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<SubscribeBody>,
+    ApiJson(body): ApiJson<SubscribeBody>,
 ) -> impl IntoResponse {
     // #901 (security-high, 2026-05-19) — sibling of #874. The pre-#901
     // path trusted body.agent_id as identity, allowing webhook-hijack

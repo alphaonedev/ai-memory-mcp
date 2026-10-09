@@ -52,6 +52,25 @@ pub async fn list_pending(
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(100).min(1000);
 
+    // #3415 — an unknown `?status=` is a client error on BOTH backends, not
+    // a `200` that silently matches nothing (the raw string used to be
+    // bound straight into the `status = ?1` filter).
+    if let Some(status) = p.status.as_deref()
+        && !crate::models::PENDING_ACTION_STATUSES.contains(&status)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "invalid status filter (expected one of: {})",
+                    crate::models::PENDING_ACTION_STATUSES.join(", ")
+                ),
+                "fields": ["status"],
+            })),
+        )
+            .into_response();
+    }
+
     // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
     // the #958 caller-vs-requester post-filter below. Under `enforce`, a
     // shared-key `Claimed` caller forging `X-Agent-Id: <victim>` cannot

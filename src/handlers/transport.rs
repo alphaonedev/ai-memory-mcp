@@ -788,12 +788,53 @@ where
     }
 }
 
+/// #3415 — JSON body extractor for every other `Json`-extracted route.
+/// Delegates to `axum::Json<T>` and keeps axum's rejection STATUS (`422`
+/// for a body that parses but does not deserialize, `400` for malformed
+/// JSON, `415` for a missing `Content-Type`, `413` past the body limit —
+/// the documented per-route contract), but renders the rejection as the
+/// daemon's JSON error envelope `{"error": ..., "fields": [...]}` instead
+/// of axum's `text/plain` body, so a client that parses every error as
+/// JSON never trips on a body-deserialisation failure.
+///
+/// [`JsonOrBadRequest`] (the store path) additionally folds the status to
+/// `400`; the two share [`json_rejection_response`].
+pub struct ApiJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rej) => {
+                let status = rej.status();
+                Err(json_rejection_response(&rej, status))
+            }
+        }
+    }
+}
+
 /// Convert an axum `JsonRejection` into a `400 Bad Request` response
 /// with the daemon's standard `{"error": ..., "fields": [...]}` shape.
 /// The `fields` array best-effort-extracts missing field names from
 /// the underlying serde error message; on parse failure it is left
 /// empty so callers can still rely on the envelope shape.
 fn json_rejection_to_400(rej: &JsonRejection) -> Response {
+    json_rejection_response(rej, StatusCode::BAD_REQUEST)
+}
+
+/// #3415 — the ONE rendering of an axum `JsonRejection` as the daemon's
+/// `{"error": ..., "fields": [...]}` envelope under the caller-chosen
+/// `status` (`400` for [`JsonOrBadRequest`], axum's own status for
+/// [`ApiJson`]). The raw serde diagnostic is never echoed: a missing
+/// field is named structurally, everything else is a sanitized message.
+fn json_rejection_response(rej: &JsonRejection, status: StatusCode) -> Response {
     let raw_msg = rej.body_text();
     // serde_json's "missing field" diagnostic: `missing field \`<name>\``.
     // We extract the backtick-quoted identifier and surface it both as
@@ -814,7 +855,7 @@ fn json_rejection_to_400(rej: &JsonRejection) -> Response {
         }
     };
     (
-        StatusCode::BAD_REQUEST,
+        status,
         Json(json!({
             "error": error_msg,
             "fields": fields,

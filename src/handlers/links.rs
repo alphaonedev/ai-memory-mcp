@@ -42,6 +42,7 @@ use crate::models::LinkBody;
 use crate::models::MemoryLink;
 use crate::validate;
 
+use super::ApiJson;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
@@ -137,7 +138,7 @@ pub fn verify_require_nonce_flip_notice(require_nonce: bool) -> Option<&'static 
 pub async fn verify_link_handler(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<VerifyLinkBody>,
+    ApiJson(body): ApiJson<VerifyLinkBody>,
 ) -> impl IntoResponse {
     if body.source_id.is_none() && body.link_id.is_none() {
         return (
@@ -344,7 +345,7 @@ fn unknown_link_body_fields(raw: &serde_json::Value) -> Option<Vec<String>> {
 pub async fn create_link(
     State(app): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(raw): Json<serde_json::Value>,
+    ApiJson(raw): ApiJson<serde_json::Value>,
 ) -> impl IntoResponse {
     // #1924 (CWE-288) — consult the PRE-LINK enforcement gate before the link
     // write (HTTP parity with the MCP gate). INERT for default deployments.
@@ -907,7 +908,7 @@ pub async fn create_link(
 pub async fn delete_link(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(raw): Json<serde_json::Value>,
+    ApiJson(raw): ApiJson<serde_json::Value>,
 ) -> impl IntoResponse {
     // v0.7.0 G-PHASE-E-1 (#706) — mirror create_link: reject unknown
     // fields with a structured 400 so caller bugs surface loudly

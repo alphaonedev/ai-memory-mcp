@@ -54,6 +54,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
+use super::ApiJson;
 use super::AppState;
 
 /// Tracing target for the skills HTTP handlers (#1558 tracing-target SSOT).
@@ -117,7 +118,7 @@ fn refuse_skills_on_postgres(
 pub async fn skill_register_route(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    ApiJson(body): ApiJson<serde_json::Value>,
 ) -> impl IntoResponse {
     // #3183 — the skills substrate is sqlite-only; on a postgres-backed
     // daemon `app.db` below is the node-local scratch file, not the
@@ -311,7 +312,7 @@ pub async fn skill_export_route(
     State(app): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(body): Json<SkillExportBody>,
+    ApiJson(body): ApiJson<SkillExportBody>,
 ) -> impl IntoResponse {
     // #3183 — the skills substrate is sqlite-only; on a postgres-backed
     // daemon `app.db` below is the node-local scratch file, not the
@@ -368,7 +369,7 @@ pub async fn skill_promote_route(
     State(app): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(body): Json<SkillPromoteBody>,
+    ApiJson(body): ApiJson<SkillPromoteBody>,
 ) -> impl IntoResponse {
     // #3183 — the skills substrate is sqlite-only; on a postgres-backed
     // daemon `app.db` below is the node-local scratch file, not the

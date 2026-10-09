@@ -161,8 +161,12 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
         .await
         .expect("read body");
-    serde_json::from_slice(&bytes)
-        .unwrap_or_else(|e| panic!("body is not JSON ({e}): {}", String::from_utf8_lossy(&bytes)))
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        panic!(
+            "body is not JSON ({e}): {}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })
 }
 
 fn content_type(resp: &axum::response::Response) -> String {
@@ -213,7 +217,10 @@ async fn http_gc_dry_run_counts_without_deleting_3415() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     assert_eq!(body["expired_deleted"], serde_json::json!(1), "{body}");
-    assert!(!row_exists(f.path(), &id), "control: the real sweep deletes");
+    assert!(
+        !row_exists(f.path(), &id),
+        "control: the real sweep deletes"
+    );
 }
 
 /// (2) A body the JSON extractor rejects (wrong type, malformed JSON)

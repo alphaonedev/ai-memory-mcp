@@ -131,6 +131,7 @@ use crate::models::field_names;
 use crate::models::{CreateMemory, Memory};
 use crate::validate;
 
+use super::ApiJson;
 use super::AppState;
 use super::BULK_FANOUT_CONCURRENCY;
 #[cfg(feature = "sal")]
@@ -823,9 +824,9 @@ async fn run_bulk_post_commit(app: &AppState, committed_mems: &[Memory], ledger:
 pub async fn bulk_create(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(bodies): Json<Vec<CreateMemory>>,
+    ApiJson(bodies): ApiJson<Vec<CreateMemory>>,
 ) -> impl IntoResponse {
-    let response = bulk_create_write(State(app.clone()), headers, Json(bodies))
+    let response = bulk_create_write(State(app.clone()), headers, ApiJson(bodies))
         .await
         .into_response();
     super::write_receipt::complete(
@@ -840,7 +841,7 @@ pub async fn bulk_create(
 async fn bulk_create_write(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(bodies): Json<Vec<CreateMemory>>,
+    ApiJson(bodies): ApiJson<Vec<CreateMemory>>,
 ) -> impl IntoResponse {
     if bodies.len() > app.max_page_size {
         return (

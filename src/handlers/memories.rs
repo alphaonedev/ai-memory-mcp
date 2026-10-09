@@ -24,6 +24,7 @@ use crate::identity::sentinels;
 use crate::models::{Tier, UpdateMemory};
 use crate::validate;
 
+use super::ApiJson;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
@@ -326,9 +327,9 @@ pub async fn update_memory(
     State(app): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<UpdateMemory>,
+    ApiJson(body): ApiJson<UpdateMemory>,
 ) -> impl IntoResponse {
-    let response = update_memory_write(State(app.clone()), Path(id), headers, Json(body))
+    let response = update_memory_write(State(app.clone()), Path(id), headers, ApiJson(body))
         .await
         .into_response();
     super::write_receipt::complete(
@@ -344,7 +345,7 @@ async fn update_memory_write(
     State(app): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<UpdateMemory>,
+    ApiJson(body): ApiJson<UpdateMemory>,
 ) -> impl IntoResponse {
     let state = app.db.clone();
     if let Err(e) = validate::validate_id(&id) {

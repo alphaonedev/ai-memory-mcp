@@ -26,6 +26,7 @@ use crate::db;
 use crate::models::Memory;
 use crate::validate;
 
+use super::ApiJson;
 use super::AppState;
 use super::MAX_BULK_SIZE;
 #[cfg(feature = "sal")]
@@ -808,7 +809,7 @@ fn embedder_failed_response() -> axum::response::Response {
 pub async fn check_duplicate(
     State(app): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(body): Json<CheckDuplicateBody>,
+    ApiJson(body): ApiJson<CheckDuplicateBody>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_title(&body.title) {
         return (

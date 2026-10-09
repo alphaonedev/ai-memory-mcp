@@ -30,6 +30,7 @@ use crate::models::{ConfidenceSource, Tier};
 use crate::models::{Memory, MemoryLink, RegisterAgentBody};
 use crate::validate;
 
+use super::ApiJson;
 use super::AppState;
 use super::MAX_BULK_SIZE;
 #[cfg(feature = "sal")]
@@ -80,7 +81,7 @@ fn register_agent_response(
 pub async fn register_agent(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<RegisterAgentBody>,
+    ApiJson(body): ApiJson<RegisterAgentBody>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_agent_id(&body.agent_id) {
         return (
@@ -345,7 +346,7 @@ pub async fn bind_agent_pubkey(
     State(app): State<AppState>,
     headers: HeaderMap,
     axum::extract::Path(agent_id): axum::extract::Path<String>,
-    Json(body): Json<crate::models::BindAgentPubkeyBody>,
+    ApiJson(body): ApiJson<crate::models::BindAgentPubkeyBody>,
 ) -> impl IntoResponse {
     let caller = match require_admin(&app, &headers, BIND_AGENT_PUBKEY_ACTION) {
         Ok(c) => c,
@@ -600,7 +601,7 @@ pub async fn bind_agent_pubkey_challenge(
     State(app): State<AppState>,
     headers: HeaderMap,
     axum::extract::Path(agent_id): axum::extract::Path<String>,
-    Json(body): Json<crate::models::BindAgentPubkeyChallengeBody>,
+    ApiJson(body): ApiJson<crate::models::BindAgentPubkeyChallengeBody>,
 ) -> impl IntoResponse {
     if let Err(resp) = require_admin(&app, &headers, BIND_AGENT_PUBKEY_ACTION) {
         return resp;
@@ -732,7 +733,7 @@ pub struct QuotaStatusBody {
 pub async fn quota_status_handler(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<QuotaStatusBody>,
+    ApiJson(body): ApiJson<QuotaStatusBody>,
 ) -> impl IntoResponse {
     // #2138 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
     // the per-agent quota read. The pre-#2138 `agent_id == caller` check below
@@ -931,7 +932,21 @@ pub async fn get_stats(
     Json(envelope).into_response()
 }
 
-pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+/// #3415 — query parameters of `POST /api/v1/gc`. `dry_run=true` COUNTS the
+/// rows the sweep would reap and deletes nothing, the twin of the MCP
+/// `memory_gc` `dry_run` flag; absent / `false` is the real sweep.
+#[derive(Debug, Default, Deserialize)]
+pub struct GcQuery {
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
+pub async fn run_gc(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<GcQuery>,
+) -> impl IntoResponse {
+    let dry_run = q.dry_run.unwrap_or(false);
     // #1027 (security-critical, 2026-05-21) — admin-role gate. GC
     // permanently sweeps expired rows; pre-#1027 the handler logged
     // the caller to the forensic chain but accepted ANY API-key
@@ -956,7 +971,7 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
         "allow",
         "run_gc",
         "",
-        crate::governance::audit::ForensicPayload::new(),
+        crate::governance::audit::ForensicPayload::new().flag("dry_run", dry_run),
     );
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 17) — postgres-backed daemons
@@ -978,6 +993,22 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
             let lock = app.db.lock().await;
             lock.3
         };
+        if dry_run {
+            // #3415 — count only: `Stats::expired_pending_gc` is the
+            // adapter's own expired-awaiting-GC census (the same
+            // `expires_at <= now` predicate the sweep reaps), so the dry
+            // run reads it instead of growing the trait surface.
+            return match app.store.stats().await {
+                Ok(stats) => Json(json!({
+                    "collected": stats.expired_pending_gc,
+                    "dry_run": true,
+                    "archived": archive_flag,
+                    (field_names::STORAGE_BACKEND): "postgres",
+                }))
+                .into_response(),
+                Err(e) => store_err_to_response(e),
+            };
+        }
         return match app.store.run_gc(archive_flag).await {
             Ok(n) => {
                 Json(json!({(field_names::EXPIRED_DELETED): n, (field_names::STORAGE_BACKEND): "postgres"}))
@@ -994,6 +1025,30 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
         db::fold_recall_accesses(&lock.0, lock.2.short_extend_secs, lock.2.mid_extend_secs)
     {
         tracing::warn!("run_gc (sqlite): recall-access fold failed (pre-gc): {e}");
+    }
+    if dry_run {
+        // #3415 — count the rows the sweep would reap (post-fold, so an
+        // extended row is not counted) and delete nothing: the same
+        // `SQL_GC_EXPIRED_WHERE` predicate `db::gc` sweeps, unscoped
+        // (the admin gate above already admitted the caller).
+        let now = chrono::Utc::now().to_rfc3339();
+        let counted: Result<usize, rusqlite::Error> = lock.0.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM memories WHERE {}",
+                db::SQL_GC_EXPIRED_WHERE
+            ),
+            rusqlite::params![now, Option::<&str>::None],
+            |r| r.get(0),
+        );
+        return match counted {
+            Ok(count) => Json(json!({
+                "collected": count,
+                "dry_run": true,
+                "archived": lock.3,
+            }))
+            .into_response(),
+            Err(e) => crate::handlers::errors::handler_error_500(&e),
+        };
     }
     match db::gc(&lock.0, lock.3) {
         Ok(n) => Json(json!({(field_names::EXPIRED_DELETED): n})).into_response(),
@@ -1289,7 +1344,7 @@ pub async fn export_memories(
 pub async fn import_memories(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<ImportBody>,
+    ApiJson(body): ApiJson<ImportBody>,
 ) -> impl IntoResponse {
     if body.memories.len() > MAX_BULK_SIZE {
         return (

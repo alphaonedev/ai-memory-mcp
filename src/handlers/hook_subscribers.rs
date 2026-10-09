@@ -19,6 +19,7 @@ use crate::identity::sentinels;
 use crate::models::{Memory, Tier};
 use crate::validate;
 
+use super::ApiJson;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
@@ -931,7 +932,7 @@ pub async fn set_namespace_standard(
     State(app): State<AppState>,
     headers: HeaderMap,
     Path(ns): Path<String>,
-    Json(body): Json<NamespaceStandardBody>,
+    ApiJson(body): ApiJson<NamespaceStandardBody>,
 ) -> impl IntoResponse {
     set_namespace_standard_inner(&app, &ns, body, Some(&headers)).await
 }
@@ -988,7 +989,7 @@ pub async fn clear_namespace_standard(
 pub async fn set_namespace_standard_qs(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<NamespaceStandardBody>,
+    ApiJson(body): ApiJson<NamespaceStandardBody>,
 ) -> impl IntoResponse {
     let Some(ns) = body
         .namespace
@@ -1409,7 +1410,7 @@ pub struct SessionStartBody {
 pub async fn session_start(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<SessionStartBody>,
+    ApiJson(body): ApiJson<SessionStartBody>,
 ) -> impl IntoResponse {
     // agent_id is optional for session_start; but if supplied it must validate.
     if let Some(ref id) = body.agent_id

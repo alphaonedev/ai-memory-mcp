@@ -39,6 +39,7 @@ use crate::db;
 use crate::identity::sentinels;
 use crate::validate;
 
+use super::ApiJson;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
@@ -78,7 +79,7 @@ pub struct EntityByAliasQuery {
 pub async fn entity_register(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<EntityRegisterBody>,
+    ApiJson(body): ApiJson<EntityRegisterBody>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_title(&body.canonical_name) {
         return (
@@ -871,7 +872,7 @@ pub struct KgInvalidateBody {
 pub async fn kg_invalidate(
     State(app): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(body): Json<KgInvalidateBody>,
+    ApiJson(body): ApiJson<KgInvalidateBody>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::RequestValidator::validate_link_triple(
         &body.source_id,
@@ -1163,7 +1164,7 @@ pub struct FindPathsBody {
 pub async fn kg_find_paths(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<FindPathsBody>,
+    ApiJson(body): ApiJson<FindPathsBody>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&body.source_id) {
         return (
@@ -1428,7 +1429,7 @@ fn kg_row_to_node(r: &crate::store::KgQueryRow) -> crate::models::KgQueryNode {
 pub async fn kg_query(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<KgQueryBody>,
+    ApiJson(body): ApiJson<KgQueryBody>,
 ) -> impl IntoResponse {
     // #2133 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
     // the #910 caller-keyed scope=private visibility filter below. Under
