@@ -288,6 +288,16 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                           "tier URL file carries sslpassword; use a key without a passphrase")
         self.assertFalse((self.base / "psql.log").exists(), "psql must never be called")
 
+    def test_sslpassword_case_variants_get_the_sslpassword_message(self):
+        # R6-F2 (mutant rev_drop_sslpassword_lower): a case variant is a secret, not "an unlisted key".
+        self.install_good()
+        for key in ("SSLPassword", "SSLPASSWORD", "sslPassword"):
+            with self.subTest(key=key):
+                self.url_file.write_text(f"postgres://ciuser@127.0.0.1:5445/cidb?{key}={PW_MARKER}\n")
+                self.assert_fails(self.run_script(), 2,
+                                  "tier URL file carries sslpassword; use a key without a passphrase")
+                self.assertFalse((self.base / "psql.log").exists(), "psql must never be called")
+
     # ---- URL shapes libpq parses differently from urllib (R3-F1, F-R3-1) --
     def assert_url_refused(self, url, names=(), absent=()):
         """The URL is refused with exit 2 before psql runs, and the value never prints.
