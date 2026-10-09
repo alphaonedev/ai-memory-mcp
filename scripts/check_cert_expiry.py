@@ -200,16 +200,25 @@ HTML_BLOCK_KINDS = (
     (re.compile(r"^[ ]{0,3}</?[A-Za-z]"), None),
 )
 QUOTE_MARKERS_RE = re.compile(r"^(?:[ ]{0,3}>[ ]?)+")
-# Every issue / pull number and every link target on a `Path back to LIVE:`
-# line: `#N`, `/issues/N`, `/pull/N`; inline link targets, autolinks, bare
-# URLs, `www.` autolinks. A reference-style link (`][`) is refused outright.
-BACK_ISSUE_RE = re.compile(r"#(\d+)|/(?:issues|pull)/(\d+)")
-BACK_TARGET_RE = re.compile(
-    r"\]\(\s*<?([^)\s>]*)|<([A-Za-z][A-Za-z0-9+.-]*:[^<>\s]*)>"
-    r"|((?:[A-Za-z][A-Za-z0-9+.-]*://|www\.)[^\s()<>\]]+)"
-)
+# #6354/#6367: the new record's grammar and character set. Every body line is
+# a list entry, the back line or plain prose (a letter first); every line
+# (header included) is printable ASCII, a tab, or one of a few typographic
+# marks, so no bidi control, zero-width, escape or fullwidth lookalike.
+AMENDMENT_PROSE_RE = re.compile(r"^>[ ]{0,4}[A-Za-z]")
+AMENDMENT_MARKER_RE = re.compile(r"^>[ ]{0,4}")
+AMENDMENT_EXTRA_CHARS = frozenset("§—–→’‘“”…·×")
+# What may not be left in a record line once its list-entry code span and the
+# canonical #6063 link are removed: any other issue / pull / commit reference,
+# link, autolink, entity, HTML or code span (GitHub autolinks `#N`, `GH-N`,
+# `owner/repo#N`, `owner/repo@sha`, a 7+ hex sha, `www.`, email).
+AMENDMENT_BODY_BANNED_RE = re.compile(
+    r"[#@/&\[\]<>\\`]|\bGH-\d|www\.|\b[0-9a-f]{7,}\b", re.IGNORECASE)
+# The header keeps its `#N` (the issue the change is for); nothing else.
+AMENDMENT_HEAD_BANNED_RE = re.compile(
+    r"[@/&\[\]<>\\`]|\bGH-\d|www\.|\b[0-9a-f]{7,}\b", re.IGNORECASE)
 RE_CERT_ISSUE = "#6063"
 RE_CERT_URL = "https://github.com/alphaonedev/ai-memory-mcp/issues/6063"
+RE_CERT_LINK = f"[{RE_CERT_ISSUE}]({RE_CERT_URL})"
 REGULAR_DOC_MODES = ("100644", "100755")
 # Cap on the cert doc the amendment ledger reads whole (#6124; #6140 applies
 # the same cap to the banner reader).
@@ -444,17 +453,10 @@ def _fence_closes(ln, fence):
 
 
 def _ledger_plain(ln):
-    """True iff LN can continue a new amendment's paragraph: a non-blank quoted
-    line that opens no fence, no HTML comment and no other record."""
-    return (
-        ln.startswith(">")
-        and not QUOTED_BLANK_RE.match(ln)
-        and "<!--" not in ln
-        and "-->" not in ln
-        and _fence_opener(ln) is None
-        and not AMENDMENT_LEDGER_RE.match(ln)
-        and not STATUS_LINE_RE.match(ln)
-    )
+    """True iff LN continues the new record's paragraph: a non-blank quoted
+    line (#6354: whatever it carries, it is part of the record and is held
+    to the record grammar)."""
+    return ln.startswith(">") and not QUOTED_BLANK_RE.match(ln)
 
 
 def _html_opener(content):
@@ -562,30 +564,38 @@ def _ledger_key(entries):
     return [(e["header"], tuple(e["raw"]), e["below_status"]) for e in entries]
 
 
-def _back_problems(back_lines):
-    """Why the `Path back to LIVE:` lines do not cite exactly #6063 by its
-    issue URL ([] when they do)."""
-    if not back_lines:
-        return [f"no 'Path back to LIVE:' line citing {RE_CERT_ISSUE}"]
-    nums = set()
-    targets = []
-    ref_link = False
-    for ln in back_lines:
-        nums.update(a or b for a, b in BACK_ISSUE_RE.findall(ln))
-        targets.extend((a or b or c).rstrip(".,;:") for a, b, c in BACK_TARGET_RE.findall(ln))
-        ref_link = ref_link or "][" in ln
+def _record_problems(header, body):
+    """Why the new record's HEADER and BODY lines are not in the record
+    grammar, character set and citation rule ([] when they are; #6354,
+    #6367). The whole record is scanned, not only its back line."""
     why = []
-    others = sorted(n for n in nums if "#" + n != RE_CERT_ISSUE)
-    if others:
-        why.append("'Path back to LIVE:' cites another issue or pull request: "
-                   + ", ".join(_doc_safe(n) for n in others))
-    stray = sorted({t for t in targets if t != RE_CERT_URL})
-    if stray or ref_link:
-        why.append("'Path back to LIVE:' links somewhere other than " + RE_CERT_URL
-                   + (": " + ", ".join(_doc_safe(t) for t in stray) if stray else ""))
-    if RE_CERT_URL not in targets:
-        why.append(f"'Path back to LIVE:' does not link {RE_CERT_ISSUE} as "
-                   f"[{RE_CERT_ISSUE}]({RE_CERT_URL})")
+    for ln in [header] + body:
+        text = ln[:-1] if ln.endswith("\r") else ln
+        bad = sorted({ch for ch in text if not (" " <= ch <= "~" or ch == "\t"
+                                                or ch in AMENDMENT_EXTRA_CHARS)})
+        if bad:
+            why.append("a record line carries a character outside printable ASCII "
+                       "(control, bidi, zero-width or lookalike): "
+                       + ", ".join(f"U+{ord(ch):04X}" for ch in bad))
+    if AMENDMENT_HEAD_BANNED_RE.search(AMENDMENT_MARKER_RE.sub("", header, count=1)):
+        why.append("its header carries a link, an autolink, an entity, HTML, a code span, "
+                   "a commit sha or a cross-repository reference")
+    for ln in body:
+        if not (AMENDMENT_ITEM_RE.match(ln) or AMENDMENT_BACK_RE.match(ln)
+                or AMENDMENT_PROSE_RE.match(ln)):
+            why.append(f"record line {_doc_safe(ln)!s} is not a list entry "
+                       "('> - `path`'), the 'Path back to LIVE:' line or plain prose")
+            continue
+        if AMENDMENT_ITEM_RE.match(ln):
+            continue
+        rest = AMENDMENT_MARKER_RE.sub("", ln, count=1).replace(RE_CERT_LINK, "")
+        hit = AMENDMENT_BODY_BANNED_RE.search(rest)
+        if hit:
+            why.append(f"record line {_doc_safe(ln)!s} cites or links something other than "
+                       f"{RE_CERT_LINK} (found {_doc_safe(hit.group(0))!s}); the record "
+                       f"cites only {RE_CERT_ISSUE}, by its issue URL")
+    if not any(AMENDMENT_BACK_RE.match(ln) and RE_CERT_LINK in ln for ln in body):
+        why.append(f"no 'Path back to LIVE:' line citing {RE_CERT_LINK}")
     return why
 
 
@@ -626,6 +636,11 @@ def amendment_verdict(repo, mb, judged, required):
     para = new_lines[start + 1:end]
     prev = new_lines[start - 1] if start > 0 else ""
     why = []
+    if end < len(new_lines) and not (BLANK_RE.match(new_lines[end])
+                                     or QUOTED_BLANK_RE.match(new_lines[end])):
+        why.append(f"{at}: line {end + 1} continues its last paragraph without a '>' (a lazy "
+                   "continuation line renders inside the record); end the record with a "
+                   "blank line or a blank '>' line")
     # Append-only: drop the new entry (and the one blank '>' line separating
     # it) and the rest of the ledger must be the merge-base ledger, unchanged.
     drop = set(range(start, end))
@@ -669,8 +684,7 @@ def amendment_verdict(repo, mb, judged, required):
         why.append(f"{at}: not listed: {', '.join(_doc_safe(m) for m in missing)}")
     if extra:
         why.append(f"{at}: listed but not changed: {', '.join(_doc_safe(x) for x in extra)}")
-    why.extend(f"{at}: {w}" for w in _back_problems(
-        [ln for ln in para if AMENDMENT_BACK_RE.match(ln)]))
+    why.extend(f"{at}: {w}" for w in _record_problems(ent["header"], para))
     if why:
         return False, "; ".join(why)
     return True, f"line {ent['start'] + 1}"
