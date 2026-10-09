@@ -1749,3 +1749,174 @@ fn issue_1240_synthesis_depth_guard_admits_depth_under_cap() {
         "RAII guard restored the depth on drop"
     );
 }
+
+/// #4173 — a Delete verdict the K9 recheck WITHHOLDS (deny OR ask) must be
+/// named on the store response, not collapsed to a WARN + NoOp. Pre-fix the
+/// envelope reported `synthesis_decisions.delete = 2` while ZERO deletes
+/// ran, so a caller could not tell "applied" from "silently skipped". The
+/// field is the additive honest-envelope shape `synthesis_failed` already
+/// uses: absent when nothing was withheld (the permitted-delete control).
+#[test]
+fn k9_withheld_synthesis_delete_is_reported_on_the_response_4173() {
+    use ai_memory::permissions::{
+        PermissionRule, RuleDecision, clear_active_permission_rules_for_test,
+        set_active_permission_rules,
+    };
+
+    let _g = k9_synthesis_rules_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
+    let (conn, db_path) = open_db();
+    let ns = "ns-k9-withheld-4173";
+    install_synthesis_policy(&conn, ns, None, Some(5), None);
+
+    let denied_id = seed_existing(&conn, "kubernetes deployment notes", "kept body", ns);
+    let asked_id = seed_existing(&conn, "kubernetes rolling strategy", "pruned body", ns);
+
+    // Deny on the first candidate, Ask on the second: both are withheld,
+    // each with its own reason code.
+    clear_active_permission_rules_for_test();
+    set_active_permission_rules(vec![PermissionRule {
+        namespace_pattern: ns.to_string(),
+        op: "memory_delete".to_string(),
+        agent_pattern: "*".to_string(),
+        decision: RuleDecision::Deny,
+        reason: Some("K9 deny 4173".into()),
+    }]);
+
+    let verdict = json!({
+        "verdicts": [
+            {"candidate_id": denied_id, "verb": "delete"},
+            {"candidate_id": asked_id, "verb": "delete"},
+        ]
+    });
+    let server = shared_mock_for_synthesis(verdict);
+    let uri = server.uri();
+    let llm = OllamaClient::new_with_url(&uri, "test-model").expect("mock client");
+
+    let resp = run_store(
+        &conn,
+        &db_path,
+        &llm,
+        json!({
+            "title": "kubernetes patch tuesday rollout",
+            "content": BASE_CONTENT,
+            "namespace": ns,
+            "on_conflict": "version",
+        }),
+    )
+    .expect("store ok");
+
+    // The durable write still succeeded and both candidates survive.
+    assert!(resp["id"].is_string(), "store proceeded: {resp}");
+    for id in [&denied_id, &asked_id] {
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM memories WHERE id = ?1", [id], |_| Ok(true))
+            .unwrap_or(false);
+        assert!(exists, "k9-withheld candidate must NOT be deleted");
+    }
+
+    // The envelope names each withheld candidate with a reason code.
+    let withheld = resp["synthesis_deletes_withheld"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("#4173: response must carry synthesis_deletes_withheld; got {resp}")
+        });
+    assert_eq!(
+        withheld.len(),
+        2,
+        "both withheld deletes are reported: {resp}"
+    );
+    let mut by_id: std::collections::BTreeMap<String, String> = withheld
+        .iter()
+        .map(|w| {
+            (
+                w["id"].as_str().expect("id").to_string(),
+                w["reason"].as_str().expect("reason").to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(by_id.remove(&denied_id).as_deref(), Some("k9_denied"));
+    assert_eq!(by_id.remove(&asked_id).as_deref(), Some("k9_denied"));
+    assert!(by_id.is_empty(), "no unexpected ids: {by_id:?}");
+
+    // Ask reports its own reason code. Each leg gets its own namespace so
+    // the candidate pool (and therefore the verdict count the mock must
+    // match) is exactly the seeded row.
+    let ns_ask = "ns-k9-withheld-4173-ask";
+    install_synthesis_policy(&conn, ns_ask, None, Some(5), None);
+    clear_active_permission_rules_for_test();
+    set_active_permission_rules(vec![PermissionRule {
+        namespace_pattern: ns_ask.to_string(),
+        op: "memory_delete".to_string(),
+        agent_pattern: "*".to_string(),
+        decision: RuleDecision::Ask,
+        reason: Some("K9 ask 4173".into()),
+    }]);
+    let ask_target = seed_existing(&conn, "kubernetes deploy notes ask", "body ask", ns_ask);
+    let verdict = json!({"verdicts": [{"candidate_id": ask_target, "verb": "delete"}]});
+    let server = shared_mock_for_synthesis(verdict);
+    let uri = server.uri();
+    let llm = OllamaClient::new_with_url(&uri, "test-model").expect("mock client");
+    let resp = run_store(
+        &conn,
+        &db_path,
+        &llm,
+        json!({
+            "title": "kubernetes ask-path rollout",
+            "content": BASE_CONTENT,
+            "namespace": ns_ask,
+            "on_conflict": "version",
+        }),
+    )
+    .expect("store ok under K9 ask");
+    let withheld = resp["synthesis_deletes_withheld"]
+        .as_array()
+        .unwrap_or_else(|| panic!("#4173: ask arm must be reported; got {resp}"));
+    assert_eq!(withheld.len(), 1, "{resp}");
+    assert_eq!(withheld[0]["id"].as_str(), Some(ask_target.as_str()));
+    assert_eq!(withheld[0]["reason"].as_str(), Some("k9_ask"));
+
+    // Control: a PERMITTED delete reports nothing and applies the delete.
+    clear_active_permission_rules_for_test();
+    let ns_ok = "ns-k9-withheld-4173-ok";
+    install_synthesis_policy(&conn, ns_ok, None, Some(5), None);
+    let allowed = seed_existing(
+        &conn,
+        "kubernetes allowed prune notes",
+        "body allowed",
+        ns_ok,
+    );
+    let verdict = json!({"verdicts": [{"candidate_id": allowed, "verb": "delete"}]});
+    let server = shared_mock_for_synthesis(verdict);
+    let uri = server.uri();
+    let llm = OllamaClient::new_with_url(&uri, "test-model").expect("mock client");
+    let resp = run_store(
+        &conn,
+        &db_path,
+        &llm,
+        json!({
+            "title": "kubernetes permitted prune rollout",
+            "content": BASE_CONTENT,
+            "namespace": ns_ok,
+            "on_conflict": "version",
+        }),
+    )
+    .expect("store ok with permitted delete");
+    assert!(
+        resp.get("synthesis_deletes_withheld").is_none(),
+        "control: nothing withheld ⇒ field absent: {resp}"
+    );
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM memories WHERE id = ?1", [&allowed], |_| {
+            Ok(true)
+        })
+        .unwrap_or(false);
+    assert!(!exists, "control: the permitted delete was applied");
+
+    clear_active_permission_rules_for_test();
+}
