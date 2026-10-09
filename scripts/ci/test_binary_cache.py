@@ -25,18 +25,22 @@ the ``rustc -Vv`` text; the feature/profile string; the behaviour-affecting
 environment; the Postgres server identity (``SELECT version()`` and the
 age / vector extension versions, or ``none`` without a test database URL);
 and a digest of every file in the repo a test could read at run time that
-rustc never saw (everything but build/VCS dirs and the ``.rs`` files under
-src/ and tests/ that some dep-info of THIS build names; a ``.rs`` file no
-dep-info names, such as a cfg-off module or an orphan, stays in).
-changelog.d/, docs/ and *.md are in the key only of a binary whose OWN
-sources name them (``changelog``, ``docs`` or ``.md`` outside a ``//``
-comment; r1 M4). The lib code reads no documentation at run time (an
-``include_str!`` of a doc is in dep-info), so a docs-only change is a hit for
-every other binary. A binary whose own sources look like a tree scanner
-(read_dir, walkdir, glob, a "tests" path; integration test targets only) is
-keyed on the whole tree
-including those ``.rs`` files, so a source-scanning test is never skipped
-because some OTHER file changed.
+rustc never saw. That digest leaves out build/VCS dirs and the ``.rs`` files
+a build-independent rule marks compiled (r2 M1: an impact build compiles a
+subset, and a key must not depend on which): src/ files the shared non-test
+closure or the lib unittest's dep-info names, and tests/ files reachable from
+a cargo test-target root (``static_test_labels``). An orphan or a cfg-off
+module stays in. docs/ and *.md are in the key only of a binary whose OWN
+sources name them (``docs`` or ``.md`` outside a ``//`` comment; r1 M4);
+changelog.d/ only of a binary that can read it (``source_traits``: names
+``changelog``, spawns a tool or a repo script, or walks the repo root; r2
+M1). A binary whose own sources look like a tree scanner (read_dir, walkdir,
+glob, a "tests" path; integration test targets only) is keyed on the whole
+tree including those ``.rs`` files, so a source-scanning test is never
+skipped because some OTHER file changed. A docs-only pull request never
+reaches this script (``__SKIP__`` in ci.yml), and a src/ edit changes the
+shared closure, so the hits come from pull requests that touch only tests/
+and changelog.d/.
 
 Safety rules (enforced here, not only documented):
 
@@ -245,18 +249,47 @@ COMPILED_RS_ROOTS = ('src', 'tests')
 TREE_SENSITIVE_RE = re.compile(r'read_dir|walkdir|WalkDir|\bglob\b|"tests"|tests/|include_dir')
 
 
-# Documentation a test binary only reads when its code names it (r1 M4).
-DOC_ROOTS = ('changelog.d', 'docs')
+# Documentation a test binary only reads when its code names it (r1 M4). The
+# changelog fragments are their own class (r2 M1): every pull request adds one.
+CHANGELOG_ROOT = 'changelog.d'
+DOC_ROOTS = (CHANGELOG_ROOT, 'docs')
 DOC_SUFFIXES = ('.md',)
 # A binary whose code (``//`` line comments ignored) matches this is keyed on
-# the documentation as well.
-DOC_READER_RE = re.compile(r'changelog|\bdocs\b|\.md\b', re.I)
+# docs/ and *.md.
+DOC_READER_RE = re.compile(r'\bdocs\b|\.md\b', re.I)
+# ... and on changelog.d/ when it names it, spawns a tool that may read it,
+# names an existing repo script, or (integration tests) walks the repo root.
+CHANGELOG_READER_RE = re.compile(r'changelog', re.I)
+TOOL_SPAWN_RE = re.compile(r'Command::new\(\s*"(?:bash|sh|zsh|dash|git|find|grep|rg|python|python3|perl|xargs|env|make)"')
+SCRIPT_PATH_RE = re.compile(r'"(?:\./)?(scripts/[\w./-]+\.(?:sh|py))"')
+ENUM_RE = re.compile(r'\bread_dir\b|\bWalkDir\b|\bwalkdir\b|\bglob\b|\binclude_dir\b')
+ROOT_EXPR_RE = re.compile(r'env!\(\s*"CARGO_MANIFEST_DIR"\s*\)|\bcurrent_dir\(\s*\)')
+BARE_WALK_RE = re.compile(r'\b(?:read_dir|WalkDir::new|walkdir|glob)\(\s*"(?:\.|\./|\*[^"]*)?"')
+_TAIL_RE = re.compile(r'\s*(?:\)|\?|\.(?:unwrap|expect|context|with_context|unwrap_or_else|to_path_buf|as_path'
+                      r'|canonicalize|to_owned|clone)\s*\()')
+_JOIN_LIT_RE = re.compile(r'\s*\.join\(\s*"([^"]*)"')
+_CONCAT_LIT_RE = re.compile(r'\s*,\s*"([^"]*)"')
+_BIND_RE = re.compile(r'\b(?:let\s+(?:mut\s+)?|const\s+|static\s+)(\w+)\s*(?::[^=]*)?=')
+_WRAP_RE = re.compile(r'\s*(?:&?\s*(?:std::)?(?:path::)?(?:PathBuf::from|Path::new)\(\s*)*$')
+_MOD_RE = re.compile(r'(?:#\[path\s*=\s*"([^"\n]+)"\]\s*)?(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;')
+_INCLUDE_RE = re.compile(r'\binclude(?:_str|_bytes)?!\(\s*"([^"\n]+)"')
+
+
+def label_class(rel):
+    """'changelog' (changelog.d/), 'docs' (docs/ or another *.md) or None."""
+    rel = Path(rel)
+    if not rel.parts:
+        return None
+    if rel.parts[0] == CHANGELOG_ROOT:
+        return 'changelog'
+    if rel.parts[0] in DOC_ROOTS or rel.suffix.lower() in DOC_SUFFIXES:
+        return 'docs'
+    return None
 
 
 def is_doc_label(rel):
     """True for a repo-relative path under changelog.d/ or docs/, or a *.md file."""
-    rel = Path(rel)
-    return bool(rel.parts) and (rel.parts[0] in DOC_ROOTS or rel.suffix.lower() in DOC_SUFFIXES)
+    return label_class(rel) is not None
 
 
 def digest_runtime_tree(root, include_compiled_rs, compiled_labels=None, include_docs=None):
@@ -368,48 +401,166 @@ def runtime_entry_digest(path):
     return 'special:' + _special_kind(st.st_mode)
 
 
-def tree_sensitive(depinfo_path, repo_root):
-    """True when any own source of the binary looks like a tree scanner."""
-    deps, _ = parse_depinfo(Path(depinfo_path).read_text(errors='replace'))
-    root = Path(repo_root).resolve()
-    for d in deps:
-        p = Path(d)
-        p = p if p.is_absolute() else root / p
-        if _is_registry(p) or not p.is_file():
-            continue
-        try:
-            if TREE_SENSITIVE_RE.search(p.read_text(errors='replace')):
-                return True
-        except OSError:
-            return True
-    return False
+def _code_lines(text):
+    """``text`` with every line whose first non-blank characters are ``//`` blanked."""
+    return '\n'.join('' if l.lstrip().startswith('//') else l for l in text.splitlines())
 
 
-def reads_docs(depinfo_path, repo_root):
-    """True when any own source of the binary names the documentation (r1 M4).
+def _lit_ok(lit):
+    """A path literal naming a subpath that is not changelog.d/."""
+    s = lit.strip().lstrip('./')
+    return bool(s) and not s.lower().startswith('changelog')
 
-    Lines whose first non-blank characters are ``//`` are ignored; every other
-    line counts, block comments included (the conservative direction). An
-    unreadable source counts as a reader.
+
+def _skip_tails(t, i):
+    """Index after the call tails at ``i`` (``)``, ``?``, ``.unwrap()``, ``.expect("..")``)."""
+    while True:
+        m = _TAIL_RE.match(t, i)
+        if not m:
+            return i
+        i, depth = m.end(), 1 if t[m.end() - 1] == '(' else 0
+        while i < len(t) and depth:
+            if t[i] == '"':
+                j = i + 1
+                while j < len(t) and t[j] != '"':
+                    j += 2 if t[j] == '\\' else 1
+                i = j
+            else:
+                depth += {'(': 1, ')': -1}.get(t[i], 0)
+            i += 1
+
+
+def _joined_at(t, i):
+    m = _JOIN_LIT_RE.match(t, _skip_tails(t, i))
+    return bool(m) and _lit_ok(m.group(1))
+
+
+def _root_anchored(t, m):
+    """True when the repo-root expression ``m`` only reaches a named subpath:
+    ``concat!(root, "/x")``, ``root….join("x")``, or a ``let``/``const``/
+    ``static`` binding of exactly that expression whose every later use is
+    joined so (r2 M1). Anything else counts as a walk of the whole root."""
+    head = t[:m.start()]
+    if re.search(r'concat!\(\s*$', head):
+        c = _CONCAT_LIT_RE.match(t, m.end())
+        return bool(c) and _lit_ok(c.group(1))
+    if _joined_at(t, m.end()):
+        return True
+    stmt = head[max(head.rfind(';'), head.rfind('{'), head.rfind('}')) + 1:]
+    b = _BIND_RE.search(stmt)
+    end = _skip_tails(t, m.end())
+    # The binding must hold exactly the root (optionally wrapped in
+    # Path::new / PathBuf::from), and the statement must end there.
+    if not b or b.group(1) == '_' or not _WRAP_RE.match(stmt[b.end():]) or t[end:end + 1] != ';':
+        return False
+    uses = re.finditer(r'\b%s\b' % re.escape(b.group(1)), t[end:])
+    return all(_joined_at(t, end + u.end()) for u in uses)
+
+
+def source_traits(texts, kind, repo_root):
+    """{'tree', 'docs', 'changelog'} for a binary with own sources ``texts``.
+
+    * tree: an integration test whose code matches TREE_SENSITIVE_RE (the lib
+      and bins never; their run-time walks stay inside src/, r1 H1).
+    * changelog (r2 M1): the code names ``changelog``, spawns a shell, git or
+      search tool, or names an existing repo script (either may read
+      changelog.d/); or, for an integration test, it enumerates files
+      (ENUM_RE) and holds a repo-root expression that is not joined to a named
+      subpath (a walk from the root reaches changelog.d/).
+    * docs: a changelog reader, or the code names docs/ or *.md (r1 M4).
+
+    ``//`` line comments do not count except for ``tree``.
     """
+    code = [_code_lines(x) for x in texts]
+    joined = '\n'.join(code)
+    test = kind not in ('lib', 'bin')
+    root = Path(repo_root)
+    changelog = bool(CHANGELOG_READER_RE.search(joined) or TOOL_SPAWN_RE.search(joined)
+                     or any((root / m.group(1)).is_file() for m in SCRIPT_PATH_RE.finditer(joined)))
+    if test and not changelog and ENUM_RE.search(joined):
+        changelog = bool(BARE_WALK_RE.search(joined)) or any(
+            not _root_anchored(c, m) for c in code for m in ROOT_EXPR_RE.finditer(c))
+    return {'tree': test and bool(TREE_SENSITIVE_RE.search('\n'.join(texts))),
+            'docs': changelog or bool(DOC_READER_RE.search(joined)), 'changelog': changelog}
+
+
+def binary_traits(depinfo_path, repo_root, kind):
+    """source_traits over the binary's own (non-registry) dep-info sources. An
+    unreadable source makes every trait true (the conservative direction)."""
     deps, _ = parse_depinfo(Path(depinfo_path).read_text(errors='replace'))
     root = Path(repo_root).resolve()
+    texts = []
     for d in deps:
-        p = Path(d)
-        p = p if p.is_absolute() else root / p
-        if _is_registry(p) or not p.is_file():
+        q = Path(d)
+        q = q if q.is_absolute() else root / q
+        if _is_registry(q) or not q.is_file():
             continue
         try:
-            text = p.read_text(errors='replace')
+            texts.append(q.read_text(errors='replace'))
         except OSError:
-            return True
-        for line in text.splitlines():
-            s = line.lstrip()
-            if s.startswith('//'):
+            return {'tree': kind not in ('lib', 'bin'), 'docs': True, 'changelog': True}
+    return source_traits(texts, kind, repo_root)
+
+
+def test_target_roots(repo_root):
+    """Cargo's integration-test roots, independent of what a build compiled
+    (r2 M1): tests/*.rs, tests/*/main.rs and each ``[[test]] path`` of Cargo.toml."""
+    root = Path(repo_root)
+    found = set(root.glob('tests/*.rs')) | set(root.glob('tests/*/main.rs'))
+    try:
+        manifest = (root / 'Cargo.toml').read_text(errors='replace')
+    except OSError:
+        manifest = ''
+    for block in re.split(r'(?m)^\s*\[', manifest):
+        m = re.search(r'(?m)^\s*path\s*=\s*"([^"]+)"', block) if block.startswith('[test]]') else None
+        if m:
+            found.add(root / m.group(1))
+    return sorted(q for q in found if q.is_file())
+
+
+def static_mod_closure(repo_root, *roots):
+    """Every file reachable from ``roots`` through ``mod x;`` (``#[path]``
+    honoured) and ``include!``-family literals, as paths under ``repo_root``.
+
+    Both module layouts are tried and cfg is ignored, so it over-approximates;
+    a file it misses stays in the run-time key, the safe direction.
+    """
+    seen, todo = set(), [Path(os.path.normpath(str(r))) for r in roots]
+    while todo:
+        q = todo.pop()
+        if q in seen:
+            continue
+        try:
+            if not q.is_file():
                 continue
-            if DOC_READER_RE.search(s):
-                return True
-    return False
+            text = _code_lines(q.read_text(errors='replace'))
+        except OSError:
+            continue
+        seen.add(q)
+        for m in _MOD_RE.finditer(text):
+            if m.group(1):
+                todo.append(q.parent / m.group(1))
+            else:
+                n = m.group(2)
+                for base in (q.parent, q.with_suffix('')):
+                    todo += [base / (n + '.rs'), base / n / 'mod.rs']
+        todo += [q.parent / m.group(1) for m in _INCLUDE_RE.finditer(text)]
+        todo = [Path(os.path.normpath(str(x))) for x in todo]
+    return sorted(seen)
+
+
+def static_test_labels(repo_root):
+    """Repo-relative labels of the tests/**.rs files a cargo test target compiles."""
+    root = Path(os.path.normpath(str(Path(repo_root).resolve())))
+    out = set()
+    for q in static_mod_closure(root, *[root / r.relative_to(Path(repo_root)) for r in test_target_roots(repo_root)]):
+        try:
+            rel = q.relative_to(root)
+        except ValueError:
+            continue
+        if rel.parts and rel.parts[0] == 'tests' and q.suffix == '.rs':
+            out.add(str(rel))
+    return out
 
 
 # ------------------------------------------------------------------- key ----
@@ -502,13 +653,16 @@ def _read_lines(path):
 
 
 def shared_depinfo_files(lines):
-    """Dep-info paths of every local non-test unit and every test-profile lib/bin.
+    """Dep-info paths of every local NON-TEST lib / bin / build-script unit.
 
     Local = path source (not registry/git). Build scripts are included. Only
     the exact dep-info next to a file this build reported counts (no glob over
     deps/, whose old ``<name>-<hash>.d`` files outlive their builds; r1 L2).
     Every candidate that exists on disk is returned; zero results means the shared
-    closure is unknown (CacheError from the caller).
+    closure is unknown (CacheError from the caller). A test-profile unit (the
+    lib or bin unittest) is never shared (r2 M1): an integration test links the
+    non-test lib and runs the non-test bin, the unittest has its own key, and
+    an impact build (``--lib --test x``) does not build the bin unittest.
     """
     found = set()
     for raw in lines:
@@ -523,6 +677,8 @@ def shared_depinfo_files(lines):
             continue
         pid = msg.get('package_id') or ''
         if 'path+file://' not in pid:
+            continue
+        if (msg.get('profile') or {}).get('test'):
             continue
         target = msg.get('target') or {}
         kinds = set(target.get('kind') or [])
@@ -629,31 +785,50 @@ def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=T
             own_by_exe[e.key] = (dep, own)
         except CacheError as exc:
             keys[e.key], why[e.key] = None, str(exc)
-    compiled = {label for label, _ in shared}
-    for _dep, own in own_by_exe.values():
-        compiled.update(label for label, _ in own)
+    # The .rs files the narrow run-time keys leave out (r1 H1, r2 M1). Only
+    # facts that do not depend on which targets this build compiled: src/
+    # files the shared non-test closure or the lib unittest's own dep-info
+    # names (the lib is in every build), and tests/ files reachable from a
+    # cargo test-target root. An orphan or a cfg-off module stays in every key.
+    compiled = {label for label, _ in shared if label.startswith('src/')}
+    for e in exes:
+        if e.kind == 'lib' and e.key in own_by_exe:
+            compiled.update(label for label, _ in own_by_exe[e.key][1] if label.startswith('src/'))
     try:
-        rt_docs = digest_runtime_tree(repo_root, False, compiled, include_docs=True) if runtime else []
-        rt_base = [e for e in rt_docs if not is_doc_label(e[0][len('rt:'):])]
-        rt_full = digest_runtime_tree(repo_root, True) if runtime else []
-    except CacheError as exc:
+        compiled |= static_test_labels(repo_root)
+        walk = digest_runtime_tree(repo_root, True) if runtime else []
+    except (CacheError, OSError) as exc:
         for e in exes:
             keys[e.key], why[e.key] = None, 'shared inputs unavailable: %s' % exc
         return keys, why
+    views = {}
+
+    def view(full, docs, changelog):
+        """The run-time pairs of one trait combination (memoised)."""
+        sel = (full, docs or full, changelog)
+        if sel not in views:
+            out = []
+            for label, digest in walk:
+                rel = label[len('rt:'):]
+                cls = label_class(rel)
+                if (cls == 'changelog' and not sel[2]) or (cls == 'docs' and not sel[1]):
+                    continue
+                if not full and rel.endswith('.rs') and rel in compiled:
+                    continue
+                out.append((label, digest))
+            views[sel] = out
+        return views[sel]
+
     env_fp = env_fingerprint(env)
     for e in exes:
         if e.key not in own_by_exe:
             continue
         dep, own = own_by_exe[e.key]
         try:
-            if runtime and e.kind not in ('lib', 'bin') and tree_sensitive(dep, repo_root):
-                rt = rt_full
-            elif runtime and reads_docs(dep, repo_root):
-                rt = rt_docs
-            else:
-                rt = rt_base
+            tr = binary_traits(dep, repo_root, e.kind) if runtime else {}
+            rt = view(tr['tree'], tr['docs'], tr['changelog']) if runtime else []
             keys[e.key] = build_key(own, shared, lock_sha, rustc_vv, profile, env_fp, rt, server_fp)
-        except CacheError as exc:
+        except (CacheError, OSError) as exc:
             keys[e.key], why[e.key] = None, str(exc)
     return keys, why
 

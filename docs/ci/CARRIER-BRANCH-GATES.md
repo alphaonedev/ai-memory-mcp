@@ -84,8 +84,9 @@ Postgres isolation split), inside the existing `Run tests (impact-aware)` step
 file in the executable's own cargo dep-info (`target/<profile>/deps/<name>-<hash>.d`,
 including its `# env-dep:` lines with the checkout path normalised); the same
 for the shared closure, the dep-info of every local lib, bin and build-script
-unit (a test target's dep-info lists only its own sources, but it links the
-lib, so a `src/` edit must invalidate every dependent); the cfgs, env and
+unit, test-profile units excluded (a test target's dep-info lists only its own
+sources, but it links the lib, so a `src/` edit must invalidate every
+dependent; the lib and bin unittests have their own keys); the cfgs, env and
 `output` file of every local build-script run; `Cargo.lock`; the
 `rustc -Vv` text the workflow writes; the feature/profile string; the
 behaviour-affecting environment (every `AI_MEMORY_*`, `RUST_TEST_*`,
@@ -96,15 +97,26 @@ setting, only set or empty for a name containing `URL`, `PASSWORD`, `SECRET`,
 and the installed `age` and `vector` extension versions, or `none` when no
 `AI_MEMORY_TEST_POSTGRES_URL` is set; a failed query disables the cache for
 the run); and a digest of every file in the repository a test could read at
-run time. That digest leaves out `.git`, `target`, `.local-runs`, the `.rs`
-files under `src/` and `tests/` that some dep-info of the build names (an
-orphan or cfg-off `.rs` file stays in), and `changelog.d/`, `docs/` and every
-`*.md` file. Those documentation files are in the key only of a binary whose
-own code (not a `//` comment) names `changelog`, `docs` or `.md`. An
-integration test whose own sources look like a tree scanner (`read_dir`,
-`walkdir`, `glob`, a `tests` path) is keyed on the whole tree, so a
-source-scanning test is never skipped because some other file changed. The
-walk never opens a FIFO, socket or device, and the whole plan has a 120 s
+run time. That digest leaves out `.git`, `target` and `.local-runs`, and only
+`.rs` files whose set does not depend on which targets the build compiled (an
+impact-mode build compiles a subset): the `src/` files named by the shared
+closure or by the lib unittest's own dep-info (the lib is built by every run),
+and the `tests/` files reachable through `mod`, `#[path]` and `include!` from
+a cargo test-target root (`tests/*.rs`, `tests/*/main.rs`, each `[[test]]
+path`). An orphan or cfg-off `.rs` file stays in every key. `docs/` and every
+other `*.md` file are in the key only of a binary whose own code (not a `//`
+comment) names `docs` or `.md`. `changelog.d/` is in the key only of a binary
+that can read it: its code names `changelog`, spawns a shell, git or search
+tool (`Command::new("bash")`, `"git"`, `"find"`, ...), or names an existing
+`scripts/*.sh|*.py` file; or it is an integration test that enumerates files
+and holds a repository-root expression (`env!("CARGO_MANIFEST_DIR")`,
+`current_dir()`, `read_dir(".")`) that is not joined to a named subpath. On
+the tree at this change that is 36 of 1004 test targets (33 of the 535 tree
+scanners) and not the lib. An integration test whose own sources look like a
+tree scanner (`read_dir`, `walkdir`, `glob`, a `tests` path) is keyed on the
+whole tree, every `.rs` file included, so a source-scanning test is never
+skipped because some other file changed. The walk never opens a FIFO, socket
+or device, and the whole plan has a 120 s
 deadline; on expiry, or on any other failure, the full lists run.
 
 **Who reads and who writes.**
@@ -167,16 +179,27 @@ self-hosted trees are unsafe (#3128). Linux and macOS never share a manifest
 
 **Expected effect.** Hits happen only for a pull request into a `release/**`
 branch, and only for binaries whose inputs equal those of the last green push
-to that branch on the same node and tier within 7 days. A pull request that
-changes only `changelog.d/`, `docs/` or `*.md` files skips every binary whose
-code does not name them. A pull request that edits one `tests/*.rs` file
-reruns that binary plus every tree-scanning binary. A pull request that edits
-`src/`, `Cargo.lock`, the toolchain, the environment or the Postgres server
-reruns everything. Pull requests into `chain/**` and pushes never skip.
+to that branch on the same node and tier within 7 days. What the pull request
+touches decides the build first (`scripts/ci-test-impact.sh`):
+
+* Only documentation (`changelog.d/`, `docs/`, `*.md`): `TEST_IMPACT` is
+  `__SKIP__` and the test step is a no-op, so the cache is never consulted.
+* `tests/` files and the `changelog.d/` fragment every pull request carries:
+  impact mode builds `--lib --test <impacted>`. The lib and every built test
+  binary that neither changed nor scans the tree hit; the edited tests, the
+  tree scanners (whole-tree key) and the changelog readers rerun. Binaries
+  impact mode does not build do not run either way.
+* Any `src/` file, `Cargo.lock`, the toolchain, the environment or the
+  Postgres server: the shared closure or a key input changes, so every binary
+  reruns (a foundational path also forces the full build, `__ALL__`).
+
+Pull requests into `chain/**` and pushes never skip.
 
 **Known limit.** A test that reads, at run time, a `.rs` file under `tests/`
 or `src/` through a path the scanner heuristic does not recognise would not be
 re-run when only that file changes. Add the marker string to its source (or
 extend `TREE_SENSITIVE_RE`) when one is found. The same applies to a test that
-reads documentation through a path that names none of `changelog`, `docs` or
-`.md` (extend `DOC_READER_RE`).
+reads documentation through a path that names none of `docs` or `.md` (extend
+`DOC_READER_RE`), and to a test that reaches `changelog.d/` without naming
+it, spawning a tool or a repo script, or walking from the repository root
+(extend `CHANGELOG_READER_RE` or `TOOL_SPAWN_RE`).
