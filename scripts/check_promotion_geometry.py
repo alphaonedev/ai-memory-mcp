@@ -3,6 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """#3872: refuse promotion heads missing release-base commits.
 
+A push to a Promotion carrier (refs/heads/chain/*, #6117) is measured like the
+promotion PR it heads: the pushed sha against the pinned release base. A carrier
+push and its promotion PR report the same REQUIRED context on one sha, so the push
+verdict must never be INAPPLICABLE where the PR verdict can be BEHIND. Because
+behind=0 means the release base is an ancestor of the candidate, the PR merge tree
+then equals the candidate tree: the carrier push run and the PR run judge one tree.
+
 Exit 0: PASS or explicitly INAPPLICABLE event; 1: BEHIND; 2: cannot prove.
 No network, checkout, index, branch or configuration mutation by the check.
 --self-test creates and removes its own Git repositories only.
@@ -20,6 +27,9 @@ import tempfile
 
 RELEASE = "release/v1.0.0"
 REMOTE_BASE = "refs/remotes/origin/" + RELEASE
+# #6117: pushes to these refs are promotion carriers and are measured, not skipped.
+CARRIER_PREFIX = "refs/heads/chain/"
+SHA_RE = r"[0-9a-f]{40}|[0-9a-f]{64}"
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -70,11 +80,13 @@ def geometry(repo, base_ref, head_ref):
 def event_refs(path, event_name):
     if not event_name:
         raise CannotProve("--github-event requires GITHUB_EVENT_NAME (or --event-name)")
-    if event_name != "pull_request":
+    if event_name not in ("pull_request", "push"):
         print(f"INAPPLICABLE #3872: event {event_name!r} is not a promotion pull_request")
         return None
     try:
         event = json.loads(path.read_text())
+        if event_name == "push":
+            return carrier_push_refs(event)
         pr = event["pull_request"]
         base_ref = pr["base"]["ref"]
         if not isinstance(base_ref, str) or not base_ref:
@@ -83,12 +95,29 @@ def event_refs(path, event_name):
             print(f"INAPPLICABLE #3872: PR base {base_ref!r} is not {RELEASE}")
             return None
         base, head = pr["base"]["sha"], pr["head"]["sha"]
-        if not all(isinstance(s, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", s)
+        if not all(isinstance(s, str) and re.fullmatch(SHA_RE, s)
                    for s in (base, head)):
             raise ValueError("promotion base/head must be full commit SHAs")
         return base, head
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise CannotProve(f"invalid promotion event: {exc}") from exc
+
+
+def carrier_push_refs(event):
+    """(release base, pushed sha) for a carrier push (#6117); None for any other push."""
+    if not isinstance(event, dict):
+        raise ValueError("push event is not an object")
+    ref = event.get("ref")
+    if not isinstance(ref, str) or not ref.startswith("refs/"):
+        raise ValueError("push event has no ref")
+    if not ref.startswith(CARRIER_PREFIX):
+        print(f"INAPPLICABLE #3872: push to {ref!r} is not a promotion carrier ({CARRIER_PREFIX}*)")
+        return None
+    after = event.get("after")
+    if not isinstance(after, str) or not re.fullmatch(SHA_RE, after) or not after.strip("0"):
+        raise ValueError("carrier push 'after' must be a full, non-zero commit SHA")
+    print(f"CARRIER #6117: push to {ref} is measured against {REMOTE_BASE}")
+    return REMOTE_BASE, after
 
 
 def self_test():
@@ -159,7 +188,20 @@ def self_test():
         payload(base, head, "next/v1.1.0")
         check("non-promotion-PR", 0, "--github-event", str(event),
               "--event-name", "pull_request", contains="INAPPLICABLE")
+        event.write_text(json.dumps({"ref": "refs/heads/main", "after": head}))
         check("push-event", 0, "--github-event", str(event), "--event-name", "push",
+              contains="INAPPLICABLE")
+        event.write_text(json.dumps({"ref": "refs/heads/chain/promo", "after": head}))
+        check("carrier-push-BEHIND", 1, "--github-event", str(event), "--event-name", "push",
+              contains="behind=1")
+        event.write_text(json.dumps({"ref": "refs/heads/chain/promo", "after": base}))
+        check("carrier-push-equal", 0, "--github-event", str(event), "--event-name", "push",
+              contains="behind=0")
+        event.write_text(json.dumps({"ref": "refs/heads/chain/promo", "after": "0" * 40}))
+        check("carrier-push-zero-sha", 2, "--github-event", str(event), "--event-name", "push")
+        event.write_text(json.dumps({"after": head}))
+        check("push-without-ref", 2, "--github-event", str(event), "--event-name", "push")
+        check("other-event", 0, "--github-event", str(event), "--event-name", "merge_group",
               contains="INAPPLICABLE")
         payload(base, "HEAD")
         check("malformed-promotion-SHA", 2, "--github-event", str(event),
@@ -201,7 +243,15 @@ def main():
     parser.add_argument("--github-event", type=Path, help="use original PR head/base from event JSON")
     parser.add_argument("--event-name", default=os.environ.get("GITHUB_EVENT_NAME"))
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--print-release", action="store_true",
+                        help="print the pinned release branch (the one source of the carrier "
+                             "release ref the workflows fetch, #6117) and exit")
     args = parser.parse_args()
+    if args.print_release:
+        if args.self_test or args.base or args.head or args.github_event:
+            parser.error("--print-release cannot be combined with other options")
+        print(RELEASE)
+        return 0
     if args.github_event and (args.base or args.head):
         parser.error("--github-event cannot be combined with --base/--head")
     if args.self_test and (args.base or args.head or args.github_event):
