@@ -2144,6 +2144,16 @@ def _self_test_cases() -> int:
     diff_masks("#6210 R4 a changed table row without a leading pipe masks the value cell in the diff",
                "x\napi_token | old6163CanaryRow\ny", "x\napi_token | new6163CanaryRow\ny",
                hidden=("old6163CanaryRow", "new6163CanaryRow"), shown=("-api_token |", "+api_token |"))
+    # #6163 round 4 (security F4): URL userinfo is masked up to the last `@` of the authority, and a long user-only
+    # userinfo (a token sent as the user name) is masked too.
+    masks("#6163 R4 a URL password that contains @ is masked to the last @",
+          "https://deploy:p@ss6163CanaryAt@git.example.invalid/x.git", hidden=("ss6163CanaryAt",),
+          shown=("@git.example.invalid/x.git",))
+    masks("#6163 R4 a long user-only URL userinfo is masked",
+          "https://6163CanaryUserOnlyTokenValue@git.example.invalid/x.git", hidden=("6163CanaryUserOnly",),
+          shown=("@git.example.invalid/x.git",))
+    masks("#6163 R4 a short URL user name stays visible", "ssh://git@git.example.invalid/x.git",
+          shown=("ssh://git@git.example.invalid/x.git",), count=0)
 
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
