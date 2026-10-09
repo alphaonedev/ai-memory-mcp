@@ -1230,6 +1230,29 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         (f"{base}..{merge6}", "did not measure base tip..merge-commit"),
     ], tip=merge6)
 
+    # (attr, #6174) the PR adds attributes marking src/** binary plus a new
+    #       AI_MEMORY_FED_* identifier in an unwatched file. git grep takes
+    #       binary-ness from the WORKING TREE (here the merge commit, i.e.
+    #       the change under test); the identifier drift must stay RED.
+    fx.reset(base)
+    fx.g("checkout", "-q", "-b", "attr8", base)
+    fx.write(".gitattributes", "src/** binary\n")
+    fx.write("src/config.rs", 'pub const Y: &str = "AI_MEMORY_FED_ATTR_KNOB";\n', append=True)
+    attr8 = fx.commit([".gitattributes", "src/config.rs"], "attr8: src binary + new identifier")
+    fx.g("checkout", "-q", "main")
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+    merge8 = fx.merge("attr8", "Merge attr8 into main")
+    t.expect_red("attr", "identifier add hidden behind head-supplied binary attributes", repo,
+                 base, attr8, [
+                     ("+ AI_MEMORY_FED_ATTR_KNOB", "did not name the added identifier"),
+                     (sentence, "did not carry the required section 7 expiry sentence"),
+                 ], tip=merge8)
+    t.gate("attr-gate", "pull_request whose head marks src/** binary and adds an identifier",
+           repo, _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=attr8,
+                           GITHUB_BASE_REF="main", GITHUB_SHA=merge8,
+                           PATH=os.environ.get("PATH", "")), "+ AI_MEMORY_FED_ATTR_KNOB")
+    fx.reset(base)
+
     # ---- #6138: merge-commit structure cells ------------------------------
     # main is at `base`; h7 is the PR head, o7 an unrelated branch.
     fx.reset(base)
