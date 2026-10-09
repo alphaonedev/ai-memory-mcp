@@ -6390,6 +6390,43 @@ mod tests {
         assert_eq!(fact(wh, "audit_rows_pending_stale"), "0");
     }
 
+    /// Renames `subscriptions` away so every read of it is a fault (the
+    /// #4956 fixture shape), then runs the local doctor.
+    fn webhook_report_with_unreadable_subscriptions() -> Report {
+        let env = TestEnv::fresh();
+        {
+            let conn = crate::db::open(&env.db_path).expect("open + migrate");
+            conn.execute_batch("ALTER TABLE subscriptions RENAME TO subscriptions_gone")
+                .expect("rename away");
+        }
+        run_local_collect(&env.db_path)
+    }
+
+    /// #4979 — an unreadable `subscriptions` table is Critical with the
+    /// `subscription_count` fact `unreadable` and an error fact, never a
+    /// healthy-looking `0` at Info (ERRORS-19).
+    #[test]
+    fn webhook_section_critical_when_subscription_count_unreadable_4979() {
+        let report = webhook_report_with_unreadable_subscriptions();
+        let wh = find(&report, "Webhook");
+        assert_eq!(
+            fact(wh, "subscription_count"),
+            over_depth_4715::UNREADABLE,
+            "{wh:?}"
+        );
+        assert!(
+            fact(wh, "subscription_count_error").contains("subscriptions"),
+            "{wh:?}"
+        );
+        assert_eq!(wh.severity, Severity::Critical, "{wh:?}");
+        assert!(
+            wh.note.as_deref().is_some_and(|n| n.contains("#4979")),
+            "note must name the read fault: {:?}",
+            wh.note
+        );
+        assert_eq!(report.overall, Severity::Critical);
+    }
+
     #[test]
     fn local_run_webhook_section_warns_on_stale_pending_audit_rows_3659() {
         let env = TestEnv::fresh();

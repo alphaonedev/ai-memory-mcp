@@ -1143,6 +1143,69 @@ fn compute_recall_mode(
 }
 
 #[cfg(test)]
+mod read_fault_4979_tests {
+    //! #4979 — `hooks.registered_count` must never report a read fault on
+    //! the `subscriptions` table as a healthy-looking `0` (ERRORS-19).
+
+    use super::CapabilitiesAccept;
+    use crate::config::{FeatureTier, ResolvedModels};
+
+    #[test]
+    fn registered_count_is_null_with_error_when_subscriptions_unreadable_4979() {
+        let conn = crate::db::open(std::path::Path::new(":memory:")).expect("open");
+        conn.execute_batch("ALTER TABLE subscriptions RENAME TO subscriptions_gone")
+            .expect("rename away");
+        let tier = FeatureTier::Keyword.config();
+        let resolved = ResolvedModels::from_tier_preset(&tier);
+        let val = super::handle_capabilities_with_conn(
+            &tier,
+            &resolved,
+            None,
+            false,
+            Some(&conn),
+            CapabilitiesAccept::V2,
+        )
+        .expect("capabilities must still answer");
+        assert!(
+            val["hooks"]["registered_count"].is_null(),
+            "a read fault must be reported as null, never 0: {}",
+            val["hooks"]
+        );
+        assert!(
+            val["hooks"]["registered_count_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("subscriptions")),
+            "the fault reason must be on the wire: {}",
+            val["hooks"]
+        );
+    }
+
+    /// The healthy shape is unchanged: a readable table is a number and the
+    /// error field is absent from the wire.
+    #[test]
+    fn registered_count_stays_a_number_when_readable_4979() {
+        let conn = crate::db::open(std::path::Path::new(":memory:")).expect("open");
+        let tier = FeatureTier::Keyword.config();
+        let resolved = ResolvedModels::from_tier_preset(&tier);
+        let val = super::handle_capabilities_with_conn(
+            &tier,
+            &resolved,
+            None,
+            false,
+            Some(&conn),
+            CapabilitiesAccept::V2,
+        )
+        .expect("capabilities");
+        assert_eq!(val["hooks"]["registered_count"], 0, "{}", val["hooks"]);
+        assert!(
+            val["hooks"].get("registered_count_error").is_none(),
+            "{}",
+            val["hooks"]
+        );
+    }
+}
+
+#[cfg(test)]
 mod example_validity_1606_tests {
     //! #1606 — capabilities examples must stay byte-equal to valid
     //! calls (the #1325 discipline). The pre-#1606 `memory_recall`

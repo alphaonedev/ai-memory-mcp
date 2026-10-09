@@ -32506,6 +32506,19 @@ mod tests {
         assert_eq!((dispatched, failed), (0, 0));
     }
 
+    /// #4979 — an unreadable `subscriptions` table is a FAILED probe, never a
+    /// healthy-looking `Ok(0)` (ERRORS-19).
+    #[test]
+    fn count_subscriptions_unreadable_table_is_err_4979() {
+        let conn = test_db();
+        conn.execute_batch("ALTER TABLE subscriptions RENAME TO subscriptions_gone")
+            .unwrap();
+        assert!(
+            count_subscriptions(&conn).is_err(),
+            "an unreadable subscriptions table must be an error, not a healthy-looking 0"
+        );
+    }
+
     #[test]
     fn doctor_sync_peer_watermarks_empty_3655() {
         let conn = test_db();
