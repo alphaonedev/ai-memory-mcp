@@ -92,13 +92,8 @@ fn federation(peer_url: &str) -> FederationConfig {
         .expect("reqwest client");
     // W = N = 2: the single peer is REQUIRED, so a miss is a quorum miss.
     FederationConfig {
-        policy: QuorumPolicy::new(
-            2,
-            2,
-            Duration::from_millis(2000),
-            Duration::from_secs(30),
-        )
-        .unwrap(),
+        policy: QuorumPolicy::new(2, 2, Duration::from_millis(2000), Duration::from_secs(30))
+            .unwrap(),
         peers: vec![PeerEndpoint {
             id: "peer-pg-arm".to_string(),
             sync_push_url: format!("{peer_url}/api/v1/sync/push"),
@@ -122,9 +117,8 @@ pub fn origin(dir: &std::path::Path, peer_url: &str) -> (AppState, Arc<dyn Memor
         ResolvedTtl::default(),
         true,
     )));
-    let store: Arc<dyn MemoryStore> = Arc::new(
-        ai_memory::store::sqlite::SqliteStore::open(path).expect("open SqliteStore"),
-    );
+    let store: Arc<dyn MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(path).expect("open SqliteStore"));
     let app = AppState {
         db,
         embedder: Arc::new(None),
@@ -208,7 +202,10 @@ pub async fn call(
     let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 /// Scratch under `.local-runs/` (the project no-`/tmp` rule).

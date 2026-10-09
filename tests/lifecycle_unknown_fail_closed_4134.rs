@@ -72,11 +72,23 @@ fn raw_lifecycle(conn: &rusqlite::Connection, id: &str) -> rusqlite::types::Valu
 }
 
 fn listed_ids(conn: &rusqlite::Connection) -> Vec<String> {
-    db::list(conn, Some(NS), None, 100, 0, None, None, None, None, None, None)
-        .expect("list")
-        .into_iter()
-        .map(|m| m.id)
-        .collect()
+    db::list(
+        conn,
+        Some(NS),
+        None,
+        100,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("list")
+    .into_iter()
+    .map(|m| m.id)
+    .collect()
 }
 
 fn recalled_ids(conn: &rusqlite::Connection) -> Vec<String> {
@@ -187,7 +199,10 @@ fn operator_release_repairs_an_unknown_lifecycle_4134() {
     let (_tmp, mut conn) = fresh_db();
     let id = db::insert(&conn, &row("operator-repair-4134")).expect("insert");
     set_raw_lifecycle(&conn, &id, &7_i64);
-    assert!(db::get(&conn, &id).expect("get").is_none(), "hidden before repair");
+    assert!(
+        db::get(&conn, &id).expect("get").is_none(),
+        "hidden before repair"
+    );
 
     let released = db::operator_dequarantine(&mut conn, &id, "operator:4134").expect("release");
     assert!(
@@ -195,6 +210,8 @@ fn operator_release_repairs_an_unknown_lifecycle_4134() {
         "#4134: the operator release must repair a row holding an unrecognised value \
          (pre-fix it matched only the literal 'quarantined' and left the row hidden for good)"
     );
-    let row = db::get(&conn, &id).expect("get").expect("visible after repair");
+    let row = db::get(&conn, &id)
+        .expect("get")
+        .expect("visible after repair");
     assert_eq!(row.lifecycle_state, LifecycleState::Open);
 }

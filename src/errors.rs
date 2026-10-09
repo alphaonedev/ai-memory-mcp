@@ -231,8 +231,7 @@ pub mod msg {
 
     // ---- consolidate (#4091) --------------------------------------------------
     /// The fixed caller message of the 503 `SUMMARY_UNAVAILABLE` refusal.
-    pub const SUMMARY_UNAVAILABLE: &str =
-        "consolidation refused: no summary could be produced, so the sources were left untouched \
+    pub const SUMMARY_UNAVAILABLE: &str = "consolidation refused: no summary could be produced, so the sources were left untouched \
          (supply `summary`, or retry when the LLM is reachable)";
     /// `reason` tokens the refusal carries (closed set).
     pub const SUMMARY_REASON_NO_LLM: &str = "no_llm_configured";

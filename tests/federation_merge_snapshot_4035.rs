@@ -82,7 +82,10 @@ fn replay_and_losing_merge_keep_the_pre_merge_snapshot_4035() {
     assert_eq!(live_content(&conn), "newerbeta");
     let (archived, reason) = snapshot(&conn).expect("A→B leaves a recovery snapshot");
     assert_eq!(reason, "federation_merge");
-    assert_eq!(archived, "originalalpha", "the snapshot is the text B replaced");
+    assert_eq!(
+        archived, "originalalpha",
+        "the snapshot is the text B replaced"
+    );
 
     // Redeliver B byte-for-byte: nothing changes, so the snapshot must stay A.
     storage::merge_inbound(&conn, &row("newerbeta", T1), false).expect("replay B");
@@ -95,7 +98,11 @@ fn replay_and_losing_merge_keep_the_pre_merge_snapshot_4035() {
 
     // A LOSING older row: LWW keeps B live, so the snapshot must still be A.
     storage::merge_inbound(&conn, &row("olderloser", T_OLDER), false).expect("merge loser");
-    assert_eq!(live_content(&conn), "newerbeta", "LWW discards the older row");
+    assert_eq!(
+        live_content(&conn),
+        "newerbeta",
+        "LWW discards the older row"
+    );
     assert_eq!(
         snapshot(&conn).map(|(c, _)| c).as_deref(),
         Some("originalalpha"),
@@ -125,7 +132,9 @@ fn non_text_field_merge_converges_without_replacing_the_snapshot_4035() {
     storage::merge_inbound(&conn, &tagged, false).expect("merge tags");
 
     let tags: String = conn
-        .query_row("SELECT tags FROM memories WHERE id = ?1", [ID], |r| r.get(0))
+        .query_row("SELECT tags FROM memories WHERE id = ?1", [ID], |r| {
+            r.get(0)
+        })
         .expect("tags column");
     assert!(
         tags.contains("from-peer"),

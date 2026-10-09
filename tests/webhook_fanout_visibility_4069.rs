@@ -84,7 +84,12 @@ fn memory(owner: &str, scope: Option<&str>) -> Memory {
 
 /// A wildcard subscription owned by `created_by` whose hook path carries
 /// `tag`, so the receiver's log tells the two subscribers apart.
-fn subscribe(conn: &rusqlite::Connection, receiver: &TlsReceiver, created_by: &str, tag: &str) -> String {
+fn subscribe(
+    conn: &rusqlite::Connection,
+    receiver: &TlsReceiver,
+    created_by: &str,
+    tag: &str,
+) -> String {
     let unique = uuid::Uuid::new_v4().simple().to_string();
     let path = format!("/{tag}/{unique}");
     let url = format!("{}{path}", receiver.uri());
@@ -168,7 +173,10 @@ async fn private_delete_title_does_not_reach_a_non_reader_4069() {
     let alice_path = subscribe(&conn, &receiver, ALICE, "alice");
     let row = memory(ALICE, None);
     let id = ai_memory::db::insert(&conn, &row).expect("insert alice's row");
-    assert!(ai_memory::db::delete(&conn, &id).expect("delete"), "row deleted");
+    assert!(
+        ai_memory::db::delete(&conn, &id).expect("delete"),
+        "row deleted"
+    );
 
     let details = serde_json::to_value(DeleteEventDetails {
         title: row.title.clone(),
@@ -349,8 +357,7 @@ mod postgres_arm {
             .await
             .expect("store alice's private row");
 
-        dispatch_event_postgres(&state, MEMORY_STORE, &id, NS, Some(ALICE), None)
-            .await;
+        dispatch_event_postgres(&state, MEMORY_STORE, &id, NS, Some(ALICE), None).await;
         wait_dispatch_idle().await;
 
         assert!(

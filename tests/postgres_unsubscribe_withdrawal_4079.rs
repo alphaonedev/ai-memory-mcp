@@ -107,7 +107,11 @@ async fn unsubscribe_while_peer_down_reports_quorum_miss_4079() {
         "#4079: a withdrawal the peer missed is under-replicated (202), not a bare 200: {body}"
     );
     assert_eq!(body["quorum_met"], json!(false), "{body}");
-    assert_eq!(body["removed"], json!(true), "the local row IS gone: {body}");
+    assert_eq!(
+        body["removed"],
+        json!(true),
+        "the local row IS gone: {body}"
+    );
     assert!(
         withdrawals_for(&peer, &sub_id).await >= 1,
         "the withdrawal was attempted against the down peer (the lane retries a 500)"

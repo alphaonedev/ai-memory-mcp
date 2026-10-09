@@ -186,7 +186,10 @@ async fn consolidate(router: &Router, ids: &[&str]) -> (StatusCode, Value) {
     let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 /// The sources are untouched (content, lifecycle `open`, still readable by
@@ -197,7 +200,10 @@ async fn assert_nothing_consolidated(app: &AppState, ids: &(String, String), cas
         let row = ai_memory::db::get(&lock.0, id)
             .expect("read source")
             .unwrap_or_else(|| panic!("{case}: source {id} must still exist"));
-        assert_eq!(row.content, content, "{case}: source content must be untouched");
+        assert_eq!(
+            row.content, content,
+            "{case}: source content must be untouched"
+        );
         assert_eq!(
             row.lifecycle_state,
             LifecycleState::Open,

@@ -1158,8 +1158,10 @@ pub async fn dispatch_event_postgres(
         (Some(mem), true) => crate::subscriptions::SourceGate::Row(mem),
         (None, true) => crate::subscriptions::SourceGate::Unavailable,
     };
-    dispatch_event_postgres_gated(app, &ctx, event, memory_id, namespace, agent_id, details, gate)
-        .await;
+    dispatch_event_postgres_gated(
+        app, &ctx, event, memory_id, namespace, agent_id, details, gate,
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1173,7 +1175,6 @@ async fn dispatch_event_postgres_gated(
     details: Option<serde_json::Value>,
     gate: crate::subscriptions::SourceGate<'_>,
 ) {
-
     // Pull only the subscription mirror rows (`_subscriptions/<agent>`)
     // via the sargable namespace-prefix scan. `Filter::namespace` is
     // exact-match, so dispatch historically listed with `namespace=None`

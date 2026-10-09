@@ -974,7 +974,9 @@ pub fn dispatch_event_with_details(
         (Some(mem), true) => SourceGate::Row(mem),
         (None, true) => SourceGate::Unavailable,
     };
-    dispatch_event_gated(conn, event, memory_id, namespace, agent_id, db_path, details, gate);
+    dispatch_event_gated(
+        conn, event, memory_id, namespace, agent_id, db_path, details, gate,
+    );
 }
 
 /// #4069 — `memory_delete` (and any other post-erase event): the row is
