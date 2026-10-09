@@ -75,6 +75,11 @@ on:
   # its head) never share a cancel group. The range-scoped gates below widen a
   # carrier push to the whole carrier (merge-base(release/v1.0.0, HEAD)..HEAD),
   # so the push verdict is never narrower than the PR verdict it sits beside.
+  # Range AND tree: the push run tests the HEAD tree, the PR run the merge
+  # tree. The required #3872 geometry step measures the carrier push too, and
+  # behind=0 (release base an ancestor of HEAD) makes the two trees identical;
+  # a carrier behind the release is red on both runs (precedent copied from
+  # scripts/check_promotion_geometry.py, no vote).
   push:
     branches: [main, develop, "release/**", "chain/**"]
   # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
@@ -581,20 +586,28 @@ jobs:
         # the push delivered: both runs report under this context name on one
         # sha, and a narrower push verdict must not stand in for the PR one.
         # Off a carrier push `before` is empty and github.event.before applies
-        # as before. The release ref is the one
-        # scripts/check_promotion_geometry.py pins (RELEASE). Fails closed.
+        # as before. The release ref is read from
+        # scripts/check_promotion_geometry.py --print-release (its RELEASE, the
+        # one source). Fails closed, with an ::error:: line, on a fetch or
+        # merge-base failure.
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          CARRIER_RELEASE_REF: release/v1.0.0
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" != "push" ] || [ "${REF#refs/heads/chain/}" = "$REF" ]; then
             echo "before=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF"
-          before="$(git merge-base "origin/$CARRIER_RELEASE_REF" HEAD)"
+          CARRIER_RELEASE_REF="$(python3 scripts/check_promotion_geometry.py --print-release)"
+          git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF" || {
+            echo "::error::carrier push: cannot fetch origin/$CARRIER_RELEASE_REF; refusing to judge the carrier over an unknown range"
+            exit 1
+          }
+          before="$(git merge-base "origin/$CARRIER_RELEASE_REF" HEAD)" || {
+            echo "::error::carrier push: no merge-base between origin/$CARRIER_RELEASE_REF and HEAD (unrelated carrier history); refusing"
+            exit 1
+          }
           echo "carrier push: range start = merge-base(origin/$CARRIER_RELEASE_REF, HEAD) = $before"
           echo "before=$before" >> "$GITHUB_OUTPUT"
       - name: Run declaration hash gate
@@ -870,8 +883,21 @@ jobs:
           fetch-depth: 0  # #3872 requires complete ancestry, not the merge checkout alone.
       # #3872: the original PR head must contain the pinned release base.
       # The synthetic merge checkout would always hide BEHIND geometry.
-      - name: Promotion ancestry soundness (#3872)
-        run: bash scripts/check-promotion-geometry.sh --github-event "$GITHUB_EVENT_PATH"
+      # #6117: a push to a Promotion carrier (chain/**) reports this REQUIRED
+      # context on the same sha as its promotion PR, so the script measures the
+      # pushed sha (event `after`) against the release base too, never
+      # INAPPLICABLE. behind=0 means the release base is an ancestor of the
+      # candidate, so the PR merge tree equals the candidate tree the push run
+      # tests. The release ref is fetched explicitly; a failed fetch fails the job.
+      - name: Promotion ancestry soundness (#3872, #6117 carrier push)
+        run: |
+          set -euo pipefail
+          release="$(python3 scripts/check_promotion_geometry.py --print-release)"
+          git fetch --no-tags origin "+refs/heads/$release:refs/remotes/origin/$release" || {
+            echo "::error::cannot fetch origin/$release; the #3872 geometry cannot be proven, refusing"
+            exit 1
+          }
+          bash scripts/check-promotion-geometry.sh --github-event "$GITHUB_EVENT_PATH"
       - name: Self-test promotion ancestry (including BEHIND negative control)
         run: bash scripts/check-promotion-geometry.sh --self-test
       - name: Run required-contexts gate
@@ -1173,20 +1199,27 @@ jobs:
         # sha, and a narrower push verdict must not stand in for the PR one.
         # Off a carrier push `before` is empty and github.event.before applies
         # as before (the gate's own push arm: merge-base(before, sha)..sha). The
-        # release ref is the one scripts/check_promotion_geometry.py pins
-        # (RELEASE). Fails closed: an unresolvable merge-base fails the job.
+        # release ref is read from scripts/check_promotion_geometry.py
+        # --print-release (its RELEASE, the one source). Fails closed, with an
+        # ::error:: line, on a fetch or merge-base failure.
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          CARRIER_RELEASE_REF: release/v1.0.0
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" != "push" ] || [ "${REF#refs/heads/chain/}" = "$REF" ]; then
             echo "before=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF"
-          before="$(git merge-base "origin/$CARRIER_RELEASE_REF" HEAD)"
+          CARRIER_RELEASE_REF="$(python3 scripts/check_promotion_geometry.py --print-release)"
+          git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF" || {
+            echo "::error::carrier push: cannot fetch origin/$CARRIER_RELEASE_REF; refusing to judge the carrier over an unknown range"
+            exit 1
+          }
+          before="$(git merge-base "origin/$CARRIER_RELEASE_REF" HEAD)" || {
+            echo "::error::carrier push: no merge-base between origin/$CARRIER_RELEASE_REF and HEAD (unrelated carrier history); refusing"
+            exit 1
+          }
           echo "carrier push: range start = merge-base(origin/$CARRIER_RELEASE_REF, HEAD) = $before"
           echo "before=$before" >> "$GITHUB_OUTPUT"
       - name: Run enterprise-federation cert-expiry gate
@@ -1397,20 +1430,28 @@ jobs:
         # the push delivered: both runs report under this context name on one
         # sha, and a narrower push verdict must not stand in for the PR one.
         # Off a carrier push `before` is empty and github.event.before applies
-        # as before. The release ref is the one
-        # scripts/check_promotion_geometry.py pins (RELEASE). Fails closed.
+        # as before. The release ref is read from
+        # scripts/check_promotion_geometry.py --print-release (its RELEASE, the
+        # one source). Fails closed, with an ::error:: line, on a fetch or
+        # merge-base failure.
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          CARRIER_RELEASE_REF: release/v1.0.0
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" != "push" ] || [ "${REF#refs/heads/chain/}" = "$REF" ]; then
             echo "before=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF"
-          before="$(git merge-base "origin/$CARRIER_RELEASE_REF" HEAD)"
+          CARRIER_RELEASE_REF="$(python3 scripts/check_promotion_geometry.py --print-release)"
+          git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF" || {
+            echo "::error::carrier push: cannot fetch origin/$CARRIER_RELEASE_REF; refusing to judge the carrier over an unknown range"
+            exit 1
+          }
+          before="$(git merge-base "origin/$CARRIER_RELEASE_REF" HEAD)" || {
+            echo "::error::carrier push: no merge-base between origin/$CARRIER_RELEASE_REF and HEAD (unrelated carrier history); refusing"
+            exit 1
+          }
           echo "carrier push: range start = merge-base(origin/$CARRIER_RELEASE_REF, HEAD) = $before"
           echo "before=$before" >> "$GITHUB_OUTPUT"
       - name: Run stale contract-assertion gate over the change range
@@ -1455,20 +1496,28 @@ jobs:
         # the push delivered: both runs report under this context name on one
         # sha, and a narrower push verdict must not stand in for the PR one.
         # Off a carrier push `before` is empty and github.event.before applies
-        # as before. The release ref is the one
-        # scripts/check_promotion_geometry.py pins (RELEASE). Fails closed.
+        # as before. The release ref is read from
+        # scripts/check_promotion_geometry.py --print-release (its RELEASE, the
+        # one source). Fails closed, with an ::error:: line, on a fetch or
+        # merge-base failure.
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          CARRIER_RELEASE_REF: release/v1.0.0
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" != "push" ] || [ "${REF#refs/heads/chain/}" = "$REF" ]; then
             echo "before=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF"
-          before="$(git merge-base "origin/$CARRIER_RELEASE_REF" HEAD)"
+          CARRIER_RELEASE_REF="$(python3 scripts/check_promotion_geometry.py --print-release)"
+          git fetch --no-tags origin "+refs/heads/$CARRIER_RELEASE_REF:refs/remotes/origin/$CARRIER_RELEASE_REF" || {
+            echo "::error::carrier push: cannot fetch origin/$CARRIER_RELEASE_REF; refusing to judge the carrier over an unknown range"
+            exit 1
+          }
+          before="$(git merge-base "origin/$CARRIER_RELEASE_REF" HEAD)" || {
+            echo "::error::carrier push: no merge-base between origin/$CARRIER_RELEASE_REF and HEAD (unrelated carrier history); refusing"
+            exit 1
+          }
           echo "carrier push: range start = merge-base(origin/$CARRIER_RELEASE_REF, HEAD) = $before"
           echo "before=$before" >> "$GITHUB_OUTPUT"
       - name: Run count-assertion declaration gate over the change range
