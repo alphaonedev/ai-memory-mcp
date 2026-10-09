@@ -1882,6 +1882,14 @@ PROOF_CMD = ('python3 scripts/release/reproducible_build.py --target x86_64-unkn
 EPOCH_LINES = IND + 'SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"\n' + IND + "export SOURCE_DATE_EPOCH\n"
 REMAP_LINES = (IND + 'RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"\n'
                + IND + "export RUSTFLAGS\n")
+# #6274: the proof gates every publish job and its digest is compared with the
+# shipped x86_64-unknown-linux-gnu binary's.
+REPRO_OUTPUTS = "    outputs:\n      sha256: ${{ steps.proof.outputs.sha256 }}\n"
+REPRO_OUT_ARG = ' --sha256-output "$GITHUB_OUTPUT"'
+REPRO_PKG_ENV = "REPRO_SHA256: ${{ needs.reproducible.outputs.sha256 }}"
+REPRO_CHECK_LINE = ('case "${{ matrix.target }}" in x86_64-unknown-linux-gnu) test -n "$REPRO_SHA256"; '
+                    'test "$REPRO_SHA256" = "$ASSERTED_SHA256" || { echo "::error::the shipped x86_64-unknown-linux-gnu '
+                    'binary ($ASSERTED_SHA256) is not the one the reproducible job built twice ($REPRO_SHA256)"; exit 1; } ;; esac')
 
 
 def _rel(old: str, new: Union[str, Transform], every: bool = False) -> Edit:
@@ -1948,6 +1956,17 @@ def _job_needs(job: str, new: str) -> Transform:
         body = body[: n.start()] + new + body[n.end():]
         return text[: m.start("body")] + body + text[m.end("body"):]
     return go
+
+
+def _release_gains_cache(text: str) -> str:
+    """Put a rust-cache step back before the release build step; unchanged when
+    the release job already restores one (#6274: red until it is dropped)."""
+    a = text.index("\n  release:\n")
+    b = text.index("\n  reproducible:\n", a) if "\n  reproducible:\n" in text[a:] else len(text)
+    if RUST_CACHE_USES in text[a:b]:
+        return text
+    at = text.index(BUILD_HDR, a)
+    return text[:at] + "      - uses: " + RUST_CACHE_USES + " # v2\n\n" + text[at:]
 
 
 def _hdr_key(hdr: str, key: str) -> List[Edit]:
@@ -2684,6 +2703,21 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "6289 docker needs drops supply-chain": ("fail", [_rel(BUILD_HDR, _job_needs("docker", "    needs: [preflight, qualify]\n"))]),
     "6289 copr needs dropped": ("fail", [_rel(BUILD_HDR, _job_needs("copr", ""))]),
     "6289 preflight gains a needs": ("fail", [_rel(BUILD_HDR, _job_key("preflight", "    needs: qualify\n"))]),
+    # --- #6274: the reproducible proof gates every publish job and binds the shipped x86_64 binary
+    "6274 release does not need reproducible": ("fail", [_rel(BUILD_HDR, _job_needs("release", "    needs: [preflight, qualify, supply-chain]\n"))]),
+    "6274 sbom does not need reproducible": ("fail", [_rel(BUILD_HDR, _job_needs("sbom", "    needs: [preflight, qualify, supply-chain]\n"))]),
+    "6274 mobile-ios does not need reproducible": ("fail", [_rel(BUILD_HDR, _job_needs("mobile-ios", "    needs: [preflight, qualify, supply-chain]\n"))]),
+    "6274 mobile-android does not need reproducible": ("fail", [_rel(BUILD_HDR, _job_needs("mobile-android", "    needs: [preflight, qualify, supply-chain]\n"))]),
+    "6274 docker does not need reproducible": ("fail", [_rel(BUILD_HDR, _job_needs("docker", "    needs: [preflight, qualify, supply-chain]\n"))]),
+    "6274 reproducible job exposes no sha256 output": ("fail", [_rel(BUILD_HDR, _edit_all(REPRO_OUTPUTS, ""))]),
+    "6274 proof writes no sha256 output": ("fail", [_rel(BUILD_HDR, _edit_all(REPRO_OUT_ARG, ""))]),
+    "6274 package step does not compare with the proof": ("fail", [_rel(
+        BUILD_HDR, _edit_all(IND + REPRO_CHECK_LINE + "\n", ""))]),
+    "6274 package step proof compare made non-fatal": ("fail", [_rel(
+        BUILD_HDR, _edit_all(IND + REPRO_CHECK_LINE + "\n", IND + REPRO_CHECK_LINE + " || true\n"))]),
+    "6274 package step compares the asserted hash with itself": ("fail", [_rel(
+        BUILD_HDR, _edit_all(REPRO_PKG_ENV, "REPRO_SHA256: ${{ steps.assert.outputs.sha256 }}"))]),
+    "6274 release job restores rust-cache": ("fail", [_rel(BUILD_HDR, _release_gains_cache)]),
     "X05 docker step id quoted": ("fail", [_rel("        id: build\n", "        id: 'build'\n")]),
     "X09 registry login carries another with key": ("fail", [_rel(LOGIN_PW, LOGIN_PW + "          logout: false\n")]),
     "X04 image tags as a folded block": ("fail", [_rel(PUSH_TAGS, "          tags: >\n")]),
@@ -3005,6 +3039,35 @@ def self_test(root: Path) -> int:
             if rc == 0 or packaged:
                 print(f"self-test FAIL: the package unit packaged a file whose hash is not the asserted one ({wrong[:12]!r}): "
                       "fail-open", file=sys.stderr)
+                failures += 1
+
+        # --- #6274 runtime: on the x86_64-unknown-linux-gnu leg the package unit
+        # also refuses unless the asserted hash equals the reproducible job's
+        # digest; the other legs package without it.
+        def package_leg(target: str, repro: Optional[str]) -> Tuple[int, bool]:
+            pkg = tmp / "pkg"
+            shutil.rmtree(pkg, ignore_errors=True)
+            (pkg / "target" / target / "release").mkdir(parents=True)
+            (pkg / "target" / target / "release" / "ai-memory").write_bytes(payload)
+            body = "\n".join(WF_PACKAGE).replace("${{ matrix.target }}", target).replace("${{ matrix.artifact }}", "ai-memory")
+            env = dict(os.environ, ASSERTED_SHA256=good)
+            env.pop("REPRO_SHA256", None)
+            if repro is not None:
+                env["REPRO_SHA256"] = repro
+            rc = subprocess.run(["bash", "-c", body], cwd=pkg, env=env, capture_output=True).returncode
+            return rc, (pkg / "dist" / f"ai-memory-{target}.tar.gz").is_file()
+
+        if package_leg(REPRO_TARGET, good) != (0, True):
+            print("self-test FAIL: the x86_64 linux package unit refuses the binary the proof built (#6274)", file=sys.stderr)
+            failures += 1
+        if package_leg("aarch64-unknown-linux-gnu", None) != (0, True):
+            print("self-test FAIL: a leg the proof does not cover is refused for want of its digest (#6274)", file=sys.stderr)
+            failures += 1
+        for repro in (None, "", "0" * 64, good.upper()):
+            rc, packaged = package_leg(REPRO_TARGET, repro)
+            if rc == 0 or packaged:
+                print(f"self-test FAIL: the x86_64 linux package unit packaged a binary the proof did not build "
+                      f"({repro!r:.14}): fail-open (#6274)", file=sys.stderr)
                 failures += 1
 
         # --- #4768 runtime: in a checkout whose declaration and asserter are the

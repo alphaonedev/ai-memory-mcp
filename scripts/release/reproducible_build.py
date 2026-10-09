@@ -239,6 +239,21 @@ def self_test(root: Path) -> int:
             failures.append("an empty feature set was accepted (fail-open)")
         except ProofError:
             pass
+        # #6274: on success the CLI appends the proven digest to --sha256-output
+        # (the job's GITHUB_OUTPUT), which the release job compares with the
+        # shipped binary's hash.
+        fresh()
+        out = tmp / "github-output"
+        out.write_text("earlier=1\n", encoding="utf-8")
+        try:
+            rc = main(["--target", "x86_64-unknown-linux-gnu", "--features", "sal", "--workspace-a", str(ws_a),
+                       "--workspace-b", str(ws_b), "--cargo", str(stub), "--epoch", "1", "--sha256-output", str(out)])
+        except SystemExit as exc:
+            rc = exc.code if isinstance(exc.code, int) else 2
+        built = ws_a / "target" / "x86_64-unknown-linux-gnu" / "release" / "ai-memory"
+        want = "earlier=1\nsha256=" + (sha256_of(built) if built.is_file() else "?") + "\n"
+        if rc != 0 or out.read_text(encoding="utf-8") != want:
+            failures.append(f"--sha256-output did not record the proven digest (exit {rc})")
         fresh()
         try:
             two_builds(ws_a, ws_b, "x86_64-unknown-linux-gnu", "sal", "ai-memory", str(tmp / "no-such-cargo"), epoch="1")
