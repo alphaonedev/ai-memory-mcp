@@ -431,6 +431,17 @@ pub enum DrainFlushError {
     Join(tokio::task::JoinError),
     /// The supervisor exited with a typed terminal state.
     Drain(DrainError),
+    /// #3856 — the supervisor did not exit within `timeout` after the
+    /// caller's queue handle was dropped. The receiver only sees `None`
+    /// once EVERY sender clone is gone, so this names a LEAKED clone (a
+    /// hook installed into a process-global chain, a producer thread that
+    /// has not returned) — the shape that used to park
+    /// [`close_and_flush`] forever. The supervisor is aborted before this
+    /// is returned.
+    Timeout {
+        /// The bound that expired.
+        timeout: std::time::Duration,
+    },
 }
 
 impl std::fmt::Display for DrainFlushError {
@@ -438,6 +449,11 @@ impl std::fmt::Display for DrainFlushError {
         match self {
             Self::Join(e) => write!(f, "deferred-audit supervisor join failed: {e}"),
             Self::Drain(e) => write!(f, "{e}"),
+            Self::Timeout { timeout } => write!(
+                f,
+                "deferred-audit drain timed out after {timeout:?}: a queue sender clone is \
+                 still alive, so the receiver can never observe close (#3856)"
+            ),
         }
     }
 }
@@ -447,6 +463,7 @@ impl std::error::Error for DrainFlushError {
         match self {
             Self::Join(e) => Some(e),
             Self::Drain(e) => Some(e),
+            Self::Timeout { .. } => None,
         }
     }
 }
@@ -2915,23 +2932,63 @@ fn panic_retry_backoff(restart: u32) -> std::time::Duration {
 /// terminal chain/DLQ residence. An unresolved occurrence never counts as
 /// drained merely because its failed attempts were observed.
 ///
+/// Bounded by [`DEFAULT_SHUTDOWN_DRAIN_TIMEOUT`] — the same bound the
+/// production [`DeferredAuditShutdown::close_and_flush`] applies — via
+/// [`close_and_flush_within`].
+///
 /// # Errors
 ///
 /// Returns [`DrainFlushError::Join`] if the supervisor task itself fails to
-/// join, and [`DrainFlushError::Drain`] if the sink exhausted its configured
+/// join, [`DrainFlushError::Drain`] if the sink exhausted its configured
 /// restart budget (v1.0.0 #3164 — previously this arrived as a `JoinError`
-/// wrapping a panic, which carried no machine-readable cause). An `Ok(())`
+/// wrapping a panic, which carried no machine-readable cause), and
+/// [`DrainFlushError::Timeout`] (#3856) when the supervisor is still running
+/// at the bound — which means a sender clone outlived `queue`, since the
+/// receiver drains to `None` only once every clone is gone. An `Ok(())`
 /// result therefore continues to mean that the queue drained completely.
 pub async fn close_and_flush(
     queue: DeferredAuditQueue,
     supervisor: JoinHandle<std::result::Result<(), DrainError>>,
 ) -> std::result::Result<(), DrainFlushError> {
+    close_and_flush_within(queue, supervisor, DEFAULT_SHUTDOWN_DRAIN_TIMEOUT).await
+}
+
+/// [`close_and_flush`] with an explicit bound.
+///
+/// #3856 — the pre-fix helper awaited the supervisor UNBOUNDED after
+/// `drop(queue)`. Its own precondition ("once every clone is dropped") is
+/// exactly what a leaked sender clone violates, and then `recv().await`
+/// never returns `None`, the drainer never exits, and the await parked
+/// forever: 0 CPU, a futex wait, the tokio driver idle — the signature that
+/// hung two landing-chain `cargo test --lib` legs (~6 h, then 21 min). A
+/// leaked clone is now a FAILING call that names the leak.
+///
+/// On expiry the supervisor is aborted and NOT awaited afterwards (mirrors
+/// the production shutdown): a synchronous sink operation cannot observe
+/// cancellation and could block the abort's join forever.
+///
+/// # Errors
+///
+/// As [`close_and_flush`]; `timeout` is the bound reported in
+/// [`DrainFlushError::Timeout`].
+pub async fn close_and_flush_within(
+    queue: DeferredAuditQueue,
+    mut supervisor: JoinHandle<std::result::Result<(), DrainError>>,
+    timeout: std::time::Duration,
+) -> std::result::Result<(), DrainFlushError> {
     // Drop the producer-side sender — once every clone is dropped,
     // the receiver's `recv().await` returns None and the drainer
     // exits gracefully.
     drop(queue);
-    supervisor.await??;
-    Ok(())
+    match tokio::time::timeout(timeout, &mut supervisor).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(drain))) => Err(DrainFlushError::Drain(drain)),
+        Ok(Err(join)) => Err(DrainFlushError::Join(join)),
+        Err(_elapsed) => {
+            supervisor.abort();
+            Err(DrainFlushError::Timeout { timeout })
+        }
+    }
 }
 
 /// Default daemon shutdown deadline for background-writer quiescence and
@@ -3779,6 +3836,12 @@ mod tests {
             err.to_string().contains("timed out"),
             "the error must name the drain timeout: {err}"
         );
+        match err {
+            DrainFlushError::Timeout { timeout } => {
+                assert_eq!(timeout, DEFAULT_SHUTDOWN_DRAIN_TIMEOUT);
+            }
+            other => panic!("expected the typed drain timeout naming the leak, got {other:?}"),
+        }
         // The admitted prefix still drained before the bound expired: the
         // timeout names the LEAK, not a lost event.
         assert_eq!(metrics.appended_count(), 1);
