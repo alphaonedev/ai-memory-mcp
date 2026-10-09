@@ -1372,5 +1372,17 @@ class ManifestWriterWording6384R2L2(unittest.TestCase):
             self.assertIn('never skips', flat, name)
 
 
+class LineageCorrection6384R2L4(unittest.TestCase):
+    """r2 L4: the two commits with stale Base trailers are named, with the
+    true base of the series, in the carrier-gates lineage note."""
+
+    def test_lineage_note_names_the_true_base(self):
+        text = (REPO / 'docs' / 'ci' / 'CARRIER-BRANCH-GATES.md').read_text()
+        i = text.index('**Lineage correction.**')
+        note = ' '.join(text[i:i + 600].split())
+        for sha in ('72ca19c23', '35f2729b1', '24ea76fb3', '923248059', 'fb8998028'):
+            self.assertIn(sha, note)
+
+
 if __name__ == '__main__':
     unittest.main()
