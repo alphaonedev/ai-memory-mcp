@@ -1113,6 +1113,31 @@ the nearest match with an `is_duplicate` flag.
 `suggested_merge` is non-null when `is_duplicate == true`. Requires
 the `semantic` feature tier or higher (embeddings must be available).
 
+**Degraded verdict (#3350).** When live memories exist in scope but none
+of them could be compared (no row carries an embedding in the active
+embedding space — unembedded, foreign-space or malformed rows — or, on a
+postgres-backed daemon, no query embedding could be produced), the tool
+fails closed instead of answering a confident `is_duplicate: false`:
+`is_duplicate` is `null` (unknown) and two additive keys name the fault.
+Healthy responses are byte-identical to the shape above.
+
+```json
+{
+  "is_duplicate": null,
+  "status": "degraded",
+  "reason": "none of the 5 live candidate(s) in scope could be compared: no embedding in the active embedding space (unembedded, foreign-space or malformed rows); duplicate verdict unknown",
+  "threshold": 0.85,
+  "nearest": null,
+  "suggested_merge": null,
+  "candidates_scanned": 0
+}
+```
+
+An empty scope (no live memories at all) is not degraded and stays a
+confident `is_duplicate: false`. Read `status` before `is_duplicate`.
+The CLI's human summary prints `check-duplicate: DEGRADED  no verdict
+reason=...` for this case (never "no duplicate").
+
 ---
 
 ### memory_entity_register

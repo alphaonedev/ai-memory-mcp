@@ -1937,6 +1937,10 @@ mod d1_6_987_tests {
         // #3382: restore preserves original_expires_at; it never cleared expiry.
         "memory_archive_restore",
         "memory_calibrate_confidence",
+        // 2026-10-09 (#3350): the check fails closed — `is_duplicate` is
+        // null + `status: "degraded"` + `reason` when live memories exist in
+        // scope but none could be compared; the docs now say so.
+        "memory_check_duplicate",
         // 2026-09-09 (#3380): tombstoned sources retain derived_from links;
         // the former metadata-only provenance claim was false.
         "memory_consolidate",

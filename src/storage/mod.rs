@@ -11701,11 +11701,15 @@ pub fn check_duplicate(
     let is_duplicate = best
         .as_ref()
         .is_some_and(|m| m.similarity >= effective_threshold);
+    // #3350 — phase 2 only ever sees embedded rows, so it cannot know whether
+    // the live pool was non-empty; the degraded signal is derived by
+    // `check_duplicate_with_text`, which does.
     Ok(DuplicateCheck {
         is_duplicate,
         threshold: effective_threshold,
         nearest: best,
         candidates_scanned: scanned,
+        degraded: None,
     })
 }
 
@@ -12353,6 +12357,7 @@ pub fn check_duplicate_with_text(
                 // We scanned every row through the hash compare to find
                 // the match — report that, not just the first one.
                 candidates_scanned: rows.len(),
+                degraded: None,
             });
         }
     }
@@ -12360,7 +12365,24 @@ pub fn check_duplicate_with_text(
     // Phase 2 — no hash match; fall back to the embedding-based
     // nearest-neighbor scan so callers still get the "closest existing
     // memory was X at similarity Y" signal on near-but-not-exact hits.
-    check_duplicate(conn, query_embedding, namespace, threshold)
+    let pool = rows.len();
+    let mut check = check_duplicate(conn, query_embedding, namespace, threshold)?;
+    // #3350 (WP-FAULT #6051) — fail closed, never fail open: when the live
+    // pool is NON-EMPTY but the cosine scan compared NOTHING (no row carries
+    // an embedding in the active space: unembedded, foreign-space, malformed
+    // or dimension-mismatched), `is_duplicate: false` would be a confident
+    // answer to a question that was never asked. Carry the fault so every
+    // surface renders the verdict as unknown. An EMPTY pool is a genuine
+    // "nothing to collide with" and stays a confident `false`.
+    if pool > 0 && check.candidates_scanned == 0 {
+        tracing::warn!(
+            pool,
+            namespace = namespace.unwrap_or("*"),
+            "check_duplicate: no live candidate could be compared; verdict withheld (#3350)"
+        );
+        check.degraded = Some(crate::models::DuplicateDegraded::NoComparableCandidates { pool });
+    }
+    Ok(check)
 }
 
 /// Register an entity (canonical name + aliases) under a namespace

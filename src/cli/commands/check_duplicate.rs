@@ -20,7 +20,7 @@
 //! through the same [`crate::daemon_runtime::build_embedder`]
 //! resolution ladder the daemon uses.
 
-use crate::models::field_names;
+use crate::models::{DuplicateDegraded, field_names};
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -129,14 +129,34 @@ pub fn run_with_embedder(
         return Ok(());
     }
 
-    let is_dup = envelope
-        .get(field_names::IS_DUPLICATE)
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let scanned = envelope
         .get(field_names::CANDIDATES_SCANNED)
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    // #3350 (WP-FAULT #6051) — read `status` BEFORE `is_duplicate`: a
+    // degraded check carries `is_duplicate: null`, and `as_bool()
+    // .unwrap_or(false)` would coerce that back into the exact "ok  no
+    // duplicate" fail-open line this fix removes. The human summary never
+    // claims a verdict that was not computed.
+    if envelope
+        .get(DuplicateDegraded::STATUS_KEY)
+        .and_then(Value::as_str)
+        == Some(DuplicateDegraded::STATUS_DEGRADED)
+    {
+        let reason = envelope
+            .get(DuplicateDegraded::REASON_KEY)
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        writeln!(
+            out.stdout,
+            "check-duplicate: DEGRADED  no verdict  reason={reason}  candidates_scanned={scanned}",
+        )?;
+        return Ok(());
+    }
+    let is_dup = envelope
+        .get(field_names::IS_DUPLICATE)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if is_dup {
         let merge = envelope
             .get(field_names::SUGGESTED_MERGE)

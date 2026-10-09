@@ -95,13 +95,20 @@ pub fn handle_check_duplicate(
         None
     };
 
-    Ok(json!({
-        (field_names::IS_DUPLICATE): check.is_duplicate,
+    // #3350 (WP-FAULT #6051) — a degraded check (live pool non-empty, nothing
+    // compared) renders `is_duplicate` as null and adds `status: "degraded"`
+    // + `reason`; a healthy envelope is byte-identical to before. Same
+    // helper as the HTTP projection (`handlers::power`), so the two cannot
+    // drift. 5-agent vote (4d3ea1c5), option A.
+    let mut body = json!({
+        (field_names::IS_DUPLICATE): check.wire_is_duplicate(),
         "threshold": check.threshold,
         "nearest": nearest_json,
         (field_names::SUGGESTED_MERGE): suggested_merge,
         (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
-    }))
+    });
+    check.stamp_degraded(&mut body);
+    Ok(body)
 }
 
 // --- D1.5 (#986): per-tool McpTool impl for memory_check_duplicate ---
@@ -141,7 +148,7 @@ impl McpTool for CheckDuplicateTool {
         "Pre-write near-duplicate check via cosine over stored embeddings."
     }
     fn docs() -> &'static str {
-        "Pillar 2 / Stream D: pre-write near-dup check. Embeds title+content, returns highest-cosine match + is_duplicate + suggested_merge. Threshold floor 0.5. Requires semantic tier+."
+        "Pillar 2 / Stream D: pre-write near-dup check. Embeds title+content, returns highest-cosine match + is_duplicate + suggested_merge. Threshold floor 0.5. Requires semantic tier+. Fails closed (#3350): when live memories exist in scope but none could be compared (no embedding in the active space), is_duplicate is null and status=\"degraded\" + reason are added; read status before is_duplicate. An empty scope is a confident false."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<CheckDuplicateRequest>()

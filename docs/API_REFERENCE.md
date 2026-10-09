@@ -1104,6 +1104,32 @@ tier or higher — without an embedder the endpoint returns **503**
 (Service Unavailable); threshold mismatches return `200` with
 `is_duplicate: false`.
 
+**Degraded verdict (#3350).** When live memories exist in scope but NONE
+of them could be compared — no row carries an embedding in the active
+embedding space (unembedded, foreign-space or malformed rows), or on a
+postgres-backed daemon no query embedding could be produced — the check
+fails closed instead of answering a confident `is_duplicate: false`: the
+response is still `200`, `is_duplicate` is `null` (unknown), and two
+additive keys name the fault. Healthy responses are byte-identical to the
+shape above (no `status` / `reason` keys).
+
+```json
+{
+  "is_duplicate": null,
+  "status": "degraded",
+  "reason": "none of the 5 live candidate(s) in scope could be compared: no embedding in the active embedding space (unembedded, foreign-space or malformed rows); duplicate verdict unknown",
+  "threshold": 0.85,
+  "nearest": null,
+  "suggested_merge": null,
+  "candidates_scanned": 0
+}
+```
+
+An empty scope (no live memories at all) is NOT degraded: it stays a
+confident `is_duplicate: false`. Read `status` before `is_duplicate`; a
+caller that only tests the boolean must treat `null` as "do not assume
+no duplicate".
+
 ### `POST /api/v1/entities`
 
 Register an entity-as-typed-memory. Idempotent on

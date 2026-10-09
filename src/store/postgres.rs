@@ -33480,6 +33480,7 @@ impl MemoryStore for PostgresStore {
                         similarity: 1.0,
                     }),
                     candidates_scanned,
+                    degraded: None,
                 });
             }
         }
@@ -33489,12 +33490,28 @@ impl MemoryStore for PostgresStore {
         // still get a "closest existing memory" signal on near hits.
         // Empty-embedding shortcut: if no vector was supplied (caller
         // is keyword-only), report "no duplicate found".
+        // #3350 (WP-FAULT #6051) — with a NON-EMPTY pool this is not "no
+        // duplicate found": nothing beyond the hash was compared, so the
+        // verdict is withheld (`degraded`, rendered as `is_duplicate: null`
+        // + `status: "degraded"` on the wire). An empty pool stays a
+        // confident `false`. `candidates_scanned` reports what was
+        // cosine-compared on this arm: nothing.
         if query_embedding.is_empty() {
+            let degraded = (candidates_scanned > 0).then_some(
+                crate::models::DuplicateDegraded::NoQueryVector {
+                    pool: candidates_scanned,
+                },
+            );
             return Ok(crate::models::DuplicateCheck {
                 is_duplicate: false,
                 threshold: effective_threshold,
                 nearest: None,
-                candidates_scanned,
+                candidates_scanned: if degraded.is_some() {
+                    0
+                } else {
+                    candidates_scanned
+                },
+                degraded,
             });
         }
 
@@ -33577,11 +33594,32 @@ impl MemoryStore for PostgresStore {
             .as_ref()
             .is_some_and(|n| n.similarity >= effective_threshold);
 
+        // #3350 — a non-empty pool with NO nearest row means no live row in
+        // scope carries an embedding in the active space: the cosine scan
+        // compared nothing, so the verdict is withheld rather than answered
+        // `false` (sqlite twin: `db::check_duplicate_with_text`).
+        let degraded = (candidates_scanned > 0 && nearest.is_none()).then_some(
+            crate::models::DuplicateDegraded::NoComparableCandidates {
+                pool: candidates_scanned,
+            },
+        );
+        if let Some(d) = degraded.as_ref() {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                reason = %d.reason(),
+                "check_duplicate_with_text: verdict withheld (#3350)"
+            );
+        }
         Ok(crate::models::DuplicateCheck {
             is_duplicate,
             threshold: effective_threshold,
             nearest,
-            candidates_scanned,
+            candidates_scanned: if degraded.is_some() {
+                0
+            } else {
+                candidates_scanned
+            },
+            degraded,
         })
     }
 

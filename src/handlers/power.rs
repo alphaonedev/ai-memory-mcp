@@ -780,13 +780,19 @@ fn check_duplicate_response(check: &crate::models::DuplicateCheck) -> serde_json
     } else {
         None
     };
-    json!({
-        (field_names::IS_DUPLICATE): check.is_duplicate,
+    // #3350 — a degraded check (pool non-empty, nothing compared) renders
+    // `is_duplicate` as null and adds `status` + `reason`; healthy envelopes
+    // are byte-identical to the documented shape. Same helper as the MCP
+    // tool, so the two projections cannot drift.
+    let mut body = json!({
+        (field_names::IS_DUPLICATE): check.wire_is_duplicate(),
         "threshold": check.threshold,
         "nearest": nearest_json,
         (field_names::SUGGESTED_MERGE): suggested_merge,
         (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
-    })
+    });
+    check.stamp_degraded(&mut body);
+    body
 }
 
 /// #3234 / #4089 — the ONE `check_duplicate` response for an embedder that
@@ -1068,7 +1074,41 @@ mod check_duplicate_wire_shape_tests_3424 {
             threshold: 0.85,
             nearest,
             candidates_scanned: 412,
+            degraded: None,
         }
+    }
+
+    /// #3350 — a degraded check renders `is_duplicate: null` plus the two
+    /// additive keys; nothing else in the envelope changes.
+    #[test]
+    fn degraded_check_withholds_the_verdict_3350() {
+        use crate::models::DuplicateDegraded;
+        let check = DuplicateCheck {
+            is_duplicate: false,
+            threshold: 0.85,
+            nearest: None,
+            candidates_scanned: 0,
+            degraded: Some(DuplicateDegraded::NoComparableCandidates { pool: 5 }),
+        };
+        let body = check_duplicate_response(&check);
+        assert!(
+            body[field_names::IS_DUPLICATE].is_null(),
+            "verdict unknown, never `false`: {body}"
+        );
+        assert_eq!(
+            body[DuplicateDegraded::STATUS_KEY],
+            DuplicateDegraded::STATUS_DEGRADED,
+            "{body}"
+        );
+        assert!(
+            body[DuplicateDegraded::REASON_KEY]
+                .as_str()
+                .is_some_and(|r| r.contains("5 live candidate")),
+            "{body}"
+        );
+        assert_eq!(body[field_names::CANDIDATES_SCANNED], 0, "{body}");
+        assert!(body["nearest"].is_null(), "{body}");
+        assert!(body[field_names::SUGGESTED_MERGE].is_null(), "{body}");
     }
 
     fn a_match() -> DuplicateMatch {

@@ -610,6 +610,59 @@ pub struct DuplicateMatch {
     pub similarity: f32,
 }
 
+/// #3350 (WP-FAULT #6051) — why a duplicate check could NOT reach a verdict.
+///
+/// The live candidate pool in scope was non-empty, yet zero candidates were
+/// compared, so `is_duplicate: false` would be a fail-open answer for a
+/// pre-write gate. The two surfaces render it as the additive
+/// `status: "degraded"` + `reason` keys with `is_duplicate` set to JSON
+/// null (verdict unknown); healthy responses are byte-identical to before.
+/// Mirrors the [`crate::embeddings::EmbedStatus`] `as_str` / `reason`
+/// shape. Decided by 5-agent vote (4d3ea1c5), option A.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum DuplicateDegraded {
+    /// No query embedding could be produced (the postgres lane runs the
+    /// hash phase without an embedder), so the `pool` live rows in scope
+    /// were only hash-compared.
+    NoQueryVector { pool: usize },
+    /// The `pool` live rows in scope carried no embedding in the active
+    /// embedding space (unembedded, foreign-space or malformed rows), so
+    /// the cosine scan compared nothing.
+    NoComparableCandidates { pool: usize },
+}
+
+impl DuplicateDegraded {
+    /// Wire key carrying the degraded marker.
+    pub const STATUS_KEY: &'static str = "status";
+    /// Wire key carrying [`Self::reason`].
+    pub const REASON_KEY: &'static str = "reason";
+    /// The ONE value `status` takes on this envelope.
+    pub const STATUS_DEGRADED: &'static str = "degraded";
+
+    /// Static label used in API surfaces and logs.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        Self::STATUS_DEGRADED
+    }
+
+    /// Human-readable reason, naming the pool size and the fault.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            Self::NoQueryVector { pool } => format!(
+                "no query embedding could be produced (embedder unavailable), so none of the \
+                 {pool} live candidate(s) in scope could be compared beyond the exact-content \
+                 hash; duplicate verdict unknown"
+            ),
+            Self::NoComparableCandidates { pool } => format!(
+                "none of the {pool} live candidate(s) in scope could be compared: no embedding \
+                 in the active embedding space (unembedded, foreign-space or malformed rows); \
+                 duplicate verdict unknown"
+            ),
+        }
+    }
+}
+
 /// Result envelope returned by `db::check_duplicate`.
 ///
 /// `is_duplicate` is `nearest.similarity >= threshold`. `nearest` is
@@ -617,12 +670,46 @@ pub struct DuplicateMatch {
 /// memories matched the namespace filter). When `is_duplicate` is true,
 /// `nearest.id` doubles as the suggested merge target — we surface it
 /// under that name in the JSON response so the contract stays explicit.
+///
+/// `degraded` (#3350) is `Some` when the pool was non-empty but nothing
+/// could be compared; `is_duplicate` is then `false` internally and MUST be
+/// rendered as JSON null on the wire via [`Self::wire_is_duplicate`].
 #[derive(Debug, Clone, Serialize)]
 pub struct DuplicateCheck {
     pub is_duplicate: bool,
     pub threshold: f32,
     pub nearest: Option<DuplicateMatch>,
     pub candidates_scanned: usize,
+    pub degraded: Option<DuplicateDegraded>,
+}
+
+impl DuplicateCheck {
+    /// #3350 — the wire `is_duplicate` value: the boolean verdict, or JSON
+    /// null when the check is degraded (verdict unknown, never `false`).
+    #[must_use]
+    pub fn wire_is_duplicate(&self) -> serde_json::Value {
+        if self.degraded.is_some() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Bool(self.is_duplicate)
+        }
+    }
+
+    /// #3350 — stamp the additive `status` + `reason` keys onto a wire
+    /// envelope ONLY when the check is degraded, so healthy envelopes stay
+    /// byte-identical to the documented shape.
+    pub fn stamp_degraded(&self, body: &mut serde_json::Value) {
+        if let (Some(d), Some(obj)) = (self.degraded.as_ref(), body.as_object_mut()) {
+            obj.insert(
+                DuplicateDegraded::STATUS_KEY.to_string(),
+                serde_json::Value::String(d.as_str().to_string()),
+            );
+            obj.insert(
+                DuplicateDegraded::REASON_KEY.to_string(),
+                serde_json::Value::String(d.reason()),
+            );
+        }
+    }
 }
 
 /// One node of the hierarchical namespace tree returned by
