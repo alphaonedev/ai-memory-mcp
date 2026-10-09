@@ -803,6 +803,9 @@ class FailureRecorder:
 GIT_SHIM = """#!{python}
 import os, sys
 real, argv = {real!r}, sys.argv[1:]
+if {probe!r} in argv:
+    print({marker!r})
+    sys.exit(0)
 if "--version" in argv and {version!r}:
     print({version!r})
     sys.exit(0)
@@ -811,6 +814,27 @@ if {fail!r} and {fail!r} in argv:
     sys.exit(128)
 os.execv(real, [real] + argv)
 """
+
+
+GIT_SHIM_PROBE_ARG = "--gitshim-probe"
+GIT_SHIM_PROBE_MARKER = "gitshim-probe-ok"
+
+
+def _require_shim_reachable(path):
+    """Positive probe (#6379): `git` looked up on `path` must be the shim,
+    which answers GIT_SHIM_PROBE_ARG with GIT_SHIM_PROBE_MARKER. Any cause that
+    makes the shim unreachable (not executable, an exec-refusing mount, a split
+    PATH entry) lets lookup fall through to the real git; refuse by name so the
+    cells never blame the gate for it."""
+    try:
+        proc = subprocess.run(["git", GIT_SHIM_PROBE_ARG], capture_output=True, text=True,
+                              env=dict(os.environ, PATH=path), timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GateError(f"the git shim is not the git on PATH (probe failed: {exc})") from exc
+    if proc.returncode != 0 or proc.stdout.strip() != GIT_SHIM_PROBE_MARKER:
+        raise GateError("the git shim is not the git on PATH (the probe "
+                        f"{GIT_SHIM_PROBE_ARG!r} did not reach the shim; check that the "
+                        "scratch directory allows executing files)")
 
 
 def run_gate_shimmed(tmp, repo, env, version="", fail=""):
@@ -829,10 +853,17 @@ def run_gate_shimmed(tmp, repo, env, version="", fail=""):
                         f"from a checkout whose path has no {os.pathsep!r})")
     shim = shim_dir / "git"
     shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version=version,
-                                    fail=fail), encoding="utf-8")
+                                    fail=fail, probe=GIT_SHIM_PROBE_ARG,
+                                    marker=GIT_SHIM_PROBE_MARKER), encoding="utf-8")
     shim.chmod(0o755)
     saved = os.environ.get("PATH")
-    os.environ["PATH"] = f"{shim_dir}{os.pathsep}{saved or ''}"
+    shim_path = f"{shim_dir}{os.pathsep}{saved or ''}"
+    try:
+        _require_shim_reachable(shim_path)
+    except GateError:
+        shutil.rmtree(shim_dir, ignore_errors=True)
+        raise
+    os.environ["PATH"] = shim_path
     try:
         return run_gate(repo, dict(env, PATH=os.environ["PATH"]))
     finally:
