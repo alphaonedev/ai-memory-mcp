@@ -235,13 +235,15 @@ WantedBy=multi-user.target</code></pre>
   <h2>One image, env-driven config.</h2>
   <p>Plan C is the production container recipe. Image boots, reads <code>AI_MEMORY_API_KEY</code> + <code>AI_MEMORY_DB</code> from env, renders <code>config.toml</code>, and exec's the daemon. No baked-in secrets.</p>
 
-  <pre><code>docker run -d \
+  <pre><code># /run/secrets/ai-memory.env is a mode-0600 file holding one line: AI_MEMORY_API_KEY=&lt;key&gt;
+docker run -d \
   --name ai-memory \
   -p 9077:9077 \
-  -e AI_MEMORY_API_KEY=$(cat /run/secrets/ai-memory-key) \
+  --env-file /run/secrets/ai-memory.env \
   -e AI_MEMORY_DB=/data/ai-memory.db \
   -v /var/lib/ai-memory:/data \
   ghcr.io/alphaonedev/ai-memory:0.9.0</code></pre>
+  <p><code>--env-file</code> hands the key to the container without it ever appearing on the <code>docker</code> client argv (<code>ps</code>, shell history, a unit file); <code>-e AI_MEMORY_API_KEY=$(cat …)</code> would expand the key into that argv.</p>
 
   <p>Per-issue context (#845 hardened entrypoint, never-leak invariant): <a href="../integrations/README.html">integrations/README.md</a>.</p>
 </section>
