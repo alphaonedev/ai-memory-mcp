@@ -324,7 +324,7 @@ SHAPE_PATHS = (
     "Cargo.toml", "Cargo.lock", "src/**", "migrations/**",
 )
 SHAPE_ON: Dict[str, Spec] = {
-    "pull_request": {"branches": Flow('"release/**", "rehearsal/**", "main"'), "paths": [Double(p) for p in SHAPE_PATHS]},
+    "pull_request": {"branches": Flow('"release/**", "rehearsal/**", "chain/**", "main"'), "paths": [Double(p) for p in SHAPE_PATHS]},
     "push": {"branches": Flow('"release/**"')},
     "workflow_dispatch": None,
 }
