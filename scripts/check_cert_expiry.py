@@ -127,6 +127,9 @@ after fetching the head as objects. Trusted mode:
     producer of a required context; Refs #6177);
   * fails closed on any git read error (a missing object is never "absent")
     and on a blob above MAX_BLOB_BYTES.
+In every mode a name the change controls (a path, a workflow file name, a
+trailer value, git's stderr) is printed through log_safe(), which escapes
+control characters, so it cannot start a workflow-command line (#6175).
 In every mode the cert doc is read through its tree entry: a symlink or any
 other non-regular entry at its path is refused (fail-closed), never followed.
 
@@ -194,6 +197,26 @@ EXPIRY_SENTENCE = (
 )
 
 
+def log_safe(text):
+    """TEXT with every control character escaped (#6175): backslash as `\\\\`,
+    C0, DEL and C1 as `\\xNN`, U+2028 / U+2029 as `\\uNNNN`. A name the change
+    controls (a path, a workflow file name, a trailer value, git's stderr
+    echoing one) therefore stays on its own step-log line and can never begin
+    a line the Actions runner reads as a workflow command (`::error`, ...)."""
+    out = []
+    for ch in str(text):
+        code = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif code < 0x20 or 0x7F <= code <= 0x9F:
+            out.append(f"\\x{code:02x}")
+        elif code in (0x2028, 0x2029):
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 class GateError(Exception):
     """Evidence is missing or ambiguous: the gate fails closed."""
 
@@ -225,7 +248,7 @@ def git_text(repo, *args):
     """Stdout of a git command that must succeed, as stripped text."""
     proc = run_git(repo, *args)
     if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", "replace").strip()
+        err = log_safe(proc.stderr.decode("utf-8", "replace").strip())
         raise GateError(f"git {args[0]} exited {proc.returncode}: {err}")
     return proc.stdout.decode("utf-8", "replace").strip()
 
@@ -299,7 +322,7 @@ def changed_paths(repo, frm, to):
     or newline-bearing name cannot be C-quoted past the path globs."""
     proc = run_git(repo, "diff", "--name-only", "-z", "--no-renames", "--end-of-options", frm, to)
     if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", "replace").strip()
+        err = log_safe(proc.stderr.decode("utf-8", "replace").strip())
         raise GateError(f"git diff {frm} {to} exited {proc.returncode}: {err}")
     return [p.decode("utf-8", "replace") for p in proc.stdout.split(b"\0") if p]
 
@@ -310,7 +333,7 @@ def extract_fed_ids(repo, tree):
     if proc.returncode == 1:  # no match
         return set()
     if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", "replace").strip()
+        err = log_safe(proc.stderr.decode("utf-8", "replace").strip())
         raise GateError(f"git grep at {tree} exited {proc.returncode}: {err}")
     return set(FED_ID_RE.findall(proc.stdout.decode("utf-8", "replace")))
 
@@ -336,7 +359,7 @@ def tree_entry(repo, tree, rel):
     the object database only (no working tree); a git failure is fail-closed."""
     proc = run_git(repo, "ls-tree", "-z", "--full-tree", "--end-of-options", tree, rel)
     if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", "replace").strip()
+        err = log_safe(proc.stderr.decode("utf-8", "replace").strip())
         raise GateError(f"git ls-tree {tree} {rel} exited {proc.returncode}: {err}")
     for rec in proc.stdout.split(b"\0"):
         meta, sep, name = rec.partition(b"\t")
@@ -355,7 +378,7 @@ def read_blob(repo, oid, rel):
         raise GateError(f"{rel} blob {oid} size {size!r} exceeds {MAX_BLOB_BYTES} bytes (fail-closed)")
     proc = run_git(repo, "cat-file", "blob", "--end-of-options", oid)
     if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", "replace").strip()
+        err = log_safe(proc.stderr.decode("utf-8", "replace").strip())
         raise GateError(f"git cat-file blob {oid} ({rel}) exited {proc.returncode}: {err}")
     return proc.stdout
 
@@ -399,7 +422,7 @@ def cert_banner(repo, tree):
 
 
 def fmt_banner(banner):
-    return f"{banner[0]} {banner[1]}"
+    return log_safe(f"{banner[0]} {banner[1]}")
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +498,7 @@ def check_banner_consistency(repo, judged):
         "Federation-wire drift since the bind (paths; +added / -removed "
         "AI_MEMORY_FED_* identifiers):",
     ]
-    lines.extend("  " + d for d in drift)
+    lines.extend("  " + log_safe(d) for d in drift)
     lines.append("")
     lines.append(
         f"Remedy: re-run §5.4(2)–(5) at HEAD and rebind {CERT_DOC}, or set its "
@@ -526,7 +549,7 @@ def pr_base_tip(repo, base, head, tip, base_name=None):
             "rebuilds the merge ref (a re-run reuses the same GITHUB_SHA)"
         )
     if anc.returncode != 0:
-        err = anc.stderr.decode("utf-8", "replace").strip()
+        err = log_safe(anc.stderr.decode("utf-8", "replace").strip())
         raise GateError(f"git merge-base --is-ancestor exited {anc.returncode}: {err}")
     return first
 
@@ -635,11 +658,11 @@ def _judge(repo, base, head, judged, mb, tip):
         out.append(f"Range: {mb}..{judged}  (merge-base of {base} and {head})")
     if watched:
         out.append("Watched federation-wire paths touched:")
-        out.extend("  " + w for w in watched)
+        out.extend("  " + log_safe(w) for w in watched)
     if id_changed:
         out.append("AI_MEMORY_FED_* identifiers added/removed/renamed in src/:")
-        out.extend("  + " + a for a in added)
-        out.extend("  - " + r for r in removed)
+        out.extend("  + " + log_safe(a) for a in added)
+        out.extend("  - " + log_safe(r) for r in removed)
     out.append("")
     out.append(
         f"Remedy: modify {CERT_DOC} in this same change (re-issue against the "
@@ -872,7 +895,7 @@ def shadow_check(repo, merge):
                        f"(mode {entry[0]} {entry[1]}); refused (fail-closed, #6140)"]
     proc = run_git(repo, "ls-tree", "-z", "--full-tree", "--end-of-options", merge, WORKFLOW_DIR + "/")
     if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", "replace").strip()
+        err = log_safe(proc.stderr.decode("utf-8", "replace").strip())
         raise GateError(f"git ls-tree {merge} {WORKFLOW_DIR}/ exited {proc.returncode}: {err}")
     trusted_wf, (c8_rel, job) = TRUSTED_PATHS[1], TRUSTED_JOB
     found, scanned = [], 0
@@ -888,7 +911,7 @@ def shadow_check(repo, merge):
         if kind == "tree":
             continue
         if kind != "blob" or mode not in REGULAR_MODES:
-            found.append(f"GUARD SHADOW: {rel}: a symlink or other non-regular workflow entry "
+            found.append(f"GUARD SHADOW: {log_safe(rel)}: a symlink or other non-regular workflow entry "
                          f"(mode {mode} {kind}); refused (fail-closed, #6140)")
             continue
         scanned += 1
@@ -901,7 +924,7 @@ def shadow_check(repo, merge):
             window += _shadow_canon(line)
             if any(m in window for m in SHADOW_MARKERS):
                 found.append(
-                    f"GUARD SHADOW: {rel} line {number}: names the required check "
+                    f"GUARD SHADOW: {log_safe(rel)} line {number}: names the required check "
                     f"'{CERT_CONTEXT}' (or a fragment of it) outside the {c8_rel} {job} job; a second "
                     "producer of a required context can satisfy it with an always-green job "
                     "(fail-closed, #6140; a trailer does not waive this; Refs #6177)"
@@ -925,7 +948,7 @@ def guard_check(repo, first, head, merge):
     if not changed:
         return True, [f"{PREFIX}: trusted guard — no trusted gate path changed in {first}..{merge}"]
     log = git_text(repo, "log", "--format=%B%x00", "--end-of-options", f"{first}..{head}")
-    who = [m.group(1).strip() for m in TRAILER.finditer(log)]
+    who = [log_safe(m.group(1).strip()) for m in TRAILER.finditer(log)]
     lines = [f"GUARD CHANGED: {c} (changes what the cert-expiry gate enforces)" for c in changed]
     if who:
         lines.append(f"{PREFIX}: approval trailer(s): {'; '.join(who)} (the §7 verdict is not waived)")
@@ -1062,7 +1085,7 @@ class Fixture:
     def g(self, *args):
         proc = run_git(self.repo, *args)
         if proc.returncode != 0:
-            err = proc.stderr.decode("utf-8", "replace").strip()
+            err = log_safe(proc.stderr.decode("utf-8", "replace").strip())
             raise GateError(f"fixture git {args} failed: {err}")
         return proc.stdout.decode("utf-8", "replace").strip()
 
@@ -2901,7 +2924,9 @@ SELF_TEST_OK = (
     "RED even with the trailer while an unrelated new workflow stays GREEN; "
     "(tr #6176) --pr-number fetches the merge ref itself: current GREEN with no sleep, current on the "
     "second fetch GREEN after one fixed sleep, stale or missing (conflicted) RED with an ::error after "
-    "the fixed backoff, malformed numbers and a sha --merge-ref refused."
+    "the fixed backoff, malformed numbers and a sha --merge-ref refused; (tr #6175) a watched path, a "
+    "workflow file name and an approval trailer carrying LF / CR and a forged ::error printed escaped, "
+    "with no log line read as a workflow command."
 )
 
 
