@@ -4039,5 +4039,46 @@ class QueueRefShaBinding6242(unittest.TestCase):
         self.assertEqual(1, self.run_group(_merge_group_event(7, sha=SHA_D))[0])  # ... the live gate does not
 
 
+# ---- Round 4, item 7 (#6244): bounded PR-number digits ----
+
+
+class QueueRefDigitCap6244(unittest.TestCase):
+    """A queue ref with an enormous digit run fails closed with one short error line, never a traceback."""
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def gate(self, digits: str) -> Tuple[int, List[str]]:
+        ref = f"refs/heads/gh-readonly-queue/main/pr-{digits}-{SHA_C}"
+        event = {"merge_group": {"head_sha": SHA_C, "head_ref": ref}}
+        return self.mod.run_gate("merge_group", event, REPO_6117, SHA_C, OPERATOR_6117, _fake_api([_pr(7, SHA_A)]))
+
+    def test_6244_oversized_digit_run_fails_closed_with_one_short_line(self) -> None:
+        for digits in ("9" * 5000, "9" * 10, "1" + "0" * 4400):
+            with self.subTest(digits=len(digits)):
+                rc, lines = self.gate(digits)
+                self.assertEqual(1, rc, lines)
+                self.assertEqual(1, len(lines), lines)
+                self.assertLess(len(lines[0]), 600, len(lines[0]))
+                self.assertIn("cannot establish its verdict", lines[0])
+
+    def test_6244_ordinary_pr_numbers_still_parse(self) -> None:
+        for digits in ("7", "6117", "123456789"):
+            with self.subTest(digits=digits):
+                ref = f"refs/heads/gh-readonly-queue/main/pr-{digits}-{SHA_C}"
+                event = {"merge_group": {"head_sha": SHA_C, "head_ref": ref}}
+                self.assertEqual(int(digits), self.mod.merge_group_pr_number(event))
+
+    def test_6244_m01_removing_the_cap_is_killed(self) -> None:
+        src = APPROVAL_PY.read_text(encoding="utf-8")
+        needle = "pr-([0-9]{1,9})-"
+        self.assertIn(needle, src)
+        mod = _exec_approval_src(src.replace(needle, "pr-([0-9]+)-"))
+        ref = f"refs/heads/gh-readonly-queue/main/pr-{'9' * 5000}-{SHA_C}"
+        event = {"merge_group": {"head_sha": SHA_C, "head_ref": ref}}
+        with self.assertRaises(ValueError):  # the mutant dies in int(); the live gate returns 1
+            mod.run_gate("merge_group", event, REPO_6117, SHA_C, OPERATOR_6117, _fake_api([_pr(7, SHA_A)]))
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
