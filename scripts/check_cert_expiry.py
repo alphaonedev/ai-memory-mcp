@@ -1293,6 +1293,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     except GateError as exc:
         if "PATH separator" not in str(exc):
             t.fail(f"(shim-pathsep): refused for the wrong reason: {exc}")
+        elif f"run the self-test from a checkout whose path has no {os.pathsep!r}" not in str(exc):
+            t.fail(f"(shim-pathsep): the refusal does not tell the user the remedy: {exc}")
     else:
         t.fail("(shim-pathsep): a scratch path containing the PATH separator was not refused")
     # #6380: the call-site wrapper turns a refused shim into exactly one named
