@@ -3632,6 +3632,145 @@ mod consolidation_pass_tests_1746 {
         );
     }
 
+    fn enabled_cfg() -> CuratorConfig {
+        CuratorConfig {
+            compaction: super::CompactionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn live_rows(conn: &rusqlite::Connection) -> Vec<Memory> {
+        db::list(
+            conn,
+            Some("ns"),
+            None,
+            16,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// #3170 — with `compaction.enabled` the SAL pass is the live destructive
+    /// consolidator. When the autonomy passes have already flagged the
+    /// rollback log as degraded (#3116 halt), the SAL pass must not run: no
+    /// LLM spend, no merge, sources untouched.
+    #[test]
+    fn consolidation_pass_skips_when_rollback_log_degraded_3170() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        let cfg = enabled_cfg();
+        let llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+        let mut report = CuratorReport::new(false);
+        report.autonomy.rollback_log_degraded = true;
+        run_consolidation_pass(&conn, &candidates, &cfg, &llm, &mut report);
+
+        assert_eq!(
+            *llm.summarize_calls.lock().unwrap(),
+            0,
+            "a degraded rollback log must stop the SAL pass before any LLM call"
+        );
+        assert_eq!(report.autonomy.memories_consolidated, 0);
+        let rows = live_rows(&conn);
+        assert_eq!(rows.len(), 2, "both sources stay live: {rows:?}");
+        assert!(
+            rows.iter().all(|m| !m.title.starts_with("[consolidated]")),
+            "no consolidated row may be written"
+        );
+    }
+
+    /// #3170 — the SAL pass is charged against the cycle's remaining
+    /// `max_ops_per_cycle` budget like autonomy Pass-1. An exhausted budget
+    /// defers every cluster (counted in `operations_skipped_cap`).
+    #[test]
+    fn consolidation_pass_respects_remaining_cycle_budget_3170() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        let mut cfg = enabled_cfg();
+        cfg.max_ops_per_cycle = 4;
+        let llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+        let mut report = CuratorReport::new(false);
+        report.operations_attempted = 4;
+        run_consolidation_pass(&conn, &candidates, &cfg, &llm, &mut report);
+
+        assert_eq!(
+            *llm.summarize_calls.lock().unwrap(),
+            0,
+            "an exhausted cycle budget must not summarise"
+        );
+        assert_eq!(live_rows(&conn).len(), 2, "both sources stay live");
+        assert!(
+            report.operations_skipped_cap >= 1,
+            "the deferred cluster is counted: {}",
+            report.operations_skipped_cap
+        );
+        assert_eq!(report.operations_attempted, 4, "nothing extra charged");
+    }
+
+    /// #3170 — a budget with room is charged: each summarise is one op.
+    #[test]
+    fn consolidation_pass_charges_ops_against_cycle_budget_3170() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        let cfg = enabled_cfg();
+        let llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+        let mut report = CuratorReport::new(false);
+        run_consolidation_pass(&conn, &candidates, &cfg, &llm, &mut report);
+
+        let calls = *llm.summarize_calls.lock().unwrap();
+        assert_eq!(calls, 1, "one cluster, one summarise");
+        assert_eq!(
+            report.operations_attempted, calls,
+            "every SAL summarise is charged to the cycle"
+        );
+    }
+
+    /// #3170 — the SAL pass folds its own rollback write-ahead failures into
+    /// the cycle's `rollback_log_degraded` flag (the #3116 contract), so the
+    /// self-report shows the degradation whichever consolidator ran.
+    #[test]
+    fn consolidation_pass_write_ahead_failure_flags_degraded_3170() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        conn.execute_batch(
+            "CREATE TRIGGER halt_rollback_writes BEFORE INSERT ON memories \
+             WHEN new.namespace = '_curator/rollback' \
+             BEGIN SELECT RAISE(ABORT, 'forced rollback-log failure'); END;",
+        )
+        .unwrap();
+        let cfg = enabled_cfg();
+        let llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+        let mut report = CuratorReport::new(false);
+        run_consolidation_pass(&conn, &candidates, &cfg, &llm, &mut report);
+
+        assert!(
+            report.autonomy.rollback_log_degraded,
+            "a failed write-ahead must flag the cycle: {:?}",
+            report.errors
+        );
+        assert_eq!(live_rows(&conn).len(), 2, "nothing consolidated");
+    }
+
     /// REGRESSION (ox-alpha #8) — `run_once` is a `pub fn` whose SAL
     /// consolidation pass drives its own runtime via `block_on`. Reached
     /// from a thread that already has an ambient tokio runtime that call
