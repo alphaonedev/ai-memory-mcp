@@ -325,6 +325,8 @@ fn handle_update_inner(
         ) {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
+        #[cfg(test)]
+        crate::recover::in_tx_fault::owner_gate_passed(&resolved_id);
     }
     // v0.7.0 Provenance Gap 5 (#888) — typed `edit_source`
     // discriminator. `Llm` and `Hook` route through the
@@ -744,6 +746,12 @@ fn conflict_or_string(e: anyhow::Error) -> String {
 #[cfg(test)]
 #[path = "update_3152_tests.rs"]
 mod update_3152_tests;
+
+// #4147 — MCP `memory_update` / `memory_delete` run their owner gate and
+// write under ONE `BEGIN IMMEDIATE` (cross-process interleave pins).
+#[cfg(test)]
+#[path = "owner_gate_txn_4147_tests.rs"]
+mod owner_gate_txn_4147_tests;
 
 #[cfg(test)]
 mod tests {

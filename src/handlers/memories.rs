@@ -710,6 +710,8 @@ async fn update_memory_write(
             return resp;
         }
     }
+    #[cfg(test)]
+    crate::recover::in_tx_fault::owner_gate_passed(&resolved_id);
     // Preserve existing agent_id when caller provides new metadata — provenance
     // is immutable after first write (see NHI design in crate::identity).
     let preserved_metadata = body.metadata.as_ref().map(|new_meta| {
@@ -1297,6 +1299,8 @@ pub async fn delete_memory(
         ) {
             return resp;
         }
+        #[cfg(test)]
+        crate::recover::in_tx_fault::owner_gate_passed(&target.id);
         let payload = json!({"id": target.id, "title": target.title});
         // v0.9.0 G10.1 (#1827) — edge-parse the optional
         // `X-AI-Memory-Capability` header ONCE; inert unless

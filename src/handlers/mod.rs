@@ -414,3 +414,9 @@ mod capability_from_headers_tests {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+// #4147 — the sqlite HTTP update/delete funnels run their owner gate and
+// write under ONE `BEGIN IMMEDIATE` (cross-process interleave pins).
+#[cfg(test)]
+#[path = "owner_gate_txn_4147_tests.rs"]
+mod owner_gate_txn_4147_tests;

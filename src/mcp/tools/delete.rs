@@ -287,6 +287,8 @@ pub(super) fn handle_delete(
         ) {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
+        #[cfg(test)]
+        crate::recover::in_tx_fault::owner_gate_passed(&target.id);
     }
 
     // #3730 — retention policy by namespace (`inbox_delete_retains`): a

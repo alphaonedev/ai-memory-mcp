@@ -70,6 +70,43 @@ pub(crate) fn patched_before_lifecycle(id: &str) {
     }
 }
 
+/// #4147 — the interleave point between a sqlite HTTP / MCP funnel's
+/// OWNERSHIP GATE and the write it authorises (the #3957 `OWNER_GATE_TEST_HOOK`
+/// shape, for the four funnels that bypass the SAL trait). A cell arms it for
+/// ONE row id with an observer that re-owns the row through a SECOND
+/// `rusqlite::Connection` on the same file — the second OS process the
+/// in-process mutex cannot see. Any other id passes through untouched.
+static OWNER_GATE_ARMED: Mutex<Vec<(String, Box<dyn Fn() + Send>)>> = Mutex::new(Vec::new());
+
+/// Arm the #4147 owner-gate point for memory `id` only.
+pub(crate) fn arm_owner_gate(id: &str, observe: Box<dyn Fn() + Send>) {
+    OWNER_GATE_ARMED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((id.to_string(), observe));
+}
+
+/// Disarm the #4147 owner-gate point for memory `id`.
+pub(crate) fn disarm_owner_gate(id: &str) {
+    OWNER_GATE_ARMED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|(armed, _)| armed != id);
+}
+
+/// Called by the four sqlite funnels right after their ownership gate
+/// passed and before the write it authorises. A no-op unless armed for
+/// `id`. The observer runs with the registry locked, so it must not itself
+/// reach the point.
+pub(crate) fn owner_gate_passed(id: &str) {
+    let armed = OWNER_GATE_ARMED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, observe)) = armed.iter().find(|(armed, _)| armed == id) {
+        observe();
+    }
+}
+
 /// Env var naming the role a re-executed test plays. Read, never set, in
 /// the test process: the parent passes it only to the child's `Command`.
 pub(crate) const CHILD_ROLE_ENV: &str = "AI_MEMORY_TEST_3152_CHILD_ROLE";
