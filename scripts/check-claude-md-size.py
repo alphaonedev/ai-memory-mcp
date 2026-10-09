@@ -1610,8 +1610,8 @@ WORKFLOW_PUSH_BRANCHES = ("main", "develop", "release/**")
 WORKFLOW_FORBIDDEN_KEYS = ("pull_request_target", "continue-on-error", "paths", "paths-ignore",
                            "branches-ignore", "tags", "tags-ignore", "if", "shell", "working-directory",
                            "defaults", "env", "container", "services", "strategy", "needs")
-WORKFLOW_RUN_LINES = ("run: python3 scripts/check-claude-md-size.py",
-                      "run: python3 scripts/check-claude-md-size.py --self-test")
+WORKFLOW_RUN_LINES = ("run: python3 -I scripts/check-claude-md-size.py",
+                      "run: python3 -I scripts/check-claude-md-size.py --self-test")
 WORKFLOW_PR_TYPES = ("opened", "synchronize", "reopened")
 # R4 (#4507): the checkout action every CLAUDE.md workflow uses, pinned to ONE sha (the repo-wide pin), so a
 # fork-network impostor commit of the same action cannot pass as "a 40-hex sha".
@@ -1641,9 +1641,9 @@ WORKFLOW_CANONICAL_LINES = (
     '    steps:',
     '      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
     '      - name: Guard the tracked CLAUDE.md and its reference files',
-    '        run: python3 scripts/check-claude-md-size.py',
+    '        run: python3 -I scripts/check-claude-md-size.py',
     '      - name: Guard self-test',
-    '        run: python3 scripts/check-claude-md-size.py --self-test',
+    '        run: python3 -I scripts/check-claude-md-size.py --self-test',
 )
 
 
@@ -1930,25 +1930,25 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
     ok &= case("R3-F4 unpinned action", good.replace(
         "@11d5960a326750d5838078e36cf38b85af677262", "@v4", 1), "action is not pinned")  # #5177: exact refusal
     ok &= case("R3-F4 guard step removed", good.replace(
-        "python3 scripts/check-claude-md-size.py\n", "true\n", 1), "check-claude-md-size.py")
+        "python3 -I scripts/check-claude-md-size.py\n", "true\n", 1), "check-claude-md-size.py")
     ok &= case("R3-F4 self-test step removed", good.replace(" --self-test", "", 1), "--self-test")
     ok &= case("R3-F4 continue-on-error", good.replace(
         "    timeout-minutes: 5", "    timeout-minutes: 5\n    continue-on-error: true", 1), "uses `continue-on-error:`")
     ok &= case("R3-F4 pull_request_target", good.replace(
         "  merge_group:", "  pull_request_target:\n    branches: [main]\n  merge_group:", 1), "uses `pull_request_target:`")
     ok &= case("R3-F4 failure swallowed with || true", good.replace(
-        "run: python3 scripts/check-claude-md-size.py\n", "run: python3 scripts/check-claude-md-size.py || true\n", 1),
+        "run: python3 -I scripts/check-claude-md-size.py\n", "run: python3 -I scripts/check-claude-md-size.py || true\n", 1),
         "swallow")
     ok &= case("R3-F4 extra step added", good.replace(
         "      - name: Guard self-test", "      - run: git checkout -- CLAUDE.md\n      - name: Guard self-test", 1), "exactly one job")
     ok &= case("R3-F4 second job added", good + "  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n",
                "exactly one job")
     ok &= case("R3-F4 shell override", good.replace(
-        "        run: python3 scripts/check-claude-md-size.py\n",
-        "        shell: bash -c true {0}\n        run: python3 scripts/check-claude-md-size.py\n", 1), "uses `shell:`")
+        "        run: python3 -I scripts/check-claude-md-size.py\n",
+        "        shell: bash -c true {0}\n        run: python3 -I scripts/check-claude-md-size.py\n", 1), "uses `shell:`")
     ok &= case("R3-F4 step condition", good.replace(
-        "        run: python3 scripts/check-claude-md-size.py\n",
-        "        if: false\n        run: python3 scripts/check-claude-md-size.py\n", 1), "uses `if:`")
+        "        run: python3 -I scripts/check-claude-md-size.py\n",
+        "        if: false\n        run: python3 -I scripts/check-claude-md-size.py\n", 1), "uses `if:`")
     ok &= case("R3-F4 env override", good.replace(
         "    timeout-minutes: 5", "    timeout-minutes: 5\n    env:\n      PYTHONPATH: /x", 1), "env")
     ok &= case("R4 checkout pinned to a fixed ref", good.replace(
@@ -1956,8 +1956,8 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
         "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n        with:\n          ref: 0000000000000000000000000000000000000000\n", 1),
         "pinned form")
     ok &= case("R4 run line swallowed in a block scalar", good.replace(
-        "        run: python3 scripts/check-claude-md-size.py\n",
-        "        run: |\n          python3 scripts/check-claude-md-size.py ||\n          true\n", 1), "pinned form")
+        "        run: python3 -I scripts/check-claude-md-size.py\n",
+        "        run: |\n          python3 -I scripts/check-claude-md-size.py ||\n          true\n", 1), "pinned form")
     ok &= case("R4 runner label changed", good.replace("runs-on: ubuntu-latest", "runs-on: no-such-runner", 1),
                "pinned form")
     uses = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n"
@@ -1966,11 +1966,11 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
     ok &= case("R5 third-party checkout action pinned by sha", good.replace(
         "actions/checkout@", "someone-else/checkout@", 1), "pinned form")
     ok &= case("R5 guard run line moved into a step name", good.replace(
-        "      - name: Guard the tracked CLAUDE.md and its reference files\n        run: python3 scripts/check-claude-md-size.py\n",
-        "      - name: run: python3 scripts/check-claude-md-size.py\n        run: true\n", 1), "pinned form")
+        "      - name: Guard the tracked CLAUDE.md and its reference files\n        run: python3 -I scripts/check-claude-md-size.py\n",
+        "      - name: run: python3 -I scripts/check-claude-md-size.py\n        run: true\n", 1), "pinned form")
     ok &= case("R5 step indentation shifted", good.replace(
-        "        run: python3 scripts/check-claude-md-size.py --self-test\n",
-        "          run: python3 scripts/check-claude-md-size.py --self-test\n", 1), "pinned form")
+        "        run: python3 -I scripts/check-claude-md-size.py --self-test\n",
+        "          run: python3 -I scripts/check-claude-md-size.py --self-test\n", 1), "pinned form")
     ok &= case("R5 timeout raised", good.replace("timeout-minutes: 5", "timeout-minutes: 500", 1), "pinned form")
     ok &= case("R5 concurrency cancel switched off", good.replace(
         "cancel-in-progress: true", "cancel-in-progress: false", 1), "pinned form")
