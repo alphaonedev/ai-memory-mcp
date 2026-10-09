@@ -1314,6 +1314,34 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                            PATH=os.environ.get("PATH", "")), "+ AI_MEMORY_FED_ATTR_KNOB")
     fx.reset(base)
 
+    # (attr-rm, #6174) the removal direction: the base defines an identifier
+    #       only in an unwatched file; the PR marks src/** binary and removes
+    #       the definition. The BASE-side scan runs under the head's attributes
+    #       too, so it must not regain -I either: the removal must stay RED.
+    fx.reset(base)
+    fx.g("checkout", "-q", "-b", "rm0", base)
+    fx.write("src/attr_rm.rs", 'pub const R: &str = "AI_MEMORY_FED_ATTR_RM_KNOB";\n')
+    rm0 = fx.commit(["src/attr_rm.rs"], "rm0: define an identifier in an unwatched file")
+    fx.g("checkout", "-q", "-b", "rm9", rm0)
+    fx.write(".gitattributes", "src/** binary\n")
+    fx.write("src/attr_rm.rs", 'pub const R: &str = "";\n')
+    rm9 = fx.commit([".gitattributes", "src/attr_rm.rs"], "rm9: src binary + remove the identifier")
+    fx.g("checkout", "-q", "main")
+    fx.g("reset", "-q", "--hard", rm0)
+    fx.g("update-ref", "refs/remotes/origin/main", rm0)
+    merge_rm = fx.merge("rm9", "Merge rm9 into main")
+    t.expect_red("attr-rm", "identifier removal hidden behind head-supplied binary attributes",
+                 repo, rm0, rm9, [
+                     ("- AI_MEMORY_FED_ATTR_RM_KNOB", "did not name the removed identifier"),
+                     (sentence, "did not carry the required section 7 expiry sentence"),
+                 ], tip=merge_rm)
+    t.gate("attr-rm-gate", "pull_request whose head marks src/** binary and removes an identifier",
+           repo, _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=rm9,
+                           GITHUB_BASE_REF="main", GITHUB_SHA=merge_rm,
+                           PATH=os.environ.get("PATH", "")), "- AI_MEMORY_FED_ATTR_RM_KNOB")
+    fx.reset(base)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+
     # ---- #6138: merge-commit structure cells ------------------------------
     # main is at `base`; h7 is the PR head, o7 an unrelated branch.
     fx.reset(base)
@@ -1573,6 +1601,7 @@ SELF_TEST_OK = (
     "PATH restored after every shim cell; "
     "(attr, attr-gate, #6174) an identifier add hidden behind head-supplied attributes "
     "marking src/** binary RED in check_change and end to end on pull_request; "
+    "(attr-rm, attr-rm-gate, #6174) the same for an identifier REMOVAL; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
