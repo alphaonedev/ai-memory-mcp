@@ -85,6 +85,7 @@ import argparse
 import bisect
 import contextlib
 import errno
+import functools
 import html
 import io
 import os
@@ -641,8 +642,33 @@ def next_tick(line, i):
         i = tick + 1
 
 
+BACKTICKS_RE = re.compile(r"`+")
+
+
+@functools.lru_cache(maxsize=2)
+def code_span_ends(line):
+    """{index of a backtick: index after the next run of the same length, or -1} for ``line`` (#6419).
+
+    One right-to-left pass over the runs answers every ``code_span_end`` by lookup, where a scan per
+    unmatched run cost the number of runs times the length of the line. A backtick that is not the
+    first of its run (the first is escaped) opens a run of the remaining length.
+    """
+    ends, later = {}, {}
+    for m in reversed(list(BACKTICKS_RE.finditer(line))):
+        start, stop = m.span()
+        for tick in (start, start + 1) if stop - start > 1 else (start,):
+            ends[tick] = later.get(stop - tick, -1)
+        later[stop - start] = stop
+    return ends
+
+
 def code_span_end(line, tick):
     """Index after the code span opened by the backtick run at ``tick``, or -1 when it is unclosed."""
+    ends = code_span_ends(line)
+    if tick in ends:
+        return ends[tick]
+    # A position inside a run that no caller reaches (every caller starts at a run or after an
+    # escaped backtick): measured directly, as before the table.
     n = backtick_run(line, tick)
     j = tick + n
     while True:
