@@ -562,8 +562,6 @@ DOCKER_STEPS: List[Spec] = [
             "org.opencontainers.image.source=https://github.com/${{ github.repository }}",
             "org.opencontainers.image.version=${{ steps.version.outputs.version }}",
         )),
-        "cache-from": "type=gha",
-        "cache-to": "type=gha,mode=max",
     }},
     {"name": "Attest build provenance (Docker image)", "if": "github.event.inputs.dry_run == 'false'",
      "uses": ATTEST_USES, "with": {
@@ -2168,7 +2166,8 @@ ATTEST_NAME = "      - name: Attest build provenance (Docker image)\n"
 PUSH_USES = "        uses: " + IMAGE_BUILD_USES + " # v6\n"
 BUILDX_STEP = "      - name: Set up Docker Buildx\n        uses: " + BUILDX_USES + " # v3\n"
 LOGIN_NAME = "      - name: Log in to GitHub Container Registry\n"
-PUSH_CACHE = "          cache-from: type=gha\n          cache-to: type=gha,mode=max\n"
+PUSH_CTX = ("          context: .\n          # #3546 D6 — a dry run builds the image and pushes nothing.\n"
+            "          push: ${{ github.event.inputs.dry_run == 'false' }}\n")
 PUSH_TAGS = "          tags: |\n"
 PUSH_LABELS = "          labels: |\n"
 SHAPE_PROOF_LINE = "          " + SHAPE_PROOF_CMD
@@ -2219,8 +2218,9 @@ def _image_cache(line: str) -> Transform:
     return go
 
 
-def _swap_cache_order(text: str) -> str:
-    return text.replace(PUSH_CACHE, "          cache-to: type=gha,mode=max\n          cache-from: type=gha\n", 1)
+def _swap_with_order(text: str) -> str:
+    a, b = PUSH_CTX.split("          # #3546", 1)
+    return text.replace(PUSH_CTX, "          # #3546" + b + a, 1)
 
 
 def _reusable_builder_job(text: str) -> str:
@@ -2768,8 +2768,6 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
                                           "push: '${{ github.event.inputs.dry_run == ''false'' }}'")]),
     "IB tags changed": ("fail", [_rel(PUSH_TAGS, PUSH_TAGS + "            ghcr.io/other/ai-memory:latest\n")]),
     "IB labels changed": ("fail", [_rel(PUSH_LABELS, PUSH_LABELS + "            extra=1\n")]),
-    "IB cache-from changed": ("fail", [_rel("cache-from: type=gha", "cache-from: type=registry,ref=x/y")]),
-    "IB cache-to changed": ("fail", [_rel("cache-to: type=gha,mode=max", "cache-to: type=gha")]),
     "IB second image build in the docker job": ("fail", [_rel(BUILD_IMG_NAME, _second_image_build)]),
     "IB image build moved to the sbom job": ("fail", [_rel(BUILD_IMG_NAME, _image_build_in_sbom_job)]),
     "IB image build copied into the sbom job": ("fail", [_rel(BUILD_IMG_NAME, _image_build_copy_in_sbom_job)]),
@@ -2782,7 +2780,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "IB buildx setup carries with": ("fail", [_rel(BUILDX_STEP, BUILDX_STEP + "        with:\n          driver-opts: image=x\n")]),
     "IB buildx setup in another case": ("fail", [_rel(BUILDX_STEP, BUILDX_STEP.replace("docker/setup", "Docker/setup"))]),
     "IB login carries another key": ("fail", [_rel(LOGIN_NAME, LOGIN_NAME + "        env:\n          X: y\n")]),
-    "valid: image build with: keys reordered": ("pass", [_rel(PUSH_CACHE, _swap_cache_order)]),
+    "valid: image build with: keys reordered": ("pass", [_rel(PUSH_CTX, _swap_with_order)]),
     # --- #6276: the release image build neither reads nor writes a shared build cache
     "6276 docker build reads the shared gha cache": ("fail", [_rel(BUILD_IMG_NAME, _image_cache(
         "          cache-from: type=gha"))]),

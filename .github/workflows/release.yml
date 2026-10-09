@@ -1323,8 +1323,8 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # #4768 / #6276 — no build-cache import or export: a shared cache is
+          # written by other runs and would be an unverified input to the image.
 
       - name: Attest build provenance (Docker image)
         if: github.event.inputs.dry_run == 'false'
